@@ -1,0 +1,156 @@
+scsi: qla2xxx: Fix fw dump corruption
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit a4226ec3ef1214b0973abdba64db66e10f6b0a1c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/a4226ec3.failed
+
+If fw dump buffer size changes and there is an existing fw dump, then save
+the old dump in the newly allocated buffer.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit a4226ec3ef1214b0973abdba64db66e10f6b0a1c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_init.c
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index 824b13554ed2,8d28ea9b0b73..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -3984,12 -4039,16 +3984,18 @@@ struct qla_hw_data 
+  	uint8_t		pep_version[3];
+  
+  	/* Firmware dump template */
+ -	struct fwdt {
+ -		void *template;
+ -		ulong length;
+ -		ulong dump_size;
+ -	} fwdt[2];
+ +	void		*fw_dump_template;
+ +	uint32_t	fw_dump_template_len;
+ +	/* Firmware dump information. */
+  	struct qla2xxx_fw_dump *fw_dump;
+  	uint32_t	fw_dump_len;
+++<<<<<<< HEAD
+ +	int		fw_dumped;
+++=======
++ 	u32		fw_dump_alloc_len;
++ 	bool		fw_dumped;
++ 	bool		fw_dump_mpi;
+++>>>>>>> a4226ec3ef12 (scsi: qla2xxx: Fix fw dump corruption)
+  	unsigned long	fw_dump_cap_flags;
+  #define RISC_PAUSE_CMPL		0
+  #define DMA_SHUTDOWN_CMPL	1
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index 046c47b82245,8183de0bd626..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -2935,15 -3137,16 +2935,15 @@@ qla2x00_alloc_fw_dump(scsi_qla_host_t *
+  		mem_size = (ha->fw_memory_size - 0x100000 + 1) *
+  		    sizeof(uint32_t);
+  		if (ha->mqenable) {
+ -			if (!IS_QLA83XX(ha) && !IS_QLA27XX(ha) &&
+ -			    !IS_QLA28XX(ha))
+ +			if (!IS_QLA83XX(ha) && !IS_QLA27XX(ha))
+  				mq_size = sizeof(struct qla2xxx_mq_chain);
+  			/*
+- 			 * Allocate maximum buffer size for all queues.
++ 			 * Allocate maximum buffer size for all queues - Q0.
+  			 * Resizing must be done at end-of-dump processing.
+  			 */
+- 			mq_size += ha->max_req_queues *
++ 			mq_size += (ha->max_req_queues - 1) *
+  			    (req->length * sizeof(request_t));
+- 			mq_size += ha->max_rsp_queues *
++ 			mq_size += (ha->max_rsp_queues - 1) *
+  			    (rsp->length * sizeof(response_t));
+  		}
+  		if (ha->tgt.atio_ring)
+@@@ -2994,35 -3234,49 +3000,54 @@@ allocate
+  			    "Unable to allocate (%d KB) for firmware dump.\n",
+  			    dump_size / 1024);
+  		} else {
+- 			if (ha->fw_dump)
++ 			if (ha->fw_dumped) {
++ 				memcpy(fw_dump, ha->fw_dump, ha->fw_dump_len);
+  				vfree(ha->fw_dump);
+- 			ha->fw_dump = fw_dump;
++ 				ha->fw_dump = fw_dump;
++ 				ha->fw_dump_alloc_len =  dump_size;
++ 				ql_dbg(ql_dbg_init, vha, 0x00c5,
++ 				    "Re-Allocated (%d KB) and save firmware dump.\n",
++ 				    dump_size / 1024);
++ 			} else {
++ 				if (ha->fw_dump)
++ 					vfree(ha->fw_dump);
++ 				ha->fw_dump = fw_dump;
+  
+- 			ha->fw_dump_len = dump_size;
+- 			ql_dbg(ql_dbg_init, vha, 0x00c5,
+- 			    "Allocated (%d KB) for firmware dump.\n",
+- 			    dump_size / 1024);
++ 				ha->fw_dump_len = ha->fw_dump_alloc_len =
++ 				    dump_size;
++ 				ql_dbg(ql_dbg_init, vha, 0x00c5,
++ 				    "Allocated (%d KB) for firmware dump.\n",
++ 				    dump_size / 1024);
+  
+++<<<<<<< HEAD
+ +			if (IS_QLA27XX(ha))
+ +				return;
+- 
+- 			ha->fw_dump->signature[0] = 'Q';
+- 			ha->fw_dump->signature[1] = 'L';
+- 			ha->fw_dump->signature[2] = 'G';
+- 			ha->fw_dump->signature[3] = 'C';
+- 			ha->fw_dump->version = htonl(1);
+- 
+- 			ha->fw_dump->fixed_size = htonl(fixed_size);
+- 			ha->fw_dump->mem_size = htonl(mem_size);
+- 			ha->fw_dump->req_q_size = htonl(req_q_size);
+- 			ha->fw_dump->rsp_q_size = htonl(rsp_q_size);
+- 
+- 			ha->fw_dump->eft_size = htonl(eft_size);
+- 			ha->fw_dump->eft_addr_l = htonl(LSD(ha->eft_dma));
+- 			ha->fw_dump->eft_addr_h = htonl(MSD(ha->eft_dma));
+- 
+- 			ha->fw_dump->header_size =
+- 				htonl(offsetof(struct qla2xxx_fw_dump, isp));
+++=======
++ 				if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
++ 					return;
+++>>>>>>> a4226ec3ef12 (scsi: qla2xxx: Fix fw dump corruption)
++ 
++ 				ha->fw_dump->signature[0] = 'Q';
++ 				ha->fw_dump->signature[1] = 'L';
++ 				ha->fw_dump->signature[2] = 'G';
++ 				ha->fw_dump->signature[3] = 'C';
++ 				ha->fw_dump->version = htonl(1);
++ 
++ 				ha->fw_dump->fixed_size = htonl(fixed_size);
++ 				ha->fw_dump->mem_size = htonl(mem_size);
++ 				ha->fw_dump->req_q_size = htonl(req_q_size);
++ 				ha->fw_dump->rsp_q_size = htonl(rsp_q_size);
++ 
++ 				ha->fw_dump->eft_size = htonl(eft_size);
++ 				ha->fw_dump->eft_addr_l =
++ 				    htonl(LSD(ha->eft_dma));
++ 				ha->fw_dump->eft_addr_h =
++ 				    htonl(MSD(ha->eft_dma));
++ 
++ 				ha->fw_dump->header_size =
++ 					htonl(offsetof
++ 					    (struct qla2xxx_fw_dump, isp));
++ 			}
+  		}
+  	}
+  }
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
