@@ -1,0 +1,435 @@
+net/mlx5e: Move flow attr reformat action bit to per dest flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Eli Britstein <elibr@mellanox.com>
+commit f493f15534ecb5c2c295ba49a2add5822d05ae19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/f493f155.failed
+
+Flow attr reformat action bit is moved from the global action bits to a
+per destination flags field, as a pre-step for adding additional flags
+to support encapsulation properties per destination, with no
+functionality change.
+
+	Signed-off-by: Eli Britstein <elibr@mellanox.com>
+	Reviewed-by: Oz Shlomo <ozsh@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit f493f15534ecb5c2c295ba49a2add5822d05ae19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c9ee89f4edb1,e48fbb7d9735..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -831,20 -907,39 +831,28 @@@ mlx5e_tc_add_fdb_flow(struct mlx5e_pri
+  	struct mlx5_fc *counter = NULL;
+  	struct mlx5e_rep_priv *rpriv;
+  	struct mlx5e_priv *out_priv;
+++<<<<<<< HEAD
+ +	int err;
+++=======
++ 	int err = 0, encap_err = 0;
++ 	int out_index;
+++>>>>>>> f493f15534ec (net/mlx5e: Move flow attr reformat action bit to per dest flags)
+  
+ -	/* if prios are not supported, keep the old behaviour of using same prio
+ -	 * for all offloaded rules.
+ -	 */
+ -	if (!mlx5_eswitch_prios_supported(esw))
+ -		attr->prio = 1;
+ -
+ -	if (attr->chain > max_chain) {
+ -		NL_SET_ERR_MSG(extack, "Requested chain is out of supported range");
+ -		err = -EOPNOTSUPP;
+ -		goto err_max_prio_chain;
+ -	}
+ -
+ -	if (attr->prio > max_prio) {
+ -		NL_SET_ERR_MSG(extack, "Requested priority is out of supported range");
+ -		err = -EOPNOTSUPP;
+ -		goto err_max_prio_chain;
+ -	}
+ +	/* keep the old behaviour, use same prio for all offloaded rules */
+ +	attr->prio = 1;
+  
+- 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT) {
++ 	for (out_index = 0; out_index < MLX5_MAX_FLOW_FWD_VPORTS; out_index++) {
++ 		if (!(attr->dests[out_index].flags & MLX5_ESW_DEST_ENCAP))
++ 			continue;
++ 
+  		out_dev = __dev_get_by_index(dev_net(priv->netdev),
+  					     attr->parse_attr->mirred_ifindex);
+ -		encap_err = mlx5e_attach_encap(priv, &parse_attr->tun_info,
+ -					       out_dev, &encap_dev, flow,
+ -					       extack);
+ -		if (encap_err && encap_err != -EAGAIN) {
+ -			err = encap_err;
+ -			goto err_attach_encap;
+ +		err = mlx5e_attach_encap(priv, &parse_attr->tun_info,
+ +					 out_dev, &encap_dev, flow);
+ +		if (err) {
+ +			rule = ERR_PTR(err);
+ +			if (err != -EAGAIN)
+ +				goto err_attach_encap;
+  		}
+  		out_priv = netdev_priv(encap_dev);
+  		rpriv = out_priv->ppriv;
+@@@ -904,10 -995,14 +912,13 @@@ err_create_counter
+  err_mod_hdr:
+  	mlx5_eswitch_del_vlan_action(esw, attr);
+  err_add_vlan:
+- 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT)
+- 		mlx5e_detach_encap(priv, flow);
++ 	for (out_index = 0; out_index < MLX5_MAX_FLOW_FWD_VPORTS; out_index++)
++ 		if (attr->dests[out_index].flags & MLX5_ESW_DEST_ENCAP) {
++ 			mlx5e_detach_encap(priv, flow);
++ 			break;
++ 		}
+  err_attach_encap:
+ -err_max_prio_chain:
+ -	return err;
+ +	return rule;
+  }
+  
+  static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
+@@@ -915,12 -1010,14 +926,17 @@@
+  {
+  	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+  	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5_esw_flow_attr slow_attr;
++ 	int out_index;
+++>>>>>>> f493f15534ec (net/mlx5e: Move flow attr reformat action bit to per dest flags)
+  
+  	if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
+ -		if (flow->flags & MLX5E_TC_FLOW_SLOW)
+ -			mlx5e_tc_unoffload_from_slow_path(esw, flow, &slow_attr);
+ -		else
+ -			mlx5e_tc_unoffload_fdb_rules(esw, flow, attr);
+ +		flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
+ +		if (attr->mirror_count)
+ +			mlx5_eswitch_del_fwd_rule(esw, flow->rule[1], attr);
+ +		mlx5_eswitch_del_offloaded_rule(esw, flow->rule[0], attr);
+  	}
+  
+  	mlx5_eswitch_del_vlan_action(esw, attr);
+@@@ -2661,21 -2476,30 +2681,34 @@@ static int parse_tc_fdb_actions(struct 
+  			if (switchdev_port_same_parent_id(priv->netdev,
+  							  out_dev) ||
+  			    is_merged_eswitch_dev(priv, out_dev)) {
+- 				action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+- 					  MLX5_FLOW_CONTEXT_ACTION_COUNT;
+  				out_priv = netdev_priv(out_dev);
+  				rpriv = out_priv->ppriv;
+ -				attr->dests[attr->out_count].rep = rpriv->rep;
+ -				attr->dests[attr->out_count].mdev = out_priv->mdev;
+ -				attr->out_count++;
+ +				attr->out_rep[attr->out_count] = rpriv->rep;
+ +				attr->out_mdev[attr->out_count++] = out_priv->mdev;
+  			} else if (encap) {
+  				parse_attr->mirred_ifindex = out_dev->ifindex;
+  				parse_attr->tun_info = *info;
+  				attr->parse_attr = parse_attr;
+++<<<<<<< HEAD
+ +				action |= MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT |
+ +					  MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+ +					  MLX5_FLOW_CONTEXT_ACTION_COUNT;
+ +				/* attr->out_rep is resolved when we handle encap */
+++=======
++ 				attr->dests[attr->out_count].flags |=
++ 					MLX5_ESW_DEST_ENCAP;
++ 				/* attr->dests[].rep is resolved when we
++ 				 * handle encap
++ 				 */
++ 			} else if (parse_attr->filter_dev != priv->netdev) {
++ 				/* All mlx5 devices are called to configure
++ 				 * high level device filters. Therefore, the
++ 				 * *attempt* to  install a filter on invalid
++ 				 * eswitch should not trigger an explicit error
++ 				 */
++ 				return -EINVAL;
+++>>>>>>> f493f15534ec (net/mlx5e: Move flow attr reformat action bit to per dest flags)
+  			} else {
+ -				NL_SET_ERR_MSG_MOD(extack,
+ -						   "devices are not on same switch HW, can't offload forwarding");
+  				pr_err("devices %s %s not on same switch HW, can't offload forwarding\n",
+  				       priv->netdev->name, out_dev->name);
+  				return -EINVAL;
+@@@ -2803,47 -2620,171 +2836,153 @@@ int mlx5e_configure_flower(struct mlx5e
+  	flow->flags = flow_flags;
+  	flow->priv = priv;
+  
+ -	*__flow = flow;
+ -	*__parse_attr = parse_attr;
+ -
+ -	return 0;
+ -
+ -err_free:
+ -	kfree(flow);
+ -	kvfree(parse_attr);
+ -	return err;
+ -}
+ +	err = parse_cls_flower(priv, flow, &parse_attr->spec, f);
+ +	if (err < 0)
+ +		goto err_free;
+  
+ -static int
+ -mlx5e_add_fdb_flow(struct mlx5e_priv *priv,
+ -		   struct tc_cls_flower_offload *f,
+ -		   u16 flow_flags,
+ -		   struct net_device *filter_dev,
+ -		   struct mlx5e_tc_flow **__flow)
+ -{
+ -	struct netlink_ext_ack *extack = f->common.extack;
+ -	struct mlx5e_tc_flow_parse_attr *parse_attr;
+ -	struct mlx5e_tc_flow *flow;
+ -	int attr_size, err;
+ +	if (flow->flags & MLX5E_TC_FLOW_ESWITCH) {
+ +		err = parse_tc_fdb_actions(priv, f->exts, parse_attr, flow);
+ +		if (err < 0)
+ +			goto err_free;
+ +		flow->rule[0] = mlx5e_tc_add_fdb_flow(priv, parse_attr, flow);
+ +	} else {
+ +		err = parse_tc_nic_actions(priv, f->exts, parse_attr, flow);
+ +		if (err < 0)
+ +			goto err_free;
+ +		flow->rule[0] = mlx5e_tc_add_nic_flow(priv, parse_attr, flow);
+ +	}
+  
+ -	flow_flags |= MLX5E_TC_FLOW_ESWITCH;
+ -	attr_size  = sizeof(struct mlx5_esw_flow_attr);
+ -	err = mlx5e_alloc_flow(priv, attr_size, f, flow_flags,
+ -			       &parse_attr, &flow);
+ -	if (err)
+ -		goto out;
+ -	parse_attr->filter_dev = filter_dev;
+ -	flow->esw_attr->parse_attr = parse_attr;
+ -	err = parse_cls_flower(flow->priv, flow, &parse_attr->spec,
+ -			       f, filter_dev);
+ -	if (err)
+ -		goto err_free;
+ +	if (IS_ERR(flow->rule[0])) {
+ +		err = PTR_ERR(flow->rule[0]);
+ +		if (err != -EAGAIN)
+ +			goto err_free;
+ +	}
+  
+ -	flow->esw_attr->chain = f->common.chain_index;
+ -	flow->esw_attr->prio = TC_H_MAJ(f->common.prio) >> 16;
+ -	err = parse_tc_fdb_actions(priv, f->exts, parse_attr, flow, extack);
+ -	if (err)
+ -		goto err_free;
+++<<<<<<< HEAD
+ +	if (err != -EAGAIN)
+ +		flow->flags |= MLX5E_TC_FLOW_OFFLOADED;
+  
+ -	err = mlx5e_tc_add_fdb_flow(priv, parse_attr, flow, extack);
+ -	if (err)
+ -		goto err_free;
+ +	if (!(flow->flags & MLX5E_TC_FLOW_ESWITCH) ||
+ +	    !(flow->esw_attr->action &
+ +	      MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT))
+ +		kvfree(parse_attr);
+  
+ +	err = rhashtable_insert_fast(tc_ht, &flow->node, tc_ht_params);
+ +	if (err) {
+ +		mlx5e_tc_del_flow(priv, flow);
+ +		kfree(flow);
+++=======
++ 	*__flow = flow;
++ 
++ 	return 0;
++ 
++ err_free:
++ 	kfree(flow);
++ 	kvfree(parse_attr);
++ out:
++ 	return err;
++ }
++ 
++ static int
++ mlx5e_add_nic_flow(struct mlx5e_priv *priv,
++ 		   struct tc_cls_flower_offload *f,
++ 		   u16 flow_flags,
++ 		   struct net_device *filter_dev,
++ 		   struct mlx5e_tc_flow **__flow)
++ {
++ 	struct netlink_ext_ack *extack = f->common.extack;
++ 	struct mlx5e_tc_flow_parse_attr *parse_attr;
++ 	struct mlx5e_tc_flow *flow;
++ 	int attr_size, err;
++ 
++ 	/* multi-chain not supported for NIC rules */
++ 	if (!tc_cls_can_offload_and_chain0(priv->netdev, &f->common))
++ 		return -EOPNOTSUPP;
++ 
++ 	flow_flags |= MLX5E_TC_FLOW_NIC;
++ 	attr_size  = sizeof(struct mlx5_nic_flow_attr);
++ 	err = mlx5e_alloc_flow(priv, attr_size, f, flow_flags,
++ 			       &parse_attr, &flow);
++ 	if (err)
++ 		goto out;
++ 
++ 	parse_attr->filter_dev = filter_dev;
++ 	err = parse_cls_flower(flow->priv, flow, &parse_attr->spec,
++ 			       f, filter_dev);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	err = parse_tc_nic_actions(priv, f->exts, parse_attr, flow, extack);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	err = mlx5e_tc_add_nic_flow(priv, parse_attr, flow, extack);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	flow->flags |= MLX5E_TC_FLOW_OFFLOADED;
++ 	kvfree(parse_attr);
++ 	*__flow = flow;
++ 
++ 	return 0;
++ 
++ err_free:
++ 	kfree(flow);
++ 	kvfree(parse_attr);
++ out:
++ 	return err;
++ }
++ 
++ static int
++ mlx5e_tc_add_flow(struct mlx5e_priv *priv,
++ 		  struct tc_cls_flower_offload *f,
++ 		  int flags,
++ 		  struct net_device *filter_dev,
++ 		  struct mlx5e_tc_flow **flow)
++ {
++ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++ 	u16 flow_flags;
++ 	int err;
++ 
++ 	get_flags(flags, &flow_flags);
++ 
++ 	if (!tc_can_offload_extack(priv->netdev, f->common.extack))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (esw && esw->mode == SRIOV_OFFLOADS)
++ 		err = mlx5e_add_fdb_flow(priv, f, flow_flags,
++ 					 filter_dev, flow);
++ 	else
++ 		err = mlx5e_add_nic_flow(priv, f, flow_flags,
++ 					 filter_dev, flow);
++ 
++ 	return err;
++ }
++ 
++ int mlx5e_configure_flower(struct net_device *dev, struct mlx5e_priv *priv,
++ 			   struct tc_cls_flower_offload *f, int flags)
++ {
++ 	struct netlink_ext_ack *extack = f->common.extack;
++ 	struct rhashtable *tc_ht = get_tc_ht(priv);
++ 	struct mlx5e_tc_flow *flow;
++ 	int err = 0;
++ 
++ 	flow = rhashtable_lookup_fast(tc_ht, &f->cookie, tc_ht_params);
++ 	if (flow) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "flow cookie already exists, ignoring");
++ 		netdev_warn_once(priv->netdev,
++ 				 "flow cookie %lx already exists, ignoring\n",
++ 				 f->cookie);
++ 		goto out;
+++>>>>>>> f493f15534ec (net/mlx5e: Move flow attr reformat action bit to per dest flags)
+  	}
+  
+ -	err = mlx5e_tc_add_flow(priv, f, flags, dev, &flow);
+ -	if (err)
+ -		goto out;
+ -
+ -	err = rhashtable_insert_fast(tc_ht, &flow->node, tc_ht_params);
+ -	if (err)
+ -		goto err_free;
+ -
+ -	return 0;
+ +	return err;
+  
+  err_free:
+ -	mlx5e_tc_del_flow(priv, flow);
+ +	kvfree(parse_attr);
+  	kfree(flow);
+ -out:
+  	return err;
+  }
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index de691a49ed92,39363d4662b3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -280,21 -281,29 +280,33 @@@ enum mlx5_flow_match_level 
+  /* current maximum for flow based vport multicasting */
+  #define MLX5_MAX_FLOW_FWD_VPORTS 2
+  
++ enum {
++ 	MLX5_ESW_DEST_ENCAP         = BIT(0),
++ };
++ 
+  struct mlx5_esw_flow_attr {
+  	struct mlx5_eswitch_rep *in_rep;
+ +	struct mlx5_eswitch_rep *out_rep[MLX5_MAX_FLOW_FWD_VPORTS];
+ +	struct mlx5_core_dev	*out_mdev[MLX5_MAX_FLOW_FWD_VPORTS];
+  	struct mlx5_core_dev	*in_mdev;
+  
+ -	int split_count;
+ +	int mirror_count;
+  	int out_count;
+  
+  	int	action;
+ -	__be16	vlan_proto[MLX5_FS_VLAN_DEPTH];
+ -	u16	vlan_vid[MLX5_FS_VLAN_DEPTH];
+ -	u8	vlan_prio[MLX5_FS_VLAN_DEPTH];
+ -	u8	total_vlan;
+ +	__be16	vlan_proto;
+ +	u16	vlan_vid;
+ +	u8	vlan_prio;
+  	bool	vlan_handled;
+  	u32	encap_id;
+++<<<<<<< HEAD
+++=======
++ 	struct {
++ 		u32 flags;
++ 		struct mlx5_eswitch_rep *rep;
++ 		struct mlx5_core_dev *mdev;
++ 	} dests[MLX5_MAX_FLOW_FWD_VPORTS];
+++>>>>>>> f493f15534ec (net/mlx5e: Move flow attr reformat action bit to per dest flags)
+  	u32	mod_hdr_id;
+  	u8	match_level;
+  	struct mlx5_fc *counter;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 828174ece8e4,0387b5068be6..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -159,10 -168,7 +163,14 @@@ mlx5_eswitch_add_offloaded_rule(struct 
+  	if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR)
+  		flow_act.modify_id = attr->mod_hdr_id;
+  
+++<<<<<<< HEAD
+ +	if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT)
+ +		flow_act.reformat_id = attr->encap_id;
+ +
+ +	fdb = esw_get_prio_table(esw, attr->chain, attr->prio, !!mirror);
+++=======
++ 	fdb = esw_get_prio_table(esw, attr->chain, attr->prio, !!split);
+++>>>>>>> f493f15534ec (net/mlx5e: Move flow attr reformat action bit to per dest flags)
+  	if (IS_ERR(fdb)) {
+  		rule = ERR_CAST(fdb);
+  		goto err_esw_get;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
