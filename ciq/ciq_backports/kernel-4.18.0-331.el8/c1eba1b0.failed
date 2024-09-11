@@ -1,0 +1,132 @@
+gfs2: Move lock flush locking to gfs2_trans_{begin,end}
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit c1eba1b0bca59316f34aa6f70fe5004abba8082d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/c1eba1b0.failed
+
+Move the read locking of sd_log_flush_lock from gfs2_log_reserve to
+gfs2_trans_begin, and its unlocking from gfs2_log_release to
+gfs2_trans_end.  Use gfs2_log_release in two places in which it was open
+coded before.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit c1eba1b0bca59316f34aa6f70fe5004abba8082d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+#	fs/gfs2/trans.c
+diff --cc fs/gfs2/log.c
+index 1a5aad0b1fab,e7183c84ffc0..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -442,15 -475,6 +435,18 @@@ retry
+  	 */
+  	if (unlikely(did_wait))
+  		wake_up(&sdp->sd_log_waitq);
+++<<<<<<< HEAD
+ +
+ +	down_read(&sdp->sd_log_flush_lock);
+ +	if (unlikely(!test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags))) {
+ +		gfs2_log_release(sdp, blks);
+ +		ret = -EROFS;
+ +	}
+ +	if (atomic_dec_and_test(&sdp->sd_reserving_log))
+ +		wake_up(&sdp->sd_reserving_log_wait);
+ +	return ret;
+++=======
+++>>>>>>> c1eba1b0bca5 (gfs2: Move lock flush locking to gfs2_trans_{begin,end})
+  }
+  
+  /**
+diff --cc fs/gfs2/trans.c
+index 35084a676633,2269aa7ad69d..000000000000
+--- a/fs/gfs2/trans.c
++++ b/fs/gfs2/trans.c
+@@@ -40,12 -37,10 +40,15 @@@ static void gfs2_print_trans(struct gfs
+  		tr->tr_num_revoke, tr->tr_num_revoke_rm);
+  }
+  
+ -int __gfs2_trans_begin(struct gfs2_trans *tr, struct gfs2_sbd *sdp,
+ -		       unsigned int blocks, unsigned int revokes,
+ -		       unsigned long ip)
+ +int gfs2_trans_begin(struct gfs2_sbd *sdp, unsigned int blocks,
+ +		     unsigned int revokes)
+  {
+++<<<<<<< HEAD
+ +	struct gfs2_trans *tr;
+ +	int error;
+ +
+++=======
+++>>>>>>> c1eba1b0bca5 (gfs2: Move lock flush locking to gfs2_trans_{begin,end})
+  	if (current->journal_info) {
+  		gfs2_print_trans(sdp, current->journal_info);
+  		BUG();
+@@@ -72,12 -61,24 +75,28 @@@
+  	INIT_LIST_HEAD(&tr->tr_databuf);
+  	INIT_LIST_HEAD(&tr->tr_buf);
+  	INIT_LIST_HEAD(&tr->tr_list);
+ -	INIT_LIST_HEAD(&tr->tr_ail1_list);
+ -	INIT_LIST_HEAD(&tr->tr_ail2_list);
+  
++ 	if (gfs2_assert_warn(sdp, tr->tr_reserved <= sdp->sd_jdesc->jd_blocks))
++ 		return -EINVAL;
++ 
+  	sb_start_intwrite(sdp->sd_vfs);
+  
+++<<<<<<< HEAD
+ +	error = gfs2_log_reserve(sdp, tr->tr_reserved);
+ +	if (error)
+ +		goto fail;
+++=======
++ 	gfs2_log_reserve(sdp, tr->tr_reserved);
++ 
++ 	down_read(&sdp->sd_log_flush_lock);
++ 	if (unlikely(!test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags))) {
++ 		gfs2_log_release(sdp, tr->tr_reserved);
++ 		up_read(&sdp->sd_log_flush_lock);
++ 		sb_end_intwrite(sdp->sd_vfs);
++ 		wake_up(&sdp->sd_log_waitq);
++ 		return -EROFS;
++ 	}
+++>>>>>>> c1eba1b0bca5 (gfs2: Move lock flush locking to gfs2_trans_{begin,end})
+  
+  	current->journal_info = tr;
+  
+@@@ -100,10 -109,10 +119,17 @@@ void gfs2_trans_end(struct gfs2_sbd *sd
+  
+  	if (!test_bit(TR_TOUCHED, &tr->tr_flags)) {
+  		gfs2_log_release(sdp, tr->tr_reserved);
+++<<<<<<< HEAD
+ +		if (alloced) {
+ +			kfree(tr);
+ +			sb_end_intwrite(sdp->sd_vfs);
+ +		}
+++=======
++ 		up_read(&sdp->sd_log_flush_lock);
++ 		if (!test_bit(TR_ONSTACK, &tr->tr_flags))
++ 			gfs2_trans_free(sdp, tr);
++ 		sb_end_intwrite(sdp->sd_vfs);
+++>>>>>>> c1eba1b0bca5 (gfs2: Move lock flush locking to gfs2_trans_{begin,end})
+  		return;
+  	}
+  
+* Unmerged path fs/gfs2/log.c
+diff --git a/fs/gfs2/log.h b/fs/gfs2/log.h
+index 0fb59261f18d..b1c70fa7031b 100644
+--- a/fs/gfs2/log.h
++++ b/fs/gfs2/log.h
+@@ -69,7 +69,7 @@ extern unsigned int gfs2_struct2blk(struct gfs2_sbd *sdp, unsigned int nstruct,
+ 
+ extern void gfs2_remove_from_ail(struct gfs2_bufdata *bd);
+ extern void gfs2_log_release(struct gfs2_sbd *sdp, unsigned int blks);
+-extern int gfs2_log_reserve(struct gfs2_sbd *sdp, unsigned int blks);
++extern void gfs2_log_reserve(struct gfs2_sbd *sdp, unsigned int blks);
+ extern void gfs2_write_log_header(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
+ 				  u64 seq, u32 tail, u32 lblock, u32 flags,
+ 				  int op_flags);
+* Unmerged path fs/gfs2/trans.c
