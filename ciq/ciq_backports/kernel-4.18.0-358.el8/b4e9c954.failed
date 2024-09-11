@@ -1,0 +1,193 @@
+introduction of regset ->get() wrappers, switching ELF coredumps to those
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit b4e9c9549f62329d2412f899635fddc5212b9cd4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b4e9c954.failed
+
+Two new helpers: given a process and regset, dump into a buffer.
+regset_get() takes a buffer and size, regset_get_alloc() takes size
+and allocates a buffer.
+
+Return value in both cases is the amount of data actually dumped in
+case of success or -E...  on error.
+
+In both cases the size is capped by regset->n * regset->size, so
+->get() is called with offset 0 and size no more than what regset
+expects.
+
+binfmt_elf.c callers of ->get() are switched to using those; the other
+caller (copy_regset_to_user()) will need some preparations to switch.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit b4e9c9549f62329d2412f899635fddc5212b9cd4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/binfmt_elf.c
+#	kernel/Makefile
+diff --cc fs/binfmt_elf.c
+index c9fdad31fb37,e922a6abdca8..000000000000
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@@ -1761,32 -1848,28 +1763,56 @@@ static int fill_thread_core_info(struc
+  	 */
+  	for (i = 1; i < view->n; ++i) {
+  		const struct user_regset *regset = &view->regsets[i];
++ 		int note_type = regset->core_note_type;
++ 		bool is_fpreg = note_type == NT_PRFPREG;
++ 		void *data;
++ 		int ret;
++ 
+  		do_thread_regset_writeback(t->task, regset);
+++<<<<<<< HEAD
+ +		if (regset->core_note_type && regset->get &&
+ +		    (!regset->active || regset->active(t->task, regset))) {
+ +			int ret;
+ +			size_t size = regset_size(t->task, regset);
+ +			void *data = kzalloc(size, GFP_KERNEL);
+ +			if (unlikely(!data))
+ +				return 0;
+ +			ret = regset->get(t->task, regset,
+ +					  0, size, data, NULL);
+ +			if (unlikely(ret))
+ +				kfree(data);
+ +			else {
+ +				if (regset->core_note_type != NT_PRFPREG)
+ +					fill_note(&t->notes[i], "LINUX",
+ +						  regset->core_note_type,
+ +						  size, data);
+ +				else {
+ +					SET_PR_FPVALID(&t->prstatus,
+ +							1, regset0_size);
+ +					fill_note(&t->notes[i], "CORE",
+ +						  NT_PRFPREG, size, data);
+ +				}
+ +				*total += notesize(&t->notes[i]);
+ +			}
+ +		}
+++=======
++ 		if (!note_type) // not for coredumps
++ 			continue;
++ 		if (regset->active && regset->active(t->task, regset) <= 0)
++ 			continue;
++ 
++ 		ret = regset_get_alloc(t->task, regset, ~0U, &data);
++ 		if (ret < 0)
++ 			continue;
++ 
++ 		if (is_fpreg)
++ 			SET_PR_FPVALID(&t->prstatus, 1, regset0_size);
++ 
++ 		fill_note(&t->notes[i], is_fpreg ? "CORE" : "LINUX",
++ 			  note_type, ret, data);
++ 
++ 		*total += notesize(&t->notes[i]);
+++>>>>>>> b4e9c9549f62 (introduction of regset ->get() wrappers, switching ELF coredumps to those)
+  	}
+  
+  	return 1;
+diff --cc kernel/Makefile
+index aaddcc060052,e6e03380a0f1..000000000000
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@@ -10,10 -10,8 +10,14 @@@ obj-y     = fork.o exec_domain.o panic.
+  	    extable.o params.o \
+  	    kthread.o sys_ni.o nsproxy.o \
+  	    notifier.o ksysfs.o cred.o reboot.o \
+++<<<<<<< HEAD
+ +	    async.o range.o smpboot.o ucount.o \
+ +	    rh_taint.o rh_features.o
+++=======
++ 	    async.o range.o smpboot.o ucount.o regset.o
+++>>>>>>> b4e9c9549f62 (introduction of regset ->get() wrappers, switching ELF coredumps to those)
+  
+ +obj-$(CONFIG_USERMODE_DRIVER) += usermode_driver.o
+  obj-$(CONFIG_MODULES) += kmod.o
+  obj-$(CONFIG_MULTIUSER) += groups.o
+  
+* Unmerged path fs/binfmt_elf.c
+diff --git a/include/linux/regset.h b/include/linux/regset.h
+index 148d174ef250..6d8179c567f5 100644
+--- a/include/linux/regset.h
++++ b/include/linux/regset.h
+@@ -356,6 +356,15 @@ static inline int user_regset_copyin_ignore(unsigned int *pos,
+ 	return 0;
+ }
+ 
++extern int regset_get(struct task_struct *target,
++		      const struct user_regset *regset,
++		      unsigned int size, void *data);
++
++extern int regset_get_alloc(struct task_struct *target,
++			    const struct user_regset *regset,
++			    unsigned int size,
++			    void **data);
++
+ /**
+  * copy_regset_to_user - fetch a thread's user_regset data into user memory
+  * @target:	thread to be examined
+* Unmerged path kernel/Makefile
+diff --git a/kernel/regset.c b/kernel/regset.c
+new file mode 100644
+index 000000000000..6b39fa0993ec
+--- /dev/null
++++ b/kernel/regset.c
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/export.h>
++#include <linux/slab.h>
++#include <linux/regset.h>
++
++static int __regset_get(struct task_struct *target,
++			const struct user_regset *regset,
++			unsigned int size,
++			void **data)
++{
++	void *p = *data, *to_free = NULL;
++	int res;
++
++	if (!regset->get)
++		return -EOPNOTSUPP;
++	if (size > regset->n * regset->size)
++		size = regset->n * regset->size;
++	if (!p) {
++		to_free = p = kzalloc(size, GFP_KERNEL);
++		if (!p)
++			return -ENOMEM;
++	}
++	res = regset->get(target, regset, 0, size, p, NULL);
++	if (unlikely(res < 0)) {
++		kfree(to_free);
++		return res;
++	}
++	*data = p;
++	if (regset->get_size) { // arm64-only kludge, will go away
++		unsigned max_size = regset->get_size(target, regset);
++		if (size > max_size)
++			size = max_size;
++	}
++	return size;
++}
++
++int regset_get(struct task_struct *target,
++	       const struct user_regset *regset,
++	       unsigned int size,
++	       void *data)
++{
++	return __regset_get(target, regset, size, &data);
++}
++EXPORT_SYMBOL(regset_get);
++
++int regset_get_alloc(struct task_struct *target,
++		     const struct user_regset *regset,
++		     unsigned int size,
++		     void **data)
++{
++	*data = NULL;
++	return __regset_get(target, regset, size, data);
++}
++EXPORT_SYMBOL(regset_get_alloc);
