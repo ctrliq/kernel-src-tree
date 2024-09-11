@@ -1,0 +1,370 @@
+io_uring: fix io_kiocb.flags modification race in IOPOLL mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+commit 65a6543da386838f935d2f03f452c5c0acff2a68
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/65a6543d.failed
+
+While testing io_uring in arm, we found sometimes io_sq_thread() keeps
+polling io requests even though there are not inflight io requests in
+block layer. After some investigations, found a possible race about
+io_kiocb.flags, see below race codes:
+  1) in the end of io_write() or io_read()
+    req->flags &= ~REQ_F_NEED_CLEANUP;
+    kfree(iovec);
+    return ret;
+
+  2) in io_complete_rw_iopoll()
+    if (res != -EAGAIN)
+        req->flags |= REQ_F_IOPOLL_COMPLETED;
+
+In IOPOLL mode, io requests still maybe completed by interrupt, then
+above codes are not safe, concurrent modifications to req->flags, which
+is not protected by lock or is not atomic modifications. I also had
+disassemble io_complete_rw_iopoll() in arm:
+   req->flags |= REQ_F_IOPOLL_COMPLETED;
+   0xffff000008387b18 <+76>:    ldr     w0, [x19,#104]
+   0xffff000008387b1c <+80>:    orr     w0, w0, #0x1000
+   0xffff000008387b20 <+84>:    str     w0, [x19,#104]
+
+Seems that the "req->flags |= REQ_F_IOPOLL_COMPLETED;" is  load and
+modification, two instructions, which obviously is not atomic.
+
+To fix this issue, add a new iopoll_completed in io_kiocb to indicate
+whether io request is completed.
+
+	Signed-off-by: Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 65a6543da386838f935d2f03f452c5c0acff2a68)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 0b681a205810,61fca5afaac8..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -308,6 -356,256 +308,259 @@@ struct io_poll_iocb 
+  	struct wait_queue_entry		wait;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct io_close {
++ 	struct file			*file;
++ 	struct file			*put_file;
++ 	int				fd;
++ };
++ 
++ struct io_timeout_data {
++ 	struct io_kiocb			*req;
++ 	struct hrtimer			timer;
++ 	struct timespec64		ts;
++ 	enum hrtimer_mode		mode;
++ };
++ 
++ struct io_accept {
++ 	struct file			*file;
++ 	struct sockaddr __user		*addr;
++ 	int __user			*addr_len;
++ 	int				flags;
++ 	unsigned long			nofile;
++ };
++ 
++ struct io_sync {
++ 	struct file			*file;
++ 	loff_t				len;
++ 	loff_t				off;
++ 	int				flags;
++ 	int				mode;
++ };
++ 
++ struct io_cancel {
++ 	struct file			*file;
++ 	u64				addr;
++ };
++ 
++ struct io_timeout {
++ 	struct file			*file;
++ 	u64				addr;
++ 	int				flags;
++ 	u32				off;
++ 	u32				target_seq;
++ };
++ 
++ struct io_rw {
++ 	/* NOTE: kiocb has the file as the first member, so don't do it here */
++ 	struct kiocb			kiocb;
++ 	u64				addr;
++ 	u64				len;
++ };
++ 
++ struct io_connect {
++ 	struct file			*file;
++ 	struct sockaddr __user		*addr;
++ 	int				addr_len;
++ };
++ 
++ struct io_sr_msg {
++ 	struct file			*file;
++ 	union {
++ 		struct user_msghdr __user *msg;
++ 		void __user		*buf;
++ 	};
++ 	int				msg_flags;
++ 	int				bgid;
++ 	size_t				len;
++ 	struct io_buffer		*kbuf;
++ };
++ 
++ struct io_open {
++ 	struct file			*file;
++ 	int				dfd;
++ 	struct filename			*filename;
++ 	struct open_how			how;
++ 	unsigned long			nofile;
++ };
++ 
++ struct io_files_update {
++ 	struct file			*file;
++ 	u64				arg;
++ 	u32				nr_args;
++ 	u32				offset;
++ };
++ 
++ struct io_fadvise {
++ 	struct file			*file;
++ 	u64				offset;
++ 	u32				len;
++ 	u32				advice;
++ };
++ 
++ struct io_madvise {
++ 	struct file			*file;
++ 	u64				addr;
++ 	u32				len;
++ 	u32				advice;
++ };
++ 
++ struct io_epoll {
++ 	struct file			*file;
++ 	int				epfd;
++ 	int				op;
++ 	int				fd;
++ 	struct epoll_event		event;
++ };
++ 
++ struct io_splice {
++ 	struct file			*file_out;
++ 	struct file			*file_in;
++ 	loff_t				off_out;
++ 	loff_t				off_in;
++ 	u64				len;
++ 	unsigned int			flags;
++ };
++ 
++ struct io_provide_buf {
++ 	struct file			*file;
++ 	__u64				addr;
++ 	__s32				len;
++ 	__u32				bgid;
++ 	__u16				nbufs;
++ 	__u16				bid;
++ };
++ 
++ struct io_statx {
++ 	struct file			*file;
++ 	int				dfd;
++ 	unsigned int			mask;
++ 	unsigned int			flags;
++ 	const char __user		*filename;
++ 	struct statx __user		*buffer;
++ };
++ 
++ struct io_async_connect {
++ 	struct sockaddr_storage		address;
++ };
++ 
++ struct io_async_msghdr {
++ 	struct iovec			fast_iov[UIO_FASTIOV];
++ 	struct iovec			*iov;
++ 	struct sockaddr __user		*uaddr;
++ 	struct msghdr			msg;
++ 	struct sockaddr_storage		addr;
++ };
++ 
++ struct io_async_rw {
++ 	struct iovec			fast_iov[UIO_FASTIOV];
++ 	struct iovec			*iov;
++ 	ssize_t				nr_segs;
++ 	ssize_t				size;
++ };
++ 
++ struct io_async_ctx {
++ 	union {
++ 		struct io_async_rw	rw;
++ 		struct io_async_msghdr	msg;
++ 		struct io_async_connect	connect;
++ 		struct io_timeout_data	timeout;
++ 	};
++ };
++ 
++ enum {
++ 	REQ_F_FIXED_FILE_BIT	= IOSQE_FIXED_FILE_BIT,
++ 	REQ_F_IO_DRAIN_BIT	= IOSQE_IO_DRAIN_BIT,
++ 	REQ_F_LINK_BIT		= IOSQE_IO_LINK_BIT,
++ 	REQ_F_HARDLINK_BIT	= IOSQE_IO_HARDLINK_BIT,
++ 	REQ_F_FORCE_ASYNC_BIT	= IOSQE_ASYNC_BIT,
++ 	REQ_F_BUFFER_SELECT_BIT	= IOSQE_BUFFER_SELECT_BIT,
++ 
++ 	REQ_F_LINK_HEAD_BIT,
++ 	REQ_F_LINK_NEXT_BIT,
++ 	REQ_F_FAIL_LINK_BIT,
++ 	REQ_F_INFLIGHT_BIT,
++ 	REQ_F_CUR_POS_BIT,
++ 	REQ_F_NOWAIT_BIT,
++ 	REQ_F_LINK_TIMEOUT_BIT,
++ 	REQ_F_TIMEOUT_BIT,
++ 	REQ_F_ISREG_BIT,
++ 	REQ_F_MUST_PUNT_BIT,
++ 	REQ_F_TIMEOUT_NOSEQ_BIT,
++ 	REQ_F_COMP_LOCKED_BIT,
++ 	REQ_F_NEED_CLEANUP_BIT,
++ 	REQ_F_OVERFLOW_BIT,
++ 	REQ_F_POLLED_BIT,
++ 	REQ_F_BUFFER_SELECTED_BIT,
++ 	REQ_F_NO_FILE_TABLE_BIT,
++ 	REQ_F_QUEUE_TIMEOUT_BIT,
++ 	REQ_F_WORK_INITIALIZED_BIT,
++ 
++ 	/* not a real bit, just to check we're not overflowing the space */
++ 	__REQ_F_LAST_BIT,
++ };
++ 
++ enum {
++ 	/* ctx owns file */
++ 	REQ_F_FIXED_FILE	= BIT(REQ_F_FIXED_FILE_BIT),
++ 	/* drain existing IO first */
++ 	REQ_F_IO_DRAIN		= BIT(REQ_F_IO_DRAIN_BIT),
++ 	/* linked sqes */
++ 	REQ_F_LINK		= BIT(REQ_F_LINK_BIT),
++ 	/* doesn't sever on completion < 0 */
++ 	REQ_F_HARDLINK		= BIT(REQ_F_HARDLINK_BIT),
++ 	/* IOSQE_ASYNC */
++ 	REQ_F_FORCE_ASYNC	= BIT(REQ_F_FORCE_ASYNC_BIT),
++ 	/* IOSQE_BUFFER_SELECT */
++ 	REQ_F_BUFFER_SELECT	= BIT(REQ_F_BUFFER_SELECT_BIT),
++ 
++ 	/* head of a link */
++ 	REQ_F_LINK_HEAD		= BIT(REQ_F_LINK_HEAD_BIT),
++ 	/* already grabbed next link */
++ 	REQ_F_LINK_NEXT		= BIT(REQ_F_LINK_NEXT_BIT),
++ 	/* fail rest of links */
++ 	REQ_F_FAIL_LINK		= BIT(REQ_F_FAIL_LINK_BIT),
++ 	/* on inflight list */
++ 	REQ_F_INFLIGHT		= BIT(REQ_F_INFLIGHT_BIT),
++ 	/* read/write uses file position */
++ 	REQ_F_CUR_POS		= BIT(REQ_F_CUR_POS_BIT),
++ 	/* must not punt to workers */
++ 	REQ_F_NOWAIT		= BIT(REQ_F_NOWAIT_BIT),
++ 	/* has linked timeout */
++ 	REQ_F_LINK_TIMEOUT	= BIT(REQ_F_LINK_TIMEOUT_BIT),
++ 	/* timeout request */
++ 	REQ_F_TIMEOUT		= BIT(REQ_F_TIMEOUT_BIT),
++ 	/* regular file */
++ 	REQ_F_ISREG		= BIT(REQ_F_ISREG_BIT),
++ 	/* must be punted even for NONBLOCK */
++ 	REQ_F_MUST_PUNT		= BIT(REQ_F_MUST_PUNT_BIT),
++ 	/* no timeout sequence */
++ 	REQ_F_TIMEOUT_NOSEQ	= BIT(REQ_F_TIMEOUT_NOSEQ_BIT),
++ 	/* completion under lock */
++ 	REQ_F_COMP_LOCKED	= BIT(REQ_F_COMP_LOCKED_BIT),
++ 	/* needs cleanup */
++ 	REQ_F_NEED_CLEANUP	= BIT(REQ_F_NEED_CLEANUP_BIT),
++ 	/* in overflow list */
++ 	REQ_F_OVERFLOW		= BIT(REQ_F_OVERFLOW_BIT),
++ 	/* already went through poll handler */
++ 	REQ_F_POLLED		= BIT(REQ_F_POLLED_BIT),
++ 	/* buffer already selected */
++ 	REQ_F_BUFFER_SELECTED	= BIT(REQ_F_BUFFER_SELECTED_BIT),
++ 	/* doesn't need file table for this request */
++ 	REQ_F_NO_FILE_TABLE	= BIT(REQ_F_NO_FILE_TABLE_BIT),
++ 	/* needs to queue linked timeout */
++ 	REQ_F_QUEUE_TIMEOUT	= BIT(REQ_F_QUEUE_TIMEOUT_BIT),
++ 	/* io_wq_work is initialized */
++ 	REQ_F_WORK_INITIALIZED	= BIT(REQ_F_WORK_INITIALIZED_BIT),
++ };
++ 
++ struct async_poll {
++ 	struct io_poll_iocb	poll;
++ 	struct io_wq_work	work;
++ };
++ 
+++>>>>>>> 65a6543da386 (io_uring: fix io_kiocb.flags modification race in IOPOLL mode)
+  /*
+   * NOTE! Each of the iocb union members has the file pointer
+   * as the first entry in their struct definition. So you can
+@@@ -317,11 -615,32 +570,21 @@@
+  struct io_kiocb {
+  	union {
+  		struct file		*file;
+ -		struct io_rw		rw;
+ +		struct kiocb		rw;
+  		struct io_poll_iocb	poll;
+ -		struct io_accept	accept;
+ -		struct io_sync		sync;
+ -		struct io_cancel	cancel;
+ -		struct io_timeout	timeout;
+ -		struct io_connect	connect;
+ -		struct io_sr_msg	sr_msg;
+ -		struct io_open		open;
+ -		struct io_close		close;
+ -		struct io_files_update	files_update;
+ -		struct io_fadvise	fadvise;
+ -		struct io_madvise	madvise;
+ -		struct io_epoll		epoll;
+ -		struct io_splice	splice;
+ -		struct io_provide_buf	pbuf;
+ -		struct io_statx		statx;
+  	};
+  
+++<<<<<<< HEAD
+ +	struct sqe_submit	submit;
+++=======
++ 	struct io_async_ctx		*io;
++ 	int				cflags;
++ 	u8				opcode;
++ 	/* polled IO has completed */
++ 	u8				iopoll_completed;
++ 
++ 	u16				buf_index;
+++>>>>>>> 65a6543da386 (io_uring: fix io_kiocb.flags modification race in IOPOLL mode)
+  
+  	struct io_ring_ctx	*ctx;
+  	struct list_head	list;
+@@@ -932,15 -1969,16 +1195,15 @@@ static void io_complete_rw(struct kioc
+  
+  static void io_complete_rw_iopoll(struct kiocb *kiocb, long res, long res2)
+  {
+ -	struct io_kiocb *req = container_of(kiocb, struct io_kiocb, rw.kiocb);
+ +	struct io_kiocb *req = container_of(kiocb, struct io_kiocb, rw);
+  
+ -	if (kiocb->ki_flags & IOCB_WRITE)
+ -		kiocb_end_write(req);
+ +	kiocb_end_write(kiocb);
+  
+ -	if (res != req->result)
+ -		req_set_fail_links(req);
+ +	if ((req->flags & REQ_F_LINK) && res != req->result)
+ +		req->flags |= REQ_F_FAIL_LINK;
+  	req->result = res;
+  	if (res != -EAGAIN)
+- 		req->flags |= REQ_F_IOPOLL_COMPLETED;
++ 		WRITE_ONCE(req->iopoll_completed, 1);
+  }
+  
+  /*
+* Unmerged path fs/io_uring.c
