@@ -1,0 +1,384 @@
+io_uring: introduce req_need_defer()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Bob Liu <bob.liu@oracle.com>
+commit 9d858b21483981db9c0cb4b184d4cdeb4bc525c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/9d858b21.failed
+
+Makes the code easier to read.
+
+	Signed-off-by: Bob Liu <bob.liu@oracle.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 9d858b21483981db9c0cb4b184d4cdeb4bc525c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index f656b9c7fa46,9500780bcaea..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -424,27 -435,54 +424,61 @@@ static struct io_ring_ctx *io_ring_ctx_
+  	INIT_LIST_HEAD(&ctx->poll_list);
+  	INIT_LIST_HEAD(&ctx->cancel_list);
+  	INIT_LIST_HEAD(&ctx->defer_list);
+ -	INIT_LIST_HEAD(&ctx->timeout_list);
+ -	init_waitqueue_head(&ctx->inflight_wait);
+ -	spin_lock_init(&ctx->inflight_lock);
+ -	INIT_LIST_HEAD(&ctx->inflight_list);
+  	return ctx;
+ -err:
+ -	if (ctx->fallback_req)
+ -		kmem_cache_free(req_cachep, ctx->fallback_req);
+ -	kfree(ctx->completions);
+ -	kfree(ctx);
+ -	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static inline bool io_sequence_defer(struct io_ring_ctx *ctx,
+ +				     struct io_kiocb *req)
+++=======
++ static inline bool __req_need_defer(struct io_kiocb *req)
+  {
+- 	if ((req->flags & (REQ_F_IO_DRAIN|REQ_F_IO_DRAINED)) != REQ_F_IO_DRAIN)
+- 		return false;
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 
++ 	return req->sequence != ctx->cached_cq_tail + ctx->cached_sq_dropped
++ 					+ atomic_read(&ctx->cached_cq_overflow);
++ }
++ 
++ static inline bool req_need_defer(struct io_kiocb *req)
+++>>>>>>> 9d858b214839 (io_uring: introduce req_need_defer())
++ {
++ 	if ((req->flags & (REQ_F_IO_DRAIN|REQ_F_IO_DRAINED)) == REQ_F_IO_DRAIN)
++ 		return __req_need_defer(req);
+  
+++<<<<<<< HEAD
+ +	return req->sequence != ctx->cached_cq_tail + ctx->sq_ring->dropped;
+++=======
++ 	return false;
+++>>>>>>> 9d858b214839 (io_uring: introduce req_need_defer())
+  }
+  
+  static struct io_kiocb *io_get_deferred_req(struct io_ring_ctx *ctx)
+  {
+  	struct io_kiocb *req;
+  
+++<<<<<<< HEAD
+ +	if (list_empty(&ctx->defer_list))
+ +		return NULL;
+ +
+ +	req = list_first_entry(&ctx->defer_list, struct io_kiocb, list);
+ +	if (!io_sequence_defer(ctx, req)) {
+++=======
++ 	req = list_first_entry_or_null(&ctx->defer_list, struct io_kiocb, list);
++ 	if (req && !req_need_defer(req)) {
++ 		list_del_init(&req->list);
++ 		return req;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static struct io_kiocb *io_get_timeout_req(struct io_ring_ctx *ctx)
++ {
++ 	struct io_kiocb *req;
++ 
++ 	req = list_first_entry_or_null(&ctx->timeout_list, struct io_kiocb, list);
++ 	if (req && !__req_need_defer(req)) {
+++>>>>>>> 9d858b214839 (io_uring: introduce req_need_defer())
+  		list_del_init(&req->list);
+  		return req;
+  	}
+@@@ -1838,12 -2177,267 +1872,17 @@@ static int io_poll_add(struct io_kiocb 
+  	return ipt.error;
+  }
+  
+ -static enum hrtimer_restart io_timeout_fn(struct hrtimer *timer)
+ -{
+ -	struct io_ring_ctx *ctx;
+ -	struct io_kiocb *req;
+ -	unsigned long flags;
+ -
+ -	req = container_of(timer, struct io_kiocb, timeout.timer);
+ -	ctx = req->ctx;
+ -	atomic_inc(&ctx->cq_timeouts);
+ -
+ -	spin_lock_irqsave(&ctx->completion_lock, flags);
+ -	/*
+ -	 * We could be racing with timeout deletion. If the list is empty,
+ -	 * then timeout lookup already found it and will be handling it.
+ -	 */
+ -	if (!list_empty(&req->list)) {
+ -		struct io_kiocb *prev;
+ -
+ -		/*
+ -		 * Adjust the reqs sequence before the current one because it
+ -		 * will consume a slot in the cq_ring and the the cq_tail
+ -		 * pointer will be increased, otherwise other timeout reqs may
+ -		 * return in advance without waiting for enough wait_nr.
+ -		 */
+ -		prev = req;
+ -		list_for_each_entry_continue_reverse(prev, &ctx->timeout_list, list)
+ -			prev->sequence++;
+ -		list_del_init(&req->list);
+ -	}
+ -
+ -	io_cqring_fill_event(req, -ETIME);
+ -	io_commit_cqring(ctx);
+ -	spin_unlock_irqrestore(&ctx->completion_lock, flags);
+ -
+ -	io_cqring_ev_posted(ctx);
+ -	if (req->flags & REQ_F_LINK)
+ -		req->flags |= REQ_F_FAIL_LINK;
+ -	io_put_req(req);
+ -	return HRTIMER_NORESTART;
+ -}
+ -
+ -static int io_timeout_cancel(struct io_ring_ctx *ctx, __u64 user_data)
+ -{
+ -	struct io_kiocb *req;
+ -	int ret = -ENOENT;
+ -
+ -	list_for_each_entry(req, &ctx->timeout_list, list) {
+ -		if (user_data == req->user_data) {
+ -			list_del_init(&req->list);
+ -			ret = 0;
+ -			break;
+ -		}
+ -	}
+ -
+ -	if (ret == -ENOENT)
+ -		return ret;
+ -
+ -	ret = hrtimer_try_to_cancel(&req->timeout.timer);
+ -	if (ret == -1)
+ -		return -EALREADY;
+ -
+ -	io_cqring_fill_event(req, -ECANCELED);
+ -	io_put_req(req);
+ -	return 0;
+ -}
+ -
+ -/*
+ - * Remove or update an existing timeout command
+ - */
+ -static int io_timeout_remove(struct io_kiocb *req,
+ -			     const struct io_uring_sqe *sqe)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	unsigned flags;
+ -	int ret;
+ -
+ -	if (unlikely(ctx->flags & IORING_SETUP_IOPOLL))
+ -		return -EINVAL;
+ -	if (sqe->flags || sqe->ioprio || sqe->buf_index || sqe->len)
+ -		return -EINVAL;
+ -	flags = READ_ONCE(sqe->timeout_flags);
+ -	if (flags)
+ -		return -EINVAL;
+ -
+ -	spin_lock_irq(&ctx->completion_lock);
+ -	ret = io_timeout_cancel(ctx, READ_ONCE(sqe->addr));
+ -
+ -	io_cqring_fill_event(req, ret);
+ -	io_commit_cqring(ctx);
+ -	spin_unlock_irq(&ctx->completion_lock);
+ -	io_cqring_ev_posted(ctx);
+ -	if (ret < 0 && req->flags & REQ_F_LINK)
+ -		req->flags |= REQ_F_FAIL_LINK;
+ -	io_put_req(req);
+ -	return 0;
+ -}
+ -
+ -static int io_timeout(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ -{
+ -	unsigned count;
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	struct list_head *entry;
+ -	enum hrtimer_mode mode;
+ -	struct timespec64 ts;
+ -	unsigned span = 0;
+ -	unsigned flags;
+ -
+ -	if (unlikely(ctx->flags & IORING_SETUP_IOPOLL))
+ -		return -EINVAL;
+ -	if (sqe->flags || sqe->ioprio || sqe->buf_index || sqe->len != 1)
+ -		return -EINVAL;
+ -	flags = READ_ONCE(sqe->timeout_flags);
+ -	if (flags & ~IORING_TIMEOUT_ABS)
+ -		return -EINVAL;
+ -
+ -	if (get_timespec64(&ts, u64_to_user_ptr(sqe->addr)))
+ -		return -EFAULT;
+ -
+ -	if (flags & IORING_TIMEOUT_ABS)
+ -		mode = HRTIMER_MODE_ABS;
+ -	else
+ -		mode = HRTIMER_MODE_REL;
+ -
+ -	hrtimer_init(&req->timeout.timer, CLOCK_MONOTONIC, mode);
+ -
+ -	/*
+ -	 * sqe->off holds how many events that need to occur for this
+ -	 * timeout event to be satisfied.
+ -	 */
+ -	count = READ_ONCE(sqe->off);
+ -	if (!count)
+ -		count = 1;
+ -
+ -	req->sequence = ctx->cached_sq_head + count - 1;
+ -	/* reuse it to store the count */
+ -	req->submit.sequence = count;
+ -	req->flags |= REQ_F_TIMEOUT;
+ -
+ -	/*
+ -	 * Insertion sort, ensuring the first entry in the list is always
+ -	 * the one we need first.
+ -	 */
+ -	spin_lock_irq(&ctx->completion_lock);
+ -	list_for_each_prev(entry, &ctx->timeout_list) {
+ -		struct io_kiocb *nxt = list_entry(entry, struct io_kiocb, list);
+ -		unsigned nxt_sq_head;
+ -		long long tmp, tmp_nxt;
+ -
+ -		/*
+ -		 * Since cached_sq_head + count - 1 can overflow, use type long
+ -		 * long to store it.
+ -		 */
+ -		tmp = (long long)ctx->cached_sq_head + count - 1;
+ -		nxt_sq_head = nxt->sequence - nxt->submit.sequence + 1;
+ -		tmp_nxt = (long long)nxt_sq_head + nxt->submit.sequence - 1;
+ -
+ -		/*
+ -		 * cached_sq_head may overflow, and it will never overflow twice
+ -		 * once there is some timeout req still be valid.
+ -		 */
+ -		if (ctx->cached_sq_head < nxt_sq_head)
+ -			tmp += UINT_MAX;
+ -
+ -		if (tmp > tmp_nxt)
+ -			break;
+ -
+ -		/*
+ -		 * Sequence of reqs after the insert one and itself should
+ -		 * be adjusted because each timeout req consumes a slot.
+ -		 */
+ -		span++;
+ -		nxt->sequence++;
+ -	}
+ -	req->sequence -= span;
+ -	list_add(&req->list, entry);
+ -	req->timeout.timer.function = io_timeout_fn;
+ -	hrtimer_start(&req->timeout.timer, timespec64_to_ktime(ts), mode);
+ -	spin_unlock_irq(&ctx->completion_lock);
+ -	return 0;
+ -}
+ -
+ -static bool io_cancel_cb(struct io_wq_work *work, void *data)
+ -{
+ -	struct io_kiocb *req = container_of(work, struct io_kiocb, work);
+ -
+ -	return req->user_data == (unsigned long) data;
+ -}
+ -
+ -static int io_async_cancel_one(struct io_ring_ctx *ctx, void *sqe_addr)
+ -{
+ -	enum io_wq_cancel cancel_ret;
+ -	int ret = 0;
+ -
+ -	cancel_ret = io_wq_cancel_cb(ctx->io_wq, io_cancel_cb, sqe_addr);
+ -	switch (cancel_ret) {
+ -	case IO_WQ_CANCEL_OK:
+ -		ret = 0;
+ -		break;
+ -	case IO_WQ_CANCEL_RUNNING:
+ -		ret = -EALREADY;
+ -		break;
+ -	case IO_WQ_CANCEL_NOTFOUND:
+ -		ret = -ENOENT;
+ -		break;
+ -	}
+ -
+ -	return ret;
+ -}
+ -
+ -static void io_async_find_and_cancel(struct io_ring_ctx *ctx,
+ -				     struct io_kiocb *req, __u64 sqe_addr,
+ -				     struct io_kiocb **nxt)
+ -{
+ -	unsigned long flags;
+ -	int ret;
+ -
+ -	ret = io_async_cancel_one(ctx, (void *) (unsigned long) sqe_addr);
+ -	if (ret != -ENOENT) {
+ -		spin_lock_irqsave(&ctx->completion_lock, flags);
+ -		goto done;
+ -	}
+ -
+ -	spin_lock_irqsave(&ctx->completion_lock, flags);
+ -	ret = io_timeout_cancel(ctx, sqe_addr);
+ -	if (ret != -ENOENT)
+ -		goto done;
+ -	ret = io_poll_cancel(ctx, sqe_addr);
+ -done:
+ -	io_cqring_fill_event(req, ret);
+ -	io_commit_cqring(ctx);
+ -	spin_unlock_irqrestore(&ctx->completion_lock, flags);
+ -	io_cqring_ev_posted(ctx);
+ -
+ -	if (ret < 0 && (req->flags & REQ_F_LINK))
+ -		req->flags |= REQ_F_FAIL_LINK;
+ -	io_put_req_find_next(req, nxt);
+ -}
+ -
+ -static int io_async_cancel(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ -			   struct io_kiocb **nxt)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -
+ -	if (unlikely(ctx->flags & IORING_SETUP_IOPOLL))
+ -		return -EINVAL;
+ -	if (sqe->flags || sqe->ioprio || sqe->off || sqe->len ||
+ -	    sqe->cancel_flags)
+ -		return -EINVAL;
+ -
+ -	io_async_find_and_cancel(ctx, req, READ_ONCE(sqe->addr), NULL);
+ -	return 0;
+ -}
+ -
+ -static int io_req_defer(struct io_kiocb *req)
+ +static int io_req_defer(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ +			const struct io_uring_sqe *sqe)
+  {
+ -	const struct io_uring_sqe *sqe = req->submit.sqe;
+  	struct io_uring_sqe *sqe_copy;
+ -	struct io_ring_ctx *ctx = req->ctx;
+  
+++<<<<<<< HEAD
+ +	if (!io_sequence_defer(ctx, req) && list_empty(&ctx->defer_list))
+++=======
++ 	/* Still need defer if there is pending req in defer list. */
++ 	if (!req_need_defer(req) && list_empty(&ctx->defer_list))
+++>>>>>>> 9d858b214839 (io_uring: introduce req_need_defer())
+  		return 0;
+  
+  	sqe_copy = kmalloc(sizeof(*sqe_copy), GFP_KERNEL);
+@@@ -1851,7 -2445,7 +1890,11 @@@
+  		return -EAGAIN;
+  
+  	spin_lock_irq(&ctx->completion_lock);
+++<<<<<<< HEAD
+ +	if (!io_sequence_defer(ctx, req) && list_empty(&ctx->defer_list)) {
+++=======
++ 	if (!req_need_defer(req) && list_empty(&ctx->defer_list)) {
+++>>>>>>> 9d858b214839 (io_uring: introduce req_need_defer())
+  		spin_unlock_irq(&ctx->completion_lock);
+  		kfree(sqe_copy);
+  		return 0;
+* Unmerged path fs/io_uring.c
