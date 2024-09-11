@@ -259,7 +259,7 @@ void evsel__init(struct evsel *evsel,
 	evsel->pmu_name      = NULL;
 }
 
-struct evsel *perf_evsel__new_idx(struct perf_event_attr *attr, int idx)
+struct evsel *evsel__new_idx(struct perf_event_attr *attr, int idx)
 {
 	struct evsel *evsel = zalloc(perf_evsel__object.size);
 
@@ -292,7 +292,7 @@ static bool perf_event_can_profile_kernel(void)
 	return perf_event_paranoid_check(1);
 }
 
-struct evsel *perf_evsel__new_cycles(bool precise)
+struct evsel *evsel__new_cycles(bool precise)
 {
 	struct perf_event_attr attr = {
 		.type	= PERF_TYPE_HARDWARE,
@@ -334,7 +334,7 @@ error_free:
 /*
  * Returns pointer with encoded error via <linux/err.h> interface.
  */
-struct evsel *perf_evsel__newtp_idx(const char *sys, const char *name, int idx)
+struct evsel *evsel__newtp_idx(const char *sys, const char *name, int idx)
 {
 	struct evsel *evsel = zalloc(perf_evsel__object.size);
 	int err = -ENOMEM;
