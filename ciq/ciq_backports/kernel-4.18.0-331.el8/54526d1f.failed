@@ -1,0 +1,374 @@
+KVM: x86: Support KVM VMs sharing SEV context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Nathan Tempelman <natet@google.com>
+commit 54526d1fd59338fd6a381dbd806b7ccbae3aa4aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/54526d1f.failed
+
+Add a capability for userspace to mirror SEV encryption context from
+one vm to another. On our side, this is intended to support a
+Migration Helper vCPU, but it can also be used generically to support
+other in-guest workloads scheduled by the host. The intention is for
+the primary guest and the mirror to have nearly identical memslots.
+
+The primary benefits of this are that:
+1) The VMs do not share KVM contexts (think APIC/MSRs/etc), so they
+can't accidentally clobber each other.
+2) The VMs can have different memory-views, which is necessary for post-copy
+migration (the migration vCPUs on the target need to read and write to
+pages, when the primary guest would VMEXIT).
+
+This does not change the threat model for AMD SEV. Any memory involved
+is still owned by the primary guest and its initial state is still
+attested to through the normal SEV_LAUNCH_* flows. If userspace wanted
+to circumvent SEV, they could achieve the same effect by simply attaching
+a vCPU to the primary VM.
+This patch deliberately leaves userspace in charge of the memslots for the
+mirror, as it already has the power to mess with them in the primary guest.
+
+This patch does not support SEV-ES (much less SNP), as it does not
+handle handing off attested VMSAs to the mirror.
+
+For additional context, we need a Migration Helper because SEV PSP
+migration is far too slow for our live migration on its own. Using
+an in-guest migrator lets us speed this up significantly.
+
+	Signed-off-by: Nathan Tempelman <natet@google.com>
+Message-Id: <20210408223214.2582277-1-natet@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 54526d1fd59338fd6a381dbd806b7ccbae3aa4aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virt/kvm/api.rst
+diff --cc Documentation/virt/kvm/api.rst
+index 52d41923062d,fd4a84911355..000000000000
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@@ -6233,6 -6197,32 +6233,35 @@@ the bus lock vm exit can be preempted b
+  notifications to userspace can be KVM_EXIT_BUS_LOCK or other reasons.
+  KVM_RUN_BUS_LOCK flag is used to distinguish between them.
+  
+++<<<<<<< HEAD
+++=======
++ 7.23 KVM_CAP_PPC_DAWR1
++ ----------------------
++ 
++ :Architectures: ppc
++ :Parameters: none
++ :Returns: 0 on success, -EINVAL when CPU doesn't support 2nd DAWR
++ 
++ This capability can be used to check / enable 2nd DAWR feature provided
++ by POWER10 processor.
++ 
++ 7.24 KVM_CAP_VM_COPY_ENC_CONTEXT_FROM
++ -------------------------------------
++ 
++ Architectures: x86 SEV enabled
++ Type: vm
++ Parameters: args[0] is the fd of the source vm
++ Returns: 0 on success; ENOTTY on error
++ 
++ This capability enables userspace to copy encryption context from the vm
++ indicated by the fd to the vm this is called on.
++ 
++ This is intended to support in-guest workloads scheduled by the host. This
++ allows the in-guest workload to maintain its own NPTs and keeps the two vms
++ from accidentally clobbering each other with interrupts and the like (separate
++ APIC/MSRs/etc).
++ 
+++>>>>>>> 54526d1fd593 (KVM: x86: Support KVM VMs sharing SEV context)
+  7.25 KVM_CAP_SGX_ATTRIBUTE
+  ----------------------
+  
+@@@ -6750,3 -6740,29 +6779,32 @@@ vcpu_info is set
+  The KVM_XEN_HVM_CONFIG_RUNSTATE flag indicates that the runstate-related
+  features KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_ADDR/_CURRENT/_DATA/_ADJUST are
+  supported by the KVM_XEN_VCPU_SET_ATTR/KVM_XEN_VCPU_GET_ATTR ioctls.
+++<<<<<<< HEAD
+++=======
++ 
++ 8.31 KVM_CAP_PPC_MULTITCE
++ -------------------------
++ 
++ :Capability: KVM_CAP_PPC_MULTITCE
++ :Architectures: ppc
++ :Type: vm
++ 
++ This capability means the kernel is capable of handling hypercalls
++ H_PUT_TCE_INDIRECT and H_STUFF_TCE without passing those into the user
++ space. This significantly accelerates DMA operations for PPC KVM guests.
++ User space should expect that its handlers for these hypercalls
++ are not going to be called if user space previously registered LIOBN
++ in KVM (via KVM_CREATE_SPAPR_TCE or similar calls).
++ 
++ In order to enable H_PUT_TCE_INDIRECT and H_STUFF_TCE use in the guest,
++ user space might have to advertise it for the guest. For example,
++ IBM pSeries (sPAPR) guest starts using them if "hcall-multi-tce" is
++ present in the "ibm,hypertas-functions" device-tree property.
++ 
++ The hypercalls mentioned above may or may not be processed successfully
++ in the kernel based fast path. If they can not be handled by the kernel,
++ they will get passed on to user space. So user space still has to have
++ an implementation for these despite the in kernel acceleration.
++ 
++ This capability is always enabled.
+++>>>>>>> 54526d1fd593 (KVM: x86: Support KVM VMs sharing SEV context)
+* Unmerged path Documentation/virt/kvm/api.rst
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 28f7ff0e580b..b7ce0120f6a6 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1371,6 +1371,7 @@ struct kvm_x86_ops {
+ 	int (*mem_enc_op)(struct kvm *kvm, void __user *argp);
+ 	int (*mem_enc_reg_region)(struct kvm *kvm, struct kvm_enc_region *argp);
+ 	int (*mem_enc_unreg_region)(struct kvm *kvm, struct kvm_enc_region *argp);
++	int (*vm_copy_enc_context_from)(struct kvm *kvm, unsigned int source_fd);
+ 
+ 	int (*get_msr_feature)(struct kvm_msr_entry *entry);
+ 
+diff --git a/arch/x86/kvm/svm/sev.c b/arch/x86/kvm/svm/sev.c
+index 91b602bcf2d8..9456a159aaa6 100644
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -67,6 +67,11 @@ static int sev_flush_asids(void)
+ 	return ret;
+ }
+ 
++static inline bool is_mirroring_enc_context(struct kvm *kvm)
++{
++	return !!to_kvm_svm(kvm)->sev_info.enc_context_owner;
++}
++
+ /* Must be called with the sev_bitmap_lock held */
+ static bool __sev_recycle_asids(int min_asid, int max_asid)
+ {
+@@ -1451,6 +1456,12 @@ int svm_mem_enc_op(struct kvm *kvm, void __user *argp)
+ 
+ 	mutex_lock(&kvm->lock);
+ 
++	/* enc_context_owner handles all memory enc operations */
++	if (is_mirroring_enc_context(kvm)) {
++		r = -EINVAL;
++		goto out;
++	}
++
+ 	switch (sev_cmd.id) {
+ 	case KVM_SEV_ES_INIT:
+ 		if (!sev_es) {
+@@ -1535,6 +1546,10 @@ int svm_register_enc_region(struct kvm *kvm,
+ 	if (!sev_guest(kvm))
+ 		return -ENOTTY;
+ 
++	/* If kvm is mirroring encryption context it isn't responsible for it */
++	if (is_mirroring_enc_context(kvm))
++		return -EINVAL;
++
+ 	if (range->addr > ULONG_MAX || range->size > ULONG_MAX)
+ 		return -EINVAL;
+ 
+@@ -1601,6 +1616,10 @@ int svm_unregister_enc_region(struct kvm *kvm,
+ 	struct enc_region *region;
+ 	int ret;
+ 
++	/* If kvm is mirroring encryption context it isn't responsible for it */
++	if (is_mirroring_enc_context(kvm))
++		return -EINVAL;
++
+ 	mutex_lock(&kvm->lock);
+ 
+ 	if (!sev_guest(kvm)) {
+@@ -1631,6 +1650,71 @@ int svm_unregister_enc_region(struct kvm *kvm,
+ 	return ret;
+ }
+ 
++int svm_vm_copy_asid_from(struct kvm *kvm, unsigned int source_fd)
++{
++	struct file *source_kvm_file;
++	struct kvm *source_kvm;
++	struct kvm_sev_info *mirror_sev;
++	unsigned int asid;
++	int ret;
++
++	source_kvm_file = fget(source_fd);
++	if (!file_is_kvm(source_kvm_file)) {
++		ret = -EBADF;
++		goto e_source_put;
++	}
++
++	source_kvm = source_kvm_file->private_data;
++	mutex_lock(&source_kvm->lock);
++
++	if (!sev_guest(source_kvm)) {
++		ret = -EINVAL;
++		goto e_source_unlock;
++	}
++
++	/* Mirrors of mirrors should work, but let's not get silly */
++	if (is_mirroring_enc_context(source_kvm) || source_kvm == kvm) {
++		ret = -EINVAL;
++		goto e_source_unlock;
++	}
++
++	asid = to_kvm_svm(source_kvm)->sev_info.asid;
++
++	/*
++	 * The mirror kvm holds an enc_context_owner ref so its asid can't
++	 * disappear until we're done with it
++	 */
++	kvm_get_kvm(source_kvm);
++
++	fput(source_kvm_file);
++	mutex_unlock(&source_kvm->lock);
++	mutex_lock(&kvm->lock);
++
++	if (sev_guest(kvm)) {
++		ret = -EINVAL;
++		goto e_mirror_unlock;
++	}
++
++	/* Set enc_context_owner and copy its encryption context over */
++	mirror_sev = &to_kvm_svm(kvm)->sev_info;
++	mirror_sev->enc_context_owner = source_kvm;
++	mirror_sev->asid = asid;
++	mirror_sev->active = true;
++
++	mutex_unlock(&kvm->lock);
++	return 0;
++
++e_mirror_unlock:
++	mutex_unlock(&kvm->lock);
++	kvm_put_kvm(source_kvm);
++	return ret;
++e_source_unlock:
++	mutex_unlock(&source_kvm->lock);
++e_source_put:
++	fput(source_kvm_file);
++	return ret;
++}
++
+ void sev_vm_destroy(struct kvm *kvm)
+ {
+ 	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+@@ -1640,6 +1724,12 @@ void sev_vm_destroy(struct kvm *kvm)
+ 	if (!sev_guest(kvm))
+ 		return;
+ 
++	/* If this is a mirror_kvm release the enc_context_owner and skip sev cleanup */
++	if (is_mirroring_enc_context(kvm)) {
++		kvm_put_kvm(sev->enc_context_owner);
++		return;
++	}
++
+ 	mutex_lock(&kvm->lock);
+ 
+ 	/*
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 93f38d5790da..b50ce95f75b9 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -4554,6 +4554,8 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
+ 	.mem_enc_reg_region = svm_register_enc_region,
+ 	.mem_enc_unreg_region = svm_unregister_enc_region,
+ 
++	.vm_copy_enc_context_from = svm_vm_copy_asid_from,
++
+ 	.can_emulate_instruction = svm_can_emulate_instruction,
+ 
+ 	.apic_init_signal_blocked = svm_apic_init_signal_blocked,
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index 7deb7a057004..454da1c1d9b7 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -68,6 +68,7 @@ struct kvm_sev_info {
+ 	unsigned long pages_locked; /* Number of pages locked */
+ 	struct list_head regions_list;  /* List of registered regions */
+ 	u64 ap_jump_table;	/* SEV-ES AP Jump Table address */
++	struct kvm *enc_context_owner; /* Owner of copied encryption context */
+ };
+ 
+ struct kvm_svm {
+@@ -580,6 +581,7 @@ int svm_register_enc_region(struct kvm *kvm,
+ 			    struct kvm_enc_region *range);
+ int svm_unregister_enc_region(struct kvm *kvm,
+ 			      struct kvm_enc_region *range);
++int svm_vm_copy_asid_from(struct kvm *kvm, unsigned int source_fd);
+ void pre_sev_run(struct vcpu_svm *svm, int cpu);
+ void __init sev_hardware_setup(void);
+ void sev_hardware_teardown(void);
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index a8d2fd7ef8b4..7e3099ab446d 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3834,6 +3834,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ #ifdef CONFIG_X86_SGX_KVM
+ 	case KVM_CAP_SGX_ATTRIBUTE:
+ #endif
++	case KVM_CAP_VM_COPY_ENC_CONTEXT_FROM:
+ 		r = 1;
+ 		break;
+ 	case KVM_CAP_SET_GUEST_DEBUG2:
+@@ -4738,7 +4739,6 @@ static int kvm_vcpu_ioctl_enable_cap(struct kvm_vcpu *vcpu,
+ 			kvm_update_pv_runtime(vcpu);
+ 
+ 		return 0;
+-
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -5437,6 +5437,11 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+ 		break;
+ 	}
+ #endif
++	case KVM_CAP_VM_COPY_ENC_CONTEXT_FROM:
++		r = -EINVAL;
++		if (kvm_x86_ops.vm_copy_enc_context_from)
++			r = kvm_x86_ops.vm_copy_enc_context_from(kvm, cap->args[0]);
++		return r;
+ 	default:
+ 		r = -EINVAL;
+ 		break;
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 709b6acf1647..8e8707019549 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -643,6 +643,7 @@ void kvm_exit(void);
+ 
+ void kvm_get_kvm(struct kvm *kvm);
+ void kvm_put_kvm(struct kvm *kvm);
++bool file_is_kvm(struct file *file);
+ void kvm_put_kvm_no_destroy(struct kvm *kvm);
+ 
+ static inline struct kvm_memslots *__kvm_memslots(struct kvm *kvm, int as_id)
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index 7a95f4c44d76..1e90d5a48059 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -1078,6 +1078,7 @@ struct kvm_ppc_resize_hpt {
+ #define KVM_CAP_X86_BUS_LOCK_EXIT 193
+ #define KVM_CAP_SET_GUEST_DEBUG2 195
+ #define KVM_CAP_SGX_ATTRIBUTE 196
++#define KVM_CAP_VM_COPY_ENC_CONTEXT_FROM 197
+ 
+ #ifdef KVM_CAP_IRQ_ROUTING
+ 
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 6182c3ec983d..c245000ded99 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -4076,6 +4076,12 @@ static struct file_operations kvm_vm_fops = {
+ 	KVM_COMPAT(kvm_vm_compat_ioctl),
+ };
+ 
++bool file_is_kvm(struct file *file)
++{
++	return file && file->f_op == &kvm_vm_fops;
++}
++EXPORT_SYMBOL_GPL(file_is_kvm);
++
+ static int kvm_dev_ioctl_create_vm(unsigned long type)
+ {
+ 	int r;
