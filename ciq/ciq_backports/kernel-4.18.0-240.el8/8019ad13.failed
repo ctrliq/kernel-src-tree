@@ -1,0 +1,171 @@
+futex: Fix inode life-time issue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 8019ad13ef7f64be44d4f892af9c840179009254
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8019ad13.failed
+
+As reported by Jann, ihold() does not in fact guarantee inode
+persistence. And instead of making it so, replace the usage of inode
+pointers with a per boot, machine wide, unique inode identifier.
+
+This sequence number is global, but shared (file backed) futexes are
+rare enough that this should not become a performance issue.
+
+	Reported-by: Jann Horn <jannh@google.com>
+	Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+(cherry picked from commit 8019ad13ef7f64be44d4f892af9c840179009254)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/futex.c
+diff --cc kernel/futex.c
+index 07521caa68bc,e14f7cd45dbd..000000000000
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@@ -481,6 -476,75 +480,78 @@@ enum futex_access 
+  };
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * futex_setup_timer - set up the sleeping hrtimer.
++  * @time:	ptr to the given timeout value
++  * @timeout:	the hrtimer_sleeper structure to be set up
++  * @flags:	futex flags
++  * @range_ns:	optional range in ns
++  *
++  * Return: Initialized hrtimer_sleeper structure or NULL if no timeout
++  *	   value given
++  */
++ static inline struct hrtimer_sleeper *
++ futex_setup_timer(ktime_t *time, struct hrtimer_sleeper *timeout,
++ 		  int flags, u64 range_ns)
++ {
++ 	if (!time)
++ 		return NULL;
++ 
++ 	hrtimer_init_sleeper_on_stack(timeout, (flags & FLAGS_CLOCKRT) ?
++ 				      CLOCK_REALTIME : CLOCK_MONOTONIC,
++ 				      HRTIMER_MODE_ABS);
++ 	/*
++ 	 * If range_ns is 0, calling hrtimer_set_expires_range_ns() is
++ 	 * effectively the same as calling hrtimer_set_expires().
++ 	 */
++ 	hrtimer_set_expires_range_ns(&timeout->timer, *time, range_ns);
++ 
++ 	return timeout;
++ }
++ 
++ /*
++  * Generate a machine wide unique identifier for this inode.
++  *
++  * This relies on u64 not wrapping in the life-time of the machine; which with
++  * 1ns resolution means almost 585 years.
++  *
++  * This further relies on the fact that a well formed program will not unmap
++  * the file while it has a (shared) futex waiting on it. This mapping will have
++  * a file reference which pins the mount and inode.
++  *
++  * If for some reason an inode gets evicted and read back in again, it will get
++  * a new sequence number and will _NOT_ match, even though it is the exact same
++  * file.
++  *
++  * It is important that match_futex() will never have a false-positive, esp.
++  * for PI futexes that can mess up the state. The above argues that false-negatives
++  * are only possible for malformed programs.
++  */
++ static u64 get_inode_sequence_number(struct inode *inode)
++ {
++ 	static atomic64_t i_seq;
++ 	u64 old;
++ 
++ 	/* Does the inode already have a sequence number? */
++ 	old = atomic64_read(&inode->i_sequence);
++ 	if (likely(old))
++ 		return old;
++ 
++ 	for (;;) {
++ 		u64 new = atomic64_add_return(1, &i_seq);
++ 		if (WARN_ON_ONCE(!new))
++ 			continue;
++ 
++ 		old = atomic64_cmpxchg_relaxed(&inode->i_sequence, 0, new);
++ 		if (old)
++ 			return old;
++ 		return new;
++ 	}
++ }
++ 
++ /**
+++>>>>>>> 8019ad13ef7f (futex: Fix inode life-time issue)
+   * get_futex_key() - Get parameters which are the keys for a futex
+   * @uaddr:	virtual address of the futex
+   * @fshared:	0 for a PROCESS_PRIVATE futex, 1 for PROCESS_SHARED
+diff --git a/fs/inode.c b/fs/inode.c
+index 7175ae3c50b4..f7c7ad94396d 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -136,6 +136,7 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
+ 	inode->i_sb = sb;
+ 	inode->i_blkbits = sb->s_blocksize_bits;
+ 	inode->i_flags = 0;
++	atomic64_set(&inode->i_sequence, 0);
+ 	atomic_set(&inode->i_count, 1);
+ 	inode->i_op = &empty_iops;
+ 	inode->i_fop = &no_open_fops;
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index cf5d1cf0627c..405034c9adc4 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -666,6 +666,7 @@ struct inode {
+ 		struct rcu_head		i_rcu;
+ 	};
+ 	atomic64_t		i_version;
++	atomic64_t		i_sequence; /* see futex */
+ 	atomic_t		i_count;
+ 	atomic_t		i_dio_count;
+ 	atomic_t		i_writecount;
+diff --git a/include/linux/futex.h b/include/linux/futex.h
+index 821ae502d3d8..9ffab3efd97f 100644
+--- a/include/linux/futex.h
++++ b/include/linux/futex.h
+@@ -32,23 +32,26 @@ handle_futex_death(u32 __user *uaddr, struct task_struct *curr, int pi);
+ 
+ union futex_key {
+ 	struct {
++		u64 i_seq;
+ 		unsigned long pgoff;
+-		struct inode *inode;
+-		int offset;
++		unsigned int offset;
+ 	} shared;
+ 	struct {
++		union {
++			struct mm_struct *mm;
++			u64 __tmp;
++		};
+ 		unsigned long address;
+-		struct mm_struct *mm;
+-		int offset;
++		unsigned int offset;
+ 	} private;
+ 	struct {
++		u64 ptr;
+ 		unsigned long word;
+-		void *ptr;
+-		int offset;
++		unsigned int offset;
+ 	} both;
+ };
+ 
+-#define FUTEX_KEY_INIT (union futex_key) { .both = { .ptr = NULL } }
++#define FUTEX_KEY_INIT (union futex_key) { .both = { .ptr = 0ULL } }
+ 
+ #ifdef CONFIG_FUTEX
+ extern void exit_robust_list(struct task_struct *curr);
+* Unmerged path kernel/futex.c
