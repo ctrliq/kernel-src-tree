@@ -1,0 +1,216 @@
+IB/mlx5: Introduce VAR object and its alloc/destroy methods
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit 7be76bef320b1f1d1b8dc87d3d5a03f3a2421a43
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7be76bef.failed
+
+Introduce VAR object and its alloc/destroy KABI methods. The internal
+implementation uses the IB core API to manage mmap/munamp calls.
+
+Link: https://lore.kernel.org/r/20191212110928.334995-5-leon@kernel.org
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 7be76bef320b1f1d1b8dc87d3d5a03f3a2421a43)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 31c8d9c10418,433ed48425ad..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -2083,6 -2074,31 +2083,34 @@@ static int mlx5_ib_mmap_clock_info_page
+  			      virt_to_page(dev->mdev->clock_info));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mlx5_ib_mmap_free(struct rdma_user_mmap_entry *entry)
++ {
++ 	struct mlx5_user_mmap_entry *mentry = to_mmmap(entry);
++ 	struct mlx5_ib_dev *dev = to_mdev(entry->ucontext->device);
++ 	struct mlx5_var_table *var_table = &dev->var_table;
++ 	struct mlx5_ib_dm *mdm;
++ 
++ 	switch (mentry->mmap_flag) {
++ 	case MLX5_IB_MMAP_TYPE_MEMIC:
++ 		mdm = container_of(mentry, struct mlx5_ib_dm, mentry);
++ 		mlx5_cmd_dealloc_memic(&dev->dm, mdm->dev_addr,
++ 				       mdm->size);
++ 		kfree(mdm);
++ 		break;
++ 	case MLX5_IB_MMAP_TYPE_VAR:
++ 		mutex_lock(&var_table->bitmap_lock);
++ 		clear_bit(mentry->page_idx, var_table->bitmap);
++ 		mutex_unlock(&var_table->bitmap_lock);
++ 		kfree(mentry);
++ 		break;
++ 	default:
++ 		WARN_ON(true);
++ 	}
++ }
++ 
+++>>>>>>> 7be76bef320b (IB/mlx5: Introduce VAR object and its alloc/destroy methods)
+  static int uar_mmap(struct mlx5_ib_dev *dev, enum mlx5_ib_mmap_cmd cmd,
+  		    struct vm_area_struct *vma,
+  		    struct mlx5_ib_ucontext *context)
+@@@ -2195,27 -2211,66 +2223,36 @@@ free_bfreg
+  	return err;
+  }
+  
+ -static int add_dm_mmap_entry(struct ib_ucontext *context,
+ -			     struct mlx5_ib_dm *mdm,
+ -			     u64 address)
+ -{
+ -	mdm->mentry.mmap_flag = MLX5_IB_MMAP_TYPE_MEMIC;
+ -	mdm->mentry.address = address;
+ -	return rdma_user_mmap_entry_insert_range(
+ -			context, &mdm->mentry.rdma_entry,
+ -			mdm->size,
+ -			MLX5_IB_MMAP_DEVICE_MEM << 16,
+ -			(MLX5_IB_MMAP_DEVICE_MEM << 16) + (1UL << 16) - 1);
+ -}
+ -
+ -static unsigned long mlx5_vma_to_pgoff(struct vm_area_struct *vma)
+ -{
+ -	unsigned long idx;
+ -	u8 command;
+ -
+ -	command = get_command(vma->vm_pgoff);
+ -	idx = get_extended_index(vma->vm_pgoff);
+ -
+ -	return (command << 16 | idx);
+ -}
+ -
+ -static int mlx5_ib_mmap_offset(struct mlx5_ib_dev *dev,
+ -			       struct vm_area_struct *vma,
+ -			       struct ib_ucontext *ucontext)
+ +static int dm_mmap(struct ib_ucontext *context, struct vm_area_struct *vma)
+  {
+ -	struct mlx5_user_mmap_entry *mentry;
+ -	struct rdma_user_mmap_entry *entry;
+ -	unsigned long pgoff;
+ -	pgprot_t prot;
+ +	struct mlx5_ib_ucontext *mctx = to_mucontext(context);
+ +	struct mlx5_ib_dev *dev = to_mdev(context->device);
+ +	u16 page_idx = get_extended_index(vma->vm_pgoff);
+ +	size_t map_size = vma->vm_end - vma->vm_start;
+ +	u32 npages = map_size >> PAGE_SHIFT;
+  	phys_addr_t pfn;
+ -	int ret;
+  
+ -	pgoff = mlx5_vma_to_pgoff(vma);
+ -	entry = rdma_user_mmap_entry_get_pgoff(ucontext, pgoff);
+ -	if (!entry)
+ +	if (find_next_zero_bit(mctx->dm_pages, page_idx + npages, page_idx) !=
+ +	    page_idx + npages)
+  		return -EINVAL;
+  
+ -	mentry = to_mmmap(entry);
+ -	pfn = (mentry->address >> PAGE_SHIFT);
+ -	prot = pgprot_writecombine(vma->vm_page_prot);
+ -	ret = rdma_user_mmap_io(ucontext, vma, pfn,
+ -				entry->npages * PAGE_SIZE,
+ -				prot,
+ -				entry);
+ -	rdma_user_mmap_entry_put(&mentry->rdma_entry);
+ -	return ret;
+ +	pfn = ((dev->mdev->bar_addr +
+ +	      MLX5_CAP64_DEV_MEM(dev->mdev, memic_bar_start_addr)) >>
+ +	      PAGE_SHIFT) +
+ +	      page_idx;
+ +	return rdma_user_mmap_io(context, vma, pfn, map_size,
+ +				 pgprot_writecombine(vma->vm_page_prot));
+  }
+  
++ static u64 mlx5_entry_to_mmap_offset(struct mlx5_user_mmap_entry *entry)
++ {
++ 	u16 cmd = entry->rdma_entry.start_pgoff >> 16;
++ 	u16 index = entry->rdma_entry.start_pgoff & 0xFFFF;
++ 
++ 	return (((index >> 8) << 16) | (cmd << MLX5_IB_MMAP_CMD_SHIFT) |
++ 		(index & 0xFF)) << PAGE_SHIFT;
++ }
++ 
+  static int mlx5_ib_mmap(struct ib_ucontext *ibcontext, struct vm_area_struct *vma)
+  {
+  	struct mlx5_ib_ucontext *context = to_mucontext(ibcontext);
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index f7b53c47e9f7,676462c8909f..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -118,6 -123,11 +123,14 @@@ enum 
+  	MLX5_MEMIC_BASE_SIZE	= 1 << MLX5_MEMIC_BASE_ALIGN,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum mlx5_ib_mmap_type {
++ 	MLX5_IB_MMAP_TYPE_MEMIC = 1,
++ 	MLX5_IB_MMAP_TYPE_VAR = 2,
++ };
++ 
+++>>>>>>> 7be76bef320b (IB/mlx5: Introduce VAR object and its alloc/destroy methods)
+  #define MLX5_LOG_SW_ICM_BLOCK_SIZE(dev)                                        \
+  	(MLX5_CAP_DEV_MEM(dev, log_sw_icm_alloc_granularity))
+  #define MLX5_SW_ICM_BLOCK_SIZE(dev) (1 << MLX5_LOG_SW_ICM_BLOCK_SIZE(dev))
+@@@ -556,6 -565,13 +569,16 @@@ enum mlx5_ib_mtt_access_flags 
+  	MLX5_IB_MTT_WRITE = (1 << 1),
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5_user_mmap_entry {
++ 	struct rdma_user_mmap_entry rdma_entry;
++ 	u8 mmap_flag;
++ 	u64 address;
++ 	u32 page_idx;
++ };
++ 
+++>>>>>>> 7be76bef320b (IB/mlx5: Introduce VAR object and its alloc/destroy methods)
+  struct mlx5_ib_dm {
+  	struct ib_dm		ibdm;
+  	phys_addr_t		dev_addr;
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --git a/include/uapi/rdma/mlx5_user_ioctl_cmds.h b/include/uapi/rdma/mlx5_user_ioctl_cmds.h
+index d0da070cf0ab..1a50b3af1b32 100644
+--- a/include/uapi/rdma/mlx5_user_ioctl_cmds.h
++++ b/include/uapi/rdma/mlx5_user_ioctl_cmds.h
+@@ -115,6 +115,22 @@ enum mlx5_ib_devx_obj_methods {
+ 	MLX5_IB_METHOD_DEVX_OBJ_ASYNC_QUERY,
+ };
+ 
++enum mlx5_ib_var_alloc_attrs {
++	MLX5_IB_ATTR_VAR_OBJ_ALLOC_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
++	MLX5_IB_ATTR_VAR_OBJ_ALLOC_MMAP_OFFSET,
++	MLX5_IB_ATTR_VAR_OBJ_ALLOC_MMAP_LENGTH,
++	MLX5_IB_ATTR_VAR_OBJ_ALLOC_PAGE_ID,
++};
++
++enum mlx5_ib_var_obj_destroy_attrs {
++	MLX5_IB_ATTR_VAR_OBJ_DESTROY_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
++};
++
++enum mlx5_ib_var_obj_methods {
++	MLX5_IB_METHOD_VAR_OBJ_ALLOC = (1U << UVERBS_ID_NS_SHIFT),
++	MLX5_IB_METHOD_VAR_OBJ_DESTROY,
++};
++
+ enum mlx5_ib_devx_umem_reg_attrs {
+ 	MLX5_IB_ATTR_DEVX_UMEM_REG_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+ 	MLX5_IB_ATTR_DEVX_UMEM_REG_ADDR,
+@@ -156,6 +172,7 @@ enum mlx5_ib_objects {
+ 	MLX5_IB_OBJECT_FLOW_MATCHER,
+ 	MLX5_IB_OBJECT_DEVX_ASYNC_CMD_FD,
+ 	MLX5_IB_OBJECT_DEVX_ASYNC_EVENT_FD,
++	MLX5_IB_OBJECT_VAR,
+ };
+ 
+ enum mlx5_ib_flow_matcher_create_attrs {
