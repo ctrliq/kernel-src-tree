@@ -1,0 +1,138 @@
+scsi: core: Add mq_poll support to SCSI layer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Kashyap Desai <kashyap.desai@broadcom.com>
+commit af1830956dc3dca0c87b2d679f7c91a8fe0331e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/af183095.failed
+
+Currently IOPOLL support is only available in block layer. This patch
+adds mq_poll support to the SCSI layer.
+
+Link: https://lore.kernel.org/r/20210215074048.19424-2-kashyap.desai@broadcom.com
+	Cc: sumit.saxena@broadcom.com
+	Cc: chandrakanth.patil@broadcom.com
+	Cc: linux-block@vger.kernel.org
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: John Garry <john.garry@huawei.com>
+	Signed-off-by: Kashyap Desai <kashyap.desai@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit af1830956dc3dca0c87b2d679f7c91a8fe0331e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/scsi/scsi_host.h
+diff --cc include/scsi/scsi_host.h
+index 46e700c5e992,d95c1502e17d..000000000000
+--- a/include/scsi/scsi_host.h
++++ b/include/scsi/scsi_host.h
+@@@ -261,6 -281,23 +261,26 @@@ struct scsi_host_template 
+  	int (* map_queues)(struct Scsi_Host *shost);
+  
+  	/*
+++<<<<<<< HEAD
+++=======
++ 	 * SCSI interface of blk_poll - poll for IO completions.
++ 	 * Only applicable if SCSI LLD exposes multiple h/w queues.
++ 	 *
++ 	 * Return value: Number of completed entries found.
++ 	 *
++ 	 * Status: OPTIONAL
++ 	 */
++ 	int (* mq_poll)(struct Scsi_Host *shost, unsigned int queue_num);
++ 
++ 	/*
++ 	 * Check if scatterlists need to be padded for DMA draining.
++ 	 *
++ 	 * Status: OPTIONAL
++ 	 */
++ 	bool (* dma_need_drain)(struct request *rq);
++ 
++ 	/*
+++>>>>>>> af1830956dc3 (scsi: core: Add mq_poll support to SCSI layer)
+  	 * This function determines the BIOS parameters for a given
+  	 * harddisk.  These tend to be numbers that are made up by
+  	 * the host adapter.  Parameters:
+@@@ -622,15 -632,9 +642,19 @@@ struct Scsi_Host 
+  	 * the total queue depth is can_queue.
+  	 */
+  	unsigned nr_hw_queues;
+++<<<<<<< HEAD
+ +	/* 
+ +	 * Used to assign serial numbers to the cmds.
+ +	 * Protected by the host lock.
+ +	 */
+ +	unsigned long cmd_serial_number;
+ +	
+++=======
++ 	unsigned nr_maps;
+++>>>>>>> af1830956dc3 (scsi: core: Add mq_poll support to SCSI layer)
+  	unsigned active_mode:2;
+  	unsigned unchecked_isa_dma:1;
+ +	unsigned use_clustering:1;
+  
+  	/*
+  	 * Host has requested that no further requests come through for the
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index f95ee33a7e2c..79142f5d18ed 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -1788,6 +1788,19 @@ static void scsi_mq_exit_request(struct blk_mq_tag_set *set, struct request *rq,
+ 			       cmd->sense_buffer);
+ }
+ 
++
++static int scsi_mq_poll(struct blk_mq_hw_ctx *hctx)
++{
++	struct request_queue *q = hctx->queue;
++	struct scsi_device *sdev = q->queuedata;
++	struct Scsi_Host *shost = sdev->host;
++
++	if (shost->hostt->mq_poll)
++		return shost->hostt->mq_poll(shost, hctx->queue_num);
++
++	return 0;
++}
++
+ static int scsi_map_queues(struct blk_mq_tag_set *set)
+ {
+ 	struct Scsi_Host *shost = container_of(set, struct Scsi_Host, tag_set);
+@@ -1852,6 +1865,7 @@ static const struct blk_mq_ops scsi_mq_ops_no_commit = {
+ 	.cleanup_rq	= scsi_cleanup_rq,
+ 	.busy		= scsi_mq_lld_busy,
+ 	.map_queues	= scsi_map_queues,
++	.poll		= scsi_mq_poll,
+ 	.set_rq_budget_token = scsi_mq_set_rq_budget_token,
+ 	.get_rq_budget_token = scsi_mq_get_rq_budget_token,
+ };
+@@ -1882,6 +1896,7 @@ static const struct blk_mq_ops scsi_mq_ops = {
+ 	.cleanup_rq	= scsi_cleanup_rq,
+ 	.busy		= scsi_mq_lld_busy,
+ 	.map_queues	= scsi_map_queues,
++	.poll		= scsi_mq_poll,
+ 	.set_rq_budget_token = scsi_mq_set_rq_budget_token,
+ 	.get_rq_budget_token = scsi_mq_get_rq_budget_token,
+ };
+@@ -1916,6 +1931,7 @@ int scsi_mq_setup_tags(struct Scsi_Host *shost)
+ 	else
+ 		tag_set->ops = &scsi_mq_ops_no_commit;
+ 	tag_set->nr_hw_queues = shost->nr_hw_queues ? : 1;
++	tag_set->nr_maps = shost->nr_maps ? : 1;
+ 	tag_set->queue_depth = shost->can_queue;
+ 	tag_set->cmd_size = cmd_size;
+ 	tag_set->numa_node = NUMA_NO_NODE;
+diff --git a/include/scsi/scsi_cmnd.h b/include/scsi/scsi_cmnd.h
+index dc6e247f851d..b377346a071a 100644
+--- a/include/scsi/scsi_cmnd.h
++++ b/include/scsi/scsi_cmnd.h
+@@ -10,6 +10,7 @@
+ #include <linux/timer.h>
+ #include <linux/scatterlist.h>
+ #include <scsi/scsi_device.h>
++#include <scsi/scsi_host.h>
+ #include <scsi/scsi_request.h>
+ 
+ #include <linux/rh_kabi.h>
+* Unmerged path include/scsi/scsi_host.h
