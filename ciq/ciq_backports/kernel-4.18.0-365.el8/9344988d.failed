@@ -1,0 +1,278 @@
+netfilter: ctnetlink: allow to filter dump by status bits
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 9344988d2979ce9eefe136a69efcf692615ebba8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/9344988d.failed
+
+If CTA_STATUS is present, but CTA_STATUS_MASK is not, then the
+mask is automatically set to 'status', so that kernel returns those
+entries that have all of the requested bits set.
+
+This makes more sense than using a all-one mask since we'd hardly
+ever find a match.
+
+There are no other checks for status bits, so if e.g. userspace
+sets impossible combinations it will get an empty dump.
+
+If kernel would reject unknown status bits, then a program that works on
+a future kernel that has IPS_FOO bit fails on old kernels.
+
+Same for 'impossible' combinations:
+
+Kernel never sets ASSURED without first having set SEEN_REPLY, but its
+possible that a future kernel could do so.
+
+Therefore no sanity tests other than a 0-mask.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 9344988d2979ce9eefe136a69efcf692615ebba8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/netfilter/nfnetlink_conntrack.h
+#	net/netfilter/nf_conntrack_netlink.c
+diff --cc include/uapi/linux/netfilter/nfnetlink_conntrack.h
+index b3f67a846ca2,c6e6d7d7d538..000000000000
+--- a/include/uapi/linux/netfilter/nfnetlink_conntrack.h
++++ b/include/uapi/linux/netfilter/nfnetlink_conntrack.h
+@@@ -55,6 -55,8 +55,11 @@@ enum ctattr_type 
+  	CTA_LABELS,
+  	CTA_LABELS_MASK,
+  	CTA_SYNPROXY,
+++<<<<<<< HEAD
+++=======
++ 	CTA_FILTER,
++ 	CTA_STATUS_MASK,
+++>>>>>>> 9344988d2979 (netfilter: ctnetlink: allow to filter dump by status bits)
+  	__CTA_MAX
+  };
+  #define CTA_MAX (__CTA_MAX - 1)
+diff --cc net/netfilter/nf_conntrack_netlink.c
+index 6e7fb1ac52a8,eb35c6151fb0..000000000000
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@@ -858,14 -852,104 +858,108 @@@ static int ctnetlink_done(struct netlin
+  	return 0;
+  }
+  
+ -struct ctnetlink_filter_u32 {
+ -	u32 val;
+ -	u32 mask;
+ -};
+ -
+  struct ctnetlink_filter {
+  	u8 family;
+++<<<<<<< HEAD
+ +	struct {
+ +		u_int32_t val;
+ +		u_int32_t mask;
+ +	} mark;
+ +};
+ +
+++=======
++ 
++ 	u_int32_t orig_flags;
++ 	u_int32_t reply_flags;
++ 
++ 	struct nf_conntrack_tuple orig;
++ 	struct nf_conntrack_tuple reply;
++ 	struct nf_conntrack_zone zone;
++ 
++ 	struct ctnetlink_filter_u32 mark;
++ 	struct ctnetlink_filter_u32 status;
++ };
++ 
++ static const struct nla_policy cta_filter_nla_policy[CTA_FILTER_MAX + 1] = {
++ 	[CTA_FILTER_ORIG_FLAGS]		= { .type = NLA_U32 },
++ 	[CTA_FILTER_REPLY_FLAGS]	= { .type = NLA_U32 },
++ };
++ 
++ static int ctnetlink_parse_filter(const struct nlattr *attr,
++ 				  struct ctnetlink_filter *filter)
++ {
++ 	struct nlattr *tb[CTA_FILTER_MAX + 1];
++ 	int ret = 0;
++ 
++ 	ret = nla_parse_nested(tb, CTA_FILTER_MAX, attr, cta_filter_nla_policy,
++ 			       NULL);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (tb[CTA_FILTER_ORIG_FLAGS]) {
++ 		filter->orig_flags = nla_get_u32(tb[CTA_FILTER_ORIG_FLAGS]);
++ 		if (filter->orig_flags & ~CTA_FILTER_F_ALL)
++ 			return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (tb[CTA_FILTER_REPLY_FLAGS]) {
++ 		filter->reply_flags = nla_get_u32(tb[CTA_FILTER_REPLY_FLAGS]);
++ 		if (filter->reply_flags & ~CTA_FILTER_F_ALL)
++ 			return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int ctnetlink_parse_zone(const struct nlattr *attr,
++ 				struct nf_conntrack_zone *zone);
++ static int ctnetlink_parse_tuple_filter(const struct nlattr * const cda[],
++ 					 struct nf_conntrack_tuple *tuple,
++ 					 u32 type, u_int8_t l3num,
++ 					 struct nf_conntrack_zone *zone,
++ 					 u_int32_t flags);
++ 
++ static int ctnetlink_filter_parse_mark(struct ctnetlink_filter_u32 *mark,
++ 				       const struct nlattr * const cda[])
++ {
++ #ifdef CONFIG_NF_CONNTRACK_MARK
++ 	if (cda[CTA_MARK]) {
++ 		mark->val = ntohl(nla_get_be32(cda[CTA_MARK]));
++ 
++ 		if (cda[CTA_MARK_MASK])
++ 			mark->mask = ntohl(nla_get_be32(cda[CTA_MARK_MASK]));
++ 		else
++ 			mark->mask = 0xffffffff;
++ 	} else if (cda[CTA_MARK_MASK]) {
++ 		return -EINVAL;
++ 	}
++ #endif
++ 	return 0;
++ }
++ 
++ static int ctnetlink_filter_parse_status(struct ctnetlink_filter_u32 *status,
++ 					 const struct nlattr * const cda[])
++ {
++ 	if (cda[CTA_STATUS]) {
++ 		status->val = ntohl(nla_get_be32(cda[CTA_STATUS]));
++ 		if (cda[CTA_STATUS_MASK])
++ 			status->mask = ntohl(nla_get_be32(cda[CTA_STATUS_MASK]));
++ 		else
++ 			status->mask = status->val;
++ 
++ 		/* status->val == 0? always true, else always false. */
++ 		if (status->mask == 0)
++ 			return -EINVAL;
++ 	} else if (cda[CTA_STATUS_MASK]) {
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* CTA_STATUS is NLA_U32, if this fires UAPI needs to be extended */
++ 	BUILD_BUG_ON(__IPS_MAX_BIT >= 32);
++ 	return 0;
++ }
++ 
+++>>>>>>> 9344988d2979 (netfilter: ctnetlink: allow to filter dump by status bits)
+  static struct ctnetlink_filter *
+  ctnetlink_alloc_filter(const struct nlattr * const cda[], u8 family)
+  {
+@@@ -882,13 -967,68 +976,61 @@@
+  
+  	filter->family = family;
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NF_CONNTRACK_MARK
+ +	if (cda[CTA_MARK] && cda[CTA_MARK_MASK]) {
+ +		filter->mark.val = ntohl(nla_get_be32(cda[CTA_MARK]));
+ +		filter->mark.mask = ntohl(nla_get_be32(cda[CTA_MARK_MASK]));
+++=======
++ 	err = ctnetlink_filter_parse_mark(&filter->mark, cda);
++ 	if (err)
++ 		goto err_filter;
++ 
++ 	err = ctnetlink_filter_parse_status(&filter->status, cda);
++ 	if (err)
++ 		goto err_filter;
++ 
++ 	if (!cda[CTA_FILTER])
++ 		return filter;
++ 
++ 	err = ctnetlink_parse_zone(cda[CTA_ZONE], &filter->zone);
++ 	if (err < 0)
++ 		goto err_filter;
++ 
++ 	err = ctnetlink_parse_filter(cda[CTA_FILTER], filter);
++ 	if (err < 0)
++ 		goto err_filter;
++ 
++ 	if (filter->orig_flags) {
++ 		if (!cda[CTA_TUPLE_ORIG]) {
++ 			err = -EINVAL;
++ 			goto err_filter;
++ 		}
++ 
++ 		err = ctnetlink_parse_tuple_filter(cda, &filter->orig,
++ 						   CTA_TUPLE_ORIG,
++ 						   filter->family,
++ 						   &filter->zone,
++ 						   filter->orig_flags);
++ 		if (err < 0)
++ 			goto err_filter;
+++>>>>>>> 9344988d2979 (netfilter: ctnetlink: allow to filter dump by status bits)
+  	}
+ -
+ -	if (filter->reply_flags) {
+ -		if (!cda[CTA_TUPLE_REPLY]) {
+ -			err = -EINVAL;
+ -			goto err_filter;
+ -		}
+ -
+ -		err = ctnetlink_parse_tuple_filter(cda, &filter->reply,
+ -						   CTA_TUPLE_REPLY,
+ -						   filter->family,
+ -						   &filter->zone,
+ -						   filter->orig_flags);
+ -		if (err < 0) {
+ -			err = -EINVAL;
+ -			goto err_filter;
+ -		}
+ -	}
+ -
+ +#endif
+  	return filter;
+++<<<<<<< HEAD
+++=======
++ 
++ err_filter:
++ 	kfree(filter);
++ 
++ 	return ERR_PTR(err);
++ }
++ 
++ static bool ctnetlink_needs_filter(u8 family, const struct nlattr * const *cda)
++ {
++ 	return family || cda[CTA_MARK] || cda[CTA_FILTER] || cda[CTA_STATUS];
+++>>>>>>> 9344988d2979 (netfilter: ctnetlink: allow to filter dump by status bits)
+  }
+  
+  static int ctnetlink_start(struct netlink_callback *cb)
+@@@ -911,6 -1051,77 +1053,11 @@@
+  static int ctnetlink_filter_match(struct nf_conn *ct, void *data)
+  {
+  	struct ctnetlink_filter *filter = data;
+++<<<<<<< HEAD
+++=======
++ 	struct nf_conntrack_tuple *tuple;
++ 	u32 status;
+++>>>>>>> 9344988d2979 (netfilter: ctnetlink: allow to filter dump by status bits)
+  
+  	if (filter == NULL)
+  		goto out;
+@@@ -1255,6 -1537,8 +1405,11 @@@ static const struct nla_policy ct_nla_p
+  				    .len = NF_CT_LABELS_MAX_SIZE },
+  	[CTA_LABELS_MASK]	= { .type = NLA_BINARY,
+  				    .len = NF_CT_LABELS_MAX_SIZE },
+++<<<<<<< HEAD
+++=======
++ 	[CTA_FILTER]		= { .type = NLA_NESTED },
++ 	[CTA_STATUS_MASK]	= { .type = NLA_U32 },
+++>>>>>>> 9344988d2979 (netfilter: ctnetlink: allow to filter dump by status bits)
+  };
+  
+  static int ctnetlink_flush_iterate(struct nf_conn *ct, void *data)
+* Unmerged path include/uapi/linux/netfilter/nfnetlink_conntrack.h
+* Unmerged path net/netfilter/nf_conntrack_netlink.c
