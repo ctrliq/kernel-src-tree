@@ -988,7 +988,7 @@ int ocrdma_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 	struct ocrdma_create_cq_ureq ureq;
 
 	if (attr->flags)
-		return -EINVAL;
+		return -EOPNOTSUPP;
 
 	if (udata) {
 		if (ib_copy_from_udata(&ureq, udata, sizeof(ureq)))
@@ -1062,7 +1062,7 @@ static void ocrdma_flush_cq(struct ocrdma_cq *cq)
 	spin_unlock_irqrestore(&cq->cq_lock, flags);
 }
 
-void ocrdma_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
+int ocrdma_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 {
 	struct ocrdma_cq *cq = get_ocrdma_cq(ibcq);
 	struct ocrdma_eq *eq = NULL;
@@ -1087,6 +1087,7 @@ void ocrdma_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 				ocrdma_get_db_addr(dev, pdid),
 				dev->nic_info.db_page_size);
 	}
+	return 0;
 }
 
 static int ocrdma_add_qpn_map(struct ocrdma_dev *dev, struct ocrdma_qp *qp)
@@ -1312,6 +1313,9 @@ struct ib_qp *ocrdma_create_qp(struct ib_pd *ibpd,
 	struct ocrdma_create_qp_ureq ureq;
 	u16 dpp_credit_lmt, dpp_offset;
 
+	if (attrs->create_flags)
+		return ERR_PTR(-EOPNOTSUPP);
+
 	status = ocrdma_check_qp_params(ibpd, dev, attrs, udata);
 	if (status)
 		goto gen_err;
@@ -1403,6 +1407,9 @@ int ocrdma_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	struct ocrdma_qp *qp;
 	struct ocrdma_dev *dev;
 	enum ib_qp_state old_qps, new_qps;
+
+	if (attr_mask & ~IB_QP_ATTR_STANDARD_BITS)
+		return -EOPNOTSUPP;
 
 	qp = get_ocrdma_qp(ibqp);
 	dev = get_ocrdma_dev(ibqp->device);
@@ -1783,6 +1790,9 @@ int ocrdma_create_srq(struct ib_srq *ibsrq, struct ib_srq_init_attr *init_attr,
 	struct ocrdma_dev *dev = get_ocrdma_dev(ibsrq->device);
 	struct ocrdma_srq *srq = get_ocrdma_srq(ibsrq);
 
+	if (init_attr->srq_type != IB_SRQT_BASIC)
+		return -EOPNOTSUPP;
+
 	if (init_attr->attr.max_sge > dev->attr.max_recv_sge)
 		return -EINVAL;
 	if (init_attr->attr.max_wr > dev->attr.max_rqe)
@@ -1863,7 +1873,7 @@ int ocrdma_query_srq(struct ib_srq *ibsrq, struct ib_srq_attr *srq_attr)
 	return status;
 }
 
-void ocrdma_destroy_srq(struct ib_srq *ibsrq, struct ib_udata *udata)
+int ocrdma_destroy_srq(struct ib_srq *ibsrq, struct ib_udata *udata)
 {
 	struct ocrdma_srq *srq;
 	struct ocrdma_dev *dev = get_ocrdma_dev(ibsrq->device);
@@ -1878,6 +1888,7 @@ void ocrdma_destroy_srq(struct ib_srq *ibsrq, struct ib_udata *udata)
 
 	kfree(srq->idx_bit_fields);
 	kfree(srq->rqe_wr_id_tbl);
+	return 0;
 }
 
 /* unprivileged verbs and their support functions. */

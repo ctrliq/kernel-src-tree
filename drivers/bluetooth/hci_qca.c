@@ -1684,7 +1684,9 @@ static int qca_setup(struct hci_uart *hu)
 
 	bt_dev_info(hdev, "setting up %s",
 		qca_is_wcn399x(soc_type) ? "wcn399x" : "ROME");
- 
+
+	qca->memdump_state = QCA_MEMDUMP_IDLE;
+
 retry:
 	ret = qca_power_on(hdev);
 	if (ret)
@@ -1824,9 +1826,6 @@ static void qca_power_shutdown(struct hci_uart *hu)
 	qca_flush(hu);
 	spin_unlock_irqrestore(&qca->hci_ibs_lock, flags);
 
-	hu->hdev->hw_error = NULL;
-	hu->hdev->cmd_timeout = NULL;
-
 	/* Non-serdev device usually is powered by external power
 	 * and don't need additional action in driver for power down
 	 */
@@ -1850,6 +1849,9 @@ static int qca_power_off(struct hci_dev *hdev)
 	struct qca_data *qca = hu->priv;
 	enum qca_btsoc_type soc_type = qca_soc_type(hu);
 
+	hu->hdev->hw_error = NULL;
+	hu->hdev->cmd_timeout = NULL;
+
 	/* Stop sending shutdown command if soc crashes. */
 	if (qca_is_wcn399x(soc_type)
 		&& qca->memdump_state == QCA_MEMDUMP_IDLE) {
@@ -1857,7 +1859,6 @@ static int qca_power_off(struct hci_dev *hdev)
 		usleep_range(8000, 10000);
 	}
 
-	qca->memdump_state = QCA_MEMDUMP_IDLE;
 	qca_power_shutdown(hu);
 	return 0;
 }
@@ -2039,6 +2040,38 @@ static void qca_serdev_remove(struct serdev_device *serdev)
 	hci_uart_unregister_device(&qcadev->serdev_hu);
 }
 
+static void qca_serdev_shutdown(struct device *dev)
+{
+	int ret;
+	int timeout = msecs_to_jiffies(CMD_TRANS_TIMEOUT_MS);
+	struct serdev_device *serdev = to_serdev_device(dev);
+	struct qca_serdev *qcadev = serdev_device_get_drvdata(serdev);
+	const u8 ibs_wake_cmd[] = { 0xFD };
+	const u8 edl_reset_soc_cmd[] = { 0x01, 0x00, 0xFC, 0x01, 0x05 };
+
+	if (qcadev->btsoc_type == QCA_QCA6390) {
+		serdev_device_write_flush(serdev);
+		ret = serdev_device_write_buf(serdev, ibs_wake_cmd,
+					      sizeof(ibs_wake_cmd));
+		if (ret < 0) {
+			BT_ERR("QCA send IBS_WAKE_IND error: %d", ret);
+			return;
+		}
+		serdev_device_wait_until_sent(serdev, timeout);
+		usleep_range(8000, 10000);
+
+		serdev_device_write_flush(serdev);
+		ret = serdev_device_write_buf(serdev, edl_reset_soc_cmd,
+					      sizeof(edl_reset_soc_cmd));
+		if (ret < 0) {
+			BT_ERR("QCA send EDL_RESET_REQ error: %d", ret);
+			return;
+		}
+		serdev_device_wait_until_sent(serdev, timeout);
+		usleep_range(8000, 10000);
+	}
+}
+
 static int __maybe_unused qca_suspend(struct device *dev)
 {
 	struct serdev_device *serdev = to_serdev_device(dev);
@@ -2161,6 +2194,7 @@ static SIMPLE_DEV_PM_OPS(qca_pm_ops, qca_suspend, qca_resume);
 
 static const struct of_device_id qca_bluetooth_of_match[] = {
 	{ .compatible = "qcom,qca6174-bt" },
+	{ .compatible = "qcom,qca9377-bt" },
 	{ .compatible = "qcom,wcn3990-bt", .data = &qca_soc_data_wcn3990},
 	{ .compatible = "qcom,wcn3998-bt", .data = &qca_soc_data_wcn3998},
 	{ /* sentinel */ }
@@ -2173,6 +2207,7 @@ static struct serdev_device_driver qca_serdev_driver = {
 	.driver = {
 		.name = "hci_uart_qca",
 		.of_match_table = qca_bluetooth_of_match,
+		.shutdown = qca_serdev_shutdown,
 		.pm = &qca_pm_ops,
 	},
 };

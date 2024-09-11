@@ -756,8 +756,7 @@ struct ib_mr *mlx4_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 				  u64 virt_addr, int access_flags,
 				  struct ib_udata *udata);
 int mlx4_ib_dereg_mr(struct ib_mr *mr, struct ib_udata *udata);
-struct ib_mw *mlx4_ib_alloc_mw(struct ib_pd *pd, enum ib_mw_type type,
-			       struct ib_udata *udata);
+int mlx4_ib_alloc_mw(struct ib_mw *mw, struct ib_udata *udata);
 int mlx4_ib_dealloc_mw(struct ib_mw *mw);
 struct ib_mr *mlx4_ib_alloc_mr(struct ib_pd *pd, enum ib_mr_type mr_type,
 			       u32 max_num_sg);
@@ -767,7 +766,7 @@ int mlx4_ib_modify_cq(struct ib_cq *cq, u16 cq_count, u16 cq_period);
 int mlx4_ib_resize_cq(struct ib_cq *ibcq, int entries, struct ib_udata *udata);
 int mlx4_ib_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 		      struct ib_udata *udata);
-void mlx4_ib_destroy_cq(struct ib_cq *cq, struct ib_udata *udata);
+int mlx4_ib_destroy_cq(struct ib_cq *cq, struct ib_udata *udata);
 int mlx4_ib_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc);
 int mlx4_ib_arm_cq(struct ib_cq *cq, enum ib_cq_notify_flags flags);
 void __mlx4_ib_cq_clean(struct mlx4_ib_cq *cq, u32 qpn, struct mlx4_ib_srq *srq);
@@ -788,7 +787,7 @@ int mlx4_ib_create_srq(struct ib_srq *srq, struct ib_srq_init_attr *init_attr,
 int mlx4_ib_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
 		       enum ib_srq_attr_mask attr_mask, struct ib_udata *udata);
 int mlx4_ib_query_srq(struct ib_srq *srq, struct ib_srq_attr *srq_attr);
-void mlx4_ib_destroy_srq(struct ib_srq *srq, struct ib_udata *udata);
+int mlx4_ib_destroy_srq(struct ib_srq *srq, struct ib_udata *udata);
 void mlx4_ib_free_srq_wqe(struct mlx4_ib_srq *srq, int wqe_index);
 int mlx4_ib_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
 			  const struct ib_recv_wr **bad_wr);
@@ -909,10 +908,10 @@ int mlx4_ib_steer_qp_alloc(struct mlx4_ib_dev *dev, int count, int *qpn);
 void mlx4_ib_steer_qp_free(struct mlx4_ib_dev *dev, u32 qpn, int count);
 int mlx4_ib_steer_qp_reg(struct mlx4_ib_dev *mdev, struct mlx4_ib_qp *mqp,
 			 int is_attach);
-int mlx4_ib_rereg_user_mr(struct ib_mr *mr, int flags,
-			  u64 start, u64 length, u64 virt_addr,
-			  int mr_access_flags, struct ib_pd *pd,
-			  struct ib_udata *udata);
+struct ib_mr *mlx4_ib_rereg_user_mr(struct ib_mr *mr, int flags, u64 start,
+				    u64 length, u64 virt_addr,
+				    int mr_access_flags, struct ib_pd *pd,
+				    struct ib_udata *udata);
 int mlx4_ib_gid_index_to_real_index(struct mlx4_ib_dev *ibdev,
 				    const struct ib_gid_attr *attr);
 

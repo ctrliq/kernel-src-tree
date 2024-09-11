@@ -1224,7 +1224,7 @@ static int mptcp_nl_cmd_set_flags(struct sk_buff *skb, struct genl_info *info)
 	return 0;
 }
 
-static const struct genl_ops mptcp_pm_ops[] = {
+static const struct genl_small_ops mptcp_pm_ops[] = {
 	{
 		.cmd    = MPTCP_PM_CMD_ADD_ADDR,
 		.doit   = mptcp_nl_cmd_add_addr,
@@ -1268,8 +1268,8 @@ static struct genl_family mptcp_genl_family __ro_after_init = {
 	.policy		= mptcp_pm_policy,
 	.netnsok	= true,
 	.module		= THIS_MODULE,
-	.ops		= mptcp_pm_ops,
-	.n_ops		= ARRAY_SIZE(mptcp_pm_ops),
+	.small_ops	= mptcp_pm_ops,
+	.n_small_ops	= ARRAY_SIZE(mptcp_pm_ops),
 	.mcgrps		= mptcp_pm_mcgrps,
 	.n_mcgrps	= ARRAY_SIZE(mptcp_pm_mcgrps),
 };

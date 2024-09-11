@@ -89,26 +89,38 @@ static dev_t nvme_ctrl_base_chr_devt;
 static struct class *nvme_class;
 static struct class *nvme_subsys_class;
 
-static int nvme_revalidate_disk(struct gendisk *disk);
 static void nvme_put_subsystem(struct nvme_subsystem *subsys);
 static void nvme_remove_invalid_namespaces(struct nvme_ctrl *ctrl,
 					   unsigned nsid);
 
+static void nvme_update_bdev_size(struct gendisk *disk)
+{
+	struct block_device *bdev = bdget_disk(disk, 0);
+
+	if (bdev) {
+		bd_set_nr_sectors(bdev, get_capacity(disk));
+		bdput(bdev);
+	}
+}
+
+/*
+ * Prepare a queue for teardown.
+ *
+ * This must forcibly unquiesce queues to avoid blocking dispatch, and only set
+ * the capacity to 0 after that to avoid blocking dispatchers that may be
+ * holding bd_butex.  This will end buffered writers dirtying pages that can't
+ * be synced.
+ */
 static void nvme_set_queue_dying(struct nvme_ns *ns)
 {
-	/*
-	 * Revalidating a dead namespace sets capacity to 0. This will end
-	 * buffered writers dirtying pages that can't be synced.
-	 */
 	if (test_and_set_bit(NVME_NS_DEAD, &ns->flags))
 		return;
+
 	blk_set_queue_dying(ns->queue);
-	/* Forcibly unquiesce queues to avoid blocking dispatch */
 	blk_mq_unquiesce_queue(ns->queue);
-	/*
-	 * Revalidate after unblocking dispatchers that may be holding bd_butex
-	 */
-	revalidate_disk(ns->disk);
+
+	set_capacity(ns->disk, 0);
+	nvme_update_bdev_size(ns->disk);
 }
 
 static void nvme_queue_scan(struct nvme_ctrl *ctrl)
@@ -331,7 +343,12 @@ static inline enum nvme_disposition nvme_decide_disposition(struct request *req)
 
 static inline void __nvme_end_req(struct request *req, blk_status_t status)
 {
-	nvme_trace_bio_complete(req, status);
+	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED) &&
+		req_op(req) == REQ_OP_ZONE_APPEND) {
+		req->__sector = nvme_lba_to_sect(req->q->queuedata,
+		le64_to_cpu(nvme_req(req)->result.u64));
+	}
+	nvme_trace_bio_complete(req);
 	blk_mq_end_request(req, status);
 }
 
@@ -847,7 +864,8 @@ static inline blk_status_t nvme_setup_write_zeroes(struct nvme_ns *ns,
 }
 
 static inline blk_status_t nvme_setup_rw(struct nvme_ns *ns,
-		struct request *req, struct nvme_command *cmnd)
+		struct request *req, struct nvme_command *cmnd,
+		enum nvme_opcode op)
 {
 	struct nvme_ctrl *ctrl = ns->ctrl;
 	u16 control = 0;
@@ -861,7 +879,7 @@ static inline blk_status_t nvme_setup_rw(struct nvme_ns *ns,
 	if (req->cmd_flags & REQ_RAHEAD)
 		dsmgmt |= NVME_RW_DSM_FREQ_PREFETCH;
 
-	cmnd->rw.opcode = (rq_data_dir(req) ? nvme_cmd_write : nvme_cmd_read);
+	cmnd->rw.opcode = op;
 	cmnd->rw.nsid = cpu_to_le32(ns->head->ns_id);
 	cmnd->rw.slba = cpu_to_le64(nvme_sect_to_lba(ns, blk_rq_pos(req)));
 	cmnd->rw.length = cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);
@@ -890,11 +908,12 @@ static inline blk_status_t nvme_setup_rw(struct nvme_ns *ns,
 		case NVME_NS_DPS_PI_TYPE2:
 			control |= NVME_RW_PRINFO_PRCHK_GUARD |
 					NVME_RW_PRINFO_PRCHK_REF;
+			if (op == nvme_cmd_zone_append)
+				control |= NVME_RW_APPEND_PIREMAP;
 			cmnd->rw.reftag = cpu_to_le32(t10_pi_ref_tag(req));
 			break;
 		}
 	}
-
 	cmnd->rw.control = cpu_to_le16(control);
 	cmnd->rw.dsmgmt = cpu_to_le32(dsmgmt);
 	return 0;
@@ -930,6 +949,19 @@ blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
 	case REQ_OP_FLUSH:
 		nvme_setup_flush(ns, cmd);
 		break;
+	case REQ_OP_ZONE_RESET_ALL:
+	case REQ_OP_ZONE_RESET:
+		ret = nvme_setup_zone_mgmt_send(ns, req, cmd, NVME_ZONE_RESET);
+		break;
+	case REQ_OP_ZONE_OPEN:
+		ret = nvme_setup_zone_mgmt_send(ns, req, cmd, NVME_ZONE_OPEN);
+		break;
+	case REQ_OP_ZONE_CLOSE:
+		ret = nvme_setup_zone_mgmt_send(ns, req, cmd, NVME_ZONE_CLOSE);
+		break;
+	case REQ_OP_ZONE_FINISH:
+		ret = nvme_setup_zone_mgmt_send(ns, req, cmd, NVME_ZONE_FINISH);
+		break;
 	case REQ_OP_WRITE_ZEROES:
 		ret = nvme_setup_write_zeroes(ns, req, cmd);
 		break;
@@ -937,8 +969,13 @@ blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
 		ret = nvme_setup_discard(ns, req, cmd);
 		break;
 	case REQ_OP_READ:
+		ret = nvme_setup_rw(ns, req, cmd, nvme_cmd_read);
+		break;
 	case REQ_OP_WRITE:
-		ret = nvme_setup_rw(ns, req, cmd);
+		ret = nvme_setup_rw(ns, req, cmd, nvme_cmd_write);
+		break;
+	case REQ_OP_ZONE_APPEND:
+		ret = nvme_setup_rw(ns, req, cmd, nvme_cmd_zone_append);
 		break;
 	default:
 		WARN_ON_ONCE(1);
@@ -1107,7 +1144,7 @@ static u32 nvme_passthru_start(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	 * For simplicity, IO to all namespaces is quiesced even if the command
 	 * effects say only one namespace is affected.
 	 */
-	if (effects & (NVME_CMD_EFFECTS_LBCC | NVME_CMD_EFFECTS_CSE_MASK)) {
+	if (effects & NVME_CMD_EFFECTS_CSE_MASK) {
 		mutex_lock(&ctrl->scan_lock);
 		mutex_lock(&ctrl->subsys->lock);
 		nvme_mpath_start_freeze(ctrl->subsys);
@@ -1118,36 +1155,9 @@ static u32 nvme_passthru_start(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	return effects;
 }
 
-static void nvme_update_formats(struct nvme_ctrl *ctrl, u32 *effects)
-{
-	struct nvme_ns *ns;
-
-	down_read(&ctrl->namespaces_rwsem);
-	list_for_each_entry(ns, &ctrl->namespaces, list)
-		if (nvme_revalidate_disk(ns->disk))
-			nvme_set_queue_dying(ns);
-		else if (blk_queue_is_zoned(ns->disk->queue)) {
-			/*
-			 * IO commands are required to fully revalidate a zoned
-			 * device. Force the command effects to trigger rescan
-			 * work so report zones can run in a context with
-			 * unfrozen IO queues.
-			 */
-			*effects |= NVME_CMD_EFFECTS_NCC;
-		}
-	up_read(&ctrl->namespaces_rwsem);
-}
-
 static void nvme_passthru_end(struct nvme_ctrl *ctrl, u32 effects)
 {
-	/*
-	 * Revalidate LBA changes prior to unfreezing. This is necessary to
-	 * prevent memory corruption if a logical block size was changed by
-	 * this command.
-	 */
-	if (effects & NVME_CMD_EFFECTS_LBCC)
-		nvme_update_formats(ctrl, &effects);
-	if (effects & (NVME_CMD_EFFECTS_LBCC | NVME_CMD_EFFECTS_CSE_MASK)) {
+	if (effects & NVME_CMD_EFFECTS_CSE_MASK) {
 		nvme_unfreeze(ctrl);
 		nvme_mpath_unfreeze(ctrl->subsys);
 		mutex_unlock(&ctrl->subsys->lock);
@@ -1408,6 +1418,8 @@ static int nvme_identify_ns_descs(struct nvme_ctrl *ctrl, unsigned nsid,
 	int status, pos, len;
 	void *data;
 
+	if (ctrl->vs < NVME_VS(1, 3, 0) && !nvme_multi_css(ctrl))
+		return 0;
 	if (ctrl->quirks & NVME_QUIRK_NO_NS_DESC_LIST)
 		return 0;
 
@@ -1452,19 +1464,8 @@ free_data:
 	return status;
 }
 
-static int nvme_identify_ns_list(struct nvme_ctrl *dev, unsigned nsid, __le32 *ns_list)
-{
-	struct nvme_command c = { };
-
-	c.identify.opcode = nvme_admin_identify;
-	c.identify.cns = NVME_ID_CNS_NS_ACTIVE_LIST;
-	c.identify.nsid = cpu_to_le32(nsid);
-	return nvme_submit_sync_cmd(dev->admin_q, &c, ns_list,
-				    NVME_IDENTIFY_DATA_SIZE);
-}
-
-static int nvme_identify_ns(struct nvme_ctrl *ctrl,
-		unsigned nsid, struct nvme_id_ns **id)
+static int nvme_identify_ns(struct nvme_ctrl *ctrl, unsigned nsid,
+			struct nvme_ns_ids *ids, struct nvme_id_ns **id)
 {
 	struct nvme_command c = { };
 	int error;
@@ -1484,9 +1485,17 @@ static int nvme_identify_ns(struct nvme_ctrl *ctrl,
 		goto out_free_id;
 	}
 
-	error = -ENODEV;
+	error = NVME_SC_INVALID_NS | NVME_SC_DNR;
 	if ((*id)->ncap == 0) /* namespace not allocated or attached */
 		goto out_free_id;
+
+	if (ctrl->vs >= NVME_VS(1, 1, 0) &&
+	    !memchr_inv(ids->eui64, 0, sizeof(ids->eui64)))
+		memcpy(ids->eui64, (*id)->eui64, sizeof(ids->eui64));
+	if (ctrl->vs >= NVME_VS(1, 2, 0) &&
+	    !memchr_inv(ids->nguid, 0, sizeof(ids->nguid)))
+		memcpy(ids->nguid, (*id)->nguid, sizeof(ids->nguid));
+
 	return 0;
 
 out_free_id:
@@ -1748,7 +1757,7 @@ static int nvme_user_cmd64(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
  * Issue ioctl requests on the first available path.  Note that unlike normal
  * block layer requests we will not retry failed request on another controller.
  */
-static struct nvme_ns *nvme_get_ns_from_disk(struct gendisk *disk,
+struct nvme_ns *nvme_get_ns_from_disk(struct gendisk *disk,
 		struct nvme_ns_head **head, int *srcu_idx)
 {
 #ifdef CONFIG_NVME_MULTIPATH
@@ -1768,7 +1777,7 @@ static struct nvme_ns *nvme_get_ns_from_disk(struct gendisk *disk,
 	return disk->private_data;
 }
 
-static void nvme_put_ns_from_disk(struct nvme_ns_head *head, int idx)
+void nvme_put_ns_from_disk(struct nvme_ns_head *head, int idx)
 {
 	if (head)
 		srcu_read_unlock(&head->srcu, idx);
@@ -2025,20 +2034,6 @@ static void nvme_config_write_zeroes(struct gendisk *disk, struct nvme_ns *ns)
 					   nvme_lba_to_sect(ns, max_blocks));
 }
 
-static int nvme_report_ns_ids(struct nvme_ctrl *ctrl, unsigned int nsid,
-		struct nvme_id_ns *id, struct nvme_ns_ids *ids)
-{
-	memset(ids, 0, sizeof(*ids));
-
-	if (ctrl->vs >= NVME_VS(1, 1, 0))
-		memcpy(ids->eui64, id->eui64, sizeof(id->eui64));
-	if (ctrl->vs >= NVME_VS(1, 2, 0))
-		memcpy(ids->nguid, id->nguid, sizeof(id->nguid));
-	if (ctrl->vs >= NVME_VS(1, 3, 0) || nvme_multi_css(ctrl))
-		return nvme_identify_ns_descs(ctrl, nsid, ids);
-	return 0;
-}
-
 static bool nvme_ns_ids_valid(struct nvme_ns_ids *ids)
 {
 	return !uuid_is_null(&ids->uuid) ||
@@ -2079,6 +2074,68 @@ static int nvme_setup_streams_ns(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	return 0;
 }
 
+static int nvme_configure_metadata(struct nvme_ns *ns, struct nvme_id_ns *id)
+{
+	struct nvme_ctrl *ctrl = ns->ctrl;
+
+	/*
+	 * The PI implementation requires the metadata size to be equal to the
+	 * t10 pi tuple size.
+	 */
+	ns->ms = le16_to_cpu(id->lbaf[id->flbas & NVME_NS_FLBAS_LBA_MASK].ms);
+	if (ns->ms == sizeof(struct t10_pi_tuple))
+		ns->pi_type = id->dps & NVME_NS_DPS_PI_MASK;
+	else
+		ns->pi_type = 0;
+
+	ns->features &= ~(NVME_NS_METADATA_SUPPORTED | NVME_NS_EXT_LBAS);
+	if (!ns->ms || !(ctrl->ops->flags & NVME_F_METADATA_SUPPORTED))
+		return 0;
+	if (ctrl->ops->flags & NVME_F_FABRICS) {
+		/*
+		 * The NVMe over Fabrics specification only supports metadata as
+		 * part of the extended data LBA.  We rely on HCA/HBA support to
+		 * remap the separate metadata buffer from the block layer.
+		 */
+		if (WARN_ON_ONCE(!(id->flbas & NVME_NS_FLBAS_META_EXT)))
+			return -EINVAL;
+		if (ctrl->max_integrity_segments)
+			ns->features |=
+				(NVME_NS_METADATA_SUPPORTED | NVME_NS_EXT_LBAS);
+	} else {
+		/*
+		 * For PCIe controllers, we can't easily remap the separate
+		 * metadata buffer from the block layer and thus require a
+		 * separate metadata buffer for block layer metadata/PI support.
+		 * We allow extended LBAs for the passthrough interface, though.
+		 */
+		if (id->flbas & NVME_NS_FLBAS_META_EXT)
+			ns->features |= NVME_NS_EXT_LBAS;
+		else
+			ns->features |= NVME_NS_METADATA_SUPPORTED;
+	}
+
+	return 0;
+}
+
+static void nvme_set_queue_limits(struct nvme_ctrl *ctrl,
+		struct request_queue *q)
+{
+	bool vwc = ctrl->vwc & NVME_CTRL_VWC_PRESENT;
+
+	if (ctrl->max_hw_sectors) {
+		u32 max_segments =
+			(ctrl->max_hw_sectors / (NVME_CTRL_PAGE_SIZE >> 9)) + 1;
+
+		max_segments = min_not_zero(max_segments, ctrl->max_segments);
+		blk_queue_max_hw_sectors(q, ctrl->max_hw_sectors);
+		blk_queue_max_segments(q, min_t(u32, max_segments, USHRT_MAX));
+	}
+	blk_queue_virt_boundary(q, NVME_CTRL_PAGE_SIZE - 1);
+	blk_queue_dma_alignment(q, 7);
+	blk_queue_write_cache(q, vwc, vwc);
+}
+
 static void nvme_update_disk_info(struct gendisk *disk,
 		struct nvme_ns *ns, struct nvme_id_ns *id)
 {
@@ -2094,7 +2151,7 @@ static void nvme_update_disk_info(struct gendisk *disk,
 		capacity = 0;
 		bs = (1 << 9);
 	}
-	blk_mq_freeze_queue(disk->queue);
+
 	blk_integrity_unregister(disk);
 
 	atomic_bs = phys_bs = bs;
@@ -2143,17 +2200,13 @@ static void nvme_update_disk_info(struct gendisk *disk,
 			capacity = 0;
 	}
 
-	set_capacity_revalidate_and_notify(disk, capacity, false);
+	set_capacity_revalidate_and_notify(disk, capacity, true);
 
 	nvme_config_discard(disk, ns);
 	nvme_config_write_zeroes(disk, ns);
 
-	if (id->nsattr & NVME_NS_ATTR_RO)
-		set_disk_ro(disk, true);
-	else
-		set_disk_ro(disk, false);
-
-	blk_mq_unfreeze_queue(disk->queue);
+	set_disk_ro(disk, (id->nsattr & NVME_NS_ATTR_RO) ||
+		test_bit(NVME_NS_FORCE_RO, &ns->flags));
 }
 
 static inline bool nvme_first_scan(struct gendisk *disk)
@@ -2193,111 +2246,48 @@ static void nvme_set_chunk_sectors(struct nvme_ns *ns, struct nvme_id_ns *id)
 	blk_queue_chunk_sectors(ns->queue, iob);
 }
 
-static int __nvme_revalidate_disk(struct gendisk *disk, struct nvme_id_ns *id)
+static int nvme_update_ns_info(struct nvme_ns *ns, struct nvme_id_ns *id)
 {
-	struct nvme_ns *ns = disk->private_data;
-	struct nvme_ctrl *ctrl = ns->ctrl;
+	unsigned lbaf = id->flbas & NVME_NS_FLBAS_LBA_MASK;
+	int ret;
 
-	/*
-	 * If identify namespace failed, use default 512 byte block size so
-	 * block layer can use before failing read/write for 0 capacity.
-	 */
-	ns->lba_shift = id->lbaf[id->flbas & NVME_NS_FLBAS_LBA_MASK].ds;
-	if (ns->lba_shift == 0)
-		ns->lba_shift = 9;
+	blk_mq_freeze_queue(ns->disk->queue);
+	ns->lba_shift = id->lbaf[lbaf].ds;
+	nvme_set_queue_limits(ns->ctrl, ns->queue);
 
-	switch (ns->head->ids.csi) {
-	case NVME_CSI_NVM:
-		break;
-	default:
-		dev_warn(ctrl->device, "unknown csi:%d ns:%d\n",
-			ns->head->ids.csi, ns->head->ns_id);
-		return -ENODEV;
-	}
-
-	ns->features = 0;
-	ns->ms = le16_to_cpu(id->lbaf[id->flbas & NVME_NS_FLBAS_LBA_MASK].ms);
-	/* the PI implementation requires metadata equal t10 pi tuple size */
-	if (ns->ms == sizeof(struct t10_pi_tuple))
-		ns->pi_type = id->dps & NVME_NS_DPS_PI_MASK;
-	else
-		ns->pi_type = 0;
-
-	if (ns->ms) {
-		/*
-		 * For PCIe only the separate metadata pointer is supported,
-		 * as the block layer supplies metadata in a separate bio_vec
-		 * chain. For Fabrics, only metadata as part of extended data
-		 * LBA is supported on the wire per the Fabrics specification,
-		 * but the HBA/HCA will do the remapping from the separate
-		 * metadata buffers for us.
-		 */
-		if (id->flbas & NVME_NS_FLBAS_META_EXT) {
-			ns->features |= NVME_NS_EXT_LBAS;
-			if ((ctrl->ops->flags & NVME_F_FABRICS) &&
-			    (ctrl->ops->flags & NVME_F_METADATA_SUPPORTED) &&
-			    ctrl->max_integrity_segments)
-				ns->features |= NVME_NS_METADATA_SUPPORTED;
-		} else {
-			if (WARN_ON_ONCE(ctrl->ops->flags & NVME_F_FABRICS))
-				return -EINVAL;
-			if (ctrl->ops->flags & NVME_F_METADATA_SUPPORTED)
-				ns->features |= NVME_NS_METADATA_SUPPORTED;
-		}
-	}
-
+	ret = nvme_configure_metadata(ns, id);
+	if (ret)
+		goto out_unfreeze;
 	nvme_set_chunk_sectors(ns, id);
-	nvme_update_disk_info(disk, ns, id);
+	nvme_update_disk_info(ns->disk, ns, id);
+
+	if (ns->head->ids.csi == NVME_CSI_ZNS) {
+		ret = nvme_update_zone_info(ns, lbaf);
+		if (ret)
+			goto out_unfreeze;
+	}
+
+	blk_mq_unfreeze_queue(ns->disk->queue);
+
+	if (blk_queue_is_zoned(ns->queue)) {
+		ret = nvme_revalidate_zones(ns);
+		if (ret && !nvme_first_scan(ns->disk))
+			return ret;
+	}
+
 #ifdef CONFIG_NVME_MULTIPATH
 	if (ns->head->disk) {
+		blk_mq_freeze_queue(ns->head->disk->queue);
 		nvme_update_disk_info(ns->head->disk, ns, id);
 		blk_queue_stack_limits(ns->head->disk->queue, ns->queue);
-		nvme_mpath_update_disk_size(ns->head->disk);
+		blk_queue_update_readahead(ns->head->disk->queue);
+		blk_mq_unfreeze_queue(ns->head->disk->queue);
 	}
 #endif
 	return 0;
-}
 
-static int nvme_revalidate_disk(struct gendisk *disk)
-{
-	struct nvme_ns *ns = disk->private_data;
-	struct nvme_ctrl *ctrl = ns->ctrl;
-	struct nvme_id_ns *id;
-	struct nvme_ns_ids ids;
-	int ret = 0;
-
-	if (test_bit(NVME_NS_DEAD, &ns->flags)) {
-		set_capacity(disk, 0);
-		return -ENODEV;
-	}
-
-	ret = nvme_identify_ns(ctrl, ns->head->ns_id, &id);
-	if (ret)
-		goto out;
-
-	ret = nvme_report_ns_ids(ctrl, ns->head->ns_id, id, &ids);
-	if (ret)
-		goto free_id;
-
-	if (!nvme_ns_ids_equal(&ns->head->ids, &ids)) {
-		dev_err(ctrl->device,
-			"identifiers changed for nsid %d\n", ns->head->ns_id);
-		ret = -ENODEV;
-		goto free_id;
-	}
-
-	ret = __nvme_revalidate_disk(disk, id);
-free_id:
-	kfree(id);
-out:
-	/*
-	 * Only fail the function if we got a fatal error back from the
-	 * device, otherwise ignore the error and just move on.
-	 */
-	if (ret == -ENOMEM || (ret > 0 && !(ret & NVME_SC_DNR)))
-		ret = 0;
-	else if (ret > 0)
-		ret = blk_status_to_errno(nvme_error_status(ret));
+out_unfreeze:
+	blk_mq_unfreeze_queue(ns->disk->queue);
 	return ret;
 }
 
@@ -2430,7 +2420,7 @@ static const struct block_device_operations nvme_bdev_ops = {
 	.open		= nvme_open,
 	.release	= nvme_release,
 	.getgeo		= nvme_getgeo,
-	.revalidate_disk= nvme_revalidate_disk,
+	.report_zones	= nvme_report_zones,
 	.pr_ops		= &nvme_pr_ops,
 };
 
@@ -2456,6 +2446,7 @@ const struct block_device_operations nvme_ns_head_ops = {
 	.ioctl		= nvme_ioctl,
 	.compat_ioctl	= nvme_compat_ioctl,
 	.getgeo		= nvme_getgeo,
+	.report_zones	= nvme_report_zones,
 	.pr_ops		= &nvme_pr_ops,
 };
 #endif /* CONFIG_NVME_MULTIPATH */
@@ -2513,12 +2504,7 @@ EXPORT_SYMBOL_GPL(nvme_disable_ctrl);
 
 int nvme_enable_ctrl(struct nvme_ctrl *ctrl)
 {
-	/*
-	 * Default to a 4K page size, with the intention to update this
-	 * path in the future to accomodate architectures with differing
-	 * kernel and IO page sizes.
-	 */
-	unsigned dev_page_min, page_shift = 12;
+	unsigned dev_page_min;
 	int ret;
 
 	ret = ctrl->ops->reg_read64(ctrl, NVME_REG_CAP, &ctrl->cap);
@@ -2528,20 +2514,18 @@ int nvme_enable_ctrl(struct nvme_ctrl *ctrl)
 	}
 	dev_page_min = NVME_CAP_MPSMIN(ctrl->cap) + 12;
 
-	if (page_shift < dev_page_min) {
+	if (NVME_CTRL_PAGE_SHIFT < dev_page_min) {
 		dev_err(ctrl->device,
 			"Minimum device page size %u too large for host (%u)\n",
-			1 << dev_page_min, 1 << page_shift);
+			1 << dev_page_min, 1 << NVME_CTRL_PAGE_SHIFT);
 		return -ENODEV;
 	}
-
-	ctrl->page_size = 1 << page_shift;
 
 	if (NVME_CAP_CSS(ctrl->cap) & NVME_CAP_CSS_CSI)
 		ctrl->ctrl_config = NVME_CC_CSS_CSI;
 	else
 		ctrl->ctrl_config = NVME_CC_CSS_NVM;
-	ctrl->ctrl_config |= (page_shift - 12) << NVME_CC_MPS_SHIFT;
+	ctrl->ctrl_config |= (NVME_CTRL_PAGE_SHIFT - 12) << NVME_CC_MPS_SHIFT;
 	ctrl->ctrl_config |= NVME_CC_AMS_RR | NVME_CC_SHN_NONE;
 	ctrl->ctrl_config |= NVME_CC_IOSQES | NVME_CC_IOCQES;
 	ctrl->ctrl_config |= NVME_CC_ENABLE;
@@ -2583,29 +2567,6 @@ int nvme_shutdown_ctrl(struct nvme_ctrl *ctrl)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(nvme_shutdown_ctrl);
-
-static void nvme_set_queue_limits(struct nvme_ctrl *ctrl,
-		struct request_queue *q)
-{
-	bool vwc = false;
-
-	if (ctrl->segment_boundary)
-		blk_queue_segment_boundary(q, ctrl->segment_boundary);
-
-	if (ctrl->max_hw_sectors) {
-		u32 max_segments =
-			(ctrl->max_hw_sectors / (ctrl->page_size >> 9)) + 1;
-
-		max_segments = min_not_zero(max_segments, ctrl->max_segments);
-		blk_queue_max_hw_sectors(q, ctrl->max_hw_sectors);
-		blk_queue_max_segments(q, min_t(u32, max_segments, USHRT_MAX));
-	}
-	blk_queue_virt_boundary(q, ctrl->page_size - 1);
-	blk_queue_dma_alignment(q, 7);
-	if (ctrl->vwc & NVME_CTRL_VWC_PRESENT)
-		vwc = true;
-	blk_queue_write_cache(q, vwc, vwc);
-}
 
 static int nvme_configure_timestamp(struct nvme_ctrl *ctrl)
 {
@@ -3927,25 +3888,16 @@ out:
 }
 
 static int nvme_init_ns_head(struct nvme_ns *ns, unsigned nsid,
-		struct nvme_id_ns *id)
+		struct nvme_ns_ids *ids, bool is_shared)
 {
 	struct nvme_ctrl *ctrl = ns->ctrl;
-	bool is_shared = id->nmic & NVME_NS_NMIC_SHARED;
 	struct nvme_ns_head *head = NULL;
-	struct nvme_ns_ids ids;
 	int ret = 0;
-
-	ret = nvme_report_ns_ids(ctrl, nsid, id, &ids);
-	if (ret) {
-		if (ret < 0)
-			return ret;
-		return blk_status_to_errno(nvme_error_status(ret));
-	}
 
 	mutex_lock(&ctrl->subsys->lock);
 	head = nvme_find_ns_head(ctrl->subsys, nsid);
 	if (!head) {
-		head = nvme_alloc_ns_head(ctrl, nsid, &ids);
+		head = nvme_alloc_ns_head(ctrl, nsid, ids);
 		if (IS_ERR(head)) {
 			ret = PTR_ERR(head);
 			goto out_unlock;
@@ -3958,7 +3910,7 @@ static int nvme_init_ns_head(struct nvme_ns *ns, unsigned nsid,
 				"Duplicate unshared namespace %d\n", nsid);
 			goto out_put_ns_head;
 		}
-		if (!nvme_ns_ids_equal(&head->ids, &ids)) {
+		if (!nvme_ns_ids_equal(&head->ids, ids)) {
 			dev_err(ctrl->device,
 				"IDs don't match for shared namespace %d\n",
 					nsid);
@@ -4006,15 +3958,16 @@ struct nvme_ns *nvme_find_get_ns(struct nvme_ctrl *ctrl, unsigned nsid)
 }
 EXPORT_SYMBOL_GPL(nvme_find_get_ns);
 
-static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid,
+		struct nvme_ns_ids *ids)
 {
 	struct nvme_ns *ns;
 	struct gendisk *disk;
 	struct nvme_id_ns *id;
 	char disk_name[DISK_NAME_LEN];
-	int node = ctrl->numa_node, flags = GENHD_FL_EXT_DEVT, ret;
+	int node = ctrl->numa_node, flags = GENHD_FL_EXT_DEVT;
 
-	if (nvme_identify_ns(ctrl, nsid, &id))
+	if (nvme_identify_ns(ctrl, nsid, ids, &id))
 		return;
 
 	ns = kzalloc_node(sizeof(*ns), GFP_KERNEL, node);
@@ -4035,15 +3988,9 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
 
 	ns->queue->queuedata = ns;
 	ns->ctrl = ctrl;
-
 	kref_init(&ns->kref);
-	ns->lba_shift = 9; /* set to a default value for 512 until disk is validated */
 
-	blk_queue_logical_block_size(ns->queue, 1 << ns->lba_shift);
-	nvme_set_queue_limits(ctrl, ns->queue);
-
-	ret = nvme_init_ns_head(ns, nsid, id);
-	if (ret)
+	if (nvme_init_ns_head(ns, nsid, ids, id->nmic & NVME_NS_NMIC_SHARED))
 		goto out_free_queue;
 	nvme_set_disk_name(disk_name, ns, ctrl, &flags);
 
@@ -4058,12 +4005,11 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
 	memcpy(disk->disk_name, disk_name, DISK_NAME_LEN);
 	ns->disk = disk;
 
-	if (__nvme_revalidate_disk(disk, id))
+	if (nvme_update_ns_info(ns, id))
 		goto out_put_disk;
 
 	if ((ctrl->quirks & NVME_QUIRK_LIGHTNVM) && id->vs[0] == 0x1) {
-		ret = nvme_nvm_register(ns, disk_name, node);
-		if (ret) {
+		if (nvme_nvm_register(ns, disk_name, node)) {
 			dev_warn(ctrl->device, "LightNVM init failure\n");
 			goto out_put_disk;
 		}
@@ -4106,6 +4052,7 @@ static void nvme_ns_remove(struct nvme_ns *ns)
 	if (test_and_set_bit(NVME_NS_REMOVING, &ns->flags))
 		return;
 
+	set_capacity(ns->disk, 0);
 	nvme_fault_inject_fini(&ns->fault_inject);
 
 	mutex_lock(&ns->ctrl->subsys->lock);
@@ -4143,17 +4090,79 @@ static void nvme_ns_remove_by_nsid(struct nvme_ctrl *ctrl, u32 nsid)
 	}
 }
 
+static void nvme_validate_ns(struct nvme_ns *ns, struct nvme_ns_ids *ids)
+{
+	struct nvme_id_ns *id;
+	int ret = NVME_SC_INVALID_NS | NVME_SC_DNR;
+
+	if (test_bit(NVME_NS_DEAD, &ns->flags))
+		goto out;
+
+	ret = nvme_identify_ns(ns->ctrl, ns->head->ns_id, ids, &id);
+	if (ret)
+		goto out;
+
+	ret = NVME_SC_INVALID_NS | NVME_SC_DNR;
+	if (!nvme_ns_ids_equal(&ns->head->ids, ids)) {
+		dev_err(ns->ctrl->device,
+			"identifiers changed for nsid %d\n", ns->head->ns_id);
+		goto out_free_id;
+	}
+
+	ret = nvme_update_ns_info(ns, id);
+
+out_free_id:
+	kfree(id);
+out:
+	/*
+	 * Only remove the namespace if we got a fatal error back from the
+	 * device, otherwise ignore the error and just move on.
+	 *
+	 * TODO: we should probably schedule a delayed retry here.
+	 */
+	if (ret > 0 && (ret & NVME_SC_DNR))
+		nvme_ns_remove(ns);
+}
+
 static void nvme_validate_or_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
 {
+	struct nvme_ns_ids ids = { };
 	struct nvme_ns *ns;
+
+	if (nvme_identify_ns_descs(ctrl, nsid, &ids))
+		return;
 
 	ns = nvme_find_get_ns(ctrl, nsid);
 	if (ns) {
-		if (revalidate_disk(ns->disk))
-			nvme_ns_remove(ns);
+		nvme_validate_ns(ns, &ids);
 		nvme_put_ns(ns);
-	} else
-		nvme_alloc_ns(ctrl, nsid);
+		return;
+	}
+
+	switch (ids.csi) {
+	case NVME_CSI_NVM:
+		nvme_alloc_ns(ctrl, nsid, &ids);
+		break;
+	case NVME_CSI_ZNS:
+		if (!IS_ENABLED(CONFIG_BLK_DEV_ZONED)) {
+			dev_warn(ctrl->device,
+				"nsid %u not supported without CONFIG_BLK_DEV_ZONED\n",
+				nsid);
+			break;
+		}
+		if (!nvme_multi_css(ctrl)) {
+			dev_warn(ctrl->device,
+				"command set not reported for nsid: %d\n",
+				nsid);
+			break;
+		}
+		nvme_alloc_ns(ctrl, nsid, &ids);
+		break;
+	default:
+		dev_warn(ctrl->device, "unknown csi %u for nsid %u\n",
+			ids.csi, nsid);
+		break;
+	}
 }
 
 static void nvme_remove_invalid_namespaces(struct nvme_ctrl *ctrl,
@@ -4189,9 +4198,19 @@ static int nvme_scan_ns_list(struct nvme_ctrl *ctrl)
 		return -ENOMEM;
 
 	for (;;) {
-		ret = nvme_identify_ns_list(ctrl, prev, ns_list);
-		if (ret)
+		struct nvme_command cmd = {
+			.identify.opcode	= nvme_admin_identify,
+			.identify.cns		= NVME_ID_CNS_NS_ACTIVE_LIST,
+			.identify.nsid		= cpu_to_le32(prev),
+		};
+
+		ret = nvme_submit_sync_cmd(ctrl->admin_q, &cmd, ns_list,
+					    NVME_IDENTIFY_DATA_SIZE);
+		if (ret) {
+			dev_warn(ctrl->device,
+				"Identify NS List failed (status=0x%x)\n", ret);
 			goto free;
+		}
 
 		for (i = 0; i < nr_entries; i++) {
 			u32 nsid = le32_to_cpu(ns_list[i]);
@@ -4763,28 +4782,13 @@ void nvme_sync_queues(struct nvme_ctrl *ctrl)
 }
 EXPORT_SYMBOL_GPL(nvme_sync_queues);
 
-struct nvme_ctrl *nvme_ctrl_get_by_path(const char *path)
+struct nvme_ctrl *nvme_ctrl_from_file(struct file *file)
 {
-	struct nvme_ctrl *ctrl;
-	struct file *f;
-
-	f = filp_open(path, O_RDWR, 0);
-	if (IS_ERR(f))
-		return ERR_CAST(f);
-
-	if (f->f_op != &nvme_dev_fops) {
-		ctrl = ERR_PTR(-EINVAL);
-		goto out_close;
-	}
-
-	ctrl = f->private_data;
-	nvme_get_ctrl(ctrl);
-
-out_close:
-	filp_close(f, NULL);
-	return ctrl;
+	if (file->f_op != &nvme_dev_fops)
+		return NULL;
+	return file->private_data;
 }
-EXPORT_SYMBOL_GPL(nvme_ctrl_get_by_path);
+EXPORT_SYMBOL_GPL(nvme_ctrl_from_file);
 
 /*
  * Check we didn't inadvertently grow the command structure sizes:
@@ -4804,6 +4808,8 @@ static inline void _nvme_check_size(void)
 	BUILD_BUG_ON(sizeof(struct nvme_command) != 64);
 	BUILD_BUG_ON(sizeof(struct nvme_id_ctrl) != NVME_IDENTIFY_DATA_SIZE);
 	BUILD_BUG_ON(sizeof(struct nvme_id_ns) != NVME_IDENTIFY_DATA_SIZE);
+	BUILD_BUG_ON(sizeof(struct nvme_id_ns_zns) != NVME_IDENTIFY_DATA_SIZE);
+	BUILD_BUG_ON(sizeof(struct nvme_id_ctrl_zns) != NVME_IDENTIFY_DATA_SIZE);
 	BUILD_BUG_ON(sizeof(struct nvme_lba_range_type) != 64);
 	BUILD_BUG_ON(sizeof(struct nvme_smart_log) != 512);
 	BUILD_BUG_ON(sizeof(struct nvme_dbbuf) != 64);

@@ -83,7 +83,7 @@ struct page {
 		struct {	/* Page cache and anonymous pages */
 			/**
 			 * @lru: Pageout list, eg. active_list protected by
-			 * pgdat->lru_lock.  Sometimes used as a generic list
+			 * lruvec->lru_lock.  Sometimes used as a generic list
 			 * by the page owner.
 			 */
 			struct list_head lru;
@@ -142,7 +142,8 @@ struct page {
 		};
 		struct {	/* Second tail page of compound page */
 			unsigned long _compound_pad_1;	/* compound_head */
-			unsigned long _compound_pad_2;
+			RH_KABI_REPLACE(unsigned long _compound_pad_2,
+					atomic_t hpage_pinned_refcount)
 			/* For both global and memcg */
 			struct list_head deferred_list;
 		};
@@ -197,10 +198,7 @@ struct page {
 
 #ifdef CONFIG_MEMCG
 	RH_KABI_REPLACE(struct mem_cgroup *mem_cgroup,
-			union {
-				struct mem_cgroup *mem_cgroup;
-				struct obj_cgroup **obj_cgroups;
-			})
+			unsigned long memcg_data)
 #endif
 
 	/*
@@ -226,6 +224,11 @@ struct page {
 static inline atomic_t *compound_mapcount_ptr(struct page *page)
 {
 	return &page[1].compound_mapcount;
+}
+
+static inline atomic_t *compound_pincount_ptr(struct page *page)
+{
+	return &page[2].hpage_pinned_refcount;
 }
 
 #define PAGE_FRAG_CACHE_MAX_SIZE	__ALIGN_MASK(32768, ~PAGE_MASK)

@@ -31,7 +31,6 @@
 #include <net/net_namespace.h>
 #include <net/sock.h>
 #include <net/devlink.h>
-#include <net/drop_monitor.h>
 #define CREATE_TRACE_POINTS
 #include <trace/events/devlink.h>
 
@@ -467,10 +466,132 @@ static int devlink_nl_put_handle(struct sk_buff *msg, struct devlink *devlink)
 	return 0;
 }
 
+struct devlink_reload_combination {
+	enum devlink_reload_action action;
+	enum devlink_reload_limit limit;
+};
+
+static const struct devlink_reload_combination devlink_reload_invalid_combinations[] = {
+	{
+		/* can't reinitialize driver with no down time */
+		.action = DEVLINK_RELOAD_ACTION_DRIVER_REINIT,
+		.limit = DEVLINK_RELOAD_LIMIT_NO_RESET,
+	},
+};
+
+static bool
+devlink_reload_combination_is_invalid(enum devlink_reload_action action,
+				      enum devlink_reload_limit limit)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(devlink_reload_invalid_combinations); i++)
+		if (devlink_reload_invalid_combinations[i].action == action &&
+		    devlink_reload_invalid_combinations[i].limit == limit)
+			return true;
+	return false;
+}
+
+static bool
+devlink_reload_action_is_supported(struct devlink *devlink, enum devlink_reload_action action)
+{
+	return test_bit(action, &devlink->ops->reload_actions);
+}
+
+static bool
+devlink_reload_limit_is_supported(struct devlink *devlink, enum devlink_reload_limit limit)
+{
+	return test_bit(limit, &devlink->ops->reload_limits);
+}
+
+static int devlink_reload_stat_put(struct sk_buff *msg,
+				   enum devlink_reload_limit limit, u32 value)
+{
+	struct nlattr *reload_stats_entry;
+
+	reload_stats_entry = nla_nest_start(msg, DEVLINK_ATTR_RELOAD_STATS_ENTRY);
+	if (!reload_stats_entry)
+		return -EMSGSIZE;
+
+	if (nla_put_u8(msg, DEVLINK_ATTR_RELOAD_STATS_LIMIT, limit) ||
+	    nla_put_u32(msg, DEVLINK_ATTR_RELOAD_STATS_VALUE, value))
+		goto nla_put_failure;
+	nla_nest_end(msg, reload_stats_entry);
+	return 0;
+
+nla_put_failure:
+	nla_nest_cancel(msg, reload_stats_entry);
+	return -EMSGSIZE;
+}
+
+static int devlink_reload_stats_put(struct sk_buff *msg, struct devlink *devlink, bool is_remote)
+{
+	struct nlattr *reload_stats_attr, *act_info, *act_stats;
+	int i, j, stat_idx;
+	u32 value;
+
+	if (!is_remote)
+		reload_stats_attr = nla_nest_start(msg, DEVLINK_ATTR_RELOAD_STATS);
+	else
+		reload_stats_attr = nla_nest_start(msg, DEVLINK_ATTR_REMOTE_RELOAD_STATS);
+
+	if (!reload_stats_attr)
+		return -EMSGSIZE;
+
+	for (i = 0; i <= DEVLINK_RELOAD_ACTION_MAX; i++) {
+		if ((!is_remote &&
+		     !devlink_reload_action_is_supported(devlink, i)) ||
+		    i == DEVLINK_RELOAD_ACTION_UNSPEC)
+			continue;
+		act_info = nla_nest_start(msg, DEVLINK_ATTR_RELOAD_ACTION_INFO);
+		if (!act_info)
+			goto nla_put_failure;
+
+		if (nla_put_u8(msg, DEVLINK_ATTR_RELOAD_ACTION, i))
+			goto action_info_nest_cancel;
+		act_stats = nla_nest_start(msg, DEVLINK_ATTR_RELOAD_ACTION_STATS);
+		if (!act_stats)
+			goto action_info_nest_cancel;
+
+		for (j = 0; j <= DEVLINK_RELOAD_LIMIT_MAX; j++) {
+			/* Remote stats are shown even if not locally supported.
+			 * Stats of actions with unspecified limit are shown
+			 * though drivers don't need to register unspecified
+			 * limit.
+			 */
+			if ((!is_remote && j != DEVLINK_RELOAD_LIMIT_UNSPEC &&
+			     !devlink_reload_limit_is_supported(devlink, j)) ||
+			    devlink_reload_combination_is_invalid(i, j))
+				continue;
+
+			stat_idx = j * __DEVLINK_RELOAD_ACTION_MAX + i;
+			if (!is_remote)
+				value = devlink->stats.reload_stats[stat_idx];
+			else
+				value = devlink->stats.remote_reload_stats[stat_idx];
+			if (devlink_reload_stat_put(msg, j, value))
+				goto action_stats_nest_cancel;
+		}
+		nla_nest_end(msg, act_stats);
+		nla_nest_end(msg, act_info);
+	}
+	nla_nest_end(msg, reload_stats_attr);
+	return 0;
+
+action_stats_nest_cancel:
+	nla_nest_cancel(msg, act_stats);
+action_info_nest_cancel:
+	nla_nest_cancel(msg, act_info);
+nla_put_failure:
+	nla_nest_cancel(msg, reload_stats_attr);
+	return -EMSGSIZE;
+}
+
 static int devlink_nl_fill(struct sk_buff *msg, struct devlink *devlink,
 			   enum devlink_command cmd, u32 portid,
 			   u32 seq, int flags)
 {
+	struct nlattr *dev_stats;
 	void *hdr;
 
 	hdr = genlmsg_put(msg, portid, seq, &devlink_nl_family, flags, cmd);
@@ -482,9 +603,21 @@ static int devlink_nl_fill(struct sk_buff *msg, struct devlink *devlink,
 	if (nla_put_u8(msg, DEVLINK_ATTR_RELOAD_FAILED, devlink->reload_failed))
 		goto nla_put_failure;
 
+	dev_stats = nla_nest_start(msg, DEVLINK_ATTR_DEV_STATS);
+	if (!dev_stats)
+		goto nla_put_failure;
+
+	if (devlink_reload_stats_put(msg, devlink, false))
+		goto dev_stats_nest_cancel;
+	if (devlink_reload_stats_put(msg, devlink, true))
+		goto dev_stats_nest_cancel;
+
+	nla_nest_end(msg, dev_stats);
 	genlmsg_end(msg, hdr);
 	return 0;
 
+dev_stats_nest_cancel:
+	nla_nest_cancel(msg, dev_stats);
 nla_put_failure:
 	genlmsg_cancel(msg, hdr);
 	return -EMSGSIZE;
@@ -528,15 +661,20 @@ static int devlink_nl_port_attrs_put(struct sk_buff *msg,
 		return -EMSGSIZE;
 	switch (devlink_port->attrs.flavour) {
 	case DEVLINK_PORT_FLAVOUR_PCI_PF:
-		if (nla_put_u16(msg, DEVLINK_ATTR_PORT_PCI_PF_NUMBER,
-				attrs->pci_pf.pf))
+		if (nla_put_u32(msg, DEVLINK_ATTR_PORT_CONTROLLER_NUMBER,
+				attrs->pci_pf.controller) ||
+		    nla_put_u16(msg, DEVLINK_ATTR_PORT_PCI_PF_NUMBER, attrs->pci_pf.pf))
+			return -EMSGSIZE;
+		if (nla_put_u8(msg, DEVLINK_ATTR_PORT_EXTERNAL, attrs->pci_pf.external))
 			return -EMSGSIZE;
 		break;
 	case DEVLINK_PORT_FLAVOUR_PCI_VF:
-		if (nla_put_u16(msg, DEVLINK_ATTR_PORT_PCI_PF_NUMBER,
-				attrs->pci_vf.pf) ||
-		    nla_put_u16(msg, DEVLINK_ATTR_PORT_PCI_VF_NUMBER,
-				attrs->pci_vf.vf))
+		if (nla_put_u32(msg, DEVLINK_ATTR_PORT_CONTROLLER_NUMBER,
+				attrs->pci_vf.controller) ||
+		    nla_put_u16(msg, DEVLINK_ATTR_PORT_PCI_PF_NUMBER, attrs->pci_vf.pf) ||
+		    nla_put_u16(msg, DEVLINK_ATTR_PORT_PCI_VF_NUMBER, attrs->pci_vf.vf))
+			return -EMSGSIZE;
+		if (nla_put_u8(msg, DEVLINK_ATTR_PORT_EXTERNAL, attrs->pci_vf.external))
 			return -EMSGSIZE;
 		break;
 	case DEVLINK_PORT_FLAVOUR_PHYSICAL:
@@ -2973,30 +3111,129 @@ bool devlink_is_reload_failed(const struct devlink *devlink)
 }
 EXPORT_SYMBOL_GPL(devlink_is_reload_failed);
 
-static int devlink_reload(struct devlink *devlink, struct net *dest_net,
-			  struct netlink_ext_ack *extack)
+static void
+__devlink_reload_stats_update(struct devlink *devlink, u32 *reload_stats,
+			      enum devlink_reload_limit limit, u32 actions_performed)
 {
+	unsigned long actions = actions_performed;
+	int stat_idx;
+	int action;
+
+	for_each_set_bit(action, &actions, __DEVLINK_RELOAD_ACTION_MAX) {
+		stat_idx = limit * __DEVLINK_RELOAD_ACTION_MAX + action;
+		reload_stats[stat_idx]++;
+	}
+	devlink_notify(devlink, DEVLINK_CMD_NEW);
+}
+
+static void
+devlink_reload_stats_update(struct devlink *devlink, enum devlink_reload_limit limit,
+			    u32 actions_performed)
+{
+	__devlink_reload_stats_update(devlink, devlink->stats.reload_stats, limit,
+				      actions_performed);
+}
+
+/**
+ *	devlink_remote_reload_actions_performed - Update devlink on reload actions
+ *	  performed which are not a direct result of devlink reload call.
+ *
+ *	This should be called by a driver after performing reload actions in case it was not
+ *	a result of devlink reload call. For example fw_activate was performed as a result
+ *	of devlink reload triggered fw_activate on another host.
+ *	The motivation for this function is to keep data on reload actions performed on this
+ *	function whether it was done due to direct devlink reload call or not.
+ *
+ *	@devlink: devlink
+ *	@limit: reload limit
+ *	@actions_performed: bitmask of actions performed
+ */
+void devlink_remote_reload_actions_performed(struct devlink *devlink,
+					     enum devlink_reload_limit limit,
+					     u32 actions_performed)
+{
+	if (WARN_ON(!actions_performed ||
+		    actions_performed & BIT(DEVLINK_RELOAD_ACTION_UNSPEC) ||
+		    actions_performed >= BIT(__DEVLINK_RELOAD_ACTION_MAX) ||
+		    limit > DEVLINK_RELOAD_LIMIT_MAX))
+		return;
+
+	__devlink_reload_stats_update(devlink, devlink->stats.remote_reload_stats, limit,
+				      actions_performed);
+}
+EXPORT_SYMBOL_GPL(devlink_remote_reload_actions_performed);
+
+static int devlink_reload(struct devlink *devlink, struct net *dest_net,
+			  enum devlink_reload_action action, enum devlink_reload_limit limit,
+			  u32 *actions_performed, struct netlink_ext_ack *extack)
+{
+	u32 remote_reload_stats[DEVLINK_RELOAD_STATS_ARRAY_SIZE];
 	int err;
 
 	if (!devlink->reload_enabled)
 		return -EOPNOTSUPP;
 
-	err = devlink->ops->reload_down(devlink, !!dest_net, extack);
+	memcpy(remote_reload_stats, devlink->stats.remote_reload_stats,
+	       sizeof(remote_reload_stats));
+	err = devlink->ops->reload_down(devlink, !!dest_net, action, limit, extack);
 	if (err)
 		return err;
 
 	if (dest_net && !net_eq(dest_net, devlink_net(devlink)))
 		devlink_reload_netns_change(devlink, dest_net);
 
-	err = devlink->ops->reload_up(devlink, extack);
+	err = devlink->ops->reload_up(devlink, action, limit, actions_performed, extack);
 	devlink_reload_failed_set(devlink, !!err);
-	return err;
+	if (err)
+		return err;
+
+	WARN_ON(!(*actions_performed & BIT(action)));
+	/* Catch driver on updating the remote action within devlink reload */
+	WARN_ON(memcmp(remote_reload_stats, devlink->stats.remote_reload_stats,
+		       sizeof(remote_reload_stats)));
+	devlink_reload_stats_update(devlink, limit, *actions_performed);
+	return 0;
+}
+
+static int
+devlink_nl_reload_actions_performed_snd(struct devlink *devlink, u32 actions_performed,
+					enum devlink_command cmd, struct genl_info *info)
+{
+	struct sk_buff *msg;
+	void *hdr;
+
+	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+	if (!msg)
+		return -ENOMEM;
+
+	hdr = genlmsg_put(msg, info->snd_portid, info->snd_seq, &devlink_nl_family, 0, cmd);
+	if (!hdr)
+		goto free_msg;
+
+	if (devlink_nl_put_handle(msg, devlink))
+		goto nla_put_failure;
+
+	if (nla_put_bitfield32(msg, DEVLINK_ATTR_RELOAD_ACTIONS_PERFORMED, actions_performed,
+			       actions_performed))
+		goto nla_put_failure;
+	genlmsg_end(msg, hdr);
+
+	return genlmsg_reply(msg, info);
+
+nla_put_failure:
+	genlmsg_cancel(msg, hdr);
+free_msg:
+	nlmsg_free(msg);
+	return -EMSGSIZE;
 }
 
 static int devlink_nl_cmd_reload(struct sk_buff *skb, struct genl_info *info)
 {
 	struct devlink *devlink = info->user_ptr[0];
+	enum devlink_reload_action action;
+	enum devlink_reload_limit limit;
 	struct net *dest_net = NULL;
+	u32 actions_performed;
 	int err;
 
 	if (!devlink_reload_supported(devlink->ops))
@@ -3016,12 +3253,61 @@ static int devlink_nl_cmd_reload(struct sk_buff *skb, struct genl_info *info)
 			return PTR_ERR(dest_net);
 	}
 
-	err = devlink_reload(devlink, dest_net, info->extack);
+	if (info->attrs[DEVLINK_ATTR_RELOAD_ACTION])
+		action = nla_get_u8(info->attrs[DEVLINK_ATTR_RELOAD_ACTION]);
+	else
+		action = DEVLINK_RELOAD_ACTION_DRIVER_REINIT;
+
+	if (!devlink_reload_action_is_supported(devlink, action)) {
+		NL_SET_ERR_MSG_MOD(info->extack,
+				   "Requested reload action is not supported by the driver");
+		return -EOPNOTSUPP;
+	}
+
+	limit = DEVLINK_RELOAD_LIMIT_UNSPEC;
+	if (info->attrs[DEVLINK_ATTR_RELOAD_LIMITS]) {
+		struct nla_bitfield32 limits;
+		u32 limits_selected;
+
+		limits = nla_get_bitfield32(info->attrs[DEVLINK_ATTR_RELOAD_LIMITS]);
+		limits_selected = limits.value & limits.selector;
+		if (!limits_selected) {
+			NL_SET_ERR_MSG_MOD(info->extack, "Invalid limit selected");
+			return -EINVAL;
+		}
+		for (limit = 0 ; limit <= DEVLINK_RELOAD_LIMIT_MAX ; limit++)
+			if (limits_selected & BIT(limit))
+				break;
+		/* UAPI enables multiselection, but currently it is not used */
+		if (limits_selected != BIT(limit)) {
+			NL_SET_ERR_MSG_MOD(info->extack,
+					   "Multiselection of limit is not supported");
+			return -EOPNOTSUPP;
+		}
+		if (!devlink_reload_limit_is_supported(devlink, limit)) {
+			NL_SET_ERR_MSG_MOD(info->extack,
+					   "Requested limit is not supported by the driver");
+			return -EOPNOTSUPP;
+		}
+		if (devlink_reload_combination_is_invalid(action, limit)) {
+			NL_SET_ERR_MSG_MOD(info->extack,
+					   "Requested limit is invalid for this action");
+			return -EINVAL;
+		}
+	}
+	err = devlink_reload(devlink, dest_net, action, limit, &actions_performed, info->extack);
 
 	if (dest_net)
 		put_net(dest_net);
 
-	return err;
+	if (err)
+		return err;
+	/* For backward compatibility generate reply only if attributes used by user */
+	if (!info->attrs[DEVLINK_ATTR_RELOAD_ACTION] && !info->attrs[DEVLINK_ATTR_RELOAD_LIMITS])
+		return 0;
+
+	return devlink_nl_reload_actions_performed_snd(devlink, actions_performed,
+						       DEVLINK_CMD_RELOAD, info);
 }
 
 static int devlink_nl_flash_update_fill(struct sk_buff *msg,
@@ -3095,7 +3381,7 @@ out_free_msg:
 	nlmsg_free(msg);
 }
 
-void devlink_flash_update_begin_notify(struct devlink *devlink)
+static void devlink_flash_update_begin_notify(struct devlink *devlink)
 {
 	struct devlink_flash_notify params = { 0 };
 
@@ -3103,9 +3389,8 @@ void devlink_flash_update_begin_notify(struct devlink *devlink)
 				      DEVLINK_CMD_FLASH_UPDATE,
 				      &params);
 }
-EXPORT_SYMBOL_GPL(devlink_flash_update_begin_notify);
 
-void devlink_flash_update_end_notify(struct devlink *devlink)
+static void devlink_flash_update_end_notify(struct devlink *devlink)
 {
 	struct devlink_flash_notify params = { 0 };
 
@@ -3113,7 +3398,6 @@ void devlink_flash_update_end_notify(struct devlink *devlink)
 				      DEVLINK_CMD_FLASH_UPDATE_END,
 				      &params);
 }
-EXPORT_SYMBOL_GPL(devlink_flash_update_end_notify);
 
 void devlink_flash_update_status_notify(struct devlink *devlink,
 					const char *status_msg,
@@ -3154,22 +3438,59 @@ EXPORT_SYMBOL_GPL(devlink_flash_update_timeout_notify);
 static int devlink_nl_cmd_flash_update(struct sk_buff *skb,
 				       struct genl_info *info)
 {
+	struct nlattr *nla_component, *nla_overwrite_mask, *nla_file_name;
+	struct devlink_flash_update_params params = {};
 	struct devlink *devlink = info->user_ptr[0];
-	const char *file_name, *component;
-	struct nlattr *nla_component;
+	const char *file_name;
+	u32 supported_params;
+	int ret;
 
 	if (!devlink->ops->flash_update)
 		return -EOPNOTSUPP;
 
 	if (!info->attrs[DEVLINK_ATTR_FLASH_UPDATE_FILE_NAME])
 		return -EINVAL;
-	file_name = nla_data(info->attrs[DEVLINK_ATTR_FLASH_UPDATE_FILE_NAME]);
+
+	supported_params = devlink->ops->supported_flash_update_params;
 
 	nla_component = info->attrs[DEVLINK_ATTR_FLASH_UPDATE_COMPONENT];
-	component = nla_component ? nla_data(nla_component) : NULL;
+	if (nla_component) {
+		if (!(supported_params & DEVLINK_SUPPORT_FLASH_UPDATE_COMPONENT)) {
+			NL_SET_ERR_MSG_ATTR(info->extack, nla_component,
+					    "component update is not supported by this device");
+			return -EOPNOTSUPP;
+		}
+		params.component = nla_data(nla_component);
+	}
 
-	return devlink->ops->flash_update(devlink, file_name, component,
-					  info->extack);
+	nla_overwrite_mask = info->attrs[DEVLINK_ATTR_FLASH_UPDATE_OVERWRITE_MASK];
+	if (nla_overwrite_mask) {
+		struct nla_bitfield32 sections;
+
+		if (!(supported_params & DEVLINK_SUPPORT_FLASH_UPDATE_OVERWRITE_MASK)) {
+			NL_SET_ERR_MSG_ATTR(info->extack, nla_overwrite_mask,
+					    "overwrite settings are not supported by this device");
+			return -EOPNOTSUPP;
+		}
+		sections = nla_get_bitfield32(nla_overwrite_mask);
+		params.overwrite_mask = sections.value & sections.selector;
+	}
+
+	nla_file_name = info->attrs[DEVLINK_ATTR_FLASH_UPDATE_FILE_NAME];
+	file_name = nla_data(nla_file_name);
+	ret = request_firmware(&params.fw, file_name, devlink->dev);
+	if (ret) {
+		NL_SET_ERR_MSG_ATTR(info->extack, nla_file_name, "failed to locate the requested firmware file");
+		return ret;
+	}
+
+	devlink_flash_update_begin_notify(devlink);
+	ret = devlink->ops->flash_update(devlink, &params, info->extack);
+	devlink_flash_update_end_notify(devlink);
+
+	release_firmware(params.fw);
+
+	return ret;
 }
 
 static const struct devlink_param devlink_param_generic[] = {
@@ -4476,27 +4797,17 @@ static int devlink_nl_region_read_snapshot_fill(struct sk_buff *skb,
 static int devlink_nl_cmd_region_read_dumpit(struct sk_buff *skb,
 					     struct netlink_callback *cb)
 {
+	const struct genl_dumpit_info *info = genl_dumpit_info(cb);
 	u64 ret_offset, start_offset, end_offset = U64_MAX;
+	struct nlattr **attrs = info->attrs;
 	struct devlink_region *region;
 	struct nlattr *chunks_attr;
 	const char *region_name;
 	struct devlink *devlink;
-	struct nlattr **attrs;
 	void *hdr;
 	int err;
 
 	start_offset = *((u64 *)&cb->args[0]);
-
-	attrs = kmalloc_array(DEVLINK_ATTR_MAX + 1, sizeof(*attrs), GFP_KERNEL);
-	if (!attrs)
-		return -ENOMEM;
-
-	err = nlmsg_parse_deprecated(cb->nlh,
-				     GENL_HDRLEN + devlink_nl_family.hdrsize,
-				     attrs, DEVLINK_ATTR_MAX,
-				     devlink_nl_family.policy, cb->extack);
-	if (err)
-		goto out_free;
 
 	mutex_lock(&devlink_mutex);
 	devlink = devlink_get_from_attrs(sock_net(cb->skb->sk), attrs);
@@ -4581,7 +4892,6 @@ static int devlink_nl_cmd_region_read_dumpit(struct sk_buff *skb,
 	genlmsg_end(skb, hdr);
 	mutex_unlock(&devlink->lock);
 	mutex_unlock(&devlink_mutex);
-	kfree(attrs);
 
 	return skb->len;
 
@@ -4591,8 +4901,6 @@ out_unlock:
 	mutex_unlock(&devlink->lock);
 out_dev:
 	mutex_unlock(&devlink_mutex);
-out_free:
-	kfree(attrs);
 	return err;
 }
 
@@ -5839,21 +6147,10 @@ devlink_health_reporter_get_from_info(struct devlink *devlink,
 static struct devlink_health_reporter *
 devlink_health_reporter_get_from_cb(struct netlink_callback *cb)
 {
+	const struct genl_dumpit_info *info = genl_dumpit_info(cb);
 	struct devlink_health_reporter *reporter;
+	struct nlattr **attrs = info->attrs;
 	struct devlink *devlink;
-	struct nlattr **attrs;
-	int err;
-
-	attrs = kmalloc_array(DEVLINK_ATTR_MAX + 1, sizeof(*attrs), GFP_KERNEL);
-	if (!attrs)
-		return NULL;
-
-	err = nlmsg_parse_deprecated(cb->nlh,
-				     GENL_HDRLEN + devlink_nl_family.hdrsize,
-				     attrs, DEVLINK_ATTR_MAX,
-				     devlink_nl_family.policy, cb->extack);
-	if (err)
-		goto free;
 
 	mutex_lock(&devlink_mutex);
 	devlink = devlink_get_from_attrs(sock_net(cb->skb->sk), attrs);
@@ -5862,12 +6159,9 @@ devlink_health_reporter_get_from_cb(struct netlink_callback *cb)
 
 	reporter = devlink_health_reporter_get_from_attrs(devlink, attrs);
 	mutex_unlock(&devlink_mutex);
-	kfree(attrs);
 	return reporter;
 unlock:
 	mutex_unlock(&devlink_mutex);
-free:
-	kfree(attrs);
 	return NULL;
 }
 
@@ -7104,6 +7398,11 @@ static int devlink_nl_cmd_trap_policer_set_doit(struct sk_buff *skb,
 	return devlink_trap_policer_set(devlink, policer_item, info);
 }
 
+
+/* RHEL: variable for RHEL specific macro NLA_POLICY_BITFIELD32_PTR */
+static const u32 supported_flash_overwrite_sections = DEVLINK_SUPPORTED_FLASH_OVERWRITE_SECTIONS;
+static const u32 reload_limits_valid_mask = DEVLINK_RELOAD_LIMITS_VALID_MASK;
+
 static const struct nla_policy devlink_nl_policy[DEVLINK_ATTR_MAX + 1] = {
 	[DEVLINK_ATTR_UNSPEC] = { .strict_start_type =
 		DEVLINK_ATTR_TRAP_POLICER_ID },
@@ -7140,6 +7439,8 @@ static const struct nla_policy devlink_nl_policy[DEVLINK_ATTR_MAX + 1] = {
 	[DEVLINK_ATTR_HEALTH_REPORTER_AUTO_RECOVER] = { .type = NLA_U8 },
 	[DEVLINK_ATTR_FLASH_UPDATE_FILE_NAME] = { .type = NLA_NUL_STRING },
 	[DEVLINK_ATTR_FLASH_UPDATE_COMPONENT] = { .type = NLA_NUL_STRING },
+	[DEVLINK_ATTR_FLASH_UPDATE_OVERWRITE_MASK] =
+		NLA_POLICY_BITFIELD32_PTR(&supported_flash_overwrite_sections),
 	[DEVLINK_ATTR_TRAP_NAME] = { .type = NLA_NUL_STRING },
 	[DEVLINK_ATTR_TRAP_ACTION] = { .type = NLA_U8 },
 	[DEVLINK_ATTR_TRAP_GROUP_NAME] = { .type = NLA_NUL_STRING },
@@ -7151,9 +7452,12 @@ static const struct nla_policy devlink_nl_policy[DEVLINK_ATTR_MAX + 1] = {
 	[DEVLINK_ATTR_TRAP_POLICER_RATE] = { .type = NLA_U64 },
 	[DEVLINK_ATTR_TRAP_POLICER_BURST] = { .type = NLA_U64 },
 	[DEVLINK_ATTR_PORT_FUNCTION] = { .type = NLA_NESTED },
+	[DEVLINK_ATTR_RELOAD_ACTION] = NLA_POLICY_RANGE(NLA_U8, DEVLINK_RELOAD_ACTION_DRIVER_REINIT,
+							DEVLINK_RELOAD_ACTION_MAX),
+	[DEVLINK_ATTR_RELOAD_LIMITS] = NLA_POLICY_BITFIELD32_PTR(&reload_limits_valid_mask),
 };
 
-static const struct genl_ops devlink_nl_ops[] = {
+static const struct genl_small_ops devlink_nl_ops[] = {
 	{
 		.cmd = DEVLINK_CMD_GET,
 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
@@ -7358,7 +7662,8 @@ static const struct genl_ops devlink_nl_ops[] = {
 	},
 	{
 		.cmd = DEVLINK_CMD_REGION_READ,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+		.validate = GENL_DONT_VALIDATE_STRICT |
+			    GENL_DONT_VALIDATE_DUMP_STRICT,
 		.dumpit = devlink_nl_cmd_region_read_dumpit,
 		.flags = GENL_ADMIN_PERM,
 	},
@@ -7477,11 +7782,40 @@ static struct genl_family devlink_nl_family __ro_after_init = {
 	.pre_doit	= devlink_nl_pre_doit,
 	.post_doit	= devlink_nl_post_doit,
 	.module		= THIS_MODULE,
-	.ops		= devlink_nl_ops,
-	.n_ops		= ARRAY_SIZE(devlink_nl_ops),
+	.small_ops	= devlink_nl_ops,
+	.n_small_ops	= ARRAY_SIZE(devlink_nl_ops),
 	.mcgrps		= devlink_nl_mcgrps,
 	.n_mcgrps	= ARRAY_SIZE(devlink_nl_mcgrps),
 };
+
+static bool devlink_reload_actions_valid(const struct devlink_ops *ops)
+{
+	const struct devlink_reload_combination *comb;
+	int i;
+
+	if (!devlink_reload_supported(ops)) {
+		if (WARN_ON(ops->reload_actions))
+			return false;
+		return true;
+	}
+
+	if (WARN_ON(!ops->reload_actions ||
+		    ops->reload_actions & BIT(DEVLINK_RELOAD_ACTION_UNSPEC) ||
+		    ops->reload_actions >= BIT(__DEVLINK_RELOAD_ACTION_MAX)))
+		return false;
+
+	if (WARN_ON(ops->reload_limits & BIT(DEVLINK_RELOAD_LIMIT_UNSPEC) ||
+		    ops->reload_limits >= BIT(__DEVLINK_RELOAD_LIMIT_MAX)))
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(devlink_reload_invalid_combinations); i++)  {
+		comb = &devlink_reload_invalid_combinations[i];
+		if (ops->reload_actions == BIT(comb->action) &&
+		    ops->reload_limits == BIT(comb->limit))
+			return false;
+	}
+	return true;
+}
 
 /**
  *	devlink_alloc - Allocate new devlink instance resources
@@ -7497,6 +7831,9 @@ struct devlink *devlink_alloc(const struct devlink_ops *ops, size_t priv_size)
 	struct devlink *devlink;
 
 	if (WARN_ON(!ops))
+		return NULL;
+
+	if (!devlink_reload_actions_valid(ops))
 		return NULL;
 
 	devlink = kzalloc(sizeof(*devlink) + priv_size, GFP_KERNEL);
@@ -7844,9 +8181,12 @@ EXPORT_SYMBOL_GPL(devlink_port_attrs_set);
  *	devlink_port_attrs_pci_pf_set - Set PCI PF port attributes
  *
  *	@devlink_port: devlink port
+ *	@controller: associated controller number for the devlink port instance
  *	@pf: associated PF for the devlink port instance
+ *	@external: indicates if the port is for an external controller
  */
-void devlink_port_attrs_pci_pf_set(struct devlink_port *devlink_port, u16 pf)
+void devlink_port_attrs_pci_pf_set(struct devlink_port *devlink_port, u32 controller,
+				   u16 pf, bool external)
 {
 	struct devlink_port_attrs *attrs = &devlink_port->attrs;
 	int ret;
@@ -7857,8 +8197,9 @@ void devlink_port_attrs_pci_pf_set(struct devlink_port *devlink_port, u16 pf)
 				       DEVLINK_PORT_FLAVOUR_PCI_PF);
 	if (ret)
 		return;
-
+	attrs->pci_pf.controller = controller;
 	attrs->pci_pf.pf = pf;
+	attrs->pci_pf.external = external;
 }
 EXPORT_SYMBOL_GPL(devlink_port_attrs_pci_pf_set);
 
@@ -7866,11 +8207,13 @@ EXPORT_SYMBOL_GPL(devlink_port_attrs_pci_pf_set);
  *	devlink_port_attrs_pci_vf_set - Set PCI VF port attributes
  *
  *	@devlink_port: devlink port
+ *	@controller: associated controller number for the devlink port instance
  *	@pf: associated PF for the devlink port instance
  *	@vf: associated VF of a PF for the devlink port instance
+ *	@external: indicates if the port is for an external controller
  */
-void devlink_port_attrs_pci_vf_set(struct devlink_port *devlink_port,
-				   u16 pf, u16 vf)
+void devlink_port_attrs_pci_vf_set(struct devlink_port *devlink_port, u32 controller,
+				   u16 pf, u16 vf, bool external)
 {
 	struct devlink_port_attrs *attrs = &devlink_port->attrs;
 	int ret;
@@ -7881,8 +8224,10 @@ void devlink_port_attrs_pci_vf_set(struct devlink_port *devlink_port,
 				       DEVLINK_PORT_FLAVOUR_PCI_VF);
 	if (ret)
 		return;
+	attrs->pci_vf.controller = controller;
 	attrs->pci_vf.pf = pf;
 	attrs->pci_vf.vf = vf;
+	attrs->pci_vf.external = external;
 }
 EXPORT_SYMBOL_GPL(devlink_port_attrs_pci_vf_set);
 
@@ -9307,24 +9652,6 @@ devlink_trap_stats_update(struct devlink_stats __percpu *trap_stats,
 }
 
 static void
-devlink_trap_report_metadata_fill(struct net_dm_hw_metadata *hw_metadata,
-				  const struct devlink_trap_item *trap_item,
-				  struct devlink_port *in_devlink_port,
-				  const struct flow_action_cookie *fa_cookie)
-{
-	struct devlink_trap_group_item *group_item = trap_item->group_item;
-
-	hw_metadata->trap_group_name = group_item->group->name;
-	hw_metadata->trap_name = trap_item->trap->name;
-	hw_metadata->fa_cookie = fa_cookie;
-
-	spin_lock(&in_devlink_port->type_lock);
-	if (in_devlink_port->type == DEVLINK_PORT_TYPE_ETH)
-		hw_metadata->input_dev = in_devlink_port->type_dev;
-	spin_unlock(&in_devlink_port->type_lock);
-}
-
-static void
 devlink_trap_report_metadata_set(struct devlink_trap_metadata *metadata,
 				 const struct devlink_trap_item *trap_item,
 				 struct devlink_port *in_devlink_port,
@@ -9333,6 +9660,7 @@ devlink_trap_report_metadata_set(struct devlink_trap_metadata *metadata,
 	metadata->trap_name = trap_item->trap->name;
 	metadata->trap_group_name = trap_item->group_item->group->name;
 	metadata->fa_cookie = fa_cookie;
+	metadata->trap_type = trap_item->trap->type;
 
 	spin_lock(&in_devlink_port->type_lock);
 	if (in_devlink_port->type == DEVLINK_PORT_TYPE_ETH)
@@ -9354,21 +9682,9 @@ void devlink_trap_report(struct devlink *devlink, struct sk_buff *skb,
 
 {
 	struct devlink_trap_item *trap_item = trap_ctx;
-	struct net_dm_hw_metadata hw_metadata = {};
 
 	devlink_trap_stats_update(trap_item->stats, skb->len);
 	devlink_trap_stats_update(trap_item->group_item->stats, skb->len);
-
-	/* Control packets were not dropped by the device or encountered an
-	 * exception during forwarding and therefore should not be reported to
-	 * the kernel's drop monitor.
-	 */
-	if (trap_item->trap->type == DEVLINK_TRAP_TYPE_CONTROL)
-		return;
-
-	devlink_trap_report_metadata_fill(&hw_metadata, trap_item,
-					  in_devlink_port, fa_cookie);
-	net_dm_hw_report(skb, &hw_metadata);
 
 	if (trace_devlink_trap_report_enabled()) {
 		struct devlink_trap_metadata metadata = {};
@@ -9735,6 +10051,7 @@ out:
 
 int devlink_compat_flash_update(struct net_device *dev, const char *file_name)
 {
+	struct devlink_flash_update_params params = {};
 	struct devlink *devlink;
 	int ret;
 
@@ -9747,9 +10064,17 @@ int devlink_compat_flash_update(struct net_device *dev, const char *file_name)
 		goto out;
 	}
 
+	ret = request_firmware(&params.fw, file_name, devlink->dev);
+	if (ret)
+		goto out;
+
 	mutex_lock(&devlink->lock);
-	ret = devlink->ops->flash_update(devlink, file_name, NULL, NULL);
+	devlink_flash_update_begin_notify(devlink);
+	ret = devlink->ops->flash_update(devlink, &params, NULL);
+	devlink_flash_update_end_notify(devlink);
 	mutex_unlock(&devlink->lock);
+
+	release_firmware(params.fw);
 
 out:
 	rtnl_lock();
@@ -9797,6 +10122,7 @@ int devlink_compat_switch_id_get(struct net_device *dev,
 static void __net_exit devlink_pernet_pre_exit(struct net *net)
 {
 	struct devlink *devlink;
+	u32 actions_performed;
 	int err;
 
 	/* In case network namespace is getting destroyed, reload
@@ -9807,7 +10133,10 @@ static void __net_exit devlink_pernet_pre_exit(struct net *net)
 		if (net_eq(devlink_net(devlink), net)) {
 			if (WARN_ON(!devlink_reload_supported(devlink->ops)))
 				continue;
-			err = devlink_reload(devlink, &init_net, NULL);
+			err = devlink_reload(devlink, &init_net,
+					     DEVLINK_RELOAD_ACTION_DRIVER_REINIT,
+					     DEVLINK_RELOAD_LIMIT_UNSPEC,
+					     &actions_performed, NULL);
 			if (err && err != -EOPNOTSUPP)
 				pr_warn("Failed to reload devlink instance into init_net\n");
 		}

@@ -16,6 +16,7 @@
 #include "igc.h"
 #include "igc_hw.h"
 #include "igc_tsn.h"
+#include <generated/utsrelease.h>
 
 #define DRV_SUMMARY	"Intel(R) 2.5G Ethernet Linux Driver"
 
@@ -26,6 +27,7 @@ static int debug = -1;
 MODULE_AUTHOR("Intel Corporation, <linux.nics@intel.com>");
 MODULE_DESCRIPTION(DRV_SUMMARY);
 MODULE_LICENSE("GPL v2");
+MODULE_VERSION(UTS_RELEASE);
 module_param(debug, int, 0);
 MODULE_PARM_DESC(debug, "Debug level (0=none,...,16=all)");
 
@@ -1652,18 +1654,13 @@ static void igc_reuse_rx_page(struct igc_ring *rx_ring,
 	new_buff->pagecnt_bias	= old_buff->pagecnt_bias;
 }
 
-static inline bool igc_page_is_reserved(struct page *page)
-{
-	return (page_to_nid(page) != numa_mem_id()) || page_is_pfmemalloc(page);
-}
-
 static bool igc_can_reuse_rx_page(struct igc_rx_buffer *rx_buffer)
 {
 	unsigned int pagecnt_bias = rx_buffer->pagecnt_bias;
 	struct page *page = rx_buffer->page;
 
-	/* avoid re-using remote pages */
-	if (unlikely(igc_page_is_reserved(page)))
+	/* avoid re-using remote and pfmemalloc pages */
+	if (!dev_page_is_reusable(page))
 		return false;
 
 #if (PAGE_SIZE < 8192)

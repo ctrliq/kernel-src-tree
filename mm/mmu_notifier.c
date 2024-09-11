@@ -577,6 +577,15 @@ int __mmu_notifier_register(struct mmu_notifier *mn, struct mm_struct *mm)
 	lockdep_assert_held_write(&mm->mmap_sem);
 	BUG_ON(atomic_read(&mm->mm_users) <= 0);
 
+	if (mn) {
+		mn->_rh = kmalloc(sizeof(*mn->_rh), GFP_KERNEL);
+		if (!mn->_rh) {
+			return -ENOMEM;
+		}
+		mn->_rh->back_ptr = mn;
+		RH_KABI_AUX_SET_SIZE(mn, mmu_notifier);
+	}
+
 	if (!mm->mmu_notifier_mm) {
 		/*
 		 * kmalloc cannot be called under mm_take_all_locks(), but we
@@ -585,8 +594,10 @@ int __mmu_notifier_register(struct mmu_notifier *mn, struct mm_struct *mm)
 		 */
 		mmu_notifier_mm =
 			kzalloc(sizeof(struct mmu_notifier_mm), GFP_KERNEL);
-		if (!mmu_notifier_mm)
-			return -ENOMEM;
+		if (!mmu_notifier_mm) {
+			ret = -ENOMEM;
+			goto out_free_rh;
+		}
 
 		INIT_HLIST_HEAD(&mmu_notifier_mm->list);
 		spin_lock_init(&mmu_notifier_mm->lock);
@@ -638,6 +649,9 @@ int __mmu_notifier_register(struct mmu_notifier *mn, struct mm_struct *mm)
 
 out_clean:
 	kfree(mmu_notifier_mm);
+out_free_rh:
+	if (mn)
+		kfree(mn->_rh);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(__mmu_notifier_register);
@@ -731,21 +745,11 @@ struct mmu_notifier *mmu_notifier_get_locked(const struct mmu_notifier_ops *ops,
 	if (IS_ERR(mn))
 		return mn;
 
-	mn->_rh = kmalloc(sizeof(*mn->_rh), GFP_KERNEL);
-	if (!mn->_rh) {
-		ret = -ENOMEM;
-		goto out_free;
-	}
-	mn->_rh->back_ptr = mn;
-	RH_KABI_AUX_SET_SIZE(mn, mmu_notifier);
-
 	mn->ops = ops;
 	ret = __mmu_notifier_register(mn, mm);
 	if (ret)
-		goto out_free_rh;
+		goto out_free;
 	return mn;
-out_free_rh:
-	kfree(mn->_rh);
 out_free:
 	mn->ops->free_notifier(mn);
 	return ERR_PTR(ret);
@@ -805,11 +809,18 @@ void mmu_notifier_unregister(struct mmu_notifier *mn, struct mm_struct *mm)
 	 */
 	synchronize_srcu(&srcu);
 
+	kfree(mn->_rh);
+
 	BUG_ON(atomic_read(&mm->mm_count) <= 0);
 
 	mmdrop(mm);
 }
 EXPORT_SYMBOL_GPL(mmu_notifier_unregister);
+
+static void mmu_notifier_rh_free_rcu(struct rcu_head *rcu)
+{
+	kfree(container_of(rcu, struct mmu_notifier_rh, rcu));
+}
 
 /*
  * Same as mmu_notifier_unregister but no callback and no srcu synchronization.
@@ -824,6 +835,8 @@ void mmu_notifier_unregister_no_release(struct mmu_notifier *mn,
 	 */
 	hlist_del_init_rcu(&mn->hlist);
 	spin_unlock(&mm->mmu_notifier_mm->lock);
+
+	call_srcu(&srcu, &mn->_rh->rcu, mmu_notifier_rh_free_rcu);
 
 	BUG_ON(atomic_read(&mm->mm_count) <= 0);
 	mmdrop(mm);

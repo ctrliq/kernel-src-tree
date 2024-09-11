@@ -1131,7 +1131,7 @@ int mlx5_ib_create_srq(struct ib_srq *srq, struct ib_srq_init_attr *init_attr,
 int mlx5_ib_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
 		       enum ib_srq_attr_mask attr_mask, struct ib_udata *udata);
 int mlx5_ib_query_srq(struct ib_srq *ibsrq, struct ib_srq_attr *srq_attr);
-void mlx5_ib_destroy_srq(struct ib_srq *srq, struct ib_udata *udata);
+int mlx5_ib_destroy_srq(struct ib_srq *srq, struct ib_udata *udata);
 int mlx5_ib_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
 			  const struct ib_recv_wr **bad_wr);
 int mlx5_ib_enable_lb(struct mlx5_ib_dev *dev, bool td, bool qp);
@@ -1154,7 +1154,7 @@ int mlx5_ib_read_wqe_srq(struct mlx5_ib_srq *srq, int wqe_index, void *buffer,
 			 size_t buflen, size_t *bc);
 int mlx5_ib_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 		      struct ib_udata *udata);
-void mlx5_ib_destroy_cq(struct ib_cq *cq, struct ib_udata *udata);
+int mlx5_ib_destroy_cq(struct ib_cq *cq, struct ib_udata *udata);
 int mlx5_ib_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc);
 int mlx5_ib_arm_cq(struct ib_cq *ibcq, enum ib_cq_notify_flags flags);
 int mlx5_ib_modify_cq(struct ib_cq *cq, u16 cq_count, u16 cq_period);
@@ -1169,8 +1169,7 @@ int mlx5_ib_advise_mr(struct ib_pd *pd,
 		      struct ib_sge *sg_list,
 		      u32 num_sge,
 		      struct uverbs_attr_bundle *attrs);
-struct ib_mw *mlx5_ib_alloc_mw(struct ib_pd *pd, enum ib_mw_type type,
-			       struct ib_udata *udata);
+int mlx5_ib_alloc_mw(struct ib_mw *mw, struct ib_udata *udata);
 int mlx5_ib_dealloc_mw(struct ib_mw *mw);
 int mlx5_ib_update_xlt(struct mlx5_ib_mr *mr, u64 idx, int npages,
 		       int page_shift, int flags);
@@ -1179,9 +1178,9 @@ struct mlx5_ib_mr *mlx5_ib_alloc_implicit_mr(struct mlx5_ib_pd *pd,
 					     int access_flags);
 void mlx5_ib_free_implicit_mr(struct mlx5_ib_mr *mr);
 void mlx5_ib_fence_odp_mr(struct mlx5_ib_mr *mr);
-int mlx5_ib_rereg_user_mr(struct ib_mr *ib_mr, int flags, u64 start,
-			  u64 length, u64 virt_addr, int access_flags,
-			  struct ib_pd *pd, struct ib_udata *udata);
+struct ib_mr *mlx5_ib_rereg_user_mr(struct ib_mr *ib_mr, int flags, u64 start,
+				    u64 length, u64 virt_addr, int access_flags,
+				    struct ib_pd *pd, struct ib_udata *udata);
 int mlx5_ib_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata);
 struct ib_mr *mlx5_ib_alloc_mr(struct ib_pd *pd, enum ib_mr_type mr_type,
 			       u32 max_num_sg);

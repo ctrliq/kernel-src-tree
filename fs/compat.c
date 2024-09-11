@@ -49,7 +49,6 @@ COMPAT_SYSCALL_DEFINE5(mount, const char __user *, dev_name,
 
 	retval = do_mount(kernel_dev, dir_name, kernel_type, flags, options);
 
- out3:
 	kfree(options);
  out2:
 	kfree(kernel_dev);

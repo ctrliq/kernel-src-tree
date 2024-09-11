@@ -2602,6 +2602,7 @@ static int __tipc_nl_add_node_links(struct net *net, struct tipc_nl_msg *msg,
 int tipc_nl_node_dump_link(struct sk_buff *skb, struct netlink_callback *cb)
 {
 	struct net *net = sock_net(skb->sk);
+	struct nlattr **attrs = genl_dumpit_info(cb)->attrs;
 	struct nlattr *link[TIPC_NLA_LINK_MAX + 1];
 	struct tipc_net *tn = net_generic(net, tipc_net_id);
 	struct tipc_node *node;
@@ -2616,12 +2617,6 @@ int tipc_nl_node_dump_link(struct sk_buff *skb, struct netlink_callback *cb)
 		return 0;
 
 	if (!prev_node) {
-		struct nlattr **attrs;
-
-		err = tipc_nlmsg_parse(cb->nlh, &attrs);
-		if (err)
-			return err;
-
 		/* Check if broadcast-receiver links dumping is needed */
 		if (attrs && attrs[TIPC_NLA_LINK]) {
 			err = nla_parse_nested_deprecated(link,

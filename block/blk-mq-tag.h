@@ -20,6 +20,12 @@ struct blk_mq_tags {
 
 	RH_KABI_EXTEND(struct sbitmap_queue *bitmap_tags)
 	RH_KABI_EXTEND(struct sbitmap_queue *breserved_tags)
+
+	/*
+	 * used to clear request reference in rqs[] before freeing one
+	 * request pool
+	 */
+	RH_KABI_EXTEND(spinlock_t lock)
 };
 
 extern struct blk_mq_tags *blk_mq_init_tags(unsigned int nr_tags,

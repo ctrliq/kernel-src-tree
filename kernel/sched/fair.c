@@ -1547,7 +1547,8 @@ struct task_numa_env {
 static unsigned long cpu_load(struct rq *rq);
 static unsigned long cpu_runnable(struct rq *rq);
 static unsigned long cpu_util(int cpu);
-static inline long adjust_numa_imbalance(int imbalance, int dst_running);
+static inline long adjust_numa_imbalance(int imbalance,
+					int dst_running, int dst_weight);
 
 static inline enum
 numa_type numa_classify(unsigned int imbalance_pct,
@@ -1927,7 +1928,8 @@ static void task_numa_find_cpu(struct task_numa_env *env,
 		src_running = env->src_stats.nr_running - 1;
 		dst_running = env->dst_stats.nr_running + 1;
 		imbalance = max(0, dst_running - src_running);
-		imbalance = adjust_numa_imbalance(imbalance, dst_running);
+		imbalance = adjust_numa_imbalance(imbalance, dst_running,
+							env->dst_stats.weight);
 
 		/* Use idle CPU if there is no imbalance */
 		if (!imbalance) {
@@ -6566,7 +6568,8 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 			 * Find the CPU with the maximum spare capacity in
 			 * the performance domain
 			 */
-			spare_cap = cpu_cap - util;
+			spare_cap = cpu_cap;
+			lsub_positive(&spare_cap, util);
 			if (spare_cap > max_spare_cap) {
 				max_spare_cap = spare_cap;
 				max_spare_cap_cpu = cpu;
@@ -6605,7 +6608,7 @@ fail:
 
 /*
  * select_task_rq_fair: Select target runqueue for the waking task in domains
- * that have the 'sd_flag' flag set. In practice, this is SD_BALANCE_WAKE,
+ * that have the relevant SD flag set. In practice, this is SD_BALANCE_WAKE,
  * SD_BALANCE_FORK, or SD_BALANCE_EXEC.
  *
  * Balances load by selecting the idlest CPU in the idlest group, or under
@@ -6616,13 +6619,15 @@ fail:
  * preempt must be disabled.
  */
 static int
-select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_flags)
+select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 {
+	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
 	struct sched_domain *tmp, *sd = NULL;
 	int cpu = smp_processor_id();
 	int new_cpu = prev_cpu;
 	int want_affine = 0;
-	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
+	/* SD_flags and WF_flags share the first nibble */
+	int sd_flag = wake_flags & 0x1c; /* RHEL adjust this from 0xf */
 
 	if (wake_flags & WF_TTWU) {
 		record_wakee(p);
@@ -8668,6 +8673,16 @@ static bool update_pick_idlest(struct sched_group *idlest,
 }
 
 /*
+ * Allow a NUMA imbalance if busy CPUs is less than 25% of the domain.
+ * This is an approximation as the number of running tasks may not be
+ * related to the number of busy CPUs due to sched_setaffinity.
+ */
+static inline bool allow_numa_imbalance(int dst_running, int dst_weight)
+{
+	return (dst_running < (dst_weight >> 2));
+}
+
+/*
  * find_idlest_group() finds and returns the least busy CPU group within the
  * domain.
  *
@@ -8800,7 +8815,7 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p,
 			 * a real need of migration, periodic load balance will
 			 * take care of it.
 			 */
-			if (local_sgs.idle_cpus)
+			if (allow_numa_imbalance(local_sgs.sum_nr_running, sd->span_weight))
 				return NULL;
 		}
 
@@ -8904,19 +8919,20 @@ next_group:
 
 #define NUMA_IMBALANCE_MIN 2
 
-static inline long adjust_numa_imbalance(int imbalance, int dst_running)
+static inline long adjust_numa_imbalance(int imbalance,
+				int dst_running, int dst_weight)
 {
 /* RHEL only: This is crippled because it causes performance losses on some 
  * workloads. */
 #if 0
-	unsigned int imbalance_min;
+	if (!allow_numa_imbalance(dst_running, dst_weight))
+		return imbalance;
 
 	/*
 	 * Allow a small imbalance based on a simple pair of communicating
-	 * tasks that remain local when the source domain is almost idle.
+	 * tasks that remain local when the destination is lightly loaded.
 	 */
-	imbalance_min = NUMA_IMBALANCE_MIN;
-	if (dst_running <= imbalance_min)
+	if (imbalance <= NUMA_IMBALANCE_MIN)
 		return 0;
 #endif
 	return imbalance;
@@ -9019,9 +9035,10 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
 		}
 
 		/* Consider allowing a small imbalance between NUMA groups */
-		if (env->sd->flags & SD_NUMA)
+		if (env->sd->flags & SD_NUMA) {
 			env->imbalance = adjust_numa_imbalance(env->imbalance,
-						busiest->sum_nr_running);
+				busiest->sum_nr_running, busiest->group_weight);
+		}
 
 		return;
 	}

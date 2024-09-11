@@ -477,7 +477,7 @@ megasas_read_fw_status_reg_xscale(struct megasas_instance *instance)
 	return readl(&instance->reg_set->outbound_msg_0);
 }
 /**
- * megasas_clear_interrupt_xscale -	Check & clear interrupt
+ * megasas_clear_intr_xscale -	Check & clear interrupt
  * @instance:	Adapter soft state
  */
 static int
@@ -660,7 +660,7 @@ megasas_read_fw_status_reg_ppc(struct megasas_instance *instance)
 }
 
 /**
- * megasas_clear_interrupt_ppc -	Check & clear interrupt
+ * megasas_clear_intr_ppc -	Check & clear interrupt
  * @instance:	Adapter soft state
  */
 static int
@@ -789,7 +789,7 @@ megasas_read_fw_status_reg_skinny(struct megasas_instance *instance)
 }
 
 /**
- * megasas_clear_interrupt_skinny -	Check & clear interrupt
+ * megasas_clear_intr_skinny -	Check & clear interrupt
  * @instance:	Adapter soft state
  */
 static int
@@ -937,7 +937,7 @@ megasas_read_fw_status_reg_gen2(struct megasas_instance *instance)
 }
 
 /**
- * megasas_clear_interrupt_gen2 -      Check & clear interrupt
+ * megasas_clear_intr_gen2 -      Check & clear interrupt
  * @instance:	Adapter soft state
  */
 static int
@@ -3447,8 +3447,8 @@ static struct scsi_host_template megasas_template = {
 	.eh_timed_out = megasas_reset_timer,
 	.shost_attrs = megaraid_host_attrs,
 	.bios_param = megasas_bios_param,
-	.map_queues = megasas_map_queues,
 	.use_clustering = ENABLE_CLUSTERING,
+	.map_queues = megasas_map_queues,
 	.change_queue_depth = scsi_change_queue_depth,
 };
 
@@ -3543,7 +3543,7 @@ megasas_complete_cmd(struct megasas_instance *instance, struct megasas_cmd *cmd,
 			megasas_complete_int_cmd(instance, cmd);
 			break;
 		}
-		/* fall through */
+		fallthrough;
 
 	case MFI_CMD_LD_READ:
 	case MFI_CMD_LD_WRITE:
@@ -4886,6 +4886,7 @@ megasas_ld_list_query(struct megasas_instance *instance, u8 query_type)
 }
 
 /**
+ * megasas_host_device_list_query
  * dcmd.opcode            - MR_DCMD_CTRL_DEVICE_LIST_GET
  * dcmd.mbox              - reserved
  * dcmd.sge IN            - ptr to return MR_HOST_DEVICE_LIST structure
@@ -5163,7 +5164,7 @@ void megasas_get_snapdump_properties(struct megasas_instance *instance)
 }
 
 /**
- * megasas_get_controller_info -	Returns FW's controller structure
+ * megasas_get_ctrl_info -	Returns FW's controller structure
  * @instance:				Adapter soft state
  *
  * Issues an internal command (DCMD) to get the FW's controller structure.
@@ -7597,25 +7598,23 @@ static void megasas_shutdown_controller(struct megasas_instance *instance,
 	megasas_return_cmd(instance, cmd);
 }
 
-#ifdef CONFIG_PM
 /**
  * megasas_suspend -	driver suspend entry point
- * @pdev:		PCI device structure
- * @state:		PCI power state to suspend routine
+ * @dev:		Device structure
  */
-static int
-megasas_suspend(struct pci_dev *pdev, pm_message_t state)
+static int __maybe_unused
+megasas_suspend(struct device *dev)
 {
 	struct megasas_instance *instance;
 
-	instance = pci_get_drvdata(pdev);
+	instance = dev_get_drvdata(dev);
 
 	if (!instance)
 		return 0;
 
 	instance->unload = 1;
 
-	dev_info(&pdev->dev, "%s is called\n", __func__);
+	dev_info(dev, "%s is called\n", __func__);
 
 	/* Shutdown SR-IOV heartbeat timer */
 	if (instance->requestorId && !instance->skip_heartbeat_timer_del)
@@ -7645,48 +7644,29 @@ megasas_suspend(struct pci_dev *pdev, pm_message_t state)
 	if (instance->msix_vectors)
 		pci_free_irq_vectors(instance->pdev);
 
-	pci_save_state(pdev);
-	pci_disable_device(pdev);
-
-	pci_set_power_state(pdev, pci_choose_state(pdev, state));
-
 	return 0;
 }
 
 /**
  * megasas_resume-      driver resume entry point
- * @pdev:               PCI device structure
+ * @dev:		Device structure
  */
-static int
-megasas_resume(struct pci_dev *pdev)
+static int __maybe_unused
+megasas_resume(struct device *dev)
 {
 	int rval;
 	struct Scsi_Host *host;
 	struct megasas_instance *instance;
 	u32 status_reg;
 
-	instance = pci_get_drvdata(pdev);
+	instance = dev_get_drvdata(dev);
 
 	if (!instance)
 		return 0;
 
 	host = instance->host;
-	pci_set_power_state(pdev, PCI_D0);
-	pci_enable_wake(pdev, PCI_D0, 0);
-	pci_restore_state(pdev);
 
-	dev_info(&pdev->dev, "%s is called\n", __func__);
-	/*
-	 * PCI prepping: enable device set bus mastering and dma mask
-	 */
-	rval = pci_enable_device_mem(pdev);
-
-	if (rval) {
-		dev_err(&pdev->dev, "Enable device failed\n");
-		return rval;
-	}
-
-	pci_set_master(pdev);
+	dev_info(dev, "%s is called\n", __func__);
 
 	/*
 	 * We expect the FW state to be READY
@@ -7812,14 +7792,8 @@ fail_reenable_msix:
 fail_set_dma_mask:
 fail_ready_state:
 
-	pci_disable_device(pdev);
-
 	return -ENODEV;
 }
-#else
-#define megasas_suspend	NULL
-#define megasas_resume	NULL
-#endif
 
 static inline int
 megasas_wait_for_adapter_operational(struct megasas_instance *instance)
@@ -7989,7 +7963,7 @@ skip_firing_dcmds:
 
 /**
  * megasas_shutdown -	Shutdown entry point
- * @pdev:		Generic device structure
+ * @pdev:		PCI device structure
  */
 static void megasas_shutdown(struct pci_dev *pdev)
 {
@@ -8138,7 +8112,7 @@ megasas_mgmt_fw_ioctl(struct megasas_instance *instance,
 	int error = 0, i;
 	void *sense = NULL;
 	dma_addr_t sense_handle;
-	unsigned long *sense_ptr;
+	void *sense_ptr;
 	u32 opcode = 0;
 	int ret = DCMD_SUCCESS;
 
@@ -8261,6 +8235,13 @@ megasas_mgmt_fw_ioctl(struct megasas_instance *instance,
 	}
 
 	if (ioc->sense_len) {
+		/* make sure the pointer is part of the frame */
+		if (ioc->sense_off >
+		    (sizeof(union megasas_frame) - sizeof(__le64))) {
+			error = -EINVAL;
+			goto out;
+		}
+
 		sense = dma_alloc_coherent(&instance->pdev->dev, ioc->sense_len,
 					     &sense_handle, GFP_KERNEL);
 		if (!sense) {
@@ -8268,12 +8249,9 @@ megasas_mgmt_fw_ioctl(struct megasas_instance *instance,
 			goto out;
 		}
 
-		sense_ptr =
-		(unsigned long *) ((unsigned long)cmd->frame + ioc->sense_off);
-		if (instance->consistent_mask_64bit)
-			*sense_ptr = cpu_to_le64(sense_handle);
-		else
-			*sense_ptr = cpu_to_le32(sense_handle);
+		/* always store 64 bits regardless of addressing */
+		sense_ptr = (void *)cmd->frame + ioc->sense_off;
+		put_unaligned_le64(sense_handle, sense_ptr);
 	}
 
 	/*
@@ -8577,6 +8555,8 @@ static const struct file_operations megasas_mgmt_fops = {
 	.llseek = noop_llseek,
 };
 
+static SIMPLE_DEV_PM_OPS(megasas_pm_ops, megasas_suspend, megasas_resume);
+
 /*
  * PCI hotplug support registration structure
  */
@@ -8586,8 +8566,7 @@ static struct pci_driver megasas_pci_driver = {
 	.id_table = megasas_pci_table,
 	.probe = megasas_probe_one,
 	.remove = megasas_detach_one,
-	.suspend = megasas_suspend,
-	.resume = megasas_resume,
+	.driver.pm = &megasas_pm_ops,
 	.shutdown = megasas_shutdown,
 };
 

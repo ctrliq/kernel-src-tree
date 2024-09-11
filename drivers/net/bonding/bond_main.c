@@ -1251,14 +1251,14 @@ static netdev_features_t bond_fix_features(struct net_device *dev,
 }
 
 #define BOND_VLAN_FEATURES	(NETIF_F_HW_CSUM | NETIF_F_SG | \
-				 NETIF_F_FRAGLIST | NETIF_F_ALL_TSO | \
+				 NETIF_F_FRAGLIST | NETIF_F_GSO_SOFTWARE | \
 				 NETIF_F_HIGHDMA | NETIF_F_LRO)
 
 #define BOND_ENC_FEATURES	(NETIF_F_HW_CSUM | NETIF_F_SG | \
-				 NETIF_F_RXCSUM | NETIF_F_ALL_TSO)
+				 NETIF_F_RXCSUM | NETIF_F_GSO_SOFTWARE)
 
 #define BOND_MPLS_FEATURES	(NETIF_F_HW_CSUM | NETIF_F_SG | \
-				 NETIF_F_ALL_TSO)
+				 NETIF_F_GSO_SOFTWARE)
 
 
 static void bond_compute_features(struct bonding *bond)
@@ -1314,8 +1314,7 @@ done:
 	bond_dev->vlan_features = vlan_features;
 	bond_dev->hw_enc_features = enc_features | NETIF_F_GSO_ENCAP_ALL |
 				    NETIF_F_HW_VLAN_CTAG_TX |
-				    NETIF_F_HW_VLAN_STAG_TX |
-				    NETIF_F_GSO_UDP_L4;
+				    NETIF_F_HW_VLAN_STAG_TX;
 #ifdef CONFIG_XFRM_OFFLOAD
 	bond_dev->hw_enc_features |= xfrm_features;
 #endif /* CONFIG_XFRM_OFFLOAD */
@@ -2563,22 +2562,26 @@ re_arm:
 	}
 }
 
-static int bond_upper_dev_walk(struct net_device *upper, void *data)
+static int bond_upper_dev_walk(struct net_device *upper,
+			       struct netdev_nested_priv *priv)
 {
-	__be32 ip = *((__be32 *)data);
+	__be32 ip = *(__be32 *)priv->data;
 
 	return ip == bond_confirm_addr(upper, 0, ip);
 }
 
 static bool bond_has_this_ip(struct bonding *bond, __be32 ip)
 {
+	struct netdev_nested_priv priv = {
+		.data = (void *)&ip,
+	};
 	bool ret = false;
 
 	if (ip == bond_confirm_addr(bond->dev, 0, ip))
 		return true;
 
 	rcu_read_lock();
-	if (netdev_walk_all_upper_dev_rcu(bond->dev, bond_upper_dev_walk, &ip))
+	if (netdev_walk_all_upper_dev_rcu(bond->dev, bond_upper_dev_walk, &priv))
 		ret = true;
 	rcu_read_unlock();
 
@@ -4899,7 +4902,7 @@ void bond_setup(struct net_device *bond_dev)
 				NETIF_F_HW_VLAN_CTAG_RX |
 				NETIF_F_HW_VLAN_CTAG_FILTER;
 
-	bond_dev->hw_features |= NETIF_F_GSO_ENCAP_ALL | NETIF_F_GSO_UDP_L4;
+	bond_dev->hw_features |= NETIF_F_GSO_ENCAP_ALL;
 	bond_dev->features |= bond_dev->hw_features;
 	bond_dev->features |= NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_STAG_TX;
 #ifdef CONFIG_XFRM_OFFLOAD

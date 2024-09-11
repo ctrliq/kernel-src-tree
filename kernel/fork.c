@@ -91,6 +91,7 @@
 #include <linux/kcov.h>
 #include <linux/livepatch.h>
 #include <linux/thread_info.h>
+#include <linux/scs.h>
 
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
@@ -267,13 +268,8 @@ static inline void free_thread_stack(struct task_struct *tsk)
 	if (vm) {
 		int i;
 
-		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
-			mod_memcg_page_state(vm->pages[i],
-					     MEMCG_KERNEL_STACK_KB,
-					     -(int)(PAGE_SIZE / 1024));
-
+		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++)
 			memcg_kmem_uncharge_page(vm->pages[i], 0);
-		}
 
 		for (i = 0; i < NR_CACHED_STACKS; i++) {
 			if (this_cpu_cmpxchg(cached_stacks[i],
@@ -365,31 +361,14 @@ static void account_kernel_stack(struct task_struct *tsk, int account)
 	void *stack = task_stack_page(tsk);
 	struct vm_struct *vm = task_stack_vm_area(tsk);
 
-	BUILD_BUG_ON(IS_ENABLED(CONFIG_VMAP_STACK) && PAGE_SIZE % 1024 != 0);
 
-	if (vm) {
-		int i;
-
-		BUG_ON(vm->nr_pages != THREAD_SIZE / PAGE_SIZE);
-
-		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
-			mod_zone_page_state(page_zone(vm->pages[i]),
-					    NR_KERNEL_STACK_KB,
-					    PAGE_SIZE / 1024 * account);
-		}
-	} else {
-		/*
-		 * All stack pages are in the same zone and belong to the
-		 * same memcg.
-		 */
-		struct page *first_page = virt_to_page(stack);
-
-		mod_zone_page_state(page_zone(first_page), NR_KERNEL_STACK_KB,
-				    THREAD_SIZE / 1024 * account);
-
-		mod_memcg_obj_state(stack, MEMCG_KERNEL_STACK_KB,
-				    account * (THREAD_SIZE / 1024));
-	}
+	/* All stack pages are in the same node. */
+	if (vm)
+		mod_lruvec_page_state(vm->pages[0], NR_KERNEL_STACK_KB,
+				      account * (THREAD_SIZE / 1024));
+	else
+		mod_lruvec_kmem_state(stack, NR_KERNEL_STACK_KB,
+				      account * (THREAD_SIZE / 1024));
 }
 
 static int memcg_charge_kernel_stack(struct task_struct *tsk)
@@ -398,24 +377,24 @@ static int memcg_charge_kernel_stack(struct task_struct *tsk)
 	struct vm_struct *vm = task_stack_vm_area(tsk);
 	int ret;
 
+	BUILD_BUG_ON(IS_ENABLED(CONFIG_VMAP_STACK) && PAGE_SIZE % 1024 != 0);
+
 	if (vm) {
 		int i;
 
+		BUG_ON(vm->nr_pages != THREAD_SIZE / PAGE_SIZE);
+
 		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
 			/*
-			 * If memcg_kmem_charge_page() fails, page->mem_cgroup
-			 * pointer is NULL, and both memcg_kmem_uncharge_page()
-			 * and mod_memcg_page_state() in free_thread_stack()
-			 * will ignore this page. So it's safe.
+			 * If memcg_kmem_charge_page() fails, page's
+			 * memory cgroup pointer is NULL, and
+			 * memcg_kmem_uncharge_page() in free_thread_stack()
+			 * will ignore this page.
 			 */
 			ret = memcg_kmem_charge_page(vm->pages[i], GFP_KERNEL,
 						     0);
 			if (ret)
 				return ret;
-
-			mod_memcg_page_state(vm->pages[i],
-					     MEMCG_KERNEL_STACK_KB,
-					     PAGE_SIZE / 1024);
 		}
 	}
 #endif
@@ -446,6 +425,8 @@ void put_task_stack(struct task_struct *tsk)
 
 void free_task(struct task_struct *tsk)
 {
+	scs_release(tsk);
+
 #ifndef CONFIG_THREAD_INFO_IN_TASK
 	/*
 	 * The task is finally done with both the stack and thread_info,
@@ -825,6 +806,8 @@ void __init fork_init(void)
 			  NULL, free_vm_stack_cache);
 #endif
 
+	scs_init();
+
 	lockdep_init_task(&init_task);
 }
 
@@ -907,6 +890,10 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 #endif
 
 	if (err || !dup_rh_task_struct(tsk, orig, node))
+		goto free_stack;
+
+	err = scs_prepare(tsk, node);
+	if (err)
 		goto free_stack;
 
 #ifdef CONFIG_SECCOMP
@@ -1887,8 +1874,6 @@ static __latent_entropy struct task_struct *copy_process(
 
 	posix_cputimers_init(&p->task_struct_rh->posix_cputimers);
 
-	p->start_time = ktime_get_ns();
-	p->real_start_time = ktime_get_boot_ns();
 	p->io_context = NULL;
 	audit_set_context(p, NULL);
 	cgroup_fork(p);
@@ -2004,14 +1989,9 @@ static __latent_entropy struct task_struct *copy_process(
 	/* ok, now we should be set up.. */
 	p->pid = pid_nr(pid);
 	if (clone_flags & CLONE_THREAD) {
-		p->exit_signal = -1;
 		p->group_leader = current->group_leader;
 		p->tgid = current->tgid;
 	} else {
-		if (clone_flags & CLONE_PARENT)
-			p->exit_signal = current->group_leader->exit_signal;
-		else
-			p->exit_signal = (clone_flags & CSIGNAL);
 		p->group_leader = p;
 		p->tgid = p->pid;
 	}
@@ -2024,7 +2004,6 @@ static __latent_entropy struct task_struct *copy_process(
 	INIT_LIST_HEAD(&p->thread_group);
 	p->task_works = NULL;
 
-	cgroup_threadgroup_change_begin(current);
 	/*
 	 * Ensure that the cgroup subsystem policies allow the new process to be
 	 * forked. It should be noted the the new process's css_set can be changed
@@ -2034,6 +2013,17 @@ static __latent_entropy struct task_struct *copy_process(
 	retval = cgroup_can_fork(p);
 	if (retval)
 		goto bad_fork_free_pid;
+
+	/*
+	 * From this point on we must avoid any synchronous user-space
+	 * communication until we take the tasklist-lock. In particular, we do
+	 * not want user-space to be able to predict the process start-time by
+	 * stalling fork(2) after we recorded the start_time but before it is
+	 * visible to the system.
+	 */
+
+	p->start_time = ktime_get_ns();
+	p->real_start_time = ktime_get_boot_ns();
 
 	/*
 	 * Make it visible to the rest of the system, but dont wake it up yet.
@@ -2046,10 +2036,15 @@ static __latent_entropy struct task_struct *copy_process(
 		p->real_parent = current->real_parent;
 		p->task_struct_rh->parent_exec_id =
 			current->task_struct_rh->parent_exec_id;
+		if (clone_flags & CLONE_THREAD)
+			p->exit_signal = -1;
+		else
+			p->exit_signal = current->group_leader->exit_signal;
 	} else {
 		p->real_parent = current;
 		p->task_struct_rh->parent_exec_id =
 			current->task_struct_rh->self_exec_id;
+		p->exit_signal = (clone_flags & CSIGNAL);
 	}
 
 	klp_copy_process(p);
@@ -2127,7 +2122,6 @@ static __latent_entropy struct task_struct *copy_process(
 
 	proc_fork_connector(p);
 	cgroup_post_fork(p);
-	cgroup_threadgroup_change_end(current);
 	perf_event_fork(p);
 
 	trace_task_newtask(p, clone_flags);
@@ -2140,7 +2134,6 @@ bad_fork_cancel_cgroup:
 	write_unlock_irq(&tasklist_lock);
 	cgroup_cancel_fork(p);
 bad_fork_free_pid:
-	cgroup_threadgroup_change_end(current);
 	if (pid != &init_struct_pid)
 		free_pid(pid);
 bad_fork_cleanup_thread:

@@ -57,7 +57,7 @@ static void warn_setuid_and_fcaps_mixed(const char *fname)
  * @cred: The credentials to use
  * @ns:  The user namespace in which we need the capability
  * @cap: The capability to check for
- * @audit: Whether to write an audit message or not
+ * @opts: Bitmask of options defined in include/linux/security.h
  *
  * Determine whether the nominated task has the specified capability amongst
  * its effective set, returning 0 if it does, -ve if it does not.
@@ -1387,10 +1387,17 @@ static struct security_hook_list capability_hooks[] __lsm_ro_after_init = {
 	LSM_HOOK_INIT(vm_enough_memory, cap_vm_enough_memory),
 };
 
-void __init capability_add_hooks(void)
+static int __init capability_init(void)
 {
 	security_add_hooks(capability_hooks, ARRAY_SIZE(capability_hooks),
 				"capability");
+	return 0;
 }
+
+DEFINE_LSM(capability) = {
+	.name = "capability",
+	.order = LSM_ORDER_FIRST,
+	.init = capability_init,
+};
 
 #endif /* CONFIG_SECURITY */

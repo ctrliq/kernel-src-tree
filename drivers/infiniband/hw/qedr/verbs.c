@@ -928,6 +928,9 @@ int qedr_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 		 "create_cq: called from %s. entries=%d, vector=%d\n",
 		 udata ? "User Lib" : "Kernel", entries, vector);
 
+	if (attr->flags)
+		return -EOPNOTSUPP;
+
 	if (entries > QEDR_MAX_CQES) {
 		DP_ERR(dev,
 		       "create cq: the number of entries %d is too high. Must be equal or below %d.\n",
@@ -1061,7 +1064,7 @@ int qedr_resize_cq(struct ib_cq *ibcq, int new_cnt, struct ib_udata *udata)
 #define QEDR_DESTROY_CQ_MAX_ITERATIONS		(10)
 #define QEDR_DESTROY_CQ_ITER_DURATION		(10)
 
-void qedr_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
+int qedr_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 {
 	struct qedr_dev *dev = get_qedr_dev(ibcq->device);
 	struct qed_rdma_destroy_cq_out_params oparams;
@@ -1076,7 +1079,7 @@ void qedr_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 	/* GSIs CQs are handled by driver, so they don't exist in the FW */
 	if (cq->cq_type == QEDR_CQ_TYPE_GSI) {
 		qedr_db_recovery_del(dev, cq->db_addr, &cq->db.data);
-		return;
+		return 0;
 	}
 
 	iparams.icid = cq->icid;
@@ -1124,6 +1127,7 @@ void qedr_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 	 * Since the destroy CQ ramrod has also been received on the EQ we can
 	 * be certain that there's no event handler in process.
 	 */
+	return 0;
 }
 
 static inline int get_gid_info_from_table(struct ib_qp *ibqp,
@@ -1233,14 +1237,6 @@ static int qedr_check_qp_attrs(struct ib_pd *ibpd, struct qedr_dev *dev,
 		DP_ERR(dev,
 		       "create qp: unsupported recv_sge=0x%x requested (max_recv_sge=0x%x)\n",
 		       attrs->cap.max_recv_sge, qattr->max_sge);
-		return -EINVAL;
-	}
-
-	/* Unprivileged user space cannot create special QP */
-	if (udata && attrs->qp_type == IB_QPT_GSI) {
-		DP_ERR(dev,
-		       "create qp: userspace can't create special QPs of type=0x%x\n",
-		       attrs->qp_type);
 		return -EINVAL;
 	}
 
@@ -1555,6 +1551,10 @@ int qedr_create_srq(struct ib_srq *ibsrq, struct ib_srq_init_attr *init_attr,
 		 "create SRQ called from %s (pd %p)\n",
 		 (udata) ? "User lib" : "kernel", pd);
 
+	if (init_attr->srq_type != IB_SRQT_BASIC &&
+	    init_attr->srq_type != IB_SRQT_XRC)
+		return -EOPNOTSUPP;
+
 	rc = qedr_check_srq_params(dev, init_attr, udata);
 	if (rc)
 		return -EINVAL;
@@ -1644,7 +1644,7 @@ err0:
 	return -EFAULT;
 }
 
-void qedr_destroy_srq(struct ib_srq *ibsrq, struct ib_udata *udata)
+int qedr_destroy_srq(struct ib_srq *ibsrq, struct ib_udata *udata)
 {
 	struct qed_rdma_destroy_srq_in_params in_params = {};
 	struct qedr_dev *dev = get_qedr_dev(ibsrq->device);
@@ -1663,6 +1663,7 @@ void qedr_destroy_srq(struct ib_srq *ibsrq, struct ib_udata *udata)
 	DP_DEBUG(dev, QEDR_MSG_SRQ,
 		 "destroy srq: destroyed srq with srq_id=0x%0x\n",
 		 srq->srq_id);
+	return 0;
 }
 
 int qedr_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
@@ -2218,6 +2219,9 @@ struct ib_qp *qedr_create_qp(struct ib_pd *ibpd,
 	struct ib_qp *ibqp;
 	int rc = 0;
 
+	if (attrs->create_flags)
+		return ERR_PTR(-EOPNOTSUPP);
+
 	if (attrs->qp_type == IB_QPT_XRC_TGT) {
 		xrcd = get_qedr_xrcd(attrs->xrcd);
 		dev = get_qedr_dev(xrcd->ibxrcd.device);
@@ -2451,6 +2455,9 @@ int qedr_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	DP_DEBUG(dev, QEDR_MSG_QP,
 		 "modify qp: qp %p attr_mask=0x%x, state=%d", qp, attr_mask,
 		 attr->qp_state);
+
+	if (attr_mask & ~IB_QP_ATTR_STANDARD_BITS)
+		return -EOPNOTSUPP;
 
 	old_qp_state = qedr_get_ibqp_state(qp->state);
 	if (attr_mask & IB_QP_STATE)
@@ -3632,7 +3639,7 @@ static int __qedr_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
 		break;
 	case IB_WR_RDMA_READ_WITH_INV:
 		SET_FIELD2(wqe->flags, RDMA_SQ_RDMA_WQE_1ST_READ_INV_FLG, 1);
-		/* fallthrough -- same is identical to RDMA READ */
+		fallthrough;	/* same is identical to RDMA READ */
 
 	case IB_WR_RDMA_READ:
 		wqe->req_type = RDMA_SQ_REQ_TYPE_RDMA_RD;

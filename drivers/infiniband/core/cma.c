@@ -411,10 +411,10 @@ static int cma_comp_exch(struct rdma_id_private *id_priv,
 	/*
 	 * The FSM uses a funny double locking where state is protected by both
 	 * the handler_mutex and the spinlock. State is not allowed to change
-	 * away from a handler_mutex protected value without also holding
+	 * to/from a handler_mutex protected value without also holding
 	 * handler_mutex.
 	 */
-	if (comp == RDMA_CM_CONNECT)
+	if (comp == RDMA_CM_CONNECT || exch == RDMA_CM_CONNECT)
 		lockdep_assert_held(&id_priv->handler_mutex);
 
 	spin_lock_irqsave(&id_priv->lock, flags);
@@ -2015,7 +2015,8 @@ static int cma_ib_handler(struct ib_cm_id *cm_id,
 		event.event = RDMA_CM_EVENT_ESTABLISHED;
 		break;
 	case IB_CM_DREQ_ERROR:
-		event.status = -ETIMEDOUT; /* fall through */
+		event.status = -ETIMEDOUT;
+		fallthrough;
 	case IB_CM_DREQ_RECEIVED:
 	case IB_CM_DREP_RECEIVED:
 		if (!cma_comp_exch(id_priv, RDMA_CM_CONNECT,
@@ -2920,9 +2921,10 @@ struct iboe_prio_tc_map {
 	bool found;
 };
 
-static int get_lower_vlan_dev_tc(struct net_device *dev, void *data)
+static int get_lower_vlan_dev_tc(struct net_device *dev,
+				 struct netdev_nested_priv *priv)
 {
-	struct iboe_prio_tc_map *map = data;
+	struct iboe_prio_tc_map *map = (struct iboe_prio_tc_map *)priv->data;
 
 	if (is_vlan_dev(dev))
 		map->output_tc = get_vlan_ndev_tc(dev, map->input_prio);
@@ -2941,16 +2943,18 @@ static int iboe_tos_to_sl(struct net_device *ndev, int tos)
 {
 	struct iboe_prio_tc_map prio_tc_map = {};
 	int prio = rt_tos2priority(tos);
+	struct netdev_nested_priv priv;
 
 	/* If VLAN device, get it directly from the VLAN netdev */
 	if (is_vlan_dev(ndev))
 		return get_vlan_ndev_tc(ndev, prio);
 
 	prio_tc_map.input_prio = prio;
+	priv.data = (void *)&prio_tc_map;
 	rcu_read_lock();
 	netdev_walk_all_lower_dev_rcu(ndev,
 				      get_lower_vlan_dev_tc,
-				      &prio_tc_map);
+				      &priv);
 	rcu_read_unlock();
 	/* If map is found from lower device, use it; Otherwise
 	 * continue with the current netdevice to get priority to tc map.
@@ -4092,17 +4096,23 @@ out:
 	return ret;
 }
 
-int rdma_connect(struct rdma_cm_id *id, struct rdma_conn_param *conn_param)
+/**
+ * rdma_connect_locked - Initiate an active connection request.
+ * @id: Connection identifier to connect.
+ * @conn_param: Connection information used for connected QPs.
+ *
+ * Same as rdma_connect() but can only be called from the
+ * RDMA_CM_EVENT_ROUTE_RESOLVED handler callback.
+ */
+int rdma_connect_locked(struct rdma_cm_id *id,
+			struct rdma_conn_param *conn_param)
 {
 	struct rdma_id_private *id_priv =
 		container_of(id, struct rdma_id_private, id);
 	int ret;
 
-	mutex_lock(&id_priv->handler_mutex);
-	if (!cma_comp_exch(id_priv, RDMA_CM_ROUTE_RESOLVED, RDMA_CM_CONNECT)) {
-		ret = -EINVAL;
-		goto err_unlock;
-	}
+	if (!cma_comp_exch(id_priv, RDMA_CM_ROUTE_RESOLVED, RDMA_CM_CONNECT))
+		return -EINVAL;
 
 	if (!id->qp) {
 		id_priv->qp_num = conn_param->qp_num;
@@ -4120,11 +4130,33 @@ int rdma_connect(struct rdma_cm_id *id, struct rdma_conn_param *conn_param)
 		ret = -ENOSYS;
 	if (ret)
 		goto err_state;
-	mutex_unlock(&id_priv->handler_mutex);
 	return 0;
 err_state:
 	cma_comp_exch(id_priv, RDMA_CM_CONNECT, RDMA_CM_ROUTE_RESOLVED);
-err_unlock:
+	return ret;
+}
+EXPORT_SYMBOL(rdma_connect_locked);
+
+/**
+ * rdma_connect - Initiate an active connection request.
+ * @id: Connection identifier to connect.
+ * @conn_param: Connection information used for connected QPs.
+ *
+ * Users must have resolved a route for the rdma_cm_id to connect with by having
+ * called rdma_resolve_route before calling this routine.
+ *
+ * This call will either connect to a remote QP or obtain remote QP information
+ * for unconnected rdma_cm_id's.  The actual operation is based on the
+ * rdma_cm_id's port space.
+ */
+int rdma_connect(struct rdma_cm_id *id, struct rdma_conn_param *conn_param)
+{
+	struct rdma_id_private *id_priv =
+		container_of(id, struct rdma_id_private, id);
+	int ret;
+
+	mutex_lock(&id_priv->handler_mutex);
+	ret = rdma_connect_locked(id, conn_param);
 	mutex_unlock(&id_priv->handler_mutex);
 	return ret;
 }

@@ -953,13 +953,10 @@ void hns_roce_bitmap_free_range(struct hns_roce_bitmap *bitmap,
 int hns_roce_create_ah(struct ib_ah *ah, struct rdma_ah_init_attr *init_attr,
 		       struct ib_udata *udata);
 int hns_roce_query_ah(struct ib_ah *ibah, struct rdma_ah_attr *ah_attr);
-static inline int hns_roce_destroy_ah(struct ib_ah *ah, u32 flags)
-{
-	return 0;
-}
+void hns_roce_destroy_ah(struct ib_ah *ah, u32 flags);
 
 int hns_roce_alloc_pd(struct ib_pd *pd, struct ib_udata *udata);
-int hns_roce_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata);
+void hns_roce_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata);
 
 struct ib_mr *hns_roce_get_dma_mr(struct ib_pd *pd, int acc);
 struct ib_mr *hns_roce_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,

@@ -366,6 +366,8 @@ struct queue_limits {
 typedef int (*report_zones_cb)(struct blk_zone *zone, unsigned int idx,
 			       void *data);
 
+void blk_queue_set_zoned(struct gendisk *disk, enum blk_zoned_model model);
+
 #ifdef CONFIG_BLK_DEV_ZONED
 
 #define BLK_ALL_ZONES  ((unsigned int)-1)
@@ -480,7 +482,7 @@ struct request_queue {
 
 #ifdef CONFIG_PM
 	struct device		*dev;
-	enum rpm_status		rpm_status;
+	RH_KABI_REPLACE(int	rpm_status, enum rpm_status rpm_status)
 	unsigned int		nr_pending;
 #endif
 
@@ -1142,6 +1144,7 @@ extern void blk_queue_max_zone_append_sectors(struct request_queue *q,
 extern void blk_queue_physical_block_size(struct request_queue *, unsigned int);
 extern void blk_queue_alignment_offset(struct request_queue *q,
 				       unsigned int alignment);
+void blk_queue_update_readahead(struct request_queue *q);
 extern void blk_limits_io_min(struct queue_limits *limits, unsigned int min);
 extern void blk_queue_io_min(struct request_queue *q, unsigned int min);
 extern void blk_limits_io_opt(struct queue_limits *limits, unsigned int opt);
@@ -1319,6 +1322,11 @@ static inline int sb_issue_zeroout(struct super_block *sb, sector_t block,
 extern int blk_verify_command(struct request_queue *q, unsigned char *cmd,
 			      fmode_t mode);
 
+static inline bool bdev_is_partition(struct block_device *bdev)
+{
+	return bdev->bd_partno;
+}
+
 enum blk_default_limits {
 	BLK_MAX_SEGMENTS	= 128,
 	BLK_SAFE_MAX_SECTORS	= 255,
@@ -1436,7 +1444,7 @@ static inline int bdev_alignment_offset(struct block_device *bdev)
 	if (q->limits.misaligned)
 		return -1;
 
-	if (bdev != bdev->bd_contains)
+	if (bdev_is_partition(bdev))
 		return bdev->bd_part->alignment_offset;
 
 	return q->limits.alignment_offset;
@@ -1477,7 +1485,7 @@ static inline int bdev_discard_alignment(struct block_device *bdev)
 {
 	struct request_queue *q = bdev_get_queue(bdev);
 
-	if (bdev != bdev->bd_contains)
+	if (bdev_is_partition(bdev))
 		return bdev->bd_part->discard_alignment;
 
 	return q->limits.discard_alignment;
@@ -1764,7 +1772,6 @@ struct block_device_operations {
 	void (*unlock_native_capacity) (struct gendisk *);
 	int (*revalidate_disk) (struct gendisk *);
 	int (*getgeo)(struct block_device *, struct hd_geometry *);
-	int (*set_read_only)(struct block_device *bdev, bool ro);
 	/* this callback is with swap_lock and sometimes page table lock held */
 	void (*swap_slot_free_notify) (struct block_device *, unsigned long);
 
@@ -1779,7 +1786,8 @@ struct block_device_operations {
 	const struct pr_ops *pr_ops;
 
 	RH_KABI_USE(1, char *(*devnode)(struct gendisk *disk, umode_t *mode))
-	RH_KABI_RESERVE(2)
+	RH_KABI_USE(2, int (*set_read_only)(struct block_device *bdev, bool ro))
+
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 };
@@ -1936,4 +1944,58 @@ static inline void bio_end_io_acct(struct bio *bio, unsigned long start_time)
 }
 #endif /* CONFIG_BLOCK */
 
+int bdev_read_only(struct block_device *bdev);
+int set_blocksize(struct block_device *bdev, int size);
+
+const char *bdevname(struct block_device *bdev, char *buffer);
+struct block_device *lookup_bdev(const char *);
+
+void blkdev_show(struct seq_file *seqf, off_t offset);
+
+#define BDEVNAME_SIZE	32	/* Largest string for a blockdev identifier */
+#define BDEVT_SIZE	10	/* Largest string for MAJ:MIN for blkdev */
+#ifdef CONFIG_BLOCK
+#define BLKDEV_MAJOR_MAX	512
+#else
+#define BLKDEV_MAJOR_MAX	0
 #endif
+
+int blkdev_get(struct block_device *bdev, fmode_t mode, void *holder);
+struct block_device *blkdev_get_by_path(const char *path, fmode_t mode,
+		void *holder);
+struct block_device *blkdev_get_by_dev(dev_t dev, fmode_t mode, void *holder);
+int bd_prepare_to_claim(struct block_device *bdev, struct block_device *whole,
+		void *holder);
+void bd_abort_claiming(struct block_device *bdev, struct block_device *whole,
+		void *holder);
+void blkdev_put(struct block_device *bdev, fmode_t mode);
+
+struct block_device *bdget(dev_t);
+struct block_device *bdgrab(struct block_device *bdev);
+void bdput(struct block_device *);
+
+#ifdef CONFIG_BLOCK
+void invalidate_bdev(struct block_device *bdev);
+int truncate_bdev_range(struct block_device *bdev, fmode_t mode, loff_t lstart,
+			loff_t lend);
+int sync_blockdev(struct block_device *bdev);
+#else
+static inline void invalidate_bdev(struct block_device *bdev)
+{
+}
+static inline int truncate_bdev_range(struct block_device *bdev, fmode_t mode,
+				      loff_t lstart, loff_t lend)
+{
+	return 0;
+}
+static inline int sync_blockdev(struct block_device *bdev)
+{
+	return 0;
+}
+#endif
+int fsync_bdev(struct block_device *bdev);
+
+struct super_block *freeze_bdev(struct block_device *bdev);
+int thaw_bdev(struct block_device *bdev, struct super_block *sb);
+
+#endif /* _LINUX_BLKDEV_H */

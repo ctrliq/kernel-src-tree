@@ -917,6 +917,9 @@ int efa_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *qp_attr,
 	enum ib_qp_state new_state;
 	int err;
 
+	if (qp_attr_mask & ~IB_QP_ATTR_STANDARD_BITS)
+		return -EOPNOTSUPP;
+
 	if (udata->inlen &&
 	    !ib_is_udata_cleared(udata, 0, udata->inlen)) {
 		ibdev_dbg(&dev->ibdev,
@@ -982,7 +985,7 @@ static int efa_destroy_cq_idx(struct efa_dev *dev, int cq_idx)
 	return efa_com_destroy_cq(&dev->edev, &params);
 }
 
-void efa_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
+int efa_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 {
 	struct efa_dev *dev = to_edev(ibcq->device);
 	struct efa_cq *cq = to_ecq(ibcq);
@@ -995,6 +998,7 @@ void efa_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 	efa_destroy_cq_idx(dev, cq->cq_idx);
 	efa_free_mapped(dev, cq->cpu_addr, cq->dma_addr, cq->size,
 			DMA_FROM_DEVICE);
+	return 0;
 }
 
 static int cq_mmap_entries_setup(struct efa_dev *dev, struct efa_cq *cq,
@@ -1027,6 +1031,9 @@ int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 	int err;
 
 	ibdev_dbg(ibdev, "create_cq entries %d\n", entries);
+
+	if (attr->flags)
+		return -EOPNOTSUPP;
 
 	if (entries < 1 || entries > dev->dev_attr.max_cq_depth) {
 		ibdev_dbg(ibdev,
@@ -1152,8 +1159,7 @@ static int umem_to_page_list(struct efa_dev *dev,
 	ibdev_dbg(&dev->ibdev, "hp_cnt[%u], pages_in_hp[%u]\n",
 		  hp_cnt, pages_in_hp);
 
-	rdma_for_each_block(umem->sg_head.sgl, &biter, umem->nmap,
-			    BIT(hp_shift))
+	rdma_umem_for_each_dma_block(umem, &biter, BIT(hp_shift))
 		page_list[hp_idx++] = rdma_block_iter_dma_address(&biter);
 
 	return 0;

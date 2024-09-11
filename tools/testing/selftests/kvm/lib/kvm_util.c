@@ -142,26 +142,26 @@ static void vm_open(struct kvm_vm *vm, int perm)
 		"rc: %i errno: %i", vm->fd, errno);
 }
 
-const char * const vm_guest_mode_string[] = {
-	"PA-bits:52,  VA-bits:48,  4K pages",
-	"PA-bits:52,  VA-bits:48, 64K pages",
-	"PA-bits:48,  VA-bits:48,  4K pages",
-	"PA-bits:48,  VA-bits:48, 64K pages",
-	"PA-bits:40,  VA-bits:48,  4K pages",
-	"PA-bits:40,  VA-bits:48, 64K pages",
-	"PA-bits:ANY, VA-bits:48,  4K pages",
-};
-_Static_assert(sizeof(vm_guest_mode_string)/sizeof(char *) == NUM_VM_MODES,
-	       "Missing new mode strings?");
+const char *vm_guest_mode_string(uint32_t i)
+{
+	static const char * const strings[] = {
+		[VM_MODE_P52V48_4K]	= "PA-bits:52,  VA-bits:48,  4K pages",
+		[VM_MODE_P52V48_64K]	= "PA-bits:52,  VA-bits:48, 64K pages",
+		[VM_MODE_P48V48_4K]	= "PA-bits:48,  VA-bits:48,  4K pages",
+		[VM_MODE_P48V48_64K]	= "PA-bits:48,  VA-bits:48, 64K pages",
+		[VM_MODE_P40V48_4K]	= "PA-bits:40,  VA-bits:48,  4K pages",
+		[VM_MODE_P40V48_64K]	= "PA-bits:40,  VA-bits:48, 64K pages",
+		[VM_MODE_PXXV48_4K]	= "PA-bits:ANY, VA-bits:48,  4K pages",
+	};
+	_Static_assert(sizeof(strings)/sizeof(char *) == NUM_VM_MODES,
+		       "Missing new mode strings?");
 
-struct vm_guest_mode_params {
-	unsigned int pa_bits;
-	unsigned int va_bits;
-	unsigned int page_size;
-	unsigned int page_shift;
-};
+	TEST_ASSERT(i < NUM_VM_MODES, "Guest mode ID %d too big", i);
 
-static const struct vm_guest_mode_params vm_guest_mode_params[] = {
+	return strings[i];
+}
+
+const struct vm_guest_mode_params vm_guest_mode_params[] = {
 	{ 52, 48,  0x1000, 12 },
 	{ 52, 48, 0x10000, 16 },
 	{ 48, 48,  0x1000, 12 },
@@ -758,7 +758,7 @@ void vm_userspace_mem_region_add(struct kvm_vm *vm,
 	region->mmap_start = mmap(NULL, region->mmap_size,
 				  PROT_READ | PROT_WRITE,
 				  MAP_PRIVATE | MAP_ANONYMOUS
-				  | (src_type == VM_MEM_SRC_ANONYMOUS_HUGETLB ? MAP_HUGETLB : 0),
+				  | vm_mem_backing_src_alias(src_type)->flag,
 				  -1, 0);
 	TEST_ASSERT(region->mmap_start != MAP_FAILED,
 		    "test_malloc failed, mmap_start: %p errno: %i",
@@ -1803,6 +1803,9 @@ static struct exit_reason {
 	{KVM_EXIT_OSI, "OSI"},
 	{KVM_EXIT_PAPR_HCALL, "PAPR_HCALL"},
 	{KVM_EXIT_DIRTY_RING_FULL, "DIRTY_RING_FULL"},
+	{KVM_EXIT_X86_RDMSR, "RDMSR"},
+	{KVM_EXIT_X86_WRMSR, "WRMSR"},
+	{KVM_EXIT_XEN, "XEN"},
 #ifdef KVM_EXIT_MEMORY_NOT_PRESENT
 	{KVM_EXIT_MEMORY_NOT_PRESENT, "MEMORY_NOT_PRESENT"},
 #endif

@@ -107,7 +107,7 @@ SYM_CODE_START_NOALIGN(startup_64)
 	jmp 1f
 SYM_CODE_END(startup_64)
 
-ENTRY(secondary_startup_64)
+SYM_CODE_START(secondary_startup_64)
 	UNWIND_HINT_EMPTY
 	/*
 	 * At this point the CPU runs in 64bit mode CS.L = 1 CS.D = 0,
@@ -292,7 +292,7 @@ SYM_INNER_LABEL(secondary_startup_64_no_verify, SYM_L_GLOBAL)
 	pushq	%rax		# target address in negative space
 	lretq
 .Lafter_lret:
-END(secondary_startup_64)
+SYM_CODE_END(secondary_startup_64)
 
 #include "verify_cpu.S"
 #include "sev_verify_cbit.S"
@@ -303,11 +303,11 @@ END(secondary_startup_64)
  * up already except stack. We just set up stack here. Then call
  * start_secondary() via .Ljump_to_C_code.
  */
-ENTRY(start_cpu0)
+SYM_CODE_START(start_cpu0)
 	UNWIND_HINT_EMPTY
 	movq	initial_stack(%rip), %rsp
 	jmp	.Ljump_to_C_code
-END(start_cpu0)
+SYM_CODE_END(start_cpu0)
 #endif
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
@@ -362,7 +362,7 @@ SYM_DATA(initial_vc_handler,   .quad handle_vc_boot_ghcb)
 	__FINITDATA
 
 	__INIT
-ENTRY(early_idt_handler_array)
+SYM_CODE_START(early_idt_handler_array)
 	i = 0
 	.rept NUM_EXCEPTION_VECTORS
 	.if ((EXCEPTION_ERRCODE_MASK >> i) & 1) == 0
@@ -378,7 +378,7 @@ ENTRY(early_idt_handler_array)
 	.fill early_idt_handler_array + i*EARLY_IDT_HANDLER_SIZE - ., 1, 0xcc
 	.endr
 	UNWIND_HINT_IRET_REGS offset=16
-END(early_idt_handler_array)
+SYM_CODE_END(early_idt_handler_array)
 
 early_idt_handler_common:
 	/*

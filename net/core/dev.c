@@ -3482,7 +3482,7 @@ static struct sk_buff *validate_xmit_vlan(struct sk_buff *skb,
 int skb_csum_hwoffload_help(struct sk_buff *skb,
 			    const netdev_features_t features)
 {
-	if (unlikely(skb->csum_not_inet))
+	if (unlikely(skb_csum_is_sctp(skb)))
 		return !!(features & NETIF_F_SCTP_CRC) ? 0 :
 			skb_crc32c_csum_help(skb);
 
@@ -4709,6 +4709,21 @@ int netif_rx_ni(struct sk_buff *skb)
 	return err;
 }
 EXPORT_SYMBOL(netif_rx_ni);
+
+int netif_rx_any_context(struct sk_buff *skb)
+{
+	/*
+	 * If invoked from contexts which do not invoke bottom half
+	 * processing either at return from interrupt or when softrqs are
+	 * reenabled, use netif_rx_ni() which invokes bottomhalf processing
+	 * directly.
+	 */
+	if (in_interrupt())
+		return netif_rx(skb);
+	else
+		return netif_rx_ni(skb);
+}
+EXPORT_SYMBOL(netif_rx_any_context);
 
 static __latent_entropy void net_tx_action(struct softirq_action *h)
 {
@@ -6439,9 +6454,10 @@ static struct netdev_adjacent *__netdev_find_adj(struct net_device *adj_dev,
 	return NULL;
 }
 
-static int ____netdev_has_upper_dev(struct net_device *upper_dev, void *data)
+static int ____netdev_has_upper_dev(struct net_device *upper_dev,
+				    struct netdev_nested_priv *priv)
 {
-	struct net_device *dev = data;
+	struct net_device *dev = (struct net_device *)priv->data;
 
 	return upper_dev == dev;
 }
@@ -6458,10 +6474,14 @@ static int ____netdev_has_upper_dev(struct net_device *upper_dev, void *data)
 bool netdev_has_upper_dev(struct net_device *dev,
 			  struct net_device *upper_dev)
 {
+	struct netdev_nested_priv priv = {
+		.data = (void *)upper_dev,
+	};
+
 	ASSERT_RTNL();
 
 	return netdev_walk_all_upper_dev_rcu(dev, ____netdev_has_upper_dev,
-					     upper_dev);
+					     &priv);
 }
 EXPORT_SYMBOL(netdev_has_upper_dev);
 
@@ -6478,8 +6498,12 @@ EXPORT_SYMBOL(netdev_has_upper_dev);
 bool netdev_has_upper_dev_all_rcu(struct net_device *dev,
 				  struct net_device *upper_dev)
 {
+	struct netdev_nested_priv priv = {
+		.data = (void *)upper_dev,
+	};
+
 	return !!netdev_walk_all_upper_dev_rcu(dev, ____netdev_has_upper_dev,
-					       upper_dev);
+					       &priv);
 }
 EXPORT_SYMBOL(netdev_has_upper_dev_all_rcu);
 
@@ -6624,8 +6648,8 @@ static struct net_device *netdev_next_upper_dev_rcu(struct net_device *dev,
 
 static int __netdev_walk_all_upper_dev(struct net_device *dev,
 				       int (*fn)(struct net_device *dev,
-						 void *data),
-				       void *data)
+					 struct netdev_nested_priv *priv),
+				       struct netdev_nested_priv *priv)
 {
 	struct net_device *udev, *next, *now, *dev_stack[MAX_NEST_DEV + 1];
 	struct list_head *niter, *iter, *iter_stack[MAX_NEST_DEV + 1];
@@ -6637,7 +6661,7 @@ static int __netdev_walk_all_upper_dev(struct net_device *dev,
 
 	while (1) {
 		if (now != dev) {
-			ret = fn(now, data);
+			ret = fn(now, priv);
 			if (ret)
 				return ret;
 		}
@@ -6673,8 +6697,8 @@ static int __netdev_walk_all_upper_dev(struct net_device *dev,
 
 int netdev_walk_all_upper_dev_rcu(struct net_device *dev,
 				  int (*fn)(struct net_device *dev,
-					    void *data),
-				  void *data)
+					    struct netdev_nested_priv *priv),
+				  struct netdev_nested_priv *priv)
 {
 	struct net_device *udev, *next, *now, *dev_stack[MAX_NEST_DEV + 1];
 	struct list_head *niter, *iter, *iter_stack[MAX_NEST_DEV + 1];
@@ -6685,7 +6709,7 @@ int netdev_walk_all_upper_dev_rcu(struct net_device *dev,
 
 	while (1) {
 		if (now != dev) {
-			ret = fn(now, data);
+			ret = fn(now, priv);
 			if (ret)
 				return ret;
 		}
@@ -6721,10 +6745,14 @@ EXPORT_SYMBOL_GPL(netdev_walk_all_upper_dev_rcu);
 static bool __netdev_has_upper_dev(struct net_device *dev,
 				   struct net_device *upper_dev)
 {
+	struct netdev_nested_priv priv = {
+		.data = (void *)upper_dev,
+	};
+
 	ASSERT_RTNL();
 
 	return __netdev_walk_all_upper_dev(dev, ____netdev_has_upper_dev,
-					   upper_dev);
+					   &priv);
 }
 
 /**
@@ -6842,8 +6870,8 @@ static struct net_device *__netdev_next_lower_dev(struct net_device *dev,
 
 int netdev_walk_all_lower_dev(struct net_device *dev,
 			      int (*fn)(struct net_device *dev,
-					void *data),
-			      void *data)
+					struct netdev_nested_priv *priv),
+			      struct netdev_nested_priv *priv)
 {
 	struct net_device *ldev, *next, *now, *dev_stack[MAX_NEST_DEV + 1];
 	struct list_head *niter, *iter, *iter_stack[MAX_NEST_DEV + 1];
@@ -6854,7 +6882,7 @@ int netdev_walk_all_lower_dev(struct net_device *dev,
 
 	while (1) {
 		if (now != dev) {
-			ret = fn(now, data);
+			ret = fn(now, priv);
 			if (ret)
 				return ret;
 		}
@@ -6889,8 +6917,8 @@ EXPORT_SYMBOL_GPL(netdev_walk_all_lower_dev);
 
 static int __netdev_walk_all_lower_dev(struct net_device *dev,
 				       int (*fn)(struct net_device *dev,
-						 void *data),
-				       void *data)
+					 struct netdev_nested_priv *priv),
+				       struct netdev_nested_priv *priv)
 {
 	struct net_device *ldev, *next, *now, *dev_stack[MAX_NEST_DEV + 1];
 	struct list_head *niter, *iter, *iter_stack[MAX_NEST_DEV + 1];
@@ -6902,7 +6930,7 @@ static int __netdev_walk_all_lower_dev(struct net_device *dev,
 
 	while (1) {
 		if (now != dev) {
-			ret = fn(now, data);
+			ret = fn(now, priv);
 			if (ret)
 				return ret;
 		}
@@ -6991,13 +7019,15 @@ static u8 __netdev_lower_depth(struct net_device *dev)
 	return max_depth;
 }
 
-static int __netdev_update_upper_level(struct net_device *dev, void *data)
+static int __netdev_update_upper_level(struct net_device *dev,
+				       struct netdev_nested_priv *__unused)
 {
 	dev->upper_level = __netdev_upper_depth(dev) + 1;
 	return 0;
 }
 
-static int __netdev_update_lower_level(struct net_device *dev, void *data)
+static int __netdev_update_lower_level(struct net_device *dev,
+				       struct netdev_nested_priv *__unused)
 {
 	dev->lower_level = __netdev_lower_depth(dev) + 1;
 	return 0;
@@ -7005,8 +7035,8 @@ static int __netdev_update_lower_level(struct net_device *dev, void *data)
 
 int netdev_walk_all_lower_dev_rcu(struct net_device *dev,
 				  int (*fn)(struct net_device *dev,
-					    void *data),
-				  void *data)
+					    struct netdev_nested_priv *priv),
+				  struct netdev_nested_priv *priv)
 {
 	struct net_device *ldev, *next, *now, *dev_stack[MAX_NEST_DEV + 1];
 	struct list_head *niter, *iter, *iter_stack[MAX_NEST_DEV + 1];
@@ -7017,7 +7047,7 @@ int netdev_walk_all_lower_dev_rcu(struct net_device *dev,
 
 	while (1) {
 		if (now != dev) {
-			ret = fn(now, data);
+			ret = fn(now, priv);
 			if (ret)
 				return ret;
 		}
@@ -7552,6 +7582,39 @@ struct net_device *netdev_get_xmit_slave(struct net_device *dev,
 	return ops->ndo_get_xmit_slave(dev, skb, all_slaves);
 }
 EXPORT_SYMBOL(netdev_get_xmit_slave);
+
+static struct net_device *netdev_sk_get_lower_dev(struct net_device *dev,
+						  struct sock *sk)
+{
+	const struct net_device_ops *ops = dev->netdev_ops;
+
+	if (!ops->ndo_sk_get_lower_dev)
+		return NULL;
+	return ops->ndo_sk_get_lower_dev(dev, sk);
+}
+
+/**
+ * netdev_sk_get_lowest_dev - Get the lowest device in chain given device and socket
+ * @dev: device
+ * @sk: the socket
+ *
+ * %NULL is returned if no lower device is found.
+ */
+
+struct net_device *netdev_sk_get_lowest_dev(struct net_device *dev,
+					    struct sock *sk)
+{
+	struct net_device *lower;
+
+	lower = netdev_sk_get_lower_dev(dev, sk);
+	while (lower) {
+		dev = lower;
+		lower = netdev_sk_get_lower_dev(dev, sk);
+	}
+
+	return dev;
+}
+EXPORT_SYMBOL(netdev_sk_get_lowest_dev);
 
 static void netdev_adjacent_add_links(struct net_device *dev)
 {
@@ -8174,6 +8237,48 @@ int dev_set_mac_address(struct net_device *dev, struct sockaddr *sa,
 	return 0;
 }
 EXPORT_SYMBOL(dev_set_mac_address);
+
+static DECLARE_RWSEM(dev_addr_sem);
+
+int dev_set_mac_address_user(struct net_device *dev, struct sockaddr *sa,
+			     struct netlink_ext_ack *extack)
+{
+	int ret;
+
+	down_write(&dev_addr_sem);
+	ret = dev_set_mac_address(dev, sa, extack);
+	up_write(&dev_addr_sem);
+	return ret;
+}
+EXPORT_SYMBOL(dev_set_mac_address_user);
+
+int dev_get_mac_address(struct sockaddr *sa, struct net *net, char *dev_name)
+{
+	size_t size = sizeof(sa->sa_data);
+	struct net_device *dev;
+	int ret = 0;
+
+	down_read(&dev_addr_sem);
+	rcu_read_lock();
+
+	dev = dev_get_by_name_rcu(net, dev_name);
+	if (!dev) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	if (!dev->addr_len)
+		memset(sa->sa_data, 0, size);
+	else
+		memcpy(sa->sa_data, dev->dev_addr,
+		       min_t(size_t, size, dev->addr_len));
+	sa->sa_family = dev->type;
+
+unlock:
+	rcu_read_unlock();
+	up_read(&dev_addr_sem);
+	return ret;
+}
+EXPORT_SYMBOL(dev_get_mac_address);
 
 /**
  *	dev_change_carrier - Change device carrier
@@ -9782,6 +9887,55 @@ struct rtnl_link_stats64 *dev_get_stats(struct net_device *dev,
 	return storage;
 }
 EXPORT_SYMBOL(dev_get_stats);
+
+/**
+ *	dev_fetch_sw_netstats - get per-cpu network device statistics
+ *	@s: place to store stats
+ *	@netstats: per-cpu network stats to read from
+ *
+ *	Read per-cpu network statistics and populate the related fields in @s.
+ */
+void dev_fetch_sw_netstats(struct rtnl_link_stats64 *s,
+			   const struct pcpu_sw_netstats __percpu *netstats)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		const struct pcpu_sw_netstats *stats;
+		struct pcpu_sw_netstats tmp;
+		unsigned int start;
+
+		stats = per_cpu_ptr(netstats, cpu);
+		do {
+			start = u64_stats_fetch_begin_irq(&stats->syncp);
+			tmp.rx_packets = stats->rx_packets;
+			tmp.rx_bytes   = stats->rx_bytes;
+			tmp.tx_packets = stats->tx_packets;
+			tmp.tx_bytes   = stats->tx_bytes;
+		} while (u64_stats_fetch_retry_irq(&stats->syncp, start));
+
+		s->rx_packets += tmp.rx_packets;
+		s->rx_bytes   += tmp.rx_bytes;
+		s->tx_packets += tmp.tx_packets;
+		s->tx_bytes   += tmp.tx_bytes;
+	}
+}
+EXPORT_SYMBOL_GPL(dev_fetch_sw_netstats);
+
+/**
+ *	dev_get_tstats64 - ndo_get_stats64 implementation
+ *	@dev: device to get statistics from
+ *	@s: place to store stats
+ *
+ *	Populate @s from dev->stats and dev->tstats. Can be used as
+ *	ndo_get_stats64() callback.
+ */
+void dev_get_tstats64(struct net_device *dev, struct rtnl_link_stats64 *s)
+{
+	netdev_stats_to_stats64(s, &dev->stats);
+	dev_fetch_sw_netstats(s, dev->tstats);
+}
+EXPORT_SYMBOL_GPL(dev_get_tstats64);
 
 struct netdev_queue *dev_ingress_queue_create(struct net_device *dev)
 {

@@ -9,6 +9,7 @@
 #include <asm/hyperv-tlfs.h>
 #include <asm/nospec-branch.h>
 #include <asm/paravirt.h>
+#include <asm/mshyperv.h>
 
 typedef int (*hyperv_fill_flush_list_func)(
 		struct hv_guest_mapping_flush_list *flush,
@@ -39,17 +40,6 @@ void hyperv_reenlightenment_vector(void);
 #define trace_hyperv_callback_vector hyperv_callback_vector
 #endif
 
-/*
- * Reference to pv_ops must be inline so objtool
- * detection of noinstr violations can work correctly.
- */
-static __always_inline void hv_setup_sched_clock(void *sched_clock)
-{
-#ifdef CONFIG_PARAVIRT
-	pv_time_ops.sched_clock = sched_clock;
-#endif
-}
-
 void hyperv_vector_handler(struct pt_regs *regs);
 
 /*
@@ -59,14 +49,18 @@ void hyperv_vector_handler(struct pt_regs *regs);
 void hv_stimer0_vector_handler(struct pt_regs *regs);
 void hv_stimer0_callback_vector(void);
 
-static inline void hv_enable_stimer0_percpu_irq(int irq) {}
-static inline void hv_disable_stimer0_percpu_irq(int irq) {}
-
-
 #if IS_ENABLED(CONFIG_HYPERV)
+extern int hyperv_init_cpuhp;
+
 extern void *hv_hypercall_pg;
 extern void  __percpu  **hyperv_pcpu_input_arg;
 extern void  __percpu  **hyperv_pcpu_output_arg;
+
+extern u64 hv_current_partition_id;
+
+int hv_call_deposit_pages(int node, u64 partition_id, u32 num_pages);
+int hv_call_add_logical_proc(int node, u32 lp_index, u32 acpi_id);
+int hv_call_create_vp(int node, u64 partition_id, u32 vp_index, u32 flags);
 
 static inline u64 hv_do_hypercall(u64 control, void *input, void *output)
 {
@@ -183,10 +177,6 @@ static inline struct hv_vp_assist_page *hv_get_vp_assist_page(unsigned int cpu)
 
 void __init hyperv_init(void);
 void hyperv_setup_mmu_ops(void);
-void *hv_alloc_hyperv_page(void);
-void *hv_alloc_hyperv_zeroed_page(void);
-void hv_free_hyperv_page(unsigned long addr);
-void hyperv_reenlightenment_intr(struct pt_regs *regs);
 void set_hv_tscchange_cb(void (*cb)(void));
 void clear_hv_tscchange_cb(void);
 void hyperv_stop_tsc_emulation(void);
@@ -210,15 +200,13 @@ static inline void hv_apic_init(void) {}
 static inline void hv_set_msi_entry_from_desc(union hv_msi_entry *msi_entry,
 					      struct msi_desc *msi_desc)
 {
-	msi_entry->address = msi_desc->msg.address_lo;
-	msi_entry->data = msi_desc->msg.data;
+	msi_entry->address.as_uint32 = msi_desc->msg.address_lo;
+	msi_entry->data.as_uint32 = msi_desc->msg.data;
 }
 
 #else /* CONFIG_HYPERV */
 static inline void hyperv_init(void) {}
 static inline void hyperv_setup_mmu_ops(void) {}
-static inline void *hv_alloc_hyperv_page(void) { return NULL; }
-static inline void hv_free_hyperv_page(unsigned long addr) {}
 static inline void set_hv_tscchange_cb(void (*cb)(void)) {}
 static inline void clear_hv_tscchange_cb(void) {}
 static inline void hyperv_stop_tsc_emulation(void) {};

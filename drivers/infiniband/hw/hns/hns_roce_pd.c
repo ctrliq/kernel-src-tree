@@ -85,10 +85,9 @@ int hns_roce_alloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 }
 EXPORT_SYMBOL_GPL(hns_roce_alloc_pd);
 
-int hns_roce_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
+void hns_roce_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
 {
 	hns_roce_pd_free(to_hr_dev(pd->device), to_hr_pd(pd)->pdn);
-	return 0;
 }
 EXPORT_SYMBOL_GPL(hns_roce_dealloc_pd);
 

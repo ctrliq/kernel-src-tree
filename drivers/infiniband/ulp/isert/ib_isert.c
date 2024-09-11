@@ -688,8 +688,8 @@ isert_cma_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 	case RDMA_CM_EVENT_ESTABLISHED:
 		isert_connected_handler(cma_id);
 		break;
-	case RDMA_CM_EVENT_ADDR_CHANGE:    /* FALLTHRU */
-	case RDMA_CM_EVENT_DISCONNECTED:   /* FALLTHRU */
+	case RDMA_CM_EVENT_ADDR_CHANGE:
+	case RDMA_CM_EVENT_DISCONNECTED:
 	case RDMA_CM_EVENT_TIMEWAIT_EXIT:  /* FALLTHRU */
 		ret = isert_disconnected_handler(cma_id, event->event);
 		break;
@@ -708,7 +708,7 @@ isert_cma_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 	case RDMA_CM_EVENT_REJECTED:
 		isert_info("Connection rejected: %s\n",
 			   rdma_reject_msg(cma_id, event->status));
-		/* fall through */
+		fallthrough;
 	case RDMA_CM_EVENT_UNREACHABLE:
 	case RDMA_CM_EVENT_CONNECT_ERROR:
 		ret = isert_connect_error(cma_id);
@@ -1491,7 +1491,7 @@ isert_put_cmd(struct isert_cmd *isert_cmd, bool comp_err)
 			transport_generic_free_cmd(&cmd->se_cmd, 0);
 			break;
 		}
-		/* fall through */
+		fallthrough;
 	default:
 		iscsit_release_cmd(cmd);
 		break;
@@ -1553,12 +1553,12 @@ isert_check_pi_status(struct se_cmd *se_cmd, struct ib_mr *sig_mr)
 		}
 		sec_offset_err = mr_status.sig_err.sig_err_offset;
 		do_div(sec_offset_err, block_size);
-		se_cmd->bad_sector = sec_offset_err + se_cmd->t_task_lba;
+		se_cmd->sense_info = sec_offset_err + se_cmd->t_task_lba;
 
 		isert_err("PI error found type %d at sector 0x%llx "
 			  "expected 0x%x vs actual 0x%x\n",
 			  mr_status.sig_err.err_type,
-			  (unsigned long long)se_cmd->bad_sector,
+			  (unsigned long long)se_cmd->sense_info,
 			  mr_status.sig_err.expected,
 			  mr_status.sig_err.actual);
 		ret = 1;
@@ -1669,7 +1669,7 @@ isert_do_control_comp(struct work_struct *work)
 	switch (cmd->i_state) {
 	case ISTATE_SEND_TASKMGTRSP:
 		iscsit_tmr_post_handler(cmd, cmd->conn);
-		/* fall through */
+		fallthrough;
 	case ISTATE_SEND_REJECT:
 	case ISTATE_SEND_TEXTRSP:
 		cmd->i_state = ISTATE_SENT_STATUS;
@@ -2496,7 +2496,7 @@ isert_wait4cmds(struct iscsi_conn *conn)
 	isert_info("iscsi_conn %p\n", conn);
 
 	if (conn->sess) {
-		target_sess_cmd_list_set_waiting(conn->sess->se_sess);
+		target_stop_session(conn->sess->se_sess);
 		target_wait_for_sess_cmds(conn->sess->se_sess);
 	}
 }

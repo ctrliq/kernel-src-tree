@@ -2603,6 +2603,7 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 			err = -EINVAL;
 			goto out_put_prog;
 		}
+		rh_mark_used_feature("eBPF/LSM");
 		break;
 	default:
 		err = -EINVAL;

@@ -188,10 +188,6 @@ static void qedr_roce_register_device(struct qedr_dev *dev)
 	dev->ibdev.node_type = RDMA_NODE_IB_CA;
 
 	ib_set_device_ops(&dev->ibdev, &qedr_roce_dev_ops);
-
-	dev->ibdev.uverbs_cmd_mask |= QEDR_UVERBS(OPEN_XRCD) |
-		QEDR_UVERBS(CLOSE_XRCD) |
-		QEDR_UVERBS(CREATE_XSRQ);
 }
 
 static const struct ib_device_ops qedr_dev_ops = {
@@ -249,31 +245,6 @@ static int qedr_register_device(struct qedr_dev *dev)
 	dev->ibdev.node_guid = dev->attr.node_guid;
 	memcpy(dev->ibdev.node_desc, QEDR_NODE_DESC, sizeof(QEDR_NODE_DESC));
 
-	dev->ibdev.uverbs_cmd_mask = QEDR_UVERBS(GET_CONTEXT) |
-				     QEDR_UVERBS(QUERY_DEVICE) |
-				     QEDR_UVERBS(QUERY_PORT) |
-				     QEDR_UVERBS(ALLOC_PD) |
-				     QEDR_UVERBS(DEALLOC_PD) |
-				     QEDR_UVERBS(CREATE_COMP_CHANNEL) |
-				     QEDR_UVERBS(CREATE_CQ) |
-				     QEDR_UVERBS(RESIZE_CQ) |
-				     QEDR_UVERBS(DESTROY_CQ) |
-				     QEDR_UVERBS(REQ_NOTIFY_CQ) |
-				     QEDR_UVERBS(CREATE_QP) |
-				     QEDR_UVERBS(MODIFY_QP) |
-				     QEDR_UVERBS(QUERY_QP) |
-				     QEDR_UVERBS(DESTROY_QP) |
-				     QEDR_UVERBS(CREATE_SRQ) |
-				     QEDR_UVERBS(DESTROY_SRQ) |
-				     QEDR_UVERBS(QUERY_SRQ) |
-				     QEDR_UVERBS(MODIFY_SRQ) |
-				     QEDR_UVERBS(POST_SRQ_RECV) |
-				     QEDR_UVERBS(REG_MR) |
-				     QEDR_UVERBS(DEREG_MR) |
-				     QEDR_UVERBS(POLL_CQ) |
-				     QEDR_UVERBS(POST_SEND) |
-				     QEDR_UVERBS(POST_RECV);
-
 	if (IS_IWARP(dev)) {
 		rc = qedr_iw_register_device(dev);
 		if (rc)
@@ -293,7 +264,8 @@ static int qedr_register_device(struct qedr_dev *dev)
 	if (rc)
 		return rc;
 
-	return ib_register_device(&dev->ibdev, "qedr%d");
+	dma_set_max_seg_size(&dev->pdev->dev, UINT_MAX);
+	return ib_register_device(&dev->ibdev, "qedr%d", &dev->pdev->dev);
 }
 
 /* This function allocates fast-path status block memory */

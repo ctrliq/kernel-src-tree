@@ -239,9 +239,9 @@ static void nvmet_passthru_execute_cmd(struct nvmet_req *req)
 		}
 
 		q = ns->queue;
-		timeout = req->sq->ctrl->subsys->io_timeout;
+		timeout = nvmet_req_subsys(req)->io_timeout;
 	} else {
-		timeout = req->sq->ctrl->subsys->admin_timeout;
+		timeout = nvmet_req_subsys(req)->admin_timeout;
 	}
 
 	rq = nvme_alloc_request(q, req->cmd, 0);
@@ -494,13 +494,14 @@ u16 nvmet_parse_passthru_admin_cmd(struct nvmet_req *req)
 		return nvmet_setup_passthru_command(req);
 	default:
 		/* Reject commands not in the allowlist above */
-		return NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
+		return nvmet_report_invalid_opcode(req);
 	}
 }
 
 int nvmet_passthru_ctrl_enable(struct nvmet_subsys *subsys)
 {
 	struct nvme_ctrl *ctrl;
+	struct file *file;
 	int ret = -EINVAL;
 	void *old;
 
@@ -515,24 +516,29 @@ int nvmet_passthru_ctrl_enable(struct nvmet_subsys *subsys)
 		goto out_unlock;
 	}
 
-	ctrl = nvme_ctrl_get_by_path(subsys->passthru_ctrl_path);
-	if (IS_ERR(ctrl)) {
-		ret = PTR_ERR(ctrl);
+	file = filp_open(subsys->passthru_ctrl_path, O_RDWR, 0);
+	if (IS_ERR(file)) {
+		ret = PTR_ERR(file);
+		goto out_unlock;
+	}
+
+	ctrl = nvme_ctrl_from_file(file);
+	if (!ctrl) {
 		pr_err("failed to open nvme controller %s\n",
 		       subsys->passthru_ctrl_path);
 
-		goto out_unlock;
+		goto out_put_file;
 	}
 
 	old = xa_cmpxchg(&passthru_subsystems, ctrl->cntlid, NULL,
 			 subsys, GFP_KERNEL);
 	if (xa_is_err(old)) {
 		ret = xa_err(old);
-		goto out_put_ctrl;
+		goto out_put_file;
 	}
 
 	if (old)
-		goto out_put_ctrl;
+		goto out_put_file;
 
 	subsys->passthru_ctrl = ctrl;
 	subsys->ver = ctrl->vs;
@@ -543,13 +549,12 @@ int nvmet_passthru_ctrl_enable(struct nvmet_subsys *subsys)
 			NVME_TERTIARY(subsys->ver));
 		subsys->ver = NVME_VS(1, 2, 1);
 	}
-
+	nvme_get_ctrl(ctrl);
 	__module_get(subsys->passthru_ctrl->ops->module);
-	mutex_unlock(&subsys->lock);
-	return 0;
+	ret = 0;
 
-out_put_ctrl:
-	nvme_put_ctrl(ctrl);
+out_put_file:
+	filp_close(file, NULL);
 out_unlock:
 	mutex_unlock(&subsys->lock);
 	return ret;

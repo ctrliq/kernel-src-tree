@@ -224,6 +224,7 @@ static unsigned long long iblock_emulate_read_cap_with_block_size(
 			break;
 		case 512:
 			blocks_long <<= 3;
+			break;
 		default:
 			break;
 		}

@@ -8,25 +8,12 @@
 #include "eswitch.h"
 
 static int mlx5_devlink_flash_update(struct devlink *devlink,
-				     const char *file_name,
-				     const char *component,
+				     struct devlink_flash_update_params *params,
 				     struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
-	const struct firmware *fw;
-	int err;
 
-	if (component)
-		return -EOPNOTSUPP;
-
-	err = request_firmware_direct(&fw, file_name, &dev->pdev->dev);
-	if (err)
-		return err;
-
-	err = mlx5_firmware_flash(dev, fw, extack);
-	release_firmware(fw);
-
-	return err;
+	return mlx5_firmware_flash(dev, params->fw, extack);
 }
 
 static u8 mlx5_fw_ver_major(u32 version)
@@ -89,6 +76,8 @@ mlx5_devlink_info_get(struct devlink *devlink, struct devlink_info_req *req,
 }
 
 static int mlx5_devlink_reload_down(struct devlink *devlink, bool netns_change,
+				    enum devlink_reload_action action,
+				    enum devlink_reload_limit limit,
 				    struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
@@ -102,11 +91,13 @@ static int mlx5_devlink_reload_down(struct devlink *devlink, bool netns_change,
 	return 0;
 }
 
-static int mlx5_devlink_reload_up(struct devlink *devlink,
+static int mlx5_devlink_reload_up(struct devlink *devlink, enum devlink_reload_action action,
+				  enum devlink_reload_limit limit, u32 *actions_performed,
 				  struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
 
+	*actions_performed = BIT(DEVLINK_RELOAD_ACTION_DRIVER_REINIT);
 	return mlx5_load_one(dev, false);
 }
 
@@ -123,6 +114,7 @@ static const struct devlink_ops mlx5_devlink_ops = {
 #endif
 	.flash_update = mlx5_devlink_flash_update,
 	.info_get = mlx5_devlink_info_get,
+	.reload_actions = BIT(DEVLINK_RELOAD_ACTION_DRIVER_REINIT),
 	.reload_down = mlx5_devlink_reload_down,
 	.reload_up = mlx5_devlink_reload_up,
 };

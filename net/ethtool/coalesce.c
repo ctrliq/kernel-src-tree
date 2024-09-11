@@ -51,32 +51,9 @@ __CHECK_SUPPORTED_OFFSET(COALESCE_TX_USECS_HIGH);
 __CHECK_SUPPORTED_OFFSET(COALESCE_TX_MAX_FRAMES_HIGH);
 __CHECK_SUPPORTED_OFFSET(COALESCE_RATE_SAMPLE_INTERVAL);
 
-const struct nla_policy
-ethnl_coalesce_get_policy[ETHTOOL_A_COALESCE_MAX + 1] = {
-	[ETHTOOL_A_COALESCE_UNSPEC]		= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_HEADER]		= { .type = NLA_NESTED },
-	[ETHTOOL_A_COALESCE_RX_USECS]		= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_RX_MAX_FRAMES]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_RX_USECS_IRQ]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_RX_MAX_FRAMES_IRQ]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_TX_USECS]		= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_TX_MAX_FRAMES]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_TX_USECS_IRQ]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_TX_MAX_FRAMES_IRQ]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_STATS_BLOCK_USECS]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_USE_ADAPTIVE_RX]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_USE_ADAPTIVE_TX]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_PKT_RATE_LOW]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_RX_USECS_LOW]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_RX_MAX_FRAMES_LOW]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_TX_USECS_LOW]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_TX_MAX_FRAMES_LOW]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_PKT_RATE_HIGH]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_RX_USECS_HIGH]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_RX_MAX_FRAMES_HIGH]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_TX_USECS_HIGH]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_TX_MAX_FRAMES_HIGH]	= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_RATE_SAMPLE_INTERVAL] = { .type = NLA_REJECT },
+const struct nla_policy ethnl_coalesce_get_policy[] = {
+	[ETHTOOL_A_COALESCE_HEADER]		=
+		NLA_POLICY_NESTED(ethnl_header_policy),
 };
 
 static int coalesce_prepare_data(const struct ethnl_req_info *req_base,
@@ -213,10 +190,9 @@ const struct ethnl_request_ops ethnl_coalesce_request_ops = {
 
 /* COALESCE_SET */
 
-static const struct nla_policy
-coalesce_set_policy[ETHTOOL_A_COALESCE_MAX + 1] = {
-	[ETHTOOL_A_COALESCE_UNSPEC]		= { .type = NLA_REJECT },
-	[ETHTOOL_A_COALESCE_HEADER]		= { .type = NLA_NESTED },
+const struct nla_policy ethnl_coalesce_set_policy[] = {
+	[ETHTOOL_A_COALESCE_HEADER]		=
+		NLA_POLICY_NESTED(ethnl_header_policy),
 	[ETHTOOL_A_COALESCE_RX_USECS]		= { .type = NLA_U32 },
 	[ETHTOOL_A_COALESCE_RX_MAX_FRAMES]	= { .type = NLA_U32 },
 	[ETHTOOL_A_COALESCE_RX_USECS_IRQ]	= { .type = NLA_U32 },
@@ -243,9 +219,9 @@ coalesce_set_policy[ETHTOOL_A_COALESCE_MAX + 1] = {
 
 int ethnl_set_coalesce(struct sk_buff *skb, struct genl_info *info)
 {
-	struct nlattr *tb[ETHTOOL_A_COALESCE_MAX + 1];
 	struct ethtool_coalesce coalesce = {};
 	struct ethnl_req_info req_info = {};
+	struct nlattr **tb = info->attrs;
 	const struct ethtool_ops *ops;
 	struct net_device *dev;
 	u32 supported_params;
@@ -253,11 +229,6 @@ int ethnl_set_coalesce(struct sk_buff *skb, struct genl_info *info)
 	int ret;
 	u16 a;
 
-	ret = nlmsg_parse(info->nlhdr, GENL_HDRLEN, tb,
-			  ETHTOOL_A_COALESCE_MAX, coalesce_set_policy,
-			  info->extack);
-	if (ret < 0)
-		return ret;
 	ret = ethnl_parse_header_dev_get(&req_info,
 					 tb[ETHTOOL_A_COALESCE_HEADER],
 					 genl_info_net(info), info->extack,

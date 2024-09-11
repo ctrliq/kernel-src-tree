@@ -1114,22 +1114,10 @@ static int mlxsw_core_fw_rev_validate(struct mlxsw_core *mlxsw_core,
 }
 
 static int mlxsw_core_fw_flash_update(struct mlxsw_core *mlxsw_core,
-				      const char *file_name, const char *component,
+				      struct devlink_flash_update_params *params,
 				      struct netlink_ext_ack *extack)
 {
-	const struct firmware *firmware;
-	int err;
-
-	if (component)
-		return -EOPNOTSUPP;
-
-	err = request_firmware_direct(&firmware, file_name, mlxsw_core->bus_info->dev);
-	if (err)
-		return err;
-	err = mlxsw_core_fw_flash(mlxsw_core, firmware, extack);
-	release_firmware(firmware);
-
-	return err;
+	return mlxsw_core_fw_flash(mlxsw_core, params->fw, extack);
 }
 
 static int mlxsw_core_devlink_param_fw_load_policy_validate(struct devlink *devlink, u32 id,
@@ -1421,7 +1409,8 @@ mlxsw_devlink_info_get(struct devlink *devlink, struct devlink_info_req *req,
 
 static int
 mlxsw_devlink_core_bus_device_reload_down(struct devlink *devlink,
-					  bool netns_change,
+					  bool netns_change, enum devlink_reload_action action,
+					  enum devlink_reload_limit limit,
 					  struct netlink_ext_ack *extack)
 {
 	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
@@ -1434,11 +1423,14 @@ mlxsw_devlink_core_bus_device_reload_down(struct devlink *devlink,
 }
 
 static int
-mlxsw_devlink_core_bus_device_reload_up(struct devlink *devlink,
+mlxsw_devlink_core_bus_device_reload_up(struct devlink *devlink, enum devlink_reload_action action,
+					enum devlink_reload_limit limit, u32 *actions_performed,
 					struct netlink_ext_ack *extack)
 {
 	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
 
+	*actions_performed = BIT(DEVLINK_RELOAD_ACTION_DRIVER_REINIT) |
+			     BIT(DEVLINK_RELOAD_ACTION_FW_ACTIVATE);
 	return mlxsw_core_bus_device_register(mlxsw_core->bus_info,
 					      mlxsw_core->bus,
 					      mlxsw_core->bus_priv, true,
@@ -1446,13 +1438,12 @@ mlxsw_devlink_core_bus_device_reload_up(struct devlink *devlink,
 }
 
 static int mlxsw_devlink_flash_update(struct devlink *devlink,
-				      const char *file_name,
-				      const char *component,
+				      struct devlink_flash_update_params *params,
 				      struct netlink_ext_ack *extack)
 {
 	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
 
-	return mlxsw_core_fw_flash_update(mlxsw_core, file_name, component, extack);
+	return mlxsw_core_fw_flash_update(mlxsw_core, params, extack);
 }
 
 static int mlxsw_devlink_trap_init(struct devlink *devlink,
@@ -1572,6 +1563,8 @@ mlxsw_devlink_trap_policer_counter_get(struct devlink *devlink,
 }
 
 static const struct devlink_ops mlxsw_devlink_ops = {
+	.reload_actions		= BIT(DEVLINK_RELOAD_ACTION_DRIVER_REINIT) |
+				  BIT(DEVLINK_RELOAD_ACTION_FW_ACTIVATE),
 	.reload_down		= mlxsw_devlink_core_bus_device_reload_down,
 	.reload_up		= mlxsw_devlink_core_bus_device_reload_up,
 	.port_type_set			= mlxsw_devlink_port_type_set,

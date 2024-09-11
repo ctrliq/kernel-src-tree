@@ -2162,7 +2162,7 @@ void mlxsw_sp_sample_receive(struct mlxsw_sp *mlxsw_sp, struct sk_buff *skb,
 {
 	struct mlxsw_sp_port *mlxsw_sp_port = mlxsw_sp->ports[local_port];
 	struct mlxsw_sp_port_sample *sample;
-	u32 size;
+	struct psample_metadata md = {};
 
 	if (unlikely(!mlxsw_sp_port)) {
 		dev_warn_ratelimited(mlxsw_sp->bus_info->dev, "Port %d: sample skb received for non-existent port\n",
@@ -2174,9 +2174,9 @@ void mlxsw_sp_sample_receive(struct mlxsw_sp *mlxsw_sp, struct sk_buff *skb,
 	sample = rcu_dereference(mlxsw_sp_port->sample);
 	if (!sample)
 		goto out_unlock;
-	size = sample->truncate ? sample->trunc_size : skb->len;
-	psample_sample_packet(sample->psample_group, skb, size,
-			      mlxsw_sp_port->dev->ifindex, 0, sample->rate);
+	md.trunc_size = sample->truncate ? sample->trunc_size : skb->len;
+	md.in_ifindex = mlxsw_sp_port->dev->ifindex;
+	psample_sample_packet(sample->psample_group, skb, sample->rate, &md);
 out_unlock:
 	rcu_read_unlock();
 out:
@@ -3333,13 +3333,13 @@ bool mlxsw_sp_port_dev_check(const struct net_device *dev)
 	return dev->netdev_ops == &mlxsw_sp_port_netdev_ops;
 }
 
-static int mlxsw_sp_lower_dev_walk(struct net_device *lower_dev, void *data)
+static int mlxsw_sp_lower_dev_walk(struct net_device *lower_dev,
+				   struct netdev_nested_priv *priv)
 {
-	struct mlxsw_sp_port **p_mlxsw_sp_port = data;
 	int ret = 0;
 
 	if (mlxsw_sp_port_dev_check(lower_dev)) {
-		*p_mlxsw_sp_port = netdev_priv(lower_dev);
+		priv->data = (void *)netdev_priv(lower_dev);
 		ret = 1;
 	}
 
@@ -3348,15 +3348,16 @@ static int mlxsw_sp_lower_dev_walk(struct net_device *lower_dev, void *data)
 
 struct mlxsw_sp_port *mlxsw_sp_port_dev_lower_find(struct net_device *dev)
 {
-	struct mlxsw_sp_port *mlxsw_sp_port;
+	struct netdev_nested_priv priv = {
+		.data = NULL,
+	};
 
 	if (mlxsw_sp_port_dev_check(dev))
 		return netdev_priv(dev);
 
-	mlxsw_sp_port = NULL;
-	netdev_walk_all_lower_dev(dev, mlxsw_sp_lower_dev_walk, &mlxsw_sp_port);
+	netdev_walk_all_lower_dev(dev, mlxsw_sp_lower_dev_walk, &priv);
 
-	return mlxsw_sp_port;
+	return (struct mlxsw_sp_port *)priv.data;
 }
 
 struct mlxsw_sp *mlxsw_sp_lower_get(struct net_device *dev)
@@ -3369,16 +3370,17 @@ struct mlxsw_sp *mlxsw_sp_lower_get(struct net_device *dev)
 
 struct mlxsw_sp_port *mlxsw_sp_port_dev_lower_find_rcu(struct net_device *dev)
 {
-	struct mlxsw_sp_port *mlxsw_sp_port;
+	struct netdev_nested_priv priv = {
+		.data = NULL,
+	};
 
 	if (mlxsw_sp_port_dev_check(dev))
 		return netdev_priv(dev);
 
-	mlxsw_sp_port = NULL;
 	netdev_walk_all_lower_dev_rcu(dev, mlxsw_sp_lower_dev_walk,
-				      &mlxsw_sp_port);
+				      &priv);
 
-	return mlxsw_sp_port;
+	return (struct mlxsw_sp_port *)priv.data;
 }
 
 struct mlxsw_sp_port *mlxsw_sp_port_lower_dev_hold(struct net_device *dev)

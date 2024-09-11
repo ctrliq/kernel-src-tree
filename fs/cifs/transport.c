@@ -341,7 +341,7 @@ __smb_send_rqst(struct TCP_Server_Info *server, int num_rqst,
 
 	if (fatal_signal_pending(current)) {
 		cifs_dbg(FYI, "signal pending before send request\n");
-		return -EINTR;
+		return -ERESTARTSYS;
 	}
 
 	/* cork the socket */

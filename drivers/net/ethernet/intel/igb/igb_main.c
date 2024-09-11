@@ -37,6 +37,7 @@
 #endif
 #include <linux/i2c.h>
 #include "igb.h"
+#include <generated/utsrelease.h>
 
 enum queue_mode {
 	QUEUE_MODE_STRICT_PRIORITY,
@@ -233,6 +234,7 @@ static struct pci_driver igb_driver = {
 MODULE_AUTHOR("Intel Corporation, <e1000-devel@lists.sourceforge.net>");
 MODULE_DESCRIPTION("Intel(R) Gigabit Ethernet Network Driver");
 MODULE_LICENSE("GPL v2");
+MODULE_VERSION(UTS_RELEASE);
 
 #define DEFAULT_MSG_ENABLE (NETIF_MSG_DRV|NETIF_MSG_PROBE|NETIF_MSG_LINK)
 static int debug = -1;
@@ -7966,18 +7968,13 @@ static void igb_reuse_rx_page(struct igb_ring *rx_ring,
 	new_buff->pagecnt_bias	= old_buff->pagecnt_bias;
 }
 
-static inline bool igb_page_is_reserved(struct page *page)
-{
-	return (page_to_nid(page) != numa_mem_id()) || page_is_pfmemalloc(page);
-}
-
 static bool igb_can_reuse_rx_page(struct igb_rx_buffer *rx_buffer)
 {
 	unsigned int pagecnt_bias = rx_buffer->pagecnt_bias;
 	struct page *page = rx_buffer->page;
 
-	/* avoid re-using remote pages */
-	if (unlikely(igb_page_is_reserved(page)))
+	/* avoid re-using remote and pfmemalloc pages */
+	if (!dev_page_is_reusable(page))
 		return false;
 
 #if (PAGE_SIZE < 8192)

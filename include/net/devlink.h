@@ -23,6 +23,15 @@
 #include <net/flow_offload.h>
 #include <uapi/linux/devlink.h>
 #include <linux/xarray.h>
+#include <linux/firmware.h>
+
+#define DEVLINK_RELOAD_STATS_ARRAY_SIZE \
+	(__DEVLINK_RELOAD_LIMIT_MAX * __DEVLINK_RELOAD_ACTION_MAX)
+
+struct devlink_dev_stats {
+	u32 reload_stats[DEVLINK_RELOAD_STATS_ARRAY_SIZE];
+	u32 remote_reload_stats[DEVLINK_RELOAD_STATS_ARRAY_SIZE];
+};
 
 struct devlink_ops;
 
@@ -42,6 +51,7 @@ struct devlink {
 	struct list_head trap_policer_list;
 	const struct devlink_ops *ops;
 	struct xarray snapshot_ids;
+	struct devlink_dev_stats stats;
 	struct device *dev;
 	possible_net_t _net;
 	struct mutex lock; /* Serializes access to devlink instance specific objects such as
@@ -63,20 +73,28 @@ struct devlink_port_phys_attrs {
 
 /**
  * struct devlink_port_pci_pf_attrs - devlink port's PCI PF attributes
+ * @controller: Associated controller number
  * @pf: Associated PCI PF number for this port.
+ * @external: when set, indicates if a port is for an external controller
  */
 struct devlink_port_pci_pf_attrs {
+	u32 controller;
 	u16 pf;
+	u8 external:1;
 };
 
 /**
  * struct devlink_port_pci_vf_attrs - devlink port's PCI VF attributes
+ * @controller: Associated controller number
  * @pf: Associated PCI PF number for this port.
  * @vf: Associated PCI VF for of the PCI PF for this port.
+ * @external: when set, indicates if a port is for an external controller
  */
 struct devlink_port_pci_vf_attrs {
+	u32 controller;
 	u16 pf;
 	u16 vf;
+	u8 external:1;
 };
 
 /**
@@ -550,6 +568,24 @@ enum devlink_param_generic_id {
 /* Firmware bundle identifier */
 #define DEVLINK_INFO_VERSION_GENERIC_FW_BUNDLE_ID	"fw.bundle_id"
 
+/**
+ * struct devlink_flash_update_params - Flash Update parameters
+ * @fw: pointer to the firmware data to update from
+ * @component: the flash component to update
+ *
+ * With the exception of fw, drivers must opt-in to parameters by
+ * setting the appropriate bit in the supported_flash_update_params field in
+ * their devlink_ops structure.
+ */
+struct devlink_flash_update_params {
+	const struct firmware *fw;
+	const char *component;
+	u32 overwrite_mask;
+};
+
+#define DEVLINK_SUPPORT_FLASH_UPDATE_COMPONENT		BIT(0)
+#define DEVLINK_SUPPORT_FLASH_UPDATE_OVERWRITE_MASK	BIT(1)
+
 struct devlink_region;
 struct devlink_info_req;
 
@@ -612,12 +648,14 @@ struct devlink_health_reporter_ops {
  * @trap_group_name: Trap group name.
  * @input_dev: Input netdevice.
  * @fa_cookie: Flow action user cookie.
+ * @trap_type: Trap type.
  */
 struct devlink_trap_metadata {
 	const char *trap_name;
 	const char *trap_group_name;
 	struct net_device *input_dev;
 	const struct flow_action_cookie *fa_cookie;
+	enum devlink_trap_type trap_type;
 };
 
 /**
@@ -1103,9 +1141,20 @@ enum devlink_trap_group_generic_id {
 	}
 
 struct devlink_ops {
+	/**
+	 * @supported_flash_update_params:
+	 * mask of parameters supported by the driver's .flash_update
+	 * implemementation.
+	 */
+	u32 supported_flash_update_params;
+	unsigned long reload_actions;
+	unsigned long reload_limits;
 	int (*reload_down)(struct devlink *devlink, bool netns_change,
+			   enum devlink_reload_action action,
+			   enum devlink_reload_limit limit,
 			   struct netlink_ext_ack *extack);
-	int (*reload_up)(struct devlink *devlink,
+	int (*reload_up)(struct devlink *devlink, enum devlink_reload_action action,
+			 enum devlink_reload_limit limit, u32 *actions_performed,
 			 struct netlink_ext_ack *extack);
 	int (*port_type_set)(struct devlink_port *devlink_port,
 			     enum devlink_port_type port_type);
@@ -1163,8 +1212,15 @@ struct devlink_ops {
 				      struct netlink_ext_ack *extack);
 	int (*info_get)(struct devlink *devlink, struct devlink_info_req *req,
 			struct netlink_ext_ack *extack);
-	int (*flash_update)(struct devlink *devlink, const char *file_name,
-			    const char *component,
+	/**
+	 * @flash_update: Device flash update function
+	 *
+	 * Used to perform a flash update for the device. The set of
+	 * parameters supported by the driver should be set in
+	 * supported_flash_update_params.
+	 */
+	int (*flash_update)(struct devlink *devlink,
+			    struct devlink_flash_update_params *params,
 			    struct netlink_ext_ack *extack);
 	/**
 	 * @trap_init: Trap initialization function.
@@ -1325,9 +1381,10 @@ void devlink_port_type_ib_set(struct devlink_port *devlink_port,
 void devlink_port_type_clear(struct devlink_port *devlink_port);
 void devlink_port_attrs_set(struct devlink_port *devlink_port,
 			    struct devlink_port_attrs *devlink_port_attrs);
-void devlink_port_attrs_pci_pf_set(struct devlink_port *devlink_port, u16 pf);
-void devlink_port_attrs_pci_vf_set(struct devlink_port *devlink_port,
-				   u16 pf, u16 vf);
+void devlink_port_attrs_pci_pf_set(struct devlink_port *devlink_port, u32 controller,
+				   u16 pf, bool external);
+void devlink_port_attrs_pci_vf_set(struct devlink_port *devlink_port, u32 controller,
+				   u16 pf, u16 vf, bool external);
 int devlink_sb_register(struct devlink *devlink, unsigned int sb_index,
 			u32 size, u16 ingress_pools_count,
 			u16 egress_pools_count, u16 ingress_tc_count,
@@ -1493,9 +1550,10 @@ void
 devlink_health_reporter_recovery_done(struct devlink_health_reporter *reporter);
 
 bool devlink_is_reload_failed(const struct devlink *devlink);
+void devlink_remote_reload_actions_performed(struct devlink *devlink,
+					     enum devlink_reload_limit limit,
+					     u32 actions_performed);
 
-void devlink_flash_update_begin_notify(struct devlink *devlink);
-void devlink_flash_update_end_notify(struct devlink *devlink);
 void devlink_flash_update_status_notify(struct devlink *devlink,
 					const char *status_msg,
 					const char *component,

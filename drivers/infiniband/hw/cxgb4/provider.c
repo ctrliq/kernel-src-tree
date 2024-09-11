@@ -498,8 +498,10 @@ static const struct ib_device_ops c4iw_dev_ops = {
 	.query_qp = c4iw_ib_query_qp,
 	.reg_user_mr = c4iw_reg_user_mr,
 	.req_notify_cq = c4iw_arm_cq,
-	INIT_RDMA_OBJ_SIZE(ib_pd, c4iw_pd, ibpd),
+
 	INIT_RDMA_OBJ_SIZE(ib_cq, c4iw_cq, ibcq),
+	INIT_RDMA_OBJ_SIZE(ib_mw, c4iw_mw, ibmw),
+	INIT_RDMA_OBJ_SIZE(ib_pd, c4iw_pd, ibpd),
 	INIT_RDMA_OBJ_SIZE(ib_srq, c4iw_srq, ibsrq),
 	INIT_RDMA_OBJ_SIZE(ib_ucontext, c4iw_ucontext, ibucontext),
 };
@@ -531,28 +533,6 @@ void c4iw_register_device(struct work_struct *work)
 	if (fastreg_support)
 		dev->device_cap_flags |= IB_DEVICE_MEM_MGT_EXTENSIONS;
 	dev->ibdev.local_dma_lkey = 0;
-	dev->ibdev.uverbs_cmd_mask =
-	    (1ull << IB_USER_VERBS_CMD_GET_CONTEXT) |
-	    (1ull << IB_USER_VERBS_CMD_QUERY_DEVICE) |
-	    (1ull << IB_USER_VERBS_CMD_QUERY_PORT) |
-	    (1ull << IB_USER_VERBS_CMD_ALLOC_PD) |
-	    (1ull << IB_USER_VERBS_CMD_DEALLOC_PD) |
-	    (1ull << IB_USER_VERBS_CMD_REG_MR) |
-	    (1ull << IB_USER_VERBS_CMD_DEREG_MR) |
-	    (1ull << IB_USER_VERBS_CMD_CREATE_COMP_CHANNEL) |
-	    (1ull << IB_USER_VERBS_CMD_CREATE_CQ) |
-	    (1ull << IB_USER_VERBS_CMD_DESTROY_CQ) |
-	    (1ull << IB_USER_VERBS_CMD_REQ_NOTIFY_CQ) |
-	    (1ull << IB_USER_VERBS_CMD_CREATE_QP) |
-	    (1ull << IB_USER_VERBS_CMD_MODIFY_QP) |
-	    (1ull << IB_USER_VERBS_CMD_QUERY_QP) |
-	    (1ull << IB_USER_VERBS_CMD_POLL_CQ) |
-	    (1ull << IB_USER_VERBS_CMD_DESTROY_QP) |
-	    (1ull << IB_USER_VERBS_CMD_POST_SEND) |
-	    (1ull << IB_USER_VERBS_CMD_POST_RECV) |
-	    (1ull << IB_USER_VERBS_CMD_CREATE_SRQ) |
-	    (1ull << IB_USER_VERBS_CMD_MODIFY_SRQ) |
-	    (1ull << IB_USER_VERBS_CMD_DESTROY_SRQ);
 	dev->ibdev.node_type = RDMA_NODE_RNIC;
 	BUILD_BUG_ON(sizeof(C4IW_NODE_DESC) > IB_DEVICE_NODE_DESC_MAX);
 	memcpy(dev->ibdev.node_desc, C4IW_NODE_DESC, sizeof(C4IW_NODE_DESC));
@@ -568,7 +548,9 @@ void c4iw_register_device(struct work_struct *work)
 	ret = set_netdevs(&dev->ibdev, &dev->rdev);
 	if (ret)
 		goto err_dealloc_ctx;
-	ret = ib_register_device(&dev->ibdev, "cxgb4_%d");
+	dma_set_max_seg_size(&dev->rdev.lldi.pdev->dev, UINT_MAX);
+	ret = ib_register_device(&dev->ibdev, "cxgb4_%d",
+				 &dev->rdev.lldi.pdev->dev);
 	if (ret)
 		goto err_dealloc_ctx;
 	return;

@@ -874,7 +874,7 @@ static int slab_pad_check(struct kmem_cache *s, struct page *page)
 		return 1;
 
 	start = page_address(page);
-	length = PAGE_SIZE << compound_order(page);
+	length = page_size(page);
 	end = start + length;
 	remainder = length % s->size;
 	if (!remainder)
@@ -1120,13 +1120,14 @@ static void setup_object_debug(struct kmem_cache *s, struct page *page,
 	init_tracking(s, object);
 }
 
-static void setup_page_debug(struct kmem_cache *s, void *addr, int order)
+static
+void setup_page_debug(struct kmem_cache *s, struct page *page, void *addr)
 {
 	if (!kmem_cache_debug_flags(s, SLAB_POISON))
 		return;
 
 	metadata_access_enable();
-	memset(addr, POISON_INUSE, PAGE_SIZE << order);
+	memset(addr, POISON_INUSE, page_size(page));
 	metadata_access_disable();
 }
 
@@ -1466,8 +1467,8 @@ slab_flags_t kmem_cache_flags(unsigned int object_size,
 #else /* !CONFIG_SLUB_DEBUG */
 static inline void setup_object_debug(struct kmem_cache *s,
 			struct page *page, void *object) {}
-static inline void setup_page_debug(struct kmem_cache *s,
-			void *addr, int order) {}
+static inline
+void setup_page_debug(struct kmem_cache *s, struct page *page, void *addr) {}
 
 static inline int alloc_debug_processing(struct kmem_cache *s,
 	struct page *page, void *object, unsigned long addr) { return 0; }
@@ -1625,9 +1626,6 @@ static inline struct page *alloc_slab_page(struct kmem_cache *s,
 	else
 		page = __alloc_pages_node(node, flags, order);
 
-	if (page)
-		account_slab_page(page, order, s);
-
 	return page;
 }
 
@@ -1746,7 +1744,7 @@ static struct page *allocate_slab(struct kmem_cache *s, gfp_t flags, int node)
 	struct kmem_cache_order_objects oo = s->oo;
 	gfp_t alloc_gfp;
 	void *start, *p, *next;
-	int idx, order;
+	int idx;
 	bool shuffle;
 
 	flags &= gfp_allowed_mask;
@@ -1780,7 +1778,8 @@ static struct page *allocate_slab(struct kmem_cache *s, gfp_t flags, int node)
 
 	page->objects = oo_objects(oo);
 
-	order = compound_order(page);
+	account_slab_page(page, oo_order(oo), s, flags);
+
 	page->slab_cache = s;
 	__SetPageSlab(page);
 	if (page_is_pfmemalloc(page))
@@ -1790,7 +1789,7 @@ static struct page *allocate_slab(struct kmem_cache *s, gfp_t flags, int node)
 
 	start = page_address(page);
 
-	setup_page_debug(s, start, order);
+	setup_page_debug(s, page, start);
 
 	shuffle = shuffle_freelist(s, page);
 
@@ -2011,7 +2010,7 @@ static void *get_any_partial(struct kmem_cache *s, gfp_t flags,
 	struct zonelist *zonelist;
 	struct zoneref *z;
 	struct zone *zone;
-	enum zone_type high_zoneidx = gfp_zone(flags);
+	enum zone_type highest_zoneidx = gfp_zone(flags);
 	void *object;
 	unsigned int cpuset_mems_cookie;
 
@@ -2040,7 +2039,7 @@ static void *get_any_partial(struct kmem_cache *s, gfp_t flags,
 	do {
 		cpuset_mems_cookie = read_mems_allowed_begin();
 		zonelist = node_zonelist(mempolicy_slab_node(), flags);
-		for_each_zone_zonelist(zone, z, zonelist, high_zoneidx) {
+		for_each_zone_zonelist(zone, z, zonelist, highest_zoneidx) {
 			struct kmem_cache_node *n;
 
 			n = get_node(s, zone_to_nid(zone));
@@ -4104,7 +4103,7 @@ size_t __ksize(const void *object)
 
 	if (unlikely(!PageSlab(page))) {
 		WARN_ON(!PageCompound(page));
-		return PAGE_SIZE << compound_order(page);
+		return page_size(page);
 	}
 
 	return slab_ksize(page->slab_cache);

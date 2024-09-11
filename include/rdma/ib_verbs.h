@@ -1232,6 +1232,8 @@ enum ib_qp_attr_mask {
 	IB_QP_RESERVED3			= (1<<23),
 	IB_QP_RESERVED4			= (1<<24),
 	IB_QP_RATE_LIMIT		= (1<<25),
+
+	IB_QP_ATTR_STANDARD_BITS = GENMASK(20, 0),
 };
 
 enum ib_qp_state {
@@ -1467,6 +1469,8 @@ enum rdma_remove_reason {
 	RDMA_REMOVE_DRIVER_REMOVE,
 	/* uobj is being cleaned-up before being committed */
 	RDMA_REMOVE_ABORT,
+	/* The driver failed to destroy the uobject and is being disconnected */
+	RDMA_REMOVE_DRIVER_FAILURE,
 };
 
 struct ib_rdmacg_object {
@@ -1478,8 +1482,6 @@ struct ib_rdmacg_object {
 struct ib_ucontext {
 	struct ib_device       *device;
 	struct ib_uverbs_file  *ufile;
-
-	bool cleanup_retryable;
 
 	struct mutex per_mm_list_lock;
 	struct list_head per_mm_list;
@@ -2402,6 +2404,8 @@ struct ib_device_ops {
 	int (*dealloc_pd)(struct ib_pd *pd, struct ib_udata *udata);
 	int (*create_ah)(struct ib_ah *ah, struct rdma_ah_init_attr *attr,
 			 struct ib_udata *udata);
+	int (*create_user_ah)(struct ib_ah *ah, struct rdma_ah_init_attr *attr,
+			      struct ib_udata *udata);
 	int (*modify_ah)(struct ib_ah *ah, struct rdma_ah_attr *ah_attr);
 	int (*query_ah)(struct ib_ah *ah, struct rdma_ah_attr *ah_attr);
 	int (*destroy_ah)(struct ib_ah *ah, u32 flags);
@@ -2412,7 +2416,7 @@ struct ib_device_ops {
 			  enum ib_srq_attr_mask srq_attr_mask,
 			  struct ib_udata *udata);
 	int (*query_srq)(struct ib_srq *srq, struct ib_srq_attr *srq_attr);
-	void (*destroy_srq)(struct ib_srq *srq, struct ib_udata *udata);
+	int (*destroy_srq)(struct ib_srq *srq, struct ib_udata *udata);
 	struct ib_qp *(*create_qp)(struct ib_pd *pd,
 				   struct ib_qp_init_attr *qp_init_attr,
 				   struct ib_udata *udata);
@@ -2424,15 +2428,16 @@ struct ib_device_ops {
 	int (*create_cq)(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
 			 struct ib_udata *udata);
 	int (*modify_cq)(struct ib_cq *cq, u16 cq_count, u16 cq_period);
-	void (*destroy_cq)(struct ib_cq *cq, struct ib_udata *udata);
+	int (*destroy_cq)(struct ib_cq *cq, struct ib_udata *udata);
 	int (*resize_cq)(struct ib_cq *cq, int cqe, struct ib_udata *udata);
 	struct ib_mr *(*get_dma_mr)(struct ib_pd *pd, int mr_access_flags);
 	struct ib_mr *(*reg_user_mr)(struct ib_pd *pd, u64 start, u64 length,
 				     u64 virt_addr, int mr_access_flags,
 				     struct ib_udata *udata);
-	int (*rereg_user_mr)(struct ib_mr *mr, int flags, u64 start, u64 length,
-			     u64 virt_addr, int mr_access_flags,
-			     struct ib_pd *pd, struct ib_udata *udata);
+	struct ib_mr *(*rereg_user_mr)(struct ib_mr *mr, int flags, u64 start,
+				       u64 length, u64 virt_addr,
+				       int mr_access_flags, struct ib_pd *pd,
+				       struct ib_udata *udata);
 	int (*dereg_mr)(struct ib_mr *mr, struct ib_udata *udata);
 	struct ib_mr *(*alloc_mr)(struct ib_pd *pd, enum ib_mr_type mr_type,
 				  u32 max_num_sg);
@@ -2447,8 +2452,7 @@ struct ib_device_ops {
 			 unsigned int *sg_offset);
 	int (*check_mr_status)(struct ib_mr *mr, u32 check_mask,
 			       struct ib_mr_status *mr_status);
-	struct ib_mw *(*alloc_mw)(struct ib_pd *pd, enum ib_mw_type type,
-				  struct ib_udata *udata);
+	int (*alloc_mw)(struct ib_mw *mw, struct ib_udata *udata);
 	int (*dealloc_mw)(struct ib_mw *mw);
 	void (*invalidate_range)(struct ib_umem_odp *umem_odp,
 				 unsigned long start, unsigned long end);
@@ -2610,6 +2614,7 @@ struct ib_device_ops {
 	DECLARE_RDMA_OBJ_SIZE(ib_ah);
 	DECLARE_RDMA_OBJ_SIZE(ib_counters);
 	DECLARE_RDMA_OBJ_SIZE(ib_cq);
+	DECLARE_RDMA_OBJ_SIZE(ib_mw);
 	DECLARE_RDMA_OBJ_SIZE(ib_pd);
 	DECLARE_RDMA_OBJ_SIZE(ib_rwq_ind_table);
 	DECLARE_RDMA_OBJ_SIZE(ib_srq);
@@ -2668,7 +2673,6 @@ struct ib_device {
 	const struct attribute_group	*groups[3];
 
 	u64			     uverbs_cmd_mask;
-	u64			     uverbs_ex_cmd_mask;
 
 	char			     node_desc[IB_DEVICE_NODE_DESC_MAX];
 	__be64			     node_guid;
@@ -2785,7 +2789,8 @@ void ib_dealloc_device(struct ib_device *device);
 
 void ib_get_device_fw_str(struct ib_device *device, char *str);
 
-int ib_register_device(struct ib_device *device, const char *name);
+int ib_register_device(struct ib_device *device, const char *name,
+		       struct device *dma_device);
 void ib_unregister_device(struct ib_device *device);
 void ib_unregister_driver(enum rdma_driver_id driver_id);
 void ib_unregister_device_and_put(struct ib_device *device);
@@ -2900,46 +2905,6 @@ static inline bool ib_is_udata_cleared(struct ib_udata *udata,
 				       size_t len)
 {
 	return ib_is_buffer_cleared(udata->inbuf + offset, len);
-}
-
-/**
- * ib_is_destroy_retryable - Check whether the uobject destruction
- * is retryable.
- * @ret: The initial destruction return code
- * @why: remove reason
- * @uobj: The uobject that is destroyed
- *
- * This function is a helper function that IB layer and low-level drivers
- * can use to consider whether the destruction of the given uobject is
- * retry-able.
- * It checks the original return code, if it wasn't success the destruction
- * is retryable according to the ucontext state (i.e. cleanup_retryable) and
- * the remove reason. (i.e. why).
- * Must be called with the object locked for destroy.
- */
-static inline bool ib_is_destroy_retryable(int ret, enum rdma_remove_reason why,
-					   struct ib_uobject *uobj)
-{
-	return ret && (why == RDMA_REMOVE_DESTROY ||
-		       uobj->context->cleanup_retryable);
-}
-
-/**
- * ib_destroy_usecnt - Called during destruction to check the usecnt
- * @usecnt: The usecnt atomic
- * @why: remove reason
- * @uobj: The uobject that is destroyed
- *
- * Non-zero usecnts will block destruction unless destruction was triggered by
- * a ucontext cleanup.
- */
-static inline int ib_destroy_usecnt(atomic_t *usecnt,
-				    enum rdma_remove_reason why,
-				    struct ib_uobject *uobj)
-{
-	if (atomic_read(usecnt) && ib_is_destroy_retryable(-EBUSY, why, uobj))
-		return -EBUSY;
-	return 0;
 }
 
 /**
@@ -3644,9 +3609,11 @@ int ib_destroy_srq_user(struct ib_srq *srq, struct ib_udata *udata);
  *
  * NOTE: for user srq use ib_destroy_srq_user with valid udata!
  */
-static inline int ib_destroy_srq(struct ib_srq *srq)
+static inline void ib_destroy_srq(struct ib_srq *srq)
 {
-	return ib_destroy_srq_user(srq, NULL);
+	int ret = ib_destroy_srq_user(srq, NULL);
+
+	WARN_ONCE(ret, "Destroy of kernel SRQ shouldn't fail");
 }
 
 /**
@@ -3884,7 +3851,9 @@ int ib_destroy_cq_user(struct ib_cq *cq, struct ib_udata *udata);
  */
 static inline void ib_destroy_cq(struct ib_cq *cq)
 {
-	ib_destroy_cq_user(cq, NULL);
+	int ret = ib_destroy_cq_user(cq, NULL);
+
+	WARN_ONCE(ret, "Destroy of kernel CQ shouldn't fail");
 }
 
 /**
@@ -3958,6 +3927,16 @@ static inline int ib_req_ncomp_notif(struct ib_cq *cq, int wc_cnt)
 		-ENOSYS;
 }
 
+/*
+ * Drivers that don't need a DMA mapping at the RDMA layer, set dma_device to
+ * NULL. This causes the ib_dma* helpers to just stash the kernel virtual
+ * address into the dma address.
+ */
+static inline bool ib_uses_virt_dma(struct ib_device *dev)
+{
+	return IS_ENABLED(CONFIG_INFINIBAND_VIRT_DMA) && !dev->dma_device;
+}
+
 /**
  * ib_dma_mapping_error - check a DMA addr for error
  * @dev: The device for which the dma_addr was created
@@ -3965,6 +3944,8 @@ static inline int ib_req_ncomp_notif(struct ib_cq *cq, int wc_cnt)
  */
 static inline int ib_dma_mapping_error(struct ib_device *dev, u64 dma_addr)
 {
+	if (ib_uses_virt_dma(dev))
+		return 0;
 	return dma_mapping_error(dev->dma_device, dma_addr);
 }
 
@@ -3979,6 +3960,8 @@ static inline u64 ib_dma_map_single(struct ib_device *dev,
 				    void *cpu_addr, size_t size,
 				    enum dma_data_direction direction)
 {
+	if (ib_uses_virt_dma(dev))
+		return (uintptr_t)cpu_addr;
 	return dma_map_single(dev->dma_device, cpu_addr, size, direction);
 }
 
@@ -3993,7 +3976,8 @@ static inline void ib_dma_unmap_single(struct ib_device *dev,
 				       u64 addr, size_t size,
 				       enum dma_data_direction direction)
 {
-	dma_unmap_single(dev->dma_device, addr, size, direction);
+	if (!ib_uses_virt_dma(dev))
+		dma_unmap_single(dev->dma_device, addr, size, direction);
 }
 
 /**
@@ -4010,6 +3994,8 @@ static inline u64 ib_dma_map_page(struct ib_device *dev,
 				  size_t size,
 					 enum dma_data_direction direction)
 {
+	if (ib_uses_virt_dma(dev))
+		return (uintptr_t)(page_address(page) + offset);
 	return dma_map_page(dev->dma_device, page, offset, size, direction);
 }
 
@@ -4024,7 +4010,30 @@ static inline void ib_dma_unmap_page(struct ib_device *dev,
 				     u64 addr, size_t size,
 				     enum dma_data_direction direction)
 {
-	dma_unmap_page(dev->dma_device, addr, size, direction);
+	if (!ib_uses_virt_dma(dev))
+		dma_unmap_page(dev->dma_device, addr, size, direction);
+}
+
+int ib_dma_virt_map_sg(struct ib_device *dev, struct scatterlist *sg, int nents);
+static inline int ib_dma_map_sg_attrs(struct ib_device *dev,
+				      struct scatterlist *sg, int nents,
+				      enum dma_data_direction direction,
+				      unsigned long dma_attrs)
+{
+	if (ib_uses_virt_dma(dev))
+		return ib_dma_virt_map_sg(dev, sg, nents);
+	return dma_map_sg_attrs(dev->dma_device, sg, nents, direction,
+				dma_attrs);
+}
+
+static inline void ib_dma_unmap_sg_attrs(struct ib_device *dev,
+					 struct scatterlist *sg, int nents,
+					 enum dma_data_direction direction,
+					 unsigned long dma_attrs)
+{
+	if (!ib_uses_virt_dma(dev))
+		dma_unmap_sg_attrs(dev->dma_device, sg, nents, direction,
+				   dma_attrs);
 }
 
 /**
@@ -4038,7 +4047,7 @@ static inline int ib_dma_map_sg(struct ib_device *dev,
 				struct scatterlist *sg, int nents,
 				enum dma_data_direction direction)
 {
-	return dma_map_sg(dev->dma_device, sg, nents, direction);
+	return ib_dma_map_sg_attrs(dev, sg, nents, direction, 0);
 }
 
 /**
@@ -4052,24 +4061,7 @@ static inline void ib_dma_unmap_sg(struct ib_device *dev,
 				   struct scatterlist *sg, int nents,
 				   enum dma_data_direction direction)
 {
-	dma_unmap_sg(dev->dma_device, sg, nents, direction);
-}
-
-static inline int ib_dma_map_sg_attrs(struct ib_device *dev,
-				      struct scatterlist *sg, int nents,
-				      enum dma_data_direction direction,
-				      unsigned long dma_attrs)
-{
-	return dma_map_sg_attrs(dev->dma_device, sg, nents, direction,
-				dma_attrs);
-}
-
-static inline void ib_dma_unmap_sg_attrs(struct ib_device *dev,
-					 struct scatterlist *sg, int nents,
-					 enum dma_data_direction direction,
-					 unsigned long dma_attrs)
-{
-	dma_unmap_sg_attrs(dev->dma_device, sg, nents, direction, dma_attrs);
+	ib_dma_unmap_sg_attrs(dev, sg, nents, direction, 0);
 }
 
 /**
@@ -4080,6 +4072,8 @@ static inline void ib_dma_unmap_sg_attrs(struct ib_device *dev,
  */
 static inline unsigned int ib_dma_max_seg_size(struct ib_device *dev)
 {
+	if (ib_uses_virt_dma(dev))
+		return UINT_MAX;
 	return dma_get_max_seg_size(dev->dma_device);
 }
 
@@ -4095,7 +4089,8 @@ static inline void ib_dma_sync_single_for_cpu(struct ib_device *dev,
 					      size_t size,
 					      enum dma_data_direction dir)
 {
-	dma_sync_single_for_cpu(dev->dma_device, addr, size, dir);
+	if (!ib_uses_virt_dma(dev))
+		dma_sync_single_for_cpu(dev->dma_device, addr, size, dir);
 }
 
 /**
@@ -4110,7 +4105,8 @@ static inline void ib_dma_sync_single_for_device(struct ib_device *dev,
 						 size_t size,
 						 enum dma_data_direction dir)
 {
-	dma_sync_single_for_device(dev->dma_device, addr, size, dir);
+	if (!ib_uses_virt_dma(dev))
+		dma_sync_single_for_device(dev->dma_device, addr, size, dir);
 }
 
 /* ib_reg_user_mr - register a memory region for virtual addresses from kernel
@@ -4606,6 +4602,19 @@ static inline struct ib_device *rdma_device_to_ibdev(struct device *device)
 }
 
 /**
+ * ibdev_to_node - return the NUMA node for a given ib_device
+ * @dev:	device to get the NUMA node for.
+ */
+static inline int ibdev_to_node(struct ib_device *ibdev)
+{
+	struct device *parent = ibdev->dev.parent;
+
+	if (!parent)
+		return NUMA_NO_NODE;
+	return dev_to_node(parent);
+}
+
+/**
  * rdma_device_to_drv_device - Helper macro to reach back to driver's
  *			       ib_device holder structure from device pointer.
  *
@@ -4662,4 +4671,7 @@ static inline u32 rdma_calc_flow_label(u32 lqpn, u32 rqpn)
 
 	return (u32)(v & IB_GRH_FLOWLABEL_MASK);
 }
+
+const struct ib_port_immutable*
+ib_port_immutable_read(struct ib_device *dev, unsigned int port);
 #endif /* IB_VERBS_H */

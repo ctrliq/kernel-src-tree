@@ -161,7 +161,7 @@ extern void downgrade_write(struct rw_semaphore *sem);
  * static then another method for expressing nested locking is
  * the explicit definition of lock class keys and the use of
  * lockdep_set_class() at lock initialization time.
- * See Documentation/locking/lockdep-design.txt for more details.)
+ * See Documentation/locking/lockdep-design.rst for more details.)
  */
 extern void down_read_nested(struct rw_semaphore *sem, int subclass);
 extern int __must_check down_read_killable_nested(struct rw_semaphore *sem, int subclass);

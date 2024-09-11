@@ -22,6 +22,8 @@ extern int __read_mostly pt_mode;
 #define PMU_CAP_FW_WRITES	(1ULL << 13)
 #define PMU_CAP_LBR_FMT		0x3f
 
+#define DEBUGCTLMSR_LBR_MASK		(DEBUGCTLMSR_LBR | DEBUGCTLMSR_FREEZE_LBRS_ON_PMI)
+
 struct nested_vmx_msrs {
 	/*
 	 * We only store the "true" versions of the VMX capability MSRs. We
@@ -264,6 +266,12 @@ static inline bool cpu_has_vmx_tsc_scaling(void)
 		SECONDARY_EXEC_TSC_SCALING;
 }
 
+static inline bool cpu_has_vmx_bus_lock_detection(void)
+{
+	return vmcs_config.cpu_based_2nd_exec_ctrl &
+	    SECONDARY_EXEC_BUS_LOCK_DETECTION;
+}
+
 static inline bool cpu_has_vmx_apicv(void)
 {
 	return cpu_has_vmx_apic_register_virt() &&
@@ -389,7 +397,12 @@ static inline u64 vmx_get_perf_capabilities(void)
 
 static inline u64 vmx_supported_debugctl(void)
 {
-	return 0;
+	u64 debugctl = 0;
+
+	if (vmx_get_perf_capabilities() & PMU_CAP_LBR_FMT)
+		debugctl |= DEBUGCTLMSR_LBR_MASK;
+
+	return debugctl;
 }
 
 #endif /* __KVM_X86_VMX_CAPS_H */

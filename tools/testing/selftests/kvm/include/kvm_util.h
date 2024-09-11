@@ -16,6 +16,8 @@
 
 #include "sparsebit.h"
 
+#define KVM_DEV_PATH "/dev/kvm"
+#define KVM_MAX_VCPUS 512
 
 /*
  * Callers of kvm_util only have an incomplete/opaque description of the
@@ -67,20 +69,20 @@ enum vm_guest_mode {
 #define MIN_PAGE_SIZE		(1U << MIN_PAGE_SHIFT)
 #define PTES_PER_MIN_PAGE	ptes_per_page(MIN_PAGE_SIZE)
 
-#define vm_guest_mode_string(m) vm_guest_mode_string[m]
-extern const char * const vm_guest_mode_string[];
-
-enum vm_mem_backing_src_type {
-	VM_MEM_SRC_ANONYMOUS,
-	VM_MEM_SRC_ANONYMOUS_THP,
-	VM_MEM_SRC_ANONYMOUS_HUGETLB,
+struct vm_guest_mode_params {
+	unsigned int pa_bits;
+	unsigned int va_bits;
+	unsigned int page_size;
+	unsigned int page_shift;
 };
+extern const struct vm_guest_mode_params vm_guest_mode_params[];
 
 int kvm_check_cap(long cap);
 int vm_enable_cap(struct kvm_vm *vm, struct kvm_enable_cap *cap);
 int vcpu_enable_cap(struct kvm_vm *vm, uint32_t vcpu_id,
 		    struct kvm_enable_cap *cap);
 void vm_enable_dirty_ring(struct kvm_vm *vm, uint32_t ring_size);
+const char *vm_guest_mode_string(uint32_t i);
 
 struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm);
 void kvm_vm_free(struct kvm_vm *vmp);

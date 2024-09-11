@@ -25,7 +25,6 @@
 #include <linux/bitops.h>
 #include <linux/slab.h>
 #include <linux/module.h>
-#include <net/drop_monitor.h>
 #include <net/genetlink.h>
 #include <net/netevent.h>
 #include <net/flow_offload.h>
@@ -33,6 +32,7 @@
 
 #include <trace/events/skb.h>
 #include <trace/events/napi.h>
+#include <trace/events/devlink.h>
 
 #include <asm/unaligned.h>
 
@@ -439,6 +439,9 @@ net_dm_hw_trap_summary_probe(void *ignore, const struct devlink *devlink,
 	struct per_cpu_dm_data *hw_data;
 	unsigned long flags;
 	int i;
+
+	if (metadata->trap_type == DEVLINK_TRAP_TYPE_CONTROL)
+		return;
 
 	hw_data = this_cpu_ptr(&dm_hw_cpu_data);
 	spin_lock_irqsave(&hw_data->lock, flags);
@@ -933,6 +936,9 @@ net_dm_hw_trap_packet_probe(void *ignore, const struct devlink *devlink,
 	struct sk_buff *nskb;
 	unsigned long flags;
 
+	if (metadata->trap_type == DEVLINK_TRAP_TYPE_CONTROL)
+		return;
+
 	if (!skb_mac_header_was_set(skb))
 		return;
 
@@ -983,25 +989,32 @@ static const struct net_dm_alert_ops *net_dm_alert_ops_arr[] = {
 	[NET_DM_ALERT_MODE_PACKET]	= &net_dm_alert_packet_ops,
 };
 
-void net_dm_hw_report(struct sk_buff *skb,
-		      const struct net_dm_hw_metadata *hw_metadata)
+#if IS_ENABLED(CONFIG_NET_DEVLINK)
+static int net_dm_hw_probe_register(const struct net_dm_alert_ops *ops)
 {
-	rcu_read_lock();
-
-	if (!monitor_hw)
-		goto out;
-
-	net_dm_alert_ops_arr[net_dm_alert_mode]->hw_probe(skb, hw_metadata);
-
-out:
-	rcu_read_unlock();
+	return register_trace_devlink_trap_report(ops->hw_trap_probe, NULL);
 }
-EXPORT_SYMBOL_GPL(net_dm_hw_report);
+
+static void net_dm_hw_probe_unregister(const struct net_dm_alert_ops *ops)
+{
+	unregister_trace_devlink_trap_report(ops->hw_trap_probe, NULL);
+	tracepoint_synchronize_unregister();
+}
+#else
+static int net_dm_hw_probe_register(const struct net_dm_alert_ops *ops)
+{
+	return -EOPNOTSUPP;
+}
+
+static void net_dm_hw_probe_unregister(const struct net_dm_alert_ops *ops)
+{
+}
+#endif
 
 static int net_dm_hw_monitor_start(struct netlink_ext_ack *extack)
 {
 	const struct net_dm_alert_ops *ops;
-	int cpu;
+	int cpu, rc;
 
 	if (monitor_hw) {
 		NL_SET_ERR_MSG_MOD(extack, "Hardware monitoring already enabled");
@@ -1025,13 +1038,38 @@ static int net_dm_hw_monitor_start(struct netlink_ext_ack *extack)
 		kfree(hw_entries);
 	}
 
+	rc = net_dm_hw_probe_register(ops);
+	if (rc) {
+		NL_SET_ERR_MSG_MOD(extack, "Failed to connect probe to devlink_trap_probe() tracepoint");
+		goto err_module_put;
+	}
+
 	monitor_hw = true;
 
 	return 0;
+
+err_module_put:
+	for_each_possible_cpu(cpu) {
+		struct per_cpu_dm_data *hw_data = &per_cpu(dm_hw_cpu_data, cpu);
+		struct sk_buff *skb;
+
+		del_timer_sync(&hw_data->send_timer);
+		cancel_work_sync(&hw_data->dm_alert_work);
+		while ((skb = __skb_dequeue(&hw_data->drop_queue))) {
+			struct devlink_trap_metadata *hw_metadata;
+
+			hw_metadata = NET_DM_SKB_CB(skb)->hw_metadata;
+			net_dm_hw_metadata_free(hw_metadata);
+			consume_skb(skb);
+		}
+	}
+	module_put(THIS_MODULE);
+	return rc;
 }
 
 static void net_dm_hw_monitor_stop(struct netlink_ext_ack *extack)
 {
+	const struct net_dm_alert_ops *ops;
 	int cpu;
 
 	if (!monitor_hw) {
@@ -1039,12 +1077,11 @@ static void net_dm_hw_monitor_stop(struct netlink_ext_ack *extack)
 		return;
 	}
 
+	ops = net_dm_alert_ops_arr[net_dm_alert_mode];
+
 	monitor_hw = false;
 
-	/* After this call returns we are guaranteed that no CPU is processing
-	 * any hardware drops.
-	 */
-	synchronize_rcu();
+	net_dm_hw_probe_unregister(ops);
 
 	for_each_possible_cpu(cpu) {
 		struct per_cpu_dm_data *hw_data = &per_cpu(dm_hw_cpu_data, cpu);
@@ -1107,6 +1144,15 @@ static int net_dm_trace_on_set(struct netlink_ext_ack *extack)
 err_unregister_trace:
 	unregister_trace_kfree_skb(ops->kfree_skb_probe, NULL);
 err_module_put:
+	for_each_possible_cpu(cpu) {
+		struct per_cpu_dm_data *data = &per_cpu(dm_cpu_data, cpu);
+		struct sk_buff *skb;
+
+		del_timer_sync(&data->send_timer);
+		cancel_work_sync(&data->dm_alert_work);
+		while ((skb = __skb_dequeue(&data->drop_queue)))
+			consume_skb(skb);
+	}
 	module_put(THIS_MODULE);
 	return rc;
 }
@@ -1548,7 +1594,7 @@ static const struct nla_policy net_dm_nl_policy[NET_DM_ATTR_MAX + 1] = {
 	[NET_DM_ATTR_HW_DROPS]	= {. type = NLA_FLAG },
 };
 
-static const struct genl_ops dropmon_ops[] = {
+static const struct genl_small_ops dropmon_ops[] = {
 	{
 		.cmd = NET_DM_CMD_CONFIG,
 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
@@ -1598,8 +1644,8 @@ static struct genl_family net_drop_monitor_family __ro_after_init = {
 	.pre_doit	= net_dm_nl_pre_doit,
 	.post_doit	= net_dm_nl_post_doit,
 	.module		= THIS_MODULE,
-	.ops		= dropmon_ops,
-	.n_ops		= ARRAY_SIZE(dropmon_ops),
+	.small_ops	= dropmon_ops,
+	.n_small_ops	= ARRAY_SIZE(dropmon_ops),
 	.mcgrps		= dropmon_mcgrps,
 	.n_mcgrps	= ARRAY_SIZE(dropmon_mcgrps),
 };

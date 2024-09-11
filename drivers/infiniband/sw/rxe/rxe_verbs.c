@@ -260,6 +260,9 @@ static int rxe_create_srq(struct ib_srq *ibsrq, struct ib_srq_init_attr *init,
 	struct rxe_srq *srq = to_rsrq(ibsrq);
 	struct rxe_create_srq_resp __user *uresp = NULL;
 
+	if (init->srq_type != IB_SRQT_BASIC)
+		return -EOPNOTSUPP;
+
 	if (udata) {
 		if (udata->outlen < sizeof(*uresp))
 			return -EINVAL;
@@ -335,7 +338,7 @@ static int rxe_query_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr)
 	return 0;
 }
 
-static void rxe_destroy_srq(struct ib_srq *ibsrq, struct ib_udata *udata)
+static int rxe_destroy_srq(struct ib_srq *ibsrq, struct ib_udata *udata)
 {
 	struct rxe_srq *srq = to_rsrq(ibsrq);
 
@@ -344,6 +347,7 @@ static void rxe_destroy_srq(struct ib_srq *ibsrq, struct ib_udata *udata)
 
 	rxe_drop_ref(srq->pd);
 	rxe_drop_ref(srq);
+	return 0;
 }
 
 static int rxe_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
@@ -386,6 +390,9 @@ static struct ib_qp *rxe_create_qp(struct ib_pd *ibpd,
 		uresp = udata->outbuf;
 	}
 
+	if (init->create_flags)
+		return ERR_PTR(-EOPNOTSUPP);
+
 	err = rxe_qp_chk_init(rxe, init);
 	if (err)
 		goto err1;
@@ -426,6 +433,9 @@ static int rxe_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	int err;
 	struct rxe_dev *rxe = to_rdev(ibqp->device);
 	struct rxe_qp *qp = to_rqp(ibqp);
+
+	if (mask & ~IB_QP_ATTR_STANDARD_BITS)
+		return -EOPNOTSUPP;
 
 	err = rxe_qp_chk_attr(rxe, qp, attr, mask);
 	if (err)
@@ -510,7 +520,7 @@ static void init_send_wr(struct rxe_qp *qp, struct rxe_send_wr *wr,
 		switch (wr->opcode) {
 		case IB_WR_RDMA_WRITE_WITH_IMM:
 			wr->ex.imm_data = ibwr->ex.imm_data;
-			/* fall through */
+			fallthrough;
 		case IB_WR_RDMA_READ:
 		case IB_WR_RDMA_WRITE:
 			wr->wr.rdma.remote_addr = rdma_wr(ibwr)->remote_addr;
@@ -753,7 +763,7 @@ static int rxe_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 	}
 
 	if (attr->flags)
-		return -EINVAL;
+		return -EOPNOTSUPP;
 
 	err = rxe_cq_chk_attr(rxe, NULL, attr->cqe, attr->comp_vector);
 	if (err)
@@ -767,13 +777,14 @@ static int rxe_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 	return rxe_add_to_pool(&rxe->cq_pool, cq);
 }
 
-static void rxe_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
+static int rxe_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 {
 	struct rxe_cq *cq = to_rcq(ibcq);
 
 	rxe_cq_disable(cq);
 
 	rxe_drop_ref(cq);
+	return 0;
 }
 
 static int rxe_resize_cq(struct ib_cq *ibcq, int cqe, struct ib_udata *udata)
@@ -1057,6 +1068,7 @@ static const struct ib_device_ops rxe_dev_ops = {
 	.create_cq = rxe_create_cq,
 	.create_qp = rxe_create_qp,
 	.create_srq = rxe_create_srq,
+	.create_user_ah = rxe_create_ah,
 	.dealloc_driver = rxe_dealloc,
 	.dealloc_pd = rxe_dealloc_pd,
 	.dealloc_ucontext = rxe_dealloc_ucontext,
@@ -1111,49 +1123,12 @@ int rxe_register_device(struct rxe_dev *rxe, const char *ibdev_name)
 	dev->node_type = RDMA_NODE_IB_CA;
 	dev->phys_port_cnt = 1;
 	dev->num_comp_vectors = num_possible_cpus();
-	dev->dev.parent = rxe_dma_device(rxe);
 	dev->local_dma_lkey = 0;
 	addrconf_addr_eui48((unsigned char *)&dev->node_guid,
 			    rxe->ndev->dev_addr);
-	dev->dev.dma_ops = &dma_virt_ops;
-	dev->dev.dma_parms = &rxe->dma_parms;
-	rxe->dma_parms = (struct device_dma_parameters)
-		{ .max_segment_size = SZ_2G };
-	dma_coerce_mask_and_coherent(&dev->dev,
-				     dma_get_required_mask(&dev->dev));
 
-	dev->uverbs_cmd_mask = BIT_ULL(IB_USER_VERBS_CMD_GET_CONTEXT)
-	    | BIT_ULL(IB_USER_VERBS_CMD_CREATE_COMP_CHANNEL)
-	    | BIT_ULL(IB_USER_VERBS_CMD_QUERY_DEVICE)
-	    | BIT_ULL(IB_USER_VERBS_CMD_QUERY_PORT)
-	    | BIT_ULL(IB_USER_VERBS_CMD_ALLOC_PD)
-	    | BIT_ULL(IB_USER_VERBS_CMD_DEALLOC_PD)
-	    | BIT_ULL(IB_USER_VERBS_CMD_CREATE_SRQ)
-	    | BIT_ULL(IB_USER_VERBS_CMD_MODIFY_SRQ)
-	    | BIT_ULL(IB_USER_VERBS_CMD_QUERY_SRQ)
-	    | BIT_ULL(IB_USER_VERBS_CMD_DESTROY_SRQ)
-	    | BIT_ULL(IB_USER_VERBS_CMD_POST_SRQ_RECV)
-	    | BIT_ULL(IB_USER_VERBS_CMD_CREATE_QP)
-	    | BIT_ULL(IB_USER_VERBS_CMD_MODIFY_QP)
-	    | BIT_ULL(IB_USER_VERBS_CMD_QUERY_QP)
-	    | BIT_ULL(IB_USER_VERBS_CMD_DESTROY_QP)
-	    | BIT_ULL(IB_USER_VERBS_CMD_POST_SEND)
-	    | BIT_ULL(IB_USER_VERBS_CMD_POST_RECV)
-	    | BIT_ULL(IB_USER_VERBS_CMD_CREATE_CQ)
-	    | BIT_ULL(IB_USER_VERBS_CMD_RESIZE_CQ)
-	    | BIT_ULL(IB_USER_VERBS_CMD_DESTROY_CQ)
-	    | BIT_ULL(IB_USER_VERBS_CMD_POLL_CQ)
-	    | BIT_ULL(IB_USER_VERBS_CMD_PEEK_CQ)
-	    | BIT_ULL(IB_USER_VERBS_CMD_REQ_NOTIFY_CQ)
-	    | BIT_ULL(IB_USER_VERBS_CMD_REG_MR)
-	    | BIT_ULL(IB_USER_VERBS_CMD_DEREG_MR)
-	    | BIT_ULL(IB_USER_VERBS_CMD_CREATE_AH)
-	    | BIT_ULL(IB_USER_VERBS_CMD_MODIFY_AH)
-	    | BIT_ULL(IB_USER_VERBS_CMD_QUERY_AH)
-	    | BIT_ULL(IB_USER_VERBS_CMD_DESTROY_AH)
-	    | BIT_ULL(IB_USER_VERBS_CMD_ATTACH_MCAST)
-	    | BIT_ULL(IB_USER_VERBS_CMD_DETACH_MCAST)
-	    ;
+	dev->uverbs_cmd_mask |= BIT_ULL(IB_USER_VERBS_CMD_POST_SEND) |
+				BIT_ULL(IB_USER_VERBS_CMD_REQ_NOTIFY_CQ);
 
 	ib_set_device_ops(dev, &rxe_dev_ops);
 	err = ib_device_set_netdev(&rxe->ib_dev, rxe->ndev, 1);
@@ -1169,7 +1144,7 @@ int rxe_register_device(struct rxe_dev *rxe, const char *ibdev_name)
 	rxe->tfm = tfm;
 
 	rdma_set_device_sysfs_group(dev, &rxe_attr_group);
-	err = ib_register_device(dev, ibdev_name);
+	err = ib_register_device(dev, ibdev_name, NULL);
 	if (err)
 		pr_warn("%s failed with error %d\n", __func__, err);
 

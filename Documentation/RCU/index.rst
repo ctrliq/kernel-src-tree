@@ -17,6 +17,10 @@ RCU concepts
    rcu_dereference
    whatisRCU
    rcu
+   rculist_nulls
+   rcuref
+   torture
+   stallwarn
    listRCU
    NMI-RCU
    UP

@@ -525,6 +525,7 @@ static int init_rootdomain(struct root_domain *rd)
 	init_irq_work(&rd->rto_push_work, rto_push_irq_work_func);
 #endif
 
+	rd->visit_gen = 0;
 	init_dl_bw(&rd->dl_bw);
 	if (cpudl_init(&rd->cpudl) != 0)
 		goto free_rto_mask;
@@ -1236,13 +1237,13 @@ static void __free_domain_allocs(struct s_data *d, enum s_alloc what,
 	case sa_rootdomain:
 		if (!atomic_read(&d->rd->refcount))
 			free_rootdomain(&d->rd->rcu);
-		/* Fall through */
+		fallthrough;
 	case sa_sd:
 		free_percpu(d->sd);
-		/* Fall through */
+		fallthrough;
 	case sa_sd_storage:
 		__sdt_free(cpu_map);
-		/* Fall through */
+		fallthrough;
 	case sa_none:
 		break;
 	}

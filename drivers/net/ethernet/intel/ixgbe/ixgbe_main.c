@@ -164,6 +164,7 @@ MODULE_PARM_DESC(debug, "Debug level (0=none,...,16=all)");
 MODULE_AUTHOR("Intel Corporation, <linux.nics@intel.com>");
 MODULE_DESCRIPTION("Intel(R) 10 Gigabit PCI Express Network Driver");
 MODULE_LICENSE("GPL v2");
+MODULE_VERSION(UTS_RELEASE);
 
 static struct workqueue_struct *ixgbe_wq;
 
@@ -1940,18 +1941,13 @@ static void ixgbe_reuse_rx_page(struct ixgbe_ring *rx_ring,
 	new_buff->pagecnt_bias	= old_buff->pagecnt_bias;
 }
 
-static inline bool ixgbe_page_is_reserved(struct page *page)
-{
-	return (page_to_nid(page) != numa_mem_id()) || page_is_pfmemalloc(page);
-}
-
 static bool ixgbe_can_reuse_rx_page(struct ixgbe_rx_buffer *rx_buffer)
 {
 	unsigned int pagecnt_bias = rx_buffer->pagecnt_bias;
 	struct page *page = rx_buffer->page;
 
-	/* avoid re-using remote pages */
-	if (unlikely(ixgbe_page_is_reserved(page)))
+	/* avoid re-using remote and pfmemalloc pages */
+	if (!dev_page_is_reusable(page))
 		return false;
 
 #if (PAGE_SIZE < 8192)
@@ -5392,9 +5388,10 @@ static int ixgbe_fwd_ring_up(struct ixgbe_adapter *adapter,
 	return err;
 }
 
-static int ixgbe_macvlan_up(struct net_device *vdev, void *data)
+static int ixgbe_macvlan_up(struct net_device *vdev,
+			    struct netdev_nested_priv *priv)
 {
-	struct ixgbe_adapter *adapter = data;
+	struct ixgbe_adapter *adapter = (struct ixgbe_adapter *)priv->data;
 	struct ixgbe_fwd_adapter *accel;
 
 	if (!netif_is_macvlan(vdev))
@@ -5411,8 +5408,12 @@ static int ixgbe_macvlan_up(struct net_device *vdev, void *data)
 
 static void ixgbe_configure_dfwd(struct ixgbe_adapter *adapter)
 {
+	struct netdev_nested_priv priv = {
+		.data = (void *)adapter,
+	};
+
 	netdev_walk_all_upper_dev_rcu(adapter->netdev,
-				      ixgbe_macvlan_up, adapter);
+				      ixgbe_macvlan_up, &priv);
 }
 
 static void ixgbe_configure(struct ixgbe_adapter *adapter)
@@ -9020,9 +9021,10 @@ static void ixgbe_set_prio_tc_map(struct ixgbe_adapter *adapter)
 }
 
 #endif /* CONFIG_IXGBE_DCB */
-static int ixgbe_reassign_macvlan_pool(struct net_device *vdev, void *data)
+static int ixgbe_reassign_macvlan_pool(struct net_device *vdev,
+				       struct netdev_nested_priv *priv)
 {
-	struct ixgbe_adapter *adapter = data;
+	struct ixgbe_adapter *adapter = (struct ixgbe_adapter *)priv->data;
 	struct ixgbe_fwd_adapter *accel;
 	int pool;
 
@@ -9059,13 +9061,16 @@ static int ixgbe_reassign_macvlan_pool(struct net_device *vdev, void *data)
 static void ixgbe_defrag_macvlan_pools(struct net_device *dev)
 {
 	struct ixgbe_adapter *adapter = netdev_priv(dev);
+	struct netdev_nested_priv priv = {
+		.data = (void *)adapter,
+	};
 
 	/* flush any stale bits out of the fwd bitmask */
 	bitmap_clear(adapter->fwd_bitmask, 1, 63);
 
 	/* walk through upper devices reassigning pools */
 	netdev_walk_all_upper_dev_rcu(dev, ixgbe_reassign_macvlan_pool,
-				      adapter);
+				      &priv);
 }
 
 /**
@@ -9239,14 +9244,18 @@ struct upper_walk_data {
 	u8 queue;
 };
 
-static int get_macvlan_queue(struct net_device *upper, void *_data)
+static int get_macvlan_queue(struct net_device *upper,
+			     struct netdev_nested_priv *priv)
 {
 	if (netif_is_macvlan(upper)) {
 		struct ixgbe_fwd_adapter *vadapter = macvlan_accel_priv(upper);
-		struct upper_walk_data *data = _data;
-		struct ixgbe_adapter *adapter = data->adapter;
-		int ifindex = data->ifindex;
+		struct ixgbe_adapter *adapter;
+		struct upper_walk_data *data;
+		int ifindex;
 
+		data = (struct upper_walk_data *)priv->data;
+		ifindex = data->ifindex;
+		adapter = data->adapter;
 		if (vadapter && upper->ifindex == ifindex) {
 			data->queue = adapter->rx_ring[vadapter->rx_base_queue]->reg_idx;
 			data->action = data->queue;
@@ -9262,6 +9271,7 @@ static int handle_redirect_action(struct ixgbe_adapter *adapter, int ifindex,
 {
 	struct ixgbe_ring_feature *vmdq = &adapter->ring_feature[RING_F_VMDQ];
 	unsigned int num_vfs = adapter->num_vfs, vf;
+	struct netdev_nested_priv priv;
 	struct upper_walk_data data;
 	struct net_device *upper;
 
@@ -9281,8 +9291,9 @@ static int handle_redirect_action(struct ixgbe_adapter *adapter, int ifindex,
 	data.ifindex = ifindex;
 	data.action = 0;
 	data.queue = 0;
+	priv.data = (void *)&data;
 	if (netdev_walk_all_upper_dev_rcu(adapter->netdev,
-					  get_macvlan_queue, &data)) {
+					  get_macvlan_queue, &priv)) {
 		*action = data.action;
 		*queue = data.queue;
 

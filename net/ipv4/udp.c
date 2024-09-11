@@ -667,7 +667,7 @@ static struct sock *__udp4_lib_err_encap(struct net *net,
  * to find the appropriate port.
  */
 
-void __udp4_lib_err(struct sk_buff *skb, u32 info, struct udp_table *udptable)
+int __udp4_lib_err(struct sk_buff *skb, u32 info, struct udp_table *udptable)
 {
 	struct inet_sock *inet;
 	const struct iphdr *iph = (const struct iphdr *)skb->data;
@@ -683,14 +683,14 @@ void __udp4_lib_err(struct sk_buff *skb, u32 info, struct udp_table *udptable)
 	sk = __udp4_lib_lookup(net, iph->daddr, uh->dest,
 			       iph->saddr, uh->source, skb->dev->ifindex, 0,
 			       udptable, NULL);
-	if (!sk) {
+	if (!sk || udp_sk(sk)->encap_type) {
 		/* No socket for error: try tunnels before discarding */
 		if (static_branch_unlikely(&udp_encap_needed_key))
 			sk = __udp4_lib_err_encap(net, iph, uh, udptable, skb);
 
 		if (!sk) {
 			__ICMP_INC_STATS(net, ICMP_MIB_INERRORS);
-			return;
+			return -ENOENT;
 		}
 		tunnel = true;
 	}
@@ -748,12 +748,12 @@ void __udp4_lib_err(struct sk_buff *skb, u32 info, struct udp_table *udptable)
 	sk->sk_err = err;
 	sk->sk_error_report(sk);
 out:
-	return;
+	return 0;
 }
 
-void udp_err(struct sk_buff *skb, u32 info)
+int udp_err(struct sk_buff *skb, u32 info)
 {
-	__udp4_lib_err(skb, info, &udp_table);
+	return __udp4_lib_err(skb, info, &udp_table);
 }
 
 /*

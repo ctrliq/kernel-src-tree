@@ -5623,6 +5623,15 @@ out:
 	return ret;
 }
 
+static bool kvmppc_hash_v3_possible(void)
+{
+	if (radix_enabled() && no_mixing_hpt_and_radix)
+		return false;
+
+	return cpu_has_feature(CPU_FTR_ARCH_300) &&
+		cpu_has_feature(CPU_FTR_HVMODE);
+}
+
 static struct kvmppc_ops kvm_ops_hv = {
 	.get_sregs = kvm_arch_vcpu_ioctl_get_sregs_hv,
 	.set_sregs = kvm_arch_vcpu_ioctl_set_sregs_hv,
@@ -5666,6 +5675,7 @@ static struct kvmppc_ops kvm_ops_hv = {
 	.store_to_eaddr = kvmhv_store_to_eaddr,
 	.enable_svm = kvmhv_enable_svm,
 	.svm_off = kvmhv_svm_off,
+	.hash_v3_possible = kvmppc_hash_v3_possible,
 };
 
 static int kvm_init_subcore_bitmap(void)

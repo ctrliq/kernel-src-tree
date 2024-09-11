@@ -43,6 +43,7 @@
 #include <linux/ktime.h>
 #include <linux/rwsem.h>
 #include <linux/wait.h>
+#include <linux/topology.h>
 
 #include <acpi/cppc_acpi.h>
 
@@ -692,6 +693,10 @@ static bool is_cppc_supported(int revision, int num_ent)
  *	}
  */
 
+#ifndef init_freq_invariance_cppc
+static inline void init_freq_invariance_cppc(void) { }
+#endif
+
 /**
  * acpi_cppc_processor_probe - Search for per CPU _CPC objects.
  * @pr: Ptr to acpi_processor containing this CPU's logical ID.
@@ -853,6 +858,8 @@ int acpi_cppc_processor_probe(struct acpi_processor *pr)
 		kobject_put(&cpc_ptr->kobj);
 		goto out_free;
 	}
+
+	init_freq_invariance_cppc();
 
 	kfree(output.pointer);
 	return 0;

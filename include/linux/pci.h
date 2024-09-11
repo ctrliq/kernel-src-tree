@@ -515,7 +515,7 @@ struct pci_dev {
 	RH_KABI_USE(3, u16  dpc_cap)
 	RH_KABI_USE(4, u8   dpc_rp_log_size)
 #endif
-	RH_KABI_RESERVE(5)
+	RH_KABI_USE(5, u16  acs_cap)
 	RH_KABI_RESERVE(6)
 	RH_KABI_RESERVE(7)
 	RH_KABI_RESERVE(8)
@@ -1115,13 +1115,6 @@ void pci_sort_breadthfirst(void);
 
 /* Generic PCI functions exported to card drivers */
 
-enum pci_lost_interrupt_reason {
-	PCI_LOST_IRQ_NO_INFORMATION = 0,
-	PCI_LOST_IRQ_DISABLE_MSI,
-	PCI_LOST_IRQ_DISABLE_MSIX,
-	PCI_LOST_IRQ_DISABLE_ACPI,
-};
-enum pci_lost_interrupt_reason pci_lost_interrupt(struct pci_dev *dev);
 int pci_find_capability(struct pci_dev *dev, int cap);
 int pci_find_next_capability(struct pci_dev *dev, u8 pos, int cap);
 int pci_find_ext_capability(struct pci_dev *dev, int cap);

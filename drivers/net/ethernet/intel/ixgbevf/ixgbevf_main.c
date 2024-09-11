@@ -31,6 +31,7 @@
 #include <linux/bpf_trace.h>
 #include <linux/atomic.h>
 #include <net/xfrm.h>
+#include <generated/utsrelease.h>
 
 #include "ixgbevf.h"
 
@@ -79,6 +80,7 @@ MODULE_DEVICE_TABLE(pci, ixgbevf_pci_tbl);
 MODULE_AUTHOR("Intel Corporation, <linux.nics@intel.com>");
 MODULE_DESCRIPTION("Intel(R) 10 Gigabit Virtual Function Network Driver");
 MODULE_LICENSE("GPL v2");
+MODULE_VERSION(UTS_RELEASE);
 
 #define DEFAULT_MSG_ENABLE (NETIF_MSG_DRV|NETIF_MSG_PROBE|NETIF_MSG_LINK)
 static int debug = -1;
@@ -781,18 +783,13 @@ static void ixgbevf_reuse_rx_page(struct ixgbevf_ring *rx_ring,
 	new_buff->pagecnt_bias = old_buff->pagecnt_bias;
 }
 
-static inline bool ixgbevf_page_is_reserved(struct page *page)
-{
-	return (page_to_nid(page) != numa_mem_id()) || page_is_pfmemalloc(page);
-}
-
 static bool ixgbevf_can_reuse_rx_page(struct ixgbevf_rx_buffer *rx_buffer)
 {
 	unsigned int pagecnt_bias = rx_buffer->pagecnt_bias;
 	struct page *page = rx_buffer->page;
 
-	/* avoid re-using remote pages */
-	if (unlikely(ixgbevf_page_is_reserved(page)))
+	/* avoid re-using remote and pfmemalloc pages */
+	if (!dev_page_is_reusable(page))
 		return false;
 
 #if (PAGE_SIZE < 8192)

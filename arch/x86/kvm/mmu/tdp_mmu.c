@@ -50,6 +50,22 @@ static void tdp_mmu_free_sp(struct kvm_mmu_page *sp)
 	kmem_cache_free(mmu_page_header_cache, sp);
 }
 
+/*
+ * This is called through call_rcu in order to free TDP page table memory
+ * safely with respect to other kernel threads that may be operating on
+ * the memory.
+ * By only accessing TDP MMU page table memory in an RCU read critical
+ * section, and freeing it after a grace period, lockless access to that
+ * memory won't use it after it is freed.
+ */
+static void tdp_mmu_free_sp_rcu_callback(struct rcu_head *head)
+{
+	struct kvm_mmu_page *sp = container_of(head, struct kvm_mmu_page,
+					       rcu_head);
+
+	tdp_mmu_free_sp(sp);
+}
+
 void kvm_tdp_mmu_put_root(struct kvm *kvm, struct kvm_mmu_page *root)
 {
 	gfn_t max_gfn = 1ULL << (shadow_phys_bits - PAGE_SHIFT);
@@ -61,33 +77,48 @@ void kvm_tdp_mmu_put_root(struct kvm *kvm, struct kvm_mmu_page *root)
 
 	WARN_ON(!root->tdp_mmu_page);
 
-	list_del(&root->link);
+	spin_lock(&kvm->arch.tdp_mmu_pages_lock);
+	list_del_rcu(&root->link);
+	spin_unlock(&kvm->arch.tdp_mmu_pages_lock);
 
 	zap_gfn_range(kvm, root, 0, max_gfn, false, false);
 
-	tdp_mmu_free_sp(root);
+	call_rcu(&root->rcu_head, tdp_mmu_free_sp_rcu_callback);
 }
 
-static inline bool tdp_mmu_next_root_valid(struct kvm *kvm,
-					   struct kvm_mmu_page *root)
-{
-	lockdep_assert_held_write(&kvm->mmu_lock);
-
-	if (list_entry_is_head(root, &kvm->arch.tdp_mmu_roots, link))
-		return false;
-
-	kvm_tdp_mmu_get_root(kvm, root);
-	return true;
-
-}
-
-static inline struct kvm_mmu_page *tdp_mmu_next_root(struct kvm *kvm,
-						     struct kvm_mmu_page *root)
+/*
+ * Finds the next valid root after root (or the first valid root if root
+ * is NULL), takes a reference on it, and returns that next root. If root
+ * is not NULL, this thread should have already taken a reference on it, and
+ * that reference will be dropped. If no valid root is found, this
+ * function will return NULL.
+ */
+static struct kvm_mmu_page *tdp_mmu_next_root(struct kvm *kvm,
+					      struct kvm_mmu_page *prev_root)
 {
 	struct kvm_mmu_page *next_root;
 
-	next_root = list_next_entry(root, link);
-	kvm_tdp_mmu_put_root(kvm, root);
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	rcu_read_lock();
+
+	if (prev_root)
+		next_root = list_next_or_null_rcu(&kvm->arch.tdp_mmu_roots,
+						  &prev_root->link,
+						  typeof(*prev_root), link);
+	else
+		next_root = list_first_or_null_rcu(&kvm->arch.tdp_mmu_roots,
+						   typeof(*next_root), link);
+
+	while (next_root && !kvm_tdp_mmu_get_root(kvm, next_root))
+		next_root = list_next_or_null_rcu(&kvm->arch.tdp_mmu_roots,
+				&next_root->link, typeof(*next_root), link);
+
+	rcu_read_unlock();
+
+	if (prev_root)
+		kvm_tdp_mmu_put_root(kvm, prev_root);
+
 	return next_root;
 }
 
@@ -97,14 +128,19 @@ static inline struct kvm_mmu_page *tdp_mmu_next_root(struct kvm *kvm,
  * if exiting the loop early, the caller must drop the reference to the most
  * recent root. (Unless keeping a live reference is desirable.)
  */
-#define for_each_tdp_mmu_root_yield_safe(_kvm, _root)				\
-	for (_root = list_first_entry(&_kvm->arch.tdp_mmu_roots,	\
-				      typeof(*_root), link);		\
-	     tdp_mmu_next_root_valid(_kvm, _root);			\
-	     _root = tdp_mmu_next_root(_kvm, _root))
+#define for_each_tdp_mmu_root_yield_safe(_kvm, _root, _as_id)	\
+	for (_root = tdp_mmu_next_root(_kvm, NULL);		\
+	     _root;						\
+	     _root = tdp_mmu_next_root(_kvm, _root))		\
+		if (kvm_mmu_page_as_id(_root) != _as_id) {	\
+		} else
 
-#define for_each_tdp_mmu_root(_kvm, _root)				\
-	list_for_each_entry(_root, &_kvm->arch.tdp_mmu_roots, link)
+#define for_each_tdp_mmu_root(_kvm, _root, _as_id)				\
+	list_for_each_entry_rcu(_root, &_kvm->arch.tdp_mmu_roots, link,		\
+				lockdep_is_held_type(&kvm->mmu_lock, 0) ||	\
+				lockdep_is_held(&kvm->arch.tdp_mmu_pages_lock))	\
+		if (kvm_mmu_page_as_id(_root) != _as_id) {		\
+		} else
 
 static union kvm_mmu_page_role page_role_for_level(struct kvm_vcpu *vcpu,
 						   int level)
@@ -149,36 +185,21 @@ hpa_t kvm_tdp_mmu_get_vcpu_root_hpa(struct kvm_vcpu *vcpu)
 	role = page_role_for_level(vcpu, vcpu->arch.mmu->shadow_root_level);
 
 	/* Check for an existing root before allocating a new one. */
-	for_each_tdp_mmu_root(kvm, root) {
-		if (root->role.word == role.word) {
-			kvm_tdp_mmu_get_root(kvm, root);
+	for_each_tdp_mmu_root(kvm, root, kvm_mmu_role_as_id(role)) {
+		if (root->role.word == role.word &&
+		    kvm_tdp_mmu_get_root(kvm, root))
 			goto out;
-		}
 	}
 
 	root = alloc_tdp_mmu_page(vcpu, 0, vcpu->arch.mmu->shadow_root_level);
 	refcount_set(&root->tdp_mmu_root_count, 1);
 
-	list_add(&root->link, &kvm->arch.tdp_mmu_roots);
+	spin_lock(&kvm->arch.tdp_mmu_pages_lock);
+	list_add_rcu(&root->link, &kvm->arch.tdp_mmu_roots);
+	spin_unlock(&kvm->arch.tdp_mmu_pages_lock);
 
 out:
 	return __pa(root->spt);
-}
-
-/*
- * This is called through call_rcu in order to free TDP page table memory
- * safely with respect to other kernel threads that may be operating on
- * the memory.
- * By only accessing TDP MMU page table memory in an RCU read critical
- * section, and freeing it after a grace period, lockless access to that
- * memory won't use it after it is freed.
- */
-static void tdp_mmu_free_sp_rcu_callback(struct rcu_head *head)
-{
-	struct kvm_mmu_page *sp = container_of(head, struct kvm_mmu_page,
-					       rcu_head);
-
-	tdp_mmu_free_sp(sp);
 }
 
 static void handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
@@ -210,7 +231,7 @@ static void handle_changed_spte_dirty_log(struct kvm *kvm, int as_id, gfn_t gfn,
 	if ((!is_writable_pte(old_spte) || pfn_changed) &&
 	    is_writable_pte(new_spte)) {
 		slot = __gfn_to_memslot(__kvm_memslots(kvm, as_id), gfn);
-		mark_page_dirty_in_slot(slot, gfn);
+		mark_page_dirty_in_slot(kvm, slot, gfn);
 	}
 }
 
@@ -699,11 +720,8 @@ bool __kvm_tdp_mmu_zap_gfn_range(struct kvm *kvm, int as_id, gfn_t start,
 {
 	struct kvm_mmu_page *root;
 
-	for_each_tdp_mmu_root_yield_safe(kvm, root) {
-		if (kvm_mmu_page_as_id(root) != as_id)
-			continue;
+	for_each_tdp_mmu_root_yield_safe(kvm, root, as_id)
 		flush = zap_gfn_range(kvm, root, start, end, can_yield, flush);
-	}
 
 	return flush;
 }
@@ -883,27 +901,28 @@ static __always_inline int kvm_tdp_mmu_handle_hva_range(struct kvm *kvm,
 	int ret = 0;
 	int as_id;
 
-	for_each_tdp_mmu_root_yield_safe(kvm, root) {
-		as_id = kvm_mmu_page_as_id(root);
-		slots = __kvm_memslots(kvm, as_id);
-		kvm_for_each_memslot(memslot, slots) {
-			unsigned long hva_start, hva_end;
-			gfn_t gfn_start, gfn_end;
+	for (as_id = 0; as_id < KVM_ADDRESS_SPACE_NUM; as_id++) {
+		for_each_tdp_mmu_root_yield_safe(kvm, root, as_id) {
+			slots = __kvm_memslots(kvm, as_id);
+			kvm_for_each_memslot(memslot, slots) {
+				unsigned long hva_start, hva_end;
+				gfn_t gfn_start, gfn_end;
 
-			hva_start = max(start, memslot->userspace_addr);
-			hva_end = min(end, memslot->userspace_addr +
-				      (memslot->npages << PAGE_SHIFT));
-			if (hva_start >= hva_end)
-				continue;
-			/*
-			 * {gfn(page) | page intersects with [hva_start, hva_end)} =
-			 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
-			 */
-			gfn_start = hva_to_gfn_memslot(hva_start, memslot);
-			gfn_end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, memslot);
+				hva_start = max(start, memslot->userspace_addr);
+				hva_end = min(end, memslot->userspace_addr +
+					(memslot->npages << PAGE_SHIFT));
+				if (hva_start >= hva_end)
+					continue;
+				/*
+				 * {gfn(page) | page intersects with [hva_start, hva_end)} =
+				 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
+				 */
+				gfn_start = hva_to_gfn_memslot(hva_start, memslot);
+				gfn_end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, memslot);
 
-			ret |= handler(kvm, memslot, root, gfn_start,
-				       gfn_end, data);
+				ret |= handler(kvm, memslot, root, gfn_start,
+					gfn_end, data);
+			}
 		}
 	}
 
@@ -1113,17 +1132,11 @@ bool kvm_tdp_mmu_wrprot_slot(struct kvm *kvm, struct kvm_memory_slot *slot,
 			     int min_level)
 {
 	struct kvm_mmu_page *root;
-	int root_as_id;
 	bool spte_set = false;
 
-	for_each_tdp_mmu_root_yield_safe(kvm, root) {
-		root_as_id = kvm_mmu_page_as_id(root);
-		if (root_as_id != slot->as_id)
-			continue;
-
+	for_each_tdp_mmu_root_yield_safe(kvm, root, slot->as_id)
 		spte_set |= wrprot_gfn_range(kvm, root, slot->base_gfn,
 			     slot->base_gfn + slot->npages, min_level);
-	}
 
 	return spte_set;
 }
@@ -1178,17 +1191,11 @@ static bool clear_dirty_gfn_range(struct kvm *kvm, struct kvm_mmu_page *root,
 bool kvm_tdp_mmu_clear_dirty_slot(struct kvm *kvm, struct kvm_memory_slot *slot)
 {
 	struct kvm_mmu_page *root;
-	int root_as_id;
 	bool spte_set = false;
 
-	for_each_tdp_mmu_root_yield_safe(kvm, root) {
-		root_as_id = kvm_mmu_page_as_id(root);
-		if (root_as_id != slot->as_id)
-			continue;
-
+	for_each_tdp_mmu_root_yield_safe(kvm, root, slot->as_id)
 		spte_set |= clear_dirty_gfn_range(kvm, root, slot->base_gfn,
 				slot->base_gfn + slot->npages);
-	}
 
 	return spte_set;
 }
@@ -1250,70 +1257,10 @@ void kvm_tdp_mmu_clear_dirty_pt_masked(struct kvm *kvm,
 				       bool wrprot)
 {
 	struct kvm_mmu_page *root;
-	int root_as_id;
 
 	lockdep_assert_held_write(&kvm->mmu_lock);
-	for_each_tdp_mmu_root(kvm, root) {
-		root_as_id = kvm_mmu_page_as_id(root);
-		if (root_as_id != slot->as_id)
-			continue;
-
+	for_each_tdp_mmu_root(kvm, root, slot->as_id)
 		clear_dirty_pt_masked(kvm, root, gfn, mask, wrprot);
-	}
-}
-
-/*
- * Set the dirty status of all the SPTEs mapping GFNs in the memslot. This is
- * only used for PML, and so will involve setting the dirty bit on each SPTE.
- * Returns true if an SPTE has been changed and the TLBs need to be flushed.
- */
-static bool set_dirty_gfn_range(struct kvm *kvm, struct kvm_mmu_page *root,
-				gfn_t start, gfn_t end)
-{
-	struct tdp_iter iter;
-	u64 new_spte;
-	bool spte_set = false;
-
-	rcu_read_lock();
-
-	tdp_root_for_each_pte(iter, root, start, end) {
-		if (tdp_mmu_iter_cond_resched(kvm, &iter, false))
-			continue;
-
-		if (!is_shadow_present_pte(iter.old_spte) ||
-		    iter.old_spte & shadow_dirty_mask)
-			continue;
-
-		new_spte = iter.old_spte | shadow_dirty_mask;
-
-		tdp_mmu_set_spte(kvm, &iter, new_spte);
-		spte_set = true;
-	}
-
-	rcu_read_unlock();
-	return spte_set;
-}
-
-/*
- * Set the dirty status of all the SPTEs mapping GFNs in the memslot. This is
- * only used for PML, and so will involve setting the dirty bit on each SPTE.
- * Returns true if an SPTE has been changed and the TLBs need to be flushed.
- */
-bool kvm_tdp_mmu_slot_set_dirty(struct kvm *kvm, struct kvm_memory_slot *slot)
-{
-	struct kvm_mmu_page *root;
-	int root_as_id;
-	bool spte_set = false;
-
-	for_each_tdp_mmu_root_yield_safe(kvm, root) {
-		root_as_id = kvm_mmu_page_as_id(root);
-		if (root_as_id != slot->as_id)
-			continue;
-
-		spte_set |= set_dirty_gfn_range(kvm, root, slot->base_gfn,
-				slot->base_gfn + slot->npages);
-	}
-	return spte_set;
 }
 
 /*
@@ -1322,7 +1269,7 @@ bool kvm_tdp_mmu_slot_set_dirty(struct kvm *kvm, struct kvm_memory_slot *slot)
  */
 static bool zap_collapsible_spte_range(struct kvm *kvm,
 				       struct kvm_mmu_page *root,
-				       struct kvm_memory_slot *slot,
+				       const struct kvm_memory_slot *slot,
 				       bool flush)
 {
 	gfn_t start = slot->base_gfn;
@@ -1362,23 +1309,16 @@ static bool zap_collapsible_spte_range(struct kvm *kvm,
  * Clear non-leaf entries (and free associated page tables) which could
  * be replaced by large mappings, for GFNs within the slot.
  */
-void kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
-				       struct kvm_memory_slot *slot)
+bool kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
+				       const struct kvm_memory_slot *slot,
+				       bool flush)
 {
 	struct kvm_mmu_page *root;
-	bool flush = false;
-	int root_as_id;
 
-	for_each_tdp_mmu_root_yield_safe(kvm, root) {
-		root_as_id = kvm_mmu_page_as_id(root);
-		if (root_as_id != slot->as_id)
-			continue;
-
+	for_each_tdp_mmu_root_yield_safe(kvm, root, slot->as_id)
 		flush = zap_collapsible_spte_range(kvm, root, slot, flush);
-	}
 
-	if (flush)
-		kvm_flush_remote_tlbs(kvm);
+	return flush;
 }
 
 /*
@@ -1420,17 +1360,12 @@ bool kvm_tdp_mmu_write_protect_gfn(struct kvm *kvm,
 				   struct kvm_memory_slot *slot, gfn_t gfn)
 {
 	struct kvm_mmu_page *root;
-	int root_as_id;
 	bool spte_set = false;
 
 	lockdep_assert_held_write(&kvm->mmu_lock);
-	for_each_tdp_mmu_root(kvm, root) {
-		root_as_id = kvm_mmu_page_as_id(root);
-		if (root_as_id != slot->as_id)
-			continue;
-
+	for_each_tdp_mmu_root(kvm, root, slot->as_id)
 		spte_set |= write_protect_gfn(kvm, root, gfn);
-	}
+
 	return spte_set;
 }
 

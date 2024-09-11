@@ -2504,18 +2504,6 @@ static int check_valid_flow(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 		return -EINVAL;
 	}
 
-	switch (attr->qp_type) {
-	case IB_QPT_SMI:
-	case MLX5_IB_QPT_HW_GSI:
-	case MLX5_IB_QPT_REG_UMR:
-	case IB_QPT_GSI:
-		mlx5_ib_dbg(dev, "Kernel doesn't support QP type %d\n",
-			    attr->qp_type);
-		return -EINVAL;
-	default:
-		break;
-	}
-
 	/*
 	 * We don't need to see this warning, it means that kernel code
 	 * missing ib_pd. Placed here to catch developer's mistakes.
@@ -2713,11 +2701,12 @@ static int process_create_flags(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
 	process_create_flag(dev, &create_flags, MLX5_IB_QP_CREATE_SQPN_QP1,
 			    true, qp);
 
-	if (create_flags)
+	if (create_flags) {
 		mlx5_ib_dbg(dev, "Create QP has unsupported flags 0x%X\n",
 			    create_flags);
-
-	return (create_flags) ? -EINVAL : 0;
+		return -EOPNOTSUPP;
+	}
+	return 0;
 }
 
 static int process_udata_size(struct mlx5_ib_dev *dev,
@@ -4236,6 +4225,9 @@ int mlx5_ib_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	int port;
 
 	if (!mlx5_ib_modify_qp_allowed(dev, qp, ibqp->qp_type))
+		return -EOPNOTSUPP;
+
+	if (attr_mask & ~(IB_QP_ATTR_STANDARD_BITS | IB_QP_RATE_LIMIT))
 		return -EOPNOTSUPP;
 
 	if (ibqp->rwq_ind_tbl)

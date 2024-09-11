@@ -129,10 +129,10 @@ extern pmd_t *mm_find_pmd(struct mm_struct *mm, unsigned long address);
  * between functions involved in allocations, including the alloc_pages*
  * family of functions.
  *
- * nodemask, migratetype and high_zoneidx are initialized only once in
+ * nodemask, migratetype and highest_zoneidx are initialized only once in
  * __alloc_pages_nodemask() and then never change.
  *
- * zonelist, preferred_zone and classzone_idx are set first in
+ * zonelist, preferred_zone and highest_zoneidx are set first in
  * __alloc_pages_nodemask() for the fast path, and might be later changed
  * in __alloc_pages_slowpath(). All other functions pass the whole strucure
  * by a const pointer.
@@ -142,11 +142,20 @@ struct alloc_context {
 	nodemask_t *nodemask;
 	struct zoneref *preferred_zoneref;
 	int migratetype;
-	enum zone_type high_zoneidx;
+
+	/*
+	 * highest_zoneidx represents highest usable zone index of
+	 * the allocation request. Due to the nature of the zone,
+	 * memory on lower zone than the highest_zoneidx will be
+	 * protected by lowmem_reserve[highest_zoneidx].
+	 *
+	 * highest_zoneidx is also used by reclaim/compaction to limit
+	 * the target zone since higher zone than this index cannot be
+	 * usable for this allocation request.
+	 */
+	enum zone_type highest_zoneidx;
 	bool spread_dirty_pages;
 };
-
-#define ac_classzone_idx(ac) (ac->high_zoneidx)
 
 /*
  * Locate the struct page for both the matching buddy in our
@@ -223,7 +232,7 @@ struct compact_control {
 	int order;			/* order a direct compactor needs */
 	int migratetype;		/* migratetype of direct compactor */
 	const unsigned int alloc_flags;	/* alloc flags of a direct compactor */
-	const int classzone_idx;	/* zone index of a direct compactor */
+	const int highest_zoneidx;	/* zone index of a direct compactor */
 	enum migrate_mode mode;		/* Async or sync migration mode */
 	bool ignore_skip_hint;		/* Scan blocks even if marked skip */
 	bool no_set_skip_hint;		/* Don't mark blocks for skipping */
@@ -262,16 +271,16 @@ int find_suitable_fallback(struct free_area *area, unsigned int order,
  * page from being allocated in parallel and returning garbage as the order.
  * If a caller does not hold page_zone(page)->lock, it must guarantee that the
  * page cannot be allocated or merged in parallel. Alternatively, it must
- * handle invalid values gracefully, and use page_order_unsafe() below.
+ * handle invalid values gracefully, and use buddy_order_unsafe() below.
  */
-static inline unsigned int page_order(struct page *page)
+static inline unsigned int buddy_order(struct page *page)
 {
 	/* PageBuddy() must be checked by the caller */
 	return page_private(page);
 }
 
 /*
- * Like page_order(), but for callers who cannot afford to hold the zone lock.
+ * Like buddy_order(), but for callers who cannot afford to hold the zone lock.
  * PageBuddy() should be checked first by the caller to minimize race window,
  * and invalid values must be handled gracefully.
  *
@@ -281,7 +290,7 @@ static inline unsigned int page_order(struct page *page)
  * times, potentially observing different values in the tests and the actual
  * use of the result.
  */
-#define page_order_unsafe(page)		READ_ONCE(page_private(page))
+#define buddy_order_unsafe(page)	READ_ONCE(page_private(page))
 
 static inline bool is_cow_mapping(vm_flags_t flags)
 {
@@ -602,5 +611,11 @@ static inline bool is_migrate_highatomic_page(struct page *page)
 }
 
 void setup_zone_pageset(struct zone *zone);
-extern struct page *alloc_new_node_page(struct page *page, unsigned long node);
+
+struct migration_target_control {
+	int nid;		/* preferred node id */
+	nodemask_t *nmask;
+	gfp_t gfp_mask;
+};
+
 #endif	/* __MM_INTERNAL_H */

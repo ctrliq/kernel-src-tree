@@ -442,7 +442,7 @@ static int mthca_create_srq(struct ib_srq *ibsrq,
 	return 0;
 }
 
-static void mthca_destroy_srq(struct ib_srq *srq, struct ib_udata *udata)
+static int mthca_destroy_srq(struct ib_srq *srq, struct ib_udata *udata)
 {
 	if (udata) {
 		struct mthca_ucontext *context =
@@ -456,6 +456,7 @@ static void mthca_destroy_srq(struct ib_srq *srq, struct ib_udata *udata)
 	}
 
 	mthca_free_srq(to_mdev(srq->device), to_msrq(srq));
+	return 0;
 }
 
 static struct ib_qp *mthca_create_qp(struct ib_pd *pd,
@@ -469,7 +470,7 @@ static struct ib_qp *mthca_create_qp(struct ib_pd *pd,
 	int err;
 
 	if (init_attr->create_flags)
-		return ERR_PTR(-EINVAL);
+		return ERR_PTR(-EOPNOTSUPP);
 
 	switch (init_attr->qp_type) {
 	case IB_QPT_RC:
@@ -534,10 +535,6 @@ static struct ib_qp *mthca_create_qp(struct ib_pd *pd,
 	case IB_QPT_SMI:
 	case IB_QPT_GSI:
 	{
-		/* Don't allow userspace to create special QPs */
-		if (udata)
-			return ERR_PTR(-EINVAL);
-
 		qp = kzalloc(sizeof(struct mthca_sqp), GFP_KERNEL);
 		if (!qp)
 			return ERR_PTR(-ENOMEM);
@@ -608,7 +605,7 @@ static int mthca_create_cq(struct ib_cq *ibcq,
 		udata, struct mthca_ucontext, ibucontext);
 
 	if (attr->flags)
-		return -EINVAL;
+		return -EOPNOTSUPP;
 
 	if (entries < 1 || entries > to_mdev(ibdev)->limits.max_cqes)
 		return -EINVAL;
@@ -791,7 +788,7 @@ out:
 	return ret;
 }
 
-static void mthca_destroy_cq(struct ib_cq *cq, struct ib_udata *udata)
+static int mthca_destroy_cq(struct ib_cq *cq, struct ib_udata *udata)
 {
 	if (udata) {
 		struct mthca_ucontext *context =
@@ -810,6 +807,7 @@ static void mthca_destroy_cq(struct ib_cq *cq, struct ib_udata *udata)
 				    to_mcq(cq)->set_ci_db_index);
 	}
 	mthca_free_cq(to_mdev(cq->device), to_mcq(cq));
+	return 0;
 }
 
 static inline u32 convert_access(int acc)
@@ -879,7 +877,7 @@ static struct ib_mr *mthca_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 		goto err;
 	}
 
-	n = ib_umem_num_pages(mr->umem);
+	n = ib_umem_num_dma_blocks(mr->umem, PAGE_SIZE);
 
 	mr->mtt = mthca_alloc_mtt(dev, n);
 	if (IS_ERR(mr->mtt)) {
@@ -1153,36 +1151,12 @@ int mthca_register_device(struct mthca_dev *dev)
 	if (ret)
 		return ret;
 
-	dev->ib_dev.uverbs_cmd_mask	 =
-		(1ull << IB_USER_VERBS_CMD_GET_CONTEXT)		|
-		(1ull << IB_USER_VERBS_CMD_QUERY_DEVICE)	|
-		(1ull << IB_USER_VERBS_CMD_QUERY_PORT)		|
-		(1ull << IB_USER_VERBS_CMD_ALLOC_PD)		|
-		(1ull << IB_USER_VERBS_CMD_DEALLOC_PD)		|
-		(1ull << IB_USER_VERBS_CMD_REG_MR)		|
-		(1ull << IB_USER_VERBS_CMD_DEREG_MR)		|
-		(1ull << IB_USER_VERBS_CMD_CREATE_COMP_CHANNEL)	|
-		(1ull << IB_USER_VERBS_CMD_CREATE_CQ)		|
-		(1ull << IB_USER_VERBS_CMD_RESIZE_CQ)		|
-		(1ull << IB_USER_VERBS_CMD_DESTROY_CQ)		|
-		(1ull << IB_USER_VERBS_CMD_CREATE_QP)		|
-		(1ull << IB_USER_VERBS_CMD_QUERY_QP)		|
-		(1ull << IB_USER_VERBS_CMD_MODIFY_QP)		|
-		(1ull << IB_USER_VERBS_CMD_DESTROY_QP)		|
-		(1ull << IB_USER_VERBS_CMD_ATTACH_MCAST)	|
-		(1ull << IB_USER_VERBS_CMD_DETACH_MCAST);
 	dev->ib_dev.node_type            = RDMA_NODE_IB_CA;
 	dev->ib_dev.phys_port_cnt        = dev->limits.num_ports;
 	dev->ib_dev.num_comp_vectors     = 1;
 	dev->ib_dev.dev.parent           = &dev->pdev->dev;
 
 	if (dev->mthca_flags & MTHCA_FLAG_SRQ) {
-		dev->ib_dev.uverbs_cmd_mask	|=
-			(1ull << IB_USER_VERBS_CMD_CREATE_SRQ)		|
-			(1ull << IB_USER_VERBS_CMD_MODIFY_SRQ)		|
-			(1ull << IB_USER_VERBS_CMD_QUERY_SRQ)		|
-			(1ull << IB_USER_VERBS_CMD_DESTROY_SRQ);
-
 		if (mthca_is_memfree(dev))
 			ib_set_device_ops(&dev->ib_dev,
 					  &mthca_dev_arbel_srq_ops);
@@ -1201,7 +1175,7 @@ int mthca_register_device(struct mthca_dev *dev)
 	mutex_init(&dev->cap_mask_mutex);
 
 	rdma_set_device_sysfs_group(&dev->ib_dev, &mthca_attr_group);
-	ret = ib_register_device(&dev->ib_dev, "mthca%d");
+	ret = ib_register_device(&dev->ib_dev, "mthca%d", &dev->pdev->dev);
 	if (ret)
 		return ret;
 

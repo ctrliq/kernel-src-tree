@@ -4237,6 +4237,15 @@ static inline void skb_ext_copy(struct sk_buff *dst, const struct sk_buff *src)
 {
 	skb_ext_put(dst);
 	__skb_ext_copy(dst, src);
+
+#ifdef CONFIG_XFRM
+	/* RHEL: Also copy the secpath, which was freed by
+	 * __rh_skb_ext_put(). Like in __rh_skb_ext_put(), we need to
+	 * expand the implementation of secpath_get(). */
+	if (src->sp)
+		refcount_inc((refcount_t *)src->sp);
+	dst->sp = src->sp;
+#endif
 }
 
 static inline bool __skb_ext_exist(const struct skb_ext *ext, enum skb_ext_id i)
@@ -4660,6 +4669,11 @@ static inline void skb_reset_redirect(struct sk_buff *skb)
 #ifdef CONFIG_NET_REDIRECT
 	skb->redirected = 0;
 #endif
+}
+
+static inline bool skb_csum_is_sctp(struct sk_buff *skb)
+{
+	return skb->csum_not_inet;
 }
 
 #endif	/* __KERNEL__ */

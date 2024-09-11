@@ -631,7 +631,7 @@ int __set_page_dirty_buffers(struct page *page)
 		} while (bh != head);
 	}
 	/*
-	 * Lock out page->mem_cgroup migration to keep PageDirty
+	 * Lock out page's memcg migration to keep PageDirty
 	 * synchronized with per-memcg dirty page counters.
 	 */
 	lock_page_memcg(page);
@@ -816,13 +816,14 @@ struct buffer_head *alloc_page_buffers(struct page *page, unsigned long size,
 	struct buffer_head *bh, *head;
 	gfp_t gfp = GFP_NOFS | __GFP_ACCOUNT;
 	long offset;
-	struct mem_cgroup *memcg;
+	struct mem_cgroup *memcg, *old_memcg;
 
 	if (retry)
 		gfp |= __GFP_NOFAIL;
 
-	memcg = get_mem_cgroup_from_page(page);
-	memalloc_use_memcg(memcg);
+	/* The page lock pins the memcg */
+	memcg = page_memcg(page);
+	old_memcg = set_active_memcg(memcg);
 
 	head = NULL;
 	offset = PAGE_SIZE;
@@ -841,8 +842,7 @@ struct buffer_head *alloc_page_buffers(struct page *page, unsigned long size,
 		set_bh_page(bh, page, offset);
 	}
 out:
-	memalloc_unuse_memcg();
-	mem_cgroup_put(memcg);
+	set_active_memcg(old_memcg);
 	return head;
 /*
  * In case anything failed, we just free everything we got.

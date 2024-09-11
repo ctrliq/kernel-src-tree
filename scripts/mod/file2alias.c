@@ -1280,6 +1280,23 @@ static int do_typec_entry(const char *filename, void *symval, char *alias)
 	return 1;
 }
 
+/* Looks like: mhi:S */
+static int do_mhi_entry(const char *filename, void *symval, char *alias)
+{
+	DEF_FIELD_ADDR(symval, mhi_device_id, chan);
+	sprintf(alias, MHI_DEVICE_MODALIAS_FMT, *chan);
+
+	return 1;
+}
+
+static int do_auxiliary_entry(const char *filename, void *symval, char *alias)
+{
+	DEF_FIELD_ADDR(symval, auxiliary_device_id, name);
+	sprintf(alias, AUXILIARY_MODULE_PREFIX "%s", *name);
+
+	return 1;
+}
+
 /* Does namelen bytes of name exactly match the symbol? */
 static bool sym_is(const char *name, unsigned namelen, const char *symbol)
 {
@@ -1351,6 +1368,8 @@ static const struct devtable devtable[] = {
 	{"fslmc", SIZE_fsl_mc_device_id, do_fsl_mc_entry},
 	{"tbsvc", SIZE_tb_service_id, do_tbsvc_entry},
 	{"typec", SIZE_typec_device_id, do_typec_entry},
+	{"mhi", SIZE_mhi_device_id, do_mhi_entry},
+	{"auxiliary", SIZE_auxiliary_device_id, do_auxiliary_entry},
 };
 
 /* Create MODULE_ALIAS() statements.

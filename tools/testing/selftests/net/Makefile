@@ -15,6 +15,7 @@ TEST_PROGS += txtimestamp.sh
 TEST_PROGS += vrf-xfrm-tests.sh
 TEST_PROGS += rxtimestamp.sh
 TEST_PROGS += devlink_port_split.py
+TEST_PROGS += drop_monitor_tests.sh
 TEST_PROGS += bareudp.sh
 TEST_PROGS_EXTENDED := in_netns.sh
 TEST_GEN_FILES =  socket nettest

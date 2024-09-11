@@ -6,19 +6,25 @@
 #include <linux/types.h>
 
 /*
- * Access type modifiers.
+ * ACCESS TYPE MODIFIERS
+ *
+ *   <none>: normal read access;
+ *   WRITE : write access;
+ *   ATOMIC: access is atomic;
+ *   ASSERT: access is not a regular access, but an assertion;
  */
-#define KCSAN_ACCESS_WRITE 0x1
+#define KCSAN_ACCESS_WRITE  0x1
 #define KCSAN_ACCESS_ATOMIC 0x2
+#define KCSAN_ACCESS_ASSERT 0x4
 
 /*
- * __kcsan_*: Always calls into runtime when KCSAN is enabled. This may be used
+ * __kcsan_*: Always calls into the runtime when KCSAN is enabled. This may be used
  * even in compilation units that selectively disable KCSAN, but must use KCSAN
- * to validate access to an address.   Never use these in header files!
+ * to validate access to an address. Never use these in header files!
  */
 #ifdef CONFIG_KCSAN
 /**
- * __kcsan_check_access - check generic access for data race
+ * __kcsan_check_access - check generic access for races
  *
  * @ptr address of access
  * @size size of access
@@ -26,13 +32,68 @@
  */
 void __kcsan_check_access(const volatile void *ptr, size_t size, int type);
 
-#else
+/**
+ * kcsan_nestable_atomic_begin - begin nestable atomic region
+ *
+ * Accesses within the atomic region may appear to race with other accesses but
+ * should be considered atomic.
+ */
+void kcsan_nestable_atomic_begin(void);
+
+/**
+ * kcsan_nestable_atomic_end - end nestable atomic region
+ */
+void kcsan_nestable_atomic_end(void);
+
+/**
+ * kcsan_flat_atomic_begin - begin flat atomic region
+ *
+ * Accesses within the atomic region may appear to race with other accesses but
+ * should be considered atomic.
+ */
+void kcsan_flat_atomic_begin(void);
+
+/**
+ * kcsan_flat_atomic_end - end flat atomic region
+ */
+void kcsan_flat_atomic_end(void);
+
+/**
+ * kcsan_atomic_next - consider following accesses as atomic
+ *
+ * Force treating the next n memory accesses for the current context as atomic
+ * operations.
+ *
+ * @n number of following memory accesses to treat as atomic.
+ */
+void kcsan_atomic_next(int n);
+
+/**
+ * kcsan_set_access_mask - set access mask
+ *
+ * Set the access mask for all accesses for the current context if non-zero.
+ * Only value changes to bits set in the mask will be reported.
+ *
+ * @mask bitmask
+ */
+void kcsan_set_access_mask(unsigned long mask);
+
+#else /* CONFIG_KCSAN */
+
 static inline void __kcsan_check_access(const volatile void *ptr, size_t size,
 					int type) { }
-#endif
+
+static inline void kcsan_nestable_atomic_begin(void)	{ }
+static inline void kcsan_nestable_atomic_end(void)	{ }
+static inline void kcsan_flat_atomic_begin(void)	{ }
+static inline void kcsan_flat_atomic_end(void)		{ }
+static inline void kcsan_atomic_next(int n)		{ }
+static inline void kcsan_set_access_mask(unsigned long mask) { }
+
+#endif /* CONFIG_KCSAN */
 
 /*
- * kcsan_*: Only calls into runtime when the particular compilation unit has
+ * kcsan_*: Only calls into the runtime when the particular compilation unit has
  * KCSAN instrumentation enabled. May be used in header files.
  */
 #ifdef __SANITIZE_THREAD__
@@ -43,7 +104,7 @@ static inline void kcsan_check_access(const volatile void *ptr, size_t size,
 #endif
 
 /**
- * __kcsan_check_read - check regular read access for data races
+ * __kcsan_check_read - check regular read access for races
  *
  * @ptr address of access
  * @size size of access
@@ -51,7 +112,7 @@ static inline void kcsan_check_access(const volatile void *ptr, size_t size,
 #define __kcsan_check_read(ptr, size) __kcsan_check_access(ptr, size, 0)
 
 /**
- * __kcsan_check_write - check regular write access for data races
+ * __kcsan_check_write - check regular write access for races
  *
  * @ptr address of access
  * @size size of access
@@ -60,7 +121,7 @@ static inline void kcsan_check_access(const volatile void *ptr, size_t size,
 	__kcsan_check_access(ptr, size, KCSAN_ACCESS_WRITE)
 
 /**
- * kcsan_check_read - check regular read access for data races
+ * kcsan_check_read - check regular read access for races
  *
  * @ptr address of access
  * @size size of access
@@ -68,7 +129,7 @@ static inline void kcsan_check_access(const volatile void *ptr, size_t size,
 #define kcsan_check_read(ptr, size) kcsan_check_access(ptr, size, 0)
 
 /**
- * kcsan_check_write - check regular write access for data races
+ * kcsan_check_write - check regular write access for races
  *
  * @ptr address of access
  * @size size of access
@@ -77,16 +138,12 @@ static inline void kcsan_check_access(const volatile void *ptr, size_t size,
 	kcsan_check_access(ptr, size, KCSAN_ACCESS_WRITE)
 
 /*
- * Check for atomic accesses: if atomic access are not ignored, this simply
- * aliases to kcsan_check_access, otherwise becomes a no-op.
+ * Check for atomic accesses: if atomic accesses are not ignored, this simply
+ * aliases to kcsan_check_access(), otherwise becomes a no-op.
  */
 #ifdef CONFIG_KCSAN_IGNORE_ATOMICS
-#define kcsan_check_atomic_read(...)                                           \
-	do {                                                                   \
-	} while (0)
-#define kcsan_check_atomic_write(...)                                          \
-	do {                                                                   \
-	} while (0)
+#define kcsan_check_atomic_read(...)	do { } while (0)
+#define kcsan_check_atomic_write(...)	do { } while (0)
 #else
 #define kcsan_check_atomic_read(ptr, size)                                     \
 	kcsan_check_access(ptr, size, KCSAN_ACCESS_ATOMIC)

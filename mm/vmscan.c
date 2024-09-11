@@ -1077,7 +1077,6 @@ static void page_check_dirty_writeback(struct page *page,
 static unsigned int shrink_page_list(struct list_head *page_list,
 				     struct pglist_data *pgdat,
 				     struct scan_control *sc,
-				     enum ttu_flags ttu_flags,
 				     struct reclaim_stat *stat,
 				     bool ignore_references)
 {
@@ -1302,7 +1301,7 @@ static unsigned int shrink_page_list(struct list_head *page_list,
 		 * processes. Try to unmap it here.
 		 */
 		if (page_mapped(page)) {
-			enum ttu_flags flags = ttu_flags | TTU_BATCH_FLUSH;
+			enum ttu_flags flags = TTU_BATCH_FLUSH;
 			bool was_swapbacked = PageSwapBacked(page);
 
 			if (unlikely(PageTransHuge(page)))
@@ -1519,7 +1518,7 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
 	}
 
 	nr_reclaimed = shrink_page_list(&clean_pages, zone->zone_pgdat, &sc,
-			TTU_IGNORE_ACCESS, &stat, true);
+					&stat, true);
 	list_splice(&clean_pages, page_list);
 	mod_node_page_state(zone->zone_pgdat, NR_ISOLATED_FILE,
 			    -(long)nr_reclaimed);
@@ -1546,7 +1545,7 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
  *
  * returns 0 on success, -ve errno on failure.
  */
-int __isolate_lru_page(struct page *page, isolate_mode_t mode)
+int __isolate_lru_page_prepare(struct page *page, isolate_mode_t mode)
 {
 	int ret = -EBUSY;
 
@@ -1598,21 +1597,8 @@ int __isolate_lru_page(struct page *page, isolate_mode_t mode)
 	if ((mode & ISOLATE_UNMAPPED) && page_mapped(page))
 		return ret;
 
-	if (likely(get_page_unless_zero(page))) {
-		/*
-		 * Be careful not to clear PageLRU until after we're
-		 * sure the page is not being freed elsewhere -- the
-		 * page release code relies on it.
-		 */
-		if (TestClearPageLRU(page))
-			ret = 0;
-		else
-			put_page(page);
-	}
-
-	return ret;
+	return 0;
 }
-
 
 /*
  * Update LRU sizes after isolating pages. The LRU size updates must
@@ -1633,14 +1619,16 @@ static __always_inline void update_lru_sizes(struct lruvec *lruvec,
 }
 
 /**
- * pgdat->lru_lock is heavily contended.  Some of the functions that
+ * Isolating page from the lruvec to fill in @dst list by nr_to_scan times.
+ *
+ * lruvec->lru_lock is heavily contended.  Some of the functions that
  * shrink the lists perform better by taking out a batch of pages
  * and working on them outside the LRU lock.
  *
  * For pagecache intensive workloads, this function is the hottest
  * spot in the kernel (apart from copy_*_user functions).
  *
- * Appropriate locks must be held before calling this function.
+ * Lru_lock must be held before calling this function.
  *
  * @nr_to_scan:	The number of eligible pages to look through on the list.
  * @lruvec:	The LRU vector to pull pages from.
@@ -1693,20 +1681,34 @@ static unsigned long isolate_lru_pages(unsigned long nr_to_scan,
 		 * only when the page is being freed somewhere else.
 		 */
 		scan += nr_pages;
-		switch (__isolate_lru_page(page, mode)) {
+		switch (__isolate_lru_page_prepare(page, mode)) {
 		case 0:
+			/*
+			 * Be careful not to clear PageLRU until after we're
+			 * sure the page is not being freed elsewhere -- the
+			 * page release code relies on it.
+			 */
+			if (unlikely(!get_page_unless_zero(page)))
+				goto busy;
+
+			if (!TestClearPageLRU(page)) {
+				/*
+				 * This page may in other isolation path,
+				 * but we still hold lru_lock.
+				 */
+				put_page(page);
+				goto busy;
+			}
+
 			nr_taken += nr_pages;
 			nr_zone_taken[page_zonenum(page)] += nr_pages;
 			list_move(&page->lru, dst);
 			break;
 
-		case -EBUSY:
+		default:
+busy:
 			/* else it is being freed elsewhere */
 			list_move(&page->lru, src);
-			continue;
-
-		default:
-			BUG();
 		}
 	}
 
@@ -1770,14 +1772,12 @@ int isolate_lru_page(struct page *page)
 	WARN_RATELIMIT(PageTail(page), "trying to isolate tail page");
 
 	if (TestClearPageLRU(page)) {
-		pg_data_t *pgdat = page_pgdat(page);
 		struct lruvec *lruvec;
 
 		get_page(page);
-		lruvec = mem_cgroup_page_lruvec(page, pgdat);
-		spin_lock_irq(&pgdat->lru_lock);
+		lruvec = lock_page_lruvec_irq(page);
 		del_page_from_lru_list(page, lruvec, page_lru(page));
-		spin_unlock_irq(&pgdat->lru_lock);
+		unlock_page_lruvec_irq(lruvec);
 		ret = 0;
 	}
 
@@ -1822,29 +1822,14 @@ static int too_many_isolated(struct pglist_data *pgdat, int file,
 }
 
 /*
- * This moves pages from @list to corresponding LRU list.
- *
- * We move them the other way if the page is referenced by one or more
- * processes, from rmap.
- *
- * If the pages are mostly unmapped, the processing is fast and it is
- * appropriate to hold zone_lru_lock across the whole operation.  But if
- * the pages are mapped, the processing is slow (page_referenced()) so we
- * should drop zone_lru_lock around each page.  It's impossible to balance
- * this, so instead we remove the pages from the LRU while processing them.
- * It is safe to rely on PG_active against the non-LRU pages in here because
- * nobody will play with that bit on a non-LRU page.
- *
- * The downside is that we have to touch page->_refcount against each page.
- * But we had to alter page->flags anyway.
+ * move_pages_to_lru() moves pages from private @list to appropriate LRU list.
+ * On return, @list is reused as a list of pages to be freed by the caller.
  *
  * Returns the number of pages moved to the given lruvec.
  */
-
 static unsigned noinline_for_stack move_pages_to_lru(struct lruvec *lruvec,
 						     struct list_head *list)
 {
-	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	int nr_pages, nr_moved = 0;
 	LIST_HEAD(pages_to_free);
 	struct page *page;
@@ -1855,9 +1840,9 @@ static unsigned noinline_for_stack move_pages_to_lru(struct lruvec *lruvec,
 		VM_BUG_ON_PAGE(PageLRU(page), page);
 		list_del(&page->lru);
 		if (unlikely(!page_evictable(page))) {
-			spin_unlock_irq(&pgdat->lru_lock);
+			spin_unlock_irq(&lruvec->lru_lock);
 			putback_lru_page(page);
-			spin_lock_irq(&pgdat->lru_lock);
+			spin_lock_irq(&lruvec->lru_lock);
 			continue;
 		}
 
@@ -1879,9 +1864,9 @@ static unsigned noinline_for_stack move_pages_to_lru(struct lruvec *lruvec,
 			__ClearPageActive(page);
 
 			if (unlikely(PageCompound(page))) {
-				spin_unlock_irq(&pgdat->lru_lock);
+				spin_unlock_irq(&lruvec->lru_lock);
 				destroy_compound_page(page);
-				spin_lock_irq(&pgdat->lru_lock);
+				spin_lock_irq(&lruvec->lru_lock);
 			} else
 				list_add(&page->lru, &pages_to_free);
 
@@ -1892,8 +1877,7 @@ static unsigned noinline_for_stack move_pages_to_lru(struct lruvec *lruvec,
 		 * All pages were isolated from the same lruvec (and isolation
 		 * inhibits memcg migration).
 		 */
-		VM_BUG_ON_PAGE(mem_cgroup_page_lruvec(page, page_pgdat(page))
-							!= lruvec, page);
+		VM_BUG_ON_PAGE(!lruvec_holds_page_lru_lock(page, lruvec), page);
 		lru = page_lru(page);
 		nr_pages = thp_nr_pages(page);
 
@@ -1958,7 +1942,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 
 	lru_add_drain();
 
-	spin_lock_irq(&pgdat->lru_lock);
+	spin_lock_irq(&lruvec->lru_lock);
 
 	nr_taken = isolate_lru_pages(nr_to_scan, lruvec, &page_list,
 				     &nr_scanned, sc, lru);
@@ -1970,15 +1954,14 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 	__count_memcg_events(lruvec_memcg(lruvec), item, nr_scanned);
 	__count_vm_events(PGSCAN_ANON + file, nr_scanned);
 
-	spin_unlock_irq(&pgdat->lru_lock);
+	spin_unlock_irq(&lruvec->lru_lock);
 
 	if (nr_taken == 0)
 		return 0;
 
-	nr_reclaimed = shrink_page_list(&page_list, pgdat, sc, 0,
-				&stat, false);
+	nr_reclaimed = shrink_page_list(&page_list, pgdat, sc, &stat, false);
 
-	spin_lock_irq(&pgdat->lru_lock);
+	spin_lock_irq(&lruvec->lru_lock);
 	move_pages_to_lru(lruvec, &page_list);
 
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
@@ -1987,7 +1970,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 		__count_vm_events(item, nr_reclaimed);
 	__count_memcg_events(lruvec_memcg(lruvec), item, nr_reclaimed);
 	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
-	spin_unlock_irq(&pgdat->lru_lock);
+	spin_unlock_irq(&lruvec->lru_lock);
 
 	lru_note_cost(lruvec, file, stat.nr_pageout);
 	mem_cgroup_uncharge_list(&page_list);
@@ -2021,6 +2004,23 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 	return nr_reclaimed;
 }
 
+/*
+ * shrink_active_list() moves pages from the active LRU to the inactive LRU.
+ *
+ * We move them the other way if the page is referenced by one or more
+ * processes.
+ *
+ * If the pages are mostly unmapped, the processing is fast and it is
+ * appropriate to hold lru_lock across the whole operation.  But if
+ * the pages are mapped, the processing is slow (page_referenced()), so
+ * we should drop lru_lock around each page.  It's impossible to balance
+ * this, so instead we remove the pages from the LRU while processing them.
+ * It is safe to rely on PG_active against the non-LRU pages in here because
+ * nobody will play with that bit on a non-LRU page.
+ *
+ * The downside is that we have to touch page->_refcount against each page.
+ * But we had to alter page->flags anyway.
+ */
 static void shrink_active_list(unsigned long nr_to_scan,
 			       struct lruvec *lruvec,
 			       struct scan_control *sc,
@@ -2040,7 +2040,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
 
 	lru_add_drain();
 
-	spin_lock_irq(&pgdat->lru_lock);
+	spin_lock_irq(&lruvec->lru_lock);
 
 	nr_taken = isolate_lru_pages(nr_to_scan, lruvec, &l_hold,
 				     &nr_scanned, sc, lru);
@@ -2051,7 +2051,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
 		__count_vm_events(PGREFILL, nr_scanned);
 	__count_memcg_events(lruvec_memcg(lruvec), PGREFILL, nr_scanned);
 
-	spin_unlock_irq(&pgdat->lru_lock);
+	spin_unlock_irq(&lruvec->lru_lock);
 
 	while (!list_empty(&l_hold)) {
 		cond_resched();
@@ -2097,7 +2097,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
 	/*
 	 * Move pages back to the lru list.
 	 */
-	spin_lock_irq(&pgdat->lru_lock);
+	spin_lock_irq(&lruvec->lru_lock);
 
 	nr_activate = move_pages_to_lru(lruvec, &l_active);
 	nr_deactivate = move_pages_to_lru(lruvec, &l_inactive);
@@ -2108,7 +2108,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
 	__count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE, nr_deactivate);
 
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
-	spin_unlock_irq(&pgdat->lru_lock);
+	spin_unlock_irq(&lruvec->lru_lock);
 
 	mem_cgroup_uncharge_list(&l_active);
 	free_unref_page_list(&l_active);
@@ -2146,8 +2146,7 @@ unsigned long reclaim_pages(struct list_head *page_list)
 
 		nr_reclaimed += shrink_page_list(&node_page_list,
 						NODE_DATA(nid),
-						&sc, 0,
-						&dummy_stat, false);
+						&sc, &dummy_stat, false);
 		while (!list_empty(&node_page_list)) {
 			page = lru_to_page(&node_page_list);
 			list_del(&page->lru);
@@ -2160,8 +2159,7 @@ unsigned long reclaim_pages(struct list_head *page_list)
 	if (!list_empty(&node_page_list)) {
 		nr_reclaimed += shrink_page_list(&node_page_list,
 						NODE_DATA(nid),
-						&sc, 0,
-						&dummy_stat, false);
+						&sc, &dummy_stat, false);
 		while (!list_empty(&node_page_list)) {
 			page = lru_to_page(&node_page_list);
 			list_del(&page->lru);
@@ -2255,7 +2253,7 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	unsigned long anon_cost, file_cost, total_cost;
 	int swappiness = mem_cgroup_swappiness(memcg);
-	u64 fraction[2];
+	u64 fraction[ANON_AND_FILE];
 	u64 denominator = 0;	/* gcc */
 	enum scan_balance scan_balance;
 	unsigned long ap, fp;
@@ -2699,10 +2697,10 @@ again:
 	/*
 	 * Determine the scan balance between anon and file LRUs.
 	 */
-	spin_lock_irq(&pgdat->lru_lock);
+	spin_lock_irq(&target_lruvec->lru_lock);
 	sc->anon_cost = target_lruvec->anon_cost;
 	sc->file_cost = target_lruvec->file_cost;
-	spin_unlock_irq(&pgdat->lru_lock);
+	spin_unlock_irq(&target_lruvec->lru_lock);
 
 	/*
 	 * Target desirable inactive:active list ratios for the anon
@@ -3144,8 +3142,8 @@ static bool allow_direct_reclaim(pg_data_t *pgdat)
 
 	/* kswapd must be awake if processes are being throttled */
 	if (!wmark_ok && waitqueue_active(&pgdat->kswapd_wait)) {
-		if (READ_ONCE(pgdat->kswapd_classzone_idx) > ZONE_NORMAL)
-			WRITE_ONCE(pgdat->kswapd_classzone_idx, ZONE_NORMAL);
+		if (READ_ONCE(pgdat->kswapd_highest_zoneidx) > ZONE_NORMAL)
+			WRITE_ONCE(pgdat->kswapd_highest_zoneidx, ZONE_NORMAL);
 
 		wake_up_interruptible(&pgdat->kswapd_wait);
 	}
@@ -3397,7 +3395,7 @@ static void age_active_anon(struct pglist_data *pgdat,
 	} while (memcg);
 }
 
-static bool pgdat_watermark_boosted(pg_data_t *pgdat, int classzone_idx)
+static bool pgdat_watermark_boosted(pg_data_t *pgdat, int highest_zoneidx)
 {
 	int i;
 	struct zone *zone;
@@ -3409,7 +3407,7 @@ static bool pgdat_watermark_boosted(pg_data_t *pgdat, int classzone_idx)
 	 * start prematurely when there is no boosting and a lower
 	 * zone is balanced.
 	 */
-	for (i = classzone_idx; i >= 0; i--) {
+	for (i = highest_zoneidx; i >= 0; i--) {
 		zone = pgdat->node_zones + i;
 		if (!managed_zone(zone))
 			continue;
@@ -3423,9 +3421,9 @@ static bool pgdat_watermark_boosted(pg_data_t *pgdat, int classzone_idx)
 
 /*
  * Returns true if there is an eligible zone balanced for the request order
- * and classzone_idx
+ * and highest_zoneidx
  */
-static bool pgdat_balanced(pg_data_t *pgdat, int order, int classzone_idx)
+static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx)
 {
 	int i;
 	unsigned long mark = -1;
@@ -3435,19 +3433,19 @@ static bool pgdat_balanced(pg_data_t *pgdat, int order, int classzone_idx)
 	 * Check watermarks bottom-up as lower zones are more likely to
 	 * meet watermarks.
 	 */
-	for (i = 0; i <= classzone_idx; i++) {
+	for (i = 0; i <= highest_zoneidx; i++) {
 		zone = pgdat->node_zones + i;
 
 		if (!managed_zone(zone))
 			continue;
 
 		mark = high_wmark_pages(zone);
-		if (zone_watermark_ok_safe(zone, order, mark, classzone_idx))
+		if (zone_watermark_ok_safe(zone, order, mark, highest_zoneidx))
 			return true;
 	}
 
 	/*
-	 * If a node has no populated zone within classzone_idx, it does not
+	 * If a node has no populated zone within highest_zoneidx, it does not
 	 * need balancing by definition. This can happen if a zone-restricted
 	 * allocation tries to wake a remote kswapd.
 	 */
@@ -3473,7 +3471,8 @@ static void clear_pgdat_congested(pg_data_t *pgdat)
  *
  * Returns true if kswapd is ready to sleep
  */
-static bool prepare_kswapd_sleep(pg_data_t *pgdat, int order, int classzone_idx)
+static bool prepare_kswapd_sleep(pg_data_t *pgdat, int order,
+				int highest_zoneidx)
 {
 	/*
 	 * The throttled processes are normally woken up in balance_pgdat() as
@@ -3495,7 +3494,7 @@ static bool prepare_kswapd_sleep(pg_data_t *pgdat, int order, int classzone_idx)
 	if (pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES)
 		return true;
 
-	if (pgdat_balanced(pgdat, order, classzone_idx)) {
+	if (pgdat_balanced(pgdat, order, highest_zoneidx)) {
 		clear_pgdat_congested(pgdat);
 		return true;
 	}
@@ -3559,7 +3558,7 @@ static bool kswapd_shrink_node(pg_data_t *pgdat,
  * or lower is eligible for reclaim until at least one usable zone is
  * balanced.
  */
-static int balance_pgdat(pg_data_t *pgdat, int order, int classzone_idx)
+static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 {
 	int i;
 	unsigned long nr_soft_reclaimed;
@@ -3587,7 +3586,7 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int classzone_idx)
 	 * stall or direct reclaim until kswapd is finished.
 	 */
 	nr_boost_reclaim = 0;
-	for (i = 0; i <= classzone_idx; i++) {
+	for (i = 0; i <= highest_zoneidx; i++) {
 		zone = pgdat->node_zones + i;
 		if (!managed_zone(zone))
 			continue;
@@ -3605,7 +3604,7 @@ restart:
 		bool balanced;
 		bool ret;
 
-		sc.reclaim_idx = classzone_idx;
+		sc.reclaim_idx = highest_zoneidx;
 
 		/*
 		 * If the number of buffer_heads exceeds the maximum allowed
@@ -3635,7 +3634,7 @@ restart:
 		 * on the grounds that the normal reclaim should be enough to
 		 * re-evaluate if boosting is required when kswapd next wakes.
 		 */
-		balanced = pgdat_balanced(pgdat, sc.order, classzone_idx);
+		balanced = pgdat_balanced(pgdat, sc.order, highest_zoneidx);
 		if (!balanced && nr_boost_reclaim) {
 			nr_boost_reclaim = 0;
 			goto restart;
@@ -3735,7 +3734,7 @@ out:
 	if (boosted) {
 		unsigned long flags;
 
-		for (i = 0; i <= classzone_idx; i++) {
+		for (i = 0; i <= highest_zoneidx; i++) {
 			if (!zone_boosts[i])
 				continue;
 
@@ -3750,7 +3749,7 @@ out:
 		 * As there is now likely space, wakeup kcompact to defragment
 		 * pageblocks.
 		 */
-		wakeup_kcompactd(pgdat, pageblock_order, classzone_idx);
+		wakeup_kcompactd(pgdat, pageblock_order, highest_zoneidx);
 	}
 
 	snapshot_refaults(NULL, pgdat);
@@ -3768,22 +3767,22 @@ out:
 }
 
 /*
- * The pgdat->kswapd_classzone_idx is used to pass the highest zone index to be
- * reclaimed by kswapd from the waker. If the value is MAX_NR_ZONES which is not
- * a valid index then either kswapd runs for first time or kswapd couldn't sleep
- * after previous reclaim attempt (node is still unbalanced). In that case
- * return the zone index of the previous kswapd reclaim cycle.
+ * The pgdat->kswapd_highest_zoneidx is used to pass the highest zone index to
+ * be reclaimed by kswapd from the waker. If the value is MAX_NR_ZONES which is
+ * not a valid index then either kswapd runs for first time or kswapd couldn't
+ * sleep after previous reclaim attempt (node is still unbalanced). In that
+ * case return the zone index of the previous kswapd reclaim cycle.
  */
-static enum zone_type kswapd_classzone_idx(pg_data_t *pgdat,
-					   enum zone_type prev_classzone_idx)
+static enum zone_type kswapd_highest_zoneidx(pg_data_t *pgdat,
+					   enum zone_type prev_highest_zoneidx)
 {
-	enum zone_type curr_idx = READ_ONCE(pgdat->kswapd_classzone_idx);
+	enum zone_type curr_idx = READ_ONCE(pgdat->kswapd_highest_zoneidx);
 
-	return curr_idx == MAX_NR_ZONES ? prev_classzone_idx : curr_idx;
+	return curr_idx == MAX_NR_ZONES ? prev_highest_zoneidx : curr_idx;
 }
 
 static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_order,
-				unsigned int classzone_idx)
+				unsigned int highest_zoneidx)
 {
 	long remaining = 0;
 	DEFINE_WAIT(wait);
@@ -3800,7 +3799,7 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 	 * eligible zone balanced that it's also unlikely that compaction will
 	 * succeed.
 	 */
-	if (prepare_kswapd_sleep(pgdat, reclaim_order, classzone_idx)) {
+	if (prepare_kswapd_sleep(pgdat, reclaim_order, highest_zoneidx)) {
 		/*
 		 * Compaction records what page blocks it recently failed to
 		 * isolate pages from and skips them in the future scanning.
@@ -3813,18 +3812,19 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 		 * We have freed the memory, now we should compact it to make
 		 * allocation of the requested order possible.
 		 */
-		wakeup_kcompactd(pgdat, alloc_order, classzone_idx);
+		wakeup_kcompactd(pgdat, alloc_order, highest_zoneidx);
 
 		remaining = schedule_timeout(HZ/10);
 
 		/*
-		 * If woken prematurely then reset kswapd_classzone_idx and
+		 * If woken prematurely then reset kswapd_highest_zoneidx and
 		 * order. The values will either be from a wakeup request or
 		 * the previous request that slept prematurely.
 		 */
 		if (remaining) {
-			WRITE_ONCE(pgdat->kswapd_classzone_idx,
-				   kswapd_classzone_idx(pgdat, classzone_idx));
+			WRITE_ONCE(pgdat->kswapd_highest_zoneidx,
+					kswapd_highest_zoneidx(pgdat,
+							highest_zoneidx));
 
 			if (READ_ONCE(pgdat->kswapd_order) < reclaim_order)
 				WRITE_ONCE(pgdat->kswapd_order, reclaim_order);
@@ -3839,7 +3839,7 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 	 * go fully to sleep until explicitly woken up.
 	 */
 	if (!remaining &&
-	    prepare_kswapd_sleep(pgdat, reclaim_order, classzone_idx)) {
+	    prepare_kswapd_sleep(pgdat, reclaim_order, highest_zoneidx)) {
 		trace_mm_vmscan_kswapd_sleep(pgdat->node_id);
 
 		/*
@@ -3881,7 +3881,7 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 static int kswapd(void *p)
 {
 	unsigned int alloc_order, reclaim_order;
-	unsigned int classzone_idx = MAX_NR_ZONES - 1;
+	unsigned int highest_zoneidx = MAX_NR_ZONES - 1;
 	pg_data_t *pgdat = (pg_data_t*)p;
 	struct task_struct *tsk = current;
 	const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
@@ -3905,22 +3905,24 @@ static int kswapd(void *p)
 	set_freezable();
 
 	WRITE_ONCE(pgdat->kswapd_order, 0);
-	WRITE_ONCE(pgdat->kswapd_classzone_idx, MAX_NR_ZONES);
+	WRITE_ONCE(pgdat->kswapd_highest_zoneidx, MAX_NR_ZONES);
 	for ( ; ; ) {
 		bool ret;
 
 		alloc_order = reclaim_order = READ_ONCE(pgdat->kswapd_order);
-		classzone_idx = kswapd_classzone_idx(pgdat, classzone_idx);
+		highest_zoneidx = kswapd_highest_zoneidx(pgdat,
+							highest_zoneidx);
 
 kswapd_try_sleep:
 		kswapd_try_to_sleep(pgdat, alloc_order, reclaim_order,
-					classzone_idx);
+					highest_zoneidx);
 
-		/* Read the new order and classzone_idx */
-		alloc_order = reclaim_order = READ_ONCE(pgdat->kswapd_order);
-		classzone_idx = kswapd_classzone_idx(pgdat, classzone_idx);
+		/* Read the new order and highest_zoneidx */
+		alloc_order = READ_ONCE(pgdat->kswapd_order);
+		highest_zoneidx = kswapd_highest_zoneidx(pgdat,
+							highest_zoneidx);
 		WRITE_ONCE(pgdat->kswapd_order, 0);
-		WRITE_ONCE(pgdat->kswapd_classzone_idx, MAX_NR_ZONES);
+		WRITE_ONCE(pgdat->kswapd_highest_zoneidx, MAX_NR_ZONES);
 
 		ret = try_to_freeze();
 		if (kthread_should_stop())
@@ -3941,9 +3943,10 @@ kswapd_try_sleep:
 		 * but kcompactd is woken to compact for the original
 		 * request (alloc_order).
 		 */
-		trace_mm_vmscan_kswapd_wake(pgdat->node_id, classzone_idx,
+		trace_mm_vmscan_kswapd_wake(pgdat->node_id, highest_zoneidx,
 						alloc_order);
-		reclaim_order = balance_pgdat(pgdat, alloc_order, classzone_idx);
+		reclaim_order = balance_pgdat(pgdat, alloc_order,
+						highest_zoneidx);
 		if (reclaim_order < alloc_order)
 			goto kswapd_try_sleep;
 	}
@@ -3961,7 +3964,7 @@ kswapd_try_sleep:
  * needed.
  */
 void wakeup_kswapd(struct zone *zone, gfp_t gfp_flags, int order,
-		   enum zone_type classzone_idx)
+		   enum zone_type highest_zoneidx)
 {
 	pg_data_t *pgdat;
 	enum zone_type curr_idx;
@@ -3973,10 +3976,10 @@ void wakeup_kswapd(struct zone *zone, gfp_t gfp_flags, int order,
 		return;
 
 	pgdat = zone->zone_pgdat;
-	curr_idx = READ_ONCE(pgdat->kswapd_classzone_idx);
+	curr_idx = READ_ONCE(pgdat->kswapd_highest_zoneidx);
 
-	if (curr_idx == MAX_NR_ZONES || curr_idx < classzone_idx)
-		WRITE_ONCE(pgdat->kswapd_classzone_idx, classzone_idx);
+	if (curr_idx == MAX_NR_ZONES || curr_idx < highest_zoneidx)
+		WRITE_ONCE(pgdat->kswapd_highest_zoneidx, highest_zoneidx);
 
 	if (READ_ONCE(pgdat->kswapd_order) < order)
 		WRITE_ONCE(pgdat->kswapd_order, order);
@@ -3986,8 +3989,8 @@ void wakeup_kswapd(struct zone *zone, gfp_t gfp_flags, int order,
 
 	/* Hopeless node, leave it to direct reclaim if possible */
 	if (pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES ||
-	    (pgdat_balanced(pgdat, order, classzone_idx) &&
-	     !pgdat_watermark_boosted(pgdat, classzone_idx))) {
+	    (pgdat_balanced(pgdat, order, highest_zoneidx) &&
+	     !pgdat_watermark_boosted(pgdat, highest_zoneidx))) {
 		/*
 		 * There may be plenty of free memory available, but it's too
 		 * fragmented for high-order allocations.  Wake up kcompactd
@@ -3996,11 +3999,11 @@ void wakeup_kswapd(struct zone *zone, gfp_t gfp_flags, int order,
 		 * ratelimit its work.
 		 */
 		if (!(gfp_flags & __GFP_DIRECT_RECLAIM))
-			wakeup_kcompactd(pgdat, order, classzone_idx);
+			wakeup_kcompactd(pgdat, order, highest_zoneidx);
 		return;
 	}
 
-	trace_mm_vmscan_wakeup_kswapd(pgdat->node_id, classzone_idx, order,
+	trace_mm_vmscan_wakeup_kswapd(pgdat->node_id, highest_zoneidx, order,
 				      gfp_flags);
 	wake_up_interruptible(&pgdat->kswapd_wait);
 }
@@ -4278,15 +4281,13 @@ int node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned int order)
  */
 void check_move_unevictable_pages(struct pagevec *pvec)
 {
-	struct lruvec *lruvec;
-	struct pglist_data *pgdat = NULL;
+	struct lruvec *lruvec = NULL;
 	int pgscanned = 0;
 	int pgrescued = 0;
 	int i;
 
 	for (i = 0; i < pvec->nr; i++) {
 		struct page *page = pvec->pages[i];
-		struct pglist_data *pagepgdat = page_pgdat(page);
 		int nr_pages;
 
 		if (PageTransTail(page))
@@ -4299,14 +4300,7 @@ void check_move_unevictable_pages(struct pagevec *pvec)
 		if (!TestClearPageLRU(page))
 			continue;
 
-		if (pagepgdat != pgdat) {
-			if (pgdat)
-				spin_unlock_irq(&pgdat->lru_lock);
-			pgdat = pagepgdat;
-			spin_lock_irq(&pgdat->lru_lock);
-		}
-		lruvec = mem_cgroup_page_lruvec(page, pgdat);
-
+		lruvec = relock_page_lruvec_irq(page, lruvec);
 		if (page_evictable(page) && PageUnevictable(page)) {
 			enum lru_list lru = page_lru_base_type(page);
 
@@ -4319,10 +4313,10 @@ void check_move_unevictable_pages(struct pagevec *pvec)
 		SetPageLRU(page);
 	}
 
-	if (pgdat) {
+	if (lruvec) {
 		__count_vm_events(UNEVICTABLE_PGRESCUED, pgrescued);
 		__count_vm_events(UNEVICTABLE_PGSCANNED, pgscanned);
-		spin_unlock_irq(&pgdat->lru_lock);
+		unlock_page_lruvec_irq(lruvec);
 	} else if (pgscanned) {
 		count_vm_events(UNEVICTABLE_PGSCANNED, pgscanned);
 	}

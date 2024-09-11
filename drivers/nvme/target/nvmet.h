@@ -446,7 +446,7 @@ struct nvmet_subsys *nvmet_subsys_alloc(const char *subsysnqn,
 void nvmet_subsys_put(struct nvmet_subsys *subsys);
 void nvmet_subsys_del_ctrls(struct nvmet_subsys *subsys);
 
-struct nvmet_ns *nvmet_find_namespace(struct nvmet_ctrl *ctrl, __le32 nsid);
+u16 nvmet_req_find_ns(struct nvmet_req *req);
 void nvmet_put_namespace(struct nvmet_ns *ns);
 int nvmet_ns_enable(struct nvmet_ns *ns);
 void nvmet_ns_disable(struct nvmet_ns *ns);
@@ -554,6 +554,11 @@ static inline u32 nvmet_dsm_len(struct nvmet_req *req)
 		sizeof(struct nvme_dsm_range);
 }
 
+static inline struct nvmet_subsys *nvmet_req_subsys(struct nvmet_req *req)
+{
+	return req->sq->ctrl->subsys;
+}
+
 #ifdef CONFIG_NVME_TARGET_PASSTHRU
 void nvmet_passthru_subsys_free(struct nvmet_subsys *subsys);
 int nvmet_passthru_ctrl_enable(struct nvmet_subsys *subsys);
@@ -588,7 +593,7 @@ static inline struct nvme_ctrl *nvmet_passthru_ctrl(struct nvmet_subsys *subsys)
 static inline struct nvme_ctrl *
 nvmet_req_passthru_ctrl(struct nvmet_req *req)
 {
-	return nvmet_passthru_ctrl(req->sq->ctrl->subsys);
+	return nvmet_passthru_ctrl(nvmet_req_subsys(req));
 }
 
 u16 errno_to_nvme_status(struct nvmet_req *req, int errno);

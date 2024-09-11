@@ -205,27 +205,6 @@ static int pvrdma_register_device(struct pvrdma_dev *dev)
 	dev->flags = 0;
 	dev->ib_dev.num_comp_vectors = 1;
 	dev->ib_dev.dev.parent = &dev->pdev->dev;
-	dev->ib_dev.uverbs_cmd_mask =
-		(1ull << IB_USER_VERBS_CMD_GET_CONTEXT)		|
-		(1ull << IB_USER_VERBS_CMD_QUERY_DEVICE)	|
-		(1ull << IB_USER_VERBS_CMD_QUERY_PORT)		|
-		(1ull << IB_USER_VERBS_CMD_ALLOC_PD)		|
-		(1ull << IB_USER_VERBS_CMD_DEALLOC_PD)		|
-		(1ull << IB_USER_VERBS_CMD_REG_MR)		|
-		(1ull << IB_USER_VERBS_CMD_DEREG_MR)		|
-		(1ull << IB_USER_VERBS_CMD_CREATE_COMP_CHANNEL)	|
-		(1ull << IB_USER_VERBS_CMD_CREATE_CQ)		|
-		(1ull << IB_USER_VERBS_CMD_POLL_CQ)		|
-		(1ull << IB_USER_VERBS_CMD_REQ_NOTIFY_CQ)	|
-		(1ull << IB_USER_VERBS_CMD_DESTROY_CQ)		|
-		(1ull << IB_USER_VERBS_CMD_CREATE_QP)		|
-		(1ull << IB_USER_VERBS_CMD_MODIFY_QP)		|
-		(1ull << IB_USER_VERBS_CMD_QUERY_QP)		|
-		(1ull << IB_USER_VERBS_CMD_DESTROY_QP)		|
-		(1ull << IB_USER_VERBS_CMD_POST_SEND)		|
-		(1ull << IB_USER_VERBS_CMD_POST_RECV)		|
-		(1ull << IB_USER_VERBS_CMD_CREATE_AH)		|
-		(1ull << IB_USER_VERBS_CMD_DESTROY_AH);
 
 	dev->ib_dev.node_type = RDMA_NODE_IB_CA;
 	dev->ib_dev.phys_port_cnt = dev->dsr->caps.phys_port_cnt;
@@ -249,13 +228,6 @@ static int pvrdma_register_device(struct pvrdma_dev *dev)
 
 	/* Check if SRQ is supported by backend */
 	if (dev->dsr->caps.max_srq) {
-		dev->ib_dev.uverbs_cmd_mask |=
-			(1ull << IB_USER_VERBS_CMD_CREATE_SRQ)	|
-			(1ull << IB_USER_VERBS_CMD_MODIFY_SRQ)	|
-			(1ull << IB_USER_VERBS_CMD_QUERY_SRQ)	|
-			(1ull << IB_USER_VERBS_CMD_DESTROY_SRQ)	|
-			(1ull << IB_USER_VERBS_CMD_POST_SRQ_RECV);
-
 		ib_set_device_ops(&dev->ib_dev, &pvrdma_dev_srq_ops);
 
 		dev->srq_tbl = kcalloc(dev->dsr->caps.max_srq,
@@ -270,7 +242,7 @@ static int pvrdma_register_device(struct pvrdma_dev *dev)
 	spin_lock_init(&dev->srq_tbl_lock);
 	rdma_set_device_sysfs_group(&dev->ib_dev, &pvrdma_attr_group);
 
-	ret = ib_register_device(&dev->ib_dev, "vmw_pvrdma%d");
+	ret = ib_register_device(&dev->ib_dev, "vmw_pvrdma%d", &dev->pdev->dev);
 	if (ret)
 		goto err_srq_free;
 
@@ -853,7 +825,7 @@ static int pvrdma_pci_probe(struct pci_dev *pdev,
 			goto err_free_resource;
 		}
 	}
-
+	dma_set_max_seg_size(&pdev->dev, UINT_MAX);
 	pci_set_master(pdev);
 
 	/* Map register space */

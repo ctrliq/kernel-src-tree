@@ -403,7 +403,7 @@ static inline int blk_mq_request_completed(struct request *rq)
 }
 
 /*
- * 
+ *
  * Set the state to complete when completing a request from inside ->queue_rq.
  * This is used by drivers that want to ensure special complete actions that
  * need access to the request are called on failure, e.g. by nvme for
@@ -423,8 +423,6 @@ void blk_mq_kick_requeue_list(struct request_queue *q);
 void blk_mq_delay_kick_requeue_list(struct request_queue *q, unsigned long msecs);
 void blk_mq_complete_request(struct request *rq);
 bool blk_mq_complete_request_remote(struct request *rq);
-bool blk_mq_bio_list_merge(struct request_queue *q, struct list_head *list,
-			   struct bio *bio);
 bool blk_mq_queue_stopped(struct request_queue *q);
 void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
 void blk_mq_start_hw_queue(struct blk_mq_hw_ctx *hctx);

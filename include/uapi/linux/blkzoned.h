@@ -111,9 +111,13 @@ struct blk_zone {
 	__u8	cond;		/* Zone condition */
 	__u8	non_seq;	/* Non-sequential write resources active */
 	__u8	reset;		/* Reset write pointer recommended */
-	__u8	resv[4];
-	__u64	capacity;	/* Zone capacity in number of sectors */
-	__u8	reserved[24];
+#ifdef __GENKSYMS__
+	__u8      reserved[36];
+#else
+	__u8    resv[4];
+	__u64   capacity;       /* Zone capacity in number of sectors */
+	__u8    reserved[24];
+#endif
 };
 
 /**
@@ -129,7 +133,13 @@ struct blk_zone {
 struct blk_zone_report {
 	__u64		sector;
 	__u32		nr_zones;
-	__u32		flags;
+#ifdef __GENKSYMS__
+
+	__u8    reserved[4];
+#else
+
+	__u32             flags;
+#endif
 	struct blk_zone zones[0];
 };
 

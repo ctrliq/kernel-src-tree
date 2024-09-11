@@ -207,6 +207,28 @@ enum udp_tunnel_nic_info_flags {
 	 * Driver will not receive any callback associated with port 4789.
 	 */
 	UDP_TUNNEL_NIC_INFO_STATIC_IANA_VXLAN	= BIT(3),
+
+	/* RHEL: Indicates that structure udp_tunnel_nic_info is extended
+	 * and contains '_rh' sub-structure with additional fields.
+	 * Drivers that allocate this structure and use fields present
+	 * in udp_tunnel_nic_info_rh have to set this flag.
+	 *
+	 * Example:
+	 * static const struct udp_tunnel_nic_info example_udp_tunnels = {
+	 *	.sync_table     = example_udp_tunnel_sync,
+	 *	.flags          = UDP_TUNNEL_NIC_INFO_MAY_SLEEP |
+	 *			  UDP_TUNNEL_NIC_INFO_OPEN_ONLY |
+	 *			  __RH_UDP_TUNNEL_NIC_INFO_EXTENDED;
+	 *	.tables         = {
+	 *		{ .n_entries = 1, .tunnel_types = UDP_TUNNEL_TYPE_VXLAN,  },
+	 *	},
+	 *	_rh.ext_field = 1234,
+	 *	RH_KABI_AUX_INIT_SIZE(udp_tunnel_nic_info)
+	 */
+	__RH_UDP_TUNNEL_NIC_INFO_EXTENDED	= BIT(31),
+};
+
+struct udp_tunnel_nic_info_rh {
 };
 
 /**
@@ -249,6 +271,8 @@ struct udp_tunnel_nic_info {
 		unsigned int n_entries;
 		unsigned int tunnel_types;
 	} tables[UDP_TUNNEL_NIC_MAX_TABLES];
+
+	RH_KABI_AUX_EMBED(udp_tunnel_nic_info);
 };
 
 /* UDP tunnel module dependencies

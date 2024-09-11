@@ -15,6 +15,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/seq_file.h>
+#include <linux/mm.h>
 
 #include "sysfs.h"
 #include "../kernfs/kernfs-internal.h"
@@ -636,3 +637,117 @@ int sysfs_file_change_owner(struct kobject *kobj, const char *name, kuid_t kuid,
 	return error;
 }
 EXPORT_SYMBOL_GPL(sysfs_file_change_owner);
+
+/**
+ *	sysfs_change_owner - change owner of the given object.
+ *	@kobj:	object.
+ *	@kuid:	new owner's kuid
+ *	@kgid:	new owner's kgid
+ *
+ * Change the owner of the default directory, files, groups, and attributes of
+ * @kobj to @kuid/@kgid. Note that sysfs_change_owner mirrors how the sysfs
+ * entries for a kobject are added by driver core. In summary,
+ * sysfs_change_owner() takes care of the default directory entry for @kobj,
+ * the default attributes associated with the ktype of @kobj and the default
+ * attributes associated with the ktype of @kobj.
+ * Additional properties not added by driver core have to be changed by the
+ * driver or subsystem which created them. This is similar to how
+ * driver/subsystem specific entries are removed.
+ *
+ * Returns 0 on success or error code on failure.
+ */
+int sysfs_change_owner(struct kobject *kobj, kuid_t kuid, kgid_t kgid)
+{
+	int error;
+	const struct kobj_type *ktype;
+
+	if (!kobj->state_in_sysfs)
+		return -EINVAL;
+
+	/* Change the owner of the kobject itself. */
+	error = internal_change_owner(kobj->sd, kuid, kgid);
+	if (error)
+		return error;
+
+	ktype = get_ktype(kobj);
+	if (ktype) {
+		struct attribute **kattr;
+
+		/*
+		 * Change owner of the default attributes associated with the
+		 * ktype of @kobj.
+		 */
+		for (kattr = ktype->default_attrs; kattr && *kattr; kattr++) {
+			error = sysfs_file_change_owner(kobj, (*kattr)->name,
+							kuid, kgid);
+			if (error)
+				return error;
+		}
+
+		/*
+		 * Change owner of the default groups associated with the
+		 * ktype of @kobj.
+		 */
+		error = sysfs_groups_change_owner(kobj, ktype->default_groups,
+						  kuid, kgid);
+		if (error)
+			return error;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(sysfs_change_owner);
+
+/**
+ *	sysfs_emit - scnprintf equivalent, aware of PAGE_SIZE buffer.
+ *	@buf:	start of PAGE_SIZE buffer.
+ *	@fmt:	format
+ *	@...:	optional arguments to @format
+ *
+ *
+ * Returns number of characters written to @buf.
+ */
+int sysfs_emit(char *buf, const char *fmt, ...)
+{
+	va_list args;
+	int len;
+
+	if (WARN(!buf || offset_in_page(buf),
+		 "invalid sysfs_emit: buf:%p\n", buf))
+		return 0;
+
+	va_start(args, fmt);
+	len = vscnprintf(buf, PAGE_SIZE, fmt, args);
+	va_end(args);
+
+	return len;
+}
+EXPORT_SYMBOL_GPL(sysfs_emit);
+
+/**
+ *	sysfs_emit_at - scnprintf equivalent, aware of PAGE_SIZE buffer.
+ *	@buf:	start of PAGE_SIZE buffer.
+ *	@at:	offset in @buf to start write in bytes
+ *		@at must be >= 0 && < PAGE_SIZE
+ *	@fmt:	format
+ *	@...:	optional arguments to @fmt
+ *
+ *
+ * Returns number of characters written starting at &@buf[@at].
+ */
+int sysfs_emit_at(char *buf, int at, const char *fmt, ...)
+{
+	va_list args;
+	int len;
+
+	if (WARN(!buf || offset_in_page(buf) || at < 0 || at >= PAGE_SIZE,
+		 "invalid sysfs_emit_at: buf:%p at:%d\n", buf, at))
+		return 0;
+
+	va_start(args, fmt);
+	len = vscnprintf(buf + at, PAGE_SIZE - at, fmt, args);
+	va_end(args);
+
+	return len;
+}
+EXPORT_SYMBOL_GPL(sysfs_emit_at);

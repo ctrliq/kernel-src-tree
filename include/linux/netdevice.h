@@ -1556,7 +1556,8 @@ struct net_device_ops {
 	RH_KABI_USE(5, struct net_device* (*ndo_get_xmit_slave)(struct net_device *dev,
 								struct sk_buff *skb,
 								bool all_slaves))
-	RH_KABI_RESERVE(6)
+	RH_KABI_USE(6, struct net_device*	(*ndo_sk_get_lower_dev)(struct net_device *dev,
+							struct sock *sk))
 	RH_KABI_RESERVE(7)
 	RH_KABI_RESERVE(8)
 	RH_KABI_RESERVE(9)
@@ -2642,6 +2643,29 @@ struct pcpu_lstats {
 };
 #endif
 
+static inline void dev_sw_netstats_rx_add(struct net_device *dev, unsigned int len)
+{
+	struct pcpu_sw_netstats *tstats = this_cpu_ptr(dev->tstats);
+
+	u64_stats_update_begin(&tstats->syncp);
+	tstats->rx_bytes += len;
+	tstats->rx_packets++;
+	u64_stats_update_end(&tstats->syncp);
+}
+
+static inline void dev_sw_netstats_tx_add(struct net_device *dev,
+					  unsigned int packets,
+					  unsigned int len)
+{
+	struct pcpu_sw_netstats *tstats = this_cpu_ptr(dev->tstats);
+
+	u64_stats_update_begin(&tstats->syncp);
+	tstats->tx_bytes += len;
+	tstats->tx_packets += packets;
+	u64_stats_update_end(&tstats->syncp);
+}
+
+
 #define __netdev_alloc_pcpu_stats(type, gfp)				\
 ({									\
 	typeof(type) __percpu *pcpu_stats = alloc_percpu_gfp(type, gfp);\
@@ -2658,6 +2682,20 @@ struct pcpu_lstats {
 
 #define netdev_alloc_pcpu_stats(type)					\
 	__netdev_alloc_pcpu_stats(type, GFP_KERNEL)
+
+#define devm_netdev_alloc_pcpu_stats(dev, type)				\
+({									\
+	typeof(type) __percpu *pcpu_stats = devm_alloc_percpu(dev, type);\
+	if (pcpu_stats) {						\
+		int __cpu;						\
+		for_each_possible_cpu(__cpu) {				\
+			typeof(type) *stat;				\
+			stat = per_cpu_ptr(pcpu_stats, __cpu);		\
+			u64_stats_init(&stat->syncp);			\
+		}							\
+	}								\
+	pcpu_stats;							\
+})
 
 enum netdev_lag_tx_type {
 	NETDEV_LAG_TX_TYPE_UNKNOWN,
@@ -2923,6 +2961,8 @@ int init_dummy_netdev(struct net_device *dev);
 struct net_device *netdev_get_xmit_slave(struct net_device *dev,
 					 struct sk_buff *skb,
 					 bool all_slaves);
+struct net_device *netdev_sk_get_lowest_dev(struct net_device *dev,
+					    struct sock *sk);
 struct net_device *dev_get_by_index(struct net *net, int ifindex);
 struct net_device *__dev_get_by_index(struct net *net, int ifindex);
 struct net_device *dev_get_by_index_rcu(struct net *net, int ifindex);
@@ -3902,6 +3942,7 @@ void generic_xdp_tx(struct sk_buff *skb, struct bpf_prog *xdp_prog);
 int do_xdp_generic(struct bpf_prog *xdp_prog, struct sk_buff *skb);
 int netif_rx(struct sk_buff *skb);
 int netif_rx_ni(struct sk_buff *skb);
+int netif_rx_any_context(struct sk_buff *skb);
 int netif_receive_skb(struct sk_buff *skb);
 int netif_receive_skb_core(struct sk_buff *skb);
 void netif_receive_skb_list(struct list_head *head);
@@ -3952,6 +3993,9 @@ int dev_pre_changeaddr_notify(struct net_device *dev, const char *addr,
 			      struct netlink_ext_ack *extack);
 int dev_set_mac_address(struct net_device *dev, struct sockaddr *sa,
 			struct netlink_ext_ack *extack);
+int dev_set_mac_address_user(struct net_device *dev, struct sockaddr *sa,
+			     struct netlink_ext_ack *extack);
+int dev_get_mac_address(struct sockaddr *sa, struct net *net, char *dev_name);
 int dev_change_carrier(struct net_device *, bool new_carrier);
 int dev_get_phys_port_id(struct net_device *dev,
 			 struct netdev_phys_item_id *ppid);
@@ -4156,7 +4200,7 @@ static inline bool netif_oper_up(const struct net_device *dev)
  *
  * Check if device has not been removed from system.
  */
-static inline bool netif_device_present(struct net_device *dev)
+static inline bool netif_device_present(const struct net_device *dev)
 {
 	return test_bit(__LINK_STATE_PRESENT, &dev->state);
 }
@@ -4571,6 +4615,9 @@ struct rtnl_link_stats64 *dev_get_stats(struct net_device *dev,
 					struct rtnl_link_stats64 *storage);
 void netdev_stats_to_stats64(struct rtnl_link_stats64 *stats64,
 			     const struct net_device_stats *netdev_stats);
+void dev_fetch_sw_netstats(struct rtnl_link_stats64 *s,
+			   const struct pcpu_sw_netstats __percpu *netstats);
+void dev_get_tstats64(struct net_device *dev, struct rtnl_link_stats64 *s);
 
 extern int		netdev_max_backlog;
 extern int		netdev_tstamp_prequeue;
@@ -4579,6 +4626,10 @@ extern int		dev_weight_rx_bias;
 extern int		dev_weight_tx_bias;
 extern int		dev_rx_weight;
 extern int		dev_tx_weight;
+
+struct netdev_nested_priv {
+	void *data;
+};
 
 bool netdev_has_upper_dev(struct net_device *dev, struct net_device *upper_dev);
 struct net_device *netdev_upper_get_next_dev_rcu(struct net_device *dev,
@@ -4595,8 +4646,8 @@ struct net_device *netdev_all_upper_get_next_dev_rcu(struct net_device *dev,
 
 int netdev_walk_all_upper_dev_rcu(struct net_device *dev,
 				  int (*fn)(struct net_device *upper_dev,
-					    void *data),
-				  void *data);
+					    struct netdev_nested_priv *priv),
+				  struct netdev_nested_priv *priv);
 
 bool netdev_has_upper_dev_all_rcu(struct net_device *dev,
 				  struct net_device *upper_dev);
@@ -4633,12 +4684,12 @@ struct net_device *netdev_next_lower_dev_rcu(struct net_device *dev,
 					     struct list_head **iter);
 int netdev_walk_all_lower_dev(struct net_device *dev,
 			      int (*fn)(struct net_device *lower_dev,
-					void *data),
-			      void *data);
+					struct netdev_nested_priv *priv),
+			      struct netdev_nested_priv *priv);
 int netdev_walk_all_lower_dev_rcu(struct net_device *dev,
 				  int (*fn)(struct net_device *lower_dev,
-					    void *data),
-				  void *data);
+					    struct netdev_nested_priv *priv),
+				  struct netdev_nested_priv *priv);
 
 void *netdev_adjacent_get_private(struct list_head *adj_list);
 void *netdev_lower_get_first_private_rcu(struct net_device *dev);

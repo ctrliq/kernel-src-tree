@@ -527,9 +527,9 @@ static struct sock *__udp6_lib_err_encap(struct net *net,
 	return sk;
 }
 
-void __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
-		    u8 type, u8 code, int offset, __be32 info,
-		    struct udp_table *udptable)
+int __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
+		   u8 type, u8 code, int offset, __be32 info,
+		   struct udp_table *udptable)
 {
 	struct ipv6_pinfo *np;
 	const struct ipv6hdr *hdr = (const struct ipv6hdr *)skb->data;
@@ -544,7 +544,7 @@ void __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 
 	sk = __udp6_lib_lookup(net, daddr, uh->dest, saddr, uh->source,
 			       inet6_iif(skb), 0, udptable, NULL);
-	if (!sk) {
+	if (!sk || udp_sk(sk)->encap_type) {
 		/* No socket for error: try tunnels before discarding */
 		if (static_branch_unlikely(&udpv6_encap_needed_key)) {
 			sk = __udp6_lib_err_encap(net, hdr, offset, uh,
@@ -554,7 +554,7 @@ void __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 		if (!sk) {
 			__ICMP6_INC_STATS(net, __in6_dev_get(skb->dev),
 					  ICMP6_MIB_INERRORS);
-			return;
+			return -ENOENT;
 		}
 		tunnel = true;
 	}
@@ -593,7 +593,7 @@ void __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 	sk->sk_err = err;
 	sk->sk_error_report(sk);
 out:
-	return;
+	return 0;
 }
 
 static int __udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
@@ -624,11 +624,11 @@ static int __udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	return 0;
 }
 
-static __inline__ void udpv6_err(struct sk_buff *skb,
-				 struct inet6_skb_parm *opt, u8 type,
-				 u8 code, int offset, __be32 info)
+static __inline__ int udpv6_err(struct sk_buff *skb,
+				struct inet6_skb_parm *opt, u8 type,
+				u8 code, int offset, __be32 info)
 {
-	__udp6_lib_err(skb, opt, type, code, offset, info, &udp_table);
+	return __udp6_lib_err(skb, opt, type, code, offset, info, &udp_table);
 }
 
 static int udpv6_queue_rcv_one_skb(struct sock *sk, struct sk_buff *skb)

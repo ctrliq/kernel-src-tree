@@ -17,11 +17,9 @@ struct wol_reply_data {
 #define WOL_REPDATA(__reply_base) \
 	container_of(__reply_base, struct wol_reply_data, base)
 
-const struct nla_policy ethnl_wol_get_policy[ETHTOOL_A_WOL_MAX + 1] = {
-	[ETHTOOL_A_WOL_UNSPEC]		= { .type = NLA_REJECT },
-	[ETHTOOL_A_WOL_HEADER]		= { .type = NLA_NESTED },
-	[ETHTOOL_A_WOL_MODES]		= { .type = NLA_REJECT },
-	[ETHTOOL_A_WOL_SOPASS]		= { .type = NLA_REJECT },
+const struct nla_policy ethnl_wol_get_policy[] = {
+	[ETHTOOL_A_WOL_HEADER]		=
+		NLA_POLICY_NESTED(ethnl_header_policy),
 };
 
 static int wol_prepare_data(const struct ethnl_req_info *req_base,
@@ -98,10 +96,9 @@ const struct ethnl_request_ops ethnl_wol_request_ops = {
 
 /* WOL_SET */
 
-static const struct nla_policy
-wol_set_policy[ETHTOOL_A_WOL_MAX + 1] = {
-	[ETHTOOL_A_WOL_UNSPEC]		= { .type = NLA_REJECT },
-	[ETHTOOL_A_WOL_HEADER]		= { .type = NLA_NESTED },
+const struct nla_policy ethnl_wol_set_policy[] = {
+	[ETHTOOL_A_WOL_HEADER]		=
+		NLA_POLICY_NESTED(ethnl_header_policy),
 	[ETHTOOL_A_WOL_MODES]		= { .type = NLA_NESTED },
 	[ETHTOOL_A_WOL_SOPASS]		= { .type = NLA_BINARY,
 					    .len = SOPASS_MAX },
@@ -110,16 +107,12 @@ wol_set_policy[ETHTOOL_A_WOL_MAX + 1] = {
 int ethnl_set_wol(struct sk_buff *skb, struct genl_info *info)
 {
 	struct ethtool_wolinfo wol = { .cmd = ETHTOOL_GWOL };
-	struct nlattr *tb[ETHTOOL_A_WOL_MAX + 1];
 	struct ethnl_req_info req_info = {};
+	struct nlattr **tb = info->attrs;
 	struct net_device *dev;
 	bool mod = false;
 	int ret;
 
-	ret = nlmsg_parse(info->nlhdr, GENL_HDRLEN, tb, ETHTOOL_A_WOL_MAX,
-			  wol_set_policy, info->extack);
-	if (ret < 0)
-		return ret;
 	ret = ethnl_parse_header_dev_get(&req_info, tb[ETHTOOL_A_WOL_HEADER],
 					 genl_info_net(info), info->extack,
 					 true);

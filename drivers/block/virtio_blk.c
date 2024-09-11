@@ -627,7 +627,6 @@ static void virtblk_update_cache_mode(struct virtio_device *vdev)
 	struct virtio_blk *vblk = vdev->priv;
 
 	blk_queue_write_cache(vblk->disk->queue, writeback, false);
-	revalidate_disk(vblk->disk);
 }
 
 static const char *const virtblk_cache_types[] = {

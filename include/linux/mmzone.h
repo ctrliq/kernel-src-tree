@@ -117,8 +117,7 @@ static inline bool free_area_empty(struct free_area *area, int migratetype)
 struct pglist_data;
 
 /*
- * zone->lock and the zone lru_lock are two of the hottest locks in the kernel.
- * So add a wild amount of padding here to ensure that they fall into separate
+ * Add a wild amount of padding here to ensure datas fall into separate
  * cachelines.  There are very few zone structures in the machine, so space
  * consumption is not a concern here.
  */
@@ -156,8 +155,8 @@ enum zone_stat_item {
 	NR_ZONE_UNEVICTABLE,
 	NR_ZONE_WRITE_PENDING,	/* Count of dirty, writeback and unstable pages */
 	NR_MLOCK,		/* mlock()ed pages found and moved off LRU */
-	NR_PAGETABLE,		/* used for pagetables */
-	NR_KERNEL_STACK_KB,	/* measured in KiB */
+	RH_KABI_BROKEN_REMOVE_ENUM(NR_PAGETABLE)
+	RH_KABI_BROKEN_REMOVE_ENUM(NR_KERNEL_STACK_KB)
 	/* Second 128 byte cacheline */
 	NR_BOUNCE,
 #if IS_ENABLED(CONFIG_ZSMALLOC)
@@ -209,8 +208,35 @@ enum node_stat_item {
 	RH_KABI_RENAME(NR_INDIRECTLY_RECLAIMABLE_BYTES,
 		       NR_KERNEL_MISC_RECLAIMABLE),
 				/* reclaimable non-slab kernel pages */
+	RH_KABI_BROKEN_INSERT_ENUM(NR_FOLL_PIN_ACQUIRED) /* via: pin_user_page(), gup flag: FOLL_PIN */
+	RH_KABI_BROKEN_INSERT_ENUM(NR_FOLL_PIN_RELEASED) /* pages returned via unpin_user_page() */
+	RH_KABI_BROKEN_INSERT_ENUM(NR_KERNEL_STACK_KB)	/* measured in KiB */
+#if IS_ENABLED(CONFIG_SHADOW_CALL_STACK)
+	NR_KERNEL_SCS_KB,	/* measured in KiB */
+#endif
+	RH_KABI_BROKEN_INSERT_ENUM(NR_PAGETABLE) /* used for pagetables */
+#ifdef CONFIG_SWAP
+	RH_KABI_BROKEN_INSERT_ENUM(NR_SWAPCACHE)
+#endif
 	NR_VM_NODE_STAT_ITEMS
 };
+
+/*
+ * Returns true if the item should be printed in THPs (/proc/vmstat
+ * currently prints number of anon, file and shmem THPs. But the item
+ * is charged in pages).
+ */
+static __always_inline bool vmstat_item_print_in_thp(enum node_stat_item item)
+{
+	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+		return false;
+
+	return item == NR_ANON_THPS ||
+	       item == NR_FILE_THPS ||
+	       item == NR_SHMEM_THPS ||
+	       item == NR_SHMEM_PMDMAPPED ||
+	       item == NR_FILE_PMDMAPPED;
+}
 
 /*
  * Returns true if the value is measured in bytes (most vmstat values are
@@ -281,6 +307,8 @@ struct zone_reclaim_stat {
 	unsigned long		recent_scanned[2];
 };
 
+#define ANON_AND_FILE 2
+
 enum lruvec_flags {
 	LRUVEC_CONGESTED,		/* lruvec has many dirty pages
 					 * backed by a congested BDI
@@ -298,8 +326,8 @@ struct lruvec {
 		struct zone_reclaim_stat	reclaim_stat,
 		unsigned long			anon_cost,
 		unsigned long			file_cost,
-		/* Refaults at the time of last reclaim cycle, anon=0, file=1 */
-		unsigned long			refaults[2])
+		/* Refaults at the time of last reclaim cycle */
+		unsigned long			refaults[ANON_AND_FILE])
 
 	/* Non-resident age, driven by LRU movement */
 	atomic_long_t			RH_KABI_RENAME(inactive_age,
@@ -310,6 +338,8 @@ struct lruvec {
 #ifdef CONFIG_MEMCG
 	struct pglist_data *pgdat;
 #endif
+	/* per lruvec lru_lock for memcg */
+	RH_KABI_BROKEN_INSERT(spinlock_t	lru_lock)
 };
 
 /* Isolate unmapped file */
@@ -418,6 +448,8 @@ enum zone_type {
 };
 
 #ifndef __GENERATING_BOUNDS_H
+
+#define ASYNC_AND_SYNC 2
 
 struct zone {
 	/* Read-mostly fields */
@@ -541,8 +573,8 @@ struct zone {
 #if defined CONFIG_COMPACTION || defined CONFIG_CMA
 	/* pfn where compaction free scanner should start */
 	unsigned long		compact_cached_free_pfn;
-	/* pfn where async and sync compaction migration scanner should start */
-	unsigned long		compact_cached_migrate_pfn[2];
+	/* pfn where compaction migration scanner should start */
+	unsigned long		compact_cached_migrate_pfn[ASYNC_AND_SYNC];
 #endif
 
 #ifdef CONFIG_COMPACTION
@@ -742,13 +774,13 @@ typedef struct pglist_data {
 	struct task_struct *kswapd;	/* Protected by
 					   mem_hotplug_begin/end() */
 	int kswapd_order;
-	enum zone_type kswapd_classzone_idx;
+	enum zone_type RH_KABI_RENAME(kswapd_classzone_idx, kswapd_highest_zoneidx);
 
 	int kswapd_failures;		/* Number of 'reclaimed == 0' runs */
 
 #ifdef CONFIG_COMPACTION
 	int kcompactd_max_order;
-	enum zone_type kcompactd_classzone_idx;
+	enum zone_type RH_KABI_RENAME(kcompactd_classzone_idx, kcompactd_highest_zoneidx);
 	wait_queue_head_t kcompactd_wait;
 	struct task_struct *kcompactd;
 #endif
@@ -778,7 +810,7 @@ typedef struct pglist_data {
 
 	/* Write-intensive fields used by page reclaim */
 	ZONE_PADDING(_pad1_)
-	spinlock_t		lru_lock;
+	RH_KABI_DEPRECATE(spinlock_t, lru_lock)
 
 #ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
 	/*
@@ -854,15 +886,15 @@ static inline int zone_id(const struct zone *zone)
 
 void build_all_zonelists(pg_data_t *pgdat);
 void wakeup_kswapd(struct zone *zone, gfp_t gfp_mask, int order,
-		   enum zone_type classzone_idx);
+		   enum zone_type highest_zoneidx);
 bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
-			 int classzone_idx, unsigned int alloc_flags,
+			 int highest_zoneidx, unsigned int alloc_flags,
 			 long free_pages);
 bool zone_watermark_ok(struct zone *z, unsigned int order,
-		unsigned long mark, int classzone_idx,
+		unsigned long mark, int highest_zoneidx,
 		unsigned int alloc_flags);
 bool zone_watermark_ok_safe(struct zone *z, unsigned int order,
-		unsigned long mark, int classzone_idx);
+		unsigned long mark, int highest_zoneidx);
 /*
  * Memory initialization context, use to differentiate memory added by
  * the platform statically or via memory hotplug interface.

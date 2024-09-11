@@ -73,6 +73,8 @@ static struct usb_driver btusb_driver;
 #define BTUSB_CW6622		0x100000
 #define BTUSB_MEDIATEK		0x200000
 #define BTUSB_WIDEBAND_SPEECH	0x400000
+#define BTUSB_VALID_LE_STATES   0x800000
+#define BTUSB_QCA_WCN6855	0x1000000
 #define BTUSB_INTEL_NEWGEN	0x2000000
 
 static const struct usb_device_id btusb_table[] = {
@@ -304,6 +306,10 @@ static const struct usb_device_id blacklist_table[] = {
 	{ USB_DEVICE(0x13d3, 0x3496), .driver_info = BTUSB_QCA_ROME |
 						     BTUSB_WIDEBAND_SPEECH },
 	{ USB_DEVICE(0x13d3, 0x3501), .driver_info = BTUSB_QCA_ROME |
+						     BTUSB_WIDEBAND_SPEECH },
+
+	/* QCA WCN6855 chipset */
+	{ USB_DEVICE(0x0cf3, 0xe600), .driver_info = BTUSB_QCA_WCN6855 |
 						     BTUSB_WIDEBAND_SPEECH },
 
 	/* Broadcom BCM2035 */
@@ -1798,8 +1804,12 @@ static int btusb_setup_bcm92035(struct hci_dev *hdev)
 
 static int btusb_setup_csr(struct hci_dev *hdev)
 {
+	struct btusb_data *data = hci_get_drvdata(hdev);
+	u16 bcdDevice = le16_to_cpu(data->udev->descriptor.bcdDevice);
 	struct hci_rp_read_local_version *rp;
 	struct sk_buff *skb;
+	bool is_fake = false;
+	int ret;
 
 	BT_DBG("%s", hdev->name);
 
@@ -1819,18 +1829,112 @@ static int btusb_setup_csr(struct hci_dev *hdev)
 
 	rp = (struct hci_rp_read_local_version *)skb->data;
 
-	/* Detect controllers which aren't real CSR ones. */
+	/* Detect a wide host of Chinese controllers that aren't CSR.
+	 *
+	 * Known fake bcdDevices: 0x0100, 0x0134, 0x1915, 0x2520, 0x7558, 0x8891
+	 *
+	 * The main thing they have in common is that these are really popular low-cost
+	 * options that support newer Bluetooth versions but rely on heavy VID/PID
+	 * squatting of this poor old Bluetooth 1.1 device. Even sold as such.
+	 *
+	 * We detect actual CSR devices by checking that the HCI manufacturer code
+	 * is Cambridge Silicon Radio (10) and ensuring that LMP sub-version and
+	 * HCI rev values always match. As they both store the firmware number.
+	 */
 	if (le16_to_cpu(rp->manufacturer) != 10 ||
-	    le16_to_cpu(rp->lmp_subver) == 0x0c5c) {
+	    le16_to_cpu(rp->hci_rev) != le16_to_cpu(rp->lmp_subver))
+		is_fake = true;
+
+	/* Known legit CSR firmware build numbers and their supported BT versions:
+	 * - 1.1 (0x1) -> 0x0073, 0x020d, 0x033c, 0x034e
+	 * - 1.2 (0x2) ->                 0x04d9, 0x0529
+	 * - 2.0 (0x3) ->         0x07a6, 0x07ad, 0x0c5c
+	 * - 2.1 (0x4) ->         0x149c, 0x1735, 0x1899 (0x1899 is a BlueCore4-External)
+	 * - 4.0 (0x6) ->         0x1d86, 0x2031, 0x22bb
+	 *
+	 * e.g. Real CSR dongles with LMP subversion 0x73 are old enough that
+	 *      support BT 1.1 only; so it's a dead giveaway when some
+	 *      third-party BT 4.0 dongle reuses it.
+	 */
+	else if (le16_to_cpu(rp->lmp_subver) <= 0x034e &&
+		 le16_to_cpu(rp->hci_ver) > BLUETOOTH_VER_1_1)
+		is_fake = true;
+
+	else if (le16_to_cpu(rp->lmp_subver) <= 0x0529 &&
+		 le16_to_cpu(rp->hci_ver) > BLUETOOTH_VER_1_2)
+		is_fake = true;
+
+	else if (le16_to_cpu(rp->lmp_subver) <= 0x0c5c &&
+		 le16_to_cpu(rp->hci_ver) > BLUETOOTH_VER_2_0)
+		is_fake = true;
+
+	else if (le16_to_cpu(rp->lmp_subver) <= 0x1899 &&
+		 le16_to_cpu(rp->hci_ver) > BLUETOOTH_VER_2_1)
+		is_fake = true;
+
+	else if (le16_to_cpu(rp->lmp_subver) <= 0x22bb &&
+		 le16_to_cpu(rp->hci_ver) > BLUETOOTH_VER_4_0)
+		is_fake = true;
+
+	/* Other clones which beat all the above checks */
+	else if (bcdDevice == 0x0134 &&
+		 le16_to_cpu(rp->lmp_subver) == 0x0c5c &&
+		 le16_to_cpu(rp->hci_ver) == BLUETOOTH_VER_2_0)
+		is_fake = true;
+
+	if (is_fake) {
+		bt_dev_warn(hdev, "CSR: Unbranded CSR clone detected; adding workarounds...");
+
+		/* Generally these clones have big discrepancies between
+		 * advertised features and what's actually supported.
+		 * Probably will need to be expanded in the future;
+		 * without these the controller will lock up.
+		 */
+		set_bit(HCI_QUIRK_BROKEN_STORED_LINK_KEY, &hdev->quirks);
+		set_bit(HCI_QUIRK_BROKEN_ERR_DATA_REPORTING, &hdev->quirks);
+
 		/* Clear the reset quirk since this is not an actual
 		 * early Bluetooth 1.1 device from CSR.
 		 */
 		clear_bit(HCI_QUIRK_RESET_ON_CLOSE, &hdev->quirks);
+		clear_bit(HCI_QUIRK_SIMULTANEOUS_DISCOVERY, &hdev->quirks);
 
-		/* These fake CSR controllers have all a broken
-		 * stored link key handling and so just disable it.
+		/*
+		 * Special workaround for clones with a Barrot 8041a02 chip,
+		 * these clones are really messed-up:
+		 * 1. Their bulk rx endpoint will never report any data unless
+		 * the device was suspended at least once (yes really).
+		 * 2. They will not wakeup when autosuspended and receiving data
+		 * on their bulk rx endpoint from e.g. a keyboard or mouse
+		 * (IOW remote-wakeup support is broken for the bulk endpoint).
+		 *
+		 * To fix 1. enable runtime-suspend, force-suspend the
+		 * hci and then wake-it up by disabling runtime-suspend.
+		 *
+		 * To fix 2. clear the hci's can_wake flag, this way the hci
+		 * will still be autosuspended when it is not open.
 		 */
-		set_bit(HCI_QUIRK_BROKEN_STORED_LINK_KEY, &hdev->quirks);
+		if (bcdDevice == 0x8891 &&
+		    le16_to_cpu(rp->lmp_subver) == 0x1012 &&
+		    le16_to_cpu(rp->hci_rev) == 0x0810 &&
+		    le16_to_cpu(rp->hci_ver) == BLUETOOTH_VER_4_0) {
+			bt_dev_warn(hdev, "CSR: detected a fake CSR dongle using a Barrot 8041a02 chip, this chip is very buggy and may have issues\n");
+
+			pm_runtime_allow(&data->udev->dev);
+
+			ret = pm_runtime_suspend(&data->udev->dev);
+			if (ret >= 0)
+				msleep(200);
+			else
+				bt_dev_err(hdev, "Failed to suspend the device for Barrot 8041a02 receive-issue workaround\n");
+
+			pm_runtime_forbid(&data->udev->dev);
+
+			device_set_wakeup_capable(&data->udev->dev, false);
+			/* Re-enable autosuspend if this was requested */
+			if (enable_autosuspend)
+				usb_enable_autosuspend(data->udev);
+		}
 	}
 
 	kfree_skb(skb);
@@ -3692,6 +3796,27 @@ static int btusb_set_bdaddr_ath3012(struct hci_dev *hdev,
 	return 0;
 }
 
+static int btusb_set_bdaddr_wcn6855(struct hci_dev *hdev,
+				const bdaddr_t *bdaddr)
+{
+	struct sk_buff *skb;
+	u8 buf[6];
+	long ret;
+
+	memcpy(buf, bdaddr, sizeof(bdaddr_t));
+
+	skb = __hci_cmd_sync_ev(hdev, 0xfc14, sizeof(buf), buf,
+				HCI_EV_CMD_COMPLETE, HCI_INIT_TIMEOUT);
+	if (IS_ERR(skb)) {
+		ret = PTR_ERR(skb);
+		bt_dev_err(hdev, "Change address command failed (%ld)", ret);
+		return ret;
+	}
+	kfree_skb(skb);
+
+	return 0;
+}
+
 #define QCA_DFU_PACKET_LEN	4096
 
 #define QCA_GET_TARGET_VERSION	0x09
@@ -3713,7 +3838,8 @@ struct qca_version {
 } __packed;
 
 struct qca_rampatch_version {
-	__le16	rom_version;
+	__le16	rom_version_high;
+	__le16  rom_version_low;
 	__le16	patch_version;
 } __packed;
 
@@ -3725,12 +3851,14 @@ struct qca_device_info {
 };
 
 static const struct qca_device_info qca_devices_table[] = {
-	{ 0x00000100, 20, 4, 10 }, /* Rome 1.0 */
-	{ 0x00000101, 20, 4, 10 }, /* Rome 1.1 */
-	{ 0x00000200, 28, 4, 18 }, /* Rome 2.0 */
-	{ 0x00000201, 28, 4, 18 }, /* Rome 2.1 */
-	{ 0x00000300, 28, 4, 18 }, /* Rome 3.0 */
-	{ 0x00000302, 28, 4, 18 }, /* Rome 3.2 */
+	{ 0x00000100, 20, 4,  8 }, /* Rome 1.0 */
+	{ 0x00000101, 20, 4,  8 }, /* Rome 1.1 */
+	{ 0x00000200, 28, 4, 16 }, /* Rome 2.0 */
+	{ 0x00000201, 28, 4, 16 }, /* Rome 2.1 */
+	{ 0x00000300, 28, 4, 16 }, /* Rome 3.0 */
+	{ 0x00000302, 28, 4, 16 }, /* Rome 3.2 */
+	{ 0x00130100, 40, 4, 16 }, /* WCN6855 1.0 */
+	{ 0x00130200, 40, 4, 16 }, /* WCN6855 2.0 */
 };
 
 static int btusb_qca_send_vendor_req(struct usb_device *udev, u8 request,
@@ -3832,8 +3960,8 @@ static int btusb_setup_qca_load_rampatch(struct hci_dev *hdev,
 {
 	struct qca_rampatch_version *rver;
 	const struct firmware *fw;
-	u32 ver_rom, ver_patch;
-	u16 rver_rom, rver_patch;
+	u32 ver_rom, ver_patch, rver_rom;
+	u16 rver_rom_low, rver_rom_high, rver_patch;
 	char fwname[64];
 	int err;
 
@@ -3852,8 +3980,15 @@ static int btusb_setup_qca_load_rampatch(struct hci_dev *hdev,
 	bt_dev_info(hdev, "using rampatch file: %s", fwname);
 
 	rver = (struct qca_rampatch_version *)(fw->data + info->ver_offset);
-	rver_rom = le16_to_cpu(rver->rom_version);
+	rver_rom_low = le16_to_cpu(rver->rom_version_low);
 	rver_patch = le16_to_cpu(rver->patch_version);
+
+	if (ver_rom & ~0xffffU) {
+		rver_rom_high = le16_to_cpu(rver->rom_version_high);
+		rver_rom = le32_to_cpu(rver_rom_high << 16 | rver_rom_low);
+	} else {
+		rver_rom = rver_rom_low;
+	}
 
 	bt_dev_info(hdev, "QCA: patch rome 0x%x build 0x%x, "
 		    "firmware rome 0x%x build 0x%x",
@@ -3934,9 +4069,6 @@ static int btusb_setup_qca(struct hci_dev *hdev)
 		return err;
 
 	ver_rom = le32_to_cpu(ver.rom_version);
-	/* Don't care about high ROM versions */
-	if (ver_rom & ~0xffffU)
-		return 0;
 
 	for (i = 0; i < ARRAY_SIZE(qca_devices_table); i++) {
 		if (ver_rom == qca_devices_table[i].rom_version)
@@ -4395,6 +4527,13 @@ static int btusb_probe(struct usb_interface *intf,
 		btusb_check_needs_reset_resume(intf);
 	}
 
+	if (id->driver_info & BTUSB_QCA_WCN6855) {
+		data->setup_on_usb = btusb_setup_qca;
+		hdev->set_bdaddr = btusb_set_bdaddr_wcn6855;
+		hdev->cmd_timeout = btusb_qca_cmd_timeout;
+		set_bit(HCI_QUIRK_SIMULTANEOUS_DISCOVERY, &hdev->quirks);
+	}
+
 	if (id->driver_info & BTUSB_AMP) {
 		/* AMP controllers do not support SCO packets */
 		data->isoc = NULL;
@@ -4451,11 +4590,13 @@ static int btusb_probe(struct usb_interface *intf,
 		if (bcdDevice < 0x117)
 			set_bit(HCI_QUIRK_RESET_ON_CLOSE, &hdev->quirks);
 
-		/* Fake CSR devices with broken commands */
-		if (bcdDevice <= 0x100 || bcdDevice == 0x134)
-			hdev->setup = btusb_setup_csr;
-
+		/* This must be set first in case we disable it for fakes */
 		set_bit(HCI_QUIRK_SIMULTANEOUS_DISCOVERY, &hdev->quirks);
+
+		/* Fake CSR devices with broken commands */
+		if (le16_to_cpu(udev->descriptor.idVendor)  == 0x0a12 &&
+		    le16_to_cpu(udev->descriptor.idProduct) == 0x0001)
+			hdev->setup = btusb_setup_csr;
 	}
 
 	if (id->driver_info & BTUSB_SNIFFER) {
@@ -4492,8 +4633,8 @@ static int btusb_probe(struct usb_interface *intf,
 			data->diag = NULL;
 	}
 
-	if (enable_autosuspend)
-		usb_enable_autosuspend(data->udev);
+	if (!enable_autosuspend)
+		usb_disable_autosuspend(data->udev);
 
 	err = hci_register_dev(hdev);
 	if (err < 0)
@@ -4553,6 +4694,9 @@ static void btusb_disconnect(struct usb_interface *intf)
 		gpiod_put(data->reset_gpio);
 
 	hci_free_dev(hdev);
+
+	if (!enable_autosuspend)
+		usb_enable_autosuspend(data->udev);
 }
 
 #ifdef CONFIG_PM
