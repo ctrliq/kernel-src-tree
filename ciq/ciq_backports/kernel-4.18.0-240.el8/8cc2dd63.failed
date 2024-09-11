@@ -1,0 +1,143 @@
+KVM: selftests: Add "zero" testcase to set_memory_region_test
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 8cc2dd637b890d75613387daf57af7e8f3a32e33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8cc2dd63.failed
+
+Add a testcase for running a guest with no memslots to the memory region
+test.  The expected result on x86_64 is that the guest will trigger an
+internal KVM error due to the initial code fetch encountering a
+non-existent memslot and resulting in an emulation failure.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200410231707.7128-9-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8cc2dd637b890d75613387daf57af7e8f3a32e33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/x86_64/set_memory_region_test.c
+diff --cc tools/testing/selftests/kvm/x86_64/set_memory_region_test.c
+index 125aeab59ab6,c274ce6b4ba2..000000000000
+--- a/tools/testing/selftests/kvm/x86_64/set_memory_region_test.c
++++ b/tools/testing/selftests/kvm/x86_64/set_memory_region_test.c
+@@@ -123,6 -206,111 +123,114 @@@ static void test_move_memory_region(voi
+  	kvm_vm_free(vm);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void guest_code_delete_memory_region(void)
++ {
++ 	uint64_t val;
++ 
++ 	GUEST_SYNC(0);
++ 
++ 	/* Spin until the memory region is deleted. */
++ 	val = guest_spin_on_val(0);
++ 	GUEST_ASSERT_1(val == MMIO_VAL, val);
++ 
++ 	/* Spin until the memory region is recreated. */
++ 	val = guest_spin_on_val(MMIO_VAL);
++ 	GUEST_ASSERT_1(val == 0, val);
++ 
++ 	/* Spin until the memory region is deleted. */
++ 	val = guest_spin_on_val(0);
++ 	GUEST_ASSERT_1(val == MMIO_VAL, val);
++ 
++ 	asm("1:\n\t"
++ 	    ".pushsection .rodata\n\t"
++ 	    ".global final_rip_start\n\t"
++ 	    "final_rip_start: .quad 1b\n\t"
++ 	    ".popsection");
++ 
++ 	/* Spin indefinitely (until the code memslot is deleted). */
++ 	guest_spin_on_val(MMIO_VAL);
++ 
++ 	asm("1:\n\t"
++ 	    ".pushsection .rodata\n\t"
++ 	    ".global final_rip_end\n\t"
++ 	    "final_rip_end: .quad 1b\n\t"
++ 	    ".popsection");
++ 
++ 	GUEST_ASSERT_1(0, 0);
++ }
++ 
++ static void test_delete_memory_region(void)
++ {
++ 	pthread_t vcpu_thread;
++ 	struct kvm_regs regs;
++ 	struct kvm_run *run;
++ 	struct kvm_vm *vm;
++ 
++ 	vm = spawn_vm(&vcpu_thread, guest_code_delete_memory_region);
++ 
++ 	/* Delete the memory region, the guest should not die. */
++ 	vm_mem_region_delete(vm, MEM_REGION_SLOT);
++ 	wait_for_vcpu();
++ 
++ 	/* Recreate the memory region.  The guest should see "0". */
++ 	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS_THP,
++ 				    MEM_REGION_GPA, MEM_REGION_SLOT,
++ 				    MEM_REGION_SIZE / getpagesize(), 0);
++ 	wait_for_vcpu();
++ 
++ 	/* Delete the region again so that there's only one memslot left. */
++ 	vm_mem_region_delete(vm, MEM_REGION_SLOT);
++ 	wait_for_vcpu();
++ 
++ 	/*
++ 	 * Delete the primary memslot.  This should cause an emulation error or
++ 	 * shutdown due to the page tables getting nuked.
++ 	 */
++ 	vm_mem_region_delete(vm, 0);
++ 
++ 	pthread_join(vcpu_thread, NULL);
++ 
++ 	run = vcpu_state(vm, VCPU_ID);
++ 
++ 	TEST_ASSERT(run->exit_reason == KVM_EXIT_SHUTDOWN ||
++ 		    run->exit_reason == KVM_EXIT_INTERNAL_ERROR,
++ 		    "Unexpected exit reason = %d", run->exit_reason);
++ 
++ 	vcpu_regs_get(vm, VCPU_ID, &regs);
++ 
++ 	TEST_ASSERT(regs.rip >= final_rip_start &&
++ 		    regs.rip < final_rip_end,
++ 		    "Bad rip, expected 0x%lx - 0x%lx, got 0x%llx\n",
++ 		    final_rip_start, final_rip_end, regs.rip);
++ 
++ 	kvm_vm_free(vm);
++ }
++ 
++ static void test_zero_memory_regions(void)
++ {
++ 	struct kvm_run *run;
++ 	struct kvm_vm *vm;
++ 
++ 	pr_info("Testing KVM_RUN with zero added memory regions\n");
++ 
++ 	vm = vm_create(VM_MODE_DEFAULT, 0, O_RDWR);
++ 	vm_vcpu_add(vm, VCPU_ID);
++ 
++ 	TEST_ASSERT(!ioctl(vm_get_fd(vm), KVM_SET_NR_MMU_PAGES, 64),
++ 		    "KVM_SET_NR_MMU_PAGES failed, errno = %d\n", errno);
++ 
++ 	vcpu_run(vm, VCPU_ID);
++ 
++ 	run = vcpu_state(vm, VCPU_ID);
++ 	TEST_ASSERT(run->exit_reason == KVM_EXIT_INTERNAL_ERROR,
++ 		    "Unexpected exit_reason = %u\n", run->exit_reason);
++ 
++ 	kvm_vm_free(vm);
++ }
++ 
+++>>>>>>> 8cc2dd637b89 (KVM: selftests: Add "zero" testcase to set_memory_region_test)
+  int main(int argc, char *argv[])
+  {
+  	int i, loops;
+* Unmerged path tools/testing/selftests/kvm/x86_64/set_memory_region_test.c
