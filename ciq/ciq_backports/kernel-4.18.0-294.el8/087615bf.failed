@@ -1,0 +1,153 @@
+dm mpath: pass IO start time to path selector
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Gabriel Krisman Bertazi <krisman@collabora.com>
+commit 087615bf3acdafd0ba7c7c9ed5286e7b7c80fe1b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/087615bf.failed
+
+The HST path selector needs this information to perform path
+prediction. For request-based mpath, struct request's io_start_time_ns
+is used, while for bio-based, use the start_time stored in dm_io.
+
+	Signed-off-by: Gabriel Krisman Bertazi <krisman@collabora.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 087615bf3acdafd0ba7c7c9ed5286e7b7c80fe1b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index a2fd7325fd7b,2fcb932eb4bd..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -653,6 -653,37 +653,40 @@@ static void free_tio(struct dm_target_i
+  	bio_put(&tio->clone);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool md_in_flight_bios(struct mapped_device *md)
++ {
++ 	int cpu;
++ 	struct hd_struct *part = &dm_disk(md)->part0;
++ 	long sum = 0;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		sum += part_stat_local_read_cpu(part, in_flight[0], cpu);
++ 		sum += part_stat_local_read_cpu(part, in_flight[1], cpu);
++ 	}
++ 
++ 	return sum != 0;
++ }
++ 
++ static bool md_in_flight(struct mapped_device *md)
++ {
++ 	if (queue_is_mq(md->queue))
++ 		return blk_mq_queue_inflight(md->queue);
++ 	else
++ 		return md_in_flight_bios(md);
++ }
++ 
++ u64 dm_start_time_ns_from_clone(struct bio *bio)
++ {
++ 	struct dm_target_io *tio = container_of(bio, struct dm_target_io, clone);
++ 	struct dm_io *io = tio->io;
++ 
++ 	return jiffies_to_nsecs(io->start_time);
++ }
++ EXPORT_SYMBOL_GPL(dm_start_time_ns_from_clone);
++ 
+++>>>>>>> 087615bf3acd (dm mpath: pass IO start time to path selector)
+  static void start_io_acct(struct dm_io *io)
+  {
+  	struct mapped_device *md = io->md;
+diff --git a/drivers/md/dm-mpath.c b/drivers/md/dm-mpath.c
+index 6b6682f4f1a8..88dc7b41b1c6 100644
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@ -577,7 +577,8 @@ static void multipath_release_clone(struct request *clone,
+ 		if (pgpath && pgpath->pg->ps.type->end_io)
+ 			pgpath->pg->ps.type->end_io(&pgpath->pg->ps,
+ 						    &pgpath->path,
+-						    mpio->nr_bytes);
++						    mpio->nr_bytes,
++						    clone->io_start_time_ns);
+ 	}
+ 
+ 	blk_put_request(clone);
+@@ -1666,7 +1667,8 @@ static int multipath_end_io(struct dm_target *ti, struct request *clone,
+ 		struct path_selector *ps = &pgpath->pg->ps;
+ 
+ 		if (ps->type->end_io)
+-			ps->type->end_io(ps, &pgpath->path, mpio->nr_bytes);
++			ps->type->end_io(ps, &pgpath->path, mpio->nr_bytes,
++					 clone->io_start_time_ns);
+ 	}
+ 
+ 	return r;
+@@ -1709,7 +1711,8 @@ static int multipath_end_io_bio(struct dm_target *ti, struct bio *clone,
+ 		struct path_selector *ps = &pgpath->pg->ps;
+ 
+ 		if (ps->type->end_io)
+-			ps->type->end_io(ps, &pgpath->path, mpio->nr_bytes);
++			ps->type->end_io(ps, &pgpath->path, mpio->nr_bytes,
++					 dm_start_time_ns_from_clone(clone));
+ 	}
+ 
+ 	return r;
+diff --git a/drivers/md/dm-path-selector.h b/drivers/md/dm-path-selector.h
+index b6eb5365b1a4..c47bc0e20275 100644
+--- a/drivers/md/dm-path-selector.h
++++ b/drivers/md/dm-path-selector.h
+@@ -74,7 +74,7 @@ struct path_selector_type {
+ 	int (*start_io) (struct path_selector *ps, struct dm_path *path,
+ 			 size_t nr_bytes);
+ 	int (*end_io) (struct path_selector *ps, struct dm_path *path,
+-		       size_t nr_bytes);
++		       size_t nr_bytes, u64 start_time);
+ };
+ 
+ /* Register a path selector */
+diff --git a/drivers/md/dm-queue-length.c b/drivers/md/dm-queue-length.c
+index 969c4f1a3633..5fd018d18418 100644
+--- a/drivers/md/dm-queue-length.c
++++ b/drivers/md/dm-queue-length.c
+@@ -227,7 +227,7 @@ static int ql_start_io(struct path_selector *ps, struct dm_path *path,
+ }
+ 
+ static int ql_end_io(struct path_selector *ps, struct dm_path *path,
+-		     size_t nr_bytes)
++		     size_t nr_bytes, u64 start_time)
+ {
+ 	struct path_info *pi = path->pscontext;
+ 
+diff --git a/drivers/md/dm-service-time.c b/drivers/md/dm-service-time.c
+index f006a9005593..9cfda665e9eb 100644
+--- a/drivers/md/dm-service-time.c
++++ b/drivers/md/dm-service-time.c
+@@ -309,7 +309,7 @@ static int st_start_io(struct path_selector *ps, struct dm_path *path,
+ }
+ 
+ static int st_end_io(struct path_selector *ps, struct dm_path *path,
+-		     size_t nr_bytes)
++		     size_t nr_bytes, u64 start_time)
+ {
+ 	struct path_info *pi = path->pscontext;
+ 
+* Unmerged path drivers/md/dm.c
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index f6d4c9cd0910..5d5e874ab865 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -334,6 +334,8 @@ void *dm_per_bio_data(struct bio *bio, size_t data_size);
+ struct bio *dm_bio_from_per_bio_data(void *data, size_t data_size);
+ unsigned dm_bio_get_target_bio_nr(const struct bio *bio);
+ 
++u64 dm_start_time_ns_from_clone(struct bio *bio);
++
+ int dm_register_target(struct target_type *t);
+ void dm_unregister_target(struct target_type *t);
+ 
