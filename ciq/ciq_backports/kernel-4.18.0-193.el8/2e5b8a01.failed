@@ -1,0 +1,354 @@
+RDMA/core: Add a netlink command to change net namespace of rdma device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Parav Pandit <parav@mellanox.com>
+commit 2e5b8a01165e4fe57ec396961daae38713edce35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/2e5b8a01.failed
+
+Provide an option to change the net namespace of a rdma device through a
+netlink command. When multiple rdma devices exists in a system, and when
+containers are used, this will limit rdma device visibility to a specified
+net namespace.
+
+An example command to change net namespace of mlx5_1 device to the
+previously created net namespace 'foo' is:
+
+$ ip netns add foo
+$ rdma dev set mlx5_1 netns foo
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 2e5b8a01165e4fe57ec396961daae38713edce35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/core_priv.h
+#	drivers/infiniband/core/device.c
+#	drivers/infiniband/core/nldev.c
+#	include/uapi/rdma/rdma_netlink.h
+diff --cc drivers/infiniband/core/core_priv.h
+index 9d1d4bce8f87,d4dd360769cb..000000000000
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@@ -326,4 -338,18 +326,21 @@@ int roce_resolve_route_from_path(struc
+  				 const struct ib_gid_attr *attr);
+  
+  struct net_device *rdma_read_gid_attr_ndev_rcu(const struct ib_gid_attr *attr);
+++<<<<<<< HEAD
+++=======
++ 
++ void ib_free_port_attrs(struct ib_core_device *coredev);
++ int ib_setup_port_attrs(struct ib_core_device *coredev,
++ 			bool alloc_hw_stats);
++ 
++ int rdma_compatdev_set(u8 enable);
++ 
++ int ib_port_register_module_stat(struct ib_device *device, u8 port_num,
++ 				 struct kobject *kobj, struct kobj_type *ktype,
++ 				 const char *name);
++ void ib_port_unregister_module_stat(struct kobject *kobj);
++ 
++ int ib_device_set_netns_put(struct sk_buff *skb,
++ 			    struct ib_device *dev, u32 ns_fd);
+++>>>>>>> 2e5b8a01165e (RDMA/core: Add a netlink command to change net namespace of rdma device)
+  #endif /* _CORE_PRIV_H */
+diff --cc drivers/infiniband/core/device.c
+index ec96a7b1c811,fcbf2d4c865d..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -700,6 -1347,217 +700,220 @@@ void ib_unregister_device(struct ib_dev
+  }
+  EXPORT_SYMBOL(ib_unregister_device);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * ib_unregister_device_and_put - Unregister a device while holding a 'get'
++  * device: The device to unregister
++  *
++  * This is the same as ib_unregister_device(), except it includes an internal
++  * ib_device_put() that should match a 'get' obtained by the caller.
++  *
++  * It is safe to call this routine concurrently from multiple threads while
++  * holding the 'get'. When the function returns the device is fully
++  * unregistered.
++  *
++  * Drivers using this flow MUST use the driver_unregister callback to clean up
++  * their resources associated with the device and dealloc it.
++  */
++ void ib_unregister_device_and_put(struct ib_device *ib_dev)
++ {
++ 	WARN_ON(!ib_dev->ops.dealloc_driver);
++ 	get_device(&ib_dev->dev);
++ 	ib_device_put(ib_dev);
++ 	__ib_unregister_device(ib_dev);
++ 	put_device(&ib_dev->dev);
++ }
++ EXPORT_SYMBOL(ib_unregister_device_and_put);
++ 
++ /**
++  * ib_unregister_driver - Unregister all IB devices for a driver
++  * @driver_id: The driver to unregister
++  *
++  * This implements a fence for device unregistration. It only returns once all
++  * devices associated with the driver_id have fully completed their
++  * unregistration and returned from ib_unregister_device*().
++  *
++  * If device's are not yet unregistered it goes ahead and starts unregistering
++  * them.
++  *
++  * This does not block creation of new devices with the given driver_id, that
++  * is the responsibility of the caller.
++  */
++ void ib_unregister_driver(enum rdma_driver_id driver_id)
++ {
++ 	struct ib_device *ib_dev;
++ 	unsigned long index;
++ 
++ 	down_read(&devices_rwsem);
++ 	xa_for_each (&devices, index, ib_dev) {
++ 		if (ib_dev->driver_id != driver_id)
++ 			continue;
++ 
++ 		get_device(&ib_dev->dev);
++ 		up_read(&devices_rwsem);
++ 
++ 		WARN_ON(!ib_dev->ops.dealloc_driver);
++ 		__ib_unregister_device(ib_dev);
++ 
++ 		put_device(&ib_dev->dev);
++ 		down_read(&devices_rwsem);
++ 	}
++ 	up_read(&devices_rwsem);
++ }
++ EXPORT_SYMBOL(ib_unregister_driver);
++ 
++ static void ib_unregister_work(struct work_struct *work)
++ {
++ 	struct ib_device *ib_dev =
++ 		container_of(work, struct ib_device, unregistration_work);
++ 
++ 	__ib_unregister_device(ib_dev);
++ 	put_device(&ib_dev->dev);
++ }
++ 
++ /**
++  * ib_unregister_device_queued - Unregister a device using a work queue
++  * device: The device to unregister
++  *
++  * This schedules an asynchronous unregistration using a WQ for the device. A
++  * driver should use this to avoid holding locks while doing unregistration,
++  * such as holding the RTNL lock.
++  *
++  * Drivers using this API must use ib_unregister_driver before module unload
++  * to ensure that all scheduled unregistrations have completed.
++  */
++ void ib_unregister_device_queued(struct ib_device *ib_dev)
++ {
++ 	WARN_ON(!refcount_read(&ib_dev->refcount));
++ 	WARN_ON(!ib_dev->ops.dealloc_driver);
++ 	get_device(&ib_dev->dev);
++ 	if (!queue_work(system_unbound_wq, &ib_dev->unregistration_work))
++ 		put_device(&ib_dev->dev);
++ }
++ EXPORT_SYMBOL(ib_unregister_device_queued);
++ 
++ /*
++  * The caller must pass in a device that has the kref held and the refcount
++  * released. If the device is in cur_net and still registered then it is moved
++  * into net.
++  */
++ static int rdma_dev_change_netns(struct ib_device *device, struct net *cur_net,
++ 				 struct net *net)
++ {
++ 	int ret2 = -EINVAL;
++ 	int ret;
++ 
++ 	mutex_lock(&device->unregistration_lock);
++ 
++ 	/*
++ 	 * If a device not under ib_device_get() or if the unregistration_lock
++ 	 * is not held, the namespace can be changed, or it can be unregistered.
++ 	 * Check again under the lock.
++ 	 */
++ 	if (refcount_read(&device->refcount) == 0 ||
++ 	    !net_eq(cur_net, read_pnet(&device->coredev.rdma_net))) {
++ 		ret = -ENODEV;
++ 		goto out;
++ 	}
++ 
++ 	kobject_uevent(&device->dev.kobj, KOBJ_REMOVE);
++ 	disable_device(device);
++ 
++ 	/*
++ 	 * At this point no one can be using the device, so it is safe to
++ 	 * change the namespace.
++ 	 */
++ 	write_pnet(&device->coredev.rdma_net, net);
++ 
++ 	down_read(&devices_rwsem);
++ 	/*
++ 	 * Currently rdma devices are system wide unique. So the device name
++ 	 * is guaranteed free in the new namespace. Publish the new namespace
++ 	 * at the sysfs level.
++ 	 */
++ 	ret = device_rename(&device->dev, dev_name(&device->dev));
++ 	up_read(&devices_rwsem);
++ 	if (ret) {
++ 		dev_warn(&device->dev,
++ 			 "%s: Couldn't rename device after namespace change\n",
++ 			 __func__);
++ 		/* Try and put things back and re-enable the device */
++ 		write_pnet(&device->coredev.rdma_net, cur_net);
++ 	}
++ 
++ 	ret2 = enable_device_and_get(device);
++ 	if (ret2) {
++ 		/*
++ 		 * This shouldn't really happen, but if it does, let the user
++ 		 * retry at later point. So don't disable the device.
++ 		 */
++ 		dev_warn(&device->dev,
++ 			 "%s: Couldn't re-enable device after namespace change\n",
++ 			 __func__);
++ 	}
++ 	kobject_uevent(&device->dev.kobj, KOBJ_ADD);
++ 
++ 	ib_device_put(device);
++ out:
++ 	mutex_unlock(&device->unregistration_lock);
++ 	if (ret)
++ 		return ret;
++ 	return ret2;
++ }
++ 
++ int ib_device_set_netns_put(struct sk_buff *skb,
++ 			    struct ib_device *dev, u32 ns_fd)
++ {
++ 	struct net *net;
++ 	int ret;
++ 
++ 	net = get_net_ns_by_fd(ns_fd);
++ 	if (IS_ERR(net)) {
++ 		ret = PTR_ERR(net);
++ 		goto net_err;
++ 	}
++ 
++ 	if (!netlink_ns_capable(skb, net->user_ns, CAP_NET_ADMIN)) {
++ 		ret = -EPERM;
++ 		goto ns_err;
++ 	}
++ 
++ 	/*
++ 	 * Currently supported only for those providers which support
++ 	 * disassociation and don't do port specific sysfs init. Once a
++ 	 * port_cleanup infrastructure is implemented, this limitation will be
++ 	 * removed.
++ 	 */
++ 	if (!dev->ops.disassociate_ucontext || dev->ops.init_port ||
++ 	    ib_devices_shared_netns) {
++ 		ret = -EOPNOTSUPP;
++ 		goto ns_err;
++ 	}
++ 
++ 	get_device(&dev->dev);
++ 	ib_device_put(dev);
++ 	ret = rdma_dev_change_netns(dev, current->nsproxy->net_ns, net);
++ 	put_device(&dev->dev);
++ 
++ 	put_net(net);
++ 	return ret;
++ 
++ ns_err:
++ 	put_net(net);
++ net_err:
++ 	ib_device_put(dev);
++ 	return ret;
++ }
++ 
++ static struct pernet_operations rdma_dev_net_ops = {
++ 	.init = rdma_dev_init_net,
++ 	.exit = rdma_dev_exit_net,
++ 	.id = &rdma_dev_net_id,
++ 	.size = sizeof(struct rdma_dev_net),
++ };
++ 
+++>>>>>>> 2e5b8a01165e (RDMA/core: Add a netlink command to change net namespace of rdma device)
+  static int assign_client_id(struct ib_client *client)
+  {
+  	int ret;
+diff --cc drivers/infiniband/core/nldev.c
+index efccd8e0fb77,bced945a456d..000000000000
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@@ -107,6 -109,17 +107,20 @@@ static const struct nla_policy nldev_po
+  	[RDMA_NLDEV_ATTR_DRIVER_U32]		= { .type = NLA_U32 },
+  	[RDMA_NLDEV_ATTR_DRIVER_S64]		= { .type = NLA_S64 },
+  	[RDMA_NLDEV_ATTR_DRIVER_U64]		= { .type = NLA_U64 },
+++<<<<<<< HEAD
+++=======
++ 	[RDMA_NLDEV_ATTR_RES_PDN]		= { .type = NLA_U32 },
++ 	[RDMA_NLDEV_ATTR_RES_CQN]               = { .type = NLA_U32 },
++ 	[RDMA_NLDEV_ATTR_RES_MRN]               = { .type = NLA_U32 },
++ 	[RDMA_NLDEV_ATTR_RES_CM_IDN]            = { .type = NLA_U32 },
++ 	[RDMA_NLDEV_ATTR_RES_CTXN]              = { .type = NLA_U32 },
++ 	[RDMA_NLDEV_ATTR_LINK_TYPE]		= { .type = NLA_NUL_STRING,
++ 				    .len = RDMA_NLDEV_ATTR_ENTRY_STRLEN },
++ 	[RDMA_NLDEV_SYS_ATTR_NETNS_MODE]	= { .type = NLA_U8 },
++ 	[RDMA_NLDEV_ATTR_DEV_PROTOCOL]		= { .type = NLA_NUL_STRING,
++ 				    .len = RDMA_NLDEV_ATTR_ENTRY_STRLEN },
++ 	[RDMA_NLDEV_NET_NS_FD]			= { .type = NLA_U32 },
+++>>>>>>> 2e5b8a01165e (RDMA/core: Add a netlink command to change net namespace of rdma device)
+  };
+  
+  static int put_driver_name_print_type(struct sk_buff *msg, const char *name,
+diff --cc include/uapi/rdma/rdma_netlink.h
+index a9d93ece538f,42a8bdc40a14..000000000000
+--- a/include/uapi/rdma/rdma_netlink.h
++++ b/include/uapi/rdma/rdma_netlink.h
+@@@ -446,6 -451,35 +446,38 @@@ enum rdma_nldev_attr 
+  	RDMA_NLDEV_ATTR_DRIVER_U64,		/* u64 */
+  
+  	/*
+++<<<<<<< HEAD
+++=======
++ 	 * Indexes to get/set secific entry,
++ 	 * for QP use RDMA_NLDEV_ATTR_RES_LQPN
++ 	 */
++ 	RDMA_NLDEV_ATTR_RES_PDN,               /* u32 */
++ 	RDMA_NLDEV_ATTR_RES_CQN,               /* u32 */
++ 	RDMA_NLDEV_ATTR_RES_MRN,               /* u32 */
++ 	RDMA_NLDEV_ATTR_RES_CM_IDN,            /* u32 */
++ 	RDMA_NLDEV_ATTR_RES_CTXN,	       /* u32 */
++ 	/*
++ 	 * Identifies the rdma driver. eg: "rxe" or "siw"
++ 	 */
++ 	RDMA_NLDEV_ATTR_LINK_TYPE,		/* string */
++ 
++ 	/*
++ 	 * net namespace mode for rdma subsystem:
++ 	 * either shared or exclusive among multiple net namespaces.
++ 	 */
++ 	RDMA_NLDEV_SYS_ATTR_NETNS_MODE,		/* u8 */
++ 	/*
++ 	 * Device protocol, e.g. ib, iw, usnic, roce and opa
++ 	 */
++ 	RDMA_NLDEV_ATTR_DEV_PROTOCOL,		/* string */
++ 
++ 	/*
++ 	 * File descriptor handle of the net namespace object
++ 	 */
++ 	RDMA_NLDEV_NET_NS_FD,			/* u32 */
++ 
++ 	/*
+++>>>>>>> 2e5b8a01165e (RDMA/core: Add a netlink command to change net namespace of rdma device)
+  	 * Always the end
+  	 */
+  	RDMA_NLDEV_ATTR_MAX
+* Unmerged path drivers/infiniband/core/core_priv.h
+* Unmerged path drivers/infiniband/core/device.c
+* Unmerged path drivers/infiniband/core/nldev.c
+* Unmerged path include/uapi/rdma/rdma_netlink.h
