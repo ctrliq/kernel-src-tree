@@ -1,0 +1,251 @@
+RDMA/rxe: Replace int num_qp by atomic_t qp_num
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Bob Pearson <rpearsonhpe@gmail.com>
+commit 8a99c81f1231786c364963a9f335eab2cca816a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/8a99c81f.failed
+
+Replace int num_qp in struct rxe_mcg by atomic_t qp_num.
+
+Link: https://lore.kernel.org/r/20220208211644.123457-5-rpearsonhpe@gmail.com
+	Signed-off-by: Bob Pearson <rpearsonhpe@gmail.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 8a99c81f1231786c364963a9f335eab2cca816a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe_mcast.c
+diff --cc drivers/infiniband/sw/rxe/rxe_mcast.c
+index 5f1c72c1473c,1995d24caa60..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_mcast.c
++++ b/drivers/infiniband/sw/rxe/rxe_mcast.c
+@@@ -98,26 -110,20 +98,38 @@@ int rxe_mcast_add_grp_elem(struct rxe_d
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (grp->num_qp >= rxe->attr.max_mcast_qp_attach) {
+++=======
++ 	/* check limits after checking if already attached */
++ 	if (atomic_inc_return(&mcg->qp_num) > rxe->attr.max_mcast_qp_attach) {
++ 		atomic_dec(&mcg->qp_num);
++ 		kfree(mca);
+++>>>>>>> 8a99c81f1231 (RDMA/rxe: Replace int num_qp by atomic_t qp_num)
+ +		err = -ENOMEM;
+ +		goto out;
+ +	}
+ +
+ +	elem = rxe_alloc_locked(&rxe->mc_elem_pool);
+ +	if (!elem) {
+  		err = -ENOMEM;
+  		goto out;
+  	}
+  
+ -	/* protect pointer to qp in mca */
+ -	rxe_add_ref(qp);
+ -	mca->qp = qp;
+++<<<<<<< HEAD
+ +	/* each qp holds a ref on the grp */
+ +	rxe_add_ref(grp);
+ +
+ +	grp->num_qp++;
+ +	elem->qp = qp;
+ +	elem->grp = grp;
+  
+ +	list_add(&elem->qp_list, &grp->qp_list);
+ +	list_add(&elem->grp_list, &qp->grp_list);
+++=======
++ 	atomic_inc(&qp->mcg_num);
++ 	list_add(&mca->qp_list, &mcg->qp_list);
+++>>>>>>> 8a99c81f1231 (RDMA/rxe: Replace int num_qp by atomic_t qp_num)
+  
+  	err = 0;
+  out:
+@@@ -126,72 -131,107 +138,129 @@@
+  	return err;
+  }
+  
+ -/* caller should be holding rxe->mcg_lock */
+ -static void __rxe_destroy_mcg(struct rxe_mcg *mcg)
+ -{
+ -	/* first remove mcg from red-black tree then drop ref */
+ -	rxe_drop_key_locked(mcg);
+ -	rxe_drop_ref(mcg);
+ -
+ -	rxe_mcast_delete(mcg->rxe, &mcg->mgid);
+ -}
+ -
+ -static void rxe_destroy_mcg(struct rxe_mcg *mcg)
+ +int rxe_mcast_drop_grp_elem(struct rxe_dev *rxe, struct rxe_qp *qp,
+ +			    union ib_gid *mgid)
+  {
+ -	struct rxe_dev *rxe = mcg->rxe;
+ -	unsigned long flags;
+ -
+ -	spin_lock_irqsave(&rxe->mcg_lock, flags);
+ -	__rxe_destroy_mcg(mcg);
+ -	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
+ -}
+ -
+ +	struct rxe_mc_grp *grp;
+ +	struct rxe_mc_elem *elem, *tmp;
+ +
+ +	grp = rxe_pool_get_key(&rxe->mc_grp_pool, mgid);
+ +	if (!grp)
+ +		goto err1;
+ +
+ +	spin_lock_bh(&qp->grp_lock);
+ +	spin_lock_bh(&grp->mcg_lock);
+ +
+ +	list_for_each_entry_safe(elem, tmp, &grp->qp_list, qp_list) {
+ +		if (elem->qp == qp) {
+ +			list_del(&elem->qp_list);
+ +			list_del(&elem->grp_list);
+ +			grp->num_qp--;
+ +
+++<<<<<<< HEAD
+ +			spin_unlock_bh(&grp->mcg_lock);
+ +			spin_unlock_bh(&qp->grp_lock);
+ +			rxe_drop_ref(elem);
+ +			rxe_drop_ref(grp);	/* ref held by QP */
+ +			rxe_drop_ref(grp);	/* ref from get_key */
+ +			return 0;
+++=======
++ void rxe_mc_cleanup(struct rxe_pool_elem *elem)
++ {
++ 	/* nothing left to do for now */
++ }
++ 
++ static int rxe_detach_mcg(struct rxe_dev *rxe, struct rxe_qp *qp,
++ 				   union ib_gid *mgid)
++ {
++ 	struct rxe_mcg *mcg;
++ 	struct rxe_mca *mca, *tmp;
++ 	unsigned long flags;
++ 	int err;
++ 
++ 	spin_lock_irqsave(&rxe->mcg_lock, flags);
++ 	mcg = rxe_pool_get_key_locked(&rxe->mc_grp_pool, mgid);
++ 	if (!mcg) {
++ 		/* we didn't find the mcast group for mgid */
++ 		err = -EINVAL;
++ 		goto out_unlock;
++ 	}
++ 
++ 	list_for_each_entry_safe(mca, tmp, &mcg->qp_list, qp_list) {
++ 		if (mca->qp == qp) {
++ 			list_del(&mca->qp_list);
++ 
++ 			/* if the number of qp's attached to the
++ 			 * mcast group falls to zero go ahead and
++ 			 * tear it down. This will not free the
++ 			 * object since we are still holding a ref
++ 			 * from the get key above.
++ 			 */
++ 			if (atomic_dec_return(&mcg->qp_num) <= 0)
++ 				__rxe_destroy_mcg(mcg);
++ 
++ 			atomic_dec(&qp->mcg_num);
++ 
++ 			/* drop the ref from get key. This will free the
++ 			 * object if num_qp is zero.
++ 			 */
++ 			rxe_drop_ref(mcg);
++ 			kfree(mca);
++ 			err = 0;
++ 			goto out_unlock;
+++>>>>>>> 8a99c81f1231 (RDMA/rxe: Replace int num_qp by atomic_t qp_num)
+  		}
+  	}
+  
+ -	/* we didn't find the qp on the list */
+ -	rxe_drop_ref(mcg);
+ -	err = -EINVAL;
+ -
+ -out_unlock:
+ -	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
+ -	return err;
+ +	spin_unlock_bh(&grp->mcg_lock);
+ +	spin_unlock_bh(&qp->grp_lock);
+ +	rxe_drop_ref(grp);			/* ref from get_key */
+ +err1:
+ +	return -EINVAL;
+  }
+  
+ -int rxe_attach_mcast(struct ib_qp *ibqp, union ib_gid *mgid, u16 mlid)
+ +void rxe_drop_all_mcast_groups(struct rxe_qp *qp)
+  {
+ -	int err;
+ -	struct rxe_dev *rxe = to_rdev(ibqp->device);
+ -	struct rxe_qp *qp = to_rqp(ibqp);
+ -	struct rxe_mcg *mcg;
+ -
+ -	/* takes a ref on mcg if successful */
+ -	mcg = rxe_get_mcg(rxe, mgid);
+ -	if (IS_ERR(mcg))
+ -		return PTR_ERR(mcg);
+ -
+ +	struct rxe_mc_grp *grp;
+ +	struct rxe_mc_elem *elem;
+ +
+ +	while (1) {
+ +		spin_lock_bh(&qp->grp_lock);
+ +		if (list_empty(&qp->grp_list)) {
+ +			spin_unlock_bh(&qp->grp_lock);
+ +			break;
+ +		}
+ +		elem = list_first_entry(&qp->grp_list, struct rxe_mc_elem,
+ +					grp_list);
+ +		list_del(&elem->grp_list);
+ +		spin_unlock_bh(&qp->grp_lock);
+ +
+++<<<<<<< HEAD
+ +		grp = elem->grp;
+ +		spin_lock_bh(&grp->mcg_lock);
+ +		list_del(&elem->qp_list);
+ +		grp->num_qp--;
+ +		spin_unlock_bh(&grp->mcg_lock);
+ +		rxe_drop_ref(grp);
+ +		rxe_drop_ref(elem);
+ +	}
+++=======
++ 	err = rxe_attach_mcg(rxe, qp, mcg);
++ 
++ 	/* if we failed to attach the first qp to mcg tear it down */
++ 	if (atomic_read(&mcg->qp_num) == 0)
++ 		rxe_destroy_mcg(mcg);
++ 
++ 	rxe_drop_ref(mcg);
++ 	return err;
+++>>>>>>> 8a99c81f1231 (RDMA/rxe: Replace int num_qp by atomic_t qp_num)
+  }
+  
+ -int rxe_detach_mcast(struct ib_qp *ibqp, union ib_gid *mgid, u16 mlid)
+ +void rxe_mc_cleanup(struct rxe_pool_entry *arg)
+  {
+ -	struct rxe_dev *rxe = to_rdev(ibqp->device);
+ -	struct rxe_qp *qp = to_rqp(ibqp);
+ +	struct rxe_mc_grp *grp = container_of(arg, typeof(*grp), pelem);
+ +	struct rxe_dev *rxe = grp->rxe;
+  
+ -	return rxe_detach_mcg(rxe, qp, mgid);
+ +	rxe_drop_key(grp);
+ +	rxe_mcast_delete(rxe, &grp->mgid);
+  }
+* Unmerged path drivers/infiniband/sw/rxe/rxe_mcast.c
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.h b/drivers/infiniband/sw/rxe/rxe_verbs.h
+index 2fd73c878e17..cfd8246b7aec 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.h
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.h
+@@ -360,7 +360,7 @@ struct rxe_mc_grp {
+ 	struct rxe_dev		*rxe;
+ 	struct list_head	qp_list;
+ 	union ib_gid		mgid;
+-	int			num_qp;
++	atomic_t		qp_num;
+ 	u32			qkey;
+ 	u16			pkey;
+ };
