@@ -1,0 +1,426 @@
+ALSA: firewire-lib: postpone to start IR context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Takashi Sakamoto <o-takashi@sakamocchi.jp>
+commit acfedcbe1ce4c69e1da914f39c02d945c80198d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/acfedcbe.failed
+
+Some devices have a quirk to postpone transmission of isoc packet for
+several dozen or hundred isoc cycles since configured to transmit.
+Furthermore, some devices have a quirk to transmit isoc packet with
+discontinued data of its header.
+
+In 1394 OHCI specification, software allows to start isoc context with
+certain isoc cycle. Linux firewire subsystem has kernel API to use it
+as well.
+
+This commit uses the functionality of 1394 OHCI controller to handle
+the quirks. At present, this feature is convenient to ALSA bebob and
+fireface driver. As a result, some devices can be safely handled, as
+long as I know:
+ - MAudio FireWire solo
+ - MAudio ProFire Lightbridge
+ - MAudio FireWire 410
+ - Roland FA-66
+
+	Signed-off-by: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+Link: https://lore.kernel.org/r/20191018061911.24909-7-o-takashi@sakamocchi.jp
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit acfedcbe1ce4c69e1da914f39c02d945c80198d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/firewire/amdtp-stream.c
+#	sound/firewire/amdtp-stream.h
+#	sound/firewire/fireworks/fireworks_stream.c
+diff --cc sound/firewire/amdtp-stream.c
+index 6e1b83a082a2,37d38efb4c87..000000000000
+--- a/sound/firewire/amdtp-stream.c
++++ b/sound/firewire/amdtp-stream.c
+@@@ -859,12 -981,19 +860,26 @@@ static void amdtp_stream_first_callback
+   * @s: the AMDTP stream to start
+   * @channel: the isochronous channel on the bus
+   * @speed: firewire speed code
+++<<<<<<< HEAD
+++=======
++  * @d: the AMDTP domain to which the AMDTP stream belongs
++  * @is_irq_target: whether isoc context for the AMDTP stream is used to generate
++  *		   hardware IRQ.
++  * @start_cycle: the isochronous cycle to start the context. Start immediately
++  *		 if negative value is given.
+++>>>>>>> acfedcbe1ce4 (ALSA: firewire-lib: postpone to start IR context)
+   *
+   * The stream cannot be started until it has been configured with
+   * amdtp_stream_set_parameters() and it must be started before any PCM or MIDI
+   * device can be started.
+   */
+++<<<<<<< HEAD
+ +static int amdtp_stream_start(struct amdtp_stream *s, int channel, int speed)
+++=======
++ static int amdtp_stream_start(struct amdtp_stream *s, int channel, int speed,
++ 			      struct amdtp_domain *d, bool is_irq_target,
++ 			      int start_cycle)
+++>>>>>>> acfedcbe1ce4 (ALSA: firewire-lib: postpone to start IR context)
+  {
+  	static const struct {
+  		unsigned int data_block;
+@@@ -1127,3 -1316,155 +1142,158 @@@ void amdtp_domain_destroy(struct amdtp_
+  	return;
+  }
+  EXPORT_SYMBOL_GPL(amdtp_domain_destroy);
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * amdtp_domain_add_stream - register isoc context into the domain.
++  * @d: the AMDTP domain.
++  * @s: the AMDTP stream.
++  * @channel: the isochronous channel on the bus.
++  * @speed: firewire speed code.
++  */
++ int amdtp_domain_add_stream(struct amdtp_domain *d, struct amdtp_stream *s,
++ 			    int channel, int speed)
++ {
++ 	struct amdtp_stream *tmp;
++ 
++ 	list_for_each_entry(tmp, &d->streams, list) {
++ 		if (s == tmp)
++ 			return -EBUSY;
++ 	}
++ 
++ 	list_add(&s->list, &d->streams);
++ 
++ 	s->channel = channel;
++ 	s->speed = speed;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(amdtp_domain_add_stream);
++ 
++ static int get_current_cycle_time(struct fw_card *fw_card, int *cur_cycle)
++ {
++ 	int generation;
++ 	int rcode;
++ 	__be32 reg;
++ 	u32 data;
++ 
++ 	// This is a request to local 1394 OHCI controller and expected to
++ 	// complete without any event waiting.
++ 	generation = fw_card->generation;
++ 	smp_rmb();	// node_id vs. generation.
++ 	rcode = fw_run_transaction(fw_card, TCODE_READ_QUADLET_REQUEST,
++ 				   fw_card->node_id, generation, SCODE_100,
++ 				   CSR_REGISTER_BASE + CSR_CYCLE_TIME,
++ 				   &reg, sizeof(reg));
++ 	if (rcode != RCODE_COMPLETE)
++ 		return -EIO;
++ 
++ 	data = be32_to_cpu(reg);
++ 	*cur_cycle = data >> 12;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * amdtp_domain_start - start sending packets for isoc context in the domain.
++  * @d: the AMDTP domain.
++  * @ir_delay_cycle: the cycle delay to start all IR contexts.
++  */
++ int amdtp_domain_start(struct amdtp_domain *d, unsigned int ir_delay_cycle)
++ {
++ 	struct amdtp_stream *s;
++ 	int cycle;
++ 	int err;
++ 
++ 	// Select an IT context as IRQ target.
++ 	list_for_each_entry(s, &d->streams, list) {
++ 		if (s->direction == AMDTP_OUT_STREAM)
++ 			break;
++ 	}
++ 	if (!s)
++ 		return -ENXIO;
++ 	d->irq_target = s;
++ 
++ 	if (ir_delay_cycle > 0) {
++ 		struct fw_card *fw_card = fw_parent_device(s->unit)->card;
++ 
++ 		err = get_current_cycle_time(fw_card, &cycle);
++ 		if (err < 0)
++ 			return err;
++ 
++ 		// No need to care overflow in cycle field because of enough
++ 		// width.
++ 		cycle += ir_delay_cycle;
++ 
++ 		// Round up to sec field.
++ 		if ((cycle & 0x00001fff) >= CYCLES_PER_SECOND) {
++ 			unsigned int sec;
++ 
++ 			// The sec field can overflow.
++ 			sec = (cycle & 0xffffe000) >> 13;
++ 			cycle = (++sec << 13) |
++ 				((cycle & 0x00001fff) / CYCLES_PER_SECOND);
++ 		}
++ 
++ 		// In OHCI 1394 specification, lower 2 bits are available for
++ 		// sec field.
++ 		cycle &= 0x00007fff;
++ 	} else {
++ 		cycle = -1;
++ 	}
++ 
++ 	list_for_each_entry(s, &d->streams, list) {
++ 		int cycle_match;
++ 
++ 		if (s->direction == AMDTP_IN_STREAM) {
++ 			cycle_match = cycle;
++ 		} else {
++ 			// IT context starts immediately.
++ 			cycle_match = -1;
++ 		}
++ 
++ 		if (s != d->irq_target) {
++ 			err = amdtp_stream_start(s, s->channel, s->speed, d,
++ 						 false, cycle_match);
++ 			if (err < 0)
++ 				goto error;
++ 		}
++ 	}
++ 
++ 	s = d->irq_target;
++ 	err = amdtp_stream_start(s, s->channel, s->speed, d, true, -1);
++ 	if (err < 0)
++ 		goto error;
++ 
++ 	return 0;
++ error:
++ 	list_for_each_entry(s, &d->streams, list)
++ 		amdtp_stream_stop(s);
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(amdtp_domain_start);
++ 
++ /**
++  * amdtp_domain_stop - stop sending packets for isoc context in the same domain.
++  * @d: the AMDTP domain to which the isoc contexts belong.
++  */
++ void amdtp_domain_stop(struct amdtp_domain *d)
++ {
++ 	struct amdtp_stream *s, *next;
++ 
++ 	if (d->irq_target)
++ 		amdtp_stream_stop(d->irq_target);
++ 
++ 	list_for_each_entry_safe(s, next, &d->streams, list) {
++ 		list_del(&s->list);
++ 
++ 		if (s != d->irq_target)
++ 			amdtp_stream_stop(s);
++ 	}
++ 
++ 	d->events_per_period = 0;
++ 	d->irq_target = NULL;
++ }
++ EXPORT_SYMBOL_GPL(amdtp_domain_stop);
+++>>>>>>> acfedcbe1ce4 (ALSA: firewire-lib: postpone to start IR context)
+diff --cc sound/firewire/amdtp-stream.h
+index 7032772c4f90,f2d44e2dc3c8..000000000000
+--- a/sound/firewire/amdtp-stream.h
++++ b/sound/firewire/amdtp-stream.h
+@@@ -270,4 -285,24 +270,27 @@@ struct amdtp_domain 
+  int amdtp_domain_init(struct amdtp_domain *d);
+  void amdtp_domain_destroy(struct amdtp_domain *d);
+  
+++<<<<<<< HEAD
+++=======
++ int amdtp_domain_add_stream(struct amdtp_domain *d, struct amdtp_stream *s,
++ 			    int channel, int speed);
++ 
++ int amdtp_domain_start(struct amdtp_domain *d, unsigned int ir_delay_cycle);
++ void amdtp_domain_stop(struct amdtp_domain *d);
++ 
++ static inline int amdtp_domain_set_events_per_period(struct amdtp_domain *d,
++ 						unsigned int events_per_period,
++ 						unsigned int events_per_buffer)
++ {
++ 	d->events_per_period = events_per_period;
++ 	d->events_per_buffer = events_per_buffer;
++ 
++ 	return 0;
++ }
++ 
++ unsigned long amdtp_domain_stream_pcm_pointer(struct amdtp_domain *d,
++ 					      struct amdtp_stream *s);
++ int amdtp_domain_stream_pcm_ack(struct amdtp_domain *d, struct amdtp_stream *s);
++ 
+++>>>>>>> acfedcbe1ce4 (ALSA: firewire-lib: postpone to start IR context)
+  #endif
+diff --cc sound/firewire/fireworks/fireworks_stream.c
+index 3987351e533c,2206af0fef42..000000000000
+--- a/sound/firewire/fireworks/fireworks_stream.c
++++ b/sound/firewire/fireworks/fireworks_stream.c
+@@@ -268,27 -263,25 +268,43 @@@ int snd_efw_stream_start_duplex(struct 
+  	if (err < 0)
+  		return err;
+  
+ +	if (amdtp_streaming_error(&efw->rx_stream) ||
+ +	    amdtp_streaming_error(&efw->tx_stream)) {
+ +		stop_stream(efw, &efw->rx_stream);
+ +		stop_stream(efw, &efw->tx_stream);
+ +	}
+ +
+ +	/* master should be always running */
+  	if (!amdtp_stream_running(&efw->rx_stream)) {
+  		err = start_stream(efw, &efw->rx_stream, rate);
+ -		if (err < 0)
+ +		if (err < 0) {
+ +			dev_err(&efw->unit->device,
+ +				"fail to start AMDTP master stream:%d\n", err);
+  			goto error;
+ +		}
+ +	}
+  
+ +	if (!amdtp_stream_running(&efw->tx_stream)) {
+  		err = start_stream(efw, &efw->tx_stream, rate);
+++<<<<<<< HEAD
+ +		if (err < 0) {
+ +			dev_err(&efw->unit->device,
+ +				"fail to start AMDTP slave stream:%d\n", err);
+++=======
++ 		if (err < 0)
++ 			goto error;
++ 
++ 		err = amdtp_domain_start(&efw->domain, 0);
++ 		if (err < 0)
++ 			goto error;
++ 
++ 		// Wait first callback.
++ 		if (!amdtp_stream_wait_callback(&efw->rx_stream,
++ 						CALLBACK_TIMEOUT) ||
++ 		    !amdtp_stream_wait_callback(&efw->tx_stream,
++ 						CALLBACK_TIMEOUT)) {
++ 			err = -ETIMEDOUT;
+++>>>>>>> acfedcbe1ce4 (ALSA: firewire-lib: postpone to start IR context)
+  			goto error;
+  		}
+  	}
+* Unmerged path sound/firewire/amdtp-stream.c
+* Unmerged path sound/firewire/amdtp-stream.h
+diff --git a/sound/firewire/bebob/bebob_stream.c b/sound/firewire/bebob/bebob_stream.c
+index f1db3ddc3e00..dce397119dbb 100644
+--- a/sound/firewire/bebob/bebob_stream.c
++++ b/sound/firewire/bebob/bebob_stream.c
+@@ -657,7 +657,15 @@ int snd_bebob_stream_start_duplex(struct snd_bebob *bebob)
+ 		if (err < 0)
+ 			goto error;
+ 
+-		err = amdtp_domain_start(&bebob->domain);
++		// The device postpones start of transmission mostly for 1 sec
++		// after receives packets firstly. For safe, IR context starts
++		// 1.5 sec (=12000 cycles) later. This is within 2.0 sec
++		// (=CALLBACK_TIMEOUT).
++		// Furthermore, some devices transfer isoc packets with
++		// discontinuous counter in the beginning of packet streaming.
++		// The delay has an effect to avoid detection of this
++		// discontinuity.
++		err = amdtp_domain_start(&bebob->domain, 12000);
+ 		if (err < 0)
+ 			goto error;
+ 
+diff --git a/sound/firewire/dice/dice-stream.c b/sound/firewire/dice/dice-stream.c
+index ef36bf588d11..a0c631f334e1 100644
+--- a/sound/firewire/dice/dice-stream.c
++++ b/sound/firewire/dice/dice-stream.c
+@@ -461,7 +461,7 @@ int snd_dice_stream_start_duplex(struct snd_dice *dice)
+ 			goto error;
+ 		}
+ 
+-		err = amdtp_domain_start(&dice->domain);
++		err = amdtp_domain_start(&dice->domain, 0);
+ 		if (err < 0)
+ 			goto error;
+ 
+diff --git a/sound/firewire/digi00x/digi00x-stream.c b/sound/firewire/digi00x/digi00x-stream.c
+index 96d331e47b07..6df787f7ba2a 100644
+--- a/sound/firewire/digi00x/digi00x-stream.c
++++ b/sound/firewire/digi00x/digi00x-stream.c
+@@ -374,7 +374,7 @@ int snd_dg00x_stream_start_duplex(struct snd_dg00x *dg00x)
+ 		if (err < 0)
+ 			goto error;
+ 
+-		err = amdtp_domain_start(&dg00x->domain);
++		err = amdtp_domain_start(&dg00x->domain, 0);
+ 		if (err < 0)
+ 			goto error;
+ 
+diff --git a/sound/firewire/fireface/ff-stream.c b/sound/firewire/fireface/ff-stream.c
+index d05e7d3055e1..f00207f8b305 100644
+--- a/sound/firewire/fireface/ff-stream.c
++++ b/sound/firewire/fireface/ff-stream.c
+@@ -183,6 +183,7 @@ int snd_ff_stream_start_duplex(struct snd_ff *ff, unsigned int rate)
+ 	 */
+ 	if (!amdtp_stream_running(&ff->rx_stream)) {
+ 		int spd = fw_parent_device(ff->unit)->max_speed;
++		unsigned int ir_delay_cycle;
+ 
+ 		err = ff->spec->protocol->begin_session(ff, rate);
+ 		if (err < 0)
+@@ -198,7 +199,14 @@ int snd_ff_stream_start_duplex(struct snd_ff *ff, unsigned int rate)
+ 		if (err < 0)
+ 			goto error;
+ 
+-		err = amdtp_domain_start(&ff->domain);
++		// The device postpones start of transmission mostly for several
++		// cycles after receiving packets firstly.
++		if (ff->spec->protocol == &snd_ff_protocol_ff800)
++			ir_delay_cycle = 800;	// = 100 msec
++		else
++			ir_delay_cycle = 16;	// = 2 msec
++
++		err = amdtp_domain_start(&ff->domain, ir_delay_cycle);
+ 		if (err < 0)
+ 			goto error;
+ 
+* Unmerged path sound/firewire/fireworks/fireworks_stream.c
+diff --git a/sound/firewire/motu/motu-stream.c b/sound/firewire/motu/motu-stream.c
+index 52b7c375bb0b..ee1478a1db58 100644
+--- a/sound/firewire/motu/motu-stream.c
++++ b/sound/firewire/motu/motu-stream.c
+@@ -259,7 +259,7 @@ int snd_motu_stream_start_duplex(struct snd_motu *motu)
+ 		if (err < 0)
+ 			goto stop_streams;
+ 
+-		err = amdtp_domain_start(&motu->domain);
++		err = amdtp_domain_start(&motu->domain, 0);
+ 		if (err < 0)
+ 			goto stop_streams;
+ 
+diff --git a/sound/firewire/oxfw/oxfw-stream.c b/sound/firewire/oxfw/oxfw-stream.c
+index 7d2e88c5b73d..978a4b4afcc7 100644
+--- a/sound/firewire/oxfw/oxfw-stream.c
++++ b/sound/firewire/oxfw/oxfw-stream.c
+@@ -354,7 +354,7 @@ int snd_oxfw_stream_start_duplex(struct snd_oxfw *oxfw)
+ 			}
+ 		}
+ 
+-		err = amdtp_domain_start(&oxfw->domain);
++		err = amdtp_domain_start(&oxfw->domain, 0);
+ 		if (err < 0)
+ 			goto error;
+ 
+diff --git a/sound/firewire/tascam/tascam-stream.c b/sound/firewire/tascam/tascam-stream.c
+index 8c04a0ad17d9..918ce1e1c592 100644
+--- a/sound/firewire/tascam/tascam-stream.c
++++ b/sound/firewire/tascam/tascam-stream.c
+@@ -472,7 +472,7 @@ int snd_tscm_stream_start_duplex(struct snd_tscm *tscm, unsigned int rate)
+ 		if (err < 0)
+ 			goto error;
+ 
+-		err = amdtp_domain_start(&tscm->domain);
++		err = amdtp_domain_start(&tscm->domain, 0);
+ 		if (err < 0)
+ 			return err;
+ 
