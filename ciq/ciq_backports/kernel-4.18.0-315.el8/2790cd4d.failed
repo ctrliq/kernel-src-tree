@@ -1,0 +1,569 @@
+scsi: smartpqi: Update OFA management
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Kevin Barnett <kevin.barnett@microchip.com>
+commit 2790cd4d3f6ac5a761b0e3851fce2e75490b5051
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/2790cd4d.failed
+
+OFA, Online Firmware Activation, allows users to update firmware without a
+reboot.
+
+ - Change OFA setup to a worker thread
+
+ - Delay soft resets
+
+ - Add OFA event handler to allow FW to initiate OFA
+
+ - Add in-memory allocation to OFA events
+
+ - Update OFA buffer size calculations
+
+ - Add ability to cancel OFA events
+
+ - Update OFA quiesce/un-quiesce
+
+ - Prevent Kernel crashes while issuing ioctl during OFA
+
+ - Returned EBUSY for pass-through IOCTLs throughout all stages of OFA
+
+ - Add mutex to prevent parallel OFA updates.
+
+Link: https://lore.kernel.org/r/161549381563.25025.2647205502550052197.stgit@brunhilda
+	Reviewed-by: Scott Benesh <scott.benesh@microchip.com>
+	Reviewed-by: Scott Teel <scott.teel@microchip.com>
+	Signed-off-by: Kevin Barnett <kevin.barnett@microchip.com>
+	Signed-off-by: Don Brace <don.brace@microchip.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 2790cd4d3f6ac5a761b0e3851fce2e75490b5051)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/smartpqi/smartpqi.h
+#	drivers/scsi/smartpqi/smartpqi_init.c
+diff --cc drivers/scsi/smartpqi/smartpqi.h
+index 8759c807d025,0b94c755a74c..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi.h
++++ b/drivers/scsi/smartpqi/smartpqi.h
+@@@ -1187,10 -1337,7 +1177,14 @@@ struct pqi_ctrl_info 
+  	atomic_t	num_blocked_threads;
+  	wait_queue_head_t block_requests_wait;
+  
+++<<<<<<< HEAD
+ +	struct list_head raid_bypass_retry_list;
+ +	spinlock_t	raid_bypass_retry_list_lock;
+ +	struct work_struct raid_bypass_retry_work;
+ +
+++=======
++ 	struct mutex	ofa_mutex;
+++>>>>>>> 2790cd4d3f6a (scsi: smartpqi: Update OFA management)
+  	struct pqi_ofa_memory *pqi_ofa_mem_virt_addr;
+  	dma_addr_t	pqi_ofa_mem_dma_handle;
+  	void		**pqi_ofa_chunk_virt_addr;
+diff --cc drivers/scsi/smartpqi/smartpqi_init.c
+index 20dab6ad8e02,89b6972a21f6..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@@ -66,11 -69,18 +69,10 @@@ static int pqi_aio_submit_io(struct pqi
+  	struct scsi_cmnd *scmd, u32 aio_handle, u8 *cdb,
+  	unsigned int cdb_length, struct pqi_queue_group *queue_group,
+  	struct pqi_encryption_info *encryption_info, bool raid_bypass);
+ -static  int pqi_aio_submit_r1_write_io(struct pqi_ctrl_info *ctrl_info,
+ -	struct scsi_cmnd *scmd, struct pqi_queue_group *queue_group,
+ -	struct pqi_encryption_info *encryption_info, struct pqi_scsi_dev *device,
+ -	struct pqi_scsi_dev_raid_map_data *rmd);
+ -static int pqi_aio_submit_r56_write_io(struct pqi_ctrl_info *ctrl_info,
+ -	struct scsi_cmnd *scmd, struct pqi_queue_group *queue_group,
+ -	struct pqi_encryption_info *encryption_info, struct pqi_scsi_dev *device,
+ -	struct pqi_scsi_dev_raid_map_data *rmd);
+  static void pqi_ofa_ctrl_quiesce(struct pqi_ctrl_info *ctrl_info);
+  static void pqi_ofa_ctrl_unquiesce(struct pqi_ctrl_info *ctrl_info);
+- static int pqi_ofa_ctrl_restart(struct pqi_ctrl_info *ctrl_info);
+- static void pqi_ofa_setup_host_buffer(struct pqi_ctrl_info *ctrl_info,
+- 	u32 bytes_requested);
++ static int pqi_ofa_ctrl_restart(struct pqi_ctrl_info *ctrl_info, unsigned int delay_secs);
++ static void pqi_ofa_setup_host_buffer(struct pqi_ctrl_info *ctrl_info);
+  static void pqi_ofa_free_host_buffer(struct pqi_ctrl_info *ctrl_info);
+  static int pqi_ofa_host_memory_update(struct pqi_ctrl_info *ctrl_info);
+  static int pqi_device_wait_for_pending_io(struct pqi_ctrl_info *ctrl_info,
+@@@ -388,18 -378,24 +391,24 @@@ static inline bool pqi_device_in_remove
+  	return device->in_remove;
+  }
+  
+- static inline void pqi_ctrl_shutdown_start(struct pqi_ctrl_info *ctrl_info)
++ static inline int pqi_event_type_to_event_index(unsigned int event_type)
+  {
+- 	ctrl_info->in_shutdown = true;
++ 	int index;
++ 
++ 	for (index = 0; index < ARRAY_SIZE(pqi_supported_event_types); index++)
++ 		if (event_type == pqi_supported_event_types[index])
++ 			return index;
++ 
++ 	return -1;
+  }
+  
+- static inline bool pqi_ctrl_in_shutdown(struct pqi_ctrl_info *ctrl_info)
++ static inline bool pqi_is_supported_event(unsigned int event_type)
+  {
+- 	return ctrl_info->in_shutdown;
++ 	return pqi_event_type_to_event_index(event_type) != -1;
+  }
+  
+ -static inline void pqi_schedule_rescan_worker_with_delay(struct pqi_ctrl_info *ctrl_info,
+ -	unsigned long delay)
+ +static inline void pqi_schedule_rescan_worker_with_delay(
+ +	struct pqi_ctrl_info *ctrl_info, unsigned long delay)
+  {
+  	if (pqi_ctrl_offline(ctrl_info))
+  		return;
+@@@ -1889,12 -1989,21 +1896,22 @@@ static void pqi_update_device_list(stru
+  
+  	spin_unlock_irqrestore(&ctrl_info->scsi_device_list_lock, flags);
+  
+- 	if (pqi_ctrl_in_ofa(ctrl_info))
+- 		pqi_ctrl_ofa_done(ctrl_info);
++ 	/*
++ 	 * If OFA is in progress and there are devices that need to be deleted,
++ 	 * allow any pending reset operations to continue and unblock any SCSI
++ 	 * requests before removal.
++ 	 */
++ 	if (pqi_ofa_in_progress(ctrl_info)) {
++ 		list_for_each_entry_safe(device, next, &delete_list, delete_list_entry)
++ 			if (pqi_is_device_added(device))
++ 				pqi_device_remove_start(device);
++ 		pqi_ctrl_unblock_device_reset(ctrl_info);
++ 		pqi_scsi_unblock_requests(ctrl_info);
++ 	}
+  
+  	/* Remove all devices that have gone away. */
+ -	list_for_each_entry_safe(device, next, &delete_list, delete_list_entry) {
+ +	list_for_each_entry_safe(device, next, &delete_list,
+ +		delete_list_entry) {
+  		if (device->volume_offline) {
+  			pqi_dev_info(ctrl_info, "offline", device);
+  			pqi_show_volume_status(ctrl_info, device);
+@@@ -2263,27 -2351,8 +2278,32 @@@ static int pqi_scan_finished(struct Scs
+  	return !mutex_is_locked(&ctrl_info->scan_mutex);
+  }
+  
+++<<<<<<< HEAD
+ +static void pqi_wait_until_scan_finished(struct pqi_ctrl_info *ctrl_info)
+ +{
+ +	mutex_lock(&ctrl_info->scan_mutex);
+ +	mutex_unlock(&ctrl_info->scan_mutex);
+ +}
+ +
+ +static void pqi_wait_until_lun_reset_finished(struct pqi_ctrl_info *ctrl_info)
+ +{
+ +	mutex_lock(&ctrl_info->lun_reset_mutex);
+ +	mutex_unlock(&ctrl_info->lun_reset_mutex);
+ +}
+ +
+ +static void pqi_wait_until_ofa_finished(struct pqi_ctrl_info *ctrl_info)
+ +{
+ +	mutex_lock(&ctrl_info->ofa_mutex);
+ +	mutex_unlock(&ctrl_info->ofa_mutex);
+ +}
+ +
+ +static inline void pqi_set_encryption_info(
+ +	struct pqi_encryption_info *encryption_info, struct raid_map *raid_map,
+ +	u64 first_block)
+++=======
++ static inline void pqi_set_encryption_info(struct pqi_encryption_info *encryption_info,
++ 	struct raid_map *raid_map, u64 first_block)
+++>>>>>>> 2790cd4d3f6a (scsi: smartpqi: Update OFA management)
+  {
+  	u32 volume_blk_size;
+  
+@@@ -3163,77 -3314,120 +3183,148 @@@ static enum pqi_soft_reset_status pqi_p
+  	}
+  }
+  
+ -static void pqi_process_soft_reset(struct pqi_ctrl_info *ctrl_info)
+ +static void pqi_process_soft_reset(struct pqi_ctrl_info *ctrl_info,
+ +	enum pqi_soft_reset_status reset_status)
+  {
+  	int rc;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int delay_secs;
++ 	enum pqi_soft_reset_status reset_status;
++ 
++ 	if (ctrl_info->soft_reset_handshake_supported)
++ 		reset_status = pqi_poll_for_soft_reset_status(ctrl_info);
++ 	else
++ 		reset_status = RESET_INITIATE_FIRMWARE;
+++>>>>>>> 2790cd4d3f6a (scsi: smartpqi: Update OFA management)
++ 
++ 	delay_secs = PQI_POST_RESET_DELAY_SECS;
+  
+  	switch (reset_status) {
+++<<<<<<< HEAD
+++=======
++ 	case RESET_TIMEDOUT:
++ 		delay_secs = PQI_POST_OFA_RESET_DELAY_UPON_TIMEOUT_SECS;
++ 		fallthrough;
+++>>>>>>> 2790cd4d3f6a (scsi: smartpqi: Update OFA management)
+  	case RESET_INITIATE_DRIVER:
+ +		/* fall through */
+ +	case RESET_TIMEDOUT:
+  		dev_info(&ctrl_info->pci_dev->dev,
+ -				"Online Firmware Activation: resetting controller\n");
+ +			"resetting controller %u\n", ctrl_info->ctrl_id);
+  		sis_soft_reset(ctrl_info);
+ -		fallthrough;
+ +		/* fall through */
+  	case RESET_INITIATE_FIRMWARE:
+++<<<<<<< HEAD
+ +		rc = pqi_ofa_ctrl_restart(ctrl_info);
+++=======
++ 		ctrl_info->pqi_mode_enabled = false;
++ 		pqi_save_ctrl_mode(ctrl_info, SIS_MODE);
++ 		rc = pqi_ofa_ctrl_restart(ctrl_info, delay_secs);
+++>>>>>>> 2790cd4d3f6a (scsi: smartpqi: Update OFA management)
+  		pqi_ofa_free_host_buffer(ctrl_info);
+ -		pqi_ctrl_ofa_done(ctrl_info);
+  		dev_info(&ctrl_info->pci_dev->dev,
+ -				"Online Firmware Activation: %s\n",
+ -				rc == 0 ? "SUCCESS" : "FAILED");
+ +			"Online Firmware Activation for controller %u: %s\n",
+ +			ctrl_info->ctrl_id, rc == 0 ? "SUCCESS" : "FAILED");
+  		break;
+  	case RESET_ABORT:
+ -		dev_info(&ctrl_info->pci_dev->dev,
+ -				"Online Firmware Activation ABORTED\n");
+ -		if (ctrl_info->soft_reset_handshake_supported)
+ -			pqi_clear_soft_reset_status(ctrl_info);
+ -		pqi_ofa_free_host_buffer(ctrl_info);
+ -		pqi_ctrl_ofa_done(ctrl_info);
+  		pqi_ofa_ctrl_unquiesce(ctrl_info);
+ +		dev_info(&ctrl_info->pci_dev->dev,
+ +			"Online Firmware Activation for controller %u: %s\n",
+ +			ctrl_info->ctrl_id, "ABORTED");
+  		break;
+  	case RESET_NORESPONSE:
+ -		fallthrough;
+ -	default:
+ -		dev_err(&ctrl_info->pci_dev->dev,
+ -			"unexpected Online Firmware Activation reset status: 0x%x\n",
+ -			reset_status);
+  		pqi_ofa_free_host_buffer(ctrl_info);
+ -		pqi_ctrl_ofa_done(ctrl_info);
+ -		pqi_ofa_ctrl_unquiesce(ctrl_info);
+  		pqi_take_ctrl_offline(ctrl_info);
+  		break;
+  	}
+  }
+  
+- static void pqi_ofa_process_event(struct pqi_ctrl_info *ctrl_info,
++ static void pqi_ofa_memory_alloc_worker(struct work_struct *work)
++ {
++ 	struct pqi_ctrl_info *ctrl_info;
++ 
++ 	ctrl_info = container_of(work, struct pqi_ctrl_info, ofa_memory_alloc_work);
++ 
++ 	pqi_ctrl_ofa_start(ctrl_info);
++ 	pqi_ofa_setup_host_buffer(ctrl_info);
++ 	pqi_ofa_host_memory_update(ctrl_info);
++ }
++ 
++ static void pqi_ofa_quiesce_worker(struct work_struct *work)
++ {
++ 	struct pqi_ctrl_info *ctrl_info;
++ 	struct pqi_event *event;
++ 
++ 	ctrl_info = container_of(work, struct pqi_ctrl_info, ofa_quiesce_work);
++ 
++ 	event = &ctrl_info->events[pqi_event_type_to_event_index(PQI_EVENT_TYPE_OFA)];
++ 
++ 	pqi_ofa_ctrl_quiesce(ctrl_info);
++ 	pqi_acknowledge_event(ctrl_info, event);
++ 	pqi_process_soft_reset(ctrl_info);
++ }
++ 
++ static bool pqi_ofa_process_event(struct pqi_ctrl_info *ctrl_info,
+  	struct pqi_event *event)
+  {
+++<<<<<<< HEAD
+ +	u16 event_id;
+ +	enum pqi_soft_reset_status status;
+++=======
++ 	bool ack_event;
+++>>>>>>> 2790cd4d3f6a (scsi: smartpqi: Update OFA management)
+  
+- 	event_id = get_unaligned_le16(&event->event_id);
++ 	ack_event = true;
+  
+- 	mutex_lock(&ctrl_info->ofa_mutex);
+- 
+- 	if (event_id == PQI_EVENT_OFA_QUIESCE) {
++ 	switch (event->event_id) {
++ 	case PQI_EVENT_OFA_MEMORY_ALLOCATION:
+  		dev_info(&ctrl_info->pci_dev->dev,
+++<<<<<<< HEAD
+ +			"Received Online Firmware Activation quiesce event for controller %u\n",
+ +			ctrl_info->ctrl_id);
+ +		pqi_ofa_ctrl_quiesce(ctrl_info);
+ +		pqi_acknowledge_event(ctrl_info, event);
+ +		if (ctrl_info->soft_reset_handshake_supported) {
+ +			status = pqi_poll_for_soft_reset_status(ctrl_info);
+ +			pqi_process_soft_reset(ctrl_info, status);
+ +		} else {
+ +			pqi_process_soft_reset(ctrl_info,
+ +					RESET_INITIATE_FIRMWARE);
+ +		}
+ +
+ +	} else if (event_id == PQI_EVENT_OFA_MEMORY_ALLOCATION) {
+ +		pqi_acknowledge_event(ctrl_info, event);
+ +		pqi_ofa_setup_host_buffer(ctrl_info,
+ +			le32_to_cpu(event->ofa_bytes_requested));
+ +		pqi_ofa_host_memory_update(ctrl_info);
+ +	} else if (event_id == PQI_EVENT_OFA_CANCELLED) {
+- 		pqi_ofa_free_host_buffer(ctrl_info);
+- 		pqi_acknowledge_event(ctrl_info, event);
+++=======
++ 			"received Online Firmware Activation memory allocation request\n");
++ 		schedule_work(&ctrl_info->ofa_memory_alloc_work);
++ 		break;
++ 	case PQI_EVENT_OFA_QUIESCE:
++ 		dev_info(&ctrl_info->pci_dev->dev,
++ 			"received Online Firmware Activation quiesce request\n");
++ 		schedule_work(&ctrl_info->ofa_quiesce_work);
++ 		ack_event = false;
++ 		break;
++ 	case PQI_EVENT_OFA_CANCELED:
+  		dev_info(&ctrl_info->pci_dev->dev,
+- 			"Online Firmware Activation(%u) cancel reason : %u\n",
+- 			ctrl_info->ctrl_id, event->ofa_cancel_reason);
++ 			"received Online Firmware Activation cancel request: reason: %u\n",
++ 			ctrl_info->ofa_cancel_reason);
+++>>>>>>> 2790cd4d3f6a (scsi: smartpqi: Update OFA management)
++ 		pqi_ofa_free_host_buffer(ctrl_info);
++ 		pqi_ctrl_ofa_done(ctrl_info);
++ 		break;
++ 	default:
++ 		dev_err(&ctrl_info->pci_dev->dev,
++ 			"received unknown Online Firmware Activation request: event ID: %u\n",
++ 			event->event_id);
++ 		break;
+  	}
+  
+- 	mutex_unlock(&ctrl_info->ofa_mutex);
++ 	return ack_event;
+  }
+  
+  static void pqi_event_worker(struct work_struct *work)
+@@@ -3322,37 -3521,18 +3419,50 @@@ static inline void pqi_stop_heartbeat_t
+  	del_timer_sync(&ctrl_info->heartbeat_timer);
+  }
+  
+- static inline int pqi_event_type_to_event_index(unsigned int event_type)
++ static void pqi_ofa_capture_event_payload(struct pqi_ctrl_info *ctrl_info,
++ 	struct pqi_event *event, struct pqi_event_response *response)
+  {
+++<<<<<<< HEAD
+ +	int index;
+ +
+ +	for (index = 0; index < ARRAY_SIZE(pqi_supported_event_types); index++)
+ +		if (event_type == pqi_supported_event_types[index])
+ +			return index;
+ +
+ +	return -1;
+ +}
+ +
+ +static inline bool pqi_is_supported_event(unsigned int event_type)
+ +{
+ +	return pqi_event_type_to_event_index(event_type) != -1;
+ +}
+ +
+ +static void pqi_ofa_capture_event_payload(struct pqi_event *event,
+ +	struct pqi_event_response *response)
+ +{
+ +	u16 event_id;
+ +
+ +	event_id = get_unaligned_le16(&event->event_id);
+ +
+ +	if (event->event_type == PQI_EVENT_TYPE_OFA) {
+ +		if (event_id == PQI_EVENT_OFA_MEMORY_ALLOCATION) {
+ +			event->ofa_bytes_requested =
+ +			response->data.ofa_memory_allocation.bytes_requested;
+ +		} else if (event_id == PQI_EVENT_OFA_CANCELLED) {
+ +			event->ofa_cancel_reason =
+ +			response->data.ofa_cancelled.reason;
+ +		}
+++=======
++ 	switch (event->event_id) {
++ 	case PQI_EVENT_OFA_MEMORY_ALLOCATION:
++ 		ctrl_info->ofa_bytes_requested =
++ 			get_unaligned_le32(&response->data.ofa_memory_allocation.bytes_requested);
++ 		break;
++ 	case PQI_EVENT_OFA_CANCELED:
++ 		ctrl_info->ofa_cancel_reason =
++ 			get_unaligned_le16(&response->data.ofa_cancelled.reason);
++ 		break;
+++>>>>>>> 2790cd4d3f6a (scsi: smartpqi: Update OFA management)
+  	}
+  }
+  
+@@@ -7708,32 -8226,21 +7819,28 @@@ static void pqi_ofa_ctrl_quiesce(struc
+  
+  static void pqi_ofa_ctrl_unquiesce(struct pqi_ctrl_info *ctrl_info)
+  {
+- 	pqi_ofa_free_host_buffer(ctrl_info);
+- 	ctrl_info->pqi_mode_enabled = true;
+- 	pqi_save_ctrl_mode(ctrl_info, PQI_MODE);
+- 	ctrl_info->controller_online = true;
+- 	pqi_ctrl_unblock_requests(ctrl_info);
+  	pqi_start_heartbeat_timer(ctrl_info);
+++<<<<<<< HEAD
+ +	pqi_schedule_update_time_worker(ctrl_info);
+ +	pqi_clear_soft_reset_status(ctrl_info,
+ +		PQI_SOFT_RESET_ABORT);
+ +	pqi_scan_scsi_devices(ctrl_info);
+++=======
++ 	pqi_ctrl_unblock_requests(ctrl_info);
++ 	pqi_ctrl_unblock_device_reset(ctrl_info);
++ 	pqi_scsi_unblock_requests(ctrl_info);
++ 	pqi_ctrl_unblock_scan(ctrl_info);
+++>>>>>>> 2790cd4d3f6a (scsi: smartpqi: Update OFA management)
+  }
+  
+- static int pqi_ofa_alloc_mem(struct pqi_ctrl_info *ctrl_info,
+- 	u32 total_size, u32 chunk_size)
++ static int pqi_ofa_alloc_mem(struct pqi_ctrl_info *ctrl_info, u32 total_size, u32 chunk_size)
+  {
+- 	u32 sg_count;
+- 	u32 size;
+  	int i;
+- 	struct pqi_sg_descriptor *mem_descriptor = NULL;
++ 	u32 sg_count;
+  	struct device *dev;
+  	struct pqi_ofa_memory *ofap;
+- 
+- 	dev = &ctrl_info->pci_dev->dev;
+- 
+- 	sg_count = (total_size + chunk_size - 1);
+- 	sg_count /= chunk_size;
++ 	struct pqi_sg_descriptor *mem_descriptor;
++ 	dma_addr_t dma_handle;
+  
+  	ofap = ctrl_info->pqi_ofa_mem_virt_addr;
+  
+@@@ -7745,27 -8252,21 +7852,27 @@@
+  	if (!ctrl_info->pqi_ofa_chunk_virt_addr)
+  		goto out;
+  
+- 	for (size = 0, i = 0; size < total_size; size += chunk_size, i++) {
+- 		dma_addr_t dma_handle;
++ 	dev = &ctrl_info->pci_dev->dev;
+  
++ 	for (i = 0; i < sg_count; i++) {
+  		ctrl_info->pqi_ofa_chunk_virt_addr[i] =
+++<<<<<<< HEAD
+ +			dma_zalloc_coherent(dev, chunk_size, &dma_handle,
+ +						GFP_KERNEL);
+ +
+++=======
++ 			dma_alloc_coherent(dev, chunk_size, &dma_handle, GFP_KERNEL);
+++>>>>>>> 2790cd4d3f6a (scsi: smartpqi: Update OFA management)
+  		if (!ctrl_info->pqi_ofa_chunk_virt_addr[i])
+- 			break;
+- 
++ 			goto out_free_chunks;
+  		mem_descriptor = &ofap->sg_descriptor[i];
+ -		put_unaligned_le64((u64)dma_handle, &mem_descriptor->address);
+ -		put_unaligned_le32(chunk_size, &mem_descriptor->length);
+ +		put_unaligned_le64 ((u64) dma_handle, &mem_descriptor->address);
+ +		put_unaligned_le32 (chunk_size, &mem_descriptor->length);
+  	}
+  
+- 	if (!size || size < total_size)
+- 		goto out_free_chunks;
+- 
+  	put_unaligned_le32(CISS_SG_LAST, &mem_descriptor->flags);
+  	put_unaligned_le16(sg_count, &ofap->num_memory_descriptors);
+- 	put_unaligned_le32(size, &ofap->bytes_allocated);
++ 	put_unaligned_le32(sg_count * chunk_size, &ofap->bytes_allocated);
+  
+  	return 0;
+  
+@@@ -7800,34 -8306,30 +7912,37 @@@ static int pqi_ofa_alloc_host_buffer(st
+  	return -ENOMEM;
+  }
+  
+- static void pqi_ofa_setup_host_buffer(struct pqi_ctrl_info *ctrl_info,
+- 	u32 bytes_requested)
++ static void pqi_ofa_setup_host_buffer(struct pqi_ctrl_info *ctrl_info)
+  {
+- 	struct pqi_ofa_memory *pqi_ofa_memory;
+  	struct device *dev;
++ 	struct pqi_ofa_memory *ofap;
+  
+  	dev = &ctrl_info->pci_dev->dev;
+++<<<<<<< HEAD
+ +	pqi_ofa_memory = dma_zalloc_coherent(dev,
+ +				PQI_OFA_MEMORY_DESCRIPTOR_LENGTH,
+ +				&ctrl_info->pqi_ofa_mem_dma_handle,
+ +				GFP_KERNEL);
+++=======
+++>>>>>>> 2790cd4d3f6a (scsi: smartpqi: Update OFA management)
+  
+- 	if (!pqi_ofa_memory)
++ 	ofap = dma_alloc_coherent(dev, sizeof(*ofap),
++ 		&ctrl_info->pqi_ofa_mem_dma_handle, GFP_KERNEL);
++ 	if (!ofap)
+  		return;
+  
+- 	put_unaligned_le16(PQI_OFA_VERSION, &pqi_ofa_memory->version);
+- 	memcpy(&pqi_ofa_memory->signature, PQI_OFA_SIGNATURE,
+- 					sizeof(pqi_ofa_memory->signature));
+- 	pqi_ofa_memory->bytes_allocated = cpu_to_le32(bytes_requested);
+- 
+- 	ctrl_info->pqi_ofa_mem_virt_addr = pqi_ofa_memory;
++ 	ctrl_info->pqi_ofa_mem_virt_addr = ofap;
+  
+  	if (pqi_ofa_alloc_host_buffer(ctrl_info) < 0) {
+- 		dev_err(dev, "Failed to allocate host buffer of size = %u",
+- 			bytes_requested);
++ 		dev_err(dev,
++ 			"failed to allocate host buffer for Online Firmware Activation\n");
++ 		dma_free_coherent(dev, sizeof(*ofap), ofap, ctrl_info->pqi_ofa_mem_dma_handle);
++ 		ctrl_info->pqi_ofa_mem_virt_addr = NULL;
++ 		return;
+  	}
+  
+- 	return;
++ 	put_unaligned_le16(PQI_OFA_VERSION, &ofap->version);
++ 	memcpy(&ofap->signature, PQI_OFA_SIGNATURE, sizeof(ofap->signature));
+  }
+  
+  static void pqi_ofa_free_host_buffer(struct pqi_ctrl_info *ctrl_info)
+@@@ -7885,18 -8390,17 +8003,18 @@@ static int pqi_ofa_host_memory_update(s
+  
+  		put_unaligned_le64((u64)ctrl_info->pqi_ofa_mem_dma_handle,
+  			&request.data.ofa_memory_allocation.buffer_address);
+- 		put_unaligned_le32(size,
++ 		put_unaligned_le32(buffer_length,
+  			&request.data.ofa_memory_allocation.buffer_length);
+- 
+  	}
+  
+ -	return pqi_submit_raid_request_synchronous(ctrl_info, &request.header, 0, NULL);
+ +	return pqi_submit_raid_request_synchronous(ctrl_info, &request.header,
+ +		0, NULL, NO_TIMEOUT);
+  }
+  
+- static int pqi_ofa_ctrl_restart(struct pqi_ctrl_info *ctrl_info)
++ static int pqi_ofa_ctrl_restart(struct pqi_ctrl_info *ctrl_info, unsigned int delay_secs)
+  {
+- 	msleep(PQI_POST_RESET_DELAY_B4_MSGU_READY);
++ 	ssleep(delay_secs);
++ 
+  	return pqi_ctrl_init_resume(ctrl_info);
+  }
+  
+* Unmerged path drivers/scsi/smartpqi/smartpqi.h
+* Unmerged path drivers/scsi/smartpqi/smartpqi_init.c
