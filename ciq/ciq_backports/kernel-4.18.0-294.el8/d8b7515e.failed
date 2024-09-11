@@ -1,0 +1,162 @@
+RDMA/mlx5: Cleanup DEVX initialization flow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit d8b7515e25ec0a294c18e366f98e85fcb4a035e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d8b7515e.failed
+
+Move DEVX initialization and cleanup flows to the devx.c instead of having
+almost empty functions in main.c
+
+Link: https://lore.kernel.org/r/20200702081809.423482-6-leon@kernel.org
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit d8b7515e25ec0a294c18e366f98e85fcb4a035e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/devx.h
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index cbcf9d2e948c,f529f32b4440..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -61,9 -32,13 +61,14 @@@
+  #include "mlx5_ib.h"
+  #include "ib_rep.h"
+  #include "cmd.h"
+++<<<<<<< HEAD
+++=======
++ #include "devx.h"
++ #include "fs.h"
+++>>>>>>> d8b7515e25ec (RDMA/mlx5: Cleanup DEVX initialization flow)
+  #include "srq.h"
+  #include "qp.h"
+ -#include "wr.h"
+ -#include "restrack.h"
+ -#include "counters.h"
+ +#include <linux/mlx5/fs_helpers.h>
+  #include <linux/mlx5/accel.h>
+  #include <rdma/uverbs_std_types.h>
+  #include <rdma/mlx5_user_ioctl_verbs.h>
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index e3b689989a06,13a2d1f3f14d..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -1387,38 -1353,6 +1387,41 @@@ extern const struct uapi_definition mlx
+  extern const struct uapi_definition mlx5_ib_qos_defs[];
+  extern const struct uapi_definition mlx5_ib_std_types_defs[];
+  
+++<<<<<<< HEAD
+ +
+ +#if IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS)
+ +int mlx5_ib_devx_create(struct mlx5_ib_dev *dev, bool is_user);
+ +void mlx5_ib_devx_destroy(struct mlx5_ib_dev *dev, u16 uid);
+ +void mlx5_ib_devx_init_event_table(struct mlx5_ib_dev *dev);
+ +void mlx5_ib_devx_cleanup_event_table(struct mlx5_ib_dev *dev);
+ +struct mlx5_ib_flow_handler *mlx5_ib_raw_fs_rule_add(
+ +	struct mlx5_ib_dev *dev, struct mlx5_ib_flow_matcher *fs_matcher,
+ +	struct mlx5_flow_context *flow_context,
+ +	struct mlx5_flow_act *flow_act, u32 counter_id,
+ +	void *cmd_in, int inlen, int dest_id, int dest_type);
+ +bool mlx5_ib_devx_is_flow_dest(void *obj, int *dest_id, int *dest_type);
+ +bool mlx5_ib_devx_is_flow_counter(void *obj, u32 offset, u32 *counter_id);
+ +void mlx5_ib_destroy_flow_action_raw(struct mlx5_ib_flow_action *maction);
+ +#else
+ +static inline int
+ +mlx5_ib_devx_create(struct mlx5_ib_dev *dev,
+ +			   bool is_user) { return -EOPNOTSUPP; }
+ +static inline void mlx5_ib_devx_destroy(struct mlx5_ib_dev *dev, u16 uid) {}
+ +static inline void mlx5_ib_devx_init_event_table(struct mlx5_ib_dev *dev) {}
+ +static inline void mlx5_ib_devx_cleanup_event_table(struct mlx5_ib_dev *dev) {}
+ +static inline bool mlx5_ib_devx_is_flow_dest(void *obj, int *dest_id,
+ +					     int *dest_type)
+ +{
+ +	return false;
+ +}
+ +static inline void
+ +mlx5_ib_destroy_flow_action_raw(struct mlx5_ib_flow_action *maction)
+ +{
+ +	return;
+ +};
+ +#endif
+++=======
+++>>>>>>> d8b7515e25ec (RDMA/mlx5: Cleanup DEVX initialization flow)
+  static inline void init_query_mad(struct ib_smp *mad)
+  {
+  	mad->base_version  = 1;
+* Unmerged path drivers/infiniband/hw/mlx5/devx.h
+diff --git a/drivers/infiniband/hw/mlx5/devx.c b/drivers/infiniband/hw/mlx5/devx.c
+index ddc3b8aef035..dc6ef770ec13 100644
+--- a/drivers/infiniband/hw/mlx5/devx.c
++++ b/drivers/infiniband/hw/mlx5/devx.c
+@@ -2421,17 +2421,24 @@ static int devx_event_notifier(struct notifier_block *nb,
+ 	return NOTIFY_OK;
+ }
+ 
+-void mlx5_ib_devx_init_event_table(struct mlx5_ib_dev *dev)
++int mlx5_ib_devx_init(struct mlx5_ib_dev *dev)
+ {
+ 	struct mlx5_devx_event_table *table = &dev->devx_event_table;
++	int uid;
++
++	uid = mlx5_ib_devx_create(dev, false);
++	if (uid > 0) {
++		dev->devx_whitelist_uid = uid;
++		xa_init(&table->event_xa);
++		mutex_init(&table->event_xa_lock);
++		MLX5_NB_INIT(&table->devx_nb, devx_event_notifier, NOTIFY_ANY);
++		mlx5_eq_notifier_register(dev->mdev, &table->devx_nb);
++	}
+ 
+-	xa_init(&table->event_xa);
+-	mutex_init(&table->event_xa_lock);
+-	MLX5_NB_INIT(&table->devx_nb, devx_event_notifier, NOTIFY_ANY);
+-	mlx5_eq_notifier_register(dev->mdev, &table->devx_nb);
++	return 0;
+ }
+ 
+-void mlx5_ib_devx_cleanup_event_table(struct mlx5_ib_dev *dev)
++void mlx5_ib_devx_cleanup(struct mlx5_ib_dev *dev)
+ {
+ 	struct mlx5_devx_event_table *table = &dev->devx_event_table;
+ 	struct devx_event_subscription *sub, *tmp;
+@@ -2439,17 +2446,21 @@ void mlx5_ib_devx_cleanup_event_table(struct mlx5_ib_dev *dev)
+ 	void *entry;
+ 	unsigned long id;
+ 
+-	mlx5_eq_notifier_unregister(dev->mdev, &table->devx_nb);
+-	mutex_lock(&dev->devx_event_table.event_xa_lock);
+-	xa_for_each(&table->event_xa, id, entry) {
+-		event = entry;
+-		list_for_each_entry_safe(sub, tmp, &event->unaffiliated_list,
+-					 xa_list)
+-			devx_cleanup_subscription(dev, sub);
+-		kfree(entry);
++	if (dev->devx_whitelist_uid) {
++		mlx5_eq_notifier_unregister(dev->mdev, &table->devx_nb);
++		mutex_lock(&dev->devx_event_table.event_xa_lock);
++		xa_for_each(&table->event_xa, id, entry) {
++			event = entry;
++			list_for_each_entry_safe(
++				sub, tmp, &event->unaffiliated_list, xa_list)
++				devx_cleanup_subscription(dev, sub);
++			kfree(entry);
++		}
++		mutex_unlock(&dev->devx_event_table.event_xa_lock);
++		xa_destroy(&table->event_xa);
++
++		mlx5_ib_devx_destroy(dev, dev->devx_whitelist_uid);
+ 	}
+-	mutex_unlock(&dev->devx_event_table.event_xa_lock);
+-	xa_destroy(&table->event_xa);
+ }
+ 
+ static ssize_t devx_async_cmd_event_read(struct file *filp, char __user *buf,
+* Unmerged path drivers/infiniband/hw/mlx5/devx.h
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
