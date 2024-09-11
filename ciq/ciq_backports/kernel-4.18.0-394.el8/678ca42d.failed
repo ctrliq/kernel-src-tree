@@ -1,0 +1,124 @@
+ip: remove tx_flags from ipcm_cookie and use same logic for v4 and v6
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Willem de Bruijn <willemb@google.com>
+commit 678ca42d688534adfc780b150abefaaac7c86687
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/678ca42d.failed
+
+skb_shinfo(skb)->tx_flags is derived from sk->sk_tsflags, possibly
+after modification by __sock_cmsg_send, by calling sock_tx_timestamp.
+
+The IPv4 and IPv6 paths do this conversion differently. In IPv4, the
+individual protocols that support tx timestamps call this function
+and store the result in ipc.tx_flags. In IPv6, sock_tx_timestamp is
+called in __ip6_append_data.
+
+There is no need to store both tx_flags and ts_flags in the cookie
+as one is derived from the other. Convert when setting up the cork
+and remove the redundant field. This is similar to IPv6, only have
+the conversion happen only once per datagram, in ip(6)_setup_cork.
+
+Also change __ip6_append_data to match __ip_append_data. Only update
+tskey if timestamping is enabled with OPT_ID. The SOCK_.. test is
+redundant: only valid protocols can have non-zero cork->tx_flags.
+
+After this change the IPv4 and IPv6 logic is the same.
+
+	Signed-off-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 678ca42d688534adfc780b150abefaaac7c86687)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/ip6_output.c
+diff --cc net/ipv6/ip6_output.c
+index ce8b1db50df5,ff4b28a600ab..000000000000
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@@ -1454,13 -1323,6 +1459,16 @@@ emsgsize
+  	    rt->dst.dev->features & (NETIF_F_IPV6_CSUM | NETIF_F_HW_CSUM))
+  		csummode = CHECKSUM_PARTIAL;
+  
+++<<<<<<< HEAD
+ +	if (sk->sk_type == SOCK_DGRAM || sk->sk_type == SOCK_RAW) {
+ +		sock_tx_timestamp(sk, sockc->tsflags, &tx_flags);
+ +		if (tx_flags & SKBTX_ANY_SW_TSTAMP &&
+ +		    sk->sk_tsflags & SOF_TIMESTAMPING_OPT_ID)
+ +			tskey = sk->sk_tskey++;
+ +	}
+ +
+++=======
+++>>>>>>> 678ca42d6885 (ip: remove tx_flags from ipcm_cookie and use same logic for v4 and v6)
+  	/*
+  	 * Let's try using as much space as possible.
+  	 * Use MTU if total length of the message fits into the MTU.
+diff --git a/include/net/ip.h b/include/net/ip.h
+index f61e0dd9a8e3..64e6f13cbf8e 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -72,7 +72,6 @@ struct ipcm_cookie {
+ 	__be32			addr;
+ 	int			oif;
+ 	struct ip_options_rcu	*opt;
+-	__u8			tx_flags;
+ 	__u8			ttl;
+ 	__s16			tos;
+ 	char			priority;
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index e18239b9a992..5aa3d90cc8b0 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -1181,8 +1181,9 @@ static int ip_setup_cork(struct sock *sk, struct inet_cork *cork,
+ 	cork->ttl = ipc->ttl;
+ 	cork->tos = ipc->tos;
+ 	cork->priority = ipc->priority;
+-	cork->tx_flags = ipc->tx_flags;
+ 	cork->transmit_time = ipc->sockc.transmit_time;
++	cork->tx_flags = 0;
++	sock_tx_timestamp(sk, ipc->sockc.tsflags, &cork->tx_flags);
+ 
+ 	return 0;
+ }
+diff --git a/net/ipv4/ping.c b/net/ipv4/ping.c
+index 9be046de601c..31451f0ac5ec 100644
+--- a/net/ipv4/ping.c
++++ b/net/ipv4/ping.c
+@@ -770,8 +770,6 @@ static int ping_v4_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ 		rcu_read_unlock();
+ 	}
+ 
+-	sock_tx_timestamp(sk, ipc.sockc.tsflags, &ipc.tx_flags);
+-
+ 	saddr = ipc.addr;
+ 	ipc.addr = faddr = daddr;
+ 
+diff --git a/net/ipv4/raw.c b/net/ipv4/raw.c
+index d6d68213fbd5..8af5d62dcd8b 100644
+--- a/net/ipv4/raw.c
++++ b/net/ipv4/raw.c
+@@ -672,8 +672,6 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ 				      &rt, msg->msg_flags, &ipc.sockc);
+ 
+ 	 else {
+-		sock_tx_timestamp(sk, ipc.sockc.tsflags, &ipc.tx_flags);
+-
+ 		if (!ipc.addr)
+ 			ipc.addr = fl4.daddr;
+ 		lock_sock(sk);
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index dd3faf1644ad..3bab08c07818 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1176,8 +1176,6 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ 	saddr = ipc.addr;
+ 	ipc.addr = faddr = daddr;
+ 
+-	sock_tx_timestamp(sk, ipc.sockc.tsflags, &ipc.tx_flags);
+-
+ 	if (ipc.opt && ipc.opt->opt.srr) {
+ 		if (!daddr) {
+ 			err = -EINVAL;
+* Unmerged path net/ipv6/ip6_output.c
