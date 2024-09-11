@@ -1,0 +1,272 @@
+block: make blk_poll() take a parameter on whether to spin or not
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 0a1b8b87d064a47fad9ec475316002da28559207
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/0a1b8b87.failed
+
+blk_poll() has always kept spinning until it found an IO. This is
+fine for SYNC polling, since we need to find one request we have
+pending, but in preparation for ASYNC polling it can be beneficial
+to just check if we have any entries available or not.
+
+Existing callers are converted to pass in 'spin == true', to retain
+the old behavior.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 0a1b8b87d064a47fad9ec475316002da28559207)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk-mq.c
+#	drivers/nvme/host/multipath.c
+#	include/linux/blkdev.h
+diff --cc block/blk-core.c
+index 7df0c1244abd,9af56dbb84f1..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -2519,10 -1273,22 +2519,26 @@@ blk_qc_t submit_bio(struct bio *bio
+  }
+  EXPORT_SYMBOL(submit_bio);
+  
+++<<<<<<< HEAD
+ +bool blk_poll(struct request_queue *q, blk_qc_t cookie)
+++=======
++ /**
++  * blk_poll - poll for IO completions
++  * @q:  the queue
++  * @cookie: cookie passed back at IO submission time
++  * @spin: whether to spin for completions
++  *
++  * Description:
++  *    Poll for completions on the passed in queue. Returns number of
++  *    completed entries found. If @spin is true, then blk_poll will continue
++  *    looping until at least one completion is found, unless the task is
++  *    otherwise marked running (or we need to reschedule).
++  */
++ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
+++>>>>>>> 0a1b8b87d064 (block: make blk_poll() take a parameter on whether to spin or not)
+  {
+  	if (!q->poll_fn || !blk_qc_t_valid(cookie))
+ -		return 0;
+ +		return false;
+  
+  	if (current->plug)
+  		blk_flush_plug_list(current->plug, false);
+diff --cc block/blk-mq.c
+index 52f967bfb7fc,c2751f0a3ccc..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -38,7 -38,7 +38,11 @@@
+  #include "blk-mq-sched.h"
+  #include "blk-rq-qos.h"
+  
+++<<<<<<< HEAD
+ +static bool blk_mq_poll(struct request_queue *q, blk_qc_t cookie);
+++=======
++ static int blk_mq_poll(struct request_queue *q, blk_qc_t cookie, bool spin);
+++>>>>>>> 0a1b8b87d064 (block: make blk_poll() take a parameter on whether to spin or not)
+  static void blk_mq_poll_stats_start(struct request_queue *q);
+  static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb);
+  
+@@@ -3361,7 -3349,56 +3365,60 @@@ static bool blk_mq_poll(struct request_
+  			return false;
+  	}
+  
+++<<<<<<< HEAD
+ +	return __blk_mq_poll(hctx, rq);
+++=======
++ 	return blk_mq_poll_hybrid_sleep(q, hctx, rq);
++ }
++ 
++ static int blk_mq_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 	long state;
++ 
++ 	if (!test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
++ 		return 0;
++ 
++ 	hctx = q->queue_hw_ctx[blk_qc_t_to_queue_num(cookie)];
++ 
++ 	/*
++ 	 * If we sleep, have the caller restart the poll loop to reset
++ 	 * the state. Like for the other success return cases, the
++ 	 * caller is responsible for checking if the IO completed. If
++ 	 * the IO isn't complete, we'll get called again and will go
++ 	 * straight to the busy poll loop.
++ 	 */
++ 	if (blk_mq_poll_hybrid(q, hctx, cookie))
++ 		return 1;
++ 
++ 	hctx->poll_considered++;
++ 
++ 	state = current->state;
++ 	while (!need_resched()) {
++ 		int ret;
++ 
++ 		hctx->poll_invoked++;
++ 
++ 		ret = q->mq_ops->poll(hctx);
++ 		if (ret > 0) {
++ 			hctx->poll_success++;
++ 			__set_current_state(TASK_RUNNING);
++ 			return ret;
++ 		}
++ 
++ 		if (signal_pending_state(state, current))
++ 			__set_current_state(TASK_RUNNING);
++ 
++ 		if (current->state == TASK_RUNNING)
++ 			return 1;
++ 		if (ret < 0 || !spin)
++ 			break;
++ 		cpu_relax();
++ 	}
++ 
++ 	__set_current_state(TASK_RUNNING);
++ 	return 0;
+++>>>>>>> 0a1b8b87d064 (block: make blk_poll() take a parameter on whether to spin or not)
+  }
+  
+  unsigned int blk_mq_rq_cpu(struct request *rq)
+diff --cc drivers/nvme/host/multipath.c
+index ff1655bfa2c9,ffebdd0ae34b..000000000000
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@@ -133,7 -220,7 +133,11 @@@ static blk_qc_t nvme_ns_head_make_reque
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static bool nvme_ns_head_poll(struct request_queue *q, blk_qc_t qc)
+++=======
++ static int nvme_ns_head_poll(struct request_queue *q, blk_qc_t qc, bool spin)
+++>>>>>>> 0a1b8b87d064 (block: make blk_poll() take a parameter on whether to spin or not)
+  {
+  	struct nvme_ns_head *head = q->queuedata;
+  	struct nvme_ns *ns;
+@@@ -141,9 -228,9 +145,15 @@@
+  	int srcu_idx;
+  
+  	srcu_idx = srcu_read_lock(&head->srcu);
+++<<<<<<< HEAD
+ +	ns = srcu_dereference(head->current_path, &head->srcu);
+ +	if (likely(ns && ns->ctrl->state == NVME_CTRL_LIVE))
+ +		found = ns->queue->poll_fn(q, qc);
+++=======
++ 	ns = srcu_dereference(head->current_path[numa_node_id()], &head->srcu);
++ 	if (likely(ns && nvme_path_is_optimized(ns)))
++ 		found = ns->queue->poll_fn(q, qc, spin);
+++>>>>>>> 0a1b8b87d064 (block: make blk_poll() take a parameter on whether to spin or not)
+  	srcu_read_unlock(&head->srcu, srcu_idx);
+  	return found;
+  }
+diff --cc include/linux/blkdev.h
+index d890005b9f66,e3c0a8ec16a7..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -308,18 -282,11 +308,22 @@@ static inline unsigned short req_get_io
+  
+  struct blk_queue_ctx;
+  
+ +typedef void (request_fn_proc) (struct request_queue *q);
+  typedef blk_qc_t (make_request_fn) (struct request_queue *q, struct bio *bio);
+++<<<<<<< HEAD
+ +typedef bool (poll_q_fn) (struct request_queue *q, blk_qc_t);
+ +typedef int (prep_rq_fn) (struct request_queue *, struct request *);
+ +typedef void (unprep_rq_fn) (struct request_queue *, struct request *);
+++=======
++ typedef int (poll_q_fn) (struct request_queue *q, blk_qc_t, bool spin);
+++>>>>>>> 0a1b8b87d064 (block: make blk_poll() take a parameter on whether to spin or not)
+  
+  struct bio_vec;
+ +typedef void (softirq_done_fn)(struct request *);
+  typedef int (dma_drain_needed_fn)(struct request *);
+ +typedef int (bsg_job_fn) (struct bsg_job *);
+ +typedef int (init_rq_fn)(struct request_queue *, struct request *, gfp_t);
+ +typedef void (exit_rq_fn)(struct request_queue *, struct request *);
+  
+  enum blk_eh_timer_return {
+  	BLK_EH_DONE,		/* drivers has completed the command */
+@@@ -982,7 -867,7 +986,11 @@@ extern void blk_execute_rq_nowait(struc
+  int blk_status_to_errno(blk_status_t status);
+  blk_status_t errno_to_blk_status(int errno);
+  
+++<<<<<<< HEAD
+ +bool blk_poll(struct request_queue *q, blk_qc_t cookie);
+++=======
++ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin);
+++>>>>>>> 0a1b8b87d064 (block: make blk_poll() take a parameter on whether to spin or not)
+  
+  static inline struct request_queue *bdev_get_queue(struct block_device *bdev)
+  {
+* Unmerged path block/blk-core.c
+* Unmerged path block/blk-mq.c
+* Unmerged path drivers/nvme/host/multipath.c
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index ee91d4d4bdec..64390f874961 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -243,7 +243,7 @@ __blkdev_direct_IO_simple(struct kiocb *iocb, struct iov_iter *iter,
+ 			break;
+ 
+ 		if (!(iocb->ki_flags & IOCB_HIPRI) ||
+-		    !blk_poll(bdev_get_queue(bdev), qc))
++		    !blk_poll(bdev_get_queue(bdev), qc, true))
+ 			io_schedule();
+ 	}
+ 	__set_current_state(TASK_RUNNING);
+@@ -423,7 +423,7 @@ __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter, int nr_pages)
+ 			break;
+ 
+ 		if (!(iocb->ki_flags & IOCB_HIPRI) ||
+-		    !blk_poll(bdev_get_queue(bdev), qc))
++		    !blk_poll(bdev_get_queue(bdev), qc, true))
+ 			io_schedule();
+ 	}
+ 	__set_current_state(TASK_RUNNING);
+diff --git a/fs/direct-io.c b/fs/direct-io.c
+index 2a4f7e919e4a..72a538b5335f 100644
+--- a/fs/direct-io.c
++++ b/fs/direct-io.c
+@@ -518,7 +518,7 @@ static struct bio *dio_await_one(struct dio *dio)
+ 		dio->waiter = current;
+ 		spin_unlock_irqrestore(&dio->bio_lock, flags);
+ 		if (!(dio->iocb->ki_flags & IOCB_HIPRI) ||
+-		    !blk_poll(dio->bio_disk->queue, dio->bio_cookie))
++		    !blk_poll(dio->bio_disk->queue, dio->bio_cookie, true))
+ 			io_schedule();
+ 		/* wake up sets us TASK_RUNNING */
+ 		spin_lock_irqsave(&dio->bio_lock, flags);
+diff --git a/fs/iomap.c b/fs/iomap.c
+index 4c69a42ff86e..16e1f2aa7122 100644
+--- a/fs/iomap.c
++++ b/fs/iomap.c
+@@ -1917,7 +1917,7 @@ iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
+ 			if (!(iocb->ki_flags & IOCB_HIPRI) ||
+ 			    !dio->submit.last_queue ||
+ 			    !blk_poll(dio->submit.last_queue,
+-					 dio->submit.cookie))
++					 dio->submit.cookie, true))
+ 				io_schedule();
+ 		}
+ 		__set_current_state(TASK_RUNNING);
+* Unmerged path include/linux/blkdev.h
+diff --git a/mm/page_io.c b/mm/page_io.c
+index 0bfa51bb9adb..39a1f5c011bd 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -410,7 +410,7 @@ int swap_readpage(struct page *page, bool synchronous)
+ 		if (!READ_ONCE(bio->bi_private))
+ 			break;
+ 
+-		if (!blk_poll(disk->queue, qc))
++		if (!blk_poll(disk->queue, qc, true))
+ 			break;
+ 	}
+ 	__set_current_state(TASK_RUNNING);
