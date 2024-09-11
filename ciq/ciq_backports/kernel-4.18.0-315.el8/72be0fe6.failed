@@ -1,0 +1,178 @@
+bpf: tcp: Add bpf_skops_established()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 72be0fe6ba76282704cb84952bd5a1eb47910290
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/72be0fe6.failed
+
+In tcp_init_transfer(), it currently calls the bpf prog to give it a
+chance to handle the just "ESTABLISHED" event (e.g. do setsockopt
+on the newly established sk).  Right now, it is done by calling the
+general purpose tcp_call_bpf().
+
+In the later patch, it also needs to pass the just-received skb which
+concludes the 3 way handshake. E.g. the SYNACK received at the active side.
+The bpf prog can then learn some specific header options written by the
+peer's bpf-prog and potentially do setsockopt on the newly established sk.
+Thus, instead of reusing the general purpose tcp_call_bpf(), a new function
+bpf_skops_established() is added to allow passing the "skb" to the bpf
+prog.  The actual skb passing from bpf_skops_established() to the bpf prog
+will happen together in a later patch which has the necessary bpf pieces.
+
+A "skb" arg is also added to tcp_init_transfer() such that
+it can then be passed to bpf_skops_established().
+
+Calling the new bpf_skops_established() instead of tcp_call_bpf()
+should be a noop in this patch.
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20200820190039.2884750-1-kafai@fb.com
+(cherry picked from commit 72be0fe6ba76282704cb84952bd5a1eb47910290)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_input.c
+diff --cc net/ipv4/tcp_input.c
+index 0a07f42fdf6f,7b0faa2bfe32..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -130,8 -130,37 +130,31 @@@ void clean_acked_data_disable(struct in
+  	icsk->icsk_clean_acked = NULL;
+  }
+  EXPORT_SYMBOL_GPL(clean_acked_data_disable);
+ -
+ -void clean_acked_data_flush(void)
+ -{
+ -	static_key_deferred_flush(&clean_acked_data_enabled);
+ -}
+ -EXPORT_SYMBOL_GPL(clean_acked_data_flush);
+  #endif
+  
++ #ifdef CONFIG_CGROUP_BPF
++ static void bpf_skops_established(struct sock *sk, int bpf_op,
++ 				  struct sk_buff *skb)
++ {
++ 	struct bpf_sock_ops_kern sock_ops;
++ 
++ 	sock_owned_by_me(sk);
++ 
++ 	memset(&sock_ops, 0, offsetof(struct bpf_sock_ops_kern, temp));
++ 	sock_ops.op = bpf_op;
++ 	sock_ops.is_fullsock = 1;
++ 	sock_ops.sk = sk;
++ 	/* skb will be passed to the bpf prog in a later patch. */
++ 
++ 	BPF_CGROUP_RUN_PROG_SOCK_OPS(&sock_ops);
++ }
++ #else
++ static void bpf_skops_established(struct sock *sk, int bpf_op,
++ 				  struct sk_buff *skb)
++ {
++ }
++ #endif
++ 
+  static void tcp_gro_dev_warn(struct sock *sk, const struct sk_buff *skb,
+  			     unsigned int len)
+  {
+@@@ -5751,6 -5831,32 +5774,35 @@@ discard
+  }
+  EXPORT_SYMBOL(tcp_rcv_established);
+  
+++<<<<<<< HEAD
+++=======
++ void tcp_init_transfer(struct sock *sk, int bpf_op, struct sk_buff *skb)
++ {
++ 	struct inet_connection_sock *icsk = inet_csk(sk);
++ 	struct tcp_sock *tp = tcp_sk(sk);
++ 
++ 	tcp_mtup_init(sk);
++ 	icsk->icsk_af_ops->rebuild_header(sk);
++ 	tcp_init_metrics(sk);
++ 
++ 	/* Initialize the congestion window to start the transfer.
++ 	 * Cut cwnd down to 1 per RFC5681 if SYN or SYN-ACK has been
++ 	 * retransmitted. In light of RFC6298 more aggressive 1sec
++ 	 * initRTO, we only reset cwnd when more than 1 SYN/SYN-ACK
++ 	 * retransmission has occurred.
++ 	 */
++ 	if (tp->total_retrans > 1 && tp->undo_marker)
++ 		tp->snd_cwnd = 1;
++ 	else
++ 		tp->snd_cwnd = tcp_init_cwnd(tp, __sk_dst_get(sk));
++ 	tp->snd_cwnd_stamp = tcp_jiffies32;
++ 
++ 	bpf_skops_established(sk, bpf_op, skb);
++ 	tcp_init_congestion_control(sk);
++ 	tcp_init_buffer_space(sk);
++ }
++ 
+++>>>>>>> 72be0fe6ba76 (bpf: tcp: Add bpf_skops_established())
+  void tcp_finish_connect(struct sock *sk, struct sk_buff *skb)
+  {
+  	struct tcp_sock *tp = tcp_sk(sk);
+@@@ -6174,24 -6338,14 +6226,32 @@@ int tcp_rcv_state_process(struct sock *
+  		if (!tp->srtt_us)
+  			tcp_synack_rtt_meas(sk, req);
+  
+ +		/* Once we leave TCP_SYN_RECV, we no longer need req
+ +		 * so release it.
+ +		 */
+  		if (req) {
+ -			tcp_rcv_synrecv_state_fastopen(sk);
+ +			inet_csk(sk)->icsk_retransmits = 0;
+ +			reqsk_fastopen_remove(sk, req, false);
+ +			/* Re-arm the timer because data may have been sent out.
+ +			 * This is similar to the regular data transmission case
+ +			 * when new data has just been ack'ed.
+ +			 *
+ +			 * (TFO) - we could try to be more aggressive and
+ +			 * retransmitting any data sooner based on when they
+ +			 * are sent out.
+ +			 */
+ +			tcp_rearm_rto(sk);
+  		} else {
+++<<<<<<< HEAD
+ +			tcp_init_transfer(sk, BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB);
+ +			tp->copied_seq = tp->rcv_nxt;
+++=======
++ 			tcp_try_undo_spurious_syn(sk);
++ 			tp->retrans_stamp = 0;
++ 			tcp_init_transfer(sk, BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB,
++ 					  skb);
++ 			WRITE_ONCE(tp->copied_seq, tp->rcv_nxt);
+++>>>>>>> 72be0fe6ba76 (bpf: tcp: Add bpf_skops_established())
+  		}
+  		smp_mb();
+  		tcp_set_state(sk, TCP_ESTABLISHED);
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index b92b04b1ecea..6895e06880d9 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -400,7 +400,7 @@ bool tcp_peer_is_proven(struct request_sock *req, struct dst_entry *dst);
+ void __tcp_close(struct sock *sk, long timeout);
+ void tcp_close(struct sock *sk, long timeout);
+ void tcp_init_sock(struct sock *sk);
+-void tcp_init_transfer(struct sock *sk, int bpf_op);
++void tcp_init_transfer(struct sock *sk, int bpf_op, struct sk_buff *skb);
+ __poll_t tcp_poll(struct file *file, struct socket *sock,
+ 		      struct poll_table_struct *wait);
+ int tcp_getsockopt(struct sock *sk, int level, int optname,
+diff --git a/net/ipv4/tcp_fastopen.c b/net/ipv4/tcp_fastopen.c
+index 7a520d5b4351..bf27f5c73916 100644
+--- a/net/ipv4/tcp_fastopen.c
++++ b/net/ipv4/tcp_fastopen.c
+@@ -259,7 +259,7 @@ static struct sock *tcp_fastopen_create_child(struct sock *sk,
+ 	refcount_set(&req->rsk_refcnt, 2);
+ 
+ 	/* Now finish processing the fastopen child socket. */
+-	tcp_init_transfer(child, BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB);
++	tcp_init_transfer(child, BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB, skb);
+ 
+ 	tp->rcv_nxt = TCP_SKB_CB(skb)->seq + 1;
+ 
+* Unmerged path net/ipv4/tcp_input.c
