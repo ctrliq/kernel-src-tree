@@ -1,0 +1,308 @@
+tipc: introduce variable window congestion control
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jon Maloy <jon.maloy@ericsson.com>
+commit 16ad3f4022bb53c7541a0bf0410b32d0231ebef9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/16ad3f40.failed
+
+We introduce a simple variable window congestion control for links.
+The algorithm is inspired by the Reno algorithm, covering both 'slow
+start', 'congestion avoidance', and 'fast recovery' modes.
+
+- We introduce hard lower and upper window limits per link, still
+  different and configurable per bearer type.
+
+- We introduce a 'slow start theshold' variable, initially set to
+  the maximum window size.
+
+- We let a link start at the minimum congestion window, i.e. in slow
+  start mode, and then let is grow rapidly (+1 per rceived ACK) until
+  it reaches the slow start threshold and enters congestion avoidance
+  mode.
+
+- In congestion avoidance mode we increment the congestion window for
+  each window-size number of acked packets, up to a possible maximum
+  equal to the configured maximum window.
+
+- For each non-duplicate NACK received, we drop back to fast recovery
+  mode, by setting the both the slow start threshold to and the
+  congestion window to (current_congestion_window / 2).
+
+- If the timeout handler finds that the transmit queue has not moved
+  since the previous timeout, it drops the link back to slow start
+  and forces a probe containing the last sent sequence number to the
+  sent to the peer, so that this can discover the stale situation.
+
+This change does in reality have effect only on unicast ethernet
+transport, as we have seen that there is no room whatsoever for
+increasing the window max size for the UDP bearer.
+For now, we also choose to keep the limits for the broadcast link
+unchanged and equal.
+
+This algorithm seems to give a 50-100% throughput improvement for
+messages larger than MTU.
+
+	Suggested-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Ying Xue <ying.xue@windriver.com>
+	Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 16ad3f4022bb53c7541a0bf0410b32d0231ebef9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/link.c
+#	net/tipc/node.c
+diff --cc net/tipc/link.c
+index 91be69d1779e,94dd48cd70a3..000000000000
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@@ -948,7 -977,8 +967,12 @@@ int tipc_link_xmit(struct tipc_link *l
+  	u16 seqno = l->snd_nxt;
+  	int pkt_cnt = skb_queue_len(list);
+  	int imp = msg_importance(hdr);
+++<<<<<<< HEAD
+ +	unsigned int maxwin = l->window;
+++=======
++ 	unsigned int mss = tipc_link_mss(l);
++ 	unsigned int cwin = l->window;
+++>>>>>>> 16ad3f4022bb (tipc: introduce variable window congestion control)
+  	unsigned int mtu = l->mtu;
+  	bool new_bundle;
+  	int rc = 0;
+diff --cc net/tipc/node.c
+index 3fe27ab13350,99b28b69fc17..000000000000
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@@ -1014,6 -1135,22 +1014,25 @@@ void tipc_node_check_dest(struct net *n
+  		return;
+  
+  	tipc_node_write_lock(n);
+++<<<<<<< HEAD
+++=======
++ 	if (unlikely(!n->bc_entry.link)) {
++ 		snd_l = tipc_bc_sndlink(net);
++ 		if (!tipc_link_bc_create(net, tipc_own_addr(net),
++ 					 addr, U16_MAX,
++ 					 tipc_link_min_win(snd_l),
++ 					 tipc_link_max_win(snd_l),
++ 					 n->capabilities,
++ 					 &n->bc_entry.inputq1,
++ 					 &n->bc_entry.namedq, snd_l,
++ 					 &n->bc_entry.link)) {
++ 			pr_warn("Broadcast rcv link creation failed, no mem\n");
++ 			tipc_node_write_unlock_fast(n);
++ 			tipc_node_put(n);
++ 			return;
++ 		}
++ 	}
+++>>>>>>> 16ad3f4022bb (tipc: introduce variable window congestion control)
+  
+  	le = &n->links[b->identity];
+  
+diff --git a/net/tipc/bcast.c b/net/tipc/bcast.c
+index 588c2709f7d2..693ddf45b0f9 100644
+--- a/net/tipc/bcast.c
++++ b/net/tipc/bcast.c
+@@ -566,18 +566,18 @@ int tipc_bclink_reset_stats(struct net *net)
+ 	return 0;
+ }
+ 
+-static int tipc_bc_link_set_queue_limits(struct net *net, u32 limit)
++static int tipc_bc_link_set_queue_limits(struct net *net, u32 max_win)
+ {
+ 	struct tipc_link *l = tipc_bc_sndlink(net);
+ 
+ 	if (!l)
+ 		return -ENOPROTOOPT;
+-	if (limit < BCLINK_WIN_MIN)
+-		limit = BCLINK_WIN_MIN;
+-	if (limit > TIPC_MAX_LINK_WIN)
++	if (max_win < BCLINK_WIN_MIN)
++		max_win = BCLINK_WIN_MIN;
++	if (max_win > TIPC_MAX_LINK_WIN)
+ 		return -EINVAL;
+ 	tipc_bcast_lock(net);
+-	tipc_link_set_queue_limits(l, limit);
++	tipc_link_set_queue_limits(l, BCLINK_WIN_MIN, max_win);
+ 	tipc_bcast_unlock(net);
+ 	return 0;
+ }
+@@ -687,6 +687,7 @@ int tipc_bcast_init(struct net *net)
+ 	if (!tipc_link_bc_create(net, 0, 0,
+ 				 FB_MTU,
+ 				 BCLINK_WIN_DEFAULT,
++				 BCLINK_WIN_DEFAULT,
+ 				 0,
+ 				 &bb->inputq,
+ 				 NULL,
+diff --git a/net/tipc/bearer.c b/net/tipc/bearer.c
+index b0f3db00a135..19edac7953a0 100644
+--- a/net/tipc/bearer.c
++++ b/net/tipc/bearer.c
+@@ -310,7 +310,8 @@ static int tipc_enable_bearer(struct net *net, const char *name,
+ 
+ 	b->identity = bearer_id;
+ 	b->tolerance = m->tolerance;
+-	b->window = m->window;
++	b->min_win = m->min_win;
++	b->max_win = m->max_win;
+ 	b->domain = disc_domain;
+ 	b->net_plane = bearer_id + 'A';
+ 	b->priority = prio;
+@@ -718,7 +719,7 @@ static int __tipc_nl_add_bearer(struct tipc_nl_msg *msg,
+ 		goto prop_msg_full;
+ 	if (nla_put_u32(msg->skb, TIPC_NLA_PROP_TOL, bearer->tolerance))
+ 		goto prop_msg_full;
+-	if (nla_put_u32(msg->skb, TIPC_NLA_PROP_WIN, bearer->window))
++	if (nla_put_u32(msg->skb, TIPC_NLA_PROP_WIN, bearer->max_win))
+ 		goto prop_msg_full;
+ 	if (bearer->media->type_id == TIPC_MEDIA_TYPE_UDP)
+ 		if (nla_put_u32(msg->skb, TIPC_NLA_PROP_MTU, bearer->mtu))
+@@ -1010,7 +1011,7 @@ int __tipc_nl_bearer_set(struct sk_buff *skb, struct genl_info *info)
+ 		if (props[TIPC_NLA_PROP_PRIO])
+ 			b->priority = nla_get_u32(props[TIPC_NLA_PROP_PRIO]);
+ 		if (props[TIPC_NLA_PROP_WIN])
+-			b->window = nla_get_u32(props[TIPC_NLA_PROP_WIN]);
++			b->max_win = nla_get_u32(props[TIPC_NLA_PROP_WIN]);
+ 		if (props[TIPC_NLA_PROP_MTU]) {
+ 			if (b->media->type_id != TIPC_MEDIA_TYPE_UDP)
+ 				return -EINVAL;
+@@ -1064,7 +1065,7 @@ static int __tipc_nl_add_media(struct tipc_nl_msg *msg,
+ 		goto prop_msg_full;
+ 	if (nla_put_u32(msg->skb, TIPC_NLA_PROP_TOL, media->tolerance))
+ 		goto prop_msg_full;
+-	if (nla_put_u32(msg->skb, TIPC_NLA_PROP_WIN, media->window))
++	if (nla_put_u32(msg->skb, TIPC_NLA_PROP_WIN, media->max_win))
+ 		goto prop_msg_full;
+ 	if (media->type_id == TIPC_MEDIA_TYPE_UDP)
+ 		if (nla_put_u32(msg->skb, TIPC_NLA_PROP_MTU, media->mtu))
+@@ -1197,7 +1198,7 @@ int __tipc_nl_media_set(struct sk_buff *skb, struct genl_info *info)
+ 		if (props[TIPC_NLA_PROP_PRIO])
+ 			m->priority = nla_get_u32(props[TIPC_NLA_PROP_PRIO]);
+ 		if (props[TIPC_NLA_PROP_WIN])
+-			m->window = nla_get_u32(props[TIPC_NLA_PROP_WIN]);
++			m->max_win = nla_get_u32(props[TIPC_NLA_PROP_WIN]);
+ 		if (props[TIPC_NLA_PROP_MTU]) {
+ 			if (m->type_id != TIPC_MEDIA_TYPE_UDP)
+ 				return -EINVAL;
+diff --git a/net/tipc/bearer.h b/net/tipc/bearer.h
+index d0b94f3743f0..7774fe9eac1e 100644
+--- a/net/tipc/bearer.h
++++ b/net/tipc/bearer.h
+@@ -119,7 +119,8 @@ struct tipc_media {
+ 			char *raw);
+ 	u32 priority;
+ 	u32 tolerance;
+-	u32 window;
++	u32 min_win;
++	u32 max_win;
+ 	u32 mtu;
+ 	u32 type_id;
+ 	u32 hwaddr_len;
+@@ -158,7 +159,8 @@ struct tipc_bearer {
+ 	struct packet_type pt;
+ 	struct rcu_head rcu;
+ 	u32 priority;
+-	u32 window;
++	u32 min_win;
++	u32 max_win;
+ 	u32 tolerance;
+ 	u32 domain;
+ 	u32 identity;
+diff --git a/net/tipc/eth_media.c b/net/tipc/eth_media.c
+index f69a2fde9f4a..8b0bb600602d 100644
+--- a/net/tipc/eth_media.c
++++ b/net/tipc/eth_media.c
+@@ -92,7 +92,8 @@ struct tipc_media eth_media_info = {
+ 	.raw2addr	= tipc_eth_raw2addr,
+ 	.priority	= TIPC_DEF_LINK_PRI,
+ 	.tolerance	= TIPC_DEF_LINK_TOL,
+-	.window		= TIPC_DEF_LINK_WIN,
++	.min_win	= TIPC_DEF_LINK_WIN,
++	.max_win	= TIPC_MAX_LINK_WIN,
+ 	.type_id	= TIPC_MEDIA_TYPE_ETH,
+ 	.hwaddr_len	= ETH_ALEN,
+ 	.name		= "eth"
+diff --git a/net/tipc/ib_media.c b/net/tipc/ib_media.c
+index e8c16718e3fa..7aa9ff88458d 100644
+--- a/net/tipc/ib_media.c
++++ b/net/tipc/ib_media.c
+@@ -42,6 +42,8 @@
+ #include "core.h"
+ #include "bearer.h"
+ 
++#define TIPC_MAX_IB_LINK_WIN 500
++
+ /* convert InfiniBand address (media address format) media address to string */
+ static int tipc_ib_addr2str(struct tipc_media_addr *a, char *str_buf,
+ 			    int str_size)
+@@ -94,7 +96,8 @@ struct tipc_media ib_media_info = {
+ 	.raw2addr	= tipc_ib_raw2addr,
+ 	.priority	= TIPC_DEF_LINK_PRI,
+ 	.tolerance	= TIPC_DEF_LINK_TOL,
+-	.window		= TIPC_DEF_LINK_WIN,
++	.min_win	= TIPC_DEF_LINK_WIN,
++	.max_win	= TIPC_MAX_IB_LINK_WIN,
+ 	.type_id	= TIPC_MEDIA_TYPE_IB,
+ 	.hwaddr_len	= INFINIBAND_ALEN,
+ 	.name		= "ib"
+* Unmerged path net/tipc/link.c
+diff --git a/net/tipc/link.h b/net/tipc/link.h
+index adcad65e761c..caed07169a0f 100644
+--- a/net/tipc/link.h
++++ b/net/tipc/link.h
+@@ -73,7 +73,7 @@ enum {
+ 
+ bool tipc_link_create(struct net *net, char *if_name, int bearer_id,
+ 		      int tolerance, char net_plane, u32 mtu, int priority,
+-		      int window, u32 session, u32 ownnode,
++		      u32 min_win, u32 max_win, u32 session, u32 ownnode,
+ 		      u32 peer, u8 *peer_id, u16 peer_caps,
+ 		      struct tipc_link *bc_sndlink,
+ 		      struct tipc_link *bc_rcvlink,
+@@ -81,7 +81,7 @@ bool tipc_link_create(struct net *net, char *if_name, int bearer_id,
+ 		      struct sk_buff_head *namedq,
+ 		      struct tipc_link **link);
+ bool tipc_link_bc_create(struct net *net, u32 ownnode, u32 peer,
+-			 int mtu, int window, u16 peer_caps,
++			 int mtu, u32 min_win, u32 max_win, u16 peer_caps,
+ 			 struct sk_buff_head *inputq,
+ 			 struct sk_buff_head *namedq,
+ 			 struct tipc_link *bc_sndlink,
+@@ -115,7 +115,8 @@ char *tipc_link_name_ext(struct tipc_link *l, char *buf);
+ u32 tipc_link_state(struct tipc_link *l);
+ char tipc_link_plane(struct tipc_link *l);
+ int tipc_link_prio(struct tipc_link *l);
+-int tipc_link_window(struct tipc_link *l);
++int tipc_link_min_win(struct tipc_link *l);
++int tipc_link_max_win(struct tipc_link *l);
+ void tipc_link_update_caps(struct tipc_link *l, u16 capabilities);
+ bool tipc_link_validate_msg(struct tipc_link *l, struct tipc_msg *hdr);
+ unsigned long tipc_link_tolerance(struct tipc_link *l);
+@@ -124,7 +125,7 @@ void tipc_link_set_tolerance(struct tipc_link *l, u32 tol,
+ void tipc_link_set_prio(struct tipc_link *l, u32 prio,
+ 			struct sk_buff_head *xmitq);
+ void tipc_link_set_abort_limit(struct tipc_link *l, u32 limit);
+-void tipc_link_set_queue_limits(struct tipc_link *l, u32 window);
++void tipc_link_set_queue_limits(struct tipc_link *l, u32 min_win, u32 max_win);
+ int __tipc_nl_add_link(struct net *net, struct tipc_nl_msg *msg,
+ 		       struct tipc_link *link, int nlflags);
+ int tipc_nl_parse_link_prop(struct nlattr *prop, struct nlattr *props[]);
+* Unmerged path net/tipc/node.c
+diff --git a/net/tipc/udp_media.c b/net/tipc/udp_media.c
+index 186c78431217..c8c271638fcc 100644
+--- a/net/tipc/udp_media.c
++++ b/net/tipc/udp_media.c
+@@ -831,7 +831,8 @@ struct tipc_media udp_media_info = {
+ 	.msg2addr	= tipc_udp_msg2addr,
+ 	.priority	= TIPC_DEF_LINK_PRI,
+ 	.tolerance	= TIPC_DEF_LINK_TOL,
+-	.window		= TIPC_DEF_LINK_WIN,
++	.min_win	= TIPC_DEF_LINK_WIN,
++	.max_win	= TIPC_DEF_LINK_WIN,
+ 	.mtu		= TIPC_DEF_LINK_UDP_MTU,
+ 	.type_id	= TIPC_MEDIA_TYPE_UDP,
+ 	.hwaddr_len	= 0,
