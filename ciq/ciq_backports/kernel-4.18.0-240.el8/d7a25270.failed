@@ -1,0 +1,109 @@
+libbpf: Improve handling of failed CO-RE relocations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit d7a252708dbc950ca2064310217e8b9f85846e2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d7a25270.failed
+
+Previously, if libbpf failed to resolve CO-RE relocation for some
+instructions, it would either return error immediately, or, if
+.relaxed_core_relocs option was set, would replace relocatable offset/imm part
+of an instruction with a bogus value (-1). Neither approach is good, because
+there are many possible scenarios where relocation is expected to fail (e.g.,
+when some field knowingly can be missing on specific kernel versions). On the
+other hand, replacing offset with invalid one can hide programmer errors, if
+this relocation failue wasn't anticipated.
+
+This patch deprecates .relaxed_core_relocs option and changes the approach to
+always replacing instruction, for which relocation failed, with invalid BPF
+helper call instruction. For cases where this is expected, BPF program should
+already ensure that that instruction is unreachable, in which case this
+invalid instruction is going to be silently ignored. But if instruction wasn't
+guarded, BPF program will be rejected at verification step with verifier log
+pointing precisely to the place in assembly where the problem is.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20200124053837.2434679-1-andriin@fb.com
+(cherry picked from commit d7a252708dbc950ca2064310217e8b9f85846e2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index 6ed9ef84b398,39f1b7633a7c..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -277,9 -338,13 +277,8 @@@ struct bpf_object 
+  	size_t nr_maps;
+  	size_t maps_cap;
+  
+ -	char *kconfig;
+ -	struct extern_desc *externs;
+ -	int nr_extern;
+ -	int kconfig_map_idx;
+ -
+  	bool loaded;
+  	bool has_pseudo_calls;
+- 	bool relaxed_core_relocs;
+  
+  	/*
+  	 * Information when doing elf related work. Only valid if fd
+@@@ -4029,16 -5075,23 +4047,25 @@@ __bpf_object__open(const char *path, co
+  	if (IS_ERR(obj))
+  		return obj;
+  
+++<<<<<<< HEAD
+ +	obj->relaxed_core_relocs = OPTS_GET(opts, relaxed_core_relocs, false);
+ +	relaxed_maps = OPTS_GET(opts, relaxed_maps, false);
+ +	pin_root_path = OPTS_GET(opts, pin_root_path, NULL);
+++=======
++ 	kconfig = OPTS_GET(opts, kconfig, NULL);
++ 	if (kconfig) {
++ 		obj->kconfig = strdup(kconfig);
++ 		if (!obj->kconfig)
++ 			return ERR_PTR(-ENOMEM);
++ 	}
+++>>>>>>> d7a252708dbc (libbpf: Improve handling of failed CO-RE relocations)
+  
+ -	err = bpf_object__elf_init(obj);
+ -	err = err ? : bpf_object__check_endianness(obj);
+ -	err = err ? : bpf_object__elf_collect(obj);
+ -	err = err ? : bpf_object__collect_externs(obj);
+ -	err = err ? : bpf_object__finalize_btf(obj);
+ -	err = err ? : bpf_object__init_maps(obj, opts);
+ -	err = err ? : bpf_object__init_prog_names(obj);
+ -	err = err ? : bpf_object__collect_reloc(obj);
+ -	if (err)
+ -		goto out;
+ +	CHECK_ERR(bpf_object__elf_init(obj), err, out);
+ +	CHECK_ERR(bpf_object__check_endianness(obj), err, out);
+ +	CHECK_ERR(bpf_object__probe_caps(obj), err, out);
+ +	CHECK_ERR(bpf_object__elf_collect(obj, relaxed_maps, pin_root_path),
+ +		  err, out);
+ +	CHECK_ERR(bpf_object__collect_reloc(obj), err, out);
+  	bpf_object__elf_finish(obj);
+  
+  	bpf_object__for_each_program(prog, obj) {
+* Unmerged path tools/lib/bpf/libbpf.c
+diff --git a/tools/lib/bpf/libbpf.h b/tools/lib/bpf/libbpf.h
+index e454ceec9fa2..e4389b8ee509 100644
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -77,7 +77,11 @@ struct bpf_object_open_opts {
+ 	const char *object_name;
+ 	/* parse map definitions non-strictly, allowing extra attributes/data */
+ 	bool relaxed_maps;
+-	/* process CO-RE relocations non-strictly, allowing them to fail */
++	/* DEPRECATED: handle CO-RE relocations non-strictly, allowing failures.
++	 * Value is ignored. Relocations always are processed non-strictly.
++	 * Non-relocatable instructions are replaced with invalid ones to
++	 * prevent accidental errors.
++	 * */
+ 	bool relaxed_core_relocs;
+ 	/* maps that set the 'pinning' attribute in their definition will have
+ 	 * their pin_path attribute set to a file in this directory, and be
