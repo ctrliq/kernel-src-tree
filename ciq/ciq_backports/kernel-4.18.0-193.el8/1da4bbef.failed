@@ -1,0 +1,260 @@
+net: core: page_pool: add user refcnt and reintroduce page_pool_destroy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] core: page_pool: add user refcnt and reintroduce page_pool_destroy (Jiri Benc) [1749817]
+Rebuild_FUZZ: 96.35%
+commit-author Ivan Khoronzhuk <ivan.khoronzhuk@linaro.org>
+commit 1da4bbeffe41ba318812d7590955faee8636668b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/1da4bbef.failed
+
+Jesper recently removed page_pool_destroy() (from driver invocation)
+and moved shutdown and free of page_pool into xdp_rxq_info_unreg(),
+in-order to handle in-flight packets/pages. This created an asymmetry
+in drivers create/destroy pairs.
+
+This patch reintroduce page_pool_destroy and add page_pool user
+refcnt. This serves the purpose to simplify drivers error handling as
+driver now drivers always calls page_pool_destroy() and don't need to
+track if xdp_rxq_info_reg_mem_model() was unsuccessful.
+
+This could be used for a special cases where a single RX-queue (with a
+single page_pool) provides packets for two net_device'es, and thus
+needs to register the same page_pool twice with two xdp_rxq_info
+structures.
+
+This patch is primarily to ease API usage for drivers. The recently
+merged netsec driver, actually have a bug in this area, which is
+solved by this API change.
+
+This patch is a modified version of Ivan Khoronzhuk's original patch.
+
+Link: https://lore.kernel.org/netdev/20190625175948.24771-2-ivan.khoronzhuk@linaro.org/
+Fixes: 5c67bf0ec4d0 ("net: netsec: Use page_pool API")
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Reviewed-by: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+	Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Reviewed-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: Ivan Khoronzhuk <ivan.khoronzhuk@linaro.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1da4bbeffe41ba318812d7590955faee8636668b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/socionext/netsec.c
+#	include/net/page_pool.h
+#	net/core/page_pool.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 69fec7fc1fd7,10efd69de7ef..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -620,31 -543,43 +620,62 @@@ static int mlx5e_alloc_rq(struct mlx5e_
+  		rq->mkey_be = c->mkey_be;
+  	}
+  
+ -	if (xsk) {
+ -		err = mlx5e_xsk_resize_reuseq(umem, num_xsk_frames);
+ -		if (unlikely(err)) {
+ -			mlx5_core_err(mdev, "Unable to allocate the Reuse Ring for %u frames\n",
+ -				      num_xsk_frames);
+ -			goto err_free;
+ -		}
+ -
+ +	/* Create a page_pool and register it with rxq */
+ +	pp_params.order     = 0;
+ +	pp_params.flags     = 0; /* No-internal DMA mapping in page_pool */
+ +	pp_params.pool_size = pool_size;
+ +	pp_params.nid       = cpu_to_node(c->cpu);
+ +	pp_params.dev       = c->pdev;
+ +	pp_params.dma_dir   = rq->buff.map_dir;
+ +
+++<<<<<<< HEAD
+ +	/* page_pool can be used even when there is no rq->xdp_prog,
+ +	 * given page_pool does not handle DMA mapping there is no
+ +	 * required state to clear. And page_pool gracefully handle
+ +	 * elevated refcnt.
+ +	 */
+ +	rq->page_pool = page_pool_create(&pp_params);
+ +	if (IS_ERR(rq->page_pool)) {
+ +		err = PTR_ERR(rq->page_pool);
+ +		rq->page_pool = NULL;
+++=======
++ 		rq->zca.free = mlx5e_xsk_zca_free;
++ 		err = xdp_rxq_info_reg_mem_model(&rq->xdp_rxq,
++ 						 MEM_TYPE_ZERO_COPY,
++ 						 &rq->zca);
++ 	} else {
++ 		/* Create a page_pool and register it with rxq */
++ 		pp_params.order     = 0;
++ 		pp_params.flags     = 0; /* No-internal DMA mapping in page_pool */
++ 		pp_params.pool_size = pool_size;
++ 		pp_params.nid       = cpu_to_node(c->cpu);
++ 		pp_params.dev       = c->pdev;
++ 		pp_params.dma_dir   = rq->buff.map_dir;
++ 
++ 		/* page_pool can be used even when there is no rq->xdp_prog,
++ 		 * given page_pool does not handle DMA mapping there is no
++ 		 * required state to clear. And page_pool gracefully handle
++ 		 * elevated refcnt.
++ 		 */
++ 		rq->page_pool = page_pool_create(&pp_params);
++ 		if (IS_ERR(rq->page_pool)) {
++ 			err = PTR_ERR(rq->page_pool);
++ 			rq->page_pool = NULL;
++ 			goto err_free;
++ 		}
++ 		err = xdp_rxq_info_reg_mem_model(&rq->xdp_rxq,
++ 						 MEM_TYPE_PAGE_POOL, rq->page_pool);
++ 	}
++ 	if (err)
+++>>>>>>> 1da4bbeffe41 (net: core: page_pool: add user refcnt and reintroduce page_pool_destroy)
+ +		goto err_free;
+ +	}
+ +	err = xdp_rxq_info_reg_mem_model(&rq->xdp_rxq,
+ +					 MEM_TYPE_PAGE_POOL, rq->page_pool);
+ +	if (err) {
+ +		page_pool_free(rq->page_pool);
+  		goto err_free;
+ +	}
+  
+  	for (i = 0; i < wq_sz; i++) {
+  		if (rq->wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ) {
+@@@ -739,9 -679,7 +771,13 @@@ static void mlx5e_free_rq(struct mlx5e_
+  	}
+  
+  	xdp_rxq_info_unreg(&rq->xdp_rxq);
+++<<<<<<< HEAD
+ +	if (rq->page_pool)
+ +		page_pool_destroy(rq->page_pool);
+ +
+++=======
++ 	page_pool_destroy(rq->page_pool);
+++>>>>>>> 1da4bbeffe41 (net: core: page_pool: add user refcnt and reintroduce page_pool_destroy)
+  	mlx5_wq_destroy(&rq->wq_ctrl);
+  }
+  
+diff --cc drivers/net/ethernet/socionext/netsec.c
+index e080d3e7c582,d7307ab90d74..000000000000
+--- a/drivers/net/ethernet/socionext/netsec.c
++++ b/drivers/net/ethernet/socionext/netsec.c
+@@@ -933,10 -1201,22 +933,29 @@@ static void netsec_uninit_pkt_dring(str
+  		if (!desc->addr)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		dma_unmap_single(priv->dev, desc->dma_addr, desc->len,
+ +				 id == NETSEC_RING_RX ? DMA_FROM_DEVICE :
+ +							      DMA_TO_DEVICE);
+ +		dev_kfree_skb(desc->skb);
+++=======
++ 		if (id == NETSEC_RING_RX) {
++ 			struct page *page = virt_to_page(desc->addr);
++ 
++ 			page_pool_put_page(dring->page_pool, page, false);
++ 		} else if (id == NETSEC_RING_TX) {
++ 			dma_unmap_single(priv->dev, desc->dma_addr, desc->len,
++ 					 DMA_TO_DEVICE);
++ 			dev_kfree_skb(desc->skb);
++ 		}
++ 	}
++ 
++ 	/* Rx is currently using page_pool */
++ 	if (id == NETSEC_RING_RX) {
++ 		if (xdp_rxq_info_is_reg(&dring->xdp_rxq))
++ 			xdp_rxq_info_unreg(&dring->xdp_rxq);
++ 		page_pool_destroy(dring->page_pool);
+++>>>>>>> 1da4bbeffe41 (net: core: page_pool: add user refcnt and reintroduce page_pool_destroy)
+  	}
+  
+  	memset(dring->desc, 0, sizeof(struct netsec_desc) * DESC_NUM);
+diff --cc include/net/page_pool.h
+index b373b65dd450,2cbcdbdec254..000000000000
+--- a/include/net/page_pool.h
++++ b/include/net/page_pool.h
+@@@ -96,6 -99,14 +96,17 @@@ struct page_pool 
+  	 * TODO: Implement bulk return pages into this structure.
+  	 */
+  	struct ptr_ring ring;
+++<<<<<<< HEAD
+++=======
++ 
++ 	atomic_t pages_state_release_cnt;
++ 
++ 	/* A page_pool is strictly tied to a single RX-queue being
++ 	 * protected by NAPI, due to above pp_alloc_cache. This
++ 	 * refcnt serves purpose is to simplify drivers error handling.
++ 	 */
++ 	refcount_t user_cnt;
+++>>>>>>> 1da4bbeffe41 (net: core: page_pool: add user refcnt and reintroduce page_pool_destroy)
+  };
+  
+  struct page *page_pool_alloc_pages(struct page_pool *pool, gfp_t gfp);
+diff --cc net/core/page_pool.c
+index 41391b5dc14c,3272dc7a8c81..000000000000
+--- a/net/core/page_pool.c
++++ b/net/core/page_pool.c
+@@@ -43,6 -47,14 +43,17 @@@ static int page_pool_init(struct page_p
+  	if (ptr_ring_init(&pool->ring, ring_qsize, GFP_KERNEL) < 0)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	atomic_set(&pool->pages_state_release_cnt, 0);
++ 
++ 	/* Driver calling page_pool_create() also call page_pool_destroy() */
++ 	refcount_set(&pool->user_cnt, 1);
++ 
++ 	if (pool->p.flags & PP_FLAG_DMA_MAP)
++ 		get_device(pool->p.dev);
++ 
+++>>>>>>> 1da4bbeffe41 (net: core: page_pool: add user refcnt and reintroduce page_pool_destroy)
+  	return 0;
+  }
+  
+@@@ -292,8 -345,25 +304,12 @@@ static void __page_pool_empty_ring(stru
+  	}
+  }
+  
+ -static void __warn_in_flight(struct page_pool *pool)
+ -{
+ -	u32 release_cnt = atomic_read(&pool->pages_state_release_cnt);
+ -	u32 hold_cnt = READ_ONCE(pool->pages_state_hold_cnt);
+ -	s32 distance;
+ -
+ -	distance = _distance(hold_cnt, release_cnt);
+ -
+ -	/* Drivers should fix this, but only problematic when DMA is used */
+ -	WARN(1, "Still in-flight pages:%d hold:%u released:%u",
+ -	     distance, hold_cnt, release_cnt);
+ -}
+ -
+  void __page_pool_free(struct page_pool *pool)
+  {
++ 	/* Only last user actually free/release resources */
++ 	if (!page_pool_put(pool))
++ 		return;
++ 
+  	WARN(pool->alloc.count, "API usage violation");
+  	WARN(!ptr_ring_empty(&pool->ring), "ptr_ring is not empty");
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/socionext/netsec.c
+* Unmerged path include/net/page_pool.h
+* Unmerged path net/core/page_pool.c
+diff --git a/net/core/xdp.c b/net/core/xdp.c
+index 762abeb89847..f71fee414b93 100644
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@ -307,6 +307,9 @@ int xdp_rxq_info_reg_mem_model(struct xdp_rxq_info *xdp_rxq,
+ 		goto err;
+ 	}
+ 
++	if (type == MEM_TYPE_PAGE_POOL)
++		page_pool_get(xdp_alloc->page_pool);
++
+ 	mutex_unlock(&mem_id_lock);
+ 
+ 	return 0;
