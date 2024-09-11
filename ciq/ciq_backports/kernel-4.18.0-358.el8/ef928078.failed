@@ -1,0 +1,237 @@
+selftests: xsk: Remove thread for netns switch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+commit ef9280789773c974b45f809d58b47b481f2cf9f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/ef928078.failed
+
+Currently, there is a dedicated thread for following remote ns operations:
+- grabbing the ifindex of the interface moved to remote netns
+- removing xdp prog from that interface
+
+With bpf_link usage in place, this can be simply omitted, so remove
+mentioned thread, as BPF resources will be managed by bpf_link itself,
+so there's no further need for creating the thread that will switch to
+remote netns and do the cleanup.
+
+Keep most of the logic for switching the ns, though, but make
+switch_namespace() return the fd so that it will be possible to close it
+at the process termination time. Get rid of logic around making sure
+that it's possible to switch ns in validate_interfaces().
+
+	Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210329224316.17793-9-maciej.fijalkowski@intel.com
+(cherry picked from commit ef9280789773c974b45f809d58b47b481f2cf9f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/xdpxceiver.c
+#	tools/testing/selftests/bpf/xdpxceiver.h
+diff --cc tools/testing/selftests/bpf/xdpxceiver.c
+index 9f8d5dabf30a,a856b2935d66..000000000000
+--- a/tools/testing/selftests/bpf/xdpxceiver.c
++++ b/tools/testing/selftests/bpf/xdpxceiver.c
+@@@ -966,25 -971,90 +924,111 @@@ static void testapp_sockets(void
+  	print_ksft_result();
+  }
+  
+ -static void testapp_stats(void)
+ +static void init_iface_config(struct ifaceconfigobj *ifaceconfig)
+  {
+++<<<<<<< HEAD
+ +	/*Init interface0 */
+++=======
++ 	for (int i = 0; i < STAT_TEST_TYPE_MAX; i++) {
++ 		stat_test_type = i;
++ 
++ 		/* reset defaults */
++ 		rxqsize = XSK_RING_CONS__DEFAULT_NUM_DESCS;
++ 		frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM;
++ 
++ 		switch (stat_test_type) {
++ 		case STAT_TEST_RX_DROPPED:
++ 			frame_headroom = XSK_UMEM__DEFAULT_FRAME_SIZE -
++ 						XDP_PACKET_HEADROOM - 1;
++ 			break;
++ 		case STAT_TEST_RX_FULL:
++ 			rxqsize = RX_FULL_RXQSIZE;
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 		testapp_validate();
++ 	}
++ 
++ 	print_ksft_result();
++ }
++ 
++ static void init_iface(struct ifobject *ifobj, const char *dst_mac,
++ 		       const char *src_mac, const char *dst_ip,
++ 		       const char *src_ip, const u16 dst_port,
++ 		       const u16 src_port)
++ {
++ 	struct in_addr ip;
++ 
++ 	memcpy(ifobj->dst_mac, dst_mac, ETH_ALEN);
++ 	memcpy(ifobj->src_mac, src_mac, ETH_ALEN);
++ 
++ 	inet_aton(dst_ip, &ip);
++ 	ifobj->dst_ip = ip.s_addr;
++ 
++ 	inet_aton(src_ip, &ip);
++ 	ifobj->src_ip = ip.s_addr;
++ 
++ 	ifobj->dst_port = dst_port;
++ 	ifobj->src_port = src_port;
++ }
++ 
++ static void run_pkt_test(int mode, int type)
++ {
++ 	test_type = type;
++ 
++ 	/* reset defaults after potential previous test */
++ 	xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
++ 	pkt_counter = 0;
++ 	switching_notify = 0;
++ 	bidi_pass = 0;
++ 	prev_pkt = -1;
+++>>>>>>> ef9280789773 (selftests: xsk: Remove thread for netns switch)
+  	ifdict[0]->fv.vector = tx;
+ +	memcpy(ifdict[0]->dst_mac, ifaceconfig->dst_mac, ETH_ALEN);
+ +	memcpy(ifdict[0]->src_mac, ifaceconfig->src_mac, ETH_ALEN);
+ +	ifdict[0]->dst_ip = ifaceconfig->dst_ip.s_addr;
+ +	ifdict[0]->src_ip = ifaceconfig->src_ip.s_addr;
+ +	ifdict[0]->dst_port = ifaceconfig->dst_port;
+ +	ifdict[0]->src_port = ifaceconfig->src_port;
+ +
+ +	/*Init interface1 */
+  	ifdict[1]->fv.vector = rx;
+++<<<<<<< HEAD
+ +	memcpy(ifdict[1]->dst_mac, ifaceconfig->src_mac, ETH_ALEN);
+ +	memcpy(ifdict[1]->src_mac, ifaceconfig->dst_mac, ETH_ALEN);
+ +	ifdict[1]->dst_ip = ifaceconfig->src_ip.s_addr;
+ +	ifdict[1]->src_ip = ifaceconfig->dst_ip.s_addr;
+ +	ifdict[1]->dst_port = ifaceconfig->src_port;
+ +	ifdict[1]->src_port = ifaceconfig->dst_port;
+++=======
++ 	sigvar = 0;
++ 	stat_test_type = -1;
++ 	rxqsize = XSK_RING_CONS__DEFAULT_NUM_DESCS;
++ 	frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM;
++ 
++ 	switch (mode) {
++ 	case (TEST_MODE_SKB):
++ 		xdp_flags |= XDP_FLAGS_SKB_MODE;
++ 		break;
++ 	case (TEST_MODE_DRV):
++ 		xdp_flags |= XDP_FLAGS_DRV_MODE;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	pthread_init_mutex();
++ 
++ 	if (test_type == TEST_TYPE_STATS)
++ 		testapp_stats();
++ 	else if ((test_type != TEST_TYPE_TEARDOWN) && (test_type != TEST_TYPE_BIDI))
++ 		testapp_validate();
++ 	else
++ 		testapp_sockets();
++ 
++ 	pthread_destroy_mutex();
+++>>>>>>> ef9280789773 (selftests: xsk: Remove thread for netns switch)
+  }
+  
+  int main(int argc, char **argv)
+@@@ -1023,26 -1079,25 +1067,37 @@@
+  
+  	num_frames = ++opt_pkt_count;
+  
+ -	ifdict[0]->fv.vector = tx;
+ -	init_iface(ifdict[0], MAC1, MAC2, IP1, IP2, UDP_PORT1, UDP_PORT2);
+ +	init_iface_config(ifaceconfig);
+  
+ -	ifdict[1]->fv.vector = rx;
+ -	init_iface(ifdict[1], MAC2, MAC1, IP2, IP1, UDP_PORT2, UDP_PORT1);
+ +	pthread_init_mutex();
+ +
+++<<<<<<< HEAD
+ +	ksft_set_plan(1);
+  
+ +	if (!opt_teardown && !opt_bidi) {
+ +		testapp_validate();
+ +	} else if (opt_teardown && opt_bidi) {
+ +		ksft_test_result_fail("ERROR: parameters -T and -B cannot be used together\n");
+ +		ksft_exit_xfail();
+ +	} else {
+ +		testapp_sockets();
+++=======
++ 	ksft_set_plan(TEST_MODE_MAX * TEST_TYPE_MAX);
++ 
++ 	for (i = 0; i < TEST_MODE_MAX; i++) {
++ 		for (j = 0; j < TEST_TYPE_MAX; j++)
++ 			run_pkt_test(i, j);
+++>>>>>>> ef9280789773 (selftests: xsk: Remove thread for netns switch)
+  	}
+  
+- 	for (int i = 0; i < MAX_INTERFACES; i++)
++ 	for (int i = 0; i < MAX_INTERFACES; i++) {
++ 		if (ifdict[i]->ns_fd != -1)
++ 			close(ifdict[i]->ns_fd);
+  		free(ifdict[i]);
++ 	}
+  
+ +	pthread_destroy_mutex();
+ +
+  	ksft_exit_pass();
+  
+  	return 0;
+diff --cc tools/testing/selftests/bpf/xdpxceiver.h
+index f66f399dfb2d,493f7498d40e..000000000000
+--- a/tools/testing/selftests/bpf/xdpxceiver.h
++++ b/tools/testing/selftests/bpf/xdpxceiver.h
+@@@ -102,17 -125,8 +102,17 @@@ struct generic_data 
+  	u32 seqnum;
+  };
+  
+ +struct ifaceconfigobj {
+ +	u8 dst_mac[ETH_ALEN];
+ +	u8 src_mac[ETH_ALEN];
+ +	struct in_addr dst_ip;
+ +	struct in_addr src_ip;
+ +	u16 src_port;
+ +	u16 dst_port;
+ +} *ifaceconfig;
+ +
+  struct ifobject {
+- 	int ifindex;
++ 	int ns_fd;
+  	int ifdict_index;
+  	char ifname[MAX_INTERFACE_NAME_CHARS];
+  	char nsname[MAX_INTERFACES_NAMESPACE_CHARS];
+@@@ -136,14 -150,9 +136,17 @@@ pthread_mutex_t sync_mutex
+  pthread_mutex_t sync_mutex_tx;
+  pthread_cond_t signal_rx_condition;
+  pthread_cond_t signal_tx_condition;
+- pthread_t t0, t1, ns_thread;
++ pthread_t t0, t1;
+  pthread_attr_t attr;
+  
+++<<<<<<< HEAD
+ +struct targs {
+ +	bool retptr;
+ +	int idx;
+ +};
+ +
+++=======
+++>>>>>>> ef9280789773 (selftests: xsk: Remove thread for netns switch)
+  TAILQ_HEAD(head_s, pkt) head = TAILQ_HEAD_INITIALIZER(head);
+  struct head_s *head_p;
+  struct pkt {
+* Unmerged path tools/testing/selftests/bpf/xdpxceiver.c
+* Unmerged path tools/testing/selftests/bpf/xdpxceiver.h
