@@ -1,0 +1,200 @@
+drm/i915: Force a TypeC PHY disconnect during suspend/shutdown
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Imre Deak <imre.deak@intel.com>
+commit 151ec347b06a2fb6ecd2922475dca71a7af827a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/151ec347.failed
+
+Disconnect TypeC PHYs during system suspend and shutdown, even with the
+corresponding TypeC sink still plugged to its connector, since leaving
+the PHY connected causes havoc at least during system resume in the
+presence of an Nvidia card.
+
+Note that this will only make a difference in the TypeC DP alternate
+mode, since in Thunderbolt alternate mode the PHY is never owned by the
+display engine and there is no notion of PHY ownership in legacy mode
+(the display engine being the only possible owner in that mode and the
+TypeC subsystem not having anything to do with the port in that case).
+
+Closes: https://gitlab.freedesktop.org/drm/intel/-/issues/3500
+Reported-and-tested-by: Chris Chiu <chris.chiu@canonical.com>
+	Signed-off-by: Imre Deak <imre.deak@intel.com>
+	Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210610174223.605904-1-imre.deak@intel.com
+(cherry picked from commit 151ec347b06a2fb6ecd2922475dca71a7af827a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_ddi.c
+diff --cc drivers/gpu/drm/i915/display/intel_ddi.c
+index 0f72647ed48c,637286fbb847..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@@ -5589,6 -4487,46 +5589,49 @@@ static enum hpd_pin skl_hpd_pin(struct 
+  	return HPD_PORT_A + port - PORT_A;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool intel_ddi_is_tc(struct drm_i915_private *i915, enum port port)
++ {
++ 	if (DISPLAY_VER(i915) >= 12)
++ 		return port >= PORT_TC1;
++ 	else if (DISPLAY_VER(i915) >= 11)
++ 		return port >= PORT_C;
++ 	else
++ 		return false;
++ }
++ 
++ static void intel_ddi_encoder_suspend(struct intel_encoder *encoder)
++ {
++ 	struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
++ 	struct drm_i915_private *i915 = dp_to_i915(intel_dp);
++ 	struct intel_digital_port *dig_port = dp_to_dig_port(intel_dp);
++ 	enum phy phy = intel_port_to_phy(i915, encoder->port);
++ 
++ 	intel_dp_encoder_suspend(encoder);
++ 
++ 	if (!intel_phy_is_tc(i915, phy))
++ 		return;
++ 
++ 	intel_tc_port_disconnect_phy(dig_port);
++ }
++ 
++ static void intel_ddi_encoder_shutdown(struct intel_encoder *encoder)
++ {
++ 	struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
++ 	struct drm_i915_private *i915 = dp_to_i915(intel_dp);
++ 	struct intel_digital_port *dig_port = dp_to_dig_port(intel_dp);
++ 	enum phy phy = intel_port_to_phy(i915, encoder->port);
++ 
++ 	intel_dp_encoder_shutdown(encoder);
++ 
++ 	if (!intel_phy_is_tc(i915, phy))
++ 		return;
++ 
++ 	intel_tc_port_disconnect_phy(dig_port);
++ }
++ 
+++>>>>>>> 151ec347b06a (drm/i915: Force a TypeC PHY disconnect during suspend/shutdown)
+  #define port_tc_name(port) ((port) - PORT_TC1 + '1')
+  #define tc_port_name(tc_port) ((tc_port) - TC_PORT_1 + '1')
+  
+@@@ -5680,11 -4634,10 +5723,11 @@@ void intel_ddi_init(struct drm_i915_pri
+  	encoder->post_disable = intel_ddi_post_disable;
+  	encoder->update_pipe = intel_ddi_update_pipe;
+  	encoder->get_hw_state = intel_ddi_get_hw_state;
+ +	encoder->get_config = intel_ddi_get_config;
+  	encoder->sync_state = intel_ddi_sync_state;
+  	encoder->initial_fastset_check = intel_ddi_initial_fastset_check;
+- 	encoder->suspend = intel_dp_encoder_suspend;
+- 	encoder->shutdown = intel_dp_encoder_shutdown;
++ 	encoder->suspend = intel_ddi_encoder_suspend;
++ 	encoder->shutdown = intel_ddi_encoder_shutdown;
+  	encoder->get_power_domains = intel_ddi_get_power_domains;
+  
+  	encoder->type = INTEL_OUTPUT_DDI;
+* Unmerged path drivers/gpu/drm/i915/display/intel_ddi.c
+diff --git a/drivers/gpu/drm/i915/display/intel_tc.c b/drivers/gpu/drm/i915/display/intel_tc.c
+index 2cefc13535a0..da1eb22fb0be 100644
+--- a/drivers/gpu/drm/i915/display/intel_tc.c
++++ b/drivers/gpu/drm/i915/display/intel_tc.c
+@@ -449,7 +449,7 @@ intel_tc_port_get_target_mode(struct intel_digital_port *dig_port)
+ }
+ 
+ static void intel_tc_port_reset_mode(struct intel_digital_port *dig_port,
+-				     int required_lanes)
++				     int required_lanes, bool force_disconnect)
+ {
+ 	struct drm_i915_private *i915 = to_i915(dig_port->base.base.dev);
+ 	enum tc_port_mode old_tc_mode = dig_port->tc_mode;
+@@ -465,7 +465,8 @@ static void intel_tc_port_reset_mode(struct intel_digital_port *dig_port,
+ 	}
+ 
+ 	icl_tc_phy_disconnect(dig_port);
+-	icl_tc_phy_connect(dig_port, required_lanes);
++	if (!force_disconnect)
++		icl_tc_phy_connect(dig_port, required_lanes);
+ 
+ 	drm_dbg_kms(&i915->drm, "Port %s: TC port mode reset (%s -> %s)\n",
+ 		    dig_port->tc_port_name,
+@@ -555,7 +556,7 @@ bool intel_tc_port_connected(struct intel_encoder *encoder)
+ }
+ 
+ static void __intel_tc_port_lock(struct intel_digital_port *dig_port,
+-				 int required_lanes)
++				 int required_lanes, bool force_disconnect)
+ {
+ 	struct drm_i915_private *i915 = to_i915(dig_port->base.base.dev);
+ 	intel_wakeref_t wakeref;
+@@ -569,8 +570,9 @@ static void __intel_tc_port_lock(struct intel_digital_port *dig_port,
+ 
+ 		tc_cold_wref = tc_cold_block(dig_port);
+ 
+-		if (intel_tc_port_needs_reset(dig_port))
+-			intel_tc_port_reset_mode(dig_port, required_lanes);
++		if (force_disconnect || intel_tc_port_needs_reset(dig_port))
++			intel_tc_port_reset_mode(dig_port, required_lanes,
++						 force_disconnect);
+ 
+ 		tc_cold_unblock(dig_port, tc_cold_wref);
+ 	}
+@@ -581,7 +583,7 @@ static void __intel_tc_port_lock(struct intel_digital_port *dig_port,
+ 
+ void intel_tc_port_lock(struct intel_digital_port *dig_port)
+ {
+-	__intel_tc_port_lock(dig_port, 1);
++	__intel_tc_port_lock(dig_port, 1, false);
+ }
+ 
+ void intel_tc_port_unlock(struct intel_digital_port *dig_port)
+@@ -595,6 +597,24 @@ void intel_tc_port_unlock(struct intel_digital_port *dig_port)
+ 				      wakeref);
+ }
+ 
++/**
++ * intel_tc_port_disconnect_phy: disconnect TypeC PHY from display port
++ * @dig_port: digital port
++ *
++ * Disconnect the given digital port from its TypeC PHY (handing back the
++ * control of the PHY to the TypeC subsystem). The only purpose of this
++ * function is to force the disconnect even with a TypeC display output still
++ * plugged to the TypeC connector, which is required by the TypeC firmwares
++ * during system suspend and shutdown. Otherwise - during the unplug event
++ * handling - the PHY ownership is released automatically by
++ * intel_tc_port_reset_mode(), when calling this function is not required.
++ */
++void intel_tc_port_disconnect_phy(struct intel_digital_port *dig_port)
++{
++	__intel_tc_port_lock(dig_port, 1, true);
++	intel_tc_port_unlock(dig_port);
++}
++
+ bool intel_tc_port_ref_held(struct intel_digital_port *dig_port)
+ {
+ 	return mutex_is_locked(&dig_port->tc_lock) ||
+@@ -604,7 +624,7 @@ bool intel_tc_port_ref_held(struct intel_digital_port *dig_port)
+ void intel_tc_port_get_link(struct intel_digital_port *dig_port,
+ 			    int required_lanes)
+ {
+-	__intel_tc_port_lock(dig_port, required_lanes);
++	__intel_tc_port_lock(dig_port, required_lanes, false);
+ 	dig_port->tc_link_refcount++;
+ 	intel_tc_port_unlock(dig_port);
+ }
+diff --git a/drivers/gpu/drm/i915/display/intel_tc.h b/drivers/gpu/drm/i915/display/intel_tc.h
+index b619e4736f85..57d157fc822f 100644
+--- a/drivers/gpu/drm/i915/display/intel_tc.h
++++ b/drivers/gpu/drm/i915/display/intel_tc.h
+@@ -13,6 +13,8 @@ struct intel_digital_port;
+ struct intel_encoder;
+ 
+ bool intel_tc_port_connected(struct intel_encoder *encoder);
++void intel_tc_port_disconnect_phy(struct intel_digital_port *dig_port);
++
+ u32 intel_tc_port_get_lane_mask(struct intel_digital_port *dig_port);
+ u32 intel_tc_port_get_pin_assignment_mask(struct intel_digital_port *dig_port);
+ int intel_tc_port_fia_max_lane_count(struct intel_digital_port *dig_port);
