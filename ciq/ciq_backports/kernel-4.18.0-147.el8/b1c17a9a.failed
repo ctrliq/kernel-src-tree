@@ -1,0 +1,152 @@
+flow_dissector: disable preemption around BPF calls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Eric Dumazet <edumazet@google.com>
+commit b1c17a9a353878602fd5bfe9103e4afe5e9a3f96
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/b1c17a9a.failed
+
+Various things in eBPF really require us to disable preemption
+before running an eBPF program.
+
+syzbot reported :
+
+BUG: assuming atomic context at net/core/flow_dissector.c:737
+in_atomic(): 0, irqs_disabled(): 0, pid: 24710, name: syz-executor.3
+2 locks held by syz-executor.3/24710:
+ #0: 00000000e81a4bf1 (&tfile->napi_mutex){+.+.}, at: tun_get_user+0x168e/0x3ff0 drivers/net/tun.c:1850
+ #1: 00000000254afebd (rcu_read_lock){....}, at: __skb_flow_dissect+0x1e1/0x4bb0 net/core/flow_dissector.c:822
+CPU: 1 PID: 24710 Comm: syz-executor.3 Not tainted 5.1.0+ #6
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
+Call Trace:
+ __dump_stack lib/dump_stack.c:77 [inline]
+ dump_stack+0x172/0x1f0 lib/dump_stack.c:113
+ __cant_sleep kernel/sched/core.c:6165 [inline]
+ __cant_sleep.cold+0xa3/0xbb kernel/sched/core.c:6142
+ bpf_flow_dissect+0xfe/0x390 net/core/flow_dissector.c:737
+ __skb_flow_dissect+0x362/0x4bb0 net/core/flow_dissector.c:853
+ skb_flow_dissect_flow_keys_basic include/linux/skbuff.h:1322 [inline]
+ skb_probe_transport_header include/linux/skbuff.h:2500 [inline]
+ skb_probe_transport_header include/linux/skbuff.h:2493 [inline]
+ tun_get_user+0x2cfe/0x3ff0 drivers/net/tun.c:1940
+ tun_chr_write_iter+0xbd/0x156 drivers/net/tun.c:2037
+ call_write_iter include/linux/fs.h:1872 [inline]
+ do_iter_readv_writev+0x5fd/0x900 fs/read_write.c:693
+ do_iter_write fs/read_write.c:970 [inline]
+ do_iter_write+0x184/0x610 fs/read_write.c:951
+ vfs_writev+0x1b3/0x2f0 fs/read_write.c:1015
+ do_writev+0x15b/0x330 fs/read_write.c:1058
+ __do_sys_writev fs/read_write.c:1131 [inline]
+ __se_sys_writev fs/read_write.c:1128 [inline]
+ __x64_sys_writev+0x75/0xb0 fs/read_write.c:1128
+ do_syscall_64+0x103/0x670 arch/x86/entry/common.c:298
+ entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+Fixes: d58e468b1112 ("flow_dissector: implements flow dissector BPF hook")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: syzbot <syzkaller@googlegroups.com>
+	Cc: Petar Penkov <ppenkov@google.com>
+	Cc: Stanislav Fomichev <sdf@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b1c17a9a353878602fd5bfe9103e4afe5e9a3f96)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/flow_dissector.c
+diff --cc net/core/flow_dissector.c
+index 9dda92c23ba9,548f39dde307..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -588,8 -668,86 +588,88 @@@ static bool skb_flow_dissect_allowed(in
+  	return (*num_hdrs <= MAX_FLOW_DISSECT_HDRS);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __skb_flow_bpf_to_target(const struct bpf_flow_keys *flow_keys,
++ 				     struct flow_dissector *flow_dissector,
++ 				     void *target_container)
++ {
++ 	struct flow_dissector_key_control *key_control;
++ 	struct flow_dissector_key_basic *key_basic;
++ 	struct flow_dissector_key_addrs *key_addrs;
++ 	struct flow_dissector_key_ports *key_ports;
++ 
++ 	key_control = skb_flow_dissector_target(flow_dissector,
++ 						FLOW_DISSECTOR_KEY_CONTROL,
++ 						target_container);
++ 	key_control->thoff = flow_keys->thoff;
++ 	if (flow_keys->is_frag)
++ 		key_control->flags |= FLOW_DIS_IS_FRAGMENT;
++ 	if (flow_keys->is_first_frag)
++ 		key_control->flags |= FLOW_DIS_FIRST_FRAG;
++ 	if (flow_keys->is_encap)
++ 		key_control->flags |= FLOW_DIS_ENCAPSULATION;
++ 
++ 	key_basic = skb_flow_dissector_target(flow_dissector,
++ 					      FLOW_DISSECTOR_KEY_BASIC,
++ 					      target_container);
++ 	key_basic->n_proto = flow_keys->n_proto;
++ 	key_basic->ip_proto = flow_keys->ip_proto;
++ 
++ 	if (flow_keys->addr_proto == ETH_P_IP &&
++ 	    dissector_uses_key(flow_dissector, FLOW_DISSECTOR_KEY_IPV4_ADDRS)) {
++ 		key_addrs = skb_flow_dissector_target(flow_dissector,
++ 						      FLOW_DISSECTOR_KEY_IPV4_ADDRS,
++ 						      target_container);
++ 		key_addrs->v4addrs.src = flow_keys->ipv4_src;
++ 		key_addrs->v4addrs.dst = flow_keys->ipv4_dst;
++ 		key_control->addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
++ 	} else if (flow_keys->addr_proto == ETH_P_IPV6 &&
++ 		   dissector_uses_key(flow_dissector,
++ 				      FLOW_DISSECTOR_KEY_IPV6_ADDRS)) {
++ 		key_addrs = skb_flow_dissector_target(flow_dissector,
++ 						      FLOW_DISSECTOR_KEY_IPV6_ADDRS,
++ 						      target_container);
++ 		memcpy(&key_addrs->v6addrs, &flow_keys->ipv6_src,
++ 		       sizeof(key_addrs->v6addrs));
++ 		key_control->addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
++ 	}
++ 
++ 	if (dissector_uses_key(flow_dissector, FLOW_DISSECTOR_KEY_PORTS)) {
++ 		key_ports = skb_flow_dissector_target(flow_dissector,
++ 						      FLOW_DISSECTOR_KEY_PORTS,
++ 						      target_container);
++ 		key_ports->src = flow_keys->sport;
++ 		key_ports->dst = flow_keys->dport;
++ 	}
++ }
++ 
++ bool bpf_flow_dissect(struct bpf_prog *prog, struct bpf_flow_dissector *ctx,
++ 		      __be16 proto, int nhoff, int hlen)
++ {
++ 	struct bpf_flow_keys *flow_keys = ctx->flow_keys;
++ 	u32 result;
++ 
++ 	/* Pass parameters to the BPF program */
++ 	memset(flow_keys, 0, sizeof(*flow_keys));
++ 	flow_keys->n_proto = proto;
++ 	flow_keys->nhoff = nhoff;
++ 	flow_keys->thoff = flow_keys->nhoff;
++ 
++ 	preempt_disable();
++ 	result = BPF_PROG_RUN(prog, ctx);
++ 	preempt_enable();
++ 
++ 	flow_keys->nhoff = clamp_t(u16, flow_keys->nhoff, nhoff, hlen);
++ 	flow_keys->thoff = clamp_t(u16, flow_keys->thoff,
++ 				   flow_keys->nhoff, hlen);
++ 
++ 	return result == BPF_OK;
++ }
++ 
+++>>>>>>> b1c17a9a3538 (flow_dissector: disable preemption around BPF calls)
+  /**
+   * __skb_flow_dissect - extract the flow_keys struct and return it
+ - * @net: associated network namespace, derived from @skb if NULL
+   * @skb: sk_buff to extract the flow from, can be NULL if the rest are specified
+   * @flow_dissector: list of keys to dissect
+   * @target_container: target structure to put dissected values into
+* Unmerged path net/core/flow_dissector.c
