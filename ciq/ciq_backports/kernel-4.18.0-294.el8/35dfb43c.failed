@@ -1,0 +1,101 @@
+KVM: PPC: Book3S HV: Set LPCR[HDICE] before writing HDEC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [powerpc] kvm: ppc: book3s hv: Set LPCR[HDICE] before writing HDEC (Greg Kurz) [1882796]
+Rebuild_FUZZ: 92.31%
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit 35dfb43c243b28658ef757a2b9c6454f99cfc43c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/35dfb43c.failed
+
+POWER8 and POWER9 machines have a hardware deviation where generation
+of a hypervisor decrementer exception is suppressed if the HDICE bit
+in the LPCR register is 0 at the time when the HDEC register
+decrements from 0 to -1.  When entering a guest, KVM first writes the
+HDEC register with the time until it wants the CPU to exit the guest,
+and then writes the LPCR with the guest value, which includes
+HDICE = 1.  If HDEC decrements from 0 to -1 during the interval
+between those two events, it is possible that we can enter the guest
+with HDEC already negative but no HDEC exception pending, meaning that
+no HDEC interrupt will occur while the CPU is in the guest, or at
+least not until HDEC wraps around.  Thus it is possible for the CPU to
+keep executing in the guest for a long time; up to about 4 seconds on
+POWER8, or about 4.46 years on POWER9 (except that the host kernel
+hard lockup detector will fire first).
+
+To fix this, we set the LPCR[HDICE] bit before writing HDEC on guest
+entry.
+
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 35dfb43c243b28658ef757a2b9c6454f99cfc43c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv.c
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 8240505adba5,7ee00681ecb5..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -3447,9 -3442,19 +3447,23 @@@ static int kvmhv_load_hv_regs_and_go(st
+  	unsigned long host_psscr = mfspr(SPRN_PSSCR);
+  	unsigned long host_pidr = mfspr(SPRN_PID);
+  
++ 	/*
++ 	 * P8 and P9 suppress the HDEC exception when LPCR[HDICE] = 0,
++ 	 * so set HDICE before writing HDEC.
++ 	 */
++ 	mtspr(SPRN_LPCR, vcpu->kvm->arch.host_lpcr | LPCR_HDICE);
++ 	isync();
++ 
+  	hdec = time_limit - mftb();
+++<<<<<<< HEAD
+ +	if (hdec < 2048)
+++=======
++ 	if (hdec < 0) {
++ 		mtspr(SPRN_LPCR, vcpu->kvm->arch.host_lpcr);
++ 		isync();
+++>>>>>>> 35dfb43c243b (KVM: PPC: Book3S HV: Set LPCR[HDICE] before writing HDEC)
+  		return BOOK3S_INTERRUPT_HV_DECREMENTER;
++ 	}
+  	mtspr(SPRN_HDEC, hdec);
+  
+  	if (vc->tb_offset) {
+@@@ -3577,7 -3582,7 +3591,11 @@@ int kvmhv_p9_guest_entry(struct kvm_vcp
+  
+  	dec = mfspr(SPRN_DEC);
+  	tb = mftb();
+++<<<<<<< HEAD
+ +	if (dec < 2048)
+++=======
++ 	if (dec < 0)
+++>>>>>>> 35dfb43c243b (KVM: PPC: Book3S HV: Set LPCR[HDICE] before writing HDEC)
+  		return BOOK3S_INTERRUPT_HV_DECREMENTER;
+  	local_paca->kvm_hstate.dec_expires = dec + tb;
+  	if (local_paca->kvm_hstate.dec_expires < time_limit)
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+diff --git a/arch/powerpc/kvm/book3s_hv_interrupts.S b/arch/powerpc/kvm/book3s_hv_interrupts.S
+index ff3f921b4bad..1c730151faec 100644
+--- a/arch/powerpc/kvm/book3s_hv_interrupts.S
++++ b/arch/powerpc/kvm/book3s_hv_interrupts.S
+@@ -67,13 +67,16 @@ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S)
+ 	/*
+ 	 * Put whatever is in the decrementer into the
+ 	 * hypervisor decrementer.
++	 * Because of a hardware deviation in P8 and P9,
++	 * we need to set LPCR[HDICE] before writing HDEC.
+ 	 */
+-BEGIN_FTR_SECTION
+ 	ld	r5, HSTATE_KVM_VCORE(r13)
+ 	ld	r6, VCORE_KVM(r5)
+ 	ld	r9, KVM_HOST_LPCR(r6)
+-	andis.	r9, r9, LPCR_LD@h
+-END_FTR_SECTION_IFSET(CPU_FTR_ARCH_300)
++	ori	r8, r9, LPCR_HDICE
++	mtspr	SPRN_LPCR, r8
++	isync
++	andis.	r0, r9, LPCR_LD@h
+ 	mfspr	r8,SPRN_DEC
+ 	mftb	r7
+ BEGIN_FTR_SECTION
