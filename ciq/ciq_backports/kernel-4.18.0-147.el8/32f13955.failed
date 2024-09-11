@@ -1,0 +1,115 @@
+arm/arm64: KVM: Statically configure the host's view of MPIDR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Marc Zyngier <marc.zyngier@arm.com>
+commit 32f139551954512bfdf9d558341af453bb8b12b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/32f13955.failed
+
+We currently eagerly save/restore MPIDR. It turns out to be
+slightly pointless:
+- On the host, this value is known as soon as we're scheduled on a
+  physical CPU
+- In the guest, this value cannot change, as it is set by KVM
+  (and this is a read-only register)
+
+The result of the above is that we can perfectly avoid the eager
+saving of MPIDR_EL1, and only keep the restore. We just have
+to setup the host contexts appropriately at boot time.
+
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+	Acked-by: Christoffer Dall <christoffer.dall@arm.com>
+	Signed-off-by: Christoffer Dall <christoffer.dall@arm.com>
+(cherry picked from commit 32f139551954512bfdf9d558341af453bb8b12b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_host.h
+diff --cc arch/arm64/include/asm/kvm_host.h
+index 5460ee87456c,f497bb31031f..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -418,6 -419,15 +419,18 @@@ struct kvm_vcpu *kvm_mpidr_to_vcpu(stru
+  
+  DECLARE_PER_CPU(kvm_cpu_context_t, kvm_host_cpu_state);
+  
+++<<<<<<< HEAD
+++=======
++ static inline void kvm_init_host_cpu_context(kvm_cpu_context_t *cpu_ctxt,
++ 					     int cpu)
++ {
++ 	/* The host's MPIDR is immutable, so let's set it up at boot time */
++ 	cpu_ctxt->sys_regs[MPIDR_EL1] = cpu_logical_map(cpu);
++ }
++ 
++ void __kvm_enable_ssbs(void);
++ 
+++>>>>>>> 32f139551954 (arm/arm64: KVM: Statically configure the host's view of MPIDR)
+  static inline void __cpu_init_hyp_mode(phys_addr_t pgd_ptr,
+  				       unsigned long hyp_stack_ptr,
+  				       unsigned long vector_ptr)
+diff --git a/arch/arm/include/asm/kvm_host.h b/arch/arm/include/asm/kvm_host.h
+index 704ceafb0cd3..f77eb1a714a2 100644
+--- a/arch/arm/include/asm/kvm_host.h
++++ b/arch/arm/include/asm/kvm_host.h
+@@ -26,6 +26,7 @@
+ #include <asm/kvm_asm.h>
+ #include <asm/kvm_mmio.h>
+ #include <asm/fpstate.h>
++#include <asm/smp_plat.h>
+ #include <kvm/arm_arch_timer.h>
+ 
+ #define __KVM_HAVE_ARCH_INTC_INITIALIZED
+@@ -147,6 +148,13 @@ struct kvm_cpu_context {
+ 
+ typedef struct kvm_cpu_context kvm_cpu_context_t;
+ 
++static inline void kvm_init_host_cpu_context(kvm_cpu_context_t *cpu_ctxt,
++					     int cpu)
++{
++	/* The host's MPIDR is immutable, so let's set it up at boot time */
++	cpu_ctxt->cp15[c0_MPIDR] = cpu_logical_map(cpu);
++}
++
+ struct kvm_vcpu_arch {
+ 	struct kvm_cpu_context ctxt;
+ 
+diff --git a/arch/arm/kvm/hyp/cp15-sr.c b/arch/arm/kvm/hyp/cp15-sr.c
+index c4782812714c..8bf895ec6e04 100644
+--- a/arch/arm/kvm/hyp/cp15-sr.c
++++ b/arch/arm/kvm/hyp/cp15-sr.c
+@@ -27,7 +27,6 @@ static u64 *cp15_64(struct kvm_cpu_context *ctxt, int idx)
+ 
+ void __hyp_text __sysreg_save_state(struct kvm_cpu_context *ctxt)
+ {
+-	ctxt->cp15[c0_MPIDR]		= read_sysreg(VMPIDR);
+ 	ctxt->cp15[c0_CSSELR]		= read_sysreg(CSSELR);
+ 	ctxt->cp15[c1_SCTLR]		= read_sysreg(SCTLR);
+ 	ctxt->cp15[c1_CPACR]		= read_sysreg(CPACR);
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+diff --git a/arch/arm64/kvm/hyp/sysreg-sr.c b/arch/arm64/kvm/hyp/sysreg-sr.c
+index beedda03641e..497451bda47e 100644
+--- a/arch/arm64/kvm/hyp/sysreg-sr.c
++++ b/arch/arm64/kvm/hyp/sysreg-sr.c
+@@ -53,7 +53,6 @@ static void __hyp_text __sysreg_save_user_state(struct kvm_cpu_context *ctxt)
+ 
+ static void __hyp_text __sysreg_save_el1_state(struct kvm_cpu_context *ctxt)
+ {
+-	ctxt->sys_regs[MPIDR_EL1]	= read_sysreg(vmpidr_el2);
+ 	ctxt->sys_regs[CSSELR_EL1]	= read_sysreg(csselr_el1);
+ 	ctxt->sys_regs[SCTLR_EL1]	= read_sysreg_el1(sctlr);
+ 	ctxt->sys_regs[ACTLR_EL1]	= read_sysreg(actlr_el1);
+diff --git a/virt/kvm/arm/arm.c b/virt/kvm/arm/arm.c
+index 7ebf32c9cfc6..c0dcc17b60df 100644
+--- a/virt/kvm/arm/arm.c
++++ b/virt/kvm/arm/arm.c
+@@ -1549,6 +1549,7 @@ static int init_hyp_mode(void)
+ 		kvm_cpu_context_t *cpu_ctxt;
+ 
+ 		cpu_ctxt = per_cpu_ptr(&kvm_host_cpu_state, cpu);
++		kvm_init_host_cpu_context(cpu_ctxt, cpu);
+ 		err = create_hyp_mappings(cpu_ctxt, cpu_ctxt + 1, PAGE_HYP);
+ 
+ 		if (err) {
