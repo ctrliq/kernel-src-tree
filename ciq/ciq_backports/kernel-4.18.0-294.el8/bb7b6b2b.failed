@@ -1,0 +1,167 @@
+vfs: Kill mount_ns()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Howells <dhowells@redhat.com>
+commit bb7b6b2bbdb827e68cd506c8f5e3ba13215cccb2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bb7b6b2b.failed
+
+Kill mount_ns() as it has been replaced by vfs_get_super() in the new mount
+API.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: linux-fsdevel@vger.kernel.org
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit bb7b6b2bbdb827e68cd506c8f5e3ba13215cccb2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/super.c
+diff --cc fs/super.c
+index 72596c26684f,6919f5c728f0..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -1046,43 -1143,88 +1046,126 @@@ void kill_litter_super(struct super_blo
+  }
+  EXPORT_SYMBOL(kill_litter_super);
+  
+++<<<<<<< HEAD
+ +static int ns_test_super(struct super_block *sb, void *data)
+ +{
+ +	return sb->s_fs_info == data;
+ +}
+ +
+ +static int ns_set_super(struct super_block *sb, void *data)
+ +{
+ +	sb->s_fs_info = data;
+ +	return set_anon_super(sb, NULL);
+ +}
+ +
+ +struct dentry *mount_ns(struct file_system_type *fs_type,
+ +	int flags, void *data, void *ns, struct user_namespace *user_ns,
+ +	int (*fill_super)(struct super_block *, void *, int))
+ +{
+ +	struct super_block *sb;
+ +
+ +	sb = sget_userns(fs_type, ns_test_super, ns_set_super, flags,
+ +			 user_ns, ns);
+ +	if (IS_ERR(sb))
+ +		return ERR_CAST(sb);
+ +
+ +	if (!sb->s_root) {
+ +		int err;
+ +		err = fill_super(sb, data, flags & SB_SILENT ? 1 : 0);
+ +		if (err) {
+ +			deactivate_locked_super(sb);
+ +			return ERR_PTR(err);
+++=======
++ int set_anon_super_fc(struct super_block *sb, struct fs_context *fc)
++ {
++ 	return set_anon_super(sb, NULL);
++ }
++ EXPORT_SYMBOL(set_anon_super_fc);
++ 
++ static int test_keyed_super(struct super_block *sb, struct fs_context *fc)
++ {
++ 	return sb->s_fs_info == fc->s_fs_info;
++ }
++ 
++ static int test_single_super(struct super_block *s, struct fs_context *fc)
++ {
++ 	return 1;
++ }
++ 
++ /**
++  * vfs_get_super - Get a superblock with a search key set in s_fs_info.
++  * @fc: The filesystem context holding the parameters
++  * @keying: How to distinguish superblocks
++  * @fill_super: Helper to initialise a new superblock
++  *
++  * Search for a superblock and create a new one if not found.  The search
++  * criterion is controlled by @keying.  If the search fails, a new superblock
++  * is created and @fill_super() is called to initialise it.
++  *
++  * @keying can take one of a number of values:
++  *
++  * (1) vfs_get_single_super - Only one superblock of this type may exist on the
++  *     system.  This is typically used for special system filesystems.
++  *
++  * (2) vfs_get_keyed_super - Multiple superblocks may exist, but they must have
++  *     distinct keys (where the key is in s_fs_info).  Searching for the same
++  *     key again will turn up the superblock for that key.
++  *
++  * (3) vfs_get_independent_super - Multiple superblocks may exist and are
++  *     unkeyed.  Each call will get a new superblock.
++  *
++  * A permissions check is made by sget_fc() unless we're getting a superblock
++  * for a kernel-internal mount or a submount.
++  */
++ int vfs_get_super(struct fs_context *fc,
++ 		  enum vfs_get_super_keying keying,
++ 		  int (*fill_super)(struct super_block *sb,
++ 				    struct fs_context *fc))
++ {
++ 	int (*test)(struct super_block *, struct fs_context *);
++ 	struct super_block *sb;
++ 
++ 	switch (keying) {
++ 	case vfs_get_single_super:
++ 		test = test_single_super;
++ 		break;
++ 	case vfs_get_keyed_super:
++ 		test = test_keyed_super;
++ 		break;
++ 	case vfs_get_independent_super:
++ 		test = NULL;
++ 		break;
++ 	default:
++ 		BUG();
++ 	}
++ 
++ 	sb = sget_fc(fc, test, set_anon_super_fc);
++ 	if (IS_ERR(sb))
++ 		return PTR_ERR(sb);
++ 
++ 	if (!sb->s_root) {
++ 		int err = fill_super(sb, fc);
++ 		if (err) {
++ 			deactivate_locked_super(sb);
++ 			return err;
+++>>>>>>> bb7b6b2bbdb8 (vfs: Kill mount_ns())
+  		}
+  
+  		sb->s_flags |= SB_ACTIVE;
+  	}
+  
+++<<<<<<< HEAD
+ +	return dget(sb->s_root);
+ +}
+ +
+ +EXPORT_SYMBOL(mount_ns);
+++=======
++ 	BUG_ON(fc->root);
++ 	fc->root = dget(sb->s_root);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(vfs_get_super);
+++>>>>>>> bb7b6b2bbdb8 (vfs: Kill mount_ns())
+  
+  #ifdef CONFIG_BLOCK
+  static int set_bdev_super(struct super_block *s, void *data)
+* Unmerged path fs/super.c
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index feabaa0642d8..5242dec7f9a5 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2232,9 +2232,6 @@ struct file_system_type {
+ 
+ #define MODULE_ALIAS_FS(NAME) MODULE_ALIAS("fs-" NAME)
+ 
+-extern struct dentry *mount_ns(struct file_system_type *fs_type,
+-	int flags, void *data, void *ns, struct user_namespace *user_ns,
+-	int (*fill_super)(struct super_block *, void *, int));
+ #ifdef CONFIG_BLOCK
+ extern struct dentry *mount_bdev(struct file_system_type *fs_type,
+ 	int flags, const char *dev_name, void *data,
