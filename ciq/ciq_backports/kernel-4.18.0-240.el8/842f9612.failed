@@ -1,0 +1,277 @@
+io_uring: fix race with canceling timeouts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 842f96124c5617b060cc0f071dcfb6ab24bdd042
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/842f9612.failed
+
+If we get -1 from hrtimer_try_to_cancel(), we know that the timer
+is running. Hence leave all completion to the timeout handler. If
+we don't, we can corrupt the list and miss a completion.
+
+Fixes: 11365043e527 ("io_uring: add support for canceling timeout requests")
+	Reported-by: Hrvoje Zeba <zeba.hrvoje@gmail.com>
+	Tested-by: Hrvoje Zeba <zeba.hrvoje@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 842f96124c5617b060cc0f071dcfb6ab24bdd042)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index eebc29709945,8e25c25c7309..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -476,12 -501,52 +476,54 @@@ static inline void io_queue_async_work(
+  		switch (req->submit.sqe->opcode) {
+  		case IORING_OP_WRITEV:
+  		case IORING_OP_WRITE_FIXED:
+ -			do_hashed = true;
+ +			rw = !(req->rw.ki_flags & IOCB_DIRECT);
+  			break;
+  		}
+ -		if (io_sqe_needs_user(req->submit.sqe))
+ -			req->work.flags |= IO_WQ_WORK_NEEDS_USER;
+  	}
+  
+++<<<<<<< HEAD
+ +	queue_work(ctx->sqo_wq[rw], &req->work);
+++=======
++ 	return do_hashed;
++ }
++ 
++ static inline void io_queue_async_work(struct io_ring_ctx *ctx,
++ 				       struct io_kiocb *req)
++ {
++ 	bool do_hashed = io_prep_async_work(req);
++ 
++ 	trace_io_uring_queue_async_work(ctx, do_hashed, req, &req->work,
++ 					req->flags);
++ 	if (!do_hashed) {
++ 		io_wq_enqueue(ctx->io_wq, &req->work);
++ 	} else {
++ 		io_wq_enqueue_hashed(ctx->io_wq, &req->work,
++ 					file_inode(req->file));
++ 	}
++ }
++ 
++ static void io_kill_timeout(struct io_kiocb *req)
++ {
++ 	int ret;
++ 
++ 	ret = hrtimer_try_to_cancel(&req->timeout.timer);
++ 	if (ret != -1) {
++ 		atomic_inc(&req->ctx->cq_timeouts);
++ 		list_del_init(&req->list);
++ 		io_cqring_fill_event(req->ctx, req->user_data, 0);
++ 		__io_free_req(req);
++ 	}
++ }
++ 
++ static void io_kill_timeouts(struct io_ring_ctx *ctx)
++ {
++ 	struct io_kiocb *req, *tmp;
++ 
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	list_for_each_entry_safe(req, tmp, &ctx->timeout_list, list)
++ 		io_kill_timeout(req);
++ 	spin_unlock_irq(&ctx->completion_lock);
+++>>>>>>> 842f96124c56 (io_uring: fix race with canceling timeouts)
+  }
+  
+  static void io_commit_cqring(struct io_ring_ctx *ctx)
+@@@ -1837,6 -1952,187 +1879,190 @@@ static int io_poll_add(struct io_kiocb 
+  	return ipt.error;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static enum hrtimer_restart io_timeout_fn(struct hrtimer *timer)
++ {
++ 	struct io_ring_ctx *ctx;
++ 	struct io_kiocb *req;
++ 	unsigned long flags;
++ 
++ 	req = container_of(timer, struct io_kiocb, timeout.timer);
++ 	ctx = req->ctx;
++ 	atomic_inc(&ctx->cq_timeouts);
++ 
++ 	spin_lock_irqsave(&ctx->completion_lock, flags);
++ 	/*
++ 	 * We could be racing with timeout deletion. If the list is empty,
++ 	 * then timeout lookup already found it and will be handling it.
++ 	 */
++ 	if (!list_empty(&req->list)) {
++ 		struct io_kiocb *prev;
++ 
++ 		/*
++ 		 * Adjust the reqs sequence before the current one because it
++ 		 * will consume a slot in the cq_ring and the the cq_tail
++ 		 * pointer will be increased, otherwise other timeout reqs may
++ 		 * return in advance without waiting for enough wait_nr.
++ 		 */
++ 		prev = req;
++ 		list_for_each_entry_continue_reverse(prev, &ctx->timeout_list, list)
++ 			prev->sequence++;
++ 		list_del_init(&req->list);
++ 	}
++ 
++ 	io_cqring_fill_event(ctx, req->user_data, -ETIME);
++ 	io_commit_cqring(ctx);
++ 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
++ 
++ 	io_cqring_ev_posted(ctx);
++ 	io_put_req(req, NULL);
++ 	return HRTIMER_NORESTART;
++ }
++ 
++ /*
++  * Remove or update an existing timeout command
++  */
++ static int io_timeout_remove(struct io_kiocb *req,
++ 			     const struct io_uring_sqe *sqe)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct io_kiocb *treq;
++ 	int ret = -ENOENT;
++ 	__u64 user_data;
++ 	unsigned flags;
++ 
++ 	if (unlikely(ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 	if (sqe->flags || sqe->ioprio || sqe->buf_index || sqe->len)
++ 		return -EINVAL;
++ 	flags = READ_ONCE(sqe->timeout_flags);
++ 	if (flags)
++ 		return -EINVAL;
++ 
++ 	user_data = READ_ONCE(sqe->addr);
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	list_for_each_entry(treq, &ctx->timeout_list, list) {
++ 		if (user_data == treq->user_data) {
++ 			list_del_init(&treq->list);
++ 			ret = 0;
++ 			break;
++ 		}
++ 	}
++ 
++ 	/* didn't find timeout */
++ 	if (ret) {
++ fill_ev:
++ 		io_cqring_fill_event(ctx, req->user_data, ret);
++ 		io_commit_cqring(ctx);
++ 		spin_unlock_irq(&ctx->completion_lock);
++ 		io_cqring_ev_posted(ctx);
++ 		io_put_req(req, NULL);
++ 		return 0;
++ 	}
++ 
++ 	ret = hrtimer_try_to_cancel(&treq->timeout.timer);
++ 	if (ret == -1) {
++ 		ret = -EBUSY;
++ 		goto fill_ev;
++ 	}
++ 
++ 	io_cqring_fill_event(ctx, req->user_data, 0);
++ 	io_cqring_fill_event(ctx, treq->user_data, -ECANCELED);
++ 	io_commit_cqring(ctx);
++ 	spin_unlock_irq(&ctx->completion_lock);
++ 	io_cqring_ev_posted(ctx);
++ 
++ 	io_put_req(treq, NULL);
++ 	io_put_req(req, NULL);
++ 	return 0;
++ }
++ 
++ static int io_timeout(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	unsigned count;
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct list_head *entry;
++ 	enum hrtimer_mode mode;
++ 	struct timespec64 ts;
++ 	unsigned span = 0;
++ 	unsigned flags;
++ 
++ 	if (unlikely(ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 	if (sqe->flags || sqe->ioprio || sqe->buf_index || sqe->len != 1)
++ 		return -EINVAL;
++ 	flags = READ_ONCE(sqe->timeout_flags);
++ 	if (flags & ~IORING_TIMEOUT_ABS)
++ 		return -EINVAL;
++ 
++ 	if (get_timespec64(&ts, u64_to_user_ptr(sqe->addr)))
++ 		return -EFAULT;
++ 
++ 	if (flags & IORING_TIMEOUT_ABS)
++ 		mode = HRTIMER_MODE_ABS;
++ 	else
++ 		mode = HRTIMER_MODE_REL;
++ 
++ 	hrtimer_init(&req->timeout.timer, CLOCK_MONOTONIC, mode);
++ 
++ 	/*
++ 	 * sqe->off holds how many events that need to occur for this
++ 	 * timeout event to be satisfied.
++ 	 */
++ 	count = READ_ONCE(sqe->off);
++ 	if (!count)
++ 		count = 1;
++ 
++ 	req->sequence = ctx->cached_sq_head + count - 1;
++ 	/* reuse it to store the count */
++ 	req->submit.sequence = count;
++ 	req->flags |= REQ_F_TIMEOUT;
++ 
++ 	/*
++ 	 * Insertion sort, ensuring the first entry in the list is always
++ 	 * the one we need first.
++ 	 */
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	list_for_each_prev(entry, &ctx->timeout_list) {
++ 		struct io_kiocb *nxt = list_entry(entry, struct io_kiocb, list);
++ 		unsigned nxt_sq_head;
++ 		long long tmp, tmp_nxt;
++ 
++ 		/*
++ 		 * Since cached_sq_head + count - 1 can overflow, use type long
++ 		 * long to store it.
++ 		 */
++ 		tmp = (long long)ctx->cached_sq_head + count - 1;
++ 		nxt_sq_head = nxt->sequence - nxt->submit.sequence + 1;
++ 		tmp_nxt = (long long)nxt_sq_head + nxt->submit.sequence - 1;
++ 
++ 		/*
++ 		 * cached_sq_head may overflow, and it will never overflow twice
++ 		 * once there is some timeout req still be valid.
++ 		 */
++ 		if (ctx->cached_sq_head < nxt_sq_head)
++ 			tmp += UINT_MAX;
++ 
++ 		if (tmp > tmp_nxt)
++ 			break;
++ 
++ 		/*
++ 		 * Sequence of reqs after the insert one and itself should
++ 		 * be adjusted because each timeout req consumes a slot.
++ 		 */
++ 		span++;
++ 		nxt->sequence++;
++ 	}
++ 	req->sequence -= span;
++ 	list_add(&req->list, entry);
++ 	req->timeout.timer.function = io_timeout_fn;
++ 	hrtimer_start(&req->timeout.timer, timespec64_to_ktime(ts), mode);
++ 	spin_unlock_irq(&ctx->completion_lock);
++ 	return 0;
++ }
++ 
+++>>>>>>> 842f96124c56 (io_uring: fix race with canceling timeouts)
+  static int io_req_defer(struct io_ring_ctx *ctx, struct io_kiocb *req,
+  			const struct io_uring_sqe *sqe)
+  {
+* Unmerged path fs/io_uring.c
