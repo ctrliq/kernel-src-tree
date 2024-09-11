@@ -1,0 +1,258 @@
+selftests/powerpc/pmu: Add macros to parse event codes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Madhavan Srinivasan <maddy@linux.ibm.com>
+commit 6523dce86222451e5ca2df8a46597a217084bfdf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/6523dce8.failed
+
+Each platform has raw event encoding format which specifies the bit
+positions for different fields. The fields from event code gets
+translated into performance monitoring mode control register (MMCRx)
+settings. Patch add macros to extract individual fields from the event
+code.
+
+Add functions for sanity checks, since testcases currently are only
+supported in power9 and power10.
+
+	Signed-off-by: Madhavan Srinivasan <maddy@linux.ibm.com>
+[mpe: Read PVR directly rather than using /proc/cpuinfo]
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20220127072012.662451-4-kjain@linux.ibm.com
+
+(cherry picked from commit 6523dce86222451e5ca2df8a46597a217084bfdf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/powerpc/include/reg.h
+#	tools/testing/selftests/powerpc/security/spectre_v2.c
+diff --cc tools/testing/selftests/powerpc/include/reg.h
+index 7cd77784560f,c422be8a42b2..000000000000
+--- a/tools/testing/selftests/powerpc/include/reg.h
++++ b/tools/testing/selftests/powerpc/include/reg.h
+@@@ -77,6 -86,17 +80,20 @@@
+  #define TEXASR_TE	0x0000000004000000
+  #define TEXASR_ROT	0x0000000002000000
+  
+++<<<<<<< HEAD
+++=======
++ /* MSR register bits */
++ #define MSR_HV 		(1ul << 60)	/* Hypervisor state */
++ #define MSR_TS_S_LG     33              /* Trans Mem state: Suspended */
++ #define MSR_TS_T_LG	34              /* Trans Mem state: Active */
++ 
++ #define __MASK(X)       (1UL<<(X))
++ 
++ /* macro to check TM MSR bits */
++ #define MSR_TS_S        __MASK(MSR_TS_S_LG)   /* Transaction Suspended */
++ #define MSR_TS_T	__MASK(MSR_TS_T_LG)   /* Transaction Transactional */
++ 
+++>>>>>>> 6523dce86222 (selftests/powerpc/pmu: Add macros to parse event codes)
+  /* Vector Instructions */
+  #define VSX_XX1(xs, ra, rb)	(((xs) & 0x1f) << 21 | ((ra) << 16) |  \
+  				 ((rb) << 11) | (((xs) >> 5)))
+* Unmerged path tools/testing/selftests/powerpc/security/spectre_v2.c
+* Unmerged path tools/testing/selftests/powerpc/include/reg.h
+diff --git a/tools/testing/selftests/powerpc/pmu/sampling_tests/misc.c b/tools/testing/selftests/powerpc/pmu/sampling_tests/misc.c
+index 4779b107f43b..a86d7d125955 100644
+--- a/tools/testing/selftests/powerpc/pmu/sampling_tests/misc.c
++++ b/tools/testing/selftests/powerpc/pmu/sampling_tests/misc.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * Copyright 2022, Athira Rajeev, IBM Corp.
++ * Copyright 2022, Madhavan Srinivasan, IBM Corp.
+  */
+ 
+ #include <unistd.h>
+@@ -16,6 +17,137 @@
+ 
+ #define PAGE_SIZE               sysconf(_SC_PAGESIZE)
+ 
++/* Storage for platform version */
++int pvr;
++u64 platform_extended_mask;
++
++/* Mask and Shift for Event code fields */
++int ev_mask_pmcxsel, ev_shift_pmcxsel;		//pmcxsel field
++int ev_mask_marked, ev_shift_marked;		//marked filed
++int ev_mask_comb, ev_shift_comb;		//combine field
++int ev_mask_unit, ev_shift_unit;		//unit field
++int ev_mask_pmc, ev_shift_pmc;			//pmc field
++int ev_mask_cache, ev_shift_cache;		//Cache sel field
++int ev_mask_sample, ev_shift_sample;		//Random sampling field
++int ev_mask_thd_sel, ev_shift_thd_sel;		//thresh_sel field
++int ev_mask_thd_start, ev_shift_thd_start;	//thresh_start field
++int ev_mask_thd_stop, ev_shift_thd_stop;	//thresh_stop field
++int ev_mask_thd_cmp, ev_shift_thd_cmp;		//thresh cmp field
++int ev_mask_sm, ev_shift_sm;			//SDAR mode field
++int ev_mask_rsq, ev_shift_rsq;			//radix scope qual field
++int ev_mask_l2l3, ev_shift_l2l3;		//l2l3 sel field
++int ev_mask_mmcr3_src, ev_shift_mmcr3_src;	//mmcr3 field
++
++static void init_ev_encodes(void)
++{
++	ev_mask_pmcxsel = 0xff;
++	ev_shift_pmcxsel = 0;
++	ev_mask_marked = 1;
++	ev_shift_marked = 8;
++	ev_mask_unit = 0xf;
++	ev_shift_unit = 12;
++	ev_mask_pmc = 0xf;
++	ev_shift_pmc = 16;
++	ev_mask_sample	= 0x1f;
++	ev_shift_sample = 24;
++	ev_mask_thd_sel = 0x7;
++	ev_shift_thd_sel = 29;
++	ev_mask_thd_start = 0xf;
++	ev_shift_thd_start = 36;
++	ev_mask_thd_stop = 0xf;
++	ev_shift_thd_stop = 32;
++
++	switch (pvr) {
++	case POWER10:
++		ev_mask_rsq = 1;
++		ev_shift_rsq = 9;
++		ev_mask_comb = 3;
++		ev_shift_comb = 10;
++		ev_mask_cache = 3;
++		ev_shift_cache = 20;
++		ev_mask_sm = 0x3;
++		ev_shift_sm = 22;
++		ev_mask_l2l3 = 0x1f;
++		ev_shift_l2l3 = 40;
++		ev_mask_mmcr3_src = 0x7fff;
++		ev_shift_mmcr3_src = 45;
++		break;
++	case POWER9:
++		ev_mask_comb = 3;
++		ev_shift_comb = 10;
++		ev_mask_cache = 0xf;
++		ev_shift_cache = 20;
++		ev_mask_thd_cmp = 0x3ff;
++		ev_shift_thd_cmp = 40;
++		ev_mask_sm = 0x3;
++		ev_shift_sm = 50;
++		break;
++	default:
++		FAIL_IF_EXIT(1);
++	}
++}
++
++/* Return the extended regs mask value */
++static u64 perf_get_platform_reg_mask(void)
++{
++	if (have_hwcap2(PPC_FEATURE2_ARCH_3_1))
++		return PERF_POWER10_MASK;
++	if (have_hwcap2(PPC_FEATURE2_ARCH_3_00))
++		return PERF_POWER9_MASK;
++
++	return -1;
++}
++
++int check_extended_regs_support(void)
++{
++	int fd;
++	struct event event;
++
++	event_init(&event, 0x1001e);
++
++	event.attr.type = 4;
++	event.attr.sample_period = 1;
++	event.attr.disabled = 1;
++	event.attr.sample_type = PERF_SAMPLE_REGS_INTR;
++	event.attr.sample_regs_intr = platform_extended_mask;
++
++	fd = event_open(&event);
++	if (fd != -1)
++		return 0;
++
++	return -1;
++}
++
++int check_pvr_for_sampling_tests(void)
++{
++	pvr = PVR_VER(mfspr(SPRN_PVR));
++
++	platform_extended_mask = perf_get_platform_reg_mask();
++
++	/*
++	 * Check for supported platforms
++	 * for sampling test
++	 */
++	if ((pvr != POWER10) && (pvr != POWER9))
++		goto out;
++
++	/*
++	 * Check PMU driver registered by looking for
++	 * PPC_FEATURE2_EBB bit in AT_HWCAP2
++	 */
++	if (!have_hwcap2(PPC_FEATURE2_EBB))
++		goto out;
++
++	/* check if platform supports extended regs */
++	if (check_extended_regs_support())
++		goto out;
++
++	init_ev_encodes();
++	return 0;
++out:
++	printf("%s: Sampling tests un-supported\n", __func__);
++	return -1;
++}
+ /*
+  * Allocate mmap buffer of "mmap_pages" number of
+  * pages.
+diff --git a/tools/testing/selftests/powerpc/pmu/sampling_tests/misc.h b/tools/testing/selftests/powerpc/pmu/sampling_tests/misc.h
+index 291f9adba817..c8f64e8e749c 100644
+--- a/tools/testing/selftests/powerpc/pmu/sampling_tests/misc.h
++++ b/tools/testing/selftests/powerpc/pmu/sampling_tests/misc.h
+@@ -1,9 +1,45 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ /*
+  * Copyright 2022, Athira Rajeev, IBM Corp.
++ * Copyright 2022, Madhavan Srinivasan, IBM Corp.
+  */
+ 
+ #include "../event.h"
+ 
++#define POWER10 0x80
++#define POWER9  0x4e
++#define PERF_POWER9_MASK        0x7f8ffffffffffff
++#define PERF_POWER10_MASK       0x7ffffffffffffff
++
++extern int ev_mask_pmcxsel, ev_shift_pmcxsel;
++extern int ev_mask_marked, ev_shift_marked;
++extern int ev_mask_comb, ev_shift_comb;
++extern int ev_mask_unit, ev_shift_unit;
++extern int ev_mask_pmc, ev_shift_pmc;
++extern int ev_mask_cache, ev_shift_cache;
++extern int ev_mask_sample, ev_shift_sample;
++extern int ev_mask_thd_sel, ev_shift_thd_sel;
++extern int ev_mask_thd_start, ev_shift_thd_start;
++extern int ev_mask_thd_stop, ev_shift_thd_stop;
++extern int ev_mask_thd_cmp, ev_shift_thd_cmp;
++extern int ev_mask_sm, ev_shift_sm;
++extern int ev_mask_rsq, ev_shift_rsq;
++extern int ev_mask_l2l3, ev_shift_l2l3;
++extern int ev_mask_mmcr3_src, ev_shift_mmcr3_src;
++extern int pvr;
++extern u64 platform_extended_mask;
++extern int check_pvr_for_sampling_tests(void);
++
++/*
++ * Event code field extraction macro.
++ * Raw event code is combination of multiple
++ * fields. Macro to extract individual fields
++ *
++ * x - Raw event code value
++ * y - Field to extract
++ */
++#define EV_CODE_EXTRACT(x, y)   \
++	((x >> ev_shift_##y) & ev_mask_##y)
++
+ void *event_sample_buf_mmap(int fd, int mmap_pages);
+ void *__event_read_samples(void *sample_buff, size_t *size, u64 *sample_count);
+* Unmerged path tools/testing/selftests/powerpc/security/spectre_v2.c
