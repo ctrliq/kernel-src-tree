@@ -1,0 +1,387 @@
+net/mlx5: E-Switch, Tag packet with vport number in VF vports and uplink ingress ACLs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5: E-Switch, Tag packet with vport number in VF vports and uplink ingress ACLs (Alaa Hleihel) [1724327 1724336]
+Rebuild_FUZZ: 97.59%
+commit-author Jianbo Liu <jianbol@mellanox.com>
+commit 7445cfb1169cebf8f79763acf65f85d850850461
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7445cfb1.failed
+
+When a dual-port VHCA sends a RoCE packet on its non-native port, and the
+packet arrives to its affiliated vport FDB, a mismatch might occur on the
+rules that match the packet source vport as it is not represented by single
+VHCA only in this case. So we change to match on metadata instead of source
+vport.
+To do that, a rule is created in all vports and uplink ingress ACLs, to
+save the source vport number and vhca id in the packet's metadata in order
+to match on it later.
+The metadata register used is the first of the 32-bit type C registers. It
+can be used for matching and header modify operations. The higher 16 bits
+of this register are for vhca id, and the lower 16 ones is for vport
+number.
+This change is not for dual-port RoCE only. If HW and FW allow, the vport
+metadata matching is enabled by default.
+
+	Signed-off-by: Jianbo Liu <jianbol@mellanox.com>
+	Reviewed-by: Eli Britstein <elibr@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Reviewed-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 7445cfb1169cebf8f79763acf65f85d850850461)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index a00b424f4e9c,51e71b824abf..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -186,6 -188,20 +188,23 @@@ struct esw_mc_addr { /* SRIOV only *
+  	u32                    refcnt;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5_host_work {
++ 	struct work_struct	work;
++ 	struct mlx5_eswitch	*esw;
++ };
++ 
++ struct mlx5_esw_functions {
++ 	struct mlx5_nb		nb;
++ 	u16			num_vfs;
++ };
++ 
++ enum {
++ 	MLX5_ESWITCH_VPORT_MATCH_METADATA = BIT(0),
++ };
++ 
+++>>>>>>> 7445cfb1169c (net/mlx5: E-Switch, Tag packet with vport number in VF vports and uplink ingress ACLs)
+  struct mlx5_eswitch {
+  	struct mlx5_core_dev    *dev;
+  	struct mlx5_nb          nb;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 2a02050a09e7,4bcbc872cd08..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -1521,41 -1721,93 +1566,117 @@@ out_no_mem
+  	return err;
+  }
+  
+- static int esw_prio_tag_acls_config(struct mlx5_eswitch *esw, int nvports)
++ static int esw_vport_ingress_common_config(struct mlx5_eswitch *esw,
++ 					   struct mlx5_vport *vport)
+  {
+++<<<<<<< HEAD
+ +	int i, j;
+ +	int err;
+ +
+ +	mlx5_esw_for_each_vf_vport(esw, i, nvports) {
+ +		err = esw_vport_ingress_prio_tag_config(esw, &esw->vports[i]);
+ +		if (err)
+ +			goto err_ingress;
+ +		err = esw_vport_egress_prio_tag_config(esw, &esw->vports[i]);
+ +		if (err)
+ +			goto err_egress;
+++=======
++ 	int err;
++ 
++ 	if (!mlx5_eswitch_vport_match_metadata_enabled(esw) &&
++ 	    !MLX5_CAP_GEN(esw->dev, prio_tag_required))
++ 		return 0;
++ 
++ 	esw_vport_cleanup_ingress_rules(esw, vport);
++ 
++ 	err = esw_vport_enable_ingress_acl(esw, vport);
++ 	if (err) {
++ 		esw_warn(esw->dev,
++ 			 "failed to enable ingress acl (%d) on vport[%d]\n",
++ 			 err, vport->vport);
++ 		return err;
++ 	}
++ 
++ 	esw_debug(esw->dev,
++ 		  "vport[%d] configure ingress rules\n", vport->vport);
++ 
++ 	if (mlx5_eswitch_vport_match_metadata_enabled(esw)) {
++ 		err = esw_vport_add_ingress_acl_modify_metadata(esw, vport);
++ 		if (err)
++ 			goto out;
+  	}
+  
++ 	if (MLX5_CAP_GEN(esw->dev, prio_tag_required) &&
++ 	    mlx5_eswitch_is_vf_vport(esw, vport->vport)) {
++ 		err = esw_vport_ingress_prio_tag_config(esw, vport);
++ 		if (err)
++ 			goto out;
++ 	}
++ 
++ out:
++ 	if (err)
++ 		esw_vport_disable_ingress_acl(esw, vport);
++ 	return err;
++ }
++ 
++ static int esw_create_offloads_acl_tables(struct mlx5_eswitch *esw)
++ {
++ 	struct mlx5_vport *vport;
++ 	int i, j;
++ 	int err;
++ 
++ 	mlx5_esw_for_all_vports(esw, i, vport) {
++ 		err = esw_vport_ingress_common_config(esw, vport);
++ 		if (err)
++ 			goto err_ingress;
++ 
++ 		if (mlx5_eswitch_is_vf_vport(esw, vport->vport)) {
++ 			err = esw_vport_egress_prio_tag_config(esw, vport);
++ 			if (err)
++ 				goto err_egress;
++ 		}
+++>>>>>>> 7445cfb1169c (net/mlx5: E-Switch, Tag packet with vport number in VF vports and uplink ingress ACLs)
++ 	}
++ 
++ 	if (mlx5_eswitch_vport_match_metadata_enabled(esw))
++ 		esw_info(esw->dev, "Use metadata reg_c as source vport to match\n");
++ 
+  	return 0;
+  
+  err_egress:
+ -	esw_vport_disable_ingress_acl(esw, vport);
+ +	esw_vport_disable_ingress_acl(esw, &esw->vports[i]);
+  err_ingress:
+++<<<<<<< HEAD
+ +	mlx5_esw_for_each_vf_vport_reverse(esw, j, i - 1) {
+ +		esw_vport_disable_egress_acl(esw, &esw->vports[j]);
+ +		esw_vport_disable_ingress_acl(esw, &esw->vports[j]);
+++=======
++ 	for (j = MLX5_VPORT_PF; j < i; j++) {
++ 		vport = &esw->vports[j];
++ 		esw_vport_disable_egress_acl(esw, vport);
++ 		esw_vport_disable_ingress_acl(esw, vport);
+++>>>>>>> 7445cfb1169c (net/mlx5: E-Switch, Tag packet with vport number in VF vports and uplink ingress ACLs)
+  	}
+  
+  	return err;
+  }
+  
+- static void esw_prio_tag_acls_cleanup(struct mlx5_eswitch *esw)
++ static void esw_destroy_offloads_acl_tables(struct mlx5_eswitch *esw)
+  {
+ -	struct mlx5_vport *vport;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	mlx5_esw_for_each_vf_vport(esw, i, esw->nvports) {
+ +		esw_vport_disable_egress_acl(esw, &esw->vports[i]);
+ +		esw_vport_disable_ingress_acl(esw, &esw->vports[i]);
+++=======
++ 	mlx5_esw_for_all_vports(esw, i, vport) {
++ 		esw_vport_disable_egress_acl(esw, vport);
++ 		esw_vport_disable_ingress_acl(esw, vport);
+++>>>>>>> 7445cfb1169c (net/mlx5: E-Switch, Tag packet with vport number in VF vports and uplink ingress ACLs)
+  	}
++ 
++ 	esw->flags &= ~MLX5_ESWITCH_VPORT_MATCH_METADATA;
+  }
+  
+  static int esw_offloads_steering_init(struct mlx5_eswitch *esw, int nvports)
+@@@ -1599,17 -1852,111 +1721,16 @@@ static void esw_offloads_steering_clean
+  	esw_destroy_vport_rx_group(esw);
+  	esw_destroy_offloads_table(esw);
+  	esw_destroy_offloads_fdb_tables(esw);
+- 	if (MLX5_CAP_GEN(esw->dev, prio_tag_required))
+- 		esw_prio_tag_acls_cleanup(esw);
++ 	esw_destroy_offloads_acl_tables(esw);
+  }
+  
+ -static void esw_functions_changed_event_handler(struct work_struct *work)
+ +int esw_offloads_init(struct mlx5_eswitch *esw, int nvports)
+  {
+ -	u32 out[MLX5_ST_SZ_DW(query_esw_functions_out)] = {};
+ -	struct mlx5_host_work *host_work;
+ -	struct mlx5_eswitch *esw;
+ -	u16 num_vfs = 0;
+  	int err;
+  
+ -	host_work = container_of(work, struct mlx5_host_work, work);
+ -	esw = host_work->esw;
+ -
+ -	err = mlx5_esw_query_functions(esw->dev, out, sizeof(out));
+ -	num_vfs = MLX5_GET(query_esw_functions_out, out,
+ -			   host_params_context.host_num_of_vfs);
+ -	if (err || num_vfs == esw->esw_funcs.num_vfs)
+ -		goto out;
+ -
+ -	/* Number of VFs can only change from "0 to x" or "x to 0". */
+ -	if (esw->esw_funcs.num_vfs > 0) {
+ -		esw_offloads_unload_vf_reps(esw, esw->esw_funcs.num_vfs);
+ -	} else {
+ -		err = esw_offloads_load_vf_reps(esw, num_vfs);
+ -
+ -		if (err)
+ -			goto out;
+ -	}
+ -
+ -	esw->esw_funcs.num_vfs = num_vfs;
+ -
+ -out:
+ -	kfree(host_work);
+ -}
+ -
+ -static void esw_emulate_event_handler(struct work_struct *work)
+ -{
+ -	struct mlx5_host_work *host_work =
+ -		container_of(work, struct mlx5_host_work, work);
+ -	struct mlx5_eswitch *esw = host_work->esw;
+ -	int err;
+ -
+ -	if (esw->esw_funcs.num_vfs) {
+ -		err = esw_offloads_load_vf_reps(esw, esw->esw_funcs.num_vfs);
+ -		if (err)
+ -			esw_warn(esw->dev, "Load vf reps err=%d\n", err);
+ -	}
+ -	kfree(host_work);
+ -}
+ -
+ -static int esw_functions_changed_event(struct notifier_block *nb,
+ -				       unsigned long type, void *data)
+ -{
+ -	struct mlx5_esw_functions *esw_funcs;
+ -	struct mlx5_host_work *host_work;
+ -	struct mlx5_eswitch *esw;
+ -
+ -	host_work = kzalloc(sizeof(*host_work), GFP_ATOMIC);
+ -	if (!host_work)
+ -		return NOTIFY_DONE;
+ -
+ -	esw_funcs = mlx5_nb_cof(nb, struct mlx5_esw_functions, nb);
+ -	esw = container_of(esw_funcs, struct mlx5_eswitch, esw_funcs);
+ -
+ -	host_work->esw = esw;
+ -
+ -	if (mlx5_eswitch_is_funcs_handler(esw->dev))
+ -		INIT_WORK(&host_work->work,
+ -			  esw_functions_changed_event_handler);
+ -	else
+ -		INIT_WORK(&host_work->work, esw_emulate_event_handler);
+ -	queue_work(esw->work_queue, &host_work->work);
+ -
+ -	return NOTIFY_OK;
+ -}
+ -
+ -static void esw_functions_changed_event_init(struct mlx5_eswitch *esw,
+ -					     u16 vf_nvports)
+ -{
+ -	if (mlx5_eswitch_is_funcs_handler(esw->dev)) {
+ -		esw->esw_funcs.num_vfs = 0;
+ -		MLX5_NB_INIT(&esw->esw_funcs.nb, esw_functions_changed_event,
+ -			     ESW_FUNCTIONS_CHANGED);
+ -		mlx5_eq_notifier_register(esw->dev, &esw->esw_funcs.nb);
+ -	} else {
+ -		esw->esw_funcs.num_vfs = vf_nvports;
+ -	}
+ -}
+ -
+ -static void esw_functions_changed_event_cleanup(struct mlx5_eswitch *esw)
+ -{
+ -	if (!mlx5_eswitch_is_funcs_handler(esw->dev))
+ -		return;
+ -
+ -	mlx5_eq_notifier_unregister(esw->dev, &esw->esw_funcs.nb);
+ -	flush_workqueue(esw->work_queue);
+ -}
+ -
+ -int esw_offloads_init(struct mlx5_eswitch *esw, int vf_nvports,
+ -		      int total_nvports)
+ -{
+ -	int err;
+ +	mutex_init(&esw->fdb_table.offloads.fdb_prio_lock);
+  
+ -	err = esw_offloads_steering_init(esw, total_nvports);
+ +	err = esw_offloads_steering_init(esw, nvports);
+  	if (err)
+  		return err;
+  
+@@@ -2024,6 -2382,25 +2145,28 @@@ EXPORT_SYMBOL(mlx5_eswitch_uplink_get_p
+  struct mlx5_eswitch_rep *mlx5_eswitch_vport_rep(struct mlx5_eswitch *esw,
+  						int vport)
+  {
+ -	return mlx5_eswitch_get_rep(esw, vport);
+ +	return &esw->offloads.vport_reps[vport];
+  }
+  EXPORT_SYMBOL(mlx5_eswitch_vport_rep);
+++<<<<<<< HEAD
+++=======
++ 
++ bool mlx5_eswitch_is_vf_vport(const struct mlx5_eswitch *esw, u16 vport_num)
++ {
++ 	return vport_num >= MLX5_VPORT_FIRST_VF &&
++ 	       vport_num <= esw->dev->priv.sriov.max_vfs;
++ }
++ 
++ bool mlx5_eswitch_vport_match_metadata_enabled(const struct mlx5_eswitch *esw)
++ {
++ 	return !!(esw->flags & MLX5_ESWITCH_VPORT_MATCH_METADATA);
++ }
++ EXPORT_SYMBOL(mlx5_eswitch_vport_match_metadata_enabled);
++ 
++ u32 mlx5_eswitch_get_vport_metadata_for_match(const struct mlx5_eswitch *esw,
++ 					      u16 vport_num)
++ {
++ 	return ((MLX5_CAP_GEN(esw->dev, vhca_id) & 0xffff) << 16) | vport_num;
++ }
++ EXPORT_SYMBOL(mlx5_eswitch_get_vport_metadata_for_match);
+++>>>>>>> 7445cfb1169c (net/mlx5: E-Switch, Tag packet with vport number in VF vports and uplink ingress ACLs)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 1c65050ae483..4b2ba029df3a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@ -1157,6 +1157,8 @@ void esw_vport_cleanup_ingress_rules(struct mlx5_eswitch *esw,
+ 
+ 	vport->ingress.drop_rule = NULL;
+ 	vport->ingress.allow_rule = NULL;
++
++	esw_vport_del_ingress_acl_modify_metadata(esw, vport);
+ }
+ 
+ void esw_vport_disable_ingress_acl(struct mlx5_eswitch *esw,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --git a/include/linux/mlx5/eswitch.h b/include/linux/mlx5/eswitch.h
+index 5c8be6f99f8d..1e9938674431 100644
+--- a/include/linux/mlx5/eswitch.h
++++ b/include/linux/mlx5/eswitch.h
+@@ -62,11 +62,28 @@ mlx5_eswitch_add_send_to_vport_rule(struct mlx5_eswitch *esw,
+ #ifdef CONFIG_MLX5_ESWITCH
+ enum devlink_eswitch_encap_mode
+ mlx5_eswitch_get_encap_mode(const struct mlx5_core_dev *dev);
++
++bool mlx5_eswitch_vport_match_metadata_enabled(const struct mlx5_eswitch *esw);
++u32 mlx5_eswitch_get_vport_metadata_for_match(const struct mlx5_eswitch *esw,
++					      u16 vport_num);
+ #else  /* CONFIG_MLX5_ESWITCH */
+ static inline enum devlink_eswitch_encap_mode
+ mlx5_eswitch_get_encap_mode(const struct mlx5_core_dev *dev)
+ {
+ 	return DEVLINK_ESWITCH_ENCAP_MODE_NONE;
+ }
++
++static inline bool
++mlx5_eswitch_vport_match_metadata_enabled(const struct mlx5_eswitch *esw)
++{
++	return false;
++};
++
++static inline u32
++mlx5_eswitch_get_vport_metadata_for_match(const struct mlx5_eswitch *esw,
++					  int vport_num)
++{
++	return 0;
++};
+ #endif /* CONFIG_MLX5_ESWITCH */
+ #endif
