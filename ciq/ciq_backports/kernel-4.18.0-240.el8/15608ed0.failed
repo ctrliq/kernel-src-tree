@@ -1,0 +1,131 @@
+KVM: x86: Add helpers to perform CPUID-based guest vendor check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 15608ed03f10a1414188612b0ee9653e3c78bbd9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/15608ed0.failed
+
+Add helpers to provide CPUID-based guest vendor checks, i.e. to do the
+ugly register comparisons.  Use the new helpers to check for an AMD
+guest vendor in guest_cpuid_is_amd() as well as in the existing emulator
+flows.
+
+Using the new helpers fixes a _very_ theoretical bug where
+guest_cpuid_is_amd() would get a false positive on a non-AMD virtual CPU
+with a vendor string beginning with "Auth" due to the previous logic
+only checking EBX.  It also fixes a marginally less theoretically bug
+where guest_cpuid_is_amd() would incorrectly return false for a guest
+CPU with "AMDisbetter!" as its vendor string.
+
+Fixes: a0c0feb57992c ("KVM: x86: reserve bit 8 of non-leaf PDPEs and PML4Es in 64-bit mode on AMD")
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 15608ed03f10a1414188612b0ee9653e3c78bbd9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/emulate.c
+diff --cc arch/x86/kvm/emulate.c
+index 0c4142dbfbb3,6663f6887d2c..000000000000
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@@ -2746,31 -2742,22 +2744,38 @@@ static bool em_syscall_is_enabled(struc
+  	ecx = 0x00000000;
+  	ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, false);
+  	/*
+- 	 * Intel ("GenuineIntel")
+- 	 * remark: Intel CPUs only support "syscall" in 64bit
+- 	 * longmode. Also an 64bit guest with a
+- 	 * 32bit compat-app running will #UD !! While this
+- 	 * behaviour can be fixed (by emulating) into AMD
+- 	 * response - CPUs of AMD can't behave like Intel.
++ 	 * remark: Intel CPUs only support "syscall" in 64bit longmode. Also a
++ 	 * 64bit guest with a 32bit compat-app running will #UD !! While this
++ 	 * behaviour can be fixed (by emulating) into AMD response - CPUs of
++ 	 * AMD can't behave like Intel.
+  	 */
+- 	if (ebx == X86EMUL_CPUID_VENDOR_GenuineIntel_ebx &&
+- 	    ecx == X86EMUL_CPUID_VENDOR_GenuineIntel_ecx &&
+- 	    edx == X86EMUL_CPUID_VENDOR_GenuineIntel_edx)
++ 	if (is_guest_vendor_intel(ebx, ecx, edx))
+  		return false;
+  
+++<<<<<<< HEAD
+ +	/* AMD ("AuthenticAMD") */
+ +	if (ebx == X86EMUL_CPUID_VENDOR_AuthenticAMD_ebx &&
+ +	    ecx == X86EMUL_CPUID_VENDOR_AuthenticAMD_ecx &&
+ +	    edx == X86EMUL_CPUID_VENDOR_AuthenticAMD_edx)
+ +		return true;
+ +
+ +	/* AMD ("AMDisbetter!") */
+ +	if (ebx == X86EMUL_CPUID_VENDOR_AMDisbetterI_ebx &&
+ +	    ecx == X86EMUL_CPUID_VENDOR_AMDisbetterI_ecx &&
+ +	    edx == X86EMUL_CPUID_VENDOR_AMDisbetterI_edx)
+ +		return true;
+ +
+ +	/* default: (not Intel, not AMD), apply Intel's stricter rules... */
+++=======
++ 	if (is_guest_vendor_amd(ebx, ecx, edx) ||
++ 	    is_guest_vendor_hygon(ebx, ecx, edx))
++ 		return true;
++ 
++ 	/*
++ 	 * default: (not Intel, not AMD, not Hygon), apply Intel's
++ 	 * stricter rules...
++ 	 */
+++>>>>>>> 15608ed03f10 (KVM: x86: Add helpers to perform CPUID-based guest vendor check)
+  	return false;
+  }
+  
+diff --git a/arch/x86/kvm/cpuid.h b/arch/x86/kvm/cpuid.h
+index a2335b92a9a0..7af3ee9fbb17 100644
+--- a/arch/x86/kvm/cpuid.h
++++ b/arch/x86/kvm/cpuid.h
+@@ -176,7 +176,7 @@ static inline bool guest_cpuid_is_amd(struct kvm_vcpu *vcpu)
+ 	struct kvm_cpuid_entry2 *best;
+ 
+ 	best = kvm_find_cpuid_entry(vcpu, 0, 0);
+-	return best && best->ebx == X86EMUL_CPUID_VENDOR_AuthenticAMD_ebx;
++	return best && is_guest_vendor_amd(best->ebx, best->ecx, best->edx);
+ }
+ 
+ static inline int guest_cpuid_family(struct kvm_vcpu *vcpu)
+* Unmerged path arch/x86/kvm/emulate.c
+diff --git a/arch/x86/kvm/kvm_emulate.h b/arch/x86/kvm/kvm_emulate.h
+index dcdb44a5fb11..bd6cb3f33ccd 100644
+--- a/arch/x86/kvm/kvm_emulate.h
++++ b/arch/x86/kvm/kvm_emulate.h
+@@ -388,6 +388,30 @@ struct x86_emulate_ctxt {
+ #define X86EMUL_CPUID_VENDOR_GenuineIntel_ecx 0x6c65746e
+ #define X86EMUL_CPUID_VENDOR_GenuineIntel_edx 0x49656e69
+ 
++static inline bool is_guest_vendor_intel(u32 ebx, u32 ecx, u32 edx)
++{
++	return ebx == X86EMUL_CPUID_VENDOR_GenuineIntel_ebx &&
++	       ecx == X86EMUL_CPUID_VENDOR_GenuineIntel_ecx &&
++	       edx == X86EMUL_CPUID_VENDOR_GenuineIntel_edx;
++}
++
++static inline bool is_guest_vendor_amd(u32 ebx, u32 ecx, u32 edx)
++{
++	return (ebx == X86EMUL_CPUID_VENDOR_AuthenticAMD_ebx &&
++		ecx == X86EMUL_CPUID_VENDOR_AuthenticAMD_ecx &&
++		edx == X86EMUL_CPUID_VENDOR_AuthenticAMD_edx) ||
++	       (ebx == X86EMUL_CPUID_VENDOR_AMDisbetterI_ebx &&
++		ecx == X86EMUL_CPUID_VENDOR_AMDisbetterI_ecx &&
++		edx == X86EMUL_CPUID_VENDOR_AMDisbetterI_edx);
++}
++
++static inline bool is_guest_vendor_hygon(u32 ebx, u32 ecx, u32 edx)
++{
++	return ebx == X86EMUL_CPUID_VENDOR_HygonGenuine_ebx &&
++	       ecx == X86EMUL_CPUID_VENDOR_HygonGenuine_ecx &&
++	       edx == X86EMUL_CPUID_VENDOR_HygonGenuine_edx;
++}
++
+ enum x86_intercept_stage {
+ 	X86_ICTP_NONE = 0,   /* Allow zero-init to not match anything */
+ 	X86_ICPT_PRE_EXCEPT,
