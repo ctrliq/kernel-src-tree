@@ -1,0 +1,259 @@
+libperf: Adopt perf_evlist__filter_pollfd() from tools/perf
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit 84227cb11ff4d9815b9b1daf0c1a2bd7e9274c58
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/84227cb1.failed
+
+Introduce the perf_evlist__filter_pollfd function and export it in the
+perf/evlist.h header, so that libperf users can check if the descriptor
+is still alive.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Michael Petlan <mpetlan@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lore.kernel.org/lkml/20191007125344.14268-27-jolsa@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 84227cb11ff4d9815b9b1daf0c1a2bd7e9274c58)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/lib/evlist.c
+#	tools/perf/lib/include/perf/evlist.h
+#	tools/perf/lib/libperf.map
+#	tools/perf/util/evlist.c
+diff --cc tools/perf/lib/libperf.map
+index 3536242c545c,2184aba36c3f..000000000000
+--- a/tools/perf/lib/libperf.map
++++ b/tools/perf/lib/libperf.map
+@@@ -1,6 -1,52 +1,56 @@@
+  LIBPERF_0.0.1 {
+  	global:
+++<<<<<<< HEAD
+ +		libperf_set_print;
+++=======
++ 		libperf_init;
++ 		perf_cpu_map__dummy_new;
++ 		perf_cpu_map__get;
++ 		perf_cpu_map__put;
++ 		perf_cpu_map__new;
++ 		perf_cpu_map__read;
++ 		perf_cpu_map__nr;
++ 		perf_cpu_map__cpu;
++ 		perf_cpu_map__empty;
++ 		perf_cpu_map__max;
++ 		perf_thread_map__new_dummy;
++ 		perf_thread_map__set_pid;
++ 		perf_thread_map__comm;
++ 		perf_thread_map__nr;
++ 		perf_thread_map__pid;
++ 		perf_thread_map__get;
++ 		perf_thread_map__put;
++ 		perf_evsel__new;
++ 		perf_evsel__delete;
++ 		perf_evsel__enable;
++ 		perf_evsel__disable;
++ 		perf_evsel__init;
++ 		perf_evsel__open;
++ 		perf_evsel__close;
++ 		perf_evsel__read;
++ 		perf_evsel__cpus;
++ 		perf_evsel__threads;
++ 		perf_evsel__attr;
++ 		perf_evlist__new;
++ 		perf_evlist__delete;
++ 		perf_evlist__open;
++ 		perf_evlist__close;
++ 		perf_evlist__enable;
++ 		perf_evlist__disable;
++ 		perf_evlist__init;
++ 		perf_evlist__add;
++ 		perf_evlist__remove;
++ 		perf_evlist__next;
++ 		perf_evlist__set_maps;
++ 		perf_evlist__poll;
++ 		perf_evlist__mmap;
++ 		perf_evlist__munmap;
++ 		perf_evlist__filter_pollfd;
++ 		perf_mmap__consume;
++ 		perf_mmap__read_init;
++ 		perf_mmap__read_done;
++ 		perf_mmap__read_event;
+++>>>>>>> 84227cb11ff4 (libperf: Adopt perf_evlist__filter_pollfd() from tools/perf)
+  	local:
+  		*;
+  };
+diff --cc tools/perf/util/evlist.c
+index 29a998d183ce,21b77efa802c..000000000000
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@@ -424,147 -418,22 +424,153 @@@ int perf_evlist__enable_event_idx(struc
+  		return perf_evlist__enable_event_thread(evlist, evsel, idx);
+  }
+  
+ -int evlist__add_pollfd(struct evlist *evlist, int fd)
+ +int perf_evlist__alloc_pollfd(struct perf_evlist *evlist)
+ +{
+ +	int nr_cpus = cpu_map__nr(evlist->cpus);
+ +	int nr_threads = thread_map__nr(evlist->threads);
+ +	int nfds = 0;
+ +	struct perf_evsel *evsel;
+ +
+ +	evlist__for_each_entry(evlist, evsel) {
+ +		if (evsel->system_wide)
+ +			nfds += nr_cpus;
+ +		else
+ +			nfds += nr_cpus * nr_threads;
+ +	}
+ +
+ +	if (fdarray__available_entries(&evlist->pollfd) < nfds &&
+ +	    fdarray__grow(&evlist->pollfd, nfds) < 0)
+ +		return -ENOMEM;
+ +
+ +	return 0;
+ +}
+ +
+ +static int __perf_evlist__add_pollfd(struct perf_evlist *evlist, int fd,
+ +				     struct perf_mmap *map, short revent)
+ +{
+ +	int pos = fdarray__add(&evlist->pollfd, fd, revent | POLLERR | POLLHUP);
+ +	/*
+ +	 * Save the idx so that when we filter out fds POLLHUP'ed we can
+ +	 * close the associated evlist->mmap[] entry.
+ +	 */
+ +	if (pos >= 0) {
+ +		evlist->pollfd.priv[pos].ptr = map;
+ +
+ +		fcntl(fd, F_SETFL, O_NONBLOCK);
+ +	}
+ +
+ +	return pos;
+ +}
+ +
+ +int perf_evlist__add_pollfd(struct perf_evlist *evlist, int fd)
+  {
+ -	return perf_evlist__add_pollfd(&evlist->core, fd, NULL, POLLIN);
+ +	return __perf_evlist__add_pollfd(evlist, fd, NULL, POLLIN);
+  }
+  
+++<<<<<<< HEAD
+ +static void perf_evlist__munmap_filtered(struct fdarray *fda, int fd,
+ +					 void *arg __maybe_unused)
+ +{
+ +	struct perf_mmap *map = fda->priv[fd].ptr;
+ +
+ +	if (map)
+ +		perf_mmap__put(map);
+ +}
+ +
+ +int perf_evlist__filter_pollfd(struct perf_evlist *evlist, short revents_and_mask)
+ +{
+ +	return fdarray__filter(&evlist->pollfd, revents_and_mask,
+ +			       perf_evlist__munmap_filtered, NULL);
+++=======
++ int evlist__filter_pollfd(struct evlist *evlist, short revents_and_mask)
++ {
++ 	return perf_evlist__filter_pollfd(&evlist->core, revents_and_mask);
+++>>>>>>> 84227cb11ff4 (libperf: Adopt perf_evlist__filter_pollfd() from tools/perf)
+ +}
+ +
+ +int perf_evlist__poll(struct perf_evlist *evlist, int timeout)
+ +{
+ +	return fdarray__poll(&evlist->pollfd, timeout);
+ +}
+ +
+ +static void perf_evlist__id_hash(struct perf_evlist *evlist,
+ +				 struct perf_evsel *evsel,
+ +				 int cpu, int thread, u64 id)
+ +{
+ +	int hash;
+ +	struct perf_sample_id *sid = SID(evsel, cpu, thread);
+ +
+ +	sid->id = id;
+ +	sid->evsel = evsel;
+ +	hash = hash_64(sid->id, PERF_EVLIST__HLIST_BITS);
+ +	hlist_add_head(&sid->node, &evlist->heads[hash]);
+  }
+  
+ -int evlist__poll(struct evlist *evlist, int timeout)
+ +void perf_evlist__id_add(struct perf_evlist *evlist, struct perf_evsel *evsel,
+ +			 int cpu, int thread, u64 id)
+  {
+ -	return perf_evlist__poll(&evlist->core, timeout);
+ +	perf_evlist__id_hash(evlist, evsel, cpu, thread, id);
+ +	evsel->id[evsel->ids++] = id;
+  }
+  
+ -struct perf_sample_id *perf_evlist__id2sid(struct evlist *evlist, u64 id)
+ +int perf_evlist__id_add_fd(struct perf_evlist *evlist,
+ +			   struct perf_evsel *evsel,
+ +			   int cpu, int thread, int fd)
+ +{
+ +	u64 read_data[4] = { 0, };
+ +	int id_idx = 1; /* The first entry is the counter value */
+ +	u64 id;
+ +	int ret;
+ +
+ +	ret = ioctl(fd, PERF_EVENT_IOC_ID, &id);
+ +	if (!ret)
+ +		goto add;
+ +
+ +	if (errno != ENOTTY)
+ +		return -1;
+ +
+ +	/* Legacy way to get event id.. All hail to old kernels! */
+ +
+ +	/*
+ +	 * This way does not work with group format read, so bail
+ +	 * out in that case.
+ +	 */
+ +	if (perf_evlist__read_format(evlist) & PERF_FORMAT_GROUP)
+ +		return -1;
+ +
+ +	if (!(evsel->attr.read_format & PERF_FORMAT_ID) ||
+ +	    read(fd, &read_data, sizeof(read_data)) == -1)
+ +		return -1;
+ +
+ +	if (evsel->attr.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED)
+ +		++id_idx;
+ +	if (evsel->attr.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING)
+ +		++id_idx;
+ +
+ +	id = read_data[id_idx];
+ +
+ + add:
+ +	perf_evlist__id_add(evlist, evsel, cpu, thread, id);
+ +	return 0;
+ +}
+ +
+ +static void perf_evlist__set_sid_idx(struct perf_evlist *evlist,
+ +				     struct perf_evsel *evsel, int idx, int cpu,
+ +				     int thread)
+ +{
+ +	struct perf_sample_id *sid = SID(evsel, cpu, thread);
+ +	sid->idx = idx;
+ +	if (evlist->cpus && cpu >= 0)
+ +		sid->cpu = evlist->cpus->map[cpu];
+ +	else
+ +		sid->cpu = -1;
+ +	if (!evsel->system_wide && evlist->threads && thread >= 0)
+ +		sid->tid = thread_map__pid(evlist->threads, thread);
+ +	else
+ +		sid->tid = -1;
+ +}
+ +
+ +struct perf_sample_id *perf_evlist__id2sid(struct perf_evlist *evlist, u64 id)
+  {
+  	struct hlist_head *head;
+  	struct perf_sample_id *sid;
+* Unmerged path tools/perf/lib/evlist.c
+* Unmerged path tools/perf/lib/include/perf/evlist.h
+* Unmerged path tools/perf/lib/evlist.c
+* Unmerged path tools/perf/lib/include/perf/evlist.h
+* Unmerged path tools/perf/lib/libperf.map
+* Unmerged path tools/perf/util/evlist.c
