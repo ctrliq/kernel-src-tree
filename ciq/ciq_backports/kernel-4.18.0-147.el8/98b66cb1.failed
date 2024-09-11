@@ -1,0 +1,149 @@
+net/mlx5e: Change parse attr struct to accommodate multiple tunnel infos
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Eli Britstein <elibr@mellanox.com>
+commit 98b66cb1c9ff6ffbc6133ed649b2731638520992
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/98b66cb1.failed
+
+Currently the driver can support only a single TC tunnel_set action.
+Change the tunnel info fields to arrays, as a pre-step to support
+multiple encapsulations for a single flow, with no functional change.
+
+	Signed-off-by: Eli Britstein <elibr@mellanox.com>
+	Reviewed-by: Oz Shlomo <ozsh@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 98b66cb1c9ff6ffbc6133ed649b2731638520992)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c9ee89f4edb1,67b3c6f1aeae..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -94,7 -94,8 +94,12 @@@ struct mlx5e_tc_flow 
+  };
+  
+  struct mlx5e_tc_flow_parse_attr {
+++<<<<<<< HEAD
+ +	struct ip_tunnel_info tun_info;
+++=======
++ 	struct ip_tunnel_info tun_info[MLX5_MAX_FLOW_FWD_VPORTS];
++ 	struct net_device *filter_dev;
+++>>>>>>> 98b66cb1c9ff (net/mlx5e: Change parse attr struct to accommodate multiple tunnel infos)
+  	struct mlx5_flow_spec spec;
+  	int num_mod_hdr_actions;
+  	void *mod_hdr_actions;
+@@@ -565,9 -568,10 +570,9 @@@ static int mlx5e_hairpin_get_prio(struc
+  
+  static int mlx5e_hairpin_flow_add(struct mlx5e_priv *priv,
+  				  struct mlx5e_tc_flow *flow,
+ -				  struct mlx5e_tc_flow_parse_attr *parse_attr,
+ -				  struct netlink_ext_ack *extack)
+ +				  struct mlx5e_tc_flow_parse_attr *parse_attr)
+  {
+- 	int peer_ifindex = parse_attr->mirred_ifindex;
++ 	int peer_ifindex = parse_attr->mirred_ifindex[0];
+  	struct mlx5_hairpin_params params;
+  	struct mlx5_core_dev *peer_mdev;
+  	struct mlx5e_hairpin_entry *hpe;
+@@@ -831,20 -907,39 +836,30 @@@ mlx5e_tc_add_fdb_flow(struct mlx5e_pri
+  	struct mlx5_fc *counter = NULL;
+  	struct mlx5e_rep_priv *rpriv;
+  	struct mlx5e_priv *out_priv;
+ -	int err = 0, encap_err = 0;
+ -	int out_index;
+ -
+ -	/* if prios are not supported, keep the old behaviour of using same prio
+ -	 * for all offloaded rules.
+ -	 */
+ -	if (!mlx5_eswitch_prios_supported(esw))
+ -		attr->prio = 1;
+ -
+ -	if (attr->chain > max_chain) {
+ -		NL_SET_ERR_MSG(extack, "Requested chain is out of supported range");
+ -		err = -EOPNOTSUPP;
+ -		goto err_max_prio_chain;
+ -	}
+ +	int err;
+  
+ -	if (attr->prio > max_prio) {
+ -		NL_SET_ERR_MSG(extack, "Requested priority is out of supported range");
+ -		err = -EOPNOTSUPP;
+ -		goto err_max_prio_chain;
+ -	}
+ -
+ -	for (out_index = 0; out_index < MLX5_MAX_FLOW_FWD_VPORTS; out_index++) {
+ -		if (!(attr->dests[out_index].flags & MLX5_ESW_DEST_ENCAP))
+ -			continue;
+ +	/* keep the old behaviour, use same prio for all offloaded rules */
+ +	attr->prio = 1;
+  
+ +	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT) {
+  		out_dev = __dev_get_by_index(dev_net(priv->netdev),
+++<<<<<<< HEAD
+ +					     attr->parse_attr->mirred_ifindex);
+ +		err = mlx5e_attach_encap(priv, &parse_attr->tun_info,
+ +					 out_dev, &encap_dev, flow);
+ +		if (err) {
+ +			rule = ERR_PTR(err);
+ +			if (err != -EAGAIN)
+ +				goto err_attach_encap;
+++=======
++ 					     attr->parse_attr->mirred_ifindex[0]);
++ 		encap_err = mlx5e_attach_encap(priv, &parse_attr->tun_info[0],
++ 					       out_dev, &encap_dev, flow,
++ 					       extack);
++ 		if (encap_err && encap_err != -EAGAIN) {
++ 			err = encap_err;
++ 			goto err_attach_encap;
+++>>>>>>> 98b66cb1c9ff (net/mlx5e: Change parse attr struct to accommodate multiple tunnel infos)
+  		}
+  		out_priv = netdev_priv(encap_dev);
+  		rpriv = out_priv->ppriv;
+@@@ -2661,21 -2474,33 +2676,21 @@@ static int parse_tc_fdb_actions(struct 
+  			if (switchdev_port_same_parent_id(priv->netdev,
+  							  out_dev) ||
+  			    is_merged_eswitch_dev(priv, out_dev)) {
+ +				action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+ +					  MLX5_FLOW_CONTEXT_ACTION_COUNT;
+  				out_priv = netdev_priv(out_dev);
+  				rpriv = out_priv->ppriv;
+ -				attr->dests[attr->out_count].rep = rpriv->rep;
+ -				attr->dests[attr->out_count].mdev = out_priv->mdev;
+ -				attr->out_count++;
+ +				attr->out_rep[attr->out_count] = rpriv->rep;
+ +				attr->out_mdev[attr->out_count++] = out_priv->mdev;
+  			} else if (encap) {
+- 				parse_attr->mirred_ifindex = out_dev->ifindex;
+- 				parse_attr->tun_info = *info;
++ 				parse_attr->mirred_ifindex[0] = out_dev->ifindex;
++ 				parse_attr->tun_info[0] = *info;
+  				attr->parse_attr = parse_attr;
+ -				attr->dests[attr->out_count].flags |=
+ -					MLX5_ESW_DEST_ENCAP;
+ -				attr->out_count++;
+ -				/* attr->dests[].rep is resolved when we
+ -				 * handle encap
+ -				 */
+ -			} else if (parse_attr->filter_dev != priv->netdev) {
+ -				/* All mlx5 devices are called to configure
+ -				 * high level device filters. Therefore, the
+ -				 * *attempt* to  install a filter on invalid
+ -				 * eswitch should not trigger an explicit error
+ -				 */
+ -				return -EINVAL;
+ +				action |= MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT |
+ +					  MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+ +					  MLX5_FLOW_CONTEXT_ACTION_COUNT;
+ +				/* attr->out_rep is resolved when we handle encap */
+  			} else {
+ -				NL_SET_ERR_MSG_MOD(extack,
+ -						   "devices are not on same switch HW, can't offload forwarding");
+  				pr_err("devices %s %s not on same switch HW, can't offload forwarding\n",
+  				       priv->netdev->name, out_dev->name);
+  				return -EINVAL;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
