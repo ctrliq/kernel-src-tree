@@ -1,0 +1,293 @@
+s390/qeth: consolidate online/offline code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 91003f354e6bbe8d225b4d54127d80c694d201d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/91003f35.failed
+
+Large parts of the online/offline code are identical now, and cleaning
+up the remaining stuff is easier with a shared core.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 91003f354e6bbe8d225b4d54127d80c694d201d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core.h
+#	drivers/s390/net/qeth_core_main.c
+#	drivers/s390/net/qeth_l2_main.c
+#	drivers/s390/net/qeth_l3_main.c
+diff --cc drivers/s390/net/qeth_core.h
+index 75aff3734b33,d052a265da1c..000000000000
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@@ -728,12 -727,10 +728,15 @@@ struct qeth_osn_info 
+  
+  struct qeth_discipline {
+  	const struct device_type *devtype;
+++<<<<<<< HEAD
+ +	int (*process_rx_buffer)(struct qeth_card *card, int budget, int *done);
+ +	int (*recover)(void *ptr);
+++=======
+++>>>>>>> 91003f354e6b (s390/qeth: consolidate online/offline code)
+  	int (*setup) (struct ccwgroup_device *);
+  	void (*remove) (struct ccwgroup_device *);
+- 	int (*set_online) (struct ccwgroup_device *);
+- 	int (*set_offline) (struct ccwgroup_device *);
++ 	int (*set_online)(struct qeth_card *card);
++ 	void (*set_offline)(struct qeth_card *card);
+  	int (*do_ioctl)(struct net_device *dev, struct ifreq *rq, int cmd);
+  	int (*control_event_handler)(struct qeth_card *card,
+  					struct qeth_ipa_cmd *cmd);
+diff --cc drivers/s390/net/qeth_core_main.c
+index 210b547f4f17,d66a7433908c..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -5107,6 -5038,204 +5104,207 @@@ out
+  }
+  EXPORT_SYMBOL_GPL(qeth_core_hardsetup_card);
+  
+++<<<<<<< HEAD
+++=======
++ static int qeth_set_online(struct qeth_card *card)
++ {
++ 	int rc;
++ 
++ 	mutex_lock(&card->discipline_mutex);
++ 	mutex_lock(&card->conf_mutex);
++ 	QETH_CARD_TEXT(card, 2, "setonlin");
++ 
++ 	rc = card->discipline->set_online(card);
++ 
++ 	mutex_unlock(&card->conf_mutex);
++ 	mutex_unlock(&card->discipline_mutex);
++ 
++ 	return rc;
++ }
++ 
++ int qeth_set_offline(struct qeth_card *card, bool resetting)
++ {
++ 	int rc, rc2, rc3;
++ 
++ 	mutex_lock(&card->discipline_mutex);
++ 	mutex_lock(&card->conf_mutex);
++ 	QETH_CARD_TEXT(card, 3, "setoffl");
++ 
++ 	if ((!resetting && card->info.hwtrap) || card->info.hwtrap == 2) {
++ 		qeth_hw_trap(card, QETH_DIAGS_TRAP_DISARM);
++ 		card->info.hwtrap = 1;
++ 	}
++ 
++ 	rtnl_lock();
++ 	card->info.open_when_online = card->dev->flags & IFF_UP;
++ 	dev_close(card->dev);
++ 	netif_device_detach(card->dev);
++ 	netif_carrier_off(card->dev);
++ 	rtnl_unlock();
++ 
++ 	card->discipline->set_offline(card);
++ 
++ 	rc  = qeth_stop_channel(&card->data);
++ 	rc2 = qeth_stop_channel(&card->write);
++ 	rc3 = qeth_stop_channel(&card->read);
++ 	if (!rc)
++ 		rc = (rc2) ? rc2 : rc3;
++ 	if (rc)
++ 		QETH_CARD_TEXT_(card, 2, "1err%d", rc);
++ 	qdio_free(CARD_DDEV(card));
++ 
++ 	/* let user_space know that device is offline */
++ 	kobject_uevent(&card->gdev->dev.kobj, KOBJ_CHANGE);
++ 
++ 	mutex_unlock(&card->conf_mutex);
++ 	mutex_unlock(&card->discipline_mutex);
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(qeth_set_offline);
++ 
++ static int qeth_do_reset(void *data)
++ {
++ 	struct qeth_card *card = data;
++ 	int rc;
++ 
++ 	QETH_CARD_TEXT(card, 2, "recover1");
++ 	if (!qeth_do_run_thread(card, QETH_RECOVER_THREAD))
++ 		return 0;
++ 	QETH_CARD_TEXT(card, 2, "recover2");
++ 	dev_warn(&card->gdev->dev,
++ 		 "A recovery process has been started for the device\n");
++ 
++ 	qeth_set_offline(card, true);
++ 	rc = qeth_set_online(card);
++ 	if (!rc) {
++ 		dev_info(&card->gdev->dev,
++ 			 "Device successfully recovered!\n");
++ 	} else {
++ 		ccwgroup_set_offline(card->gdev);
++ 		dev_warn(&card->gdev->dev,
++ 			 "The qeth device driver failed to recover an error on the device\n");
++ 	}
++ 	qeth_clear_thread_start_bit(card, QETH_RECOVER_THREAD);
++ 	qeth_clear_thread_running_bit(card, QETH_RECOVER_THREAD);
++ 	return 0;
++ }
++ 
++ #if IS_ENABLED(CONFIG_QETH_L3)
++ static void qeth_l3_rebuild_skb(struct qeth_card *card, struct sk_buff *skb,
++ 				struct qeth_hdr *hdr)
++ {
++ 	struct af_iucv_trans_hdr *iucv = (struct af_iucv_trans_hdr *) skb->data;
++ 	struct qeth_hdr_layer3 *l3_hdr = &hdr->hdr.l3;
++ 	struct net_device *dev = skb->dev;
++ 
++ 	if (IS_IQD(card) && iucv->magic == ETH_P_AF_IUCV) {
++ 		dev_hard_header(skb, dev, ETH_P_AF_IUCV, dev->dev_addr,
++ 				"FAKELL", skb->len);
++ 		return;
++ 	}
++ 
++ 	if (!(l3_hdr->flags & QETH_HDR_PASSTHRU)) {
++ 		u16 prot = (l3_hdr->flags & QETH_HDR_IPV6) ? ETH_P_IPV6 :
++ 							     ETH_P_IP;
++ 		unsigned char tg_addr[ETH_ALEN];
++ 
++ 		skb_reset_network_header(skb);
++ 		switch (l3_hdr->flags & QETH_HDR_CAST_MASK) {
++ 		case QETH_CAST_MULTICAST:
++ 			if (prot == ETH_P_IP)
++ 				ip_eth_mc_map(ip_hdr(skb)->daddr, tg_addr);
++ 			else
++ 				ipv6_eth_mc_map(&ipv6_hdr(skb)->daddr, tg_addr);
++ 			QETH_CARD_STAT_INC(card, rx_multicast);
++ 			break;
++ 		case QETH_CAST_BROADCAST:
++ 			ether_addr_copy(tg_addr, dev->broadcast);
++ 			QETH_CARD_STAT_INC(card, rx_multicast);
++ 			break;
++ 		default:
++ 			if (card->options.sniffer)
++ 				skb->pkt_type = PACKET_OTHERHOST;
++ 			ether_addr_copy(tg_addr, dev->dev_addr);
++ 		}
++ 
++ 		if (l3_hdr->ext_flags & QETH_HDR_EXT_SRC_MAC_ADDR)
++ 			dev_hard_header(skb, dev, prot, tg_addr,
++ 					&l3_hdr->next_hop.rx.src_mac, skb->len);
++ 		else
++ 			dev_hard_header(skb, dev, prot, tg_addr, "FAKELL",
++ 					skb->len);
++ 	}
++ 
++ 	/* copy VLAN tag from hdr into skb */
++ 	if (!card->options.sniffer &&
++ 	    (l3_hdr->ext_flags & (QETH_HDR_EXT_VLAN_FRAME |
++ 				  QETH_HDR_EXT_INCLUDE_VLAN_TAG))) {
++ 		u16 tag = (l3_hdr->ext_flags & QETH_HDR_EXT_VLAN_FRAME) ?
++ 				l3_hdr->vlan_id :
++ 				l3_hdr->next_hop.rx.vlan_id;
++ 
++ 		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), tag);
++ 	}
++ }
++ #endif
++ 
++ static void qeth_receive_skb(struct qeth_card *card, struct sk_buff *skb,
++ 			     struct qeth_hdr *hdr, bool uses_frags)
++ {
++ 	struct napi_struct *napi = &card->napi;
++ 	bool is_cso;
++ 
++ 	switch (hdr->hdr.l2.id) {
++ 	case QETH_HEADER_TYPE_OSN:
++ 		skb_push(skb, sizeof(*hdr));
++ 		skb_copy_to_linear_data(skb, hdr, sizeof(*hdr));
++ 		QETH_CARD_STAT_ADD(card, rx_bytes, skb->len);
++ 		QETH_CARD_STAT_INC(card, rx_packets);
++ 
++ 		card->osn_info.data_cb(skb);
++ 		return;
++ #if IS_ENABLED(CONFIG_QETH_L3)
++ 	case QETH_HEADER_TYPE_LAYER3:
++ 		qeth_l3_rebuild_skb(card, skb, hdr);
++ 		is_cso = hdr->hdr.l3.ext_flags & QETH_HDR_EXT_CSUM_TRANSP_REQ;
++ 		break;
++ #endif
++ 	case QETH_HEADER_TYPE_LAYER2:
++ 		is_cso = hdr->hdr.l2.flags[1] & QETH_HDR_EXT_CSUM_TRANSP_REQ;
++ 		break;
++ 	default:
++ 		/* never happens */
++ 		if (uses_frags)
++ 			napi_free_frags(napi);
++ 		else
++ 			dev_kfree_skb_any(skb);
++ 		return;
++ 	}
++ 
++ 	if (is_cso && (card->dev->features & NETIF_F_RXCSUM)) {
++ 		skb->ip_summed = CHECKSUM_UNNECESSARY;
++ 		QETH_CARD_STAT_INC(card, rx_skb_csum);
++ 	} else {
++ 		skb->ip_summed = CHECKSUM_NONE;
++ 	}
++ 
++ 	QETH_CARD_STAT_ADD(card, rx_bytes, skb->len);
++ 	QETH_CARD_STAT_INC(card, rx_packets);
++ 	if (skb_is_nonlinear(skb)) {
++ 		QETH_CARD_STAT_INC(card, rx_sg_skbs);
++ 		QETH_CARD_STAT_ADD(card, rx_sg_frags,
++ 				   skb_shinfo(skb)->nr_frags);
++ 	}
++ 
++ 	if (uses_frags) {
++ 		napi_gro_frags(napi);
++ 	} else {
++ 		skb->protocol = eth_type_trans(skb, skb->dev);
++ 		napi_gro_receive(napi, skb);
++ 	}
++ }
++ 
+++>>>>>>> 91003f354e6b (s390/qeth: consolidate online/offline code)
+  static void qeth_create_skb_frag(struct sk_buff *skb, char *data, int data_len)
+  {
+  	struct page *page = virt_to_page(data);
+diff --cc drivers/s390/net/qeth_l2_main.c
+index d1e8f2506bfa,c36b6c1fc33f..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -975,8 -858,6 +899,11 @@@ static int qeth_l2_control_event(struc
+  
+  struct qeth_discipline qeth_l2_discipline = {
+  	.devtype = &qeth_l2_devtype,
+++<<<<<<< HEAD
+ +	.process_rx_buffer = qeth_l2_process_inbound_buffer,
+ +	.recover = qeth_l2_recover,
+++=======
+++>>>>>>> 91003f354e6b (s390/qeth: consolidate online/offline code)
+  	.setup = qeth_l2_probe_device,
+  	.remove = qeth_l2_remove_device,
+  	.set_online = qeth_l2_set_online,
+diff --cc drivers/s390/net/qeth_l3_main.c
+index d915059832ae,eb2d9c427b10..000000000000
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@@ -2314,8 -2143,6 +2236,11 @@@ static int qeth_l3_control_event(struc
+  
+  struct qeth_discipline qeth_l3_discipline = {
+  	.devtype = &qeth_l3_devtype,
+++<<<<<<< HEAD
+ +	.process_rx_buffer = qeth_l3_process_inbound_buffer,
+ +	.recover = qeth_l3_recover,
+++=======
+++>>>>>>> 91003f354e6b (s390/qeth: consolidate online/offline code)
+  	.setup = qeth_l3_probe_device,
+  	.remove = qeth_l3_remove_device,
+  	.set_online = qeth_l3_set_online,
+* Unmerged path drivers/s390/net/qeth_core.h
+* Unmerged path drivers/s390/net/qeth_core_main.c
+* Unmerged path drivers/s390/net/qeth_l2_main.c
+* Unmerged path drivers/s390/net/qeth_l3_main.c
