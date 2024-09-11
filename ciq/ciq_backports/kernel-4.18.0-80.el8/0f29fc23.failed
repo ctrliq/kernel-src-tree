@@ -1,0 +1,172 @@
+net: hns3: Fix for loopback selftest failed problem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Yunsheng Lin <linyunsheng@huawei.com>
+commit 0f29fc23b21d3cbd966537bfabba07c00466b787
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/0f29fc23.failed
+
+Tqp and mac need to be enabled when doing loopback selftest,
+ae_algo->ops->start/stop is used to do the job, there is a
+time window between ae_algo->ops->start/stop and loopback setup,
+which will cause selftest failed problem when there is frame
+coming in during that time window.
+
+This patch fixes it by enabling the tqp and mac during loopback
+setup process.
+
+Fixes: c39c4d98dc65 ("net: hns3: Add mac loopback selftest support in hns3 driver")
+	Signed-off-by: Yunsheng Lin <linyunsheng@huawei.com>
+	Signed-off-by: Peng Li <lipeng321@huawei.com>
+	Signed-off-by: Salil Mehta <salil.mehta@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0f29fc23b21d3cbd966537bfabba07c00466b787)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+diff --cc drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+index 1a5f3b80688a,4c7442e2a78d..000000000000
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+@@@ -3697,7 -3658,9 +3697,13 @@@ static int hclge_set_mac_loopback(struc
+  
+  	/* 2 Then setup the loopback flag */
+  	loop_en = le32_to_cpu(req->txrx_pad_fcs_loop_en);
+++<<<<<<< HEAD
+ +	hnae_set_bit(loop_en, HCLGE_MAC_APP_LP_B, en ? 1 : 0);
+++=======
++ 	hnae3_set_bit(loop_en, HCLGE_MAC_APP_LP_B, en ? 1 : 0);
++ 	hnae3_set_bit(loop_en, HCLGE_MAC_TX_EN_B, en ? 1 : 0);
++ 	hnae3_set_bit(loop_en, HCLGE_MAC_RX_EN_B, en ? 1 : 0);
+++>>>>>>> 0f29fc23b21d (net: hns3: Fix for loopback selftest failed problem)
+  
+  	req->txrx_pad_fcs_loop_en = cpu_to_le32(loop_en);
+  
+@@@ -3712,25 -3675,54 +3718,76 @@@
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int hclge_set_loopback(struct hnae3_handle *handle,
+ +			      enum hnae3_loop loop_mode, bool en)
+ +{
+ +	struct hclge_vport *vport = hclge_get_vport(handle);
+ +	struct hclge_dev *hdev = vport->back;
+ +	int ret;
+ +
+ +	switch (loop_mode) {
+ +	case HNAE3_MAC_INTER_LOOP_MAC:
+ +		ret = hclge_set_mac_loopback(hdev, en);
+ +		break;
+ +	default:
+ +		ret = -ENOTSUPP;
+ +		dev_err(&hdev->pdev->dev,
+ +			"loop_mode %d is not supported\n", loop_mode);
+ +		break;
+ +	}
+ +
+ +	return ret;
+++=======
++ static int hclge_set_serdes_loopback(struct hclge_dev *hdev, bool en)
++ {
++ #define HCLGE_SERDES_RETRY_MS	10
++ #define HCLGE_SERDES_RETRY_NUM	100
++ 	struct hclge_serdes_lb_cmd *req;
++ 	struct hclge_desc desc;
++ 	int ret, i = 0;
++ 
++ 	req = (struct hclge_serdes_lb_cmd *)&desc.data[0];
++ 	hclge_cmd_setup_basic_desc(&desc, HCLGE_OPC_SERDES_LOOPBACK, false);
++ 
++ 	if (en) {
++ 		req->enable = HCLGE_CMD_SERDES_SERIAL_INNER_LOOP_B;
++ 		req->mask = HCLGE_CMD_SERDES_SERIAL_INNER_LOOP_B;
++ 	} else {
++ 		req->mask = HCLGE_CMD_SERDES_SERIAL_INNER_LOOP_B;
++ 	}
++ 
++ 	ret = hclge_cmd_send(&hdev->hw, &desc, 1);
++ 	if (ret) {
++ 		dev_err(&hdev->pdev->dev,
++ 			"serdes loopback set fail, ret = %d\n", ret);
++ 		return ret;
++ 	}
++ 
++ 	do {
++ 		msleep(HCLGE_SERDES_RETRY_MS);
++ 		hclge_cmd_setup_basic_desc(&desc, HCLGE_OPC_SERDES_LOOPBACK,
++ 					   true);
++ 		ret = hclge_cmd_send(&hdev->hw, &desc, 1);
++ 		if (ret) {
++ 			dev_err(&hdev->pdev->dev,
++ 				"serdes loopback get, ret = %d\n", ret);
++ 			return ret;
++ 		}
++ 	} while (++i < HCLGE_SERDES_RETRY_NUM &&
++ 		 !(req->result & HCLGE_CMD_SERDES_DONE_B));
++ 
++ 	if (!(req->result & HCLGE_CMD_SERDES_DONE_B)) {
++ 		dev_err(&hdev->pdev->dev, "serdes loopback set timeout\n");
++ 		return -EBUSY;
++ 	} else if (!(req->result & HCLGE_CMD_SERDES_SUCCESS_B)) {
++ 		dev_err(&hdev->pdev->dev, "serdes loopback set failed in fw\n");
++ 		return -EIO;
++ 	}
++ 
++ 	hclge_cfg_mac_mode(hdev, en);
++ 	return 0;
+++>>>>>>> 0f29fc23b21d (net: hns3: Fix for loopback selftest failed problem)
+  }
+  
+  static int hclge_tqp_enable(struct hclge_dev *hdev, int tqp_id,
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c b/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
+index 11620e003a8e..77f46119832e 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
+@@ -105,41 +105,26 @@ static int hns3_lp_up(struct net_device *ndev, enum hnae3_loop loop_mode)
+ 	struct hnae3_handle *h = hns3_get_handle(ndev);
+ 	int ret;
+ 
+-	if (!h->ae_algo->ops->start)
+-		return -EOPNOTSUPP;
+-
+ 	ret = hns3_nic_reset_all_ring(h);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = h->ae_algo->ops->start(h);
+-	if (ret) {
+-		netdev_err(ndev,
+-			   "hns3_lb_up ae start return error: %d\n", ret);
+-		return ret;
+-	}
+-
+ 	ret = hns3_lp_setup(ndev, loop_mode, true);
+ 	usleep_range(10000, 20000);
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static int hns3_lp_down(struct net_device *ndev, enum hnae3_loop loop_mode)
+ {
+-	struct hnae3_handle *h = hns3_get_handle(ndev);
+ 	int ret;
+ 
+-	if (!h->ae_algo->ops->stop)
+-		return -EOPNOTSUPP;
+-
+ 	ret = hns3_lp_setup(ndev, loop_mode, false);
+ 	if (ret) {
+ 		netdev_err(ndev, "lb_setup return error: %d\n", ret);
+ 		return ret;
+ 	}
+ 
+-	h->ae_algo->ops->stop(h);
+ 	usleep_range(10000, 20000);
+ 
+ 	return 0;
+* Unmerged path drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
