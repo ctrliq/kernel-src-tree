@@ -1,0 +1,154 @@
+x86/dumpstack/64: Speedup in_exception_stack()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit c450c8f532b63475b30e29bc600c25ab0a4ab282
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c450c8f5.failed
+
+The current implementation of in_exception_stack() iterates over the
+exception stacks array. Most of the time this is an useless exercise, but
+even for the actual use cases (perf and ftrace) it takes at least 2
+iterations to get to the NMI stack.
+
+As the exception stacks and the guard pages are page aligned the loop can
+be avoided completely.
+
+Add a initial check whether the stack pointer is inside the full exception
+stack area and leave early if not.
+
+Create a lookup table which describes the stack area. The table index is
+the page offset from the beginning of the exception stacks. So for any
+given stack pointer the page offset is computed and a lookup in the
+description table is performed. If it is inside a guard page, return. If
+not, use the descriptor to fill in the info structure.
+
+The table is filled at compile time and for the !KASAN case the interesting
+page descriptors exactly fit into a single cache line. Just the last guard
+page descriptor is in the next cacheline, but that should not be accessed
+in the regular case.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Sean Christopherson <sean.j.christopherson@intel.com>
+	Cc: x86-ml <x86@kernel.org>
+Link: https://lkml.kernel.org/r/20190414160145.543320386@linutronix.de
+(cherry picked from commit c450c8f532b63475b30e29bc600c25ab0a4ab282)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/dumpstack_64.c
+diff --cc arch/x86/kernel/dumpstack_64.c
+index 16a780db77dc,f356d3ea0c70..000000000000
+--- a/arch/x86/kernel/dumpstack_64.c
++++ b/arch/x86/kernel/dumpstack_64.c
+@@@ -52,31 -50,72 +52,100 @@@ const char *stack_type_name(enum stack_
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static bool in_exception_stack(unsigned long *stack, struct stack_info *info)
+ +{
+ +	unsigned long *begin, *end;
+++=======
++ /**
++  * struct estack_pages - Page descriptor for exception stacks
++  * @offs:	Offset from the start of the exception stack area
++  * @size:	Size of the exception stack
++  * @type:	Type to store in the stack_info struct
++  */
++ struct estack_pages {
++ 	u32	offs;
++ 	u16	size;
++ 	u16	type;
++ };
++ 
++ #define EPAGERANGE(st)							\
++ 	[PFN_DOWN(CEA_ESTACK_OFFS(st)) ...				\
++ 	 PFN_DOWN(CEA_ESTACK_OFFS(st) + CEA_ESTACK_SIZE(st) - 1)] = {	\
++ 		.offs	= CEA_ESTACK_OFFS(st),				\
++ 		.size	= CEA_ESTACK_SIZE(st),				\
++ 		.type	= STACK_TYPE_EXCEPTION + ESTACK_ ##st, }
++ 
++ /*
++  * Array of exception stack page descriptors. If the stack is larger than
++  * PAGE_SIZE, all pages covering a particular stack will have the same
++  * info. The guard pages including the not mapped DB2 stack are zeroed
++  * out.
++  */
++ static const
++ struct estack_pages estack_pages[CEA_ESTACK_PAGES] ____cacheline_aligned = {
++ 	EPAGERANGE(DF),
++ 	EPAGERANGE(NMI),
++ 	EPAGERANGE(DB1),
++ 	EPAGERANGE(DB),
++ 	EPAGERANGE(MCE),
++ };
++ 
++ static bool in_exception_stack(unsigned long *stack, struct stack_info *info)
++ {
++ 	unsigned long begin, end, stk = (unsigned long)stack;
++ 	const struct estack_pages *ep;
+++>>>>>>> c450c8f532b6 (x86/dumpstack/64: Speedup in_exception_stack())
+  	struct pt_regs *regs;
+ -	unsigned int k;
+ +	unsigned k;
+ +
+++<<<<<<< HEAD
+ +	BUILD_BUG_ON(N_EXCEPTION_STACKS != 4);
+ +
+ +	for (k = 0; k < N_EXCEPTION_STACKS; k++) {
+ +		end   = (unsigned long *)raw_cpu_ptr(&orig_ist)->ist[k];
+ +		begin = end - (exception_stack_sizes[k] / sizeof(long));
+ +		regs  = (struct pt_regs *)end - 1;
+ +
+ +		if (stack < begin || stack >= end)
+ +			continue;
+ +
+ +		info->type	= STACK_TYPE_EXCEPTION + k;
+ +		info->begin	= begin;
+ +		info->end	= end;
+ +		info->next_sp	= (unsigned long *)regs->sp;
+ +
+ +		return true;
+ +	}
+  
+ +	return false;
+++=======
++ 	BUILD_BUG_ON(N_EXCEPTION_STACKS != 6);
++ 
++ 	begin = (unsigned long)__this_cpu_read(cea_exception_stacks);
++ 	end = begin + sizeof(struct cea_exception_stacks);
++ 	/* Bail if @stack is outside the exception stack area. */
++ 	if (stk < begin || stk >= end)
++ 		return false;
++ 
++ 	/* Calc page offset from start of exception stacks */
++ 	k = (stk - begin) >> PAGE_SHIFT;
++ 	/* Lookup the page descriptor */
++ 	ep = &estack_pages[k];
++ 	/* Guard page? */
++ 	if (!ep->size)
++ 		return false;
++ 
++ 	begin += (unsigned long)ep->offs;
++ 	end = begin + (unsigned long)ep->size;
++ 	regs = (struct pt_regs *)end - 1;
++ 
++ 	info->type	= ep->type;
++ 	info->begin	= (unsigned long *)begin;
++ 	info->end	= (unsigned long *)end;
++ 	info->next_sp	= (unsigned long *)regs->sp;
++ 	return true;
+++>>>>>>> c450c8f532b6 (x86/dumpstack/64: Speedup in_exception_stack())
+  }
+  
+  static bool in_irq_stack(unsigned long *stack, struct stack_info *info)
+* Unmerged path arch/x86/kernel/dumpstack_64.c
