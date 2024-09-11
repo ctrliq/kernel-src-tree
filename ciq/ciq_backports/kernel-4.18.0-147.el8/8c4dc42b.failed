@@ -1,0 +1,529 @@
+net/mlx5e: Support multiple encapsulations for a TC flow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Eli Britstein <elibr@mellanox.com>
+commit 8c4dc42bf6e4ffeda49cf5e26bfc991b548fc0aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/8c4dc42b.failed
+
+Currently a flow is associated with a single encap structure. The FW
+extended destination features enables the driver to associate a flow
+with multiple encap instances.
+
+Change the encap id field from a flow scope to a per destination value
+in the flow attributes struct. Use the encaps array to associate a flow
+table entry with multiple encap entries.
+
+Update the neigh logic to offload only if all encapsulations used in a
+flow are connected, and un-offload upon the first one disconnected.
+
+Note that the driver can now support up to two encap destinations.
+
+	Signed-off-by: Eli Britstein <elibr@mellanox.com>
+	Reviewed-by: Oz Shlomo <ozsh@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 8c4dc42bf6e4ffeda49cf5e26bfc991b548fc0aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c9ee89f4edb1,0921213561cb..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -817,39 -849,133 +817,83 @@@ static int mlx5e_attach_encap(struct ml
+  			      struct ip_tunnel_info *tun_info,
+  			      struct net_device *mirred_dev,
+  			      struct net_device **encap_dev,
+++<<<<<<< HEAD
+ +			      struct mlx5e_tc_flow *flow);
+++=======
++ 			      struct mlx5e_tc_flow *flow,
++ 			      struct netlink_ext_ack *extack,
++ 			      int out_index);
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  
+  static struct mlx5_flow_handle *
+ -mlx5e_tc_offload_fdb_rules(struct mlx5_eswitch *esw,
+ -			   struct mlx5e_tc_flow *flow,
+ -			   struct mlx5_flow_spec *spec,
+ -			   struct mlx5_esw_flow_attr *attr)
+ -{
+ -	struct mlx5_flow_handle *rule;
+ -
+ -	rule = mlx5_eswitch_add_offloaded_rule(esw, spec, attr);
+ -	if (IS_ERR(rule))
+ -		return rule;
+ -
+ -	if (attr->split_count) {
+ -		flow->rule[1] = mlx5_eswitch_add_fwd_rule(esw, spec, attr);
+ -		if (IS_ERR(flow->rule[1])) {
+ -			mlx5_eswitch_del_offloaded_rule(esw, rule, attr);
+ -			return flow->rule[1];
+ -		}
+ -	}
+ -
+ -	flow->flags |= MLX5E_TC_FLOW_OFFLOADED;
+ -	return rule;
+ -}
+ -
+ -static void
+ -mlx5e_tc_unoffload_fdb_rules(struct mlx5_eswitch *esw,
+ -			     struct mlx5e_tc_flow *flow,
+ -			   struct mlx5_esw_flow_attr *attr)
+ -{
+ -	flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
+ -
+ -	if (attr->split_count)
+ -		mlx5_eswitch_del_fwd_rule(esw, flow->rule[1], attr);
+ -
+ -	mlx5_eswitch_del_offloaded_rule(esw, flow->rule[0], attr);
+ -}
+ -
+ -static struct mlx5_flow_handle *
+ -mlx5e_tc_offload_to_slow_path(struct mlx5_eswitch *esw,
+ -			      struct mlx5e_tc_flow *flow,
+ -			      struct mlx5_flow_spec *spec,
+ -			      struct mlx5_esw_flow_attr *slow_attr)
+ -{
+ -	struct mlx5_flow_handle *rule;
+ -
+ -	memcpy(slow_attr, flow->esw_attr, sizeof(*slow_attr));
+ -	slow_attr->action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST,
+ -	slow_attr->split_count = 0,
+ -	slow_attr->dest_chain = FDB_SLOW_PATH_CHAIN,
+ -
+ -	rule = mlx5e_tc_offload_fdb_rules(esw, flow, spec, slow_attr);
+ -	if (!IS_ERR(rule))
+ -		flow->flags |= MLX5E_TC_FLOW_SLOW;
+ -
+ -	return rule;
+ -}
+ -
+ -static void
+ -mlx5e_tc_unoffload_from_slow_path(struct mlx5_eswitch *esw,
+ -				  struct mlx5e_tc_flow *flow,
+ -				  struct mlx5_esw_flow_attr *slow_attr)
+ -{
+ -	memcpy(slow_attr, flow->esw_attr, sizeof(*slow_attr));
+ -	mlx5e_tc_unoffload_fdb_rules(esw, flow, slow_attr);
+ -	flow->flags &= ~MLX5E_TC_FLOW_SLOW;
+ -}
+ -
+ -static int
+  mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
+  		      struct mlx5e_tc_flow_parse_attr *parse_attr,
+ -		      struct mlx5e_tc_flow *flow,
+ -		      struct netlink_ext_ack *extack)
+ +		      struct mlx5e_tc_flow *flow)
+  {
+  	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+ -	u32 max_chain = mlx5_eswitch_get_chain_range(esw);
+  	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
+ -	u16 max_prio = mlx5_eswitch_get_prio_range(esw);
+  	struct net_device *out_dev, *encap_dev = NULL;
+ +	struct mlx5_flow_handle *rule = NULL;
+  	struct mlx5_fc *counter = NULL;
+  	struct mlx5e_rep_priv *rpriv;
+  	struct mlx5e_priv *out_priv;
+ -	int err = 0, encap_err = 0;
+ -	int out_index;
+ +	int err;
+  
+++<<<<<<< HEAD
+ +	/* keep the old behaviour, use same prio for all offloaded rules */
+ +	attr->prio = 1;
+ +
+ +	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT) {
+ +		out_dev = __dev_get_by_index(dev_net(priv->netdev),
+ +					     attr->parse_attr->mirred_ifindex);
+ +		err = mlx5e_attach_encap(priv, &parse_attr->tun_info,
+ +					 out_dev, &encap_dev, flow);
+ +		if (err) {
+ +			rule = ERR_PTR(err);
+ +			if (err != -EAGAIN)
+ +				goto err_attach_encap;
+ +		}
+++=======
++ 	/* if prios are not supported, keep the old behaviour of using same prio
++ 	 * for all offloaded rules.
++ 	 */
++ 	if (!mlx5_eswitch_prios_supported(esw))
++ 		attr->prio = 1;
++ 
++ 	if (attr->chain > max_chain) {
++ 		NL_SET_ERR_MSG(extack, "Requested chain is out of supported range");
++ 		err = -EOPNOTSUPP;
++ 		goto err_max_prio_chain;
++ 	}
++ 
++ 	if (attr->prio > max_prio) {
++ 		NL_SET_ERR_MSG(extack, "Requested priority is out of supported range");
++ 		err = -EOPNOTSUPP;
++ 		goto err_max_prio_chain;
++ 	}
++ 
++ 	for (out_index = 0; out_index < MLX5_MAX_FLOW_FWD_VPORTS; out_index++) {
++ 		int mirred_ifindex;
++ 
++ 		if (!(attr->dests[out_index].flags & MLX5_ESW_DEST_ENCAP))
++ 			continue;
++ 
++ 		mirred_ifindex = attr->parse_attr->mirred_ifindex[out_index];
++ 		out_dev = __dev_get_by_index(dev_net(priv->netdev),
++ 					     mirred_ifindex);
++ 		err = mlx5e_attach_encap(priv,
++ 					 &parse_attr->tun_info[out_index],
++ 					 out_dev, &encap_dev, flow,
++ 					 extack, out_index);
++ 		if (err && err != -EAGAIN)
++ 			goto err_attach_encap;
++ 		if (err == -EAGAIN)
++ 			encap_err = err;
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  		out_priv = netdev_priv(encap_dev);
+  		rpriv = out_priv->ppriv;
+ -		attr->dests[out_index].rep = rpriv->rep;
+ -		attr->dests[out_index].mdev = out_priv->mdev;
+ +		attr->out_rep[attr->out_count] = rpriv->rep;
+ +		attr->out_mdev[attr->out_count++] = out_priv->mdev;
+  	}
+  
+  	err = mlx5_eswitch_add_vlan_action(esw, attr);
+@@@ -904,10 -1026,12 +948,16 @@@ err_create_counter
+  err_mod_hdr:
+  	mlx5_eswitch_del_vlan_action(esw, attr);
+  err_add_vlan:
+++<<<<<<< HEAD
+ +	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT)
+ +		mlx5e_detach_encap(priv, flow);
+++=======
++ 	for (out_index = 0; out_index < MLX5_MAX_FLOW_FWD_VPORTS; out_index++)
++ 		if (attr->dests[out_index].flags & MLX5_ESW_DEST_ENCAP)
++ 			mlx5e_detach_encap(priv, flow, out_index);
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  err_attach_encap:
+ -err_max_prio_chain:
+ -	return err;
+ +	return rule;
+  }
+  
+  static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
+@@@ -925,10 -1051,10 +975,17 @@@
+  
+  	mlx5_eswitch_del_vlan_action(esw, attr);
+  
+++<<<<<<< HEAD
+ +	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT) {
+ +		mlx5e_detach_encap(priv, flow);
+ +		kvfree(attr->parse_attr);
+ +	}
+++=======
++ 	for (out_index = 0; out_index < MLX5_MAX_FLOW_FWD_VPORTS; out_index++)
++ 		if (attr->dests[out_index].flags & MLX5_ESW_DEST_ENCAP)
++ 			mlx5e_detach_encap(priv, flow, out_index);
++ 	kvfree(attr->parse_attr);
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  
+  	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR)
+  		mlx5e_detach_mod_hdr(priv, flow);
+@@@ -957,12 -1087,35 +1014,44 @@@ void mlx5e_tc_encap_flows_add(struct ml
+  	e->flags |= MLX5_ENCAP_ENTRY_VALID;
+  	mlx5e_rep_queue_neigh_stats_work(priv);
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(flow, &e->flows, encap) {
+ +		esw_attr = flow->esw_attr;
+ +		esw_attr->encap_id = e->encap_id;
+ +		flow->rule[0] = mlx5_eswitch_add_offloaded_rule(esw, &esw_attr->parse_attr->spec, esw_attr);
+ +		if (IS_ERR(flow->rule[0])) {
+ +			err = PTR_ERR(flow->rule[0]);
+++=======
++ 	list_for_each_entry(efi, &e->flows, list) {
++ 		bool all_flow_encaps_valid = true;
++ 		int i;
++ 
++ 		flow = container_of(efi, struct mlx5e_tc_flow, encaps[efi->index]);
++ 		esw_attr = flow->esw_attr;
++ 		spec = &esw_attr->parse_attr->spec;
++ 
++ 		esw_attr->dests[efi->index].encap_id = e->encap_id;
++ 		esw_attr->dests[efi->index].flags |= MLX5_ESW_DEST_ENCAP_VALID;
++ 		/* Flow can be associated with multiple encap entries.
++ 		 * Before offloading the flow verify that all of them have
++ 		 * a valid neighbour.
++ 		 */
++ 		for (i = 0; i < MLX5_MAX_FLOW_FWD_VPORTS; i++) {
++ 			if (!(esw_attr->dests[i].flags & MLX5_ESW_DEST_ENCAP))
++ 				continue;
++ 			if (!(esw_attr->dests[i].flags & MLX5_ESW_DEST_ENCAP_VALID)) {
++ 				all_flow_encaps_valid = false;
++ 				break;
++ 			}
++ 		}
++ 		/* Do not offload flows with unresolved neighbors */
++ 		if (!all_flow_encaps_valid)
++ 			continue;
++ 		/* update from slow path rule to encap rule */
++ 		rule = mlx5e_tc_offload_fdb_rules(esw, flow, spec, esw_attr);
++ 		if (IS_ERR(rule)) {
++ 			err = PTR_ERR(rule);
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  			mlx5_core_warn(priv->mdev, "Failed to update cached encapsulation flow, %d\n",
+  				       err);
+  			continue;
+@@@ -987,22 -1131,38 +1076,35 @@@ void mlx5e_tc_encap_flows_del(struct ml
+  			      struct mlx5e_encap_entry *e)
+  {
+  	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+ -	struct mlx5_esw_flow_attr slow_attr;
+ -	struct mlx5_flow_handle *rule;
+ -	struct mlx5_flow_spec *spec;
+ -	struct encap_flow_item *efi;
+  	struct mlx5e_tc_flow *flow;
+ -	int err;
+  
+ -	list_for_each_entry(efi, &e->flows, list) {
+ -		flow = container_of(efi, struct mlx5e_tc_flow, encaps[efi->index]);
+ -		spec = &flow->esw_attr->parse_attr->spec;
+ +	list_for_each_entry(flow, &e->flows, encap) {
+ +		if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
+ +			struct mlx5_esw_flow_attr *attr = flow->esw_attr;
+  
+++<<<<<<< HEAD
+ +			flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
+ +			if (attr->mirror_count)
+ +				mlx5_eswitch_del_fwd_rule(esw, flow->rule[1], attr);
+ +			mlx5_eswitch_del_offloaded_rule(esw, flow->rule[0], attr);
+++=======
++ 		/* update from encap rule to slow path rule */
++ 		rule = mlx5e_tc_offload_to_slow_path(esw, flow, spec, &slow_attr);
++ 		/* mark the flow's encap dest as non-valid */
++ 		flow->esw_attr->dests[efi->index].flags &= ~MLX5_ESW_DEST_ENCAP_VALID;
++ 
++ 		if (IS_ERR(rule)) {
++ 			err = PTR_ERR(rule);
++ 			mlx5_core_warn(priv->mdev, "Failed to update slow path (encap) flow, %d\n",
++ 				       err);
++ 			continue;
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  		}
+ -
+ -		mlx5e_tc_unoffload_fdb_rules(esw, flow, flow->esw_attr);
+ -		flow->flags |= MLX5E_TC_FLOW_OFFLOADED; /* was unset when fast path rule removed */
+ -		flow->rule[0] = rule;
+  	}
+  
+ -	if (e->flags & MLX5_ENCAP_ENTRY_VALID) {
+ -		e->flags &= ~MLX5_ENCAP_ENTRY_VALID;
+ -		mlx5_packet_reformat_dealloc(priv->mdev, e->encap_id);
+ -	}
+ +	/* we know that the encap is valid */
+ +	e->flags &= ~MLX5_ENCAP_ENTRY_VALID;
+ +	mlx5_packet_reformat_dealloc(priv->mdev, e->encap_id);
+  }
+  
+  static struct mlx5_fc *mlx5e_tc_get_counter(struct mlx5e_tc_flow *flow)
+@@@ -1066,11 -1229,11 +1168,17 @@@ void mlx5e_tc_update_neigh_used_value(s
+  }
+  
+  static void mlx5e_detach_encap(struct mlx5e_priv *priv,
+- 			       struct mlx5e_tc_flow *flow)
++ 			       struct mlx5e_tc_flow *flow, int out_index)
+  {
+++<<<<<<< HEAD
+ +	struct list_head *next = flow->encap.next;
+ +
+ +	list_del(&flow->encap);
+++=======
++ 	struct list_head *next = flow->encaps[out_index].list.next;
++ 
++ 	list_del(&flow->encaps[out_index].list);
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  	if (list_empty(next)) {
+  		struct mlx5e_encap_entry *e;
+  
+@@@ -2520,7 -2345,9 +2628,13 @@@ static int mlx5e_attach_encap(struct ml
+  			      struct ip_tunnel_info *tun_info,
+  			      struct net_device *mirred_dev,
+  			      struct net_device **encap_dev,
+++<<<<<<< HEAD
+ +			      struct mlx5e_tc_flow *flow)
+++=======
++ 			      struct mlx5e_tc_flow *flow,
++ 			      struct netlink_ext_ack *extack,
++ 			      int out_index)
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  {
+  	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+  	unsigned short family = ip_tunnel_info_af(tun_info);
+@@@ -2585,12 -2394,15 +2699,19 @@@ vxlan_encap_offload_err
+  	hash_add_rcu(esw->offloads.encap_tbl, &e->encap_hlist, hash_key);
+  
+  attach_flow:
+++<<<<<<< HEAD
+ +	list_add(&flow->encap, &e->flows);
+++=======
++ 	list_add(&flow->encaps[out_index].list, &e->flows);
++ 	flow->encaps[out_index].index = out_index;
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  	*encap_dev = e->out_dev;
+- 	if (e->flags & MLX5_ENCAP_ENTRY_VALID)
+- 		attr->encap_id = e->encap_id;
+- 	else
++ 	if (e->flags & MLX5_ENCAP_ENTRY_VALID) {
++ 		attr->dests[out_index].encap_id = e->encap_id;
++ 		attr->dests[out_index].flags |= MLX5_ESW_DEST_ENCAP_VALID;
++ 	} else {
+  		err = -EAGAIN;
++ 	}
+  
+  	return err;
+  
+@@@ -2661,21 -2533,35 +2782,28 @@@ static int parse_tc_fdb_actions(struct 
+  			if (switchdev_port_same_parent_id(priv->netdev,
+  							  out_dev) ||
+  			    is_merged_eswitch_dev(priv, out_dev)) {
+ +				action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+ +					  MLX5_FLOW_CONTEXT_ACTION_COUNT;
+  				out_priv = netdev_priv(out_dev);
+  				rpriv = out_priv->ppriv;
+ -				attr->dests[attr->out_count].rep = rpriv->rep;
+ -				attr->dests[attr->out_count].mdev = out_priv->mdev;
+ -				attr->out_count++;
+ +				attr->out_rep[attr->out_count] = rpriv->rep;
+ +				attr->out_mdev[attr->out_count++] = out_priv->mdev;
+  			} else if (encap) {
+++<<<<<<< HEAD
+ +				parse_attr->mirred_ifindex = out_dev->ifindex;
+ +				parse_attr->tun_info = *info;
+++=======
++ 				parse_attr->mirred_ifindex[attr->out_count] =
++ 					out_dev->ifindex;
++ 				parse_attr->tun_info[attr->out_count] = *info;
++ 				encap = false;
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  				attr->parse_attr = parse_attr;
+ -				attr->dests[attr->out_count].flags |=
+ -					MLX5_ESW_DEST_ENCAP;
+ -				attr->out_count++;
+ -				/* attr->dests[].rep is resolved when we
+ -				 * handle encap
+ -				 */
+ -			} else if (parse_attr->filter_dev != priv->netdev) {
+ -				/* All mlx5 devices are called to configure
+ -				 * high level device filters. Therefore, the
+ -				 * *attempt* to  install a filter on invalid
+ -				 * eswitch should not trigger an explicit error
+ -				 */
+ -				return -EINVAL;
+ +				action |= MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT |
+ +					  MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+ +					  MLX5_FLOW_CONTEXT_ACTION_COUNT;
+ +				/* attr->out_rep is resolved when we handle encap */
+  			} else {
+ -				NL_SET_ERR_MSG_MOD(extack,
+ -						   "devices are not on same switch HW, can't offload forwarding");
+  				pr_err("devices %s %s not on same switch HW, can't offload forwarding\n",
+  				       priv->netdev->name, out_dev->name);
+  				return -EINVAL;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index de691a49ed92,87c9dea9bccf..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -280,21 -281,30 +280,38 @@@ enum mlx5_flow_match_level 
+  /* current maximum for flow based vport multicasting */
+  #define MLX5_MAX_FLOW_FWD_VPORTS 2
+  
+++<<<<<<< HEAD
+++=======
++ enum {
++ 	MLX5_ESW_DEST_ENCAP         = BIT(0),
++ 	MLX5_ESW_DEST_ENCAP_VALID   = BIT(1),
++ };
++ 
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  struct mlx5_esw_flow_attr {
+  	struct mlx5_eswitch_rep *in_rep;
+ +	struct mlx5_eswitch_rep *out_rep[MLX5_MAX_FLOW_FWD_VPORTS];
+ +	struct mlx5_core_dev	*out_mdev[MLX5_MAX_FLOW_FWD_VPORTS];
+  	struct mlx5_core_dev	*in_mdev;
+  
+ -	int split_count;
+ +	int mirror_count;
+  	int out_count;
+  
+  	int	action;
+ -	__be16	vlan_proto[MLX5_FS_VLAN_DEPTH];
+ -	u16	vlan_vid[MLX5_FS_VLAN_DEPTH];
+ -	u8	vlan_prio[MLX5_FS_VLAN_DEPTH];
+ -	u8	total_vlan;
+ +	__be16	vlan_proto;
+ +	u16	vlan_vid;
+ +	u8	vlan_prio;
+  	bool	vlan_handled;
+++<<<<<<< HEAD
+ +	u32	encap_id;
+++=======
++ 	struct {
++ 		u32 flags;
++ 		struct mlx5_eswitch_rep *rep;
++ 		struct mlx5_core_dev *mdev;
++ 		u32 encap_id;
++ 	} dests[MLX5_MAX_FLOW_FWD_VPORTS];
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  	u32	mod_hdr_id;
+  	u8	match_level;
+  	struct mlx5_fc *counter;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 828174ece8e4,bde1fb8c284b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -123,6 -128,13 +123,16 @@@ mlx5_eswitch_add_offloaded_rule(struct 
+  				if (MLX5_CAP_ESW(esw->dev, merged_eswitch))
+  					dest[i].vport.flags |=
+  						MLX5_FLOW_DEST_VPORT_VHCA_ID;
+++<<<<<<< HEAD
+++=======
++ 				if (attr->dests[j].flags & MLX5_ESW_DEST_ENCAP) {
++ 					flow_act.action |= MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT;
++ 					flow_act.reformat_id = attr->dests[j].encap_id;
++ 					dest[i].vport.flags |= MLX5_FLOW_DEST_VPORT_REFORMAT_ID;
++ 					dest[i].vport.reformat_id =
++ 						attr->dests[j].encap_id;
++ 				}
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  				i++;
+  			}
+  		}
+@@@ -211,13 -220,17 +221,20 @@@ mlx5_eswitch_add_fwd_rule(struct mlx5_e
+  	}
+  
+  	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+ -	for (i = 0; i < attr->split_count; i++) {
+ +	for (i = 0; i < attr->mirror_count; i++) {
+  		dest[i].type = MLX5_FLOW_DESTINATION_TYPE_VPORT;
+ -		dest[i].vport.num = attr->dests[i].rep->vport;
+ +		dest[i].vport.num = attr->out_rep[i]->vport;
+  		dest[i].vport.vhca_id =
+ -			MLX5_CAP_GEN(attr->dests[i].mdev, vhca_id);
+ +			MLX5_CAP_GEN(attr->out_mdev[i], vhca_id);
+  		if (MLX5_CAP_ESW(esw->dev, merged_eswitch))
+  			dest[i].vport.flags |= MLX5_FLOW_DEST_VPORT_VHCA_ID;
+++<<<<<<< HEAD
+++=======
++ 		if (attr->dests[i].flags & MLX5_ESW_DEST_ENCAP) {
++ 			dest[i].vport.flags |= MLX5_FLOW_DEST_VPORT_REFORMAT_ID;
++ 			dest[i].vport.reformat_id = attr->dests[i].encap_id;
++ 		}
+++>>>>>>> 8c4dc42bf6e4 (net/mlx5e: Support multiple encapsulations for a TC flow)
+  	}
+  	dest[i].type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+  	dest[i].ft = fwd_fdb,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
