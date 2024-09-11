@@ -1,0 +1,190 @@
+drm/i915/adlp: Add support for remapping CCS FBs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Imre Deak <imre.deak@intel.com>
+commit 3d1adc3d64cfc544044feeca9c892599199f9616
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/3d1adc3d.failed
+
+Add support for remapping CCS FBs on ADL-P to remove the restriction
+of the power-of-two sized stride and the 2MB surface offset alignment
+for these FBs.
+
+We can only remap the tiles on the main surface, not the tiles on the
+CCS surface, so userspace has to generate the CCS surface aligning to
+the POT size padded main surface stride (by programming the AUX
+pagetable accordingly). For the required AUX pagetable setup, this
+requires that either the main surface stride is 8 tiles or that the
+stride is 16 tiles aligned (= 64 kbytes, the area mapped by one AUX
+PTE).
+
+v2:
+- Init intel_remapped_info::plane_alignment only for remapped views and
+  do this from intel_fb_view_init().
+
+	Cc: Juha-Pekka Heikkila <juhapekka.heikkila@gmail.com>
+	Signed-off-by: Imre Deak <imre.deak@intel.com>
+	Reviewed-by: Juha-Pekka Heikkila <juhapekka.heikkila@gmail.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210906182715.3915100-6-imre.deak@intel.com
+(cherry picked from commit 3d1adc3d64cfc544044feeca9c892599199f9616)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_display.c
+#	drivers/gpu/drm/i915/display/intel_display_types.h
+#	drivers/gpu/drm/i915/display/intel_fb.c
+#	drivers/gpu/drm/i915/gt/intel_ggtt.c
+#	drivers/gpu/drm/i915/i915_vma_types.h
+diff --cc drivers/gpu/drm/i915/display/intel_display.c
+index 19f6e7572c75,49d99915b440..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@@ -1278,8 -899,11 +1278,16 @@@ unsigned int intel_remapped_info_size(c
+  	unsigned int size = 0;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	for (i = 0 ; i < ARRAY_SIZE(rem_info->plane); i++)
+ +		size += rem_info->plane[i].width * rem_info->plane[i].height;
+++=======
++ 	for (i = 0 ; i < ARRAY_SIZE(rem_info->plane); i++) {
++ 		if (rem_info->plane_alignment)
++ 			size = ALIGN(size, rem_info->plane_alignment);
++ 		size += rem_info->plane[i].dst_stride * rem_info->plane[i].height;
++ 	}
+++>>>>>>> 3d1adc3d64cf (drm/i915/adlp: Add support for remapping CCS FBs)
+  
+  	return size;
+  }
+diff --cc drivers/gpu/drm/i915/display/intel_display_types.h
+index cc8308e725ba,73930c24d7fb..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@@ -84,6 -85,40 +84,43 @@@ enum intel_broadcast_rgb 
+  	INTEL_BROADCAST_RGB_LIMITED,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct intel_fb_view {
++ 	/*
++ 	 * The remap information used in the remapped and rotated views to
++ 	 * create the DMA scatter-gather list for each FB color plane. This sg
++ 	 * list is created along with the view type (gtt.type) specific
++ 	 * i915_vma object and contains the list of FB object pages (reordered
++ 	 * in the rotated view) that are visible in the view.
++ 	 * In the normal view the FB object's backing store sg list is used
++ 	 * directly and hence the remap information here is not used.
++ 	 */
++ 	struct i915_ggtt_view gtt;
++ 
++ 	/*
++ 	 * The GTT view (gtt.type) specific information for each FB color
++ 	 * plane. In the normal GTT view all formats (up to 4 color planes),
++ 	 * in the rotated and remapped GTT view all no-CCS formats (up to 2
++ 	 * color planes) are supported.
++ 	 *
++ 	 * The view information shared by all FB color planes in the FB,
++ 	 * like dst x/y and src/dst width, is stored separately in
++ 	 * intel_plane_state.
++ 	 */
++ 	struct i915_color_plane_view {
++ 		u32 offset;
++ 		unsigned int x, y;
++ 		/*
++ 		 * Plane stride in:
++ 		 *   bytes for 0/180 degree rotation
++ 		 *   pixels for 90/270 degree rotation
++ 		 */
++ 		unsigned int stride;
++ 	} color_plane[4];
++ };
++ 
+++>>>>>>> 3d1adc3d64cf (drm/i915/adlp: Add support for remapping CCS FBs)
+  struct intel_framebuffer {
+  	struct drm_framebuffer base;
+  	struct intel_frontbuffer *frontbuffer;
+diff --cc drivers/gpu/drm/i915/gt/intel_ggtt.c
+index 700588bc9d57,cbd0e1010a46..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_ggtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+@@@ -1317,9 -1373,10 +1317,10 @@@ err_st_alloc
+  }
+  
+  static struct scatterlist *
+- remap_pages(struct drm_i915_gem_object *obj, unsigned int offset,
++ remap_pages(struct drm_i915_gem_object *obj,
++ 	    unsigned int offset, unsigned int alignment_pad,
+  	    unsigned int width, unsigned int height,
+ -	    unsigned int src_stride, unsigned int dst_stride,
+ +	    unsigned int stride,
+  	    struct sg_table *st, struct scatterlist *sg)
+  {
+  	unsigned int row;
+@@@ -1382,9 -1471,19 +1398,23 @@@ intel_remap_pages(struct intel_remapped
+  	sg = st->sgl;
+  
+  	for (i = 0 ; i < ARRAY_SIZE(rem_info->plane); i++) {
+- 		sg = remap_pages(obj, rem_info->plane[i].offset,
++ 		unsigned int alignment_pad = 0;
++ 
++ 		if (rem_info->plane_alignment)
++ 			alignment_pad = ALIGN(gtt_offset, rem_info->plane_alignment) - gtt_offset;
++ 
++ 		sg = remap_pages(obj,
++ 				 rem_info->plane[i].offset, alignment_pad,
+  				 rem_info->plane[i].width, rem_info->plane[i].height,
+++<<<<<<< HEAD
+ +				 rem_info->plane[i].stride, st, sg);
+++=======
++ 				 rem_info->plane[i].src_stride, rem_info->plane[i].dst_stride,
++ 				 st, sg);
++ 
++ 		gtt_offset += alignment_pad +
++ 			      rem_info->plane[i].dst_stride * rem_info->plane[i].height;
+++>>>>>>> 3d1adc3d64cf (drm/i915/adlp: Add support for remapping CCS FBs)
+  	}
+  
+  	i915_sg_trim(st);
+diff --cc drivers/gpu/drm/i915/i915_vma_types.h
+index f5cb848b7a7e,80e93bf00f2e..000000000000
+--- a/drivers/gpu/drm/i915/i915_vma_types.h
++++ b/drivers/gpu/drm/i915/i915_vma_types.h
+@@@ -101,8 -105,9 +101,14 @@@ struct intel_remapped_plane_info 
+  } __packed;
+  
+  struct intel_remapped_info {
+++<<<<<<< HEAD
+ +	struct intel_remapped_plane_info plane[2];
+ +	unsigned int unused_mbz;
+++=======
++ 	struct intel_remapped_plane_info plane[4];
++ 	/* in gtt pages */
++ 	u32 plane_alignment;
+++>>>>>>> 3d1adc3d64cf (drm/i915/adlp: Add support for remapping CCS FBs)
+  } __packed;
+  
+  struct intel_rotation_info {
+@@@ -123,9 -128,9 +129,13 @@@ enum i915_ggtt_view_type 
+  
+  static inline void assert_i915_gem_gtt_types(void)
+  {
+ -	BUILD_BUG_ON(sizeof(struct intel_rotation_info) != 2 * sizeof(u32) + 8 * sizeof(u16));
+ +	BUILD_BUG_ON(sizeof(struct intel_rotation_info) != 8*sizeof(unsigned int));
+  	BUILD_BUG_ON(sizeof(struct intel_partial_info) != sizeof(u64) + sizeof(unsigned int));
+++<<<<<<< HEAD
+ +	BUILD_BUG_ON(sizeof(struct intel_remapped_info) != 9*sizeof(unsigned int));
+++=======
++ 	BUILD_BUG_ON(sizeof(struct intel_remapped_info) != 5 * sizeof(u32) + 16 * sizeof(u16));
+++>>>>>>> 3d1adc3d64cf (drm/i915/adlp: Add support for remapping CCS FBs)
+  
+  	/* Check that rotation/remapped shares offsets for simplicity */
+  	BUILD_BUG_ON(offsetof(struct intel_remapped_info, plane[0]) !=
+* Unmerged path drivers/gpu/drm/i915/display/intel_fb.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_display.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_display_types.h
+* Unmerged path drivers/gpu/drm/i915/display/intel_fb.c
+* Unmerged path drivers/gpu/drm/i915/gt/intel_ggtt.c
+* Unmerged path drivers/gpu/drm/i915/i915_vma_types.h
