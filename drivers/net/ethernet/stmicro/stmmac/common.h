@@ -43,6 +43,7 @@
 #define DWMAC_CORE_4_10		0x41
 #define DWMAC_CORE_5_00		0x50
 #define DWMAC_CORE_5_10		0x51
+#define DWMAC_CORE_5_20		0x52
 #define DWXGMAC_CORE_2_10	0x21
 
 #define STMMAC_CHAN0	0	/* Always supported and default for all chips */

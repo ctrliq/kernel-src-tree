@@ -110,6 +110,7 @@ struct stmmac_dma_cfg {
 	bool aal;
 	bool eame;
 	bool multi_msi_en;
+	bool dche;
 };
 
 #define AXI_BLEN	7
