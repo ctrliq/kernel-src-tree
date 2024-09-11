@@ -1,0 +1,323 @@
+flow_offload: fix suspicious RCU usage when offloading tc action
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Baowen Zheng <baowen.zheng@corigine.com>
+commit 963178a06352a059c688eb36f1f8c2f03212b60b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/963178a0.failed
+
+Fix suspicious rcu_dereference_protected() usage when offloading tc action.
+
+We should hold tcfa_lock to offload tc action in action initiation.
+
+Without these changes, the following warning will be observed:
+
+WARNING: suspicious RCU usage
+5.16.0-rc5-net-next-01504-g7d1f236dcffa-dirty #50 Tainted: G          I
+-----------------------------
+include/net/tc_act/tc_tunnel_key.h:33 suspicious rcu_dereference_protected() usage!
+1 lock held by tc/12108:
+CPU: 4 PID: 12108 Comm: tc Tainted: G
+Hardware name: Dell Inc. PowerEdge R740/07WCGN, BIOS 1.6.11 11/20/2018
+Call Trace:
+<TASK>
+dump_stack_lvl+0x49/0x5e
+dump_stack+0x10/0x12
+lockdep_rcu_suspicious+0xed/0xf8
+tcf_tunnel_key_offload_act_setup+0x1de/0x300 [act_tunnel_key]
+tcf_action_offload_add_ex+0xc0/0x1f0
+tcf_action_init+0x26a/0x2f0
+tcf_action_add+0xa9/0x1f0
+tc_ctl_action+0xfb/0x170
+rtnetlink_rcv_msg+0x169/0x510
+? sched_clock+0x9/0x10
+? rtnl_newlink+0x70/0x70
+netlink_rcv_skb+0x55/0x100
+rtnetlink_rcv+0x15/0x20
+netlink_unicast+0x1a8/0x270
+netlink_sendmsg+0x245/0x490
+sock_sendmsg+0x65/0x70
+____sys_sendmsg+0x219/0x260
+? __import_iovec+0x2c/0x150
+___sys_sendmsg+0xb7/0x100
+? __lock_acquire+0x3d5/0x1f40
+? __this_cpu_preempt_check+0x13/0x20
+? lock_is_held_type+0xe4/0x140
+? sched_clock+0x9/0x10
+? ktime_get_coarse_real_ts64+0xbe/0xd0
+? __this_cpu_preempt_check+0x13/0x20
+? lockdep_hardirqs_on+0x7e/0x100
+? ktime_get_coarse_real_ts64+0xbe/0xd0
+? trace_hardirqs_on+0x2a/0xf0
+__sys_sendmsg+0x5a/0xa0
+? syscall_trace_enter.constprop.0+0x1dd/0x220
+__x64_sys_sendmsg+0x1f/0x30
+do_syscall_64+0x3b/0x90
+entry_SYSCALL_64_after_hwframe+0x44/0xae
+RIP: 0033:0x7f4db7bb7a60
+
+Fixes: 8cbfe939abe9 ("flow_offload: allow user to offload tc action to net device")
+	Reported-by: Eric Dumazet <eric.dumazet@gmail.com>
+	Signed-off-by: Baowen Zheng <baowen.zheng@corigine.com>
+	Signed-off-by: Louis Peens <louis.peens@corigine.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 963178a06352a059c688eb36f1f8c2f03212b60b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_api.c
+diff --cc net/sched/act_api.c
+index f274ee42a202,32563cef85bf..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -135,8 -131,244 +135,246 @@@ static void free_tcf(struct tc_action *
+  	kfree(p);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void offload_action_hw_count_set(struct tc_action *act,
++ 					u32 hw_count)
++ {
++ 	act->in_hw_count = hw_count;
++ }
++ 
++ static void offload_action_hw_count_inc(struct tc_action *act,
++ 					u32 hw_count)
++ {
++ 	act->in_hw_count += hw_count;
++ }
++ 
++ static void offload_action_hw_count_dec(struct tc_action *act,
++ 					u32 hw_count)
++ {
++ 	act->in_hw_count = act->in_hw_count > hw_count ?
++ 			   act->in_hw_count - hw_count : 0;
++ }
++ 
++ static unsigned int tcf_offload_act_num_actions_single(struct tc_action *act)
++ {
++ 	if (is_tcf_pedit(act))
++ 		return tcf_pedit_nkeys(act);
++ 	else
++ 		return 1;
++ }
++ 
++ static bool tc_act_skip_hw(u32 flags)
++ {
++ 	return (flags & TCA_ACT_FLAGS_SKIP_HW) ? true : false;
++ }
++ 
++ static bool tc_act_skip_sw(u32 flags)
++ {
++ 	return (flags & TCA_ACT_FLAGS_SKIP_SW) ? true : false;
++ }
++ 
++ static bool tc_act_in_hw(struct tc_action *act)
++ {
++ 	return !!act->in_hw_count;
++ }
++ 
++ /* SKIP_HW and SKIP_SW are mutually exclusive flags. */
++ static bool tc_act_flags_valid(u32 flags)
++ {
++ 	flags &= TCA_ACT_FLAGS_SKIP_HW | TCA_ACT_FLAGS_SKIP_SW;
++ 
++ 	return flags ^ (TCA_ACT_FLAGS_SKIP_HW | TCA_ACT_FLAGS_SKIP_SW);
++ }
++ 
++ static int offload_action_init(struct flow_offload_action *fl_action,
++ 			       struct tc_action *act,
++ 			       enum offload_act_command  cmd,
++ 			       struct netlink_ext_ack *extack)
++ {
++ 	int err;
++ 
++ 	fl_action->extack = extack;
++ 	fl_action->command = cmd;
++ 	fl_action->index = act->tcfa_index;
++ 
++ 	if (act->ops->offload_act_setup) {
++ 		spin_lock_bh(&act->tcfa_lock);
++ 		err = act->ops->offload_act_setup(act, fl_action, NULL,
++ 						  false);
++ 		spin_unlock_bh(&act->tcfa_lock);
++ 		return err;
++ 	}
++ 
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static int tcf_action_offload_cmd_ex(struct flow_offload_action *fl_act,
++ 				     u32 *hw_count)
++ {
++ 	int err;
++ 
++ 	err = flow_indr_dev_setup_offload(NULL, NULL, TC_SETUP_ACT,
++ 					  fl_act, NULL, NULL);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (hw_count)
++ 		*hw_count = err;
++ 
++ 	return 0;
++ }
++ 
++ static int tcf_action_offload_cmd_cb_ex(struct flow_offload_action *fl_act,
++ 					u32 *hw_count,
++ 					flow_indr_block_bind_cb_t *cb,
++ 					void *cb_priv)
++ {
++ 	int err;
++ 
++ 	err = cb(NULL, NULL, cb_priv, TC_SETUP_ACT, NULL, fl_act, NULL);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (hw_count)
++ 		*hw_count = 1;
++ 
++ 	return 0;
++ }
++ 
++ static int tcf_action_offload_cmd(struct flow_offload_action *fl_act,
++ 				  u32 *hw_count,
++ 				  flow_indr_block_bind_cb_t *cb,
++ 				  void *cb_priv)
++ {
++ 	return cb ? tcf_action_offload_cmd_cb_ex(fl_act, hw_count,
++ 						 cb, cb_priv) :
++ 		    tcf_action_offload_cmd_ex(fl_act, hw_count);
++ }
++ 
++ static int tcf_action_offload_add_ex(struct tc_action *action,
++ 				     struct netlink_ext_ack *extack,
++ 				     flow_indr_block_bind_cb_t *cb,
++ 				     void *cb_priv)
++ {
++ 	bool skip_sw = tc_act_skip_sw(action->tcfa_flags);
++ 	struct tc_action *actions[TCA_ACT_MAX_PRIO] = {
++ 		[0] = action,
++ 	};
++ 	struct flow_offload_action *fl_action;
++ 	u32 in_hw_count = 0;
++ 	int num, err = 0;
++ 
++ 	if (tc_act_skip_hw(action->tcfa_flags))
++ 		return 0;
++ 
++ 	num = tcf_offload_act_num_actions_single(action);
++ 	fl_action = offload_action_alloc(num);
++ 	if (!fl_action)
++ 		return -ENOMEM;
++ 
++ 	err = offload_action_init(fl_action, action, FLOW_ACT_REPLACE, extack);
++ 	if (err)
++ 		goto fl_err;
++ 
++ 	err = tc_setup_action(&fl_action->action, actions);
++ 	if (err) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "Failed to setup tc actions for offload\n");
++ 		goto fl_err;
++ 	}
++ 
++ 	err = tcf_action_offload_cmd(fl_action, &in_hw_count, cb, cb_priv);
++ 	if (!err)
++ 		cb ? offload_action_hw_count_inc(action, in_hw_count) :
++ 		     offload_action_hw_count_set(action, in_hw_count);
++ 
++ 	if (skip_sw && !tc_act_in_hw(action))
++ 		err = -EINVAL;
++ 
++ 	tc_cleanup_offload_action(&fl_action->action);
++ 
++ fl_err:
++ 	kfree(fl_action);
++ 
++ 	return err;
++ }
++ 
++ /* offload the tc action after it is inserted */
++ static int tcf_action_offload_add(struct tc_action *action,
++ 				  struct netlink_ext_ack *extack)
++ {
++ 	return tcf_action_offload_add_ex(action, extack, NULL, NULL);
++ }
++ 
++ int tcf_action_update_hw_stats(struct tc_action *action)
++ {
++ 	struct flow_offload_action fl_act = {};
++ 	int err;
++ 
++ 	if (!tc_act_in_hw(action))
++ 		return -EOPNOTSUPP;
++ 
++ 	err = offload_action_init(&fl_act, action, FLOW_ACT_STATS, NULL);
++ 	if (err)
++ 		return err;
++ 
++ 	err = tcf_action_offload_cmd(&fl_act, NULL, NULL, NULL);
++ 	if (!err) {
++ 		preempt_disable();
++ 		tcf_action_stats_update(action, fl_act.stats.bytes,
++ 					fl_act.stats.pkts,
++ 					fl_act.stats.drops,
++ 					fl_act.stats.lastused,
++ 					true);
++ 		preempt_enable();
++ 		action->used_hw_stats = fl_act.stats.used_hw_stats;
++ 		action->used_hw_stats_valid = true;
++ 	} else {
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(tcf_action_update_hw_stats);
++ 
++ static int tcf_action_offload_del_ex(struct tc_action *action,
++ 				     flow_indr_block_bind_cb_t *cb,
++ 				     void *cb_priv)
++ {
++ 	struct flow_offload_action fl_act = {};
++ 	u32 in_hw_count = 0;
++ 	int err = 0;
++ 
++ 	if (!tc_act_in_hw(action))
++ 		return 0;
++ 
++ 	err = offload_action_init(&fl_act, action, FLOW_ACT_DESTROY, NULL);
++ 	if (err)
++ 		return err;
++ 
++ 	err = tcf_action_offload_cmd(&fl_act, &in_hw_count, cb, cb_priv);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (!cb && action->in_hw_count != in_hw_count)
++ 		return -EINVAL;
++ 
++ 	/* do not need to update hw state when deleting action */
++ 	if (cb && in_hw_count)
++ 		offload_action_hw_count_dec(action, in_hw_count);
++ 
++ 	return 0;
++ }
++ 
++ static int tcf_action_offload_del(struct tc_action *action)
++ {
++ 	return tcf_action_offload_del_ex(action, NULL, NULL);
++ }
++ 
+++>>>>>>> 963178a06352 (flow_offload: fix suspicious RCU usage when offloading tc action)
+  static void tcf_action_cleanup(struct tc_action *p)
+  {
+ -	tcf_action_offload_del(p);
+  	if (p->ops->cleanup)
+  		p->ops->cleanup(p);
+  
+* Unmerged path net/sched/act_api.c
