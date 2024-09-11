@@ -1,0 +1,166 @@
+cpufreq: intel_pstate: Implement passive mode with HWP enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit f6ebbcf08f37b01827c51309a188e85165e498e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f6ebbcf0.failed
+
+Allow intel_pstate to work in the passive mode with HWP enabled and
+make it set the HWP minimum performance limit (HWP floor) to the
+P-state value given by the target frequency supplied by the cpufreq
+governor, so as to prevent the HWP algorithm and the CPU scheduler
+from working against each other, at least when the schedutil governor
+is in use, and update the intel_pstate documentation accordingly.
+
+Among other things, this allows utilization clamps to be taken
+into account, at least to a certain extent, when intel_pstate is
+in use and makes it more likely that sufficient capacity for
+deadline tasks will be provided.
+
+After this change, the resulting behavior of an HWP system with
+intel_pstate in the passive mode should be close to the behavior
+of the analogous non-HWP system with intel_pstate in the passive
+mode, except that the HWP algorithm is generally allowed to make the
+CPU run at a frequency above the floor P-state set by intel_pstate in
+the entire available range of P-states, while without HWP a CPU can
+run in a P-state above the requested one if the latter falls into the
+range of turbo P-states (referred to as the turbo range) or if the
+P-states of all CPUs in one package are coordinated with each other
+at the hardware level.
+
+[Note that in principle the HWP floor may not be taken into account
+ by the processor if it falls into the turbo range, in which case the
+ processor has a license to choose any P-state, either below or above
+ the HWP floor, just like a non-HWP processor in the case when the
+ target P-state falls into the turbo range.]
+
+With this change applied, intel_pstate in the passive mode assumes
+complete control over the HWP request MSR and concurrent changes of
+that MSR (eg. via the direct MSR access interface) are overridden by
+it.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Acked-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Reviewed-by: Francisco Jerez <currojerez@riseup.net>
+(cherry picked from commit f6ebbcf08f37b01827c51309a188e85165e498e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/pm/intel_pstate.rst
+#	drivers/cpufreq/intel_pstate.c
+diff --cc Documentation/admin-guide/pm/intel_pstate.rst
+index ecc974c68af3,f85767e09911..000000000000
+--- a/Documentation/admin-guide/pm/intel_pstate.rst
++++ b/Documentation/admin-guide/pm/intel_pstate.rst
+@@@ -185,10 -193,15 +188,22 @@@ is not set
+  Passive Mode
+  ------------
+  
+++<<<<<<< HEAD
+ +This mode is used if the ``intel_pstate=passive`` argument is passed to the
+ +kernel in the command line (it implies the ``intel_pstate=no_hwp`` setting too).
+ +Like in the active mode without HWP support, in this mode ``intel_pstate`` may
+ +refuse to work with the given processor if it does not recognize it.
+++=======
++ This is the default operation mode of ``intel_pstate`` for processors without
++ hardware-managed P-states (HWP) support.  It is always used if the
++ ``intel_pstate=passive`` argument is passed to the kernel in the command line
++ regardless of whether or not the given processor supports HWP.  [Note that the
++ ``intel_pstate=no_hwp`` setting causes the driver to start in the passive mode
++ if it is not combined with ``intel_pstate=active``.]  Like in the active mode
++ without HWP support, in this mode ``intel_pstate`` may refuse to work with
++ processors that are not recognized by it if HWP is prevented from being enabled
++ through the kernel command line.
+++>>>>>>> f6ebbcf08f37 (cpufreq: intel_pstate: Implement passive mode with HWP enabled)
+  
+  If the driver works in this mode, the ``scaling_driver`` policy attribute in
+  ``sysfs`` for all ``CPUFreq`` policies contains the string "intel_cpufreq".
+diff --cc drivers/cpufreq/intel_pstate.c
+index f27e09c9da93,e0220a6fbc69..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -2838,6 -2952,10 +2955,13 @@@ static int __init intel_pstate_init(voi
+  			hwp_active++;
+  			hwp_mode_bdw = id->driver_data;
+  			intel_pstate.attr = hwp_cpufreq_attrs;
+++<<<<<<< HEAD
+++=======
++ 			intel_cpufreq.attr = hwp_cpufreq_attrs;
++ 			if (!default_driver)
++ 				default_driver = &intel_pstate;
++ 
+++>>>>>>> f6ebbcf08f37 (cpufreq: intel_pstate: Implement passive mode with HWP enabled)
+  			goto hwp_cpu_matched;
+  		}
+  	} else {
+@@@ -2905,13 -3026,13 +3029,18 @@@ static int __init intel_pstate_setup(ch
+  	if (!str)
+  		return -EINVAL;
+  
+- 	if (!strcmp(str, "disable")) {
++ 	if (!strcmp(str, "disable"))
+  		no_load = 1;
+++<<<<<<< HEAD
+ +	} else if (!strcmp(str, "passive")) {
+ +		pr_info("Passive mode enabled\n");
+++=======
++ 	else if (!strcmp(str, "active"))
++ 		default_driver = &intel_pstate;
++ 	else if (!strcmp(str, "passive"))
+++>>>>>>> f6ebbcf08f37 (cpufreq: intel_pstate: Implement passive mode with HWP enabled)
+  		default_driver = &intel_cpufreq;
+- 		no_hwp = 1;
+- 	}
++ 
+  	if (!strcmp(str, "no_hwp")) {
+  		pr_info("HWP disabled\n");
+  		no_hwp = 1;
+* Unmerged path Documentation/admin-guide/pm/intel_pstate.rst
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 1544b0d83295..c2e7d4235d96 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -74,8 +74,6 @@ static inline bool has_target(void)
+ static unsigned int __cpufreq_get(struct cpufreq_policy *policy);
+ static int cpufreq_init_governor(struct cpufreq_policy *policy);
+ static void cpufreq_exit_governor(struct cpufreq_policy *policy);
+-static int cpufreq_start_governor(struct cpufreq_policy *policy);
+-static void cpufreq_stop_governor(struct cpufreq_policy *policy);
+ static void cpufreq_governor_limits(struct cpufreq_policy *policy);
+ static int cpufreq_set_policy(struct cpufreq_policy *policy,
+ 			      struct cpufreq_governor *new_gov,
+@@ -2251,7 +2249,7 @@ static void cpufreq_exit_governor(struct cpufreq_policy *policy)
+ 	module_put(policy->governor->owner);
+ }
+ 
+-static int cpufreq_start_governor(struct cpufreq_policy *policy)
++int cpufreq_start_governor(struct cpufreq_policy *policy)
+ {
+ 	int ret;
+ 
+@@ -2278,7 +2276,7 @@ static int cpufreq_start_governor(struct cpufreq_policy *policy)
+ 	return 0;
+ }
+ 
+-static void cpufreq_stop_governor(struct cpufreq_policy *policy)
++void cpufreq_stop_governor(struct cpufreq_policy *policy)
+ {
+ 	if (cpufreq_suspended || !policy->governor)
+ 		return;
+* Unmerged path drivers/cpufreq/intel_pstate.c
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index 9e228f719359..25872496283e 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -582,6 +582,8 @@ unsigned int cpufreq_driver_resolve_freq(struct cpufreq_policy *policy,
+ unsigned int cpufreq_policy_transition_delay_us(struct cpufreq_policy *policy);
+ int cpufreq_register_governor(struct cpufreq_governor *governor);
+ void cpufreq_unregister_governor(struct cpufreq_governor *governor);
++int cpufreq_start_governor(struct cpufreq_policy *policy);
++void cpufreq_stop_governor(struct cpufreq_policy *policy);
+ 
+ struct cpufreq_governor *cpufreq_default_governor(void);
+ struct cpufreq_governor *cpufreq_fallback_governor(void);
