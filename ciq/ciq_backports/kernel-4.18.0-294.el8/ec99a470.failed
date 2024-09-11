@@ -1,0 +1,149 @@
+mptcp: fix length of MP_PRIO suboption
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Davide Caratti <dcaratti@redhat.com>
+commit ec99a470c7d5517c97dee6dd7953275a92c63834
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ec99a470.failed
+
+With version 0 of the protocol it was legal to encode the 'Subflow Id' in
+the MP_PRIO suboption, to specify which subflow would change its 'Backup'
+flag. This has been removed from v1 specification: thus, according to RFC
+8684 §3.3.8, the resulting 'Length' for MP_PRIO changed from 4 to 3 byte.
+
+Current Linux generates / parses MP_PRIO according to the old spec, using
+'Length' equal to 4, and hardcoding 1 as 'Subflow Id'; RFC compliance can
+improve if we change 'Length' in other to become 3, leaving a 'Nop' after
+the MP_PRIO suboption. In this way the kernel will emit and accept *only*
+MP_PRIO suboptions that are compliant to version 1 of the MPTCP protocol.
+
+ unpatched 5.11-rc kernel:
+ [root@bottarga ~]# tcpdump -tnnr unpatched.pcap | grep prio
+ reading from file unpatched.pcap, link-type LINUX_SLL (Linux cooked v1)
+ dropped privs to tcpdump
+ IP 10.0.3.2.48433 > 10.0.1.1.10006: Flags [.], ack 1, win 502, options [nop,nop,TS val 4032325513 ecr 1876514270,mptcp prio non-backup id 1,mptcp dss ack 14084896651682217737], length 0
+
+ patched 5.11-rc kernel:
+ [root@bottarga ~]# tcpdump -tnnr patched.pcap | grep prio
+ reading from file patched.pcap, link-type LINUX_SLL (Linux cooked v1)
+ dropped privs to tcpdump
+ IP 10.0.3.2.49735 > 10.0.1.1.10006: Flags [.], ack 1, win 502, options [nop,nop,TS val 1276737699 ecr 2686399734,mptcp prio non-backup,nop,mptcp dss ack 18433038869082491686], length 0
+
+Changes since v2:
+ - when accounting for option space, don't increment 'TCPOLEN_MPTCP_PRIO'
+   and use 'TCPOLEN_MPTCP_PRIO_ALIGN' instead, thanks to Matthieu Baerts.
+Changes since v1:
+ - refactor patch to avoid using 'TCPOLEN_MPTCP_PRIO' with its old value,
+   thanks to Geliang Tang.
+
+Fixes: 067065422fcd ("mptcp: add the outgoing MP_PRIO support")
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Reviewed-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+	Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+	Reviewed-by: Matteo Croce <mcroce@linux.microsoft.com>
+Link: https://lore.kernel.org/r/846cdd41e6ad6ec88ef23fee1552ab39c2f5a3d1.1612184361.git.dcaratti@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit ec99a470c7d5517c97dee6dd7953275a92c63834)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/options.c
+#	net/mptcp/protocol.h
+diff --cc net/mptcp/options.c
+index af3f2e566740,17ad42c65087..000000000000
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@@ -604,13 -650,64 +604,66 @@@ static bool mptcp_established_options_a
+  	else if (saddr.family == AF_INET6) {
+  		opts->suboptions |= OPTION_MPTCP_ADD_ADDR6;
+  		opts->addr6 = saddr.addr6;
+ -		if (!echo) {
+ -			opts->ahmac = add_addr6_generate_hmac(msk->local_key,
+ -							      msk->remote_key,
+ -							      opts->addr_id,
+ -							      &opts->addr6);
+ -		}
+ +		opts->ahmac = add_addr6_generate_hmac(msk->local_key,
+ +						      msk->remote_key,
+ +						      opts->addr_id,
+ +						      &opts->addr6);
+  	}
+  #endif
+++<<<<<<< HEAD
+ +	pr_debug("addr_id=%d, ahmac=%llu", opts->addr_id, opts->ahmac);
+++=======
++ 	pr_debug("addr_id=%d, ahmac=%llu, echo=%d, port=%d",
++ 		 opts->addr_id, opts->ahmac, echo, opts->port);
++ 
++ 	return true;
++ }
++ 
++ static bool mptcp_established_options_rm_addr(struct sock *sk,
++ 					      unsigned int *size,
++ 					      unsigned int remaining,
++ 					      struct mptcp_out_options *opts)
++ {
++ 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
++ 	struct mptcp_sock *msk = mptcp_sk(subflow->conn);
++ 	u8 rm_id;
++ 
++ 	if (!mptcp_pm_should_rm_signal(msk) ||
++ 	    !(mptcp_pm_rm_addr_signal(msk, remaining, &rm_id)))
++ 		return false;
++ 
++ 	if (remaining < TCPOLEN_MPTCP_RM_ADDR_BASE)
++ 		return false;
++ 
++ 	*size = TCPOLEN_MPTCP_RM_ADDR_BASE;
++ 	opts->suboptions |= OPTION_MPTCP_RM_ADDR;
++ 	opts->rm_id = rm_id;
++ 
++ 	pr_debug("rm_id=%d", opts->rm_id);
++ 
++ 	return true;
++ }
++ 
++ static bool mptcp_established_options_mp_prio(struct sock *sk,
++ 					      unsigned int *size,
++ 					      unsigned int remaining,
++ 					      struct mptcp_out_options *opts)
++ {
++ 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
++ 
++ 	if (!subflow->send_mp_prio)
++ 		return false;
++ 
++ 	/* account for the trailing 'nop' option */
++ 	if (remaining < TCPOLEN_MPTCP_PRIO_ALIGN)
++ 		return false;
++ 
++ 	*size = TCPOLEN_MPTCP_PRIO_ALIGN;
++ 	opts->suboptions |= OPTION_MPTCP_PRIO;
++ 	opts->backup = subflow->request_bkup;
++ 
++ 	pr_debug("prio=%d", opts->backup);
+++>>>>>>> ec99a470c7d5 (mptcp: fix length of MP_PRIO suboption)
+  
+  	return true;
+  }
+diff --cc net/mptcp/protocol.h
+index 46bdc749922f,07ee319f7847..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -58,6 -60,9 +58,12 @@@
+  #define TCPOLEN_MPTCP_ADD_ADDR6_BASE_PORT	24
+  #define TCPOLEN_MPTCP_PORT_LEN		4
+  #define TCPOLEN_MPTCP_RM_ADDR_BASE	4
+++<<<<<<< HEAD
+++=======
++ #define TCPOLEN_MPTCP_PRIO		3
++ #define TCPOLEN_MPTCP_PRIO_ALIGN	4
++ #define TCPOLEN_MPTCP_FASTCLOSE		12
+++>>>>>>> ec99a470c7d5 (mptcp: fix length of MP_PRIO suboption)
+  
+  /* MPTCP MP_JOIN flags */
+  #define MPTCPOPT_BACKUP		BIT(0)
+* Unmerged path net/mptcp/options.c
+* Unmerged path net/mptcp/protocol.h
