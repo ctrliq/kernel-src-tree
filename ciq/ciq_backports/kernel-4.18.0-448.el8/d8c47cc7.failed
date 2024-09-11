@@ -1,0 +1,94 @@
+mm: page_io: fix psi memory pressure error on cold swapins
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit d8c47cc7bf602ef73384a00869a70148146c1191
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/d8c47cc7.failed
+
+Once upon a time, all swapins counted toward memory pressure[1].  Then
+Joonsoo introduced workingset detection for anonymous pages and we gained
+the ability to distinguish hot from cold swapins[2][3].  But we failed to
+update swap_readpage() accordingly, and now we account partial memory
+pressure in the swapin path of cold memory.
+
+Not for all situations - which adds more inconsistency: paths using the
+conventional submit_bio() and lock_page() route will not see much pressure
+- unless storage itself is heavily congested and the bio submissions
+stall.  ZRAM and ZSWAP do most of the work directly from swap_readpage()
+and will see all swapins reflected as pressure.
+
+IOW, a workload doing cold swapins could see little to no pressure
+reported with on-disk swap, but potentially high pressure with a zram or
+zswap backend.  That confuses any psi-based health monitoring, load
+shedding, proactive reclaim, or userspace OOM killing schemes that might
+be in place for the workload.
+
+Restore consistency by making all swapin stall accounting conditional on
+the page actually being part of the workingset.
+
+[1] commit 937790699be9 ("mm/page_io.c: annotate refault stalls from swap_readpage")
+[2] commit aae466b0052e ("mm/swap: implement workingset detection for anonymous LRU")
+[3] commit cad8320b4b39 ("mm/swap: don't SetPageWorkingset unconditionally during swapin")
+
+Link: https://lkml.kernel.org/r/20220214214921.419687-1-hannes@cmpxchg.org
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Reported-by: CGEL <cgel.zte@gmail.com>
+	Acked-by: Minchan Kim <minchan@kernel.org>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Yu Zhao <yuzhao@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d8c47cc7bf602ef73384a00869a70148146c1191)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_io.c
+diff --cc mm/page_io.c
+index c322a203548e,5dd4dc2e2864..000000000000
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@@ -373,8 -359,7 +373,12 @@@ int swap_readpage(struct page *page, bo
+  	struct bio *bio;
+  	int ret = 0;
+  	struct swap_info_struct *sis = page_swap_info(page);
+++<<<<<<< HEAD
+ +	blk_qc_t qc;
+ +	struct gendisk *disk;
+++=======
++ 	bool workingset = PageWorkingset(page);
+++>>>>>>> d8c47cc7bf60 (mm: page_io: fix psi memory pressure error on cold swapins)
+  	unsigned long pflags;
+  
+  	VM_BUG_ON_PAGE(!PageSwapCache(page) && !synchronous, page);
+@@@ -386,7 -371,9 +390,13 @@@
+  	 * or the submitting cgroup IO-throttled, submission can be a
+  	 * significant part of overall IO time.
+  	 */
+++<<<<<<< HEAD
+ +	psi_memstall_enter(&pflags);
+++=======
++ 	if (workingset)
++ 		psi_memstall_enter(&pflags);
++ 	delayacct_swapin_start();
+++>>>>>>> d8c47cc7bf60 (mm: page_io: fix psi memory pressure error on cold swapins)
+  
+  	if (frontswap_load(page) == 0) {
+  		SetPageUptodate(page);
+@@@ -450,7 -435,9 +460,13 @@@
+  	bio_put(bio);
+  
+  out:
+++<<<<<<< HEAD
+ +	psi_memstall_leave(&pflags);
+++=======
++ 	if (workingset)
++ 		psi_memstall_leave(&pflags);
++ 	delayacct_swapin_end();
+++>>>>>>> d8c47cc7bf60 (mm: page_io: fix psi memory pressure error on cold swapins)
+  	return ret;
+  }
+  
+* Unmerged path mm/page_io.c
