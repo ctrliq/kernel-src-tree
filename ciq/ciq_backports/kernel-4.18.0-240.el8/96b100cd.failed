@@ -1,0 +1,116 @@
+KVM: nVMX: remove side effects from nested_vmx_exit_reflected
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 96b100cd1464ce41d5d6b083b1fe5ceace8eef8a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/96b100cd.failed
+
+The name of nested_vmx_exit_reflected suggests that it's purely
+a test, but it actually marks VMCS12 pages as dirty.  Move this to
+vmx_handle_exit, observing that the initial nested_run_pending check in
+nested_vmx_exit_reflected is pointless---nested_run_pending has just
+been cleared in vmx_vcpu_run and won't be set until handle_vmlaunch
+or handle_vmresume.
+
+	Suggested-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Reviewed-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 96b100cd1464ce41d5d6b083b1fe5ceace8eef8a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/nested.h
+diff --cc arch/x86/kvm/vmx/nested.h
+index 183399743537,f70968b76d33..000000000000
+--- a/arch/x86/kvm/vmx/nested.h
++++ b/arch/x86/kvm/vmx/nested.h
+@@@ -34,6 -33,9 +34,12 @@@ int vmx_get_vmx_msr(struct nested_vmx_m
+  int get_vmx_mem_address(struct kvm_vcpu *vcpu, unsigned long exit_qualification,
+  			u32 vmx_instruction_info, bool wr, int len, gva_t *ret);
+  void nested_vmx_pmu_entry_exit_ctls_update(struct kvm_vcpu *vcpu);
+++<<<<<<< HEAD
+++=======
++ void nested_mark_vmcs12_pages_dirty(struct kvm_vcpu *vcpu);
++ bool nested_vmx_check_io_bitmaps(struct kvm_vcpu *vcpu, unsigned int port,
++ 				 int size);
+++>>>>>>> 96b100cd1464 (KVM: nVMX: remove side effects from nested_vmx_exit_reflected)
+  
+  static inline struct vmcs12 *get_vmcs12(struct kvm_vcpu *vcpu)
+  {
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index 2632df1c1f2b..0e20a1acab23 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -3528,7 +3528,7 @@ static void vmcs12_save_pending_event(struct kvm_vcpu *vcpu,
+ }
+ 
+ 
+-static void nested_mark_vmcs12_pages_dirty(struct kvm_vcpu *vcpu)
++void nested_mark_vmcs12_pages_dirty(struct kvm_vcpu *vcpu)
+ {
+ 	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ 	gfn_t gfn;
+@@ -5533,8 +5533,7 @@ bool nested_vmx_exit_reflected(struct kvm_vcpu *vcpu, u32 exit_reason)
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ 
+-	if (vmx->nested.nested_run_pending)
+-		return false;
++	WARN_ON_ONCE(vmx->nested.nested_run_pending);
+ 
+ 	if (unlikely(vmx->fail)) {
+ 		trace_kvm_nested_vmenter_failed(
+@@ -5543,19 +5542,6 @@ bool nested_vmx_exit_reflected(struct kvm_vcpu *vcpu, u32 exit_reason)
+ 		return true;
+ 	}
+ 
+-	/*
+-	 * The host physical addresses of some pages of guest memory
+-	 * are loaded into the vmcs02 (e.g. vmcs12's Virtual APIC
+-	 * Page). The CPU may write to these pages via their host
+-	 * physical address while L2 is running, bypassing any
+-	 * address-translation-based dirty tracking (e.g. EPT write
+-	 * protection).
+-	 *
+-	 * Mark them dirty on every exit from L2 to prevent them from
+-	 * getting out of sync with dirty tracking.
+-	 */
+-	nested_mark_vmcs12_pages_dirty(vcpu);
+-
+ 	trace_kvm_nested_vmexit(kvm_rip_read(vcpu), exit_reason,
+ 				vmcs_readl(EXIT_QUALIFICATION),
+ 				vmx->idt_vectoring_info,
+* Unmerged path arch/x86/kvm/vmx/nested.h
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 379c7e5f2d79..f7cfee079b33 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -5969,8 +5969,23 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu,
+ 	if (vmx->emulation_required)
+ 		return handle_invalid_guest_state(vcpu);
+ 
+-	if (is_guest_mode(vcpu) && nested_vmx_exit_reflected(vcpu, exit_reason))
+-		return nested_vmx_reflect_vmexit(vcpu, exit_reason);
++	if (is_guest_mode(vcpu)) {
++		/*
++		 * The host physical addresses of some pages of guest memory
++		 * are loaded into the vmcs02 (e.g. vmcs12's Virtual APIC
++		 * Page). The CPU may write to these pages via their host
++		 * physical address while L2 is running, bypassing any
++		 * address-translation-based dirty tracking (e.g. EPT write
++		 * protection).
++		 *
++		 * Mark them dirty on every exit from L2 to prevent them from
++		 * getting out of sync with dirty tracking.
++		 */
++		nested_mark_vmcs12_pages_dirty(vcpu);
++
++		if (nested_vmx_exit_reflected(vcpu, exit_reason))
++			return nested_vmx_reflect_vmexit(vcpu, exit_reason);
++	}
+ 
+ 	if (exit_reason & VMX_EXIT_REASONS_FAILED_VMENTRY) {
+ 		dump_vmcs();
