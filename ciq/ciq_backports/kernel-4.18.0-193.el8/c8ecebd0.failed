@@ -1,0 +1,138 @@
+net: sched: extract common action counters update code into function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: extract common action counters update code into function (Ivan Vecera) [1739606]
+Rebuild_FUZZ: 96.18%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit c8ecebd04cbb6badb46d42fe54282e7883ed63cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c8ecebd0.failed
+
+Currently, all implementations of tc_action_ops->stats_update() callback
+have almost exactly the same implementation of counters update
+code (besides gact which also updates drop counter). In order to simplify
+support for using both percpu-allocated and regular action counters
+depending on run-time flag in following patches, extract action counters
+update code into standalone function in act API.
+
+This commit doesn't change functionality.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c8ecebd04cbb6badb46d42fe54282e7883ed63cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_ct.c
+* Unmerged path net/sched/act_ct.c
+diff --git a/include/net/act_api.h b/include/net/act_api.h
+index c61a1bf4e3de..ccd6c33b0f92 100644
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@ -179,6 +179,8 @@ int tcf_action_dump(struct sk_buff *skb, struct tc_action *actions[], int bind,
+ 		    int ref);
+ int tcf_action_dump_old(struct sk_buff *skb, struct tc_action *a, int, int);
+ int tcf_action_dump_1(struct sk_buff *skb, struct tc_action *a, int, int);
++void tcf_action_update_stats(struct tc_action *a, u64 bytes, u32 packets,
++			     bool drop, bool hw);
+ int tcf_action_copy_stats(struct sk_buff *, struct tc_action *, int);
+ 
+ int tcf_action_check_ctrlact(int action, struct tcf_proto *tp,
+diff --git a/net/sched/act_api.c b/net/sched/act_api.c
+index d35eb0b8379b..942d6da90abc 100644
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@ -992,6 +992,20 @@ int tcf_action_init(struct net *net, struct tcf_proto *tp, struct nlattr *nla,
+ 	return err;
+ }
+ 
++void tcf_action_update_stats(struct tc_action *a, u64 bytes, u32 packets,
++			     bool drop, bool hw)
++{
++	_bstats_cpu_update(this_cpu_ptr(a->cpu_bstats), bytes, packets);
++
++	if (drop)
++		this_cpu_ptr(a->cpu_qstats)->drops += packets;
++
++	if (hw)
++		_bstats_cpu_update(this_cpu_ptr(a->cpu_bstats_hw),
++				   bytes, packets);
++}
++EXPORT_SYMBOL(tcf_action_update_stats);
++
+ int tcf_action_copy_stats(struct sk_buff *skb, struct tc_action *p,
+ 			  int compat_mode)
+ {
+* Unmerged path net/sched/act_ct.c
+diff --git a/net/sched/act_gact.c b/net/sched/act_gact.c
+index c0e921d63e64..0723d601a2f4 100644
+--- a/net/sched/act_gact.c
++++ b/net/sched/act_gact.c
+@@ -181,15 +181,7 @@ static void tcf_gact_stats_update(struct tc_action *a, u64 bytes, u32 packets,
+ 	int action = READ_ONCE(gact->tcf_action);
+ 	struct tcf_t *tm = &gact->tcf_tm;
+ 
+-	_bstats_cpu_update(this_cpu_ptr(gact->common.cpu_bstats), bytes,
+-			   packets);
+-	if (action == TC_ACT_SHOT)
+-		this_cpu_ptr(gact->common.cpu_qstats)->drops += packets;
+-
+-	if (hw)
+-		_bstats_cpu_update(this_cpu_ptr(gact->common.cpu_bstats_hw),
+-				   bytes, packets);
+-
++	tcf_action_update_stats(a, bytes, packets, action == TC_ACT_SHOT, hw);
+ 	tm->lastuse = max_t(u64, tm->lastuse, lastuse);
+ }
+ 
+diff --git a/net/sched/act_mirred.c b/net/sched/act_mirred.c
+index e6cee7103d5b..acd6a8eb47ad 100644
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -322,10 +322,7 @@ static void tcf_stats_update(struct tc_action *a, u64 bytes, u32 packets,
+ 	struct tcf_mirred *m = to_mirred(a);
+ 	struct tcf_t *tm = &m->tcf_tm;
+ 
+-	_bstats_cpu_update(this_cpu_ptr(a->cpu_bstats), bytes, packets);
+-	if (hw)
+-		_bstats_cpu_update(this_cpu_ptr(a->cpu_bstats_hw),
+-				   bytes, packets);
++	tcf_action_update_stats(a, bytes, packets, false, hw);
+ 	tm->lastuse = max_t(u64, tm->lastuse, lastuse);
+ }
+ 
+diff --git a/net/sched/act_police.c b/net/sched/act_police.c
+index 84f634a16d3f..c87901f8d357 100644
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@ -297,10 +297,7 @@ static void tcf_police_stats_update(struct tc_action *a,
+ 	struct tcf_police *police = to_police(a);
+ 	struct tcf_t *tm = &police->tcf_tm;
+ 
+-	_bstats_cpu_update(this_cpu_ptr(a->cpu_bstats), bytes, packets);
+-	if (hw)
+-		_bstats_cpu_update(this_cpu_ptr(a->cpu_bstats_hw),
+-				   bytes, packets);
++	tcf_action_update_stats(a, bytes, packets, false, hw);
+ 	tm->lastuse = max_t(u64, tm->lastuse, lastuse);
+ }
+ 
+diff --git a/net/sched/act_vlan.c b/net/sched/act_vlan.c
+index 40cc935e5146..a3dcd53c2df9 100644
+--- a/net/sched/act_vlan.c
++++ b/net/sched/act_vlan.c
+@@ -310,10 +310,7 @@ static void tcf_vlan_stats_update(struct tc_action *a, u64 bytes, u32 packets,
+ 	struct tcf_vlan *v = to_vlan(a);
+ 	struct tcf_t *tm = &v->tcf_tm;
+ 
+-	_bstats_cpu_update(this_cpu_ptr(a->cpu_bstats), bytes, packets);
+-	if (hw)
+-		_bstats_cpu_update(this_cpu_ptr(a->cpu_bstats_hw),
+-				   bytes, packets);
++	tcf_action_update_stats(a, bytes, packets, false, hw);
+ 	tm->lastuse = max_t(u64, tm->lastuse, lastuse);
+ }
+ 
