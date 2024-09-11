@@ -1,0 +1,165 @@
+powerpc/fadump: consider f/w load area
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Hari Bathini <hbathini@linux.ibm.com>
+commit 7b1b3b48250acbfd7f15ba950d4654b7f02a8300
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7b1b3b48.failed
+
+OPAL loads kernel & initrd at 512MB offset (256MB size), also exported
+as ibm,opal/dump/fw-load-area. So, if boot memory size of FADump is
+less than 768MB, kernel memory to be exported as '/proc/vmcore' would
+be overwritten by f/w while loading kernel & initrd. To avoid such a
+scenario, enforce a minimum boot memory size of 768MB on OPAL platform
+and skip using FADump if a newer F/W version loads kernel & initrd
+above 768MB.
+
+Also, irrespective of RMA size, set the minimum boot memory size
+expected on pseries platform at 320MB. This is to avoid inflating the
+minimum memory requirements on systems with 512M/1024M RMA size.
+
+	Signed-off-by: Hari Bathini <hbathini@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/156821381414.5656.1592867278535469652.stgit@hbathini.in.ibm.com
+(cherry picked from commit 7b1b3b48250acbfd7f15ba950d4654b7f02a8300)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/fadump-internal.h
+#	arch/powerpc/kernel/fadump.c
+#	arch/powerpc/platforms/powernv/opal-fadump.c
+#	arch/powerpc/platforms/powernv/opal-fadump.h
+#	arch/powerpc/platforms/pseries/rtas-fadump.c
+diff --cc arch/powerpc/include/asm/fadump-internal.h
+index f8097510e03f,a669aaa7c610..000000000000
+--- a/arch/powerpc/include/asm/fadump-internal.h
++++ b/arch/powerpc/include/asm/fadump-internal.h
+@@@ -99,6 -110,24 +89,27 @@@ struct fw_dump 
+  	unsigned long	dump_active:1;
+  	unsigned long	dump_registered:1;
+  	unsigned long	nocma:1;
+++<<<<<<< HEAD
+++=======
++ 
++ 	struct fadump_ops	*ops;
++ };
++ 
++ struct fadump_ops {
++ 	u64	(*fadump_init_mem_struct)(struct fw_dump *fadump_conf);
++ 	u64	(*fadump_get_metadata_size)(void);
++ 	int	(*fadump_setup_metadata)(struct fw_dump *fadump_conf);
++ 	u64	(*fadump_get_bootmem_min)(void);
++ 	int	(*fadump_register)(struct fw_dump *fadump_conf);
++ 	int	(*fadump_unregister)(struct fw_dump *fadump_conf);
++ 	int	(*fadump_invalidate)(struct fw_dump *fadump_conf);
++ 	void	(*fadump_cleanup)(struct fw_dump *fadump_conf);
++ 	int	(*fadump_process)(struct fw_dump *fadump_conf);
++ 	void	(*fadump_region_show)(struct fw_dump *fadump_conf,
++ 				      struct seq_file *m);
++ 	void	(*fadump_trigger)(struct fadump_crash_info_header *fdh,
++ 				  const char *msg);
+++>>>>>>> 7b1b3b48250a (powerpc/fadump: consider f/w load area)
+  };
+  
+  /* Helper functions */
+diff --cc arch/powerpc/kernel/fadump.c
+index 56526469b148,bd49b1f200bf..000000000000
+--- a/arch/powerpc/kernel/fadump.c
++++ b/arch/powerpc/kernel/fadump.c
+@@@ -431,29 -318,15 +432,35 @@@ static unsigned long get_fadump_area_si
+  	return size;
+  }
+  
+ +static void __init fadump_reserve_crash_area(unsigned long base,
+ +					     unsigned long size)
+ +{
+ +	struct memblock_region *reg;
+ +	unsigned long mstart, mend, msize;
+ +
+ +	for_each_memblock(memory, reg) {
+ +		mstart = max_t(unsigned long, base, reg->base);
+ +		mend = reg->base + reg->size;
+ +		mend = min(base + size, mend);
+ +
+ +		if (mstart < mend) {
+ +			msize = mend - mstart;
+ +			memblock_reserve(mstart, msize);
+ +			pr_info("Reserved %ldMB of memory at %#016lx for saving crash dump\n",
+ +				(msize >> 20), mstart);
+ +		}
+ +	}
+ +}
+ +
+  int __init fadump_reserve_mem(void)
+  {
+++<<<<<<< HEAD
+ +	unsigned long base, size, memory_boundary;
+++=======
++ 	u64 base, size, mem_boundary, bootmem_min, align = PAGE_SIZE;
++ 	bool is_memblock_bottom_up = memblock_bottom_up();
++ 	int ret = 1;
+++>>>>>>> 7b1b3b48250a (powerpc/fadump: consider f/w load area)
+  
+  	if (!fw_dump.fadump_enabled)
+  		return 0;
+@@@ -469,16 -341,23 +476,23 @@@
+  	 * If dump is active then we have already calculated the size during
+  	 * first kernel.
+  	 */
+ -	if (!fw_dump.dump_active) {
+ -		fw_dump.boot_memory_size =
+ -			PAGE_ALIGN(fadump_calculate_reserve_size());
+ +	if (fdm_active)
+ +		fw_dump.boot_memory_size = be64_to_cpu(fdm_active->rmr_region.source_len);
+ +	else {
+ +		fw_dump.boot_memory_size = fadump_calculate_reserve_size();
+  #ifdef CONFIG_CMA
+ -		if (!fw_dump.nocma) {
+ -			align = FADUMP_CMA_ALIGNMENT;
+ +		if (!fw_dump.nocma)
+  			fw_dump.boot_memory_size =
+ -				ALIGN(fw_dump.boot_memory_size, align);
+ -		}
+ +				ALIGN(fw_dump.boot_memory_size,
+ +							FADUMP_CMA_ALIGNMENT);
+  #endif
++ 
++ 		bootmem_min = fw_dump.ops->fadump_get_bootmem_min();
++ 		if (fw_dump.boot_memory_size < bootmem_min) {
++ 			pr_err("Can't enable fadump with boot memory size (0x%lx) less than 0x%llx\n",
++ 			       fw_dump.boot_memory_size, bootmem_min);
++ 			goto error_out;
++ 		}
+  	}
+  
+  	/*
+* Unmerged path arch/powerpc/platforms/powernv/opal-fadump.c
+* Unmerged path arch/powerpc/platforms/powernv/opal-fadump.h
+* Unmerged path arch/powerpc/platforms/pseries/rtas-fadump.c
+* Unmerged path arch/powerpc/include/asm/fadump-internal.h
+* Unmerged path arch/powerpc/kernel/fadump.c
+* Unmerged path arch/powerpc/platforms/powernv/opal-fadump.c
+* Unmerged path arch/powerpc/platforms/powernv/opal-fadump.h
+* Unmerged path arch/powerpc/platforms/pseries/rtas-fadump.c
+diff --git a/arch/powerpc/platforms/pseries/rtas-fadump.h b/arch/powerpc/platforms/pseries/rtas-fadump.h
+index 531f3f3e42b3..6602ff69e10d 100644
+--- a/arch/powerpc/platforms/pseries/rtas-fadump.h
++++ b/arch/powerpc/platforms/pseries/rtas-fadump.h
+@@ -9,6 +9,15 @@
+ #ifndef _PSERIES_RTAS_FADUMP_H
+ #define _PSERIES_RTAS_FADUMP_H
+ 
++/*
++ * On some Power systems where RMO is 128MB, it still requires minimum of
++ * 256MB for kernel to boot successfully. When kdump infrastructure is
++ * configured to save vmcore over network, we run into OOM issue while
++ * loading modules related to network setup. Hence we need additional 64M
++ * of memory to avoid OOM issue.
++ */
++#define RTAS_FADUMP_MIN_BOOT_MEM	((0x1UL << 28) + (0x1UL << 26))
++
+ /* Firmware provided dump sections */
+ #define RTAS_FADUMP_CPU_STATE_DATA	0x0001
+ #define RTAS_FADUMP_HPTE_REGION		0x0002
