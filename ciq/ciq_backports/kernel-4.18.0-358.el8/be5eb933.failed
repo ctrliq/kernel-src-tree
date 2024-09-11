@@ -1,0 +1,204 @@
+nvme: fix per-namespace chardev deletion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Adam Manzanares <a.manzanares@samsung.com>
+commit be5eb933542629ad6a7d4c92097b1b472b1612d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/be5eb933.failed
+
+Decrease reference count of chardevice during char device deletion in
+order to fix a memory leak.  Add a release callabck for the device
+associated chardev and move ida_simple_remove into the release function.
+
+Fixes: 2637baed7801 ("nvme: introduce generic per-namespace chardev")
+	Reported-by: Yi Zhang <yi.zhang@redhat.com>
+	Suggested-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Adam Manzanares <a.manzanares@samsung.com>
+	Reviewed-by: Javier GonzÃ¡lez <javier@javigon.com>
+	Tested-by: Yi Zhang <yi.zhang@redhat.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit be5eb933542629ad6a7d4c92097b1b472b1612d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/multipath.c
+diff --cc drivers/nvme/host/core.c
+index e310c0f15679,587385bc82b6..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -3960,6 -3548,71 +3960,74 @@@ static int __nvme_check_ids(struct nvme
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nvme_cdev_rel(struct device *dev)
++ {
++ 	ida_simple_remove(&nvme_ns_chr_minor_ida, MINOR(dev->devt));
++ }
++ 
++ void nvme_cdev_del(struct cdev *cdev, struct device *cdev_device)
++ {
++ 	cdev_device_del(cdev, cdev_device);
++ 	put_device(cdev_device);
++ }
++ 
++ int nvme_cdev_add(struct cdev *cdev, struct device *cdev_device,
++ 		const struct file_operations *fops, struct module *owner)
++ {
++ 	int minor, ret;
++ 
++ 	minor = ida_simple_get(&nvme_ns_chr_minor_ida, 0, 0, GFP_KERNEL);
++ 	if (minor < 0)
++ 		return minor;
++ 	cdev_device->devt = MKDEV(MAJOR(nvme_ns_chr_devt), minor);
++ 	cdev_device->class = nvme_ns_chr_class;
++ 	cdev_device->release = nvme_cdev_rel;
++ 	device_initialize(cdev_device);
++ 	cdev_init(cdev, fops);
++ 	cdev->owner = owner;
++ 	ret = cdev_device_add(cdev, cdev_device);
++ 	if (ret)
++ 		put_device(cdev_device);
++ 
++ 	return ret;
++ }
++ 
++ static int nvme_ns_chr_open(struct inode *inode, struct file *file)
++ {
++ 	return nvme_ns_open(container_of(inode->i_cdev, struct nvme_ns, cdev));
++ }
++ 
++ static int nvme_ns_chr_release(struct inode *inode, struct file *file)
++ {
++ 	nvme_ns_release(container_of(inode->i_cdev, struct nvme_ns, cdev));
++ 	return 0;
++ }
++ 
++ static const struct file_operations nvme_ns_chr_fops = {
++ 	.owner		= THIS_MODULE,
++ 	.open		= nvme_ns_chr_open,
++ 	.release	= nvme_ns_chr_release,
++ 	.unlocked_ioctl	= nvme_ns_chr_ioctl,
++ 	.compat_ioctl	= compat_ptr_ioctl,
++ };
++ 
++ static int nvme_add_ns_cdev(struct nvme_ns *ns)
++ {
++ 	int ret;
++ 
++ 	ns->cdev_device.parent = ns->ctrl->device;
++ 	ret = dev_set_name(&ns->cdev_device, "ng%dn%d",
++ 			   ns->ctrl->instance, ns->head->instance);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return nvme_cdev_add(&ns->cdev, &ns->cdev_device, &nvme_ns_chr_fops,
++ 			     ns->ctrl->ops->module);
++ }
++ 
+++>>>>>>> be5eb9335426 (nvme: fix per-namespace chardev deletion)
+  static struct nvme_ns_head *nvme_alloc_ns_head(struct nvme_ctrl *ctrl,
+  		unsigned nsid, struct nvme_ns_ids *ids)
+  {
+diff --cc drivers/nvme/host/multipath.c
+index fd91627e7b46,fba06618c6c2..000000000000
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@@ -350,6 -352,88 +350,91 @@@ static blk_qc_t nvme_ns_head_make_reque
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nvme_ns_head_open(struct block_device *bdev, fmode_t mode)
++ {
++ 	if (!nvme_tryget_ns_head(bdev->bd_disk->private_data))
++ 		return -ENXIO;
++ 	return 0;
++ }
++ 
++ static void nvme_ns_head_release(struct gendisk *disk, fmode_t mode)
++ {
++ 	nvme_put_ns_head(disk->private_data);
++ }
++ 
++ #ifdef CONFIG_BLK_DEV_ZONED
++ static int nvme_ns_head_report_zones(struct gendisk *disk, sector_t sector,
++ 		unsigned int nr_zones, report_zones_cb cb, void *data)
++ {
++ 	struct nvme_ns_head *head = disk->private_data;
++ 	struct nvme_ns *ns;
++ 	int srcu_idx, ret = -EWOULDBLOCK;
++ 
++ 	srcu_idx = srcu_read_lock(&head->srcu);
++ 	ns = nvme_find_path(head);
++ 	if (ns)
++ 		ret = nvme_ns_report_zones(ns, sector, nr_zones, cb, data);
++ 	srcu_read_unlock(&head->srcu, srcu_idx);
++ 	return ret;
++ }
++ #else
++ #define nvme_ns_head_report_zones	NULL
++ #endif /* CONFIG_BLK_DEV_ZONED */
++ 
++ const struct block_device_operations nvme_ns_head_ops = {
++ 	.owner		= THIS_MODULE,
++ 	.submit_bio	= nvme_ns_head_submit_bio,
++ 	.open		= nvme_ns_head_open,
++ 	.release	= nvme_ns_head_release,
++ 	.ioctl		= nvme_ns_head_ioctl,
++ 	.getgeo		= nvme_getgeo,
++ 	.report_zones	= nvme_ns_head_report_zones,
++ 	.pr_ops		= &nvme_pr_ops,
++ };
++ 
++ static inline struct nvme_ns_head *cdev_to_ns_head(struct cdev *cdev)
++ {
++ 	return container_of(cdev, struct nvme_ns_head, cdev);
++ }
++ 
++ static int nvme_ns_head_chr_open(struct inode *inode, struct file *file)
++ {
++ 	if (!nvme_tryget_ns_head(cdev_to_ns_head(inode->i_cdev)))
++ 		return -ENXIO;
++ 	return 0;
++ }
++ 
++ static int nvme_ns_head_chr_release(struct inode *inode, struct file *file)
++ {
++ 	nvme_put_ns_head(cdev_to_ns_head(inode->i_cdev));
++ 	return 0;
++ }
++ 
++ static const struct file_operations nvme_ns_head_chr_fops = {
++ 	.owner		= THIS_MODULE,
++ 	.open		= nvme_ns_head_chr_open,
++ 	.release	= nvme_ns_head_chr_release,
++ 	.unlocked_ioctl	= nvme_ns_head_chr_ioctl,
++ 	.compat_ioctl	= compat_ptr_ioctl,
++ };
++ 
++ static int nvme_add_ns_head_cdev(struct nvme_ns_head *head)
++ {
++ 	int ret;
++ 
++ 	head->cdev_device.parent = &head->subsys->dev;
++ 	ret = dev_set_name(&head->cdev_device, "ng%dn%d",
++ 			   head->subsys->instance, head->instance);
++ 	if (ret)
++ 		return ret;
++ 	ret = nvme_cdev_add(&head->cdev, &head->cdev_device,
++ 			    &nvme_ns_head_chr_fops, THIS_MODULE);
++ 	return ret;
++ }
++ 
+++>>>>>>> be5eb9335426 (nvme: fix per-namespace chardev deletion)
+  static void nvme_requeue_work(struct work_struct *work)
+  {
+  	struct nvme_ns_head *head =
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/multipath.c
