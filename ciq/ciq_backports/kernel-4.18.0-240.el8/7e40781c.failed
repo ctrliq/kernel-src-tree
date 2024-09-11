@@ -1,0 +1,160 @@
+bpf: verifier: Use target program's type for access verifications
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Udip Pant <udippant@fb.com>
+commit 7e40781cc8b767dd6530910ae12d75978d7d68e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7e40781c.failed
+
+This patch adds changes in verifier to make decisions such as granting
+of read / write access or enforcement of return code status based on
+the program type of the target program while using dynamic program
+extension (of type BPF_PROG_TYPE_EXT).
+
+The BPF_PROG_TYPE_EXT type can be used to extend types such as XDP, SKB
+and others. Since the BPF_PROG_TYPE_EXT program type on itself is just a
+placeholder for those, we need this extended check for those extended
+programs to actually work with proper access, while using this option.
+
+Specifically, it introduces following changes:
+- may_access_direct_pkt_data:
+    allow access to packet data based on the target prog
+- check_return_code:
+    enforce return code based on the target prog
+    (currently, this check is skipped for EXT program)
+- check_ld_abs:
+    check for 'may_access_skb' based on the target prog
+- check_map_prog_compatibility:
+    enforce the map compatibility check based on the target prog
+- may_update_sockmap:
+    allow sockmap update based on the target prog
+
+Some other occurrences of prog->type is left as it without replacing
+with the 'resolved' type:
+- do_check_common() and check_attach_btf_id():
+    already have specific logic to handle the EXT prog type
+- jit_subprogs() and bpf_check():
+    Not changed for jit compilation or while inferring env->ops
+
+Next few patches in this series include selftests for some of these cases.
+
+	Signed-off-by: Udip Pant <udippant@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200825232003.2877030-2-udippant@fb.com
+(cherry picked from commit 7e40781cc8b767dd6530910ae12d75978d7d68e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/verifier.c
+index afe5348c8e19,8a097a85d01b..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -3619,6 -4191,38 +3627,41 @@@ err_type
+  	return -EACCES;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool may_update_sockmap(struct bpf_verifier_env *env, int func_id)
++ {
++ 	enum bpf_attach_type eatype = env->prog->expected_attach_type;
++ 	enum bpf_prog_type type = resolve_prog_type(env->prog);
++ 
++ 	if (func_id != BPF_FUNC_map_update_elem)
++ 		return false;
++ 
++ 	/* It's not possible to get access to a locked struct sock in these
++ 	 * contexts, so updating is safe.
++ 	 */
++ 	switch (type) {
++ 	case BPF_PROG_TYPE_TRACING:
++ 		if (eatype == BPF_TRACE_ITER)
++ 			return true;
++ 		break;
++ 	case BPF_PROG_TYPE_SOCKET_FILTER:
++ 	case BPF_PROG_TYPE_SCHED_CLS:
++ 	case BPF_PROG_TYPE_SCHED_ACT:
++ 	case BPF_PROG_TYPE_XDP:
++ 	case BPF_PROG_TYPE_SK_REUSEPORT:
++ 	case BPF_PROG_TYPE_FLOW_DISSECTOR:
++ 	case BPF_PROG_TYPE_SK_LOOKUP:
++ 		return true;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	verbose(env, "cannot update sockmap in this context\n");
++ 	return false;
++ }
++ 
+++>>>>>>> 7e40781cc8b7 (bpf: verifier: Use target program's type for access verifications)
+  static int check_map_func_compatibility(struct bpf_verifier_env *env,
+  					struct bpf_map *map, int func_id)
+  {
+@@@ -6400,13 -7469,41 +6443,39 @@@ static int check_ld_abs(struct bpf_veri
+  static int check_return_code(struct bpf_verifier_env *env)
+  {
+  	struct tnum enforce_attach_type_range = tnum_unknown;
+ -	const struct bpf_prog *prog = env->prog;
+  	struct bpf_reg_state *reg;
+  	struct tnum range = tnum_range(0, 1);
+++<<<<<<< HEAD
+++=======
++ 	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
++ 	int err;
++ 
++ 	/* LSM and struct_ops func-ptr's return type could be "void" */
++ 	if ((prog_type == BPF_PROG_TYPE_STRUCT_OPS ||
++ 	     prog_type == BPF_PROG_TYPE_LSM) &&
++ 	    !prog->aux->attach_func_proto->type)
++ 		return 0;
++ 
++ 	/* eBPF calling convetion is such that R0 is used
++ 	 * to return the value from eBPF program.
++ 	 * Make sure that it's readable at this time
++ 	 * of bpf_exit, which means that program wrote
++ 	 * something into it earlier
++ 	 */
++ 	err = check_reg_arg(env, BPF_REG_0, SRC_OP);
++ 	if (err)
++ 		return err;
++ 
++ 	if (is_pointer_value(env, BPF_REG_0)) {
++ 		verbose(env, "R0 leaks addr as return value\n");
++ 		return -EACCES;
++ 	}
+++>>>>>>> 7e40781cc8b7 (bpf: verifier: Use target program's type for access verifications)
+  
+- 	switch (env->prog->type) {
++ 	switch (prog_type) {
+  	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+  		if (env->prog->expected_attach_type == BPF_CGROUP_UDP4_RECVMSG ||
+ -		    env->prog->expected_attach_type == BPF_CGROUP_UDP6_RECVMSG ||
+ -		    env->prog->expected_attach_type == BPF_CGROUP_INET4_GETPEERNAME ||
+ -		    env->prog->expected_attach_type == BPF_CGROUP_INET6_GETPEERNAME ||
+ -		    env->prog->expected_attach_type == BPF_CGROUP_INET4_GETSOCKNAME ||
+ -		    env->prog->expected_attach_type == BPF_CGROUP_INET6_GETSOCKNAME)
+ +		    env->prog->expected_attach_type == BPF_CGROUP_UDP6_RECVMSG)
+  			range = tnum_range(1, 1);
+  		break;
+  	case BPF_PROG_TYPE_CGROUP_SKB:
+@@@ -8924,7 -9992,11 +8994,15 @@@ static int convert_ctx_accesses(struct 
+  			convert_ctx_access = bpf_xdp_sock_convert_ctx_access;
+  			break;
+  		case PTR_TO_BTF_ID:
+++<<<<<<< HEAD
+ +			if (type == BPF_WRITE) {
+++=======
++ 			if (type == BPF_READ) {
++ 				insn->code = BPF_LDX | BPF_PROBE_MEM |
++ 					BPF_SIZE((insn)->code);
++ 				env->prog->aux->num_exentries++;
++ 			} else if (resolve_prog_type(env->prog) != BPF_PROG_TYPE_STRUCT_OPS) {
+++>>>>>>> 7e40781cc8b7 (bpf: verifier: Use target program's type for access verifications)
+  				verbose(env, "Writes through BTF pointers are not allowed\n");
+  				return -EINVAL;
+  			}
+* Unmerged path kernel/bpf/verifier.c
