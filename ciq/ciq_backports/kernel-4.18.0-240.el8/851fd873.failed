@@ -1,0 +1,234 @@
+ASoC: SOF: Intel: hda: Allow trace DMA in S0 when DSP is in D0I3 for debug
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: SOF: Intel: hda: Allow trace DMA in S0 when DSP is in D0I3 for debug (Jaroslav Kysela) [1797509]
+Rebuild_FUZZ: 96.10%
+commit-author Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+commit 851fd87324430dfe56cd55dfd05a8114ac82d168
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/851fd873.failed
+
+Trace DMA is disabled by default when the DSP is in D0I3.
+Add a debug option to keep trace DMA enabled when the DSP
+is in D0I3 during S0.
+
+	Signed-off-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+	Signed-off-by: Keyon Jie <yang.jie@linux.intel.com>
+	Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Link: https://lore.kernel.org/r/20200129220726.31792-10-pierre-louis.bossart@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 851fd87324430dfe56cd55dfd05a8114ac82d168)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/intel/hda-dsp.c
+diff --cc sound/soc/sof/intel/hda-dsp.c
+index fddf2c48904f,14228b4931d6..000000000000
+--- a/sound/soc/sof/intel/hda-dsp.c
++++ b/sound/soc/sof/intel/hda-dsp.c
+@@@ -15,8 -15,10 +15,9 @@@
+   * Hardware interface for generic Intel audio DSP HDA IP
+   */
+  
++ #include <linux/module.h>
+  #include <sound/hdaudio_ext.h>
+  #include <sound/hda_register.h>
+ -#include "../sof-audio.h"
+  #include "../ops.h"
+  #include "hda.h"
+  #include "hda-ipc.h"
+@@@ -367,20 -373,179 +375,174 @@@ int hda_dsp_set_power_state(struct snd_
+  	dev_vdbg(bus->dev, "D0I3C updated, register = 0x%x\n",
+  		 snd_hdac_chip_readb(bus, VS_D0I3C));
+  
+ -	return 0;
+ -}
+ +	if (d0_substate == SOF_DSP_D0I0)
+ +		flags = HDA_PM_PPG;/* prevent power gating in D0 */
+ +	else
+ +		flags = HDA_PM_NO_DMA_TRACE;/* disable DMA trace in D0I3*/
+  
+++<<<<<<< HEAD
+ +	/* sending pm_gate IPC */
+++=======
++ static int hda_dsp_set_D0_state(struct snd_sof_dev *sdev,
++ 				const struct sof_dsp_power_state *target_state)
++ {
++ 	u32 flags = 0;
++ 	int ret;
++ 	u8 value = 0;
++ 
++ 	/*
++ 	 * Sanity check for illegal state transitions
++ 	 * The only allowed transitions are:
++ 	 * 1. D3 -> D0I0
++ 	 * 2. D0I0 -> D0I3
++ 	 * 3. D0I3 -> D0I0
++ 	 */
++ 	switch (sdev->dsp_power_state.state) {
++ 	case SOF_DSP_PM_D0:
++ 		/* Follow the sequence below for D0 substate transitions */
++ 		break;
++ 	case SOF_DSP_PM_D3:
++ 		/* Follow regular flow for D3 -> D0 transition */
++ 		return 0;
++ 	default:
++ 		dev_err(sdev->dev, "error: transition from %d to %d not allowed\n",
++ 			sdev->dsp_power_state.state, target_state->state);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Set flags and register value for D0 target substate */
++ 	if (target_state->substate == SOF_HDA_DSP_PM_D0I3) {
++ 		value = SOF_HDA_VS_D0I3C_I3;
++ 
++ 		/*
++ 		 * Trace DMA is disabled by default when the DSP enters D0I3.
++ 		 * But it can be kept enabled when the DSP enters D0I3 while the
++ 		 * system is in S0 for debug.
++ 		 */
++ 		if (hda_enable_trace_D0I3_S0 &&
++ 		    sdev->system_suspend_target != SOF_SUSPEND_NONE)
++ 			flags = HDA_PM_NO_DMA_TRACE;
++ 	} else {
++ 		/* prevent power gating in D0I0 */
++ 		flags = HDA_PM_PPG;
++ 	}
++ 
++ 	/* update D0I3C register */
++ 	ret = hda_dsp_update_d0i3c_register(sdev, value);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/*
++ 	 * Notify the DSP of the state change.
++ 	 * If this IPC fails, revert the D0I3C register update in order
++ 	 * to prevent partial state change.
++ 	 */
+++>>>>>>> 851fd8732443 (ASoC: SOF: Intel: hda: Allow trace DMA in S0 when DSP is in D0I3 for debug)
+  	ret = hda_dsp_send_pm_gate_ipc(sdev, flags);
+ -	if (ret < 0) {
+ +	if (ret < 0)
+  		dev_err(sdev->dev,
+  			"error: PM_GATE ipc error %d\n", ret);
+ -		goto revert;
+ -	}
+ -
+ -	return ret;
+ -
+ -revert:
+ -	/* fallback to the previous register value */
+ -	value = value ? 0 : SOF_HDA_VS_D0I3C_I3;
+ -
+ -	/*
+ -	 * This can fail but return the IPC error to signal that
+ -	 * the state change failed.
+ -	 */
+ -	hda_dsp_update_d0i3c_register(sdev, value);
+  
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * All DSP power state transitions are initiated by the driver.
++  * If the requested state change fails, the error is simply returned.
++  * Further state transitions are attempted only when the set_power_save() op
++  * is called again either because of a new IPC sent to the DSP or
++  * during system suspend/resume.
++  */
++ int hda_dsp_set_power_state(struct snd_sof_dev *sdev,
++ 			    const struct sof_dsp_power_state *target_state)
++ {
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * When the DSP is already in D0I3 and the target state is D0I3,
++ 	 * it could be the case that the DSP is in D0I3 during S0
++ 	 * and the system is suspending to S0Ix. Therefore,
++ 	 * hda_dsp_set_D0_state() must be called to disable trace DMA
++ 	 * by sending the PM_GATE IPC to the FW.
++ 	 */
++ 	if (target_state->substate == SOF_HDA_DSP_PM_D0I3 &&
++ 	    sdev->system_suspend_target == SOF_SUSPEND_S0IX)
++ 		goto set_state;
++ 
++ 	/*
++ 	 * For all other cases, return without doing anything if
++ 	 * the DSP is already in the target state.
++ 	 */
++ 	if (target_state->state == sdev->dsp_power_state.state &&
++ 	    target_state->substate == sdev->dsp_power_state.substate)
++ 		return 0;
++ 
++ set_state:
++ 	switch (target_state->state) {
++ 	case SOF_DSP_PM_D0:
++ 		ret = hda_dsp_set_D0_state(sdev, target_state);
++ 		break;
++ 	case SOF_DSP_PM_D3:
++ 		/* The only allowed transition is: D0I0 -> D3 */
++ 		if (sdev->dsp_power_state.state == SOF_DSP_PM_D0 &&
++ 		    sdev->dsp_power_state.substate == SOF_HDA_DSP_PM_D0I0)
++ 			break;
++ 
++ 		dev_err(sdev->dev,
++ 			"error: transition from %d to %d not allowed\n",
++ 			sdev->dsp_power_state.state, target_state->state);
++ 		return -EINVAL;
++ 	default:
++ 		dev_err(sdev->dev, "error: target state unsupported %d\n",
++ 			target_state->state);
++ 		return -EINVAL;
++ 	}
++ 	if (ret < 0) {
++ 		dev_err(sdev->dev,
++ 			"failed to set requested target DSP state %d substate %d\n",
++ 			target_state->state, target_state->substate);
++ 		return ret;
++ 	}
++ 
++ 	sdev->dsp_power_state = *target_state;
++ 	dev_dbg(sdev->dev, "New DSP state %d substate %d\n",
++ 		target_state->state, target_state->substate);
++ 	return ret;
++ }
++ 
++ /*
++  * Audio DSP states may transform as below:-
++  *
++  *                                         Opportunistic D0I3 in S0
++  *     Runtime    +---------------------+  Delayed D0i3 work timeout
++  *     suspend    |                     +--------------------+
++  *   +------------+       D0I0(active)  |                    |
++  *   |            |                     <---------------+    |
++  *   |   +-------->                     |    New IPC	|    |
++  *   |   |Runtime +--^--+---------^--+--+ (via mailbox)	|    |
++  *   |   |resume     |  |         |  |			|    |
++  *   |   |           |  |         |  |			|    |
++  *   |   |     System|  |         |  |			|    |
++  *   |   |     resume|  | S3/S0IX |  |                  |    |
++  *   |   |	     |  | suspend |  | S0IX             |    |
++  *   |   |           |  |         |  |suspend           |    |
++  *   |   |           |  |         |  |                  |    |
++  *   |   |           |  |         |  |                  |    |
++  * +-v---+-----------+--v-------+ |  |           +------+----v----+
++  * |                            | |  +----------->                |
++  * |       D3 (suspended)       | |              |      D0I3      |
++  * |                            | +--------------+                |
++  * |                            |  System resume |                |
++  * +----------------------------+		 +----------------+
++  *
++  * S0IX suspend: The DSP is in D0I3 if any D0I3-compatible streams
++  *		 ignored the suspend trigger. Otherwise the DSP
++  *		 is in D3.
++  */
++ 
+++>>>>>>> 851fd8732443 (ASoC: SOF: Intel: hda: Allow trace DMA in S0 when DSP is in D0I3 for debug)
+  static int hda_suspend(struct snd_sof_dev *sdev, bool runtime_suspend)
+  {
+  	struct sof_intel_hda_dev *hda = sdev->pdata->hw_pdata;
+* Unmerged path sound/soc/sof/intel/hda-dsp.c
