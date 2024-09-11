@@ -749,8 +749,8 @@ static int hmm_vma_walk_pud(pud_t *pudp,
 
 	pud = READ_ONCE(*pudp);
 	if (pud_none(pud)) {
-		ret = hmm_vma_walk_hole(start, end, -1, walk);
-		goto out_unlock;
+		spin_unlock(ptl);
+		return hmm_vma_walk_hole(start, end, -1, walk);
 	}
 
 	if (pud_huge(pud) && pud_devmap(pud)) {
@@ -759,8 +759,8 @@ static int hmm_vma_walk_pud(pud_t *pudp,
 		bool fault, write_fault;
 
 		if (!pud_present(pud)) {
-			ret = hmm_vma_walk_hole(start, end, -1, walk);
-			goto out_unlock;
+			spin_unlock(ptl);
+			return hmm_vma_walk_hole(start, end, -1, walk);
 		}
 
 		i = (addr - range->start) >> PAGE_SHIFT;
@@ -771,9 +771,9 @@ static int hmm_vma_walk_pud(pud_t *pudp,
 		hmm_range_need_fault(hmm_vma_walk, pfns, npages,
 				     cpu_flags, &fault, &write_fault);
 		if (fault || write_fault) {
-			ret = hmm_vma_walk_hole_(addr, end, fault,
-						 write_fault, walk);
-			goto out_unlock;
+			spin_unlock(ptl);
+			return hmm_vma_walk_hole_(addr, end, fault, write_fault,
+						  walk);
 		}
 
 		pfn = pud_pfn(pud) + ((addr & ~PUD_MASK) >> PAGE_SHIFT);
