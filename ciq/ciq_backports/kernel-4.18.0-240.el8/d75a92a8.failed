@@ -1,0 +1,334 @@
+drm/i915: Allow for different modes of interruptible i915_active_wait
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Chris Wilson <chris@chris-wilson.co.uk>
+commit d75a92a81467933404547edf47ec63d58d7e2b2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d75a92a8.failed
+
+Allow some users the discretion to not immediately return on a normal
+signal. Hopefully, they will opt to use TASK_KILLABLE instead.
+
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200327112212.16046-1-chris@chris-wilson.co.uk
+(cherry picked from commit d75a92a81467933404547edf47ec63d58d7e2b2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_active.c
+#	drivers/gpu/drm/i915/selftests/i915_active.c
+diff --cc drivers/gpu/drm/i915/i915_active.c
+index 293e5bcc4b6c,7b685032cc1e..000000000000
+--- a/drivers/gpu/drm/i915/i915_active.c
++++ b/drivers/gpu/drm/i915/i915_active.c
+@@@ -197,64 -445,156 +197,99 @@@ bool i915_active_acquire(struct i915_ac
+  
+  void i915_active_release(struct i915_active *ref)
+  {
+ -	debug_active_assert(ref);
+ -	active_retire(ref);
+ -}
+ -
+ -static void enable_signaling(struct i915_active_fence *active)
+ -{
+ -	struct dma_fence *fence;
+ -
+ -	if (unlikely(is_barrier(active)))
+ -		return;
+ -
+ -	fence = i915_active_fence_get(active);
+ -	if (!fence)
+ -		return;
+ -
+ -	dma_fence_enable_sw_signaling(fence);
+ -	dma_fence_put(fence);
+ +	lockdep_assert_held(BKL(ref));
+ +	__active_retire(ref);
+  }
+  
+- int i915_active_wait(struct i915_active *ref)
+ -static int flush_barrier(struct active_node *it)
+++int __i915_active_wait(struct i915_active *ref, int state)
+  {
+ -	struct intel_engine_cs *engine;
+ -
+ -	if (likely(!is_barrier(&it->base)))
+ -		return 0;
+ -
+ -	engine = __barrier_to_engine(it);
+ -	smp_rmb(); /* serialise with add_active_barriers */
+ -	if (!is_barrier(&it->base))
+ -		return 0;
+ +	struct active_node *it, *n;
+ +	int ret = 0;
+  
+ -	return intel_engine_flush_barriers(engine);
+ -}
+ +	if (i915_active_acquire(ref))
+ +		goto out_release;
+  
+ -static int flush_lazy_signals(struct i915_active *ref)
+ -{
+ -	struct active_node *it, *n;
+ -	int err = 0;
+ +	ret = i915_active_request_retire(&ref->last, BKL(ref));
+ +	if (ret)
+ +		goto out_release;
+  
+ -	enable_signaling(&ref->excl);
+++<<<<<<< HEAD
+  	rbtree_postorder_for_each_entry_safe(it, n, &ref->tree, node) {
+ -		err = flush_barrier(it); /* unconnected idle barrier? */
+ -		if (err)
+ +		ret = i915_active_request_retire(&it->base, BKL(ref));
+ +		if (ret)
+  			break;
+ -
+ -		enable_signaling(&it->base);
+ -	}
+ -
+ -	return err;
+ -}
+ -
+ -int __i915_active_wait(struct i915_active *ref, int state)
+ -{
+ -	int err;
+ -
+ -	might_sleep();
+ -
+ -	if (!i915_active_acquire_if_busy(ref))
+ -		return 0;
+ -
+++=======
++ 	/* Any fence added after the wait begins will not be auto-signaled */
++ 	err = flush_lazy_signals(ref);
++ 	i915_active_release(ref);
++ 	if (err)
++ 		return err;
++ 
++ 	if (!i915_active_is_idle(ref) &&
++ 	    ___wait_var_event(ref, i915_active_is_idle(ref),
++ 			      state, 0, 0, schedule()))
++ 		return -EINTR;
++ 
++ 	flush_work(&ref->work);
++ 	return 0;
++ }
++ 
++ static int __await_active(struct i915_active_fence *active,
++ 			  int (*fn)(void *arg, struct dma_fence *fence),
++ 			  void *arg)
++ {
++ 	struct dma_fence *fence;
++ 
++ 	if (is_barrier(active)) /* XXX flush the barrier? */
++ 		return 0;
++ 
++ 	fence = i915_active_fence_get(active);
++ 	if (fence) {
++ 		int err;
++ 
++ 		err = fn(arg, fence);
++ 		dma_fence_put(fence);
++ 		if (err < 0)
++ 			return err;
+++>>>>>>> d75a92a81467 (drm/i915: Allow for different modes of interruptible i915_active_wait)
+  	}
+  
+ -	return 0;
+ +out_release:
+ +	i915_active_release(ref);
+ +	return ret;
+  }
+  
+ -static int await_active(struct i915_active *ref,
+ -			unsigned int flags,
+ -			int (*fn)(void *arg, struct dma_fence *fence),
+ -			void *arg)
+ +int i915_request_await_active_request(struct i915_request *rq,
+ +				      struct i915_active_request *active)
+  {
+ -	int err = 0;
+ -
+ -	/* We must always wait for the exclusive fence! */
+ -	if (rcu_access_pointer(ref->excl.fence)) {
+ -		err = __await_active(&ref->excl, fn, arg);
+ -		if (err)
+ -			return err;
+ -	}
+ +	struct i915_request *barrier =
+ +		i915_active_request_raw(active, &rq->i915->drm.struct_mutex);
+  
+ -	if (flags & I915_ACTIVE_AWAIT_ALL && i915_active_acquire_if_busy(ref)) {
+ -		struct active_node *it, *n;
+ -
+ -		rbtree_postorder_for_each_entry_safe(it, n, &ref->tree, node) {
+ -			err = __await_active(&it->base, fn, arg);
+ -			if (err)
+ -				break;
+ -		}
+ -		i915_active_release(ref);
+ -		if (err)
+ -			return err;
+ -	}
+ -
+ -	return 0;
+ +	return barrier ? i915_request_await_dma_fence(rq, &barrier->fence) : 0;
+  }
+  
+ -static int rq_await_fence(void *arg, struct dma_fence *fence)
+ +int i915_request_await_active(struct i915_request *rq, struct i915_active *ref)
+  {
+ -	return i915_request_await_dma_fence(arg, fence);
+ -}
+ +	struct active_node *it, *n;
+ +	int err = 0;
+  
+ -int i915_request_await_active(struct i915_request *rq,
+ -			      struct i915_active *ref,
+ -			      unsigned int flags)
+ -{
+ -	return await_active(ref, flags, rq_await_fence, rq);
+ -}
+ +	/* await allocates and so we need to avoid hitting the shrinker */
+ +	if (i915_active_acquire(ref))
+ +		goto out; /* was idle */
+  
+ -static int sw_await_fence(void *arg, struct dma_fence *fence)
+ -{
+ -	return i915_sw_fence_await_dma_fence(arg, fence, 0,
+ -					     GFP_NOWAIT | __GFP_NOWARN);
+ -}
+ +	err = i915_request_await_active_request(rq, &ref->last);
+ +	if (err)
+ +		goto out;
+  
+ -int i915_sw_fence_await_active(struct i915_sw_fence *fence,
+ -			       struct i915_active *ref,
+ -			       unsigned int flags)
+ -{
+ -	return await_active(ref, flags, sw_await_fence, fence);
+ +	rbtree_postorder_for_each_entry_safe(it, n, &ref->tree, node) {
+ +		err = i915_request_await_active_request(rq, &it->base);
+ +		if (err)
+ +			goto out;
+ +	}
+ +
+ +out:
+ +	i915_active_release(ref);
+ +	return err;
+  }
+  
+  #if IS_ENABLED(CONFIG_DRM_I915_DEBUG_GEM)
+diff --cc drivers/gpu/drm/i915/selftests/i915_active.c
+index c0b3537a5fa6,4002c984c2e0..000000000000
+--- a/drivers/gpu/drm/i915/selftests/i915_active.c
++++ b/drivers/gpu/drm/i915/selftests/i915_active.c
+@@@ -96,14 -149,17 +96,20 @@@ static int live_active_wait(void *arg
+  
+  	/* Check that we get a callback when requests retire upon waiting */
+  
+ -	active = __live_active_setup(i915);
+ -	if (IS_ERR(active))
+ -		return PTR_ERR(active);
+ +	mutex_lock(&i915->drm.struct_mutex);
+ +	wakeref = intel_runtime_pm_get(&i915->runtime_pm);
+  
+++<<<<<<< HEAD
+ +	err = __live_active_setup(i915, &active);
+++=======
++ 	__i915_active_wait(&active->base, TASK_UNINTERRUPTIBLE);
++ 	if (!READ_ONCE(active->retired)) {
++ 		struct drm_printer p = drm_err_printer(__func__);
+++>>>>>>> d75a92a81467 (drm/i915: Allow for different modes of interruptible i915_active_wait)
+  
+ +	i915_active_wait(&active.base);
+ +	if (!active.retired) {
+  		pr_err("i915_active not retired after waiting!\n");
+ -		i915_active_print(&active->base, &p);
+ -
+  		err = -EINVAL;
+  	}
+  
+@@@ -139,9 -194,55 +145,59 @@@ static int live_active_retire(void *arg
+  		err = -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	i915_active_fini(&active.base);
+ +	intel_runtime_pm_put(&i915->runtime_pm, wakeref);
+ +	mutex_unlock(&i915->drm.struct_mutex);
+++=======
++ 	__live_put(active);
++ 
++ 	return err;
++ }
++ 
++ static int live_active_barrier(void *arg)
++ {
++ 	struct drm_i915_private *i915 = arg;
++ 	struct intel_engine_cs *engine;
++ 	struct live_active *active;
++ 	int err = 0;
++ 
++ 	/* Check that we get a callback when requests retire upon waiting */
++ 
++ 	active = __live_alloc(i915);
++ 	if (!active)
++ 		return -ENOMEM;
++ 
++ 	err = i915_active_acquire(&active->base);
++ 	if (err)
++ 		goto out;
++ 
++ 	for_each_uabi_engine(engine, i915) {
++ 		err = i915_active_acquire_preallocate_barrier(&active->base,
++ 							      engine);
++ 		if (err)
++ 			break;
++ 
++ 		i915_active_acquire_barrier(&active->base);
++ 	}
++ 
++ 	i915_active_release(&active->base);
++ 	if (err)
++ 		goto out;
++ 
++ 	__i915_active_wait(&active->base, TASK_UNINTERRUPTIBLE);
++ 	if (!READ_ONCE(active->retired)) {
++ 		pr_err("i915_active not retired after flushing barriers!\n");
++ 		err = -EINVAL;
++ 	}
++ 
++ out:
++ 	__live_put(active);
++ 
++ 	if (igt_flush_test(i915))
++ 		err = -EIO;
++ 
+++>>>>>>> d75a92a81467 (drm/i915: Allow for different modes of interruptible i915_active_wait)
+  	return err;
+  }
+  
+* Unmerged path drivers/gpu/drm/i915/i915_active.c
+diff --git a/drivers/gpu/drm/i915/i915_active.h b/drivers/gpu/drm/i915/i915_active.h
+index c14eebf6d074..b042fbb7a0f5 100644
+--- a/drivers/gpu/drm/i915/i915_active.h
++++ b/drivers/gpu/drm/i915/i915_active.h
+@@ -377,7 +377,11 @@ int i915_active_ref(struct i915_active *ref,
+ 		    u64 timeline,
+ 		    struct i915_request *rq);
+ 
+-int i915_active_wait(struct i915_active *ref);
++int __i915_active_wait(struct i915_active *ref, int state);
++static inline int i915_active_wait(struct i915_active *ref)
++{
++	return __i915_active_wait(ref, TASK_INTERRUPTIBLE);
++}
+ 
+ int i915_request_await_active(struct i915_request *rq,
+ 			      struct i915_active *ref);
+* Unmerged path drivers/gpu/drm/i915/selftests/i915_active.c
