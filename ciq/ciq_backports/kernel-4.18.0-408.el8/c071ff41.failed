@@ -1,0 +1,190 @@
+KVM: selftests: Expose align() helpers to tests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit c071ff41e1502990a0902c7c3fcf72a462e46330
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/c071ff41.failed
+
+Refactor align() to work with non-pointers and split into separate
+helpers for aligning up vs. down. Add align_ptr_up() for use with
+pointers. Expose all helpers so that they can be used by tests and/or
+other utilities.  The align_down() helper in particular will be used to
+ensure gpa alignment for hugepages.
+
+No functional change intended.
+
+[Added sepearate up/down helpers and replaced open-coded alignment
+ bit math throughout the KVM selftests.]
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: David Matlack <dmatlack@google.com>
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+Message-Id: <20211111000310.1435032-3-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c071ff41e1502990a0902c7c3fcf72a462e46330)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/include/test_util.h
+diff --cc tools/testing/selftests/kvm/include/test_util.h
+index 2405c5b89c88,78c06310cc0e..000000000000
+--- a/tools/testing/selftests/kvm/include/test_util.h
++++ b/tools/testing/selftests/kvm/include/test_util.h
+@@@ -106,4 -108,38 +106,41 @@@ void backing_src_help(const char *flag)
+  enum vm_mem_backing_src_type parse_backing_src_type(const char *type_name);
+  long get_run_delay(void);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Whether or not the given source type is shared memory (as opposed to
++  * anonymous).
++  */
++ static inline bool backing_src_is_shared(enum vm_mem_backing_src_type t)
++ {
++ 	return vm_mem_backing_src_alias(t)->flag & MAP_SHARED;
++ }
++ 
++ /* Aligns x up to the next multiple of size. Size must be a power of 2. */
++ static inline uint64_t align_up(uint64_t x, uint64_t size)
++ {
++ 	uint64_t mask = size - 1;
++ 
++ 	TEST_ASSERT(size != 0 && !(size & (size - 1)),
++ 		    "size not a power of 2: %lu", size);
++ 	return ((x + mask) & ~mask);
++ }
++ 
++ static inline uint64_t align_down(uint64_t x, uint64_t size)
++ {
++ 	uint64_t x_aligned_up = align_up(x, size);
++ 
++ 	if (x == x_aligned_up)
++ 		return x;
++ 	else
++ 		return x_aligned_up - size;
++ }
++ 
++ static inline void *align_ptr_up(void *x, size_t size)
++ {
++ 	return (void *)align_up((unsigned long)x, size);
++ }
++ 
+++>>>>>>> c071ff41e150 (KVM: selftests: Expose align() helpers to tests)
+  #endif /* SELFTEST_KVM_TEST_UTIL_H */
+diff --git a/tools/testing/selftests/kvm/dirty_log_test.c b/tools/testing/selftests/kvm/dirty_log_test.c
+index 792c60e1b17d..3fcd89e195c7 100644
+--- a/tools/testing/selftests/kvm/dirty_log_test.c
++++ b/tools/testing/selftests/kvm/dirty_log_test.c
+@@ -115,7 +115,7 @@ static void guest_code(void)
+ 			addr = guest_test_virt_mem;
+ 			addr += (READ_ONCE(random_array[i]) % guest_num_pages)
+ 				* guest_page_size;
+-			addr &= ~(host_page_size - 1);
++			addr = align_down(addr, host_page_size);
+ 			*(uint64_t *)addr = READ_ONCE(iteration);
+ 		}
+ 
+@@ -737,14 +737,14 @@ static void run_test(enum vm_guest_mode mode, void *arg)
+ 	if (!p->phys_offset) {
+ 		guest_test_phys_mem = (vm_get_max_gfn(vm) -
+ 				       guest_num_pages) * guest_page_size;
+-		guest_test_phys_mem &= ~(host_page_size - 1);
++		guest_test_phys_mem = align_down(guest_test_phys_mem, host_page_size);
+ 	} else {
+ 		guest_test_phys_mem = p->phys_offset;
+ 	}
+ 
+ #ifdef __s390x__
+ 	/* Align to 1M (segment size) */
+-	guest_test_phys_mem &= ~((1 << 20) - 1);
++	guest_test_phys_mem = align_down(guest_test_phys_mem, 1 << 20);
+ #endif
+ 
+ 	pr_info("guest physical test memory offset: 0x%lx\n", guest_test_phys_mem);
+* Unmerged path tools/testing/selftests/kvm/include/test_util.h
+diff --git a/tools/testing/selftests/kvm/kvm_page_table_test.c b/tools/testing/selftests/kvm/kvm_page_table_test.c
+index 36407cb0ec85..3836322add00 100644
+--- a/tools/testing/selftests/kvm/kvm_page_table_test.c
++++ b/tools/testing/selftests/kvm/kvm_page_table_test.c
+@@ -280,7 +280,7 @@ static struct kvm_vm *pre_init_before_test(enum vm_guest_mode mode, void *arg)
+ #ifdef __s390x__
+ 	alignment = max(0x100000, alignment);
+ #endif
+-	guest_test_phys_mem &= ~(alignment - 1);
++	guest_test_phys_mem = align_down(guest_test_virt_mem, alignment);
+ 
+ 	/* Set up the shared data structure test_args */
+ 	test_args.vm = vm;
+diff --git a/tools/testing/selftests/kvm/lib/elf.c b/tools/testing/selftests/kvm/lib/elf.c
+index eac44f5d0db0..13e8e3dcf984 100644
+--- a/tools/testing/selftests/kvm/lib/elf.c
++++ b/tools/testing/selftests/kvm/lib/elf.c
+@@ -157,8 +157,7 @@ void kvm_vm_elf_load(struct kvm_vm *vm, const char *filename)
+ 			"memsize of 0,\n"
+ 			"  phdr index: %u p_memsz: 0x%" PRIx64,
+ 			n1, (uint64_t) phdr.p_memsz);
+-		vm_vaddr_t seg_vstart = phdr.p_vaddr;
+-		seg_vstart &= ~(vm_vaddr_t)(vm->page_size - 1);
++		vm_vaddr_t seg_vstart = align_down(phdr.p_vaddr, vm->page_size);
+ 		vm_vaddr_t seg_vend = phdr.p_vaddr + phdr.p_memsz - 1;
+ 		seg_vend |= vm->page_size - 1;
+ 		size_t seg_size = seg_vend - seg_vstart + 1;
+diff --git a/tools/testing/selftests/kvm/lib/kvm_util.c b/tools/testing/selftests/kvm/lib/kvm_util.c
+index 114a6ef5f597..6f4a7c059cc5 100644
+--- a/tools/testing/selftests/kvm/lib/kvm_util.c
++++ b/tools/testing/selftests/kvm/lib/kvm_util.c
+@@ -22,15 +22,6 @@
+ 
+ static int vcpu_mmap_sz(void);
+ 
+-/* Aligns x up to the next multiple of size. Size must be a power of 2. */
+-static void *align(void *x, size_t size)
+-{
+-	size_t mask = size - 1;
+-	TEST_ASSERT(size != 0 && !(size & (size - 1)),
+-		    "size not a power of 2: %lu", size);
+-	return (void *) (((size_t) x + mask) & ~mask);
+-}
+-
+ /*
+  * Open KVM_DEV_PATH if available, otherwise exit the entire program.
+  *
+@@ -939,7 +930,7 @@ void vm_userspace_mem_region_add(struct kvm_vm *vm,
+ 		    region->mmap_start, errno);
+ 
+ 	/* Align host address */
+-	region->host_mem = align(region->mmap_start, alignment);
++	region->host_mem = align_ptr_up(region->mmap_start, alignment);
+ 
+ 	/* As needed perform madvise */
+ 	if ((src_type == VM_MEM_SRC_ANONYMOUS ||
+@@ -982,7 +973,7 @@ void vm_userspace_mem_region_add(struct kvm_vm *vm,
+ 			    "mmap of alias failed, errno: %i", errno);
+ 
+ 		/* Align host alias address */
+-		region->host_alias = align(region->mmap_alias, alignment);
++		region->host_alias = align_ptr_up(region->mmap_alias, alignment);
+ 	}
+ }
+ 
+diff --git a/tools/testing/selftests/kvm/lib/perf_test_util.c b/tools/testing/selftests/kvm/lib/perf_test_util.c
+index 0ef80dbdc116..6b8d5020dc54 100644
+--- a/tools/testing/selftests/kvm/lib/perf_test_util.c
++++ b/tools/testing/selftests/kvm/lib/perf_test_util.c
+@@ -92,10 +92,10 @@ struct kvm_vm *perf_test_create_vm(enum vm_guest_mode mode, int vcpus,
+ 
+ 	guest_test_phys_mem = (vm_get_max_gfn(vm) - guest_num_pages) *
+ 			      perf_test_args.guest_page_size;
+-	guest_test_phys_mem &= ~(perf_test_args.host_page_size - 1);
++	guest_test_phys_mem = align_down(guest_test_phys_mem, perf_test_args.host_page_size);
+ #ifdef __s390x__
+ 	/* Align to 1M (segment size) */
+-	guest_test_phys_mem &= ~((1 << 20) - 1);
++	guest_test_phys_mem = align_down(guest_test_phys_mem, 1 << 20);
+ #endif
+ 	pr_info("guest physical test memory offset: 0x%lx\n", guest_test_phys_mem);
+ 
