@@ -1,0 +1,319 @@
+drm/i915/cmdparser: Add support for backward jumps
+
+jira LE-1907
+cve CVE-2019-0155
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jon Bloomfield <jon.bloomfield@intel.com>
+commit f8c08d8faee5567803c8c533865296ca30286bbf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/f8c08d8f.failed
+
+To keep things manageable, the pre-gen9 cmdparser does not
+attempt to track any form of nested BB_START's. This did not
+prevent usermode from using nested starts, or even chained
+batches because the cmdparser is not strictly enforced pre gen9.
+
+Instead, the existence of a nested BB_START would cause the batch
+to be emitted in insecure mode, and any privileged capabilities
+would not be available.
+
+For Gen9, the cmdparser becomes mandatory (for BCS at least), and
+so not providing any form of nested BB_START support becomes
+overly restrictive. Any such batch will simply not run.
+
+We make heavy use of backward jumps in igt, and it is much easier
+to add support for this restricted subset of nested jumps, than to
+rewrite the whole of our test suite to avoid them.
+
+Add the required logic to support limited backward jumps, to
+instructions that have already been validated by the parser.
+
+Note that it's not sufficient to simply approve any BB_START
+that jumps backwards in the buffer because this would allow an
+attacker to embed a rogue instruction sequence within the
+operand words of a harmless instruction (say LRI) and jump to
+that.
+
+We introduce a bit array to track every instr offset successfully
+validated, and test the target of BB_START against this. If the
+target offset hits, it is re-written to the same offset in the
+shadow buffer and the BB_START cmd is allowed.
+
+Note: This patch deliberately ignores checkpatch issues in the
+cmdtables, in order to match the style of the surrounding code.
+We'll correct the entire file in one go in a later patch.
+
+v2: set dispatch secure late (Mika)
+v3: rebase (Mika)
+v4: Clear whitelist on each parse
+    Minor review updates (Chris)
+v5: Correct backward jump batching
+v6: fix compilation error due to struct eb shuffle (Mika)
+
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Dave Airlie <airlied@redhat.com>
+	Cc: Takashi Iwai <tiwai@suse.de>
+	Cc: Tyler Hicks <tyhicks@canonical.com>
+	Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+	Signed-off-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+	Reviewed-by: Chris Wilson <chris.p.wilson@intel.com>
+(cherry picked from commit f8c08d8faee5567803c8c533865296ca30286bbf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gem/i915_gem_context.c
+#	drivers/gpu/drm/i915/gem/i915_gem_context_types.h
+#	drivers/gpu/drm/i915/i915_cmd_parser.c
+#	drivers/gpu/drm/i915/i915_gem_execbuffer.c
+diff --cc drivers/gpu/drm/i915/i915_cmd_parser.c
+index b9796f4fc878,365eea2b95bd..000000000000
+--- a/drivers/gpu/drm/i915/i915_cmd_parser.c
++++ b/drivers/gpu/drm/i915/i915_cmd_parser.c
+@@@ -442,6 -444,60 +442,63 @@@ static const struct drm_i915_cmd_descri
+  	CMD(  MI_LOAD_SCAN_LINES_EXCL,          SMI,   !F,  0x3F,   R  ),
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * For Gen9 we can still rely on the h/w to enforce cmd security, and only
++  * need to re-enforce the register access checks. We therefore only need to
++  * teach the cmdparser how to find the end of each command, and identify
++  * register accesses. The table doesn't need to reject any commands, and so
++  * the only commands listed here are:
++  *   1) Those that touch registers
++  *   2) Those that do not have the default 8-bit length
++  *
++  * Note that the default MI length mask chosen for this table is 0xFF, not
++  * the 0x3F used on older devices. This is because the vast majority of MI
++  * cmds on Gen9 use a standard 8-bit Length field.
++  * All the Gen9 blitter instructions are standard 0xFF length mask, and
++  * none allow access to non-general registers, so in fact no BLT cmds are
++  * included in the table at all.
++  *
++  */
++ static const struct drm_i915_cmd_descriptor gen9_blt_cmds[] = {
++ 	CMD(  MI_NOOP,                          SMI,    F,  1,      S  ),
++ 	CMD(  MI_USER_INTERRUPT,                SMI,    F,  1,      S  ),
++ 	CMD(  MI_WAIT_FOR_EVENT,                SMI,    F,  1,      S  ),
++ 	CMD(  MI_FLUSH,                         SMI,    F,  1,      S  ),
++ 	CMD(  MI_ARB_CHECK,                     SMI,    F,  1,      S  ),
++ 	CMD(  MI_REPORT_HEAD,                   SMI,    F,  1,      S  ),
++ 	CMD(  MI_ARB_ON_OFF,                    SMI,    F,  1,      S  ),
++ 	CMD(  MI_SUSPEND_FLUSH,                 SMI,    F,  1,      S  ),
++ 	CMD(  MI_LOAD_SCAN_LINES_INCL,          SMI,   !F,  0x3F,   S  ),
++ 	CMD(  MI_LOAD_SCAN_LINES_EXCL,          SMI,   !F,  0x3F,   S  ),
++ 	CMD(  MI_STORE_DWORD_IMM,               SMI,   !F,  0x3FF,  S  ),
++ 	CMD(  MI_LOAD_REGISTER_IMM(1),          SMI,   !F,  0xFF,   W,
++ 	      .reg = { .offset = 1, .mask = 0x007FFFFC, .step = 2 }    ),
++ 	CMD(  MI_UPDATE_GTT,                    SMI,   !F,  0x3FF,  S  ),
++ 	CMD(  MI_STORE_REGISTER_MEM_GEN8,       SMI,    F,  4,      W,
++ 	      .reg = { .offset = 1, .mask = 0x007FFFFC }               ),
++ 	CMD(  MI_FLUSH_DW,                      SMI,   !F,  0x3F,   S  ),
++ 	CMD(  MI_LOAD_REGISTER_MEM_GEN8,        SMI,    F,  4,      W,
++ 	      .reg = { .offset = 1, .mask = 0x007FFFFC }               ),
++ 	CMD(  MI_LOAD_REGISTER_REG,             SMI,    !F,  0xFF,  W,
++ 	      .reg = { .offset = 1, .mask = 0x007FFFFC, .step = 1 }    ),
++ 
++ 	/*
++ 	 * We allow BB_START but apply further checks. We just sanitize the
++ 	 * basic fields here.
++ 	 */
++ #define MI_BB_START_OPERAND_MASK   GENMASK(SMI-1, 0)
++ #define MI_BB_START_OPERAND_EXPECT (MI_BATCH_PPGTT_HSW | 1)
++ 	CMD(  MI_BATCH_BUFFER_START_GEN8,       SMI,    !F,  0xFF,  B,
++ 	      .bits = {{
++ 			.offset = 0,
++ 			.mask = MI_BB_START_OPERAND_MASK,
++ 			.expected = MI_BB_START_OPERAND_EXPECT,
++ 	      }},						       ),
++ };
++ 
+++>>>>>>> f8c08d8faee5 (drm/i915/cmdparser: Add support for backward jumps)
+  static const struct drm_i915_cmd_descriptor noop_desc =
+  	CMD(MI_NOOP, SMI, F, 1, S);
+  
+@@@ -1253,16 -1466,6 +1414,19 @@@ int intel_engine_cmd_parser(struct i915
+  			goto err;
+  		}
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * If the batch buffer contains a chained batch, return an
+ +		 * error that tells the caller to abort and dispatch the
+ +		 * workload as a non-secure batch.
+ +		 */
+ +		if (desc->cmd.value == MI_BATCH_BUFFER_START) {
+ +			ret = -EACCES;
+ +			goto err;
+ +		}
+ +
+++=======
+++>>>>>>> f8c08d8faee5 (drm/i915/cmdparser: Add support for backward jumps)
+  		if (desc->flags & CMD_DESC_FIXED)
+  			length = desc->length.fixed;
+  		else
+diff --cc drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 21a06982621e,e635e1e5f4d3..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@@ -1977,42 -1957,99 +1977,123 @@@ static int i915_reset_gen7_sol_offsets(
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:drivers/gpu/drm/i915/i915_gem_execbuffer.c
+++=======
++ static struct i915_vma *
++ shadow_batch_pin(struct i915_execbuffer *eb, struct drm_i915_gem_object *obj)
++ {
++ 	struct drm_i915_private *dev_priv = eb->i915;
++ 	struct i915_vma * const vma = *eb->vma;
++ 	struct i915_address_space *vm;
++ 	u64 flags;
++ 
++ 	/*
++ 	 * PPGTT backed shadow buffers must be mapped RO, to prevent
++ 	 * post-scan tampering
++ 	 */
++ 	if (CMDPARSER_USES_GGTT(dev_priv)) {
++ 		flags = PIN_GLOBAL;
++ 		vm = &dev_priv->ggtt.vm;
++ 	} else if (vma->vm->has_read_only) {
++ 		flags = PIN_USER;
++ 		vm = vma->vm;
++ 		i915_gem_object_set_readonly(obj);
++ 	} else {
++ 		DRM_DEBUG("Cannot prevent post-scan tampering without RO capable vm\n");
++ 		return ERR_PTR(-EINVAL);
++ 	}
++ 
++ 	return i915_gem_object_pin(obj, vm, NULL, 0, 0, flags);
++ }
++ 
+++>>>>>>> f8c08d8faee5 (drm/i915/cmdparser: Add support for backward jumps):drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+  static struct i915_vma *eb_parse(struct i915_execbuffer *eb)
+  {
+ -	struct intel_engine_pool_node *pool;
+ +	struct drm_i915_gem_object *shadow_batch_obj;
+  	struct i915_vma *vma;
++ 	u64 batch_start;
++ 	u64 shadow_batch_start;
+  	int err;
+  
+ -	pool = intel_engine_pool_get(&eb->engine->pool, eb->batch_len);
+ -	if (IS_ERR(pool))
+ -		return ERR_CAST(pool);
+ +	shadow_batch_obj = i915_gem_batch_pool_get(&eb->engine->batch_pool,
+ +						   PAGE_ALIGN(eb->batch_len));
+ +	if (IS_ERR(shadow_batch_obj))
+ +		return ERR_CAST(shadow_batch_obj);
+  
+- 	err = intel_engine_cmd_parser(eb->engine,
++ 	vma = shadow_batch_pin(eb, pool->obj);
++ 	if (IS_ERR(vma))
++ 		goto err;
++ 
++ 	batch_start = gen8_canonical_addr(eb->batch->node.start) +
++ 		      eb->batch_start_offset;
++ 
++ 	shadow_batch_start = gen8_canonical_addr(vma->node.start);
++ 
++ 	err = intel_engine_cmd_parser(eb->gem_context,
++ 				      eb->engine,
+  				      eb->batch->obj,
+++<<<<<<< HEAD:drivers/gpu/drm/i915/i915_gem_execbuffer.c
+ +				      shadow_batch_obj,
+++=======
++ 				      batch_start,
+++>>>>>>> f8c08d8faee5 (drm/i915/cmdparser: Add support for backward jumps):drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+  				      eb->batch_start_offset,
+- 				      eb->batch_len);
++ 				      eb->batch_len,
++ 				      pool->obj,
++ 				      shadow_batch_start);
++ 
+  	if (err) {
+++<<<<<<< HEAD:drivers/gpu/drm/i915/i915_gem_execbuffer.c
+ +		if (err == -EACCES) /* unhandled chained batch */
+++=======
++ 		i915_vma_unpin(vma);
++ 
++ 		/*
++ 		 * Unsafe GGTT-backed buffers can still be submitted safely
++ 		 * as non-secure.
++ 		 * For PPGTT backing however, we have no choice but to forcibly
++ 		 * reject unsafe buffers
++ 		 */
++ 		if (CMDPARSER_USES_GGTT(eb->i915) && (err == -EACCES))
++ 			/* Execute original buffer non-secure */
+++>>>>>>> f8c08d8faee5 (drm/i915/cmdparser: Add support for backward jumps):drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+  			vma = NULL;
+  		else
+  			vma = ERR_PTR(err);
+ -		goto err;
+ +		goto out;
+  	}
+  
+++<<<<<<< HEAD:drivers/gpu/drm/i915/i915_gem_execbuffer.c
+ +	vma = i915_gem_object_ggtt_pin(shadow_batch_obj, NULL, 0, 0, 0);
+ +	if (IS_ERR(vma))
+ +		goto out;
+ +
+++=======
+++>>>>>>> f8c08d8faee5 (drm/i915/cmdparser: Add support for backward jumps):drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+  	eb->vma[eb->buffer_count] = i915_vma_get(vma);
+  	eb->flags[eb->buffer_count] =
+  		__EXEC_OBJECT_HAS_PIN | __EXEC_OBJECT_HAS_REF;
+  	vma->exec_flags = &eb->flags[eb->buffer_count];
+  	eb->buffer_count++;
+  
+++<<<<<<< HEAD:drivers/gpu/drm/i915/i915_gem_execbuffer.c
+ +out:
+ +	i915_gem_object_unpin_pages(shadow_batch_obj);
+++=======
++ 	eb->batch_start_offset = 0;
++ 	eb->batch = vma;
++ 
++ 	if (CMDPARSER_USES_GGTT(eb->i915))
++ 		eb->batch_flags |= I915_DISPATCH_SECURE;
++ 
++ 	/* eb->batch_len unchanged */
++ 
++ 	vma->private = pool;
++ 	return vma;
++ 
++ err:
++ 	intel_engine_pool_put(pool);
+++>>>>>>> f8c08d8faee5 (drm/i915/cmdparser: Add support for backward jumps):drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+  	return vma;
+  }
+  
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_context.c
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_context_types.h
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_context.c
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_context_types.h
+* Unmerged path drivers/gpu/drm/i915/i915_cmd_parser.c
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 2a3ce817328c..34df3bc986ac 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3261,11 +3261,14 @@ const char *i915_cache_level_str(struct drm_i915_private *i915, int type);
+ int i915_cmd_parser_get_version(struct drm_i915_private *dev_priv);
+ void intel_engine_init_cmd_parser(struct intel_engine_cs *engine);
+ void intel_engine_cleanup_cmd_parser(struct intel_engine_cs *engine);
+-int intel_engine_cmd_parser(struct intel_engine_cs *engine,
++int intel_engine_cmd_parser(struct i915_gem_context *cxt,
++			    struct intel_engine_cs *engine,
+ 			    struct drm_i915_gem_object *batch_obj,
+-			    struct drm_i915_gem_object *shadow_batch_obj,
++			    u64 user_batch_start,
+ 			    u32 batch_start_offset,
+-			    u32 batch_len);
++			    u32 batch_len,
++			    struct drm_i915_gem_object *shadow_batch_obj,
++			    u64 shadow_batch_start);
+ 
+ /* i915_perf.c */
+ extern void i915_perf_init(struct drm_i915_private *dev_priv);
+* Unmerged path drivers/gpu/drm/i915/i915_gem_execbuffer.c
