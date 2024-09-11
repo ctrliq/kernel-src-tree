@@ -13,6 +13,7 @@
 #include <linux/pm_clock.h>
 #include <linux/clk.h>
 #include <linux/clkdev.h>
+#include <linux/of_clk.h>
 #include <linux/slab.h>
 #include <linux/err.h>
 #include <linux/pm_domain.h>
@@ -196,8 +197,7 @@ int of_pm_clk_add_clks(struct device *dev)
 	if (!dev || !dev->of_node)
 		return -EINVAL;
 
-	count = of_count_phandle_with_args(dev->of_node, "clocks",
-					   "#clock-cells");
+	count = of_clk_get_parent_count(dev->of_node);
 	if (count <= 0)
 		return -ENODEV;
 
