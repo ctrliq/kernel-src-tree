@@ -1,0 +1,199 @@
+kexec: Allow kexec_file() with appropriate IMA policy when locked down
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Matthew Garrett <matthewgarrett@google.com>
+commit 29d3c1c8dfe752c01b7115ecd5a3142b232a38e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/29d3c1c8.failed
+
+Systems in lockdown mode should block the kexec of untrusted kernels.
+For x86 and ARM we can ensure that a kernel is trustworthy by validating
+a PE signature, but this isn't possible on other architectures. On those
+platforms we can use IMA digital signatures instead. Add a function to
+determine whether IMA has or will verify signatures for a given event type,
+and if so permit kexec_file() even if the kernel is otherwise locked down.
+This is restricted to cases where CONFIG_INTEGRITY_TRUSTED_KEYRING is set
+in order to prevent an attacker from loading additional keys at runtime.
+
+	Signed-off-by: Matthew Garrett <mjg59@google.com>
+	Acked-by: Mimi Zohar <zohar@linux.ibm.com>
+	Cc: Dmitry Kasatkin <dmitry.kasatkin@gmail.com>
+	Cc: linux-integrity@vger.kernel.org
+	Signed-off-by: James Morris <jmorris@namei.org>
+(cherry picked from commit 29d3c1c8dfe752c01b7115ecd5a3142b232a38e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/kexec_file.c
+diff --cc kernel/kexec_file.c
+index ab516b3959b2,7f4a618fc8c1..000000000000
+--- a/kernel/kexec_file.c
++++ b/kernel/kexec_file.c
+@@@ -179,6 -177,59 +179,62 @@@ void kimage_file_post_load_cleanup(stru
+  	image->image_loader_data = NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KEXEC_SIG
++ static int
++ kimage_validate_signature(struct kimage *image)
++ {
++ 	const char *reason;
++ 	int ret;
++ 
++ 	ret = arch_kexec_kernel_verify_sig(image, image->kernel_buf,
++ 					   image->kernel_buf_len);
++ 	switch (ret) {
++ 	case 0:
++ 		break;
++ 
++ 		/* Certain verification errors are non-fatal if we're not
++ 		 * checking errors, provided we aren't mandating that there
++ 		 * must be a valid signature.
++ 		 */
++ 	case -ENODATA:
++ 		reason = "kexec of unsigned image";
++ 		goto decide;
++ 	case -ENOPKG:
++ 		reason = "kexec of image with unsupported crypto";
++ 		goto decide;
++ 	case -ENOKEY:
++ 		reason = "kexec of image with unavailable key";
++ 	decide:
++ 		if (IS_ENABLED(CONFIG_KEXEC_SIG_FORCE)) {
++ 			pr_notice("%s rejected\n", reason);
++ 			return ret;
++ 		}
++ 
++ 		/* If IMA is guaranteed to appraise a signature on the kexec
++ 		 * image, permit it even if the kernel is otherwise locked
++ 		 * down.
++ 		 */
++ 		if (!ima_appraise_signature(READING_KEXEC_IMAGE) &&
++ 		    security_locked_down(LOCKDOWN_KEXEC))
++ 			return -EPERM;
++ 
++ 		return 0;
++ 
++ 		/* All other errors are fatal, including nomem, unparseable
++ 		 * signatures and signature check failures - even if signatures
++ 		 * aren't required.
++ 		 */
++ 	default:
++ 		pr_notice("kernel signature verification failed (%d).\n", ret);
++ 	}
++ 
++ 	return ret;
++ }
++ #endif
++ 
+++>>>>>>> 29d3c1c8dfe7 (kexec: Allow kexec_file() with appropriate IMA policy when locked down)
+  /*
+   * In file mode list of segments is prepared by kernel. Copy relevant
+   * data from user space, do error checking, prepare segment list
+diff --git a/include/linux/ima.h b/include/linux/ima.h
+index c7e90742b6e5..d9c6c8baa725 100644
+--- a/include/linux/ima.h
++++ b/include/linux/ima.h
+@@ -129,4 +129,13 @@ static inline int ima_inode_removexattr(struct dentry *dentry,
+ 	return 0;
+ }
+ #endif /* CONFIG_IMA_APPRAISE */
++
++#if defined(CONFIG_IMA_APPRAISE) && defined(CONFIG_INTEGRITY_TRUSTED_KEYRING)
++extern bool ima_appraise_signature(enum kernel_read_file_id func);
++#else
++static inline bool ima_appraise_signature(enum kernel_read_file_id func)
++{
++	return false;
++}
++#endif /* CONFIG_IMA_APPRAISE && CONFIG_INTEGRITY_TRUSTED_KEYRING */
+ #endif /* _LINUX_IMA_H */
+* Unmerged path kernel/kexec_file.c
+diff --git a/security/integrity/ima/ima.h b/security/integrity/ima/ima.h
+index eaf37a5d1609..6a9960aa4477 100644
+--- a/security/integrity/ima/ima.h
++++ b/security/integrity/ima/ima.h
+@@ -117,6 +117,8 @@ struct ima_kexec_hdr {
+ 	u64 count;
+ };
+ 
++extern const int read_idmap[];
++
+ #ifdef CONFIG_HAVE_IMA_KEXEC
+ void ima_load_kexec_buffer(void);
+ #else
+diff --git a/security/integrity/ima/ima_main.c b/security/integrity/ima/ima_main.c
+index 9d4eae6363a4..9bf713b0147b 100644
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@ -471,7 +471,7 @@ int ima_read_file(struct file *file, enum kernel_read_file_id read_id)
+ 	return 0;
+ }
+ 
+-static const int read_idmap[READING_MAX_ID] = {
++const int read_idmap[READING_MAX_ID] = {
+ 	[READING_FIRMWARE] = FIRMWARE_CHECK,
+ 	[READING_FIRMWARE_PREALLOC_BUFFER] = FIRMWARE_CHECK,
+ 	[READING_MODULE] = MODULE_CHECK,
+diff --git a/security/integrity/ima/ima_policy.c b/security/integrity/ima/ima_policy.c
+index 8cc4eb7a0a21..9fa9baeae9f7 100644
+--- a/security/integrity/ima/ima_policy.c
++++ b/security/integrity/ima/ima_policy.c
+@@ -1392,3 +1392,53 @@ int ima_policy_show(struct seq_file *m, void *v)
+ 	return 0;
+ }
+ #endif	/* CONFIG_IMA_READ_POLICY */
++
++#if defined(CONFIG_IMA_APPRAISE) && defined(CONFIG_INTEGRITY_TRUSTED_KEYRING)
++/*
++ * ima_appraise_signature: whether IMA will appraise a given function using
++ * an IMA digital signature. This is restricted to cases where the kernel
++ * has a set of built-in trusted keys in order to avoid an attacker simply
++ * loading additional keys.
++ */
++bool ima_appraise_signature(enum kernel_read_file_id id)
++{
++	struct ima_rule_entry *entry;
++	bool found = false;
++	enum ima_hooks func;
++
++	if (id >= READING_MAX_ID)
++		return false;
++
++	func = read_idmap[id] ?: FILE_CHECK;
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(entry, ima_rules, list) {
++		if (entry->action != APPRAISE)
++			continue;
++
++		/*
++		 * A generic entry will match, but otherwise require that it
++		 * match the func we're looking for
++		 */
++		if (entry->func && entry->func != func)
++			continue;
++
++		/*
++		 * We require this to be a digital signature, not a raw IMA
++		 * hash.
++		 */
++		if (entry->flags & IMA_DIGSIG_REQUIRED)
++			found = true;
++
++		/*
++		 * We've found a rule that matches, so break now even if it
++		 * didn't require a digital signature - a later rule that does
++		 * won't override it, so would be a false positive.
++		 */
++		break;
++	}
++
++	rcu_read_unlock();
++	return found;
++}
++#endif /* CONFIG_IMA_APPRAISE && CONFIG_INTEGRITY_TRUSTED_KEYRING */
