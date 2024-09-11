@@ -531,7 +531,7 @@ struct sys64_hook {
 	void (*handler)(unsigned int esr, struct pt_regs *regs);
 };
 
-static struct sys64_hook sys64_hooks[] = {
+static const struct sys64_hook sys64_hooks[] = {
 	{
 		.esr_mask = ESR_ELx_SYS64_ISS_EL0_CACHE_OP_MASK,
 		.esr_val = ESR_ELx_SYS64_ISS_EL0_CACHE_OP_VAL,
@@ -656,7 +656,7 @@ static void compat_cntfrq_read_handler(unsigned int esr, struct pt_regs *regs)
 	arm64_compat_skip_faulting_instruction(regs, 4);
 }
 
-static struct sys64_hook cp15_32_hooks[] = {
+static const struct sys64_hook cp15_32_hooks[] = {
 	{
 		.esr_mask = ESR_ELx_CP15_32_ISS_SYS_MASK,
 		.esr_val = ESR_ELx_CP15_32_ISS_SYS_CNTFRQ,
@@ -676,7 +676,7 @@ static void compat_cntvct_read_handler(unsigned int esr, struct pt_regs *regs)
 	arm64_compat_skip_faulting_instruction(regs, 4);
 }
 
-static struct sys64_hook cp15_64_hooks[] = {
+static const struct sys64_hook cp15_64_hooks[] = {
 	{
 		.esr_mask = ESR_ELx_CP15_64_ISS_SYS_MASK,
 		.esr_val = ESR_ELx_CP15_64_ISS_SYS_CNTVCT,
@@ -687,7 +687,7 @@ static struct sys64_hook cp15_64_hooks[] = {
 
 asmlinkage void __exception do_cp15instr(unsigned int esr, struct pt_regs *regs)
 {
-	struct sys64_hook *hook, *hook_base;
+	const struct sys64_hook *hook, *hook_base;
 
 	if (!cp15_cond_valid(esr, regs)) {
 		/*
@@ -727,7 +727,7 @@ asmlinkage void __exception do_cp15instr(unsigned int esr, struct pt_regs *regs)
 
 asmlinkage void __exception do_sysinstr(unsigned int esr, struct pt_regs *regs)
 {
-	struct sys64_hook *hook;
+	const struct sys64_hook *hook;
 
 	for (hook = sys64_hooks; hook->handler; hook++)
 		if ((hook->esr_mask & esr) == hook->esr_val) {
