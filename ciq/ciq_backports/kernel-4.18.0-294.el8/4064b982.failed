@@ -1,0 +1,689 @@
+mm: allow VM_FAULT_RETRY for multiple times
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Peter Xu <peterx@redhat.com>
+commit 4064b982706375025628094e51d11cf1a958a5d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4064b982.failed
+
+The idea comes from a discussion between Linus and Andrea [1].
+
+Before this patch we only allow a page fault to retry once.  We achieved
+this by clearing the FAULT_FLAG_ALLOW_RETRY flag when doing
+handle_mm_fault() the second time.  This was majorly used to avoid
+unexpected starvation of the system by looping over forever to handle the
+page fault on a single page.  However that should hardly happen, and after
+all for each code path to return a VM_FAULT_RETRY we'll first wait for a
+condition (during which time we should possibly yield the cpu) to happen
+before VM_FAULT_RETRY is really returned.
+
+This patch removes the restriction by keeping the FAULT_FLAG_ALLOW_RETRY
+flag when we receive VM_FAULT_RETRY.  It means that the page fault handler
+now can retry the page fault for multiple times if necessary without the
+need to generate another page fault event.  Meanwhile we still keep the
+FAULT_FLAG_TRIED flag so page fault handler can still identify whether a
+page fault is the first attempt or not.
+
+Then we'll have these combinations of fault flags (only considering
+ALLOW_RETRY flag and TRIED flag):
+
+  - ALLOW_RETRY and !TRIED:  this means the page fault allows to
+                             retry, and this is the first try
+
+  - ALLOW_RETRY and TRIED:   this means the page fault allows to
+                             retry, and this is not the first try
+
+  - !ALLOW_RETRY and !TRIED: this means the page fault does not allow
+                             to retry at all
+
+  - !ALLOW_RETRY and TRIED:  this is forbidden and should never be used
+
+In existing code we have multiple places that has taken special care of
+the first condition above by checking against (fault_flags &
+FAULT_FLAG_ALLOW_RETRY).  This patch introduces a simple helper to detect
+the first retry of a page fault by checking against both (fault_flags &
+FAULT_FLAG_ALLOW_RETRY) and !(fault_flag & FAULT_FLAG_TRIED) because now
+even the 2nd try will have the ALLOW_RETRY set, then use that helper in
+all existing special paths.  One example is in __lock_page_or_retry(), now
+we'll drop the mmap_sem only in the first attempt of page fault and we'll
+keep it in follow up retries, so old locking behavior will be retained.
+
+This will be a nice enhancement for current code [2] at the same time a
+supporting material for the future userfaultfd-writeprotect work, since in
+that work there will always be an explicit userfault writeprotect retry
+for protected pages, and if that cannot resolve the page fault (e.g., when
+userfaultfd-writeprotect is used in conjunction with swapped pages) then
+we'll possibly need a 3rd retry of the page fault.  It might also benefit
+other potential users who will have similar requirement like userfault
+write-protection.
+
+GUP code is not touched yet and will be covered in follow up patch.
+
+Please read the thread below for more information.
+
+[1] https://lore.kernel.org/lkml/20171102193644.GB22686@redhat.com/
+[2] https://lore.kernel.org/lkml/20181230154648.GB9832@redhat.com/
+
+	Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Suggested-by: Andrea Arcangeli <aarcange@redhat.com>
+	Signed-off-by: Peter Xu <peterx@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Tested-by: Brian Geffon <bgeffon@google.com>
+	Cc: Bobby Powers <bobbypowers@gmail.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Denis Plotnikov <dplotnikov@virtuozzo.com>
+	Cc: "Dr . David Alan Gilbert" <dgilbert@redhat.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Jerome Glisse <jglisse@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: "Kirill A . Shutemov" <kirill@shutemov.name>
+	Cc: Martin Cracauer <cracauer@cons.org>
+	Cc: Marty McFadden <mcfadden8@llnl.gov>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Maya Gokhale <gokhale2@llnl.gov>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Mike Rapoport <rppt@linux.vnet.ibm.com>
+	Cc: Pavel Emelyanov <xemul@openvz.org>
+Link: http://lkml.kernel.org/r/20200220160246.9790-1-peterx@redhat.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4064b982706375025628094e51d11cf1a958a5d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arc/mm/fault.c
+#	arch/x86/mm/fault.c
+#	include/linux/mm.h
+#	mm/internal.h
+diff --cc arch/arc/mm/fault.c
+index db6913094be3,92b339c7adba..000000000000
+--- a/arch/arc/mm/fault.c
++++ b/arch/arc/mm/fault.c
+@@@ -107,50 -111,51 +107,69 @@@ retry
+  	vma = find_vma(mm, address);
+  	if (!vma)
+  		goto bad_area;
+ -	if (unlikely(address < vma->vm_start)) {
+ -		if (!(vma->vm_flags & VM_GROWSDOWN) || expand_stack(vma, address))
+ -			goto bad_area;
+ -	}
+ +	if (vma->vm_start <= address)
+ +		goto good_area;
+ +	if (!(vma->vm_flags & VM_GROWSDOWN))
+ +		goto bad_area;
+ +	if (expand_stack(vma, address))
+ +		goto bad_area;
+  
+  	/*
+ -	 * vm_area is good, now check permissions for this memory access
+ +	 * Ok, we have a good vm_area for this memory access, so
+ +	 * we can handle it..
+  	 */
+ -	mask = VM_READ;
+ -	if (write)
+ -		mask = VM_WRITE;
+ -	if (exec)
+ -		mask = VM_EXEC;
+ -
+ -	if (!(vma->vm_flags & mask)) {
+ -		si_code = SEGV_ACCERR;
+ +good_area:
+ +	info.si_code = SEGV_ACCERR;
+ +
+ +	/* Handle protection violation, execute on heap or stack */
+ +
+ +	if ((regs->ecr_vec == ECR_V_PROTV) &&
+ +	    (regs->ecr_cause == ECR_C_PROTV_INST_FETCH))
+  		goto bad_area;
+ +
+ +	if (write) {
+ +		if (!(vma->vm_flags & VM_WRITE))
+ +			goto bad_area;
+ +		flags |= FAULT_FLAG_WRITE;
+ +	} else {
+ +		if (!(vma->vm_flags & (VM_READ | VM_EXEC)))
+ +			goto bad_area;
+  	}
+  
+ +	/*
+ +	 * If for any reason at all we couldn't handle the fault,
+ +	 * make sure we exit gracefully rather than endlessly redo
+ +	 * the fault.
+ +	 */
+  	fault = handle_mm_fault(vma, address, flags);
+  
+ -	/* Quick path to respond to signals */
+ -	if (fault_signal_pending(fault, regs)) {
+ -		if (!user_mode(regs))
+ -			goto no_context;
+ -		return;
+ +	/* If Pagefault was interrupted by SIGKILL, exit page fault "early" */
+ +	if (unlikely(fatal_signal_pending(current))) {
+ +		if ((fault & VM_FAULT_ERROR) && !(fault & VM_FAULT_RETRY))
+ +			up_read(&mm->mmap_sem);
+ +		if (user_mode(regs))
+ +			return;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Fault retry nuances, mmap_sem already relinquished by core mm
++ 	 */
++ 	if (unlikely((fault & VM_FAULT_RETRY) &&
++ 		     (flags & FAULT_FLAG_ALLOW_RETRY))) {
++ 		flags |= FAULT_FLAG_TRIED;
++ 		goto retry;
++ 	}
++ 
++ bad_area:
++ 	up_read(&mm->mmap_sem);
++ 
++ 	/*
++ 	 * Major/minor page fault accounting
++ 	 * (in case of retry we only land here once)
++ 	 */
+++>>>>>>> 4064b9827063 (mm: allow VM_FAULT_RETRY for multiple times)
+  	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, address);
+  
+  	if (likely(!(fault & VM_FAULT_ERROR))) {
+diff --cc arch/x86/mm/fault.c
+index 387b6dbf768c,859519f5b342..000000000000
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@@ -1397,22 -1477,10 +1397,29 @@@ good_area
+  	 * and if there is a fatal signal pending there is no guarantee
+  	 * that we made any progress. Handle this case first.
+  	 */
+++<<<<<<< HEAD
+ +	if (unlikely(fault & VM_FAULT_RETRY)) {
+ +		/* Retry at most once */
+ +		if (flags & FAULT_FLAG_ALLOW_RETRY) {
+ +			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ +			flags |= FAULT_FLAG_TRIED;
+ +			if (!fatal_signal_pending(tsk))
+ +				goto retry;
+ +		}
+ +
+ +		/* User mode? Just return to handle the fatal exception */
+ +		if (flags & FAULT_FLAG_USER)
+ +			return;
+ +
+ +		/* Not returning to user mode? Handle exceptions or die: */
+ +		no_context(regs, sw_error_code, address, SIGBUS, BUS_ADRERR);
+ +		return;
+++=======
++ 	if (unlikely((fault & VM_FAULT_RETRY) &&
++ 		     (flags & FAULT_FLAG_ALLOW_RETRY))) {
++ 		flags |= FAULT_FLAG_TRIED;
++ 		goto retry;
+++>>>>>>> 4064b9827063 (mm: allow VM_FAULT_RETRY for multiple times)
+  	}
+  
+  	up_read(&mm->mmap_sem);
+diff --cc include/linux/mm.h
+index ef77bd76b21c,e8e1afab713f..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -324,15 -381,75 +324,87 @@@ extern unsigned int kobjsize(const voi
+   */
+  extern pgprot_t protection_map[16];
+  
+++<<<<<<< HEAD
+ +#define FAULT_FLAG_WRITE	0x01	/* Fault was a write access */
+ +#define FAULT_FLAG_MKWRITE	0x02	/* Fault was mkwrite of existing pte */
+ +#define FAULT_FLAG_ALLOW_RETRY	0x04	/* Retry fault if blocking */
+ +#define FAULT_FLAG_RETRY_NOWAIT	0x08	/* Don't drop mmap_sem and wait when retrying */
+ +#define FAULT_FLAG_KILLABLE	0x10	/* The fault task is in SIGKILL killable region */
+ +#define FAULT_FLAG_TRIED	0x20	/* Second try */
+ +#define FAULT_FLAG_USER		0x40	/* The fault originated in userspace */
+ +#define FAULT_FLAG_REMOTE	0x80	/* faulting for non current tsk/mm */
+ +#define FAULT_FLAG_INSTRUCTION  0x100	/* The fault was during an instruction fetch */
+++=======
++ /**
++  * Fault flag definitions.
++  *
++  * @FAULT_FLAG_WRITE: Fault was a write fault.
++  * @FAULT_FLAG_MKWRITE: Fault was mkwrite of existing PTE.
++  * @FAULT_FLAG_ALLOW_RETRY: Allow to retry the fault if blocked.
++  * @FAULT_FLAG_RETRY_NOWAIT: Don't drop mmap_sem and wait when retrying.
++  * @FAULT_FLAG_KILLABLE: The fault task is in SIGKILL killable region.
++  * @FAULT_FLAG_TRIED: The fault has been tried once.
++  * @FAULT_FLAG_USER: The fault originated in userspace.
++  * @FAULT_FLAG_REMOTE: The fault is not for current task/mm.
++  * @FAULT_FLAG_INSTRUCTION: The fault was during an instruction fetch.
++  * @FAULT_FLAG_INTERRUPTIBLE: The fault can be interrupted by non-fatal signals.
++  *
++  * About @FAULT_FLAG_ALLOW_RETRY and @FAULT_FLAG_TRIED: we can specify
++  * whether we would allow page faults to retry by specifying these two
++  * fault flags correctly.  Currently there can be three legal combinations:
++  *
++  * (a) ALLOW_RETRY and !TRIED:  this means the page fault allows retry, and
++  *                              this is the first try
++  *
++  * (b) ALLOW_RETRY and TRIED:   this means the page fault allows retry, and
++  *                              we've already tried at least once
++  *
++  * (c) !ALLOW_RETRY and !TRIED: this means the page fault does not allow retry
++  *
++  * The unlisted combination (!ALLOW_RETRY && TRIED) is illegal and should never
++  * be used.  Note that page faults can be allowed to retry for multiple times,
++  * in which case we'll have an initial fault with flags (a) then later on
++  * continuous faults with flags (b).  We should always try to detect pending
++  * signals before a retry to make sure the continuous page faults can still be
++  * interrupted if necessary.
++  */
++ #define FAULT_FLAG_WRITE			0x01
++ #define FAULT_FLAG_MKWRITE			0x02
++ #define FAULT_FLAG_ALLOW_RETRY			0x04
++ #define FAULT_FLAG_RETRY_NOWAIT			0x08
++ #define FAULT_FLAG_KILLABLE			0x10
++ #define FAULT_FLAG_TRIED			0x20
++ #define FAULT_FLAG_USER				0x40
++ #define FAULT_FLAG_REMOTE			0x80
++ #define FAULT_FLAG_INSTRUCTION  		0x100
++ #define FAULT_FLAG_INTERRUPTIBLE		0x200
++ 
++ /*
++  * The default fault flags that should be used by most of the
++  * arch-specific page fault handlers.
++  */
++ #define FAULT_FLAG_DEFAULT  (FAULT_FLAG_ALLOW_RETRY | \
++ 			     FAULT_FLAG_KILLABLE | \
++ 			     FAULT_FLAG_INTERRUPTIBLE)
+++>>>>>>> 4064b9827063 (mm: allow VM_FAULT_RETRY for multiple times)
++ 
++ /**
++  * fault_flag_allow_retry_first - check ALLOW_RETRY the first time
++  *
++  * This is mostly used for places where we want to try to avoid taking
++  * the mmap_sem for too long a time when waiting for another condition
++  * to change, in which case we can try to be polite to release the
++  * mmap_sem in the first round to avoid potential starvation of other
++  * processes that would also want the mmap_sem.
++  *
++  * Return: true if the page fault allows retry and this is the first
++  * attempt of the fault handling; false otherwise.
++  */
++ static inline bool fault_flag_allow_retry_first(unsigned int flags)
++ {
++ 	return (flags & FAULT_FLAG_ALLOW_RETRY) &&
++ 	    (!(flags & FAULT_FLAG_TRIED));
++ }
+  
+  #define FAULT_FLAG_TRACE \
+  	{ FAULT_FLAG_WRITE,		"WRITE" }, \
+diff --cc mm/internal.h
+index 344bbc72ed9a,9fb2b8c7928f..000000000000
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@@ -355,6 -389,27 +355,30 @@@ vma_address(struct page *page, struct v
+  	return max(start, vma->vm_start);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct file *maybe_unlock_mmap_for_io(struct vm_fault *vmf,
++ 						    struct file *fpin)
++ {
++ 	int flags = vmf->flags;
++ 
++ 	if (fpin)
++ 		return fpin;
++ 
++ 	/*
++ 	 * FAULT_FLAG_RETRY_NOWAIT means we don't want to wait on page locks or
++ 	 * anything, so we only pin the file and drop the mmap_sem if only
++ 	 * FAULT_FLAG_ALLOW_RETRY is set, while this is the first attempt.
++ 	 */
++ 	if (fault_flag_allow_retry_first(flags) &&
++ 	    !(flags & FAULT_FLAG_RETRY_NOWAIT)) {
++ 		fpin = get_file(vmf->vma->vm_file);
++ 		up_read(&vmf->vma->vm_mm->mmap_sem);
++ 	}
++ 	return fpin;
++ }
++ 
+++>>>>>>> 4064b9827063 (mm: allow VM_FAULT_RETRY for multiple times)
+  #else /* !CONFIG_MMU */
+  static inline void clear_page_mlock(struct page *page) { }
+  static inline void mlock_vma_page(struct page *page) { }
+diff --git a/arch/alpha/mm/fault.c b/arch/alpha/mm/fault.c
+index ec3c7890fb5d..452e7b0254c5 100644
+--- a/arch/alpha/mm/fault.c
++++ b/arch/alpha/mm/fault.c
+@@ -169,7 +169,7 @@ do_page_fault(unsigned long address, unsigned long mmcsr,
+ 		else
+ 			current->min_flt++;
+ 		if (fault & VM_FAULT_RETRY) {
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
++			flags |= FAULT_FLAG_TRIED;
+ 
+ 			 /* No need to up_read(&mm->mmap_sem) as we would
+ 			 * have already released it in __lock_page_or_retry
+* Unmerged path arch/arc/mm/fault.c
+diff --git a/arch/arm/mm/fault.c b/arch/arm/mm/fault.c
+index e1e1d5d20735..565bc4c057a2 100644
+--- a/arch/arm/mm/fault.c
++++ b/arch/arm/mm/fault.c
+@@ -336,9 +336,6 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 					regs, addr);
+ 		}
+ 		if (fault & VM_FAULT_RETRY) {
+-			/* Clear FAULT_FLAG_ALLOW_RETRY to avoid any risk
+-			* of starvation. */
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			flags |= FAULT_FLAG_TRIED;
+ 			goto retry;
+ 		}
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index a37c2199f0aa..1fd43525b920 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -505,12 +505,7 @@ static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
+ 	}
+ 
+ 	if (fault & VM_FAULT_RETRY) {
+-		/*
+-		 * Clear FAULT_FLAG_ALLOW_RETRY to avoid any risk of
+-		 * starvation.
+-		 */
+ 		if (mm_flags & FAULT_FLAG_ALLOW_RETRY) {
+-			mm_flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			mm_flags |= FAULT_FLAG_TRIED;
+ 			goto retry;
+ 		}
+diff --git a/arch/hexagon/mm/vm_fault.c b/arch/hexagon/mm/vm_fault.c
+index fcf0fe73f36e..c0669f79d2ba 100644
+--- a/arch/hexagon/mm/vm_fault.c
++++ b/arch/hexagon/mm/vm_fault.c
+@@ -115,7 +115,6 @@ void do_page_fault(unsigned long address, long cause, struct pt_regs *regs)
+ 			else
+ 				current->min_flt++;
+ 			if (fault & VM_FAULT_RETRY) {
+-				flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 				flags |= FAULT_FLAG_TRIED;
+ 				goto retry;
+ 			}
+diff --git a/arch/ia64/mm/fault.c b/arch/ia64/mm/fault.c
+index ac19ad14da8f..314159287fb7 100644
+--- a/arch/ia64/mm/fault.c
++++ b/arch/ia64/mm/fault.c
+@@ -189,7 +189,6 @@ ia64_do_page_fault (unsigned long address, unsigned long isr, struct pt_regs *re
+ 		else
+ 			current->min_flt++;
+ 		if (fault & VM_FAULT_RETRY) {
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			flags |= FAULT_FLAG_TRIED;
+ 
+ 			 /* No need to up_read(&mm->mmap_sem) as we would
+diff --git a/arch/m68k/mm/fault.c b/arch/m68k/mm/fault.c
+index 126051833241..4737ea14fbf6 100644
+--- a/arch/m68k/mm/fault.c
++++ b/arch/m68k/mm/fault.c
+@@ -162,9 +162,6 @@ int do_page_fault(struct pt_regs *regs, unsigned long address,
+ 		else
+ 			current->min_flt++;
+ 		if (fault & VM_FAULT_RETRY) {
+-			/* Clear FAULT_FLAG_ALLOW_RETRY to avoid any risk
+-			 * of starvation. */
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			flags |= FAULT_FLAG_TRIED;
+ 
+ 			/*
+diff --git a/arch/microblaze/mm/fault.c b/arch/microblaze/mm/fault.c
+index b88d87e5d6ca..d53cec49829b 100644
+--- a/arch/microblaze/mm/fault.c
++++ b/arch/microblaze/mm/fault.c
+@@ -236,7 +236,6 @@ void do_page_fault(struct pt_regs *regs, unsigned long address,
+ 		else
+ 			current->min_flt++;
+ 		if (fault & VM_FAULT_RETRY) {
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			flags |= FAULT_FLAG_TRIED;
+ 
+ 			/*
+diff --git a/arch/mips/mm/fault.c b/arch/mips/mm/fault.c
+index 158080ec672b..078ff32ebe40 100644
+--- a/arch/mips/mm/fault.c
++++ b/arch/mips/mm/fault.c
+@@ -178,7 +178,6 @@ static void __kprobes __do_page_fault(struct pt_regs *regs, unsigned long write,
+ 			tsk->min_flt++;
+ 		}
+ 		if (fault & VM_FAULT_RETRY) {
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			flags |= FAULT_FLAG_TRIED;
+ 
+ 			/*
+diff --git a/arch/nds32/mm/fault.c b/arch/nds32/mm/fault.c
+index 0a69dcf91ae2..347a7517eb8f 100644
+--- a/arch/nds32/mm/fault.c
++++ b/arch/nds32/mm/fault.c
+@@ -237,7 +237,6 @@ void do_page_fault(unsigned long entry, unsigned long addr,
+ 		else
+ 			tsk->min_flt++;
+ 		if (fault & VM_FAULT_RETRY) {
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			flags |= FAULT_FLAG_TRIED;
+ 
+ 			/* No need to up_read(&mm->mmap_sem) as we would
+diff --git a/arch/nios2/mm/fault.c b/arch/nios2/mm/fault.c
+index a1f2af87b614..61d1d4be9b66 100644
+--- a/arch/nios2/mm/fault.c
++++ b/arch/nios2/mm/fault.c
+@@ -158,9 +158,6 @@ asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long cause,
+ 		else
+ 			current->min_flt++;
+ 		if (fault & VM_FAULT_RETRY) {
+-			/* Clear FAULT_FLAG_ALLOW_RETRY to avoid any risk
+-			 * of starvation. */
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			flags |= FAULT_FLAG_TRIED;
+ 
+ 			/*
+diff --git a/arch/openrisc/mm/fault.c b/arch/openrisc/mm/fault.c
+index f640745ecf37..d9517ea5fd86 100644
+--- a/arch/openrisc/mm/fault.c
++++ b/arch/openrisc/mm/fault.c
+@@ -185,7 +185,6 @@ asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long address,
+ 		else
+ 			tsk->min_flt++;
+ 		if (fault & VM_FAULT_RETRY) {
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			flags |= FAULT_FLAG_TRIED;
+ 
+ 			 /* No need to up_read(&mm->mmap_sem) as we would
+diff --git a/arch/parisc/mm/fault.c b/arch/parisc/mm/fault.c
+index f1725498f102..bab5228879a7 100644
+--- a/arch/parisc/mm/fault.c
++++ b/arch/parisc/mm/fault.c
+@@ -327,14 +327,12 @@ void do_page_fault(struct pt_regs *regs, unsigned long code,
+ 		else
+ 			current->min_flt++;
+ 		if (fault & VM_FAULT_RETRY) {
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+-
+ 			/*
+ 			 * No need to up_read(&mm->mmap_sem) as we would
+ 			 * have already released it in __lock_page_or_retry
+ 			 * in mm/filemap.c.
+ 			 */
+-
++			flags |= FAULT_FLAG_TRIED;
+ 			goto retry;
+ 		}
+ 	}
+diff --git a/arch/powerpc/mm/fault.c b/arch/powerpc/mm/fault.c
+index ab674ecdd294..60c0754c863a 100644
+--- a/arch/powerpc/mm/fault.c
++++ b/arch/powerpc/mm/fault.c
+@@ -599,13 +599,7 @@ static int __do_page_fault(struct pt_regs *regs, unsigned long address,
+ 	 * case.
+ 	 */
+ 	if (unlikely(fault & VM_FAULT_RETRY)) {
+-		/* We retry only once */
+ 		if (flags & FAULT_FLAG_ALLOW_RETRY) {
+-			/*
+-			 * Clear FAULT_FLAG_ALLOW_RETRY to avoid any risk
+-			 * of starvation.
+-			 */
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			flags |= FAULT_FLAG_TRIED;
+ 			goto retry;
+ 		}
+diff --git a/arch/riscv/mm/fault.c b/arch/riscv/mm/fault.c
+index 554d35ba6bcc..a71062e0cf5f 100644
+--- a/arch/riscv/mm/fault.c
++++ b/arch/riscv/mm/fault.c
+@@ -154,11 +154,6 @@ asmlinkage void do_page_fault(struct pt_regs *regs)
+ 				      1, regs, addr);
+ 		}
+ 		if (fault & VM_FAULT_RETRY) {
+-			/*
+-			 * Clear FAULT_FLAG_ALLOW_RETRY to avoid any risk
+-			 * of starvation.
+-			 */
+-			flags &= ~(FAULT_FLAG_ALLOW_RETRY);
+ 			flags |= FAULT_FLAG_TRIED;
+ 
+ 			/*
+diff --git a/arch/s390/mm/fault.c b/arch/s390/mm/fault.c
+index f88e57399bbb..83e230957b4d 100644
+--- a/arch/s390/mm/fault.c
++++ b/arch/s390/mm/fault.c
+@@ -549,10 +549,7 @@ static inline vm_fault_t do_exception(struct pt_regs *regs, int access)
+ 				fault = VM_FAULT_PFAULT;
+ 				goto out_up;
+ 			}
+-			/* Clear FAULT_FLAG_ALLOW_RETRY to avoid any risk
+-			 * of starvation. */
+-			flags &= ~(FAULT_FLAG_ALLOW_RETRY |
+-				   FAULT_FLAG_RETRY_NOWAIT);
++			flags &= ~FAULT_FLAG_RETRY_NOWAIT;
+ 			flags |= FAULT_FLAG_TRIED;
+ 			down_read(&mm->mmap_sem);
+ 			goto retry;
+diff --git a/arch/sh/mm/fault.c b/arch/sh/mm/fault.c
+index 6defd2c6d9b1..2b83a00afdd9 100644
+--- a/arch/sh/mm/fault.c
++++ b/arch/sh/mm/fault.c
+@@ -498,7 +498,6 @@ asmlinkage void __kprobes do_page_fault(struct pt_regs *regs,
+ 				      regs, address);
+ 		}
+ 		if (fault & VM_FAULT_RETRY) {
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			flags |= FAULT_FLAG_TRIED;
+ 
+ 			/*
+diff --git a/arch/sparc/mm/fault_32.c b/arch/sparc/mm/fault_32.c
+index 909820508c78..9382e131b0cb 100644
+--- a/arch/sparc/mm/fault_32.c
++++ b/arch/sparc/mm/fault_32.c
+@@ -261,7 +261,6 @@ asmlinkage void do_sparc_fault(struct pt_regs *regs, int text_fault, int write,
+ 				      1, regs, address);
+ 		}
+ 		if (fault & VM_FAULT_RETRY) {
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			flags |= FAULT_FLAG_TRIED;
+ 
+ 			/* No need to up_read(&mm->mmap_sem) as we would
+diff --git a/arch/sparc/mm/fault_64.c b/arch/sparc/mm/fault_64.c
+index 58947e0aaa29..f5a20939b8a2 100644
+--- a/arch/sparc/mm/fault_64.c
++++ b/arch/sparc/mm/fault_64.c
+@@ -459,7 +459,6 @@ asmlinkage void __kprobes do_sparc64_fault(struct pt_regs *regs)
+ 				      1, regs, address);
+ 		}
+ 		if (fault & VM_FAULT_RETRY) {
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			flags |= FAULT_FLAG_TRIED;
+ 
+ 			/* No need to up_read(&mm->mmap_sem) as we would
+diff --git a/arch/um/kernel/trap.c b/arch/um/kernel/trap.c
+index cced82946042..eacf4fe7ae4d 100644
+--- a/arch/um/kernel/trap.c
++++ b/arch/um/kernel/trap.c
+@@ -96,7 +96,6 @@ int handle_page_fault(unsigned long address, unsigned long ip,
+ 			else
+ 				current->min_flt++;
+ 			if (fault & VM_FAULT_RETRY) {
+-				flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 				flags |= FAULT_FLAG_TRIED;
+ 
+ 				goto retry;
+diff --git a/arch/unicore32/mm/fault.c b/arch/unicore32/mm/fault.c
+index 5a01f6cffab3..77080a25d68a 100644
+--- a/arch/unicore32/mm/fault.c
++++ b/arch/unicore32/mm/fault.c
+@@ -268,9 +268,7 @@ static int do_pf(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 		else
+ 			tsk->min_flt++;
+ 		if (fault & VM_FAULT_RETRY) {
+-			/* Clear FAULT_FLAG_ALLOW_RETRY to avoid any risk
+-			* of starvation. */
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
++			flags |= FAULT_FLAG_TRIED;
+ 			goto retry;
+ 		}
+ 	}
+* Unmerged path arch/x86/mm/fault.c
+diff --git a/arch/xtensa/mm/fault.c b/arch/xtensa/mm/fault.c
+index 038e2213db9b..a93e1bc31c2d 100644
+--- a/arch/xtensa/mm/fault.c
++++ b/arch/xtensa/mm/fault.c
+@@ -128,7 +128,6 @@ void do_page_fault(struct pt_regs *regs)
+ 		else
+ 			current->min_flt++;
+ 		if (fault & VM_FAULT_RETRY) {
+-			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 			flags |= FAULT_FLAG_TRIED;
+ 
+ 			 /* No need to up_read(&mm->mmap_sem) as we would
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_vm.c b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+index b9e046875d17..4eafefd7575d 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_vm.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+@@ -59,9 +59,10 @@ static vm_fault_t ttm_bo_vm_fault_idle(struct ttm_buffer_object *bo,
+ 
+ 	/*
+ 	 * If possible, avoid waiting for GPU with mmap_sem
+-	 * held.
++	 * held.  We only do this if the fault allows retry and this
++	 * is the first attempt.
+ 	 */
+-	if (vmf->flags & FAULT_FLAG_ALLOW_RETRY) {
++	if (fault_flag_allow_retry_first(vmf->flags)) {
+ 		ret = VM_FAULT_RETRY;
+ 		if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
+ 			goto out_unlock;
+@@ -135,7 +136,12 @@ vm_fault_t ttm_bo_vm_reserve(struct ttm_buffer_object *bo,
+ 	 * for the buffer to become unreserved.
+ 	 */
+ 	if (unlikely(!dma_resv_trylock(bo->base.resv))) {
+-		if (vmf->flags & FAULT_FLAG_ALLOW_RETRY) {
++		/*
++		 * If the fault allows retry and this is the first
++		 * fault attempt, we try to release the mmap_sem
++		 * before waiting
++		 */
++		if (fault_flag_allow_retry_first(vmf->flags)) {
+ 			if (!(vmf->flags & FAULT_FLAG_RETRY_NOWAIT)) {
+ 				ttm_bo_get(bo);
+ 				up_read(&vmf->vma->vm_mm->mmap_sem);
+* Unmerged path include/linux/mm.h
+diff --git a/mm/filemap.c b/mm/filemap.c
+index c5561788ab4c..34c7e4901469 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1372,7 +1372,7 @@ EXPORT_SYMBOL_GPL(__lock_page_killable);
+ int __lock_page_or_retry(struct page *page, struct mm_struct *mm,
+ 			 unsigned int flags)
+ {
+-	if (flags & FAULT_FLAG_ALLOW_RETRY) {
++	if (fault_flag_allow_retry_first(flags)) {
+ 		/*
+ 		 * CAUTION! In this case, mmap_sem is not released
+ 		 * even though return 0.
+* Unmerged path mm/internal.h
