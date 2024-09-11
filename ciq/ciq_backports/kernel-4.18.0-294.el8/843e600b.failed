@@ -1,0 +1,360 @@
+driver core: Fix sleeping in invalid context during device link deletion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Saravana Kannan <saravanak@google.com>
+commit 843e600b8a2b01463c4d873a90b2c2ea8033f1f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/843e600b.failed
+
+Marek and Guenter reported that commit 287905e68dd2 ("driver core:
+Expose device link details in sysfs") caused sleeping/scheduling while
+atomic warnings.
+
+BUG: sleeping function called from invalid context at kernel/locking/mutex.c:935
+in_atomic(): 1, irqs_disabled(): 0, non_block: 0, pid: 12, name: kworker/0:1
+2 locks held by kworker/0:1/12:
+  #0: ee8074a8 ((wq_completion)rcu_gp){+.+.}-{0:0}, at: process_one_work+0x174/0x7dc
+  #1: ee921f20 ((work_completion)(&sdp->work)){+.+.}-{0:0}, at: process_one_work+0x174/0x7dc
+Preemption disabled at:
+[<c01b10f0>] srcu_invoke_callbacks+0xc0/0x154
+----- 8< ----- SNIP
+[<c064590c>] (device_del) from [<c0645c9c>] (device_unregister+0x24/0x64)
+[<c0645c9c>] (device_unregister) from [<c01b10fc>] (srcu_invoke_callbacks+0xcc/0x154)
+[<c01b10fc>] (srcu_invoke_callbacks) from [<c01493c4>] (process_one_work+0x234/0x7dc)
+[<c01493c4>] (process_one_work) from [<c01499b0>] (worker_thread+0x44/0x51c)
+[<c01499b0>] (worker_thread) from [<c0150bf4>] (kthread+0x158/0x1a0)
+[<c0150bf4>] (kthread) from [<c0100114>] (ret_from_fork+0x14/0x20)
+Exception stack(0xee921fb0 to 0xee921ff8)
+
+This was caused by the device link device being released in the context
+of srcu_invoke_callbacks().  There is no need to wait till the RCU
+callback to release the device link device.  So release the device
+earlier and move the call_srcu() into the device release code. That way,
+the memory will get freed only after the device is released AND the RCU
+callback is called.
+
+Fixes: 287905e68dd2 ("driver core: Expose device link details in sysfs")
+	Reported-by: Marek Szyprowski <m.szyprowski@samsung.com>
+	Reported-by: Guenter Roeck <linux@roeck-us.net>
+	Reported-by: Naresh Kamboju <naresh.kamboju@linaro.org>
+	Signed-off-by: Saravana Kannan <saravanak@google.com>
+	Tested-by: Marek Szyprowski <m.szyprowski@samsung.com>
+	Tested-by: Guenter Roeck <linux@roeck-us.net>
+Link: https://lore.kernel.org/r/20200716214523.2924704-1-saravanak@google.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 843e600b8a2b01463c4d873a90b2c2ea8033f1f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/core.c
+diff --cc drivers/base/core.c
+index 7ffd5023ca95,b6e8b0bb76e4..000000000000
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@@ -215,6 -236,210 +215,213 @@@ void device_pm_move_to_tail(struct devi
+  	device_links_read_unlock(idx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define to_devlink(dev)	container_of((dev), struct device_link, link_dev)
++ 
++ static ssize_t status_show(struct device *dev,
++ 			  struct device_attribute *attr, char *buf)
++ {
++ 	char *status;
++ 
++ 	switch (to_devlink(dev)->status) {
++ 	case DL_STATE_NONE:
++ 		status = "not tracked"; break;
++ 	case DL_STATE_DORMANT:
++ 		status = "dormant"; break;
++ 	case DL_STATE_AVAILABLE:
++ 		status = "available"; break;
++ 	case DL_STATE_CONSUMER_PROBE:
++ 		status = "consumer probing"; break;
++ 	case DL_STATE_ACTIVE:
++ 		status = "active"; break;
++ 	case DL_STATE_SUPPLIER_UNBIND:
++ 		status = "supplier unbinding"; break;
++ 	default:
++ 		status = "unknown"; break;
++ 	}
++ 	return sprintf(buf, "%s\n", status);
++ }
++ static DEVICE_ATTR_RO(status);
++ 
++ static ssize_t auto_remove_on_show(struct device *dev,
++ 				   struct device_attribute *attr, char *buf)
++ {
++ 	struct device_link *link = to_devlink(dev);
++ 	char *str;
++ 
++ 	if (link->flags & DL_FLAG_AUTOREMOVE_SUPPLIER)
++ 		str = "supplier unbind";
++ 	else if (link->flags & DL_FLAG_AUTOREMOVE_CONSUMER)
++ 		str = "consumer unbind";
++ 	else
++ 		str = "never";
++ 
++ 	return sprintf(buf, "%s\n", str);
++ }
++ static DEVICE_ATTR_RO(auto_remove_on);
++ 
++ static ssize_t runtime_pm_show(struct device *dev,
++ 			       struct device_attribute *attr, char *buf)
++ {
++ 	struct device_link *link = to_devlink(dev);
++ 
++ 	return sprintf(buf, "%d\n", !!(link->flags & DL_FLAG_PM_RUNTIME));
++ }
++ static DEVICE_ATTR_RO(runtime_pm);
++ 
++ static ssize_t sync_state_only_show(struct device *dev,
++ 				    struct device_attribute *attr, char *buf)
++ {
++ 	struct device_link *link = to_devlink(dev);
++ 
++ 	return sprintf(buf, "%d\n", !!(link->flags & DL_FLAG_SYNC_STATE_ONLY));
++ }
++ static DEVICE_ATTR_RO(sync_state_only);
++ 
++ static struct attribute *devlink_attrs[] = {
++ 	&dev_attr_status.attr,
++ 	&dev_attr_auto_remove_on.attr,
++ 	&dev_attr_runtime_pm.attr,
++ 	&dev_attr_sync_state_only.attr,
++ 	NULL,
++ };
++ ATTRIBUTE_GROUPS(devlink);
++ 
++ static void device_link_free(struct device_link *link)
++ {
++ 	while (refcount_dec_not_one(&link->rpm_active))
++ 		pm_runtime_put(link->supplier);
++ 
++ 	put_device(link->consumer);
++ 	put_device(link->supplier);
++ 	kfree(link);
++ }
++ 
++ #ifdef CONFIG_SRCU
++ static void __device_link_free_srcu(struct rcu_head *rhead)
++ {
++ 	device_link_free(container_of(rhead, struct device_link, rcu_head));
++ }
++ 
++ static void devlink_dev_release(struct device *dev)
++ {
++ 	struct device_link *link = to_devlink(dev);
++ 
++ 	call_srcu(&device_links_srcu, &link->rcu_head, __device_link_free_srcu);
++ }
++ #else
++ static void devlink_dev_release(struct device *dev)
++ {
++ 	device_link_free(to_devlink(dev));
++ }
++ #endif
++ 
++ static struct class devlink_class = {
++ 	.name = "devlink",
++ 	.owner = THIS_MODULE,
++ 	.dev_groups = devlink_groups,
++ 	.dev_release = devlink_dev_release,
++ };
++ 
++ static int devlink_add_symlinks(struct device *dev,
++ 				struct class_interface *class_intf)
++ {
++ 	int ret;
++ 	size_t len;
++ 	struct device_link *link = to_devlink(dev);
++ 	struct device *sup = link->supplier;
++ 	struct device *con = link->consumer;
++ 	char *buf;
++ 
++ 	len = max(strlen(dev_name(sup)), strlen(dev_name(con)));
++ 	len += strlen("supplier:") + 1;
++ 	buf = kzalloc(len, GFP_KERNEL);
++ 	if (!buf)
++ 		return -ENOMEM;
++ 
++ 	ret = sysfs_create_link(&link->link_dev.kobj, &sup->kobj, "supplier");
++ 	if (ret)
++ 		goto out;
++ 
++ 	ret = sysfs_create_link(&link->link_dev.kobj, &con->kobj, "consumer");
++ 	if (ret)
++ 		goto err_con;
++ 
++ 	snprintf(buf, len, "consumer:%s", dev_name(con));
++ 	ret = sysfs_create_link(&sup->kobj, &link->link_dev.kobj, buf);
++ 	if (ret)
++ 		goto err_con_dev;
++ 
++ 	snprintf(buf, len, "supplier:%s", dev_name(sup));
++ 	ret = sysfs_create_link(&con->kobj, &link->link_dev.kobj, buf);
++ 	if (ret)
++ 		goto err_sup_dev;
++ 
++ 	goto out;
++ 
++ err_sup_dev:
++ 	snprintf(buf, len, "consumer:%s", dev_name(con));
++ 	sysfs_remove_link(&sup->kobj, buf);
++ err_con_dev:
++ 	sysfs_remove_link(&link->link_dev.kobj, "consumer");
++ err_con:
++ 	sysfs_remove_link(&link->link_dev.kobj, "supplier");
++ out:
++ 	kfree(buf);
++ 	return ret;
++ }
++ 
++ static void devlink_remove_symlinks(struct device *dev,
++ 				   struct class_interface *class_intf)
++ {
++ 	struct device_link *link = to_devlink(dev);
++ 	size_t len;
++ 	struct device *sup = link->supplier;
++ 	struct device *con = link->consumer;
++ 	char *buf;
++ 
++ 	sysfs_remove_link(&link->link_dev.kobj, "consumer");
++ 	sysfs_remove_link(&link->link_dev.kobj, "supplier");
++ 
++ 	len = max(strlen(dev_name(sup)), strlen(dev_name(con)));
++ 	len += strlen("supplier:") + 1;
++ 	buf = kzalloc(len, GFP_KERNEL);
++ 	if (!buf) {
++ 		WARN(1, "Unable to properly free device link symlinks!\n");
++ 		return;
++ 	}
++ 
++ 	snprintf(buf, len, "supplier:%s", dev_name(sup));
++ 	sysfs_remove_link(&con->kobj, buf);
++ 	snprintf(buf, len, "consumer:%s", dev_name(con));
++ 	sysfs_remove_link(&sup->kobj, buf);
++ 	kfree(buf);
++ }
++ 
++ static struct class_interface devlink_class_intf = {
++ 	.class = &devlink_class,
++ 	.add_dev = devlink_add_symlinks,
++ 	.remove_dev = devlink_remove_symlinks,
++ };
++ 
++ static int __init devlink_class_init(void)
++ {
++ 	int ret;
++ 
++ 	ret = class_register(&devlink_class);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = class_interface_register(&devlink_class_intf);
++ 	if (ret)
++ 		class_unregister(&devlink_class);
++ 
++ 	return ret;
++ }
++ postcore_initcall(devlink_class_init);
++ 
+++>>>>>>> 843e600b8a2b (driver core: Fix sleeping in invalid context during device link deletion)
+  #define DL_MANAGED_LINK_FLAGS (DL_FLAG_AUTOREMOVE_CONSUMER | \
+  			       DL_FLAG_AUTOREMOVE_SUPPLIER | \
+  			       DL_FLAG_AUTOPROBE_CONSUMER  | \
+@@@ -448,22 -687,75 +655,86 @@@ reorder
+  }
+  EXPORT_SYMBOL_GPL(device_link_add);
+  
+++<<<<<<< HEAD
+ +static void device_link_free(struct device_link *link)
+ +{
+ +	while (refcount_dec_not_one(&link->rpm_active))
+ +		pm_runtime_put(link->supplier);
+ +
+ +	put_device(link->consumer);
+ +	put_device(link->supplier);
+ +	kfree(link);
+++=======
++ /**
++  * device_link_wait_for_supplier - Add device to wait_for_suppliers list
++  * @consumer: Consumer device
++  *
++  * Marks the @consumer device as waiting for suppliers to become available by
++  * adding it to the wait_for_suppliers list. The consumer device will never be
++  * probed until it's removed from the wait_for_suppliers list.
++  *
++  * The caller is responsible for adding the links to the supplier devices once
++  * they are available and removing the @consumer device from the
++  * wait_for_suppliers list once links to all the suppliers have been created.
++  *
++  * This function is NOT meant to be called from the probe function of the
++  * consumer but rather from code that creates/adds the consumer device.
++  */
++ static void device_link_wait_for_supplier(struct device *consumer,
++ 					  bool need_for_probe)
++ {
++ 	mutex_lock(&wfs_lock);
++ 	list_add_tail(&consumer->links.needs_suppliers, &wait_for_suppliers);
++ 	consumer->links.need_for_probe = need_for_probe;
++ 	mutex_unlock(&wfs_lock);
+  }
+  
+- #ifdef CONFIG_SRCU
+- static void __device_link_free_srcu(struct rcu_head *rhead)
++ static void device_link_wait_for_mandatory_supplier(struct device *consumer)
+  {
+- 	device_link_free(container_of(rhead, struct device_link, rcu_head));
++ 	device_link_wait_for_supplier(consumer, true);
+  }
+  
++ static void device_link_wait_for_optional_supplier(struct device *consumer)
++ {
++ 	device_link_wait_for_supplier(consumer, false);
++ }
++ 
++ /**
++  * device_link_add_missing_supplier_links - Add links from consumer devices to
++  *					    supplier devices, leaving any
++  *					    consumer with inactive suppliers on
++  *					    the wait_for_suppliers list
++  *
++  * Loops through all consumers waiting on suppliers and tries to add all their
++  * supplier links. If that succeeds, the consumer device is removed from
++  * wait_for_suppliers list. Otherwise, they are left in the wait_for_suppliers
++  * list.  Devices left on the wait_for_suppliers list will not be probed.
++  *
++  * The fwnode add_links callback is expected to return 0 if it has found and
++  * added all the supplier links for the consumer device. It should return an
++  * error if it isn't able to do so.
++  *
++  * The caller of device_link_wait_for_supplier() is expected to call this once
++  * it's aware of potential suppliers becoming available.
++  */
++ static void device_link_add_missing_supplier_links(void)
++ {
++ 	struct device *dev, *tmp;
++ 
++ 	mutex_lock(&wfs_lock);
++ 	list_for_each_entry_safe(dev, tmp, &wait_for_suppliers,
++ 				 links.needs_suppliers) {
++ 		int ret = fwnode_call_int_op(dev->fwnode, add_links, dev);
++ 		if (!ret)
++ 			list_del_init(&dev->links.needs_suppliers);
++ 		else if (ret != -ENODEV || fw_devlink_is_permissive())
++ 			dev->links.need_for_probe = false;
++ 	}
++ 	mutex_unlock(&wfs_lock);
+++>>>>>>> 843e600b8a2b (driver core: Fix sleeping in invalid context during device link deletion)
++ }
++ 
++ #ifdef CONFIG_SRCU
+  static void __device_link_del(struct kref *kref)
+  {
+  	struct device_link *link = container_of(kref, struct device_link, kref);
+* Unmerged path drivers/base/core.c
