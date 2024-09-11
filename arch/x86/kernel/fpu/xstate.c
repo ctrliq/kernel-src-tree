@@ -901,8 +901,6 @@ void fpu__resume_cpu(void)
  * Given an xstate feature nr, calculate where in the xsave
  * buffer the state is.  Callers should ensure that the buffer
  * is valid.
- *
- * Note: does not work for compacted buffers.
  */
 static void *__raw_xsave_addr(struct xregs_state *xsave, int xfeature_nr)
 {
