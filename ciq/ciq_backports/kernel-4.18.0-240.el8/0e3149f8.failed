@@ -1,0 +1,361 @@
+perf dso: Move dso_id from 'struct map' to 'struct dso'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 0e3149f86b99ddabde8c5029eea0a9267e34f1a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0e3149f8.failed
+
+And take it into account when looking up DSOs when we have the dso_id
+fields obtained from somewhere, like from PERF_RECORD_MMAP2 records.
+
+Instances of struct map pointing to the same DSO pathname but with
+anything in dso_id different are in fact different DSOs, so better have
+different 'struct dso' instances to reflect that. At some point we may
+want to get copies of the contents of the different objects if we want
+to do correct annotation or other analysis.
+
+With this we get 'struct map' 24 bytes leaner:
+
+  $ pahole -C map ~/bin/perf
+  struct map {
+  	union {
+  		struct rb_node     rb_node __attribute__((__aligned__(8))); /*     0    24 */
+  		struct list_head   node;                 /*     0    16 */
+  	} __attribute__((__aligned__(8)));               /*     0    24 */
+  	u64                        start;                /*    24     8 */
+  	u64                        end;                  /*    32     8 */
+  	_Bool                      erange_warned:1;      /*    40: 0  1 */
+  	_Bool                      priv:1;               /*    40: 1  1 */
+
+  	/* XXX 6 bits hole, try to pack */
+  	/* XXX 3 bytes hole, try to pack */
+
+  	u32                        prot;                 /*    44     4 */
+  	u64                        pgoff;                /*    48     8 */
+  	u64                        reloc;                /*    56     8 */
+  	/* --- cacheline 1 boundary (64 bytes) --- */
+  	u64                        (*map_ip)(struct map *, u64); /*    64     8 */
+  	u64                        (*unmap_ip)(struct map *, u64); /*    72     8 */
+  	struct dso *               dso;                  /*    80     8 */
+  	refcount_t                 refcnt;               /*    88     4 */
+  	u32                        flags;                /*    92     4 */
+
+  	/* size: 96, cachelines: 2, members: 13 */
+  	/* sum members: 92, holes: 1, sum holes: 3 */
+  	/* sum bitfield members: 2 bits, bit holes: 1, sum bit holes: 6 bits */
+  	/* forced alignments: 1 */
+  	/* last cacheline: 32 bytes */
+  } __attribute__((__aligned__(8)));
+  $
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: https://lkml.kernel.org/n/tip-g4hxxmraplo7wfjmk384mfsb@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 0e3149f86b99ddabde8c5029eea0a9267e34f1a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/dso.c
+#	tools/perf/util/dsos.c
+#	tools/perf/util/dsos.h
+#	tools/perf/util/machine.h
+#	tools/perf/util/map.h
+#	tools/perf/util/sort.c
+diff --cc tools/perf/util/dso.c
+index 38a9c6ddec0d,91f21239608b..000000000000
+--- a/tools/perf/util/dso.c
++++ b/tools/perf/util/dso.c
+@@@ -1147,67 -1149,7 +1147,71 @@@ struct dso *machine__findnew_kernel(str
+  	return dso;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Find a matching entry and/or link current entry to RB tree.
+ + * Either one of the dso or name parameter must be non-NULL or the
+ + * function will not work.
+ + */
+ +static struct dso *__dso__findlink_by_longname(struct rb_root *root,
+ +					       struct dso *dso, const char *name)
+ +{
+ +	struct rb_node **p = &root->rb_node;
+ +	struct rb_node  *parent = NULL;
+ +
+ +	if (!name)
+ +		name = dso->long_name;
+ +	/*
+ +	 * Find node with the matching name
+ +	 */
+ +	while (*p) {
+ +		struct dso *this = rb_entry(*p, struct dso, rb_node);
+ +		int rc = strcmp(name, this->long_name);
+ +
+ +		parent = *p;
+ +		if (rc == 0) {
+ +			/*
+ +			 * In case the new DSO is a duplicate of an existing
+ +			 * one, print a one-time warning & put the new entry
+ +			 * at the end of the list of duplicates.
+ +			 */
+ +			if (!dso || (dso == this))
+ +				return this;	/* Find matching dso */
+ +			/*
+ +			 * The core kernel DSOs may have duplicated long name.
+ +			 * In this case, the short name should be different.
+ +			 * Comparing the short names to differentiate the DSOs.
+ +			 */
+ +			rc = strcmp(dso->short_name, this->short_name);
+ +			if (rc == 0) {
+ +				pr_err("Duplicated dso name: %s\n", name);
+ +				return NULL;
+ +			}
+ +		}
+ +		if (rc < 0)
+ +			p = &parent->rb_left;
+ +		else
+ +			p = &parent->rb_right;
+ +	}
+ +	if (dso) {
+ +		/* Add new node and rebalance tree */
+ +		rb_link_node(&dso->rb_node, parent, p);
+ +		rb_insert_color(&dso->rb_node, root);
+ +		dso->root = root;
+ +	}
+ +	return NULL;
+ +}
+ +
+ +static inline struct dso *__dso__find_by_longname(struct rb_root *root,
+ +						  const char *name)
+ +{
+ +	return __dso__findlink_by_longname(root, NULL, name);
+ +}
+ +
+ +void dso__set_long_name(struct dso *dso, const char *name, bool name_allocated)
+++=======
++ static void dso__set_long_name_id(struct dso *dso, const char *name, struct dso_id *id, bool name_allocated)
+++>>>>>>> 0e3149f86b99 (perf dso: Move dso_id from 'struct map' to 'struct dso')
+  {
+  	struct rb_root *root = dso->root;
+  
+@@@ -1220,8 -1162,8 +1224,13 @@@
+  	if (root) {
+  		rb_erase(&dso->rb_node, root);
+  		/*
+++<<<<<<< HEAD
+ +		 * __dso__findlink_by_longname() isn't guaranteed to add it
+ +		 * back, so a clean removal is required here.
+++=======
++ 		 * __dsos__findnew_link_by_longname_id() isn't guaranteed to
++ 		 * add it back, so a clean removal is required here.
+++>>>>>>> 0e3149f86b99 (perf dso: Move dso_id from 'struct map' to 'struct dso')
+  		 */
+  		RB_CLEAR_NODE(&dso->rb_node);
+  		dso->root = NULL;
+@@@ -1232,7 -1174,12 +1241,16 @@@
+  	dso->long_name_allocated = name_allocated;
+  
+  	if (root)
+++<<<<<<< HEAD
+ +		__dso__findlink_by_longname(root, dso, NULL);
+++=======
++ 		__dsos__findnew_link_by_longname_id(root, dso, NULL, id);
++ }
++ 
++ void dso__set_long_name(struct dso *dso, const char *name, bool name_allocated)
++ {
++ 	dso__set_long_name_id(dso, name, NULL, name_allocated);
+++>>>>>>> 0e3149f86b99 (perf dso: Move dso_id from 'struct map' to 'struct dso')
+  }
+  
+  void dso__set_short_name(struct dso *dso, const char *name, bool name_allocated)
+diff --cc tools/perf/util/machine.h
+index 4dd10eefeebb,499be204830d..000000000000
+--- a/tools/perf/util/machine.h
++++ b/tools/perf/util/machine.h
+@@@ -11,9 -10,12 +11,15 @@@
+  
+  struct addr_location;
+  struct branch_stack;
+++<<<<<<< HEAD
+ +struct perf_evsel;
+++=======
++ struct dso;
++ struct dso_id;
++ struct evsel;
+++>>>>>>> 0e3149f86b99 (perf dso: Move dso_id from 'struct map' to 'struct dso')
+  struct perf_sample;
+  struct symbol;
+ -struct target;
+  struct thread;
+  union perf_event;
+  
+diff --cc tools/perf/util/map.h
+index 1f79424b8478,5e8899883231..000000000000
+--- a/tools/perf/util/map.h
++++ b/tools/perf/util/map.h
+@@@ -16,18 -16,8 +16,21 @@@ struct ip_callchain
+  struct ref_reloc_sym;
+  struct map_groups;
+  struct machine;
+ -struct evsel;
+ +struct perf_evsel;
+  
+++<<<<<<< HEAD
+ +/*
+ + * Data about backing storage DSO, comes from PERF_RECORD_MMAP2 meta events
+ + */
+ +struct dso_id {
+ +	u32	maj;
+ +	u32	min;
+ +	u64	ino;
+ +	u64	ino_generation;
+ +};
+ +
+++=======
+++>>>>>>> 0e3149f86b99 (perf dso: Move dso_id from 'struct map' to 'struct dso')
+  struct map {
+  	union {
+  		struct rb_node	rb_node;
+diff --cc tools/perf/util/sort.c
+index 3e0acd8b6670,345b5ccc90f6..000000000000
+--- a/tools/perf/util/sort.c
++++ b/tools/perf/util/sort.c
+@@@ -1212,18 -1213,9 +1212,24 @@@ sort__dcacheline_cmp(struct hist_entry 
+  	if (!l_map) return -1;
+  	if (!r_map) return 1;
+  
+++<<<<<<< HEAD
+ +	if (l_map->dso_id.maj > r_map->dso_id.maj) return -1;
+ +	if (l_map->dso_id.maj < r_map->dso_id.maj) return 1;
+ +
+ +	if (l_map->dso_id.min > r_map->dso_id.min) return -1;
+ +	if (l_map->dso_id.min < r_map->dso_id.min) return 1;
+ +
+ +	if (l_map->dso_id.ino > r_map->dso_id.ino) return -1;
+ +	if (l_map->dso_id.ino < r_map->dso_id.ino) return 1;
+ +
+ +	if (l_map->dso_id.ino_generation > r_map->dso_id.ino_generation) return -1;
+ +	if (l_map->dso_id.ino_generation < r_map->dso_id.ino_generation) return 1;
+ +
+++=======
++ 	rc = dso__cmp_id(l_map->dso, r_map->dso);
++ 	if (rc)
++ 		return rc;
+++>>>>>>> 0e3149f86b99 (perf dso: Move dso_id from 'struct map' to 'struct dso')
+  	/*
+  	 * Addresses with no major/minor numbers are assumed to be
+  	 * anonymous in userspace.  Sort those on pid then address.
+* Unmerged path tools/perf/util/dsos.c
+* Unmerged path tools/perf/util/dsos.h
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index 914e3c341a48..586001a614c6 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -731,7 +731,7 @@ static size_t maps__fprintf_task(struct maps *maps, int indent, FILE *fp)
+ 				   map->prot & PROT_EXEC ? 'x' : '-',
+ 				   map->flags & MAP_SHARED ? 's' : 'p',
+ 				   map->pgoff,
+-				   map->dso_id.ino, map->dso->name);
++				   map->dso->id.ino, map->dso->name);
+ 	}
+ 
+ 	return printed;
+* Unmerged path tools/perf/util/dso.c
+diff --git a/tools/perf/util/dso.h b/tools/perf/util/dso.h
+index 8fb87de165f9..4e303ca67cbd 100644
+--- a/tools/perf/util/dso.h
++++ b/tools/perf/util/dso.h
+@@ -122,6 +122,16 @@ enum dso_load_errno {
+ #define DSO__DATA_CACHE_SIZE 4096
+ #define DSO__DATA_CACHE_MASK ~(DSO__DATA_CACHE_SIZE - 1)
+ 
++/*
++ * Data about backing storage DSO, comes from PERF_RECORD_MMAP2 meta events
++ */
++struct dso_id {
++	u32	maj;
++	u32	min;
++	u64	ino;
++	u64	ino_generation;
++};
++
+ struct dso_cache {
+ 	struct rb_node	rb_node;
+ 	u64 offset;
+@@ -206,6 +216,7 @@ struct dso {
+ 		u64	 db_id;
+ 	};
+ 	struct nsinfo	*nsinfo;
++	struct dso_id	 id;
+ 	refcount_t	 refcnt;
+ 	char		 name[0];
+ };
+@@ -224,9 +235,11 @@ static inline void dso__set_loaded(struct dso *dso)
+ 	dso->loaded = true;
+ }
+ 
++struct dso *dso__new_id(const char *name, struct dso_id *id);
+ struct dso *dso__new(const char *name);
+ void dso__delete(struct dso *dso);
+ 
++int dso__cmp_id(struct dso *a, struct dso *b);
+ void dso__set_short_name(struct dso *dso, const char *name, bool name_allocated);
+ void dso__set_long_name(struct dso *dso, const char *name, bool name_allocated);
+ 
+* Unmerged path tools/perf/util/dsos.c
+* Unmerged path tools/perf/util/dsos.h
+diff --git a/tools/perf/util/machine.c b/tools/perf/util/machine.c
+index 97b56c40a5df..eccdc03356a2 100644
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@ -2714,9 +2714,14 @@ u8 machine__addr_cpumode(struct machine *machine, u8 cpumode, u64 addr)
+ 	return addr_cpumode;
+ }
+ 
++struct dso *machine__findnew_dso_id(struct machine *machine, const char *filename, struct dso_id *id)
++{
++	return dsos__findnew_id(&machine->dsos, filename, id);
++}
++
+ struct dso *machine__findnew_dso(struct machine *machine, const char *filename)
+ {
+-	return dsos__findnew(&machine->dsos, filename);
++	return machine__findnew_dso_id(machine, filename, NULL);
+ }
+ 
+ char *machine__resolve_kernel_addr(void *vmachine, unsigned long long *addrp, char **modp)
+* Unmerged path tools/perf/util/machine.h
+diff --git a/tools/perf/util/map.c b/tools/perf/util/map.c
+index 44d08c01a8c2..715e9a1dd16d 100644
+--- a/tools/perf/util/map.c
++++ b/tools/perf/util/map.c
+@@ -159,12 +159,6 @@ struct map *map__new(struct machine *machine, u64 start, u64 len,
+ 		anon = is_anon_memory(filename, flags);
+ 		vdso = is_vdso_map(filename);
+ 		no_dso = is_no_dso_memory(filename);
+-
+-		if (id)
+-			map->dso_id = *id;
+-		else
+-			map->dso_id.min = map->dso_id.ino = map->dso_id.ino_generation = 0;
+-
+ 		map->prot = prot;
+ 		map->flags = flags;
+ 		nsi = nsinfo__get(thread->nsinfo);
+@@ -194,7 +188,7 @@ struct map *map__new(struct machine *machine, u64 start, u64 len,
+ 			pgoff = 0;
+ 			dso = machine__findnew_vdso(machine, thread);
+ 		} else
+-			dso = machine__findnew_dso(machine, filename);
++			dso = machine__findnew_dso_id(machine, filename, id);
+ 
+ 		if (dso == NULL)
+ 			goto out_delete;
+* Unmerged path tools/perf/util/map.h
+* Unmerged path tools/perf/util/sort.c
