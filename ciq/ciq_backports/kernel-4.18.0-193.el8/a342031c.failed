@@ -1,0 +1,145 @@
+ASoC: create pcm for codec2codec links as well
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: create pcm for codec2codec links as well (Jaroslav Kysela) [1738610]
+Rebuild_FUZZ: 93.88%
+commit-author Jerome Brunet <jbrunet@baylibre.com>
+commit a342031cdd0818cb0fbcb44798211c7a02c7ca27
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a342031c.failed
+
+At the moment, codec to codec links uses an ephemeral variable for
+the struct snd_pcm_substream. Also the struct snd_soc_pcm_runtime
+does not have real struct snd_pcm.
+
+This might a problem if the functions used by a codec on codec to
+codec link expect these structures to exist, and keep on existing
+during the life of the codec.
+
+For example, it is the case of the hdmi-codec, which uses
+snd_pcm_add_chmap_ctls(). For the controls to works, the pcm and
+substream must to exist.
+
+This change is first step, it create pcm (and substreams) for codec
+to codec links, in the same way as dpcm backend links.
+
+	Signed-off-by: Jerome Brunet <jbrunet@baylibre.com>
+Link: https://lore.kernel.org/r/20190725165949.29699-5-jbrunet@baylibre.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit a342031cdd0818cb0fbcb44798211c7a02c7ca27)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/soc-core.c
+#	sound/soc/soc-pcm.c
+diff --cc sound/soc/soc-core.c
+index 279fcb0cb18d,da11e44b01aa..000000000000
+--- a/sound/soc/soc-core.c
++++ b/sound/soc/soc-core.c
+@@@ -1643,43 -1536,35 +1633,59 @@@ static int soc_probe_link_dais(struct s
+  			num = rtd->dai_link->id;
+  	}
+  
+ -	/* create compress_device if possible */
+ -	ret = snd_soc_dai_compress_new(cpu_dai, rtd, num);
+ -	if (ret != -ENOTSUPP) {
+ -		if (ret < 0)
+ +	if (cpu_dai->driver->compress_new) {
+ +		/* create compress_device" */
+ +		ret = cpu_dai->driver->compress_new(rtd, num);
+ +		if (ret < 0) {
+  			dev_err(card->dev, "ASoC: can't create compress %s\n",
+  					 dai_link->stream_name);
+++<<<<<<< HEAD
+ +			return ret;
+ +		}
+ +	} else if (!dai_link->params) {
+ +		/* create the pcm */
+ +		ret = soc_new_pcm(rtd, num);
+ +		if (ret < 0) {
+ +			dev_err(card->dev, "ASoC: can't create pcm %s :%d\n",
+ +				dai_link->stream_name, ret);
+ +			return ret;
+ +		}
+ +		ret = soc_link_dai_pcm_new(&cpu_dai, 1, rtd);
+ +		if (ret < 0)
+ +			return ret;
+ +		ret = soc_link_dai_pcm_new(rtd->codec_dais,
+ +					   rtd->num_codecs, rtd);
+ +		if (ret < 0)
+ +			return ret;
+ +	} else {
+ +		INIT_DELAYED_WORK(&rtd->delayed_work,
+ +				  codec2codec_close_delayed_work);
+++=======
++ 		return ret;
+  	}
+  
+- 	return 0;
++ 	/* create the pcm */
++ 	ret = soc_new_pcm(rtd, num);
++ 	if (ret < 0) {
++ 		dev_err(card->dev, "ASoC: can't create pcm %s :%d\n",
++ 			dai_link->stream_name, ret);
++ 		return ret;
+++>>>>>>> a342031cdd08 (ASoC: create pcm for codec2codec links as well)
++ 	}
++ 	ret = soc_link_dai_pcm_new(&cpu_dai, 1, rtd);
++ 	if (ret < 0)
++ 		return ret;
++ 	ret = soc_link_dai_pcm_new(rtd->codec_dais,
++ 				   rtd->num_codecs, rtd);
++ 	return ret;
+  }
+  
+ -static int soc_bind_aux_dev(struct snd_soc_card *card, int num)
+ +static int soc_bind_aux_dev(struct snd_soc_card *card,
+ +			    struct snd_soc_aux_dev *aux_dev)
+  {
+ -	struct snd_soc_aux_dev *aux_dev = &card->aux_dev[num];
+  	struct snd_soc_component *component;
+ -	struct snd_soc_dai_link_component dlc;
+ +	const char *name;
+ +	struct device_node *codec_of_node;
+  
+  	if (aux_dev->codec_of_node || aux_dev->codec_name) {
+  		/* codecs, usually analog devices */
+diff --cc sound/soc/soc-pcm.c
+index 4878d22ebd8c,30264bc592f6..000000000000
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@@ -3090,15 -3021,23 +3100,26 @@@ int soc_new_pcm(struct snd_soc_pcm_runt
+  		playback = rtd->dai_link->dpcm_playback;
+  		capture = rtd->dai_link->dpcm_capture;
+  	} else {
++ 		/* Adapt stream for codec2codec links */
++ 		struct snd_soc_pcm_stream *cpu_capture = rtd->dai_link->params ?
++ 			&cpu_dai->driver->playback : &cpu_dai->driver->capture;
++ 		struct snd_soc_pcm_stream *cpu_playback = rtd->dai_link->params ?
++ 			&cpu_dai->driver->capture : &cpu_dai->driver->playback;
++ 
+  		for_each_rtd_codec_dai(rtd, i, codec_dai) {
+ -			if (snd_soc_dai_stream_valid(codec_dai, SNDRV_PCM_STREAM_PLAYBACK) &&
+ -			    snd_soc_dai_stream_valid(cpu_dai,   SNDRV_PCM_STREAM_PLAYBACK))
+ +			if (codec_dai->driver->playback.channels_min)
+  				playback = 1;
+ -			if (snd_soc_dai_stream_valid(codec_dai, SNDRV_PCM_STREAM_CAPTURE) &&
+ -			    snd_soc_dai_stream_valid(cpu_dai,   SNDRV_PCM_STREAM_CAPTURE))
+ +			if (codec_dai->driver->capture.channels_min)
+  				capture = 1;
+  		}
+  
+++<<<<<<< HEAD
+ +		capture = capture && cpu_dai->driver->capture.channels_min;
+ +		playback = playback && cpu_dai->driver->playback.channels_min;
+++=======
++ 		capture = capture && cpu_capture->channels_min;
++ 		playback = playback && cpu_playback->channels_min;
+++>>>>>>> a342031cdd08 (ASoC: create pcm for codec2codec links as well)
+  	}
+  
+  	if (rtd->dai_link->playback_only) {
+* Unmerged path sound/soc/soc-core.c
+* Unmerged path sound/soc/soc-pcm.c
