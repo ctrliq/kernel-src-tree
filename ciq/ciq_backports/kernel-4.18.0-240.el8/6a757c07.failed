@@ -1,0 +1,623 @@
+netfilter: conntrack: allow insertion of clashing entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 6a757c07e51f80ac34325fcd558490d2d1439e1b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6a757c07.failed
+
+This patch further relaxes the need to drop an skb due to a clash with
+an existing conntrack entry.
+
+Current clash resolution handles the case where the clash occurs between
+two identical entries (distinct nf_conn objects with same tuples), i.e.:
+
+                    Original                        Reply
+existing: 10.2.3.4:42 -> 10.8.8.8:53      10.2.3.4:42 <- 10.0.0.6:5353
+clashing: 10.2.3.4:42 -> 10.8.8.8:53      10.2.3.4:42 <- 10.0.0.6:5353
+
+... existing handling will discard the unconfirmed clashing entry and
+makes skb->_nfct point to the existing one.  The skb can then be
+processed normally just as if the clash would not have existed in the
+first place.
+
+For other clashes, the skb needs to be dropped.
+This frequently happens with DNS resolvers that send A and AAAA queries
+back-to-back when NAT rules are present that cause packets to get
+different DNAT transformations applied, for example:
+
+-m statistics --mode random ... -j DNAT --dnat-to 10.0.0.6:5353
+-m statistics --mode random ... -j DNAT --dnat-to 10.0.0.7:5353
+
+In this case the A or AAAA query is dropped which incurs a costly
+delay during name resolution.
+
+This patch also allows this collision type:
+                       Original                   Reply
+existing: 10.2.3.4:42 -> 10.8.8.8:53      10.2.3.4:42 <- 10.0.0.6:5353
+clashing: 10.2.3.4:42 -> 10.8.8.8:53      10.2.3.4:42 <- 10.0.0.7:5353
+
+In this case, clash is in original direction -- the reply direction
+is still unique.
+
+The change makes it so that when the 2nd colliding packet is received,
+the clashing conntrack is tagged with new IPS_NAT_CLASH_BIT, gets a fixed
+1 second timeout and is inserted in the reply direction only.
+
+The entry is hidden from 'conntrack -L', it will time out quickly
+and it can be early dropped because it will never progress to the
+ASSURED state.
+
+To avoid special-casing the delete code path to special case
+the ORIGINAL hlist_nulls node, a new helper, "hlist_nulls_add_fake", is
+added so hlist_nulls_del() will work.
+
+Example:
+
+      CPU A:                               CPU B:
+1.  10.2.3.4:42 -> 10.8.8.8:53 (A)
+2.                                         10.2.3.4:42 -> 10.8.8.8:53 (AAAA)
+3.  Apply DNAT, reply changed to 10.0.0.6
+4.                                         10.2.3.4:42 -> 10.8.8.8:53 (AAAA)
+5.                                         Apply DNAT, reply changed to 10.0.0.7
+6. confirm/commit to conntrack table, no collisions
+7.                                         commit clashing entry
+
+Reply comes in:
+
+10.2.3.4:42 <- 10.0.0.6:5353 (A)
+ -> Finds a conntrack, DNAT is reversed & packet forwarded to 10.2.3.4:42
+10.2.3.4:42 <- 10.0.0.7:5353 (AAAA)
+ -> Finds a conntrack, DNAT is reversed & packet forwarded to 10.2.3.4:42
+    The conntrack entry is deleted from table, as it has the NAT_CLASH
+    bit set.
+
+In case of a retransmit from ORIGINAL dir, all further packets will get
+the DNAT transformation to 10.0.0.6.
+
+I tried to come up with other solutions but they all have worse
+problems.
+
+Alternatives considered were:
+1.  Confirm ct entries at allocation time, not in postrouting.
+ a. will cause uneccesarry work when the skb that creates the
+    conntrack is dropped by ruleset.
+ b. in case nat is applied, ct entry would need to be moved in
+    the table, which requires another spinlock pair to be taken.
+ c. breaks the 'unconfirmed entry is private to cpu' assumption:
+    we would need to guard all nfct->ext allocation requests with
+    ct->lock spinlock.
+
+2. Make the unconfirmed list a hash table instead of a pcpu list.
+   Shares drawback c) of the first alternative.
+
+3. Document this is expected and force users to rearrange their
+   ruleset (e.g. by using "-m cluster" instead of "-m statistics").
+   nft has the 'jhash' expression which can be used instead of 'numgen'.
+
+   Major drawback: doesn't fix what I consider a bug, not very realistic
+   and I believe its reasonable to have the existing rulesets to 'just
+   work'.
+
+4. Document this is expected and force users to steer problematic
+   packets to the same CPU -- this would serialize the "allocate new
+   conntrack entry/nat table evaluation/perform nat/confirm entry", so
+   no race can occur.  Similar drawback to 3.
+
+Another advantage of this patch compared to 1) and 2) is that there are
+no changes to the hot path; things are handled in the udp tracker and
+the clash resolution path.
+
+	Cc: rcu@vger.kernel.org
+	Cc: "Paul E. McKenney" <paulmck@kernel.org>
+	Cc: Josh Triplett <josh@joshtriplett.org>
+	Cc: Jozsef Kadlecsik <kadlec@netfilter.org>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 6a757c07e51f80ac34325fcd558490d2d1439e1b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_core.c
+#	net/netfilter/nf_conntrack_proto_udp.c
+diff --cc net/netfilter/nf_conntrack_core.c
+index fc498c249518,1927fc296f95..000000000000
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@@ -734,32 -894,175 +734,196 @@@ static void nf_ct_acct_merge(struct nf_
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +/* Resolve race on insertion if this protocol allows this. */
+ +static __cold noinline int
+ +nf_ct_resolve_clash(struct net *net, struct sk_buff *skb,
+ +		    enum ip_conntrack_info ctinfo,
+ +		    struct nf_conntrack_tuple_hash *h)
+++=======
++ static void __nf_conntrack_insert_prepare(struct nf_conn *ct)
++ {
++ 	struct nf_conn_tstamp *tstamp;
++ 
++ 	atomic_inc(&ct->ct_general.use);
++ 	ct->status |= IPS_CONFIRMED;
++ 
++ 	/* set conntrack timestamp, if enabled. */
++ 	tstamp = nf_conn_tstamp_find(ct);
++ 	if (tstamp)
++ 		tstamp->start = ktime_get_real_ns();
++ }
++ 
++ static int __nf_ct_resolve_clash(struct sk_buff *skb,
++ 				 struct nf_conntrack_tuple_hash *h)
++ {
++ 	/* This is the conntrack entry already in hashes that won race. */
++ 	struct nf_conn *ct = nf_ct_tuplehash_to_ctrack(h);
++ 	enum ip_conntrack_info ctinfo;
++ 	struct nf_conn *loser_ct;
++ 
++ 	loser_ct = nf_ct_get(skb, &ctinfo);
++ 
++ 	if (nf_ct_is_dying(ct))
++ 		return NF_DROP;
++ 
++ 	if (!atomic_inc_not_zero(&ct->ct_general.use))
++ 		return NF_DROP;
++ 
++ 	if (((ct->status & IPS_NAT_DONE_MASK) == 0) ||
++ 	    nf_ct_match(ct, loser_ct)) {
++ 		struct net *net = nf_ct_net(ct);
++ 
++ 		nf_ct_acct_merge(ct, ctinfo, loser_ct);
++ 		nf_ct_add_to_dying_list(loser_ct);
++ 		nf_conntrack_put(&loser_ct->ct_general);
++ 		nf_ct_set(skb, ct, ctinfo);
++ 
++ 		NF_CT_STAT_INC(net, insert_failed);
++ 		return NF_ACCEPT;
++ 	}
++ 
++ 	nf_ct_put(ct);
++ 	return NF_DROP;
++ }
++ 
++ /**
++  * nf_ct_resolve_clash_harder - attempt to insert clashing conntrack entry
++  *
++  * @skb: skb that causes the collision
++  * @repl_idx: hash slot for reply direction
++  *
++  * Called when origin or reply direction had a clash.
++  * The skb can be handled without packet drop provided the reply direction
++  * is unique or there the existing entry has the identical tuple in both
++  * directions.
++  *
++  * Caller must hold conntrack table locks to prevent concurrent updates.
++  *
++  * Returns NF_DROP if the clash could not be handled.
++  */
++ static int nf_ct_resolve_clash_harder(struct sk_buff *skb, u32 repl_idx)
++ {
++ 	struct nf_conn *loser_ct = (struct nf_conn *)skb_nfct(skb);
++ 	const struct nf_conntrack_zone *zone;
++ 	struct nf_conntrack_tuple_hash *h;
++ 	struct hlist_nulls_node *n;
++ 	struct net *net;
++ 
++ 	zone = nf_ct_zone(loser_ct);
++ 	net = nf_ct_net(loser_ct);
++ 
++ 	/* Reply direction must never result in a clash, unless both origin
++ 	 * and reply tuples are identical.
++ 	 */
++ 	hlist_nulls_for_each_entry(h, n, &nf_conntrack_hash[repl_idx], hnnode) {
++ 		if (nf_ct_key_equal(h,
++ 				    &loser_ct->tuplehash[IP_CT_DIR_REPLY].tuple,
++ 				    zone, net))
++ 			return __nf_ct_resolve_clash(skb, h);
++ 	}
++ 
++ 	/* We want the clashing entry to go away real soon: 1 second timeout. */
++ 	loser_ct->timeout = nfct_time_stamp + HZ;
++ 
++ 	/* IPS_NAT_CLASH removes the entry automatically on the first
++ 	 * reply.  Also prevents UDP tracker from moving the entry to
++ 	 * ASSURED state, i.e. the entry can always be evicted under
++ 	 * pressure.
++ 	 */
++ 	loser_ct->status |= IPS_FIXED_TIMEOUT | IPS_NAT_CLASH;
++ 
++ 	__nf_conntrack_insert_prepare(loser_ct);
++ 
++ 	/* fake add for ORIGINAL dir: we want lookups to only find the entry
++ 	 * already in the table.  This also hides the clashing entry from
++ 	 * ctnetlink iteration, i.e. conntrack -L won't show them.
++ 	 */
++ 	hlist_nulls_add_fake(&loser_ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode);
++ 
++ 	hlist_nulls_add_head_rcu(&loser_ct->tuplehash[IP_CT_DIR_REPLY].hnnode,
++ 				 &nf_conntrack_hash[repl_idx]);
++ 	return NF_ACCEPT;
++ }
++ 
++ /**
++  * nf_ct_resolve_clash - attempt to handle clash without packet drop
++  *
++  * @skb: skb that causes the clash
++  * @h: tuplehash of the clashing entry already in table
++  * @hash_reply: hash slot for reply direction
++  *
++  * A conntrack entry can be inserted to the connection tracking table
++  * if there is no existing entry with an identical tuple.
++  *
++  * If there is one, @skb (and the assocated, unconfirmed conntrack) has
++  * to be dropped.  In case @skb is retransmitted, next conntrack lookup
++  * will find the already-existing entry.
++  *
++  * The major problem with such packet drop is the extra delay added by
++  * the packet loss -- it will take some time for a retransmit to occur
++  * (or the sender to time out when waiting for a reply).
++  *
++  * This function attempts to handle the situation without packet drop.
++  *
++  * If @skb has no NAT transformation or if the colliding entries are
++  * exactly the same, only the to-be-confirmed conntrack entry is discarded
++  * and @skb is associated with the conntrack entry already in the table.
++  *
++  * Failing that, the new, unconfirmed conntrack is still added to the table
++  * provided that the collision only occurs in the ORIGINAL direction.
++  * The new entry will be added after the existing one in the hash list,
++  * so packets in the ORIGINAL direction will continue to match the existing
++  * entry.  The new entry will also have a fixed timeout so it expires --
++  * due to the collision, it will not see bidirectional traffic.
++  *
++  * Returns NF_DROP if the clash could not be resolved.
++  */
++ static __cold noinline int
++ nf_ct_resolve_clash(struct sk_buff *skb, struct nf_conntrack_tuple_hash *h,
++ 		    u32 reply_hash)
+++>>>>>>> 6a757c07e51f (netfilter: conntrack: allow insertion of clashing entries)
+  {
+  	/* This is the conntrack entry already in hashes that won race. */
+  	struct nf_conn *ct = nf_ct_tuplehash_to_ctrack(h);
+  	const struct nf_conntrack_l4proto *l4proto;
+ -	enum ip_conntrack_info ctinfo;
+ -	struct nf_conn *loser_ct;
+ -	struct net *net;
+ -	int ret;
+ -
+ +	enum ip_conntrack_info oldinfo;
+ +	struct nf_conn *loser_ct = nf_ct_get(skb, &oldinfo);
+ +
+++<<<<<<< HEAD
+ +	l4proto = __nf_ct_l4proto_find(nf_ct_l3num(ct), nf_ct_protonum(ct));
+ +	if (l4proto->allow_clash &&
+ +	    !nf_ct_is_dying(ct) &&
+ +	    atomic_inc_not_zero(&ct->ct_general.use)) {
+ +		if (((ct->status & IPS_NAT_DONE_MASK) == 0) ||
+ +		    nf_ct_match(ct, loser_ct)) {
+ +			nf_ct_acct_merge(ct, ctinfo, loser_ct);
+ +			nf_conntrack_put(&loser_ct->ct_general);
+ +			nf_ct_set(skb, ct, oldinfo);
+ +			return NF_ACCEPT;
+ +		}
+ +		nf_ct_put(ct);
+ +	}
+++=======
++ 	loser_ct = nf_ct_get(skb, &ctinfo);
++ 	net = nf_ct_net(loser_ct);
++ 
++ 	l4proto = nf_ct_l4proto_find(nf_ct_protonum(ct));
++ 	if (!l4proto->allow_clash)
++ 		goto drop;
++ 
++ 	ret = __nf_ct_resolve_clash(skb, h);
++ 	if (ret == NF_ACCEPT)
++ 		return ret;
++ 
++ 	ret = nf_ct_resolve_clash_harder(skb, reply_hash);
++ 	if (ret == NF_ACCEPT)
++ 		return ret;
++ 
++ drop:
++ 	nf_ct_add_to_dying_list(loser_ct);
+++>>>>>>> 6a757c07e51f (netfilter: conntrack: allow insertion of clashing entries)
+  	NF_CT_STAT_INC(net, drop);
+ -	NF_CT_STAT_INC(net, insert_failed);
+  	return NF_DROP;
+  }
+  
+@@@ -867,11 -1173,9 +1031,15 @@@ __nf_conntrack_confirm(struct sk_buff *
+  	return NF_ACCEPT;
+  
+  out:
+++<<<<<<< HEAD
+ +	nf_ct_add_to_dying_list(ct);
+ +	ret = nf_ct_resolve_clash(net, skb, ctinfo, h);
+++=======
++ 	ret = nf_ct_resolve_clash(skb, h, reply_hash);
+++>>>>>>> 6a757c07e51f (netfilter: conntrack: allow insertion of clashing entries)
+  dying:
+  	nf_conntrack_double_unlock(hash, reply_hash);
+ +	NF_CT_STAT_INC(net, insert_failed);
+  	local_bh_enable();
+  	return ret;
+  }
+diff --cc net/netfilter/nf_conntrack_proto_udp.c
+index fe7243970aa4,760ca2422816..000000000000
+--- a/net/netfilter/nf_conntrack_proto_udp.c
++++ b/net/netfilter/nf_conntrack_proto_udp.c
+@@@ -28,53 -26,181 +28,211 @@@
+  
+  static const unsigned int udp_timeouts[UDP_CT_MAX] = {
+  	[UDP_CT_UNREPLIED]	= 30*HZ,
+ -	[UDP_CT_REPLIED]	= 120*HZ,
+ +	[UDP_CT_REPLIED]	= 180*HZ,
+  };
+  
+ -static unsigned int *udp_get_timeouts(struct net *net)
+ +static inline struct nf_udp_net *udp_pernet(struct net *net)
+  {
+ -	return nf_udp_pernet(net)->timeouts;
+ +	return &net->ct.nf_ct_proto.udp;
+  }
+  
+ -static void udp_error_log(const struct sk_buff *skb,
+ -			  const struct nf_hook_state *state,
+ -			  const char *msg)
+ +static bool udp_pkt_to_tuple(const struct sk_buff *skb,
+ +			     unsigned int dataoff,
+ +			     struct net *net,
+ +			     struct nf_conntrack_tuple *tuple)
+  {
+ -	nf_l4proto_log_invalid(skb, state->net, state->pf,
+ -			       IPPROTO_UDP, "%s", msg);
+ +	const struct udphdr *hp;
+ +	struct udphdr _hdr;
+ +
+ +	/* Actually only need first 4 bytes to get ports. */
+ +	hp = skb_header_pointer(skb, dataoff, 4, &_hdr);
+ +	if (hp == NULL)
+ +		return false;
+ +
+ +	tuple->src.u.udp.port = hp->source;
+ +	tuple->dst.u.udp.port = hp->dest;
+ +
+ +	return true;
+ +}
+ +
+ +static bool udp_invert_tuple(struct nf_conntrack_tuple *tuple,
+ +			     const struct nf_conntrack_tuple *orig)
+ +{
+ +	tuple->src.u.udp.port = orig->dst.u.udp.port;
+ +	tuple->dst.u.udp.port = orig->src.u.udp.port;
+ +	return true;
+ +}
+ +
+ +static unsigned int *udp_get_timeouts(struct net *net)
+ +{
+ +	return udp_pernet(net)->timeouts;
+  }
+  
+ -static bool udp_error(struct sk_buff *skb,
+ +/* Returns verdict for packet, and may modify conntracktype */
+ +static int udp_packet(struct nf_conn *ct,
+ +		      const struct sk_buff *skb,
+  		      unsigned int dataoff,
+ -		      const struct nf_hook_state *state)
+ +		      enum ip_conntrack_info ctinfo,
+ +		      unsigned int *timeouts)
+  {
+++<<<<<<< HEAD
+++=======
++ 	unsigned int udplen = skb->len - dataoff;
++ 	const struct udphdr *hdr;
++ 	struct udphdr _hdr;
++ 
++ 	/* Header is too small? */
++ 	hdr = skb_header_pointer(skb, dataoff, sizeof(_hdr), &_hdr);
++ 	if (!hdr) {
++ 		udp_error_log(skb, state, "short packet");
++ 		return true;
++ 	}
++ 
++ 	/* Truncated/malformed packets */
++ 	if (ntohs(hdr->len) > udplen || ntohs(hdr->len) < sizeof(*hdr)) {
++ 		udp_error_log(skb, state, "truncated/malformed packet");
++ 		return true;
++ 	}
++ 
++ 	/* Packet with no checksum */
++ 	if (!hdr->check)
++ 		return false;
++ 
++ 	/* Checksum invalid? Ignore.
++ 	 * We skip checking packets on the outgoing path
++ 	 * because the checksum is assumed to be correct.
++ 	 * FIXME: Source route IP option packets --RR */
++ 	if (state->hook == NF_INET_PRE_ROUTING &&
++ 	    state->net->ct.sysctl_checksum &&
++ 	    nf_checksum(skb, state->hook, dataoff, IPPROTO_UDP, state->pf)) {
++ 		udp_error_log(skb, state, "bad checksum");
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static void nf_conntrack_udp_refresh_unreplied(struct nf_conn *ct,
++ 					       struct sk_buff *skb,
++ 					       enum ip_conntrack_info ctinfo,
++ 					       u32 extra_jiffies)
++ {
++ 	if (unlikely(ctinfo == IP_CT_ESTABLISHED_REPLY &&
++ 		     ct->status & IPS_NAT_CLASH))
++ 		nf_ct_kill(ct);
++ 	else
++ 		nf_ct_refresh_acct(ct, ctinfo, skb, extra_jiffies);
++ }
++ 
++ /* Returns verdict for packet, and may modify conntracktype */
++ int nf_conntrack_udp_packet(struct nf_conn *ct,
++ 			    struct sk_buff *skb,
++ 			    unsigned int dataoff,
++ 			    enum ip_conntrack_info ctinfo,
++ 			    const struct nf_hook_state *state)
++ {
++ 	unsigned int *timeouts;
++ 
++ 	if (udp_error(skb, dataoff, state))
++ 		return -NF_ACCEPT;
++ 
++ 	timeouts = nf_ct_timeout_lookup(ct);
++ 	if (!timeouts)
++ 		timeouts = udp_get_timeouts(nf_ct_net(ct));
++ 
++ 	if (!nf_ct_is_confirmed(ct))
++ 		ct->proto.udp.stream_ts = 2 * HZ + jiffies;
++ 
++ 	/* If we've seen traffic both ways, this is some kind of UDP
++ 	 * stream. Set Assured.
++ 	 */
++ 	if (test_bit(IPS_SEEN_REPLY_BIT, &ct->status)) {
++ 		unsigned long extra = timeouts[UDP_CT_UNREPLIED];
++ 
++ 		/* Still active after two seconds? Extend timeout. */
++ 		if (time_after(jiffies, ct->proto.udp.stream_ts))
++ 			extra = timeouts[UDP_CT_REPLIED];
++ 
++ 		nf_ct_refresh_acct(ct, ctinfo, skb, extra);
++ 
++ 		/* Also, more likely to be important, and not a probe */
++ 		if (!test_and_set_bit(IPS_ASSURED_BIT, &ct->status))
++ 			nf_conntrack_event_cache(IPCT_ASSURED, ct);
++ 	} else {
++ 		nf_conntrack_udp_refresh_unreplied(ct, skb, ctinfo,
++ 						   timeouts[UDP_CT_UNREPLIED]);
++ 	}
++ 	return NF_ACCEPT;
++ }
++ 
++ #ifdef CONFIG_NF_CT_PROTO_UDPLITE
++ static void udplite_error_log(const struct sk_buff *skb,
++ 			      const struct nf_hook_state *state,
++ 			      const char *msg)
++ {
++ 	nf_l4proto_log_invalid(skb, state->net, state->pf,
++ 			       IPPROTO_UDPLITE, "%s", msg);
++ }
++ 
++ static bool udplite_error(struct sk_buff *skb,
++ 			  unsigned int dataoff,
++ 			  const struct nf_hook_state *state)
++ {
++ 	unsigned int udplen = skb->len - dataoff;
++ 	const struct udphdr *hdr;
++ 	struct udphdr _hdr;
++ 	unsigned int cscov;
++ 
++ 	/* Header is too small? */
++ 	hdr = skb_header_pointer(skb, dataoff, sizeof(_hdr), &_hdr);
++ 	if (!hdr) {
++ 		udplite_error_log(skb, state, "short packet");
++ 		return true;
++ 	}
++ 
++ 	cscov = ntohs(hdr->len);
++ 	if (cscov == 0) {
++ 		cscov = udplen;
++ 	} else if (cscov < sizeof(*hdr) || cscov > udplen) {
++ 		udplite_error_log(skb, state, "invalid checksum coverage");
++ 		return true;
++ 	}
++ 
++ 	/* UDPLITE mandates checksums */
++ 	if (!hdr->check) {
++ 		udplite_error_log(skb, state, "checksum missing");
++ 		return true;
++ 	}
++ 
++ 	/* Checksum invalid? Ignore. */
++ 	if (state->hook == NF_INET_PRE_ROUTING &&
++ 	    state->net->ct.sysctl_checksum &&
++ 	    nf_checksum_partial(skb, state->hook, dataoff, cscov, IPPROTO_UDP,
++ 				state->pf)) {
++ 		udplite_error_log(skb, state, "bad checksum");
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ /* Returns verdict for packet, and may modify conntracktype */
++ int nf_conntrack_udplite_packet(struct nf_conn *ct,
++ 				struct sk_buff *skb,
++ 				unsigned int dataoff,
++ 				enum ip_conntrack_info ctinfo,
++ 				const struct nf_hook_state *state)
++ {
++ 	unsigned int *timeouts;
++ 
++ 	if (udplite_error(skb, dataoff, state))
++ 		return -NF_ACCEPT;
++ 
++ 	timeouts = nf_ct_timeout_lookup(ct);
++ 	if (!timeouts)
++ 		timeouts = udp_get_timeouts(nf_ct_net(ct));
++ 
+++>>>>>>> 6a757c07e51f (netfilter: conntrack: allow insertion of clashing entries)
+  	/* If we've seen traffic both ways, this is some kind of UDP
+  	   stream.  Extend timeout. */
+  	if (test_bit(IPS_SEEN_REPLY_BIT, &ct->status)) {
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index bc8206a8f30e..9feefd18a4b9 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -100,6 +100,13 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+ 		first->pprev = &n->next;
+ }
+ 
++/* after that hlist_nulls_del will work */
++static inline void hlist_nulls_add_fake(struct hlist_nulls_node *n)
++{
++	n->pprev = &n->next;
++	n->next = (struct hlist_nulls_node *)NULLS_MARKER(NULL);
++}
++
+ /**
+  * hlist_nulls_for_each_entry_rcu - iterate over rcu list of given type
+  * @tpos:	the type * to use as a loop cursor.
+diff --git a/include/uapi/linux/netfilter/nf_conntrack_common.h b/include/uapi/linux/netfilter/nf_conntrack_common.h
+index 336014bf8868..b6f0bb1dc799 100644
+--- a/include/uapi/linux/netfilter/nf_conntrack_common.h
++++ b/include/uapi/linux/netfilter/nf_conntrack_common.h
+@@ -97,6 +97,15 @@ enum ip_conntrack_status {
+ 	IPS_UNTRACKED_BIT = 12,
+ 	IPS_UNTRACKED = (1 << IPS_UNTRACKED_BIT),
+ 
++#ifdef __KERNEL__
++	/* Re-purposed for in-kernel use:
++	 * Tags a conntrack entry that clashed with an existing entry
++	 * on insert.
++	 */
++	IPS_NAT_CLASH_BIT = IPS_UNTRACKED_BIT,
++	IPS_NAT_CLASH = IPS_UNTRACKED,
++#endif
++
+ 	/* Conntrack got a helper explicitly attached via CT target. */
+ 	IPS_HELPER_BIT = 13,
+ 	IPS_HELPER = (1 << IPS_HELPER_BIT),
+@@ -110,7 +119,8 @@ enum ip_conntrack_status {
+ 	 */
+ 	IPS_UNCHANGEABLE_MASK = (IPS_NAT_DONE_MASK | IPS_NAT_MASK |
+ 				 IPS_EXPECTED | IPS_CONFIRMED | IPS_DYING |
+-				 IPS_SEQ_ADJUST | IPS_TEMPLATE | IPS_OFFLOAD),
++				 IPS_SEQ_ADJUST | IPS_TEMPLATE | IPS_UNTRACKED |
++				 IPS_OFFLOAD),
+ 
+ 	__IPS_MAX_BIT = 15,
+ };
+* Unmerged path net/netfilter/nf_conntrack_core.c
+* Unmerged path net/netfilter/nf_conntrack_proto_udp.c
