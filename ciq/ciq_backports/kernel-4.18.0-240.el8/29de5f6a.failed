@@ -1,0 +1,194 @@
+io_uring: consider any io_read/write -EAGAIN as final
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 29de5f6a350778a621a748cecc7efbb8f0cfa5a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/29de5f6a.failed
+
+If the -EAGAIN happens because of a static condition, then a poll
+or later retry won't fix it. We must call it again from blocking
+condition. Play it safe and ensure that any -EAGAIN condition from read
+or write must retry from async context.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 29de5f6a350778a621a748cecc7efbb8f0cfa5a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,64b4519aabf8..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1340,44 -2232,50 +1340,74 @@@ static int io_read(struct io_kiocb *req
+  	if (ret < 0)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	read_size = ret;
+ +	if (req->flags & REQ_F_LINK)
+ +		req->result = read_size;
+++=======
++ 	/* Ensure we clear previously set non-block flag */
++ 	if (!force_nonblock)
++ 		kiocb->ki_flags &= ~IOCB_NOWAIT;
++ 
++ 	req->result = 0;
++ 	io_size = ret;
++ 	if (req->flags & REQ_F_LINK)
++ 		req->result = io_size;
++ 
++ 	/*
++ 	 * If the file doesn't support async, mark it as REQ_F_MUST_PUNT so
++ 	 * we know to async punt it even if it was opened O_NONBLOCK
++ 	 */
++ 	if (force_nonblock && !io_file_supports_async(req->file))
++ 		goto copy_iov;
+++>>>>>>> 29de5f6a3507 (io_uring: consider any io_read/write -EAGAIN as final)
+  
+  	iov_count = iov_iter_count(&iter);
+ -	ret = rw_verify_area(READ, req->file, &kiocb->ki_pos, iov_count);
+ +	ret = rw_verify_area(READ, file, &kiocb->ki_pos, iov_count);
+  	if (!ret) {
+  		ssize_t ret2;
+  
+ -		if (req->file->f_op->read_iter)
+ -			ret2 = call_read_iter(req->file, kiocb, &iter);
+ +		if (file->f_op->read_iter)
+ +			ret2 = call_read_iter(file, kiocb, &iter);
+  		else
+ -			ret2 = loop_rw_iter(READ, req->file, kiocb, &iter);
+ +			ret2 = loop_rw_iter(READ, file, kiocb, &iter);
+  
+ +		/*
+ +		 * In case of a short read, punt to async. This can happen
+ +		 * if we have data partially cached. Alternatively we can
+ +		 * return the short read, in which case the application will
+ +		 * need to issue another SQE and wait for it. That SQE will
+ +		 * need async punt anyway, so it's more efficient to do it
+ +		 * here.
+ +		 */
+ +		if (force_nonblock && ret2 > 0 && ret2 < read_size)
+ +			ret2 = -EAGAIN;
+  		/* Catch -EAGAIN return for forced non-blocking submission */
+  		if (!force_nonblock || ret2 != -EAGAIN) {
+ -			kiocb_done(kiocb, ret2, nxt, req->in_async);
+ +			io_rw_done(kiocb, ret2);
+  		} else {
+++<<<<<<< HEAD
+ +			/*
+ +			 * If ->needs_lock is true, we're already in async
+ +			 * context.
+ +			 */
+ +			if (!s->needs_lock)
+ +				io_async_list_note(READ, req, iov_count);
+ +			ret = -EAGAIN;
+++=======
++ copy_iov:
++ 			ret = io_setup_async_rw(req, io_size, iovec,
++ 						inline_vecs, &iter);
++ 			if (ret)
++ 				goto out_free;
++ 			/* any defer here is final, must blocking retry */
++ 			if (!(req->flags & REQ_F_NOWAIT))
++ 				req->flags |= REQ_F_MUST_PUNT;
++ 			return -EAGAIN;
+++>>>>>>> 29de5f6a3507 (io_uring: consider any io_read/write -EAGAIN as final)
+  		}
+  	}
+ -out_free:
+  	kfree(iovec);
+ -	req->flags &= ~REQ_F_NEED_CLEANUP;
+  	return ret;
+  }
+  
+@@@ -1403,20 -2322,29 +1433,36 @@@ static int io_write(struct io_kiocb *re
+  	if (ret < 0)
+  		return ret;
+  
+ -	/* Ensure we clear previously set non-block flag */
+ -	if (!force_nonblock)
+ -		req->rw.kiocb.ki_flags &= ~IOCB_NOWAIT;
+ -
+ -	req->result = 0;
+ -	io_size = ret;
+  	if (req->flags & REQ_F_LINK)
+++<<<<<<< HEAD
+ +		req->result = ret;
+++=======
++ 		req->result = io_size;
++ 
++ 	/*
++ 	 * If the file doesn't support async, mark it as REQ_F_MUST_PUNT so
++ 	 * we know to async punt it even if it was opened O_NONBLOCK
++ 	 */
++ 	if (force_nonblock && !io_file_supports_async(req->file))
++ 		goto copy_iov;
++ 
++ 	/* file path doesn't support NOWAIT for non-direct_IO */
++ 	if (force_nonblock && !(kiocb->ki_flags & IOCB_DIRECT) &&
++ 	    (req->flags & REQ_F_ISREG))
++ 		goto copy_iov;
+++>>>>>>> 29de5f6a3507 (io_uring: consider any io_read/write -EAGAIN as final)
+  
+  	iov_count = iov_iter_count(&iter);
+ -	ret = rw_verify_area(WRITE, req->file, &kiocb->ki_pos, iov_count);
+ +
+ +	ret = -EAGAIN;
+ +	if (force_nonblock && !(kiocb->ki_flags & IOCB_DIRECT)) {
+ +		/* If ->needs_lock is true, we're already in async context. */
+ +		if (!s->needs_lock)
+ +			io_async_list_note(WRITE, req, iov_count);
+ +		goto out_free;
+ +	}
+ +
+ +	ret = rw_verify_area(WRITE, file, &kiocb->ki_pos, iov_count);
+  	if (!ret) {
+  		ssize_t ret2;
+  
+@@@ -1435,20 -2363,27 +1481,31 @@@
+  		}
+  		kiocb->ki_flags |= IOCB_WRITE;
+  
+ -		if (req->file->f_op->write_iter)
+ -			ret2 = call_write_iter(req->file, kiocb, &iter);
+ +		if (file->f_op->write_iter)
+ +			ret2 = call_write_iter(file, kiocb, &iter);
+  		else
+ -			ret2 = loop_rw_iter(WRITE, req->file, kiocb, &iter);
+ -		/*
+ -		 * Raw bdev writes will -EOPNOTSUPP for IOCB_NOWAIT. Just
+ -		 * retry them without IOCB_NOWAIT.
+ -		 */
+ -		if (ret2 == -EOPNOTSUPP && (kiocb->ki_flags & IOCB_NOWAIT))
+ -			ret2 = -EAGAIN;
+ +			ret2 = loop_rw_iter(WRITE, file, kiocb, &iter);
+  		if (!force_nonblock || ret2 != -EAGAIN) {
+ -			kiocb_done(kiocb, ret2, nxt, req->in_async);
+ +			io_rw_done(kiocb, ret2);
+  		} else {
+++<<<<<<< HEAD
+ +			/*
+ +			 * If ->needs_lock is true, we're already in async
+ +			 * context.
+ +			 */
+ +			if (!s->needs_lock)
+ +				io_async_list_note(WRITE, req, iov_count);
+ +			ret = -EAGAIN;
+++=======
++ copy_iov:
++ 			ret = io_setup_async_rw(req, io_size, iovec,
++ 						inline_vecs, &iter);
++ 			if (ret)
++ 				goto out_free;
++ 			/* any defer here is final, must blocking retry */
++ 			req->flags |= REQ_F_MUST_PUNT;
++ 			return -EAGAIN;
+++>>>>>>> 29de5f6a3507 (io_uring: consider any io_read/write -EAGAIN as final)
+  		}
+  	}
+  out_free:
+* Unmerged path fs/io_uring.c
