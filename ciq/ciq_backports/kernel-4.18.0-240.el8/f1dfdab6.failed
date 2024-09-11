@@ -1,0 +1,253 @@
+sched/vtime: Prevent unstable evaluation of WARN(vtime->state)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Chris Wilson <chris@chris-wilson.co.uk>
+commit f1dfdab694eb3838ac26f4b73695929c07d92a33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f1dfdab6.failed
+
+As the vtime is sampled under loose seqcount protection by kcpustat, the
+vtime fields may change as the code flows. Where logic dictates a field
+has a static value, use a READ_ONCE.
+
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Fixes: 74722bb223d0 ("sched/vtime: Bring up complete kcpustat accessor")
+Link: https://lkml.kernel.org/r/20200123180849.28486-1-frederic@kernel.org
+(cherry picked from commit f1dfdab694eb3838ac26f4b73695929c07d92a33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/cputime.c
+diff --cc kernel/sched/cputime.c
+index c3032fb00ef6,dac9104d126f..000000000000
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@@ -896,43 -909,91 +896,122 @@@ void task_cputime(struct task_struct *t
+  	} while (read_seqcount_retry(&vtime->seqcount, seq));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vtime_state_fetch(struct vtime *vtime, int cpu)
++ {
++ 	int state = READ_ONCE(vtime->state);
++ 
++ 	/*
++ 	 * We raced against a context switch, fetch the
++ 	 * kcpustat task again.
++ 	 */
++ 	if (vtime->cpu != cpu && vtime->cpu != -1)
++ 		return -EAGAIN;
++ 
++ 	/*
++ 	 * Two possible things here:
++ 	 * 1) We are seeing the scheduling out task (prev) or any past one.
++ 	 * 2) We are seeing the scheduling in task (next) but it hasn't
++ 	 *    passed though vtime_task_switch() yet so the pending
++ 	 *    cputime of the prev task may not be flushed yet.
++ 	 *
++ 	 * Case 1) is ok but 2) is not. So wait for a safe VTIME state.
++ 	 */
++ 	if (state == VTIME_INACTIVE)
++ 		return -EAGAIN;
++ 
++ 	return state;
++ }
++ 
++ static u64 kcpustat_user_vtime(struct vtime *vtime)
++ {
++ 	if (vtime->state == VTIME_USER)
++ 		return vtime->utime + vtime_delta(vtime);
++ 	else if (vtime->state == VTIME_GUEST)
++ 		return vtime->gtime + vtime_delta(vtime);
++ 	return 0;
++ }
++ 
+++>>>>>>> f1dfdab694eb (sched/vtime: Prevent unstable evaluation of WARN(vtime->state))
+  static int kcpustat_field_vtime(u64 *cpustat,
+ -				struct task_struct *tsk,
+ +				struct vtime *vtime,
+  				enum cpu_usage_stat usage,
+  				int cpu, u64 *val)
+  {
+ -	struct vtime *vtime = &tsk->vtime;
+  	unsigned int seq;
+- 	int err;
+  
+  	do {
++ 		int state;
++ 
+  		seq = read_seqcount_begin(&vtime->seqcount);
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * We raced against context switch, fetch the
+ +		 * kcpustat task again.
+ +		 */
+ +		if (vtime->cpu != cpu && vtime->cpu != -1)
+ +			return -EAGAIN;
+ +
+ +		/*
+ +		 * Two possible things here:
+ +		 * 1) We are seeing the scheduling out task (prev) or any past one.
+ +		 * 2) We are seeing the scheduling in task (next) but it hasn't
+ +		 *    passed though vtime_task_switch() yet so the pending
+ +		 *    cputime of the prev task may not be flushed yet.
+ +		 *
+ +		 * Case 1) is ok but 2) is not. So wait for a safe VTIME state.
+ +		 */
+ +		if (vtime->state == VTIME_INACTIVE)
+ +			return -EAGAIN;
+ +
+ +		err = 0;
+ +
+ +		*val = cpustat[usage];
+ +
+ +		if (vtime->state == VTIME_SYS)
+ +			*val += vtime->stime + vtime_delta(vtime);
+ +
+++=======
++ 		state = vtime_state_fetch(vtime, cpu);
++ 		if (state < 0)
++ 			return state;
++ 
++ 		*val = cpustat[usage];
++ 
++ 		/*
++ 		 * Nice VS unnice cputime accounting may be inaccurate if
++ 		 * the nice value has changed since the last vtime update.
++ 		 * But proper fix would involve interrupting target on nice
++ 		 * updates which is a no go on nohz_full (although the scheduler
++ 		 * may still interrupt the target if rescheduling is needed...)
++ 		 */
++ 		switch (usage) {
++ 		case CPUTIME_SYSTEM:
++ 			if (state == VTIME_SYS)
++ 				*val += vtime->stime + vtime_delta(vtime);
++ 			break;
++ 		case CPUTIME_USER:
++ 			if (task_nice(tsk) <= 0)
++ 				*val += kcpustat_user_vtime(vtime);
++ 			break;
++ 		case CPUTIME_NICE:
++ 			if (task_nice(tsk) > 0)
++ 				*val += kcpustat_user_vtime(vtime);
++ 			break;
++ 		case CPUTIME_GUEST:
++ 			if (state == VTIME_GUEST && task_nice(tsk) <= 0)
++ 				*val += vtime->gtime + vtime_delta(vtime);
++ 			break;
++ 		case CPUTIME_GUEST_NICE:
++ 			if (state == VTIME_GUEST && task_nice(tsk) > 0)
++ 				*val += vtime->gtime + vtime_delta(vtime);
++ 			break;
++ 		default:
++ 			break;
++ 		}
+++>>>>>>> f1dfdab694eb (sched/vtime: Prevent unstable evaluation of WARN(vtime->state))
+  	} while (read_seqcount_retry(&vtime->seqcount, seq));
+  
+  	return 0;
+@@@ -977,4 -1032,93 +1056,96 @@@ u64 kcpustat_field(struct kernel_cpusta
+  	}
+  }
+  EXPORT_SYMBOL_GPL(kcpustat_field);
+++<<<<<<< HEAD
+++=======
++ 
++ static int kcpustat_cpu_fetch_vtime(struct kernel_cpustat *dst,
++ 				    const struct kernel_cpustat *src,
++ 				    struct task_struct *tsk, int cpu)
++ {
++ 	struct vtime *vtime = &tsk->vtime;
++ 	unsigned int seq;
++ 
++ 	do {
++ 		u64 *cpustat;
++ 		u64 delta;
++ 		int state;
++ 
++ 		seq = read_seqcount_begin(&vtime->seqcount);
++ 
++ 		state = vtime_state_fetch(vtime, cpu);
++ 		if (state < 0)
++ 			return state;
++ 
++ 		*dst = *src;
++ 		cpustat = dst->cpustat;
++ 
++ 		/* Task is sleeping, dead or idle, nothing to add */
++ 		if (state < VTIME_SYS)
++ 			continue;
++ 
++ 		delta = vtime_delta(vtime);
++ 
++ 		/*
++ 		 * Task runs either in user (including guest) or kernel space,
++ 		 * add pending nohz time to the right place.
++ 		 */
++ 		if (state == VTIME_SYS) {
++ 			cpustat[CPUTIME_SYSTEM] += vtime->stime + delta;
++ 		} else if (state == VTIME_USER) {
++ 			if (task_nice(tsk) > 0)
++ 				cpustat[CPUTIME_NICE] += vtime->utime + delta;
++ 			else
++ 				cpustat[CPUTIME_USER] += vtime->utime + delta;
++ 		} else {
++ 			WARN_ON_ONCE(state != VTIME_GUEST);
++ 			if (task_nice(tsk) > 0) {
++ 				cpustat[CPUTIME_GUEST_NICE] += vtime->gtime + delta;
++ 				cpustat[CPUTIME_NICE] += vtime->gtime + delta;
++ 			} else {
++ 				cpustat[CPUTIME_GUEST] += vtime->gtime + delta;
++ 				cpustat[CPUTIME_USER] += vtime->gtime + delta;
++ 			}
++ 		}
++ 	} while (read_seqcount_retry(&vtime->seqcount, seq));
++ 
++ 	return 0;
++ }
++ 
++ void kcpustat_cpu_fetch(struct kernel_cpustat *dst, int cpu)
++ {
++ 	const struct kernel_cpustat *src = &kcpustat_cpu(cpu);
++ 	struct rq *rq;
++ 	int err;
++ 
++ 	if (!vtime_accounting_enabled_cpu(cpu)) {
++ 		*dst = *src;
++ 		return;
++ 	}
++ 
++ 	rq = cpu_rq(cpu);
++ 
++ 	for (;;) {
++ 		struct task_struct *curr;
++ 
++ 		rcu_read_lock();
++ 		curr = rcu_dereference(rq->curr);
++ 		if (WARN_ON_ONCE(!curr)) {
++ 			rcu_read_unlock();
++ 			*dst = *src;
++ 			return;
++ 		}
++ 
++ 		err = kcpustat_cpu_fetch_vtime(dst, src, curr, cpu);
++ 		rcu_read_unlock();
++ 
++ 		if (!err)
++ 			return;
++ 
++ 		cpu_relax();
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(kcpustat_cpu_fetch);
++ 
+++>>>>>>> f1dfdab694eb (sched/vtime: Prevent unstable evaluation of WARN(vtime->state))
+  #endif /* CONFIG_VIRT_CPU_ACCOUNTING_GEN */
+* Unmerged path kernel/sched/cputime.c
