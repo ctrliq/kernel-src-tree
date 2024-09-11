@@ -796,7 +796,8 @@ mlxsw_devlink_sb_pool_set(struct devlink *devlink,
 	if (!mlxsw_driver->sb_pool_set)
 		return -EOPNOTSUPP;
 	return mlxsw_driver->sb_pool_set(mlxsw_core, sb_index,
-					 pool_index, size, threshold_type);
+					 pool_index, size, threshold_type,
+					 extack);
 }
 
 static void *__dl_port(struct devlink_port *devlink_port)
@@ -847,7 +848,7 @@ static int mlxsw_devlink_sb_port_pool_set(struct devlink_port *devlink_port,
 	    !mlxsw_core_port_check(mlxsw_core_port))
 		return -EOPNOTSUPP;
 	return mlxsw_driver->sb_port_pool_set(mlxsw_core_port, sb_index,
-					      pool_index, threshold);
+					      pool_index, threshold, extack);
 }
 
 static int
@@ -884,7 +885,7 @@ mlxsw_devlink_sb_tc_pool_bind_set(struct devlink_port *devlink_port,
 		return -EOPNOTSUPP;
 	return mlxsw_driver->sb_tc_pool_bind_set(mlxsw_core_port, sb_index,
 						 tc_index, pool_type,
-						 pool_index, threshold);
+						 pool_index, threshold, extack);
 }
 
 static int mlxsw_devlink_sb_occ_snapshot(struct devlink *devlink,
