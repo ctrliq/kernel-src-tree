@@ -4702,9 +4702,6 @@ static __init int setup_vmcs_config(struct vmcs_config *vmcs_conf)
 		}
 	}
 
-	if (boot_cpu_has(X86_FEATURE_XSAVES))
-		rdmsrl(MSR_IA32_XSS, host_xss);
-
 	return 0;
 }
 
@@ -7878,6 +7875,9 @@ static __init int hardware_setup(void)
 		rdmsrl(MSR_IA32_BNDCFGS, host_bndcfgs);
 		WARN_ONCE(host_bndcfgs, "KVM: BNDCFGS in host will be lost");
 	}
+
+	if (boot_cpu_has(X86_FEATURE_XSAVES))
+		rdmsrl(MSR_IA32_XSS, host_xss);
 
 	if (!cpu_has_vmx_vpid() || !cpu_has_vmx_invvpid() ||
 		!(cpu_has_vmx_invvpid_single() || cpu_has_vmx_invvpid_global()))
