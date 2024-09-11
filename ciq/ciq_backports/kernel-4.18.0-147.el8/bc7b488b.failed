@@ -1,0 +1,124 @@
+drm/i915/dmc: protect against reading random memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Lucas De Marchi <lucas.demarchi@intel.com>
+commit bc7b488b1d1c71dc4c5182206911127bc6c410d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/bc7b488b.failed
+
+While loading the DMC firmware we were double checking the headers made
+sense, but in no place we checked that we were actually reading memory
+we were supposed to. This could be wrong in case the firmware file is
+truncated or malformed.
+
+Before this patch:
+	# ls -l /lib/firmware/i915/icl_dmc_ver1_07.bin
+	-rw-r--r-- 1 root root  25716 Feb  1 12:26 icl_dmc_ver1_07.bin
+	# truncate -s 25700 /lib/firmware/i915/icl_dmc_ver1_07.bin
+	# modprobe i915
+	# dmesg| grep -i dmc
+	[drm:intel_csr_ucode_init [i915]] Loading i915/icl_dmc_ver1_07.bin
+	[drm] Finished loading DMC firmware i915/icl_dmc_ver1_07.bin (v1.7)
+
+i.e. it loads random data. Now it fails like below:
+	[drm:intel_csr_ucode_init [i915]] Loading i915/icl_dmc_ver1_07.bin
+	[drm:csr_load_work_fn [i915]] *ERROR* Truncated DMC firmware, rejecting.
+	i915 0000:00:02.0: Failed to load DMC firmware i915/icl_dmc_ver1_07.bin. Disabling runtime power management.
+	i915 0000:00:02.0: DMC firmware homepage: https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/tree/i915
+
+Before reading any part of the firmware file, validate the input first.
+
+Fixes: eb805623d8b1 ("drm/i915/skl: Add support to load SKL CSR firmware.")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+	Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190605235535.17791-1-lucas.demarchi@intel.com
+(cherry picked from commit bc7b488b1d1c71dc4c5182206911127bc6c410d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_csr.c
+diff --cc drivers/gpu/drm/i915/intel_csr.c
+index cf9b600cca79,bf0eebd385b9..000000000000
+--- a/drivers/gpu/drm/i915/intel_csr.c
++++ b/drivers/gpu/drm/i915/intel_csr.c
+@@@ -278,10 -300,10 +278,17 @@@ static uint32_t *parse_csr_fw(struct dr
+  	struct intel_dmc_header *dmc_header;
+  	struct intel_csr *csr = &dev_priv->csr;
+  	const struct stepping_info *si = intel_get_stepping_info(dev_priv);
+++<<<<<<< HEAD
+ +	uint32_t dmc_offset = CSR_DEFAULT_FW_OFFSET, readcount = 0, nbytes;
+ +	uint32_t i;
+ +	uint32_t *dmc_payload;
+ +	uint32_t required_version;
+++=======
++ 	u32 dmc_offset = CSR_DEFAULT_FW_OFFSET, readcount = 0, nbytes;
++ 	u32 i;
++ 	u32 *dmc_payload;
++ 	size_t fsize;
+++>>>>>>> bc7b488b1d1c (drm/i915/dmc: protect against reading random memory)
+  
+  	if (!fw)
+  		return NULL;
+@@@ -359,7 -370,12 +372,10 @@@
+  			  si->stepping);
+  		return NULL;
+  	}
+ -	/* Convert dmc_offset into number of bytes. By default it is in dwords*/
+ -	dmc_offset *= 4;
+  	readcount += dmc_offset;
++ 	fsize += dmc_offset;
++ 	if (fsize > fw->size)
++ 		goto error_truncated;
+  
+  	/* Extract dmc_header information. */
+  	dmc_header = (struct intel_dmc_header *)&fw->data[readcount];
+@@@ -391,8 -407,12 +407,17 @@@
+  
+  	/* fw_size is in dwords, so multiplied by 4 to convert into bytes. */
+  	nbytes = dmc_header->fw_size * 4;
+++<<<<<<< HEAD
+ +	if (nbytes > CSR_MAX_FW_SIZE) {
+ +		DRM_ERROR("DMC firmware too big (%u bytes)\n", nbytes);
+++=======
++ 	fsize += nbytes;
++ 	if (fsize > fw->size)
++ 		goto error_truncated;
++ 
++ 	if (nbytes > csr->max_fw_size) {
++ 		DRM_ERROR("DMC FW too big (%u bytes)\n", nbytes);
+++>>>>>>> bc7b488b1d1c (drm/i915/dmc: protect against reading random memory)
+  		return NULL;
+  	}
+  	csr->dmc_fw_size = dmc_header->fw_size;
+@@@ -404,8 -424,27 +429,12 @@@
+  	}
+  
+  	return memcpy(dmc_payload, &fw->data[readcount], nbytes);
++ 
++ error_truncated:
++ 	DRM_ERROR("Truncated DMC firmware, rejecting.\n");
++ 	return NULL;
+  }
+  
+ -static void intel_csr_runtime_pm_get(struct drm_i915_private *dev_priv)
+ -{
+ -	WARN_ON(dev_priv->csr.wakeref);
+ -	dev_priv->csr.wakeref =
+ -		intel_display_power_get(dev_priv, POWER_DOMAIN_INIT);
+ -}
+ -
+ -static void intel_csr_runtime_pm_put(struct drm_i915_private *dev_priv)
+ -{
+ -	intel_wakeref_t wakeref __maybe_unused =
+ -		fetch_and_zero(&dev_priv->csr.wakeref);
+ -
+ -	intel_display_power_put(dev_priv, POWER_DOMAIN_INIT, wakeref);
+ -}
+ -
+  static void csr_load_work_fn(struct work_struct *work)
+  {
+  	struct drm_i915_private *dev_priv;
+* Unmerged path drivers/gpu/drm/i915/intel_csr.c
