@@ -1,0 +1,163 @@
+net: bridge: switchdev: treat local FDBs the same as entries towards the bridge
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit 52e4bec15546d58f2a14dc74a6b8be128aa7db0a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/52e4bec1.failed
+
+Currently the following script:
+
+1. ip link add br0 type bridge vlan_filtering 1 && ip link set br0 up
+2. ip link set swp2 up && ip link set swp2 master br0
+3. ip link set swp3 up && ip link set swp3 master br0
+4. ip link set swp4 up && ip link set swp4 master br0
+5. bridge vlan del dev swp2 vid 1
+6. bridge vlan del dev swp3 vid 1
+7. ip link set swp4 nomaster
+8. ip link set swp3 nomaster
+
+produces the following output:
+
+[  641.010738] sja1105 spi0.1: port 2 failed to delete 00:1f:7b:63:02:48 vid 1 from fdb: -2
+
+[ swp2, swp3 and br0 all have the same MAC address, the one listed above ]
+
+In short, this happens because the number of FDB entry additions
+notified to switchdev is unbalanced with the number of deletions.
+
+At step 1, the bridge has a random MAC address. At step 2, the
+br_fdb_replay of swp2 receives this initial MAC address. Then the bridge
+inherits the MAC address of swp2 via br_fdb_change_mac_address(), and it
+notifies switchdev (only swp2 at this point) of the deletion of the
+random MAC address and the addition of 00:1f:7b:63:02:48 as a local FDB
+entry with fdb->dst == swp2, in VLANs 0 and the default_pvid (1).
+
+During step 7:
+
+del_nbp
+-> br_fdb_delete_by_port(br, p, vid=0, do_all=1);
+   -> fdb_delete_local(br, p, f);
+
+br_fdb_delete_by_port() deletes all entries towards the ports,
+regardless of vid, because do_all is 1.
+
+fdb_delete_local() has logic to migrate local FDB entries deleted from
+one port to another port which shares the same MAC address and is in the
+same VLAN, or to the bridge device itself. This migration happens
+without notifying switchdev of the deletion on the old port and the
+addition on the new one, just fdb->dst is changed and the added_by_user
+flag is cleared.
+
+In the example above, the del_nbp(swp4) causes the
+"addr 00:1f:7b:63:02:48 vid 1" local FDB entry with fdb->dst == swp4
+that existed up until then to be migrated directly towards the bridge
+(fdb->dst == NULL). This is because it cannot be migrated to any of the
+other ports (swp2 and swp3 are not in VLAN 1).
+
+After the migration to br0 takes place, swp4 requests a deletion replay
+of all FDB entries. Since the "addr 00:1f:7b:63:02:48 vid 1" entry now
+point towards the bridge, a deletion of it is replayed. There was just
+a prior addition of this address, so the switchdev driver deletes this
+entry.
+
+Then, the del_nbp(swp3) at step 8 triggers another br_fdb_replay, and
+switchdev is notified again to delete "addr 00:1f:7b:63:02:48 vid 1".
+But it can't because it no longer has it, so it returns -ENOENT.
+
+There are other possibilities to trigger this issue, but this is by far
+the simplest to explain.
+
+To fix this, we must avoid the situation where the addition of an FDB
+entry is notified to switchdev as a local entry on a port, and the
+deletion is notified on the bridge itself.
+
+Considering that the 2 types of FDB entries are completely equivalent
+and we cannot have the same MAC address as a local entry on 2 bridge
+ports, or on a bridge port and pointing towards the bridge at the same
+time, it makes sense to hide away from switchdev completely the fact
+that a local FDB entry is associated with a given bridge port at all.
+Just say that it points towards the bridge, it should make no difference
+whatsoever to the switchdev driver and should even lead to a simpler
+overall implementation, will less cases to handle.
+
+This also avoids any modification at all to the core bridge driver, just
+what is reported to switchdev changes. With the local/permanent entries
+on bridge ports being already reported to user space, it is hard to
+believe that the bridge behavior can change in any backwards-incompatible
+way such as making all local FDB entries point towards the bridge.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 52e4bec15546d58f2a14dc74a6b8be128aa7db0a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_fdb.c
+diff --cc net/bridge/br_fdb.c
+index 727e4c29f2d6,4ff8c67ac88f..000000000000
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@@ -703,13 -727,16 +703,17 @@@ static inline size_t fdb_nlmsg_size(voi
+  		+ nla_total_size(ETH_ALEN) /* NDA_LLADDR */
+  		+ nla_total_size(sizeof(u32)) /* NDA_MASTER */
+  		+ nla_total_size(sizeof(u16)) /* NDA_VLAN */
+ -		+ nla_total_size(sizeof(struct nda_cacheinfo))
+ -		+ nla_total_size(0) /* NDA_FDB_EXT_ATTRS */
+ -		+ nla_total_size(sizeof(u8)); /* NFEA_ACTIVITY_NOTIFY */
+ +		+ nla_total_size(sizeof(struct nda_cacheinfo));
+  }
+  
+ -static int br_fdb_replay_one(struct net_bridge *br, struct notifier_block *nb,
+ -			     const struct net_bridge_fdb_entry *fdb,
+ -			     unsigned long action, const void *ctx)
+ +static int br_fdb_replay_one(struct notifier_block *nb,
+ +			     struct net_bridge_fdb_entry *fdb,
+ +			     struct net_device *dev)
+  {
+++<<<<<<< HEAD
+++=======
++ 	const struct net_bridge_port *p = READ_ONCE(fdb->dst);
+++>>>>>>> 52e4bec15546 (net: bridge: switchdev: treat local FDBs the same as entries towards the bridge)
+  	struct switchdev_notifier_fdb_info item;
+  	int err;
+  
+@@@ -718,9 -745,10 +722,14 @@@
+  	item.added_by_user = test_bit(BR_FDB_ADDED_BY_USER, &fdb->flags);
+  	item.offloaded = test_bit(BR_FDB_OFFLOADED, &fdb->flags);
+  	item.is_local = test_bit(BR_FDB_LOCAL, &fdb->flags);
+++<<<<<<< HEAD
+ +	item.info.dev = dev;
+++=======
++ 	item.info.dev = item.is_local ? br->dev : p->dev;
++ 	item.info.ctx = ctx;
+++>>>>>>> 52e4bec15546 (net: bridge: switchdev: treat local FDBs the same as entries towards the bridge)
+  
+ -	err = nb->notifier_call(nb, action, &item);
+ +	err = nb->notifier_call(nb, SWITCHDEV_FDB_ADD_TO_DEVICE, &item);
+  	return notifier_to_errno(err);
+  }
+  
+* Unmerged path net/bridge/br_fdb.c
+diff --git a/net/bridge/br_switchdev.c b/net/bridge/br_switchdev.c
+index be7535fa5f0e..31b612266d9f 100644
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@ -78,7 +78,6 @@ br_switchdev_fdb_notify(struct net_bridge *br,
+ 			const struct net_bridge_fdb_entry *fdb, int type)
+ {
+ 	const struct net_bridge_port *dst = READ_ONCE(fdb->dst);
+-	struct net_device *dev = dst ? dst->dev : br->dev;
+ 	struct switchdev_notifier_fdb_info info = {
+ 		.addr = fdb->key.addr.addr,
+ 		.vid = fdb->key.vlan_id,
+@@ -86,6 +85,7 @@ br_switchdev_fdb_notify(struct net_bridge *br,
+ 		.is_local = test_bit(BR_FDB_LOCAL, &fdb->flags),
+ 		.offloaded = test_bit(BR_FDB_OFFLOADED, &fdb->flags),
+ 	};
++	struct net_device *dev = info.is_local ? br->dev : dst->dev;
+ 
+ 	switch (type) {
+ 	case RTM_DELNEIGH:
