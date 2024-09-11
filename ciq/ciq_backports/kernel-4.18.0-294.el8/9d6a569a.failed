@@ -1,0 +1,245 @@
+s390/qeth: strictly order bridge address events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 9d6a569a4cbab5a8b4c959d4e312daeecb7c9f09
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9d6a569a.failed
+
+The current code for bridge address events has two shortcomings in its
+control sequence:
+
+1. after disabling address events via PNSO, we don't flush the remaining
+   events from the event_wq. So if the feature is re-enabled fast
+   enough, stale events could leak over.
+2. PNSO and the events' arrival via the READ ccw device are unordered.
+   So even if we flushed the workqueue, it's difficult to say whether
+   the READ device might produce more events onto the workqueue
+   afterwards.
+
+Fix this by
+1. explicitly fencing off the events when we no longer care, in the
+   READ device's event handler. This ensures that once we flush the
+   workqueue, it doesn't get additional address events.
+2. Flush the workqueue after disabling the events & fencing them off.
+   As the code that triggers the flush will typically hold the sbp_lock,
+   we need to rework the worker code to avoid a deadlock here in case
+   of a 'notifications-stopped' event. In case of lock contention,
+   requeue such an event with a delay. We'll eventually aquire the lock,
+   or spot that the feature has been disabled and the event can thus be
+   discarded.
+
+This leaves the theoretical race that a stale event could arrive
+_after_ we re-enabled ourselves to receive events again. Such an event
+would be impossible to distinguish from a 'good' event, nothing we can
+do about it.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Reviewed-by: Alexandra Winter <wintera@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9d6a569a4cbab5a8b4c959d4e312daeecb7c9f09)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_l2_main.c
+diff --cc drivers/s390/net/qeth_l2_main.c
+index 88261c8e41f6,b5bef5345dd6..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -1202,41 -1163,61 +1213,73 @@@ static void qeth_bridge_state_change(st
+  	queue_work(card->event_wq, &data->worker);
+  }
+  
+++<<<<<<< HEAD
+ +struct qeth_bridge_host_data {
+ +	struct work_struct worker;
+++=======
++ struct qeth_addr_change_data {
++ 	struct delayed_work dwork;
+++>>>>>>> 9d6a569a4cba (s390/qeth: strictly order bridge address events)
+  	struct qeth_card *card;
+ -	struct qeth_ipacmd_addr_change ac_event;
+ +	struct qeth_ipacmd_addr_change hostevs;
+  };
+  
+ -static void qeth_addr_change_event_worker(struct work_struct *work)
+ +static void qeth_bridge_host_event_worker(struct work_struct *work)
+  {
+++<<<<<<< HEAD
+ +	struct qeth_bridge_host_data *data =
+ +		container_of(work, struct qeth_bridge_host_data, worker);
+ +	int i;
+ +
+ +	if (data->hostevs.lost_event_mask) {
+++=======
++ 	struct delayed_work *dwork = to_delayed_work(work);
++ 	struct qeth_addr_change_data *data;
++ 	struct qeth_card *card;
++ 	int i;
++ 
++ 	data = container_of(dwork, struct qeth_addr_change_data, dwork);
++ 	card = data->card;
++ 
++ 	QETH_CARD_TEXT(data->card, 4, "adrchgew");
++ 
++ 	if (READ_ONCE(card->info.pnso_mode) == QETH_PNSO_NONE)
++ 		goto free;
++ 
++ 	if (data->ac_event.lost_event_mask) {
++ 		/* Potential re-config in progress, try again later: */
++ 		if (!mutex_trylock(&card->sbp_lock)) {
++ 			queue_delayed_work(card->event_wq, dwork,
++ 					   msecs_to_jiffies(100));
++ 			return;
++ 		}
++ 
+++>>>>>>> 9d6a569a4cba (s390/qeth: strictly order bridge address events)
+  		dev_info(&data->card->gdev->dev,
+ -			 "Address change notification stopped on %s (%s)\n",
+ -			 data->card->dev->name,
+ -			(data->ac_event.lost_event_mask == 0x01)
+ +"Address notification from the Bridge Port stopped %s (%s)\n",
+ +			data->card->dev->name,
+ +			(data->hostevs.lost_event_mask == 0x01)
+  			? "Overflow"
+ -			: (data->ac_event.lost_event_mask == 0x02)
+ +			: (data->hostevs.lost_event_mask == 0x02)
+  			? "Bridge port state change"
+  			: "Unknown reason");
+- 		mutex_lock(&data->card->sbp_lock);
++ 
+  		data->card->options.sbp.hostnotification = 0;
++ 		card->info.pnso_mode = QETH_PNSO_NONE;
+  		mutex_unlock(&data->card->sbp_lock);
+  		qeth_bridge_emit_host_event(data->card, anev_abort,
+ -					    0, NULL, NULL);
+ +			0, NULL, NULL);
+  	} else
+ -		for (i = 0; i < data->ac_event.num_entries; i++) {
+ +		for (i = 0; i < data->hostevs.num_entries; i++) {
+  			struct qeth_ipacmd_addr_change_entry *entry =
+ -					&data->ac_event.entry[i];
+ +					&data->hostevs.entry[i];
+  			qeth_bridge_emit_host_event(data->card,
+ -						    anev_reg_unreg,
+ -						    entry->change_code,
+ -						    &entry->token,
+ -						    &entry->addr_lnid);
+ +					anev_reg_unreg,
+ +					entry->change_code,
+ +					&entry->token, &entry->addr_lnid);
+  		}
++ 
++ free:
+  	kfree(data);
+  }
+  
+@@@ -1245,10 -1226,13 +1288,17 @@@ static void qeth_bridge_host_event(stru
+  {
+  	struct qeth_ipacmd_addr_change *hostevs =
+  		 &cmd->data.addrchange;
+ -	struct qeth_addr_change_data *data;
+ +	struct qeth_bridge_host_data *data;
+  	int extrasize;
+  
+++<<<<<<< HEAD
+ +	QETH_CARD_TEXT(card, 2, "brhostev");
+++=======
++ 	if (card->info.pnso_mode == QETH_PNSO_NONE)
++ 		return;
++ 
++ 	QETH_CARD_TEXT(card, 4, "adrchgev");
+++>>>>>>> 9d6a569a4cba (s390/qeth: strictly order bridge address events)
+  	if (cmd->hdr.return_code != 0x0000) {
+  		if (cmd->hdr.return_code == 0x0010) {
+  			if (hostevs->lost_event_mask == 0x00)
+@@@ -1261,17 -1245,17 +1311,21 @@@
+  	}
+  	extrasize = sizeof(struct qeth_ipacmd_addr_change_entry) *
+  						hostevs->num_entries;
+ -	data = kzalloc(sizeof(struct qeth_addr_change_data) + extrasize,
+ -		       GFP_ATOMIC);
+ +	data = kzalloc(sizeof(struct qeth_bridge_host_data) + extrasize,
+ +		GFP_ATOMIC);
+  	if (!data) {
+ -		QETH_CARD_TEXT(card, 2, "ACNalloc");
+ +		QETH_CARD_TEXT(card, 2, "BPHalloc");
+  		return;
+  	}
+++<<<<<<< HEAD
+ +	INIT_WORK(&data->worker, qeth_bridge_host_event_worker);
+++=======
++ 	INIT_DELAYED_WORK(&data->dwork, qeth_addr_change_event_worker);
+++>>>>>>> 9d6a569a4cba (s390/qeth: strictly order bridge address events)
+  	data->card = card;
+ -	memcpy(&data->ac_event, hostevs,
+ +	memcpy(&data->hostevs, hostevs,
+  			sizeof(struct qeth_ipacmd_addr_change) + extrasize);
+- 	queue_work(card->event_wq, &data->worker);
++ 	queue_delayed_work(card->event_wq, &data->dwork, 0);
+  }
+  
+  /* SETBRIDGEPORT support; sending commands */
+@@@ -1643,11 -1577,15 +1697,23 @@@ int qeth_bridgeport_an_set(struct qeth_
+  
+  	if (enable) {
+  		qeth_bridge_emit_host_event(card, anev_reset, 0, NULL, NULL);
+++<<<<<<< HEAD
+ +		rc = qdio_pnso_brinfo(schid, 1, &response,
+ +			qeth_bridgeport_an_set_cb, card);
+ +	} else
+ +		rc = qdio_pnso_brinfo(schid, 0, &response, NULL, NULL);
+ +	return qeth_anset_makerc(card, rc, response);
+++=======
++ 		qeth_l2_set_pnso_mode(card, QETH_PNSO_BRIDGEPORT);
++ 		rc = qeth_l2_pnso(card, 1, qeth_bridgeport_an_set_cb, card);
++ 		if (rc)
++ 			qeth_l2_set_pnso_mode(card, QETH_PNSO_NONE);
++ 	} else {
++ 		rc = qeth_l2_pnso(card, 0, NULL, NULL);
++ 		qeth_l2_set_pnso_mode(card, QETH_PNSO_NONE);
++ 	}
++ 	return rc;
+++>>>>>>> 9d6a569a4cba (s390/qeth: strictly order bridge address events)
+  }
+  
+  static bool qeth_bridgeport_is_in_use(struct qeth_card *card)
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index 7c464101b646..1c54ba50738d 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -674,6 +674,11 @@ struct qeth_card_blkt {
+ 	int inter_packet_jumbo;
+ };
+ 
++enum qeth_pnso_mode {
++	QETH_PNSO_NONE,
++	QETH_PNSO_BRIDGEPORT,
++};
++
+ #define QETH_BROADCAST_WITH_ECHO    0x01
+ #define QETH_BROADCAST_WITHOUT_ECHO 0x02
+ struct qeth_card_info {
+@@ -690,6 +695,7 @@ struct qeth_card_info {
+ 	/* no bitfield, we take a pointer on these two: */
+ 	u8 has_lp2lp_cso_v6;
+ 	u8 has_lp2lp_cso_v4;
++	enum qeth_pnso_mode pnso_mode;
+ 	enum qeth_card_types type;
+ 	enum qeth_link_types link_type;
+ 	int broadcast_capable;
+* Unmerged path drivers/s390/net/qeth_l2_main.c
+diff --git a/drivers/s390/net/qeth_l2_sys.c b/drivers/s390/net/qeth_l2_sys.c
+index 86bcae992f72..4695d25e54f2 100644
+--- a/drivers/s390/net/qeth_l2_sys.c
++++ b/drivers/s390/net/qeth_l2_sys.c
+@@ -157,6 +157,7 @@ static ssize_t qeth_bridgeport_hostnotification_store(struct device *dev,
+ 		rc = -EBUSY;
+ 	else if (qeth_card_hw_is_reachable(card)) {
+ 		rc = qeth_bridgeport_an_set(card, enable);
++		/* sbp_lock ensures ordering vs notifications-stopped events */
+ 		if (!rc)
+ 			card->options.sbp.hostnotification = enable;
+ 	} else
