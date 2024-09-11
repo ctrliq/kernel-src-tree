@@ -1,0 +1,136 @@
+net/mlx5e: Move repeating code that gets TC prio into a function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Maxim Mikityanskiy <maximmi@nvidia.com>
+commit 62f7991feab69ed398ad6a03b911fa0ee0549516
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/62f7991f.failed
+
+Both mlx5e_select_queue and mlx5e_select_ptpsq contain the same logic to
+get user priority of a packet, according to the current trust state
+settings. This commit moves this repeating code to its own function.
+
+	Signed-off-by: Maxim Mikityanskiy <maximmi@nvidia.com>
+	Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 62f7991feab69ed398ad6a03b911fa0ee0549516)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/selq.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/selq.c
+index 50ea58a3cc94,aab2046da45b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/selq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/selq.c
+@@@ -93,3 -95,105 +93,108 @@@ void mlx5e_selq_cancel(struct mlx5e_sel
+  
+  	selq->is_prepared = false;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_MLX5_CORE_EN_DCB
++ static int mlx5e_get_dscp_up(struct mlx5e_priv *priv, struct sk_buff *skb)
++ {
++ 	int dscp_cp = 0;
++ 
++ 	if (skb->protocol == htons(ETH_P_IP))
++ 		dscp_cp = ipv4_get_dsfield(ip_hdr(skb)) >> 2;
++ 	else if (skb->protocol == htons(ETH_P_IPV6))
++ 		dscp_cp = ipv6_get_dsfield(ipv6_hdr(skb)) >> 2;
++ 
++ 	return priv->dcbx_dp.dscp2prio[dscp_cp];
++ }
++ #endif
++ 
++ static int mlx5e_get_up(struct mlx5e_priv *priv, struct sk_buff *skb)
++ {
++ #ifdef CONFIG_MLX5_CORE_EN_DCB
++ 	if (priv->dcbx_dp.trust_state == MLX5_QPTS_TRUST_DSCP)
++ 		return mlx5e_get_dscp_up(priv, skb);
++ #endif
++ 	if (skb_vlan_tag_present(skb))
++ 		return skb_vlan_tag_get_prio(skb);
++ 	return 0;
++ }
++ 
++ static u16 mlx5e_select_ptpsq(struct net_device *dev, struct sk_buff *skb,
++ 			      struct mlx5e_selq_params *selq)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	int up;
++ 
++ 	up = selq->num_tcs > 1 ? mlx5e_get_up(priv, skb) : 0;
++ 
++ 	return selq->num_regular_queues + up;
++ }
++ 
++ static int mlx5e_select_htb_queue(struct mlx5e_priv *priv, struct sk_buff *skb)
++ {
++ 	u16 classid;
++ 
++ 	/* Order maj_id before defcls - pairs with mlx5e_htb_root_add. */
++ 	if ((TC_H_MAJ(skb->priority) >> 16) == smp_load_acquire(&priv->htb.maj_id))
++ 		classid = TC_H_MIN(skb->priority);
++ 	else
++ 		classid = READ_ONCE(priv->htb.defcls);
++ 
++ 	if (!classid)
++ 		return 0;
++ 
++ 	return mlx5e_get_txq_by_classid(priv, classid);
++ }
++ 
++ u16 mlx5e_select_queue(struct net_device *dev, struct sk_buff *skb,
++ 		       struct net_device *sb_dev)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	struct mlx5e_selq_params *selq;
++ 	int txq_ix, up;
++ 
++ 	selq = rcu_dereference_bh(priv->selq.active);
++ 
++ 	/* This is a workaround needed only for the mlx5e_netdev_change_profile
++ 	 * flow that zeroes out the whole priv without unregistering the netdev
++ 	 * and without preventing ndo_select_queue from being called.
++ 	 */
++ 	if (unlikely(!selq))
++ 		return 0;
++ 
++ 	if (unlikely(selq->is_ptp || selq->is_htb)) {
++ 		if (unlikely(selq->is_htb)) {
++ 			txq_ix = mlx5e_select_htb_queue(priv, skb);
++ 			if (txq_ix > 0)
++ 				return txq_ix;
++ 		}
++ 
++ 		if (unlikely(selq->is_ptp && mlx5e_use_ptpsq(skb)))
++ 			return mlx5e_select_ptpsq(dev, skb, selq);
++ 
++ 		txq_ix = netdev_pick_tx(dev, skb, NULL);
++ 		/* Fix netdev_pick_tx() not to choose ptp_channel and HTB txqs.
++ 		 * If they are selected, switch to regular queues.
++ 		 * Driver to select these queues only at mlx5e_select_ptpsq()
++ 		 * and mlx5e_select_htb_queue().
++ 		 */
++ 		if (unlikely(txq_ix >= selq->num_regular_queues))
++ 			txq_ix %= selq->num_regular_queues;
++ 	} else {
++ 		txq_ix = netdev_pick_tx(dev, skb, NULL);
++ 	}
++ 
++ 	if (selq->num_tcs <= 1)
++ 		return txq_ix;
++ 
++ 	up = mlx5e_get_up(priv, skb);
++ 
++ 	/* Normalize any picked txq_ix to [0, num_channels),
++ 	 * So we can return a txq_ix that matches the channel and
++ 	 * packet UP.
++ 	 */
++ 	return txq_ix % selq->num_channels + up * selq->num_channels;
++ }
+++>>>>>>> 62f7991feab6 (net/mlx5e: Move repeating code that gets TC prio into a function)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/selq.c
