@@ -1,0 +1,124 @@
+esp4: support ipv6 nexthdrs process for beet gso segment
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 6f297068a0696eafecef13852408b05a81edb560
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6f297068.failed
+
+For beet mode, when it's ipv6 inner address with nexthdrs set,
+the packet format might be:
+
+    ----------------------------------------------------
+    | outer  |     | dest |     |      |  ESP    | ESP |
+    | IP hdr | ESP | opts.| TCP | Data | Trailer | ICV |
+    ----------------------------------------------------
+
+Before doing gso segment in xfrm4_beet_gso_segment(), the same
+thing is needed as it does in xfrm6_beet_gso_segment() in last
+patch 'esp6: support ipv6 nexthdrs process for beet gso segment'.
+
+v1->v2:
+  - remove skb_transport_offset(), as it will always return 0
+    in xfrm6_beet_gso_segment(), thank Sabrina's check.
+
+Fixes: 384a46ea7bdc ("esp4: add gso_segment for esp4 beet mode")
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 6f297068a0696eafecef13852408b05a81edb560)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/esp4_offload.c
+diff --cc net/ipv4/esp4_offload.c
+index 3a37786789f5,9b1d451edae0..000000000000
+--- a/net/ipv4/esp4_offload.c
++++ b/net/ipv4/esp4_offload.c
+@@@ -108,6 -106,81 +108,84 @@@ static void esp4_gso_encap(struct xfrm_
+  	xo->proto = proto;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *xfrm4_tunnel_gso_segment(struct xfrm_state *x,
++ 						struct sk_buff *skb,
++ 						netdev_features_t features)
++ {
++ 	__skb_push(skb, skb->mac_len);
++ 	return skb_mac_gso_segment(skb, features);
++ }
++ 
++ static struct sk_buff *xfrm4_transport_gso_segment(struct xfrm_state *x,
++ 						   struct sk_buff *skb,
++ 						   netdev_features_t features)
++ {
++ 	const struct net_offload *ops;
++ 	struct sk_buff *segs = ERR_PTR(-EINVAL);
++ 	struct xfrm_offload *xo = xfrm_offload(skb);
++ 
++ 	skb->transport_header += x->props.header_len;
++ 	ops = rcu_dereference(inet_offloads[xo->proto]);
++ 	if (likely(ops && ops->callbacks.gso_segment))
++ 		segs = ops->callbacks.gso_segment(skb, features);
++ 
++ 	return segs;
++ }
++ 
++ static struct sk_buff *xfrm4_beet_gso_segment(struct xfrm_state *x,
++ 					      struct sk_buff *skb,
++ 					      netdev_features_t features)
++ {
++ 	struct xfrm_offload *xo = xfrm_offload(skb);
++ 	struct sk_buff *segs = ERR_PTR(-EINVAL);
++ 	const struct net_offload *ops;
++ 	u8 proto = xo->proto;
++ 
++ 	skb->transport_header += x->props.header_len;
++ 
++ 	if (proto == IPPROTO_BEETPH) {
++ 		struct ip_beet_phdr *ph = (struct ip_beet_phdr *)skb->data;
++ 
++ 		skb->transport_header += ph->hdrlen * 8;
++ 		proto = ph->nexthdr;
++ 	} else if (x->sel.family == AF_INET6) {
++ 		__be16 frag;
++ 
++ 		skb->transport_header +=
++ 			ipv6_skip_exthdr(skb, 0, &proto, &frag);
++ 		if (proto == IPPROTO_TCP)
++ 			skb_shinfo(skb)->gso_type |= SKB_GSO_TCPV4;
++ 	} else {
++ 		skb->transport_header -= IPV4_BEET_PHMAXLEN;
++ 	}
++ 
++ 	__skb_pull(skb, skb_transport_offset(skb));
++ 	ops = rcu_dereference(inet_offloads[proto]);
++ 	if (likely(ops && ops->callbacks.gso_segment))
++ 		segs = ops->callbacks.gso_segment(skb, features);
++ 
++ 	return segs;
++ }
++ 
++ static struct sk_buff *xfrm4_outer_mode_gso_segment(struct xfrm_state *x,
++ 						    struct sk_buff *skb,
++ 						    netdev_features_t features)
++ {
++ 	switch (x->outer_mode.encap) {
++ 	case XFRM_MODE_TUNNEL:
++ 		return xfrm4_tunnel_gso_segment(x, skb, features);
++ 	case XFRM_MODE_TRANSPORT:
++ 		return xfrm4_transport_gso_segment(x, skb, features);
++ 	case XFRM_MODE_BEET:
++ 		return xfrm4_beet_gso_segment(x, skb, features);
++ 	}
++ 
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++ 
+++>>>>>>> 6f297068a069 (esp4: support ipv6 nexthdrs process for beet gso segment)
+  static struct sk_buff *esp4_gso_segment(struct sk_buff *skb,
+  				        netdev_features_t features)
+  {
+* Unmerged path net/ipv4/esp4_offload.c
