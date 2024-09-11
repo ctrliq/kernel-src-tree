@@ -1,0 +1,356 @@
+iommu/arm-smmu: Move .tlb_sync method to implementation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit ae2b60f34ab21780bc30d01ae976cc7340446bde
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ae2b60f3.failed
+
+With the .tlb_sync interface no longer exposed directly to io-pgtable,
+strip away the remains of that abstraction layer. Retain the callback
+in spirit, though, by transforming it into an implementation override
+for the low-level sync routine itself, for which we will have at least
+one user.
+
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit ae2b60f34ab21780bc30d01ae976cc7340446bde)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm-smmu.c
+#	drivers/iommu/arm-smmu.h
+diff --cc drivers/iommu/arm-smmu.c
+index c913cdd695bd,25876eb9266d..000000000000
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@@ -452,15 -238,20 +452,22 @@@ static void __arm_smmu_free_bitmap(unsi
+  }
+  
+  /* Wait for any pending TLB invalidations to complete */
+ -static void __arm_smmu_tlb_sync(struct arm_smmu_device *smmu, int page,
+ -				int sync, int status)
+ +static void __arm_smmu_tlb_sync(struct arm_smmu_device *smmu,
+ +				void __iomem *sync, void __iomem *status)
+  {
+  	unsigned int spin_cnt, delay;
+ -	u32 reg;
+  
+++<<<<<<< HEAD
+ +	writel_relaxed(QCOM_DUMMY_VAL, sync);
+++=======
++ 	if (smmu->impl && unlikely(smmu->impl->tlb_sync))
++ 		return smmu->impl->tlb_sync(smmu, page, sync, status);
++ 
++ 	arm_smmu_writel(smmu, page, sync, QCOM_DUMMY_VAL);
+++>>>>>>> ae2b60f34ab2 (iommu/arm-smmu: Move .tlb_sync method to implementation)
+  	for (delay = 1; delay < TLB_LOOP_TIMEOUT; delay *= 2) {
+  		for (spin_cnt = TLB_SPIN_COUNT; spin_cnt > 0; spin_cnt--) {
+ -			reg = arm_smmu_readl(smmu, page, status);
+ -			if (!(reg & sTLBGSTATUS_GSACTIVE))
+ +			if (!(readl_relaxed(status) & sTLBGSTATUS_GSACTIVE))
+  				return;
+  			cpu_relax();
+  		}
+@@@ -481,11 -271,9 +488,10 @@@ static void arm_smmu_tlb_sync_global(st
+  	spin_unlock_irqrestore(&smmu->global_sync_lock, flags);
+  }
+  
+- static void arm_smmu_tlb_sync_context(void *cookie)
++ static void arm_smmu_tlb_sync_context(struct arm_smmu_domain *smmu_domain)
+  {
+- 	struct arm_smmu_domain *smmu_domain = cookie;
+  	struct arm_smmu_device *smmu = smmu_domain->smmu;
+ +	void __iomem *base = ARM_SMMU_CB(smmu, smmu_domain->cfg.cbndx);
+  	unsigned long flags;
+  
+  	spin_lock_irqsave(&smmu_domain->cb_lock, flags);
+@@@ -497,22 -285,14 +503,22 @@@
+  static void arm_smmu_tlb_inv_context_s1(void *cookie)
+  {
+  	struct arm_smmu_domain *smmu_domain = cookie;
+ +	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+ +	void __iomem *base = ARM_SMMU_CB(smmu_domain->smmu, cfg->cbndx);
+ +
+  	/*
+ -	 * The TLBI write may be relaxed, so ensure that PTEs cleared by the
+ -	 * current CPU are visible beforehand.
+ +	 * NOTE: this is not a relaxed write; it needs to guarantee that PTEs
+ +	 * cleared by the current CPU are visible to the SMMU before the TLBI.
+  	 */
+++<<<<<<< HEAD
+ +	writel(cfg->asid, base + ARM_SMMU_CB_S1_TLBIASID);
+ +	arm_smmu_tlb_sync_context(cookie);
+++=======
++ 	wmb();
++ 	arm_smmu_cb_write(smmu_domain->smmu, smmu_domain->cfg.cbndx,
++ 			  ARM_SMMU_CB_S1_TLBIASID, smmu_domain->cfg.asid);
++ 	arm_smmu_tlb_sync_context(smmu_domain);
+++>>>>>>> ae2b60f34ab2 (iommu/arm-smmu: Move .tlb_sync method to implementation)
+  }
+  
+  static void arm_smmu_tlb_inv_context_s2(void *cookie)
+@@@ -617,34 -430,28 +623,43 @@@ static void arm_smmu_tlb_add_page(struc
+  static const struct arm_smmu_flush_ops arm_smmu_s1_tlb_ops = {
+  	.tlb = {
+  		.tlb_flush_all	= arm_smmu_tlb_inv_context_s1,
+ -		.tlb_flush_walk	= arm_smmu_tlb_inv_walk_s1,
+ -		.tlb_flush_leaf	= arm_smmu_tlb_inv_leaf_s1,
+ -		.tlb_add_page	= arm_smmu_tlb_add_page_s1,
+ +		.tlb_flush_walk	= arm_smmu_tlb_inv_walk,
+ +		.tlb_flush_leaf	= arm_smmu_tlb_inv_leaf,
+ +		.tlb_add_page	= arm_smmu_tlb_add_page,
+  	},
+++<<<<<<< HEAD
+ +	.tlb_inv_range		= arm_smmu_tlb_inv_range_nosync,
+ +	.tlb_sync		= arm_smmu_tlb_sync_context,
+++=======
+++>>>>>>> ae2b60f34ab2 (iommu/arm-smmu: Move .tlb_sync method to implementation)
+  };
+  
+  static const struct arm_smmu_flush_ops arm_smmu_s2_tlb_ops_v2 = {
+  	.tlb = {
+  		.tlb_flush_all	= arm_smmu_tlb_inv_context_s2,
+ -		.tlb_flush_walk	= arm_smmu_tlb_inv_walk_s2,
+ -		.tlb_flush_leaf	= arm_smmu_tlb_inv_leaf_s2,
+ -		.tlb_add_page	= arm_smmu_tlb_add_page_s2,
+ +		.tlb_flush_walk	= arm_smmu_tlb_inv_walk,
+ +		.tlb_flush_leaf	= arm_smmu_tlb_inv_leaf,
+ +		.tlb_add_page	= arm_smmu_tlb_add_page,
+  	},
+++<<<<<<< HEAD
+ +	.tlb_inv_range		= arm_smmu_tlb_inv_range_nosync,
+ +	.tlb_sync		= arm_smmu_tlb_sync_context,
+++=======
+++>>>>>>> ae2b60f34ab2 (iommu/arm-smmu: Move .tlb_sync method to implementation)
+  };
+  
+  static const struct arm_smmu_flush_ops arm_smmu_s2_tlb_ops_v1 = {
+  	.tlb = {
+  		.tlb_flush_all	= arm_smmu_tlb_inv_context_s2,
+ -		.tlb_flush_walk	= arm_smmu_tlb_inv_any_s2_v1,
+ -		.tlb_flush_leaf	= arm_smmu_tlb_inv_any_s2_v1,
+ -		.tlb_add_page	= arm_smmu_tlb_add_page_s2_v1,
+ +		.tlb_flush_walk	= arm_smmu_tlb_inv_walk,
+ +		.tlb_flush_leaf	= arm_smmu_tlb_inv_leaf,
+ +		.tlb_add_page	= arm_smmu_tlb_add_page,
+  	},
+++<<<<<<< HEAD
+ +	.tlb_inv_range		= arm_smmu_tlb_inv_vmid_nosync,
+ +	.tlb_sync		= arm_smmu_tlb_sync_vmid,
+++=======
+++>>>>>>> ae2b60f34ab2 (iommu/arm-smmu: Move .tlb_sync method to implementation)
+  };
+  
+  static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
+diff --cc drivers/iommu/arm-smmu.h
+index 671b3a337fea,5032102f05b7..000000000000
+--- a/drivers/iommu/arm-smmu.h
++++ b/drivers/iommu/arm-smmu.h
+@@@ -216,4 -203,199 +216,202 @@@ enum arm_smmu_cbar_type 
+  #define ARM_SMMU_CB_ATSR		0x8f0
+  #define ATSR_ACTIVE			BIT(0)
+  
+++<<<<<<< HEAD
+++=======
++ 
++ /* Maximum number of context banks per SMMU */
++ #define ARM_SMMU_MAX_CBS		128
++ 
++ 
++ /* Shared driver definitions */
++ enum arm_smmu_arch_version {
++ 	ARM_SMMU_V1,
++ 	ARM_SMMU_V1_64K,
++ 	ARM_SMMU_V2,
++ };
++ 
++ enum arm_smmu_implementation {
++ 	GENERIC_SMMU,
++ 	ARM_MMU500,
++ 	CAVIUM_SMMUV2,
++ 	QCOM_SMMUV2,
++ };
++ 
++ struct arm_smmu_device {
++ 	struct device			*dev;
++ 
++ 	void __iomem			*base;
++ 	unsigned int			numpage;
++ 	unsigned int			pgshift;
++ 
++ #define ARM_SMMU_FEAT_COHERENT_WALK	(1 << 0)
++ #define ARM_SMMU_FEAT_STREAM_MATCH	(1 << 1)
++ #define ARM_SMMU_FEAT_TRANS_S1		(1 << 2)
++ #define ARM_SMMU_FEAT_TRANS_S2		(1 << 3)
++ #define ARM_SMMU_FEAT_TRANS_NESTED	(1 << 4)
++ #define ARM_SMMU_FEAT_TRANS_OPS		(1 << 5)
++ #define ARM_SMMU_FEAT_VMID16		(1 << 6)
++ #define ARM_SMMU_FEAT_FMT_AARCH64_4K	(1 << 7)
++ #define ARM_SMMU_FEAT_FMT_AARCH64_16K	(1 << 8)
++ #define ARM_SMMU_FEAT_FMT_AARCH64_64K	(1 << 9)
++ #define ARM_SMMU_FEAT_FMT_AARCH32_L	(1 << 10)
++ #define ARM_SMMU_FEAT_FMT_AARCH32_S	(1 << 11)
++ #define ARM_SMMU_FEAT_EXIDS		(1 << 12)
++ 	u32				features;
++ 
++ 	enum arm_smmu_arch_version	version;
++ 	enum arm_smmu_implementation	model;
++ 	const struct arm_smmu_impl	*impl;
++ 
++ 	u32				num_context_banks;
++ 	u32				num_s2_context_banks;
++ 	DECLARE_BITMAP(context_map, ARM_SMMU_MAX_CBS);
++ 	struct arm_smmu_cb		*cbs;
++ 	atomic_t			irptndx;
++ 
++ 	u32				num_mapping_groups;
++ 	u16				streamid_mask;
++ 	u16				smr_mask_mask;
++ 	struct arm_smmu_smr		*smrs;
++ 	struct arm_smmu_s2cr		*s2crs;
++ 	struct mutex			stream_map_mutex;
++ 
++ 	unsigned long			va_size;
++ 	unsigned long			ipa_size;
++ 	unsigned long			pa_size;
++ 	unsigned long			pgsize_bitmap;
++ 
++ 	u32				num_global_irqs;
++ 	u32				num_context_irqs;
++ 	unsigned int			*irqs;
++ 	struct clk_bulk_data		*clks;
++ 	int				num_clks;
++ 
++ 	spinlock_t			global_sync_lock;
++ 
++ 	/* IOMMU core code handle */
++ 	struct iommu_device		iommu;
++ };
++ 
++ enum arm_smmu_context_fmt {
++ 	ARM_SMMU_CTX_FMT_NONE,
++ 	ARM_SMMU_CTX_FMT_AARCH64,
++ 	ARM_SMMU_CTX_FMT_AARCH32_L,
++ 	ARM_SMMU_CTX_FMT_AARCH32_S,
++ };
++ 
++ struct arm_smmu_cfg {
++ 	u8				cbndx;
++ 	u8				irptndx;
++ 	union {
++ 		u16			asid;
++ 		u16			vmid;
++ 	};
++ 	enum arm_smmu_cbar_type		cbar;
++ 	enum arm_smmu_context_fmt	fmt;
++ };
++ #define INVALID_IRPTNDX			0xff
++ 
++ enum arm_smmu_domain_stage {
++ 	ARM_SMMU_DOMAIN_S1 = 0,
++ 	ARM_SMMU_DOMAIN_S2,
++ 	ARM_SMMU_DOMAIN_NESTED,
++ 	ARM_SMMU_DOMAIN_BYPASS,
++ };
++ 
++ struct arm_smmu_flush_ops {
++ 	struct iommu_flush_ops		tlb;
++ };
++ 
++ struct arm_smmu_domain {
++ 	struct arm_smmu_device		*smmu;
++ 	struct io_pgtable_ops		*pgtbl_ops;
++ 	const struct arm_smmu_flush_ops	*flush_ops;
++ 	struct arm_smmu_cfg		cfg;
++ 	enum arm_smmu_domain_stage	stage;
++ 	bool				non_strict;
++ 	struct mutex			init_mutex; /* Protects smmu pointer */
++ 	spinlock_t			cb_lock; /* Serialises ATS1* ops and TLB syncs */
++ 	struct iommu_domain		domain;
++ };
++ 
++ 
++ /* Implementation details, yay! */
++ struct arm_smmu_impl {
++ 	u32 (*read_reg)(struct arm_smmu_device *smmu, int page, int offset);
++ 	void (*write_reg)(struct arm_smmu_device *smmu, int page, int offset,
++ 			  u32 val);
++ 	u64 (*read_reg64)(struct arm_smmu_device *smmu, int page, int offset);
++ 	void (*write_reg64)(struct arm_smmu_device *smmu, int page, int offset,
++ 			    u64 val);
++ 	int (*cfg_probe)(struct arm_smmu_device *smmu);
++ 	int (*reset)(struct arm_smmu_device *smmu);
++ 	int (*init_context)(struct arm_smmu_domain *smmu_domain);
++ 	void (*tlb_sync)(struct arm_smmu_device *smmu, int page, int sync,
++ 			 int status);
++ };
++ 
++ static inline void __iomem *arm_smmu_page(struct arm_smmu_device *smmu, int n)
++ {
++ 	return smmu->base + (n << smmu->pgshift);
++ }
++ 
++ static inline u32 arm_smmu_readl(struct arm_smmu_device *smmu, int page, int offset)
++ {
++ 	if (smmu->impl && unlikely(smmu->impl->read_reg))
++ 		return smmu->impl->read_reg(smmu, page, offset);
++ 	return readl_relaxed(arm_smmu_page(smmu, page) + offset);
++ }
++ 
++ static inline void arm_smmu_writel(struct arm_smmu_device *smmu, int page,
++ 				   int offset, u32 val)
++ {
++ 	if (smmu->impl && unlikely(smmu->impl->write_reg))
++ 		smmu->impl->write_reg(smmu, page, offset, val);
++ 	else
++ 		writel_relaxed(val, arm_smmu_page(smmu, page) + offset);
++ }
++ 
++ static inline u64 arm_smmu_readq(struct arm_smmu_device *smmu, int page, int offset)
++ {
++ 	if (smmu->impl && unlikely(smmu->impl->read_reg64))
++ 		return smmu->impl->read_reg64(smmu, page, offset);
++ 	return readq_relaxed(arm_smmu_page(smmu, page) + offset);
++ }
++ 
++ static inline void arm_smmu_writeq(struct arm_smmu_device *smmu, int page,
++ 				   int offset, u64 val)
++ {
++ 	if (smmu->impl && unlikely(smmu->impl->write_reg64))
++ 		smmu->impl->write_reg64(smmu, page, offset, val);
++ 	else
++ 		writeq_relaxed(val, arm_smmu_page(smmu, page) + offset);
++ }
++ 
++ #define ARM_SMMU_GR0		0
++ #define ARM_SMMU_GR1		1
++ #define ARM_SMMU_CB(s, n)	((s)->numpage + (n))
++ 
++ #define arm_smmu_gr0_read(s, o)		\
++ 	arm_smmu_readl((s), ARM_SMMU_GR0, (o))
++ #define arm_smmu_gr0_write(s, o, v)	\
++ 	arm_smmu_writel((s), ARM_SMMU_GR0, (o), (v))
++ 
++ #define arm_smmu_gr1_read(s, o)		\
++ 	arm_smmu_readl((s), ARM_SMMU_GR1, (o))
++ #define arm_smmu_gr1_write(s, o, v)	\
++ 	arm_smmu_writel((s), ARM_SMMU_GR1, (o), (v))
++ 
++ #define arm_smmu_cb_read(s, n, o)	\
++ 	arm_smmu_readl((s), ARM_SMMU_CB((s), (n)), (o))
++ #define arm_smmu_cb_write(s, n, o, v)	\
++ 	arm_smmu_writel((s), ARM_SMMU_CB((s), (n)), (o), (v))
++ #define arm_smmu_cb_readq(s, n, o)	\
++ 	arm_smmu_readq((s), ARM_SMMU_CB((s), (n)), (o))
++ #define arm_smmu_cb_writeq(s, n, o, v)	\
++ 	arm_smmu_writeq((s), ARM_SMMU_CB((s), (n)), (o), (v))
++ 
++ struct arm_smmu_device *arm_smmu_impl_init(struct arm_smmu_device *smmu);
++ 
+++>>>>>>> ae2b60f34ab2 (iommu/arm-smmu: Move .tlb_sync method to implementation)
+  #endif /* _ARM_SMMU_H */
+* Unmerged path drivers/iommu/arm-smmu.c
+* Unmerged path drivers/iommu/arm-smmu.h
