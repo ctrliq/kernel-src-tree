@@ -1,0 +1,215 @@
+net/mlx5: E-switch, Extend eswitch enable to handle num_vfs change
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Parav Pandit <parav@mellanox.com>
+commit ebf77bb83f635377ad7946b73490b18ecf50dc29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/ebf77bb8.failed
+
+Subsequent patch protects eswitch mode changes across sriov and devlink
+interfaces. It is desirable for eswitch to provide thread safe eswitch
+enable and disable APIs.
+Hence, extend eswitch enable API to optionally update num_vfs when
+requested.
+
+In subsequent patch, eswitch num_vfs are updated after all the eswitch
+users eswitch drops its reference count.
+
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Reviewed-by: Bodong Wang <bodong@mellanox.com>
+	Reviewed-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit ebf77bb83f635377ad7946b73490b18ecf50dc29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 6b21d02803c5,a22f9c77e4c3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1889,14 -2040,75 +1889,55 @@@ mlx5_eswitch_enable_pf_vf_vports(struc
+   */
+  void mlx5_eswitch_disable_pf_vf_vports(struct mlx5_eswitch *esw)
+  {
+ -	mlx5_eswitch_unload_vf_vports(esw, esw->esw_funcs.num_vfs);
+ -
+ -	if (mlx5_ecpf_vport_exists(esw->dev))
+ -		mlx5_eswitch_unload_vport(esw, MLX5_VPORT_ECPF);
+ -
+ -	mlx5_eswitch_unload_vport(esw, MLX5_VPORT_PF);
+ -}
+ -
+ -static void mlx5_eswitch_get_devlink_param(struct mlx5_eswitch *esw)
+ -{
+ -	struct devlink *devlink = priv_to_devlink(esw->dev);
+ -	union devlink_param_value val;
+ -	int err;
+ +	struct mlx5_vport *vport;
+ +	int i;
+  
+ -	err = devlink_param_driverinit_value_get(devlink,
+ -						 MLX5_DEVLINK_PARAM_ID_ESW_LARGE_GROUP_NUM,
+ -						 &val);
+ -	if (!err) {
+ -		esw->params.large_group_num = val.vu32;
+ -	} else {
+ -		esw_warn(esw->dev,
+ -			 "Devlink can't get param fdb_large_groups, uses default (%d).\n",
+ -			 ESW_OFFLOADS_DEFAULT_NUM_GROUPS);
+ -		esw->params.large_group_num = ESW_OFFLOADS_DEFAULT_NUM_GROUPS;
+ -	}
+ +	mlx5_esw_for_all_vports_reverse(esw, i, vport)
+ +		esw_disable_vport(esw, vport);
+  }
+  
+- int mlx5_eswitch_enable(struct mlx5_eswitch *esw, int mode)
++ static void
++ mlx5_eswitch_update_num_of_vfs(struct mlx5_eswitch *esw, int num_vfs)
++ {
++ 	const u32 *out;
++ 
++ 	WARN_ON_ONCE(esw->mode != MLX5_ESWITCH_NONE);
++ 
++ 	if (num_vfs < 0)
++ 		return;
++ 
++ 	if (!mlx5_core_is_ecpf_esw_manager(esw->dev)) {
++ 		esw->esw_funcs.num_vfs = num_vfs;
++ 		return;
++ 	}
++ 
++ 	out = mlx5_esw_query_functions(esw->dev);
++ 	if (IS_ERR(out))
++ 		return;
++ 
++ 	esw->esw_funcs.num_vfs = MLX5_GET(query_esw_functions_out, out,
++ 					  host_params_context.host_num_of_vfs);
++ 	kvfree(out);
++ }
++ 
++ /**
++  * mlx5_eswitch_enable - Enable eswitch
++  * @esw:	Pointer to eswitch
++  * @mode:	Eswitch mode to enable
++  * @num_vfs:	Enable eswitch for given number of VFs. This is optional.
++  *		Valid value are 0, > 0 and MLX5_ESWITCH_IGNORE_NUM_VFS.
++  *		Caller should pass num_vfs > 0 when enabling eswitch for
++  *		vf vports. Caller should pass num_vfs = 0, when eswitch
++  *		is enabled without sriov VFs or when caller
++  *		is unaware of the sriov state of the host PF on ECPF based
++  *		eswitch. Caller should pass < 0 when num_vfs should be
++  *		completely ignored. This is typically the case when eswitch
++  *		is enabled without sriov regardless of PF/ECPF system.
++  * mlx5_eswitch_enable() Enables eswitch in either legacy or offloads mode.
++  * If num_vfs >=0 is provided, it setup VF related eswitch vports. It returns
++  * 0 on success or error code on failure.
++  */
++ int mlx5_eswitch_enable(struct mlx5_eswitch *esw, int mode, int num_vfs)
+  {
+  	int err;
+  
+@@@ -1912,6 -2124,10 +1953,13 @@@
+  	if (!MLX5_CAP_ESW_EGRESS_ACL(esw->dev, ft_support))
+  		esw_warn(esw->dev, "engress ACL is not supported by FW\n");
+  
+++<<<<<<< HEAD
+++=======
++ 	mlx5_eswitch_get_devlink_param(esw);
++ 
++ 	mlx5_eswitch_update_num_of_vfs(esw, num_vfs);
++ 
+++>>>>>>> ebf77bb83f63 (net/mlx5: E-switch, Extend eswitch enable to handle num_vfs change)
+  	esw_create_tsar(esw);
+  
+  	esw->mode = mode;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 9c629f913b96,752d399bdffb..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -601,10 -637,9 +603,9 @@@ mlx5_eswitch_get_vport(struct mlx5_eswi
+  
+  bool mlx5_eswitch_is_vf_vport(const struct mlx5_eswitch *esw, u16 vport_num);
+  
+- void mlx5_eswitch_update_num_of_vfs(struct mlx5_eswitch *esw, const int num_vfs);
+  int mlx5_esw_funcs_changed_handler(struct notifier_block *nb, unsigned long type, void *data);
+  
+ -int
+ +void
+  mlx5_eswitch_enable_pf_vf_vports(struct mlx5_eswitch *esw,
+  				 enum mlx5_eswitch_vport_event enabled_events);
+  void mlx5_eswitch_disable_pf_vf_vports(struct mlx5_eswitch *esw);
+@@@ -622,8 -683,11 +623,16 @@@ static inline const u32 *mlx5_esw_query
+  	return ERR_PTR(-EOPNOTSUPP);
+  }
+  
+++<<<<<<< HEAD
+ +static inline void mlx5_eswitch_update_num_of_vfs(struct mlx5_eswitch *esw, const int num_vfs) {}
+ +
+++=======
++ static inline struct mlx5_flow_handle *
++ esw_add_restore_rule(struct mlx5_eswitch *esw, u32 tag)
++ {
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
+++>>>>>>> ebf77bb83f63 (net/mlx5: E-switch, Extend eswitch enable to handle num_vfs change)
+  #endif /* CONFIG_MLX5_ESWITCH */
+  
+  #endif /* __MLX5_ESWITCH_H__ */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 98ef84b15725..235fa02384a0 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -1383,12 +1383,13 @@ static int esw_offloads_start(struct mlx5_eswitch *esw,
+ 	}
+ 
+ 	mlx5_eswitch_disable(esw, false);
+-	mlx5_eswitch_update_num_of_vfs(esw, esw->dev->priv.sriov.num_vfs);
+-	err = mlx5_eswitch_enable(esw, MLX5_ESWITCH_OFFLOADS);
++	err = mlx5_eswitch_enable(esw, MLX5_ESWITCH_OFFLOADS,
++				  esw->dev->priv.sriov.num_vfs);
+ 	if (err) {
+ 		NL_SET_ERR_MSG_MOD(extack,
+ 				   "Failed setting eswitch to offloads");
+-		err1 = mlx5_eswitch_enable(esw, MLX5_ESWITCH_LEGACY);
++		err1 = mlx5_eswitch_enable(esw, MLX5_ESWITCH_LEGACY,
++					   MLX5_ESWITCH_IGNORE_NUM_VFS);
+ 		if (err1) {
+ 			NL_SET_ERR_MSG_MOD(extack,
+ 					   "Failed setting eswitch back to legacy");
+@@ -2204,10 +2205,12 @@ static int esw_offloads_stop(struct mlx5_eswitch *esw,
+ 	int err, err1;
+ 
+ 	mlx5_eswitch_disable(esw, false);
+-	err = mlx5_eswitch_enable(esw, MLX5_ESWITCH_LEGACY);
++	err = mlx5_eswitch_enable(esw, MLX5_ESWITCH_LEGACY,
++				  MLX5_ESWITCH_IGNORE_NUM_VFS);
+ 	if (err) {
+ 		NL_SET_ERR_MSG_MOD(extack, "Failed setting eswitch to legacy");
+-		err1 = mlx5_eswitch_enable(esw, MLX5_ESWITCH_OFFLOADS);
++		err1 = mlx5_eswitch_enable(esw, MLX5_ESWITCH_OFFLOADS,
++					   MLX5_ESWITCH_IGNORE_NUM_VFS);
+ 		if (err1) {
+ 			NL_SET_ERR_MSG_MOD(extack,
+ 					   "Failed setting eswitch back to offloads");
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/sriov.c b/drivers/net/ethernet/mellanox/mlx5/core/sriov.c
+index 03f037811f1d..10a64b91d04c 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/sriov.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/sriov.c
+@@ -77,8 +77,8 @@ static int mlx5_device_enable_sriov(struct mlx5_core_dev *dev, int num_vfs)
+ 	if (!MLX5_ESWITCH_MANAGER(dev))
+ 		goto enable_vfs_hca;
+ 
+-	mlx5_eswitch_update_num_of_vfs(dev->priv.eswitch, num_vfs);
+-	err = mlx5_eswitch_enable(dev->priv.eswitch, MLX5_ESWITCH_LEGACY);
++	err = mlx5_eswitch_enable(dev->priv.eswitch, MLX5_ESWITCH_LEGACY,
++				  num_vfs);
+ 	if (err) {
+ 		mlx5_core_warn(dev,
+ 			       "failed to enable eswitch SRIOV (%d)\n", err);
