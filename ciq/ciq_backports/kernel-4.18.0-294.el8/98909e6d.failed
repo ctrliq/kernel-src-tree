@@ -1,0 +1,193 @@
+KVM: arm64: Move ELR_EL1 to the system register array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit 98909e6d1c811b6368c9c84fa6b3f0817c32ac2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/98909e6d.failed
+
+As ELR-EL1 is a VNCR-capable register with ARMv8.4-NV, let's move it to
+the sys_regs array and repaint the accessors. While we're at it, let's
+kill the now useless accessors used only on the fault injection path.
+
+	Reviewed-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit 98909e6d1c811b6368c9c84fa6b3f0817c32ac2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_emulate.h
+#	arch/arm64/include/asm/kvm_host.h
+#	arch/arm64/kvm/guest.c
+#	arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
+diff --cc arch/arm64/include/asm/kvm_emulate.h
+index f395ff663f8a,a12b5dc5db0d..000000000000
+--- a/arch/arm64/include/asm/kvm_emulate.h
++++ b/arch/arm64/include/asm/kvm_emulate.h
+@@@ -135,33 -124,12 +135,36 @@@ static inline void vcpu_set_vsesr(struc
+  
+  static __always_inline unsigned long *vcpu_pc(const struct kvm_vcpu *vcpu)
+  {
+ -	return (unsigned long *)&vcpu_gp_regs(vcpu)->pc;
+ +	return (unsigned long *)&vcpu_gp_regs(vcpu)->regs.pc;
+ +}
+ +
+++<<<<<<< HEAD
+ +static inline unsigned long *__vcpu_elr_el1(const struct kvm_vcpu *vcpu)
+ +{
+ +	return (unsigned long *)&vcpu_gp_regs(vcpu)->elr_el1;
+ +}
+ +
+ +static inline unsigned long vcpu_read_elr_el1(const struct kvm_vcpu *vcpu)
+ +{
+ +	if (vcpu->arch.sysregs_loaded_on_cpu)
+ +		return read_sysreg_el1(SYS_ELR);
+ +	else
+ +		return *__vcpu_elr_el1(vcpu);
+  }
+  
+ +static inline void vcpu_write_elr_el1(const struct kvm_vcpu *vcpu, unsigned long v)
+ +{
+ +	if (vcpu->arch.sysregs_loaded_on_cpu)
+ +		write_sysreg_el1(v, SYS_ELR);
+ +	else
+ +		*__vcpu_elr_el1(vcpu) = v;
+ +}
+ +
+++=======
+++>>>>>>> 98909e6d1c81 (KVM: arm64: Move ELR_EL1 to the system register array)
+  static __always_inline unsigned long *vcpu_cpsr(const struct kvm_vcpu *vcpu)
+  {
+ -	return (unsigned long *)&vcpu_gp_regs(vcpu)->pstate;
+ +	return (unsigned long *)&vcpu_gp_regs(vcpu)->regs.pstate;
+  }
+  
+  static __always_inline bool vcpu_mode_is_32bit(const struct kvm_vcpu *vcpu)
+diff --cc arch/arm64/include/asm/kvm_host.h
+index d8c4d368d7b0,f255507dd916..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -232,7 -238,14 +234,18 @@@ enum vcpu_sysreg 
+  #define NR_COPRO_REGS	(NR_SYS_REGS * 2)
+  
+  struct kvm_cpu_context {
+++<<<<<<< HEAD
+ +	struct kvm_regs	gp_regs;
+++=======
++ 	struct user_pt_regs regs;	/* sp = sp_el0 */
++ 
++ 	u64	sp_el1;
++ 
++ 	u64	spsr[KVM_NR_SPSR];
++ 
++ 	struct user_fpsimd_state fp_regs;
++ 
+++>>>>>>> 98909e6d1c81 (KVM: arm64: Move ELR_EL1 to the system register array)
+  	union {
+  		u64 sys_regs[NR_SYS_REGS];
+  		u32 copro[NR_COPRO_REGS];
+diff --cc arch/arm64/kvm/guest.c
+index a0778b6214ad,99ff09ad24e8..000000000000
+--- a/arch/arm64/kvm/guest.c
++++ b/arch/arm64/kvm/guest.c
+@@@ -117,12 -107,54 +117,58 @@@ static int validate_core_offset(const s
+  	int size = core_reg_size_from_offset(vcpu, off);
+  
+  	if (size < 0)
+ -		return NULL;
+ +		return -EINVAL;
+  
+  	if (KVM_REG_SIZE(reg->id) != size)
+ -		return NULL;
+ +		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	switch (off) {
++ 	case KVM_REG_ARM_CORE_REG(regs.regs[0]) ...
++ 	     KVM_REG_ARM_CORE_REG(regs.regs[30]):
++ 		off -= KVM_REG_ARM_CORE_REG(regs.regs[0]);
++ 		off /= 2;
++ 		return &vcpu->arch.ctxt.regs.regs[off];
++ 
++ 	case KVM_REG_ARM_CORE_REG(regs.sp):
++ 		return &vcpu->arch.ctxt.regs.sp;
++ 
++ 	case KVM_REG_ARM_CORE_REG(regs.pc):
++ 		return &vcpu->arch.ctxt.regs.pc;
++ 
++ 	case KVM_REG_ARM_CORE_REG(regs.pstate):
++ 		return &vcpu->arch.ctxt.regs.pstate;
++ 
++ 	case KVM_REG_ARM_CORE_REG(sp_el1):
++ 		return &vcpu->arch.ctxt.sp_el1;
++ 
++ 	case KVM_REG_ARM_CORE_REG(elr_el1):
++ 		return __ctxt_sys_reg(&vcpu->arch.ctxt, ELR_EL1);
++ 
++ 	case KVM_REG_ARM_CORE_REG(spsr[0]) ...
++ 	     KVM_REG_ARM_CORE_REG(spsr[KVM_NR_SPSR - 1]):
++ 		off -= KVM_REG_ARM_CORE_REG(spsr[0]);
++ 		off /= 2;
++ 		return &vcpu->arch.ctxt.spsr[off];
++ 
++ 	case KVM_REG_ARM_CORE_REG(fp_regs.vregs[0]) ...
++ 	     KVM_REG_ARM_CORE_REG(fp_regs.vregs[31]):
++ 		off -= KVM_REG_ARM_CORE_REG(fp_regs.vregs[0]);
++ 		off /= 4;
++ 		return &vcpu->arch.ctxt.fp_regs.vregs[off];
++ 
++ 	case KVM_REG_ARM_CORE_REG(fp_regs.fpsr):
++ 		return &vcpu->arch.ctxt.fp_regs.fpsr;
++ 
++ 	case KVM_REG_ARM_CORE_REG(fp_regs.fpcr):
++ 		return &vcpu->arch.ctxt.fp_regs.fpcr;
++ 
++ 	default:
++ 		return NULL;
++ 	}
+++>>>>>>> 98909e6d1c81 (KVM: arm64: Move ELR_EL1 to the system register array)
+  }
+  
+  static int get_core_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg)
+* Unmerged path arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
+* Unmerged path arch/arm64/include/asm/kvm_emulate.h
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+* Unmerged path arch/arm64/kvm/guest.c
+* Unmerged path arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
+diff --git a/arch/arm64/kvm/inject_fault.c b/arch/arm64/kvm/inject_fault.c
+index 7e133aa3e590..5468e4817e5d 100644
+--- a/arch/arm64/kvm/inject_fault.c
++++ b/arch/arm64/kvm/inject_fault.c
+@@ -75,7 +75,7 @@ static void enter_exception64(struct kvm_vcpu *vcpu, unsigned long target_mode,
+ 	case PSR_MODE_EL1h:
+ 		vbar = vcpu_read_sys_reg(vcpu, VBAR_EL1);
+ 		sctlr = vcpu_read_sys_reg(vcpu, SCTLR_EL1);
+-		vcpu_write_elr_el1(vcpu, *vcpu_pc(vcpu));
++		vcpu_write_sys_reg(vcpu, *vcpu_pc(vcpu), ELR_EL1);
+ 		break;
+ 	default:
+ 		/* Don't do that */
+diff --git a/arch/arm64/kvm/sys_regs.c b/arch/arm64/kvm/sys_regs.c
+index f6dc4f4c9793..c19d288fe5a9 100644
+--- a/arch/arm64/kvm/sys_regs.c
++++ b/arch/arm64/kvm/sys_regs.c
+@@ -105,6 +105,7 @@ static bool __vcpu_read_sys_reg_from_cpu(int reg, u64 *val)
+ 	case TPIDR_EL1:		*val = read_sysreg_s(SYS_TPIDR_EL1);	break;
+ 	case AMAIR_EL1:		*val = read_sysreg_s(SYS_AMAIR_EL12);	break;
+ 	case CNTKCTL_EL1:	*val = read_sysreg_s(SYS_CNTKCTL_EL12);	break;
++	case ELR_EL1:		*val = read_sysreg_s(SYS_ELR_EL12);	break;
+ 	case PAR_EL1:		*val = read_sysreg_s(SYS_PAR_EL1);	break;
+ 	case DACR32_EL2:	*val = read_sysreg_s(SYS_DACR32_EL2);	break;
+ 	case IFSR32_EL2:	*val = read_sysreg_s(SYS_IFSR32_EL2);	break;
+@@ -144,6 +145,7 @@ static bool __vcpu_write_sys_reg_to_cpu(u64 val, int reg)
+ 	case TPIDR_EL1:		write_sysreg_s(val, SYS_TPIDR_EL1);	break;
+ 	case AMAIR_EL1:		write_sysreg_s(val, SYS_AMAIR_EL12);	break;
+ 	case CNTKCTL_EL1:	write_sysreg_s(val, SYS_CNTKCTL_EL12);	break;
++	case ELR_EL1:		write_sysreg_s(val, SYS_ELR_EL12);	break;
+ 	case PAR_EL1:		write_sysreg_s(val, SYS_PAR_EL1);	break;
+ 	case DACR32_EL2:	write_sysreg_s(val, SYS_DACR32_EL2);	break;
+ 	case IFSR32_EL2:	write_sysreg_s(val, SYS_IFSR32_EL2);	break;
