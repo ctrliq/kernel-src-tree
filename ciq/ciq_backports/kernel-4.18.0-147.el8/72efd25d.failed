@@ -1,0 +1,273 @@
+nvmet: add minimal ANA support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 72efd25dcf4f6310e9e6fa85620aa443b27c23fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/72efd25d.failed
+
+Add support for Asynchronous Namespace Access as specified in NVMe 1.3
+TP 4004.
+
+Just add a default ANA group 1 that is optimized on all ports.  This is
+(and will remain) the default assignment for any namespace not epxlicitly
+assigned to another ANA group.  The ANA state can be manually changed
+through the configfs interface, including the change state.
+
+Includes fixes and improvements from Hannes Reinecke.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+(cherry picked from commit 72efd25dcf4f6310e9e6fa85620aa443b27c23fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/core.c
+#	drivers/nvme/target/nvmet.h
+diff --cc drivers/nvme/target/core.c
+index cbb053d0f927,43a755f7baa5..000000000000
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@@ -540,7 -455,14 +548,13 @@@ struct nvmet_ns *nvmet_ns_alloc(struct 
+  
+  	ns->nsid = nsid;
+  	ns->subsys = subsys;
++ 
++ 	down_write(&nvmet_ana_sem);
++ 	ns->anagrpid = NVMET_DEFAULT_ANA_GRPID;
++ 	nvmet_ana_group_enabled[ns->anagrpid]++;
++ 	up_write(&nvmet_ana_sem);
++ 
+  	uuid_gen(&ns->uuid);
+ -	ns->buffered_io = false;
+  
+  	return ns;
+  }
+@@@ -1294,6 -1154,15 +1325,18 @@@ static int __init nvmet_init(void
+  {
+  	int error;
+  
+++<<<<<<< HEAD
+++=======
++ 	nvmet_ana_group_enabled[NVMET_DEFAULT_ANA_GRPID] = 1;
++ 
++ 	buffered_io_wq = alloc_workqueue("nvmet-buffered-io-wq",
++ 			WQ_MEM_RECLAIM, 0);
++ 	if (!buffered_io_wq) {
++ 		error = -ENOMEM;
++ 		goto out;
++ 	}
++ 
+++>>>>>>> 72efd25dcf4f (nvmet: add minimal ANA support)
+  	error = nvmet_init_discovery();
+  	if (error)
+  		goto out;
+diff --cc drivers/nvme/target/nvmet.h
+index 89c4b1275043,f7d622fc1aa7..000000000000
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@@ -65,7 -64,9 +65,8 @@@ struct nvmet_ns 
+  	loff_t			size;
+  	u8			nguid[16];
+  	uuid_t			uuid;
++ 	u32			anagrpid;
+  
+ -	bool			buffered_io;
+  	bool			enabled;
+  	struct nvmet_subsys	*subsys;
+  	const char		*device_path;
+@@@ -376,6 -365,22 +378,25 @@@ u32 nvmet_get_log_page_len(struct nvme_
+  #define NVMET_QUEUE_SIZE	1024
+  #define NVMET_NR_QUEUES		128
+  #define NVMET_MAX_CMD		NVMET_QUEUE_SIZE
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Nice round number that makes a list of nsids fit into a page.
++  * Should become tunable at some point in the future.
++  */
++ #define NVMET_MAX_NAMESPACES	1024
++ 
++ /*
++  * 0 is not a valid ANA group ID, so we start numbering at 1.
++  *
++  * ANA Group 1 exists without manual intervention, has namespaces assigned to it
++  * by default, and is available in an optimized state through all ports.
++  */
++ #define NVMET_MAX_ANAGRPS	1
++ #define NVMET_DEFAULT_ANA_GRPID	1
++ 
+++>>>>>>> 72efd25dcf4f (nvmet: add minimal ANA support)
+  #define NVMET_KAS		10
+  #define NVMET_DISC_KATO		120
+  
+diff --git a/drivers/nvme/target/admin-cmd.c b/drivers/nvme/target/admin-cmd.c
+index 16a9b24270f9..900e14cdb0da 100644
+--- a/drivers/nvme/target/admin-cmd.c
++++ b/drivers/nvme/target/admin-cmd.c
+@@ -182,6 +182,69 @@ static void nvmet_execute_get_log_changed_ns(struct nvmet_req *req)
+ 	nvmet_req_complete(req, status);
+ }
+ 
++static u32 nvmet_format_ana_group(struct nvmet_req *req, u32 grpid,
++		struct nvme_ana_group_desc *desc)
++{
++	struct nvmet_ctrl *ctrl = req->sq->ctrl;
++	struct nvmet_ns *ns;
++	u32 count = 0;
++
++	if (!(req->cmd->get_log_page.lsp & NVME_ANA_LOG_RGO)) {
++		rcu_read_lock();
++		list_for_each_entry_rcu(ns, &ctrl->subsys->namespaces, dev_link)
++			if (ns->anagrpid == grpid)
++				desc->nsids[count++] = cpu_to_le32(ns->nsid);
++		rcu_read_unlock();
++	}
++
++	desc->grpid = cpu_to_le32(grpid);
++	desc->nnsids = cpu_to_le32(count);
++	desc->chgcnt = cpu_to_le64(nvmet_ana_chgcnt);
++	desc->state = req->port->ana_state[grpid];
++	memset(desc->rsvd17, 0, sizeof(desc->rsvd17));
++	return sizeof(struct nvme_ana_group_desc) + count * sizeof(__le32);
++}
++
++static void nvmet_execute_get_log_page_ana(struct nvmet_req *req)
++{
++	struct nvme_ana_rsp_hdr hdr = { 0, };
++	struct nvme_ana_group_desc *desc;
++	size_t offset = sizeof(struct nvme_ana_rsp_hdr); /* start beyond hdr */
++	size_t len;
++	u32 grpid;
++	u16 ngrps = 0;
++	u16 status;
++
++	status = NVME_SC_INTERNAL;
++	desc = kmalloc(sizeof(struct nvme_ana_group_desc) +
++			NVMET_MAX_NAMESPACES * sizeof(__le32), GFP_KERNEL);
++	if (!desc)
++		goto out;
++
++	down_read(&nvmet_ana_sem);
++	for (grpid = 1; grpid <= NVMET_MAX_ANAGRPS; grpid++) {
++		if (!nvmet_ana_group_enabled[grpid])
++			continue;
++		len = nvmet_format_ana_group(req, grpid, desc);
++		status = nvmet_copy_to_sgl(req, offset, desc, len);
++		if (status)
++			break;
++		offset += len;
++		ngrps++;
++	}
++
++	hdr.chgcnt = cpu_to_le64(nvmet_ana_chgcnt);
++	hdr.ngrps = cpu_to_le16(ngrps);
++	up_read(&nvmet_ana_sem);
++
++	kfree(desc);
++
++	/* copy the header last once we know the number of groups */
++	status = nvmet_copy_to_sgl(req, 0, &hdr, sizeof(hdr));
++out:
++	nvmet_req_complete(req, status);
++}
++
+ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
+ {
+ 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
+@@ -213,8 +276,8 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
+ 	 * the safest is to leave it as zeroes.
+ 	 */
+ 
+-	/* we support multiple ports and multiples hosts: */
+-	id->cmic = (1 << 0) | (1 << 1);
++	/* we support multiple ports, multiples hosts and ANA: */
++	id->cmic = (1 << 0) | (1 << 1) | (1 << 3);
+ 
+ 	/* no limit on data transfer sizes for now */
+ 	id->mdts = 0;
+@@ -281,6 +344,11 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
+ 
+ 	id->msdbd = ctrl->ops->msdbd;
+ 
++	id->anacap = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4);
++	id->anatt = 10; /* random value */
++	id->anagrpmax = cpu_to_le32(NVMET_MAX_ANAGRPS);
++	id->nanagrpid = cpu_to_le32(NVMET_MAX_ANAGRPS);
++
+ 	/*
+ 	 * Meh, we don't really support any power state.  Fake up the same
+ 	 * values that qemu does.
+@@ -322,8 +390,15 @@ static void nvmet_execute_identify_ns(struct nvmet_req *req)
+ 	 * nuse = ncap = nsze isn't always true, but we have no way to find
+ 	 * that out from the underlying device.
+ 	 */
+-	id->ncap = id->nuse = id->nsze =
+-		cpu_to_le64(ns->size >> ns->blksize_shift);
++	id->ncap = id->nsze = cpu_to_le64(ns->size >> ns->blksize_shift);
++	switch (req->port->ana_state[ns->anagrpid]) {
++	case NVME_ANA_INACCESSIBLE:
++	case NVME_ANA_PERSISTENT_LOSS:
++		break;
++	default:
++		id->nuse = id->nsze;
++		break;
++        }
+ 
+ 	/*
+ 	 * We just provide a single LBA format that matches what the
+@@ -337,6 +412,7 @@ static void nvmet_execute_identify_ns(struct nvmet_req *req)
+ 	 * controllers, but also with any other user of the block device.
+ 	 */
+ 	id->nmic = (1 << 0);
++	id->anagrpid = cpu_to_le32(ns->anagrpid);
+ 
+ 	memcpy(&id->nguid, &ns->nguid, sizeof(id->nguid));
+ 
+@@ -619,6 +695,9 @@ u16 nvmet_parse_admin_cmd(struct nvmet_req *req)
+ 		case NVME_LOG_CMD_EFFECTS:
+ 			req->execute = nvmet_execute_get_log_cmd_effects_ns;
+ 			return 0;
++		case NVME_LOG_ANA:
++			req->execute = nvmet_execute_get_log_page_ana;
++			return 0;
+ 		}
+ 		break;
+ 	case nvme_admin_identify:
+diff --git a/drivers/nvme/target/configfs.c b/drivers/nvme/target/configfs.c
+index ebed21c35410..c4f9d6c5b320 100644
+--- a/drivers/nvme/target/configfs.c
++++ b/drivers/nvme/target/configfs.c
+@@ -946,6 +946,7 @@ static void nvmet_port_release(struct config_item *item)
+ {
+ 	struct nvmet_port *port = to_nvmet_port(item);
+ 
++	kfree(port->ana_state);
+ 	kfree(port);
+ }
+ 
+@@ -982,6 +983,15 @@ static struct config_group *nvmet_ports_make(struct config_group *group,
+ 	if (!port)
+ 		return ERR_PTR(-ENOMEM);
+ 
++	port->ana_state = kcalloc(NVMET_MAX_ANAGRPS + 1,
++			sizeof(*port->ana_state), GFP_KERNEL);
++	if (!port->ana_state) {
++		kfree(port);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	port->ana_state[NVMET_DEFAULT_ANA_GRPID] = NVME_ANA_OPTIMIZED;
++
+ 	INIT_LIST_HEAD(&port->entry);
+ 	INIT_LIST_HEAD(&port->subsystems);
+ 	INIT_LIST_HEAD(&port->referrals);
+* Unmerged path drivers/nvme/target/core.c
+* Unmerged path drivers/nvme/target/nvmet.h
