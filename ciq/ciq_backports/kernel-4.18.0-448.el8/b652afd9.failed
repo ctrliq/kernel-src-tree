@@ -1,0 +1,320 @@
+xfs: get rid of xfs_dir_ialloc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Dave Chinner <dchinner@redhat.com>
+commit b652afd937033911944d7f681f2031b006961f1d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/b652afd9.failed
+
+This is just a simple wrapper around the per-ag inode allocation
+that doesn't need to exist. The internal mechanism to select and
+allocate within an AG does not need to be exposed outside
+xfs_ialloc.c, and it being exposed simply makes it harder to follow
+the code and simplify it.
+
+This is simplified by internalising xf_dialloc_select_ag() and
+xfs_dialloc_ag() into a single xfs_dialloc() function and then
+xfs_dir_ialloc() can go away.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+
+(cherry picked from commit b652afd937033911944d7f681f2031b006961f1d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_inode.c
+#	fs/xfs/xfs_inode.h
+#	fs/xfs/xfs_qm.c
+#	fs/xfs/xfs_symlink.c
+diff --cc fs/xfs/xfs_inode.c
+index b0de190614c0,8d204d516621..000000000000
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@@ -778,8 -749,9 +778,8 @@@ xfs_inode_inherit_flags2
+   * Initialise a newly allocated inode and return the in-core inode to the
+   * caller locked exclusively.
+   */
+- static int
++ int
+  xfs_init_new_inode(
+ -	struct user_namespace	*mnt_userns,
+  	struct xfs_trans	*tp,
+  	struct xfs_inode	*pip,
+  	xfs_ino_t		ino,
+@@@ -913,53 -886,6 +913,56 @@@
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Allocates a new inode from disk and return a pointer to the incore copy. This
+ + * routine will internally commit the current transaction and allocate a new one
+ + * if we needed to allocate more on-disk free inodes to perform the requested
+ + * operation.
+ + *
+ + * If we are allocating quota inodes, we do not have a parent inode to attach to
+ + * or associate with (i.e. dp == NULL) because they are not linked into the
+ + * directory structure - they are attached directly to the superblock - and so
+ + * have no parent.
+ + */
+ +int
+ +xfs_dir_ialloc(
+ +	struct xfs_trans	**tpp,
+ +	struct xfs_inode	*dp,
+ +	umode_t			mode,
+ +	xfs_nlink_t		nlink,
+ +	dev_t			rdev,
+ +	prid_t			prid,
+ +	bool			init_xattrs,
+ +	struct xfs_inode	**ipp)
+ +{
+ +	struct xfs_buf		*agibp;
+ +	xfs_ino_t		parent_ino = dp ? dp->i_ino : 0;
+ +	xfs_ino_t		ino;
+ +	int			error;
+ +
+ +	ASSERT((*tpp)->t_flags & XFS_TRANS_PERM_LOG_RES);
+ +
+ +	/*
+ +	 * Call the space management code to pick the on-disk inode to be
+ +	 * allocated.
+ +	 */
+ +	error = xfs_dialloc_select_ag(tpp, parent_ino, mode, &agibp);
+ +	if (error)
+ +		return error;
+ +
+ +	/* Allocate an inode from the selected AG */
+ +	error = xfs_dialloc_ag(*tpp, agibp, parent_ino, &ino);
+ +	if (error)
+ +		return error;
+ +	ASSERT(ino != NULLFSINO);
+ +
+ +	return xfs_init_new_inode(*tpp, dp, ino, mode, nlink, rdev,
+ +				  prid, init_xattrs, ipp);
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> b652afd93703 (xfs: get rid of xfs_dir_ialloc())
+   * Decrement the link count on an inode & log the change.  If this causes the
+   * link count to go to zero, move the inode to AGI unlinked list so that it can
+   * be freed when the last active reference goes away via xfs_inactive().
+@@@ -1070,8 -999,10 +1074,15 @@@ xfs_create
+  	 * entry pointing to them, but a directory also the "." entry
+  	 * pointing to itself.
+  	 */
+++<<<<<<< HEAD
+ +	error = xfs_dir_ialloc(&tp, dp, mode, is_dir ? 2 : 1, rdev,
+ +			       prid, init_xattrs, &ip);
+++=======
++ 	error = xfs_dialloc(&tp, dp->i_ino, mode, &ino);
++ 	if (!error)
++ 		error = xfs_init_new_inode(mnt_userns, tp, dp, ino, mode,
++ 				is_dir ? 2 : 1, rdev, prid, init_xattrs, &ip);
+++>>>>>>> b652afd93703 (xfs: get rid of xfs_dir_ialloc())
+  	if (error)
+  		goto out_trans_cancel;
+  
+@@@ -1189,7 -1123,10 +1201,14 @@@ xfs_create_tmpfile
+  	if (error)
+  		goto out_release_dquots;
+  
+++<<<<<<< HEAD
+ +	error = xfs_dir_ialloc(&tp, dp, mode, 0, 0, prid, false, &ip);
+++=======
++ 	error = xfs_dialloc(&tp, dp->i_ino, mode, &ino);
++ 	if (!error)
++ 		error = xfs_init_new_inode(mnt_userns, tp, dp, ino, mode,
++ 				0, 0, prid, false, &ip);
+++>>>>>>> b652afd93703 (xfs: get rid of xfs_dir_ialloc())
+  	if (error)
+  		goto out_trans_cancel;
+  
+diff --cc fs/xfs/xfs_inode.h
+index 9bb9c82840e4,4b6703dbffb8..000000000000
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@@ -428,9 -431,10 +428,16 @@@ void		xfs_lock_two_inodes(struct xfs_in
+  xfs_extlen_t	xfs_get_extsz_hint(struct xfs_inode *ip);
+  xfs_extlen_t	xfs_get_cowextsz_hint(struct xfs_inode *ip);
+  
+++<<<<<<< HEAD
+ +int xfs_dir_ialloc(struct xfs_trans **tpp, struct xfs_inode *dp, umode_t mode,
+ +		   xfs_nlink_t nlink, dev_t dev, prid_t prid, bool need_xattr,
+ +		   struct xfs_inode **ipp);
+++=======
++ int xfs_init_new_inode(struct user_namespace *mnt_userns, struct xfs_trans *tp,
++ 		struct xfs_inode *pip, xfs_ino_t ino, umode_t mode,
++ 		xfs_nlink_t nlink, dev_t rdev, prid_t prid, bool init_xattrs,
++ 		struct xfs_inode **ipp);
+++>>>>>>> b652afd93703 (xfs: get rid of xfs_dir_ialloc())
+  
+  static inline int
+  xfs_itruncate_extents(
+diff --cc fs/xfs/xfs_qm.c
+index 99eb92d3c88e,fe341f3fd419..000000000000
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@@ -23,6 -23,8 +23,11 @@@
+  #include "xfs_trace.h"
+  #include "xfs_icache.h"
+  #include "xfs_error.h"
+++<<<<<<< HEAD
+++=======
++ #include "xfs_ag.h"
++ #include "xfs_ialloc.h"
+++>>>>>>> b652afd93703 (xfs: get rid of xfs_dir_ialloc())
+  
+  /*
+   * The global quota manager. There is only one of these for the entire
+@@@ -787,7 -789,12 +792,16 @@@ xfs_qm_qino_alloc
+  		return error;
+  
+  	if (need_alloc) {
+++<<<<<<< HEAD
+ +		error = xfs_dir_ialloc(&tp, NULL, S_IFREG, 1, 0, 0, false, ipp);
+++=======
++ 		xfs_ino_t	ino;
++ 
++ 		error = xfs_dialloc(&tp, 0, S_IFREG, &ino);
++ 		if (!error)
++ 			error = xfs_init_new_inode(&init_user_ns, tp, NULL, ino,
++ 					S_IFREG, 1, 0, 0, false, ipp);
+++>>>>>>> b652afd93703 (xfs: get rid of xfs_dir_ialloc())
+  		if (error) {
+  			xfs_trans_cancel(tp);
+  			return error;
+diff --cc fs/xfs/xfs_symlink.c
+index 8cb9e853d0e3,1525636f4065..000000000000
+--- a/fs/xfs/xfs_symlink.c
++++ b/fs/xfs/xfs_symlink.c
+@@@ -21,7 -21,7 +21,11 @@@
+  #include "xfs_trans_space.h"
+  #include "xfs_trace.h"
+  #include "xfs_trans.h"
+++<<<<<<< HEAD
+ +#include "xfs_error.h"
+++=======
++ #include "xfs_ialloc.h"
+++>>>>>>> b652afd93703 (xfs: get rid of xfs_dir_ialloc())
+  
+  /* ----- Kernel only functions below ----- */
+  int
+@@@ -230,8 -225,11 +235,16 @@@ xfs_symlink
+  	/*
+  	 * Allocate an inode for the symlink.
+  	 */
+++<<<<<<< HEAD
+ +	error = xfs_dir_ialloc(&tp, dp, S_IFLNK | (mode & ~S_IFMT), 1, 0,
+ +			       prid, false, &ip);
+++=======
++ 	error = xfs_dialloc(&tp, dp->i_ino, S_IFLNK, &ino);
++ 	if (!error)
++ 		error = xfs_init_new_inode(mnt_userns, tp, dp, ino,
++ 				S_IFLNK | (mode & ~S_IFMT), 1, 0, prid,
++ 				false, &ip);
+++>>>>>>> b652afd93703 (xfs: get rid of xfs_dir_ialloc())
+  	if (error)
+  		goto out_trans_cancel;
+  
+diff --git a/fs/xfs/libxfs/xfs_ialloc.c b/fs/xfs/libxfs/xfs_ialloc.c
+index 1e69b4d32727..303fe72f2a7d 100644
+--- a/fs/xfs/libxfs/xfs_ialloc.c
++++ b/fs/xfs/libxfs/xfs_ialloc.c
+@@ -1428,7 +1428,7 @@ xfs_dialloc_ag_update_inobt(
+  * The caller selected an AG for us, and made sure that free inodes are
+  * available.
+  */
+-int
++static int
+ xfs_dialloc_ag(
+ 	struct xfs_trans	*tp,
+ 	struct xfs_buf		*agbp,
+@@ -1602,24 +1602,23 @@ xfs_ialloc_next_ag(
+  * can be allocated, -ENOSPC be returned.
+  */
+ int
+-xfs_dialloc_select_ag(
++xfs_dialloc(
+ 	struct xfs_trans	**tpp,
+ 	xfs_ino_t		parent,
+ 	umode_t			mode,
+-	struct xfs_buf		**IO_agbp)
++	xfs_ino_t		*new_ino)
+ {
+ 	struct xfs_mount	*mp = (*tpp)->t_mountp;
+ 	struct xfs_buf		*agbp;
+ 	xfs_agnumber_t		agno;
+-	int			error;
++	int			error = 0;
+ 	xfs_agnumber_t		start_agno;
+ 	struct xfs_perag	*pag;
+ 	struct xfs_ino_geometry	*igeo = M_IGEO(mp);
+ 	bool			okalloc = true;
+ 	int			needspace;
+ 	int			flags;
+-
+-	*IO_agbp = NULL;
++	xfs_ino_t		ino;
+ 
+ 	/*
+ 	 * Directories, symlinks, and regular files frequently allocate at least
+@@ -1765,7 +1764,11 @@ xfs_dialloc_select_ag(
+ 	return error ? error : -ENOSPC;
+ found_ag:
+ 	xfs_perag_put(pag);
+-	*IO_agbp = agbp;
++	/* Allocate an inode in the found AG */
++	error = xfs_dialloc_ag(*tpp, agbp, parent, &ino);
++	if (error)
++		return error;
++	*new_ino = ino;
+ 	return 0;
+ }
+ 
+diff --git a/fs/xfs/libxfs/xfs_ialloc.h b/fs/xfs/libxfs/xfs_ialloc.h
+index 3511086a7ae1..886f6748fb22 100644
+--- a/fs/xfs/libxfs/xfs_ialloc.h
++++ b/fs/xfs/libxfs/xfs_ialloc.h
+@@ -33,30 +33,11 @@ xfs_make_iptr(struct xfs_mount *mp, struct xfs_buf *b, int o)
+ }
+ 
+ /*
+- * Allocate an inode on disk.
+- * Mode is used to tell whether the new inode will need space, and whether
+- * it is a directory.
+- *
+- * There are two phases to inode allocation: selecting an AG and ensuring
+- * that it contains free inodes, followed by allocating one of the free
+- * inodes. xfs_dialloc_select_ag() does the former and returns a locked AGI
+- * to the caller, ensuring that followup call to xfs_dialloc_ag() will
+- * have free inodes to allocate from. xfs_dialloc_ag() will return the inode
+- * number of the free inode we allocated.
++ * Allocate an inode on disk.  Mode is used to tell whether the new inode will
++ * need space, and whether it is a directory.
+  */
+-int					/* error */
+-xfs_dialloc_select_ag(
+-	struct xfs_trans **tpp,		/* double pointer of transaction */
+-	xfs_ino_t	parent,		/* parent inode (directory) */
+-	umode_t		mode,		/* mode bits for new inode */
+-	struct xfs_buf	**IO_agbp);
+-
+-int
+-xfs_dialloc_ag(
+-	struct xfs_trans	*tp,
+-	struct xfs_buf		*agbp,
+-	xfs_ino_t		parent,
+-	xfs_ino_t		*inop);
++int xfs_dialloc(struct xfs_trans **tpp, xfs_ino_t parent, umode_t mode,
++		xfs_ino_t *new_ino);
+ 
+ /*
+  * Free disk inode.  Carefully avoids touching the incore inode, all
+* Unmerged path fs/xfs/xfs_inode.c
+* Unmerged path fs/xfs/xfs_inode.h
+* Unmerged path fs/xfs/xfs_qm.c
+* Unmerged path fs/xfs/xfs_symlink.c
