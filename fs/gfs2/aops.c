@@ -738,7 +738,8 @@ int gfs2_stuffed_write_end(struct inode *inode, struct buffer_head *dibh,
  
 static int jdata_set_page_dirty(struct page *page)
 {
-	SetPageChecked(page);
+	if (current->journal_info)
+		SetPageChecked(page);
 	return __set_page_dirty_buffers(page);
 }
 
