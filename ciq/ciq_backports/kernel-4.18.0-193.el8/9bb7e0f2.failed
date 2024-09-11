@@ -1,0 +1,874 @@
+cfg80211: add peer measurement with FTM initiator API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 9bb7e0f24e7e7d00daa1219b14539e2e602649b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/9bb7e0f2.failed
+
+Add a new "peer measurement" API, that can be used to measure
+certain things related to a peer. Right now, only implement
+FTM (flight time measurement) over it, but the idea is that
+it'll be extensible to also support measuring the necessary
+things to calculate e.g. angle-of-arrival for WiGig.
+
+The API is structured to have a generic list of peers and
+channels to measure with/on, and then for each of those a
+set of measurements (again, only FTM right now) to perform.
+
+Results are sent to the requesting socket, including a final
+complete message.
+
+Closing the controlling netlink socket will abort a running
+measurement.
+
+v3:
+ - add a bit to report "final" for partial results
+ - remove list keeping etc. and just unicast out the results
+   to the requester (big code reduction ...)
+ - also send complete message unicast, and as a result
+   remove the multicast group
+ - separate out struct cfg80211_pmsr_ftm_request_peer
+   from struct cfg80211_pmsr_request_peer
+ - document timeout == 0 if no timeout
+ - disallow setting timeout nl80211 attribute to 0,
+   must not include attribute for no timeout
+ - make MAC address randomization optional
+ - change num bursts exponent default to 0 (1 burst, rather
+   rather than the old default of 15==don't care)
+
+v4:
+ - clarify NL80211_ATTR_TIMEOUT documentation
+
+v5:
+ - remove unnecessary nl80211 multicast/family changes
+ - remove partial results bit/flag, final is sufficient
+ - add max_bursts_exponent, max_ftms_per_burst to capability
+ - rename "frames per burst" -> "FTMs per burst"
+
+v6:
+ - rename cfg80211_pmsr_free_wdev() to cfg80211_pmsr_wdev_down()
+   and call it in leave, so the device can't go down with any
+   pending measurements
+
+v7:
+ - wording fixes (Lior)
+ - fix ftm.max_bursts_exponent to allow having the limit of 0 (Lior)
+
+v8:
+ - copyright statements
+ - minor coding style fixes
+ - fix error path leak
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 9bb7e0f24e7e7d00daa1219b14539e2e602649b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/cfg80211.h
+#	include/uapi/linux/nl80211.h
+#	net/wireless/core.h
+#	net/wireless/nl80211.c
+#	net/wireless/pmsr.c
+#	net/wireless/rdev-ops.h
+#	net/wireless/trace.h
+diff --cc include/net/cfg80211.h
+index f4b191144774,c21c5c70a2fd..000000000000
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@@ -3146,32 -3033,6 +3146,35 @@@ struct cfg80211_pmsr_request 
+  };
+  
+  /**
+++<<<<<<< HEAD
+ + * struct cfg80211_update_owe_info - OWE Information
+ + *
+ + * This structure provides information needed for the drivers to offload OWE
+ + * (Opportunistic Wireless Encryption) processing to the user space.
+ + *
+ + * Commonly used across update_owe_info request and event interfaces.
+ + *
+ + * @peer: MAC address of the peer device for which the OWE processing
+ + *	has to be done.
+ + * @status: status code, %WLAN_STATUS_SUCCESS for successful OWE info
+ + *	processing, use %WLAN_STATUS_UNSPECIFIED_FAILURE if user space
+ + *	cannot give you the real status code for failures. Used only for
+ + *	OWE update request command interface (user space to driver).
+ + * @ie: IEs obtained from the peer or constructed by the user space. These are
+ + *	the IEs of the remote peer in the event from the host driver and
+ + *	the constructed IEs by the user space in the request interface.
+ + * @ie_len: Length of IEs in octets.
+ + */
+ +struct cfg80211_update_owe_info {
+ +	u8 peer[ETH_ALEN] __aligned(2);
+ +	u16 status;
+ +	const u8 *ie;
+ +	size_t ie_len;
+ +};
+ +
+ +/**
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+   * struct cfg80211_ops - backend description for wireless configuration
+   *
+   * This struct is registered by fullmac card drivers and/or wireless stacks
+@@@ -3508,13 -3369,6 +3511,16 @@@
+   *	Statistics should be cumulative, currently no way to reset is provided.
+   * @start_pmsr: start peer measurement (e.g. FTM)
+   * @abort_pmsr: abort peer measurement
+++<<<<<<< HEAD
+ + *
+ + * @update_owe_info: Provide updated OWE info to driver. Driver implementing SME
+ + *	but offloading OWE processing to the user space will get the updated
+ + *	DH IE through this interface.
+ + *
+ + * @probe_mesh_link: Probe direct Mesh peer's link quality by sending data frame
+ + *	and overrule HWMP path selection algorithm.
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+   */
+  struct cfg80211_ops {
+  	int	(*suspend)(struct wiphy *wiphy, struct cfg80211_wowlan *wow);
+@@@ -3829,10 -3683,6 +3835,13 @@@
+  			      struct cfg80211_pmsr_request *request);
+  	void	(*abort_pmsr)(struct wiphy *wiphy, struct wireless_dev *wdev,
+  			      struct cfg80211_pmsr_request *request);
+++<<<<<<< HEAD
+ +	int	(*update_owe_info)(struct wiphy *wiphy, struct net_device *dev,
+ +				   struct cfg80211_update_owe_info *owe_info);
+ +	int	(*probe_mesh_link)(struct wiphy *wiphy, struct net_device *dev,
+ +				   const u8 *buf, size_t len);
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  };
+  
+  /*
+@@@ -4408,11 -4255,6 +4417,14 @@@ struct cfg80211_pmsr_capabilities 
+   * @txq_memory_limit: configuration internal TX queue memory limit
+   * @txq_quantum: configuration of internal TX queue scheduler quantum
+   *
+++<<<<<<< HEAD
+ + * @support_mbssid: can HW support association with nontransmitted AP
+ + * @support_only_he_mbssid: don't parse MBSSID elements if it is not
+ + *	HE AP, in order to avoid compatibility issues.
+ + *	@support_mbssid must be set for this to have any effect.
+ + *
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+   * @pmsr_capa: peer measurement capabilities
+   */
+  struct wiphy {
+@@@ -4553,9 -4392,6 +4565,12 @@@
+  	u32 txq_memory_limit;
+  	u32 txq_quantum;
+  
+++<<<<<<< HEAD
+ +	u8 support_mbssid:1,
+ +	   support_only_he_mbssid:1;
+ +
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	const struct cfg80211_pmsr_capabilities *pmsr_capa;
+  
+  	char priv[0] __aligned(NETDEV_ALIGN);
+@@@ -7305,21 -6893,6 +7320,24 @@@ void cfg80211_pmsr_complete(struct wire
+  			    struct cfg80211_pmsr_request *req,
+  			    gfp_t gfp);
+  
+++<<<<<<< HEAD
+ +/**
+ + * cfg80211_iftype_allowed - check whether the interface can be allowed
+ + * @wiphy: the wiphy
+ + * @iftype: interface type
+ + * @is_4addr: use_4addr flag, must be '0' when check_swif is '1'
+ + * @check_swif: check iftype against software interfaces
+ + *
+ + * Check whether the interface is allowed to operate; additionally, this API
+ + * can be used to check iftype against the software interfaces when
+ + * check_swif is '1'.
+ + */
+ +bool cfg80211_iftype_allowed(struct wiphy *wiphy, enum nl80211_iftype iftype,
+ +			     bool is_4addr, u8 check_swif);
+ +
+ +
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  /* Logging, debugging and troubleshooting/diagnostic helpers. */
+  
+  /* wiphy_printk helpers, similar to dev_printk */
+diff --cc include/uapi/linux/nl80211.h
+index ce2530138aa4,e45b88925783..000000000000
+--- a/include/uapi/linux/nl80211.h
++++ b/include/uapi/linux/nl80211.h
+@@@ -1060,31 -1060,6 +1060,34 @@@
+   *	the measurement completed, using the measurement cookie
+   *	(%NL80211_ATTR_COOKIE).
+   *
+++<<<<<<< HEAD
+ + * @NL80211_CMD_NOTIFY_RADAR: Notify the kernel that a radar signal was
+ + *	detected and reported by a neighboring device on the channel
+ + *	indicated by %NL80211_ATTR_WIPHY_FREQ and other attributes
+ + *	determining the width and type.
+ + *
+ + * @NL80211_CMD_UPDATE_OWE_INFO: This interface allows the host driver to
+ + *	offload OWE processing to user space. This intends to support
+ + *	OWE AKM by the host drivers that implement SME but rely
+ + *	on the user space for the cryptographic/DH IE processing in AP mode.
+ + *
+ + * @NL80211_CMD_PROBE_MESH_LINK: The requirement for mesh link metric
+ + *	refreshing, is that from one mesh point we be able to send some data
+ + *	frames to other mesh points which are not currently selected as a
+ + *	primary traffic path, but which are only 1 hop away. The absence of
+ + *	the primary path to the chosen node makes it necessary to apply some
+ + *	form of marking on a chosen packet stream so that the packets can be
+ + *	properly steered to the selected node for testing, and not by the
+ + *	regular mesh path lookup. Further, the packets must be of type data
+ + *	so that the rate control (often embedded in firmware) is used for
+ + *	rate selection.
+ + *
+ + *	Here attribute %NL80211_ATTR_MAC is used to specify connected mesh
+ + *	peer MAC address and %NL80211_ATTR_FRAME is used to specify the frame
+ + *	content. The frame is ethernet data.
+ + *
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+   * @NL80211_CMD_MAX: highest used command number
+   * @__NL80211_CMD_AFTER_LAST: internal use
+   */
+@@@ -1303,12 -1278,6 +1306,15 @@@ enum nl80211_commands 
+  	NL80211_CMD_PEER_MEASUREMENT_RESULT,
+  	NL80211_CMD_PEER_MEASUREMENT_COMPLETE,
+  
+++<<<<<<< HEAD
+ +	NL80211_CMD_NOTIFY_RADAR,
+ +
+ +	NL80211_CMD_UPDATE_OWE_INFO,
+ +
+ +	NL80211_CMD_PROBE_MESH_LINK,
+ +
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	/* add new commands above here */
+  
+  	/* used to define NL80211_CMD_MAX below */
+@@@ -2329,18 -2292,6 +2335,21 @@@
+   *	This is also used for capability advertisement in the wiphy information,
+   *	with the appropriate sub-attributes.
+   *
+++<<<<<<< HEAD
+ + * @NL80211_ATTR_AIRTIME_WEIGHT: Station's weight when scheduled by the airtime
+ + *	scheduler.
+ + *
+ + * @NL80211_ATTR_STA_TX_POWER_SETTING: Transmit power setting type (u8) for
+ + *	station associated with the AP. See &enum nl80211_tx_power_setting for
+ + *	possible values.
+ + * @NL80211_ATTR_STA_TX_POWER: Transmit power level (s16) in dBm units. This
+ + *	allows to set Tx power for a station. If this attribute is not included,
+ + *	the default per-interface tx power setting will be overriding. Driver
+ + *	should be picking up the lowest tx power, either tx power per-interface
+ + *	or per-station.
+ + *
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+   * @NUM_NL80211_ATTR: total number of nl80211_attrs available
+   * @NL80211_ATTR_MAX: highest attribute number currently defined
+   * @__NL80211_ATTR_AFTER_LAST: internal use
+@@@ -2790,10 -2741,6 +2799,13 @@@ enum nl80211_attrs 
+  
+  	NL80211_ATTR_PEER_MEASUREMENTS,
+  
+++<<<<<<< HEAD
+ +	NL80211_ATTR_AIRTIME_WEIGHT,
+ +	NL80211_ATTR_STA_TX_POWER_SETTING,
+ +	NL80211_ATTR_STA_TX_POWER,
+ +
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	/* add attributes here, update the policy in nl80211.c */
+  
+  	__NL80211_ATTR_AFTER_LAST,
+@@@ -6398,15 -6286,9 +6410,21 @@@ enum nl80211_peer_measurement_ftm_failu
+   * @NL80211_PMSR_FTM_RESP_ATTR_DIST_VARIANCE: distance variance (u64, mm^2, note
+   *	that standard deviation is the square root of variance, optional)
+   * @NL80211_PMSR_FTM_RESP_ATTR_DIST_SPREAD: distance spread (u64, mm, optional)
+++<<<<<<< HEAD
+ + * @NL80211_PMSR_FTM_RESP_ATTR_LCI: LCI data from peer (binary, optional);
+ + *	this is the contents of the Measurement Report Element (802.11-2016
+ + *	9.4.2.22.1) starting with the Measurement Token, with Measurement
+ + *	Type 8.
+ + * @NL80211_PMSR_FTM_RESP_ATTR_CIVICLOC: civic location data from peer
+ + *	(binary, optional);
+ + *	this is the contents of the Measurement Report Element (802.11-2016
+ + *	9.4.2.22.1) starting with the Measurement Token, with Measurement
+ + *	Type 11.
+++=======
++  * @NL80211_PMSR_FTM_RESP_ATTR_LCI: LCI data from peer (binary, optional)
++  * @NL80211_PMSR_FTM_RESP_ATTR_CIVICLOC: civic location data from peer
++  *	(binary, optional)
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+   * @NL80211_PMSR_FTM_RESP_ATTR_PAD: ignore, for u64/s64 padding only
+   *
+   * @NUM_NL80211_PMSR_FTM_RESP_ATTR: internal
+diff --cc net/wireless/core.h
+index 77556c58d9ac,c5d6f3418601..000000000000
+--- a/net/wireless/core.h
++++ b/net/wireless/core.h
+@@@ -3,7 -3,7 +3,11 @@@
+   * Wireless configuration interface internals.
+   *
+   * Copyright 2006-2010	Johannes Berg <johannes@sipsolutions.net>
+++<<<<<<< HEAD
+ + * Copyright (C) 2018-2019 Intel Corporation
+++=======
++  * Copyright (C) 2018 Intel Corporation
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+   */
+  #ifndef __NET_WIRELESS_CORE_H
+  #define __NET_WIRELESS_CORE_H
+diff --cc net/wireless/nl80211.c
+index 4e1c052bca2e,6fd93eb0df6d..000000000000
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@@ -227,7 -250,7 +227,11 @@@ nl80211_pmsr_ftm_req_attr_policy[NL8021
+  	[NL80211_PMSR_FTM_REQ_ATTR_BURST_DURATION] =
+  		NLA_POLICY_MAX(NLA_U8, 15),
+  	[NL80211_PMSR_FTM_REQ_ATTR_FTMS_PER_BURST] =
+++<<<<<<< HEAD
+ +		NLA_POLICY_MAX(NLA_U8, 31),
+++=======
++ 		NLA_POLICY_MAX(NLA_U8, 15),
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	[NL80211_PMSR_FTM_REQ_ATTR_NUM_FTMR_RETRIES] = { .type = NLA_U8 },
+  	[NL80211_PMSR_FTM_REQ_ATTR_REQUEST_LCI] = { .type = NLA_FLAG },
+  	[NL80211_PMSR_FTM_REQ_ATTR_REQUEST_CIVICLOC] = { .type = NLA_FLAG },
+@@@ -236,13 -259,15 +240,23 @@@
+  static const struct nla_policy
+  nl80211_pmsr_req_data_policy[NL80211_PMSR_TYPE_MAX + 1] = {
+  	[NL80211_PMSR_TYPE_FTM] =
+++<<<<<<< HEAD
+ +		NLA_POLICY_NESTED(nl80211_pmsr_ftm_req_attr_policy),
+++=======
++ 		NLA_POLICY_NESTED(NL80211_PMSR_FTM_REQ_ATTR_MAX,
++ 				  nl80211_pmsr_ftm_req_attr_policy),
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  };
+  
+  static const struct nla_policy
+  nl80211_pmsr_req_attr_policy[NL80211_PMSR_REQ_ATTR_MAX + 1] = {
+  	[NL80211_PMSR_REQ_ATTR_DATA] =
+++<<<<<<< HEAD
+ +		NLA_POLICY_NESTED(nl80211_pmsr_req_data_policy),
+++=======
++ 		NLA_POLICY_NESTED(NL80211_PMSR_TYPE_MAX,
++ 				  nl80211_pmsr_req_data_policy),
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	[NL80211_PMSR_REQ_ATTR_GET_AP_TSF] = { .type = NLA_FLAG },
+  };
+  
+@@@ -255,7 -280,8 +269,12 @@@ nl80211_psmr_peer_attr_policy[NL80211_P
+  	 */
+  	[NL80211_PMSR_PEER_ATTR_CHAN] = { .type = NLA_NESTED },
+  	[NL80211_PMSR_PEER_ATTR_REQ] =
+++<<<<<<< HEAD
+ +		NLA_POLICY_NESTED(nl80211_pmsr_req_attr_policy),
+++=======
++ 		NLA_POLICY_NESTED(NL80211_PMSR_REQ_ATTR_MAX,
++ 				  nl80211_pmsr_req_attr_policy),
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	[NL80211_PMSR_PEER_ATTR_RESP] = { .type = NLA_REJECT },
+  };
+  
+@@@ -266,12 -292,11 +285,20 @@@ nl80211_pmsr_attr_policy[NL80211_PMSR_A
+  	[NL80211_PMSR_ATTR_RANDOMIZE_MAC_ADDR] = { .type = NLA_REJECT },
+  	[NL80211_PMSR_ATTR_TYPE_CAPA] = { .type = NLA_REJECT },
+  	[NL80211_PMSR_ATTR_PEERS] =
+++<<<<<<< HEAD
+ +		NLA_POLICY_NESTED_ARRAY(nl80211_psmr_peer_attr_policy),
+ +};
+ +#endif /* Not in RHEL */
+ +
+ +const struct nla_policy nl80211_policy[NUM_NL80211_ATTR] = {
+ +	[0] = { .strict_start_type = NL80211_ATTR_HE_OBSS_PD },
+++=======
++ 		NLA_POLICY_NESTED_ARRAY(NL80211_PMSR_PEER_ATTR_MAX,
++ 					nl80211_psmr_peer_attr_policy),
++ };
++ 
++ const struct nla_policy nl80211_policy[NUM_NL80211_ATTR] = {
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	[NL80211_ATTR_WIPHY] = { .type = NLA_U32 },
+  	[NL80211_ATTR_WIPHY_NAME] = { .type = NLA_NUL_STRING,
+  				      .len = 20-1 },
+@@@ -509,9 -555,8 +536,14 @@@
+  	},
+  	[NL80211_ATTR_TIMEOUT] = NLA_POLICY_MIN(NLA_U32, 1),
+  	[NL80211_ATTR_PEER_MEASUREMENTS] =
+++<<<<<<< HEAD
+ +		NLA_POLICY_NESTED(nl80211_pmsr_attr_policy),
+ +	[NL80211_ATTR_AIRTIME_WEIGHT] = NLA_POLICY_MIN(NLA_U16, 1),
+ +#endif /* Not in RHEL */
+++=======
++ 		NLA_POLICY_NESTED(NL80211_PMSR_FTM_REQ_ATTR_MAX,
++ 				  nl80211_pmsr_attr_policy),
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  };
+  
+  /* policy for the key attributes */
+@@@ -1695,7 -1684,7 +1727,11 @@@ nl80211_send_pmsr_ftm_capa(const struc
+  	if (!cap->ftm.supported)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	ftm = nla_nest_start_noflag(msg, NL80211_PMSR_TYPE_FTM);
+++=======
++ 	ftm = nla_nest_start(msg, NL80211_PMSR_TYPE_FTM);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	if (!ftm)
+  		return -ENOBUFS;
+  
+@@@ -1743,7 -1732,7 +1779,11 @@@ static int nl80211_send_pmsr_capa(struc
+  	 * will genlmsg_cancel() if we fail
+  	 */
+  
+++<<<<<<< HEAD
+ +	pmsr = nla_nest_start_noflag(msg, NL80211_ATTR_PEER_MEASUREMENTS);
+++=======
++ 	pmsr = nla_nest_start(msg, NL80211_ATTR_PEER_MEASUREMENTS);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	if (!pmsr)
+  		return -ENOBUFS;
+  
+@@@ -1758,7 -1747,7 +1798,11 @@@
+  	    nla_put_flag(msg, NL80211_PMSR_ATTR_RANDOMIZE_MAC_ADDR))
+  		return -ENOBUFS;
+  
+++<<<<<<< HEAD
+ +	caps = nla_nest_start_noflag(msg, NL80211_PMSR_ATTR_TYPE_CAPA);
+++=======
++ 	caps = nla_nest_start(msg, NL80211_PMSR_ATTR_TYPE_CAPA);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	if (!caps)
+  		return -ENOBUFS;
+  
+@@@ -2319,15 -2269,6 +2363,18 @@@ static int nl80211_send_wiphy(struct cf
+  		if (nl80211_send_pmsr_capa(rdev, msg))
+  			goto nla_put_failure;
+  
+++<<<<<<< HEAD
+ +		state->split_start++;
+ +		break;
+ +	case 15:
+ +		if (rdev->wiphy.akm_suites &&
+ +		    nla_put(msg, NL80211_ATTR_AKM_SUITES,
+ +			    sizeof(u32) * rdev->wiphy.n_akm_suites,
+ +			    rdev->wiphy.akm_suites))
+ +			goto nla_put_failure;
+ +
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  		/* done */
+  		state->split_start = 0;
+  		break;
+@@@ -14585,28 -14050,6 +14632,31 @@@ static const struct genl_ops nl80211_op
+  		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+  				  NL80211_FLAG_NEED_RTNL,
+  	},
+++<<<<<<< HEAD
+ +	{
+ +		.cmd = NL80211_CMD_NOTIFY_RADAR,
+ +		.doit = nl80211_notify_radar_detection,
+ +		.policy = nl80211_policy,
+ +		.flags = GENL_UNS_ADMIN_PERM,
+ +		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ +				  NL80211_FLAG_NEED_RTNL,
+ +	},
+ +	{
+ +		.cmd = NL80211_CMD_UPDATE_OWE_INFO,
+ +		.doit = nl80211_update_owe_info,
+ +		.flags = GENL_ADMIN_PERM,
+ +		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ +				  NL80211_FLAG_NEED_RTNL,
+ +	},
+ +	{
+ +		.cmd = NL80211_CMD_PROBE_MESH_LINK,
+ +		.doit = nl80211_probe_mesh_link,
+ +		.flags = GENL_UNS_ADMIN_PERM,
+ +		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ +				  NL80211_FLAG_NEED_RTNL,
+ +	},
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  };
+  
+  static struct genl_family nl80211_fam __ro_after_init = {
+diff --cc net/wireless/pmsr.c
+index 5908de91a368,de9286703280..000000000000
+--- a/net/wireless/pmsr.c
++++ b/net/wireless/pmsr.c
+@@@ -1,6 -1,6 +1,10 @@@
+  /* SPDX-License-Identifier: GPL-2.0 */
+  /*
+++<<<<<<< HEAD
+ + * Copyright (C) 2018 - 2019 Intel Corporation
+++=======
++  * Copyright (C) 2018 Intel Corporation
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+   */
+  #ifndef __PMSR_H
+  #define __PMSR_H
+@@@ -9,11 -9,6 +13,14 @@@
+  #include "nl80211.h"
+  #include "rdev-ops.h"
+  
+++<<<<<<< HEAD
+ +#define nlmsg_parse_deprecated nlmsg_parse
+ +#define nla_parse_nested_deprecated nla_parse_nested
+ +#define nla_nest_start_noflag nla_nest_start
+ +
+ +
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  static int pmsr_parse_ftm(struct cfg80211_registered_device *rdev,
+  			  struct nlattr *ftmreq,
+  			  struct cfg80211_pmsr_request_peer *out,
+@@@ -30,8 -25,7 +37,12 @@@
+  	}
+  
+  	/* no validation needed - was already done via nested policy */
+++<<<<<<< HEAD
+ +	nla_parse_nested_deprecated(tb, NL80211_PMSR_FTM_REQ_ATTR_MAX, ftmreq,
+ +				    NULL, NULL);
+++=======
++ 	nla_parse_nested(tb, NL80211_PMSR_FTM_REQ_ATTR_MAX, ftmreq, NULL, NULL);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  
+  	if (tb[NL80211_PMSR_FTM_REQ_ATTR_PREAMBLE])
+  		preamble = nla_get_u32(tb[NL80211_PMSR_FTM_REQ_ATTR_PREAMBLE]);
+@@@ -145,8 -139,7 +156,12 @@@ static int pmsr_parse_peer(struct cfg80
+  	int err, rem;
+  
+  	/* no validation needed - was already done via nested policy */
+++<<<<<<< HEAD
+ +	nla_parse_nested_deprecated(tb, NL80211_PMSR_PEER_ATTR_MAX, peer,
+ +				    NULL, NULL);
+++=======
++ 	nla_parse_nested(tb, NL80211_PMSR_PEER_ATTR_MAX, peer, NULL, NULL);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  
+  	if (!tb[NL80211_PMSR_PEER_ATTR_ADDR] ||
+  	    !tb[NL80211_PMSR_PEER_ATTR_CHAN] ||
+@@@ -161,9 -154,9 +176,15 @@@
+  	/* reuse info->attrs */
+  	memset(info->attrs, 0, sizeof(*info->attrs) * (NL80211_ATTR_MAX + 1));
+  	/* need to validate here, we don't want to have validation recursion */
+++<<<<<<< HEAD
+ +	err = nla_parse_nested_deprecated(info->attrs, NL80211_ATTR_MAX,
+ +					  tb[NL80211_PMSR_PEER_ATTR_CHAN],
+ +					  nl80211_policy, info->extack);
+++=======
++ 	err = nla_parse_nested(info->attrs, NL80211_ATTR_MAX,
++ 			       tb[NL80211_PMSR_PEER_ATTR_CHAN],
++ 			       nl80211_policy, info->extack);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	if (err)
+  		return err;
+  
+@@@ -172,9 -165,9 +193,15 @@@
+  		return err;
+  
+  	/* no validation needed - was already done via nested policy */
+++<<<<<<< HEAD
+ +	nla_parse_nested_deprecated(req, NL80211_PMSR_REQ_ATTR_MAX,
+ +				    tb[NL80211_PMSR_PEER_ATTR_REQ], NULL,
+ +				    NULL);
+++=======
++ 	nla_parse_nested(req, NL80211_PMSR_REQ_ATTR_MAX,
++ 			 tb[NL80211_PMSR_PEER_ATTR_REQ],
++ 			 NULL, NULL);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  
+  	if (!req[NL80211_PMSR_REQ_ATTR_DATA]) {
+  		NL_SET_ERR_MSG_ATTR(info->extack,
+@@@ -263,8 -256,9 +290,14 @@@ int nl80211_pmsr_start(struct sk_buff *
+  		if (err)
+  			goto out_err;
+  	} else {
+++<<<<<<< HEAD
+ +		memcpy(req->mac_addr, wdev_address(wdev), ETH_ALEN);
+ +		eth_broadcast_addr(req->mac_addr_mask);
+++=======
++ 		memcpy(req->mac_addr, nla_data(info->attrs[NL80211_ATTR_MAC]),
++ 		       ETH_ALEN);
++ 		memset(req->mac_addr_mask, 0xff, ETH_ALEN);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	}
+  
+  	idx = 0;
+@@@ -278,7 -272,6 +311,10 @@@
+  
+  	req->n_peers = count;
+  	req->cookie = cfg80211_assign_cookie(rdev);
+++<<<<<<< HEAD
+ +	req->nl_portid = info->snd_portid;
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  
+  	err = rdev_start_pmsr(rdev, wdev, req);
+  	if (err)
+@@@ -427,22 -420,22 +463,38 @@@ static int nl80211_pmsr_send_result(str
+  {
+  	struct nlattr *pmsr, *peers, *peer, *resp, *data, *typedata;
+  
+++<<<<<<< HEAD
+ +	pmsr = nla_nest_start_noflag(msg, NL80211_ATTR_PEER_MEASUREMENTS);
+ +	if (!pmsr)
+ +		goto error;
+ +
+ +	peers = nla_nest_start_noflag(msg, NL80211_PMSR_ATTR_PEERS);
+ +	if (!peers)
+ +		goto error;
+ +
+ +	peer = nla_nest_start_noflag(msg, 1);
+++=======
++ 	pmsr = nla_nest_start(msg, NL80211_ATTR_PEER_MEASUREMENTS);
++ 	if (!pmsr)
++ 		goto error;
++ 
++ 	peers = nla_nest_start(msg, NL80211_PMSR_ATTR_PEERS);
++ 	if (!peers)
++ 		goto error;
++ 
++ 	peer = nla_nest_start(msg, 1);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	if (!peer)
+  		goto error;
+  
+  	if (nla_put(msg, NL80211_PMSR_PEER_ATTR_ADDR, ETH_ALEN, res->addr))
+  		goto error;
+  
+++<<<<<<< HEAD
+ +	resp = nla_nest_start_noflag(msg, NL80211_PMSR_PEER_ATTR_RESP);
+++=======
++ 	resp = nla_nest_start(msg, NL80211_PMSR_PEER_ATTR_RESP);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	if (!resp)
+  		goto error;
+  
+@@@ -453,17 -446,17 +505,29 @@@
+  
+  	if (res->ap_tsf_valid &&
+  	    nla_put_u64_64bit(msg, NL80211_PMSR_RESP_ATTR_AP_TSF,
+++<<<<<<< HEAD
+ +			      res->ap_tsf, NL80211_PMSR_RESP_ATTR_PAD))
+++=======
++ 			      res->host_time, NL80211_PMSR_RESP_ATTR_PAD))
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  		goto error;
+  
+  	if (res->final && nla_put_flag(msg, NL80211_PMSR_RESP_ATTR_FINAL))
+  		goto error;
+  
+++<<<<<<< HEAD
+ +	data = nla_nest_start_noflag(msg, NL80211_PMSR_RESP_ATTR_DATA);
+ +	if (!data)
+ +		goto error;
+ +
+ +	typedata = nla_nest_start_noflag(msg, res->type);
+++=======
++ 	data = nla_nest_start(msg, NL80211_PMSR_RESP_ATTR_DATA);
++ 	if (!data)
++ 		goto error;
++ 
++ 	typedata = nla_nest_start(msg, res->type);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	if (!typedata)
+  		goto error;
+  
+@@@ -537,14 -530,14 +601,24 @@@ free
+  }
+  EXPORT_SYMBOL_GPL(cfg80211_pmsr_report);
+  
+++<<<<<<< HEAD
+ +static void cfg80211_pmsr_process_abort(struct wireless_dev *wdev)
+ +{
+++=======
++ void cfg80211_pmsr_free_wk(struct work_struct *work)
++ {
++ 	struct wireless_dev *wdev = container_of(work, struct wireless_dev,
++ 						 pmsr_free_wk);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wdev->wiphy);
+  	struct cfg80211_pmsr_request *req, *tmp;
+  	LIST_HEAD(free_list);
+  
+++<<<<<<< HEAD
+ +	lockdep_assert_held(&wdev->mtx);
+ +
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	spin_lock_bh(&wdev->pmsr_lock);
+  	list_for_each_entry_safe(req, tmp, &wdev->pmsr_list, list) {
+  		if (req->nl_portid)
+@@@ -554,22 -547,14 +628,31 @@@
+  	spin_unlock_bh(&wdev->pmsr_lock);
+  
+  	list_for_each_entry_safe(req, tmp, &free_list, list) {
+++<<<<<<< HEAD
+++		rdev_abort_pmsr(rdev, wdev, req);
+++=======
++ 		wdev_lock(wdev);
+  		rdev_abort_pmsr(rdev, wdev, req);
++ 		wdev_unlock(wdev);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  
+  		kfree(req);
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +void cfg80211_pmsr_free_wk(struct work_struct *work)
+ +{
+ +	struct wireless_dev *wdev = container_of(work, struct wireless_dev,
+ +						 pmsr_free_wk);
+ +
+ +	wdev_lock(wdev);
+ +	cfg80211_pmsr_process_abort(wdev);
+ +	wdev_unlock(wdev);
+ +}
+ +
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  void cfg80211_pmsr_wdev_down(struct wireless_dev *wdev)
+  {
+  	struct cfg80211_pmsr_request *req;
+@@@ -583,8 -568,8 +666,13 @@@
+  	spin_unlock_bh(&wdev->pmsr_lock);
+  
+  	if (found)
+++<<<<<<< HEAD
+ +		cfg80211_pmsr_process_abort(wdev);
+ +
+++=======
++ 		schedule_work(&wdev->pmsr_free_wk);
++ 	flush_work(&wdev->pmsr_free_wk);
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  	WARN_ON(!list_empty(&wdev->pmsr_list));
+  }
+  
+diff --cc net/wireless/rdev-ops.h
+index 71c2d31937ec,5cb48d135fab..000000000000
+--- a/net/wireless/rdev-ops.h
++++ b/net/wireless/rdev-ops.h
+@@@ -1272,30 -1272,4 +1272,33 @@@ rdev_abort_pmsr(struct cfg80211_registe
+  	trace_rdev_return_void(&rdev->wiphy);
+  }
+  
+++<<<<<<< HEAD
+ +static inline int rdev_update_owe_info(struct cfg80211_registered_device *rdev,
+ +				       struct net_device *dev,
+ +				       struct cfg80211_update_owe_info *oweinfo)
+ +{
+ +	int ret = -EOPNOTSUPP;
+ +
+ +	trace_rdev_update_owe_info(&rdev->wiphy, dev, oweinfo);
+ +	if (rdev->ops->update_owe_info)
+ +		ret = rdev->ops->update_owe_info(&rdev->wiphy, dev, oweinfo);
+ +	trace_rdev_return_int(&rdev->wiphy, ret);
+ +	return ret;
+ +}
+ +
+ +static inline int
+ +rdev_probe_mesh_link(struct cfg80211_registered_device *rdev,
+ +		     struct net_device *dev, const u8 *dest,
+ +		     const void *buf, size_t len)
+ +{
+ +	int ret;
+ +
+ +	trace_rdev_probe_mesh_link(&rdev->wiphy, dev, dest, buf, len);
+ +	ret = rdev->ops->probe_mesh_link(&rdev->wiphy, dev, buf, len);
+ +	trace_rdev_return_int(&rdev->wiphy, ret);
+ +	return ret;
+ +}
+ +
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  #endif /* __CFG80211_RDEV_OPS */
+diff --cc net/wireless/trace.h
+index c6933fa21497,44b2ce1bb13a..000000000000
+--- a/net/wireless/trace.h
++++ b/net/wireless/trace.h
+@@@ -3381,62 -3362,6 +3381,65 @@@ TRACE_EVENT(cfg80211_pmsr_complete
+  		  WIPHY_PR_ARG, WDEV_PR_ARG,
+  		  (unsigned long long)__entry->cookie)
+  );
+++<<<<<<< HEAD
+ +
+ +TRACE_EVENT(rdev_update_owe_info,
+ +	    TP_PROTO(struct wiphy *wiphy, struct net_device *netdev,
+ +		     struct cfg80211_update_owe_info *owe_info),
+ +	    TP_ARGS(wiphy, netdev, owe_info),
+ +	    TP_STRUCT__entry(WIPHY_ENTRY
+ +			     NETDEV_ENTRY
+ +			     MAC_ENTRY(peer)
+ +			     __field(u16, status)
+ +			     __dynamic_array(u8, ie, owe_info->ie_len)),
+ +	    TP_fast_assign(WIPHY_ASSIGN;
+ +			   NETDEV_ASSIGN;
+ +			   MAC_ASSIGN(peer, owe_info->peer);
+ +			   __entry->status = owe_info->status;
+ +			   memcpy(__get_dynamic_array(ie),
+ +				  owe_info->ie, owe_info->ie_len);),
+ +	    TP_printk(WIPHY_PR_FMT ", " NETDEV_PR_FMT ", peer: " MAC_PR_FMT
+ +		  " status %d", WIPHY_PR_ARG, NETDEV_PR_ARG, MAC_PR_ARG(peer),
+ +		  __entry->status)
+ +);
+ +
+ +TRACE_EVENT(cfg80211_update_owe_info_event,
+ +	    TP_PROTO(struct wiphy *wiphy, struct net_device *netdev,
+ +		     struct cfg80211_update_owe_info *owe_info),
+ +	    TP_ARGS(wiphy, netdev, owe_info),
+ +	    TP_STRUCT__entry(WIPHY_ENTRY
+ +			     NETDEV_ENTRY
+ +			     MAC_ENTRY(peer)
+ +			     __dynamic_array(u8, ie, owe_info->ie_len)),
+ +	    TP_fast_assign(WIPHY_ASSIGN;
+ +			   NETDEV_ASSIGN;
+ +			   MAC_ASSIGN(peer, owe_info->peer);
+ +			   memcpy(__get_dynamic_array(ie), owe_info->ie,
+ +				  owe_info->ie_len);),
+ +	    TP_printk(WIPHY_PR_FMT ", " NETDEV_PR_FMT ", peer: " MAC_PR_FMT,
+ +		      WIPHY_PR_ARG, NETDEV_PR_ARG, MAC_PR_ARG(peer))
+ +);
+ +
+ +TRACE_EVENT(rdev_probe_mesh_link,
+ +	TP_PROTO(struct wiphy *wiphy, struct net_device *netdev,
+ +		 const u8 *dest, const u8 *buf, size_t len),
+ +	TP_ARGS(wiphy, netdev, dest, buf, len),
+ +	TP_STRUCT__entry(
+ +		WIPHY_ENTRY
+ +		NETDEV_ENTRY
+ +		MAC_ENTRY(dest)
+ +	),
+ +	TP_fast_assign(
+ +		WIPHY_ASSIGN;
+ +		NETDEV_ASSIGN;
+ +		MAC_ASSIGN(dest, dest);
+ +	),
+ +	TP_printk(WIPHY_PR_FMT ", " NETDEV_PR_FMT ", " MAC_PR_FMT,
+ +		  WIPHY_PR_ARG, NETDEV_PR_ARG, MAC_PR_ARG(dest))
+ +);
+ +
+++=======
+++>>>>>>> 9bb7e0f24e7e (cfg80211: add peer measurement with FTM initiator API)
+  #endif /* !__RDEV_OPS_TRACE || TRACE_HEADER_MULTI_READ */
+  
+  #undef TRACE_INCLUDE_PATH
+* Unmerged path include/net/cfg80211.h
+* Unmerged path include/uapi/linux/nl80211.h
+* Unmerged path net/wireless/core.h
+* Unmerged path net/wireless/nl80211.c
+* Unmerged path net/wireless/pmsr.c
+* Unmerged path net/wireless/rdev-ops.h
+* Unmerged path net/wireless/trace.h
