@@ -1285,7 +1285,7 @@ static void aer_isr(struct work_struct *work)
  *
  * Invoked when Root Port detects AER messages.
  */
-irqreturn_t aer_irq(int irq, void *context)
+static irqreturn_t aer_irq(int irq, void *context)
 {
 	unsigned int status, id;
 	struct pcie_device *pdev = (struct pcie_device *)context;
@@ -1334,7 +1334,6 @@ irqreturn_t aer_irq(int irq, void *context)
 
 	return IRQ_HANDLED;
 }
-EXPORT_SYMBOL_GPL(aer_irq);
 
 static int set_device_error_reporting(struct pci_dev *dev, void *data)
 {
