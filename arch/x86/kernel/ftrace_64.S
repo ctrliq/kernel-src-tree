@@ -194,6 +194,8 @@ ENTRY(ftrace_regs_caller)
 	/* Save the current flags before any operations that can change them */
 	pushfq
 
+	UNWIND_HINT_SAVE
+
 	/* added 8 bytes to save flags */
 	save_mcount_regs 8
 	/* save_mcount_regs fills in first two parameters */
@@ -245,6 +247,14 @@ GLOBAL(ftrace_regs_call)
 	movq RBX(%rsp), %rbx
 
 	restore_mcount_regs
+
+2:
+	/*
+	 * The stack layout is nondetermistic here, depending on which path was
+	 * taken.  This confuses objtool and ORC, rightfully so.  For now,
+	 * pretend the stack always looks like the non-direct case.
+	 */
+	UNWIND_HINT_RESTORE
 
 	/* Restore flags */
 	popfq
