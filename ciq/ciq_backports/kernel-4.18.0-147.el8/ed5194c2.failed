@@ -1,0 +1,195 @@
+x86/speculation/mds: Add basic bug infrastructure for MDS
+
+jira LE-1907
+cve CVE-2019-11091
+cve CVE-2018-12130
+cve CVE-2018-12127
+cve CVE-2018-12126
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Andi Kleen <ak@linux.intel.com>
+commit ed5194c2732c8084af9fd159c146ea92bf137128
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/ed5194c2.failed
+
+Microarchitectural Data Sampling (MDS), is a class of side channel attacks
+on internal buffers in Intel CPUs. The variants are:
+
+ - Microarchitectural Store Buffer Data Sampling (MSBDS) (CVE-2018-12126)
+ - Microarchitectural Fill Buffer Data Sampling (MFBDS) (CVE-2018-12130)
+ - Microarchitectural Load Port Data Sampling (MLPDS) (CVE-2018-12127)
+
+MSBDS leaks Store Buffer Entries which can be speculatively forwarded to a
+dependent load (store-to-load forwarding) as an optimization. The forward
+can also happen to a faulting or assisting load operation for a different
+memory address, which can be exploited under certain conditions. Store
+buffers are partitioned between Hyper-Threads so cross thread forwarding is
+not possible. But if a thread enters or exits a sleep state the store
+buffer is repartitioned which can expose data from one thread to the other.
+
+MFBDS leaks Fill Buffer Entries. Fill buffers are used internally to manage
+L1 miss situations and to hold data which is returned or sent in response
+to a memory or I/O operation. Fill buffers can forward data to a load
+operation and also write data to the cache. When the fill buffer is
+deallocated it can retain the stale data of the preceding operations which
+can then be forwarded to a faulting or assisting load operation, which can
+be exploited under certain conditions. Fill buffers are shared between
+Hyper-Threads so cross thread leakage is possible.
+
+MLDPS leaks Load Port Data. Load ports are used to perform load operations
+from memory or I/O. The received data is then forwarded to the register
+file or a subsequent operation. In some implementations the Load Port can
+contain stale data from a previous operation which can be forwarded to
+faulting or assisting loads under certain conditions, which again can be
+exploited eventually. Load ports are shared between Hyper-Threads so cross
+thread leakage is possible.
+
+All variants have the same mitigation for single CPU thread case (SMT off),
+so the kernel can treat them as one MDS issue.
+
+Add the basic infrastructure to detect if the current CPU is affected by
+MDS.
+
+[ tglx: Rewrote changelog ]
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Reviewed-by: Frederic Weisbecker <frederic@kernel.org>
+	Reviewed-by: Jon Masters <jcm@redhat.com>
+	Tested-by: Jon Masters <jcm@redhat.com>
+(cherry picked from commit ed5194c2732c8084af9fd159c146ea92bf137128)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpufeatures.h
+#	arch/x86/kernel/cpu/common.c
+diff --cc arch/x86/include/asm/cpufeatures.h
+index baf12a04e1ca,ae3f987b24f1..000000000000
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@@ -343,7 -344,7 +343,11 @@@
+  /* Intel-defined CPU features, CPUID level 0x00000007:0 (EDX), word 18 */
+  #define X86_FEATURE_AVX512_4VNNIW	(18*32+ 2) /* AVX-512 Neural Network Instructions */
+  #define X86_FEATURE_AVX512_4FMAPS	(18*32+ 3) /* AVX-512 Multiply Accumulation Single precision */
+++<<<<<<< HEAD
+ +#define X86_FEATURE_TSX_FORCE_ABORT	(18*32+13) /* "" TSX_FORCE_ABORT */
+++=======
++ #define X86_FEATURE_MD_CLEAR		(18*32+10) /* VERW clears CPU buffers */
+++>>>>>>> ed5194c2732c (x86/speculation/mds: Add basic bug infrastructure for MDS)
+  #define X86_FEATURE_PCONFIG		(18*32+18) /* Intel PCONFIG */
+  #define X86_FEATURE_SPEC_CTRL		(18*32+26) /* "" Speculation Control (IBRS + IBPB) */
+  #define X86_FEATURE_INTEL_STIBP		(18*32+27) /* "" Single Thread Indirect Branch Predictors */
+diff --cc arch/x86/kernel/cpu/common.c
+index 966180cda17e,e34817bca504..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -949,16 -948,61 +949,74 @@@ static void identify_cpu_without_cpuid(
+  #endif
+  }
+  
+++<<<<<<< HEAD
+ +static const __initconst struct x86_cpu_id cpu_no_speculation[] = {
+ +	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_CEDARVIEW,	X86_FEATURE_ANY },
+ +	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_CLOVERVIEW,	X86_FEATURE_ANY },
+ +	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_LINCROFT,	X86_FEATURE_ANY },
+ +	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_PENWELL,	X86_FEATURE_ANY },
+ +	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_PINEVIEW,	X86_FEATURE_ANY },
+ +	{ X86_VENDOR_CENTAUR,	5 },
+ +	{ X86_VENDOR_INTEL,	5 },
+ +	{ X86_VENDOR_NSC,	5 },
+ +	{ X86_VENDOR_ANY,	4 },
+++=======
++ #define NO_SPECULATION	BIT(0)
++ #define NO_MELTDOWN	BIT(1)
++ #define NO_SSB		BIT(2)
++ #define NO_L1TF		BIT(3)
++ #define NO_MDS		BIT(4)
++ 
++ #define VULNWL(_vendor, _family, _model, _whitelist)	\
++ 	{ X86_VENDOR_##_vendor, _family, _model, X86_FEATURE_ANY, _whitelist }
++ 
++ #define VULNWL_INTEL(model, whitelist)		\
++ 	VULNWL(INTEL, 6, INTEL_FAM6_##model, whitelist)
++ 
++ #define VULNWL_AMD(family, whitelist)		\
++ 	VULNWL(AMD, family, X86_MODEL_ANY, whitelist)
++ 
++ #define VULNWL_HYGON(family, whitelist)		\
++ 	VULNWL(HYGON, family, X86_MODEL_ANY, whitelist)
++ 
++ static const __initconst struct x86_cpu_id cpu_vuln_whitelist[] = {
++ 	VULNWL(ANY,	4, X86_MODEL_ANY,	NO_SPECULATION),
++ 	VULNWL(CENTAUR,	5, X86_MODEL_ANY,	NO_SPECULATION),
++ 	VULNWL(INTEL,	5, X86_MODEL_ANY,	NO_SPECULATION),
++ 	VULNWL(NSC,	5, X86_MODEL_ANY,	NO_SPECULATION),
++ 
++ 	/* Intel Family 6 */
++ 	VULNWL_INTEL(ATOM_SALTWELL,		NO_SPECULATION),
++ 	VULNWL_INTEL(ATOM_SALTWELL_TABLET,	NO_SPECULATION),
++ 	VULNWL_INTEL(ATOM_SALTWELL_MID,		NO_SPECULATION),
++ 	VULNWL_INTEL(ATOM_BONNELL,		NO_SPECULATION),
++ 	VULNWL_INTEL(ATOM_BONNELL_MID,		NO_SPECULATION),
++ 
++ 	VULNWL_INTEL(ATOM_SILVERMONT,		NO_SSB | NO_L1TF),
++ 	VULNWL_INTEL(ATOM_SILVERMONT_X,		NO_SSB | NO_L1TF),
++ 	VULNWL_INTEL(ATOM_SILVERMONT_MID,	NO_SSB | NO_L1TF),
++ 	VULNWL_INTEL(ATOM_AIRMONT,		NO_SSB | NO_L1TF),
++ 	VULNWL_INTEL(XEON_PHI_KNL,		NO_SSB | NO_L1TF),
++ 	VULNWL_INTEL(XEON_PHI_KNM,		NO_SSB | NO_L1TF),
++ 
++ 	VULNWL_INTEL(CORE_YONAH,		NO_SSB),
++ 
++ 	VULNWL_INTEL(ATOM_AIRMONT_MID,		NO_L1TF),
++ 
++ 	VULNWL_INTEL(ATOM_GOLDMONT,		NO_MDS | NO_L1TF),
++ 	VULNWL_INTEL(ATOM_GOLDMONT_X,		NO_MDS | NO_L1TF),
++ 	VULNWL_INTEL(ATOM_GOLDMONT_PLUS,	NO_MDS | NO_L1TF),
++ 
++ 	/* AMD Family 0xf - 0x12 */
++ 	VULNWL_AMD(0x0f,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS),
++ 	VULNWL_AMD(0x10,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS),
++ 	VULNWL_AMD(0x11,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS),
++ 	VULNWL_AMD(0x12,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS),
++ 
++ 	/* FAMILY_ANY must be last, otherwise 0x0f - 0x12 matches won't work */
++ 	VULNWL_AMD(X86_FAMILY_ANY,	NO_MELTDOWN | NO_L1TF | NO_MDS),
++ 	VULNWL_HYGON(X86_FAMILY_ANY,	NO_MELTDOWN | NO_L1TF | NO_MDS),
+++>>>>>>> ed5194c2732c (x86/speculation/mds: Add basic bug infrastructure for MDS)
+  	{}
+  };
+  
+@@@ -1019,7 -1033,10 +1077,14 @@@ static void __init cpu_set_bug_bits(str
+  	if (ia32_cap & ARCH_CAP_IBRS_ALL)
+  		setup_force_cpu_cap(X86_FEATURE_IBRS_ENHANCED);
+  
+++<<<<<<< HEAD
+ +	if (x86_match_cpu(cpu_no_meltdown))
+++=======
++ 	if (!cpu_matches(NO_MDS) && !(ia32_cap & ARCH_CAP_MDS_NO))
++ 		setup_force_cpu_bug(X86_BUG_MDS);
++ 
++ 	if (cpu_matches(NO_MELTDOWN))
+++>>>>>>> ed5194c2732c (x86/speculation/mds: Add basic bug infrastructure for MDS)
+  		return;
+  
+  	/* Rogue Data Cache Load? No! */
+* Unmerged path arch/x86/include/asm/cpufeatures.h
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index f0a9cd62aea3..b887da5a8b31 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -79,6 +79,11 @@
+ 						 * attack, so no Speculative Store Bypass
+ 						 * control required.
+ 						 */
++#define ARCH_CAP_MDS_NO			BIT(5)   /*
++						  * Not susceptible to
++						  * Microarchitectural Data
++						  * Sampling (MDS) vulnerabilities.
++						  */
+ 
+ #define MSR_IA32_FLUSH_CMD		0x0000010b
+ #define L1D_FLUSH			BIT(0)	/*
+* Unmerged path arch/x86/kernel/cpu/common.c
