@@ -1,0 +1,93 @@
+KVM: x86/mmu: Coalesce TLB flushes when zapping collapsible SPTEs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 142ccde1f7b1b0c621c299cbcc8feb6353f7cc92
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/142ccde1.failed
+
+Gather pending TLB flushes across both the legacy and TDP MMUs when
+zapping collapsible SPTEs to avoid multiple flushes if both the legacy
+MMU (for nested guests) and TDP MMU have mappings for the memslot.
+
+Note, this also optimizes the TDP MMU to flush only the relevant range
+when running as L1 with Hyper-V enlightenments.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210326021957.1424875-4-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 142ccde1f7b1b0c621c299cbcc8feb6353f7cc92)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.h
+diff --cc arch/x86/kvm/mmu/tdp_mmu.h
+index 10b7d90d0fe9,a76a84d2ff46..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@@ -55,9 -55,8 +55,14 @@@ void kvm_tdp_mmu_clear_dirty_pt_masked(
+  				       struct kvm_memory_slot *slot,
+  				       gfn_t gfn, unsigned long mask,
+  				       bool wrprot);
+++<<<<<<< HEAD
+ +bool kvm_tdp_mmu_slot_set_dirty(struct kvm *kvm, struct kvm_memory_slot *slot);
+ +void kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
+ +				       struct kvm_memory_slot *slot);
+++=======
++ bool kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
++ 				       struct kvm_memory_slot *slot, bool flush);
+++>>>>>>> 142ccde1f7b1 (KVM: x86/mmu: Coalesce TLB flushes when zapping collapsible SPTEs)
+  
+  bool kvm_tdp_mmu_write_protect_gfn(struct kvm *kvm,
+  				   struct kvm_memory_slot *slot, gfn_t gfn);
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 5c81dbc04cf3..bff8792d6047 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -5639,11 +5639,13 @@ void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
+ 
+ 	write_lock(&kvm->mmu_lock);
+ 	flush = slot_handle_leaf(kvm, slot, kvm_mmu_zap_collapsible_spte, true);
++
++	if (is_tdp_mmu_enabled(kvm))
++		flush = kvm_tdp_mmu_zap_collapsible_sptes(kvm, slot, flush);
++
+ 	if (flush)
+ 		kvm_arch_flush_remote_tlbs_memslot(kvm, slot);
+ 
+-	if (is_tdp_mmu_enabled(kvm))
+-		kvm_tdp_mmu_zap_collapsible_sptes(kvm, slot);
+ 	write_unlock(&kvm->mmu_lock);
+ }
+ 
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index c821539040c7..4a4b17340bd8 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -1364,11 +1364,10 @@ static bool zap_collapsible_spte_range(struct kvm *kvm,
+  * Clear non-leaf entries (and free associated page tables) which could
+  * be replaced by large mappings, for GFNs within the slot.
+  */
+-void kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
+-				       struct kvm_memory_slot *slot)
++bool kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
++				       struct kvm_memory_slot *slot, bool flush)
+ {
+ 	struct kvm_mmu_page *root;
+-	bool flush = false;
+ 	int root_as_id;
+ 
+ 	for_each_tdp_mmu_root_yield_safe(kvm, root) {
+@@ -1379,8 +1378,7 @@ void kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
+ 		flush = zap_collapsible_spte_range(kvm, root, slot, flush);
+ 	}
+ 
+-	if (flush)
+-		kvm_flush_remote_tlbs(kvm);
++	return flush;
+ }
+ 
+ /*
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.h
