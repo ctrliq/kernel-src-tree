@@ -1,0 +1,151 @@
+RDMA/mlx5: Move ports allocation to outside of INIT stage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Mark Bloch <markb@mellanox.com>
+commit da796ccb3e0eba24b15beedb168178c9b74ce6f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/da796ccb.failed
+
+In downstream patches we will need access to the ports before doing any
+stages, in order to set net device per representor.
+
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit da796ccb3e0eba24b15beedb168178c9b74ce6f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/ib_rep.c
+#	drivers/infiniband/hw/mlx5/main.c
+diff --cc drivers/infiniband/hw/mlx5/ib_rep.c
+index 95ac97af6166,14ac728b460c..000000000000
+--- a/drivers/infiniband/hw/mlx5/ib_rep.c
++++ b/drivers/infiniband/hw/mlx5/ib_rep.c
+@@@ -46,42 -47,34 +46,56 @@@ static const struct mlx5_ib_profile rep
+  };
+  
+  static int
+ -mlx5_ib_vport_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+ +mlx5_ib_nic_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+  {
+ -	const struct mlx5_ib_profile *profile;
+  	struct mlx5_ib_dev *ibdev;
++ 	int num_ports = 1;
+  
+ -	if (rep->vport == MLX5_VPORT_UPLINK)
+ -		profile = &uplink_rep_profile;
+ -	else
+ -		profile = &vf_rep_profile;
+ +	ibdev = mlx5_ib_rep_to_dev(rep);
+ +	if (!__mlx5_ib_add(ibdev, ibdev->profile))
+ +		return -EINVAL;
+ +	return 0;
+ +}
+ +
+ +static void
+ +mlx5_ib_nic_rep_unload(struct mlx5_eswitch_rep *rep)
+ +{
+ +	struct mlx5_ib_dev *ibdev;
+ +
+ +	ibdev = mlx5_ib_rep_to_dev(rep);
+ +	__mlx5_ib_remove(ibdev, ibdev->profile, MLX5_IB_STAGE_MAX);
+ +}
+ +
+ +static int
+ +mlx5_ib_vport_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+ +{
+ +	struct mlx5_ib_dev *ibdev;
+  
+  	ibdev = ib_alloc_device(mlx5_ib_dev, ib_dev);
+  	if (!ibdev)
+  		return -ENOMEM;
+  
++ 	ibdev->port = kcalloc(num_ports, sizeof(*ibdev->port),
++ 			      GFP_KERNEL);
++ 	if (!ibdev->port) {
++ 		ib_dealloc_device(&ibdev->ib_dev);
++ 		return -ENOMEM;
++ 	}
++ 
+  	ibdev->rep = rep;
+  	ibdev->mdev = dev;
+++<<<<<<< HEAD
+ +	ibdev->num_ports = max(MLX5_CAP_GEN(dev, num_ports),
+ +			       MLX5_CAP_GEN(dev, num_vhca_ports));
+ +	if (!__mlx5_ib_add(ibdev, &rep_profile)) {
+ +		ib_dealloc_device(&ibdev->ib_dev);
+++=======
++ 	ibdev->num_ports = num_ports;
++ 
++ 	if (!__mlx5_ib_add(ibdev, profile))
+++>>>>>>> da796ccb3e0e (RDMA/mlx5: Move ports allocation to outside of INIT stage)
+  		return -EINVAL;
+ +	}
+  
+  	rep->rep_if[REP_IB].priv = ibdev;
+  
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 5fcf98302272,0d86b5266960..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -5856,14 -5852,9 +5855,9 @@@ int mlx5_ib_stage_init_init(struct mlx5
+  	int err;
+  	int i;
+  
+- 	dev->port = kcalloc(dev->num_ports, sizeof(*dev->port),
+- 			    GFP_KERNEL);
+- 	if (!dev->port)
+- 		return -ENOMEM;
+- 
+  	for (i = 0; i < dev->num_ports; i++) {
+  		spin_lock_init(&dev->port[i].mp.mpi_lock);
+ -		rwlock_init(&dev->port[i].roce.netdev_lock);
+ +		rwlock_init(&dev->roce[i].netdev_lock);
+  	}
+  
+  	err = mlx5_ib_init_multiport_master(dev);
+@@@ -6414,6 -6408,9 +6405,12 @@@ void __mlx5_ib_remove(struct mlx5_ib_de
+  		if (profile->stage[stage].cleanup)
+  			profile->stage[stage].cleanup(dev);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	kfree(dev->port);
++ 	ib_dealloc_device(&dev->ib_dev);
+++>>>>>>> da796ccb3e0e (RDMA/mlx5: Move ports allocation to outside of INIT stage)
+  }
+  
+  void *__mlx5_ib_add(struct mlx5_ib_dev *dev,
+@@@ -6600,19 -6606,16 +6600,24 @@@ static void *mlx5_ib_add(struct mlx5_co
+  	dev = ib_alloc_device(mlx5_ib_dev, ib_dev);
+  	if (!dev)
+  		return NULL;
++ 	dev->port = kcalloc(num_ports, sizeof(*dev->port),
++ 			     GFP_KERNEL);
++ 	if (!dev->port) {
++ 		ib_dealloc_device((struct ib_device *)dev);
++ 		return NULL;
++ 	}
+  
+  	dev->mdev = mdev;
+- 	dev->num_ports = max(MLX5_CAP_GEN(mdev, num_ports),
+- 			     MLX5_CAP_GEN(mdev, num_vhca_ports));
++ 	dev->num_ports = num_ports;
+  
+ +	if (MLX5_ESWITCH_MANAGER(mdev) &&
+ +	    mlx5_ib_eswitch_mode(mdev->priv.eswitch) == SRIOV_OFFLOADS) {
+ +		dev->rep = mlx5_ib_vport_rep(mdev->priv.eswitch, 0);
+ +		dev->profile = &nic_rep_profile;
+ +		mlx5_ib_register_vport_reps(dev);
+ +		return dev;
+ +	}
+ +
+  	return __mlx5_ib_add(dev, &pf_profile);
+  }
+  
+* Unmerged path drivers/infiniband/hw/mlx5/ib_rep.c
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
