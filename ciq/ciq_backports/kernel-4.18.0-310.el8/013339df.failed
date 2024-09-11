@@ -1,0 +1,220 @@
+mm/rmap: always do TTU_IGNORE_ACCESS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Shakeel Butt <shakeelb@google.com>
+commit 013339df116c2ee0d796dd8bfb8f293a2030c063
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/013339df.failed
+
+Since commit 369ea8242c0f ("mm/rmap: update to new mmu_notifier semantic
+v2"), the code to check the secondary MMU's page table access bit is
+broken for !(TTU_IGNORE_ACCESS) because the page is unmapped from the
+secondary MMU's page table before the check.  More specifically for those
+secondary MMUs which unmap the memory in
+mmu_notifier_invalidate_range_start() like kvm.
+
+However memory reclaim is the only user of !(TTU_IGNORE_ACCESS) or the
+absence of TTU_IGNORE_ACCESS and it explicitly performs the page table
+access check before trying to unmap the page.  So, at worst the reclaim
+will miss accesses in a very short window if we remove page table access
+check in unmapping code.
+
+There is an unintented consequence of !(TTU_IGNORE_ACCESS) for the memcg
+reclaim.  From memcg reclaim the page_referenced() only account the
+accesses from the processes which are in the same memcg of the target page
+but the unmapping code is considering accesses from all the processes, so,
+decreasing the effectiveness of memcg reclaim.
+
+The simplest solution is to always assume TTU_IGNORE_ACCESS in unmapping
+code.
+
+Link: https://lkml.kernel.org/r/20201104231928.1494083-1-shakeelb@google.com
+Fixes: 369ea8242c0f ("mm/rmap: update to new mmu_notifier semantic v2")
+	Signed-off-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Jerome Glisse <jglisse@redhat.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 013339df116c2ee0d796dd8bfb8f293a2030c063)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/migrate.c
+diff --cc mm/migrate.c
+index f9092c22e9d0,8ea0c65f1075..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -1332,9 -1327,29 +1331,31 @@@ static int unmap_and_move_huge_page(new
+  		goto put_anon;
+  
+  	if (page_mapped(hpage)) {
+++<<<<<<< HEAD
+ +		try_to_unmap(hpage,
+ +			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS);
+++=======
++ 		bool mapping_locked = false;
++ 		enum ttu_flags ttu = TTU_MIGRATION|TTU_IGNORE_MLOCK;
++ 
++ 		if (!PageAnon(hpage)) {
++ 			/*
++ 			 * In shared mappings, try_to_unmap could potentially
++ 			 * call huge_pmd_unshare.  Because of this, take
++ 			 * semaphore in write mode here and set TTU_RMAP_LOCKED
++ 			 * to let lower levels know we have taken the lock.
++ 			 */
++ 			mapping = hugetlb_page_mapping_lock_write(hpage);
++ 			if (unlikely(!mapping))
++ 				goto unlock_put_anon;
++ 
++ 			mapping_locked = true;
++ 			ttu |= TTU_RMAP_LOCKED;
++ 		}
++ 
++ 		try_to_unmap(hpage, ttu);
+++>>>>>>> 013339df116c (mm/rmap: always do TTU_IGNORE_ACCESS)
+  		page_was_mapped = 1;
+ -
+ -		if (mapping_locked)
+ -			i_mmap_unlock_write(mapping);
+  	}
+  
+  	if (!page_mapped(hpage))
+diff --git a/include/linux/rmap.h b/include/linux/rmap.h
+index 988d176472df..c2471095469c 100644
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -91,7 +91,6 @@ enum ttu_flags {
+ 
+ 	TTU_SPLIT_HUGE_PMD	= 0x4,	/* split huge PMD if any */
+ 	TTU_IGNORE_MLOCK	= 0x8,	/* ignore mlock */
+-	TTU_IGNORE_ACCESS	= 0x10,	/* don't age */
+ 	TTU_IGNORE_HWPOISON	= 0x20,	/* corrupted page is recoverable */
+ 	TTU_BATCH_FLUSH		= 0x40,	/* Batch TLB flushes where possible
+ 					 * and caller guarantees they will
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index f8f2e337b025..7fc9c6bb88f0 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2251,7 +2251,7 @@ void vma_adjust_trans_huge(struct vm_area_struct *vma,
+ 
+ static void unmap_page(struct page *page)
+ {
+-	enum ttu_flags ttu_flags = TTU_IGNORE_MLOCK | TTU_IGNORE_ACCESS |
++	enum ttu_flags ttu_flags = TTU_IGNORE_MLOCK |
+ 		TTU_RMAP_LOCKED | TTU_SPLIT_HUGE_PMD;
+ 	bool unmap_success;
+ 
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index 1eb364eceed0..3f7d7a5ef7e3 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -990,7 +990,7 @@ static int get_hwpoison_page(struct page *page)
+ static bool hwpoison_user_mappings(struct page *p, unsigned long pfn,
+ 				  int flags, struct page **hpagep)
+ {
+-	enum ttu_flags ttu = TTU_IGNORE_MLOCK | TTU_IGNORE_ACCESS;
++	enum ttu_flags ttu = TTU_IGNORE_MLOCK;
+ 	struct address_space *mapping;
+ 	LIST_HEAD(tokill);
+ 	bool unmap_success;
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index 7ce5e5a2242e..8fa3b8a4783c 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -1309,7 +1309,7 @@ do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
+ 			if (WARN_ON(PageLRU(page)))
+ 				isolate_lru_page(page);
+ 			if (page_mapped(page))
+-				try_to_unmap(page, TTU_IGNORE_MLOCK | TTU_IGNORE_ACCESS);
++				try_to_unmap(page, TTU_IGNORE_MLOCK);
+ 			continue;
+ 		}
+ 
+* Unmerged path mm/migrate.c
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 9650908547de..35a4accb8d2f 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1514,15 +1514,6 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 			goto discard;
+ 		}
+ 
+-		if (!(flags & TTU_IGNORE_ACCESS)) {
+-			if (ptep_clear_flush_young_notify(vma, address,
+-						pvmw.pte)) {
+-				ret = false;
+-				page_vma_mapped_walk_done(&pvmw);
+-				break;
+-			}
+-		}
+-
+ 		/* Nuke the page table entry. */
+ 		flush_cache_page(vma, address, pte_pfn(*pvmw.pte));
+ 		if (should_defer_flush(mm, flags)) {
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 78909cbd70f5..5a26a681e071 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1077,7 +1077,6 @@ static void page_check_dirty_writeback(struct page *page,
+ static unsigned int shrink_page_list(struct list_head *page_list,
+ 				     struct pglist_data *pgdat,
+ 				     struct scan_control *sc,
+-				     enum ttu_flags ttu_flags,
+ 				     struct reclaim_stat *stat,
+ 				     bool ignore_references)
+ {
+@@ -1302,7 +1301,7 @@ static unsigned int shrink_page_list(struct list_head *page_list,
+ 		 * processes. Try to unmap it here.
+ 		 */
+ 		if (page_mapped(page)) {
+-			enum ttu_flags flags = ttu_flags | TTU_BATCH_FLUSH;
++			enum ttu_flags flags = TTU_BATCH_FLUSH;
+ 			bool was_swapbacked = PageSwapBacked(page);
+ 
+ 			if (unlikely(PageTransHuge(page)))
+@@ -1519,7 +1518,7 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
+ 	}
+ 
+ 	nr_reclaimed = shrink_page_list(&clean_pages, zone->zone_pgdat, &sc,
+-			TTU_IGNORE_ACCESS, &stat, true);
++					&stat, true);
+ 	list_splice(&clean_pages, page_list);
+ 	mod_node_page_state(zone->zone_pgdat, NR_ISOLATED_FILE,
+ 			    -(long)nr_reclaimed);
+@@ -1963,8 +1962,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 	if (nr_taken == 0)
+ 		return 0;
+ 
+-	nr_reclaimed = shrink_page_list(&page_list, pgdat, sc, 0,
+-				&stat, false);
++	nr_reclaimed = shrink_page_list(&page_list, pgdat, sc, &stat, false);
+ 
+ 	spin_lock_irq(&pgdat->lru_lock);
+ 
+@@ -2136,8 +2134,7 @@ unsigned long reclaim_pages(struct list_head *page_list)
+ 
+ 		nr_reclaimed += shrink_page_list(&node_page_list,
+ 						NODE_DATA(nid),
+-						&sc, 0,
+-						&dummy_stat, false);
++						&sc, &dummy_stat, false);
+ 		while (!list_empty(&node_page_list)) {
+ 			page = lru_to_page(&node_page_list);
+ 			list_del(&page->lru);
+@@ -2150,8 +2147,7 @@ unsigned long reclaim_pages(struct list_head *page_list)
+ 	if (!list_empty(&node_page_list)) {
+ 		nr_reclaimed += shrink_page_list(&node_page_list,
+ 						NODE_DATA(nid),
+-						&sc, 0,
+-						&dummy_stat, false);
++						&sc, &dummy_stat, false);
+ 		while (!list_empty(&node_page_list)) {
+ 			page = lru_to_page(&node_page_list);
+ 			list_del(&page->lru);
