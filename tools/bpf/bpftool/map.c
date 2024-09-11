@@ -1188,6 +1188,7 @@ static int do_help(int argc, char **argv)
 		"       %s %s delete     MAP  key DATA\n"
 		"       %s %s pin        MAP  FILE\n"
 		"       %s %s event_pipe MAP [cpu N index M]\n"
+		"       %s %s peek       MAP\n"
 		"       %s %s help\n"
 		"\n"
 		"       " HELP_SPEC_MAP "\n"
@@ -1205,7 +1206,7 @@ static int do_help(int argc, char **argv)
 		bin_name, argv[-2], bin_name, argv[-2], bin_name, argv[-2],
 		bin_name, argv[-2], bin_name, argv[-2], bin_name, argv[-2],
 		bin_name, argv[-2], bin_name, argv[-2], bin_name, argv[-2],
-		bin_name, argv[-2]);
+		bin_name, argv[-2], bin_name, argv[-2]);
 
 	return 0;
 }
@@ -1222,6 +1223,7 @@ static const struct cmd cmds[] = {
 	{ "pin",	do_pin },
 	{ "event_pipe",	do_event_pipe },
 	{ "create",	do_create },
+	{ "peek",	do_lookup },
 	{ 0 }
 };
 
