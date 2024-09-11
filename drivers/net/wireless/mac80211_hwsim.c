@@ -1769,6 +1769,8 @@ static void mac80211_hwsim_configure_filter(struct ieee80211_hw *hw,
 	data->rx_filter = 0;
 	if (*total_flags & FIF_ALLMULTI)
 		data->rx_filter |= FIF_ALLMULTI;
+	if (*total_flags & FIF_MCAST_ACTION)
+		data->rx_filter |= FIF_MCAST_ACTION;
 
 	*total_flags = data->rx_filter;
 }
@@ -2726,6 +2728,8 @@ static int mac80211_hwsim_new_radio(struct genl_info *info,
 			       NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR;
 	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_VHT_IBSS);
 	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_BEACON_PROTECTION);
+	wiphy_ext_feature_set(hw->wiphy,
+			      NL80211_EXT_FEATURE_MULTICAST_REGISTRATIONS);
 
 	/* ask mac80211 to reserve space for magic */
 	hw->vif_data_size = sizeof(struct hwsim_vif_priv);
