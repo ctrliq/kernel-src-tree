@@ -515,6 +515,7 @@ static void soc_pcm_hw_init(struct snd_pcm_hardware *hw)
 	hw->rate_max		= UINT_MAX;
 	hw->channels_min	= 0;
 	hw->channels_max	= UINT_MAX;
+	hw->formats		= ULLONG_MAX;
 }
 
 static void soc_pcm_hw_update_rate(struct snd_pcm_hardware *hw,
@@ -537,6 +538,12 @@ static void soc_pcm_hw_update_chan(struct snd_pcm_hardware *hw,
 	hw->channels_max = min(hw->channels_max, p->channels_max);
 }
 
+static void soc_pcm_hw_update_format(struct snd_pcm_hardware *hw,
+				     struct snd_soc_pcm_stream *p)
+{
+	hw->formats &= p->formats;
+}
+
 /**
  * snd_soc_runtime_calc_hw() - Calculate hw limits for a PCM stream
  * @rtd: ASoC PCM runtime
@@ -554,7 +561,6 @@ int snd_soc_runtime_calc_hw(struct snd_soc_pcm_runtime *rtd,
 	struct snd_soc_pcm_stream *codec_stream;
 	struct snd_soc_pcm_stream *cpu_stream;
 	unsigned int cpu_chan_min = 0, cpu_chan_max = UINT_MAX;
-	u64 formats = ULLONG_MAX;
 	int i;
 
 	soc_pcm_hw_init(hw);
@@ -575,7 +581,7 @@ int snd_soc_runtime_calc_hw(struct snd_soc_pcm_runtime *rtd,
 
 		soc_pcm_hw_update_chan(hw, cpu_stream);
 		soc_pcm_hw_update_rate(hw, cpu_stream);
-		formats &= cpu_stream->formats;
+		soc_pcm_hw_update_format(hw, cpu_stream);
 	}
 	cpu_chan_min = hw->channels_min;
 	cpu_chan_max = hw->channels_max;
@@ -596,7 +602,7 @@ int snd_soc_runtime_calc_hw(struct snd_soc_pcm_runtime *rtd,
 
 		soc_pcm_hw_update_chan(hw, codec_stream);
 		soc_pcm_hw_update_rate(hw, codec_stream);
-		formats &= codec_stream->formats;
+		soc_pcm_hw_update_format(hw, codec_stream);
 	}
 
 	/* Verify both a valid CPU DAI and a valid CODEC DAI were found */
@@ -612,9 +618,6 @@ int snd_soc_runtime_calc_hw(struct snd_soc_pcm_runtime *rtd,
 		hw->channels_min = cpu_chan_min;
 		hw->channels_max = cpu_chan_max;
 	}
-
-	/* finally find a intersection between CODECs and CPUs */
-	hw->formats = formats;
 
 	return 0;
 }
@@ -1603,7 +1606,7 @@ static void dpcm_runtime_merge_format(struct snd_pcm_substream *substream,
 
 			codec_stream = snd_soc_dai_get_pcm_stream(dai, stream);
 
-			hw->formats &= codec_stream->formats;
+			soc_pcm_hw_update_format(hw, codec_stream);
 		}
 	}
 }
