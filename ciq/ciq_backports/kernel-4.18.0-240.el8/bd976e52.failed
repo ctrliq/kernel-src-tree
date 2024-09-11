@@ -1,0 +1,371 @@
+block: Kill gfp_t argument of blkdev_report_zones()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Damien Le Moal <damien.lemoal@wdc.com>
+commit bd976e52725965ddcceb9abecbcc7ca46863665c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/bd976e52.failed
+
+Only GFP_KERNEL and GFP_NOIO are used with blkdev_report_zones(). In
+preparation of using vmalloc() for large report buffer and zone array
+allocations used by this function, remove its "gfp_t gfp_mask" argument
+and rely on the caller context to use memalloc_noio_save/restore() where
+necessary (block layer zone revalidation and dm-zoned I/O error path).
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit bd976e52725965ddcceb9abecbcc7ca46863665c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/sd_zbc.c
+diff --cc drivers/scsi/sd_zbc.c
+index 70d040a9ce49,ec3764c8f3f1..000000000000
+--- a/drivers/scsi/sd_zbc.c
++++ b/drivers/scsi/sd_zbc.c
+@@@ -128,11 -126,13 +126,17 @@@ int sd_zbc_report_zones(struct gendisk 
+  		return -EOPNOTSUPP;
+  
+  	/*
+ -	 * Get a reply buffer for the number of requested zones plus a header,
+ -	 * without exceeding the device maximum command size. For ATA disks,
+ -	 * buffers must be aligned to 512B.
+ +	 * Get a reply buffer for the number of requested zones plus a header.
+ +	 * For ATA, buffers must be aligned to 512B.
+  	 */
+++<<<<<<< HEAD
+ +	buflen = roundup((nrz + 1) * 64, 512);
+ +	buf = kmalloc(buflen, gfp_mask);
+++=======
++ 	buflen = min(queue_max_hw_sectors(disk->queue) << 9,
++ 		     roundup((nrz + 1) * 64, 512));
++ 	buf = kmalloc(buflen, GFP_KERNEL);
+++>>>>>>> bd976e527259 (block: Kill gfp_t argument of blkdev_report_zones())
+  	if (!buf)
+  		return -ENOMEM;
+  
+diff --git a/block/blk-zoned.c b/block/blk-zoned.c
+index f8ec547131fd..6b9cb62a43a8 100644
+--- a/block/blk-zoned.c
++++ b/block/blk-zoned.c
+@@ -13,6 +13,7 @@
+ #include <linux/rbtree.h>
+ #include <linux/blkdev.h>
+ #include <linux/blk-mq.h>
++#include <linux/sched/mm.h>
+ 
+ #include "blk.h"
+ 
+@@ -116,8 +117,7 @@ static bool blkdev_report_zone(struct block_device *bdev, struct blk_zone *rep)
+ }
+ 
+ static int blk_report_zones(struct gendisk *disk, sector_t sector,
+-			    struct blk_zone *zones, unsigned int *nr_zones,
+-			    gfp_t gfp_mask)
++			    struct blk_zone *zones, unsigned int *nr_zones)
+ {
+ 	struct request_queue *q = disk->queue;
+ 	unsigned int z = 0, n, nrz = *nr_zones;
+@@ -126,8 +126,7 @@ static int blk_report_zones(struct gendisk *disk, sector_t sector,
+ 
+ 	while (z < nrz && sector < capacity) {
+ 		n = nrz - z;
+-		ret = disk->fops->report_zones(disk, sector, &zones[z], &n,
+-					       gfp_mask);
++		ret = disk->fops->report_zones(disk, sector, &zones[z], &n);
+ 		if (ret)
+ 			return ret;
+ 		if (!n)
+@@ -148,17 +147,18 @@ static int blk_report_zones(struct gendisk *disk, sector_t sector,
+  * @sector:	Sector from which to report zones
+  * @zones:	Array of zone structures where to return the zones information
+  * @nr_zones:	Number of zone structures in the zone array
+- * @gfp_mask:	Memory allocation flags (for bio_alloc)
+  *
+  * Description:
+  *    Get zone information starting from the zone containing @sector.
+  *    The number of zone information reported may be less than the number
+  *    requested by @nr_zones. The number of zones actually reported is
+  *    returned in @nr_zones.
++ *    The caller must use memalloc_noXX_save/restore() calls to control
++ *    memory allocations done within this function (zone array and command
++ *    buffer allocation by the device driver).
+  */
+ int blkdev_report_zones(struct block_device *bdev, sector_t sector,
+-			struct blk_zone *zones, unsigned int *nr_zones,
+-			gfp_t gfp_mask)
++			struct blk_zone *zones, unsigned int *nr_zones)
+ {
+ 	struct request_queue *q = bdev_get_queue(bdev);
+ 	unsigned int i, nrz;
+@@ -183,7 +183,7 @@ int blkdev_report_zones(struct block_device *bdev, sector_t sector,
+ 	nrz = min(*nr_zones,
+ 		  __blkdev_nr_zones(q, bdev->bd_part->nr_sects - sector));
+ 	ret = blk_report_zones(bdev->bd_disk, get_start_sect(bdev) + sector,
+-			       zones, &nrz, gfp_mask);
++			       zones, &nrz);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -304,9 +304,7 @@ int blkdev_report_zones_ioctl(struct block_device *bdev, fmode_t mode,
+ 	if (!zones)
+ 		return -ENOMEM;
+ 
+-	ret = blkdev_report_zones(bdev, rep.sector,
+-				  zones, &rep.nr_zones,
+-				  GFP_KERNEL);
++	ret = blkdev_report_zones(bdev, rep.sector, zones, &rep.nr_zones);
+ 	if (ret)
+ 		goto out;
+ 
+@@ -414,6 +412,7 @@ int blk_revalidate_disk_zones(struct gendisk *disk)
+ 	unsigned long *seq_zones_wlock = NULL, *seq_zones_bitmap = NULL;
+ 	unsigned int i, rep_nr_zones = 0, z = 0, nrz;
+ 	struct blk_zone *zones = NULL;
++	unsigned int noio_flag;
+ 	sector_t sector = 0;
+ 	int ret = 0;
+ 
+@@ -426,6 +425,12 @@ int blk_revalidate_disk_zones(struct gendisk *disk)
+ 		return 0;
+ 	}
+ 
++	/*
++	 * Ensure that all memory allocations in this context are done as
++	 * if GFP_NOIO was specified.
++	 */
++	noio_flag = memalloc_noio_save();
++
+ 	if (!blk_queue_is_zoned(q) || !nr_zones) {
+ 		nr_zones = 0;
+ 		goto update;
+@@ -448,7 +453,7 @@ int blk_revalidate_disk_zones(struct gendisk *disk)
+ 
+ 	while (z < nr_zones) {
+ 		nrz = min(nr_zones - z, rep_nr_zones);
+-		ret = blk_report_zones(disk, sector, zones, &nrz, GFP_NOIO);
++		ret = blk_report_zones(disk, sector, zones, &nrz);
+ 		if (ret)
+ 			goto out;
+ 		if (!nrz)
+@@ -479,6 +484,8 @@ int blk_revalidate_disk_zones(struct gendisk *disk)
+ 	blk_mq_unfreeze_queue(q);
+ 
+ out:
++	memalloc_noio_restore(noio_flag);
++
+ 	free_pages((unsigned long)zones,
+ 		   get_order(rep_nr_zones * sizeof(struct blk_zone)));
+ 	kfree(seq_zones_wlock);
+diff --git a/drivers/block/null_blk.h b/drivers/block/null_blk.h
+index 34b22d6523ba..4b9bbe3bb5a1 100644
+--- a/drivers/block/null_blk.h
++++ b/drivers/block/null_blk.h
+@@ -89,8 +89,7 @@ struct nullb {
+ int null_zone_init(struct nullb_device *dev);
+ void null_zone_exit(struct nullb_device *dev);
+ int null_zone_report(struct gendisk *disk, sector_t sector,
+-		     struct blk_zone *zones, unsigned int *nr_zones,
+-		     gfp_t gfp_mask);
++		     struct blk_zone *zones, unsigned int *nr_zones);
+ void null_zone_write(struct nullb_cmd *cmd, sector_t sector,
+ 			unsigned int nr_sectors);
+ void null_zone_reset(struct nullb_cmd *cmd, sector_t sector);
+diff --git a/drivers/block/null_blk_zoned.c b/drivers/block/null_blk_zoned.c
+index fca0c97ff1aa..cb28d93f2bd1 100644
+--- a/drivers/block/null_blk_zoned.c
++++ b/drivers/block/null_blk_zoned.c
+@@ -67,8 +67,7 @@ void null_zone_exit(struct nullb_device *dev)
+ }
+ 
+ int null_zone_report(struct gendisk *disk, sector_t sector,
+-		     struct blk_zone *zones, unsigned int *nr_zones,
+-		     gfp_t gfp_mask)
++		     struct blk_zone *zones, unsigned int *nr_zones)
+ {
+ 	struct nullb *nullb = disk->private_data;
+ 	struct nullb_device *dev = nullb->dev;
+diff --git a/drivers/md/dm-flakey.c b/drivers/md/dm-flakey.c
+index a9bc518156f2..2900fbde89b3 100644
+--- a/drivers/md/dm-flakey.c
++++ b/drivers/md/dm-flakey.c
+@@ -461,15 +461,14 @@ static int flakey_prepare_ioctl(struct dm_target *ti, struct block_device **bdev
+ 
+ #ifdef CONFIG_BLK_DEV_ZONED
+ static int flakey_report_zones(struct dm_target *ti, sector_t sector,
+-			       struct blk_zone *zones, unsigned int *nr_zones,
+-			       gfp_t gfp_mask)
++			       struct blk_zone *zones, unsigned int *nr_zones)
+ {
+ 	struct flakey_c *fc = ti->private;
+ 	int ret;
+ 
+ 	/* Do report and remap it */
+ 	ret = blkdev_report_zones(fc->dev->bdev, flakey_map_sector(ti, sector),
+-				  zones, nr_zones, gfp_mask);
++				  zones, nr_zones);
+ 	if (ret != 0)
+ 		return ret;
+ 
+diff --git a/drivers/md/dm-linear.c b/drivers/md/dm-linear.c
+index ad980a38fb1e..ecefe6703736 100644
+--- a/drivers/md/dm-linear.c
++++ b/drivers/md/dm-linear.c
+@@ -137,15 +137,14 @@ static int linear_prepare_ioctl(struct dm_target *ti, struct block_device **bdev
+ 
+ #ifdef CONFIG_BLK_DEV_ZONED
+ static int linear_report_zones(struct dm_target *ti, sector_t sector,
+-			       struct blk_zone *zones, unsigned int *nr_zones,
+-			       gfp_t gfp_mask)
++			       struct blk_zone *zones, unsigned int *nr_zones)
+ {
+ 	struct linear_c *lc = (struct linear_c *) ti->private;
+ 	int ret;
+ 
+ 	/* Do report and remap it */
+ 	ret = blkdev_report_zones(lc->dev->bdev, linear_map_sector(ti, sector),
+-				  zones, nr_zones, gfp_mask);
++				  zones, nr_zones);
+ 	if (ret != 0)
+ 		return ret;
+ 
+diff --git a/drivers/md/dm-zoned-metadata.c b/drivers/md/dm-zoned-metadata.c
+index 3466fdf2a466..38ecd9e9218f 100644
+--- a/drivers/md/dm-zoned-metadata.c
++++ b/drivers/md/dm-zoned-metadata.c
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/module.h>
+ #include <linux/crc32.h>
++#include <linux/sched/mm.h>
+ 
+ #define	DM_MSG_PREFIX		"zoned metadata"
+ 
+@@ -1142,8 +1143,7 @@ static int dmz_init_zones(struct dmz_metadata *zmd)
+ 	while (sector < dev->capacity) {
+ 		/* Get zone information */
+ 		nr_blkz = DMZ_REPORT_NR_ZONES;
+-		ret = blkdev_report_zones(dev->bdev, sector, blkz,
+-					  &nr_blkz, GFP_KERNEL);
++		ret = blkdev_report_zones(dev->bdev, sector, blkz, &nr_blkz);
+ 		if (ret) {
+ 			dmz_dev_err(dev, "Report zones failed %d", ret);
+ 			goto out;
+@@ -1181,12 +1181,20 @@ static int dmz_init_zones(struct dmz_metadata *zmd)
+ static int dmz_update_zone(struct dmz_metadata *zmd, struct dm_zone *zone)
+ {
+ 	unsigned int nr_blkz = 1;
++	unsigned int noio_flag;
+ 	struct blk_zone blkz;
+ 	int ret;
+ 
+-	/* Get zone information from disk */
++	/*
++	 * Get zone information from disk. Since blkdev_report_zones() uses
++	 * GFP_KERNEL by default for memory allocations, set the per-task
++	 * PF_MEMALLOC_NOIO flag so that all allocations are done as if
++	 * GFP_NOIO was specified.
++	 */
++	noio_flag = memalloc_noio_save();
+ 	ret = blkdev_report_zones(zmd->dev->bdev, dmz_start_sect(zmd, zone),
+-				  &blkz, &nr_blkz, GFP_NOIO);
++				  &blkz, &nr_blkz);
++	memalloc_noio_restore(noio_flag);
+ 	if (!nr_blkz)
+ 		ret = -EIO;
+ 	if (ret) {
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 78cfd9b2a0f7..60bc90391027 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -441,8 +441,7 @@ static int dm_blk_getgeo(struct block_device *bdev, struct hd_geometry *geo)
+ }
+ 
+ static int dm_blk_report_zones(struct gendisk *disk, sector_t sector,
+-			       struct blk_zone *zones, unsigned int *nr_zones,
+-			       gfp_t gfp_mask)
++			       struct blk_zone *zones, unsigned int *nr_zones)
+ {
+ #ifdef CONFIG_BLK_DEV_ZONED
+ 	struct mapped_device *md = disk->private_data;
+@@ -480,8 +479,7 @@ static int dm_blk_report_zones(struct gendisk *disk, sector_t sector,
+ 	 * So there is no need to loop here trying to fill the entire array
+ 	 * of zones.
+ 	 */
+-	ret = tgt->type->report_zones(tgt, sector, zones,
+-				      nr_zones, gfp_mask);
++	ret = tgt->type->report_zones(tgt, sector, zones, nr_zones);
+ 
+ out:
+ 	dm_put_live_table(md, srcu_idx);
+diff --git a/drivers/scsi/sd.h b/drivers/scsi/sd.h
+index dea134affc5d..0b473080ddd8 100644
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@ -285,8 +285,7 @@ extern blk_status_t sd_zbc_setup_reset_cmnd(struct scsi_cmnd *cmd);
+ extern void sd_zbc_complete(struct scsi_cmnd *cmd, unsigned int good_bytes,
+ 			    struct scsi_sense_hdr *sshdr);
+ extern int sd_zbc_report_zones(struct gendisk *disk, sector_t sector,
+-			       struct blk_zone *zones, unsigned int *nr_zones,
+-			       gfp_t gfp_mask);
++			       struct blk_zone *zones, unsigned int *nr_zones);
+ 
+ #else /* CONFIG_BLK_DEV_ZONED */
+ 
+* Unmerged path drivers/scsi/sd_zbc.c
+diff --git a/fs/f2fs/super.c b/fs/f2fs/super.c
+index 17bcff789c08..f04188e77b90 100644
+--- a/fs/f2fs/super.c
++++ b/fs/f2fs/super.c
+@@ -2430,9 +2430,7 @@ static int init_blkz_info(struct f2fs_sb_info *sbi, int devi)
+ 	while (zones && sector < nr_sectors) {
+ 
+ 		nr_zones = F2FS_REPORT_NR_ZONES;
+-		err = blkdev_report_zones(bdev, sector,
+-					  zones, &nr_zones,
+-					  GFP_KERNEL);
++		err = blkdev_report_zones(bdev, sector, zones, &nr_zones);
+ 		if (err)
+ 			break;
+ 		if (!nr_zones) {
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index bd38adaa12b3..e8d6c1263a29 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -362,7 +362,7 @@ struct queue_limits {
+ extern unsigned int blkdev_nr_zones(struct block_device *bdev);
+ extern int blkdev_report_zones(struct block_device *bdev,
+ 			       sector_t sector, struct blk_zone *zones,
+-			       unsigned int *nr_zones, gfp_t gfp_mask);
++			       unsigned int *nr_zones);
+ extern int blkdev_reset_zones(struct block_device *bdev, sector_t sectors,
+ 			      sector_t nr_sectors, gfp_t gfp_mask);
+ extern int blk_revalidate_disk_zones(struct gendisk *disk);
+@@ -1704,8 +1704,7 @@ struct block_device_operations {
+ 	/* this callback is with swap_lock and sometimes page table lock held */
+ 	void (*swap_slot_free_notify) (struct block_device *, unsigned long);
+ 	int (*report_zones)(struct gendisk *, sector_t sector,
+-			    struct blk_zone *zones, unsigned int *nr_zones,
+-			    gfp_t gfp_mask);
++			    struct blk_zone *zones, unsigned int *nr_zones);
+ 	struct module *owner;
+ 	const struct pr_ops *pr_ops;
+ 
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index be224eb936df..41cfcdba0d3f 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -94,8 +94,7 @@ typedef int (*dm_prepare_ioctl_fn) (struct dm_target *ti, struct block_device **
+ 
+ typedef int (*dm_report_zones_fn) (struct dm_target *ti, sector_t sector,
+ 				   struct blk_zone *zones,
+-				   unsigned int *nr_zones,
+-				   gfp_t gfp_mask);
++				   unsigned int *nr_zones);
+ 
+ /*
+  * These iteration functions are typically used to check (and combine)
