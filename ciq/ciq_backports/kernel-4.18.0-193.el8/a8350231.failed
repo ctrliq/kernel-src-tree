@@ -1,0 +1,177 @@
+x86/kvm/hyper-v: don't allow to turn on unsupported VMX controls for nested guests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [x86] kvm/hyper-v: don't allow to turn on unsupported VMX controls for nested guests (Vitaly Kuznetsov) [1786288]
+Rebuild_FUZZ: 97.50%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit a83502314ce303c6341b249c41121759c7477ba1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a8350231.failed
+
+Sane L1 hypervisors are not supposed to turn any of the unsupported VMX
+controls on for its guests and nested_vmx_check_controls() checks for
+that. This is, however, not the case for the controls which are supported
+on the host but are missing in enlightened VMCS and when eVMCS is in use.
+
+It would certainly be possible to add these missing checks to
+nested_check_vm_execution_controls()/_vm_exit_controls()/.. but it seems
+preferable to keep eVMCS-specific stuff in eVMCS and reduce the impact on
+non-eVMCS guests by doing less unrelated checks. Create a separate
+nested_evmcs_check_controls() for this purpose.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a83502314ce303c6341b249c41121759c7477ba1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/evmcs.c
+#	arch/x86/kvm/vmx/evmcs.h
+#	arch/x86/kvm/vmx/nested.c
+diff --cc arch/x86/kvm/vmx/evmcs.c
+index 89c3e0caf39f,303813423c3e..000000000000
+--- a/arch/x86/kvm/vmx/evmcs.c
++++ b/arch/x86/kvm/vmx/evmcs.c
+@@@ -346,6 -347,84 +347,87 @@@ uint16_t nested_get_evmcs_version(struc
+         return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void nested_evmcs_filter_control_msr(u32 msr_index, u64 *pdata)
++ {
++ 	u32 ctl_low = (u32)*pdata;
++ 	u32 ctl_high = (u32)(*pdata >> 32);
++ 
++ 	/*
++ 	 * Hyper-V 2016 and 2019 try using these features even when eVMCS
++ 	 * is enabled but there are no corresponding fields.
++ 	 */
++ 	switch (msr_index) {
++ 	case MSR_IA32_VMX_EXIT_CTLS:
++ 	case MSR_IA32_VMX_TRUE_EXIT_CTLS:
++ 		ctl_high &= ~VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL;
++ 		break;
++ 	case MSR_IA32_VMX_ENTRY_CTLS:
++ 	case MSR_IA32_VMX_TRUE_ENTRY_CTLS:
++ 		ctl_high &= ~VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL;
++ 		break;
++ 	case MSR_IA32_VMX_PROCBASED_CTLS2:
++ 		ctl_high &= ~SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES;
++ 		break;
++ 	}
++ 
++ 	*pdata = ctl_low | ((u64)ctl_high << 32);
++ }
++ 
++ int nested_evmcs_check_controls(struct vmcs12 *vmcs12)
++ {
++ 	int ret = 0;
++ 	u32 unsupp_ctl;
++ 
++ 	unsupp_ctl = vmcs12->pin_based_vm_exec_control &
++ 		EVMCS1_UNSUPPORTED_PINCTRL;
++ 	if (unsupp_ctl) {
++ 		trace_kvm_nested_vmenter_failed(
++ 			"eVMCS: unsupported pin-based VM-execution controls",
++ 			unsupp_ctl);
++ 		ret = -EINVAL;
++ 	}
++ 
++ 	unsupp_ctl = vmcs12->secondary_vm_exec_control &
++ 		EVMCS1_UNSUPPORTED_2NDEXEC;
++ 	if (unsupp_ctl) {
++ 		trace_kvm_nested_vmenter_failed(
++ 			"eVMCS: unsupported secondary VM-execution controls",
++ 			unsupp_ctl);
++ 		ret = -EINVAL;
++ 	}
++ 
++ 	unsupp_ctl = vmcs12->vm_exit_controls &
++ 		EVMCS1_UNSUPPORTED_VMEXIT_CTRL;
++ 	if (unsupp_ctl) {
++ 		trace_kvm_nested_vmenter_failed(
++ 			"eVMCS: unsupported VM-exit controls",
++ 			unsupp_ctl);
++ 		ret = -EINVAL;
++ 	}
++ 
++ 	unsupp_ctl = vmcs12->vm_entry_controls &
++ 		EVMCS1_UNSUPPORTED_VMENTRY_CTRL;
++ 	if (unsupp_ctl) {
++ 		trace_kvm_nested_vmenter_failed(
++ 			"eVMCS: unsupported VM-entry controls",
++ 			unsupp_ctl);
++ 		ret = -EINVAL;
++ 	}
++ 
++ 	unsupp_ctl = vmcs12->vm_function_control & EVMCS1_UNSUPPORTED_VMFUNC;
++ 	if (unsupp_ctl) {
++ 		trace_kvm_nested_vmenter_failed(
++ 			"eVMCS: unsupported VM-function controls",
++ 			unsupp_ctl);
++ 		ret = -EINVAL;
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> a83502314ce3 (x86/kvm/hyper-v: don't allow to turn on unsupported VMX controls for nested guests)
+  int nested_enable_evmcs(struct kvm_vcpu *vcpu,
+  			uint16_t *vmcs_version)
+  {
+diff --cc arch/x86/kvm/vmx/evmcs.h
+index 07ebf6882a45,6de47f2569c9..000000000000
+--- a/arch/x86/kvm/vmx/evmcs.h
++++ b/arch/x86/kvm/vmx/evmcs.h
+@@@ -201,5 -202,7 +202,10 @@@ bool nested_enlightened_vmentry(struct 
+  uint16_t nested_get_evmcs_version(struct kvm_vcpu *vcpu);
+  int nested_enable_evmcs(struct kvm_vcpu *vcpu,
+  			uint16_t *vmcs_version);
+++<<<<<<< HEAD
+++=======
++ void nested_evmcs_filter_control_msr(u32 msr_index, u64 *pdata);
++ int nested_evmcs_check_controls(struct vmcs12 *vmcs12);
+++>>>>>>> a83502314ce3 (x86/kvm/hyper-v: don't allow to turn on unsupported VMX controls for nested guests)
+  
+  #endif /* __KVM_X86_VMX_EVMCS_H */
+diff --cc arch/x86/kvm/vmx/nested.c
+index 3d84294e42e2,657c2eda357c..000000000000
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@@ -2649,11 -2749,22 +2649,30 @@@ static int nested_check_vm_entry_contro
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Checks related to Host Control Registers and MSRs
+ + */
+ +static int nested_check_host_control_regs(struct kvm_vcpu *vcpu,
+ +                                          struct vmcs12 *vmcs12)
+++=======
++ static int nested_vmx_check_controls(struct kvm_vcpu *vcpu,
++ 				     struct vmcs12 *vmcs12)
++ {
++ 	if (nested_check_vm_execution_controls(vcpu, vmcs12) ||
++ 	    nested_check_vm_exit_controls(vcpu, vmcs12) ||
++ 	    nested_check_vm_entry_controls(vcpu, vmcs12))
++ 		return -EINVAL;
++ 
++ 	if (to_vmx(vcpu)->nested.enlightened_vmcs_enabled)
++ 		return nested_evmcs_check_controls(vmcs12);
++ 
++ 	return 0;
++ }
++ 
++ static int nested_vmx_check_host_state(struct kvm_vcpu *vcpu,
++ 				       struct vmcs12 *vmcs12)
+++>>>>>>> a83502314ce3 (x86/kvm/hyper-v: don't allow to turn on unsupported VMX controls for nested guests)
+  {
+  	bool ia32e;
+  
+* Unmerged path arch/x86/kvm/vmx/evmcs.c
+* Unmerged path arch/x86/kvm/vmx/evmcs.h
+* Unmerged path arch/x86/kvm/vmx/nested.c
