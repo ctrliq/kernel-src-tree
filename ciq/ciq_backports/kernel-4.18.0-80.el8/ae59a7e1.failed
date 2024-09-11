@@ -1,0 +1,91 @@
+KVM: PPC: Book3S HV: Keep rc bits in shadow pgtable in sync with host
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Suraj Jitindar Singh <sjitindarsingh@gmail.com>
+commit ae59a7e1945bc2245bbb587071ca737e00daf443
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/ae59a7e1.failed
+
+The rc bits contained in ptes are used to track whether a page has been
+accessed and whether it is dirty. The accessed bit is used to age a page
+and the dirty bit to track whether a page is dirty or not.
+
+Now that we support nested guests there are three ptes which track the
+state of the same page:
+- The partition-scoped page table in the L1 guest, mapping L2->L1 address
+- The partition-scoped page table in the host for the L1 guest, mapping
+  L1->L0 address
+- The shadow partition-scoped page table for the nested guest in the host,
+  mapping L2->L0 address
+
+The idea is to attempt to keep the rc state of these three ptes in sync,
+both when setting and when clearing rc bits.
+
+When setting the bits we achieve consistency by:
+- Initially setting the bits in the shadow page table as the 'and' of the
+  other two.
+- When updating in software the rc bits in the shadow page table we
+  ensure the state is consistent with the other two locations first, and
+  update these before reflecting the change into the shadow page table.
+  i.e. only set the bits in the L2->L0 pte if also set in both the
+       L2->L1 and the L1->L0 pte.
+
+When clearing the bits we achieve consistency by:
+- The rc bits in the shadow page table are only cleared when discarding
+  a pte, and we don't need to record this as if either bit is set then
+  it must also be set in the pte mapping L1->L0.
+- When L1 clears an rc bit in the L2->L1 mapping it __should__ issue a
+  tlbie instruction
+  - This means we will discard the pte from the shadow page table
+    meaning the mapping will have to be setup again.
+  - When setup the pte again in the shadow page table we will ensure
+    consistency with the L2->L1 pte.
+- When the host clears an rc bit in the L1->L0 mapping we need to also
+  clear the bit in any ptes in the shadow page table which map the same
+  gfn so we will be notified if a nested guest accesses the page.
+  This case is what this patch specifically concerns.
+  - We can search the nest_rmap list for that given gfn and clear the
+    same bit from all corresponding ptes in shadow page tables.
+  - If a nested guest causes either of the rc bits to be set by software
+    in future then we will update the L1->L0 pte and maintain consistency.
+
+With the process outlined above we aim to maintain consistency of the 3
+pte locations where we track rc for a given guest page.
+
+	Signed-off-by: Suraj Jitindar Singh <sjitindarsingh@gmail.com>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit ae59a7e1945bc2245bbb587071ca737e00daf443)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_64_mmu_radix.c
+diff --cc arch/powerpc/kvm/book3s_64_mmu_radix.c
+index cb2d337c9210,fb88167a402a..000000000000
+--- a/arch/powerpc/kvm/book3s_64_mmu_radix.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+@@@ -849,9 -1030,16 +856,22 @@@ static int kvm_radix_test_clear_dirty(s
+  		ret = 1;
+  		if (shift)
+  			ret = 1 << (shift - PAGE_SHIFT);
+++<<<<<<< HEAD
+ +		kvmppc_radix_update_pte(kvm, ptep, _PAGE_DIRTY, 0,
+ +					gpa, shift);
+ +		kvmppc_radix_tlbie_page(kvm, gpa, shift);
+++=======
++ 		spin_lock(&kvm->mmu_lock);
++ 		old = kvmppc_radix_update_pte(kvm, ptep, _PAGE_DIRTY, 0,
++ 					      gpa, shift);
++ 		kvmppc_radix_tlbie_page(kvm, gpa, shift, kvm->arch.lpid);
++ 		/* Also clear bit in ptes in shadow pgtable for nested guests */
++ 		rmapp = &memslot->arch.rmap[gfn - memslot->base_gfn];
++ 		kvmhv_update_nest_rmap_rc_list(kvm, rmapp, _PAGE_DIRTY, 0,
++ 					       old & PTE_RPN_MASK,
++ 					       1UL << shift);
++ 		spin_unlock(&kvm->mmu_lock);
+++>>>>>>> ae59a7e1945b (KVM: PPC: Book3S HV: Keep rc bits in shadow pgtable in sync with host)
+  	}
+  	return ret;
+  }
+* Unmerged path arch/powerpc/kvm/book3s_64_mmu_radix.c
