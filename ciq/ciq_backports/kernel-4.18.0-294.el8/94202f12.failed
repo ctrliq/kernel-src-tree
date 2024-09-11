@@ -1,0 +1,183 @@
+mm/gup: require FOLL_GET for get_user_pages_fast()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author John Hubbard <jhubbard@nvidia.com>
+commit 94202f126f698691f8865906ad6a68203e5dde8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/94202f12.failed
+
+Internal to mm/gup.c, require that get_user_pages_fast() and
+__get_user_pages_fast() identify themselves, by setting FOLL_GET.  This is
+required in order to be able to make decisions based on "FOLL_PIN, or
+FOLL_GET, or both or neither are set", in upcoming patches.
+
+	Signed-off-by: John Hubbard <jhubbard@nvidia.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Ira Weiny <ira.weiny@intel.com>
+	Cc: Jérôme Glisse <jglisse@redhat.com>
+	Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Shuah Khan <shuah@kernel.org>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+Link: http://lkml.kernel.org/r/20200211001536.1027652-6-jhubbard@nvidia.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 94202f126f698691f8865906ad6a68203e5dde8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/gup.c
+diff --cc mm/gup.c
+index 64143166cb9e,c8affbea2019..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -2173,9 -2420,10 +2181,9 @@@ int __get_user_pages_fast(unsigned lon
+  	 * block IPIs that come from THPs splitting.
+  	 */
+  
+ -	if (IS_ENABLED(CONFIG_HAVE_FAST_GUP) &&
+ -	    gup_fast_permitted(start, end)) {
+ +	if (gup_fast_permitted(start, end)) {
+  		local_irq_save(flags);
+- 		gup_pgd_range(start, end, write ? FOLL_WRITE : 0, pages, &nr);
++ 		gup_pgd_range(start, end, gup_flags, pages, &nr);
+  		local_irq_restore(flags);
+  	}
+  
+@@@ -2228,7 -2462,7 +2236,11 @@@ int get_user_pages_fast(unsigned long s
+  	int nr = 0, ret = 0;
+  
+  	if (WARN_ON_ONCE(gup_flags & ~(FOLL_WRITE | FOLL_LONGTERM |
+++<<<<<<< HEAD
+ +				       FOLL_FORCE)))
+++=======
++ 				       FOLL_FORCE | FOLL_PIN | FOLL_GET)))
+++>>>>>>> 94202f126f69 (mm/gup: require FOLL_GET for get_user_pages_fast())
+  		return -EINVAL;
+  
+  	start = untagged_addr(start) & PAGE_MASK;
+@@@ -2268,4 -2503,109 +2280,113 @@@
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +#endif /* CONFIG_HAVE_GENERIC_GUP */
+++=======
++ /**
++  * get_user_pages_fast() - pin user pages in memory
++  * @start:	starting user address
++  * @nr_pages:	number of pages from start to pin
++  * @gup_flags:	flags modifying pin behaviour
++  * @pages:	array that receives pointers to the pages pinned.
++  *		Should be at least nr_pages long.
++  *
++  * Attempt to pin user pages in memory without taking mm->mmap_sem.
++  * If not successful, it will fall back to taking the lock and
++  * calling get_user_pages().
++  *
++  * Returns number of pages pinned. This may be fewer than the number requested.
++  * If nr_pages is 0 or negative, returns 0. If no pages were pinned, returns
++  * -errno.
++  */
++ int get_user_pages_fast(unsigned long start, int nr_pages,
++ 			unsigned int gup_flags, struct page **pages)
++ {
++ 	/*
++ 	 * FOLL_PIN must only be set internally by the pin_user_pages*() APIs,
++ 	 * never directly by the caller, so enforce that:
++ 	 */
++ 	if (WARN_ON_ONCE(gup_flags & FOLL_PIN))
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * The caller may or may not have explicitly set FOLL_GET; either way is
++ 	 * OK. However, internally (within mm/gup.c), gup fast variants must set
++ 	 * FOLL_GET, because gup fast is always a "pin with a +1 page refcount"
++ 	 * request.
++ 	 */
++ 	gup_flags |= FOLL_GET;
++ 	return internal_get_user_pages_fast(start, nr_pages, gup_flags, pages);
++ }
++ EXPORT_SYMBOL_GPL(get_user_pages_fast);
++ 
++ /**
++  * pin_user_pages_fast() - pin user pages in memory without taking locks
++  *
++  * For now, this is a placeholder function, until various call sites are
++  * converted to use the correct get_user_pages*() or pin_user_pages*() API. So,
++  * this is identical to get_user_pages_fast().
++  *
++  * This is intended for Case 1 (DIO) in Documentation/vm/pin_user_pages.rst. It
++  * is NOT intended for Case 2 (RDMA: long-term pins).
++  */
++ int pin_user_pages_fast(unsigned long start, int nr_pages,
++ 			unsigned int gup_flags, struct page **pages)
++ {
++ 	/*
++ 	 * This is a placeholder, until the pin functionality is activated.
++ 	 * Until then, just behave like the corresponding get_user_pages*()
++ 	 * routine.
++ 	 */
++ 	return get_user_pages_fast(start, nr_pages, gup_flags, pages);
++ }
++ EXPORT_SYMBOL_GPL(pin_user_pages_fast);
++ 
++ /**
++  * pin_user_pages_remote() - pin pages of a remote process (task != current)
++  *
++  * For now, this is a placeholder function, until various call sites are
++  * converted to use the correct get_user_pages*() or pin_user_pages*() API. So,
++  * this is identical to get_user_pages_remote().
++  *
++  * This is intended for Case 1 (DIO) in Documentation/vm/pin_user_pages.rst. It
++  * is NOT intended for Case 2 (RDMA: long-term pins).
++  */
++ long pin_user_pages_remote(struct task_struct *tsk, struct mm_struct *mm,
++ 			   unsigned long start, unsigned long nr_pages,
++ 			   unsigned int gup_flags, struct page **pages,
++ 			   struct vm_area_struct **vmas, int *locked)
++ {
++ 	/*
++ 	 * This is a placeholder, until the pin functionality is activated.
++ 	 * Until then, just behave like the corresponding get_user_pages*()
++ 	 * routine.
++ 	 */
++ 	return get_user_pages_remote(tsk, mm, start, nr_pages, gup_flags, pages,
++ 				     vmas, locked);
++ }
++ EXPORT_SYMBOL(pin_user_pages_remote);
++ 
++ /**
++  * pin_user_pages() - pin user pages in memory for use by other devices
++  *
++  * For now, this is a placeholder function, until various call sites are
++  * converted to use the correct get_user_pages*() or pin_user_pages*() API. So,
++  * this is identical to get_user_pages().
++  *
++  * This is intended for Case 1 (DIO) in Documentation/vm/pin_user_pages.rst. It
++  * is NOT intended for Case 2 (RDMA: long-term pins).
++  */
++ long pin_user_pages(unsigned long start, unsigned long nr_pages,
++ 		    unsigned int gup_flags, struct page **pages,
++ 		    struct vm_area_struct **vmas)
++ {
++ 	/*
++ 	 * This is a placeholder, until the pin functionality is activated.
++ 	 * Until then, just behave like the corresponding get_user_pages*()
++ 	 * routine.
++ 	 */
++ 	return get_user_pages(start, nr_pages, gup_flags, pages, vmas);
++ }
++ EXPORT_SYMBOL(pin_user_pages);
+++>>>>>>> 94202f126f69 (mm/gup: require FOLL_GET for get_user_pages_fast())
+* Unmerged path mm/gup.c
