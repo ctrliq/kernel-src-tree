@@ -1,0 +1,510 @@
+IB/mlx5: Add steering SW ICM device memory type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Ariel Levkovich <lariel@mellanox.com>
+commit 25c13324d03d004f9e8071bf5bf5d5c6fdace71e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/25c13324.failed
+
+This patch adds support for allocating, deallocating and registering a new
+device memory type, STEERING_SW_ICM.  This memory can be allocated and
+used by a privileged user for direct rule insertion and management of the
+device's steering tables.
+
+The type is provided by the user via the dedicated attribute in the
+alloc_dm ioctl command.
+
+	Signed-off-by: Ariel Levkovich <lariel@mellanox.com>
+	Reviewed-by: Eli Cohen <eli@mellanox.com>
+	Reviewed-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 25c13324d03d004f9e8071bf5bf5d5c6fdace71e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/cmd.c
+#	drivers/infiniband/hw/mlx5/cmd.h
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	drivers/infiniband/hw/mlx5/mr.c
+#	include/uapi/rdma/mlx5_user_ioctl_verbs.h
+diff --cc drivers/infiniband/hw/mlx5/cmd.c
+index be95ac5aeb30,e3ec79b8f7f5..000000000000
+--- a/drivers/infiniband/hw/mlx5/cmd.c
++++ b/drivers/infiniband/hw/mlx5/cmd.c
+@@@ -157,9 -157,9 +157,13 @@@ int mlx5_cmd_alloc_memic(struct mlx5_me
+  	return -ENOMEM;
+  }
+  
+++<<<<<<< HEAD
+ +int mlx5_cmd_dealloc_memic(struct mlx5_memic *memic, u64 addr, u64 length)
+++=======
++ int mlx5_cmd_dealloc_memic(struct mlx5_dm *dm, phys_addr_t addr, u64 length)
+++>>>>>>> 25c13324d03d (IB/mlx5: Add steering SW ICM device memory type)
+  {
+ -	struct mlx5_core_dev *dev = dm->dev;
+ +	struct mlx5_core_dev *dev = memic->dev;
+  	u64 hw_start_addr = MLX5_CAP64_DEV_MEM(dev, memic_bar_start_addr);
+  	u32 num_pages = DIV_ROUND_UP(length, PAGE_SIZE);
+  	u32 out[MLX5_ST_SZ_DW(dealloc_memic_out)] = {0};
+diff --cc drivers/infiniband/hw/mlx5/cmd.h
+index 923a7b93f507,0572dcba6eae..000000000000
+--- a/drivers/infiniband/hw/mlx5/cmd.h
++++ b/drivers/infiniband/hw/mlx5/cmd.h
+@@@ -44,9 -44,9 +44,13 @@@ int mlx5_cmd_query_cong_params(struct m
+  int mlx5_cmd_query_ext_ppcnt_counters(struct mlx5_core_dev *dev, void *out);
+  int mlx5_cmd_modify_cong_params(struct mlx5_core_dev *mdev,
+  				void *in, int in_size);
+ -int mlx5_cmd_alloc_memic(struct mlx5_dm *dm, phys_addr_t *addr,
+ +int mlx5_cmd_alloc_memic(struct mlx5_memic *memic, phys_addr_t *addr,
+  			 u64 length, u32 alignment);
+++<<<<<<< HEAD
+ +int mlx5_cmd_dealloc_memic(struct mlx5_memic *memic, u64 addr, u64 length);
+++=======
++ int mlx5_cmd_dealloc_memic(struct mlx5_dm *dm, phys_addr_t addr, u64 length);
+++>>>>>>> 25c13324d03d (IB/mlx5: Add steering SW ICM device memory type)
+  void mlx5_cmd_dealloc_pd(struct mlx5_core_dev *dev, u32 pdn, u16 uid);
+  void mlx5_cmd_destroy_tir(struct mlx5_core_dev *dev, u32 tirn, u16 uid);
+  void mlx5_cmd_destroy_tis(struct mlx5_core_dev *dev, u32 tisn, u16 uid);
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 46c0299d6e7a,f9def2dfdba3..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -2270,15 -2264,34 +2270,44 @@@ static int mlx5_ib_mmap(struct ib_ucont
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +struct ib_dm *mlx5_ib_alloc_dm(struct ib_device *ibdev,
+ +			       struct ib_ucontext *context,
+ +			       struct ib_dm_alloc_attr *attr,
+ +			       struct uverbs_attr_bundle *attrs)
+++=======
++ static inline int check_dm_type_support(struct mlx5_ib_dev *dev,
++ 					u32 type)
++ {
++ 	switch (type) {
++ 	case MLX5_IB_UAPI_DM_TYPE_MEMIC:
++ 		if (!MLX5_CAP_DEV_MEM(dev->mdev, memic))
++ 			return -EOPNOTSUPP;
++ 		break;
++ 	case MLX5_IB_UAPI_DM_TYPE_STEERING_SW_ICM:
++ 		if (!capable(CAP_SYS_RAWIO) ||
++ 		    !capable(CAP_NET_RAW))
++ 			return -EPERM;
++ 
++ 		if (!(MLX5_CAP_FLOWTABLE_NIC_RX(dev->mdev, sw_owner) ||
++ 		      MLX5_CAP_FLOWTABLE_NIC_TX(dev->mdev, sw_owner)))
++ 			return -EOPNOTSUPP;
++ 		break;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int handle_alloc_dm_memic(struct ib_ucontext *ctx,
++ 				 struct mlx5_ib_dm *dm,
++ 				 struct ib_dm_alloc_attr *attr,
++ 				 struct uverbs_attr_bundle *attrs)
+++>>>>>>> 25c13324d03d (IB/mlx5: Add steering SW ICM device memory type)
+  {
+ -	struct mlx5_dm *dm_db = &to_mdev(ctx->device)->dm;
+ +	u64 act_size = roundup(attr->length, MLX5_MEMIC_BASE_SIZE);
+ +	struct mlx5_memic *memic = &to_mdev(ibdev)->memic;
+ +	phys_addr_t memic_addr;
+ +	struct mlx5_ib_dm *dm;
+  	u64 start_offset;
+  	u32 page_idx;
+  	int err;
+@@@ -2312,10 -2320,95 +2341,102 @@@
+  	if (err)
+  		goto err_dealloc;
+  
+ +	bitmap_set(to_mucontext(context)->dm_pages, page_idx,
+ +		   DIV_ROUND_UP(act_size, PAGE_SIZE));
+ +
+++<<<<<<< HEAD
+ +	dm->dev_addr = memic_addr;
+++=======
++ 	bitmap_set(to_mucontext(ctx)->dm_pages, page_idx,
++ 		   DIV_ROUND_UP(dm->size, PAGE_SIZE));
++ 
++ 	return 0;
++ 
++ err_dealloc:
++ 	mlx5_cmd_dealloc_memic(dm_db, dm->dev_addr, dm->size);
++ 
++ 	return err;
++ }
++ 
++ static int handle_alloc_dm_sw_icm(struct ib_ucontext *ctx,
++ 				  struct mlx5_ib_dm *dm,
++ 				  struct ib_dm_alloc_attr *attr,
++ 				  struct uverbs_attr_bundle *attrs,
++ 				  int type)
++ {
++ 	struct mlx5_dm *dm_db = &to_mdev(ctx->device)->dm;
++ 	u64 act_size;
++ 	int err;
++ 
++ 	/* Allocation size must a multiple of the basic block size
++ 	 * and a power of 2.
++ 	 */
++ 	act_size = roundup(attr->length, MLX5_SW_ICM_BLOCK_SIZE(dm_db->dev));
++ 	act_size = roundup_pow_of_two(act_size);
++ 
++ 	dm->size = act_size;
++ 	err = mlx5_cmd_alloc_sw_icm(dm_db, type, act_size,
++ 				    to_mucontext(ctx)->devx_uid, &dm->dev_addr,
++ 				    &dm->icm_dm.obj_id);
++ 	if (err)
++ 		return err;
++ 
++ 	err = uverbs_copy_to(attrs,
++ 			     MLX5_IB_ATTR_ALLOC_DM_RESP_START_OFFSET,
++ 			     &dm->dev_addr, sizeof(dm->dev_addr));
++ 	if (err)
++ 		mlx5_cmd_dealloc_sw_icm(dm_db, type, dm->size,
++ 					to_mucontext(ctx)->devx_uid,
++ 					dm->dev_addr, dm->icm_dm.obj_id);
++ 
++ 	return err;
++ }
++ 
++ struct ib_dm *mlx5_ib_alloc_dm(struct ib_device *ibdev,
++ 			       struct ib_ucontext *context,
++ 			       struct ib_dm_alloc_attr *attr,
++ 			       struct uverbs_attr_bundle *attrs)
++ {
++ 	struct mlx5_ib_dm *dm;
++ 	enum mlx5_ib_uapi_dm_type type;
++ 	int err;
++ 
++ 	err = uverbs_get_const_default(&type, attrs,
++ 				       MLX5_IB_ATTR_ALLOC_DM_REQ_TYPE,
++ 				       MLX5_IB_UAPI_DM_TYPE_MEMIC);
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	mlx5_ib_dbg(to_mdev(ibdev), "alloc_dm req: dm_type=%d user_length=0x%llx log_alignment=%d\n",
++ 		    type, attr->length, attr->alignment);
++ 
++ 	err = check_dm_type_support(to_mdev(ibdev), type);
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	dm = kzalloc(sizeof(*dm), GFP_KERNEL);
++ 	if (!dm)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	dm->type = type;
++ 
++ 	switch (type) {
++ 	case MLX5_IB_UAPI_DM_TYPE_MEMIC:
++ 		err = handle_alloc_dm_memic(context, dm,
++ 					    attr,
++ 					    attrs);
++ 		break;
++ 	case MLX5_IB_UAPI_DM_TYPE_STEERING_SW_ICM:
++ 	case MLX5_IB_UAPI_DM_TYPE_HEADER_MODIFY_SW_ICM:
++ 		err = handle_alloc_dm_sw_icm(context, dm, attr, attrs, type);
++ 		break;
++ 	default:
++ 		err = -EOPNOTSUPP;
++ 	}
++ 
++ 	if (err)
++ 		goto err_free;
+++>>>>>>> 25c13324d03d (IB/mlx5: Add steering SW ICM device memory type)
+  
+  	return &dm->ibdm;
+  
+@@@ -2327,24 -2417,40 +2448,52 @@@ err_free
+  	return ERR_PTR(err);
+  }
+  
+ -int mlx5_ib_dealloc_dm(struct ib_dm *ibdm, struct uverbs_attr_bundle *attrs)
+ +int mlx5_ib_dealloc_dm(struct ib_dm *ibdm)
+  {
+++<<<<<<< HEAD
+ +	struct mlx5_memic *memic = &to_mdev(ibdm->device)->memic;
+++=======
++ 	struct mlx5_ib_ucontext *ctx = rdma_udata_to_drv_context(
++ 		&attrs->driver_udata, struct mlx5_ib_ucontext, ibucontext);
++ 	struct mlx5_dm *dm_db = &to_mdev(ibdm->device)->dm;
+++>>>>>>> 25c13324d03d (IB/mlx5: Add steering SW ICM device memory type)
+  	struct mlx5_ib_dm *dm = to_mdm(ibdm);
+ +	u64 act_size = roundup(dm->ibdm.length, MLX5_MEMIC_BASE_SIZE);
+  	u32 page_idx;
+  	int ret;
+  
+ -	switch (dm->type) {
+ -	case MLX5_IB_UAPI_DM_TYPE_MEMIC:
+ -		ret = mlx5_cmd_dealloc_memic(dm_db, dm->dev_addr, dm->size);
+ -		if (ret)
+ -			return ret;
+ +	ret = mlx5_cmd_dealloc_memic(memic, dm->dev_addr, act_size);
+ +	if (ret)
+ +		return ret;
+  
+++<<<<<<< HEAD
+ +	page_idx = (dm->dev_addr - memic->dev->bar_addr -
+ +		    MLX5_CAP64_DEV_MEM(memic->dev, memic_bar_start_addr)) >>
+ +		    PAGE_SHIFT;
+ +	bitmap_clear(to_mucontext(ibdm->uobject->context)->dm_pages,
+ +		     page_idx,
+ +		     DIV_ROUND_UP(act_size, PAGE_SIZE));
+++=======
++ 		page_idx = (dm->dev_addr -
++ 			    pci_resource_start(dm_db->dev->pdev, 0) -
++ 			    MLX5_CAP64_DEV_MEM(dm_db->dev,
++ 					       memic_bar_start_addr)) >>
++ 			   PAGE_SHIFT;
++ 		bitmap_clear(ctx->dm_pages, page_idx,
++ 			     DIV_ROUND_UP(dm->size, PAGE_SIZE));
++ 		break;
++ 	case MLX5_IB_UAPI_DM_TYPE_STEERING_SW_ICM:
++ 	case MLX5_IB_UAPI_DM_TYPE_HEADER_MODIFY_SW_ICM:
++ 		ret = mlx5_cmd_dealloc_sw_icm(dm_db, dm->type, dm->size,
++ 					      ctx->devx_uid, dm->dev_addr,
++ 					      dm->icm_dm.obj_id);
++ 		if (ret)
++ 			return ret;
++ 		break;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
+++>>>>>>> 25c13324d03d (IB/mlx5: Add steering SW ICM device memory type)
+  
+  	kfree(dm);
+  
+@@@ -5845,19 -5971,40 +5994,44 @@@ static struct ib_counters *mlx5_ib_crea
+  	return &mcounters->ibcntrs;
+  }
+  
+ -static void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
+ +void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
+  {
++ 	struct mlx5_core_dev *mdev = dev->mdev;
++ 
+  	mlx5_ib_cleanup_multiport_master(dev);
+  	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
+  		srcu_barrier(&dev->mr_srcu);
+  		cleanup_srcu_struct(&dev->mr_srcu);
+  	}
+++<<<<<<< HEAD
+ +	kfree(dev->port);
+++=======
++ 
++ 	WARN_ON(!bitmap_empty(dev->dm.memic_alloc_pages, MLX5_MAX_MEMIC_PAGES));
++ 
++ 	WARN_ON(dev->dm.steering_sw_icm_alloc_blocks &&
++ 		!bitmap_empty(
++ 			dev->dm.steering_sw_icm_alloc_blocks,
++ 			BIT(MLX5_CAP_DEV_MEM(mdev, log_steering_sw_icm_size) -
++ 			    MLX5_LOG_SW_ICM_BLOCK_SIZE(mdev))));
++ 
++ 	kfree(dev->dm.steering_sw_icm_alloc_blocks);
++ 
++ 	WARN_ON(dev->dm.header_modify_sw_icm_alloc_blocks &&
++ 		!bitmap_empty(dev->dm.header_modify_sw_icm_alloc_blocks,
++ 			      BIT(MLX5_CAP_DEV_MEM(
++ 					  mdev, log_header_modify_sw_icm_size) -
++ 				  MLX5_LOG_SW_ICM_BLOCK_SIZE(mdev))));
++ 
++ 	kfree(dev->dm.header_modify_sw_icm_alloc_blocks);
+++>>>>>>> 25c13324d03d (IB/mlx5: Add steering SW ICM device memory type)
+  }
+  
+ -static int mlx5_ib_stage_init_init(struct mlx5_ib_dev *dev)
+ +int mlx5_ib_stage_init_init(struct mlx5_ib_dev *dev)
+  {
+  	struct mlx5_core_dev *mdev = dev->mdev;
++ 	u64 header_modify_icm_blocks = 0;
++ 	u64 steering_icm_blocks = 0;
+  	int err;
+  	int i;
+  
+@@@ -5905,8 -6050,38 +6079,43 @@@
+  	INIT_LIST_HEAD(&dev->qp_list);
+  	spin_lock_init(&dev->reset_flow_resource_lock);
+  
+++<<<<<<< HEAD
+ +	spin_lock_init(&dev->memic.memic_lock);
+ +	dev->memic.dev = mdev;
+++=======
++ 	if (MLX5_CAP_GEN_64(mdev, general_obj_types) &
++ 	    MLX5_GENERAL_OBJ_TYPES_CAP_SW_ICM) {
++ 		if (MLX5_CAP64_DEV_MEM(mdev, steering_sw_icm_start_address)) {
++ 			steering_icm_blocks =
++ 				BIT(MLX5_CAP_DEV_MEM(mdev,
++ 						     log_steering_sw_icm_size) -
++ 				    MLX5_LOG_SW_ICM_BLOCK_SIZE(mdev));
++ 
++ 			dev->dm.steering_sw_icm_alloc_blocks =
++ 				kcalloc(BITS_TO_LONGS(steering_icm_blocks),
++ 					sizeof(unsigned long), GFP_KERNEL);
++ 			if (!dev->dm.steering_sw_icm_alloc_blocks)
++ 				goto err_mp;
++ 		}
++ 
++ 		if (MLX5_CAP64_DEV_MEM(mdev,
++ 				       header_modify_sw_icm_start_address)) {
++ 			header_modify_icm_blocks = BIT(
++ 				MLX5_CAP_DEV_MEM(
++ 					mdev, log_header_modify_sw_icm_size) -
++ 				MLX5_LOG_SW_ICM_BLOCK_SIZE(mdev));
++ 
++ 			dev->dm.header_modify_sw_icm_alloc_blocks =
++ 				kcalloc(BITS_TO_LONGS(header_modify_icm_blocks),
++ 					sizeof(unsigned long), GFP_KERNEL);
++ 			if (!dev->dm.header_modify_sw_icm_alloc_blocks)
++ 				goto err_dm;
++ 		}
++ 	}
++ 
++ 	spin_lock_init(&dev->dm.lock);
++ 	dev->dm.dev = mdev;
+++>>>>>>> 25c13324d03d (IB/mlx5: Add steering SW ICM device memory type)
+  
+  	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
+  		err = init_srcu_struct(&dev->mr_srcu);
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 37022aa82058,40eb8be482e4..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -551,16 -559,29 +555,32 @@@ enum mlx5_ib_mtt_access_flags 
+  struct mlx5_ib_dm {
+  	struct ib_dm		ibdm;
+  	phys_addr_t		dev_addr;
+++<<<<<<< HEAD
+++=======
++ 	u32			type;
++ 	size_t			size;
++ 	union {
++ 		struct {
++ 			u32	obj_id;
++ 		} icm_dm;
++ 		/* other dm types specific params should be added here */
++ 	};
+++>>>>>>> 25c13324d03d (IB/mlx5: Add steering SW ICM device memory type)
+  };
+  
+  #define MLX5_IB_MTT_PRESENT (MLX5_IB_MTT_READ | MLX5_IB_MTT_WRITE)
+  
+ -#define MLX5_IB_DM_MEMIC_ALLOWED_ACCESS (IB_ACCESS_LOCAL_WRITE   |\
+ -					 IB_ACCESS_REMOTE_WRITE  |\
+ -					 IB_ACCESS_REMOTE_READ   |\
+ -					 IB_ACCESS_REMOTE_ATOMIC |\
+ -					 IB_ZERO_BASED)
+ +#define MLX5_IB_DM_ALLOWED_ACCESS (IB_ACCESS_LOCAL_WRITE   |\
+ +				   IB_ACCESS_REMOTE_WRITE  |\
+ +				   IB_ACCESS_REMOTE_READ   |\
+ +				   IB_ACCESS_REMOTE_ATOMIC |\
+ +				   IB_ZERO_BASED)
+  
++ #define MLX5_IB_DM_SW_ICM_ALLOWED_ACCESS (IB_ACCESS_LOCAL_WRITE   |\
++ 					  IB_ACCESS_REMOTE_WRITE  |\
++ 					  IB_ACCESS_REMOTE_READ   |\
++ 					  IB_ZERO_BASED)
++ 
+  struct mlx5_ib_mr {
+  	struct ib_mr		ibmr;
+  	void			*descs;
+@@@ -844,10 -861,16 +864,12 @@@ struct mlx5_ib_flow_action 
+  	};
+  };
+  
+ -struct mlx5_dm {
+ +struct mlx5_memic {
+  	struct mlx5_core_dev *dev;
+ -	/* This lock is used to protect the access to the shared
+ -	 * allocation map when concurrent requests by different
+ -	 * processes are handled.
+ -	 */
+ -	spinlock_t lock;
+ +	spinlock_t		memic_lock;
+  	DECLARE_BITMAP(memic_alloc_pages, MLX5_MAX_MEMIC_PAGES);
++ 	unsigned long *steering_sw_icm_alloc_blocks;
++ 	unsigned long *header_modify_sw_icm_alloc_blocks;
+  };
+  
+  struct mlx5_read_counters_attr {
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index 0a633d06794a,5f09699fab98..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -1270,15 -1235,31 +1270,34 @@@ struct ib_mr *mlx5_ib_reg_dm_mr(struct 
+  				struct uverbs_attr_bundle *attrs)
+  {
+  	struct mlx5_ib_dm *mdm = to_mdm(dm);
+ -	struct mlx5_core_dev *dev = to_mdev(dm->device)->mdev;
+ -	u64 start_addr = mdm->dev_addr + attr->offset;
+ -	int mode;
+ +	u64 memic_addr;
+  
+++<<<<<<< HEAD
+ +	if (attr->access_flags & ~MLX5_IB_DM_ALLOWED_ACCESS)
+++=======
++ 	switch (mdm->type) {
++ 	case MLX5_IB_UAPI_DM_TYPE_MEMIC:
++ 		if (attr->access_flags & ~MLX5_IB_DM_MEMIC_ALLOWED_ACCESS)
++ 			return ERR_PTR(-EINVAL);
++ 
++ 		mode = MLX5_MKC_ACCESS_MODE_MEMIC;
++ 		start_addr -= pci_resource_start(dev->pdev, 0);
++ 		break;
++ 	case MLX5_IB_UAPI_DM_TYPE_STEERING_SW_ICM:
++ 	case MLX5_IB_UAPI_DM_TYPE_HEADER_MODIFY_SW_ICM:
++ 		if (attr->access_flags & ~MLX5_IB_DM_SW_ICM_ALLOWED_ACCESS)
++ 			return ERR_PTR(-EINVAL);
++ 
++ 		mode = MLX5_MKC_ACCESS_MODE_SW_ICM;
++ 		break;
++ 	default:
+++>>>>>>> 25c13324d03d (IB/mlx5: Add steering SW ICM device memory type)
+  		return ERR_PTR(-EINVAL);
+ -	}
+  
+ -	return mlx5_ib_get_dm_mr(pd, start_addr, attr->length,
+ -				 attr->access_flags, mode);
+ +	memic_addr = mdm->dev_addr + attr->offset;
+ +
+ +	return mlx5_ib_get_memic_mr(pd, memic_addr, attr->length,
+ +				    attr->access_flags);
+  }
+  
+  struct ib_mr *mlx5_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+diff --cc include/uapi/rdma/mlx5_user_ioctl_verbs.h
+index 173ec938ff3a,a8f34c237458..000000000000
+--- a/include/uapi/rdma/mlx5_user_ioctl_verbs.h
++++ b/include/uapi/rdma/mlx5_user_ioctl_verbs.h
+@@@ -52,5 -52,16 +52,19 @@@ enum mlx5_ib_uapi_flow_action_packet_re
+  	MLX5_IB_UAPI_FLOW_ACTION_PACKET_REFORMAT_TYPE_L2_TO_L3_TUNNEL = 0x3,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5_ib_uapi_devx_async_cmd_hdr {
++ 	__aligned_u64	wr_id;
++ 	__u8		out_data[];
++ };
++ 
++ enum mlx5_ib_uapi_dm_type {
++ 	MLX5_IB_UAPI_DM_TYPE_MEMIC,
++ 	MLX5_IB_UAPI_DM_TYPE_STEERING_SW_ICM,
++ 	MLX5_IB_UAPI_DM_TYPE_HEADER_MODIFY_SW_ICM,
++ };
++ 
+++>>>>>>> 25c13324d03d (IB/mlx5: Add steering SW ICM device memory type)
+  #endif
+  
+* Unmerged path drivers/infiniband/hw/mlx5/cmd.c
+* Unmerged path drivers/infiniband/hw/mlx5/cmd.h
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
+* Unmerged path include/uapi/rdma/mlx5_user_ioctl_verbs.h
