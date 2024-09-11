@@ -1,0 +1,335 @@
+drm/i915/tc: Fix TypeC PHY connect/disconnect logic on ADL-P
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Imre Deak <imre.deak@intel.com>
+commit 3e0abc7661c82266d3a3f27fbbadcc74cc4997e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/3e0abc76.failed
+
+So far TC-cold was blocked only for the duration of TypeC mode resets.
+The DP-alt and legacy modes require TC-cold to be blocked also whenever
+the port is in use (AUX transfers, enable modeset), and this was ensured
+by the held PHY ownership flag. On ADL-P this doesn't work, since the
+PHY ownership flag is in a register backed by the PW#2 power well.
+Whenever this power well is disabled the ownership flag is cleared by
+the HW under the driver.
+
+The only way to cleanly release and re-acquire the PHY ownership flag
+and also allow for power saving (by disabling the display power wells
+and reaching DC5/6 states) is to hold the TC-cold blocking power domains
+while the PHY is connected and disconnect/reconnect the PHY on-demand
+around AUX transfers and modeset enable/disables. Let's do that,
+disconnecting a PHY with a 1 sec delay after it becomes idle. For
+consistency do this on all platforms and TypeC modes.
+
+v2: Add tc_mode!=disconnected and phy_is_owned asserts to
+    __intel_tc_port_lock().
+
+	Cc: José Roberto de Souza <jose.souza@intel.com>
+	Signed-off-by: Imre Deak <imre.deak@intel.com>
+	Reviewed-by: José Roberto de Souza <jose.souza@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210929132833.2253961-6-imre.deak@intel.com
+(cherry picked from commit 3e0abc7661c82266d3a3f27fbbadcc74cc4997e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_ddi.c
+#	drivers/gpu/drm/i915/display/intel_display_types.h
+#	drivers/gpu/drm/i915/display/intel_tc.c
+#	drivers/gpu/drm/i915/display/intel_tc.h
+diff --cc drivers/gpu/drm/i915/display/intel_ddi.c
+index 0f72647ed48c,51d07e9af9f3..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@@ -5177,9 -4015,14 +5177,16 @@@ static int intel_ddi_compute_config_lat
+  
+  static void intel_ddi_encoder_destroy(struct drm_encoder *encoder)
+  {
+ -	struct drm_i915_private *i915 = to_i915(encoder->dev);
+  	struct intel_digital_port *dig_port = enc_to_dig_port(to_intel_encoder(encoder));
++ 	enum phy phy = intel_port_to_phy(i915, dig_port->base.port);
+  
+  	intel_dp_encoder_flush_work(encoder);
+++<<<<<<< HEAD
+++=======
++ 	if (intel_phy_is_tc(i915, phy))
++ 		intel_tc_port_flush_work(dig_port);
++ 	intel_display_power_flush_work(i915);
+++>>>>>>> 3e0abc7661c8 (drm/i915/tc: Fix TypeC PHY connect/disconnect logic on ADL-P)
+  
+  	drm_encoder_cleanup(encoder);
+  	if (dig_port)
+@@@ -5581,12 -4434,34 +5588,36 @@@ static bool intel_ddi_is_tc(struct drm_
+  		return false;
+  }
+  
+ -static void intel_ddi_encoder_suspend(struct intel_encoder *encoder)
+ +static enum hpd_pin skl_hpd_pin(struct drm_i915_private *dev_priv, enum port port)
+  {
+ -	struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
+ -	struct drm_i915_private *i915 = dp_to_i915(intel_dp);
+ -	struct intel_digital_port *dig_port = dp_to_dig_port(intel_dp);
+ -	enum phy phy = intel_port_to_phy(i915, encoder->port);
+ +	if (HAS_PCH_TGP(dev_priv))
+ +		return icl_hpd_pin(dev_priv, port);
+  
+++<<<<<<< HEAD
+ +	return HPD_PORT_A + port - PORT_A;
+++=======
++ 	intel_dp_encoder_suspend(encoder);
++ 
++ 	if (!intel_phy_is_tc(i915, phy))
++ 		return;
++ 
++ 	intel_tc_port_flush_work(dig_port);
++ }
++ 
++ static void intel_ddi_encoder_shutdown(struct intel_encoder *encoder)
++ {
++ 	struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
++ 	struct drm_i915_private *i915 = dp_to_i915(intel_dp);
++ 	struct intel_digital_port *dig_port = dp_to_dig_port(intel_dp);
++ 	enum phy phy = intel_port_to_phy(i915, encoder->port);
++ 
++ 	intel_dp_encoder_shutdown(encoder);
++ 
++ 	if (!intel_phy_is_tc(i915, phy))
++ 		return;
++ 
++ 	intel_tc_port_flush_work(dig_port);
+++>>>>>>> 3e0abc7661c8 (drm/i915/tc: Fix TypeC PHY connect/disconnect logic on ADL-P)
+  }
+  
+  #define port_tc_name(port) ((port) - PORT_TC1 + '1')
+diff --cc drivers/gpu/drm/i915/display/intel_display_types.h
+index cc8308e725ba,632391197937..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@@ -1550,8 -1662,11 +1550,13 @@@ struct intel_digital_port 
+  	enum intel_display_power_domain ddi_io_power_domain;
+  	intel_wakeref_t ddi_io_wakeref;
+  	intel_wakeref_t aux_wakeref;
+ -
+  	struct mutex tc_lock;	/* protects the TypeC port mode */
+  	intel_wakeref_t tc_lock_wakeref;
+++<<<<<<< HEAD
+++=======
++ 	enum intel_display_power_domain tc_lock_power_domain;
++ 	struct delayed_work tc_disconnect_phy_work;
+++>>>>>>> 3e0abc7661c8 (drm/i915/tc: Fix TypeC PHY connect/disconnect logic on ADL-P)
+  	int tc_link_refcount;
+  	bool tc_legacy_port:1;
+  	char tc_port_name[8];
+diff --cc drivers/gpu/drm/i915/display/intel_tc.c
+index 2cefc13535a0,66cb321a4488..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_tc.c
++++ b/drivers/gpu/drm/i915/display/intel_tc.c
+@@@ -473,6 -639,43 +473,46 @@@ static void intel_tc_port_reset_mode(st
+  		    tc_port_mode_name(dig_port->tc_mode));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool intel_tc_port_needs_reset(struct intel_digital_port *dig_port)
++ {
++ 	return intel_tc_port_get_target_mode(dig_port) != dig_port->tc_mode;
++ }
++ 
++ static void intel_tc_port_update_mode(struct intel_digital_port *dig_port,
++ 				      int required_lanes, bool force_disconnect)
++ {
++ 	enum intel_display_power_domain domain;
++ 	intel_wakeref_t wref;
++ 	bool needs_reset = force_disconnect;
++ 
++ 	if (!needs_reset) {
++ 		/* Get power domain required to check the hotplug live status. */
++ 		wref = tc_cold_block(dig_port, &domain);
++ 		needs_reset = intel_tc_port_needs_reset(dig_port);
++ 		tc_cold_unblock(dig_port, domain, wref);
++ 	}
++ 
++ 	if (!needs_reset)
++ 		return;
++ 
++ 	/* Get power domain required for resetting the mode. */
++ 	wref = tc_cold_block_in_mode(dig_port, TC_PORT_DISCONNECTED, &domain);
++ 
++ 	intel_tc_port_reset_mode(dig_port, required_lanes, force_disconnect);
++ 
++ 	/* Get power domain matching the new mode after reset. */
++ 	tc_cold_unblock(dig_port, dig_port->tc_lock_power_domain,
++ 			fetch_and_zero(&dig_port->tc_lock_wakeref));
++ 	if (dig_port->tc_mode != TC_PORT_DISCONNECTED)
++ 		dig_port->tc_lock_wakeref = tc_cold_block(dig_port,
++ 							  &dig_port->tc_lock_power_domain);
++ 
++ 	tc_cold_unblock(dig_port, domain, wref);
++ }
++ 
+++>>>>>>> 3e0abc7661c8 (drm/i915/tc: Fix TypeC PHY connect/disconnect logic on ADL-P)
+  static void
+  intel_tc_port_link_init_refcount(struct intel_digital_port *dig_port,
+  				 int refcount)
+@@@ -499,20 -699,26 +539,32 @@@ void intel_tc_port_sanitize(struct inte
+  	else if (encoder->base.crtc)
+  		active_links = to_intel_crtc(encoder->base.crtc)->active;
+  
+++<<<<<<< HEAD
+++=======
++ 	drm_WARN_ON(&i915->drm, dig_port->tc_mode != TC_PORT_DISCONNECTED);
++ 	drm_WARN_ON(&i915->drm, dig_port->tc_lock_wakeref);
+++>>>>>>> 3e0abc7661c8 (drm/i915/tc: Fix TypeC PHY connect/disconnect logic on ADL-P)
+  	if (active_links) {
+ -		enum intel_display_power_domain domain;
+ -		intel_wakeref_t tc_cold_wref = tc_cold_block(dig_port, &domain);
+ -
+ -		dig_port->tc_mode = intel_tc_port_get_current_mode(dig_port);
+ -
+  		if (!icl_tc_phy_is_connected(dig_port))
+  			drm_dbg_kms(&i915->drm,
+  				    "Port %s: PHY disconnected with %d active link(s)\n",
+  				    dig_port->tc_port_name, active_links);
+  		intel_tc_port_link_init_refcount(dig_port, active_links);
+  
+++<<<<<<< HEAD
+ +		goto out;
+++=======
++ 		dig_port->tc_lock_wakeref = tc_cold_block(dig_port,
++ 							  &dig_port->tc_lock_power_domain);
++ 
++ 		tc_cold_unblock(dig_port, domain, tc_cold_wref);
+++>>>>>>> 3e0abc7661c8 (drm/i915/tc: Fix TypeC PHY connect/disconnect logic on ADL-P)
+  	}
+  
+ +	if (dig_port->tc_legacy_port)
+ +		icl_tc_phy_connect(dig_port, 1);
+ +
+ +out:
+  	drm_dbg_kms(&i915->drm, "Port %s: sanitize mode (%s)\n",
+  		    dig_port->tc_port_name,
+  		    tc_port_mode_name(dig_port->tc_mode));
+@@@ -561,38 -762,61 +613,83 @@@ static void __intel_tc_port_lock(struc
+  
+  	mutex_lock(&dig_port->tc_lock);
+  
+++<<<<<<< HEAD
+ +	if (!dig_port->tc_link_refcount) {
+ +		intel_wakeref_t tc_cold_wref;
+ +
+ +		tc_cold_wref = tc_cold_block(dig_port);
+ +
+ +		if (intel_tc_port_needs_reset(dig_port))
+ +			intel_tc_port_reset_mode(dig_port, required_lanes);
+ +
+ +		tc_cold_unblock(dig_port, tc_cold_wref);
+ +	}
+++=======
++ 	cancel_delayed_work(&dig_port->tc_disconnect_phy_work);
+  
+- 	drm_WARN_ON(&i915->drm, dig_port->tc_lock_wakeref);
+- 	dig_port->tc_lock_wakeref = wakeref;
++ 	if (!dig_port->tc_link_refcount)
++ 		intel_tc_port_update_mode(dig_port, required_lanes,
++ 					  false);
+++>>>>>>> 3e0abc7661c8 (drm/i915/tc: Fix TypeC PHY connect/disconnect logic on ADL-P)
++ 
++ 	drm_WARN_ON(&i915->drm, dig_port->tc_mode == TC_PORT_DISCONNECTED);
++ 	drm_WARN_ON(&i915->drm, dig_port->tc_mode != TC_PORT_TBT_ALT &&
++ 				!tc_phy_is_owned(dig_port));
+  }
+  
+  void intel_tc_port_lock(struct intel_digital_port *dig_port)
+  {
+  	__intel_tc_port_lock(dig_port, 1);
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ /**
++  * intel_tc_port_disconnect_phy_work: disconnect TypeC PHY from display port
++  * @dig_port: digital port
++  *
++  * Disconnect the given digital port from its TypeC PHY (handing back the
++  * control of the PHY to the TypeC subsystem). This will happen in a delayed
++  * manner after each aux transactions and modeset disables.
++  */
++ static void intel_tc_port_disconnect_phy_work(struct work_struct *work)
++ {
++ 	struct intel_digital_port *dig_port =
++ 		container_of(work, struct intel_digital_port, tc_disconnect_phy_work.work);
++ 
++ 	mutex_lock(&dig_port->tc_lock);
++ 
++ 	if (!dig_port->tc_link_refcount)
++ 		intel_tc_port_update_mode(dig_port, 1, true);
++ 
++ 	mutex_unlock(&dig_port->tc_lock);
++ }
++ 
++ /**
++  * intel_tc_port_flush_work: flush the work disconnecting the PHY
++  * @dig_port: digital port
++  *
++  * Flush the delayed work disconnecting an idle PHY.
++  */
++ void intel_tc_port_flush_work(struct intel_digital_port *dig_port)
++ {
++ 	flush_delayed_work(&dig_port->tc_disconnect_phy_work);
+++>>>>>>> 3e0abc7661c8 (drm/i915/tc: Fix TypeC PHY connect/disconnect logic on ADL-P)
+  }
+  
+  void intel_tc_port_unlock(struct intel_digital_port *dig_port)
+  {
+- 	struct drm_i915_private *i915 = to_i915(dig_port->base.base.dev);
+- 	intel_wakeref_t wakeref = fetch_and_zero(&dig_port->tc_lock_wakeref);
++ 	if (!dig_port->tc_link_refcount && dig_port->tc_mode != TC_PORT_DISCONNECTED)
++ 		queue_delayed_work(system_unbound_wq, &dig_port->tc_disconnect_phy_work,
++ 				   msecs_to_jiffies(1000));
+  
+  	mutex_unlock(&dig_port->tc_lock);
+++<<<<<<< HEAD
+ +
+ +	intel_display_power_put_async(i915, POWER_DOMAIN_DISPLAY_CORE,
+ +				      wakeref);
+++=======
+++>>>>>>> 3e0abc7661c8 (drm/i915/tc: Fix TypeC PHY connect/disconnect logic on ADL-P)
+  }
+  
+  bool intel_tc_port_ref_held(struct intel_digital_port *dig_port)
+@@@ -666,7 -893,9 +763,8 @@@ void intel_tc_port_init(struct intel_di
+  		 "%c/TC#%d", port_name(port), tc_port + 1);
+  
+  	mutex_init(&dig_port->tc_lock);
++ 	INIT_DELAYED_WORK(&dig_port->tc_disconnect_phy_work, intel_tc_port_disconnect_phy_work);
+  	dig_port->tc_legacy_port = is_legacy;
+ -	dig_port->tc_mode = TC_PORT_DISCONNECTED;
+  	dig_port->tc_link_refcount = 0;
+  	tc_port_load_fia_params(i915, dig_port);
+  }
+diff --cc drivers/gpu/drm/i915/display/intel_tc.h
+index b619e4736f85,6b47b29f551c..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_tc.h
++++ b/drivers/gpu/drm/i915/display/intel_tc.h
+@@@ -12,7 -12,12 +12,11 @@@
+  struct intel_digital_port;
+  struct intel_encoder;
+  
+ -bool intel_tc_port_in_tbt_alt_mode(struct intel_digital_port *dig_port);
+ -bool intel_tc_port_in_dp_alt_mode(struct intel_digital_port *dig_port);
+ -bool intel_tc_port_in_legacy_mode(struct intel_digital_port *dig_port);
+ -
+  bool intel_tc_port_connected(struct intel_encoder *encoder);
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> 3e0abc7661c8 (drm/i915/tc: Fix TypeC PHY connect/disconnect logic on ADL-P)
+  u32 intel_tc_port_get_lane_mask(struct intel_digital_port *dig_port);
+  u32 intel_tc_port_get_pin_assignment_mask(struct intel_digital_port *dig_port);
+  int intel_tc_port_fia_max_lane_count(struct intel_digital_port *dig_port);
+* Unmerged path drivers/gpu/drm/i915/display/intel_ddi.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_display_types.h
+* Unmerged path drivers/gpu/drm/i915/display/intel_tc.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_tc.h
