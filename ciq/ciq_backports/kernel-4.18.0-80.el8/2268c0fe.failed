@@ -1,0 +1,202 @@
+blkcg: introduce common blkg association logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Dennis Zhou <dennis@kernel.org>
+commit 2268c0feb0ffb1c1bb6e1d4d5505d30f485aa77b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/2268c0fe.failed
+
+There are 3 ways blkg association can happen: association with the
+current css, with the page css (swap), or from the wbc css (writeback).
+
+This patch handles how association is done for the first case where we
+are associating bsaed on the current css. If there is already a blkg
+associated, the css will be reused and association will be redone as the
+request_queue may have changed.
+
+	Signed-off-by: Dennis Zhou <dennis@kernel.org>
+	Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 2268c0feb0ffb1c1bb6e1d4d5505d30f485aa77b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/bio.c
+#	block/blk-iolatency.c
+#	block/blk-throttle.c
+diff --cc block/bio.c
+index 8d70c85b6b8f,452b8e79b998..000000000000
+--- a/block/bio.c
++++ b/block/bio.c
+@@@ -2009,22 -2009,69 +2009,77 @@@ int bio_associate_blkcg(struct bio *bio
+  EXPORT_SYMBOL_GPL(bio_associate_blkcg);
+  
+  /**
+++<<<<<<< HEAD
+ + * bio_associate_blkg - associate a bio with the specified blkg
+++=======
++  * bio_disassociate_blkg - puts back the blkg reference if associated
++  * @bio: target bio
++  *
++  * Helper to disassociate the blkg from @bio if a blkg is associated.
++  */
++ void bio_disassociate_blkg(struct bio *bio)
++ {
++ 	if (bio->bi_blkg) {
++ 		blkg_put(bio->bi_blkg);
++ 		bio->bi_blkg = NULL;
++ 	}
++ }
++ 
++ /**
++  * __bio_associate_blkg - associate a bio with the a blkg
+++>>>>>>> 2268c0feb0ff (blkcg: introduce common blkg association logic)
+   * @bio: target bio
+   * @blkg: the blkg to associate
+   *
+ - * This tries to associate @bio with the specified @blkg.  Association failure
+ - * is handled by walking up the blkg tree.  Therefore, the blkg associated can
+ - * be anything between @blkg and the root_blkg.  This situation only happens
+ - * when a cgroup is dying and then the remaining bios will spill to the closest
+ - * alive blkg.
+ - *
+ - * A reference will be taken on the @blkg and will be released when @bio is
+ - * freed.
+ + * Associate @bio with the blkg specified by @blkg.  This is the queue specific
+ + * blkcg information associated with the @bio, a reference will be taken on the
+ + * @blkg and will be freed when the bio is freed.
+   */
+- int bio_associate_blkg(struct bio *bio, struct blkcg_gq *blkg)
++ static void __bio_associate_blkg(struct bio *bio, struct blkcg_gq *blkg)
+  {
+++<<<<<<< HEAD
+ +	if (unlikely(bio->bi_blkg))
+ +		return -EBUSY;
+ +	if (!blkg_try_get(blkg))
+ +		return -ENODEV;
+ +	bio->bi_blkg = blkg;
+ +	return 0;
+++=======
++ 	bio_disassociate_blkg(bio);
++ 
++ 	bio->bi_blkg = blkg_try_get_closest(blkg);
++ }
++ 
++ /**
++  * bio_associate_blkg - associate a bio with a blkg
++  * @bio: target bio
++  *
++  * Associate @bio with the blkg found from the bio's css and request_queue.
++  * If one is not found, bio_lookup_blkg() creates the blkg.  If a blkg is
++  * already associated, the css is reused and association redone as the
++  * request_queue may have changed.
++  */
++ void bio_associate_blkg(struct bio *bio)
++ {
++ 	struct request_queue *q = bio->bi_disk->queue;
++ 	struct blkcg *blkcg;
++ 	struct blkcg_gq *blkg;
++ 
++ 	rcu_read_lock();
++ 
++ 	bio_associate_blkcg(bio, NULL);
++ 	blkcg = bio_blkcg(bio);
++ 
++ 	if (!blkcg->css.parent) {
++ 		__bio_associate_blkg(bio, q->root_blkg);
++ 	} else {
++ 		blkg = blkg_lookup_create(blkcg, q);
++ 
++ 		__bio_associate_blkg(bio, blkg);
++ 	}
++ 
++ 	rcu_read_unlock();
+++>>>>>>> 2268c0feb0ff (blkcg: introduce common blkg association logic)
+  }
+  
+  /**
+diff --cc block/blk-iolatency.c
+index 171f7ae1a396,cdbd10564e66..000000000000
+--- a/block/blk-iolatency.c
++++ b/block/blk-iolatency.c
+@@@ -393,24 -478,10 +391,31 @@@ static void blkcg_iolatency_throttle(st
+  	if (!blk_iolatency_enabled(blkiolat))
+  		return;
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	bio_associate_blkcg(bio, NULL);
+ +	blkcg = bio_blkcg(bio);
+ +	blkg = blkg_lookup(blkcg, q);
+ +	if (unlikely(!blkg)) {
+ +		spin_lock_irq(q->queue_lock);
+ +		blkg = blkg_lookup_create(blkcg, q);
+ +		if (IS_ERR(blkg))
+ +			blkg = NULL;
+ +		spin_unlock_irq(q->queue_lock);
+ +	}
+ +	if (!blkg)
+ +		goto out;
+ +
+ +	bio_issue_init(&bio->bi_issue, bio_sectors(bio));
+ +	bio_associate_blkg(bio, blkg);
+ +out:
+ +	rcu_read_unlock();
+++=======
++ 	bio_associate_blkg(bio);
++ 	blkg = bio->bi_blkg;
++ 	bio_issue_init(&bio->bi_issue, bio_sectors(bio));
++ 
+++>>>>>>> 2268c0feb0ff (blkcg: introduce common blkg association logic)
+  	while (blkg && blkg->parent) {
+  		struct iolatency_grp *iolat = blkg_to_lat(blkg);
+  		if (!iolat) {
+diff --cc block/blk-throttle.c
+index 07f1b008e5ab,228c3a007ebc..000000000000
+--- a/block/blk-throttle.c
++++ b/block/blk-throttle.c
+@@@ -2113,12 -2115,10 +2113,16 @@@ static inline void throtl_update_latenc
+  }
+  #endif
+  
+- static void blk_throtl_assoc_bio(struct throtl_grp *tg, struct bio *bio)
++ static void blk_throtl_assoc_bio(struct bio *bio)
+  {
+  #ifdef CONFIG_BLK_DEV_THROTTLING_LOW
+++<<<<<<< HEAD
+ +	/* fallback to root_blkg if we fail to get a blkg ref */
+ +	if (bio->bi_css && (bio_associate_blkg(bio, tg_to_blkg(tg)) == -ENODEV))
+ +		bio_associate_blkg(bio, bio->bi_disk->queue->root_blkg);
+++=======
++ 	bio_associate_blkg(bio);
+++>>>>>>> 2268c0feb0ff (blkcg: introduce common blkg association logic)
+  	bio_issue_init(&bio->bi_issue, bio_sectors(bio));
+  #endif
+  }
+* Unmerged path block/bio.c
+* Unmerged path block/blk-iolatency.c
+* Unmerged path block/blk-throttle.c
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index 056fb627edb3..62715a5a4f32 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -511,12 +511,15 @@ static inline int bio_associate_blkcg_from_page(struct bio *bio,
+ 
+ #ifdef CONFIG_BLK_CGROUP
+ int bio_associate_blkcg(struct bio *bio, struct cgroup_subsys_state *blkcg_css);
+-int bio_associate_blkg(struct bio *bio, struct blkcg_gq *blkg);
++void bio_disassociate_blkg(struct bio *bio);
++void bio_associate_blkg(struct bio *bio);
+ void bio_disassociate_task(struct bio *bio);
+ void bio_clone_blkcg_association(struct bio *dst, struct bio *src);
+ #else	/* CONFIG_BLK_CGROUP */
+ static inline int bio_associate_blkcg(struct bio *bio,
+ 			struct cgroup_subsys_state *blkcg_css) { return 0; }
++static inline void bio_disassociate_blkg(struct bio *bio) { }
++static inline void bio_associate_blkg(struct bio *bio) { }
+ static inline void bio_disassociate_task(struct bio *bio) { }
+ static inline void bio_clone_blkcg_association(struct bio *dst,
+ 			struct bio *src) { }
