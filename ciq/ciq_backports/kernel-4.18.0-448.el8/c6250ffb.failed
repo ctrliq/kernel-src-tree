@@ -1,0 +1,147 @@
+vfio/mdev: Pass in a struct vfio_device * to vfio_dma_rw()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+Rebuild_CHGLOG: - Revert "vfio/mdev: Pass in a struct vfio_device * to vfio_dma_rw()" (Jocelyn Falempe) [2115880]
+Rebuild_FUZZ: 92.80%
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit c6250ffbacc5989a5db3b9acce34b93570938f60
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/c6250ffb.failed
+
+Every caller has a readily available vfio_device pointer, use that instead
+of passing in a generic struct device. Change vfio_dma_rw() to take in the
+struct vfio_device and move the container users that would have been held
+by vfio_group_get_external_user_from_dev() to vfio_dma_rw() directly, like
+vfio_pin/unpin_pages().
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Link: https://lore.kernel.org/r/4-v4-8045e76bf00b+13d-vfio_mdev_no_group_jgg@nvidia.com
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit c6250ffbacc5989a5db3b9acce34b93570938f60)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gvt/gvt.h
+diff --cc drivers/gpu/drm/i915/gvt/gvt.h
+index 0c0615602343,5a28ee965b7f..000000000000
+--- a/drivers/gpu/drm/i915/gvt/gvt.h
++++ b/drivers/gpu/drm/i915/gvt/gvt.h
+@@@ -724,6 -717,42 +724,45 @@@ static inline bool intel_gvt_mmio_is_cm
+  	return gvt->mmio.mmio_attribute[offset >> 2] & F_CMD_WRITE_PATCH;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * intel_gvt_read_gpa - copy data from GPA to host data buffer
++  * @vgpu: a vGPU
++  * @gpa: guest physical address
++  * @buf: host data buffer
++  * @len: data length
++  *
++  * Returns:
++  * Zero on success, negative error code if failed.
++  */
++ static inline int intel_gvt_read_gpa(struct intel_vgpu *vgpu, unsigned long gpa,
++ 		void *buf, unsigned long len)
++ {
++ 	if (!vgpu->attached)
++ 		return -ESRCH;
++ 	return vfio_dma_rw(&vgpu->vfio_device, gpa, buf, len, false);
++ }
++ 
++ /**
++  * intel_gvt_write_gpa - copy data from host data buffer to GPA
++  * @vgpu: a vGPU
++  * @gpa: guest physical address
++  * @buf: host data buffer
++  * @len: data length
++  *
++  * Returns:
++  * Zero on success, negative error code if failed.
++  */
++ static inline int intel_gvt_write_gpa(struct intel_vgpu *vgpu,
++ 		unsigned long gpa, void *buf, unsigned long len)
++ {
++ 	if (!vgpu->attached)
++ 		return -ESRCH;
++ 	return vfio_dma_rw(&vgpu->vfio_device, gpa, buf, len, true);
++ }
++ 
+++>>>>>>> c6250ffbacc5 (vfio/mdev: Pass in a struct vfio_device * to vfio_dma_rw())
+  void intel_gvt_debugfs_remove_vgpu(struct intel_vgpu *vgpu);
+  void intel_gvt_debugfs_init(struct intel_gvt *gvt);
+  void intel_gvt_debugfs_clean(struct intel_gvt *gvt);
+* Unmerged path drivers/gpu/drm/i915/gvt/gvt.h
+diff --git a/drivers/vfio/vfio.c b/drivers/vfio/vfio.c
+index 6b6579dad759..bf1ae19d403d 100644
+--- a/drivers/vfio/vfio.c
++++ b/drivers/vfio/vfio.c
+@@ -2129,32 +2129,28 @@ EXPORT_SYMBOL(vfio_group_unpin_pages);
+  * As the read/write of user space memory is conducted via the CPUs and is
+  * not a real device DMA, it is not necessary to pin the user space memory.
+  *
+- * The caller needs to call vfio_group_get_external_user() or
+- * vfio_group_get_external_user_from_dev() prior to calling this interface,
+- * so as to prevent the VFIO group from disposal in the middle of the call.
+- * But it can keep the reference to the VFIO group for several calls into
+- * this interface.
+- * After finishing using of the VFIO group, the caller needs to release the
+- * VFIO group by calling vfio_group_put_external_user().
+- *
+- * @group [in]		: VFIO group
++ * @device [in]		: VFIO device
+  * @user_iova [in]	: base IOVA of a user space buffer
+  * @data [in]		: pointer to kernel buffer
+  * @len [in]		: kernel buffer length
+  * @write		: indicate read or write
+  * Return error code on failure or 0 on success.
+  */
+-int vfio_dma_rw(struct vfio_group *group, dma_addr_t user_iova,
+-		void *data, size_t len, bool write)
++int vfio_dma_rw(struct vfio_device *device, dma_addr_t user_iova, void *data,
++		size_t len, bool write)
+ {
+ 	struct vfio_container *container;
+ 	struct vfio_iommu_driver *driver;
+ 	int ret = 0;
+ 
+-	if (!group || !data || len <= 0)
++	if (!data || len <= 0)
+ 		return -EINVAL;
+ 
+-	container = group->container;
++	ret = vfio_group_add_container_user(device->group);
++	if (ret)
++		return ret;
++
++	container = device->group->container;
+ 	driver = container->iommu_driver;
+ 
+ 	if (likely(driver && driver->ops->dma_rw))
+@@ -2163,6 +2159,8 @@ int vfio_dma_rw(struct vfio_group *group, dma_addr_t user_iova,
+ 	else
+ 		ret = -ENOTTY;
+ 
++	vfio_group_try_dissolve_container(device->group);
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL(vfio_dma_rw);
+diff --git a/include/linux/vfio.h b/include/linux/vfio.h
+index 96af7a2ad4d3..74459552a2df 100644
+--- a/include/linux/vfio.h
++++ b/include/linux/vfio.h
+@@ -126,7 +126,7 @@ extern int vfio_group_pin_pages(struct vfio_group *group,
+ extern int vfio_group_unpin_pages(struct vfio_group *group,
+ 				  unsigned long *user_iova_pfn, int npage);
+ 
+-extern int vfio_dma_rw(struct vfio_group *group, dma_addr_t user_iova,
++extern int vfio_dma_rw(struct vfio_device *device, dma_addr_t user_iova,
+ 		       void *data, size_t len, bool write);
+ 
+ /* each type has independent events */
