@@ -1,0 +1,1002 @@
+sched: Change task_struct::state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 2f064a59a11ff9bc22e52e9678bc601404c7cb34
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/2f064a59.failed
+
+Change the type and name of task_struct::state. Drop the volatile and
+shrink it to an 'unsigned int'. Rename it in order to find all uses
+such that we can use READ_ONCE/WRITE_ONCE as appropriate.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Daniel Bristot de Oliveira <bristot@redhat.com>
+	Acked-by: Will Deacon <will@kernel.org>
+	Acked-by: Daniel Thompson <daniel.thompson@linaro.org>
+Link: https://lore.kernel.org/r/20210611082838.550736351@infradead.org
+(cherry picked from commit 2f064a59a11ff9bc22e52e9678bc601404c7cb34)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/sched/core.c
+diff --cc include/linux/sched.h
+index e1f5728a81c8,50db9496c99d..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -111,11 -113,13 +111,17 @@@ struct task_group
+  					 __TASK_TRACED | EXIT_DEAD | EXIT_ZOMBIE | \
+  					 TASK_PARKED)
+  
+++<<<<<<< HEAD
+ +#define task_is_traced(task)		((task->state & __TASK_TRACED) != 0)
+++=======
++ #define task_is_running(task)		(READ_ONCE((task)->__state) == TASK_RUNNING)
+  
+- #define task_is_stopped(task)		((task->state & __TASK_STOPPED) != 0)
++ #define task_is_traced(task)		((READ_ONCE(task->__state) & __TASK_TRACED) != 0)
+++>>>>>>> 2f064a59a11f (sched: Change task_struct::state)
+  
+- #define task_is_stopped_or_traced(task)	((task->state & (__TASK_STOPPED | __TASK_TRACED)) != 0)
++ #define task_is_stopped(task)		((READ_ONCE(task->__state) & __TASK_STOPPED) != 0)
++ 
++ #define task_is_stopped_or_traced(task)	((READ_ONCE(task->__state) & (__TASK_STOPPED | __TASK_TRACED)) != 0)
+  
+  #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
+  
+@@@ -1750,11 -1830,19 +1755,24 @@@ extern char *__get_task_comm(char *to, 
+  })
+  
+  #ifdef CONFIG_SMP
+++<<<<<<< HEAD
+ +void scheduler_ipi(void);
+ +extern unsigned long wait_task_inactive(struct task_struct *, long match_state);
+++=======
++ static __always_inline void scheduler_ipi(void)
++ {
++ 	/*
++ 	 * Fold TIF_NEED_RESCHED into the preempt_count; anybody setting
++ 	 * TIF_NEED_RESCHED remotely (for the first time) will also send
++ 	 * this IPI.
++ 	 */
++ 	preempt_fold_need_resched();
++ }
++ extern unsigned long wait_task_inactive(struct task_struct *, unsigned int match_state);
+++>>>>>>> 2f064a59a11f (sched: Change task_struct::state)
+  #else
+  static inline void scheduler_ipi(void) { }
+- static inline unsigned long wait_task_inactive(struct task_struct *p, long match_state)
++ static inline unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state)
+  {
+  	return 1;
+  }
+diff --cc kernel/sched/core.c
+index 9945a9321de5,309745a7ec51..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -1201,6 -2473,227 +1201,230 @@@ void do_set_cpus_allowed(struct task_st
+  		set_next_task(rq, p);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
++ {
++ 	__do_set_cpus_allowed(p, new_mask, 0);
++ }
++ 
++ /*
++  * This function is wildly self concurrent; here be dragons.
++  *
++  *
++  * When given a valid mask, __set_cpus_allowed_ptr() must block until the
++  * designated task is enqueued on an allowed CPU. If that task is currently
++  * running, we have to kick it out using the CPU stopper.
++  *
++  * Migrate-Disable comes along and tramples all over our nice sandcastle.
++  * Consider:
++  *
++  *     Initial conditions: P0->cpus_mask = [0, 1]
++  *
++  *     P0@CPU0                  P1
++  *
++  *     migrate_disable();
++  *     <preempted>
++  *                              set_cpus_allowed_ptr(P0, [1]);
++  *
++  * P1 *cannot* return from this set_cpus_allowed_ptr() call until P0 executes
++  * its outermost migrate_enable() (i.e. it exits its Migrate-Disable region).
++  * This means we need the following scheme:
++  *
++  *     P0@CPU0                  P1
++  *
++  *     migrate_disable();
++  *     <preempted>
++  *                              set_cpus_allowed_ptr(P0, [1]);
++  *                                <blocks>
++  *     <resumes>
++  *     migrate_enable();
++  *       __set_cpus_allowed_ptr();
++  *       <wakes local stopper>
++  *                         `--> <woken on migration completion>
++  *
++  * Now the fun stuff: there may be several P1-like tasks, i.e. multiple
++  * concurrent set_cpus_allowed_ptr(P0, [*]) calls. CPU affinity changes of any
++  * task p are serialized by p->pi_lock, which we can leverage: the one that
++  * should come into effect at the end of the Migrate-Disable region is the last
++  * one. This means we only need to track a single cpumask (i.e. p->cpus_mask),
++  * but we still need to properly signal those waiting tasks at the appropriate
++  * moment.
++  *
++  * This is implemented using struct set_affinity_pending. The first
++  * __set_cpus_allowed_ptr() caller within a given Migrate-Disable region will
++  * setup an instance of that struct and install it on the targeted task_struct.
++  * Any and all further callers will reuse that instance. Those then wait for
++  * a completion signaled at the tail of the CPU stopper callback (1), triggered
++  * on the end of the Migrate-Disable region (i.e. outermost migrate_enable()).
++  *
++  *
++  * (1) In the cases covered above. There is one more where the completion is
++  * signaled within affine_move_task() itself: when a subsequent affinity request
++  * occurs after the stopper bailed out due to the targeted task still being
++  * Migrate-Disable. Consider:
++  *
++  *     Initial conditions: P0->cpus_mask = [0, 1]
++  *
++  *     CPU0		  P1				P2
++  *     <P0>
++  *       migrate_disable();
++  *       <preempted>
++  *                        set_cpus_allowed_ptr(P0, [1]);
++  *                          <blocks>
++  *     <migration/0>
++  *       migration_cpu_stop()
++  *         is_migration_disabled()
++  *           <bails>
++  *                                                       set_cpus_allowed_ptr(P0, [0, 1]);
++  *                                                         <signal completion>
++  *                          <awakes>
++  *
++  * Note that the above is safe vs a concurrent migrate_enable(), as any
++  * pending affinity completion is preceded by an uninstallation of
++  * p->migration_pending done with p->pi_lock held.
++  */
++ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flags *rf,
++ 			    int dest_cpu, unsigned int flags)
++ {
++ 	struct set_affinity_pending my_pending = { }, *pending = NULL;
++ 	bool stop_pending, complete = false;
++ 
++ 	/* Can the task run on the task's current CPU? If so, we're done */
++ 	if (cpumask_test_cpu(task_cpu(p), &p->cpus_mask)) {
++ 		struct task_struct *push_task = NULL;
++ 
++ 		if ((flags & SCA_MIGRATE_ENABLE) &&
++ 		    (p->migration_flags & MDF_PUSH) && !rq->push_busy) {
++ 			rq->push_busy = true;
++ 			push_task = get_task_struct(p);
++ 		}
++ 
++ 		/*
++ 		 * If there are pending waiters, but no pending stop_work,
++ 		 * then complete now.
++ 		 */
++ 		pending = p->migration_pending;
++ 		if (pending && !pending->stop_pending) {
++ 			p->migration_pending = NULL;
++ 			complete = true;
++ 		}
++ 
++ 		task_rq_unlock(rq, p, rf);
++ 
++ 		if (push_task) {
++ 			stop_one_cpu_nowait(rq->cpu, push_cpu_stop,
++ 					    p, &rq->push_work);
++ 		}
++ 
++ 		if (complete)
++ 			complete_all(&pending->done);
++ 
++ 		return 0;
++ 	}
++ 
++ 	if (!(flags & SCA_MIGRATE_ENABLE)) {
++ 		/* serialized by p->pi_lock */
++ 		if (!p->migration_pending) {
++ 			/* Install the request */
++ 			refcount_set(&my_pending.refs, 1);
++ 			init_completion(&my_pending.done);
++ 			my_pending.arg = (struct migration_arg) {
++ 				.task = p,
++ 				.dest_cpu = dest_cpu,
++ 				.pending = &my_pending,
++ 			};
++ 
++ 			p->migration_pending = &my_pending;
++ 		} else {
++ 			pending = p->migration_pending;
++ 			refcount_inc(&pending->refs);
++ 			/*
++ 			 * Affinity has changed, but we've already installed a
++ 			 * pending. migration_cpu_stop() *must* see this, else
++ 			 * we risk a completion of the pending despite having a
++ 			 * task on a disallowed CPU.
++ 			 *
++ 			 * Serialized by p->pi_lock, so this is safe.
++ 			 */
++ 			pending->arg.dest_cpu = dest_cpu;
++ 		}
++ 	}
++ 	pending = p->migration_pending;
++ 	/*
++ 	 * - !MIGRATE_ENABLE:
++ 	 *   we'll have installed a pending if there wasn't one already.
++ 	 *
++ 	 * - MIGRATE_ENABLE:
++ 	 *   we're here because the current CPU isn't matching anymore,
++ 	 *   the only way that can happen is because of a concurrent
++ 	 *   set_cpus_allowed_ptr() call, which should then still be
++ 	 *   pending completion.
++ 	 *
++ 	 * Either way, we really should have a @pending here.
++ 	 */
++ 	if (WARN_ON_ONCE(!pending)) {
++ 		task_rq_unlock(rq, p, rf);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (task_running(rq, p) || READ_ONCE(p->__state) == TASK_WAKING) {
++ 		/*
++ 		 * MIGRATE_ENABLE gets here because 'p == current', but for
++ 		 * anything else we cannot do is_migration_disabled(), punt
++ 		 * and have the stopper function handle it all race-free.
++ 		 */
++ 		stop_pending = pending->stop_pending;
++ 		if (!stop_pending)
++ 			pending->stop_pending = true;
++ 
++ 		if (flags & SCA_MIGRATE_ENABLE)
++ 			p->migration_flags &= ~MDF_PUSH;
++ 
++ 		task_rq_unlock(rq, p, rf);
++ 
++ 		if (!stop_pending) {
++ 			stop_one_cpu_nowait(cpu_of(rq), migration_cpu_stop,
++ 					    &pending->arg, &pending->stop_work);
++ 		}
++ 
++ 		if (flags & SCA_MIGRATE_ENABLE)
++ 			return 0;
++ 	} else {
++ 
++ 		if (!is_migration_disabled(p)) {
++ 			if (task_on_rq_queued(p))
++ 				rq = move_queued_task(rq, rf, p, dest_cpu);
++ 
++ 			if (!pending->stop_pending) {
++ 				p->migration_pending = NULL;
++ 				complete = true;
++ 			}
++ 		}
++ 		task_rq_unlock(rq, p, rf);
++ 
++ 		if (complete)
++ 			complete_all(&pending->done);
++ 	}
++ 
++ 	wait_for_completion(&pending->done);
++ 
++ 	if (refcount_dec_and_test(&pending->refs))
++ 		wake_up_var(&pending->refs); /* No UaF, just an address */
++ 
++ 	/*
++ 	 * Block the original owner of &pending until all subsequent callers
++ 	 * have seen the completion and decremented the refcount
++ 	 */
++ 	wait_var_event(&my_pending.refs, !refcount_read(&my_pending.refs));
++ 
++ 	/* ARGH */
++ 	WARN_ON_ONCE(my_pending.stop_pending);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 2f064a59a11f (sched: Change task_struct::state)
+  /*
+   * Change a given task's CPU affinity. Migrate the thread to a
+   * proper CPU and schedule it away if the CPU it's executing on
+@@@ -3640,6 -5243,18 +3865,21 @@@ static inline void schedule_debug(struc
+  #ifdef CONFIG_SCHED_STACK_END_CHECK
+  	if (task_stack_end_corrupted(prev))
+  		panic("corrupted stack end detected inside scheduler\n");
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (task_scs_end_corrupted(prev))
++ 		panic("corrupted shadow stack detected inside scheduler\n");
++ #endif
++ 
++ #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
++ 	if (!preempt && READ_ONCE(prev->__state) && prev->non_block_count) {
++ 		printk(KERN_ERR "BUG: scheduling in a non-blocking section: %s/%d/%i\n",
++ 			prev->comm, prev->pid, prev->non_block_count);
++ 		dump_stack();
++ 		add_taint(TAINT_WARN, LOCKDEP_STILL_OK);
++ 	}
+++>>>>>>> 2f064a59a11f (sched: Change task_struct::state)
+  #endif
+  
+  	if (unlikely(in_atomic_preempt_off())) {
+@@@ -5901,12 -8244,25 +6143,12 @@@ void init_idle(struct task_struct *idle
+  
+  	__sched_fork(0, idle);
+  
+ -	/*
+ -	 * The idle task doesn't need the kthread struct to function, but it
+ -	 * is dressed up as a per-CPU kthread and thus needs to play the part
+ -	 * if we want to avoid special-casing it in code that deals with per-CPU
+ -	 * kthreads.
+ -	 */
+ -	set_kthread_struct(idle);
+ -
+  	raw_spin_lock_irqsave(&idle->pi_lock, flags);
+ -	raw_spin_rq_lock(rq);
+ +	raw_spin_lock(&rq->lock);
+  
+- 	idle->state = TASK_RUNNING;
++ 	idle->__state = TASK_RUNNING;
+  	idle->se.exec_start = sched_clock();
+ -	/*
+ -	 * PF_KTHREAD should already be set at this point; regardless, make it
+ -	 * look like a proper per-CPU kthread.
+ -	 */
+ -	idle->flags |= PF_IDLE | PF_KTHREAD | PF_NO_SETAFFINITY;
+ -	kthread_set_per_cpu(idle, cpu);
+ +	idle->flags |= PF_IDLE;
+  
+  	scs_task_reset(idle);
+  	kasan_unpoison_task_stack(idle);
+diff --git a/arch/ia64/kernel/mca.c b/arch/ia64/kernel/mca.c
+index 506b1dd6d9d7..f57e2835215f 100644
+--- a/arch/ia64/kernel/mca.c
++++ b/arch/ia64/kernel/mca.c
+@@ -1823,7 +1823,7 @@ format_mca_init_stack(void *mca_data, unsigned long offset,
+ 	ti->task = p;
+ 	ti->cpu = cpu;
+ 	p->stack = ti;
+-	p->state = TASK_UNINTERRUPTIBLE;
++	p->__state = TASK_UNINTERRUPTIBLE;
+ 	cpumask_set_cpu(cpu, &p->cpus_mask);
+ 	INIT_LIST_HEAD(&p->tasks);
+ 	p->parent = p->real_parent = p->group_leader = p;
+diff --git a/arch/ia64/kernel/ptrace.c b/arch/ia64/kernel/ptrace.c
+index 6d50ede0ed69..3e41150ee81f 100644
+--- a/arch/ia64/kernel/ptrace.c
++++ b/arch/ia64/kernel/ptrace.c
+@@ -645,11 +645,11 @@ ptrace_attach_sync_user_rbs (struct task_struct *child)
+ 	read_lock(&tasklist_lock);
+ 	if (child->sighand) {
+ 		spin_lock_irq(&child->sighand->siglock);
+-		if (child->state == TASK_STOPPED &&
++		if (READ_ONCE(child->__state) == TASK_STOPPED &&
+ 		    !test_and_set_tsk_thread_flag(child, TIF_RESTORE_RSE)) {
+ 			set_notify_resume(child);
+ 
+-			child->state = TASK_TRACED;
++			WRITE_ONCE(child->__state, TASK_TRACED);
+ 			stopped = 1;
+ 		}
+ 		spin_unlock_irq(&child->sighand->siglock);
+@@ -669,9 +669,9 @@ ptrace_attach_sync_user_rbs (struct task_struct *child)
+ 	read_lock(&tasklist_lock);
+ 	if (child->sighand) {
+ 		spin_lock_irq(&child->sighand->siglock);
+-		if (child->state == TASK_TRACED &&
++		if (READ_ONCE(child->__state) == TASK_TRACED &&
+ 		    (child->signal->flags & SIGNAL_STOP_STOPPED)) {
+-			child->state = TASK_STOPPED;
++			WRITE_ONCE(child->__state, TASK_STOPPED);
+ 		}
+ 		spin_unlock_irq(&child->sighand->siglock);
+ 	}
+diff --git a/arch/powerpc/xmon/xmon.c b/arch/powerpc/xmon/xmon.c
+index 483879d59b20..a35ef0ffd414 100644
+--- a/arch/powerpc/xmon/xmon.c
++++ b/arch/powerpc/xmon/xmon.c
+@@ -3145,6 +3145,7 @@ memzcan(void)
+ 
+ static void show_task(struct task_struct *tsk)
+ {
++	unsigned int p_state = READ_ONCE(tsk->__state);
+ 	char state;
+ 
+ 	/*
+@@ -3152,14 +3153,14 @@ static void show_task(struct task_struct *tsk)
+ 	 * appropriate for calling from xmon. This could be moved
+ 	 * to a common, generic, routine used by both.
+ 	 */
+-	state = (tsk->state == 0) ? 'R' :
+-		(tsk->state < 0) ? 'U' :
+-		(tsk->state & TASK_UNINTERRUPTIBLE) ? 'D' :
+-		(tsk->state & TASK_STOPPED) ? 'T' :
+-		(tsk->state & TASK_TRACED) ? 'C' :
++	state = (p_state == 0) ? 'R' :
++		(p_state < 0) ? 'U' :
++		(p_state & TASK_UNINTERRUPTIBLE) ? 'D' :
++		(p_state & TASK_STOPPED) ? 'T' :
++		(p_state & TASK_TRACED) ? 'C' :
+ 		(tsk->exit_state & EXIT_ZOMBIE) ? 'Z' :
+ 		(tsk->exit_state & EXIT_DEAD) ? 'E' :
+-		(tsk->state & TASK_INTERRUPTIBLE) ? 'S' : '?';
++		(p_state & TASK_INTERRUPTIBLE) ? 'S' : '?';
+ 
+ 	printf("%px %016lx %6d %6d %c %2d %s\n", tsk,
+ 		tsk->thread.ksp,
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 324fb90610e9..d1ccd7b51938 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -3985,7 +3985,7 @@ static bool blk_mq_poll_hybrid(struct request_queue *q,
+ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
+ {
+ 	struct blk_mq_hw_ctx *hctx;
+-	long state;
++	unsigned int state;
+ 
+ 	if (!blk_qc_t_valid(cookie) ||
+ 	    !test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 019ecc311945..bb75cad63911 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -2361,7 +2361,7 @@ static bool md_in_flight_bios(struct mapped_device *md)
+ 	return sum != 0;
+ }
+ 
+-static int dm_wait_for_bios_completion(struct mapped_device *md, long task_state)
++static int dm_wait_for_bios_completion(struct mapped_device *md, unsigned int task_state)
+ {
+ 	int r = 0;
+ 	DEFINE_WAIT(wait);
+@@ -2384,7 +2384,7 @@ static int dm_wait_for_bios_completion(struct mapped_device *md, long task_state
+ 	return r;
+ }
+ 
+-static int dm_wait_for_completion(struct mapped_device *md, long task_state)
++static int dm_wait_for_completion(struct mapped_device *md, unsigned int task_state)
+ {
+ 	int r = 0;
+ 
+@@ -2519,7 +2519,7 @@ static void unlock_fs(struct mapped_device *md)
+  * are being added to md->deferred list.
+  */
+ static int __dm_suspend(struct mapped_device *md, struct dm_table *map,
+-			unsigned suspend_flags, long task_state,
++			unsigned suspend_flags, unsigned int task_state,
+ 			int dmf_suspended_flag)
+ {
+ 	bool do_lockfs = suspend_flags & DM_SUSPEND_LOCKFS_FLAG;
+diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+index c9fdad31fb37..1d5e0ca5ec48 100644
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -1543,7 +1543,8 @@ static int fill_psinfo(struct elf_prpsinfo *psinfo, struct task_struct *p,
+ {
+ 	const struct cred *cred;
+ 	unsigned int i, len;
+-	
++	unsigned int state;
++
+ 	/* first copy the parameters from user space */
+ 	memset(psinfo, 0, sizeof(struct elf_prpsinfo));
+ 
+@@ -1565,7 +1566,8 @@ static int fill_psinfo(struct elf_prpsinfo *psinfo, struct task_struct *p,
+ 	psinfo->pr_pgrp = task_pgrp_vnr(p);
+ 	psinfo->pr_sid = task_session_vnr(p);
+ 
+-	i = p->state ? ffz(~p->state) + 1 : 0;
++	state = READ_ONCE(p->__state);
++	i = state ? ffz(~state) + 1 : 0;
+ 	psinfo->pr_state = i;
+ 	psinfo->pr_sname = (i > 5) ? '.' : "RSDTZW"[i];
+ 	psinfo->pr_zomb = psinfo->pr_sname == 'Z';
+@@ -1577,7 +1579,7 @@ static int fill_psinfo(struct elf_prpsinfo *psinfo, struct task_struct *p,
+ 	SET_GID(psinfo->pr_gid, from_kgid_munged(cred->user_ns, cred->gid));
+ 	rcu_read_unlock();
+ 	strncpy(psinfo->pr_fname, p->comm, sizeof(psinfo->pr_fname));
+-	
++
+ 	return 0;
+ }
+ 
+diff --git a/fs/binfmt_elf_fdpic.c b/fs/binfmt_elf_fdpic.c
+index 60896c16f103..4ca58551a06f 100644
+--- a/fs/binfmt_elf_fdpic.c
++++ b/fs/binfmt_elf_fdpic.c
+@@ -1384,6 +1384,7 @@ static int fill_psinfo(struct elf_prpsinfo *psinfo, struct task_struct *p,
+ {
+ 	const struct cred *cred;
+ 	unsigned int i, len;
++	unsigned int state;
+ 
+ 	/* first copy the parameters from user space */
+ 	memset(psinfo, 0, sizeof(struct elf_prpsinfo));
+@@ -1406,7 +1407,8 @@ static int fill_psinfo(struct elf_prpsinfo *psinfo, struct task_struct *p,
+ 	psinfo->pr_pgrp = task_pgrp_vnr(p);
+ 	psinfo->pr_sid = task_session_vnr(p);
+ 
+-	i = p->state ? ffz(~p->state) + 1 : 0;
++	state = READ_ONCE(p->__state);
++	i = state ? ffz(~state) + 1 : 0;
+ 	psinfo->pr_state = i;
+ 	psinfo->pr_sname = (i > 5) ? '.' : "RSDTZW"[i];
+ 	psinfo->pr_zomb = psinfo->pr_sname == 'Z';
+diff --git a/fs/userfaultfd.c b/fs/userfaultfd.c
+index f914e1515eba..9ba1fa459921 100644
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@ -330,7 +330,7 @@ static inline bool userfaultfd_must_wait(struct userfaultfd_ctx *ctx,
+ 	return ret;
+ }
+ 
+-static inline long userfaultfd_get_blocking_state(unsigned int flags)
++static inline unsigned int userfaultfd_get_blocking_state(unsigned int flags)
+ {
+ 	if (flags & FAULT_FLAG_INTERRUPTIBLE)
+ 		return TASK_INTERRUPTIBLE;
+@@ -363,7 +363,7 @@ vm_fault_t handle_userfault(struct vm_fault *vmf, unsigned long reason)
+ 	struct userfaultfd_wait_queue uwq;
+ 	vm_fault_t ret = VM_FAULT_SIGBUS;
+ 	bool must_wait;
+-	long blocking_state;
++	unsigned int blocking_state;
+ 
+ 	/*
+ 	 * We don't do userfault handling for the final child pid update.
+* Unmerged path include/linux/sched.h
+diff --git a/include/linux/sched/debug.h b/include/linux/sched/debug.h
+index 95fb9e025247..b7e42a629e05 100644
+--- a/include/linux/sched/debug.h
++++ b/include/linux/sched/debug.h
+@@ -14,7 +14,7 @@ extern void dump_cpu_task(int cpu);
+ /*
+  * Only dump TASK_* tasks. (0 for all tasks)
+  */
+-extern void show_state_filter(unsigned long state_filter);
++extern void show_state_filter(unsigned int state_filter);
+ 
+ static inline void show_state(void)
+ {
+diff --git a/include/linux/sched/signal.h b/include/linux/sched/signal.h
+index b260e8feef0c..2b5d9107a289 100644
+--- a/include/linux/sched/signal.h
++++ b/include/linux/sched/signal.h
+@@ -375,7 +375,7 @@ static inline int fatal_signal_pending(struct task_struct *p)
+ 	return signal_pending(p) && __fatal_signal_pending(p);
+ }
+ 
+-static inline int signal_pending_state(long state, struct task_struct *p)
++static inline int signal_pending_state(unsigned int state, struct task_struct *p)
+ {
+ 	if (!(state & (TASK_INTERRUPTIBLE | TASK_WAKEKILL)))
+ 		return 0;
+diff --git a/init/init_task.c b/init/init_task.c
+index 90c9deb50d80..64dd2008b036 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -78,7 +78,7 @@ struct task_struct init_task
+ 	.thread_info	= INIT_THREAD_INFO(init_task),
+ 	.stack_refcount	= REFCOUNT_INIT(1),
+ #endif
+-	.state		= 0,
++	.__state	= 0,
+ 	.stack		= init_stack,
+ 	.usage		= REFCOUNT_INIT(2),
+ 	.flags		= PF_KTHREAD,
+diff --git a/kernel/cgroup/cgroup-v1.c b/kernel/cgroup/cgroup-v1.c
+index 852f1349f9d9..6c969fc274d7 100644
+--- a/kernel/cgroup/cgroup-v1.c
++++ b/kernel/cgroup/cgroup-v1.c
+@@ -712,7 +712,7 @@ int cgroupstats_build(struct cgroupstats *stats, struct dentry *dentry)
+ 
+ 	css_task_iter_start(&cgrp->self, 0, &it);
+ 	while ((tsk = css_task_iter_next(&it))) {
+-		switch (tsk->state) {
++		switch (READ_ONCE(tsk->__state)) {
+ 		case TASK_RUNNING:
+ 			stats->nr_running++;
+ 			break;
+diff --git a/kernel/debug/kdb/kdb_support.c b/kernel/debug/kdb/kdb_support.c
+index b14b0925c184..44099e3e44aa 100644
+--- a/kernel/debug/kdb/kdb_support.c
++++ b/kernel/debug/kdb/kdb_support.c
+@@ -620,22 +620,24 @@ unsigned long kdb_task_state_string(const char *s)
+  */
+ char kdb_task_state_char (const struct task_struct *p)
+ {
+-	int cpu;
+-	char state;
++	unsigned int p_state;
+ 	unsigned long tmp;
++	char state;
++	int cpu;
+ 
+ 	if (!p || probe_kernel_read(&tmp, (char *)p, sizeof(unsigned long)))
+ 		return 'E';
+ 
+ 	cpu = kdb_process_cpu(p);
+-	state = (p->state == 0) ? 'R' :
+-		(p->state < 0) ? 'U' :
+-		(p->state & TASK_UNINTERRUPTIBLE) ? 'D' :
+-		(p->state & TASK_STOPPED) ? 'T' :
+-		(p->state & TASK_TRACED) ? 'C' :
++	p_state = READ_ONCE(p->__state);
++	state = (p_state == 0) ? 'R' :
++		(p_state < 0) ? 'U' :
++		(p_state & TASK_UNINTERRUPTIBLE) ? 'D' :
++		(p_state & TASK_STOPPED) ? 'T' :
++		(p_state & TASK_TRACED) ? 'C' :
+ 		(p->exit_state & EXIT_ZOMBIE) ? 'Z' :
+ 		(p->exit_state & EXIT_DEAD) ? 'E' :
+-		(p->state & TASK_INTERRUPTIBLE) ? 'S' : '?';
++		(p_state & TASK_INTERRUPTIBLE) ? 'S' : '?';
+ 	if (is_idle_task(p)) {
+ 		/* Idle task.  Is it really idle, apart from the kdb
+ 		 * interrupt? */
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 83c6e84610ad..3ede6113d781 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -405,7 +405,7 @@ static int memcg_charge_kernel_stack(struct task_struct *tsk)
+ 
+ static void release_task_stack(struct task_struct *tsk)
+ {
+-	if (WARN_ON(tsk->state != TASK_DEAD))
++	if (WARN_ON(READ_ONCE(tsk->__state) != TASK_DEAD))
+ 		return;  /* Better to leak the stack than to free prematurely */
+ 
+ 	account_kernel_stack(tsk, -1);
+@@ -2203,7 +2203,7 @@ static __latent_entropy struct task_struct *copy_process(
+ 	atomic_dec(&p->cred->user->processes);
+ 	exit_creds(p);
+ bad_fork_free:
+-	p->state = TASK_DEAD;
++	WRITE_ONCE(p->__state, TASK_DEAD);
+ 	put_task_stack(p);
+ 	delayed_free_task(p);
+ fork_out:
+diff --git a/kernel/hung_task.c b/kernel/hung_task.c
+index 06beff8a1a82..d6a5b180d96e 100644
+--- a/kernel/hung_task.c
++++ b/kernel/hung_task.c
+@@ -186,7 +186,7 @@ static void check_hung_uninterruptible_tasks(unsigned long timeout)
+ 			last_break = jiffies;
+ 		}
+ 		/* use "==" to skip the TASK_KILLABLE tasks waiting on NFS */
+-		if (t->state == TASK_UNINTERRUPTIBLE)
++		if (READ_ONCE(t->__state) == TASK_UNINTERRUPTIBLE)
+ 			check_hung_task(t, timeout);
+ 	}
+  unlock:
+diff --git a/kernel/kthread.c b/kernel/kthread.c
+index 8256f0e75930..c462d57c84f2 100644
+--- a/kernel/kthread.c
++++ b/kernel/kthread.c
+@@ -457,7 +457,7 @@ struct task_struct *kthread_create_on_node(int (*threadfn)(void *data),
+ }
+ EXPORT_SYMBOL(kthread_create_on_node);
+ 
+-static void __kthread_bind_mask(struct task_struct *p, const struct cpumask *mask, long state)
++static void __kthread_bind_mask(struct task_struct *p, const struct cpumask *mask, unsigned int state)
+ {
+ 	unsigned long flags;
+ 
+@@ -473,7 +473,7 @@ static void __kthread_bind_mask(struct task_struct *p, const struct cpumask *mas
+ 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+ }
+ 
+-static void __kthread_bind(struct task_struct *p, unsigned int cpu, long state)
++static void __kthread_bind(struct task_struct *p, unsigned int cpu, unsigned int state)
+ {
+ 	__kthread_bind_mask(p, cpumask_of(cpu), state);
+ }
+diff --git a/kernel/locking/mutex.c b/kernel/locking/mutex.c
+index 707bcab79bca..bdef450d648c 100644
+--- a/kernel/locking/mutex.c
++++ b/kernel/locking/mutex.c
+@@ -932,7 +932,7 @@ __ww_mutex_add_waiter(struct mutex_waiter *waiter,
+  * Lock a mutex (possibly interruptible), slowpath:
+  */
+ static __always_inline int __sched
+-__mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
++__mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclass,
+ 		    struct lockdep_map *nest_lock, unsigned long ip,
+ 		    struct ww_acquire_ctx *ww_ctx, const bool use_ww_ctx)
+ {
+@@ -1107,14 +1107,14 @@ __mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
+ }
+ 
+ static int __sched
+-__mutex_lock(struct mutex *lock, long state, unsigned int subclass,
++__mutex_lock(struct mutex *lock, unsigned int state, unsigned int subclass,
+ 	     struct lockdep_map *nest_lock, unsigned long ip)
+ {
+ 	return __mutex_lock_common(lock, state, subclass, nest_lock, ip, NULL, false);
+ }
+ 
+ static int __sched
+-__ww_mutex_lock(struct mutex *lock, long state, unsigned int subclass,
++__ww_mutex_lock(struct mutex *lock, unsigned int state, unsigned int subclass,
+ 		struct lockdep_map *nest_lock, unsigned long ip,
+ 		struct ww_acquire_ctx *ww_ctx)
+ {
+diff --git a/kernel/locking/rtmutex.c b/kernel/locking/rtmutex.c
+index 96a3c8afddd9..c64a41193034 100644
+--- a/kernel/locking/rtmutex.c
++++ b/kernel/locking/rtmutex.c
+@@ -1134,7 +1134,7 @@ void __sched rt_mutex_init_waiter(struct rt_mutex_waiter *waiter)
+  *
+  * Must be called with lock->wait_lock held and interrupts disabled
+  */
+-static int __sched __rt_mutex_slowlock(struct rt_mutex *lock, int state,
++static int __sched __rt_mutex_slowlock(struct rt_mutex *lock, unsigned int state,
+ 				       struct hrtimer_sleeper *timeout,
+ 				       struct rt_mutex_waiter *waiter)
+ {
+@@ -1189,7 +1189,7 @@ static void __sched rt_mutex_handle_deadlock(int res, int detect_deadlock,
+ /*
+  * Slow path lock function:
+  */
+-static int __sched rt_mutex_slowlock(struct rt_mutex *lock, int state,
++static int __sched rt_mutex_slowlock(struct rt_mutex *lock, unsigned int state,
+ 				     struct hrtimer_sleeper *timeout,
+ 				     enum rtmutex_chainwalk chwalk)
+ {
+diff --git a/kernel/locking/rwsem.c b/kernel/locking/rwsem.c
+index e66759cc66a5..61d0477c7350 100644
+--- a/kernel/locking/rwsem.c
++++ b/kernel/locking/rwsem.c
+@@ -897,7 +897,7 @@ rwsem_spin_on_owner(struct rw_semaphore *sem)
+  * Wait for the read lock to be granted
+  */
+ static struct rw_semaphore __sched *
+-rwsem_down_read_slowpath(struct rw_semaphore *sem, long count, int state)
++rwsem_down_read_slowpath(struct rw_semaphore *sem, long count, unsigned int state)
+ {
+ 	long adjustment = -RWSEM_READER_BIAS;
+ 	long rcnt = (count >> RWSEM_READER_SHIFT);
+diff --git a/kernel/ptrace.c b/kernel/ptrace.c
+index e7bf439bdc11..f0e901521446 100644
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -189,7 +189,7 @@ static bool ptrace_freeze_traced(struct task_struct *task)
+ 	spin_lock_irq(&task->sighand->siglock);
+ 	if (task_is_traced(task) && !looks_like_a_spurious_pid(task) &&
+ 	    !__fatal_signal_pending(task)) {
+-		task->state = __TASK_TRACED;
++		WRITE_ONCE(task->__state, __TASK_TRACED);
+ 		ret = true;
+ 	}
+ 	spin_unlock_irq(&task->sighand->siglock);
+@@ -199,7 +199,7 @@ static bool ptrace_freeze_traced(struct task_struct *task)
+ 
+ static void ptrace_unfreeze_traced(struct task_struct *task)
+ {
+-	if (task->state != __TASK_TRACED)
++	if (READ_ONCE(task->__state) != __TASK_TRACED)
+ 		return;
+ 
+ 	WARN_ON(!task->ptrace || task->parent != current);
+@@ -209,11 +209,11 @@ static void ptrace_unfreeze_traced(struct task_struct *task)
+ 	 * Recheck state under the lock to close this race.
+ 	 */
+ 	spin_lock_irq(&task->sighand->siglock);
+-	if (task->state == __TASK_TRACED) {
++	if (READ_ONCE(task->__state) == __TASK_TRACED) {
+ 		if (__fatal_signal_pending(task))
+ 			wake_up_state(task, __TASK_TRACED);
+ 		else
+-			task->state = TASK_TRACED;
++			WRITE_ONCE(task->__state, TASK_TRACED);
+ 	}
+ 	spin_unlock_irq(&task->sighand->siglock);
+ }
+@@ -248,7 +248,7 @@ static int ptrace_check_attach(struct task_struct *child, bool ignore_state)
+ 	 */
+ 	read_lock(&tasklist_lock);
+ 	if (child->ptrace && child->parent == current) {
+-		WARN_ON(child->state == __TASK_TRACED);
++		WARN_ON(READ_ONCE(child->__state) == __TASK_TRACED);
+ 		/*
+ 		 * child->sighand can't be NULL, release_task()
+ 		 * does ptrace_unlink() before __exit_signal().
+@@ -265,7 +265,7 @@ static int ptrace_check_attach(struct task_struct *child, bool ignore_state)
+ 			 * ptrace_stop() changes ->state back to TASK_RUNNING,
+ 			 * so we should not worry about leaking __TASK_TRACED.
+ 			 */
+-			WARN_ON(child->state == __TASK_TRACED);
++			WARN_ON(READ_ONCE(child->__state) == __TASK_TRACED);
+ 			ret = -ESRCH;
+ 		}
+ 	}
+diff --git a/kernel/rcu/rcutorture.c b/kernel/rcu/rcutorture.c
+index 060a7d6c2572..4b90eafe4a62 100644
+--- a/kernel/rcu/rcutorture.c
++++ b/kernel/rcu/rcutorture.c
+@@ -1836,10 +1836,10 @@ rcu_torture_stats_print(void)
+ 		srcutorture_get_gp_data(cur_ops->ttype, srcu_ctlp,
+ 					&flags, &gp_seq);
+ 		wtp = READ_ONCE(writer_task);
+-		pr_alert("??? Writer stall state %s(%d) g%lu f%#x ->state %#lx cpu %d\n",
++		pr_alert("??? Writer stall state %s(%d) g%lu f%#x ->state %#x cpu %d\n",
+ 			 rcu_torture_writer_state_getname(),
+ 			 rcu_torture_writer_state, gp_seq, flags,
+-			 wtp == NULL ? ~0UL : wtp->state,
++			 wtp == NULL ? ~0U : wtp->__state,
+ 			 wtp == NULL ? -1 : (int)task_cpu(wtp));
+ 		if (!splatted && wtp) {
+ 			sched_show_task(wtp);
+diff --git a/kernel/rcu/tree_stall.h b/kernel/rcu/tree_stall.h
+index 1d29d81715aa..c6b2dd8f1033 100644
+--- a/kernel/rcu/tree_stall.h
++++ b/kernel/rcu/tree_stall.h
+@@ -454,12 +454,12 @@ static void rcu_check_gp_kthread_starvation(void)
+ 
+ 	if (rcu_is_gp_kthread_starving(&j)) {
+ 		cpu = gpk ? task_cpu(gpk) : -1;
+-		pr_err("%s kthread starved for %ld jiffies! g%ld f%#x %s(%d) ->state=%#lx ->cpu=%d\n",
++		pr_err("%s kthread starved for %ld jiffies! g%ld f%#x %s(%d) ->state=%#x ->cpu=%d\n",
+ 		       rcu_state.name, j,
+ 		       (long)rcu_seq_current(&rcu_state.gp_seq),
+ 		       data_race(rcu_state.gp_flags),
+ 		       gp_state_getname(rcu_state.gp_state), rcu_state.gp_state,
+-		       gpk ? gpk->state : ~0, cpu);
++		       gpk ? gpk->__state : ~0, cpu);
+ 		if (gpk) {
+ 			pr_err("\tUnless %s kthread gets sufficient CPU time, OOM is now expected behavior.\n", rcu_state.name);
+ 			pr_err("RCU grace-period kthread stack dump:\n");
+@@ -497,12 +497,12 @@ static void rcu_check_gp_kthread_expired_fqs_timer(void)
+ 	    time_after(jiffies, jiffies_fqs + RCU_STALL_MIGHT_MIN) &&
+ 	    gpk && !READ_ONCE(gpk->on_rq)) {
+ 		cpu = task_cpu(gpk);
+-		pr_err("%s kthread timer wakeup didn't happen for %ld jiffies! g%ld f%#x %s(%d) ->state=%#lx\n",
++		pr_err("%s kthread timer wakeup didn't happen for %ld jiffies! g%ld f%#x %s(%d) ->state=%#x\n",
+ 		       rcu_state.name, (jiffies - jiffies_fqs),
+ 		       (long)rcu_seq_current(&rcu_state.gp_seq),
+ 		       data_race(rcu_state.gp_flags),
+ 		       gp_state_getname(RCU_GP_WAIT_FQS), RCU_GP_WAIT_FQS,
+-		       gpk->state);
++		       gpk->__state);
+ 		pr_err("\tPossible timer handling issue on cpu=%d timer-softirq=%u\n",
+ 		       cpu, kstat_softirqs_cpu(TIMER_SOFTIRQ, cpu));
+ 	}
+@@ -727,9 +727,9 @@ void show_rcu_gp_kthreads(void)
+ 	ja = j - data_race(rcu_state.gp_activity);
+ 	jr = j - data_race(rcu_state.gp_req_activity);
+ 	jw = j - data_race(rcu_state.gp_wake_time);
+-	pr_info("%s: wait state: %s(%d) ->state: %#lx delta ->gp_activity %lu ->gp_req_activity %lu ->gp_wake_time %lu ->gp_wake_seq %ld ->gp_seq %ld ->gp_seq_needed %ld ->gp_flags %#x\n",
++	pr_info("%s: wait state: %s(%d) ->state: %#x delta ->gp_activity %lu ->gp_req_activity %lu ->gp_wake_time %lu ->gp_wake_seq %ld ->gp_seq %ld ->gp_seq_needed %ld ->gp_flags %#x\n",
+ 		rcu_state.name, gp_state_getname(rcu_state.gp_state),
+-		rcu_state.gp_state, t ? t->state : 0x1ffffL,
++		rcu_state.gp_state, t ? t->__state : 0x1ffff,
+ 		ja, jr, jw, (long)data_race(rcu_state.gp_wake_seq),
+ 		(long)data_race(rcu_state.gp_seq),
+ 		(long)data_race(rcu_get_root()->gp_seq_needed),
+* Unmerged path kernel/sched/core.c
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 57029bad9a1f..4f9502dfbe42 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -348,10 +348,10 @@ static void task_non_contending(struct task_struct *p)
+ 	if ((zerolag_time < 0) || hrtimer_active(&dl_se->inactive_timer)) {
+ 		if (dl_task(p))
+ 			sub_running_bw(dl_se, dl_rq);
+-		if (!dl_task(p) || p->state == TASK_DEAD) {
++		if (!dl_task(p) || READ_ONCE(p->__state) == TASK_DEAD) {
+ 			struct dl_bw *dl_b = dl_bw_of(task_cpu(p));
+ 
+-			if (p->state == TASK_DEAD)
++			if (READ_ONCE(p->__state) == TASK_DEAD)
+ 				sub_rq_bw(&p->dl, &rq->dl);
+ 			raw_spin_lock(&dl_b->lock);
+ 			__dl_sub(dl_b, p->dl.dl_bw, dl_bw_cpus(task_cpu(p)));
+@@ -1355,10 +1355,10 @@ static enum hrtimer_restart inactive_task_timer(struct hrtimer *timer)
+ 	sched_clock_tick();
+ 	update_rq_clock(rq);
+ 
+-	if (!dl_task(p) || p->state == TASK_DEAD) {
++	if (!dl_task(p) || READ_ONCE(p->__state) == TASK_DEAD) {
+ 		struct dl_bw *dl_b = dl_bw_of(task_cpu(p));
+ 
+-		if (p->state == TASK_DEAD && dl_se->dl_non_contending) {
++		if (READ_ONCE(p->__state) == TASK_DEAD && dl_se->dl_non_contending) {
+ 			sub_running_bw(&p->dl, dl_rq_of_se(&p->dl));
+ 			sub_rq_bw(&p->dl, dl_rq_of_se(&p->dl));
+ 			dl_se->dl_non_contending = 0;
+@@ -1719,7 +1719,7 @@ static void migrate_task_rq_dl(struct task_struct *p, int new_cpu __maybe_unused
+ {
+ 	struct rq *rq;
+ 
+-	if (p->state != TASK_WAKING)
++	if (READ_ONCE(p->__state) != TASK_WAKING)
+ 		return;
+ 
+ 	rq = task_rq(p);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 48895c563625..924ab2977161 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1032,11 +1032,14 @@ update_stats_dequeue(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 
+ 	if ((flags & DEQUEUE_SLEEP) && entity_is_task(se)) {
+ 		struct task_struct *tsk = task_of(se);
++		unsigned int state;
+ 
+-		if (tsk->state & TASK_INTERRUPTIBLE)
++		/* XXX racy against TTWU */
++		state = READ_ONCE(tsk->__state);
++		if (state & TASK_INTERRUPTIBLE)
+ 			__schedstat_set(se->statistics.sleep_start,
+ 				      rq_clock(rq_of(cfs_rq)));
+-		if (tsk->state & TASK_UNINTERRUPTIBLE)
++		if (state & TASK_UNINTERRUPTIBLE)
+ 			__schedstat_set(se->statistics.block_start,
+ 				      rq_clock(rq_of(cfs_rq)));
+ 	}
+@@ -6768,7 +6771,7 @@ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
+ 	 * min_vruntime -- the latter is done by enqueue_entity() when placing
+ 	 * the task on the new runqueue.
+ 	 */
+-	if (p->state == TASK_WAKING) {
++	if (READ_ONCE(p->__state) == TASK_WAKING) {
+ 		struct sched_entity *se = &p->se;
+ 		struct cfs_rq *cfs_rq = cfs_rq_of(se);
+ 		u64 min_vruntime;
+@@ -10770,7 +10773,7 @@ static inline bool vruntime_normalized(struct task_struct *p)
+ 	 *   waiting for actually being woken up by sched_ttwu_pending().
+ 	 */
+ 	if (!se->sum_exec_runtime ||
+-	    (p->state == TASK_WAKING && p->sched_remote_wakeup))
++	    (READ_ONCE(p->__state) == TASK_WAKING && p->sched_remote_wakeup))
+ 		return true;
+ 
+ 	return false;
+diff --git a/lib/syscall.c b/lib/syscall.c
+index 1a7077f20eae..3bcb06864e5a 100644
+--- a/lib/syscall.c
++++ b/lib/syscall.c
+@@ -65,8 +65,8 @@ int task_current_syscall(struct task_struct *target, long *callno,
+ 			 unsigned long args[6], unsigned int maxargs,
+ 			 unsigned long *sp, unsigned long *pc)
+ {
+-	long state;
+ 	unsigned long ncsw;
++	unsigned int state;
+ 
+ 	if (unlikely(maxargs > 6))
+ 		return -EINVAL;
+@@ -74,7 +74,7 @@ int task_current_syscall(struct task_struct *target, long *callno,
+ 	if (target == current)
+ 		return collect_syscall(target, callno, args, maxargs, sp, pc);
+ 
+-	state = target->state;
++	state = READ_ONCE(target->__state);
+ 	if (unlikely(!state))
+ 		return -EAGAIN;
+ 
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 93c5e03ab56c..feecf99446a9 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4277,7 +4277,7 @@ static inline void ____napi_schedule(struct softnet_data *sd,
+ 			 * makes sure to proceed with napi polling
+ 			 * if the thread is explicitly woken from here.
+ 			 */
+-			if (READ_ONCE(thread->state) != TASK_INTERRUPTIBLE)
++			if (READ_ONCE(thread->__state) != TASK_INTERRUPTIBLE)
+ 				set_bit(NAPI_STATE_SCHED_THREADED, &napi->state);
+ 			wake_up_process(thread);
+ 			return;
