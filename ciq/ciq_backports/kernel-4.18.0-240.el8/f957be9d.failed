@@ -1,0 +1,376 @@
+netfilter: conntrack: remove ctnetlink callbacks from l3 protocol trackers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit f957be9d349a3800940f823b16e12b0405cc305b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f957be9d.failed
+
+handle everything from ctnetlink directly.
+
+After all these years we still only support ipv4 and ipv6, so it
+seems reasonable to remove l3 protocol tracker support and instead
+handle ipv4/ipv6 from a common, always builtin inet tracker.
+
+Step 1: Get rid of all the l3proto->func() calls.
+
+Start with ctnetlink, then move on to packet-path ones.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit f957be9d349a3800940f823b16e12b0405cc305b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/netfilter/nf_conntrack_l3proto_ipv6.c
+#	net/netfilter/nf_conntrack_netlink.c
+diff --cc net/ipv6/netfilter/nf_conntrack_l3proto_ipv6.c
+index a806b2410151,13a660ae5799..000000000000
+--- a/net/ipv6/netfilter/nf_conntrack_l3proto_ipv6.c
++++ b/net/ipv6/netfilter/nf_conntrack_l3proto_ipv6.c
+@@@ -269,53 -269,6 +269,56 @@@ ipv6_getorigdst(struct sock *sk, int op
+  	return copy_to_user(user, &sin6, sizeof(sin6)) ? -EFAULT : 0;
+  }
+  
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+ +
+ +#include <linux/netfilter/nfnetlink.h>
+ +#include <linux/netfilter/nfnetlink_conntrack.h>
+ +
+ +static int ipv6_tuple_to_nlattr(struct sk_buff *skb,
+ +				const struct nf_conntrack_tuple *tuple)
+ +{
+ +	if (nla_put_in6_addr(skb, CTA_IP_V6_SRC, &tuple->src.u3.in6) ||
+ +	    nla_put_in6_addr(skb, CTA_IP_V6_DST, &tuple->dst.u3.in6))
+ +		goto nla_put_failure;
+ +	return 0;
+ +
+ +nla_put_failure:
+ +	return -1;
+ +}
+ +
+ +static const struct nla_policy ipv6_nla_policy[CTA_IP_MAX+1] = {
+ +	[CTA_IP_V6_SRC]	= { .len = sizeof(u_int32_t)*4 },
+ +	[CTA_IP_V6_DST]	= { .len = sizeof(u_int32_t)*4 },
+ +};
+ +
+ +static int ipv6_nlattr_to_tuple(struct nlattr *tb[],
+ +				struct nf_conntrack_tuple *t)
+ +{
+ +	if (!tb[CTA_IP_V6_SRC] || !tb[CTA_IP_V6_DST])
+ +		return -EINVAL;
+ +
+ +	t->src.u3.in6 = nla_get_in6_addr(tb[CTA_IP_V6_SRC]);
+ +	t->dst.u3.in6 = nla_get_in6_addr(tb[CTA_IP_V6_DST]);
+ +
+ +	return 0;
+ +}
+ +#endif
+ +
+ +static int ipv6_ct_tcp_fixup(struct nf_conn *ct, void *ignored)
+ +{
+ +	if (nf_ct_l3num(ct) == NFPROTO_IPV6 &&
+ +	    nf_ct_protonum(ct) == IPPROTO_TCP &&
+ +	    ct->proto.tcp.state == TCP_CONNTRACK_ESTABLISHED) {
+ +		ct->proto.tcp.seen[0].td_maxwin = 0;
+ +		ct->proto.tcp.seen[1].td_maxwin = 0;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> f957be9d349a (netfilter: conntrack: remove ctnetlink callbacks from l3 protocol trackers)
+  static int ipv6_hooks_register(struct net *net)
+  {
+  	struct conntrack6_net *cnet = net_generic(net, conntrack6_net_id);
+diff --cc net/netfilter/nf_conntrack_netlink.c
+index fcffaeb975eb,40152b9ad772..000000000000
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@@ -958,26 -989,26 +1007,35 @@@ static int ctnetlink_parse_tuple_ip(str
+  				    struct nf_conntrack_tuple *tuple)
+  {
+  	struct nlattr *tb[CTA_IP_MAX+1];
+- 	struct nf_conntrack_l3proto *l3proto;
+  	int ret = 0;
+  
+ -	ret = nla_parse_nested(tb, CTA_IP_MAX, attr, NULL, NULL);
+ +	ret = nla_parse_nested_deprecated(tb, CTA_IP_MAX, attr, NULL, NULL);
+  	if (ret < 0)
+  		return ret;
+  
+- 	rcu_read_lock();
+- 	l3proto = __nf_ct_l3proto_find(tuple->src.l3num);
++ 	ret = nla_validate_nested(attr, CTA_IP_MAX,
++ 				  cta_ip_nla_policy, NULL);
++ 	if (ret)
++ 		return ret;
+  
+++<<<<<<< HEAD
+ +	if (likely(l3proto->nlattr_to_tuple)) {
+ +		ret = nla_validate_nested_deprecated(attr, CTA_IP_MAX,
+ +						     l3proto->nla_policy,
+ +						     NULL);
+ +		if (ret == 0)
+ +			ret = l3proto->nlattr_to_tuple(tb, tuple);
+++=======
++ 	switch (tuple->src.l3num) {
++ 	case NFPROTO_IPV4:
++ 		ret = ipv4_nlattr_to_tuple(tb, tuple);
++ 		break;
++ 	case NFPROTO_IPV6:
++ 		ret = ipv6_nlattr_to_tuple(tb, tuple);
++ 		break;
+++>>>>>>> f957be9d349a (netfilter: conntrack: remove ctnetlink callbacks from l3 protocol trackers)
+  	}
+  
+- 	rcu_read_unlock();
+- 
+  	return ret;
+  }
+  
+diff --git a/include/net/netfilter/nf_conntrack_core.h b/include/net/netfilter/nf_conntrack_core.h
+index 90df45022c51..d454a53ba646 100644
+--- a/include/net/netfilter/nf_conntrack_core.h
++++ b/include/net/netfilter/nf_conntrack_core.h
+@@ -68,10 +68,8 @@ static inline int nf_conntrack_confirm(struct sk_buff *skb)
+ 	return ret;
+ }
+ 
+-void
+-print_tuple(struct seq_file *s, const struct nf_conntrack_tuple *tuple,
+-            const struct nf_conntrack_l3proto *l3proto,
+-            const struct nf_conntrack_l4proto *proto);
++void print_tuple(struct seq_file *s, const struct nf_conntrack_tuple *tuple,
++		 const struct nf_conntrack_l4proto *proto);
+ 
+ #define CONNTRACK_LOCKS 1024
+ 
+diff --git a/include/net/netfilter/nf_conntrack_l3proto.h b/include/net/netfilter/nf_conntrack_l3proto.h
+index d5808f3e2715..d07b5216a925 100644
+--- a/include/net/netfilter/nf_conntrack_l3proto.h
++++ b/include/net/netfilter/nf_conntrack_l3proto.h
+@@ -46,14 +46,6 @@ struct nf_conntrack_l3proto {
+ 	int (*get_l4proto)(const struct sk_buff *skb, unsigned int nhoff,
+ 			   unsigned int *dataoff, u_int8_t *protonum);
+ 
+-#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+-	int (*tuple_to_nlattr)(struct sk_buff *skb,
+-			       const struct nf_conntrack_tuple *t);
+-	int (*nlattr_to_tuple)(struct nlattr *tb[],
+-			       struct nf_conntrack_tuple *t);
+-	const struct nla_policy *nla_policy;
+-#endif
+-
+ 	/* Called when netns wants to use connection tracking */
+ 	int (*net_ns_get)(struct net *);
+ 	void (*net_ns_put)(struct net *);
+diff --git a/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c b/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c
+index 79ae5ebcfe62..1bd71eb370c8 100644
+--- a/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c
++++ b/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c
+@@ -274,41 +274,6 @@ getorigdst(struct sock *sk, int optval, void __user *user, int *len)
+ 	return -ENOENT;
+ }
+ 
+-#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+-
+-#include <linux/netfilter/nfnetlink.h>
+-#include <linux/netfilter/nfnetlink_conntrack.h>
+-
+-static int ipv4_tuple_to_nlattr(struct sk_buff *skb,
+-				const struct nf_conntrack_tuple *tuple)
+-{
+-	if (nla_put_in_addr(skb, CTA_IP_V4_SRC, tuple->src.u3.ip) ||
+-	    nla_put_in_addr(skb, CTA_IP_V4_DST, tuple->dst.u3.ip))
+-		goto nla_put_failure;
+-	return 0;
+-
+-nla_put_failure:
+-	return -1;
+-}
+-
+-static const struct nla_policy ipv4_nla_policy[CTA_IP_MAX+1] = {
+-	[CTA_IP_V4_SRC]	= { .type = NLA_U32 },
+-	[CTA_IP_V4_DST]	= { .type = NLA_U32 },
+-};
+-
+-static int ipv4_nlattr_to_tuple(struct nlattr *tb[],
+-				struct nf_conntrack_tuple *t)
+-{
+-	if (!tb[CTA_IP_V4_SRC] || !tb[CTA_IP_V4_DST])
+-		return -EINVAL;
+-
+-	t->src.u3.ip = nla_get_in_addr(tb[CTA_IP_V4_SRC]);
+-	t->dst.u3.ip = nla_get_in_addr(tb[CTA_IP_V4_DST]);
+-
+-	return 0;
+-}
+-#endif
+-
+ static struct nf_sockopt_ops so_getorigdst = {
+ 	.pf		= PF_INET,
+ 	.get_optmin	= SO_ORIGINAL_DST,
+@@ -374,13 +339,6 @@ const struct nf_conntrack_l3proto nf_conntrack_l3proto_ipv4 = {
+ 	.pkt_to_tuple	 = ipv4_pkt_to_tuple,
+ 	.invert_tuple	 = ipv4_invert_tuple,
+ 	.get_l4proto	 = ipv4_get_l4proto,
+-#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+-	.tuple_to_nlattr = ipv4_tuple_to_nlattr,
+-	.nlattr_to_tuple = ipv4_nlattr_to_tuple,
+-	.nla_policy	 = ipv4_nla_policy,
+-	.nla_size	 = NLA_ALIGN(NLA_HDRLEN + sizeof(u32)) + /* CTA_IP_V4_SRC */
+-			   NLA_ALIGN(NLA_HDRLEN + sizeof(u32)),  /* CTA_IP_V4_DST */
+-#endif
+ 	.net_ns_get	 = ipv4_hooks_register,
+ 	.net_ns_put	 = ipv4_hooks_unregister,
+ 	.me		 = THIS_MODULE,
+@@ -433,11 +391,6 @@ static int __init nf_conntrack_l3proto_ipv4_init(void)
+ 
+ 	need_conntrack();
+ 
+-#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+-	if (WARN_ON(nla_policy_len(ipv4_nla_policy, CTA_IP_MAX + 1) !=
+-	    nf_conntrack_l3proto_ipv4.nla_size))
+-		return -EINVAL;
+-#endif
+ 	ret = nf_register_sockopt(&so_getorigdst);
+ 	if (ret < 0) {
+ 		pr_err("Unable to register netfilter socket option\n");
+* Unmerged path net/ipv6/netfilter/nf_conntrack_l3proto_ipv6.c
+diff --git a/net/ipv6/netfilter/nf_defrag_ipv6_hooks.c b/net/ipv6/netfilter/nf_defrag_ipv6_hooks.c
+index 9a0590bb9da0..72dd3e202375 100644
+--- a/net/ipv6/netfilter/nf_defrag_ipv6_hooks.c
++++ b/net/ipv6/netfilter/nf_defrag_ipv6_hooks.c
+@@ -22,7 +22,6 @@
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_helper.h>
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+-#include <net/netfilter/nf_conntrack_l3proto.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/ipv6/nf_conntrack_ipv6.h>
+ #endif
+diff --git a/net/netfilter/nf_conntrack_expect.c b/net/netfilter/nf_conntrack_expect.c
+index 853b23206bb7..3f586ba23d92 100644
+--- a/net/netfilter/nf_conntrack_expect.c
++++ b/net/netfilter/nf_conntrack_expect.c
+@@ -610,7 +610,6 @@ static int exp_seq_show(struct seq_file *s, void *v)
+ 		   expect->tuple.src.l3num,
+ 		   expect->tuple.dst.protonum);
+ 	print_tuple(s, &expect->tuple,
+-		    __nf_ct_l3proto_find(expect->tuple.src.l3num),
+ 		    __nf_ct_l4proto_find(expect->tuple.src.l3num,
+ 				       expect->tuple.dst.protonum));
+ 
+diff --git a/net/netfilter/nf_conntrack_helper.c b/net/netfilter/nf_conntrack_helper.c
+index 4b46bb9340eb..1ccc98258eab 100644
+--- a/net/netfilter/nf_conntrack_helper.c
++++ b/net/netfilter/nf_conntrack_helper.c
+@@ -24,7 +24,6 @@
+ #include <linux/rtnetlink.h>
+ 
+ #include <net/netfilter/nf_conntrack.h>
+-#include <net/netfilter/nf_conntrack_l3proto.h>
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_helper.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+* Unmerged path net/netfilter/nf_conntrack_netlink.c
+diff --git a/net/netfilter/nf_conntrack_proto.c b/net/netfilter/nf_conntrack_proto.c
+index 928ff492bf36..2c434732ee34 100644
+--- a/net/netfilter/nf_conntrack_proto.c
++++ b/net/netfilter/nf_conntrack_proto.c
+@@ -294,10 +294,7 @@ int nf_ct_l3proto_register(const struct nf_conntrack_l3proto *proto)
+ 
+ 	if (proto->l3proto >= NFPROTO_NUMPROTO)
+ 		return -EBUSY;
+-#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+-	if (proto->tuple_to_nlattr && proto->nla_size == 0)
+-		return -EINVAL;
+-#endif
++
+ 	mutex_lock(&nf_ct_proto_mutex);
+ 	old = rcu_dereference_protected(nf_ct_l3protos[proto->l3proto],
+ 					lockdep_is_held(&nf_ct_proto_mutex));
+diff --git a/net/netfilter/nf_conntrack_standalone.c b/net/netfilter/nf_conntrack_standalone.c
+index b642c0b2495c..47b80fd0d2c3 100644
+--- a/net/netfilter/nf_conntrack_standalone.c
++++ b/net/netfilter/nf_conntrack_standalone.c
+@@ -24,7 +24,6 @@
+ 
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+-#include <net/netfilter/nf_conntrack_l3proto.h>
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_expect.h>
+ #include <net/netfilter/nf_conntrack_helper.h>
+@@ -38,10 +37,9 @@ MODULE_LICENSE("GPL");
+ #ifdef CONFIG_NF_CONNTRACK_PROCFS
+ void
+ print_tuple(struct seq_file *s, const struct nf_conntrack_tuple *tuple,
+-            const struct nf_conntrack_l3proto *l3proto,
+             const struct nf_conntrack_l4proto *l4proto)
+ {
+-	switch (l3proto->l3proto) {
++	switch (tuple->src.l3num) {
+ 	case NFPROTO_IPV4:
+ 		seq_printf(s, "src=%pI4 dst=%pI4 ",
+ 			   &tuple->src.u3.ip, &tuple->dst.u3.ip);
+@@ -282,7 +280,6 @@ static int ct_seq_show(struct seq_file *s, void *v)
+ {
+ 	struct nf_conntrack_tuple_hash *hash = v;
+ 	struct nf_conn *ct = nf_ct_tuplehash_to_ctrack(hash);
+-	const struct nf_conntrack_l3proto *l3proto;
+ 	const struct nf_conntrack_l4proto *l4proto;
+ 	struct net *net = seq_file_net(s);
+ 	int ret = 0;
+@@ -303,14 +300,12 @@ static int ct_seq_show(struct seq_file *s, void *v)
+ 	if (!net_eq(nf_ct_net(ct), net))
+ 		goto release;
+ 
+-	l3proto = __nf_ct_l3proto_find(nf_ct_l3num(ct));
+-	WARN_ON(!l3proto);
+ 	l4proto = __nf_ct_l4proto_find(nf_ct_l3num(ct), nf_ct_protonum(ct));
+ 	WARN_ON(!l4proto);
+ 
+ 	ret = -ENOSPC;
+ 	seq_printf(s, "%-8s %u %-8s %u ",
+-		   l3proto_name(l3proto->l3proto), nf_ct_l3num(ct),
++		   l3proto_name(nf_ct_l3num(ct)), nf_ct_l3num(ct),
+ 		   l4proto_name(l4proto->l4proto), nf_ct_protonum(ct));
+ 
+ 	if (!test_bit(IPS_OFFLOAD_BIT, &ct->status))
+@@ -320,7 +315,7 @@ static int ct_seq_show(struct seq_file *s, void *v)
+ 		l4proto->print_conntrack(s, ct);
+ 
+ 	print_tuple(s, &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
+-		    l3proto, l4proto);
++		    l4proto);
+ 
+ 	ct_show_zone(s, ct, NF_CT_ZONE_DIR_ORIG);
+ 
+@@ -333,8 +328,7 @@ static int ct_seq_show(struct seq_file *s, void *v)
+ 	if (!(test_bit(IPS_SEEN_REPLY_BIT, &ct->status)))
+ 		seq_puts(s, "[UNREPLIED] ");
+ 
+-	print_tuple(s, &ct->tuplehash[IP_CT_DIR_REPLY].tuple,
+-		    l3proto, l4proto);
++	print_tuple(s, &ct->tuplehash[IP_CT_DIR_REPLY].tuple, l4proto);
+ 
+ 	ct_show_zone(s, ct, NF_CT_ZONE_DIR_REPL);
+ 
+diff --git a/net/netfilter/nfnetlink_cttimeout.c b/net/netfilter/nfnetlink_cttimeout.c
+index 6720dbb70442..6c152ffb5435 100644
+--- a/net/netfilter/nfnetlink_cttimeout.c
++++ b/net/netfilter/nfnetlink_cttimeout.c
+@@ -26,7 +26,6 @@
+ #include <net/sock.h>
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+-#include <net/netfilter/nf_conntrack_l3proto.h>
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_tuple.h>
+ #include <net/netfilter/nf_conntrack_timeout.h>
