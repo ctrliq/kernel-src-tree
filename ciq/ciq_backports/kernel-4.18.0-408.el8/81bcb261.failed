@@ -1,0 +1,385 @@
+KVM: selftests: Move vCPU thread creation and joining to common helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Matlack <dmatlack@google.com>
+commit 81bcb26172a8f00840e0ca44277272dcb673887a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/81bcb261.failed
+
+Move vCPU thread creation and joining to common helper functions. This
+is in preparation for the next commit which ensures that all vCPU
+threads are fully created before entering guest mode on any one
+vCPU.
+
+No functional change intended.
+
+	Signed-off-by: David Matlack <dmatlack@google.com>
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+Message-Id: <20211111001257.1446428-3-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 81bcb26172a8f00840e0ca44277272dcb673887a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/demand_paging_test.c
+#	tools/testing/selftests/kvm/dirty_log_perf_test.c
+#	tools/testing/selftests/kvm/memslot_modification_stress_test.c
+diff --cc tools/testing/selftests/kvm/demand_paging_test.c
+index 52bd44288de9,6a719d065599..000000000000
+--- a/tools/testing/selftests/kvm/demand_paging_test.c
++++ b/tools/testing/selftests/kvm/demand_paging_test.c
+@@@ -68,32 -67,45 +67,30 @@@ static void vcpu_worker(struct perf_tes
+  	ts_diff = timespec_elapsed(start);
+  	PER_VCPU_DEBUG("vCPU %d execution time: %ld.%.9lds\n", vcpu_id,
+  		       ts_diff.tv_sec, ts_diff.tv_nsec);
+- 
+- 	return NULL;
+  }
+  
+ -static int handle_uffd_page_request(int uffd_mode, int uffd, uint64_t addr)
+ +static int handle_uffd_page_request(int uffd, uint64_t addr)
+  {
+ -	pid_t tid = syscall(__NR_gettid);
+ +	pid_t tid;
+  	struct timespec start;
+  	struct timespec ts_diff;
+ +	struct uffdio_copy copy;
+  	int r;
+  
+ -	clock_gettime(CLOCK_MONOTONIC, &start);
+ -
+ -	if (uffd_mode == UFFDIO_REGISTER_MODE_MISSING) {
+ -		struct uffdio_copy copy;
+ -
+ -		copy.src = (uint64_t)guest_data_prototype;
+ -		copy.dst = addr;
+ -		copy.len = demand_paging_size;
+ -		copy.mode = 0;
+ +	tid = syscall(__NR_gettid);
+  
+ -		r = ioctl(uffd, UFFDIO_COPY, &copy);
+ -		if (r == -1) {
+ -			pr_info("Failed UFFDIO_COPY in 0x%lx from thread %d with errno: %d\n",
+ -				addr, tid, errno);
+ -			return r;
+ -		}
+ -	} else if (uffd_mode == UFFDIO_REGISTER_MODE_MINOR) {
+ -		struct uffdio_continue cont = {0};
+ +	copy.src = (uint64_t)guest_data_prototype;
+ +	copy.dst = addr;
+ +	copy.len = demand_paging_size;
+ +	copy.mode = 0;
+  
+ -		cont.range.start = addr;
+ -		cont.range.len = demand_paging_size;
+ +	clock_gettime(CLOCK_MONOTONIC, &start);
+  
+ -		r = ioctl(uffd, UFFDIO_CONTINUE, &cont);
+ -		if (r == -1) {
+ -			pr_info("Failed UFFDIO_CONTINUE in 0x%lx from thread %d with errno: %d\n",
+ -				addr, tid, errno);
+ -			return r;
+ -		}
+ -	} else {
+ -		TEST_FAIL("Invalid uffd mode %d", uffd_mode);
+ +	r = ioctl(uffd, UFFDIO_COPY, &copy);
+ +	if (r == -1) {
+ +		pr_info("Failed Paged in 0x%lx from thread %d with errno: %d\n",
+ +			addr, tid, errno);
+ +		return r;
+  	}
+  
+  	ts_diff = timespec_elapsed(start);
+@@@ -268,13 -298,7 +264,17 @@@ static void run_test(enum vm_guest_mod
+  		    "Failed to allocate buffer for guest data pattern");
+  	memset(guest_data_prototype, 0xAB, demand_paging_size);
+  
+++<<<<<<< HEAD
+ +	vcpu_threads = malloc(nr_vcpus * sizeof(*vcpu_threads));
+ +	TEST_ASSERT(vcpu_threads, "Memory allocation failed");
+ +
+ +	perf_test_setup_vcpus(vm, nr_vcpus, guest_percpu_mem_size,
+ +			      p->partition_vcpu_memory_access);
+ +
+ +	if (p->use_uffd) {
+++=======
++ 	if (p->uffd_mode) {
+++>>>>>>> 81bcb26172a8 (KVM: selftests: Move vCPU thread creation and joining to common helpers)
+  		uffd_handler_threads =
+  			malloc(nr_vcpus * sizeof(*uffd_handler_threads));
+  		TEST_ASSERT(uffd_handler_threads, "Memory allocation failed");
+@@@ -326,25 -339,14 +326,14 @@@
+  	pr_info("Finished creating vCPUs and starting uffd threads\n");
+  
+  	clock_gettime(CLOCK_MONOTONIC, &start);
+- 
+- 	for (vcpu_id = 0; vcpu_id < nr_vcpus; vcpu_id++) {
+- 		pthread_create(&vcpu_threads[vcpu_id], NULL, vcpu_worker,
+- 			       &perf_test_args.vcpu_args[vcpu_id]);
+- 	}
+- 
++ 	perf_test_start_vcpu_threads(nr_vcpus, vcpu_worker);
+  	pr_info("Started all vCPUs\n");
+  
+- 	/* Wait for the vcpu threads to quit */
+- 	for (vcpu_id = 0; vcpu_id < nr_vcpus; vcpu_id++) {
+- 		pthread_join(vcpu_threads[vcpu_id], NULL);
+- 		PER_VCPU_DEBUG("Joined thread for vCPU %d\n", vcpu_id);
+- 	}
+- 
++ 	perf_test_join_vcpu_threads(nr_vcpus);
+  	ts_diff = timespec_elapsed(start);
+- 
+  	pr_info("All vCPU threads joined\n");
+  
+ -	if (p->uffd_mode) {
+ +	if (p->use_uffd) {
+  		char c;
+  
+  		/* Tell the user fault fd handler threads to quit */
+@@@ -365,8 -367,7 +354,12 @@@
+  	perf_test_destroy_vm(vm);
+  
+  	free(guest_data_prototype);
+++<<<<<<< HEAD
+ +	free(vcpu_threads);
+ +	if (p->use_uffd) {
+++=======
++ 	if (p->uffd_mode) {
+++>>>>>>> 81bcb26172a8 (KVM: selftests: Move vCPU thread creation and joining to common helpers)
+  		free(uffd_handler_threads);
+  		free(uffd_args);
+  		free(pipefds);
+diff --cc tools/testing/selftests/kvm/dirty_log_perf_test.c
+index 7ffab5bd5ce5,1954b964d1cf..000000000000
+--- a/tools/testing/selftests/kvm/dirty_log_perf_test.c
++++ b/tools/testing/selftests/kvm/dirty_log_perf_test.c
+@@@ -203,14 -200,6 +199,17 @@@ static void run_test(enum vm_guest_mod
+  		vm_enable_cap(vm, &cap);
+  	}
+  
+++<<<<<<< HEAD
+ +	vcpu_threads = malloc(nr_vcpus * sizeof(*vcpu_threads));
+ +	TEST_ASSERT(vcpu_threads, "Memory allocation failed");
+ +
+ +	perf_test_setup_vcpus(vm, nr_vcpus, guest_percpu_mem_size,
+ +			      p->partition_vcpu_memory_access);
+ +
+ +	sync_global_to_guest(vm, perf_test_args);
+ +
+++=======
+++>>>>>>> 81bcb26172a8 (KVM: selftests: Move vCPU thread creation and joining to common helpers)
+  	/* Start the iterations */
+  	iteration = 0;
+  	host_quit = false;
+diff --cc tools/testing/selftests/kvm/memslot_modification_stress_test.c
+index 4cfcafea9f5a,5bd0b076f57f..000000000000
+--- a/tools/testing/selftests/kvm/memslot_modification_stress_test.c
++++ b/tools/testing/selftests/kvm/memslot_modification_stress_test.c
+@@@ -100,29 -96,15 +96,28 @@@ struct test_params 
+  static void run_test(enum vm_guest_mode mode, void *arg)
+  {
+  	struct test_params *p = arg;
+- 	pthread_t *vcpu_threads;
+  	struct kvm_vm *vm;
+- 	int vcpu_id;
+  
+  	vm = perf_test_create_vm(mode, nr_vcpus, guest_percpu_mem_size, 1,
+ -				 VM_MEM_SRC_ANONYMOUS,
+ -				 p->partition_vcpu_memory_access);
+ +				 VM_MEM_SRC_ANONYMOUS);
+  
+ +	perf_test_args.wr_fract = 1;
+ +
+++<<<<<<< HEAD
+ +	vcpu_threads = malloc(nr_vcpus * sizeof(*vcpu_threads));
+ +	TEST_ASSERT(vcpu_threads, "Memory allocation failed");
+ +
+ +	perf_test_setup_vcpus(vm, nr_vcpus, guest_percpu_mem_size,
+ +			      p->partition_vcpu_memory_access);
+ +
+ +	/* Export the shared variables to the guest */
+ +	sync_global_to_guest(vm, perf_test_args);
+ +
+++=======
+++>>>>>>> 81bcb26172a8 (KVM: selftests: Move vCPU thread creation and joining to common helpers)
+  	pr_info("Finished creating vCPUs\n");
+  
+- 	for (vcpu_id = 0; vcpu_id < nr_vcpus; vcpu_id++)
+- 		pthread_create(&vcpu_threads[vcpu_id], NULL, vcpu_worker,
+- 			       &perf_test_args.vcpu_args[vcpu_id]);
++ 	perf_test_start_vcpu_threads(nr_vcpus, vcpu_worker);
+  
+  	pr_info("Started all vCPUs\n");
+  
+diff --git a/tools/testing/selftests/kvm/access_tracking_perf_test.c b/tools/testing/selftests/kvm/access_tracking_perf_test.c
+index 8964fe69d998..d6d863af35a3 100644
+--- a/tools/testing/selftests/kvm/access_tracking_perf_test.c
++++ b/tools/testing/selftests/kvm/access_tracking_perf_test.c
+@@ -215,9 +215,8 @@ static bool spin_wait_for_next_iteration(int *current_iteration)
+ 	return true;
+ }
+ 
+-static void *vcpu_thread_main(void *arg)
++static void vcpu_thread_main(struct perf_test_vcpu_args *vcpu_args)
+ {
+-	struct perf_test_vcpu_args *vcpu_args = arg;
+ 	struct kvm_vm *vm = perf_test_args.vm;
+ 	int vcpu_id = vcpu_args->vcpu_id;
+ 	int current_iteration = 0;
+@@ -235,8 +234,6 @@ static void *vcpu_thread_main(void *arg)
+ 
+ 		vcpu_last_completed_iteration[vcpu_id] = current_iteration;
+ 	}
+-
+-	return NULL;
+ }
+ 
+ static void spin_wait_for_vcpu(int vcpu_id, int target_iteration)
+@@ -296,37 +293,10 @@ static void mark_memory_idle(struct kvm_vm *vm, int vcpus)
+ 	run_iteration(vm, vcpus, "Mark memory idle");
+ }
+ 
+-static pthread_t *create_vcpu_threads(int vcpus)
+-{
+-	pthread_t *vcpu_threads;
+-	int i;
+-
+-	vcpu_threads = malloc(vcpus * sizeof(vcpu_threads[0]));
+-	TEST_ASSERT(vcpu_threads, "Failed to allocate vcpu_threads.");
+-
+-	for (i = 0; i < vcpus; i++)
+-		pthread_create(&vcpu_threads[i], NULL, vcpu_thread_main,
+-			       &perf_test_args.vcpu_args[i]);
+-
+-	return vcpu_threads;
+-}
+-
+-static void terminate_vcpu_threads(pthread_t *vcpu_threads, int vcpus)
+-{
+-	int i;
+-
+-	/* Set done to signal the vCPU threads to exit */
+-	done = true;
+-
+-	for (i = 0; i < vcpus; i++)
+-		pthread_join(vcpu_threads[i], NULL);
+-}
+-
+ static void run_test(enum vm_guest_mode mode, void *arg)
+ {
+ 	struct test_params *params = arg;
+ 	struct kvm_vm *vm;
+-	pthread_t *vcpu_threads;
+ 	int vcpus = params->vcpus;
+ 
+ 	vm = perf_test_create_vm(mode, vcpus, params->vcpu_memory_bytes, 1,
+@@ -335,7 +305,7 @@ static void run_test(enum vm_guest_mode mode, void *arg)
+ 	perf_test_setup_vcpus(vm, vcpus, params->vcpu_memory_bytes,
+ 			      !overlap_memory_access);
+ 
+-	vcpu_threads = create_vcpu_threads(vcpus);
++	perf_test_start_vcpu_threads(vcpus, vcpu_thread_main);
+ 
+ 	pr_info("\n");
+ 	access_memory(vm, vcpus, ACCESS_WRITE, "Populating memory");
+@@ -350,8 +320,10 @@ static void run_test(enum vm_guest_mode mode, void *arg)
+ 	mark_memory_idle(vm, vcpus);
+ 	access_memory(vm, vcpus, ACCESS_READ, "Reading from idle memory");
+ 
+-	terminate_vcpu_threads(vcpu_threads, vcpus);
+-	free(vcpu_threads);
++	/* Set done to signal the vCPU threads to exit */
++	done = true;
++
++	perf_test_join_vcpu_threads(vcpus);
+ 	perf_test_destroy_vm(vm);
+ }
+ 
+* Unmerged path tools/testing/selftests/kvm/demand_paging_test.c
+* Unmerged path tools/testing/selftests/kvm/dirty_log_perf_test.c
+diff --git a/tools/testing/selftests/kvm/include/perf_test_util.h b/tools/testing/selftests/kvm/include/perf_test_util.h
+index df9f1a3a3ffb..fe53533f6080 100644
+--- a/tools/testing/selftests/kvm/include/perf_test_util.h
++++ b/tools/testing/selftests/kvm/include/perf_test_util.h
+@@ -8,6 +8,8 @@
+ #ifndef SELFTEST_KVM_PERF_TEST_UTIL_H
+ #define SELFTEST_KVM_PERF_TEST_UTIL_H
+ 
++#include <pthread.h>
++
+ #include "kvm_util.h"
+ 
+ /* Default guest test virtual memory offset */
+@@ -51,4 +53,7 @@ void perf_test_setup_vcpus(struct kvm_vm *vm, int vcpus,
+ 			   uint64_t vcpu_memory_bytes,
+ 			   bool partition_vcpu_memory_access);
+ 
++void perf_test_start_vcpu_threads(int vcpus, void (*vcpu_fn)(struct perf_test_vcpu_args *));
++void perf_test_join_vcpu_threads(int vcpus);
++
+ #endif /* SELFTEST_KVM_PERF_TEST_UTIL_H */
+diff --git a/tools/testing/selftests/kvm/lib/perf_test_util.c b/tools/testing/selftests/kvm/lib/perf_test_util.c
+index 0ef80dbdc116..db2578eaa392 100644
+--- a/tools/testing/selftests/kvm/lib/perf_test_util.c
++++ b/tools/testing/selftests/kvm/lib/perf_test_util.c
+@@ -18,6 +18,20 @@ uint64_t guest_test_phys_mem;
+  */
+ static uint64_t guest_test_virt_mem = DEFAULT_GUEST_TEST_MEM;
+ 
++struct vcpu_thread {
++	/* The id of the vCPU. */
++	int vcpu_id;
++
++	/* The pthread backing the vCPU. */
++	pthread_t thread;
++};
++
++/* The vCPU threads involved in this test. */
++static struct vcpu_thread vcpu_threads[KVM_MAX_VCPUS];
++
++/* The function run by each vCPU thread, as provided by the test. */
++static void (*vcpu_thread_fn)(struct perf_test_vcpu_args *);
++
+ /*
+  * Continuously write to the first 8 bytes of each page in the
+  * specified region.
+@@ -157,3 +171,35 @@ void perf_test_setup_vcpus(struct kvm_vm *vm, int vcpus,
+ 			 (vcpu_args->pages * perf_test_args.guest_page_size));
+ 	}
+ }
++
++static void *vcpu_thread_main(void *data)
++{
++	struct vcpu_thread *vcpu = data;
++
++	vcpu_thread_fn(&perf_test_args.vcpu_args[vcpu->vcpu_id]);
++
++	return NULL;
++}
++
++void perf_test_start_vcpu_threads(int vcpus, void (*vcpu_fn)(struct perf_test_vcpu_args *))
++{
++	int vcpu_id;
++
++	vcpu_thread_fn = vcpu_fn;
++
++	for (vcpu_id = 0; vcpu_id < vcpus; vcpu_id++) {
++		struct vcpu_thread *vcpu = &vcpu_threads[vcpu_id];
++
++		vcpu->vcpu_id = vcpu_id;
++
++		pthread_create(&vcpu->thread, NULL, vcpu_thread_main, vcpu);
++	}
++}
++
++void perf_test_join_vcpu_threads(int vcpus)
++{
++	int vcpu_id;
++
++	for (vcpu_id = 0; vcpu_id < vcpus; vcpu_id++)
++		pthread_join(vcpu_threads[vcpu_id].thread, NULL);
++}
+* Unmerged path tools/testing/selftests/kvm/memslot_modification_stress_test.c
