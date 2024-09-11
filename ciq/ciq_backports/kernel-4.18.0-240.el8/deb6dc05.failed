@@ -1,0 +1,272 @@
+io_uring: don't do full *prep_worker() from io-wq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit deb6dc0544884067b93bbf9a4716be323103b911
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/deb6dc05.failed
+
+io_prep_async_worker() called io_wq_assign_next() do many useless checks:
+io_req_work_grab_env() was already called during prep, and @do_hashed
+is not ever used. Add io_prep_next_work() -- simplified version, that
+can be called io-wq.
+
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit deb6dc0544884067b93bbf9a4716be323103b911)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,6f085215be13..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -466,21 -925,104 +466,37 @@@ static void __io_commit_cqring(struct i
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static inline void io_queue_async_work(struct io_ring_ctx *ctx,
+ +				       struct io_kiocb *req)
+++=======
++ static inline void io_prep_next_work(struct io_kiocb *req,
++ 				     struct io_kiocb **link)
++ {
++ 	const struct io_op_def *def = &io_op_defs[req->opcode];
++ 
++ 	if (!(req->flags & REQ_F_ISREG) && def->unbound_nonreg_file)
++ 		req->work.flags |= IO_WQ_WORK_UNBOUND;
++ 
++ 	*link = io_prep_linked_timeout(req);
++ }
++ 
++ static inline bool io_prep_async_work(struct io_kiocb *req,
++ 				      struct io_kiocb **link)
+++>>>>>>> deb6dc054488 (io_uring: don't do full *prep_worker() from io-wq)
+  {
+ -	const struct io_op_def *def = &io_op_defs[req->opcode];
+ -	bool do_hashed = false;
+ -
+ -	if (req->flags & REQ_F_ISREG) {
+ -		if (def->hash_reg_file)
+ -			do_hashed = true;
+ -	} else {
+ -		if (def->unbound_nonreg_file)
+ -			req->work.flags |= IO_WQ_WORK_UNBOUND;
+ -	}
+ -
+ -	io_req_work_grab_env(req, def);
+ -
+ -	*link = io_prep_linked_timeout(req);
+ -	return do_hashed;
+ -}
+ -
+ -static inline void io_queue_async_work(struct io_kiocb *req)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	struct io_kiocb *link;
+ -	bool do_hashed;
+ -
+ -	do_hashed = io_prep_async_work(req, &link);
+ -
+ -	trace_io_uring_queue_async_work(ctx, do_hashed, req, &req->work,
+ -					req->flags);
+ -	if (!do_hashed) {
+ -		io_wq_enqueue(ctx->io_wq, &req->work);
+ -	} else {
+ -		io_wq_enqueue_hashed(ctx->io_wq, &req->work,
+ -					file_inode(req->file));
+ -	}
+ -
+ -	if (link)
+ -		io_queue_linked_timeout(link);
+ -}
+ -
+ -static void io_kill_timeout(struct io_kiocb *req)
+ -{
+ -	int ret;
+ +	int rw = 0;
+  
+ -	ret = hrtimer_try_to_cancel(&req->io->timeout.timer);
+ -	if (ret != -1) {
+ -		atomic_inc(&req->ctx->cq_timeouts);
+ -		list_del_init(&req->list);
+ -		io_cqring_fill_event(req, 0);
+ -		io_put_req(req);
+ +	if (req->submit.sqe) {
+ +		switch (req->submit.sqe->opcode) {
+ +		case IORING_OP_WRITEV:
+ +		case IORING_OP_WRITE_FIXED:
+ +			rw = !(req->rw.ki_flags & IOCB_DIRECT);
+ +			break;
+ +		}
+  	}
+ -}
+ -
+ -static void io_kill_timeouts(struct io_ring_ctx *ctx)
+ -{
+ -	struct io_kiocb *req, *tmp;
+  
+ -	spin_lock_irq(&ctx->completion_lock);
+ -	list_for_each_entry_safe(req, tmp, &ctx->timeout_list, list)
+ -		io_kill_timeout(req);
+ -	spin_unlock_irq(&ctx->completion_lock);
+ +	queue_work(ctx->sqo_wq[rw], &req->work);
+  }
+  
+  static void io_commit_cqring(struct io_ring_ctx *ctx)
+@@@ -1487,35 -2433,133 +1503,99 @@@ static int io_prep_fsync(struct io_kioc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int io_fsync(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+++=======
++ static bool io_req_cancelled(struct io_kiocb *req)
++ {
++ 	if (req->work.flags & IO_WQ_WORK_CANCEL) {
++ 		req_set_fail_links(req);
++ 		io_cqring_add_event(req, -ECANCELED);
++ 		io_put_req(req);
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static void io_link_work_cb(struct io_wq_work **workptr)
++ {
++ 	struct io_wq_work *work = *workptr;
++ 	struct io_kiocb *link = work->data;
++ 
++ 	io_queue_linked_timeout(link);
++ 	work->func = io_wq_submit_work;
++ }
++ 
++ static void io_wq_assign_next(struct io_wq_work **workptr, struct io_kiocb *nxt)
++ {
++ 	struct io_kiocb *link;
++ 
++ 	io_prep_next_work(nxt, &link);
++ 	*workptr = &nxt->work;
++ 	if (link) {
++ 		nxt->work.flags |= IO_WQ_WORK_CB;
++ 		nxt->work.func = io_link_work_cb;
++ 		nxt->work.data = link;
++ 	}
++ }
++ 
++ static void __io_fsync(struct io_kiocb *req, struct io_kiocb **nxt)
++ {
++ 	loff_t end = req->sync.off + req->sync.len;
++ 	int ret;
++ 
++ 	ret = vfs_fsync_range(req->file, req->sync.off,
++ 				end > 0 ? end : LLONG_MAX,
++ 				req->sync.flags & IORING_FSYNC_DATASYNC);
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_cqring_add_event(req, ret);
++ 	io_put_req_find_next(req, nxt);
++ }
++ 
++ static void io_fsync_finish(struct io_wq_work **workptr)
++ {
++ 	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
++ 	struct io_kiocb *nxt = NULL;
++ 
++ 	if (io_req_cancelled(req))
++ 		return;
++ 	__io_fsync(req, &nxt);
++ 	if (nxt)
++ 		io_wq_assign_next(workptr, nxt);
++ }
++ 
++ static int io_fsync(struct io_kiocb *req, struct io_kiocb **nxt,
+++>>>>>>> deb6dc054488 (io_uring: don't do full *prep_worker() from io-wq)
+  		    bool force_nonblock)
+  {
+ -	/* fsync always requires a blocking context */
+ -	if (force_nonblock) {
+ -		io_put_req(req);
+ -		req->work.func = io_fsync_finish;
+ -		return -EAGAIN;
+ -	}
+ -	__io_fsync(req, nxt);
+ -	return 0;
+ -}
+ -
+ -static void __io_fallocate(struct io_kiocb *req, struct io_kiocb **nxt)
+ -{
+ +	loff_t sqe_off = READ_ONCE(sqe->off);
+ +	loff_t sqe_len = READ_ONCE(sqe->len);
+ +	loff_t end = sqe_off + sqe_len;
+ +	unsigned fsync_flags;
+  	int ret;
+  
+ -	if (io_req_cancelled(req))
+ -		return;
+ -
+ -	ret = vfs_fallocate(req->file, req->sync.mode, req->sync.off,
+ -				req->sync.len);
+ -	if (ret < 0)
+ -		req_set_fail_links(req);
+ -	io_cqring_add_event(req, ret);
+ -	io_put_req_find_next(req, nxt);
+ -}
+ -
+ -static void io_fallocate_finish(struct io_wq_work **workptr)
+ -{
+ -	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
+ -	struct io_kiocb *nxt = NULL;
+ -
+ -	__io_fallocate(req, &nxt);
+ -	if (nxt)
+ -		io_wq_assign_next(workptr, nxt);
+ -}
+ -
+ -static int io_fallocate_prep(struct io_kiocb *req,
+ -			     const struct io_uring_sqe *sqe)
+ -{
+ -	if (sqe->ioprio || sqe->buf_index || sqe->rw_flags)
+ +	fsync_flags = READ_ONCE(sqe->fsync_flags);
+ +	if (unlikely(fsync_flags & ~IORING_FSYNC_DATASYNC))
+  		return -EINVAL;
+  
+ -	req->sync.off = READ_ONCE(sqe->off);
+ -	req->sync.len = READ_ONCE(sqe->addr);
+ -	req->sync.mode = READ_ONCE(sqe->len);
+ -	return 0;
+ -}
+ +	ret = io_prep_fsync(req, sqe);
+ +	if (ret)
+ +		return ret;
+  
+ -static int io_fallocate(struct io_kiocb *req, struct io_kiocb **nxt,
+ -			bool force_nonblock)
+ -{
+ -	/* fallocate always requiring blocking context */
+ -	if (force_nonblock) {
+ -		io_put_req(req);
+ -		req->work.func = io_fallocate_finish;
+ +	/* fsync always requires a blocking context */
+ +	if (force_nonblock)
+  		return -EAGAIN;
+ -	}
+  
+ -	__io_fallocate(req, nxt);
+ +	ret = vfs_fsync_range(req->rw.ki_filp, sqe_off,
+ +				end > 0 ? end : LLONG_MAX,
+ +				fsync_flags & IORING_FSYNC_DATASYNC);
+ +
+ +	if (ret < 0 && (req->flags & REQ_F_LINK))
+ +		req->flags |= REQ_F_FAIL_LINK;
+ +	io_cqring_add_event(req->ctx, sqe->user_data, ret);
+ +	io_put_req(req);
+  	return 0;
+  }
+  
+* Unmerged path fs/io_uring.c
