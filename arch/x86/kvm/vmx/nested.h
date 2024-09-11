@@ -256,7 +256,7 @@ static inline bool fixed_bits_valid(u64 val, u64 fixed0, u64 fixed1)
 	return ((val & fixed1) | fixed0) == val;
 }
 
-static bool nested_guest_cr0_valid(struct kvm_vcpu *vcpu, unsigned long val)
+static inline bool nested_guest_cr0_valid(struct kvm_vcpu *vcpu, unsigned long val)
 {
 	u64 fixed0 = to_vmx(vcpu)->nested.msrs.cr0_fixed0;
 	u64 fixed1 = to_vmx(vcpu)->nested.msrs.cr0_fixed1;
@@ -270,7 +270,7 @@ static bool nested_guest_cr0_valid(struct kvm_vcpu *vcpu, unsigned long val)
 	return fixed_bits_valid(val, fixed0, fixed1);
 }
 
-static bool nested_host_cr0_valid(struct kvm_vcpu *vcpu, unsigned long val)
+static inline bool nested_host_cr0_valid(struct kvm_vcpu *vcpu, unsigned long val)
 {
 	u64 fixed0 = to_vmx(vcpu)->nested.msrs.cr0_fixed0;
 	u64 fixed1 = to_vmx(vcpu)->nested.msrs.cr0_fixed1;
@@ -278,7 +278,7 @@ static bool nested_host_cr0_valid(struct kvm_vcpu *vcpu, unsigned long val)
 	return fixed_bits_valid(val, fixed0, fixed1);
 }
 
-static bool nested_cr4_valid(struct kvm_vcpu *vcpu, unsigned long val)
+static inline bool nested_cr4_valid(struct kvm_vcpu *vcpu, unsigned long val)
 {
 	u64 fixed0 = to_vmx(vcpu)->nested.msrs.cr4_fixed0;
 	u64 fixed1 = to_vmx(vcpu)->nested.msrs.cr4_fixed1;
