@@ -1,0 +1,226 @@
+xfs: selectively keep sick inodes in memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Darrick J. Wong <djwong@kernel.org>
+commit 9492750a8b18f02a8dec2aab594c59aabe2e4d0d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/9492750a.failed
+
+It's important that the filesystem retain its memory of sick inodes for
+a little while after problems are found so that reports can be collected
+about what was wrong.  Don't let inode reclamation free sick inodes
+unless we're unmounting or the fs already went down.
+
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Carlos Maiolino <cmaiolino@redhat.com>
+(cherry picked from commit 9492750a8b18f02a8dec2aab594c59aabe2e4d0d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_icache.c
+diff --cc fs/xfs/xfs_icache.c
+index bcf460a4fea6,6f1383bf706a..000000000000
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@@ -67,9 -68,16 +67,22 @@@ static int xfs_icwalk_ag(struct xfs_per
+  #define XFS_ICWALK_FLAG_DROP_GDQUOT	(1U << 30)
+  #define XFS_ICWALK_FLAG_DROP_PDQUOT	(1U << 29)
+  
+++<<<<<<< HEAD
+ +#define XFS_ICWALK_PRIVATE_FLAGS	(XFS_ICWALK_FLAG_DROP_UDQUOT | \
+ +					 XFS_ICWALK_FLAG_DROP_GDQUOT | \
+ +					 XFS_ICWALK_FLAG_DROP_PDQUOT)
+++=======
++ /* Stop scanning after icw_scan_limit inodes. */
++ #define XFS_ICWALK_FLAG_SCAN_LIMIT	(1U << 28)
++ 
++ #define XFS_ICWALK_FLAG_RECLAIM_SICK	(1U << 27)
++ 
++ #define XFS_ICWALK_PRIVATE_FLAGS	(XFS_ICWALK_FLAG_DROP_UDQUOT | \
++ 					 XFS_ICWALK_FLAG_DROP_GDQUOT | \
++ 					 XFS_ICWALK_FLAG_DROP_PDQUOT | \
++ 					 XFS_ICWALK_FLAG_SCAN_LIMIT | \
++ 					 XFS_ICWALK_FLAG_RECLAIM_SICK)
+++>>>>>>> 9492750a8b18 (xfs: selectively keep sick inodes in memory)
+  
+  /*
+   * Allocate and initialise an xfs_inode.
+@@@ -916,8 -912,9 +929,14 @@@ xfs_dqrele_all_inodes
+   * Return true if we grabbed it, false otherwise.
+   */
+  static bool
+++<<<<<<< HEAD
+ +xfs_reclaim_inode_grab(
+ +	struct xfs_inode	*ip)
+++=======
++ xfs_reclaim_igrab(
++ 	struct xfs_inode	*ip,
++ 	struct xfs_eofblocks	*eofb)
+++>>>>>>> 9492750a8b18 (xfs: selectively keep sick inodes in memory)
+  {
+  	ASSERT(rcu_read_lock_held());
+  
+@@@ -1028,105 -1033,30 +1055,129 @@@ out
+  	xfs_iflags_clear(ip, XFS_IRECLAIM);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Walk the AGs and reclaim the inodes in them. Even if the filesystem is
+ + * corrupted, we still want to try to reclaim all the inodes. If we don't,
+ + * then a shut down during filesystem unmount reclaim walk leak all the
+ + * unreclaimed inodes.
+ + *
+ + * Returns non-zero if any AGs or inodes were skipped in the reclaim pass
+ + * so that callers that want to block until all dirty inodes are written back
+ + * and reclaimed can sanely loop.
+ + */
+ +static void
+ +xfs_reclaim_inodes_ag(
+ +	struct xfs_mount	*mp,
+ +	int			*nr_to_scan)
+ +{
+ +	struct xfs_perag	*pag;
+ +	xfs_agnumber_t		agno;
+ +
+ +	for_each_perag_tag(mp, agno, pag, XFS_ICI_RECLAIM_TAG) {
+ +		unsigned long	first_index = 0;
+ +		int		done = 0;
+ +		int		nr_found = 0;
+ +
+ +		first_index = READ_ONCE(pag->pag_ici_reclaim_cursor);
+ +		do {
+ +			struct xfs_inode *batch[XFS_LOOKUP_BATCH];
+ +			int	i;
+ +
+ +			rcu_read_lock();
+ +			nr_found = radix_tree_gang_lookup_tag(
+ +					&pag->pag_ici_root,
+ +					(void **)batch, first_index,
+ +					XFS_LOOKUP_BATCH,
+ +					XFS_ICI_RECLAIM_TAG);
+ +			if (!nr_found) {
+ +				done = 1;
+ +				rcu_read_unlock();
+ +				break;
+ +			}
+ +
+ +			/*
+ +			 * Grab the inodes before we drop the lock. if we found
+ +			 * nothing, nr == 0 and the loop will be skipped.
+ +			 */
+ +			for (i = 0; i < nr_found; i++) {
+ +				struct xfs_inode *ip = batch[i];
+ +
+ +				if (done || !xfs_reclaim_inode_grab(ip))
+ +					batch[i] = NULL;
+ +
+ +				/*
+ +				 * Update the index for the next lookup. Catch
+ +				 * overflows into the next AG range which can
+ +				 * occur if we have inodes in the last block of
+ +				 * the AG and we are currently pointing to the
+ +				 * last inode.
+ +				 *
+ +				 * Because we may see inodes that are from the
+ +				 * wrong AG due to RCU freeing and
+ +				 * reallocation, only update the index if it
+ +				 * lies in this AG. It was a race that lead us
+ +				 * to see this inode, so another lookup from
+ +				 * the same index will not find it again.
+ +				 */
+ +				if (XFS_INO_TO_AGNO(mp, ip->i_ino) !=
+ +								pag->pag_agno)
+ +					continue;
+ +				first_index = XFS_INO_TO_AGINO(mp, ip->i_ino + 1);
+ +				if (first_index < XFS_INO_TO_AGINO(mp, ip->i_ino))
+ +					done = 1;
+ +			}
+ +
+ +			/* unlock now we've grabbed the inodes. */
+ +			rcu_read_unlock();
+ +
+ +			for (i = 0; i < nr_found; i++) {
+ +				if (batch[i])
+ +					xfs_reclaim_inode(batch[i], pag);
+ +			}
+ +
+ +			*nr_to_scan -= XFS_LOOKUP_BATCH;
+ +			cond_resched();
+ +		} while (nr_found && !done && *nr_to_scan > 0);
+ +
+ +		if (done)
+ +			first_index = 0;
+ +		WRITE_ONCE(pag->pag_ici_reclaim_cursor, first_index);
+ +	}
+++=======
++ /* Reclaim sick inodes if we're unmounting or the fs went down. */
++ static inline bool
++ xfs_want_reclaim_sick(
++ 	struct xfs_mount	*mp)
++ {
++ 	return (mp->m_flags & XFS_MOUNT_UNMOUNTING) ||
++ 	       (mp->m_flags & XFS_MOUNT_NORECOVERY) ||
++ 	       XFS_FORCED_SHUTDOWN(mp);
+++>>>>>>> 9492750a8b18 (xfs: selectively keep sick inodes in memory)
+  }
+  
+  void
+  xfs_reclaim_inodes(
+  	struct xfs_mount	*mp)
+  {
+++<<<<<<< HEAD
+ +	int		nr_to_scan = INT_MAX;
+ +
+ +	while (radix_tree_tagged(&mp->m_perag_tree, XFS_ICI_RECLAIM_TAG)) {
+ +		xfs_ail_push_all_sync(mp->m_ail);
+ +		xfs_reclaim_inodes_ag(mp, &nr_to_scan);
+++=======
++ 	struct xfs_eofblocks	eofb = {
++ 		.eof_flags	= 0,
++ 	};
++ 
++ 	if (xfs_want_reclaim_sick(mp))
++ 		eofb.eof_flags |= XFS_ICWALK_FLAG_RECLAIM_SICK;
++ 
++ 	while (radix_tree_tagged(&mp->m_perag_tree, XFS_ICI_RECLAIM_TAG)) {
++ 		xfs_ail_push_all_sync(mp->m_ail);
++ 		xfs_icwalk(mp, XFS_ICWALK_RECLAIM, &eofb);
+++>>>>>>> 9492750a8b18 (xfs: selectively keep sick inodes in memory)
+  	}
+  }
+  
+@@@ -1142,6 -1072,14 +1193,17 @@@ xfs_reclaim_inodes_nr
+  	struct xfs_mount	*mp,
+  	int			nr_to_scan)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct xfs_eofblocks	eofb = {
++ 		.eof_flags	= XFS_ICWALK_FLAG_SCAN_LIMIT,
++ 		.icw_scan_limit	= nr_to_scan,
++ 	};
++ 
++ 	if (xfs_want_reclaim_sick(mp))
++ 		eofb.eof_flags |= XFS_ICWALK_FLAG_RECLAIM_SICK;
++ 
+++>>>>>>> 9492750a8b18 (xfs: selectively keep sick inodes in memory)
+  	/* kick background reclaimer and push the AIL */
+  	xfs_reclaim_work_queue(mp);
+  	xfs_ail_push_all(mp->m_ail);
+@@@ -1690,6 -1637,8 +1753,11 @@@ xfs_icwalk_igrab
+  		return xfs_dqrele_igrab(ip);
+  	case XFS_ICWALK_BLOCKGC:
+  		return xfs_blockgc_igrab(ip);
+++<<<<<<< HEAD
+++=======
++ 	case XFS_ICWALK_RECLAIM:
++ 		return xfs_reclaim_igrab(ip, eofb);
+++>>>>>>> 9492750a8b18 (xfs: selectively keep sick inodes in memory)
+  	default:
+  		return false;
+  	}
+* Unmerged path fs/xfs/xfs_icache.c
