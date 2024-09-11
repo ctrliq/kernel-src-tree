@@ -1,0 +1,153 @@
+netfilter: nf_tables: use dedicated mutex to guard transactions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit f102d66b335a417d4848da9441f585695a838934
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f102d66b.failed
+
+Continue to use nftnl subsys mutex to protect (un)registration of hook types,
+expressions and so on, but force batch operations to do their own
+locking.
+
+This allows distinct net namespaces to perform transactions in parallel.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit f102d66b335a417d4848da9441f585695a838934)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nft_chain_filter.c
+diff --cc net/netfilter/nf_tables_api.c
+index 6c3c56b8f3d5,c0fb2bcd30fe..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -1487,9 -1448,11 +1507,17 @@@ static int nft_chain_parse_hook(struct 
+  	struct net_device *dev;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	err = nla_parse_nested_deprecated(ha, NFTA_HOOK_MAX,
+ +					  nla[NFTA_CHAIN_HOOK],
+ +					  nft_hook_policy, NULL);
+++=======
++ 	lockdep_assert_held(&net->nft.commit_mutex);
++ 	lockdep_nfnl_nft_mutex_not_held();
++ 
++ 	err = nla_parse_nested(ha, NFTA_HOOK_MAX, nla[NFTA_CHAIN_HOOK],
++ 			       nft_hook_policy, NULL);
+++>>>>>>> f102d66b335a (netfilter: nf_tables: use dedicated mutex to guard transactions)
+  	if (err < 0)
+  		return err;
+  
+@@@ -2511,8 -2411,9 +2543,9 @@@ err
+  static void nf_tables_rule_destroy(const struct nft_ctx *ctx,
+  				   struct nft_rule *rule)
+  {
+ -	struct nft_expr *expr;
+ +	struct nft_expr *expr, *next;
+  
++ 	lockdep_assert_held(&ctx->net->nft.commit_mutex);
+  	/*
+  	 * Careful: some expressions might not be initialized in case this
+  	 * is called on error from nf_tables_newrule().
+diff --cc net/netfilter/nft_chain_filter.c
+index 85666c974c62,ea5b7c4944f6..000000000000
+--- a/net/netfilter/nft_chain_filter.c
++++ b/net/netfilter/nft_chain_filter.c
+@@@ -325,7 -318,11 +325,15 @@@ static int nf_tables_netdev_event(struc
+  	    event != NETDEV_CHANGENAME)
+  		return NOTIFY_DONE;
+  
+++<<<<<<< HEAD
+ +	nfnl_lock(NFNL_SUBSYS_NFTABLES);
+++=======
++ 	ctx.net = maybe_get_net(ctx.net);
++ 	if (!ctx.net)
++ 		return NOTIFY_DONE;
++ 
++ 	mutex_lock(&ctx.net->nft.commit_mutex);
+++>>>>>>> f102d66b335a (netfilter: nf_tables: use dedicated mutex to guard transactions)
+  	list_for_each_entry(table, &ctx.net->nft.tables, list) {
+  		if (table->family != NFPROTO_NETDEV)
+  			continue;
+@@@ -340,7 -337,8 +348,12 @@@
+  			nft_netdev_event(event, dev, &ctx);
+  		}
+  	}
+++<<<<<<< HEAD
+ +	nfnl_unlock(NFNL_SUBSYS_NFTABLES);
+++=======
++ 	mutex_unlock(&ctx.net->nft.commit_mutex);
++ 	put_net(ctx.net);
+++>>>>>>> f102d66b335a (netfilter: nf_tables: use dedicated mutex to guard transactions)
+  
+  	return NOTIFY_DONE;
+  }
+diff --git a/include/net/netns/nftables.h b/include/net/netns/nftables.h
+index 94767ea3a490..286fd960896f 100644
+--- a/include/net/netns/nftables.h
++++ b/include/net/netns/nftables.h
+@@ -7,6 +7,7 @@
+ struct netns_nftables {
+ 	struct list_head	tables;
+ 	struct list_head	commit_list;
++	struct mutex		commit_mutex;
+ 	unsigned int		base_seq;
+ 	u8			gencursor;
+ 	u8			validate_state;
+* Unmerged path net/netfilter/nf_tables_api.c
+diff --git a/net/netfilter/nfnetlink.c b/net/netfilter/nfnetlink.c
+index 22d40a428157..4abbb452cf6c 100644
+--- a/net/netfilter/nfnetlink.c
++++ b/net/netfilter/nfnetlink.c
+@@ -351,6 +351,8 @@ static void nfnetlink_rcv_batch(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 		return kfree_skb(skb);
+ 	}
+ 
++	nfnl_unlock(subsys_id);
++
+ 	while (skb->len >= nlmsg_total_size(0)) {
+ 		int msglen, type;
+ 
+@@ -474,13 +476,8 @@ static void nfnetlink_rcv_batch(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	}
+ done:
+ 	if (status & NFNL_BATCH_REPLAY) {
+-		const struct nfnetlink_subsystem *ss2;
+-
+-		ss2 = nfnl_dereference_protected(subsys_id);
+-		if (ss2 == ss)
+-			ss->abort(net, oskb);
++		ss->abort(net, oskb);
+ 		nfnl_err_reset(&err_list);
+-		nfnl_unlock(subsys_id);
+ 		kfree_skb(skb);
+ 		module_put(ss->owner);
+ 		goto replay;
+@@ -500,7 +497,6 @@ static void nfnetlink_rcv_batch(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 		ss->cleanup(net);
+ 
+ 	nfnl_err_deliver(&err_list, oskb);
+-	nfnl_unlock(subsys_id);
+ 	kfree_skb(skb);
+ 	module_put(ss->owner);
+ }
+* Unmerged path net/netfilter/nft_chain_filter.c
+diff --git a/net/netfilter/nft_dynset.c b/net/netfilter/nft_dynset.c
+index 9b6f3042c6b0..ecb25b9185ef 100644
+--- a/net/netfilter/nft_dynset.c
++++ b/net/netfilter/nft_dynset.c
+@@ -118,6 +118,8 @@ static int nft_dynset_init(const struct nft_ctx *ctx,
+ 	u64 timeout;
+ 	int err;
+ 
++	lockdep_assert_held(&ctx->net->nft.commit_mutex);
++
+ 	if (tb[NFTA_DYNSET_SET_NAME] == NULL ||
+ 	    tb[NFTA_DYNSET_OP] == NULL ||
+ 	    tb[NFTA_DYNSET_SREG_KEY] == NULL)
