@@ -1,0 +1,111 @@
+powerpc/watchdog: Avoid holding wd_smp_lock over printk and smp_send_nmi_ipi
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Nicholas Piggin <npiggin@gmail.com>
+commit 76521c4b0291ad25723638ade5a0ff4d5f659771
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/76521c4b.failed
+
+There is a deadlock with the console_owner lock and the wd_smp_lock:
+
+CPU x takes the console_owner lock
+CPU y takes a watchdog timer interrupt and takes __wd_smp_lock
+CPU x takes a soft-NMI interrupt, detects deadlock, spins on __wd_smp_lock
+CPU y detects deadlock, tries to print something and spins on console_owner
+-> deadlock
+
+Change the watchdog locking scheme so wd_smp_lock protects the watchdog
+internal data, but "reporting" (printing, issuing NMI IPIs, taking any
+action outside of watchdog) uses a non-waiting exclusion. If a CPU detects
+a problem but can not take the reporting lock, it just returns because
+something else is already reporting. It will try again at some point.
+
+Typically hard lockup watchdog report usefulness is not impacted due to
+failure to spewing a large enough amount of data in as short a time as
+possible, but by messages getting garbled.
+
+Laurent debugged this and found the deadlock, and this patch is based on
+his general approach to avoid expensive operations while holding the lock.
+With the addition of the reporting exclusion.
+
+	Signed-off-by: Laurent Dufour <ldufour@linux.ibm.com>
+[np: rework to add reporting exclusion update changelog]
+	Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20211110025056.2084347-4-npiggin@gmail.com
+
+(cherry picked from commit 76521c4b0291ad25723638ade5a0ff4d5f659771)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/watchdog.c
+diff --cc arch/powerpc/kernel/watchdog.c
+index ad2f126d0d8d,af16a835ddec..000000000000
+--- a/arch/powerpc/kernel/watchdog.c
++++ b/arch/powerpc/kernel/watchdog.c
+@@@ -171,27 -216,20 +213,27 @@@ static void watchdog_smp_panic(int cpu
+  		 * Try to trigger the stuck CPUs, unless we are going to
+  		 * get a backtrace on all of them anyway.
+  		 */
+- 		for_each_cpu(c, &wd_smp_cpus_pending) {
+- 			bool empty;
+- 			if (c == cpu)
+- 				continue;
+- 			/* Take the stuck CPUs out of the watch group */
+- 			empty = set_cpu_stuck(c, tb);
++ 		for_each_cpu(c, &wd_smp_cpus_ipi) {
+  			smp_send_nmi_ipi(c, wd_lockup_ipi, 1000000);
+- 			if (empty)
+- 				break;
++ 			__cpumask_clear_cpu(c, &wd_smp_cpus_ipi);
+  		}
+ -	} else {
+ -		trigger_allbutself_cpu_backtrace();
+ -		cpumask_clear(&wd_smp_cpus_ipi);
+++<<<<<<< HEAD
+  	}
+  
+ +	wd_smp_unlock(&flags);
+ +
+ +	printk_safe_flush();
+  	/*
+ -	 * Force flush any remote buffers that might be stuck in IRQ context
+ -	 * and therefore could not run their irq_work.
+ +	 * printk_safe_flush() seems to require another print
+ +	 * before anything actually goes out to console.
+  	 */
+ -	printk_trigger_flush();
+ +	if (sysctl_hardlockup_all_cpu_backtrace)
+++=======
+++	} else {
+++>>>>>>> 76521c4b0291 (powerpc/watchdog: Avoid holding wd_smp_lock over printk and smp_send_nmi_ipi)
+ +		trigger_allbutself_cpu_backtrace();
+++		cpumask_clear(&wd_smp_cpus_ipi);
+++	}
+  
+  	if (hardlockup_panic)
+  		nmi_panic(NULL, "Hard LOCKUP");
+@@@ -316,10 -362,19 +365,19 @@@ void soft_nmi_interrupt(struct pt_regs 
+  		wd_smp_lock(&flags);
+  		if (cpumask_test_cpu(cpu, &wd_smp_cpus_stuck)) {
+  			wd_smp_unlock(&flags);
+ -			return 0;
+ +			goto out;
+  		}
++ 		if (!wd_try_report()) {
++ 			wd_smp_unlock(&flags);
++ 			/* Couldn't report, try again in 100ms */
++ 			mtspr(SPRN_DEC, 100 * tb_ticks_per_usec * 1000);
++ 			return 0;
++ 		}
++ 
+  		set_cpu_stuck(cpu, tb);
+  
++ 		wd_smp_unlock(&flags);
++ 
+  		pr_emerg("CPU %d self-detected hard LOCKUP @ %pS\n",
+  			 cpu, (void *)regs->nip);
+  		pr_emerg("CPU %d TB:%lld, last heartbeat TB:%lld (%lldms ago)\n",
+* Unmerged path arch/powerpc/kernel/watchdog.c
