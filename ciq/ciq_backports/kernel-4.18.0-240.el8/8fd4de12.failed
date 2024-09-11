@@ -1,0 +1,161 @@
+mptcp: cache msk on MP_JOIN init_req
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 8fd4de1275580a1befa1456d1070eaf6489fb48f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8fd4de12.failed
+
+The msk ownership is transferred to the child socket at
+3rd ack time, so that we avoid more lookups later. If the
+request does not reach the 3rd ack, the MSK reference is
+dropped at request sock release time.
+
+As a side effect, fallback is now tracked by a NULL msk
+reference instead of zeroed 'mp_join' field. This will
+simplify the next patch.
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8fd4de1275580a1befa1456d1070eaf6489fb48f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/subflow.c
+diff --cc net/mptcp/subflow.c
+index c928ab97b1e2,4068bdb2523b..000000000000
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@@ -78,19 -89,18 +81,24 @@@ static void subflow_generate_hmac(u64 k
+  }
+  
+  /* validate received token and create truncated hmac and nonce for SYN-ACK */
+- static bool subflow_token_join_request(struct request_sock *req,
+- 				       const struct sk_buff *skb)
++ static struct mptcp_sock *subflow_token_join_request(struct request_sock *req,
++ 						     const struct sk_buff *skb)
+  {
+  	struct mptcp_subflow_request_sock *subflow_req = mptcp_subflow_rsk(req);
+ -	u8 hmac[SHA256_DIGEST_SIZE];
+ +	u8 hmac[MPTCPOPT_HMAC_LEN];
+  	struct mptcp_sock *msk;
+  	int local_id;
+  
+  	msk = mptcp_token_get_sock(subflow_req->token);
+  	if (!msk) {
+++<<<<<<< HEAD
+ +		pr_debug("subflow_req=%p, token=%u - not found\n",
+ +			 subflow_req, subflow_req->token);
+ +		return false;
+++=======
++ 		SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINNOTOKEN);
++ 		return NULL;
+++>>>>>>> 8fd4de127558 (mptcp: cache msk on MP_JOIN init_req)
+  	}
+  
+  	local_id = mptcp_pm_get_local_id(msk, (struct sock_common *)req);
+@@@ -147,19 -161,16 +154,29 @@@ static void subflow_init_req(struct req
+  			subflow_req->mp_capable = 1;
+  
+  		subflow_req->ssn_offset = TCP_SKB_CB(skb)->seq;
+ -	} else if (mp_opt.mp_join && listener->request_mptcp) {
+ +	} else if (rx_opt.mptcp.mp_join && listener->request_mptcp) {
+  		subflow_req->ssn_offset = TCP_SKB_CB(skb)->seq;
+  		subflow_req->mp_join = 1;
+++<<<<<<< HEAD
+ +		subflow_req->backup = rx_opt.mptcp.backup;
+ +		subflow_req->remote_id = rx_opt.mptcp.join_id;
+ +		subflow_req->token = rx_opt.mptcp.token;
+ +		subflow_req->remote_nonce = rx_opt.mptcp.nonce;
+ +		pr_debug("token=%u, remote_nonce=%u", subflow_req->token,
+ +			 subflow_req->remote_nonce);
+ +		if (!subflow_token_join_request(req, skb)) {
+ +			subflow_req->mp_join = 0;
+ +			// @@ need to trigger RST
+ +		}
+++=======
++ 		subflow_req->backup = mp_opt.backup;
++ 		subflow_req->remote_id = mp_opt.join_id;
++ 		subflow_req->token = mp_opt.token;
++ 		subflow_req->remote_nonce = mp_opt.nonce;
++ 		subflow_req->msk = subflow_token_join_request(req, skb);
++ 		pr_debug("token=%u, remote_nonce=%u msk=%p", subflow_req->token,
++ 			 subflow_req->remote_nonce, subflow_req->msk);
+++>>>>>>> 8fd4de127558 (mptcp: cache msk on MP_JOIN init_req)
+  	}
+  }
+  
+@@@ -308,15 -348,14 +325,14 @@@ drop
+  
+  /* validate hmac received in third ACK */
+  static bool subflow_hmac_valid(const struct request_sock *req,
+ -			       const struct mptcp_options_received *mp_opt)
+ +			       const struct tcp_options_received *rx_opt)
+  {
+  	const struct mptcp_subflow_request_sock *subflow_req;
+ -	u8 hmac[SHA256_DIGEST_SIZE];
+ +	u8 hmac[MPTCPOPT_HMAC_LEN];
+  	struct mptcp_sock *msk;
+- 	bool ret;
+  
+  	subflow_req = mptcp_subflow_rsk(req);
+- 	msk = mptcp_token_get_sock(subflow_req->token);
++ 	msk = subflow_req->msk;
+  	if (!msk)
+  		return false;
+  
+@@@ -324,12 -363,7 +340,16 @@@
+  			      subflow_req->remote_nonce,
+  			      subflow_req->local_nonce, hmac);
+  
+++<<<<<<< HEAD
+ +	ret = true;
+ +	if (crypto_memneq(hmac, rx_opt->mptcp.hmac, sizeof(hmac)))
+ +		ret = false;
+ +
+ +	sock_put((struct sock *)msk);
+ +	return ret;
+++=======
++ 	return !crypto_memneq(hmac, mp_opt->hmac, MPTCPOPT_HMAC_LEN);
+++>>>>>>> 8fd4de127558 (mptcp: cache msk on MP_JOIN init_req)
+  }
+  
+  static void mptcp_sock_destruct(struct sock *sk)
+@@@ -463,13 -515,18 +483,15 @@@ create_child
+  		} else if (ctx->mp_join) {
+  			struct mptcp_sock *owner;
+  
+- 			owner = mptcp_token_get_sock(ctx->token);
++ 			owner = subflow_req->msk;
+  			if (!owner)
+ -				goto dispose_child;
+ +				goto close_child;
+  
++ 			/* move the msk reference ownership to the subflow */
++ 			subflow_req->msk = NULL;
+  			ctx->conn = (struct sock *)owner;
+  			if (!mptcp_finish_join(child))
+ -				goto dispose_child;
+ -
+ -			SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINACKRX);
+ -			tcp_rsk(req)->drop_req = true;
+ +				goto close_child;
+  		}
+  	}
+  
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 07a6c079534b..4fc44af13c2d 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -213,6 +213,7 @@ struct mptcp_subflow_request_sock {
+ 	u64	thmac;
+ 	u32	local_nonce;
+ 	u32	remote_nonce;
++	struct mptcp_sock	*msk;
+ };
+ 
+ static inline struct mptcp_subflow_request_sock *
+* Unmerged path net/mptcp/subflow.c
