@@ -286,7 +286,7 @@ static void xsk_configure_umem(struct ifobject *data, void *buffer, u64 size)
 static void xsk_populate_fill_ring(struct xsk_umem_info *umem)
 {
 	int ret, i;
-	u32 idx;
+	u32 idx = 0;
 
 	ret = xsk_ring_prod__reserve(&umem->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS, &idx);
 	if (ret != XSK_RING_PROD__DEFAULT_NUM_DESCS)
@@ -602,7 +602,7 @@ static void rx_pkt(struct xsk_socket_info *xsk, struct pollfd *fds)
 
 static void tx_only(struct xsk_socket_info *xsk, u32 *frameptr, int batch_size)
 {
-	u32 idx;
+	u32 idx = 0;
 	unsigned int i;
 
 	while (xsk_ring_prod__reserve(&xsk->tx, batch_size, &idx) < batch_size)
