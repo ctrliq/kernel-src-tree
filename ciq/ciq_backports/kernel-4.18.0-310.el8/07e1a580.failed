@@ -1,0 +1,265 @@
+psample: Add additional metadata attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Ido Schimmel <idosch@nvidia.com>
+commit 07e1a5809b595df6e125504dff6245cb2c8ed3de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/07e1a580.failed
+
+Extend psample to report the following attributes when available:
+
+* Output traffic class as a 16-bit value
+* Output traffic class occupancy in bytes as a 64-bit value
+* End-to-end latency of the packet in nanoseconds resolution
+* Software timestamp in nanoseconds resolution (always available)
+* Packet's protocol. Needed for packet dissection in user space (always
+  available)
+
+	Signed-off-by: Ido Schimmel <idosch@nvidia.com>
+	Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 07e1a5809b595df6e125504dff6245cb2c8ed3de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/psample.h
+#	net/psample/psample.c
+diff --cc include/net/psample.h
+index 68ae16bb0a4a,e328c5127757..000000000000
+--- a/include/net/psample.h
++++ b/include/net/psample.h
+@@@ -14,6 -14,19 +14,22 @@@ struct psample_group 
+  	struct rcu_head rcu;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct psample_metadata {
++ 	u32 trunc_size;
++ 	int in_ifindex;
++ 	int out_ifindex;
++ 	u16 out_tc;
++ 	u64 out_tc_occ;	/* bytes */
++ 	u64 latency;	/* nanoseconds */
++ 	u8 out_tc_valid:1,
++ 	   out_tc_occ_valid:1,
++ 	   latency_valid:1,
++ 	   unused:5;
++ };
++ 
+++>>>>>>> 07e1a5809b59 (psample: Add additional metadata attributes)
+  struct psample_group *psample_group_get(struct net *net, u32 group_num);
+  void psample_group_take(struct psample_group *group);
+  void psample_group_put(struct psample_group *group);
+diff --cc net/psample/psample.c
+index 157348b50da5,118d5d2a81a0..000000000000
+--- a/net/psample/psample.c
++++ b/net/psample/psample.c
+@@@ -210,10 -210,162 +211,20 @@@ void psample_group_put(struct psample_g
+  }
+  EXPORT_SYMBOL_GPL(psample_group_put);
+  
+ -#ifdef CONFIG_INET
+ -static int __psample_ip_tun_to_nlattr(struct sk_buff *skb,
+ -			      struct ip_tunnel_info *tun_info)
+ -{
+ -	unsigned short tun_proto = ip_tunnel_info_af(tun_info);
+ -	const void *tun_opts = ip_tunnel_info_opts(tun_info);
+ -	const struct ip_tunnel_key *tun_key = &tun_info->key;
+ -	int tun_opts_len = tun_info->options_len;
+ -
+ -	if (tun_key->tun_flags & TUNNEL_KEY &&
+ -	    nla_put_be64(skb, PSAMPLE_TUNNEL_KEY_ATTR_ID, tun_key->tun_id,
+ -			 PSAMPLE_TUNNEL_KEY_ATTR_PAD))
+ -		return -EMSGSIZE;
+ -
+ -	if (tun_info->mode & IP_TUNNEL_INFO_BRIDGE &&
+ -	    nla_put_flag(skb, PSAMPLE_TUNNEL_KEY_ATTR_IPV4_INFO_BRIDGE))
+ -		return -EMSGSIZE;
+ -
+ -	switch (tun_proto) {
+ -	case AF_INET:
+ -		if (tun_key->u.ipv4.src &&
+ -		    nla_put_in_addr(skb, PSAMPLE_TUNNEL_KEY_ATTR_IPV4_SRC,
+ -				    tun_key->u.ipv4.src))
+ -			return -EMSGSIZE;
+ -		if (tun_key->u.ipv4.dst &&
+ -		    nla_put_in_addr(skb, PSAMPLE_TUNNEL_KEY_ATTR_IPV4_DST,
+ -				    tun_key->u.ipv4.dst))
+ -			return -EMSGSIZE;
+ -		break;
+ -	case AF_INET6:
+ -		if (!ipv6_addr_any(&tun_key->u.ipv6.src) &&
+ -		    nla_put_in6_addr(skb, PSAMPLE_TUNNEL_KEY_ATTR_IPV6_SRC,
+ -				     &tun_key->u.ipv6.src))
+ -			return -EMSGSIZE;
+ -		if (!ipv6_addr_any(&tun_key->u.ipv6.dst) &&
+ -		    nla_put_in6_addr(skb, PSAMPLE_TUNNEL_KEY_ATTR_IPV6_DST,
+ -				     &tun_key->u.ipv6.dst))
+ -			return -EMSGSIZE;
+ -		break;
+ -	}
+ -	if (tun_key->tos &&
+ -	    nla_put_u8(skb, PSAMPLE_TUNNEL_KEY_ATTR_TOS, tun_key->tos))
+ -		return -EMSGSIZE;
+ -	if (nla_put_u8(skb, PSAMPLE_TUNNEL_KEY_ATTR_TTL, tun_key->ttl))
+ -		return -EMSGSIZE;
+ -	if ((tun_key->tun_flags & TUNNEL_DONT_FRAGMENT) &&
+ -	    nla_put_flag(skb, PSAMPLE_TUNNEL_KEY_ATTR_DONT_FRAGMENT))
+ -		return -EMSGSIZE;
+ -	if ((tun_key->tun_flags & TUNNEL_CSUM) &&
+ -	    nla_put_flag(skb, PSAMPLE_TUNNEL_KEY_ATTR_CSUM))
+ -		return -EMSGSIZE;
+ -	if (tun_key->tp_src &&
+ -	    nla_put_be16(skb, PSAMPLE_TUNNEL_KEY_ATTR_TP_SRC, tun_key->tp_src))
+ -		return -EMSGSIZE;
+ -	if (tun_key->tp_dst &&
+ -	    nla_put_be16(skb, PSAMPLE_TUNNEL_KEY_ATTR_TP_DST, tun_key->tp_dst))
+ -		return -EMSGSIZE;
+ -	if ((tun_key->tun_flags & TUNNEL_OAM) &&
+ -	    nla_put_flag(skb, PSAMPLE_TUNNEL_KEY_ATTR_OAM))
+ -		return -EMSGSIZE;
+ -	if (tun_opts_len) {
+ -		if (tun_key->tun_flags & TUNNEL_GENEVE_OPT &&
+ -		    nla_put(skb, PSAMPLE_TUNNEL_KEY_ATTR_GENEVE_OPTS,
+ -			    tun_opts_len, tun_opts))
+ -			return -EMSGSIZE;
+ -		else if (tun_key->tun_flags & TUNNEL_ERSPAN_OPT &&
+ -			 nla_put(skb, PSAMPLE_TUNNEL_KEY_ATTR_ERSPAN_OPTS,
+ -				 tun_opts_len, tun_opts))
+ -			return -EMSGSIZE;
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -static int psample_ip_tun_to_nlattr(struct sk_buff *skb,
+ -			    struct ip_tunnel_info *tun_info)
+ -{
+ -	struct nlattr *nla;
+ -	int err;
+ -
+ -	nla = nla_nest_start_noflag(skb, PSAMPLE_ATTR_TUNNEL);
+ -	if (!nla)
+ -		return -EMSGSIZE;
+ -
+ -	err = __psample_ip_tun_to_nlattr(skb, tun_info);
+ -	if (err) {
+ -		nla_nest_cancel(skb, nla);
+ -		return err;
+ -	}
+ -
+ -	nla_nest_end(skb, nla);
+ -
+ -	return 0;
+ -}
+ -
+ -static int psample_tunnel_meta_len(struct ip_tunnel_info *tun_info)
+ -{
+ -	unsigned short tun_proto = ip_tunnel_info_af(tun_info);
+ -	const struct ip_tunnel_key *tun_key = &tun_info->key;
+ -	int tun_opts_len = tun_info->options_len;
+ -	int sum = nla_total_size(0);	/* PSAMPLE_ATTR_TUNNEL */
+ -
+ -	if (tun_key->tun_flags & TUNNEL_KEY)
+ -		sum += nla_total_size_64bit(sizeof(u64));
+ -
+ -	if (tun_info->mode & IP_TUNNEL_INFO_BRIDGE)
+ -		sum += nla_total_size(0);
+ -
+ -	switch (tun_proto) {
+ -	case AF_INET:
+ -		if (tun_key->u.ipv4.src)
+ -			sum += nla_total_size(sizeof(u32));
+ -		if (tun_key->u.ipv4.dst)
+ -			sum += nla_total_size(sizeof(u32));
+ -		break;
+ -	case AF_INET6:
+ -		if (!ipv6_addr_any(&tun_key->u.ipv6.src))
+ -			sum += nla_total_size(sizeof(struct in6_addr));
+ -		if (!ipv6_addr_any(&tun_key->u.ipv6.dst))
+ -			sum += nla_total_size(sizeof(struct in6_addr));
+ -		break;
+ -	}
+ -	if (tun_key->tos)
+ -		sum += nla_total_size(sizeof(u8));
+ -	sum += nla_total_size(sizeof(u8));	/* TTL */
+ -	if (tun_key->tun_flags & TUNNEL_DONT_FRAGMENT)
+ -		sum += nla_total_size(0);
+ -	if (tun_key->tun_flags & TUNNEL_CSUM)
+ -		sum += nla_total_size(0);
+ -	if (tun_key->tp_src)
+ -		sum += nla_total_size(sizeof(u16));
+ -	if (tun_key->tp_dst)
+ -		sum += nla_total_size(sizeof(u16));
+ -	if (tun_key->tun_flags & TUNNEL_OAM)
+ -		sum += nla_total_size(0);
+ -	if (tun_opts_len) {
+ -		if (tun_key->tun_flags & TUNNEL_GENEVE_OPT)
+ -			sum += nla_total_size(tun_opts_len);
+ -		else if (tun_key->tun_flags & TUNNEL_ERSPAN_OPT)
+ -			sum += nla_total_size(tun_opts_len);
+ -	}
+ -
+ -	return sum;
+ -}
+ -#endif
+ -
+  void psample_sample_packet(struct psample_group *group, struct sk_buff *skb,
+ -			   u32 sample_rate, const struct psample_metadata *md)
+ +			   u32 trunc_size, int in_ifindex, int out_ifindex,
+ +			   u32 sample_rate)
+  {
+++<<<<<<< HEAD
+++=======
++ 	ktime_t tstamp = ktime_get_real();
++ 	int out_ifindex = md->out_ifindex;
++ 	int in_ifindex = md->in_ifindex;
++ 	u32 trunc_size = md->trunc_size;
++ #ifdef CONFIG_INET
++ 	struct ip_tunnel_info *tun_info;
++ #endif
+++>>>>>>> 07e1a5809b59 (psample: Add additional metadata attributes)
+  	struct sk_buff *nl_skb;
+  	int data_len;
+  	int meta_len;
+@@@ -225,8 -380,16 +239,10 @@@
+  		   nla_total_size(sizeof(u32)) +	/* sample_rate */
+  		   nla_total_size(sizeof(u32)) +	/* orig_size */
+  		   nla_total_size(sizeof(u32)) +	/* group_num */
+- 		   nla_total_size(sizeof(u32));		/* seq */
++ 		   nla_total_size(sizeof(u32)) +	/* seq */
++ 		   nla_total_size_64bit(sizeof(u64)) +	/* timestamp */
++ 		   nla_total_size(sizeof(u16));		/* protocol */
+  
+ -#ifdef CONFIG_INET
+ -	tun_info = skb_tunnel_info(skb);
+ -	if (tun_info)
+ -		meta_len += psample_tunnel_meta_len(tun_info);
+ -#endif
+ -
+  	data_len = min(skb->len, trunc_size);
+  	if (meta_len + nla_total_size(data_len) > PSAMPLE_MAX_PACKET_SIZE)
+  		data_len = PSAMPLE_MAX_PACKET_SIZE - meta_len - NLA_HDRLEN
+* Unmerged path include/net/psample.h
+diff --git a/include/uapi/linux/psample.h b/include/uapi/linux/psample.h
+index ce1116cff53d..e37656b4f8af 100644
+--- a/include/uapi/linux/psample.h
++++ b/include/uapi/linux/psample.h
+@@ -15,6 +15,13 @@ enum {
+ 	/* commands attributes */
+ 	PSAMPLE_ATTR_GROUP_REFCOUNT,
+ 
++	PSAMPLE_ATTR_PAD,
++	PSAMPLE_ATTR_OUT_TC,		/* u16 */
++	PSAMPLE_ATTR_OUT_TC_OCC,	/* u64, bytes */
++	PSAMPLE_ATTR_LATENCY,		/* u64, nanoseconds */
++	PSAMPLE_ATTR_TIMESTAMP,		/* u64, nanoseconds */
++	PSAMPLE_ATTR_PROTO,		/* u16 */
++
+ 	__PSAMPLE_ATTR_MAX
+ };
+ 
+* Unmerged path net/psample/psample.c
