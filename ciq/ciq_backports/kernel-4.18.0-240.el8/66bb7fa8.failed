@@ -1,0 +1,124 @@
+scsi: ibmvfc: Don't send implicit logouts prior to NPIV login
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Brian King <brking@linux.vnet.ibm.com>
+commit 66bb7fa81e28514ffd2cee9d07526fbb7484c029
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/66bb7fa8.failed
+
+Commit ed830385a2b1 ("scsi: ibmvfc: Avoid loss of all paths during SVC node
+reboot") introduced a regression where when the client resets or re-enables
+its CRQ with the hypervisor there is a chance that if the server side
+doesn't issue its INIT handshake quick enough the client can issue an
+Implicit Logout prior to doing an NPIV Login. The server treats this
+scenario as a protocol violation and closes the CRQ on its end forcing the
+client through a reset that gets the client host state and next host action
+out of agreement leading to a BUG assert.
+
+ibmvfc 30000003: Partner initialization complete
+ibmvfc 30000002: Partner initialization complete
+ibmvfc 30000002: Host partner adapter deregistered or failed (rc=2)
+ibmvfc 30000002: Partner initialized
+------------[ cut here ]------------
+kernel BUG at ../drivers/scsi/ibmvscsi/ibmvfc.c:4489!
+Oops: Exception in kernel mode, sig: 5 [#1]
+LE PAGE_SIZE=64K MMU=Hash SMP NR_CPUS=2048 NUMA pSeries
+Supported: No, Unreleased kernel
+CPU: 16 PID: 1290 Comm: ibmvfc_0 Tainted: G           OE  X   5.3.18-12-default
+NIP:  c00800000d84a2b4 LR: c00800000d84a040 CTR: c00800000d84a2a0
+REGS: c00000000cb57a00 TRAP: 0700   Tainted: G           OE  X    (5.3.18-12-default)
+MSR:  800000000282b033 <SF,VEC,VSX,EE,FP,ME,IR,DR,RI,LE>  CR: 24000848  XER: 00000001
+CFAR: c00800000d84a070 IRQMASK: 1
+GPR00: c00800000d84a040 c00000000cb57c90 c00800000d858e00 0000000000000000
+GPR04: 0000000000000000 0000000000000000 0000000000000000 00000000000000a0
+GPR08: c00800000d84a074 0000000000000001 0000000000000014 c00800000d84d7d0
+GPR12: 0000000000000000 c00000001ea28200 c00000000016cd98 0000000000000000
+GPR16: c00800000d84b7b8 0000000000000000 0000000000000000 c00000542c706d68
+GPR20: 0000000000000005 c00000542c706d88 5deadbeef0000100 5deadbeef0000122
+GPR24: 000000000000000c 000000000000000b c00800000d852180 0000000000000001
+GPR28: 0000000000000000 c00000542c706da0 c00000542c706860 c00000542c706828
+NIP [c00800000d84a2b4] ibmvfc_work+0x3ac/0xc90 [ibmvfc]
+LR [c00800000d84a040] ibmvfc_work+0x138/0xc90 [ibmvfc]
+
+This scenario can be prevented by rejecting any attempt to send an Implicit
+Logout if the client adapter is not logged in yet.
+
+Link: https://lore.kernel.org/r/20200427214824.6890-1-tyreld@linux.ibm.com
+Fixes: ed830385a2b1 ("scsi: ibmvfc: Avoid loss of all paths during SVC node reboot")
+	Signed-off-by: Brian King <brking@linux.vnet.ibm.com>
+	Signed-off-by: Tyrel Datwyler <tyreld@linux.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 66bb7fa81e28514ffd2cee9d07526fbb7484c029)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/ibmvscsi/ibmvfc.c
+diff --cc drivers/scsi/ibmvscsi/ibmvfc.c
+index 9964d62f816d,635f6f9cffc4..000000000000
+--- a/drivers/scsi/ibmvscsi/ibmvfc.c
++++ b/drivers/scsi/ibmvscsi/ibmvfc.c
+@@@ -3573,6 -3610,58 +3573,61 @@@ static void ibmvfc_tgt_implicit_logout(
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ibmvfc_tgt_implicit_logout_and_del_done - Completion handler for Implicit Logout MAD
++  * @evt:	ibmvfc event struct
++  *
++  **/
++ static void ibmvfc_tgt_implicit_logout_and_del_done(struct ibmvfc_event *evt)
++ {
++ 	struct ibmvfc_target *tgt = evt->tgt;
++ 	struct ibmvfc_host *vhost = evt->vhost;
++ 	struct ibmvfc_passthru_mad *mad = &evt->xfer_iu->passthru;
++ 	u32 status = be16_to_cpu(mad->common.status);
++ 
++ 	vhost->discovery_threads--;
++ 	ibmvfc_free_event(evt);
++ 	ibmvfc_set_tgt_action(tgt, IBMVFC_TGT_ACTION_DEL_RPORT);
++ 
++ 	tgt_dbg(tgt, "Implicit Logout %s\n", (status == IBMVFC_MAD_SUCCESS) ? "succeeded" : "failed");
++ 	kref_put(&tgt->kref, ibmvfc_release_tgt);
++ 	wake_up(&vhost->work_wait_q);
++ }
++ 
++ /**
++  * ibmvfc_tgt_implicit_logout_and_del - Initiate an Implicit Logout for specified target
++  * @tgt:		ibmvfc target struct
++  *
++  **/
++ static void ibmvfc_tgt_implicit_logout_and_del(struct ibmvfc_target *tgt)
++ {
++ 	struct ibmvfc_host *vhost = tgt->vhost;
++ 	struct ibmvfc_event *evt;
++ 
++ 	if (!vhost->logged_in) {
++ 		ibmvfc_set_tgt_action(tgt, IBMVFC_TGT_ACTION_DEL_RPORT);
++ 		return;
++ 	}
++ 
++ 	if (vhost->discovery_threads >= disc_threads)
++ 		return;
++ 
++ 	vhost->discovery_threads++;
++ 	evt = __ibmvfc_tgt_get_implicit_logout_evt(tgt,
++ 						   ibmvfc_tgt_implicit_logout_and_del_done);
++ 
++ 	ibmvfc_set_tgt_action(tgt, IBMVFC_TGT_ACTION_LOGOUT_RPORT_WAIT);
++ 	if (ibmvfc_send_event(evt, vhost, default_timeout)) {
++ 		vhost->discovery_threads--;
++ 		ibmvfc_set_tgt_action(tgt, IBMVFC_TGT_ACTION_DEL_RPORT);
++ 		kref_put(&tgt->kref, ibmvfc_release_tgt);
++ 	} else
++ 		tgt_dbg(tgt, "Sent Implicit Logout\n");
++ }
++ 
++ /**
+++>>>>>>> 66bb7fa81e28 (scsi: ibmvfc: Don't send implicit logouts prior to NPIV login)
+   * ibmvfc_adisc_needs_plogi - Does device need PLOGI?
+   * @mad:	ibmvfc passthru mad struct
+   * @tgt:	ibmvfc target struct
+* Unmerged path drivers/scsi/ibmvscsi/ibmvfc.c
