@@ -1,0 +1,266 @@
+io_uring: fix memleak in io_sqe_files_register()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Yang Yingliang <yangyingliang@huawei.com>
+commit 667e57da358f61b6966e12e925a69e42d912e8bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/667e57da.failed
+
+I got a memleak report when doing some fuzz test:
+
+BUG: memory leak
+unreferenced object 0x607eeac06e78 (size 8):
+  comm "test", pid 295, jiffies 4294735835 (age 31.745s)
+  hex dump (first 8 bytes):
+    00 00 00 00 00 00 00 00                          ........
+  backtrace:
+    [<00000000932632e6>] percpu_ref_init+0x2a/0x1b0
+    [<0000000092ddb796>] __io_uring_register+0x111d/0x22a0
+    [<00000000eadd6c77>] __x64_sys_io_uring_register+0x17b/0x480
+    [<00000000591b89a6>] do_syscall_64+0x56/0xa0
+    [<00000000864a281d>] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Call percpu_ref_exit() on error path to avoid
+refcount memleak.
+
+Fixes: 05f3fb3c5397 ("io_uring: avoid ring quiesce for fixed file set unregister and update")
+	Cc: stable@vger.kernel.org
+	Reported-by: Hulk Robot <hulkci@huawei.com>
+	Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 667e57da358f61b6966e12e925a69e42d912e8bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index bff2058d3f07,fc07baf4392a..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -3038,6 -6513,220 +3038,223 @@@ static void io_sqe_file_unregister(stru
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct io_file_put {
++ 	struct list_head list;
++ 	struct file *file;
++ };
++ 
++ static void __io_file_put_work(struct fixed_file_ref_node *ref_node)
++ {
++ 	struct fixed_file_data *file_data = ref_node->file_data;
++ 	struct io_ring_ctx *ctx = file_data->ctx;
++ 	struct io_file_put *pfile, *tmp;
++ 
++ 	list_for_each_entry_safe(pfile, tmp, &ref_node->file_list, list) {
++ 		list_del(&pfile->list);
++ 		io_ring_file_put(ctx, pfile->file);
++ 		kfree(pfile);
++ 	}
++ 
++ 	spin_lock(&file_data->lock);
++ 	list_del(&ref_node->node);
++ 	spin_unlock(&file_data->lock);
++ 
++ 	percpu_ref_exit(&ref_node->refs);
++ 	kfree(ref_node);
++ 	percpu_ref_put(&file_data->refs);
++ }
++ 
++ static void io_file_put_work(struct work_struct *work)
++ {
++ 	struct io_ring_ctx *ctx;
++ 	struct llist_node *node;
++ 
++ 	ctx = container_of(work, struct io_ring_ctx, file_put_work.work);
++ 	node = llist_del_all(&ctx->file_put_llist);
++ 
++ 	while (node) {
++ 		struct fixed_file_ref_node *ref_node;
++ 		struct llist_node *next = node->next;
++ 
++ 		ref_node = llist_entry(node, struct fixed_file_ref_node, llist);
++ 		__io_file_put_work(ref_node);
++ 		node = next;
++ 	}
++ }
++ 
++ static void io_file_data_ref_zero(struct percpu_ref *ref)
++ {
++ 	struct fixed_file_ref_node *ref_node;
++ 	struct io_ring_ctx *ctx;
++ 	bool first_add;
++ 	int delay = HZ;
++ 
++ 	ref_node = container_of(ref, struct fixed_file_ref_node, refs);
++ 	ctx = ref_node->file_data->ctx;
++ 
++ 	if (percpu_ref_is_dying(&ctx->file_data->refs))
++ 		delay = 0;
++ 
++ 	first_add = llist_add(&ref_node->llist, &ctx->file_put_llist);
++ 	if (!delay)
++ 		mod_delayed_work(system_wq, &ctx->file_put_work, 0);
++ 	else if (first_add)
++ 		queue_delayed_work(system_wq, &ctx->file_put_work, delay);
++ }
++ 
++ static struct fixed_file_ref_node *alloc_fixed_file_ref_node(
++ 			struct io_ring_ctx *ctx)
++ {
++ 	struct fixed_file_ref_node *ref_node;
++ 
++ 	ref_node = kzalloc(sizeof(*ref_node), GFP_KERNEL);
++ 	if (!ref_node)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	if (percpu_ref_init(&ref_node->refs, io_file_data_ref_zero,
++ 			    0, GFP_KERNEL)) {
++ 		kfree(ref_node);
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 	INIT_LIST_HEAD(&ref_node->node);
++ 	INIT_LIST_HEAD(&ref_node->file_list);
++ 	ref_node->file_data = ctx->file_data;
++ 	return ref_node;
++ }
++ 
++ static void destroy_fixed_file_ref_node(struct fixed_file_ref_node *ref_node)
++ {
++ 	percpu_ref_exit(&ref_node->refs);
++ 	kfree(ref_node);
++ }
++ 
++ static int io_sqe_files_register(struct io_ring_ctx *ctx, void __user *arg,
++ 				 unsigned nr_args)
++ {
++ 	__s32 __user *fds = (__s32 __user *) arg;
++ 	unsigned nr_tables;
++ 	struct file *file;
++ 	int fd, ret = 0;
++ 	unsigned i;
++ 	struct fixed_file_ref_node *ref_node;
++ 
++ 	if (ctx->file_data)
++ 		return -EBUSY;
++ 	if (!nr_args)
++ 		return -EINVAL;
++ 	if (nr_args > IORING_MAX_FIXED_FILES)
++ 		return -EMFILE;
++ 
++ 	ctx->file_data = kzalloc(sizeof(*ctx->file_data), GFP_KERNEL);
++ 	if (!ctx->file_data)
++ 		return -ENOMEM;
++ 	ctx->file_data->ctx = ctx;
++ 	init_completion(&ctx->file_data->done);
++ 	INIT_LIST_HEAD(&ctx->file_data->ref_list);
++ 	spin_lock_init(&ctx->file_data->lock);
++ 
++ 	nr_tables = DIV_ROUND_UP(nr_args, IORING_MAX_FILES_TABLE);
++ 	ctx->file_data->table = kcalloc(nr_tables,
++ 					sizeof(struct fixed_file_table),
++ 					GFP_KERNEL);
++ 	if (!ctx->file_data->table) {
++ 		kfree(ctx->file_data);
++ 		ctx->file_data = NULL;
++ 		return -ENOMEM;
++ 	}
++ 
++ 	if (percpu_ref_init(&ctx->file_data->refs, io_file_ref_kill,
++ 				PERCPU_REF_ALLOW_REINIT, GFP_KERNEL)) {
++ 		kfree(ctx->file_data->table);
++ 		kfree(ctx->file_data);
++ 		ctx->file_data = NULL;
++ 		return -ENOMEM;
++ 	}
++ 
++ 	if (io_sqe_alloc_file_tables(ctx, nr_tables, nr_args)) {
++ 		percpu_ref_exit(&ctx->file_data->refs);
++ 		kfree(ctx->file_data->table);
++ 		kfree(ctx->file_data);
++ 		ctx->file_data = NULL;
++ 		return -ENOMEM;
++ 	}
++ 
++ 	for (i = 0; i < nr_args; i++, ctx->nr_user_files++) {
++ 		struct fixed_file_table *table;
++ 		unsigned index;
++ 
++ 		ret = -EFAULT;
++ 		if (copy_from_user(&fd, &fds[i], sizeof(fd)))
++ 			break;
++ 		/* allow sparse sets */
++ 		if (fd == -1) {
++ 			ret = 0;
++ 			continue;
++ 		}
++ 
++ 		table = &ctx->file_data->table[i >> IORING_FILE_TABLE_SHIFT];
++ 		index = i & IORING_FILE_TABLE_MASK;
++ 		file = fget(fd);
++ 
++ 		ret = -EBADF;
++ 		if (!file)
++ 			break;
++ 
++ 		/*
++ 		 * Don't allow io_uring instances to be registered. If UNIX
++ 		 * isn't enabled, then this causes a reference cycle and this
++ 		 * instance can never get freed. If UNIX is enabled we'll
++ 		 * handle it just fine, but there's still no point in allowing
++ 		 * a ring fd as it doesn't support regular read/write anyway.
++ 		 */
++ 		if (file->f_op == &io_uring_fops) {
++ 			fput(file);
++ 			break;
++ 		}
++ 		ret = 0;
++ 		table->files[index] = file;
++ 	}
++ 
++ 	if (ret) {
++ 		for (i = 0; i < ctx->nr_user_files; i++) {
++ 			file = io_file_from_index(ctx, i);
++ 			if (file)
++ 				fput(file);
++ 		}
++ 		for (i = 0; i < nr_tables; i++)
++ 			kfree(ctx->file_data->table[i].files);
++ 
++ 		percpu_ref_exit(&ctx->file_data->refs);
++ 		kfree(ctx->file_data->table);
++ 		kfree(ctx->file_data);
++ 		ctx->file_data = NULL;
++ 		ctx->nr_user_files = 0;
++ 		return ret;
++ 	}
++ 
++ 	ret = io_sqe_files_scm(ctx);
++ 	if (ret) {
++ 		io_sqe_files_unregister(ctx);
++ 		return ret;
++ 	}
++ 
++ 	ref_node = alloc_fixed_file_ref_node(ctx);
++ 	if (IS_ERR(ref_node)) {
++ 		io_sqe_files_unregister(ctx);
++ 		return PTR_ERR(ref_node);
++ 	}
++ 
++ 	ctx->file_data->cur_refs = &ref_node->refs;
++ 	spin_lock(&ctx->file_data->lock);
++ 	list_add(&ref_node->node, &ctx->file_data->ref_list);
++ 	spin_unlock(&ctx->file_data->lock);
++ 	percpu_ref_get(&ctx->file_data->refs);
++ 	return ret;
++ }
++ 
+++>>>>>>> 667e57da358f (io_uring: fix memleak in io_sqe_files_register())
+  static int io_sqe_file_register(struct io_ring_ctx *ctx, struct file *file,
+  				int index)
+  {
+* Unmerged path fs/io_uring.c
