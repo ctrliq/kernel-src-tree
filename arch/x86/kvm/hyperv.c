@@ -155,7 +155,7 @@ static struct kvm_vcpu_hv_synic *synic_get(struct kvm *kvm, u32 vpidx)
 	struct kvm_vcpu_hv_synic *synic;
 
 	vcpu = get_vcpu_by_vpidx(kvm, vpidx);
-	if (!vcpu)
+	if (!vcpu || !to_hv_vcpu(vcpu))
 		return NULL;
 	synic = vcpu_to_synic(vcpu);
 	return (synic->active) ? synic : NULL;
