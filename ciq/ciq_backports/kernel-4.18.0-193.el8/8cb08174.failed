@@ -1,0 +1,5280 @@
+netlink: make validation more configurable for future strictness
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 8cb081746c031fb164089322e2336a0bf5b3070c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/8cb08174.failed
+
+We currently have two levels of strict validation:
+
+ 1) liberal (default)
+     - undefined (type >= max) & NLA_UNSPEC attributes accepted
+     - attribute length >= expected accepted
+     - garbage at end of message accepted
+ 2) strict (opt-in)
+     - NLA_UNSPEC attributes accepted
+     - attribute length >= expected accepted
+
+Split out parsing strictness into four different options:
+ * TRAILING     - check that there's no trailing data after parsing
+                  attributes (in message or nested)
+ * MAXTYPE      - reject attrs > max known type
+ * UNSPEC       - reject attributes with NLA_UNSPEC policy entries
+ * STRICT_ATTRS - strictly validate attribute size
+
+The default for future things should be *everything*.
+The current *_strict() is a combination of TRAILING and MAXTYPE,
+and is renamed to _deprecated_strict().
+The current regular parsing has none of this, and is renamed to
+*_parse_deprecated().
+
+Additionally it allows us to selectively set one of the new flags
+even on old policies. Notably, the UNSPEC flag could be useful in
+this case, since it can be arranged (by filling in the policy) to
+not be an incompatible userspace ABI change, but would then going
+forward prevent forgetting attribute entries. Similar can apply
+to the POLICY flag.
+
+We end up with the following renames:
+ * nla_parse           -> nla_parse_deprecated
+ * nla_parse_strict    -> nla_parse_deprecated_strict
+ * nlmsg_parse         -> nlmsg_parse_deprecated
+ * nlmsg_parse_strict  -> nlmsg_parse_deprecated_strict
+ * nla_parse_nested    -> nla_parse_nested_deprecated
+ * nla_validate_nested -> nla_validate_nested_deprecated
+
+Using spatch, of course:
+    @@
+    expression TB, MAX, HEAD, LEN, POL, EXT;
+    @@
+    -nla_parse(TB, MAX, HEAD, LEN, POL, EXT)
+    +nla_parse_deprecated(TB, MAX, HEAD, LEN, POL, EXT)
+
+    @@
+    expression NLH, HDRLEN, TB, MAX, POL, EXT;
+    @@
+    -nlmsg_parse(NLH, HDRLEN, TB, MAX, POL, EXT)
+    +nlmsg_parse_deprecated(NLH, HDRLEN, TB, MAX, POL, EXT)
+
+    @@
+    expression NLH, HDRLEN, TB, MAX, POL, EXT;
+    @@
+    -nlmsg_parse_strict(NLH, HDRLEN, TB, MAX, POL, EXT)
+    +nlmsg_parse_deprecated_strict(NLH, HDRLEN, TB, MAX, POL, EXT)
+
+    @@
+    expression TB, MAX, NLA, POL, EXT;
+    @@
+    -nla_parse_nested(TB, MAX, NLA, POL, EXT)
+    +nla_parse_nested_deprecated(TB, MAX, NLA, POL, EXT)
+
+    @@
+    expression START, MAX, POL, EXT;
+    @@
+    -nla_validate_nested(START, MAX, POL, EXT)
+    +nla_validate_nested_deprecated(START, MAX, POL, EXT)
+
+    @@
+    expression NLH, HDRLEN, MAX, POL, EXT;
+    @@
+    -nlmsg_validate(NLH, HDRLEN, MAX, POL, EXT)
+    +nlmsg_validate_deprecated(NLH, HDRLEN, MAX, POL, EXT)
+
+For this patch, don't actually add the strict, non-renamed versions
+yet so that it breaks compile if I get it wrong.
+
+Also, while at it, make nla_validate and nla_parse go down to a
+common __nla_validate_parse() function to avoid code duplication.
+
+Ultimately, this allows us to have very strict validation for every
+new caller of nla_parse()/nlmsg_parse() etc as re-introduced in the
+next patch, while existing things will continue to work as is.
+
+In effect then, this adds fully strict validation for any new command.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8cb081746c031fb164089322e2336a0bf5b3070c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/nldev.c
+#	drivers/net/ieee802154/mac802154_hwsim.c
+#	kernel/taskstats.c
+#	net/core/devlink.c
+#	net/core/neighbour.c
+#	net/core/rtnetlink.c
+#	net/netfilter/ipset/ip_set_core.c
+#	net/netfilter/nf_conntrack_netlink.c
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nft_ct.c
+#	net/netfilter/nft_tunnel.c
+#	net/netlink/genetlink.c
+#	net/openvswitch/flow_netlink.c
+#	net/sched/sch_taprio.c
+diff --cc drivers/infiniband/core/nldev.c
+index efccd8e0fb77,85324012bf07..000000000000
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@@ -776,10 -776,10 +776,10 @@@ static int nldev_port_get_dumpit(struc
+  	u32 idx = 0;
+  	u32 ifindex;
+  	int err;
+ -	unsigned int p;
+ +	u32 p;
+  
+- 	err = nlmsg_parse(cb->nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
+- 			  nldev_policy, NULL);
++ 	err = nlmsg_parse_deprecated(cb->nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 				     nldev_policy, NULL);
+  	if (err || !tb[RDMA_NLDEV_ATTR_DEV_INDEX])
+  		return -EINVAL;
+  
+@@@ -949,6 -969,89 +949,92 @@@ static bool is_visible_in_pid_ns(struc
+  	return task_active_pid_ns(current) == task_active_pid_ns(res->task);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int res_get_common_doit(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 			       struct netlink_ext_ack *extack,
++ 			       enum rdma_restrack_type res_type)
++ {
++ 	const struct nldev_fill_res_entry *fe = &fill_entries[res_type];
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	struct rdma_restrack_entry *res;
++ 	struct ib_device *device;
++ 	u32 index, id, port = 0;
++ 	bool has_cap_net_admin;
++ 	struct sk_buff *msg;
++ 	int ret;
++ 
++ 	ret = nlmsg_parse_deprecated(nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 				     nldev_policy, extack);
++ 	if (ret || !tb[RDMA_NLDEV_ATTR_DEV_INDEX] || !fe->id || !tb[fe->id])
++ 		return -EINVAL;
++ 
++ 	index = nla_get_u32(tb[RDMA_NLDEV_ATTR_DEV_INDEX]);
++ 	device = ib_device_get_by_index(index);
++ 	if (!device)
++ 		return -EINVAL;
++ 
++ 	if (tb[RDMA_NLDEV_ATTR_PORT_INDEX]) {
++ 		port = nla_get_u32(tb[RDMA_NLDEV_ATTR_PORT_INDEX]);
++ 		if (!rdma_is_port_valid(device, port)) {
++ 			ret = -EINVAL;
++ 			goto err;
++ 		}
++ 	}
++ 
++ 	if ((port && fe->flags & NLDEV_PER_DEV) ||
++ 	    (!port && ~fe->flags & NLDEV_PER_DEV)) {
++ 		ret = -EINVAL;
++ 		goto err;
++ 	}
++ 
++ 	id = nla_get_u32(tb[fe->id]);
++ 	res = rdma_restrack_get_byid(device, res_type, id);
++ 	if (IS_ERR(res)) {
++ 		ret = PTR_ERR(res);
++ 		goto err;
++ 	}
++ 
++ 	if (!is_visible_in_pid_ns(res)) {
++ 		ret = -ENOENT;
++ 		goto err_get;
++ 	}
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg) {
++ 		ret = -ENOMEM;
++ 		goto err;
++ 	}
++ 
++ 	nlh = nlmsg_put(msg, NETLINK_CB(skb).portid, nlh->nlmsg_seq,
++ 			RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, fe->nldev_cmd),
++ 			0, 0);
++ 
++ 	if (fill_nldev_handle(msg, device)) {
++ 		ret = -EMSGSIZE;
++ 		goto err_free;
++ 	}
++ 
++ 	has_cap_net_admin = netlink_capable(skb, CAP_NET_ADMIN);
++ 	ret = fe->fill_res_func(msg, has_cap_net_admin, res, port);
++ 	rdma_restrack_put(res);
++ 	if (ret)
++ 		goto err_free;
++ 
++ 	nlmsg_end(msg, nlh);
++ 	ib_device_put(device);
++ 	return rdma_nl_unicast(msg, NETLINK_CB(skb).portid);
++ 
++ err_free:
++ 	nlmsg_free(msg);
++ err_get:
++ 	rdma_restrack_put(res);
++ err:
++ 	ib_device_put(device);
++ 	return ret;
++ }
++ 
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  static int res_get_common_dumpit(struct sk_buff *skb,
+  				 struct netlink_callback *cb,
+  				 enum rdma_restrack_type res_type)
+@@@ -1090,6 -1204,115 +1176,118 @@@ RES_GET_FUNCS(cq, RDMA_RESTRACK_CQ)
+  RES_GET_FUNCS(pd, RDMA_RESTRACK_PD);
+  RES_GET_FUNCS(mr, RDMA_RESTRACK_MR);
+  
+++<<<<<<< HEAD
+++=======
++ static LIST_HEAD(link_ops);
++ static DECLARE_RWSEM(link_ops_rwsem);
++ 
++ static const struct rdma_link_ops *link_ops_get(const char *type)
++ {
++ 	const struct rdma_link_ops *ops;
++ 
++ 	list_for_each_entry(ops, &link_ops, list) {
++ 		if (!strcmp(ops->type, type))
++ 			goto out;
++ 	}
++ 	ops = NULL;
++ out:
++ 	return ops;
++ }
++ 
++ void rdma_link_register(struct rdma_link_ops *ops)
++ {
++ 	down_write(&link_ops_rwsem);
++ 	if (WARN_ON_ONCE(link_ops_get(ops->type)))
++ 		goto out;
++ 	list_add(&ops->list, &link_ops);
++ out:
++ 	up_write(&link_ops_rwsem);
++ }
++ EXPORT_SYMBOL(rdma_link_register);
++ 
++ void rdma_link_unregister(struct rdma_link_ops *ops)
++ {
++ 	down_write(&link_ops_rwsem);
++ 	list_del(&ops->list);
++ 	up_write(&link_ops_rwsem);
++ }
++ EXPORT_SYMBOL(rdma_link_unregister);
++ 
++ static int nldev_newlink(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 			  struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	char ibdev_name[IB_DEVICE_NAME_MAX];
++ 	const struct rdma_link_ops *ops;
++ 	char ndev_name[IFNAMSIZ];
++ 	struct net_device *ndev;
++ 	char type[IFNAMSIZ];
++ 	int err;
++ 
++ 	err = nlmsg_parse_deprecated(nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 				     nldev_policy, extack);
++ 	if (err || !tb[RDMA_NLDEV_ATTR_DEV_NAME] ||
++ 	    !tb[RDMA_NLDEV_ATTR_LINK_TYPE] || !tb[RDMA_NLDEV_ATTR_NDEV_NAME])
++ 		return -EINVAL;
++ 
++ 	nla_strlcpy(ibdev_name, tb[RDMA_NLDEV_ATTR_DEV_NAME],
++ 		    sizeof(ibdev_name));
++ 	if (strchr(ibdev_name, '%'))
++ 		return -EINVAL;
++ 
++ 	nla_strlcpy(type, tb[RDMA_NLDEV_ATTR_LINK_TYPE], sizeof(type));
++ 	nla_strlcpy(ndev_name, tb[RDMA_NLDEV_ATTR_NDEV_NAME],
++ 		    sizeof(ndev_name));
++ 
++ 	ndev = dev_get_by_name(&init_net, ndev_name);
++ 	if (!ndev)
++ 		return -ENODEV;
++ 
++ 	down_read(&link_ops_rwsem);
++ 	ops = link_ops_get(type);
++ #ifdef CONFIG_MODULES
++ 	if (!ops) {
++ 		up_read(&link_ops_rwsem);
++ 		request_module("rdma-link-%s", type);
++ 		down_read(&link_ops_rwsem);
++ 		ops = link_ops_get(type);
++ 	}
++ #endif
++ 	err = ops ? ops->newlink(ibdev_name, ndev) : -EINVAL;
++ 	up_read(&link_ops_rwsem);
++ 	dev_put(ndev);
++ 
++ 	return err;
++ }
++ 
++ static int nldev_dellink(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 			  struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	struct ib_device *device;
++ 	u32 index;
++ 	int err;
++ 
++ 	err = nlmsg_parse_deprecated(nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 				     nldev_policy, extack);
++ 	if (err || !tb[RDMA_NLDEV_ATTR_DEV_INDEX])
++ 		return -EINVAL;
++ 
++ 	index = nla_get_u32(tb[RDMA_NLDEV_ATTR_DEV_INDEX]);
++ 	device = ib_device_get_by_index(index);
++ 	if (!device)
++ 		return -EINVAL;
++ 
++ 	if (!(device->attrs.device_cap_flags & IB_DEVICE_ALLOW_USER_UNREG)) {
++ 		ib_device_put(device);
++ 		return -EINVAL;
++ 	}
++ 
++ 	ib_unregister_device_and_put(device);
++ 	return 0;
++ }
++ 
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  static const struct rdma_nl_cbs nldev_cb_table[RDMA_NLDEV_NUM_OPS] = {
+  	[RDMA_NLDEV_CMD_GET] = {
+  		.doit = nldev_get_doit,
+diff --cc kernel/taskstats.c
+index 4e62a4a8fa91,0e347f1c7800..000000000000
+--- a/kernel/taskstats.c
++++ b/kernel/taskstats.c
+@@@ -660,6 -661,27 +660,30 @@@ static const struct genl_ops taskstats_
+  	},
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int taskstats_pre_doit(const struct genl_ops *ops, struct sk_buff *skb,
++ 			      struct genl_info *info)
++ {
++ 	const struct nla_policy *policy = NULL;
++ 
++ 	switch (ops->cmd) {
++ 	case TASKSTATS_CMD_GET:
++ 		policy = taskstats_cmd_get_policy;
++ 		break;
++ 	case CGROUPSTATS_CMD_GET:
++ 		policy = cgroupstats_cmd_get_policy;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	return nlmsg_validate_deprecated(info->nlhdr, GENL_HDRLEN,
++ 					 TASKSTATS_CMD_ATTR_MAX, policy,
++ 					 info->extack);
++ }
++ 
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  static struct genl_family family __ro_after_init = {
+  	.name		= TASKSTATS_GENL_NAME,
+  	.version	= TASKSTATS_GENL_VERSION,
+diff --cc net/core/devlink.c
+index d12ffdf1735e,b020d182c9fc..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -3669,8 -3674,10 +3669,15 @@@ static int devlink_nl_cmd_region_read_d
+  	if (!attrs)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	err = nlmsg_parse(cb->nlh, GENL_HDRLEN + devlink_nl_family.hdrsize,
+ +			  attrs, DEVLINK_ATTR_MAX, ops->policy, cb->extack);
+++=======
++ 	err = nlmsg_parse_deprecated(cb->nlh,
++ 				     GENL_HDRLEN + devlink_nl_family.hdrsize,
++ 				     attrs, DEVLINK_ATTR_MAX,
++ 				     devlink_nl_family.policy, cb->extack);
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  	if (err)
+  		goto out_free;
+  
+diff --cc net/core/neighbour.c
+index d9c3cf3020a0,e73bfc63e473..000000000000
+--- a/net/core/neighbour.c
++++ b/net/core/neighbour.c
+@@@ -1749,7 -1862,8 +1749,12 @@@ static int neigh_add(struct sk_buff *sk
+  	int err;
+  
+  	ASSERT_RTNL();
+++<<<<<<< HEAD
+ +	err = nlmsg_parse(nlh, sizeof(*ndm), tb, NDA_MAX, NULL, extack);
+++=======
++ 	err = nlmsg_parse_deprecated(nlh, sizeof(*ndm), tb, NDA_MAX,
++ 				     nda_policy, extack);
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  	if (err < 0)
+  		goto out;
+  
+@@@ -2539,11 -2662,12 +2545,20 @@@ static int neigh_valid_dump_req(const s
+  			return -EINVAL;
+  		}
+  
+++<<<<<<< HEAD
+ +		err = nlmsg_parse_strict(nlh, sizeof(struct ndmsg), tb, NDA_MAX,
+ +					 NULL, extack);
+ +	} else {
+ +		err = nlmsg_parse(nlh, sizeof(struct ndmsg), tb, NDA_MAX,
+ +				  NULL, extack);
+++=======
++ 		err = nlmsg_parse_deprecated_strict(nlh, sizeof(struct ndmsg),
++ 						    tb, NDA_MAX, nda_policy,
++ 						    extack);
++ 	} else {
++ 		err = nlmsg_parse_deprecated(nlh, sizeof(struct ndmsg), tb,
++ 					     NDA_MAX, nda_policy, extack);
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  	}
+  	if (err < 0)
+  		return err;
+diff --cc net/core/rtnetlink.c
+index 0dae4a52abd7,2bd12afb9297..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -4092,6 -4080,165 +4106,168 @@@ out
+  	return skb->len;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int valid_fdb_get_strict(const struct nlmsghdr *nlh,
++ 				struct nlattr **tb, u8 *ndm_flags,
++ 				int *br_idx, int *brport_idx, u8 **addr,
++ 				u16 *vid, struct netlink_ext_ack *extack)
++ {
++ 	struct ndmsg *ndm;
++ 	int err, i;
++ 
++ 	if (nlh->nlmsg_len < nlmsg_msg_size(sizeof(*ndm))) {
++ 		NL_SET_ERR_MSG(extack, "Invalid header for fdb get request");
++ 		return -EINVAL;
++ 	}
++ 
++ 	ndm = nlmsg_data(nlh);
++ 	if (ndm->ndm_pad1  || ndm->ndm_pad2  || ndm->ndm_state ||
++ 	    ndm->ndm_type) {
++ 		NL_SET_ERR_MSG(extack, "Invalid values in header for fdb get request");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (ndm->ndm_flags & ~(NTF_MASTER | NTF_SELF)) {
++ 		NL_SET_ERR_MSG(extack, "Invalid flags in header for fdb get request");
++ 		return -EINVAL;
++ 	}
++ 
++ 	err = nlmsg_parse_deprecated_strict(nlh, sizeof(struct ndmsg), tb,
++ 					    NDA_MAX, nda_policy, extack);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	*ndm_flags = ndm->ndm_flags;
++ 	*brport_idx = ndm->ndm_ifindex;
++ 	for (i = 0; i <= NDA_MAX; ++i) {
++ 		if (!tb[i])
++ 			continue;
++ 
++ 		switch (i) {
++ 		case NDA_MASTER:
++ 			*br_idx = nla_get_u32(tb[i]);
++ 			break;
++ 		case NDA_LLADDR:
++ 			if (nla_len(tb[i]) != ETH_ALEN) {
++ 				NL_SET_ERR_MSG(extack, "Invalid address in fdb get request");
++ 				return -EINVAL;
++ 			}
++ 			*addr = nla_data(tb[i]);
++ 			break;
++ 		case NDA_VLAN:
++ 			err = fdb_vid_parse(tb[i], vid, extack);
++ 			if (err)
++ 				return err;
++ 			break;
++ 		case NDA_VNI:
++ 			break;
++ 		default:
++ 			NL_SET_ERR_MSG(extack, "Unsupported attribute in fdb get request");
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int rtnl_fdb_get(struct sk_buff *in_skb, struct nlmsghdr *nlh,
++ 			struct netlink_ext_ack *extack)
++ {
++ 	struct net_device *dev = NULL, *br_dev = NULL;
++ 	const struct net_device_ops *ops = NULL;
++ 	struct net *net = sock_net(in_skb->sk);
++ 	struct nlattr *tb[NDA_MAX + 1];
++ 	struct sk_buff *skb;
++ 	int brport_idx = 0;
++ 	u8 ndm_flags = 0;
++ 	int br_idx = 0;
++ 	u8 *addr = NULL;
++ 	u16 vid = 0;
++ 	int err;
++ 
++ 	err = valid_fdb_get_strict(nlh, tb, &ndm_flags, &br_idx,
++ 				   &brport_idx, &addr, &vid, extack);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (!addr) {
++ 		NL_SET_ERR_MSG(extack, "Missing lookup address for fdb get request");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (brport_idx) {
++ 		dev = __dev_get_by_index(net, brport_idx);
++ 		if (!dev) {
++ 			NL_SET_ERR_MSG(extack, "Unknown device ifindex");
++ 			return -ENODEV;
++ 		}
++ 	}
++ 
++ 	if (br_idx) {
++ 		if (dev) {
++ 			NL_SET_ERR_MSG(extack, "Master and device are mutually exclusive");
++ 			return -EINVAL;
++ 		}
++ 
++ 		br_dev = __dev_get_by_index(net, br_idx);
++ 		if (!br_dev) {
++ 			NL_SET_ERR_MSG(extack, "Invalid master ifindex");
++ 			return -EINVAL;
++ 		}
++ 		ops = br_dev->netdev_ops;
++ 	}
++ 
++ 	if (dev) {
++ 		if (!ndm_flags || (ndm_flags & NTF_MASTER)) {
++ 			if (!(dev->priv_flags & IFF_BRIDGE_PORT)) {
++ 				NL_SET_ERR_MSG(extack, "Device is not a bridge port");
++ 				return -EINVAL;
++ 			}
++ 			br_dev = netdev_master_upper_dev_get(dev);
++ 			if (!br_dev) {
++ 				NL_SET_ERR_MSG(extack, "Master of device not found");
++ 				return -EINVAL;
++ 			}
++ 			ops = br_dev->netdev_ops;
++ 		} else {
++ 			if (!(ndm_flags & NTF_SELF)) {
++ 				NL_SET_ERR_MSG(extack, "Missing NTF_SELF");
++ 				return -EINVAL;
++ 			}
++ 			ops = dev->netdev_ops;
++ 		}
++ 	}
++ 
++ 	if (!br_dev && !dev) {
++ 		NL_SET_ERR_MSG(extack, "No device specified");
++ 		return -ENODEV;
++ 	}
++ 
++ 	if (!ops || !ops->ndo_fdb_get) {
++ 		NL_SET_ERR_MSG(extack, "Fdb get operation not supported by device");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	skb = nlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
++ 	if (!skb)
++ 		return -ENOBUFS;
++ 
++ 	if (br_dev)
++ 		dev = br_dev;
++ 	err = ops->ndo_fdb_get(skb, tb, dev, addr, vid,
++ 			       NETLINK_CB(in_skb).portid,
++ 			       nlh->nlmsg_seq, extack);
++ 	if (err)
++ 		goto out;
++ 
++ 	return rtnl_unicast(skb, net, NETLINK_CB(in_skb).portid);
++ out:
++ 	kfree_skb(skb);
++ 	return err;
++ }
++ 
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  static int brport_nla_put_flag(struct sk_buff *skb, u32 flags, u32 mask,
+  			       unsigned int attrnum, unsigned int flag)
+  {
+diff --cc net/netfilter/ipset/ip_set_core.c
+index 49c7f5be46d5,3f4a4936f63c..000000000000
+--- a/net/netfilter/ipset/ip_set_core.c
++++ b/net/netfilter/ipset/ip_set_core.c
+@@@ -1296,12 -1293,11 +1293,19 @@@ dump_init(struct netlink_callback *cb, 
+  	struct nlattr *attr = (void *)nlh + min_len;
+  	u32 dump_type;
+  	ip_set_id_t index;
+ +	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = nla_parse(cda, IPSET_ATTR_CMD_MAX, attr, nlh->nlmsg_len - min_len,
+ +			ip_set_setname_policy, NULL);
+ +	if (ret)
+ +		return ret;
+++=======
++ 	/* Second pass, so parser can't fail */
++ 	nla_parse_deprecated(cda, IPSET_ATTR_CMD_MAX, attr,
++ 			     nlh->nlmsg_len - min_len, ip_set_setname_policy,
++ 			     NULL);
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  
+  	cb->args[IPSET_CB_PROTO] = nla_get_u8(cda[IPSET_ATTR_PROTOCOL]);
+  	if (cda[IPSET_ATTR_SETNAME]) {
+@@@ -1548,14 -1544,10 +1552,20 @@@ call_ad(struct sock *ctnl, struct sk_bu
+  		memcpy(&errmsg->msg, nlh, nlh->nlmsg_len);
+  		cmdattr = (void *)&errmsg->msg + min_len;
+  
+++<<<<<<< HEAD
+ +		ret = nla_parse(cda, IPSET_ATTR_CMD_MAX, cmdattr,
+ +				nlh->nlmsg_len - min_len, ip_set_adt_policy,
+ +				NULL);
+++=======
++ 		nla_parse_deprecated(cda, IPSET_ATTR_CMD_MAX, cmdattr,
++ 				     nlh->nlmsg_len - min_len,
++ 				     ip_set_adt_policy, NULL);
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  
+ +		if (ret) {
+ +			nlmsg_free(skb2);
+ +			return ret;
+ +		}
+  		errline = nla_data(cda[IPSET_ATTR_LINENO]);
+  
+  		*errline = lineno;
+diff --cc net/netfilter/nf_conntrack_netlink.c
+index b33075a42117,8dcc064d518d..000000000000
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@@ -958,25 -1018,26 +958,32 @@@ static int ctnetlink_parse_tuple_ip(str
+  				    struct nf_conntrack_tuple *tuple)
+  {
+  	struct nlattr *tb[CTA_IP_MAX+1];
+ +	struct nf_conntrack_l3proto *l3proto;
+  	int ret = 0;
+  
+- 	ret = nla_parse_nested(tb, CTA_IP_MAX, attr, NULL, NULL);
++ 	ret = nla_parse_nested_deprecated(tb, CTA_IP_MAX, attr, NULL, NULL);
+  	if (ret < 0)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	l3proto = __nf_ct_l3proto_find(tuple->src.l3num);
+++=======
++ 	ret = nla_validate_nested_deprecated(attr, CTA_IP_MAX,
++ 					     cta_ip_nla_policy, NULL);
++ 	if (ret)
++ 		return ret;
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  
+ -	switch (tuple->src.l3num) {
+ -	case NFPROTO_IPV4:
+ -		ret = ipv4_nlattr_to_tuple(tb, tuple);
+ -		break;
+ -	case NFPROTO_IPV6:
+ -		ret = ipv6_nlattr_to_tuple(tb, tuple);
+ -		break;
+ +	if (likely(l3proto->nlattr_to_tuple)) {
+ +		ret = nla_validate_nested(attr, CTA_IP_MAX,
+ +					  l3proto->nla_policy, NULL);
+ +		if (ret == 0)
+ +			ret = l3proto->nlattr_to_tuple(tb, tuple);
+  	}
+  
+ +	rcu_read_unlock();
+ +
+  	return ret;
+  }
+  
+@@@ -1001,11 -1062,12 +1008,12 @@@ static int ctnetlink_parse_tuple_proto(
+  	tuple->dst.protonum = nla_get_u8(tb[CTA_PROTO_NUM]);
+  
+  	rcu_read_lock();
+ -	l4proto = nf_ct_l4proto_find(tuple->dst.protonum);
+ +	l4proto = __nf_ct_l4proto_find(tuple->src.l3num, tuple->dst.protonum);
+  
+  	if (likely(l4proto->nlattr_to_tuple)) {
+- 		ret = nla_validate_nested(attr, CTA_PROTO_MAX,
+- 					  l4proto->nla_policy, NULL);
++ 		ret = nla_validate_nested_deprecated(attr, CTA_PROTO_MAX,
++ 						     l4proto->nla_policy,
++ 						     NULL);
+  		if (ret == 0)
+  			ret = l4proto->nlattr_to_tuple(tb, tuple);
+  	}
+diff --cc net/netfilter/nf_tables_api.c
+index 9433a9c149a7,d98416e83d4e..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -1447,8 -1522,12 +1447,17 @@@ static int nft_chain_parse_hook(struct 
+  	struct net_device *dev;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	err = nla_parse_nested(ha, NFTA_HOOK_MAX, nla[NFTA_CHAIN_HOOK],
+ +			       nft_hook_policy, NULL);
+++=======
++ 	lockdep_assert_held(&net->nft.commit_mutex);
++ 	lockdep_nfnl_nft_mutex_not_held();
++ 
++ 	err = nla_parse_nested_deprecated(ha, NFTA_HOOK_MAX,
++ 					  nla[NFTA_CHAIN_HOOK],
++ 					  nft_hook_policy, NULL);
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  	if (err < 0)
+  		return err;
+  
+diff --cc net/netfilter/nft_ct.c
+index 3fe9a7819557,b422b74bfe08..000000000000
+--- a/net/netfilter/nft_ct.c
++++ b/net/netfilter/nft_ct.c
+@@@ -765,6 -782,191 +765,194 @@@ static struct nft_expr_type nft_notrack
+  	.owner		= THIS_MODULE,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NF_CONNTRACK_TIMEOUT
++ static int
++ nft_ct_timeout_parse_policy(void *timeouts,
++ 			    const struct nf_conntrack_l4proto *l4proto,
++ 			    struct net *net, const struct nlattr *attr)
++ {
++ 	struct nlattr **tb;
++ 	int ret = 0;
++ 
++ 	tb = kcalloc(l4proto->ctnl_timeout.nlattr_max + 1, sizeof(*tb),
++ 		     GFP_KERNEL);
++ 
++ 	if (!tb)
++ 		return -ENOMEM;
++ 
++ 	ret = nla_parse_nested_deprecated(tb,
++ 					  l4proto->ctnl_timeout.nlattr_max,
++ 					  attr,
++ 					  l4proto->ctnl_timeout.nla_policy,
++ 					  NULL);
++ 	if (ret < 0)
++ 		goto err;
++ 
++ 	ret = l4proto->ctnl_timeout.nlattr_to_obj(tb, net, timeouts);
++ 
++ err:
++ 	kfree(tb);
++ 	return ret;
++ }
++ 
++ struct nft_ct_timeout_obj {
++ 	struct nf_ct_timeout    *timeout;
++ 	u8			l4proto;
++ };
++ 
++ static void nft_ct_timeout_obj_eval(struct nft_object *obj,
++ 				    struct nft_regs *regs,
++ 				    const struct nft_pktinfo *pkt)
++ {
++ 	const struct nft_ct_timeout_obj *priv = nft_obj_data(obj);
++ 	struct nf_conn *ct = (struct nf_conn *)skb_nfct(pkt->skb);
++ 	struct nf_conn_timeout *timeout;
++ 	const unsigned int *values;
++ 
++ 	if (priv->l4proto != pkt->tprot)
++ 		return;
++ 
++ 	if (!ct || nf_ct_is_template(ct) || nf_ct_is_confirmed(ct))
++ 		return;
++ 
++ 	timeout = nf_ct_timeout_find(ct);
++ 	if (!timeout) {
++ 		timeout = nf_ct_timeout_ext_add(ct, priv->timeout, GFP_ATOMIC);
++ 		if (!timeout) {
++ 			regs->verdict.code = NF_DROP;
++ 			return;
++ 		}
++ 	}
++ 
++ 	rcu_assign_pointer(timeout->timeout, priv->timeout);
++ 
++ 	/* adjust the timeout as per 'new' state. ct is unconfirmed,
++ 	 * so the current timestamp must not be added.
++ 	 */
++ 	values = nf_ct_timeout_data(timeout);
++ 	if (values)
++ 		nf_ct_refresh(ct, pkt->skb, values[0]);
++ }
++ 
++ static int nft_ct_timeout_obj_init(const struct nft_ctx *ctx,
++ 				   const struct nlattr * const tb[],
++ 				   struct nft_object *obj)
++ {
++ 	struct nft_ct_timeout_obj *priv = nft_obj_data(obj);
++ 	const struct nf_conntrack_l4proto *l4proto;
++ 	struct nf_ct_timeout *timeout;
++ 	int l3num = ctx->family;
++ 	__u8 l4num;
++ 	int ret;
++ 
++ 	if (!tb[NFTA_CT_TIMEOUT_L4PROTO] ||
++ 	    !tb[NFTA_CT_TIMEOUT_DATA])
++ 		return -EINVAL;
++ 
++ 	if (tb[NFTA_CT_TIMEOUT_L3PROTO])
++ 		l3num = ntohs(nla_get_be16(tb[NFTA_CT_TIMEOUT_L3PROTO]));
++ 
++ 	l4num = nla_get_u8(tb[NFTA_CT_TIMEOUT_L4PROTO]);
++ 	priv->l4proto = l4num;
++ 
++ 	l4proto = nf_ct_l4proto_find(l4num);
++ 
++ 	if (l4proto->l4proto != l4num) {
++ 		ret = -EOPNOTSUPP;
++ 		goto err_proto_put;
++ 	}
++ 
++ 	timeout = kzalloc(sizeof(struct nf_ct_timeout) +
++ 			  l4proto->ctnl_timeout.obj_size, GFP_KERNEL);
++ 	if (timeout == NULL) {
++ 		ret = -ENOMEM;
++ 		goto err_proto_put;
++ 	}
++ 
++ 	ret = nft_ct_timeout_parse_policy(&timeout->data, l4proto, ctx->net,
++ 					  tb[NFTA_CT_TIMEOUT_DATA]);
++ 	if (ret < 0)
++ 		goto err_free_timeout;
++ 
++ 	timeout->l3num = l3num;
++ 	timeout->l4proto = l4proto;
++ 
++ 	ret = nf_ct_netns_get(ctx->net, ctx->family);
++ 	if (ret < 0)
++ 		goto err_free_timeout;
++ 
++ 	priv->timeout = timeout;
++ 	return 0;
++ 
++ err_free_timeout:
++ 	kfree(timeout);
++ err_proto_put:
++ 	return ret;
++ }
++ 
++ static void nft_ct_timeout_obj_destroy(const struct nft_ctx *ctx,
++ 				       struct nft_object *obj)
++ {
++ 	struct nft_ct_timeout_obj *priv = nft_obj_data(obj);
++ 	struct nf_ct_timeout *timeout = priv->timeout;
++ 
++ 	nf_ct_untimeout(ctx->net, timeout);
++ 	nf_ct_netns_put(ctx->net, ctx->family);
++ 	kfree(priv->timeout);
++ }
++ 
++ static int nft_ct_timeout_obj_dump(struct sk_buff *skb,
++ 				   struct nft_object *obj, bool reset)
++ {
++ 	const struct nft_ct_timeout_obj *priv = nft_obj_data(obj);
++ 	const struct nf_ct_timeout *timeout = priv->timeout;
++ 	struct nlattr *nest_params;
++ 	int ret;
++ 
++ 	if (nla_put_u8(skb, NFTA_CT_TIMEOUT_L4PROTO, timeout->l4proto->l4proto) ||
++ 	    nla_put_be16(skb, NFTA_CT_TIMEOUT_L3PROTO, htons(timeout->l3num)))
++ 		return -1;
++ 
++ 	nest_params = nla_nest_start(skb, NFTA_CT_TIMEOUT_DATA);
++ 	if (!nest_params)
++ 		return -1;
++ 
++ 	ret = timeout->l4proto->ctnl_timeout.obj_to_nlattr(skb, &timeout->data);
++ 	if (ret < 0)
++ 		return -1;
++ 	nla_nest_end(skb, nest_params);
++ 	return 0;
++ }
++ 
++ static const struct nla_policy nft_ct_timeout_policy[NFTA_CT_TIMEOUT_MAX + 1] = {
++ 	[NFTA_CT_TIMEOUT_L3PROTO] = {.type = NLA_U16 },
++ 	[NFTA_CT_TIMEOUT_L4PROTO] = {.type = NLA_U8 },
++ 	[NFTA_CT_TIMEOUT_DATA]	  = {.type = NLA_NESTED },
++ };
++ 
++ static struct nft_object_type nft_ct_timeout_obj_type;
++ 
++ static const struct nft_object_ops nft_ct_timeout_obj_ops = {
++ 	.type		= &nft_ct_timeout_obj_type,
++ 	.size		= sizeof(struct nft_ct_timeout_obj),
++ 	.eval		= nft_ct_timeout_obj_eval,
++ 	.init		= nft_ct_timeout_obj_init,
++ 	.destroy	= nft_ct_timeout_obj_destroy,
++ 	.dump		= nft_ct_timeout_obj_dump,
++ };
++ 
++ static struct nft_object_type nft_ct_timeout_obj_type __read_mostly = {
++ 	.type		= NFT_OBJECT_CT_TIMEOUT,
++ 	.ops		= &nft_ct_timeout_obj_ops,
++ 	.maxattr	= NFTA_CT_TIMEOUT_MAX,
++ 	.policy		= nft_ct_timeout_policy,
++ 	.owner		= THIS_MODULE,
++ };
++ #endif /* CONFIG_NF_CONNTRACK_TIMEOUT */
++ 
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  static int nft_ct_helper_obj_init(const struct nft_ctx *ctx,
+  				  const struct nlattr * const tb[],
+  				  struct nft_object *obj)
+diff --cc net/netlink/genetlink.c
+index f0ec068e1d02,994d9aff2093..000000000000
+--- a/net/netlink/genetlink.c
++++ b/net/netlink/genetlink.c
+@@@ -577,8 -577,9 +577,14 @@@ static int genl_family_rcv_msg(const st
+  		attrbuf = family->attrbuf;
+  
+  	if (attrbuf) {
+++<<<<<<< HEAD
+ +		err = nlmsg_parse(nlh, hdrlen, attrbuf, family->maxattr,
+ +				  ops->policy, extack);
+++=======
++ 		err = nlmsg_parse_deprecated(nlh, hdrlen, attrbuf,
++ 					     family->maxattr, family->policy,
++ 					     extack);
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  		if (err < 0)
+  			goto out;
+  	}
+diff --cc net/openvswitch/flow_netlink.c
+index eab5e8eaddaa,54eb80dd2dc6..000000000000
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@@ -2838,6 -2866,88 +2838,91 @@@ static int validate_userspace(const str
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static const struct nla_policy cpl_policy[OVS_CHECK_PKT_LEN_ATTR_MAX + 1] = {
++ 	[OVS_CHECK_PKT_LEN_ATTR_PKT_LEN] = {.type = NLA_U16 },
++ 	[OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_GREATER] = {.type = NLA_NESTED },
++ 	[OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_LESS_EQUAL] = {.type = NLA_NESTED },
++ };
++ 
++ static int validate_and_copy_check_pkt_len(struct net *net,
++ 					   const struct nlattr *attr,
++ 					   const struct sw_flow_key *key,
++ 					   struct sw_flow_actions **sfa,
++ 					   __be16 eth_type, __be16 vlan_tci,
++ 					   bool log, bool last)
++ {
++ 	const struct nlattr *acts_if_greater, *acts_if_lesser_eq;
++ 	struct nlattr *a[OVS_CHECK_PKT_LEN_ATTR_MAX + 1];
++ 	struct check_pkt_len_arg arg;
++ 	int nested_acts_start;
++ 	int start, err;
++ 
++ 	err = nla_parse_deprecated_strict(a, OVS_CHECK_PKT_LEN_ATTR_MAX,
++ 					  nla_data(attr), nla_len(attr),
++ 					  cpl_policy, NULL);
++ 	if (err)
++ 		return err;
++ 
++ 	if (!a[OVS_CHECK_PKT_LEN_ATTR_PKT_LEN] ||
++ 	    !nla_get_u16(a[OVS_CHECK_PKT_LEN_ATTR_PKT_LEN]))
++ 		return -EINVAL;
++ 
++ 	acts_if_lesser_eq = a[OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_LESS_EQUAL];
++ 	acts_if_greater = a[OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_GREATER];
++ 
++ 	/* Both the nested action should be present. */
++ 	if (!acts_if_greater || !acts_if_lesser_eq)
++ 		return -EINVAL;
++ 
++ 	/* validation done, copy the nested actions. */
++ 	start = add_nested_action_start(sfa, OVS_ACTION_ATTR_CHECK_PKT_LEN,
++ 					log);
++ 	if (start < 0)
++ 		return start;
++ 
++ 	arg.pkt_len = nla_get_u16(a[OVS_CHECK_PKT_LEN_ATTR_PKT_LEN]);
++ 	arg.exec_for_lesser_equal =
++ 		last || !actions_may_change_flow(acts_if_lesser_eq);
++ 	arg.exec_for_greater =
++ 		last || !actions_may_change_flow(acts_if_greater);
++ 
++ 	err = ovs_nla_add_action(sfa, OVS_CHECK_PKT_LEN_ATTR_ARG, &arg,
++ 				 sizeof(arg), log);
++ 	if (err)
++ 		return err;
++ 
++ 	nested_acts_start = add_nested_action_start(sfa,
++ 		OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_LESS_EQUAL, log);
++ 	if (nested_acts_start < 0)
++ 		return nested_acts_start;
++ 
++ 	err = __ovs_nla_copy_actions(net, acts_if_lesser_eq, key, sfa,
++ 				     eth_type, vlan_tci, log);
++ 
++ 	if (err)
++ 		return err;
++ 
++ 	add_nested_action_end(*sfa, nested_acts_start);
++ 
++ 	nested_acts_start = add_nested_action_start(sfa,
++ 		OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_GREATER, log);
++ 	if (nested_acts_start < 0)
++ 		return nested_acts_start;
++ 
++ 	err = __ovs_nla_copy_actions(net, acts_if_greater, key, sfa,
++ 				     eth_type, vlan_tci, log);
++ 
++ 	if (err)
++ 		return err;
++ 
++ 	add_nested_action_end(*sfa, nested_acts_start);
++ 	add_nested_action_end(*sfa, start);
++ 	return 0;
++ }
++ 
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  static int copy_action(const struct nlattr *from,
+  		       struct sw_flow_actions **sfa, bool log)
+  {
+diff --cc net/sched/sch_taprio.c
+index fcaf3eaa7b4f,09563c245473..000000000000
+--- a/net/sched/sch_taprio.c
++++ b/net/sched/sch_taprio.c
+@@@ -458,8 -322,71 +458,74 @@@ static int parse_sched_entry(struct nla
+  	return fill_sched_entry(tb, entry, extack);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Returns the number of entries in case of success */
++ static int parse_sched_single_entry(struct nlattr *n,
++ 				    struct taprio_sched *q,
++ 				    struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb_entry[TCA_TAPRIO_SCHED_ENTRY_MAX + 1] = { };
++ 	struct nlattr *tb_list[TCA_TAPRIO_SCHED_MAX + 1] = { };
++ 	struct sched_entry *entry;
++ 	bool found = false;
++ 	u32 index;
++ 	int err;
++ 
++ 	err = nla_parse_nested_deprecated(tb_list, TCA_TAPRIO_SCHED_MAX, n,
++ 					  entry_list_policy, NULL);
++ 	if (err < 0) {
++ 		NL_SET_ERR_MSG(extack, "Could not parse nested entry");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!tb_list[TCA_TAPRIO_SCHED_ENTRY]) {
++ 		NL_SET_ERR_MSG(extack, "Single-entry must include an entry");
++ 		return -EINVAL;
++ 	}
++ 
++ 	err = nla_parse_nested_deprecated(tb_entry,
++ 					  TCA_TAPRIO_SCHED_ENTRY_MAX,
++ 					  tb_list[TCA_TAPRIO_SCHED_ENTRY],
++ 					  entry_policy, NULL);
++ 	if (err < 0) {
++ 		NL_SET_ERR_MSG(extack, "Could not parse nested entry");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!tb_entry[TCA_TAPRIO_SCHED_ENTRY_INDEX]) {
++ 		NL_SET_ERR_MSG(extack, "Entry must specify an index\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	index = nla_get_u32(tb_entry[TCA_TAPRIO_SCHED_ENTRY_INDEX]);
++ 	if (index >= q->num_entries) {
++ 		NL_SET_ERR_MSG(extack, "Index for single entry exceeds number of entries in schedule");
++ 		return -EINVAL;
++ 	}
++ 
++ 	list_for_each_entry(entry, &q->entries, list) {
++ 		if (entry->index == index) {
++ 			found = true;
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (!found) {
++ 		NL_SET_ERR_MSG(extack, "Could not find entry");
++ 		return -ENOENT;
++ 	}
++ 
++ 	err = fill_sched_entry(tb_entry, entry, extack);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	return q->num_entries;
++ }
++ 
+++>>>>>>> 8cb081746c03 (netlink: make validation more configurable for future strictness)
+  static int parse_sched_list(struct nlattr *list,
+ -			    struct taprio_sched *q,
+ +			    struct sched_gate_list *sched,
+  			    struct netlink_ext_ack *extack)
+  {
+  	struct nlattr *n;
+@@@ -715,12 -642,11 +781,12 @@@ static int taprio_change(struct Qdisc *
+  	struct taprio_sched *q = qdisc_priv(sch);
+  	struct net_device *dev = qdisc_dev(sch);
+  	struct tc_mqprio_qopt *mqprio = NULL;
+ -	int i, err, size;
+ +	int i, err, clockid;
+ +	unsigned long flags;
+  	ktime_t start;
+  
+- 	err = nla_parse_nested(tb, TCA_TAPRIO_ATTR_MAX, opt,
+- 			       taprio_policy, extack);
++ 	err = nla_parse_nested_deprecated(tb, TCA_TAPRIO_ATTR_MAX, opt,
++ 					  taprio_policy, extack);
+  	if (err < 0)
+  		return err;
+  
+* Unmerged path drivers/net/ieee802154/mac802154_hwsim.c
+* Unmerged path net/netfilter/nft_tunnel.c
+diff --git a/crypto/crypto_user.c b/crypto/crypto_user.c
+index 3cca814348a2..d4bbf24deec8 100644
+--- a/crypto/crypto_user.c
++++ b/crypto/crypto_user.c
+@@ -525,8 +525,8 @@ static int crypto_user_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 		return err;
+ 	}
+ 
+-	err = nlmsg_parse(nlh, crypto_msg_min[type], attrs, CRYPTOCFGA_MAX,
+-			  crypto_policy, extack);
++	err = nlmsg_parse_deprecated(nlh, crypto_msg_min[type], attrs,
++				     CRYPTOCFGA_MAX, crypto_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/drivers/block/drbd/drbd_nla.c b/drivers/block/drbd/drbd_nla.c
+index 8e261cb5198b..6a09b0b98018 100644
+--- a/drivers/block/drbd/drbd_nla.c
++++ b/drivers/block/drbd/drbd_nla.c
+@@ -35,7 +35,8 @@ int drbd_nla_parse_nested(struct nlattr *tb[], int maxtype, struct nlattr *nla,
+ 
+ 	err = drbd_nla_check_mandatory(maxtype, nla);
+ 	if (!err)
+-		err = nla_parse_nested(tb, maxtype, nla, policy, NULL);
++		err = nla_parse_nested_deprecated(tb, maxtype, nla, policy,
++						  NULL);
+ 
+ 	return err;
+ }
+diff --git a/drivers/block/nbd.c b/drivers/block/nbd.c
+index e769f4352e98..4f3c376ee9cb 100644
+--- a/drivers/block/nbd.c
++++ b/drivers/block/nbd.c
+@@ -1823,8 +1823,10 @@ static int nbd_genl_connect(struct sk_buff *skb, struct genl_info *info)
+ 				ret = -EINVAL;
+ 				goto out;
+ 			}
+-			ret = nla_parse_nested(socks, NBD_SOCK_MAX, attr,
+-					       nbd_sock_policy, info->extack);
++			ret = nla_parse_nested_deprecated(socks, NBD_SOCK_MAX,
++							  attr,
++							  nbd_sock_policy,
++							  info->extack);
+ 			if (ret != 0) {
+ 				printk(KERN_ERR "nbd: error processing sock list\n");
+ 				ret = -EINVAL;
+@@ -1994,8 +1996,10 @@ static int nbd_genl_reconfigure(struct sk_buff *skb, struct genl_info *info)
+ 				ret = -EINVAL;
+ 				goto out;
+ 			}
+-			ret = nla_parse_nested(socks, NBD_SOCK_MAX, attr,
+-					       nbd_sock_policy, info->extack);
++			ret = nla_parse_nested_deprecated(socks, NBD_SOCK_MAX,
++							  attr,
++							  nbd_sock_policy,
++							  info->extack);
+ 			if (ret != 0) {
+ 				printk(KERN_ERR "nbd: error processing sock list\n");
+ 				ret = -EINVAL;
+diff --git a/drivers/infiniband/core/addr.c b/drivers/infiniband/core/addr.c
+index 4ca31ce29a29..4398f84ecf9d 100644
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@ -86,8 +86,8 @@ static inline bool ib_nl_is_good_ip_resp(const struct nlmsghdr *nlh)
+ 	if (nlh->nlmsg_flags & RDMA_NL_LS_F_ERR)
+ 		return false;
+ 
+-	ret = nla_parse(tb, LS_NLA_TYPE_MAX - 1, nlmsg_data(nlh),
+-			nlmsg_len(nlh), ib_nl_addr_policy, NULL);
++	ret = nla_parse_deprecated(tb, LS_NLA_TYPE_MAX - 1, nlmsg_data(nlh),
++				   nlmsg_len(nlh), ib_nl_addr_policy, NULL);
+ 	if (ret)
+ 		return false;
+ 
+diff --git a/drivers/infiniband/core/iwpm_util.c b/drivers/infiniband/core/iwpm_util.c
+index a7fefad0c14d..bc9c01e44519 100644
+--- a/drivers/infiniband/core/iwpm_util.c
++++ b/drivers/infiniband/core/iwpm_util.c
+@@ -506,14 +506,14 @@ int iwpm_parse_nlmsg(struct netlink_callback *cb, int policy_max,
+ 	int ret;
+ 	const char *err_str = "";
+ 
+-	ret = nlmsg_validate(cb->nlh, nlh_len, policy_max - 1, nlmsg_policy,
+-			     NULL);
++	ret = nlmsg_validate_deprecated(cb->nlh, nlh_len, policy_max - 1,
++					nlmsg_policy, NULL);
+ 	if (ret) {
+ 		err_str = "Invalid attribute";
+ 		goto parse_nlmsg_error;
+ 	}
+-	ret = nlmsg_parse(cb->nlh, nlh_len, nltb, policy_max - 1,
+-			  nlmsg_policy, NULL);
++	ret = nlmsg_parse_deprecated(cb->nlh, nlh_len, nltb, policy_max - 1,
++				     nlmsg_policy, NULL);
+ 	if (ret) {
+ 		err_str = "Unable to parse the nlmsg";
+ 		goto parse_nlmsg_error;
+* Unmerged path drivers/infiniband/core/nldev.c
+diff --git a/drivers/infiniband/core/sa_query.c b/drivers/infiniband/core/sa_query.c
+index 114f890ab425..7d8071c7e564 100644
+--- a/drivers/infiniband/core/sa_query.c
++++ b/drivers/infiniband/core/sa_query.c
+@@ -1027,8 +1027,8 @@ int ib_nl_handle_set_timeout(struct sk_buff *skb,
+ 	    !(NETLINK_CB(skb).sk))
+ 		return -EPERM;
+ 
+-	ret = nla_parse(tb, LS_NLA_TYPE_MAX - 1, nlmsg_data(nlh),
+-			nlmsg_len(nlh), ib_nl_policy, NULL);
++	ret = nla_parse_deprecated(tb, LS_NLA_TYPE_MAX - 1, nlmsg_data(nlh),
++				   nlmsg_len(nlh), ib_nl_policy, NULL);
+ 	attr = (const struct nlattr *)tb[LS_NLA_TYPE_TIMEOUT];
+ 	if (ret || !attr)
+ 		goto settimeout_out;
+@@ -1079,8 +1079,8 @@ static inline int ib_nl_is_good_resolve_resp(const struct nlmsghdr *nlh)
+ 	if (nlh->nlmsg_flags & RDMA_NL_LS_F_ERR)
+ 		return 0;
+ 
+-	ret = nla_parse(tb, LS_NLA_TYPE_MAX - 1, nlmsg_data(nlh),
+-			nlmsg_len(nlh), ib_nl_policy, NULL);
++	ret = nla_parse_deprecated(tb, LS_NLA_TYPE_MAX - 1, nlmsg_data(nlh),
++				   nlmsg_len(nlh), ib_nl_policy, NULL);
+ 	if (ret)
+ 		return 0;
+ 
+* Unmerged path drivers/net/ieee802154/mac802154_hwsim.c
+diff --git a/drivers/net/macsec.c b/drivers/net/macsec.c
+index 590f48f56360..f1d9e3fc2370 100644
+--- a/drivers/net/macsec.c
++++ b/drivers/net/macsec.c
+@@ -1612,9 +1612,7 @@ static int parse_sa_config(struct nlattr **attrs, struct nlattr **tb_sa)
+ 	if (!attrs[MACSEC_ATTR_SA_CONFIG])
+ 		return -EINVAL;
+ 
+-	if (nla_parse_nested(tb_sa, MACSEC_SA_ATTR_MAX,
+-			     attrs[MACSEC_ATTR_SA_CONFIG],
+-			     macsec_genl_sa_policy, NULL))
++	if (nla_parse_nested_deprecated(tb_sa, MACSEC_SA_ATTR_MAX, attrs[MACSEC_ATTR_SA_CONFIG], macsec_genl_sa_policy, NULL))
+ 		return -EINVAL;
+ 
+ 	return 0;
+@@ -1625,9 +1623,7 @@ static int parse_rxsc_config(struct nlattr **attrs, struct nlattr **tb_rxsc)
+ 	if (!attrs[MACSEC_ATTR_RXSC_CONFIG])
+ 		return -EINVAL;
+ 
+-	if (nla_parse_nested(tb_rxsc, MACSEC_RXSC_ATTR_MAX,
+-			     attrs[MACSEC_ATTR_RXSC_CONFIG],
+-			     macsec_genl_rxsc_policy, NULL))
++	if (nla_parse_nested_deprecated(tb_rxsc, MACSEC_RXSC_ATTR_MAX, attrs[MACSEC_ATTR_RXSC_CONFIG], macsec_genl_rxsc_policy, NULL))
+ 		return -EINVAL;
+ 
+ 	return 0;
+diff --git a/drivers/net/team/team.c b/drivers/net/team/team.c
+index 14f06bc02f1b..b2287efd67dd 100644
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -2524,9 +2524,11 @@ static int team_nl_cmd_options_set(struct sk_buff *skb, struct genl_info *info)
+ 			err = -EINVAL;
+ 			goto team_put;
+ 		}
+-		err = nla_parse_nested(opt_attrs, TEAM_ATTR_OPTION_MAX,
+-				       nl_option, team_nl_option_policy,
+-				       info->extack);
++		err = nla_parse_nested_deprecated(opt_attrs,
++						  TEAM_ATTR_OPTION_MAX,
++						  nl_option,
++						  team_nl_option_policy,
++						  info->extack);
+ 		if (err)
+ 			goto team_put;
+ 		if (!opt_attrs[TEAM_ATTR_OPTION_NAME] ||
+diff --git a/drivers/net/wireless/ath/ath6kl/testmode.c b/drivers/net/wireless/ath/ath6kl/testmode.c
+index d8dcacda9add..f3906dbe5495 100644
+--- a/drivers/net/wireless/ath/ath6kl/testmode.c
++++ b/drivers/net/wireless/ath/ath6kl/testmode.c
+@@ -74,8 +74,8 @@ int ath6kl_tm_cmd(struct wiphy *wiphy, struct wireless_dev *wdev,
+ 	int err, buf_len;
+ 	void *buf;
+ 
+-	err = nla_parse(tb, ATH6KL_TM_ATTR_MAX, data, len, ath6kl_tm_policy,
+-			NULL);
++	err = nla_parse_deprecated(tb, ATH6KL_TM_ATTR_MAX, data, len,
++				   ath6kl_tm_policy, NULL);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/drivers/net/wireless/ath/wcn36xx/testmode.c b/drivers/net/wireless/ath/wcn36xx/testmode.c
+index 51a038022c8b..7ae14b4d2d0e 100644
+--- a/drivers/net/wireless/ath/wcn36xx/testmode.c
++++ b/drivers/net/wireless/ath/wcn36xx/testmode.c
+@@ -132,8 +132,8 @@ int wcn36xx_tm_cmd(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	unsigned short attr;
+ 
+ 	wcn36xx_dbg_dump(WCN36XX_DBG_TESTMODE_DUMP, "Data:", data, len);
+-	ret = nla_parse(tb, WCN36XX_TM_ATTR_MAX, data, len,
+-			wcn36xx_tm_policy, NULL);
++	ret = nla_parse_deprecated(tb, WCN36XX_TM_ATTR_MAX, data, len,
++				   wcn36xx_tm_policy, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/net/wireless/ath/wil6210/cfg80211.c b/drivers/net/wireless/ath/wil6210/cfg80211.c
+index 78946f28d0c7..8b3851b86634 100644
+--- a/drivers/net/wireless/ath/wil6210/cfg80211.c
++++ b/drivers/net/wireless/ath/wil6210/cfg80211.c
+@@ -2259,8 +2259,8 @@ static int wil_rf_sector_get_cfg(struct wiphy *wiphy,
+ 	if (!test_bit(WMI_FW_CAPABILITY_RF_SECTORS, wil->fw_capabilities))
+ 		return -EOPNOTSUPP;
+ 
+-	rc = nla_parse(tb, QCA_ATTR_DMG_RF_SECTOR_MAX, data, data_len,
+-		       wil_rf_sector_policy, NULL);
++	rc = nla_parse_deprecated(tb, QCA_ATTR_DMG_RF_SECTOR_MAX, data,
++				  data_len, wil_rf_sector_policy, NULL);
+ 	if (rc) {
+ 		wil_err(wil, "Invalid rf sector ATTR\n");
+ 		return rc;
+@@ -2379,8 +2379,8 @@ static int wil_rf_sector_set_cfg(struct wiphy *wiphy,
+ 	if (!test_bit(WMI_FW_CAPABILITY_RF_SECTORS, wil->fw_capabilities))
+ 		return -EOPNOTSUPP;
+ 
+-	rc = nla_parse(tb, QCA_ATTR_DMG_RF_SECTOR_MAX, data, data_len,
+-		       wil_rf_sector_policy, NULL);
++	rc = nla_parse_deprecated(tb, QCA_ATTR_DMG_RF_SECTOR_MAX, data,
++				  data_len, wil_rf_sector_policy, NULL);
+ 	if (rc) {
+ 		wil_err(wil, "Invalid rf sector ATTR\n");
+ 		return rc;
+@@ -2412,9 +2412,11 @@ static int wil_rf_sector_set_cfg(struct wiphy *wiphy,
+ 	cmd.sector_type = sector_type;
+ 	nla_for_each_nested(nl_cfg, tb[QCA_ATTR_DMG_RF_SECTOR_CFG],
+ 			    tmp) {
+-		rc = nla_parse_nested(tb2, QCA_ATTR_DMG_RF_SECTOR_CFG_MAX,
+-				      nl_cfg, wil_rf_sector_cfg_policy,
+-				      NULL);
++		rc = nla_parse_nested_deprecated(tb2,
++						 QCA_ATTR_DMG_RF_SECTOR_CFG_MAX,
++						 nl_cfg,
++						 wil_rf_sector_cfg_policy,
++						 NULL);
+ 		if (rc) {
+ 			wil_err(wil, "invalid sector cfg\n");
+ 			return -EINVAL;
+@@ -2486,8 +2488,8 @@ static int wil_rf_sector_get_selected(struct wiphy *wiphy,
+ 	if (!test_bit(WMI_FW_CAPABILITY_RF_SECTORS, wil->fw_capabilities))
+ 		return -EOPNOTSUPP;
+ 
+-	rc = nla_parse(tb, QCA_ATTR_DMG_RF_SECTOR_MAX, data, data_len,
+-		       wil_rf_sector_policy, NULL);
++	rc = nla_parse_deprecated(tb, QCA_ATTR_DMG_RF_SECTOR_MAX, data,
++				  data_len, wil_rf_sector_policy, NULL);
+ 	if (rc) {
+ 		wil_err(wil, "Invalid rf sector ATTR\n");
+ 		return rc;
+@@ -2594,8 +2596,8 @@ static int wil_rf_sector_set_selected(struct wiphy *wiphy,
+ 	if (!test_bit(WMI_FW_CAPABILITY_RF_SECTORS, wil->fw_capabilities))
+ 		return -EOPNOTSUPP;
+ 
+-	rc = nla_parse(tb, QCA_ATTR_DMG_RF_SECTOR_MAX, data, data_len,
+-		       wil_rf_sector_policy, NULL);
++	rc = nla_parse_deprecated(tb, QCA_ATTR_DMG_RF_SECTOR_MAX, data,
++				  data_len, wil_rf_sector_policy, NULL);
+ 	if (rc) {
+ 		wil_err(wil, "Invalid rf sector ATTR\n");
+ 		return rc;
+diff --git a/drivers/net/wireless/mac80211_hwsim.c b/drivers/net/wireless/mac80211_hwsim.c
+index d8266956df1f..856aa529826f 100644
+--- a/drivers/net/wireless/mac80211_hwsim.c
++++ b/drivers/net/wireless/mac80211_hwsim.c
+@@ -390,8 +390,8 @@ static int mac80211_hwsim_vendor_cmd_test(struct wiphy *wiphy,
+ 	int err;
+ 	u32 val;
+ 
+-	err = nla_parse(tb, QCA_WLAN_VENDOR_ATTR_MAX, data, data_len,
+-			hwsim_vendor_test_policy, NULL);
++	err = nla_parse_deprecated(tb, QCA_WLAN_VENDOR_ATTR_MAX, data,
++				   data_len, hwsim_vendor_test_policy, NULL);
+ 	if (err)
+ 		return err;
+ 	if (!tb[QCA_WLAN_VENDOR_ATTR_TEST])
+@@ -1949,8 +1949,8 @@ static int mac80211_hwsim_testmode_cmd(struct ieee80211_hw *hw,
+ 	struct sk_buff *skb;
+ 	int err, ps;
+ 
+-	err = nla_parse(tb, HWSIM_TM_ATTR_MAX, data, len,
+-			hwsim_testmode_policy, NULL);
++	err = nla_parse_deprecated(tb, HWSIM_TM_ATTR_MAX, data, len,
++				   hwsim_testmode_policy, NULL);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/drivers/net/wireless/ti/wlcore/testmode.c b/drivers/net/wireless/ti/wlcore/testmode.c
+index 009ec07c4cec..f0323480020b 100644
+--- a/drivers/net/wireless/ti/wlcore/testmode.c
++++ b/drivers/net/wireless/ti/wlcore/testmode.c
+@@ -366,8 +366,8 @@ int wl1271_tm_cmd(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	u32 nla_cmd;
+ 	int err;
+ 
+-	err = nla_parse(tb, WL1271_TM_ATTR_MAX, data, len, wl1271_tm_policy,
+-			NULL);
++	err = nla_parse_deprecated(tb, WL1271_TM_ATTR_MAX, data, len,
++				   wl1271_tm_policy, NULL);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/drivers/net/wireless/ti/wlcore/vendor_cmd.c b/drivers/net/wireless/ti/wlcore/vendor_cmd.c
+index 5c0bcb1fe1a1..90d4d1bf2c8f 100644
+--- a/drivers/net/wireless/ti/wlcore/vendor_cmd.c
++++ b/drivers/net/wireless/ti/wlcore/vendor_cmd.c
+@@ -40,8 +40,8 @@ wlcore_vendor_cmd_smart_config_start(struct wiphy *wiphy,
+ 	if (!data)
+ 		return -EINVAL;
+ 
+-	ret = nla_parse(tb, MAX_WLCORE_VENDOR_ATTR, data, data_len,
+-			wlcore_vendor_attr_policy, NULL);
++	ret = nla_parse_deprecated(tb, MAX_WLCORE_VENDOR_ATTR, data, data_len,
++				   wlcore_vendor_attr_policy, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -115,8 +115,8 @@ wlcore_vendor_cmd_smart_config_set_group_key(struct wiphy *wiphy,
+ 	if (!data)
+ 		return -EINVAL;
+ 
+-	ret = nla_parse(tb, MAX_WLCORE_VENDOR_ATTR, data, data_len,
+-			wlcore_vendor_attr_policy, NULL);
++	ret = nla_parse_deprecated(tb, MAX_WLCORE_VENDOR_ATTR, data, data_len,
++				   wlcore_vendor_attr_policy, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/include/net/genetlink.h b/include/net/genetlink.h
+index 22f49598a574..f5f503ffb157 100644
+--- a/include/net/genetlink.h
++++ b/include/net/genetlink.h
+@@ -188,7 +188,7 @@ static inline struct nlmsghdr *genlmsg_nlhdr(void *user_hdr)
+ }
+ 
+ /**
+- * genlmsg_parse - parse attributes of a genetlink message
++ * genlmsg_parse_deprecated - parse attributes of a genetlink message
+  * @nlh: netlink message header
+  * @family: genetlink message family
+  * @tb: destination array with maxtype+1 elements
+@@ -196,14 +196,14 @@ static inline struct nlmsghdr *genlmsg_nlhdr(void *user_hdr)
+  * @policy: validation policy
+  * @extack: extended ACK report struct
+  */
+-static inline int genlmsg_parse(const struct nlmsghdr *nlh,
+-				const struct genl_family *family,
+-				struct nlattr *tb[], int maxtype,
+-				const struct nla_policy *policy,
+-				struct netlink_ext_ack *extack)
++static inline int genlmsg_parse_deprecated(const struct nlmsghdr *nlh,
++					   const struct genl_family *family,
++					   struct nlattr *tb[], int maxtype,
++					   const struct nla_policy *policy,
++					   struct netlink_ext_ack *extack)
+ {
+-	return nlmsg_parse(nlh, family->hdrsize + GENL_HDRLEN, tb, maxtype,
+-			   policy, extack);
++	return __nlmsg_parse(nlh, family->hdrsize + GENL_HDRLEN, tb, maxtype,
++			     policy, NL_VALIDATE_LIBERAL, extack);
+ }
+ 
+ /**
+diff --git a/include/net/netlink.h b/include/net/netlink.h
+index 01d3e027e7e1..3becd57f70ed 100644
+--- a/include/net/netlink.h
++++ b/include/net/netlink.h
+@@ -282,21 +282,48 @@ struct nl_info {
+ 	bool			skip_notify;
+ };
+ 
++/**
++ * enum netlink_validation - netlink message/attribute validation levels
++ * @NL_VALIDATE_LIBERAL: Old-style "be liberal" validation, not caring about
++ *	extra data at the end of the message, attributes being longer than
++ *	they should be, or unknown attributes being present.
++ * @NL_VALIDATE_TRAILING: Reject junk data encountered after attribute parsing.
++ * @NL_VALIDATE_MAXTYPE: Reject attributes > max type; Together with _TRAILING
++ *	this is equivalent to the old nla_parse_strict()/nlmsg_parse_strict().
++ * @NL_VALIDATE_UNSPEC: Reject attributes with NLA_UNSPEC in the policy.
++ *	This can safely be set by the kernel when the given policy has no
++ *	NLA_UNSPEC anymore, and can thus be used to ensure policy entries
++ *	are enforced going forward.
++ * @NL_VALIDATE_STRICT_ATTRS: strict attribute policy parsing (e.g.
++ *	U8, U16, U32 must have exact size, etc.)
++ */
++enum netlink_validation {
++	NL_VALIDATE_LIBERAL = 0,
++	NL_VALIDATE_TRAILING = BIT(0),
++	NL_VALIDATE_MAXTYPE = BIT(1),
++	NL_VALIDATE_UNSPEC = BIT(2),
++	NL_VALIDATE_STRICT_ATTRS = BIT(3),
++};
++
++#define NL_VALIDATE_DEPRECATED_STRICT (NL_VALIDATE_TRAILING |\
++				       NL_VALIDATE_MAXTYPE)
++#define NL_VALIDATE_STRICT (NL_VALIDATE_TRAILING |\
++			    NL_VALIDATE_MAXTYPE |\
++			    NL_VALIDATE_UNSPEC |\
++			    NL_VALIDATE_STRICT_ATTRS)
++
+ int netlink_rcv_skb(struct sk_buff *skb,
+ 		    int (*cb)(struct sk_buff *, struct nlmsghdr *,
+ 			      struct netlink_ext_ack *));
+ int nlmsg_notify(struct sock *sk, struct sk_buff *skb, u32 portid,
+ 		 unsigned int group, int report, gfp_t flags);
+ 
+-int nla_validate(const struct nlattr *head, int len, int maxtype,
+-		 const struct nla_policy *policy,
+-		 struct netlink_ext_ack *extack);
+-int nla_parse(struct nlattr **tb, int maxtype, const struct nlattr *head,
+-	      int len, const struct nla_policy *policy,
+-	      struct netlink_ext_ack *extack);
+-int nla_parse_strict(struct nlattr **tb, int maxtype, const struct nlattr *head,
+-		     int len, const struct nla_policy *policy,
+-		     struct netlink_ext_ack *extack);
++int __nla_validate(const struct nlattr *head, int len, int maxtype,
++		   const struct nla_policy *policy, unsigned int validate,
++		   struct netlink_ext_ack *extack);
++int __nla_parse(struct nlattr **tb, int maxtype, const struct nlattr *head,
++		int len, const struct nla_policy *policy, unsigned int validate,
++		struct netlink_ext_ack *extack);
+ int nla_policy_len(const struct nla_policy *, int);
+ struct nlattr *nla_find(const struct nlattr *head, int len, int attrtype);
+ size_t nla_strlcpy(char *dst, const struct nlattr *nla, size_t dstsize);
+@@ -425,42 +452,121 @@ nlmsg_next(const struct nlmsghdr *nlh, int *remaining)
+ }
+ 
+ /**
+- * nlmsg_parse - parse attributes of a netlink message
++ * nla_parse_deprecated - Parse a stream of attributes into a tb buffer
++ * @tb: destination array with maxtype+1 elements
++ * @maxtype: maximum attribute type to be expected
++ * @head: head of attribute stream
++ * @len: length of attribute stream
++ * @policy: validation policy
++ * @extack: extended ACK pointer
++ *
++ * Parses a stream of attributes and stores a pointer to each attribute in
++ * the tb array accessible via the attribute type. Attributes with a type
++ * exceeding maxtype will be ignored and attributes from the policy are not
++ * always strictly validated (only for new attributes).
++ *
++ * Returns 0 on success or a negative error code.
++ */
++static inline int nla_parse_deprecated(struct nlattr **tb, int maxtype,
++				       const struct nlattr *head, int len,
++				       const struct nla_policy *policy,
++				       struct netlink_ext_ack *extack)
++{
++	return __nla_parse(tb, maxtype, head, len, policy,
++			   NL_VALIDATE_LIBERAL, extack);
++}
++
++/**
++ * nla_parse_deprecated_strict - Parse a stream of attributes into a tb buffer
++ * @tb: destination array with maxtype+1 elements
++ * @maxtype: maximum attribute type to be expected
++ * @head: head of attribute stream
++ * @len: length of attribute stream
++ * @policy: validation policy
++ * @extack: extended ACK pointer
++ *
++ * Parses a stream of attributes and stores a pointer to each attribute in
++ * the tb array accessible via the attribute type. Attributes with a type
++ * exceeding maxtype will be rejected as well as trailing data, but the
++ * policy is not completely strictly validated (only for new attributes).
++ *
++ * Returns 0 on success or a negative error code.
++ */
++static inline int nla_parse_deprecated_strict(struct nlattr **tb, int maxtype,
++					      const struct nlattr *head,
++					      int len,
++					      const struct nla_policy *policy,
++					      struct netlink_ext_ack *extack)
++{
++	return __nla_parse(tb, maxtype, head, len, policy,
++			   NL_VALIDATE_DEPRECATED_STRICT, extack);
++}
++
++/**
++ * __nlmsg_parse - parse attributes of a netlink message
+  * @nlh: netlink message header
+  * @hdrlen: length of family specific header
+  * @tb: destination array with maxtype+1 elements
+  * @maxtype: maximum attribute type to be expected
+  * @policy: validation policy
++ * @validate: validation strictness
+  * @extack: extended ACK report struct
+  *
+  * See nla_parse()
+  */
+-static inline int nlmsg_parse(const struct nlmsghdr *nlh, int hdrlen,
+-			      struct nlattr *tb[], int maxtype,
+-			      const struct nla_policy *policy,
+-			      struct netlink_ext_ack *extack)
++static inline int __nlmsg_parse(const struct nlmsghdr *nlh, int hdrlen,
++				struct nlattr *tb[], int maxtype,
++				const struct nla_policy *policy,
++				unsigned int validate,
++				struct netlink_ext_ack *extack)
+ {
+ 	if (nlh->nlmsg_len < nlmsg_msg_size(hdrlen)) {
+ 		NL_SET_ERR_MSG(extack, "Invalid header length");
+ 		return -EINVAL;
+ 	}
+ 
+-	return nla_parse(tb, maxtype, nlmsg_attrdata(nlh, hdrlen),
+-			 nlmsg_attrlen(nlh, hdrlen), policy, extack);
++	return __nla_parse(tb, maxtype, nlmsg_attrdata(nlh, hdrlen),
++			   nlmsg_attrlen(nlh, hdrlen), policy, validate,
++			   extack);
+ }
+ 
+-static inline int nlmsg_parse_strict(const struct nlmsghdr *nlh, int hdrlen,
+-				     struct nlattr *tb[], int maxtype,
+-				     const struct nla_policy *policy,
+-				     struct netlink_ext_ack *extack)
++/**
++ * nlmsg_parse_deprecated - parse attributes of a netlink message
++ * @nlh: netlink message header
++ * @hdrlen: length of family specific header
++ * @tb: destination array with maxtype+1 elements
++ * @maxtype: maximum attribute type to be expected
++ * @extack: extended ACK report struct
++ *
++ * See nla_parse_deprecated()
++ */
++static inline int nlmsg_parse_deprecated(const struct nlmsghdr *nlh, int hdrlen,
++					 struct nlattr *tb[], int maxtype,
++					 const struct nla_policy *policy,
++					 struct netlink_ext_ack *extack)
+ {
+-	if (nlh->nlmsg_len < nlmsg_msg_size(hdrlen)) {
+-		NL_SET_ERR_MSG(extack, "Invalid header length");
+-		return -EINVAL;
+-	}
++	return __nlmsg_parse(nlh, hdrlen, tb, maxtype, policy,
++			     NL_VALIDATE_LIBERAL, extack);
++}
+ 
+-	return nla_parse_strict(tb, maxtype, nlmsg_attrdata(nlh, hdrlen),
+-				nlmsg_attrlen(nlh, hdrlen), policy, extack);
++/**
++ * nlmsg_parse_deprecated_strict - parse attributes of a netlink message
++ * @nlh: netlink message header
++ * @hdrlen: length of family specific header
++ * @tb: destination array with maxtype+1 elements
++ * @maxtype: maximum attribute type to be expected
++ * @extack: extended ACK report struct
++ *
++ * See nla_parse_deprecated_strict()
++ */
++static inline int
++nlmsg_parse_deprecated_strict(const struct nlmsghdr *nlh, int hdrlen,
++			      struct nlattr *tb[], int maxtype,
++			      const struct nla_policy *policy,
++			      struct netlink_ext_ack *extack)
++{
++	return __nlmsg_parse(nlh, hdrlen, tb, maxtype, policy,
++			     NL_VALIDATE_DEPRECATED_STRICT, extack);
+ }
+ 
+ /**
+@@ -479,26 +585,53 @@ static inline struct nlattr *nlmsg_find_attr(const struct nlmsghdr *nlh,
+ }
+ 
+ /**
+- * nlmsg_validate - validate a netlink message including attributes
++ * nla_validate_deprecated - Validate a stream of attributes
++ * @head: head of attribute stream
++ * @len: length of attribute stream
++ * @maxtype: maximum attribute type to be expected
++ * @policy: validation policy
++ * @validate: validation strictness
++ * @extack: extended ACK report struct
++ *
++ * Validates all attributes in the specified attribute stream against the
++ * specified policy. Validation is done in liberal mode.
++ * See documenation of struct nla_policy for more details.
++ *
++ * Returns 0 on success or a negative error code.
++ */
++static inline int nla_validate_deprecated(const struct nlattr *head, int len,
++					  int maxtype,
++					  const struct nla_policy *policy,
++					  struct netlink_ext_ack *extack)
++{
++	return __nla_validate(head, len, maxtype, policy, NL_VALIDATE_LIBERAL,
++			      extack);
++}
++
++
++/**
++ * nlmsg_validate_deprecated - validate a netlink message including attributes
+  * @nlh: netlinket message header
+  * @hdrlen: length of familiy specific header
+  * @maxtype: maximum attribute type to be expected
+  * @policy: validation policy
+  * @extack: extended ACK report struct
+  */
+-static inline int nlmsg_validate(const struct nlmsghdr *nlh,
+-				 int hdrlen, int maxtype,
+-				 const struct nla_policy *policy,
+-				 struct netlink_ext_ack *extack)
++static inline int nlmsg_validate_deprecated(const struct nlmsghdr *nlh,
++					    int hdrlen, int maxtype,
++					    const struct nla_policy *policy,
++					    struct netlink_ext_ack *extack)
+ {
+ 	if (nlh->nlmsg_len < nlmsg_msg_size(hdrlen))
+ 		return -EINVAL;
+ 
+-	return nla_validate(nlmsg_attrdata(nlh, hdrlen),
+-			    nlmsg_attrlen(nlh, hdrlen), maxtype, policy,
+-			    extack);
++	return __nla_validate(nlmsg_attrdata(nlh, hdrlen),
++			      nlmsg_attrlen(nlh, hdrlen), maxtype,
++			      policy, NL_VALIDATE_LIBERAL, extack);
+ }
+ 
++
++
+ /**
+  * nlmsg_report - need to report back to application?
+  * @nlh: netlink message header
+@@ -812,22 +945,22 @@ nla_find_nested(const struct nlattr *nla, int attrtype)
+ }
+ 
+ /**
+- * nla_parse_nested - parse nested attributes
++ * nla_parse_nested_deprecated - parse nested attributes
+  * @tb: destination array with maxtype+1 elements
+  * @maxtype: maximum attribute type to be expected
+  * @nla: attribute containing the nested attributes
+  * @policy: validation policy
+  * @extack: extended ACK report struct
+  *
+- * See nla_parse()
++ * See nla_parse_deprecated()
+  */
+-static inline int nla_parse_nested(struct nlattr *tb[], int maxtype,
+-				   const struct nlattr *nla,
+-				   const struct nla_policy *policy,
+-				   struct netlink_ext_ack *extack)
++static inline int nla_parse_nested_deprecated(struct nlattr *tb[], int maxtype,
++					      const struct nlattr *nla,
++					      const struct nla_policy *policy,
++					      struct netlink_ext_ack *extack)
+ {
+-	return nla_parse(tb, maxtype, nla_data(nla), nla_len(nla), policy,
+-			 extack);
++	return __nla_parse(tb, maxtype, nla_data(nla), nla_len(nla), policy,
++			   NL_VALIDATE_LIBERAL, extack);
+ }
+ 
+ /**
+@@ -1382,6 +1515,7 @@ static inline void nla_nest_cancel(struct sk_buff *skb, struct nlattr *start)
+  * @start: container attribute
+  * @maxtype: maximum attribute type to be expected
+  * @policy: validation policy
++ * @validate: validation strictness
+  * @extack: extended ACK report struct
+  *
+  * Validates all attributes in the nested attribute stream against the
+@@ -1390,12 +1524,22 @@ static inline void nla_nest_cancel(struct sk_buff *skb, struct nlattr *start)
+  *
+  * Returns 0 on success or a negative error code.
+  */
+-static inline int nla_validate_nested(const struct nlattr *start, int maxtype,
+-				      const struct nla_policy *policy,
+-				      struct netlink_ext_ack *extack)
++static inline int __nla_validate_nested(const struct nlattr *start, int maxtype,
++					const struct nla_policy *policy,
++					unsigned int validate,
++					struct netlink_ext_ack *extack)
++{
++	return __nla_validate(nla_data(start), nla_len(start), maxtype, policy,
++			      validate, extack);
++}
++
++static inline int
++nla_validate_nested_deprecated(const struct nlattr *start, int maxtype,
++			       const struct nla_policy *policy,
++			       struct netlink_ext_ack *extack)
+ {
+-	return nla_validate(nla_data(start), nla_len(start), maxtype, policy,
+-			    extack);
++	return __nla_validate_nested(start, maxtype, policy,
++				     NL_VALIDATE_LIBERAL, extack);
+ }
+ 
+ /**
+* Unmerged path kernel/taskstats.c
+diff --git a/lib/nlattr.c b/lib/nlattr.c
+index 17d86e6fbd3b..bc5680389f0f 100644
+--- a/lib/nlattr.c
++++ b/lib/nlattr.c
+@@ -69,7 +69,8 @@ static int validate_nla_bitfield32(const struct nlattr *nla,
+ 
+ static int nla_validate_array(const struct nlattr *head, int len, int maxtype,
+ 			      const struct nla_policy *policy,
+-			      struct netlink_ext_ack *extack)
++			      struct netlink_ext_ack *extack,
++			      unsigned int validate)
+ {
+ 	const struct nlattr *entry;
+ 	int rem;
+@@ -86,8 +87,8 @@ static int nla_validate_array(const struct nlattr *head, int len, int maxtype,
+ 			return -ERANGE;
+ 		}
+ 
+-		ret = nla_validate(nla_data(entry), nla_len(entry),
+-				   maxtype, policy, extack);
++		ret = __nla_validate(nla_data(entry), nla_len(entry),
++				     maxtype, policy, validate, extack);
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+@@ -96,7 +97,7 @@ static int nla_validate_array(const struct nlattr *head, int len, int maxtype,
+ }
+ 
+ static int validate_nla(const struct nlattr *nla, int maxtype,
+-			const struct nla_policy *policy,
++			const struct nla_policy *policy, unsigned int validate,
+ 			struct netlink_ext_ack *extack)
+ {
+ 	const struct nla_policy *pt;
+@@ -114,6 +115,11 @@ static int validate_nla(const struct nlattr *nla, int maxtype,
+ 	    (pt->type == NLA_EXACT_LEN_WARN && attrlen != pt->len)) {
+ 		pr_warn_ratelimited("netlink: '%s': attribute type %d has an invalid length.\n",
+ 				    current->comm, type);
++		if (validate & NL_VALIDATE_STRICT_ATTRS) {
++			NL_SET_ERR_MSG_ATTR(extack, nla,
++					    "invalid attribute length");
++			return -EINVAL;
++		}
+ 	}
+ 
+ 	switch (pt->type) {
+@@ -186,8 +192,9 @@ static int validate_nla(const struct nlattr *nla, int maxtype,
+ 		if (attrlen < NLA_HDRLEN)
+ 			goto out_err;
+ 		if (pt->validation_data) {
+-			err = nla_validate(nla_data(nla), nla_len(nla), pt->len,
+-					   pt->validation_data, extack);
++			err = __nla_validate(nla_data(nla), nla_len(nla), pt->len,
++					     pt->validation_data, validate,
++					     extack);
+ 			if (err < 0) {
+ 				/*
+ 				 * return directly to preserve the inner
+@@ -210,7 +217,7 @@ static int validate_nla(const struct nlattr *nla, int maxtype,
+ 
+ 			err = nla_validate_array(nla_data(nla), nla_len(nla),
+ 						 pt->len, pt->validation_data,
+-						 extack);
++						 extack, validate);
+ 			if (err < 0) {
+ 				/*
+ 				 * return directly to preserve the inner
+@@ -222,6 +229,12 @@ static int validate_nla(const struct nlattr *nla, int maxtype,
+ 		break;
+ 
+ 	case NLA_UNSPEC:
++		if (validate & NL_VALIDATE_UNSPEC) {
++			NL_SET_ERR_MSG_ATTR(extack, nla,
++					    "Unsupported attribute");
++			return -EINVAL;
++		}
++		/* fall through */
+ 	case NLA_MIN_LEN:
+ 		if (attrlen < pt->len)
+ 			goto out_err;
+@@ -243,37 +256,75 @@ static int validate_nla(const struct nlattr *nla, int maxtype,
+ 	return err;
+ }
+ 
++static int __nla_validate_parse(const struct nlattr *head, int len, int maxtype,
++				const struct nla_policy *policy,
++				unsigned int validate,
++				struct netlink_ext_ack *extack,
++				struct nlattr **tb)
++{
++	const struct nlattr *nla;
++	int rem;
++
++	if (tb)
++		memset(tb, 0, sizeof(struct nlattr *) * (maxtype + 1));
++
++	nla_for_each_attr(nla, head, len, rem) {
++		u16 type = nla_type(nla);
++
++		if (type == 0 || type > maxtype) {
++			if (validate & NL_VALIDATE_MAXTYPE) {
++				NL_SET_ERR_MSG(extack, "Unknown attribute type");
++				return -EINVAL;
++			}
++			continue;
++		}
++		if (policy) {
++			int err = validate_nla(nla, maxtype, policy,
++					       validate, extack);
++
++			if (err < 0)
++				return err;
++		}
++
++		if (tb)
++			tb[type] = (struct nlattr *)nla;
++	}
++
++	if (unlikely(rem > 0)) {
++		pr_warn_ratelimited("netlink: %d bytes leftover after parsing attributes in process `%s'.\n",
++				    rem, current->comm);
++		NL_SET_ERR_MSG(extack, "bytes leftover after parsing attributes");
++		if (validate & NL_VALIDATE_TRAILING)
++			return -EINVAL;
++	}
++
++	return 0;
++}
++
+ /**
+- * nla_validate - Validate a stream of attributes
++ * __nla_validate - Validate a stream of attributes
+  * @head: head of attribute stream
+  * @len: length of attribute stream
+  * @maxtype: maximum attribute type to be expected
+  * @policy: validation policy
++ * @validate: validation strictness
+  * @extack: extended ACK report struct
+  *
+  * Validates all attributes in the specified attribute stream against the
+- * specified policy. Attributes with a type exceeding maxtype will be
+- * ignored. See documenation of struct nla_policy for more details.
++ * specified policy. Validation depends on the validate flags passed, see
++ * &enum netlink_validation for more details on that.
++ * See documenation of struct nla_policy for more details.
+  *
+  * Returns 0 on success or a negative error code.
+  */
+-int nla_validate(const struct nlattr *head, int len, int maxtype,
+-		 const struct nla_policy *policy,
+-		 struct netlink_ext_ack *extack)
++int __nla_validate(const struct nlattr *head, int len, int maxtype,
++		   const struct nla_policy *policy, unsigned int validate,
++		   struct netlink_ext_ack *extack)
+ {
+-	const struct nlattr *nla;
+-	int rem;
+-
+-	nla_for_each_attr(nla, head, len, rem) {
+-		int err = validate_nla(nla, maxtype, policy, extack);
+-
+-		if (err < 0)
+-			return err;
+-	}
+-
+-	return 0;
++	return __nla_validate_parse(head, len, maxtype, policy, validate,
++				    extack, NULL);
+ }
+-EXPORT_SYMBOL(nla_validate);
++EXPORT_SYMBOL(__nla_validate);
+ 
+ /**
+  * nla_policy_len - Determin the max. length of a policy
+@@ -305,76 +356,30 @@ nla_policy_len(const struct nla_policy *p, int n)
+ EXPORT_SYMBOL(nla_policy_len);
+ 
+ /**
+- * nla_parse - Parse a stream of attributes into a tb buffer
++ * __nla_parse - Parse a stream of attributes into a tb buffer
+  * @tb: destination array with maxtype+1 elements
+  * @maxtype: maximum attribute type to be expected
+  * @head: head of attribute stream
+  * @len: length of attribute stream
+  * @policy: validation policy
++ * @validate: validation strictness
++ * @extack: extended ACK pointer
+  *
+  * Parses a stream of attributes and stores a pointer to each attribute in
+- * the tb array accessible via the attribute type. Attributes with a type
+- * exceeding maxtype will be silently ignored for backwards compatibility
+- * reasons. policy may be set to NULL if no validation is required.
++ * the tb array accessible via the attribute type.
++ * Validation is controlled by the @validate parameter.
+  *
+  * Returns 0 on success or a negative error code.
+  */
+-static int __nla_parse(struct nlattr **tb, int maxtype,
+-		       const struct nlattr *head, int len,
+-		       bool strict, const struct nla_policy *policy,
+-		       struct netlink_ext_ack *extack)
+-{
+-	const struct nlattr *nla;
+-	int rem;
+-
+-	memset(tb, 0, sizeof(struct nlattr *) * (maxtype + 1));
+-
+-	nla_for_each_attr(nla, head, len, rem) {
+-		u16 type = nla_type(nla);
+-
+-		if (type == 0 || type > maxtype) {
+-			if (strict) {
+-				NL_SET_ERR_MSG(extack, "Unknown attribute type");
+-				return -EINVAL;
+-			}
+-			continue;
+-		}
+-		if (policy) {
+-			int err = validate_nla(nla, maxtype, policy, extack);
+-
+-			if (err < 0)
+-				return err;
+-		}
+-
+-		tb[type] = (struct nlattr *)nla;
+-	}
+-
+-	if (unlikely(rem > 0)) {
+-		pr_warn_ratelimited("netlink: %d bytes leftover after parsing attributes in process `%s'.\n",
+-				    rem, current->comm);
+-		NL_SET_ERR_MSG(extack, "bytes leftover after parsing attributes");
+-		if (strict)
+-			return -EINVAL;
+-	}
+-
+-	return 0;
+-}
+-
+-int nla_parse(struct nlattr **tb, int maxtype, const struct nlattr *head,
+-	      int len, const struct nla_policy *policy,
+-	      struct netlink_ext_ack *extack)
+-{
+-	return __nla_parse(tb, maxtype, head, len, false, policy, extack);
+-}
+-EXPORT_SYMBOL(nla_parse);
+-
+-int nla_parse_strict(struct nlattr **tb, int maxtype, const struct nlattr *head,
+-		     int len, const struct nla_policy *policy,
+-		     struct netlink_ext_ack *extack)
++int __nla_parse(struct nlattr **tb, int maxtype,
++		const struct nlattr *head, int len,
++		const struct nla_policy *policy, unsigned int validate,
++		struct netlink_ext_ack *extack)
+ {
+-	return __nla_parse(tb, maxtype, head, len, true, policy, extack);
++	return __nla_validate_parse(head, len, maxtype, policy, validate,
++				    extack, tb);
+ }
+-EXPORT_SYMBOL(nla_parse_strict);
++EXPORT_SYMBOL(__nla_parse);
+ 
+ /**
+  * nla_find - Find a specific attribute in a stream of attributes
+diff --git a/net/8021q/vlan_netlink.c b/net/8021q/vlan_netlink.c
+index 9b60c1e399e2..afbaae47489d 100644
+--- a/net/8021q/vlan_netlink.c
++++ b/net/8021q/vlan_netlink.c
+@@ -35,8 +35,8 @@ static inline int vlan_validate_qos_map(struct nlattr *attr)
+ {
+ 	if (!attr)
+ 		return 0;
+-	return nla_validate_nested(attr, IFLA_VLAN_QOS_MAX, vlan_map_policy,
+-				   NULL);
++	return nla_validate_nested_deprecated(attr, IFLA_VLAN_QOS_MAX,
++					      vlan_map_policy, NULL);
+ }
+ 
+ static int vlan_validate(struct nlattr *tb[], struct nlattr *data[],
+diff --git a/net/bridge/br_mdb.c b/net/bridge/br_mdb.c
+index b7add7010820..59e0b69ab736 100644
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@ -542,8 +542,8 @@ static int br_mdb_parse(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	struct net_device *dev;
+ 	int err;
+ 
+-	err = nlmsg_parse(nlh, sizeof(*bpm), tb, MDBA_SET_ENTRY_MAX, NULL,
+-			  NULL);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*bpm), tb,
++				     MDBA_SET_ENTRY_MAX, NULL, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 0b3ccef34ba8..6b9556049cb4 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -852,8 +852,10 @@ int br_setlink(struct net_device *dev, struct nlmsghdr *nlh, u16 flags,
+ 
+ 	if (p && protinfo) {
+ 		if (protinfo->nla_type & NLA_F_NESTED) {
+-			err = nla_parse_nested(tb, IFLA_BRPORT_MAX, protinfo,
+-					       br_port_policy, NULL);
++			err = nla_parse_nested_deprecated(tb, IFLA_BRPORT_MAX,
++							  protinfo,
++							  br_port_policy,
++							  NULL);
+ 			if (err)
+ 				return err;
+ 
+diff --git a/net/bridge/br_netlink_tunnel.c b/net/bridge/br_netlink_tunnel.c
+index da8cb99fd259..5d8b0cbf9ba0 100644
+--- a/net/bridge/br_netlink_tunnel.c
++++ b/net/bridge/br_netlink_tunnel.c
+@@ -230,8 +230,8 @@ int br_parse_vlan_tunnel_info(struct nlattr *attr,
+ 
+ 	memset(tinfo, 0, sizeof(*tinfo));
+ 
+-	err = nla_parse_nested(tb, IFLA_BRIDGE_VLAN_TUNNEL_MAX, attr,
+-			       vlan_tunnel_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, IFLA_BRIDGE_VLAN_TUNNEL_MAX,
++					  attr, vlan_tunnel_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/can/gw.c b/net/can/gw.c
+index faa3da88a127..be8e2408d2cf 100644
+--- a/net/can/gw.c
++++ b/net/can/gw.c
+@@ -638,8 +638,8 @@ static int cgw_parse_attr(struct nlmsghdr *nlh, struct cf_mod *mod,
+ 	/* initialize modification & checksum data space */
+ 	memset(mod, 0, sizeof(*mod));
+ 
+-	err = nlmsg_parse(nlh, sizeof(struct rtcanmsg), tb, CGW_MAX,
+-			  cgw_policy, NULL);
++	err = nlmsg_parse_deprecated(nlh, sizeof(struct rtcanmsg), tb,
++				     CGW_MAX, cgw_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+* Unmerged path net/core/devlink.c
+diff --git a/net/core/fib_rules.c b/net/core/fib_rules.c
+index 2f8a8173a1e8..390d8b5d62ef 100644
+--- a/net/core/fib_rules.c
++++ b/net/core/fib_rules.c
+@@ -746,7 +746,8 @@ int fib_nl_newrule(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 		goto errout;
+ 	}
+ 
+-	err = nlmsg_parse(nlh, sizeof(*frh), tb, FRA_MAX, ops->policy, extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*frh), tb, FRA_MAX,
++				     ops->policy, extack);
+ 	if (err < 0) {
+ 		NL_SET_ERR_MSG(extack, "Error parsing msg");
+ 		goto errout;
+@@ -853,7 +854,8 @@ int fib_nl_delrule(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 		goto errout;
+ 	}
+ 
+-	err = nlmsg_parse(nlh, sizeof(*frh), tb, FRA_MAX, ops->policy, extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*frh), tb, FRA_MAX,
++				     ops->policy, extack);
+ 	if (err < 0) {
+ 		NL_SET_ERR_MSG(extack, "Error parsing msg");
+ 		goto errout;
+diff --git a/net/core/lwt_bpf.c b/net/core/lwt_bpf.c
+index 4110d65e9441..66f17e1b4679 100644
+--- a/net/core/lwt_bpf.c
++++ b/net/core/lwt_bpf.c
+@@ -336,8 +336,8 @@ static int bpf_parse_prog(struct nlattr *attr, struct bpf_lwt_prog *prog,
+ 	int ret;
+ 	u32 fd;
+ 
+-	ret = nla_parse_nested(tb, LWT_BPF_PROG_MAX, attr, bpf_prog_policy,
+-			       NULL);
++	ret = nla_parse_nested_deprecated(tb, LWT_BPF_PROG_MAX, attr,
++					  bpf_prog_policy, NULL);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -380,7 +380,8 @@ static int bpf_build_state(struct nlattr *nla,
+ 	if (family != AF_INET && family != AF_INET6)
+ 		return -EAFNOSUPPORT;
+ 
+-	ret = nla_parse_nested(tb, LWT_BPF_MAX, nla, bpf_nl_policy, extack);
++	ret = nla_parse_nested_deprecated(tb, LWT_BPF_MAX, nla, bpf_nl_policy,
++					  extack);
+ 	if (ret < 0)
+ 		return ret;
+ 
+* Unmerged path net/core/neighbour.c
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+index dcf2fc6a6750..5ba0ac2ad2ed 100644
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -654,8 +654,8 @@ static int rtnl_net_newid(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	struct net *peer;
+ 	int nsid, err;
+ 
+-	err = nlmsg_parse(nlh, sizeof(struct rtgenmsg), tb, NETNSA_MAX,
+-			  rtnl_net_policy, extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(struct rtgenmsg), tb,
++				     NETNSA_MAX, rtnl_net_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 	if (!tb[NETNSA_NSID]) {
+@@ -759,11 +759,13 @@ static int rtnl_net_valid_getid_req(struct sk_buff *skb,
+ 	int i, err;
+ 
+ 	if (!netlink_strict_get_check(skb))
+-		return nlmsg_parse(nlh, sizeof(struct rtgenmsg), tb, NETNSA_MAX,
+-				   rtnl_net_policy, extack);
++		return nlmsg_parse_deprecated(nlh, sizeof(struct rtgenmsg),
++					      tb, NETNSA_MAX, rtnl_net_policy,
++					      extack);
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(struct rtgenmsg), tb, NETNSA_MAX,
+-				 rtnl_net_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(struct rtgenmsg), tb,
++					    NETNSA_MAX, rtnl_net_policy,
++					    extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -901,8 +903,9 @@ static int rtnl_valid_dump_net_req(const struct nlmsghdr *nlh, struct sock *sk,
+ 	struct nlattr *tb[NETNSA_MAX + 1];
+ 	int err, i;
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(struct rtgenmsg), tb, NETNSA_MAX,
+-				 rtnl_net_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(struct rtgenmsg), tb,
++					    NETNSA_MAX, rtnl_net_policy,
++					    extack);
+ 	if (err < 0)
+ 		return err;
+ 
+* Unmerged path net/core/rtnetlink.c
+diff --git a/net/dcb/dcbnl.c b/net/dcb/dcbnl.c
+index a556cd708885..56d8d15afadd 100644
+--- a/net/dcb/dcbnl.c
++++ b/net/dcb/dcbnl.c
+@@ -241,8 +241,9 @@ static int dcbnl_getpfccfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (!netdev->dcbnl_ops->getpfccfg)
+ 		return -EOPNOTSUPP;
+ 
+-	ret = nla_parse_nested(data, DCB_PFC_UP_ATTR_MAX,
+-			       tb[DCB_ATTR_PFC_CFG], dcbnl_pfc_up_nest, NULL);
++	ret = nla_parse_nested_deprecated(data, DCB_PFC_UP_ATTR_MAX,
++					  tb[DCB_ATTR_PFC_CFG],
++					  dcbnl_pfc_up_nest, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -299,8 +300,9 @@ static int dcbnl_getcap(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (!netdev->dcbnl_ops->getcap)
+ 		return -EOPNOTSUPP;
+ 
+-	ret = nla_parse_nested(data, DCB_CAP_ATTR_MAX, tb[DCB_ATTR_CAP],
+-			       dcbnl_cap_nest, NULL);
++	ret = nla_parse_nested_deprecated(data, DCB_CAP_ATTR_MAX,
++					  tb[DCB_ATTR_CAP], dcbnl_cap_nest,
++					  NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -343,8 +345,9 @@ static int dcbnl_getnumtcs(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (!netdev->dcbnl_ops->getnumtcs)
+ 		return -EOPNOTSUPP;
+ 
+-	ret = nla_parse_nested(data, DCB_NUMTCS_ATTR_MAX, tb[DCB_ATTR_NUMTCS],
+-			       dcbnl_numtcs_nest, NULL);
++	ret = nla_parse_nested_deprecated(data, DCB_NUMTCS_ATTR_MAX,
++					  tb[DCB_ATTR_NUMTCS],
++					  dcbnl_numtcs_nest, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -388,8 +391,9 @@ static int dcbnl_setnumtcs(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (!netdev->dcbnl_ops->setnumtcs)
+ 		return -EOPNOTSUPP;
+ 
+-	ret = nla_parse_nested(data, DCB_NUMTCS_ATTR_MAX, tb[DCB_ATTR_NUMTCS],
+-			       dcbnl_numtcs_nest, NULL);
++	ret = nla_parse_nested_deprecated(data, DCB_NUMTCS_ATTR_MAX,
++					  tb[DCB_ATTR_NUMTCS],
++					  dcbnl_numtcs_nest, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -447,8 +451,9 @@ static int dcbnl_getapp(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (!tb[DCB_ATTR_APP])
+ 		return -EINVAL;
+ 
+-	ret = nla_parse_nested(app_tb, DCB_APP_ATTR_MAX, tb[DCB_ATTR_APP],
+-			       dcbnl_app_nest, NULL);
++	ret = nla_parse_nested_deprecated(app_tb, DCB_APP_ATTR_MAX,
++					  tb[DCB_ATTR_APP], dcbnl_app_nest,
++					  NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -515,8 +520,9 @@ static int dcbnl_setapp(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (!tb[DCB_ATTR_APP])
+ 		return -EINVAL;
+ 
+-	ret = nla_parse_nested(app_tb, DCB_APP_ATTR_MAX, tb[DCB_ATTR_APP],
+-			       dcbnl_app_nest, NULL);
++	ret = nla_parse_nested_deprecated(app_tb, DCB_APP_ATTR_MAX,
++					  tb[DCB_ATTR_APP], dcbnl_app_nest,
++					  NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -573,8 +579,9 @@ static int __dcbnl_pg_getcfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	    !netdev->dcbnl_ops->getpgbwgcfgrx)
+ 		return -EOPNOTSUPP;
+ 
+-	ret = nla_parse_nested(pg_tb, DCB_PG_ATTR_MAX, tb[DCB_ATTR_PG_CFG],
+-			       dcbnl_pg_nest, NULL);
++	ret = nla_parse_nested_deprecated(pg_tb, DCB_PG_ATTR_MAX,
++					  tb[DCB_ATTR_PG_CFG], dcbnl_pg_nest,
++					  NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -593,8 +600,9 @@ static int __dcbnl_pg_getcfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 			data = pg_tb[DCB_PG_ATTR_TC_ALL];
+ 		else
+ 			data = pg_tb[i];
+-		ret = nla_parse_nested(param_tb, DCB_TC_ATTR_PARAM_MAX, data,
+-				       dcbnl_tc_param_nest, NULL);
++		ret = nla_parse_nested_deprecated(param_tb,
++						  DCB_TC_ATTR_PARAM_MAX, data,
++						  dcbnl_tc_param_nest, NULL);
+ 		if (ret)
+ 			goto err_pg;
+ 
+@@ -730,8 +738,9 @@ static int dcbnl_setpfccfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (!netdev->dcbnl_ops->setpfccfg)
+ 		return -EOPNOTSUPP;
+ 
+-	ret = nla_parse_nested(data, DCB_PFC_UP_ATTR_MAX,
+-			       tb[DCB_ATTR_PFC_CFG], dcbnl_pfc_up_nest, NULL);
++	ret = nla_parse_nested_deprecated(data, DCB_PFC_UP_ATTR_MAX,
++					  tb[DCB_ATTR_PFC_CFG],
++					  dcbnl_pfc_up_nest, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -786,8 +795,9 @@ static int __dcbnl_pg_setcfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	    !netdev->dcbnl_ops->setpgbwgcfgrx)
+ 		return -EOPNOTSUPP;
+ 
+-	ret = nla_parse_nested(pg_tb, DCB_PG_ATTR_MAX, tb[DCB_ATTR_PG_CFG],
+-			       dcbnl_pg_nest, NULL);
++	ret = nla_parse_nested_deprecated(pg_tb, DCB_PG_ATTR_MAX,
++					  tb[DCB_ATTR_PG_CFG], dcbnl_pg_nest,
++					  NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -795,8 +805,10 @@ static int __dcbnl_pg_setcfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 		if (!pg_tb[i])
+ 			continue;
+ 
+-		ret = nla_parse_nested(param_tb, DCB_TC_ATTR_PARAM_MAX,
+-				       pg_tb[i], dcbnl_tc_param_nest, NULL);
++		ret = nla_parse_nested_deprecated(param_tb,
++						  DCB_TC_ATTR_PARAM_MAX,
++						  pg_tb[i],
++						  dcbnl_tc_param_nest, NULL);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -884,8 +896,9 @@ static int dcbnl_bcn_getcfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	    !netdev->dcbnl_ops->getbcncfg)
+ 		return -EOPNOTSUPP;
+ 
+-	ret = nla_parse_nested(bcn_tb, DCB_BCN_ATTR_MAX, tb[DCB_ATTR_BCN],
+-			       dcbnl_bcn_nest, NULL);
++	ret = nla_parse_nested_deprecated(bcn_tb, DCB_BCN_ATTR_MAX,
++					  tb[DCB_ATTR_BCN], dcbnl_bcn_nest,
++					  NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -943,8 +956,9 @@ static int dcbnl_bcn_setcfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	    !netdev->dcbnl_ops->setbcnrp)
+ 		return -EOPNOTSUPP;
+ 
+-	ret = nla_parse_nested(data, DCB_BCN_ATTR_MAX, tb[DCB_ATTR_BCN],
+-			       dcbnl_pfc_up_nest, NULL);
++	ret = nla_parse_nested_deprecated(data, DCB_BCN_ATTR_MAX,
++					  tb[DCB_ATTR_BCN], dcbnl_pfc_up_nest,
++					  NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1429,8 +1443,9 @@ static int dcbnl_ieee_set(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (!tb[DCB_ATTR_IEEE])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(ieee, DCB_ATTR_IEEE_MAX, tb[DCB_ATTR_IEEE],
+-			       dcbnl_ieee_policy, NULL);
++	err = nla_parse_nested_deprecated(ieee, DCB_ATTR_IEEE_MAX,
++					  tb[DCB_ATTR_IEEE],
++					  dcbnl_ieee_policy, NULL);
+ 	if (err)
+ 		return err;
+ 
+@@ -1529,8 +1544,9 @@ static int dcbnl_ieee_del(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (!tb[DCB_ATTR_IEEE])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(ieee, DCB_ATTR_IEEE_MAX, tb[DCB_ATTR_IEEE],
+-			       dcbnl_ieee_policy, NULL);
++	err = nla_parse_nested_deprecated(ieee, DCB_ATTR_IEEE_MAX,
++					  tb[DCB_ATTR_IEEE],
++					  dcbnl_ieee_policy, NULL);
+ 	if (err)
+ 		return err;
+ 
+@@ -1602,8 +1618,9 @@ static int dcbnl_getfeatcfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (!tb[DCB_ATTR_FEATCFG])
+ 		return -EINVAL;
+ 
+-	ret = nla_parse_nested(data, DCB_FEATCFG_ATTR_MAX,
+-			       tb[DCB_ATTR_FEATCFG], dcbnl_featcfg_nest, NULL);
++	ret = nla_parse_nested_deprecated(data, DCB_FEATCFG_ATTR_MAX,
++					  tb[DCB_ATTR_FEATCFG],
++					  dcbnl_featcfg_nest, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1646,8 +1663,9 @@ static int dcbnl_setfeatcfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (!tb[DCB_ATTR_FEATCFG])
+ 		return -EINVAL;
+ 
+-	ret = nla_parse_nested(data, DCB_FEATCFG_ATTR_MAX,
+-			       tb[DCB_ATTR_FEATCFG], dcbnl_featcfg_nest, NULL);
++	ret = nla_parse_nested_deprecated(data, DCB_FEATCFG_ATTR_MAX,
++					  tb[DCB_ATTR_FEATCFG],
++					  dcbnl_featcfg_nest, NULL);
+ 
+ 	if (ret)
+ 		goto err;
+@@ -1736,8 +1754,8 @@ static int dcb_doit(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	if ((nlh->nlmsg_type == RTM_SETDCB) && !netlink_capable(skb, CAP_NET_ADMIN))
+ 		return -EPERM;
+ 
+-	ret = nlmsg_parse(nlh, sizeof(*dcb), tb, DCB_ATTR_MAX,
+-			  dcbnl_rtnl_policy, extack);
++	ret = nlmsg_parse_deprecated(nlh, sizeof(*dcb), tb, DCB_ATTR_MAX,
++				     dcbnl_rtnl_policy, extack);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/net/decnet/dn_dev.c b/net/decnet/dn_dev.c
+index bfd43e8f2c06..bc5523115939 100644
+--- a/net/decnet/dn_dev.c
++++ b/net/decnet/dn_dev.c
+@@ -583,8 +583,8 @@ static int dn_nl_deladdr(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	if (!net_eq(net, &init_net))
+ 		goto errout;
+ 
+-	err = nlmsg_parse(nlh, sizeof(*ifm), tb, IFA_MAX, dn_ifa_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFA_MAX,
++				     dn_ifa_policy, extack);
+ 	if (err < 0)
+ 		goto errout;
+ 
+@@ -629,8 +629,8 @@ static int dn_nl_newaddr(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	if (!net_eq(net, &init_net))
+ 		return -EINVAL;
+ 
+-	err = nlmsg_parse(nlh, sizeof(*ifm), tb, IFA_MAX, dn_ifa_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFA_MAX,
++				     dn_ifa_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/decnet/dn_fib.c b/net/decnet/dn_fib.c
+index fce94cbd4378..31c0f926b297 100644
+--- a/net/decnet/dn_fib.c
++++ b/net/decnet/dn_fib.c
+@@ -517,8 +517,8 @@ static int dn_fib_rtm_delroute(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	if (!net_eq(net, &init_net))
+ 		return -EINVAL;
+ 
+-	err = nlmsg_parse(nlh, sizeof(*r), attrs, RTA_MAX, rtm_dn_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*r), attrs, RTA_MAX,
++				     rtm_dn_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -544,8 +544,8 @@ static int dn_fib_rtm_newroute(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	if (!net_eq(net, &init_net))
+ 		return -EINVAL;
+ 
+-	err = nlmsg_parse(nlh, sizeof(*r), attrs, RTA_MAX, rtm_dn_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*r), attrs, RTA_MAX,
++				     rtm_dn_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/decnet/dn_route.c b/net/decnet/dn_route.c
+index e74765024d88..3c5fa2bdbe53 100644
+--- a/net/decnet/dn_route.c
++++ b/net/decnet/dn_route.c
+@@ -1651,8 +1651,8 @@ static int dn_cache_getroute(struct sk_buff *in_skb, struct nlmsghdr *nlh,
+ 	if (!net_eq(net, &init_net))
+ 		return -EINVAL;
+ 
+-	err = nlmsg_parse(nlh, sizeof(*rtm), tb, RTA_MAX, rtm_dn_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*rtm), tb, RTA_MAX,
++				     rtm_dn_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/ieee802154/nl802154.c b/net/ieee802154/nl802154.c
+index 99f6c254ea77..7ebdb5fa2f35 100644
+--- a/net/ieee802154/nl802154.c
++++ b/net/ieee802154/nl802154.c
+@@ -247,9 +247,11 @@ nl802154_prepare_wpan_dev_dump(struct sk_buff *skb,
+ 	rtnl_lock();
+ 
+ 	if (!cb->args[0]) {
+-		err = nlmsg_parse(cb->nlh, GENL_HDRLEN + nl802154_fam.hdrsize,
+-				  genl_family_attrbuf(&nl802154_fam),
+-				  nl802154_fam.maxattr, nl802154_policy, NULL);
++		err = nlmsg_parse_deprecated(cb->nlh,
++					     GENL_HDRLEN + nl802154_fam.hdrsize,
++					     genl_family_attrbuf(&nl802154_fam),
++					     nl802154_fam.maxattr,
++					     nl802154_policy, NULL);
+ 		if (err)
+ 			goto out_unlock;
+ 
+@@ -561,8 +563,10 @@ static int nl802154_dump_wpan_phy_parse(struct sk_buff *skb,
+ 					struct nl802154_dump_wpan_phy_state *state)
+ {
+ 	struct nlattr **tb = genl_family_attrbuf(&nl802154_fam);
+-	int ret = nlmsg_parse(cb->nlh, GENL_HDRLEN + nl802154_fam.hdrsize, tb,
+-			      nl802154_fam.maxattr, nl802154_policy, NULL);
++	int ret = nlmsg_parse_deprecated(cb->nlh,
++					 GENL_HDRLEN + nl802154_fam.hdrsize,
++					 tb, nl802154_fam.maxattr,
++					 nl802154_policy, NULL);
+ 
+ 	/* TODO check if we can handle error here,
+ 	 * we have no backward compatibility
+@@ -1306,8 +1310,7 @@ ieee802154_llsec_parse_dev_addr(struct nlattr *nla,
+ {
+ 	struct nlattr *attrs[NL802154_DEV_ADDR_ATTR_MAX + 1];
+ 
+-	if (!nla || nla_parse_nested(attrs, NL802154_DEV_ADDR_ATTR_MAX, nla,
+-				     nl802154_dev_addr_policy, NULL))
++	if (!nla || nla_parse_nested_deprecated(attrs, NL802154_DEV_ADDR_ATTR_MAX, nla, nl802154_dev_addr_policy, NULL))
+ 		return -EINVAL;
+ 
+ 	if (!attrs[NL802154_DEV_ADDR_ATTR_PAN_ID] ||
+@@ -1346,8 +1349,7 @@ ieee802154_llsec_parse_key_id(struct nlattr *nla,
+ {
+ 	struct nlattr *attrs[NL802154_KEY_ID_ATTR_MAX + 1];
+ 
+-	if (!nla || nla_parse_nested(attrs, NL802154_KEY_ID_ATTR_MAX, nla,
+-				     nl802154_key_id_policy, NULL))
++	if (!nla || nla_parse_nested_deprecated(attrs, NL802154_KEY_ID_ATTR_MAX, nla, nl802154_key_id_policy, NULL))
+ 		return -EINVAL;
+ 
+ 	if (!attrs[NL802154_KEY_ID_ATTR_MODE])
+@@ -1562,9 +1564,7 @@ static int nl802154_add_llsec_key(struct sk_buff *skb, struct genl_info *info)
+ 	struct ieee802154_llsec_key_id id = { };
+ 	u32 commands[NL802154_CMD_FRAME_NR_IDS / 32] = { };
+ 
+-	if (nla_parse_nested(attrs, NL802154_KEY_ATTR_MAX,
+-			     info->attrs[NL802154_ATTR_SEC_KEY],
+-			     nl802154_key_policy, info->extack))
++	if (nla_parse_nested_deprecated(attrs, NL802154_KEY_ATTR_MAX, info->attrs[NL802154_ATTR_SEC_KEY], nl802154_key_policy, info->extack))
+ 		return -EINVAL;
+ 
+ 	if (!attrs[NL802154_KEY_ATTR_USAGE_FRAMES] ||
+@@ -1612,9 +1612,7 @@ static int nl802154_del_llsec_key(struct sk_buff *skb, struct genl_info *info)
+ 	struct nlattr *attrs[NL802154_KEY_ATTR_MAX + 1];
+ 	struct ieee802154_llsec_key_id id;
+ 
+-	if (nla_parse_nested(attrs, NL802154_KEY_ATTR_MAX,
+-			     info->attrs[NL802154_ATTR_SEC_KEY],
+-			     nl802154_key_policy, info->extack))
++	if (nla_parse_nested_deprecated(attrs, NL802154_KEY_ATTR_MAX, info->attrs[NL802154_ATTR_SEC_KEY], nl802154_key_policy, info->extack))
+ 		return -EINVAL;
+ 
+ 	if (ieee802154_llsec_parse_key_id(attrs[NL802154_KEY_ATTR_ID], &id) < 0)
+@@ -1728,8 +1726,7 @@ ieee802154_llsec_parse_device(struct nlattr *nla,
+ {
+ 	struct nlattr *attrs[NL802154_DEV_ATTR_MAX + 1];
+ 
+-	if (!nla || nla_parse_nested(attrs, NL802154_DEV_ATTR_MAX,
+-				     nla, nl802154_dev_policy, NULL))
++	if (!nla || nla_parse_nested_deprecated(attrs, NL802154_DEV_ATTR_MAX, nla, nl802154_dev_policy, NULL))
+ 		return -EINVAL;
+ 
+ 	memset(dev, 0, sizeof(*dev));
+@@ -1780,9 +1777,7 @@ static int nl802154_del_llsec_dev(struct sk_buff *skb, struct genl_info *info)
+ 	struct nlattr *attrs[NL802154_DEV_ATTR_MAX + 1];
+ 	__le64 extended_addr;
+ 
+-	if (nla_parse_nested(attrs, NL802154_DEV_ATTR_MAX,
+-			     info->attrs[NL802154_ATTR_SEC_DEVICE],
+-			     nl802154_dev_policy, info->extack))
++	if (nla_parse_nested_deprecated(attrs, NL802154_DEV_ATTR_MAX, info->attrs[NL802154_ATTR_SEC_DEVICE], nl802154_dev_policy, info->extack))
+ 		return -EINVAL;
+ 
+ 	if (!attrs[NL802154_DEV_ATTR_EXTENDED_ADDR])
+@@ -1908,9 +1903,7 @@ static int nl802154_add_llsec_devkey(struct sk_buff *skb, struct genl_info *info
+ 	__le64 extended_addr;
+ 
+ 	if (!info->attrs[NL802154_ATTR_SEC_DEVKEY] ||
+-	    nla_parse_nested(attrs, NL802154_DEVKEY_ATTR_MAX,
+-			     info->attrs[NL802154_ATTR_SEC_DEVKEY],
+-			     nl802154_devkey_policy, info->extack) < 0)
++	    nla_parse_nested_deprecated(attrs, NL802154_DEVKEY_ATTR_MAX, info->attrs[NL802154_ATTR_SEC_DEVKEY], nl802154_devkey_policy, info->extack) < 0)
+ 		return -EINVAL;
+ 
+ 	if (!attrs[NL802154_DEVKEY_ATTR_FRAME_COUNTER] ||
+@@ -1940,9 +1933,7 @@ static int nl802154_del_llsec_devkey(struct sk_buff *skb, struct genl_info *info
+ 	struct ieee802154_llsec_device_key key;
+ 	__le64 extended_addr;
+ 
+-	if (nla_parse_nested(attrs, NL802154_DEVKEY_ATTR_MAX,
+-			     info->attrs[NL802154_ATTR_SEC_DEVKEY],
+-			     nl802154_devkey_policy, info->extack))
++	if (nla_parse_nested_deprecated(attrs, NL802154_DEVKEY_ATTR_MAX, info->attrs[NL802154_ATTR_SEC_DEVKEY], nl802154_devkey_policy, info->extack))
+ 		return -EINVAL;
+ 
+ 	if (!attrs[NL802154_DEVKEY_ATTR_EXTENDED_ADDR])
+@@ -2062,8 +2053,7 @@ llsec_parse_seclevel(struct nlattr *nla, struct ieee802154_llsec_seclevel *sl)
+ {
+ 	struct nlattr *attrs[NL802154_SECLEVEL_ATTR_MAX + 1];
+ 
+-	if (!nla || nla_parse_nested(attrs, NL802154_SECLEVEL_ATTR_MAX,
+-				     nla, nl802154_seclevel_policy, NULL))
++	if (!nla || nla_parse_nested_deprecated(attrs, NL802154_SECLEVEL_ATTR_MAX, nla, nl802154_seclevel_policy, NULL))
+ 		return -EINVAL;
+ 
+ 	memset(sl, 0, sizeof(*sl));
+diff --git a/net/ipv4/devinet.c b/net/ipv4/devinet.c
+index a1741f3dafb7..e3727b8baefe 100644
+--- a/net/ipv4/devinet.c
++++ b/net/ipv4/devinet.c
+@@ -621,8 +621,8 @@ static int inet_rtm_deladdr(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 
+ 	ASSERT_RTNL();
+ 
+-	err = nlmsg_parse(nlh, sizeof(*ifm), tb, IFA_MAX, ifa_ipv4_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFA_MAX,
++				     ifa_ipv4_policy, extack);
+ 	if (err < 0)
+ 		goto errout;
+ 
+@@ -793,8 +793,8 @@ static struct in_ifaddr *rtm_to_ifaddr(struct net *net, struct nlmsghdr *nlh,
+ 	struct in_device *in_dev;
+ 	int err;
+ 
+-	err = nlmsg_parse(nlh, sizeof(*ifm), tb, IFA_MAX, ifa_ipv4_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFA_MAX,
++				     ifa_ipv4_policy, extack);
+ 	if (err < 0)
+ 		goto errout;
+ 
+@@ -1688,8 +1688,8 @@ static int inet_valid_dump_ifaddr_req(const struct nlmsghdr *nlh,
+ 		fillargs->flags |= NLM_F_DUMP_FILTERED;
+ 	}
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(*ifm), tb, IFA_MAX,
+-				 ifa_ipv4_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(*ifm), tb, IFA_MAX,
++					    ifa_ipv4_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -1905,7 +1905,8 @@ static int inet_validate_link_af(const struct net_device *dev,
+ 	if (dev && !__in_dev_get_rcu(dev))
+ 		return -EAFNOSUPPORT;
+ 
+-	err = nla_parse_nested(tb, IFLA_INET_MAX, nla, inet_af_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, IFLA_INET_MAX, nla,
++					  inet_af_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -1933,7 +1934,7 @@ static int inet_set_link_af(struct net_device *dev, const struct nlattr *nla)
+ 	if (!in_dev)
+ 		return -EAFNOSUPPORT;
+ 
+-	if (nla_parse_nested(tb, IFLA_INET_MAX, nla, NULL, NULL) < 0)
++	if (nla_parse_nested_deprecated(tb, IFLA_INET_MAX, nla, NULL, NULL) < 0)
+ 		BUG();
+ 
+ 	if (tb[IFLA_INET_CONF]) {
+@@ -2075,11 +2076,13 @@ static int inet_netconf_valid_get_req(struct sk_buff *skb,
+ 	}
+ 
+ 	if (!netlink_strict_get_check(skb))
+-		return nlmsg_parse(nlh, sizeof(struct netconfmsg), tb,
+-				   NETCONFA_MAX, devconf_ipv4_policy, extack);
++		return nlmsg_parse_deprecated(nlh, sizeof(struct netconfmsg),
++					      tb, NETCONFA_MAX,
++					      devconf_ipv4_policy, extack);
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(struct netconfmsg), tb,
+-				 NETCONFA_MAX, devconf_ipv4_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(struct netconfmsg),
++					    tb, NETCONFA_MAX,
++					    devconf_ipv4_policy, extack);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/ipv4/fib_frontend.c b/net/ipv4/fib_frontend.c
+index 01d3edcf609c..e8c106e2f4db 100644
+--- a/net/ipv4/fib_frontend.c
++++ b/net/ipv4/fib_frontend.c
+@@ -672,8 +672,8 @@ static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
+ 	int err, remaining;
+ 	struct rtmsg *rtm;
+ 
+-	err = nlmsg_validate(nlh, sizeof(*rtm), RTA_MAX, rtm_ipv4_policy,
+-			     extack);
++	err = nlmsg_validate_deprecated(nlh, sizeof(*rtm), RTA_MAX,
++					rtm_ipv4_policy, extack);
+ 	if (err < 0)
+ 		goto errout;
+ 
+@@ -840,8 +840,8 @@ int ip_valid_fib_dump_req(struct net *net, const struct nlmsghdr *nlh,
+ 	filter->rt_type  = rtm->rtm_type;
+ 	filter->table_id = rtm->rtm_table;
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(*rtm), tb, RTA_MAX,
+-				 rtm_ipv4_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(*rtm), tb, RTA_MAX,
++					    rtm_ipv4_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/ipv4/ip_tunnel_core.c b/net/ipv4/ip_tunnel_core.c
+index 67ef9d853d90..592b26a35ded 100644
+--- a/net/ipv4/ip_tunnel_core.c
++++ b/net/ipv4/ip_tunnel_core.c
+@@ -241,8 +241,8 @@ static int ip_tun_build_state(struct nlattr *attr,
+ 	struct nlattr *tb[LWTUNNEL_IP_MAX + 1];
+ 	int err;
+ 
+-	err = nla_parse_nested(tb, LWTUNNEL_IP_MAX, attr, ip_tun_policy,
+-			       extack);
++	err = nla_parse_nested_deprecated(tb, LWTUNNEL_IP_MAX, attr,
++					  ip_tun_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -340,8 +340,8 @@ static int ip6_tun_build_state(struct nlattr *attr,
+ 	struct nlattr *tb[LWTUNNEL_IP6_MAX + 1];
+ 	int err;
+ 
+-	err = nla_parse_nested(tb, LWTUNNEL_IP6_MAX, attr, ip6_tun_policy,
+-			       extack);
++	err = nla_parse_nested_deprecated(tb, LWTUNNEL_IP6_MAX, attr,
++					  ip6_tun_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/ipv4/ipmr.c b/net/ipv4/ipmr.c
+index 379c86dc93ce..f97f370032b6 100644
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -2479,8 +2479,8 @@ static int ipmr_rtm_valid_getroute_req(struct sk_buff *skb,
+ 	}
+ 
+ 	if (!netlink_strict_get_check(skb))
+-		return nlmsg_parse(nlh, sizeof(*rtm), tb, RTA_MAX,
+-				   rtm_ipv4_policy, extack);
++		return nlmsg_parse_deprecated(nlh, sizeof(*rtm), tb, RTA_MAX,
++					      rtm_ipv4_policy, extack);
+ 
+ 	rtm = nlmsg_data(nlh);
+ 	if ((rtm->rtm_src_len && rtm->rtm_src_len != 32) ||
+@@ -2491,8 +2491,8 @@ static int ipmr_rtm_valid_getroute_req(struct sk_buff *skb,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(*rtm), tb, RTA_MAX,
+-				 rtm_ipv4_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(*rtm), tb, RTA_MAX,
++					    rtm_ipv4_policy, extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -2655,8 +2655,8 @@ static int rtm_to_ipmr_mfcc(struct net *net, struct nlmsghdr *nlh,
+ 	struct rtmsg *rtm;
+ 	int ret, rem;
+ 
+-	ret = nlmsg_validate(nlh, sizeof(*rtm), RTA_MAX, rtm_ipmr_policy,
+-			     extack);
++	ret = nlmsg_validate_deprecated(nlh, sizeof(*rtm), RTA_MAX,
++					rtm_ipmr_policy, extack);
+ 	if (ret < 0)
+ 		goto out;
+ 	rtm = nlmsg_data(nlh);
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index 0d9a8db6ae59..66ba2b4abb84 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -2879,8 +2879,8 @@ static int inet_rtm_valid_getroute_req(struct sk_buff *skb,
+ 	}
+ 
+ 	if (!netlink_strict_get_check(skb))
+-		return nlmsg_parse(nlh, sizeof(*rtm), tb, RTA_MAX,
+-				   rtm_ipv4_policy, extack);
++		return nlmsg_parse_deprecated(nlh, sizeof(*rtm), tb, RTA_MAX,
++					      rtm_ipv4_policy, extack);
+ 
+ 	rtm = nlmsg_data(nlh);
+ 	if ((rtm->rtm_src_len && rtm->rtm_src_len != 32) ||
+@@ -2898,8 +2898,8 @@ static int inet_rtm_valid_getroute_req(struct sk_buff *skb,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(*rtm), tb, RTA_MAX,
+-				 rtm_ipv4_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(*rtm), tb, RTA_MAX,
++					    rtm_ipv4_policy, extack);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
+index 34029f363b7a..f8146b73e416 100644
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -610,11 +610,13 @@ static int inet6_netconf_valid_get_req(struct sk_buff *skb,
+ 	}
+ 
+ 	if (!netlink_strict_get_check(skb))
+-		return nlmsg_parse(nlh, sizeof(struct netconfmsg), tb,
+-				   NETCONFA_MAX, devconf_ipv6_policy, extack);
++		return nlmsg_parse_deprecated(nlh, sizeof(struct netconfmsg),
++					      tb, NETCONFA_MAX,
++					      devconf_ipv6_policy, extack);
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(struct netconfmsg), tb,
+-				 NETCONFA_MAX, devconf_ipv6_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(struct netconfmsg),
++					    tb, NETCONFA_MAX,
++					    devconf_ipv6_policy, extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -4563,8 +4565,8 @@ inet6_rtm_deladdr(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	u32 ifa_flags;
+ 	int err;
+ 
+-	err = nlmsg_parse(nlh, sizeof(*ifm), tb, IFA_MAX, ifa_ipv6_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFA_MAX,
++				     ifa_ipv6_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -4729,8 +4731,8 @@ inet6_rtm_newaddr(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	struct ifa6_config cfg;
+ 	int err;
+ 
+-	err = nlmsg_parse(nlh, sizeof(*ifm), tb, IFA_MAX, ifa_ipv6_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFA_MAX,
++				     ifa_ipv6_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -5086,8 +5088,8 @@ static int inet6_valid_dump_ifaddr_req(const struct nlmsghdr *nlh,
+ 		fillargs->flags |= NLM_F_DUMP_FILTERED;
+ 	}
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(*ifm), tb, IFA_MAX,
+-				 ifa_ipv6_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(*ifm), tb, IFA_MAX,
++					    ifa_ipv6_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -5237,11 +5239,11 @@ static int inet6_rtm_valid_getaddr_req(struct sk_buff *skb,
+ 	}
+ 
+ 	if (!netlink_strict_get_check(skb))
+-		return nlmsg_parse(nlh, sizeof(*ifm), tb, IFA_MAX,
+-				   ifa_ipv6_policy, extack);
++		return nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFA_MAX,
++					      ifa_ipv6_policy, extack);
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(*ifm), tb, IFA_MAX,
+-				 ifa_ipv6_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(*ifm), tb, IFA_MAX,
++					    ifa_ipv6_policy, extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -5667,8 +5669,8 @@ static int inet6_validate_link_af(const struct net_device *dev,
+ 	if (dev && !__in6_dev_get(dev))
+ 		return -EAFNOSUPPORT;
+ 
+-	return nla_parse_nested(tb, IFLA_INET6_MAX, nla, inet6_af_policy,
+-				NULL);
++	return nla_parse_nested_deprecated(tb, IFLA_INET6_MAX, nla,
++					   inet6_af_policy, NULL);
+ }
+ 
+ static int check_addr_gen_mode(int mode)
+@@ -5700,7 +5702,7 @@ static int inet6_set_link_af(struct net_device *dev, const struct nlattr *nla)
+ 	if (!idev)
+ 		return -EAFNOSUPPORT;
+ 
+-	if (nla_parse_nested(tb, IFLA_INET6_MAX, nla, NULL, NULL) < 0)
++	if (nla_parse_nested_deprecated(tb, IFLA_INET6_MAX, nla, NULL, NULL) < 0)
+ 		BUG();
+ 
+ 	if (tb[IFLA_INET6_TOKEN]) {
+diff --git a/net/ipv6/addrlabel.c b/net/ipv6/addrlabel.c
+index d43d076c98f5..ae81f4183489 100644
+--- a/net/ipv6/addrlabel.c
++++ b/net/ipv6/addrlabel.c
+@@ -383,8 +383,8 @@ static int ip6addrlbl_newdel(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	u32 label;
+ 	int err = 0;
+ 
+-	err = nlmsg_parse(nlh, sizeof(*ifal), tb, IFAL_MAX, ifal_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*ifal), tb, IFAL_MAX,
++				     ifal_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -537,8 +537,8 @@ static int ip6addrlbl_valid_get_req(struct sk_buff *skb,
+ 	}
+ 
+ 	if (!netlink_strict_get_check(skb))
+-		return nlmsg_parse(nlh, sizeof(*ifal), tb, IFAL_MAX,
+-				   ifal_policy, extack);
++		return nlmsg_parse_deprecated(nlh, sizeof(*ifal), tb,
++					      IFAL_MAX, ifal_policy, extack);
+ 
+ 	ifal = nlmsg_data(nlh);
+ 	if (ifal->__ifal_reserved || ifal->ifal_flags || ifal->ifal_seq) {
+@@ -546,8 +546,8 @@ static int ip6addrlbl_valid_get_req(struct sk_buff *skb,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(*ifal), tb, IFAL_MAX,
+-				 ifal_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(*ifal), tb, IFAL_MAX,
++					    ifal_policy, extack);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/ipv6/ila/ila_lwt.c b/net/ipv6/ila/ila_lwt.c
+index 3d56a2fb6f86..422dcc691f71 100644
+--- a/net/ipv6/ila/ila_lwt.c
++++ b/net/ipv6/ila/ila_lwt.c
+@@ -146,7 +146,8 @@ static int ila_build_state(struct nlattr *nla,
+ 	if (family != AF_INET6)
+ 		return -EINVAL;
+ 
+-	ret = nla_parse_nested(tb, ILA_ATTR_MAX, nla, ila_nl_policy, extack);
++	ret = nla_parse_nested_deprecated(tb, ILA_ATTR_MAX, nla,
++					  ila_nl_policy, extack);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 4ed0a11ad1a8..2c0d38bf783b 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -4200,8 +4200,8 @@ static int rtm_to_fib6_config(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	unsigned int pref;
+ 	int err;
+ 
+-	err = nlmsg_parse(nlh, sizeof(*rtm), tb, RTA_MAX, rtm_ipv6_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*rtm), tb, RTA_MAX,
++				     rtm_ipv6_policy, extack);
+ 	if (err < 0)
+ 		goto errout;
+ 
+@@ -4993,8 +4993,8 @@ static int inet6_rtm_valid_getroute_req(struct sk_buff *skb,
+ 	}
+ 
+ 	if (!netlink_strict_get_check(skb))
+-		return nlmsg_parse(nlh, sizeof(*rtm), tb, RTA_MAX,
+-				   rtm_ipv6_policy, extack);
++		return nlmsg_parse_deprecated(nlh, sizeof(*rtm), tb, RTA_MAX,
++					      rtm_ipv6_policy, extack);
+ 
+ 	rtm = nlmsg_data(nlh);
+ 	if ((rtm->rtm_src_len && rtm->rtm_src_len != 128) ||
+@@ -5010,8 +5010,8 @@ static int inet6_rtm_valid_getroute_req(struct sk_buff *skb,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(*rtm), tb, RTA_MAX,
+-				 rtm_ipv6_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(*rtm), tb, RTA_MAX,
++					    rtm_ipv6_policy, extack);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/ipv6/seg6_iptunnel.c b/net/ipv6/seg6_iptunnel.c
+index 8181ee7e1e27..42a033c603ac 100644
+--- a/net/ipv6/seg6_iptunnel.c
++++ b/net/ipv6/seg6_iptunnel.c
+@@ -394,8 +394,8 @@ static int seg6_build_state(struct nlattr *nla,
+ 	if (family != AF_INET && family != AF_INET6)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, SEG6_IPTUNNEL_MAX, nla,
+-			       seg6_iptunnel_policy, extack);
++	err = nla_parse_nested_deprecated(tb, SEG6_IPTUNNEL_MAX, nla,
++					  seg6_iptunnel_policy, extack);
+ 
+ 	if (err < 0)
+ 		return err;
+diff --git a/net/ipv6/seg6_local.c b/net/ipv6/seg6_local.c
+index 9ff512baf0a6..0f80e7c595a3 100644
+--- a/net/ipv6/seg6_local.c
++++ b/net/ipv6/seg6_local.c
+@@ -825,8 +825,9 @@ static int parse_nla_bpf(struct nlattr **attrs, struct seg6_local_lwt *slwt)
+ 	int ret;
+ 	u32 fd;
+ 
+-	ret = nla_parse_nested(tb, SEG6_LOCAL_BPF_PROG_MAX,
+-			       attrs[SEG6_LOCAL_BPF], bpf_prog_policy, NULL);
++	ret = nla_parse_nested_deprecated(tb, SEG6_LOCAL_BPF_PROG_MAX,
++					  attrs[SEG6_LOCAL_BPF],
++					  bpf_prog_policy, NULL);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -961,8 +962,8 @@ static int seg6_local_build_state(struct nlattr *nla, unsigned int family,
+ 	if (family != AF_INET6)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, SEG6_LOCAL_MAX, nla, seg6_local_policy,
+-			       extack);
++	err = nla_parse_nested_deprecated(tb, SEG6_LOCAL_MAX, nla,
++					  seg6_local_policy, extack);
+ 
+ 	if (err < 0)
+ 		return err;
+diff --git a/net/mpls/af_mpls.c b/net/mpls/af_mpls.c
+index daca8ffff9f0..31b226eab4d4 100644
+--- a/net/mpls/af_mpls.c
++++ b/net/mpls/af_mpls.c
+@@ -1223,11 +1223,13 @@ static int mpls_netconf_valid_get_req(struct sk_buff *skb,
+ 	}
+ 
+ 	if (!netlink_strict_get_check(skb))
+-		return nlmsg_parse(nlh, sizeof(struct netconfmsg), tb,
+-				   NETCONFA_MAX, devconf_mpls_policy, extack);
++		return nlmsg_parse_deprecated(nlh, sizeof(struct netconfmsg),
++					      tb, NETCONFA_MAX,
++					      devconf_mpls_policy, extack);
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(struct netconfmsg), tb,
+-				 NETCONFA_MAX, devconf_mpls_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(struct netconfmsg),
++					    tb, NETCONFA_MAX,
++					    devconf_mpls_policy, extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -1784,8 +1786,8 @@ static int rtm_to_route_config(struct sk_buff *skb,
+ 	int index;
+ 	int err;
+ 
+-	err = nlmsg_parse(nlh, sizeof(*rtm), tb, RTA_MAX, rtm_mpls_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*rtm), tb, RTA_MAX,
++				     rtm_mpls_policy, extack);
+ 	if (err < 0)
+ 		goto errout;
+ 
+@@ -2102,8 +2104,8 @@ static int mpls_valid_fib_dump_req(struct net *net, const struct nlmsghdr *nlh,
+ 		cb->answer_flags = NLM_F_DUMP_FILTERED;
+ 	}
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(*rtm), tb, RTA_MAX,
+-				 rtm_mpls_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(*rtm), tb, RTA_MAX,
++					    rtm_mpls_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -2286,8 +2288,8 @@ static int mpls_valid_getroute_req(struct sk_buff *skb,
+ 	}
+ 
+ 	if (!netlink_strict_get_check(skb))
+-		return nlmsg_parse(nlh, sizeof(*rtm), tb, RTA_MAX,
+-				   rtm_mpls_policy, extack);
++		return nlmsg_parse_deprecated(nlh, sizeof(*rtm), tb, RTA_MAX,
++					      rtm_mpls_policy, extack);
+ 
+ 	rtm = nlmsg_data(nlh);
+ 	if ((rtm->rtm_dst_len && rtm->rtm_dst_len != 20) ||
+@@ -2302,8 +2304,8 @@ static int mpls_valid_getroute_req(struct sk_buff *skb,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = nlmsg_parse_strict(nlh, sizeof(*rtm), tb, RTA_MAX,
+-				 rtm_mpls_policy, extack);
++	err = nlmsg_parse_deprecated_strict(nlh, sizeof(*rtm), tb, RTA_MAX,
++					    rtm_mpls_policy, extack);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/mpls/mpls_iptunnel.c b/net/mpls/mpls_iptunnel.c
+index 816a9cacf5d2..836a2fa0c2dc 100644
+--- a/net/mpls/mpls_iptunnel.c
++++ b/net/mpls/mpls_iptunnel.c
+@@ -174,8 +174,8 @@ static int mpls_build_state(struct nlattr *nla,
+ 	u8 n_labels;
+ 	int ret;
+ 
+-	ret = nla_parse_nested(tb, MPLS_IPTUNNEL_MAX, nla,
+-			       mpls_iptunnel_policy, extack);
++	ret = nla_parse_nested_deprecated(tb, MPLS_IPTUNNEL_MAX, nla,
++					  mpls_iptunnel_policy, extack);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/net/ncsi/ncsi-netlink.c b/net/ncsi/ncsi-netlink.c
+index 82e6edf9c5d9..2f1550d6755e 100644
+--- a/net/ncsi/ncsi-netlink.c
++++ b/net/ncsi/ncsi-netlink.c
+@@ -216,8 +216,8 @@ static int ncsi_pkg_info_all_nl(struct sk_buff *skb,
+ 	void *hdr;
+ 	int rc;
+ 
+-	rc = genlmsg_parse(cb->nlh, &ncsi_genl_family, attrs, NCSI_ATTR_MAX,
+-			   ncsi_genl_policy, NULL);
++	rc = genlmsg_parse_deprecated(cb->nlh, &ncsi_genl_family, attrs, NCSI_ATTR_MAX,
++				      ncsi_genl_policy, NULL);
+ 	if (rc)
+ 		return rc;
+ 
+* Unmerged path net/netfilter/ipset/ip_set_core.c
+diff --git a/net/netfilter/ipvs/ip_vs_ctl.c b/net/netfilter/ipvs/ip_vs_ctl.c
+index cba808405e0a..13bdee5cf9e4 100644
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@ -3084,8 +3084,7 @@ static int ip_vs_genl_parse_service(struct netns_ipvs *ipvs,
+ 
+ 	/* Parse mandatory identifying service fields first */
+ 	if (nla == NULL ||
+-	    nla_parse_nested(attrs, IPVS_SVC_ATTR_MAX, nla,
+-			     ip_vs_svc_policy, NULL))
++	    nla_parse_nested_deprecated(attrs, IPVS_SVC_ATTR_MAX, nla, ip_vs_svc_policy, NULL))
+ 		return -EINVAL;
+ 
+ 	nla_af		= attrs[IPVS_SVC_ATTR_AF];
+@@ -3243,8 +3242,7 @@ static int ip_vs_genl_dump_dests(struct sk_buff *skb,
+ 	mutex_lock(&__ip_vs_mutex);
+ 
+ 	/* Try to find the service for which to dump destinations */
+-	if (nlmsg_parse(cb->nlh, GENL_HDRLEN, attrs, IPVS_CMD_ATTR_MAX,
+-			ip_vs_cmd_policy, cb->extack))
++	if (nlmsg_parse_deprecated(cb->nlh, GENL_HDRLEN, attrs, IPVS_CMD_ATTR_MAX, ip_vs_cmd_policy, cb->extack))
+ 		goto out_err;
+ 
+ 
+@@ -3280,8 +3278,7 @@ static int ip_vs_genl_parse_dest(struct ip_vs_dest_user_kern *udest,
+ 
+ 	/* Parse mandatory identifying destination fields first */
+ 	if (nla == NULL ||
+-	    nla_parse_nested(attrs, IPVS_DEST_ATTR_MAX, nla,
+-			     ip_vs_dest_policy, NULL))
++	    nla_parse_nested_deprecated(attrs, IPVS_DEST_ATTR_MAX, nla, ip_vs_dest_policy, NULL))
+ 		return -EINVAL;
+ 
+ 	nla_addr	= attrs[IPVS_DEST_ATTR_ADDR];
+@@ -3517,9 +3514,7 @@ static int ip_vs_genl_set_daemon(struct sk_buff *skb, struct genl_info *info)
+ 		struct nlattr *daemon_attrs[IPVS_DAEMON_ATTR_MAX + 1];
+ 
+ 		if (!info->attrs[IPVS_CMD_ATTR_DAEMON] ||
+-		    nla_parse_nested(daemon_attrs, IPVS_DAEMON_ATTR_MAX,
+-				     info->attrs[IPVS_CMD_ATTR_DAEMON],
+-				     ip_vs_daemon_policy, info->extack))
++		    nla_parse_nested_deprecated(daemon_attrs, IPVS_DAEMON_ATTR_MAX, info->attrs[IPVS_CMD_ATTR_DAEMON], ip_vs_daemon_policy, info->extack))
+ 			goto out;
+ 
+ 		if (cmd == IPVS_CMD_NEW_DAEMON)
+* Unmerged path net/netfilter/nf_conntrack_netlink.c
+diff --git a/net/netfilter/nf_conntrack_proto_dccp.c b/net/netfilter/nf_conntrack_proto_dccp.c
+index 9ce6336d1e55..ceb4915370b9 100644
+--- a/net/netfilter/nf_conntrack_proto_dccp.c
++++ b/net/netfilter/nf_conntrack_proto_dccp.c
+@@ -669,8 +669,8 @@ static int nlattr_to_dccp(struct nlattr *cda[], struct nf_conn *ct)
+ 	if (!attr)
+ 		return 0;
+ 
+-	err = nla_parse_nested(tb, CTA_PROTOINFO_DCCP_MAX, attr,
+-			       dccp_nla_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, CTA_PROTOINFO_DCCP_MAX, attr,
++					  dccp_nla_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/netfilter/nf_conntrack_proto_sctp.c b/net/netfilter/nf_conntrack_proto_sctp.c
+index fb9a35d16069..a05ec66e3d24 100644
+--- a/net/netfilter/nf_conntrack_proto_sctp.c
++++ b/net/netfilter/nf_conntrack_proto_sctp.c
+@@ -593,8 +593,8 @@ static int nlattr_to_sctp(struct nlattr *cda[], struct nf_conn *ct)
+ 	if (!attr)
+ 		return 0;
+ 
+-	err = nla_parse_nested(tb, CTA_PROTOINFO_SCTP_MAX, attr,
+-			       sctp_nla_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, CTA_PROTOINFO_SCTP_MAX, attr,
++					  sctp_nla_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/netfilter/nf_conntrack_proto_tcp.c b/net/netfilter/nf_conntrack_proto_tcp.c
+index 970b7ad8174e..3013076b57d2 100644
+--- a/net/netfilter/nf_conntrack_proto_tcp.c
++++ b/net/netfilter/nf_conntrack_proto_tcp.c
+@@ -1255,8 +1255,8 @@ static int nlattr_to_tcp(struct nlattr *cda[], struct nf_conn *ct)
+ 	if (!pattr)
+ 		return 0;
+ 
+-	err = nla_parse_nested(tb, CTA_PROTOINFO_TCP_MAX, pattr,
+-			       tcp_nla_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, CTA_PROTOINFO_TCP_MAX, pattr,
++					  tcp_nla_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/netfilter/nf_nat_core.c b/net/netfilter/nf_nat_core.c
+index 60cb27f6897e..5e173f6800a4 100644
+--- a/net/netfilter/nf_nat_core.c
++++ b/net/netfilter/nf_nat_core.c
+@@ -818,8 +818,8 @@ static int nfnetlink_parse_nat_proto(struct nlattr *attr,
+ 	const struct nf_nat_l4proto *l4proto;
+ 	int err;
+ 
+-	err = nla_parse_nested(tb, CTA_PROTONAT_MAX, attr,
+-			       protonat_nla_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, CTA_PROTONAT_MAX, attr,
++					  protonat_nla_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -848,7 +848,8 @@ nfnetlink_parse_nat(const struct nlattr *nat,
+ 
+ 	memset(range, 0, sizeof(*range));
+ 
+-	err = nla_parse_nested(tb, CTA_NAT_MAX, nat, nat_nla_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, CTA_NAT_MAX, nat,
++					  nat_nla_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+* Unmerged path net/netfilter/nf_tables_api.c
+diff --git a/net/netfilter/nfnetlink.c b/net/netfilter/nfnetlink.c
+index 2871327a4c6b..94360bd35148 100644
+--- a/net/netfilter/nfnetlink.c
++++ b/net/netfilter/nfnetlink.c
+@@ -206,8 +206,9 @@ static int nfnetlink_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 			return -ENOMEM;
+ 		}
+ 
+-		err = nla_parse(cda, ss->cb[cb_id].attr_count, attr, attrlen,
+-				ss->cb[cb_id].policy, extack);
++		err = nla_parse_deprecated(cda, ss->cb[cb_id].attr_count,
++					   attr, attrlen,
++					   ss->cb[cb_id].policy, extack);
+ 		if (err < 0) {
+ 			rcu_read_unlock();
+ 			return err;
+@@ -412,8 +413,10 @@ static void nfnetlink_rcv_batch(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 				goto ack;
+ 			}
+ 
+-			err = nla_parse(cda, ss->cb[cb_id].attr_count, attr,
+-					attrlen, ss->cb[cb_id].policy, NULL);
++			err = nla_parse_deprecated(cda,
++						   ss->cb[cb_id].attr_count,
++						   attr, attrlen,
++						   ss->cb[cb_id].policy, NULL);
+ 			if (err < 0)
+ 				goto ack;
+ 
+@@ -515,8 +518,8 @@ static void nfnetlink_rcv_skb_batch(struct sk_buff *skb, struct nlmsghdr *nlh)
+ 	if (skb->len < NLMSG_HDRLEN + sizeof(struct nfgenmsg))
+ 		return;
+ 
+-	err = nla_parse(cda, NFNL_BATCH_MAX, attr, attrlen, nfnl_batch_policy,
+-			NULL);
++	err = nla_parse_deprecated(cda, NFNL_BATCH_MAX, attr, attrlen,
++				   nfnl_batch_policy, NULL);
+ 	if (err < 0) {
+ 		netlink_ack(skb, nlh, err, NULL);
+ 		return;
+diff --git a/net/netfilter/nfnetlink_acct.c b/net/netfilter/nfnetlink_acct.c
+index 8fa8bf7c48e6..02c877432d71 100644
+--- a/net/netfilter/nfnetlink_acct.c
++++ b/net/netfilter/nfnetlink_acct.c
+@@ -248,8 +248,8 @@ static int nfnl_acct_start(struct netlink_callback *cb)
+ 	if (!attr)
+ 		return 0;
+ 
+-	err = nla_parse_nested(tb, NFACCT_FILTER_MAX, attr, filter_policy,
+-			       NULL);
++	err = nla_parse_nested_deprecated(tb, NFACCT_FILTER_MAX, attr,
++					  filter_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/netfilter/nfnetlink_cthelper.c b/net/netfilter/nfnetlink_cthelper.c
+index e5d27b2e4eba..01a51df83975 100644
+--- a/net/netfilter/nfnetlink_cthelper.c
++++ b/net/netfilter/nfnetlink_cthelper.c
+@@ -78,8 +78,8 @@ nfnl_cthelper_parse_tuple(struct nf_conntrack_tuple *tuple,
+ 	int err;
+ 	struct nlattr *tb[NFCTH_TUPLE_MAX+1];
+ 
+-	err = nla_parse_nested(tb, NFCTH_TUPLE_MAX, attr,
+-			       nfnl_cthelper_tuple_pol, NULL);
++	err = nla_parse_nested_deprecated(tb, NFCTH_TUPLE_MAX, attr,
++					  nfnl_cthelper_tuple_pol, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -139,8 +139,8 @@ nfnl_cthelper_expect_policy(struct nf_conntrack_expect_policy *expect_policy,
+ 	int err;
+ 	struct nlattr *tb[NFCTH_POLICY_MAX+1];
+ 
+-	err = nla_parse_nested(tb, NFCTH_POLICY_MAX, attr,
+-			       nfnl_cthelper_expect_pol, NULL);
++	err = nla_parse_nested_deprecated(tb, NFCTH_POLICY_MAX, attr,
++					  nfnl_cthelper_expect_pol, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -176,8 +176,9 @@ nfnl_cthelper_parse_expect_policy(struct nf_conntrack_helper *helper,
+ 	struct nlattr *tb[NFCTH_POLICY_SET_MAX+1];
+ 	unsigned int class_max;
+ 
+-	ret = nla_parse_nested(tb, NFCTH_POLICY_SET_MAX, attr,
+-			       nfnl_cthelper_expect_policy_set, NULL);
++	ret = nla_parse_nested_deprecated(tb, NFCTH_POLICY_SET_MAX, attr,
++					  nfnl_cthelper_expect_policy_set,
++					  NULL);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -289,8 +290,8 @@ nfnl_cthelper_update_policy_one(const struct nf_conntrack_expect_policy *policy,
+ 	struct nlattr *tb[NFCTH_POLICY_MAX + 1];
+ 	int err;
+ 
+-	err = nla_parse_nested(tb, NFCTH_POLICY_MAX, attr,
+-			       nfnl_cthelper_expect_pol, NULL);
++	err = nla_parse_nested_deprecated(tb, NFCTH_POLICY_MAX, attr,
++					  nfnl_cthelper_expect_pol, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -361,8 +362,9 @@ static int nfnl_cthelper_update_policy(struct nf_conntrack_helper *helper,
+ 	unsigned int class_max;
+ 	int err;
+ 
+-	err = nla_parse_nested(tb, NFCTH_POLICY_SET_MAX, attr,
+-			       nfnl_cthelper_expect_policy_set, NULL);
++	err = nla_parse_nested_deprecated(tb, NFCTH_POLICY_SET_MAX, attr,
++					  nfnl_cthelper_expect_policy_set,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/netfilter/nfnetlink_cttimeout.c b/net/netfilter/nfnetlink_cttimeout.c
+index 9ee5fa551fa6..88b22f8561a0 100644
+--- a/net/netfilter/nfnetlink_cttimeout.c
++++ b/net/netfilter/nfnetlink_cttimeout.c
+@@ -63,8 +63,11 @@ ctnl_timeout_parse_policy(void *timeouts,
+ 	if (!tb)
+ 		return -ENOMEM;
+ 
+-	ret = nla_parse_nested(tb, l4proto->ctnl_timeout.nlattr_max, attr,
+-			       l4proto->ctnl_timeout.nla_policy, NULL);
++	ret = nla_parse_nested_deprecated(tb,
++					  l4proto->ctnl_timeout.nlattr_max,
++					  attr,
++					  l4proto->ctnl_timeout.nla_policy,
++					  NULL);
+ 	if (ret < 0)
+ 		goto err;
+ 
+diff --git a/net/netfilter/nfnetlink_queue.c b/net/netfilter/nfnetlink_queue.c
+index 974fa430836d..746b1cad294d 100644
+--- a/net/netfilter/nfnetlink_queue.c
++++ b/net/netfilter/nfnetlink_queue.c
+@@ -1139,8 +1139,9 @@ static int nfqa_parse_bridge(struct nf_queue_entry *entry,
+ 		struct nlattr *tb[NFQA_VLAN_MAX + 1];
+ 		int err;
+ 
+-		err = nla_parse_nested(tb, NFQA_VLAN_MAX, nfqa[NFQA_VLAN],
+-				       nfqa_vlan_policy, NULL);
++		err = nla_parse_nested_deprecated(tb, NFQA_VLAN_MAX,
++						  nfqa[NFQA_VLAN],
++						  nfqa_vlan_policy, NULL);
+ 		if (err < 0)
+ 			return err;
+ 
+diff --git a/net/netfilter/nft_compat.c b/net/netfilter/nft_compat.c
+index c90a4640723f..eb2d413e745d 100644
+--- a/net/netfilter/nft_compat.c
++++ b/net/netfilter/nft_compat.c
+@@ -222,8 +222,8 @@ static int nft_parse_compat(const struct nlattr *attr, u16 *proto, bool *inv)
+ 	u32 flags;
+ 	int err;
+ 
+-	err = nla_parse_nested(tb, NFTA_RULE_COMPAT_MAX, attr,
+-			       nft_rule_compat_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, NFTA_RULE_COMPAT_MAX, attr,
++					  nft_rule_compat_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+* Unmerged path net/netfilter/nft_ct.c
+* Unmerged path net/netfilter/nft_tunnel.c
+diff --git a/net/netlabel/netlabel_cipso_v4.c b/net/netlabel/netlabel_cipso_v4.c
+index 9aacf2da3d98..ccd4143e7778 100644
+--- a/net/netlabel/netlabel_cipso_v4.c
++++ b/net/netlabel/netlabel_cipso_v4.c
+@@ -99,9 +99,10 @@ static int netlbl_cipsov4_add_common(struct genl_info *info,
+ 
+ 	doi_def->doi = nla_get_u32(info->attrs[NLBL_CIPSOV4_A_DOI]);
+ 
+-	if (nla_validate_nested(info->attrs[NLBL_CIPSOV4_A_TAGLST],
+-				NLBL_CIPSOV4_A_MAX,
+-				netlbl_cipsov4_genl_policy, NULL) != 0)
++	if (nla_validate_nested_deprecated(info->attrs[NLBL_CIPSOV4_A_TAGLST],
++					   NLBL_CIPSOV4_A_MAX,
++					   netlbl_cipsov4_genl_policy,
++					   NULL) != 0)
+ 		return -EINVAL;
+ 
+ 	nla_for_each_nested(nla, info->attrs[NLBL_CIPSOV4_A_TAGLST], nla_rem)
+@@ -146,9 +147,10 @@ static int netlbl_cipsov4_add_std(struct genl_info *info,
+ 	    !info->attrs[NLBL_CIPSOV4_A_MLSLVLLST])
+ 		return -EINVAL;
+ 
+-	if (nla_validate_nested(info->attrs[NLBL_CIPSOV4_A_MLSLVLLST],
+-				NLBL_CIPSOV4_A_MAX,
+-				netlbl_cipsov4_genl_policy, NULL) != 0)
++	if (nla_validate_nested_deprecated(info->attrs[NLBL_CIPSOV4_A_MLSLVLLST],
++					   NLBL_CIPSOV4_A_MAX,
++					   netlbl_cipsov4_genl_policy,
++					   NULL) != 0)
+ 		return -EINVAL;
+ 
+ 	doi_def = kmalloc(sizeof(*doi_def), GFP_KERNEL);
+@@ -170,9 +172,10 @@ static int netlbl_cipsov4_add_std(struct genl_info *info,
+ 			    info->attrs[NLBL_CIPSOV4_A_MLSLVLLST],
+ 			    nla_a_rem)
+ 		if (nla_type(nla_a) == NLBL_CIPSOV4_A_MLSLVL) {
+-			if (nla_validate_nested(nla_a, NLBL_CIPSOV4_A_MAX,
+-						netlbl_cipsov4_genl_policy,
+-						NULL) != 0)
++			if (nla_validate_nested_deprecated(nla_a,
++							   NLBL_CIPSOV4_A_MAX,
++							   netlbl_cipsov4_genl_policy,
++							   NULL) != 0)
+ 				goto add_std_failure;
+ 			nla_for_each_nested(nla_b, nla_a, nla_b_rem)
+ 				switch (nla_type(nla_b)) {
+@@ -234,19 +237,20 @@ static int netlbl_cipsov4_add_std(struct genl_info *info,
+ 		}
+ 
+ 	if (info->attrs[NLBL_CIPSOV4_A_MLSCATLST]) {
+-		if (nla_validate_nested(info->attrs[NLBL_CIPSOV4_A_MLSCATLST],
+-					NLBL_CIPSOV4_A_MAX,
+-					netlbl_cipsov4_genl_policy, NULL) != 0)
++		if (nla_validate_nested_deprecated(info->attrs[NLBL_CIPSOV4_A_MLSCATLST],
++						   NLBL_CIPSOV4_A_MAX,
++						   netlbl_cipsov4_genl_policy,
++						   NULL) != 0)
+ 			goto add_std_failure;
+ 
+ 		nla_for_each_nested(nla_a,
+ 				    info->attrs[NLBL_CIPSOV4_A_MLSCATLST],
+ 				    nla_a_rem)
+ 			if (nla_type(nla_a) == NLBL_CIPSOV4_A_MLSCAT) {
+-				if (nla_validate_nested(nla_a,
+-							NLBL_CIPSOV4_A_MAX,
+-							netlbl_cipsov4_genl_policy,
+-							NULL) != 0)
++				if (nla_validate_nested_deprecated(nla_a,
++								   NLBL_CIPSOV4_A_MAX,
++								   netlbl_cipsov4_genl_policy,
++								   NULL) != 0)
+ 					goto add_std_failure;
+ 				nla_for_each_nested(nla_b, nla_a, nla_b_rem)
+ 					switch (nla_type(nla_b)) {
+* Unmerged path net/netlink/genetlink.c
+diff --git a/net/nfc/netlink.c b/net/nfc/netlink.c
+index 376181cc1def..7d12a222e4ce 100644
+--- a/net/nfc/netlink.c
++++ b/net/nfc/netlink.c
+@@ -119,9 +119,10 @@ static struct nfc_dev *__get_device_from_cb(struct netlink_callback *cb)
+ 	int rc;
+ 	u32 idx;
+ 
+-	rc = nlmsg_parse(cb->nlh, GENL_HDRLEN + nfc_genl_family.hdrsize,
+-			 attrbuf, nfc_genl_family.maxattr, nfc_genl_policy,
+-			 NULL);
++	rc = nlmsg_parse_deprecated(cb->nlh,
++				    GENL_HDRLEN + nfc_genl_family.hdrsize,
++				    attrbuf, nfc_genl_family.maxattr,
++				    nfc_genl_policy, NULL);
+ 	if (rc < 0)
+ 		return ERR_PTR(rc);
+ 
+@@ -1177,8 +1178,9 @@ static int nfc_genl_llc_sdreq(struct sk_buff *skb, struct genl_info *info)
+ 	tlvs_len = 0;
+ 
+ 	nla_for_each_nested(attr, info->attrs[NFC_ATTR_LLC_SDP], rem) {
+-		rc = nla_parse_nested(sdp_attrs, NFC_SDP_ATTR_MAX, attr,
+-				      nfc_sdp_genl_policy, info->extack);
++		rc = nla_parse_nested_deprecated(sdp_attrs, NFC_SDP_ATTR_MAX,
++						 attr, nfc_sdp_genl_policy,
++						 info->extack);
+ 
+ 		if (rc != 0) {
+ 			rc = -EINVAL;
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index 40d80caa4367..3b5dd2bb1240 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -1377,8 +1377,8 @@ static int ovs_flow_cmd_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ 	u32 ufid_flags;
+ 	int err;
+ 
+-	err = genlmsg_parse(cb->nlh, &dp_flow_genl_family, a,
+-			    OVS_FLOW_ATTR_MAX, flow_policy, NULL);
++	err = genlmsg_parse_deprecated(cb->nlh, &dp_flow_genl_family, a,
++				       OVS_FLOW_ATTR_MAX, flow_policy, NULL);
+ 	if (err)
+ 		return err;
+ 	ufid_flags = ovs_nla_get_ufid_flags(a[OVS_FLOW_ATTR_UFID_FLAGS]);
+* Unmerged path net/openvswitch/flow_netlink.c
+diff --git a/net/openvswitch/meter.c b/net/openvswitch/meter.c
+index 43849d752a1e..063b328e2a3b 100644
+--- a/net/openvswitch/meter.c
++++ b/net/openvswitch/meter.c
+@@ -227,9 +227,9 @@ static struct dp_meter *dp_meter_create(struct nlattr **a)
+ 		struct nlattr *attr[OVS_BAND_ATTR_MAX + 1];
+ 		u32 band_max_delta_t;
+ 
+-		err = nla_parse((struct nlattr **)&attr, OVS_BAND_ATTR_MAX,
+-				nla_data(nla), nla_len(nla), band_policy,
+-				NULL);
++		err = nla_parse_deprecated((struct nlattr **)&attr,
++					   OVS_BAND_ATTR_MAX, nla_data(nla),
++					   nla_len(nla), band_policy, NULL);
+ 		if (err)
+ 			goto exit_free_meter;
+ 
+diff --git a/net/openvswitch/vport-vxlan.c b/net/openvswitch/vport-vxlan.c
+index 8f16f11f7ad3..76e7c38d8dc9 100644
+--- a/net/openvswitch/vport-vxlan.c
++++ b/net/openvswitch/vport-vxlan.c
+@@ -70,8 +70,8 @@ static int vxlan_configure_exts(struct vport *vport, struct nlattr *attr,
+ 	if (nla_len(attr) < sizeof(struct nlattr))
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(exts, OVS_VXLAN_EXT_MAX, attr, exts_policy,
+-			       NULL);
++	err = nla_parse_nested_deprecated(exts, OVS_VXLAN_EXT_MAX, attr,
++					  exts_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/phonet/pn_netlink.c b/net/phonet/pn_netlink.c
+index 871eaf2cb85e..be92d936b5d5 100644
+--- a/net/phonet/pn_netlink.c
++++ b/net/phonet/pn_netlink.c
+@@ -79,8 +79,8 @@ static int addr_doit(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 
+ 	ASSERT_RTNL();
+ 
+-	err = nlmsg_parse(nlh, sizeof(*ifm), tb, IFA_MAX, ifa_phonet_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFA_MAX,
++				     ifa_phonet_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -246,8 +246,8 @@ static int route_doit(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 
+ 	ASSERT_RTNL();
+ 
+-	err = nlmsg_parse(nlh, sizeof(*rtm), tb, RTA_MAX, rtm_phonet_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(*rtm), tb, RTA_MAX,
++				     rtm_phonet_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/qrtr/qrtr.c b/net/qrtr/qrtr.c
+index 86e1e37eb4e8..016790831167 100644
+--- a/net/qrtr/qrtr.c
++++ b/net/qrtr/qrtr.c
+@@ -1092,7 +1092,8 @@ static int qrtr_addr_doit(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 
+ 	ASSERT_RTNL();
+ 
+-	rc = nlmsg_parse(nlh, sizeof(*ifm), tb, IFA_MAX, qrtr_policy, extack);
++	rc = nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFA_MAX,
++				    qrtr_policy, extack);
+ 	if (rc < 0)
+ 		return rc;
+ 
+diff --git a/net/sched/act_api.c b/net/sched/act_api.c
+index f44a574dc4d5..9515f2cd420b 100644
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@ -852,7 +852,8 @@ struct tc_action *tcf_action_init_1(struct net *net, struct tcf_proto *tp,
+ 	int err;
+ 
+ 	if (name == NULL) {
+-		err = nla_parse_nested(tb, TCA_ACT_MAX, nla, NULL, extack);
++		err = nla_parse_nested_deprecated(tb, TCA_ACT_MAX, nla, NULL,
++						  extack);
+ 		if (err < 0)
+ 			goto err_out;
+ 		err = -EINVAL;
+@@ -967,7 +968,8 @@ int tcf_action_init(struct net *net, struct tcf_proto *tp, struct nlattr *nla,
+ 	int err;
+ 	int i;
+ 
+-	err = nla_parse_nested(tb, TCA_ACT_MAX_PRIO, nla, NULL, extack);
++	err = nla_parse_nested_deprecated(tb, TCA_ACT_MAX_PRIO, nla, NULL,
++					  extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -1102,7 +1104,7 @@ static struct tc_action *tcf_action_get_1(struct net *net, struct nlattr *nla,
+ 	int index;
+ 	int err;
+ 
+-	err = nla_parse_nested(tb, TCA_ACT_MAX, nla, NULL, extack);
++	err = nla_parse_nested_deprecated(tb, TCA_ACT_MAX, nla, NULL, extack);
+ 	if (err < 0)
+ 		goto err_out;
+ 
+@@ -1156,7 +1158,7 @@ static int tca_action_flush(struct net *net, struct nlattr *nla,
+ 
+ 	b = skb_tail_pointer(skb);
+ 
+-	err = nla_parse_nested(tb, TCA_ACT_MAX, nla, NULL, extack);
++	err = nla_parse_nested_deprecated(tb, TCA_ACT_MAX, nla, NULL, extack);
+ 	if (err < 0)
+ 		goto err_out;
+ 
+@@ -1285,7 +1287,8 @@ tca_action_gd(struct net *net, struct nlattr *nla, struct nlmsghdr *n,
+ 	size_t attr_size = 0;
+ 	struct tc_action *actions[TCA_ACT_MAX_PRIO] = {};
+ 
+-	ret = nla_parse_nested(tb, TCA_ACT_MAX_PRIO, nla, NULL, extack);
++	ret = nla_parse_nested_deprecated(tb, TCA_ACT_MAX_PRIO, nla, NULL,
++					  extack);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -1387,8 +1390,8 @@ static int tc_ctl_action(struct sk_buff *skb, struct nlmsghdr *n,
+ 	    !netlink_capable(skb, CAP_NET_ADMIN))
+ 		return -EPERM;
+ 
+-	ret = nlmsg_parse(n, sizeof(struct tcamsg), tca, TCA_ROOT_MAX, NULL,
+-			  extack);
++	ret = nlmsg_parse_deprecated(n, sizeof(struct tcamsg), tca,
++				     TCA_ROOT_MAX, NULL, extack);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -1439,13 +1442,12 @@ static struct nlattr *find_dump_kind(struct nlattr **nla)
+ 	if (tb1 == NULL)
+ 		return NULL;
+ 
+-	if (nla_parse(tb, TCA_ACT_MAX_PRIO, nla_data(tb1),
+-		      NLMSG_ALIGN(nla_len(tb1)), NULL, NULL) < 0)
++	if (nla_parse_deprecated(tb, TCA_ACT_MAX_PRIO, nla_data(tb1), NLMSG_ALIGN(nla_len(tb1)), NULL, NULL) < 0)
+ 		return NULL;
+ 
+ 	if (tb[1] == NULL)
+ 		return NULL;
+-	if (nla_parse_nested(tb2, TCA_ACT_MAX, tb[1], NULL, NULL) < 0)
++	if (nla_parse_nested_deprecated(tb2, TCA_ACT_MAX, tb[1], NULL, NULL) < 0)
+ 		return NULL;
+ 	kind = tb2[TCA_ACT_KIND];
+ 
+@@ -1469,8 +1471,8 @@ static int tc_dump_action(struct sk_buff *skb, struct netlink_callback *cb)
+ 	u32 msecs_since = 0;
+ 	u32 act_count = 0;
+ 
+-	ret = nlmsg_parse(cb->nlh, sizeof(struct tcamsg), tb, TCA_ROOT_MAX,
+-			  tcaa_policy, cb->extack);
++	ret = nlmsg_parse_deprecated(cb->nlh, sizeof(struct tcamsg), tb,
++				     TCA_ROOT_MAX, tcaa_policy, cb->extack);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/net/sched/act_bpf.c b/net/sched/act_bpf.c
+index d8f218efec81..46fd10a798da 100644
+--- a/net/sched/act_bpf.c
++++ b/net/sched/act_bpf.c
+@@ -298,7 +298,8 @@ static int tcf_bpf_init(struct net *net, struct nlattr *nla,
+ 	if (!nla)
+ 		return -EINVAL;
+ 
+-	ret = nla_parse_nested(tb, TCA_ACT_BPF_MAX, nla, act_bpf_policy, NULL);
++	ret = nla_parse_nested_deprecated(tb, TCA_ACT_BPF_MAX, nla,
++					  act_bpf_policy, NULL);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/net/sched/act_connmark.c b/net/sched/act_connmark.c
+index 10de4b1e0c1a..4c18b23a6da7 100644
+--- a/net/sched/act_connmark.c
++++ b/net/sched/act_connmark.c
+@@ -112,8 +112,8 @@ static int tcf_connmark_init(struct net *net, struct nlattr *nla,
+ 	if (!nla)
+ 		return -EINVAL;
+ 
+-	ret = nla_parse_nested(tb, TCA_CONNMARK_MAX, nla, connmark_policy,
+-			       NULL);
++	ret = nla_parse_nested_deprecated(tb, TCA_CONNMARK_MAX, nla,
++					  connmark_policy, NULL);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/net/sched/act_csum.c b/net/sched/act_csum.c
+index 209377dabe2f..a49b964cb0e1 100644
+--- a/net/sched/act_csum.c
++++ b/net/sched/act_csum.c
+@@ -62,7 +62,8 @@ static int tcf_csum_init(struct net *net, struct nlattr *nla,
+ 	if (nla == NULL)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_CSUM_MAX, nla, csum_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_CSUM_MAX, nla, csum_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/act_gact.c b/net/sched/act_gact.c
+index c0e921d63e64..06a0ce859b4f 100644
+--- a/net/sched/act_gact.c
++++ b/net/sched/act_gact.c
+@@ -75,7 +75,8 @@ static int tcf_gact_init(struct net *net, struct nlattr *nla,
+ 	if (nla == NULL)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_GACT_MAX, nla, gact_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_GACT_MAX, nla, gact_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/act_ife.c b/net/sched/act_ife.c
+index 575a19b4b575..0879ffa0b23c 100644
+--- a/net/sched/act_ife.c
++++ b/net/sched/act_ife.c
+@@ -487,7 +487,8 @@ static int tcf_ife_init(struct net *net, struct nlattr *nla,
+ 	u32 index;
+ 	int err;
+ 
+-	err = nla_parse_nested(tb, TCA_IFE_MAX, nla, ife_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_IFE_MAX, nla, ife_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -569,8 +570,9 @@ static int tcf_ife_init(struct net *net, struct nlattr *nla,
+ 		INIT_LIST_HEAD(&ife->metalist);
+ 
+ 	if (tb[TCA_IFE_METALST]) {
+-		err = nla_parse_nested(tb2, IFE_META_MAX, tb[TCA_IFE_METALST],
+-				       NULL, NULL);
++		err = nla_parse_nested_deprecated(tb2, IFE_META_MAX,
++						  tb[TCA_IFE_METALST], NULL,
++						  NULL);
+ 		if (err)
+ 			goto metadata_parse_err;
+ 		err = populate_metalist(ife, tb2, exists, rtnl_held);
+diff --git a/net/sched/act_ipt.c b/net/sched/act_ipt.c
+index 04a0b5c61194..ae6e28ab1cd7 100644
+--- a/net/sched/act_ipt.c
++++ b/net/sched/act_ipt.c
+@@ -113,7 +113,8 @@ static int __tcf_ipt_init(struct net *net, unsigned int id, struct nlattr *nla,
+ 	if (nla == NULL)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_IPT_MAX, nla, ipt_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_IPT_MAX, nla, ipt_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/act_mirred.c b/net/sched/act_mirred.c
+index 4646d67090e6..d05d29da0cd5 100644
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -115,7 +115,8 @@ static int tcf_mirred_init(struct net *net, struct nlattr *nla,
+ 		NL_SET_ERR_MSG_MOD(extack, "Mirred requires attributes to be passed");
+ 		return -EINVAL;
+ 	}
+-	ret = nla_parse_nested(tb, TCA_MIRRED_MAX, nla, mirred_policy, extack);
++	ret = nla_parse_nested_deprecated(tb, TCA_MIRRED_MAX, nla,
++					  mirred_policy, extack);
+ 	if (ret < 0)
+ 		return ret;
+ 	if (!tb[TCA_MIRRED_PARMS]) {
+diff --git a/net/sched/act_nat.c b/net/sched/act_nat.c
+index 14fdf25f3540..8f270203432f 100644
+--- a/net/sched/act_nat.c
++++ b/net/sched/act_nat.c
+@@ -53,7 +53,8 @@ static int tcf_nat_init(struct net *net, struct nlattr *nla, struct nlattr *est,
+ 	if (nla == NULL)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_NAT_MAX, nla, nat_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_NAT_MAX, nla, nat_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/act_pedit.c b/net/sched/act_pedit.c
+index 14225288f643..864810b0415f 100644
+--- a/net/sched/act_pedit.c
++++ b/net/sched/act_pedit.c
+@@ -70,8 +70,9 @@ static struct tcf_pedit_key_ex *tcf_pedit_keys_ex_parse(struct nlattr *nla,
+ 			goto err_out;
+ 		}
+ 
+-		err = nla_parse_nested(tb, TCA_PEDIT_KEY_EX_MAX, ka,
+-				       pedit_key_ex_policy, NULL);
++		err = nla_parse_nested_deprecated(tb, TCA_PEDIT_KEY_EX_MAX,
++						  ka, pedit_key_ex_policy,
++						  NULL);
+ 		if (err)
+ 			goto err_out;
+ 
+@@ -158,7 +159,8 @@ static int tcf_pedit_init(struct net *net, struct nlattr *nla,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = nla_parse_nested(tb, TCA_PEDIT_MAX, nla, pedit_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_PEDIT_MAX, nla,
++					  pedit_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/act_police.c b/net/sched/act_police.c
+index 4555131c31a6..a193f2418508 100644
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@ -66,7 +66,8 @@ static int tcf_police_init(struct net *net, struct nlattr *nla,
+ 	if (nla == NULL)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_POLICE_MAX, nla, police_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_POLICE_MAX, nla,
++					  police_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/act_sample.c b/net/sched/act_sample.c
+index 808f4ad67ab9..a975c08c5c8c 100644
+--- a/net/sched/act_sample.c
++++ b/net/sched/act_sample.c
+@@ -53,7 +53,8 @@ static int tcf_sample_init(struct net *net, struct nlattr *nla,
+ 
+ 	if (!nla)
+ 		return -EINVAL;
+-	ret = nla_parse_nested(tb, TCA_SAMPLE_MAX, nla, sample_policy, NULL);
++	ret = nla_parse_nested_deprecated(tb, TCA_SAMPLE_MAX, nla,
++					  sample_policy, NULL);
+ 	if (ret < 0)
+ 		return ret;
+ 	if (!tb[TCA_SAMPLE_PARMS] || !tb[TCA_SAMPLE_RATE] ||
+diff --git a/net/sched/act_simple.c b/net/sched/act_simple.c
+index 4c3010e90ad6..6155f14f2dcd 100644
+--- a/net/sched/act_simple.c
++++ b/net/sched/act_simple.c
+@@ -105,7 +105,8 @@ static int tcf_simp_init(struct net *net, struct nlattr *nla,
+ 	if (nla == NULL)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_DEF_MAX, nla, simple_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_DEF_MAX, nla, simple_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/act_skbedit.c b/net/sched/act_skbedit.c
+index 246a503f2407..1748cb771476 100644
+--- a/net/sched/act_skbedit.c
++++ b/net/sched/act_skbedit.c
+@@ -115,7 +115,8 @@ static int tcf_skbedit_init(struct net *net, struct nlattr *nla,
+ 	if (nla == NULL)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_SKBEDIT_MAX, nla, skbedit_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_SKBEDIT_MAX, nla,
++					  skbedit_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/act_skbmod.c b/net/sched/act_skbmod.c
+index 5cb3726f71a9..f046ce7a197d 100644
+--- a/net/sched/act_skbmod.c
++++ b/net/sched/act_skbmod.c
+@@ -102,7 +102,8 @@ static int tcf_skbmod_init(struct net *net, struct nlattr *nla,
+ 	if (!nla)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_SKBMOD_MAX, nla, skbmod_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_SKBMOD_MAX, nla,
++					  skbmod_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/act_tunnel_key.c b/net/sched/act_tunnel_key.c
+index 2e1c7c13ae7a..1b0b3ccf8dfd 100644
+--- a/net/sched/act_tunnel_key.c
++++ b/net/sched/act_tunnel_key.c
+@@ -76,8 +76,9 @@ tunnel_key_copy_geneve_opt(const struct nlattr *nla, void *dst, int dst_len,
+ 	int err, data_len, opt_len;
+ 	u8 *data;
+ 
+-	err = nla_parse_nested(tb, TCA_TUNNEL_KEY_ENC_OPT_GENEVE_MAX,
+-			       nla, geneve_opt_policy, extack);
++	err = nla_parse_nested_deprecated(tb,
++					  TCA_TUNNEL_KEY_ENC_OPT_GENEVE_MAX,
++					  nla, geneve_opt_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -125,8 +126,8 @@ static int tunnel_key_copy_opts(const struct nlattr *nla, u8 *dst,
+ 	int err, rem, opt_len, len = nla_len(nla), opts_len = 0;
+ 	const struct nlattr *attr, *head = nla_data(nla);
+ 
+-	err = nla_validate(head, len, TCA_TUNNEL_KEY_ENC_OPTS_MAX,
+-			   enc_opts_policy, extack);
++	err = nla_validate_deprecated(head, len, TCA_TUNNEL_KEY_ENC_OPTS_MAX,
++				      enc_opts_policy, extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -236,8 +237,8 @@ static int tunnel_key_init(struct net *net, struct nlattr *nla,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = nla_parse_nested(tb, TCA_TUNNEL_KEY_MAX, nla, tunnel_key_policy,
+-			       extack);
++	err = nla_parse_nested_deprecated(tb, TCA_TUNNEL_KEY_MAX, nla,
++					  tunnel_key_policy, extack);
+ 	if (err < 0) {
+ 		NL_SET_ERR_MSG(extack, "Failed to parse nested tunnel key attributes");
+ 		return err;
+diff --git a/net/sched/act_vlan.c b/net/sched/act_vlan.c
+index 4f9b12dbae4f..c0c3e34b9a3f 100644
+--- a/net/sched/act_vlan.c
++++ b/net/sched/act_vlan.c
+@@ -125,7 +125,8 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
+ 	if (!nla)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_VLAN_MAX, nla, vlan_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_VLAN_MAX, nla, vlan_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index a2bdef3274d4..63fd4e579c90 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -2008,7 +2008,8 @@ static int tc_new_tfilter(struct sk_buff *skb, struct nlmsghdr *n,
+ replay:
+ 	tp_created = 0;
+ 
+-	err = nlmsg_parse(n, sizeof(*t), tca, TCA_MAX, rtm_tca_policy, extack);
++	err = nlmsg_parse_deprecated(n, sizeof(*t), tca, TCA_MAX,
++				     rtm_tca_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -2219,7 +2220,8 @@ static int tc_del_tfilter(struct sk_buff *skb, struct nlmsghdr *n,
+ 	if (!netlink_ns_capable(skb, net->user_ns, CAP_NET_ADMIN))
+ 		return -EPERM;
+ 
+-	err = nlmsg_parse(n, sizeof(*t), tca, TCA_MAX, rtm_tca_policy, extack);
++	err = nlmsg_parse_deprecated(n, sizeof(*t), tca, TCA_MAX,
++				     rtm_tca_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -2368,7 +2370,8 @@ static int tc_get_tfilter(struct sk_buff *skb, struct nlmsghdr *n,
+ 	int err;
+ 	bool rtnl_held = false;
+ 
+-	err = nlmsg_parse(n, sizeof(*t), tca, TCA_MAX, rtm_tca_policy, extack);
++	err = nlmsg_parse_deprecated(n, sizeof(*t), tca, TCA_MAX,
++				     rtm_tca_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -2560,8 +2563,8 @@ static int tc_dump_tfilter(struct sk_buff *skb, struct netlink_callback *cb)
+ 	if (nlmsg_len(cb->nlh) < sizeof(*tcm))
+ 		return skb->len;
+ 
+-	err = nlmsg_parse(cb->nlh, sizeof(*tcm), tca, TCA_MAX, NULL,
+-			  cb->extack);
++	err = nlmsg_parse_deprecated(cb->nlh, sizeof(*tcm), tca, TCA_MAX,
++				     NULL, cb->extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -2808,7 +2811,8 @@ static int tc_ctl_chain(struct sk_buff *skb, struct nlmsghdr *n,
+ 		return -EPERM;
+ 
+ replay:
+-	err = nlmsg_parse(n, sizeof(*t), tca, TCA_MAX, rtm_tca_policy, extack);
++	err = nlmsg_parse_deprecated(n, sizeof(*t), tca, TCA_MAX,
++				     rtm_tca_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -2939,8 +2943,8 @@ static int tc_dump_chain(struct sk_buff *skb, struct netlink_callback *cb)
+ 	if (nlmsg_len(cb->nlh) < sizeof(*tcm))
+ 		return skb->len;
+ 
+-	err = nlmsg_parse(cb->nlh, sizeof(*tcm), tca, TCA_MAX, rtm_tca_policy,
+-			  cb->extack);
++	err = nlmsg_parse_deprecated(cb->nlh, sizeof(*tcm), tca, TCA_MAX,
++				     rtm_tca_policy, cb->extack);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/sched/cls_basic.c b/net/sched/cls_basic.c
+index 687b0af67878..76ae20e10e0e 100644
+--- a/net/sched/cls_basic.c
++++ b/net/sched/cls_basic.c
+@@ -185,8 +185,8 @@ static int basic_change(struct net *net, struct sk_buff *in_skb,
+ 	if (tca[TCA_OPTIONS] == NULL)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_BASIC_MAX, tca[TCA_OPTIONS],
+-			       basic_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_BASIC_MAX, tca[TCA_OPTIONS],
++					  basic_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/cls_bpf.c b/net/sched/cls_bpf.c
+index ff1deece0104..c630c2d6a289 100644
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@ -472,8 +472,8 @@ static int cls_bpf_change(struct net *net, struct sk_buff *in_skb,
+ 	if (tca[TCA_OPTIONS] == NULL)
+ 		return -EINVAL;
+ 
+-	ret = nla_parse_nested(tb, TCA_BPF_MAX, tca[TCA_OPTIONS], bpf_policy,
+-			       NULL);
++	ret = nla_parse_nested_deprecated(tb, TCA_BPF_MAX, tca[TCA_OPTIONS],
++					  bpf_policy, NULL);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/net/sched/cls_cgroup.c b/net/sched/cls_cgroup.c
+index 706a160142ea..939314110361 100644
+--- a/net/sched/cls_cgroup.c
++++ b/net/sched/cls_cgroup.c
+@@ -106,8 +106,9 @@ static int cls_cgroup_change(struct net *net, struct sk_buff *in_skb,
+ 		goto errout;
+ 	new->handle = handle;
+ 	new->tp = tp;
+-	err = nla_parse_nested(tb, TCA_CGROUP_MAX, tca[TCA_OPTIONS],
+-			       cgroup_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_CGROUP_MAX,
++					  tca[TCA_OPTIONS], cgroup_policy,
++					  NULL);
+ 	if (err < 0)
+ 		goto errout;
+ 
+diff --git a/net/sched/cls_flow.c b/net/sched/cls_flow.c
+index eece1ee26930..9a42e1deb3fd 100644
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@ -408,7 +408,8 @@ static int flow_change(struct net *net, struct sk_buff *in_skb,
+ 	if (opt == NULL)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_FLOW_MAX, opt, flow_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_FLOW_MAX, opt, flow_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/cls_flower.c b/net/sched/cls_flower.c
+index bf30bf04d4ea..e33a2b4ba3a2 100644
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -784,8 +784,9 @@ static int fl_set_geneve_opt(const struct nlattr *nla, struct fl_flow_key *key,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = nla_parse_nested(tb, TCA_FLOWER_KEY_ENC_OPT_GENEVE_MAX,
+-			       nla, geneve_opt_policy, extack);
++	err = nla_parse_nested_deprecated(tb,
++					  TCA_FLOWER_KEY_ENC_OPT_GENEVE_MAX,
++					  nla, geneve_opt_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -847,18 +848,18 @@ static int fl_set_enc_opt(struct nlattr **tb, struct fl_flow_key *key,
+ 	const struct nlattr *nla_enc_key, *nla_opt_key, *nla_opt_msk = NULL;
+ 	int err, option_len, key_depth, msk_depth = 0;
+ 
+-	err = nla_validate_nested(tb[TCA_FLOWER_KEY_ENC_OPTS],
+-				  TCA_FLOWER_KEY_ENC_OPTS_MAX,
+-				  enc_opts_policy, extack);
++	err = nla_validate_nested_deprecated(tb[TCA_FLOWER_KEY_ENC_OPTS],
++					     TCA_FLOWER_KEY_ENC_OPTS_MAX,
++					     enc_opts_policy, extack);
+ 	if (err)
+ 		return err;
+ 
+ 	nla_enc_key = nla_data(tb[TCA_FLOWER_KEY_ENC_OPTS]);
+ 
+ 	if (tb[TCA_FLOWER_KEY_ENC_OPTS_MASK]) {
+-		err = nla_validate_nested(tb[TCA_FLOWER_KEY_ENC_OPTS_MASK],
+-					  TCA_FLOWER_KEY_ENC_OPTS_MAX,
+-					  enc_opts_policy, extack);
++		err = nla_validate_nested_deprecated(tb[TCA_FLOWER_KEY_ENC_OPTS_MASK],
++						     TCA_FLOWER_KEY_ENC_OPTS_MAX,
++						     enc_opts_policy, extack);
+ 		if (err)
+ 			return err;
+ 
+@@ -1382,8 +1383,8 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
+ 		goto errout_mask_alloc;
+ 	}
+ 
+-	err = nla_parse_nested(tb, TCA_FLOWER_MAX, tca[TCA_OPTIONS],
+-			       fl_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_FLOWER_MAX,
++					  tca[TCA_OPTIONS], fl_policy, NULL);
+ 	if (err < 0)
+ 		goto errout_tb;
+ 
+@@ -1653,8 +1654,8 @@ static void *fl_tmplt_create(struct net *net, struct tcf_chain *chain,
+ 	tb = kcalloc(TCA_FLOWER_MAX + 1, sizeof(struct nlattr *), GFP_KERNEL);
+ 	if (!tb)
+ 		return ERR_PTR(-ENOBUFS);
+-	err = nla_parse_nested(tb, TCA_FLOWER_MAX, tca[TCA_OPTIONS],
+-			       fl_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_FLOWER_MAX,
++					  tca[TCA_OPTIONS], fl_policy, NULL);
+ 	if (err)
+ 		goto errout_tb;
+ 
+diff --git a/net/sched/cls_fw.c b/net/sched/cls_fw.c
+index ad036b00427d..7b10563d5ab4 100644
+--- a/net/sched/cls_fw.c
++++ b/net/sched/cls_fw.c
+@@ -263,7 +263,8 @@ static int fw_change(struct net *net, struct sk_buff *in_skb,
+ 	if (!opt)
+ 		return handle ? -EINVAL : 0; /* Succeed if it is old method. */
+ 
+-	err = nla_parse_nested(tb, TCA_FW_MAX, opt, fw_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_FW_MAX, opt, fw_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/cls_matchall.c b/net/sched/cls_matchall.c
+index 297b15dae9b8..fc0a22e6f170 100644
+--- a/net/sched/cls_matchall.c
++++ b/net/sched/cls_matchall.c
+@@ -201,8 +201,8 @@ static int mall_change(struct net *net, struct sk_buff *in_skb,
+ 	if (head)
+ 		return -EEXIST;
+ 
+-	err = nla_parse_nested(tb, TCA_MATCHALL_MAX, tca[TCA_OPTIONS],
+-			       mall_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_MATCHALL_MAX,
++					  tca[TCA_OPTIONS], mall_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/cls_route.c b/net/sched/cls_route.c
+index f006af23b64a..d68b8174d9ba 100644
+--- a/net/sched/cls_route.c
++++ b/net/sched/cls_route.c
+@@ -484,7 +484,8 @@ static int route4_change(struct net *net, struct sk_buff *in_skb,
+ 	if (opt == NULL)
+ 		return handle ? -EINVAL : 0;
+ 
+-	err = nla_parse_nested(tb, TCA_ROUTE4_MAX, opt, route4_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_ROUTE4_MAX, opt,
++					  route4_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/cls_rsvp.h b/net/sched/cls_rsvp.h
+index 0719a21d9c41..e523684fe28a 100644
+--- a/net/sched/cls_rsvp.h
++++ b/net/sched/cls_rsvp.h
+@@ -497,7 +497,8 @@ static int rsvp_change(struct net *net, struct sk_buff *in_skb,
+ 	if (opt == NULL)
+ 		return handle ? -EINVAL : 0;
+ 
+-	err = nla_parse_nested(tb, TCA_RSVP_MAX, opt, rsvp_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_RSVP_MAX, opt, rsvp_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/cls_tcindex.c b/net/sched/cls_tcindex.c
+index 24e0a62a65cc..9915a7172ecb 100644
+--- a/net/sched/cls_tcindex.c
++++ b/net/sched/cls_tcindex.c
+@@ -510,7 +510,8 @@ tcindex_change(struct net *net, struct sk_buff *in_skb,
+ 	if (!opt)
+ 		return 0;
+ 
+-	err = nla_parse_nested(tb, TCA_TCINDEX_MAX, opt, tcindex_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_TCINDEX_MAX, opt,
++					  tcindex_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/cls_u32.c b/net/sched/cls_u32.c
+index b0858cec6fae..a739157e0d44 100644
+--- a/net/sched/cls_u32.c
++++ b/net/sched/cls_u32.c
+@@ -884,7 +884,8 @@ static int u32_change(struct net *net, struct sk_buff *in_skb,
+ 		}
+ 	}
+ 
+-	err = nla_parse_nested(tb, TCA_U32_MAX, opt, u32_policy, extack);
++	err = nla_parse_nested_deprecated(tb, TCA_U32_MAX, opt, u32_policy,
++					  extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/em_ipt.c b/net/sched/em_ipt.c
+index a5f34e930eff..60c26b8294b5 100644
+--- a/net/sched/em_ipt.c
++++ b/net/sched/em_ipt.c
+@@ -120,8 +120,8 @@ static int em_ipt_change(struct net *net, void *data, int data_len,
+ 	struct xt_match *match;
+ 	int mdata_len, ret;
+ 
+-	ret = nla_parse(tb, TCA_EM_IPT_MAX, data, data_len, em_ipt_policy,
+-			NULL);
++	ret = nla_parse_deprecated(tb, TCA_EM_IPT_MAX, data, data_len,
++				   em_ipt_policy, NULL);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/net/sched/em_meta.c b/net/sched/em_meta.c
+index d6e97115500b..28dfa8f2a4ea 100644
+--- a/net/sched/em_meta.c
++++ b/net/sched/em_meta.c
+@@ -912,7 +912,8 @@ static int em_meta_change(struct net *net, void *data, int len,
+ 	struct tcf_meta_hdr *hdr;
+ 	struct meta_match *meta = NULL;
+ 
+-	err = nla_parse(tb, TCA_EM_META_MAX, data, len, meta_policy, NULL);
++	err = nla_parse_deprecated(tb, TCA_EM_META_MAX, data, len,
++				   meta_policy, NULL);
+ 	if (err < 0)
+ 		goto errout;
+ 
+diff --git a/net/sched/ematch.c b/net/sched/ematch.c
+index 1331a4c2d8ff..e66b6acc64f4 100644
+--- a/net/sched/ematch.c
++++ b/net/sched/ematch.c
+@@ -314,7 +314,8 @@ int tcf_em_tree_validate(struct tcf_proto *tp, struct nlattr *nla,
+ 	if (!nla)
+ 		return 0;
+ 
+-	err = nla_parse_nested(tb, TCA_EMATCH_TREE_MAX, nla, em_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_EMATCH_TREE_MAX, nla,
++					  em_policy, NULL);
+ 	if (err < 0)
+ 		goto errout;
+ 
+diff --git a/net/sched/sch_api.c b/net/sched/sch_api.c
+index c126b9f78d6e..199838e3a5d9 100644
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -479,7 +479,8 @@ static struct qdisc_size_table *qdisc_get_stab(struct nlattr *opt,
+ 	u16 *tab = NULL;
+ 	int err;
+ 
+-	err = nla_parse_nested(tb, TCA_STAB_MAX, opt, stab_policy, extack);
++	err = nla_parse_nested_deprecated(tb, TCA_STAB_MAX, opt, stab_policy,
++					  extack);
+ 	if (err < 0)
+ 		return ERR_PTR(err);
+ 	if (!tb[TCA_STAB_BASE]) {
+@@ -1423,8 +1424,8 @@ static int tc_get_qdisc(struct sk_buff *skb, struct nlmsghdr *n,
+ 	    !netlink_ns_capable(skb, net->user_ns, CAP_NET_ADMIN))
+ 		return -EPERM;
+ 
+-	err = nlmsg_parse(n, sizeof(*tcm), tca, TCA_MAX, rtm_tca_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(n, sizeof(*tcm), tca, TCA_MAX,
++				     rtm_tca_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -1508,8 +1509,8 @@ static int tc_modify_qdisc(struct sk_buff *skb, struct nlmsghdr *n,
+ 
+ replay:
+ 	/* Reinit, just in case something touches this. */
+-	err = nlmsg_parse(n, sizeof(*tcm), tca, TCA_MAX, rtm_tca_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(n, sizeof(*tcm), tca, TCA_MAX,
++				     rtm_tca_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -1743,8 +1744,8 @@ static int tc_dump_qdisc(struct sk_buff *skb, struct netlink_callback *cb)
+ 	idx = 0;
+ 	ASSERT_RTNL();
+ 
+-	err = nlmsg_parse(nlh, sizeof(struct tcmsg), tca, TCA_MAX,
+-			  rtm_tca_policy, cb->extack);
++	err = nlmsg_parse_deprecated(nlh, sizeof(struct tcmsg), tca, TCA_MAX,
++				     rtm_tca_policy, cb->extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -1972,8 +1973,8 @@ static int tc_ctl_tclass(struct sk_buff *skb, struct nlmsghdr *n,
+ 	    !netlink_ns_capable(skb, net->user_ns, CAP_NET_ADMIN))
+ 		return -EPERM;
+ 
+-	err = nlmsg_parse(n, sizeof(*tcm), tca, TCA_MAX, rtm_tca_policy,
+-			  extack);
++	err = nlmsg_parse_deprecated(n, sizeof(*tcm), tca, TCA_MAX,
++				     rtm_tca_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_atm.c b/net/sched/sch_atm.c
+index d714d3747bcb..9c1f2d44ea93 100644
+--- a/net/sched/sch_atm.c
++++ b/net/sched/sch_atm.c
+@@ -223,7 +223,8 @@ static int atm_tc_change(struct Qdisc *sch, u32 classid, u32 parent,
+ 	if (opt == NULL)
+ 		return -EINVAL;
+ 
+-	error = nla_parse_nested(tb, TCA_ATM_MAX, opt, atm_policy, NULL);
++	error = nla_parse_nested_deprecated(tb, TCA_ATM_MAX, opt, atm_policy,
++					    NULL);
+ 	if (error < 0)
+ 		return error;
+ 
+diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
+index 259d97bc2abd..3a4c9217c3ac 100644
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -2531,7 +2531,8 @@ static int cake_change(struct Qdisc *sch, struct nlattr *opt,
+ 	if (!opt)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_CAKE_MAX, opt, cake_policy, extack);
++	err = nla_parse_nested_deprecated(tb, TCA_CAKE_MAX, opt, cake_policy,
++					  extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_cbq.c b/net/sched/sch_cbq.c
+index 114b9048ea7e..efa5b9db7f73 100644
+--- a/net/sched/sch_cbq.c
++++ b/net/sched/sch_cbq.c
+@@ -1149,7 +1149,8 @@ static int cbq_init(struct Qdisc *sch, struct nlattr *opt,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = nla_parse_nested(tb, TCA_CBQ_MAX, opt, cbq_policy, extack);
++	err = nla_parse_nested_deprecated(tb, TCA_CBQ_MAX, opt, cbq_policy,
++					  extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -1473,7 +1474,8 @@ cbq_change_class(struct Qdisc *sch, u32 classid, u32 parentid, struct nlattr **t
+ 		return -EINVAL;
+ 	}
+ 
+-	err = nla_parse_nested(tb, TCA_CBQ_MAX, opt, cbq_policy, extack);
++	err = nla_parse_nested_deprecated(tb, TCA_CBQ_MAX, opt, cbq_policy,
++					  extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_cbs.c b/net/sched/sch_cbs.c
+index c4b73380a917..9519af3b6114 100644
+--- a/net/sched/sch_cbs.c
++++ b/net/sched/sch_cbs.c
+@@ -358,7 +358,8 @@ static int cbs_change(struct Qdisc *sch, struct nlattr *opt,
+ 	struct tc_cbs_qopt *qopt;
+ 	int err;
+ 
+-	err = nla_parse_nested(tb, TCA_CBS_MAX, opt, cbs_policy, extack);
++	err = nla_parse_nested_deprecated(tb, TCA_CBS_MAX, opt, cbs_policy,
++					  extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_choke.c b/net/sched/sch_choke.c
+index eafc0d17d174..e3795ac66684 100644
+--- a/net/sched/sch_choke.c
++++ b/net/sched/sch_choke.c
+@@ -358,7 +358,8 @@ static int choke_change(struct Qdisc *sch, struct nlattr *opt,
+ 	if (opt == NULL)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_CHOKE_MAX, opt, choke_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_CHOKE_MAX, opt,
++					  choke_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_codel.c b/net/sched/sch_codel.c
+index 17cd81f84b5d..b4dab563737b 100644
+--- a/net/sched/sch_codel.c
++++ b/net/sched/sch_codel.c
+@@ -141,7 +141,8 @@ static int codel_change(struct Qdisc *sch, struct nlattr *opt,
+ 	if (!opt)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_CODEL_MAX, opt, codel_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_CODEL_MAX, opt,
++					  codel_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_drr.c b/net/sched/sch_drr.c
+index 430df9a55ec4..ffec34ba3b8f 100644
+--- a/net/sched/sch_drr.c
++++ b/net/sched/sch_drr.c
+@@ -70,7 +70,8 @@ static int drr_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = nla_parse_nested(tb, TCA_DRR_MAX, opt, drr_policy, extack);
++	err = nla_parse_nested_deprecated(tb, TCA_DRR_MAX, opt, drr_policy,
++					  extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_dsmark.c b/net/sched/sch_dsmark.c
+index 42471464ded3..f22bffa10701 100644
+--- a/net/sched/sch_dsmark.c
++++ b/net/sched/sch_dsmark.c
+@@ -132,7 +132,8 @@ static int dsmark_change(struct Qdisc *sch, u32 classid, u32 parent,
+ 	if (!opt)
+ 		goto errout;
+ 
+-	err = nla_parse_nested(tb, TCA_DSMARK_MAX, opt, dsmark_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_DSMARK_MAX, opt,
++					  dsmark_policy, NULL);
+ 	if (err < 0)
+ 		goto errout;
+ 
+@@ -353,7 +354,8 @@ static int dsmark_init(struct Qdisc *sch, struct nlattr *opt,
+ 	if (err)
+ 		return err;
+ 
+-	err = nla_parse_nested(tb, TCA_DSMARK_MAX, opt, dsmark_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_DSMARK_MAX, opt,
++					  dsmark_policy, NULL);
+ 	if (err < 0)
+ 		goto errout;
+ 
+diff --git a/net/sched/sch_etf.c b/net/sched/sch_etf.c
+index 1150f22983df..3241123905c3 100644
+--- a/net/sched/sch_etf.c
++++ b/net/sched/sch_etf.c
+@@ -351,7 +351,8 @@ static int etf_init(struct Qdisc *sch, struct nlattr *opt,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = nla_parse_nested(tb, TCA_ETF_MAX, opt, etf_policy, extack);
++	err = nla_parse_nested_deprecated(tb, TCA_ETF_MAX, opt, etf_policy,
++					  extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_fq.c b/net/sched/sch_fq.c
+index b27ba36a269c..052843530db0 100644
+--- a/net/sched/sch_fq.c
++++ b/net/sched/sch_fq.c
+@@ -710,7 +710,8 @@ static int fq_change(struct Qdisc *sch, struct nlattr *opt,
+ 	if (!opt)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_FQ_MAX, opt, fq_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_FQ_MAX, opt, fq_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_fq_codel.c b/net/sched/sch_fq_codel.c
+index cd04d40c30b6..adb27c6fc518 100644
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -387,8 +387,8 @@ static int fq_codel_change(struct Qdisc *sch, struct nlattr *opt,
+ 	if (!opt)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_FQ_CODEL_MAX, opt, fq_codel_policy,
+-			       NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_FQ_CODEL_MAX, opt,
++					  fq_codel_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 	if (tb[TCA_FQ_CODEL_FLOWS]) {
+diff --git a/net/sched/sch_gred.c b/net/sched/sch_gred.c
+index 234afbf9115b..b4e425c696f0 100644
+--- a/net/sched/sch_gred.c
++++ b/net/sched/sch_gred.c
+@@ -538,7 +538,8 @@ static void gred_vq_apply(struct gred_sched *table, const struct nlattr *entry)
+ 	struct nlattr *tb[TCA_GRED_VQ_MAX + 1];
+ 	u32 dp;
+ 
+-	nla_parse_nested(tb, TCA_GRED_VQ_MAX, entry, gred_vq_policy, NULL);
++	nla_parse_nested_deprecated(tb, TCA_GRED_VQ_MAX, entry,
++				    gred_vq_policy, NULL);
+ 
+ 	dp = nla_get_u32(tb[TCA_GRED_VQ_DP]);
+ 
+@@ -568,8 +569,8 @@ static int gred_vq_validate(struct gred_sched *table, u32 cdp,
+ 	int err;
+ 	u32 dp;
+ 
+-	err = nla_parse_nested(tb, TCA_GRED_VQ_MAX, entry, gred_vq_policy,
+-			       extack);
++	err = nla_parse_nested_deprecated(tb, TCA_GRED_VQ_MAX, entry,
++					  gred_vq_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -610,8 +611,8 @@ static int gred_vqs_validate(struct gred_sched *table, u32 cdp,
+ 	const struct nlattr *attr;
+ 	int rem, err;
+ 
+-	err = nla_validate_nested(vqs, TCA_GRED_VQ_ENTRY_MAX,
+-				  gred_vqe_policy, extack);
++	err = nla_validate_nested_deprecated(vqs, TCA_GRED_VQ_ENTRY_MAX,
++					     gred_vqe_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -650,7 +651,8 @@ static int gred_change(struct Qdisc *sch, struct nlattr *opt,
+ 	if (opt == NULL)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_GRED_MAX, opt, gred_policy, extack);
++	err = nla_parse_nested_deprecated(tb, TCA_GRED_MAX, opt, gred_policy,
++					  extack);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -737,7 +739,8 @@ static int gred_init(struct Qdisc *sch, struct nlattr *opt,
+ 	if (!opt)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_GRED_MAX, opt, gred_policy, extack);
++	err = nla_parse_nested_deprecated(tb, TCA_GRED_MAX, opt, gred_policy,
++					  extack);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_hfsc.c b/net/sched/sch_hfsc.c
+index d2ab463f22ae..945890448d5f 100644
+--- a/net/sched/sch_hfsc.c
++++ b/net/sched/sch_hfsc.c
+@@ -926,7 +926,8 @@ hfsc_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
+ 	if (opt == NULL)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_HFSC_MAX, opt, hfsc_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_HFSC_MAX, opt, hfsc_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_hhf.c b/net/sched/sch_hhf.c
+index 9d6a47697406..9493d4933546 100644
+--- a/net/sched/sch_hhf.c
++++ b/net/sched/sch_hhf.c
+@@ -518,7 +518,8 @@ static int hhf_change(struct Qdisc *sch, struct nlattr *opt,
+ 	if (!opt)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_HHF_MAX, opt, hhf_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_HHF_MAX, opt, hhf_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_htb.c b/net/sched/sch_htb.c
+index 2f9883b196e8..a9ead852dbbe 100644
+--- a/net/sched/sch_htb.c
++++ b/net/sched/sch_htb.c
+@@ -1012,7 +1012,8 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt,
+ 	if (err)
+ 		return err;
+ 
+-	err = nla_parse_nested(tb, TCA_HTB_MAX, opt, htb_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_HTB_MAX, opt, htb_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -1310,7 +1311,8 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
+ 	if (!opt)
+ 		goto failure;
+ 
+-	err = nla_parse_nested(tb, TCA_HTB_MAX, opt, htb_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_HTB_MAX, opt, htb_policy,
++					  NULL);
+ 	if (err < 0)
+ 		goto failure;
+ 
+diff --git a/net/sched/sch_mqprio.c b/net/sched/sch_mqprio.c
+index ea0dc112b38d..d61684eef0b5 100644
+--- a/net/sched/sch_mqprio.c
++++ b/net/sched/sch_mqprio.c
+@@ -125,8 +125,9 @@ static int parse_attr(struct nlattr *tb[], int maxtype, struct nlattr *nla,
+ 	int nested_len = nla_len(nla) - NLA_ALIGN(len);
+ 
+ 	if (nested_len >= nla_attr_size(0))
+-		return nla_parse(tb, maxtype, nla_data(nla) + NLA_ALIGN(len),
+-				 nested_len, policy, NULL);
++		return nla_parse_deprecated(tb, maxtype,
++					    nla_data(nla) + NLA_ALIGN(len),
++					    nested_len, policy, NULL);
+ 
+ 	memset(tb, 0, sizeof(struct nlattr *) * (maxtype + 1));
+ 	return 0;
+diff --git a/net/sched/sch_netem.c b/net/sched/sch_netem.c
+index f7ac84c1d5b1..2f1c9c46c13c 100644
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@ -937,8 +937,9 @@ static int parse_attr(struct nlattr *tb[], int maxtype, struct nlattr *nla,
+ 	}
+ 
+ 	if (nested_len >= nla_attr_size(0))
+-		return nla_parse(tb, maxtype, nla_data(nla) + NLA_ALIGN(len),
+-				 nested_len, policy, NULL);
++		return nla_parse_deprecated(tb, maxtype,
++					    nla_data(nla) + NLA_ALIGN(len),
++					    nested_len, policy, NULL);
+ 
+ 	memset(tb, 0, sizeof(struct nlattr *) * (maxtype + 1));
+ 	return 0;
+diff --git a/net/sched/sch_pie.c b/net/sched/sch_pie.c
+index 1cc0c7b74aa3..6dead0add2aa 100644
+--- a/net/sched/sch_pie.c
++++ b/net/sched/sch_pie.c
+@@ -216,7 +216,8 @@ static int pie_change(struct Qdisc *sch, struct nlattr *opt,
+ 	if (!opt)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_PIE_MAX, opt, pie_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_PIE_MAX, opt, pie_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_qfq.c b/net/sched/sch_qfq.c
+index 1589364b54da..00f0a7a9cb37 100644
+--- a/net/sched/sch_qfq.c
++++ b/net/sched/sch_qfq.c
+@@ -410,8 +410,8 @@ static int qfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = nla_parse_nested(tb, TCA_QFQ_MAX, tca[TCA_OPTIONS], qfq_policy,
+-			       NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_QFQ_MAX, tca[TCA_OPTIONS],
++					  qfq_policy, NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_red.c b/net/sched/sch_red.c
+index 4e8c0abf6194..d94a648414df 100644
+--- a/net/sched/sch_red.c
++++ b/net/sched/sch_red.c
+@@ -205,7 +205,8 @@ static int red_change(struct Qdisc *sch, struct nlattr *opt,
+ 	if (opt == NULL)
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(tb, TCA_RED_MAX, opt, red_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_RED_MAX, opt, red_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/sched/sch_sfb.c b/net/sched/sch_sfb.c
+index 2419fdb75966..833ff8b44829 100644
+--- a/net/sched/sch_sfb.c
++++ b/net/sched/sch_sfb.c
+@@ -499,7 +499,8 @@ static int sfb_change(struct Qdisc *sch, struct nlattr *opt,
+ 	int err;
+ 
+ 	if (opt) {
+-		err = nla_parse_nested(tb, TCA_SFB_MAX, opt, sfb_policy, NULL);
++		err = nla_parse_nested_deprecated(tb, TCA_SFB_MAX, opt,
++						  sfb_policy, NULL);
+ 		if (err < 0)
+ 			return -EINVAL;
+ 
+* Unmerged path net/sched/sch_taprio.c
+diff --git a/net/sched/sch_tbf.c b/net/sched/sch_tbf.c
+index f71578dbb9e3..79138aba209c 100644
+--- a/net/sched/sch_tbf.c
++++ b/net/sched/sch_tbf.c
+@@ -308,7 +308,8 @@ static int tbf_change(struct Qdisc *sch, struct nlattr *opt,
+ 	s64 buffer, mtu;
+ 	u64 rate64 = 0, prate64 = 0;
+ 
+-	err = nla_parse_nested(tb, TCA_TBF_MAX, opt, tbf_policy, NULL);
++	err = nla_parse_nested_deprecated(tb, TCA_TBF_MAX, opt, tbf_policy,
++					  NULL);
+ 	if (err < 0)
+ 		return err;
+ 
+diff --git a/net/tipc/bearer.c b/net/tipc/bearer.c
+index 70fe195237ff..a914f1512d4f 100644
+--- a/net/tipc/bearer.c
++++ b/net/tipc/bearer.c
+@@ -776,9 +776,9 @@ int tipc_nl_bearer_get(struct sk_buff *skb, struct genl_info *info)
+ 	if (!info->attrs[TIPC_NLA_BEARER])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(attrs, TIPC_NLA_BEARER_MAX,
+-			       info->attrs[TIPC_NLA_BEARER],
+-			       tipc_nl_bearer_policy, info->extack);
++	err = nla_parse_nested_deprecated(attrs, TIPC_NLA_BEARER_MAX,
++					  info->attrs[TIPC_NLA_BEARER],
++					  tipc_nl_bearer_policy, info->extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -825,9 +825,9 @@ int __tipc_nl_bearer_disable(struct sk_buff *skb, struct genl_info *info)
+ 	if (!info->attrs[TIPC_NLA_BEARER])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(attrs, TIPC_NLA_BEARER_MAX,
+-			       info->attrs[TIPC_NLA_BEARER],
+-			       tipc_nl_bearer_policy, info->extack);
++	err = nla_parse_nested_deprecated(attrs, TIPC_NLA_BEARER_MAX,
++					  info->attrs[TIPC_NLA_BEARER],
++					  tipc_nl_bearer_policy, info->extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -870,9 +870,9 @@ int __tipc_nl_bearer_enable(struct sk_buff *skb, struct genl_info *info)
+ 	if (!info->attrs[TIPC_NLA_BEARER])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(attrs, TIPC_NLA_BEARER_MAX,
+-			       info->attrs[TIPC_NLA_BEARER],
+-			       tipc_nl_bearer_policy, info->extack);
++	err = nla_parse_nested_deprecated(attrs, TIPC_NLA_BEARER_MAX,
++					  info->attrs[TIPC_NLA_BEARER],
++					  tipc_nl_bearer_policy, info->extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -921,9 +921,9 @@ int tipc_nl_bearer_add(struct sk_buff *skb, struct genl_info *info)
+ 	if (!info->attrs[TIPC_NLA_BEARER])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(attrs, TIPC_NLA_BEARER_MAX,
+-			       info->attrs[TIPC_NLA_BEARER],
+-			       tipc_nl_bearer_policy, info->extack);
++	err = nla_parse_nested_deprecated(attrs, TIPC_NLA_BEARER_MAX,
++					  info->attrs[TIPC_NLA_BEARER],
++					  tipc_nl_bearer_policy, info->extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -964,9 +964,9 @@ int __tipc_nl_bearer_set(struct sk_buff *skb, struct genl_info *info)
+ 	if (!info->attrs[TIPC_NLA_BEARER])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(attrs, TIPC_NLA_BEARER_MAX,
+-			       info->attrs[TIPC_NLA_BEARER],
+-			       tipc_nl_bearer_policy, info->extack);
++	err = nla_parse_nested_deprecated(attrs, TIPC_NLA_BEARER_MAX,
++					  info->attrs[TIPC_NLA_BEARER],
++					  tipc_nl_bearer_policy, info->extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -1107,9 +1107,9 @@ int tipc_nl_media_get(struct sk_buff *skb, struct genl_info *info)
+ 	if (!info->attrs[TIPC_NLA_MEDIA])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(attrs, TIPC_NLA_MEDIA_MAX,
+-			       info->attrs[TIPC_NLA_MEDIA],
+-			       tipc_nl_media_policy, info->extack);
++	err = nla_parse_nested_deprecated(attrs, TIPC_NLA_MEDIA_MAX,
++					  info->attrs[TIPC_NLA_MEDIA],
++					  tipc_nl_media_policy, info->extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -1155,9 +1155,9 @@ int __tipc_nl_media_set(struct sk_buff *skb, struct genl_info *info)
+ 	if (!info->attrs[TIPC_NLA_MEDIA])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(attrs, TIPC_NLA_MEDIA_MAX,
+-			       info->attrs[TIPC_NLA_MEDIA],
+-			       tipc_nl_media_policy, info->extack);
++	err = nla_parse_nested_deprecated(attrs, TIPC_NLA_MEDIA_MAX,
++					  info->attrs[TIPC_NLA_MEDIA],
++					  tipc_nl_media_policy, info->extack);
+ 
+ 	if (!attrs[TIPC_NLA_MEDIA_NAME])
+ 		return -EINVAL;
+diff --git a/net/tipc/link.c b/net/tipc/link.c
+index 6dac63b94ab3..2566997fb411 100644
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@ -2184,8 +2184,8 @@ int tipc_nl_parse_link_prop(struct nlattr *prop, struct nlattr *props[])
+ {
+ 	int err;
+ 
+-	err = nla_parse_nested(props, TIPC_NLA_PROP_MAX, prop,
+-			       tipc_nl_prop_policy, NULL);
++	err = nla_parse_nested_deprecated(props, TIPC_NLA_PROP_MAX, prop,
++					  tipc_nl_prop_policy, NULL);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/tipc/net.c b/net/tipc/net.c
+index 7ce1e86b024f..2b8537879faf 100644
+--- a/net/tipc/net.c
++++ b/net/tipc/net.c
+@@ -245,9 +245,9 @@ int __tipc_nl_net_set(struct sk_buff *skb, struct genl_info *info)
+ 	if (!info->attrs[TIPC_NLA_NET])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(attrs, TIPC_NLA_NET_MAX,
+-			       info->attrs[TIPC_NLA_NET], tipc_nl_net_policy,
+-			       info->extack);
++	err = nla_parse_nested_deprecated(attrs, TIPC_NLA_NET_MAX,
++					  info->attrs[TIPC_NLA_NET],
++					  tipc_nl_net_policy, info->extack);
+ 
+ 	if (err)
+ 		return err;
+diff --git a/net/tipc/netlink.c b/net/tipc/netlink.c
+index 5240f64e8ccc..d124a6f0a59e 100644
+--- a/net/tipc/netlink.c
++++ b/net/tipc/netlink.c
+@@ -275,8 +275,8 @@ int tipc_nlmsg_parse(const struct nlmsghdr *nlh, struct nlattr ***attr)
+ 	if (!*attr)
+ 		return -EOPNOTSUPP;
+ 
+-	return nlmsg_parse(nlh, GENL_HDRLEN, *attr, maxattr, tipc_nl_policy,
+-			   NULL);
++	return nlmsg_parse_deprecated(nlh, GENL_HDRLEN, *attr, maxattr,
++				      tipc_nl_policy, NULL);
+ }
+ 
+ int __init tipc_netlink_start(void)
+diff --git a/net/tipc/netlink_compat.c b/net/tipc/netlink_compat.c
+index a83aee01a707..af71d5edad5d 100644
+--- a/net/tipc/netlink_compat.c
++++ b/net/tipc/netlink_compat.c
+@@ -330,9 +330,9 @@ static int __tipc_nl_compat_doit(struct tipc_nl_compat_cmd_doit *cmd,
+ 	if (err)
+ 		goto doit_out;
+ 
+-	err = nla_parse(attrbuf, tipc_genl_family.maxattr,
+-			(const struct nlattr *)trans_buf->data,
+-			trans_buf->len, NULL, NULL);
++	err = nla_parse_deprecated(attrbuf, tipc_genl_family.maxattr,
++				   (const struct nlattr *)trans_buf->data,
++				   trans_buf->len, NULL, NULL);
+ 	if (err)
+ 		goto doit_out;
+ 
+@@ -381,8 +381,8 @@ static int tipc_nl_compat_bearer_dump(struct tipc_nl_compat_msg *msg,
+ 	if (!attrs[TIPC_NLA_BEARER])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(bearer, TIPC_NLA_BEARER_MAX,
+-			       attrs[TIPC_NLA_BEARER], NULL, NULL);
++	err = nla_parse_nested_deprecated(bearer, TIPC_NLA_BEARER_MAX,
++					  attrs[TIPC_NLA_BEARER], NULL, NULL);
+ 	if (err)
+ 		return err;
+ 
+@@ -517,24 +517,26 @@ static int tipc_nl_compat_link_stat_dump(struct tipc_nl_compat_msg *msg,
+ 	if (!attrs[TIPC_NLA_LINK])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(link, TIPC_NLA_LINK_MAX, attrs[TIPC_NLA_LINK],
+-			       NULL, NULL);
++	err = nla_parse_nested_deprecated(link, TIPC_NLA_LINK_MAX,
++					  attrs[TIPC_NLA_LINK], NULL, NULL);
+ 	if (err)
+ 		return err;
+ 
+ 	if (!link[TIPC_NLA_LINK_PROP])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(prop, TIPC_NLA_PROP_MAX,
+-			       link[TIPC_NLA_LINK_PROP], NULL, NULL);
++	err = nla_parse_nested_deprecated(prop, TIPC_NLA_PROP_MAX,
++					  link[TIPC_NLA_LINK_PROP], NULL,
++					  NULL);
+ 	if (err)
+ 		return err;
+ 
+ 	if (!link[TIPC_NLA_LINK_STATS])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(stats, TIPC_NLA_STATS_MAX,
+-			       link[TIPC_NLA_LINK_STATS], NULL, NULL);
++	err = nla_parse_nested_deprecated(stats, TIPC_NLA_STATS_MAX,
++					  link[TIPC_NLA_LINK_STATS], NULL,
++					  NULL);
+ 	if (err)
+ 		return err;
+ 
+@@ -648,8 +650,8 @@ static int tipc_nl_compat_link_dump(struct tipc_nl_compat_msg *msg,
+ 	if (!attrs[TIPC_NLA_LINK])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(link, TIPC_NLA_LINK_MAX, attrs[TIPC_NLA_LINK],
+-			       NULL, NULL);
++	err = nla_parse_nested_deprecated(link, TIPC_NLA_LINK_MAX,
++					  attrs[TIPC_NLA_LINK], NULL, NULL);
+ 	if (err)
+ 		return err;
+ 
+@@ -872,16 +874,18 @@ static int tipc_nl_compat_name_table_dump(struct tipc_nl_compat_msg *msg,
+ 	if (!attrs[TIPC_NLA_NAME_TABLE])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(nt, TIPC_NLA_NAME_TABLE_MAX,
+-			       attrs[TIPC_NLA_NAME_TABLE], NULL, NULL);
++	err = nla_parse_nested_deprecated(nt, TIPC_NLA_NAME_TABLE_MAX,
++					  attrs[TIPC_NLA_NAME_TABLE], NULL,
++					  NULL);
+ 	if (err)
+ 		return err;
+ 
+ 	if (!nt[TIPC_NLA_NAME_TABLE_PUBL])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(publ, TIPC_NLA_PUBL_MAX,
+-			       nt[TIPC_NLA_NAME_TABLE_PUBL], NULL, NULL);
++	err = nla_parse_nested_deprecated(publ, TIPC_NLA_PUBL_MAX,
++					  nt[TIPC_NLA_NAME_TABLE_PUBL], NULL,
++					  NULL);
+ 	if (err)
+ 		return err;
+ 
+@@ -940,8 +944,8 @@ static int __tipc_nl_compat_publ_dump(struct tipc_nl_compat_msg *msg,
+ 	if (!attrs[TIPC_NLA_PUBL])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(publ, TIPC_NLA_PUBL_MAX, attrs[TIPC_NLA_PUBL],
+-			       NULL, NULL);
++	err = nla_parse_nested_deprecated(publ, TIPC_NLA_PUBL_MAX,
++					  attrs[TIPC_NLA_PUBL], NULL, NULL);
+ 	if (err)
+ 		return err;
+ 
+@@ -1010,8 +1014,8 @@ static int tipc_nl_compat_sk_dump(struct tipc_nl_compat_msg *msg,
+ 	if (!attrs[TIPC_NLA_SOCK])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(sock, TIPC_NLA_SOCK_MAX, attrs[TIPC_NLA_SOCK],
+-			       NULL, NULL);
++	err = nla_parse_nested_deprecated(sock, TIPC_NLA_SOCK_MAX,
++					  attrs[TIPC_NLA_SOCK], NULL, NULL);
+ 	if (err)
+ 		return err;
+ 
+@@ -1022,8 +1026,9 @@ static int tipc_nl_compat_sk_dump(struct tipc_nl_compat_msg *msg,
+ 		u32 node;
+ 		struct nlattr *con[TIPC_NLA_CON_MAX + 1];
+ 
+-		err = nla_parse_nested(con, TIPC_NLA_CON_MAX,
+-				       sock[TIPC_NLA_SOCK_CON], NULL, NULL);
++		err = nla_parse_nested_deprecated(con, TIPC_NLA_CON_MAX,
++						  sock[TIPC_NLA_SOCK_CON],
++						  NULL, NULL);
+ 
+ 		if (err)
+ 			return err;
+@@ -1062,8 +1067,8 @@ static int tipc_nl_compat_media_dump(struct tipc_nl_compat_msg *msg,
+ 	if (!attrs[TIPC_NLA_MEDIA])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(media, TIPC_NLA_MEDIA_MAX,
+-			       attrs[TIPC_NLA_MEDIA], NULL, NULL);
++	err = nla_parse_nested_deprecated(media, TIPC_NLA_MEDIA_MAX,
++					  attrs[TIPC_NLA_MEDIA], NULL, NULL);
+ 	if (err)
+ 		return err;
+ 
+@@ -1082,8 +1087,8 @@ static int tipc_nl_compat_node_dump(struct tipc_nl_compat_msg *msg,
+ 	if (!attrs[TIPC_NLA_NODE])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(node, TIPC_NLA_NODE_MAX, attrs[TIPC_NLA_NODE],
+-			       NULL, NULL);
++	err = nla_parse_nested_deprecated(node, TIPC_NLA_NODE_MAX,
++					  attrs[TIPC_NLA_NODE], NULL, NULL);
+ 	if (err)
+ 		return err;
+ 
+@@ -1129,8 +1134,8 @@ static int tipc_nl_compat_net_dump(struct tipc_nl_compat_msg *msg,
+ 	if (!attrs[TIPC_NLA_NET])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(net, TIPC_NLA_NET_MAX, attrs[TIPC_NLA_NET],
+-			       NULL, NULL);
++	err = nla_parse_nested_deprecated(net, TIPC_NLA_NET_MAX,
++					  attrs[TIPC_NLA_NET], NULL, NULL);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/tipc/node.c b/net/tipc/node.c
+index 548f7a0a9670..2ae4ea54876a 100644
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@ -1926,9 +1926,9 @@ int tipc_nl_peer_rm(struct sk_buff *skb, struct genl_info *info)
+ 	if (!info->attrs[TIPC_NLA_NET])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(attrs, TIPC_NLA_NET_MAX,
+-			       info->attrs[TIPC_NLA_NET], tipc_nl_net_policy,
+-			       info->extack);
++	err = nla_parse_nested_deprecated(attrs, TIPC_NLA_NET_MAX,
++					  info->attrs[TIPC_NLA_NET],
++					  tipc_nl_net_policy, info->extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -2084,9 +2084,9 @@ int tipc_nl_node_set_link(struct sk_buff *skb, struct genl_info *info)
+ 	if (!info->attrs[TIPC_NLA_LINK])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(attrs, TIPC_NLA_LINK_MAX,
+-			       info->attrs[TIPC_NLA_LINK],
+-			       tipc_nl_link_policy, info->extack);
++	err = nla_parse_nested_deprecated(attrs, TIPC_NLA_LINK_MAX,
++					  info->attrs[TIPC_NLA_LINK],
++					  tipc_nl_link_policy, info->extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -2160,9 +2160,9 @@ int tipc_nl_node_get_link(struct sk_buff *skb, struct genl_info *info)
+ 	if (!info->attrs[TIPC_NLA_LINK])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(attrs, TIPC_NLA_LINK_MAX,
+-			       info->attrs[TIPC_NLA_LINK],
+-			       tipc_nl_link_policy, info->extack);
++	err = nla_parse_nested_deprecated(attrs, TIPC_NLA_LINK_MAX,
++					  info->attrs[TIPC_NLA_LINK],
++					  tipc_nl_link_policy, info->extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -2225,9 +2225,9 @@ int tipc_nl_node_reset_link_stats(struct sk_buff *skb, struct genl_info *info)
+ 	if (!info->attrs[TIPC_NLA_LINK])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(attrs, TIPC_NLA_LINK_MAX,
+-			       info->attrs[TIPC_NLA_LINK],
+-			       tipc_nl_link_policy, info->extack);
++	err = nla_parse_nested_deprecated(attrs, TIPC_NLA_LINK_MAX,
++					  info->attrs[TIPC_NLA_LINK],
++					  tipc_nl_link_policy, info->extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -2365,9 +2365,10 @@ int tipc_nl_node_set_monitor(struct sk_buff *skb, struct genl_info *info)
+ 	if (!info->attrs[TIPC_NLA_MON])
+ 		return -EINVAL;
+ 
+-	err = nla_parse_nested(attrs, TIPC_NLA_MON_MAX,
+-			       info->attrs[TIPC_NLA_MON],
+-			       tipc_nl_monitor_policy, info->extack);
++	err = nla_parse_nested_deprecated(attrs, TIPC_NLA_MON_MAX,
++					  info->attrs[TIPC_NLA_MON],
++					  tipc_nl_monitor_policy,
++					  info->extack);
+ 	if (err)
+ 		return err;
+ 
+@@ -2485,9 +2486,10 @@ int tipc_nl_node_dump_monitor_peer(struct sk_buff *skb,
+ 		if (!attrs[TIPC_NLA_MON])
+ 			return -EINVAL;
+ 
+-		err = nla_parse_nested(mon, TIPC_NLA_MON_MAX,
+-				       attrs[TIPC_NLA_MON],
+-				       tipc_nl_monitor_policy, NULL);
++		err = nla_parse_nested_deprecated(mon, TIPC_NLA_MON_MAX,
++						  attrs[TIPC_NLA_MON],
++						  tipc_nl_monitor_policy,
++						  NULL);
+ 		if (err)
+ 			return err;
+ 
+diff --git a/net/tipc/socket.c b/net/tipc/socket.c
+index 57c8f2459016..3cc6cebb9b79 100644
+--- a/net/tipc/socket.c
++++ b/net/tipc/socket.c
+@@ -3598,9 +3598,9 @@ int tipc_nl_publ_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ 		if (!attrs[TIPC_NLA_SOCK])
+ 			return -EINVAL;
+ 
+-		err = nla_parse_nested(sock, TIPC_NLA_SOCK_MAX,
+-				       attrs[TIPC_NLA_SOCK],
+-				       tipc_nl_sock_policy, NULL);
++		err = nla_parse_nested_deprecated(sock, TIPC_NLA_SOCK_MAX,
++						  attrs[TIPC_NLA_SOCK],
++						  tipc_nl_sock_policy, NULL);
+ 		if (err)
+ 			return err;
+ 
+diff --git a/net/tipc/udp_media.c b/net/tipc/udp_media.c
+index fca0dcea0b75..742a39c3e8fd 100644
+--- a/net/tipc/udp_media.c
++++ b/net/tipc/udp_media.c
+@@ -445,9 +445,9 @@ int tipc_udp_nl_dump_remoteip(struct sk_buff *skb, struct netlink_callback *cb)
+ 		if (!attrs[TIPC_NLA_BEARER])
+ 			return -EINVAL;
+ 
+-		err = nla_parse_nested(battrs, TIPC_NLA_BEARER_MAX,
+-				       attrs[TIPC_NLA_BEARER],
+-				       tipc_nl_bearer_policy, NULL);
++		err = nla_parse_nested_deprecated(battrs, TIPC_NLA_BEARER_MAX,
++						  attrs[TIPC_NLA_BEARER],
++						  tipc_nl_bearer_policy, NULL);
+ 		if (err)
+ 			return err;
+ 
+@@ -599,8 +599,7 @@ int tipc_udp_nl_bearer_add(struct tipc_bearer *b, struct nlattr *attr)
+ 	struct nlattr *opts[TIPC_NLA_UDP_MAX + 1];
+ 	struct udp_media_addr *dst;
+ 
+-	if (nla_parse_nested(opts, TIPC_NLA_UDP_MAX, attr,
+-			     tipc_nl_udp_policy, NULL))
++	if (nla_parse_nested_deprecated(opts, TIPC_NLA_UDP_MAX, attr, tipc_nl_udp_policy, NULL))
+ 		return -EINVAL;
+ 
+ 	if (!opts[TIPC_NLA_UDP_REMOTE])
+@@ -653,9 +652,7 @@ static int tipc_udp_enable(struct net *net, struct tipc_bearer *b,
+ 	if (!attrs[TIPC_NLA_BEARER_UDP_OPTS])
+ 		goto err;
+ 
+-	if (nla_parse_nested(opts, TIPC_NLA_UDP_MAX,
+-			     attrs[TIPC_NLA_BEARER_UDP_OPTS],
+-			     tipc_nl_udp_policy, NULL))
++	if (nla_parse_nested_deprecated(opts, TIPC_NLA_UDP_MAX, attrs[TIPC_NLA_BEARER_UDP_OPTS], tipc_nl_udp_policy, NULL))
+ 		goto err;
+ 
+ 	if (!opts[TIPC_NLA_UDP_LOCAL] || !opts[TIPC_NLA_UDP_REMOTE]) {
+diff --git a/net/xfrm/xfrm_user.c b/net/xfrm/xfrm_user.c
+index 6243a701771c..84f0dc1833f4 100644
+--- a/net/xfrm/xfrm_user.c
++++ b/net/xfrm/xfrm_user.c
+@@ -1031,8 +1031,8 @@ static int xfrm_dump_sa(struct sk_buff *skb, struct netlink_callback *cb)
+ 		u8 proto = 0;
+ 		int err;
+ 
+-		err = nlmsg_parse(cb->nlh, 0, attrs, XFRMA_MAX, xfrma_policy,
+-				  cb->extack);
++		err = nlmsg_parse_deprecated(cb->nlh, 0, attrs, XFRMA_MAX,
++					     xfrma_policy, cb->extack);
+ 		if (err < 0)
+ 			return err;
+ 
+@@ -2671,9 +2671,9 @@ static int xfrm_user_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 		}
+ 	}
+ 
+-	err = nlmsg_parse(nlh, xfrm_msg_min[type], attrs,
+-			  link->nla_max ? : XFRMA_MAX,
+-			  link->nla_pol ? : xfrma_policy, extack);
++	err = nlmsg_parse_deprecated(nlh, xfrm_msg_min[type], attrs,
++				     link->nla_max ? : XFRMA_MAX,
++				     link->nla_pol ? : xfrma_policy, extack);
+ 	if (err < 0)
+ 		return err;
+ 
