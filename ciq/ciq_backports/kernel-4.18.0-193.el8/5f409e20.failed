@@ -1,0 +1,703 @@
+x86/fpu: Defer FPU state load until return to userspace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Rik van Riel <riel@surriel.com>
+commit 5f409e20b794565e2d60ad333e79334630a6c798
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/5f409e20.failed
+
+Defer loading of FPU state until return to userspace. This gives
+the kernel the potential to skip loading FPU state for tasks that
+stay in kernel mode, or for tasks that end up with repeated
+invocations of kernel_fpu_begin() & kernel_fpu_end().
+
+The fpregs_lock/unlock() section ensures that the registers remain
+unchanged. Otherwise a context switch or a bottom half could save the
+registers to its FPU context and the processor's FPU registers would
+became random if modified at the same time.
+
+KVM swaps the host/guest registers on entry/exit path. This flow has
+been kept as is. First it ensures that the registers are loaded and then
+saves the current (host) state before it loads the guest's registers. The
+swap is done at the very end with disabled interrupts so it should not
+change anymore before theg guest is entered. The read/save version seems
+to be cheaper compared to memcpy() in a micro benchmark.
+
+Each thread gets TIF_NEED_FPU_LOAD set as part of fork() / fpu__copy().
+For kernel threads, this flag gets never cleared which avoids saving /
+restoring the FPU state for kernel threads and during in-kernel usage of
+the FPU registers.
+
+ [
+   bp: Correct and update commit message and fix checkpatch warnings.
+   s/register/registers/ where it is used in plural.
+   minor comment corrections.
+   remove unused trace_x86_fpu_activate_state() TP.
+ ]
+
+	Signed-off-by: Rik van Riel <riel@surriel.com>
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Aubrey Li <aubrey.li@intel.com>
+	Cc: Babu Moger <Babu.Moger@amd.com>
+	Cc: "Chang S. Bae" <chang.seok.bae@intel.com>
+	Cc: Dmitry Safonov <dima@arista.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+	Cc: Joerg Roedel <jroedel@suse.de>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: kvm ML <kvm@vger.kernel.org>
+	Cc: Nicolai Stange <nstange@suse.de>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: "Radim Krčmář" <rkrcmar@redhat.com>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc: Waiman Long <longman@redhat.com>
+	Cc: x86-ml <x86@kernel.org>
+	Cc: Yi Wang <wang.yi59@zte.com.cn>
+Link: https://lkml.kernel.org/r/20190403164156.19645-24-bigeasy@linutronix.de
+(cherry picked from commit 5f409e20b794565e2d60ad333e79334630a6c798)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/common.c
+#	arch/x86/include/asm/fpu/api.h
+#	arch/x86/include/asm/fpu/internal.h
+#	arch/x86/include/asm/trace/fpu.h
+#	arch/x86/kernel/fpu/core.c
+#	arch/x86/kernel/fpu/signal.c
+#	arch/x86/kernel/process_32.c
+#	arch/x86/kernel/process_64.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/entry/common.c
+index 19f650d729f5,51beb8d29123..000000000000
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@@ -29,9 -30,8 +30,12 @@@
+  #include <asm/desc.h>
+  #include <asm/traps.h>
+  #include <asm/vdso.h>
+- #include <linux/uaccess.h>
+  #include <asm/cpufeature.h>
+++<<<<<<< HEAD
+ +#include <asm/nospec-branch.h>
+++=======
++ #include <asm/fpu/api.h>
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  
+  #define CREATE_TRACE_POINTS
+  #include <trace/events/syscalls.h>
+diff --cc arch/x86/include/asm/fpu/api.h
+index a9caac9d4a72,b774c52e5411..000000000000
+--- a/arch/x86/include/asm/fpu/api.h
++++ b/arch/x86/include/asm/fpu/api.h
+@@@ -10,23 -10,49 +10,60 @@@
+  
+  #ifndef _ASM_X86_FPU_API_H
+  #define _ASM_X86_FPU_API_H
+++<<<<<<< HEAD
+++=======
++ #include <linux/bottom_half.h>
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  
+  /*
+ - * Use kernel_fpu_begin/end() if you intend to use FPU in kernel context. It
+ - * disables preemption so be careful if you intend to use it for long periods
+ - * of time.
+ - * If you intend to use the FPU in softirq you need to check first with
+ - * irq_fpu_usable() if it is possible.
+ + * Careful: __kernel_fpu_begin/end() must be called with preempt disabled
+ + * and they don't touch the preempt state on their own.
+ + * If you enable preemption after __kernel_fpu_begin(), preempt notifier
+ + * should call the __kernel_fpu_end() to prevent the kernel/user FPU
+ + * state from getting corrupted. KVM for example uses this model.
+ + *
+ + * All other cases use kernel_fpu_begin/end() which disable preemption
+ + * during kernel FPU usage.
+   */
+ +extern void __kernel_fpu_begin(void);
+ +extern void __kernel_fpu_end(void);
+  extern void kernel_fpu_begin(void);
+  extern void kernel_fpu_end(void);
+  extern bool irq_fpu_usable(void);
++ extern void fpregs_mark_activate(void);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Use fpregs_lock() while editing CPU's FPU registers or fpu->state.
++  * A context switch will (and softirq might) save CPU's FPU registers to
++  * fpu->state and set TIF_NEED_FPU_LOAD leaving CPU's FPU registers in
++  * a random state.
++  */
++ static inline void fpregs_lock(void)
++ {
++ 	preempt_disable();
++ 	local_bh_disable();
++ }
++ 
++ static inline void fpregs_unlock(void)
++ {
++ 	local_bh_enable();
++ 	preempt_enable();
++ }
++ 
++ #ifdef CONFIG_X86_DEBUG_FPU
++ extern void fpregs_assert_state_consistent(void);
++ #else
++ static inline void fpregs_assert_state_consistent(void) { }
++ #endif
++ 
++ /*
++  * Load the task FPU state before returning to userspace.
++  */
++ extern void switch_fpu_return(void);
++ 
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  /*
+   * Query the presence of one or more xfeatures. Works on any legacy CPU as well.
+   *
+diff --cc arch/x86/include/asm/fpu/internal.h
+index 8265ef2d693b,0c8a5093647a..000000000000
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@@ -513,6 -529,25 +513,28 @@@ static inline void fpregs_activate(stru
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Internal helper, do not use directly. Use switch_fpu_return() instead.
++  */
++ static inline void __fpregs_load_activate(void)
++ {
++ 	struct fpu *fpu = &current->thread.fpu;
++ 	int cpu = smp_processor_id();
++ 
++ 	if (WARN_ON_ONCE(current->mm == NULL))
++ 		return;
++ 
++ 	if (!fpregs_state_valid(fpu, cpu)) {
++ 		copy_kernel_to_fpregs(&fpu->state);
++ 		fpregs_activate(fpu);
++ 		fpu->last_cpu = cpu;
++ 	}
++ 	clear_thread_flag(TIF_NEED_FPU_LOAD);
++ }
++ 
++ /*
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+   * FPU state switching for scheduling.
+   *
+   * This is a two-stage process:
+@@@ -520,8 -555,19 +542,24 @@@
+   *  - switch_fpu_prepare() saves the old state.
+   *    This is done within the context of the old process.
+   *
+++<<<<<<< HEAD
+ + *  - switch_fpu_finish() restores the new state as
+ + *    necessary.
+++=======
++  *  - switch_fpu_finish() sets TIF_NEED_FPU_LOAD; the floating point state
++  *    will get loaded on return to userspace, or when the kernel needs it.
++  *
++  * If TIF_NEED_FPU_LOAD is cleared then the CPU's FPU registers
++  * are saved in the current thread's FPU register state.
++  *
++  * If TIF_NEED_FPU_LOAD is set then CPU's FPU registers may not
++  * hold current()'s FPU registers. It is required to load the
++  * registers before returning to userland or using the content
++  * otherwise.
++  *
++  * The FPU context is only stored/restored for a user task and
++  * ->mm is used to distinguish between kernel and user threads.
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+   */
+  static inline void
+  switch_fpu_prepare(struct fpu *old_fpu, int cpu)
+@@@ -543,19 -588,32 +581,38 @@@
+   */
+  
+  /*
+-  * Set up the userspace FPU context for the new task, if the task
+-  * has used the FPU.
++  * Load PKRU from the FPU context if available. Delay loading of the
++  * complete FPU state until the return to userland.
+   */
+- static inline void switch_fpu_finish(struct fpu *new_fpu, int cpu)
++ static inline void switch_fpu_finish(struct fpu *new_fpu)
+  {
+ -	u32 pkru_val = init_pkru_value;
+ -	struct pkru_state *pk;
+ +	bool preload = static_cpu_has(X86_FEATURE_FPU) &&
+ +		       new_fpu->initialized;
+  
+++<<<<<<< HEAD
+ +	if (preload) {
+ +		if (!fpregs_state_valid(new_fpu, cpu))
+ +			copy_kernel_to_fpregs(&new_fpu->state);
+ +		fpregs_activate(new_fpu);
+++=======
++ 	if (!static_cpu_has(X86_FEATURE_FPU))
++ 		return;
++ 
++ 	set_thread_flag(TIF_NEED_FPU_LOAD);
++ 
++ 	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
++ 		return;
++ 
++ 	/*
++ 	 * PKRU state is switched eagerly because it needs to be valid before we
++ 	 * return to userland e.g. for a copy_to_user() operation.
++ 	 */
++ 	if (current->mm) {
++ 		pk = get_xsave_addr(&new_fpu->state.xsave, XFEATURE_PKRU);
++ 		if (pk)
++ 			pkru_val = pk->pkru;
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  	}
+ -	__write_pkru(pkru_val);
+  }
+  
+  /*
+diff --cc arch/x86/include/asm/trace/fpu.h
+index 069c04be1507,879b77792f94..000000000000
+--- a/arch/x86/include/asm/trace/fpu.h
++++ b/arch/x86/include/asm/trace/fpu.h
+@@@ -13,22 -13,22 +13,36 @@@ DECLARE_EVENT_CLASS(x86_fpu
+  
+  	TP_STRUCT__entry(
+  		__field(struct fpu *, fpu)
+++<<<<<<< HEAD
+ +		__field(bool, initialized)
+++=======
++ 		__field(bool, load_fpu)
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  		__field(u64, xfeatures)
+  		__field(u64, xcomp_bv)
+  		),
+  
+  	TP_fast_assign(
+  		__entry->fpu		= fpu;
+++<<<<<<< HEAD
+ +		__entry->initialized	= fpu->initialized;
+++=======
++ 		__entry->load_fpu	= test_thread_flag(TIF_NEED_FPU_LOAD);
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  		if (boot_cpu_has(X86_FEATURE_OSXSAVE)) {
+  			__entry->xfeatures = fpu->state.xsave.header.xfeatures;
+  			__entry->xcomp_bv  = fpu->state.xsave.header.xcomp_bv;
+  		}
+  	),
+++<<<<<<< HEAD
+ +	TP_printk("x86/fpu: %p initialized: %d xfeatures: %llx xcomp_bv: %llx",
+ +			__entry->fpu,
+ +			__entry->initialized,
+++=======
++ 	TP_printk("x86/fpu: %p load: %d xfeatures: %llx xcomp_bv: %llx",
++ 			__entry->fpu,
++ 			__entry->load_fpu,
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  			__entry->xfeatures,
+  			__entry->xcomp_bv
+  	)
+diff --cc arch/x86/kernel/fpu/core.c
+index eb3de7cdd906,ce243f76bdb7..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -101,28 -101,23 +101,44 @@@ void __kernel_fpu_begin(void
+  
+  	kernel_fpu_disable();
+  
+++<<<<<<< HEAD
+ +	if (fpu->initialized) {
+ +		/*
+ +		 * Ignore return value -- we don't care if reg state
+ +		 * is clobbered.
+ +		 */
+ +		copy_fpregs_to_fpstate(fpu);
+ +	} else {
+ +		__cpu_invalidate_fpregs_state();
+++=======
++ 	if (current->mm) {
++ 		if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
++ 			set_thread_flag(TIF_NEED_FPU_LOAD);
++ 			/*
++ 			 * Ignore return value -- we don't care if reg state
++ 			 * is clobbered.
++ 			 */
++ 			copy_fpregs_to_fpstate(fpu);
++ 		}
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  	}
++ 	__cpu_invalidate_fpregs_state();
+  }
+ +EXPORT_SYMBOL(__kernel_fpu_begin);
+  
+ -static void __kernel_fpu_end(void)
+ +void __kernel_fpu_end(void)
+  {
+++<<<<<<< HEAD
+ +	struct fpu *fpu = &current->thread.fpu;
+ +
+ +	if (fpu->initialized)
+ +		copy_kernel_to_fpregs(&fpu->state);
+ +
+++=======
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  	kernel_fpu_enable();
+  }
+ +EXPORT_SYMBOL(__kernel_fpu_end);
+  
+  void kernel_fpu_begin(void)
+  {
+@@@ -147,15 -142,17 +163,24 @@@ void fpu__save(struct fpu *fpu
+  {
+  	WARN_ON_FPU(fpu != &current->thread.fpu);
+  
+- 	preempt_disable();
++ 	fpregs_lock();
+  	trace_x86_fpu_before_save(fpu);
+++<<<<<<< HEAD
+ +	if (fpu->initialized) {
+++=======
++ 
++ 	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  		if (!copy_fpregs_to_fpstate(fpu)) {
+  			copy_kernel_to_fpregs(&fpu->state);
+  		}
+  	}
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  	trace_x86_fpu_after_save(fpu);
+- 	preempt_enable();
++ 	fpregs_unlock();
+  }
+  EXPORT_SYMBOL_GPL(fpu__save);
+  
+@@@ -188,11 -185,14 +213,14 @@@ void fpstate_init(union fpregs_state *s
+  }
+  EXPORT_SYMBOL_GPL(fpstate_init);
+  
+- int fpu__copy(struct fpu *dst_fpu, struct fpu *src_fpu)
++ int fpu__copy(struct task_struct *dst, struct task_struct *src)
+  {
++ 	struct fpu *dst_fpu = &dst->thread.fpu;
++ 	struct fpu *src_fpu = &src->thread.fpu;
++ 
+  	dst_fpu->last_cpu = -1;
+  
+ -	if (!static_cpu_has(X86_FEATURE_FPU))
+ +	if (!src_fpu->initialized || !static_cpu_has(X86_FEATURE_FPU))
+  		return 0;
+  
+  	WARN_ON_FPU(src_fpu != &current->thread.fpu);
+@@@ -229,14 -236,9 +264,20 @@@ static void fpu__initialize(struct fpu 
+  {
+  	WARN_ON_FPU(fpu != &current->thread.fpu);
+  
+++<<<<<<< HEAD
+ +	if (!fpu->initialized) {
+ +		fpstate_init(&fpu->state);
+ +		trace_x86_fpu_init_state(fpu);
+ +
+ +		trace_x86_fpu_activate_state(fpu);
+ +		/* Safe to do for the current task: */
+ +		fpu->initialized = 1;
+ +	}
+++=======
++ 	set_thread_flag(TIF_NEED_FPU_LOAD);
++ 	fpstate_init(&fpu->state);
++ 	trace_x86_fpu_init_state(fpu);
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  }
+  
+  /*
+diff --cc arch/x86/kernel/fpu/signal.c
+index ef1568522109,6df1f15e0cd5..000000000000
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@@ -265,9 -266,12 +265,16 @@@ static int __fpu__restore_sig(void __us
+  	int ia32_fxstate = (buf != buf_fx);
+  	struct task_struct *tsk = current;
+  	struct fpu *fpu = &tsk->thread.fpu;
+++<<<<<<< HEAD
+ +	int state_size = fpu_kernel_xstate_size;
+ +	u64 xfeatures = 0;
+ +	int fx_only = 0;
+++=======
++ 	struct user_i387_ia32_struct env;
++ 	u64 xfeatures = 0;
++ 	int fx_only = 0;
++ 	int ret = 0;
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  
+  	ia32_fxstate &= (IS_ENABLED(CONFIG_X86_32) ||
+  			 IS_ENABLED(CONFIG_IA32_EMULATION));
+@@@ -304,78 -306,82 +311,150 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * The current state of the FPU registers does not matter. By setting
++ 	 * TIF_NEED_FPU_LOAD unconditionally it is ensured that the our xstate
++ 	 * is not modified on context switch and that the xstate is considered
++ 	 * to be loaded again on return to userland (overriding last_cpu avoids
++ 	 * the optimisation).
++ 	 */
++ 	set_thread_flag(TIF_NEED_FPU_LOAD);
++ 	__fpu_invalidate_fpregs_state(fpu);
++ 
++ 	if ((unsigned long)buf_fx % 64)
++ 		fx_only = 1;
++ 	/*
++ 	 * For 32-bit frames with fxstate, copy the fxstate so it can be
++ 	 * reconstructed later.
++ 	 */
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  	if (ia32_fxstate) {
+ -		ret = __copy_from_user(&env, buf, sizeof(env));
+ -		if (ret)
+ -			goto err_out;
+ -		envp = &env;
+ -	}
+ +		/*
+ +		 * For 32-bit frames with fxstate, copy the user state to the
+ +		 * thread's fpu state, reconstruct fxstate from the fsave
+ +		 * header. Validate and sanitize the copied state.
+ +		 */
+ +		struct user_i387_ia32_struct env;
+ +		int err = 0;
+  
+ -	if (use_xsave() && !fx_only) {
+ -		u64 init_bv = xfeatures_mask & ~xfeatures;
+ +		/*
+ +		 * Drop the current fpu which clears fpu->initialized. This ensures
+ +		 * that any context-switch during the copy of the new state,
+ +		 * avoids the intermediate state from getting restored/saved.
+ +		 * Thus avoiding the new restored state from getting corrupted.
+ +		 * We will be ready to restore/save the state only after
+ +		 * fpu->initialized is again set.
+ +		 */
+ +		fpu__drop(fpu);
+  
+  		if (using_compacted_format()) {
+++<<<<<<< HEAD
+ +			err = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
+ +		} else {
+ +			err = __copy_from_user(&fpu->state.xsave, buf_fx, state_size);
+ +
+ +			if (!err && state_size > offsetof(struct xregs_state, header))
+ +				err = validate_xstate_header(&fpu->state.xsave.header);
+ +		}
+ +
+ +		if (err || __copy_from_user(&env, buf, sizeof(env))) {
+ +			fpstate_init(&fpu->state);
+ +			trace_x86_fpu_init_state(fpu);
+ +			err = -1;
+ +		} else {
+ +			sanitize_restored_xstate(tsk, &env, xfeatures, fx_only);
+ +		}
+ +
+ +		fpu->initialized = 1;
+ +		preempt_disable();
+ +		fpu__restore(fpu);
+ +		preempt_enable();
+ +
+ +		return err;
+ +	} else {
+ +		int ret;
+ +
+ +		/*
+ +		 * For 64-bit frames and 32-bit fsave frames, restore the user
+ +		 * state to the registers directly (with exceptions handled).
+ +		 */
+ +		if (use_xsave()) {
+ +			if ((unsigned long)buf_fx % 64 || fx_only) {
+ +				u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
+ +				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ +				ret = copy_user_to_fxregs(buf_fx);
+ +			} else {
+ +				u64 init_bv = xfeatures_mask & ~xfeatures;
+ +				if (unlikely(init_bv))
+ +					copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ +				ret = copy_user_to_xregs(buf_fx, xfeatures);
+ +			}
+ +		} else if (use_fxsr()) {
+ +			ret = copy_user_to_fxregs(buf_fx);
+ +		} else
+ +			ret = copy_user_to_fregs(buf_fx);
+ +
+ +		if (ret) {
+ +			fpu__clear(fpu);
+ +			return -1;
+ +		}
+++=======
++ 			ret = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
++ 		} else {
++ 			ret = __copy_from_user(&fpu->state.xsave, buf_fx, state_size);
++ 
++ 			if (!ret && state_size > offsetof(struct xregs_state, header))
++ 				ret = validate_xstate_header(&fpu->state.xsave.header);
++ 		}
++ 		if (ret)
++ 			goto err_out;
++ 
++ 		sanitize_restored_xstate(&fpu->state, envp, xfeatures, fx_only);
++ 
++ 		fpregs_lock();
++ 		if (unlikely(init_bv))
++ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
++ 		ret = copy_kernel_to_xregs_err(&fpu->state.xsave, xfeatures);
++ 
++ 	} else if (use_fxsr()) {
++ 		ret = __copy_from_user(&fpu->state.fxsave, buf_fx, state_size);
++ 		if (ret) {
++ 			ret = -EFAULT;
++ 			goto err_out;
++ 		}
++ 
++ 		sanitize_restored_xstate(&fpu->state, envp, xfeatures, fx_only);
++ 
++ 		fpregs_lock();
++ 		if (use_xsave()) {
++ 			u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
++ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
++ 		}
++ 
++ 		ret = copy_kernel_to_fxregs_err(&fpu->state.fxsave);
++ 	} else {
++ 		ret = __copy_from_user(&fpu->state.fsave, buf_fx, state_size);
++ 		if (ret)
++ 			goto err_out;
++ 
++ 		fpregs_lock();
++ 		ret = copy_kernel_to_fregs_err(&fpu->state.fsave);
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  	}
++ 	if (!ret)
++ 		fpregs_mark_activate();
++ 	fpregs_unlock();
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ err_out:
++ 	if (ret)
++ 		fpu__clear(fpu);
++ 	return ret;
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  }
+  
+  static inline int xstate_sigframe_size(void)
+diff --cc arch/x86/kernel/process_32.c
+index e4842e011b4e,1bc47f3a4885..000000000000
+--- a/arch/x86/kernel/process_32.c
++++ b/arch/x86/kernel/process_32.c
+@@@ -298,9 -289,9 +299,15 @@@ __switch_to(struct task_struct *prev_p
+  	if (prev->gs | next->gs)
+  		lazy_load_gs(next->gs);
+  
+++<<<<<<< HEAD
+ +	switch_fpu_finish(next_fpu, cpu);
+++=======
++ 	this_cpu_write(current_task, next_p);
++ 
++ 	switch_fpu_finish(next_fpu);
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+ +
+ +	this_cpu_write(current_task, next_p);
+  
+  	/* Load the Intel cache allocation PQR MSR. */
+  	resctrl_sched_in();
+diff --cc arch/x86/kernel/process_64.c
+index bdcae69a8d8f,37b2ecef041e..000000000000
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@@ -490,8 -573,10 +491,13 @@@ __switch_to(struct task_struct *prev_p
+  	this_cpu_write(current_task, next_p);
+  	this_cpu_write(cpu_current_top_of_stack, task_top_of_stack(next_p));
+  
+++<<<<<<< HEAD
+++=======
++ 	switch_fpu_finish(next_fpu);
++ 
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  	/* Reload sp0. */
+ -	update_task_stack(next_p);
+ +	update_sp0(next_p);
+  
+  	switch_to_extra(prev_p, next_p);
+  
+diff --cc arch/x86/kvm/x86.c
+index e45a5f0a3c94,e340c3c0cba3..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -8154,8 -8141,9 +8158,14 @@@ static int complete_emulated_mmio(struc
+  /* Swap (qemu) user FPU context for the guest FPU context. */
+  static void kvm_load_guest_fpu(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	preempt_disable();
+ +	copy_fpregs_to_fpstate(vcpu->arch.user_fpu);
+++=======
++ 	fpregs_lock();
++ 
++ 	copy_fpregs_to_fpstate(&current->thread.fpu);
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  	/* PKRU is separately restored in kvm_x86_ops->run.  */
+  	__copy_kernel_to_fpregs(&vcpu->arch.guest_fpu->state,
+  				~XFEATURE_MASK_PKRU);
+@@@ -8166,10 -8157,13 +8179,18 @@@
+  /* When vcpu_run ends, restore user space FPU context. */
+  static void kvm_put_guest_fpu(struct kvm_vcpu *vcpu)
+  {
+- 	preempt_disable();
++ 	fpregs_lock();
++ 
+  	copy_fpregs_to_fpstate(vcpu->arch.guest_fpu);
+++<<<<<<< HEAD
+ +	copy_kernel_to_fpregs(&vcpu->arch.user_fpu->state);
+ +	preempt_enable();
+++=======
++ 	copy_kernel_to_fpregs(&current->thread.fpu.state);
++ 
++ 	fpregs_mark_activate();
++ 	fpregs_unlock();
+++>>>>>>> 5f409e20b794 (x86/fpu: Defer FPU state load until return to userspace)
+  
+  	++vcpu->stat.fpu_reload;
+  	trace_kvm_fpu(0);
+* Unmerged path arch/x86/entry/common.c
+* Unmerged path arch/x86/include/asm/fpu/api.h
+* Unmerged path arch/x86/include/asm/fpu/internal.h
+* Unmerged path arch/x86/include/asm/trace/fpu.h
+* Unmerged path arch/x86/kernel/fpu/core.c
+* Unmerged path arch/x86/kernel/fpu/signal.c
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index 38a7e32832c1..cbbf411b4ae0 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -104,7 +104,7 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
+ 	dst->thread.vm86 = NULL;
+ #endif
+ 
+-	return fpu__copy(&dst->thread.fpu, &src->thread.fpu);
++	return fpu__copy(dst, src);
+ }
+ 
+ /*
+* Unmerged path arch/x86/kernel/process_32.c
+* Unmerged path arch/x86/kernel/process_64.c
+* Unmerged path arch/x86/kvm/x86.c
