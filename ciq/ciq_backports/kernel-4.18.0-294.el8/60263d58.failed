@@ -1,0 +1,478 @@
+iomap: fall back to buffered writes for invalidation failures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 60263d5889e6dc5987dc51b801be4955ff2e4aa7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/60263d58.failed
+
+Failing to invalid the page cache means data in incoherent, which is
+a very bad state for the system.  Always fall back to buffered I/O
+through the page cache if we can't invalidate mappings.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Goldwyn Rodrigues <rgoldwyn@suse.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Acked-by: Bob Peterson <rpeterso@redhat.com>
+	Acked-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Reviewed-by: Theodore Ts'o <tytso@mit.edu> # for ext4
+	Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com> # for gfs2
+	Reviewed-by: Ritesh Harjani <riteshh@linux.ibm.com>
+(cherry picked from commit 60263d5889e6dc5987dc51b801be4955ff2e4aa7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/file.c
+#	fs/zonefs/super.c
+diff --cc fs/ext4/file.c
+index eb7375e38241,129cc1dd6b79..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -184,6 -237,354 +184,356 @@@ static ssize_t ext4_write_checks(struc
+  	return iov_iter_count(from);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t ext4_write_checks(struct kiocb *iocb, struct iov_iter *from)
++ {
++ 	ssize_t ret, count;
++ 
++ 	count = ext4_generic_write_checks(iocb, from);
++ 	if (count <= 0)
++ 		return count;
++ 
++ 	ret = file_modified(iocb->ki_filp);
++ 	if (ret)
++ 		return ret;
++ 	return count;
++ }
++ 
++ static ssize_t ext4_buffered_write_iter(struct kiocb *iocb,
++ 					struct iov_iter *from)
++ {
++ 	ssize_t ret;
++ 	struct inode *inode = file_inode(iocb->ki_filp);
++ 
++ 	if (iocb->ki_flags & IOCB_NOWAIT)
++ 		return -EOPNOTSUPP;
++ 
++ 	inode_lock(inode);
++ 	ret = ext4_write_checks(iocb, from);
++ 	if (ret <= 0)
++ 		goto out;
++ 
++ 	current->backing_dev_info = inode_to_bdi(inode);
++ 	ret = generic_perform_write(iocb->ki_filp, from, iocb->ki_pos);
++ 	current->backing_dev_info = NULL;
++ 
++ out:
++ 	inode_unlock(inode);
++ 	if (likely(ret > 0)) {
++ 		iocb->ki_pos += ret;
++ 		ret = generic_write_sync(iocb, ret);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static ssize_t ext4_handle_inode_extension(struct inode *inode, loff_t offset,
++ 					   ssize_t written, size_t count)
++ {
++ 	handle_t *handle;
++ 	bool truncate = false;
++ 	u8 blkbits = inode->i_blkbits;
++ 	ext4_lblk_t written_blk, end_blk;
++ 	int ret;
++ 
++ 	/*
++ 	 * Note that EXT4_I(inode)->i_disksize can get extended up to
++ 	 * inode->i_size while the I/O was running due to writeback of delalloc
++ 	 * blocks. But, the code in ext4_iomap_alloc() is careful to use
++ 	 * zeroed/unwritten extents if this is possible; thus we won't leave
++ 	 * uninitialized blocks in a file even if we didn't succeed in writing
++ 	 * as much as we intended.
++ 	 */
++ 	WARN_ON_ONCE(i_size_read(inode) < EXT4_I(inode)->i_disksize);
++ 	if (offset + count <= EXT4_I(inode)->i_disksize) {
++ 		/*
++ 		 * We need to ensure that the inode is removed from the orphan
++ 		 * list if it has been added prematurely, due to writeback of
++ 		 * delalloc blocks.
++ 		 */
++ 		if (!list_empty(&EXT4_I(inode)->i_orphan) && inode->i_nlink) {
++ 			handle = ext4_journal_start(inode, EXT4_HT_INODE, 2);
++ 
++ 			if (IS_ERR(handle)) {
++ 				ext4_orphan_del(NULL, inode);
++ 				return PTR_ERR(handle);
++ 			}
++ 
++ 			ext4_orphan_del(handle, inode);
++ 			ext4_journal_stop(handle);
++ 		}
++ 
++ 		return written;
++ 	}
++ 
++ 	if (written < 0)
++ 		goto truncate;
++ 
++ 	handle = ext4_journal_start(inode, EXT4_HT_INODE, 2);
++ 	if (IS_ERR(handle)) {
++ 		written = PTR_ERR(handle);
++ 		goto truncate;
++ 	}
++ 
++ 	if (ext4_update_inode_size(inode, offset + written)) {
++ 		ret = ext4_mark_inode_dirty(handle, inode);
++ 		if (unlikely(ret)) {
++ 			written = ret;
++ 			ext4_journal_stop(handle);
++ 			goto truncate;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * We may need to truncate allocated but not written blocks beyond EOF.
++ 	 */
++ 	written_blk = ALIGN(offset + written, 1 << blkbits);
++ 	end_blk = ALIGN(offset + count, 1 << blkbits);
++ 	if (written_blk < end_blk && ext4_can_truncate(inode))
++ 		truncate = true;
++ 
++ 	/*
++ 	 * Remove the inode from the orphan list if it has been extended and
++ 	 * everything went OK.
++ 	 */
++ 	if (!truncate && inode->i_nlink)
++ 		ext4_orphan_del(handle, inode);
++ 	ext4_journal_stop(handle);
++ 
++ 	if (truncate) {
++ truncate:
++ 		ext4_truncate_failed_write(inode);
++ 		/*
++ 		 * If the truncate operation failed early, then the inode may
++ 		 * still be on the orphan list. In that case, we need to try
++ 		 * remove the inode from the in-memory linked list.
++ 		 */
++ 		if (inode->i_nlink)
++ 			ext4_orphan_del(NULL, inode);
++ 	}
++ 
++ 	return written;
++ }
++ 
++ static int ext4_dio_write_end_io(struct kiocb *iocb, ssize_t size,
++ 				 int error, unsigned int flags)
++ {
++ 	loff_t offset = iocb->ki_pos;
++ 	struct inode *inode = file_inode(iocb->ki_filp);
++ 
++ 	if (error)
++ 		return error;
++ 
++ 	if (size && flags & IOMAP_DIO_UNWRITTEN)
++ 		return ext4_convert_unwritten_extents(NULL, inode,
++ 						      offset, size);
++ 
++ 	return 0;
++ }
++ 
++ static const struct iomap_dio_ops ext4_dio_write_ops = {
++ 	.end_io = ext4_dio_write_end_io,
++ };
++ 
++ /*
++  * The intention here is to start with shared lock acquired then see if any
++  * condition requires an exclusive inode lock. If yes, then we restart the
++  * whole operation by releasing the shared lock and acquiring exclusive lock.
++  *
++  * - For unaligned_io we never take shared lock as it may cause data corruption
++  *   when two unaligned IO tries to modify the same block e.g. while zeroing.
++  *
++  * - For extending writes case we don't take the shared lock, since it requires
++  *   updating inode i_disksize and/or orphan handling with exclusive lock.
++  *
++  * - shared locking will only be true mostly with overwrites. Otherwise we will
++  *   switch to exclusive i_rwsem lock.
++  */
++ static ssize_t ext4_dio_write_checks(struct kiocb *iocb, struct iov_iter *from,
++ 				     bool *ilock_shared, bool *extend)
++ {
++ 	struct file *file = iocb->ki_filp;
++ 	struct inode *inode = file_inode(file);
++ 	loff_t offset;
++ 	size_t count;
++ 	ssize_t ret;
++ 
++ restart:
++ 	ret = ext4_generic_write_checks(iocb, from);
++ 	if (ret <= 0)
++ 		goto out;
++ 
++ 	offset = iocb->ki_pos;
++ 	count = ret;
++ 	if (ext4_extending_io(inode, offset, count))
++ 		*extend = true;
++ 	/*
++ 	 * Determine whether the IO operation will overwrite allocated
++ 	 * and initialized blocks.
++ 	 * We need exclusive i_rwsem for changing security info
++ 	 * in file_modified().
++ 	 */
++ 	if (*ilock_shared && (!IS_NOSEC(inode) || *extend ||
++ 	     !ext4_overwrite_io(inode, offset, count))) {
++ 		inode_unlock_shared(inode);
++ 		*ilock_shared = false;
++ 		inode_lock(inode);
++ 		goto restart;
++ 	}
++ 
++ 	ret = file_modified(file);
++ 	if (ret < 0)
++ 		goto out;
++ 
++ 	return count;
++ out:
++ 	if (*ilock_shared)
++ 		inode_unlock_shared(inode);
++ 	else
++ 		inode_unlock(inode);
++ 	return ret;
++ }
++ 
++ static ssize_t ext4_dio_write_iter(struct kiocb *iocb, struct iov_iter *from)
++ {
++ 	ssize_t ret;
++ 	handle_t *handle;
++ 	struct inode *inode = file_inode(iocb->ki_filp);
++ 	loff_t offset = iocb->ki_pos;
++ 	size_t count = iov_iter_count(from);
++ 	const struct iomap_ops *iomap_ops = &ext4_iomap_ops;
++ 	bool extend = false, unaligned_io = false;
++ 	bool ilock_shared = true;
++ 
++ 	/*
++ 	 * We initially start with shared inode lock unless it is
++ 	 * unaligned IO which needs exclusive lock anyways.
++ 	 */
++ 	if (ext4_unaligned_io(inode, from, offset)) {
++ 		unaligned_io = true;
++ 		ilock_shared = false;
++ 	}
++ 	/*
++ 	 * Quick check here without any i_rwsem lock to see if it is extending
++ 	 * IO. A more reliable check is done in ext4_dio_write_checks() with
++ 	 * proper locking in place.
++ 	 */
++ 	if (offset + count > i_size_read(inode))
++ 		ilock_shared = false;
++ 
++ 	if (iocb->ki_flags & IOCB_NOWAIT) {
++ 		if (ilock_shared) {
++ 			if (!inode_trylock_shared(inode))
++ 				return -EAGAIN;
++ 		} else {
++ 			if (!inode_trylock(inode))
++ 				return -EAGAIN;
++ 		}
++ 	} else {
++ 		if (ilock_shared)
++ 			inode_lock_shared(inode);
++ 		else
++ 			inode_lock(inode);
++ 	}
++ 
++ 	/* Fallback to buffered I/O if the inode does not support direct I/O. */
++ 	if (!ext4_dio_supported(inode)) {
++ 		if (ilock_shared)
++ 			inode_unlock_shared(inode);
++ 		else
++ 			inode_unlock(inode);
++ 		return ext4_buffered_write_iter(iocb, from);
++ 	}
++ 
++ 	ret = ext4_dio_write_checks(iocb, from, &ilock_shared, &extend);
++ 	if (ret <= 0)
++ 		return ret;
++ 
++ 	/* if we're going to block and IOCB_NOWAIT is set, return -EAGAIN */
++ 	if ((iocb->ki_flags & IOCB_NOWAIT) && (unaligned_io || extend)) {
++ 		ret = -EAGAIN;
++ 		goto out;
++ 	}
++ 
++ 	offset = iocb->ki_pos;
++ 	count = ret;
++ 
++ 	/*
++ 	 * Unaligned direct IO must be serialized among each other as zeroing
++ 	 * of partial blocks of two competing unaligned IOs can result in data
++ 	 * corruption.
++ 	 *
++ 	 * So we make sure we don't allow any unaligned IO in flight.
++ 	 * For IOs where we need not wait (like unaligned non-AIO DIO),
++ 	 * below inode_dio_wait() may anyway become a no-op, since we start
++ 	 * with exclusive lock.
++ 	 */
++ 	if (unaligned_io)
++ 		inode_dio_wait(inode);
++ 
++ 	if (extend) {
++ 		handle = ext4_journal_start(inode, EXT4_HT_INODE, 2);
++ 		if (IS_ERR(handle)) {
++ 			ret = PTR_ERR(handle);
++ 			goto out;
++ 		}
++ 
++ 		ret = ext4_orphan_add(handle, inode);
++ 		if (ret) {
++ 			ext4_journal_stop(handle);
++ 			goto out;
++ 		}
++ 
++ 		ext4_journal_stop(handle);
++ 	}
++ 
++ 	if (ilock_shared)
++ 		iomap_ops = &ext4_iomap_overwrite_ops;
++ 	ret = iomap_dio_rw(iocb, from, iomap_ops, &ext4_dio_write_ops,
++ 			   is_sync_kiocb(iocb) || unaligned_io || extend);
++ 	if (ret == -ENOTBLK)
++ 		ret = 0;
++ 
++ 	if (extend)
++ 		ret = ext4_handle_inode_extension(inode, offset, ret, count);
++ 
++ out:
++ 	if (ilock_shared)
++ 		inode_unlock_shared(inode);
++ 	else
++ 		inode_unlock(inode);
++ 
++ 	if (ret >= 0 && iov_iter_count(from)) {
++ 		ssize_t err;
++ 		loff_t endbyte;
++ 
++ 		offset = iocb->ki_pos;
++ 		err = ext4_buffered_write_iter(iocb, from);
++ 		if (err < 0)
++ 			return err;
++ 
++ 		/*
++ 		 * We need to ensure that the pages within the page cache for
++ 		 * the range covered by this I/O are written to disk and
++ 		 * invalidated. This is in attempt to preserve the expected
++ 		 * direct I/O semantics in the case we fallback to buffered I/O
++ 		 * to complete off the I/O request.
++ 		 */
++ 		ret += err;
++ 		endbyte = offset + err - 1;
++ 		err = filemap_write_and_wait_range(iocb->ki_filp->f_mapping,
++ 						   offset, endbyte);
++ 		if (!err)
++ 			invalidate_mapping_pages(iocb->ki_filp->f_mapping,
++ 						 offset >> PAGE_SHIFT,
++ 						 endbyte >> PAGE_SHIFT);
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 60263d5889e6 (iomap: fall back to buffered writes for invalidation failures)
+  #ifdef CONFIG_FS_DAX
+  static ssize_t
+  ext4_dax_write_iter(struct kiocb *iocb, struct iov_iter *from)
+* Unmerged path fs/zonefs/super.c
+* Unmerged path fs/ext4/file.c
+diff --git a/fs/gfs2/file.c b/fs/gfs2/file.c
+index 31149ac3715f..3c6fb512e8e4 100644
+--- a/fs/gfs2/file.c
++++ b/fs/gfs2/file.c
+@@ -749,7 +749,8 @@ static ssize_t gfs2_file_direct_write(struct kiocb *iocb, struct iov_iter *from)
+ 
+ 	ret = iomap_dio_rw(iocb, from, &gfs2_iomap_ops, NULL,
+ 			   is_sync_kiocb(iocb));
+-
++	if (ret == -ENOTBLK)
++		ret = 0;
+ out:
+ 	gfs2_glock_dq(&gh);
+ out_uninit:
+diff --git a/fs/iomap/direct-io.c b/fs/iomap/direct-io.c
+index 7317f429c7d0..fa8ec4e25f8e 100644
+--- a/fs/iomap/direct-io.c
++++ b/fs/iomap/direct-io.c
+@@ -10,6 +10,7 @@
+ #include <linux/backing-dev.h>
+ #include <linux/uio.h>
+ #include <linux/task_io_accounting_ops.h>
++#include "trace.h"
+ 
+ #include "../internal.h"
+ 
+@@ -402,6 +403,9 @@ iomap_dio_actor(struct inode *inode, loff_t pos, loff_t length,
+  * can be mapped into multiple disjoint IOs and only a subset of the IOs issued
+  * may be pure data writes. In that case, we still need to do a full data sync
+  * completion.
++ *
++ * Returns -ENOTBLK In case of a page invalidation invalidation failure for
++ * writes.  The callers needs to fall back to buffered I/O in this case.
+  */
+ ssize_t
+ iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
+@@ -479,13 +483,15 @@ iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
+ 	if (iov_iter_rw(iter) == WRITE) {
+ 		/*
+ 		 * Try to invalidate cache pages for the range we are writing.
+-		 * If this invalidation fails, tough, the write will still work,
+-		 * but racing two incompatible write paths is a pretty crazy
+-		 * thing to do, so we don't support it 100%.
++		 * If this invalidation fails, let the caller fall back to
++		 * buffered I/O.
+ 		 */
+ 		if (invalidate_inode_pages2_range(mapping, pos >> PAGE_SHIFT,
+-				end >> PAGE_SHIFT))
+-			dio_warn_stale_pagecache(iocb->ki_filp);
++				end >> PAGE_SHIFT)) {
++			trace_iomap_dio_invalidate_fail(inode, pos, count);
++			ret = -ENOTBLK;
++			goto out_free_dio;
++		}
+ 
+ 		if (!wait_for_completion && !inode->i_sb->s_dio_done_wq) {
+ 			ret = sb_init_dio_done_wq(inode->i_sb);
+diff --git a/fs/iomap/trace.h b/fs/iomap/trace.h
+index 4df19c66f597..e49bd8767fa5 100644
+--- a/fs/iomap/trace.h
++++ b/fs/iomap/trace.h
+@@ -74,6 +74,7 @@ DEFINE_EVENT(iomap_range_class, name,	\
+ DEFINE_RANGE_EVENT(iomap_writepage);
+ DEFINE_RANGE_EVENT(iomap_releasepage);
+ DEFINE_RANGE_EVENT(iomap_invalidatepage);
++DEFINE_RANGE_EVENT(iomap_dio_invalidate_fail);
+ 
+ #define IOMAP_TYPE_STRINGS \
+ 	{ IOMAP_HOLE,		"HOLE" }, \
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 1658090aee19..6c95a4a155e2 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -552,8 +552,8 @@ xfs_file_dio_aio_write(
+ 	xfs_iunlock(ip, iolock);
+ 
+ 	/*
+-	 * No fallback to buffered IO on errors for XFS, direct IO will either
+-	 * complete fully or fail.
++	 * No fallback to buffered IO after short writes for XFS, direct I/O
++	 * will either complete fully or return an error.
+ 	 */
+ 	ASSERT(ret < 0 || ret == count);
+ 	return ret;
+* Unmerged path fs/zonefs/super.c
