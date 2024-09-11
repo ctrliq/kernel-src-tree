@@ -194,3 +194,12 @@ void mptcp_token_destroy(u32 token)
 	radix_tree_delete(&token_tree, token);
 	spin_unlock_bh(&token_tree_lock);
 }
+
+#if IS_MODULE(CONFIG_MPTCP_KUNIT_TESTS)
+EXPORT_SYMBOL_GPL(mptcp_token_new_request);
+EXPORT_SYMBOL_GPL(mptcp_token_new_connect);
+EXPORT_SYMBOL_GPL(mptcp_token_accept);
+EXPORT_SYMBOL_GPL(mptcp_token_get_sock);
+EXPORT_SYMBOL_GPL(mptcp_token_destroy_request);
+EXPORT_SYMBOL_GPL(mptcp_token_destroy);
+#endif
