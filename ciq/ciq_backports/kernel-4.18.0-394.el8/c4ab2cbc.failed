@@ -1,0 +1,185 @@
+arm64: tlb: Set the TTL field in flush_tlb_range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Zhenyu Ye <yezhenyu2@huawei.com>
+commit c4ab2cbc1d8768eb505708a58c54c277dfe4a93d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/c4ab2cbc.failed
+
+This patch uses the cleared_* in struct mmu_gather to set the
+TTL field in flush_tlb_range().
+
+	Signed-off-by: Zhenyu Ye <yezhenyu2@huawei.com>
+	Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+Link: https://lore.kernel.org/r/20200625080314.230-6-yezhenyu2@huawei.com
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit c4ab2cbc1d8768eb505708a58c54c277dfe4a93d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/tlbflush.h
+diff --cc arch/arm64/include/asm/tlbflush.h
+index 60446bc6b633,3505f6fbfca3..000000000000
+--- a/arch/arm64/include/asm/tlbflush.h
++++ b/arch/arm64/include/asm/tlbflush.h
+@@@ -363,15 -230,11 +363,16 @@@ static inline void flush_tlb_page(struc
+  
+  static inline void __flush_tlb_range(struct vm_area_struct *vma,
+  				     unsigned long start, unsigned long end,
+- 				     unsigned long stride, bool last_level)
++ 				     unsigned long stride, bool last_level,
++ 				     int tlb_level)
+  {
+ -	unsigned long asid = ASID(vma->vm_mm);
+ +	struct mm_struct *mm = vma->vm_mm;
+ +	int num = 0;
+ +	int scale = 0;
+ +	unsigned long asid = ASID(mm);
+  	unsigned long addr;
+ +	unsigned long pages;
+ +	enum tlb_flush_types flush;
+  
+  	start = round_down(start, stride);
+  	end = round_up(end, stride);
+@@@ -390,68 -244,23 +391,79 @@@
+  		return;
+  	}
+  
+ -	/* Convert the stride into units of 4k */
+ -	stride >>= 12;
+ -
+ -	start = __TLBI_VADDR(start, asid);
+ -	end = __TLBI_VADDR(end, asid);
+ -
+ +	flush = tlb_flush_check(mm, get_cpu());
+ +	switch (flush) {
+ +	case TLB_FLUSH_LOCAL:
+ +		stride >>= PAGE_SHIFT;
+ +
+ +		start = __TLBI_VADDR(start, asid);
+ +		end = __TLBI_VADDR(end, asid);
+ +
+++<<<<<<< HEAD
+ +		dsb(nshst);
+ +		for (addr = start; addr < end; addr += stride) {
+ +			if (last_level) {
+ +				__tlbi(vale1, addr);
+ +				__tlbi_user(vale1, addr);
+ +			} else {
+ +				__tlbi(vae1, addr);
+ +				__tlbi_user(vae1, addr);
+ +			}
+++=======
++ 	dsb(ishst);
++ 	for (addr = start; addr < end; addr += stride) {
++ 		if (last_level) {
++ 			__tlbi_level(vale1is, addr, tlb_level);
++ 			__tlbi_user_level(vale1is, addr, tlb_level);
++ 		} else {
++ 			__tlbi_level(vae1is, addr, tlb_level);
++ 			__tlbi_user_level(vae1is, addr, tlb_level);
+++>>>>>>> c4ab2cbc1d87 (arm64: tlb: Set the TTL field in flush_tlb_range)
+ +		}
+ +		dsb(nsh);
+ +
+ +		/* fall through */
+ +	case TLB_FLUSH_NO:
+ +		put_cpu();
+ +		break;
+ +	case TLB_FLUSH_BROADCAST:
+ +		put_cpu();
+ +
+ +		dsb(ishst);
+ +		while (pages > 0) {
+ +			if (!system_supports_tlb_range() ||
+ +			    pages % 2 == 1) {
+ +			        addr = __TLBI_VADDR(start, asid);
+ +				if (last_level) {
+ +					__tlbi(vale1is, addr);
+ +					__tlbi_user(vale1is, addr);
+ +				} else {
+ +					__tlbi(vae1is, addr);
+ +					__tlbi_user(vae1is, addr);
+ +				}
+ +				start += stride;
+ +				pages -= stride >> PAGE_SHIFT;
+ +			} else {
+ +				num = __TLBI_RANGE_NUM(pages, scale);
+ +				if (num >= 0) {
+ +					addr = __TLBI_VADDR_RANGE(start, asid, scale,
+ +								  num, 0);
+ +					if (last_level) {
+ +						 __tlbi(rvale1is, addr);
+ +						 __tlbi_user(rvale1is, addr);
+ +					} else {
+ +						__tlbi(rvae1is, addr);
+ +						__tlbi_user(rvae1is, addr);
+ +					}
+ +					start += __TLBI_RANGE_PAGES(num, scale) << PAGE_SHIFT;
+ +					pages -= __TLBI_RANGE_PAGES(num, scale);
+ +				}
+ +				scale++;
+ +			}
+  		}
+ +		dsb(ish);
+ +		break;
+  	}
+ -	dsb(ish);
+  }
+  
+  static inline void flush_tlb_range(struct vm_area_struct *vma,
+diff --git a/arch/arm64/include/asm/tlb.h b/arch/arm64/include/asm/tlb.h
+index f3b4951d7cf6..a71a5306fa29 100644
+--- a/arch/arm64/include/asm/tlb.h
++++ b/arch/arm64/include/asm/tlb.h
+@@ -32,11 +32,37 @@ static void tlb_flush(struct mmu_gather *tlb);
+ 
+ #include <asm-generic/tlb.h>
+ 
++/*
++ * get the tlbi levels in arm64.  Default value is 0 if more than one
++ * of cleared_* is set or neither is set.
++ * Arm64 doesn't support p4ds now.
++ */
++static inline int tlb_get_level(struct mmu_gather *tlb)
++{
++	if (tlb->cleared_ptes && !(tlb->cleared_pmds ||
++				   tlb->cleared_puds ||
++				   tlb->cleared_p4ds))
++		return 3;
++
++	if (tlb->cleared_pmds && !(tlb->cleared_ptes ||
++				   tlb->cleared_puds ||
++				   tlb->cleared_p4ds))
++		return 2;
++
++	if (tlb->cleared_puds && !(tlb->cleared_ptes ||
++				   tlb->cleared_pmds ||
++				   tlb->cleared_p4ds))
++		return 1;
++
++	return 0;
++}
++
+ static inline void tlb_flush(struct mmu_gather *tlb)
+ {
+ 	struct vm_area_struct vma = TLB_FLUSH_VMA(tlb->mm, 0);
+ 	bool last_level = !tlb->freed_tables;
+ 	unsigned long stride = tlb_get_unmap_size(tlb);
++	int tlb_level = tlb_get_level(tlb);
+ 
+ 	/*
+ 	 * If we're tearing down the address space then we only care about
+@@ -49,7 +75,8 @@ static inline void tlb_flush(struct mmu_gather *tlb)
+ 		return;
+ 	}
+ 
+-	__flush_tlb_range(&vma, tlb->start, tlb->end, stride, last_level);
++	__flush_tlb_range(&vma, tlb->start, tlb->end, stride,
++			  last_level, tlb_level);
+ }
+ 
+ static inline void __pte_free_tlb(struct mmu_gather *tlb, pgtable_t pte,
+* Unmerged path arch/arm64/include/asm/tlbflush.h
