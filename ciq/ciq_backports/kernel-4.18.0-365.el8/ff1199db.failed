@@ -1,0 +1,195 @@
+netfilter: ctnetlink: add and use a helper for mark parsing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit ff1199db8c3b7cdc3ac4430badfd254023c5142e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/ff1199db.failed
+
+ctnetlink dumps can be filtered based on the connmark.
+
+Prepare for status bit filtering by using a named structure and by
+moving the mark parsing code to a helper.
+
+Else ctnetlink_alloc_filter size grows a bit too big for my taste
+when status handling is added.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit ff1199db8c3b7cdc3ac4430badfd254023c5142e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_netlink.c
+diff --cc net/netfilter/nf_conntrack_netlink.c
+index 6e7fb1ac52a8,e8368e66b0f5..000000000000
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@@ -858,14 -852,81 +858,90 @@@ static int ctnetlink_done(struct netlin
+  	return 0;
+  }
+  
++ struct ctnetlink_filter_u32 {
++ 	u32 val;
++ 	u32 mask;
++ };
++ 
+  struct ctnetlink_filter {
+  	u8 family;
+++<<<<<<< HEAD
+ +	struct {
+ +		u_int32_t val;
+ +		u_int32_t mask;
+ +	} mark;
+ +};
+ +
+++=======
++ 
++ 	u_int32_t orig_flags;
++ 	u_int32_t reply_flags;
++ 
++ 	struct nf_conntrack_tuple orig;
++ 	struct nf_conntrack_tuple reply;
++ 	struct nf_conntrack_zone zone;
++ 
++ 	struct ctnetlink_filter_u32 mark;
++ };
++ 
++ static const struct nla_policy cta_filter_nla_policy[CTA_FILTER_MAX + 1] = {
++ 	[CTA_FILTER_ORIG_FLAGS]		= { .type = NLA_U32 },
++ 	[CTA_FILTER_REPLY_FLAGS]	= { .type = NLA_U32 },
++ };
++ 
++ static int ctnetlink_parse_filter(const struct nlattr *attr,
++ 				  struct ctnetlink_filter *filter)
++ {
++ 	struct nlattr *tb[CTA_FILTER_MAX + 1];
++ 	int ret = 0;
++ 
++ 	ret = nla_parse_nested(tb, CTA_FILTER_MAX, attr, cta_filter_nla_policy,
++ 			       NULL);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (tb[CTA_FILTER_ORIG_FLAGS]) {
++ 		filter->orig_flags = nla_get_u32(tb[CTA_FILTER_ORIG_FLAGS]);
++ 		if (filter->orig_flags & ~CTA_FILTER_F_ALL)
++ 			return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (tb[CTA_FILTER_REPLY_FLAGS]) {
++ 		filter->reply_flags = nla_get_u32(tb[CTA_FILTER_REPLY_FLAGS]);
++ 		if (filter->reply_flags & ~CTA_FILTER_F_ALL)
++ 			return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int ctnetlink_parse_zone(const struct nlattr *attr,
++ 				struct nf_conntrack_zone *zone);
++ static int ctnetlink_parse_tuple_filter(const struct nlattr * const cda[],
++ 					 struct nf_conntrack_tuple *tuple,
++ 					 u32 type, u_int8_t l3num,
++ 					 struct nf_conntrack_zone *zone,
++ 					 u_int32_t flags);
++ 
++ static int ctnetlink_filter_parse_mark(struct ctnetlink_filter_u32 *mark,
++ 				       const struct nlattr * const cda[])
++ {
++ #ifdef CONFIG_NF_CONNTRACK_MARK
++ 	if (cda[CTA_MARK]) {
++ 		mark->val = ntohl(nla_get_be32(cda[CTA_MARK]));
++ 
++ 		if (cda[CTA_MARK_MASK])
++ 			mark->mask = ntohl(nla_get_be32(cda[CTA_MARK_MASK]));
++ 		else
++ 			mark->mask = 0xffffffff;
++ 	} else if (cda[CTA_MARK_MASK]) {
++ 		return -EINVAL;
++ 	}
++ #endif
++ 	return 0;
++ }
++ 
+++>>>>>>> ff1199db8c3b (netfilter: ctnetlink: add and use a helper for mark parsing)
+  static struct ctnetlink_filter *
+  ctnetlink_alloc_filter(const struct nlattr * const cda[], u8 family)
+  {
+@@@ -882,13 -944,64 +958,63 @@@
+  
+  	filter->family = family;
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NF_CONNTRACK_MARK
+ +	if (cda[CTA_MARK] && cda[CTA_MARK_MASK]) {
+ +		filter->mark.val = ntohl(nla_get_be32(cda[CTA_MARK]));
+ +		filter->mark.mask = ntohl(nla_get_be32(cda[CTA_MARK_MASK]));
+ +	}
+ +#endif
+++=======
++ 	err = ctnetlink_filter_parse_mark(&filter->mark, cda);
++ 	if (err)
++ 		goto err_filter;
++ 
++ 	if (!cda[CTA_FILTER])
++ 		return filter;
++ 
++ 	err = ctnetlink_parse_zone(cda[CTA_ZONE], &filter->zone);
++ 	if (err < 0)
++ 		goto err_filter;
++ 
++ 	err = ctnetlink_parse_filter(cda[CTA_FILTER], filter);
++ 	if (err < 0)
++ 		goto err_filter;
++ 
++ 	if (filter->orig_flags) {
++ 		if (!cda[CTA_TUPLE_ORIG]) {
++ 			err = -EINVAL;
++ 			goto err_filter;
++ 		}
++ 
++ 		err = ctnetlink_parse_tuple_filter(cda, &filter->orig,
++ 						   CTA_TUPLE_ORIG,
++ 						   filter->family,
++ 						   &filter->zone,
++ 						   filter->orig_flags);
++ 		if (err < 0)
++ 			goto err_filter;
++ 	}
++ 
++ 	if (filter->reply_flags) {
++ 		if (!cda[CTA_TUPLE_REPLY]) {
++ 			err = -EINVAL;
++ 			goto err_filter;
++ 		}
++ 
++ 		err = ctnetlink_parse_tuple_filter(cda, &filter->reply,
++ 						   CTA_TUPLE_REPLY,
++ 						   filter->family,
++ 						   &filter->zone,
++ 						   filter->orig_flags);
++ 		if (err < 0) {
++ 			err = -EINVAL;
++ 			goto err_filter;
++ 		}
++ 	}
++ 
+++>>>>>>> ff1199db8c3b (netfilter: ctnetlink: add and use a helper for mark parsing)
+  	return filter;
+ -
+ -err_filter:
+ -	kfree(filter);
+ -
+ -	return ERR_PTR(err);
+ -}
+ -
+ -static bool ctnetlink_needs_filter(u8 family, const struct nlattr * const *cda)
+ -{
+ -	return family || cda[CTA_MARK] || cda[CTA_FILTER];
+  }
+  
+  static int ctnetlink_start(struct netlink_callback *cb)
+* Unmerged path net/netfilter/nf_conntrack_netlink.c
