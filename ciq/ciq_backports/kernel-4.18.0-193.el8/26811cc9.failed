@@ -1,0 +1,198 @@
+net: tls: export protocol version, cipher, tx_conf/rx_conf to socket diag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] tls: export protocol version, cipher, tx_conf/rx_conf to socket diag (Sabrina Dubroca) [1760375]
+Rebuild_FUZZ: 96.45%
+commit-author Davide Caratti <dcaratti@redhat.com>
+commit 26811cc9f55acf835f7fdadc5ff2bbd6f06bc3ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/26811cc9.failed
+
+When an application configures kernel TLS on top of a TCP socket, it's
+now possible for inet_diag_handler() to collect information regarding the
+protocol version, the cipher type and TX / RX configuration, in case
+INET_DIAG_INFO is requested.
+
+	Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 26811cc9f55acf835f7fdadc5ff2bbd6f06bc3ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tls/tls_main.c
+diff --cc net/tls/tls_main.c
+index 797e39e87f9c,277f7c209fed..000000000000
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@@ -795,11 -822,86 +796,88 @@@ out
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tls_update(struct sock *sk, struct proto *p)
++ {
++ 	struct tls_context *ctx;
++ 
++ 	ctx = tls_get_ctx(sk);
++ 	if (likely(ctx)) {
++ 		ctx->sk_proto_close = p->close;
++ 		ctx->sk_proto = p;
++ 	} else {
++ 		sk->sk_prot = p;
++ 	}
++ }
++ 
++ static int tls_get_info(const struct sock *sk, struct sk_buff *skb)
++ {
++ 	u16 version, cipher_type;
++ 	struct tls_context *ctx;
++ 	struct nlattr *start;
++ 	int err;
++ 
++ 	start = nla_nest_start_noflag(skb, INET_ULP_INFO_TLS);
++ 	if (!start)
++ 		return -EMSGSIZE;
++ 
++ 	rcu_read_lock();
++ 	ctx = rcu_dereference(inet_csk(sk)->icsk_ulp_data);
++ 	if (!ctx) {
++ 		err = 0;
++ 		goto nla_failure;
++ 	}
++ 	version = ctx->prot_info.version;
++ 	if (version) {
++ 		err = nla_put_u16(skb, TLS_INFO_VERSION, version);
++ 		if (err)
++ 			goto nla_failure;
++ 	}
++ 	cipher_type = ctx->prot_info.cipher_type;
++ 	if (cipher_type) {
++ 		err = nla_put_u16(skb, TLS_INFO_CIPHER, cipher_type);
++ 		if (err)
++ 			goto nla_failure;
++ 	}
++ 	err = nla_put_u16(skb, TLS_INFO_TXCONF, tls_user_config(ctx, true));
++ 	if (err)
++ 		goto nla_failure;
++ 
++ 	err = nla_put_u16(skb, TLS_INFO_RXCONF, tls_user_config(ctx, false));
++ 	if (err)
++ 		goto nla_failure;
++ 
++ 	rcu_read_unlock();
++ 	nla_nest_end(skb, start);
++ 	return 0;
++ 
++ nla_failure:
++ 	rcu_read_unlock();
++ 	nla_nest_cancel(skb, start);
++ 	return err;
++ }
++ 
++ static size_t tls_get_info_size(const struct sock *sk)
++ {
++ 	size_t size = 0;
++ 
++ 	size += nla_total_size(0) +		/* INET_ULP_INFO_TLS */
++ 		nla_total_size(sizeof(u16)) +	/* TLS_INFO_VERSION */
++ 		nla_total_size(sizeof(u16)) +	/* TLS_INFO_CIPHER */
++ 		nla_total_size(sizeof(u16)) +	/* TLS_INFO_RXCONF */
++ 		nla_total_size(sizeof(u16)) +	/* TLS_INFO_TXCONF */
++ 		0;
++ 
++ 	return size;
++ }
++ 
+++>>>>>>> 26811cc9f55a (net: tls: export protocol version, cipher, tx_conf/rx_conf to socket diag)
+  void tls_register_device(struct tls_device *device)
+  {
+ -	spin_lock_bh(&device_spinlock);
+ +	mutex_lock(&device_mutex);
+  	list_add_tail(&device->dev_list, &device_list);
+ -	spin_unlock_bh(&device_spinlock);
+ +	mutex_unlock(&device_mutex);
+  }
+  EXPORT_SYMBOL(tls_register_device);
+  
+@@@ -815,6 -917,9 +893,12 @@@ static struct tcp_ulp_ops tcp_tls_ulp_o
+  	.name			= "tls",
+  	.owner			= THIS_MODULE,
+  	.init			= tls_init,
+++<<<<<<< HEAD
+++=======
++ 	.update			= tls_update,
++ 	.get_info		= tls_get_info,
++ 	.get_info_size		= tls_get_info_size,
+++>>>>>>> 26811cc9f55a (net: tls: export protocol version, cipher, tx_conf/rx_conf to socket diag)
+  };
+  
+  static int __init tls_register(void)
+diff --git a/include/net/tls.h b/include/net/tls.h
+index c12ffebfa2b4..255daae9d0b8 100644
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -389,6 +389,23 @@ static inline bool is_tx_ready(struct tls_sw_context_tx *ctx)
+ 	return READ_ONCE(rec->tx_ready);
+ }
+ 
++static inline u16 tls_user_config(struct tls_context *ctx, bool tx)
++{
++	u16 config = tx ? ctx->tx_conf : ctx->rx_conf;
++
++	switch (config) {
++	case TLS_BASE:
++		return TLS_CONF_BASE;
++	case TLS_SW:
++		return TLS_CONF_SW;
++	case TLS_HW:
++		return TLS_CONF_HW;
++	case TLS_HW_RECORD:
++		return TLS_CONF_HW_RECORD;
++	}
++	return 0;
++}
++
+ struct sk_buff *
+ tls_validate_xmit_skb(struct sock *sk, struct net_device *dev,
+ 		      struct sk_buff *skb);
+diff --git a/include/uapi/linux/inet_diag.h b/include/uapi/linux/inet_diag.h
+index 46ae4000f08c..1989def6c456 100644
+--- a/include/uapi/linux/inet_diag.h
++++ b/include/uapi/linux/inet_diag.h
+@@ -156,6 +156,7 @@ enum {
+ enum {
+ 	INET_ULP_INFO_UNSPEC,
+ 	INET_ULP_INFO_NAME,
++	INET_ULP_INFO_TLS,
+ 	__INET_ULP_INFO_MAX,
+ };
+ #define INET_ULP_INFO_MAX (__INET_ULP_INFO_MAX - 1)
+diff --git a/include/uapi/linux/tls.h b/include/uapi/linux/tls.h
+index 5b9c26753e46..bcd2869ed472 100644
+--- a/include/uapi/linux/tls.h
++++ b/include/uapi/linux/tls.h
+@@ -109,4 +109,19 @@ struct tls12_crypto_info_aes_ccm_128 {
+ 	unsigned char rec_seq[TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE];
+ };
+ 
++enum {
++	TLS_INFO_UNSPEC,
++	TLS_INFO_VERSION,
++	TLS_INFO_CIPHER,
++	TLS_INFO_TXCONF,
++	TLS_INFO_RXCONF,
++	__TLS_INFO_MAX,
++};
++#define TLS_INFO_MAX (__TLS_INFO_MAX - 1)
++
++#define TLS_CONF_BASE 1
++#define TLS_CONF_SW 2
++#define TLS_CONF_HW 3
++#define TLS_CONF_HW_RECORD 4
++
+ #endif /* _UAPI_LINUX_TLS_H */
+* Unmerged path net/tls/tls_main.c
