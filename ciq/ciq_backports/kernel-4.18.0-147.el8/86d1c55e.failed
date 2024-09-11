@@ -1,0 +1,192 @@
+KVM: arm64: Support PUD hugepage in stage2_is_exec()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Punit Agrawal <punit.agrawal@arm.com>
+commit 86d1c55ea605025f78d026e7fc3a2bb4c3fc2d6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/86d1c55e.failed
+
+In preparation for creating PUD hugepages at stage 2, add support for
+detecting execute permissions on PUD page table entries. Faults due to
+lack of execute permissions on page table entries is used to perform
+i-cache invalidation on first execute.
+
+Provide trivial implementations of arm32 helpers to allow sharing of
+code.
+
+	Signed-off-by: Punit Agrawal <punit.agrawal@arm.com>
+	Reviewed-by: Christoffer Dall <christoffer.dall@arm.com>
+	Cc: Russell King <linux@armlinux.org.uk>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+[ Replaced BUG() => WARN_ON(1) in arm32 PUD helpers ]
+	Signed-off-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+(cherry picked from commit 86d1c55ea605025f78d026e7fc3a2bb4c3fc2d6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/include/asm/kvm_mmu.h
+#	arch/arm64/include/asm/kvm_mmu.h
+diff --cc arch/arm/include/asm/kvm_mmu.h
+index aa04390ce4a5,a49655fe7cd9..000000000000
+--- a/arch/arm/include/asm/kvm_mmu.h
++++ b/arch/arm/include/asm/kvm_mmu.h
+@@@ -82,6 -82,32 +82,35 @@@ void kvm_clear_hyp_idmap(void)
+  #define kvm_mk_pud(pmdp)	__pud(__pa(pmdp) | PMD_TYPE_TABLE)
+  #define kvm_mk_pgd(pudp)	({ BUILD_BUG(); 0; })
+  
+++<<<<<<< HEAD
+++=======
++ #define kvm_pfn_pte(pfn, prot)	pfn_pte(pfn, prot)
++ #define kvm_pfn_pmd(pfn, prot)	pfn_pmd(pfn, prot)
++ 
++ #define kvm_pmd_mkhuge(pmd)	pmd_mkhuge(pmd)
++ 
++ /*
++  * The following kvm_*pud*() functions are provided strictly to allow
++  * sharing code with arm64. They should never be called in practice.
++  */
++ static inline void kvm_set_s2pud_readonly(pud_t *pud)
++ {
++ 	WARN_ON(1);
++ }
++ 
++ static inline bool kvm_s2pud_readonly(pud_t *pud)
++ {
++ 	WARN_ON(1);
++ 	return false;
++ }
++ 
++ static inline bool kvm_s2pud_exec(pud_t *pud)
++ {
++ 	WARN_ON(1);
++ 	return false;
++ }
++ 
+++>>>>>>> 86d1c55ea605 (KVM: arm64: Support PUD hugepage in stage2_is_exec())
+  static inline pte_t kvm_s2pte_mkwrite(pte_t pte)
+  {
+  	pte_val(pte) |= L_PTE_S2_RDWR;
+diff --cc arch/arm64/include/asm/kvm_mmu.h
+index 94acbfa0650c,c755b37b3f92..000000000000
+--- a/arch/arm64/include/asm/kvm_mmu.h
++++ b/arch/arm64/include/asm/kvm_mmu.h
+@@@ -246,6 -251,21 +246,24 @@@ static inline bool kvm_s2pmd_exec(pmd_
+  	return !(READ_ONCE(pmd_val(*pmdp)) & PMD_S2_XN);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void kvm_set_s2pud_readonly(pud_t *pudp)
++ {
++ 	kvm_set_s2pte_readonly((pte_t *)pudp);
++ }
++ 
++ static inline bool kvm_s2pud_readonly(pud_t *pudp)
++ {
++ 	return kvm_s2pte_readonly((pte_t *)pudp);
++ }
++ 
++ static inline bool kvm_s2pud_exec(pud_t *pudp)
++ {
++ 	return !(READ_ONCE(pud_val(*pudp)) & PUD_S2_XN);
++ }
++ 
+++>>>>>>> 86d1c55ea605 (KVM: arm64: Support PUD hugepage in stage2_is_exec())
+  #define hyp_pte_table_empty(ptep) kvm_page_empty(ptep)
+  
+  #ifdef __PAGETABLE_PMD_FOLDED
+* Unmerged path arch/arm/include/asm/kvm_mmu.h
+* Unmerged path arch/arm64/include/asm/kvm_mmu.h
+diff --git a/arch/arm64/include/asm/pgtable-hwdef.h b/arch/arm64/include/asm/pgtable-hwdef.h
+index 54a37660b8c9..091e92cd5d74 100644
+--- a/arch/arm64/include/asm/pgtable-hwdef.h
++++ b/arch/arm64/include/asm/pgtable-hwdef.h
+@@ -193,6 +193,8 @@
+ #define PMD_S2_RDWR		(_AT(pmdval_t, 3) << 6)   /* HAP[2:1] */
+ #define PMD_S2_XN		(_AT(pmdval_t, 2) << 53)  /* XN[1:0] */
+ 
++#define PUD_S2_XN		(_AT(pudval_t, 2) << 53)  /* XN[1:0] */
++
+ /*
+  * Memory Attribute override for Stage-2 (MemAttr[3:0])
+  */
+diff --git a/virt/kvm/arm/mmu.c b/virt/kvm/arm/mmu.c
+index 22e88cffe24c..98a39ed0332d 100644
+--- a/virt/kvm/arm/mmu.c
++++ b/virt/kvm/arm/mmu.c
+@@ -1079,23 +1079,66 @@ static int stage2_set_pmd_huge(struct kvm *kvm, struct kvm_mmu_memory_cache
+ 	return 0;
+ }
+ 
+-static bool stage2_is_exec(struct kvm *kvm, phys_addr_t addr)
++/*
++ * stage2_get_leaf_entry - walk the stage2 VM page tables and return
++ * true if a valid and present leaf-entry is found. A pointer to the
++ * leaf-entry is returned in the appropriate level variable - pudpp,
++ * pmdpp, ptepp.
++ */
++static bool stage2_get_leaf_entry(struct kvm *kvm, phys_addr_t addr,
++				  pud_t **pudpp, pmd_t **pmdpp, pte_t **ptepp)
+ {
++	pud_t *pudp;
+ 	pmd_t *pmdp;
+ 	pte_t *ptep;
+ 
+-	pmdp = stage2_get_pmd(kvm, NULL, addr);
++	*pudpp = NULL;
++	*pmdpp = NULL;
++	*ptepp = NULL;
++
++	pudp = stage2_get_pud(kvm, NULL, addr);
++	if (!pudp || stage2_pud_none(kvm, *pudp) || !stage2_pud_present(kvm, *pudp))
++		return false;
++
++	if (stage2_pud_huge(kvm, *pudp)) {
++		*pudpp = pudp;
++		return true;
++	}
++
++	pmdp = stage2_pmd_offset(kvm, pudp, addr);
+ 	if (!pmdp || pmd_none(*pmdp) || !pmd_present(*pmdp))
+ 		return false;
+ 
+-	if (pmd_thp_or_huge(*pmdp))
+-		return kvm_s2pmd_exec(pmdp);
++	if (pmd_thp_or_huge(*pmdp)) {
++		*pmdpp = pmdp;
++		return true;
++	}
+ 
+ 	ptep = pte_offset_kernel(pmdp, addr);
+ 	if (!ptep || pte_none(*ptep) || !pte_present(*ptep))
+ 		return false;
+ 
+-	return kvm_s2pte_exec(ptep);
++	*ptepp = ptep;
++	return true;
++}
++
++static bool stage2_is_exec(struct kvm *kvm, phys_addr_t addr)
++{
++	pud_t *pudp;
++	pmd_t *pmdp;
++	pte_t *ptep;
++	bool found;
++
++	found = stage2_get_leaf_entry(kvm, addr, &pudp, &pmdp, &ptep);
++	if (!found)
++		return false;
++
++	if (pudp)
++		return kvm_s2pud_exec(pudp);
++	else if (pmdp)
++		return kvm_s2pmd_exec(pmdp);
++	else
++		return kvm_s2pte_exec(ptep);
+ }
+ 
+ static int stage2_set_pte(struct kvm *kvm, struct kvm_mmu_memory_cache *cache,
