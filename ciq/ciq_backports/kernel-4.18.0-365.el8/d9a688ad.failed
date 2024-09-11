@@ -1,0 +1,141 @@
+swiotlb-xen: maintain slab count properly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Jan Beulich <jbeulich@suse.com>
+commit d9a688add3d412c840e31060847a6a297b552316
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/d9a688ad.failed
+
+Generic swiotlb code makes sure to keep the slab count a multiple of the
+number of slabs per segment. Yet even without checking whether any such
+assumption is made elsewhere, it is easy to see that xen_swiotlb_fixup()
+might alter unrelated memory when calling xen_create_contiguous_region()
+for the last segment, when that's not a full one - the function acts on
+full order-N regions, not individual pages.
+
+Align the slab count suitably when halving it for a retry. Add a build
+time check and a runtime one. Replace the no longer useful local
+variable "slabs" by an "order" one calculated just once, outside of the
+loop. Re-use "order" for calculating "dma_bits", and change the type of
+the latter as well as the one of "i" while touching this anyway.
+
+	Signed-off-by: Jan Beulich <jbeulich@suse.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+
+Link: https://lore.kernel.org/r/dc054cb0-bec4-4db0-fc06-c9fc957b6e66@suse.com
+	Signed-off-by: Juergen Gross <jgross@suse.com>
+(cherry picked from commit d9a688add3d412c840e31060847a6a297b552316)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/xen/swiotlb-xen.c
+diff --cc drivers/xen/swiotlb-xen.c
+index 8ccd85660984,08fc694f05b7..000000000000
+--- a/drivers/xen/swiotlb-xen.c
++++ b/drivers/xen/swiotlb-xen.c
+@@@ -113,11 -104,11 +113,12 @@@ static int is_xen_swiotlb_buffer(struc
+  	return 0;
+  }
+  
+ -static int xen_swiotlb_fixup(void *buf, unsigned long nslabs)
+ +static int
+ +xen_swiotlb_fixup(void *buf, size_t size, unsigned long nslabs)
+  {
+- 	int i, rc;
+- 	int dma_bits;
++ 	int rc;
++ 	unsigned int order = get_order(IO_TLB_SEGSIZE << IO_TLB_SHIFT);
++ 	unsigned int i, dma_bits = order + PAGE_SHIFT;
+  	dma_addr_t dma_handle;
+  	phys_addr_t p = virt_to_phys(buf);
+  
+@@@ -227,24 -201,17 +226,31 @@@ retry
+  		m_ret = XEN_SWIOTLB_EFIXUP;
+  		goto error;
+  	}
+ -	rc = swiotlb_late_init_with_tbl(start, nslabs);
+ -	if (rc)
+ -		return rc;
+ -	swiotlb_set_max_segment(PAGE_SIZE);
+ -	return 0;
+ +	if (early) {
+ +		if (swiotlb_init_with_tbl(start, nslabs,
+ +			 verbose))
+ +			panic("Cannot allocate SWIOTLB buffer");
+ +		rc = 0;
+ +	} else
+ +		rc = swiotlb_late_init_with_tbl(start, nslabs);
+ +
+ +	if (!rc)
+ +		swiotlb_set_max_segment(PAGE_SIZE);
+ +
+ +	return rc;
+  error:
+  	if (repeat--) {
+++<<<<<<< HEAD
+ +		nslabs = max(1024UL, /* Min is 2MB */
+ +					(nslabs >> 1));
+ +		pr_info("Lowering to %luMB\n",
+ +			(nslabs << IO_TLB_SHIFT) >> 20);
+++=======
++ 		/* Min is 2MB */
++ 		nslabs = max(1024UL, ALIGN(nslabs >> 1, IO_TLB_SEGSIZE));
++ 		bytes = nslabs << IO_TLB_SHIFT;
++ 		pr_info("Lowering to %luMB\n", bytes >> 20);
+++>>>>>>> d9a688add3d4 (swiotlb-xen: maintain slab count properly)
+  		goto retry;
+  	}
+  	pr_err("%s (rc:%d)\n", xen_swiotlb_error(m_ret), rc);
+@@@ -255,6 -218,46 +261,49 @@@
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_X86
++ void __init xen_swiotlb_init_early(void)
++ {
++ 	unsigned long bytes = swiotlb_size_or_default();
++ 	unsigned long nslabs = bytes >> IO_TLB_SHIFT;
++ 	unsigned int repeat = 3;
++ 	char *start;
++ 	int rc;
++ 
++ retry:
++ 	/*
++ 	 * Get IO TLB memory from any location.
++ 	 */
++ 	start = memblock_alloc(PAGE_ALIGN(bytes), PAGE_SIZE);
++ 	if (!start)
++ 		panic("%s: Failed to allocate %lu bytes align=0x%lx\n",
++ 		      __func__, PAGE_ALIGN(bytes), PAGE_SIZE);
++ 
++ 	/*
++ 	 * And replace that memory with pages under 4GB.
++ 	 */
++ 	rc = xen_swiotlb_fixup(start, nslabs);
++ 	if (rc) {
++ 		memblock_free(__pa(start), PAGE_ALIGN(bytes));
++ 		if (repeat--) {
++ 			/* Min is 2MB */
++ 			nslabs = max(1024UL, ALIGN(nslabs >> 1, IO_TLB_SEGSIZE));
++ 			bytes = nslabs << IO_TLB_SHIFT;
++ 			pr_info("Lowering to %luMB\n", bytes >> 20);
++ 			goto retry;
++ 		}
++ 		panic("%s (rc:%d)", xen_swiotlb_error(XEN_SWIOTLB_EFIXUP), rc);
++ 	}
++ 
++ 	if (swiotlb_init_with_tbl(start, nslabs, false))
++ 		panic("Cannot allocate SWIOTLB buffer");
++ 	swiotlb_set_max_segment(PAGE_SIZE);
++ }
++ #endif /* CONFIG_X86 */
++ 
+++>>>>>>> d9a688add3d4 (swiotlb-xen: maintain slab count properly)
+  static void *
+  xen_swiotlb_alloc_coherent(struct device *hwdev, size_t size,
+  			   dma_addr_t *dma_handle, gfp_t flags,
+* Unmerged path drivers/xen/swiotlb-xen.c
