@@ -1,0 +1,217 @@
+net/smc: Dynamic control handshake limitation by socket options
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author D. Wythe <alibuda@linux.alibaba.com>
+commit a6a6fe27bab48f0d09a64b051e7bde432fcae081
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/a6a6fe27.failed
+
+This patch aims to add dynamic control for SMC handshake limitation for
+every smc sockets, in production environment, it is possible for the
+same applications to handle different service types, and may have
+different opinion on SMC handshake limitation.
+
+This patch try socket options to complete it, since we don't have socket
+option level for SMC yet, which requires us to implement it at the same
+time.
+
+This patch does the following:
+
+- add new socket option level: SOL_SMC.
+- add new SMC socket option: SMC_LIMIT_HS.
+- provide getter/setter for SMC socket options.
+
+Link: https://lore.kernel.org/all/20f504f961e1a803f85d64229ad84260434203bd.1644323503.git.alibuda@linux.alibaba.com/
+	Signed-off-by: D. Wythe <alibuda@linux.alibaba.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a6a6fe27bab48f0d09a64b051e7bde432fcae081)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/socket.h
+#	net/smc/af_smc.c
+diff --cc include/linux/socket.h
+index da58673a9cb0,6f85f5d957ef..000000000000
+--- a/include/linux/socket.h
++++ b/include/linux/socket.h
+@@@ -346,6 -364,9 +346,12 @@@ struct ucred 
+  #define SOL_KCM		281
+  #define SOL_TLS		282
+  #define SOL_XDP		283
+++<<<<<<< HEAD
+++=======
++ #define SOL_MPTCP	284
++ #define SOL_MCTP	285
++ #define SOL_SMC		286
+++>>>>>>> a6a6fe27bab4 (net/smc: Dynamic control handshake limitation by socket options)
+  
+  /* IPX options */
+  #define IPX_TYPE	1
+diff --cc net/smc/af_smc.c
+index b7264bf208bb,97dcdc0a2107..000000000000
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@@ -2125,6 -2317,18 +2125,21 @@@ static int smc_listen(struct socket *so
+  	smc->clcsock->sk->sk_data_ready = smc_clcsock_data_ready;
+  	smc->clcsock->sk->sk_user_data =
+  		(void *)((uintptr_t)smc | SK_USER_DATA_NOCOPY);
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* save original ops */
++ 	smc->ori_af_ops = inet_csk(smc->clcsock->sk)->icsk_af_ops;
++ 
++ 	smc->af_ops = *smc->ori_af_ops;
++ 	smc->af_ops.syn_recv_sock = smc_tcp_syn_recv_sock;
++ 
++ 	inet_csk(smc->clcsock->sk)->icsk_af_ops = &smc->af_ops;
++ 
++ 	if (smc->limit_smc_hs)
++ 		tcp_sk(smc->clcsock->sk)->smc_hs_congested = smc_hs_congested;
++ 
+++>>>>>>> a6a6fe27bab4 (net/smc: Dynamic control handshake limitation by socket options)
+  	rc = kernel_listen(smc->clcsock, backlog);
+  	if (rc) {
+  		smc->clcsock->sk->sk_data_ready = smc->clcsk_data_ready;
+@@@ -2416,13 -2622,79 +2431,82 @@@ out
+  	return rc ? rc : rc1;
+  }
+  
++ static int __smc_getsockopt(struct socket *sock, int level, int optname,
++ 			    char __user *optval, int __user *optlen)
++ {
++ 	struct smc_sock *smc;
++ 	int val, len;
++ 
++ 	smc = smc_sk(sock->sk);
++ 
++ 	if (get_user(len, optlen))
++ 		return -EFAULT;
++ 
++ 	len = min_t(int, len, sizeof(int));
++ 
++ 	if (len < 0)
++ 		return -EINVAL;
++ 
++ 	switch (optname) {
++ 	case SMC_LIMIT_HS:
++ 		val = smc->limit_smc_hs;
++ 		break;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (put_user(len, optlen))
++ 		return -EFAULT;
++ 	if (copy_to_user(optval, &val, len))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int __smc_setsockopt(struct socket *sock, int level, int optname,
++ 			    sockptr_t optval, unsigned int optlen)
++ {
++ 	struct sock *sk = sock->sk;
++ 	struct smc_sock *smc;
++ 	int val, rc;
++ 
++ 	smc = smc_sk(sk);
++ 
++ 	lock_sock(sk);
++ 	switch (optname) {
++ 	case SMC_LIMIT_HS:
++ 		if (optlen < sizeof(int))
++ 			return -EINVAL;
++ 		if (copy_from_sockptr(&val, optval, sizeof(int)))
++ 			return -EFAULT;
++ 
++ 		smc->limit_smc_hs = !!val;
++ 		rc = 0;
++ 		break;
++ 	default:
++ 		rc = -EOPNOTSUPP;
++ 		break;
++ 	}
++ 	release_sock(sk);
++ 
++ 	return rc;
++ }
++ 
+  static int smc_setsockopt(struct socket *sock, int level, int optname,
+ -			  sockptr_t optval, unsigned int optlen)
+ +			  char __user *optval, unsigned int optlen)
+  {
+  	struct sock *sk = sock->sk;
+  	struct smc_sock *smc;
+  	int val, rc;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (level == SOL_TCP && optname == TCP_ULP)
++ 		return -EOPNOTSUPP;
++ 	else if (level == SOL_SMC)
++ 		return __smc_setsockopt(sock, level, optname, optval, optlen);
++ 
+++>>>>>>> a6a6fe27bab4 (net/smc: Dynamic control handshake limitation by socket options)
+  	smc = smc_sk(sk);
+  
+  	/* generic setsockopts reaching us here always apply to the
+@@@ -2494,11 -2774,26 +2578,14 @@@ static int smc_getsockopt(struct socke
+  			  char __user *optval, int __user *optlen)
+  {
+  	struct smc_sock *smc;
+ -	int rc;
+  
++ 	if (level == SOL_SMC)
++ 		return __smc_getsockopt(sock, level, optname, optval, optlen);
++ 
+  	smc = smc_sk(sock->sk);
+ -	mutex_lock(&smc->clcsock_release_lock);
+ -	if (!smc->clcsock) {
+ -		mutex_unlock(&smc->clcsock_release_lock);
+ -		return -EBADF;
+ -	}
+  	/* socket options apply to the CLC socket */
+ -	if (unlikely(!smc->clcsock->ops->getsockopt)) {
+ -		mutex_unlock(&smc->clcsock_release_lock);
+ -		return -EOPNOTSUPP;
+ -	}
+ -	rc = smc->clcsock->ops->getsockopt(smc->clcsock, level, optname,
+ -					   optval, optlen);
+ -	mutex_unlock(&smc->clcsock_release_lock);
+ -	return rc;
+ +	return smc->clcsock->ops->getsockopt(smc->clcsock, level, optname,
+ +					     optval, optlen);
+  }
+  
+  static int smc_ioctl(struct socket *sock, unsigned int cmd,
+* Unmerged path include/linux/socket.h
+diff --git a/include/uapi/linux/smc.h b/include/uapi/linux/smc.h
+index 6c2874fd2c00..343e7450c3a3 100644
+--- a/include/uapi/linux/smc.h
++++ b/include/uapi/linux/smc.h
+@@ -284,4 +284,8 @@ enum {
+ 	__SMC_NLA_SEID_TABLE_MAX,
+ 	SMC_NLA_SEID_TABLE_MAX = __SMC_NLA_SEID_TABLE_MAX - 1
+ };
++
++/* SMC socket options */
++#define SMC_LIMIT_HS 1	/* constraint on smc handshake */
++
+ #endif /* _UAPI_LINUX_SMC_H */
+* Unmerged path net/smc/af_smc.c
+diff --git a/net/smc/smc.h b/net/smc/smc.h
+index 3d0b8e300deb..b9a15081a68c 100644
+--- a/net/smc/smc.h
++++ b/net/smc/smc.h
+@@ -237,6 +237,7 @@ struct smc_sock {				/* smc sock container */
+ 	struct work_struct	smc_listen_work;/* prepare new accept socket */
+ 	struct list_head	accept_q;	/* sockets to be accepted */
+ 	spinlock_t		accept_q_lock;	/* protects accept_q */
++	bool			limit_smc_hs;	/* put constraint on handshake */
+ 	bool			use_fallback;	/* fallback to tcp */
+ 	int			fallback_rsn;	/* reason for fallback */
+ 	u32			peer_diagnosis; /* decline reason from peer */
