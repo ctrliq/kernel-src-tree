@@ -418,7 +418,7 @@ unsigned long x86_gsbase_read_cpu_inactive(void)
 {
 	unsigned long gsbase;
 
-	if (static_cpu_has(X86_FEATURE_FSGSBASE)) {
+	if (boot_cpu_has(X86_FEATURE_FSGSBASE)) {
 		unsigned long flags;
 
 		/* Interrupts are disabled here. */
@@ -434,7 +434,7 @@ unsigned long x86_gsbase_read_cpu_inactive(void)
 
 void x86_gsbase_write_cpu_inactive(unsigned long gsbase)
 {
-	if (static_cpu_has(X86_FEATURE_FSGSBASE)) {
+	if (boot_cpu_has(X86_FEATURE_FSGSBASE)) {
 		unsigned long flags;
 
 		/* Interrupts are disabled here. */
@@ -452,7 +452,7 @@ unsigned long x86_fsbase_read_task(struct task_struct *task)
 
 	if (task == current)
 		fsbase = x86_fsbase_read_cpu();
-	else if (static_cpu_has(X86_FEATURE_FSGSBASE) ||
+	else if (boot_cpu_has(X86_FEATURE_FSGSBASE) ||
 		 (task->thread.fsindex == 0))
 		fsbase = task->thread.fsbase;
 	else
@@ -467,7 +467,7 @@ unsigned long x86_gsbase_read_task(struct task_struct *task)
 
 	if (task == current)
 		gsbase = x86_gsbase_read_cpu_inactive();
-	else if (static_cpu_has(X86_FEATURE_FSGSBASE) ||
+	else if (boot_cpu_has(X86_FEATURE_FSGSBASE) ||
 		 (task->thread.gsindex == 0))
 		gsbase = task->thread.gsbase;
 	else
