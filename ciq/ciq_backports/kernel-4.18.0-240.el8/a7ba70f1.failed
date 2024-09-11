@@ -1,0 +1,375 @@
+dma-mapping: treat dev->bus_dma_mask as a DMA limit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Nicolas Saenz Julienne <nsaenzjulienne@suse.de>
+commit a7ba70f1787f977f970cd116076c6fce4b9e01cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a7ba70f1.failed
+
+Using a mask to represent bus DMA constraints has a set of limitations.
+The biggest one being it can only hold a power of two (minus one). The
+DMA mapping code is already aware of this and treats dev->bus_dma_mask
+as a limit. This quirk is already used by some architectures although
+still rare.
+
+With the introduction of the Raspberry Pi 4 we've found a new contender
+for the use of bus DMA limits, as its PCIe bus can only address the
+lower 3GB of memory (of a total of 4GB). This is impossible to represent
+with a mask. To make things worse the device-tree code rounds non power
+of two bus DMA limits to the next power of two, which is unacceptable in
+this case.
+
+In the light of this, rename dev->bus_dma_mask to dev->bus_dma_limit all
+over the tree and treat it as such. Note that dev->bus_dma_limit should
+contain the higher accessible DMA address.
+
+	Signed-off-by: Nicolas Saenz Julienne <nsaenzjulienne@suse.de>
+	Reviewed-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit a7ba70f1787f977f970cd116076c6fce4b9e01cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/mips/pci/fixup-sb1250.c
+#	arch/powerpc/sysdev/fsl_pci.c
+#	arch/x86/pci/sta2x11-fixup.c
+#	drivers/ata/ahci.c
+#	include/linux/dma-direct.h
+#	kernel/dma/direct.c
+diff --cc arch/mips/pci/fixup-sb1250.c
+index 8feae9154baf,40efc990cdce..000000000000
+--- a/arch/mips/pci/fixup-sb1250.c
++++ b/arch/mips/pci/fixup-sb1250.c
+@@@ -22,6 -20,57 +22,60 @@@ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_S
+  			quirk_sb1250_pci);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * The BCM1250, etc. PCI host bridge does not support DAC on its 32-bit
++  * bus, so we set the bus's DMA limit accordingly.  However the HT link
++  * down the artificial PCI-HT bridge supports 40-bit addressing and the
++  * SP1011 HT-PCI bridge downstream supports both DAC and a 64-bit bus
++  * width, so we record the PCI-HT bridge's secondary and subordinate bus
++  * numbers and do not set the limit for devices present in the inclusive
++  * range of those.
++  */
++ struct sb1250_bus_dma_limit_exclude {
++ 	bool set;
++ 	unsigned char start;
++ 	unsigned char end;
++ };
++ 
++ static int sb1250_bus_dma_limit(struct pci_dev *dev, void *data)
++ {
++ 	struct sb1250_bus_dma_limit_exclude *exclude = data;
++ 	bool exclude_this;
++ 	bool ht_bridge;
++ 
++ 	exclude_this = exclude->set && (dev->bus->number >= exclude->start &&
++ 					dev->bus->number <= exclude->end);
++ 	ht_bridge = !exclude->set && (dev->vendor == PCI_VENDOR_ID_SIBYTE &&
++ 				      dev->device == PCI_DEVICE_ID_BCM1250_HT);
++ 
++ 	if (exclude_this) {
++ 		dev_dbg(&dev->dev, "not disabling DAC for device");
++ 	} else if (ht_bridge) {
++ 		exclude->start = dev->subordinate->number;
++ 		exclude->end = pci_bus_max_busnr(dev->subordinate);
++ 		exclude->set = true;
++ 		dev_dbg(&dev->dev, "not disabling DAC for [bus %02x-%02x]",
++ 			exclude->start, exclude->end);
++ 	} else {
++ 		dev_dbg(&dev->dev, "disabling DAC for device");
++ 		dev->dev.bus_dma_limit = DMA_BIT_MASK(32);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void quirk_sb1250_pci_dac(struct pci_dev *dev)
++ {
++ 	struct sb1250_bus_dma_limit_exclude exclude = { .set = false };
++ 
++ 	pci_walk_bus(dev->bus, sb1250_bus_dma_limit, &exclude);
++ }
++ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_SIBYTE, PCI_DEVICE_ID_BCM1250_PCI,
++ 			quirk_sb1250_pci_dac);
++ 
++ /*
+++>>>>>>> a7ba70f1787f (dma-mapping: treat dev->bus_dma_mask as a DMA limit)
+   * The BCM1250, etc. PCI/HT bridge reports as a host bridge.
+   */
+  static void quirk_sb1250_ht(struct pci_dev *dev)
+diff --cc arch/powerpc/sysdev/fsl_pci.c
+index 0c6510f340cb,617a443d673d..000000000000
+--- a/arch/powerpc/sysdev/fsl_pci.c
++++ b/arch/powerpc/sysdev/fsl_pci.c
+@@@ -140,9 -135,8 +140,14 @@@ static void fsl_pci_dma_set_mask(struc
+  	 * mapping that allows addressing any RAM address from across PCI.
+  	 */
+  	if (dev_is_pci(dev) && dma_mask >= pci64_dma_offset * 2 - 1) {
+++<<<<<<< HEAD
+ +		dev->bus_dma_mask = 0;
+ +		set_dma_ops(dev, &dma_nommu_ops);
+ +		set_dma_offset(dev, pci64_dma_offset);
+++=======
++ 		dev->bus_dma_limit = 0;
++ 		dev->archdata.dma_offset = pci64_dma_offset;
+++>>>>>>> a7ba70f1787f (dma-mapping: treat dev->bus_dma_mask as a DMA limit)
+  	}
+  }
+  
+diff --cc arch/x86/pci/sta2x11-fixup.c
+index 7a5bafb76d77,c313d784efab..000000000000
+--- a/arch/x86/pci/sta2x11-fixup.c
++++ b/arch/x86/pci/sta2x11-fixup.c
+@@@ -250,12 -130,22 +250,24 @@@ phys_addr_t __dma_to_phys(struct devic
+  /* At probe time, enable mapping for each endpoint, using the pdev */
+  static void sta2x11_map_ep(struct pci_dev *pdev)
+  {
+ -	struct sta2x11_instance *instance = sta2x11_pdev_to_instance(pdev);
+ -	struct device *dev = &pdev->dev;
+ -	u32 amba_base, max_amba_addr;
+ +	struct sta2x11_mapping *map = sta2x11_pdev_to_mapping(pdev);
+  	int i;
+  
+ -	if (!instance)
+ +	if (!map)
+  		return;
+++<<<<<<< HEAD
+ +	pci_read_config_dword(pdev, AHB_BASE(0), &map->amba_base);
+++=======
++ 
++ 	pci_read_config_dword(pdev, AHB_BASE(0), &amba_base);
++ 	max_amba_addr = amba_base + STA2X11_AMBA_SIZE - 1;
++ 
++ 	dev->dma_pfn_offset = PFN_DOWN(-amba_base);
++ 
++ 	dev->bus_dma_limit = max_amba_addr;
++ 	pci_set_consistent_dma_mask(pdev, max_amba_addr);
++ 	pci_set_dma_mask(pdev, max_amba_addr);
+++>>>>>>> a7ba70f1787f (dma-mapping: treat dev->bus_dma_mask as a DMA limit)
+  
+  	/* Configure AHB mapping */
+  	pci_write_config_dword(pdev, AHB_PEXLBASE(0), 0);
+diff --cc drivers/ata/ahci.c
+index a2ef9d2ce4fc,7c6d06ffb586..000000000000
+--- a/drivers/ata/ahci.c
++++ b/drivers/ata/ahci.c
+@@@ -927,6 -895,9 +927,12 @@@ static int ahci_configure_dma_masks(str
+  	/*
+  	 * If the device fixup already set the dma_mask to some non-standard
+  	 * value, don't extend it here. This happens on STA2X11, for example.
+++<<<<<<< HEAD
+++=======
++ 	 *
++ 	 * XXX: manipulating the DMA mask from platform code is completely
++ 	 * bogus, platform code should use dev->bus_dma_limit instead..
+++>>>>>>> a7ba70f1787f (dma-mapping: treat dev->bus_dma_mask as a DMA limit)
+  	 */
+  	if (pdev->dma_mask && pdev->dma_mask < DMA_BIT_MASK(32))
+  		return 0;
+diff --cc include/linux/dma-direct.h
+index 3238177e65ad,24b8684aa21d..000000000000
+--- a/include/linux/dma-direct.h
++++ b/include/linux/dma-direct.h
+@@@ -65,6 -51,21 +65,24 @@@ static inline phys_addr_t dma_to_phys(s
+  	return __sme_clr(__dma_to_phys(dev, daddr));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool dma_capable(struct device *dev, dma_addr_t addr, size_t size,
++ 		bool is_ram)
++ {
++ 	dma_addr_t end = addr + size - 1;
++ 
++ 	if (!dev->dma_mask)
++ 		return false;
++ 
++ 	if (is_ram && !IS_ENABLED(CONFIG_ARCH_DMA_ADDR_T_64BIT) &&
++ 	    min(addr, end) < phys_to_dma(dev, PFN_PHYS(min_low_pfn)))
++ 		return false;
++ 
++ 	return end <= min_not_zero(*dev->dma_mask, dev->bus_dma_limit);
++ }
++ 
+++>>>>>>> a7ba70f1787f (dma-mapping: treat dev->bus_dma_mask as a DMA limit)
+  u64 dma_direct_get_required_mask(struct device *dev);
+  void *dma_direct_alloc(struct device *dev, size_t size, dma_addr_t *dma_handle,
+  		gfp_t gfp, unsigned long attrs);
+diff --cc kernel/dma/direct.c
+index f4581748eeeb,6af7ae83c4ad..000000000000
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@@ -69,9 -74,9 +68,13 @@@ static gfp_t __dma_direct_optimal_gfp_m
+  	 * Note that GFP_DMA32 and GFP_DMA are no ops without the corresponding
+  	 * zones.
+  	 */
+++<<<<<<< HEAD
+ +	if (*phys_mask <= DMA_BIT_MASK(ARCH_ZONE_DMA_BITS))
+++=======
++ 	if (*phys_limit <= DMA_BIT_MASK(zone_dma_bits))
+++>>>>>>> a7ba70f1787f (dma-mapping: treat dev->bus_dma_mask as a DMA limit)
+  		return GFP_DMA;
+- 	if (*phys_mask <= DMA_BIT_MASK(32))
++ 	if (*phys_limit <= DMA_BIT_MASK(32))
+  		return GFP_DMA32;
+  	return 0;
+  }
+* Unmerged path arch/mips/pci/fixup-sb1250.c
+* Unmerged path arch/powerpc/sysdev/fsl_pci.c
+diff --git a/arch/x86/kernel/pci-dma.c b/arch/x86/kernel/pci-dma.c
+index 3a99329ce314..6500d948bd0e 100644
+--- a/arch/x86/kernel/pci-dma.c
++++ b/arch/x86/kernel/pci-dma.c
+@@ -146,7 +146,7 @@ rootfs_initcall(pci_iommu_init);
+ 
+ static int via_no_dac_cb(struct pci_dev *pdev, void *data)
+ {
+-	pdev->dev.bus_dma_mask = DMA_BIT_MASK(32);
++	pdev->dev.bus_dma_limit = DMA_BIT_MASK(32);
+ 	return 0;
+ }
+ 
+diff --git a/arch/x86/mm/mem_encrypt.c b/arch/x86/mm/mem_encrypt.c
+index 597968f1dabb..49bc3e8dd98c 100644
+--- a/arch/x86/mm/mem_encrypt.c
++++ b/arch/x86/mm/mem_encrypt.c
+@@ -370,7 +370,7 @@ bool force_dma_unencrypted(struct device *dev)
+ 	if (sme_active()) {
+ 		u64 dma_enc_mask = DMA_BIT_MASK(__ffs64(sme_me_mask));
+ 		u64 dma_dev_mask = min_not_zero(dev->coherent_dma_mask,
+-						dev->bus_dma_mask);
++						dev->bus_dma_limit);
+ 
+ 		if (dma_dev_mask <= dma_enc_mask)
+ 			return true;
+* Unmerged path arch/x86/pci/sta2x11-fixup.c
+diff --git a/drivers/acpi/arm64/iort.c b/drivers/acpi/arm64/iort.c
+index 0c9a5995b738..bc61e5bf7272 100644
+--- a/drivers/acpi/arm64/iort.c
++++ b/drivers/acpi/arm64/iort.c
+@@ -1137,8 +1137,8 @@ static int rc_dma_get_range(struct device *dev, u64 *size)
+  */
+ void iort_dma_setup(struct device *dev, u64 *dma_addr, u64 *dma_size)
+ {
+-	u64 mask, dmaaddr = 0, size = 0, offset = 0;
+-	int ret, msb;
++	u64 end, mask, dmaaddr = 0, size = 0, offset = 0;
++	int ret;
+ 
+ 	/*
+ 	 * If @dev is expected to be DMA-capable then the bus code that created
+@@ -1165,19 +1165,13 @@ void iort_dma_setup(struct device *dev, u64 *dma_addr, u64 *dma_size)
+ 	}
+ 
+ 	if (!ret) {
+-		msb = fls64(dmaaddr + size - 1);
+ 		/*
+-		 * Round-up to the power-of-two mask or set
+-		 * the mask to the whole 64-bit address space
+-		 * in case the DMA region covers the full
+-		 * memory window.
++		 * Limit coherent and dma mask based on size retrieved from
++		 * firmware.
+ 		 */
+-		mask = msb == 64 ? U64_MAX : (1ULL << msb) - 1;
+-		/*
+-		 * Limit coherent and dma mask based on size
+-		 * retrieved from firmware.
+-		 */
+-		dev->bus_dma_mask = mask;
++		end = dmaaddr + size - 1;
++		mask = DMA_BIT_MASK(ilog2(end) + 1);
++		dev->bus_dma_limit = end;
+ 		dev->coherent_dma_mask = mask;
+ 		*dev->dma_mask = mask;
+ 	}
+* Unmerged path drivers/ata/ahci.c
+diff --git a/drivers/iommu/dma-iommu.c b/drivers/iommu/dma-iommu.c
+index 4e05d76051f2..1e3da6190ff1 100644
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -431,8 +431,7 @@ static dma_addr_t iommu_dma_alloc_iova(struct iommu_domain *domain,
+ 	if (iova_len < (1 << (IOVA_RANGE_CACHE_MAX_SIZE - 1)))
+ 		iova_len = roundup_pow_of_two(iova_len);
+ 
+-	if (dev->bus_dma_mask)
+-		dma_limit &= dev->bus_dma_mask;
++	dma_limit = min_not_zero(dma_limit, dev->bus_dma_limit);
+ 
+ 	if (domain->geometry.force_aperture)
+ 		dma_limit = min(dma_limit, (u64)domain->geometry.aperture_end);
+diff --git a/drivers/of/device.c b/drivers/of/device.c
+index 409343cd3b4b..7f5545936bb6 100644
+--- a/drivers/of/device.c
++++ b/drivers/of/device.c
+@@ -93,7 +93,7 @@ int of_dma_configure(struct device *dev, struct device_node *np, bool force_dma)
+ 	bool coherent;
+ 	unsigned long offset;
+ 	const struct iommu_ops *iommu;
+-	u64 mask;
++	u64 mask, end;
+ 
+ 	ret = of_dma_get_range(np, &dma_addr, &paddr, &size);
+ 	if (ret < 0) {
+@@ -148,12 +148,13 @@ int of_dma_configure(struct device *dev, struct device_node *np, bool force_dma)
+ 	 * Limit coherent and dma mask based on size and default mask
+ 	 * set by the driver.
+ 	 */
+-	mask = DMA_BIT_MASK(ilog2(dma_addr + size - 1) + 1);
++	end = dma_addr + size - 1;
++	mask = DMA_BIT_MASK(ilog2(end) + 1);
+ 	dev->coherent_dma_mask &= mask;
+ 	*dev->dma_mask &= mask;
+-	/* ...but only set bus mask if we found valid dma-ranges earlier */
++	/* ...but only set bus limit if we found valid dma-ranges earlier */
+ 	if (!ret)
+-		dev->bus_dma_mask = mask;
++		dev->bus_dma_limit = end;
+ 
+ 	coherent = of_dma_is_coherent(np);
+ 	dev_dbg(dev, "device is%sdma coherent\n",
+diff --git a/include/linux/device.h b/include/linux/device.h
+index a7e07e1be4e6..dc36fd7c1a64 100644
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -931,8 +931,8 @@ struct device_extended_rh {
+  * @coherent_dma_mask: Like dma_mask, but for alloc_coherent mapping as not all
+  * 		hardware supports 64-bit addresses for consistent allocations
+  * 		such descriptors.
+- * @bus_dma_mask: Mask of an upstream bridge or bus which imposes a smaller DMA
+- *		limit than the device itself supports.
++ * @bus_dma_limit: Limit of an upstream bridge or bus which imposes a smaller
++ *		DMA limit than the device itself supports.
+  * @dma_pfn_offset: offset of DMA memory range relatively of RAM
+  * @dma_parms:	A low level driver may set these to teach IOMMU code about
+  * 		segment limitations.
+@@ -1015,7 +1015,7 @@ struct device {
+ 					     not all hardware supports
+ 					     64 bit addresses for consistent
+ 					     allocations such descriptors. */
+-	u64		bus_dma_mask;	/* upstream dma_mask constraint */
++	u64		bus_dma_limit;	/* upstream dma constraint */
+ 	unsigned long	dma_pfn_offset;
+ 
+ 	struct device_dma_parameters *dma_parms;
+* Unmerged path include/linux/dma-direct.h
+diff --git a/include/linux/dma-mapping.h b/include/linux/dma-mapping.h
+index e7035a66d5a5..c6362aabff8f 100644
+--- a/include/linux/dma-mapping.h
++++ b/include/linux/dma-mapping.h
+@@ -697,7 +697,7 @@ static inline int dma_coerce_mask_and_coherent(struct device *dev, u64 mask)
+  */
+ static inline bool dma_addressing_limited(struct device *dev)
+ {
+-	return min_not_zero(dma_get_mask(dev), dev->bus_dma_mask) <
++	return min_not_zero(dma_get_mask(dev), dev->bus_dma_limit) <
+ 			    dma_get_required_mask(dev);
+ }
+ 
+* Unmerged path kernel/dma/direct.c
