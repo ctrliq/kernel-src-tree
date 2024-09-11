@@ -1,0 +1,174 @@
+mm: memcontrol: consolidate lruvec stat flushing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 2cd21c89800c2203331e5564df2155757ded2e86
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/2cd21c89.failed
+
+There are two functions to flush the per-cpu data of an lruvec into the
+rest of the cgroup tree: when the cgroup is being freed, and when a CPU
+disappears during hotplug.  The difference is whether all CPUs or just
+one is being collected, but the rest of the flushing code is the same.
+Merge them into one function and share the common code.
+
+Link: https://lkml.kernel.org/r/20210209163304.77088-8-hannes@cmpxchg.org
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Roman Gushchin <guro@fb.com>
+	Cc: Michal Koutný <mkoutny@suse.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2cd21c89800c2203331e5564df2155757ded2e86)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index 1161adcc002d,5582e1531b43..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -2452,49 -2395,8 +2475,54 @@@ static int memcg_hotplug_cpu_dead(unsig
+  	stock = &per_cpu(memcg_stock, cpu);
+  	drain_stock(stock);
+  
+++<<<<<<< HEAD
+ +	for_each_mem_cgroup(memcg) {
+ +		struct memcg_vmstats_percpu *statc;
+ +		int i;
+ +
+ +		statc = per_cpu_ptr(memcg->vmstats_percpu, cpu);
+ +
+ +		for (i = 0; i < MEMCG_NR_STAT; i++) {
+ +			int nid;
+ +
+ +			if (statc->stat[i]) {
+ +				mod_memcg_state(memcg, i, statc->stat[i]);
+ +				statc->stat[i] = 0;
+ +			}
+ +
+ +			if (i >= NR_VM_NODE_STAT_ITEMS)
+ +				continue;
+ +
+ +			for_each_node(nid) {
+ +				struct batched_lruvec_stat *lstatc;
+ +				struct mem_cgroup_per_node *pn;
+ +				long x;
+ +
+ +				pn = memcg->nodeinfo[nid];
+ +				lstatc = per_cpu_ptr(pn->lruvec_stat_cpu, cpu);
+ +
+ +				x = lstatc->count[i];
+ +				lstatc->count[i] = 0;
+ +
+ +				if (x) {
+ +					do {
+ +						atomic_long_add(x, &pn->lruvec_stat[i]);
+ +					} while ((pn = parent_nodeinfo(pn, nid)));
+ +				}
+ +			}
+ +		}
+ +
+ +		for (i = 0; i < NR_VM_EVENT_ITEMS; i++) {
+ +			if (statc->events[i]) {
+ +				count_memcg_events(memcg, i, statc->events[i]);
+ +				statc->events[i] = 0;
+ +			}
+ +		}
+ +	}
+++=======
++ 	for_each_mem_cgroup(memcg)
++ 		memcg_flush_lruvec_page_state(memcg, cpu);
+++>>>>>>> 2cd21c89800c (mm: memcontrol: consolidate lruvec stat flushing)
+  
+  	return 0;
+  }
+@@@ -3795,57 -3583,6 +3823,60 @@@ static u64 mem_cgroup_read_u64(struct c
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void memcg_flush_percpu_vmstats(struct mem_cgroup *memcg)
+ +{
+ +	unsigned long stat[MEMCG_NR_STAT] = {0};
+ +	struct mem_cgroup *mi;
+ +	int node, cpu, i;
+ +
+ +	for_each_online_cpu(cpu)
+ +		for (i = 0; i < MEMCG_NR_STAT; i++)
+ +			stat[i] += per_cpu(memcg->vmstats_percpu->stat[i], cpu);
+ +
+ +	for (mi = memcg; mi; mi = parent_mem_cgroup(mi))
+ +		for (i = 0; i < MEMCG_NR_STAT; i++)
+ +			atomic_long_add(stat[i], &mi->vmstats[i]);
+ +
+ +	for_each_node(node) {
+ +		struct mem_cgroup_per_node *pn = memcg->nodeinfo[node];
+ +		struct mem_cgroup_per_node *pi;
+ +
+ +		for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++)
+ +			stat[i] = 0;
+ +
+ +		for_each_online_cpu(cpu)
+ +			for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++)
+ +				stat[i] += per_cpu(
+ +					pn->lruvec_stat_cpu->count[i], cpu);
+ +
+ +		for (pi = pn; pi; pi = parent_nodeinfo(pi, node))
+ +			for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++)
+ +				atomic_long_add(stat[i], &pi->lruvec_stat[i]);
+ +	}
+ +}
+ +
+ +static void memcg_flush_percpu_vmevents(struct mem_cgroup *memcg)
+ +{
+ +	unsigned long events[NR_VM_EVENT_ITEMS];
+ +	struct mem_cgroup *mi;
+ +	int cpu, i;
+ +
+ +	for (i = 0; i < NR_VM_EVENT_ITEMS; i++)
+ +		events[i] = 0;
+ +
+ +	for_each_online_cpu(cpu)
+ +		for (i = 0; i < NR_VM_EVENT_ITEMS; i++)
+ +			events[i] += per_cpu(memcg->vmstats_percpu->events[i],
+ +					     cpu);
+ +
+ +	for (mi = memcg; mi; mi = parent_mem_cgroup(mi))
+ +		for (i = 0; i < NR_VM_EVENT_ITEMS; i++)
+ +			atomic_long_add(events[i], &mi->vmevents[i]);
+ +}
+ +
+++=======
+++>>>>>>> 2cd21c89800c (mm: memcontrol: consolidate lruvec stat flushing)
+  #ifdef CONFIG_MEMCG_KMEM
+  static int memcg_online_kmem(struct mem_cgroup *memcg)
+  {
+@@@ -5392,13 -5118,15 +5423,20 @@@ static void __mem_cgroup_free(struct me
+  
+  static void mem_cgroup_free(struct mem_cgroup *memcg)
+  {
++ 	int cpu;
++ 
+  	memcg_wb_domain_exit(memcg);
+  	/*
+ -	 * Flush percpu lruvec stats to guarantee the value
+ -	 * correctness on parent's and all ancestor levels.
+ +	 * Flush percpu vmstats and vmevents to guarantee the value correctness
+ +	 * on parent's and all ancestor levels.
+  	 */
+++<<<<<<< HEAD
+ +	memcg_flush_percpu_vmstats(memcg);
+ +	memcg_flush_percpu_vmevents(memcg);
+++=======
++ 	for_each_online_cpu(cpu)
++ 		memcg_flush_lruvec_page_state(memcg, cpu);
+++>>>>>>> 2cd21c89800c (mm: memcontrol: consolidate lruvec stat flushing)
+  	__mem_cgroup_free(memcg);
+  }
+  
+* Unmerged path mm/memcontrol.c
