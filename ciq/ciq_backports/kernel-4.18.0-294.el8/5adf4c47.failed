@@ -1,0 +1,326 @@
+net/mlx5e: RX, Re-work initializaiton of RX function pointers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 5adf4c475aaa037d8f787d08c7699954cf78b19b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/5adf4c47.failed
+
+Instead of exposing the RQ datapath handlers (from en_rx.c) so that
+they are set in the control path (in en_main.c), wrap this logic
+in a single function in en_rx.c and expose it alone.
+
+Every profile will now have a pointer to the new mlx5e_rx_handlers
+structure, instead of directly pointing to the previously-exposed
+RQ handlers.
+
+This significantly improves locality and modularity of the driver,
+and allows many functions in en_rx.c to become static.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Reviewed-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 5adf4c475aaa037d8f787d08c7699954cf78b19b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index fb2ab3692827,9c0ef6e5da88..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -1051,7 -1112,18 +1068,22 @@@ struct sk_buff *mlx5e_build_linear_skb(
+  	return skb;
+  }
+  
+++<<<<<<< HEAD
+ +struct sk_buff *
+++=======
++ static void mlx5e_fill_xdp_buff(struct mlx5e_rq *rq, void *va, u16 headroom,
++ 				u32 len, struct xdp_buff *xdp)
++ {
++ 	xdp->data_hard_start = va;
++ 	xdp->data = va + headroom;
++ 	xdp_set_data_meta_invalid(xdp);
++ 	xdp->data_end = xdp->data + len;
++ 	xdp->rxq = &rq->xdp_rxq;
++ 	xdp->frame_sz = rq->buff.frame0_sz;
++ }
++ 
++ static struct sk_buff *
+++>>>>>>> 5adf4c475aaa (net/mlx5e: RX, Re-work initializaiton of RX function pointers)
+  mlx5e_skb_from_cqe_linear(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
+  			  struct mlx5e_wqe_frag_info *wi, u32 cqe_bcnt)
+  {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index de4ff7465a5f..026a42082be8 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -532,6 +532,8 @@ typedef struct sk_buff *
+ typedef bool (*mlx5e_fp_post_rx_wqes)(struct mlx5e_rq *rq);
+ typedef void (*mlx5e_fp_dealloc_wqe)(struct mlx5e_rq*, u16);
+ 
++int mlx5e_rq_set_handlers(struct mlx5e_rq *rq, struct mlx5e_params *params, bool xsk);
++
+ enum mlx5e_rq_flag {
+ 	MLX5E_RQ_FLAG_XDP_XMIT,
+ 	MLX5E_RQ_FLAG_XDP_REDIRECT,
+@@ -816,6 +818,13 @@ struct mlx5e_priv {
+ 	struct mlx5e_scratchpad    scratchpad;
+ };
+ 
++struct mlx5e_rx_handlers {
++	mlx5e_fp_handle_rx_cqe handle_rx_cqe;
++	mlx5e_fp_handle_rx_cqe handle_rx_cqe_mpwqe;
++};
++
++extern const struct mlx5e_rx_handlers mlx5e_rx_handlers_nic;
++
+ struct mlx5e_profile {
+ 	int	(*init)(struct mlx5_core_dev *mdev,
+ 			struct net_device *netdev,
+@@ -832,10 +841,7 @@ struct mlx5e_profile {
+ 	void	(*update_carrier)(struct mlx5e_priv *priv);
+ 	unsigned int (*stats_grps_num)(struct mlx5e_priv *priv);
+ 	mlx5e_stats_grp_t *stats_grps;
+-	struct {
+-		mlx5e_fp_handle_rx_cqe handle_rx_cqe;
+-		mlx5e_fp_handle_rx_cqe handle_rx_cqe_mpwqe;
+-	} rx_handlers;
++	const struct mlx5e_rx_handlers *rx_handlers;
+ 	int	max_tc;
+ 	u8	rq_groups;
+ };
+@@ -865,26 +871,9 @@ void mlx5e_page_dma_unmap(struct mlx5e_rq *rq, struct mlx5e_dma_info *dma_info);
+ void mlx5e_page_release_dynamic(struct mlx5e_rq *rq,
+ 				struct mlx5e_dma_info *dma_info,
+ 				bool recycle);
+-void mlx5e_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe);
+-void mlx5e_handle_rx_cqe_mpwrq(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe);
+ bool mlx5e_post_rx_wqes(struct mlx5e_rq *rq);
+ int mlx5e_poll_ico_cq(struct mlx5e_cq *cq);
+ bool mlx5e_post_rx_mpwqes(struct mlx5e_rq *rq);
+-void mlx5e_dealloc_rx_wqe(struct mlx5e_rq *rq, u16 ix);
+-void mlx5e_dealloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix);
+-struct sk_buff *
+-mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
+-				u16 cqe_bcnt, u32 head_offset, u32 page_idx);
+-struct sk_buff *
+-mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
+-				   u16 cqe_bcnt, u32 head_offset, u32 page_idx);
+-struct sk_buff *
+-mlx5e_skb_from_cqe_linear(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
+-			  struct mlx5e_wqe_frag_info *wi, u32 cqe_bcnt);
+-struct sk_buff *
+-mlx5e_skb_from_cqe_nonlinear(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
+-			     struct mlx5e_wqe_frag_info *wi, u32 cqe_bcnt);
+-
+ void mlx5e_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats);
+ void mlx5e_fold_sw_stats64(struct mlx5e_priv *priv, struct rtnl_link_stats64 *s);
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.h b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.h
+index 2a47673da5a4..f96e786db158 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.h
+@@ -47,7 +47,6 @@
+ 
+ struct sk_buff *mlx5e_ipsec_handle_rx_skb(struct net_device *netdev,
+ 					  struct sk_buff *skb, u32 *cqe_bcnt);
+-void mlx5e_ipsec_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe);
+ 
+ void mlx5e_ipsec_inverse_table_init(void);
+ bool mlx5e_ipsec_feature_check(struct sk_buff *skb, struct net_device *netdev,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 950b255f7f4e..c299cfa6ea7f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -45,7 +45,6 @@
+ #include "en_tc.h"
+ #include "en_rep.h"
+ #include "en_accel/ipsec.h"
+-#include "en_accel/ipsec_rxtx.h"
+ #include "en_accel/en_accel.h"
+ #include "en_accel/tls.h"
+ #include "accel/ipsec.h"
+@@ -65,7 +64,6 @@
+ #include "en/hv_vhca_stats.h"
+ #include "en/devlink.h"
+ #include "lib/mlx5.h"
+-#include "fpga/ipsec.h"
+ 
+ bool mlx5e_check_fragmented_striding_rq_cap(struct mlx5_core_dev *mdev)
+ {
+@@ -434,29 +432,6 @@ static int mlx5e_alloc_rq(struct mlx5e_channel *c,
+ 		pool_size = MLX5_MPWRQ_PAGES_PER_WQE <<
+ 			mlx5e_mpwqe_get_log_rq_size(params, xsk);
+ 
+-		rq->post_wqes = mlx5e_post_rx_mpwqes;
+-		rq->dealloc_wqe = mlx5e_dealloc_rx_mpwqe;
+-
+-		rq->handle_rx_cqe = c->priv->profile->rx_handlers.handle_rx_cqe_mpwqe;
+-#ifdef CONFIG_MLX5_EN_IPSEC
+-		if (MLX5_IPSEC_DEV(mdev)) {
+-			err = -EINVAL;
+-			netdev_err(c->netdev, "MPWQE RQ with IPSec offload not supported\n");
+-			goto err_rq_wq_destroy;
+-		}
+-#endif
+-		if (!rq->handle_rx_cqe) {
+-			err = -EINVAL;
+-			netdev_err(c->netdev, "RX handler of MPWQE RQ is not set, err %d\n", err);
+-			goto err_rq_wq_destroy;
+-		}
+-
+-		rq->mpwqe.skb_from_cqe_mpwrq = xsk ?
+-			mlx5e_xsk_skb_from_cqe_mpwrq_linear :
+-			mlx5e_rx_mpwqe_is_linear_skb(mdev, params, NULL) ?
+-				mlx5e_skb_from_cqe_mpwrq_linear :
+-				mlx5e_skb_from_cqe_mpwrq_nonlinear;
+-
+ 		rq->mpwqe.log_stride_sz = mlx5e_mpwqe_get_log_stride_size(mdev, params, xsk);
+ 		rq->mpwqe.num_strides =
+ 			BIT(mlx5e_mpwqe_get_log_num_strides(mdev, params, xsk));
+@@ -501,30 +476,13 @@ static int mlx5e_alloc_rq(struct mlx5e_channel *c,
+ 		if (err)
+ 			goto err_free;
+ 
+-		rq->post_wqes = mlx5e_post_rx_wqes;
+-		rq->dealloc_wqe = mlx5e_dealloc_rx_wqe;
+-
+-#ifdef CONFIG_MLX5_EN_IPSEC
+-		if ((mlx5_fpga_ipsec_device_caps(mdev) & MLX5_ACCEL_IPSEC_CAP_DEVICE) &&
+-		    c->priv->ipsec)
+-			rq->handle_rx_cqe = mlx5e_ipsec_handle_rx_cqe;
+-		else
+-#endif
+-			rq->handle_rx_cqe = c->priv->profile->rx_handlers.handle_rx_cqe;
+-		if (!rq->handle_rx_cqe) {
+-			err = -EINVAL;
+-			netdev_err(c->netdev, "RX handler of RQ is not set, err %d\n", err);
+-			goto err_free;
+-		}
+-
+-		rq->wqe.skb_from_cqe = xsk ?
+-			mlx5e_xsk_skb_from_cqe_linear :
+-			mlx5e_rx_is_linear_skb(params, NULL) ?
+-				mlx5e_skb_from_cqe_linear :
+-				mlx5e_skb_from_cqe_nonlinear;
+ 		rq->mkey_be = c->mkey_be;
+ 	}
+ 
++	err = mlx5e_rq_set_handlers(rq, params, xsk);
++	if (err)
++		goto err_free;
++
+ 	if (xsk) {
+ 		rq->buff.frame0_sz = xsk_umem_xdp_frame_sz(umem);
+ 
+@@ -5310,8 +5268,7 @@ static const struct mlx5e_profile mlx5e_nic_profile = {
+ 	.update_rx	   = mlx5e_update_nic_rx,
+ 	.update_stats	   = mlx5e_update_ndo_stats,
+ 	.update_carrier	   = mlx5e_update_carrier,
+-	.rx_handlers.handle_rx_cqe       = mlx5e_handle_rx_cqe,
+-	.rx_handlers.handle_rx_cqe_mpwqe = mlx5e_handle_rx_cqe_mpwrq,
++	.rx_handlers       = &mlx5e_rx_handlers_nic,
+ 	.max_tc		   = MLX5E_MAX_NUM_TC,
+ 	.rq_groups	   = MLX5E_NUM_RQ_GROUPS(XSK),
+ 	.stats_grps	   = mlx5e_nic_stats_grps,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 2053796e8e01..586876e13dbb 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -1128,8 +1128,7 @@ static const struct mlx5e_profile mlx5e_rep_profile = {
+ 	.enable		        = mlx5e_rep_enable,
+ 	.update_rx		= mlx5e_update_rep_rx,
+ 	.update_stats           = mlx5e_update_ndo_stats,
+-	.rx_handlers.handle_rx_cqe       = mlx5e_handle_rx_cqe_rep,
+-	.rx_handlers.handle_rx_cqe_mpwqe = mlx5e_handle_rx_cqe_mpwrq_rep,
++	.rx_handlers            = &mlx5e_rx_handlers_rep,
+ 	.max_tc			= 1,
+ 	.rq_groups		= MLX5E_NUM_RQ_GROUPS(REGULAR),
+ 	.stats_grps		= mlx5e_rep_stats_grps,
+@@ -1148,8 +1147,7 @@ static const struct mlx5e_profile mlx5e_uplink_rep_profile = {
+ 	.update_rx		= mlx5e_update_rep_rx,
+ 	.update_stats           = mlx5e_update_ndo_stats,
+ 	.update_carrier	        = mlx5e_update_carrier,
+-	.rx_handlers.handle_rx_cqe       = mlx5e_handle_rx_cqe_rep,
+-	.rx_handlers.handle_rx_cqe_mpwqe = mlx5e_handle_rx_cqe_mpwrq_rep,
++	.rx_handlers            = &mlx5e_rx_handlers_rep,
+ 	.max_tc			= MLX5E_MAX_NUM_TC,
+ 	.rq_groups		= MLX5E_NUM_RQ_GROUPS(REGULAR),
+ 	.stats_grps		= mlx5e_ul_rep_stats_grps,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+index 1f74a4b54f5f..ffc458ab43fe 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+@@ -41,6 +41,8 @@
+ #include "lib/port_tun.h"
+ 
+ #ifdef CONFIG_MLX5_ESWITCH
++extern const struct mlx5e_rx_handlers mlx5e_rx_handlers_rep;
++
+ struct mlx5e_neigh_update_table {
+ 	struct rhashtable       neigh_ht;
+ 	/* Save the neigh hash entries in a list in addition to the hash table
+@@ -194,10 +196,6 @@ bool mlx5e_is_uplink_rep(struct mlx5e_priv *priv);
+ int mlx5e_add_sqs_fwd_rules(struct mlx5e_priv *priv);
+ void mlx5e_remove_sqs_fwd_rules(struct mlx5e_priv *priv);
+ 
+-void mlx5e_handle_rx_cqe_rep(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe);
+-void mlx5e_handle_rx_cqe_mpwrq_rep(struct mlx5e_rq *rq,
+-				   struct mlx5_cqe64 *cqe);
+-
+ void mlx5e_rep_queue_neigh_stats_work(struct mlx5e_priv *priv);
+ 
+ bool mlx5e_eswitch_vf_rep(struct net_device *netdev);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+index 2a89a07ac11c..cbb271d1a4e3 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@ -466,8 +466,7 @@ static const struct mlx5e_profile mlx5i_nic_profile = {
+ 	.update_rx	   = mlx5i_update_nic_rx,
+ 	.update_stats	   = NULL, /* mlx5i_update_stats */
+ 	.update_carrier    = NULL, /* no HW update in IB link */
+-	.rx_handlers.handle_rx_cqe       = mlx5i_handle_rx_cqe,
+-	.rx_handlers.handle_rx_cqe_mpwqe = NULL, /* Not supported */
++	.rx_handlers       = &mlx5i_rx_handlers,
+ 	.max_tc		   = MLX5I_MAX_NUM_TC,
+ 	.rq_groups	   = MLX5E_NUM_RQ_GROUPS(REGULAR),
+ 	.stats_grps        = mlx5i_stats_grps,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.h b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.h
+index 9009be732515..af626886dbd7 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.h
+@@ -42,6 +42,7 @@
+ 
+ extern const struct ethtool_ops mlx5i_ethtool_ops;
+ extern const struct ethtool_ops mlx5i_pkey_ethtool_ops;
++extern const struct mlx5e_rx_handlers mlx5i_rx_handlers;
+ 
+ #define MLX5_IB_GRH_BYTES       40
+ #define MLX5_IPOIB_ENCAP_LEN    4
+@@ -117,7 +118,6 @@ struct mlx5i_tx_wqe {
+ 
+ void mlx5i_sq_xmit(struct mlx5e_txqsq *sq, struct sk_buff *skb,
+ 		   struct mlx5_av *av, u32 dqpn, u32 dqkey, bool xmit_more);
+-void mlx5i_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe);
+ void mlx5i_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats);
+ 
+ #endif /* CONFIG_MLX5_CORE_IPOIB */
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
+index 1a25ef296021..81fd970ef3f6 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
+@@ -352,8 +352,7 @@ static const struct mlx5e_profile mlx5i_pkey_nic_profile = {
+ 	.disable	   = NULL,
+ 	.update_rx	   = mlx5i_update_nic_rx,
+ 	.update_stats	   = NULL,
+-	.rx_handlers.handle_rx_cqe       = mlx5i_handle_rx_cqe,
+-	.rx_handlers.handle_rx_cqe_mpwqe = NULL, /* Not supported */
++	.rx_handlers       = &mlx5i_rx_handlers,
+ 	.max_tc		   = MLX5I_MAX_NUM_TC,
+ 	.rq_groups	   = MLX5E_NUM_RQ_GROUPS(REGULAR),
+ };
