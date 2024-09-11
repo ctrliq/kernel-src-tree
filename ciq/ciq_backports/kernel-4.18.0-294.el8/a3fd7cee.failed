@@ -1,0 +1,351 @@
+net: Introduce netns_bpf for BPF programs attached to netns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] Introduce netns_bpf for BPF programs attached to netns (Jiri Benc) [1882708]
+Rebuild_FUZZ: 95.58%
+commit-author Jakub Sitnicki <jakub@cloudflare.com>
+commit a3fd7ceee05431d2c51ed86c6cae015d236a51f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a3fd7cee.failed
+
+In order to:
+
+ (1) attach more than one BPF program type to netns, or
+ (2) support attaching BPF programs to netns with bpf_link, or
+ (3) support multi-prog attach points for netns
+
+we will need to keep more state per netns than a single pointer like we
+have now for BPF flow dissector program.
+
+Prepare for the above by extracting netns_bpf that is part of struct net,
+for storing all state related to BPF programs attached to netns.
+
+Turn flow dissector callbacks for querying/attaching/detaching a program
+into generic ones that operate on netns_bpf. Next patch will move the
+generic callbacks into their own module.
+
+This is similar to how it is organized for cgroup with cgroup_bpf.
+
+	Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Cc: Stanislav Fomichev <sdf@google.com>
+Link: https://lore.kernel.org/bpf/20200531082846.2117903-3-jakub@cloudflare.com
+(cherry picked from commit a3fd7ceee05431d2c51ed86c6cae015d236a51f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/net_namespace.h
+#	kernel/bpf/syscall.c
+#	net/core/flow_dissector.c
+diff --cc include/net/net_namespace.h
+index 9957bfa4293e,2ee5901bec7a..000000000000
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@@ -32,7 -32,8 +32,12 @@@
+  #include <net/netns/xfrm.h>
+  #include <net/netns/mpls.h>
+  #include <net/netns/can.h>
+++<<<<<<< HEAD
+ +#include RH_KABI_HIDE_INCLUDE(<net/netns/xdp.h>)
+++=======
++ #include <net/netns/xdp.h>
++ #include <net/netns/bpf.h>
+++>>>>>>> a3fd7ceee054 (net: Introduce netns_bpf for BPF programs attached to netns)
+  #include <linux/ns_common.h>
+  #include <linux/idr.h>
+  #include <linux/skbuff.h>
+@@@ -150,6 -163,9 +155,12 @@@ struct net 
+  #endif
+  	struct net_generic __rcu	*gen;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Used to store attached BPF programs */
++ 	struct netns_bpf	bpf;
++ 
+++>>>>>>> a3fd7ceee054 (net: Introduce netns_bpf for BPF programs attached to netns)
+  	/* Note : following structs are cache line aligned */
+  #ifdef CONFIG_XFRM
+  	struct netns_xfrm	xfrm;
+diff --cc kernel/bpf/syscall.c
+index 9186e511feb3,c77ab9c76f7b..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -34,9 -26,8 +34,14 @@@
+  #include <linux/audit.h>
+  #include <uapi/linux/btf.h>
+  #include <linux/bpf_lsm.h>
+++<<<<<<< HEAD
+ +#include <linux/init.h>
+ +
+ +#include <linux/rh_features.h>
+++=======
++ #include <linux/poll.h>
++ #include <linux/bpf-netns.h>
+++>>>>>>> a3fd7ceee054 (net: Introduce netns_bpf for BPF programs attached to netns)
+  
+  #define IS_FD_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PERF_EVENT_ARRAY || \
+  			  (map)->map_type == BPF_MAP_TYPE_CGROUP_ARRAY || \
+@@@ -2849,7 -2907,9 +2854,13 @@@ static int bpf_prog_detach(const union 
+  	case BPF_PROG_TYPE_LIRC_MODE2:
+  		return lirc_prog_detach(attr);
+  	case BPF_PROG_TYPE_FLOW_DISSECTOR:
+++<<<<<<< HEAD
+ +		return skb_flow_dissector_bpf_prog_detach(attr);
+++=======
++ 		if (!capable(CAP_NET_ADMIN))
++ 			return -EPERM;
++ 		return netns_bpf_prog_detach(attr);
+++>>>>>>> a3fd7ceee054 (net: Introduce netns_bpf for BPF programs attached to netns)
+  	case BPF_PROG_TYPE_CGROUP_DEVICE:
+  	case BPF_PROG_TYPE_CGROUP_SKB:
+  	case BPF_PROG_TYPE_CGROUP_SOCK:
+diff --cc net/core/flow_dissector.c
+index 4f65dd7a24e0,6c1b8e43d611..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -30,10 -31,10 +30,16 @@@
+  #include <net/netfilter/nf_conntrack_core.h>
+  #include <net/netfilter/nf_conntrack_labels.h>
+  #endif
++ #include <linux/bpf-netns.h>
+  
+++<<<<<<< HEAD
+ +#include <linux/rh_features.h>
+ +
+ +static DEFINE_MUTEX(flow_dissector_mutex);
+++=======
++ /* Protects updates to netns_bpf */
++ DEFINE_MUTEX(netns_bpf_mutex);
+++>>>>>>> a3fd7ceee054 (net: Introduce netns_bpf for BPF programs attached to netns)
+  
+  static void dissector_set_key(struct flow_dissector *flow_dissector,
+  			      enum flow_dissector_key_id key_id)
+@@@ -110,17 -116,11 +121,18 @@@ int netns_bpf_prog_query(const union bp
+  	return 0;
+  }
+  
+ -static int flow_dissector_bpf_prog_attach(struct net *net,
+ -					  struct bpf_prog *prog)
+ +int skb_flow_dissector_bpf_prog_attach(const union bpf_attr *attr,
+ +				       struct bpf_prog *prog)
+  {
++ 	enum netns_bpf_attach_type type = NETNS_BPF_FLOW_DISSECTOR;
+  	struct bpf_prog *attached;
+ +	struct net *net;
+ +	int ret = 0;
+ +
+ +	rh_mark_used_feature("eBPF/flowdissector");
+ +
+ +	net = current->nsproxy->net_ns;
+ +	mutex_lock(&flow_dissector_mutex);
+  
+  	if (net == &init_net) {
+  		/* BPF flow dissector in the root namespace overrides
+@@@ -133,33 -133,51 +145,79 @@@
+  		for_each_net(ns) {
+  			if (ns == &init_net)
+  				continue;
+++<<<<<<< HEAD
+ +			if (rcu_access_pointer(ns->flow_dissector_prog)) {
+ +				ret = -EEXIST;
+ +				goto out;
+ +			}
+++=======
++ 			if (rcu_access_pointer(ns->bpf.progs[type]))
++ 				return -EEXIST;
+++>>>>>>> a3fd7ceee054 (net: Introduce netns_bpf for BPF programs attached to netns)
+  		}
+  	} else {
+  		/* Make sure root flow dissector is not attached
+  		 * when attaching to the non-root namespace.
+  		 */
+++<<<<<<< HEAD
+ +		if (rcu_access_pointer(init_net.flow_dissector_prog)) {
+ +			ret = -EEXIST;
+ +			goto out;
+ +		}
+ +	}
+ +
+ +	attached = rcu_dereference_protected(net->flow_dissector_prog,
+ +					     lockdep_is_held(&flow_dissector_mutex));
+ +	if (attached == prog) {
+ +		/* The same program cannot be attached twice */
+ +		ret = -EINVAL;
+ +		goto out;
+ +	}
+ +	rcu_assign_pointer(net->flow_dissector_prog, prog);
+ +	if (attached)
+ +		bpf_prog_put(attached);
+ +out:
+ +	mutex_unlock(&flow_dissector_mutex);
+++=======
++ 		if (rcu_access_pointer(init_net.bpf.progs[type]))
++ 			return -EEXIST;
++ 	}
++ 
++ 	attached = rcu_dereference_protected(net->bpf.progs[type],
++ 					     lockdep_is_held(&netns_bpf_mutex));
++ 	if (attached == prog)
++ 		/* The same program cannot be attached twice */
++ 		return -EINVAL;
++ 
++ 	rcu_assign_pointer(net->bpf.progs[type], prog);
++ 	if (attached)
++ 		bpf_prog_put(attached);
++ 	return 0;
++ }
++ 
++ int netns_bpf_prog_attach(const union bpf_attr *attr, struct bpf_prog *prog)
++ {
++ 	enum netns_bpf_attach_type type;
++ 	struct net *net;
++ 	int ret;
++ 
++ 	type = to_netns_bpf_attach_type(attr->attach_type);
++ 	if (type < 0)
++ 		return -EINVAL;
++ 
++ 	net = current->nsproxy->net_ns;
++ 	mutex_lock(&netns_bpf_mutex);
++ 	switch (type) {
++ 	case NETNS_BPF_FLOW_DISSECTOR:
++ 		ret = flow_dissector_bpf_prog_attach(net, prog);
++ 		break;
++ 	default:
++ 		ret = -EINVAL;
++ 		break;
++ 	}
++ 	mutex_unlock(&netns_bpf_mutex);
++ 
+++>>>>>>> a3fd7ceee054 (net: Introduce netns_bpf for BPF programs attached to netns)
+  	return ret;
+  }
+  
+diff --git a/include/linux/bpf-netns.h b/include/linux/bpf-netns.h
+new file mode 100644
+index 000000000000..f3aec3d79824
+--- /dev/null
++++ b/include/linux/bpf-netns.h
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _BPF_NETNS_H
++#define _BPF_NETNS_H
++
++#include <linux/mutex.h>
++#include <uapi/linux/bpf.h>
++
++enum netns_bpf_attach_type {
++	NETNS_BPF_INVALID = -1,
++	NETNS_BPF_FLOW_DISSECTOR = 0,
++	MAX_NETNS_BPF_ATTACH_TYPE
++};
++
++static inline enum netns_bpf_attach_type
++to_netns_bpf_attach_type(enum bpf_attach_type attach_type)
++{
++	switch (attach_type) {
++	case BPF_FLOW_DISSECTOR:
++		return NETNS_BPF_FLOW_DISSECTOR;
++	default:
++		return NETNS_BPF_INVALID;
++	}
++}
++
++/* Protects updates to netns_bpf */
++extern struct mutex netns_bpf_mutex;
++
++union bpf_attr;
++struct bpf_prog;
++
++#ifdef CONFIG_NET
++int netns_bpf_prog_query(const union bpf_attr *attr,
++			 union bpf_attr __user *uattr);
++int netns_bpf_prog_attach(const union bpf_attr *attr,
++			  struct bpf_prog *prog);
++int netns_bpf_prog_detach(const union bpf_attr *attr);
++#else
++static inline int netns_bpf_prog_query(const union bpf_attr *attr,
++				       union bpf_attr __user *uattr)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int netns_bpf_prog_attach(const union bpf_attr *attr,
++					struct bpf_prog *prog)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int netns_bpf_prog_detach(const union bpf_attr *attr)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++
++#endif /* _BPF_NETNS_H */
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 70dc491847b5..af760668d76d 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1315,32 +1315,6 @@ void skb_flow_dissector_init(struct flow_dissector *flow_dissector,
+ 			     const struct flow_dissector_key *key,
+ 			     unsigned int key_count);
+ 
+-#ifdef CONFIG_NET
+-int skb_flow_dissector_prog_query(const union bpf_attr *attr,
+-				  union bpf_attr __user *uattr);
+-int skb_flow_dissector_bpf_prog_attach(const union bpf_attr *attr,
+-				       struct bpf_prog *prog);
+-
+-int skb_flow_dissector_bpf_prog_detach(const union bpf_attr *attr);
+-#else
+-static inline int skb_flow_dissector_prog_query(const union bpf_attr *attr,
+-						union bpf_attr __user *uattr)
+-{
+-	return -EOPNOTSUPP;
+-}
+-
+-static inline int skb_flow_dissector_bpf_prog_attach(const union bpf_attr *attr,
+-						     struct bpf_prog *prog)
+-{
+-	return -EOPNOTSUPP;
+-}
+-
+-static inline int skb_flow_dissector_bpf_prog_detach(const union bpf_attr *attr)
+-{
+-	return -EOPNOTSUPP;
+-}
+-#endif
+-
+ struct bpf_flow_dissector;
+ bool bpf_flow_dissect(struct bpf_prog *prog, struct bpf_flow_dissector *ctx,
+ 		      __be16 proto, int nhoff, int hlen, unsigned int flags);
+* Unmerged path include/net/net_namespace.h
+diff --git a/include/net/netns/bpf.h b/include/net/netns/bpf.h
+new file mode 100644
+index 000000000000..a858d1c5b166
+--- /dev/null
++++ b/include/net/netns/bpf.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * BPF programs attached to network namespace
++ */
++
++#ifndef __NETNS_BPF_H__
++#define __NETNS_BPF_H__
++
++#include <linux/bpf-netns.h>
++
++struct bpf_prog;
++
++struct netns_bpf {
++	struct bpf_prog __rcu *progs[MAX_NETNS_BPF_ATTACH_TYPE];
++};
++
++#endif /* __NETNS_BPF_H__ */
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path net/core/flow_dissector.c
