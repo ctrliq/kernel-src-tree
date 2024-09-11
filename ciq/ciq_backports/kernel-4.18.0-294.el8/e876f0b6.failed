@@ -1,0 +1,253 @@
+lib/vdso: Allow architectures to provide the vdso data pointer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christophe Leroy <christophe.leroy@c-s.fr>
+commit e876f0b69dc993e86ca7795e63e98385aa9a7ef3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e876f0b6.failed
+
+On powerpc, __arch_get_vdso_data() clobbers the link register, requiring
+the caller to save it.
+
+As the parent function already has to set a stack frame and saves the link
+register before calling the C vdso function, retrieving the vdso data
+pointer there is less overhead.
+
+Split out the functional code from the __cvdso.*() interfaces into new
+static functions which can either be called from the existing interfaces
+with the vdso data pointer supplied via __arch_get_vdso_data() or directly
+from ASM code.
+
+	Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Reviewed-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Link: https://lore.kernel.org/r/abf97996602ef07223fec30c005df78e5ed41b2e.1580399657.git.christophe.leroy@c-s.fr
+Link: https://lkml.kernel.org/r/20200207124403.965789141@linutronix.de
+
+
+
+(cherry picked from commit e876f0b69dc993e86ca7795e63e98385aa9a7ef3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/vdso/gettimeofday.c
+diff --cc lib/vdso/gettimeofday.c
+index 632c43443888,72d282ffd156..000000000000
+--- a/lib/vdso/gettimeofday.c
++++ b/lib/vdso/gettimeofday.c
+@@@ -71,9 -231,11 +71,13 @@@ static void do_coarse(const struct vdso
+  }
+  
+  static __maybe_unused int
+++<<<<<<< HEAD
+ +__cvdso_clock_gettime(clockid_t clock, struct __kernel_timespec *ts)
+++=======
++ __cvdso_clock_gettime_common(const struct vdso_data *vd, clockid_t clock,
++ 			     struct __kernel_timespec *ts)
+++>>>>>>> e876f0b69dc9 (lib/vdso: Allow architectures to provide the vdso data pointer)
+  {
+- 	const struct vdso_data *vd = __arch_get_vdso_data();
+  	u32 msk;
+  
+  	/* Check for negative values or invalid clocks */
+@@@ -85,17 -247,33 +89,38 @@@
+  	 * clocks are handled in the VDSO directly.
+  	 */
+  	msk = 1U << clock;
+ -	if (likely(msk & VDSO_HRES))
+ -		vd = &vd[CS_HRES_COARSE];
+ -	else if (msk & VDSO_COARSE)
+ -		return do_coarse(&vd[CS_HRES_COARSE], clock, ts);
+ -	else if (msk & VDSO_RAW)
+ -		vd = &vd[CS_RAW];
+ -	else
+ -		return -1;
+ +	if (likely(msk & VDSO_HRES)) {
+ +		return do_hres(&vd[CS_HRES_COARSE], clock, ts);
+ +	} else if (msk & VDSO_COARSE) {
+ +		do_coarse(&vd[CS_HRES_COARSE], clock, ts);
+ +		return 0;
+ +	} else if (msk & VDSO_RAW) {
+ +		return do_hres(&vd[CS_RAW], clock, ts);
+ +	}
+  
+++<<<<<<< HEAD
+ +fallback:
+ +	return clock_gettime_fallback(clock, ts);
+++=======
++ 	return do_hres(vd, clock, ts);
++ }
++ 
++ static __maybe_unused int
++ __cvdso_clock_gettime_data(const struct vdso_data *vd, clockid_t clock,
++ 			   struct __kernel_timespec *ts)
++ {
++ 	int ret = __cvdso_clock_gettime_common(vd, clock, ts);
++ 
++ 	if (unlikely(ret))
++ 		return clock_gettime_fallback(clock, ts);
++ 	return 0;
+++>>>>>>> e876f0b69dc9 (lib/vdso: Allow architectures to provide the vdso data pointer)
++ }
++ 
++ static __maybe_unused int
++ __cvdso_clock_gettime(clockid_t clock, struct __kernel_timespec *ts)
++ {
++ 	return __cvdso_clock_gettime_data(__arch_get_vdso_data(), clock, ts);
+  }
+  
+  #ifdef BUILD_VDSO32
+@@@ -105,12 -284,14 +131,16 @@@ __cvdso_clock_gettime32_data(const stru
+  	struct __kernel_timespec ts;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = __cvdso_clock_gettime(clock, &ts);
+++=======
++ 	ret = __cvdso_clock_gettime_common(vd, clock, &ts);
+++>>>>>>> e876f0b69dc9 (lib/vdso: Allow architectures to provide the vdso data pointer)
+  
+ -	if (unlikely(ret))
+ -		return clock_gettime32_fallback(clock, res);
+ -
+ -	/* For ret == 0 */
+ -	res->tv_sec = ts.tv_sec;
+ -	res->tv_nsec = ts.tv_nsec;
+ +	if (ret == 0) {
+ +		res->tv_sec = ts.tv_sec;
+ +		res->tv_nsec = ts.tv_nsec;
+ +	}
+  
+  	return ret;
+  }
+@@@ -139,11 -330,23 +175,31 @@@ __cvdso_gettimeofday_data(const struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef VDSO_HAS_TIME
+ +static __maybe_unused time_t __cvdso_time(time_t *time)
+ +{
+ +	const struct vdso_data *vd = __arch_get_vdso_data();
+ +	time_t t = READ_ONCE(vd[CS_HRES_COARSE].basetime[CLOCK_REALTIME].sec);
+++=======
++ static __maybe_unused int
++ __cvdso_gettimeofday(struct __kernel_old_timeval *tv, struct timezone *tz)
++ {
++ 	return __cvdso_gettimeofday_data(__arch_get_vdso_data(), tv, tz);
++ }
++ 
++ #ifdef VDSO_HAS_TIME
++ static __maybe_unused __kernel_old_time_t
++ __cvdso_time_data(const struct vdso_data *vd, __kernel_old_time_t *time)
++ {
++ 	__kernel_old_time_t t;
++ 
++ 	if (IS_ENABLED(CONFIG_TIME_NS) &&
++ 	    vd->clock_mode == VDSO_CLOCKMODE_TIMENS)
++ 		vd = __arch_get_timens_vdso_data();
++ 
++ 	t = READ_ONCE(vd[CS_HRES_COARSE].basetime[CLOCK_REALTIME].sec);
+++>>>>>>> e876f0b69dc9 (lib/vdso: Allow architectures to provide the vdso data pointer)
+  
+  	if (time)
+  		*time = t;
+@@@ -154,12 -362,11 +215,19 @@@ static __maybe_unused __kernel_old_time
+  
+  #ifdef VDSO_HAS_CLOCK_GETRES
+  static __maybe_unused
+++<<<<<<< HEAD
+ +int __cvdso_clock_getres(clockid_t clock, struct __kernel_timespec *res)
+ +{
+ +	const struct vdso_data *vd = __arch_get_vdso_data();
+++=======
++ int __cvdso_clock_getres_common(const struct vdso_data *vd, clockid_t clock,
++ 				struct __kernel_timespec *res)
++ {
++ 	u32 msk;
+++>>>>>>> e876f0b69dc9 (lib/vdso: Allow architectures to provide the vdso data pointer)
+  	u64 ns;
+ +	u32 msk;
+ +	u64 hrtimer_res = READ_ONCE(vd[CS_HRES_COARSE].hrtimer_res);
+  
+  	/* Check for negative values or invalid clocks */
+  	if (unlikely((u32) clock >= MAX_CLOCKS))
+@@@ -181,33 -392,58 +249,62 @@@
+  		 */
+  		ns = LOW_RES_NSEC;
+  	} else {
+ -		return -1;
+ +		goto fallback;
+  	}
+  
+ -	if (likely(res)) {
+ -		res->tv_sec = 0;
+ -		res->tv_nsec = ns;
+ -	}
+ -	return 0;
+ -}
+ +	res->tv_sec = 0;
+ +	res->tv_nsec = ns;
+  
+++<<<<<<< HEAD
+++=======
++ static __maybe_unused
++ int __cvdso_clock_getres_data(const struct vdso_data *vd, clockid_t clock,
++ 			      struct __kernel_timespec *res)
++ {
++ 	int ret = __cvdso_clock_getres_common(vd, clock, res);
++ 
++ 	if (unlikely(ret))
++ 		return clock_getres_fallback(clock, res);
+++>>>>>>> e876f0b69dc9 (lib/vdso: Allow architectures to provide the vdso data pointer)
+  	return 0;
+ +
+ +fallback:
+ +	return clock_getres_fallback(clock, res);
+  }
+  
++ static __maybe_unused
++ int __cvdso_clock_getres(clockid_t clock, struct __kernel_timespec *res)
++ {
++ 	return __cvdso_clock_getres_data(__arch_get_vdso_data(), clock, res);
++ }
++ 
+  #ifdef BUILD_VDSO32
+  static __maybe_unused int
+- __cvdso_clock_getres_time32(clockid_t clock, struct old_timespec32 *res)
++ __cvdso_clock_getres_time32_data(const struct vdso_data *vd, clockid_t clock,
++ 				 struct old_timespec32 *res)
+  {
+  	struct __kernel_timespec ts;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = __cvdso_clock_getres(clock, &ts);
+++=======
++ 	ret = __cvdso_clock_getres_common(vd, clock, &ts);
+++>>>>>>> e876f0b69dc9 (lib/vdso: Allow architectures to provide the vdso data pointer)
+  
+ -	if (unlikely(ret))
+ -		return clock_getres32_fallback(clock, res);
+ -
+ -	if (likely(res)) {
+ +	if (ret == 0) {
+  		res->tv_sec = ts.tv_sec;
+  		res->tv_nsec = ts.tv_nsec;
+  	}
+ +
+  	return ret;
+  }
++ 
++ static __maybe_unused int
++ __cvdso_clock_getres_time32(clockid_t clock, struct old_timespec32 *res)
++ {
++ 	return __cvdso_clock_getres_time32_data(__arch_get_vdso_data(),
++ 						clock, res);
++ }
+  #endif /* BUILD_VDSO32 */
+  #endif /* VDSO_HAS_CLOCK_GETRES */
+* Unmerged path lib/vdso/gettimeofday.c
