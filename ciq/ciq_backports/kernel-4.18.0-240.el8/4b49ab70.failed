@@ -1,0 +1,120 @@
+perf stat: Use affinity for reading
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andi Kleen <ak@linux.intel.com>
+commit 4b49ab708d1804bc8b2fcdde79844b8bc98f7ef6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4b49ab70.failed
+
+Restructure event reading to use affinity to minimize the number of IPIs
+needed.
+
+Before on a large test case with 94 CPUs:
+
+  % time     seconds  usecs/call     calls    errors syscall
+  ------ ----------- ----------- --------- --------- ----------------
+    3.16    0.106079           4     22082           read
+
+After:
+
+    3.43    0.081295           3     22082           read
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+Link: http://lore.kernel.org/lkml/20191121001522.180827-11-andi@firstfloor.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 4b49ab708d1804bc8b2fcdde79844b8bc98f7ef6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-stat.c
+diff --cc tools/perf/builtin-stat.c
+index 13e7c7e6714e,a098c2ebf4ea..000000000000
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@@ -263,15 -266,10 +263,22 @@@ static int read_single_counter(struct p
+   * Read out the results of a single counter:
+   * do not aggregate counts across CPUs in system-wide mode
+   */
+++<<<<<<< HEAD
+ +static int read_counter(struct perf_evsel *counter, struct timespec *rs)
+ +{
+ +	int nthreads = thread_map__nr(evsel_list->threads);
+ +	int ncpus, cpu, thread;
+ +
+ +	if (target__has_cpu(&target) && !target__has_per_thread(&target))
+ +		ncpus = perf_evsel__nr_cpus(counter);
+ +	else
+ +		ncpus = 1;
+++=======
++ static int read_counter_cpu(struct evsel *counter, struct timespec *rs, int cpu)
++ {
++ 	int nthreads = perf_thread_map__nr(evsel_list->core.threads);
++ 	int thread;
+++>>>>>>> 4b49ab708d18 (perf stat: Use affinity for reading)
+  
+  	if (!counter->supported)
+  		return -ENOENT;
+@@@ -321,16 -317,38 +326,43 @@@
+  
+  static void read_counters(struct timespec *rs)
+  {
+++<<<<<<< HEAD
+ +	struct perf_evsel *counter;
+ +	int ret;
+++=======
++ 	struct evsel *counter;
++ 	struct affinity affinity;
++ 	int i, ncpus, cpu;
++ 
++ 	if (affinity__setup(&affinity) < 0)
++ 		return;
++ 
++ 	ncpus = perf_cpu_map__nr(evsel_list->core.all_cpus);
++ 	if (!target__has_cpu(&target) || target__has_per_thread(&target))
++ 		ncpus = 1;
++ 	evlist__for_each_cpu(evsel_list, i, cpu) {
++ 		if (i >= ncpus)
++ 			break;
++ 		affinity__set(&affinity, cpu);
++ 
++ 		evlist__for_each_entry(evsel_list, counter) {
++ 			if (evsel__cpu_iter_skip(counter, cpu))
++ 				continue;
++ 			if (!counter->err) {
++ 				counter->err = read_counter_cpu(counter, rs,
++ 								counter->cpu_iter - 1);
++ 			}
++ 		}
++ 	}
++ 	affinity__cleanup(&affinity);
+++>>>>>>> 4b49ab708d18 (perf stat: Use affinity for reading)
+  
+  	evlist__for_each_entry(evsel_list, counter) {
+- 		ret = read_counter(counter, rs);
+- 		if (ret)
++ 		if (counter->err)
+  			pr_debug("failed to read counter %s\n", counter->name);
+- 
+- 		if (ret == 0 && perf_stat_process_counter(&stat_config, counter))
++ 		if (counter->err == 0 && perf_stat_process_counter(&stat_config, counter))
+  			pr_warning("failed to process counter %s\n", counter->name);
++ 		counter->err = 0;
+  	}
+  }
+  
+* Unmerged path tools/perf/builtin-stat.c
+diff --git a/tools/perf/util/evsel.h b/tools/perf/util/evsel.h
+index 2ab992b39a4c..61e2c357d186 100644
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@ -158,6 +158,7 @@ struct perf_evsel {
+ 	struct list_head	config_terms;
+ 	struct bpf_object	*bpf_obj;
+ 	int			bpf_fd;
++	int			err;
+ 	bool			auto_merge_stats;
+ 	bool			merged_stat;
+ 	const char *		metric_expr;
