@@ -1,0 +1,164 @@
+gve: Move the irq db indexes out of the ntfy block struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Catherine Sullivan <csully@google.com>
+commit d30baacc04948bbfded609cf7fb298e5ae754fcd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/d30baacc.failed
+
+Giving the device access to other kernel structs is not ideal.
+Move the indexes into their own array and just keep pointers to
+them in the ntfy block struct.
+
+	Signed-off-by: Catherine Sullivan <csully@google.com>
+	Signed-off-by: David Awogbemila <awogbemila@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d30baacc04948bbfded609cf7fb298e5ae754fcd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve.h
+#	drivers/net/ethernet/google/gve/gve_dqo.h
+diff --cc drivers/net/ethernet/google/gve/gve.h
+index 4775214c4d98,b6bd8f679127..000000000000
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@@ -424,6 -461,35 +424,38 @@@ struct gve_qpl_config 
+  	unsigned long *qpl_id_map; /* bitmap of used qpl ids */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct gve_options_dqo_rda {
++ 	u16 tx_comp_ring_entries; /* number of tx_comp descriptors */
++ 	u16 rx_buff_ring_entries; /* number of rx_buff descriptors */
++ };
++ 
++ struct gve_irq_db {
++ 	__be32 index;
++ } ____cacheline_aligned;
++ 
++ struct gve_ptype {
++ 	u8 l3_type;  /* `gve_l3_type` in gve_adminq.h */
++ 	u8 l4_type;  /* `gve_l4_type` in gve_adminq.h */
++ };
++ 
++ struct gve_ptype_lut {
++ 	struct gve_ptype ptypes[GVE_NUM_PTYPES];
++ };
++ 
++ /* GVE_QUEUE_FORMAT_UNSPECIFIED must be zero since 0 is the default value
++  * when the entire configure_device_resources command is zeroed out and the
++  * queue_format is not specified.
++  */
++ enum gve_queue_format {
++ 	GVE_QUEUE_FORMAT_UNSPECIFIED	= 0x0,
++ 	GVE_GQI_RDA_FORMAT		= 0x1,
++ 	GVE_GQI_QPL_FORMAT		= 0x2,
++ 	GVE_DQO_RDA_FORMAT		= 0x3,
++ };
++ 
+++>>>>>>> d30baacc0494 (gve: Move the irq db indexes out of the ntfy block struct)
+  struct gve_priv {
+  	struct net_device *dev;
+  	struct gve_tx_ring *tx; /* array of tx_cfg.num_queues */
+* Unmerged path drivers/net/ethernet/google/gve/gve_dqo.h
+* Unmerged path drivers/net/ethernet/google/gve/gve.h
+diff --git a/drivers/net/ethernet/google/gve/gve_adminq.c b/drivers/net/ethernet/google/gve/gve_adminq.c
+index 69a76038cb46..93bff8afa345 100644
+--- a/drivers/net/ethernet/google/gve/gve_adminq.c
++++ b/drivers/net/ethernet/google/gve/gve_adminq.c
+@@ -437,7 +437,7 @@ int gve_adminq_configure_device_resources(struct gve_priv *priv,
+ 		.num_counters = cpu_to_be32(num_counters),
+ 		.irq_db_addr = cpu_to_be64(db_array_bus_addr),
+ 		.num_irq_dbs = cpu_to_be32(num_ntfy_blks),
+-		.irq_db_stride = cpu_to_be32(sizeof(priv->ntfy_blocks[0])),
++		.irq_db_stride = cpu_to_be32(sizeof(*priv->irq_db_indices)),
+ 		.ntfy_blk_msix_base_idx =
+ 					cpu_to_be32(GVE_NTFY_BLK_BASE_MSIX_IDX),
+ 	};
+* Unmerged path drivers/net/ethernet/google/gve/gve_dqo.h
+diff --git a/drivers/net/ethernet/google/gve/gve_main.c b/drivers/net/ethernet/google/gve/gve_main.c
+index 1ed501fc0cf1..ce3b56c0ed5c 100644
+--- a/drivers/net/ethernet/google/gve/gve_main.c
++++ b/drivers/net/ethernet/google/gve/gve_main.c
+@@ -261,15 +261,23 @@ static int gve_alloc_notify_blocks(struct gve_priv *priv)
+ 		dev_err(&priv->pdev->dev, "Did not receive management vector.\n");
+ 		goto abort_with_msix_enabled;
+ 	}
+-	priv->ntfy_blocks =
++	priv->irq_db_indices =
+ 		dma_alloc_coherent(&priv->pdev->dev,
+ 				   priv->num_ntfy_blks *
+-				   sizeof(*priv->ntfy_blocks),
+-				   &priv->ntfy_block_bus, GFP_KERNEL);
+-	if (!priv->ntfy_blocks) {
++				   sizeof(*priv->irq_db_indices),
++				   &priv->irq_db_indices_bus, GFP_KERNEL);
++	if (!priv->irq_db_indices) {
+ 		err = -ENOMEM;
+ 		goto abort_with_mgmt_vector;
+ 	}
++
++	priv->ntfy_blocks = kvzalloc(priv->num_ntfy_blks *
++				     sizeof(*priv->ntfy_blocks), GFP_KERNEL);
++	if (!priv->ntfy_blocks) {
++		err = -ENOMEM;
++		goto abort_with_irq_db_indices;
++	}
++
+ 	/* Setup the other blocks - the first n-1 vectors */
+ 	for (i = 0; i < priv->num_ntfy_blks; i++) {
+ 		struct gve_notify_block *block = &priv->ntfy_blocks[i];
+@@ -287,6 +295,7 @@ static int gve_alloc_notify_blocks(struct gve_priv *priv)
+ 		}
+ 		irq_set_affinity_hint(priv->msix_vectors[msix_idx].vector,
+ 				      get_cpu_mask(i % active_cpus));
++		block->irq_db_index = &priv->irq_db_indices[i].index;
+ 	}
+ 	return 0;
+ abort_with_some_ntfy_blocks:
+@@ -298,10 +307,13 @@ static int gve_alloc_notify_blocks(struct gve_priv *priv)
+ 				      NULL);
+ 		free_irq(priv->msix_vectors[msix_idx].vector, block);
+ 	}
+-	dma_free_coherent(&priv->pdev->dev, priv->num_ntfy_blks *
+-			  sizeof(*priv->ntfy_blocks),
+-			  priv->ntfy_blocks, priv->ntfy_block_bus);
++	kvfree(priv->ntfy_blocks);
+ 	priv->ntfy_blocks = NULL;
++abort_with_irq_db_indices:
++	dma_free_coherent(&priv->pdev->dev, priv->num_ntfy_blks *
++			  sizeof(*priv->irq_db_indices),
++			  priv->irq_db_indices, priv->irq_db_indices_bus);
++	priv->irq_db_indices = NULL;
+ abort_with_mgmt_vector:
+ 	free_irq(priv->msix_vectors[priv->mgmt_msix_idx].vector, priv);
+ abort_with_msix_enabled:
+@@ -329,10 +341,12 @@ static void gve_free_notify_blocks(struct gve_priv *priv)
+ 		free_irq(priv->msix_vectors[msix_idx].vector, block);
+ 	}
+ 	free_irq(priv->msix_vectors[priv->mgmt_msix_idx].vector, priv);
+-	dma_free_coherent(&priv->pdev->dev,
+-			  priv->num_ntfy_blks * sizeof(*priv->ntfy_blocks),
+-			  priv->ntfy_blocks, priv->ntfy_block_bus);
++	kvfree(priv->ntfy_blocks);
+ 	priv->ntfy_blocks = NULL;
++	dma_free_coherent(&priv->pdev->dev, priv->num_ntfy_blks *
++			  sizeof(*priv->irq_db_indices),
++			  priv->irq_db_indices, priv->irq_db_indices_bus);
++	priv->irq_db_indices = NULL;
+ 	pci_disable_msix(priv->pdev);
+ 	kvfree(priv->msix_vectors);
+ 	priv->msix_vectors = NULL;
+@@ -354,7 +368,7 @@ static int gve_setup_device_resources(struct gve_priv *priv)
+ 	err = gve_adminq_configure_device_resources(priv,
+ 						    priv->counter_array_bus,
+ 						    priv->num_event_counters,
+-						    priv->ntfy_block_bus,
++						    priv->irq_db_indices_bus,
+ 						    priv->num_ntfy_blks);
+ 	if (unlikely(err)) {
+ 		dev_err(&priv->pdev->dev,
