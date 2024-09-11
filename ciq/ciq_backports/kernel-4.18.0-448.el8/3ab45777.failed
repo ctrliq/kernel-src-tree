@@ -1,0 +1,315 @@
+net/mlx5e: Use select queue parameters to sync with control flow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Maxim Mikityanskiy <maximmi@nvidia.com>
+commit 3ab45777a27c5f53a55a2c353b70648449ca7a33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/3ab45777.failed
+
+Start using the select queue parameters introduced in the previous
+commit to have proper synchronization with changing the configuration
+(such as number of channels and queues). It ensures that the state that
+mlx5e_select_queue() sees is always consistent and stays the same while
+the function is running. Also it allows mlx5e_select_queue to stop using
+data structures that weren't synchronized properly: txq2sq,
+channel_tc2realtxq, port_ptp_tc2realtxq. The last two are removed
+completely, as they were used only in mlx5e_select_queue.
+
+	Signed-off-by: Maxim Mikityanskiy <maximmi@nvidia.com>
+	Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 3ab45777a27c5f53a55a2c353b70648449ca7a33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/selq.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/selq.c
+index 50ea58a3cc94,a0bed47fd392..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/selq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/selq.c
+@@@ -4,7 -4,9 +4,8 @@@
+  #include "selq.h"
+  #include <linux/slab.h>
+  #include <linux/netdevice.h>
++ #include <linux/rcupdate.h>
+  #include "en.h"
+ -#include "en/ptp.h"
+  
+  struct mlx5e_selq_params {
+  	unsigned int num_regular_queues;
+@@@ -93,3 -95,111 +94,114 @@@ void mlx5e_selq_cancel(struct mlx5e_sel
+  
+  	selq->is_prepared = false;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_MLX5_CORE_EN_DCB
++ static int mlx5e_get_dscp_up(struct mlx5e_priv *priv, struct sk_buff *skb)
++ {
++ 	int dscp_cp = 0;
++ 
++ 	if (skb->protocol == htons(ETH_P_IP))
++ 		dscp_cp = ipv4_get_dsfield(ip_hdr(skb)) >> 2;
++ 	else if (skb->protocol == htons(ETH_P_IPV6))
++ 		dscp_cp = ipv6_get_dsfield(ipv6_hdr(skb)) >> 2;
++ 
++ 	return priv->dcbx_dp.dscp2prio[dscp_cp];
++ }
++ #endif
++ 
++ static u16 mlx5e_select_ptpsq(struct net_device *dev, struct sk_buff *skb,
++ 			      struct mlx5e_selq_params *selq)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	int up = 0;
++ 
++ 	if (selq->num_tcs <= 1)
++ 		goto return_txq;
++ 
++ #ifdef CONFIG_MLX5_CORE_EN_DCB
++ 	if (priv->dcbx_dp.trust_state == MLX5_QPTS_TRUST_DSCP)
++ 		up = mlx5e_get_dscp_up(priv, skb);
++ 	else
++ #endif
++ 		if (skb_vlan_tag_present(skb))
++ 			up = skb_vlan_tag_get_prio(skb);
++ 
++ return_txq:
++ 	return selq->num_regular_queues + up;
++ }
++ 
++ static int mlx5e_select_htb_queue(struct mlx5e_priv *priv, struct sk_buff *skb)
++ {
++ 	u16 classid;
++ 
++ 	/* Order maj_id before defcls - pairs with mlx5e_htb_root_add. */
++ 	if ((TC_H_MAJ(skb->priority) >> 16) == smp_load_acquire(&priv->htb.maj_id))
++ 		classid = TC_H_MIN(skb->priority);
++ 	else
++ 		classid = READ_ONCE(priv->htb.defcls);
++ 
++ 	if (!classid)
++ 		return 0;
++ 
++ 	return mlx5e_get_txq_by_classid(priv, classid);
++ }
++ 
++ u16 mlx5e_select_queue(struct net_device *dev, struct sk_buff *skb,
++ 		       struct net_device *sb_dev)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	struct mlx5e_selq_params *selq;
++ 	int txq_ix;
++ 	int up = 0;
++ 
++ 	selq = rcu_dereference_bh(priv->selq.active);
++ 
++ 	/* This is a workaround needed only for the mlx5e_netdev_change_profile
++ 	 * flow that zeroes out the whole priv without unregistering the netdev
++ 	 * and without preventing ndo_select_queue from being called.
++ 	 */
++ 	if (unlikely(!selq))
++ 		return 0;
++ 
++ 	if (unlikely(selq->is_ptp || selq->is_htb)) {
++ 		if (unlikely(selq->is_htb)) {
++ 			txq_ix = mlx5e_select_htb_queue(priv, skb);
++ 			if (txq_ix > 0)
++ 				return txq_ix;
++ 		}
++ 
++ 		if (unlikely(selq->is_ptp && mlx5e_use_ptpsq(skb)))
++ 			return mlx5e_select_ptpsq(dev, skb, selq);
++ 
++ 		txq_ix = netdev_pick_tx(dev, skb, NULL);
++ 		/* Fix netdev_pick_tx() not to choose ptp_channel and HTB txqs.
++ 		 * If they are selected, switch to regular queues.
++ 		 * Driver to select these queues only at mlx5e_select_ptpsq()
++ 		 * and mlx5e_select_htb_queue().
++ 		 */
++ 		if (unlikely(txq_ix >= selq->num_regular_queues))
++ 			txq_ix %= selq->num_regular_queues;
++ 	} else {
++ 		txq_ix = netdev_pick_tx(dev, skb, NULL);
++ 	}
++ 
++ 	if (selq->num_tcs <= 1)
++ 		return txq_ix;
++ 
++ #ifdef CONFIG_MLX5_CORE_EN_DCB
++ 	if (priv->dcbx_dp.trust_state == MLX5_QPTS_TRUST_DSCP)
++ 		up = mlx5e_get_dscp_up(priv, skb);
++ 	else
++ #endif
++ 		if (skb_vlan_tag_present(skb))
++ 			up = skb_vlan_tag_get_prio(skb);
++ 
++ 	/* Normalize any picked txq_ix to [0, num_channels),
++ 	 * So we can return a txq_ix that matches the channel and
++ 	 * packet UP.
++ 	 */
++ 	return txq_ix % selq->num_channels + up * selq->num_channels;
++ }
+++>>>>>>> 3ab45777a27c (net/mlx5e: Use select queue parameters to sync with control flow)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 7041af57c022..02868cbb5e7f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -849,8 +849,6 @@ struct mlx5e_priv {
+ 	/* priv data path fields - start */
+ 	struct mlx5e_selq selq;
+ 	struct mlx5e_txqsq **txq2sq;
+-	int **channel_tc2realtxq;
+-	int port_ptp_tc2realtxq[MLX5E_MAX_NUM_TC];
+ #ifdef CONFIG_MLX5_CORE_EN_DCB
+ 	struct mlx5e_dcbx_dp       dcbx_dp;
+ #endif
+@@ -893,7 +891,6 @@ struct mlx5e_priv {
+ 	u16                        drop_rq_q_counter;
+ 	struct notifier_block      events_nb;
+ 	struct notifier_block      blocking_events_nb;
+-	int                        num_tc_x_num_ch;
+ 
+ 	struct udp_tunnel_nic_info nic_info;
+ #ifdef CONFIG_MLX5_CORE_EN_DCB
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/qos.c b/drivers/net/ethernet/mellanox/mlx5/core/en/qos.c
+index c987d52d59cc..5bc035688c46 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/qos.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/qos.c
+@@ -548,11 +548,15 @@ int mlx5e_htb_root_del(struct mlx5e_priv *priv)
+ 
+ 	qos_dbg(priv->mdev, "TC_HTB_DESTROY\n");
+ 
++	/* Wait until real_num_tx_queues is updated for mlx5e_select_queue,
++	 * so that we can safely switch to its non-HTB non-PTP fastpath.
++	 */
++	synchronize_net();
++
+ 	mlx5e_selq_prepare(&priv->selq, &priv->channels.params, false);
+ 	mlx5e_selq_apply(&priv->selq);
+ 
+ 	WRITE_ONCE(priv->htb.maj_id, 0);
+-	synchronize_rcu(); /* Sync with mlx5e_select_htb_queue and TX data path. */
+ 
+ 	root = mlx5e_sw_node_find(priv, MLX5E_HTB_CLASSID_ROOT);
+ 	if (!root) {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/selq.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 68ee807cde5b..a2d0dc8cc13d 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2508,7 +2508,6 @@ static void mlx5e_build_txq_maps(struct mlx5e_priv *priv)
+ 			struct mlx5e_txqsq *sq = &c->sq[tc];
+ 
+ 			priv->txq2sq[sq->txq_ix] = sq;
+-			priv->channel_tc2realtxq[i][tc] = i + tc * ch;
+ 		}
+ 	}
+ 
+@@ -2523,7 +2522,6 @@ static void mlx5e_build_txq_maps(struct mlx5e_priv *priv)
+ 		struct mlx5e_txqsq *sq = &c->ptpsq[tc].txqsq;
+ 
+ 		priv->txq2sq[sq->txq_ix] = sq;
+-		priv->port_ptp_tc2realtxq[tc] = priv->num_tc_x_num_ch + tc;
+ 	}
+ 
+ out:
+@@ -2534,16 +2532,8 @@ static void mlx5e_build_txq_maps(struct mlx5e_priv *priv)
+ 	smp_wmb();
+ }
+ 
+-static void mlx5e_update_num_tc_x_num_ch(struct mlx5e_priv *priv)
+-{
+-	/* Sync with mlx5e_select_queue. */
+-	WRITE_ONCE(priv->num_tc_x_num_ch,
+-		   mlx5e_get_dcb_num_tc(&priv->channels.params) * priv->channels.num);
+-}
+-
+ void mlx5e_activate_priv_channels(struct mlx5e_priv *priv)
+ {
+-	mlx5e_update_num_tc_x_num_ch(priv);
+ 	mlx5e_build_txq_maps(priv);
+ 	mlx5e_activate_channels(&priv->channels);
+ 	mlx5e_qos_activate_queues(priv);
+@@ -4492,11 +4482,6 @@ void mlx5e_build_nic_params(struct mlx5e_priv *priv, struct mlx5e_xsk *xsk, u16
+ 				     priv->max_nch);
+ 	mlx5e_params_mqprio_reset(params);
+ 
+-	/* Set an initial non-zero value, so that mlx5e_select_queue won't
+-	 * divide by zero if called before first activating channels.
+-	 */
+-	priv->num_tc_x_num_ch = params->num_channels * params->mqprio.num_tc;
+-
+ 	/* SQ */
+ 	params->log_sq_size = is_kdump_kernel() ?
+ 		MLX5E_PARAMS_MINIMUM_LOG_SQ_SIZE :
+@@ -5059,7 +5044,7 @@ int mlx5e_priv_init(struct mlx5e_priv *priv,
+ 		    struct net_device *netdev,
+ 		    struct mlx5_core_dev *mdev)
+ {
+-	int nch, num_txqs, node, i;
++	int nch, num_txqs, node;
+ 	int err;
+ 
+ 	num_txqs = netdev->num_tx_queues;
+@@ -5100,30 +5085,13 @@ int mlx5e_priv_init(struct mlx5e_priv *priv,
+ 	if (!priv->tx_rates)
+ 		goto err_free_txq2sq;
+ 
+-	priv->channel_tc2realtxq =
+-		kcalloc_node(nch, sizeof(*priv->channel_tc2realtxq), GFP_KERNEL, node);
+-	if (!priv->channel_tc2realtxq)
+-		goto err_free_tx_rates;
+-
+-	for (i = 0; i < nch; i++) {
+-		priv->channel_tc2realtxq[i] =
+-			kcalloc_node(profile->max_tc, sizeof(**priv->channel_tc2realtxq),
+-				     GFP_KERNEL, node);
+-		if (!priv->channel_tc2realtxq[i])
+-			goto err_free_channel_tc2realtxq;
+-	}
+-
+ 	priv->channel_stats =
+ 		kcalloc_node(nch, sizeof(*priv->channel_stats), GFP_KERNEL, node);
+ 	if (!priv->channel_stats)
+-		goto err_free_channel_tc2realtxq;
++		goto err_free_tx_rates;
+ 
+ 	return 0;
+ 
+-err_free_channel_tc2realtxq:
+-	while (--i >= 0)
+-		kfree(priv->channel_tc2realtxq[i]);
+-	kfree(priv->channel_tc2realtxq);
+ err_free_tx_rates:
+ 	kfree(priv->tx_rates);
+ err_free_txq2sq:
+@@ -5148,9 +5116,6 @@ void mlx5e_priv_cleanup(struct mlx5e_priv *priv)
+ 	for (i = 0; i < priv->stats_nch; i++)
+ 		kvfree(priv->channel_stats[i]);
+ 	kfree(priv->channel_stats);
+-	for (i = 0; i < priv->max_nch; i++)
+-		kfree(priv->channel_tc2realtxq[i]);
+-	kfree(priv->channel_tc2realtxq);
+ 	kfree(priv->tx_rates);
+ 	kfree(priv->txq2sq);
+ 	destroy_workqueue(priv->wq);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index ee7bcca24540..a980731869bb 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -632,11 +632,6 @@ static void mlx5e_build_rep_params(struct net_device *netdev)
+ 	params->mqprio.num_tc       = 1;
+ 	params->tunneled_offload_en = false;
+ 
+-	/* Set an initial non-zero value, so that mlx5e_select_queue won't
+-	 * divide by zero if called before first activating channels.
+-	 */
+-	priv->num_tc_x_num_ch = params->num_channels * params->mqprio.num_tc;
+-
+ 	mlx5_query_min_inline(mdev, &params->tx_min_inline_mode);
+ }
+ 
