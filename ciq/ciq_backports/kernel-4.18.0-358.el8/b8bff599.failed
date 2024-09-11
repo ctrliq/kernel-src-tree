@@ -1,0 +1,461 @@
+exec: Factor security_bprm_creds_for_exec out of security_bprm_set_creds
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit b8bff599261c930630385ee21d3f98e7ce7d4843
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b8bff599.failed
+
+Today security_bprm_set_creds has several implementations:
+apparmor_bprm_set_creds, cap_bprm_set_creds, selinux_bprm_set_creds,
+smack_bprm_set_creds, and tomoyo_bprm_set_creds.
+
+Except for cap_bprm_set_creds they all test bprm->called_set_creds and
+return immediately if it is true.  The function cap_bprm_set_creds
+ignores bprm->calld_sed_creds entirely.
+
+Create a new LSM hook security_bprm_creds_for_exec that is called just
+before prepare_binprm in __do_execve_file, resulting in a LSM hook
+that is called exactly once for the entire of exec.  Modify the bits
+of security_bprm_set_creds that only want to be called once per exec
+into security_bprm_creds_for_exec, leaving only cap_bprm_set_creds
+behind.
+
+Remove bprm->called_set_creds all of it's former users have been moved
+to security_bprm_creds_for_exec.
+
+Add or upate comments a appropriate to bring them up to date and
+to reflect this change.
+
+Link: https://lkml.kernel.org/r/87v9kszrzh.fsf_-_@x220.int.ebiederm.org
+	Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Acked-by: Casey Schaufler <casey@schaufler-ca.com> # For the LSM and Smack bits
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit b8bff599261c930630385ee21d3f98e7ce7d4843)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/smack/smack_lsm.c
+#	security/tomoyo/tomoyo.c
+diff --cc security/smack/smack_lsm.c
+index 922e3ab09003,0ac8f4518d07..000000000000
+--- a/security/smack/smack_lsm.c
++++ b/security/smack/smack_lsm.c
+@@@ -909,18 -896,15 +909,22 @@@ static int smack_sb_statfs(struct dentr
+   *
+   * Returns 0 if it gets a blob, -EPERM if exec forbidden and -ENOMEM otherwise
+   */
+- static int smack_bprm_set_creds(struct linux_binprm *bprm)
++ static int smack_bprm_creds_for_exec(struct linux_binprm *bprm)
+  {
+  	struct inode *inode = file_inode(bprm->file);
+ -	struct task_smack *bsp = smack_cred(bprm->cred);
+ +	struct task_smack *bsp = bprm->cred->security;
+  	struct inode_smack *isp;
+  	struct superblock_smack *sbsp;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	if (bprm->called_set_creds)
+ +		return 0;
+ +
+ +	isp = inode->i_security;
+++=======
++ 	isp = smack_inode(inode);
+++>>>>>>> b8bff599261c (exec: Factor security_bprm_creds_for_exec out of security_bprm_set_creds)
+  	if (isp->smk_task == NULL || isp->smk_task == bsp->smk_task)
+  		return 0;
+  
+@@@ -4646,18 -4585,19 +4650,18 @@@ static struct security_hook_list smack_
+  	LSM_HOOK_INIT(ptrace_traceme, smack_ptrace_traceme),
+  	LSM_HOOK_INIT(syslog, smack_syslog),
+  
+ -	LSM_HOOK_INIT(fs_context_dup, smack_fs_context_dup),
+ -	LSM_HOOK_INIT(fs_context_parse_param, smack_fs_context_parse_param),
+ -
+  	LSM_HOOK_INIT(sb_alloc_security, smack_sb_alloc_security),
+  	LSM_HOOK_INIT(sb_free_security, smack_sb_free_security),
+ -	LSM_HOOK_INIT(sb_free_mnt_opts, smack_free_mnt_opts),
+ -	LSM_HOOK_INIT(sb_eat_lsm_opts, smack_sb_eat_lsm_opts),
+ +	LSM_HOOK_INIT(sb_copy_data, smack_sb_copy_data),
+ +	LSM_HOOK_INIT(sb_kern_mount, smack_sb_kern_mount),
+  	LSM_HOOK_INIT(sb_statfs, smack_sb_statfs),
+  	LSM_HOOK_INIT(sb_set_mnt_opts, smack_set_mnt_opts),
+ +	LSM_HOOK_INIT(sb_parse_opts_str, smack_parse_opts_str),
+  
+- 	LSM_HOOK_INIT(bprm_set_creds, smack_bprm_set_creds),
++ 	LSM_HOOK_INIT(bprm_creds_for_exec, smack_bprm_creds_for_exec),
+  
+  	LSM_HOOK_INIT(inode_alloc_security, smack_inode_alloc_security),
+ +	LSM_HOOK_INIT(inode_free_security, smack_inode_free_security),
+  	LSM_HOOK_INIT(inode_init_security, smack_inode_init_security),
+  	LSM_HOOK_INIT(inode_link, smack_inode_link),
+  	LSM_HOOK_INIT(inode_unlink, smack_inode_unlink),
+diff --cc security/tomoyo/tomoyo.c
+index daff7d7897ad,f9adddc42ac8..000000000000
+--- a/security/tomoyo/tomoyo.c
++++ b/security/tomoyo/tomoyo.c
+@@@ -42,45 -48,30 +42,48 @@@ static int tomoyo_cred_prepare(struct c
+  }
+  
+  /**
+ - * tomoyo_bprm_committed_creds - Target for security_bprm_committed_creds().
+ + * tomoyo_cred_transfer - Target for security_transfer_creds().
+   *
+ - * @bprm: Pointer to "struct linux_binprm".
+ + * @new: Pointer to "struct cred".
+ + * @old: Pointer to "struct cred".
+   */
+ -static void tomoyo_bprm_committed_creds(struct linux_binprm *bprm)
+ +static void tomoyo_cred_transfer(struct cred *new, const struct cred *old)
+  {
+ -	/* Clear old_domain_info saved by execve() request. */
+ -	struct tomoyo_task *s = tomoyo_task(current);
+ +	tomoyo_cred_prepare(new, old, 0);
+ +}
+  
+ -	atomic_dec(&s->old_domain_info->users);
+ -	s->old_domain_info = NULL;
+ +/**
+ + * tomoyo_cred_free - Target for security_cred_free().
+ + *
+ + * @cred: Pointer to "struct cred".
+ + */
+ +static void tomoyo_cred_free(struct cred *cred)
+ +{
+ +	struct tomoyo_domain_info *domain = cred->security;
+ +	if (domain)
+ +		atomic_dec(&domain->users);
+  }
+  
+ -#ifndef CONFIG_SECURITY_TOMOYO_OMIT_USERSPACE_LOADER
+  /**
+-  * tomoyo_bprm_set_creds - Target for security_bprm_set_creds().
++  * tomoyo_bprm_for_exec - Target for security_bprm_creds_for_exec().
+   *
+   * @bprm: Pointer to "struct linux_binprm".
+   *
+ - * Returns 0.
+ + * Returns 0 on success, negative value otherwise.
+   */
+- static int tomoyo_bprm_set_creds(struct linux_binprm *bprm)
++ static int tomoyo_bprm_creds_for_exec(struct linux_binprm *bprm)
+  {
+  	/*
+++<<<<<<< HEAD
+ +	 * Do only if this function is called for the first time of an execve
+ +	 * operation.
+ +	 */
+ +	if (bprm->called_set_creds)
+ +		return 0;
+ +#ifndef CONFIG_SECURITY_TOMOYO_OMIT_USERSPACE_LOADER
+ +	/*
+++=======
+++>>>>>>> b8bff599261c (exec: Factor security_bprm_creds_for_exec out of security_bprm_set_creds)
+  	 * Load policy if /sbin/tomoyo-init exists and /sbin/init is requested
+  	 * for the first time.
+  	 */
+@@@ -498,11 -528,13 +501,20 @@@ static int tomoyo_socket_sendmsg(struc
+   * registering TOMOYO.
+   */
+  static struct security_hook_list tomoyo_hooks[] __lsm_ro_after_init = {
+ +	LSM_HOOK_INIT(cred_alloc_blank, tomoyo_cred_alloc_blank),
+  	LSM_HOOK_INIT(cred_prepare, tomoyo_cred_prepare),
+++<<<<<<< HEAD
+ +	LSM_HOOK_INIT(cred_transfer, tomoyo_cred_transfer),
+ +	LSM_HOOK_INIT(cred_free, tomoyo_cred_free),
+ +	LSM_HOOK_INIT(bprm_set_creds, tomoyo_bprm_set_creds),
+++=======
++ 	LSM_HOOK_INIT(bprm_committed_creds, tomoyo_bprm_committed_creds),
++ 	LSM_HOOK_INIT(task_alloc, tomoyo_task_alloc),
++ 	LSM_HOOK_INIT(task_free, tomoyo_task_free),
++ #ifndef CONFIG_SECURITY_TOMOYO_OMIT_USERSPACE_LOADER
++ 	LSM_HOOK_INIT(bprm_creds_for_exec, tomoyo_bprm_creds_for_exec),
++ #endif
+++>>>>>>> b8bff599261c (exec: Factor security_bprm_creds_for_exec out of security_bprm_set_creds)
+  	LSM_HOOK_INIT(bprm_check_security, tomoyo_bprm_check_security),
+  	LSM_HOOK_INIT(file_fcntl, tomoyo_file_fcntl),
+  	LSM_HOOK_INIT(file_open, tomoyo_file_open),
+diff --git a/fs/exec.c b/fs/exec.c
+index 267f61b63004..5f159bdba316 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1605,7 +1605,6 @@ int prepare_binprm(struct linux_binprm *bprm)
+ 	retval = security_bprm_set_creds(bprm);
+ 	if (retval)
+ 		return retval;
+-	bprm->called_set_creds = 1;
+ 
+ 	memset(bprm->buf, 0, BINPRM_BUF_SIZE);
+ 	return kernel_read(bprm->file, bprm->buf, BINPRM_BUF_SIZE, &pos);
+@@ -1827,6 +1826,11 @@ static int do_execveat_common(int fd, struct filename *filename,
+ 	if ((retval = bprm->envc) < 0)
+ 		goto out;
+ 
++	/* Set the unchanging part of bprm->cred */
++	retval = security_bprm_creds_for_exec(bprm);
++	if (retval)
++		goto out;
++
+ 	retval = prepare_binprm(bprm);
+ 	if (retval < 0)
+ 		goto out;
+diff --git a/include/linux/binfmts.h b/include/linux/binfmts.h
+index 8c12228326b0..b04649552b2d 100644
+--- a/include/linux/binfmts.h
++++ b/include/linux/binfmts.h
+@@ -27,22 +27,14 @@ struct linux_binprm {
+ 	unsigned long p; /* current top of mem */
+ 	unsigned int
+ 		/*
+-		 * True after the bprm_set_creds hook has been called once
+-		 * (multiple calls can be made via prepare_binprm() for
+-		 * binfmt_script/misc).
+-		 */
+-		called_set_creds:1,
+-		/*
+-		 * True if most recent call to the commoncaps bprm_set_creds
+-		 * hook (due to multiple prepare_binprm() calls from the
+-		 * binfmt_script/misc handlers) resulted in elevated
+-		 * privileges.
++		 * True if most recent call to cap_bprm_set_creds
++		 * resulted in elevated privileges.
+ 		 */
+ 		cap_elevated:1,
+ 		/*
+-		 * Set by bprm_set_creds hook to indicate a privilege-gaining
+-		 * exec has happened. Used to sanitize execution environment
+-		 * and to set AT_SECURE auxv for glibc.
++		 * Set by bprm_creds_for_exec hook to indicate a
++		 * privilege-gaining exec has happened. Used to set
++		 * AT_SECURE auxv for glibc.
+ 		 */
+ 		secureexec:1;
+ #ifdef __alpha__
+diff --git a/include/linux/lsm_hook_defs.h b/include/linux/lsm_hook_defs.h
+index cadd0184a87f..e20d7573918d 100644
+--- a/include/linux/lsm_hook_defs.h
++++ b/include/linux/lsm_hook_defs.h
+@@ -49,6 +49,7 @@ LSM_HOOK(int, 0, syslog, int type)
+ LSM_HOOK(int, 0, settime, const struct timespec64 *ts,
+ 	 const struct timezone *tz)
+ LSM_HOOK(int, 0, vm_enough_memory, struct mm_struct *mm, long pages)
++LSM_HOOK(int, 0, bprm_creds_for_exec, struct linux_binprm *bprm)
+ LSM_HOOK(int, 0, bprm_set_creds, struct linux_binprm *bprm)
+ LSM_HOOK(int, 0, bprm_check_security, struct linux_binprm *bprm)
+ LSM_HOOK(void, LSM_RET_VOID, bprm_committing_creds, struct linux_binprm *bprm)
+diff --git a/include/linux/lsm_hooks.h b/include/linux/lsm_hooks.h
+index 021d496e375e..14c3d036a9fb 100644
+--- a/include/linux/lsm_hooks.h
++++ b/include/linux/lsm_hooks.h
+@@ -34,40 +34,46 @@
+  *
+  * Security hooks for program execution operations.
+  *
++ * @bprm_creds_for_exec:
++ *	If the setup in prepare_exec_creds did not setup @bprm->cred->security
++ *	properly for executing @bprm->file, update the LSM's portion of
++ *	@bprm->cred->security to be what commit_creds needs to install for the
++ *	new program.  This hook may also optionally check permissions
++ *	(e.g. for transitions between security domains).
++ *	The hook must set @bprm->secureexec to 1 if AT_SECURE should be set to
++ *	request libc enable secure mode.
++ *	@bprm contains the linux_binprm structure.
++ *	Return 0 if the hook is successful and permission is granted.
+  * @bprm_set_creds:
+- *	Save security information in the bprm->security field, typically based
+- *	on information about the bprm->file, for later use by the apply_creds
+- *	hook.  This hook may also optionally check permissions (e.g. for
++ *	Assuming that the relevant bits of @bprm->cred->security have been
++ *	previously set, examine @bprm->file and regenerate them.  This is
++ *	so that the credentials derived from the interpreter the code is
++ *	actually going to run are used rather than credentials derived
++ *	from a script.  This done because the interpreter binary needs to
++ *	reopen script, and may end up opening something completely different.
++ *	This hook may also optionally check permissions (e.g. for
+  *	transitions between security domains).
+- *	This hook may be called multiple times during a single execve, e.g. for
+- *	interpreters.  The hook can tell whether it has already been called by
+- *	checking to see if @bprm->security is non-NULL.  If so, then the hook
+- *	may decide either to retain the security information saved earlier or
+- *	to replace it.  The hook must set @bprm->secureexec to 1 if a "secure
+- *	exec" has happened as a result of this hook call.  The flag is used to
+- *	indicate the need for a sanitized execution environment, and is also
+- *	passed in the ELF auxiliary table on the initial stack to indicate
+- *	whether libc should enable secure mode.
++ *	The hook must set @bprm->cap_elevated to 1 if AT_SECURE should be set to
++ *	request libc enable secure mode.
+  *	@bprm contains the linux_binprm structure.
+  *	Return 0 if the hook is successful and permission is granted.
+  * @bprm_check_security:
+  *	This hook mediates the point when a search for a binary handler will
+- *	begin.  It allows a check the @bprm->security value which is set in the
+- *	preceding set_creds call.  The primary difference from set_creds is
+- *	that the argv list and envp list are reliably available in @bprm.  This
+- *	hook may be called multiple times during a single execve; and in each
+- *	pass set_creds is called first.
++ *	begin.  It allows a check against the @bprm->cred->security value
++ *	which was set in the preceding creds_for_exec call.  The argv list and
++ *	envp list are reliably available in @bprm.  This hook may be called
++ *	multiple times during a single execve.
+  *	@bprm contains the linux_binprm structure.
+  *	Return 0 if the hook is successful and permission is granted.
+  * @bprm_committing_creds:
+  *	Prepare to install the new security attributes of a process being
+  *	transformed by an execve operation, based on the old credentials
+  *	pointed to by @current->cred and the information set in @bprm->cred by
+- *	the bprm_set_creds hook.  @bprm points to the linux_binprm structure.
+- *	This hook is a good place to perform state changes on the process such
+- *	as closing open file descriptors to which access will no longer be
+- *	granted when the attributes are changed.  This is called immediately
+- *	before commit_creds().
++ *	the bprm_creds_for_exec hook.  @bprm points to the linux_binprm
++ *	structure.  This hook is a good place to perform state changes on the
++ *	process such as closing open file descriptors to which access will no
++ *	longer be granted when the attributes are changed.  This is called
++ *	immediately before commit_creds().
+  * @bprm_committed_creds:
+  *	Tidy up after the installation of the new security attributes of a
+  *	process being transformed by an execve operation.  The new credentials
+diff --git a/include/linux/security.h b/include/linux/security.h
+index db504cd9f8e7..1a46e9ceae59 100644
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@ -222,6 +222,7 @@ int security_quota_on(struct dentry *dentry);
+ int security_syslog(int type);
+ int security_settime64(const struct timespec64 *ts, const struct timezone *tz);
+ int security_vm_enough_memory_mm(struct mm_struct *mm, long pages);
++int security_bprm_creds_for_exec(struct linux_binprm *bprm);
+ int security_bprm_set_creds(struct linux_binprm *bprm);
+ int security_bprm_check(struct linux_binprm *bprm);
+ void security_bprm_committing_creds(struct linux_binprm *bprm);
+@@ -510,6 +511,11 @@ static inline int security_vm_enough_memory_mm(struct mm_struct *mm, long pages)
+ 	return __vm_enough_memory(mm, pages, cap_vm_enough_memory(mm, pages));
+ }
+ 
++static inline int security_bprm_creds_for_exec(struct linux_binprm *bprm)
++{
++	return 0;
++}
++
+ static inline int security_bprm_set_creds(struct linux_binprm *bprm)
+ {
+ 	return cap_bprm_set_creds(bprm);
+diff --git a/security/apparmor/domain.c b/security/apparmor/domain.c
+index 989d65d26689..b434ecd46e56 100644
+--- a/security/apparmor/domain.c
++++ b/security/apparmor/domain.c
+@@ -865,14 +865,14 @@ static struct aa_label *handle_onexec(struct aa_label *label,
+ }
+ 
+ /**
+- * apparmor_bprm_set_creds - set the new creds on the bprm struct
++ * apparmor_bprm_creds_for_exec - Update the new creds on the bprm struct
+  * @bprm: binprm for the exec  (NOT NULL)
+  *
+  * Returns: %0 or error on failure
+  *
+  * TODO: once the other paths are done see if we can't refactor into a fn
+  */
+-int apparmor_bprm_set_creds(struct linux_binprm *bprm)
++int apparmor_bprm_creds_for_exec(struct linux_binprm *bprm)
+ {
+ 	struct aa_task_ctx *ctx;
+ 	struct aa_label *label, *new = NULL;
+@@ -886,9 +886,6 @@ int apparmor_bprm_set_creds(struct linux_binprm *bprm)
+ 		file_inode(bprm->file)->i_mode
+ 	};
+ 
+-	if (bprm->called_set_creds)
+-		return 0;
+-
+ 	ctx = task_ctx(current);
+ 	AA_BUG(!cred_label(bprm->cred));
+ 	AA_BUG(!ctx);
+diff --git a/security/apparmor/include/domain.h b/security/apparmor/include/domain.h
+index ac9862ff7cdf..7bf9eac061c8 100644
+--- a/security/apparmor/include/domain.h
++++ b/security/apparmor/include/domain.h
+@@ -34,7 +34,7 @@ struct aa_domain {
+ struct aa_label *x_table_lookup(struct aa_profile *profile, u32 xindex,
+ 				const char **name);
+ 
+-int apparmor_bprm_set_creds(struct linux_binprm *bprm);
++int apparmor_bprm_creds_for_exec(struct linux_binprm *bprm);
+ 
+ void aa_free_domain_entries(struct aa_domain *domain);
+ int aa_change_hat(const char *hats[], int count, u64 token, int flags);
+diff --git a/security/apparmor/lsm.c b/security/apparmor/lsm.c
+index 85c05989635b..cb3eb1021922 100644
+--- a/security/apparmor/lsm.c
++++ b/security/apparmor/lsm.c
+@@ -1189,7 +1189,7 @@ static struct security_hook_list apparmor_hooks[] __lsm_ro_after_init = {
+ 	LSM_HOOK_INIT(cred_prepare, apparmor_cred_prepare),
+ 	LSM_HOOK_INIT(cred_transfer, apparmor_cred_transfer),
+ 
+-	LSM_HOOK_INIT(bprm_set_creds, apparmor_bprm_set_creds),
++	LSM_HOOK_INIT(bprm_creds_for_exec, apparmor_bprm_creds_for_exec),
+ 	LSM_HOOK_INIT(bprm_committing_creds, apparmor_bprm_committing_creds),
+ 	LSM_HOOK_INIT(bprm_committed_creds, apparmor_bprm_committed_creds),
+ 
+diff --git a/security/security.c b/security/security.c
+index 3186ac8031f0..1dfcfdb903e9 100644
+--- a/security/security.c
++++ b/security/security.c
+@@ -764,6 +764,11 @@ int security_vm_enough_memory_mm(struct mm_struct *mm, long pages)
+ 	return __vm_enough_memory(mm, pages, cap_sys_admin);
+ }
+ 
++int security_bprm_creds_for_exec(struct linux_binprm *bprm)
++{
++	return call_int_hook(bprm_creds_for_exec, 0, bprm);
++}
++
+ int security_bprm_set_creds(struct linux_binprm *bprm)
+ {
+ 	return call_int_hook(bprm_set_creds, 0, bprm);
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 97342403aade..35f414da294d 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -2391,7 +2391,7 @@ static int check_nnp_nosuid(const struct linux_binprm *bprm,
+ 	return -EACCES;
+ }
+ 
+-static int selinux_bprm_set_creds(struct linux_binprm *bprm)
++static int selinux_bprm_creds_for_exec(struct linux_binprm *bprm)
+ {
+ 	const struct task_security_struct *old_tsec;
+ 	struct task_security_struct *new_tsec;
+@@ -2402,8 +2402,6 @@ static int selinux_bprm_set_creds(struct linux_binprm *bprm)
+ 
+ 	/* SELinux context only depends on initial program or script and not
+ 	 * the script interpreter */
+-	if (bprm->called_set_creds)
+-		return 0;
+ 
+ 	old_tsec = selinux_cred(current_cred());
+ 	new_tsec = selinux_cred(bprm->cred);
+@@ -6511,7 +6509,7 @@ static int selinux_setprocattr(const char *name, void *value, size_t size)
+ 	/* Permission checking based on the specified context is
+ 	   performed during the actual operation (execve,
+ 	   open/mkdir/...), when we know the full context of the
+-	   operation.  See selinux_bprm_set_creds for the execve
++	   operation.  See selinux_bprm_creds_for_exec for the execve
+ 	   checks and may_create for the file creation checks. The
+ 	   operation will then fail if the context is not permitted. */
+ 	tsec = selinux_cred(new);
+@@ -7013,7 +7011,7 @@ static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
+ 
+ 	LSM_HOOK_INIT(netlink_send, selinux_netlink_send),
+ 
+-	LSM_HOOK_INIT(bprm_set_creds, selinux_bprm_set_creds),
++	LSM_HOOK_INIT(bprm_creds_for_exec, selinux_bprm_creds_for_exec),
+ 	LSM_HOOK_INIT(bprm_committing_creds, selinux_bprm_committing_creds),
+ 	LSM_HOOK_INIT(bprm_committed_creds, selinux_bprm_committed_creds),
+ 
+* Unmerged path security/smack/smack_lsm.c
+* Unmerged path security/tomoyo/tomoyo.c
