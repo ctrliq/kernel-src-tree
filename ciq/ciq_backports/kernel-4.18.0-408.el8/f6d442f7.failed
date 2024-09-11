@@ -1,0 +1,176 @@
+dmaengine: idxd: handle invalid interrupt handle descriptors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit f6d442f7088cbf5e2ac4561aca6888380239d5b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/f6d442f7.failed
+
+Handle a descriptor that has been marked with invalid interrupt handle
+error in status. Create a work item that will resubmit the descriptor. This
+typically happens when the driver has handled the revoke interrupt handle
+event and has a new interrupt handle.
+
+	Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/163528419601.3925689.4166517602890523193.stgit@djiang5-desk3.ch.intel.com
+	Signed-off-by: Vinod Koul <vkoul@kernel.org>
+(cherry picked from commit f6d442f7088cbf5e2ac4561aca6888380239d5b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dma/idxd/irq.c
+diff --cc drivers/dma/idxd/irq.c
+index 7a2cf0512501,eaaec7a2c740..000000000000
+--- a/drivers/dma/idxd/irq.c
++++ b/drivers/dma/idxd/irq.c
+@@@ -22,12 -22,10 +22,19 @@@ struct idxd_fault 
+  	struct idxd_device *idxd;
+  };
+  
+++<<<<<<< HEAD
+ +static int irq_process_work_list(struct idxd_irq_entry *irq_entry,
+ +				 enum irq_work_type wtype,
+ +				 int *processed, u64 data);
+ +static int irq_process_pending_llist(struct idxd_irq_entry *irq_entry,
+ +				     enum irq_work_type wtype,
+ +				     int *processed, u64 data);
+++=======
++ struct idxd_resubmit {
++ 	struct work_struct work;
++ 	struct idxd_desc *desc;
++ };
+++>>>>>>> f6d442f7088c (dmaengine: idxd: handle invalid interrupt handle descriptors)
+  
+  static void idxd_device_reinit(struct work_struct *work)
+  {
+@@@ -228,32 -221,52 +235,81 @@@ irqreturn_t idxd_misc_thread(int vec, v
+  	return IRQ_HANDLED;
+  }
+  
+++<<<<<<< HEAD
+ +static inline bool match_fault(struct idxd_desc *desc, u64 fault_addr)
+ +{
+ +	/*
+ +	 * Completion address can be bad as well. Check fault address match for descriptor
+ +	 * and completion address.
+ +	 */
+ +	if ((u64)desc->hw == fault_addr || (u64)desc->completion == fault_addr) {
+ +		struct idxd_device *idxd = desc->wq->idxd;
+ +		struct device *dev = &idxd->pdev->dev;
+ +
+ +		dev_warn(dev, "desc with fault address: %#llx\n", fault_addr);
+ +		return true;
+ +	}
+ +
+ +	return false;
+ +}
+ +
+ +static inline void complete_desc(struct idxd_desc *desc, enum idxd_complete_type reason)
+ +{
+ +	idxd_dma_complete_txd(desc, reason);
+ +	idxd_free_desc(desc->wq, desc);
+ +}
+ +
+ +static int irq_process_pending_llist(struct idxd_irq_entry *irq_entry,
+ +				     enum irq_work_type wtype,
+ +				     int *processed, u64 data)
+++=======
++ static void idxd_int_handle_resubmit_work(struct work_struct *work)
++ {
++ 	struct idxd_resubmit *irw = container_of(work, struct idxd_resubmit, work);
++ 	struct idxd_desc *desc = irw->desc;
++ 	struct idxd_wq *wq = desc->wq;
++ 	int rc;
++ 
++ 	desc->completion->status = 0;
++ 	rc = idxd_submit_desc(wq, desc);
++ 	if (rc < 0) {
++ 		dev_dbg(&wq->idxd->pdev->dev, "Failed to resubmit desc %d to wq %d.\n",
++ 			desc->id, wq->id);
++ 		/*
++ 		 * If the error is not -EAGAIN, it means the submission failed due to wq
++ 		 * has been killed instead of ENQCMDS failure. Here the driver needs to
++ 		 * notify the submitter of the failure by reporting abort status.
++ 		 *
++ 		 * -EAGAIN comes from ENQCMDS failure. idxd_submit_desc() will handle the
++ 		 * abort.
++ 		 */
++ 		if (rc != -EAGAIN) {
++ 			desc->completion->status = IDXD_COMP_DESC_ABORT;
++ 			idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT, false);
++ 		}
++ 		idxd_free_desc(wq, desc);
++ 	}
++ 	kfree(irw);
++ }
++ 
++ bool idxd_queue_int_handle_resubmit(struct idxd_desc *desc)
++ {
++ 	struct idxd_wq *wq = desc->wq;
++ 	struct idxd_device *idxd = wq->idxd;
++ 	struct idxd_resubmit *irw;
++ 
++ 	irw = kzalloc(sizeof(*irw), GFP_KERNEL);
++ 	if (!irw)
++ 		return false;
++ 
++ 	irw->desc = desc;
++ 	INIT_WORK(&irw->work, idxd_int_handle_resubmit_work);
++ 	queue_work(idxd->wq, &irw->work);
++ 	return true;
++ }
++ 
++ static void irq_process_pending_llist(struct idxd_irq_entry *irq_entry)
+++>>>>>>> f6d442f7088c (dmaengine: idxd: handle invalid interrupt handle descriptors)
+  {
+  	struct idxd_desc *desc, *t;
+  	struct llist_node *head;
+diff --git a/drivers/dma/idxd/dma.c b/drivers/dma/idxd/dma.c
+index 77439b645044..b6ee543bde0c 100644
+--- a/drivers/dma/idxd/dma.c
++++ b/drivers/dma/idxd/dma.c
+@@ -23,18 +23,24 @@ static inline struct idxd_wq *to_idxd_wq(struct dma_chan *c)
+ void idxd_dma_complete_txd(struct idxd_desc *desc,
+ 			   enum idxd_complete_type comp_type)
+ {
++	struct idxd_device *idxd = desc->wq->idxd;
+ 	struct dma_async_tx_descriptor *tx;
+ 	struct dmaengine_result res;
+ 	int complete = 1;
+ 
+-	if (desc->completion->status == DSA_COMP_SUCCESS)
++	if (desc->completion->status == DSA_COMP_SUCCESS) {
+ 		res.result = DMA_TRANS_NOERROR;
+-	else if (desc->completion->status)
++	} else if (desc->completion->status) {
++		if (idxd->request_int_handles && comp_type != IDXD_COMPLETE_ABORT &&
++		    desc->completion->status == DSA_COMP_INT_HANDLE_INVAL &&
++		    idxd_queue_int_handle_resubmit(desc))
++			return;
+ 		res.result = DMA_TRANS_WRITE_FAILED;
+-	else if (comp_type == IDXD_COMPLETE_ABORT)
++	} else if (comp_type == IDXD_COMPLETE_ABORT) {
+ 		res.result = DMA_TRANS_ABORTED;
+-	else
++	} else {
+ 		complete = 0;
++	}
+ 
+ 	tx = &desc->txd;
+ 	if (complete && tx->cookie) {
+diff --git a/drivers/dma/idxd/idxd.h b/drivers/dma/idxd/idxd.h
+index 03dc70e1f4d4..0f41a35edd8d 100644
+--- a/drivers/dma/idxd/idxd.h
++++ b/drivers/dma/idxd/idxd.h
+@@ -428,6 +428,7 @@ void idxd_unregister_devices(struct idxd_device *idxd);
+ int idxd_register_driver(void);
+ void idxd_unregister_driver(void);
+ void idxd_wqs_quiesce(struct idxd_device *idxd);
++bool idxd_queue_int_handle_resubmit(struct idxd_desc *desc);
+ 
+ /* device interrupt control */
+ void idxd_msix_perm_setup(struct idxd_device *idxd);
+* Unmerged path drivers/dma/idxd/irq.c
