@@ -1355,6 +1355,9 @@ struct bnxt_test_info {
 #define BNXT_GRC_REG_CHIP_NUM			0x48
 #define BNXT_GRC_REG_BASE			0x260000
 
+#define BNXT_TS_REG_TIMESYNC_TS0_LOWER		0x640180c
+#define BNXT_TS_REG_TIMESYNC_TS0_UPPER		0x6401810
+
 #define BNXT_GRC_BASE_MASK			0xfffff000
 #define BNXT_GRC_OFFSET_MASK			0x00000ffc
 
@@ -2034,6 +2037,8 @@ struct bnxt {
 #define BNXT_DUMP_CRASH		1
 
 	struct bpf_prog		*xdp_prog;
+
+	struct bnxt_ptp_cfg	*ptp_cfg;
 
 	/* devlink interface and vf-rep structs */
 	struct devlink		*dl;
