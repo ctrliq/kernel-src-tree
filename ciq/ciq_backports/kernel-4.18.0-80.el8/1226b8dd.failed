@@ -1,0 +1,174 @@
+block: switch to per-cpu in-flight counters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 1226b8dd0e91331cfab500f305b2c264445a0392
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/1226b8dd.failed
+
+Now when part_round_stats is gone, we can switch to per-cpu in-flight
+counters.
+
+We use the local-atomic type local_t, so that if part_inc_in_flight or
+part_dec_in_flight is reentrantly called from an interrupt, the value will
+be correct.
+
+The other counters could be corrupted due to reentrant interrupt, but the
+corruption only results in slight counter skew - the in_flight counter
+must be exact, so it needs local_t.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 1226b8dd0e91331cfab500f305b2c264445a0392)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/genhd.c
+#	include/linux/genhd.h
+diff --cc block/genhd.c
+index be5bab20b2ab,9827a2c05db7..000000000000
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@@ -47,28 -47,30 +47,34 @@@ static void disk_release_events(struct 
+  
+  void part_inc_in_flight(struct request_queue *q, struct hd_struct *part, int rw)
+  {
+ -	if (queue_is_mq(q))
+ +	if (q->mq_ops)
+  		return;
+  
+- 	atomic_inc(&part->in_flight[rw]);
++ 	part_stat_local_inc(part, in_flight[rw]);
+  	if (part->partno)
+- 		atomic_inc(&part_to_disk(part)->part0.in_flight[rw]);
++ 		part_stat_local_inc(&part_to_disk(part)->part0, in_flight[rw]);
+  }
+  
+  void part_dec_in_flight(struct request_queue *q, struct hd_struct *part, int rw)
+  {
+ -	if (queue_is_mq(q))
+ +	if (q->mq_ops)
+  		return;
+  
+- 	atomic_dec(&part->in_flight[rw]);
++ 	part_stat_local_dec(part, in_flight[rw]);
+  	if (part->partno)
+- 		atomic_dec(&part_to_disk(part)->part0.in_flight[rw]);
++ 		part_stat_local_dec(&part_to_disk(part)->part0, in_flight[rw]);
+  }
+  
+  void part_in_flight(struct request_queue *q, struct hd_struct *part,
+  		    unsigned int inflight[2])
+  {
+++<<<<<<< HEAD
+ +	if (q->mq_ops) {
+++=======
++ 	int cpu;
++ 
++ 	if (queue_is_mq(q)) {
+++>>>>>>> 1226b8dd0e91 (block: switch to per-cpu in-flight counters)
+  		blk_mq_in_flight(q, part, inflight);
+  		return;
+  	}
+@@@ -85,7 -98,9 +102,13 @@@
+  void part_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+  		       unsigned int inflight[2])
+  {
+++<<<<<<< HEAD
+ +	if (q->mq_ops) {
+++=======
++ 	int cpu;
++ 
++ 	if (queue_is_mq(q)) {
+++>>>>>>> 1226b8dd0e91 (block: switch to per-cpu in-flight counters)
+  		blk_mq_in_flight_rw(q, part, inflight);
+  		return;
+  	}
+diff --cc include/linux/genhd.h
+index f767293b00e6,636b4f687e35..000000000000
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@@ -295,8 -296,11 +296,16 @@@ extern struct hd_struct *disk_map_secto
+  #define part_stat_lock()	({ rcu_read_lock(); get_cpu(); })
+  #define part_stat_unlock()	do { put_cpu(); rcu_read_unlock(); } while (0)
+  
+++<<<<<<< HEAD
+ +#define __part_stat_add(cpu, part, field, addnd)			\
+ +	(per_cpu_ptr((part)->dkstats, (cpu))->field += (addnd))
+++=======
++ #define part_stat_get_cpu(part, field, cpu)					\
++ 	(per_cpu_ptr((part)->dkstats, (cpu))->field)
++ 
++ #define part_stat_get(part, field)					\
++ 	part_stat_get_cpu(part, field, smp_processor_id())
+++>>>>>>> 1226b8dd0e91 (block: switch to per-cpu in-flight counters)
+  
+  #define part_stat_read(part, field)					\
+  ({									\
+@@@ -333,10 -337,9 +342,16 @@@ static inline void free_part_stats(stru
+  #define part_stat_lock()	({ rcu_read_lock(); 0; })
+  #define part_stat_unlock()	rcu_read_unlock()
+  
+++<<<<<<< HEAD
+ +#define __part_stat_add(cpu, part, field, addnd)				\
+ +	((part)->dkstats.field += addnd)
+ +
+ +#define part_stat_read(part, field)	((part)->dkstats.field)
+++=======
++ #define part_stat_get(part, field)		((part)->dkstats.field)
++ #define part_stat_get_cpu(part, field, cpu)	part_stat_get(part, field)
++ #define part_stat_read(part, field)		part_stat_get(part, field)
+++>>>>>>> 1226b8dd0e91 (block: switch to per-cpu in-flight counters)
+  
+  static inline void part_stat_set_all(struct hd_struct *part, int value)
+  {
+@@@ -362,20 -365,32 +377,37 @@@ static inline void free_part_stats(stru
+  	 part_stat_read(part, field[STAT_WRITE]) +			\
+  	 part_stat_read(part, field[STAT_DISCARD]))
+  
+++<<<<<<< HEAD
+ +#define part_stat_add(cpu, part, field, addnd)	do {			\
+ +	__part_stat_add((cpu), (part), field, addnd);			\
+++=======
++ #define __part_stat_add(part, field, addnd)				\
++ 	(part_stat_get(part, field) += (addnd))
++ 
++ #define part_stat_add(part, field, addnd)	do {			\
++ 	__part_stat_add((part), field, addnd);				\
+++>>>>>>> 1226b8dd0e91 (block: switch to per-cpu in-flight counters)
+  	if ((part)->partno)						\
+ -		__part_stat_add(&part_to_disk((part))->part0,		\
+ +		__part_stat_add((cpu), &part_to_disk((part))->part0,	\
+  				field, addnd);				\
+  } while (0)
+  
+ -#define part_stat_dec(gendiskp, field)					\
+ -	part_stat_add(gendiskp, field, -1)
+ -#define part_stat_inc(gendiskp, field)					\
+ -	part_stat_add(gendiskp, field, 1)
+ -#define part_stat_sub(gendiskp, field, subnd)				\
+ -	part_stat_add(gendiskp, field, -subnd)
+ +#define part_stat_dec(cpu, gendiskp, field)				\
+ +	part_stat_add(cpu, gendiskp, field, -1)
+ +#define part_stat_inc(cpu, gendiskp, field)				\
+ +	part_stat_add(cpu, gendiskp, field, 1)
+ +#define part_stat_sub(cpu, gendiskp, field, subnd)			\
+ +	part_stat_add(cpu, gendiskp, field, -subnd)
+  
++ #define part_stat_local_dec(gendiskp, field)				\
++ 	local_dec(&(part_stat_get(gendiskp, field)))
++ #define part_stat_local_inc(gendiskp, field)				\
++ 	local_inc(&(part_stat_get(gendiskp, field)))
++ #define part_stat_local_read(gendiskp, field)				\
++ 	local_read(&(part_stat_get(gendiskp, field)))
++ #define part_stat_local_read_cpu(gendiskp, field, cpu)			\
++ 	local_read(&(part_stat_get_cpu(gendiskp, field, cpu)))
++ 
+  void part_in_flight(struct request_queue *q, struct hd_struct *part,
+  		    unsigned int inflight[2]);
+  void part_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+* Unmerged path block/genhd.c
+* Unmerged path include/linux/genhd.h
