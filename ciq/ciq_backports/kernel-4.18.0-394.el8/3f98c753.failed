@@ -1,0 +1,350 @@
+block: don't check bio in blk_throtl_dispatch_work_fn
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 3f98c753717c600eb5708e9b78b3eba6664bddf1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/3f98c753.failed
+
+The bio has been checked already before throttling, so no need to check
+it again before dispatching it from throttle queue.
+
+Add a helper of submit_bio_noacct_nocheck() for this purpose.
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20220216044514.2903784-5-ming.lei@redhat.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 3f98c753717c600eb5708e9b78b3eba6664bddf1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk-throttle.c
+#	block/blk.h
+diff --cc block/blk-core.c
+index 15d6da8e75fd,72b7b2214c70..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -952,20 -783,115 +952,36 @@@ end_io
+  	return false;
+  }
+  
+ -static void __submit_bio(struct bio *bio)
+ -{
+ -	struct gendisk *disk = bio->bi_bdev->bd_disk;
+ -
+ -	if (unlikely(!blk_crypto_bio_prep(&bio)))
+ -		return;
+ -
+ -	if (!disk->fops->submit_bio) {
+ -		blk_mq_submit_bio(bio);
+ -	} else if (likely(bio_queue_enter(bio) == 0)) {
+ -		disk->fops->submit_bio(bio);
+ -		blk_queue_exit(disk->queue);
+ -	}
+ -}
+ -
+ -/*
+ - * The loop in this function may be a bit non-obvious, and so deserves some
+ - * explanation:
+ - *
+ - *  - Before entering the loop, bio->bi_next is NULL (as all callers ensure
+ - *    that), so we have a list with a single bio.
+ - *  - We pretend that we have just taken it off a longer list, so we assign
+ - *    bio_list to a pointer to the bio_list_on_stack, thus initialising the
+ - *    bio_list of new bios to be added.  ->submit_bio() may indeed add some more
+ - *    bios through a recursive call to submit_bio_noacct.  If it did, we find a
+ - *    non-NULL value in bio_list and re-enter the loop from the top.
+ - *  - In this case we really did just take the bio of the top of the list (no
+ - *    pretending) and so remove it from bio_list, and call into ->submit_bio()
+ - *    again.
+ - *
+ - * bio_list_on_stack[0] contains bios submitted by the current ->submit_bio.
+ - * bio_list_on_stack[1] contains bios that were submitted before the current
+ - *	->submit_bio_bio, but that haven't been processed yet.
+ - */
+ -static void __submit_bio_noacct(struct bio *bio)
+ +static blk_qc_t do_make_request(struct bio *bio)
+  {
+ -	struct bio_list bio_list_on_stack[2];
+ -
+ -	BUG_ON(bio->bi_next);
+ +	struct request_queue *q = bio->bi_disk->queue;
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+  
+ -	bio_list_init(&bio_list_on_stack[0]);
+ -	current->bio_list = bio_list_on_stack;
+ -
+ -	do {
+ -		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+ -		struct bio_list lower, same;
+ -
+ -		/*
+ -		 * Create a fresh bio_list for all subordinate requests.
+ -		 */
+ -		bio_list_on_stack[1] = bio_list_on_stack[0];
+ -		bio_list_init(&bio_list_on_stack[0]);
+ -
+ -		__submit_bio(bio);
+ -
+ -		/*
+ -		 * Sort new bios into those for a lower level and those for the
+ -		 * same level.
+ -		 */
+ -		bio_list_init(&lower);
+ -		bio_list_init(&same);
+ -		while ((bio = bio_list_pop(&bio_list_on_stack[0])) != NULL)
+ -			if (q == bdev_get_queue(bio->bi_bdev))
+ -				bio_list_add(&same, bio);
+ -			else
+ -				bio_list_add(&lower, bio);
+ -
+ -		/*
+ -		 * Now assemble so we handle the lowest level first.
+ -		 */
+ -		bio_list_merge(&bio_list_on_stack[0], &lower);
+ -		bio_list_merge(&bio_list_on_stack[0], &same);
+ -		bio_list_merge(&bio_list_on_stack[0], &bio_list_on_stack[1]);
+ -	} while ((bio = bio_list_pop(&bio_list_on_stack[0])));
+ -
+ -	current->bio_list = NULL;
+ -}
+ -
+ -static void __submit_bio_noacct_mq(struct bio *bio)
+ -{
+ -	struct bio_list bio_list[2] = { };
+ -
+ -	current->bio_list = bio_list;
+ -
+ -	do {
+ -		__submit_bio(bio);
+ -	} while ((bio = bio_list_pop(&bio_list[0])));
+ -
+ -	current->bio_list = NULL;
+ +	if (queue_is_mq(q))
+ +		return q->make_request_fn(q, bio);
+ +	ret = q->make_request_fn(q, bio);
+ +	blk_queue_exit(q);
+ +	return ret;
+  }
+  
++ void submit_bio_noacct_nocheck(struct bio *bio)
++ {
++ 	/*
++ 	 * We only want one ->submit_bio to be active at a time, else stack
++ 	 * usage with stacked devices could be a problem.  Use current->bio_list
++ 	 * to collect a list of requests submited by a ->submit_bio method while
++ 	 * it is active, and then process them after it returned.
++ 	 */
++ 	if (current->bio_list)
++ 		bio_list_add(&current->bio_list[0], bio);
++ 	else if (!bio->bi_bdev->bd_disk->fops->submit_bio)
++ 		__submit_bio_noacct_mq(bio);
++ 	else
++ 		__submit_bio_noacct(bio);
++ }
++ 
+  /**
+ - * submit_bio_noacct - re-submit a bio to the block device layer for I/O
+ + * generic_make_request - re-submit a bio to the block device layer for I/O
+   * @bio:  The bio describing the location in memory and on the device.
+   *
+   * This is a version of submit_bio() that shall only be used for I/O that is
+@@@ -973,111 -899,13 +989,117 @@@
+   * systems and other upper level users of the block layer should use
+   * submit_bio() instead.
+   */
+ -void submit_bio_noacct(struct bio *bio)
+ +blk_qc_t generic_make_request(struct bio *bio)
+  {
+++<<<<<<< HEAD
+ +	/*
+ +	 * bio_list_on_stack[0] contains bios submitted by the current
+ +	 * make_request_fn.
+ +	 * bio_list_on_stack[1] contains bios that were submitted before
+ +	 * the current make_request_fn, but that haven't been processed
+ +	 * yet.
+ +	 */
+ +	struct bio_list bio_list_on_stack[2];
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+ +
+ +	if (!generic_make_request_checks(bio))
+ +		goto out;
+ +
+ +	/*
+ +	 * We only want one ->make_request_fn to be active at a time, else
+ +	 * stack usage with stacked devices could be a problem.  So use
+ +	 * current->bio_list to keep a list of requests submited by a
+ +	 * make_request_fn function.  current->bio_list is also used as a
+ +	 * flag to say if generic_make_request is currently active in this
+ +	 * task or not.  If it is NULL, then no make_request is active.  If
+ +	 * it is non-NULL, then a make_request is active, and new requests
+ +	 * should be added at the tail
+ +	 */
+ +	if (current->bio_list) {
+ +		bio_list_add(&current->bio_list[0], bio);
+ +		goto out;
+ +	}
+ +
+ +	/* following loop may be a bit non-obvious, and so deserves some
+ +	 * explanation.
+ +	 * Before entering the loop, bio->bi_next is NULL (as all callers
+ +	 * ensure that) so we have a list with a single bio.
+ +	 * We pretend that we have just taken it off a longer list, so
+ +	 * we assign bio_list to a pointer to the bio_list_on_stack,
+ +	 * thus initialising the bio_list of new bios to be
+ +	 * added.  ->make_request() may indeed add some more bios
+ +	 * through a recursive call to generic_make_request.  If it
+ +	 * did, we find a non-NULL value in bio_list and re-enter the loop
+ +	 * from the top.  In this case we really did just take the bio
+ +	 * of the top of the list (no pretending) and so remove it from
+ +	 * bio_list, and call into ->make_request() again.
+ +	 */
+ +	BUG_ON(bio->bi_next);
+ +	bio_list_init(&bio_list_on_stack[0]);
+ +	current->bio_list = bio_list_on_stack;
+ +	do {
+ +		struct request_queue *q = bio->bi_disk->queue;
+ +
+ +		if (likely(bio_queue_enter(bio) == 0)) {
+ +			struct bio_list lower, same;
+ +
+ +			/* Create a fresh bio_list for all subordinate requests */
+ +			bio_list_on_stack[1] = bio_list_on_stack[0];
+ +			bio_list_init(&bio_list_on_stack[0]);
+ +			ret = do_make_request(bio);
+ +
+ +			/* sort new bios into those for a lower level
+ +			 * and those for the same level
+ +			 */
+ +			bio_list_init(&lower);
+ +			bio_list_init(&same);
+ +			while ((bio = bio_list_pop(&bio_list_on_stack[0])) != NULL)
+ +				if (q == bio->bi_disk->queue)
+ +					bio_list_add(&same, bio);
+ +				else
+ +					bio_list_add(&lower, bio);
+ +			/* now assemble so we handle the lowest level first */
+ +			bio_list_merge(&bio_list_on_stack[0], &lower);
+ +			bio_list_merge(&bio_list_on_stack[0], &same);
+ +			bio_list_merge(&bio_list_on_stack[0], &bio_list_on_stack[1]);
+ +		}
+ +		bio = bio_list_pop(&bio_list_on_stack[0]);
+ +	} while (bio);
+ +	current->bio_list = NULL; /* deactivate */
+ +
+ +out:
+ +	return ret;
+++=======
++ 	if (unlikely(!submit_bio_checks(bio)))
++ 		return;
++ 	submit_bio_noacct_nocheck(bio);
+++>>>>>>> 3f98c753717c (block: don't check bio in blk_throtl_dispatch_work_fn)
+ +}
+ +EXPORT_SYMBOL(generic_make_request);
+ +
+ +/**
+ + * direct_make_request - hand a buffer directly to its device driver for I/O
+ + * @bio:  The bio describing the location in memory and on the device.
+ + *
+ + * This function behaves like generic_make_request(), but does not protect
+ + * against recursion.  Must only be used if the called driver is known
+ + * to be blk-mq based.
+ + */
+ +blk_qc_t direct_make_request(struct bio *bio)
+ +{
+ +	struct request_queue *q = bio->bi_disk->queue;
+ +
+ +	if (WARN_ON_ONCE(!queue_is_mq(q))) {
+ +		bio_io_error(bio);
+ +		return BLK_QC_T_NONE;
+ +	}
+ +	if (!generic_make_request_checks(bio))
+ +		return BLK_QC_T_NONE;
+ +	if (unlikely(bio_queue_enter(bio)))
+ +		return BLK_QC_T_NONE;
+ +	return q->make_request_fn(q, bio);
+  }
+ -EXPORT_SYMBOL(submit_bio_noacct);
+ +EXPORT_SYMBOL_GPL(direct_make_request);
+  
+  /**
+   * submit_bio - submit a bio to the block device layer for I/O
+diff --cc block/blk-throttle.c
+index 977cb2fbd03d,8770768f1000..000000000000
+--- a/block/blk-throttle.c
++++ b/block/blk-throttle.c
+@@@ -1353,8 -1217,8 +1353,13 @@@ static void blk_throtl_dispatch_work_fn
+  
+  	if (!bio_list_empty(&bio_list_on_stack)) {
+  		blk_start_plug(&plug);
+++<<<<<<< HEAD
+ +		while((bio = bio_list_pop(&bio_list_on_stack)))
+ +			generic_make_request(bio);
+++=======
++ 		while ((bio = bio_list_pop(&bio_list_on_stack)))
++ 			submit_bio_noacct_nocheck(bio);
+++>>>>>>> 3f98c753717c (block: don't check bio in blk_throtl_dispatch_work_fn)
+  		blk_finish_plug(&plug);
+  	}
+  }
+diff --cc block/blk.h
+index 27083581f6da,ebaa59ca46ca..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -55,9 -42,44 +55,49 @@@ struct blk_flush_queue *blk_alloc_flush
+  					      gfp_t flags);
+  void blk_free_flush_queue(struct blk_flush_queue *q);
+  
+ +void blk_rq_bio_prep(struct request_queue *q, struct request *rq,
+ +			struct bio *bio);
+  void blk_freeze_queue(struct request_queue *q);
+++<<<<<<< HEAD
+++=======
++ void __blk_mq_unfreeze_queue(struct request_queue *q, bool force_atomic);
++ void blk_queue_start_drain(struct request_queue *q);
++ int __bio_queue_enter(struct request_queue *q, struct bio *bio);
++ void submit_bio_noacct_nocheck(struct bio *bio);
++ 
++ static inline bool blk_try_enter_queue(struct request_queue *q, bool pm)
++ {
++ 	rcu_read_lock();
++ 	if (!percpu_ref_tryget_live_rcu(&q->q_usage_counter))
++ 		goto fail;
++ 
++ 	/*
++ 	 * The code that increments the pm_only counter must ensure that the
++ 	 * counter is globally visible before the queue is unfrozen.
++ 	 */
++ 	if (blk_queue_pm_only(q) &&
++ 	    (!pm || queue_rpm_status(q) == RPM_SUSPENDED))
++ 		goto fail_put;
++ 
++ 	rcu_read_unlock();
++ 	return true;
++ 
++ fail_put:
++ 	blk_queue_exit(q);
++ fail:
++ 	rcu_read_unlock();
++ 	return false;
++ }
++ 
++ static inline int bio_queue_enter(struct bio *bio)
++ {
++ 	struct request_queue *q = bdev_get_queue(bio->bi_bdev);
++ 
++ 	if (blk_try_enter_queue(q, false))
++ 		return 0;
++ 	return __bio_queue_enter(q, bio);
++ }
+++>>>>>>> 3f98c753717c (block: don't check bio in blk_throtl_dispatch_work_fn)
+  
+  #define BIO_INLINE_VECS 4
+  struct bio_vec *bvec_alloc(mempool_t *pool, unsigned short *nr_vecs,
+* Unmerged path block/blk-core.c
+* Unmerged path block/blk-throttle.c
+* Unmerged path block/blk.h
