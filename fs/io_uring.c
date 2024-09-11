@@ -1186,7 +1186,7 @@ static ssize_t io_import_iovec(struct io_ring_ctx *ctx, int rw,
 	    opcode == IORING_OP_WRITE_FIXED) {
 		ssize_t ret = io_import_fixed(ctx, rw, sqe, iter);
 		*iovec = NULL;
-		return ret;
+		return ret < 0 ? ret : sqe_len;
 	}
 
 	if (!s->has_user)
