@@ -1,0 +1,296 @@
+RDMA/restrack: Resource-tracker should not use uobject pointers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Shamir Rabinovitch <shamir.rabinovitch@oracle.com>
+commit af8d70375d562034d375ca7a8b08997422223258
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/af8d7037.failed
+
+Having uobject pointer embedded in ib core objects is not aligned with a
+future shared ib_x model. The resource tracker only does this to keep
+track of user/kernel objects - track this directly instead.
+
+	Signed-off-by: Shamir Rabinovitch <shamir.rabinovitch@oracle.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit af8d70375d562034d375ca7a8b08997422223258)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_cmd.c
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index 300532a4cde8,17be53da21b0..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -150,9 -261,18 +150,14 @@@ ssize_t ib_uverbs_get_context(struct ib
+  
+  	fd_install(resp.async_fd, filp);
+  
+++<<<<<<< HEAD
+ +	mutex_unlock(&file->mutex);
+++=======
++ 	ucontext->res.type = RDMA_RESTRACK_CTX;
++ 	rdma_restrack_uadd(&ucontext->res);
+++>>>>>>> af8d70375d56 (RDMA/restrack: Resource-tracker should not use uobject pointers)
+  
+ -	/*
+ -	 * Make sure that ib_uverbs_get_ucontext() sees the pointer update
+ -	 * only after all writes to setup the ucontext have completed
+ -	 */
+ -	smp_store_release(&file->ucontext, ucontext);
+ -
+ -	mutex_unlock(&file->ucontext_lock);
+ -
+ -	return 0;
+ +	return in_len;
+  
+  err_file:
+  	ib_uverbs_free_async_event_file(file);
+@@@ -365,16 -472,13 +370,16 @@@ ssize_t ib_uverbs_alloc_pd(struct ib_uv
+  	memset(&resp, 0, sizeof resp);
+  	resp.pd_handle = uobj->id;
+  	pd->res.type = RDMA_RESTRACK_PD;
+- 	rdma_restrack_add(&pd->res);
++ 	rdma_restrack_uadd(&pd->res);
+  
+ -	ret = uverbs_response(attrs, &resp, sizeof(resp));
+ -	if (ret)
+ +	if (copy_to_user(u64_to_user_ptr(cmd.response), &resp, sizeof resp)) {
+ +		ret = -EFAULT;
+  		goto err_copy;
+ +	}
+ +
+ +	uobj_alloc_commit(uobj);
+  
+ -	return uobj_alloc_commit(uobj);
+ +	return in_len;
+  
+  err_copy:
+  	ib_dealloc_pd(pd);
+@@@ -1029,14 -1063,12 +1034,14 @@@ static struct ib_ucq_object *create_cq(
+  	memset(&resp, 0, sizeof resp);
+  	resp.base.cq_handle = obj->uobject.id;
+  	resp.base.cqe       = cq->cqe;
+ -	resp.response_length = uverbs_response_length(attrs, sizeof(resp));
+ +
+ +	resp.response_length = offsetof(typeof(resp), response_length) +
+ +		sizeof(resp.response_length);
+  
+  	cq->res.type = RDMA_RESTRACK_CQ;
+- 	rdma_restrack_add(&cq->res);
++ 	rdma_restrack_uadd(&cq->res);
+  
+ -	ret = uverbs_response(attrs, &resp, sizeof(resp));
+ +	ret = cb(file, obj, &resp, ucore, context);
+  	if (ret)
+  		goto err_cb;
+  
+diff --git a/drivers/infiniband/core/cma.c b/drivers/infiniband/core/cma.c
+index fecc801376d9..6bfbe9dfb7b7 100644
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@ -494,7 +494,7 @@ static void _cma_attach_to_dev(struct rdma_id_private *id_priv,
+ 	id_priv->id.route.addr.dev_addr.transport =
+ 		rdma_node_get_transport(cma_dev->device->node_type);
+ 	list_add_tail(&id_priv->list, &cma_dev->id_list);
+-	rdma_restrack_add(&id_priv->res);
++	rdma_restrack_kadd(&id_priv->res);
+ }
+ 
+ static void cma_attach_to_dev(struct rdma_id_private *id_priv,
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index 4dcd76e94ca7..c44da8997a0b 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -296,7 +296,10 @@ static inline struct ib_qp *_ib_create_qp(struct ib_device *dev,
+ 	 */
+ 	if (attr->qp_type < IB_QPT_XRC_INI) {
+ 		qp->res.type = RDMA_RESTRACK_QP;
+-		rdma_restrack_add(&qp->res);
++		if (uobj)
++			rdma_restrack_uadd(&qp->res);
++		else
++			rdma_restrack_kadd(&qp->res);
+ 	} else
+ 		qp->res.valid = false;
+ 
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index b1e5365ddafa..e961652d77cb 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -162,7 +162,7 @@ struct ib_cq *__ib_alloc_cq(struct ib_device *dev, void *private,
+ 
+ 	cq->res.type = RDMA_RESTRACK_CQ;
+ 	rdma_restrack_set_task(&cq->res, caller);
+-	rdma_restrack_add(&cq->res);
++	rdma_restrack_kadd(&cq->res);
+ 
+ 	switch (cq->poll_ctx) {
+ 	case IB_POLL_DIRECT:
+diff --git a/drivers/infiniband/core/restrack.c b/drivers/infiniband/core/restrack.c
+index 16873effa8f6..2437c72446bc 100644
+--- a/drivers/infiniband/core/restrack.c
++++ b/drivers/infiniband/core/restrack.c
+@@ -140,27 +140,6 @@ static struct ib_device *res_to_dev(struct rdma_restrack_entry *res)
+ 	}
+ }
+ 
+-static bool res_is_user(struct rdma_restrack_entry *res)
+-{
+-	switch (res->type) {
+-	case RDMA_RESTRACK_PD:
+-		return container_of(res, struct ib_pd, res)->uobject;
+-	case RDMA_RESTRACK_CQ:
+-		return container_of(res, struct ib_cq, res)->uobject;
+-	case RDMA_RESTRACK_QP:
+-		return container_of(res, struct ib_qp, res)->uobject;
+-	case RDMA_RESTRACK_CM_ID:
+-		return !res->kern_name;
+-	case RDMA_RESTRACK_MR:
+-		return container_of(res, struct ib_mr, res)->pd->uobject;
+-	case RDMA_RESTRACK_CTX:
+-		return true;
+-	default:
+-		WARN_ONCE(true, "Wrong resource tracking type %u\n", res->type);
+-		return false;
+-	}
+-}
+-
+ void rdma_restrack_set_task(struct rdma_restrack_entry *res,
+ 			    const char *caller)
+ {
+@@ -176,17 +155,17 @@ void rdma_restrack_set_task(struct rdma_restrack_entry *res,
+ }
+ EXPORT_SYMBOL(rdma_restrack_set_task);
+ 
+-void rdma_restrack_add(struct rdma_restrack_entry *res)
++static void rdma_restrack_add(struct rdma_restrack_entry *res)
+ {
+ 	struct ib_device *dev = res_to_dev(res);
+ 
+ 	if (!dev)
+ 		return;
+ 
+-	if (res->type != RDMA_RESTRACK_CM_ID || !res_is_user(res))
++	if (res->type != RDMA_RESTRACK_CM_ID || rdma_is_kernel_res(res))
+ 		res->task = NULL;
+ 
+-	if (res_is_user(res)) {
++	if (!rdma_is_kernel_res(res)) {
+ 		if (!res->task)
+ 			rdma_restrack_set_task(res, NULL);
+ 		res->kern_name = NULL;
+@@ -202,7 +181,28 @@ void rdma_restrack_add(struct rdma_restrack_entry *res)
+ 	hash_add(dev->res.hash, &res->node, res->type);
+ 	up_write(&dev->res.rwsem);
+ }
+-EXPORT_SYMBOL(rdma_restrack_add);
++
++/**
++ * rdma_restrack_kadd() - add kernel object to the reource tracking database
++ * @res:  resource entry
++ */
++void rdma_restrack_kadd(struct rdma_restrack_entry *res)
++{
++	res->user = false;
++	rdma_restrack_add(res);
++}
++EXPORT_SYMBOL(rdma_restrack_kadd);
++
++/**
++ * rdma_restrack_uadd() - add user object to the reource tracking database
++ * @res:  resource entry
++ */
++void rdma_restrack_uadd(struct rdma_restrack_entry *res)
++{
++	res->user = true;
++	rdma_restrack_add(res);
++}
++EXPORT_SYMBOL(rdma_restrack_uadd);
+ 
+ int __must_check rdma_restrack_get(struct rdma_restrack_entry *res)
+ {
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
+diff --git a/drivers/infiniband/core/uverbs_std_types_cq.c b/drivers/infiniband/core/uverbs_std_types_cq.c
+index 150b7c04ce15..ada9d0c3008d 100644
+--- a/drivers/infiniband/core/uverbs_std_types_cq.c
++++ b/drivers/infiniband/core/uverbs_std_types_cq.c
+@@ -124,7 +124,7 @@ static int UVERBS_HANDLER(UVERBS_METHOD_CQ_CREATE)(struct ib_device *ib_dev,
+ 	obj->uobject.user_handle = user_handle;
+ 	atomic_set(&cq->usecnt, 0);
+ 	cq->res.type = RDMA_RESTRACK_CQ;
+-	rdma_restrack_add(&cq->res);
++	rdma_restrack_uadd(&cq->res);
+ 
+ 	ret = uverbs_copy_to(attrs, UVERBS_ATTR_CREATE_CQ_RESP_CQE, &cq->cqe,
+ 			     sizeof(cq->cqe));
+diff --git a/drivers/infiniband/core/verbs.c b/drivers/infiniband/core/verbs.c
+index 515376e87764..85213aeae9c9 100644
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@ -277,7 +277,7 @@ struct ib_pd *__ib_alloc_pd(struct ib_device *device, unsigned int flags,
+ 
+ 	pd->res.type = RDMA_RESTRACK_PD;
+ 	rdma_restrack_set_task(&pd->res, caller);
+-	rdma_restrack_add(&pd->res);
++	rdma_restrack_kadd(&pd->res);
+ 
+ 	if (mr_access_flags) {
+ 		struct ib_mr *mr;
+@@ -1900,7 +1900,7 @@ struct ib_cq *__ib_create_cq(struct ib_device *device,
+ 		atomic_set(&cq->usecnt, 0);
+ 		cq->res.type = RDMA_RESTRACK_CQ;
+ 		rdma_restrack_set_task(&cq->res, caller);
+-		rdma_restrack_add(&cq->res);
++		rdma_restrack_kadd(&cq->res);
+ 	}
+ 
+ 	return cq;
+@@ -1981,7 +1981,7 @@ struct ib_mr *ib_alloc_mr(struct ib_pd *pd,
+ 		atomic_inc(&pd->usecnt);
+ 		mr->need_inval = false;
+ 		mr->res.type = RDMA_RESTRACK_MR;
+-		rdma_restrack_add(&mr->res);
++		rdma_restrack_kadd(&mr->res);
+ 	}
+ 
+ 	return mr;
+diff --git a/include/rdma/restrack.h b/include/rdma/restrack.h
+index f34aa96e4518..8f179be9d9a9 100644
+--- a/include/rdma/restrack.h
++++ b/include/rdma/restrack.h
+@@ -116,6 +116,10 @@ struct rdma_restrack_entry {
+ 	 * @type: various objects in restrack database
+ 	 */
+ 	enum rdma_restrack_type	type;
++	/**
++	 * @user: user resource
++	 */
++	bool			user;
+ };
+ 
+ /**
+@@ -140,11 +144,8 @@ int rdma_restrack_count(struct rdma_restrack_root *res,
+ 			enum rdma_restrack_type type,
+ 			struct pid_namespace *ns);
+ 
+-/**
+- * rdma_restrack_add() - add object to the reource tracking database
+- * @res:  resource entry
+- */
+-void rdma_restrack_add(struct rdma_restrack_entry *res);
++void rdma_restrack_kadd(struct rdma_restrack_entry *res);
++void rdma_restrack_uadd(struct rdma_restrack_entry *res);
+ 
+ /**
+  * rdma_restrack_del() - delete object from the reource tracking database
+@@ -159,7 +160,7 @@ void rdma_restrack_del(struct rdma_restrack_entry *res);
+  */
+ static inline bool rdma_is_kernel_res(struct rdma_restrack_entry *res)
+ {
+-	return !res->task;
++	return !res->user;
+ }
+ 
+ /**
