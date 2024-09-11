@@ -1,0 +1,177 @@
+tls: Fix recvmsg() to be able to peek across multiple records
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Vakul Garg <vakul.garg@nxp.com>
+commit 692d7b5d1f9125a1cf0595e979e3b5fb7210547e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/692d7b5d.failed
+
+This fixes recvmsg() to be able to peek across multiple tls records.
+Without this patch, the tls's selftests test case
+'recv_peek_large_buf_mult_recs' fails. Each tls receive context now
+maintains a 'rx_list' to retain incoming skb carrying tls records. If a
+tls record needs to be retained e.g. for peek case or for the case when
+the buffer passed to recvmsg() has a length smaller than decrypted
+record length, then it is added to 'rx_list'. Additionally, records are
+added in 'rx_list' if the crypto operation runs in async mode. The
+records are dequeued from 'rx_list' after the decrypted data is consumed
+by copying into the buffer passed to recvmsg(). In case, the MSG_PEEK
+flag is used in recvmsg(), then records are not consumed or removed
+from the 'rx_list'.
+
+	Signed-off-by: Vakul Garg <vakul.garg@nxp.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 692d7b5d1f9125a1cf0595e979e3b5fb7210547e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tls/tls_sw.c
+diff --cc net/tls/tls_sw.c
+index 3f443983a6b3,86b9527c4826..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -1297,14 -1545,17 +1377,25 @@@ int tls_sw_recvmsg(struct sock *sk
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
+++<<<<<<< HEAD
+ +	unsigned char control;
+++=======
++ 	struct sk_psock *psock;
++ 	unsigned char control = 0;
++ 	ssize_t decrypted = 0;
+++>>>>>>> 692d7b5d1f91 (tls: Fix recvmsg() to be able to peek across multiple records)
+  	struct strp_msg *rxm;
+  	struct sk_buff *skb;
+  	ssize_t copied = 0;
+  	bool cmsg = false;
+  	int target, err = 0;
+  	long timeo;
+++<<<<<<< HEAD
+ +	bool is_kvec = msg->msg_iter.type & ITER_KVEC;
+++=======
++ 	bool is_kvec = iov_iter_is_kvec(&msg->msg_iter);
++ 	bool is_peek = flags & MSG_PEEK;
+++>>>>>>> 692d7b5d1f91 (tls: Fix recvmsg() to be able to peek across multiple records)
+  	int num_async = 0;
+  
+  	flags |= nonblock;
+@@@ -1312,18 -1563,47 +1403,50 @@@
+  	if (unlikely(flags & MSG_ERRQUEUE))
+  		return sock_recv_errqueue(sk, msg, len, SOL_IP, IP_RECVERR);
+  
+ -	psock = sk_psock_get(sk);
+  	lock_sock(sk);
+  
+- 	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+- 	timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
++ 	/* Process pending decrypted records. It must be non-zero-copy */
++ 	err = process_rx_list(ctx, msg, 0, len, false, is_peek);
++ 	if (err < 0) {
++ 		tls_err_abort(sk, err);
++ 		goto end;
++ 	} else {
++ 		copied = err;
++ 	}
++ 
++ 	len = len - copied;
++ 	if (len) {
++ 		target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
++ 		timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
++ 	} else {
++ 		goto recv_end;
++ 	}
++ 
+  	do {
+- 		bool zc = false;
++ 		bool retain_skb = false;
+  		bool async = false;
++ 		bool zc = false;
++ 		int to_decrypt;
+  		int chunk = 0;
+  
+++<<<<<<< HEAD
+ +		skb = tls_wait_data(sk, flags, timeo, &err);
+ +		if (!skb)
+++=======
++ 		skb = tls_wait_data(sk, psock, flags, timeo, &err);
++ 		if (!skb) {
++ 			if (psock) {
++ 				int ret = __tcp_bpf_recvmsg(sk, psock,
++ 							    msg, len, flags);
++ 
++ 				if (ret > 0) {
++ 					decrypted += ret;
++ 					len -= ret;
++ 					continue;
++ 				}
++ 			}
+++>>>>>>> 692d7b5d1f91 (tls: Fix recvmsg() to be able to peek across multiple records)
+  			goto recv_end;
+ -		}
+  
+  		rxm = strp_msg(skb);
+  
+@@@ -1426,9 -1708,29 +1551,27 @@@ recv_end
+  			reinit_completion(&ctx->async_wait.completion);
+  		}
+  		WRITE_ONCE(ctx->async_notify, false);
++ 
++ 		/* Drain records from the rx_list & copy if required */
++ 		if (is_peek || is_kvec)
++ 			err = process_rx_list(ctx, msg, copied,
++ 					      decrypted, false, is_peek);
++ 		else
++ 			err = process_rx_list(ctx, msg, 0,
++ 					      decrypted, true, is_peek);
++ 		if (err < 0) {
++ 			tls_err_abort(sk, err);
++ 			copied = 0;
++ 			goto end;
++ 		}
++ 
++ 		WARN_ON(decrypted != err);
+  	}
+  
++ 	copied += decrypted;
++ 
++ end:
+  	release_sock(sk);
+ -	if (psock)
+ -		sk_psock_put(sk, psock);
+  	return copied ? : err;
+  }
+  
+@@@ -1735,8 -2045,10 +1880,9 @@@ int tls_set_sw_offload(struct sock *sk
+  		INIT_DELAYED_WORK(&sw_ctx_tx->tx_work.work, tx_work_handler);
+  		sw_ctx_tx->tx_work.sk = sk;
+  	} else {
+ -		crypto_init_wait(&sw_ctx_rx->async_wait);
+  		crypto_info = &ctx->crypto_recv.info;
+  		cctx = &ctx->rx;
++ 		skb_queue_head_init(&sw_ctx_rx->rx_list);
+  		aead = &sw_ctx_rx->aead_recv;
+  	}
+  
+diff --git a/include/net/tls.h b/include/net/tls.h
+index d1f6db15d1de..66848a7739f0 100644
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -141,12 +141,13 @@ struct tls_sw_context_tx {
+ struct tls_sw_context_rx {
+ 	struct crypto_aead *aead_recv;
+ 	struct crypto_wait async_wait;
+-
+ 	struct strparser strp;
++	struct sk_buff_head rx_list;	/* list of decrypted 'data' records */
+ 	void (*saved_data_ready)(struct sock *sk);
+ 
+ 	struct sk_buff *recv_pkt;
+ 	u8 control;
++	int async_capable;
+ 	bool decrypted;
+ 	atomic_t decrypt_pending;
+ 	bool async_notify;
+* Unmerged path net/tls/tls_sw.c
