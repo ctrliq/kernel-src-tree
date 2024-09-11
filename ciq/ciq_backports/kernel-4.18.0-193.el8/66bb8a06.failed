@@ -1,0 +1,253 @@
+KVM: x86: PMU Event Filter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Eric Hankland <ehankland@google.com>
+commit 66bb8a065f5aedd4551d8d3fbce582972f65c2e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/66bb8a06.failed
+
+Some events can provide a guest with information about other guests or the
+host (e.g. L3 cache stats); providing the capability to restrict access
+to a "safe" set of events would limit the potential for the PMU to be used
+in any side channel attacks. This change introduces a new VM ioctl that
+sets an event filter. If the guest attempts to program a counter for
+any blacklisted or non-whitelisted event, the kernel counter won't be
+created, so any RDPMC/RDMSR will show 0 instances of that event.
+
+	Signed-off-by: Eric Hankland <ehankland@google.com>
+[Lots of changes. All remaining bugs are probably mine. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 66bb8a065f5aedd4551d8d3fbce582972f65c2e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/kvm.h
+diff --cc include/uapi/linux/kvm.h
+index bc3fe4cbad6c,a7c19540ce21..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -988,10 -988,14 +988,16 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_HYPERV_ENLIGHTENED_VMCS 163
+  #define KVM_CAP_EXCEPTION_PAYLOAD 164
+  #define KVM_CAP_ARM_VM_IPA_SIZE 165
+ -#define KVM_CAP_MANUAL_DIRTY_LOG_PROTECT 166 /* Obsolete */
+ +#define KVM_CAP_MANUAL_DIRTY_LOG_PROTECT 166
+  #define KVM_CAP_HYPERV_CPUID 167
+ -#define KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 168
+  #define KVM_CAP_PPC_IRQ_XIVE 169
+  #define KVM_CAP_ARM_SVE 170
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_ARM_PTRAUTH_ADDRESS 171
++ #define KVM_CAP_ARM_PTRAUTH_GENERIC 172
++ #define KVM_CAP_PMU_EVENT_FILTER 173
+++>>>>>>> 66bb8a065f5a (KVM: x86: PMU Event Filter)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+diff --git a/Documentation/virtual/kvm/api.txt b/Documentation/virtual/kvm/api.txt
+index ffb9718c32c1..33a08da84625 100644
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@ -4065,6 +4065,32 @@ KVM_ARM_VCPU_FINALIZE call.
+ See KVM_ARM_VCPU_INIT for details of vcpu features that require finalization
+ using this ioctl.
+ 
++4.120 KVM_SET_PMU_EVENT_FILTER
++
++Capability: KVM_CAP_PMU_EVENT_FILTER
++Architectures: x86
++Type: vm ioctl
++Parameters: struct kvm_pmu_event_filter (in)
++Returns: 0 on success, -1 on error
++
++struct kvm_pmu_event_filter {
++       __u32 action;
++       __u32 nevents;
++       __u64 events[0];
++};
++
++This ioctl restricts the set of PMU events that the guest can program.
++The argument holds a list of events which will be allowed or denied.
++The eventsel+umask of each event the guest attempts to program is compared
++against the events field to determine whether the guest should have access.
++This only affects general purpose counters; fixed purpose counters can
++be disabled by changing the perfmon CPUID leaf.
++
++Valid values for 'action':
++#define KVM_PMU_EVENT_ALLOW 0
++#define KVM_PMU_EVENT_DENY 1
++
++
+ 5. The kvm_run structure
+ ------------------------
+ 
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 52bd8ee8b3f3..6c9438b489e4 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -934,6 +934,8 @@ struct kvm_arch {
+ 
+ 	bool guest_can_read_msr_platform_info;
+ 	bool exception_payload_enabled;
++
++	struct kvm_pmu_event_filter *pmu_event_filter;
+ };
+ 
+ struct kvm_vm_stat {
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index 4a9184f8e57e..e901b0ab116f 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -433,4 +433,14 @@ struct kvm_nested_state {
+ 	} data;
+ };
+ 
++/* for KVM_CAP_PMU_EVENT_FILTER */
++struct kvm_pmu_event_filter {
++       __u32 action;
++       __u32 nevents;
++       __u64 events[0];
++};
++
++#define KVM_PMU_EVENT_ALLOW 0
++#define KVM_PMU_EVENT_DENY 1
++
+ #endif /* _ASM_X86_KVM_H */
+diff --git a/arch/x86/kvm/pmu.c b/arch/x86/kvm/pmu.c
+index dd745b58ffd8..9d92c4d3cd44 100644
+--- a/arch/x86/kvm/pmu.c
++++ b/arch/x86/kvm/pmu.c
+@@ -22,6 +22,9 @@
+ #include "lapic.h"
+ #include "pmu.h"
+ 
++/* This keeps the total size of the filter under 4k. */
++#define KVM_PMU_EVENT_FILTER_MAX_EVENTS 63
++
+ /* NOTE:
+  * - Each perf counter is defined as "struct kvm_pmc";
+  * - There are two types of perf counters: general purpose (gp) and fixed.
+@@ -144,6 +147,10 @@ void reprogram_gp_counter(struct kvm_pmc *pmc, u64 eventsel)
+ {
+ 	unsigned config, type = PERF_TYPE_RAW;
+ 	u8 event_select, unit_mask;
++	struct kvm *kvm = pmc->vcpu->kvm;
++	struct kvm_pmu_event_filter *filter;
++	int i;
++	bool allow_event = true;
+ 
+ 	if (eventsel & ARCH_PERFMON_EVENTSEL_PIN_CONTROL)
+ 		printk_once("kvm pmu: pin control bit is ignored\n");
+@@ -155,6 +162,22 @@ void reprogram_gp_counter(struct kvm_pmc *pmc, u64 eventsel)
+ 	if (!(eventsel & ARCH_PERFMON_EVENTSEL_ENABLE) || !pmc_is_enabled(pmc))
+ 		return;
+ 
++	filter = srcu_dereference(kvm->arch.pmu_event_filter, &kvm->srcu);
++	if (filter) {
++		for (i = 0; i < filter->nevents; i++)
++			if (filter->events[i] ==
++			    (eventsel & AMD64_RAW_EVENT_MASK_NB))
++				break;
++		if (filter->action == KVM_PMU_EVENT_ALLOW &&
++		    i == filter->nevents)
++			allow_event = false;
++		if (filter->action == KVM_PMU_EVENT_DENY &&
++		    i < filter->nevents)
++			allow_event = false;
++	}
++	if (!allow_event)
++		return;
++
+ 	event_select = eventsel & ARCH_PERFMON_EVENTSEL_EVENT;
+ 	unit_mask = (eventsel & ARCH_PERFMON_EVENTSEL_UMASK) >> 8;
+ 
+@@ -351,3 +374,43 @@ void kvm_pmu_destroy(struct kvm_vcpu *vcpu)
+ {
+ 	kvm_pmu_reset(vcpu);
+ }
++
++int kvm_vm_ioctl_set_pmu_event_filter(struct kvm *kvm, void __user *argp)
++{
++	struct kvm_pmu_event_filter tmp, *filter;
++	size_t size;
++	int r;
++
++	if (copy_from_user(&tmp, argp, sizeof(tmp)))
++		return -EFAULT;
++
++	if (tmp.action != KVM_PMU_EVENT_ALLOW &&
++	    tmp.action != KVM_PMU_EVENT_DENY)
++		return -EINVAL;
++
++	if (tmp.nevents > KVM_PMU_EVENT_FILTER_MAX_EVENTS)
++		return -E2BIG;
++
++	size = struct_size(filter, events, tmp.nevents);
++	filter = kmalloc(size, GFP_KERNEL_ACCOUNT);
++	if (!filter)
++		return -ENOMEM;
++
++	r = -EFAULT;
++	if (copy_from_user(filter, argp, size))
++		goto cleanup;
++
++	/* Ensure nevents can't be changed between the user copies. */
++	*filter = tmp;
++
++	mutex_lock(&kvm->lock);
++	rcu_swap_protected(kvm->arch.pmu_event_filter, filter,
++			   mutex_is_locked(&kvm->lock));
++	mutex_unlock(&kvm->lock);
++
++	synchronize_srcu_expedited(&kvm->srcu);
++ 	r = 0;
++cleanup:
++	kfree(filter);
++ 	return r;
++}
+diff --git a/arch/x86/kvm/pmu.h b/arch/x86/kvm/pmu.h
+index 22dff661145a..58265f761c3b 100644
+--- a/arch/x86/kvm/pmu.h
++++ b/arch/x86/kvm/pmu.h
+@@ -118,6 +118,7 @@ void kvm_pmu_refresh(struct kvm_vcpu *vcpu);
+ void kvm_pmu_reset(struct kvm_vcpu *vcpu);
+ void kvm_pmu_init(struct kvm_vcpu *vcpu);
+ void kvm_pmu_destroy(struct kvm_vcpu *vcpu);
++int kvm_vm_ioctl_set_pmu_event_filter(struct kvm *kvm, void __user *argp);
+ 
+ bool is_vmware_backdoor_pmc(u32 pmc_idx);
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 94b3eeb9c8af..97c79b14d95d 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3132,6 +3132,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_SET_BOOT_CPU_ID:
+  	case KVM_CAP_SPLIT_IRQCHIP:
+ 	case KVM_CAP_IMMEDIATE_EXIT:
++	case KVM_CAP_PMU_EVENT_FILTER:
+ 	case KVM_CAP_GET_MSR_FEATURES:
+ 	case KVM_CAP_MSR_PLATFORM_INFO:
+ 	case KVM_CAP_EXCEPTION_PAYLOAD:
+@@ -4978,6 +4979,9 @@ long kvm_arch_vm_ioctl(struct file *filp,
+ 		r = kvm_vm_ioctl_hv_eventfd(kvm, &hvevfd);
+ 		break;
+ 	}
++	case KVM_SET_PMU_EVENT_FILTER:
++		r = kvm_vm_ioctl_set_pmu_event_filter(kvm, argp);
++		break;
+ 	default:
+ 		r = -ENOTTY;
+ 	}
+@@ -9413,6 +9417,7 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
+ 	kvm_ioapic_destroy(kvm);
+ 	kvm_free_vcpus(kvm);
+ 	kvfree(rcu_dereference_check(kvm->arch.apic_map, 1));
++	kfree(srcu_dereference_check(kvm->arch.pmu_event_filter, &kvm->srcu, 1));
+ 	kvm_mmu_uninit_vm(kvm);
+ 	kvm_page_track_cleanup(kvm);
+ 	kvm_hv_destroy_vm(kvm);
+* Unmerged path include/uapi/linux/kvm.h
