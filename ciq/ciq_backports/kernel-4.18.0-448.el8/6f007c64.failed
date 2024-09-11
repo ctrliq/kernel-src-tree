@@ -1,0 +1,160 @@
+gve: Add support for raw addressing in the tx path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Catherine Sullivan <csully@google.com>
+commit 6f007c6486d69967ac1d9e67df9ae9c77d49f1cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/6f007c64.failed
+
+During TX, skbs' data addresses are dma_map'ed and passed to the NIC.
+This means that the device can perform DMA directly from these addresses
+and the driver does not have to copy the buffer content into
+pre-allocated buffers/qpls (as in qpl mode).
+
+	Reviewed-by: Yangchun Fu <yangchun@google.com>
+	Signed-off-by: Catherine Sullivan <csully@google.com>
+	Signed-off-by: David Awogbemila <awogbemila@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6f007c6486d69967ac1d9e67df9ae9c77d49f1cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve_tx.c
+diff --cc drivers/net/ethernet/google/gve/gve_tx.c
+index f4889431f9b7,6938f3a939d6..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_tx.c
++++ b/drivers/net/ethernet/google/gve/gve_tx.c
+@@@ -505,8 -618,9 +622,14 @@@ netdev_tx_t gve_tx(struct sk_buff *skb
+  	if (!netif_xmit_stopped(tx->netdev_txq) && netdev_xmit_more())
+  		return NETDEV_TX_OK;
+  
+++<<<<<<< HEAD
+ +	/* Ensure tx descs are visible before ringing doorbell */
+ +	dma_wmb();
+++=======
++ 	/* Give packets to NIC. Even if this packet failed to send the doorbell
++ 	 * might need to be rung because of xmit_more.
++ 	 */
+++>>>>>>> 6f007c6486d6 (gve: Add support for raw addressing in the tx path)
+  	gve_tx_put_doorbell(priv, tx->q_resources, tx->req);
+  	return NETDEV_TX_OK;
+  }
+diff --git a/drivers/net/ethernet/google/gve/gve.h b/drivers/net/ethernet/google/gve/gve.h
+index 8aad4af2aa2b..daf07c0f790b 100644
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@ -112,12 +112,20 @@ struct gve_tx_iovec {
+ 	u32 iov_padding; /* padding associated with this segment */
+ };
+ 
++struct gve_tx_dma_buf {
++	DEFINE_DMA_UNMAP_ADDR(dma);
++	DEFINE_DMA_UNMAP_LEN(len);
++};
++
+ /* Tracks the memory in the fifo occupied by the skb. Mapped 1:1 to a desc
+  * ring entry but only used for a pkt_desc not a seg_desc
+  */
+ struct gve_tx_buffer_state {
+ 	struct sk_buff *skb; /* skb for this pkt */
+-	struct gve_tx_iovec iov[GVE_TX_MAX_IOVEC]; /* segments of this pkt */
++	union {
++		struct gve_tx_iovec iov[GVE_TX_MAX_IOVEC]; /* segments of this pkt */
++		struct gve_tx_dma_buf buf;
++	};
+ };
+ 
+ /* A TX buffer - each queue has one */
+@@ -140,13 +148,17 @@ struct gve_tx_ring {
+ 	__be32 last_nic_done ____cacheline_aligned; /* NIC tail pointer */
+ 	u64 pkt_done; /* free-running - total packets completed */
+ 	u64 bytes_done; /* free-running - total bytes completed */
++	u64 dropped_pkt; /* free-running - total packets dropped */
++	u64 dma_mapping_error; /* count of dma mapping errors */
+ 
+ 	/* Cacheline 2 -- Read-mostly fields */
+ 	union gve_tx_desc *desc ____cacheline_aligned;
+ 	struct gve_tx_buffer_state *info; /* Maps 1:1 to a desc */
+ 	struct netdev_queue *netdev_txq;
+ 	struct gve_queue_resources *q_resources; /* head and tail pointer idx */
++	struct device *dev;
+ 	u32 mask; /* masks req and done down to queue size */
++	u8 raw_addressing; /* use raw_addressing? */
+ 
+ 	/* Slow-path fields */
+ 	u32 q_num ____cacheline_aligned; /* queue idx */
+@@ -442,7 +454,7 @@ static inline u32 gve_rx_idx_to_ntfy(struct gve_priv *priv, u32 queue_idx)
+  */
+ static inline u32 gve_num_tx_qpls(struct gve_priv *priv)
+ {
+-	return priv->tx_cfg.num_queues;
++	return priv->raw_addressing ? 0 : priv->tx_cfg.num_queues;
+ }
+ 
+ /* Returns the number of rx queue page lists
+diff --git a/drivers/net/ethernet/google/gve/gve_adminq.c b/drivers/net/ethernet/google/gve/gve_adminq.c
+index a1b9370db1e4..53864f200599 100644
+--- a/drivers/net/ethernet/google/gve/gve_adminq.c
++++ b/drivers/net/ethernet/google/gve/gve_adminq.c
+@@ -369,8 +369,10 @@ static int gve_adminq_create_tx_queue(struct gve_priv *priv, u32 queue_index)
+ {
+ 	struct gve_tx_ring *tx = &priv->tx[queue_index];
+ 	union gve_adminq_command cmd;
++	u32 qpl_id;
+ 	int err;
+ 
++	qpl_id = priv->raw_addressing ? GVE_RAW_ADDRESSING_QPL_ID : tx->tx_fifo.qpl->id;
+ 	memset(&cmd, 0, sizeof(cmd));
+ 	cmd.opcode = cpu_to_be32(GVE_ADMINQ_CREATE_TX_QUEUE);
+ 	cmd.create_tx_queue = (struct gve_adminq_create_tx_queue) {
+@@ -379,7 +381,7 @@ static int gve_adminq_create_tx_queue(struct gve_priv *priv, u32 queue_index)
+ 		.queue_resources_addr =
+ 			cpu_to_be64(tx->q_resources_bus),
+ 		.tx_ring_addr = cpu_to_be64(tx->bus),
+-		.queue_page_list_id = cpu_to_be32(tx->tx_fifo.qpl->id),
++		.queue_page_list_id = cpu_to_be32(qpl_id),
+ 		.ntfy_id = cpu_to_be32(tx->ntfy_id),
+ 	};
+ 
+diff --git a/drivers/net/ethernet/google/gve/gve_desc.h b/drivers/net/ethernet/google/gve/gve_desc.h
+index a1c0aaa60139..05ae6300e984 100644
+--- a/drivers/net/ethernet/google/gve/gve_desc.h
++++ b/drivers/net/ethernet/google/gve/gve_desc.h
+@@ -16,9 +16,11 @@
+  * Base addresses encoded in seg_addr are not assumed to be physical
+  * addresses. The ring format assumes these come from some linear address
+  * space. This could be physical memory, kernel virtual memory, user virtual
+- * memory. gVNIC uses lists of registered pages. Each queue is assumed
+- * to be associated with a single such linear address space to ensure a
+- * consistent meaning for seg_addrs posted to its rings.
++ * memory.
++ * If raw dma addressing is not supported then gVNIC uses lists of registered
++ * pages. Each queue is assumed to be associated with a single such linear
++ * address space to ensure a consistent meaning for seg_addrs posted to its
++ * rings.
+  */
+ 
+ struct gve_tx_pkt_desc {
+diff --git a/drivers/net/ethernet/google/gve/gve_ethtool.c b/drivers/net/ethernet/google/gve/gve_ethtool.c
+index 66f9b377f8e7..c6ca402f30c6 100644
+--- a/drivers/net/ethernet/google/gve/gve_ethtool.c
++++ b/drivers/net/ethernet/google/gve/gve_ethtool.c
+@@ -50,6 +50,7 @@ static const char gve_gstrings_rx_stats[][ETH_GSTRING_LEN] = {
+ static const char gve_gstrings_tx_stats[][ETH_GSTRING_LEN] = {
+ 	"tx_posted_desc[%u]", "tx_completed_desc[%u]", "tx_bytes[%u]",
+ 	"tx_wake[%u]", "tx_stop[%u]", "tx_event_counter[%u]",
++	"tx_dma_mapping_error[%u]",
+ };
+ 
+ static const char gve_gstrings_adminq_stats[][ETH_GSTRING_LEN] = {
+@@ -322,6 +323,7 @@ gve_get_ethtool_stats(struct net_device *netdev,
+ 			data[i++] = tx->stop_queue;
+ 			data[i++] = be32_to_cpu(gve_tx_load_event_counter(priv,
+ 									  tx));
++			data[i++] = tx->dma_mapping_error;
+ 			/* stats from NIC */
+ 			if (skip_nic_stats) {
+ 				/* skip NIC tx stats */
+* Unmerged path drivers/net/ethernet/google/gve/gve_tx.c
