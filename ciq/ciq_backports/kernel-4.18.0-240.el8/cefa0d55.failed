@@ -1,0 +1,214 @@
+iommu/arm-smmu: Convert to probe/release_device() call-backs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Joerg Roedel <jroedel@suse.de>
+commit cefa0d55da3753e969764fb4b161052a1cb4ddfb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/cefa0d55.failed
+
+Convert the arm-smmu and arm-smmu-v3 drivers to use the probe_device() and
+release_device() call-backs of iommu_ops, so that the iommu core code does the
+group and sysfs setup.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+Link: https://lore.kernel.org/r/20200429133712.31431-18-joro@8bytes.org
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit cefa0d55da3753e969764fb4b161052a1cb4ddfb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm-smmu-v3.c
+#	drivers/iommu/arm-smmu.c
+diff --cc drivers/iommu/arm-smmu-v3.c
+index 1b61de0d69f6,42e1ee7e5197..000000000000
+--- a/drivers/iommu/arm-smmu-v3.c
++++ b/drivers/iommu/arm-smmu-v3.c
+@@@ -2535,13 -2920,12 +2535,17 @@@ static struct iommu_device *arm_smmu_pr
+  	struct arm_smmu_device *smmu;
+  	struct arm_smmu_master *master;
+  	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
+- 	struct iommu_group *group;
+  
+  	if (!fwspec || fwspec->ops != &arm_smmu_ops)
+- 		return -ENODEV;
++ 		return ERR_PTR(-ENODEV);
+  
+++<<<<<<< HEAD
+ +	if (WARN_ON_ONCE(fwspec->iommu_priv))
+ +		return -EBUSY;
+++=======
++ 	if (WARN_ON_ONCE(dev_iommu_priv_get(dev)))
++ 		return ERR_PTR(-EBUSY);
+++>>>>>>> cefa0d55da37 (iommu/arm-smmu: Convert to probe/release_device() call-backs)
+  
+  	smmu = arm_smmu_get_by_fwnode(fwspec->iommu_fwnode);
+  	if (!smmu)
+@@@ -2572,16 -2958,31 +2576,41 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	group = iommu_group_get_for_dev(dev);
+ +	if (!IS_ERR(group)) {
+ +		iommu_group_put(group);
+ +		iommu_device_link(&smmu->iommu, dev);
+ +	}
+ +
+ +	return PTR_ERR_OR_ZERO(group);
+++=======
++ 	master->ssid_bits = min(smmu->ssid_bits, fwspec->num_pasid_bits);
++ 
++ 	/*
++ 	 * Note that PASID must be enabled before, and disabled after ATS:
++ 	 * PCI Express Base 4.0r1.0 - 10.5.1.3 ATS Control Register
++ 	 *
++ 	 *   Behavior is undefined if this bit is Set and the value of the PASID
++ 	 *   Enable, Execute Requested Enable, or Privileged Mode Requested bits
++ 	 *   are changed.
++ 	 */
++ 	arm_smmu_enable_pasid(master);
++ 
++ 	if (!(smmu->features & ARM_SMMU_FEAT_2_LVL_CDTAB))
++ 		master->ssid_bits = min_t(u8, master->ssid_bits,
++ 					  CTXDESC_LINEAR_CDMAX);
++ 
++ 	return &smmu->iommu;
++ 
++ err_free_master:
++ 	kfree(master);
++ 	dev_iommu_priv_set(dev, NULL);
++ 	return ERR_PTR(ret);
+++>>>>>>> cefa0d55da37 (iommu/arm-smmu: Convert to probe/release_device() call-backs)
+  }
+  
+- static void arm_smmu_remove_device(struct device *dev)
++ static void arm_smmu_release_device(struct device *dev)
+  {
+  	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
+  	struct arm_smmu_master *master;
+@@@ -2590,11 -2991,10 +2619,15 @@@
+  	if (!fwspec || fwspec->ops != &arm_smmu_ops)
+  		return;
+  
+ -	master = dev_iommu_priv_get(dev);
+ +	master = fwspec->iommu_priv;
+  	smmu = master->smmu;
+  	arm_smmu_detach_dev(master);
+++<<<<<<< HEAD
+ +	iommu_group_remove_device(dev);
+ +	iommu_device_unlink(&smmu->iommu, dev);
+++=======
++ 	arm_smmu_disable_pasid(master);
+++>>>>>>> cefa0d55da37 (iommu/arm-smmu: Convert to probe/release_device() call-backs)
+  	kfree(master);
+  	iommu_fwspec_free(dev);
+  }
+diff --cc drivers/iommu/arm-smmu.c
+index e041a562cbc2,e622f4e33379..000000000000
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@@ -413,6 -216,27 +413,30 @@@ static int arm_smmu_register_legacy_mas
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * With the legacy DT binding in play, we have no guarantees about
++  * probe order, but then we're also not doing default domains, so we can
++  * delay setting bus ops until we're sure every possible SMMU is ready,
++  * and that way ensure that no probe_device() calls get missed.
++  */
++ static int arm_smmu_legacy_bus_init(void)
++ {
++ 	if (using_legacy_binding)
++ 		return arm_smmu_bus_init(&arm_smmu_ops);
++ 	return 0;
++ }
++ device_initcall_sync(arm_smmu_legacy_bus_init);
++ #else
++ static int arm_smmu_register_legacy_master(struct device *dev,
++ 					   struct arm_smmu_device **smmu)
++ {
++ 	return -ENODEV;
++ }
++ #endif /* CONFIG_ARM_SMMU_LEGACY_DT_BINDINGS */
++ 
+++>>>>>>> cefa0d55da37 (iommu/arm-smmu: Convert to probe/release_device() call-backs)
+  static int __arm_smmu_alloc_bitmap(unsigned long *map, int start, int end)
+  {
+  	int idx;
+@@@ -1194,10 -1059,9 +1218,9 @@@ static bool arm_smmu_free_sme(struct ar
+  static int arm_smmu_master_alloc_smes(struct device *dev)
+  {
+  	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
+ -	struct arm_smmu_master_cfg *cfg = dev_iommu_priv_get(dev);
+ +	struct arm_smmu_master_cfg *cfg = fwspec->iommu_priv;
+  	struct arm_smmu_device *smmu = cfg->smmu;
+  	struct arm_smmu_smr *smrs = smmu->smrs;
+- 	struct iommu_group *group;
+  	int i, idx, ret;
+  
+  	mutex_lock(&smmu->stream_map_mutex);
+@@@ -1225,18 -1089,9 +1248,13 @@@
+  		cfg->smendx[i] = (s16)idx;
+  	}
+  
+- 	group = iommu_group_get_for_dev(dev);
+- 	if (IS_ERR(group)) {
+- 		ret = PTR_ERR(group);
+- 		goto out_err;
+- 	}
+- 	iommu_group_put(group);
+- 
+  	/* It worked! Now, poke the actual hardware */
+++<<<<<<< HEAD
+ +	for_each_cfg_sme(fwspec, i, idx) {
+++=======
++ 	for_each_cfg_sme(cfg, fwspec, i, idx)
+++>>>>>>> cefa0d55da37 (iommu/arm-smmu: Convert to probe/release_device() call-backs)
+  		arm_smmu_write_sme(smmu, idx);
+- 		smmu->s2crs[idx].group = group;
+- 	}
+  
+  	mutex_unlock(&smmu->stream_map_mutex);
+  	return 0;
+@@@ -1502,9 -1372,9 +1520,9 @@@ struct arm_smmu_device *arm_smmu_get_by
+  	return dev ? dev_get_drvdata(dev) : NULL;
+  }
+  
+- static int arm_smmu_add_device(struct device *dev)
++ static struct iommu_device *arm_smmu_probe_device(struct device *dev)
+  {
+ -	struct arm_smmu_device *smmu = NULL;
+ +	struct arm_smmu_device *smmu;
+  	struct arm_smmu_master_cfg *cfg;
+  	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
+  	int i, ret;
+@@@ -1595,13 -1463,12 +1611,22 @@@ static void arm_smmu_release_device(str
+  	if (ret < 0)
+  		return;
+  
+++<<<<<<< HEAD
+ +	iommu_device_unlink(&smmu->iommu, dev);
+ +	arm_smmu_master_free_smes(fwspec);
+ +
+ +	arm_smmu_rpm_put(smmu);
+ +
+ +	iommu_group_remove_device(dev);
+ +	kfree(fwspec->iommu_priv);
+++=======
++ 	arm_smmu_master_free_smes(cfg, fwspec);
++ 
++ 	arm_smmu_rpm_put(smmu);
++ 
++ 	dev_iommu_priv_set(dev, NULL);
++ 	kfree(cfg);
+++>>>>>>> cefa0d55da37 (iommu/arm-smmu: Convert to probe/release_device() call-backs)
+  	iommu_fwspec_free(dev);
+  }
+  
+* Unmerged path drivers/iommu/arm-smmu-v3.c
+* Unmerged path drivers/iommu/arm-smmu.c
