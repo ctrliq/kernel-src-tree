@@ -1,0 +1,113 @@
+vhost: use mmgrab() instead of mmget() for non worker device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jason Wang <jasowang@redhat.com>
+commit 5ce995f313ce56c0c62425c3ddc37c5c50fc33db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/5ce995f3.failed
+
+For the device that doesn't use vhost worker and use_mm(), mmget() is
+too heavy weight and it may brings troubles for implementing mmap()
+support for vDPA device.
+
+This is because, an reference to the address space was held via
+mm_get() in vhost_dev_set_owner() and an reference to the file was
+held in mmap(). This means when process exits, the mm can not be
+released thus we can not release the file.
+
+This patch tries to use mmgrab() instead of mmget(), which allows the
+address space to be destroy in process exit without releasing the mm
+structure itself. This is sufficient for vDPA device which pin user
+pages and does not depend on the address space to work.
+
+	Signed-off-by: Jason Wang <jasowang@redhat.com>
+Link: https://lore.kernel.org/r/20200529080303.15449-3-jasowang@redhat.com
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+(cherry picked from commit 5ce995f313ce56c0c62425c3ddc37c5c50fc33db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vhost/vhost.c
+diff --cc drivers/vhost/vhost.c
+index 0ae40f9fd189,a40d16bdebb5..000000000000
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@@ -541,33 -583,38 +571,58 @@@ long vhost_dev_set_owner(struct vhost_d
+  		goto err_mm;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* No owner, become one */
+ +	dev->mm = get_task_mm(current);
+ +	worker = kthread_create(vhost_worker, dev, "vhost-%d", current->pid);
+ +	if (IS_ERR(worker)) {
+ +		err = PTR_ERR(worker);
+ +		goto err_worker;
+++=======
++ 	vhost_attach_mm(dev);
++ 
++ 	dev->kcov_handle = kcov_common_handle();
++ 	if (dev->use_worker) {
++ 		worker = kthread_create(vhost_worker, dev,
++ 					"vhost-%d", current->pid);
++ 		if (IS_ERR(worker)) {
++ 			err = PTR_ERR(worker);
++ 			goto err_worker;
++ 		}
++ 
++ 		dev->worker = worker;
++ 		wake_up_process(worker); /* avoid contributing to loadavg */
++ 
++ 		err = vhost_attach_cgroups(dev);
++ 		if (err)
++ 			goto err_cgroup;
+++>>>>>>> 5ce995f313ce (vhost: use mmgrab() instead of mmget() for non worker device)
+  	}
+  
+ +	dev->worker = worker;
+ +	wake_up_process(worker);	/* avoid contributing to loadavg */
+ +
+ +	err = vhost_attach_cgroups(dev);
+ +	if (err)
+ +		goto err_cgroup;
+ +
+  	err = vhost_dev_alloc_iovecs(dev);
+  	if (err)
+  		goto err_cgroup;
+  
+  	return 0;
+  err_cgroup:
+ -	if (dev->worker) {
+ -		kthread_stop(dev->worker);
+ -		dev->worker = NULL;
+ -	}
+ +	kthread_stop(worker);
+ +	dev->worker = NULL;
+  err_worker:
+++<<<<<<< HEAD
+ +	if (dev->mm)
+ +		mmput(dev->mm);
+ +	dev->mm = NULL;
+++=======
++ 	vhost_detach_mm(dev);
++ 	dev->kcov_handle = 0;
+++>>>>>>> 5ce995f313ce (vhost: use mmgrab() instead of mmget() for non worker device)
+  err_mm:
+  	return err;
+  }
+@@@ -661,10 -708,9 +716,8 @@@ void vhost_dev_cleanup(struct vhost_de
+  	if (dev->worker) {
+  		kthread_stop(dev->worker);
+  		dev->worker = NULL;
+ -		dev->kcov_handle = 0;
+  	}
+- 	if (dev->mm)
+- 		mmput(dev->mm);
+- 	dev->mm = NULL;
++ 	vhost_detach_mm(dev);
+  }
+  EXPORT_SYMBOL_GPL(vhost_dev_cleanup);
+  
+* Unmerged path drivers/vhost/vhost.c
