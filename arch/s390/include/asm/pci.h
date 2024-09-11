@@ -287,8 +287,10 @@ void zpci_debug_init_device(struct zpci_dev *, const char *);
 void zpci_debug_exit_device(struct zpci_dev *);
 void zpci_debug_info(struct zpci_dev *, struct seq_file *);
 
-/* Error reporting */
+/* Error handling */
 int zpci_report_error(struct pci_dev *, struct zpci_report_error_header *);
+int zpci_clear_error_state(struct zpci_dev *zdev);
+int zpci_reset_load_store_blocked(struct zpci_dev *zdev);
 
 #ifdef CONFIG_NUMA
 
