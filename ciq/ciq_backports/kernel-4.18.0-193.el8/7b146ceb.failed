@@ -1,0 +1,341 @@
+bpf: Sysctl hook
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Andrey Ignatov <rdna@fb.com>
+commit 7b146cebe30cb481b0f70d85779da938da818637
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7b146ceb.failed
+
+Containerized applications may run as root and it may create problems
+for whole host. Specifically such applications may change a sysctl and
+affect applications in other containers.
+
+Furthermore in existing infrastructure it may not be possible to just
+completely disable writing to sysctl, instead such a process should be
+gradual with ability to log what sysctl are being changed by a
+container, investigate, limit the set of writable sysctl to currently
+used ones (so that new ones can not be changed) and eventually reduce
+this set to zero.
+
+The patch introduces new program type BPF_PROG_TYPE_CGROUP_SYSCTL and
+attach type BPF_CGROUP_SYSCTL to solve these problems on cgroup basis.
+
+New program type has access to following minimal context:
+	struct bpf_sysctl {
+		__u32	write;
+	};
+
+Where @write indicates whether sysctl is being read (= 0) or written (=
+1).
+
+Helpers to access sysctl name and value will be introduced separately.
+
+BPF_CGROUP_SYSCTL attach point is added to sysctl code right before
+passing control to ctl_table->proc_handler so that BPF program can
+either allow or deny access to sysctl.
+
+	Suggested-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrey Ignatov <rdna@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 7b146cebe30cb481b0f70d85779da938da818637)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index 6d4bc9ebe78a,cc2a2466d5f3..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -167,10 -165,9 +167,14 @@@ enum bpf_prog_type 
+  	BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
+  	BPF_PROG_TYPE_LWT_SEG6LOCAL,
+  	BPF_PROG_TYPE_LIRC_MODE2,
+ +#ifndef __GENKSYMS__
+  	BPF_PROG_TYPE_SK_REUSEPORT,
+  	BPF_PROG_TYPE_FLOW_DISSECTOR,
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	BPF_PROG_TYPE_CGROUP_SYSCTL,
+++>>>>>>> 7b146cebe30c (bpf: Sysctl hook)
+  };
+  
+  enum bpf_attach_type {
+@@@ -191,9 -188,8 +195,13 @@@
+  	BPF_CGROUP_UDP4_SENDMSG,
+  	BPF_CGROUP_UDP6_SENDMSG,
+  	BPF_LIRC_MODE2,
+ +#ifndef __GENKSYMS__
+  	BPF_FLOW_DISSECTOR,
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	BPF_CGROUP_SYSCTL,
+++>>>>>>> 7b146cebe30c (bpf: Sysctl hook)
+  	__MAX_BPF_ATTACH_TYPE
+  };
+  
+diff --git a/fs/proc/proc_sysctl.c b/fs/proc/proc_sysctl.c
+index 89921a0d2ebb..43015f69ed4e 100644
+--- a/fs/proc/proc_sysctl.c
++++ b/fs/proc/proc_sysctl.c
+@@ -13,6 +13,7 @@
+ #include <linux/namei.h>
+ #include <linux/mm.h>
+ #include <linux/module.h>
++#include <linux/bpf-cgroup.h>
+ #include "internal.h"
+ 
+ static const struct dentry_operations proc_sys_dentry_operations;
+@@ -589,6 +590,10 @@ static ssize_t proc_sys_call_handler(struct file *filp, void __user *buf,
+ 	if (!table->proc_handler)
+ 		goto out;
+ 
++	error = BPF_CGROUP_RUN_PROG_SYSCTL(head, table, write);
++	if (error)
++		goto out;
++
+ 	/* careful: calling conventions are nasty here */
+ 	res = count;
+ 	error = table->proc_handler(table, write, buf, &res, ppos);
+diff --git a/include/linux/bpf-cgroup.h b/include/linux/bpf-cgroup.h
+index 14647819f7e6..0341f23e6b63 100644
+--- a/include/linux/bpf-cgroup.h
++++ b/include/linux/bpf-cgroup.h
+@@ -22,6 +22,8 @@ struct bpf_map;
+ struct bpf_prog;
+ struct bpf_sock_ops_kern;
+ struct bpf_cgroup_storage;
++struct ctl_table;
++struct ctl_table_header;
+ 
+ #ifdef CONFIG_CGROUP_BPF
+ 
+@@ -150,6 +152,10 @@ int __cgroup_bpf_run_filter_sock_ops(struct sock *sk,
+ int __cgroup_bpf_check_dev_permission(short dev_type, u32 major, u32 minor,
+ 				      short access, enum bpf_attach_type type);
+ 
++int __cgroup_bpf_run_filter_sysctl(struct ctl_table_header *head,
++				   struct ctl_table *table, int write,
++				   enum bpf_attach_type type);
++
+ static inline enum bpf_cgroup_storage_type cgroup_storage_type(
+ 	struct bpf_map *map)
+ {
+@@ -294,6 +300,17 @@ int bpf_percpu_cgroup_storage_update(struct bpf_map *map, void *key,
+ 									      \
+ 	__ret;								      \
+ })
++
++
++#define BPF_CGROUP_RUN_PROG_SYSCTL(head, table, write)			       \
++({									       \
++	int __ret = 0;							       \
++	if (cgroup_bpf_enabled)						       \
++		__ret = __cgroup_bpf_run_filter_sysctl(head, table, write,     \
++						       BPF_CGROUP_SYSCTL);     \
++	__ret;								       \
++})
++
+ int cgroup_bpf_prog_attach(const union bpf_attr *attr,
+ 			   enum bpf_prog_type ptype, struct bpf_prog *prog);
+ int cgroup_bpf_prog_detach(const union bpf_attr *attr,
+@@ -362,6 +379,7 @@ static inline int bpf_percpu_cgroup_storage_update(struct bpf_map *map,
+ #define BPF_CGROUP_RUN_PROG_UDP6_SENDMSG_LOCK(sk, uaddr, t_ctx) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_SOCK_OPS(sock_ops) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_DEVICE_CGROUP(type,major,minor,access) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_SYSCTL(head, table, write) ({ 0; })
+ 
+ #define for_each_cgroup_storage_type(stype) for (; false; )
+ 
+diff --git a/include/linux/bpf_types.h b/include/linux/bpf_types.h
+index 08bf2f1fe553..d26991a16894 100644
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -28,6 +28,7 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_RAW_TRACEPOINT, raw_tracepoint)
+ #endif
+ #ifdef CONFIG_CGROUP_BPF
+ BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_DEVICE, cg_dev)
++BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SYSCTL, cg_sysctl)
+ #endif
+ #ifdef CONFIG_BPF_LIRC_MODE2
+ BPF_PROG_TYPE(BPF_PROG_TYPE_LIRC_MODE2, lirc_mode2)
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index f32b3eca5a04..f70640080280 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -33,6 +33,8 @@ struct bpf_prog_aux;
+ struct xdp_rxq_info;
+ struct xdp_buff;
+ struct sock_reuseport;
++struct ctl_table;
++struct ctl_table_header;
+ 
+ /* ArgX, context and stack frame pointer register positions. Note,
+  * Arg1, Arg2, Arg3, etc are used as argument mappings of function
+@@ -1152,4 +1154,10 @@ struct bpf_sock_ops_kern {
+ 					 */
+ };
+ 
++struct bpf_sysctl_kern {
++	struct ctl_table_header *head;
++	struct ctl_table *table;
++	int write;
++};
++
+ #endif /* __LINUX_FILTER_H__ */
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/kernel/bpf/cgroup.c b/kernel/bpf/cgroup.c
+index 7d9c426bf2c7..3d1f1053a839 100644
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@ -11,7 +11,9 @@
+ #include <linux/kernel.h>
+ #include <linux/atomic.h>
+ #include <linux/cgroup.h>
++#include <linux/filter.h>
+ #include <linux/slab.h>
++#include <linux/sysctl.h>
+ #include <linux/bpf.h>
+ #include <linux/bpf-cgroup.h>
+ #include <net/sock.h>
+@@ -811,3 +813,93 @@ const struct bpf_verifier_ops cg_dev_verifier_ops = {
+ 	.get_func_proto		= cgroup_dev_func_proto,
+ 	.is_valid_access	= cgroup_dev_is_valid_access,
+ };
++
++/**
++ * __cgroup_bpf_run_filter_sysctl - Run a program on sysctl
++ *
++ * @head: sysctl table header
++ * @table: sysctl table
++ * @write: sysctl is being read (= 0) or written (= 1)
++ * @type: type of program to be executed
++ *
++ * Program is run when sysctl is being accessed, either read or written, and
++ * can allow or deny such access.
++ *
++ * This function will return %-EPERM if an attached program is found and
++ * returned value != 1 during execution. In all other cases 0 is returned.
++ */
++int __cgroup_bpf_run_filter_sysctl(struct ctl_table_header *head,
++				   struct ctl_table *table, int write,
++				   enum bpf_attach_type type)
++{
++	struct bpf_sysctl_kern ctx = {
++		.head = head,
++		.table = table,
++		.write = write,
++	};
++	struct cgroup *cgrp;
++	int ret;
++
++	rcu_read_lock();
++	cgrp = task_dfl_cgroup(current);
++	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], &ctx, BPF_PROG_RUN);
++	rcu_read_unlock();
++
++	return ret == 1 ? 0 : -EPERM;
++}
++EXPORT_SYMBOL(__cgroup_bpf_run_filter_sysctl);
++
++static const struct bpf_func_proto *
++sysctl_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++{
++	return cgroup_base_func_proto(func_id, prog);
++}
++
++static bool sysctl_is_valid_access(int off, int size, enum bpf_access_type type,
++				   const struct bpf_prog *prog,
++				   struct bpf_insn_access_aux *info)
++{
++	const int size_default = sizeof(__u32);
++
++	if (off < 0 || off + size > sizeof(struct bpf_sysctl) ||
++	    off % size || type != BPF_READ)
++		return false;
++
++	switch (off) {
++	case offsetof(struct bpf_sysctl, write):
++		bpf_ctx_record_field_size(info, size_default);
++		return bpf_ctx_narrow_access_ok(off, size, size_default);
++	default:
++		return false;
++	}
++}
++
++static u32 sysctl_convert_ctx_access(enum bpf_access_type type,
++				     const struct bpf_insn *si,
++				     struct bpf_insn *insn_buf,
++				     struct bpf_prog *prog, u32 *target_size)
++{
++	struct bpf_insn *insn = insn_buf;
++
++	switch (si->off) {
++	case offsetof(struct bpf_sysctl, write):
++		*insn++ = BPF_LDX_MEM(
++			BPF_SIZE(si->code), si->dst_reg, si->src_reg,
++			bpf_target_off(struct bpf_sysctl_kern, write,
++				       FIELD_SIZEOF(struct bpf_sysctl_kern,
++						    write),
++				       target_size));
++		break;
++	}
++
++	return insn - insn_buf;
++}
++
++const struct bpf_verifier_ops cg_sysctl_verifier_ops = {
++	.get_func_proto		= sysctl_func_proto,
++	.is_valid_access	= sysctl_is_valid_access,
++	.convert_ctx_access	= sysctl_convert_ctx_access,
++};
++
++const struct bpf_prog_ops cg_sysctl_prog_ops = {
++};
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 5f6f2f8cfd8e..8885524adb06 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1871,6 +1871,9 @@ static int bpf_prog_attach(const union bpf_attr *attr)
+ 	case BPF_FLOW_DISSECTOR:
+ 		ptype = BPF_PROG_TYPE_FLOW_DISSECTOR;
+ 		break;
++	case BPF_CGROUP_SYSCTL:
++		ptype = BPF_PROG_TYPE_CGROUP_SYSCTL;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1949,6 +1952,9 @@ static int bpf_prog_detach(const union bpf_attr *attr)
+ 		return lirc_prog_detach(attr);
+ 	case BPF_FLOW_DISSECTOR:
+ 		return skb_flow_dissector_bpf_prog_detach(attr);
++	case BPF_CGROUP_SYSCTL:
++		ptype = BPF_PROG_TYPE_CGROUP_SYSCTL;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1982,6 +1988,7 @@ static int bpf_prog_query(const union bpf_attr *attr,
+ 	case BPF_CGROUP_UDP6_SENDMSG:
+ 	case BPF_CGROUP_SOCK_OPS:
+ 	case BPF_CGROUP_DEVICE:
++	case BPF_CGROUP_SYSCTL:
+ 		break;
+ 	case BPF_LIRC_MODE2:
+ 		return lirc_prog_query(attr, uattr);
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 80b527e92638..8ea90ed5d110 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -5269,6 +5269,7 @@ static int check_return_code(struct bpf_verifier_env *env)
+ 	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+ 	case BPF_PROG_TYPE_SOCK_OPS:
+ 	case BPF_PROG_TYPE_CGROUP_DEVICE:
++	case BPF_PROG_TYPE_CGROUP_SYSCTL:
+ 		break;
+ 	default:
+ 		return 0;
