@@ -1887,7 +1887,7 @@ static void b43_handle_firmware_panic(struct b43_wldev *dev)
 	switch (reason) {
 	default:
 		b43dbg(dev->wl, "The panic reason is unknown.\n");
-		/* fallthrough */
+		fallthrough;
 	case B43_FWPANIC_DIE:
 		/* Do not restart the controller or firmware.
 		 * The device is nonfunctional from now on.
@@ -2281,7 +2281,7 @@ fw_ready:
 		size = be32_to_cpu(hdr->size);
 		if (size != ctx->blob->size - sizeof(struct b43_fw_header))
 			goto err_format;
-		/* fallthrough */
+		fallthrough;
 	case B43_FW_TYPE_IV:
 		if (hdr->ver != 1)
 			goto err_format;
@@ -3198,7 +3198,7 @@ static void b43_rate_memory_init(struct b43_wldev *dev)
 		b43_rate_memory_write(dev, B43_OFDM_RATE_36MB, 1);
 		b43_rate_memory_write(dev, B43_OFDM_RATE_48MB, 1);
 		b43_rate_memory_write(dev, B43_OFDM_RATE_54MB, 1);
-		/* fallthrough */
+		fallthrough;
 	case B43_PHYTYPE_B:
 		b43_rate_memory_write(dev, B43_CCK_RATE_1MB, 0);
 		b43_rate_memory_write(dev, B43_CCK_RATE_2MB, 0);
@@ -5349,7 +5349,7 @@ static void b43_supported_bands(struct b43_wldev *dev, bool *have_2ghz_phy,
 		/* There are 14e4:4321 PCI devs with 2.4 GHz BCM4321 (N-PHY) */
 		if (dev->phy.type != B43_PHYTYPE_G)
 			break;
-		/* fall through */
+		fallthrough;
 	case 0x4313: /* BCM4311 */
 	case 0x431a: /* BCM4318 */
 	case 0x432a: /* BCM4321 */
