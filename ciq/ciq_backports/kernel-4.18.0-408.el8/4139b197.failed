@@ -1,0 +1,121 @@
+KVM: X86: Introduce kvm_mmu_slot_lpages() helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Peter Xu <peterx@redhat.com>
+commit 4139b1972af281e0293c2414a0f1cd59fa5b2980
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/4139b197.failed
+
+Introduce kvm_mmu_slot_lpages() to calculcate lpage_info and rmap array size.
+The other __kvm_mmu_slot_lpages() can take an extra parameter of npages rather
+than fetching from the memslot pointer.  Start to use the latter one in
+kvm_alloc_memslot_metadata().
+
+	Signed-off-by: Peter Xu <peterx@redhat.com>
+Message-Id: <20210730220455.26054-4-peterx@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4139b1972af281e0293c2414a0f1cd59fa5b2980)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.h
+diff --cc arch/x86/kvm/mmu.h
+index c9adcc66bdd5,59e831a8ab9d..000000000000
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@@ -229,4 -230,35 +229,38 @@@ int kvm_arch_write_log_dirty(struct kvm
+  int kvm_mmu_post_init_vm(struct kvm *kvm);
+  void kvm_mmu_pre_destroy_vm(struct kvm *kvm);
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool kvm_memslots_have_rmaps(struct kvm *kvm)
++ {
++ 	/*
++ 	 * Read memslot_have_rmaps before rmap pointers.  Hence, threads reading
++ 	 * memslots_have_rmaps in any lock context are guaranteed to see the
++ 	 * pointers.  Pairs with smp_store_release in alloc_all_memslots_rmaps.
++ 	 */
++ 	return smp_load_acquire(&kvm->arch.memslots_have_rmaps);
++ }
++ 
++ static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
++ {
++ 	/* KVM_HPAGE_GFN_SHIFT(PG_LEVEL_4K) must be 0. */
++ 	return (gfn >> KVM_HPAGE_GFN_SHIFT(level)) -
++ 		(base_gfn >> KVM_HPAGE_GFN_SHIFT(level));
++ }
++ 
++ static inline unsigned long
++ __kvm_mmu_slot_lpages(struct kvm_memory_slot *slot, unsigned long npages,
++ 		      int level)
++ {
++ 	return gfn_to_index(slot->base_gfn + npages - 1,
++ 			    slot->base_gfn, level) + 1;
++ }
++ 
++ static inline unsigned long
++ kvm_mmu_slot_lpages(struct kvm_memory_slot *slot, int level)
++ {
++ 	return __kvm_mmu_slot_lpages(slot, slot->npages, level);
++ }
++ 
+++>>>>>>> 4139b1972af2 (KVM: X86: Introduce kvm_mmu_slot_lpages() helpers)
+  #endif
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index c108053d930b..0611e1c976e8 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -128,13 +128,6 @@
+ #define KVM_HPAGE_MASK(x)	(~(KVM_HPAGE_SIZE(x) - 1))
+ #define KVM_PAGES_PER_HPAGE(x)	(KVM_HPAGE_SIZE(x) / PAGE_SIZE)
+ 
+-static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
+-{
+-	/* KVM_HPAGE_GFN_SHIFT(PG_LEVEL_4K) must be 0. */
+-	return (gfn >> KVM_HPAGE_GFN_SHIFT(level)) -
+-		(base_gfn >> KVM_HPAGE_GFN_SHIFT(level));
+-}
+-
+ #define KVM_PERMILLE_MMU_PAGES 20
+ #define KVM_MIN_ALLOC_MMU_PAGES 64UL
+ #define KVM_MMU_HASH_SHIFT 12
+* Unmerged path arch/x86/kvm/mmu.h
+diff --git a/arch/x86/kvm/mmu/page_track.c b/arch/x86/kvm/mmu/page_track.c
+index 68e67228101d..21427e84a82e 100644
+--- a/arch/x86/kvm/mmu/page_track.c
++++ b/arch/x86/kvm/mmu/page_track.c
+@@ -16,6 +16,7 @@
+ 
+ #include <asm/kvm_page_track.h>
+ 
++#include "mmu.h"
+ #include "mmu_internal.h"
+ 
+ void kvm_page_track_free_memslot(struct kvm_memory_slot *slot)
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 8637d2d61d5e..2ff03ae254a9 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -11582,8 +11582,7 @@ static int memslot_rmap_alloc(struct kvm_memory_slot *slot,
+ 
+ 	for (i = 0; i < KVM_NR_PAGE_SIZES; ++i) {
+ 		int level = i + 1;
+-		int lpages = gfn_to_index(slot->base_gfn + npages - 1,
+-					  slot->base_gfn, level) + 1;
++		int lpages = __kvm_mmu_slot_lpages(slot, npages, level);
+ 
+ 		slot->arch.rmap[i] = kvcalloc(lpages, sz, GFP_KERNEL_ACCOUNT);
+ 		if (!slot->arch.rmap[i]) {
+@@ -11620,8 +11619,7 @@ static int kvm_alloc_memslot_metadata(struct kvm *kvm,
+ 		int lpages;
+ 		int level = i + 1;
+ 
+-		lpages = gfn_to_index(slot->base_gfn + npages - 1,
+-				      slot->base_gfn, level) + 1;
++		lpages = __kvm_mmu_slot_lpages(slot, npages, level);
+ 
+ 		linfo = kvcalloc(lpages, sizeof(*linfo), GFP_KERNEL_ACCOUNT);
+ 		if (!linfo)
