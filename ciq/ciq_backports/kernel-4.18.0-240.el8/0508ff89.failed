@@ -1,0 +1,231 @@
+mlxsw: spectrum_router: Prevent incorrect replacement of local table routes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 0508ff8934f40b52a78313049b96eec29a46ba49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0508ff89.failed
+
+The driver uses the same table to represent both the main and local
+routing tables. Prevent routes in the main table from replacing routes
+in the local table to reflect the fact that the local table is consulted
+first during lookup.
+
+Fixes: b6a1d871d37a ("mlxsw: spectrum_router: Start using new IPv4 route notifications")
+Fixes: dacad7b34b59 ("mlxsw: spectrum_router: Start using new IPv6 route notifications")
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0508ff8934f40b52a78313049b96eec29a46ba49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index 575ab41fc96b,f8b3869672c3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -4740,30 -4835,32 +4740,47 @@@ err_fib_node_entry_add
+  }
+  
+  static void
+ -mlxsw_sp_fib_node_entry_unlink(struct mlxsw_sp *mlxsw_sp,
+ -			       struct mlxsw_sp_fib_entry *fib_entry)
+ +mlxsw_sp_fib4_node_entry_unlink(struct mlxsw_sp *mlxsw_sp,
+ +				struct mlxsw_sp_fib4_entry *fib4_entry)
+  {
+ -	struct mlxsw_sp_fib_node *fib_node = fib_entry->fib_node;
+ +	mlxsw_sp_fib_node_entry_del(mlxsw_sp, &fib4_entry->common);
+ +	list_del(&fib4_entry->common.list);
+ +}
+  
+ -	mlxsw_sp_fib_entry_del(mlxsw_sp, fib_entry);
+ -	fib_node->fib_entry = NULL;
+ +static void mlxsw_sp_fib4_entry_replace(struct mlxsw_sp *mlxsw_sp,
+ +					struct mlxsw_sp_fib4_entry *fib4_entry)
+ +{
+ +	struct mlxsw_sp_fib_node *fib_node = fib4_entry->common.fib_node;
+ +	struct mlxsw_sp_fib4_entry *replaced;
+ +
+ +	if (list_is_singular(&fib_node->entry_list))
+ +		return;
+ +
+ +	/* We inserted the new entry before replaced one */
+ +	replaced = list_next_entry(fib4_entry, common.list);
+ +
+ +	mlxsw_sp_fib4_node_entry_unlink(mlxsw_sp, replaced);
+ +	mlxsw_sp_fib4_entry_destroy(mlxsw_sp, replaced);
+ +	mlxsw_sp_fib_node_put(mlxsw_sp, fib_node);
+  }
+  
++ static bool mlxsw_sp_fib4_allow_replace(struct mlxsw_sp_fib4_entry *fib4_entry)
++ {
++ 	struct mlxsw_sp_fib_node *fib_node = fib4_entry->common.fib_node;
++ 	struct mlxsw_sp_fib4_entry *fib4_replaced;
++ 
++ 	if (!fib_node->fib_entry)
++ 		return true;
++ 
++ 	fib4_replaced = container_of(fib_node->fib_entry,
++ 				     struct mlxsw_sp_fib4_entry, common);
++ 	if (fib4_entry->tb_id == RT_TABLE_MAIN &&
++ 	    fib4_replaced->tb_id == RT_TABLE_LOCAL)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
+  static int
+  mlxsw_sp_router_fib4_replace(struct mlxsw_sp *mlxsw_sp,
+  			     const struct fib_entry_notifier_info *fen_info)
+@@@ -4791,13 -4889,27 +4808,24 @@@
+  		goto err_fib4_entry_create;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = mlxsw_sp_fib4_node_entry_link(mlxsw_sp, fib4_entry);
+++=======
++ 	if (!mlxsw_sp_fib4_allow_replace(fib4_entry)) {
++ 		mlxsw_sp_fib4_entry_destroy(mlxsw_sp, fib4_entry);
++ 		mlxsw_sp_fib_node_put(mlxsw_sp, fib_node);
++ 		return 0;
++ 	}
++ 
++ 	replaced = fib_node->fib_entry;
++ 	err = mlxsw_sp_fib_node_entry_link(mlxsw_sp, &fib4_entry->common);
+++>>>>>>> 0508ff8934f4 (mlxsw: spectrum_router: Prevent incorrect replacement of local table routes)
+  	if (err) {
+  		dev_warn(mlxsw_sp->bus_info->dev, "Failed to link FIB entry to node\n");
+ -		goto err_fib_node_entry_link;
+ +		goto err_fib4_node_entry_link;
+  	}
+  
+ -	/* Nothing to replace */
+ -	if (!replaced)
+ -		return 0;
+ -
+ -	mlxsw_sp_fib_entry_hw_flags_clear(mlxsw_sp, replaced);
+ -	fib4_replaced = container_of(replaced, struct mlxsw_sp_fib4_entry,
+ -				     common);
+ -	mlxsw_sp_fib4_entry_destroy(mlxsw_sp, fib4_replaced);
+ +	mlxsw_sp_fib4_entry_replace(mlxsw_sp, fib4_entry);
+  
+  	return 0;
+  
+@@@ -5450,26 -5431,94 +5478,100 @@@ mlxsw_sp_fib6_entry_lookup(struct mlxsw
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static void mlxsw_sp_fib6_entry_replace(struct mlxsw_sp *mlxsw_sp,
+ +					struct mlxsw_sp_fib6_entry *fib6_entry,
+ +					bool replace)
+++=======
++ static bool mlxsw_sp_fib6_allow_replace(struct mlxsw_sp_fib6_entry *fib6_entry)
++ {
++ 	struct mlxsw_sp_fib_node *fib_node = fib6_entry->common.fib_node;
++ 	struct mlxsw_sp_fib6_entry *fib6_replaced;
++ 	struct fib6_info *rt, *rt_replaced;
++ 
++ 	if (!fib_node->fib_entry)
++ 		return true;
++ 
++ 	fib6_replaced = container_of(fib_node->fib_entry,
++ 				     struct mlxsw_sp_fib6_entry,
++ 				     common);
++ 	rt = mlxsw_sp_fib6_entry_rt(fib6_entry);
++ 	rt_replaced = mlxsw_sp_fib6_entry_rt(fib6_replaced);
++ 	if (rt->fib6_table->tb6_id == RT_TABLE_MAIN &&
++ 	    rt_replaced->fib6_table->tb6_id == RT_TABLE_LOCAL)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static int mlxsw_sp_router_fib6_replace(struct mlxsw_sp *mlxsw_sp,
++ 					struct fib6_info **rt_arr,
++ 					unsigned int nrt6)
+++>>>>>>> 0508ff8934f4 (mlxsw: spectrum_router: Prevent incorrect replacement of local table routes)
+  {
+ -	struct mlxsw_sp_fib6_entry *fib6_entry, *fib6_replaced;
+ -	struct mlxsw_sp_fib_entry *replaced;
+ -	struct mlxsw_sp_fib_node *fib_node;
+ -	struct fib6_info *rt = rt_arr[0];
+ -	int err;
+ +	struct mlxsw_sp_fib_node *fib_node = fib6_entry->common.fib_node;
+ +	struct mlxsw_sp_fib6_entry *replaced;
+  
+ -	if (mlxsw_sp->router->aborted)
+ -		return 0;
+ +	if (!replace)
+ +		return;
+  
+ -	if (rt->fib6_src.plen)
+ -		return -EINVAL;
+ +	replaced = list_next_entry(fib6_entry, common.list);
+  
+++<<<<<<< HEAD
+ +	mlxsw_sp_fib6_node_entry_unlink(mlxsw_sp, replaced);
+ +	mlxsw_sp_fib6_entry_destroy(mlxsw_sp, replaced);
+++=======
++ 	if (mlxsw_sp_fib6_rt_should_ignore(rt))
++ 		return 0;
++ 
++ 	fib_node = mlxsw_sp_fib_node_get(mlxsw_sp, rt->fib6_table->tb6_id,
++ 					 &rt->fib6_dst.addr,
++ 					 sizeof(rt->fib6_dst.addr),
++ 					 rt->fib6_dst.plen,
++ 					 MLXSW_SP_L3_PROTO_IPV6);
++ 	if (IS_ERR(fib_node))
++ 		return PTR_ERR(fib_node);
++ 
++ 	fib6_entry = mlxsw_sp_fib6_entry_create(mlxsw_sp, fib_node, rt_arr,
++ 						nrt6);
++ 	if (IS_ERR(fib6_entry)) {
++ 		err = PTR_ERR(fib6_entry);
++ 		goto err_fib6_entry_create;
++ 	}
++ 
++ 	if (!mlxsw_sp_fib6_allow_replace(fib6_entry)) {
++ 		mlxsw_sp_fib6_entry_destroy(mlxsw_sp, fib6_entry);
++ 		mlxsw_sp_fib_node_put(mlxsw_sp, fib_node);
++ 		return 0;
++ 	}
++ 
++ 	replaced = fib_node->fib_entry;
++ 	err = mlxsw_sp_fib_node_entry_link(mlxsw_sp, &fib6_entry->common);
++ 	if (err)
++ 		goto err_fib_node_entry_link;
++ 
++ 	/* Nothing to replace */
++ 	if (!replaced)
++ 		return 0;
++ 
++ 	mlxsw_sp_fib_entry_hw_flags_clear(mlxsw_sp, replaced);
++ 	fib6_replaced = container_of(replaced, struct mlxsw_sp_fib6_entry,
++ 				     common);
++ 	mlxsw_sp_fib6_entry_destroy(mlxsw_sp, fib6_replaced);
++ 
++ 	return 0;
++ 
++ err_fib_node_entry_link:
++ 	fib_node->fib_entry = replaced;
++ 	mlxsw_sp_fib6_entry_destroy(mlxsw_sp, fib6_entry);
++ err_fib6_entry_create:
+++>>>>>>> 0508ff8934f4 (mlxsw: spectrum_router: Prevent incorrect replacement of local table routes)
+  	mlxsw_sp_fib_node_put(mlxsw_sp, fib_node);
+ -	return err;
+  }
+  
+ -static int mlxsw_sp_router_fib6_append(struct mlxsw_sp *mlxsw_sp,
+ -				       struct fib6_info **rt_arr,
+ -				       unsigned int nrt6)
+ +static int mlxsw_sp_router_fib6_add(struct mlxsw_sp *mlxsw_sp,
+ +				    struct fib6_info **rt_arr,
+ +				    unsigned int nrt6, bool replace)
+  {
+  	struct mlxsw_sp_fib6_entry *fib6_entry;
+  	struct mlxsw_sp_fib_node *fib_node;
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
