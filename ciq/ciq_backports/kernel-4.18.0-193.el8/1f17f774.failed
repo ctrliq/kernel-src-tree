@@ -1,0 +1,191 @@
+net: sched: flower: insert filter to ht before offloading it to hw
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: flower: insert filter to ht before offloading it to hw (Ivan Vecera) [1751856]
+Rebuild_FUZZ: 96.06%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 1f17f7742eeba73dbd5ae8bdec1a85ce5877001e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/1f17f774.failed
+
+John reports:
+
+Recent refactoring of fl_change aims to use the classifier spinlock to
+avoid the need for rtnl lock. In doing so, the fl_hw_replace_filer()
+function was moved to before the lock is taken. This can create problems
+for drivers if duplicate filters are created (commmon in ovs tc offload
+due to filters being triggered by user-space matches).
+
+Drivers registered for such filters will now receive multiple copies of
+the same rule, each with a different cookie value. This means that the
+drivers would need to do a full match field lookup to determine
+duplicates, repeating work that will happen in flower __fl_lookup().
+Currently, drivers do not expect to receive duplicate filters.
+
+To fix this, verify that filter with same key is not present in flower
+classifier hash table and insert the new filter to the flower hash table
+before offloading it to hardware. Implement helper function
+fl_ht_insert_unique() to atomically verify/insert a filter.
+
+This change makes filter visible to fast path at the beginning of
+fl_change() function, which means it can no longer be freed directly in
+case of error. Refactor fl_change() error handling code to deallocate the
+filter with rcu timeout.
+
+Fixes: 620da4860827 ("net: sched: flower: refactor fl_change")
+	Reported-by: John Hurley <john.hurley@netronome.com>
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1f17f7742eeba73dbd5ae8bdec1a85ce5877001e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_flower.c
+index bf30bf04d4ea,2763176e369c..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -1367,14 -1492,19 +1389,15 @@@ static int fl_change(struct net *net, s
+  	struct cls_fl_filter *fnew;
+  	struct fl_flow_mask *mask;
+  	struct nlattr **tb;
++ 	bool in_ht;
+  	int err;
+  
+ -	if (!tca[TCA_OPTIONS]) {
+ -		err = -EINVAL;
+ -		goto errout_fold;
+ -	}
+ +	if (!tca[TCA_OPTIONS])
+ +		return -EINVAL;
+  
+  	mask = kzalloc(sizeof(struct fl_flow_mask), GFP_KERNEL);
+ -	if (!mask) {
+ -		err = -ENOBUFS;
+ -		goto errout_fold;
+ -	}
+ +	if (!mask)
+ +		return -ENOBUFS;
+  
+  	tb = kcalloc(TCA_FLOWER_MAX + 1, sizeof(struct nlattr *), GFP_KERNEL);
+  	if (!tb) {
+@@@ -1420,22 -1551,50 +1443,33 @@@
+  	if (err)
+  		goto errout;
+  
++ 	err = fl_ht_insert_unique(fnew, fold, &in_ht);
++ 	if (err)
++ 		goto errout_mask;
++ 
+  	if (!tc_skip_hw(fnew->flags)) {
+ -		err = fl_hw_replace_filter(tp, fnew, rtnl_held, extack);
+ +		err = fl_hw_replace_filter(tp, fnew, extack);
+  		if (err)
+- 			goto errout_mask;
++ 			goto errout_ht;
+  	}
+  
+  	if (!tc_in_hw(fnew->flags))
+  		fnew->flags |= TCA_CLS_FLAGS_NOT_IN_HW;
+  
+ -	spin_lock(&tp->lock);
+ -
+ -	/* tp was deleted concurrently. -EAGAIN will cause caller to lookup
+ -	 * proto again or create new one, if necessary.
+ -	 */
+ -	if (tp->deleting) {
+ -		err = -EAGAIN;
+ -		goto errout_hw;
+ -	}
+ -
+ -	refcount_inc(&fnew->refcnt);
+  	if (fold) {
+ -		/* Fold filter was deleted concurrently. Retry lookup. */
+ -		if (fold->deleted) {
+ -			err = -EAGAIN;
+ -			goto errout_hw;
+ -		}
+ -
+  		fnew->handle = handle;
+  
+- 		err = rhashtable_insert_fast(&fnew->mask->ht, &fnew->ht_node,
+- 					     fnew->mask->filter_ht_params);
+- 		if (err)
+- 			goto errout_hw;
++ 		if (!in_ht) {
++ 			struct rhashtable_params params =
++ 				fnew->mask->filter_ht_params;
++ 
++ 			err = rhashtable_insert_fast(&fnew->mask->ht,
++ 						     &fnew->ht_node,
++ 						     params);
++ 			if (err)
++ 				goto errout_hw;
++ 			in_ht = true;
++ 		}
+  
+  		rhashtable_remove_fast(&fold->mask->ht,
+  				       &fold->ht_node,
+@@@ -1445,16 -1604,18 +1479,11 @@@
+  
+  		fl_mask_put(head, fold->mask, true);
+  		if (!tc_skip_hw(fold->flags))
+ -			fl_hw_destroy_filter(tp, fold, rtnl_held, NULL);
+ +			fl_hw_destroy_filter(tp, fold, NULL);
+  		tcf_unbind_filter(tp, &fold->res);
+  		tcf_exts_get_net(&fold->exts);
+ -		/* Caller holds reference to fold, so refcnt is always > 0
+ -		 * after this.
+ -		 */
+ -		refcount_dec(&fold->refcnt);
+ -		__fl_put(fold);
+ +		tcf_queue_work(&fold->rwork, fl_destroy_filter_work);
+  	} else {
+- 		if (__fl_lookup(fnew->mask, &fnew->mkey)) {
+- 			err = -EEXIST;
+- 			goto errout_hw;
+- 		}
+- 
+  		if (handle) {
+  			/* user specifies a handle and it doesn't exist */
+  			err = idr_alloc_u32(&head->handle_idr, fnew, &handle,
+@@@ -1477,13 -1638,8 +1506,7 @@@
+  			goto errout_hw;
+  
+  		fnew->handle = handle;
+- 
+- 		err = rhashtable_insert_fast(&fnew->mask->ht, &fnew->ht_node,
+- 					     fnew->mask->filter_ht_params);
+- 		if (err)
+- 			goto errout_idr;
+- 
+  		list_add_tail_rcu(&fnew->list, &fnew->mask->filters);
+ -		spin_unlock(&tp->lock);
+  	}
+  
+  	*arg = fnew;
+@@@ -1492,11 -1648,14 +1515,17 @@@
+  	kfree(mask);
+  	return 0;
+  
+- errout_idr:
+- 	idr_remove(&head->handle_idr, fnew->handle);
+  errout_hw:
+ -	spin_unlock(&tp->lock);
+  	if (!tc_skip_hw(fnew->flags))
+++<<<<<<< HEAD
+ +		fl_hw_destroy_filter(tp, fnew, NULL);
+++=======
++ 		fl_hw_destroy_filter(tp, fnew, rtnl_held, NULL);
++ errout_ht:
++ 	if (in_ht)
++ 		rhashtable_remove_fast(&fnew->mask->ht, &fnew->ht_node,
++ 				       fnew->mask->filter_ht_params);
+++>>>>>>> 1f17f7742eeb (net: sched: flower: insert filter to ht before offloading it to hw)
+  errout_mask:
+  	fl_mask_put(head, fnew->mask, true);
+  errout:
+* Unmerged path net/sched/cls_flower.c
