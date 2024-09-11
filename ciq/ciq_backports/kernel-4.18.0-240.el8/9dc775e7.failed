@@ -1,0 +1,176 @@
+RDMA/odp: Lift umem_mutex out of ib_umem_odp_unmap_dma_pages()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 9dc775e7f5508f848661bbfb2e15683affb85f24
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/9dc775e7.failed
+
+This fixes a race of the form:
+    CPU0                               CPU1
+mlx5_ib_invalidate_range()     mlx5_ib_invalidate_range()
+				 // This one actually makes npages == 0
+				 ib_umem_odp_unmap_dma_pages()
+				 if (npages == 0 && !dying)
+  // This one does nothing
+  ib_umem_odp_unmap_dma_pages()
+  if (npages == 0 && !dying)
+     dying = 1;
+                                    dying = 1;
+				    schedule_work(&umem_odp->work);
+     // Double schedule of the same work
+     schedule_work(&umem_odp->work);  // BOOM
+
+npages and dying must be read and written under the umem_mutex lock.
+
+Since whenever ib_umem_odp_unmap_dma_pages() is called mlx5 must also call
+mlx5_ib_update_xlt, and both need to be done in the same locking region,
+hoist the lock out of unmap.
+
+This avoids an expensive double critical section in
+mlx5_ib_invalidate_range().
+
+Fixes: 81713d3788d2 ("IB/mlx5: Add implicit MR support")
+Link: https://lore.kernel.org/r/20191001153821.23621-4-jgg@ziepe.ca
+	Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 9dc775e7f5508f848661bbfb2e15683affb85f24)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/umem_odp.c
+#	drivers/infiniband/hw/mlx5/odp.c
+diff --cc drivers/infiniband/core/umem_odp.c
+index e93b673104dc,163ff7ba92b7..000000000000
+--- a/drivers/infiniband/core/umem_odp.c
++++ b/drivers/infiniband/core/umem_odp.c
+@@@ -454,14 -450,36 +454,25 @@@ void ib_umem_odp_release(struct ib_umem
+  	 * It is the driver's responsibility to ensure, before calling us,
+  	 * that the hardware will not attempt to access the MR any more.
+  	 */
+++<<<<<<< HEAD
+ +	ib_umem_odp_unmap_dma_pages(umem_odp, ib_umem_start(umem_odp),
+ +				    ib_umem_end(umem_odp));
+++=======
++ 	if (!umem_odp->is_implicit_odp) {
++ 		mutex_lock(&umem_odp->umem_mutex);
++ 		ib_umem_odp_unmap_dma_pages(umem_odp, ib_umem_start(umem_odp),
++ 					    ib_umem_end(umem_odp));
++ 		mutex_unlock(&umem_odp->umem_mutex);
++ 		kvfree(umem_odp->dma_list);
++ 		kvfree(umem_odp->page_list);
++ 	}
+++>>>>>>> 9dc775e7f550 (RDMA/odp: Lift umem_mutex out of ib_umem_odp_unmap_dma_pages())
+  
+ -	down_write(&per_mm->umem_rwsem);
+ -	if (!umem_odp->is_implicit_odp) {
+ -		interval_tree_remove(&umem_odp->interval_tree,
+ -				     &per_mm->umem_tree);
+ -		complete_all(&umem_odp->notifier_completion);
+ -	}
+ -	/*
+ -	 * NOTE! mmu_notifier_unregister() can happen between a start/end
+ -	 * callback, resulting in a missing end, and thus an unbalanced
+ -	 * lock. This doesn't really matter to us since we are about to kfree
+ -	 * the memory that holds the lock, however LOCKDEP doesn't like this.
+ -	 * Thus we call the mmu_notifier_put under the rwsem and test the
+ -	 * internal users count to reliably see if we are past this point.
+ -	 */
+ -	mmu_notifier_put(&per_mm->mn);
+ -	up_write(&per_mm->umem_rwsem);
+ -
+ -	mmdrop(umem_odp->umem.owning_mm);
+ -	kfree(umem_odp);
+ +	remove_umem_from_per_mm(umem_odp);
+ +	put_per_mm(umem_odp);
+ +	vfree(umem_odp->dma_list);
+ +	vfree(umem_odp->page_list);
+  }
+ -EXPORT_SYMBOL(ib_umem_odp_release);
+  
+  /*
+   * Map for DMA and insert a single page into the on-demand paging page tables.
+@@@ -702,8 -719,10 +713,10 @@@ void ib_umem_odp_unmap_dma_pages(struc
+  {
+  	int idx;
+  	u64 addr;
+ -	struct ib_device *dev = umem_odp->umem.ibdev;
+ +	struct ib_device *dev = umem_odp->umem.context->device;
+  
++ 	lockdep_assert_held(&umem_odp->umem_mutex);
++ 
+  	virt = max_t(u64, virt, ib_umem_start(umem_odp));
+  	bound = min_t(u64, bound, ib_umem_end(umem_odp));
+  	/* Note that during the run of this function, the
+diff --cc drivers/infiniband/hw/mlx5/odp.c
+index 2f4c0f111ee1,1930d78c3091..000000000000
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@@ -312,10 -308,6 +312,13 @@@ void mlx5_ib_invalidate_range(struct ib
+  				   idx - blk_start_idx + 1, 0,
+  				   MLX5_IB_UPD_XLT_ZAP |
+  				   MLX5_IB_UPD_XLT_ATOMIC);
+++<<<<<<< HEAD
+ +	mutex_unlock(&umem_odp->umem_mutex);
+ +
+ +	mlx5_update_odp_stats(mr, invalidations, invalidations);
+ +
+++=======
+++>>>>>>> 9dc775e7f550 (RDMA/odp: Lift umem_mutex out of ib_umem_odp_unmap_dma_pages())
+  	/*
+  	 * We are now sure that the device will not access the
+  	 * memory. We can safely unmap it, and mark it as dirty if
+@@@ -324,10 -316,9 +327,10 @@@
+  
+  	ib_umem_odp_unmap_dma_pages(umem_odp, start, end);
+  
+ +
+  	if (unlikely(!umem_odp->npages && mr->parent &&
+  		     !umem_odp->dying)) {
+- 		WRITE_ONCE(umem_odp->dying, 1);
++ 		umem_odp->dying = 1;
+  		atomic_inc(&mr->parent->num_leaf_free);
+  		schedule_work(&umem_odp->work);
+  	}
+@@@ -605,10 -573,32 +609,36 @@@ static int mr_leaf_free(struct ib_umem_
+  void mlx5_ib_free_implicit_mr(struct mlx5_ib_mr *imr)
+  {
+  	struct ib_ucontext_per_mm *per_mm = mr_to_per_mm(imr);
+ -	struct rb_node *node;
+  
+  	down_read(&per_mm->umem_rwsem);
+++<<<<<<< HEAD
+ +	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, 0, ULLONG_MAX,
+ +				      mr_leaf_free, imr);
+++=======
++ 	for (node = rb_first_cached(&per_mm->umem_tree); node;
++ 	     node = rb_next(node)) {
++ 		struct ib_umem_odp *umem_odp =
++ 			rb_entry(node, struct ib_umem_odp, interval_tree.rb);
++ 		struct mlx5_ib_mr *mr = umem_odp->private;
++ 
++ 		if (mr->parent != imr)
++ 			continue;
++ 
++ 		mutex_lock(&umem_odp->umem_mutex);
++ 		ib_umem_odp_unmap_dma_pages(umem_odp, ib_umem_start(umem_odp),
++ 					    ib_umem_end(umem_odp));
++ 
++ 		if (umem_odp->dying) {
++ 			mutex_unlock(&umem_odp->umem_mutex);
++ 			continue;
++ 		}
++ 
++ 		umem_odp->dying = 1;
++ 		atomic_inc(&imr->num_leaf_free);
++ 		schedule_work(&umem_odp->work);
++ 		mutex_unlock(&umem_odp->umem_mutex);
++ 	}
+++>>>>>>> 9dc775e7f550 (RDMA/odp: Lift umem_mutex out of ib_umem_odp_unmap_dma_pages())
+  	up_read(&per_mm->umem_rwsem);
+  
+  	wait_event(imr->q_leaf_free, !atomic_read(&imr->num_leaf_free));
+* Unmerged path drivers/infiniband/core/umem_odp.c
+* Unmerged path drivers/infiniband/hw/mlx5/odp.c
