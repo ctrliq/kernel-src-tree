@@ -179,6 +179,11 @@ static struct cache_head *rsi_alloc(void)
 		return NULL;
 }
 
+static int rsi_upcall(struct cache_detail *cd, struct cache_head *h)
+{
+	return sunrpc_cache_pipe_upcall_timeout(cd, h);
+}
+
 static void rsi_request(struct cache_detail *cd,
 		       struct cache_head *h,
 		       char **bpp, int *blen)
@@ -277,6 +282,7 @@ static const struct cache_detail rsi_cache_template = {
 	.hash_size	= RSI_HASHMAX,
 	.name           = "auth.rpcsec.init",
 	.cache_put      = rsi_put,
+	.cache_upcall	= rsi_upcall,
 	.cache_request  = rsi_request,
 	.cache_parse    = rsi_parse,
 	.match		= rsi_match,
@@ -423,6 +429,11 @@ rsc_alloc(void)
 		return NULL;
 }
 
+static int rsc_upcall(struct cache_detail *cd, struct cache_head *h)
+{
+	return -EINVAL;
+}
+
 static int rsc_parse(struct cache_detail *cd,
 		     char *mesg, int mlen)
 {
@@ -549,6 +560,7 @@ static const struct cache_detail rsc_cache_template = {
 	.hash_size	= RSC_HASHMAX,
 	.name		= "auth.rpcsec.context",
 	.cache_put	= rsc_put,
+	.cache_upcall	= rsc_upcall,
 	.cache_parse	= rsc_parse,
 	.match		= rsc_match,
 	.init		= rsc_init,
