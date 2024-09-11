@@ -1,0 +1,92 @@
+io_uring: make CQ ring wakeups be more efficient
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit bda521624e75c665c407b3d9cece6e7a28178cd8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/bda52162.failed
+
+For batched IO, it's not uncommon for waiters to ask for more than 1
+IO to complete before being woken up. This is a problem with
+wait_event() since tasks will get woken for every IO that completes,
+re-check condition, then go back to sleep. For batch counts on the
+order of what you do for high IOPS, that can result in 10s of extra
+wakeups for the waiting task.
+
+Add a private wake function that checks for the wake up count criteria
+being met before calling autoremove_wake_function(). Pavel reports that
+one test case he has runs 40% faster with proper batching of wakeups.
+
+	Reported-by: Pavel Begunkov <asml.silence@gmail.com>
+	Tested-by: Pavel Begunkov <asml.silence@gmail.com>
+	Reviewed-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit bda521624e75c665c407b3d9cece6e7a28178cd8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 3c3c73eab2a0,c934f91c51e9..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -2670,11 -2807,19 +2702,24 @@@ static int io_wake_function(struct wait
+  static int io_cqring_wait(struct io_ring_ctx *ctx, int min_events,
+  			  const sigset_t __user *sig, size_t sigsz)
+  {
+++<<<<<<< HEAD
+ +	struct io_cq_ring *ring = ctx->cq_ring;
+ +	sigset_t ksigmask, sigsaved;
+++=======
++ 	struct io_wait_queue iowq = {
++ 		.wq = {
++ 			.private	= current,
++ 			.func		= io_wake_function,
++ 			.entry		= LIST_HEAD_INIT(iowq.wq.entry),
++ 		},
++ 		.ctx		= ctx,
++ 		.to_wait	= min_events,
++ 	};
++ 	struct io_rings *rings = ctx->rings;
+++>>>>>>> bda521624e75 (io_uring: make CQ ring wakeups be more efficient)
+  	int ret;
+  
+ -	if (io_cqring_events(rings) >= min_events)
+ +	if (io_cqring_events(ring) >= min_events)
+  		return 0;
+  
+  	if (sig) {
+@@@ -2691,11 -2835,22 +2736,30 @@@
+  			return ret;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = wait_event_interruptible(ctx->wait, io_cqring_events(ring) >= min_events);
+ +
+ +	if (sig)
+ +		restore_user_sigmask(sig, &sigsaved, ret == -ERESTARTSYS);
+ +
+++=======
++ 	ret = 0;
++ 	iowq.nr_timeouts = atomic_read(&ctx->cq_timeouts);
++ 	do {
++ 		prepare_to_wait_exclusive(&ctx->wait, &iowq.wq,
++ 						TASK_INTERRUPTIBLE);
++ 		if (io_should_wake(&iowq))
++ 			break;
++ 		schedule();
++ 		if (signal_pending(current)) {
++ 			ret = -ERESTARTSYS;
++ 			break;
++ 		}
++ 	} while (1);
++ 	finish_wait(&ctx->wait, &iowq.wq);
++ 
++ 	restore_saved_sigmask_unless(ret == -ERESTARTSYS);
+++>>>>>>> bda521624e75 (io_uring: make CQ ring wakeups be more efficient)
+  	if (ret == -ERESTARTSYS)
+  		ret = -EINTR;
+  
+* Unmerged path fs/io_uring.c
