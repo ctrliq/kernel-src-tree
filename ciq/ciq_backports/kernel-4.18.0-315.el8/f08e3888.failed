@@ -1,0 +1,263 @@
+lockdep: Fix recursive read lock related safe->unsafe detection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Boqun Feng <boqun.feng@gmail.com>
+commit f08e3888574d490b31481eef6d84c61bedba7a47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/f08e3888.failed
+
+Currently, in safe->unsafe detection, lockdep misses the fact that a
+LOCK_ENABLED_IRQ_*_READ usage and a LOCK_USED_IN_IRQ_*_READ usage may
+cause deadlock too, for example:
+
+	P1                          P2
+	<irq disabled>
+	write_lock(l1);             <irq enabled>
+				    read_lock(l2);
+	write_lock(l2);
+				    <in irq>
+				    read_lock(l1);
+
+Actually, all of the following cases may cause deadlocks:
+
+	LOCK_USED_IN_IRQ_* -> LOCK_ENABLED_IRQ_*
+	LOCK_USED_IN_IRQ_*_READ -> LOCK_ENABLED_IRQ_*
+	LOCK_USED_IN_IRQ_* -> LOCK_ENABLED_IRQ_*_READ
+	LOCK_USED_IN_IRQ_*_READ -> LOCK_ENABLED_IRQ_*_READ
+
+To fix this, we need to 1) change the calculation of exclusive_mask() so
+that READ bits are not dropped and 2) always call usage() in
+mark_lock_irq() to check usage deadlocks, even when the new usage of the
+lock is READ.
+
+Besides, adjust usage_match() and usage_acculumate() to recursive read
+lock changes.
+
+	Signed-off-by: Boqun Feng <boqun.feng@gmail.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20200807074238.1632519-12-boqun.feng@gmail.com
+(cherry picked from commit f08e3888574d490b31481eef6d84c61bedba7a47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/lockdep.c
+diff --cc kernel/locking/lockdep.c
+index 3abcaf4f62ca,6644974a4f5a..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -1939,22 -2100,72 +1939,83 @@@ check_redundant(struct held_lock *src, 
+  
+  #ifdef CONFIG_TRACE_IRQFLAGS
+  
+++<<<<<<< HEAD
+ +static inline int usage_accumulate(struct lock_list *entry, void *mask)
+++=======
++ /*
++  * Forwards and backwards subgraph searching, for the purposes of
++  * proving that two subgraphs can be connected by a new dependency
++  * without creating any illegal irq-safe -> irq-unsafe lock dependency.
++  *
++  * A irq safe->unsafe deadlock happens with the following conditions:
++  *
++  * 1) We have a strong dependency path A -> ... -> B
++  *
++  * 2) and we have ENABLED_IRQ usage of B and USED_IN_IRQ usage of A, therefore
++  *    irq can create a new dependency B -> A (consider the case that a holder
++  *    of B gets interrupted by an irq whose handler will try to acquire A).
++  *
++  * 3) the dependency circle A -> ... -> B -> A we get from 1) and 2) is a
++  *    strong circle:
++  *
++  *      For the usage bits of B:
++  *        a) if A -> B is -(*N)->, then B -> A could be any type, so any
++  *           ENABLED_IRQ usage suffices.
++  *        b) if A -> B is -(*R)->, then B -> A must be -(E*)->, so only
++  *           ENABLED_IRQ_*_READ usage suffices.
++  *
++  *      For the usage bits of A:
++  *        c) if A -> B is -(E*)->, then B -> A could be any type, so any
++  *           USED_IN_IRQ usage suffices.
++  *        d) if A -> B is -(S*)->, then B -> A must be -(*N)->, so only
++  *           USED_IN_IRQ_*_READ usage suffices.
++  */
++ 
++ /*
++  * There is a strong dependency path in the dependency graph: A -> B, and now
++  * we need to decide which usage bit of A should be accumulated to detect
++  * safe->unsafe bugs.
++  *
++  * Note that usage_accumulate() is used in backwards search, so ->only_xr
++  * stands for whether A -> B only has -(S*)-> (in this case ->only_xr is true).
++  *
++  * As above, if only_xr is false, which means A -> B has -(E*)-> dependency
++  * path, any usage of A should be considered. Otherwise, we should only
++  * consider _READ usage.
++  */
++ static inline bool usage_accumulate(struct lock_list *entry, void *mask)
+++>>>>>>> f08e3888574d (lockdep: Fix recursive read lock related safe->unsafe detection)
+  {
+- 	*(unsigned long *)mask |= entry->class->usage_mask;
++ 	if (!entry->only_xr)
++ 		*(unsigned long *)mask |= entry->class->usage_mask;
++ 	else /* Mask out _READ usage bits */
++ 		*(unsigned long *)mask |= (entry->class->usage_mask & LOCKF_IRQ);
+  
+ -	return false;
+ +	return 0;
+  }
+  
+  /*
+-  * Forwards and backwards subgraph searching, for the purposes of
+-  * proving that two subgraphs can be connected by a new dependency
+-  * without creating any illegal irq-safe -> irq-unsafe lock dependency.
++  * There is a strong dependency path in the dependency graph: A -> B, and now
++  * we need to decide which usage bit of B conflicts with the usage bits of A,
++  * i.e. which usage bit of B may introduce safe->unsafe deadlocks.
++  *
++  * As above, if only_xr is false, which means A -> B has -(*N)-> dependency
++  * path, any usage of B should be considered. Otherwise, we should only
++  * consider _READ usage.
+   */
+++<<<<<<< HEAD
+ +
+ +static inline int usage_match(struct lock_list *entry, void *mask)
+ +{
+ +	return entry->class->usage_mask & *(unsigned long *)mask;
+++=======
++ static inline bool usage_match(struct lock_list *entry, void *mask)
++ {
++ 	if (!entry->only_xr)
++ 		return !!(entry->class->usage_mask & *(unsigned long *)mask);
++ 	else /* Mask out _READ usage bits */
++ 		return !!((entry->class->usage_mask & LOCKF_IRQ) & *(unsigned long *)mask);
+++>>>>>>> f08e3888574d (lockdep: Fix recursive read lock related safe->unsafe detection)
+  }
+  
+  /*
+@@@ -2328,11 -2563,10 +2422,10 @@@ static int check_irq_usage(struct task_
+  	 * Step 1: gather all hard/soft IRQs usages backward in an
+  	 * accumulated usage mask.
+  	 */
+- 	this.parent = NULL;
+- 	this.class = hlock_class(prev);
++ 	bfs_init_rootb(&this, prev);
+  
+  	ret = __bfs_backwards(&this, &usage_mask, usage_accumulate, NULL);
+ -	if (bfs_error(ret)) {
+ +	if (ret < 0) {
+  		print_bfs_bug(ret);
+  		return 0;
+  	}
+@@@ -2347,11 -2581,10 +2440,10 @@@
+  	 */
+  	forward_mask = exclusive_mask(usage_mask);
+  
+- 	that.parent = NULL;
+- 	that.class = hlock_class(next);
++ 	bfs_init_root(&that, next);
+  
+  	ret = find_usage_forwards(&that, forward_mask, &target_entry1);
+ -	if (bfs_error(ret)) {
+ +	if (ret < 0) {
+  		print_bfs_bug(ret);
+  		return 0;
+  	}
+@@@ -3541,24 -3776,32 +3633,41 @@@ print_irq_inversion_bug(struct task_str
+   */
+  static int
+  check_usage_forwards(struct task_struct *curr, struct held_lock *this,
+- 		     enum lock_usage_bit bit, const char *irqclass)
++ 		     enum lock_usage_bit bit)
+  {
+ -	enum bfs_result ret;
+ +	int ret;
+  	struct lock_list root;
+++<<<<<<< HEAD
+ +	struct lock_list *uninitialized_var(target_entry);
+ +
+ +	root.parent = NULL;
+ +	root.class = hlock_class(this);
+ +	ret = find_usage_forwards(&root, lock_flag(bit), &target_entry);
+ +	if (ret < 0) {
+++=======
++ 	struct lock_list *target_entry;
++ 	enum lock_usage_bit read_bit = bit + LOCK_USAGE_READ_MASK;
++ 	unsigned usage_mask = lock_flag(bit) | lock_flag(read_bit);
++ 
++ 	bfs_init_root(&root, this);
++ 	ret = find_usage_forwards(&root, usage_mask, &target_entry);
++ 	if (bfs_error(ret)) {
+++>>>>>>> f08e3888574d (lockdep: Fix recursive read lock related safe->unsafe detection)
+  		print_bfs_bug(ret);
+  		return 0;
+  	}
+ -	if (ret == BFS_RNOMATCH)
+ -		return 1;
+ +	if (ret == 1)
+ +		return ret;
+  
+- 	print_irq_inversion_bug(curr, &root, target_entry,
+- 				this, 1, irqclass);
++ 	/* Check whether write or read usage is the match */
++ 	if (target_entry->class->usage_mask & lock_flag(bit)) {
++ 		print_irq_inversion_bug(curr, &root, target_entry,
++ 					this, 1, state_name(bit));
++ 	} else {
++ 		print_irq_inversion_bug(curr, &root, target_entry,
++ 					this, 1, state_name(read_bit));
++ 	}
++ 
+  	return 0;
+  }
+  
+@@@ -3568,24 -3811,32 +3677,41 @@@
+   */
+  static int
+  check_usage_backwards(struct task_struct *curr, struct held_lock *this,
+- 		      enum lock_usage_bit bit, const char *irqclass)
++ 		      enum lock_usage_bit bit)
+  {
+ -	enum bfs_result ret;
+ +	int ret;
+  	struct lock_list root;
+++<<<<<<< HEAD
+ +	struct lock_list *uninitialized_var(target_entry);
+ +
+ +	root.parent = NULL;
+ +	root.class = hlock_class(this);
+ +	ret = find_usage_backwards(&root, lock_flag(bit), &target_entry);
+ +	if (ret < 0) {
+++=======
++ 	struct lock_list *target_entry;
++ 	enum lock_usage_bit read_bit = bit + LOCK_USAGE_READ_MASK;
++ 	unsigned usage_mask = lock_flag(bit) | lock_flag(read_bit);
++ 
++ 	bfs_init_rootb(&root, this);
++ 	ret = find_usage_backwards(&root, usage_mask, &target_entry);
++ 	if (bfs_error(ret)) {
+++>>>>>>> f08e3888574d (lockdep: Fix recursive read lock related safe->unsafe detection)
+  		print_bfs_bug(ret);
+  		return 0;
+  	}
+ -	if (ret == BFS_RNOMATCH)
+ -		return 1;
+ +	if (ret == 1)
+ +		return ret;
+  
+- 	print_irq_inversion_bug(curr, &root, target_entry,
+- 				this, 0, irqclass);
++ 	/* Check whether write or read usage is the match */
++ 	if (target_entry->class->usage_mask & lock_flag(bit)) {
++ 		print_irq_inversion_bug(curr, &root, target_entry,
++ 					this, 0, state_name(bit));
++ 	} else {
++ 		print_irq_inversion_bug(curr, &root, target_entry,
++ 					this, 0, state_name(read_bit));
++ 	}
++ 
+  	return 0;
+  }
+  
+* Unmerged path kernel/locking/lockdep.c
