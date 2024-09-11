@@ -1,0 +1,183 @@
+selinux: avoid dereferencing the policy prior to initialization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Stephen Smalley <stephen.smalley.work@gmail.com>
+commit 37ea433c66070fcef09c6d118492c36299eb72ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/37ea433c.failed
+
+Certain SELinux security server functions (e.g. security_port_sid,
+called during bind) were not explicitly testing to see if SELinux
+has been initialized (i.e. initial policy loaded) and handling
+the no-policy-loaded case.  In the past this happened to work
+because the policydb was statically allocated and could always
+be accessed, but with the recent encapsulation of policy state
+and conversion to dynamic allocation, we can no longer access
+the policy state prior to initialization.  Add a test of
+!selinux_initialized(state) to all of the exported functions that
+were missing them and handle appropriately.
+
+Fixes: 461698026ffa ("selinux: encapsulate policy state, refactor policy load")
+	Reported-by: Naresh Kamboju <naresh.kamboju@linaro.org>
+	Tested-by: Andy Shevchenko <andy.shevchenko@gmail.com>
+	Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 37ea433c66070fcef09c6d118492c36299eb72ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/ss/services.c
+diff --cc security/selinux/ss/services.c
+index 45cded883bbc,a48fc1b337ba..000000000000
+--- a/security/selinux/ss/services.c
++++ b/security/selinux/ss/services.c
+@@@ -2807,9 -2840,15 +2840,15 @@@ int security_fs_use(struct selinux_stat
+  	struct sidtab *sidtab;
+  	int rc = 0;
+  	struct ocontext *c;
+ -	struct superblock_security_struct *sbsec = sb->s_security;
+ +	struct superblock_security_struct *sbsec = selinux_superblock(sb);
+  	const char *fstype = sb->s_type->name;
+  
++ 	if (!selinux_initialized(state)) {
++ 		sbsec->behavior = SECURITY_FS_USE_NONE;
++ 		sbsec->sid = SECINITSID_UNLABELED;
++ 		return 0;
++ 	}
++ 
+  	read_lock(&state->ss->policy_rwlock);
+  
+  	policydb = &state->ss->policy->policydb;
+@@@ -2902,65 -2941,80 +2941,85 @@@ err
+  
+  int security_set_bools(struct selinux_state *state, u32 len, int *values)
+  {
+ -	struct selinux_policy *newpolicy, *oldpolicy;
+ +	struct policydb *policydb;
+  	int rc;
+ -	u32 i, seqno = 0;
+ +	u32 i, lenp, seqno = 0;
+ +	char **changed_names;
+  
+++<<<<<<< HEAD
+ +	changed_names = kcalloc(len, sizeof(*changed_names), GFP_KERNEL);
+ +	if (!changed_names)
+++=======
++ 	if (!selinux_initialized(state))
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * NOTE: We do not need to take the policy read-lock
++ 	 * around the code below because other policy-modifying
++ 	 * operations are already excluded by selinuxfs via
++ 	 * fsi->mutex.
++ 	 */
++ 
++ 	/* Consistency check on number of booleans, should never fail */
++ 	if (WARN_ON(len != state->ss->policy->policydb.p_bools.nprim))
++ 		return -EINVAL;
++ 
++ 	newpolicy = kmemdup(state->ss->policy, sizeof(*newpolicy),
++ 			GFP_KERNEL);
++ 	if (!newpolicy)
+++>>>>>>> 37ea433c6607 (selinux: avoid dereferencing the policy prior to initialization)
+  		return -ENOMEM;
+  
+ -	oldpolicy = state->ss->policy;
+ +	write_lock_irq(&state->ss->policy_rwlock);
+  
+ -	/*
+ -	 * Deep copy only the parts of the policydb that might be
+ -	 * modified as a result of changing booleans.
+ -	 */
+ -	rc = cond_policydb_dup(&newpolicy->policydb, &oldpolicy->policydb);
+ -	if (rc) {
+ -		kfree(newpolicy);
+ -		return -ENOMEM;
+ -	}
+ +	policydb = &state->ss->policy->policydb;
+ +
+ +	rc = -EFAULT;
+ +	lenp = policydb->p_bools.nprim;
+ +	if (len != lenp)
+ +		goto out;
+  
+ -	/* Update the boolean states in the copy */
+  	for (i = 0; i < len; i++) {
+ -		int new_state = !!values[i];
+ -		int old_state = newpolicy->policydb.bool_val_to_struct[i]->state;
+ -
+ -		if (new_state != old_state) {
+ -			audit_log(audit_context(), GFP_ATOMIC,
+ -				AUDIT_MAC_CONFIG_CHANGE,
+ -				"bool=%s val=%d old_val=%d auid=%u ses=%u",
+ -				sym_name(&newpolicy->policydb, SYM_BOOLS, i),
+ -				new_state,
+ -				old_state,
+ -				from_kuid(&init_user_ns, audit_get_loginuid(current)),
+ -				audit_get_sessionid(current));
+ -			newpolicy->policydb.bool_val_to_struct[i]->state = new_state;
+ +		if (!!values[i] != policydb->bool_val_to_struct[i]->state) {
+ +			changed_names[i] = kstrdup(sym_name(policydb, SYM_BOOLS, i),
+ +						   GFP_ATOMIC);
+ +			if (!changed_names[i]) {
+ +				rc = -ENOMEM;
+ +				goto out;
+ +			}
+  		}
+ +		if (values[i])
+ +			policydb->bool_val_to_struct[i]->state = 1;
+ +		else
+ +			policydb->bool_val_to_struct[i]->state = 0;
+  	}
+  
+ -	/* Re-evaluate the conditional rules in the copy */
+ -	evaluate_cond_nodes(&newpolicy->policydb);
+ +	evaluate_cond_nodes(policydb);
+  
+ -	/* Install the new policy */
+ -	write_lock_irq(&state->ss->policy_rwlock);
+ -	state->ss->policy = newpolicy;
+  	seqno = ++state->ss->latest_granting;
+ +	rc = 0;
+ +out:
+  	write_unlock_irq(&state->ss->policy_rwlock);
+ -
+ -	/*
+ -	 * Free the conditional portions of the old policydb
+ -	 * that were copied for the new policy.
+ -	 */
+ -	cond_policydb_destroy_dup(&oldpolicy->policydb);
+ -
+ -	/* Free the old policy structure but not what it references. */
+ -	kfree(oldpolicy);
+ -
+ -	/* Notify others of the policy change */
+ -	selinux_notify_policy_change(state, seqno);
+ -	return 0;
+ +	if (!rc) {
+ +		for (i = 0; i < len; i++) {
+ +			if (changed_names[i]) {
+ +				audit_log(audit_context(), GFP_KERNEL,
+ +					AUDIT_MAC_CONFIG_CHANGE,
+ +					"bool=%s val=%d old_val=%d auid=%u ses=%u",
+ +					changed_names[i], !!values[i], !values[i],
+ +					from_kuid(&init_user_ns, audit_get_loginuid(current)),
+ +					audit_get_sessionid(current));
+ +			}
+ +		}
+ +		avc_ss_reset(state->avc, seqno);
+ +		selnl_notify_policyload(seqno);
+ +		selinux_status_update_policyload(state, seqno);
+ +		selinux_xfrm_notify_policyload();
+ +	}
+ +	for (i = 0; i < len; i++)
+ +		kfree(changed_names[i]);
+ +	kfree(changed_names);
+ +	return rc;
+  }
+  
+  int security_get_bool_value(struct selinux_state *state,
+* Unmerged path security/selinux/ss/services.c
