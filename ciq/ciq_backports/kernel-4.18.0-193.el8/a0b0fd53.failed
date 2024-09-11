@@ -1,0 +1,122 @@
+locking/lockdep: Free lock classes that are no longer in use
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Bart Van Assche <bvanassche@acm.org>
+commit a0b0fd53e1e67639b303b15939b9c653dbe7a8c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a0b0fd53.failed
+
+Instead of leaving lock classes that are no longer in use in the
+lock_classes array, reuse entries from that array that are no longer in
+use. Maintain a linked list of free lock classes with list head
+'free_lock_class'. Only add freed lock classes to the free_lock_classes
+list after a grace period to avoid that a lock_classes[] element would
+be reused while an RCU reader is accessing it. Since the lockdep
+selftests run in a context where sleeping is not allowed and since the
+selftests require that lock resetting/zapping works with debug_locks
+off, make the behavior of lockdep_free_key_range() and
+lockdep_reset_lock() depend on whether or not these are called from
+the context of the lockdep selftests.
+
+Thanks to Peter for having shown how to modify get_pending_free()
+such that that function does not have to sleep.
+
+	Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Johannes Berg <johannes@sipsolutions.net>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Waiman Long <longman@redhat.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: johannes.berg@intel.com
+	Cc: tj@kernel.org
+Link: https://lkml.kernel.org/r/20190214230058.196511-12-bvanassche@acm.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit a0b0fd53e1e67639b303b15939b9c653dbe7a8c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/lockdep.c
+diff --cc kernel/locking/lockdep.c
+index ca1c46610d39,8ecf355dd163..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -4295,7 -4553,34 +4567,38 @@@ out_irq
+  	raw_local_irq_restore(flags);
+  }
+  
+++<<<<<<< HEAD
+ +void __init lockdep_info(void)
+++=======
++ /*
++  * Reset a lock. Does not sleep. Ignores debug_locks. Must only be used by the
++  * lockdep selftests.
++  */
++ static void lockdep_reset_lock_imm(struct lockdep_map *lock)
++ {
++ 	struct pending_free *pf = delayed_free.pf;
++ 	unsigned long flags;
++ 
++ 	raw_local_irq_save(flags);
++ 	arch_spin_lock(&lockdep_lock);
++ 	__lockdep_reset_lock(pf, lock);
++ 	__free_zapped_classes(pf);
++ 	arch_spin_unlock(&lockdep_lock);
++ 	raw_local_irq_restore(flags);
++ }
++ 
++ void lockdep_reset_lock(struct lockdep_map *lock)
++ {
++ 	init_data_structures_once();
++ 
++ 	if (inside_selftest())
++ 		lockdep_reset_lock_imm(lock);
++ 	else
++ 		lockdep_reset_lock_reg(lock);
++ }
++ 
++ void __init lockdep_init(void)
+++>>>>>>> a0b0fd53e1e6 (locking/lockdep: Free lock classes that are no longer in use)
+  {
+  	printk("Lock dependency validator: Copyright (c) 2006 Red Hat, Inc., Ingo Molnar\n");
+  
+diff --git a/include/linux/lockdep.h b/include/linux/lockdep.h
+index dad038683702..e9ff34977291 100644
+--- a/include/linux/lockdep.h
++++ b/include/linux/lockdep.h
+@@ -63,7 +63,8 @@ extern struct lock_class_key __lockdep_no_validate__;
+ #define LOCKSTAT_POINTS		4
+ 
+ /*
+- * The lock-class itself:
++ * The lock-class itself. The order of the structure members matters.
++ * reinit_class() zeroes the key member and all subsequent members.
+  */
+ struct lock_class {
+ 	/*
+@@ -72,7 +73,9 @@ struct lock_class {
+ 	struct hlist_node		hash_entry;
+ 
+ 	/*
+-	 * global list of all lock-classes:
++	 * Entry in all_lock_classes when in use. Entry in free_lock_classes
++	 * when not in use. Instances that are being freed are on one of the
++	 * zapped_classes lists.
+ 	 */
+ 	struct list_head		lock_entry;
+ 
+@@ -104,7 +107,7 @@ struct lock_class {
+ 	unsigned long			contention_point[LOCKSTAT_POINTS];
+ 	unsigned long			contending_point[LOCKSTAT_POINTS];
+ #endif
+-};
++} __no_randomize_layout;
+ 
+ #ifdef CONFIG_LOCK_STAT
+ struct lock_time {
+* Unmerged path kernel/locking/lockdep.c
