@@ -1,0 +1,164 @@
+NFSv4.1: Don't rebind to the same source port when reconnecting to the server
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit e6237b6feb37582fbd6bd7a8336d1256a6b4b4f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e6237b6f.failed
+
+NFSv2, v3 and NFSv4 servers often have duplicate replay caches that look
+at the source port when deciding whether or not an RPC call is a replay
+of a previous call. This requires clients to perform strange TCP gymnastics
+in order to ensure that when they reconnect to the server, they bind
+to the same source port.
+
+NFSv4.1 and NFSv4.2 have sessions that provide proper replay semantics,
+that do not look at the source port of the connection. This patch therefore
+ensures they can ignore the rebind requirement.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit e6237b6feb37582fbd6bd7a8336d1256a6b4b4f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/client.c
+diff --cc fs/nfs/client.c
+index d0d6b507eb52,02110a30a49e..000000000000
+--- a/fs/nfs/client.c
++++ b/fs/nfs/client.c
+@@@ -673,6 -671,8 +675,11 @@@ static int nfs_init_server(struct nfs_s
+  		.net = data->net,
+  		.timeparms = &timeparms,
+  		.cred = server->cred,
+++<<<<<<< HEAD
+++=======
++ 		.nconnect = data->nfs_server.nconnect,
++ 		.init_flags = (1UL << NFS_CS_REUSEPORT),
+++>>>>>>> e6237b6feb37 (NFSv4.1: Don't rebind to the same source port when reconnecting to the server)
+  	};
+  	struct nfs_client *clp;
+  	int error;
+diff --git a/fs/lockd/host.c b/fs/lockd/host.c
+index af2426100183..3ccbe0604a1c 100644
+--- a/fs/lockd/host.c
++++ b/fs/lockd/host.c
+@@ -464,7 +464,8 @@ nlm_bind_host(struct nlm_host *host)
+ 			.version	= host->h_version,
+ 			.authflavor	= RPC_AUTH_UNIX,
+ 			.flags		= (RPC_CLNT_CREATE_NOPING |
+-					   RPC_CLNT_CREATE_AUTOBIND),
++					   RPC_CLNT_CREATE_AUTOBIND |
++					   RPC_CLNT_CREATE_REUSEPORT),
+ 			.cred		= host->h_cred,
+ 		};
+ 
+* Unmerged path fs/nfs/client.c
+diff --git a/fs/nfs/nfs4client.c b/fs/nfs/nfs4client.c
+index 43ea8e59787e..c78f18a395fd 100644
+--- a/fs/nfs/nfs4client.c
++++ b/fs/nfs/nfs4client.c
+@@ -878,8 +878,11 @@ static int nfs4_set_client(struct nfs_server *server,
+ 	};
+ 	struct nfs_client *clp;
+ 
+-	if (minorversion > 0 && proto == XPRT_TRANSPORT_TCP)
++	if (minorversion == 0)
++		__set_bit(NFS_CS_REUSEPORT, &cl_init.init_flags);
++	else if (proto == XPRT_TRANSPORT_TCP)
+ 		cl_init.nconnect = nconnect;
++
+ 	if (server->flags & NFS_MOUNT_NORESVPORT)
+ 		__set_bit(NFS_CS_NORESVPORT, &cl_init.init_flags);
+ 	if (server->options & NFS_OPTION_MIGRATION)
+diff --git a/include/linux/nfs_fs_sb.h b/include/linux/nfs_fs_sb.h
+index 69e80cef5a81..df61ff8981e8 100644
+--- a/include/linux/nfs_fs_sb.h
++++ b/include/linux/nfs_fs_sb.h
+@@ -47,6 +47,7 @@ struct nfs_client {
+ #define NFS_CS_TSM_POSSIBLE	5		/* - Maybe state migration */
+ #define NFS_CS_NOPING		6		/* - don't ping on connect */
+ #define NFS_CS_DS		7		/* - Server is a DS */
++#define NFS_CS_REUSEPORT	8		/* - reuse src port on reconnect */
+ 	struct sockaddr_storage	cl_addr;	/* server identifier */
+ 	size_t			cl_addrlen;
+ 	char *			cl_hostname;	/* hostname of server */
+diff --git a/include/linux/sunrpc/clnt.h b/include/linux/sunrpc/clnt.h
+index cf2fdcec90fa..7e45668522c9 100644
+--- a/include/linux/sunrpc/clnt.h
++++ b/include/linux/sunrpc/clnt.h
+@@ -149,6 +149,7 @@ struct rpc_add_xprt_test {
+ #define RPC_CLNT_CREATE_NO_IDLE_TIMEOUT	(1UL << 8)
+ #define RPC_CLNT_CREATE_NO_RETRANS_TIMEOUT	(1UL << 9)
+ #define RPC_CLNT_CREATE_SOFTERR		(1UL << 10)
++#define RPC_CLNT_CREATE_REUSEPORT	(1UL << 11)
+ 
+ struct rpc_clnt *rpc_create(struct rpc_create_args *args);
+ struct rpc_clnt	*rpc_bind_new_program(struct rpc_clnt *,
+diff --git a/include/linux/sunrpc/xprt.h b/include/linux/sunrpc/xprt.h
+index d783e15ba898..ccd35cf4fc41 100644
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@ -207,7 +207,8 @@ struct rpc_xprt {
+ 	unsigned int		min_reqs;	/* min number of slots */
+ 	unsigned int		num_reqs;	/* total slots */
+ 	unsigned long		state;		/* transport state */
+-	unsigned char		resvport   : 1; /* use a reserved port */
++	unsigned char		resvport   : 1,	/* use a reserved port */
++				reuseport  : 1; /* reuse port on reconnect */
+ 	atomic_t		swapper;	/* we're swapping over this
+ 						   transport */
+ 	unsigned int		bind_index;	/* bind function index */
+diff --git a/net/sunrpc/clnt.c b/net/sunrpc/clnt.c
+index 5ef3bbff36c5..0a438f8fbada 100644
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@ -590,6 +590,9 @@ struct rpc_clnt *rpc_create(struct rpc_create_args *args)
+ 	xprt->resvport = 1;
+ 	if (args->flags & RPC_CLNT_CREATE_NONPRIVPORT)
+ 		xprt->resvport = 0;
++	xprt->reuseport = 0;
++	if (args->flags & RPC_CLNT_CREATE_REUSEPORT)
++		xprt->reuseport = 1;
+ 
+ 	clnt = rpc_create_xprt(args, xprt);
+ 	if (IS_ERR(clnt) || args->nconnect <= 1)
+@@ -2884,7 +2887,7 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
+ 	struct rpc_xprt *xprt;
+ 	unsigned long connect_timeout;
+ 	unsigned long reconnect_timeout;
+-	unsigned char resvport;
++	unsigned char resvport, reuseport;
+ 	int ret = 0;
+ 
+ 	rcu_read_lock();
+@@ -2896,6 +2899,7 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
+ 		return -EAGAIN;
+ 	}
+ 	resvport = xprt->resvport;
++	reuseport = xprt->reuseport;
+ 	connect_timeout = xprt->connect_timeout;
+ 	reconnect_timeout = xprt->max_reconnect_timeout;
+ 	rcu_read_unlock();
+@@ -2906,6 +2910,7 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
+ 		goto out_put_switch;
+ 	}
+ 	xprt->resvport = resvport;
++	xprt->reuseport = reuseport;
+ 	if (xprt->ops->set_connect_timeout != NULL)
+ 		xprt->ops->set_connect_timeout(xprt,
+ 				connect_timeout,
+diff --git a/net/sunrpc/xprtsock.c b/net/sunrpc/xprtsock.c
+index 8cf4e0efd8a9..1f7273661caa 100644
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@ -1753,7 +1753,7 @@ static void xs_set_port(struct rpc_xprt *xprt, unsigned short port)
+ 
+ static void xs_set_srcport(struct sock_xprt *transport, struct socket *sock)
+ {
+-	if (transport->srcport == 0)
++	if (transport->srcport == 0 && transport->xprt.reuseport)
+ 		transport->srcport = xs_sock_getport(sock);
+ }
+ 
