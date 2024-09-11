@@ -1020,6 +1020,7 @@ void phy_attached_info(struct phy_device *phydev);
 
 /* Clause 22 PHY */
 int genphy_config_init(struct phy_device *phydev);
+int genphy_read_abilities(struct phy_device *phydev);
 int genphy_setup_forced(struct phy_device *phydev);
 int genphy_restart_aneg(struct phy_device *phydev);
 int genphy_config_aneg(struct phy_device *phydev);
