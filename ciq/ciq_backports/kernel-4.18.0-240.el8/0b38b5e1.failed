@@ -1,0 +1,285 @@
+s390: prevent leaking kernel address in BEAR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sven Schnelle <svens@linux.ibm.com>
+commit 0b38b5e1d0e2f361e418e05c179db05bb688bbd6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0b38b5e1.failed
+
+When userspace executes a syscall or gets interrupted,
+BEAR contains a kernel address when returning to userspace.
+This make it pretty easy to figure out where the kernel is
+mapped even with KASLR enabled. To fix this, add lpswe to
+lowcore and always execute it there, so userspace sees only
+the lowcore address of lpswe. For this we have to extend
+both critical_cleanup and the SWITCH_ASYNC macro to also check
+for lpswe addresses in lowcore.
+
+Fixes: b2d24b97b2a9 ("s390/kernel: add support for kernel address space layout randomization (KASLR)")
+	Cc: <stable@vger.kernel.org> # v5.2+
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Signed-off-by: Sven Schnelle <svens@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 0b38b5e1d0e2f361e418e05c179db05bb688bbd6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/entry.S
+diff --cc arch/s390/kernel/entry.S
+index b97e4c98e2bb,3ae64914bd14..000000000000
+--- a/arch/s390/kernel/entry.S
++++ b/arch/s390/kernel/entry.S
+@@@ -93,28 -93,51 +93,40 @@@ _LPP_OFFSET	= __LC_LP
+  #endif
+  	.endm
+  
+ -	.macro	CHECK_VMAP_STACK savearea,oklabel
+ -#ifdef CONFIG_VMAP_STACK
+ -	lgr	%r14,%r15
+ -	nill	%r14,0x10000 - STACK_SIZE
+ -	oill	%r14,STACK_INIT
+ -	clg	%r14,__LC_KERNEL_STACK
+ -	je	\oklabel
+ -	clg	%r14,__LC_ASYNC_STACK
+ -	je	\oklabel
+ -	clg	%r14,__LC_NODAT_STACK
+ -	je	\oklabel
+ -	clg	%r14,__LC_RESTART_STACK
+ -	je	\oklabel
+ -	lghi	%r14,\savearea
+ -	j	stack_overflow
+ -#else
+ -	j	\oklabel
+ -#endif
+ -	.endm
+ -
+  	.macro	SWITCH_ASYNC savearea,timer
+  	tmhh	%r8,0x0001		# interrupting from user ?
+- 	jnz	1f
++ 	jnz	2f
+  	lgr	%r14,%r9
++ 	cghi	%r14,__LC_RETURN_LPSWE
++ 	je	0f
+  	slg	%r14,BASED(.Lcritical_start)
+  	clg	%r14,BASED(.Lcritical_length)
+- 	jhe	0f
++ 	jhe	1f
++ 0:
+  	lghi	%r11,\savearea		# inside critical section, do cleanup
+  	brasl	%r14,cleanup_critical
+  	tmhh	%r8,0x0001		# retest problem state after cleanup
+++<<<<<<< HEAD
+ +	jnz	1f
+ +0:	lg	%r14,__LC_ASYNC_STACK	# are we already on the async stack?
+ +	slgr	%r14,%r15
+ +	srag	%r14,%r14,STACK_SHIFT
+ +	jnz	2f
+ +	CHECK_STACK 1<<STACK_SHIFT,\savearea
+++=======
++ 	jnz	2f
++ 1:	lg	%r14,__LC_ASYNC_STACK	# are we already on the target stack?
++ 	slgr	%r14,%r15
++ 	srag	%r14,%r14,STACK_SHIFT
++ 	jnz	3f
++ 	CHECK_STACK \savearea
+++>>>>>>> 0b38b5e1d0e2 (s390: prevent leaking kernel address in BEAR)
+  	aghi	%r15,-(STACK_FRAME_OVERHEAD + __PT_SIZE)
+- 	j	3f
+- 1:	UPDATE_VTIME %r14,%r15,\timer
++ 	j	4f
++ 2:	UPDATE_VTIME %r14,%r15,\timer
+  	BPENTER __TI_flags(%r12),_TIF_ISOLATE_BP
+- 2:	lg	%r15,__LC_ASYNC_STACK	# load async stack
+- 3:	la	%r11,STACK_FRAME_OVERHEAD(%r15)
++ 3:	lg	%r15,__LC_ASYNC_STACK	# load async stack
++ 4:	la	%r11,STACK_FRAME_OVERHEAD(%r15)
+  	.endm
+  
+  	.macro UPDATE_VTIME w1,w2,enter_timer
+@@@ -596,14 -636,15 +615,22 @@@ ENTRY(pgm_check_handler
+  	larl	%r9,sie_exit			# skip forward to sie_exit
+  	lghi	%r11,_PIF_GUEST_FAULT
+  #endif
+- 0:	tmhh	%r8,0x4000		# PER bit set in old PSW ?
+- 	jnz	1f			# -> enabled, can't be a double fault
++ 1:	tmhh	%r8,0x4000		# PER bit set in old PSW ?
++ 	jnz	2f			# -> enabled, can't be a double fault
+  	tm	__LC_PGM_ILC+3,0x80	# check for per exception
+  	jnz	.Lpgm_svcper		# -> single stepped svc
+++<<<<<<< HEAD
+ +1:	CHECK_STACK STACK_SIZE,__LC_SAVE_AREA_SYNC
+ +	aghi	%r15,-(STACK_FRAME_OVERHEAD + __PT_SIZE)
+ +	j	4f
+ +2:	UPDATE_VTIME %r14,%r15,__LC_SYNC_ENTER_TIMER
+++=======
++ 2:	CHECK_STACK __LC_SAVE_AREA_SYNC
++ 	aghi	%r15,-(STACK_FRAME_OVERHEAD + __PT_SIZE)
++ 	# CHECK_VMAP_STACK branches to stack_overflow or 5f
++ 	CHECK_VMAP_STACK __LC_SAVE_AREA_SYNC,5f
++ 3:	UPDATE_VTIME %r14,%r15,__LC_SYNC_ENTER_TIMER
+++>>>>>>> 0b38b5e1d0e2 (s390: prevent leaking kernel address in BEAR)
+  	BPENTER __TI_flags(%r12),_TIF_ISOLATE_BP
+  	lg	%r15,__LC_KERNEL_STACK
+  	lgr	%r14,%r12
+@@@ -1179,12 -1224,13 +1206,12 @@@ ENTRY(mcck_int_handler
+  	stpt	__LC_EXIT_TIMER
+  	mvc	__VDSO_ECTG_BASE(16,%r14),__LC_EXIT_TIMER
+  0:	lmg	%r11,%r15,__PT_R11(%r11)
+- 	lpswe	__LC_RETURN_MCCK_PSW
++ 	b	__LC_RETURN_MCCK_LPSWE
+  
+  .Lmcck_panic:
+ -	lg	%r15,__LC_NODAT_STACK
+ +	lg	%r15,__LC_PANIC_STACK
+  	la	%r11,STACK_FRAME_OVERHEAD(%r15)
+  	j	.Lmcck_skip
+ -ENDPROC(mcck_int_handler)
+  
+  #
+  # PSW restart interrupt handler
+@@@ -1232,9 -1277,12 +1259,15 @@@ stack_overflow
+  	xc	__SF_BACKCHAIN(8,%r15),__SF_BACKCHAIN(%r15)
+  	lgr	%r2,%r11		# pass pointer to pt_regs
+  	jg	kernel_stack_overflow
+ -ENDPROC(stack_overflow)
+  #endif
+  
+++<<<<<<< HEAD
+ +cleanup_critical:
+++=======
++ ENTRY(cleanup_critical)
++ 	cghi	%r9,__LC_RETURN_LPSWE
++ 	je	.Lcleanup_lpswe
+++>>>>>>> 0b38b5e1d0e2 (s390: prevent leaking kernel address in BEAR)
+  #if IS_ENABLED(CONFIG_KVM)
+  	clg	%r9,BASED(.Lcleanup_table_sie)	# .Lsie_gmap
+  	jl	0f
+diff --git a/arch/s390/include/asm/lowcore.h b/arch/s390/include/asm/lowcore.h
+index 9b32d0c2ad2d..3731c59c9a13 100644
+--- a/arch/s390/include/asm/lowcore.h
++++ b/arch/s390/include/asm/lowcore.h
+@@ -141,7 +141,9 @@ struct lowcore {
+ 
+ 	/* br %r1 trampoline */
+ 	__u16	br_r1_trampoline;		/* 0x0400 */
+-	__u8	pad_0x0402[0x0e00-0x0402];	/* 0x0402 */
++	__u32	return_lpswe;			/* 0x0402 */
++	__u32	return_mcck_lpswe;		/* 0x0406 */
++	__u8	pad_0x040a[0x0e00-0x040a];	/* 0x040a */
+ 
+ 	/*
+ 	 * 0xe00 contains the address of the IPL Parameter Information
+diff --git a/arch/s390/include/asm/processor.h b/arch/s390/include/asm/processor.h
+index 97f8c20d24fc..e58c88cf9eb0 100644
+--- a/arch/s390/include/asm/processor.h
++++ b/arch/s390/include/asm/processor.h
+@@ -194,6 +194,7 @@ struct stack_frame {
+ #define INIT_THREAD {							\
+ 	.ksp = sizeof(init_stack) + (unsigned long) &init_stack,	\
+ 	.fpu.regs = (void *) init_task.thread.fpu.fprs,			\
++	.last_break = 1,						\
+ }
+ 
+ /*
+diff --git a/arch/s390/include/asm/setup.h b/arch/s390/include/asm/setup.h
+index 6c9beb0c2218..1ddeda9dc190 100644
+--- a/arch/s390/include/asm/setup.h
++++ b/arch/s390/include/asm/setup.h
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/const.h>
+ #include <uapi/asm/setup.h>
++#include <linux/build_bug.h>
+ 
+ #define EP_OFFSET		0x10008
+ #define EP_STRING		"S390EP"
+@@ -154,6 +155,12 @@ static inline unsigned long kaslr_offset(void)
+ 	return __kaslr_offset;
+ }
+ 
++static inline u32 gen_lpswe(unsigned long addr)
++{
++	BUILD_BUG_ON(addr > 0xfff);
++	return 0xb2b20000 | addr;
++}
++
+ #else /* __ASSEMBLY__ */
+ 
+ #define IPL_DEVICE	(IPL_DEVICE_OFFSET)
+diff --git a/arch/s390/kernel/asm-offsets.c b/arch/s390/kernel/asm-offsets.c
+index 11aea745a2a6..6a29ed24d99f 100644
+--- a/arch/s390/kernel/asm-offsets.c
++++ b/arch/s390/kernel/asm-offsets.c
+@@ -132,6 +132,8 @@ int main(void)
+ 	OFFSET(__LC_EXT_DAMAGE_CODE, lowcore, external_damage_code);
+ 	OFFSET(__LC_MCCK_FAIL_STOR_ADDR, lowcore, failing_storage_address);
+ 	OFFSET(__LC_LAST_BREAK, lowcore, breaking_event_addr);
++	OFFSET(__LC_RETURN_LPSWE, lowcore, return_lpswe);
++	OFFSET(__LC_RETURN_MCCK_LPSWE, lowcore, return_mcck_lpswe);
+ 	OFFSET(__LC_RST_OLD_PSW, lowcore, restart_old_psw);
+ 	OFFSET(__LC_EXT_OLD_PSW, lowcore, external_old_psw);
+ 	OFFSET(__LC_SVC_OLD_PSW, lowcore, svc_old_psw);
+* Unmerged path arch/s390/kernel/entry.S
+diff --git a/arch/s390/kernel/process.c b/arch/s390/kernel/process.c
+index f3526377b87e..b59c7492ee71 100644
+--- a/arch/s390/kernel/process.c
++++ b/arch/s390/kernel/process.c
+@@ -104,6 +104,7 @@ int copy_thread_tls(unsigned long clone_flags, unsigned long new_stackp,
+ 	p->thread.system_timer = 0;
+ 	p->thread.hardirq_timer = 0;
+ 	p->thread.softirq_timer = 0;
++	p->thread.last_break = 1;
+ 
+ 	frame->sf.back_chain = 0;
+ 	/* new return point is ret_from_fork */
+diff --git a/arch/s390/kernel/setup.c b/arch/s390/kernel/setup.c
+index d5516ab24db2..5e9dd6b6aaad 100644
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -74,6 +74,7 @@
+ #include <asm/nospec-branch.h>
+ #include <asm/mem_detect.h>
+ #include <asm/uv.h>
++#include <asm/asm-offsets.h>
+ #include "entry.h"
+ 
+ /*
+@@ -391,6 +392,8 @@ static void __init setup_lowcore_dat_off(void)
+ 	arch_spin_lock_setup(0);
+ #endif
+ 	lc->br_r1_trampoline = 0x07f1;	/* br %r1 */
++	lc->return_lpswe = gen_lpswe(__LC_RETURN_PSW);
++	lc->return_mcck_lpswe = gen_lpswe(__LC_RETURN_MCCK_PSW);
+ 
+ 	set_prefix((u32)(unsigned long) lc);
+ 	lowcore_ptr[0] = lc;
+diff --git a/arch/s390/kernel/smp.c b/arch/s390/kernel/smp.c
+index 04f7fa77a1f6..4ade91d9d688 100644
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@ -214,6 +214,8 @@ static int pcpu_alloc_lowcore(struct pcpu *pcpu, int cpu)
+ 	lc->spinlock_lockval = arch_spin_lockval(cpu);
+ 	lc->spinlock_index = 0;
+ 	lc->br_r1_trampoline = 0x07f1;	/* br %r1 */
++	lc->return_lpswe = gen_lpswe(__LC_RETURN_PSW);
++	lc->return_mcck_lpswe = gen_lpswe(__LC_RETURN_MCCK_PSW);
+ 	if (nmi_alloc_per_cpu(lc))
+ 		goto out;
+ 	if (vdso_alloc_per_cpu(lc))
+diff --git a/arch/s390/mm/vmem.c b/arch/s390/mm/vmem.c
+index 1d460c2f5bfb..0e59bbb70ccf 100644
+--- a/arch/s390/mm/vmem.c
++++ b/arch/s390/mm/vmem.c
+@@ -416,6 +416,10 @@ void __init vmem_map_init(void)
+ 		     SET_MEMORY_RO | SET_MEMORY_X);
+ 	__set_memory(__stext_dma, (__etext_dma - __stext_dma) >> PAGE_SHIFT,
+ 		     SET_MEMORY_RO | SET_MEMORY_X);
++
++	/* we need lowcore executable for our LPSWE instructions */
++	set_memory_x(0, 1);
++
+ 	pr_info("Write protected kernel read-only data: %luk\n",
+ 		(unsigned long)(__end_rodata - _stext) >> 10);
+ }
