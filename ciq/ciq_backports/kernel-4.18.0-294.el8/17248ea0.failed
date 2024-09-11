@@ -1,0 +1,206 @@
+s390: fix __EMIT_BUG() macro
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Sven Schnelle <svens@linux.ibm.com>
+commit 17248ea0367465f4aaef728f6af661ed38e38cf1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/17248ea0.failed
+
+Setting a kprobe on getname_flags() failed:
+
+$ echo 'p:tmr1 getname_flags +0(%r2):ustring' > kprobe_events
+-bash: echo: write error: Invalid argument
+
+Debugging the kprobes code showed that the address of
+getname_flags() is contained in the __bug_table. Kprobes
+doesn't allow to set probes at BUG() locations.
+
+$ objdump -j  __bug_table -x build/fs/namei.o
+[..]
+0000000000000108 R_390_PC32        .text+0x00000000000075a8
+000000000000010c R_390_PC32        .L223+0x0000000000000004
+
+I was expecting getname_flags() to start with a BUG(), but:
+
+7598:       e3 20 10 00 00 04       lg      %r2,0(%r1)
+759e:       c0 f4 00 00 00 00       jg      759e <putname+0x7e>
+75a0: R_390_PLT32DBL    kmem_cache_free+0x2
+75a4:       a7 f4 00 01             j       75a6 <putname+0x86>
+
+00000000000075a8 <getname_flags>:
+75a8:       c0 04 00 00 00 00       brcl    0,75a8 <getname_flags>
+75ae:       eb 6f f0 48 00 24       stmg    %r6,%r15,72(%r15)
+75b4:       b9 04 00 ef             lgr     %r14,%r15
+75b8:       e3 f0 ff a8 ff 71       lay     %r15,-88(%r15)
+
+So the BUG() is actually the last opcode of the previous function.
+Fix this by switching to using the MONITOR CALL (MC) instruction,
+and set the entry in __bug_table to the beginning of that MC.
+
+	Reviewed-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Signed-off-by: Sven Schnelle <svens@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 17248ea0367465f4aaef728f6af661ed38e38cf1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/bug.h
+diff --cc arch/s390/include/asm/bug.h
+index 713fc9735ffb,7725f8006fdf..000000000000
+--- a/arch/s390/include/asm/bug.h
++++ b/arch/s390/include/asm/bug.h
+@@@ -9,16 -9,15 +9,21 @@@
+  #ifdef CONFIG_DEBUG_BUGVERBOSE
+  
+  #define __EMIT_BUG(x) do {					\
+++<<<<<<< HEAD
+ +	asm volatile(						\
+ +		"0:	j	0b+2\n"				\
+ +		"1:\n"						\
+++=======
++ 	asm_inline volatile(					\
++ 		"0:	mc	0,0\n"				\
+++>>>>>>> 17248ea03674 (s390: fix __EMIT_BUG() macro)
+  		".section .rodata.str,\"aMS\",@progbits,1\n"	\
+- 		"2:	.asciz	\""__FILE__"\"\n"		\
++ 		"1:	.asciz	\""__FILE__"\"\n"		\
+  		".previous\n"					\
+  		".section __bug_table,\"awM\",@progbits,%2\n"	\
+- 		"3:	.long	1b-3b,2b-3b\n"			\
++ 		"2:	.long	0b-2b,1b-2b\n"			\
+  		"	.short	%0,%1\n"			\
+- 		"	.org	3b+%2\n"			\
++ 		"	.org	2b+%2\n"			\
+  		".previous\n"					\
+  		: : "i" (__LINE__),				\
+  		    "i" (x),					\
+@@@ -28,13 -27,12 +33,18 @@@
+  #else /* CONFIG_DEBUG_BUGVERBOSE */
+  
+  #define __EMIT_BUG(x) do {					\
+++<<<<<<< HEAD
+ +	asm volatile(						\
+ +		"0:	j	0b+2\n"				\
+ +		"1:\n"						\
+++=======
++ 	asm_inline volatile(					\
++ 		"0:	mc	0,0\n"				\
+++>>>>>>> 17248ea03674 (s390: fix __EMIT_BUG() macro)
+  		".section __bug_table,\"awM\",@progbits,%1\n"	\
+- 		"2:	.long	1b-2b\n"			\
++ 		"1:	.long	0b-1b\n"			\
+  		"	.short	%0\n"				\
+- 		"	.org	2b+%1\n"			\
++ 		"	.org	1b+%1\n"			\
+  		".previous\n"					\
+  		: : "i" (x),					\
+  		    "i" (sizeof(struct bug_entry)));		\
+diff --git a/arch/s390/boot/head.S b/arch/s390/boot/head.S
+index 028aab03a9e7..732bddaa7ec5 100644
+--- a/arch/s390/boot/head.S
++++ b/arch/s390/boot/head.S
+@@ -327,7 +327,7 @@ ENTRY(startup_kdump)
+ 	.quad	.Lduct			# cr5: primary-aste origin
+ 	.quad	0			# cr6:	I/O interrupts
+ 	.quad	0			# cr7:	secondary space segment table
+-	.quad	0			# cr8:	access registers translation
++	.quad	0x0000000000008000	# cr8:	access registers translation
+ 	.quad	0			# cr9:	tracing off
+ 	.quad	0			# cr10: tracing off
+ 	.quad	0			# cr11: tracing off
+* Unmerged path arch/s390/include/asm/bug.h
+diff --git a/arch/s390/kernel/entry.h b/arch/s390/kernel/entry.h
+index 5fcb23f092e0..49e0bb0e5bee 100644
+--- a/arch/s390/kernel/entry.h
++++ b/arch/s390/kernel/entry.h
+@@ -47,6 +47,7 @@ void specification_exception(struct pt_regs *regs);
+ void transaction_exception(struct pt_regs *regs);
+ void translation_exception(struct pt_regs *regs);
+ void vector_exception(struct pt_regs *regs);
++void monitor_event_exception(struct pt_regs *regs);
+ 
+ void do_per_trap(struct pt_regs *regs);
+ void do_report_trap(struct pt_regs *regs, int si_signo, int si_code, char *str);
+diff --git a/arch/s390/kernel/pgm_check.S b/arch/s390/kernel/pgm_check.S
+index 27ac4f324c70..2c27907a5ffc 100644
+--- a/arch/s390/kernel/pgm_check.S
++++ b/arch/s390/kernel/pgm_check.S
+@@ -81,7 +81,7 @@ PGM_CHECK_DEFAULT			/* 3c */
+ PGM_CHECK(do_secure_storage_access)	/* 3d */
+ PGM_CHECK(do_non_secure_storage_access)	/* 3e */
+ PGM_CHECK_DEFAULT			/* 3f */
+-PGM_CHECK_DEFAULT			/* 40 */
++PGM_CHECK(monitor_event_exception)	/* 40 */
+ PGM_CHECK_DEFAULT			/* 41 */
+ PGM_CHECK_DEFAULT			/* 42 */
+ PGM_CHECK_DEFAULT			/* 43 */
+diff --git a/arch/s390/kernel/traps.c b/arch/s390/kernel/traps.c
+index 82e81a9f7112..f0dc63f3b8c9 100644
+--- a/arch/s390/kernel/traps.c
++++ b/arch/s390/kernel/traps.c
+@@ -53,11 +53,6 @@ void do_report_trap(struct pt_regs *regs, int si_signo, int si_code, char *str)
+                 if (fixup)
+ 			regs->psw.addr = extable_fixup(fixup);
+ 		else {
+-			enum bug_trap_type btt;
+-
+-			btt = report_bug(regs->psw.addr, regs);
+-			if (btt == BUG_TRAP_TYPE_WARN)
+-				return;
+ 			die(regs, str);
+ 		}
+         }
+@@ -251,6 +246,27 @@ void space_switch_exception(struct pt_regs *regs)
+ 	do_trap(regs, SIGILL, ILL_PRVOPC, "space switch event");
+ }
+ 
++void monitor_event_exception(struct pt_regs *regs)
++{
++	const struct exception_table_entry *fixup;
++
++	if (user_mode(regs))
++		return;
++
++	switch (report_bug(regs->psw.addr - (regs->int_code >> 16), regs)) {
++	case BUG_TRAP_TYPE_NONE:
++		fixup = s390_search_extables(regs->psw.addr);
++		if (fixup)
++			regs->psw.addr = extable_fixup(fixup);
++		break;
++	case BUG_TRAP_TYPE_WARN:
++		break;
++	case BUG_TRAP_TYPE_BUG:
++		die(regs, "monitor event");
++		break;
++	}
++}
++
+ void kernel_stack_overflow(struct pt_regs *regs)
+ {
+ 	bust_spinlocks(1);
+@@ -261,8 +277,23 @@ void kernel_stack_overflow(struct pt_regs *regs)
+ }
+ NOKPROBE_SYMBOL(kernel_stack_overflow);
+ 
++static void test_monitor_call(void)
++{
++	int val = 1;
++
++	asm volatile(
++		"	mc	0,0\n"
++		"0:	xgr	%0,%0\n"
++		"1:\n"
++		EX_TABLE(0b,1b)
++		: "+d" (val));
++	if (!val)
++		panic("Monitor call doesn't work!\n");
++}
++
+ void __init trap_init(void)
+ {
+ 	sort_extable(__start_dma_ex_table, __stop_dma_ex_table);
+ 	local_mcck_enable();
++	test_monitor_call();
+ }
