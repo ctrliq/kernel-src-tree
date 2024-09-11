@@ -1,0 +1,1232 @@
+bpf: Add redirect_peer helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 9aa1206e8f48222f35a0c809f33b2f4aaa1e2661
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/9aa1206e.failed
+
+Add an efficient ingress to ingress netns switch that can be used out of tc BPF
+programs in order to redirect traffic from host ns ingress into a container
+veth device ingress without having to go via CPU backlog queue [0]. For local
+containers this can also be utilized and path via CPU backlog queue only needs
+to be taken once, not twice. On a high level this borrows from ipvlan which does
+similar switch in __netif_receive_skb_core() and then iterates via another_round.
+This helps to reduce latency for mentioned use cases.
+
+Pod to remote pod with redirect(), TCP_RR [1]:
+
+  # percpu_netperf 10.217.1.33
+          RT_LATENCY:         122.450         (per CPU:         122.666         122.401         122.333         122.401 )
+        MEAN_LATENCY:         121.210         (per CPU:         121.100         121.260         121.320         121.160 )
+      STDDEV_LATENCY:         120.040         (per CPU:         119.420         119.910         125.460         115.370 )
+         MIN_LATENCY:          46.500         (per CPU:          47.000          47.000          47.000          45.000 )
+         P50_LATENCY:         118.500         (per CPU:         118.000         119.000         118.000         119.000 )
+         P90_LATENCY:         127.500         (per CPU:         127.000         128.000         127.000         128.000 )
+         P99_LATENCY:         130.750         (per CPU:         131.000         131.000         129.000         132.000 )
+
+    TRANSACTION_RATE:       32666.400         (per CPU:        8152.200        8169.842        8174.439        8169.897 )
+
+Pod to remote pod with redirect_peer(), TCP_RR:
+
+  # percpu_netperf 10.217.1.33
+          RT_LATENCY:          44.449         (per CPU:          43.767          43.127          45.279          45.622 )
+        MEAN_LATENCY:          45.065         (per CPU:          44.030          45.530          45.190          45.510 )
+      STDDEV_LATENCY:          84.823         (per CPU:          66.770          97.290          84.380          90.850 )
+         MIN_LATENCY:          33.500         (per CPU:          33.000          33.000          34.000          34.000 )
+         P50_LATENCY:          43.250         (per CPU:          43.000          43.000          43.000          44.000 )
+         P90_LATENCY:          46.750         (per CPU:          46.000          47.000          47.000          47.000 )
+         P99_LATENCY:          52.750         (per CPU:          51.000          54.000          53.000          53.000 )
+
+    TRANSACTION_RATE:       90039.500         (per CPU:       22848.186       23187.089       22085.077       21919.130 )
+
+  [0] https://linuxplumbersconf.org/event/7/contributions/674/attachments/568/1002/plumbers_2020_cilium_load_balancer.pdf
+  [1] https://github.com/borkmann/netperf_scripts/blob/master/percpu_netperf
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20201010234006.7075-3-daniel@iogearbox.net
+(cherry picked from commit 9aa1206e8f48222f35a0c809f33b2f4aaa1e2661)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	include/uapi/linux/bpf.h
+#	net/core/filter.c
+#	tools/include/uapi/linux/bpf.h
+diff --cc include/linux/netdevice.h
+index 78e630aa8cd5,0533f86018dd..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1338,6 -1274,12 +1338,15 @@@ struct devlink
+   *	Get devlink port instance associated with a given netdev.
+   *	Called with a reference on the netdevice and devlink locks only,
+   *	rtnl_lock is not held.
+++<<<<<<< HEAD
+++=======
++  * int (*ndo_tunnel_ctl)(struct net_device *dev, struct ip_tunnel_parm *p,
++  *			 int cmd);
++  *	Add, change, delete or get information on an IPv4 tunnel.
++  * struct net_device *(*ndo_get_peer_dev)(struct net_device *dev);
++  *	If a device is paired with a peer device, return the peer instance.
++  *	The caller must be under RCU read context.
+++>>>>>>> 9aa1206e8f48 (bpf: Add redirect_peer helper)
+   */
+  struct net_device_ops {
+  	int			(*ndo_init)(struct net_device *dev);
+@@@ -1533,74 -1477,17 +1542,84 @@@
+  						       struct sk_buff *skb);
+  	void			(*ndo_set_rx_headroom)(struct net_device *dev,
+  						       int needed_headroom);
+ -	int			(*ndo_bpf)(struct net_device *dev,
+ -					   struct netdev_bpf *bpf);
+ -	int			(*ndo_xdp_xmit)(struct net_device *dev, int n,
+ +	RH_KABI_EXCLUDE(int	(*ndo_bpf)(struct net_device *dev,
+ +					   struct netdev_bpf *bpf))
+ +	RH_KABI_EXCLUDE(int	(*ndo_xdp_xmit)(struct net_device *dev, int n,
+  						struct xdp_frame **xdp,
+++<<<<<<< HEAD
+ +						u32 flags))
+ +	RH_KABI_EXCLUDE(int	(*ndo_xsk_wakeup)(struct net_device *dev,
+ +						  u32 queue_id, u32 flags))
+ +
+ +	RH_KABI_USE(1, int	(*ndo_get_port_parent_id)(struct net_device *dev,
+ +							  struct netdev_phys_item_id *ppid))
+ +	RH_KABI_USE(2, struct devlink_port *(*ndo_get_devlink_port)(struct net_device *dev))
+ +	RH_KABI_USE(3, int	(*ndo_fdb_get)(struct sk_buff *skb,
+ +					       struct nlattr *tb[],
+ +					       struct net_device *dev,
+ +					       const unsigned char *addr,
+ +					       u16 vid, u32 portid, u32 seq,
+ +					       struct netlink_ext_ack *extack))
+ +	RH_KABI_USE(4, int	(*ndo_get_vf_guid)(struct net_device *dev,
+ +						   int vf,
+ +						   struct ifla_vf_guid *node_guid,
+ +						   struct ifla_vf_guid *port_guid))
+ +	RH_KABI_USE(5, struct net_device* (*ndo_get_xmit_slave)(struct net_device *dev,
+ +								struct sk_buff *skb,
+ +								bool all_slaves))
+ +	RH_KABI_USE(6, struct net_device*	(*ndo_sk_get_lower_dev)(struct net_device *dev,
+ +							struct sock *sk))
+ +	RH_KABI_RESERVE(7)
+ +	RH_KABI_RESERVE(8)
+ +	RH_KABI_RESERVE(9)
+ +	RH_KABI_RESERVE(10)
+ +	RH_KABI_RESERVE(11)
+ +	RH_KABI_RESERVE(12)
+ +	RH_KABI_RESERVE(13)
+ +	RH_KABI_RESERVE(14)
+ +	RH_KABI_RESERVE(15)
+ +	RH_KABI_RESERVE(16)
+ +	RH_KABI_RESERVE(17)
+ +	RH_KABI_RESERVE(18)
+ +	RH_KABI_RESERVE(19)
+ +	RH_KABI_RESERVE(20)
+ +	RH_KABI_RESERVE(21)
+ +	RH_KABI_RESERVE(22)
+ +	RH_KABI_RESERVE(23)
+ +	RH_KABI_RESERVE(24)
+ +	RH_KABI_RESERVE(25)
+ +	RH_KABI_RESERVE(26)
+ +	RH_KABI_RESERVE(27)
+ +	RH_KABI_RESERVE(28)
+ +	RH_KABI_RESERVE(29)
+ +	RH_KABI_RESERVE(30)
+ +	RH_KABI_RESERVE(31)
+ +	RH_KABI_RESERVE(32)
+ +	RH_KABI_RESERVE(33)
+ +	RH_KABI_RESERVE(34)
+ +	RH_KABI_RESERVE(35)
+ +	RH_KABI_RESERVE(36)
+ +	RH_KABI_RESERVE(37)
+ +	RH_KABI_RESERVE(38)
+ +	RH_KABI_RESERVE(39)
+ +	RH_KABI_RESERVE(40)
+ +	RH_KABI_RESERVE(41)
+ +	RH_KABI_RESERVE(42)
+ +	RH_KABI_RESERVE(43)
+ +	RH_KABI_RESERVE(44)
+ +	RH_KABI_RESERVE(45)
+ +	RH_KABI_RESERVE(46)
+ +	RH_KABI_RESERVE(47)
+ +	RH_KABI_AUX_EMBED(net_device_ops_extended)
+++=======
++ 						u32 flags);
++ 	int			(*ndo_xsk_wakeup)(struct net_device *dev,
++ 						  u32 queue_id, u32 flags);
++ 	struct devlink_port *	(*ndo_get_devlink_port)(struct net_device *dev);
++ 	int			(*ndo_tunnel_ctl)(struct net_device *dev,
++ 						  struct ip_tunnel_parm *p, int cmd);
++ 	struct net_device *	(*ndo_get_peer_dev)(struct net_device *dev);
+++>>>>>>> 9aa1206e8f48 (bpf: Add redirect_peer helper)
+  };
+  
+  /**
+diff --cc include/uapi/linux/bpf.h
+index 0a8b1917a074,b97bc5abb3b8..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -3444,6 -3448,293 +3444,296 @@@ union bpf_attr 
+   *		A non-negative value equal to or less than *size* on success,
+   *		or a negative error in case of failure.
+   *
+++<<<<<<< HEAD
+++=======
++  * long bpf_load_hdr_opt(struct bpf_sock_ops *skops, void *searchby_res, u32 len, u64 flags)
++  *	Description
++  *		Load header option.  Support reading a particular TCP header
++  *		option for bpf program (**BPF_PROG_TYPE_SOCK_OPS**).
++  *
++  *		If *flags* is 0, it will search the option from the
++  *		*skops*\ **->skb_data**.  The comment in **struct bpf_sock_ops**
++  *		has details on what skb_data contains under different
++  *		*skops*\ **->op**.
++  *
++  *		The first byte of the *searchby_res* specifies the
++  *		kind that it wants to search.
++  *
++  *		If the searching kind is an experimental kind
++  *		(i.e. 253 or 254 according to RFC6994).  It also
++  *		needs to specify the "magic" which is either
++  *		2 bytes or 4 bytes.  It then also needs to
++  *		specify the size of the magic by using
++  *		the 2nd byte which is "kind-length" of a TCP
++  *		header option and the "kind-length" also
++  *		includes the first 2 bytes "kind" and "kind-length"
++  *		itself as a normal TCP header option also does.
++  *
++  *		For example, to search experimental kind 254 with
++  *		2 byte magic 0xeB9F, the searchby_res should be
++  *		[ 254, 4, 0xeB, 0x9F, 0, 0, .... 0 ].
++  *
++  *		To search for the standard window scale option (3),
++  *		the *searchby_res* should be [ 3, 0, 0, .... 0 ].
++  *		Note, kind-length must be 0 for regular option.
++  *
++  *		Searching for No-Op (0) and End-of-Option-List (1) are
++  *		not supported.
++  *
++  *		*len* must be at least 2 bytes which is the minimal size
++  *		of a header option.
++  *
++  *		Supported flags:
++  *
++  *		* **BPF_LOAD_HDR_OPT_TCP_SYN** to search from the
++  *		  saved_syn packet or the just-received syn packet.
++  *
++  *	Return
++  *		> 0 when found, the header option is copied to *searchby_res*.
++  *		The return value is the total length copied. On failure, a
++  *		negative error code is returned:
++  *
++  *		**-EINVAL** if a parameter is invalid.
++  *
++  *		**-ENOMSG** if the option is not found.
++  *
++  *		**-ENOENT** if no syn packet is available when
++  *		**BPF_LOAD_HDR_OPT_TCP_SYN** is used.
++  *
++  *		**-ENOSPC** if there is not enough space.  Only *len* number of
++  *		bytes are copied.
++  *
++  *		**-EFAULT** on failure to parse the header options in the
++  *		packet.
++  *
++  *		**-EPERM** if the helper cannot be used under the current
++  *		*skops*\ **->op**.
++  *
++  * long bpf_store_hdr_opt(struct bpf_sock_ops *skops, const void *from, u32 len, u64 flags)
++  *	Description
++  *		Store header option.  The data will be copied
++  *		from buffer *from* with length *len* to the TCP header.
++  *
++  *		The buffer *from* should have the whole option that
++  *		includes the kind, kind-length, and the actual
++  *		option data.  The *len* must be at least kind-length
++  *		long.  The kind-length does not have to be 4 byte
++  *		aligned.  The kernel will take care of the padding
++  *		and setting the 4 bytes aligned value to th->doff.
++  *
++  *		This helper will check for duplicated option
++  *		by searching the same option in the outgoing skb.
++  *
++  *		This helper can only be called during
++  *		**BPF_SOCK_OPS_WRITE_HDR_OPT_CB**.
++  *
++  *	Return
++  *		0 on success, or negative error in case of failure:
++  *
++  *		**-EINVAL** If param is invalid.
++  *
++  *		**-ENOSPC** if there is not enough space in the header.
++  *		Nothing has been written
++  *
++  *		**-EEXIST** if the option already exists.
++  *
++  *		**-EFAULT** on failrue to parse the existing header options.
++  *
++  *		**-EPERM** if the helper cannot be used under the current
++  *		*skops*\ **->op**.
++  *
++  * long bpf_reserve_hdr_opt(struct bpf_sock_ops *skops, u32 len, u64 flags)
++  *	Description
++  *		Reserve *len* bytes for the bpf header option.  The
++  *		space will be used by **bpf_store_hdr_opt**\ () later in
++  *		**BPF_SOCK_OPS_WRITE_HDR_OPT_CB**.
++  *
++  *		If **bpf_reserve_hdr_opt**\ () is called multiple times,
++  *		the total number of bytes will be reserved.
++  *
++  *		This helper can only be called during
++  *		**BPF_SOCK_OPS_HDR_OPT_LEN_CB**.
++  *
++  *	Return
++  *		0 on success, or negative error in case of failure:
++  *
++  *		**-EINVAL** if a parameter is invalid.
++  *
++  *		**-ENOSPC** if there is not enough space in the header.
++  *
++  *		**-EPERM** if the helper cannot be used under the current
++  *		*skops*\ **->op**.
++  *
++  * void *bpf_inode_storage_get(struct bpf_map *map, void *inode, void *value, u64 flags)
++  *	Description
++  *		Get a bpf_local_storage from an *inode*.
++  *
++  *		Logically, it could be thought of as getting the value from
++  *		a *map* with *inode* as the **key**.  From this
++  *		perspective,  the usage is not much different from
++  *		**bpf_map_lookup_elem**\ (*map*, **&**\ *inode*) except this
++  *		helper enforces the key must be an inode and the map must also
++  *		be a **BPF_MAP_TYPE_INODE_STORAGE**.
++  *
++  *		Underneath, the value is stored locally at *inode* instead of
++  *		the *map*.  The *map* is used as the bpf-local-storage
++  *		"type". The bpf-local-storage "type" (i.e. the *map*) is
++  *		searched against all bpf_local_storage residing at *inode*.
++  *
++  *		An optional *flags* (**BPF_LOCAL_STORAGE_GET_F_CREATE**) can be
++  *		used such that a new bpf_local_storage will be
++  *		created if one does not exist.  *value* can be used
++  *		together with **BPF_LOCAL_STORAGE_GET_F_CREATE** to specify
++  *		the initial value of a bpf_local_storage.  If *value* is
++  *		**NULL**, the new bpf_local_storage will be zero initialized.
++  *	Return
++  *		A bpf_local_storage pointer is returned on success.
++  *
++  *		**NULL** if not found or there was an error in adding
++  *		a new bpf_local_storage.
++  *
++  * int bpf_inode_storage_delete(struct bpf_map *map, void *inode)
++  *	Description
++  *		Delete a bpf_local_storage from an *inode*.
++  *	Return
++  *		0 on success.
++  *
++  *		**-ENOENT** if the bpf_local_storage cannot be found.
++  *
++  * long bpf_d_path(struct path *path, char *buf, u32 sz)
++  *	Description
++  *		Return full path for given **struct path** object, which
++  *		needs to be the kernel BTF *path* object. The path is
++  *		returned in the provided buffer *buf* of size *sz* and
++  *		is zero terminated.
++  *
++  *	Return
++  *		On success, the strictly positive length of the string,
++  *		including the trailing NUL character. On error, a negative
++  *		value.
++  *
++  * long bpf_copy_from_user(void *dst, u32 size, const void *user_ptr)
++  * 	Description
++  * 		Read *size* bytes from user space address *user_ptr* and store
++  * 		the data in *dst*. This is a wrapper of **copy_from_user**\ ().
++  * 	Return
++  * 		0 on success, or a negative error in case of failure.
++  *
++  * long bpf_snprintf_btf(char *str, u32 str_size, struct btf_ptr *ptr, u32 btf_ptr_size, u64 flags)
++  *	Description
++  *		Use BTF to store a string representation of *ptr*->ptr in *str*,
++  *		using *ptr*->type_id.  This value should specify the type
++  *		that *ptr*->ptr points to. LLVM __builtin_btf_type_id(type, 1)
++  *		can be used to look up vmlinux BTF type ids. Traversing the
++  *		data structure using BTF, the type information and values are
++  *		stored in the first *str_size* - 1 bytes of *str*.  Safe copy of
++  *		the pointer data is carried out to avoid kernel crashes during
++  *		operation.  Smaller types can use string space on the stack;
++  *		larger programs can use map data to store the string
++  *		representation.
++  *
++  *		The string can be subsequently shared with userspace via
++  *		bpf_perf_event_output() or ring buffer interfaces.
++  *		bpf_trace_printk() is to be avoided as it places too small
++  *		a limit on string size to be useful.
++  *
++  *		*flags* is a combination of
++  *
++  *		**BTF_F_COMPACT**
++  *			no formatting around type information
++  *		**BTF_F_NONAME**
++  *			no struct/union member names/types
++  *		**BTF_F_PTR_RAW**
++  *			show raw (unobfuscated) pointer values;
++  *			equivalent to printk specifier %px.
++  *		**BTF_F_ZERO**
++  *			show zero-valued struct/union members; they
++  *			are not displayed by default
++  *
++  *	Return
++  *		The number of bytes that were written (or would have been
++  *		written if output had to be truncated due to string size),
++  *		or a negative error in cases of failure.
++  *
++  * long bpf_seq_printf_btf(struct seq_file *m, struct btf_ptr *ptr, u32 ptr_size, u64 flags)
++  *	Description
++  *		Use BTF to write to seq_write a string representation of
++  *		*ptr*->ptr, using *ptr*->type_id as per bpf_snprintf_btf().
++  *		*flags* are identical to those used for bpf_snprintf_btf.
++  *	Return
++  *		0 on success or a negative error in case of failure.
++  *
++  * u64 bpf_skb_cgroup_classid(struct sk_buff *skb)
++  * 	Description
++  * 		See **bpf_get_cgroup_classid**\ () for the main description.
++  * 		This helper differs from **bpf_get_cgroup_classid**\ () in that
++  * 		the cgroup v1 net_cls class is retrieved only from the *skb*'s
++  * 		associated socket instead of the current process.
++  * 	Return
++  * 		The id is returned or 0 in case the id could not be retrieved.
++  *
++  * long bpf_redirect_neigh(u32 ifindex, u64 flags)
++  * 	Description
++  * 		Redirect the packet to another net device of index *ifindex*
++  * 		and fill in L2 addresses from neighboring subsystem. This helper
++  * 		is somewhat similar to **bpf_redirect**\ (), except that it
++  * 		populates L2 addresses as well, meaning, internally, the helper
++  * 		performs a FIB lookup based on the skb's networking header to
++  * 		get the address of the next hop and then relies on the neighbor
++  * 		lookup for the L2 address of the nexthop.
++  *
++  * 		The *flags* argument is reserved and must be 0. The helper is
++  * 		currently only supported for tc BPF program types, and enabled
++  * 		for IPv4 and IPv6 protocols.
++  * 	Return
++  * 		The helper returns **TC_ACT_REDIRECT** on success or
++  * 		**TC_ACT_SHOT** on error.
++  *
++  * void *bpf_per_cpu_ptr(const void *percpu_ptr, u32 cpu)
++  *     Description
++  *             Take a pointer to a percpu ksym, *percpu_ptr*, and return a
++  *             pointer to the percpu kernel variable on *cpu*. A ksym is an
++  *             extern variable decorated with '__ksym'. For ksym, there is a
++  *             global var (either static or global) defined of the same name
++  *             in the kernel. The ksym is percpu if the global var is percpu.
++  *             The returned pointer points to the global percpu var on *cpu*.
++  *
++  *             bpf_per_cpu_ptr() has the same semantic as per_cpu_ptr() in the
++  *             kernel, except that bpf_per_cpu_ptr() may return NULL. This
++  *             happens if *cpu* is larger than nr_cpu_ids. The caller of
++  *             bpf_per_cpu_ptr() must check the returned value.
++  *     Return
++  *             A pointer pointing to the kernel percpu variable on *cpu*, or
++  *             NULL, if *cpu* is invalid.
++  *
++  * void *bpf_this_cpu_ptr(const void *percpu_ptr)
++  *	Description
++  *		Take a pointer to a percpu ksym, *percpu_ptr*, and return a
++  *		pointer to the percpu kernel variable on this cpu. See the
++  *		description of 'ksym' in **bpf_per_cpu_ptr**\ ().
++  *
++  *		bpf_this_cpu_ptr() has the same semantic as this_cpu_ptr() in
++  *		the kernel. Different from **bpf_per_cpu_ptr**\ (), it would
++  *		never return NULL.
++  *	Return
++  *		A pointer pointing to the kernel percpu variable on this cpu.
++  *
++  * long bpf_redirect_peer(u32 ifindex, u64 flags)
++  * 	Description
++  * 		Redirect the packet to another net device of index *ifindex*.
++  * 		This helper is somewhat similar to **bpf_redirect**\ (), except
++  * 		that the redirection happens to the *ifindex*' peer device and
++  * 		the netns switch takes place from ingress to ingress without
++  * 		going through the CPU's backlog queue.
++  *
++  * 		The *flags* argument is reserved and must be 0. The helper is
++  * 		currently only supported for tc BPF program types at the ingress
++  * 		hook and for veth device types. The peer device must reside in a
++  * 		different network namespace.
++  * 	Return
++  * 		The helper returns **TC_ACT_REDIRECT** on success or
++  * 		**TC_ACT_SHOT** on error.
+++>>>>>>> 9aa1206e8f48 (bpf: Add redirect_peer helper)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+@@@ -3588,6 -3879,20 +3878,23 @@@
+  	FN(skc_to_tcp_request_sock),	\
+  	FN(skc_to_udp6_sock),		\
+  	FN(get_task_stack),		\
+++<<<<<<< HEAD
+++=======
++ 	FN(load_hdr_opt),		\
++ 	FN(store_hdr_opt),		\
++ 	FN(reserve_hdr_opt),		\
++ 	FN(inode_storage_get),		\
++ 	FN(inode_storage_delete),	\
++ 	FN(d_path),			\
++ 	FN(copy_from_user),		\
++ 	FN(snprintf_btf),		\
++ 	FN(seq_printf_btf),		\
++ 	FN(skb_cgroup_classid),		\
++ 	FN(redirect_neigh),		\
++ 	FN(bpf_per_cpu_ptr),            \
++ 	FN(bpf_this_cpu_ptr),		\
++ 	FN(redirect_peer),		\
+++>>>>>>> 9aa1206e8f48 (bpf: Add redirect_peer helper)
+  	/* */
+  
+  /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+diff --cc net/core/filter.c
+index a22f97d754fb,fab951c6be57..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -2173,6 -2164,227 +2173,230 @@@ static int __bpf_redirect(struct sk_buf
+  		return __bpf_redirect_no_mac(skb, dev, flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_IPV6)
++ static int bpf_out_neigh_v6(struct net *net, struct sk_buff *skb)
++ {
++ 	struct dst_entry *dst = skb_dst(skb);
++ 	struct net_device *dev = dst->dev;
++ 	u32 hh_len = LL_RESERVED_SPACE(dev);
++ 	const struct in6_addr *nexthop;
++ 	struct neighbour *neigh;
++ 
++ 	if (dev_xmit_recursion()) {
++ 		net_crit_ratelimited("bpf: recursion limit reached on datapath, buggy bpf program?\n");
++ 		goto out_drop;
++ 	}
++ 
++ 	skb->dev = dev;
++ 	skb->tstamp = 0;
++ 
++ 	if (unlikely(skb_headroom(skb) < hh_len && dev->header_ops)) {
++ 		struct sk_buff *skb2;
++ 
++ 		skb2 = skb_realloc_headroom(skb, hh_len);
++ 		if (unlikely(!skb2)) {
++ 			kfree_skb(skb);
++ 			return -ENOMEM;
++ 		}
++ 		if (skb->sk)
++ 			skb_set_owner_w(skb2, skb->sk);
++ 		consume_skb(skb);
++ 		skb = skb2;
++ 	}
++ 
++ 	rcu_read_lock_bh();
++ 	nexthop = rt6_nexthop(container_of(dst, struct rt6_info, dst),
++ 			      &ipv6_hdr(skb)->daddr);
++ 	neigh = ip_neigh_gw6(dev, nexthop);
++ 	if (likely(!IS_ERR(neigh))) {
++ 		int ret;
++ 
++ 		sock_confirm_neigh(skb, neigh);
++ 		dev_xmit_recursion_inc();
++ 		ret = neigh_output(neigh, skb, false);
++ 		dev_xmit_recursion_dec();
++ 		rcu_read_unlock_bh();
++ 		return ret;
++ 	}
++ 	rcu_read_unlock_bh();
++ 	IP6_INC_STATS(dev_net(dst->dev),
++ 		      ip6_dst_idev(dst), IPSTATS_MIB_OUTNOROUTES);
++ out_drop:
++ 	kfree_skb(skb);
++ 	return -ENETDOWN;
++ }
++ 
++ static int __bpf_redirect_neigh_v6(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	const struct ipv6hdr *ip6h = ipv6_hdr(skb);
++ 	struct net *net = dev_net(dev);
++ 	int err, ret = NET_XMIT_DROP;
++ 	struct dst_entry *dst;
++ 	struct flowi6 fl6 = {
++ 		.flowi6_flags	= FLOWI_FLAG_ANYSRC,
++ 		.flowi6_mark	= skb->mark,
++ 		.flowlabel	= ip6_flowinfo(ip6h),
++ 		.flowi6_oif	= dev->ifindex,
++ 		.flowi6_proto	= ip6h->nexthdr,
++ 		.daddr		= ip6h->daddr,
++ 		.saddr		= ip6h->saddr,
++ 	};
++ 
++ 	dst = ipv6_stub->ipv6_dst_lookup_flow(net, NULL, &fl6, NULL);
++ 	if (IS_ERR(dst))
++ 		goto out_drop;
++ 
++ 	skb_dst_set(skb, dst);
++ 
++ 	err = bpf_out_neigh_v6(net, skb);
++ 	if (unlikely(net_xmit_eval(err)))
++ 		dev->stats.tx_errors++;
++ 	else
++ 		ret = NET_XMIT_SUCCESS;
++ 	goto out_xmit;
++ out_drop:
++ 	dev->stats.tx_errors++;
++ 	kfree_skb(skb);
++ out_xmit:
++ 	return ret;
++ }
++ #else
++ static int __bpf_redirect_neigh_v6(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	kfree_skb(skb);
++ 	return NET_XMIT_DROP;
++ }
++ #endif /* CONFIG_IPV6 */
++ 
++ #if IS_ENABLED(CONFIG_INET)
++ static int bpf_out_neigh_v4(struct net *net, struct sk_buff *skb)
++ {
++ 	struct dst_entry *dst = skb_dst(skb);
++ 	struct rtable *rt = container_of(dst, struct rtable, dst);
++ 	struct net_device *dev = dst->dev;
++ 	u32 hh_len = LL_RESERVED_SPACE(dev);
++ 	struct neighbour *neigh;
++ 	bool is_v6gw = false;
++ 
++ 	if (dev_xmit_recursion()) {
++ 		net_crit_ratelimited("bpf: recursion limit reached on datapath, buggy bpf program?\n");
++ 		goto out_drop;
++ 	}
++ 
++ 	skb->dev = dev;
++ 	skb->tstamp = 0;
++ 
++ 	if (unlikely(skb_headroom(skb) < hh_len && dev->header_ops)) {
++ 		struct sk_buff *skb2;
++ 
++ 		skb2 = skb_realloc_headroom(skb, hh_len);
++ 		if (unlikely(!skb2)) {
++ 			kfree_skb(skb);
++ 			return -ENOMEM;
++ 		}
++ 		if (skb->sk)
++ 			skb_set_owner_w(skb2, skb->sk);
++ 		consume_skb(skb);
++ 		skb = skb2;
++ 	}
++ 
++ 	rcu_read_lock_bh();
++ 	neigh = ip_neigh_for_gw(rt, skb, &is_v6gw);
++ 	if (likely(!IS_ERR(neigh))) {
++ 		int ret;
++ 
++ 		sock_confirm_neigh(skb, neigh);
++ 		dev_xmit_recursion_inc();
++ 		ret = neigh_output(neigh, skb, is_v6gw);
++ 		dev_xmit_recursion_dec();
++ 		rcu_read_unlock_bh();
++ 		return ret;
++ 	}
++ 	rcu_read_unlock_bh();
++ out_drop:
++ 	kfree_skb(skb);
++ 	return -ENETDOWN;
++ }
++ 
++ static int __bpf_redirect_neigh_v4(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	const struct iphdr *ip4h = ip_hdr(skb);
++ 	struct net *net = dev_net(dev);
++ 	int err, ret = NET_XMIT_DROP;
++ 	struct rtable *rt;
++ 	struct flowi4 fl4 = {
++ 		.flowi4_flags	= FLOWI_FLAG_ANYSRC,
++ 		.flowi4_mark	= skb->mark,
++ 		.flowi4_tos	= RT_TOS(ip4h->tos),
++ 		.flowi4_oif	= dev->ifindex,
++ 		.flowi4_proto	= ip4h->protocol,
++ 		.daddr		= ip4h->daddr,
++ 		.saddr		= ip4h->saddr,
++ 	};
++ 
++ 	rt = ip_route_output_flow(net, &fl4, NULL);
++ 	if (IS_ERR(rt))
++ 		goto out_drop;
++ 	if (rt->rt_type != RTN_UNICAST && rt->rt_type != RTN_LOCAL) {
++ 		ip_rt_put(rt);
++ 		goto out_drop;
++ 	}
++ 
++ 	skb_dst_set(skb, &rt->dst);
++ 
++ 	err = bpf_out_neigh_v4(net, skb);
++ 	if (unlikely(net_xmit_eval(err)))
++ 		dev->stats.tx_errors++;
++ 	else
++ 		ret = NET_XMIT_SUCCESS;
++ 	goto out_xmit;
++ out_drop:
++ 	dev->stats.tx_errors++;
++ 	kfree_skb(skb);
++ out_xmit:
++ 	return ret;
++ }
++ #else
++ static int __bpf_redirect_neigh_v4(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	kfree_skb(skb);
++ 	return NET_XMIT_DROP;
++ }
++ #endif /* CONFIG_INET */
++ 
++ static int __bpf_redirect_neigh(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct ethhdr *ethh = eth_hdr(skb);
++ 
++ 	if (unlikely(skb->mac_header >= skb->network_header))
++ 		goto out;
++ 	bpf_push_mac_rcsum(skb);
++ 	if (is_multicast_ether_addr(ethh->h_dest))
++ 		goto out;
++ 
++ 	skb_pull(skb, sizeof(*ethh));
++ 	skb_unset_mac_header(skb);
++ 	skb_reset_network_header(skb);
++ 
++ 	if (skb->protocol == htons(ETH_P_IP))
++ 		return __bpf_redirect_neigh_v4(skb, dev);
++ 	else if (skb->protocol == htons(ETH_P_IPV6))
++ 		return __bpf_redirect_neigh_v6(skb, dev);
++ out:
++ 	kfree_skb(skb);
++ 	return -ENOTSUPP;
++ }
++ 
++ /* Internal, non-exposed redirect flags. */
++ enum {
++ 	BPF_F_NEIGH	= (1ULL << 1),
++ 	BPF_F_PEER	= (1ULL << 2),
++ #define BPF_F_REDIRECT_INTERNAL	(BPF_F_NEIGH | BPF_F_PEER)
++ };
++ 
+++>>>>>>> 9aa1206e8f48 (bpf: Add redirect_peer helper)
+  BPF_CALL_3(bpf_clone_redirect, struct sk_buff *, skb, u32, ifindex, u64, flags)
+  {
+  	struct net_device *dev;
+@@@ -2216,6 -2428,40 +2440,43 @@@ static const struct bpf_func_proto bpf_
+  DEFINE_PER_CPU(struct bpf_redirect_info, bpf_redirect_info);
+  EXPORT_PER_CPU_SYMBOL_GPL(bpf_redirect_info);
+  
+++<<<<<<< HEAD
+++=======
++ int skb_do_redirect(struct sk_buff *skb)
++ {
++ 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
++ 	struct net *net = dev_net(skb->dev);
++ 	struct net_device *dev;
++ 	u32 flags = ri->flags;
++ 
++ 	dev = dev_get_by_index_rcu(net, ri->tgt_index);
++ 	ri->tgt_index = 0;
++ 	ri->flags = 0;
++ 	if (unlikely(!dev))
++ 		goto out_drop;
++ 	if (flags & BPF_F_PEER) {
++ 		const struct net_device_ops *ops = dev->netdev_ops;
++ 
++ 		if (unlikely(!ops->ndo_get_peer_dev ||
++ 			     !skb_at_tc_ingress(skb)))
++ 			goto out_drop;
++ 		dev = ops->ndo_get_peer_dev(dev);
++ 		if (unlikely(!dev ||
++ 			     !is_skb_forwardable(dev, skb) ||
++ 			     net_eq(net, dev_net(dev))))
++ 			goto out_drop;
++ 		skb->dev = dev;
++ 		return -EAGAIN;
++ 	}
++ 	return flags & BPF_F_NEIGH ?
++ 	       __bpf_redirect_neigh(skb, dev) :
++ 	       __bpf_redirect(skb, dev, flags);
++ out_drop:
++ 	kfree_skb(skb);
++ 	return -EINVAL;
++ }
++ 
+++>>>>>>> 9aa1206e8f48 (bpf: Add redirect_peer helper)
+  BPF_CALL_2(bpf_redirect, u32, ifindex, u64, flags)
+  {
+  	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
+@@@ -2252,6 -2483,48 +2513,51 @@@ static const struct bpf_func_proto bpf_
+  	.arg2_type      = ARG_ANYTHING,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ BPF_CALL_2(bpf_redirect_peer, u32, ifindex, u64, flags)
++ {
++ 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
++ 
++ 	if (unlikely(flags))
++ 		return TC_ACT_SHOT;
++ 
++ 	ri->flags = BPF_F_PEER;
++ 	ri->tgt_index = ifindex;
++ 
++ 	return TC_ACT_REDIRECT;
++ }
++ 
++ static const struct bpf_func_proto bpf_redirect_peer_proto = {
++ 	.func           = bpf_redirect_peer,
++ 	.gpl_only       = false,
++ 	.ret_type       = RET_INTEGER,
++ 	.arg1_type      = ARG_ANYTHING,
++ 	.arg2_type      = ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_2(bpf_redirect_neigh, u32, ifindex, u64, flags)
++ {
++ 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
++ 
++ 	if (unlikely(flags))
++ 		return TC_ACT_SHOT;
++ 
++ 	ri->flags = BPF_F_NEIGH;
++ 	ri->tgt_index = ifindex;
++ 
++ 	return TC_ACT_REDIRECT;
++ }
++ 
++ static const struct bpf_func_proto bpf_redirect_neigh_proto = {
++ 	.func		= bpf_redirect_neigh,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_ANYTHING,
++ 	.arg2_type	= ARG_ANYTHING,
++ };
++ 
+++>>>>>>> 9aa1206e8f48 (bpf: Add redirect_peer helper)
+  BPF_CALL_2(bpf_msg_apply_bytes, struct sk_msg *, msg, u32, bytes)
+  {
+  	msg->apply_bytes = bytes;
+@@@ -6469,6 -7089,10 +6775,13 @@@ tc_cls_act_func_proto(enum bpf_func_id 
+  		return bpf_get_skb_set_tunnel_proto(func_id);
+  	case BPF_FUNC_redirect:
+  		return &bpf_redirect_proto;
+++<<<<<<< HEAD
+++=======
++ 	case BPF_FUNC_redirect_neigh:
++ 		return &bpf_redirect_neigh_proto;
++ 	case BPF_FUNC_redirect_peer:
++ 		return &bpf_redirect_peer_proto;
+++>>>>>>> 9aa1206e8f48 (bpf: Add redirect_peer helper)
+  	case BPF_FUNC_get_route_realm:
+  		return &bpf_get_route_realm_proto;
+  	case BPF_FUNC_get_hash_recalc:
+diff --cc tools/include/uapi/linux/bpf.h
+index 0dc0309df9c7,b97bc5abb3b8..000000000000
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@@ -3424,6 -3448,293 +3424,296 @@@ union bpf_attr 
+   *		A non-negative value equal to or less than *size* on success,
+   *		or a negative error in case of failure.
+   *
+++<<<<<<< HEAD
+++=======
++  * long bpf_load_hdr_opt(struct bpf_sock_ops *skops, void *searchby_res, u32 len, u64 flags)
++  *	Description
++  *		Load header option.  Support reading a particular TCP header
++  *		option for bpf program (**BPF_PROG_TYPE_SOCK_OPS**).
++  *
++  *		If *flags* is 0, it will search the option from the
++  *		*skops*\ **->skb_data**.  The comment in **struct bpf_sock_ops**
++  *		has details on what skb_data contains under different
++  *		*skops*\ **->op**.
++  *
++  *		The first byte of the *searchby_res* specifies the
++  *		kind that it wants to search.
++  *
++  *		If the searching kind is an experimental kind
++  *		(i.e. 253 or 254 according to RFC6994).  It also
++  *		needs to specify the "magic" which is either
++  *		2 bytes or 4 bytes.  It then also needs to
++  *		specify the size of the magic by using
++  *		the 2nd byte which is "kind-length" of a TCP
++  *		header option and the "kind-length" also
++  *		includes the first 2 bytes "kind" and "kind-length"
++  *		itself as a normal TCP header option also does.
++  *
++  *		For example, to search experimental kind 254 with
++  *		2 byte magic 0xeB9F, the searchby_res should be
++  *		[ 254, 4, 0xeB, 0x9F, 0, 0, .... 0 ].
++  *
++  *		To search for the standard window scale option (3),
++  *		the *searchby_res* should be [ 3, 0, 0, .... 0 ].
++  *		Note, kind-length must be 0 for regular option.
++  *
++  *		Searching for No-Op (0) and End-of-Option-List (1) are
++  *		not supported.
++  *
++  *		*len* must be at least 2 bytes which is the minimal size
++  *		of a header option.
++  *
++  *		Supported flags:
++  *
++  *		* **BPF_LOAD_HDR_OPT_TCP_SYN** to search from the
++  *		  saved_syn packet or the just-received syn packet.
++  *
++  *	Return
++  *		> 0 when found, the header option is copied to *searchby_res*.
++  *		The return value is the total length copied. On failure, a
++  *		negative error code is returned:
++  *
++  *		**-EINVAL** if a parameter is invalid.
++  *
++  *		**-ENOMSG** if the option is not found.
++  *
++  *		**-ENOENT** if no syn packet is available when
++  *		**BPF_LOAD_HDR_OPT_TCP_SYN** is used.
++  *
++  *		**-ENOSPC** if there is not enough space.  Only *len* number of
++  *		bytes are copied.
++  *
++  *		**-EFAULT** on failure to parse the header options in the
++  *		packet.
++  *
++  *		**-EPERM** if the helper cannot be used under the current
++  *		*skops*\ **->op**.
++  *
++  * long bpf_store_hdr_opt(struct bpf_sock_ops *skops, const void *from, u32 len, u64 flags)
++  *	Description
++  *		Store header option.  The data will be copied
++  *		from buffer *from* with length *len* to the TCP header.
++  *
++  *		The buffer *from* should have the whole option that
++  *		includes the kind, kind-length, and the actual
++  *		option data.  The *len* must be at least kind-length
++  *		long.  The kind-length does not have to be 4 byte
++  *		aligned.  The kernel will take care of the padding
++  *		and setting the 4 bytes aligned value to th->doff.
++  *
++  *		This helper will check for duplicated option
++  *		by searching the same option in the outgoing skb.
++  *
++  *		This helper can only be called during
++  *		**BPF_SOCK_OPS_WRITE_HDR_OPT_CB**.
++  *
++  *	Return
++  *		0 on success, or negative error in case of failure:
++  *
++  *		**-EINVAL** If param is invalid.
++  *
++  *		**-ENOSPC** if there is not enough space in the header.
++  *		Nothing has been written
++  *
++  *		**-EEXIST** if the option already exists.
++  *
++  *		**-EFAULT** on failrue to parse the existing header options.
++  *
++  *		**-EPERM** if the helper cannot be used under the current
++  *		*skops*\ **->op**.
++  *
++  * long bpf_reserve_hdr_opt(struct bpf_sock_ops *skops, u32 len, u64 flags)
++  *	Description
++  *		Reserve *len* bytes for the bpf header option.  The
++  *		space will be used by **bpf_store_hdr_opt**\ () later in
++  *		**BPF_SOCK_OPS_WRITE_HDR_OPT_CB**.
++  *
++  *		If **bpf_reserve_hdr_opt**\ () is called multiple times,
++  *		the total number of bytes will be reserved.
++  *
++  *		This helper can only be called during
++  *		**BPF_SOCK_OPS_HDR_OPT_LEN_CB**.
++  *
++  *	Return
++  *		0 on success, or negative error in case of failure:
++  *
++  *		**-EINVAL** if a parameter is invalid.
++  *
++  *		**-ENOSPC** if there is not enough space in the header.
++  *
++  *		**-EPERM** if the helper cannot be used under the current
++  *		*skops*\ **->op**.
++  *
++  * void *bpf_inode_storage_get(struct bpf_map *map, void *inode, void *value, u64 flags)
++  *	Description
++  *		Get a bpf_local_storage from an *inode*.
++  *
++  *		Logically, it could be thought of as getting the value from
++  *		a *map* with *inode* as the **key**.  From this
++  *		perspective,  the usage is not much different from
++  *		**bpf_map_lookup_elem**\ (*map*, **&**\ *inode*) except this
++  *		helper enforces the key must be an inode and the map must also
++  *		be a **BPF_MAP_TYPE_INODE_STORAGE**.
++  *
++  *		Underneath, the value is stored locally at *inode* instead of
++  *		the *map*.  The *map* is used as the bpf-local-storage
++  *		"type". The bpf-local-storage "type" (i.e. the *map*) is
++  *		searched against all bpf_local_storage residing at *inode*.
++  *
++  *		An optional *flags* (**BPF_LOCAL_STORAGE_GET_F_CREATE**) can be
++  *		used such that a new bpf_local_storage will be
++  *		created if one does not exist.  *value* can be used
++  *		together with **BPF_LOCAL_STORAGE_GET_F_CREATE** to specify
++  *		the initial value of a bpf_local_storage.  If *value* is
++  *		**NULL**, the new bpf_local_storage will be zero initialized.
++  *	Return
++  *		A bpf_local_storage pointer is returned on success.
++  *
++  *		**NULL** if not found or there was an error in adding
++  *		a new bpf_local_storage.
++  *
++  * int bpf_inode_storage_delete(struct bpf_map *map, void *inode)
++  *	Description
++  *		Delete a bpf_local_storage from an *inode*.
++  *	Return
++  *		0 on success.
++  *
++  *		**-ENOENT** if the bpf_local_storage cannot be found.
++  *
++  * long bpf_d_path(struct path *path, char *buf, u32 sz)
++  *	Description
++  *		Return full path for given **struct path** object, which
++  *		needs to be the kernel BTF *path* object. The path is
++  *		returned in the provided buffer *buf* of size *sz* and
++  *		is zero terminated.
++  *
++  *	Return
++  *		On success, the strictly positive length of the string,
++  *		including the trailing NUL character. On error, a negative
++  *		value.
++  *
++  * long bpf_copy_from_user(void *dst, u32 size, const void *user_ptr)
++  * 	Description
++  * 		Read *size* bytes from user space address *user_ptr* and store
++  * 		the data in *dst*. This is a wrapper of **copy_from_user**\ ().
++  * 	Return
++  * 		0 on success, or a negative error in case of failure.
++  *
++  * long bpf_snprintf_btf(char *str, u32 str_size, struct btf_ptr *ptr, u32 btf_ptr_size, u64 flags)
++  *	Description
++  *		Use BTF to store a string representation of *ptr*->ptr in *str*,
++  *		using *ptr*->type_id.  This value should specify the type
++  *		that *ptr*->ptr points to. LLVM __builtin_btf_type_id(type, 1)
++  *		can be used to look up vmlinux BTF type ids. Traversing the
++  *		data structure using BTF, the type information and values are
++  *		stored in the first *str_size* - 1 bytes of *str*.  Safe copy of
++  *		the pointer data is carried out to avoid kernel crashes during
++  *		operation.  Smaller types can use string space on the stack;
++  *		larger programs can use map data to store the string
++  *		representation.
++  *
++  *		The string can be subsequently shared with userspace via
++  *		bpf_perf_event_output() or ring buffer interfaces.
++  *		bpf_trace_printk() is to be avoided as it places too small
++  *		a limit on string size to be useful.
++  *
++  *		*flags* is a combination of
++  *
++  *		**BTF_F_COMPACT**
++  *			no formatting around type information
++  *		**BTF_F_NONAME**
++  *			no struct/union member names/types
++  *		**BTF_F_PTR_RAW**
++  *			show raw (unobfuscated) pointer values;
++  *			equivalent to printk specifier %px.
++  *		**BTF_F_ZERO**
++  *			show zero-valued struct/union members; they
++  *			are not displayed by default
++  *
++  *	Return
++  *		The number of bytes that were written (or would have been
++  *		written if output had to be truncated due to string size),
++  *		or a negative error in cases of failure.
++  *
++  * long bpf_seq_printf_btf(struct seq_file *m, struct btf_ptr *ptr, u32 ptr_size, u64 flags)
++  *	Description
++  *		Use BTF to write to seq_write a string representation of
++  *		*ptr*->ptr, using *ptr*->type_id as per bpf_snprintf_btf().
++  *		*flags* are identical to those used for bpf_snprintf_btf.
++  *	Return
++  *		0 on success or a negative error in case of failure.
++  *
++  * u64 bpf_skb_cgroup_classid(struct sk_buff *skb)
++  * 	Description
++  * 		See **bpf_get_cgroup_classid**\ () for the main description.
++  * 		This helper differs from **bpf_get_cgroup_classid**\ () in that
++  * 		the cgroup v1 net_cls class is retrieved only from the *skb*'s
++  * 		associated socket instead of the current process.
++  * 	Return
++  * 		The id is returned or 0 in case the id could not be retrieved.
++  *
++  * long bpf_redirect_neigh(u32 ifindex, u64 flags)
++  * 	Description
++  * 		Redirect the packet to another net device of index *ifindex*
++  * 		and fill in L2 addresses from neighboring subsystem. This helper
++  * 		is somewhat similar to **bpf_redirect**\ (), except that it
++  * 		populates L2 addresses as well, meaning, internally, the helper
++  * 		performs a FIB lookup based on the skb's networking header to
++  * 		get the address of the next hop and then relies on the neighbor
++  * 		lookup for the L2 address of the nexthop.
++  *
++  * 		The *flags* argument is reserved and must be 0. The helper is
++  * 		currently only supported for tc BPF program types, and enabled
++  * 		for IPv4 and IPv6 protocols.
++  * 	Return
++  * 		The helper returns **TC_ACT_REDIRECT** on success or
++  * 		**TC_ACT_SHOT** on error.
++  *
++  * void *bpf_per_cpu_ptr(const void *percpu_ptr, u32 cpu)
++  *     Description
++  *             Take a pointer to a percpu ksym, *percpu_ptr*, and return a
++  *             pointer to the percpu kernel variable on *cpu*. A ksym is an
++  *             extern variable decorated with '__ksym'. For ksym, there is a
++  *             global var (either static or global) defined of the same name
++  *             in the kernel. The ksym is percpu if the global var is percpu.
++  *             The returned pointer points to the global percpu var on *cpu*.
++  *
++  *             bpf_per_cpu_ptr() has the same semantic as per_cpu_ptr() in the
++  *             kernel, except that bpf_per_cpu_ptr() may return NULL. This
++  *             happens if *cpu* is larger than nr_cpu_ids. The caller of
++  *             bpf_per_cpu_ptr() must check the returned value.
++  *     Return
++  *             A pointer pointing to the kernel percpu variable on *cpu*, or
++  *             NULL, if *cpu* is invalid.
++  *
++  * void *bpf_this_cpu_ptr(const void *percpu_ptr)
++  *	Description
++  *		Take a pointer to a percpu ksym, *percpu_ptr*, and return a
++  *		pointer to the percpu kernel variable on this cpu. See the
++  *		description of 'ksym' in **bpf_per_cpu_ptr**\ ().
++  *
++  *		bpf_this_cpu_ptr() has the same semantic as this_cpu_ptr() in
++  *		the kernel. Different from **bpf_per_cpu_ptr**\ (), it would
++  *		never return NULL.
++  *	Return
++  *		A pointer pointing to the kernel percpu variable on this cpu.
++  *
++  * long bpf_redirect_peer(u32 ifindex, u64 flags)
++  * 	Description
++  * 		Redirect the packet to another net device of index *ifindex*.
++  * 		This helper is somewhat similar to **bpf_redirect**\ (), except
++  * 		that the redirection happens to the *ifindex*' peer device and
++  * 		the netns switch takes place from ingress to ingress without
++  * 		going through the CPU's backlog queue.
++  *
++  * 		The *flags* argument is reserved and must be 0. The helper is
++  * 		currently only supported for tc BPF program types at the ingress
++  * 		hook and for veth device types. The peer device must reside in a
++  * 		different network namespace.
++  * 	Return
++  * 		The helper returns **TC_ACT_REDIRECT** on success or
++  * 		**TC_ACT_SHOT** on error.
+++>>>>>>> 9aa1206e8f48 (bpf: Add redirect_peer helper)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+@@@ -3568,6 -3879,20 +3858,23 @@@
+  	FN(skc_to_tcp_request_sock),	\
+  	FN(skc_to_udp6_sock),		\
+  	FN(get_task_stack),		\
+++<<<<<<< HEAD
+++=======
++ 	FN(load_hdr_opt),		\
++ 	FN(store_hdr_opt),		\
++ 	FN(reserve_hdr_opt),		\
++ 	FN(inode_storage_get),		\
++ 	FN(inode_storage_delete),	\
++ 	FN(d_path),			\
++ 	FN(copy_from_user),		\
++ 	FN(snprintf_btf),		\
++ 	FN(seq_printf_btf),		\
++ 	FN(skb_cgroup_classid),		\
++ 	FN(redirect_neigh),		\
++ 	FN(bpf_per_cpu_ptr),            \
++ 	FN(bpf_this_cpu_ptr),		\
++ 	FN(redirect_peer),		\
+++>>>>>>> 9aa1206e8f48 (bpf: Add redirect_peer helper)
+  	/* */
+  
+  /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+diff --git a/drivers/net/veth.c b/drivers/net/veth.c
+index 780ed93785b3..313d9a5452fb 100644
+--- a/drivers/net/veth.c
++++ b/drivers/net/veth.c
+@@ -440,6 +440,14 @@ static int veth_select_rxq(struct net_device *dev)
+ 	return smp_processor_id() % dev->real_num_rx_queues;
+ }
+ 
++static struct net_device *veth_peer_dev(struct net_device *dev)
++{
++	struct veth_priv *priv = netdev_priv(dev);
++
++	/* Callers must be under RCU read side. */
++	return rcu_dereference(priv->peer);
++}
++
+ static int veth_xdp_xmit(struct net_device *dev, int n,
+ 			 struct xdp_frame **frames,
+ 			 u32 flags, bool ndo_xmit)
+@@ -1245,6 +1253,7 @@ static const struct net_device_ops veth_netdev_ops = {
+ 	.ndo_set_rx_headroom	= veth_set_rx_headroom,
+ 	.ndo_bpf		= veth_xdp,
+ 	.ndo_xdp_xmit		= veth_ndo_xdp_xmit,
++	.ndo_get_peer_dev	= veth_peer_dev,
+ };
+ 
+ #define VETH_FEATURES (NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_HW_CSUM | \
+* Unmerged path include/linux/netdevice.h
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 36e5745172c4..5cd4b5d2ce21 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4799,7 +4799,7 @@ EXPORT_SYMBOL_GPL(br_fdb_test_addr_hook);
+ 
+ static inline struct sk_buff *
+ sch_handle_ingress(struct sk_buff *skb, struct packet_type **pt_prev, int *ret,
+-		   struct net_device *orig_dev)
++		   struct net_device *orig_dev, bool *another)
+ {
+ #ifdef CONFIG_NET_CLS_ACT
+ 	struct mini_Qdisc *miniq = rcu_dereference_bh(skb->dev->miniq_ingress);
+@@ -4845,7 +4845,11 @@ sch_handle_ingress(struct sk_buff *skb, struct packet_type **pt_prev, int *ret,
+ 		 * redirecting to another netdev
+ 		 */
+ 		__skb_push(skb, skb->mac_len);
+-		skb_do_redirect(skb);
++		if (skb_do_redirect(skb) == -EAGAIN) {
++			__skb_pull(skb, skb->mac_len);
++			*another = true;
++			break;
++		}
+ 		return NULL;
+ 	case TC_ACT_CONSUMED:
+ 		return NULL;
+@@ -5032,7 +5036,12 @@ static int __netif_receive_skb_core(struct sk_buff *skb, bool pfmemalloc)
+ skip_taps:
+ #ifdef CONFIG_NET_INGRESS
+ 	if (static_branch_unlikely(&ingress_needed_key)) {
+-		skb = sch_handle_ingress(skb, &pt_prev, &ret, orig_dev);
++		bool another = false;
++
++		skb = sch_handle_ingress(skb, &pt_prev, &ret, orig_dev,
++					 &another);
++		if (another)
++			goto another_round;
+ 		if (!skb)
+ 			goto out;
+ 
+* Unmerged path net/core/filter.c
+* Unmerged path tools/include/uapi/linux/bpf.h
