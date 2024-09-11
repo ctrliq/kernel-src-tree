@@ -251,12 +251,15 @@ static void mlx5_deactivate_lag(struct mlx5_lag *ldev)
 
 static bool mlx5_lag_check_prereq(struct mlx5_lag *ldev)
 {
-	if (ldev->pf[0].dev &&
-	    ldev->pf[1].dev &&
-	    mlx5_esw_lag_prereq(ldev->pf[0].dev, ldev->pf[1].dev))
-		return true;
-	else
+	if (!ldev->pf[0].dev || !ldev->pf[1].dev)
 		return false;
+
+#ifdef CONFIG_MLX5_ESWITCH
+	return mlx5_esw_lag_prereq(ldev->pf[0].dev, ldev->pf[1].dev);
+#else
+	return (!mlx5_sriov_is_enabled(ldev->pf[0].dev) &&
+		!mlx5_sriov_is_enabled(ldev->pf[1].dev));
+#endif
 }
 
 static void mlx5_do_bond(struct mlx5_lag *ldev)
