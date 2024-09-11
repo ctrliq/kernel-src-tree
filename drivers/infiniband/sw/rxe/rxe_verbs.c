@@ -556,6 +556,13 @@ static int init_send_wqe(struct rxe_qp *qp, const struct ib_send_wr *ibwr,
 
 	init_send_wr(qp, &wqe->wr, ibwr);
 
+	/* local operation */
+	if (unlikely(mask & WR_REG_MASK)) {
+		wqe->mask = mask;
+		wqe->state = wqe_state_posted;
+		return 0;
+	}
+
 	if (qp_type(qp) == IB_QPT_UD ||
 	    qp_type(qp) == IB_QPT_SMI ||
 	    qp_type(qp) == IB_QPT_GSI)
@@ -571,13 +578,10 @@ static int init_send_wqe(struct rxe_qp *qp, const struct ib_send_wr *ibwr,
 
 			p += sge->length;
 		}
-	} else if (mask & WR_REG_MASK) {
-		wqe->mask = mask;
-		wqe->state = wqe_state_posted;
-		return 0;
-	} else
+	} else {
 		memcpy(wqe->dma.sge, ibwr->sg_list,
 		       num_sge * sizeof(struct ib_sge));
+	}
 
 	wqe->iova = mask & WR_ATOMIC_MASK ? atomic_wr(ibwr)->remote_addr :
 		mask & WR_READ_OR_WRITE_MASK ? rdma_wr(ibwr)->remote_addr : 0;
@@ -1106,7 +1110,7 @@ int rxe_register_device(struct rxe_dev *rxe, const char *ibdev_name)
 	struct ib_device *dev = &rxe->ib_dev;
 	struct crypto_shash *tfm;
 
-	strlcpy(dev->node_desc, "rxe", sizeof(dev->node_desc));
+	strscpy(dev->node_desc, "rxe", sizeof(dev->node_desc));
 
 	dev->node_type = RDMA_NODE_IB_CA;
 	dev->phys_port_cnt = 1;
