@@ -1,0 +1,86 @@
+sched: Fix balance_push() vs __sched_setscheduler()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 04193d590b390ec7a0592630f46d559ec6564ba1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/04193d59.failed
+
+The purpose of balance_push() is to act as a filter on task selection
+in the case of CPU hotplug, specifically when taking the CPU out.
+
+It does this by (ab)using the balance callback infrastructure, with
+the express purpose of keeping all the unlikely/odd cases in a single
+place.
+
+In order to serve its purpose, the balance_push_callback needs to be
+(exclusively) on the callback list at all times (noting that the
+callback always places itself back on the list the moment it runs,
+also noting that when the CPU goes down, regular balancing concerns
+are moot, so ignoring them is fine).
+
+And here-in lies the problem, __sched_setscheduler()'s use of
+splice_balance_callbacks() takes the callbacks off the list across a
+lock-break, making it possible for, an interleaving, __schedule() to
+see an empty list and not get filtered.
+
+Fixes: ae7927023243 ("sched: Optimize finish_lock_switch()")
+	Reported-by: Jing-Ting Wu <jing-ting.wu@mediatek.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Tested-by: Jing-Ting Wu <jing-ting.wu@mediatek.com>
+Link: https://lkml.kernel.org/r/20220519134706.GH2578@worktop.programming.kicks-ass.net
+(cherry picked from commit 04193d590b390ec7a0592630f46d559ec6564ba1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index 40d3ff08806e,da0bf6fe9ecd..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -3386,8 -4819,21 +3398,26 @@@ __splice_balance_callbacks(struct rq *r
+  {
+  	struct callback_head *head = rq->balance_callback;
+  
+++<<<<<<< HEAD
+ +	lockdep_assert_held(&rq->lock);
+ +	if (head)
+++=======
++ 	if (likely(!head))
++ 		return NULL;
++ 
++ 	lockdep_assert_rq_held(rq);
++ 	/*
++ 	 * Must not take balance_push_callback off the list when
++ 	 * splice_balance_callbacks() and balance_callbacks() are not
++ 	 * in the same rq->lock section.
++ 	 *
++ 	 * In that case it would be possible for __schedule() to interleave
++ 	 * and observe the list empty.
++ 	 */
++ 	if (split && head == &balance_push_callback)
++ 		head = NULL;
++ 	else
+++>>>>>>> 04193d590b39 (sched: Fix balance_push() vs __sched_setscheduler())
+  		rq->balance_callback = NULL;
+  
+  	return head;
+* Unmerged path kernel/sched/core.c
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 9ac43e67b88f..9f026762cf72 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1427,6 +1427,11 @@ queue_balance_callback(struct rq *rq,
+ {
+ 	lockdep_assert_held(&rq->lock);
+ 
++	/*
++	 * Don't (re)queue an already queued item; nor queue anything when
++	 * balance_push() is active, see the comment with
++	 * balance_push_callback.
++	 */
+ 	if (unlikely(head->next || rq->balance_callback == &balance_push_callback))
+ 		return;
+ 
