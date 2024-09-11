@@ -1,0 +1,398 @@
+s390/pci: fix zpci_zdev_put() on reserve
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit a46044a92add6a400f4dada7b943b30221f7cc80
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/a46044a9.failed
+
+Since commit 2a671f77ee49 ("s390/pci: fix use after free of zpci_dev")
+the reference count of a zpci_dev is incremented between
+pcibios_add_device() and pcibios_release_device() which was supposed to
+prevent the zpci_dev from being freed while the common PCI code has
+access to it. It was missed however that the handling of zPCI
+availability events assumed that once zpci_zdev_put() was called no
+later availability event would still see the device. With the previously
+mentioned commit however this assumption no longer holds and we must
+make sure that we only drop the initial long-lived reference the zPCI
+subsystem holds exactly once.
+
+Do so by introducing a zpci_device_reserved() function that handles when
+a device is reserved. Here we make sure the zpci_dev will not be
+considered for further events by removing it from the zpci_list.
+
+This also means that the device actually stays in the
+ZPCI_FN_STATE_RESERVED state between the time we know it has been
+reserved and the final reference going away. We thus need to consider it
+a real state instead of just a conceptual state after the removal. The
+final cleanup of PCI resources, removal from zbus, and destruction of
+the IOMMU stays in zpci_release_device() to make sure holders of the
+reference do see valid data until the release.
+
+Fixes: 2a671f77ee49 ("s390/pci: fix use after free of zpci_dev")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit a46044a92add6a400f4dada7b943b30221f7cc80)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/pci.h
+#	arch/s390/pci/pci.c
+#	arch/s390/pci/pci_event.c
+diff --cc arch/s390/include/asm/pci.h
+index dbdd0473bafe,6b3c366af78e..000000000000
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@@ -197,10 -202,14 +197,18 @@@ extern unsigned int s390_pci_no_rid
+    Prototypes
+  ----------------------------------------------------------------------------- */
+  /* Base stuff */
+ -struct zpci_dev *zpci_create_device(u32 fid, u32 fh, enum zpci_state state);
+ +int zpci_create_device(struct zpci_dev *);
+ +void zpci_remove_device(struct zpci_dev *zdev);
+  int zpci_enable_device(struct zpci_dev *);
+  int zpci_disable_device(struct zpci_dev *);
+++<<<<<<< HEAD
+++=======
++ int zpci_scan_configured_device(struct zpci_dev *zdev, u32 fh);
++ int zpci_deconfigure_device(struct zpci_dev *zdev);
++ void zpci_device_reserved(struct zpci_dev *zdev);
++ bool zpci_is_device_configured(struct zpci_dev *zdev);
++ 
+++>>>>>>> a46044a92add (s390/pci: fix zpci_zdev_put() on reserve)
+  int zpci_register_ioat(struct zpci_dev *, u8, u64, u64, u64);
+  int zpci_unregister_ioat(struct zpci_dev *, u8);
+  void zpci_remove_reserved_devices(void);
+diff --cc arch/s390/pci/pci.c
+index 3f3a6f48ed6c,b833155ce838..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -746,56 -741,152 +746,177 @@@ int zpci_create_device(struct zpci_dev 
+  	list_add_tail(&zdev->entry, &zpci_list);
+  	spin_unlock(&zpci_list_lock);
+  
+++<<<<<<< HEAD
+ +	rc = zpci_init_iommu(zdev);
+++=======
++ 	return zdev;
++ 
++ error_destroy_iommu:
++ 	zpci_destroy_iommu(zdev);
++ error:
++ 	zpci_dbg(0, "add fid:%x, rc:%d\n", fid, rc);
++ 	kfree(zdev);
++ 	return ERR_PTR(rc);
++ }
++ 
++ bool zpci_is_device_configured(struct zpci_dev *zdev)
++ {
++ 	enum zpci_state state = zdev->state;
++ 
++ 	return state != ZPCI_FN_STATE_RESERVED &&
++ 		state != ZPCI_FN_STATE_STANDBY;
++ }
++ 
++ /**
++  * zpci_scan_configured_device() - Scan a freshly configured zpci_dev
++  * @zdev: The zpci_dev to be configured
++  * @fh: The general function handle supplied by the platform
++  *
++  * Given a device in the configuration state Configured, enables, scans and
++  * adds it to the common code PCI subsystem if possible. If the PCI device is
++  * parked because we can not yet create a PCI bus because we have not seen
++  * function 0, it is ignored but will be scanned once function 0 appears.
++  * If any failure occurs, the zpci_dev is left disabled.
++  *
++  * Return: 0 on success, or an error code otherwise
++  */
++ int zpci_scan_configured_device(struct zpci_dev *zdev, u32 fh)
++ {
++ 	int rc;
++ 
++ 	zdev->fh = fh;
++ 	/* the PCI function will be scanned once function 0 appears */
++ 	if (!zdev->zbus->bus)
++ 		return 0;
++ 
++ 	/* For function 0 on a multi-function bus scan whole bus as we might
++ 	 * have to pick up existing functions waiting for it to allow creating
++ 	 * the PCI bus
++ 	 */
++ 	if (zdev->devfn == 0 && zdev->zbus->multifunction)
++ 		rc = zpci_bus_scan_bus(zdev->zbus);
++ 	else
++ 		rc = zpci_bus_scan_device(zdev);
++ 
++ 	return rc;
++ }
++ 
++ /**
++  * zpci_deconfigure_device() - Deconfigure a zpci_dev
++  * @zdev: The zpci_dev to configure
++  *
++  * Deconfigure a zPCI function that is currently configured and possibly known
++  * to the common code PCI subsystem.
++  * If any failure occurs the device is left as is.
++  *
++  * Return: 0 on success, or an error code otherwise
++  */
++ int zpci_deconfigure_device(struct zpci_dev *zdev)
++ {
++ 	int rc;
++ 
++ 	if (zdev->zbus->bus)
++ 		zpci_bus_remove_device(zdev, false);
++ 
++ 	if (zdev->dma_table) {
++ 		rc = zpci_dma_exit_device(zdev);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 	if (zdev_enabled(zdev)) {
++ 		rc = zpci_disable_device(zdev);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	rc = sclp_pci_deconfigure(zdev->fid);
++ 	zpci_dbg(3, "deconf fid:%x, rc:%d\n", zdev->fid, rc);
+++>>>>>>> a46044a92add (s390/pci: fix zpci_zdev_put() on reserve)
+ +	if (rc)
+ +		goto out;
+ +
+ +	mutex_init(&zdev->lock);
+ +	if (zdev->state == ZPCI_FN_STATE_CONFIGURED) {
+ +		rc = zpci_enable_device(zdev);
+ +		if (rc)
+ +			goto out_destroy_iommu;
+ +	}
+ +
+ +	rc = zpci_bus_device_register(zdev, &pci_root_ops);
+  	if (rc)
+ -		return rc;
+ -	zdev->state = ZPCI_FN_STATE_STANDBY;
+ +		goto out_disable;
+  
+  	return 0;
+ +
+ +out_disable:
+ +	if (zdev->state == ZPCI_FN_STATE_ONLINE)
+ +		zpci_disable_device(zdev);
+ +
+ +out_destroy_iommu:
+ +	zpci_destroy_iommu(zdev);
+ +out:
+ +	spin_lock(&zpci_list_lock);
+ +	list_del(&zdev->entry);
+ +	spin_unlock(&zpci_list_lock);
+ +	return rc;
+  }
+  
++ /**
++  * zpci_device_reserved() - Mark device as resverved
++  * @zdev: the zpci_dev that was reserved
++  *
++  * Handle the case that a given zPCI function was reserved by another system.
++  * After a call to this function the zpci_dev can not be found via
++  * get_zdev_by_fid() anymore but may still be accessible via existing
++  * references though it will not be functional anymore.
++  */
++ void zpci_device_reserved(struct zpci_dev *zdev)
++ {
++ 	if (zdev->has_hp_slot)
++ 		zpci_exit_slot(zdev);
++ 	/*
++ 	 * Remove device from zpci_list as it is going away. This also
++ 	 * makes sure we ignore subsequent zPCI events for this device.
++ 	 */
++ 	spin_lock(&zpci_list_lock);
++ 	list_del(&zdev->entry);
++ 	spin_unlock(&zpci_list_lock);
++ 	zdev->state = ZPCI_FN_STATE_RESERVED;
++ 	zpci_dbg(3, "rsv fid:%x\n", zdev->fid);
++ 	zpci_zdev_put(zdev);
++ }
++ 
+  void zpci_release_device(struct kref *kref)
+  {
+  	struct zpci_dev *zdev = container_of(kref, struct zpci_dev, kref);
+ -	int ret;
+  
+  	if (zdev->zbus->bus)
+ -		zpci_bus_remove_device(zdev, false);
+ -
+ -	if (zdev->dma_table)
+ -		zpci_dma_exit_device(zdev);
+ -	if (zdev_enabled(zdev))
+ -		zpci_disable_device(zdev);
+ +		zpci_remove_device(zdev);
+  
+  	switch (zdev->state) {
+ +	case ZPCI_FN_STATE_ONLINE:
+  	case ZPCI_FN_STATE_CONFIGURED:
+ -		ret = sclp_pci_deconfigure(zdev->fid);
+ -		zpci_dbg(3, "deconf fid:%x, rc:%d\n", zdev->fid, ret);
+ -		fallthrough;
+ +		zpci_disable_device(zdev);
+ +		/* fallthrough */
+  	case ZPCI_FN_STATE_STANDBY:
+ -		if (zdev->has_hp_slot)
+ +		if (zdev->has_hp_slot) {
+  			zpci_exit_slot(zdev);
+++<<<<<<< HEAD
+ +		}
+ +		zpci_cleanup_bus_resources(zdev);
+++=======
++ 		spin_lock(&zpci_list_lock);
++ 		list_del(&zdev->entry);
++ 		spin_unlock(&zpci_list_lock);
++ 		zpci_dbg(3, "rsv fid:%x\n", zdev->fid);
++ 		fallthrough;
++ 	case ZPCI_FN_STATE_RESERVED:
++ 		if (zdev->has_resources)
++ 			zpci_cleanup_bus_resources(zdev);
+++>>>>>>> a46044a92add (s390/pci: fix zpci_zdev_put() on reserve)
+  		zpci_bus_device_unregister(zdev);
+  		zpci_destroy_iommu(zdev);
+ -		fallthrough;
+ +		/* fallthrough */
+  	default:
+  		break;
+  	}
+diff --cc arch/s390/pci/pci_event.c
+index 40a569b548cc,5b8d647523f9..000000000000
+--- a/arch/s390/pci/pci_event.c
++++ b/arch/s390/pci/pci_event.c
+@@@ -89,70 -102,46 +89,84 @@@ static void __zpci_event_availability(s
+  	switch (ccdf->pec) {
+  	case 0x0301: /* Reserved|Standby -> Configured */
+  		if (!zdev) {
+ -			zdev = zpci_create_device(ccdf->fid, ccdf->fh, ZPCI_FN_STATE_CONFIGURED);
+ -			if (IS_ERR(zdev))
+ -				break;
+ -		} else {
+ -			/* the configuration request may be stale */
+ -			if (zdev->state != ZPCI_FN_STATE_STANDBY)
+ -				break;
+ -			zdev->state = ZPCI_FN_STATE_CONFIGURED;
+ +			ret = clp_add_pci_device(ccdf->fid, ccdf->fh, 1);
+ +			break;
+  		}
+ -		zpci_scan_configured_device(zdev, ccdf->fh);
+ +		/* the configuration request may be stale */
+ +		if (zdev->state != ZPCI_FN_STATE_STANDBY)
+ +			break;
+ +		zdev->fh = ccdf->fh;
+ +		zdev->state = ZPCI_FN_STATE_CONFIGURED;
+ +		ret = zpci_enable_device(zdev);
+ +		if (ret)
+ +			break;
+ +
+ +		/* the PCI function will be scanned once function 0 appears */
+ +		if (!zdev->zbus->bus)
+ +			break;
+ +
+ +		pdev = pci_scan_single_device(zdev->zbus->bus, zdev->devfn);
+ +		if (!pdev)
+ +			break;
+ +
+ +		pci_bus_add_device(pdev);
+ +		pci_lock_rescan_remove();
+ +		pci_bus_add_devices(zdev->zbus->bus);
+ +		pci_unlock_rescan_remove();
+  		break;
+  	case 0x0302: /* Reserved -> Standby */
+ -		if (!zdev)
+ -			zpci_create_device(ccdf->fid, ccdf->fh, ZPCI_FN_STATE_STANDBY);
+ -		else
+ -			zdev->fh = ccdf->fh;
+ +		if (!zdev) {
+ +			clp_add_pci_device(ccdf->fid, ccdf->fh, 0);
+ +			break;
+ +		}
+ +		zdev->fh = ccdf->fh;
+  		break;
+  	case 0x0303: /* Deconfiguration requested */
+ -		if (zdev) {
+ -			/* The event may have been queued before we confirgured
+ -			 * the device.
+ -			 */
+ -			if (zdev->state != ZPCI_FN_STATE_CONFIGURED)
+ -				break;
+ -			zdev->fh = ccdf->fh;
+ -			zpci_deconfigure_device(zdev);
+ -		}
+ +		if (!zdev)
+ +			break;
+ +		if (pdev)
+ +			zpci_remove_device(zdev);
+ +
+ +		ret = zpci_disable_device(zdev);
+ +		if (ret)
+ +			break;
+ +
+ +		ret = sclp_pci_deconfigure(zdev->fid);
+ +		zpci_dbg(3, "deconf fid:%x, rc:%d\n", zdev->fid, ret);
+ +		if (!ret)
+ +			zdev->state = ZPCI_FN_STATE_STANDBY;
+ +
+  		break;
+  	case 0x0304: /* Configured -> Standby|Reserved */
+++<<<<<<< HEAD
+ +		if (!zdev)
+ +			break;
+ +		if (pdev) {
+ +			/* Give the driver a hint that the function is
+ +			 * already unusable. */
+ +			pdev->error_state = pci_channel_io_perm_failure;
+ +			zpci_remove_device(zdev);
+ +		}
+ +
+ +		zdev->fh = ccdf->fh;
+ +		zpci_disable_device(zdev);
+ +		zdev->state = ZPCI_FN_STATE_STANDBY;
+ +		if (!clp_get_state(ccdf->fid, &state) &&
+ +		    state == ZPCI_FN_STATE_RESERVED) {
+ +			zpci_zdev_put(zdev);
+++=======
++ 		if (zdev) {
++ 			/* The event may have been queued before we confirgured
++ 			 * the device.:
++ 			 */
++ 			if (zdev->state == ZPCI_FN_STATE_CONFIGURED)
++ 				zpci_event_hard_deconfigured(zdev, ccdf->fh);
++ 			/* The 0x0304 event may immediately reserve the device */
++ 			if (!clp_get_state(zdev->fid, &state) &&
++ 			    state == ZPCI_FN_STATE_RESERVED) {
++ 				zpci_device_reserved(zdev);
++ 			}
+++>>>>>>> a46044a92add (s390/pci: fix zpci_zdev_put() on reserve)
+  		}
+  		break;
+  	case 0x0306: /* 0x308 or 0x302 for multiple devices */
+* Unmerged path arch/s390/include/asm/pci.h
+* Unmerged path arch/s390/pci/pci.c
+* Unmerged path arch/s390/pci/pci_event.c
+diff --git a/drivers/pci/hotplug/s390_pci_hpc.c b/drivers/pci/hotplug/s390_pci_hpc.c
+index c9e790c74051..8534cf105796 100644
+--- a/drivers/pci/hotplug/s390_pci_hpc.c
++++ b/drivers/pci/hotplug/s390_pci_hpc.c
+@@ -108,14 +108,7 @@ static int get_power_status(struct hotplug_slot *hotplug_slot, u8 *value)
+ 	struct zpci_dev *zdev = container_of(hotplug_slot, struct zpci_dev,
+ 					     hotplug_slot);
+ 
+-	switch (zdev->state) {
+-	case ZPCI_FN_STATE_STANDBY:
+-		*value = 0;
+-		break;
+-	default:
+-		*value = 1;
+-		break;
+-	}
++	*value = zpci_is_device_configured(zdev) ? 1 : 0;
+ 	return 0;
+ }
+ 
