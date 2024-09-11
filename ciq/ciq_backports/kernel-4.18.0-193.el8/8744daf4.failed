@@ -1,0 +1,132 @@
+iommu/vt-d: Remove global page flush support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [iommu] vt-d: Remove global page flush support (Jerry Snitselaar) [1742234]
+Rebuild_FUZZ: 92.68%
+commit-author Jacob Pan <jacob.jun.pan@linux.intel.com>
+commit 8744daf4b0699b724ee0a56b313a6c0c4ea289e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/8744daf4.failed
+
+Global pages support is removed from VT-d spec 3.0. Since global pages G
+flag only affects first-level paging structures and because DMA request
+with PASID are only supported by VT-d spec. 3.0 and onward, we can
+safely remove global pages support.
+
+For kernel shared virtual address IOTLB invalidation, PASID
+granularity and page selective within PASID will be used. There is
+no global granularity supported. Without this fix, IOTLB invalidation
+will cause invalid descriptor error in the queued invalidation (QI)
+interface.
+
+Fixes: 1c4f88b7f1f9 ("iommu/vt-d: Shared virtual address in scalable mode")
+	Reported-by: Sanjay K Kumar <sanjay.k.kumar@intel.com>
+	Signed-off-by: Jacob Pan <jacob.jun.pan@linux.intel.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 8744daf4b0699b724ee0a56b313a6c0c4ea289e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-svm.c
+diff --cc drivers/iommu/intel-svm.c
+index 9792b5535b23,9b159132405d..000000000000
+--- a/drivers/iommu/intel-svm.c
++++ b/drivers/iommu/intel-svm.c
+@@@ -220,14 -160,9 +214,14 @@@ static void intel_flush_svm_range(struc
+  {
+  	struct intel_svm_dev *sdev;
+  
+ +	/* Try deferred invalidate if available */
+ +	if (svm->iommu->pasid_state_table &&
+ +	    !cmpxchg64(&svm->iommu->pasid_state_table[svm->pasid].val, 0, 1ULL << 63))
+ +		return;
+ +
+  	rcu_read_lock();
+  	list_for_each_entry_rcu(sdev, &svm->devs, list)
+- 		intel_flush_svm_range_dev(svm, sdev, address, pages, ih, gl);
++ 		intel_flush_svm_range_dev(svm, sdev, address, pages, ih);
+  	rcu_read_unlock();
+  }
+  
+@@@ -239,23 -174,9 +233,23 @@@ static void intel_invalidate_range(stru
+  	struct intel_svm *svm = container_of(mn, struct intel_svm, notifier);
+  
+  	intel_flush_svm_range(svm, start,
+- 			      (end - start + PAGE_SIZE - 1) >> VTD_PAGE_SHIFT, 0, 0);
++ 			      (end - start + PAGE_SIZE - 1) >> VTD_PAGE_SHIFT, 0);
+  }
+  
+ +
+ +static void intel_flush_pasid_dev(struct intel_svm *svm, struct intel_svm_dev *sdev, int pasid)
+ +{
+ +	struct qi_desc desc;
+ +
+ +	desc.qw0 = QI_PC_TYPE | QI_PC_DID(sdev->did) |
+ +			QI_PC_PASID_SEL | QI_PC_PASID(pasid);
+ +	desc.qw1 = 0;
+ +	desc.qw2 = 0;
+ +	desc.qw3 = 0;
+ +
+ +	qi_submit_sync(&desc, svm->iommu);
+ +}
+ +
+  static void intel_mm_release(struct mmu_notifier *mn, struct mm_struct *mm)
+  {
+  	struct intel_svm *svm = container_of(mn, struct intel_svm, notifier);
+@@@ -273,13 -194,10 +267,18 @@@
+  	 * page) so that we end up taking a fault that the hardware really
+  	 * *has* to handle gracefully without affecting other processes.
+  	 */
+ +	svm->iommu->pasid_table[svm->pasid].val = 0;
+ +	wmb();
+ +
+  	rcu_read_lock();
+  	list_for_each_entry_rcu(sdev, &svm->devs, list) {
+++<<<<<<< HEAD
+ +		intel_flush_pasid_dev(svm, sdev, svm->pasid);
+ +		intel_flush_svm_range_dev(svm, sdev, 0, -1, 0, !svm->mm);
+++=======
++ 		intel_pasid_tear_down_entry(svm->iommu, sdev->dev, svm->pasid);
++ 		intel_flush_svm_range_dev(svm, sdev, 0, -1, 0);
+++>>>>>>> 8744daf4b069 (iommu/vt-d: Remove global page flush support)
+  	}
+  	rcu_read_unlock();
+  
+@@@ -486,8 -418,8 +485,13 @@@ int intel_svm_unbind_mm(struct device *
+  				 * to use. We have a *shared* PASID table, because it's
+  				 * large and has to be physically contiguous. So it's
+  				 * hard to be as defensive as we might like. */
+++<<<<<<< HEAD
+ +				intel_flush_pasid_dev(svm, sdev, svm->pasid);
+ +				intel_flush_svm_range_dev(svm, sdev, 0, -1, 0, !svm->mm);
+++=======
++ 				intel_pasid_tear_down_entry(iommu, dev, svm->pasid);
++ 				intel_flush_svm_range_dev(svm, sdev, 0, -1, 0);
+++>>>>>>> 8744daf4b069 (iommu/vt-d: Remove global page flush support)
+  				kfree_rcu(sdev, rcu);
+  
+  				if (list_empty(&svm->devs)) {
+* Unmerged path drivers/iommu/intel-svm.c
+diff --git a/include/linux/intel-iommu.h b/include/linux/intel-iommu.h
+index 8d42a6ffd805..5a733999f888 100644
+--- a/include/linux/intel-iommu.h
++++ b/include/linux/intel-iommu.h
+@@ -337,7 +337,6 @@ enum {
+ #define QI_PC_PASID_SEL		(QI_PC_TYPE | QI_PC_GRAN(1))
+ 
+ #define QI_EIOTLB_ADDR(addr)	((u64)(addr) & VTD_PAGE_MASK)
+-#define QI_EIOTLB_GL(gl)	(((u64)gl) << 7)
+ #define QI_EIOTLB_IH(ih)	(((u64)ih) << 6)
+ #define QI_EIOTLB_AM(am)	(((u64)am))
+ #define QI_EIOTLB_PASID(pasid) 	(((u64)pasid) << 32)
+@@ -369,8 +368,6 @@ enum {
+ #define QI_RESP_INVALID		0x1
+ #define QI_RESP_FAILURE		0xf
+ 
+-#define QI_GRAN_ALL_ALL			0
+-#define QI_GRAN_NONG_ALL		1
+ #define QI_GRAN_NONG_PASID		2
+ #define QI_GRAN_PSI_PASID		3
+ 
