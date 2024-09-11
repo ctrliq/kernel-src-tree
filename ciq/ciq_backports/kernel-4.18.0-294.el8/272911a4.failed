@@ -1,0 +1,361 @@
+mm: memcg/slab: remove memcg_kmem_get_cache()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit 272911a4ad18c48f8bc449a5db945a54987dd687
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/272911a4.failed
+
+The memcg_kmem_get_cache() function became really trivial, so let's just
+inline it into the single call point: memcg_slab_pre_alloc_hook().
+
+It will make the code less bulky and can also help the compiler to
+generate a better code.
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Tejun Heo <tj@kernel.org>
+Link: http://lkml.kernel.org/r/20200623174037.3951353-15-guro@fb.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 272911a4ad18c48f8bc449a5db945a54987dd687)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+#	mm/memcontrol.c
+#	mm/slab.h
+diff --cc include/linux/memcontrol.h
+index 72fba94a643f,5a8b62d075e6..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -1345,11 -1396,13 +1345,14 @@@ static inline bool mem_cgroup_under_soc
+  {
+  	return false;
+  }
+ -
+ -static inline void memcg_set_shrinker_bit(struct mem_cgroup *memcg,
+ -					  int nid, int shrinker_id)
+ -{
+ -}
+  #endif
+  
+++<<<<<<< HEAD
+ +struct kmem_cache *memcg_kmem_get_cache(struct kmem_cache *cachep);
+ +void memcg_kmem_put_cache(struct kmem_cache *cachep);
+ +
+++=======
+++>>>>>>> 272911a4ad18 (mm: memcg/slab: remove memcg_kmem_get_cache())
+  #ifdef CONFIG_MEMCG_KMEM
+  int __memcg_kmem_charge(struct mem_cgroup *memcg, gfp_t gfp,
+  			unsigned int nr_pages);
+diff --cc mm/memcontrol.c
+index 13b0a0f8cd33,a8113b77b23a..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -2828,139 -2900,7 +2828,142 @@@ static void memcg_free_cache_id(int id
+  	ida_simple_remove(&memcg_cache_ida, id);
+  }
+  
+ +struct memcg_kmem_cache_create_work {
+ +	struct mem_cgroup *memcg;
+ +	struct kmem_cache *cachep;
+ +	struct work_struct work;
+ +};
+ +
+ +static void memcg_kmem_cache_create_func(struct work_struct *w)
+ +{
+ +	struct memcg_kmem_cache_create_work *cw =
+ +		container_of(w, struct memcg_kmem_cache_create_work, work);
+ +	struct mem_cgroup *memcg = cw->memcg;
+ +	struct kmem_cache *cachep = cw->cachep;
+ +
+ +	memcg_create_kmem_cache(memcg, cachep);
+ +
+ +	css_put(&memcg->css);
+ +	kfree(cw);
+ +}
+ +
+ +/*
+ + * Enqueue the creation of a per-memcg kmem_cache.
+ + */
+ +static void memcg_schedule_kmem_cache_create(struct mem_cgroup *memcg,
+ +					       struct kmem_cache *cachep)
+ +{
+ +	struct memcg_kmem_cache_create_work *cw;
+ +
+ +	if (!css_tryget_online(&memcg->css))
+ +		return;
+ +
+ +	cw = kmalloc(sizeof(*cw), GFP_NOWAIT | __GFP_NOWARN);
+ +	if (!cw) {
+ +		css_put(&memcg->css);
+ +		return;
+ +	}
+ +
+ +	cw->memcg = memcg;
+ +	cw->cachep = cachep;
+ +	INIT_WORK(&cw->work, memcg_kmem_cache_create_func);
+ +
+ +	queue_work(memcg_kmem_cache_wq, &cw->work);
+ +}
+ +
+  /**
+++<<<<<<< HEAD
+ + * memcg_kmem_get_cache: select the correct per-memcg cache for allocation
+ + * @cachep: the original global kmem cache
+ + *
+ + * Return the kmem_cache we're supposed to use for a slab allocation.
+ + * We try to use the current memcg's version of the cache.
+ + *
+ + * If the cache does not exist yet, if we are the first user of it, we
+ + * create it asynchronously in a workqueue and let the current allocation
+ + * go through with the original cache.
+ + *
+ + * This function takes a reference to the cache it returns to assure it
+ + * won't get destroyed while we are working with it. Once the caller is
+ + * done with it, memcg_kmem_put_cache() must be called to release the
+ + * reference.
+ + */
+ +struct kmem_cache *memcg_kmem_get_cache(struct kmem_cache *cachep)
+ +{
+ +	struct mem_cgroup *memcg;
+ +	struct kmem_cache *memcg_cachep;
+ +	struct memcg_cache_array *arr;
+ +	int kmemcg_id;
+ +
+ +	VM_BUG_ON(!is_root_cache(cachep));
+ +
+ +	if (memcg_kmem_bypass())
+ +		return cachep;
+ +
+ +	rcu_read_lock();
+ +
+ +	if (unlikely(current->active_memcg))
+ +		memcg = current->active_memcg;
+ +	else
+ +		memcg = mem_cgroup_from_task(current);
+ +
+ +	if (!memcg || memcg == root_mem_cgroup)
+ +		goto out_unlock;
+ +
+ +	kmemcg_id = READ_ONCE(memcg->kmemcg_id);
+ +	if (kmemcg_id < 0)
+ +		goto out_unlock;
+ +
+ +	arr = rcu_dereference(cachep->memcg_params.memcg_caches);
+ +
+ +	/*
+ +	 * Make sure we will access the up-to-date value. The code updating
+ +	 * memcg_caches issues a write barrier to match the data dependency
+ +	 * barrier inside READ_ONCE() (see memcg_create_kmem_cache()).
+ +	 */
+ +	memcg_cachep = READ_ONCE(arr->entries[kmemcg_id]);
+ +
+ +	/*
+ +	 * If we are in a safe context (can wait, and not in interrupt
+ +	 * context), we could be be predictable and return right away.
+ +	 * This would guarantee that the allocation being performed
+ +	 * already belongs in the new cache.
+ +	 *
+ +	 * However, there are some clashes that can arrive from locking.
+ +	 * For instance, because we acquire the slab_mutex while doing
+ +	 * memcg_create_kmem_cache, this means no further allocation
+ +	 * could happen with the slab_mutex held. So it's better to
+ +	 * defer everything.
+ +	 *
+ +	 * If the memcg is dying or memcg_cache is about to be released,
+ +	 * don't bother creating new kmem_caches. Because memcg_cachep
+ +	 * is ZEROed as the fist step of kmem offlining, we don't need
+ +	 * percpu_ref_tryget_live() here. css_tryget_online() check in
+ +	 * memcg_schedule_kmem_cache_create() will prevent us from
+ +	 * creation of a new kmem_cache.
+ +	 */
+ +	if (unlikely(!memcg_cachep))
+ +		memcg_schedule_kmem_cache_create(memcg, cachep);
+ +	else if (percpu_ref_tryget(&memcg_cachep->memcg_params.refcnt))
+ +		cachep = memcg_cachep;
+ +out_unlock:
+ +	rcu_read_unlock();
+ +	return cachep;
+ +}
+ +
+ +/**
+ + * memcg_kmem_put_cache: drop reference taken by memcg_kmem_get_cache
+ + * @cachep: the cache returned by memcg_kmem_get_cache
+ + */
+ +void memcg_kmem_put_cache(struct kmem_cache *cachep)
+ +{
+ +	if (!is_root_cache(cachep))
+ +		percpu_ref_put(&cachep->memcg_params.refcnt);
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> 272911a4ad18 (mm: memcg/slab: remove memcg_kmem_get_cache())
+   * __memcg_kmem_charge: charge a number of kernel pages to a memcg
+   * @memcg: memory cgroup to charge
+   * @gfp: reclaim mode
+diff --cc mm/slab.h
+index 45ad57de9d88,342eac852967..000000000000
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@@ -278,55 -307,92 +278,117 @@@ static inline struct mem_cgroup *memcg_
+  	return NULL;
+  }
+  
+ -static inline struct obj_cgroup **page_obj_cgroups(struct page *page)
+ +/*
+ + * Charge the slab page belonging to the non-root kmem_cache.
+ + * Can be called for non-root kmem_caches only.
+ + */
+ +static __always_inline int memcg_charge_slab(struct page *page,
+ +					     gfp_t gfp, int order,
+ +					     struct kmem_cache *s)
+  {
+ -	/*
+ -	 * page->mem_cgroup and page->obj_cgroups are sharing the same
+ -	 * space. To distinguish between them in case we don't know for sure
+ -	 * that the page is a slab page (e.g. page_cgroup_ino()), let's
+ -	 * always set the lowest bit of obj_cgroups.
+ -	 */
+ -	return (struct obj_cgroup **)
+ -		((unsigned long)page->obj_cgroups & ~0x1UL);
+ -}
+ +	int nr_pages = 1 << order;
+ +	struct mem_cgroup *memcg;
+ +	struct lruvec *lruvec;
+ +	int ret;
+  
+ -static inline bool page_has_obj_cgroups(struct page *page)
+ -{
+ -	return ((unsigned long)page->obj_cgroups & 0x1UL);
+ -}
+ +	rcu_read_lock();
+ +	memcg = READ_ONCE(s->memcg_params.memcg);
+ +	while (memcg && !css_tryget_online(&memcg->css))
+ +		memcg = parent_mem_cgroup(memcg);
+ +	rcu_read_unlock();
+  
+++<<<<<<< HEAD
+ +	if (unlikely(!memcg || mem_cgroup_is_root(memcg))) {
+ +		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ +				    nr_pages);
+ +		percpu_ref_get_many(&s->memcg_params.refcnt, nr_pages);
+ +		return 0;
+++=======
++ static inline int memcg_alloc_page_obj_cgroups(struct page *page,
++ 					       struct kmem_cache *s, gfp_t gfp)
++ {
++ 	unsigned int objects = objs_per_slab_page(s, page);
++ 	void *vec;
++ 
++ 	vec = kcalloc_node(objects, sizeof(struct obj_cgroup *), gfp,
++ 			   page_to_nid(page));
++ 	if (!vec)
++ 		return -ENOMEM;
++ 
++ 	kmemleak_not_leak(vec);
++ 	page->obj_cgroups = (struct obj_cgroup **) ((unsigned long)vec | 0x1UL);
++ 	return 0;
++ }
++ 
++ static inline void memcg_free_page_obj_cgroups(struct page *page)
++ {
++ 	kfree(page_obj_cgroups(page));
++ 	page->obj_cgroups = NULL;
++ }
++ 
++ static inline size_t obj_full_size(struct kmem_cache *s)
++ {
++ 	/*
++ 	 * For each accounted object there is an extra space which is used
++ 	 * to store obj_cgroup membership. Charge it too.
++ 	 */
++ 	return s->size + sizeof(struct obj_cgroup *);
++ }
++ 
++ static inline struct kmem_cache *memcg_slab_pre_alloc_hook(struct kmem_cache *s,
++ 						struct obj_cgroup **objcgp,
++ 						size_t objects, gfp_t flags)
++ {
++ 	struct kmem_cache *cachep;
++ 	struct obj_cgroup *objcg;
++ 
++ 	if (memcg_kmem_bypass())
++ 		return s;
++ 
++ 	cachep = READ_ONCE(s->memcg_params.memcg_cache);
++ 	if (unlikely(!cachep)) {
++ 		/*
++ 		 * If memcg cache does not exist yet, we schedule it's
++ 		 * asynchronous creation and let the current allocation
++ 		 * go through with the root cache.
++ 		 */
++ 		queue_work(system_wq, &s->memcg_params.work);
++ 		return s;
++ 	}
++ 
++ 	objcg = get_obj_cgroup_from_current();
++ 	if (!objcg)
++ 		return s;
++ 
++ 	if (obj_cgroup_charge(objcg, flags, objects * obj_full_size(s))) {
++ 		obj_cgroup_put(objcg);
++ 		cachep = NULL;
+++>>>>>>> 272911a4ad18 (mm: memcg/slab: remove memcg_kmem_get_cache())
+  	}
+  
+ -	*objcgp = objcg;
+ -	return cachep;
+ +	ret = memcg_kmem_charge(memcg, gfp, nr_pages);
+ +	if (ret)
+ +		goto out;
+ +
+ +	lruvec = mem_cgroup_lruvec(memcg, page_pgdat(page));
+ +	mod_lruvec_state(lruvec, cache_vmstat_idx(s), nr_pages);
+ +
+ +	/* transer try_charge() page references to kmem_cache */
+ +	percpu_ref_get_many(&s->memcg_params.refcnt, nr_pages);
+ +	css_put_many(&memcg->css, nr_pages);
+ +out:
+ +	css_put(&memcg->css);
+ +	return ret;
+  }
+  
+ -static inline void mod_objcg_state(struct obj_cgroup *objcg,
+ -				   struct pglist_data *pgdat,
+ -				   int idx, int nr)
+ +/*
+ + * Uncharge a slab page belonging to a non-root kmem_cache.
+ + * Can be called for non-root kmem_caches only.
+ + */
+ +static __always_inline void memcg_uncharge_slab(struct page *page, int order,
+ +						struct kmem_cache *s)
+  {
+ +	int nr_pages = 1 << order;
+  	struct mem_cgroup *memcg;
+  	struct lruvec *lruvec;
+  
+* Unmerged path include/linux/memcontrol.h
+* Unmerged path mm/memcontrol.c
+* Unmerged path mm/slab.h
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index dd4f84ee402c..e54a4bd62c03 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -703,7 +703,7 @@ void memcg_create_kmem_cache(struct mem_cgroup *memcg,
+ 	}
+ 
+ 	/*
+-	 * Since readers won't lock (see memcg_kmem_get_cache()), we need a
++	 * Since readers won't lock (see memcg_slab_pre_alloc_hook()), we need a
+ 	 * barrier here to ensure nobody will see the kmem_cache partially
+ 	 * initialized.
+ 	 */
