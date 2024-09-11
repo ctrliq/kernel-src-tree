@@ -1,0 +1,366 @@
+selftests/vm/pkeys: introduce powerpc support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Ram Pai <linuxram@us.ibm.com>
+commit 589944b53b0f913b89f5b6bc50d53c38a252ba0f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/589944b5.failed
+
+This makes use of the abstractions added earlier and introduces support
+for powerpc.
+
+For powerpc, after receiving the SIGSEGV, the signal handler must
+explicitly restore access permissions for the faulting pkey to allow the
+test to continue.  As this makes use of pkey_access_allow(), all of its
+dependencies and other similar functions have been moved ahead of the
+signal handler.
+
+[sandipan@linux.ibm.com: fix powerpc access right updates]
+  Link: http://lkml.kernel.org/r/5f65cf37be993760de8112a88da194e3ccbb2bf8.1588959697.git.sandipan@linux.ibm.com
+	Signed-off-by: Ram Pai <linuxram@us.ibm.com>
+	Signed-off-by: Sandipan Das <sandipan@linux.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Acked-by: Dave Hansen <dave.hansen@intel.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Florian Weimer <fweimer@redhat.com>
+	Cc: "Desnes A. Nunes do Rosario" <desnesn@linux.vnet.ibm.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Thiago Jung Bauermann <bauerman@linux.ibm.com>
+	Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Michal Suchanek <msuchanek@suse.de>
+	Cc: Shuah Khan <shuah@kernel.org>
+Link: http://lkml.kernel.org/r/b121e9fd33789ed9195276e32fe4e80bb6b88a31.1585646528.git.sandipan@linux.ibm.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 589944b53b0f913b89f5b6bc50d53c38a252ba0f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/vm/pkey-helpers.h
+#	tools/testing/selftests/x86/protection_keys.c
+diff --cc tools/testing/selftests/x86/protection_keys.c
+index 9b8be6a43dde,e6de078a9196..000000000000
+--- a/tools/testing/selftests/x86/protection_keys.c
++++ b/tools/testing/selftests/x86/protection_keys.c
+@@@ -230,182 -165,13 +230,185 @@@ void dump_mem(void *dumpme, int len_byt
+  
+  	for (i = 0; i < len_bytes; i += sizeof(u64)) {
+  		u64 *ptr = (u64 *)(c + i);
+ -		dprintf1("dump[%03d][@%p]: %016llx\n", i, ptr, *ptr);
+ +		dprintf1("dump[%03d][@%p]: %016jx\n", i, ptr, *ptr);
+ +	}
+ +}
+ +
+++<<<<<<< HEAD:tools/testing/selftests/x86/protection_keys.c
+ +/* Failed address bound checks: */
+ +#ifndef SEGV_BNDERR
+ +# define SEGV_BNDERR		3
+ +#endif
+ +
+ +#ifndef SEGV_PKUERR
+ +# define SEGV_PKUERR		4
+ +#endif
+ +
+ +static char *si_code_str(int si_code)
+ +{
+ +	if (si_code == SEGV_MAPERR)
+ +		return "SEGV_MAPERR";
+ +	if (si_code == SEGV_ACCERR)
+ +		return "SEGV_ACCERR";
+ +	if (si_code == SEGV_BNDERR)
+ +		return "SEGV_BNDERR";
+ +	if (si_code == SEGV_PKUERR)
+ +		return "SEGV_PKUERR";
+ +	return "UNKNOWN";
+ +}
+ +
+ +int pkru_faults;
+ +int last_si_pkey = -1;
+ +void signal_handler(int signum, siginfo_t *si, void *vucontext)
+ +{
+ +	ucontext_t *uctxt = vucontext;
+ +	int trapno;
+ +	unsigned long ip;
+ +	char *fpregs;
+ +	u32 *pkru_ptr;
+ +	u64 siginfo_pkey;
+ +	u32 *si_pkey_ptr;
+ +	int pkru_offset;
+ +	fpregset_t fpregset;
+ +
+ +	dprint_in_signal = 1;
+ +	dprintf1(">>>>===============SIGSEGV============================\n");
+ +	dprintf1("%s()::%d, pkru: 0x%x shadow: %x\n", __func__, __LINE__,
+ +			__rdpkru(), shadow_pkru);
+ +
+ +	trapno = uctxt->uc_mcontext.gregs[REG_TRAPNO];
+ +	ip = uctxt->uc_mcontext.gregs[REG_IP_IDX];
+ +	fpregset = uctxt->uc_mcontext.fpregs;
+ +	fpregs = (void *)fpregset;
+ +
+ +	dprintf2("%s() trapno: %d ip: 0x%lx info->si_code: %s/%d\n", __func__,
+ +			trapno, ip, si_code_str(si->si_code), si->si_code);
+ +#ifdef __i386__
+ +	/*
+ +	 * 32-bit has some extra padding so that userspace can tell whether
+ +	 * the XSTATE header is present in addition to the "legacy" FPU
+ +	 * state.  We just assume that it is here.
+ +	 */
+ +	fpregs += 0x70;
+ +#endif
+ +	pkru_offset = pkru_xstate_offset();
+ +	pkru_ptr = (void *)(&fpregs[pkru_offset]);
+ +
+ +	dprintf1("siginfo: %p\n", si);
+ +	dprintf1(" fpregs: %p\n", fpregs);
+ +	/*
+ +	 * If we got a PKRU fault, we *HAVE* to have at least one bit set in
+ +	 * here.
+ +	 */
+ +	dprintf1("pkru_xstate_offset: %d\n", pkru_xstate_offset());
+ +	if (DEBUG_LEVEL > 4)
+ +		dump_mem(pkru_ptr - 128, 256);
+ +	pkey_assert(*pkru_ptr);
+ +
+ +	if ((si->si_code == SEGV_MAPERR) ||
+ +	    (si->si_code == SEGV_ACCERR) ||
+ +	    (si->si_code == SEGV_BNDERR)) {
+ +		printf("non-PK si_code, exiting...\n");
+ +		exit(4);
+  	}
+ +
+ +	si_pkey_ptr = (u32 *)(((u8 *)si) + si_pkey_offset);
+ +	dprintf1("si_pkey_ptr: %p\n", si_pkey_ptr);
+ +	dump_mem((u8 *)si_pkey_ptr - 8, 24);
+ +	siginfo_pkey = *si_pkey_ptr;
+ +	pkey_assert(siginfo_pkey < NR_PKEYS);
+ +	last_si_pkey = siginfo_pkey;
+ +
+ +	dprintf1("signal pkru from xsave: %08x\n", *pkru_ptr);
+ +	/* need __rdpkru() version so we do not do shadow_pkru checking */
+ +	dprintf1("signal pkru from  pkru: %08x\n", __rdpkru());
+ +	dprintf1("pkey from siginfo: %jx\n", siginfo_pkey);
+ +	*(u64 *)pkru_ptr = 0x00000000;
+ +	dprintf1("WARNING: set PRKU=0 to allow faulting instruction to continue\n");
+ +	pkru_faults++;
+ +	dprintf1("<<<<==================================================\n");
+ +	dprint_in_signal = 0;
+ +}
+ +
+ +int wait_all_children(void)
+ +{
+ +	int status;
+ +	return waitpid(-1, &status, 0);
+ +}
+ +
+ +void sig_chld(int x)
+ +{
+ +	dprint_in_signal = 1;
+ +	dprintf2("[%d] SIGCHLD: %d\n", getpid(), x);
+ +	dprint_in_signal = 0;
+ +}
+ +
+ +void setup_sigsegv_handler(void)
+ +{
+ +	int r, rs;
+ +	struct sigaction newact;
+ +	struct sigaction oldact;
+ +
+ +	/* #PF is mapped to sigsegv */
+ +	int signum  = SIGSEGV;
+ +
+ +	newact.sa_handler = 0;
+ +	newact.sa_sigaction = signal_handler;
+ +
+ +	/*sigset_t - signals to block while in the handler */
+ +	/* get the old signal mask. */
+ +	rs = sigprocmask(SIG_SETMASK, 0, &newact.sa_mask);
+ +	pkey_assert(rs == 0);
+ +
+ +	/* call sa_sigaction, not sa_handler*/
+ +	newact.sa_flags = SA_SIGINFO;
+ +
+ +	newact.sa_restorer = 0;  /* void(*)(), obsolete */
+ +	r = sigaction(signum, &newact, &oldact);
+ +	r = sigaction(SIGALRM, &newact, &oldact);
+ +	pkey_assert(r == 0);
+ +}
+ +
+ +void setup_handlers(void)
+ +{
+ +	signal(SIGCHLD, &sig_chld);
+ +	setup_sigsegv_handler();
+  }
+  
+ +pid_t fork_lazy_child(void)
+ +{
+ +	pid_t forkret;
+ +
+ +	forkret = fork();
+ +	pkey_assert(forkret >= 0);
+ +	dprintf3("[%d] fork() ret: %d\n", getpid(), forkret);
+ +
+ +	if (!forkret) {
+ +		/* in the child */
+ +		while (1) {
+ +			dprintf1("child sleeping...\n");
+ +			sleep(30);
+ +		}
+ +	}
+ +	return forkret;
+ +}
+ +
+ +#ifndef PKEY_DISABLE_ACCESS
+ +# define PKEY_DISABLE_ACCESS	0x1
+ +#endif
+ +
+ +#ifndef PKEY_DISABLE_WRITE
+ +# define PKEY_DISABLE_WRITE	0x2
+ +#endif
+ +
+++=======
+++>>>>>>> 589944b53b0f (selftests/vm/pkeys: introduce powerpc support):tools/testing/selftests/vm/protection_keys.c
+  static u32 hw_pkey_get(int pkey, unsigned long flags)
+  {
+ -	u64 pkey_reg = __read_pkey_reg();
+ +	u32 mask = (PKEY_DISABLE_ACCESS|PKEY_DISABLE_WRITE);
+ +	u32 pkru = __rdpkru();
+ +	u32 shifted_pkru;
+ +	u32 masked_pkru;
+  
+  	dprintf1("%s(pkey=%d, flags=%lx) = %x / %d\n",
+  			__func__, pkey, flags, 0, 0);
+@@@ -950,17 -899,21 +1126,25 @@@ void expected_pk_fault(int pkey
+  	if (pkey != UNKNOWN_PKEY)
+  		pkey_assert(last_si_pkey == pkey);
+  
++ #if defined(__i386__) || defined(__x86_64__) /* arch */
+  	/*
+ -	 * The signal handler shold have cleared out PKEY register to let the
+ +	 * The signal handler shold have cleared out PKRU to let the
+  	 * test program continue.  We now have to restore it.
+  	 */
+++<<<<<<< HEAD:tools/testing/selftests/x86/protection_keys.c
+ +	if (__rdpkru() != 0)
+++=======
++ 	if (__read_pkey_reg() != 0)
++ #else /* arch */
++ 	if (__read_pkey_reg() != shadow_pkey_reg)
++ #endif /* arch */
+++>>>>>>> 589944b53b0f (selftests/vm/pkeys: introduce powerpc support):tools/testing/selftests/vm/protection_keys.c
+  		pkey_assert(0);
+  
+ -	__write_pkey_reg(shadow_pkey_reg);
+ -	dprintf1("%s() set pkey_reg=%016llx to restore state after signal "
+ -		       "nuked it\n", __func__, shadow_pkey_reg);
+ -	last_pkey_faults = pkey_faults;
+ +	__wrpkru(shadow_pkru);
+ +	dprintf1("%s() set PKRU=%x to restore state after signal nuked it\n",
+ +			__func__, shadow_pkru);
+ +	last_pkru_faults = pkru_faults;
+  	last_si_pkey = -1;
+  }
+  
+* Unmerged path tools/testing/selftests/vm/pkey-helpers.h
+* Unmerged path tools/testing/selftests/vm/pkey-helpers.h
+diff --git a/tools/testing/selftests/vm/pkey-powerpc.h b/tools/testing/selftests/vm/pkey-powerpc.h
+new file mode 100644
+index 000000000000..3fded948856d
+--- /dev/null
++++ b/tools/testing/selftests/vm/pkey-powerpc.h
+@@ -0,0 +1,91 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef _PKEYS_POWERPC_H
++#define _PKEYS_POWERPC_H
++
++#ifndef SYS_mprotect_key
++# define SYS_mprotect_key	386
++#endif
++#ifndef SYS_pkey_alloc
++# define SYS_pkey_alloc		384
++# define SYS_pkey_free		385
++#endif
++#define REG_IP_IDX		PT_NIP
++#define REG_TRAPNO		PT_TRAP
++#define gregs			gp_regs
++#define fpregs			fp_regs
++#define si_pkey_offset		0x20
++
++#ifndef PKEY_DISABLE_ACCESS
++# define PKEY_DISABLE_ACCESS	0x3  /* disable read and write */
++#endif
++
++#ifndef PKEY_DISABLE_WRITE
++# define PKEY_DISABLE_WRITE	0x2
++#endif
++
++#define NR_PKEYS		32
++#define NR_RESERVED_PKEYS_4K	27 /* pkey-0, pkey-1, exec-only-pkey
++				      and 24 other keys that cannot be
++				      represented in the PTE */
++#define NR_RESERVED_PKEYS_64K	3  /* pkey-0, pkey-1 and exec-only-pkey */
++#define PKEY_BITS_PER_PKEY	2
++#define HPAGE_SIZE		(1UL << 24)
++#define PAGE_SIZE		(1UL << 16)
++
++static inline u32 pkey_bit_position(int pkey)
++{
++	return (NR_PKEYS - pkey - 1) * PKEY_BITS_PER_PKEY;
++}
++
++static inline u64 __read_pkey_reg(void)
++{
++	u64 pkey_reg;
++
++	asm volatile("mfspr %0, 0xd" : "=r" (pkey_reg));
++
++	return pkey_reg;
++}
++
++static inline void __write_pkey_reg(u64 pkey_reg)
++{
++	u64 amr = pkey_reg;
++
++	dprintf4("%s() changing %016llx to %016llx\n",
++			 __func__, __read_pkey_reg(), pkey_reg);
++
++	asm volatile("isync; mtspr 0xd, %0; isync"
++		     : : "r" ((unsigned long)(amr)) : "memory");
++
++	dprintf4("%s() pkey register after changing %016llx to %016llx\n",
++			__func__, __read_pkey_reg(), pkey_reg);
++}
++
++static inline int cpu_has_pku(void)
++{
++	return 1;
++}
++
++static inline int get_arch_reserved_keys(void)
++{
++	if (sysconf(_SC_PAGESIZE) == 4096)
++		return NR_RESERVED_PKEYS_4K;
++	else
++		return NR_RESERVED_PKEYS_64K;
++}
++
++void expect_fault_on_read_execonly_key(void *p1, int pkey)
++{
++	/*
++	 * powerpc does not allow userspace to change permissions of exec-only
++	 * keys since those keys are not allocated by userspace. The signal
++	 * handler wont be able to reset the permissions, which means the code
++	 * will infinitely continue to segfault here.
++	 */
++	return;
++}
++
++/* 4-byte instructions * 16384 = 64K page */
++#define __page_o_noops() asm(".rept 16384 ; nop; .endr")
++
++#endif /* _PKEYS_POWERPC_H */
+* Unmerged path tools/testing/selftests/x86/protection_keys.c
