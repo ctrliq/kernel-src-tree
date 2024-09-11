@@ -1,0 +1,780 @@
+sched: Introduce task_is_running()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit b03fbd4ff24c5f075e58eb19261d5f8b3e40d7c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b03fbd4f.failed
+
+Replace a bunch of 'p->state == TASK_RUNNING' with a new helper:
+task_is_running(p).
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Davidlohr Bueso <dave@stgolabs.net>
+	Acked-by: Geert Uytterhoeven <geert@linux-m68k.org>
+	Acked-by: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20210611082838.222401495@infradead.org
+(cherry picked from commit b03fbd4ff24c5f075e58eb19261d5f8b3e40d7c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arc/kernel/stacktrace.c
+#	arch/csky/kernel/stacktrace.c
+#	arch/parisc/kernel/process.c
+#	kernel/kcsan/report.c
+diff --cc arch/arc/kernel/stacktrace.c
+index bf40e06f3fb8,1b9576d21e24..000000000000
+--- a/arch/arc/kernel/stacktrace.c
++++ b/arch/arc/kernel/stacktrace.c
+@@@ -66,13 -75,17 +66,19 @@@ static void seed_unwind_frame_info(stru
+  		frame_info->regs.r31 = blink;
+  		frame_info->regs.r63 = ret;
+  		frame_info->call_frame = 0;
+ -	} else {
+ +	} else if (regs == NULL) {
+  		/*
+ -		 * Asynchronous unwinding of a likely sleeping task
+ -		 *  - first ensure it is actually sleeping
+ -		 *  - if so, it will be in __switch_to, kernel mode SP of task
+ -		 *    is safe-kept and BLINK at a well known location in there
+ +		 * Asynchronous unwinding of sleeping task
+ +		 *  - Gets SP etc from task's pt_regs (saved bottom of kernel
+ +		 *    mode stack of task)
+  		 */
+  
+++<<<<<<< HEAD
+++=======
++ 		if (task_is_running(tsk))
++ 			return -1;
++ 
+++>>>>>>> b03fbd4ff24c (sched: Introduce task_is_running())
+  		frame_info->task = tsk;
+  
+  		frame_info->regs.r27 = TSK_K_FP(tsk);
+diff --cc arch/parisc/kernel/process.c
+index b931745815e0,184ec3c1eae4..000000000000
+--- a/arch/parisc/kernel/process.c
++++ b/arch/parisc/kernel/process.c
+@@@ -299,6 -260,8 +299,11 @@@ get_wchan(struct task_struct *p
+  	do {
+  		if (unwind_once(&info) < 0)
+  			return 0;
+++<<<<<<< HEAD
+++=======
++ 		if (task_is_running(p))
++                         return 0;
+++>>>>>>> b03fbd4ff24c (sched: Introduce task_is_running())
+  		ip = info.ip;
+  		if (!in_sched_functions(ip))
+  			return ip;
+diff --cc kernel/kcsan/report.c
+index 11c791b886f3,56016e8e7461..000000000000
+--- a/kernel/kcsan/report.c
++++ b/kernel/kcsan/report.c
+@@@ -358,126 -447,155 +358,267 @@@ static void release_report(unsigned lon
+  }
+  
+  /*
+ - * Sets @other_info->task and awaits consumption of @other_info.
+ - *
+ - * Precondition: report_lock is held.
+ - * Postcondition: report_lock is held.
+ + * Depending on the report type either sets other_info and returns false, or
+ + * acquires the matching other_info and returns true. If other_info is not
+ + * required for the report type, simply acquires report_lock and returns true.
+   */
+ -static void set_other_info_task_blocking(unsigned long *flags,
+ -					 const struct access_info *ai,
+ -					 struct other_info *other_info)
+ +static bool prepare_report(unsigned long *flags, const volatile void *ptr,
+ +			   size_t size, int access_type, int cpu_id,
+ +			   enum kcsan_report_type type)
+  {
+++<<<<<<< HEAD
+ +	if (type != KCSAN_REPORT_CONSUMED_WATCHPOINT &&
+ +	    type != KCSAN_REPORT_RACE_SIGNAL) {
+ +		/* other_info not required; just acquire report_lock */
+ +		spin_lock_irqsave(&report_lock, *flags);
+++=======
++ 	/*
++ 	 * We may be instrumenting a code-path where current->state is already
++ 	 * something other than TASK_RUNNING.
++ 	 */
++ 	const bool is_running = task_is_running(current);
++ 	/*
++ 	 * To avoid deadlock in case we are in an interrupt here and this is a
++ 	 * race with a task on the same CPU (KCSAN_INTERRUPT_WATCHER), provide a
++ 	 * timeout to ensure this works in all contexts.
++ 	 *
++ 	 * Await approximately the worst case delay of the reporting thread (if
++ 	 * we are not interrupted).
++ 	 */
++ 	int timeout = max(kcsan_udelay_task, kcsan_udelay_interrupt);
++ 
++ 	other_info->task = current;
++ 	do {
++ 		if (is_running) {
++ 			/*
++ 			 * Let lockdep know the real task is sleeping, to print
++ 			 * the held locks (recall we turned lockdep off, so
++ 			 * locking/unlocking @report_lock won't be recorded).
++ 			 */
++ 			set_current_state(TASK_UNINTERRUPTIBLE);
++ 		}
++ 		raw_spin_unlock_irqrestore(&report_lock, *flags);
++ 		/*
++ 		 * We cannot call schedule() since we also cannot reliably
++ 		 * determine if sleeping here is permitted -- see in_atomic().
++ 		 */
++ 
++ 		udelay(1);
++ 		raw_spin_lock_irqsave(&report_lock, *flags);
++ 		if (timeout-- < 0) {
++ 			/*
++ 			 * Abort. Reset @other_info->task to NULL, since it
++ 			 * appears the other thread is still going to consume
++ 			 * it. It will result in no verbose info printed for
++ 			 * this task.
++ 			 */
++ 			other_info->task = NULL;
++ 			break;
++ 		}
++ 		/*
++ 		 * If invalid, or @ptr nor @current matches, then @other_info
++ 		 * has been consumed and we may continue. If not, retry.
++ 		 */
++ 	} while (other_info->ai.size && other_info->ai.ptr == ai->ptr &&
++ 		 other_info->task == current);
++ 	if (is_running)
++ 		set_current_state(TASK_RUNNING);
++ }
++ 
++ /* Populate @other_info; requires that the provided @other_info not in use. */
++ static void prepare_report_producer(unsigned long *flags,
++ 				    const struct access_info *ai,
++ 				    struct other_info *other_info)
++ {
++ 	raw_spin_lock_irqsave(&report_lock, *flags);
++ 
++ 	/*
++ 	 * The same @other_infos entry cannot be used concurrently, because
++ 	 * there is a one-to-one mapping to watchpoint slots (@watchpoints in
++ 	 * core.c), and a watchpoint is only released for reuse after reporting
++ 	 * is done by the consumer of @other_info. Therefore, it is impossible
++ 	 * for another concurrent prepare_report_producer() to set the same
++ 	 * @other_info, and are guaranteed exclusivity for the @other_infos
++ 	 * entry pointed to by @other_info.
++ 	 *
++ 	 * To check this property holds, size should never be non-zero here,
++ 	 * because every consumer of struct other_info resets size to 0 in
++ 	 * release_report().
++ 	 */
++ 	WARN_ON(other_info->ai.size);
++ 
++ 	other_info->ai = *ai;
++ 	other_info->num_stack_entries = stack_trace_save(other_info->stack_entries, NUM_STACK_ENTRIES, 2);
++ 
++ 	if (IS_ENABLED(CONFIG_KCSAN_VERBOSE))
++ 		set_other_info_task_blocking(flags, ai, other_info);
++ 
++ 	raw_spin_unlock_irqrestore(&report_lock, *flags);
++ }
++ 
++ /* Awaits producer to fill @other_info and then returns. */
++ static bool prepare_report_consumer(unsigned long *flags,
++ 				    const struct access_info *ai,
++ 				    struct other_info *other_info)
++ {
++ 
++ 	raw_spin_lock_irqsave(&report_lock, *flags);
++ 	while (!other_info->ai.size) { /* Await valid @other_info. */
++ 		raw_spin_unlock_irqrestore(&report_lock, *flags);
++ 		cpu_relax();
++ 		raw_spin_lock_irqsave(&report_lock, *flags);
++ 	}
++ 
++ 	/* Should always have a matching access based on watchpoint encoding. */
++ 	if (WARN_ON(!matching_access((unsigned long)other_info->ai.ptr & WATCHPOINT_ADDR_MASK, other_info->ai.size,
++ 				     (unsigned long)ai->ptr & WATCHPOINT_ADDR_MASK, ai->size)))
++ 		goto discard;
++ 
++ 	if (!matching_access((unsigned long)other_info->ai.ptr, other_info->ai.size,
++ 			     (unsigned long)ai->ptr, ai->size)) {
++ 		/*
++ 		 * If the actual accesses to not match, this was a false
++ 		 * positive due to watchpoint encoding.
++ 		 */
++ 		atomic_long_inc(&kcsan_counters[KCSAN_COUNTER_ENCODING_FALSE_POSITIVES]);
++ 		goto discard;
++ 	}
++ 
++ 	return true;
++ 
++ discard:
++ 	release_report(flags, other_info);
++ 	return false;
++ }
++ 
++ /*
++  * Depending on the report type either sets @other_info and returns false, or
++  * awaits @other_info and returns true. If @other_info is not required for the
++  * report type, simply acquires @report_lock and returns true.
++  */
++ static noinline bool prepare_report(unsigned long *flags,
++ 				    enum kcsan_report_type type,
++ 				    const struct access_info *ai,
++ 				    struct other_info *other_info)
++ {
++ 	switch (type) {
++ 	case KCSAN_REPORT_CONSUMED_WATCHPOINT:
++ 		prepare_report_producer(flags, ai, other_info);
++ 		return false;
++ 	case KCSAN_REPORT_RACE_SIGNAL:
++ 		return prepare_report_consumer(flags, ai, other_info);
++ 	default:
++ 		/* @other_info not required; just acquire @report_lock. */
++ 		raw_spin_lock_irqsave(&report_lock, *flags);
+++>>>>>>> b03fbd4ff24c (sched: Introduce task_is_running())
+ +		return true;
+ +	}
+ +
+ +retry:
+ +	spin_lock_irqsave(&report_lock, *flags);
+ +
+ +	switch (type) {
+ +	case KCSAN_REPORT_CONSUMED_WATCHPOINT:
+ +		if (other_info.ptr != NULL)
+ +			break; /* still in use, retry */
+ +
+ +		other_info.ptr			= ptr;
+ +		other_info.size			= size;
+ +		other_info.access_type		= access_type;
+ +		other_info.task_pid		= in_task() ? task_pid_nr(current) : -1;
+ +		other_info.cpu_id		= cpu_id;
+ +		other_info.num_stack_entries	= stack_trace_save(other_info.stack_entries, NUM_STACK_ENTRIES, 1);
+ +
+ +		spin_unlock_irqrestore(&report_lock, *flags);
+ +
+ +		/*
+ +		 * The other thread will print the summary; other_info may now
+ +		 * be consumed.
+ +		 */
+ +		return false;
+ +
+ +	case KCSAN_REPORT_RACE_SIGNAL:
+ +		if (other_info.ptr == NULL)
+ +			break; /* no data available yet, retry */
+ +
+ +		/*
+ +		 * First check if this is the other_info we are expecting, i.e.
+ +		 * matches based on how watchpoint was encoded.
+ +		 */
+ +		if (!matching_access((unsigned long)other_info.ptr &
+ +					     WATCHPOINT_ADDR_MASK,
+ +				     other_info.size,
+ +				     (unsigned long)ptr & WATCHPOINT_ADDR_MASK,
+ +				     size))
+ +			break; /* mismatching watchpoint, retry */
+ +
+ +		if (!matching_access((unsigned long)other_info.ptr,
+ +				     other_info.size, (unsigned long)ptr,
+ +				     size)) {
+ +			/*
+ +			 * If the actual accesses to not match, this was a false
+ +			 * positive due to watchpoint encoding.
+ +			 */
+ +			kcsan_counter_inc(
+ +				KCSAN_COUNTER_ENCODING_FALSE_POSITIVES);
+ +
+ +			/* discard this other_info */
+ +			release_report(flags, KCSAN_REPORT_RACE_SIGNAL);
+ +			return false;
+ +		}
+ +
+ +		access_type |= other_info.access_type;
+ +		if ((access_type & KCSAN_ACCESS_WRITE) == 0) {
+ +			/*
+ +			 * While the address matches, this is not the other_info
+ +			 * from the thread that consumed our watchpoint, since
+ +			 * neither this nor the access in other_info is a write.
+ +			 * It is invalid to continue with the report, since we
+ +			 * only have information about reads.
+ +			 *
+ +			 * This can happen due to concurrent races on the same
+ +			 * address, with at least 4 threads. To avoid locking up
+ +			 * other_info and all other threads, we have to consume
+ +			 * it regardless.
+ +			 *
+ +			 * A concrete case to illustrate why we might lock up if
+ +			 * we do not consume other_info:
+ +			 *
+ +			 *   We have 4 threads, all accessing the same address
+ +			 *   (or matching address ranges). Assume the following
+ +			 *   watcher and watchpoint consumer pairs:
+ +			 *   write1-read1, read2-write2. The first to populate
+ +			 *   other_info is write2, however, write1 consumes it,
+ +			 *   resulting in a report of write1-write2. This report
+ +			 *   is valid, however, now read1 populates other_info;
+ +			 *   read2-read1 is an invalid conflict, yet, no other
+ +			 *   conflicting access is left. Therefore, we must
+ +			 *   consume read1's other_info.
+ +			 *
+ +			 * Since this case is assumed to be rare, it is
+ +			 * reasonable to omit this report: one of the other
+ +			 * reports includes information about the same shared
+ +			 * data, and at this point the likelihood that we
+ +			 * re-report the same race again is high.
+ +			 */
+ +			release_report(flags, KCSAN_REPORT_RACE_SIGNAL);
+ +			return false;
+ +		}
+ +
+ +		/*
+ +		 * Matching & usable access in other_info: keep other_info_lock
+ +		 * locked, as this thread consumes it to print the full report;
+ +		 * unlocked in release_report.
+ +		 */
+  		return true;
+ +
+ +	default:
+ +		BUG();
+  	}
+ +
+ +	spin_unlock_irqrestore(&report_lock, *flags);
+ +
+ +	goto retry;
+  }
+  
+  void kcsan_report(const volatile void *ptr, size_t size, int access_type,
+* Unmerged path arch/csky/kernel/stacktrace.c
+diff --git a/arch/alpha/kernel/process.c b/arch/alpha/kernel/process.c
+index 48b81d015d8a..96895e69f76f 100644
+--- a/arch/alpha/kernel/process.c
++++ b/arch/alpha/kernel/process.c
+@@ -382,7 +382,7 @@ get_wchan(struct task_struct *p)
+ {
+ 	unsigned long schedule_frame;
+ 	unsigned long pc;
+-	if (!p || p == current || p->state == TASK_RUNNING)
++	if (!p || p == current || task_is_running(p))
+ 		return 0;
+ 	/*
+ 	 * This one depends on the frame size of schedule().  Do a
+* Unmerged path arch/arc/kernel/stacktrace.c
+diff --git a/arch/arm/kernel/process.c b/arch/arm/kernel/process.c
+index d9c299133111..f499d7e54c1f 100644
+--- a/arch/arm/kernel/process.c
++++ b/arch/arm/kernel/process.c
+@@ -299,7 +299,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 	struct stackframe frame;
+ 	unsigned long stack_page;
+ 	int count = 0;
+-	if (!p || p == current || p->state == TASK_RUNNING)
++	if (!p || p == current || task_is_running(p))
+ 		return 0;
+ 
+ 	frame.fp = thread_saved_fp(p);
+diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
+index 44a20d71dac5..520b0ae6b5c1 100644
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -527,7 +527,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 	struct stackframe frame;
+ 	unsigned long stack_page, ret = 0;
+ 	int count = 0;
+-	if (!p || p == current || p->state == TASK_RUNNING)
++	if (!p || p == current || task_is_running(p))
+ 		return 0;
+ 
+ 	stack_page = (unsigned long)try_get_task_stack(p);
+* Unmerged path arch/csky/kernel/stacktrace.c
+diff --git a/arch/h8300/kernel/process.c b/arch/h8300/kernel/process.c
+index e35cdf092e07..039a87e6ccfa 100644
+--- a/arch/h8300/kernel/process.c
++++ b/arch/h8300/kernel/process.c
+@@ -136,7 +136,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 	unsigned long stack_page;
+ 	int count = 0;
+ 
+-	if (!p || p == current || p->state == TASK_RUNNING)
++	if (!p || p == current || task_is_running(p))
+ 		return 0;
+ 
+ 	stack_page = (unsigned long)p;
+diff --git a/arch/hexagon/kernel/process.c b/arch/hexagon/kernel/process.c
+index 656050c2e6a0..c35c098c5cc8 100644
+--- a/arch/hexagon/kernel/process.c
++++ b/arch/hexagon/kernel/process.c
+@@ -148,7 +148,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 	unsigned long fp, pc;
+ 	unsigned long stack_page;
+ 	int count = 0;
+-	if (!p || p == current || p->state == TASK_RUNNING)
++	if (!p || p == current || task_is_running(p))
+ 		return 0;
+ 
+ 	stack_page = (unsigned long)task_stack_page(p);
+diff --git a/arch/ia64/kernel/process.c b/arch/ia64/kernel/process.c
+index 968b5f33e725..a40e44d7b154 100644
+--- a/arch/ia64/kernel/process.c
++++ b/arch/ia64/kernel/process.c
+@@ -597,7 +597,7 @@ get_wchan (struct task_struct *p)
+ 	unsigned long ip;
+ 	int count = 0;
+ 
+-	if (!p || p == current || p->state == TASK_RUNNING)
++	if (!p || p == current || task_is_running(p))
+ 		return 0;
+ 
+ 	/*
+@@ -610,7 +610,7 @@ get_wchan (struct task_struct *p)
+ 	 */
+ 	unw_init_from_blocked_task(&info, p);
+ 	do {
+-		if (p->state == TASK_RUNNING)
++		if (task_is_running(p))
+ 			return 0;
+ 		if (unw_unwind(&info) < 0)
+ 			return 0;
+diff --git a/arch/m68k/kernel/process.c b/arch/m68k/kernel/process.c
+index 4e77a06735c1..eba5698f6d8f 100644
+--- a/arch/m68k/kernel/process.c
++++ b/arch/m68k/kernel/process.c
+@@ -249,7 +249,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 	unsigned long fp, pc;
+ 	unsigned long stack_page;
+ 	int count = 0;
+-	if (!p || p == current || p->state == TASK_RUNNING)
++	if (!p || p == current || task_is_running(p))
+ 		return 0;
+ 
+ 	stack_page = (unsigned long)task_stack_page(p);
+diff --git a/arch/mips/kernel/process.c b/arch/mips/kernel/process.c
+index 9670e70139fd..9bbfa3f9e7e0 100644
+--- a/arch/mips/kernel/process.c
++++ b/arch/mips/kernel/process.c
+@@ -626,7 +626,7 @@ unsigned long get_wchan(struct task_struct *task)
+ 	unsigned long ra = 0;
+ #endif
+ 
+-	if (!task || task == current || task->state == TASK_RUNNING)
++	if (!task || task == current || task_is_running(task))
+ 		goto out;
+ 	if (!task_stack_page(task))
+ 		goto out;
+diff --git a/arch/nds32/kernel/process.c b/arch/nds32/kernel/process.c
+index 65fda986e55f..40c12597d27b 100644
+--- a/arch/nds32/kernel/process.c
++++ b/arch/nds32/kernel/process.c
+@@ -185,7 +185,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 	unsigned long stack_start, stack_end;
+ 	int count = 0;
+ 
+-	if (!p || p == current || p->state == TASK_RUNNING)
++	if (!p || p == current || task_is_running(p))
+ 		return 0;
+ 
+ 	if (IS_ENABLED(CONFIG_FRAME_POINTER)) {
+diff --git a/arch/nios2/kernel/process.c b/arch/nios2/kernel/process.c
+index 509e7855e8dc..75abeda818d8 100644
+--- a/arch/nios2/kernel/process.c
++++ b/arch/nios2/kernel/process.c
+@@ -223,7 +223,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 	unsigned long stack_page;
+ 	int count = 0;
+ 
+-	if (!p || p == current || p->state == TASK_RUNNING)
++	if (!p || p == current || task_is_running(p))
+ 		return 0;
+ 
+ 	stack_page = (unsigned long)p;
+* Unmerged path arch/parisc/kernel/process.c
+diff --git a/arch/powerpc/kernel/process.c b/arch/powerpc/kernel/process.c
+index f53683882378..7f12fa79216a 100644
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@ -2044,7 +2044,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 	unsigned long ip, sp;
+ 	int count = 0;
+ 
+-	if (!p || p == current || p->state == TASK_RUNNING)
++	if (!p || p == current || task_is_running(p))
+ 		return 0;
+ 
+ 	sp = p->thread.ksp;
+@@ -2054,7 +2054,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 	do {
+ 		sp = *(unsigned long *)sp;
+ 		if (!validate_sp(sp, p, STACK_FRAME_OVERHEAD) ||
+-		    p->state == TASK_RUNNING)
++		    task_is_running(p))
+ 			return 0;
+ 		if (count > 0) {
+ 			ip = ((unsigned long *)sp)[STACK_FRAME_LR_SAVE];
+diff --git a/arch/riscv/kernel/stacktrace.c b/arch/riscv/kernel/stacktrace.c
+index 4d403274c2e8..5013deec1d23 100644
+--- a/arch/riscv/kernel/stacktrace.c
++++ b/arch/riscv/kernel/stacktrace.c
+@@ -135,7 +135,7 @@ unsigned long get_wchan(struct task_struct *task)
+ {
+ 	unsigned long pc = 0;
+ 
+-	if (likely(task && task != current && task->state != TASK_RUNNING))
++	if (likely(task && task != current && !task_is_running(task)))
+ 		walk_stackframe(task, NULL, save_wchan, &pc);
+ 	return pc;
+ }
+diff --git a/arch/s390/kernel/process.c b/arch/s390/kernel/process.c
+index b59c7492ee71..bf8986bd2430 100644
+--- a/arch/s390/kernel/process.c
++++ b/arch/s390/kernel/process.c
+@@ -182,7 +182,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 	unsigned long return_address;
+ 	int count;
+ 
+-	if (!p || p == current || p->state == TASK_RUNNING || !task_stack_page(p))
++	if (!p || p == current || task_is_running(p) || !task_stack_page(p))
+ 		return 0;
+ 
+ 	if (!try_get_task_stack(p))
+diff --git a/arch/s390/mm/fault.c b/arch/s390/mm/fault.c
+index c0fa6ab8ddac..0984668b3cec 100644
+--- a/arch/s390/mm/fault.c
++++ b/arch/s390/mm/fault.c
+@@ -763,7 +763,7 @@ static void pfault_interrupt(struct ext_code ext_code,
+ 			 * interrupt since it must be a leftover of a PFAULT
+ 			 * CANCEL operation which didn't remove all pending
+ 			 * completion interrupts. */
+-			if (tsk->state == TASK_RUNNING)
++			if (task_is_running(tsk))
+ 				tsk->thread.pfault_wait = -1;
+ 		}
+ 	} else {
+diff --git a/arch/sh/kernel/process_32.c b/arch/sh/kernel/process_32.c
+index 27fddb56b3e1..20af563b312a 100644
+--- a/arch/sh/kernel/process_32.c
++++ b/arch/sh/kernel/process_32.c
+@@ -212,7 +212,7 @@ unsigned long get_wchan(struct task_struct *p)
+ {
+ 	unsigned long pc;
+ 
+-	if (!p || p == current || p->state == TASK_RUNNING)
++	if (!p || p == current || task_is_running(p))
+ 		return 0;
+ 
+ 	/*
+diff --git a/arch/sparc/kernel/process_32.c b/arch/sparc/kernel/process_32.c
+index d9662cf7e648..1c57cc13788e 100644
+--- a/arch/sparc/kernel/process_32.c
++++ b/arch/sparc/kernel/process_32.c
+@@ -466,8 +466,7 @@ unsigned long get_wchan(struct task_struct *task)
+ 	struct reg_window32 *rw;
+ 	int count = 0;
+ 
+-	if (!task || task == current ||
+-            task->state == TASK_RUNNING)
++	if (!task || task == current || task_is_running(task))
+ 		goto out;
+ 
+ 	fp = task_thread_info(task)->ksp + bias;
+diff --git a/arch/sparc/kernel/process_64.c b/arch/sparc/kernel/process_64.c
+index 6c086086ca8f..912d75f5c8db 100644
+--- a/arch/sparc/kernel/process_64.c
++++ b/arch/sparc/kernel/process_64.c
+@@ -762,8 +762,7 @@ unsigned long get_wchan(struct task_struct *task)
+         unsigned long ret = 0;
+ 	int count = 0; 
+ 
+-	if (!task || task == current ||
+-            task->state == TASK_RUNNING)
++	if (!task || task == current || task_is_running(task))
+ 		goto out;
+ 
+ 	tp = task_thread_info(task);
+diff --git a/arch/um/kernel/process.c b/arch/um/kernel/process.c
+index 691b83b10649..aa07ffaca9fb 100644
+--- a/arch/um/kernel/process.c
++++ b/arch/um/kernel/process.c
+@@ -362,7 +362,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 	unsigned long stack_page, sp, ip;
+ 	bool seen_sched = 0;
+ 
+-	if ((p == NULL) || (p == current) || (p->state == TASK_RUNNING))
++	if ((p == NULL) || (p == current) || task_is_running(p))
+ 		return 0;
+ 
+ 	stack_page = (unsigned long) task_stack_page(p);
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index 56f2acf80dcb..4a8be74535ab 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -909,7 +909,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 	unsigned long start, bottom, top, sp, fp, ip, ret = 0;
+ 	int count = 0;
+ 
+-	if (p == current || p->state == TASK_RUNNING)
++	if (p == current || task_is_running(p))
+ 		return 0;
+ 
+ 	if (!try_get_task_stack(p))
+@@ -953,7 +953,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 			goto out;
+ 		}
+ 		fp = READ_ONCE_NOCHECK(*(unsigned long *)fp);
+-	} while (count++ < 16 && p->state != TASK_RUNNING);
++	} while (count++ < 16 && !task_is_running(p));
+ 
+ out:
+ 	put_task_stack(p);
+diff --git a/arch/xtensa/kernel/process.c b/arch/xtensa/kernel/process.c
+index 483dcfb6e681..84959997ac4e 100644
+--- a/arch/xtensa/kernel/process.c
++++ b/arch/xtensa/kernel/process.c
+@@ -301,7 +301,7 @@ unsigned long get_wchan(struct task_struct *p)
+ 	unsigned long stack_page = (unsigned long) task_stack_page(p);
+ 	int count = 0;
+ 
+-	if (!p || p == current || p->state == TASK_RUNNING)
++	if (!p || p == current || task_is_running(p))
+ 		return 0;
+ 
+ 	sp = p->thread.sp;
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index cde7957a5b9a..3041db448da0 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -4025,7 +4025,7 @@ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
+ 		if (signal_pending_state(state, current))
+ 			__set_current_state(TASK_RUNNING);
+ 
+-		if (current->state == TASK_RUNNING)
++		if (task_is_running(current))
+ 			return 1;
+ 		if (ret < 0 || !spin)
+ 			break;
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 0e3e386fa1a7..dc33c4f315b6 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -111,6 +111,8 @@ struct task_group;
+ 					 __TASK_TRACED | EXIT_DEAD | EXIT_ZOMBIE | \
+ 					 TASK_PARKED)
+ 
++#define task_is_running(task)		(READ_ONCE((task)->state) == TASK_RUNNING)
++
+ #define task_is_traced(task)		((task->state & __TASK_TRACED) != 0)
+ 
+ #define task_is_stopped(task)		((task->state & __TASK_STOPPED) != 0)
+* Unmerged path kernel/kcsan/report.c
+diff --git a/kernel/locking/lockdep.c b/kernel/locking/lockdep.c
+index 8f3cee77a9fe..67006822a81c 100644
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@ -759,7 +759,7 @@ static void lockdep_print_held_locks(struct task_struct *p)
+ 	 * It's not reliable to print a task's held locks if it's not sleeping
+ 	 * and it's not the current task.
+ 	 */
+-	if (p->state == TASK_RUNNING && p != current)
++	if (p != current && task_is_running(p))
+ 		return;
+ 	for (i = 0; i < depth; i++) {
+ 		printk(" #%d: ", i);
+diff --git a/kernel/rcu/tree_plugin.h b/kernel/rcu/tree_plugin.h
+index 34892608f6d3..bbf671fdb251 100644
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@ -2390,7 +2390,7 @@ EXPORT_SYMBOL_GPL(rcu_bind_current_to_nocb);
+ #ifdef CONFIG_SMP
+ static char *show_rcu_should_be_on_cpu(struct task_struct *tsp)
+ {
+-	return tsp && tsp->state == TASK_RUNNING && !tsp->on_cpu ? "!" : "";
++	return tsp && task_is_running(tsp) && !tsp->on_cpu ? "!" : "";
+ }
+ #else // #ifdef CONFIG_SMP
+ static char *show_rcu_should_be_on_cpu(struct task_struct *tsp)
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index ecbd538e5ed4..0a1e2f0702d1 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3904,7 +3904,7 @@ static inline void sched_submit_work(struct task_struct *tsk)
+ {
+ 	unsigned int task_flags;
+ 
+-	if (!tsk->state)
++	if (task_is_running(tsk))
+ 		return;
+ 
+ 	task_flags = tsk->flags;
+@@ -5609,7 +5609,7 @@ int __sched yield_to(struct task_struct *p, bool preempt)
+ 	if (curr->sched_class != p->sched_class)
+ 		goto out_unlock;
+ 
+-	if (task_running(p_rq, p) || p->state)
++	if (task_running(p_rq, p) || !task_is_running(p))
+ 		goto out_unlock;
+ 
+ 	yielded = curr->sched_class->yield_to_task(rq, p);
+@@ -5813,7 +5813,7 @@ void sched_show_task(struct task_struct *p)
+ 
+ 	pr_info("task:%-15.15s state:%c", p->comm, task_state_to_char(p));
+ 
+-	if (p->state == TASK_RUNNING)
++	if (task_is_running(p))
+ 		pr_cont("  running task    ");
+ #ifdef CONFIG_DEBUG_STACK_USAGE
+ 	free = stack_not_used(p);
+diff --git a/kernel/sched/stats.h b/kernel/sched/stats.h
+index 7fdd211f99e1..174c6ed79bfc 100644
+--- a/kernel/sched/stats.h
++++ b/kernel/sched/stats.h
+@@ -213,7 +213,7 @@ static inline void sched_info_depart(struct rq *rq, struct task_struct *t)
+ 
+ 	rq_sched_info_depart(rq, delta);
+ 
+-	if (t->state == TASK_RUNNING)
++	if (task_is_running(t))
+ 		sched_info_enqueue(rq, t);
+ }
+ 
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 0770041a0f5a..6ffd4d94cce7 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -4376,7 +4376,7 @@ void kdb_send_sig(struct task_struct *t, int sig)
+ 	}
+ 	new_t = kdb_prev_t != t;
+ 	kdb_prev_t = t;
+-	if (t->state != TASK_RUNNING && new_t) {
++	if (!task_is_running(t) && new_t) {
+ 		spin_unlock(&t->sighand->siglock);
+ 		kdb_printf("Process is not RUNNING, sending a signal from "
+ 			   "kdb risks deadlock\n"
+diff --git a/kernel/softirq.c b/kernel/softirq.c
+index 41fc30f3ff6d..41ff80a28b57 100644
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -89,8 +89,7 @@ static bool ksoftirqd_running(unsigned long pending)
+ 
+ 	if (pending & SOFTIRQ_NOW_MASK)
+ 		return false;
+-	return tsk && (tsk->state == TASK_RUNNING) &&
+-		!__kthread_should_park(tsk);
++	return tsk && task_is_running(tsk) && !__kthread_should_park(tsk);
+ }
+ 
+ #ifdef CONFIG_TRACE_IRQFLAGS
+diff --git a/mm/compaction.c b/mm/compaction.c
+index b117844cff7c..25645a4a5018 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -1922,7 +1922,7 @@ static inline bool is_via_compact_memory(int order)
+ 
+ static bool kswapd_is_running(pg_data_t *pgdat)
+ {
+-	return pgdat->kswapd && (pgdat->kswapd->state == TASK_RUNNING);
++	return pgdat->kswapd && task_is_running(pgdat->kswapd);
+ }
+ 
+ /*
