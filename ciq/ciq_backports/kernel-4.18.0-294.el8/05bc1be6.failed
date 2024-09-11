@@ -1,0 +1,623 @@
+s390/pci: create zPCI bus
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Pierre Morel <pmorel@linux.ibm.com>
+commit 05bc1be6db4b2683bbf5b9394a75d0fb3acfcede
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/05bc1be6.failed
+
+The zPCI bus is in charge to handle common zPCI resources for
+zPCI devices.
+
+Creating the zPCI bus, the PCI bus, the zPCI devices and the
+PCI devices and hotplug slots
+done in a specific order:
+- PCI hotplug slot creation needs a PCI bus
+- PCI bus needs a PCI domain
+  which is reported by the pci_domain_nr() when setting up the
+  host bridge
+- PCI domain is set from the zPCI with devfn 0
+  this is necessary to have a reproducible enumeration
+
+Therefore we can not create devices or hotplug slots for any PCI
+device associated with a zPCI device before having discovered
+the function zero of the bus.
+
+The discovery and initialization of devices can be done at several
+points in the code:
+- On Events, serialized in a thread context
+- On initialization, in the kernel init thread context
+- When powering on the hotplug slot, in a user thread context
+
+The removal of devices and their parent bus may also be done on
+events or for devices when powering down the slot.
+
+To guarantee the existence of the bus and devices until they are
+no more needed we use kref in zPCI bus and introduce a reference
+count in the zPCI devices.
+
+In this patch the zPCI bus still only accept a device with
+a devfn 0.
+
+	Signed-off-by: Pierre Morel <pmorel@linux.ibm.com>
+	Reviewed-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 05bc1be6db4b2683bbf5b9394a75d0fb3acfcede)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+diff --cc arch/s390/pci/pci.c
+index 3ca1c80f304d,41423dad881c..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -608,129 -606,54 +605,131 @@@ void pcibios_disable_device(struct pci_
+  	zpci_debug_exit_device(zdev);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_HIBERNATE_CALLBACKS
+ +static int zpci_restore(struct device *dev)
+ +{
+ +	struct pci_dev *pdev = to_pci_dev(dev);
+ +	struct zpci_dev *zdev = to_zpci(pdev);
+ +	int ret = 0;
+ +
+ +	if (zdev->state != ZPCI_FN_STATE_ONLINE)
+ +		goto out;
+ +
+ +	ret = clp_enable_fh(zdev, ZPCI_NR_DMA_SPACES);
+ +	if (ret)
+ +		goto out;
+ +
+ +	zpci_map_resources(pdev);
+ +	zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+ +			   (u64) zdev->dma_table);
+ +
+ +out:
+ +	return ret;
+ +}
+ +
+ +static int zpci_freeze(struct device *dev)
+ +{
+ +	struct pci_dev *pdev = to_pci_dev(dev);
+ +	struct zpci_dev *zdev = to_zpci(pdev);
+ +
+ +	if (zdev->state != ZPCI_FN_STATE_ONLINE)
+ +		return 0;
+ +
+ +	zpci_unregister_ioat(zdev, 0);
+ +	zpci_unmap_resources(pdev);
+ +	return clp_disable_fh(zdev);
+ +}
+ +
+ +struct dev_pm_ops pcibios_pm_ops = {
+ +	.thaw_noirq = zpci_restore,
+ +	.freeze_noirq = zpci_freeze,
+ +	.restore_noirq = zpci_restore,
+ +	.poweroff_noirq = zpci_freeze,
+ +};
+ +#endif /* CONFIG_HIBERNATE_CALLBACKS */
+ +
+ +static int zpci_alloc_domain(struct zpci_dev *zdev)
+ +{
+ +	if (zpci_unique_uid) {
+ +		zdev->domain = (u16) zdev->uid;
+ +		if (zdev->domain >= ZPCI_NR_DEVICES)
+ +			return 0;
+ +
+ +		spin_lock(&zpci_domain_lock);
+ +		if (test_bit(zdev->domain, zpci_domain)) {
+ +			spin_unlock(&zpci_domain_lock);
+ +			return -EEXIST;
+ +		}
+ +		set_bit(zdev->domain, zpci_domain);
+ +		spin_unlock(&zpci_domain_lock);
+ +		return 0;
+ +	}
+ +
+ +	spin_lock(&zpci_domain_lock);
+ +	zdev->domain = find_first_zero_bit(zpci_domain, ZPCI_NR_DEVICES);
+ +	if (zdev->domain == ZPCI_NR_DEVICES) {
+ +		spin_unlock(&zpci_domain_lock);
+ +		return -ENOSPC;
+ +	}
+ +	set_bit(zdev->domain, zpci_domain);
+++=======
++ static int __zpci_register_domain(int domain)
++ {
++ 	spin_lock(&zpci_domain_lock);
++ 	if (test_bit(domain, zpci_domain)) {
++ 		spin_unlock(&zpci_domain_lock);
++ 		pr_err("Domain %04x is already assigned\n", domain);
++ 		return -EEXIST;
++ 	}
++ 	set_bit(domain, zpci_domain);
+  	spin_unlock(&zpci_domain_lock);
+- 	return 0;
++ 	return domain;
+  }
+  
+- static void zpci_free_domain(struct zpci_dev *zdev)
++ static int __zpci_alloc_domain(void)
+  {
+- 	if (zdev->domain >= ZPCI_NR_DEVICES)
+- 		return;
++ 	int domain;
+  
+  	spin_lock(&zpci_domain_lock);
+- 	clear_bit(zdev->domain, zpci_domain);
++ 	/*
++ 	 * We can always auto allocate domains below ZPCI_NR_DEVICES.
++ 	 * There is either a free domain or we have reached the maximum in
++ 	 * which case we would have bailed earlier.
++ 	 */
++ 	domain = find_first_zero_bit(zpci_domain, ZPCI_NR_DEVICES);
++ 	set_bit(domain, zpci_domain);
+++>>>>>>> 05bc1be6db4b (s390/pci: create zPCI bus)
+  	spin_unlock(&zpci_domain_lock);
++ 	return domain;
+  }
+  
+- void pcibios_remove_bus(struct pci_bus *bus)
++ int zpci_alloc_domain(int domain)
+  {
+- 	struct zpci_dev *zdev = get_zdev_by_bus(bus);
+- 
+- 	zpci_exit_slot(zdev);
+- 	zpci_cleanup_bus_resources(zdev);
+- 	zpci_destroy_iommu(zdev);
+- 	zpci_free_domain(zdev);
+- 
+- 	spin_lock(&zpci_list_lock);
+- 	list_del(&zdev->entry);
+- 	spin_unlock(&zpci_list_lock);
+- 
+- 	zpci_dbg(3, "rem fid:%x\n", zdev->fid);
+- 	kfree(zdev);
++ 	if (zpci_unique_uid) {
++ 		if (domain)
++ 			return __zpci_register_domain(domain);
++ 		pr_warn("UID checking was active but no UID is provided: switching to automatic domain allocation\n");
++ 		update_uid_checking(false);
++ 	}
++ 	return __zpci_alloc_domain();
+  }
+  
+- static int zpci_scan_bus(struct zpci_dev *zdev)
++ void zpci_free_domain(int domain)
+  {
+- 	LIST_HEAD(resources);
+- 	int ret;
+- 
+- 	ret = zpci_setup_bus_resources(zdev, &resources);
+- 	if (ret)
+- 		goto error;
+- 
+- 	zdev->bus = pci_scan_root_bus(NULL, ZPCI_BUS_NR, &pci_root_ops,
+- 				      zdev, &resources);
+- 	if (!zdev->bus) {
+- 		ret = -EIO;
+- 		goto error;
+- 	}
+- 	zdev->bus->max_bus_speed = zdev->max_bus_speed;
+- 	pci_bus_add_devices(zdev->bus);
+- 	return 0;
+++	if (zdev->domain >= ZPCI_NR_DEVICES)
+++		return;
+ +
+- error:
+- 	zpci_cleanup_bus_resources(zdev);
+- 	pci_free_resource_list(&resources);
+- 	return ret;
++ 	spin_lock(&zpci_domain_lock);
+++<<<<<<< HEAD
+++	clear_bit(zdev->domain, zpci_domain);
+++=======
++ 	clear_bit(domain, zpci_domain);
+++>>>>>>> 05bc1be6db4b (s390/pci: create zPCI bus)
++ 	spin_unlock(&zpci_domain_lock);
+  }
+  
++ 
+  int zpci_enable_device(struct zpci_dev *zdev)
+  {
+  	int rc;
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index 2d7a8ea6c42b..4b81e9d8ca9b 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -27,6 +27,12 @@ int pci_proc_domain(struct pci_bus *);
+ #define ZPCI_NR_DMA_SPACES		1
+ #define ZPCI_NR_DEVICES			CONFIG_PCI_NR_FUNCTIONS
+ 
++#ifdef PCI
++#if (ZPCI_NR_DEVICES > ZPCI_DOMAIN_BITMAP_SIZE)
++# error ZPCI_NR_DEVICES can not be bigger than ZPCI_DOMAIN_BITMAP_SIZE
++#endif
++#endif /* PCI */
++
+ /* PCI Function Controls */
+ #define ZPCI_FC_FN_ENABLED		0x80
+ #define ZPCI_FC_ERROR			0x40
+@@ -88,10 +94,23 @@ struct zpci_bar_struct {
+ 
+ struct s390_domain;
+ 
++#define ZPCI_FUNCTIONS_PER_BUS 256
++struct zpci_bus {
++	struct kref		kref;
++	struct pci_bus		*bus;
++	struct zpci_dev		*function[ZPCI_FUNCTIONS_PER_BUS];
++	struct list_head	resources;
++	struct list_head	bus_next;
++	int			pchid;
++	int			domain_nr;
++	enum pci_bus_speed	max_bus_speed;
++};
++
+ /* Private data per function */
+ struct zpci_dev {
+-	struct pci_bus	*bus;
++	struct zpci_bus *zbus;
+ 	struct list_head entry;		/* list of all zpci_devices, needed for hotplug, etc. */
++	struct kref kref;
+ 	struct hotplug_slot hotplug_slot;
+ 
+ 	enum zpci_state state;
+@@ -101,7 +120,6 @@ struct zpci_dev {
+ 	u16		pchid;		/* physical channel ID */
+ 	u8		pfgid;		/* function group ID */
+ 	u8		pft;		/* pci function type */
+-	u16		domain;
+ 	u8		port;
+ 	u8		rid_available	: 1;
+ 	u8		reserved	: 7;
+@@ -224,7 +242,9 @@ static inline void zpci_exit_slot(struct zpci_dev *zdev) {}
+ /* Helpers */
+ static inline struct zpci_dev *to_zpci(struct pci_dev *pdev)
+ {
+-	return pdev->sysdata;
++	struct zpci_bus *zbus = pdev->sysdata;
++
++	return zbus->function[ZPCI_DEVFN];
+ }
+ 
+ struct zpci_dev *get_zdev_by_fid(u32);
+diff --git a/arch/s390/pci/Makefile b/arch/s390/pci/Makefile
+index 748626a33028..b4e3c84772a1 100644
+--- a/arch/s390/pci/Makefile
++++ b/arch/s390/pci/Makefile
+@@ -4,4 +4,5 @@
+ #
+ 
+ obj-$(CONFIG_PCI)	+= pci.o pci_irq.o pci_dma.o pci_clp.o pci_sysfs.o \
+-			   pci_event.o pci_debug.o pci_insn.o pci_mmio.o
++			   pci_event.o pci_debug.o pci_insn.o pci_mmio.o \
++			   pci_bus.o
+* Unmerged path arch/s390/pci/pci.c
+diff --git a/arch/s390/pci/pci_bus.c b/arch/s390/pci/pci_bus.c
+new file mode 100644
+index 000000000000..e1565b8537de
+--- /dev/null
++++ b/arch/s390/pci/pci_bus.c
+@@ -0,0 +1,147 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright IBM Corp. 2020
++ *
++ * Author(s):
++ *   Pierre Morel <pmorel@linux.ibm.com>
++ *
++ */
++
++#define KMSG_COMPONENT "zpci"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/err.h>
++#include <linux/export.h>
++#include <linux/delay.h>
++#include <linux/seq_file.h>
++#include <linux/jump_label.h>
++#include <linux/pci.h>
++#include <linux/printk.h>
++
++#include <asm/pci_clp.h>
++#include <asm/pci_dma.h>
++
++#include "pci_bus.h"
++
++static LIST_HEAD(zbus_list);
++static DEFINE_SPINLOCK(zbus_list_lock);
++static int zpci_nb_devices;
++
++/* zpci_bus_scan
++ * @zbus: the zbus holding the zdevices
++ * @ops: the pci operations
++ *
++ * The domain number must be set before pci_scan_root_bus is called.
++ * This function can be called once the domain is known, hence
++ * when the function_0 is dicovered.
++ */
++static int zpci_bus_scan(struct zpci_bus *zbus, int domain, struct pci_ops *ops)
++{
++	struct pci_bus *bus;
++	int rc;
++
++	rc = zpci_alloc_domain(domain);
++	if (rc < 0)
++		return rc;
++	zbus->domain_nr = rc;
++
++	bus = pci_scan_root_bus(NULL, ZPCI_BUS_NR, ops, zbus, &zbus->resources);
++	if (!bus) {
++		zpci_free_domain(zbus->domain_nr);
++		return -EFAULT;
++	}
++
++	zbus->bus = bus;
++	pci_bus_add_devices(bus);
++	return 0;
++}
++
++static void zpci_bus_release(struct kref *kref)
++{
++	struct zpci_bus *zbus = container_of(kref, struct zpci_bus, kref);
++
++	pci_lock_rescan_remove();
++	pci_stop_root_bus(zbus->bus);
++
++	zpci_free_domain(zbus->domain_nr);
++	pci_free_resource_list(&zbus->resources);
++
++	pci_remove_root_bus(zbus->bus);
++	pci_unlock_rescan_remove();
++
++	spin_lock(&zbus_list_lock);
++	list_del(&zbus->bus_next);
++	spin_unlock(&zbus_list_lock);
++	kfree(zbus);
++}
++
++static void zpci_bus_put(struct zpci_bus *zbus)
++{
++	kref_put(&zbus->kref, zpci_bus_release);
++}
++
++static struct zpci_bus *zpci_bus_alloc(int pchid)
++{
++	struct zpci_bus *zbus;
++
++	zbus = kzalloc(sizeof(*zbus), GFP_KERNEL);
++	if (!zbus)
++		return NULL;
++
++	zbus->pchid = pchid;
++	INIT_LIST_HEAD(&zbus->bus_next);
++	spin_lock(&zbus_list_lock);
++	list_add_tail(&zbus->bus_next, &zbus_list);
++	spin_unlock(&zbus_list_lock);
++
++	kref_init(&zbus->kref);
++	INIT_LIST_HEAD(&zbus->resources);
++
++	return zbus;
++}
++
++int zpci_bus_device_register(struct zpci_dev *zdev, struct pci_ops *ops)
++{
++	struct zpci_bus *zbus;
++	int rc;
++
++	if (zpci_nb_devices == ZPCI_NR_DEVICES) {
++		pr_warn("Adding PCI function %08x failed because the configured limit of %d is reached\n",
++			zdev->fid, ZPCI_NR_DEVICES);
++		return -ENOSPC;
++	}
++	zpci_nb_devices++;
++
++	if (zdev->devfn != ZPCI_DEVFN)
++		return -EINVAL;
++
++	zbus = zpci_bus_alloc(zdev->pchid);
++	if (!zbus)
++		return -ENOMEM;
++
++	zdev->zbus = zbus;
++	zbus->function[ZPCI_DEVFN] = zdev;
++
++	zpci_setup_bus_resources(zdev, &zbus->resources);
++	zbus->max_bus_speed = zdev->max_bus_speed;
++
++	rc = zpci_bus_scan(zbus, (u16)zdev->uid, ops);
++	if (!rc)
++		return 0;
++
++	pr_err("Adding PCI function %08x failed\n", zdev->fid);
++	zdev->zbus = NULL;
++	zpci_bus_put(zbus);
++	return rc;
++}
++
++void zpci_bus_device_unregister(struct zpci_dev *zdev)
++{
++	struct zpci_bus *zbus = zdev->zbus;
++
++	zpci_nb_devices--;
++	zbus->function[ZPCI_DEVFN] = NULL;
++	zpci_bus_put(zbus);
++}
+diff --git a/arch/s390/pci/pci_bus.h b/arch/s390/pci/pci_bus.h
+new file mode 100644
+index 000000000000..c6aff42cc2cf
+--- /dev/null
++++ b/arch/s390/pci/pci_bus.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright IBM Corp. 2020
++ *
++ * Author(s):
++ *   Pierre Morel <pmorel@linux.ibm.com>
++ *
++ */
++
++int zpci_bus_device_register(struct zpci_dev *zdev, struct pci_ops *ops);
++void zpci_bus_device_unregister(struct zpci_dev *zdev);
++int zpci_bus_init(void);
++
++void zpci_release_device(struct kref *kref);
++static inline void zpci_zdev_put(struct zpci_dev *zdev)
++{
++	kref_put(&zdev->kref, zpci_release_device);
++}
++
++int zpci_alloc_domain(int domain);
++void zpci_free_domain(int domain);
++int zpci_setup_bus_resources(struct zpci_dev *zdev,
++			     struct list_head *resources);
++
++static inline struct zpci_dev *get_zdev_by_bus(struct pci_bus *bus)
++{
++	struct zpci_bus *zbus = bus->sysdata;
++
++	return zbus->function[ZPCI_DEVFN];
++}
+diff --git a/arch/s390/pci/pci_event.c b/arch/s390/pci/pci_event.c
+index 8d6ee4af4230..d39e9299e133 100644
+--- a/arch/s390/pci/pci_event.c
++++ b/arch/s390/pci/pci_event.c
+@@ -14,6 +14,8 @@
+ #include <asm/pci_debug.h>
+ #include <asm/sclp.h>
+ 
++#include "pci_bus.h"
++
+ /* Content Code Description for PCI Function Error */
+ struct zpci_ccdf_err {
+ 	u32 reserved1;
+@@ -53,7 +55,7 @@ static void __zpci_event_error(struct zpci_ccdf_err *ccdf)
+ 	zpci_err_hex(ccdf, sizeof(*ccdf));
+ 
+ 	if (zdev)
+-		pdev = pci_get_slot(zdev->bus, ZPCI_DEVFN);
++		pdev = pci_get_slot(zdev->zbus->bus, ZPCI_DEVFN);
+ 
+ 	pr_err("%s: Event 0x%x reports an error for PCI function 0x%x\n",
+ 	       pdev ? pci_name(pdev) : "n/a", ccdf->pec, ccdf->fid);
+@@ -78,11 +80,9 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+ 	enum zpci_state state;
+ 	int ret;
+ 
+-	if (zdev)
+-		pdev = pci_get_slot(zdev->bus, ZPCI_DEVFN);
++	if (zdev && zdev->zbus && zdev->zbus->bus)
++		pdev = pci_get_slot(zdev->zbus->bus, ZPCI_DEVFN);
+ 
+-	pr_info("%s: Event 0x%x reconfigured PCI function 0x%x\n",
+-		pdev ? pci_name(pdev) : "n/a", ccdf->pec, ccdf->fid);
+ 	zpci_err("avail CCDF:\n");
+ 	zpci_err_hex(ccdf, sizeof(*ccdf));
+ 
+@@ -102,7 +102,7 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+ 		if (ret)
+ 			break;
+ 		pci_lock_rescan_remove();
+-		pci_rescan_bus(zdev->bus);
++		pci_rescan_bus(zdev->zbus->bus);
+ 		pci_unlock_rescan_remove();
+ 		break;
+ 	case 0x0302: /* Reserved -> Standby */
+@@ -140,7 +140,7 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+ 		zdev->state = ZPCI_FN_STATE_STANDBY;
+ 		if (!clp_get_state(ccdf->fid, &state) &&
+ 		    state == ZPCI_FN_STATE_RESERVED) {
+-			zpci_remove_device(zdev);
++			zpci_zdev_put(zdev);
+ 		}
+ 		break;
+ 	case 0x0306: /* 0x308 or 0x302 for multiple devices */
+@@ -149,12 +149,11 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+ 	case 0x0308: /* Standby -> Reserved */
+ 		if (!zdev)
+ 			break;
+-		zpci_remove_device(zdev);
++		zpci_zdev_put(zdev);
+ 		break;
+ 	default:
+ 		break;
+ 	}
+-	pci_dev_put(pdev);
+ }
+ 
+ void zpci_event_availability(void *data)
+diff --git a/arch/s390/pci/pci_sysfs.c b/arch/s390/pci/pci_sysfs.c
+index 8ea8d04ed86d..5c028bee91b9 100644
+--- a/arch/s390/pci/pci_sysfs.c
++++ b/arch/s390/pci/pci_sysfs.c
+@@ -89,7 +89,7 @@ static ssize_t recover_store(struct device *dev, struct device_attribute *attr,
+ 		ret = zpci_enable_device(zdev);
+ 		if (ret)
+ 			goto out;
+-		pci_rescan_bus(zdev->bus);
++		pci_rescan_bus(zdev->zbus->bus);
+ 	}
+ out:
+ 	pci_unlock_rescan_remove();
+diff --git a/drivers/pci/hotplug/s390_pci_hpc.c b/drivers/pci/hotplug/s390_pci_hpc.c
+index 39295d88f670..a9c9f05fe54b 100644
+--- a/drivers/pci/hotplug/s390_pci_hpc.c
++++ b/drivers/pci/hotplug/s390_pci_hpc.c
+@@ -52,6 +52,7 @@ static int enable_slot(struct hotplug_slot *hotplug_slot)
+ {
+ 	struct zpci_dev *zdev = container_of(hotplug_slot, struct zpci_dev,
+ 					     hotplug_slot);
++	struct zpci_bus *zbus = zdev->zbus;
+ 	int rc;
+ 
+ 	if (zdev->state != ZPCI_FN_STATE_STANDBY)
+@@ -65,9 +66,9 @@ static int enable_slot(struct hotplug_slot *hotplug_slot)
+ 	if (rc)
+ 		goto out_deconfigure;
+ 
+-	pci_scan_slot(zdev->bus, ZPCI_DEVFN);
++	pci_scan_slot(zbus->bus, ZPCI_DEVFN);
+ 	pci_lock_rescan_remove();
+-	pci_bus_add_devices(zdev->bus);
++	pci_bus_add_devices(zbus->bus);
+ 	pci_unlock_rescan_remove();
+ 
+ 	return rc;
+@@ -82,12 +83,13 @@ static int disable_slot(struct hotplug_slot *hotplug_slot)
+ 	struct zpci_dev *zdev = container_of(hotplug_slot, struct zpci_dev,
+ 					     hotplug_slot);
+ 	struct pci_dev *pdev;
++	struct zpci_bus *zbus = zdev->zbus;
+ 	int rc;
+ 
+ 	if (!zpci_fn_configured(zdev->state))
+ 		return -EIO;
+ 
+-	pdev = pci_get_slot(zdev->bus, ZPCI_DEVFN);
++	pdev = pci_get_slot(zbus->bus, ZPCI_DEVFN);
+ 	if (pdev) {
+ 		pci_stop_and_remove_bus_device_locked(pdev);
+ 		pci_dev_put(pdev);
+@@ -133,11 +135,12 @@ static const struct hotplug_slot_ops s390_hotplug_slot_ops = {
+ int zpci_init_slot(struct zpci_dev *zdev)
+ {
+ 	char name[SLOT_NAME_SIZE];
++	struct zpci_bus *zbus = zdev->zbus;
+ 
+ 	zdev->hotplug_slot.ops = &s390_hotplug_slot_ops;
+ 
+ 	snprintf(name, SLOT_NAME_SIZE, "%08x", zdev->fid);
+-	return pci_hp_register(&zdev->hotplug_slot, zdev->bus,
++	return pci_hp_register(&zdev->hotplug_slot, zbus->bus,
+ 			       ZPCI_DEVFN, name);
+ }
+ 
