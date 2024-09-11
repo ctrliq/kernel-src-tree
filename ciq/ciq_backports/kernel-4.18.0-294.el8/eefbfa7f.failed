@@ -1,0 +1,192 @@
+mm: memcg/slab: fix use after free in obj_cgroup_charge
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Muchun Song <songmuchun@bytedance.com>
+commit eefbfa7fd678805b38a46293e78543f98f353d3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/eefbfa7f.failed
+
+The rcu_read_lock/unlock only can guarantee that the memcg will not be
+freed, but it cannot guarantee the success of css_get to memcg.
+
+If the whole process of a cgroup offlining is completed between reading a
+objcg->memcg pointer and bumping the css reference on another CPU, and
+there are exactly 0 external references to this memory cgroup (how we get
+to the obj_cgroup_charge() then?), css_get() can change the ref counter
+from 0 back to 1.
+
+Link: https://lkml.kernel.org/r/20201028035013.99711-2-songmuchun@bytedance.com
+Fixes: bf4f059954dc ("mm: memcg/slab: obj_cgroup API")
+	Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+	Acked-by: Roman Gushchin <guro@fb.com>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Yafang Shao <laoar.shao@gmail.com>
+	Cc: Chris Down <chris@chrisdown.name>
+	Cc: Christian Brauner <christian.brauner@ubuntu.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit eefbfa7fd678805b38a46293e78543f98f353d3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index 4b64abb55f3f,08a8fac29f6a..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -3099,9 -3123,143 +3099,148 @@@ void __memcg_kmem_uncharge_page(struct 
+  	/* slab pages do not have PageKmemcg flag set */
+  	if (PageKmemcg(page))
+  		__ClearPageKmemcg(page);
+ +
+ +	css_put_many(&memcg->css, nr_pages);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static bool consume_obj_stock(struct obj_cgroup *objcg, unsigned int nr_bytes)
++ {
++ 	struct memcg_stock_pcp *stock;
++ 	unsigned long flags;
++ 	bool ret = false;
++ 
++ 	local_irq_save(flags);
++ 
++ 	stock = this_cpu_ptr(&memcg_stock);
++ 	if (objcg == stock->cached_objcg && stock->nr_bytes >= nr_bytes) {
++ 		stock->nr_bytes -= nr_bytes;
++ 		ret = true;
++ 	}
++ 
++ 	local_irq_restore(flags);
++ 
++ 	return ret;
++ }
++ 
++ static void drain_obj_stock(struct memcg_stock_pcp *stock)
++ {
++ 	struct obj_cgroup *old = stock->cached_objcg;
++ 
++ 	if (!old)
++ 		return;
++ 
++ 	if (stock->nr_bytes) {
++ 		unsigned int nr_pages = stock->nr_bytes >> PAGE_SHIFT;
++ 		unsigned int nr_bytes = stock->nr_bytes & (PAGE_SIZE - 1);
++ 
++ 		if (nr_pages) {
++ 			rcu_read_lock();
++ 			__memcg_kmem_uncharge(obj_cgroup_memcg(old), nr_pages);
++ 			rcu_read_unlock();
++ 		}
++ 
++ 		/*
++ 		 * The leftover is flushed to the centralized per-memcg value.
++ 		 * On the next attempt to refill obj stock it will be moved
++ 		 * to a per-cpu stock (probably, on an other CPU), see
++ 		 * refill_obj_stock().
++ 		 *
++ 		 * How often it's flushed is a trade-off between the memory
++ 		 * limit enforcement accuracy and potential CPU contention,
++ 		 * so it might be changed in the future.
++ 		 */
++ 		atomic_add(nr_bytes, &old->nr_charged_bytes);
++ 		stock->nr_bytes = 0;
++ 	}
++ 
++ 	obj_cgroup_put(old);
++ 	stock->cached_objcg = NULL;
++ }
++ 
++ static bool obj_stock_flush_required(struct memcg_stock_pcp *stock,
++ 				     struct mem_cgroup *root_memcg)
++ {
++ 	struct mem_cgroup *memcg;
++ 
++ 	if (stock->cached_objcg) {
++ 		memcg = obj_cgroup_memcg(stock->cached_objcg);
++ 		if (memcg && mem_cgroup_is_descendant(memcg, root_memcg))
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static void refill_obj_stock(struct obj_cgroup *objcg, unsigned int nr_bytes)
++ {
++ 	struct memcg_stock_pcp *stock;
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 
++ 	stock = this_cpu_ptr(&memcg_stock);
++ 	if (stock->cached_objcg != objcg) { /* reset if necessary */
++ 		drain_obj_stock(stock);
++ 		obj_cgroup_get(objcg);
++ 		stock->cached_objcg = objcg;
++ 		stock->nr_bytes = atomic_xchg(&objcg->nr_charged_bytes, 0);
++ 	}
++ 	stock->nr_bytes += nr_bytes;
++ 
++ 	if (stock->nr_bytes > PAGE_SIZE)
++ 		drain_obj_stock(stock);
++ 
++ 	local_irq_restore(flags);
++ }
++ 
++ int obj_cgroup_charge(struct obj_cgroup *objcg, gfp_t gfp, size_t size)
++ {
++ 	struct mem_cgroup *memcg;
++ 	unsigned int nr_pages, nr_bytes;
++ 	int ret;
++ 
++ 	if (consume_obj_stock(objcg, size))
++ 		return 0;
++ 
++ 	/*
++ 	 * In theory, memcg->nr_charged_bytes can have enough
++ 	 * pre-charged bytes to satisfy the allocation. However,
++ 	 * flushing memcg->nr_charged_bytes requires two atomic
++ 	 * operations, and memcg->nr_charged_bytes can't be big,
++ 	 * so it's better to ignore it and try grab some new pages.
++ 	 * memcg->nr_charged_bytes will be flushed in
++ 	 * refill_obj_stock(), called from this function or
++ 	 * independently later.
++ 	 */
++ 	rcu_read_lock();
++ retry:
++ 	memcg = obj_cgroup_memcg(objcg);
++ 	if (unlikely(!css_tryget(&memcg->css)))
++ 		goto retry;
++ 	rcu_read_unlock();
++ 
++ 	nr_pages = size >> PAGE_SHIFT;
++ 	nr_bytes = size & (PAGE_SIZE - 1);
++ 
++ 	if (nr_bytes)
++ 		nr_pages += 1;
++ 
++ 	ret = __memcg_kmem_charge(memcg, gfp, nr_pages);
++ 	if (!ret && nr_bytes)
++ 		refill_obj_stock(objcg, PAGE_SIZE - nr_bytes);
++ 
++ 	css_put(&memcg->css);
++ 	return ret;
++ }
++ 
++ void obj_cgroup_uncharge(struct obj_cgroup *objcg, size_t size)
++ {
++ 	refill_obj_stock(objcg, size);
++ }
++ 
+++>>>>>>> eefbfa7fd678 (mm: memcg/slab: fix use after free in obj_cgroup_charge)
+  #endif /* CONFIG_MEMCG_KMEM */
+  
+  #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+* Unmerged path mm/memcontrol.c
