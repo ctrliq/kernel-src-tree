@@ -1,0 +1,141 @@
+ima: Store the measurement again when appraising a modsig
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Thiago Jung Bauermann <bauerman@linux.ibm.com>
+commit e5092255bb3967bcc473dc86492dbbd5f7714023
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e5092255.failed
+
+If the IMA template contains the "modsig" or "d-modsig" field, then the
+modsig should be added to the measurement list when the file is appraised.
+
+And that is what normally happens, but if a measurement rule caused a file
+containing a modsig to be measured before a different rule causes it to be
+appraised, the resulting measurement entry will not contain the modsig
+because it is only fetched during appraisal. When the appraisal rule
+triggers, it won't store a new measurement containing the modsig because
+the file was already measured.
+
+We need to detect that situation and store an additional measurement with
+the modsig. This is done by adding an IMA_MEASURE action flag if we read a
+modsig and the IMA template contains a modsig field.
+
+	Suggested-by: Mimi Zohar <zohar@linux.ibm.com>
+	Signed-off-by: Thiago Jung Bauermann <bauerman@linux.ibm.com>
+	Signed-off-by: Mimi Zohar <zohar@linux.ibm.com>
+(cherry picked from commit e5092255bb3967bcc473dc86492dbbd5f7714023)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/integrity/ima/ima_main.c
+diff --cc security/integrity/ima/ima_main.c
+index b7dd38fbfd04,79c01516211b..000000000000
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@@ -281,9 -307,23 +281,26 @@@ static int process_measurement(struct f
+  		/* read 'security.ima' */
+  		xattr_len = ima_read_xattr(file_dentry(file), &xattr_value);
+  
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * Read the appended modsig if allowed by the policy, and allow
++ 		 * an additional measurement list entry, if needed, based on the
++ 		 * template format and whether the file was already measured.
++ 		 */
++ 		if (iint->flags & IMA_MODSIG_ALLOWED) {
++ 			rc = ima_read_modsig(func, buf, size, &modsig);
++ 
++ 			if (!rc && ima_template_has_modsig(template_desc) &&
++ 			    iint->flags & IMA_MEASURED)
++ 				action |= IMA_MEASURE;
++ 		}
++ 	}
++ 
+++>>>>>>> e5092255bb39 (ima: Store the measurement again when appraising a modsig)
+  	hash_algo = ima_get_hash_algo(xattr_value, xattr_len);
+  
+ -	rc = ima_collect_measurement(iint, file, buf, size, hash_algo, modsig);
+ +	rc = ima_collect_measurement(iint, file, buf, size, hash_algo);
+  	if (rc != 0 && rc != -EBADF && rc != -EINVAL)
+  		goto out_locked;
+  
+diff --git a/security/integrity/ima/ima.h b/security/integrity/ima/ima.h
+index 837eb0799374..ff4177f8c0e4 100644
+--- a/security/integrity/ima/ima.h
++++ b/security/integrity/ima/ima.h
+@@ -153,6 +153,7 @@ int template_desc_init_fields(const char *template_fmt,
+ 			      int *num_fields);
+ struct ima_template_desc *ima_template_desc_current(void);
+ struct ima_template_desc *lookup_template_desc(const char *name);
++bool ima_template_has_modsig(const struct ima_template_desc *ima_template);
+ int ima_restore_measurement_entry(struct ima_template_entry *entry);
+ int ima_restore_measurement_list(loff_t bufsize, void *buf);
+ int ima_measurements_show(struct seq_file *m, void *v);
+diff --git a/security/integrity/ima/ima_api.c b/security/integrity/ima/ima_api.c
+index d426d4d1fe04..7c1064ac0b55 100644
+--- a/security/integrity/ima/ima_api.c
++++ b/security/integrity/ima/ima_api.c
+@@ -223,6 +223,14 @@ int ima_collect_measurement(struct integrity_iint_cache *iint,
+ 		char digest[IMA_MAX_DIGEST_SIZE];
+ 	} hash;
+ 
++	/*
++	 * Always collect the modsig, because IMA might have already collected
++	 * the file digest without collecting the modsig in a previous
++	 * measurement rule.
++	 */
++	if (modsig)
++		ima_collect_modsig(modsig, buf, size);
++
+ 	if (iint->flags & IMA_COLLECTED)
+ 		goto out;
+ 
+@@ -304,7 +312,13 @@ void ima_store_measurement(struct integrity_iint_cache *iint,
+ 					     .xattr_len = xattr_len };
+ 	int violation = 0;
+ 
+-	if (iint->measured_pcrs & (0x1 << pcr))
++	/*
++	 * We still need to store the measurement in the case of MODSIG because
++	 * we only have its contents to put in the list at the time of
++	 * appraisal, but a file measurement from earlier might already exist in
++	 * the measurement list.
++	 */
++	if (iint->measured_pcrs & (0x1 << pcr) && !modsig)
+ 		return;
+ 
+ 	result = ima_alloc_init_template(&event_data, &entry, template_desc);
+* Unmerged path security/integrity/ima/ima_main.c
+diff --git a/security/integrity/ima/ima_template.c b/security/integrity/ima/ima_template.c
+index 7343e8e0ae2f..d44e503baf2a 100644
+--- a/security/integrity/ima/ima_template.c
++++ b/security/integrity/ima/ima_template.c
+@@ -57,6 +57,25 @@ static const struct ima_template_field supported_fields[] = {
+ 
+ static struct ima_template_desc *ima_template;
+ 
++/**
++ * ima_template_has_modsig - Check whether template has modsig-related fields.
++ * @ima_template: IMA template to check.
++ *
++ * Tells whether the given template has fields referencing a file's appended
++ * signature.
++ */
++bool ima_template_has_modsig(const struct ima_template_desc *ima_template)
++{
++	int i;
++
++	for (i = 0; i < ima_template->num_fields; i++)
++		if (!strcmp(ima_template->fields[i]->field_id, "modsig") ||
++		    !strcmp(ima_template->fields[i]->field_id, "d-modsig"))
++			return true;
++
++	return false;
++}
++
+ static int __init ima_template_setup(char *str)
+ {
+ 	struct ima_template_desc *template_desc;
