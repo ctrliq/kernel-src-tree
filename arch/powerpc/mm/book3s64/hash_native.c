@@ -72,7 +72,7 @@ static inline void tlbiel_hash_set_isa300(unsigned int set, unsigned int is,
 	rs = ((unsigned long)pid << PPC_BITLSHIFT(31));
 
 	asm volatile(PPC_TLBIEL(%0, %1, %2, %3, %4)
-		     : : "r"(rb), "r"(rs), "i"(ric), "i"(prs), "r"(r)
+		     : : "r"(rb), "r"(rs), "i"(ric), "i"(prs), "i"(r)
 		     : "memory");
 }
 
