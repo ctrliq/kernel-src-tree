@@ -2138,6 +2138,7 @@ static void tipc_sk_filter_rcv(struct sock *sk, struct sk_buff *skb,
 	struct tipc_msg *hdr = buf_msg(skb);
 	struct net *net = sock_net(sk);
 	struct sk_buff_head inputq;
+	int mtyp = msg_type(hdr);
 	int limit, err = TIPC_OK;
 
 	TIPC_SKB_CB(skb)->bytes_read = 0;
@@ -2150,7 +2151,7 @@ static void tipc_sk_filter_rcv(struct sock *sk, struct sk_buff *skb,
 	if (unlikely(grp))
 		tipc_group_filter_msg(grp, &inputq, xmitq);
 
-	if (msg_type(hdr) == TIPC_MCAST_MSG)
+	if (unlikely(!grp) && mtyp == TIPC_MCAST_MSG)
 		tipc_mcast_filter_msg(&tsk->mc_method.deferredq, &inputq);
 
 	/* Validate and add to receive buffer if there is space */
