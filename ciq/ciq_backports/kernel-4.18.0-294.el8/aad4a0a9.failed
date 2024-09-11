@@ -1,0 +1,260 @@
+tcp: Expose tcp_sock_set_keepidle_locked
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Dmitry Yakunin <zeil@yandex-team.ru>
+commit aad4a0a9513af962137c4842463d11ed491eec37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/aad4a0a9.failed
+
+This is preparation for usage in bpf_setsockopt.
+
+v2:
+  - remove redundant EXPORT_SYMBOL (Alexei Starovoitov)
+
+	Signed-off-by: Dmitry Yakunin <zeil@yandex-team.ru>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200620153052.9439-2-zeil@yandex-team.ru
+(cherry picked from commit aad4a0a9513af962137c4842463d11ed491eec37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/tcp.h
+#	net/ipv4/tcp.c
+diff --cc include/linux/tcp.h
+index 723bf168e2c0,3bdec31ce8f4..000000000000
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@@ -495,4 -497,14 +495,17 @@@ static inline u16 tcp_mss_clamp(const s
+  int tcp_skb_shift(struct sk_buff *to, struct sk_buff *from, int pcount,
+  		  int shiftlen);
+  
+++<<<<<<< HEAD
+++=======
++ void tcp_sock_set_cork(struct sock *sk, bool on);
++ int tcp_sock_set_keepcnt(struct sock *sk, int val);
++ int tcp_sock_set_keepidle_locked(struct sock *sk, int val);
++ int tcp_sock_set_keepidle(struct sock *sk, int val);
++ int tcp_sock_set_keepintvl(struct sock *sk, int val);
++ void tcp_sock_set_nodelay(struct sock *sk);
++ void tcp_sock_set_quickack(struct sock *sk, int val);
++ int tcp_sock_set_syncnt(struct sock *sk, int val);
++ void tcp_sock_set_user_timeout(struct sock *sk, u32 val);
++ 
+++>>>>>>> aad4a0a9513a (tcp: Expose tcp_sock_set_keepidle_locked)
+  #endif	/* _LINUX_TCP_H */
+diff --cc net/ipv4/tcp.c
+index 8f4b529b1711,de36c91d32ea..000000000000
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@@ -2746,6 -2842,178 +2746,181 @@@ static int tcp_repair_options_est(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ DEFINE_STATIC_KEY_FALSE(tcp_tx_delay_enabled);
++ EXPORT_SYMBOL(tcp_tx_delay_enabled);
++ 
++ static void tcp_enable_tx_delay(void)
++ {
++ 	if (!static_branch_unlikely(&tcp_tx_delay_enabled)) {
++ 		static int __tcp_tx_delay_enabled = 0;
++ 
++ 		if (cmpxchg(&__tcp_tx_delay_enabled, 0, 1) == 0) {
++ 			static_branch_enable(&tcp_tx_delay_enabled);
++ 			pr_info("TCP_TX_DELAY enabled\n");
++ 		}
++ 	}
++ }
++ 
++ /* When set indicates to always queue non-full frames.  Later the user clears
++  * this option and we transmit any pending partial frames in the queue.  This is
++  * meant to be used alongside sendfile() to get properly filled frames when the
++  * user (for example) must write out headers with a write() call first and then
++  * use sendfile to send out the data parts.
++  *
++  * TCP_CORK can be set together with TCP_NODELAY and it is stronger than
++  * TCP_NODELAY.
++  */
++ static void __tcp_sock_set_cork(struct sock *sk, bool on)
++ {
++ 	struct tcp_sock *tp = tcp_sk(sk);
++ 
++ 	if (on) {
++ 		tp->nonagle |= TCP_NAGLE_CORK;
++ 	} else {
++ 		tp->nonagle &= ~TCP_NAGLE_CORK;
++ 		if (tp->nonagle & TCP_NAGLE_OFF)
++ 			tp->nonagle |= TCP_NAGLE_PUSH;
++ 		tcp_push_pending_frames(sk);
++ 	}
++ }
++ 
++ void tcp_sock_set_cork(struct sock *sk, bool on)
++ {
++ 	lock_sock(sk);
++ 	__tcp_sock_set_cork(sk, on);
++ 	release_sock(sk);
++ }
++ EXPORT_SYMBOL(tcp_sock_set_cork);
++ 
++ /* TCP_NODELAY is weaker than TCP_CORK, so that this option on corked socket is
++  * remembered, but it is not activated until cork is cleared.
++  *
++  * However, when TCP_NODELAY is set we make an explicit push, which overrides
++  * even TCP_CORK for currently queued segments.
++  */
++ static void __tcp_sock_set_nodelay(struct sock *sk, bool on)
++ {
++ 	if (on) {
++ 		tcp_sk(sk)->nonagle |= TCP_NAGLE_OFF|TCP_NAGLE_PUSH;
++ 		tcp_push_pending_frames(sk);
++ 	} else {
++ 		tcp_sk(sk)->nonagle &= ~TCP_NAGLE_OFF;
++ 	}
++ }
++ 
++ void tcp_sock_set_nodelay(struct sock *sk)
++ {
++ 	lock_sock(sk);
++ 	__tcp_sock_set_nodelay(sk, true);
++ 	release_sock(sk);
++ }
++ EXPORT_SYMBOL(tcp_sock_set_nodelay);
++ 
++ static void __tcp_sock_set_quickack(struct sock *sk, int val)
++ {
++ 	if (!val) {
++ 		inet_csk_enter_pingpong_mode(sk);
++ 		return;
++ 	}
++ 
++ 	inet_csk_exit_pingpong_mode(sk);
++ 	if ((1 << sk->sk_state) & (TCPF_ESTABLISHED | TCPF_CLOSE_WAIT) &&
++ 	    inet_csk_ack_scheduled(sk)) {
++ 		inet_csk(sk)->icsk_ack.pending |= ICSK_ACK_PUSHED;
++ 		tcp_cleanup_rbuf(sk, 1);
++ 		if (!(val & 1))
++ 			inet_csk_enter_pingpong_mode(sk);
++ 	}
++ }
++ 
++ void tcp_sock_set_quickack(struct sock *sk, int val)
++ {
++ 	lock_sock(sk);
++ 	__tcp_sock_set_quickack(sk, val);
++ 	release_sock(sk);
++ }
++ EXPORT_SYMBOL(tcp_sock_set_quickack);
++ 
++ int tcp_sock_set_syncnt(struct sock *sk, int val)
++ {
++ 	if (val < 1 || val > MAX_TCP_SYNCNT)
++ 		return -EINVAL;
++ 
++ 	lock_sock(sk);
++ 	inet_csk(sk)->icsk_syn_retries = val;
++ 	release_sock(sk);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(tcp_sock_set_syncnt);
++ 
++ void tcp_sock_set_user_timeout(struct sock *sk, u32 val)
++ {
++ 	lock_sock(sk);
++ 	inet_csk(sk)->icsk_user_timeout = val;
++ 	release_sock(sk);
++ }
++ EXPORT_SYMBOL(tcp_sock_set_user_timeout);
++ 
++ int tcp_sock_set_keepidle_locked(struct sock *sk, int val)
++ {
++ 	struct tcp_sock *tp = tcp_sk(sk);
++ 
++ 	if (val < 1 || val > MAX_TCP_KEEPIDLE)
++ 		return -EINVAL;
++ 
++ 	tp->keepalive_time = val * HZ;
++ 	if (sock_flag(sk, SOCK_KEEPOPEN) &&
++ 	    !((1 << sk->sk_state) & (TCPF_CLOSE | TCPF_LISTEN))) {
++ 		u32 elapsed = keepalive_time_elapsed(tp);
++ 
++ 		if (tp->keepalive_time > elapsed)
++ 			elapsed = tp->keepalive_time - elapsed;
++ 		else
++ 			elapsed = 0;
++ 		inet_csk_reset_keepalive_timer(sk, elapsed);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int tcp_sock_set_keepidle(struct sock *sk, int val)
++ {
++ 	int err;
++ 
++ 	lock_sock(sk);
++ 	err = tcp_sock_set_keepidle_locked(sk, val);
++ 	release_sock(sk);
++ 	return err;
++ }
++ EXPORT_SYMBOL(tcp_sock_set_keepidle);
++ 
++ int tcp_sock_set_keepintvl(struct sock *sk, int val)
++ {
++ 	if (val < 1 || val > MAX_TCP_KEEPINTVL)
++ 		return -EINVAL;
++ 
++ 	lock_sock(sk);
++ 	tcp_sk(sk)->keepalive_intvl = val * HZ;
++ 	release_sock(sk);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(tcp_sock_set_keepintvl);
++ 
++ int tcp_sock_set_keepcnt(struct sock *sk, int val)
++ {
++ 	if (val < 1 || val > MAX_TCP_KEEPCNT)
++ 		return -EINVAL;
++ 
++ 	lock_sock(sk);
++ 	tcp_sk(sk)->keepalive_probes = val;
++ 	release_sock(sk);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(tcp_sock_set_keepcnt);
++ 
+++>>>>>>> aad4a0a9513a (tcp: Expose tcp_sock_set_keepidle_locked)
+  /*
+   *	Socket option code for TCP.
+   */
+@@@ -2938,21 -3183,7 +3113,25 @@@ static int do_tcp_setsockopt(struct soc
+  		break;
+  
+  	case TCP_KEEPIDLE:
+++<<<<<<< HEAD
+ +		if (val < 1 || val > MAX_TCP_KEEPIDLE)
+ +			err = -EINVAL;
+ +		else {
+ +			tp->keepalive_time = val * HZ;
+ +			if (sock_flag(sk, SOCK_KEEPOPEN) &&
+ +			    !((1 << sk->sk_state) &
+ +			      (TCPF_CLOSE | TCPF_LISTEN))) {
+ +				u32 elapsed = keepalive_time_elapsed(tp);
+ +				if (tp->keepalive_time > elapsed)
+ +					elapsed = tp->keepalive_time - elapsed;
+ +				else
+ +					elapsed = 0;
+ +				inet_csk_reset_keepalive_timer(sk, elapsed);
+ +			}
+ +		}
+++=======
++ 		err = tcp_sock_set_keepidle_locked(sk, val);
+++>>>>>>> aad4a0a9513a (tcp: Expose tcp_sock_set_keepidle_locked)
+  		break;
+  	case TCP_KEEPINTVL:
+  		if (val < 1 || val > MAX_TCP_KEEPINTVL)
+* Unmerged path include/linux/tcp.h
+* Unmerged path net/ipv4/tcp.c
