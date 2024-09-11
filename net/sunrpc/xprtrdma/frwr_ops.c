@@ -511,8 +511,8 @@ void frwr_unmap_sync(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req)
 	 * a single ib_post_send() call.
 	 */
 	prev = &first;
-	while ((mr = rpcrdma_mr_pop(&req->rl_registered))) {
-
+	mr = rpcrdma_mr_pop(&req->rl_registered);
+	do {
 		trace_xprtrdma_mr_localinv(mr);
 		r_xprt->rx_stats.local_inv_needed++;
 
@@ -529,7 +529,8 @@ void frwr_unmap_sync(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req)
 
 		*prev = last;
 		prev = &last->next;
-	}
+	} while ((mr = rpcrdma_mr_pop(&req->rl_registered)));
+
 	mr = container_of(last, struct rpcrdma_mr, mr_invwr);
 
 	/* Strong send queue ordering guarantees that when the
@@ -609,8 +610,8 @@ void frwr_unmap_async(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req)
 	 * a single ib_post_send() call.
 	 */
 	prev = &first;
-	while ((mr = rpcrdma_mr_pop(&req->rl_registered))) {
-
+	mr = rpcrdma_mr_pop(&req->rl_registered);
+	do {
 		trace_xprtrdma_mr_localinv(mr);
 		r_xprt->rx_stats.local_inv_needed++;
 
@@ -627,7 +628,7 @@ void frwr_unmap_async(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req)
 
 		*prev = last;
 		prev = &last->next;
-	}
+	} while ((mr = rpcrdma_mr_pop(&req->rl_registered)));
 
 	/* Strong send queue ordering guarantees that when the
 	 * last WR in the chain completes, all WRs in the chain
