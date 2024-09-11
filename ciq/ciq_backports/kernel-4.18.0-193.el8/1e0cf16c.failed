@@ -1,0 +1,122 @@
+KVM: arm/arm64: Initialise host's MPIDRs by reading the actual register
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Marc Zyngier <marc.zyngier@arm.com>
+commit 1e0cf16cdad1ba53e9eeee8746fe57de42f20c97
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/1e0cf16c.failed
+
+As part of setting up the host context, we populate its
+MPIDR by using cpu_logical_map(). It turns out that contrary
+to arm64, cpu_logical_map() on 32bit ARM doesn't return the
+*full* MPIDR, but a truncated version.
+
+This leaves the host MPIDR slightly corrupted after the first
+run of a VM, since we won't correctly restore the MPIDR on
+exit. Oops.
+
+Since we cannot trust cpu_logical_map(), let's adopt a different
+strategy. We move the initialization of the host CPU context as
+part of the per-CPU initialization (which, in retrospect, makes
+a lot of sense), and directly read the MPIDR from the HW. This
+is guaranteed to work on both arm and arm64.
+
+	Reported-by: Andre Przywara <Andre.Przywara@arm.com>
+	Tested-by: Andre Przywara <Andre.Przywara@arm.com>
+Fixes: 32f139551954 ("arm/arm64: KVM: Statically configure the host's view of MPIDR")
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+(cherry picked from commit 1e0cf16cdad1ba53e9eeee8746fe57de42f20c97)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/include/asm/kvm_host.h
+#	arch/arm64/include/asm/kvm_host.h
+#	virt/kvm/arm/arm.c
+diff --cc arch/arm/include/asm/kvm_host.h
+index 516193804b39,8a37c8e89777..000000000000
+--- a/arch/arm/include/asm/kvm_host.h
++++ b/arch/arm/include/asm/kvm_host.h
+@@@ -153,7 -140,17 +152,21 @@@ struct kvm_cpu_context 
+  	u32 cp15[NR_CP15_REGS];
+  };
+  
+++<<<<<<< HEAD
+ +typedef struct kvm_cpu_context kvm_cpu_context_t;
+++=======
++ struct kvm_host_data {
++ 	struct kvm_cpu_context host_ctxt;
++ };
++ 
++ typedef struct kvm_host_data kvm_host_data_t;
++ 
++ static inline void kvm_init_host_cpu_context(struct kvm_cpu_context *cpu_ctxt)
++ {
++ 	/* The host's MPIDR is immutable, so let's set it up at boot time */
++ 	cpu_ctxt->cp15[c0_MPIDR] = read_cpuid_mpidr();
++ }
+++>>>>>>> 1e0cf16cdad1 (KVM: arm/arm64: Initialise host's MPIDRs by reading the actual register)
+  
+  struct vcpu_reset_state {
+  	unsigned long	pc;
+diff --cc arch/arm64/include/asm/kvm_host.h
+index 90427baf5f4c,63a196c19fed..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -27,8 -16,10 +27,9 @@@
+  #include <linux/jump_label.h>
+  #include <linux/kvm_types.h>
+  #include <linux/percpu.h>
+ -#include <asm/arch_gicv3.h>
+  #include <asm/barrier.h>
+  #include <asm/cpufeature.h>
++ #include <asm/cputype.h>
+  #include <asm/daifflags.h>
+  #include <asm/fpsimd.h>
+  #include <asm/kvm.h>
+@@@ -465,13 -482,12 +465,17 @@@ void kvm_set_sei_esr(struct kvm_vcpu *v
+  
+  struct kvm_vcpu *kvm_mpidr_to_vcpu(struct kvm *kvm, unsigned long mpidr);
+  
+ -DECLARE_PER_CPU(kvm_host_data_t, kvm_host_data);
+ +DECLARE_PER_CPU(kvm_cpu_context_t, kvm_host_cpu_state);
+  
+++<<<<<<< HEAD
+ +static inline void kvm_init_host_cpu_context(kvm_cpu_context_t *cpu_ctxt,
+ +					     int cpu)
+++=======
++ static inline void kvm_init_host_cpu_context(struct kvm_cpu_context *cpu_ctxt)
+++>>>>>>> 1e0cf16cdad1 (KVM: arm/arm64: Initialise host's MPIDRs by reading the actual register)
+  {
+  	/* The host's MPIDR is immutable, so let's set it up at boot time */
+- 	cpu_ctxt->sys_regs[MPIDR_EL1] = cpu_logical_map(cpu);
++ 	cpu_ctxt->sys_regs[MPIDR_EL1] = read_cpuid_mpidr();
+  }
+  
+  void __kvm_enable_ssbs(void);
+diff --cc virt/kvm/arm/arm.c
+index 2482b77e6427,f149c79fd6ef..000000000000
+--- a/virt/kvm/arm/arm.c
++++ b/virt/kvm/arm/arm.c
+@@@ -1572,11 -1568,10 +1574,16 @@@ static int init_hyp_mode(void
+  	}
+  
+  	for_each_possible_cpu(cpu) {
+ -		kvm_host_data_t *cpu_data;
+ +		kvm_cpu_context_t *cpu_ctxt;
+  
+++<<<<<<< HEAD
+ +		cpu_ctxt = per_cpu_ptr(&kvm_host_cpu_state, cpu);
+ +		kvm_init_host_cpu_context(cpu_ctxt, cpu);
+ +		err = create_hyp_mappings(cpu_ctxt, cpu_ctxt + 1, PAGE_HYP);
+++=======
++ 		cpu_data = per_cpu_ptr(&kvm_host_data, cpu);
++ 		err = create_hyp_mappings(cpu_data, cpu_data + 1, PAGE_HYP);
+++>>>>>>> 1e0cf16cdad1 (KVM: arm/arm64: Initialise host's MPIDRs by reading the actual register)
+  
+  		if (err) {
+  			kvm_err("Cannot map host CPU state: %d\n", err);
+* Unmerged path arch/arm/include/asm/kvm_host.h
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+* Unmerged path virt/kvm/arm/arm.c
