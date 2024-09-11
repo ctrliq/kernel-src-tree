@@ -1,0 +1,474 @@
+s390/qdio: let driver manage the QAOB
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 396c100472dd63bb1a5389d9dfb25a94943c41c9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/396c1004.failed
+
+We are spending way too much effort on qdio-internal bookkeeping for
+QAOB management & caching, and it's still not robust. Once qdio's
+TX path has detached the QAOB from a PENDING buffer, we lost all
+track of it until it shows up in a CQ notification again. So if the
+device is torn down before that notification arrives, we leak the QAOB.
+
+Just have the driver take care of it, and simply pass down a QAOB if
+they want a TX with async-completion capability. For a buffer in PENDING
+state that requires the QAOB for final completion, qeth can now also try
+to recycle the buffer's QAOB rather than unconditionally freeing it.
+
+This also eliminates the qdio_outbuf_state array, which was only needed
+to transfer the aob->user1 tag from the driver to the qdio layer.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Acked-by: Benjamin Block <bblock@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 396c100472dd63bb1a5389d9dfb25a94943c41c9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index 1bc7dd282aaf,175b82b98f36..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -1449,9 -1420,16 +1418,16 @@@ static void qeth_clear_output_buffer(st
+  	atomic_set(&buf->state, QETH_QDIO_BUF_EMPTY);
+  }
+  
++ static void qeth_free_out_buf(struct qeth_qdio_out_buffer *buf)
++ {
++ 	if (buf->aob)
++ 		qdio_release_aob(buf->aob);
++ 	kmem_cache_free(qeth_qdio_outbuf_cache, buf);
++ }
++ 
+  static void qeth_tx_complete_pending_bufs(struct qeth_card *card,
+  					  struct qeth_qdio_out_q *queue,
+ -					  bool drain)
+ +					  bool drain, int budget)
+  {
+  	struct qeth_qdio_out_buffer *buf, *tmp;
+  
+@@@ -1463,10 -1441,10 +1439,10 @@@
+  			if (drain)
+  				qeth_notify_skbs(queue, buf,
+  						 TX_NOTIFY_GENERALERROR);
+ -			qeth_tx_complete_buf(buf, drain, 0);
+ +			qeth_tx_complete_buf(buf, drain, budget);
+  
+  			list_del(&buf->list_entry);
+- 			kmem_cache_free(qeth_qdio_outbuf_cache, buf);
++ 			qeth_free_out_buf(buf);
+  		}
+  	}
+  }
+@@@ -2635,11 -2601,23 +2611,22 @@@ static struct qeth_qdio_out_q *qeth_all
+  	if (!q)
+  		return NULL;
+  
+ -	if (qdio_alloc_buffers(q->qdio_bufs, QDIO_MAX_BUFFERS_PER_Q))
+ -		goto err_qdio_bufs;
+ -
+ -	for (i = 0; i < QDIO_MAX_BUFFERS_PER_Q; i++) {
+ -		if (qeth_init_qdio_out_buf(q, i))
+ -			goto err_out_bufs;
+ +	if (qdio_alloc_buffers(q->qdio_bufs, QDIO_MAX_BUFFERS_PER_Q)) {
+ +		kfree(q);
+ +		return NULL;
+  	}
+ -
+  	return q;
+++<<<<<<< HEAD
+++=======
++ 
++ err_out_bufs:
++ 	while (i > 0)
++ 		qeth_free_out_buf(q->bufs[--i]);
++ 	qdio_free_buffers(q->qdio_bufs, QDIO_MAX_BUFFERS_PER_Q);
++ err_qdio_bufs:
++ 	kfree(q);
++ 	return NULL;
+++>>>>>>> 396c100472dd (s390/qdio: let driver manage the QAOB)
+  }
+  
+  static void qeth_tx_completion_timer(struct timer_list *timer)
+diff --git a/arch/s390/include/asm/qdio.h b/arch/s390/include/asm/qdio.h
+index d9215c7106f0..8fc52679543d 100644
+--- a/arch/s390/include/asm/qdio.h
++++ b/arch/s390/include/asm/qdio.h
+@@ -246,21 +246,8 @@ struct slsb {
+ 	u8 val[QDIO_MAX_BUFFERS_PER_Q];
+ } __attribute__ ((packed, aligned(256)));
+ 
+-/**
+- * struct qdio_outbuf_state - SBAL related asynchronous operation information
+- *   (for communication with upper layer programs)
+- *   (only required for use with completion queues)
+- * @user: pointer to upper layer program's state information related to SBAL
+- *        (stored in user1 data of QAOB)
+- */
+-struct qdio_outbuf_state {
+-	void *user;
+-};
+-
+-#define CHSC_AC1_INITIATE_INPUTQ	0x80
+-
+-
+ /* qdio adapter-characteristics-1 flag */
++#define CHSC_AC1_INITIATE_INPUTQ	0x80
+ #define AC1_SIGA_INPUT_NEEDED		0x40	/* process input queues */
+ #define AC1_SIGA_OUTPUT_NEEDED		0x20	/* process output queues */
+ #define AC1_SIGA_SYNC_NEEDED		0x10	/* ask hypervisor to sync */
+@@ -338,7 +325,6 @@ typedef void qdio_handler_t(struct ccw_device *, unsigned int, int,
+  * @int_parm: interruption parameter
+  * @input_sbal_addr_array:  per-queue array, each element points to 128 SBALs
+  * @output_sbal_addr_array: per-queue array, each element points to 128 SBALs
+- * @output_sbal_state_array: no_output_qs * 128 state info (for CQ or NULL)
+  */
+ struct qdio_initialize {
+ 	unsigned char q_format;
+@@ -357,7 +343,6 @@ struct qdio_initialize {
+ 	unsigned long int_parm;
+ 	struct qdio_buffer ***input_sbal_addr_array;
+ 	struct qdio_buffer ***output_sbal_addr_array;
+-	struct qdio_outbuf_state *output_sbal_state_array;
+ };
+ 
+ #define QDIO_STATE_INACTIVE		0x00000002 /* after qdio_cleanup */
+@@ -378,9 +363,10 @@ extern int qdio_allocate(struct ccw_device *cdev, unsigned int no_input_qs,
+ extern int qdio_establish(struct ccw_device *cdev,
+ 			  struct qdio_initialize *init_data);
+ extern int qdio_activate(struct ccw_device *);
++extern struct qaob *qdio_allocate_aob(void);
+ extern void qdio_release_aob(struct qaob *);
+-extern int do_QDIO(struct ccw_device *, unsigned int, int, unsigned int,
+-		   unsigned int);
++extern int do_QDIO(struct ccw_device *cdev, unsigned int callflags, int q_nr,
++		   unsigned int bufnr, unsigned int count, struct qaob *aob);
+ extern int qdio_start_irq(struct ccw_device *cdev);
+ extern int qdio_stop_irq(struct ccw_device *cdev);
+ extern int qdio_get_next_buffers(struct ccw_device *, int, int *, int *);
+diff --git a/drivers/s390/cio/qdio.h b/drivers/s390/cio/qdio.h
+index ff421907ce01..9a66c0d8e8ac 100644
+--- a/drivers/s390/cio/qdio.h
++++ b/drivers/s390/cio/qdio.h
+@@ -181,12 +181,6 @@ struct qdio_input_q {
+ struct qdio_output_q {
+ 	/* PCIs are enabled for the queue */
+ 	int pci_out_enabled;
+-	/* cq: use asynchronous output buffers */
+-	int use_cq;
+-	/* cq: aobs used for particual SBAL */
+-	struct qaob **aobs;
+-	/* cq: sbal state related to asynchronous operation */
+-	struct qdio_outbuf_state *sbal_state;
+ 	/* timer to check for more outbound work */
+ 	struct timer_list timer;
+ 	/* tasklet to check for completions */
+@@ -379,12 +373,8 @@ int qdio_setup_irq(struct qdio_irq *irq_ptr, struct qdio_initialize *init_data);
+ void qdio_shutdown_irq(struct qdio_irq *irq);
+ void qdio_print_subchannel_info(struct qdio_irq *irq_ptr);
+ void qdio_free_queues(struct qdio_irq *irq_ptr);
+-void qdio_free_async_data(struct qdio_irq *irq_ptr);
+ int qdio_setup_init(void);
+ void qdio_setup_exit(void);
+-int qdio_enable_async_operation(struct qdio_output_q *q);
+-void qdio_disable_async_operation(struct qdio_output_q *q);
+-struct qaob *qdio_allocate_aob(void);
+ 
+ int debug_get_buf_state(struct qdio_q *q, unsigned int bufnr,
+ 			unsigned char *state);
+diff --git a/drivers/s390/cio/qdio_main.c b/drivers/s390/cio/qdio_main.c
+index a7e380054f89..48ca66aab6c3 100644
+--- a/drivers/s390/cio/qdio_main.c
++++ b/drivers/s390/cio/qdio_main.c
+@@ -517,24 +517,6 @@ static inline int qdio_inbound_q_done(struct qdio_q *q, unsigned int start)
+ 	return 1;
+ }
+ 
+-static inline unsigned long qdio_aob_for_buffer(struct qdio_output_q *q,
+-					int bufnr)
+-{
+-	unsigned long phys_aob = 0;
+-
+-	if (!q->aobs[bufnr]) {
+-		struct qaob *aob = qdio_allocate_aob();
+-		q->aobs[bufnr] = aob;
+-	}
+-	if (q->aobs[bufnr]) {
+-		q->aobs[bufnr]->user1 = (u64) q->sbal_state[bufnr].user;
+-		phys_aob = virt_to_phys(q->aobs[bufnr]);
+-		WARN_ON_ONCE(phys_aob & 0xFF);
+-	}
+-
+-	return phys_aob;
+-}
+-
+ static inline int qdio_tasklet_schedule(struct qdio_q *q)
+ {
+ 	if (likely(q->irq_ptr->state == QDIO_IRQ_STATE_ACTIVE)) {
+@@ -548,7 +530,6 @@ static int get_outbound_buffer_frontier(struct qdio_q *q, unsigned int start,
+ 					unsigned int *error)
+ {
+ 	unsigned char state = 0;
+-	unsigned int i;
+ 	int count;
+ 
+ 	q->timestamp = get_tod_clock_fast();
+@@ -570,10 +551,6 @@ static int get_outbound_buffer_frontier(struct qdio_q *q, unsigned int start,
+ 
+ 	switch (state) {
+ 	case SLSB_P_OUTPUT_PENDING:
+-		/* detach the utilized QAOBs: */
+-		for (i = 0; i < count; i++)
+-			q->u.out.aobs[QDIO_BUFNR(start + i)] = NULL;
+-
+ 		*error = QDIO_ERROR_SLSB_PENDING;
+ 		fallthrough;
+ 	case SLSB_P_OUTPUT_EMPTY:
+@@ -998,7 +975,6 @@ int qdio_free(struct ccw_device *cdev)
+ 	cdev->private->qdio_data = NULL;
+ 	mutex_unlock(&irq_ptr->setup_mutex);
+ 
+-	qdio_free_async_data(irq_ptr);
+ 	qdio_free_queues(irq_ptr);
+ 	free_page((unsigned long) irq_ptr->qdr);
+ 	free_page(irq_ptr->chsc_page);
+@@ -1074,28 +1050,6 @@ int qdio_allocate(struct ccw_device *cdev, unsigned int no_input_qs,
+ }
+ EXPORT_SYMBOL_GPL(qdio_allocate);
+ 
+-static void qdio_detect_hsicq(struct qdio_irq *irq_ptr)
+-{
+-	struct qdio_q *q = irq_ptr->input_qs[0];
+-	int i, use_cq = 0;
+-
+-	if (irq_ptr->nr_input_qs > 1 && queue_type(q) == QDIO_IQDIO_QFMT)
+-		use_cq = 1;
+-
+-	for_each_output_queue(irq_ptr, q, i) {
+-		if (use_cq) {
+-			if (multicast_outbound(q))
+-				continue;
+-			if (qdio_enable_async_operation(&q->u.out) < 0) {
+-				use_cq = 0;
+-				continue;
+-			}
+-		} else
+-			qdio_disable_async_operation(&q->u.out);
+-	}
+-	DBF_EVENT("use_cq:%d", use_cq);
+-}
+-
+ static void qdio_trace_init_data(struct qdio_irq *irq,
+ 				 struct qdio_initialize *data)
+ {
+@@ -1190,8 +1144,6 @@ int qdio_establish(struct ccw_device *cdev,
+ 
+ 	qdio_setup_ssqd_info(irq_ptr);
+ 
+-	qdio_detect_hsicq(irq_ptr);
+-
+ 	/* qebsm is now setup if available, initialize buffer states */
+ 	qdio_init_buf_states(irq_ptr);
+ 
+@@ -1296,9 +1248,11 @@ static int handle_inbound(struct qdio_q *q, unsigned int callflags,
+  * @callflags: flags
+  * @bufnr: first buffer to process
+  * @count: how many buffers are filled
++ * @aob: asynchronous operation block
+  */
+ static int handle_outbound(struct qdio_q *q, unsigned int callflags,
+-			   unsigned int bufnr, unsigned int count)
++			   unsigned int bufnr, unsigned int count,
++			   struct qaob *aob)
+ {
+ 	const unsigned int scan_threshold = q->irq_ptr->scan_threshold;
+ 	unsigned char state = 0;
+@@ -1319,11 +1273,9 @@ static int handle_outbound(struct qdio_q *q, unsigned int callflags,
+ 		q->u.out.pci_out_enabled = 0;
+ 
+ 	if (queue_type(q) == QDIO_IQDIO_QFMT) {
+-		unsigned long phys_aob = 0;
+-
+-		if (q->u.out.use_cq && count == 1)
+-			phys_aob = qdio_aob_for_buffer(&q->u.out, bufnr);
++		unsigned long phys_aob = aob ? virt_to_phys(aob) : 0;
+ 
++		WARN_ON_ONCE(!IS_ALIGNED(phys_aob, 256));
+ 		rc = qdio_kick_outbound_q(q, count, phys_aob);
+ 	} else if (need_siga_sync(q)) {
+ 		rc = qdio_siga_sync_q(q);
+@@ -1358,9 +1310,10 @@ static int handle_outbound(struct qdio_q *q, unsigned int callflags,
+  * @q_nr: queue number
+  * @bufnr: buffer number
+  * @count: how many buffers to process
++ * @aob: asynchronous operation block (outbound only)
+  */
+ int do_QDIO(struct ccw_device *cdev, unsigned int callflags,
+-	    int q_nr, unsigned int bufnr, unsigned int count)
++	    int q_nr, unsigned int bufnr, unsigned int count, struct qaob *aob)
+ {
+ 	struct qdio_irq *irq_ptr = cdev->private->qdio_data;
+ 
+@@ -1382,7 +1335,7 @@ int do_QDIO(struct ccw_device *cdev, unsigned int callflags,
+ 				      callflags, bufnr, count);
+ 	else if (callflags & QDIO_FLAG_SYNC_OUTPUT)
+ 		return handle_outbound(irq_ptr->output_qs[q_nr],
+-				       callflags, bufnr, count);
++				       callflags, bufnr, count, aob);
+ 	return -EINVAL;
+ }
+ EXPORT_SYMBOL_GPL(do_QDIO);
+diff --git a/drivers/s390/cio/qdio_setup.c b/drivers/s390/cio/qdio_setup.c
+index fe2bef305e5c..bebfef771b19 100644
+--- a/drivers/s390/cio/qdio_setup.c
++++ b/drivers/s390/cio/qdio_setup.c
+@@ -30,6 +30,7 @@ struct qaob *qdio_allocate_aob(void)
+ {
+ 	return kmem_cache_zalloc(qdio_aob_cache, GFP_ATOMIC);
+ }
++EXPORT_SYMBOL_GPL(qdio_allocate_aob);
+ 
+ void qdio_release_aob(struct qaob *aob)
+ {
+@@ -247,8 +248,6 @@ static void setup_queues(struct qdio_irq *irq_ptr,
+ 			 struct qdio_initialize *qdio_init)
+ {
+ 	struct qdio_q *q;
+-	struct qdio_outbuf_state *output_sbal_state_array =
+-				  qdio_init->output_sbal_state_array;
+ 	int i;
+ 
+ 	for_each_input_queue(irq_ptr, q, i) {
+@@ -265,9 +264,6 @@ static void setup_queues(struct qdio_irq *irq_ptr,
+ 		DBF_EVENT("outq:%1d", i);
+ 		setup_queues_misc(q, irq_ptr, qdio_init->output_handler, i);
+ 
+-		q->u.out.sbal_state = output_sbal_state_array;
+-		output_sbal_state_array += QDIO_MAX_BUFFERS_PER_Q;
+-
+ 		q->is_input_q = 0;
+ 		setup_storage_lists(q, irq_ptr,
+ 				    qdio_init->output_sbal_addr_array[i], i);
+@@ -373,30 +369,6 @@ void qdio_setup_ssqd_info(struct qdio_irq *irq_ptr)
+ 	DBF_EVENT("3:%4x qib:%4x", irq_ptr->ssqd_desc.qdioac3, irq_ptr->qib.ac);
+ }
+ 
+-void qdio_free_async_data(struct qdio_irq *irq_ptr)
+-{
+-	struct qdio_q *q;
+-	int i;
+-
+-	for (i = 0; i < irq_ptr->max_output_qs; i++) {
+-		q = irq_ptr->output_qs[i];
+-		if (q->u.out.use_cq) {
+-			unsigned int n;
+-
+-			for (n = 0; n < QDIO_MAX_BUFFERS_PER_Q; n++) {
+-				struct qaob *aob = q->u.out.aobs[n];
+-
+-				if (aob) {
+-					qdio_release_aob(aob);
+-					q->u.out.aobs[n] = NULL;
+-				}
+-			}
+-
+-			qdio_disable_async_operation(&q->u.out);
+-		}
+-	}
+-}
+-
+ static void qdio_fill_qdr_desc(struct qdesfmt0 *desc, struct qdio_q *queue)
+ {
+ 	desc->sliba = virt_to_phys(queue->slib);
+@@ -546,25 +518,6 @@ void qdio_print_subchannel_info(struct qdio_irq *irq_ptr)
+ 	printk(KERN_INFO "%s", s);
+ }
+ 
+-int qdio_enable_async_operation(struct qdio_output_q *outq)
+-{
+-	outq->aobs = kcalloc(QDIO_MAX_BUFFERS_PER_Q, sizeof(struct qaob *),
+-			     GFP_KERNEL);
+-	if (!outq->aobs) {
+-		outq->use_cq = 0;
+-		return -ENOMEM;
+-	}
+-	outq->use_cq = 1;
+-	return 0;
+-}
+-
+-void qdio_disable_async_operation(struct qdio_output_q *q)
+-{
+-	kfree(q->aobs);
+-	q->aobs = NULL;
+-	q->use_cq = 0;
+-}
+-
+ int __init qdio_setup_init(void)
+ {
+ 	int rc;
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index 4ac70401c184..9fc1ee8718bf 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -417,6 +417,7 @@ struct qeth_qdio_out_buffer {
+ 
+ 	struct qeth_qdio_out_q *q;
+ 	struct list_head list_entry;
++	struct qaob *aob;
+ };
+ 
+ struct qeth_card;
+@@ -479,7 +480,6 @@ struct qeth_out_q_stats {
+ struct qeth_qdio_out_q {
+ 	struct qdio_buffer *qdio_bufs[QDIO_MAX_BUFFERS_PER_Q];
+ 	struct qeth_qdio_out_buffer *bufs[QDIO_MAX_BUFFERS_PER_Q];
+-	struct qdio_outbuf_state *bufstates; /* convenience pointer */
+ 	struct list_head pending_bufs;
+ 	struct qeth_out_q_stats stats;
+ 	spinlock_t lock;
+@@ -542,7 +542,6 @@ struct qeth_qdio_info {
+ 	/* output */
+ 	int no_out_queues;
+ 	struct qeth_qdio_out_q *out_qs[QETH_MAX_OUT_QUEUES];
+-	struct qdio_outbuf_state *out_bufstates;
+ 
+ 	/* priority queueing */
+ 	int do_prio_queueing;
+* Unmerged path drivers/s390/net/qeth_core_main.c
+diff --git a/drivers/s390/scsi/zfcp_qdio.c b/drivers/s390/scsi/zfcp_qdio.c
+index fee195965194..c6a26ab7cd7b 100644
+--- a/drivers/s390/scsi/zfcp_qdio.c
++++ b/drivers/s390/scsi/zfcp_qdio.c
+@@ -128,7 +128,7 @@ static void zfcp_qdio_int_resp(struct ccw_device *cdev, unsigned int qdio_err,
+ 	/*
+ 	 * put SBALs back to response queue
+ 	 */
+-	if (do_QDIO(cdev, QDIO_FLAG_SYNC_INPUT, 0, idx, count))
++	if (do_QDIO(cdev, QDIO_FLAG_SYNC_INPUT, 0, idx, count, NULL))
+ 		zfcp_erp_adapter_reopen(qdio->adapter, 0, "qdires2");
+ }
+ 
+@@ -297,7 +297,7 @@ int zfcp_qdio_send(struct zfcp_qdio *qdio, struct zfcp_qdio_req *q_req)
+ 	atomic_sub(sbal_number, &qdio->req_q_free);
+ 
+ 	retval = do_QDIO(qdio->adapter->ccw_device, QDIO_FLAG_SYNC_OUTPUT, 0,
+-			 q_req->sbal_first, sbal_number);
++			 q_req->sbal_first, sbal_number, NULL);
+ 
+ 	if (unlikely(retval)) {
+ 		/* Failed to submit the IO, roll back our modifications. */
+@@ -462,7 +462,8 @@ int zfcp_qdio_open(struct zfcp_qdio *qdio)
+ 		sbale->addr = 0;
+ 	}
+ 
+-	if (do_QDIO(cdev, QDIO_FLAG_SYNC_INPUT, 0, 0, QDIO_MAX_BUFFERS_PER_Q))
++	if (do_QDIO(cdev, QDIO_FLAG_SYNC_INPUT, 0, 0, QDIO_MAX_BUFFERS_PER_Q,
++		    NULL))
+ 		goto failed_qdio;
+ 
+ 	/* set index of first available SBALS / number of available SBALS */
