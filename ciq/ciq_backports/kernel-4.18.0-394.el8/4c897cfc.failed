@@ -1,0 +1,406 @@
+devlink: Simplify devlink resources unregister call
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Leon Romanovsky <leonro@nvidia.com>
+commit 4c897cfc46a554a523343fc3296333c473a2fc52
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/4c897cfc.failed
+
+The devlink_resources_unregister() used second parameter as an
+entry point for the recursive removal of devlink resources. None
+of the callers outside of devlink core needed to use this field,
+so let's remove it.
+
+As part of this removal, the "struct devlink_resource" was moved
+from .h to .c file as it is not possible to use in any place in
+the code except devlink.c.
+
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4c897cfc46a554a523343fc3296333c473a2fc52)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/core.c
+#	drivers/net/netdevsim/dev.c
+#	net/core/devlink.c
+#	net/dsa/dsa.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/core.c
+index 7e9a7cb31720,0d1f08bbf631..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/core.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/core.c
+@@@ -2119,8 -2108,7 +2119,12 @@@ void mlxsw_core_bus_device_unregister(s
+  
+  reload_fail_deinit:
+  	mlxsw_core_params_unregister(mlxsw_core);
+++<<<<<<< HEAD
+ +	devlink_unregister(devlink);
+ +	devlink_resources_unregister(devlink, NULL);
+++=======
++ 	devlink_resources_unregister(devlink);
+++>>>>>>> 4c897cfc46a5 (devlink: Simplify devlink resources unregister call)
+  	devlink_free(devlink);
+  }
+  EXPORT_SYMBOL(mlxsw_core_bus_device_unregister);
+diff --cc drivers/net/netdevsim/dev.c
+index a3dd545b2aec,08d7b465a0de..000000000000
+--- a/drivers/net/netdevsim/dev.c
++++ b/drivers/net/netdevsim/dev.c
+@@@ -1533,11 -1622,12 +1533,17 @@@ err_params_unregister
+  	devlink_params_unregister(devlink, nsim_devlink_params,
+  				  ARRAY_SIZE(nsim_devlink_params));
+  err_dl_unregister:
+++<<<<<<< HEAD
+ +	devlink_unregister(devlink);
+ +err_resources_unregister:
+ +	devlink_resources_unregister(devlink, NULL);
+++=======
++ 	devlink_resources_unregister(devlink);
++ err_vfc_free:
++ 	kfree(nsim_dev->vfconfigs);
+++>>>>>>> 4c897cfc46a5 (devlink: Simplify devlink resources unregister call)
+  err_devlink_free:
+  	devlink_free(devlink);
+ -	dev_set_drvdata(&nsim_bus_dev->dev, NULL);
+  	return err;
+  }
+  
+@@@ -1576,9 -1668,10 +1582,14 @@@ void nsim_dev_remove(struct nsim_bus_de
+  	nsim_dev_debugfs_exit(nsim_dev);
+  	devlink_params_unregister(devlink, nsim_devlink_params,
+  				  ARRAY_SIZE(nsim_devlink_params));
+++<<<<<<< HEAD
+ +	devlink_unregister(devlink);
+ +	devlink_resources_unregister(devlink, NULL);
+++=======
++ 	devlink_resources_unregister(devlink);
++ 	kfree(nsim_dev->vfconfigs);
+++>>>>>>> 4c897cfc46a5 (devlink: Simplify devlink resources unregister call)
+  	devlink_free(devlink);
+ -	dev_set_drvdata(&nsim_bus_dev->dev, NULL);
+  }
+  
+  static struct nsim_dev_port *
+diff --cc net/core/devlink.c
+index 4aa3abd9c46c,db3b52110cf2..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -34,6 -30,92 +34,95 @@@
+  #define CREATE_TRACE_POINTS
+  #include <trace/events/devlink.h>
+  
+++<<<<<<< HEAD
+++=======
++ #define DEVLINK_RELOAD_STATS_ARRAY_SIZE \
++ 	(__DEVLINK_RELOAD_LIMIT_MAX * __DEVLINK_RELOAD_ACTION_MAX)
++ 
++ struct devlink_dev_stats {
++ 	u32 reload_stats[DEVLINK_RELOAD_STATS_ARRAY_SIZE];
++ 	u32 remote_reload_stats[DEVLINK_RELOAD_STATS_ARRAY_SIZE];
++ };
++ 
++ struct devlink {
++ 	u32 index;
++ 	struct list_head port_list;
++ 	struct list_head rate_list;
++ 	struct list_head sb_list;
++ 	struct list_head dpipe_table_list;
++ 	struct list_head resource_list;
++ 	struct list_head param_list;
++ 	struct list_head region_list;
++ 	struct list_head reporter_list;
++ 	struct mutex reporters_lock; /* protects reporter_list */
++ 	struct devlink_dpipe_headers *dpipe_headers;
++ 	struct list_head trap_list;
++ 	struct list_head trap_group_list;
++ 	struct list_head trap_policer_list;
++ 	const struct devlink_ops *ops;
++ 	u64 features;
++ 	struct xarray snapshot_ids;
++ 	struct devlink_dev_stats stats;
++ 	struct device *dev;
++ 	possible_net_t _net;
++ 	/* Serializes access to devlink instance specific objects such as
++ 	 * port, sb, dpipe, resource, params, region, traps and more.
++ 	 */
++ 	struct mutex lock;
++ 	u8 reload_failed:1;
++ 	refcount_t refcount;
++ 	struct completion comp;
++ 	char priv[] __aligned(NETDEV_ALIGN);
++ };
++ 
++ /**
++  * struct devlink_resource - devlink resource
++  * @name: name of the resource
++  * @id: id, per devlink instance
++  * @size: size of the resource
++  * @size_new: updated size of the resource, reload is needed
++  * @size_valid: valid in case the total size of the resource is valid
++  *              including its children
++  * @parent: parent resource
++  * @size_params: size parameters
++  * @list: parent list
++  * @resource_list: list of child resources
++  * @occ_get: occupancy getter callback
++  * @occ_get_priv: occupancy getter callback priv
++  */
++ struct devlink_resource {
++ 	const char *name;
++ 	u64 id;
++ 	u64 size;
++ 	u64 size_new;
++ 	bool size_valid;
++ 	struct devlink_resource *parent;
++ 	struct devlink_resource_size_params size_params;
++ 	struct list_head list;
++ 	struct list_head resource_list;
++ 	devlink_resource_occ_get_t *occ_get;
++ 	void *occ_get_priv;
++ };
++ 
++ void *devlink_priv(struct devlink *devlink)
++ {
++ 	return &devlink->priv;
++ }
++ EXPORT_SYMBOL_GPL(devlink_priv);
++ 
++ struct devlink *priv_to_devlink(void *priv)
++ {
++ 	return container_of(priv, struct devlink, priv);
++ }
++ EXPORT_SYMBOL_GPL(priv_to_devlink);
++ 
++ struct device *devlink_to_dev(const struct devlink *devlink)
++ {
++ 	return devlink->dev;
++ }
++ EXPORT_SYMBOL_GPL(devlink_to_dev);
++ 
+++>>>>>>> 4c897cfc46a5 (devlink: Simplify devlink resources unregister call)
+  static struct devlink_dpipe_field devlink_dpipe_fields_ethernet[] = {
+  	{
+  		.name = "destination mac",
+diff --cc net/dsa/dsa.c
+index e63c554e0623,d9d0d227092c..000000000000
+--- a/net/dsa/dsa.c
++++ b/net/dsa/dsa.c
+@@@ -262,27 -345,126 +262,123 @@@ bool dsa_schedule_work(struct work_stru
+  	return queue_work(dsa_owq, work);
+  }
+  
+ -void dsa_flush_workqueue(void)
+ +static ATOMIC_NOTIFIER_HEAD(dsa_notif_chain);
+ +
+ +int register_dsa_notifier(struct notifier_block *nb)
+  {
+ -	flush_workqueue(dsa_owq);
+ +	return atomic_notifier_chain_register(&dsa_notif_chain, nb);
+  }
+ +EXPORT_SYMBOL_GPL(register_dsa_notifier);
+  
+ -int dsa_devlink_param_get(struct devlink *dl, u32 id,
+ -			  struct devlink_param_gset_ctx *ctx)
+ +int unregister_dsa_notifier(struct notifier_block *nb)
+  {
+ -	struct dsa_switch *ds = dsa_devlink_to_ds(dl);
+ -
+ -	if (!ds->ops->devlink_param_get)
+ -		return -EOPNOTSUPP;
+ -
+ -	return ds->ops->devlink_param_get(ds, id, ctx);
+ +	return atomic_notifier_chain_unregister(&dsa_notif_chain, nb);
+  }
+ -EXPORT_SYMBOL_GPL(dsa_devlink_param_get);
+ +EXPORT_SYMBOL_GPL(unregister_dsa_notifier);
+  
+ -int dsa_devlink_param_set(struct devlink *dl, u32 id,
+ -			  struct devlink_param_gset_ctx *ctx)
+ +int call_dsa_notifiers(unsigned long val, struct net_device *dev,
+ +		       struct dsa_notifier_info *info)
+  {
+ -	struct dsa_switch *ds = dsa_devlink_to_ds(dl);
+ -
+ -	if (!ds->ops->devlink_param_set)
+ -		return -EOPNOTSUPP;
+ -
+ -	return ds->ops->devlink_param_set(ds, id, ctx);
+ +	info->dev = dev;
+ +	return atomic_notifier_call_chain(&dsa_notif_chain, val, info);
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(call_dsa_notifiers);
+++=======
++ EXPORT_SYMBOL_GPL(dsa_devlink_param_set);
++ 
++ int dsa_devlink_params_register(struct dsa_switch *ds,
++ 				const struct devlink_param *params,
++ 				size_t params_count)
++ {
++ 	return devlink_params_register(ds->devlink, params, params_count);
++ }
++ EXPORT_SYMBOL_GPL(dsa_devlink_params_register);
++ 
++ void dsa_devlink_params_unregister(struct dsa_switch *ds,
++ 				   const struct devlink_param *params,
++ 				   size_t params_count)
++ {
++ 	devlink_params_unregister(ds->devlink, params, params_count);
++ }
++ EXPORT_SYMBOL_GPL(dsa_devlink_params_unregister);
++ 
++ int dsa_devlink_resource_register(struct dsa_switch *ds,
++ 				  const char *resource_name,
++ 				  u64 resource_size,
++ 				  u64 resource_id,
++ 				  u64 parent_resource_id,
++ 				  const struct devlink_resource_size_params *size_params)
++ {
++ 	return devlink_resource_register(ds->devlink, resource_name,
++ 					 resource_size, resource_id,
++ 					 parent_resource_id,
++ 					 size_params);
++ }
++ EXPORT_SYMBOL_GPL(dsa_devlink_resource_register);
++ 
++ void dsa_devlink_resources_unregister(struct dsa_switch *ds)
++ {
++ 	devlink_resources_unregister(ds->devlink);
++ }
++ EXPORT_SYMBOL_GPL(dsa_devlink_resources_unregister);
++ 
++ void dsa_devlink_resource_occ_get_register(struct dsa_switch *ds,
++ 					   u64 resource_id,
++ 					   devlink_resource_occ_get_t *occ_get,
++ 					   void *occ_get_priv)
++ {
++ 	return devlink_resource_occ_get_register(ds->devlink, resource_id,
++ 						 occ_get, occ_get_priv);
++ }
++ EXPORT_SYMBOL_GPL(dsa_devlink_resource_occ_get_register);
++ 
++ void dsa_devlink_resource_occ_get_unregister(struct dsa_switch *ds,
++ 					     u64 resource_id)
++ {
++ 	devlink_resource_occ_get_unregister(ds->devlink, resource_id);
++ }
++ EXPORT_SYMBOL_GPL(dsa_devlink_resource_occ_get_unregister);
++ 
++ struct devlink_region *
++ dsa_devlink_region_create(struct dsa_switch *ds,
++ 			  const struct devlink_region_ops *ops,
++ 			  u32 region_max_snapshots, u64 region_size)
++ {
++ 	return devlink_region_create(ds->devlink, ops, region_max_snapshots,
++ 				     region_size);
++ }
++ EXPORT_SYMBOL_GPL(dsa_devlink_region_create);
++ 
++ struct devlink_region *
++ dsa_devlink_port_region_create(struct dsa_switch *ds,
++ 			       int port,
++ 			       const struct devlink_port_region_ops *ops,
++ 			       u32 region_max_snapshots, u64 region_size)
++ {
++ 	struct dsa_port *dp = dsa_to_port(ds, port);
++ 
++ 	return devlink_port_region_create(&dp->devlink_port, ops,
++ 					  region_max_snapshots,
++ 					  region_size);
++ }
++ EXPORT_SYMBOL_GPL(dsa_devlink_port_region_create);
++ 
++ void dsa_devlink_region_destroy(struct devlink_region *region)
++ {
++ 	devlink_region_destroy(region);
++ }
++ EXPORT_SYMBOL_GPL(dsa_devlink_region_destroy);
++ 
++ struct dsa_port *dsa_port_from_netdev(struct net_device *netdev)
++ {
++ 	if (!netdev || !dsa_slave_dev_check(netdev))
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	return dsa_slave_to_port(netdev);
++ }
++ EXPORT_SYMBOL_GPL(dsa_port_from_netdev);
+++>>>>>>> 4c897cfc46a5 (devlink: Simplify devlink resources unregister call)
+  
+  static int __init dsa_init_module(void)
+  {
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/core.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index a642eab2c3a2..a329b39a2d64 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@ -3260,7 +3260,7 @@ static int mlxsw_sp1_resources_register(struct mlxsw_core *mlxsw_core)
+ 
+ err_resources_counter_register:
+ err_resources_span_register:
+-	devlink_resources_unregister(priv_to_devlink(mlxsw_core), NULL);
++	devlink_resources_unregister(priv_to_devlink(mlxsw_core));
+ 	return err;
+ }
+ 
+@@ -3288,7 +3288,7 @@ static int mlxsw_sp2_resources_register(struct mlxsw_core *mlxsw_core)
+ 
+ err_resources_counter_register:
+ err_resources_span_register:
+-	devlink_resources_unregister(priv_to_devlink(mlxsw_core), NULL);
++	devlink_resources_unregister(priv_to_devlink(mlxsw_core));
+ 	return err;
+ }
+ 
+* Unmerged path drivers/net/netdevsim/dev.c
+diff --git a/include/net/devlink.h b/include/net/devlink.h
+index a316af63761b..a6c74e464079 100644
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -403,33 +403,6 @@ devlink_resource_size_params_init(struct devlink_resource_size_params *size_para
+ 
+ typedef u64 devlink_resource_occ_get_t(void *priv);
+ 
+-/**
+- * struct devlink_resource - devlink resource
+- * @name: name of the resource
+- * @id: id, per devlink instance
+- * @size: size of the resource
+- * @size_new: updated size of the resource, reload is needed
+- * @size_valid: valid in case the total size of the resource is valid
+- *              including its children
+- * @parent: parent resource
+- * @size_params: size parameters
+- * @list: parent list
+- * @resource_list: list of child resources
+- */
+-struct devlink_resource {
+-	const char *name;
+-	u64 id;
+-	u64 size;
+-	u64 size_new;
+-	bool size_valid;
+-	struct devlink_resource *parent;
+-	struct devlink_resource_size_params size_params;
+-	struct list_head list;
+-	struct list_head resource_list;
+-	devlink_resource_occ_get_t *occ_get;
+-	void *occ_get_priv;
+-};
+-
+ #define DEVLINK_RESOURCE_ID_PARENT_TOP 0
+ 
+ #define DEVLINK_RESOURCE_GENERIC_NAME_PORTS "physical_ports"
+@@ -1616,8 +1589,7 @@ int devlink_resource_register(struct devlink *devlink,
+ 			      u64 resource_id,
+ 			      u64 parent_resource_id,
+ 			      const struct devlink_resource_size_params *size_params);
+-void devlink_resources_unregister(struct devlink *devlink,
+-				  struct devlink_resource *resource);
++void devlink_resources_unregister(struct devlink *devlink);
+ int devlink_resource_size_get(struct devlink *devlink,
+ 			      u64 resource_id,
+ 			      u64 *p_resource_size);
+* Unmerged path net/core/devlink.c
+* Unmerged path net/dsa/dsa.c
