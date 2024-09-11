@@ -1,0 +1,175 @@
+KVM: s390: Fix pfmf and conditional skey emulation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Janosch Frank <frankja@linux.ibm.com>
+commit a11bdb1a6b782ee97587f92fae798efc78c31093
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/a11bdb1a.failed
+
+We should not return with a lock.
+We also have to increase the address when we do page clearing.
+
+Fixes: bd096f644319 ("KVM: s390: Add skey emulation fault handling")
+	Signed-off-by: Janosch Frank <frankja@linux.ibm.com>
+Message-Id: <20180830081355.59234-1-frankja@linux.ibm.com>
+	Reviewed-by: David Hildenbrand <david@redhat.com>
+	Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+(cherry picked from commit a11bdb1a6b782ee97587f92fae798efc78c31093)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/priv.c
+diff --cc arch/s390/kvm/priv.c
+index 63285b14ff31,8679bd74d337..000000000000
+--- a/arch/s390/kvm/priv.c
++++ b/arch/s390/kvm/priv.c
+@@@ -260,18 -261,30 +260,34 @@@ static int handle_iske(struct kvm_vcpu 
+  
+  	kvm_s390_get_regs_rre(vcpu, &reg1, &reg2);
+  
+ -	gaddr = vcpu->run->s.regs.gprs[reg2] & PAGE_MASK;
+ -	gaddr = kvm_s390_logical_to_effective(vcpu, gaddr);
+ -	gaddr = kvm_s390_real_to_abs(vcpu, gaddr);
+ -	vmaddr = gfn_to_hva(vcpu->kvm, gpa_to_gfn(gaddr));
+ -	if (kvm_is_error_hva(vmaddr))
+ +	addr = vcpu->run->s.regs.gprs[reg2] & PAGE_MASK;
+ +	addr = kvm_s390_logical_to_effective(vcpu, addr);
+ +	addr = kvm_s390_real_to_abs(vcpu, addr);
+ +	addr = gfn_to_hva(vcpu->kvm, gpa_to_gfn(addr));
+ +	if (kvm_is_error_hva(addr))
+  		return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
+ -retry:
+ -	unlocked = false;
+ -	down_read(&current->mm->mmap_sem);
+ -	rc = get_guest_storage_key(current->mm, vmaddr, &key);
+  
+++<<<<<<< HEAD
+ +	down_read(&current->mm->mmap_sem);
+ +	rc = get_guest_storage_key(current->mm, addr, &key);
+ +	up_read(&current->mm->mmap_sem);
+ +	if (rc)
+ +		return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
+++=======
++ 	if (rc) {
++ 		rc = fixup_user_fault(current, current->mm, vmaddr,
++ 				      FAULT_FLAG_WRITE, &unlocked);
++ 		if (!rc) {
++ 			up_read(&current->mm->mmap_sem);
++ 			goto retry;
++ 		}
++ 	}
++ 	up_read(&current->mm->mmap_sem);
++ 	if (rc == -EFAULT)
++ 		return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
++ 	if (rc < 0)
++ 		return rc;
+++>>>>>>> a11bdb1a6b78 (KVM: s390: Fix pfmf and conditional skey emulation)
+  	vcpu->run->s.regs.gprs[reg1] &= ~0xff;
+  	vcpu->run->s.regs.gprs[reg1] |= key;
+  	return 0;
+@@@ -294,19 -308,29 +310,36 @@@ static int handle_rrbe(struct kvm_vcpu 
+  
+  	kvm_s390_get_regs_rre(vcpu, &reg1, &reg2);
+  
+ -	gaddr = vcpu->run->s.regs.gprs[reg2] & PAGE_MASK;
+ -	gaddr = kvm_s390_logical_to_effective(vcpu, gaddr);
+ -	gaddr = kvm_s390_real_to_abs(vcpu, gaddr);
+ -	vmaddr = gfn_to_hva(vcpu->kvm, gpa_to_gfn(gaddr));
+ -	if (kvm_is_error_hva(vmaddr))
+ +	addr = vcpu->run->s.regs.gprs[reg2] & PAGE_MASK;
+ +	addr = kvm_s390_logical_to_effective(vcpu, addr);
+ +	addr = kvm_s390_real_to_abs(vcpu, addr);
+ +	addr = gfn_to_hva(vcpu->kvm, gpa_to_gfn(addr));
+ +	if (kvm_is_error_hva(addr))
+  		return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
+ -retry:
+ -	unlocked = false;
+ +
+  	down_read(&current->mm->mmap_sem);
+++<<<<<<< HEAD
+ +	rc = reset_guest_reference_bit(current->mm, addr);
+ +	up_read(&current->mm->mmap_sem);
+ +	if (rc < 0)
+ +		return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
+ +
+++=======
++ 	rc = reset_guest_reference_bit(current->mm, vmaddr);
++ 	if (rc < 0) {
++ 		rc = fixup_user_fault(current, current->mm, vmaddr,
++ 				      FAULT_FLAG_WRITE, &unlocked);
++ 		if (!rc) {
++ 			up_read(&current->mm->mmap_sem);
++ 			goto retry;
++ 		}
++ 	}
++ 	up_read(&current->mm->mmap_sem);
++ 	if (rc == -EFAULT)
++ 		return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
++ 	if (rc < 0)
++ 		return rc;
+++>>>>>>> a11bdb1a6b78 (KVM: s390: Fix pfmf and conditional skey emulation)
+  	kvm_s390_set_psw_cc(vcpu, rc);
+  	return 0;
+  }
+@@@ -359,12 -385,20 +392,26 @@@ static int handle_sske(struct kvm_vcpu 
+  			return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
+  
+  		down_read(&current->mm->mmap_sem);
+ -		rc = cond_set_guest_storage_key(current->mm, vmaddr, key, &oldkey,
+ +		rc = cond_set_guest_storage_key(current->mm, addr, key, &oldkey,
+  						m3 & SSKE_NQ, m3 & SSKE_MR,
+  						m3 & SSKE_MC);
+++<<<<<<< HEAD
+ +		up_read(&current->mm->mmap_sem);
+ +		if (rc < 0)
+ +			return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
+++=======
++ 
++ 		if (rc < 0) {
++ 			rc = fixup_user_fault(current, current->mm, vmaddr,
++ 					      FAULT_FLAG_WRITE, &unlocked);
++ 			rc = !rc ? -EAGAIN : rc;
++ 		}
++ 		up_read(&current->mm->mmap_sem);
++ 		if (rc == -EFAULT)
++ 			return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
++ 		if (rc < 0)
++ 			return rc;
+++>>>>>>> a11bdb1a6b78 (KVM: s390: Fix pfmf and conditional skey emulation)
+  		start += PAGE_SIZE;
+  	}
+  
+@@@ -964,13 -999,21 +1011,29 @@@ static int handle_pfmf(struct kvm_vcpu 
+  			if (rc)
+  				return rc;
+  			down_read(&current->mm->mmap_sem);
+ -			rc = cond_set_guest_storage_key(current->mm, vmaddr,
+ +			rc = cond_set_guest_storage_key(current->mm, useraddr,
+  							key, NULL, nq, mr, mc);
+++<<<<<<< HEAD
+ +			up_read(&current->mm->mmap_sem);
+ +			if (rc < 0)
+ +				return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
+ +		}
+ +
+++=======
++ 			if (rc < 0) {
++ 				rc = fixup_user_fault(current, current->mm, vmaddr,
++ 						      FAULT_FLAG_WRITE, &unlocked);
++ 				rc = !rc ? -EAGAIN : rc;
++ 			}
++ 			up_read(&current->mm->mmap_sem);
++ 			if (rc == -EFAULT)
++ 				return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
++ 			if (rc == -EAGAIN)
++ 				continue;
++ 			if (rc < 0)
++ 				return rc;
++ 		}
+++>>>>>>> a11bdb1a6b78 (KVM: s390: Fix pfmf and conditional skey emulation)
+  		start += PAGE_SIZE;
+  	}
+  	if (vcpu->run->s.regs.gprs[reg1] & PFMF_FSC) {
+* Unmerged path arch/s390/kvm/priv.c
