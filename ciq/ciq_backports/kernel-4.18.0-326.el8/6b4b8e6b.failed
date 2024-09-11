@@ -1,0 +1,84 @@
+ext4: fix bug for rename with RENAME_WHITEOUT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author yangerkun <yangerkun@huawei.com>
+commit 6b4b8e6b4ad8553660421d6360678b3811d5deb9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/6b4b8e6b.failed
+
+We got a "deleted inode referenced" warning cross our fsstress test. The
+bug can be reproduced easily with following steps:
+
+  cd /dev/shm
+  mkdir test/
+  fallocate -l 128M img
+  mkfs.ext4 -b 1024 img
+  mount img test/
+  dd if=/dev/zero of=test/foo bs=1M count=128
+  mkdir test/dir/ && cd test/dir/
+  for ((i=0;i<1000;i++)); do touch file$i; done # consume all block
+  cd ~ && renameat2(AT_FDCWD, /dev/shm/test/dir/file1, AT_FDCWD,
+    /dev/shm/test/dir/dst_file, RENAME_WHITEOUT) # ext4_add_entry in
+    ext4_rename will return ENOSPC!!
+  cd /dev/shm/ && umount test/ && mount img test/ && ls -li test/dir/file1
+  We will get the output:
+  "ls: cannot access 'test/dir/file1': Structure needs cleaning"
+  and the dmesg show:
+  "EXT4-fs error (device loop0): ext4_lookup:1626: inode #2049: comm ls:
+  deleted inode referenced: 139"
+
+ext4_rename will create a special inode for whiteout and use this 'ino'
+to replace the source file's dir entry 'ino'. Once error happens
+latter(the error above was the ENOSPC return from ext4_add_entry in
+ext4_rename since all space has been consumed), the cleanup do drop the
+nlink for whiteout, but forget to restore 'ino' with source file. This
+will trigger the bug describle as above.
+
+	Signed-off-by: yangerkun <yangerkun@huawei.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: stable@vger.kernel.org
+Fixes: cd808deced43 ("ext4: support RENAME_WHITEOUT")
+Link: https://lore.kernel.org/r/20210105062857.3566-1-yangerkun@huawei.com
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 6b4b8e6b4ad8553660421d6360678b3811d5deb9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/namei.c
+diff --cc fs/ext4/namei.c
+index 0088801ee734,fa625a247e9a..000000000000
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@@ -3380,20 -3592,16 +3380,24 @@@ static int ext4_setent(handle_t *handle
+  	inode_inc_iversion(ent->dir);
+  	ent->dir->i_ctime = ent->dir->i_mtime =
+  		current_time(ent->dir);
+ -	retval = ext4_mark_inode_dirty(handle, ent->dir);
+ +	ext4_mark_inode_dirty(handle, ent->dir);
+  	BUFFER_TRACE(ent->bh, "call ext4_handle_dirty_metadata");
+  	if (!ent->inlined) {
+ -		retval2 = ext4_handle_dirty_dirblock(handle, ent->dir, ent->bh);
+ -		if (unlikely(retval2)) {
+ -			ext4_std_error(ent->dir->i_sb, retval2);
+ -			return retval2;
+ +		retval = ext4_handle_dirty_dirent_node(handle,
+ +						       ent->dir, ent->bh);
+ +		if (unlikely(retval)) {
+ +			ext4_std_error(ent->dir->i_sb, retval);
+ +			return retval;
+  		}
+  	}
+++<<<<<<< HEAD
+ +	brelse(ent->bh);
+ +	ent->bh = NULL;
+ +
+ +	return 0;
+++=======
++ 	return retval;
+++>>>>>>> 6b4b8e6b4ad8 (ext4: fix bug for rename with RENAME_WHITEOUT)
+  }
+  
+  static int ext4_find_delete_entry(handle_t *handle, struct inode *dir,
+* Unmerged path fs/ext4/namei.c
