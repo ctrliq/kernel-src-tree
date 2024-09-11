@@ -1,0 +1,210 @@
+KVM: SVM: Add support for SEV-ES GHCB MSR protocol function 0x002
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 1edc14599e06fdf23dcf7516f73f09091853eb9a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/1edc1459.failed
+
+The GHCB specification defines a GHCB MSR protocol using the lower
+12-bits of the GHCB MSR (in the hypervisor this corresponds to the
+GHCB GPA field in the VMCB).
+
+Function 0x002 is a request to set the GHCB MSR value to the SEV INFO as
+per the specification via the VMCB GHCB GPA field.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+Message-Id: <c23c163a505290a0d1b9efc4659b838c8c902cbc.1607620209.git.thomas.lendacky@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 1edc14599e06fdf23dcf7516f73f09091853eb9a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/sev.c
+#	arch/x86/kvm/svm/svm.h
+diff --cc arch/x86/kvm/svm/sev.c
+index e32b3ec356a9,2246e4f3e4f3..000000000000
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@@ -17,7 -17,10 +17,8 @@@
+  
+  #include "x86.h"
+  #include "svm.h"
+ -#include "cpuid.h"
+  
++ static u8 sev_enc_bit;
+  static int sev_flush_asids(void);
+  static DECLARE_RWSEM(sev_deactivate_lock);
+  static DEFINE_MUTEX(sev_bitmap_lock);
+@@@ -1126,16 -1128,30 +1127,33 @@@ void sev_vm_destroy(struct kvm *kvm
+  	sev_asid_free(sev->asid);
+  }
+  
+ -void __init sev_hardware_setup(void)
+ +int __init sev_hardware_setup(void)
+  {
+++<<<<<<< HEAD
+++=======
++ 	unsigned int eax, ebx, ecx, edx;
++ 	bool sev_es_supported = false;
++ 	bool sev_supported = false;
++ 
++ 	/* Does the CPU support SEV? */
++ 	if (!boot_cpu_has(X86_FEATURE_SEV))
++ 		goto out;
++ 
++ 	/* Retrieve SEV CPUID information */
++ 	cpuid(0x8000001f, &eax, &ebx, &ecx, &edx);
++ 
++ 	/* Set encryption bit location for SEV-ES guests */
++ 	sev_enc_bit = ebx & 0x3f;
++ 
+++>>>>>>> 1edc14599e06 (KVM: SVM: Add support for SEV-ES GHCB MSR protocol function 0x002)
+  	/* Maximum number of encrypted guests supported simultaneously */
+ -	max_sev_asid = ecx;
+ +	max_sev_asid = cpuid_ecx(0x8000001F);
+  
+  	if (!svm_sev_enabled())
+ -		goto out;
+ +		return 1;
+  
+  	/* Minimum ASID value that should be used for SEV guest */
+ -	min_sev_asid = edx;
+ +	min_sev_asid = cpuid_edx(0x8000001F);
+  
+  	/* Initialize SEV ASID bitmaps */
+  	sev_asid_bitmap = bitmap_zalloc(max_sev_asid, GFP_KERNEL);
+@@@ -1184,3 -1499,79 +1202,82 @@@ void pre_sev_run(struct vcpu_svm *svm, 
+  	svm->vmcb->control.tlb_ctl = TLB_CONTROL_FLUSH_ASID;
+  	vmcb_mark_dirty(svm->vmcb, VMCB_ASID);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void set_ghcb_msr(struct vcpu_svm *svm, u64 value)
++ {
++ 	svm->vmcb->control.ghcb_gpa = value;
++ }
++ 
++ static int sev_handle_vmgexit_msr_protocol(struct vcpu_svm *svm)
++ {
++ 	struct vmcb_control_area *control = &svm->vmcb->control;
++ 	u64 ghcb_info;
++ 
++ 	ghcb_info = control->ghcb_gpa & GHCB_MSR_INFO_MASK;
++ 
++ 	switch (ghcb_info) {
++ 	case GHCB_MSR_SEV_INFO_REQ:
++ 		set_ghcb_msr(svm, GHCB_MSR_SEV_INFO(GHCB_VERSION_MAX,
++ 						    GHCB_VERSION_MIN,
++ 						    sev_enc_bit));
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 1;
++ }
++ 
++ int sev_handle_vmgexit(struct vcpu_svm *svm)
++ {
++ 	struct vmcb_control_area *control = &svm->vmcb->control;
++ 	u64 ghcb_gpa, exit_code;
++ 	struct ghcb *ghcb;
++ 	int ret;
++ 
++ 	/* Validate the GHCB */
++ 	ghcb_gpa = control->ghcb_gpa;
++ 	if (ghcb_gpa & GHCB_MSR_INFO_MASK)
++ 		return sev_handle_vmgexit_msr_protocol(svm);
++ 
++ 	if (!ghcb_gpa) {
++ 		vcpu_unimpl(&svm->vcpu, "vmgexit: GHCB gpa is not set\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (kvm_vcpu_map(&svm->vcpu, ghcb_gpa >> PAGE_SHIFT, &svm->ghcb_map)) {
++ 		/* Unable to map GHCB from guest */
++ 		vcpu_unimpl(&svm->vcpu, "vmgexit: error mapping GHCB [%#llx] from guest\n",
++ 			    ghcb_gpa);
++ 		return -EINVAL;
++ 	}
++ 
++ 	svm->ghcb = svm->ghcb_map.hva;
++ 	ghcb = svm->ghcb_map.hva;
++ 
++ 	exit_code = ghcb_get_sw_exit_code(ghcb);
++ 
++ 	ret = sev_es_validate_vmgexit(svm);
++ 	if (ret)
++ 		return ret;
++ 
++ 	sev_es_sync_from_ghcb(svm);
++ 	ghcb_set_sw_exit_info_1(ghcb, 0);
++ 	ghcb_set_sw_exit_info_2(ghcb, 0);
++ 
++ 	ret = -EINVAL;
++ 	switch (exit_code) {
++ 	case SVM_VMGEXIT_UNSUPPORTED_EVENT:
++ 		vcpu_unimpl(&svm->vcpu,
++ 			    "vmgexit: unsupported event - exit_info_1=%#llx, exit_info_2=%#llx\n",
++ 			    control->exit_info_1, control->exit_info_2);
++ 		break;
++ 	default:
++ 		ret = svm_invoke_exit_handler(svm, exit_code);
++ 	}
++ 
++ 	return ret;
++ }
+++>>>>>>> 1edc14599e06 (KVM: SVM: Add support for SEV-ES GHCB MSR protocol function 0x002)
+diff --cc arch/x86/kvm/svm/svm.h
+index cd87acc0418b,546f8d05e81e..000000000000
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@@ -480,19 -514,28 +480,42 @@@ void svm_vcpu_unblocking(struct kvm_vcp
+  
+  /* sev.c */
+  
+++<<<<<<< HEAD
+++=======
++ #define GHCB_VERSION_MAX		1ULL
++ #define GHCB_VERSION_MIN		1ULL
++ 
++ #define GHCB_MSR_INFO_POS		0
++ #define GHCB_MSR_INFO_MASK		(BIT_ULL(12) - 1)
++ 
++ #define GHCB_MSR_SEV_INFO_RESP		0x001
++ #define GHCB_MSR_SEV_INFO_REQ		0x002
++ #define GHCB_MSR_VER_MAX_POS		48
++ #define GHCB_MSR_VER_MAX_MASK		0xffff
++ #define GHCB_MSR_VER_MIN_POS		32
++ #define GHCB_MSR_VER_MIN_MASK		0xffff
++ #define GHCB_MSR_CBIT_POS		24
++ #define GHCB_MSR_CBIT_MASK		0xff
++ #define GHCB_MSR_SEV_INFO(_max, _min, _cbit)				\
++ 	((((_max) & GHCB_MSR_VER_MAX_MASK) << GHCB_MSR_VER_MAX_POS) |	\
++ 	 (((_min) & GHCB_MSR_VER_MIN_MASK) << GHCB_MSR_VER_MIN_POS) |	\
++ 	 (((_cbit) & GHCB_MSR_CBIT_MASK) << GHCB_MSR_CBIT_POS) |	\
++ 	 GHCB_MSR_SEV_INFO_RESP)
++ 
+++>>>>>>> 1edc14599e06 (KVM: SVM: Add support for SEV-ES GHCB MSR protocol function 0x002)
+  extern unsigned int max_sev_asid;
+  
+ +static inline bool sev_guest(struct kvm *kvm)
+ +{
+ +#ifdef CONFIG_KVM_AMD_SEV
+ +	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+ +
+ +	return sev->active;
+ +#else
+ +	return false;
+ +#endif
+ +}
+ +
+  static inline bool svm_sev_enabled(void)
+  {
+  	return IS_ENABLED(CONFIG_KVM_AMD_SEV) ? max_sev_asid : 0;
+* Unmerged path arch/x86/kvm/svm/sev.c
+* Unmerged path arch/x86/kvm/svm/svm.h
