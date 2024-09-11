@@ -114,7 +114,7 @@ static int simple_parse_node(struct asoc_simple_priv *priv,
 			     struct device_node *np,
 			     struct link_info *li,
 			     char *prefix,
-			     int is_cpu)
+			     int *cpu)
 {
 	struct device *dev = simple_priv_to_dev(priv);
 	struct device_node *top = dev->of_node;
@@ -122,9 +122,9 @@ static int simple_parse_node(struct asoc_simple_priv *priv,
 	struct simple_dai_props *dai_props = simple_priv_to_props(priv, li->link);
 	struct snd_soc_dai_link_component *dlc;
 	struct asoc_simple_dai *dai;
-	int ret, single = 0;
+	int ret;
 
-	if (is_cpu) {
+	if (cpu) {
 		dlc = asoc_link_to_cpu(dai_link, 0);
 		dai = simple_props_to_dai_cpu(dai_props, 0);
 	} else {
@@ -134,7 +134,7 @@ static int simple_parse_node(struct asoc_simple_priv *priv,
 
 	simple_parse_mclk_fs(top, np, dai_props, prefix);
 
-	ret = asoc_simple_parse_dai(np, dlc, &single);
+	ret = asoc_simple_parse_dai(np, dlc, cpu);
 	if (ret)
 		return ret;
 
@@ -146,13 +146,6 @@ static int simple_parse_node(struct asoc_simple_priv *priv,
 	if (ret)
 		return ret;
 
-	if (is_cpu) {
-		struct snd_soc_dai_link_component *platforms = asoc_link_to_platform(dai_link, 0);
-
-		asoc_simple_canonicalize_cpu(dlc, single);
-		asoc_simple_canonicalize_platform(platforms, dlc);
-	}
-
 	return 0;
 }
 
@@ -160,8 +153,7 @@ static int simple_link_init(struct asoc_simple_priv *priv,
 			    struct device_node *node,
 			    struct device_node *codec,
 			    struct link_info *li,
-			    char *prefix,
-			    char *name)
+			    char *prefix, char *name)
 {
 	struct device *dev = simple_priv_to_dev(priv);
 	struct snd_soc_dai_link *dai_link = simple_priv_to_link(priv, li->link);
@@ -187,8 +179,6 @@ static int simple_dai_link_of_dpcm(struct asoc_simple_priv *priv,
 	struct device *dev = simple_priv_to_dev(priv);
 	struct snd_soc_dai_link *dai_link = simple_priv_to_link(priv, li->link);
 	struct simple_dai_props *dai_props = simple_priv_to_props(priv, li->link);
-	struct snd_soc_dai_link_component *cpus = asoc_link_to_cpu(dai_link, 0);
-	struct snd_soc_dai_link_component *codecs = asoc_link_to_codec(dai_link, 0);
 	struct device_node *top = dev->of_node;
 	struct device_node *node = of_get_parent(np);
 	char *prefix = "";
@@ -202,18 +192,26 @@ static int simple_dai_link_of_dpcm(struct asoc_simple_priv *priv,
 		prefix = PREFIX;
 
 	if (li->cpu) {
+		struct snd_soc_dai_link_component *cpus = asoc_link_to_cpu(dai_link, 0);
+		struct snd_soc_dai_link_component *platforms = asoc_link_to_platform(dai_link, 0);
+		int is_single_links = 0;
+
 		/* Codec is dummy */
 
 		/* FE settings */
 		dai_link->dynamic		= 1;
 		dai_link->dpcm_merged_format	= 1;
 
-		ret = simple_parse_node(priv, np, li, prefix, 1);
+		ret = simple_parse_node(priv, np, li, prefix, &is_single_links);
 		if (ret < 0)
 			goto out_put_node;
 
 		snprintf(dai_name, sizeof(dai_name), "fe.%s", cpus->dai_name);
+
+		asoc_simple_canonicalize_cpu(cpus, is_single_links);
+		asoc_simple_canonicalize_platform(platforms, cpus);
 	} else {
+		struct snd_soc_dai_link_component *codecs = asoc_link_to_codec(dai_link, 0);
 		struct snd_soc_codec_conf *cconf;
 
 		/* CPU is dummy */
@@ -224,7 +222,7 @@ static int simple_dai_link_of_dpcm(struct asoc_simple_priv *priv,
 
 		cconf	= simple_props_to_codec_conf(dai_props, 0);
 
-		ret = simple_parse_node(priv, np, li, prefix, 0);
+		ret = simple_parse_node(priv, np, li, prefix, NULL);
 		if (ret < 0)
 			goto out_put_node;
 
@@ -269,7 +267,7 @@ static int simple_dai_link_of(struct asoc_simple_priv *priv,
 	char dai_name[64];
 	char prop[128];
 	char *prefix = "";
-	int ret;
+	int ret, single_cpu = 0;
 
 	cpu  = np;
 	node = of_get_parent(np);
@@ -283,11 +281,11 @@ static int simple_dai_link_of(struct asoc_simple_priv *priv,
 	snprintf(prop, sizeof(prop), "%splat", prefix);
 	plat = of_get_child_by_name(node, prop);
 
-	ret = simple_parse_node(priv, cpu, li, prefix, 1);
+	ret = simple_parse_node(priv, cpu, li, prefix, &single_cpu);
 	if (ret < 0)
 		goto dai_link_of_err;
 
-	ret = simple_parse_node(priv, codec, li, prefix, 0);
+	ret = simple_parse_node(priv, codec, li, prefix, NULL);
 	if (ret < 0)
 		goto dai_link_of_err;
 
@@ -297,9 +295,11 @@ static int simple_dai_link_of(struct asoc_simple_priv *priv,
 
 	snprintf(dai_name, sizeof(dai_name),
 		 "%s-%s", cpus->dai_name, codecs->dai_name);
+
+	asoc_simple_canonicalize_cpu(cpus, single_cpu);
+	asoc_simple_canonicalize_platform(platforms, cpus);
+
 	ret = simple_link_init(priv, node, codec, li, prefix, dai_name);
-	if (ret < 0)
-		goto dai_link_of_err;
 
 dai_link_of_err:
 	of_node_put(plat);

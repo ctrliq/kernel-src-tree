@@ -565,7 +565,6 @@ static void mlx5e_build_rep_params(struct net_device *netdev)
 					 MLX5_CQ_PERIOD_MODE_START_FROM_CQE :
 					 MLX5_CQ_PERIOD_MODE_START_FROM_EQE;
 
-	priv->max_nch = mlx5e_calc_max_nch(priv, priv->profile);
 	params = &priv->channels.params;
 
 	params->num_channels = MLX5E_REP_PARAMS_DEF_NUM_CHANNELS;
@@ -1081,6 +1080,7 @@ static const struct mlx5e_profile mlx5e_rep_profile = {
 	.rq_groups		= MLX5E_NUM_RQ_GROUPS(REGULAR),
 	.stats_grps		= mlx5e_rep_stats_grps,
 	.stats_grps_num		= mlx5e_rep_stats_grps_num,
+	.rx_ptp_support		= false,
 };
 
 static const struct mlx5e_profile mlx5e_uplink_rep_profile = {
@@ -1101,6 +1101,7 @@ static const struct mlx5e_profile mlx5e_uplink_rep_profile = {
 	.rq_groups		= MLX5E_NUM_RQ_GROUPS(XSK),
 	.stats_grps		= mlx5e_ul_rep_stats_grps,
 	.stats_grps_num		= mlx5e_ul_rep_stats_grps_num,
+	.rx_ptp_support		= false,
 };
 
 /* e-Switch vport representors */
@@ -1158,7 +1159,7 @@ mlx5e_vport_vf_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
 	nch = mlx5e_get_max_num_channels(dev);
 	txqs = nch * profile->max_tc;
 	rxqs = nch * profile->rq_groups;
-	netdev = mlx5e_create_netdev(dev, txqs, rxqs);
+	netdev = mlx5e_create_netdev(dev, profile, txqs, rxqs);
 	if (!netdev) {
 		mlx5_core_warn(dev,
 			       "Failed to create representor netdev for vport %d\n",

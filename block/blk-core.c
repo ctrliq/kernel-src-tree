@@ -1308,19 +1308,19 @@ void blk_account_io_start(struct request *rq)
 }
 
 static unsigned long __part_start_io_acct(struct hd_struct *part,
-					  unsigned int sectors, unsigned int op)
+					  unsigned int sectors, unsigned int op,
+					  unsigned long start_time)
 {
 	const int sgrp = op_stat_group(op);
-	unsigned long now = READ_ONCE(jiffies);
 
 	part_stat_lock();
-	update_io_ticks(part, now, false);
+	update_io_ticks(part, start_time, false);
 	part_stat_inc(part, ios[sgrp]);
 	part_stat_add(part, sectors[sgrp], sectors);
 	part_stat_local_inc(part, in_flight[op_is_write(op)]);
 	part_stat_unlock();
 
-	return now;
+	return start_time;
 }
 
 unsigned long part_start_io_acct(struct gendisk *disk, struct hd_struct **part,
@@ -1328,16 +1328,41 @@ unsigned long part_start_io_acct(struct gendisk *disk, struct hd_struct **part,
 {
 	*part = disk_map_sector_rcu(disk, bio->bi_iter.bi_sector);
 
-	return __part_start_io_acct(*part, bio_sectors(bio), bio_op(bio));
+	return __part_start_io_acct(*part, bio_sectors(bio),
+				    bio_op(bio), jiffies);
 }
 EXPORT_SYMBOL_GPL(part_start_io_acct);
 
 unsigned long disk_start_io_acct(struct gendisk *disk, unsigned int sectors,
 				 unsigned int op)
 {
-	return __part_start_io_acct(&disk->part0, sectors, op);
+	return __part_start_io_acct(&disk->part0, sectors, op, jiffies);
 }
 EXPORT_SYMBOL(disk_start_io_acct);
+
+/**
+ * bio_start_io_acct_time - start I/O accounting for bio based drivers
+ * @bio:	bio to start account for
+ * @start_time: start time that should be passed back to bio_end_io_acct().
+ */
+void bio_start_io_acct_time(struct bio *bio, unsigned long start_time)
+{
+	__part_start_io_acct(&bio->bi_disk->part0, bio_sectors(bio),
+			     bio_op(bio), start_time);
+}
+EXPORT_SYMBOL(bio_start_io_acct_time);
+
+/**
+ * bio_start_io_acct - start I/O accounting for bio based drivers
+ * @bio:	bio to start account for
+ *
+ * Returns the start time that should be passed back to bio_end_io_acct().
+ */
+unsigned long bio_start_io_acct(struct bio *bio)
+{
+	return disk_start_io_acct(bio->bi_disk, bio_sectors(bio), bio_op(bio));
+}
+EXPORT_SYMBOL(bio_start_io_acct);
 
 static void __part_end_io_acct(struct hd_struct *part, unsigned int op,
 			       unsigned long start_time)

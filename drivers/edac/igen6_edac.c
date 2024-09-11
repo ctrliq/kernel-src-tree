@@ -738,9 +738,6 @@ static int ecclog_mce_handler(struct notifier_block *nb, unsigned long val,
 	struct mce *mce = (struct mce *)data;
 	char *type;
 
-	if (mce->kflags & MCE_HANDLED_CEC)
-		return NOTIFY_DONE;
-
 	/*
 	 * Ignore unless this is a memory related error.
 	 * We don't check the bit MCI_STATUS_ADDRV of MCi_STATUS here,
@@ -772,8 +769,6 @@ static int ecclog_mce_handler(struct notifier_block *nb, unsigned long val,
 	 */
 	if (!ecclog_handler())
 		return NOTIFY_DONE;
-
-	mce->kflags |= MCE_HANDLED_EDAC;
 
 	return NOTIFY_DONE;
 }

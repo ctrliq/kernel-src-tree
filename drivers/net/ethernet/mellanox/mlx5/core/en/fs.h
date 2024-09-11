@@ -50,18 +50,10 @@ struct mlx5e_promisc_table {
 	struct mlx5_flow_handle	*rule;
 };
 
-struct mlx5e_vlan_table {
-	struct mlx5e_flow_table		ft;
-	DECLARE_BITMAP(active_cvlans, VLAN_N_VID);
-	DECLARE_BITMAP(active_svlans, VLAN_N_VID);
-	struct mlx5_flow_handle	*active_cvlans_rule[VLAN_N_VID];
-	struct mlx5_flow_handle	*active_svlans_rule[VLAN_N_VID];
-	struct mlx5_flow_handle	*untagged_rule;
-	struct mlx5_flow_handle	*any_cvlan_rule;
-	struct mlx5_flow_handle	*any_svlan_rule;
-	struct mlx5_flow_handle	*trap_rule;
-	bool			cvlan_filter_disabled;
-};
+/* Forward declaration and APIs to get private fields of vlan_table */
+struct mlx5e_vlan_table;
+unsigned long *mlx5e_vlan_get_active_svlans(struct mlx5e_vlan_table *vlan);
+struct mlx5_flow_table *mlx5e_vlan_get_flowtable(struct mlx5e_vlan_table *vlan);
 
 struct mlx5e_l2_table {
 	struct mlx5e_flow_table    ft;
@@ -222,6 +214,7 @@ struct mlx5e_accel_fs_tcp;
 
 struct mlx5e_fs_udp;
 struct mlx5e_fs_any;
+struct mlx5e_ptp_fs;
 
 struct mlx5e_flow_steering {
 	struct mlx5_flow_namespace      *ns;
@@ -231,7 +224,7 @@ struct mlx5e_flow_steering {
 #endif
 	struct mlx5e_tc_table           tc;
 	struct mlx5e_promisc_table      promisc;
-	struct mlx5e_vlan_table         vlan;
+	struct mlx5e_vlan_table         *vlan;
 	struct mlx5e_l2_table           l2;
 	struct mlx5e_ttc_table          ttc;
 	struct mlx5e_ttc_table          inner_ttc;
@@ -243,6 +236,7 @@ struct mlx5e_flow_steering {
 #endif
 	struct mlx5e_fs_udp            *udp;
 	struct mlx5e_fs_any            *any;
+	struct mlx5e_ptp_fs            *ptp_fs;
 };
 
 struct ttc_params {
@@ -272,6 +266,9 @@ void mlx5e_disable_cvlan_filter(struct mlx5e_priv *priv);
 
 int mlx5e_create_flow_steering(struct mlx5e_priv *priv);
 void mlx5e_destroy_flow_steering(struct mlx5e_priv *priv);
+
+int mlx5e_fs_init(struct mlx5e_priv *priv);
+void mlx5e_fs_cleanup(struct mlx5e_priv *priv);
 
 u8 mlx5e_get_proto_by_tunnel_type(enum mlx5e_tunnel_types tt);
 int mlx5e_add_vlan_trap(struct mlx5e_priv *priv, int  trap_id, int tir_num);

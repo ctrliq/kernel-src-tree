@@ -2689,6 +2689,23 @@ static void qla2x00_iocb_work_fn(struct work_struct *work)
 	spin_unlock_irqrestore(&vha->work_lock, flags);
 }
 
+#ifdef CONFIG_RHEL_DIFFERENCES
+static const struct pci_device_id rh_deprecated_pci_table[] = {
+	{ PCI_DEVICE(PCI_VENDOR_ID_QLOGIC, PCI_DEVICE_ID_QLOGIC_ISP2532) },
+	{ PCI_DEVICE(PCI_VENDOR_ID_QLOGIC, PCI_DEVICE_ID_QLOGIC_ISP2031) },
+	{ PCI_DEVICE(PCI_VENDOR_ID_QLOGIC, PCI_DEVICE_ID_QLOGIC_ISP8031) },
+	{ 0 }
+};
+
+static const struct pci_device_id rh_unmaintained_pci_table[] = {
+	{ 0 }
+};
+
+static const struct pci_device_id rh_disabled_pci_table[] = {
+	{ 0 }
+};
+#endif
+
 /*
  * PCI driver interface
  */
@@ -2707,6 +2724,14 @@ qla2x00_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct req_que *req = NULL;
 	struct rsp_que *rsp = NULL;
 	int i;
+
+#ifdef CONFIG_RHEL_DIFFERENCES
+	if (pci_hw_disabled(rh_disabled_pci_table, pdev))
+		return -ENODEV;
+
+	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
+	pci_hw_unmaintained(rh_unmaintained_pci_table, pdev);
+#endif
 
 	bars = pci_select_bars(pdev, IORESOURCE_MEM | IORESOURCE_IO);
 	sht = &qla2xxx_driver_template;

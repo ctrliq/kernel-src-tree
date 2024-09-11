@@ -105,7 +105,7 @@ struct mlx5e_tc_attr_to_reg_mapping mlx5e_tc_attr_to_reg_mappings[] = {
 	[MARK_TO_REG] = mark_to_reg_ct,
 	[LABELS_TO_REG] = labels_to_reg_ct,
 	[FTEID_TO_REG] = fteid_to_reg_ct,
-	/* For NIC rules we store the retore metadata directly
+	/* For NIC rules we store the restore metadata directly
 	 * into reg_b that is passed to SW since we don't
 	 * jump between steering domains.
 	 */
@@ -986,7 +986,7 @@ mlx5e_add_offloaded_nic_rule(struct mlx5e_priv *priv,
 			if (IS_ERR(dest[dest_ix].ft))
 				return ERR_CAST(dest[dest_ix].ft);
 		} else {
-			dest[dest_ix].ft = priv->fs.vlan.ft.t;
+			dest[dest_ix].ft = mlx5e_vlan_get_flowtable(priv->fs.vlan);
 		}
 		dest_ix++;
 	}
@@ -2090,6 +2090,10 @@ static int __parse_cls_flower(struct mlx5e_priv *priv,
 				    misc_parameters);
 	void *misc_v = MLX5_ADDR_OF(fte_match_param, spec->match_value,
 				    misc_parameters);
+	void *misc_c_3 = MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
+				    misc_parameters_3);
+	void *misc_v_3 = MLX5_ADDR_OF(fte_match_param, spec->match_value,
+				    misc_parameters_3);
 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
 	struct flow_dissector *dissector = rule->match.dissector;
 	enum fs_flow_table_type fs_type;
@@ -2121,6 +2125,7 @@ static int __parse_cls_flower(struct mlx5e_priv *priv,
 	      BIT(FLOW_DISSECTOR_KEY_CT) |
 	      BIT(FLOW_DISSECTOR_KEY_ENC_IP) |
 	      BIT(FLOW_DISSECTOR_KEY_ENC_OPTS) |
+	      BIT(FLOW_DISSECTOR_KEY_ICMP) |
 	      BIT(FLOW_DISSECTOR_KEY_MPLS))) {
 		NL_SET_ERR_MSG_MOD(extack, "Unsupported key");
 		netdev_dbg(priv->netdev, "Unsupported key used: 0x%x\n",
@@ -2448,17 +2453,50 @@ static int __parse_cls_flower(struct mlx5e_priv *priv,
 			*match_level = MLX5_MATCH_L4;
 	}
 
-	/* Currenlty supported only for MPLS over UDP */
-	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_MPLS) &&
-	    !netif_is_bareudp(filter_dev)) {
-		NL_SET_ERR_MSG_MOD(extack,
-				   "Matching on MPLS is supported only for MPLS over UDP");
-		netdev_err(priv->netdev,
-			   "Matching on MPLS is supported only for MPLS over UDP\n");
-		return -EOPNOTSUPP;
-	}
+	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ICMP)) {
+		struct flow_match_icmp match;
 
-	/* Currenlty supported only for MPLS over UDP */
+		flow_rule_match_icmp(rule, &match);
+		switch (ip_proto) {
+		case IPPROTO_ICMP:
+			if (!(MLX5_CAP_GEN(priv->mdev, flex_parser_protocols) &
+			      MLX5_FLEX_PROTO_ICMP))
+				return -EOPNOTSUPP;
+			MLX5_SET(fte_match_set_misc3, misc_c_3, icmp_type,
+				 match.mask->type);
+			MLX5_SET(fte_match_set_misc3, misc_v_3, icmp_type,
+				 match.key->type);
+			MLX5_SET(fte_match_set_misc3, misc_c_3, icmp_code,
+				 match.mask->code);
+			MLX5_SET(fte_match_set_misc3, misc_v_3, icmp_code,
+				 match.key->code);
+			break;
+		case IPPROTO_ICMPV6:
+			if (!(MLX5_CAP_GEN(priv->mdev, flex_parser_protocols) &
+			      MLX5_FLEX_PROTO_ICMPV6))
+				return -EOPNOTSUPP;
+			MLX5_SET(fte_match_set_misc3, misc_c_3, icmpv6_type,
+				 match.mask->type);
+			MLX5_SET(fte_match_set_misc3, misc_v_3, icmpv6_type,
+				 match.key->type);
+			MLX5_SET(fte_match_set_misc3, misc_c_3, icmpv6_code,
+				 match.mask->code);
+			MLX5_SET(fte_match_set_misc3, misc_v_3, icmpv6_code,
+				 match.key->code);
+			break;
+		default:
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Code and type matching only with ICMP and ICMPv6");
+			netdev_err(priv->netdev,
+				   "Code and type matching only with ICMP and ICMPv6\n");
+			return -EINVAL;
+		}
+		if (match.mask->code || match.mask->type) {
+			*match_level = MLX5_MATCH_L4;
+			spec->match_criteria_enable |= MLX5_MATCH_MISC_PARAMETERS_3;
+		}
+	}
+	/* Currently supported only for MPLS over UDP */
 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_MPLS) &&
 	    !netif_is_bareudp(filter_dev)) {
 		NL_SET_ERR_MSG_MOD(extack,
@@ -4896,7 +4934,7 @@ int mlx5e_tc_nic_init(struct mlx5e_priv *priv)
 	attr.ns = MLX5_FLOW_NAMESPACE_KERNEL;
 	attr.max_ft_sz = mlx5e_tc_nic_get_ft_size(dev);
 	attr.max_grp_num = MLX5E_TC_TABLE_NUM_GROUPS;
-	attr.default_ft = priv->fs.vlan.ft.t;
+	attr.default_ft = mlx5e_vlan_get_flowtable(priv->fs.vlan);
 	attr.mapping = chains_mapping;
 
 	tc->chains = mlx5_chains_create(dev, &attr);

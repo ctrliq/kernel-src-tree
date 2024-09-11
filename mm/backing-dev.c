@@ -325,7 +325,7 @@ static int wb_init(struct bdi_writeback *wb, struct backing_dev_info *bdi,
 	INIT_LIST_HEAD(&wb->work_list);
 	INIT_DELAYED_WORK(&wb->dwork, wb_workfn);
 
-	bw_dwork = kzalloc(sizeof(*bw_dwork), GFP_KERNEL);
+	bw_dwork = kzalloc(sizeof(*bw_dwork), gfp);
 	if (!bw_dwork) {
 		err = -ENOMEM;
 		goto out_put_bdi;

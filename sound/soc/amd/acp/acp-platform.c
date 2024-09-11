@@ -86,7 +86,7 @@ int acp_machine_select(struct acp_dev_data *adata)
 
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(acp_machine_select, SND_SOC_ACP_COMMON);
+EXPORT_SYMBOL_GPL(acp_machine_select);
 
 static irqreturn_t i2s_irq_handler(int irq, void *data)
 {
@@ -298,7 +298,7 @@ int acp_platform_register(struct device *dev)
 	}
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(acp_platform_register, SND_SOC_ACP_COMMON);
+EXPORT_SYMBOL_GPL(acp_platform_register);
 
 int acp_platform_unregister(struct device *dev)
 {
@@ -308,7 +308,7 @@ int acp_platform_unregister(struct device *dev)
 		platform_device_unregister(adata->mach_dev);
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(acp_platform_unregister, SND_SOC_ACP_COMMON);
+EXPORT_SYMBOL_GPL(acp_platform_unregister);
 
 MODULE_DESCRIPTION("AMD ACP PCM Driver");
 MODULE_LICENSE("Dual BSD/GPL");

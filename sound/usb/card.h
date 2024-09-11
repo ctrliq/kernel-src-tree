@@ -19,7 +19,7 @@ struct audioformat {
 	unsigned char iface;		/* interface number */
 	unsigned char altsetting;	/* corresponding alternate setting */
 	unsigned char ep_idx;		/* endpoint array index */
-	unsigned char altset_idx;	/* array index of altenate setting */
+	unsigned char altset_idx;	/* array index of alternate setting */
 	unsigned char attributes;	/* corresponding attributes of cs endpoint */
 	unsigned char endpoint;		/* endpoint */
 	unsigned char ep_attr;		/* endpoint attributes */
@@ -74,8 +74,9 @@ struct snd_usb_endpoint {
 
 	atomic_t state;		/* running state */
 
-	void (*prepare_data_urb) (struct snd_usb_substream *subs,
-				  struct urb *urb);
+	int (*prepare_data_urb) (struct snd_usb_substream *subs,
+				 struct urb *urb,
+				 bool in_stream_lock);
 	void (*retire_data_urb) (struct snd_usb_substream *subs,
 				 struct urb *urb);
 
@@ -125,6 +126,7 @@ struct snd_usb_endpoint {
 	int skip_packets;		/* quirks for devices to ignore the first n packets
 					   in a stream */
 	bool implicit_fb_sync;		/* syncs with implicit feedback */
+	bool lowlatency_playback;	/* low-latency playback mode */
 	bool need_setup;		/* (re-)need for configure? */
 
 	/* for hw constraints */
@@ -187,6 +189,7 @@ struct snd_usb_substream {
 	} dsd_dop;
 
 	bool trigger_tstamp_pending_update; /* trigger timestamp being updated from initial estimate */
+	bool lowlatency_playback;	/* low-latency playback mode */
 };
 
 struct snd_usb_stream {

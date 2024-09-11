@@ -1865,22 +1865,29 @@ static u64 mlx_to_vritio_features(u16 dev_features)
 	return result;
 }
 
-static u64 mlx5_vdpa_get_features(struct vdpa_device *vdev)
+static u64 get_supported_features(struct mlx5_core_dev *mdev)
+{
+	u64 mlx_vdpa_features = 0;
+	u16 dev_features;
+
+	dev_features = MLX5_CAP_DEV_VDPA_EMULATION(mdev, device_features_bits_mask);
+	mlx_vdpa_features |= mlx_to_vritio_features(dev_features);
+	if (MLX5_CAP_DEV_VDPA_EMULATION(mdev, virtio_version_1_0))
+		mlx_vdpa_features |= BIT_ULL(VIRTIO_F_VERSION_1);
+	mlx_vdpa_features |= BIT_ULL(VIRTIO_F_ACCESS_PLATFORM);
+	mlx_vdpa_features |= BIT_ULL(VIRTIO_NET_F_CTRL_VQ);
+	mlx_vdpa_features |= BIT_ULL(VIRTIO_NET_F_CTRL_MAC_ADDR);
+	mlx_vdpa_features |= BIT_ULL(VIRTIO_NET_F_MQ);
+	mlx_vdpa_features |= BIT_ULL(VIRTIO_NET_F_STATUS);
+	mlx_vdpa_features |= BIT_ULL(VIRTIO_NET_F_MTU);
+
+	return mlx_vdpa_features;
+}
+
+static u64 mlx5_vdpa_get_device_features(struct vdpa_device *vdev)
 {
 	struct mlx5_vdpa_dev *mvdev = to_mvdev(vdev);
 	struct mlx5_vdpa_net *ndev = to_mlx5_vdpa_ndev(mvdev);
-	u16 dev_features;
-
-	dev_features = MLX5_CAP_DEV_VDPA_EMULATION(mvdev->mdev, device_features_bits_mask);
-	ndev->mvdev.mlx_features |= mlx_to_vritio_features(dev_features);
-	if (MLX5_CAP_DEV_VDPA_EMULATION(mvdev->mdev, virtio_version_1_0))
-		ndev->mvdev.mlx_features |= BIT_ULL(VIRTIO_F_VERSION_1);
-	ndev->mvdev.mlx_features |= BIT_ULL(VIRTIO_F_ACCESS_PLATFORM);
-	ndev->mvdev.mlx_features |= BIT_ULL(VIRTIO_NET_F_CTRL_VQ);
-	ndev->mvdev.mlx_features |= BIT_ULL(VIRTIO_NET_F_CTRL_MAC_ADDR);
-	ndev->mvdev.mlx_features |= BIT_ULL(VIRTIO_NET_F_MQ);
-	ndev->mvdev.mlx_features |= BIT_ULL(VIRTIO_NET_F_STATUS);
-	ndev->mvdev.mlx_features |= BIT_ULL(VIRTIO_NET_F_MTU);
 
 	print_features(mvdev, ndev->mvdev.mlx_features, false);
 	return ndev->mvdev.mlx_features;
@@ -1958,7 +1965,7 @@ static void update_cvq_info(struct mlx5_vdpa_dev *mvdev)
 	}
 }
 
-static int mlx5_vdpa_set_features(struct vdpa_device *vdev, u64 features)
+static int mlx5_vdpa_set_driver_features(struct vdpa_device *vdev, u64 features)
 {
 	struct mlx5_vdpa_dev *mvdev = to_mvdev(vdev);
 	struct mlx5_vdpa_net *ndev = to_mlx5_vdpa_ndev(mvdev);
@@ -2333,6 +2340,13 @@ static int mlx5_get_vq_irq(struct vdpa_device *vdv, u16 idx)
 	return -EOPNOTSUPP;
 }
 
+static u64 mlx5_vdpa_get_driver_features(struct vdpa_device *vdev)
+{
+	struct mlx5_vdpa_dev *mvdev = to_mvdev(vdev);
+
+	return mvdev->actual_features;
+}
+
 static const struct vdpa_config_ops mlx5_vdpa_ops = {
 	.set_vq_address = mlx5_vdpa_set_vq_address,
 	.set_vq_num = mlx5_vdpa_set_vq_num,
@@ -2345,8 +2359,9 @@ static const struct vdpa_config_ops mlx5_vdpa_ops = {
 	.get_vq_notification = mlx5_get_vq_notification,
 	.get_vq_irq = mlx5_get_vq_irq,
 	.get_vq_align = mlx5_vdpa_get_vq_align,
-	.get_features = mlx5_vdpa_get_features,
-	.set_features = mlx5_vdpa_set_features,
+	.get_device_features = mlx5_vdpa_get_device_features,
+	.set_driver_features = mlx5_vdpa_set_driver_features,
+	.get_driver_features = mlx5_vdpa_get_driver_features,
 	.set_config_cb = mlx5_vdpa_set_config_cb,
 	.get_vq_num_max = mlx5_vdpa_get_vq_num_max,
 	.get_device_id = mlx5_vdpa_get_device_id,
@@ -2516,7 +2531,8 @@ static int event_handler(struct notifier_block *nb, unsigned long event, void *p
 	return ret;
 }
 
-static int mlx5_vdpa_dev_add(struct vdpa_mgmt_dev *v_mdev, const char *name)
+static int mlx5_vdpa_dev_add(struct vdpa_mgmt_dev *v_mdev, const char *name,
+			     const struct vdpa_dev_set_config *add_config)
 {
 	struct mlx5_vdpa_mgmtdev *mgtdev = container_of(v_mdev, struct mlx5_vdpa_mgmtdev, mgtdev);
 	struct virtio_net_config *config;
@@ -2559,6 +2575,7 @@ static int mlx5_vdpa_dev_add(struct vdpa_mgmt_dev *v_mdev, const char *name)
 	if (IS_ERR(ndev))
 		return PTR_ERR(ndev);
 
+	ndev->mvdev.mlx_features = mgtdev->mgtdev.supported_features;
 	ndev->mvdev.max_vqs = max_vqs;
 	mvdev = &ndev->mvdev;
 	mvdev->mdev = mdev;
@@ -2691,6 +2708,9 @@ static int mlx5v_probe(struct auxiliary_device *adev,
 	mgtdev->mgtdev.id_table = id_table;
 	mgtdev->mgtdev.config_attr_mask = BIT_ULL(VDPA_ATTR_DEV_NET_CFG_MACADDR) |
 					  BIT_ULL(VDPA_ATTR_DEV_NET_CFG_MAX_VQP);
+	mgtdev->mgtdev.max_supported_vqs =
+		MLX5_CAP_DEV_VDPA_EMULATION(mdev, max_num_virtio_queues) + 1;
+	mgtdev->mgtdev.supported_features = get_supported_features(mdev);
 	mgtdev->madev = madev;
 
 	err = vdpa_mgmtdev_register(&mgtdev->mgtdev);

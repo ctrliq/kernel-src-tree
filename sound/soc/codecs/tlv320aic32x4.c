@@ -701,7 +701,7 @@ static int aic32x4_set_processing_blocks(struct snd_soc_component *component,
 }
 
 static int aic32x4_setup_clocks(struct snd_soc_component *component,
-				unsigned int sample_rate, unsigned int channel,
+				unsigned int sample_rate, unsigned int channels,
 				unsigned int bit_depth)
 {
 	struct aic32x4_priv *aic32x4 = snd_soc_component_get_drvdata(component);
@@ -800,8 +800,9 @@ static int aic32x4_setup_clocks(struct snd_soc_component *component,
 							dosr);
 
 						clk_set_rate(clocks[5].clk,
-							sample_rate * channel *
+							sample_rate * channels *
 							bit_depth);
+
 						return 0;
 					}
 				}

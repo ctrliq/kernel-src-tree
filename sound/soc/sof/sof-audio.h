@@ -28,6 +28,8 @@
 
 #define DMA_CHAN_INVALID	0xFFFFFFFF
 
+#define WIDGET_IS_DAI(id) ((id) == snd_soc_dapm_dai_in || (id) == snd_soc_dapm_dai_out)
+
 /* PCM stream, mapped to FW component  */
 struct snd_sof_pcm_stream {
 	u32 comp_id;
@@ -36,6 +38,7 @@ struct snd_sof_pcm_stream {
 	struct snd_pcm_substream *substream;
 	struct snd_compr_stream *cstream;
 	struct work_struct period_elapsed_work;
+	struct snd_soc_dapm_widget_list *list; /* list of connected DAPM widgets */
 	bool d0i3_compatible; /* DSP can be in D0I3 when this pcm is opened */
 	/*
 	 * flag to indicate that the DSP pipelines should be kept
@@ -179,10 +182,10 @@ void snd_sof_control_notify(struct snd_sof_dev *sdev,
  * be freed by snd_soc_unregister_component,
  */
 int snd_sof_load_topology(struct snd_soc_component *scomp, const char *file);
-int snd_sof_complete_pipeline(struct device *dev,
+int snd_sof_complete_pipeline(struct snd_sof_dev *sdev,
 			      struct snd_sof_widget *swidget);
 
-int sof_load_pipeline_ipc(struct device *dev,
+int sof_load_pipeline_ipc(struct snd_sof_dev *sdev,
 			  struct sof_ipc_pipe_new *pipeline,
 			  struct sof_ipc_comp_reply *r);
 int sof_pipeline_core_enable(struct snd_sof_dev *sdev,
@@ -252,8 +255,8 @@ int snd_sof_ipc_set_get_comp_data(struct snd_sof_control *scontrol,
 int sof_pcm_dai_link_fixup(struct snd_soc_pcm_runtime *rtd, struct snd_pcm_hw_params *params);
 
 /* PM */
-int sof_set_up_pipelines(struct device *dev);
-void sof_tear_down_pipelines(struct device *dev);
+int sof_set_up_pipelines(struct snd_sof_dev *sdev, bool verify);
+int sof_tear_down_pipelines(struct snd_sof_dev *sdev, bool verify);
 int sof_set_hw_params_upon_resume(struct device *dev);
 bool snd_sof_stream_suspend_ignored(struct snd_sof_dev *sdev);
 bool snd_sof_dsp_only_d0i3_compatible_stream_active(struct snd_sof_dev *sdev);
@@ -265,4 +268,9 @@ void sof_machine_unregister(struct snd_sof_dev *sdev, void *pdata);
 int sof_widget_setup(struct snd_sof_dev *sdev, struct snd_sof_widget *swidget);
 int sof_widget_free(struct snd_sof_dev *sdev, struct snd_sof_widget *swidget);
 
+/* PCM */
+int sof_widget_list_setup(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm, int dir);
+int sof_widget_list_free(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm, int dir);
+int sof_pcm_dsp_pcm_free(struct snd_pcm_substream *substream, struct snd_sof_dev *sdev,
+			 struct snd_sof_pcm *spcm);
 #endif

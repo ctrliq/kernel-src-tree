@@ -154,7 +154,7 @@
 
 #include "net-sysfs.h"
 
-#include <linux/rh_features.h>
+#include <linux/rh_flags.h>
 
 /* Instead of increasing this, you should create a hash table. */
 #define MAX_GRO_SKBS 8
@@ -9085,7 +9085,7 @@ static int dev_xdp_attach(struct net_device *dev, struct netlink_ext_ack *extack
 
 	ASSERT_RTNL();
 
-	rh_mark_used_feature("eBPF/xdp");
+	rh_add_flag("eBPF/xdp");
 
 	/* either link or prog attachment, never both */
 	if (link && (new_prog || old_prog))

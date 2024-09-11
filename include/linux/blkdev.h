@@ -1946,16 +1946,8 @@ unsigned long part_start_io_acct(struct gendisk *disk, struct hd_struct **part,
 void part_end_io_acct(struct hd_struct *part, struct bio *bio,
 		      unsigned long start_time);
 
-/**
- * bio_start_io_acct - start I/O accounting for bio based drivers
- * @bio:	bio to start account for
- *
- * Returns the start time that should be passed back to bio_end_io_acct().
- */
-static inline unsigned long bio_start_io_acct(struct bio *bio)
-{
-	return disk_start_io_acct(bio->bi_disk, bio_sectors(bio), bio_op(bio));
-}
+void bio_start_io_acct_time(struct bio *bio, unsigned long start_time);
+unsigned long bio_start_io_acct(struct bio *bio);
 
 /**
  * bio_end_io_acct - end I/O accounting for bio based drivers

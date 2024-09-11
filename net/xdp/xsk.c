@@ -26,7 +26,7 @@
 #include <net/busy_poll.h>
 #include <net/xdp.h>
 
-#include <linux/rh_features.h>
+#include <linux/rh_flags.h>
 
 #include "xsk_queue.h"
 #include "xdp_umem.h"
@@ -1384,7 +1384,7 @@ static int xsk_create(struct net *net, struct socket *sock, int protocol,
 	if (protocol)
 		return -EPROTONOSUPPORT;
 
-	rh_mark_used_feature("AF_XDP");
+	rh_add_flag("AF_XDP");
 
 	sock->state = SS_UNCONNECTED;
 

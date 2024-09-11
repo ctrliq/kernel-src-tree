@@ -84,15 +84,6 @@ efi_status_t handle_kernel_image(efi_system_table_t *sys_table_arg,
 	if (preferred_offset < dram_base)
 		preferred_offset += MIN_KIMG_ALIGN;
 
-	BUILD_BUG_ON(EFI_KIMG_ALIGN != SZ_64K && EFI_KIMG_ALIGN != SZ_64K * 2);
-
-	if (!IS_ALIGNED((u64)_text, EFI_KIMG_ALIGN)) {
-		if (EFI_KIMG_ALIGN == SZ_64K)
-			pr_efi_err(sys_table_arg, "FIRMWARE BUG: kernel image not aligned on 64k boundary\n");
-		else
-			pr_efi_err(sys_table_arg, "FIRMWARE BUG: kernel image not aligned on 128k boundary\n");
-	}
-
 	kernel_size = _edata - _text;
 	kernel_memsize = kernel_size + (_end - _edata);
 

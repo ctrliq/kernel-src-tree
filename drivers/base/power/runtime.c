@@ -1118,7 +1118,7 @@ EXPORT_SYMBOL_GPL(__pm_runtime_resume);
  * the device when both its runtime PM status is RPM_ACTIVE and its usage_count
  * is non-zero.
  *
- * The caller is resposible for putting the device's usage count when ther
+ * The caller is responsible for putting the device's usage count when ther
  * return value is greater than zero.
  */
 int pm_runtime_get_if_active(struct device *dev, bool ign_usage_count)
