@@ -1,0 +1,376 @@
+x86/fpu/xstate: Clear xstate header in copy_xstate_to_uabi_buf() again
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 93c2cdc975aab53c222472c5b96c2d41dbeb350c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/93c2cdc9.failed
+
+The change which made copy_xstate_to_uabi_buf() usable for
+[x]fpregs_get() removed the zeroing of the header which means the
+header, which is copied to user space later, contains except for the
+xfeatures member, random stack content.
+
+Add the memset() back to zero it before usage.
+
+Fixes: eb6f51723f03 ("x86/fpu: Make copy_xstate_to_kernel() usable for [x]fpregs_get()")
+	Reported-by: kernel test robot <oliver.sang@intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/875yy3wb8h.ffs@nanos.tec.linutronix.de
+(cherry picked from commit 93c2cdc975aab53c222472c5b96c2d41dbeb350c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/xstate.c
+diff --cc arch/x86/kernel/fpu/xstate.c
+index 4641d3145e59,c8def1b7f8fb..000000000000
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@@ -994,235 -954,154 +994,238 @@@ int arch_set_user_pkey_access(struct ta
+  }
+  #endif /* ! CONFIG_ARCH_HAS_PKEYS */
+  
+ -static void copy_feature(bool from_xstate, struct membuf *to, void *xstate,
+ -			 void *init_xstate, unsigned int size)
+ +/*
+ + * Weird legacy quirk: SSE and YMM states store information in the
+ + * MXCSR and MXCSR_FLAGS fields of the FP area. That means if the FP
+ + * area is marked as unused in the xfeatures header, we need to copy
+ + * MXCSR and MXCSR_FLAGS if either SSE or YMM are in use.
+ + */
+ +static inline bool xfeatures_mxcsr_quirk(u64 xfeatures)
+  {
+ -	membuf_write(to, from_xstate ? xstate : init_xstate, size);
+ +	if (!(xfeatures & (XFEATURE_MASK_SSE|XFEATURE_MASK_YMM)))
+ +		return false;
+ +
+ +	if (xfeatures & XFEATURE_MASK_FP)
+ +		return false;
+ +
+ +	return true;
+  }
+  
+ -/**
+ - * copy_xstate_to_uabi_buf - Copy kernel saved xstate to a UABI buffer
+ - * @to:		membuf descriptor
+ - * @tsk:	The task from which to copy the saved xstate
+ - * @copy_mode:	The requested copy mode
+ - *
+ - * Converts from kernel XSAVE or XSAVES compacted format to UABI conforming
+ - * format, i.e. from the kernel internal hardware dependent storage format
+ - * to the requested @mode. UABI XSTATE is always uncompacted!
+ +static void fill_gap(unsigned to, void **kbuf, unsigned *pos, unsigned *count)
+ +{
+ +	if (*pos < to) {
+ +		unsigned size = to - *pos;
+ +
+ +		if (size > *count)
+ +			size = *count;
+ +		memcpy(*kbuf, (void *)&init_fpstate.xsave + *pos, size);
+ +		*kbuf += size;
+ +		*pos += size;
+ +		*count -= size;
+ +	}
+ +}
+ +
+ +static void copy_part(unsigned offset, unsigned size, void *from,
+ +			void **kbuf, unsigned *pos, unsigned *count)
+ +{
+ +	fill_gap(offset, kbuf, pos, count);
+ +	if (size > *count)
+ +		size = *count;
+ +	if (size) {
+ +		memcpy(*kbuf, from, size);
+ +		*kbuf += size;
+ +		*pos += size;
+ +		*count -= size;
+ +	}
+ +}
+ +
+ +/*
+ + * Convert from kernel XSAVES compacted format to standard format and copy
+ + * to a kernel-space ptrace buffer.
+   *
+ - * It supports partial copy but @to.pos always starts from zero.
+ + * It supports partial copy but pos always starts from zero. This is called
+ + * from xstateregs_get() and there we check the CPU has XSAVES.
+   */
+ -void copy_xstate_to_uabi_buf(struct membuf to, struct task_struct *tsk,
+ -			     enum xstate_copy_mode copy_mode)
+ +int copy_xstate_to_kernel(void *kbuf, struct xregs_state *xsave, unsigned int offset_start, unsigned int size_total)
+  {
+ -	const unsigned int off_mxcsr = offsetof(struct fxregs_state, mxcsr);
+ -	struct xregs_state *xsave = &tsk->thread.fpu.state.xsave;
+ -	struct xregs_state *xinit = &init_fpstate.xsave;
+  	struct xstate_header header;
+ -	unsigned int zerofrom;
+ +	const unsigned off_mxcsr = offsetof(struct fxregs_state, mxcsr);
+ +	unsigned count = size_total;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Currently copy_regset_to_user() starts from pos 0:
+ +	 */
+ +	if (unlikely(offset_start != 0))
+ +		return -EFAULT;
+ +
+ +	/*
+ +	 * The destination is a ptrace buffer; we put in only user xstates:
+ +	 */
+++=======
+++>>>>>>> 93c2cdc975aa (x86/fpu/xstate: Clear xstate header in copy_xstate_to_uabi_buf() again)
+  	memset(&header, 0, sizeof(header));
+  	header.xfeatures = xsave->header.xfeatures;
+ +	header.xfeatures &= xfeatures_mask_user();
+ +
+ +	if (header.xfeatures & XFEATURE_MASK_FP)
+ +		copy_part(0, off_mxcsr,
+ +			  &xsave->i387, &kbuf, &offset_start, &count);
+ +	if (header.xfeatures & (XFEATURE_MASK_SSE | XFEATURE_MASK_YMM))
+ +		copy_part(off_mxcsr, MXCSR_AND_FLAGS_SIZE,
+ +			  &xsave->i387.mxcsr, &kbuf, &offset_start, &count);
+ +	if (header.xfeatures & XFEATURE_MASK_FP)
+ +		copy_part(offsetof(struct fxregs_state, st_space), 128,
+ +			  &xsave->i387.st_space, &kbuf, &offset_start, &count);
+ +	if (header.xfeatures & XFEATURE_MASK_SSE)
+ +		copy_part(xstate_offsets[XFEATURE_SSE], 256,
+ +			  &xsave->i387.xmm_space, &kbuf, &offset_start, &count);
+ +	/*
+ +	 * Fill xsave->i387.sw_reserved value for ptrace frame:
+ +	 */
+ +	copy_part(offsetof(struct fxregs_state, sw_reserved), 48,
+ +		  xstate_fx_sw_bytes, &kbuf, &offset_start, &count);
+ +	/*
+ +	 * Copy xregs_state->header:
+ +	 */
+ +	copy_part(offsetof(struct xregs_state, header), sizeof(header),
+ +		  &header, &kbuf, &offset_start, &count);
+  
+ -	/* Mask out the feature bits depending on copy mode */
+ -	switch (copy_mode) {
+ -	case XSTATE_COPY_FP:
+ -		header.xfeatures &= XFEATURE_MASK_FP;
+ -		break;
+ +	for (i = FIRST_EXTENDED_XFEATURE; i < XFEATURE_MAX; i++) {
+ +		/*
+ +		 * Copy only in-use xstates:
+ +		 */
+ +		if ((header.xfeatures >> i) & 1) {
+ +			void *src = __raw_xsave_addr(xsave, i);
+  
+ -	case XSTATE_COPY_FX:
+ -		header.xfeatures &= XFEATURE_MASK_FP | XFEATURE_MASK_SSE;
+ -		break;
+ +			copy_part(xstate_offsets[i], xstate_sizes[i],
+ +				  src, &kbuf, &offset_start, &count);
+ +		}
+  
+ -	case XSTATE_COPY_XSAVE:
+ -		header.xfeatures &= xfeatures_mask_uabi();
+ -		break;
+  	}
+ +	fill_gap(size_total, &kbuf, &offset_start, &count);
+  
+ -	/* Copy FP state up to MXCSR */
+ -	copy_feature(header.xfeatures & XFEATURE_MASK_FP, &to, &xsave->i387,
+ -		     &xinit->i387, off_mxcsr);
+ +	return 0;
+ +}
+  
+ -	/* Copy MXCSR when SSE or YMM are set in the feature mask */
+ -	copy_feature(header.xfeatures & (XFEATURE_MASK_SSE | XFEATURE_MASK_YMM),
+ -		     &to, &xsave->i387.mxcsr, &xinit->i387.mxcsr,
+ -		     MXCSR_AND_FLAGS_SIZE);
+ +static inline int
+ +__copy_xstate_to_user(void __user *ubuf, const void *data, unsigned int offset, unsigned int size, unsigned int size_total)
+ +{
+ +	if (!size)
+ +		return 0;
+  
+ -	/* Copy the remaining FP state */
+ -	copy_feature(header.xfeatures & XFEATURE_MASK_FP,
+ -		     &to, &xsave->i387.st_space, &xinit->i387.st_space,
+ -		     sizeof(xsave->i387.st_space));
+ +	if (offset < size_total) {
+ +		unsigned int copy = min(size, size_total - offset);
+  
+ -	/* Copy the SSE state - shared with YMM, but independently managed */
+ -	copy_feature(header.xfeatures & XFEATURE_MASK_SSE,
+ -		     &to, &xsave->i387.xmm_space, &xinit->i387.xmm_space,
+ -		     sizeof(xsave->i387.xmm_space));
+ +		if (__copy_to_user(ubuf + offset, data, copy))
+ +			return -EFAULT;
+ +	}
+ +	return 0;
+ +}
+  
+ -	if (copy_mode != XSTATE_COPY_XSAVE)
+ -		goto out;
+ +/*
+ + * Convert from kernel XSAVES compacted format to standard format and copy
+ + * to a user-space buffer. It supports partial copy but pos always starts from
+ + * zero. This is called from xstateregs_get() and there we check the CPU
+ + * has XSAVES.
+ + */
+ +int copy_xstate_to_user(void __user *ubuf, struct xregs_state *xsave, unsigned int offset_start, unsigned int size_total)
+ +{
+ +	unsigned int offset, size;
+ +	int ret, i;
+ +	struct xstate_header header;
+  
+ -	/* Zero the padding area */
+ -	membuf_zero(&to, sizeof(xsave->i387.padding));
+ +	/*
+ +	 * Currently copy_regset_to_user() starts from pos 0:
+ +	 */
+ +	if (unlikely(offset_start != 0))
+ +		return -EFAULT;
+  
+ -	/* Copy xsave->i387.sw_reserved */
+ -	membuf_write(&to, xstate_fx_sw_bytes, sizeof(xsave->i387.sw_reserved));
+ +	/*
+ +	 * The destination is a ptrace buffer; we put in only user xstates:
+ +	 */
+ +	memset(&header, 0, sizeof(header));
+ +	header.xfeatures = xsave->header.xfeatures;
+ +	header.xfeatures &= xfeatures_mask_user();
+  
+ -	/* Copy the user space relevant state of @xsave->header */
+ -	membuf_write(&to, &header, sizeof(header));
+ +	/*
+ +	 * Copy xregs_state->header:
+ +	 */
+ +	offset = offsetof(struct xregs_state, header);
+ +	size = sizeof(header);
+  
+ -	zerofrom = offsetof(struct xregs_state, extended_state_area);
+ +	ret = __copy_xstate_to_user(ubuf, &header, offset, size, size_total);
+ +	if (ret)
+ +		return ret;
+  
+ -	for (i = FIRST_EXTENDED_XFEATURE; i < XFEATURE_MAX; i++) {
+ +	for (i = 0; i < XFEATURE_MAX; i++) {
+  		/*
+ -		 * The ptrace buffer is in non-compacted XSAVE format.
+ -		 * In non-compacted format disabled features still occupy
+ -		 * state space, but there is no state to copy from in the
+ -		 * compacted init_fpstate. The gap tracking will zero this
+ -		 * later.
+ +		 * Copy only in-use xstates:
+  		 */
+ -		if (!(xfeatures_mask_uabi() & BIT_ULL(i)))
+ -			continue;
+ +		if ((header.xfeatures >> i) & 1) {
+ +			void *src = __raw_xsave_addr(xsave, i);
+  
+ -		/*
+ -		 * If there was a feature or alignment gap, zero the space
+ -		 * in the destination buffer.
+ -		 */
+ -		if (zerofrom < xstate_offsets[i])
+ -			membuf_zero(&to, xstate_offsets[i] - zerofrom);
+ +			offset = xstate_offsets[i];
+ +			size = xstate_sizes[i];
+  
+ -		if (i == XFEATURE_PKRU) {
+ -			struct pkru_state pkru = {0};
+ -			/*
+ -			 * PKRU is not necessarily up to date in the
+ -			 * thread's XSAVE buffer.  Fill this part from the
+ -			 * per-thread storage.
+ -			 */
+ -			pkru.pkru = tsk->thread.pkru;
+ -			membuf_write(&to, &pkru, sizeof(pkru));
+ -		} else {
+ -			copy_feature(header.xfeatures & BIT_ULL(i), &to,
+ -				     __raw_xsave_addr(xsave, i),
+ -				     __raw_xsave_addr(xinit, i),
+ -				     xstate_sizes[i]);
+ +			/* The next component has to fit fully into the output buffer: */
+ +			if (offset + size > size_total)
+ +				break;
+ +
+ +			ret = __copy_xstate_to_user(ubuf, src, offset, size, size_total);
+ +			if (ret)
+ +				return ret;
+  		}
+ -		/*
+ -		 * Keep track of the last copied state in the non-compacted
+ -		 * target buffer for gap zeroing.
+ -		 */
+ -		zerofrom = xstate_offsets[i] + xstate_sizes[i];
+ +
+  	}
+  
+ -out:
+ -	if (to.left)
+ -		membuf_zero(&to, to.left);
+ +	if (xfeatures_mxcsr_quirk(header.xfeatures)) {
+ +		offset = offsetof(struct fxregs_state, mxcsr);
+ +		size = MXCSR_AND_FLAGS_SIZE;
+ +		__copy_xstate_to_user(ubuf, &xsave->i387.mxcsr, offset, size, size_total);
+ +	}
+ +
+ +	/*
+ +	 * Fill xsave->i387.sw_reserved value for ptrace frame:
+ +	 */
+ +	offset = offsetof(struct fxregs_state, sw_reserved);
+ +	size = sizeof(xstate_fx_sw_bytes);
+ +
+ +	ret = __copy_xstate_to_user(ubuf, xstate_fx_sw_bytes, offset, size, size_total);
+ +	if (ret)
+ +		return ret;
+ +
+ +	return 0;
+  }
+  
+ -static int copy_from_buffer(void *dst, unsigned int offset, unsigned int size,
+ -			    const void *kbuf, const void __user *ubuf)
+ +static inline bool mxcsr_valid(struct xstate_header *hdr, const u32 *mxcsr)
+  {
+ -	if (kbuf) {
+ -		memcpy(dst, kbuf + offset, size);
+ -	} else {
+ -		if (copy_from_user(dst, ubuf + offset, size))
+ -			return -EFAULT;
+ +	u64 mask = XFEATURE_MASK_FP | XFEATURE_MASK_SSE | XFEATURE_MASK_YMM;
+ +
+ +	/* Only check if it is in use */
+ +	if (hdr->xfeatures & mask) {
+ +		/* Reserved bits in MXCSR must be zero. */
+ +		if (*mxcsr & ~mxcsr_feature_mask)
+ +			return false;
+  	}
+ -	return 0;
+ +	return true;
+  }
+  
+ -
+ -static int copy_uabi_to_xstate(struct xregs_state *xsave, const void *kbuf,
+ -			       const void __user *ubuf)
+ +/*
+ + * Convert from a ptrace standard-format kernel buffer to kernel XSAVE[S] format
+ + * and copy to the target thread. This is called from xstateregs_set().
+ + */
+ +int copy_kernel_to_xstate(struct xregs_state *xsave, const void *kbuf)
+  {
+  	unsigned int offset, size;
+ -	struct xstate_header hdr;
+ -	u64 mask;
+  	int i;
+ +	struct xstate_header hdr;
+  
+  	offset = offsetof(struct xregs_state, header);
+ -	if (copy_from_buffer(&hdr, offset, sizeof(hdr), kbuf, ubuf))
+ -		return -EFAULT;
+ +	size = sizeof(hdr);
+ +
+ +	memcpy(&hdr, kbuf + offset, size);
+  
+  	if (validate_user_xstate_header(&hdr))
+  		return -EINVAL;
+* Unmerged path arch/x86/kernel/fpu/xstate.c
