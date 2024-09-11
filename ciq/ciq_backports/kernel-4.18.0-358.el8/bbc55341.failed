@@ -1,0 +1,146 @@
+x86/fpu: Deactivate FPU state after failure during state load
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+commit bbc55341b9c67645d1a5471506370caf7dd4a203
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/bbc55341.failed
+
+In __fpu__restore_sig(), fpu_fpregs_owner_ctx needs to be reset if the
+FPU state was not fully restored. Otherwise the following may happen (on
+the same CPU):
+
+  Task A                     Task B               fpu_fpregs_owner_ctx
+  *active*                                        A.fpu
+  __fpu__restore_sig()
+                             ctx switch           load B.fpu
+                             *active*             B.fpu
+  fpregs_lock()
+  copy_user_to_fpregs_zeroing()
+    copy_kernel_to_xregs() *modify*
+    copy_user_to_xregs() *fails*
+  fpregs_unlock()
+                            ctx switch            skip loading B.fpu,
+                            *active*              B.fpu
+
+In the success case, fpu_fpregs_owner_ctx is set to the current task.
+
+In the failure case, the FPU state might have been modified by loading
+the init state.
+
+In this case, fpu_fpregs_owner_ctx needs to be reset in order to ensure
+that the FPU state of the following task is loaded from saved state (and
+not skipped because it was the previous state).
+
+Reset fpu_fpregs_owner_ctx after a failure during restore occurred, to
+ensure that the FPU state for the next task is always loaded.
+
+The problem was debugged-by Yu-cheng Yu <yu-cheng.yu@intel.com>.
+
+ [ bp: Massage commit message. ]
+
+Fixes: 5f409e20b7945 ("x86/fpu: Defer FPU state load until return to userspace")
+	Reported-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Fenghua Yu <fenghua.yu@intel.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: "Ravi V. Shankar" <ravi.v.shankar@intel.com>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: x86-ml <x86@kernel.org>
+Link: https://lkml.kernel.org/r/20191220195906.plk6kpmsrikvbcfn@linutronix.de
+(cherry picked from commit bbc55341b9c67645d1a5471506370caf7dd4a203)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/signal.c
+diff --cc arch/x86/kernel/fpu/signal.c
+index 0af3999b30f9,400a05e1c1c5..000000000000
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@@ -368,62 -352,22 +368,66 @@@ static int __fpu__restore_sig(void __us
+  			fpregs_unlock();
+  			return 0;
+  		}
+++<<<<<<< HEAD
+ +
+ +		/*
+ +		 * The above did an FPU restore operation, restricted to
+ +		 * the user portion of the registers, and failed, but the
+ +		 * microcode might have modified the FPU registers
+ +		 * nevertheless.
+ +		 *
+ +		 * If the FPU registers do not belong to current, then
+ +		 * invalidate the FPU register state otherwise the task might
+ +		 * preempt current and return to user space with corrupted
+ +		 * FPU registers.
+ +		 *
+ +		 * In case current owns the FPU registers then no further
+ +		 * action is required. The fixup below will handle it
+ +		 * correctly.
+ +		 */
+ +		if (test_thread_flag(TIF_NEED_FPU_LOAD))
+ +			__cpu_invalidate_fpregs_state();
+ +
+++=======
++ 		fpregs_deactivate(fpu);
+++>>>>>>> bbc55341b9c6 (x86/fpu: Deactivate FPU state after failure during state load)
+  		fpregs_unlock();
+ +	} else {
+ +		/*
+ +		 * For 32-bit frames with fxstate, copy the fxstate so it can
+ +		 * be reconstructed later.
+ +		 */
+ +		ret = __copy_from_user(&env, buf, sizeof(env));
+ +		if (ret)
+ +			goto err_out;
+ +		envp = &env;
+  	}
+  
+ +	/*
+ +	 * By setting TIF_NEED_FPU_LOAD it is ensured that our xstate is
+ +	 * not modified on context switch and that the xstate is considered
+ +	 * to be loaded again on return to userland (overriding last_cpu avoids
+ +	 * the optimisation).
+ +	 */
+ +	fpregs_lock();
+  
+ -	if (use_xsave() && !fx_only) {
+ -		u64 init_bv = xfeatures_mask & ~xfeatures;
+ +	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
+  
+ -		if (using_compacted_format()) {
+ -			ret = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
+ -		} else {
+ -			ret = __copy_from_user(&fpu->state.xsave, buf_fx, state_size);
+ +		/*
+ +		 * Supervisor states are not modified by user space input.  Save
+ +		 * current supervisor states first and invalidate the FPU regs.
+ +		 */
+ +		if (xfeatures_mask_supervisor())
+ +			copy_supervisor_to_kernel(&fpu->state.xsave);
+ +		set_thread_flag(TIF_NEED_FPU_LOAD);
+ +	}
+ +	__fpu_invalidate_fpregs_state(fpu);
+ +	fpregs_unlock();
+  
+ -			if (!ret && state_size > offsetof(struct xregs_state, header))
+ -				ret = validate_xstate_header(&fpu->state.xsave.header);
+ -		}
+ +	if (use_xsave() && !fx_only) {
+ +		u64 init_bv = xfeatures_mask_user() & ~user_xfeatures;
+ +
+ +		ret = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
+  		if (ret)
+  			goto err_out;
+  
+* Unmerged path arch/x86/kernel/fpu/signal.c
