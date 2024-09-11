@@ -1,0 +1,602 @@
+kcov: remote coverage support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit eec028c9386ed1a692aa01a85b55952202b41619
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/eec028c9.failed
+
+Patch series " kcov: collect coverage from usb and vhost", v3.
+
+This patchset extends kcov to allow collecting coverage from backgound
+kernel threads.  This extension requires custom annotations for each of
+the places where coverage collection is desired.  This patchset
+implements this for hub events in the USB subsystem and for vhost
+workers.  See the first patch description for details about the kcov
+extension.  The other two patches apply this kcov extension to USB and
+vhost.
+
+Examples of other subsystems that might potentially benefit from this
+when custom annotations are added (the list is based on
+process_one_work() callers for bugs recently reported by syzbot):
+
+1. fs: writeback wb_workfn() worker,
+2. net: addrconf_dad_work()/addrconf_verify_work() workers,
+3. net: neigh_periodic_work() worker,
+4. net/p9: p9_write_work()/p9_read_work() workers,
+5. block: blk_mq_run_work_fn() worker.
+
+These patches have been used to enable coverage-guided USB fuzzing with
+syzkaller for the last few years, see the details here:
+
+  https://github.com/google/syzkaller/blob/master/docs/linux/external_fuzzing_usb.md
+
+This patchset has been pushed to the public Linux kernel Gerrit
+instance:
+
+  https://linux-review.googlesource.com/c/linux/kernel/git/torvalds/linux/+/1524
+
+This patch (of 3):
+
+Add background thread coverage collection ability to kcov.
+
+With KCOV_ENABLE coverage is collected only for syscalls that are issued
+from the current process.  With KCOV_REMOTE_ENABLE it's possible to
+collect coverage for arbitrary parts of the kernel code, provided that
+those parts are annotated with kcov_remote_start()/kcov_remote_stop().
+
+This allows to collect coverage from two types of kernel background
+threads: the global ones, that are spawned during kernel boot in a
+limited number of instances (e.g.  one USB hub_event() worker thread is
+spawned per USB HCD); and the local ones, that are spawned when a user
+interacts with some kernel interface (e.g.  vhost workers).
+
+To enable collecting coverage from a global background thread, a unique
+global handle must be assigned and passed to the corresponding
+kcov_remote_start() call.  Then a userspace process can pass a list of
+such handles to the KCOV_REMOTE_ENABLE ioctl in the handles array field
+of the kcov_remote_arg struct.  This will attach the used kcov device to
+the code sections, that are referenced by those handles.
+
+Since there might be many local background threads spawned from
+different userspace processes, we can't use a single global handle per
+annotation.  Instead, the userspace process passes a non-zero handle
+through the common_handle field of the kcov_remote_arg struct.  This
+common handle gets saved to the kcov_handle field in the current
+task_struct and needs to be passed to the newly spawned threads via
+custom annotations.  Those threads should in turn be annotated with
+kcov_remote_start()/kcov_remote_stop().
+
+Internally kcov stores handles as u64 integers.  The top byte of a
+handle is used to denote the id of a subsystem that this handle belongs
+to, and the lower 4 bytes are used to denote the id of a thread instance
+within that subsystem.  A reserved value 0 is used as a subsystem id for
+common handles as they don't belong to a particular subsystem.  The
+bytes 4-7 are currently reserved and must be zero.  In the future the
+number of bytes used for the subsystem or handle ids might be increased.
+
+When a particular userspace process collects coverage by via a common
+handle, kcov will collect coverage for each code section that is
+annotated to use the common handle obtained as kcov_handle from the
+current task_struct.  However non common handles allow to collect
+coverage selectively from different subsystems.
+
+Link: http://lkml.kernel.org/r/e90e315426a384207edbec1d6aa89e43008e4caf.1572366574.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Alan Stern <stern@rowland.harvard.edu>
+	Cc: "Michael S. Tsirkin" <mst@redhat.com>
+	Cc: Jason Wang <jasowang@redhat.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: David Windsor <dwindsor@gmail.com>
+	Cc: Elena Reshetova <elena.reshetova@intel.com>
+	Cc: Anders Roxell <anders.roxell@linaro.org>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Marco Elver <elver@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit eec028c9386ed1a692aa01a85b55952202b41619)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/kcov.c
+diff --cc kernel/kcov.c
+index 3ebd09efe72a,f50354202dbe..000000000000
+--- a/kernel/kcov.c
++++ b/kernel/kcov.c
+@@@ -20,8 -21,12 +21,15 @@@
+  #include <linux/debugfs.h>
+  #include <linux/uaccess.h>
+  #include <linux/kcov.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/refcount.h>
++ #include <linux/log2.h>
+++>>>>>>> eec028c9386e (kcov: remote coverage support)
+  #include <asm/setup.h>
+  
++ #define kcov_debug(fmt, ...) pr_debug("%s: " fmt, __func__, ##__VA_ARGS__)
++ 
+  /* Number of 64-bit words written per one comparison: */
+  #define KCOV_WORDS_PER_CMP 4
+  
+@@@ -43,8 -48,9 +51,9 @@@ struct kcov 
+  	 * Reference counter. We keep one for:
+  	 *  - opened file descriptor
+  	 *  - task with enabled coverage (we can't unwire it from another task)
++ 	 *  - each code section for remote coverage collection
+  	 */
+ -	refcount_t		refcount;
+ +	atomic_t		refcount;
+  	/* The lock protects mode, size, area and t. */
+  	spinlock_t		lock;
+  	enum kcov_mode		mode;
+@@@ -54,9 -60,89 +63,93 @@@
+  	void			*area;
+  	/* Task for which we collect coverage, or NULL. */
+  	struct task_struct	*t;
++ 	/* Collecting coverage from remote (background) threads. */
++ 	bool			remote;
++ 	/* Size of remote area (in long's). */
++ 	unsigned int		remote_size;
++ 	/*
++ 	 * Sequence is incremented each time kcov is reenabled, used by
++ 	 * kcov_remote_stop(), see the comment there.
++ 	 */
++ 	int			sequence;
+  };
+  
+++<<<<<<< HEAD
+ +static bool check_kcov_mode(enum kcov_mode needed_mode, struct task_struct *t)
+++=======
++ struct kcov_remote_area {
++ 	struct list_head	list;
++ 	unsigned int		size;
++ };
++ 
++ struct kcov_remote {
++ 	u64			handle;
++ 	struct kcov		*kcov;
++ 	struct hlist_node	hnode;
++ };
++ 
++ static DEFINE_SPINLOCK(kcov_remote_lock);
++ static DEFINE_HASHTABLE(kcov_remote_map, 4);
++ static struct list_head kcov_remote_areas = LIST_HEAD_INIT(kcov_remote_areas);
++ 
++ /* Must be called with kcov_remote_lock locked. */
++ static struct kcov_remote *kcov_remote_find(u64 handle)
++ {
++ 	struct kcov_remote *remote;
++ 
++ 	hash_for_each_possible(kcov_remote_map, remote, hnode, handle) {
++ 		if (remote->handle == handle)
++ 			return remote;
++ 	}
++ 	return NULL;
++ }
++ 
++ static struct kcov_remote *kcov_remote_add(struct kcov *kcov, u64 handle)
++ {
++ 	struct kcov_remote *remote;
++ 
++ 	if (kcov_remote_find(handle))
++ 		return ERR_PTR(-EEXIST);
++ 	remote = kmalloc(sizeof(*remote), GFP_ATOMIC);
++ 	if (!remote)
++ 		return ERR_PTR(-ENOMEM);
++ 	remote->handle = handle;
++ 	remote->kcov = kcov;
++ 	hash_add(kcov_remote_map, &remote->hnode, handle);
++ 	return remote;
++ }
++ 
++ /* Must be called with kcov_remote_lock locked. */
++ static struct kcov_remote_area *kcov_remote_area_get(unsigned int size)
++ {
++ 	struct kcov_remote_area *area;
++ 	struct list_head *pos;
++ 
++ 	kcov_debug("size = %u\n", size);
++ 	list_for_each(pos, &kcov_remote_areas) {
++ 		area = list_entry(pos, struct kcov_remote_area, list);
++ 		if (area->size == size) {
++ 			list_del(&area->list);
++ 			kcov_debug("rv = %px\n", area);
++ 			return area;
++ 		}
++ 	}
++ 	kcov_debug("rv = NULL\n");
++ 	return NULL;
++ }
++ 
++ /* Must be called with kcov_remote_lock locked. */
++ static void kcov_remote_area_put(struct kcov_remote_area *area,
++ 					unsigned int size)
++ {
++ 	kcov_debug("area = %px, size = %u\n", area, size);
++ 	INIT_LIST_HEAD(&area->list);
++ 	area->size = size;
++ 	list_add(&area->list, &kcov_remote_areas);
++ }
++ 
++ static notrace bool check_kcov_mode(enum kcov_mode needed_mode, struct task_struct *t)
+++>>>>>>> eec028c9386e (kcov: remote coverage support)
+  {
+  	unsigned int mode;
+  
+@@@ -226,14 -312,87 +319,91 @@@ void notrace __sanitizer_cov_trace_swit
+  EXPORT_SYMBOL(__sanitizer_cov_trace_switch);
+  #endif /* ifdef CONFIG_KCOV_ENABLE_COMPARISONS */
+  
++ static void kcov_start(struct task_struct *t, unsigned int size,
++ 			void *area, enum kcov_mode mode, int sequence)
++ {
++ 	kcov_debug("t = %px, size = %u, area = %px\n", t, size, area);
++ 	/* Cache in task struct for performance. */
++ 	t->kcov_size = size;
++ 	t->kcov_area = area;
++ 	/* See comment in check_kcov_mode(). */
++ 	barrier();
++ 	WRITE_ONCE(t->kcov_mode, mode);
++ 	t->kcov_sequence = sequence;
++ }
++ 
++ static void kcov_stop(struct task_struct *t)
++ {
++ 	WRITE_ONCE(t->kcov_mode, KCOV_MODE_DISABLED);
++ 	barrier();
++ 	t->kcov_size = 0;
++ 	t->kcov_area = NULL;
++ }
++ 
++ static void kcov_task_reset(struct task_struct *t)
++ {
++ 	kcov_stop(t);
++ 	t->kcov = NULL;
++ 	t->kcov_sequence = 0;
++ 	t->kcov_handle = 0;
++ }
++ 
++ void kcov_task_init(struct task_struct *t)
++ {
++ 	kcov_task_reset(t);
++ 	t->kcov_handle = current->kcov_handle;
++ }
++ 
++ static void kcov_reset(struct kcov *kcov)
++ {
++ 	kcov->t = NULL;
++ 	kcov->mode = KCOV_MODE_INIT;
++ 	kcov->remote = false;
++ 	kcov->remote_size = 0;
++ 	kcov->sequence++;
++ }
++ 
++ static void kcov_remote_reset(struct kcov *kcov)
++ {
++ 	int bkt;
++ 	struct kcov_remote *remote;
++ 	struct hlist_node *tmp;
++ 
++ 	spin_lock(&kcov_remote_lock);
++ 	hash_for_each_safe(kcov_remote_map, bkt, tmp, remote, hnode) {
++ 		if (remote->kcov != kcov)
++ 			continue;
++ 		kcov_debug("removing handle %llx\n", remote->handle);
++ 		hash_del(&remote->hnode);
++ 		kfree(remote);
++ 	}
++ 	/* Do reset before unlock to prevent races with kcov_remote_start(). */
++ 	kcov_reset(kcov);
++ 	spin_unlock(&kcov_remote_lock);
++ }
++ 
++ static void kcov_disable(struct task_struct *t, struct kcov *kcov)
++ {
++ 	kcov_task_reset(t);
++ 	if (kcov->remote)
++ 		kcov_remote_reset(kcov);
++ 	else
++ 		kcov_reset(kcov);
++ }
++ 
+  static void kcov_get(struct kcov *kcov)
+  {
+ -	refcount_inc(&kcov->refcount);
+ +	atomic_inc(&kcov->refcount);
+  }
+  
+  static void kcov_put(struct kcov *kcov)
+  {
+++<<<<<<< HEAD
+ +	if (atomic_dec_and_test(&kcov->refcount)) {
+++=======
++ 	if (refcount_dec_and_test(&kcov->refcount)) {
++ 		kcov_remote_reset(kcov);
+++>>>>>>> eec028c9386e (kcov: remote coverage support)
+  		vfree(kcov->area);
+  		kfree(kcov);
+  	}
+@@@ -312,7 -483,8 +494,12 @@@ static int kcov_open(struct inode *inod
+  	if (!kcov)
+  		return -ENOMEM;
+  	kcov->mode = KCOV_MODE_DISABLED;
+++<<<<<<< HEAD
+ +	atomic_set(&kcov->refcount, 1);
+++=======
++ 	kcov->sequence = 1;
++ 	refcount_set(&kcov->refcount, 1);
+++>>>>>>> eec028c9386e (kcov: remote coverage support)
+  	spin_lock_init(&kcov->lock);
+  	filep->private_data = kcov;
+  	return nonseekable_open(inode, filep);
+diff --git a/Documentation/dev-tools/kcov.rst b/Documentation/dev-tools/kcov.rst
+index c2f6452e38ed..b37e8e743af1 100644
+--- a/Documentation/dev-tools/kcov.rst
++++ b/Documentation/dev-tools/kcov.rst
+@@ -34,6 +34,7 @@ Profiling data will only become accessible once debugfs has been mounted::
+ 
+ Coverage collection
+ -------------------
++
+ The following program demonstrates coverage collection from within a test
+ program using kcov:
+ 
+@@ -128,6 +129,7 @@ only need to enable coverage (disable happens automatically on thread end).
+ 
+ Comparison operands collection
+ ------------------------------
++
+ Comparison operands collection is similar to coverage collection:
+ 
+ .. code-block:: c
+@@ -202,3 +204,130 @@ Comparison operands collection is similar to coverage collection:
+ 
+ Note that the kcov modes (coverage collection or comparison operands) are
+ mutually exclusive.
++
++Remote coverage collection
++--------------------------
++
++With KCOV_ENABLE coverage is collected only for syscalls that are issued
++from the current process. With KCOV_REMOTE_ENABLE it's possible to collect
++coverage for arbitrary parts of the kernel code, provided that those parts
++are annotated with kcov_remote_start()/kcov_remote_stop().
++
++This allows to collect coverage from two types of kernel background
++threads: the global ones, that are spawned during kernel boot in a limited
++number of instances (e.g. one USB hub_event() worker thread is spawned per
++USB HCD); and the local ones, that are spawned when a user interacts with
++some kernel interface (e.g. vhost workers).
++
++To enable collecting coverage from a global background thread, a unique
++global handle must be assigned and passed to the corresponding
++kcov_remote_start() call. Then a userspace process can pass a list of such
++handles to the KCOV_REMOTE_ENABLE ioctl in the handles array field of the
++kcov_remote_arg struct. This will attach the used kcov device to the code
++sections, that are referenced by those handles.
++
++Since there might be many local background threads spawned from different
++userspace processes, we can't use a single global handle per annotation.
++Instead, the userspace process passes a non-zero handle through the
++common_handle field of the kcov_remote_arg struct. This common handle gets
++saved to the kcov_handle field in the current task_struct and needs to be
++passed to the newly spawned threads via custom annotations. Those threads
++should in turn be annotated with kcov_remote_start()/kcov_remote_stop().
++
++Internally kcov stores handles as u64 integers. The top byte of a handle
++is used to denote the id of a subsystem that this handle belongs to, and
++the lower 4 bytes are used to denote the id of a thread instance within
++that subsystem. A reserved value 0 is used as a subsystem id for common
++handles as they don't belong to a particular subsystem. The bytes 4-7 are
++currently reserved and must be zero. In the future the number of bytes
++used for the subsystem or handle ids might be increased.
++
++When a particular userspace proccess collects coverage by via a common
++handle, kcov will collect coverage for each code section that is annotated
++to use the common handle obtained as kcov_handle from the current
++task_struct. However non common handles allow to collect coverage
++selectively from different subsystems.
++
++.. code-block:: c
++
++    struct kcov_remote_arg {
++	unsigned	trace_mode;
++	unsigned	area_size;
++	unsigned	num_handles;
++	uint64_t	common_handle;
++	uint64_t	handles[0];
++    };
++
++    #define KCOV_INIT_TRACE			_IOR('c', 1, unsigned long)
++    #define KCOV_DISABLE			_IO('c', 101)
++    #define KCOV_REMOTE_ENABLE		_IOW('c', 102, struct kcov_remote_arg)
++
++    #define COVER_SIZE	(64 << 10)
++
++    #define KCOV_TRACE_PC	0
++
++    #define KCOV_SUBSYSTEM_COMMON	(0x00ull << 56)
++    #define KCOV_SUBSYSTEM_USB	(0x01ull << 56)
++
++    #define KCOV_SUBSYSTEM_MASK	(0xffull << 56)
++    #define KCOV_INSTANCE_MASK	(0xffffffffull)
++
++    static inline __u64 kcov_remote_handle(__u64 subsys, __u64 inst)
++    {
++	if (subsys & ~KCOV_SUBSYSTEM_MASK || inst & ~KCOV_INSTANCE_MASK)
++		return 0;
++	return subsys | inst;
++    }
++
++    #define KCOV_COMMON_ID	0x42
++    #define KCOV_USB_BUS_NUM	1
++
++    int main(int argc, char **argv)
++    {
++	int fd;
++	unsigned long *cover, n, i;
++	struct kcov_remote_arg *arg;
++
++	fd = open("/sys/kernel/debug/kcov", O_RDWR);
++	if (fd == -1)
++		perror("open"), exit(1);
++	if (ioctl(fd, KCOV_INIT_TRACE, COVER_SIZE))
++		perror("ioctl"), exit(1);
++	cover = (unsigned long*)mmap(NULL, COVER_SIZE * sizeof(unsigned long),
++				     PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++	if ((void*)cover == MAP_FAILED)
++		perror("mmap"), exit(1);
++
++	/* Enable coverage collection via common handle and from USB bus #1. */
++	arg = calloc(1, sizeof(*arg) + sizeof(uint64_t));
++	if (!arg)
++		perror("calloc"), exit(1);
++	arg->trace_mode = KCOV_TRACE_PC;
++	arg->area_size = COVER_SIZE;
++	arg->num_handles = 1;
++	arg->common_handle = kcov_remote_handle(KCOV_SUBSYSTEM_COMMON,
++							KCOV_COMMON_ID);
++	arg->handles[0] = kcov_remote_handle(KCOV_SUBSYSTEM_USB,
++						KCOV_USB_BUS_NUM);
++	if (ioctl(fd, KCOV_REMOTE_ENABLE, arg))
++		perror("ioctl"), free(arg), exit(1);
++	free(arg);
++
++	/*
++	 * Here the user needs to trigger execution of a kernel code section
++	 * that is either annotated with the common handle, or to trigger some
++	 * activity on USB bus #1.
++	 */
++	sleep(2);
++
++	n = __atomic_load_n(&cover[0], __ATOMIC_RELAXED);
++	for (i = 0; i < n; i++)
++		printf("0x%lx\n", cover[i + 1]);
++	if (ioctl(fd, KCOV_DISABLE, 0))
++		perror("ioctl"), exit(1);
++	if (munmap(cover, COVER_SIZE * sizeof(unsigned long)))
++		perror("munmap"), exit(1);
++	if (close(fd))
++		perror("close"), exit(1);
++	return 0;
++    }
+diff --git a/include/linux/kcov.h b/include/linux/kcov.h
+index b76a1807028d..a10e84707d82 100644
+--- a/include/linux/kcov.h
++++ b/include/linux/kcov.h
+@@ -37,12 +37,35 @@ do {						\
+ 	(t)->kcov_mode &= ~KCOV_IN_CTXSW;	\
+ } while (0)
+ 
++/* See Documentation/dev-tools/kcov.rst for usage details. */
++void kcov_remote_start(u64 handle);
++void kcov_remote_stop(void);
++u64 kcov_common_handle(void);
++
++static inline void kcov_remote_start_common(u64 id)
++{
++	kcov_remote_start(kcov_remote_handle(KCOV_SUBSYSTEM_COMMON, id));
++}
++
++static inline void kcov_remote_start_usb(u64 id)
++{
++	kcov_remote_start(kcov_remote_handle(KCOV_SUBSYSTEM_USB, id));
++}
++
+ #else
+ 
+ static inline void kcov_task_init(struct task_struct *t) {}
+ static inline void kcov_task_exit(struct task_struct *t) {}
+ static inline void kcov_prepare_switch(struct task_struct *t) {}
+ static inline void kcov_finish_switch(struct task_struct *t) {}
++static inline void kcov_remote_start(u64 handle) {}
++static inline void kcov_remote_stop(void) {}
++static inline u64 kcov_common_handle(void)
++{
++	return 0;
++}
++static inline void kcov_remote_start_common(u64 id) {}
++static inline void kcov_remote_start_usb(u64 id) {}
+ 
+ #endif /* CONFIG_KCOV */
+ #endif /* _LINUX_KCOV_H */
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 360e418a49e6..4fd0e54f6f47 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1185,6 +1185,8 @@ struct task_struct {
+ #endif /* CONFIG_TRACING */
+ 
+ #ifdef CONFIG_KCOV
++	/* See kernel/kcov.c for more details. */
++
+ 	/* Coverage collection mode enabled for this task (0 if disabled): */
+ 	unsigned int			kcov_mode;
+ 
+@@ -1196,6 +1198,12 @@ struct task_struct {
+ 
+ 	/* KCOV descriptor wired with this task or NULL: */
+ 	struct kcov			*kcov;
++
++	/* KCOV common handle for remote coverage collection: */
++	u64				kcov_handle;
++
++	/* KCOV sequence number: */
++	int				kcov_sequence;
+ #endif
+ 
+ #ifdef CONFIG_MEMCG
+diff --git a/include/uapi/linux/kcov.h b/include/uapi/linux/kcov.h
+index 9529867717a8..409d3ad1e6e2 100644
+--- a/include/uapi/linux/kcov.h
++++ b/include/uapi/linux/kcov.h
+@@ -4,9 +4,24 @@
+ 
+ #include <linux/types.h>
+ 
++/*
++ * Argument for KCOV_REMOTE_ENABLE ioctl, see Documentation/dev-tools/kcov.rst
++ * and the comment before kcov_remote_start() for usage details.
++ */
++struct kcov_remote_arg {
++	unsigned int	trace_mode;	/* KCOV_TRACE_PC or KCOV_TRACE_CMP */
++	unsigned int	area_size;	/* Length of coverage buffer in words */
++	unsigned int	num_handles;	/* Size of handles array */
++	__u64		common_handle;
++	__u64		handles[0];
++};
++
++#define KCOV_REMOTE_MAX_HANDLES		0x100
++
+ #define KCOV_INIT_TRACE			_IOR('c', 1, unsigned long)
+ #define KCOV_ENABLE			_IO('c', 100)
+ #define KCOV_DISABLE			_IO('c', 101)
++#define KCOV_REMOTE_ENABLE		_IOW('c', 102, struct kcov_remote_arg)
+ 
+ enum {
+ 	/*
+@@ -32,4 +47,17 @@ enum {
+ #define KCOV_CMP_SIZE(n)        ((n) << 1)
+ #define KCOV_CMP_MASK           KCOV_CMP_SIZE(3)
+ 
++#define KCOV_SUBSYSTEM_COMMON	(0x00ull << 56)
++#define KCOV_SUBSYSTEM_USB	(0x01ull << 56)
++
++#define KCOV_SUBSYSTEM_MASK	(0xffull << 56)
++#define KCOV_INSTANCE_MASK	(0xffffffffull)
++
++static inline __u64 kcov_remote_handle(__u64 subsys, __u64 inst)
++{
++	if (subsys & ~KCOV_SUBSYSTEM_MASK || inst & ~KCOV_INSTANCE_MASK)
++		return 0;
++	return subsys | inst;
++}
++
+ #endif /* _LINUX_KCOV_IOCTLS_H */
+* Unmerged path kernel/kcov.c
