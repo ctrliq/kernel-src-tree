@@ -1,0 +1,167 @@
+s390/qdio: clear DSCI early for polling drivers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 9c159bbc14ba196d590dc1a2fe7931ccfe73db98
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9c159bbc.failed
+
+Polling drivers in a configuration with 1 Input Queue currently keep
+their DSCI armed all the way through the poll cycle, until
+qdio_start_irq() clears it.
+
+_Any_ intermittent QDIO interrupt delivered to tiqdio_thinint_handler()
+will thus cause
+1) the 'adapter_int' statistic to be incremented,
+2) a call to tiqdio_call_inq_handlers() for this device, and then
+3) the 'int_discarded' statistics to be incremented.
+
+This causes overhead & complexity in the IRQ path, along with ambiguity
+in the statistics.
+On the other hand the device should be in IRQ avoidance mode during a
+poll cycle, so there won't be a lot of DSCI ping-pong that this
+micro-optimization could prevent.
+
+So align the DSCI handling with what we already do for devices with
+multiple Input Queues: clear it right away while processing the IRQ.
+
+For the non-polling path this means that we no longer need to handle
+the 1-queue case separately.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Reviewed-by: Benjamin Block <bblock@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 9c159bbc14ba196d590dc1a2fe7931ccfe73db98)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/cio/qdio_main.c
+#	drivers/s390/cio/qdio_thinint.c
+diff --cc drivers/s390/cio/qdio_main.c
+index 23f655ed8c78,bcc3ab14e72d..000000000000
+--- a/drivers/s390/cio/qdio_main.c
++++ b/drivers/s390/cio/qdio_main.c
+@@@ -1647,11 -1641,12 +1647,18 @@@ int qdio_start_irq(struct ccw_device *c
+  
+  	if (!irq_ptr)
+  		return -ENODEV;
+ +	q = irq_ptr->input_qs[nr];
+  
+++<<<<<<< HEAD
+ +	clear_nonshared_ind(irq_ptr);
+ +	qdio_stop_polling(q);
+ +	clear_bit(QDIO_QUEUE_IRQS_DISABLED, &q->u.in.queue_irq_state);
+++=======
++ 	for_each_input_queue(irq_ptr, q, i)
++ 		qdio_stop_polling(q);
++ 
++ 	clear_bit(QDIO_IRQ_DISABLED, &irq_ptr->poll_state);
+++>>>>>>> 9c159bbc14ba (s390/qdio: clear DSCI early for polling drivers)
+  
+  	/*
+  	 * We need to check again to not lose initiative after
+diff --cc drivers/s390/cio/qdio_thinint.c
+index 999b998ea0c9,ae50373617cd..000000000000
+--- a/drivers/s390/cio/qdio_thinint.c
++++ b/drivers/s390/cio/qdio_thinint.c
+@@@ -92,26 -87,11 +87,33 @@@ static inline int references_shared_dsc
+  	return irq_ptr->dsci == &q_indicators[TIQDIO_SHARED_IND].ind;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int shared_ind(struct qdio_irq *irq_ptr)
+ +{
+ +	return references_shared_dsci(irq_ptr) ||
+ +		has_multiple_inq_on_dsci(irq_ptr);
+ +}
+ +
+ +void clear_nonshared_ind(struct qdio_irq *irq_ptr)
+ +{
+ +	if (!is_thinint_irq(irq_ptr))
+ +		return;
+ +	if (shared_ind(irq_ptr))
+ +		return;
+ +	xchg(irq_ptr->dsci, 0);
+ +}
+ +
+++=======
+++>>>>>>> 9c159bbc14ba (s390/qdio: clear DSCI early for polling drivers)
+  int test_nonshared_ind(struct qdio_irq *irq_ptr)
+  {
+  	if (!is_thinint_irq(irq_ptr))
+  		return 0;
+++<<<<<<< HEAD
+ +	if (shared_ind(irq_ptr))
+++=======
++ 	if (references_shared_dsci(irq_ptr))
+++>>>>>>> 9c159bbc14ba (s390/qdio: clear DSCI early for polling drivers)
+  		return 0;
+  	if (*irq_ptr->dsci)
+  		return 1;
+@@@ -131,32 -111,24 +133,43 @@@ static inline void tiqdio_call_inq_hand
+  	struct qdio_q *q;
+  	int i;
+  
+- 	if (!references_shared_dsci(irq) &&
+- 	    has_multiple_inq_on_dsci(irq))
++ 	if (!references_shared_dsci(irq))
+  		xchg(irq->dsci, 0);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (irq->irq_poll) {
++ 		if (!test_and_set_bit(QDIO_IRQ_DISABLED, &irq->poll_state))
++ 			irq->irq_poll(irq->cdev, irq->int_parm);
++ 		else
++ 			QDIO_PERF_STAT_INC(irq, int_discarded);
++ 
++ 		return;
++ 	}
++ 
+++>>>>>>> 9c159bbc14ba (s390/qdio: clear DSCI early for polling drivers)
+  	for_each_input_queue(irq, q, i) {
+ -		/*
+ -		 * Call inbound processing but not directly
+ -		 * since that could starve other thinint queues.
+ -		 */
+ -		tasklet_schedule(&q->tasklet);
+ +		if (q->u.in.queue_start_poll) {
+ +			/* skip if polling is enabled or already in work */
+ +			if (test_and_set_bit(QDIO_QUEUE_IRQS_DISABLED,
+ +					     &q->u.in.queue_irq_state)) {
+ +				QDIO_PERF_STAT_INC(irq, int_discarded);
+ +				continue;
+ +			}
+ +
+ +			/* avoid dsci clear here, done after processing */
+ +			q->u.in.queue_start_poll(irq->cdev, q->nr,
+ +						 irq->int_parm);
+ +		} else {
+ +			if (!shared_ind(irq))
+ +				xchg(irq->dsci, 0);
+ +
+ +			/*
+ +			 * Call inbound processing but not directly
+ +			 * since that could starve other thinint queues.
+ +			 */
+ +			tasklet_schedule(&q->tasklet);
+ +		}
+  	}
+  }
+  
+diff --git a/drivers/s390/cio/qdio.h b/drivers/s390/cio/qdio.h
+index 098bf8c9bbec..3aff51aac9b4 100644
+--- a/drivers/s390/cio/qdio.h
++++ b/drivers/s390/cio/qdio.h
+@@ -375,7 +375,6 @@ int tiqdio_allocate_memory(void);
+ void tiqdio_free_memory(void);
+ int tiqdio_register_thinints(void);
+ void tiqdio_unregister_thinints(void);
+-void clear_nonshared_ind(struct qdio_irq *);
+ int test_nonshared_ind(struct qdio_irq *);
+ 
+ /* prototypes for setup */
+* Unmerged path drivers/s390/cio/qdio_main.c
+* Unmerged path drivers/s390/cio/qdio_thinint.c
