@@ -1,0 +1,216 @@
+x86/irq: Initialize PCI/MSI domain at PCI init time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 6b15ffa07dc325f4e4dd98c877bfa970202c378b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/6b15ffa0.failed
+
+No point in initializing the default PCI/MSI interrupt domain early and no
+point to create it when XEN PV/HVM/DOM0 are active.
+
+Move the initialization to pci_arch_init() and convert it to init ops so
+that XEN can override it as XEN has it's own PCI/MSI management. The XEN
+override comes in a later step.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/20200826112332.859209894@linutronix.de
+
+(cherry picked from commit 6b15ffa07dc325f4e4dd98c877bfa970202c378b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/apic/msi.c
+diff --cc arch/x86/kernel/apic/msi.c
+index f3ecf25fec59,39136f7bde70..000000000000
+--- a/arch/x86/kernel/apic/msi.c
++++ b/arch/x86/kernel/apic/msi.c
+@@@ -23,8 -21,35 +23,8 @@@
+  #include <asm/apic.h>
+  #include <asm/irq_remapping.h>
+  
+- static struct irq_domain *msi_default_domain;
++ static struct irq_domain *x86_pci_msi_default_domain __ro_after_init;
+  
+ -static void __irq_msi_compose_msg(struct irq_cfg *cfg, struct msi_msg *msg)
+ -{
+ -	msg->address_hi = MSI_ADDR_BASE_HI;
+ -
+ -	if (x2apic_enabled())
+ -		msg->address_hi |= MSI_ADDR_EXT_DEST_ID(cfg->dest_apicid);
+ -
+ -	msg->address_lo =
+ -		MSI_ADDR_BASE_LO |
+ -		((apic->irq_dest_mode == 0) ?
+ -			MSI_ADDR_DEST_MODE_PHYSICAL :
+ -			MSI_ADDR_DEST_MODE_LOGICAL) |
+ -		MSI_ADDR_REDIRECTION_CPU |
+ -		MSI_ADDR_DEST_ID(cfg->dest_apicid);
+ -
+ -	msg->data =
+ -		MSI_DATA_TRIGGER_EDGE |
+ -		MSI_DATA_LEVEL_ASSERT |
+ -		MSI_DATA_DELIVERY_FIXED |
+ -		MSI_DATA_VECTOR(cfg->vector);
+ -}
+ -
+ -void x86_vector_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
+ -{
+ -	__irq_msi_compose_msg(irqd_cfg(data), msg);
+ -}
+ -
+  static void irq_msi_update_msg(struct irq_data *irqd, struct irq_cfg *cfg)
+  {
+  	struct msi_msg msg[2] = { [1] = { }, };
+@@@ -224,24 -234,32 +224,45 @@@ static struct msi_domain_info pci_msi_d
+  	.handler_name	= "edge",
+  };
+  
+- void __init arch_init_msi_domain(struct irq_domain *parent)
++ struct irq_domain * __init native_create_pci_msi_domain(void)
+  {
+  	struct fwnode_handle *fn;
++ 	struct irq_domain *d;
+  
+  	if (disable_apic)
+- 		return;
++ 		return NULL;
+  
+  	fn = irq_domain_alloc_named_fwnode("PCI-MSI");
+++<<<<<<< HEAD
+ +	if (fn) {
+ +		msi_default_domain =
+ +			pci_msi_create_irq_domain(fn, &pci_msi_domain_info,
+ +						  parent);
+ +		irq_domain_free_fwnode(fn);
+ +	}
+ +	if (!msi_default_domain)
+ +		pr_warn("failed to initialize irqdomain for MSI/MSI-x.\n");
+ +	else
+ +		msi_default_domain->flags |= IRQ_DOMAIN_MSI_NOMASK_QUIRK;
+++=======
++ 	if (!fn)
++ 		return NULL;
++ 
++ 	d = pci_msi_create_irq_domain(fn, &pci_msi_domain_info,
++ 				      x86_vector_domain);
++ 	if (!d) {
++ 		irq_domain_free_fwnode(fn);
++ 		pr_warn("Failed to initialize PCI-MSI irqdomain.\n");
++ 	} else {
++ 		d->flags |= IRQ_DOMAIN_MSI_NOMASK_QUIRK;
++ 	}
++ 	return d;
++ }
++ 
++ void __init x86_create_pci_msi_domain(void)
++ {
++ 	x86_pci_msi_default_domain = x86_init.irqs.create_pci_msi_domain();
+++>>>>>>> 6b15ffa07dc3 (x86/irq: Initialize PCI/MSI domain at PCI init time)
+  }
+  
+  #ifdef CONFIG_IRQ_REMAP
+diff --git a/arch/x86/include/asm/irqdomain.h b/arch/x86/include/asm/irqdomain.h
+index c066ffae222b..430486f65a9b 100644
+--- a/arch/x86/include/asm/irqdomain.h
++++ b/arch/x86/include/asm/irqdomain.h
+@@ -51,9 +51,11 @@ extern int mp_irqdomain_ioapic_idx(struct irq_domain *domain);
+ #endif /* CONFIG_X86_IO_APIC */
+ 
+ #ifdef CONFIG_PCI_MSI
+-extern void arch_init_msi_domain(struct irq_domain *domain);
++void x86_create_pci_msi_domain(void);
++struct irq_domain *native_create_pci_msi_domain(void);
+ #else
+-static inline void arch_init_msi_domain(struct irq_domain *domain) { }
++static inline void x86_create_pci_msi_domain(void) { }
++#define native_create_pci_msi_domain	NULL
+ #endif
+ 
+ #endif
+diff --git a/arch/x86/include/asm/x86_init.h b/arch/x86/include/asm/x86_init.h
+index 8fc13f253b4a..0ab1f0494218 100644
+--- a/arch/x86/include/asm/x86_init.h
++++ b/arch/x86/include/asm/x86_init.h
+@@ -10,6 +10,7 @@ struct mpc_cpu;
+ struct pt_regs;
+ struct mpc_table;
+ struct cpuinfo_x86;
++struct irq_domain;
+ 
+ /**
+  * struct x86_init_mpparse - platform specific mpparse ops
+@@ -54,12 +55,14 @@ struct x86_init_resources {
+  * @intr_init:			interrupt init code
+  * @intr_mode_select:		interrupt delivery mode selection
+  * @intr_mode_init:		interrupt delivery mode setup
++ * @create_pci_msi_domain:	Create the PCI/MSI interrupt domain
+  */
+ struct x86_init_irqs {
+ 	void (*pre_vector_init)(void);
+ 	void (*intr_init)(void);
+ 	void (*intr_mode_select)(void);
+ 	void (*intr_mode_init)(void);
++	struct irq_domain *(*create_pci_msi_domain)(void);
+ };
+ 
+ /**
+* Unmerged path arch/x86/kernel/apic/msi.c
+diff --git a/arch/x86/kernel/apic/vector.c b/arch/x86/kernel/apic/vector.c
+index 59bfa6f40ab4..00e657456558 100644
+--- a/arch/x86/kernel/apic/vector.c
++++ b/arch/x86/kernel/apic/vector.c
+@@ -727,8 +727,6 @@ int __init arch_early_irq_init(void)
+ 	irq_domain_free_fwnode(fn);
+ 	irq_set_default_host(x86_vector_domain);
+ 
+-	arch_init_msi_domain(x86_vector_domain);
+-
+ 	BUG_ON(!alloc_cpumask_var(&vector_searchmask, GFP_KERNEL));
+ 
+ 	/*
+diff --git a/arch/x86/kernel/x86_init.c b/arch/x86/kernel/x86_init.c
+index 81f7ed1be211..cb13abca22fd 100644
+--- a/arch/x86/kernel/x86_init.c
++++ b/arch/x86/kernel/x86_init.c
+@@ -24,6 +24,7 @@
+ #include <asm/tsc.h>
+ #include <asm/iommu.h>
+ #include <asm/mach_traps.h>
++#include <asm/irqdomain.h>
+ 
+ void x86_init_noop(void) { }
+ void __init x86_init_uint_noop(unsigned int unused) { }
+@@ -58,7 +59,8 @@ struct x86_init_ops x86_init __initdata = {
+ 		.pre_vector_init	= init_ISA_irqs,
+ 		.intr_init		= native_init_IRQ,
+ 		.intr_mode_select	= apic_intr_mode_select,
+-		.intr_mode_init		= apic_intr_mode_init
++		.intr_mode_init		= apic_intr_mode_init,
++		.create_pci_msi_domain	= native_create_pci_msi_domain,
+ 	},
+ 
+ 	.oem = {
+diff --git a/arch/x86/pci/init.c b/arch/x86/pci/init.c
+index 5fc617edf108..e759a8aba06b 100644
+--- a/arch/x86/pci/init.c
++++ b/arch/x86/pci/init.c
+@@ -3,6 +3,7 @@
+ #include <linux/init.h>
+ #include <asm/pci_x86.h>
+ #include <asm/x86_init.h>
++#include <asm/irqdomain.h>
+ 
+ /* arch_initcall has too random ordering, so call the initializers
+    in the right sequence from here. */
+@@ -11,6 +12,8 @@ static __init int pci_arch_init(void)
+ #ifdef CONFIG_PCI_DIRECT
+ 	int type = 0;
+ 
++	x86_create_pci_msi_domain();
++
+ 	type = pci_direct_probe();
+ #endif
+ 
