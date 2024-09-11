@@ -1,0 +1,473 @@
+rcu: Remove kfree_rcu() special casing and lazy-callback handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Joel Fernandes (Google) <joel@joelfernandes.org>
+commit 77a40f97030b27b3fc1640a3ed203870f0817f57
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/77a40f97.failed
+
+This commit removes kfree_rcu() special-casing and the lazy-callback
+handling from Tree RCU.  It moves some of this special casing to Tiny RCU,
+the removal of which will be the subject of later commits.
+
+This results in a nice negative delta.
+
+	Suggested-by: Paul E. McKenney <paulmck@linux.ibm.com>
+	Signed-off-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+[ paulmck: Add slab.h #include, thanks to kbuild test robot <lkp@intel.com>. ]
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit 77a40f97030b27b3fc1640a3ed203870f0817f57)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/trace/events/rcu.h
+#	kernel/rcu/rcu_segcblist.c
+#	kernel/rcu/tree.c
+diff --cc include/trace/events/rcu.h
+index 7f4d4f531b5a,4ab16fcda895..000000000000
+--- a/include/trace/events/rcu.h
++++ b/include/trace/events/rcu.h
+@@@ -501,10 -499,9 +499,13 @@@ TRACE_EVENT_RCU(rcu_callback
+  		__entry->qlen = qlen;
+  	),
+  
+++<<<<<<< HEAD
+ +	TP_printk("%s rhp=%p func=%pf %ld/%ld",
+++=======
++ 	TP_printk("%s rhp=%p func=%ps %ld",
+++>>>>>>> 77a40f97030b (rcu: Remove kfree_rcu() special casing and lazy-callback handling)
+  		  __entry->rcuname, __entry->rhp, __entry->func,
+- 		  __entry->qlen_lazy, __entry->qlen)
++ 		  __entry->qlen)
+  );
+  
+  /*
+diff --cc kernel/rcu/rcu_segcblist.c
+index 9dec88cb7bc2,5f4fd3b8777c..000000000000
+--- a/kernel/rcu/rcu_segcblist.c
++++ b/kernel/rcu/rcu_segcblist.c
+@@@ -50,11 -33,36 +46,39 @@@ void rcu_cblist_enqueue(struct rcu_cbli
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Flush the second rcu_cblist structure onto the first one, obliterating
++  * any contents of the first.  If rhp is non-NULL, enqueue it as the sole
++  * element of the second rcu_cblist structure, but ensuring that the second
++  * rcu_cblist structure, if initially non-empty, always appears non-empty
++  * throughout the process.  If rdp is NULL, the second rcu_cblist structure
++  * is instead initialized to empty.
++  */
++ void rcu_cblist_flush_enqueue(struct rcu_cblist *drclp,
++ 			      struct rcu_cblist *srclp,
++ 			      struct rcu_head *rhp)
++ {
++ 	drclp->head = srclp->head;
++ 	if (drclp->head)
++ 		drclp->tail = srclp->tail;
++ 	else
++ 		drclp->tail = &drclp->head;
++ 	drclp->len = srclp->len;
++ 	if (!rhp) {
++ 		rcu_cblist_init(srclp);
++ 	} else {
++ 		rhp->next = NULL;
++ 		srclp->head = rhp;
++ 		srclp->tail = &rhp->next;
++ 		WRITE_ONCE(srclp->len, 1);
++ 	}
++ }
++ 
++ /*
+++>>>>>>> 77a40f97030b (rcu: Remove kfree_rcu() special casing and lazy-callback handling)
+   * Dequeue the oldest rcu_head structure from the specified callback
+-  * list.  This function assumes that the callback is non-lazy, but
+-  * the caller can later invoke rcu_cblist_dequeued_lazy() if it
+-  * finds otherwise (and if it cares about laziness).  This allows
+-  * different users to have different ways of determining laziness.
++  * list.
+   */
+  struct rcu_head *rcu_cblist_dequeue(struct rcu_cblist *rclp)
+  {
+diff --cc kernel/rcu/tree.c
+index 332d4008fcd0,a8dd612098bf..000000000000
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@@ -2600,9 -2627,11 +2609,17 @@@ __call_rcu(struct rcu_head *head, rcu_c
+  		if (rcu_segcblist_empty(&rdp->cblist))
+  			rcu_segcblist_init(&rdp->cblist);
+  	}
+++<<<<<<< HEAD
+ +	rcu_nocb_lock(rdp);
+ +	was_alldone = !rcu_segcblist_pend_cbs(&rdp->cblist);
+ +	rcu_segcblist_enqueue(&rdp->cblist, head, lazy);
+++=======
++ 
++ 	if (rcu_nocb_try_bypass(rdp, head, &was_alldone, flags))
++ 		return; // Enqueued onto ->nocb_bypass, so just leave.
++ 	/* If we get here, rcu_nocb_try_bypass() acquired ->nocb_lock. */
++ 	rcu_segcblist_enqueue(&rdp->cblist, head);
+++>>>>>>> 77a40f97030b (rcu: Remove kfree_rcu() special casing and lazy-callback handling)
+  	if (__is_kfree_rcu_offset((unsigned long)func))
+  		trace_rcu_kfree_callback(rcu_state.name, head,
+  					 (unsigned long)func,
+@@@ -3080,7 -3115,8 +3103,12 @@@ static void rcu_barrier_func(void *unus
+  	rdp->barrier_head.func = rcu_barrier_callback;
+  	debug_rcu_head_queue(&rdp->barrier_head);
+  	rcu_nocb_lock(rdp);
+++<<<<<<< HEAD
+ +	if (rcu_segcblist_entrain(&rdp->cblist, &rdp->barrier_head, 0)) {
+++=======
++ 	WARN_ON_ONCE(!rcu_nocb_flush_bypass(rdp, NULL, jiffies));
++ 	if (rcu_segcblist_entrain(&rdp->cblist, &rdp->barrier_head)) {
+++>>>>>>> 77a40f97030b (rcu: Remove kfree_rcu() special casing and lazy-callback handling)
+  		atomic_inc(&rcu_state.barrier_cpu_count);
+  	} else {
+  		debug_rcu_head_unqueue(&rdp->barrier_head);
+diff --git a/Documentation/RCU/stallwarn.txt b/Documentation/RCU/stallwarn.txt
+index 8f9dc29b162b..e5afbd95727c 100644
+--- a/Documentation/RCU/stallwarn.txt
++++ b/Documentation/RCU/stallwarn.txt
+@@ -225,18 +225,13 @@ an estimate of the total number of RCU callbacks queued across all CPUs
+ In kernels with CONFIG_RCU_FAST_NO_HZ, more information is printed
+ for each CPU:
+ 
+-	0: (64628 ticks this GP) idle=dd5/3fffffffffffffff/0 softirq=82/543 last_accelerate: a345/d342 Nonlazy posted: ..D
++	0: (64628 ticks this GP) idle=dd5/3fffffffffffffff/0 softirq=82/543 last_accelerate: a345/d342 dyntick_enabled: 1
+ 
+ The "last_accelerate:" prints the low-order 16 bits (in hex) of the
+ jiffies counter when this CPU last invoked rcu_try_advance_all_cbs()
+ from rcu_needs_cpu() or last invoked rcu_accelerate_cbs() from
+-rcu_prepare_for_idle().  The "Nonlazy posted:" indicates lazy-callback
+-status, so that an "l" indicates that all callbacks were lazy at the start
+-of the last idle period and an "L" indicates that there are currently
+-no non-lazy callbacks (in both cases, "." is printed otherwise, as
+-shown above) and "D" indicates that dyntick-idle processing is enabled
+-("." is printed otherwise, for example, if disabled via the "nohz="
+-kernel boot parameter).
++rcu_prepare_for_idle(). "dyntick_enabled: 1" indicates that dyntick-idle
++processing is enabled.
+ 
+ If the grace period ends just as the stall warning starts printing,
+ there will be a spurious stall-warning message, which will include
+diff --git a/include/linux/rcu_segcblist.h b/include/linux/rcu_segcblist.h
+index 12ed22f6812b..6554c07f06d3 100644
+--- a/include/linux/rcu_segcblist.h
++++ b/include/linux/rcu_segcblist.h
+@@ -35,7 +35,6 @@ struct rcu_cblist {
+ 	struct rcu_head *head;
+ 	struct rcu_head **tail;
+ 	long len;
+-	long len_lazy;
+ };
+ 
+ #define RCU_CBLIST_INITIALIZER(n) { .head = NULL, .tail = &n.head }
+@@ -86,7 +85,6 @@ struct rcu_segcblist {
+ #else
+ 	long len;
+ #endif
+-	long len_lazy;
+ 	u8 enabled;
+ 	u8 offloaded;
+ };
+* Unmerged path include/trace/events/rcu.h
+diff --git a/kernel/rcu/rcu.h b/kernel/rcu/rcu.h
+index 61315175aacb..a676d1c3ed30 100644
+--- a/kernel/rcu/rcu.h
++++ b/kernel/rcu/rcu.h
+@@ -211,33 +211,6 @@ static inline void debug_rcu_head_unqueue(struct rcu_head *head)
+ }
+ #endif	/* #else !CONFIG_DEBUG_OBJECTS_RCU_HEAD */
+ 
+-void kfree(const void *);
+-
+-/*
+- * Reclaim the specified callback, either by invoking it (non-lazy case)
+- * or freeing it directly (lazy case).  Return true if lazy, false otherwise.
+- */
+-static inline bool __rcu_reclaim(const char *rn, struct rcu_head *head)
+-{
+-	rcu_callback_t f;
+-	unsigned long offset = (unsigned long)head->func;
+-
+-	rcu_lock_acquire(&rcu_callback_map);
+-	if (__is_kfree_rcu_offset(offset)) {
+-		trace_rcu_invoke_kfree_callback(rn, head, offset);
+-		kfree((void *)head - offset);
+-		rcu_lock_release(&rcu_callback_map);
+-		return true;
+-	} else {
+-		trace_rcu_invoke_callback(rn, head);
+-		f = head->func;
+-		WRITE_ONCE(head->func, (rcu_callback_t)0L);
+-		f(head);
+-		rcu_lock_release(&rcu_callback_map);
+-		return false;
+-	}
+-}
+-
+ #ifdef CONFIG_RCU_STALL_COMMON
+ 
+ extern int rcu_cpu_stall_ftrace_dump;
+* Unmerged path kernel/rcu/rcu_segcblist.c
+diff --git a/kernel/rcu/rcu_segcblist.h b/kernel/rcu/rcu_segcblist.h
+index 73e3e3b345cb..48d94c00b928 100644
+--- a/kernel/rcu/rcu_segcblist.h
++++ b/kernel/rcu/rcu_segcblist.h
+@@ -28,15 +28,6 @@ static inline long rcu_cblist_n_cbs(struct rcu_cblist *rclp)
+ 	return READ_ONCE(rclp->len);
+ }
+ 
+-/*
+- * Account for the fact that a previously dequeued callback turned out
+- * to be marked as lazy.
+- */
+-static inline void rcu_cblist_dequeued_lazy(struct rcu_cblist *rclp)
+-{
+-	rclp->len_lazy--;
+-}
+-
+ void rcu_cblist_init(struct rcu_cblist *rclp);
+ struct rcu_head *rcu_cblist_dequeue(struct rcu_cblist *rclp);
+ 
+@@ -68,18 +59,6 @@ static inline long rcu_segcblist_n_cbs(struct rcu_segcblist *rsclp)
+ #endif
+ }
+ 
+-/* Return number of lazy callbacks in segmented callback list. */
+-static inline long rcu_segcblist_n_lazy_cbs(struct rcu_segcblist *rsclp)
+-{
+-	return rsclp->len_lazy;
+-}
+-
+-/* Return number of lazy callbacks in segmented callback list. */
+-static inline long rcu_segcblist_n_nonlazy_cbs(struct rcu_segcblist *rsclp)
+-{
+-	return rcu_segcblist_n_cbs(rsclp) - rsclp->len_lazy;
+-}
+-
+ /*
+  * Is the specified rcu_segcblist enabled, for example, not corresponding
+  * to an offline CPU?
+@@ -114,9 +93,9 @@ struct rcu_head *rcu_segcblist_first_cb(struct rcu_segcblist *rsclp);
+ struct rcu_head *rcu_segcblist_first_pend_cb(struct rcu_segcblist *rsclp);
+ bool rcu_segcblist_nextgp(struct rcu_segcblist *rsclp, unsigned long *lp);
+ void rcu_segcblist_enqueue(struct rcu_segcblist *rsclp,
+-			   struct rcu_head *rhp, bool lazy);
++			   struct rcu_head *rhp);
+ bool rcu_segcblist_entrain(struct rcu_segcblist *rsclp,
+-			   struct rcu_head *rhp, bool lazy);
++			   struct rcu_head *rhp);
+ void rcu_segcblist_extract_count(struct rcu_segcblist *rsclp,
+ 				 struct rcu_cblist *rclp);
+ void rcu_segcblist_extract_done_cbs(struct rcu_segcblist *rsclp,
+diff --git a/kernel/rcu/srcutree.c b/kernel/rcu/srcutree.c
+index a522ac4b5d47..fdc5fd68623f 100644
+--- a/kernel/rcu/srcutree.c
++++ b/kernel/rcu/srcutree.c
+@@ -867,7 +867,7 @@ static void __call_srcu(struct srcu_struct *ssp, struct rcu_head *rhp,
+ 	local_irq_save(flags);
+ 	sdp = this_cpu_ptr(ssp->sda);
+ 	spin_lock_rcu_node(sdp);
+-	rcu_segcblist_enqueue(&sdp->srcu_cblist, rhp, false);
++	rcu_segcblist_enqueue(&sdp->srcu_cblist, rhp);
+ 	rcu_segcblist_advance(&sdp->srcu_cblist,
+ 			      rcu_seq_current(&ssp->srcu_gp_seq));
+ 	s = rcu_seq_snap(&ssp->srcu_gp_seq);
+@@ -1066,7 +1066,7 @@ void srcu_barrier(struct srcu_struct *ssp)
+ 		sdp->srcu_barrier_head.func = srcu_barrier_cb;
+ 		debug_rcu_head_queue(&sdp->srcu_barrier_head);
+ 		if (!rcu_segcblist_entrain(&sdp->srcu_cblist,
+-					   &sdp->srcu_barrier_head, 0)) {
++					   &sdp->srcu_barrier_head)) {
+ 			debug_rcu_head_unqueue(&sdp->srcu_barrier_head);
+ 			atomic_dec(&ssp->srcu_barrier_cpu_cnt);
+ 		}
+diff --git a/kernel/rcu/tiny.c b/kernel/rcu/tiny.c
+index 319285a8c55c..406dddd2b54b 100644
+--- a/kernel/rcu/tiny.c
++++ b/kernel/rcu/tiny.c
+@@ -35,6 +35,7 @@
+ #include <linux/time.h>
+ #include <linux/cpu.h>
+ #include <linux/prefetch.h>
++#include <linux/slab.h>
+ 
+ #include "rcu.h"
+ 
+@@ -86,6 +87,31 @@ void rcu_sched_clock_irq(int user)
+ 	}
+ }
+ 
++/*
++ * Reclaim the specified callback, either by invoking it for non-kfree cases or
++ * freeing it directly (for kfree). Return true if kfreeing, false otherwise.
++ */
++static inline bool rcu_reclaim_tiny(struct rcu_head *head)
++{
++	rcu_callback_t f;
++	unsigned long offset = (unsigned long)head->func;
++
++	rcu_lock_acquire(&rcu_callback_map);
++	if (__is_kfree_rcu_offset(offset)) {
++		trace_rcu_invoke_kfree_callback("", head, offset);
++		kfree((void *)head - offset);
++		rcu_lock_release(&rcu_callback_map);
++		return true;
++	}
++
++	trace_rcu_invoke_callback("", head);
++	f = head->func;
++	WRITE_ONCE(head->func, (rcu_callback_t)0L);
++	f(head);
++	rcu_lock_release(&rcu_callback_map);
++	return false;
++}
++
+ /* Invoke the RCU callbacks whose grace period has elapsed.  */
+ static __latent_entropy void rcu_process_callbacks(struct softirq_action *unused)
+ {
+@@ -113,7 +139,7 @@ static __latent_entropy void rcu_process_callbacks(struct softirq_action *unused
+ 		prefetch(next);
+ 		debug_rcu_head_unqueue(list);
+ 		local_bh_disable();
+-		__rcu_reclaim("", list);
++		rcu_reclaim_tiny(list);
+ 		local_bh_enable();
+ 		list = next;
+ 	}
+* Unmerged path kernel/rcu/tree.c
+diff --git a/kernel/rcu/tree.h b/kernel/rcu/tree.h
+index af5d2f3e0062..dabb06e33e92 100644
+--- a/kernel/rcu/tree.h
++++ b/kernel/rcu/tree.h
+@@ -183,7 +183,6 @@ struct rcu_data {
+ 	bool rcu_forced_tick;		/* Forced tick to provide QS. */
+ 	bool rcu_forced_tick_exp;	/*   ... provide QS to expedited GP. */
+ #ifdef CONFIG_RCU_FAST_NO_HZ
+-	bool all_lazy;			/* All CPU's CBs lazy at idle start? */
+ 	unsigned long last_accelerate;	/* Last jiffy CBs were accelerated. */
+ 	unsigned long last_advance_all;	/* Last jiffy CBs were all advanced. */
+ 	int tick_nohz_enabled_snap;	/* Previously seen value from sysfs. */
+diff --git a/kernel/rcu/tree_plugin.h b/kernel/rcu/tree_plugin.h
+index aea150d11e61..b8334a4a0472 100644
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@ -1262,10 +1262,9 @@ static void rcu_prepare_for_idle(void)
+ /*
+  * This code is invoked when a CPU goes idle, at which point we want
+  * to have the CPU do everything required for RCU so that it can enter
+- * the energy-efficient dyntick-idle mode.  This is handled by a
+- * state machine implemented by rcu_prepare_for_idle() below.
++ * the energy-efficient dyntick-idle mode.
+  *
+- * The following three proprocessor symbols control this state machine:
++ * The following preprocessor symbol controls this:
+  *
+  * RCU_IDLE_GP_DELAY gives the number of jiffies that a CPU is permitted
+  *	to sleep in dyntick-idle mode with RCU callbacks pending.  This
+@@ -1274,21 +1273,15 @@ static void rcu_prepare_for_idle(void)
+  *	number, be warned: Setting RCU_IDLE_GP_DELAY too high can hang your
+  *	system.  And if you are -that- concerned about energy efficiency,
+  *	just power the system down and be done with it!
+- * RCU_IDLE_LAZY_GP_DELAY gives the number of jiffies that a CPU is
+- *	permitted to sleep in dyntick-idle mode with only lazy RCU
+- *	callbacks pending.  Setting this too high can OOM your system.
+  *
+- * The values below work well in practice.  If future workloads require
++ * The value below works well in practice.  If future workloads require
+  * adjustment, they can be converted into kernel config parameters, though
+  * making the state machine smarter might be a better option.
+  */
+ #define RCU_IDLE_GP_DELAY 4		/* Roughly one grace period. */
+-#define RCU_IDLE_LAZY_GP_DELAY (6 * HZ)	/* Roughly six seconds. */
+ 
+ static int rcu_idle_gp_delay = RCU_IDLE_GP_DELAY;
+ module_param(rcu_idle_gp_delay, int, 0644);
+-static int rcu_idle_lazy_gp_delay = RCU_IDLE_LAZY_GP_DELAY;
+-module_param(rcu_idle_lazy_gp_delay, int, 0644);
+ 
+ /*
+  * Try to advance callbacks on the current CPU, but only if it has been
+@@ -1327,8 +1320,7 @@ static bool __maybe_unused rcu_try_advance_all_cbs(void)
+ /*
+  * Allow the CPU to enter dyntick-idle mode unless it has callbacks ready
+  * to invoke.  If the CPU has callbacks, try to advance them.  Tell the
+- * caller to set the timeout based on whether or not there are non-lazy
+- * callbacks.
++ * caller about what to set the timeout.
+  *
+  * The caller must have disabled interrupts.
+  */
+@@ -1354,25 +1346,18 @@ int rcu_needs_cpu(u64 basemono, u64 *nextevt)
+ 	}
+ 	rdp->last_accelerate = jiffies;
+ 
+-	/* Request timer delay depending on laziness, and round. */
+-	rdp->all_lazy = !rcu_segcblist_n_nonlazy_cbs(&rdp->cblist);
+-	if (rdp->all_lazy) {
+-		dj = round_jiffies(rcu_idle_lazy_gp_delay + jiffies) - jiffies;
+-	} else {
+-		dj = round_up(rcu_idle_gp_delay + jiffies,
+-			       rcu_idle_gp_delay) - jiffies;
+-	}
++	/* Request timer and round. */
++	dj = round_up(rcu_idle_gp_delay + jiffies, rcu_idle_gp_delay) - jiffies;
++
+ 	*nextevt = basemono + dj * TICK_NSEC;
+ 	return 0;
+ }
+ 
+ /*
+- * Prepare a CPU for idle from an RCU perspective.  The first major task
+- * is to sense whether nohz mode has been enabled or disabled via sysfs.
+- * The second major task is to check to see if a non-lazy callback has
+- * arrived at a CPU that previously had only lazy callbacks.  The third
+- * major task is to accelerate (that is, assign grace-period numbers to)
+- * any recently arrived callbacks.
++ * Prepare a CPU for idle from an RCU perspective.  The first major task is to
++ * sense whether nohz mode has been enabled or disabled via sysfs.  The second
++ * major task is to accelerate (that is, assign grace-period numbers to) any
++ * recently arrived callbacks.
+  *
+  * The caller must have disabled interrupts.
+  */
+@@ -1398,17 +1383,6 @@ static void rcu_prepare_for_idle(void)
+ 	if (!tne)
+ 		return;
+ 
+-	/*
+-	 * If a non-lazy callback arrived at a CPU having only lazy
+-	 * callbacks, invoke RCU core for the side-effect of recalculating
+-	 * idle duration on re-entry to idle.
+-	 */
+-	if (rdp->all_lazy && rcu_segcblist_n_nonlazy_cbs(&rdp->cblist)) {
+-		rdp->all_lazy = false;
+-		invoke_rcu_core();
+-		return;
+-	}
+-
+ 	/*
+ 	 * If we have not yet accelerated this jiffy, accelerate all
+ 	 * callbacks on this CPU.
+diff --git a/kernel/rcu/tree_stall.h b/kernel/rcu/tree_stall.h
+index d411b8fd150c..16629eec5f53 100644
+--- a/kernel/rcu/tree_stall.h
++++ b/kernel/rcu/tree_stall.h
+@@ -263,11 +263,9 @@ static void print_cpu_stall_fast_no_hz(char *cp, int cpu)
+ {
+ 	struct rcu_data *rdp = &per_cpu(rcu_data, cpu);
+ 
+-	sprintf(cp, "last_accelerate: %04lx/%04lx, Nonlazy posted: %c%c%c",
++	sprintf(cp, "last_accelerate: %04lx/%04lx dyntick_enabled: %d",
+ 		rdp->last_accelerate & 0xffff, jiffies & 0xffff,
+-		".l"[rdp->all_lazy],
+-		".L"[!rcu_segcblist_n_nonlazy_cbs(&rdp->cblist)],
+-		".D"[!!rdp->tick_nohz_enabled_snap]);
++		!!rdp->tick_nohz_enabled_snap);
+ }
+ 
+ #else /* #ifdef CONFIG_RCU_FAST_NO_HZ */
