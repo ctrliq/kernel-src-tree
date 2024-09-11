@@ -1678,6 +1678,12 @@ static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 		return -EFAULT;
 	if (cmd.flags)
 		return -EINVAL;
+	if (ns && cmd.nsid != ns->head->ns_id) {
+		dev_err(ctrl->device,
+			"%s: nsid (%u) in cmd does not match nsid (%u) of namespace\n",
+			current->comm, cmd.nsid, ns->head->ns_id);
+		return -EINVAL;
+	}
 
 	memset(&c, 0, sizeof(c));
 	c.common.opcode = cmd.opcode;
@@ -1722,6 +1728,12 @@ static int nvme_user_cmd64(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 		return -EFAULT;
 	if (cmd.flags)
 		return -EINVAL;
+	if (ns && cmd.nsid != ns->head->ns_id) {
+		dev_err(ctrl->device,
+			"%s: nsid (%u) in cmd does not match nsid (%u) of namespace\n",
+			current->comm, cmd.nsid, ns->head->ns_id);
+		return -EINVAL;
+	}
 
 	memset(&c, 0, sizeof(c));
 	c.common.opcode = cmd.opcode;
