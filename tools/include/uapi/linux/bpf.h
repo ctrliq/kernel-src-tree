@@ -3567,6 +3567,19 @@ struct xdp_md {
 	__u32 rx_queue_index;  /* rxq->queue_index  */
 };
 
+/* DEVMAP map-value layout
+ *
+ * The struct data-layout of map-value is a configuration interface.
+ * New members can only be added to the end of this structure.
+ */
+struct bpf_devmap_val {
+	__u32 ifindex;   /* device index */
+	union {
+		int   fd;  /* prog fd on map write */
+		__u32 id;  /* prog id on map read */
+	} bpf_prog;
+};
+
 enum sk_action {
 	SK_DROP = 0,
 	SK_PASS,
