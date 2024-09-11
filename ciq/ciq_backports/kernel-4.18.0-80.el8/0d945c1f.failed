@@ -1,0 +1,640 @@
+block: remove the queue_lock indirection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 0d945c1f966b2bcb67bb12be749da0a7fb00201b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/0d945c1f.failed
+
+With the legacy request path gone there is no good reason to keep
+queue_lock as a pointer, we can always use the embedded lock now.
+
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+
+Fixed floppy and blk-cgroup missing conversions and half done edits.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 0d945c1f966b2bcb67bb12be749da0a7fb00201b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-cgroup.c
+#	block/blk-ioc.c
+diff --cc block/blk-cgroup.c
+index 301ed0447460,0f6b44614165..000000000000
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@@ -325,8 -297,9 +325,8 @@@ static void blkg_destroy(struct blkcg_g
+  {
+  	struct blkcg *blkcg = blkg->blkcg;
+  	struct blkcg_gq *parent = blkg->parent;
+ -	int i;
+  
+- 	lockdep_assert_held(blkg->q->queue_lock);
++ 	lockdep_assert_held(&blkg->q->queue_lock);
+  	lockdep_assert_held(&blkcg->lock);
+  
+  	/* Something wrong if we are trying to remove same group twice */
+@@@ -369,8 -349,7 +369,12 @@@ static void blkg_destroy_all(struct req
+  {
+  	struct blkcg_gq *blkg, *n;
+  
+++<<<<<<< HEAD
+ +	lockdep_assert_held(q->queue_lock);
+ +
+++=======
++ 	spin_lock_irq(&q->queue_lock);
+++>>>>>>> 0d945c1f966b (block: remove the queue_lock indirection)
+  	list_for_each_entry_safe(blkg, n, &q->blkg_list, q_node) {
+  		struct blkcg *blkcg = blkg->blkcg;
+  
+@@@ -381,7 -359,7 +385,11 @@@
+  	}
+  
+  	q->root_blkg = NULL;
+++<<<<<<< HEAD
+ +	q->root_rl.blkg = NULL;
+++=======
++ 	spin_unlock_irq(&q->queue_lock);
+++>>>>>>> 0d945c1f966b (block: remove the queue_lock indirection)
+  }
+  
+  /*
+@@@ -1073,26 -1019,28 +1081,26 @@@ static void blkcg_css_offline(struct cg
+  }
+  
+  /**
+ - * blkcg_destroy_blkgs - responsible for shooting down blkgs
+ + * blkcg_destroy_all_blkgs - destroy all blkgs associated with a blkcg
+   * @blkcg: blkcg of interest
+   *
+ - * blkgs should be removed while holding both q and blkcg locks.  As blkcg lock
+ + * This function is called when blkcg css is about to free and responsible for
+ + * destroying all blkgs associated with @blkcg.
+ + * blkgs should be removed while holding both q and blkcg locks. As blkcg lock
+   * is nested inside q lock, this function performs reverse double lock dancing.
+ - * Destroying the blkgs releases the reference held on the blkcg's css allowing
+ - * blkcg_css_free to eventually be called.
+ - *
+ - * This is the blkcg counterpart of ioc_release_fn().
+   */
+ -void blkcg_destroy_blkgs(struct blkcg *blkcg)
+ +static void blkcg_destroy_all_blkgs(struct blkcg *blkcg)
+  {
+  	spin_lock_irq(&blkcg->lock);
+ -
+  	while (!hlist_empty(&blkcg->blkg_list)) {
+  		struct blkcg_gq *blkg = hlist_entry(blkcg->blkg_list.first,
+ -						struct blkcg_gq, blkcg_node);
+ +						    struct blkcg_gq,
+ +						    blkcg_node);
+  		struct request_queue *q = blkg->q;
+  
+- 		if (spin_trylock(q->queue_lock)) {
++ 		if (spin_trylock(&q->queue_lock)) {
+  			blkg_destroy(blkg);
+- 			spin_unlock(q->queue_lock);
++ 			spin_unlock(&q->queue_lock);
+  		} else {
+  			spin_unlock_irq(&blkcg->lock);
+  			cpu_relax();
+@@@ -1218,8 -1166,7 +1226,12 @@@ int blkcg_init_queue(struct request_que
+  	if (IS_ERR(blkg))
+  		goto err_unlock;
+  	q->root_blkg = blkg;
+++<<<<<<< HEAD
+ +	q->root_rl.blkg = blkg;
+ +	spin_unlock_irq(q->queue_lock);
+++=======
++ 	spin_unlock_irq(&q->queue_lock);
+++>>>>>>> 0d945c1f966b (block: remove the queue_lock indirection)
+  	rcu_read_unlock();
+  
+  	if (preloaded)
+@@@ -1235,12 -1182,10 +1247,12 @@@
+  	return 0;
+  
+  err_destroy_all:
+ +	spin_lock_irq(q->queue_lock);
+  	blkg_destroy_all(q);
+ +	spin_unlock_irq(q->queue_lock);
+  	return ret;
+  err_unlock:
+- 	spin_unlock_irq(q->queue_lock);
++ 	spin_unlock_irq(&q->queue_lock);
+  	rcu_read_unlock();
+  	if (preloaded)
+  		radix_tree_preload_end();
+diff --cc block/blk-ioc.c
+index 69e1ffe87f8d,5ed59ac6ae58..000000000000
+--- a/block/blk-ioc.c
++++ b/block/blk-ioc.c
+@@@ -249,16 -233,11 +249,20 @@@ void ioc_clear_queue(struct request_que
+  {
+  	LIST_HEAD(icq_list);
+  
+- 	spin_lock_irq(q->queue_lock);
++ 	spin_lock_irq(&q->queue_lock);
+  	list_splice_init(&q->icq_list, &icq_list);
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock_irq(&q->queue_lock);
+++>>>>>>> 0d945c1f966b (block: remove the queue_lock indirection)
+  
+ -	__ioc_clear_queue(&icq_list);
+ +	if (q->mq_ops) {
+ +		spin_unlock_irq(q->queue_lock);
+ +		__ioc_clear_queue(&icq_list);
+ +	} else {
+ +		__ioc_clear_queue(&icq_list);
+ +		spin_unlock_irq(q->queue_lock);
+ +	}
+  }
+  
+  int create_task_io_context(struct task_struct *task, gfp_t gfp_flags, int node)
+diff --git a/block/bfq-cgroup.c b/block/bfq-cgroup.c
+index 9fe5952d117d..a7a1712632b0 100644
+--- a/block/bfq-cgroup.c
++++ b/block/bfq-cgroup.c
+@@ -334,7 +334,7 @@ static void bfqg_stats_xfer_dead(struct bfq_group *bfqg)
+ 
+ 	parent = bfqg_parent(bfqg);
+ 
+-	lockdep_assert_held(bfqg_to_blkg(bfqg)->q->queue_lock);
++	lockdep_assert_held(&bfqg_to_blkg(bfqg)->q->queue_lock);
+ 
+ 	if (unlikely(!parent))
+ 		return;
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index 97337214bec4..76fedae81b75 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -399,9 +399,9 @@ static struct bfq_io_cq *bfq_bic_lookup(struct bfq_data *bfqd,
+ 		unsigned long flags;
+ 		struct bfq_io_cq *icq;
+ 
+-		spin_lock_irqsave(q->queue_lock, flags);
++		spin_lock_irqsave(&q->queue_lock, flags);
+ 		icq = icq_to_bic(ioc_lookup_icq(ioc, q));
+-		spin_unlock_irqrestore(q->queue_lock, flags);
++		spin_unlock_irqrestore(&q->queue_lock, flags);
+ 
+ 		return icq;
+ 	}
+@@ -4066,7 +4066,7 @@ static void bfq_update_dispatch_stats(struct request_queue *q,
+ 	 * In addition, the following queue lock guarantees that
+ 	 * bfqq_group(bfqq) exists as well.
+ 	 */
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 	if (idle_timer_disabled)
+ 		/*
+ 		 * Since the idle timer has been disabled,
+@@ -4085,7 +4085,7 @@ static void bfq_update_dispatch_stats(struct request_queue *q,
+ 		bfqg_stats_set_start_empty_time(bfqg);
+ 		bfqg_stats_update_io_remove(bfqg, rq->cmd_flags);
+ 	}
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ }
+ #else
+ static inline void bfq_update_dispatch_stats(struct request_queue *q,
+@@ -4669,11 +4669,11 @@ static void bfq_update_insert_stats(struct request_queue *q,
+ 	 * In addition, the following queue lock guarantees that
+ 	 * bfqq_group(bfqq) exists as well.
+ 	 */
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 	bfqg_stats_update_io_add(bfqq_group(bfqq), bfqq, cmd_flags);
+ 	if (idle_timer_disabled)
+ 		bfqg_stats_update_idle_time(bfqq_group(bfqq));
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ }
+ #else
+ static inline void bfq_update_insert_stats(struct request_queue *q,
+@@ -5414,9 +5414,9 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	}
+ 	eq->elevator_data = bfqd;
+ 
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 	q->elevator = eq;
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ 
+ 	/*
+ 	 * Our fallback bfqq if bfq_find_alloc_queue() runs into OOM issues.
+* Unmerged path block/blk-cgroup.c
+diff --git a/block/blk-core.c b/block/blk-core.c
+index f000f658d70d..86e1ae447251 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -749,8 +749,6 @@ void blk_exit_queue(struct request_queue *q)
+  */
+ void blk_cleanup_queue(struct request_queue *q)
+ {
+-	spinlock_t *lock = q->queue_lock;
+-
+ 	/* mark @q DYING, no new request or merges will be allowed afterwards */
+ 	mutex_lock(&q->sysfs_lock);
+ 	blk_set_queue_dying(q);
+@@ -806,11 +804,6 @@ void blk_cleanup_queue(struct request_queue *q)
+ 		blk_mq_free_queue(q);
+ 	percpu_ref_exit(&q->q_usage_counter);
+ 
+-	spin_lock_irq(lock);
+-	if (q->queue_lock != &q->__queue_lock)
+-		q->queue_lock = &q->__queue_lock;
+-	spin_unlock_irq(lock);
+-
+ 	/* @q is and will stay empty, shutdown and put */
+ 	blk_put_queue(q);
+ }
+@@ -1028,8 +1021,7 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
+ 	mutex_init(&q->blk_trace_mutex);
+ #endif
+ 	mutex_init(&q->sysfs_lock);
+-	spin_lock_init(&q->__queue_lock);
+-	q->queue_lock = &q->__queue_lock;
++	spin_lock_init(&q->queue_lock);
+ 
+ 	init_waitqueue_head(&q->mq_freeze_wq);
+ 
+* Unmerged path block/blk-ioc.c
+diff --git a/block/blk-iolatency.c b/block/blk-iolatency.c
+index 15bf5b89f84d..cb4c04bfd6c9 100644
+--- a/block/blk-iolatency.c
++++ b/block/blk-iolatency.c
+@@ -398,11 +398,11 @@ static void blkcg_iolatency_throttle(struct rq_qos *rqos, struct bio *bio)
+ 	bio_associate_blkcg(bio, &blkcg->css);
+ 	blkg = blkg_lookup(blkcg, q);
+ 	if (unlikely(!blkg)) {
+-		spin_lock_irq(q->queue_lock);
++		spin_lock_irq(&q->queue_lock);
+ 		blkg = blkg_lookup_create(blkcg, q);
+ 		if (IS_ERR(blkg))
+ 			blkg = NULL;
+-		spin_unlock_irq(q->queue_lock);
++		spin_unlock_irq(&q->queue_lock);
+ 	}
+ 	if (!blkg)
+ 		goto out;
+diff --git a/block/blk-mq-sched.c b/block/blk-mq-sched.c
+index 51ff587cddb8..78d4bad32222 100644
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@ -37,9 +37,9 @@ void blk_mq_sched_assign_ioc(struct request *rq, struct bio *bio)
+ 	struct io_context *ioc = rq_ioc(bio);
+ 	struct io_cq *icq;
+ 
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 	icq = ioc_lookup_icq(ioc, q);
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ 
+ 	if (!icq) {
+ 		icq = ioc_create_icq(ioc, q, GFP_ATOMIC);
+diff --git a/block/blk-pm.c b/block/blk-pm.c
+index f8fdae01bea2..0a028c189897 100644
+--- a/block/blk-pm.c
++++ b/block/blk-pm.c
+@@ -89,12 +89,12 @@ int blk_pre_runtime_suspend(struct request_queue *q)
+ 	/* Switch q_usage_counter back to per-cpu mode. */
+ 	blk_mq_unfreeze_queue(q);
+ 
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 	if (ret < 0)
+ 		pm_runtime_mark_last_busy(q->dev);
+ 	else
+ 		q->rpm_status = RPM_SUSPENDING;
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ 
+ 	if (ret)
+ 		blk_clear_pm_only(q);
+@@ -121,14 +121,14 @@ void blk_post_runtime_suspend(struct request_queue *q, int err)
+ 	if (!q->dev)
+ 		return;
+ 
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 	if (!err) {
+ 		q->rpm_status = RPM_SUSPENDED;
+ 	} else {
+ 		q->rpm_status = RPM_ACTIVE;
+ 		pm_runtime_mark_last_busy(q->dev);
+ 	}
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ 
+ 	if (err)
+ 		blk_clear_pm_only(q);
+@@ -151,9 +151,9 @@ void blk_pre_runtime_resume(struct request_queue *q)
+ 	if (!q->dev)
+ 		return;
+ 
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 	q->rpm_status = RPM_RESUMING;
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ }
+ EXPORT_SYMBOL(blk_pre_runtime_resume);
+ 
+@@ -176,7 +176,7 @@ void blk_post_runtime_resume(struct request_queue *q, int err)
+ 	if (!q->dev)
+ 		return;
+ 
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 	if (!err) {
+ 		q->rpm_status = RPM_ACTIVE;
+ 		pm_runtime_mark_last_busy(q->dev);
+@@ -184,7 +184,7 @@ void blk_post_runtime_resume(struct request_queue *q, int err)
+ 	} else {
+ 		q->rpm_status = RPM_SUSPENDED;
+ 	}
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ 
+ 	if (!err)
+ 		blk_clear_pm_only(q);
+@@ -207,10 +207,10 @@ EXPORT_SYMBOL(blk_post_runtime_resume);
+  */
+ void blk_set_runtime_active(struct request_queue *q)
+ {
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 	q->rpm_status = RPM_ACTIVE;
+ 	pm_runtime_mark_last_busy(q->dev);
+ 	pm_request_autosuspend(q->dev);
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ }
+ EXPORT_SYMBOL(blk_set_runtime_active);
+diff --git a/block/blk-pm.h b/block/blk-pm.h
+index a8564ea72a41..ea5507d23e75 100644
+--- a/block/blk-pm.h
++++ b/block/blk-pm.h
+@@ -21,7 +21,7 @@ static inline void blk_pm_mark_last_busy(struct request *rq)
+ 
+ static inline void blk_pm_requeue_request(struct request *rq)
+ {
+-	lockdep_assert_held(rq->q->queue_lock);
++	lockdep_assert_held(&rq->q->queue_lock);
+ 
+ 	if (rq->q->dev && !(rq->rq_flags & RQF_PM))
+ 		rq->q->nr_pending--;
+@@ -30,7 +30,7 @@ static inline void blk_pm_requeue_request(struct request *rq)
+ static inline void blk_pm_add_request(struct request_queue *q,
+ 				      struct request *rq)
+ {
+-	lockdep_assert_held(q->queue_lock);
++	lockdep_assert_held(&q->queue_lock);
+ 
+ 	if (q->dev && !(rq->rq_flags & RQF_PM))
+ 		q->nr_pending++;
+@@ -38,7 +38,7 @@ static inline void blk_pm_add_request(struct request_queue *q,
+ 
+ static inline void blk_pm_put_request(struct request *rq)
+ {
+-	lockdep_assert_held(rq->q->queue_lock);
++	lockdep_assert_held(&rq->q->queue_lock);
+ 
+ 	if (rq->q->dev && !(rq->rq_flags & RQF_PM))
+ 		--rq->q->nr_pending;
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index 369b4855dcaf..c8e5464403e7 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -242,10 +242,10 @@ queue_max_sectors_store(struct request_queue *q, const char *page, size_t count)
+ 	if (max_sectors_kb > max_hw_sectors_kb || max_sectors_kb < page_kb)
+ 		return -EINVAL;
+ 
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 	q->limits.max_sectors = max_sectors_kb << 1;
+ 	q->backing_dev_info->io_pages = max_sectors_kb >> (PAGE_SHIFT - 10);
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ 
+ 	return ret;
+ }
+diff --git a/block/blk-throttle.c b/block/blk-throttle.c
+index 07f1b008e5ab..21ab0fc34ced 100644
+--- a/block/blk-throttle.c
++++ b/block/blk-throttle.c
+@@ -1241,7 +1241,7 @@ static void throtl_pending_timer_fn(struct timer_list *t)
+ 	bool dispatched;
+ 	int ret;
+ 
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 	if (throtl_can_upgrade(td, NULL))
+ 		throtl_upgrade_state(td);
+ 
+@@ -1264,9 +1264,9 @@ static void throtl_pending_timer_fn(struct timer_list *t)
+ 			break;
+ 
+ 		/* this dispatch windows is still open, relax and repeat */
+-		spin_unlock_irq(q->queue_lock);
++		spin_unlock_irq(&q->queue_lock);
+ 		cpu_relax();
+-		spin_lock_irq(q->queue_lock);
++		spin_lock_irq(&q->queue_lock);
+ 	}
+ 
+ 	if (!dispatched)
+@@ -1288,7 +1288,7 @@ static void throtl_pending_timer_fn(struct timer_list *t)
+ 		queue_work(kthrotld_workqueue, &td->dispatch_work);
+ 	}
+ out_unlock:
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ }
+ 
+ /**
+@@ -1312,11 +1312,11 @@ static void blk_throtl_dispatch_work_fn(struct work_struct *work)
+ 
+ 	bio_list_init(&bio_list_on_stack);
+ 
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 	for (rw = READ; rw <= WRITE; rw++)
+ 		while ((bio = throtl_pop_queued(&td_sq->queued[rw], NULL)))
+ 			bio_list_add(&bio_list_on_stack, bio);
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ 
+ 	if (!bio_list_empty(&bio_list_on_stack)) {
+ 		blk_start_plug(&plug);
+@@ -2139,7 +2139,7 @@ bool blk_throtl_bio(struct request_queue *q, struct blkcg_gq *blkg,
+ 	if (bio_flagged(bio, BIO_THROTTLED) || !tg->has_rules[rw])
+ 		goto out;
+ 
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 
+ 	throtl_update_latency_buckets(td);
+ 
+@@ -2222,7 +2222,7 @@ bool blk_throtl_bio(struct request_queue *q, struct blkcg_gq *blkg,
+ 	}
+ 
+ out_unlock:
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ out:
+ 	bio_set_flag(bio, BIO_THROTTLED);
+ 
+@@ -2343,7 +2343,7 @@ static void tg_drain_bios(struct throtl_service_queue *parent_sq)
+  * Dispatch all currently throttled bios on @q through ->make_request_fn().
+  */
+ void blk_throtl_drain(struct request_queue *q)
+-	__releases(q->queue_lock) __acquires(q->queue_lock)
++	__releases(&q->queue_lock) __acquires(&q->queue_lock)
+ {
+ 	struct throtl_data *td = q->td;
+ 	struct blkcg_gq *blkg;
+@@ -2367,7 +2367,7 @@ void blk_throtl_drain(struct request_queue *q)
+ 	tg_drain_bios(&td->service_queue);
+ 
+ 	rcu_read_unlock();
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ 
+ 	/* all bios now should be in td->service_queue, issue them */
+ 	for (rw = READ; rw <= WRITE; rw++)
+@@ -2375,7 +2375,7 @@ void blk_throtl_drain(struct request_queue *q)
+ 						NULL)))
+ 			generic_make_request(bio);
+ 
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ }
+ 
+ int blk_throtl_init(struct request_queue *q)
+diff --git a/drivers/block/floppy.c b/drivers/block/floppy.c
+index b3a7977baf05..e92a99c899d5 100644
+--- a/drivers/block/floppy.c
++++ b/drivers/block/floppy.c
+@@ -2255,9 +2255,9 @@ static void request_done(int uptodate)
+ 			DRS->maxtrack = 1;
+ 
+ 		/* unlock chained buffers */
+-		spin_lock_irqsave(q->queue_lock, flags);
++		spin_lock_irqsave(&q->queue_lock, flags);
+ 		floppy_end_request(req, 0);
+-		spin_unlock_irqrestore(q->queue_lock, flags);
++		spin_unlock_irqrestore(&q->queue_lock, flags);
+ 	} else {
+ 		if (rq_data_dir(req) == WRITE) {
+ 			/* record write error information */
+@@ -2269,9 +2269,9 @@ static void request_done(int uptodate)
+ 			DRWE->last_error_sector = blk_rq_pos(req);
+ 			DRWE->last_error_generation = DRS->generation;
+ 		}
+-		spin_lock_irqsave(q->queue_lock, flags);
++		spin_lock_irqsave(&q->queue_lock, flags);
+ 		floppy_end_request(req, BLK_STS_IOERR);
+-		spin_unlock_irqrestore(q->queue_lock, flags);
++		spin_unlock_irqrestore(&q->queue_lock, flags);
+ 	}
+ }
+ 
+diff --git a/drivers/block/pktcdvd.c b/drivers/block/pktcdvd.c
+index d77895a8ff90..d0afec697451 100644
+--- a/drivers/block/pktcdvd.c
++++ b/drivers/block/pktcdvd.c
+@@ -2203,9 +2203,9 @@ static int pkt_open_dev(struct pktcdvd_device *pd, fmode_t write)
+ 		 * Some CDRW drives can not handle writes larger than one packet,
+ 		 * even if the size is a multiple of the packet size.
+ 		 */
+-		spin_lock_irq(q->queue_lock);
++		spin_lock_irq(&q->queue_lock);
+ 		blk_queue_max_hw_sectors(q, pd->settings.size);
+-		spin_unlock_irq(q->queue_lock);
++		spin_unlock_irq(&q->queue_lock);
+ 		set_bit(PACKET_WRITABLE, &pd->flags);
+ 	} else {
+ 		pkt_set_speed(pd, MAX_SPEED, MAX_SPEED);
+diff --git a/drivers/ide/ide-pm.c b/drivers/ide/ide-pm.c
+index a8c53c98252d..51fe10ac02fa 100644
+--- a/drivers/ide/ide-pm.c
++++ b/drivers/ide/ide-pm.c
+@@ -44,15 +44,15 @@ static int ide_pm_execute_rq(struct request *rq)
+ {
+ 	struct request_queue *q = rq->q;
+ 
+-	spin_lock_irq(q->queue_lock);
++	spin_lock_irq(&q->queue_lock);
+ 	if (unlikely(blk_queue_dying(q))) {
+ 		rq->rq_flags |= RQF_QUIET;
+ 		scsi_req(rq)->result = -ENXIO;
+-		spin_unlock_irq(q->queue_lock);
++		spin_unlock_irq(&q->queue_lock);
+ 		blk_mq_end_request(rq, BLK_STS_OK);
+ 		return -ENXIO;
+ 	}
+-	spin_unlock_irq(q->queue_lock);
++	spin_unlock_irq(&q->queue_lock);
+ 	blk_execute_rq(q, NULL, rq, true);
+ 
+ 	return scsi_req(rq)->result ? -EIO : 0;
+@@ -214,12 +214,12 @@ void ide_complete_pm_rq(ide_drive_t *drive, struct request *rq)
+ 	printk("%s: completing PM request, %s\n", drive->name,
+ 	       (ide_req(rq)->type == ATA_PRIV_PM_SUSPEND) ? "suspend" : "resume");
+ #endif
+-	spin_lock_irqsave(q->queue_lock, flags);
++	spin_lock_irqsave(&q->queue_lock, flags);
+ 	if (ide_req(rq)->type == ATA_PRIV_PM_SUSPEND)
+ 		blk_mq_stop_hw_queues(q);
+ 	else
+ 		drive->dev_flags &= ~IDE_DFLAG_BLOCKED;
+-	spin_unlock_irqrestore(q->queue_lock, flags);
++	spin_unlock_irqrestore(&q->queue_lock, flags);
+ 
+ 	drive->hwif->rq = NULL;
+ 
+diff --git a/include/linux/blk-cgroup.h b/include/linux/blk-cgroup.h
+index 91435ae5a5fe..d765e568e3e6 100644
+--- a/include/linux/blk-cgroup.h
++++ b/include/linux/blk-cgroup.h
+@@ -771,11 +771,11 @@ static inline bool blkcg_bio_issue_check(struct request_queue *q,
+ 
+ 	blkg = blkg_lookup(blkcg, q);
+ 	if (unlikely(!blkg)) {
+-		spin_lock_irq(q->queue_lock);
++		spin_lock_irq(&q->queue_lock);
+ 		blkg = blkg_lookup_create(blkcg, q);
+ 		if (IS_ERR(blkg))
+ 			blkg = NULL;
+-		spin_unlock_irq(q->queue_lock);
++		spin_unlock_irq(&q->queue_lock);
+ 	}
+ 
+ 	throtl = blk_throtl_bio(q, blkg, bio);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index d486e83425a8..709b2361106c 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -515,13 +515,7 @@ struct request_queue {
+ 	 */
+ 	gfp_t			bounce_gfp;
+ 
+-	/*
+-	 * protects queue structures from reentrancy. ->__queue_lock should
+-	 * _never_ be used directly, it is queue private. always use
+-	 * ->queue_lock.
+-	 */
+-	spinlock_t		__queue_lock;
+-	spinlock_t		*queue_lock;
++	spinlock_t		queue_lock;
+ 
+ 	/*
+ 	 * queue kobject
