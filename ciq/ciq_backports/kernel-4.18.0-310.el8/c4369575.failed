@@ -1,0 +1,130 @@
+RDMA/rxe: Fix bug in rxe_alloc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Bob Pearson <rpearsonhpe@gmail.com>
+commit c4369575b2bc2993edf8223a8f5c9f510ee629d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/c4369575.failed
+
+A recent patch which added an 'unlocked' version of rxe_alloc introduced a
+bug causing kzalloc(..., GFP_KERNEL) to be called while holding a spin
+lock. This patch corrects that error.
+
+rxe_alloc_nl() should always be called while holding the pool->pool_lock
+so the 2nd argument to kzalloc there should be GFP_ATOMIC.
+
+rxe_alloc() prior to the change only locked the code around checking that
+pool->state is RXE_POOL_STATE_VALID to avoid races between working threads
+and a thread shutting down the rxe driver. This patch reverts rxe_alloc()
+to this behavior so the lock is not held when kzalloc() is called.
+
+Link: https://lore.kernel.org/r/20210125211641.2694-2-rpearson@hpe.com
+	Reported-by: syzbot+ec2fd72374785d0e558e@syzkaller.appspotmail.com
+Fixes: 3853c35e243d ("RDMA/rxe: Add unlocked versions of pool APIs")
+	Signed-off-by: Bob Pearson <rpearson@hpe.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit c4369575b2bc2993edf8223a8f5c9f510ee629d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe_pool.c
+diff --cc drivers/infiniband/sw/rxe/rxe_pool.c
+index 3727f20dbe87,cfcd55175572..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_pool.c
++++ b/drivers/infiniband/sw/rxe/rxe_pool.c
+@@@ -365,20 -337,16 +365,24 @@@ void __rxe_drop_index(struct rxe_pool_e
+  	write_unlock_irqrestore(&pool->pool_lock, flags);
+  }
+  
+ -void *rxe_alloc_nl(struct rxe_pool *pool)
+ +void *rxe_alloc(struct rxe_pool *pool)
+  {
+ -	struct rxe_type_info *info = &rxe_type_info[pool->type];
+  	struct rxe_pool_entry *elem;
+ -	u8 *obj;
+ +	unsigned long flags;
+ +
+++<<<<<<< HEAD
+ +	might_sleep_if(!(pool->flags & RXE_POOL_ATOMIC));
+  
+ +	read_lock_irqsave(&pool->pool_lock, flags);
+ +	if (pool->state != RXE_POOL_STATE_VALID) {
+ +		read_unlock_irqrestore(&pool->pool_lock, flags);
+++=======
++ 	if (pool->state != RXE_POOL_STATE_VALID)
+++>>>>>>> c4369575b2bc (RDMA/rxe: Fix bug in rxe_alloc())
+  		return NULL;
+ -
+ +	}
+  	kref_get(&pool->ref_cnt);
+ +	read_unlock_irqrestore(&pool->pool_lock, flags);
+  
+  	if (!ib_device_try_get(&pool->rxe->ib_dev))
+  		goto out_put_pool;
+@@@ -386,12 -354,56 +390,61 @@@
+  	if (atomic_inc_return(&pool->num_elem) > pool->max_elem)
+  		goto out_cnt;
+  
+++<<<<<<< HEAD
+ +	elem = kmem_cache_zalloc(pool_cache(pool),
+ +				 (pool->flags & RXE_POOL_ATOMIC) ?
+ +				 GFP_ATOMIC : GFP_KERNEL);
+ +	if (!elem)
+++=======
++ 	obj = kzalloc(info->size, GFP_ATOMIC);
++ 	if (!obj)
++ 		goto out_cnt;
++ 
++ 	elem = (struct rxe_pool_entry *)(obj + info->elem_offset);
++ 
++ 	elem->pool = pool;
++ 	kref_init(&elem->ref_cnt);
++ 
++ 	return obj;
++ 
++ out_cnt:
++ 	atomic_dec(&pool->num_elem);
++ 	ib_device_put(&pool->rxe->ib_dev);
++ out_put_pool:
++ 	rxe_pool_put(pool);
++ 	return NULL;
++ }
++ 
++ void *rxe_alloc(struct rxe_pool *pool)
++ {
++ 	unsigned long flags;
++ 	struct rxe_type_info *info = &rxe_type_info[pool->type];
++ 	struct rxe_pool_entry *elem;
++ 	u8 *obj;
++ 
++ 	might_sleep_if(!(pool->flags & RXE_POOL_ATOMIC));
++ 
++ 	read_lock_irqsave(&pool->pool_lock, flags);
++ 	if (pool->state != RXE_POOL_STATE_VALID) {
++ 		read_unlock_irqrestore(&pool->pool_lock, flags);
++ 		return NULL;
++ 	}
++ 
++ 	kref_get(&pool->ref_cnt);
++ 	read_unlock_irqrestore(&pool->pool_lock, flags);
++ 
++ 	if (!ib_device_try_get(&pool->rxe->ib_dev))
++ 		goto out_put_pool;
++ 
++ 	if (atomic_inc_return(&pool->num_elem) > pool->max_elem)
++ 		goto out_cnt;
++ 
++ 	obj = kzalloc(info->size, (pool->flags & RXE_POOL_ATOMIC) ?
++ 		      GFP_ATOMIC : GFP_KERNEL);
++ 	if (!obj)
+++>>>>>>> c4369575b2bc (RDMA/rxe: Fix bug in rxe_alloc())
+  		goto out_cnt;
+  
+ -	elem = (struct rxe_pool_entry *)(obj + info->elem_offset);
+ -
+  	elem->pool = pool;
+  	kref_init(&elem->ref_cnt);
+  
+* Unmerged path drivers/infiniband/sw/rxe/rxe_pool.c
