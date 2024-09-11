@@ -1,0 +1,376 @@
+KVM: x86/mmu: clean up prefetch/prefault/speculative naming
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 2839180ce5bb27ad5e1f092fdafede284a925e5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/2839180c.failed
+
+"prefetch", "prefault" and "speculative" are used throughout KVM to mean
+the same thing.  Use a single name, standardizing on "prefetch" which
+is already used by various functions such as direct_pte_prefetch,
+FNAME(prefetch_gpte), FNAME(pte_prefetch), etc.
+
+	Suggested-by: David Matlack <dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 2839180ce5bb27ad5e1f092fdafede284a925e5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/mmu/mmu_internal.h
+#	arch/x86/kvm/mmu/spte.c
+#	arch/x86/kvm/mmu/spte.h
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 8ec545b124be,43ee10181459..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -2581,9 -2572,11 +2581,14 @@@ static void kvm_unsync_page(struct kvm_
+   * were marked unsync (or if there is no shadow page), -EPERM if the SPTE must
+   * be write-protected.
+   */
+++<<<<<<< HEAD
+ +int mmu_try_to_unsync_pages(struct kvm_vcpu *vcpu, gfn_t gfn, bool can_unsync)
+++=======
++ int mmu_try_to_unsync_pages(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
++ 			    gfn_t gfn, bool can_unsync, bool prefetch)
+++>>>>>>> 2839180ce5bb (KVM: x86/mmu: clean up prefetch/prefault/speculative naming)
+  {
+  	struct kvm_mmu_page *sp;
+ -	bool locked = false;
+  
+  	/*
+  	 * Force write-protection if the page is being tracked.  Note, the page
+@@@ -2606,6 -2599,32 +2611,35 @@@
+  		if (sp->unsync)
+  			continue;
+  
+++<<<<<<< HEAD
+++=======
++ 		if (prefetch)
++ 			return -EEXIST;
++ 
++ 		/*
++ 		 * TDP MMU page faults require an additional spinlock as they
++ 		 * run with mmu_lock held for read, not write, and the unsync
++ 		 * logic is not thread safe.  Take the spinklock regardless of
++ 		 * the MMU type to avoid extra conditionals/parameters, there's
++ 		 * no meaningful penalty if mmu_lock is held for write.
++ 		 */
++ 		if (!locked) {
++ 			locked = true;
++ 			spin_lock(&vcpu->kvm->arch.mmu_unsync_pages_lock);
++ 
++ 			/*
++ 			 * Recheck after taking the spinlock, a different vCPU
++ 			 * may have since marked the page unsync.  A false
++ 			 * positive on the unprotected check above is not
++ 			 * possible as clearing sp->unsync _must_ hold mmu_lock
++ 			 * for write, i.e. unsync cannot transition from 0->1
++ 			 * while this CPU holds mmu_lock for read (or write).
++ 			 */
++ 			if (READ_ONCE(sp->unsync))
++ 				continue;
++ 		}
++ 
+++>>>>>>> 2839180ce5bb (KVM: x86/mmu: clean up prefetch/prefault/speculative naming)
+  		WARN_ON(sp->role.level != PG_LEVEL_4K);
+  		kvm_unsync_page(vcpu, sp);
+  	}
+@@@ -2652,40 -2673,22 +2686,50 @@@
+  	return 0;
+  }
+  
+ -static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
+ -			u64 *sptep, unsigned int pte_access, gfn_t gfn,
+ -			kvm_pfn_t pfn, struct kvm_page_fault *fault)
+ +static int set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
+ +		    unsigned int pte_access, int level,
+ +		    gfn_t gfn, kvm_pfn_t pfn, bool speculative,
+ +		    bool can_unsync, bool host_writable)
+ +{
+ +	u64 spte;
+ +	struct kvm_mmu_page *sp;
+ +	int ret;
+ +
+ +	sp = sptep_to_sp(sptep);
+ +
+ +	ret = make_spte(vcpu, pte_access, level, gfn, pfn, *sptep, speculative,
+ +			can_unsync, host_writable, sp_ad_disabled(sp), &spte);
+ +
+ +	if (spte & PT_WRITABLE_MASK)
+ +		kvm_vcpu_mark_page_dirty(vcpu, gfn);
+ +
+ +	if (*sptep == spte)
+ +		ret |= SET_SPTE_SPURIOUS;
+ +	else if (mmu_spte_update(sptep, spte))
+ +		ret |= SET_SPTE_NEED_REMOTE_TLB_FLUSH;
+ +	return ret;
+ +}
+ +
+ +static int mmu_set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
+ +			unsigned int pte_access, bool write_fault, int level,
+ +			gfn_t gfn, kvm_pfn_t pfn, bool speculative,
+ +			bool host_writable)
+  {
+ -	struct kvm_mmu_page *sp = sptep_to_sp(sptep);
+ -	int level = sp->role.level;
+  	int was_rmapped = 0;
+ +	int rmap_count;
+ +	int set_spte_ret;
+  	int ret = RET_PF_FIXED;
+  	bool flush = false;
+++<<<<<<< HEAD
+++=======
++ 	bool wrprot;
++ 	u64 spte;
++ 
++ 	/* Prefetching always gets a writable pfn.  */
++ 	bool host_writable = !fault || fault->map_writable;
++ 	bool prefetch = !fault || fault->prefetch;
++ 	bool write_fault = fault && fault->write;
+++>>>>>>> 2839180ce5bb (KVM: x86/mmu: clean up prefetch/prefault/speculative naming)
+  
+  	pgprintk("%s: spte %llx write_fault %d gfn %llx\n", __func__,
+  		 *sptep, write_fault, gfn);
+@@@ -2716,9 -2719,17 +2760,23 @@@
+  			was_rmapped = 1;
+  	}
+  
+++<<<<<<< HEAD
+ +	set_spte_ret = set_spte(vcpu, sptep, pte_access, level, gfn, pfn,
+ +				speculative, true, host_writable);
+ +	if (set_spte_ret & SET_SPTE_WRITE_PROTECTED_PT) {
+++=======
++ 	wrprot = make_spte(vcpu, sp, slot, pte_access, gfn, pfn, *sptep, prefetch,
++ 			   true, host_writable, &spte);
++ 
++ 	if (*sptep == spte) {
++ 		ret = RET_PF_SPURIOUS;
++ 	} else {
++ 		trace_kvm_mmu_set_spte(level, gfn, sptep);
++ 		flush |= mmu_spte_update(sptep, spte);
++ 	}
++ 
++ 	if (wrprot) {
+++>>>>>>> 2839180ce5bb (KVM: x86/mmu: clean up prefetch/prefault/speculative naming)
+  		if (write_fault)
+  			ret = RET_PF_EMULATE;
+  	}
+@@@ -3893,13 -3923,13 +3951,20 @@@ static bool kvm_faultin_pfn(struct kvm_
+  	if (!async)
+  		return false; /* *pfn has correct page already */
+  
+++<<<<<<< HEAD
+ +	if (!prefault && kvm_can_do_async_pf(vcpu)) {
+ +		trace_kvm_try_async_get_page(cr2_or_gpa, gfn);
+ +		if (kvm_find_async_pf_gfn(vcpu, gfn)) {
+ +			trace_kvm_async_pf_doublefault(cr2_or_gpa, gfn);
+++=======
++ 	if (!fault->prefetch && kvm_can_do_async_pf(vcpu)) {
++ 		trace_kvm_try_async_get_page(fault->addr, fault->gfn);
++ 		if (kvm_find_async_pf_gfn(vcpu, fault->gfn)) {
++ 			trace_kvm_async_pf_doublefault(fault->addr, fault->gfn);
+++>>>>>>> 2839180ce5bb (KVM: x86/mmu: clean up prefetch/prefault/speculative naming)
+  			kvm_make_request(KVM_REQ_APF_HALT, vcpu);
+  			goto out_retry;
+ -		} else if (kvm_arch_setup_async_pf(vcpu, fault->addr, fault->gfn))
+ +		} else if (kvm_arch_setup_async_pf(vcpu, cr2_or_gpa, gfn))
+  			goto out_retry;
+  	}
+  
+diff --cc arch/x86/kvm/mmu/mmu_internal.h
+index 5ac367b7f49f,52c6527b1a06..000000000000
+--- a/arch/x86/kvm/mmu/mmu_internal.h
++++ b/arch/x86/kvm/mmu/mmu_internal.h
+@@@ -119,16 -118,11 +119,21 @@@ static inline bool kvm_vcpu_ad_need_wri
+  	       kvm_x86_ops.cpu_dirty_log_size;
+  }
+  
+++<<<<<<< HEAD
+ +extern int nx_huge_pages;
+ +static inline bool is_nx_huge_page_enabled(void)
+ +{
+ +	return READ_ONCE(nx_huge_pages);
+ +}
+++=======
++ int mmu_try_to_unsync_pages(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
++ 			    gfn_t gfn, bool can_unsync, bool prefetch);
+++>>>>>>> 2839180ce5bb (KVM: x86/mmu: clean up prefetch/prefault/speculative naming)
+  
+ -void kvm_mmu_gfn_disallow_lpage(const struct kvm_memory_slot *slot, gfn_t gfn);
+ -void kvm_mmu_gfn_allow_lpage(const struct kvm_memory_slot *slot, gfn_t gfn);
+ +int mmu_try_to_unsync_pages(struct kvm_vcpu *vcpu, gfn_t gfn, bool can_unsync);
+ +
+ +void kvm_mmu_gfn_disallow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+ +void kvm_mmu_gfn_allow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+  bool kvm_mmu_slot_gfn_write_protect(struct kvm *kvm,
+  				    struct kvm_memory_slot *slot, u64 gfn,
+  				    int min_level);
+diff --cc arch/x86/kvm/mmu/spte.c
+index 86a21eb85d25,0c76c45fdb68..000000000000
+--- a/arch/x86/kvm/mmu/spte.c
++++ b/arch/x86/kvm/mmu/spte.c
+@@@ -89,15 -89,17 +89,23 @@@ static bool kvm_is_mmio_pfn(kvm_pfn_t p
+  				     E820_TYPE_RAM);
+  }
+  
+++<<<<<<< HEAD
+ +int make_spte(struct kvm_vcpu *vcpu, unsigned int pte_access, int level,
+ +		     gfn_t gfn, kvm_pfn_t pfn, u64 old_spte, bool speculative,
+ +		     bool can_unsync, bool host_writable, bool ad_disabled,
+ +		     u64 *new_spte)
+++=======
++ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
++ 	       struct kvm_memory_slot *slot,
++ 	       unsigned int pte_access, gfn_t gfn, kvm_pfn_t pfn,
++ 	       u64 old_spte, bool prefetch, bool can_unsync,
++ 	       bool host_writable, u64 *new_spte)
+++>>>>>>> 2839180ce5bb (KVM: x86/mmu: clean up prefetch/prefault/speculative naming)
+  {
+ -	int level = sp->role.level;
+  	u64 spte = SPTE_MMU_PRESENT_MASK;
+ -	bool wrprot = false;
+ +	int ret = 0;
+  
+ -	if (sp->role.ad_disabled)
+ +	if (ad_disabled)
+  		spte |= SPTE_TDP_AD_DISABLED_MASK;
+  	else if (kvm_vcpu_ad_need_write_protect(vcpu))
+  		spte |= SPTE_TDP_AD_WRPROT_ONLY_MASK;
+@@@ -159,10 -161,10 +167,14 @@@
+  		 * e.g. it's write-tracked (upper-level SPs) or has one or more
+  		 * shadow pages and unsync'ing pages is not allowed.
+  		 */
+++<<<<<<< HEAD
+ +		if (mmu_try_to_unsync_pages(vcpu, gfn, can_unsync)) {
+++=======
++ 		if (mmu_try_to_unsync_pages(vcpu, slot, gfn, can_unsync, prefetch)) {
+++>>>>>>> 2839180ce5bb (KVM: x86/mmu: clean up prefetch/prefault/speculative naming)
+  			pgprintk("%s: found shadow page for %llx, marking ro\n",
+  				 __func__, gfn);
+ -			wrprot = true;
+ +			ret |= SET_SPTE_WRITE_PROTECTED_PT;
+  			pte_access &= ~ACC_WRITE_MASK;
+  			spte &= ~(PT_WRITABLE_MASK | shadow_mmu_writable_mask);
+  		}
+diff --cc arch/x86/kvm/mmu/spte.h
+index 31d6456d8ac3,cc432f9a966b..000000000000
+--- a/arch/x86/kvm/mmu/spte.h
++++ b/arch/x86/kvm/mmu/spte.h
+@@@ -329,15 -329,11 +329,23 @@@ static inline u64 get_mmio_spte_generat
+  	return gen;
+  }
+  
+++<<<<<<< HEAD
+ +/* Bits which may be returned by set_spte() */
+ +#define SET_SPTE_WRITE_PROTECTED_PT    BIT(0)
+ +#define SET_SPTE_NEED_REMOTE_TLB_FLUSH BIT(1)
+ +#define SET_SPTE_SPURIOUS              BIT(2)
+ +
+ +int make_spte(struct kvm_vcpu *vcpu, unsigned int pte_access, int level,
+ +		     gfn_t gfn, kvm_pfn_t pfn, u64 old_spte, bool speculative,
+ +		     bool can_unsync, bool host_writable, bool ad_disabled,
+ +		     u64 *new_spte);
+++=======
++ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
++ 	       struct kvm_memory_slot *slot,
++ 	       unsigned int pte_access, gfn_t gfn, kvm_pfn_t pfn,
++ 	       u64 old_spte, bool prefetch, bool can_unsync,
++ 	       bool host_writable, u64 *new_spte);
+++>>>>>>> 2839180ce5bb (KVM: x86/mmu: clean up prefetch/prefault/speculative naming)
+  u64 make_nonleaf_spte(u64 *child_pt, bool ad_disabled);
+  u64 make_mmio_spte(struct kvm_vcpu *vcpu, u64 gfn, unsigned int access);
+  u64 mark_spte_for_access_track(u64 spte);
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 8e1489964d2a,7c5dd83e52de..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -863,22 -893,22 +863,28 @@@ void kvm_tdp_mmu_invalidate_all_roots(s
+   * Installs a last-level SPTE to handle a TDP page fault.
+   * (NPT/EPT violation/misconfiguration)
+   */
+ -static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
+ -					  struct kvm_page_fault *fault,
+ -					  struct tdp_iter *iter)
+ +static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu, int write,
+ +					  int map_writable,
+ +					  struct tdp_iter *iter,
+ +					  kvm_pfn_t pfn, bool prefault)
+  {
+ -	struct kvm_mmu_page *sp = sptep_to_sp(iter->sptep);
+  	u64 new_spte;
+  	int ret = RET_PF_FIXED;
+ -	bool wrprot = false;
+ +	int make_spte_ret = 0;
+  
+ -	WARN_ON(sp->role.level != fault->goal_level);
+ -	if (unlikely(!fault->slot))
+ +	if (unlikely(is_noslot_pfn(pfn)))
+  		new_spte = make_mmio_spte(vcpu, iter->gfn, ACC_ALL);
+  	else
+++<<<<<<< HEAD
+ +		make_spte_ret = make_spte(vcpu, ACC_ALL, iter->level, iter->gfn,
+ +					 pfn, iter->old_spte, prefault, true,
+ +					 map_writable, !shadow_accessed_mask,
+ +					 &new_spte);
+++=======
++ 		wrprot = make_spte(vcpu, sp, fault->slot, ACC_ALL, iter->gfn,
++ 					 fault->pfn, iter->old_spte, fault->prefetch, true,
++ 					 fault->map_writable, &new_spte);
+++>>>>>>> 2839180ce5bb (KVM: x86/mmu: clean up prefetch/prefault/speculative naming)
+  
+  	if (new_spte == iter->old_spte)
+  		ret = RET_PF_SPURIOUS;
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index 58b438826461..8491c77d5a86 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -117,7 +117,7 @@ struct kvm_page_fault {
+ 	/* arguments to kvm_mmu_do_page_fault.  */
+ 	const gpa_t addr;
+ 	const u32 error_code;
+-	const bool prefault;
++	const bool prefetch;
+ 
+ 	/* Derived from error_code.  */
+ 	const bool exec;
+@@ -139,7 +139,7 @@ struct kvm_page_fault {
+ int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault);
+ 
+ static inline int kvm_mmu_do_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+-					u32 err, bool prefault)
++					u32 err, bool prefetch)
+ {
+ 	struct kvm_page_fault fault = {
+ 		.addr = cr2_or_gpa,
+@@ -149,7 +149,7 @@ static inline int kvm_mmu_do_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+ 		.present = err & PFERR_PRESENT_MASK,
+ 		.rsvd = err & PFERR_RSVD_MASK,
+ 		.user = err & PFERR_USER_MASK,
+-		.prefault = prefault,
++		.prefetch = prefetch,
+ 		.is_tdp = likely(vcpu->arch.mmu->page_fault == kvm_tdp_page_fault),
+ 
+ 		.max_level = KVM_MAX_HUGEPAGE_LEVEL,
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+* Unmerged path arch/x86/kvm/mmu/mmu_internal.h
+diff --git a/arch/x86/kvm/mmu/paging_tmpl.h b/arch/x86/kvm/mmu/paging_tmpl.h
+index de3ee26beb48..f334d3bb307d 100644
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@ -863,7 +863,7 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 	 */
+ 	if (!r) {
+ 		pgprintk("%s: guest page fault\n", __func__);
+-		if (!fault->prefault)
++		if (!fault->prefetch)
+ 			kvm_inject_emulated_page_fault(vcpu, &walker.fault);
+ 
+ 		return RET_PF_RETRY;
+* Unmerged path arch/x86/kvm/mmu/spte.c
+* Unmerged path arch/x86/kvm/mmu/spte.h
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
