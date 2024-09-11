@@ -1,0 +1,249 @@
+bpf, xdp: Maintain info on attached XDP BPF programs in net_device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 7f0a838254bdd9114b978ef2541a6ce330307e9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/7f0a8382.failed
+
+Instead of delegating to drivers, maintain information about which BPF
+programs are attached in which XDP modes (generic/skb, driver, or hardware)
+locally in net_device. This effectively obsoletes XDP_QUERY_PROG command.
+
+Such re-organization simplifies existing code already. But it also allows to
+further add bpf_link-based XDP attachments without drivers having to know
+about any of this at all, which seems like a good setup.
+XDP_SETUP_PROG/XDP_SETUP_PROG_HW are just low-level commands to driver to
+install/uninstall active BPF program. All the higher-level concerns about
+prog/link interaction will be contained within generic driver-agnostic logic.
+
+All the XDP_QUERY_PROG calls to driver in dev_xdp_uninstall() were removed.
+It's not clear for me why dev_xdp_uninstall() were passing previous prog_flags
+when resetting installed programs. That seems unnecessary, plus most drivers
+don't populate prog_flags anyways. Having XDP_SETUP_PROG vs XDP_SETUP_PROG_HW
+should be enough of an indicator of what is required of driver to correctly
+reset active BPF program. dev_xdp_uninstall() is also generalized as an
+iteration over all three supported mode.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200722064603.3350758-3-andriin@fb.com
+(cherry picked from commit 7f0a838254bdd9114b978ef2541a6ce330307e9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/core/dev.c
+diff --cc include/linux/netdevice.h
+index 9bd71ddf715b,cad44b40c776..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -2222,54 -2140,22 +2233,66 @@@ struct net_device 
+  #endif
+  	struct phy_device	*phydev;
+  	struct sfp_bus		*sfp_bus;
+ -	struct lock_class_key	*qdisc_tx_busylock;
+ -	struct lock_class_key	*qdisc_running_key;
+ +	RH_KABI_DEPRECATE(struct lock_class_key	*, qdisc_tx_busylock)
+ +	RH_KABI_DEPRECATE(struct lock_class_key	*, qdisc_running_key)
+ +	/* RHEL: The KABI breakage here is not real. We are inserting
+ +	 * 4 fields of type struct lock_class_key but the size of this
+ +	 * structure is zero for non-debug kernel configs because
+ +	 * LOCKDEP is not enabled for them and for debug flavours
+ +	 * KABI is not preserved.
+ +	 */
+ +	RH_KABI_BROKEN_INSERT(struct lock_class_key qdisc_tx_busylock_key)
+ +	RH_KABI_BROKEN_INSERT(struct lock_class_key qdisc_running_key)
+ +	RH_KABI_BROKEN_INSERT(struct lock_class_key qdisc_xmit_lock_key)
+ +	RH_KABI_BROKEN_INSERT(struct lock_class_key addr_list_lock_key)
+  	bool			proto_down;
+ -	unsigned		wol_enabled:1;
+ -
+ -	struct list_head	net_notifier_list;
+ -
+ +	RH_KABI_FILL_HOLE(unsigned	wol_enabled:1)
+ +
+ +	/* 23 bits hole remain and... */
+ +	/* 4 bytes hole remain prior RH_KABI reservations below */
+ +
+++<<<<<<< HEAD
+ +	RH_KABI_USE(1, struct mpls_dev __rcu   *mpls_ptr)
+ +	RH_KABI_USE(2, 3, struct list_head	net_notifier_list)
+ +	RH_KABI_USE(4, struct xdp_dev_bulk_queue __percpu *xdp_bulkq)
+ +	RH_KABI_RESERVE(5)
+ +	RH_KABI_RESERVE(6)
+ +	RH_KABI_RESERVE(7)
+ +	RH_KABI_RESERVE(8)
+ +	RH_KABI_RESERVE(9)
+ +	RH_KABI_RESERVE(10)
+ +	RH_KABI_RESERVE(11)
+ +	RH_KABI_RESERVE(12)
+ +	RH_KABI_RESERVE(13)
+ +	RH_KABI_RESERVE(14)
+ +	RH_KABI_RESERVE(15)
+ +	RH_KABI_RESERVE(16)
+ +	RH_KABI_RESERVE(17)
+ +	RH_KABI_RESERVE(18)
+ +	RH_KABI_RESERVE(19)
+ +	RH_KABI_RESERVE(20)
+ +	RH_KABI_RESERVE(21)
+ +	RH_KABI_RESERVE(22)
+ +	RH_KABI_RESERVE(23)
+ +	RH_KABI_RESERVE(24)
+ +	RH_KABI_RESERVE(25)
+ +	RH_KABI_RESERVE(26)
+ +	RH_KABI_RESERVE(27)
+ +	RH_KABI_RESERVE(28)
+ +	RH_KABI_RESERVE(29)
+ +	RH_KABI_RESERVE(30)
+ +	RH_KABI_AUX_PTR(net_device_extended)
+++=======
++ #if IS_ENABLED(CONFIG_MACSEC)
++ 	/* MACsec management functions */
++ 	const struct macsec_ops *macsec_ops;
++ #endif
++ 	const struct udp_tunnel_nic_info	*udp_tunnel_nic_info;
++ 	struct udp_tunnel_nic	*udp_tunnel_nic;
++ 
++ 	/* protected by rtnl_lock */
++ 	struct bpf_xdp_entity	xdp_state[__MAX_XDP_MODE];
+++>>>>>>> 7f0a838254bd (bpf, xdp: Maintain info on attached XDP BPF programs in net_device)
+  };
+  #define to_net_dev(d) container_of(d, struct net_device, dev)
+  
+diff --cc net/core/dev.c
+index 2404a0d99788,bf38fde667e9..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -8230,29 -8697,70 +8230,75 @@@ int dev_change_proto_down(struct net_de
+  }
+  EXPORT_SYMBOL(dev_change_proto_down);
+  
+++<<<<<<< HEAD
+ +u32 __dev_xdp_query(struct net_device *dev, bpf_op_t bpf_op,
+ +		    enum bpf_netdev_command cmd)
+++=======
++ /**
++  *	dev_change_proto_down_generic - generic implementation for
++  * 	ndo_change_proto_down that sets carrier according to
++  * 	proto_down.
++  *
++  *	@dev: device
++  *	@proto_down: new value
++  */
++ int dev_change_proto_down_generic(struct net_device *dev, bool proto_down)
+  {
+- 	struct netdev_bpf xdp;
++ 	if (proto_down)
++ 		netif_carrier_off(dev);
++ 	else
++ 		netif_carrier_on(dev);
++ 	dev->proto_down = proto_down;
++ 	return 0;
++ }
++ EXPORT_SYMBOL(dev_change_proto_down_generic);
+  
+- 	if (!bpf_op)
+- 		return 0;
++ static enum bpf_xdp_mode dev_xdp_mode(u32 flags)
+++>>>>>>> 7f0a838254bd (bpf, xdp: Maintain info on attached XDP BPF programs in net_device)
++ {
++ 	if (flags & XDP_FLAGS_HW_MODE)
++ 		return XDP_MODE_HW;
++ 	if (flags & XDP_FLAGS_DRV_MODE)
++ 		return XDP_MODE_DRV;
++ 	return XDP_MODE_SKB;
++ }
+  
+- 	memset(&xdp, 0, sizeof(xdp));
+- 	xdp.command = cmd;
++ static bpf_op_t dev_xdp_bpf_op(struct net_device *dev, enum bpf_xdp_mode mode)
++ {
++ 	switch (mode) {
++ 	case XDP_MODE_SKB:
++ 		return generic_xdp_install;
++ 	case XDP_MODE_DRV:
++ 	case XDP_MODE_HW:
++ 		return dev->netdev_ops->ndo_bpf;
++ 	default:
++ 		return NULL;
++ 	};
++ }
+  
+- 	/* Query must always succeed. */
+- 	WARN_ON(bpf_op(dev, &xdp) < 0 && cmd == XDP_QUERY_PROG);
++ static struct bpf_prog *dev_xdp_prog(struct net_device *dev,
++ 				     enum bpf_xdp_mode mode)
++ {
++ 	return dev->xdp_state[mode].prog;
++ }
+  
+- 	return xdp.prog_id;
++ u32 dev_xdp_prog_id(struct net_device *dev, enum bpf_xdp_mode mode)
++ {
++ 	struct bpf_prog *prog = dev_xdp_prog(dev, mode);
++ 
++ 	return prog ? prog->aux->id : 0;
++ }
++ 
++ static void dev_xdp_set_prog(struct net_device *dev, enum bpf_xdp_mode mode,
++ 			     struct bpf_prog *prog)
++ {
++ 	dev->xdp_state[mode].prog = prog;
+  }
+  
+- static int dev_xdp_install(struct net_device *dev, bpf_op_t bpf_op,
+- 			   struct netlink_ext_ack *extack, u32 flags,
+- 			   struct bpf_prog *prog)
++ static int dev_xdp_install(struct net_device *dev, enum bpf_xdp_mode mode,
++ 			   bpf_op_t bpf_op, struct netlink_ext_ack *extack,
++ 			   u32 flags, struct bpf_prog *prog)
+  {
+- 	bool non_hw = !(flags & XDP_FLAGS_HW_MODE);
+- 	struct bpf_prog *prev_prog = NULL;
+  	struct netdev_bpf xdp;
+  	int err;
+  
+@@@ -8333,13 -8838,8 +8376,18 @@@ int dev_change_xdp_fd(struct net_devic
+  
+  	ASSERT_RTNL();
+  
+++<<<<<<< HEAD
+ +	rh_mark_used_feature("eBPF/xdp");
+ +
+ +	offload = flags & XDP_FLAGS_HW_MODE;
+ +	query = offload ? XDP_QUERY_PROG_HW : XDP_QUERY_PROG;
+ +
+ +	bpf_op = bpf_chk = ops->ndo_bpf;
+ +	if (!bpf_op && (flags & (XDP_FLAGS_DRV_MODE | XDP_FLAGS_HW_MODE))) {
+++=======
++ 	bpf_op = dev_xdp_bpf_op(dev, mode);
++ 	if (!bpf_op) {
+++>>>>>>> 7f0a838254bd (bpf, xdp: Maintain info on attached XDP BPF programs in net_device)
+  		NL_SET_ERR_MSG(extack, "underlying driver does not support XDP in native mode");
+  		return -EOPNOTSUPP;
+  	}
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index 3d59e813523a..b42157bd5c89 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -1420,13 +1420,12 @@ static u32 rtnl_xdp_prog_skb(struct net_device *dev)
+ 
+ static u32 rtnl_xdp_prog_drv(struct net_device *dev)
+ {
+-	return __dev_xdp_query(dev, dev->netdev_ops->ndo_bpf, XDP_QUERY_PROG);
++	return dev_xdp_prog_id(dev, XDP_MODE_DRV);
+ }
+ 
+ static u32 rtnl_xdp_prog_hw(struct net_device *dev)
+ {
+-	return __dev_xdp_query(dev, dev->netdev_ops->ndo_bpf,
+-			       XDP_QUERY_PROG_HW);
++	return dev_xdp_prog_id(dev, XDP_MODE_HW);
+ }
+ 
+ static int rtnl_xdp_report_one(struct sk_buff *skb, struct net_device *dev,
