@@ -1,0 +1,181 @@
+powerpc/spinlocks: Fix oops in __spin_yield() on bare metal
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christopher M. Riedl <cmr@informatik.wtf>
+commit 405efc5980f2590a9520dc66cfe295456b8c9818
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/405efc59.failed
+
+Booting w/ppc64le_defconfig + CONFIG_PREEMPT on bare metal results in
+the oops below due to calling into __spin_yield() when not running in
+an SPLPAR, which means lppaca pointers are NULL.
+
+We fixed a similar case previously in commit a6201da34ff9 ("powerpc:
+Fix oops due to bad access of lppaca on bare metal"), by adding SPLPAR
+checks in lppaca_shared_proc(). However when PREEMPT is enabled we can
+call __spin_yield() directly from arch_spin_yield().
+
+To fix it add spin_yield() and rw_yield() which check that
+shared-processor LPAR is enabled before calling the SPLPAR-only
+implementation of each.
+
+  BUG: Kernel NULL pointer dereference at 0x00000100
+  Faulting instruction address: 0xc000000000097f88
+  Oops: Kernel access of bad area, sig: 7 [#1]
+  LE PAGE_SIZE=64K MMU=Radix MMU=Hash PREEMPT SMP NR_CPUS=2048 NUMA PowerNV
+  Modules linked in:
+  CPU: 0 PID: 2 Comm: kthreadd Not tainted 5.2.0-rc6-00491-g249155c20f9b #28
+  NIP:  c000000000097f88 LR: c000000000c07a88 CTR: c00000000015ca10
+  REGS: c0000000727079f0 TRAP: 0300   Not tainted  (5.2.0-rc6-00491-g249155c20f9b)
+  MSR:  9000000002009033 <SF,HV,VEC,EE,ME,IR,DR,RI,LE>  CR: 84000424  XER: 20040000
+  CFAR: c000000000c07a84 DAR: 0000000000000100 DSISR: 00080000 IRQMASK: 1
+  GPR00: c000000000c07a88 c000000072707c80 c000000001546300 c00000007be38a80
+  GPR04: c0000000726f0c00 0000000000000002 c00000007279c980 0000000000000100
+  GPR08: c000000001581b78 0000000080000001 0000000000000008 c00000007279c9b0
+  GPR12: 0000000000000000 c000000001730000 c000000000142558 0000000000000000
+  GPR16: 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+  GPR20: 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+  GPR24: c00000007be38a80 c000000000c002f4 0000000000000000 0000000000000000
+  GPR28: c000000072221a00 c0000000726c2600 c00000007be38a80 c00000007be38a80
+  NIP [c000000000097f88] __spin_yield+0x48/0xa0
+  LR [c000000000c07a88] __raw_spin_lock+0xb8/0xc0
+  Call Trace:
+  [c000000072707c80] [c000000072221a00] 0xc000000072221a00 (unreliable)
+  [c000000072707cb0] [c000000000bffb0c] __schedule+0xbc/0x850
+  [c000000072707d70] [c000000000c002f4] schedule+0x54/0x130
+  [c000000072707da0] [c0000000001427dc] kthreadd+0x28c/0x2b0
+  [c000000072707e20] [c00000000000c1cc] ret_from_kernel_thread+0x5c/0x70
+  Instruction dump:
+  4d9e0020 552a043e 210a07ff 79080fe0 0b080000 3d020004 3908b878 794a1f24
+  e8e80000 7ce7502a e8e70000 38e70100 <7ca03c2c> 70a70001 78a50020 4d820020
+  ---[ end trace 474d6b2b8fc5cb7e ]---
+
+Fixes: 499dcd41378e ("powerpc/64s: Allocate LPPACAs individually")
+	Signed-off-by: Christopher M. Riedl <cmr@informatik.wtf>
+[mpe: Reword change log a bit]
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20190813031314.1828-4-cmr@informatik.wtf
+(cherry picked from commit 405efc5980f2590a9520dc66cfe295456b8c9818)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/spinlock.h
+diff --cc arch/powerpc/include/asm/spinlock.h
+index b322a6b3c984,e9a960e28f3c..000000000000
+--- a/arch/powerpc/include/asm/spinlock.h
++++ b/arch/powerpc/include/asm/spinlock.h
+@@@ -108,15 -101,43 +108,55 @@@ static inline int arch_spin_trylock(arc
+  
+  #if defined(CONFIG_PPC_SPLPAR)
+  /* We only yield to the hypervisor if we are in shared processor mode */
+++<<<<<<< HEAD
+ +#define SHARED_PROCESSOR (static_branch_unlikely(&shared_processor))
+ +extern void __spin_yield(arch_spinlock_t *lock);
+ +extern void __rw_yield(arch_rwlock_t *lock);
+ +#else /* SPLPAR */
+ +#define __spin_yield(x)	barrier()
+ +#define __rw_yield(x)	barrier()
+ +#define SHARED_PROCESSOR	0
+ +#endif
+ +
+++=======
++ void splpar_spin_yield(arch_spinlock_t *lock);
++ void splpar_rw_yield(arch_rwlock_t *lock);
++ #else /* SPLPAR */
++ static inline void splpar_spin_yield(arch_spinlock_t *lock) {};
++ static inline void splpar_rw_yield(arch_rwlock_t *lock) {};
++ #endif
++ 
++ static inline bool is_shared_processor(void)
++ {
++ /*
++  * LPPACA is only available on Pseries so guard anything LPPACA related to
++  * allow other platforms (which include this common header) to compile.
++  */
++ #ifdef CONFIG_PPC_PSERIES
++ 	return (IS_ENABLED(CONFIG_PPC_SPLPAR) &&
++ 		lppaca_shared_proc(local_paca->lppaca_ptr));
++ #else
++ 	return false;
++ #endif
++ }
++ 
++ static inline void spin_yield(arch_spinlock_t *lock)
++ {
++ 	if (is_shared_processor())
++ 		splpar_spin_yield(lock);
++ 	else
++ 		barrier();
++ }
++ 
++ static inline void rw_yield(arch_rwlock_t *lock)
++ {
++ 	if (is_shared_processor())
++ 		splpar_rw_yield(lock);
++ 	else
++ 		barrier();
++ }
++ 
+++>>>>>>> 405efc5980f2 (powerpc/spinlocks: Fix oops in __spin_yield() on bare metal)
+  static inline void arch_spin_lock(arch_spinlock_t *lock)
+  {
+  	while (1) {
+@@@ -124,8 -145,8 +164,13 @@@
+  			break;
+  		do {
+  			HMT_low();
+++<<<<<<< HEAD
+ +			if (SHARED_PROCESSOR)
+ +				__spin_yield(lock);
+++=======
++ 			if (is_shared_processor())
++ 				splpar_spin_yield(lock);
+++>>>>>>> 405efc5980f2 (powerpc/spinlocks: Fix oops in __spin_yield() on bare metal)
+  		} while (unlikely(lock->slock != 0));
+  		HMT_medium();
+  	}
+@@@ -143,8 -164,8 +188,13 @@@ void arch_spin_lock_flags(arch_spinlock
+  		local_irq_restore(flags);
+  		do {
+  			HMT_low();
+++<<<<<<< HEAD
+ +			if (SHARED_PROCESSOR)
+ +				__spin_yield(lock);
+++=======
++ 			if (is_shared_processor())
++ 				splpar_spin_yield(lock);
+++>>>>>>> 405efc5980f2 (powerpc/spinlocks: Fix oops in __spin_yield() on bare metal)
+  		} while (unlikely(lock->slock != 0));
+  		HMT_medium();
+  		local_irq_restore(flags_dis);
+@@@ -233,8 -254,8 +283,13 @@@ static inline void arch_read_lock(arch_
+  			break;
+  		do {
+  			HMT_low();
+++<<<<<<< HEAD
+ +			if (SHARED_PROCESSOR)
+ +				__rw_yield(rw);
+++=======
++ 			if (is_shared_processor())
++ 				splpar_rw_yield(rw);
+++>>>>>>> 405efc5980f2 (powerpc/spinlocks: Fix oops in __spin_yield() on bare metal)
+  		} while (unlikely(rw->lock < 0));
+  		HMT_medium();
+  	}
+@@@ -247,8 -268,8 +302,13 @@@ static inline void arch_write_lock(arch
+  			break;
+  		do {
+  			HMT_low();
+++<<<<<<< HEAD
+ +			if (SHARED_PROCESSOR)
+ +				__rw_yield(rw);
+++=======
++ 			if (is_shared_processor())
++ 				splpar_rw_yield(rw);
+++>>>>>>> 405efc5980f2 (powerpc/spinlocks: Fix oops in __spin_yield() on bare metal)
+  		} while (unlikely(rw->lock != 0));
+  		HMT_medium();
+  	}
+* Unmerged path arch/powerpc/include/asm/spinlock.h
