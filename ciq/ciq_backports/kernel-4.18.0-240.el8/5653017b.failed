@@ -1,0 +1,167 @@
+xfs: turn io_append_trans into an io_private void pointer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 5653017bc44e54baa299f3523f160c23ac0628fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5653017b.failed
+
+In preparation for moving the ioend structure to common code we need
+to get rid of the xfs-specific xfs_trans type.  Just make it a file
+system private void pointer instead.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 5653017bc44e54baa299f3523f160c23ac0628fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+diff --cc fs/xfs/xfs_aops.c
+index add26533d923,df5955388adc..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -265,23 -282,16 +265,23 @@@ xfs_end_ioend
+  	 */
+  	if (ioend->io_fork == XFS_COW_FORK)
+  		error = xfs_reflink_end_cow(ip, offset, size);
+ -	else if (ioend->io_type == IOMAP_UNWRITTEN)
+ +	else if (ioend->io_state == XFS_EXT_UNWRITTEN)
+  		error = xfs_iomap_write_unwritten(ip, offset, size, false);
+  	else
+- 		ASSERT(!xfs_ioend_is_append(ioend) || ioend->io_append_trans);
++ 		ASSERT(!xfs_ioend_is_append(ioend) || ioend->io_private);
+  
+  done:
+- 	if (ioend->io_append_trans)
++ 	if (ioend->io_private)
+  		error = xfs_setfilesize_ioend(ioend, error);
+ -	xfs_destroy_ioends(ioend, error);
+ -	memalloc_nofs_restore(nofs_flag);
+ +	list_replace_init(&ioend->io_list, &ioend_list);
+ +	xfs_destroy_ioend(ioend, error);
+ +
+ +	while (!list_empty(&ioend_list)) {
+ +		ioend = list_first_entry(&ioend_list, struct xfs_ioend,
+ +				io_list);
+ +		list_del_init(&ioend->io_list);
+ +		xfs_destroy_ioend(ioend, error);
+ +	}
+  }
+  
+  /*
+@@@ -310,32 -314,43 +310,61 @@@ xfs_ioend_can_merge
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * If the to be merged ioend has a preallocated transaction for file
++  * size updates we need to ensure the ioend it is merged into also
++  * has one.  If it already has one we can simply cancel the transaction
++  * as it is guaranteed to be clean.
++  */
++ static void
++ xfs_ioend_merge_private(
++ 	struct xfs_ioend	*ioend,
++ 	struct xfs_ioend	*next)
++ {
++ 	if (!ioend->io_private) {
++ 		ioend->io_private = next->io_private;
++ 		next->io_private = NULL;
++ 	} else {
++ 		xfs_setfilesize_ioend(next, -ECANCELED);
++ 	}
++ }
++ 
+++>>>>>>> 5653017bc44e (xfs: turn io_append_trans into an io_private void pointer)
+  /* Try to merge adjacent completions. */
+  STATIC void
+  xfs_ioend_try_merge(
+  	struct xfs_ioend	*ioend,
+  	struct list_head	*more_ioends)
+  {
+ -	struct xfs_ioend	*next;
+ +	struct xfs_ioend	*next_ioend;
+ +	int			ioend_error;
+ +	int			error;
+  
+ -	INIT_LIST_HEAD(&ioend->io_list);
+ +	if (list_empty(more_ioends))
+ +		return;
+  
+ -	while ((next = list_first_entry_or_null(more_ioends, struct xfs_ioend,
+ -			io_list))) {
+ -		if (!xfs_ioend_can_merge(ioend, next))
+ +	ioend_error = blk_status_to_errno(ioend->io_bio->bi_status);
+ +
+ +	while (!list_empty(more_ioends)) {
+ +		next_ioend = list_first_entry(more_ioends, struct xfs_ioend,
+ +				io_list);
+ +		if (!xfs_ioend_can_merge(ioend, ioend_error, next_ioend))
+  			break;
+++<<<<<<< HEAD
+ +		list_move_tail(&next_ioend->io_list, &ioend->io_list);
+ +		ioend->io_size += next_ioend->io_size;
+ +		if (ioend->io_append_trans) {
+ +			error = xfs_setfilesize_ioend(next_ioend, 1);
+ +			ASSERT(error == 1);
+ +		}
+++=======
++ 		list_move_tail(&next->io_list, &ioend->io_list);
++ 		ioend->io_size += next->io_size;
++ 		if (next->io_private)
++ 			xfs_ioend_merge_private(ioend, next);
+++>>>>>>> 5653017bc44e (xfs: turn io_append_trans into an io_private void pointer)
+  	}
+  }
+  
+@@@ -395,8 -414,8 +424,13 @@@ xfs_end_bio
+  	unsigned long		flags;
+  
+  	if (ioend->io_fork == XFS_COW_FORK ||
+++<<<<<<< HEAD
+ +	    ioend->io_state == XFS_EXT_UNWRITTEN ||
+ +	    ioend->io_append_trans != NULL) {
+++=======
++ 	    ioend->io_type == IOMAP_UNWRITTEN ||
++ 	    ioend->io_private) {
+++>>>>>>> 5653017bc44e (xfs: turn io_append_trans into an io_private void pointer)
+  		spin_lock_irqsave(&ip->i_ioend_lock, flags);
+  		if (list_empty(&ip->i_ioend_list))
+  			WARN_ON_ONCE(!queue_work(mp->m_unwritten_workqueue,
+@@@ -658,11 -678,13 +692,11 @@@ xfs_submit_ioend
+  	/* Reserve log space if we might write beyond the on-disk inode size. */
+  	if (!status &&
+  	    (ioend->io_fork == XFS_COW_FORK ||
+ -	     ioend->io_type != IOMAP_UNWRITTEN) &&
+ +	     ioend->io_state != XFS_EXT_UNWRITTEN) &&
+  	    xfs_ioend_is_append(ioend) &&
+- 	    !ioend->io_append_trans)
++ 	    !ioend->io_private)
+  		status = xfs_setfilesize_trans_alloc(ioend);
+  
+ -	memalloc_nofs_restore(nofs_flag);
+ -
+  	ioend->io_bio->bi_private = ioend;
+  	ioend->io_bio->bi_end_io = xfs_end_bio;
+  
+* Unmerged path fs/xfs/xfs_aops.c
+diff --git a/fs/xfs/xfs_aops.h b/fs/xfs/xfs_aops.h
+index f62b03186c62..fad6cef4f0bd 100644
+--- a/fs/xfs/xfs_aops.h
++++ b/fs/xfs/xfs_aops.h
+@@ -18,7 +18,7 @@ struct xfs_ioend {
+ 	struct inode		*io_inode;	/* file being written to */
+ 	size_t			io_size;	/* size of the extent */
+ 	xfs_off_t		io_offset;	/* offset in the file */
+-	struct xfs_trans	*io_append_trans;/* xact. for size update */
++	void			*io_private;	/* file system private data */
+ 	struct bio		*io_bio;	/* bio being built */
+ 	struct bio		io_inline_bio;	/* MUST BE LAST! */
+ };
