@@ -1,0 +1,152 @@
+kasan: remove __kasan_unpoison_stack
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit 77f57c983065d0569ee1b4af80f07224b439af57
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/77f57c98.failed
+
+There's no need for __kasan_unpoison_stack() helper, as it's only
+currently used in a single place. Removing it also removes unneeded
+arithmetic.
+
+No functional changes.
+
+Link: https://lkml.kernel.org/r/93e78948704a42ea92f6248ff8a725613d721161.1606162397.git.andreyknvl@google.com
+Link: https://linux-review.googlesource.com/id/Ie5ba549d445292fe629b4a96735e4034957bcc50
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Tested-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Cc: Vasily Gorbik <gor@linux.ibm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 77f57c983065d0569ee1b4af80f07224b439af57)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/common.c
+diff --cc mm/kasan/common.c
+index e989322c0f3f,b71dfe7c5059..000000000000
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@@ -84,102 -56,14 +84,106 @@@ void kasan_disable_current(void
+  {
+  	current->kasan_depth--;
+  }
+ -#endif /* CONFIG_KASAN_GENERIC || CONFIG_KASAN_SW_TAGS */
+  
+ -void kasan_unpoison_range(const void *address, size_t size)
+ +bool __kasan_check_read(const volatile void *p, unsigned int size)
+ +{
+ +	return check_memory_region((unsigned long)p, size, false, _RET_IP_);
+ +}
+ +EXPORT_SYMBOL(__kasan_check_read);
+ +
+ +bool __kasan_check_write(const volatile void *p, unsigned int size)
+ +{
+ +	return check_memory_region((unsigned long)p, size, true, _RET_IP_);
+ +}
+ +EXPORT_SYMBOL(__kasan_check_write);
+ +
+ +#undef memset
+ +void *memset(void *addr, int c, size_t len)
+ +{
+ +	if (!check_memory_region((unsigned long)addr, len, true, _RET_IP_))
+ +		return NULL;
+ +
+ +	return __memset(addr, c, len);
+ +}
+ +
+ +#ifdef __HAVE_ARCH_MEMMOVE
+ +#undef memmove
+ +void *memmove(void *dest, const void *src, size_t len)
+ +{
+ +	if (!check_memory_region((unsigned long)src, len, false, _RET_IP_) ||
+ +	    !check_memory_region((unsigned long)dest, len, true, _RET_IP_))
+ +		return NULL;
+ +
+ +	return __memmove(dest, src, len);
+ +}
+ +#endif
+ +
+ +#undef memcpy
+ +void *memcpy(void *dest, const void *src, size_t len)
+ +{
+ +	if (!check_memory_region((unsigned long)src, len, false, _RET_IP_) ||
+ +	    !check_memory_region((unsigned long)dest, len, true, _RET_IP_))
+ +		return NULL;
+ +
+ +	return __memcpy(dest, src, len);
+ +}
+ +
+ +/*
+ + * Poisons the shadow memory for 'size' bytes starting from 'addr'.
+ + * Memory addresses should be aligned to KASAN_SHADOW_SCALE_SIZE.
+ + */
+ +void kasan_poison_shadow(const void *address, size_t size, u8 value)
+ +{
+ +	void *shadow_start, *shadow_end;
+ +
+ +	/*
+ +	 * Perform shadow offset calculation based on untagged address, as
+ +	 * some of the callers (e.g. kasan_poison_object_data) pass tagged
+ +	 * addresses to this function.
+ +	 */
+ +	address = reset_tag(address);
+ +
+ +	shadow_start = kasan_mem_to_shadow(address);
+ +	shadow_end = kasan_mem_to_shadow(address + size);
+ +
+ +	__memset(shadow_start, value, shadow_end - shadow_start);
+ +}
+ +
+ +void kasan_unpoison_shadow(const void *address, size_t size)
+ +{
+ +	u8 tag = get_tag(address);
+ +
+ +	/*
+ +	 * Perform shadow offset calculation based on untagged address, as
+ +	 * some of the callers (e.g. kasan_unpoison_object_data) pass tagged
+ +	 * addresses to this function.
+ +	 */
+ +	address = reset_tag(address);
+ +
+ +	kasan_poison_shadow(address, size, tag);
+ +
+ +	if (size & KASAN_SHADOW_MASK) {
+ +		u8 *shadow = (u8 *)kasan_mem_to_shadow(address + size);
+ +
+ +		if (IS_ENABLED(CONFIG_KASAN_SW_TAGS))
+ +			*shadow = tag;
+ +		else
+ +			*shadow = size & KASAN_SHADOW_MASK;
+ +	}
+ +}
+ +
+++<<<<<<< HEAD
+ +static void __kasan_unpoison_stack(struct task_struct *task, const void *sp)
+  {
+ -	unpoison_range(address, size);
+ +	void *base = task_stack_page(task);
+ +	size_t size = sp - base;
+ +
+ +	kasan_unpoison_shadow(base, size);
+  }
+  
+++=======
++ #if CONFIG_KASAN_STACK
+++>>>>>>> 77f57c983065 (kasan: remove __kasan_unpoison_stack)
+  /* Unpoison the entire stack for a task. */
+  void kasan_unpoison_task_stack(struct task_struct *task)
+  {
+* Unmerged path mm/kasan/common.c
