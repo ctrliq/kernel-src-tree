@@ -1,0 +1,1274 @@
+pagewalk: separate function pointers from iterator data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 7b86ac3371b70c3fd8fd95501719beb1faab719f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7b86ac33.failed
+
+The mm_walk structure currently mixed data and code.  Split out the
+operations vectors into a new mm_walk_ops structure, and while we are
+changing the API also declare the mm_walk structure inside the
+walk_page_range and walk_page_vma functions.
+
+Based on patch from Linus Torvalds.
+
+Link: https://lore.kernel.org/r/20190828141955.22210-3-hch@lst.de
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Thomas Hellstrom <thellstrom@vmware.com>
+	Reviewed-by: Steven Price <steven.price@arm.com>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 7b86ac3371b70c3fd8fd95501719beb1faab719f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/openrisc/kernel/dma.c
+#	fs/proc/task_mmu.c
+#	include/linux/pagewalk.h
+#	mm/hmm.c
+#	mm/madvise.c
+#	mm/migrate.c
+diff --cc arch/openrisc/kernel/dma.c
+index ec7fd45704d2,4d5b8bd1d795..000000000000
+--- a/arch/openrisc/kernel/dma.c
++++ b/arch/openrisc/kernel/dma.c
+@@@ -87,12 -89,8 +95,8 @@@ or1k_dma_alloc(struct device *dev, size
+  {
+  	unsigned long va;
+  	void *page;
+- 	struct mm_walk walk = {
+- 		.pte_entry = page_set_nocache,
+- 		.mm = &init_mm
+- 	};
+  
+ -	page = alloc_pages_exact(size, gfp | __GFP_ZERO);
+ +	page = alloc_pages_exact(size, gfp);
+  	if (!page)
+  		return NULL;
+  
+@@@ -101,34 -99,28 +105,47 @@@
+  
+  	va = (unsigned long)page;
+  
+++<<<<<<< HEAD
+ +	if ((attrs & DMA_ATTR_NON_CONSISTENT) == 0) {
+ +		/*
+ +		 * We need to iterate through the pages, clearing the dcache for
+ +		 * them and setting the cache-inhibit bit.
+ +		 */
+ +		if (walk_page_range(va, va + size, &walk)) {
+ +			free_pages_exact(page, size);
+ +			return NULL;
+ +		}
+++=======
++ 	/*
++ 	 * We need to iterate through the pages, clearing the dcache for
++ 	 * them and setting the cache-inhibit bit.
++ 	 */
++ 	if (walk_page_range(&init_mm, va, va + size, &set_nocache_walk_ops,
++ 			NULL)) {
++ 		free_pages_exact(page, size);
++ 		return NULL;
+++>>>>>>> 7b86ac3371b7 (pagewalk: separate function pointers from iterator data)
+  	}
+  
+  	return (void *)va;
+  }
+  
+ -void
+ -arch_dma_free(struct device *dev, size_t size, void *vaddr,
+ -		dma_addr_t dma_handle, unsigned long attrs)
+ +static void
+ +or1k_dma_free(struct device *dev, size_t size, void *vaddr,
+ +	      dma_addr_t dma_handle, unsigned long attrs)
+  {
+  	unsigned long va = (unsigned long)vaddr;
+- 	struct mm_walk walk = {
+- 		.pte_entry = page_clear_nocache,
+- 		.mm = &init_mm
+- 	};
+  
+++<<<<<<< HEAD
+ +	if ((attrs & DMA_ATTR_NON_CONSISTENT) == 0) {
+ +		/* walk_page_range shouldn't be able to fail here */
+ +		WARN_ON(walk_page_range(va, va + size, &walk));
+ +	}
+++=======
++ 	/* walk_page_range shouldn't be able to fail here */
++ 	WARN_ON(walk_page_range(&init_mm, va, va + size,
++ 			&clear_nocache_walk_ops, NULL));
+++>>>>>>> 7b86ac3371b7 (pagewalk: separate function pointers from iterator data)
+  
+  	free_pages_exact(vaddr, size);
+  }
+diff --cc fs/proc/task_mmu.c
+index 85cefc505c86,bf43d1d60059..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -729,43 -731,24 +731,62 @@@ static int smaps_hugetlb_range(pte_t *p
+  	}
+  	return 0;
+  }
++ #else
++ #define smaps_hugetlb_range	NULL
+  #endif /* HUGETLB_PAGE */
+  
+++<<<<<<< HEAD
+ +#define SEQ_PUT_DEC(str, val) \
+ +		seq_put_decimal_ull_width(m, str, (val) >> 10, 8)
+ +static int show_smap(struct seq_file *m, void *v, int is_pid)
+ +{
+ +	struct proc_maps_private *priv = m->private;
+ +	struct vm_area_struct *vma = v;
+ +	struct mem_size_stats mss_stack;
+ +	struct mem_size_stats *mss;
+ +	struct mm_walk smaps_walk = {
+ +		.pmd_entry = smaps_pte_range,
+ +#ifdef CONFIG_HUGETLB_PAGE
+ +		.hugetlb_entry = smaps_hugetlb_range,
+ +#endif
+ +		.mm = vma->vm_mm,
+ +	};
+ +	int ret = 0;
+ +	bool rollup_mode;
+ +	bool last_vma;
+ +
+ +	if (priv->rollup) {
+ +		rollup_mode = true;
+ +		mss = priv->rollup;
+ +		if (mss->first) {
+ +			mss->first_vma_start = vma->vm_start;
+ +			mss->first = false;
+ +		}
+ +		last_vma = !m_next_vma(priv, vma);
+ +	} else {
+ +		rollup_mode = false;
+ +		memset(&mss_stack, 0, sizeof(mss_stack));
+ +		mss = &mss_stack;
+ +	}
+ +
+ +	smaps_walk.private = mss;
+ +
+++=======
++ static const struct mm_walk_ops smaps_walk_ops = {
++ 	.pmd_entry		= smaps_pte_range,
++ 	.hugetlb_entry		= smaps_hugetlb_range,
++ };
++ 
++ static const struct mm_walk_ops smaps_shmem_walk_ops = {
++ 	.pmd_entry		= smaps_pte_range,
++ 	.hugetlb_entry		= smaps_hugetlb_range,
++ 	.pte_hole		= smaps_pte_hole,
++ };
++ 
++ static void smap_gather_stats(struct vm_area_struct *vma,
++ 			     struct mem_size_stats *mss)
++ {
+++>>>>>>> 7b86ac3371b7 (pagewalk: separate function pointers from iterator data)
+  #ifdef CONFIG_SHMEM
+  	/* In case of smaps_rollup, reset the value from previous vma */
+  	mss->check_shmem_swap = false;
+@@@ -791,71 -775,132 +813,76 @@@
+  		}
+  	}
+  #endif
+ +
+  	/* mmap_sem is held in m_start */
+++<<<<<<< HEAD
+ +	walk_page_vma(vma, &smaps_walk);
+ +	if (vma->vm_flags & VM_LOCKED)
+ +		mss->pss_locked += mss->pss;
+++=======
++ 	walk_page_vma(vma, &smaps_walk_ops, mss);
++ }
+++>>>>>>> 7b86ac3371b7 (pagewalk: separate function pointers from iterator data)
+  
+ -#define SEQ_PUT_DEC(str, val) \
+ -		seq_put_decimal_ull_width(m, str, (val) >> 10, 8)
+ -
+ -/* Show the contents common for smaps and smaps_rollup */
+ -static void __show_smap(struct seq_file *m, const struct mem_size_stats *mss,
+ -	bool rollup_mode)
+ -{
+ -	SEQ_PUT_DEC("Rss:            ", mss->resident);
+ -	SEQ_PUT_DEC(" kB\nPss:            ", mss->pss >> PSS_SHIFT);
+ -	if (rollup_mode) {
+ -		/*
+ -		 * These are meaningful only for smaps_rollup, otherwise two of
+ -		 * them are zero, and the other one is the same as Pss.
+ -		 */
+ -		SEQ_PUT_DEC(" kB\nPss_Anon:       ",
+ -			mss->pss_anon >> PSS_SHIFT);
+ -		SEQ_PUT_DEC(" kB\nPss_File:       ",
+ -			mss->pss_file >> PSS_SHIFT);
+ -		SEQ_PUT_DEC(" kB\nPss_Shmem:      ",
+ -			mss->pss_shmem >> PSS_SHIFT);
+ +	if (!rollup_mode) {
+ +		show_map_vma(m, vma, is_pid);
+ +	} else if (last_vma) {
+ +		show_vma_header_prefix(
+ +			m, mss->first_vma_start, vma->vm_end, 0, 0, 0, 0);
+ +		seq_pad(m, ' ');
+ +		seq_puts(m, "[rollup]\n");
+ +	} else {
+ +		ret = SEQ_SKIP;
+  	}
+ -	SEQ_PUT_DEC(" kB\nShared_Clean:   ", mss->shared_clean);
+ -	SEQ_PUT_DEC(" kB\nShared_Dirty:   ", mss->shared_dirty);
+ -	SEQ_PUT_DEC(" kB\nPrivate_Clean:  ", mss->private_clean);
+ -	SEQ_PUT_DEC(" kB\nPrivate_Dirty:  ", mss->private_dirty);
+ -	SEQ_PUT_DEC(" kB\nReferenced:     ", mss->referenced);
+ -	SEQ_PUT_DEC(" kB\nAnonymous:      ", mss->anonymous);
+ -	SEQ_PUT_DEC(" kB\nLazyFree:       ", mss->lazyfree);
+ -	SEQ_PUT_DEC(" kB\nAnonHugePages:  ", mss->anonymous_thp);
+ -	SEQ_PUT_DEC(" kB\nShmemPmdMapped: ", mss->shmem_thp);
+ -	SEQ_PUT_DEC(" kB\nShared_Hugetlb: ", mss->shared_hugetlb);
+ -	seq_put_decimal_ull_width(m, " kB\nPrivate_Hugetlb: ",
+ -				  mss->private_hugetlb >> 10, 7);
+ -	SEQ_PUT_DEC(" kB\nSwap:           ", mss->swap);
+ -	SEQ_PUT_DEC(" kB\nSwapPss:        ",
+ -					mss->swap_pss >> PSS_SHIFT);
+ -	SEQ_PUT_DEC(" kB\nLocked:         ",
+ -					mss->pss_locked >> PSS_SHIFT);
+ -	seq_puts(m, " kB\n");
+ -}
+ -
+ -static int show_smap(struct seq_file *m, void *v)
+ -{
+ -	struct vm_area_struct *vma = v;
+ -	struct mem_size_stats mss;
+ -
+ -	memset(&mss, 0, sizeof(mss));
+ -
+ -	smap_gather_stats(vma, &mss);
+  
+ -	show_map_vma(m, vma);
+ -
+ -	SEQ_PUT_DEC("Size:           ", vma->vm_end - vma->vm_start);
+ -	SEQ_PUT_DEC(" kB\nKernelPageSize: ", vma_kernel_pagesize(vma));
+ -	SEQ_PUT_DEC(" kB\nMMUPageSize:    ", vma_mmu_pagesize(vma));
+ -	seq_puts(m, " kB\n");
+ -
+ -	__show_smap(m, &mss, false);
+ -
+ -	seq_printf(m, "THPeligible:		%d\n",
+ -		   transparent_hugepage_enabled(vma));
+ -
+ -	if (arch_pkeys_enabled())
+ -		seq_printf(m, "ProtectionKey:  %8u\n", vma_pkey(vma));
+ -	show_smap_vma_flags(m, vma);
+ +	if (!rollup_mode) {
+ +		SEQ_PUT_DEC("Size:           ", vma->vm_end - vma->vm_start);
+ +		SEQ_PUT_DEC(" kB\nKernelPageSize: ", vma_kernel_pagesize(vma));
+ +		SEQ_PUT_DEC(" kB\nMMUPageSize:    ", vma_mmu_pagesize(vma));
+ +		seq_puts(m, " kB\n");
+ +	}
+  
+ +	if (!rollup_mode || last_vma) {
+ +		SEQ_PUT_DEC("Rss:            ", mss->resident);
+ +		SEQ_PUT_DEC(" kB\nPss:            ", mss->pss >> PSS_SHIFT);
+ +		SEQ_PUT_DEC(" kB\nShared_Clean:   ", mss->shared_clean);
+ +		SEQ_PUT_DEC(" kB\nShared_Dirty:   ", mss->shared_dirty);
+ +		SEQ_PUT_DEC(" kB\nPrivate_Clean:  ", mss->private_clean);
+ +		SEQ_PUT_DEC(" kB\nPrivate_Dirty:  ", mss->private_dirty);
+ +		SEQ_PUT_DEC(" kB\nReferenced:     ", mss->referenced);
+ +		SEQ_PUT_DEC(" kB\nAnonymous:      ", mss->anonymous);
+ +		SEQ_PUT_DEC(" kB\nLazyFree:       ", mss->lazyfree);
+ +		SEQ_PUT_DEC(" kB\nAnonHugePages:  ", mss->anonymous_thp);
+ +		SEQ_PUT_DEC(" kB\nShmemPmdMapped: ", mss->shmem_thp);
+ +		SEQ_PUT_DEC(" kB\nShared_Hugetlb: ", mss->shared_hugetlb);
+ +		seq_put_decimal_ull_width(m, " kB\nPrivate_Hugetlb: ",
+ +					  mss->private_hugetlb >> 10, 7);
+ +		SEQ_PUT_DEC(" kB\nSwap:           ", mss->swap);
+ +		SEQ_PUT_DEC(" kB\nSwapPss:        ",
+ +						mss->swap_pss >> PSS_SHIFT);
+ +		SEQ_PUT_DEC(" kB\nLocked:         ",
+ +						mss->pss_locked >> PSS_SHIFT);
+ +		seq_puts(m, " kB\n");
+ +	}
+ +	if (!rollup_mode) {
+ +		if (arch_pkeys_enabled())
+ +			seq_printf(m, "ProtectionKey:  %8u\n", vma_pkey(vma));
+ +		show_smap_vma_flags(m, vma);
+ +	}
+  	m_cache_vma(m, vma);
+ -
+ -	return 0;
+ +	return ret;
+  }
+ +#undef SEQ_PUT_DEC
+  
+ -static int show_smaps_rollup(struct seq_file *m, void *v)
+ +static int show_pid_smap(struct seq_file *m, void *v)
+  {
+ -	struct proc_maps_private *priv = m->private;
+ -	struct mem_size_stats mss;
+ -	struct mm_struct *mm;
+ -	struct vm_area_struct *vma;
+ -	unsigned long last_vma_end = 0;
+ -	int ret = 0;
+ -
+ -	priv->task = get_proc_task(priv->inode);
+ -	if (!priv->task)
+ -		return -ESRCH;
+ -
+ -	mm = priv->mm;
+ -	if (!mm || !mmget_not_zero(mm)) {
+ -		ret = -ESRCH;
+ -		goto out_put_task;
+ -	}
+ -
+ -	memset(&mss, 0, sizeof(mss));
+ -
+ -	ret = down_read_killable(&mm->mmap_sem);
+ -	if (ret)
+ -		goto out_put_mm;
+ -
+ -	hold_task_mempolicy(priv);
+ -
+ -	for (vma = priv->mm->mmap; vma; vma = vma->vm_next) {
+ -		smap_gather_stats(vma, &mss);
+ -		last_vma_end = vma->vm_end;
+ -	}
+ -
+ -	show_vma_header_prefix(m, priv->mm->mmap->vm_start,
+ -			       last_vma_end, 0, 0, 0, 0);
+ -	seq_pad(m, ' ');
+ -	seq_puts(m, "[rollup]\n");
+ -
+ -	__show_smap(m, &mss, true);
+ -
+ -	release_task_mempolicy(priv);
+ -	up_read(&mm->mmap_sem);
+ -
+ -out_put_mm:
+ -	mmput(mm);
+ -out_put_task:
+ -	put_task_struct(priv->task);
+ -	priv->task = NULL;
+ +	return show_smap(m, v, 1);
+ +}
+  
+ -	return ret;
+ +static int show_tid_smap(struct seq_file *m, void *v)
+ +{
+ +	return show_smap(m, v, 0);
+  }
+ -#undef SEQ_PUT_DEC
+  
+  static const struct seq_operations proc_pid_smaps_op = {
+  	.start	= m_start,
+@@@ -1164,11 -1217,15 +1190,12 @@@ static ssize_t clear_refs_write(struct 
+  				downgrade_write(&mm->mmap_sem);
+  				break;
+  			}
+ -
+ -			mmu_notifier_range_init(&range, MMU_NOTIFY_SOFT_DIRTY,
+ -						0, NULL, mm, 0, -1UL);
+ -			mmu_notifier_invalidate_range_start(&range);
+ +			mmu_notifier_invalidate_range_start(mm, 0, -1);
+  		}
+- 		walk_page_range(0, mm->highest_vm_end, &clear_refs_walk);
++ 		walk_page_range(mm, 0, mm->highest_vm_end, &clear_refs_walk_ops,
++ 				&cp);
+  		if (type == CLEAR_REFS_SOFT_DIRTY)
+ -			mmu_notifier_invalidate_range_end(&range);
+ +			mmu_notifier_invalidate_range_end(mm, 0, -1);
+  		tlb_finish_mmu(&tlb, 0, -1);
+  		up_read(&mm->mmap_sem);
+  out_mm:
+@@@ -1532,8 -1588,10 +1558,15 @@@ static ssize_t pagemap_read(struct fil
+  		/* overflow ? */
+  		if (end < start_vaddr || end > end_vaddr)
+  			end = end_vaddr;
+++<<<<<<< HEAD
+ +		down_read(&mm->mmap_sem);
+ +		ret = walk_page_range(start_vaddr, end, &pagemap_walk);
+++=======
++ 		ret = down_read_killable(&mm->mmap_sem);
++ 		if (ret)
++ 			goto out_free;
++ 		ret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);
+++>>>>>>> 7b86ac3371b7 (pagewalk: separate function pointers from iterator data)
+  		up_read(&mm->mmap_sem);
+  		start_vaddr = end;
+  
+diff --cc mm/hmm.c
+index 78e07e5f853a,902f5fa6bf93..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -956,105 -852,33 +956,125 @@@ void hmm_range_unregister(struct hmm_ra
+  }
+  EXPORT_SYMBOL(hmm_range_unregister);
+  
+++<<<<<<< HEAD
+ +/*
+ + * hmm_range_snapshot() - snapshot CPU page table for a range
+ + * @range: range
+ + * Return: -EINVAL if invalid argument, -ENOMEM out of memory, -EPERM invalid
+ + *          permission (for instance asking for write and range is read only),
+ + *          -EBUSY if you need to retry, -EFAULT invalid (ie either no valid
+ + *          vma or it is illegal to access that range), number of valid pages
+ + *          in range->pfns[] (from range start address).
+++=======
++ static const struct mm_walk_ops hmm_walk_ops = {
++ 	.pud_entry	= hmm_vma_walk_pud,
++ 	.pmd_entry	= hmm_vma_walk_pmd,
++ 	.pte_hole	= hmm_vma_walk_hole,
++ 	.hugetlb_entry	= hmm_vma_walk_hugetlb_entry,
++ };
++ 
++ /**
++  * hmm_range_fault - try to fault some address in a virtual address range
++  * @range:	range being faulted
++  * @flags:	HMM_FAULT_* flags
+++>>>>>>> 7b86ac3371b7 (pagewalk: separate function pointers from iterator data)
+   *
+ - * Return: the number of valid pages in range->pfns[] (from range start
+ - * address), which may be zero.  On error one of the following status codes
+ - * can be returned:
+ + * This snapshots the CPU page table for a range of virtual addresses. Snapshot
+ + * validity is tracked by range struct. See in include/linux/hmm.h for example
+ + * on how to use.
+ + */
+ +long hmm_range_snapshot(struct hmm_range *range)
+ +{
+ +	const unsigned long device_vma = VM_IO | VM_PFNMAP | VM_MIXEDMAP;
+ +	unsigned long start = range->start, end;
+ +	struct hmm_vma_walk hmm_vma_walk;
+ +	struct hmm *hmm = range->hmm;
+ +	struct vm_area_struct *vma;
+++<<<<<<< HEAD
+ +	struct mm_walk mm_walk;
+++=======
+++	int ret;
+++
+++	lockdep_assert_held(&hmm->mmu_notifier.mm->mmap_sem);
+++>>>>>>> 7b86ac3371b7 (pagewalk: separate function pointers from iterator data)
+ +
+ +	lockdep_assert_held(&hmm->mm->mmap_sem);
+ +	do {
+ +		/* If range is no longer valid force retry. */
+ +		if (!range->valid)
+ +			return -EBUSY;
+ +
+ +		vma = find_vma(hmm->mm, start);
+ +		if (vma == NULL || (vma->vm_flags & device_vma))
+ +			return -EFAULT;
+ +
+ +		if (is_vm_hugetlb_page(vma)) {
+ +			if (huge_page_shift(hstate_vma(vma)) !=
+ +				    range->page_shift &&
+ +			    range->page_shift != PAGE_SHIFT)
+ +				return -EINVAL;
+ +		} else {
+ +			if (range->page_shift != PAGE_SHIFT)
+ +				return -EINVAL;
+ +		}
+ +
+ +		if (!(vma->vm_flags & VM_READ)) {
+ +			/*
+ +			 * If vma do not allow read access, then assume that it
+ +			 * does not allow write access, either. HMM does not
+ +			 * support architecture that allow write without read.
+ +			 */
+ +			hmm_pfns_clear(range, range->pfns,
+ +				range->start, range->end);
+ +			return -EPERM;
+ +		}
+ +
+ +		range->vma = vma;
+ +		hmm_vma_walk.pgmap = NULL;
+ +		hmm_vma_walk.last = start;
+ +		hmm_vma_walk.fault = false;
+ +		hmm_vma_walk.range = range;
+ +		mm_walk.private = &hmm_vma_walk;
+ +		end = min(range->end, vma->vm_end);
+ +
+ +		mm_walk.vma = vma;
+ +		mm_walk.mm = vma->vm_mm;
+ +		mm_walk.pte_entry = NULL;
+ +		mm_walk.test_walk = NULL;
+ +		mm_walk.hugetlb_entry = NULL;
+ +		mm_walk.pud_entry = hmm_vma_walk_pud;
+ +		mm_walk.pmd_entry = hmm_vma_walk_pmd;
+ +		mm_walk.pte_hole = hmm_vma_walk_hole;
+ +		mm_walk.hugetlb_entry = hmm_vma_walk_hugetlb_entry;
+ +
+ +		walk_page_range(start, end, &mm_walk);
+ +		start = end;
+ +	} while (start < range->end);
+ +
+ +	return (hmm_vma_walk.last - range->start) >> PAGE_SHIFT;
+ +}
+ +EXPORT_SYMBOL(hmm_range_snapshot);
+ +
+ +/*
+ + * hmm_range_fault() - try to fault some address in a virtual address range
+ + * @range: range being faulted
+ + * @block: allow blocking on fault (if true it sleeps and do not drop mmap_sem)
+ + * Return: number of valid pages in range->pfns[] (from range start
+ + *          address). This may be zero. If the return value is negative,
+ + *          then one of the following values may be returned:
+   *
+ - * -EINVAL:	Invalid arguments or mm or virtual address is in an invalid vma
+ - *		(e.g., device file vma).
+ - * -ENOMEM:	Out of memory.
+ - * -EPERM:	Invalid permission (e.g., asking for write and range is read
+ - *		only).
+ - * -EAGAIN:	A page fault needs to be retried and mmap_sem was dropped.
+ - * -EBUSY:	The range has been invalidated and the caller needs to wait for
+ - *		the invalidation to finish.
+ - * -EFAULT:	Invalid (i.e., either no valid vma or it is illegal to access
+ - *		that range) number of valid pages in range->pfns[] (from
+ - *              range start address).
+ + *           -EINVAL  invalid arguments or mm or virtual address are in an
+ + *                    invalid vma (for instance device file vma).
+ + *           -ENOMEM: Out of memory.
+ + *           -EPERM:  Invalid permission (for instance asking for write and
+ + *                    range is read only).
+ + *           -EAGAIN: If you need to retry and mmap_sem was drop. This can only
+ + *                    happens if block argument is false.
+ + *           -EBUSY:  If the the range is being invalidated and you should wait
+ + *                    for invalidation to finish.
+ + *           -EFAULT: Invalid (ie either no valid vma or it is illegal to access
+ + *                    that range), number of valid pages in range->pfns[] (from
+ + *                    range start address).
+   *
+   * This is similar to a regular CPU page fault except that it will not trigger
+   * any memory migration if the memory being faulted is not accessible by CPUs
+@@@ -1105,27 -918,18 +1125,20 @@@ long hmm_range_fault(struct hmm_range *
+  			return -EPERM;
+  		}
+  
+ +		range->vma = vma;
+  		hmm_vma_walk.pgmap = NULL;
+  		hmm_vma_walk.last = start;
+ -		hmm_vma_walk.flags = flags;
+ +		hmm_vma_walk.fault = true;
+ +		hmm_vma_walk.block = block;
+  		hmm_vma_walk.range = range;
+- 		mm_walk.private = &hmm_vma_walk;
+  		end = min(range->end, vma->vm_end);
+  
+- 		mm_walk.vma = vma;
+- 		mm_walk.mm = vma->vm_mm;
+- 		mm_walk.pte_entry = NULL;
+- 		mm_walk.test_walk = NULL;
+- 		mm_walk.hugetlb_entry = NULL;
+- 		mm_walk.pud_entry = hmm_vma_walk_pud;
+- 		mm_walk.pmd_entry = hmm_vma_walk_pmd;
+- 		mm_walk.pte_hole = hmm_vma_walk_hole;
+- 		mm_walk.hugetlb_entry = hmm_vma_walk_hugetlb_entry;
++ 		walk_page_range(vma->vm_mm, start, end, &hmm_walk_ops,
++ 				&hmm_vma_walk);
+  
+  		do {
+- 			ret = walk_page_range(start, end, &mm_walk);
++ 			ret = walk_page_range(vma->vm_mm, start, end,
++ 					&hmm_walk_ops, &hmm_vma_walk);
+  			start = hmm_vma_walk.last;
+  
+  			/* Keep trying while the range is valid. */
+diff --cc mm/madvise.c
+index 4f76df2dbfb5,afe2b015ea58..000000000000
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@@ -466,21 -447,26 +446,31 @@@ static int madvise_free_single_vma(stru
+  	if (!vma_is_anonymous(vma))
+  		return -EINVAL;
+  
+ -	range.start = max(vma->vm_start, start_addr);
+ -	if (range.start >= vma->vm_end)
+ +	start = max(vma->vm_start, start_addr);
+ +	if (start >= vma->vm_end)
+  		return -EINVAL;
+ -	range.end = min(vma->vm_end, end_addr);
+ -	if (range.end <= vma->vm_start)
+ +	end = min(vma->vm_end, end_addr);
+ +	if (end <= vma->vm_start)
+  		return -EINVAL;
+ -	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, mm,
+ -				range.start, range.end);
+  
+  	lru_add_drain();
+ -	tlb_gather_mmu(&tlb, mm, range.start, range.end);
+ +	tlb_gather_mmu(&tlb, mm, start, end);
+  	update_hiwater_rss(mm);
+  
+++<<<<<<< HEAD
+ +	mmu_notifier_invalidate_range_start(mm, start, end);
+ +	madvise_free_page_range(&tlb, vma, start, end);
+ +	mmu_notifier_invalidate_range_end(mm, start, end);
+ +	tlb_finish_mmu(&tlb, start, end);
+++=======
++ 	mmu_notifier_invalidate_range_start(&range);
++ 	tlb_start_vma(&tlb, vma);
++ 	walk_page_range(vma->vm_mm, range.start, range.end,
++ 			&madvise_free_walk_ops, &tlb);
++ 	tlb_end_vma(&tlb, vma);
++ 	mmu_notifier_invalidate_range_end(&range);
++ 	tlb_finish_mmu(&tlb, range.start, range.end);
+++>>>>>>> 7b86ac3371b7 (pagewalk: separate function pointers from iterator data)
+  
+  	return 0;
+  }
+diff --cc mm/migrate.c
+index 8dd716702fdd,9f4ed4e985c1..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -2342,25 -2335,16 +2347,37 @@@ static const struct mm_walk_ops migrate
+   */
+  static void migrate_vma_collect(struct migrate_vma *migrate)
+  {
+++<<<<<<< HEAD
+ +	struct mm_walk mm_walk;
+ +
+ +	mm_walk.pmd_entry = migrate_vma_collect_pmd;
+ +	mm_walk.pte_entry = NULL;
+ +	mm_walk.pte_hole = migrate_vma_collect_hole;
+ +	mm_walk.hugetlb_entry = NULL;
+ +	mm_walk.test_walk = NULL;
+ +	mm_walk.vma = migrate->vma;
+ +	mm_walk.mm = migrate->vma->vm_mm;
+ +	mm_walk.private = migrate;
+ +
+ +	mmu_notifier_invalidate_range_start(mm_walk.mm,
+ +					    migrate->start,
+ +					    migrate->end);
+ +	walk_page_range(migrate->start, migrate->end, &mm_walk);
+ +	mmu_notifier_invalidate_range_end(mm_walk.mm,
+ +					  migrate->start,
+ +					  migrate->end);
+++=======
++ 	struct mmu_notifier_range range;
++ 
++ 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, NULL,
++ 			migrate->vma->vm_mm, migrate->start, migrate->end);
++ 	mmu_notifier_invalidate_range_start(&range);
+++>>>>>>> 7b86ac3371b7 (pagewalk: separate function pointers from iterator data)
++ 
++ 	walk_page_range(migrate->vma->vm_mm, migrate->start, migrate->end,
++ 			&migrate_vma_walk_ops, migrate);
+  
++ 	mmu_notifier_invalidate_range_end(&range);
+  	migrate->end = migrate->start + (migrate->npages << PAGE_SHIFT);
+  }
+  
+* Unmerged path include/linux/pagewalk.h
+* Unmerged path arch/openrisc/kernel/dma.c
+diff --git a/arch/powerpc/mm/book3s64/subpage_prot.c b/arch/powerpc/mm/book3s64/subpage_prot.c
+index 199822357568..b27fc5498a6b 100644
+--- a/arch/powerpc/mm/book3s64/subpage_prot.c
++++ b/arch/powerpc/mm/book3s64/subpage_prot.c
+@@ -140,14 +140,14 @@ static int subpage_walk_pmd_entry(pmd_t *pmd, unsigned long addr,
+ 	return 0;
+ }
+ 
++static const struct mm_walk_ops subpage_walk_ops = {
++	.pmd_entry	= subpage_walk_pmd_entry,
++};
++
+ static void subpage_mark_vma_nohuge(struct mm_struct *mm, unsigned long addr,
+ 				    unsigned long len)
+ {
+ 	struct vm_area_struct *vma;
+-	struct mm_walk subpage_proto_walk = {
+-		.mm = mm,
+-		.pmd_entry = subpage_walk_pmd_entry,
+-	};
+ 
+ 	/*
+ 	 * We don't try too hard, we just mark all the vma in that range
+@@ -164,7 +164,7 @@ static void subpage_mark_vma_nohuge(struct mm_struct *mm, unsigned long addr,
+ 		if (vma->vm_start >= (addr + len))
+ 			break;
+ 		vma->vm_flags |= VM_NOHUGEPAGE;
+-		walk_page_vma(vma, &subpage_proto_walk);
++		walk_page_vma(vma, &subpage_walk_ops, NULL);
+ 		vma = vma->vm_next;
+ 	}
+ }
+diff --git a/arch/s390/mm/gmap.c b/arch/s390/mm/gmap.c
+index 911c7ded35f1..a18ebfc0e880 100644
+--- a/arch/s390/mm/gmap.c
++++ b/arch/s390/mm/gmap.c
+@@ -2515,13 +2515,9 @@ static int __zap_zero_pages(pmd_t *pmd, unsigned long start,
+ 	return 0;
+ }
+ 
+-static inline void zap_zero_pages(struct mm_struct *mm)
+-{
+-	struct mm_walk walk = { .pmd_entry = __zap_zero_pages };
+-
+-	walk.mm = mm;
+-	walk_page_range(0, TASK_SIZE, &walk);
+-}
++static const struct mm_walk_ops zap_zero_walk_ops = {
++	.pmd_entry	= __zap_zero_pages,
++};
+ 
+ /*
+  * switch on pgstes for its userspace process (for kvm)
+@@ -2540,7 +2536,7 @@ int s390_enable_sie(void)
+ 	mm->context.has_pgste = 1;
+ 	/* split thp mappings and disable thp for future mappings */
+ 	thp_split_mm(mm);
+-	zap_zero_pages(mm);
++	walk_page_range(mm, 0, TASK_SIZE, &zap_zero_walk_ops, NULL);
+ 	up_write(&mm->mmap_sem);
+ 	return 0;
+ }
+@@ -2583,12 +2579,13 @@ static int __s390_enable_skey_hugetlb(pte_t *pte, unsigned long addr,
+ 	return 0;
+ }
+ 
++static const struct mm_walk_ops enable_skey_walk_ops = {
++	.hugetlb_entry		= __s390_enable_skey_hugetlb,
++	.pte_entry		= __s390_enable_skey_pte,
++};
++
+ int s390_enable_skey(void)
+ {
+-	struct mm_walk walk = {
+-		.hugetlb_entry = __s390_enable_skey_hugetlb,
+-		.pte_entry = __s390_enable_skey_pte,
+-	};
+ 	struct mm_struct *mm = current->mm;
+ 	struct vm_area_struct *vma;
+ 	int rc = 0;
+@@ -2608,8 +2605,7 @@ int s390_enable_skey(void)
+ 	}
+ 	mm->def_flags &= ~VM_MERGEABLE;
+ 
+-	walk.mm = mm;
+-	walk_page_range(0, TASK_SIZE, &walk);
++	walk_page_range(mm, 0, TASK_SIZE, &enable_skey_walk_ops, NULL);
+ 
+ out_up:
+ 	up_write(&mm->mmap_sem);
+@@ -2627,13 +2623,14 @@ static int __s390_reset_cmma(pte_t *pte, unsigned long addr,
+ 	return 0;
+ }
+ 
++static const struct mm_walk_ops reset_cmma_walk_ops = {
++	.pte_entry		= __s390_reset_cmma,
++};
++
+ void s390_reset_cmma(struct mm_struct *mm)
+ {
+-	struct mm_walk walk = { .pte_entry = __s390_reset_cmma };
+-
+ 	down_write(&mm->mmap_sem);
+-	walk.mm = mm;
+-	walk_page_range(0, TASK_SIZE, &walk);
++	walk_page_range(mm, 0, TASK_SIZE, &reset_cmma_walk_ops, NULL);
+ 	up_write(&mm->mmap_sem);
+ }
+ EXPORT_SYMBOL_GPL(s390_reset_cmma);
+* Unmerged path fs/proc/task_mmu.c
+* Unmerged path include/linux/pagewalk.h
+* Unmerged path mm/hmm.c
+* Unmerged path mm/madvise.c
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 383961c504ef..b84970aaa334 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -5060,17 +5060,16 @@ static int mem_cgroup_count_precharge_pte_range(pmd_t *pmd,
+ 	return 0;
+ }
+ 
++static const struct mm_walk_ops precharge_walk_ops = {
++	.pmd_entry	= mem_cgroup_count_precharge_pte_range,
++};
++
+ static unsigned long mem_cgroup_count_precharge(struct mm_struct *mm)
+ {
+ 	unsigned long precharge;
+ 
+-	struct mm_walk mem_cgroup_count_precharge_walk = {
+-		.pmd_entry = mem_cgroup_count_precharge_pte_range,
+-		.mm = mm,
+-	};
+ 	down_read(&mm->mmap_sem);
+-	walk_page_range(0, mm->highest_vm_end,
+-			&mem_cgroup_count_precharge_walk);
++	walk_page_range(mm, 0, mm->highest_vm_end, &precharge_walk_ops, NULL);
+ 	up_read(&mm->mmap_sem);
+ 
+ 	precharge = mc.precharge;
+@@ -5339,13 +5338,12 @@ static int mem_cgroup_move_charge_pte_range(pmd_t *pmd,
+ 	return ret;
+ }
+ 
++static const struct mm_walk_ops charge_walk_ops = {
++	.pmd_entry	= mem_cgroup_move_charge_pte_range,
++};
++
+ static void mem_cgroup_move_charge(void)
+ {
+-	struct mm_walk mem_cgroup_move_charge_walk = {
+-		.pmd_entry = mem_cgroup_move_charge_pte_range,
+-		.mm = mc.mm,
+-	};
+-
+ 	lru_add_drain_all();
+ 	/*
+ 	 * Signal lock_page_memcg() to take the memcg's move_lock
+@@ -5371,7 +5369,8 @@ static void mem_cgroup_move_charge(void)
+ 	 * When we have consumed all precharges and failed in doing
+ 	 * additional charge, the page walk just aborts.
+ 	 */
+-	walk_page_range(0, mc.mm->highest_vm_end, &mem_cgroup_move_charge_walk);
++	walk_page_range(mc.mm, 0, mc.mm->highest_vm_end, &charge_walk_ops,
++			NULL);
+ 
+ 	up_read(&mc.mm->mmap_sem);
+ 	atomic_dec(&mc.from->moving_account);
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index a22278fe510c..00fbce4a07c9 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -635,6 +635,12 @@ static int queue_pages_test_walk(unsigned long start, unsigned long end,
+ 	return 1;
+ }
+ 
++static const struct mm_walk_ops queue_pages_walk_ops = {
++	.hugetlb_entry		= queue_pages_hugetlb,
++	.pmd_entry		= queue_pages_pte_range,
++	.test_walk		= queue_pages_test_walk,
++};
++
+ /*
+  * Walk through page tables and collect pages to be migrated.
+  *
+@@ -653,15 +659,8 @@ queue_pages_range(struct mm_struct *mm, unsigned long start, unsigned long end,
+ 		.nmask = nodes,
+ 		.prev = NULL,
+ 	};
+-	struct mm_walk queue_pages_walk = {
+-		.hugetlb_entry = queue_pages_hugetlb,
+-		.pmd_entry = queue_pages_pte_range,
+-		.test_walk = queue_pages_test_walk,
+-		.mm = mm,
+-		.private = &qp,
+-	};
+ 
+-	return walk_page_range(start, end, &queue_pages_walk);
++	return walk_page_range(mm, start, end, &queue_pages_walk_ops, &qp);
+ }
+ 
+ /*
+* Unmerged path mm/migrate.c
+diff --git a/mm/mincore.c b/mm/mincore.c
+index 4fe91d497436..5784d658af37 100644
+--- a/mm/mincore.c
++++ b/mm/mincore.c
+@@ -193,6 +193,12 @@ static inline bool can_do_mincore(struct vm_area_struct *vma)
+ 		inode_permission(file_inode(vma->vm_file), MAY_WRITE) == 0;
+ }
+ 
++static const struct mm_walk_ops mincore_walk_ops = {
++	.pmd_entry		= mincore_pte_range,
++	.pte_hole		= mincore_unmapped_range,
++	.hugetlb_entry		= mincore_hugetlb,
++};
++
+ /*
+  * Do a chunk of "sys_mincore()". We've already checked
+  * all the arguments, we hold the mmap semaphore: we should
+@@ -203,12 +209,6 @@ static long do_mincore(unsigned long addr, unsigned long pages, unsigned char *v
+ 	struct vm_area_struct *vma;
+ 	unsigned long end;
+ 	int err;
+-	struct mm_walk mincore_walk = {
+-		.pmd_entry = mincore_pte_range,
+-		.pte_hole = mincore_unmapped_range,
+-		.hugetlb_entry = mincore_hugetlb,
+-		.private = vec,
+-	};
+ 
+ 	vma = find_vma(current->mm, addr);
+ 	if (!vma || addr < vma->vm_start)
+@@ -219,8 +219,7 @@ static long do_mincore(unsigned long addr, unsigned long pages, unsigned char *v
+ 		memset(vec, 1, pages);
+ 		return pages;
+ 	}
+-	mincore_walk.mm = vma->vm_mm;
+-	err = walk_page_range(addr, end, &mincore_walk);
++	err = walk_page_range(vma->vm_mm, addr, end, &mincore_walk_ops, vec);
+ 	if (err < 0)
+ 		return err;
+ 	return (end - addr) >> PAGE_SHIFT;
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 86837f25055b..61470fc11a89 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -361,20 +361,11 @@ static int prot_none_test(unsigned long addr, unsigned long next,
+ 	return 0;
+ }
+ 
+-static int prot_none_walk(struct vm_area_struct *vma, unsigned long start,
+-			   unsigned long end, unsigned long newflags)
+-{
+-	pgprot_t new_pgprot = vm_get_page_prot(newflags);
+-	struct mm_walk prot_none_walk = {
+-		.pte_entry = prot_none_pte_entry,
+-		.hugetlb_entry = prot_none_hugetlb_entry,
+-		.test_walk = prot_none_test,
+-		.mm = current->mm,
+-		.private = &new_pgprot,
+-	};
+-
+-	return walk_page_range(start, end, &prot_none_walk);
+-}
++static const struct mm_walk_ops prot_none_walk_ops = {
++	.pte_entry		= prot_none_pte_entry,
++	.hugetlb_entry		= prot_none_hugetlb_entry,
++	.test_walk		= prot_none_test,
++};
+ 
+ int
+ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
+@@ -401,7 +392,10 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
+ 	if (arch_has_pfn_modify_check() &&
+ 	    (vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) &&
+ 	    (newflags & (VM_READ|VM_WRITE|VM_EXEC)) == 0) {
+-		error = prot_none_walk(vma, start, end, newflags);
++		pgprot_t new_pgprot = vm_get_page_prot(newflags);
++
++		error = walk_page_range(current->mm, start, end,
++				&prot_none_walk_ops, &new_pgprot);
+ 		if (error)
+ 			return error;
+ 	}
+diff --git a/mm/pagewalk.c b/mm/pagewalk.c
+index c3084ff2569d..f42f792b8c0a 100644
+--- a/mm/pagewalk.c
++++ b/mm/pagewalk.c
+@@ -9,10 +9,11 @@ static int walk_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ {
+ 	pte_t *pte;
+ 	int err = 0;
++	const struct mm_walk_ops *ops = walk->ops;
+ 
+ 	pte = pte_offset_map(pmd, addr);
+ 	for (;;) {
+-		err = walk->pte_entry(pte, addr, addr + PAGE_SIZE, walk);
++		err = ops->pte_entry(pte, addr, addr + PAGE_SIZE, walk);
+ 		if (err)
+ 		       break;
+ 		addr += PAGE_SIZE;
+@@ -30,6 +31,7 @@ static int walk_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
+ {
+ 	pmd_t *pmd;
+ 	unsigned long next;
++	const struct mm_walk_ops *ops = walk->ops;
+ 	int err = 0;
+ 
+ 	pmd = pmd_offset(pud, addr);
+@@ -37,8 +39,8 @@ static int walk_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
+ again:
+ 		next = pmd_addr_end(addr, end);
+ 		if (pmd_none(*pmd) || !walk->vma) {
+-			if (walk->pte_hole)
+-				err = walk->pte_hole(addr, next, walk);
++			if (ops->pte_hole)
++				err = ops->pte_hole(addr, next, walk);
+ 			if (err)
+ 				break;
+ 			continue;
+@@ -47,8 +49,8 @@ static int walk_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
+ 		 * This implies that each ->pmd_entry() handler
+ 		 * needs to know about pmd_trans_huge() pmds
+ 		 */
+-		if (walk->pmd_entry)
+-			err = walk->pmd_entry(pmd, addr, next, walk);
++		if (ops->pmd_entry)
++			err = ops->pmd_entry(pmd, addr, next, walk);
+ 		if (err)
+ 			break;
+ 
+@@ -56,7 +58,7 @@ static int walk_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
+ 		 * Check this here so we only break down trans_huge
+ 		 * pages when we _need_ to
+ 		 */
+-		if (!walk->pte_entry)
++		if (!ops->pte_entry)
+ 			continue;
+ 
+ 		split_huge_pmd(walk->vma, pmd, addr);
+@@ -75,6 +77,7 @@ static int walk_pud_range(p4d_t *p4d, unsigned long addr, unsigned long end,
+ {
+ 	pud_t *pud;
+ 	unsigned long next;
++	const struct mm_walk_ops *ops = walk->ops;
+ 	int err = 0;
+ 
+ 	pud = pud_offset(p4d, addr);
+@@ -82,18 +85,18 @@ static int walk_pud_range(p4d_t *p4d, unsigned long addr, unsigned long end,
+  again:
+ 		next = pud_addr_end(addr, end);
+ 		if (pud_none(*pud) || !walk->vma) {
+-			if (walk->pte_hole)
+-				err = walk->pte_hole(addr, next, walk);
++			if (ops->pte_hole)
++				err = ops->pte_hole(addr, next, walk);
+ 			if (err)
+ 				break;
+ 			continue;
+ 		}
+ 
+-		if (walk->pud_entry) {
++		if (ops->pud_entry) {
+ 			spinlock_t *ptl = pud_trans_huge_lock(pud, walk->vma);
+ 
+ 			if (ptl) {
+-				err = walk->pud_entry(pud, addr, next, walk);
++				err = ops->pud_entry(pud, addr, next, walk);
+ 				spin_unlock(ptl);
+ 				if (err)
+ 					break;
+@@ -105,7 +108,7 @@ static int walk_pud_range(p4d_t *p4d, unsigned long addr, unsigned long end,
+ 		if (pud_none(*pud))
+ 			goto again;
+ 
+-		if (walk->pmd_entry || walk->pte_entry)
++		if (ops->pmd_entry || ops->pte_entry)
+ 			err = walk_pmd_range(pud, addr, next, walk);
+ 		if (err)
+ 			break;
+@@ -119,19 +122,20 @@ static int walk_p4d_range(pgd_t *pgd, unsigned long addr, unsigned long end,
+ {
+ 	p4d_t *p4d;
+ 	unsigned long next;
++	const struct mm_walk_ops *ops = walk->ops;
+ 	int err = 0;
+ 
+ 	p4d = p4d_offset(pgd, addr);
+ 	do {
+ 		next = p4d_addr_end(addr, end);
+ 		if (p4d_none_or_clear_bad(p4d)) {
+-			if (walk->pte_hole)
+-				err = walk->pte_hole(addr, next, walk);
++			if (ops->pte_hole)
++				err = ops->pte_hole(addr, next, walk);
+ 			if (err)
+ 				break;
+ 			continue;
+ 		}
+-		if (walk->pmd_entry || walk->pte_entry)
++		if (ops->pmd_entry || ops->pte_entry)
+ 			err = walk_pud_range(p4d, addr, next, walk);
+ 		if (err)
+ 			break;
+@@ -145,19 +149,20 @@ static int walk_pgd_range(unsigned long addr, unsigned long end,
+ {
+ 	pgd_t *pgd;
+ 	unsigned long next;
++	const struct mm_walk_ops *ops = walk->ops;
+ 	int err = 0;
+ 
+ 	pgd = pgd_offset(walk->mm, addr);
+ 	do {
+ 		next = pgd_addr_end(addr, end);
+ 		if (pgd_none_or_clear_bad(pgd)) {
+-			if (walk->pte_hole)
+-				err = walk->pte_hole(addr, next, walk);
++			if (ops->pte_hole)
++				err = ops->pte_hole(addr, next, walk);
+ 			if (err)
+ 				break;
+ 			continue;
+ 		}
+-		if (walk->pmd_entry || walk->pte_entry)
++		if (ops->pmd_entry || ops->pte_entry)
+ 			err = walk_p4d_range(pgd, addr, next, walk);
+ 		if (err)
+ 			break;
+@@ -183,6 +188,7 @@ static int walk_hugetlb_range(unsigned long addr, unsigned long end,
+ 	unsigned long hmask = huge_page_mask(h);
+ 	unsigned long sz = huge_page_size(h);
+ 	pte_t *pte;
++	const struct mm_walk_ops *ops = walk->ops;
+ 	int err = 0;
+ 
+ 	do {
+@@ -190,9 +196,9 @@ static int walk_hugetlb_range(unsigned long addr, unsigned long end,
+ 		pte = huge_pte_offset(walk->mm, addr & hmask, sz);
+ 
+ 		if (pte)
+-			err = walk->hugetlb_entry(pte, hmask, addr, next, walk);
+-		else if (walk->pte_hole)
+-			err = walk->pte_hole(addr, next, walk);
++			err = ops->hugetlb_entry(pte, hmask, addr, next, walk);
++		else if (ops->pte_hole)
++			err = ops->pte_hole(addr, next, walk);
+ 
+ 		if (err)
+ 			break;
+@@ -220,9 +226,10 @@ static int walk_page_test(unsigned long start, unsigned long end,
+ 			struct mm_walk *walk)
+ {
+ 	struct vm_area_struct *vma = walk->vma;
++	const struct mm_walk_ops *ops = walk->ops;
+ 
+-	if (walk->test_walk)
+-		return walk->test_walk(start, end, walk);
++	if (ops->test_walk)
++		return ops->test_walk(start, end, walk);
+ 
+ 	/*
+ 	 * vma(VM_PFNMAP) doesn't have any valid struct pages behind VM_PFNMAP
+@@ -234,8 +241,8 @@ static int walk_page_test(unsigned long start, unsigned long end,
+ 	 */
+ 	if (vma->vm_flags & VM_PFNMAP) {
+ 		int err = 1;
+-		if (walk->pte_hole)
+-			err = walk->pte_hole(start, end, walk);
++		if (ops->pte_hole)
++			err = ops->pte_hole(start, end, walk);
+ 		return err ? err : 1;
+ 	}
+ 	return 0;
+@@ -248,7 +255,7 @@ static int __walk_page_range(unsigned long start, unsigned long end,
+ 	struct vm_area_struct *vma = walk->vma;
+ 
+ 	if (vma && is_vm_hugetlb_page(vma)) {
+-		if (walk->hugetlb_entry)
++		if (walk->ops->hugetlb_entry)
+ 			err = walk_hugetlb_range(start, end, walk);
+ 	} else
+ 		err = walk_pgd_range(start, end, walk);
+@@ -258,11 +265,13 @@ static int __walk_page_range(unsigned long start, unsigned long end,
+ 
+ /**
+  * walk_page_range - walk page table with caller specific callbacks
+- * @start: start address of the virtual address range
+- * @end: end address of the virtual address range
+- * @walk: mm_walk structure defining the callbacks and the target address space
++ * @mm:		mm_struct representing the target process of page table walk
++ * @start:	start address of the virtual address range
++ * @end:	end address of the virtual address range
++ * @ops:	operation to call during the walk
++ * @private:	private data for callbacks' usage
+  *
+- * Recursively walk the page table tree of the process represented by @walk->mm
++ * Recursively walk the page table tree of the process represented by @mm
+  * within the virtual address range [@start, @end). During walking, we can do
+  * some caller-specific works for each entry, by setting up pmd_entry(),
+  * pte_entry(), and/or hugetlb_entry(). If you don't set up for some of these
+@@ -278,47 +287,52 @@ static int __walk_page_range(unsigned long start, unsigned long end,
+  *
+  * Before starting to walk page table, some callers want to check whether
+  * they really want to walk over the current vma, typically by checking
+- * its vm_flags. walk_page_test() and @walk->test_walk() are used for this
++ * its vm_flags. walk_page_test() and @ops->test_walk() are used for this
+  * purpose.
+  *
+  * struct mm_walk keeps current values of some common data like vma and pmd,
+  * which are useful for the access from callbacks. If you want to pass some
+- * caller-specific data to callbacks, @walk->private should be helpful.
++ * caller-specific data to callbacks, @private should be helpful.
+  *
+  * Locking:
+- *   Callers of walk_page_range() and walk_page_vma() should hold
+- *   @walk->mm->mmap_sem, because these function traverse vma list and/or
+- *   access to vma's data.
++ *   Callers of walk_page_range() and walk_page_vma() should hold @mm->mmap_sem,
++ *   because these function traverse vma list and/or access to vma's data.
+  */
+-int walk_page_range(unsigned long start, unsigned long end,
+-		    struct mm_walk *walk)
++int walk_page_range(struct mm_struct *mm, unsigned long start,
++		unsigned long end, const struct mm_walk_ops *ops,
++		void *private)
+ {
+ 	int err = 0;
+ 	unsigned long next;
+ 	struct vm_area_struct *vma;
++	struct mm_walk walk = {
++		.ops		= ops,
++		.mm		= mm,
++		.private	= private,
++	};
+ 
+ 	if (start >= end)
+ 		return -EINVAL;
+ 
+-	if (!walk->mm)
++	if (!walk.mm)
+ 		return -EINVAL;
+ 
+-	VM_BUG_ON_MM(!rwsem_is_locked(&walk->mm->mmap_sem), walk->mm);
++	VM_BUG_ON_MM(!rwsem_is_locked(&walk.mm->mmap_sem), walk.mm);
+ 
+-	vma = find_vma(walk->mm, start);
++	vma = find_vma(walk.mm, start);
+ 	do {
+ 		if (!vma) { /* after the last vma */
+-			walk->vma = NULL;
++			walk.vma = NULL;
+ 			next = end;
+ 		} else if (start < vma->vm_start) { /* outside vma */
+-			walk->vma = NULL;
++			walk.vma = NULL;
+ 			next = min(end, vma->vm_start);
+ 		} else { /* inside vma */
+-			walk->vma = vma;
++			walk.vma = vma;
+ 			next = min(end, vma->vm_end);
+ 			vma = vma->vm_next;
+ 
+-			err = walk_page_test(start, next, walk);
++			err = walk_page_test(start, next, &walk);
+ 			if (err > 0) {
+ 				/*
+ 				 * positive return values are purely for
+@@ -331,28 +345,34 @@ int walk_page_range(unsigned long start, unsigned long end,
+ 			if (err < 0)
+ 				break;
+ 		}
+-		if (walk->vma || walk->pte_hole)
+-			err = __walk_page_range(start, next, walk);
++		if (walk.vma || walk.ops->pte_hole)
++			err = __walk_page_range(start, next, &walk);
+ 		if (err)
+ 			break;
+ 	} while (start = next, start < end);
+ 	return err;
+ }
+ 
+-int walk_page_vma(struct vm_area_struct *vma, struct mm_walk *walk)
++int walk_page_vma(struct vm_area_struct *vma, const struct mm_walk_ops *ops,
++		void *private)
+ {
++	struct mm_walk walk = {
++		.ops		= ops,
++		.mm		= vma->vm_mm,
++		.vma		= vma,
++		.private	= private,
++	};
+ 	int err;
+ 
+-	if (!walk->mm)
++	if (!walk.mm)
+ 		return -EINVAL;
+ 
+-	VM_BUG_ON(!rwsem_is_locked(&walk->mm->mmap_sem));
+-	VM_BUG_ON(!vma);
+-	walk->vma = vma;
+-	err = walk_page_test(vma->vm_start, vma->vm_end, walk);
++	VM_BUG_ON(!rwsem_is_locked(&vma->vm_mm->mmap_sem));
++
++	err = walk_page_test(vma->vm_start, vma->vm_end, &walk);
+ 	if (err > 0)
+ 		return 0;
+ 	if (err < 0)
+ 		return err;
+-	return __walk_page_range(vma->vm_start, vma->vm_end, walk);
++	return __walk_page_range(vma->vm_start, vma->vm_end, &walk);
+ }
