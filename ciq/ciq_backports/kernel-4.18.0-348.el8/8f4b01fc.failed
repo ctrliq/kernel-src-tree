@@ -1,0 +1,427 @@
+libnvdimm/namespace: Differentiate between probe mapping and runtime mapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-348.el8
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+commit 8f4b01fcded2dc821349cc0edfa5311c05abe293
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-348.el8/8f4b01fc.failed
+
+The nvdimm core currently maps the full namespace to an ioremap range
+while probing the namespace mode. This can result in probe failures on
+architectures that have limited ioremap space.
+
+For example, with a large btt namespace that consumes most of I/O remap
+range, depending on the sequence of namespace initialization, the user
+can find a pfn namespace initialization failure due to unavailable I/O
+remap space which nvdimm core uses for temporary mapping.
+
+nvdimm core can avoid this failure by only mapping the reserved info
+block area to check for pfn superblock type and map the full namespace
+resource only before using the namespace.
+
+Given that personalities like BTT can be layered on top of any namespace
+type create a generic form of devm_nsio_enable (devm_namespace_enable)
+and use it inside the per-personality attach routines. Now
+devm_namespace_enable() is always paired with disable unless the mapping
+is going to be used for long term runtime access.
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Link: https://lore.kernel.org/r/20191017073308.32645-1-aneesh.kumar@linux.ibm.com
+[djbw: reworks to move devm_namespace_{en,dis}able into *attach helpers]
+	Reported-by: kbuild test robot <lkp@intel.com>
+Link: https://lore.kernel.org/r/20191031105741.102793-2-aneesh.kumar@linux.ibm.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 8f4b01fcded2dc821349cc0edfa5311c05abe293)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvdimm/nd-core.h
+diff --cc drivers/nvdimm/nd-core.h
+index ba6815195352,96e8630f451c..000000000000
+--- a/drivers/nvdimm/nd-core.h
++++ b/drivers/nvdimm/nd-core.h
+@@@ -175,4 -169,88 +175,91 @@@ ssize_t nd_namespace_store(struct devic
+  		struct nd_namespace_common **_ndns, const char *buf,
+  		size_t len);
+  struct nd_pfn *to_nd_pfn_safe(struct device *dev);
+++<<<<<<< HEAD
+++=======
++ bool is_nvdimm_bus(struct device *dev);
++ 
++ #if IS_ENABLED(CONFIG_ND_CLAIM)
++ int devm_nsio_enable(struct device *dev, struct nd_namespace_io *nsio,
++ 		resource_size_t size);
++ void devm_nsio_disable(struct device *dev, struct nd_namespace_io *nsio);
++ #else
++ static inline int devm_nsio_enable(struct device *dev,
++ 		struct nd_namespace_io *nsio, resource_size_t size)
++ {
++ 	return -ENXIO;
++ }
++ 
++ static inline void devm_nsio_disable(struct device *dev,
++ 		struct nd_namespace_io *nsio)
++ {
++ }
++ #endif
++ 
++ #ifdef CONFIG_PROVE_LOCKING
++ extern struct class *nd_class;
++ 
++ enum {
++ 	LOCK_BUS,
++ 	LOCK_NDCTL,
++ 	LOCK_REGION,
++ 	LOCK_DIMM = LOCK_REGION,
++ 	LOCK_NAMESPACE,
++ 	LOCK_CLAIM,
++ };
++ 
++ static inline void debug_nvdimm_lock(struct device *dev)
++ {
++ 	if (is_nd_region(dev))
++ 		mutex_lock_nested(&dev->lockdep_mutex, LOCK_REGION);
++ 	else if (is_nvdimm(dev))
++ 		mutex_lock_nested(&dev->lockdep_mutex, LOCK_DIMM);
++ 	else if (is_nd_btt(dev) || is_nd_pfn(dev) || is_nd_dax(dev))
++ 		mutex_lock_nested(&dev->lockdep_mutex, LOCK_CLAIM);
++ 	else if (dev->parent && (is_nd_region(dev->parent)))
++ 		mutex_lock_nested(&dev->lockdep_mutex, LOCK_NAMESPACE);
++ 	else if (is_nvdimm_bus(dev))
++ 		mutex_lock_nested(&dev->lockdep_mutex, LOCK_BUS);
++ 	else if (dev->class && dev->class == nd_class)
++ 		mutex_lock_nested(&dev->lockdep_mutex, LOCK_NDCTL);
++ 	else
++ 		dev_WARN(dev, "unknown lock level\n");
++ }
++ 
++ static inline void debug_nvdimm_unlock(struct device *dev)
++ {
++ 	mutex_unlock(&dev->lockdep_mutex);
++ }
++ 
++ static inline void nd_device_lock(struct device *dev)
++ {
++ 	device_lock(dev);
++ 	debug_nvdimm_lock(dev);
++ }
++ 
++ static inline void nd_device_unlock(struct device *dev)
++ {
++ 	debug_nvdimm_unlock(dev);
++ 	device_unlock(dev);
++ }
++ #else
++ static inline void nd_device_lock(struct device *dev)
++ {
++ 	device_lock(dev);
++ }
++ 
++ static inline void nd_device_unlock(struct device *dev)
++ {
++ 	device_unlock(dev);
++ }
++ 
++ static inline void debug_nvdimm_lock(struct device *dev)
++ {
++ }
++ 
++ static inline void debug_nvdimm_unlock(struct device *dev)
++ {
++ }
++ #endif
+++>>>>>>> 8f4b01fcded2 (libnvdimm/namespace: Differentiate between probe mapping and runtime mapping)
+  #endif /* __ND_CORE_H__ */
+diff --git a/drivers/dax/pmem/core.c b/drivers/dax/pmem/core.c
+index 979761680371..244146b845b8 100644
+--- a/drivers/dax/pmem/core.c
++++ b/drivers/dax/pmem/core.c
+@@ -25,20 +25,20 @@ struct dev_dax *__dax_pmem_probe(struct device *dev, enum dev_dax_subsys subsys)
+ 	ndns = nvdimm_namespace_common_probe(dev);
+ 	if (IS_ERR(ndns))
+ 		return ERR_CAST(ndns);
+-	nsio = to_nd_namespace_io(&ndns->dev);
+ 
+ 	/* parse the 'pfn' info block via ->rw_bytes */
+-	rc = devm_nsio_enable(dev, nsio);
++	rc = devm_namespace_enable(dev, ndns, nd_info_block_reserve());
+ 	if (rc)
+ 		return ERR_PTR(rc);
+ 	rc = nvdimm_setup_pfn(nd_pfn, &pgmap);
+ 	if (rc)
+ 		return ERR_PTR(rc);
+-	devm_nsio_disable(dev, nsio);
++	devm_namespace_disable(dev, ndns);
+ 
+ 	/* reserve the metadata area, device-dax will reserve the data */
+         pfn_sb = nd_pfn->pfn_sb;
+ 	offset = le64_to_cpu(pfn_sb->dataoff);
++	nsio = to_nd_namespace_io(&ndns->dev);
+ 	if (!devm_request_mem_region(dev, nsio->res.start, offset,
+ 				dev_name(&ndns->dev))) {
+                 dev_warn(dev, "could not reserve metadata\n");
+diff --git a/drivers/nvdimm/btt.c b/drivers/nvdimm/btt.c
+index fcdd1ce49080..69d23bda759e 100644
+--- a/drivers/nvdimm/btt.c
++++ b/drivers/nvdimm/btt.c
+@@ -1680,7 +1680,8 @@ int nvdimm_namespace_attach_btt(struct nd_namespace_common *ndns)
+ 	struct nd_region *nd_region;
+ 	struct btt_sb *btt_sb;
+ 	struct btt *btt;
+-	size_t rawsize;
++	size_t size, rawsize;
++	int rc;
+ 
+ 	if (!nd_btt->uuid || !nd_btt->ndns || !nd_btt->lbasize) {
+ 		dev_dbg(&nd_btt->dev, "incomplete btt configuration\n");
+@@ -1691,6 +1692,11 @@ int nvdimm_namespace_attach_btt(struct nd_namespace_common *ndns)
+ 	if (!btt_sb)
+ 		return -ENOMEM;
+ 
++	size = nvdimm_namespace_capacity(ndns);
++	rc = devm_namespace_enable(&nd_btt->dev, ndns, size);
++	if (rc)
++		return rc;
++
+ 	/*
+ 	 * If this returns < 0, that is ok as it just means there wasn't
+ 	 * an existing BTT, and we're creating a new one. We still need to
+@@ -1699,7 +1705,7 @@ int nvdimm_namespace_attach_btt(struct nd_namespace_common *ndns)
+ 	 */
+ 	nd_btt_version(nd_btt, ndns, btt_sb);
+ 
+-	rawsize = nvdimm_namespace_capacity(ndns) - nd_btt->initial_offset;
++	rawsize = size - nd_btt->initial_offset;
+ 	if (rawsize < ARENA_MIN_SIZE) {
+ 		dev_dbg(&nd_btt->dev, "%s must be at least %ld bytes\n",
+ 				dev_name(&ndns->dev),
+diff --git a/drivers/nvdimm/claim.c b/drivers/nvdimm/claim.c
+index 13510bae1e6f..37a0ea954792 100644
+--- a/drivers/nvdimm/claim.c
++++ b/drivers/nvdimm/claim.c
+@@ -308,13 +308,14 @@ static int nsio_rw_bytes(struct nd_namespace_common *ndns,
+ 	return rc;
+ }
+ 
+-int devm_nsio_enable(struct device *dev, struct nd_namespace_io *nsio)
++int devm_nsio_enable(struct device *dev, struct nd_namespace_io *nsio,
++		resource_size_t size)
+ {
+ 	struct resource *res = &nsio->res;
+ 	struct nd_namespace_common *ndns = &nsio->common;
+ 
+-	nsio->size = resource_size(res);
+-	if (!devm_request_mem_region(dev, res->start, resource_size(res),
++	nsio->size = size;
++	if (!devm_request_mem_region(dev, res->start, size,
+ 				dev_name(&ndns->dev))) {
+ 		dev_warn(dev, "could not reserve region %pR\n", res);
+ 		return -EBUSY;
+@@ -326,12 +327,10 @@ int devm_nsio_enable(struct device *dev, struct nd_namespace_io *nsio)
+ 	nvdimm_badblocks_populate(to_nd_region(ndns->dev.parent), &nsio->bb,
+ 			&nsio->res);
+ 
+-	nsio->addr = devm_memremap(dev, res->start, resource_size(res),
+-			ARCH_MEMREMAP_PMEM);
++	nsio->addr = devm_memremap(dev, res->start, size, ARCH_MEMREMAP_PMEM);
+ 
+ 	return PTR_ERR_OR_ZERO(nsio->addr);
+ }
+-EXPORT_SYMBOL_GPL(devm_nsio_enable);
+ 
+ void devm_nsio_disable(struct device *dev, struct nd_namespace_io *nsio)
+ {
+@@ -339,6 +338,5 @@ void devm_nsio_disable(struct device *dev, struct nd_namespace_io *nsio)
+ 
+ 	devm_memunmap(dev, nsio->addr);
+ 	devm_exit_badblocks(dev, &nsio->bb);
+-	devm_release_mem_region(dev, res->start, resource_size(res));
++	devm_release_mem_region(dev, res->start, nsio->size);
+ }
+-EXPORT_SYMBOL_GPL(devm_nsio_disable);
+diff --git a/drivers/nvdimm/namespace_devs.c b/drivers/nvdimm/namespace_devs.c
+index aa7ec6857351..7a0e6ff0d900 100644
+--- a/drivers/nvdimm/namespace_devs.c
++++ b/drivers/nvdimm/namespace_devs.c
+@@ -1793,6 +1793,23 @@ struct nd_namespace_common *nvdimm_namespace_common_probe(struct device *dev)
+ }
+ EXPORT_SYMBOL(nvdimm_namespace_common_probe);
+ 
++int devm_namespace_enable(struct device *dev, struct nd_namespace_common *ndns,
++		resource_size_t size)
++{
++	if (is_namespace_blk(&ndns->dev))
++		return 0;
++	return devm_nsio_enable(dev, to_nd_namespace_io(&ndns->dev), size);
++}
++EXPORT_SYMBOL_GPL(devm_namespace_enable);
++
++void devm_namespace_disable(struct device *dev, struct nd_namespace_common *ndns)
++{
++	if (is_namespace_blk(&ndns->dev))
++		return;
++	devm_nsio_disable(dev, to_nd_namespace_io(&ndns->dev));
++}
++EXPORT_SYMBOL_GPL(devm_namespace_disable);
++
+ static struct device **create_namespace_io(struct nd_region *nd_region)
+ {
+ 	struct nd_namespace_io *nsio;
+* Unmerged path drivers/nvdimm/nd-core.h
+diff --git a/drivers/nvdimm/nd.h b/drivers/nvdimm/nd.h
+index c4ece6ae6695..7db83ed3a791 100644
+--- a/drivers/nvdimm/nd.h
++++ b/drivers/nvdimm/nd.h
+@@ -221,6 +221,11 @@ struct nd_dax {
+ 	struct nd_pfn nd_pfn;
+ };
+ 
++static inline u32 nd_info_block_reserve(void)
++{
++	return ALIGN(SZ_8K, PAGE_SIZE);
++}
++
+ enum nd_async_mode {
+ 	ND_SYNC,
+ 	ND_ASYNC,
+@@ -386,29 +391,20 @@ const char *nvdimm_namespace_disk_name(struct nd_namespace_common *ndns,
+ unsigned int pmem_sector_size(struct nd_namespace_common *ndns);
+ void nvdimm_badblocks_populate(struct nd_region *nd_region,
+ 		struct badblocks *bb, const struct resource *res);
++int devm_namespace_enable(struct device *dev, struct nd_namespace_common *ndns,
++		resource_size_t size);
++void devm_namespace_disable(struct device *dev,
++		struct nd_namespace_common *ndns);
+ #if IS_ENABLED(CONFIG_ND_CLAIM)
+-
+ /* max struct page size independent of kernel config */
+ #define MAX_STRUCT_PAGE_SIZE 64
+-
+ int nvdimm_setup_pfn(struct nd_pfn *nd_pfn, struct dev_pagemap *pgmap);
+-int devm_nsio_enable(struct device *dev, struct nd_namespace_io *nsio);
+-void devm_nsio_disable(struct device *dev, struct nd_namespace_io *nsio);
+ #else
+ static inline int nvdimm_setup_pfn(struct nd_pfn *nd_pfn,
+ 				   struct dev_pagemap *pgmap)
+ {
+ 	return -ENXIO;
+ }
+-static inline int devm_nsio_enable(struct device *dev,
+-		struct nd_namespace_io *nsio)
+-{
+-	return -ENXIO;
+-}
+-static inline void devm_nsio_disable(struct device *dev,
+-		struct nd_namespace_io *nsio)
+-{
+-}
+ #endif
+ int nd_blk_region_init(struct nd_region *nd_region);
+ int nd_region_activate(struct nd_region *nd_region);
+diff --git a/drivers/nvdimm/pfn_devs.c b/drivers/nvdimm/pfn_devs.c
+index 9424afbce427..e6f29d1f118d 100644
+--- a/drivers/nvdimm/pfn_devs.c
++++ b/drivers/nvdimm/pfn_devs.c
+@@ -376,6 +376,15 @@ static int nd_pfn_clear_memmap_errors(struct nd_pfn *nd_pfn)
+ 	meta_start = (SZ_4K + sizeof(*pfn_sb)) >> 9;
+ 	meta_num = (le64_to_cpu(pfn_sb->dataoff) >> 9) - meta_start;
+ 
++	/*
++	 * re-enable the namespace with correct size so that we can access
++	 * the device memmap area.
++	 */
++	devm_namespace_disable(&nd_pfn->dev, ndns);
++	rc = devm_namespace_enable(&nd_pfn->dev, ndns, le64_to_cpu(pfn_sb->dataoff));
++	if (rc)
++		return rc;
++
+ 	do {
+ 		unsigned long zero_len;
+ 		u64 nsoff;
+@@ -616,11 +625,6 @@ int nd_pfn_probe(struct device *dev, struct nd_namespace_common *ndns)
+ }
+ EXPORT_SYMBOL(nd_pfn_probe);
+ 
+-static u32 info_block_reserve(void)
+-{
+-	return ALIGN(SZ_8K, PAGE_SIZE);
+-}
+-
+ /*
+  * We hotplug memory at sub-section granularity, pad the reserved area
+  * from the previous section base to the namespace base address.
+@@ -634,7 +638,7 @@ static unsigned long init_altmap_base(resource_size_t base)
+ 
+ static unsigned long init_altmap_reserve(resource_size_t base)
+ {
+-	unsigned long reserve = info_block_reserve() >> PAGE_SHIFT;
++	unsigned long reserve = nd_info_block_reserve() >> PAGE_SHIFT;
+ 	unsigned long base_pfn = PHYS_PFN(base);
+ 
+ 	reserve += base_pfn - SUBSECTION_ALIGN_DOWN(base_pfn);
+@@ -649,7 +653,7 @@ static int __nvdimm_setup_pfn(struct nd_pfn *nd_pfn, struct dev_pagemap *pgmap)
+ 	u64 offset = le64_to_cpu(pfn_sb->dataoff);
+ 	u32 start_pad = __le32_to_cpu(pfn_sb->start_pad);
+ 	u32 end_trunc = __le32_to_cpu(pfn_sb->end_trunc);
+-	u32 reserve = info_block_reserve();
++	u32 reserve = nd_info_block_reserve();
+ 	struct nd_namespace_common *ndns = nd_pfn->ndns;
+ 	struct nd_namespace_io *nsio = to_nd_namespace_io(&ndns->dev);
+ 	resource_size_t base = nsio->res.start + start_pad;
+diff --git a/drivers/nvdimm/pmem.c b/drivers/nvdimm/pmem.c
+index 18752df39bd6..30d89c62cbef 100644
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@ -400,6 +400,10 @@ static int pmem_attach_disk(struct device *dev,
+ 	if (!pmem)
+ 		return -ENOMEM;
+ 
++	rc = devm_namespace_enable(dev, ndns, nd_info_block_reserve());
++	if (rc)
++		return rc;
++
+ 	/* while nsio_rw_bytes is active, parse a pfn info block if present */
+ 	if (is_nd_pfn(dev)) {
+ 		nd_pfn = to_nd_pfn(dev);
+@@ -409,7 +413,7 @@ static int pmem_attach_disk(struct device *dev,
+ 	}
+ 
+ 	/* we're attaching a block device, disable raw namespace access */
+-	devm_nsio_disable(dev, nsio);
++	devm_namespace_disable(dev, ndns);
+ 
+ 	dev_set_drvdata(dev, pmem);
+ 	pmem->phys_addr = res->start;
+@@ -524,15 +528,16 @@ static int nd_pmem_probe(struct device *dev)
+ 	if (IS_ERR(ndns))
+ 		return PTR_ERR(ndns);
+ 
+-	if (devm_nsio_enable(dev, to_nd_namespace_io(&ndns->dev)))
+-		return -ENXIO;
+-
+ 	if (is_nd_btt(dev))
+ 		return nvdimm_namespace_attach_btt(ndns);
+ 
+ 	if (is_nd_pfn(dev))
+ 		return pmem_attach_disk(dev, ndns);
+ 
++	ret = devm_namespace_enable(dev, ndns, nd_info_block_reserve());
++	if (ret)
++		return ret;
++
+ 	ret = nd_btt_probe(dev, ndns);
+ 	if (ret == 0)
+ 		return -ENXIO;
+@@ -559,6 +564,10 @@ static int nd_pmem_probe(struct device *dev)
+ 		return -ENXIO;
+ 	else if (ret == -EOPNOTSUPP)
+ 		return ret;
++
++	/* probe complete, attach handles namespace enabling */
++	devm_namespace_disable(dev, ndns);
++
+ 	return pmem_attach_disk(dev, ndns);
+ }
+ 
