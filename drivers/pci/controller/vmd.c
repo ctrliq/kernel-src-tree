@@ -815,7 +815,6 @@ static int vmd_suspend(struct device *dev)
 	for (i = 0; i < vmd->msix_count; i++)
                 devm_free_irq(dev, pci_irq_vector(pdev, i), vmd->irqs[i]);
 
-	pci_save_state(pdev);
 	return 0;
 }
 
@@ -833,7 +832,6 @@ static int vmd_resume(struct device *dev)
 			return err;
 	}
 
-	pci_restore_state(pdev);
 	return 0;
 }
 #endif
