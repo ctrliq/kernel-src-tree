@@ -119,13 +119,21 @@ $(OUTPUT)/test_xdp_noinline.o: CLANG_FLAGS += -fno-inline
 BTF_LLC_PROBE := $(shell $(LLC) -march=bpf -mattr=help 2>&1 | grep dwarfris)
 BTF_PAHOLE_PROBE := $(shell $(BTF_PAHOLE) --help 2>&1 | grep BTF)
 BTF_OBJCOPY_PROBE := $(shell $(LLVM_OBJCOPY) --help 2>&1 | grep -i 'usage.*llvm')
+BTF_LLVM_PROBE := $(shell echo "int main() { return 0; }" | \
+			  $(CLANG) -target bpf -O2 -g -c -x c - -o ./llvm_btf_verify.o; \
+			  readelf -S ./llvm_btf_verify.o | grep BTF; \
+			  /bin/rm -f ./llvm_btf_verify.o)
 
+ifneq ($(BTF_LLVM_PROBE),)
+	CLANG_FLAGS += -g
+else
 ifneq ($(BTF_LLC_PROBE),)
 ifneq ($(BTF_PAHOLE_PROBE),)
 ifneq ($(BTF_OBJCOPY_PROBE),)
 	CLANG_FLAGS += -g
 	LLC_FLAGS += -mattr=dwarfris
 	DWARF2BTF = y
+endif
 endif
 endif
 endif
