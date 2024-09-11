@@ -1,0 +1,1420 @@
+net: bridge: move the switchdev object replay helpers to "push" mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit 4e51bf44a03af6fa19a39a36ea8fedfacb8ccadf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/4e51bf44.failed
+
+Starting with commit 4f2673b3a2b6 ("net: bridge: add helper to replay
+port and host-joined mdb entries"), DSA has introduced some bridge
+helpers that replay switchdev events (FDB/MDB/VLAN additions and
+deletions) that can be lost by the switchdev drivers in a variety of
+circumstances:
+
+- an IP multicast group was host-joined on the bridge itself before any
+  switchdev port joined the bridge, leading to the host MDB entries
+  missing in the hardware database.
+- during the bridge creation process, the MAC address of the bridge was
+  added to the FDB as an entry pointing towards the bridge device
+  itself, but with no switchdev ports being part of the bridge yet, this
+  local FDB entry would remain unknown to the switchdev hardware
+  database.
+- a VLAN/FDB/MDB was added to a bridge port that is a LAG interface,
+  before any switchdev port joined that LAG, leading to the hardware
+  database missing those entries.
+- a switchdev port left a LAG that is a bridge port, while the LAG
+  remained part of the bridge, and all FDB/MDB/VLAN entries remained
+  installed in the hardware database of the switchdev port.
+
+Also, since commit 0d2cfbd41c4a ("net: bridge: ignore switchdev events
+for LAG ports which didn't request replay"), DSA introduced a method,
+based on a const void *ctx, to ensure that two switchdev ports under the
+same LAG that is a bridge port do not see the same MDB/VLAN entry being
+replayed twice by the bridge, once for every bridge port that joins the
+LAG.
+
+With so many ordering corner cases being possible, it seems unreasonable
+to expect a switchdev driver writer to get it right from the first try.
+Therefore, now that DSA has experimented with the bridge replay helpers
+for a little bit, we can move the code to the bridge driver where it is
+more readily available to all switchdev drivers.
+
+To convert the switchdev object replay helpers from "pull mode" (where
+the driver asks for them) to a "push mode" (where the bridge offers them
+automatically), the biggest problem is that the bridge needs to be aware
+when a switchdev port joins and leaves, even when the switchdev is only
+indirectly a bridge port (for example when the bridge port is a LAG
+upper of the switchdev).
+
+Luckily, we already have a hook for that, in the form of the newly
+introduced switchdev_bridge_port_offload() and
+switchdev_bridge_port_unoffload() calls. These offer a natural place for
+hooking the object addition and deletion replays.
+
+Extend the above 2 functions with:
+- pointers to the switchdev atomic notifier (for FDB replays) and the
+  blocking notifier (for MDB and VLAN replays).
+- the "const void *ctx" argument required for drivers to be able to
+  disambiguate between which port is targeted, when multiple ports are
+  lowers of the same LAG that is a bridge port. Most of the drivers pass
+  NULL to this argument, except the ones that support LAG offload and have
+  the proper context check already in place in the switchdev blocking
+  notifier handler.
+
+Also unexport the replay helpers, since nobody except the bridge calls
+them directly now.
+
+Note that:
+(a) we abuse the terminology slightly, because FDB entries are not
+    "switchdev objects", but we count them as objects nonetheless.
+    With no direct way to prove it, I think they are not modeled as
+    switchdev objects because those can only be installed by the bridge
+    to the hardware (as opposed to FDB entries which can be propagated
+    in the other direction too). This is merely an abuse of terms, FDB
+    entries are replayed too, despite not being objects.
+(b) the bridge does not attempt to sync port attributes to newly joined
+    ports, just the countable stuff (the objects). The reason for this
+    is simple: no universal and symmetric way to sync and unsync them is
+    known. For example, VLAN filtering: what to do on unsync, disable or
+    leave it enabled? Similarly, STP state, ageing timer, etc etc. What
+    a switchdev port does when it becomes standalone again is not really
+    up to the bridge's competence, and the driver should deal with it.
+    On the other hand, replaying deletions of switchdev objects can be
+    seen a matter of cleanup and therefore be treated by the bridge,
+    hence this patch.
+
+We make the replay helpers opt-in for drivers, because they might not
+bring immediate benefits for them:
+
+- nbp_vlan_init() is called _after_ netdev_master_upper_dev_link(),
+  so br_vlan_replay() should not do anything for the new drivers on
+  which we call it. The existing drivers where there was even a slight
+  possibility for there to exist a VLAN on a bridge port before they
+  join it are already guarded against this: mlxsw and prestera deny
+  joining LAG interfaces that are members of a bridge.
+
+- br_fdb_replay() should now notify of local FDB entries, but I patched
+  all drivers except DSA to ignore these new entries in commit
+  2c4eca3ef716 ("net: bridge: switchdev: include local flag in FDB
+  notifications"). Driver authors can lift this restriction as they
+  wish, and when they do, they can also opt into the FDB replay
+  functionality.
+
+- br_mdb_replay() should fix a real issue which is described in commit
+  4f2673b3a2b6 ("net: bridge: add helper to replay port and host-joined
+  mdb entries"). However most drivers do not offload the
+  SWITCHDEV_OBJ_ID_HOST_MDB to see this issue: only cpsw and am65_cpsw
+  offload this switchdev object, and I don't completely understand the
+  way in which they offload this switchdev object anyway. So I'll leave
+  it up to these drivers' respective maintainers to opt into
+  br_mdb_replay().
+
+So most of the drivers pass NULL notifier blocks for the replay helpers,
+except:
+- dpaa2-switch which was already acked/regression-tested with the
+  helpers enabled (and there isn't much of a downside in having them)
+- ocelot which already had replay logic in "pull" mode
+- DSA which already had replay logic in "pull" mode
+
+An important observation is that the drivers which don't currently
+request bridge event replays don't even have the
+switchdev_bridge_port_{offload,unoffload} calls placed in proper places
+right now. This was done to avoid unnecessary rework for drivers which
+might never even add support for this. For driver writers who wish to
+add replay support, this can be used as a tentative placement guide:
+https://patchwork.kernel.org/project/netdevbpf/patch/20210720134655.892334-11-vladimir.oltean@nxp.com/
+
+	Cc: Vadym Kochan <vkochan@marvell.com>
+	Cc: Taras Chornyi <tchornyi@marvell.com>
+	Cc: Ioana Ciornei <ioana.ciornei@nxp.com>
+	Cc: Lars Povlsen <lars.povlsen@microchip.com>
+	Cc: Steen Hegelund <Steen.Hegelund@microchip.com>
+	Cc: UNGLinuxDriver@microchip.com
+	Cc: Claudiu Manoil <claudiu.manoil@nxp.com>
+	Cc: Alexandre Belloni <alexandre.belloni@bootlin.com>
+	Cc: Grygorii Strashko <grygorii.strashko@ti.com>
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Acked-by: Ioana Ciornei <ioana.ciornei@nxp.com> # dpaa2-switch
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4e51bf44a03af6fa19a39a36ea8fedfacb8ccadf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+#	drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+#	drivers/net/ethernet/microchip/sparx5/sparx5_switchdev.c
+#	drivers/net/ethernet/mscc/ocelot_net.c
+#	drivers/net/ethernet/rocker/rocker_ofdpa.c
+#	drivers/net/ethernet/ti/am65-cpsw-nuss.c
+#	drivers/net/ethernet/ti/cpsw_new.c
+#	include/linux/if_bridge.h
+#	net/bridge/br_mdb.c
+#	net/bridge/br_private.h
+#	net/bridge/br_switchdev.c
+#	net/dsa/dsa_priv.h
+#	net/dsa/port.c
+#	net/dsa/slave.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+index 14ce372c3f85,0a53f1d8e7e1..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+@@@ -359,12 -361,23 +359,24 @@@ mlxsw_sp_bridge_port_create(struct mlxs
+  	list_add(&bridge_port->list, &bridge_device->ports_list);
+  	bridge_port->ref_count = 1;
+  
+++<<<<<<< HEAD
+++=======
++ 	err = switchdev_bridge_port_offload(brport_dev, mlxsw_sp_port->dev,
++ 					    NULL, NULL, NULL, extack);
++ 	if (err)
++ 		goto err_switchdev_offload;
++ 
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  	return bridge_port;
+ -
+ -err_switchdev_offload:
+ -	list_del(&bridge_port->list);
+ -	kfree(bridge_port);
+ -	return ERR_PTR(err);
+  }
+  
+  static void
+  mlxsw_sp_bridge_port_destroy(struct mlxsw_sp_bridge_port *bridge_port)
+  {
+++<<<<<<< HEAD
+++=======
++ 	switchdev_bridge_port_unoffload(bridge_port->dev, NULL, NULL, NULL);
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  	list_del(&bridge_port->list);
+  	WARN_ON(!list_empty(&bridge_port->vlans_list));
+  	kfree(bridge_port);
+diff --cc drivers/net/ethernet/rocker/rocker_ofdpa.c
+index fa296a7c255d,03df6a24d0ba..000000000000
+--- a/drivers/net/ethernet/rocker/rocker_ofdpa.c
++++ b/drivers/net/ethernet/rocker/rocker_ofdpa.c
+@@@ -2618,13 -2594,21 +2618,27 @@@ static int ofdpa_port_bridge_join(struc
+  
+  	ofdpa_port->bridge_dev = bridge;
+  
+++<<<<<<< HEAD
+ +	return ofdpa_port_vlan_add(ofdpa_port, OFDPA_UNTAGGED_VID, 0);
+++=======
++ 	err = ofdpa_port_vlan_add(ofdpa_port, OFDPA_UNTAGGED_VID, 0);
++ 	if (err)
++ 		return err;
++ 
++ 	return switchdev_bridge_port_offload(dev, dev, NULL, NULL, NULL,
++ 					     extack);
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  }
+  
+  static int ofdpa_port_bridge_leave(struct ofdpa_port *ofdpa_port)
+  {
+ -	struct net_device *dev = ofdpa_port->dev;
+  	int err;
+  
+++<<<<<<< HEAD
+++=======
++ 	switchdev_bridge_port_unoffload(dev, NULL, NULL, NULL);
++ 
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  	err = ofdpa_port_vlan_del(ofdpa_port, OFDPA_UNTAGGED_VID, 0);
+  	if (err)
+  		return err;
+diff --cc include/linux/if_bridge.h
+index f87c7c990fb6,bbf680093823..000000000000
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@@ -115,8 -110,6 +115,11 @@@ int br_vlan_get_pvid_rcu(const struct n
+  int br_vlan_get_proto(const struct net_device *dev, u16 *p_proto);
+  int br_vlan_get_info(const struct net_device *dev, u16 vid,
+  		     struct bridge_vlan_info *p_vinfo);
+++<<<<<<< HEAD
+ +int br_vlan_replay(struct net_device *br_dev, struct net_device *dev,
+ +		   struct notifier_block *nb, struct netlink_ext_ack *extack);
+++=======
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  #else
+  static inline bool br_vlan_enabled(const struct net_device *dev)
+  {
+@@@ -143,14 -136,6 +146,17 @@@ static inline int br_vlan_get_info(cons
+  {
+  	return -EINVAL;
+  }
+++<<<<<<< HEAD
+ +
+ +static inline int br_vlan_replay(struct net_device *br_dev,
+ +				 struct net_device *dev,
+ +				 struct notifier_block *nb,
+ +				 struct netlink_ext_ack *extack)
+ +{
+ +	return -EOPNOTSUPP;
+ +}
+++=======
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  #endif
+  
+  #if IS_ENABLED(CONFIG_BRIDGE)
+@@@ -160,9 -145,7 +166,13 @@@ struct net_device *br_fdb_find_port(con
+  void br_fdb_clear_offload(const struct net_device *dev, u16 vid);
+  bool br_port_flag_is_set(const struct net_device *dev, unsigned long flag);
+  u8 br_port_get_stp_state(const struct net_device *dev);
+++<<<<<<< HEAD
+ +clock_t br_get_ageing_time(struct net_device *br_dev);
+ +int br_fdb_replay(struct net_device *br_dev, struct net_device *dev,
+ +		  struct notifier_block *nb);
+++=======
++ clock_t br_get_ageing_time(const struct net_device *br_dev);
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  #else
+  static inline struct net_device *
+  br_fdb_find_port(const struct net_device *br_dev,
+@@@ -191,13 -174,39 +201,51 @@@ static inline clock_t br_get_ageing_tim
+  {
+  	return 0;
+  }
+++<<<<<<< HEAD
+ +
+ +static inline int br_fdb_replay(struct net_device *br_dev,
+ +				struct net_device *dev,
+ +				struct notifier_block *nb)
+ +{
+ +	return -EOPNOTSUPP;
+ +}
+ +#endif
+ +
+++=======
++ #endif
++ 
++ #if IS_ENABLED(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_NET_SWITCHDEV)
++ 
++ int switchdev_bridge_port_offload(struct net_device *brport_dev,
++ 				  struct net_device *dev, const void *ctx,
++ 				  struct notifier_block *atomic_nb,
++ 				  struct notifier_block *blocking_nb,
++ 				  struct netlink_ext_ack *extack);
++ void switchdev_bridge_port_unoffload(struct net_device *brport_dev,
++ 				     const void *ctx,
++ 				     struct notifier_block *atomic_nb,
++ 				     struct notifier_block *blocking_nb);
++ 
++ #else
++ 
++ static inline int
++ switchdev_bridge_port_offload(struct net_device *brport_dev,
++ 			      struct net_device *dev, const void *ctx,
++ 			      struct notifier_block *atomic_nb,
++ 			      struct notifier_block *blocking_nb,
++ 			      struct netlink_ext_ack *extack)
++ {
++ 	return -EINVAL;
++ }
++ 
++ static inline void
++ switchdev_bridge_port_unoffload(struct net_device *brport_dev,
++ 				const void *ctx,
++ 				struct notifier_block *atomic_nb,
++ 				struct notifier_block *blocking_nb)
++ {
++ }
++ #endif
++ 
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  #endif
+diff --cc net/bridge/br_mdb.c
+index 5621f5510fd4,73a8915b0148..000000000000
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@@ -466,6 -551,145 +466,148 @@@ err
+  	kfree(priv);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void br_switchdev_mdb_populate(struct switchdev_obj_port_mdb *mdb,
++ 				      const struct net_bridge_mdb_entry *mp)
++ {
++ 	if (mp->addr.proto == htons(ETH_P_IP))
++ 		ip_eth_mc_map(mp->addr.dst.ip4, mdb->addr);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	else if (mp->addr.proto == htons(ETH_P_IPV6))
++ 		ipv6_eth_mc_map(&mp->addr.dst.ip6, mdb->addr);
++ #endif
++ 	else
++ 		ether_addr_copy(mdb->addr, mp->addr.dst.mac_addr);
++ 
++ 	mdb->vid = mp->addr.vid;
++ }
++ 
++ static int br_mdb_replay_one(struct notifier_block *nb, struct net_device *dev,
++ 			     const struct switchdev_obj_port_mdb *mdb,
++ 			     unsigned long action, const void *ctx,
++ 			     struct netlink_ext_ack *extack)
++ {
++ 	struct switchdev_notifier_port_obj_info obj_info = {
++ 		.info = {
++ 			.dev = dev,
++ 			.extack = extack,
++ 			.ctx = ctx,
++ 		},
++ 		.obj = &mdb->obj,
++ 	};
++ 	int err;
++ 
++ 	err = nb->notifier_call(nb, action, &obj_info);
++ 	return notifier_to_errno(err);
++ }
++ 
++ static int br_mdb_queue_one(struct list_head *mdb_list,
++ 			    enum switchdev_obj_id id,
++ 			    const struct net_bridge_mdb_entry *mp,
++ 			    struct net_device *orig_dev)
++ {
++ 	struct switchdev_obj_port_mdb *mdb;
++ 
++ 	mdb = kzalloc(sizeof(*mdb), GFP_ATOMIC);
++ 	if (!mdb)
++ 		return -ENOMEM;
++ 
++ 	mdb->obj.id = id;
++ 	mdb->obj.orig_dev = orig_dev;
++ 	br_switchdev_mdb_populate(mdb, mp);
++ 	list_add_tail(&mdb->obj.list, mdb_list);
++ 
++ 	return 0;
++ }
++ 
++ int br_mdb_replay(struct net_device *br_dev, struct net_device *dev,
++ 		  const void *ctx, bool adding, struct notifier_block *nb,
++ 		  struct netlink_ext_ack *extack)
++ {
++ 	const struct net_bridge_mdb_entry *mp;
++ 	struct switchdev_obj *obj, *tmp;
++ 	struct net_bridge *br;
++ 	unsigned long action;
++ 	LIST_HEAD(mdb_list);
++ 	int err = 0;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if (!nb)
++ 		return 0;
++ 
++ 	if (!netif_is_bridge_master(br_dev) || !netif_is_bridge_port(dev))
++ 		return -EINVAL;
++ 
++ 	br = netdev_priv(br_dev);
++ 
++ 	if (!br_opt_get(br, BROPT_MULTICAST_ENABLED))
++ 		return 0;
++ 
++ 	/* We cannot walk over br->mdb_list protected just by the rtnl_mutex,
++ 	 * because the write-side protection is br->multicast_lock. But we
++ 	 * need to emulate the [ blocking ] calling context of a regular
++ 	 * switchdev event, so since both br->multicast_lock and RCU read side
++ 	 * critical sections are atomic, we have no choice but to pick the RCU
++ 	 * read side lock, queue up all our events, leave the critical section
++ 	 * and notify switchdev from blocking context.
++ 	 */
++ 	rcu_read_lock();
++ 
++ 	hlist_for_each_entry_rcu(mp, &br->mdb_list, mdb_node) {
++ 		struct net_bridge_port_group __rcu * const *pp;
++ 		const struct net_bridge_port_group *p;
++ 
++ 		if (mp->host_joined) {
++ 			err = br_mdb_queue_one(&mdb_list,
++ 					       SWITCHDEV_OBJ_ID_HOST_MDB,
++ 					       mp, br_dev);
++ 			if (err) {
++ 				rcu_read_unlock();
++ 				goto out_free_mdb;
++ 			}
++ 		}
++ 
++ 		for (pp = &mp->ports; (p = rcu_dereference(*pp)) != NULL;
++ 		     pp = &p->next) {
++ 			if (p->key.port->dev != dev)
++ 				continue;
++ 
++ 			err = br_mdb_queue_one(&mdb_list,
++ 					       SWITCHDEV_OBJ_ID_PORT_MDB,
++ 					       mp, dev);
++ 			if (err) {
++ 				rcu_read_unlock();
++ 				goto out_free_mdb;
++ 			}
++ 		}
++ 	}
++ 
++ 	rcu_read_unlock();
++ 
++ 	if (adding)
++ 		action = SWITCHDEV_PORT_OBJ_ADD;
++ 	else
++ 		action = SWITCHDEV_PORT_OBJ_DEL;
++ 
++ 	list_for_each_entry(obj, &mdb_list, list) {
++ 		err = br_mdb_replay_one(nb, dev, SWITCHDEV_OBJ_PORT_MDB(obj),
++ 					action, ctx, extack);
++ 		if (err)
++ 			goto out_free_mdb;
++ 	}
++ 
++ out_free_mdb:
++ 	list_for_each_entry_safe(obj, tmp, &mdb_list, list) {
++ 		list_del(&obj->list);
++ 		kfree(SWITCHDEV_OBJ_PORT_MDB(obj));
++ 	}
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  static void br_mdb_switchdev_host_port(struct net_device *dev,
+  				       struct net_device *lower_dev,
+  				       struct net_bridge_mdb_entry *mp,
+diff --cc net/bridge/br_private.h
+index 30e07225bc94,2f32d330b648..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -767,8 -906,39 +769,41 @@@ void br_multicast_get_stats(const struc
+  			    struct br_mcast_stats *dest);
+  void br_mdb_init(void);
+  void br_mdb_uninit(void);
+ -void br_multicast_host_join(const struct net_bridge_mcast *brmctx,
+ -			    struct net_bridge_mdb_entry *mp, bool notify);
+ +void br_multicast_host_join(struct net_bridge_mdb_entry *mp, bool notify);
+  void br_multicast_host_leave(struct net_bridge_mdb_entry *mp, bool notify);
+++<<<<<<< HEAD
+++=======
++ void br_multicast_star_g_handle_mode(struct net_bridge_port_group *pg,
++ 				     u8 filter_mode);
++ void br_multicast_sg_add_exclude_ports(struct net_bridge_mdb_entry *star_mp,
++ 				       struct net_bridge_port_group *sg);
++ struct net_bridge_group_src *
++ br_multicast_find_group_src(struct net_bridge_port_group *pg, struct br_ip *ip);
++ void br_multicast_del_group_src(struct net_bridge_group_src *src,
++ 				bool fastleave);
++ void br_multicast_ctx_init(struct net_bridge *br,
++ 			   struct net_bridge_vlan *vlan,
++ 			   struct net_bridge_mcast *brmctx);
++ void br_multicast_ctx_deinit(struct net_bridge_mcast *brmctx);
++ void br_multicast_port_ctx_init(struct net_bridge_port *port,
++ 				struct net_bridge_vlan *vlan,
++ 				struct net_bridge_mcast_port *pmctx);
++ void br_multicast_port_ctx_deinit(struct net_bridge_mcast_port *pmctx);
++ void br_multicast_toggle_one_vlan(struct net_bridge_vlan *vlan, bool on);
++ void br_multicast_toggle_vlan(struct net_bridge_vlan *vlan, bool on);
++ int br_multicast_toggle_vlan_snooping(struct net_bridge *br, bool on,
++ 				      struct netlink_ext_ack *extack);
++ bool br_multicast_toggle_global_vlan(struct net_bridge_vlan *vlan, bool on);
++ 
++ int br_mdb_replay(struct net_device *br_dev, struct net_device *dev,
++ 		  const void *ctx, bool adding, struct notifier_block *nb,
++ 		  struct netlink_ext_ack *extack);
++ 
++ static inline bool br_group_is_l2(const struct br_ip *group)
++ {
++ 	return group->proto == 0;
++ }
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  
+  #define mlock_dereference(X, br) \
+  	rcu_dereference_protected(X, lockdep_is_held(&br->multicast_lock))
+@@@ -946,6 -1270,57 +981,60 @@@ static inline int br_multicast_igmp_typ
+  {
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline void br_multicast_ctx_init(struct net_bridge *br,
++ 					 struct net_bridge_vlan *vlan,
++ 					 struct net_bridge_mcast *brmctx)
++ {
++ }
++ 
++ static inline void br_multicast_ctx_deinit(struct net_bridge_mcast *brmctx)
++ {
++ }
++ 
++ static inline void br_multicast_port_ctx_init(struct net_bridge_port *port,
++ 					      struct net_bridge_vlan *vlan,
++ 					      struct net_bridge_mcast_port *pmctx)
++ {
++ }
++ 
++ static inline void br_multicast_port_ctx_deinit(struct net_bridge_mcast_port *pmctx)
++ {
++ }
++ 
++ static inline void br_multicast_toggle_one_vlan(struct net_bridge_vlan *vlan,
++ 						bool on)
++ {
++ }
++ 
++ static inline void br_multicast_toggle_vlan(struct net_bridge_vlan *vlan,
++ 					    bool on)
++ {
++ }
++ 
++ static inline int br_multicast_toggle_vlan_snooping(struct net_bridge *br,
++ 						    bool on,
++ 						    struct netlink_ext_ack *extack)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static inline bool br_multicast_toggle_global_vlan(struct net_bridge_vlan *vlan,
++ 						   bool on)
++ {
++ 	return false;
++ }
++ 
++ static inline int br_mdb_replay(struct net_device *br_dev,
++ 				struct net_device *dev, const void *ctx,
++ 				bool adding, struct notifier_block *nb,
++ 				struct netlink_ext_ack *extack)
++ {
++ 	return -EOPNOTSUPP;
++ }
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  #endif
+  
+  /* br_vlan.c */
+diff --cc net/bridge/br_switchdev.c
+index be7535fa5f0e,6bfff28ede23..000000000000
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@@ -162,27 -162,154 +162,164 @@@ static void nbp_switchdev_hwdom_put(str
+  	clear_bit(leaving->hwdom, &br->busy_hwdoms);
+  }
+  
+ -static int nbp_switchdev_add(struct net_bridge_port *p,
+ -			     struct netdev_phys_item_id ppid,
+ -			     struct netlink_ext_ack *extack)
+ +int nbp_switchdev_add(struct net_bridge_port *p)
+  {
+++<<<<<<< HEAD
+ +	struct netdev_phys_item_id ppid = { };
+++=======
++ 	if (p->offload_count) {
++ 		/* Prevent unsupported configurations such as a bridge port
++ 		 * which is a bonding interface, and the member ports are from
++ 		 * different hardware switches.
++ 		 */
++ 		if (!netdev_phys_item_id_same(&p->ppid, &ppid)) {
++ 			NL_SET_ERR_MSG_MOD(extack,
++ 					   "Same bridge port cannot be offloaded by two physical switches");
++ 			return -EBUSY;
++ 		}
++ 
++ 		/* Tolerate drivers that call switchdev_bridge_port_offload()
++ 		 * more than once for the same bridge port, such as when the
++ 		 * bridge port is an offloaded bonding/team interface.
++ 		 */
++ 		p->offload_count++;
++ 
++ 		return 0;
++ 	}
++ 
++ 	p->ppid = ppid;
++ 	p->offload_count = 1;
++ 
++ 	return nbp_switchdev_hwdom_set(p);
++ }
++ 
++ static void nbp_switchdev_del(struct net_bridge_port *p)
++ {
++ 	if (WARN_ON(!p->offload_count))
++ 		return;
++ 
++ 	p->offload_count--;
++ 
++ 	if (p->offload_count)
++ 		return;
++ 
++ 	if (p->hwdom)
++ 		nbp_switchdev_hwdom_put(p);
++ }
++ 
++ static int nbp_switchdev_sync_objs(struct net_bridge_port *p, const void *ctx,
++ 				   struct notifier_block *atomic_nb,
++ 				   struct notifier_block *blocking_nb,
++ 				   struct netlink_ext_ack *extack)
++ {
++ 	struct net_device *br_dev = p->br->dev;
++ 	struct net_device *dev = p->dev;
++ 	int err;
++ 
++ 	err = br_vlan_replay(br_dev, dev, ctx, true, blocking_nb, extack);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	err = br_mdb_replay(br_dev, dev, ctx, true, blocking_nb, extack);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	/* Forwarding and termination FDB entries on the port */
++ 	err = br_fdb_replay(br_dev, dev, ctx, true, atomic_nb);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	/* Termination FDB entries on the bridge itself */
++ 	err = br_fdb_replay(br_dev, br_dev, ctx, true, atomic_nb);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	return 0;
++ }
++ 
++ static void nbp_switchdev_unsync_objs(struct net_bridge_port *p,
++ 				      const void *ctx,
++ 				      struct notifier_block *atomic_nb,
++ 				      struct notifier_block *blocking_nb)
++ {
++ 	struct net_device *br_dev = p->br->dev;
++ 	struct net_device *dev = p->dev;
++ 
++ 	br_vlan_replay(br_dev, dev, ctx, false, blocking_nb, NULL);
++ 
++ 	br_mdb_replay(br_dev, dev, ctx, false, blocking_nb, NULL);
++ 
++ 	/* Forwarding and termination FDB entries on the port */
++ 	br_fdb_replay(br_dev, dev, ctx, false, atomic_nb);
++ 
++ 	/* Termination FDB entries on the bridge itself */
++ 	br_fdb_replay(br_dev, br_dev, ctx, false, atomic_nb);
++ }
++ 
++ /* Let the bridge know that this port is offloaded, so that it can assign a
++  * switchdev hardware domain to it.
++  */
++ int switchdev_bridge_port_offload(struct net_device *brport_dev,
++ 				  struct net_device *dev, const void *ctx,
++ 				  struct notifier_block *atomic_nb,
++ 				  struct notifier_block *blocking_nb,
++ 				  struct netlink_ext_ack *extack)
++ {
++ 	struct netdev_phys_item_id ppid;
++ 	struct net_bridge_port *p;
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  	int err;
+  
+  	ASSERT_RTNL();
+  
+ -	p = br_port_get_rtnl(brport_dev);
+ -	if (!p)
+ -		return -ENODEV;
+ -
+ -	err = dev_get_port_parent_id(dev, &ppid, false);
+ -	if (err)
+ +	err = dev_get_port_parent_id(p->dev, &ppid, true);
+ +	if (err) {
+ +		if (err == -EOPNOTSUPP)
+ +			return 0;
+  		return err;
+ +	}
+  
+++<<<<<<< HEAD
+ +	return nbp_switchdev_hwdom_set(p);
+++=======
++ 	err = nbp_switchdev_add(p, ppid, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nbp_switchdev_sync_objs(p, ctx, atomic_nb, blocking_nb, extack);
++ 	if (err)
++ 		goto out_switchdev_del;
++ 
++ 	return 0;
++ 
++ out_switchdev_del:
++ 	nbp_switchdev_del(p);
++ 
++ 	return err;
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  }
+ -EXPORT_SYMBOL_GPL(switchdev_bridge_port_offload);
+  
+++<<<<<<< HEAD
+ +void nbp_switchdev_del(struct net_bridge_port *p)
+++=======
++ void switchdev_bridge_port_unoffload(struct net_device *brport_dev,
++ 				     const void *ctx,
++ 				     struct notifier_block *atomic_nb,
++ 				     struct notifier_block *blocking_nb)
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  {
+ -	struct net_bridge_port *p;
+ -
+  	ASSERT_RTNL();
+  
+++<<<<<<< HEAD
+ +	if (p->hwdom)
+ +		nbp_switchdev_hwdom_put(p);
+++=======
++ 	p = br_port_get_rtnl(brport_dev);
++ 	if (!p)
++ 		return;
++ 
++ 	nbp_switchdev_unsync_objs(p, ctx, atomic_nb, blocking_nb);
++ 
++ 	nbp_switchdev_del(p);
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  }
+ -EXPORT_SYMBOL_GPL(switchdev_bridge_port_unoffload);
+diff --cc net/dsa/dsa_priv.h
+index 4aeecfbc0008,78c70f5bdab5..000000000000
+--- a/net/dsa/dsa_priv.h
++++ b/net/dsa/dsa_priv.h
+@@@ -139,16 -195,30 +139,32 @@@ static inline struct net_device *dsa_ma
+  }
+  
+  /* port.c */
+ -void dsa_port_set_tag_protocol(struct dsa_port *cpu_dp,
+ -			       const struct dsa_device_ops *tag_ops);
+ -int dsa_port_set_state(struct dsa_port *dp, u8 state);
+ -int dsa_port_enable_rt(struct dsa_port *dp, struct phy_device *phy);
+ +int dsa_port_set_state(struct dsa_port *dp, u8 state,
+ +		       struct switchdev_trans *trans);
+  int dsa_port_enable(struct dsa_port *dp, struct phy_device *phy);
+++<<<<<<< HEAD
+ +void dsa_port_disable(struct dsa_port *dp, struct phy_device *phy);
+ +int dsa_port_bridge_join(struct dsa_port *dp, struct net_device *br);
+ +void dsa_port_bridge_leave(struct dsa_port *dp, struct net_device *br);
+++=======
++ void dsa_port_disable_rt(struct dsa_port *dp);
++ void dsa_port_disable(struct dsa_port *dp);
++ int dsa_port_bridge_join(struct dsa_port *dp, struct net_device *br,
++ 			 struct netlink_ext_ack *extack);
++ void dsa_port_pre_bridge_leave(struct dsa_port *dp, struct net_device *br);
++ void dsa_port_bridge_leave(struct dsa_port *dp, struct net_device *br);
++ int dsa_port_lag_change(struct dsa_port *dp,
++ 			struct netdev_lag_lower_state_info *linfo);
++ int dsa_port_lag_join(struct dsa_port *dp, struct net_device *lag_dev,
++ 		      struct netdev_lag_upper_info *uinfo,
++ 		      struct netlink_ext_ack *extack);
++ void dsa_port_pre_lag_leave(struct dsa_port *dp, struct net_device *lag_dev);
++ void dsa_port_lag_leave(struct dsa_port *dp, struct net_device *lag_dev);
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  int dsa_port_vlan_filtering(struct dsa_port *dp, bool vlan_filtering,
+ -			    struct netlink_ext_ack *extack);
+ -bool dsa_port_skip_vlan_configuration(struct dsa_port *dp);
+ -int dsa_port_ageing_time(struct dsa_port *dp, clock_t ageing_clock);
+ -int dsa_port_mtu_change(struct dsa_port *dp, int new_mtu,
+ -			bool targeted_match);
+ +			    struct switchdev_trans *trans);
+ +int dsa_port_ageing_time(struct dsa_port *dp, clock_t ageing_clock,
+ +			 struct switchdev_trans *trans);
+  int dsa_port_fdb_add(struct dsa_port *dp, const unsigned char *addr,
+  		     u16 vid);
+  int dsa_port_fdb_del(struct dsa_port *dp, const unsigned char *addr,
+diff --cc net/dsa/port.c
+index 2d7e01b23572,d81c283b7358..000000000000
+--- a/net/dsa/port.c
++++ b/net/dsa/port.c
+@@@ -90,15 -105,136 +90,135 @@@ void dsa_port_disable(struct dsa_port *
+  	struct dsa_switch *ds = dp->ds;
+  	int port = dp->index;
+  
+ -	if (dp->pl)
+ -		phylink_stop(dp->pl);
+ -
+ -	if (!dp->bridge_dev)
+ -		dsa_port_set_state_now(dp, BR_STATE_DISABLED);
+ +	dsa_port_set_state_now(dp, BR_STATE_DISABLED);
+  
+  	if (ds->ops->port_disable)
+ -		ds->ops->port_disable(ds, port);
+ +		ds->ops->port_disable(ds, port, phy);
+  }
+  
+++<<<<<<< HEAD
+ +int dsa_port_bridge_join(struct dsa_port *dp, struct net_device *br)
+++=======
++ void dsa_port_disable(struct dsa_port *dp)
++ {
++ 	rtnl_lock();
++ 	dsa_port_disable_rt(dp);
++ 	rtnl_unlock();
++ }
++ 
++ static int dsa_port_inherit_brport_flags(struct dsa_port *dp,
++ 					 struct netlink_ext_ack *extack)
++ {
++ 	const unsigned long mask = BR_LEARNING | BR_FLOOD | BR_MCAST_FLOOD |
++ 				   BR_BCAST_FLOOD;
++ 	struct net_device *brport_dev = dsa_port_to_bridge_port(dp);
++ 	int flag, err;
++ 
++ 	for_each_set_bit(flag, &mask, 32) {
++ 		struct switchdev_brport_flags flags = {0};
++ 
++ 		flags.mask = BIT(flag);
++ 
++ 		if (br_port_flag_is_set(brport_dev, BIT(flag)))
++ 			flags.val = BIT(flag);
++ 
++ 		err = dsa_port_bridge_flags(dp, flags, extack);
++ 		if (err && err != -EOPNOTSUPP)
++ 			return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void dsa_port_clear_brport_flags(struct dsa_port *dp)
++ {
++ 	const unsigned long val = BR_FLOOD | BR_MCAST_FLOOD | BR_BCAST_FLOOD;
++ 	const unsigned long mask = BR_LEARNING | BR_FLOOD | BR_MCAST_FLOOD |
++ 				   BR_BCAST_FLOOD;
++ 	int flag, err;
++ 
++ 	for_each_set_bit(flag, &mask, 32) {
++ 		struct switchdev_brport_flags flags = {0};
++ 
++ 		flags.mask = BIT(flag);
++ 		flags.val = val & BIT(flag);
++ 
++ 		err = dsa_port_bridge_flags(dp, flags, NULL);
++ 		if (err && err != -EOPNOTSUPP)
++ 			dev_err(dp->ds->dev,
++ 				"failed to clear bridge port flag %lu: %pe\n",
++ 				flags.val, ERR_PTR(err));
++ 	}
++ }
++ 
++ static int dsa_port_switchdev_sync_attrs(struct dsa_port *dp,
++ 					 struct netlink_ext_ack *extack)
++ {
++ 	struct net_device *brport_dev = dsa_port_to_bridge_port(dp);
++ 	struct net_device *br = dp->bridge_dev;
++ 	int err;
++ 
++ 	err = dsa_port_inherit_brport_flags(dp, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	err = dsa_port_set_state(dp, br_port_get_stp_state(brport_dev));
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	err = dsa_port_vlan_filtering(dp, br_vlan_enabled(br), extack);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	err = dsa_port_mrouter(dp->cpu_dp, br_multicast_router(br), extack);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	err = dsa_port_ageing_time(dp, br_get_ageing_time(br));
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	return 0;
++ }
++ 
++ static void dsa_port_switchdev_unsync_attrs(struct dsa_port *dp)
++ {
++ 	/* Configure the port for standalone mode (no address learning,
++ 	 * flood everything).
++ 	 * The bridge only emits SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS events
++ 	 * when the user requests it through netlink or sysfs, but not
++ 	 * automatically at port join or leave, so we need to handle resetting
++ 	 * the brport flags ourselves. But we even prefer it that way, because
++ 	 * otherwise, some setups might never get the notification they need,
++ 	 * for example, when a port leaves a LAG that offloads the bridge,
++ 	 * it becomes standalone, but as far as the bridge is concerned, no
++ 	 * port ever left.
++ 	 */
++ 	dsa_port_clear_brport_flags(dp);
++ 
++ 	/* Port left the bridge, put in BR_STATE_DISABLED by the bridge layer,
++ 	 * so allow it to be in BR_STATE_FORWARDING to be kept functional
++ 	 */
++ 	dsa_port_set_state_now(dp, BR_STATE_FORWARDING);
++ 
++ 	/* VLAN filtering is handled by dsa_switch_bridge_leave */
++ 
++ 	/* Some drivers treat the notification for having a local multicast
++ 	 * router by allowing multicast to be flooded to the CPU, so we should
++ 	 * allow this in standalone mode too.
++ 	 */
++ 	dsa_port_mrouter(dp->cpu_dp, true, NULL);
++ 
++ 	/* Ageing time may be global to the switch chip, so don't change it
++ 	 * here because we have no good reason (or value) to change it to.
++ 	 */
++ }
++ 
++ int dsa_port_bridge_join(struct dsa_port *dp, struct net_device *br,
++ 			 struct netlink_ext_ack *extack)
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  {
+  	struct dsa_notifier_bridge_info info = {
+ -		.tree_index = dp->ds->dst->index,
+  		.sw_index = dp->ds->index,
+  		.port = dp->index,
+  		.br = br,
+@@@ -110,15 -248,45 +230,51 @@@
+  	 */
+  	dp->bridge_dev = br;
+  
+ -	brport_dev = dsa_port_to_bridge_port(dp);
+ +	err = dsa_port_notify(dp, DSA_NOTIFIER_BRIDGE_JOIN, &info);
+  
+ -	err = dsa_broadcast(DSA_NOTIFIER_BRIDGE_JOIN, &info);
+ +	/* The bridging is rolled back on error */
+  	if (err)
+ -		goto out_rollback;
+ +		dp->bridge_dev = NULL;
+ +
+++<<<<<<< HEAD
+ +	return err;
+ +}
+  
+++=======
++ 	err = switchdev_bridge_port_offload(brport_dev, dev, dp,
++ 					    &dsa_slave_switchdev_notifier,
++ 					    &dsa_slave_switchdev_blocking_notifier,
++ 					    extack);
++ 	if (err)
++ 		goto out_rollback_unbridge;
++ 
++ 	err = dsa_port_switchdev_sync_attrs(dp, extack);
++ 	if (err)
++ 		goto out_rollback_unoffload;
++ 
++ 	return 0;
++ 
++ out_rollback_unoffload:
++ 	switchdev_bridge_port_unoffload(brport_dev, dp,
++ 					&dsa_slave_switchdev_notifier,
++ 					&dsa_slave_switchdev_blocking_notifier);
++ out_rollback_unbridge:
++ 	dsa_broadcast(DSA_NOTIFIER_BRIDGE_LEAVE, &info);
++ out_rollback:
++ 	dp->bridge_dev = NULL;
++ 	return err;
++ }
++ 
++ void dsa_port_pre_bridge_leave(struct dsa_port *dp, struct net_device *br)
++ {
++ 	struct net_device *brport_dev = dsa_port_to_bridge_port(dp);
++ 
++ 	switchdev_bridge_port_unoffload(brport_dev, dp,
++ 					&dsa_slave_switchdev_notifier,
++ 					&dsa_slave_switchdev_blocking_notifier);
++ }
++ 
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  void dsa_port_bridge_leave(struct dsa_port *dp, struct net_device *br)
+  {
+  	struct dsa_notifier_bridge_info info = {
+@@@ -137,10 -306,175 +293,162 @@@
+  	if (err)
+  		pr_err("DSA: failed to notify DSA_NOTIFIER_BRIDGE_LEAVE\n");
+  
+ -	dsa_port_switchdev_unsync_attrs(dp);
+ -}
+ -
+ -int dsa_port_lag_change(struct dsa_port *dp,
+ -			struct netdev_lag_lower_state_info *linfo)
+ -{
+ -	struct dsa_notifier_lag_info info = {
+ -		.sw_index = dp->ds->index,
+ -		.port = dp->index,
+ -	};
+ -	bool tx_enabled;
+ -
+ -	if (!dp->lag_dev)
+ -		return 0;
+ -
+ -	/* On statically configured aggregates (e.g. loadbalance
+ -	 * without LACP) ports will always be tx_enabled, even if the
+ -	 * link is down. Thus we require both link_up and tx_enabled
+ -	 * in order to include it in the tx set.
+ +	/* Port left the bridge, put in BR_STATE_DISABLED by the bridge layer,
+ +	 * so allow it to be in BR_STATE_FORWARDING to be kept functional
+  	 */
+++<<<<<<< HEAD
+ +	dsa_port_set_state_now(dp, BR_STATE_FORWARDING);
+++=======
++ 	tx_enabled = linfo->link_up && linfo->tx_enabled;
++ 
++ 	if (tx_enabled == dp->lag_tx_enabled)
++ 		return 0;
++ 
++ 	dp->lag_tx_enabled = tx_enabled;
++ 
++ 	return dsa_port_notify(dp, DSA_NOTIFIER_LAG_CHANGE, &info);
++ }
++ 
++ int dsa_port_lag_join(struct dsa_port *dp, struct net_device *lag,
++ 		      struct netdev_lag_upper_info *uinfo,
++ 		      struct netlink_ext_ack *extack)
++ {
++ 	struct dsa_notifier_lag_info info = {
++ 		.sw_index = dp->ds->index,
++ 		.port = dp->index,
++ 		.lag = lag,
++ 		.info = uinfo,
++ 	};
++ 	struct net_device *bridge_dev;
++ 	int err;
++ 
++ 	dsa_lag_map(dp->ds->dst, lag);
++ 	dp->lag_dev = lag;
++ 
++ 	err = dsa_port_notify(dp, DSA_NOTIFIER_LAG_JOIN, &info);
++ 	if (err)
++ 		goto err_lag_join;
++ 
++ 	bridge_dev = netdev_master_upper_dev_get(lag);
++ 	if (!bridge_dev || !netif_is_bridge_master(bridge_dev))
++ 		return 0;
++ 
++ 	err = dsa_port_bridge_join(dp, bridge_dev, extack);
++ 	if (err)
++ 		goto err_bridge_join;
++ 
++ 	return 0;
++ 
++ err_bridge_join:
++ 	dsa_port_notify(dp, DSA_NOTIFIER_LAG_LEAVE, &info);
++ err_lag_join:
++ 	dp->lag_dev = NULL;
++ 	dsa_lag_unmap(dp->ds->dst, lag);
++ 	return err;
++ }
++ 
++ void dsa_port_pre_lag_leave(struct dsa_port *dp, struct net_device *lag)
++ {
++ 	if (dp->bridge_dev)
++ 		dsa_port_pre_bridge_leave(dp, dp->bridge_dev);
++ }
++ 
++ void dsa_port_lag_leave(struct dsa_port *dp, struct net_device *lag)
++ {
++ 	struct dsa_notifier_lag_info info = {
++ 		.sw_index = dp->ds->index,
++ 		.port = dp->index,
++ 		.lag = lag,
++ 	};
++ 	int err;
++ 
++ 	if (!dp->lag_dev)
++ 		return;
++ 
++ 	/* Port might have been part of a LAG that in turn was
++ 	 * attached to a bridge.
++ 	 */
++ 	if (dp->bridge_dev)
++ 		dsa_port_bridge_leave(dp, dp->bridge_dev);
++ 
++ 	dp->lag_tx_enabled = false;
++ 	dp->lag_dev = NULL;
++ 
++ 	err = dsa_port_notify(dp, DSA_NOTIFIER_LAG_LEAVE, &info);
++ 	if (err)
++ 		pr_err("DSA: failed to notify DSA_NOTIFIER_LAG_LEAVE: %d\n",
++ 		       err);
++ 
++ 	dsa_lag_unmap(dp->ds->dst, lag);
++ }
++ 
++ /* Must be called under rcu_read_lock() */
++ static bool dsa_port_can_apply_vlan_filtering(struct dsa_port *dp,
++ 					      bool vlan_filtering,
++ 					      struct netlink_ext_ack *extack)
++ {
++ 	struct dsa_switch *ds = dp->ds;
++ 	int err, i;
++ 
++ 	/* VLAN awareness was off, so the question is "can we turn it on".
++ 	 * We may have had 8021q uppers, those need to go. Make sure we don't
++ 	 * enter an inconsistent state: deny changing the VLAN awareness state
++ 	 * as long as we have 8021q uppers.
++ 	 */
++ 	if (vlan_filtering && dsa_is_user_port(ds, dp->index)) {
++ 		struct net_device *upper_dev, *slave = dp->slave;
++ 		struct net_device *br = dp->bridge_dev;
++ 		struct list_head *iter;
++ 
++ 		netdev_for_each_upper_dev_rcu(slave, upper_dev, iter) {
++ 			struct bridge_vlan_info br_info;
++ 			u16 vid;
++ 
++ 			if (!is_vlan_dev(upper_dev))
++ 				continue;
++ 
++ 			vid = vlan_dev_vlan_id(upper_dev);
++ 
++ 			/* br_vlan_get_info() returns -EINVAL or -ENOENT if the
++ 			 * device, respectively the VID is not found, returning
++ 			 * 0 means success, which is a failure for us here.
++ 			 */
++ 			err = br_vlan_get_info(br, vid, &br_info);
++ 			if (err == 0) {
++ 				NL_SET_ERR_MSG_MOD(extack,
++ 						   "Must first remove VLAN uppers having VIDs also present in bridge");
++ 				return false;
++ 			}
++ 		}
++ 	}
++ 
++ 	if (!ds->vlan_filtering_is_global)
++ 		return true;
++ 
++ 	/* For cases where enabling/disabling VLAN awareness is global to the
++ 	 * switch, we need to handle the case where multiple bridges span
++ 	 * different ports of the same switch device and one of them has a
++ 	 * different setting than what is being requested.
++ 	 */
++ 	for (i = 0; i < ds->num_ports; i++) {
++ 		struct net_device *other_bridge;
++ 
++ 		other_bridge = dsa_to_port(ds, i)->bridge_dev;
++ 		if (!other_bridge)
++ 			continue;
++ 		/* If it's the same bridge, it also has same
++ 		 * vlan_filtering setting => no need to check
++ 		 */
++ 		if (other_bridge == dp->bridge_dev)
++ 			continue;
++ 		if (br_vlan_enabled(other_bridge) != vlan_filtering) {
++ 			NL_SET_ERR_MSG_MOD(extack,
++ 					   "VLAN filtering is a global setting");
++ 			return false;
++ 		}
++ 	}
++ 	return true;
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  }
+  
+  int dsa_port_vlan_filtering(struct dsa_port *dp, bool vlan_filtering,
+diff --cc net/dsa/slave.c
+index 24cc4de02bd3,8105f642572b..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -1436,6 -2048,166 +1436,169 @@@ static int dsa_slave_changeupper(struc
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int dsa_slave_prechangeupper(struct net_device *dev,
++ 				    struct netdev_notifier_changeupper_info *info)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 
++ 	if (netif_is_bridge_master(info->upper_dev) && !info->linking)
++ 		dsa_port_pre_bridge_leave(dp, info->upper_dev);
++ 	else if (netif_is_lag_master(info->upper_dev) && !info->linking)
++ 		dsa_port_pre_lag_leave(dp, info->upper_dev);
++ 	/* dsa_port_pre_hsr_leave is not yet necessary since hsr cannot be
++ 	 * meaningfully enslaved to a bridge yet
++ 	 */
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
++ static int
++ dsa_slave_lag_changeupper(struct net_device *dev,
++ 			  struct netdev_notifier_changeupper_info *info)
++ {
++ 	struct net_device *lower;
++ 	struct list_head *iter;
++ 	int err = NOTIFY_DONE;
++ 	struct dsa_port *dp;
++ 
++ 	netdev_for_each_lower_dev(dev, lower, iter) {
++ 		if (!dsa_slave_dev_check(lower))
++ 			continue;
++ 
++ 		dp = dsa_slave_to_port(lower);
++ 		if (!dp->lag_dev)
++ 			/* Software LAG */
++ 			continue;
++ 
++ 		err = dsa_slave_changeupper(lower, info);
++ 		if (notifier_to_errno(err))
++ 			break;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ /* Same as dsa_slave_lag_changeupper() except that it calls
++  * dsa_slave_prechangeupper()
++  */
++ static int
++ dsa_slave_lag_prechangeupper(struct net_device *dev,
++ 			     struct netdev_notifier_changeupper_info *info)
++ {
++ 	struct net_device *lower;
++ 	struct list_head *iter;
++ 	int err = NOTIFY_DONE;
++ 	struct dsa_port *dp;
++ 
++ 	netdev_for_each_lower_dev(dev, lower, iter) {
++ 		if (!dsa_slave_dev_check(lower))
++ 			continue;
++ 
++ 		dp = dsa_slave_to_port(lower);
++ 		if (!dp->lag_dev)
++ 			/* Software LAG */
++ 			continue;
++ 
++ 		err = dsa_slave_prechangeupper(lower, info);
++ 		if (notifier_to_errno(err))
++ 			break;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static int
++ dsa_prevent_bridging_8021q_upper(struct net_device *dev,
++ 				 struct netdev_notifier_changeupper_info *info)
++ {
++ 	struct netlink_ext_ack *ext_ack;
++ 	struct net_device *slave;
++ 	struct dsa_port *dp;
++ 
++ 	ext_ack = netdev_notifier_info_to_extack(&info->info);
++ 
++ 	if (!is_vlan_dev(dev))
++ 		return NOTIFY_DONE;
++ 
++ 	slave = vlan_dev_real_dev(dev);
++ 	if (!dsa_slave_dev_check(slave))
++ 		return NOTIFY_DONE;
++ 
++ 	dp = dsa_slave_to_port(slave);
++ 	if (!dp->bridge_dev)
++ 		return NOTIFY_DONE;
++ 
++ 	/* Deny enslaving a VLAN device into a VLAN-aware bridge */
++ 	if (br_vlan_enabled(dp->bridge_dev) &&
++ 	    netif_is_bridge_master(info->upper_dev) && info->linking) {
++ 		NL_SET_ERR_MSG_MOD(ext_ack,
++ 				   "Cannot enslave VLAN device into VLAN aware bridge");
++ 		return notifier_from_errno(-EINVAL);
++ 	}
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
++ static int
++ dsa_slave_check_8021q_upper(struct net_device *dev,
++ 			    struct netdev_notifier_changeupper_info *info)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct net_device *br = dp->bridge_dev;
++ 	struct bridge_vlan_info br_info;
++ 	struct netlink_ext_ack *extack;
++ 	int err = NOTIFY_DONE;
++ 	u16 vid;
++ 
++ 	if (!br || !br_vlan_enabled(br))
++ 		return NOTIFY_DONE;
++ 
++ 	extack = netdev_notifier_info_to_extack(&info->info);
++ 	vid = vlan_dev_vlan_id(info->upper_dev);
++ 
++ 	/* br_vlan_get_info() returns -EINVAL or -ENOENT if the
++ 	 * device, respectively the VID is not found, returning
++ 	 * 0 means success, which is a failure for us here.
++ 	 */
++ 	err = br_vlan_get_info(br, vid, &br_info);
++ 	if (err == 0) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "This VLAN is already configured by the bridge");
++ 		return notifier_from_errno(-EBUSY);
++ 	}
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
++ static int
++ dsa_slave_prechangeupper_sanity_check(struct net_device *dev,
++ 				      struct netdev_notifier_changeupper_info *info)
++ {
++ 	struct dsa_switch *ds;
++ 	struct dsa_port *dp;
++ 	int err;
++ 
++ 	if (!dsa_slave_dev_check(dev))
++ 		return dsa_prevent_bridging_8021q_upper(dev, info);
++ 
++ 	dp = dsa_slave_to_port(dev);
++ 	ds = dp->ds;
++ 
++ 	if (ds->ops->port_prechangeupper) {
++ 		err = ds->ops->port_prechangeupper(ds, dp->index, info);
++ 		if (err)
++ 			return notifier_from_errno(err);
++ 	}
++ 
++ 	if (is_vlan_dev(info->upper_dev))
++ 		return dsa_slave_check_8021q_upper(dev, info);
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
+++>>>>>>> 4e51bf44a03a (net: bridge: move the switchdev object replay helpers to "push" mode)
+  static int dsa_slave_netdevice_event(struct notifier_block *nb,
+  				     unsigned long event, void *ptr)
+  {
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+* Unmerged path drivers/net/ethernet/microchip/sparx5/sparx5_switchdev.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-nuss.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+* Unmerged path drivers/net/ethernet/microchip/sparx5/sparx5_switchdev.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+* Unmerged path drivers/net/ethernet/rocker/rocker_ofdpa.c
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-nuss.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+* Unmerged path include/linux/if_bridge.h
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index 727e4c29f2d6..88e0a22a6fbb 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -758,7 +758,6 @@ int br_fdb_replay(struct net_device *br_dev, struct net_device *dev,
+ 
+ 	return err;
+ }
+-EXPORT_SYMBOL_GPL(br_fdb_replay);
+ 
+ static void fdb_notify(struct net_bridge *br,
+ 		       const struct net_bridge_fdb_entry *fdb, int type,
+* Unmerged path net/bridge/br_mdb.c
+* Unmerged path net/bridge/br_private.h
+* Unmerged path net/bridge/br_switchdev.c
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index b985e572c168..0053b3ae3963 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -1775,7 +1775,6 @@ int br_vlan_replay(struct net_device *br_dev, struct net_device *dev,
+ 
+ 	return err;
+ }
+-EXPORT_SYMBOL_GPL(br_vlan_replay);
+ 
+ /* check if v_curr can enter a range ending in range_end */
+ bool br_vlan_can_enter_range(const struct net_bridge_vlan *v_curr,
+* Unmerged path net/dsa/dsa_priv.h
+* Unmerged path net/dsa/port.c
+* Unmerged path net/dsa/slave.c
