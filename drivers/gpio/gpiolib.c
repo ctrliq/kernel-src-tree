@@ -1827,6 +1827,17 @@ static void gpiochip_irq_relres(struct irq_data *d)
 	gpiochip_relres_irq(chip, d->hwirq);
 }
 
+static void gpiochip_set_irq_hooks(struct gpio_chip *gpiochip)
+{
+	struct irq_chip *irqchip = gpiochip->irq.chip;
+
+	if (!irqchip->irq_request_resources &&
+	    !irqchip->irq_release_resources) {
+		irqchip->irq_request_resources = gpiochip_irq_reqres;
+		irqchip->irq_release_resources = gpiochip_irq_relres;
+	}
+}
+
 /**
  * gpiochip_add_irqchip() - adds an IRQ chip to a GPIO chip
  * @gpiochip: the GPIO chip to add the IRQ chip to
@@ -1885,16 +1896,6 @@ static int gpiochip_add_irqchip(struct gpio_chip *gpiochip,
 	if (!gpiochip->irq.domain)
 		return -EINVAL;
 
-	/*
-	 * It is possible for a driver to override this, but only if the
-	 * alternative functions are both implemented.
-	 */
-	if (!irqchip->irq_request_resources &&
-	    !irqchip->irq_release_resources) {
-		irqchip->irq_request_resources = gpiochip_irq_reqres;
-		irqchip->irq_release_resources = gpiochip_irq_relres;
-	}
-
 	if (gpiochip->irq.parent_handler) {
 		void *data = gpiochip->irq.parent_handler_data ?: gpiochip;
 
@@ -1910,6 +1911,8 @@ static int gpiochip_add_irqchip(struct gpio_chip *gpiochip,
 		}
 	}
 
+	gpiochip_set_irq_hooks(gpiochip);
+
 	acpi_gpiochip_request_interrupts(gpiochip);
 
 	return 0;
@@ -1923,11 +1926,12 @@ static int gpiochip_add_irqchip(struct gpio_chip *gpiochip,
  */
 static void gpiochip_irqchip_remove(struct gpio_chip *gpiochip)
 {
+	struct irq_chip *irqchip = gpiochip->irq.chip;
 	unsigned int offset;
 
 	acpi_gpiochip_free_interrupts(gpiochip);
 
-	if (gpiochip->irq.chip && gpiochip->irq.parent_handler) {
+	if (irqchip && gpiochip->irq.parent_handler) {
 		struct gpio_irq_chip *irq = &gpiochip->irq;
 		unsigned int i;
 
@@ -1951,11 +1955,12 @@ static void gpiochip_irqchip_remove(struct gpio_chip *gpiochip)
 		irq_domain_remove(gpiochip->irq.domain);
 	}
 
-	if (gpiochip->irq.chip) {
-		gpiochip->irq.chip->irq_request_resources = NULL;
-		gpiochip->irq.chip->irq_release_resources = NULL;
-		gpiochip->irq.chip = NULL;
+	if (irqchip &&
+	    irqchip->irq_request_resources == gpiochip_irq_reqres) {
+		irqchip->irq_request_resources = NULL;
+		irqchip->irq_release_resources = NULL;
 	}
+	gpiochip->irq.chip = NULL;
 
 	gpiochip_irqchip_free_valid_mask(gpiochip);
 }
@@ -2044,15 +2049,7 @@ int gpiochip_irqchip_add_key(struct gpio_chip *gpiochip,
 		return -EINVAL;
 	}
 
-	/*
-	 * It is possible for a driver to override this, but only if the
-	 * alternative functions are both implemented.
-	 */
-	if (!irqchip->irq_request_resources &&
-	    !irqchip->irq_release_resources) {
-		irqchip->irq_request_resources = gpiochip_irq_reqres;
-		irqchip->irq_release_resources = gpiochip_irq_relres;
-	}
+	gpiochip_set_irq_hooks(gpiochip);
 
 	acpi_gpiochip_request_interrupts(gpiochip);
 
