@@ -1,0 +1,226 @@
+drm/i915/tc/icl: Implement TC cold sequences
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author José Roberto de Souza <jose.souza@intel.com>
+commit feb7e0ef5ff820ee7242bb46cfe3d0dd3e234c38
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/feb7e0ef.failed
+
+This is required for legacy/static TC ports as IOM is not aware of
+the connection and will not trigger the TC cold exit.
+
+Just request PCODE to exit TCCOLD is not enough as it could enter
+again before driver makes use of the port, to prevent it BSpec states
+that aux powerwell should be held.
+
+So here embedding the TC cold exit sequence into ICL aux enable,
+it will enable aux and then request TC cold to exit.
+
+The TC cold block(exit and aux hold) and unblock was added to some
+exported TC functions for the others and to access PHY registers,
+callers should enable and keep aux powerwell enabled during access.
+
+Also adding TC cold check and warnig in tc_port_load_fia_params() as
+at this point of the driver initialization we can't request power
+wells, if we get this warning we will need to figure out how to handle
+it.
+
+v2:
+- moved ICL TC cold exit function to intel_display_power
+- using dig_port->tc_legacy_port to only execute sequences for legacy
+ports, hopefully VBTs will have this right
+- fixed check to call _hsw_power_well_continue_enable()
+- calling _hsw_power_well_continue_enable() unconditionally in
+icl_tc_phy_aux_power_well_enable(), if needed we will surpress timeout
+warnings of TC legacy ports
+- only blocking TC cold around fia access
+
+v3:
+- added timeout of 5msec to not loop forever if
+sandybridge_pcode_write_timeout() keeps returning -EAGAIN
+returning -EAGAIN in in icl_tc_cold_exit()
+- removed leftover tc_cold_wakeref
+- added one msec sleep when PCODE returns -EAGAIN
+
+v4:
+- removed 5msec timeout, instead giving 1msec to whoever is using
+PCODE to finish it up to 3 times
+- added a comment about turn TC cold exit failure as a error in future
+
+BSpec: 21750
+Closes: https://gitlab.freedesktop.org/drm/intel/issues/1296
+	Cc: Imre Deak <imre.deak@intel.com>
+	Cc: Cooper Chiou <cooper.chiou@intel.com>
+	Cc: Kai-Heng Feng <kai.heng.feng@canonical.com>
+	Reviewed-by: Imre Deak <imre.deak@intel.com>
+	Signed-off-by: José Roberto de Souza <jose.souza@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200414194956.164323-4-jose.souza@intel.com
+(cherry picked from commit feb7e0ef5ff820ee7242bb46cfe3d0dd3e234c38)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_display_power.c
+#	drivers/gpu/drm/i915/display/intel_tc.c
+diff --cc drivers/gpu/drm/i915/display/intel_display_power.c
+index dd1a43a366f2,c4043d665645..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_display_power.c
++++ b/drivers/gpu/drm/i915/display/intel_display_power.c
+@@@ -441,24 -524,126 +441,134 @@@ icl_combo_phy_aux_power_well_disable(st
+  #define ICL_TBT_AUX_PW_TO_CH(pw_idx)	\
+  	((pw_idx) - ICL_PW_CTL_IDX_AUX_TBT1 + AUX_CH_C)
+  
+++<<<<<<< HEAD
+++=======
++ static enum aux_ch icl_tc_phy_aux_ch(struct drm_i915_private *dev_priv,
++ 				     struct i915_power_well *power_well)
++ {
++ 	int pw_idx = power_well->desc->hsw.idx;
++ 
++ 	return power_well->desc->hsw.is_tc_tbt ? ICL_TBT_AUX_PW_TO_CH(pw_idx) :
++ 						 ICL_AUX_PW_TO_CH(pw_idx);
++ }
++ 
++ #if IS_ENABLED(CONFIG_DRM_I915_DEBUG_RUNTIME_PM)
++ 
++ static u64 async_put_domains_mask(struct i915_power_domains *power_domains);
++ 
++ static int power_well_async_ref_count(struct drm_i915_private *dev_priv,
++ 				      struct i915_power_well *power_well)
++ {
++ 	int refs = hweight64(power_well->desc->domains &
++ 			     async_put_domains_mask(&dev_priv->power_domains));
++ 
++ 	drm_WARN_ON(&dev_priv->drm, refs > power_well->count);
++ 
++ 	return refs;
++ }
++ 
++ static void icl_tc_port_assert_ref_held(struct drm_i915_private *dev_priv,
++ 					struct i915_power_well *power_well,
++ 					struct intel_digital_port *dig_port)
++ {
++ 	/* Bypass the check if all references are released asynchronously */
++ 	if (power_well_async_ref_count(dev_priv, power_well) ==
++ 	    power_well->count)
++ 		return;
++ 
++ 	if (drm_WARN_ON(&dev_priv->drm, !dig_port))
++ 		return;
++ 
++ 	drm_WARN_ON(&dev_priv->drm, !intel_tc_port_ref_held(dig_port));
++ }
++ 
++ #else
++ 
++ static void icl_tc_port_assert_ref_held(struct drm_i915_private *dev_priv,
++ 					struct i915_power_well *power_well,
++ 					struct intel_digital_port *dig_port)
++ {
++ }
++ 
++ #endif
++ 
++ #define TGL_AUX_PW_TO_TC_PORT(pw_idx)	((pw_idx) - TGL_PW_CTL_IDX_AUX_TC1)
++ 
++ static void icl_tc_cold_exit(struct drm_i915_private *i915)
++ {
++ 	int ret, tries = 0;
++ 
++ 	while (1) {
++ 		ret = sandybridge_pcode_write_timeout(i915,
++ 						      ICL_PCODE_EXIT_TCCOLD,
++ 						      0, 250, 1);
++ 		if (ret != -EAGAIN || ++tries == 3)
++ 			break;
++ 		msleep(1);
++ 	}
++ 
++ 	/* Spec states that TC cold exit can take up to 1ms to complete */
++ 	if (!ret)
++ 		msleep(1);
++ 
++ 	/* TODO: turn failure into a error as soon i915 CI updates ICL IFWI */
++ 	drm_dbg_kms(&i915->drm, "TC cold block %s\n", ret ? "failed" :
++ 		    "succeeded");
++ }
++ 
+++>>>>>>> feb7e0ef5ff8 (drm/i915/tc/icl: Implement TC cold sequences)
+  static void
+  icl_tc_phy_aux_power_well_enable(struct drm_i915_private *dev_priv,
+  				 struct i915_power_well *power_well)
+  {
+ -	enum aux_ch aux_ch = icl_tc_phy_aux_ch(dev_priv, power_well);
+ -	struct intel_digital_port *dig_port = aux_ch_to_digital_port(dev_priv, aux_ch);
+ +	int pw_idx = power_well->desc->hsw.idx;
+ +	bool is_tbt = power_well->desc->hsw.is_tc_tbt;
+ +	enum aux_ch aux_ch;
+  	u32 val;
+  
+ -	icl_tc_port_assert_ref_held(dev_priv, power_well, dig_port);
+ -
+ -	val = intel_de_read(dev_priv, DP_AUX_CH_CTL(aux_ch));
+ +	aux_ch = is_tbt ? ICL_TBT_AUX_PW_TO_CH(pw_idx) :
+ +			  ICL_AUX_PW_TO_CH(pw_idx);
+ +	val = I915_READ(DP_AUX_CH_CTL(aux_ch));
+  	val &= ~DP_AUX_CH_CTL_TBT_IO;
+ -	if (power_well->desc->hsw.is_tc_tbt)
+ +	if (is_tbt)
+  		val |= DP_AUX_CH_CTL_TBT_IO;
+ -	intel_de_write(dev_priv, DP_AUX_CH_CTL(aux_ch), val);
+ +	I915_WRITE(DP_AUX_CH_CTL(aux_ch), val);
+  
+++<<<<<<< HEAD
+ +	hsw_power_well_enable(dev_priv, power_well);
+++=======
++ 	hsw_power_well_enable_prepare(dev_priv, power_well);
++ 
++ 	if (INTEL_GEN(dev_priv) == 11 && dig_port->tc_legacy_port)
++ 		icl_tc_cold_exit(dev_priv);
++ 
++ 	hsw_power_well_enable_complete(dev_priv, power_well);
++ 
++ 	if (INTEL_GEN(dev_priv) >= 12 && !power_well->desc->hsw.is_tc_tbt) {
++ 		enum tc_port tc_port;
++ 
++ 		tc_port = TGL_AUX_PW_TO_TC_PORT(power_well->desc->hsw.idx);
++ 		intel_de_write(dev_priv, HIP_INDEX_REG(tc_port),
++ 			       HIP_INDEX_VAL(tc_port, 0x2));
++ 
++ 		if (intel_de_wait_for_set(dev_priv, DKL_CMN_UC_DW_27(tc_port),
++ 					  DKL_CMN_UC_DW27_UC_HEALTH, 1))
++ 			drm_warn(&dev_priv->drm,
++ 				 "Timeout waiting TC uC health\n");
++ 	}
++ }
++ 
++ static void
++ icl_tc_phy_aux_power_well_disable(struct drm_i915_private *dev_priv,
++ 				  struct i915_power_well *power_well)
++ {
++ 	enum aux_ch aux_ch = icl_tc_phy_aux_ch(dev_priv, power_well);
++ 	struct intel_digital_port *dig_port = aux_ch_to_digital_port(dev_priv, aux_ch);
++ 
++ 	icl_tc_port_assert_ref_held(dev_priv, power_well, dig_port);
++ 
++ 	hsw_power_well_disable(dev_priv, power_well);
+++>>>>>>> feb7e0ef5ff8 (drm/i915/tc/icl: Implement TC cold sequences)
+  }
+  
+  /*
+* Unmerged path drivers/gpu/drm/i915/display/intel_tc.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_display_power.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_tc.c
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 32940dd2ebc5..45e71410def1 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -8824,6 +8824,7 @@ enum {
+ #define     ICL_PCODE_MEM_SS_READ_QGV_POINT_INFO(point)	(((point) << 16) | (0x1 << 8))
+ #define   GEN6_PCODE_READ_D_COMP		0x10
+ #define   GEN6_PCODE_WRITE_D_COMP		0x11
++#define   ICL_PCODE_EXIT_TCCOLD			0x12
+ #define   HSW_PCODE_DE_WRITE_FREQ_REQ		0x17
+ #define   DISPLAY_IPS_CONTROL			0x19
+             /* See also IPS_CTL */
