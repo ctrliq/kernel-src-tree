@@ -1,0 +1,127 @@
+net/sched: act_ct: fix miss set mru for ovs after defrag in act_ct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] sched: act_ct: fix miss set mru for ovs after defrag in act_ct (Ivan Vecera) [1874071]
+Rebuild_FUZZ: 96.88%
+commit-author wenxu <wenxu@ucloud.cn>
+commit 038ebb1a713d114d54dbf14868a73181c0c92758
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/038ebb1a.failed
+
+When openvswitch conntrack offload with act_ct action. Fragment packets
+defrag in the ingress tc act_ct action and miss the next chain. Then the
+packet pass to the openvswitch datapath without the mru. The over
+mtu packet will be dropped in output action in openvswitch for over mtu.
+
+"kernel: net2: dropped over-mtu packet: 1528 > 1500"
+
+This patch add mru in the tc_skb_ext for adefrag and miss next chain
+situation. And also add mru in the qdisc_skb_cb. The act_ct set the mru
+to the qdisc_skb_cb when the packet defrag. And When the chain miss,
+The mru is set to tc_skb_ext which can be got by ovs datapath.
+
+Fixes: b57dc7c13ea9 ("net/sched: Introduce action ct")
+	Signed-off-by: wenxu <wenxu@ucloud.cn>
+	Reviewed-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 038ebb1a713d114d54dbf14868a73181c0c92758)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_ct.c
+diff --cc net/sched/act_ct.c
+index c0253f51149d,e6ad42b11835..000000000000
+--- a/net/sched/act_ct.c
++++ b/net/sched/act_ct.c
+@@@ -703,7 -704,12 +703,16 @@@ static int tcf_ct_handle_fragments(stru
+  		err = ip_defrag(net, skb, user);
+  		local_bh_enable();
+  		if (err && err != -EINPROGRESS)
+++<<<<<<< HEAD
+ +			return err;
+++=======
++ 			goto out_free;
++ 
++ 		if (!err) {
++ 			*defrag = true;
++ 			cb.mru = IPCB(skb)->frag_max_size;
++ 		}
+++>>>>>>> 038ebb1a713d (net/sched: act_ct: fix miss set mru for ovs after defrag in act_ct)
+  	} else { /* NFPROTO_IPV6 */
+  #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
+  		enum ip6_defrag_users user = IP6_DEFRAG_CONNTRACK_IN + zone;
+@@@ -712,6 -718,11 +721,14 @@@
+  		err = nf_ct_frag6_gather(net, skb, user);
+  		if (err && err != -EINPROGRESS)
+  			goto out_free;
+++<<<<<<< HEAD
+++=======
++ 
++ 		if (!err) {
++ 			*defrag = true;
++ 			cb.mru = IP6CB(skb)->frag_max_size;
++ 		}
+++>>>>>>> 038ebb1a713d (net/sched: act_ct: fix miss set mru for ovs after defrag in act_ct)
+  #else
+  		err = -EOPNOTSUPP;
+  		goto out_free;
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index dd5eeea5beeb..13bdc10249b9 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -292,6 +292,7 @@ struct nf_bridge_info {
+  */
+ struct tc_skb_ext {
+ 	__u32 chain;
++	__u16 mru;
+ };
+ #endif
+ 
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 580f661dd842..45237f8a7156 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -384,6 +384,7 @@ struct qdisc_skb_cb {
+ 	};
+ #define QDISC_CB_PRIV_LEN 20
+ 	unsigned char		data[QDISC_CB_PRIV_LEN];
++	u16			mru;
+ };
+ 
+ typedef void tcf_chain_head_change_t(struct tcf_proto *tp_head, void *priv);
+@@ -463,7 +464,7 @@ static inline void qdisc_cb_private_validate(const struct sk_buff *skb, int sz)
+ {
+ 	struct qdisc_skb_cb *qcb;
+ 
+-	BUILD_BUG_ON(sizeof(skb->cb) < offsetof(struct qdisc_skb_cb, data) + sz);
++	BUILD_BUG_ON(sizeof(skb->cb) < sizeof(*qcb));
+ 	BUILD_BUG_ON(sizeof(qcb->data) < sz);
+ }
+ 
+diff --git a/net/openvswitch/flow.c b/net/openvswitch/flow.c
+index 03f856a935ca..3f2ee2279b39 100644
+--- a/net/openvswitch/flow.c
++++ b/net/openvswitch/flow.c
+@@ -903,6 +903,7 @@ int ovs_flow_key_extract(const struct ip_tunnel_info *tun_info,
+ 	if (static_branch_unlikely(&tc_recirc_sharing_support)) {
+ 		tc_ext = skb_ext_find(skb, TC_SKB_EXT);
+ 		key->recirc_id = tc_ext ? tc_ext->chain : 0;
++		OVS_CB(skb)->mru = tc_ext ? tc_ext->mru : 0;
+ 	} else {
+ 		key->recirc_id = 0;
+ 	}
+* Unmerged path net/sched/act_ct.c
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index 1652fc7f408a..e64375702839 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -1631,6 +1631,7 @@ int tcf_classify_ingress(struct sk_buff *skb,
+ 		if (WARN_ON_ONCE(!ext))
+ 			return TC_ACT_SHOT;
+ 		ext->chain = last_executed_chain;
++		ext->mru = qdisc_skb_cb(skb)->mru;
+ 	}
+ 
+ 	return ret;
