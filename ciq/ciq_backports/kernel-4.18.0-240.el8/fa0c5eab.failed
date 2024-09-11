@@ -1,0 +1,266 @@
+KVM: s390: protvirt: Secure memory is not mergeable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Janosch Frank <frankja@linux.ibm.com>
+commit fa0c5eabbdd33012b369cf75d6a39389cc9ae707
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/fa0c5eab.failed
+
+KSM will not work on secure pages, because when the kernel reads a
+secure page, it will be encrypted and hence no two pages will look the
+same.
+
+Let's mark the guest pages as unmergeable when we transition to secure
+mode.
+
+	Signed-off-by: Janosch Frank <frankja@linux.ibm.com>
+	Reviewed-by: Thomas Huth <thuth@redhat.com>
+	Reviewed-by: David Hildenbrand <david@redhat.com>
+	Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+[borntraeger@de.ibm.com: patch merging, splitting, fixing]
+	Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+(cherry picked from commit fa0c5eabbdd33012b369cf75d6a39389cc9ae707)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/kvm-s390.c
+#	arch/s390/mm/gmap.c
+diff --cc arch/s390/kvm/kvm-s390.c
+index 2e5b00d67d71,bf61f48e9a3d..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -2158,6 -2168,166 +2158,169 @@@ out
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int kvm_s390_cpus_from_pv(struct kvm *kvm, u16 *rcp, u16 *rrcp)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	u16 rc, rrc;
++ 	int ret = 0;
++ 	int i;
++ 
++ 	/*
++ 	 * We ignore failures and try to destroy as many CPUs as possible.
++ 	 * At the same time we must not free the assigned resources when
++ 	 * this fails, as the ultravisor has still access to that memory.
++ 	 * So kvm_s390_pv_destroy_cpu can leave a "wanted" memory leak
++ 	 * behind.
++ 	 * We want to return the first failure rc and rrc, though.
++ 	 */
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		mutex_lock(&vcpu->mutex);
++ 		if (kvm_s390_pv_destroy_cpu(vcpu, &rc, &rrc) && !ret) {
++ 			*rcp = rc;
++ 			*rrcp = rrc;
++ 			ret = -EIO;
++ 		}
++ 		mutex_unlock(&vcpu->mutex);
++ 	}
++ 	return ret;
++ }
++ 
++ static int kvm_s390_cpus_to_pv(struct kvm *kvm, u16 *rc, u16 *rrc)
++ {
++ 	int i, r = 0;
++ 	u16 dummy;
++ 
++ 	struct kvm_vcpu *vcpu;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		mutex_lock(&vcpu->mutex);
++ 		r = kvm_s390_pv_create_cpu(vcpu, rc, rrc);
++ 		mutex_unlock(&vcpu->mutex);
++ 		if (r)
++ 			break;
++ 	}
++ 	if (r)
++ 		kvm_s390_cpus_from_pv(kvm, &dummy, &dummy);
++ 	return r;
++ }
++ 
++ static int kvm_s390_handle_pv(struct kvm *kvm, struct kvm_pv_cmd *cmd)
++ {
++ 	int r = 0;
++ 	u16 dummy;
++ 	void __user *argp = (void __user *)cmd->data;
++ 
++ 	switch (cmd->cmd) {
++ 	case KVM_PV_ENABLE: {
++ 		r = -EINVAL;
++ 		if (kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		/*
++ 		 *  FMT 4 SIE needs esca. As we never switch back to bsca from
++ 		 *  esca, we need no cleanup in the error cases below
++ 		 */
++ 		r = sca_switch_to_extended(kvm);
++ 		if (r)
++ 			break;
++ 
++ 		down_write(&current->mm->mmap_sem);
++ 		r = gmap_mark_unmergeable();
++ 		up_write(&current->mm->mmap_sem);
++ 		if (r)
++ 			break;
++ 
++ 		r = kvm_s390_pv_init_vm(kvm, &cmd->rc, &cmd->rrc);
++ 		if (r)
++ 			break;
++ 
++ 		r = kvm_s390_cpus_to_pv(kvm, &cmd->rc, &cmd->rrc);
++ 		if (r)
++ 			kvm_s390_pv_deinit_vm(kvm, &dummy, &dummy);
++ 		break;
++ 	}
++ 	case KVM_PV_DISABLE: {
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = kvm_s390_cpus_from_pv(kvm, &cmd->rc, &cmd->rrc);
++ 		/*
++ 		 * If a CPU could not be destroyed, destroy VM will also fail.
++ 		 * There is no point in trying to destroy it. Instead return
++ 		 * the rc and rrc from the first CPU that failed destroying.
++ 		 */
++ 		if (r)
++ 			break;
++ 		r = kvm_s390_pv_deinit_vm(kvm, &cmd->rc, &cmd->rrc);
++ 		break;
++ 	}
++ 	case KVM_PV_SET_SEC_PARMS: {
++ 		struct kvm_s390_pv_sec_parm parms = {};
++ 		void *hdr;
++ 
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = -EFAULT;
++ 		if (copy_from_user(&parms, argp, sizeof(parms)))
++ 			break;
++ 
++ 		/* Currently restricted to 8KB */
++ 		r = -EINVAL;
++ 		if (parms.length > PAGE_SIZE * 2)
++ 			break;
++ 
++ 		r = -ENOMEM;
++ 		hdr = vmalloc(parms.length);
++ 		if (!hdr)
++ 			break;
++ 
++ 		r = -EFAULT;
++ 		if (!copy_from_user(hdr, (void __user *)parms.origin,
++ 				    parms.length))
++ 			r = kvm_s390_pv_set_sec_parms(kvm, hdr, parms.length,
++ 						      &cmd->rc, &cmd->rrc);
++ 
++ 		vfree(hdr);
++ 		break;
++ 	}
++ 	case KVM_PV_UNPACK: {
++ 		struct kvm_s390_pv_unp unp = {};
++ 
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = -EFAULT;
++ 		if (copy_from_user(&unp, argp, sizeof(unp)))
++ 			break;
++ 
++ 		r = kvm_s390_pv_unpack(kvm, unp.addr, unp.size, unp.tweak,
++ 				       &cmd->rc, &cmd->rrc);
++ 		break;
++ 	}
++ 	case KVM_PV_VERIFY: {
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = uv_cmd_nodata(kvm_s390_pv_get_handle(kvm),
++ 				  UVC_CMD_VERIFY_IMG, &cmd->rc, &cmd->rrc);
++ 		KVM_UV_EVENT(kvm, 3, "PROTVIRT VERIFY: rc %x rrc %x", cmd->rc,
++ 			     cmd->rrc);
++ 		break;
++ 	}
++ 	default:
++ 		r = -ENOTTY;
++ 	}
++ 	return r;
++ }
++ 
+++>>>>>>> fa0c5eabbdd3 (KVM: s390: protvirt: Secure memory is not mergeable)
+  long kvm_arch_vm_ioctl(struct file *filp,
+  		       unsigned int ioctl, unsigned long arg)
+  {
+diff --cc arch/s390/mm/gmap.c
+index 911c7ded35f1,7291452fe5f0..000000000000
+--- a/arch/s390/mm/gmap.c
++++ b/arch/s390/mm/gmap.c
+@@@ -2583,14 -2601,14 +2599,13 @@@ static int __s390_enable_skey_hugetlb(p
+  	return 0;
+  }
+  
+ -static const struct mm_walk_ops enable_skey_walk_ops = {
+ -	.hugetlb_entry		= __s390_enable_skey_hugetlb,
+ -	.pte_entry		= __s390_enable_skey_pte,
+ -};
+ -
+  int s390_enable_skey(void)
+  {
+ +	struct mm_walk walk = {
+ +		.hugetlb_entry = __s390_enable_skey_hugetlb,
+ +		.pte_entry = __s390_enable_skey_pte,
+ +	};
+  	struct mm_struct *mm = current->mm;
+- 	struct vm_area_struct *vma;
+  	int rc = 0;
+  
+  	down_write(&mm->mmap_sem);
+@@@ -2598,18 -2616,12 +2613,19 @@@
+  		goto out_up;
+  
+  	mm->context.uses_skeys = 1;
+- 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+- 		if (ksm_madvise(vma, vma->vm_start, vma->vm_end,
+- 				MADV_UNMERGEABLE, &vma->vm_flags)) {
+- 			mm->context.uses_skeys = 0;
+- 			rc = -ENOMEM;
+- 			goto out_up;
+- 		}
++ 	rc = gmap_mark_unmergeable();
++ 	if (rc) {
++ 		mm->context.uses_skeys = 0;
++ 		goto out_up;
+  	}
+++<<<<<<< HEAD
+ +	mm->def_flags &= ~VM_MERGEABLE;
+ +
+ +	walk.mm = mm;
+ +	walk_page_range(0, TASK_SIZE, &walk);
+++=======
++ 	walk_page_range(mm, 0, TASK_SIZE, &enable_skey_walk_ops, NULL);
+++>>>>>>> fa0c5eabbdd3 (KVM: s390: protvirt: Secure memory is not mergeable)
+  
+  out_up:
+  	up_write(&mm->mmap_sem);
+diff --git a/arch/s390/include/asm/gmap.h b/arch/s390/include/asm/gmap.h
+index fcbd638fb9f4..1be1e1e89932 100644
+--- a/arch/s390/include/asm/gmap.h
++++ b/arch/s390/include/asm/gmap.h
+@@ -142,4 +142,5 @@ int gmap_mprotect_notify(struct gmap *, unsigned long start,
+ 
+ void gmap_sync_dirty_log_pmd(struct gmap *gmap, unsigned long dirty_bitmap[4],
+ 			     unsigned long gaddr, unsigned long vmaddr);
++int gmap_mark_unmergeable(void);
+ #endif /* _ASM_S390_GMAP_H */
+* Unmerged path arch/s390/kvm/kvm-s390.c
+* Unmerged path arch/s390/mm/gmap.c
