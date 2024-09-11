@@ -2332,7 +2332,7 @@ int snd_ymfpci_create(struct snd_card *card,
 {
 	struct snd_ymfpci *chip;
 	int err;
-	static struct snd_device_ops ops = {
+	static const struct snd_device_ops ops = {
 		.dev_free =	snd_ymfpci_dev_free,
 	};
 	

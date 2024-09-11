@@ -2044,7 +2044,7 @@ static int snd_ensoniq_create(struct snd_card *card,
 {
 	struct ensoniq *ensoniq;
 	int err;
-	static struct snd_device_ops ops = {
+	static const struct snd_device_ops ops = {
 		.dev_free =	snd_ensoniq_dev_free,
 	};
 
