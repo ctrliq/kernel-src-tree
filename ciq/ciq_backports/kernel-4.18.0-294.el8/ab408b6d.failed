@@ -1,0 +1,175 @@
+tcp: switch tcp and sch_fq to new earliest departure time model
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Eric Dumazet <edumazet@google.com>
+commit ab408b6dc7449c0f791e9e5f8de72fa7428584f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ab408b6d.failed
+
+TCP keeps track of tcp_wstamp_ns by itself, meaning sch_fq
+no longer has to do it.
+
+Thanks to this model, TCP can get more accurate RTT samples,
+since pacing no longer inflates them.
+
+This has the nice effect of removing some delays caused by FQ
+quantum mechanism, causing inflated max/P99 latencies.
+
+Also we might relax TCP Small Queue tight limits in the future,
+since this new model allow TCP to build bigger batches, since
+sch_fq (or a device with earliest departure time offload) ensure
+these packets will be delivered on time.
+
+Note that other protocols are not converted (they will probably
+never be) so sch_fq has still support for SO_MAX_PACING_RATE
+
+Tested:
+
+Test showing FQ pacing quantum artifact for low-rate flows,
+adding unexpected throttles for RPC flows, inflating max and P99 latencies.
+
+The parameters chosen here are to show what happens typically when
+a TCP flow has a reduced pacing rate (this can be caused by a reduced
+cwin after few losses, or/and rtt above few ms)
+
+MIBS="MIN_LATENCY,MEAN_LATENCY,MAX_LATENCY,P99_LATENCY,STDDEV_LATENCY"
+Before :
+$ netperf -H 10.246.7.133 -t TCP_RR -Cc -T6,6 -- -q 2000000 -r 100,100 -o $MIBS
+MIGRATED TCP REQUEST/RESPONSE TEST from 0.0.0.0 (0.0.0.0) port 0 AF_INET to 10.246.7.133 () port 0 AF_INET : first burst 0 : cpu bind
+ Minimum Latency Microseconds,Mean Latency Microseconds,Maximum Latency Microseconds,99th Percentile Latency Microseconds,Stddev Latency Microseconds
+19,82.78,5279,3825,482.02
+
+After :
+$ netperf -H 10.246.7.133 -t TCP_RR -Cc -T6,6 -- -q 2000000 -r 100,100 -o $MIBS
+MIGRATED TCP REQUEST/RESPONSE TEST from 0.0.0.0 (0.0.0.0) port 0 AF_INET to 10.246.7.133 () port 0 AF_INET : first burst 0 : cpu bind
+Minimum Latency Microseconds,Mean Latency Microseconds,Maximum Latency Microseconds,99th Percentile Latency Microseconds,Stddev Latency Microseconds
+20,49.94,128,63,3.18
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ab408b6dc7449c0f791e9e5f8de72fa7428584f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_fq.c
+diff --cc net/sched/sch_fq.c
+index 520fc183e0d7,77692ad6741d..000000000000
+--- a/net/sched/sch_fq.c
++++ b/net/sched/sch_fq.c
+@@@ -453,17 -492,15 +453,29 @@@ begin
+  
+  	skb = f->head;
+  	if (skb && !skb_is_tcp_pure_ack(skb)) {
+++<<<<<<< HEAD
+ +		u64 time_next_packet = f->time_next_packet;
+ +		if (now < time_next_packet) {
+ +			head->first = f->next;
+ +			fq_flow_set_throttled(q, f);
+ +			goto begin;
+ +		}
+ +		if (time_next_packet &&
+ +		    (s64)(now - time_next_packet - q->ce_threshold) > 0) {
+ +			INET_ECN_set_ce(skb);
+ +			q->stat_ce_mark++;
+ +		}
+++=======
++ 		u64 time_next_packet = max_t(u64, ktime_to_ns(skb->tstamp),
++ 					     f->time_next_packet);
++ 
++ 		if (now < time_next_packet) {
++ 			head->first = f->next;
++ 			f->time_next_packet = time_next_packet;
++ 			fq_flow_set_throttled(q, f);
++ 			goto begin;
++ 		}
+++>>>>>>> ab408b6dc744 (tcp: switch tcp and sch_fq to new earliest departure time model)
+  	}
+  
+  	skb = fq_dequeue_head(sch, f);
+diff --git a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
+index c75c19bf9668..eee6ba4d0a4c 100644
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@ -128,6 +128,9 @@ static const u32 bbr_probe_rtt_mode_ms = 200;
+ /* Skip TSO below the following bandwidth (bits/sec): */
+ static const int bbr_min_tso_rate = 1200000;
+ 
++/* Pace at ~1% below estimated bw, on average, to reduce queue at bottleneck. */
++static const int bbr_pacing_marging_percent = 1;
++
+ /* We use a high_gain value of 2/ln(2) because it's the smallest pacing gain
+  * that will allow a smoothly increasing pacing rate that will double each RTT
+  * and send the same number of packets per RTT that an un-paced, slow-starting
+@@ -208,12 +211,10 @@ static u64 bbr_rate_bytes_per_sec(struct sock *sk, u64 rate, int gain)
+ {
+ 	unsigned int mss = tcp_sk(sk)->mss_cache;
+ 
+-	if (!tcp_needs_internal_pacing(sk))
+-		mss = tcp_mss_to_mtu(sk, mss);
+ 	rate *= mss;
+ 	rate *= gain;
+ 	rate >>= BBR_SCALE;
+-	rate *= USEC_PER_SEC;
++	rate *= USEC_PER_SEC / 100 * (100 - bbr_pacing_marging_percent);
+ 	return rate >> BW_SCALE;
+ }
+ 
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 18b0cf43ad92..46cf8fd705b1 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -1079,9 +1079,23 @@ static void tcp_internal_pacing(struct sock *sk, const struct sk_buff *skb)
+ 	sock_hold(sk);
+ }
+ 
+-static void tcp_update_skb_after_send(struct tcp_sock *tp, struct sk_buff *skb)
++static void tcp_update_skb_after_send(struct sock *sk, struct sk_buff *skb)
+ {
++	struct tcp_sock *tp = tcp_sk(sk);
++
+ 	skb->skb_mstamp_ns = tp->tcp_wstamp_ns;
++	if (sk->sk_pacing_status != SK_PACING_NONE) {
++		u32 rate = sk->sk_pacing_rate;
++
++		/* Original sch_fq does not pace first 10 MSS
++		 * Note that tp->data_segs_out overflows after 2^32 packets,
++		 * this is a minor annoyance.
++		 */
++		if (rate != ~0U && rate && tp->data_segs_out >= 10) {
++			tp->tcp_wstamp_ns += div_u64((u64)skb->len * NSEC_PER_SEC, rate);
++			/* TODO: update internal pacing here */
++		}
++	}
+ 	list_move_tail(&skb->tcp_tsorted_anchor, &tp->tsorted_sent_queue);
+ }
+ 
+@@ -1249,7 +1263,7 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
+ 		err = net_xmit_eval(err);
+ 	}
+ 	if (!err && oskb) {
+-		tcp_update_skb_after_send(tp, oskb);
++		tcp_update_skb_after_send(sk, oskb);
+ 		tcp_rate_skb_sent(sk, oskb);
+ 	}
+ 	return err;
+@@ -2434,7 +2448,7 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+ 
+ 		if (unlikely(tp->repair) && tp->repair_queue == TCP_SEND_QUEUE) {
+ 			/* "skb_mstamp" is used as a start point for the retransmit timer */
+-			tcp_update_skb_after_send(tp, skb);
++			tcp_update_skb_after_send(sk, skb);
+ 			goto repair; /* Skip network transmission */
+ 		}
+ 
+@@ -3029,7 +3043,7 @@ int __tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb, int segs)
+ 		} tcp_skb_tsorted_restore(skb);
+ 
+ 		if (!err) {
+-			tcp_update_skb_after_send(tp, skb);
++			tcp_update_skb_after_send(sk, skb);
+ 			tcp_rate_skb_sent(sk, skb);
+ 		}
+ 	} else {
+* Unmerged path net/sched/sch_fq.c
