@@ -1,0 +1,263 @@
+io_uring: fix sporadic -EFAULT from IORING_OP_RECVMSG
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 0b416c3e1345fd696db4c422643468d844410877
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0b416c3e.failed
+
+If we have to punt the recvmsg to async context, we copy all the
+context.  But since the iovec used can be either on-stack (if small) or
+dynamically allocated, if it's on-stack, then we need to ensure we reset
+the iov pointer. If we don't, then we're reusing old stack data, and
+that can lead to -EFAULTs if things get overwritten.
+
+Ensure we retain the right pointers for the iov, and free it as well if
+we end up having to go beyond UIO_FASTIOV number of vectors.
+
+Fixes: 03b1230ca12a ("io_uring: ensure async punted sendmsg/recvmsg requests copy data")
+	Reported-by: 李通洲 <carter.li@eoitek.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 0b416c3e1345fd696db4c422643468d844410877)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7e2b8c92aeeb,0e01cdc8a120..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1577,12 -2021,112 +1577,102 @@@ static int io_sync_file_range(struct io
+  	return 0;
+  }
+  
+ -static int io_sendmsg_prep(struct io_kiocb *req, struct io_async_ctx *io)
+ -{
+  #if defined(CONFIG_NET)
+ -	const struct io_uring_sqe *sqe = req->sqe;
+ -	struct user_msghdr __user *msg;
+ -	unsigned flags;
+ -
+ -	flags = READ_ONCE(sqe->msg_flags);
+ -	msg = (struct user_msghdr __user *)(unsigned long) READ_ONCE(sqe->addr);
+ -	io->msg.iov = io->msg.fast_iov;
+ -	return sendmsg_copy_msghdr(&io->msg.msg, msg, flags, &io->msg.iov);
+ -#else
+ -	return 0;
+ -#endif
+ -}
+ -
+ -static int io_sendmsg(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ -		      struct io_kiocb **nxt, bool force_nonblock)
+ +static int io_send_recvmsg(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ +			   bool force_nonblock,
+ +		   long (*fn)(struct socket *, struct user_msghdr __user *,
+ +				unsigned int))
+  {
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_NET)
++ 	struct io_async_msghdr *kmsg = NULL;
++ 	struct socket *sock;
++ 	int ret;
++ 
++ 	if (unlikely(req->ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 
++ 	sock = sock_from_file(req->file, &ret);
++ 	if (sock) {
++ 		struct io_async_ctx io, *copy;
++ 		struct sockaddr_storage addr;
++ 		unsigned flags;
++ 
++ 		flags = READ_ONCE(sqe->msg_flags);
++ 		if (flags & MSG_DONTWAIT)
++ 			req->flags |= REQ_F_NOWAIT;
++ 		else if (force_nonblock)
++ 			flags |= MSG_DONTWAIT;
++ 
++ 		if (req->io) {
++ 			kmsg = &req->io->msg;
++ 			kmsg->msg.msg_name = &addr;
++ 			/* if iov is set, it's allocated already */
++ 			if (!kmsg->iov)
++ 				kmsg->iov = kmsg->fast_iov;
++ 			kmsg->msg.msg_iter.iov = kmsg->iov;
++ 		} else {
++ 			kmsg = &io.msg;
++ 			kmsg->msg.msg_name = &addr;
++ 			ret = io_sendmsg_prep(req, &io);
++ 			if (ret)
++ 				goto out;
++ 		}
++ 
++ 		ret = __sys_sendmsg_sock(sock, &kmsg->msg, flags);
++ 		if (force_nonblock && ret == -EAGAIN) {
++ 			copy = kmalloc(sizeof(*copy), GFP_KERNEL);
++ 			if (!copy) {
++ 				ret = -ENOMEM;
++ 				goto out;
++ 			}
++ 			memcpy(&copy->msg, &io.msg, sizeof(copy->msg));
++ 			req->io = copy;
++ 			memcpy(&req->io->sqe, req->sqe, sizeof(*req->sqe));
++ 			req->sqe = &req->io->sqe;
++ 			return -EAGAIN;
++ 		}
++ 		if (ret == -ERESTARTSYS)
++ 			ret = -EINTR;
++ 	}
++ 
++ out:
++ 	if (kmsg && kmsg->iov != kmsg->fast_iov)
++ 		kfree(kmsg->iov);
++ 	io_cqring_add_event(req, ret);
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_put_req_find_next(req, nxt);
++ 	return 0;
++ #else
++ 	return -EOPNOTSUPP;
++ #endif
++ }
++ 
++ static int io_recvmsg_prep(struct io_kiocb *req, struct io_async_ctx *io)
++ {
++ #if defined(CONFIG_NET)
++ 	const struct io_uring_sqe *sqe = req->sqe;
++ 	struct user_msghdr __user *msg;
++ 	unsigned flags;
++ 
++ 	flags = READ_ONCE(sqe->msg_flags);
++ 	msg = (struct user_msghdr __user *)(unsigned long) READ_ONCE(sqe->addr);
++ 	io->msg.iov = io->msg.fast_iov;
++ 	return recvmsg_copy_msghdr(&io->msg.msg, msg, flags, &io->msg.uaddr,
++ 					&io->msg.iov);
++ #else
++ 	return 0;
++ #endif
++ }
++ 
++ static int io_recvmsg(struct io_kiocb *req, const struct io_uring_sqe *sqe,
++ 		      struct io_kiocb **nxt, bool force_nonblock)
++ {
++ #if defined(CONFIG_NET)
++ 	struct io_async_msghdr *kmsg = NULL;
+++>>>>>>> 0b416c3e1345 (io_uring: fix sporadic -EFAULT from IORING_OP_RECVMSG)
+  	struct socket *sock;
+  	int ret;
+  
+@@@ -1592,6 -2136,8 +1682,11 @@@
+  	sock = sock_from_file(req->file, &ret);
+  	if (sock) {
+  		struct user_msghdr __user *msg;
+++<<<<<<< HEAD
+++=======
++ 		struct io_async_ctx io, *copy;
++ 		struct sockaddr_storage addr;
+++>>>>>>> 0b416c3e1345 (io_uring: fix sporadic -EFAULT from IORING_OP_RECVMSG)
+  		unsigned flags;
+  
+  		flags = READ_ONCE(sqe->msg_flags);
+@@@ -1602,25 -2148,82 +1697,66 @@@
+  
+  		msg = (struct user_msghdr __user *) (unsigned long)
+  			READ_ONCE(sqe->addr);
+++<<<<<<< HEAD
+ +
+ +		ret = fn(sock, msg, flags);
+ +		if (force_nonblock && ret == -EAGAIN)
+ +			return ret;
+++=======
++ 		if (req->io) {
++ 			kmsg = &req->io->msg;
++ 			kmsg->msg.msg_name = &addr;
++ 			/* if iov is set, it's allocated already */
++ 			if (!kmsg->iov)
++ 				kmsg->iov = kmsg->fast_iov;
++ 			kmsg->msg.msg_iter.iov = kmsg->iov;
++ 		} else {
++ 			kmsg = &io.msg;
++ 			kmsg->msg.msg_name = &addr;
++ 			ret = io_recvmsg_prep(req, &io);
++ 			if (ret)
++ 				goto out;
++ 		}
++ 
++ 		ret = __sys_recvmsg_sock(sock, &kmsg->msg, msg, kmsg->uaddr, flags);
++ 		if (force_nonblock && ret == -EAGAIN) {
++ 			copy = kmalloc(sizeof(*copy), GFP_KERNEL);
++ 			if (!copy) {
++ 				ret = -ENOMEM;
++ 				goto out;
++ 			}
++ 			memcpy(copy, &io, sizeof(*copy));
++ 			req->io = copy;
++ 			memcpy(&req->io->sqe, req->sqe, sizeof(*req->sqe));
++ 			req->sqe = &req->io->sqe;
++ 			return -EAGAIN;
++ 		}
+++>>>>>>> 0b416c3e1345 (io_uring: fix sporadic -EFAULT from IORING_OP_RECVMSG)
+  		if (ret == -ERESTARTSYS)
+  			ret = -EINTR;
+  	}
+  
+++<<<<<<< HEAD
+ +	io_cqring_add_event(req->ctx, sqe->user_data, ret);
+ +	io_put_req(req);
+++=======
++ out:
++ 	if (kmsg && kmsg->iov != kmsg->fast_iov)
++ 		kfree(kmsg->iov);
++ 	io_cqring_add_event(req, ret);
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_put_req_find_next(req, nxt);
+++>>>>>>> 0b416c3e1345 (io_uring: fix sporadic -EFAULT from IORING_OP_RECVMSG)
+  	return 0;
+ -#else
+ -	return -EOPNOTSUPP;
+ -#endif
+  }
+ +#endif
+  
+ -static int io_accept(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ -		     struct io_kiocb **nxt, bool force_nonblock)
+ +static int io_sendmsg(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ +		      bool force_nonblock)
+  {
+  #if defined(CONFIG_NET)
+ -	struct sockaddr __user *addr;
+ -	int __user *addr_len;
+ -	unsigned file_flags;
+ -	int flags, ret;
+ -
+ -	if (unlikely(req->ctx->flags & (IORING_SETUP_IOPOLL|IORING_SETUP_SQPOLL)))
+ -		return -EINVAL;
+ -	if (sqe->ioprio || sqe->len || sqe->buf_index)
+ -		return -EINVAL;
+ -
+ -	addr = (struct sockaddr __user *) (unsigned long) READ_ONCE(sqe->addr);
+ -	addr_len = (int __user *) (unsigned long) READ_ONCE(sqe->addr2);
+ -	flags = READ_ONCE(sqe->accept_flags);
+ -	file_flags = force_nonblock ? O_NONBLOCK : 0;
+ -
+ -	ret = __sys_accept4_file(req->file, file_flags, addr, addr_len, flags);
+ -	if (ret == -EAGAIN && force_nonblock) {
+ -		req->work.flags |= IO_WQ_WORK_NEEDS_FILES;
+ -		return -EAGAIN;
+ -	}
+ -	if (ret == -ERESTARTSYS)
+ -		ret = -EINTR;
+ -	if (ret < 0)
+ -		req_set_fail_links(req);
+ -	io_cqring_add_event(req, ret);
+ -	io_put_req_find_next(req, nxt);
+ -	return 0;
+ +	return io_send_recvmsg(req, sqe, force_nonblock, __sys_sendmsg_sock);
+  #else
+  	return -EOPNOTSUPP;
+  #endif
+* Unmerged path fs/io_uring.c
