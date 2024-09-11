@@ -1,0 +1,139 @@
+net: sched: ensure tc flower reoffload takes filter ref
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: ensure tc flower reoffload takes filter ref (Ivan Vecera) [1751856]
+Rebuild_FUZZ: 95.24%
+commit-author John Hurley <john.hurley@netronome.com>
+commit 95e27a4da6143ad8a0c908215a0f402031b9ebf3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/95e27a4d.failed
+
+Recent changes to TC flower remove the requirement for rtnl lock when
+accessing and modifying filters. Refcounts now ensure access and deletion
+do not happen concurrently. However, the reoffload function which cycles
+through all filters and replays them to registered hw drivers is not
+protected.
+
+Use the fl_get_next_filter() function to cycle the filters for reoffload
+and ensure the ref taken by this function is put when done with each
+filter.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Vlad Buslov <vladbu@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 95e27a4da6143ad8a0c908215a0f402031b9ebf3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_flower.c
+index bf30bf04d4ea,6050e3caee31..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -1551,50 -1689,57 +1550,98 @@@ static int fl_reoffload(struct tcf_prot
+  	struct cls_fl_filter *f;
+  	int err;
+  
+- 	list_for_each_entry(mask, &head->masks, list) {
+- 		list_for_each_entry(f, &mask->filters, list) {
+- 			if (tc_skip_hw(f->flags))
+- 				continue;
++ 	while ((f = fl_get_next_filter(tp, &handle))) {
++ 		if (tc_skip_hw(f->flags))
++ 			goto next_flow;
+  
+++<<<<<<< HEAD
+ +			cls_flower.rule =
+ +				flow_rule_alloc(tcf_exts_num_actions(&f->exts));
+ +			if (!cls_flower.rule)
+ +				return -ENOMEM;
+ +
+ +			tc_cls_common_offload_init(&cls_flower.common, tp,
+ +						   f->flags, extack);
+ +			cls_flower.command = add ?
+ +				TC_CLSFLOWER_REPLACE : TC_CLSFLOWER_DESTROY;
+ +			cls_flower.cookie = (unsigned long)f;
+ +			cls_flower.rule->match.dissector = &mask->dissector;
+ +			cls_flower.rule->match.mask = &mask->key;
+ +			cls_flower.rule->match.key = &f->mkey;
+ +
+ +			err = tc_setup_flow_action(&cls_flower.rule->action,
+ +						   &f->exts);
+ +			if (err) {
+ +				kfree(cls_flower.rule);
+ +				if (tc_skip_sw(f->flags)) {
+ +					NL_SET_ERR_MSG_MOD(extack, "Failed to setup flow action");
+ +					return err;
+ +				}
+ +				continue;
+ +			}
+ +
+ +			cls_flower.classid = f->res.classid;
+ +
+ +			err = cb(TC_SETUP_CLSFLOWER, &cls_flower, cb_priv);
+ +			kfree(cls_flower.rule);
+ +
+ +			if (err) {
+ +				if (add && tc_skip_sw(f->flags))
+ +					return err;
+ +				continue;
+ +			}
+ +
+ +			tc_cls_offload_cnt_update(block, &f->in_hw_count,
+ +						  &f->flags, add);
+++=======
++ 		cls_flower.rule =
++ 			flow_rule_alloc(tcf_exts_num_actions(&f->exts));
++ 		if (!cls_flower.rule) {
++ 			__fl_put(f);
++ 			return -ENOMEM;
+++>>>>>>> 95e27a4da614 (net: sched: ensure tc flower reoffload takes filter ref)
++ 		}
++ 
++ 		tc_cls_common_offload_init(&cls_flower.common, tp, f->flags,
++ 					   extack);
++ 		cls_flower.command = add ?
++ 			TC_CLSFLOWER_REPLACE : TC_CLSFLOWER_DESTROY;
++ 		cls_flower.cookie = (unsigned long)f;
++ 		cls_flower.rule->match.dissector = &f->mask->dissector;
++ 		cls_flower.rule->match.mask = &f->mask->key;
++ 		cls_flower.rule->match.key = &f->mkey;
++ 
++ 		err = tc_setup_flow_action(&cls_flower.rule->action, &f->exts);
++ 		if (err) {
++ 			kfree(cls_flower.rule);
++ 			if (tc_skip_sw(f->flags)) {
++ 				NL_SET_ERR_MSG_MOD(extack, "Failed to setup flow action");
++ 				__fl_put(f);
++ 				return err;
++ 			}
++ 			goto next_flow;
+  		}
++ 
++ 		cls_flower.classid = f->res.classid;
++ 
++ 		err = cb(TC_SETUP_CLSFLOWER, &cls_flower, cb_priv);
++ 		kfree(cls_flower.rule);
++ 
++ 		if (err) {
++ 			if (add && tc_skip_sw(f->flags)) {
++ 				__fl_put(f);
++ 				return err;
++ 			}
++ 			goto next_flow;
++ 		}
++ 
++ 		spin_lock(&tp->lock);
++ 		tc_cls_offload_cnt_update(block, &f->in_hw_count, &f->flags,
++ 					  add);
++ 		spin_unlock(&tp->lock);
++ next_flow:
++ 		handle++;
++ 		__fl_put(f);
+  	}
+  
+  	return 0;
+* Unmerged path net/sched/cls_flower.c
