@@ -1,0 +1,393 @@
+RDMA/restrack: Prepare restrack_root to addition of extra fields per-type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit 7c77c6a9bf9d71711dd3f89858bb0f5157a11919
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7c77c6a9.failed
+
+As a preparation to extension of rdma_restrack_root to provide software
+IDs, which will be per-type too. We convert the rdma_restrack_root from
+struct with arrays to array of structs.
+
+Such conversion allows us to drop rwsem lock in favour of internal XArray
+lock.
+
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 7c77c6a9bf9d71711dd3f89858bb0f5157a11919)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/nldev.c
+#	drivers/infiniband/core/restrack.c
+#	drivers/infiniband/core/restrack.h
+diff --cc drivers/infiniband/core/nldev.c
+index efccd8e0fb77,9b4f891771c4..000000000000
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@@ -956,8 -1018,10 +956,9 @@@ static int res_get_common_dumpit(struc
+  	const struct nldev_fill_res_entry *fe = &fill_entries[res_type];
+  	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
+  	struct rdma_restrack_entry *res;
++ 	struct rdma_restrack_root *rt;
+  	int err, ret = 0, idx = 0;
+  	struct nlattr *table_attr;
+ -	struct nlattr *entry_attr;
+  	struct ib_device *device;
+  	int start = cb->args[0];
+  	bool has_cap_net_admin;
+@@@ -1011,8 -1076,14 +1012,19 @@@
+  
+  	has_cap_net_admin = netlink_capable(cb->skb, CAP_NET_ADMIN);
+  
+++<<<<<<< HEAD
+ +	down_read(&device->res.rwsem);
+ +	hash_for_each_possible(device->res.hash, res, node, res_type) {
+++=======
++ 	rt = &device->res[res_type];
++ 	xa_lock(&rt->xa);
++ 	/*
++ 	 * FIXME: if the skip ahead is something common this loop should
++ 	 * use xas_for_each & xas_pause to optimize, we can have a lot of
++ 	 * objects.
++ 	 */
++ 	xa_for_each(&rt->xa, id, res) {
+++>>>>>>> 7c77c6a9bf9d (RDMA/restrack: Prepare restrack_root to addition of extra fields per-type)
+  		if (idx < start)
+  			goto next;
+  
+@@@ -1020,37 -1091,37 +1032,61 @@@
+  			goto next;
+  
+  		if (!rdma_restrack_get(res))
+- 			/*
+- 			 * Resource is under release now, but we are not
+- 			 * relesing lock now, so it will be released in
+- 			 * our next pass, once we will get ->next pointer.
+- 			 */
+  			goto next;
+  
++ 		xa_unlock(&rt->xa);
++ 
+  		filled = true;
+  
+++<<<<<<< HEAD
+ +		up_read(&device->res.rwsem);
+ +		ret = fe->fill_res_func(skb, has_cap_net_admin, res, port);
+ +		down_read(&device->res.rwsem);
+ +		/*
+ +		 * Return resource back, but it won't be released till
+ +		 * the &device->res.rwsem will be released for write.
+ +		 */
+ +		rdma_restrack_put(res);
+ +
+ +		if (ret == -EMSGSIZE)
+ +			/*
+ +			 * There is a chance to optimize here.
+ +			 * It can be done by using list_prepare_entry
+ +			 * and list_for_each_entry_continue afterwards.
+ +			 */
+ +			break;
+ +		if (ret)
+ +			goto res_err;
+ +next:		idx++;
+ +	}
+ +	up_read(&device->res.rwsem);
+++=======
++ 		entry_attr = nla_nest_start(skb, fe->entry);
++ 		if (!entry_attr) {
++ 			ret = -EMSGSIZE;
++ 			rdma_restrack_put(res);
++ 			goto msg_full;
++ 		}
++ 
++ 		ret = fe->fill_res_func(skb, has_cap_net_admin, res, port);
++ 		rdma_restrack_put(res);
++ 
++ 		if (ret) {
++ 			nla_nest_cancel(skb, entry_attr);
++ 			if (ret == -EMSGSIZE)
++ 				goto msg_full;
++ 			if (ret == -EAGAIN)
++ 				goto again;
++ 			goto res_err;
++ 		}
++ 		nla_nest_end(skb, entry_attr);
++ again:		xa_lock(&rt->xa);
++ next:		idx++;
++ 	}
++ 	xa_unlock(&rt->xa);
+++>>>>>>> 7c77c6a9bf9d (RDMA/restrack: Prepare restrack_root to addition of extra fields per-type)
+  
++ msg_full:
+  	nla_nest_end(skb, table_attr);
+  	nlmsg_end(skb, nlh);
+  	cb->args[0] = idx;
+@@@ -1067,7 -1138,6 +1103,10 @@@
+  
+  res_err:
+  	nla_nest_cancel(skb, table_attr);
+++<<<<<<< HEAD
+ +	up_read(&device->res.rwsem);
+++=======
+++>>>>>>> 7c77c6a9bf9d (RDMA/restrack: Prepare restrack_root to addition of extra fields per-type)
+  
+  err:
+  	nlmsg_cancel(skb, nlh);
+diff --cc drivers/infiniband/core/restrack.c
+index bfd36820ee66,a5ea3988b4c3..000000000000
+--- a/drivers/infiniband/core/restrack.c
++++ b/drivers/infiniband/core/restrack.c
+@@@ -19,15 -36,26 +19,28 @@@ static int fill_res_noop(struct sk_buf
+  }
+  
+  /**
+ - * rdma_restrack_init() - initialize and allocate resource tracking
+ + * rdma_restrack_init() - initialize resource tracking
+   * @dev:  IB device
+ - *
+ - * Return: 0 on success
+   */
+ -int rdma_restrack_init(struct ib_device *dev)
+ +void rdma_restrack_init(struct ib_device *dev)
+  {
+ -	struct rdma_restrack_root *rt;
+ -	int i;
+ +	struct rdma_restrack_root *res = &dev->res;
+  
+++<<<<<<< HEAD
+ +	init_rwsem(&res->rwsem);
+ +	res->fill_res_entry = fill_res_noop;
+++=======
++ 	dev->res = kcalloc(RDMA_RESTRACK_MAX, sizeof(*rt), GFP_KERNEL);
++ 	if (!dev->res)
++ 		return -ENOMEM;
++ 
++ 	rt = dev->res;
++ 
++ 	for (i = 0; i < RDMA_RESTRACK_MAX; i++)
++ 		xa_init_flags(&rt[i].xa, XA_FLAGS_ALLOC);
++ 
++ 	return 0;
+++>>>>>>> 7c77c6a9bf9d (RDMA/restrack: Prepare restrack_root to addition of extra fields per-type)
+  }
+  
+  static const char *type2str(enum rdma_restrack_type type)
+@@@ -50,36 -78,49 +63,41 @@@
+   */
+  void rdma_restrack_clean(struct ib_device *dev)
+  {
+ -	struct rdma_restrack_root *rt = dev->res;
+ +	struct rdma_restrack_root *res = &dev->res;
+  	struct rdma_restrack_entry *e;
+  	char buf[TASK_COMM_LEN];
+ -	bool found = false;
+  	const char *owner;
+ -	int i;
+ +	int bkt;
+  
+++<<<<<<< HEAD
+ +	if (hash_empty(res->hash))
+ +		return;
+++=======
++ 	for (i = 0 ; i < RDMA_RESTRACK_MAX; i++) {
++ 		struct xarray *xa = &dev->res[i].xa;
+ -
+ -		if (!xa_empty(xa)) {
+ -			unsigned long index;
+ -
+ -			if (!found) {
+ -				pr_err("restrack: %s", CUT_HERE);
+ -				dev_err(&dev->dev, "BUG: RESTRACK detected leak of resources\n");
+ -			}
+ -			xa_for_each(xa, index, e) {
+ -				if (rdma_is_kernel_res(e)) {
+ -					owner = e->kern_name;
+ -				} else {
+ -					/*
+ -					 * There is no need to call get_task_struct here,
+ -					 * because we can be here only if there are more
+ -					 * get_task_struct() call than put_task_struct().
+ -					 */
+ -					get_task_comm(buf, e->task);
+ -					owner = buf;
+ -				}
+ -
+ -				pr_err("restrack: %s %s object allocated by %s is not freed\n",
+ -				       rdma_is_kernel_res(e) ? "Kernel" :
+ -							       "User",
+ -				       type2str(e->type), owner);
+ -			}
+ -			found = true;
+++>>>>>>> 7c77c6a9bf9d (RDMA/restrack: Prepare restrack_root to addition of extra fields per-type)
+ +
+ +	dev = container_of(res, struct ib_device, res);
+ +	pr_err("restrack: %s", CUT_HERE);
+ +	dev_err(&dev->dev, "BUG: RESTRACK detected leak of resources\n");
+ +	hash_for_each(res->hash, bkt, e, node) {
+ +		if (rdma_is_kernel_res(e)) {
+ +			owner = e->kern_name;
+ +		} else {
+ +			/*
+ +			 * There is no need to call get_task_struct here,
+ +			 * because we can be here only if there are more
+ +			 * get_task_struct() call than put_task_struct().
+ +			 */
+ +			get_task_comm(buf, e->task);
+ +			owner = buf;
+  		}
+ -		xa_destroy(xa);
+ -	}
+ -	if (found)
+ -		pr_err("restrack: %s", CUT_HERE);
+  
+ -	kfree(rt);
+ +		pr_err("restrack: %s %s object allocated by %s is not freed\n",
+ +		       rdma_is_kernel_res(e) ? "Kernel" : "User",
+ +		       type2str(e->type), owner);
+ +	}
+ +	pr_err("restrack: %s", CUT_HERE);
+  }
+  
+  /**
+@@@ -91,18 -132,19 +109,32 @@@
+  int rdma_restrack_count(struct ib_device *dev, enum rdma_restrack_type type,
+  			struct pid_namespace *ns)
+  {
+++<<<<<<< HEAD
+ +	struct rdma_restrack_root *res = &dev->res;
+ +	struct rdma_restrack_entry *e;
+ +	u32 cnt = 0;
+ +
+ +	down_read(&res->rwsem);
+ +	hash_for_each_possible(res->hash, e, node, type) {
+++=======
++ 	struct rdma_restrack_root *rt = &dev->res[type];
++ 	struct rdma_restrack_entry *e;
++ 	XA_STATE(xas, &rt->xa, 0);
++ 	u32 cnt = 0;
++ 
++ 	xa_lock(&rt->xa);
++ 	xas_for_each(&xas, e, U32_MAX) {
+++>>>>>>> 7c77c6a9bf9d (RDMA/restrack: Prepare restrack_root to addition of extra fields per-type)
+  		if (ns == &init_pid_ns ||
+  		    (!rdma_is_kernel_res(e) &&
+  		     ns == task_active_pid_ns(e->task)))
+  			cnt++;
+  	}
+++<<<<<<< HEAD
+ +	up_read(&res->rwsem);
+++=======
++ 	xa_unlock(&rt->xa);
+++>>>>>>> 7c77c6a9bf9d (RDMA/restrack: Prepare restrack_root to addition of extra fields per-type)
+  	return cnt;
+  }
+  EXPORT_SYMBOL(rdma_restrack_count);
+@@@ -173,17 -215,19 +205,32 @@@ EXPORT_SYMBOL(rdma_restrack_set_task)
+  static void rdma_restrack_add(struct rdma_restrack_entry *res)
+  {
+  	struct ib_device *dev = res_to_dev(res);
+++<<<<<<< HEAD
+++=======
++ 	struct rdma_restrack_root *rt;
++ 	int ret;
+++>>>>>>> 7c77c6a9bf9d (RDMA/restrack: Prepare restrack_root to addition of extra fields per-type)
+  
+  	if (!dev)
+  		return;
+  
+++<<<<<<< HEAD
+ +	kref_init(&res->kref);
+ +	init_completion(&res->comp);
+ +	res->valid = true;
+ +
+ +	down_write(&dev->res.rwsem);
+ +	hash_add(dev->res.hash, &res->node, res->type);
+ +	up_write(&dev->res.rwsem);
+++=======
++ 	rt = &dev->res[res->type];
++ 
++ 	kref_init(&res->kref);
++ 	init_completion(&res->comp);
++ 	ret = rt_xa_alloc_cyclic(&rt->xa, &res->id, res, &rt->next_id);
++ 	if (!ret)
++ 		res->valid = true;
+++>>>>>>> 7c77c6a9bf9d (RDMA/restrack: Prepare restrack_root to addition of extra fields per-type)
+  }
+  
+  /**
+@@@ -235,14 -279,14 +282,25 @@@ struct rdma_restrack_entry 
+  rdma_restrack_get_byid(struct ib_device *dev,
+  		       enum rdma_restrack_type type, u32 id)
+  {
+++<<<<<<< HEAD
+ +	struct rdma_restrack_root *rt = &dev->res;
+ +	struct rdma_restrack_entry *res;
+ +
+ +	down_read(&dev->res.rwsem);
+ +	res = xa_load(&rt->xa[type], id);
+ +	if (!res || !rdma_restrack_get(res))
+ +		res = ERR_PTR(-ENOENT);
+ +	up_read(&dev->res.rwsem);
+++=======
++ 	struct rdma_restrack_root *rt = &dev->res[type];
++ 	struct rdma_restrack_entry *res;
++ 
++ 	xa_lock(&rt->xa);
++ 	res = xa_load(&rt->xa, id);
++ 	if (!res || !rdma_restrack_get(res))
++ 		res = ERR_PTR(-ENOENT);
++ 	xa_unlock(&rt->xa);
+++>>>>>>> 7c77c6a9bf9d (RDMA/restrack: Prepare restrack_root to addition of extra fields per-type)
+  
+  	return res;
+  }
+@@@ -264,24 -308,26 +322,41 @@@ EXPORT_SYMBOL(rdma_restrack_put)
+  
+  void rdma_restrack_del(struct rdma_restrack_entry *res)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct rdma_restrack_entry *old;
++ 	struct rdma_restrack_root *rt;
+++>>>>>>> 7c77c6a9bf9d (RDMA/restrack: Prepare restrack_root to addition of extra fields per-type)
+  	struct ib_device *dev;
+  
+  	if (!res->valid)
+  		goto out;
+  
+  	dev = res_to_dev(res);
+++<<<<<<< HEAD
+ +	if (!dev)
+ +		return;
+ +
+++=======
++ 	if (WARN_ON(!dev))
++ 		return;
++ 
++ 	rt = &dev->res[res->type];
++ 
++ 	old = xa_erase(&rt->xa, res->id);
++ 	WARN_ON(old != res);
++ 	res->valid = false;
++ 
+++>>>>>>> 7c77c6a9bf9d (RDMA/restrack: Prepare restrack_root to addition of extra fields per-type)
+  	rdma_restrack_put(res);
+ +
+  	wait_for_completion(&res->comp);
+  
+ +	down_write(&dev->res.rwsem);
+ +	hash_del(&res->node);
+ +	res->valid = false;
+ +	up_write(&dev->res.rwsem);
+ +
+  out:
+  	if (res->task) {
+  		put_task_struct(res->task);
+* Unmerged path drivers/infiniband/core/restrack.h
+* Unmerged path drivers/infiniband/core/nldev.c
+* Unmerged path drivers/infiniband/core/restrack.c
+* Unmerged path drivers/infiniband/core/restrack.h
