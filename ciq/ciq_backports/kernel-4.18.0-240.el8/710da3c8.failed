@@ -1,0 +1,124 @@
+sched/core: Prevent race condition between cpuset and __sched_setscheduler()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Juri Lelli <juri.lelli@redhat.com>
+commit 710da3c8ea7dfbd327920afd3831d8c82c42789d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/710da3c8.failed
+
+No synchronisation mechanism exists between the cpuset subsystem and
+calls to function __sched_setscheduler(). As such, it is possible that
+new root domains are created on the cpuset side while a deadline
+acceptance test is carried out in __sched_setscheduler(), leading to a
+potential oversell of CPU bandwidth.
+
+Grab cpuset_rwsem read lock from core scheduler, so to prevent
+situations such as the one described above from happening.
+
+The only exception is normalize_rt_tasks() which needs to work under
+tasklist_lock and can't therefore grab cpuset_rwsem. We are fine with
+this, as this function is only called by sysrq and, if that gets
+triggered, DEADLINE guarantees are already gone out of the window
+anyway.
+
+	Tested-by: Dietmar Eggemann <dietmar.eggemann@arm.com>
+	Signed-off-by: Juri Lelli <juri.lelli@redhat.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: bristot@redhat.com
+	Cc: claudio@evidence.eu.com
+	Cc: lizefan@huawei.com
+	Cc: longman@redhat.com
+	Cc: luca.abeni@santannapisa.it
+	Cc: mathieu.poirier@linaro.org
+	Cc: rostedt@goodmis.org
+	Cc: tj@kernel.org
+	Cc: tommaso.cucinotta@santannapisa.it
+Link: https://lkml.kernel.org/r/20190719140000.31694-9-juri.lelli@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 710da3c8ea7dfbd327920afd3831d8c82c42789d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cgroup/cpuset.c
+#	kernel/sched/core.c
+diff --cc kernel/cgroup/cpuset.c
+index 6f44b6b04fcb,c52bc91f882b..000000000000
+--- a/kernel/cgroup/cpuset.c
++++ b/kernel/cgroup/cpuset.c
+@@@ -331,7 -333,18 +331,22 @@@ static struct cpuset top_cpuset = 
+   * guidelines for accessing subsystem state in kernel/cgroup.c
+   */
+  
+++<<<<<<< HEAD
+ +static DEFINE_MUTEX(cpuset_mutex);
+++=======
++ DEFINE_STATIC_PERCPU_RWSEM(cpuset_rwsem);
++ 
++ void cpuset_read_lock(void)
++ {
++ 	percpu_down_read(&cpuset_rwsem);
++ }
++ 
++ void cpuset_read_unlock(void)
++ {
++ 	percpu_up_read(&cpuset_rwsem);
++ }
++ 
+++>>>>>>> 710da3c8ea7d (sched/core: Prevent race condition between cpuset and __sched_setscheduler())
+  static DEFINE_SPINLOCK(callback_lock);
+  
+  static struct workqueue_struct *cpuset_migrate_mm_wq;
+diff --cc kernel/sched/core.c
+index 7af3161009c2,1bceb22dac18..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -4237,6 -4691,16 +4237,19 @@@ recheck
+  			return retval;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Update task specific "requested" clamps */
++ 	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP) {
++ 		retval = uclamp_validate(p, attr);
++ 		if (retval)
++ 			return retval;
++ 	}
++ 
++ 	if (pi)
++ 		cpuset_read_lock();
++ 
+++>>>>>>> 710da3c8ea7d (sched/core: Prevent race condition between cpuset and __sched_setscheduler())
+  	/*
+  	 * Make sure no PI-waiters arrive (or leave) while we are
+  	 * changing the priority of the task:
+diff --git a/include/linux/cpuset.h b/include/linux/cpuset.h
+index 934633a05d20..f7b686876ad6 100644
+--- a/include/linux/cpuset.h
++++ b/include/linux/cpuset.h
+@@ -55,6 +55,8 @@ extern void cpuset_init_smp(void);
+ extern void cpuset_force_rebuild(void);
+ extern void cpuset_update_active_cpus(void);
+ extern void cpuset_wait_for_hotplug(void);
++extern void cpuset_read_lock(void);
++extern void cpuset_read_unlock(void);
+ extern void cpuset_cpus_allowed(struct task_struct *p, struct cpumask *mask);
+ extern void cpuset_cpus_allowed_fallback(struct task_struct *p);
+ extern nodemask_t cpuset_mems_allowed(struct task_struct *p);
+@@ -176,6 +178,9 @@ static inline void cpuset_update_active_cpus(void)
+ 
+ static inline void cpuset_wait_for_hotplug(void) { }
+ 
++static inline void cpuset_read_lock(void) { }
++static inline void cpuset_read_unlock(void) { }
++
+ static inline void cpuset_cpus_allowed(struct task_struct *p,
+ 				       struct cpumask *mask)
+ {
+* Unmerged path kernel/cgroup/cpuset.c
+* Unmerged path kernel/sched/core.c
