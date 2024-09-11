@@ -1,0 +1,427 @@
+drm/i915: Mark concurrent submissions with a weak-dependency
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Chris Wilson <chris@chris-wilson.co.uk>
+commit 6b6cd2ebd8d071e55998e32b648bb8081f7f02bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6b6cd2eb.failed
+
+We recorded the dependencies for WAIT_FOR_SUBMIT in order that we could
+correctly perform priority inheritance from the parallel branches to the
+common trunk. However, for the purpose of timeslicing and reset
+handling, the dependency is weak -- as we the pair of requests are
+allowed to run in parallel and not in strict succession.
+
+The real significance though is that this allows us to rearrange
+groups of WAIT_FOR_SUBMIT linked requests along the single engine, and
+so can resolve user level inter-batch scheduling dependencies from user
+semaphores.
+
+Fixes: c81471f5e95c ("drm/i915: Copy across scheduler behaviour flags across submit fences")
+Testcase: igt/gem_exec_fence/submit
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+	Cc: <stable@vger.kernel.org> # v5.6+
+	Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200507155109.8892-1-chris@chris-wilson.co.uk
+(cherry picked from commit 6b6cd2ebd8d071e55998e32b648bb8081f7f02bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gt/intel_lrc.c
+#	drivers/gpu/drm/i915/i915_request.c
+diff --cc drivers/gpu/drm/i915/gt/intel_lrc.c
+index f2865f3cc1d5,dd0fd4c4cf32..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_lrc.c
++++ b/drivers/gpu/drm/i915/gt/intel_lrc.c
+@@@ -815,6 -1849,215 +815,218 @@@ static void virtual_xfer_breadcrumbs(st
+  	spin_unlock(&old->breadcrumbs.irq_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define for_each_waiter(p__, rq__) \
++ 	list_for_each_entry_lockless(p__, \
++ 				     &(rq__)->sched.waiters_list, \
++ 				     wait_link)
++ 
++ #define for_each_signaler(p__, rq__) \
++ 	list_for_each_entry_rcu(p__, \
++ 				&(rq__)->sched.signalers_list, \
++ 				signal_link)
++ 
++ static void defer_request(struct i915_request *rq, struct list_head * const pl)
++ {
++ 	LIST_HEAD(list);
++ 
++ 	/*
++ 	 * We want to move the interrupted request to the back of
++ 	 * the round-robin list (i.e. its priority level), but
++ 	 * in doing so, we must then move all requests that were in
++ 	 * flight and were waiting for the interrupted request to
++ 	 * be run after it again.
++ 	 */
++ 	do {
++ 		struct i915_dependency *p;
++ 
++ 		GEM_BUG_ON(i915_request_is_active(rq));
++ 		list_move_tail(&rq->sched.link, pl);
++ 
++ 		for_each_waiter(p, rq) {
++ 			struct i915_request *w =
++ 				container_of(p->waiter, typeof(*w), sched);
++ 
++ 			if (p->flags & I915_DEPENDENCY_WEAK)
++ 				continue;
++ 
++ 			/* Leave semaphores spinning on the other engines */
++ 			if (w->engine != rq->engine)
++ 				continue;
++ 
++ 			/* No waiter should start before its signaler */
++ 			GEM_BUG_ON(i915_request_started(w) &&
++ 				   !i915_request_completed(rq));
++ 
++ 			GEM_BUG_ON(i915_request_is_active(w));
++ 			if (!i915_request_is_ready(w))
++ 				continue;
++ 
++ 			if (rq_prio(w) < rq_prio(rq))
++ 				continue;
++ 
++ 			GEM_BUG_ON(rq_prio(w) > rq_prio(rq));
++ 			list_move_tail(&w->sched.link, &list);
++ 		}
++ 
++ 		rq = list_first_entry_or_null(&list, typeof(*rq), sched.link);
++ 	} while (rq);
++ }
++ 
++ static void defer_active(struct intel_engine_cs *engine)
++ {
++ 	struct i915_request *rq;
++ 
++ 	rq = __unwind_incomplete_requests(engine);
++ 	if (!rq)
++ 		return;
++ 
++ 	defer_request(rq, i915_sched_lookup_priolist(engine, rq_prio(rq)));
++ }
++ 
++ static bool
++ need_timeslice(const struct intel_engine_cs *engine,
++ 	       const struct i915_request *rq)
++ {
++ 	int hint;
++ 
++ 	if (!intel_engine_has_timeslices(engine))
++ 		return false;
++ 
++ 	hint = engine->execlists.queue_priority_hint;
++ 	if (!list_is_last(&rq->sched.link, &engine->active.requests))
++ 		hint = max(hint, rq_prio(list_next_entry(rq, sched.link)));
++ 
++ 	return hint >= effective_prio(rq);
++ }
++ 
++ static bool
++ timeslice_yield(const struct intel_engine_execlists *el,
++ 		const struct i915_request *rq)
++ {
++ 	/*
++ 	 * Once bitten, forever smitten!
++ 	 *
++ 	 * If the active context ever busy-waited on a semaphore,
++ 	 * it will be treated as a hog until the end of its timeslice (i.e.
++ 	 * until it is scheduled out and replaced by a new submission,
++ 	 * possibly even its own lite-restore). The HW only sends an interrupt
++ 	 * on the first miss, and we do know if that semaphore has been
++ 	 * signaled, or even if it is now stuck on another semaphore. Play
++ 	 * safe, yield if it might be stuck -- it will be given a fresh
++ 	 * timeslice in the near future.
++ 	 */
++ 	return rq->context->lrc.ccid == READ_ONCE(el->yield);
++ }
++ 
++ static bool
++ timeslice_expired(const struct intel_engine_execlists *el,
++ 		  const struct i915_request *rq)
++ {
++ 	return timer_expired(&el->timer) || timeslice_yield(el, rq);
++ }
++ 
++ static int
++ switch_prio(struct intel_engine_cs *engine, const struct i915_request *rq)
++ {
++ 	if (list_is_last(&rq->sched.link, &engine->active.requests))
++ 		return INT_MIN;
++ 
++ 	return rq_prio(list_next_entry(rq, sched.link));
++ }
++ 
++ static inline unsigned long
++ timeslice(const struct intel_engine_cs *engine)
++ {
++ 	return READ_ONCE(engine->props.timeslice_duration_ms);
++ }
++ 
++ static unsigned long active_timeslice(const struct intel_engine_cs *engine)
++ {
++ 	const struct intel_engine_execlists *execlists = &engine->execlists;
++ 	const struct i915_request *rq = *execlists->active;
++ 
++ 	if (!rq || i915_request_completed(rq))
++ 		return 0;
++ 
++ 	if (READ_ONCE(execlists->switch_priority_hint) < effective_prio(rq))
++ 		return 0;
++ 
++ 	return timeslice(engine);
++ }
++ 
++ static void set_timeslice(struct intel_engine_cs *engine)
++ {
++ 	unsigned long duration;
++ 
++ 	if (!intel_engine_has_timeslices(engine))
++ 		return;
++ 
++ 	duration = active_timeslice(engine);
++ 	ENGINE_TRACE(engine, "bump timeslicing, interval:%lu", duration);
++ 
++ 	set_timer_ms(&engine->execlists.timer, duration);
++ }
++ 
++ static void start_timeslice(struct intel_engine_cs *engine)
++ {
++ 	struct intel_engine_execlists *execlists = &engine->execlists;
++ 	const int prio = queue_prio(execlists);
++ 	unsigned long duration;
++ 
++ 	if (!intel_engine_has_timeslices(engine))
++ 		return;
++ 
++ 	WRITE_ONCE(execlists->switch_priority_hint, prio);
++ 	if (prio == INT_MIN)
++ 		return;
++ 
++ 	if (timer_pending(&execlists->timer))
++ 		return;
++ 
++ 	duration = timeslice(engine);
++ 	ENGINE_TRACE(engine,
++ 		     "start timeslicing, prio:%d, interval:%lu",
++ 		     prio, duration);
++ 
++ 	set_timer_ms(&execlists->timer, duration);
++ }
++ 
++ static void record_preemption(struct intel_engine_execlists *execlists)
++ {
++ 	(void)I915_SELFTEST_ONLY(execlists->preempt_hang.count++);
++ }
++ 
++ static unsigned long active_preempt_timeout(struct intel_engine_cs *engine,
++ 					    const struct i915_request *rq)
++ {
++ 	if (!rq)
++ 		return 0;
++ 
++ 	/* Force a fast reset for terminated contexts (ignoring sysfs!) */
++ 	if (unlikely(intel_context_is_banned(rq->context)))
++ 		return 1;
++ 
++ 	return READ_ONCE(engine->props.preempt_timeout_ms);
++ }
++ 
++ static void set_preempt_timeout(struct intel_engine_cs *engine,
++ 				const struct i915_request *rq)
++ {
++ 	if (!intel_engine_has_preempt_reset(engine))
++ 		return;
++ 
++ 	set_timer_ms(&engine->execlists.preempt,
++ 		     active_preempt_timeout(engine, rq));
++ }
++ 
++ static inline void clear_ports(struct i915_request **ports, int count)
++ {
++ 	memset_p((void **)ports, NULL, count);
++ }
++ 
+++>>>>>>> 6b6cd2ebd8d0 (drm/i915: Mark concurrent submissions with a weak-dependency)
+  static void execlists_dequeue(struct intel_engine_cs *engine)
+  {
+  	struct intel_engine_execlists * const execlists = &engine->execlists;
+diff --cc drivers/gpu/drm/i915/i915_request.c
+index a195a92d0105,3c38d61c90f8..000000000000
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@@ -856,11 -1034,15 +856,13 @@@ i915_request_await_request(struct i915_
+  	GEM_BUG_ON(to == from);
+  	GEM_BUG_ON(to->timeline == from->timeline);
+  
+ -	if (i915_request_completed(from)) {
+ -		i915_sw_fence_set_error_once(&to->submit, from->fence.error);
+ +	if (i915_request_completed(from))
+  		return 0;
+ -	}
+  
+  	if (to->engine->schedule) {
+- 		ret = i915_sched_node_add_dependency(&to->sched, &from->sched);
++ 		ret = i915_sched_node_add_dependency(&to->sched,
++ 						     &from->sched,
++ 						     I915_DEPENDENCY_EXTERNAL);
+  		if (ret < 0)
+  			return ret;
+  	}
+@@@ -949,6 -1129,92 +951,95 @@@ i915_request_await_dma_fence(struct i91
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool intel_timeline_sync_has_start(struct intel_timeline *tl,
++ 					  struct dma_fence *fence)
++ {
++ 	return __intel_timeline_sync_is_later(tl,
++ 					      fence->context,
++ 					      fence->seqno - 1);
++ }
++ 
++ static int intel_timeline_sync_set_start(struct intel_timeline *tl,
++ 					 const struct dma_fence *fence)
++ {
++ 	return __intel_timeline_sync_set(tl, fence->context, fence->seqno - 1);
++ }
++ 
++ static int
++ __i915_request_await_execution(struct i915_request *to,
++ 			       struct i915_request *from,
++ 			       void (*hook)(struct i915_request *rq,
++ 					    struct dma_fence *signal))
++ {
++ 	int err;
++ 
++ 	GEM_BUG_ON(intel_context_is_barrier(from->context));
++ 
++ 	/* Submit both requests at the same time */
++ 	err = __await_execution(to, from, hook, I915_FENCE_GFP);
++ 	if (err)
++ 		return err;
++ 
++ 	/* Squash repeated depenendices to the same timelines */
++ 	if (intel_timeline_sync_has_start(i915_request_timeline(to),
++ 					  &from->fence))
++ 		return 0;
++ 
++ 	/*
++ 	 * Wait until the start of this request.
++ 	 *
++ 	 * The execution cb fires when we submit the request to HW. But in
++ 	 * many cases this may be long before the request itself is ready to
++ 	 * run (consider that we submit 2 requests for the same context, where
++ 	 * the request of interest is behind an indefinite spinner). So we hook
++ 	 * up to both to reduce our queues and keep the execution lag minimised
++ 	 * in the worst case, though we hope that the await_start is elided.
++ 	 */
++ 	err = i915_request_await_start(to, from);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	/*
++ 	 * Ensure both start together [after all semaphores in signal]
++ 	 *
++ 	 * Now that we are queued to the HW at roughly the same time (thanks
++ 	 * to the execute cb) and are ready to run at roughly the same time
++ 	 * (thanks to the await start), our signaler may still be indefinitely
++ 	 * delayed by waiting on a semaphore from a remote engine. If our
++ 	 * signaler depends on a semaphore, so indirectly do we, and we do not
++ 	 * want to start our payload until our signaler also starts theirs.
++ 	 * So we wait.
++ 	 *
++ 	 * However, there is also a second condition for which we need to wait
++ 	 * for the precise start of the signaler. Consider that the signaler
++ 	 * was submitted in a chain of requests following another context
++ 	 * (with just an ordinary intra-engine fence dependency between the
++ 	 * two). In this case the signaler is queued to HW, but not for
++ 	 * immediate execution, and so we must wait until it reaches the
++ 	 * active slot.
++ 	 */
++ 	if (intel_engine_has_semaphores(to->engine)) {
++ 		err = __emit_semaphore_wait(to, from, from->fence.seqno - 1);
++ 		if (err < 0)
++ 			return err;
++ 	}
++ 
++ 	/* Couple the dependency tree for PI on this exposed to->fence */
++ 	if (to->engine->schedule) {
++ 		err = i915_sched_node_add_dependency(&to->sched,
++ 						     &from->sched,
++ 						     I915_DEPENDENCY_WEAK);
++ 		if (err < 0)
++ 			return err;
++ 	}
++ 
++ 	return intel_timeline_sync_set_start(i915_request_timeline(to),
++ 					     &from->fence);
++ }
++ 
+++>>>>>>> 6b6cd2ebd8d0 (drm/i915: Mark concurrent submissions with a weak-dependency)
+  int
+  i915_request_await_execution(struct i915_request *rq,
+  			     struct dma_fence *fence,
+* Unmerged path drivers/gpu/drm/i915/gt/intel_lrc.c
+* Unmerged path drivers/gpu/drm/i915/i915_request.c
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index 2e9b38bdc33c..783a82efeb71 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -421,7 +421,8 @@ bool __i915_sched_node_add_dependency(struct i915_sched_node *node,
+ }
+ 
+ int i915_sched_node_add_dependency(struct i915_sched_node *node,
+-				   struct i915_sched_node *signal)
++				   struct i915_sched_node *signal,
++				   unsigned long flags)
+ {
+ 	struct i915_dependency *dep;
+ 
+@@ -430,8 +431,7 @@ int i915_sched_node_add_dependency(struct i915_sched_node *node,
+ 		return -ENOMEM;
+ 
+ 	if (!__i915_sched_node_add_dependency(node, signal, dep,
+-					      I915_DEPENDENCY_EXTERNAL |
+-					      I915_DEPENDENCY_ALLOC))
++					      flags | I915_DEPENDENCY_ALLOC))
+ 		i915_dependency_free(dep);
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index 7eefccff39bf..fc7b6baa1355 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -33,7 +33,8 @@ bool __i915_sched_node_add_dependency(struct i915_sched_node *node,
+ 				      unsigned long flags);
+ 
+ int i915_sched_node_add_dependency(struct i915_sched_node *node,
+-				   struct i915_sched_node *signal);
++				   struct i915_sched_node *signal,
++				   unsigned long flags);
+ 
+ void i915_sched_node_fini(struct i915_sched_node *node);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_scheduler_types.h b/drivers/gpu/drm/i915/i915_scheduler_types.h
+index 3e309631bd0b..69f9798ab48a 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler_types.h
++++ b/drivers/gpu/drm/i915/i915_scheduler_types.h
+@@ -68,6 +68,7 @@ struct i915_dependency {
+ 	unsigned long flags;
+ #define I915_DEPENDENCY_ALLOC		BIT(0)
+ #define I915_DEPENDENCY_EXTERNAL	BIT(1)
++#define I915_DEPENDENCY_WEAK		BIT(2)
+ };
+ 
+ #endif /* _I915_SCHEDULER_TYPES_H_ */
