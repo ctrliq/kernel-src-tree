@@ -1,0 +1,170 @@
+seqlock: lockdep assert non-preemptibility on seqcount_t write
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ahmed S. Darwish <a.darwish@linutronix.de>
+commit 859247d39fb008ea812e8f0c398a58a20c12899e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/859247d3.failed
+
+Preemption must be disabled before entering a sequence count write side
+critical section.  Failing to do so, the seqcount read side can preempt
+the write side section and spin for the entire scheduler tick.  If that
+reader belongs to a real-time scheduling class, it can spin forever and
+the kernel will livelock.
+
+Assert through lockdep that preemption is disabled for seqcount writers.
+
+	Signed-off-by: Ahmed S. Darwish <a.darwish@linutronix.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20200720155530.1173732-9-a.darwish@linutronix.de
+(cherry picked from commit 859247d39fb008ea812e8f0c398a58a20c12899e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/seqlock.h
+diff --cc include/linux/seqlock.h
+index 362623ec6c41,54bc20496392..000000000000
+--- a/include/linux/seqlock.h
++++ b/include/linux/seqlock.h
+@@@ -258,15 -266,74 +258,46 @@@ static inline void raw_write_seqcount_e
+  	kcsan_nestable_atomic_end();
+  }
+  
++ static inline void __write_seqcount_begin_nested(seqcount_t *s, int subclass)
++ {
++ 	raw_write_seqcount_begin(s);
++ 	seqcount_acquire(&s->dep_map, subclass, 0, _RET_IP_);
++ }
++ 
+  /**
+ - * write_seqcount_begin_nested() - start a seqcount_t write section with
+ - *                                 custom lockdep nesting level
+ - * @s: Pointer to seqcount_t
+ - * @subclass: lockdep nesting level
+ + * raw_write_seqcount_barrier - do a seq write barrier
+ + * @s: pointer to seqcount_t
+   *
+++<<<<<<< HEAD
+ + * This can be used to provide an ordering guarantee instead of the
+ + * usual consistency guarantee. It is one wmb cheaper, because we can
+ + * collapse the two back-to-back wmb()s.
+++=======
++  * See Documentation/locking/lockdep-design.rst
++  */
++ static inline void write_seqcount_begin_nested(seqcount_t *s, int subclass)
++ {
++ 	lockdep_assert_preemption_disabled();
++ 	__write_seqcount_begin_nested(s, subclass);
++ }
++ 
++ /*
++  * A write_seqcount_begin() variant w/o lockdep non-preemptibility checks.
++  *
++  * Use for internal seqlock.h code where it's known that preemption is
++  * already disabled. For example, seqlock_t write side functions.
++  */
++ static inline void __write_seqcount_begin(seqcount_t *s)
++ {
++ 	__write_seqcount_begin_nested(s, 0);
++ }
++ 
++ /**
++  * write_seqcount_begin() - start a seqcount_t write side critical section
++  * @s: Pointer to seqcount_t
+++>>>>>>> 859247d39fb0 (seqlock: lockdep assert non-preemptibility on seqcount_t write)
+   *
+ - * write_seqcount_begin opens a write side critical section of the given
+ - * seqcount_t.
+ - *
+ - * Context: seqcount_t write side critical sections must be serialized and
+ - * non-preemptible. If readers can be invoked from hardirq or softirq
+ - * context, interrupts or bottom halves must be respectively disabled.
+ - */
+ -static inline void write_seqcount_begin(seqcount_t *s)
+ -{
+ -	write_seqcount_begin_nested(s, 0);
+ -}
+ -
+ -/**
+ - * write_seqcount_end() - end a seqcount_t write side critical section
+ - * @s: Pointer to seqcount_t
+ - *
+ - * The write section must've been opened with write_seqcount_begin().
+ - */
+ -static inline void write_seqcount_end(seqcount_t *s)
+ -{
+ -	seqcount_release(&s->dep_map, _RET_IP_);
+ -	raw_write_seqcount_end(s);
+ -}
+ -
+ -/**
+ - * raw_write_seqcount_barrier() - do a seqcount_t write barrier
+ - * @s: Pointer to seqcount_t
+ - *
+ - * This can be used to provide an ordering guarantee instead of the usual
+ - * consistency guarantee. It is one wmb cheaper, because it can collapse
+ - * the two back-to-back wmb()s.
+ - *
+ - * Note that writes surrounding the barrier should be declared atomic (e.g.
+ + * Note that, writes surrounding the barrier should be declared atomic (e.g.
+   * via WRITE_ONCE): a) to ensure the writes become visible to other threads
+   * atomically, avoiding compiler optimizations; b) to document which writes are
+   * meant to propagate to the reader critical section. This is necessary because
+@@@ -494,9 -592,16 +525,9 @@@ static inline unsigned read_seqretry(co
+  static inline void write_seqlock(seqlock_t *sl)
+  {
+  	spin_lock(&sl->lock);
+- 	write_seqcount_begin(&sl->seqcount);
++ 	__write_seqcount_begin(&sl->seqcount);
+  }
+  
+ -/**
+ - * write_sequnlock() - end a seqlock_t write side critical section
+ - * @sl: Pointer to seqlock_t
+ - *
+ - * write_sequnlock closes the (serialized and non-preemptible) write side
+ - * critical section of given seqlock_t.
+ - */
+  static inline void write_sequnlock(seqlock_t *sl)
+  {
+  	write_seqcount_end(&sl->seqcount);
+@@@ -506,9 -611,24 +537,9 @@@
+  static inline void write_seqlock_bh(seqlock_t *sl)
+  {
+  	spin_lock_bh(&sl->lock);
+- 	write_seqcount_begin(&sl->seqcount);
++ 	__write_seqcount_begin(&sl->seqcount);
+  }
+  
+ -/**
+ - * write_sequnlock_bh() - end a softirqs-disabled seqlock_t write section
+ - * @sl: Pointer to seqlock_t
+ - *
+ - * write_sequnlock_bh closes the serialized, non-preemptible, and
+ - * softirqs-disabled, seqlock_t write side critical section opened with
+ - * write_seqlock_bh().
+ - */
+  static inline void write_sequnlock_bh(seqlock_t *sl)
+  {
+  	write_seqcount_end(&sl->seqcount);
+@@@ -518,9 -638,23 +549,9 @@@
+  static inline void write_seqlock_irq(seqlock_t *sl)
+  {
+  	spin_lock_irq(&sl->lock);
+- 	write_seqcount_begin(&sl->seqcount);
++ 	__write_seqcount_begin(&sl->seqcount);
+  }
+  
+ -/**
+ - * write_sequnlock_irq() - end a non-interruptible seqlock_t write section
+ - * @sl: Pointer to seqlock_t
+ - *
+ - * write_sequnlock_irq closes the serialized and non-interruptible
+ - * seqlock_t write side section opened with write_seqlock_irq().
+ - */
+  static inline void write_sequnlock_irq(seqlock_t *sl)
+  {
+  	write_seqcount_end(&sl->seqcount);
+* Unmerged path include/linux/seqlock.h
