@@ -1,0 +1,112 @@
+bpf: Run devmap xdp_prog on flush instead of bulk enqueue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit cb261b594b4108668e00f565184c7c221efe0359
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/cb261b59.failed
+
+This changes the devmap XDP program support to run the program when the
+bulk queue is flushed instead of before the frame is enqueued. This has
+a couple of benefits:
+
+- It "sorts" the packets by destination devmap entry, and then runs the
+  same BPF program on all the packets in sequence. This ensures that we
+  keep the XDP program and destination device properties hot in I-cache.
+
+- It makes the multicast implementation simpler because it can just
+  enqueue packets using bq_enqueue() without having to deal with the
+  devmap program at all.
+
+The drawback is that if the devmap program drops the packet, the enqueue
+step is redundant. However, arguably this is mostly visible in a
+micro-benchmark, and with more mixed traffic the I-cache benefit should
+win out. The performance impact of just this patch is as follows:
+
+Using 2 10Gb i40e NIC, redirecting one to another, or into a veth interface,
+which do XDP_DROP on veth peer. With xdp_redirect_map in sample/bpf, send
+pkts via pktgen cmd:
+./pktgen_sample03_burst_single_flow.sh -i eno1 -d $dst_ip -m $dst_mac -t 10 -s 64
+
+There are about +/- 0.1M deviation for native testing, the performance
+improved for the base-case, but some drop back with xdp devmap prog attached.
+
+Version          | Test                           | Generic | Native | Native + 2nd xdp_prog
+5.12 rc4         | xdp_redirect_map   i40e->i40e  |    1.9M |   9.6M |  8.4M
+5.12 rc4         | xdp_redirect_map   i40e->veth  |    1.7M |  11.7M |  9.8M
+5.12 rc4 + patch | xdp_redirect_map   i40e->i40e  |    1.9M |   9.8M |  8.0M
+5.12 rc4 + patch | xdp_redirect_map   i40e->veth  |    1.7M |  12.0M |  9.4M
+
+When bq_xmit_all() is called from bq_enqueue(), another packet will
+always be enqueued immediately after, so clearing dev_rx, xdp_prog and
+flush_node in bq_xmit_all() is redundant. Move the clear to __dev_flush(),
+and only check them once in bq_enqueue() since they are all modified
+together.
+
+This change also has the side effect of extending the lifetime of the
+RCU-protected xdp_prog that lives inside the devmap entries: Instead of
+just living for the duration of the XDP program invocation, the
+reference now lives all the way until the bq is flushed. This is safe
+because the bq flush happens at the end of the NAPI poll loop, so
+everything happens between a local_bh_disable()/local_bh_enable() pair.
+However, this is by no means obvious from looking at the call sites; in
+particular, some drivers have an additional rcu_read_lock() around only
+the XDP program invocation, which only confuses matters further.
+Cleaning this up will be done in a separate patch series.
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20210519090747.1655268-2-liuhangbin@gmail.com
+(cherry picked from commit cb261b594b4108668e00f565184c7c221efe0359)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/devmap.c
+diff --cc kernel/bpf/devmap.c
+index 83af56804922,642264e32abd..000000000000
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@@ -451,34 -501,6 +509,37 @@@ static inline int __xdp_enqueue(struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static struct xdp_buff *dev_map_run_prog(struct net_device *dev,
+ +					 struct xdp_buff *xdp,
+ +					 struct bpf_prog *xdp_prog)
+ +{
+ +	struct xdp_txq_info txq = { .dev = dev };
+ +	u32 act;
+ +
+ +	xdp_set_data_meta_invalid(xdp);
+ +	xdp->txq = &txq;
+ +
+ +	act = bpf_prog_run_xdp(xdp_prog, xdp);
+ +	switch (act) {
+ +	case XDP_PASS:
+ +		return xdp;
+ +	case XDP_DROP:
+ +		break;
+ +	default:
+ +		bpf_warn_invalid_xdp_action(NULL, xdp_prog, act);
+ +		/* fallthrough */
+ +	case XDP_ABORTED:
+ +		trace_xdp_exception(dev, xdp_prog, act);
+ +		break;
+ +	}
+ +
+ +	xdp_return_buff(xdp);
+ +	return NULL;
+ +}
+ +
+++=======
+++>>>>>>> cb261b594b41 (bpf: Run devmap xdp_prog on flush instead of bulk enqueue)
+  int dev_xdp_enqueue(struct net_device *dev, struct xdp_buff *xdp,
+  		    struct net_device *dev_rx)
+  {
+* Unmerged path kernel/bpf/devmap.c
