@@ -1,0 +1,288 @@
+RDMA/rxe: Close a race after ib_register_device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit ca22354b140853b8155692d5b2bc0110aa54e937
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ca22354b.failed
+
+Since rxe allows unregistration from other threads the rxe pointer can
+become invalid any moment after ib_register_driver returns. This could
+cause a user triggered use after free.
+
+Add another driver callback to be called right after the device becomes
+registered to complete any device setup required post-registration.  This
+callback has enough core locking to prevent the device from becoming
+unregistered.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit ca22354b140853b8155692d5b2bc0110aa54e937)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+#	drivers/infiniband/sw/rxe/rxe_net.c
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/core/device.c
+index 8641d8bca5aa,bf2a215d94dd..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -545,13 -752,74 +545,84 @@@ static int setup_device(struct ib_devic
+  		return ret;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = setup_port_pkey_list(device);
+ +	if (ret) {
+ +		dev_warn(&device->dev, "Couldn't create per port_pkey_list\n");
+ +		return ret;
+ +	}
+ +
+ +	return 0;
+++=======
++ 	return 0;
++ }
++ 
++ static void disable_device(struct ib_device *device)
++ {
++ 	struct ib_client *client;
++ 
++ 	WARN_ON(!refcount_read(&device->refcount));
++ 
++ 	down_write(&devices_rwsem);
++ 	xa_clear_mark(&devices, device->index, DEVICE_REGISTERED);
++ 	up_write(&devices_rwsem);
++ 
++ 	down_read(&clients_rwsem);
++ 	list_for_each_entry_reverse(client, &client_list, list)
++ 		remove_client_context(device, client->client_id);
++ 	up_read(&clients_rwsem);
++ 
++ 	/* Pairs with refcount_set in enable_device */
++ 	ib_device_put(device);
++ 	wait_for_completion(&device->unreg_completion);
++ 
++ 	/* Expedite removing unregistered pointers from the hash table */
++ 	free_netdevs(device);
++ }
++ 
++ /*
++  * An enabled device is visible to all clients and to all the public facing
++  * APIs that return a device pointer. This always returns with a new get, even
++  * if it fails.
++  */
++ static int enable_device_and_get(struct ib_device *device)
++ {
++ 	struct ib_client *client;
++ 	unsigned long index;
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * One ref belongs to the xa and the other belongs to this
++ 	 * thread. This is needed to guard against parallel unregistration.
++ 	 */
++ 	refcount_set(&device->refcount, 2);
++ 	down_write(&devices_rwsem);
++ 	xa_set_mark(&devices, device->index, DEVICE_REGISTERED);
++ 
++ 	/*
++ 	 * By using downgrade_write() we ensure that no other thread can clear
++ 	 * DEVICE_REGISTERED while we are completing the client setup.
++ 	 */
++ 	downgrade_write(&devices_rwsem);
++ 
++ 	if (device->ops.enable_driver) {
++ 		ret = device->ops.enable_driver(device);
++ 		if (ret)
++ 			goto out;
++ 	}
++ 
++ 	down_read(&clients_rwsem);
++ 	xa_for_each_marked (&clients, index, client, CLIENT_REGISTERED) {
++ 		ret = add_client_context(device, client);
++ 		if (ret)
++ 			break;
++ 	}
++ 	up_read(&clients_rwsem);
++ 
++ out:
++ 	up_read(&devices_rwsem);
++ 	return ret;
+++>>>>>>> ca22354b1408 (RDMA/rxe: Close a race after ib_register_device)
+  }
+  
+  /**
+@@@ -1302,6 -1783,8 +1373,11 @@@ void ib_set_device_ops(struct ib_devic
+  	SET_DEVICE_OP(dev_ops, disassociate_ucontext);
+  	SET_DEVICE_OP(dev_ops, drain_rq);
+  	SET_DEVICE_OP(dev_ops, drain_sq);
+++<<<<<<< HEAD
+++=======
++ 	SET_DEVICE_OP(dev_ops, enable_driver);
++ 	SET_DEVICE_OP(dev_ops, fill_res_entry);
+++>>>>>>> ca22354b1408 (RDMA/rxe: Close a race after ib_register_device)
+  	SET_DEVICE_OP(dev_ops, get_dev_fw_str);
+  	SET_DEVICE_OP(dev_ops, get_dma_mr);
+  	SET_DEVICE_OP(dev_ops, get_hw_stats);
+diff --cc drivers/infiniband/sw/rxe/rxe_net.c
+index 56878453f1ae,fb792f5bc0b7..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_net.c
++++ b/drivers/infiniband/sw/rxe/rxe_net.c
+@@@ -550,28 -531,10 +550,32 @@@ int rxe_net_add(struct net_device *ndev
+  	err = rxe_add(rxe, ndev->mtu);
+  	if (err) {
+  		ib_dealloc_device(&rxe->ib_dev);
+- 		return NULL;
++ 		return err;
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&dev_list_lock);
+ +	list_add_tail(&rxe->list, &rxe_dev_list);
+ +	spin_unlock_bh(&dev_list_lock);
+ +	return rxe;
+++=======
++ 	return 0;
+++>>>>>>> ca22354b1408 (RDMA/rxe: Close a race after ib_register_device)
+ +}
+ +
+ +void rxe_remove_all(void)
+ +{
+ +	spin_lock_bh(&dev_list_lock);
+ +	while (!list_empty(&rxe_dev_list)) {
+ +		struct rxe_dev *rxe =
+ +			list_first_entry(&rxe_dev_list, struct rxe_dev, list);
+ +
+ +		list_del(&rxe->list);
+ +		spin_unlock_bh(&dev_list_lock);
+ +		rxe_remove(rxe);
+ +		spin_lock_bh(&dev_list_lock);
+ +	}
+ +	spin_unlock_bh(&dev_list_lock);
+  }
+  
+  static void rxe_port_event(struct rxe_dev *rxe,
+diff --cc include/rdma/ib_verbs.h
+index 2ff74f11eec0,640263289ab9..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -2525,8 -2532,28 +2525,29 @@@ struct ib_device_ops 
+  	 */
+  	int (*init_port)(struct ib_device *device, u8 port_num,
+  			 struct kobject *port_sysfs);
+++<<<<<<< HEAD
+++=======
++ 	/**
++ 	 * Allows rdma drivers to add their own restrack attributes.
++ 	 */
++ 	int (*fill_res_entry)(struct sk_buff *msg,
++ 			      struct rdma_restrack_entry *entry);
++ 
++ 	/* Device lifecycle callbacks */
++ 	/*
++ 	 * Called after the device becomes registered, before clients are
++ 	 * attached
++ 	 */
++ 	int (*enable_driver)(struct ib_device *dev);
++ 	/*
++ 	 * This is called as part of ib_dealloc_device().
++ 	 */
++ 	void (*dealloc_driver)(struct ib_device *dev);
++ 
++ 	DECLARE_RDMA_OBJ_SIZE(ib_pd);
+++>>>>>>> ca22354b1408 (RDMA/rxe: Close a race after ib_register_device)
+  };
+  
+ -struct rdma_restrack_root;
+ -
+  struct ib_device {
+  	/* Do not access @dma_device directly from ULP nor from HW drivers. */
+  	struct device                *dma_device;
+* Unmerged path drivers/infiniband/core/device.c
+* Unmerged path drivers/infiniband/sw/rxe/rxe_net.c
+diff --git a/drivers/infiniband/sw/rxe/rxe_net.h b/drivers/infiniband/sw/rxe/rxe_net.h
+index 106c586dbb26..ad79514191bb 100644
+--- a/drivers/infiniband/sw/rxe/rxe_net.h
++++ b/drivers/infiniband/sw/rxe/rxe_net.h
+@@ -43,7 +43,7 @@ struct rxe_recv_sockets {
+ 	struct socket *sk6;
+ };
+ 
+-struct rxe_dev *rxe_net_add(struct net_device *ndev);
++int rxe_net_add(struct net_device *ndev);
+ 
+ int rxe_net_init(void);
+ void rxe_net_exit(void);
+diff --git a/drivers/infiniband/sw/rxe/rxe_sysfs.c b/drivers/infiniband/sw/rxe/rxe_sysfs.c
+index 6802be71bf9b..ed4fa0d23e8f 100644
+--- a/drivers/infiniband/sw/rxe/rxe_sysfs.c
++++ b/drivers/infiniband/sw/rxe/rxe_sysfs.c
+@@ -60,7 +60,6 @@ static int rxe_param_set_add(const char *val, const struct kernel_param *kp)
+ 	char intf[32];
+ 	struct net_device *ndev;
+ 	struct rxe_dev *exists;
+-	struct rxe_dev *rxe;
+ 
+ 	len = sanitize_arg(val, intf, sizeof(intf));
+ 	if (!len) {
+@@ -82,16 +81,12 @@ static int rxe_param_set_add(const char *val, const struct kernel_param *kp)
+ 		goto err;
+ 	}
+ 
+-	rxe = rxe_net_add(ndev);
+-	if (!rxe) {
++	err = rxe_net_add(ndev);
++	if (err) {
+ 		pr_err("failed to add %s\n", intf);
+-		err = -EINVAL;
+ 		goto err;
+ 	}
+ 
+-	rxe_set_port_state(rxe);
+-	dev_info(&rxe->ib_dev.dev, "added %s\n", intf);
+-
+ err:
+ 	dev_put(ndev);
+ 	return err;
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.c b/drivers/infiniband/sw/rxe/rxe_verbs.c
+index f3188f269481..ba57e2bd2fca 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.c
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.c
+@@ -1126,6 +1126,15 @@ static const struct attribute_group rxe_attr_group = {
+ 	.attrs = rxe_dev_attributes,
+ };
+ 
++static int rxe_enable_driver(struct ib_device *ib_dev)
++{
++	struct rxe_dev *rxe = container_of(ib_dev, struct rxe_dev, ib_dev);
++
++	rxe_set_port_state(rxe);
++	dev_info(&rxe->ib_dev.dev, "added %s\n", netdev_name(rxe->ndev));
++	return 0;
++}
++
+ static const struct ib_device_ops rxe_dev_ops = {
+ 	.alloc_hw_stats = rxe_ib_alloc_hw_stats,
+ 	.alloc_mr = rxe_alloc_mr,
+@@ -1144,6 +1153,7 @@ static const struct ib_device_ops rxe_dev_ops = {
+ 	.destroy_qp = rxe_destroy_qp,
+ 	.destroy_srq = rxe_destroy_srq,
+ 	.detach_mcast = rxe_detach_mcast,
++	.enable_driver = rxe_enable_driver,
+ 	.get_dma_mr = rxe_get_dma_mr,
+ 	.get_hw_stats = rxe_ib_get_hw_stats,
+ 	.get_link_layer = rxe_get_link_layer,
+@@ -1251,6 +1261,10 @@ int rxe_register_device(struct rxe_dev *rxe)
+ err1:
+ 	crypto_free_shash(rxe->tfm);
+ 
++	/*
++	 * Note that rxe may be invalid at this point if another thread
++	 * unregistered it.
++	 */
+ 	return err;
+ }
+ 
+* Unmerged path include/rdma/ib_verbs.h
