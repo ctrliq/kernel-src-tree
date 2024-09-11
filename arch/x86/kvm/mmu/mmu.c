@@ -4240,7 +4240,7 @@ static void reset_rsvds_bits_mask(struct kvm_vcpu *vcpu,
 {
 	__reset_rsvds_bits_mask(&context->guest_rsvd_check,
 				vcpu->arch.reserved_gpa_bits,
-				context->root_level, context->nx,
+				context->root_level, is_efer_nx(context),
 				guest_cpuid_has(vcpu, X86_FEATURE_GBPAGES),
 				is_pse(vcpu), guest_cpuid_is_amd(vcpu));
 }
@@ -4305,7 +4305,7 @@ static void reset_shadow_zero_bits_mask(struct kvm_vcpu *vcpu,
 	 * NX can be used by any non-nested shadow MMU to avoid having to reset
 	 * MMU contexts.  Note, KVM forces EFER.NX=1 when TDP is disabled.
 	 */
-	bool uses_nx = context->nx || !tdp_enabled;
+	bool uses_nx = is_efer_nx(context) || !tdp_enabled;
 
 	/* @amd adds a check on bit of SPTEs, which KVM shouldn't use anyways. */
 	bool is_amd = true;
@@ -4402,6 +4402,7 @@ static void update_permission_bitmask(struct kvm_mmu *mmu, bool ept)
 	bool cr4_smep = is_cr4_smep(mmu);
 	bool cr4_smap = is_cr4_smap(mmu);
 	bool cr0_wp = is_cr0_wp(mmu);
+	bool efer_nx = is_efer_nx(mmu);
 
 	for (byte = 0; byte < ARRAY_SIZE(mmu->permissions); ++byte) {
 		unsigned pfec = byte << 1;
@@ -4427,7 +4428,7 @@ static void update_permission_bitmask(struct kvm_mmu *mmu, bool ept)
 			u8 kf = (pfec & PFERR_USER_MASK) ? 0 : u;
 
 			/* Not really needed: !nx will cause pte.nx to fault */
-			if (!mmu->nx)
+			if (!efer_nx)
 				ff = 0;
 
 			/* Allow supervisor writes if !cr0.wp */
