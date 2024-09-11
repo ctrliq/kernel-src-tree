@@ -1,0 +1,158 @@
+nvmet: make nvmet_find_namespace() req based
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+commit 3a1f7c79ae6d3dfdc16082daa44b3cf8dbe4f238
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/3a1f7c79.failed
+
+The six callers of nvmet_find_namespace() duplicate the error log page
+update and status setting code for each call on failure.
+
+All callers are nvmet requests based functions, so we can pass req
+to the nvmet_find_namesapce() & derive ctrl from req, that'll allow us
+to update the error log page in nvmet_find_namespace(). Now that we
+pass the request we can also get rid of the local variable in
+nvmet_find_namespace() and use the req->ns and return the error code.
+
+Replace the ctrl parameter with nvmet_req for nvmet_find_namespace(),
+centralize the error log page update for non allocated namesapces, and
+return uniform error for non-allocated namespace.
+
+The nvmet_find_namespace() takes nsid parameter which is from NVMe
+commands structures such as get_log_page, identify, rw and common. All
+these commands have same offset for the nsid field.
+
+Derive nsid from req->cmd->common.nsid) & remove the extra parameter
+from the nvmet_find_namespace().
+
+Lastly now we associate the ns to the req parameter that we pass to the
+nvmet_find_namespace(), rename nvmet_find_namespace() to
+nvmet_req_find_ns().
+
+	Signed-off-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 3a1f7c79ae6d3dfdc16082daa44b3cf8dbe4f238)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/admin-cmd.c
+diff --cc drivers/nvme/target/admin-cmd.c
+index f16796aa8138,f32533480e66..000000000000
+--- a/drivers/nvme/target/admin-cmd.c
++++ b/drivers/nvme/target/admin-cmd.c
+@@@ -81,27 -74,23 +81,34 @@@ static void nvmet_execute_get_log_page_
+  static u16 nvmet_get_smart_log_nsid(struct nvmet_req *req,
+  		struct nvme_smart_log *slog)
+  {
+ +	struct nvmet_ns *ns;
+  	u64 host_reads, host_writes, data_units_read, data_units_written;
++ 	u16 status;
+  
+++<<<<<<< HEAD
+ +	ns = nvmet_find_namespace(req->sq->ctrl, req->cmd->get_log_page.nsid);
+ +	if (!ns) {
+ +		pr_err("Could not find namespace id : %d\n",
+ +				le32_to_cpu(req->cmd->get_log_page.nsid));
+ +		req->error_loc = offsetof(struct nvme_rw_command, nsid);
+ +		return NVME_SC_INVALID_NS | NVME_SC_DNR;
+ +	}
+++=======
++ 	status = nvmet_req_find_ns(req);
++ 	if (status)
++ 		return status;
+++>>>>>>> 3a1f7c79ae6d (nvmet: make nvmet_find_namespace() req based)
+  
+  	/* we don't have the right data for file backed ns */
+ -	if (!req->ns->bdev)
+ -		return NVME_SC_SUCCESS;
+ +	if (!ns->bdev)
+ +		goto out;
+  
+ -	host_reads = part_stat_read(req->ns->bdev, ios[READ]);
+ -	data_units_read =
+ -		DIV_ROUND_UP(part_stat_read(req->ns->bdev, sectors[READ]), 1000);
+ -	host_writes = part_stat_read(req->ns->bdev, ios[WRITE]);
+ -	data_units_written =
+ -		DIV_ROUND_UP(part_stat_read(req->ns->bdev, sectors[WRITE]), 1000);
+ +	host_reads = part_stat_read(ns->bdev->bd_part, ios[READ]);
+ +	data_units_read = DIV_ROUND_UP(part_stat_read(ns->bdev->bd_part,
+ +		sectors[READ]), 1000);
+ +	host_writes = part_stat_read(ns->bdev->bd_part, ios[WRITE]);
+ +	data_units_written = DIV_ROUND_UP(part_stat_read(ns->bdev->bd_part,
+ +		sectors[WRITE]), 1000);
+  
+  	put_unaligned_le64(host_reads, &slog->host_reads[0]);
+  	put_unaligned_le64(data_units_read, &slog->data_units_read[0]);
+@@@ -475,8 -462,9 +482,8 @@@ out
+  
+  static void nvmet_execute_identify_ns(struct nvmet_req *req)
+  {
+ -	struct nvmet_ctrl *ctrl = req->sq->ctrl;
+  	struct nvme_id_ns *id;
+- 	u16 status = 0;
++ 	u16 status;
+  
+  	if (le32_to_cpu(req->cmd->identify.nsid) == NVME_NSID_ALL) {
+  		req->error_loc = offsetof(struct nvme_identify, nsid);
+* Unmerged path drivers/nvme/target/admin-cmd.c
+diff --git a/drivers/nvme/target/core.c b/drivers/nvme/target/core.c
+index 2c9eee9a39c8..ecd79d2b6c67 100644
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@ -425,15 +425,18 @@ void nvmet_stop_keep_alive_timer(struct nvmet_ctrl *ctrl)
+ 	cancel_delayed_work_sync(&ctrl->ka_work);
+ }
+ 
+-struct nvmet_ns *nvmet_find_namespace(struct nvmet_ctrl *ctrl, __le32 nsid)
++u16 nvmet_req_find_ns(struct nvmet_req *req)
+ {
+-	struct nvmet_ns *ns;
++	u32 nsid = le32_to_cpu(req->cmd->common.nsid);
+ 
+-	ns = xa_load(&ctrl->subsys->namespaces, le32_to_cpu(nsid));
+-	if (ns)
+-		percpu_ref_get(&ns->ref);
++	req->ns = xa_load(&req->sq->ctrl->subsys->namespaces, nsid);
++	if (unlikely(!req->ns)) {
++		req->error_loc = offsetof(struct nvme_common_command, nsid);
++		return NVME_SC_INVALID_NS | NVME_SC_DNR;
++	}
+ 
+-	return ns;
++	percpu_ref_get(&req->ns->ref);
++	return NVME_SC_SUCCESS;
+ }
+ 
+ static void nvmet_destroy_namespace(struct percpu_ref *ref)
+@@ -869,11 +872,10 @@ static u16 nvmet_parse_io_cmd(struct nvmet_req *req)
+ 	if (nvmet_req_passthru_ctrl(req))
+ 		return nvmet_parse_passthru_io_cmd(req);
+ 
+-	req->ns = nvmet_find_namespace(req->sq->ctrl, cmd->rw.nsid);
+-	if (unlikely(!req->ns)) {
+-		req->error_loc = offsetof(struct nvme_common_command, nsid);
+-		return NVME_SC_INVALID_NS | NVME_SC_DNR;
+-	}
++	ret = nvmet_req_find_ns(req);
++	if (unlikely(ret))
++		return ret;
++
+ 	ret = nvmet_check_ana_state(req->port, req->ns);
+ 	if (unlikely(ret)) {
+ 		req->error_loc = offsetof(struct nvme_common_command, nsid);
+diff --git a/drivers/nvme/target/nvmet.h b/drivers/nvme/target/nvmet.h
+index 558660c454bb..d04f0795c235 100644
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -451,7 +451,7 @@ struct nvmet_subsys *nvmet_subsys_alloc(const char *subsysnqn,
+ void nvmet_subsys_put(struct nvmet_subsys *subsys);
+ void nvmet_subsys_del_ctrls(struct nvmet_subsys *subsys);
+ 
+-struct nvmet_ns *nvmet_find_namespace(struct nvmet_ctrl *ctrl, __le32 nsid);
++u16 nvmet_req_find_ns(struct nvmet_req *req);
+ void nvmet_put_namespace(struct nvmet_ns *ns);
+ int nvmet_ns_enable(struct nvmet_ns *ns);
+ void nvmet_ns_disable(struct nvmet_ns *ns);
