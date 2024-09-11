@@ -1,0 +1,182 @@
+panic: avoid the extra noise dmesg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Feng Tang <feng.tang@intel.com>
+commit c39ea0b9dd24bf1bf2baa5cdbfa1905f3065347b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c39ea0b9.failed
+
+When kernel panic happens, it will first print the panic call stack,
+then the ending msg like:
+
+[   35.743249] ---[ end Kernel panic - not syncing: Fatal exception
+[   35.749975] ------------[ cut here ]------------
+
+The above message are very useful for debugging.
+
+But if system is configured to not reboot on panic, say the
+"panic_timeout" parameter equals 0, it will likely print out many noisy
+message like WARN() call stack for each and every CPU except the panic
+one, messages like below:
+
+	WARNING: CPU: 1 PID: 280 at kernel/sched/core.c:1198 set_task_cpu+0x183/0x190
+	Call Trace:
+	<IRQ>
+	try_to_wake_up
+	default_wake_function
+	autoremove_wake_function
+	__wake_up_common
+	__wake_up_common_lock
+	__wake_up
+	wake_up_klogd_work_func
+	irq_work_run_list
+	irq_work_tick
+	update_process_times
+	tick_sched_timer
+	__hrtimer_run_queues
+	hrtimer_interrupt
+	smp_apic_timer_interrupt
+	apic_timer_interrupt
+
+For people working in console mode, the screen will first show the panic
+call stack, but immediately overridden by these noisy extra messages,
+which makes debugging much more difficult, as the original context gets
+lost on screen.
+
+Also these noisy messages will confuse some users, as I have seen many bug
+reporters posted the noisy message into bugzilla, instead of the real
+panic call stack and context.
+
+Adding a flag "suppress_printk" which gets set in panic() to avoid those
+noisy messages, without changing current kernel behavior that both panic
+blinking and sysrq magic key can work as is, suggested by Petr Mladek.
+
+To verify this, make sure kernel is not configured to reboot on panic and
+in console
+ # echo c > /proc/sysrq-trigger
+to see if console only prints out the panic call stack.
+
+Link: http://lkml.kernel.org/r/1551430186-24169-1-git-send-email-feng.tang@intel.com
+	Signed-off-by: Feng Tang <feng.tang@intel.com>
+	Suggested-by: Petr Mladek <pmladek@suse.com>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Acked-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Acked-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Jiri Slaby <jslaby@suse.com>
+	Cc: Sasha Levin <sashal@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c39ea0b9dd24bf1bf2baa5cdbfa1905f3065347b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index 7e38153d9916,17102fd4c136..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -1901,11 -1936,36 +1907,31 @@@ asmlinkage int vprintk_emit(int facilit
+  	if (dict)
+  		lflags |= LOG_NEWLINE;
+  
+ -	return log_output(facility, level, lflags,
+ -			  dict, dictlen, text, text_len);
+ -}
+ +	if (suppress_message_printing(level))
+ +		lflags |= LOG_NOCONS;
+  
+ -asmlinkage int vprintk_emit(int facility, int level,
+ -			    const char *dict, size_t dictlen,
+ -			    const char *fmt, va_list args)
+ -{
+ -	int printed_len;
+ -	bool in_sched = false, pending_output;
+ -	unsigned long flags;
+ -	u64 curr_log_seq;
+ +	printed_len = log_output(facility, level, lflags, dict, dictlen, text, text_len);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Suppress unimportant messages after panic happens */
++ 	if (unlikely(suppress_printk))
++ 		return 0;
++ 
++ 	if (level == LOGLEVEL_SCHED) {
++ 		level = LOGLEVEL_DEFAULT;
++ 		in_sched = true;
++ 	}
++ 
++ 	boot_delay_msec(level);
++ 	printk_delay();
++ 
++ 	/* This stops the holder of console_sem just where we want him */
++ 	logbuf_lock_irqsave(flags);
++ 	curr_log_seq = log_next_seq;
++ 	printed_len = vprintk_store(facility, level, dict, dictlen, fmt, args);
++ 	pending_output = (curr_log_seq != log_next_seq);
+++>>>>>>> c39ea0b9dd24 (panic: avoid the extra noise dmesg)
+  	logbuf_unlock_irqrestore(flags);
+  
+  	/* If called from the scheduler, we can not call up(). */
+diff --git a/drivers/tty/sysrq.c b/drivers/tty/sysrq.c
+index 45c81499ed9a..22973a5c59a2 100644
+--- a/drivers/tty/sysrq.c
++++ b/drivers/tty/sysrq.c
+@@ -534,8 +534,12 @@ void __handle_sysrq(int key, bool check_mask)
+ {
+ 	struct sysrq_key_op *op_p;
+ 	int orig_log_level;
++	int orig_suppress_printk;
+ 	int i;
+ 
++	orig_suppress_printk = suppress_printk;
++	suppress_printk = 0;
++
+ 	rcu_sysrq_start();
+ 	rcu_read_lock();
+ 	/*
+@@ -581,6 +585,8 @@ void __handle_sysrq(int key, bool check_mask)
+ 	}
+ 	rcu_read_unlock();
+ 	rcu_sysrq_end();
++
++	suppress_printk = orig_suppress_printk;
+ }
+ 
+ void handle_sysrq(int key)
+diff --git a/include/linux/printk.h b/include/linux/printk.h
+index 84ea4d094af3..cefd374c47b1 100644
+--- a/include/linux/printk.h
++++ b/include/linux/printk.h
+@@ -82,6 +82,8 @@ static inline void console_verbose(void)
+ extern char devkmsg_log_str[];
+ struct ctl_table;
+ 
++extern int suppress_printk;
++
+ struct va_format {
+ 	const char *fmt;
+ 	va_list *va;
+diff --git a/kernel/panic.c b/kernel/panic.c
+index d8e25dde1699..5e9bf13d64cc 100644
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -318,6 +318,9 @@ void panic(const char *fmt, ...)
+ 	}
+ #endif
+ 	pr_emerg("---[ end Kernel panic - not syncing: %s ]---\n", buf);
++
++	/* Do not scroll important messages printed above */
++	suppress_printk = 1;
+ 	local_irq_enable();
+ 	for (i = 0; ; i += PANIC_TIMER_STEP) {
+ 		touch_softlockup_watchdog();
+* Unmerged path kernel/printk/printk.c
