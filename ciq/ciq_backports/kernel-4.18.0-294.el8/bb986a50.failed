@@ -1,0 +1,163 @@
+seg6: fix seg6_validate_srh() to avoid slab-out-of-bounds
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ahmed Abdelsalam <ahabdels@gmail.com>
+commit bb986a50421a11bf31a81afb15b9b8f45a4a3a11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bb986a50.failed
+
+The seg6_validate_srh() is used to validate SRH for three cases:
+
+case1: SRH of data-plane SRv6 packets to be processed by the Linux kernel.
+Case2: SRH of the netlink message received  from user-space (iproute2)
+Case3: SRH injected into packets through setsockopt
+
+In case1, the SRH can be encoded in the Reduced way (i.e., first SID is
+carried in DA only and not represented as SID in the SRH) and the
+seg6_validate_srh() now handles this case correctly.
+
+In case2 and case3, the SRH shouldn’t be encoded in the Reduced way
+otherwise we lose the first segment (i.e., the first hop).
+
+The current implementation of the seg6_validate_srh() allow SRH of case2
+and case3 to be encoded in the Reduced way. This leads a slab-out-of-bounds
+problem.
+
+This patch verifies SRH of case1, case2 and case3. Allowing case1 to be
+reduced while preventing SRH of case2 and case3 from being reduced .
+
+	Reported-by: syzbot+e8c028b62439eac42073@syzkaller.appspotmail.com
+	Reported-by: YueHaibing <yuehaibing@huawei.com>
+Fixes: 0cb7498f234e ("seg6: fix SRH processing to comply with RFC8754")
+	Signed-off-by: Ahmed Abdelsalam <ahabdels@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bb986a50421a11bf31a81afb15b9b8f45a4a3a11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/seg6_local.c
+diff --cc net/ipv6/seg6_local.c
+index ea278dacda42,eba23279912d..000000000000
+--- a/net/ipv6/seg6_local.c
++++ b/net/ipv6/seg6_local.c
+@@@ -86,7 -82,12 +86,16 @@@ static struct ipv6_sr_hdr *get_srh(stru
+  	if (!pskb_may_pull(skb, srhoff + len))
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	if (!seg6_validate_srh(srh, len))
+++=======
++ 	/* note that pskb_may_pull may change pointers in header;
++ 	 * for this reason it is necessary to reload them when needed.
++ 	 */
++ 	srh = (struct ipv6_sr_hdr *)(skb->data + srhoff);
++ 
++ 	if (!seg6_validate_srh(srh, len, true))
+++>>>>>>> bb986a50421a (seg6: fix seg6_validate_srh() to avoid slab-out-of-bounds)
+  		return NULL;
+  
+  	return srh;
+@@@ -648,10 -670,10 +657,10 @@@ static int parse_nla_srh(struct nlattr 
+  	if (len < sizeof(*srh) + sizeof(struct in6_addr))
+  		return -EINVAL;
+  
+- 	if (!seg6_validate_srh(srh, len))
++ 	if (!seg6_validate_srh(srh, len, false))
+  		return -EINVAL;
+  
+ -	slwt->srh = kmemdup(srh, len, GFP_KERNEL);
+ +	slwt->srh = kmalloc(len, GFP_KERNEL);
+  	if (!slwt->srh)
+  		return -ENOMEM;
+  
+diff --git a/include/net/seg6.h b/include/net/seg6.h
+index 2567941a2f32..0d0dc562de0a 100644
+--- a/include/net/seg6.h
++++ b/include/net/seg6.h
+@@ -63,7 +63,7 @@ extern void seg6_iptunnel_exit(void);
+ extern int seg6_local_init(void);
+ extern void seg6_local_exit(void);
+ 
+-extern bool seg6_validate_srh(struct ipv6_sr_hdr *srh, int len);
++extern bool seg6_validate_srh(struct ipv6_sr_hdr *srh, int len, bool reduced);
+ extern int seg6_do_srh_encap(struct sk_buff *skb, struct ipv6_sr_hdr *osrh,
+ 			     int proto);
+ extern int seg6_do_srh_inline(struct sk_buff *skb, struct ipv6_sr_hdr *osrh);
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 88af5520d339..c42eca331a8a 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -4981,7 +4981,7 @@ static int bpf_push_seg6_encap(struct sk_buff *skb, u32 type, void *hdr, u32 len
+ 	int err;
+ 	struct ipv6_sr_hdr *srh = (struct ipv6_sr_hdr *)hdr;
+ 
+-	if (!seg6_validate_srh(srh, len))
++	if (!seg6_validate_srh(srh, len, false))
+ 		return -EINVAL;
+ 
+ 	switch (type) {
+diff --git a/net/ipv6/ipv6_sockglue.c b/net/ipv6/ipv6_sockglue.c
+index f2387a7da520..269ee5e2e31a 100644
+--- a/net/ipv6/ipv6_sockglue.c
++++ b/net/ipv6/ipv6_sockglue.c
+@@ -463,7 +463,7 @@ static int do_ipv6_setsockopt(struct sock *sk, int level, int optname,
+ 				struct ipv6_sr_hdr *srh = (struct ipv6_sr_hdr *)
+ 							  opt->srcrt;
+ 
+-				if (!seg6_validate_srh(srh, optlen))
++				if (!seg6_validate_srh(srh, optlen, false))
+ 					goto sticky_done;
+ 				break;
+ 			}
+diff --git a/net/ipv6/seg6.c b/net/ipv6/seg6.c
+index e64d04f32394..2024d0005d72 100644
+--- a/net/ipv6/seg6.c
++++ b/net/ipv6/seg6.c
+@@ -30,7 +30,7 @@
+ #include <net/seg6_hmac.h>
+ #endif
+ 
+-bool seg6_validate_srh(struct ipv6_sr_hdr *srh, int len)
++bool seg6_validate_srh(struct ipv6_sr_hdr *srh, int len, bool reduced)
+ {
+ 	unsigned int tlv_offset;
+ 	int max_last_entry;
+@@ -42,13 +42,17 @@ bool seg6_validate_srh(struct ipv6_sr_hdr *srh, int len)
+ 	if (((srh->hdrlen + 1) << 3) != len)
+ 		return false;
+ 
+-	max_last_entry = (srh->hdrlen / 2) - 1;
+-
+-	if (srh->first_segment > max_last_entry)
++	if (!reduced && srh->segments_left > srh->first_segment) {
+ 		return false;
++	} else {
++		max_last_entry = (srh->hdrlen / 2) - 1;
+ 
+-	if (srh->segments_left > srh->first_segment + 1)
+-		return false;
++		if (srh->first_segment > max_last_entry)
++			return false;
++
++		if (srh->segments_left > srh->first_segment + 1)
++			return false;
++	}
+ 
+ 	tlv_offset = sizeof(*srh) + ((srh->first_segment + 1) << 4);
+ 
+diff --git a/net/ipv6/seg6_iptunnel.c b/net/ipv6/seg6_iptunnel.c
+index 42a033c603ac..c758f70f8a9a 100644
+--- a/net/ipv6/seg6_iptunnel.c
++++ b/net/ipv6/seg6_iptunnel.c
+@@ -429,7 +429,7 @@ static int seg6_build_state(struct nlattr *nla,
+ 	}
+ 
+ 	/* verify that SRH is consistent */
+-	if (!seg6_validate_srh(tuninfo->srh, tuninfo_len - sizeof(*tuninfo)))
++	if (!seg6_validate_srh(tuninfo->srh, tuninfo_len - sizeof(*tuninfo), false))
+ 		return -EINVAL;
+ 
+ 	newts = lwtunnel_state_alloc(tuninfo_len + sizeof(*slwt));
+* Unmerged path net/ipv6/seg6_local.c
