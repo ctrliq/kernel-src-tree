@@ -1,0 +1,124 @@
+md/raid5: move checking badblock before clone bio in raid5_read_one_chunk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Guoqing Jiang <jgq516@gmail.com>
+commit c82aa1b76787c34fd02374e519b6f52cdeb2f54b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/c82aa1b7.failed
+
+We don't need to clone bio if the relevant region has badblock.
+
+	Signed-off-by: Guoqing Jiang <jiangguoqing@kylinos.cn>
+	Signed-off-by: Song Liu <song@kernel.org>
+(cherry picked from commit c82aa1b76787c34fd02374e519b6f52cdeb2f54b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5.c
+diff --cc drivers/md/raid5.c
+index 08041f68d898,5a05277f4be7..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -5457,58 -5416,50 +5457,81 @@@ static int raid5_read_one_chunk(struct 
+  	if (!rdev || test_bit(Faulty, &rdev->flags) ||
+  	    rdev->recovery_offset < end_sector) {
+  		rdev = rcu_dereference(conf->disks[dd_idx].rdev);
+ -		if (!rdev)
+ -			goto out_rcu_unlock;
+ -		if (test_bit(Faulty, &rdev->flags) ||
+ +		if (rdev &&
+ +		    (test_bit(Faulty, &rdev->flags) ||
+  		    !(test_bit(In_sync, &rdev->flags) ||
+ -		      rdev->recovery_offset >= end_sector))
+ -			goto out_rcu_unlock;
+ +		      rdev->recovery_offset >= end_sector)))
+ +			rdev = NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (r5c_big_stripe_cached(conf, align_bi->bi_iter.bi_sector)) {
+ +		rcu_read_unlock();
+ +		bio_put(align_bi);
+ +		return 0;
+ +	}
+ +
+ +	if (rdev) {
+ +		sector_t first_bad;
+ +		int bad_sectors;
+++=======
++ 	atomic_inc(&rdev->nr_pending);
++ 	rcu_read_unlock();
++ 
++ 	if (is_badblock(rdev, sector, bio_sectors(raid_bio), &first_bad,
++ 			&bad_sectors)) {
++ 		bio_put(raid_bio);
++ 		rdev_dec_pending(rdev, mddev);
++ 		return 0;
++ 	}
++ 
++ 	align_bio = bio_clone_fast(raid_bio, GFP_NOIO, &mddev->bio_set);
++ 	bio_set_dev(align_bio, rdev->bdev);
++ 	align_bio->bi_end_io = raid5_align_endio;
++ 	align_bio->bi_private = raid_bio;
++ 	align_bio->bi_iter.bi_sector = sector;
++ 
++ 	raid_bio->bi_next = (void *)rdev;
++ 
++ 	/* No reshape active, so we can trust rdev->data_offset */
++ 	align_bio->bi_iter.bi_sector += rdev->data_offset;
+++>>>>>>> c82aa1b76787 (md/raid5: move checking badblock before clone bio in raid5_read_one_chunk)
+  
+ -	spin_lock_irq(&conf->device_lock);
+ -	wait_event_lock_irq(conf->wait_for_quiescent, conf->quiesce == 0,
+ -			    conf->device_lock);
+ -	atomic_inc(&conf->active_aligned_reads);
+ -	spin_unlock_irq(&conf->device_lock);
+ +		atomic_inc(&rdev->nr_pending);
+ +		rcu_read_unlock();
+ +		raid_bio->bi_next = (void*)rdev;
+ +		bio_set_dev(align_bi, rdev->bdev);
+ +		bio_clear_flag(align_bi, BIO_SEG_VALID);
+ +
+ +		if (is_badblock(rdev, align_bi->bi_iter.bi_sector,
+ +				bio_sectors(align_bi),
+ +				&first_bad, &bad_sectors)) {
+ +			bio_put(align_bi);
+ +			rdev_dec_pending(rdev, mddev);
+ +			return 0;
+ +		}
+  
+ -	if (mddev->gendisk)
+ -		trace_block_bio_remap(align_bio, disk_devt(mddev->gendisk),
+ -				      raid_bio->bi_iter.bi_sector);
+ -	submit_bio_noacct(align_bio);
+ -	return 1;
+ +		/* No reshape active, so we can trust rdev->data_offset */
+ +		align_bi->bi_iter.bi_sector += rdev->data_offset;
+  
+ -out_rcu_unlock:
+ -	rcu_read_unlock();
+ -	return 0;
+ +		spin_lock_irq(&conf->device_lock);
+ +		wait_event_lock_irq(conf->wait_for_quiescent,
+ +				    conf->quiesce == 0,
+ +				    conf->device_lock);
+ +		atomic_inc(&conf->active_aligned_reads);
+ +		spin_unlock_irq(&conf->device_lock);
+ +
+ +		if (mddev->gendisk)
+ +			trace_block_bio_remap(align_bi->bi_disk->queue,
+ +					      align_bi, disk_devt(mddev->gendisk),
+ +					      raid_bio->bi_iter.bi_sector);
+ +		generic_make_request(align_bi);
+ +		return 1;
+ +	} else {
+ +		rcu_read_unlock();
+ +		bio_put(align_bi);
+ +		return 0;
+ +	}
+  }
+  
+  static struct bio *chunk_aligned_read(struct mddev *mddev, struct bio *raid_bio)
+* Unmerged path drivers/md/raid5.c
