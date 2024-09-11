@@ -1,0 +1,208 @@
+KVM: X86: Move handling of INVPCID types to x86
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Babu Moger <babu.moger@amd.com>
+commit 9715092f8d7eaab2e06a86b67bffc61c20e76f17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9715092f.failed
+
+INVPCID instruction handling is mostly same across both VMX and
+SVM. So, move the code to common x86.c.
+
+	Signed-off-by: Babu Moger <babu.moger@amd.com>
+	Reviewed-by: Jim Mattson <jmattson@google.com>
+Message-Id: <159985255212.11252.10322694343971983487.stgit@bmoger-ubuntu>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 9715092f8d7eaab2e06a86b67bffc61c20e76f17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 360bf7eb8ef7,1d20705193c2..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -5513,68 -5524,7 +5508,72 @@@ static int handle_invpcid(struct kvm_vc
+  				sizeof(operand), &gva))
+  		return 1;
+  
+++<<<<<<< HEAD
+ +	r = kvm_read_guest_virt(vcpu, gva, &operand, sizeof(operand), &e);
+ +	if (r != X86EMUL_CONTINUE)
+ +		return kvm_handle_memory_failure(vcpu, r, &e);
+ +
+ +	if (operand.pcid >> 12 != 0) {
+ +		kvm_inject_gp(vcpu, 0);
+ +		return 1;
+ +	}
+ +
+ +	pcid_enabled = kvm_read_cr4_bits(vcpu, X86_CR4_PCIDE);
+ +
+ +	switch (type) {
+ +	case INVPCID_TYPE_INDIV_ADDR:
+ +		if ((!pcid_enabled && (operand.pcid != 0)) ||
+ +		    is_noncanonical_address(operand.gla, vcpu)) {
+ +			kvm_inject_gp(vcpu, 0);
+ +			return 1;
+ +		}
+ +		kvm_mmu_invpcid_gva(vcpu, operand.gla, operand.pcid);
+ +		return kvm_skip_emulated_instruction(vcpu);
+ +
+ +	case INVPCID_TYPE_SINGLE_CTXT:
+ +		if (!pcid_enabled && (operand.pcid != 0)) {
+ +			kvm_inject_gp(vcpu, 0);
+ +			return 1;
+ +		}
+ +
+ +		if (kvm_get_active_pcid(vcpu) == operand.pcid) {
+ +			kvm_mmu_sync_roots(vcpu);
+ +			kvm_make_request(KVM_REQ_TLB_FLUSH_CURRENT, vcpu);
+ +		}
+ +
+ +		for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
+ +			if (kvm_get_pcid(vcpu, vcpu->arch.mmu->prev_roots[i].pgd)
+ +			    == operand.pcid)
+ +				roots_to_free |= KVM_MMU_ROOT_PREVIOUS(i);
+ +
+ +		kvm_mmu_free_roots(vcpu, vcpu->arch.mmu, roots_to_free);
+ +		/*
+ +		 * If neither the current cr3 nor any of the prev_roots use the
+ +		 * given PCID, then nothing needs to be done here because a
+ +		 * resync will happen anyway before switching to any other CR3.
+ +		 */
+ +
+ +		return kvm_skip_emulated_instruction(vcpu);
+ +
+ +	case INVPCID_TYPE_ALL_NON_GLOBAL:
+ +		/*
+ +		 * Currently, KVM doesn't mark global entries in the shadow
+ +		 * page tables, so a non-global flush just degenerates to a
+ +		 * global flush. If needed, we could optimize this later by
+ +		 * keeping track of global entries in shadow page tables.
+ +		 */
+ +
+ +		/* fall-through */
+ +	case INVPCID_TYPE_ALL_INCL_GLOBAL:
+ +		kvm_mmu_unload(vcpu);
+ +		return kvm_skip_emulated_instruction(vcpu);
+ +
+ +	default:
+ +		BUG(); /* We have already checked above that type <= 3 */
+ +	}
+++=======
++ 	return kvm_handle_invpcid(vcpu, type, gva);
+++>>>>>>> 9715092f8d7e (KVM: X86: Move handling of INVPCID types to x86)
+  }
+  
+  static int handle_pml_full(struct kvm_vcpu *vcpu)
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 677caf08e04e..d9e7afbc14cc 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -70,6 +70,7 @@
+ #include <asm/irq_remapping.h>
+ #include <asm/mshyperv.h>
+ #include <asm/hypervisor.h>
++#include <asm/tlbflush.h>
+ #include <asm/intel_pt.h>
+ #include <clocksource/hyperv_timer.h>
+ #include <asm/emulate_prefix.h>
+@@ -10726,6 +10727,83 @@ int kvm_handle_memory_failure(struct kvm_vcpu *vcpu, int r,
+ }
+ EXPORT_SYMBOL_GPL(kvm_handle_memory_failure);
+ 
++int kvm_handle_invpcid(struct kvm_vcpu *vcpu, unsigned long type, gva_t gva)
++{
++	bool pcid_enabled;
++	struct x86_exception e;
++	unsigned i;
++	unsigned long roots_to_free = 0;
++	struct {
++		u64 pcid;
++		u64 gla;
++	} operand;
++	int r;
++
++	r = kvm_read_guest_virt(vcpu, gva, &operand, sizeof(operand), &e);
++	if (r != X86EMUL_CONTINUE)
++		return kvm_handle_memory_failure(vcpu, r, &e);
++
++	if (operand.pcid >> 12 != 0) {
++		kvm_inject_gp(vcpu, 0);
++		return 1;
++	}
++
++	pcid_enabled = kvm_read_cr4_bits(vcpu, X86_CR4_PCIDE);
++
++	switch (type) {
++	case INVPCID_TYPE_INDIV_ADDR:
++		if ((!pcid_enabled && (operand.pcid != 0)) ||
++		    is_noncanonical_address(operand.gla, vcpu)) {
++			kvm_inject_gp(vcpu, 0);
++			return 1;
++		}
++		kvm_mmu_invpcid_gva(vcpu, operand.gla, operand.pcid);
++		return kvm_skip_emulated_instruction(vcpu);
++
++	case INVPCID_TYPE_SINGLE_CTXT:
++		if (!pcid_enabled && (operand.pcid != 0)) {
++			kvm_inject_gp(vcpu, 0);
++			return 1;
++		}
++
++		if (kvm_get_active_pcid(vcpu) == operand.pcid) {
++			kvm_mmu_sync_roots(vcpu);
++			kvm_make_request(KVM_REQ_TLB_FLUSH_CURRENT, vcpu);
++		}
++
++		for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
++			if (kvm_get_pcid(vcpu, vcpu->arch.mmu->prev_roots[i].pgd)
++			    == operand.pcid)
++				roots_to_free |= KVM_MMU_ROOT_PREVIOUS(i);
++
++		kvm_mmu_free_roots(vcpu, vcpu->arch.mmu, roots_to_free);
++		/*
++		 * If neither the current cr3 nor any of the prev_roots use the
++		 * given PCID, then nothing needs to be done here because a
++		 * resync will happen anyway before switching to any other CR3.
++		 */
++
++		return kvm_skip_emulated_instruction(vcpu);
++
++	case INVPCID_TYPE_ALL_NON_GLOBAL:
++		/*
++		 * Currently, KVM doesn't mark global entries in the shadow
++		 * page tables, so a non-global flush just degenerates to a
++		 * global flush. If needed, we could optimize this later by
++		 * keeping track of global entries in shadow page tables.
++		 */
++
++		fallthrough;
++	case INVPCID_TYPE_ALL_INCL_GLOBAL:
++		kvm_mmu_unload(vcpu);
++		return kvm_skip_emulated_instruction(vcpu);
++
++	default:
++		BUG(); /* We have already checked above that type <= 3 */
++	}
++}
++EXPORT_SYMBOL_GPL(kvm_handle_invpcid);
++
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_exit);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_fast_mmio);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_inj_virq);
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 9d742f062ef2..24f324bcccbd 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -373,6 +373,7 @@ int kvm_spec_ctrl_test_value(u64 value);
+ bool kvm_vcpu_exit_request(struct kvm_vcpu *vcpu);
+ int kvm_handle_memory_failure(struct kvm_vcpu *vcpu, int r,
+ 			      struct x86_exception *e);
++int kvm_handle_invpcid(struct kvm_vcpu *vcpu, unsigned long type, gva_t gva);
+ 
+ #define  KVM_MSR_RET_INVALID  2
+ 
