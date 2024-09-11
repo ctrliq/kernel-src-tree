@@ -1,0 +1,92 @@
+cpufreq: intel_pstate: Fix unchecked MSR 0x773 access
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit 5521055670a53bd495676d1163b40ecb0a37af9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/55210556.failed
+
+It is possible that on some platforms HWP interrupts are disabled. In
+that case accessing MSR 0x773 will result in warning.
+
+So check X86_FEATURE_HWP_NOTIFY feature to access MSR 0x773. The other
+places in code where this MSR is accessed, already checks this feature
+except during disable path called during cpufreq offline and suspend
+callbacks.
+
+Fixes: 57577c996d73 ("cpufreq: intel_pstate: Process HWP Guaranteed change notification")
+	Reported-by: Steven Rostedt <rostedt@goodmis.org>
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Tested-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 5521055670a53bd495676d1163b40ecb0a37af9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index e350c1a5667f,2bb847650b9d..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -1578,8 -1590,53 +1578,58 @@@ void notify_hwp_interrupt(void
+  	if (!(value & 0x01))
+  		return;
+  
+++<<<<<<< HEAD
+ +	cpudata = all_cpu_data[this_cpu];
+ +	schedule_delayed_work_on(this_cpu, &cpudata->hwp_notify_work, msecs_to_jiffies(10));
+++=======
++ 	spin_lock_irqsave(&hwp_notify_lock, flags);
++ 
++ 	if (!cpumask_test_cpu(this_cpu, &hwp_intr_enable_mask))
++ 		goto ack_intr;
++ 
++ 	/*
++ 	 * Currently we never free all_cpu_data. And we can't reach here
++ 	 * without this allocated. But for safety for future changes, added
++ 	 * check.
++ 	 */
++ 	if (unlikely(!READ_ONCE(all_cpu_data)))
++ 		goto ack_intr;
++ 
++ 	/*
++ 	 * The free is done during cleanup, when cpufreq registry is failed.
++ 	 * We wouldn't be here if it fails on init or switch status. But for
++ 	 * future changes, added check.
++ 	 */
++ 	cpudata = READ_ONCE(all_cpu_data[this_cpu]);
++ 	if (unlikely(!cpudata))
++ 		goto ack_intr;
++ 
++ 	schedule_delayed_work(&cpudata->hwp_notify_work, msecs_to_jiffies(10));
++ 
++ 	spin_unlock_irqrestore(&hwp_notify_lock, flags);
++ 
++ 	return;
++ 
++ ack_intr:
++ 	wrmsrl_safe(MSR_HWP_STATUS, 0);
++ 	spin_unlock_irqrestore(&hwp_notify_lock, flags);
++ }
++ 
++ static void intel_pstate_disable_hwp_interrupt(struct cpudata *cpudata)
++ {
++ 	unsigned long flags;
++ 
++ 	if (!boot_cpu_has(X86_FEATURE_HWP_NOTIFY))
++ 		return;
++ 
++ 	/* wrmsrl_on_cpu has to be outside spinlock as this can result in IPC */
++ 	wrmsrl_on_cpu(cpudata->cpu, MSR_HWP_INTERRUPT, 0x00);
++ 
++ 	spin_lock_irqsave(&hwp_notify_lock, flags);
++ 	if (cpumask_test_and_clear_cpu(cpudata->cpu, &hwp_intr_enable_mask))
++ 		cancel_delayed_work(&cpudata->hwp_notify_work);
++ 	spin_unlock_irqrestore(&hwp_notify_lock, flags);
+++>>>>>>> 5521055670a5 (cpufreq: intel_pstate: Fix unchecked MSR 0x773 access)
+  }
+  
+  static void intel_pstate_enable_hwp_interrupt(struct cpudata *cpudata)
+* Unmerged path drivers/cpufreq/intel_pstate.c
