@@ -45,7 +45,7 @@ xfs_dir3_leafn_check(
 	struct xfs_dir2_leaf	*leaf = bp->b_addr;
 	struct xfs_dir3_icleaf_hdr leafhdr;
 
-	dp->d_ops->leaf_hdr_from_disk(&leafhdr, leaf);
+	xfs_dir2_leaf_hdr_from_disk(dp->i_mount, &leafhdr, leaf);
 
 	if (leafhdr.magic == XFS_DIR3_LEAFN_MAGIC) {
 		struct xfs_dir3_leaf_hdr *leaf3 = bp->b_addr;
@@ -439,7 +439,7 @@ xfs_dir2_leafn_add(
 
 	trace_xfs_dir2_leafn_add(args, index);
 
-	dp->d_ops->leaf_hdr_from_disk(&leafhdr, leaf);
+	xfs_dir2_leaf_hdr_from_disk(dp->i_mount, &leafhdr, leaf);
 	ents = dp->d_ops->leaf_ents_p(leaf);
 
 	/*
@@ -535,7 +535,7 @@ xfs_dir2_leaf_lasthash(
 	struct xfs_dir2_leaf_entry *ents;
 	struct xfs_dir3_icleaf_hdr leafhdr;
 
-	dp->d_ops->leaf_hdr_from_disk(&leafhdr, leaf);
+	xfs_dir2_leaf_hdr_from_disk(dp->i_mount, &leafhdr, leaf);
 
 	ASSERT(leafhdr.magic == XFS_DIR2_LEAFN_MAGIC ||
 	       leafhdr.magic == XFS_DIR3_LEAFN_MAGIC ||
@@ -584,7 +584,7 @@ xfs_dir2_leafn_lookup_for_addname(
 	tp = args->trans;
 	mp = dp->i_mount;
 	leaf = bp->b_addr;
-	dp->d_ops->leaf_hdr_from_disk(&leafhdr, leaf);
+	xfs_dir2_leaf_hdr_from_disk(mp, &leafhdr, leaf);
 	ents = dp->d_ops->leaf_ents_p(leaf);
 
 	xfs_dir3_leaf_check(dp, bp);
@@ -736,7 +736,7 @@ xfs_dir2_leafn_lookup_for_entry(
 	tp = args->trans;
 	mp = dp->i_mount;
 	leaf = bp->b_addr;
-	dp->d_ops->leaf_hdr_from_disk(&leafhdr, leaf);
+	xfs_dir2_leaf_hdr_from_disk(mp, &leafhdr, leaf);
 	ents = dp->d_ops->leaf_ents_p(leaf);
 
 	xfs_dir3_leaf_check(dp, bp);
@@ -972,8 +972,8 @@ xfs_dir2_leafn_order(
 	struct xfs_dir3_icleaf_hdr hdr1;
 	struct xfs_dir3_icleaf_hdr hdr2;
 
-	dp->d_ops->leaf_hdr_from_disk(&hdr1, leaf1);
-	dp->d_ops->leaf_hdr_from_disk(&hdr2, leaf2);
+	xfs_dir2_leaf_hdr_from_disk(dp->i_mount, &hdr1, leaf1);
+	xfs_dir2_leaf_hdr_from_disk(dp->i_mount, &hdr2, leaf2);
 	ents1 = dp->d_ops->leaf_ents_p(leaf1);
 	ents2 = dp->d_ops->leaf_ents_p(leaf2);
 
@@ -1025,8 +1025,8 @@ xfs_dir2_leafn_rebalance(
 
 	leaf1 = blk1->bp->b_addr;
 	leaf2 = blk2->bp->b_addr;
-	dp->d_ops->leaf_hdr_from_disk(&hdr1, leaf1);
-	dp->d_ops->leaf_hdr_from_disk(&hdr2, leaf2);
+	xfs_dir2_leaf_hdr_from_disk(dp->i_mount, &hdr1, leaf1);
+	xfs_dir2_leaf_hdr_from_disk(dp->i_mount, &hdr2, leaf2);
 	ents1 = dp->d_ops->leaf_ents_p(leaf1);
 	ents2 = dp->d_ops->leaf_ents_p(leaf2);
 
@@ -1223,7 +1223,7 @@ xfs_dir2_leafn_remove(
 	dp = args->dp;
 	tp = args->trans;
 	leaf = bp->b_addr;
-	dp->d_ops->leaf_hdr_from_disk(&leafhdr, leaf);
+	xfs_dir2_leaf_hdr_from_disk(dp->i_mount, &leafhdr, leaf);
 	ents = dp->d_ops->leaf_ents_p(leaf);
 
 	/*
@@ -1445,7 +1445,7 @@ xfs_dir2_leafn_toosmall(
 	 */
 	blk = &state->path.blk[state->path.active - 1];
 	leaf = blk->bp->b_addr;
-	dp->d_ops->leaf_hdr_from_disk(&leafhdr, leaf);
+	xfs_dir2_leaf_hdr_from_disk(dp->i_mount, &leafhdr, leaf);
 	ents = dp->d_ops->leaf_ents_p(leaf);
 	xfs_dir3_leaf_check(dp, blk->bp);
 
@@ -1508,7 +1508,7 @@ xfs_dir2_leafn_toosmall(
 			(state->args->geo->blksize >> 2);
 
 		leaf = bp->b_addr;
-		dp->d_ops->leaf_hdr_from_disk(&hdr2, leaf);
+		xfs_dir2_leaf_hdr_from_disk(dp->i_mount, &hdr2, leaf);
 		ents = dp->d_ops->leaf_ents_p(leaf);
 		count += hdr2.count - hdr2.stale;
 		bytes -= count * sizeof(ents[0]);
@@ -1571,8 +1571,8 @@ xfs_dir2_leafn_unbalance(
 	drop_leaf = drop_blk->bp->b_addr;
 	save_leaf = save_blk->bp->b_addr;
 
-	dp->d_ops->leaf_hdr_from_disk(&savehdr, save_leaf);
-	dp->d_ops->leaf_hdr_from_disk(&drophdr, drop_leaf);
+	xfs_dir2_leaf_hdr_from_disk(dp->i_mount, &savehdr, save_leaf);
+	xfs_dir2_leaf_hdr_from_disk(dp->i_mount, &drophdr, drop_leaf);
 	sents = dp->d_ops->leaf_ents_p(save_leaf);
 	dents = dp->d_ops->leaf_ents_p(drop_leaf);
 
