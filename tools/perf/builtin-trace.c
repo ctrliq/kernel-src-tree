@@ -3680,7 +3680,7 @@ static int trace__set_filter_pids(struct trace *trace)
 	 * Better not use !target__has_task() here because we need to cover the
 	 * case where no threads were specified in the command line, but a
 	 * workload was, and in that case we will fill in the thread_map when
-	 * we fork the workload in perf_evlist__prepare_workload.
+	 * we fork the workload in evlist__prepare_workload.
 	 */
 	if (trace->filter_pids.nr > 0) {
 		err = perf_evlist__append_tp_filter_pids(trace->evlist, trace->filter_pids.nr,
@@ -3966,8 +3966,7 @@ static int trace__run(struct trace *trace, int argc, const char **argv)
 	perf_evlist__config(evlist, &trace->opts, &callchain_param);
 
 	if (forks) {
-		err = perf_evlist__prepare_workload(evlist, &trace->opts.target,
-						    argv, false, NULL);
+		err = evlist__prepare_workload(evlist, &trace->opts.target, argv, false, NULL);
 		if (err < 0) {
 			fprintf(trace->output, "Couldn't run the workload!\n");
 			goto out_delete_evlist;
@@ -4040,7 +4039,7 @@ static int trace__run(struct trace *trace, int argc, const char **argv)
 		evlist__enable(evlist);
 
 	if (forks)
-		perf_evlist__start_workload(evlist);
+		evlist__start_workload(evlist);
 
 	if (trace->opts.initial_delay) {
 		usleep(trace->opts.initial_delay * 1000);
