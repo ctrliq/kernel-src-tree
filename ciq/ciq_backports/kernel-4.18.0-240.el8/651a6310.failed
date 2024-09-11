@@ -1,0 +1,148 @@
+KVM: PPC: Book3S HV: Track the state GFNs associated with secure VMs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ram Pai <linuxram@us.ibm.com>
+commit 651a6310111ef8e09394e77d6d959ab3d066930d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/651a6310.failed
+
+During the life of SVM, its GFNs transition through normal, secure and
+shared states. Since the kernel does not track GFNs that are shared, it
+is not possible to disambiguate a shared GFN from a GFN whose PFN has
+not yet been migrated to a secure-PFN. Also it is not possible to
+disambiguate a secure-GFN from a GFN whose GFN has been pagedout from
+the ultravisor.
+
+The ability to identify the state of a GFN is needed to skip migration
+of its PFN to secure-PFN during ESM transition.
+
+The code is re-organized to track the states of a GFN as explained
+below.
+
+************************************************************************
+ 1. States of a GFN
+    ---------------
+ The GFN can be in one of the following states.
+
+ (a) Secure - The GFN is secure. The GFN is associated with
+ 	a Secure VM, the contents of the GFN is not accessible
+ 	to the Hypervisor.  This GFN can be backed by a secure-PFN,
+ 	or can be backed by a normal-PFN with contents encrypted.
+ 	The former is true when the GFN is paged-in into the
+ 	ultravisor. The latter is true when the GFN is paged-out
+ 	of the ultravisor.
+
+ (b) Shared - The GFN is shared. The GFN is associated with a
+ 	a secure VM. The contents of the GFN is accessible to
+ 	Hypervisor. This GFN is backed by a normal-PFN and its
+ 	content is un-encrypted.
+
+ (c) Normal - The GFN is a normal. The GFN is associated with
+ 	a normal VM. The contents of the GFN is accesible to
+ 	the Hypervisor. Its content is never encrypted.
+
+ 2. States of a VM.
+    ---------------
+
+ (a) Normal VM:  A VM whose contents are always accessible to
+ 	the hypervisor.  All its GFNs are normal-GFNs.
+
+ (b) Secure VM: A VM whose contents are not accessible to the
+ 	hypervisor without the VM's consent.  Its GFNs are
+ 	either Shared-GFN or Secure-GFNs.
+
+ (c) Transient VM: A Normal VM that is transitioning to secure VM.
+ 	The transition starts on successful return of
+ 	H_SVM_INIT_START, and ends on successful return
+ 	of H_SVM_INIT_DONE. This transient VM, can have GFNs
+ 	in any of the three states; i.e Secure-GFN, Shared-GFN,
+ 	and Normal-GFN.	The VM never executes in this state
+ 	in supervisor-mode.
+
+ 3. Memory slot State.
+    ------------------
+  	The state of a memory slot mirrors the state of the
+  	VM the memory slot is associated with.
+
+ 4. VM State transition.
+    --------------------
+
+  A VM always starts in Normal Mode.
+
+  H_SVM_INIT_START moves the VM into transient state. During this
+  time the Ultravisor may request some of its GFNs to be shared or
+  secured. So its GFNs can be in one of the three GFN states.
+
+  H_SVM_INIT_DONE moves the VM entirely from transient state to
+  secure-state. At this point any left-over normal-GFNs are
+  transitioned to Secure-GFN.
+
+  H_SVM_INIT_ABORT moves the transient VM back to normal VM.
+  All its GFNs are moved to Normal-GFNs.
+
+  UV_TERMINATE transitions the secure-VM back to normal-VM. All
+  the secure-GFN and shared-GFNs are tranistioned to normal-GFN
+  Note: The contents of the normal-GFN is undefined at this point.
+
+ 5. GFN state implementation:
+    -------------------------
+
+ Secure GFN is associated with a secure-PFN; also called uvmem_pfn,
+ when the GFN is paged-in. Its pfn[] has KVMPPC_GFN_UVMEM_PFN flag
+ set, and contains the value of the secure-PFN.
+ It is associated with a normal-PFN; also called mem_pfn, when
+ the GFN is pagedout. Its pfn[] has KVMPPC_GFN_MEM_PFN flag set.
+ The value of the normal-PFN is not tracked.
+
+ Shared GFN is associated with a normal-PFN. Its pfn[] has
+ KVMPPC_UVMEM_SHARED_PFN flag set. The value of the normal-PFN
+ is not tracked.
+
+ Normal GFN is associated with normal-PFN. Its pfn[] has
+ no flag set. The value of the normal-PFN is not tracked.
+
+ 6. Life cycle of a GFN
+    --------------------
+ --------------------------------------------------------------
+ |        |     Share  |  Unshare | SVM       |H_SVM_INIT_DONE|
+ |        |operation   |operation | abort/    |               |
+ |        |            |          | terminate |               |
+ -------------------------------------------------------------
+ |        |            |          |           |               |
+ | Secure |     Shared | Secure   |Normal     |Secure         |
+ |        |            |          |           |               |
+ | Shared |     Shared | Secure   |Normal     |Shared         |
+ |        |            |          |           |               |
+ | Normal |     Shared | Secure   |Normal     |Secure         |
+ --------------------------------------------------------------
+
+ 7. Life cycle of a VM
+    --------------------
+ --------------------------------------------------------------------
+ |         |  start    |  H_SVM_  |H_SVM_   |H_SVM_     |UV_SVM_    |
+ |         |  VM       |INIT_START|INIT_DONE|INIT_ABORT |TERMINATE  |
+ |         |           |          |         |           |           |
+ --------- ----------------------------------------------------------
+ |         |           |          |         |           |           |
+ | Normal  | Normal    | Transient|Error    |Error      |Normal     |
+ |         |           |          |         |           |           |
+ | Secure  |   Error   | Error    |Error    |Error      |Normal     |
+ |         |           |          |         |           |           |
+ |Transient|   N/A     | Error    |Secure   |Normal     |Normal     |
+ --------------------------------------------------------------------
+
+************************************************************************
+
+	Reviewed-by: Bharata B Rao <bharata@linux.ibm.com>
+	Reviewed-by: Thiago Jung Bauermann <bauerman@linux.ibm.com>
+	Signed-off-by: Ram Pai <linuxram@us.ibm.com>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 651a6310111ef8e09394e77d6d959ab3d066930d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_uvmem.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_uvmem.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_uvmem.c
