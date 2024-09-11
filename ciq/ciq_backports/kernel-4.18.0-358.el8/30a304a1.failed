@@ -1,0 +1,161 @@
+x86/fpu: Mask PKRU from kernel XRSTOR[S] operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+Rebuild_CHGLOG: - x86/fpu: Mask PKRU from kernel XRSTOR[S] operations (Prarit Bhargava) [1981448]
+Rebuild_FUZZ: 95.92%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 30a304a138738d71a09c730ca8044e9662de0dbf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/30a304a1.failed
+
+As the PKRU state is managed separately restoring it from the xstate
+buffer would be counterproductive as it might either restore a stale
+value or reinit the PKRU state to 0.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121456.606745195@linutronix.de
+(cherry picked from commit 30a304a138738d71a09c730ca8044e9662de0dbf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/internal.h
+#	arch/x86/include/asm/fpu/xstate.h
+#	arch/x86/mm/extable.c
+diff --cc arch/x86/include/asm/fpu/internal.h
+index 5a42546d89cb,2a484f5f2413..000000000000
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@@ -260,9 -257,9 +260,9 @@@ static inline void fxsave(struct fxregs
+   * This function is called only during boot time when x86 caps are not set
+   * up and alternative can not be used yet.
+   */
+ -static inline void os_xrstor_booting(struct xregs_state *xstate)
+ +static inline void copy_kernel_to_xregs_booting(struct xregs_state *xstate)
+  {
+- 	u64 mask = -1;
++ 	u64 mask = xfeatures_mask_fpstate();
+  	u32 lmask = mask;
+  	u32 hmask = mask >> 32;
+  	int err;
+@@@ -377,36 -384,11 +377,40 @@@ static inline int copy_kernel_to_xregs_
+  	return err;
+  }
+  
+ -extern void __restore_fpregs_from_fpstate(union fpregs_state *fpstate, u64 mask);
+ +extern int save_fpregs_to_fpstate(struct fpu *fpu);
+ +
+ +static inline void __copy_kernel_to_fpregs(union fpregs_state *fpstate, u64 mask)
+ +{
+++<<<<<<< HEAD
+ +	if (use_xsave()) {
+ +		copy_kernel_to_xregs(&fpstate->xsave, mask);
+ +	} else {
+ +		if (use_fxsr())
+ +			copy_kernel_to_fxregs(&fpstate->fxsave);
+ +		else
+ +			frstor(&fpstate->fsave);
+ +	}
+ +}
+  
+ -static inline void restore_fpregs_from_fpstate(union fpregs_state *fpstate)
+ +static inline void copy_kernel_to_fpregs(union fpregs_state *fpstate)
+  {
+ +	/*
+ +	 * AMD K7/K8 CPUs don't save/restore FDP/FIP/FOP unless an exception is
+ +	 * pending. Clear the x87 state here by setting it to fixed values.
+ +	 * "m" is a random variable that should be in L1.
+ +	 */
+ +	if (unlikely(static_cpu_has_bug(X86_BUG_FXSAVE_LEAK))) {
+ +		asm volatile(
+ +			"fnclex\n\t"
+ +			"emms\n\t"
+ +			"fildl %P[addr]"	/* set F?P to defined value */
+ +			: : [addr] "m" (fpstate));
+ +	}
+ +
+ +	__copy_kernel_to_fpregs(fpstate, -1);
+++=======
++ 	__restore_fpregs_from_fpstate(fpstate, xfeatures_mask_fpstate());
+++>>>>>>> 30a304a13873 (x86/fpu: Mask PKRU from kernel XRSTOR[S] operations)
+  }
+  
+  extern int copy_fpstate_to_sigframe(void __user *buf, void __user *fp, int size);
+diff --cc arch/x86/include/asm/fpu/xstate.h
+index 1a0fecae6ef8,109dfcc75299..000000000000
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@@ -88,12 -100,33 +88,37 @@@ static inline u64 xfeatures_mask_user(v
+  	return xfeatures_mask_all & XFEATURE_MASK_USER_SUPPORTED;
+  }
+  
+++<<<<<<< HEAD
+ +static inline u64 xfeatures_mask_dynamic(void)
+++=======
++ /*
++  * The xfeatures which are restored by the kernel when returning to user
++  * mode. This is not necessarily the same as xfeatures_mask_uabi() as the
++  * kernel does not manage all XCR0 enabled features via xsave/xrstor as
++  * some of them have to be switched eagerly on context switch and exec().
++  */
++ static inline u64 xfeatures_mask_restore_user(void)
++ {
++ 	return xfeatures_mask_all & XFEATURE_MASK_USER_RESTORE;
++ }
++ 
++ /*
++  * Like xfeatures_mask_restore_user() but additionally restors the
++  * supported supervisor states.
++  */
++ static inline u64 xfeatures_mask_fpstate(void)
++ {
++ 	return xfeatures_mask_all & \
++ 		(XFEATURE_MASK_USER_RESTORE | XFEATURE_MASK_SUPERVISOR_SUPPORTED);
++ }
++ 
++ static inline u64 xfeatures_mask_independent(void)
+++>>>>>>> 30a304a13873 (x86/fpu: Mask PKRU from kernel XRSTOR[S] operations)
+  {
+  	if (!boot_cpu_has(X86_FEATURE_ARCH_LBR))
+ -		return XFEATURE_MASK_INDEPENDENT & ~XFEATURE_MASK_LBR;
+ +		return XFEATURE_MASK_DYNAMIC & ~XFEATURE_MASK_LBR;
+  
+ -	return XFEATURE_MASK_INDEPENDENT;
+ +	return XFEATURE_MASK_DYNAMIC;
+  }
+  
+  extern u64 xstate_fx_sw_bytes[USER_XSTATE_FX_SW_WORDS];
+diff --cc arch/x86/mm/extable.c
+index 034f9e2c889e,e1664e9f969c..000000000000
+--- a/arch/x86/mm/extable.c
++++ b/arch/x86/mm/extable.c
+@@@ -104,7 -65,7 +104,11 @@@ __visible bool ex_handler_fprestore(con
+  	WARN_ONCE(1, "Bad FPU state detected at %pB, reinitializing FPU registers.",
+  		  (void *)instruction_pointer(regs));
+  
+++<<<<<<< HEAD
+ +	__copy_kernel_to_fpregs(&init_fpstate, -1);
+++=======
++ 	__restore_fpregs_from_fpstate(&init_fpstate, xfeatures_mask_fpstate());
+++>>>>>>> 30a304a13873 (x86/fpu: Mask PKRU from kernel XRSTOR[S] operations)
+  	return true;
+  }
+  EXPORT_SYMBOL_GPL(ex_handler_fprestore);
+* Unmerged path arch/x86/include/asm/fpu/internal.h
+* Unmerged path arch/x86/include/asm/fpu/xstate.h
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index 4641d3145e59..bf01e192c93c 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -57,6 +57,7 @@ static short xsave_cpuid_features[] __initdata = {
+  * XSAVE buffer, both supervisor and user xstates.
+  */
+ u64 xfeatures_mask_all __ro_after_init;
++EXPORT_SYMBOL_GPL(xfeatures_mask_all);
+ 
+ static unsigned int xstate_offsets[XFEATURE_MAX] __ro_after_init =
+ 	{ [ 0 ... XFEATURE_MAX - 1] = -1};
+* Unmerged path arch/x86/mm/extable.c
