@@ -1,0 +1,134 @@
+net/sched: act_police: disallow 'goto chain' on fallback control action
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+Rebuild_CHGLOG: - [net] sched: act_police: disallow 'goto chain' on fallback control action (Ivan Vecera) [1638022]
+Rebuild_FUZZ: 97.10%
+commit-author Davide Caratti <dcaratti@redhat.com>
+commit c08f5ed5d625926f38552b734b587a28e947b55c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/c08f5ed5.failed
+
+in the following command:
+
+ # tc action add action police rate <r> burst <b> conform-exceed <c1>/<c2>
+
+'goto chain x' is allowed only for c1: setting it for c2 makes the kernel
+crash with NULL pointer dereference, since TC core doesn't initialize the
+chain handle.
+
+	Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+	Acked-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c08f5ed5d625926f38552b734b587a28e947b55c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_police.c
+diff --cc net/sched/act_police.c
+index 0b82775575a6,052855d47354..000000000000
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@@ -146,50 -157,68 +146,78 @@@ static int tcf_police_init(struct net *
+  		goto failure;
+  	}
+  
+ -	new = kzalloc(sizeof(*new), GFP_KERNEL);
+ -	if (unlikely(!new)) {
+ -		err = -ENOMEM;
+ -		goto failure;
+ -	}
+ -
+ +	spin_lock_bh(&police->tcf_lock);
+  	/* No failure allowed after this point */
+ -	new->tcfp_mtu = parm->mtu;
+ -	if (!new->tcfp_mtu) {
+ -		new->tcfp_mtu = ~0;
+ +	police->tcfp_mtu = parm->mtu;
+ +	if (police->tcfp_mtu == 0) {
+ +		police->tcfp_mtu = ~0;
+  		if (R_tab)
+ -			new->tcfp_mtu = 255 << R_tab->rate.cell_log;
+ +			police->tcfp_mtu = 255 << R_tab->rate.cell_log;
+  	}
+  	if (R_tab) {
+ -		new->rate_present = true;
+ -		psched_ratecfg_precompute(&new->rate, &R_tab->rate, 0);
+ +		police->rate_present = true;
+ +		psched_ratecfg_precompute(&police->rate, &R_tab->rate, 0);
+  		qdisc_put_rtab(R_tab);
+  	} else {
+ -		new->rate_present = false;
+ +		police->rate_present = false;
+  	}
+  	if (P_tab) {
+ -		new->peak_present = true;
+ -		psched_ratecfg_precompute(&new->peak, &P_tab->rate, 0);
+ +		police->peak_present = true;
+ +		psched_ratecfg_precompute(&police->peak, &P_tab->rate, 0);
+  		qdisc_put_rtab(P_tab);
+  	} else {
+ -		new->peak_present = false;
+ +		police->peak_present = false;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (tb[TCA_POLICE_RESULT])
+ +		police->tcfp_result = nla_get_u32(tb[TCA_POLICE_RESULT]);
+ +	police->tcfp_burst = PSCHED_TICKS2NS(parm->burst);
+ +	police->tcfp_toks = police->tcfp_burst;
+ +	if (police->peak_present) {
+ +		police->tcfp_mtu_ptoks = (s64) psched_l2t_ns(&police->peak,
+ +							     police->tcfp_mtu);
+ +		police->tcfp_ptoks = police->tcfp_mtu_ptoks;
+++=======
++ 	new->tcfp_burst = PSCHED_TICKS2NS(parm->burst);
++ 	new->tcfp_toks = new->tcfp_burst;
++ 	if (new->peak_present) {
++ 		new->tcfp_mtu_ptoks = (s64)psched_l2t_ns(&new->peak,
++ 							 new->tcfp_mtu);
++ 		new->tcfp_ptoks = new->tcfp_mtu_ptoks;
+++>>>>>>> c08f5ed5d625 (net/sched: act_police: disallow 'goto chain' on fallback control action)
+  	}
+ +	police->tcf_action = parm->action;
+  
+  	if (tb[TCA_POLICE_AVRATE])
+ -		new->tcfp_ewma_rate = nla_get_u32(tb[TCA_POLICE_AVRATE]);
+ +		police->tcfp_ewma_rate = nla_get_u32(tb[TCA_POLICE_AVRATE]);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (tb[TCA_POLICE_RESULT]) {
++ 		new->tcfp_result = nla_get_u32(tb[TCA_POLICE_RESULT]);
++ 		if (TC_ACT_EXT_CMP(new->tcfp_result, TC_ACT_GOTO_CHAIN)) {
++ 			NL_SET_ERR_MSG(extack,
++ 				       "goto chain not allowed on fallback");
++ 			err = -EINVAL;
++ 			goto failure;
++ 		}
++ 	}
++ 
++ 	spin_lock_bh(&police->tcf_lock);
++ 	new->tcfp_t_c = ktime_get_ns();
++ 	police->tcf_action = parm->action;
++ 	rcu_swap_protected(police->params,
++ 			   new,
++ 			   lockdep_is_held(&police->tcf_lock));
+++>>>>>>> c08f5ed5d625 (net/sched: act_police: disallow 'goto chain' on fallback control action)
+  	spin_unlock_bh(&police->tcf_lock);
+ +	if (ret != ACT_P_CREATED)
+ +		return ret;
+  
+ -	if (new)
+ -		kfree_rcu(new, rcu);
+ +	police->tcfp_t_c = ktime_get_ns();
+ +	tcf_idr_insert(tn, *a);
+  
+ -	if (ret == ACT_P_CREATED)
+ -		tcf_idr_insert(tn, *a);
+  	return ret;
+  
+  failure:
+* Unmerged path net/sched/act_police.c
