@@ -1,0 +1,149 @@
+net/mlx5e: Eswitch, use state_lock to synchronize vlan change
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5e: Eswitch, use state_lock to synchronize vlan change (Alaa Hleihel) [1663231 1724327 1724336]
+Rebuild_FUZZ: 96.61%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 0e18134f4f9f1e5c75b63b84d250b116c76d5116
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/0e18134f.failed
+
+esw->state_lock is already used to protect vlan vport configuration change.
+However, all preparation and correctness checks, and code that sets vport
+data are not protected by this lock and assume external synchronization by
+rtnl lock. In order to remove dependency on rtnl lock, extend
+esw->state_lock protection to whole eswitch vlan add/del functions.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Jianbo Liu <jianbol@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 0e18134f4f9f1e5c75b63b84d250b116c76d5116)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index f4a0b22e3987,7a0888470fae..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -2003,22 -2081,21 +2003,25 @@@ int __mlx5_eswitch_set_vport_vlan(struc
+  
+  	if (!ESW_ALLOWED(esw))
+  		return -EPERM;
+ -	if (IS_ERR(evport))
+ -		return PTR_ERR(evport);
+ -	if (vlan > 4095 || qos > 7)
+ +	if (!LEGAL_VPORT(esw, vport) || (vlan > 4095) || (qos > 7))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&esw->state_lock);
+ +	evport = &esw->vports[vport];
+ +
+++=======
+++>>>>>>> 0e18134f4f9f (net/mlx5e: Eswitch, use state_lock to synchronize vlan change)
+  	err = modify_esw_vport_cvlan(esw->dev, vport, vlan, qos, set_flags);
+  	if (err)
+- 		goto unlock;
++ 		return err;
+  
+  	evport->info.vlan = vlan;
+  	evport->info.qos = qos;
+ -	if (evport->enabled && esw->mode == MLX5_ESWITCH_LEGACY) {
+ +	if (evport->enabled && esw->mode == SRIOV_LEGACY) {
+  		err = esw_vport_ingress_config(esw, evport);
+  		if (err)
+- 			goto unlock;
++ 			return err;
+  		err = esw_vport_egress_config(esw, evport);
+  	}
+  
+@@@ -2028,9 -2103,10 +2029,10 @@@
+  }
+  
+  int mlx5_eswitch_set_vport_vlan(struct mlx5_eswitch *esw,
+ -				u16 vport, u16 vlan, u8 qos)
+ +				int vport, u16 vlan, u8 qos)
+  {
+  	u8 set_flags = 0;
++ 	int err;
+  
+  	if (vlan || qos)
+  		set_flags = SET_VLAN_STRIP | SET_VLAN_INSERT;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 2a02050a09e7..b27b9380c68a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -400,9 +400,11 @@ int mlx5_eswitch_add_vlan_action(struct mlx5_eswitch *esw,
+ 	fwd  = !!((attr->action & MLX5_FLOW_CONTEXT_ACTION_FWD_DEST) &&
+ 		   !attr->dest_chain);
+ 
++	mutex_lock(&esw->state_lock);
++
+ 	err = esw_add_vlan_action_check(attr, push, pop, fwd);
+ 	if (err)
+-		return err;
++		goto unlock;
+ 
+ 	attr->vlan_handled = false;
+ 
+@@ -415,11 +417,11 @@ int mlx5_eswitch_add_vlan_action(struct mlx5_eswitch *esw,
+ 			attr->vlan_handled = true;
+ 		}
+ 
+-		return 0;
++		goto unlock;
+ 	}
+ 
+ 	if (!push && !pop)
+-		return 0;
++		goto unlock;
+ 
+ 	if (!(offloads->vlan_push_pop_refcount)) {
+ 		/* it's the 1st vlan rule, apply global vlan pop policy */
+@@ -444,6 +446,8 @@ int mlx5_eswitch_add_vlan_action(struct mlx5_eswitch *esw,
+ out:
+ 	if (!err)
+ 		attr->vlan_handled = true;
++unlock:
++	mutex_unlock(&esw->state_lock);
+ 	return err;
+ }
+ 
+@@ -466,6 +470,8 @@ int mlx5_eswitch_del_vlan_action(struct mlx5_eswitch *esw,
+ 	pop  = !!(attr->action & MLX5_FLOW_CONTEXT_ACTION_VLAN_POP);
+ 	fwd  = !!(attr->action & MLX5_FLOW_CONTEXT_ACTION_FWD_DEST);
+ 
++	mutex_lock(&esw->state_lock);
++
+ 	vport = esw_vlan_action_get_vport(attr, push, pop);
+ 
+ 	if (!push && !pop && fwd) {
+@@ -473,7 +479,7 @@ int mlx5_eswitch_del_vlan_action(struct mlx5_eswitch *esw,
+ 		if (attr->dests[0].rep->vport == FDB_UPLINK_VPORT)
+ 			vport->vlan_refcount--;
+ 
+-		return 0;
++		goto out;
+ 	}
+ 
+ 	if (push) {
+@@ -491,12 +497,13 @@ int mlx5_eswitch_del_vlan_action(struct mlx5_eswitch *esw,
+ skip_unset_push:
+ 	offloads->vlan_push_pop_refcount--;
+ 	if (offloads->vlan_push_pop_refcount)
+-		return 0;
++		goto out;
+ 
+ 	/* no more vlan rules, stop global vlan pop policy */
+ 	err = esw_set_global_vlan_pop(esw, 0);
+ 
+ out:
++	mutex_unlock(&esw->state_lock);
+ 	return err;
+ }
+ 
