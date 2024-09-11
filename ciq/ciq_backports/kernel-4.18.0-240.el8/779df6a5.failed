@@ -1,0 +1,339 @@
+NFS: Ensure security label is set for root inode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Scott Mayhew <smayhew@redhat.com>
+commit 779df6a5480f1307d51b66ea72352be592265cad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/779df6a5.failed
+
+When using NFSv4.2, the security label for the root inode should be set
+via a call to nfs_setsecurity() during the mount process, otherwise the
+inode will appear as unlabeled for up to acdirmin seconds.  Currently
+the label for the root inode is allocated, retrieved, and freed entirely
+witin nfs4_proc_get_root().
+
+Add a field for the label to the nfs_fattr struct, and allocate & free
+the label in nfs_get_root(), where we also add a call to
+nfs_setsecurity().  Note that for the call to nfs_setsecurity() to
+succeed, it's necessary to also move the logic calling
+security_sb_{set,clone}_security() from nfs_get_tree_common() down into
+nfs_get_root()... otherwise the SBLABEL_MNT flag will not be set in the
+super_block's security flags and nfs_setsecurity() will silently fail.
+
+	Reported-by: Richard Haines <richard_c_haines@btinternet.com>
+	Signed-off-by: Scott Mayhew <smayhew@redhat.com>
+	Acked-by: Stephen Smalley <sds@tycho.nsa.gov>
+	Tested-by: Stephen Smalley <sds@tycho.nsa.gov>
+[PM: fixed 80-char line width problems]
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 779df6a5480f1307d51b66ea72352be592265cad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/getroot.c
+#	fs/nfs/super.c
+diff --cc fs/nfs/getroot.c
+index 391dafaf9182,aaeeb4659bff..000000000000
+--- a/fs/nfs/getroot.c
++++ b/fs/nfs/getroot.c
+@@@ -68,66 -64,102 +68,140 @@@ static int nfs_superblock_set_dummy_roo
+  /*
+   * get an NFS2/NFS3 root dentry from the root filehandle
+   */
+ -int nfs_get_root(struct super_block *s, struct fs_context *fc)
+ +struct dentry *nfs_get_root(struct super_block *sb, struct nfs_fh *mntfh,
+ +			    const char *devname)
+  {
+ -	struct nfs_fs_context *ctx = nfs_fc2context(fc);
+ -	struct nfs_server *server = NFS_SB(s);
+ +	struct nfs_server *server = NFS_SB(sb);
+  	struct nfs_fsinfo fsinfo;
+ -	struct dentry *root;
+ +	struct dentry *ret;
+  	struct inode *inode;
+++<<<<<<< HEAD
+ +	void *name = kstrdup(devname, GFP_KERNEL);
+ +	int error;
+++=======
++ 	char *name;
++ 	int error = -ENOMEM;
++ 	unsigned long kflags = 0, kflags_out = 0;
+++>>>>>>> 779df6a5480f (NFS: Ensure security label is set for root inode)
+  
+ -	name = kstrdup(fc->source, GFP_KERNEL);
+  	if (!name)
+ -		goto out;
+ +		return ERR_PTR(-ENOMEM);
+  
+  	/* get the actual root for this mount */
+  	fsinfo.fattr = nfs_alloc_fattr();
+ -	if (fsinfo.fattr == NULL)
+ -		goto out_name;
+ +	if (fsinfo.fattr == NULL) {
+ +		kfree(name);
+ +		return ERR_PTR(-ENOMEM);
+ +	}
+  
+++<<<<<<< HEAD
+ +	error = server->nfs_client->rpc_ops->getroot(server, mntfh, &fsinfo);
+ +	if (error < 0) {
+ +		dprintk("nfs_get_root: getattr error = %d\n", -error);
+ +		ret = ERR_PTR(error);
+ +		goto out;
+++=======
++ 	fsinfo.fattr->label = nfs4_label_alloc(server, GFP_KERNEL);
++ 	if (IS_ERR(fsinfo.fattr->label))
++ 		goto out_fattr;
++ 	error = server->nfs_client->rpc_ops->getroot(server, ctx->mntfh, &fsinfo);
++ 	if (error < 0) {
++ 		dprintk("nfs_get_root: getattr error = %d\n", -error);
++ 		nfs_errorf(fc, "NFS: Couldn't getattr on root");
++ 		goto out_label;
+++>>>>>>> 779df6a5480f (NFS: Ensure security label is set for root inode)
+  	}
+  
+ -	inode = nfs_fhget(s, ctx->mntfh, fsinfo.fattr, NULL);
+ +	inode = nfs_fhget(sb, mntfh, fsinfo.fattr, NULL);
+  	if (IS_ERR(inode)) {
+  		dprintk("nfs_get_root: get root inode failed\n");
+++<<<<<<< HEAD
+ +		ret = ERR_CAST(inode);
+ +		goto out;
+ +	}
+ +
+ +	error = nfs_superblock_set_dummy_root(sb, inode);
+ +	if (error != 0) {
+ +		ret = ERR_PTR(error);
+ +		goto out;
+ +	}
+++=======
++ 		error = PTR_ERR(inode);
++ 		nfs_errorf(fc, "NFS: Couldn't get root inode");
++ 		goto out_label;
++ 	}
++ 
++ 	error = nfs_superblock_set_dummy_root(s, inode);
++ 	if (error != 0)
++ 		goto out_label;
+++>>>>>>> 779df6a5480f (NFS: Ensure security label is set for root inode)
+  
+  	/* root dentries normally start off anonymous and get spliced in later
+  	 * if the dentry tree reaches them; however if the dentry already
+  	 * exists, we'll pick it up at this point and use it as the root
+  	 */
+ -	root = d_obtain_root(inode);
+ -	if (IS_ERR(root)) {
+ +	ret = d_obtain_root(inode);
+ +	if (IS_ERR(ret)) {
+  		dprintk("nfs_get_root: get root dentry failed\n");
+++<<<<<<< HEAD
+ +		goto out;
+++=======
++ 		error = PTR_ERR(root);
++ 		nfs_errorf(fc, "NFS: Couldn't get root dentry");
++ 		goto out_label;
+++>>>>>>> 779df6a5480f (NFS: Ensure security label is set for root inode)
+  	}
+  
+ -	security_d_instantiate(root, inode);
+ -	spin_lock(&root->d_lock);
+ -	if (IS_ROOT(root) && !root->d_fsdata &&
+ -	    !(root->d_flags & DCACHE_NFSFS_RENAMED)) {
+ -		root->d_fsdata = name;
+ +	security_d_instantiate(ret, inode);
+ +	spin_lock(&ret->d_lock);
+ +	if (IS_ROOT(ret) && !ret->d_fsdata &&
+ +	    !(ret->d_flags & DCACHE_NFSFS_RENAMED)) {
+ +		ret->d_fsdata = name;
+  		name = NULL;
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock(&ret->d_lock);
+ +out:
+ +	kfree(name);
+ +	nfs_free_fattr(fsinfo.fattr);
+ +	return ret;
+++=======
++ 	spin_unlock(&root->d_lock);
++ 	fc->root = root;
++ 	if (NFS_SB(s)->caps & NFS_CAP_SECURITY_LABEL)
++ 		kflags |= SECURITY_LSM_NATIVE_LABELS;
++ 	if (ctx->clone_data.sb) {
++ 		if (d_inode(fc->root)->i_fop != &nfs_dir_operations) {
++ 			error = -ESTALE;
++ 			goto error_splat_root;
++ 		}
++ 		/* clone lsm security options from the parent to the new sb */
++ 		error = security_sb_clone_mnt_opts(ctx->clone_data.sb,
++ 						   s, kflags, &kflags_out);
++ 	} else {
++ 		error = security_sb_set_mnt_opts(s, fc->security,
++ 							kflags, &kflags_out);
++ 	}
++ 	if (error)
++ 		goto error_splat_root;
++ 	if (NFS_SB(s)->caps & NFS_CAP_SECURITY_LABEL &&
++ 		!(kflags_out & SECURITY_LSM_NATIVE_LABELS))
++ 		NFS_SB(s)->caps &= ~NFS_CAP_SECURITY_LABEL;
++ 
++ 	nfs_setsecurity(inode, fsinfo.fattr, fsinfo.fattr->label);
++ 	error = 0;
++ 
++ out_label:
++ 	nfs4_label_free(fsinfo.fattr->label);
++ out_fattr:
++ 	nfs_free_fattr(fsinfo.fattr);
++ out_name:
++ 	kfree(name);
++ out:
++ 	return error;
++ error_splat_root:
++ 	dput(fc->root);
++ 	fc->root = NULL;
++ 	goto out_label;
+++>>>>>>> 779df6a5480f (NFS: Ensure security label is set for root inode)
+  }
+diff --cc fs/nfs/super.c
+index 2afc30c8066a,bb14bede6da5..000000000000
+--- a/fs/nfs/super.c
++++ b/fs/nfs/super.c
+@@@ -2659,20 -1173,18 +2659,25 @@@ static void nfs_set_readahead(struct ba
+  	bdi->io_pages = iomax_pages;
+  }
+  
+ -int nfs_get_tree_common(struct fs_context *fc)
+ +struct dentry *nfs_fs_mount_common(struct nfs_server *server,
+ +				   int flags, const char *dev_name,
+ +				   struct nfs_mount_info *mount_info,
+ +				   struct nfs_subversion *nfs_mod)
+  {
+ -	struct nfs_fs_context *ctx = nfs_fc2context(fc);
+  	struct super_block *s;
+++<<<<<<< HEAD
+ +	struct dentry *mntroot = ERR_PTR(-ENOMEM);
+ +	int (*compare_super)(struct super_block *, void *) = nfs_compare_super;
+ +	struct nfs_sb_mountdata sb_mntdata = {
+ +		.mntflags = flags,
+ +		.server = server,
+ +	};
+++=======
++ 	int (*compare_super)(struct super_block *, struct fs_context *) = nfs_compare_super;
++ 	struct nfs_server *server = ctx->server;
+++>>>>>>> 779df6a5480f (NFS: Ensure security label is set for root inode)
+  	int error;
+  
+ -	ctx->server = NULL;
+ -	if (IS_ERR(server))
+ -		return PTR_ERR(server);
+ -
+  	if (server->flags & NFS_MOUNT_UNSHARED)
+  		compare_super = NULL;
+  
+@@@ -2706,33 -1222,31 +2711,39 @@@
+  	}
+  
+  	if (!s->s_root) {
+ -		unsigned bsize = ctx->clone_data.inherited_bsize;
+  		/* initial superblock/root creation */
+ -		nfs_fill_super(s, ctx);
+ -		if (bsize) {
+ -			s->s_blocksize_bits = bsize;
+ -			s->s_blocksize = 1U << bsize;
+ -		}
+ -		nfs_get_cache_cookie(s, ctx);
+ +		mount_info->fill_super(s, mount_info);
+ +		nfs_get_cache_cookie(s, mount_info->parsed, mount_info->cloned);
+ +		if (!(server->flags & NFS_MOUNT_UNSHARED))
+ +			s->s_iflags |= SB_I_MULTIROOT;
+  	}
+  
+ -	error = nfs_get_root(s, fc);
+ -	if (error < 0) {
+ -		nfs_errorf(fc, "NFS: Couldn't get root dentry");
+ +	mntroot = nfs_get_root(s, mount_info->mntfh, dev_name);
+ +	if (IS_ERR(mntroot))
+  		goto error_splat_super;
+ -	}
+  
+++<<<<<<< HEAD
+ +	error = mount_info->set_security(s, mntroot, mount_info);
+ +	if (error)
+ +		goto error_splat_root;
+ +
+++=======
+++>>>>>>> 779df6a5480f (NFS: Ensure security label is set for root inode)
+  	s->s_flags |= SB_ACTIVE;
+ -	error = 0;
+  
+  out:
+ -	return error;
+ +	return mntroot;
+  
+  out_err_nosb:
+  	nfs_free_server(server);
+  	goto out;
+++<<<<<<< HEAD
+ +
+ +error_splat_root:
+ +	dput(mntroot);
+ +	mntroot = ERR_PTR(error);
+++=======
+++>>>>>>> 779df6a5480f (NFS: Ensure security label is set for root inode)
+  error_splat_super:
+  	deactivate_locked_super(s);
+  	goto out;
+* Unmerged path fs/nfs/getroot.c
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index d2375150d70f..331abc8be7cd 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -3919,7 +3919,7 @@ static int nfs4_proc_get_root(struct nfs_server *server, struct nfs_fh *mntfh,
+ {
+ 	int error;
+ 	struct nfs_fattr *fattr = info->fattr;
+-	struct nfs4_label *label = NULL;
++	struct nfs4_label *label = fattr->label;
+ 
+ 	error = nfs4_server_capabilities(server, mntfh);
+ 	if (error < 0) {
+@@ -3927,23 +3927,17 @@ static int nfs4_proc_get_root(struct nfs_server *server, struct nfs_fh *mntfh,
+ 		return error;
+ 	}
+ 
+-	label = nfs4_label_alloc(server, GFP_KERNEL);
+-	if (IS_ERR(label))
+-		return PTR_ERR(label);
+-
+ 	error = nfs4_proc_getattr(server, mntfh, fattr, label, NULL);
+ 	if (error < 0) {
+ 		dprintk("nfs4_get_root: getattr error = %d\n", -error);
+-		goto err_free_label;
++		goto out;
+ 	}
+ 
+ 	if (fattr->valid & NFS_ATTR_FATTR_FSID &&
+ 	    !nfs_fsid_equal(&server->fsid, &fattr->fsid))
+ 		memcpy(&server->fsid, &fattr->fsid, sizeof(server->fsid));
+ 
+-err_free_label:
+-	nfs4_label_free(label);
+-
++out:
+ 	return error;
+ }
+ 
+* Unmerged path fs/nfs/super.c
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index f4c2bb21fb1b..2e9ff4c0de68 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -75,6 +75,7 @@ struct nfs_fattr {
+ 	struct nfs4_string	*owner_name;
+ 	struct nfs4_string	*group_name;
+ 	struct nfs4_threshold	*mdsthreshold;	/* pNFS threshold hints */
++	struct nfs4_label	*label;
+ };
+ 
+ #define NFS_ATTR_FATTR_TYPE		(1U << 0)
