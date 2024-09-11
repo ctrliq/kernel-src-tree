@@ -135,7 +135,8 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
 	 */
 	if ((ipv6_addr_loopback(&hdr->saddr) ||
 	     ipv6_addr_loopback(&hdr->daddr)) &&
-	     !(dev->flags & IFF_LOOPBACK))
+	    !(dev->flags & IFF_LOOPBACK) &&
+	    !netif_is_l3_master(dev))
 		goto err;
 
 	/* RFC4291 Errata ID: 3480
