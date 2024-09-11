@@ -18,7 +18,7 @@ static inline int is_sdw_slave(const struct device *dev)
 #define sdw_register_driver(drv) \
 	__sdw_register_driver(drv, THIS_MODULE)
 
-int __sdw_register_driver(struct sdw_driver *drv, struct module *);
+int __sdw_register_driver(struct sdw_driver *drv, struct module *owner);
 void sdw_unregister_driver(struct sdw_driver *drv);
 
 int sdw_slave_uevent(struct device *dev, struct kobj_uevent_env *env);
