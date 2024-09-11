@@ -1,0 +1,96 @@
+mm: memcontrol: optimize per-lruvec stats counter memory usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Muchun Song <songmuchun@bytedance.com>
+commit f3344adf38bdb3107d40483dd9501215ad40edce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/f3344adf.failed
+
+The vmstat threshold is 32 (MEMCG_CHARGE_BATCH), Actually the threshold
+can be as big as MEMCG_CHARGE_BATCH * PAGE_SIZE.  It still fits into s32.
+So introduce struct batched_lruvec_stat to optimize memory usage.
+
+The size of struct lruvec_stat is 304 bytes on 64 bit systems.  As it is a
+per-cpu structure.  So with this patch, we can save 304 / 2 * ncpu bytes
+per-memcg per-node where ncpu is the number of the possible CPU.  If there
+are c memory cgroup (include dying cgroup) and n NUMA node in the system.
+Finally, we can save (152 * ncpu * c * n) bytes.
+
+[akpm@linux-foundation.org: fix typo in comment]
+
+Link: https://lkml.kernel.org/r/20201210042121.39665-1-songmuchun@bytedance.com
+	Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+	Cc: Chris Down <chris@chrisdown.name>
+	Cc: Yafang Shao <laoar.shao@gmail.com>
+	Cc: Wei Yang <richard.weiyang@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f3344adf38bdb3107d40483dd9501215ad40edce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+diff --cc include/linux/memcontrol.h
+index da9b4f3ccbfd,41bbf71edd9f..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -129,8 -111,17 +133,20 @@@ struct memcg_shrinker_map 
+  struct mem_cgroup_per_node {
+  	struct lruvec		lruvec;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Legacy local VM stats. This should be struct lruvec_stat and
++ 	 * cannot be optimized to struct batched_lruvec_stat. Because
++ 	 * the threshold of the lruvec_stat_cpu can be as big as
++ 	 * MEMCG_CHARGE_BATCH * PAGE_SIZE. It can fit into s32. But this
++ 	 * filed has no upper limit.
++ 	 */
++ 	struct lruvec_stat __percpu *lruvec_stat_local;
++ 
+++>>>>>>> f3344adf38bd (mm: memcontrol: optimize per-lruvec stats counter memory usage)
+  	/* Subtree VM stats (batched updates) */
+- 	struct lruvec_stat __percpu *lruvec_stat_cpu;
++ 	struct batched_lruvec_stat __percpu *lruvec_stat_cpu;
+  	atomic_long_t		lruvec_stat[NR_VM_NODE_STAT_ITEMS];
+  
+  	unsigned long		lru_zone_size[MAX_NR_ZONES][NR_LRU_LISTS];
+* Unmerged path include/linux/memcontrol.h
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 4d65b541b4a3..9012533e7f14 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -5160,7 +5160,7 @@ static int alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
+ 		return 1;
+ 	}
+ 
+-	pn->lruvec_stat_cpu = alloc_percpu_gfp(struct lruvec_stat,
++	pn->lruvec_stat_cpu = alloc_percpu_gfp(struct batched_lruvec_stat,
+ 					       GFP_KERNEL_ACCOUNT);
+ 	if (!pn->lruvec_stat_cpu) {
+ 		free_percpu(pn->lruvec_stat_local);
+@@ -7098,6 +7098,14 @@ static int __init mem_cgroup_init(void)
+ {
+ 	int cpu, node;
+ 
++	/*
++	 * Currently s32 type (can refer to struct batched_lruvec_stat) is
++	 * used for per-memcg-per-cpu caching of per-node statistics. In order
++	 * to work fine, we should make sure that the overfill threshold can't
++	 * exceed S32_MAX / PAGE_SIZE.
++	 */
++	BUILD_BUG_ON(MEMCG_CHARGE_BATCH > S32_MAX / PAGE_SIZE);
++
+ 	cpuhp_setup_state_nocalls(CPUHP_MM_MEMCQ_DEAD, "mm/memctrl:dead", NULL,
+ 				  memcg_hotplug_cpu_dead);
+ 
