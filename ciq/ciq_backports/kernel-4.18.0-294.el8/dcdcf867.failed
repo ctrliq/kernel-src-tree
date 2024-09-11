@@ -1,0 +1,192 @@
+s390/qeth: use napi_gro_frags() for SG skbs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit dcdcf8670dad7547cff59ef9ddd7312fc706464a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/dcdcf867.failed
+
+For non-linear packets, get the skb for attaching the page fragments
+from napi_get_frags() so that it can be recycled during GRO.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dcdcf8670dad7547cff59ef9ddd7312fc706464a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index 210b547f4f17,b32b50384c5c..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -5107,6 -5046,121 +5107,124 @@@ out
+  }
+  EXPORT_SYMBOL_GPL(qeth_core_hardsetup_card);
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_QETH_L3)
++ static void qeth_l3_rebuild_skb(struct qeth_card *card, struct sk_buff *skb,
++ 				struct qeth_hdr *hdr)
++ {
++ 	struct af_iucv_trans_hdr *iucv = (struct af_iucv_trans_hdr *) skb->data;
++ 	struct qeth_hdr_layer3 *l3_hdr = &hdr->hdr.l3;
++ 	struct net_device *dev = skb->dev;
++ 
++ 	if (IS_IQD(card) && iucv->magic == ETH_P_AF_IUCV) {
++ 		dev_hard_header(skb, dev, ETH_P_AF_IUCV, dev->dev_addr,
++ 				"FAKELL", skb->len);
++ 		return;
++ 	}
++ 
++ 	if (!(l3_hdr->flags & QETH_HDR_PASSTHRU)) {
++ 		u16 prot = (l3_hdr->flags & QETH_HDR_IPV6) ? ETH_P_IPV6 :
++ 							     ETH_P_IP;
++ 		unsigned char tg_addr[ETH_ALEN];
++ 
++ 		skb_reset_network_header(skb);
++ 		switch (l3_hdr->flags & QETH_HDR_CAST_MASK) {
++ 		case QETH_CAST_MULTICAST:
++ 			if (prot == ETH_P_IP)
++ 				ip_eth_mc_map(ip_hdr(skb)->daddr, tg_addr);
++ 			else
++ 				ipv6_eth_mc_map(&ipv6_hdr(skb)->daddr, tg_addr);
++ 			QETH_CARD_STAT_INC(card, rx_multicast);
++ 			break;
++ 		case QETH_CAST_BROADCAST:
++ 			ether_addr_copy(tg_addr, dev->broadcast);
++ 			QETH_CARD_STAT_INC(card, rx_multicast);
++ 			break;
++ 		default:
++ 			if (card->options.sniffer)
++ 				skb->pkt_type = PACKET_OTHERHOST;
++ 			ether_addr_copy(tg_addr, dev->dev_addr);
++ 		}
++ 
++ 		if (l3_hdr->ext_flags & QETH_HDR_EXT_SRC_MAC_ADDR)
++ 			dev_hard_header(skb, dev, prot, tg_addr,
++ 					&l3_hdr->next_hop.rx.src_mac, skb->len);
++ 		else
++ 			dev_hard_header(skb, dev, prot, tg_addr, "FAKELL",
++ 					skb->len);
++ 	}
++ 
++ 	/* copy VLAN tag from hdr into skb */
++ 	if (!card->options.sniffer &&
++ 	    (l3_hdr->ext_flags & (QETH_HDR_EXT_VLAN_FRAME |
++ 				  QETH_HDR_EXT_INCLUDE_VLAN_TAG))) {
++ 		u16 tag = (l3_hdr->ext_flags & QETH_HDR_EXT_VLAN_FRAME) ?
++ 				l3_hdr->vlan_id :
++ 				l3_hdr->next_hop.rx.vlan_id;
++ 
++ 		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), tag);
++ 	}
++ }
++ #endif
++ 
++ static void qeth_receive_skb(struct qeth_card *card, struct sk_buff *skb,
++ 			     struct qeth_hdr *hdr, bool uses_frags)
++ {
++ 	struct napi_struct *napi = &card->napi;
++ 	bool is_cso;
++ 
++ 	switch (hdr->hdr.l2.id) {
++ 	case QETH_HEADER_TYPE_OSN:
++ 		skb_push(skb, sizeof(*hdr));
++ 		skb_copy_to_linear_data(skb, hdr, sizeof(*hdr));
++ 		QETH_CARD_STAT_ADD(card, rx_bytes, skb->len);
++ 		QETH_CARD_STAT_INC(card, rx_packets);
++ 
++ 		card->osn_info.data_cb(skb);
++ 		return;
++ #if IS_ENABLED(CONFIG_QETH_L3)
++ 	case QETH_HEADER_TYPE_LAYER3:
++ 		qeth_l3_rebuild_skb(card, skb, hdr);
++ 		is_cso = hdr->hdr.l3.ext_flags & QETH_HDR_EXT_CSUM_TRANSP_REQ;
++ 		break;
++ #endif
++ 	case QETH_HEADER_TYPE_LAYER2:
++ 		is_cso = hdr->hdr.l2.flags[1] & QETH_HDR_EXT_CSUM_TRANSP_REQ;
++ 		break;
++ 	default:
++ 		/* never happens */
++ 		if (uses_frags)
++ 			napi_free_frags(napi);
++ 		else
++ 			dev_kfree_skb_any(skb);
++ 		return;
++ 	}
++ 
++ 	if (is_cso && (card->dev->features & NETIF_F_RXCSUM)) {
++ 		skb->ip_summed = CHECKSUM_UNNECESSARY;
++ 		QETH_CARD_STAT_INC(card, rx_skb_csum);
++ 	} else {
++ 		skb->ip_summed = CHECKSUM_NONE;
++ 	}
++ 
++ 	QETH_CARD_STAT_ADD(card, rx_bytes, skb->len);
++ 	QETH_CARD_STAT_INC(card, rx_packets);
++ 	if (skb_is_nonlinear(skb)) {
++ 		QETH_CARD_STAT_INC(card, rx_sg_skbs);
++ 		QETH_CARD_STAT_ADD(card, rx_sg_frags,
++ 				   skb_shinfo(skb)->nr_frags);
++ 	}
++ 
++ 	if (uses_frags) {
++ 		napi_gro_frags(napi);
++ 	} else {
++ 		skb->protocol = eth_type_trans(skb, skb->dev);
++ 		napi_gro_receive(napi, skb);
++ 	}
++ }
++ 
+++>>>>>>> dcdcf8670dad (s390/qeth: use napi_gro_frags() for SG skbs)
+  static void qeth_create_skb_frag(struct sk_buff *skb, char *data, int data_len)
+  {
+  	struct page *page = virt_to_page(data);
+@@@ -5269,14 -5350,32 +5413,39 @@@ walk_packet
+  
+  	*__element = element;
+  	*__offset = offset;
+++<<<<<<< HEAD
+ +	if (use_rx_sg) {
+ +		QETH_CARD_STAT_INC(card, rx_sg_skbs);
+ +		QETH_CARD_STAT_ADD(card, rx_sg_frags,
+ +				   skb_shinfo(skb)->nr_frags);
+++=======
++ 
++ 	qeth_receive_skb(card, skb, hdr, uses_frags);
++ 	return 0;
++ }
++ 
++ static int qeth_extract_skbs(struct qeth_card *card, int budget,
++ 			     struct qeth_qdio_buffer *buf, bool *done)
++ {
++ 	int work_done = 0;
++ 
++ 	WARN_ON_ONCE(!budget);
++ 	*done = false;
++ 
++ 	while (budget) {
++ 		if (qeth_extract_skb(card, buf, &card->rx.b_element,
++ 				     &card->rx.e_offset)) {
++ 			*done = true;
++ 			break;
++ 		}
++ 
++ 		work_done++;
++ 		budget--;
+++>>>>>>> dcdcf8670dad (s390/qeth: use napi_gro_frags() for SG skbs)
+  	}
+ -
+ -	return work_done;
+ +	return skb;
+  }
+ +EXPORT_SYMBOL_GPL(qeth_core_get_next_skb);
+  
+  int qeth_poll(struct napi_struct *napi, int budget)
+  {
+* Unmerged path drivers/s390/net/qeth_core_main.c
