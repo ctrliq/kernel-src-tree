@@ -1,0 +1,567 @@
+cxgb4/ch_ktls: Clear resources when pf4 device is removed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Ayush Sawal <ayush.sawal@chelsio.com>
+commit 65e302a9bd57b62872040d57eea1201562a7cbb2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/65e302a9.failed
+
+This patch maintain the list of active tids and clear all the active
+connection resources when DETACH notification comes.
+
+Fixes: a8c16e8ed624f ("crypto/chcr: move nic TLS functionality to drivers/net")
+	Signed-off-by: Ayush Sawal <ayush.sawal@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 65e302a9bd57b62872040d57eea1201562a7cbb2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_ktls.c
+#	drivers/crypto/chelsio/chcr_ktls.h
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+diff --cc drivers/crypto/chelsio/chcr_ktls.c
+index 887ecc2060e8,59683f79959c..000000000000
+--- a/drivers/crypto/chelsio/chcr_ktls.c
++++ b/drivers/crypto/chelsio/chcr_ktls.c
+@@@ -1,12 -1,65 +1,13 @@@
+  // SPDX-License-Identifier: GPL-2.0-only
+  /* Copyright (C) 2020 Chelsio Communications.  All rights reserved. */
+  
+ -#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ -
+ -#include <linux/skbuff.h>
+ -#include <linux/module.h>
+ +#ifdef CONFIG_CHELSIO_TLS_DEVICE
+  #include <linux/highmem.h>
+ -#include <linux/ip.h>
+ -#include <net/ipv6.h>
+ -#include <linux/netdevice.h>
+ -#include <crypto/aes.h>
+  #include "chcr_ktls.h"
+ -
+ -static LIST_HEAD(uld_ctx_list);
+ -static DEFINE_MUTEX(dev_mutex);
+ -
+ -/* chcr_get_nfrags_to_send: get the remaining nfrags after start offset
+ - * @skb: skb
+ - * @start: start offset.
+ - * @len: how much data to send after @start
+ - */
+ -static int chcr_get_nfrags_to_send(struct sk_buff *skb, u32 start, u32 len)
+ -{
+ -	struct skb_shared_info *si = skb_shinfo(skb);
+ -	u32 frag_size, skb_linear_data_len = skb_headlen(skb);
+ -	u8 nfrags = 0, frag_idx = 0;
+ -	skb_frag_t *frag;
+ -
+ -	/* if its a linear skb then return 1 */
+ -	if (!skb_is_nonlinear(skb))
+ -		return 1;
+ -
+ -	if (unlikely(start < skb_linear_data_len)) {
+ -		frag_size = min(len, skb_linear_data_len - start);
+ -	} else {
+ -		start -= skb_linear_data_len;
+ -
+ -		frag = &si->frags[frag_idx];
+ -		frag_size = skb_frag_size(frag);
+ -		while (start >= frag_size) {
+ -			start -= frag_size;
+ -			frag_idx++;
+ -			frag = &si->frags[frag_idx];
+ -			frag_size = skb_frag_size(frag);
+ -		}
+ -		frag_size = min(len, skb_frag_size(frag) - start);
+ -	}
+ -	len -= frag_size;
+ -	nfrags++;
+ -
+ -	while (len) {
+ -		frag_size = min(len, skb_frag_size(&si->frags[frag_idx]));
+ -		len -= frag_size;
+ -		nfrags++;
+ -		frag_idx++;
+ -	}
+ -	return nfrags;
+ -}
+ +#include "clip_tbl.h"
+  
+  static int chcr_init_tcb_fields(struct chcr_ktls_info *tx_info);
++ static void clear_conn_resources(struct chcr_ktls_info *tx_info);
+  /*
+   * chcr_ktls_save_keys: calculate and save crypto keys.
+   * @tx_info - driver specific tls info.
+@@@ -388,16 -364,15 +389,24 @@@ void chcr_ktls_dev_del(struct net_devic
+  	struct chcr_ktls_ofld_ctx_tx *tx_ctx =
+  				chcr_get_ktls_tx_context(tls_ctx);
+  	struct chcr_ktls_info *tx_info = tx_ctx->chcr_info;
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +	struct sock *sk;
+++=======
++ 	struct ch_ktls_port_stats_debug *port_stats;
++ 	struct chcr_ktls_uld_ctx *u_ctx;
+++>>>>>>> 65e302a9bd57 (cxgb4/ch_ktls: Clear resources when pf4 device is removed):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  
+  	if (!tx_info)
+  		return;
+ +	sk = tx_info->sk;
+ +
+ +	spin_lock(&tx_info->lock);
+ +	tx_info->connection_state = KTLS_CONN_CLOSED;
+ +	spin_unlock(&tx_info->lock);
+  
++ 	u_ctx = tx_info->adap->uld[CXGB4_ULD_KTLS].handle;
++ 	if (u_ctx && u_ctx->detach)
++ 		return;
+  	/* clear l2t entry */
+  	if (tx_info->l2te)
+  		cxgb4_l2t_release(tx_info->l2te);
+@@@ -412,13 -387,14 +421,15 @@@
+  
+  	/* clear tid */
+  	if (tx_info->tid != -1) {
+ +		/* clear tcb state and then release tid */
+ +		chcr_ktls_mark_tcb_close(tx_info);
+  		cxgb4_remove_tid(&tx_info->adap->tids, tx_info->tx_chan,
+  				 tx_info->tid, tx_info->ip_family);
++ 
++ 		xa_erase(&u_ctx->tid_list, tx_info->tid);
+  	}
+  
+ -	port_stats = &tx_info->adap->ch_ktls_stats.ktls_port[tx_info->port_id];
+ -	atomic64_inc(&port_stats->ktls_tx_connection_close);
+ +	atomic64_inc(&tx_info->adap->chcr_stats.ktls_tx_connection_close);
+  	kvfree(tx_info);
+  	tx_ctx->chcr_info = NULL;
+  	/* release module refcount */
+@@@ -434,13 -410,15 +445,14 @@@
+   * @direction - TX/RX crypto direction
+   * return: SUCCESS/FAILURE.
+   */
+ -static int chcr_ktls_dev_add(struct net_device *netdev, struct sock *sk,
+ -			     enum tls_offload_ctx_dir direction,
+ -			     struct tls_crypto_info *crypto_info,
+ -			     u32 start_offload_tcp_sn)
+ +int chcr_ktls_dev_add(struct net_device *netdev, struct sock *sk,
+ +		      enum tls_offload_ctx_dir direction,
+ +		      struct tls_crypto_info *crypto_info,
+ +		      u32 start_offload_tcp_sn)
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+ -	struct ch_ktls_port_stats_debug *port_stats;
+  	struct chcr_ktls_ofld_ctx_tx *tx_ctx;
++ 	struct chcr_ktls_uld_ctx *u_ctx;
+  	struct chcr_ktls_info *tx_info;
+  	struct dst_entry *dst;
+  	struct adapter *adap;
+@@@ -453,30 -431,27 +465,46 @@@
+  
+  	pi = netdev_priv(netdev);
+  	adap = pi->adapter;
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+++=======
++ 	port_stats = &adap->ch_ktls_stats.ktls_port[pi->port_id];
++ 	atomic64_inc(&port_stats->ktls_tx_connection_open);
++ 	u_ctx = adap->uld[CXGB4_ULD_KTLS].handle;
++ 
+++>>>>>>> 65e302a9bd57 (cxgb4/ch_ktls: Clear resources when pf4 device is removed):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	if (direction == TLS_OFFLOAD_CTX_DIR_RX) {
+  		pr_err("not expecting for RX direction\n");
+ +		ret = -EINVAL;
+ +		goto out;
+ +	}
+ +	if (tx_ctx->chcr_info) {
+ +		ret = -EINVAL;
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+++=======
++ 	if (tx_ctx->chcr_info)
++ 		goto out;
++ 
++ 	if (u_ctx && u_ctx->detach)
++ 		goto out;
++ 
+++>>>>>>> 65e302a9bd57 (cxgb4/ch_ktls: Clear resources when pf4 device is removed):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	tx_info = kvzalloc(sizeof(*tx_info), GFP_KERNEL);
+ -	if (!tx_info)
+ +	if (!tx_info) {
+ +		ret = -ENOMEM;
+  		goto out;
+ +	}
+  
+ -	tx_info->sk = sk;
+  	spin_lock_init(&tx_info->lock);
+ +
+ +	/* clear connection state */
+ +	spin_lock(&tx_info->lock);
+ +	tx_info->connection_state = KTLS_CONN_CLOSED;
+ +	spin_unlock(&tx_info->lock);
+ +
+ +	tx_info->sk = sk;
+  	/* initialize tid and atid to -1, 0 is a also a valid id. */
+  	tx_info->tid = -1;
+  	tx_info->atid = -1;
+@@@ -540,23 -523,79 +568,50 @@@
+  	/* create a filter and call cxgb4_l2t_send to send the packet out, which
+  	 * will take care of updating l2t entry in hw if not already done.
+  	 */
+ -	tx_info->open_state = CH_KTLS_OPEN_PENDING;
+ -
+ -	if (chcr_setup_connection(sk, tx_info))
+ -		goto put_module;
+ -
+ -	/* Wait for reply */
+ -	wait_for_completion_timeout(&tx_info->completion, 30 * HZ);
+ -	spin_lock_bh(&tx_info->lock);
+ -	if (tx_info->open_state) {
+ -		/* need to wait for hw response, can't free tx_info yet. */
+ -		if (tx_info->open_state == CH_KTLS_OPEN_PENDING)
+ -			tx_info->pending_close = true;
+ -		else
+ -			spin_unlock_bh(&tx_info->lock);
+ -		/* if in pending close, free the lock after the cleanup */
+ -		goto put_module;
+ -	}
+ -	spin_unlock_bh(&tx_info->lock);
+ -
+ -	/* initialize tcb */
+ -	reinit_completion(&tx_info->completion);
+ -	/* mark it pending for hw response */
+ -	tx_info->open_state = CH_KTLS_OPEN_PENDING;
+ -
+ -	if (chcr_init_tcb_fields(tx_info))
+ -		goto free_tid;
+ +	ret = chcr_setup_connection(sk, tx_info);
+ +	if (ret)
+ +		goto out2;
+  
+ -	/* Wait for reply */
+ -	wait_for_completion_timeout(&tx_info->completion, 30 * HZ);
+ -	spin_lock_bh(&tx_info->lock);
+ -	if (tx_info->open_state) {
+ -		/* need to wait for hw response, can't free tx_info yet. */
+ -		tx_info->pending_close = true;
+ -		/* free the lock after cleanup */
+ -		goto free_tid;
+ +	/* Driver shouldn't be removed until any single connection exists */
+ +	if (!try_module_get(THIS_MODULE)) {
+ +		ret = -EINVAL;
+ +		goto out2;
+  	}
+ -	spin_unlock_bh(&tx_info->lock);
+ -
+ -	if (!cxgb4_check_l2t_valid(tx_info->l2te))
+ -		goto free_tid;
+ -
+ -	atomic64_inc(&port_stats->ktls_tx_ctx);
+ -	tx_ctx->chcr_info = tx_info;
+  
+ +	atomic64_inc(&adap->chcr_stats.ktls_tx_connection_open);
+  	return 0;
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +out2:
+ +	kvfree(tx_info);
+++=======
++ 
++ free_tid:
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	/* clear clip entry */
++ 	if (tx_info->ip_family == AF_INET6)
++ 		cxgb4_clip_release(netdev, (const u32 *)
++ 				   &sk->sk_v6_rcv_saddr,
++ 				   1);
++ #endif
++ 	cxgb4_remove_tid(&tx_info->adap->tids, tx_info->tx_chan,
++ 			 tx_info->tid, tx_info->ip_family);
++ 
++ 	xa_erase(&u_ctx->tid_list, tx_info->tid);
++ 
++ put_module:
++ 	/* release module refcount */
++ 	module_put(THIS_MODULE);
++ free_l2t:
++ 	cxgb4_l2t_release(tx_info->l2te);
++ free_tx_info:
++ 	if (tx_info->pending_close)
++ 		spin_unlock_bh(&tx_info->lock);
++ 	else
++ 		kvfree(tx_info);
+++>>>>>>> 65e302a9bd57 (cxgb4/ch_ktls: Clear resources when pf4 device is removed):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  out:
+ -	atomic64_inc(&port_stats->ktls_tx_connection_fail);
+ -	return -1;
+ +	atomic64_inc(&adap->chcr_stats.ktls_tx_connection_fail);
+ +	return ret;
+  }
+  
+  /*
+@@@ -625,14 -669,44 +684,40 @@@ int chcr_ktls_cpl_act_open_rpl(struct a
+  	if (!status) {
+  		tx_info->tid = tid;
+  		cxgb4_insert_tid(t, tx_info, tx_info->tid, tx_info->ip_family);
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +
+ +		cxgb4_free_atid(t, atid);
+ +		tx_info->atid = -1;
+ +		/* update the connection state */
+ +		chcr_ktls_update_connection_state(tx_info,
+ +						  KTLS_CONN_ACT_OPEN_RPL);
+ +	}
+ +	return 0;
+++=======
++ 		/* Adding tid */
++ 		tls_ctx = tls_get_ctx(tx_info->sk);
++ 		tx_ctx = chcr_get_ktls_tx_context(tls_ctx);
++ 		u_ctx = adap->uld[CXGB4_ULD_KTLS].handle;
++ 		if (u_ctx) {
++ 			ret = xa_insert_bh(&u_ctx->tid_list, tid, tx_ctx,
++ 					   GFP_NOWAIT);
++ 			if (ret < 0) {
++ 				pr_err("%s: Failed to allocate tid XA entry = %d\n",
++ 				       __func__, tx_info->tid);
++ 				tx_info->open_state = CH_KTLS_OPEN_FAILURE;
++ 				goto out;
++ 			}
++ 		}
++ 		tx_info->open_state = CH_KTLS_OPEN_SUCCESS;
++ 	} else {
++ 		tx_info->open_state = CH_KTLS_OPEN_FAILURE;
++ 	}
++ out:
++ 	spin_unlock(&tx_info->lock);
++ 
++ 	complete(&tx_info->completion);
++ 	return ret;
+++>>>>>>> 65e302a9bd57 (cxgb4/ch_ktls: Clear resources when pf4 device is removed):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  }
+  
+  /*
+@@@ -2022,4 -2110,162 +2107,166 @@@ out
+  	dev_kfree_skb_any(skb);
+  	return NETDEV_TX_OK;
+  }
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +#endif /* CONFIG_CHELSIO_TLS_DEVICE */
+++=======
++ 
++ static void *chcr_ktls_uld_add(const struct cxgb4_lld_info *lldi)
++ {
++ 	struct chcr_ktls_uld_ctx *u_ctx;
++ 
++ 	pr_info_once("%s - version %s\n", CHCR_KTLS_DRV_DESC,
++ 		     CHCR_KTLS_DRV_VERSION);
++ 	u_ctx = kzalloc(sizeof(*u_ctx), GFP_KERNEL);
++ 	if (!u_ctx) {
++ 		u_ctx = ERR_PTR(-ENOMEM);
++ 		goto out;
++ 	}
++ 	u_ctx->lldi = *lldi;
++ 	u_ctx->detach = false;
++ 	xa_init_flags(&u_ctx->tid_list, XA_FLAGS_LOCK_BH);
++ out:
++ 	return u_ctx;
++ }
++ 
++ static const struct tlsdev_ops chcr_ktls_ops = {
++ 	.tls_dev_add = chcr_ktls_dev_add,
++ 	.tls_dev_del = chcr_ktls_dev_del,
++ };
++ 
++ static chcr_handler_func work_handlers[NUM_CPL_CMDS] = {
++ 	[CPL_ACT_OPEN_RPL] = chcr_ktls_cpl_act_open_rpl,
++ 	[CPL_SET_TCB_RPL] = chcr_ktls_cpl_set_tcb_rpl,
++ };
++ 
++ static int chcr_ktls_uld_rx_handler(void *handle, const __be64 *rsp,
++ 				    const struct pkt_gl *pgl)
++ {
++ 	const struct cpl_act_open_rpl *rpl = (struct cpl_act_open_rpl *)rsp;
++ 	struct chcr_ktls_uld_ctx *u_ctx = handle;
++ 	u8 opcode = rpl->ot.opcode;
++ 	struct adapter *adap;
++ 
++ 	adap = pci_get_drvdata(u_ctx->lldi.pdev);
++ 
++ 	if (!work_handlers[opcode]) {
++ 		pr_err("Unsupported opcode %d received\n", opcode);
++ 		return 0;
++ 	}
++ 
++ 	work_handlers[opcode](adap, (unsigned char *)&rsp[1]);
++ 	return 0;
++ }
++ 
++ static void clear_conn_resources(struct chcr_ktls_info *tx_info)
++ {
++ 	/* clear l2t entry */
++ 	if (tx_info->l2te)
++ 		cxgb4_l2t_release(tx_info->l2te);
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	/* clear clip entry */
++ 	if (tx_info->ip_family == AF_INET6)
++ 		cxgb4_clip_release(tx_info->netdev, (const u32 *)
++ 				   &tx_info->sk->sk_v6_rcv_saddr,
++ 				   1);
++ #endif
++ 
++ 	/* clear tid */
++ 	if (tx_info->tid != -1)
++ 		cxgb4_remove_tid(&tx_info->adap->tids, tx_info->tx_chan,
++ 				 tx_info->tid, tx_info->ip_family);
++ }
++ 
++ static void ch_ktls_reset_all_conn(struct chcr_ktls_uld_ctx *u_ctx)
++ {
++ 	struct ch_ktls_port_stats_debug *port_stats;
++ 	struct chcr_ktls_ofld_ctx_tx *tx_ctx;
++ 	struct chcr_ktls_info *tx_info;
++ 	unsigned long index;
++ 
++ 	xa_for_each(&u_ctx->tid_list, index, tx_ctx) {
++ 		tx_info = tx_ctx->chcr_info;
++ 		clear_conn_resources(tx_info);
++ 		port_stats = &tx_info->adap->ch_ktls_stats.ktls_port[tx_info->port_id];
++ 		atomic64_inc(&port_stats->ktls_tx_connection_close);
++ 		kvfree(tx_info);
++ 		tx_ctx->chcr_info = NULL;
++ 		/* release module refcount */
++ 		module_put(THIS_MODULE);
++ 	}
++ }
++ 
++ static int chcr_ktls_uld_state_change(void *handle, enum cxgb4_state new_state)
++ {
++ 	struct chcr_ktls_uld_ctx *u_ctx = handle;
++ 
++ 	switch (new_state) {
++ 	case CXGB4_STATE_UP:
++ 		pr_info("%s: Up\n", pci_name(u_ctx->lldi.pdev));
++ 		mutex_lock(&dev_mutex);
++ 		list_add_tail(&u_ctx->entry, &uld_ctx_list);
++ 		mutex_unlock(&dev_mutex);
++ 		break;
++ 	case CXGB4_STATE_START_RECOVERY:
++ 	case CXGB4_STATE_DOWN:
++ 	case CXGB4_STATE_DETACH:
++ 		pr_info("%s: Down\n", pci_name(u_ctx->lldi.pdev));
++ 		mutex_lock(&dev_mutex);
++ 		u_ctx->detach = true;
++ 		list_del(&u_ctx->entry);
++ 		ch_ktls_reset_all_conn(u_ctx);
++ 		xa_destroy(&u_ctx->tid_list);
++ 		mutex_unlock(&dev_mutex);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static struct cxgb4_uld_info chcr_ktls_uld_info = {
++ 	.name = CHCR_KTLS_DRV_MODULE_NAME,
++ 	.nrxq = 1,
++ 	.rxq_size = 1024,
++ 	.add = chcr_ktls_uld_add,
++ 	.tx_handler = chcr_ktls_xmit,
++ 	.rx_handler = chcr_ktls_uld_rx_handler,
++ 	.state_change = chcr_ktls_uld_state_change,
++ 	.tlsdev_ops = &chcr_ktls_ops,
++ };
++ 
++ static int __init chcr_ktls_init(void)
++ {
++ 	cxgb4_register_uld(CXGB4_ULD_KTLS, &chcr_ktls_uld_info);
++ 	return 0;
++ }
++ 
++ static void __exit chcr_ktls_exit(void)
++ {
++ 	struct chcr_ktls_uld_ctx *u_ctx, *tmp;
++ 	struct adapter *adap;
++ 
++ 	pr_info("driver unloaded\n");
++ 
++ 	mutex_lock(&dev_mutex);
++ 	list_for_each_entry_safe(u_ctx, tmp, &uld_ctx_list, entry) {
++ 		adap = pci_get_drvdata(u_ctx->lldi.pdev);
++ 		memset(&adap->ch_ktls_stats, 0, sizeof(adap->ch_ktls_stats));
++ 		list_del(&u_ctx->entry);
++ 		xa_destroy(&u_ctx->tid_list);
++ 		kfree(u_ctx);
++ 	}
++ 	mutex_unlock(&dev_mutex);
++ 	cxgb4_unregister_uld(CXGB4_ULD_KTLS);
++ }
++ 
++ module_init(chcr_ktls_init);
++ module_exit(chcr_ktls_exit);
++ 
++ MODULE_DESCRIPTION("Chelsio NIC TLS ULD driver");
++ MODULE_LICENSE("GPL");
++ MODULE_AUTHOR("Chelsio Communications");
++ MODULE_VERSION(CHCR_KTLS_DRV_VERSION);
+++>>>>>>> 65e302a9bd57 (cxgb4/ch_ktls: Clear resources when pf4 device is removed):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+diff --cc drivers/crypto/chelsio/chcr_ktls.h
+index 5cbd84b1da05,10572dc55365..000000000000
+--- a/drivers/crypto/chelsio/chcr_ktls.h
++++ b/drivers/crypto/chelsio/chcr_ktls.h
+@@@ -69,6 -72,13 +69,16 @@@ struct chcr_ktls_ofld_ctx_tx 
+  	struct chcr_ktls_info *chcr_info;
+  };
+  
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.h
+++=======
++ struct chcr_ktls_uld_ctx {
++ 	struct list_head entry;
++ 	struct cxgb4_lld_info lldi;
++ 	struct xarray tid_list;
++ 	bool detach;
++ };
++ 
+++>>>>>>> 65e302a9bd57 (cxgb4/ch_ktls: Clear resources when pf4 device is removed):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.h
+  static inline struct chcr_ktls_ofld_ctx_tx *
+  chcr_get_ktls_tx_context(struct tls_context *tls_ctx)
+  {
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index acd7043aee47,421bd9b88028..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@@ -6075,22 -6475,14 +6075,28 @@@ static void cxgb4_ktls_dev_del(struct n
+  	struct adapter *adap = netdev2adap(netdev);
+  
+  	mutex_lock(&uld_mutex);
+ -	if (chcr_offload_state(adap, CXGB4_TLSDEV_OPS))
+ +	if (!adap->uld[CXGB4_ULD_CRYPTO].handle) {
+ +		dev_err(adap->pdev_dev, "chcr driver is not loaded\n");
+ +		goto out_unlock;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	if (!adap->uld[CXGB4_ULD_CRYPTO].tlsdev_ops) {
+ +		dev_err(adap->pdev_dev,
+ +			"chcr driver has no registered tlsdev_ops\n");
+  		goto out_unlock;
+ +	}
+  
+ +	adap->uld[CXGB4_ULD_CRYPTO].tlsdev_ops->tls_dev_del(netdev, tls_ctx,
+ +							    direction);
+ +	cxgb4_set_ktls_feature(adap, FW_PARAMS_PARAM_DEV_KTLS_HW_DISABLE);
+++=======
++ 	adap->uld[CXGB4_ULD_KTLS].tlsdev_ops->tls_dev_del(netdev, tls_ctx,
++ 							  direction);
+++>>>>>>> 65e302a9bd57 (cxgb4/ch_ktls: Clear resources when pf4 device is removed)
+  
+  out_unlock:
++ 	cxgb4_set_ktls_feature(adap, FW_PARAMS_PARAM_DEV_KTLS_HW_DISABLE);
+  	mutex_unlock(&uld_mutex);
+  }
+  
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.c
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.h
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
