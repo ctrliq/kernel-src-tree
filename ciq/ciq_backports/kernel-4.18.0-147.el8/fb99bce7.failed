@@ -1,0 +1,240 @@
+net: tls: Support 256 bit keys
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] tls: Support 256 bit keys (Sabrina Dubroca) [1711821]
+Rebuild_FUZZ: 90.91%
+commit-author Dave Watson <davejwatson@fb.com>
+commit fb99bce7120014307dde57b3d7def6977a9a62a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/fb99bce7.failed
+
+Wire up support for 256 bit keys from the setsockopt to the crypto
+framework
+
+	Signed-off-by: Dave Watson <davejwatson@fb.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fb99bce7120014307dde57b3d7def6977a9a62a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tls.h
+#	net/tls/tls_sw.c
+diff --cc include/net/tls.h
+index d1f6db15d1de,da616db48413..000000000000
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@@ -195,25 -202,14 +195,32 @@@ struct cipher_context 
+  	char *iv;
+  	u16 rec_seq_size;
+  	char *rec_seq;
+ +
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+  };
+  
+ +/* Note: this sizeof(struct tls12_crypto_info_aes_gcm_128) + 32 at rhel8 GA */
+ +#define RH_KABI_TLS_CRYPT_CONTEXT_SIZE		72
+ +
+  union tls_crypto_context {
+  	struct tls_crypto_info info;
+++<<<<<<< HEAD
+ +	struct tls12_crypto_info_aes_gcm_128 aes_gcm_128;
+ +
+ +	/* RHEL: new alternative ciphers must be added under KABI_EXTEND(),
+ +	 * build time checks in tls_register() will ensure tls_crypto_context
+ +	 * does not exceed the padding storage
+ +	 */
+ +	char rh_kabi_padding[RH_KABI_TLS_CRYPT_CONTEXT_SIZE];
+++=======
++ 	union {
++ 		struct tls12_crypto_info_aes_gcm_128 aes_gcm_128;
++ 		struct tls12_crypto_info_aes_gcm_256 aes_gcm_256;
++ 	};
+++>>>>>>> fb99bce71200 (net: tls: Support 256 bit keys)
+  };
+  
+  struct tls_context {
+diff --cc net/tls/tls_sw.c
+index 3f443983a6b3,9326c06c2ffe..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -1701,7 -2006,9 +1702,13 @@@ int tls_set_sw_offload(struct sock *sk
+  	struct crypto_aead **aead;
+  	struct strp_callbacks cb;
+  	u16 nonce_size, tag_size, iv_size, rec_seq_size;
+++<<<<<<< HEAD
+ +	char *iv, *rec_seq;
+++=======
++ 	struct crypto_tfm *tfm;
++ 	char *iv, *rec_seq, *key, *salt;
++ 	size_t keysize;
+++>>>>>>> fb99bce71200 (net: tls: Support 256 bit keys)
+  	int rc = 0;
+  
+  	if (!ctx) {
+* Unmerged path include/net/tls.h
+diff --git a/include/uapi/linux/tls.h b/include/uapi/linux/tls.h
+index ff02287495ac..9affceaa3db4 100644
+--- a/include/uapi/linux/tls.h
++++ b/include/uapi/linux/tls.h
+@@ -59,6 +59,13 @@
+ #define TLS_CIPHER_AES_GCM_128_TAG_SIZE		16
+ #define TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE		8
+ 
++#define TLS_CIPHER_AES_GCM_256				52
++#define TLS_CIPHER_AES_GCM_256_IV_SIZE			8
++#define TLS_CIPHER_AES_GCM_256_KEY_SIZE		32
++#define TLS_CIPHER_AES_GCM_256_SALT_SIZE		4
++#define TLS_CIPHER_AES_GCM_256_TAG_SIZE		16
++#define TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE		8
++
+ #define TLS_SET_RECORD_TYPE	1
+ #define TLS_GET_RECORD_TYPE	2
+ 
+@@ -75,4 +82,12 @@ struct tls12_crypto_info_aes_gcm_128 {
+ 	unsigned char rec_seq[TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE];
+ };
+ 
++struct tls12_crypto_info_aes_gcm_256 {
++	struct tls_crypto_info info;
++	unsigned char iv[TLS_CIPHER_AES_GCM_256_IV_SIZE];
++	unsigned char key[TLS_CIPHER_AES_GCM_256_KEY_SIZE];
++	unsigned char salt[TLS_CIPHER_AES_GCM_256_SALT_SIZE];
++	unsigned char rec_seq[TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE];
++};
++
+ #endif /* _UAPI_LINUX_TLS_H */
+diff --git a/net/tls/tls_main.c b/net/tls/tls_main.c
+index a3694e64e12d..8a4673b1e298 100644
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@ -363,6 +363,30 @@ static int do_tls_getsockopt_tx(struct sock *sk, char __user *optval,
+ 			rc = -EFAULT;
+ 		break;
+ 	}
++	case TLS_CIPHER_AES_GCM_256: {
++		struct tls12_crypto_info_aes_gcm_256 *
++		  crypto_info_aes_gcm_256 =
++		  container_of(crypto_info,
++			       struct tls12_crypto_info_aes_gcm_256,
++			       info);
++
++		if (len != sizeof(*crypto_info_aes_gcm_256)) {
++			rc = -EINVAL;
++			goto out;
++		}
++		lock_sock(sk);
++		memcpy(crypto_info_aes_gcm_256->iv,
++		       ctx->tx.iv + TLS_CIPHER_AES_GCM_256_SALT_SIZE,
++		       TLS_CIPHER_AES_GCM_256_IV_SIZE);
++		memcpy(crypto_info_aes_gcm_256->rec_seq, ctx->tx.rec_seq,
++		       TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
++		release_sock(sk);
++		if (copy_to_user(optval,
++				 crypto_info_aes_gcm_256,
++				 sizeof(*crypto_info_aes_gcm_256)))
++			rc = -EFAULT;
++		break;
++	}
+ 	default:
+ 		rc = -EINVAL;
+ 	}
+@@ -403,6 +427,7 @@ static int do_tls_setsockopt_conf(struct sock *sk, char __user *optval,
+ {
+ 	struct tls_crypto_info *crypto_info;
+ 	struct tls_context *ctx = tls_get_ctx(sk);
++	size_t optsize;
+ 	int rc = 0;
+ 	int conf;
+ 
+@@ -435,8 +460,12 @@ static int do_tls_setsockopt_conf(struct sock *sk, char __user *optval,
+ 	}
+ 
+ 	switch (crypto_info->cipher_type) {
+-	case TLS_CIPHER_AES_GCM_128: {
+-		if (optlen != sizeof(struct tls12_crypto_info_aes_gcm_128)) {
++	case TLS_CIPHER_AES_GCM_128:
++	case TLS_CIPHER_AES_GCM_256: {
++		optsize = crypto_info->cipher_type == TLS_CIPHER_AES_GCM_128 ?
++			sizeof(struct tls12_crypto_info_aes_gcm_128) :
++			sizeof(struct tls12_crypto_info_aes_gcm_256);
++		if (optlen != optsize) {
+ 			rc = -EINVAL;
+ 			goto err_crypto_info;
+ 		}
+* Unmerged path net/tls/tls_sw.c
+diff --git a/tools/testing/selftests/net/tls.c b/tools/testing/selftests/net/tls.c
+index f846f2589fa0..e18244277bbd 100644
+--- a/tools/testing/selftests/net/tls.c
++++ b/tools/testing/selftests/net/tls.c
+@@ -713,4 +713,66 @@ TEST_F(tls, control_msg)
+ 	EXPECT_EQ(memcmp(buf, test_str, send_len), 0);
+ }
+ 
++TEST(keysizes) {
++	struct tls12_crypto_info_aes_gcm_256 tls12;
++	struct sockaddr_in addr;
++	int sfd, ret, fd, cfd;
++	socklen_t len;
++	bool notls;
++
++	notls = false;
++	len = sizeof(addr);
++
++	memset(&tls12, 0, sizeof(tls12));
++	tls12.info.version = TLS_1_2_VERSION;
++	tls12.info.cipher_type = TLS_CIPHER_AES_GCM_256;
++
++	addr.sin_family = AF_INET;
++	addr.sin_addr.s_addr = htonl(INADDR_ANY);
++	addr.sin_port = 0;
++
++	fd = socket(AF_INET, SOCK_STREAM, 0);
++	sfd = socket(AF_INET, SOCK_STREAM, 0);
++
++	ret = bind(sfd, &addr, sizeof(addr));
++	ASSERT_EQ(ret, 0);
++	ret = listen(sfd, 10);
++	ASSERT_EQ(ret, 0);
++
++	ret = getsockname(sfd, &addr, &len);
++	ASSERT_EQ(ret, 0);
++
++	ret = connect(fd, &addr, sizeof(addr));
++	ASSERT_EQ(ret, 0);
++
++	ret = setsockopt(fd, IPPROTO_TCP, TCP_ULP, "tls", sizeof("tls"));
++	if (ret != 0) {
++		notls = true;
++		printf("Failure setting TCP_ULP, testing without tls\n");
++	}
++
++	if (!notls) {
++		ret = setsockopt(fd, SOL_TLS, TLS_TX, &tls12,
++				 sizeof(tls12));
++		EXPECT_EQ(ret, 0);
++	}
++
++	cfd = accept(sfd, &addr, &len);
++	ASSERT_GE(cfd, 0);
++
++	if (!notls) {
++		ret = setsockopt(cfd, IPPROTO_TCP, TCP_ULP, "tls",
++				 sizeof("tls"));
++		EXPECT_EQ(ret, 0);
++
++		ret = setsockopt(cfd, SOL_TLS, TLS_RX, &tls12,
++				 sizeof(tls12));
++		EXPECT_EQ(ret, 0);
++	}
++
++	close(sfd);
++	close(fd);
++	close(cfd);
++}
++
+ TEST_HARNESS_MAIN
