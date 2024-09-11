@@ -50,7 +50,6 @@ static const struct snd_pcm_hardware txx9aclc_pcm_hardware = {
 static int txx9aclc_pcm_hw_params(struct snd_pcm_substream *substream,
 				  struct snd_pcm_hw_params *params)
 {
-	struct snd_soc_pcm_runtime *rtd = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct snd_soc_component *component = snd_soc_rtdcom_lookup(rtd, DRV_NAME);
 	struct txx9aclc_dmadata *dmadata = runtime->private_data;
