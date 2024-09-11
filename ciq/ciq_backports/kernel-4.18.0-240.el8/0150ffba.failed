@@ -1,0 +1,673 @@
+netfilter: conntrack: avoid using ->error callback if possible
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 0150ffbac78318549bf4818ddee3481d87100928
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0150ffba.failed
+
+The error() handler gets called before allocating or looking up a
+connection tracking entry.
+
+We can instead use direct calls from the ->packet() handlers which get
+invoked for every packet anyway.
+
+Only exceptions are icmp and icmpv6, these two special cases will be
+handled in the next patch.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 0150ffbac78318549bf4818ddee3481d87100928)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_proto_dccp.c
+#	net/netfilter/nf_conntrack_proto_sctp.c
+#	net/netfilter/nf_conntrack_proto_tcp.c
+diff --cc net/netfilter/nf_conntrack_proto_dccp.c
+index 5773ad591022,1b9e600f707d..000000000000
+--- a/net/netfilter/nf_conntrack_proto_dccp.c
++++ b/net/netfilter/nf_conntrack_proto_dccp.c
+@@@ -437,23 -435,68 +437,78 @@@ static u64 dccp_ack_seq(const struct dc
+  		     ntohl(dhack->dccph_ack_nr_low);
+  }
+  
+++<<<<<<< HEAD
+ +static unsigned int *dccp_get_timeouts(struct net *net)
+ +{
+ +	return dccp_pernet(net)->dccp_timeout;
+ +}
+ +
+ +static int dccp_packet(struct nf_conn *ct, const struct sk_buff *skb,
+++=======
++ static bool dccp_error(const struct dccp_hdr *dh,
++ 		       struct sk_buff *skb, unsigned int dataoff,
++ 		       const struct nf_hook_state *state)
++ {
++ 	unsigned int dccp_len = skb->len - dataoff;
++ 	unsigned int cscov;
++ 	const char *msg;
++ 
++ 	if (dh->dccph_doff * 4 < sizeof(struct dccp_hdr) ||
++ 	    dh->dccph_doff * 4 > dccp_len) {
++ 		msg = "nf_ct_dccp: truncated/malformed packet ";
++ 		goto out_invalid;
++ 	}
++ 
++ 	cscov = dccp_len;
++ 	if (dh->dccph_cscov) {
++ 		cscov = (dh->dccph_cscov - 1) * 4;
++ 		if (cscov > dccp_len) {
++ 			msg = "nf_ct_dccp: bad checksum coverage ";
++ 			goto out_invalid;
++ 		}
++ 	}
++ 
++ 	if (state->hook == NF_INET_PRE_ROUTING &&
++ 	    state->net->ct.sysctl_checksum &&
++ 	    nf_checksum_partial(skb, state->hook, dataoff, cscov,
++ 				IPPROTO_DCCP, state->pf)) {
++ 		msg = "nf_ct_dccp: bad checksum ";
++ 		goto out_invalid;
++ 	}
++ 
++ 	if (dh->dccph_type >= DCCP_PKT_INVALID) {
++ 		msg = "nf_ct_dccp: reserved packet type ";
++ 		goto out_invalid;
++ 	}
++ 	return false;
++ out_invalid:
++ 	nf_l4proto_log_invalid(skb, state->net, state->pf,
++ 			       IPPROTO_DCCP, "%s", msg);
++ 	return true;
++ }
++ 
++ static int dccp_packet(struct nf_conn *ct, struct sk_buff *skb,
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  		       unsigned int dataoff, enum ip_conntrack_info ctinfo,
+ -		       const struct nf_hook_state *state)
+ +		       unsigned int *timeouts)
+  {
+  	enum ip_conntrack_dir dir = CTINFO2DIR(ctinfo);
+  	struct dccp_hdr _dh, *dh;
+  	u_int8_t type, old_state, new_state;
+  	enum ct_dccp_roles role;
+ -	unsigned int *timeouts;
+  
+  	dh = skb_header_pointer(skb, dataoff, sizeof(_dh), &_dh);
+++<<<<<<< HEAD
+ +	BUG_ON(dh == NULL);
+++=======
++ 	if (!dh)
++ 		return NF_DROP;
++ 
++ 	if (dccp_error(dh, skb, dataoff, state))
++ 		return -NF_ACCEPT;
++ 
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  	type = dh->dccph_type;
+ -	if (!nf_ct_is_confirmed(ct) && !dccp_new(ct, skb, dh))
+ -		return -NF_ACCEPT;
+  
+  	if (type == DCCP_PKT_RESET &&
+  	    !test_bit(IPS_SEEN_REPLY_BIT, &ct->status)) {
+@@@ -528,55 -574,6 +583,58 @@@
+  	return NF_ACCEPT;
+  }
+  
+++<<<<<<< HEAD
+ +static int dccp_error(struct net *net, struct nf_conn *tmpl,
+ +		      struct sk_buff *skb, unsigned int dataoff,
+ +		      u_int8_t pf, unsigned int hooknum)
+ +{
+ +	struct dccp_hdr _dh, *dh;
+ +	unsigned int dccp_len = skb->len - dataoff;
+ +	unsigned int cscov;
+ +	const char *msg;
+ +
+ +	dh = skb_header_pointer(skb, dataoff, sizeof(_dh), &_dh);
+ +	if (dh == NULL) {
+ +		msg = "nf_ct_dccp: short packet ";
+ +		goto out_invalid;
+ +	}
+ +
+ +	if (dh->dccph_doff * 4 < sizeof(struct dccp_hdr) ||
+ +	    dh->dccph_doff * 4 > dccp_len) {
+ +		msg = "nf_ct_dccp: truncated/malformed packet ";
+ +		goto out_invalid;
+ +	}
+ +
+ +	cscov = dccp_len;
+ +	if (dh->dccph_cscov) {
+ +		cscov = (dh->dccph_cscov - 1) * 4;
+ +		if (cscov > dccp_len) {
+ +			msg = "nf_ct_dccp: bad checksum coverage ";
+ +			goto out_invalid;
+ +		}
+ +	}
+ +
+ +	if (net->ct.sysctl_checksum && hooknum == NF_INET_PRE_ROUTING &&
+ +	    nf_checksum_partial(skb, hooknum, dataoff, cscov, IPPROTO_DCCP,
+ +				pf)) {
+ +		msg = "nf_ct_dccp: bad checksum ";
+ +		goto out_invalid;
+ +	}
+ +
+ +	if (dh->dccph_type >= DCCP_PKT_INVALID) {
+ +		msg = "nf_ct_dccp: reserved packet type ";
+ +		goto out_invalid;
+ +	}
+ +
+ +	return NF_ACCEPT;
+ +
+ +out_invalid:
+ +	nf_l4proto_log_invalid(skb, net, pf, IPPROTO_DCCP, "%s", msg);
+ +	return -NF_ACCEPT;
+ +}
+ +
+++=======
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  static bool dccp_can_early_drop(const struct nf_conn *ct)
+  {
+  	switch (ct->proto.dccp.state) {
+@@@ -851,10 -845,7 +909,13 @@@ static struct nf_proto_net *dccp_get_ne
+  const struct nf_conntrack_l4proto nf_conntrack_l4proto_dccp4 = {
+  	.l3proto		= AF_INET,
+  	.l4proto		= IPPROTO_DCCP,
+ +	.new			= dccp_new,
+  	.packet			= dccp_packet,
+++<<<<<<< HEAD
+ +	.get_timeouts		= dccp_get_timeouts,
+ +	.error			= dccp_error,
+++=======
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  	.can_early_drop		= dccp_can_early_drop,
+  #ifdef CONFIG_NF_CONNTRACK_PROCFS
+  	.print_conntrack	= dccp_print_conntrack,
+@@@ -885,10 -876,7 +946,13 @@@ EXPORT_SYMBOL_GPL(nf_conntrack_l4proto_
+  const struct nf_conntrack_l4proto nf_conntrack_l4proto_dccp6 = {
+  	.l3proto		= AF_INET6,
+  	.l4proto		= IPPROTO_DCCP,
+ +	.new			= dccp_new,
+  	.packet			= dccp_packet,
+++<<<<<<< HEAD
+ +	.get_timeouts		= dccp_get_timeouts,
+ +	.error			= dccp_error,
+++=======
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  	.can_early_drop		= dccp_can_early_drop,
+  #ifdef CONFIG_NF_CONNTRACK_PROCFS
+  	.print_conntrack	= dccp_print_conntrack,
+diff --cc net/netfilter/nf_conntrack_proto_sctp.c
+index 900b74fa0c53,7d7eb18f658b..000000000000
+--- a/net/netfilter/nf_conntrack_proto_sctp.c
++++ b/net/netfilter/nf_conntrack_proto_sctp.c
+@@@ -272,17 -273,100 +272,48 @@@ static int sctp_new_state(enum ip_connt
+  	return sctp_conntracks[dir][i][cur_state];
+  }
+  
+ -/* Don't need lock here: this conntrack not in circulation yet */
+ -static noinline bool
+ -sctp_new(struct nf_conn *ct, const struct sk_buff *skb,
+ -	 const struct sctphdr *sh, unsigned int dataoff)
+ +static unsigned int *sctp_get_timeouts(struct net *net)
+  {
+ -	enum sctp_conntrack new_state;
+ -	const struct sctp_chunkhdr *sch;
+ -	struct sctp_chunkhdr _sch;
+ -	u32 offset, count;
+ -
+ -	memset(&ct->proto.sctp, 0, sizeof(ct->proto.sctp));
+ -	new_state = SCTP_CONNTRACK_MAX;
+ -	for_each_sctp_chunk(skb, sch, _sch, offset, dataoff, count) {
+ -		new_state = sctp_new_state(IP_CT_DIR_ORIGINAL,
+ -					   SCTP_CONNTRACK_NONE, sch->type);
+ -
+ -		/* Invalid: delete conntrack */
+ -		if (new_state == SCTP_CONNTRACK_NONE ||
+ -		    new_state == SCTP_CONNTRACK_MAX) {
+ -			pr_debug("nf_conntrack_sctp: invalid new deleting.\n");
+ -			return false;
+ -		}
+ -
+ -		/* Copy the vtag into the state info */
+ -		if (sch->type == SCTP_CID_INIT) {
+ -			struct sctp_inithdr _inithdr, *ih;
+ -			/* Sec 8.5.1 (A) */
+ -			if (sh->vtag)
+ -				return false;
+ -
+ -			ih = skb_header_pointer(skb, offset + sizeof(_sch),
+ -						sizeof(_inithdr), &_inithdr);
+ -			if (!ih)
+ -				return false;
+ -
+ -			pr_debug("Setting vtag %x for new conn\n",
+ -				 ih->init_tag);
+ -
+ -			ct->proto.sctp.vtag[IP_CT_DIR_REPLY] = ih->init_tag;
+ -		} else if (sch->type == SCTP_CID_HEARTBEAT) {
+ -			pr_debug("Setting vtag %x for secondary conntrack\n",
+ -				 sh->vtag);
+ -			ct->proto.sctp.vtag[IP_CT_DIR_ORIGINAL] = sh->vtag;
+ -		} else {
+ -		/* If it is a shutdown ack OOTB packet, we expect a return
+ -		   shutdown complete, otherwise an ABORT Sec 8.4 (5) and (8) */
+ -			pr_debug("Setting vtag %x for new conn OOTB\n",
+ -				 sh->vtag);
+ -			ct->proto.sctp.vtag[IP_CT_DIR_REPLY] = sh->vtag;
+ -		}
+ -
+ -		ct->proto.sctp.state = new_state;
+ -	}
+ -
+ -	return true;
+ +	return sctp_pernet(net)->timeouts;
+  }
+  
++ static bool sctp_error(struct sk_buff *skb,
++ 		       unsigned int dataoff,
++ 		       const struct nf_hook_state *state)
++ {
++ 	const struct sctphdr *sh;
++ 	const char *logmsg;
++ 
++ 	if (skb->len < dataoff + sizeof(struct sctphdr)) {
++ 		logmsg = "nf_ct_sctp: short packet ";
++ 		goto out_invalid;
++ 	}
++ 	if (state->hook == NF_INET_PRE_ROUTING &&
++ 	    state->net->ct.sysctl_checksum &&
++ 	    skb->ip_summed == CHECKSUM_NONE) {
++ 		if (!skb_make_writable(skb, dataoff + sizeof(struct sctphdr))) {
++ 			logmsg = "nf_ct_sctp: failed to read header ";
++ 			goto out_invalid;
++ 		}
++ 		sh = (const struct sctphdr *)(skb->data + dataoff);
++ 		if (sh->checksum != sctp_compute_cksum(skb, dataoff)) {
++ 			logmsg = "nf_ct_sctp: bad CRC ";
++ 			goto out_invalid;
++ 		}
++ 		skb->ip_summed = CHECKSUM_UNNECESSARY;
++ 	}
++ 	return false;
++ out_invalid:
++ 	nf_l4proto_log_invalid(skb, state->net, state->pf, IPPROTO_SCTP, "%s", logmsg);
++ 	return true;
++ }
++ 
+  /* Returns verdict for packet, or -NF_ACCEPT for invalid. */
+  static int sctp_packet(struct nf_conn *ct,
+ -		       struct sk_buff *skb,
+ +		       const struct sk_buff *skb,
+  		       unsigned int dataoff,
+  		       enum ip_conntrack_info ctinfo,
+ -		       const struct nf_hook_state *state)
+ +		       unsigned int *timeouts)
+  {
+  	enum sctp_conntrack new_state, old_state;
+  	enum ip_conntrack_dir dir = CTINFO2DIR(ctinfo);
+@@@ -291,8 -375,12 +322,11 @@@
+  	const struct sctp_chunkhdr *sch;
+  	struct sctp_chunkhdr _sch;
+  	u_int32_t offset, count;
+ -	unsigned int *timeouts;
+  	unsigned long map[256 / sizeof(unsigned long)] = { 0 };
+  
++ 	if (sctp_error(skb, dataoff, state))
++ 		return -NF_ACCEPT;
++ 
+  	sh = skb_header_pointer(skb, dataoff, sizeof(_sctph), &_sctph);
+  	if (sh == NULL)
+  		goto out;
+@@@ -397,110 -500,6 +431,113 @@@ out
+  	return -NF_ACCEPT;
+  }
+  
+++<<<<<<< HEAD
+ +/* Called when a new connection for this protocol found. */
+ +static bool sctp_new(struct nf_conn *ct, const struct sk_buff *skb,
+ +		     unsigned int dataoff, unsigned int *timeouts)
+ +{
+ +	enum sctp_conntrack new_state;
+ +	const struct sctphdr *sh;
+ +	struct sctphdr _sctph;
+ +	const struct sctp_chunkhdr *sch;
+ +	struct sctp_chunkhdr _sch;
+ +	u_int32_t offset, count;
+ +	unsigned long map[256 / sizeof(unsigned long)] = { 0 };
+ +
+ +	sh = skb_header_pointer(skb, dataoff, sizeof(_sctph), &_sctph);
+ +	if (sh == NULL)
+ +		return false;
+ +
+ +	if (do_basic_checks(ct, skb, dataoff, map) != 0)
+ +		return false;
+ +
+ +	/* If an OOTB packet has any of these chunks discard (Sec 8.4) */
+ +	if (test_bit(SCTP_CID_ABORT, map) ||
+ +	    test_bit(SCTP_CID_SHUTDOWN_COMPLETE, map) ||
+ +	    test_bit(SCTP_CID_COOKIE_ACK, map))
+ +		return false;
+ +
+ +	memset(&ct->proto.sctp, 0, sizeof(ct->proto.sctp));
+ +	new_state = SCTP_CONNTRACK_MAX;
+ +	for_each_sctp_chunk (skb, sch, _sch, offset, dataoff, count) {
+ +		/* Don't need lock here: this conntrack not in circulation yet */
+ +		new_state = sctp_new_state(IP_CT_DIR_ORIGINAL,
+ +					   SCTP_CONNTRACK_NONE, sch->type);
+ +
+ +		/* Invalid: delete conntrack */
+ +		if (new_state == SCTP_CONNTRACK_NONE ||
+ +		    new_state == SCTP_CONNTRACK_MAX) {
+ +			pr_debug("nf_conntrack_sctp: invalid new deleting.\n");
+ +			return false;
+ +		}
+ +
+ +		/* Copy the vtag into the state info */
+ +		if (sch->type == SCTP_CID_INIT) {
+ +			struct sctp_inithdr _inithdr, *ih;
+ +			/* Sec 8.5.1 (A) */
+ +			if (sh->vtag)
+ +				return false;
+ +
+ +			ih = skb_header_pointer(skb, offset + sizeof(_sch),
+ +						sizeof(_inithdr), &_inithdr);
+ +			if (!ih)
+ +				return false;
+ +
+ +			pr_debug("Setting vtag %x for new conn\n",
+ +				 ih->init_tag);
+ +
+ +			ct->proto.sctp.vtag[IP_CT_DIR_REPLY] = ih->init_tag;
+ +		} else if (sch->type == SCTP_CID_HEARTBEAT) {
+ +			pr_debug("Setting vtag %x for secondary conntrack\n",
+ +				 sh->vtag);
+ +			ct->proto.sctp.vtag[IP_CT_DIR_ORIGINAL] = sh->vtag;
+ +		}
+ +		/* If it is a shutdown ack OOTB packet, we expect a return
+ +		   shutdown complete, otherwise an ABORT Sec 8.4 (5) and (8) */
+ +		else {
+ +			pr_debug("Setting vtag %x for new conn OOTB\n",
+ +				 sh->vtag);
+ +			ct->proto.sctp.vtag[IP_CT_DIR_REPLY] = sh->vtag;
+ +		}
+ +
+ +		ct->proto.sctp.state = new_state;
+ +	}
+ +
+ +	return true;
+ +}
+ +
+ +static int sctp_error(struct net *net, struct nf_conn *tpl, struct sk_buff *skb,
+ +		      unsigned int dataoff,
+ +		      u8 pf, unsigned int hooknum)
+ +{
+ +	const struct sctphdr *sh;
+ +	const char *logmsg;
+ +
+ +	if (skb->len < dataoff + sizeof(struct sctphdr)) {
+ +		logmsg = "nf_ct_sctp: short packet ";
+ +		goto out_invalid;
+ +	}
+ +	if (net->ct.sysctl_checksum && hooknum == NF_INET_PRE_ROUTING &&
+ +	    skb->ip_summed == CHECKSUM_NONE) {
+ +		if (!skb_make_writable(skb, dataoff + sizeof(struct sctphdr))) {
+ +			logmsg = "nf_ct_sctp: failed to read header ";
+ +			goto out_invalid;
+ +		}
+ +		sh = (const struct sctphdr *)(skb->data + dataoff);
+ +		if (sh->checksum != sctp_compute_cksum(skb, dataoff)) {
+ +			logmsg = "nf_ct_sctp: bad CRC ";
+ +			goto out_invalid;
+ +		}
+ +		skb->ip_summed = CHECKSUM_UNNECESSARY;
+ +	}
+ +	return NF_ACCEPT;
+ +out_invalid:
+ +	nf_l4proto_log_invalid(skb, net, pf, IPPROTO_SCTP, "%s", logmsg);
+ +	return -NF_ACCEPT;
+ +}
+ +
+++=======
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  static bool sctp_can_early_drop(const struct nf_conn *ct)
+  {
+  	switch (ct->proto.sctp.state) {
+@@@ -770,9 -766,6 +807,12 @@@ const struct nf_conntrack_l4proto nf_co
+  	.print_conntrack	= sctp_print_conntrack,
+  #endif
+  	.packet 		= sctp_packet,
+++<<<<<<< HEAD
+ +	.get_timeouts		= sctp_get_timeouts,
+ +	.new 			= sctp_new,
+ +	.error			= sctp_error,
+++=======
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  	.can_early_drop		= sctp_can_early_drop,
+  	.me 			= THIS_MODULE,
+  #if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+@@@ -805,9 -798,6 +845,12 @@@ const struct nf_conntrack_l4proto nf_co
+  	.print_conntrack	= sctp_print_conntrack,
+  #endif
+  	.packet 		= sctp_packet,
+++<<<<<<< HEAD
+ +	.get_timeouts		= sctp_get_timeouts,
+ +	.new 			= sctp_new,
+ +	.error			= sctp_error,
+++=======
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  	.can_early_drop		= sctp_can_early_drop,
+  	.me 			= THIS_MODULE,
+  #if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+diff --cc net/netfilter/nf_conntrack_proto_tcp.c
+index 4908e99488e6,14a1a9348fcc..000000000000
+--- a/net/netfilter/nf_conntrack_proto_tcp.c
++++ b/net/netfilter/nf_conntrack_proto_tcp.c
+@@@ -725,28 -725,18 +725,42 @@@ static void tcp_error_log(const struct 
+  }
+  
+  /* Protect conntrack agaist broken packets. Code taken from ipt_unclean.c.  */
+++<<<<<<< HEAD
+ +static int tcp_error(struct net *net, struct nf_conn *tmpl,
+ +		     struct sk_buff *skb,
+ +		     unsigned int dataoff,
+ +		     u_int8_t pf,
+ +		     unsigned int hooknum)
+++=======
++ static bool tcp_error(const struct tcphdr *th,
++ 		      struct sk_buff *skb,
++ 		      unsigned int dataoff,
++ 		      const struct nf_hook_state *state)
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  {
+- 	const struct tcphdr *th;
+- 	struct tcphdr _tcph;
+  	unsigned int tcplen = skb->len - dataoff;
+++<<<<<<< HEAD
+ +	u_int8_t tcpflags;
+ +
+ +	/* Smaller that minimal TCP header? */
+ +	th = skb_header_pointer(skb, dataoff, sizeof(_tcph), &_tcph);
+ +	if (th == NULL) {
+ +		tcp_error_log(skb, net, pf, "short packet");
+ +		return -NF_ACCEPT;
+ +	}
+ +
+ +	/* Not whole TCP header or malformed packet */
+ +	if (th->doff*4 < sizeof(struct tcphdr) || tcplen < th->doff*4) {
+ +		tcp_error_log(skb, net, pf, "truncated packet");
+ +		return -NF_ACCEPT;
+++=======
++ 	u8 tcpflags;
++ 
++ 	/* Not whole TCP header or malformed packet */
++ 	if (th->doff*4 < sizeof(struct tcphdr) || tcplen < th->doff*4) {
++ 		tcp_error_log(skb, state, "truncated packet");
++ 		return true;
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  	}
+  
+  	/* Checksum invalid? Ignore.
+@@@ -754,25 -744,93 +768,38 @@@
+  	 * because the checksum is assumed to be correct.
+  	 */
+  	/* FIXME: Source route IP option packets --RR */
+++<<<<<<< HEAD
+ +	if (net->ct.sysctl_checksum && hooknum == NF_INET_PRE_ROUTING &&
+ +	    nf_checksum(skb, hooknum, dataoff, IPPROTO_TCP, pf)) {
+ +		tcp_error_log(skb, net, pf, "bad checksum");
+ +		return -NF_ACCEPT;
+++=======
++ 	if (state->net->ct.sysctl_checksum &&
++ 	    state->hook == NF_INET_PRE_ROUTING &&
++ 	    nf_checksum(skb, state->hook, dataoff, IPPROTO_TCP, state->pf)) {
++ 		tcp_error_log(skb, state, "bad checksum");
++ 		return true;
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  	}
+  
+  	/* Check TCP flags. */
+  	tcpflags = (tcp_flag_byte(th) & ~(TCPHDR_ECE|TCPHDR_CWR|TCPHDR_PSH));
+  	if (!tcp_valid_flags[tcpflags]) {
+++<<<<<<< HEAD
+ +		tcp_error_log(skb, net, pf, "invalid tcp flag combination");
+ +		return -NF_ACCEPT;
+++=======
++ 		tcp_error_log(skb, state, "invalid tcp flag combination");
++ 		return true;
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  	}
+  
+- 	return NF_ACCEPT;
++ 	return false;
+  }
+  
+ -static noinline bool tcp_new(struct nf_conn *ct, const struct sk_buff *skb,
+ -			     unsigned int dataoff,
+ -			     const struct tcphdr *th)
+ +static unsigned int *tcp_get_timeouts(struct net *net)
+  {
+ -	enum tcp_conntrack new_state;
+ -	struct net *net = nf_ct_net(ct);
+ -	const struct nf_tcp_net *tn = tcp_pernet(net);
+ -	const struct ip_ct_tcp_state *sender = &ct->proto.tcp.seen[0];
+ -	const struct ip_ct_tcp_state *receiver = &ct->proto.tcp.seen[1];
+ -
+ -	/* Don't need lock here: this conntrack not in circulation yet */
+ -	new_state = tcp_conntracks[0][get_conntrack_index(th)][TCP_CONNTRACK_NONE];
+ -
+ -	/* Invalid: delete conntrack */
+ -	if (new_state >= TCP_CONNTRACK_MAX) {
+ -		pr_debug("nf_ct_tcp: invalid new deleting.\n");
+ -		return false;
+ -	}
+ -
+ -	if (new_state == TCP_CONNTRACK_SYN_SENT) {
+ -		memset(&ct->proto.tcp, 0, sizeof(ct->proto.tcp));
+ -		/* SYN packet */
+ -		ct->proto.tcp.seen[0].td_end =
+ -			segment_seq_plus_len(ntohl(th->seq), skb->len,
+ -					     dataoff, th);
+ -		ct->proto.tcp.seen[0].td_maxwin = ntohs(th->window);
+ -		if (ct->proto.tcp.seen[0].td_maxwin == 0)
+ -			ct->proto.tcp.seen[0].td_maxwin = 1;
+ -		ct->proto.tcp.seen[0].td_maxend =
+ -			ct->proto.tcp.seen[0].td_end;
+ -
+ -		tcp_options(skb, dataoff, th, &ct->proto.tcp.seen[0]);
+ -	} else if (tn->tcp_loose == 0) {
+ -		/* Don't try to pick up connections. */
+ -		return false;
+ -	} else {
+ -		memset(&ct->proto.tcp, 0, sizeof(ct->proto.tcp));
+ -		/*
+ -		 * We are in the middle of a connection,
+ -		 * its history is lost for us.
+ -		 * Let's try to use the data from the packet.
+ -		 */
+ -		ct->proto.tcp.seen[0].td_end =
+ -			segment_seq_plus_len(ntohl(th->seq), skb->len,
+ -					     dataoff, th);
+ -		ct->proto.tcp.seen[0].td_maxwin = ntohs(th->window);
+ -		if (ct->proto.tcp.seen[0].td_maxwin == 0)
+ -			ct->proto.tcp.seen[0].td_maxwin = 1;
+ -		ct->proto.tcp.seen[0].td_maxend =
+ -			ct->proto.tcp.seen[0].td_end +
+ -			ct->proto.tcp.seen[0].td_maxwin;
+ -
+ -		/* We assume SACK and liberal window checking to handle
+ -		 * window scaling */
+ -		ct->proto.tcp.seen[0].flags =
+ -		ct->proto.tcp.seen[1].flags = IP_CT_TCP_FLAG_SACK_PERM |
+ -					      IP_CT_TCP_FLAG_BE_LIBERAL;
+ -	}
+ -
+ -	/* tcp_packet will set them */
+ -	ct->proto.tcp.last_index = TCP_NONE_SET;
+ -
+ -	pr_debug("%s: sender end=%u maxend=%u maxwin=%u scale=%i "
+ -		 "receiver end=%u maxend=%u maxwin=%u scale=%i\n",
+ -		 __func__,
+ -		 sender->td_end, sender->td_maxend, sender->td_maxwin,
+ -		 sender->td_scale,
+ -		 receiver->td_end, receiver->td_maxend, receiver->td_maxwin,
+ -		 receiver->td_scale);
+ -	return true;
+ +	return tcp_pernet(net)->timeouts;
+  }
+  
+  /* Returns verdict for packet, or -1 for invalid. */
+@@@ -790,10 -849,16 +817,21 @@@ static int tcp_packet(struct nf_conn *c
+  	const struct tcphdr *th;
+  	struct tcphdr _tcph;
+  	unsigned long timeout;
+ +	unsigned int index;
+  
+  	th = skb_header_pointer(skb, dataoff, sizeof(_tcph), &_tcph);
+++<<<<<<< HEAD
+ +	BUG_ON(th == NULL);
+++=======
++ 	if (th == NULL)
++ 		return -NF_ACCEPT;
++ 
++ 	if (tcp_error(th, skb, dataoff, state))
++ 		return -NF_ACCEPT;
++ 
++ 	if (!nf_ct_is_confirmed(ct) && !tcp_new(ct, skb, dataoff, th))
++ 		return -NF_ACCEPT;
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  
+  	spin_lock_bh(&ct->lock);
+  	old_state = ct->proto.tcp.state;
+@@@ -1547,9 -1542,6 +1585,12 @@@ const struct nf_conntrack_l4proto nf_co
+  	.print_conntrack 	= tcp_print_conntrack,
+  #endif
+  	.packet 		= tcp_packet,
+++<<<<<<< HEAD
+ +	.get_timeouts		= tcp_get_timeouts,
+ +	.new 			= tcp_new,
+ +	.error			= tcp_error,
+++=======
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  	.can_early_drop		= tcp_can_early_drop,
+  #if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+  	.to_nlattr		= tcp_to_nlattr,
+@@@ -1583,9 -1575,6 +1624,12 @@@ const struct nf_conntrack_l4proto nf_co
+  	.print_conntrack 	= tcp_print_conntrack,
+  #endif
+  	.packet 		= tcp_packet,
+++<<<<<<< HEAD
+ +	.get_timeouts		= tcp_get_timeouts,
+ +	.new 			= tcp_new,
+ +	.error			= tcp_error,
+++=======
+++>>>>>>> 0150ffbac783 (netfilter: conntrack: avoid using ->error callback if possible)
+  	.can_early_drop		= tcp_can_early_drop,
+  #if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+  	.nlattr_size		= TCP_NLATTR_SIZE,
+* Unmerged path net/netfilter/nf_conntrack_proto_dccp.c
+* Unmerged path net/netfilter/nf_conntrack_proto_sctp.c
+* Unmerged path net/netfilter/nf_conntrack_proto_tcp.c
