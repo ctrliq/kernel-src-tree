@@ -229,7 +229,7 @@ void *__dma_nommu_alloc_coherent(struct device *dev, size_t size,
 		do {
 			SetPageReserved(page);
 			map_kernel_page(vaddr, page_to_phys(page),
-				 pgprot_val(pgprot_noncached(PAGE_KERNEL)));
+					pgprot_noncached(PAGE_KERNEL));
 			page++;
 			vaddr += PAGE_SIZE;
 		} while (size -= PAGE_SIZE);
