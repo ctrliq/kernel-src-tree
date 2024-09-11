@@ -1,0 +1,137 @@
+net: openvswitch: expand the meters supported number
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] openvswitch: expand the meters supported number (Eelco Chaudron) [1888576]
+Rebuild_FUZZ: 94.95%
+commit-author Tonghao Zhang <xiangxia.m.yue@gmail.com>
+commit c7c4c44c9a95d87e50ced38f7480e779cb472174
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c7c4c44c.failed
+
+In kernel datapath of Open vSwitch, there are only 1024
+buckets of meter in one datapath. If installing more than
+1024 (e.g. 8192) meters, it may lead to the performance drop.
+But in some case, for example, Open vSwitch used as edge
+gateway, there should be 20K at least, where meters used for
+IP address bandwidth limitation.
+
+[Open vSwitch userspace datapath has this issue too.]
+
+For more scalable meter, this patch use meter array instead of
+hash tables, and expand/shrink the array when necessary. So we
+can install more meters than before in the datapath.
+Introducing the struct *dp_meter_instance, it's easy to
+expand meter though changing the *ti point in the struct
+*dp_meter_table.
+
+	Cc: Pravin B Shelar <pshelar@ovn.org>
+	Cc: Andy Zhou <azhou@ovn.org>
+	Signed-off-by: Tonghao Zhang <xiangxia.m.yue@gmail.com>
+	Acked-by: Pravin B Shelar <pshelar@ovn.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c7c4c44c9a95d87e50ced38f7480e779cb472174)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/meter.c
+diff --cc net/openvswitch/meter.c
+index bb67238f0340,f806ded1dd0a..000000000000
+--- a/net/openvswitch/meter.c
++++ b/net/openvswitch/meter.c
+@@@ -50,24 -50,18 +53,26 @@@ static void ovs_meter_free(struct dp_me
+  	kfree_rcu(meter, rcu);
+  }
+  
+- static struct hlist_head *meter_hash_bucket(const struct datapath *dp,
+- 					    u32 meter_id)
+- {
+- 	return &dp->meters[meter_id & (METER_HASH_BUCKETS - 1)];
+- }
+- 
+  /* Call with ovs_mutex or RCU read lock. */
+- static struct dp_meter *lookup_meter(const struct datapath *dp,
++ static struct dp_meter *lookup_meter(const struct dp_meter_table *tbl,
+  				     u32 meter_id)
+  {
++ 	struct dp_meter_instance *ti = rcu_dereference_ovsl(tbl->ti);
++ 	u32 hash = meter_hash(ti, meter_id);
+  	struct dp_meter *meter;
+- 	struct hlist_head *head;
+  
+++<<<<<<< HEAD
+ +	head = meter_hash_bucket(dp, meter_id);
+ +	hlist_for_each_entry_rcu(meter, head, dp_hash_node) {
+ +		if (meter->id == meter_id)
+ +			return meter;
+ +	}
+++=======
++ 	meter = rcu_dereference_ovsl(ti->dp_meters[hash]);
++ 	if (meter && likely(meter->id == meter_id))
++ 		return meter;
++ 
+++>>>>>>> c7c4c44c9a95 (net: openvswitch: expand the meters supported number)
+  	return NULL;
+  }
+  
+diff --git a/net/openvswitch/datapath.h b/net/openvswitch/datapath.h
+index 172e2e8c86c0..c6c52b7079c4 100644
+--- a/net/openvswitch/datapath.h
++++ b/net/openvswitch/datapath.h
+@@ -96,7 +96,7 @@ struct datapath {
+ 	u32 max_headroom;
+ 
+ 	/* Switch meters. */
+-	struct hlist_head *meters;
++	struct dp_meter_table meter_tbl;
+ };
+ 
+ /**
+* Unmerged path net/openvswitch/meter.c
+diff --git a/net/openvswitch/meter.h b/net/openvswitch/meter.h
+index 964ace2650f8..8c5e53b6f679 100644
+--- a/net/openvswitch/meter.h
++++ b/net/openvswitch/meter.h
+@@ -16,11 +16,13 @@
+ #include <linux/openvswitch.h>
+ #include <linux/genetlink.h>
+ #include <linux/skbuff.h>
++#include <linux/bits.h>
+ 
+ #include "flow.h"
+ struct datapath;
+ 
+ #define DP_MAX_BANDS		1
++#define DP_METER_ARRAY_SIZE_MIN	BIT_ULL(10)
+ 
+ struct dp_meter_band {
+ 	u32 type;
+@@ -33,9 +35,6 @@ struct dp_meter_band {
+ struct dp_meter {
+ 	spinlock_t lock;    /* Per meter lock */
+ 	struct rcu_head rcu;
+-	struct hlist_node dp_hash_node; /*Element in datapath->meters
+-					 * hash table.
+-					 */
+ 	u32 id;
+ 	u16 kbps:1, keep_stats:1;
+ 	u16 n_bands;
+@@ -45,6 +44,17 @@ struct dp_meter {
+ 	struct dp_meter_band bands[];
+ };
+ 
++struct dp_meter_instance {
++	struct rcu_head rcu;
++	u32 n_meters;
++	struct dp_meter __rcu *dp_meters[];
++};
++
++struct dp_meter_table {
++	struct dp_meter_instance __rcu *ti;
++	u32 count;
++};
++
+ extern struct genl_family dp_meter_genl_family;
+ int ovs_meters_init(struct datapath *dp);
+ void ovs_meters_exit(struct datapath *dp);
