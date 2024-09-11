@@ -1,0 +1,158 @@
+dm: don't pass bio to __dm_start_io_acct and dm_end_io_acct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit b992b40dfcc1d904e5040c34c5edde3bbc83f60b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/b992b40d.failed
+
+dm->orig_bio is always passed to __dm_start_io_acct and dm_end_io_acct,
+so it isn't necessary to take one bio parameter for the two helpers.
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit b992b40dfcc1d904e5040c34c5edde3bbc83f60b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,19d0d6192ea6..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -584,15 -531,36 +584,45 @@@ static void dm_io_acct(bool end, struc
+  		bio->bi_iter.bi_size = bi_size;
+  }
+  
+++<<<<<<< HEAD
+ +static void start_io_acct(struct dm_io *io)
+++=======
++ static void __dm_start_io_acct(struct dm_io *io)
+++>>>>>>> b992b40dfcc1 (dm: don't pass bio to __dm_start_io_acct and dm_end_io_acct)
+  {
+  	dm_io_acct(false, io->md, io->orig_bio, io->start_time, &io->stats_aux);
+  }
+  
+ -static void dm_start_io_acct(struct dm_io *io, struct bio *clone)
+ +static void end_io_acct(struct mapped_device *md, struct bio *bio,
+ +			unsigned long start_time, struct dm_stats_aux *stats_aux)
+  {
+++<<<<<<< HEAD
+ +	dm_io_acct(true, md, bio, start_time, stats_aux);
+++=======
++ 	/*
++ 	 * Ensure IO accounting is only ever started once.
++ 	 */
++ 	if (dm_io_flagged(io, DM_IO_ACCOUNTED))
++ 		return;
++ 
++ 	/* Expect no possibility for race unless DM_TIO_IS_DUPLICATE_BIO. */
++ 	if (!clone || likely(dm_tio_is_normal(clone_to_tio(clone)))) {
++ 		dm_io_set_flag(io, DM_IO_ACCOUNTED);
++ 	} else {
++ 		unsigned long flags;
++ 		/* Can afford locking given DM_TIO_IS_DUPLICATE_BIO */
++ 		spin_lock_irqsave(&io->lock, flags);
++ 		dm_io_set_flag(io, DM_IO_ACCOUNTED);
++ 		spin_unlock_irqrestore(&io->lock, flags);
++ 	}
++ 
++ 	__dm_start_io_acct(io);
++ }
++ 
++ static void dm_end_io_acct(struct dm_io *io)
++ {
++ 	dm_io_acct(true, io->md, io->orig_bio, io->start_time, &io->stats_aux);
+++>>>>>>> b992b40dfcc1 (dm: don't pass bio to __dm_start_io_acct and dm_end_io_acct)
+  }
+  
+  static struct dm_io *alloc_io(struct mapped_device *md, struct bio *bio)
+@@@ -866,6 -868,82 +896,85 @@@ static int __noflush_suspending(struct 
+  	return test_bit(DMF_NOFLUSH_SUSPENDING, &md->flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void dm_io_complete(struct dm_io *io)
++ {
++ 	blk_status_t io_error;
++ 	struct mapped_device *md = io->md;
++ 	struct bio *bio = io->orig_bio;
++ 
++ 	if (io->status == BLK_STS_DM_REQUEUE) {
++ 		unsigned long flags;
++ 		/*
++ 		 * Target requested pushing back the I/O.
++ 		 */
++ 		spin_lock_irqsave(&md->deferred_lock, flags);
++ 		if (__noflush_suspending(md) &&
++ 		    !WARN_ON_ONCE(dm_is_zone_write(md, bio))) {
++ 			/* NOTE early return due to BLK_STS_DM_REQUEUE below */
++ 			bio_list_add_head(&md->deferred, bio);
++ 		} else {
++ 			/*
++ 			 * noflush suspend was interrupted or this is
++ 			 * a write to a zoned target.
++ 			 */
++ 			io->status = BLK_STS_IOERR;
++ 		}
++ 		spin_unlock_irqrestore(&md->deferred_lock, flags);
++ 	}
++ 
++ 	io_error = io->status;
++ 	if (dm_io_flagged(io, DM_IO_ACCOUNTED))
++ 		dm_end_io_acct(io);
++ 	else if (!io_error) {
++ 		/*
++ 		 * Must handle target that DM_MAPIO_SUBMITTED only to
++ 		 * then bio_endio() rather than dm_submit_bio_remap()
++ 		 */
++ 		__dm_start_io_acct(io);
++ 		dm_end_io_acct(io);
++ 	}
++ 	free_io(io);
++ 	smp_wmb();
++ 	this_cpu_dec(*md->pending_io);
++ 
++ 	/* nudge anyone waiting on suspend queue */
++ 	if (unlikely(wq_has_sleeper(&md->wait)))
++ 		wake_up(&md->wait);
++ 
++ 	if (io_error == BLK_STS_DM_REQUEUE || io_error == BLK_STS_AGAIN) {
++ 		if (bio->bi_opf & REQ_POLLED) {
++ 			/*
++ 			 * Upper layer won't help us poll split bio (io->orig_bio
++ 			 * may only reflect a subset of the pre-split original)
++ 			 * so clear REQ_POLLED in case of requeue.
++ 			 */
++ 			bio_clear_polled(bio);
++ 			if (io_error == BLK_STS_AGAIN) {
++ 				/* io_uring doesn't handle BLK_STS_AGAIN (yet) */
++ 				queue_io(md, bio);
++ 			}
++ 		}
++ 		return;
++ 	}
++ 
++ 	if (bio_is_flush_with_data(bio)) {
++ 		/*
++ 		 * Preflush done for flush with data, reissue
++ 		 * without REQ_PREFLUSH.
++ 		 */
++ 		bio->bi_opf &= ~REQ_PREFLUSH;
++ 		queue_io(md, bio);
++ 	} else {
++ 		/* done with normal IO or empty flush */
++ 		if (io_error)
++ 			bio->bi_status = io_error;
++ 		bio_endio(bio);
++ 	}
++ }
++ 
+++>>>>>>> b992b40dfcc1 (dm: don't pass bio to __dm_start_io_acct and dm_end_io_acct)
+  /*
+   * Decrements the number of outstanding ios that a bio has been
+   * cloned into, completing the original io if necc.
+* Unmerged path drivers/md/dm.c
