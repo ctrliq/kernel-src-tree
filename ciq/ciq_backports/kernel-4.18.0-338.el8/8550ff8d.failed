@@ -1,0 +1,131 @@
+skbuff: Release nfct refcount on napi stolen or re-used skbs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Paul Blakey <paulb@nvidia.com>
+commit 8550ff8d8c75416e984d9c4b082845e57e560984
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/8550ff8d.failed
+
+When multiple SKBs are merged to a new skb under napi GRO,
+or SKB is re-used by napi, if nfct was set for them in the
+driver, it will not be released while freeing their stolen
+head state or on re-use.
+
+Release nfct on napi's stolen or re-used SKBs, and
+in gro_list_prepare, check conntrack metadata diff.
+
+Fixes: 5c6b94604744 ("net/mlx5e: CT: Handle misses after executing CT action")
+	Reviewed-by: Roi Dayan <roid@nvidia.com>
+	Signed-off-by: Paul Blakey <paulb@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8550ff8d8c75416e984d9c4b082845e57e560984)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skbuff.c
+diff --cc net/core/skbuff.c
+index 773d4f5cb151,f63de967ac25..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -760,43 -916,37 +760,56 @@@ void __consume_stateless_skb(struct sk_
+  	kfree_skbmem(skb);
+  }
+  
+ -static void napi_skb_cache_put(struct sk_buff *skb)
+ +void __kfree_skb_flush(void)
+  {
+  	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+ -	u32 i;
+  
+ -	kasan_poison_object_data(skbuff_head_cache, skb);
+ +	/* flush skb_cache if containing objects */
+ +	if (nc->skb_count) {
+ +		kmem_cache_free_bulk(skbuff_head_cache, nc->skb_count,
+ +				     nc->skb_cache);
+ +		nc->skb_count = 0;
+ +	}
+ +}
+ +
+ +static inline void _kfree_skb_defer(struct sk_buff *skb)
+ +{
+ +	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+ +
+ +	/* drop skb->head and call any destructors for packet */
+ +	skb_release_all(skb);
+ +
+ +	/* record skb to CPU local list */
+  	nc->skb_cache[nc->skb_count++] = skb;
+  
+ -	if (unlikely(nc->skb_count == NAPI_SKB_CACHE_SIZE)) {
+ -		for (i = NAPI_SKB_CACHE_HALF; i < NAPI_SKB_CACHE_SIZE; i++)
+ -			kasan_unpoison_object_data(skbuff_head_cache,
+ -						   nc->skb_cache[i]);
+ +#ifdef CONFIG_SLUB
+ +	/* SLUB writes into objects when freeing */
+ +	prefetchw(skb);
+ +#endif
+  
+ -		kmem_cache_free_bulk(skbuff_head_cache, NAPI_SKB_CACHE_HALF,
+ -				     nc->skb_cache + NAPI_SKB_CACHE_HALF);
+ -		nc->skb_count = NAPI_SKB_CACHE_HALF;
+ +	/* flush skb_cache if it is filled */
+ +	if (unlikely(nc->skb_count == NAPI_SKB_CACHE_SIZE)) {
+ +		kmem_cache_free_bulk(skbuff_head_cache, NAPI_SKB_CACHE_SIZE,
+ +				     nc->skb_cache);
+ +		nc->skb_count = 0;
+  	}
+  }
+ -
+  void __kfree_skb_defer(struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	_kfree_skb_defer(skb);
+++=======
++ 	skb_release_all(skb);
++ 	napi_skb_cache_put(skb);
++ }
++ 
++ void napi_skb_free_stolen_head(struct sk_buff *skb)
++ {
++ 	nf_reset_ct(skb);
++ 	skb_dst_drop(skb);
++ 	skb_ext_put(skb);
++ 	napi_skb_cache_put(skb);
+++>>>>>>> 8550ff8d8c75 (skbuff: Release nfct refcount on napi stolen or re-used skbs)
+  }
+  
+  void napi_consume_skb(struct sk_buff *skb, int budget)
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 4f3813eeafe4..44c97dc7b89a 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -5553,6 +5553,18 @@ static void gro_list_prepare(struct napi_struct *napi, struct sk_buff *skb)
+ 			diffs = memcmp(skb_mac_header(p),
+ 				       skb_mac_header(skb),
+ 				       maclen);
++
++		diffs |= skb_get_nfct(p) ^ skb_get_nfct(skb);
++
++		if (!diffs) {
++			struct tc_skb_ext *skb_ext = skb_ext_find(skb, TC_SKB_EXT);
++			struct tc_skb_ext *p_ext = skb_ext_find(p, TC_SKB_EXT);
++
++			diffs |= (!!p_ext) ^ (!!skb_ext);
++			if (!diffs && unlikely(skb_ext))
++				diffs |= p_ext->chain ^ skb_ext->chain;
++		}
++
+ 		NAPI_GRO_CB(p)->same_flow = !diffs;
+ 	}
+ }
+@@ -5800,6 +5812,7 @@ static void napi_reuse_skb(struct napi_struct *napi, struct sk_buff *skb)
+ 	skb_shinfo(skb)->gso_type = 0;
+ 	skb->truesize = SKB_TRUESIZE(skb_end_offset(skb));
+ 	skb_ext_reset(skb);
++	nf_reset_ct(skb);
+ 
+ 	napi->skb = skb;
+ }
+* Unmerged path net/core/skbuff.c
