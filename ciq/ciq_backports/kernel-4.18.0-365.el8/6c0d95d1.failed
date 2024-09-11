@@ -1,0 +1,159 @@
+netfilter: ctnetlink: fix mark based dump filtering regression
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Martin Willi <martin@strongswan.org>
+commit 6c0d95d1238d944fe54f0bbfc7ec017d78435daa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/6c0d95d1.failed
+
+conntrack mark based dump filtering may falsely skip entries if a mask
+is given: If the mask-based check does not filter out the entry, the
+else-if check is always true and compares the mark without considering
+the mask. The if/else-if logic seems wrong.
+
+Given that the mask during filter setup is implicitly set to 0xffffffff
+if not specified explicitly, the mark filtering flags seem to just
+complicate things. Restore the previously used approach by always
+matching against a zero mask is no filter mark is given.
+
+Fixes: cb8aa9a3affb ("netfilter: ctnetlink: add kernel side filtering for dump")
+	Signed-off-by: Martin Willi <martin@strongswan.org>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 6c0d95d1238d944fe54f0bbfc7ec017d78435daa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_netlink.c
+diff --cc net/netfilter/nf_conntrack_netlink.c
+index 42c27d1c2011,c3a4214dc958..000000000000
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@@ -854,6 -866,45 +854,48 @@@ struct ctnetlink_filter 
+  	} mark;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct nla_policy cta_filter_nla_policy[CTA_FILTER_MAX + 1] = {
++ 	[CTA_FILTER_ORIG_FLAGS]		= { .type = NLA_U32 },
++ 	[CTA_FILTER_REPLY_FLAGS]	= { .type = NLA_U32 },
++ };
++ 
++ static int ctnetlink_parse_filter(const struct nlattr *attr,
++ 				  struct ctnetlink_filter *filter)
++ {
++ 	struct nlattr *tb[CTA_FILTER_MAX + 1];
++ 	int ret = 0;
++ 
++ 	ret = nla_parse_nested(tb, CTA_FILTER_MAX, attr, cta_filter_nla_policy,
++ 			       NULL);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (tb[CTA_FILTER_ORIG_FLAGS]) {
++ 		filter->orig_flags = nla_get_u32(tb[CTA_FILTER_ORIG_FLAGS]);
++ 		if (filter->orig_flags & ~CTA_FILTER_F_ALL)
++ 			return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (tb[CTA_FILTER_REPLY_FLAGS]) {
++ 		filter->reply_flags = nla_get_u32(tb[CTA_FILTER_REPLY_FLAGS]);
++ 		if (filter->reply_flags & ~CTA_FILTER_F_ALL)
++ 			return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int ctnetlink_parse_zone(const struct nlattr *attr,
++ 				struct nf_conntrack_zone *zone);
++ static int ctnetlink_parse_tuple_filter(const struct nlattr * const cda[],
++ 					 struct nf_conntrack_tuple *tuple,
++ 					 u32 type, u_int8_t l3num,
++ 					 struct nf_conntrack_zone *zone,
++ 					 u_int32_t flags);
++ 
+++>>>>>>> 6c0d95d1238d (netfilter: ctnetlink: fix mark based dump filtering regression)
+  static struct ctnetlink_filter *
+  ctnetlink_alloc_filter(const struct nlattr * const cda[], u8 family)
+  {
+@@@ -871,12 -923,71 +913,22 @@@
+  	filter->family = family;
+  
+  #ifdef CONFIG_NF_CONNTRACK_MARK
+ -	if (cda[CTA_MARK]) {
+ +	if (cda[CTA_MARK] && cda[CTA_MARK_MASK]) {
+  		filter->mark.val = ntohl(nla_get_be32(cda[CTA_MARK]));
+++<<<<<<< HEAD
+ +		filter->mark.mask = ntohl(nla_get_be32(cda[CTA_MARK_MASK]));
+++=======
++ 		if (cda[CTA_MARK_MASK])
++ 			filter->mark.mask = ntohl(nla_get_be32(cda[CTA_MARK_MASK]));
++ 		else
++ 			filter->mark.mask = 0xffffffff;
++ 	} else if (cda[CTA_MARK_MASK]) {
++ 		err = -EINVAL;
++ 		goto err_filter;
+++>>>>>>> 6c0d95d1238d (netfilter: ctnetlink: fix mark based dump filtering regression)
+  	}
+  #endif
+ -	if (!cda[CTA_FILTER])
+ -		return filter;
+ -
+ -	err = ctnetlink_parse_zone(cda[CTA_ZONE], &filter->zone);
+ -	if (err < 0)
+ -		goto err_filter;
+ -
+ -	err = ctnetlink_parse_filter(cda[CTA_FILTER], filter);
+ -	if (err < 0)
+ -		goto err_filter;
+ -
+ -	if (filter->orig_flags) {
+ -		if (!cda[CTA_TUPLE_ORIG]) {
+ -			err = -EINVAL;
+ -			goto err_filter;
+ -		}
+ -
+ -		err = ctnetlink_parse_tuple_filter(cda, &filter->orig,
+ -						   CTA_TUPLE_ORIG,
+ -						   filter->family,
+ -						   &filter->zone,
+ -						   filter->orig_flags);
+ -		if (err < 0)
+ -			goto err_filter;
+ -	}
+ -
+ -	if (filter->reply_flags) {
+ -		if (!cda[CTA_TUPLE_REPLY]) {
+ -			err = -EINVAL;
+ -			goto err_filter;
+ -		}
+ -
+ -		err = ctnetlink_parse_tuple_filter(cda, &filter->reply,
+ -						   CTA_TUPLE_REPLY,
+ -						   filter->family,
+ -						   &filter->zone,
+ -						   filter->orig_flags);
+ -		if (err < 0) {
+ -			err = -EINVAL;
+ -			goto err_filter;
+ -		}
+ -	}
+ -
+  	return filter;
+ -
+ -err_filter:
+ -	kfree(filter);
+ -
+ -	return ERR_PTR(err);
+ -}
+ -
+ -static bool ctnetlink_needs_filter(u8 family, const struct nlattr * const *cda)
+ -{
+ -	return family || cda[CTA_MARK] || cda[CTA_FILTER];
+  }
+  
+  static int ctnetlink_start(struct netlink_callback *cb)
+* Unmerged path net/netfilter/nf_conntrack_netlink.c
