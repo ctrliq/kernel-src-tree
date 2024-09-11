@@ -1,0 +1,82 @@
+vt/fbcon: deinitialize resources in visual_init() after failed memory allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Grzegorz Halat <ghalat@redhat.com>
+commit 5e309c6c5ea12515616a4835b7fa2141c8016c94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5e309c6c.failed
+
+After memory allocation failure vc_allocate() doesn't clean up data
+which has been initialized in visual_init(). In case of fbcon this
+leads to divide-by-0 in fbcon_init() on next open of the same tty.
+
+memory allocation in vc_allocate() may fail here:
+1097:     vc->vc_screenbuf = kzalloc(vc->vc_screenbuf_size, GFP_KERNEL);
+
+on next open() fbcon_init() skips vc_font.data initialization:
+1088:     if (!p->fontdata) {
+
+division by zero in fbcon_init() happens here:
+1149:     new_cols /= vc->vc_font.width;
+
+Additional check is needed in fbcon_deinit() to prevent
+usage of uninitialized vc_screenbuf:
+
+1251:        if (vc->vc_hi_font_mask && vc->vc_screenbuf)
+1252:                set_vc_hi_font(vc, false);
+
+Crash:
+
+ #6 [ffffc90001eafa60] divide_error at ffffffff81a00be4
+    [exception RIP: fbcon_init+463]
+    RIP: ffffffff814b860f  RSP: ffffc90001eafb18  RFLAGS: 00010246
+...
+ #7 [ffffc90001eafb60] visual_init at ffffffff8154c36e
+ #8 [ffffc90001eafb80] vc_allocate at ffffffff8154f53c
+ #9 [ffffc90001eafbc8] con_install at ffffffff8154f624
+...
+
+	Signed-off-by: Grzegorz Halat <ghalat@redhat.com>
+	Reviewed-by: Oleksandr Natalenko <oleksandr@redhat.com>
+	Acked-by: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 5e309c6c5ea12515616a4835b7fa2141c8016c94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/vt/vt.c
+diff --cc drivers/tty/vt/vt.c
+index 4272dd4a76ea,5c0ca1c24b6f..000000000000
+--- a/drivers/tty/vt/vt.c
++++ b/drivers/tty/vt/vt.c
+@@@ -1007,9 -1339,9 +1015,13 @@@ struct vc_data *vc_deallocate(unsigned 
+  		param.vc = vc = vc_cons[currcons].d;
+  		atomic_notifier_call_chain(&vt_notifier_list, VT_DEALLOCATE, &param);
+  		vcs_remove_sysfs(currcons);
+- 		vc->vc_sw->con_deinit(vc);
++ 		visual_deinit(vc);
+  		put_pid(vc->vt_pid);
+++<<<<<<< HEAD
+ +		module_put(vc->vc_sw->owner);
+++=======
++ 		vc_uniscr_set(vc, NULL);
+++>>>>>>> 5e309c6c5ea1 (vt/fbcon: deinitialize resources in visual_init() after failed memory allocation)
+  		kfree(vc->vc_screenbuf);
+  		vc_cons[currcons].d = NULL;
+  	}
+* Unmerged path drivers/tty/vt/vt.c
+diff --git a/drivers/video/fbdev/core/fbcon.c b/drivers/video/fbdev/core/fbcon.c
+index 1684aac3c85a..bbccde0fa535 100644
+--- a/drivers/video/fbdev/core/fbcon.c
++++ b/drivers/video/fbdev/core/fbcon.c
+@@ -1227,7 +1227,7 @@ static void fbcon_deinit(struct vc_data *vc)
+ 	if (free_font)
+ 		vc->vc_font.data = NULL;
+ 
+-	if (vc->vc_hi_font_mask)
++	if (vc->vc_hi_font_mask && vc->vc_screenbuf)
+ 		set_vc_hi_font(vc, false);
+ 
+ 	if (!con_is_bound(&fb_con))
