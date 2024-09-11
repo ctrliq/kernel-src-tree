@@ -1,0 +1,466 @@
+KVM: x86/mmu: Split huge pages mapped by the TDP MMU when dirty logging is enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Matlack <dmatlack@google.com>
+commit a3fe5dbda0a4bb7759dcd5a0ad713d347e020401
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/a3fe5dbd.failed
+
+When dirty logging is enabled without initially-all-set, try to split
+all huge pages in the memslot down to 4KB pages so that vCPUs do not
+have to take expensive write-protection faults to split huge pages.
+
+Eager page splitting is best-effort only. This commit only adds the
+support for the TDP MMU, and even there splitting may fail due to out
+of memory conditions. Failures to split a huge page is fine from a
+correctness standpoint because KVM will always follow up splitting by
+write-protecting any remaining huge pages.
+
+Eager page splitting moves the cost of splitting huge pages off of the
+vCPU threads and onto the thread enabling dirty logging on the memslot.
+This is useful because:
+
+ 1. Splitting on the vCPU thread interrupts vCPUs execution and is
+    disruptive to customers whereas splitting on VM ioctl threads can
+    run in parallel with vCPU execution.
+
+ 2. Splitting all huge pages at once is more efficient because it does
+    not require performing VM-exit handling or walking the page table for
+    every 4KiB page in the memslot, and greatly reduces the amount of
+    contention on the mmu_lock.
+
+For example, when running dirty_log_perf_test with 96 virtual CPUs, 1GiB
+per vCPU, and 1GiB HugeTLB memory, the time it takes vCPUs to write to
+all of their memory after dirty logging is enabled decreased by 95% from
+2.94s to 0.14s.
+
+Eager Page Splitting is over 100x more efficient than the current
+implementation of splitting on fault under the read lock. For example,
+taking the same workload as above, Eager Page Splitting reduced the CPU
+required to split all huge pages from ~270 CPU-seconds ((2.94s - 0.14s)
+* 96 vCPU threads) to only 1.55 CPU-seconds.
+
+Eager page splitting does increase the amount of time it takes to enable
+dirty logging since it has split all huge pages. For example, the time
+it took to enable dirty logging in the 96GiB region of the
+aforementioned test increased from 0.001s to 1.55s.
+
+	Reviewed-by: Peter Xu <peterx@redhat.com>
+	Signed-off-by: David Matlack <dmatlack@google.com>
+Message-Id: <20220119230739.2234394-16-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a3fe5dbda0a4bb7759dcd5a0ad713d347e020401)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/spte.h
+diff --cc arch/x86/kvm/mmu/spte.h
+index e2953f371916,73f12615416f..000000000000
+--- a/arch/x86/kvm/mmu/spte.h
++++ b/arch/x86/kvm/mmu/spte.h
+@@@ -403,15 -410,12 +403,24 @@@ static inline u64 get_mmio_spte_generat
+  	return gen;
+  }
+  
+++<<<<<<< HEAD
+ +/* Bits which may be returned by set_spte() */
+ +#define SET_SPTE_WRITE_PROTECTED_PT    BIT(0)
+ +#define SET_SPTE_NEED_REMOTE_TLB_FLUSH BIT(1)
+ +#define SET_SPTE_SPURIOUS              BIT(2)
+ +
+ +int make_spte(struct kvm_vcpu *vcpu, unsigned int pte_access, int level,
+ +		     gfn_t gfn, kvm_pfn_t pfn, u64 old_spte, bool speculative,
+ +		     bool can_unsync, bool host_writable, bool ad_disabled,
+ +		     u64 *new_spte);
+++=======
++ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
++ 	       const struct kvm_memory_slot *slot,
++ 	       unsigned int pte_access, gfn_t gfn, kvm_pfn_t pfn,
++ 	       u64 old_spte, bool prefetch, bool can_unsync,
++ 	       bool host_writable, u64 *new_spte);
++ u64 make_huge_page_split_spte(u64 huge_spte, int huge_level, int index);
+++>>>>>>> a3fe5dbda0a4 (KVM: x86/mmu: Split huge pages mapped by the TDP MMU when dirty logging is enabled)
+  u64 make_nonleaf_spte(u64 *child_pt, bool ad_disabled);
+  u64 make_mmio_spte(struct kvm_vcpu *vcpu, u64 gfn, unsigned int access);
+  u64 mark_spte_for_access_track(u64 spte);
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 1a1eb4e957f1..952c5ec7b740 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -2114,6 +2114,30 @@
+ 	kvm.ignore_msrs=[KVM] Ignore guest accesses to unhandled MSRs.
+ 			Default is 0 (don't ignore, but inject #GP)
+ 
++	kvm.eager_page_split=
++			[KVM,X86] Controls whether or not KVM will try to
++			proactively split all huge pages during dirty logging.
++			Eager page splitting reduces interruptions to vCPU
++			execution by eliminating the write-protection faults
++			and MMU lock contention that would otherwise be
++			required to split huge pages lazily.
++
++			VM workloads that rarely perform writes or that write
++			only to a small region of VM memory may benefit from
++			disabling eager page splitting to allow huge pages to
++			still be used for reads.
++
++			The behavior of eager page splitting depends on whether
++			KVM_DIRTY_LOG_INITIALLY_SET is enabled or disabled. If
++			disabled, all huge pages in a memslot will be eagerly
++			split when dirty logging is enabled on that memslot. If
++			enabled, huge pages will not be eagerly split.
++
++			Eager page splitting currently only supports splitting
++			huge pages mapped by the TDP MMU.
++
++			Default is Y (on).
++
+ 	kvm.enable_vmware_backdoor=[KVM] Support VMware backdoor PV interface.
+ 				   Default is false (don't support).
+ 
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 96ecf6f2c1a5..76a645179602 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1576,6 +1576,9 @@ void kvm_mmu_reset_context(struct kvm_vcpu *vcpu);
+ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+ 				      struct kvm_memory_slot *memslot,
+ 				      int start_level);
++void kvm_mmu_slot_try_split_huge_pages(struct kvm *kvm,
++				       const struct kvm_memory_slot *memslot,
++				       int target_level);
+ void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
+ 				   const struct kvm_memory_slot *memslot);
+ void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index e1bc11990a29..1c5fac606c4d 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -5740,6 +5740,30 @@ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+ 		kvm_arch_flush_remote_tlbs_memslot(kvm, memslot);
+ }
+ 
++void kvm_mmu_slot_try_split_huge_pages(struct kvm *kvm,
++				       const struct kvm_memory_slot *memslot,
++				       int target_level)
++{
++	u64 start = memslot->base_gfn;
++	u64 end = start + memslot->npages;
++
++	if (is_tdp_mmu_enabled(kvm)) {
++		read_lock(&kvm->mmu_lock);
++		kvm_tdp_mmu_try_split_huge_pages(kvm, memslot, start, end, target_level);
++		read_unlock(&kvm->mmu_lock);
++	}
++
++	/*
++	 * No TLB flush is necessary here. KVM will flush TLBs after
++	 * write-protecting and/or clearing dirty on the newly split SPTEs to
++	 * ensure that guest writes are reflected in the dirty log before the
++	 * ioctl to enable dirty logging on this memslot completes. Since the
++	 * split SPTEs retain the write and dirty bits of the huge SPTE, it is
++	 * safe for KVM to decide if a TLB flush is necessary based on the split
++	 * SPTEs.
++	 */
++}
++
+ static bool kvm_mmu_zap_collapsible_spte(struct kvm *kvm,
+ 					 struct kvm_rmap_head *rmap_head,
+ 					 struct kvm_memory_slot *slot)
+diff --git a/arch/x86/kvm/mmu/spte.c b/arch/x86/kvm/mmu/spte.c
+index 31a0e0981b05..134b1222d161 100644
+--- a/arch/x86/kvm/mmu/spte.c
++++ b/arch/x86/kvm/mmu/spte.c
+@@ -183,6 +183,65 @@ int make_spte(struct kvm_vcpu *vcpu, unsigned int pte_access, int level,
+ 	return ret;
+ }
+ 
++static u64 make_spte_executable(u64 spte)
++{
++	bool is_access_track = is_access_track_spte(spte);
++
++	if (is_access_track)
++		spte = restore_acc_track_spte(spte);
++
++	spte &= ~shadow_nx_mask;
++	spte |= shadow_x_mask;
++
++	if (is_access_track)
++		spte = mark_spte_for_access_track(spte);
++
++	return spte;
++}
++
++/*
++ * Construct an SPTE that maps a sub-page of the given huge page SPTE where
++ * `index` identifies which sub-page.
++ *
++ * This is used during huge page splitting to build the SPTEs that make up the
++ * new page table.
++ */
++u64 make_huge_page_split_spte(u64 huge_spte, int huge_level, int index)
++{
++	u64 child_spte;
++	int child_level;
++
++	if (WARN_ON_ONCE(!is_shadow_present_pte(huge_spte)))
++		return 0;
++
++	if (WARN_ON_ONCE(!is_large_pte(huge_spte)))
++		return 0;
++
++	child_spte = huge_spte;
++	child_level = huge_level - 1;
++
++	/*
++	 * The child_spte already has the base address of the huge page being
++	 * split. So we just have to OR in the offset to the page at the next
++	 * lower level for the given index.
++	 */
++	child_spte |= (index * KVM_PAGES_PER_HPAGE(child_level)) << PAGE_SHIFT;
++
++	if (child_level == PG_LEVEL_4K) {
++		child_spte &= ~PT_PAGE_SIZE_MASK;
++
++		/*
++		 * When splitting to a 4K page, mark the page executable as the
++		 * NX hugepage mitigation no longer applies.
++		 */
++		if (is_nx_huge_page_enabled())
++			child_spte = make_spte_executable(child_spte);
++	}
++
++	return child_spte;
++}
++
++
+ u64 make_nonleaf_spte(u64 *child_pt, bool ad_disabled)
+ {
+ 	u64 spte = SPTE_MMU_PRESENT_MASK;
+* Unmerged path arch/x86/kvm/mmu/spte.h
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index 00e34bc04af0..153a834b26a3 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -1268,6 +1268,179 @@ bool kvm_tdp_mmu_wrprot_slot(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 	return spte_set;
+ }
+ 
++static struct kvm_mmu_page *__tdp_mmu_alloc_sp_for_split(gfp_t gfp)
++{
++	struct kvm_mmu_page *sp;
++
++	gfp |= __GFP_ZERO;
++
++	sp = kmem_cache_alloc(mmu_page_header_cache, gfp);
++	if (!sp)
++		return NULL;
++
++	sp->spt = (void *)__get_free_page(gfp);
++	if (!sp->spt) {
++		kmem_cache_free(mmu_page_header_cache, sp);
++		return NULL;
++	}
++
++	return sp;
++}
++
++static struct kvm_mmu_page *tdp_mmu_alloc_sp_for_split(struct kvm *kvm,
++						       struct tdp_iter *iter)
++{
++	struct kvm_mmu_page *sp;
++
++	lockdep_assert_held_read(&kvm->mmu_lock);
++
++	/*
++	 * Since we are allocating while under the MMU lock we have to be
++	 * careful about GFP flags. Use GFP_NOWAIT to avoid blocking on direct
++	 * reclaim and to avoid making any filesystem callbacks (which can end
++	 * up invoking KVM MMU notifiers, resulting in a deadlock).
++	 *
++	 * If this allocation fails we drop the lock and retry with reclaim
++	 * allowed.
++	 */
++	sp = __tdp_mmu_alloc_sp_for_split(GFP_NOWAIT | __GFP_ACCOUNT);
++	if (sp)
++		return sp;
++
++	rcu_read_unlock();
++	read_unlock(&kvm->mmu_lock);
++
++	iter->yielded = true;
++	sp = __tdp_mmu_alloc_sp_for_split(GFP_KERNEL_ACCOUNT);
++
++	read_lock(&kvm->mmu_lock);
++	rcu_read_lock();
++
++	return sp;
++}
++
++static int tdp_mmu_split_huge_page_atomic(struct kvm *kvm,
++					  struct tdp_iter *iter,
++					  struct kvm_mmu_page *sp)
++{
++	const u64 huge_spte = iter->old_spte;
++	const int level = iter->level;
++	int ret, i;
++
++	tdp_mmu_init_child_sp(sp, iter);
++
++	/*
++	 * No need for atomics when writing to sp->spt since the page table has
++	 * not been linked in yet and thus is not reachable from any other CPU.
++	 */
++	for (i = 0; i < PT64_ENT_PER_PAGE; i++)
++		sp->spt[i] = make_huge_page_split_spte(huge_spte, level, i);
++
++	/*
++	 * Replace the huge spte with a pointer to the populated lower level
++	 * page table. Since we are making this change without a TLB flush vCPUs
++	 * will see a mix of the split mappings and the original huge mapping,
++	 * depending on what's currently in their TLB. This is fine from a
++	 * correctness standpoint since the translation will be the same either
++	 * way.
++	 */
++	ret = tdp_mmu_link_sp_atomic(kvm, iter, sp, false);
++	if (ret)
++		return ret;
++
++	/*
++	 * tdp_mmu_link_sp_atomic() will handle subtracting the huge page we
++	 * are overwriting from the page stats. But we have to manually update
++	 * the page stats with the new present child pages.
++	 */
++	kvm_update_page_stats(kvm, level - 1, PT64_ENT_PER_PAGE);
++
++	return 0;
++}
++
++static int tdp_mmu_split_huge_pages_root(struct kvm *kvm,
++					 struct kvm_mmu_page *root,
++					 gfn_t start, gfn_t end,
++					 int target_level)
++{
++	struct kvm_mmu_page *sp = NULL;
++	struct tdp_iter iter;
++	int ret = 0;
++
++	rcu_read_lock();
++
++	/*
++	 * Traverse the page table splitting all huge pages above the target
++	 * level into one lower level. For example, if we encounter a 1GB page
++	 * we split it into 512 2MB pages.
++	 *
++	 * Since the TDP iterator uses a pre-order traversal, we are guaranteed
++	 * to visit an SPTE before ever visiting its children, which means we
++	 * will correctly recursively split huge pages that are more than one
++	 * level above the target level (e.g. splitting a 1GB to 512 2MB pages,
++	 * and then splitting each of those to 512 4KB pages).
++	 */
++	for_each_tdp_pte_min_level(iter, root, target_level + 1, start, end) {
++retry:
++		if (tdp_mmu_iter_cond_resched(kvm, &iter, false, true))
++			continue;
++
++		if (!is_shadow_present_pte(iter.old_spte) || !is_large_pte(iter.old_spte))
++			continue;
++
++		if (!sp) {
++			sp = tdp_mmu_alloc_sp_for_split(kvm, &iter);
++			if (!sp) {
++				ret = -ENOMEM;
++				break;
++			}
++
++			if (iter.yielded)
++				continue;
++		}
++
++		if (tdp_mmu_split_huge_page_atomic(kvm, &iter, sp))
++			goto retry;
++
++		sp = NULL;
++	}
++
++	rcu_read_unlock();
++
++	/*
++	 * It's possible to exit the loop having never used the last sp if, for
++	 * example, a vCPU doing HugePage NX splitting wins the race and
++	 * installs its own sp in place of the last sp we tried to split.
++	 */
++	if (sp)
++		tdp_mmu_free_sp(sp);
++
++
++	return ret;
++}
++
++/*
++ * Try to split all huge pages mapped by the TDP MMU down to the target level.
++ */
++void kvm_tdp_mmu_try_split_huge_pages(struct kvm *kvm,
++				      const struct kvm_memory_slot *slot,
++				      gfn_t start, gfn_t end,
++				      int target_level)
++{
++	struct kvm_mmu_page *root;
++	int r = 0;
++
++	lockdep_assert_held_read(&kvm->mmu_lock);
++
++	for_each_tdp_mmu_root_yield_safe(kvm, root, slot->as_id, true) {
++		r = tdp_mmu_split_huge_pages_root(kvm, root, start, end, target_level);
++		if (r) {
++			kvm_tdp_mmu_put_root(kvm, root, true);
++			break;
++		}
++	}
++}
++
+ /*
+  * Clear the dirty status of all the SPTEs mapping GFNs in the memslot. If
+  * AD bits are enabled, this will involve clearing the dirty bit on each SPTE.
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+index e1f1ae8ec3e2..bc14744a695a 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -74,6 +74,11 @@ bool kvm_tdp_mmu_write_protect_gfn(struct kvm *kvm,
+ 				   struct kvm_memory_slot *slot, gfn_t gfn,
+ 				   int min_level);
+ 
++void kvm_tdp_mmu_try_split_huge_pages(struct kvm *kvm,
++				      const struct kvm_memory_slot *slot,
++				      gfn_t start, gfn_t end,
++				      int target_level);
++
+ static inline void kvm_tdp_mmu_walk_lockless_begin(void)
+ {
+ 	rcu_read_lock();
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index b7a417ad06ef..f8f73ea1f5f2 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -191,6 +191,9 @@ bool __read_mostly enable_pmu = true;
+ EXPORT_SYMBOL_GPL(enable_pmu);
+ module_param(enable_pmu, bool, 0444);
+ 
++static bool __read_mostly eager_page_split = true;
++module_param(eager_page_split, bool, 0644);
++
+ /*
+  * Restoring the host value for MSRs that are only consumed when running in
+  * usermode, e.g. SYSCALL MSRs and TSC_AUX, can be deferred until the CPU
+@@ -11952,6 +11955,9 @@ static void kvm_mmu_slot_apply_flags(struct kvm *kvm,
+ 		if (kvm_dirty_log_manual_protect_and_init_set(kvm))
+ 			return;
+ 
++		if (READ_ONCE(eager_page_split))
++			kvm_mmu_slot_try_split_huge_pages(kvm, new, PG_LEVEL_4K);
++
+ 		if (kvm_x86_ops.cpu_dirty_log_size) {
+ 			kvm_mmu_slot_leaf_clear_dirty(kvm, new);
+ 			kvm_mmu_slot_remove_write_access(kvm, new, PG_LEVEL_2M);
