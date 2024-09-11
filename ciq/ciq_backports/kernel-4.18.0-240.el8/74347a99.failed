@@ -1,0 +1,212 @@
+x86/Hyper-V: Unload vmbus channel in hv panic callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Tianyu Lan <Tianyu.Lan@microsoft.com>
+commit 74347a99e73ae00b8385f1209aaea193c670f901
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/74347a99.failed
+
+When kdump is not configured, a Hyper-V VM might still respond to
+network traffic after a kernel panic when kernel parameter panic=0.
+The panic CPU goes into an infinite loop with interrupts enabled,
+and the VMbus driver interrupt handler still works because the
+VMbus connection is unloaded only in the kdump path.  The network
+responses make the other end of the connection think the VM is
+still functional even though it has panic'ed, which could affect any
+failover actions that should be taken.
+
+Fix this by unloading the VMbus connection during the panic process.
+vmbus_initiate_unload() could then be called twice (e.g., by
+hyperv_panic_event() and hv_crash_handler(), so reset the connection
+state in vmbus_initiate_unload() to ensure the unload is done only
+once.
+
+Fixes: 81b18bce48af ("Drivers: HV: Send one page worth of kmsg dump over Hyper-V during panic")
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: Tianyu Lan <Tianyu.Lan@microsoft.com>
+Link: https://lore.kernel.org/r/20200406155331.2105-2-Tianyu.Lan@microsoft.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 74347a99e73ae00b8385f1209aaea193c670f901)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/vmbus_drv.c
+index 767e107097b4,6478240d11ab..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -2061,6 -2140,128 +2070,131 @@@ acpi_walk_err
+  	return ret_val;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PM_SLEEP
++ static int vmbus_bus_suspend(struct device *dev)
++ {
++ 	struct vmbus_channel *channel, *sc;
++ 	unsigned long flags;
++ 
++ 	while (atomic_read(&vmbus_connection.offer_in_progress) != 0) {
++ 		/*
++ 		 * We wait here until the completion of any channel
++ 		 * offers that are currently in progress.
++ 		 */
++ 		msleep(1);
++ 	}
++ 
++ 	mutex_lock(&vmbus_connection.channel_mutex);
++ 	list_for_each_entry(channel, &vmbus_connection.chn_list, listentry) {
++ 		if (!is_hvsock_channel(channel))
++ 			continue;
++ 
++ 		vmbus_force_channel_rescinded(channel);
++ 	}
++ 	mutex_unlock(&vmbus_connection.channel_mutex);
++ 
++ 	/*
++ 	 * Wait until all the sub-channels and hv_sock channels have been
++ 	 * cleaned up. Sub-channels should be destroyed upon suspend, otherwise
++ 	 * they would conflict with the new sub-channels that will be created
++ 	 * in the resume path. hv_sock channels should also be destroyed, but
++ 	 * a hv_sock channel of an established hv_sock connection can not be
++ 	 * really destroyed since it may still be referenced by the userspace
++ 	 * application, so we just force the hv_sock channel to be rescinded
++ 	 * by vmbus_force_channel_rescinded(), and the userspace application
++ 	 * will thoroughly destroy the channel after hibernation.
++ 	 *
++ 	 * Note: the counter nr_chan_close_on_suspend may never go above 0 if
++ 	 * the VM has no sub-channel and hv_sock channel, e.g. a 1-vCPU VM.
++ 	 */
++ 	if (atomic_read(&vmbus_connection.nr_chan_close_on_suspend) > 0)
++ 		wait_for_completion(&vmbus_connection.ready_for_suspend_event);
++ 
++ 	WARN_ON(atomic_read(&vmbus_connection.nr_chan_fixup_on_resume) != 0);
++ 
++ 	mutex_lock(&vmbus_connection.channel_mutex);
++ 
++ 	list_for_each_entry(channel, &vmbus_connection.chn_list, listentry) {
++ 		/*
++ 		 * Invalidate the field. Upon resume, vmbus_onoffer() will fix
++ 		 * up the field, and the other fields (if necessary).
++ 		 */
++ 		channel->offermsg.child_relid = INVALID_RELID;
++ 
++ 		if (is_hvsock_channel(channel)) {
++ 			if (!channel->rescind) {
++ 				pr_err("hv_sock channel not rescinded!\n");
++ 				WARN_ON_ONCE(1);
++ 			}
++ 			continue;
++ 		}
++ 
++ 		spin_lock_irqsave(&channel->lock, flags);
++ 		list_for_each_entry(sc, &channel->sc_list, sc_list) {
++ 			pr_err("Sub-channel not deleted!\n");
++ 			WARN_ON_ONCE(1);
++ 		}
++ 		spin_unlock_irqrestore(&channel->lock, flags);
++ 
++ 		atomic_inc(&vmbus_connection.nr_chan_fixup_on_resume);
++ 	}
++ 
++ 	mutex_unlock(&vmbus_connection.channel_mutex);
++ 
++ 	vmbus_initiate_unload(false);
++ 
++ 	/* Reset the event for the next resume. */
++ 	reinit_completion(&vmbus_connection.ready_for_resume_event);
++ 
++ 	return 0;
++ }
++ 
++ static int vmbus_bus_resume(struct device *dev)
++ {
++ 	struct vmbus_channel_msginfo *msginfo;
++ 	size_t msgsize;
++ 	int ret;
++ 
++ 	/*
++ 	 * We only use the 'vmbus_proto_version', which was in use before
++ 	 * hibernation, to re-negotiate with the host.
++ 	 */
++ 	if (!vmbus_proto_version) {
++ 		pr_err("Invalid proto version = 0x%x\n", vmbus_proto_version);
++ 		return -EINVAL;
++ 	}
++ 
++ 	msgsize = sizeof(*msginfo) +
++ 		  sizeof(struct vmbus_channel_initiate_contact);
++ 
++ 	msginfo = kzalloc(msgsize, GFP_KERNEL);
++ 
++ 	if (msginfo == NULL)
++ 		return -ENOMEM;
++ 
++ 	ret = vmbus_negotiate_version(msginfo, vmbus_proto_version);
++ 
++ 	kfree(msginfo);
++ 
++ 	if (ret != 0)
++ 		return ret;
++ 
++ 	WARN_ON(atomic_read(&vmbus_connection.nr_chan_fixup_on_resume) == 0);
++ 
++ 	vmbus_request_offers();
++ 
++ 	wait_for_completion(&vmbus_connection.ready_for_resume_event);
++ 
++ 	/* Reset the event for the next suspend. */
++ 	reinit_completion(&vmbus_connection.ready_for_suspend_event);
++ 
++ 	return 0;
++ }
++ #endif /* CONFIG_PM_SLEEP */
++ 
+++>>>>>>> 74347a99e73a (x86/Hyper-V: Unload vmbus channel in hv panic callback)
+  static const struct acpi_device_id vmbus_acpi_device_ids[] = {
+  	{"VMBUS", 0},
+  	{"VMBus", 0},
+@@@ -2079,9 -2294,8 +2213,8 @@@ static struct acpi_driver vmbus_acpi_dr
+  
+  static void hv_kexec_handler(void)
+  {
+ -	hv_stimer_global_cleanup();
+ +	hv_synic_clockevents_cleanup();
+  	vmbus_initiate_unload(false);
+- 	vmbus_connection.conn_state = DISCONNECTED;
+  	/* Make sure conn_state is set as hv_synic_cleanup checks for it */
+  	mb();
+  	cpuhp_remove_state(hyperv_cpuhp_online);
+@@@ -2096,8 -2312,9 +2229,14 @@@ static void hv_crash_handler(struct pt_
+  	 * doing the cleanup for current CPU only. This should be sufficient
+  	 * for kdump.
+  	 */
+++<<<<<<< HEAD
+ +	vmbus_connection.conn_state = DISCONNECTED;
+ +	hv_synic_cleanup(smp_processor_id());
+++=======
++ 	cpu = smp_processor_id();
++ 	hv_stimer_cleanup(cpu);
++ 	hv_synic_disable_regs(cpu);
+++>>>>>>> 74347a99e73a (x86/Hyper-V: Unload vmbus channel in hv panic callback)
+  	hyperv_cleanup();
+  };
+  
+diff --git a/drivers/hv/channel_mgmt.c b/drivers/hv/channel_mgmt.c
+index 7cce288d5af7..7466ea78a15a 100644
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@ -839,6 +839,9 @@ void vmbus_initiate_unload(bool crash)
+ {
+ 	struct vmbus_channel_message_header hdr;
+ 
++	if (xchg(&vmbus_connection.conn_state, DISCONNECTED) == DISCONNECTED)
++		return;
++
+ 	/* Pre-Win2012R2 hosts don't support reconnect */
+ 	if (vmbus_proto_version < VERSION_WIN8_1)
+ 		return;
+* Unmerged path drivers/hv/vmbus_drv.c
