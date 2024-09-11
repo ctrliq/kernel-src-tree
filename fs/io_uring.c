@@ -2646,13 +2646,14 @@ out:
 
 		io_submit_sqe(ctx, &s, statep, &link, force_nonblock);
 	}
-	io_commit_sqring(ctx);
 
 	if (link)
 		io_queue_link_head(ctx, link, &link->submit, shadow_req,
 					!block_for_last);
 	if (statep)
 		io_submit_state_end(statep);
+
+	io_commit_sqring(ctx);
 
 	return submit;
 }
