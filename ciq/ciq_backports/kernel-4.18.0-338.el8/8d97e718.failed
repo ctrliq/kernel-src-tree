@@ -1,0 +1,132 @@
+perf/core: Add PERF_SAMPLE_DATA_PAGE_SIZE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit 8d97e71811aaafe4abf611dc24822fd6e73df1a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/8d97e718.failed
+
+Current perf can report both virtual addresses and physical addresses,
+but not the MMU page size. Without the MMU page size information of the
+utilized page, users cannot decide whether to promote/demote large pages
+to optimize memory usage.
+
+Add a new sample type for the data MMU page size.
+
+Current perf already has a facility to collect data virtual addresses.
+A page walker is required to walk the pages tables and calculate the
+MMU page size from a given virtual address.
+
+On some platforms, e.g., X86, the page walker is invoked in an NMI
+handler. So the page walker must be NMI-safe and low overhead. Besides,
+the page walker should work for both user and kernel virtual address.
+The existing generic page walker, e.g., walk_page_range_novma(), is a
+little bit complex and doesn't guarantee the NMI-safe. The follow_page()
+is only for user-virtual address.
+
+Add a new function perf_get_page_size() to walk the page tables and
+calculate the MMU page size. In the function:
+- Interrupts have to be disabled to prevent any teardown of the page
+  tables.
+- For user space threads, the current->mm is used for the page walker.
+  For kernel threads and the like, the current->mm is NULL. The init_mm
+  is used for the page walker. The active_mm is not used here, because
+  it can be NULL.
+  Quote from Peter Zijlstra,
+  "context_switch() can set prev->active_mm to NULL when it transfers it
+   to @next. It does this before @current is updated. So an NMI that
+   comes in between this active_mm swizzling and updating @current will
+   see !active_mm."
+- The MMU page size is calculated from the page table level.
+
+The method should work for all architectures, but it has only been
+verified on X86. Should there be some architectures, which support perf,
+where the method doesn't work, it can be fixed later separately.
+Reporting the wrong page size would not be fatal for the architecture.
+
+Some under discussion features may impact the method in the future.
+Quote from Dave Hansen,
+  "There are lots of weird things folks are trying to do with the page
+   tables, like Address Space Isolation.  For instance, if you get a
+   perf NMI when running userspace, current->mm->pgd is *different* than
+   the PGD that was in use when userspace was running. It's close enough
+   today, but it might not stay that way."
+If the case happens later, lots of consecutive page walk errors will
+happen. The worst case is that lots of page-size '0' are returned, which
+would not be fatal.
+In the perf tool, a check is implemented to detect this case. Once it
+happens, a kernel patch could be implemented accordingly then.
+
+	Suggested-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20201001135749.2804-2-kan.liang@linux.intel.com
+(cherry picked from commit 8d97e71811aaafe4abf611dc24822fd6e73df1a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/perf_event.h
+#	include/uapi/linux/perf_event.h
+#	kernel/events/core.c
+diff --cc include/linux/perf_event.h
+index 477e3a44ef5b,7e3785dd27d9..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -1053,7 -1033,8 +1053,12 @@@ struct perf_sample_data 
+  	u64				stack_user_size;
+  
+  	u64				phys_addr;
+++<<<<<<< HEAD
+ +	RH_KABI_BROKEN_INSERT(u64				cgroup)
+++=======
++ 	u64				cgroup;
++ 	u64				data_page_size;
+++>>>>>>> 8d97e71811aa (perf/core: Add PERF_SAMPLE_DATA_PAGE_SIZE)
+  } ____cacheline_aligned;
+  
+  /* default value for data source */
+diff --cc include/uapi/linux/perf_event.h
+index 9a7caf442fb5,cc6ea346e9f9..000000000000
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@@ -143,13 -143,9 +143,19 @@@ enum perf_event_sample_format 
+  	PERF_SAMPLE_PHYS_ADDR			= 1U << 19,
+  	PERF_SAMPLE_AUX				= 1U << 20,
+  	PERF_SAMPLE_CGROUP			= 1U << 21,
+++<<<<<<< HEAD
+ +#ifndef __GENKSYMS__
+ +	PERF_SAMPLE_WEIGHT_STRUCT		= 1U << 22,
+ +
+ +	PERF_SAMPLE_MAX = 1U << 23,		/* non-ABI */
+ +#else
+ +	PERF_SAMPLE_MAX = 1U << 22,		/* non-ABI */
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	PERF_SAMPLE_DATA_PAGE_SIZE		= 1U << 22,
++ 
++ 	PERF_SAMPLE_MAX = 1U << 23,		/* non-ABI */
+++>>>>>>> 8d97e71811aa (perf/core: Add PERF_SAMPLE_DATA_PAGE_SIZE)
+  
+  	__PERF_SAMPLE_CALLCHAIN_EARLY		= 1ULL << 63, /* non-ABI; internal use */
+  };
+diff --cc kernel/events/core.c
+index 04b715857832,a796db2f3b57..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -50,7 -51,7 +50,11 @@@
+  #include <linux/proc_ns.h>
+  #include <linux/mount.h>
+  #include <linux/min_heap.h>
+++<<<<<<< HEAD
+ +#include <linux/buildid.h>
+++=======
++ #include <linux/highmem.h>
+++>>>>>>> 8d97e71811aa (perf/core: Add PERF_SAMPLE_DATA_PAGE_SIZE)
+  
+  #include "internal.h"
+  
+* Unmerged path include/linux/perf_event.h
+* Unmerged path include/uapi/linux/perf_event.h
+* Unmerged path kernel/events/core.c
