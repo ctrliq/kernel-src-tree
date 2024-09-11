@@ -1,0 +1,398 @@
+inet: Run SK_LOOKUP BPF program on socket lookup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jakub Sitnicki <jakub@cloudflare.com>
+commit 1559b4aa1db443096af493c7d621dc156054babe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1559b4aa.failed
+
+Run a BPF program before looking up a listening socket on the receive path.
+Program selects a listening socket to yield as result of socket lookup by
+calling bpf_sk_assign() helper and returning SK_PASS code. Program can
+revert its decision by assigning a NULL socket with bpf_sk_assign().
+
+Alternatively, BPF program can also fail the lookup by returning with
+SK_DROP, or let the lookup continue as usual with SK_PASS on return, when
+no socket has been selected with bpf_sk_assign().
+
+This lets the user match packets with listening sockets freely at the last
+possible point on the receive path, where we know that packets are destined
+for local delivery after undergoing policing, filtering, and routing.
+
+With BPF code selecting the socket, directing packets destined to an IP
+range or to a port range to a single socket becomes possible.
+
+In case multiple programs are attached, they are run in series in the order
+in which they were attached. The end result is determined from return codes
+of all the programs according to following rules:
+
+ 1. If any program returned SK_PASS and selected a valid socket, the socket
+    is used as result of socket lookup.
+ 2. If more than one program returned SK_PASS and selected a socket,
+    last selection takes effect.
+ 3. If any program returned SK_DROP, and no program returned SK_PASS and
+    selected a socket, socket lookup fails with -ECONNREFUSED.
+ 4. If all programs returned SK_PASS and none of them selected a socket,
+    socket lookup continues to htable-based lookup.
+
+	Suggested-by: Marek Majkowski <marek@cloudflare.com>
+	Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200717103536.397595-5-jakub@cloudflare.com
+(cherry picked from commit 1559b4aa1db443096af493c7d621dc156054babe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/net_namespace.c
+#	net/core/filter.c
+diff --cc net/core/filter.c
+index 7f019106de88,2bd129b5ae74..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -9193,6 -9229,189 +9193,192 @@@ const struct bpf_verifier_ops sk_reusep
+  
+  const struct bpf_prog_ops sk_reuseport_prog_ops = {
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ DEFINE_STATIC_KEY_FALSE(bpf_sk_lookup_enabled);
++ EXPORT_SYMBOL(bpf_sk_lookup_enabled);
++ 
++ BPF_CALL_3(bpf_sk_lookup_assign, struct bpf_sk_lookup_kern *, ctx,
++ 	   struct sock *, sk, u64, flags)
++ {
++ 	if (unlikely(flags & ~(BPF_SK_LOOKUP_F_REPLACE |
++ 			       BPF_SK_LOOKUP_F_NO_REUSEPORT)))
++ 		return -EINVAL;
++ 	if (unlikely(sk && sk_is_refcounted(sk)))
++ 		return -ESOCKTNOSUPPORT; /* reject non-RCU freed sockets */
++ 	if (unlikely(sk && sk->sk_state == TCP_ESTABLISHED))
++ 		return -ESOCKTNOSUPPORT; /* reject connected sockets */
++ 
++ 	/* Check if socket is suitable for packet L3/L4 protocol */
++ 	if (sk && sk->sk_protocol != ctx->protocol)
++ 		return -EPROTOTYPE;
++ 	if (sk && sk->sk_family != ctx->family &&
++ 	    (sk->sk_family == AF_INET || ipv6_only_sock(sk)))
++ 		return -EAFNOSUPPORT;
++ 
++ 	if (ctx->selected_sk && !(flags & BPF_SK_LOOKUP_F_REPLACE))
++ 		return -EEXIST;
++ 
++ 	/* Select socket as lookup result */
++ 	ctx->selected_sk = sk;
++ 	ctx->no_reuseport = flags & BPF_SK_LOOKUP_F_NO_REUSEPORT;
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_sk_lookup_assign_proto = {
++ 	.func		= bpf_sk_lookup_assign,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_SOCKET_OR_NULL,
++ 	.arg3_type	= ARG_ANYTHING,
++ };
++ 
++ static const struct bpf_func_proto *
++ sk_lookup_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_perf_event_output:
++ 		return &bpf_event_output_data_proto;
++ 	case BPF_FUNC_sk_assign:
++ 		return &bpf_sk_lookup_assign_proto;
++ 	case BPF_FUNC_sk_release:
++ 		return &bpf_sk_release_proto;
++ 	default:
++ 		return bpf_base_func_proto(func_id);
++ 	}
++ }
++ 
++ static bool sk_lookup_is_valid_access(int off, int size,
++ 				      enum bpf_access_type type,
++ 				      const struct bpf_prog *prog,
++ 				      struct bpf_insn_access_aux *info)
++ {
++ 	if (off < 0 || off >= sizeof(struct bpf_sk_lookup))
++ 		return false;
++ 	if (off % size != 0)
++ 		return false;
++ 	if (type != BPF_READ)
++ 		return false;
++ 
++ 	switch (off) {
++ 	case offsetof(struct bpf_sk_lookup, sk):
++ 		info->reg_type = PTR_TO_SOCKET_OR_NULL;
++ 		return size == sizeof(__u64);
++ 
++ 	case bpf_ctx_range(struct bpf_sk_lookup, family):
++ 	case bpf_ctx_range(struct bpf_sk_lookup, protocol):
++ 	case bpf_ctx_range(struct bpf_sk_lookup, remote_ip4):
++ 	case bpf_ctx_range(struct bpf_sk_lookup, local_ip4):
++ 	case bpf_ctx_range_till(struct bpf_sk_lookup, remote_ip6[0], remote_ip6[3]):
++ 	case bpf_ctx_range_till(struct bpf_sk_lookup, local_ip6[0], local_ip6[3]):
++ 	case bpf_ctx_range(struct bpf_sk_lookup, remote_port):
++ 	case bpf_ctx_range(struct bpf_sk_lookup, local_port):
++ 		bpf_ctx_record_field_size(info, sizeof(__u32));
++ 		return bpf_ctx_narrow_access_ok(off, size, sizeof(__u32));
++ 
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ static u32 sk_lookup_convert_ctx_access(enum bpf_access_type type,
++ 					const struct bpf_insn *si,
++ 					struct bpf_insn *insn_buf,
++ 					struct bpf_prog *prog,
++ 					u32 *target_size)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 
++ 	switch (si->off) {
++ 	case offsetof(struct bpf_sk_lookup, sk):
++ 		*insn++ = BPF_LDX_MEM(BPF_SIZEOF(void *), si->dst_reg, si->src_reg,
++ 				      offsetof(struct bpf_sk_lookup_kern, selected_sk));
++ 		break;
++ 
++ 	case offsetof(struct bpf_sk_lookup, family):
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct bpf_sk_lookup_kern,
++ 						     family, 2, target_size));
++ 		break;
++ 
++ 	case offsetof(struct bpf_sk_lookup, protocol):
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct bpf_sk_lookup_kern,
++ 						     protocol, 2, target_size));
++ 		break;
++ 
++ 	case offsetof(struct bpf_sk_lookup, remote_ip4):
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct bpf_sk_lookup_kern,
++ 						     v4.saddr, 4, target_size));
++ 		break;
++ 
++ 	case offsetof(struct bpf_sk_lookup, local_ip4):
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct bpf_sk_lookup_kern,
++ 						     v4.daddr, 4, target_size));
++ 		break;
++ 
++ 	case bpf_ctx_range_till(struct bpf_sk_lookup,
++ 				remote_ip6[0], remote_ip6[3]): {
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		int off = si->off;
++ 
++ 		off -= offsetof(struct bpf_sk_lookup, remote_ip6[0]);
++ 		off += bpf_target_off(struct in6_addr, s6_addr32[0], 4, target_size);
++ 		*insn++ = BPF_LDX_MEM(BPF_SIZEOF(void *), si->dst_reg, si->src_reg,
++ 				      offsetof(struct bpf_sk_lookup_kern, v6.saddr));
++ 		*insn++ = BPF_JMP_IMM(BPF_JEQ, si->dst_reg, 0, 1);
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg, off);
++ #else
++ 		*insn++ = BPF_MOV32_IMM(si->dst_reg, 0);
++ #endif
++ 		break;
++ 	}
++ 	case bpf_ctx_range_till(struct bpf_sk_lookup,
++ 				local_ip6[0], local_ip6[3]): {
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		int off = si->off;
++ 
++ 		off -= offsetof(struct bpf_sk_lookup, local_ip6[0]);
++ 		off += bpf_target_off(struct in6_addr, s6_addr32[0], 4, target_size);
++ 		*insn++ = BPF_LDX_MEM(BPF_SIZEOF(void *), si->dst_reg, si->src_reg,
++ 				      offsetof(struct bpf_sk_lookup_kern, v6.daddr));
++ 		*insn++ = BPF_JMP_IMM(BPF_JEQ, si->dst_reg, 0, 1);
++ 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg, off);
++ #else
++ 		*insn++ = BPF_MOV32_IMM(si->dst_reg, 0);
++ #endif
++ 		break;
++ 	}
++ 	case offsetof(struct bpf_sk_lookup, remote_port):
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct bpf_sk_lookup_kern,
++ 						     sport, 2, target_size));
++ 		break;
++ 
++ 	case offsetof(struct bpf_sk_lookup, local_port):
++ 		*insn++ = BPF_LDX_MEM(BPF_H, si->dst_reg, si->src_reg,
++ 				      bpf_target_off(struct bpf_sk_lookup_kern,
++ 						     dport, 2, target_size));
++ 		break;
++ 	}
++ 
++ 	return insn - insn_buf;
++ }
++ 
++ const struct bpf_prog_ops sk_lookup_prog_ops = {
++ };
++ 
++ const struct bpf_verifier_ops sk_lookup_verifier_ops = {
++ 	.get_func_proto		= sk_lookup_func_proto,
++ 	.is_valid_access	= sk_lookup_is_valid_access,
++ 	.convert_ctx_access	= sk_lookup_convert_ctx_access,
++ };
++ 
+++>>>>>>> 1559b4aa1db4 (inet: Run SK_LOOKUP BPF program on socket lookup)
+  #endif /* CONFIG_INET */
+  
+  DEFINE_BPF_DISPATCHER(xdp)
+* Unmerged path kernel/bpf/net_namespace.c
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index c66524220071..825454333239 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -1287,4 +1287,95 @@ struct bpf_sockopt_kern {
+ 
+ int copy_bpf_fprog_from_user(struct sock_fprog *dst, void __user *src, int len);
+ 
++extern struct static_key_false bpf_sk_lookup_enabled;
++
++/* Runners for BPF_SK_LOOKUP programs to invoke on socket lookup.
++ *
++ * Allowed return values for a BPF SK_LOOKUP program are SK_PASS and
++ * SK_DROP. Their meaning is as follows:
++ *
++ *  SK_PASS && ctx.selected_sk != NULL: use selected_sk as lookup result
++ *  SK_PASS && ctx.selected_sk == NULL: continue to htable-based socket lookup
++ *  SK_DROP                           : terminate lookup with -ECONNREFUSED
++ *
++ * This macro aggregates return values and selected sockets from
++ * multiple BPF programs according to following rules in order:
++ *
++ *  1. If any program returned SK_PASS and a non-NULL ctx.selected_sk,
++ *     macro result is SK_PASS and last ctx.selected_sk is used.
++ *  2. If any program returned SK_DROP return value,
++ *     macro result is SK_DROP.
++ *  3. Otherwise result is SK_PASS and ctx.selected_sk is NULL.
++ *
++ * Caller must ensure that the prog array is non-NULL, and that the
++ * array as well as the programs it contains remain valid.
++ */
++#define BPF_PROG_SK_LOOKUP_RUN_ARRAY(array, ctx, func)			\
++	({								\
++		struct bpf_sk_lookup_kern *_ctx = &(ctx);		\
++		struct bpf_prog_array_item *_item;			\
++		struct sock *_selected_sk = NULL;			\
++		bool _no_reuseport = false;				\
++		struct bpf_prog *_prog;					\
++		bool _all_pass = true;					\
++		u32 _ret;						\
++									\
++		migrate_disable();					\
++		_item = &(array)->items[0];				\
++		while ((_prog = READ_ONCE(_item->prog))) {		\
++			/* restore most recent selection */		\
++			_ctx->selected_sk = _selected_sk;		\
++			_ctx->no_reuseport = _no_reuseport;		\
++									\
++			_ret = func(_prog, _ctx);			\
++			if (_ret == SK_PASS && _ctx->selected_sk) {	\
++				/* remember last non-NULL socket */	\
++				_selected_sk = _ctx->selected_sk;	\
++				_no_reuseport = _ctx->no_reuseport;	\
++			} else if (_ret == SK_DROP && _all_pass) {	\
++				_all_pass = false;			\
++			}						\
++			_item++;					\
++		}							\
++		_ctx->selected_sk = _selected_sk;			\
++		_ctx->no_reuseport = _no_reuseport;			\
++		migrate_enable();					\
++		_all_pass || _selected_sk ? SK_PASS : SK_DROP;		\
++	 })
++
++static inline bool bpf_sk_lookup_run_v4(struct net *net, int protocol,
++					const __be32 saddr, const __be16 sport,
++					const __be32 daddr, const u16 dport,
++					struct sock **psk)
++{
++	struct bpf_prog_array *run_array;
++	struct sock *selected_sk = NULL;
++	bool no_reuseport = false;
++
++	rcu_read_lock();
++	run_array = rcu_dereference(net->bpf.run_array[NETNS_BPF_SK_LOOKUP]);
++	if (run_array) {
++		struct bpf_sk_lookup_kern ctx = {
++			.family		= AF_INET,
++			.protocol	= protocol,
++			.v4.saddr	= saddr,
++			.v4.daddr	= daddr,
++			.sport		= sport,
++			.dport		= dport,
++		};
++		u32 act;
++
++		act = BPF_PROG_SK_LOOKUP_RUN_ARRAY(run_array, ctx, BPF_PROG_RUN);
++		if (act == SK_PASS) {
++			selected_sk = ctx.selected_sk;
++			no_reuseport = ctx.no_reuseport;
++		} else {
++			selected_sk = ERR_PTR(-ECONNREFUSED);
++		}
++	}
++	rcu_read_unlock();
++	*psk = selected_sk;
++	return no_reuseport;
++}
++
+ #endif /* __LINUX_FILTER_H__ */
+* Unmerged path kernel/bpf/net_namespace.c
+* Unmerged path net/core/filter.c
+diff --git a/net/ipv4/inet_hashtables.c b/net/ipv4/inet_hashtables.c
+index d78df8d86a44..28de151454f5 100644
+--- a/net/ipv4/inet_hashtables.c
++++ b/net/ipv4/inet_hashtables.c
+@@ -311,6 +311,29 @@ static struct sock *inet_lhash2_lookup(struct net *net,
+ 	return result;
+ }
+ 
++static inline struct sock *inet_lookup_run_bpf(struct net *net,
++					       struct inet_hashinfo *hashinfo,
++					       struct sk_buff *skb, int doff,
++					       __be32 saddr, __be16 sport,
++					       __be32 daddr, u16 hnum)
++{
++	struct sock *sk, *reuse_sk;
++	bool no_reuseport;
++
++	if (hashinfo != &tcp_hashinfo)
++		return NULL; /* only TCP is supported */
++
++	no_reuseport = bpf_sk_lookup_run_v4(net, IPPROTO_TCP,
++					    saddr, sport, daddr, hnum, &sk);
++	if (no_reuseport || IS_ERR_OR_NULL(sk))
++		return sk;
++
++	reuse_sk = lookup_reuseport(net, sk, skb, doff, saddr, sport, daddr, hnum);
++	if (reuse_sk)
++		sk = reuse_sk;
++	return sk;
++}
++
+ struct sock *__inet_lookup_listener(struct net *net,
+ 				    struct inet_hashinfo *hashinfo,
+ 				    struct sk_buff *skb, int doff,
+@@ -334,6 +357,14 @@ struct sock *__inet_lookup_listener(struct net *net,
+ 	 * Try lhash2 (which is hashed by port and addr) instead.
+ 	 */
+ 
++	/* Lookup redirect from BPF */
++	if (static_branch_unlikely(&bpf_sk_lookup_enabled)) {
++		result = inet_lookup_run_bpf(net, hashinfo, skb, doff,
++					     saddr, sport, daddr, hnum);
++		if (result)
++			goto done;
++	}
++
+ 	hash2 = ipv4_portaddr_hash(net, daddr, hnum);
+ 	ilb2 = inet_lhash2_bucket(hashinfo, hash2);
+ 	if (ilb2->count > ilb->count)
