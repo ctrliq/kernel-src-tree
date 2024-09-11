@@ -1,0 +1,246 @@
+x86/traps: Attempt to fixup exceptions in vDSO before signaling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 334872a0919890a70cccd00b8e11931020a819be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/334872a0.failed
+
+vDSO functions can now leverage an exception fixup mechanism similar to
+kernel exception fixup.  For vDSO exception fixup, the initial user is
+Intel's Software Guard Extensions (SGX), which will wrap the low-level
+transitions to/from the enclave, i.e. EENTER and ERESUME instructions,
+in a vDSO function and leverage fixup to intercept exceptions that would
+otherwise generate a signal.  This allows the vDSO wrapper to return the
+fault information directly to its caller, obviating the need for SGX
+applications and libraries to juggle signal handlers.
+
+Attempt to fixup vDSO exceptions immediately prior to populating and
+sending signal information.  Except for the delivery mechanism, an
+exception in a vDSO function should be treated like any other exception
+in userspace, e.g. any fault that is successfully handled by the kernel
+should not be directly visible to userspace.
+
+Although it's debatable whether or not all exceptions are of interest to
+enclaves, defer to the vDSO fixup to decide whether to do fixup or
+generate a signal.  Future users of vDSO fixup, if there ever are any,
+will undoubtedly have different requirements than SGX enclaves, e.g. the
+fixup vs. signal logic can be made function specific if/when necessary.
+
+	Suggested-by: Andy Lutomirski <luto@amacapital.net>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Jarkko Sakkinen <jarkko@kernel.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Acked-by: Jethro Beekman <jethro@fortanix.com>
+Link: https://lkml.kernel.org/r/20201112220135.165028-19-jarkko@kernel.org
+(cherry picked from commit 334872a0919890a70cccd00b8e11931020a819be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/traps.c
+#	arch/x86/mm/fault.c
+diff --cc arch/x86/kernel/traps.c
+index bceb85be1c08,7798d862983f..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -58,10 -56,11 +58,16 @@@
+  #include <asm/mach_traps.h>
+  #include <asm/alternative.h>
+  #include <asm/fpu/xstate.h>
+ +#include <asm/trace/mpx.h>
+ +#include <asm/mpx.h>
+  #include <asm/vm86.h>
+  #include <asm/umip.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/insn.h>
++ #include <asm/insn-eval.h>
++ #include <asm/vdso.h>
+++>>>>>>> 334872a09198 (x86/traps: Attempt to fixup exceptions in vDSO before signaling)
+  
+  #ifdef CONFIG_X86_64
+  #include <asm/x86_init.h>
+@@@ -561,18 -549,22 +570,28 @@@ do_general_protection(struct pt_regs *r
+  	}
+  
+  	tsk = current;
+ +	if (!user_mode(regs)) {
+ +		if (fixup_exception(regs, X86_TRAP_GP))
+ +			return;
+  
+ -	if (user_mode(regs)) {
+  		tsk->thread.error_code = error_code;
+  		tsk->thread.trap_nr = X86_TRAP_GP;
+++<<<<<<< HEAD
+ +		if (notify_die(DIE_GPF, desc, regs, error_code,
+ +			       X86_TRAP_GP, SIGSEGV) != NOTIFY_STOP)
+ +			die(desc, regs, error_code);
+ +		return;
+++=======
++ 
++ 		if (fixup_vdso_exception(regs, X86_TRAP_GP, error_code, 0))
++ 			return;
++ 
++ 		show_signal(tsk, SIGSEGV, "", desc, regs, error_code);
++ 		force_sig(SIGSEGV);
++ 		goto exit;
+++>>>>>>> 334872a09198 (x86/traps: Attempt to fixup exceptions in vDSO before signaling)
+  	}
+  
+ -	if (fixup_exception(regs, X86_TRAP_GP, error_code, 0))
+ -		goto exit;
+ -
+  	tsk->thread.error_code = error_code;
+  	tsk->thread.trap_nr = X86_TRAP_GP;
+  
+@@@ -874,40 -1053,63 +893,43 @@@ static void math_error(struct pt_regs *
+  	si_code = fpu__exception_code(fpu, trapnr);
+  	/* Retry when we get spurious exceptions: */
+  	if (!si_code)
+ -		goto exit;
+ +		return;
+  
++ 	if (fixup_vdso_exception(regs, trapnr, 0, 0))
++ 		return;
++ 
+  	force_sig_fault(SIGFPE, si_code,
+ -			(void __user *)uprobe_get_trap_addr(regs));
+ -exit:
+ -	cond_local_irq_disable(regs);
+ +			(void __user *)uprobe_get_trap_addr(regs), task);
+  }
+  
+ -DEFINE_IDTENTRY(exc_coprocessor_error)
+ +dotraplinkage void do_coprocessor_error(struct pt_regs *regs, long error_code)
+  {
+ -	math_error(regs, X86_TRAP_MF);
+ +	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+ +	math_error(regs, error_code, X86_TRAP_MF);
+  }
+  
+ -DEFINE_IDTENTRY(exc_simd_coprocessor_error)
+ +dotraplinkage void
+ +do_simd_coprocessor_error(struct pt_regs *regs, long error_code)
+  {
+ -	if (IS_ENABLED(CONFIG_X86_INVD_BUG)) {
+ -		/* AMD 486 bug: INVD in CPL 0 raises #XF instead of #GP */
+ -		if (!static_cpu_has(X86_FEATURE_XMM)) {
+ -			__exc_general_protection(regs, 0);
+ -			return;
+ -		}
+ -	}
+ -	math_error(regs, X86_TRAP_XF);
+ +	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+ +	math_error(regs, error_code, X86_TRAP_XF);
+  }
+  
+ -DEFINE_IDTENTRY(exc_spurious_interrupt_bug)
+ +dotraplinkage void
+ +do_spurious_interrupt_bug(struct pt_regs *regs, long error_code)
+  {
+ -	/*
+ -	 * This addresses a Pentium Pro Erratum:
+ -	 *
+ -	 * PROBLEM: If the APIC subsystem is configured in mixed mode with
+ -	 * Virtual Wire mode implemented through the local APIC, an
+ -	 * interrupt vector of 0Fh (Intel reserved encoding) may be
+ -	 * generated by the local APIC (Int 15).  This vector may be
+ -	 * generated upon receipt of a spurious interrupt (an interrupt
+ -	 * which is removed before the system receives the INTA sequence)
+ -	 * instead of the programmed 8259 spurious interrupt vector.
+ -	 *
+ -	 * IMPLICATION: The spurious interrupt vector programmed in the
+ -	 * 8259 is normally handled by an operating system's spurious
+ -	 * interrupt handler. However, a vector of 0Fh is unknown to some
+ -	 * operating systems, which would crash if this erratum occurred.
+ -	 *
+ -	 * In theory this could be limited to 32bit, but the handler is not
+ -	 * hurting and who knows which other CPUs suffer from this.
+ -	 */
+ +	cond_local_irq_enable(regs);
+  }
+  
+ -DEFINE_IDTENTRY(exc_device_not_available)
+ +dotraplinkage void
+ +do_device_not_available(struct pt_regs *regs, long error_code)
+  {
+ -	unsigned long cr0 = read_cr0();
+ +	unsigned long cr0;
+ +
+ +	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+  
+  #ifdef CONFIG_MATH_EMULATION
+ -	if (!boot_cpu_has(X86_FEATURE_FPU) && (cr0 & X86_CR0_EM)) {
+ +	if (!boot_cpu_has(X86_FEATURE_FPU) && (read_cr0() & X86_CR0_EM)) {
+  		struct math_emu_info info = { };
+  
+  		cond_local_irq_enable(regs);
+diff --cc arch/x86/mm/fault.c
+index e075641dae7b,f1f1b5a0956a..000000000000
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@@ -27,6 -26,11 +27,14 @@@
+  #include <asm/vm86.h>			/* struct vm86			*/
+  #include <asm/mmu_context.h>		/* vma_pkey()			*/
+  #include <asm/efi.h>			/* efi_recover_from_page_fault()*/
+++<<<<<<< HEAD
+++=======
++ #include <asm/desc.h>			/* store_idt(), ...		*/
++ #include <asm/cpu_entry_area.h>		/* exception stack		*/
++ #include <asm/pgtable_areas.h>		/* VMALLOC_START, ...		*/
++ #include <asm/kvm_para.h>		/* kvm_handle_async_pf		*/
++ #include <asm/vdso.h>			/* fixup_vdso_exception()	*/
+++>>>>>>> 334872a09198 (x86/traps: Attempt to fixup exceptions in vDSO before signaling)
+  
+  #define CREATE_TRACE_POINTS
+  #include <asm/trace/exceptions.h>
+@@@ -839,26 -813,11 +847,29 @@@ __bad_area_nosemaphore(struct pt_regs *
+  		if (is_errata100(regs, address))
+  			return;
+  
+ -		sanitize_error_code(address, &error_code);
+ +#ifdef CONFIG_X86_64
+ +		/*
+ +		 * Instruction fetch faults in the vsyscall page might need
+ +		 * emulation.
+ +		 */
+ +		if (unlikely((error_code & X86_PF_INSTR) &&
+ +			     ((address & ~0xfff) == VSYSCALL_ADDR))) {
+ +			if (emulate_vsyscall(regs, address))
+ +				return;
+ +		}
+ +#endif
+ +
+ +		/*
+ +		 * To avoid leaking information about the kernel page table
+ +		 * layout, pretend that user-mode accesses to kernel addresses
+ +		 * are always protection faults.
+ +		 */
+ +		if (address >= TASK_SIZE_MAX)
+ +			error_code |= X86_PF_PROT;
+  
++ 		if (fixup_vdso_exception(regs, X86_TRAP_PF, error_code, address))
++ 			return;
++ 
+  		if (likely(show_unhandled_signals))
+  			show_signal_msg(regs, error_code, address, tsk);
+  
+@@@ -976,6 -935,11 +987,14 @@@ do_sigbus(struct pt_regs *regs, unsigne
+  	if (is_prefetch(regs, error_code, address))
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	sanitize_error_code(address, &error_code);
++ 
++ 	if (fixup_vdso_exception(regs, X86_TRAP_PF, error_code, address))
++ 		return;
++ 
+++>>>>>>> 334872a09198 (x86/traps: Attempt to fixup exceptions in vDSO before signaling)
+  	set_signal_archinfo(address, error_code);
+  
+  #ifdef CONFIG_MEMORY_FAILURE
+* Unmerged path arch/x86/kernel/traps.c
+* Unmerged path arch/x86/mm/fault.c
