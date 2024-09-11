@@ -1,0 +1,182 @@
+x86/fpu: Restore from kernel memory on the 64-bit path too
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+commit 926b21f37b072ae4c117052de45a975c6d468fec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/926b21f3.failed
+
+The 64-bit case (both 64-bit and 32-bit frames) loads the new state from
+user memory.
+
+However, doing this is not desired if the FPU state is going to be
+restored on return to userland: it would be required to disable
+preemption in order to avoid a context switch which would set
+TIF_NEED_FPU_LOAD. If this happens before the restore operation then the
+loaded registers would become volatile.
+
+Furthermore, disabling preemption while accessing user memory requires
+to disable the pagefault handler. An error during FXRSTOR would then
+mean that either a page fault occurred (and it would have to be retried
+with enabled page fault handler) or a #GP occurred because the xstate is
+bogus (after all, the signal handler can modify it).
+
+In order to avoid that mess, copy the FPU state from userland, validate
+it and then load it. The copy_kernel_…() helpers are basically just
+like the old helpers except that they operate on kernel memory and the
+fault handler just sets the error value and the caller handles it.
+
+copy_user_to_fpregs_zeroing() and its helpers remain and will be used
+later for a fastpath optimisation.
+
+ [ bp: Clarify commit message. ]
+
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Aubrey Li <aubrey.li@intel.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+	Cc: kvm ML <kvm@vger.kernel.org>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: x86-ml <x86@kernel.org>
+Link: https://lkml.kernel.org/r/20190403164156.19645-22-bigeasy@linutronix.de
+(cherry picked from commit 926b21f37b072ae4c117052de45a975c6d468fec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/signal.c
+diff --cc arch/x86/kernel/fpu/signal.c
+index ef1568522109,9ea1eaa4c9b1..000000000000
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@@ -234,7 -234,8 +234,12 @@@ sanitize_restored_xstate(struct task_st
+  		 */
+  		xsave->i387.mxcsr &= mxcsr_feature_mask;
+  
+++<<<<<<< HEAD
+ +		convert_to_fxsr(tsk, ia32_env);
+++=======
++ 		if (ia32_env)
++ 			convert_to_fxsr(&state->fxsave, ia32_env);
+++>>>>>>> 926b21f37b07 (x86/fpu: Restore from kernel memory on the 64-bit path too)
+  	}
+  }
+  
+@@@ -333,22 -329,24 +338,29 @@@ static int __fpu__restore_sig(void __us
+  		}
+  
+  		if (err || __copy_from_user(&env, buf, sizeof(env))) {
+ +			fpstate_init(&fpu->state);
+ +			trace_x86_fpu_init_state(fpu);
+  			err = -1;
+  		} else {
+ -			sanitize_restored_xstate(state, &env, xfeatures, fx_only);
+ -			copy_kernel_to_fpregs(state);
+ +			sanitize_restored_xstate(tsk, &env, xfeatures, fx_only);
+  		}
+  
+ -		kfree(tmp);
+ +		fpu->initialized = 1;
+ +		preempt_disable();
+ +		fpu__restore(fpu);
+ +		preempt_enable();
+ +
+  		return err;
+  	} else {
++ 		union fpregs_state *state;
++ 		void *tmp;
+  		int ret;
+  
++ 		tmp = kzalloc(sizeof(*state) + fpu_kernel_xstate_size + 64, GFP_KERNEL);
++ 		if (!tmp)
++ 			return -ENOMEM;
++ 		state = PTR_ALIGN(tmp, 64);
++ 
+  		/*
+  		 * For 64-bit frames and 32-bit fsave frames, restore the user
+  		 * state to the registers directly (with exceptions handled).
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 8265ef2d693b..407cdbfe7214 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -117,6 +117,21 @@ extern void fpstate_sanitize_xstate(struct fpu *fpu);
+ 	err;								\
+ })
+ 
++#define kernel_insn_err(insn, output, input...)				\
++({									\
++	int err;							\
++	asm volatile("1:" #insn "\n\t"					\
++		     "2:\n"						\
++		     ".section .fixup,\"ax\"\n"				\
++		     "3:  movl $-1,%[err]\n"				\
++		     "    jmp  2b\n"					\
++		     ".previous\n"					\
++		     _ASM_EXTABLE(1b, 3b)				\
++		     : [err] "=r" (err), output				\
++		     : "0"(0), input);					\
++	err;								\
++})
++
+ #define kernel_insn(insn, output, input...)				\
+ 	asm volatile("1:" #insn "\n\t"					\
+ 		     "2:\n"						\
+@@ -153,6 +168,14 @@ static inline void copy_kernel_to_fxregs(struct fxregs_state *fx)
+ 	}
+ }
+ 
++static inline int copy_kernel_to_fxregs_err(struct fxregs_state *fx)
++{
++	if (IS_ENABLED(CONFIG_X86_32))
++		return kernel_insn_err(fxrstor %[fx], "=m" (*fx), [fx] "m" (*fx));
++	else
++		return kernel_insn_err(fxrstorq %[fx], "=m" (*fx), [fx] "m" (*fx));
++}
++
+ static inline int copy_user_to_fxregs(struct fxregs_state __user *fx)
+ {
+ 	if (IS_ENABLED(CONFIG_X86_32))
+@@ -170,6 +193,11 @@ static inline void copy_kernel_to_fregs(struct fregs_state *fx)
+ 	kernel_insn(frstor %[fx], "=m" (*fx), [fx] "m" (*fx));
+ }
+ 
++static inline int copy_kernel_to_fregs_err(struct fregs_state *fx)
++{
++	return kernel_insn_err(frstor %[fx], "=m" (*fx), [fx] "m" (*fx));
++}
++
+ static inline int copy_user_to_fregs(struct fregs_state __user *fx)
+ {
+ 	return user_insn(frstor %[fx], "=m" (*fx), [fx] "m" (*fx));
+@@ -395,6 +423,21 @@ static inline int copy_user_to_xregs(struct xregs_state __user *buf, u64 mask)
+ 	return err;
+ }
+ 
++/*
++ * Restore xstate from kernel space xsave area, return an error code instead of
++ * an exception.
++ */
++static inline int copy_kernel_to_xregs_err(struct xregs_state *xstate, u64 mask)
++{
++	u32 lmask = mask;
++	u32 hmask = mask >> 32;
++	int err;
++
++	XSTATE_OP(XRSTOR, xstate, lmask, hmask, err);
++
++	return err;
++}
++
+ /*
+  * These must be called with preempt disabled. Returns
+  * 'true' if the FPU state is still intact and we can
+* Unmerged path arch/x86/kernel/fpu/signal.c
