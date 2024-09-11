@@ -1,0 +1,334 @@
+net/mlx5: E-Switch, Reg/unreg function changed event at correct stage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5: E-Switch, Reg/unreg function changed event at correct stage (Alaa Hleihel) [1724327 1724336]
+Rebuild_FUZZ: 97.01%
+commit-author Bodong Wang <bodong@mellanox.com>
+commit 16fff98a7e827396eb68f9243636b7240f511f10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/16fff98a.failed
+
+When driver is doing eswitch mode change, it's critical to keep number
+of enabled VFs unchanged. However, it can be changed on the fly once
+function changed event is registered.
+
+To remove this uncertainty, function changed event should not be
+registered before all setups, and first be unregistered before all
+cleanups. Wrap this functionality together with vport event handler.
+
+Fixes: 61fc880839e6 ("net/mlx5: E-Switch, Handle representors creation in handler context")
+	Signed-off-by: Bodong Wang <bodong@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 16fff98a7e827396eb68f9243636b7240f511f10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index f4a0b22e3987,b256f397f112..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1685,6 -1715,38 +1685,41 @@@ static int eswitch_vport_event(struct n
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int mlx5_esw_query_functions(struct mlx5_core_dev *dev, u32 *out, int outlen)
++ {
++ 	u32 in[MLX5_ST_SZ_DW(query_esw_functions_in)] = {};
++ 
++ 	MLX5_SET(query_esw_functions_in, in, opcode,
++ 		 MLX5_CMD_OP_QUERY_ESW_FUNCTIONS);
++ 
++ 	return mlx5_cmd_exec(dev, in, sizeof(in), out, outlen);
++ }
++ 
++ static void mlx5_eswitch_event_handlers_register(struct mlx5_eswitch *esw)
++ {
++ 	if (esw->mode == MLX5_ESWITCH_LEGACY) {
++ 		MLX5_NB_INIT(&esw->nb, eswitch_vport_event, NIC_VPORT_CHANGE);
++ 		mlx5_eq_notifier_register(esw->dev, &esw->nb);
++ 	} else if (mlx5_eswitch_is_funcs_handler(esw->dev)) {
++ 		MLX5_NB_INIT(&esw->esw_funcs.nb, mlx5_esw_funcs_changed_handler,
++ 			     ESW_FUNCTIONS_CHANGED);
++ 		mlx5_eq_notifier_register(esw->dev, &esw->esw_funcs.nb);
++ 	}
++ }
++ 
++ static void mlx5_eswitch_event_handlers_unregister(struct mlx5_eswitch *esw)
++ {
++ 	if (esw->mode == MLX5_ESWITCH_LEGACY)
++ 		mlx5_eq_notifier_unregister(esw->dev, &esw->nb);
++ 	else if (mlx5_eswitch_is_funcs_handler(esw->dev))
++ 		mlx5_eq_notifier_unregister(esw->dev, &esw->esw_funcs.nb);
++ 
++ 	flush_workqueue(esw->work_queue);
++ }
++ 
+++>>>>>>> 16fff98a7e82 (net/mlx5: E-Switch, Reg/unreg function changed event at correct stage)
+  /* Public E-Switch API */
+  #define ESW_ALLOWED(esw) ((esw) && MLX5_ESWITCH_MANAGER((esw)->dev))
+  
+@@@ -1732,17 -1793,28 +1767,35 @@@ int mlx5_eswitch_enable_sriov(struct ml
+  	 * 1. L2 table (MPFS) is programmed by PF/VF representors netdevs set_rx_mode
+  	 * 2. FDB/Eswitch is programmed by user space tools
+  	 */
+ -	enabled_events = (mode == MLX5_ESWITCH_LEGACY) ? SRIOV_VPORT_EVENTS : 0;
+ +	enabled_events = (mode == SRIOV_LEGACY) ? SRIOV_VPORT_EVENTS : 0;
+ +	for (i = 0; i <= nvfs; i++)
+ +		esw_enable_vport(esw, i, enabled_events);
+  
+++<<<<<<< HEAD
+ +	if (mode == SRIOV_LEGACY) {
+ +		MLX5_NB_INIT(&esw->nb, eswitch_vport_event, NIC_VPORT_CHANGE);
+ +		mlx5_eq_notifier_register(esw->dev, &esw->nb);
+ +	}
+++=======
++ 	/* Enable PF vport */
++ 	vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_PF);
++ 	esw_enable_vport(esw, vport, enabled_events);
++ 
++ 	/* Enable ECPF vports */
++ 	if (mlx5_ecpf_vport_exists(esw->dev)) {
++ 		vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_ECPF);
++ 		esw_enable_vport(esw, vport, enabled_events);
++ 	}
++ 
++ 	/* Enable VF vports */
++ 	mlx5_esw_for_each_vf_vport(esw, i, vport, esw->esw_funcs.num_vfs)
++ 		esw_enable_vport(esw, vport, enabled_events);
++ 
++ 	mlx5_eswitch_event_handlers_register(esw);
+++>>>>>>> 16fff98a7e82 (net/mlx5: E-Switch, Reg/unreg function changed event at correct stage)
+  
+ -	esw_info(esw->dev, "Enable: mode(%s), nvfs(%d), active vports(%d)\n",
+ -		 mode == MLX5_ESWITCH_LEGACY ? "LEGACY" : "OFFLOADS",
+ -		 esw->esw_funcs.num_vfs, esw->enabled_vports);
+ -
+ +	esw_info(esw->dev, "SRIOV enabled: active vports(%d)\n",
+ +		 esw->enabled_vports);
+  	return 0;
+  
+  abort:
+@@@ -1756,27 -1828,25 +1809,31 @@@
+  	return err;
+  }
+  
+ -void mlx5_eswitch_disable(struct mlx5_eswitch *esw)
+ +void mlx5_eswitch_disable_sriov(struct mlx5_eswitch *esw)
+  {
+  	struct esw_mc_addr *mc_promisc;
+ -	struct mlx5_vport *vport;
+  	int old_mode;
+ +	int nvports;
+  	int i;
+  
+ -	if (!ESW_ALLOWED(esw) || esw->mode == MLX5_ESWITCH_NONE)
+ +	if (!ESW_ALLOWED(esw) || esw->mode == SRIOV_NONE)
+  		return;
+  
+ -	esw_info(esw->dev, "Disable: mode(%s), nvfs(%d), active vports(%d)\n",
+ -		 esw->mode == MLX5_ESWITCH_LEGACY ? "LEGACY" : "OFFLOADS",
+ -		 esw->esw_funcs.num_vfs, esw->enabled_vports);
+ +	esw_info(esw->dev, "disable SRIOV: active vports(%d) mode(%d)\n",
+ +		 esw->enabled_vports, esw->mode);
+  
+  	mc_promisc = &esw->mc_promisc;
+++<<<<<<< HEAD
+ +	nvports = esw->enabled_vports;
+ +
+ +	if (esw->mode == SRIOV_LEGACY)
+ +		mlx5_eq_notifier_unregister(esw->dev, &esw->nb);
+++=======
++ 	mlx5_eswitch_event_handlers_unregister(esw);
+++>>>>>>> 16fff98a7e82 (net/mlx5: E-Switch, Reg/unreg function changed event at correct stage)
+  
+ -	mlx5_esw_for_all_vports(esw, i, vport)
+ -		esw_disable_vport(esw, vport);
+ +	for (i = 0; i < esw->total_vports; i++)
+ +		esw_disable_vport(esw, i);
+  
+  	if (mc_promisc && mc_promisc->uplink_rule)
+  		mlx5_del_flow_rules(mc_promisc->uplink_rule);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index af9a875f1cf1,bfc32bcbf544..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -395,6 -418,114 +395,59 @@@ bool mlx5_esw_multipath_prereq(struct m
+  /* TODO: This mlx5e_tc function shouldn't be called by eswitch */
+  void mlx5e_tc_clean_fdb_peer_flows(struct mlx5_eswitch *esw);
+  
+++<<<<<<< HEAD
+++=======
++ /* The vport getter/iterator are only valid after esw->total_vports
++  * and vport->vport are initialized in mlx5_eswitch_init.
++  */
++ #define mlx5_esw_for_all_vports(esw, i, vport)		\
++ 	for ((i) = MLX5_VPORT_PF;			\
++ 	     (vport) = &(esw)->vports[i],		\
++ 	     (i) < (esw)->total_vports; (i)++)
++ 
++ #define mlx5_esw_for_each_vf_vport(esw, i, vport, nvfs)	\
++ 	for ((i) = MLX5_VPORT_FIRST_VF;			\
++ 	     (vport) = &(esw)->vports[(i)],		\
++ 	     (i) <= (nvfs); (i)++)
++ 
++ #define mlx5_esw_for_each_vf_vport_reverse(esw, i, vport, nvfs)	\
++ 	for ((i) = (nvfs);					\
++ 	     (vport) = &(esw)->vports[(i)],			\
++ 	     (i) >= MLX5_VPORT_FIRST_VF; (i)--)
++ 
++ /* The rep getter/iterator are only valid after esw->total_vports
++  * and vport->vport are initialized in mlx5_eswitch_init.
++  */
++ #define mlx5_esw_for_all_reps(esw, i, rep)			\
++ 	for ((i) = MLX5_VPORT_PF;				\
++ 	     (rep) = &(esw)->offloads.vport_reps[i],		\
++ 	     (i) < (esw)->total_vports; (i)++)
++ 
++ #define mlx5_esw_for_each_vf_rep(esw, i, rep, nvfs)		\
++ 	for ((i) = MLX5_VPORT_FIRST_VF;				\
++ 	     (rep) = &(esw)->offloads.vport_reps[i],		\
++ 	     (i) <= (nvfs); (i)++)
++ 
++ #define mlx5_esw_for_each_vf_rep_reverse(esw, i, rep, nvfs)	\
++ 	for ((i) = (nvfs);					\
++ 	     (rep) = &(esw)->offloads.vport_reps[i],		\
++ 	     (i) >= MLX5_VPORT_FIRST_VF; (i)--)
++ 
++ #define mlx5_esw_for_each_vf_vport_num(esw, vport, nvfs)	\
++ 	for ((vport) = MLX5_VPORT_FIRST_VF; (vport) <= (nvfs); (vport)++)
++ 
++ #define mlx5_esw_for_each_vf_vport_num_reverse(esw, vport, nvfs)	\
++ 	for ((vport) = (nvfs); (vport) >= MLX5_VPORT_FIRST_VF; (vport)--)
++ 
++ struct mlx5_vport *__must_check
++ mlx5_eswitch_get_vport(struct mlx5_eswitch *esw, u16 vport_num);
++ 
++ bool mlx5_eswitch_is_vf_vport(const struct mlx5_eswitch *esw, u16 vport_num);
++ 
++ void mlx5_eswitch_update_num_of_vfs(struct mlx5_eswitch *esw, const int num_vfs);
++ int mlx5_esw_funcs_changed_handler(struct notifier_block *nb, unsigned long type, void *data);
++ 
+++>>>>>>> 16fff98a7e82 (net/mlx5: E-Switch, Reg/unreg function changed event at correct stage)
+  #else  /* CONFIG_MLX5_ESWITCH */
+  /* eswitch API stubs */
+  static inline int  mlx5_eswitch_init(struct mlx5_core_dev *dev) { return 0; }
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 2a02050a09e7,1d790d43e729..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -1599,11 -2044,67 +1599,72 @@@ static void esw_offloads_steering_clean
+  	esw_destroy_vport_rx_group(esw);
+  	esw_destroy_offloads_table(esw);
+  	esw_destroy_offloads_fdb_tables(esw);
+ -	esw_destroy_offloads_acl_tables(esw);
+ +	if (MLX5_CAP_GEN(esw->dev, prio_tag_required))
+ +		esw_prio_tag_acls_cleanup(esw);
+  }
+  
+++<<<<<<< HEAD
+ +int esw_offloads_init(struct mlx5_eswitch *esw, int nvports)
+++=======
++ static void esw_functions_changed_event_handler(struct work_struct *work)
++ {
++ 	u32 out[MLX5_ST_SZ_DW(query_esw_functions_out)] = {};
++ 	struct mlx5_host_work *host_work;
++ 	struct mlx5_eswitch *esw;
++ 	bool host_pf_disabled;
++ 	u16 num_vfs = 0;
++ 	int err;
++ 
++ 	host_work = container_of(work, struct mlx5_host_work, work);
++ 	esw = host_work->esw;
++ 
++ 	err = mlx5_esw_query_functions(esw->dev, out, sizeof(out));
++ 	num_vfs = MLX5_GET(query_esw_functions_out, out,
++ 			   host_params_context.host_num_of_vfs);
++ 	host_pf_disabled = MLX5_GET(query_esw_functions_out, out,
++ 				    host_params_context.host_pf_disabled);
++ 	if (err || host_pf_disabled || num_vfs == esw->esw_funcs.num_vfs)
++ 		goto out;
++ 
++ 	/* Number of VFs can only change from "0 to x" or "x to 0". */
++ 	if (esw->esw_funcs.num_vfs > 0) {
++ 		esw_offloads_unload_vf_reps(esw, esw->esw_funcs.num_vfs);
++ 	} else {
++ 		err = esw_offloads_load_vf_reps(esw, num_vfs);
++ 
++ 		if (err)
++ 			goto out;
++ 	}
++ 
++ 	esw->esw_funcs.num_vfs = num_vfs;
++ 
++ out:
++ 	kfree(host_work);
++ }
++ 
++ int mlx5_esw_funcs_changed_handler(struct notifier_block *nb, unsigned long type, void *data)
++ {
++ 	struct mlx5_esw_functions *esw_funcs;
++ 	struct mlx5_host_work *host_work;
++ 	struct mlx5_eswitch *esw;
++ 
++ 	host_work = kzalloc(sizeof(*host_work), GFP_ATOMIC);
++ 	if (!host_work)
++ 		return NOTIFY_DONE;
++ 
++ 	esw_funcs = mlx5_nb_cof(nb, struct mlx5_esw_functions, nb);
++ 	esw = container_of(esw_funcs, struct mlx5_eswitch, esw_funcs);
++ 
++ 	host_work->esw = esw;
++ 
++ 	INIT_WORK(&host_work->work, esw_functions_changed_event_handler);
++ 	queue_work(esw->work_queue, &host_work->work);
++ 
++ 	return NOTIFY_OK;
++ }
++ 
++ int esw_offloads_init(struct mlx5_eswitch *esw)
+++>>>>>>> 16fff98a7e82 (net/mlx5: E-Switch, Reg/unreg function changed event at correct stage)
+  {
+  	int err;
+  
+@@@ -1618,6 -2123,9 +1679,12 @@@
+  		goto err_reps;
+  
+  	esw_offloads_devcom_init(esw);
+++<<<<<<< HEAD
+++=======
++ 
++ 	mlx5_rdma_enable_roce(esw->dev);
++ 
+++>>>>>>> 16fff98a7e82 (net/mlx5: E-Switch, Reg/unreg function changed event at correct stage)
+  	return 0;
+  
+  err_reps:
+@@@ -1644,10 -2155,13 +1711,14 @@@ static int esw_offloads_stop(struct mlx
+  	return err;
+  }
+  
+ -void esw_offloads_cleanup(struct mlx5_eswitch *esw)
+ +void esw_offloads_cleanup(struct mlx5_eswitch *esw, int nvports)
+  {
+++<<<<<<< HEAD
+++=======
++ 	mlx5_rdma_disable_roce(esw->dev);
+++>>>>>>> 16fff98a7e82 (net/mlx5: E-Switch, Reg/unreg function changed event at correct stage)
+  	esw_offloads_devcom_cleanup(esw);
+ -	esw_offloads_unload_all_reps(esw);
+ -	if (mlx5_eswitch_vport_match_metadata_enabled(esw))
+ -		mlx5_eswitch_disable_passing_vport_metadata(esw);
+ +	esw_offloads_unload_reps(esw, nvports);
+  	esw_offloads_steering_cleanup(esw);
+  }
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
