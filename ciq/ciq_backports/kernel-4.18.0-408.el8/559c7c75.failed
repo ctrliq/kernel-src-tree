@@ -1,0 +1,317 @@
+KVM: SVM: Rename SEV implemenations to conform to kvm_x86_ops hooks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 559c7c75c326ee3e74507910dd15b05dc6a5859d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/559c7c75.failed
+
+Rename svm_vm_copy_asid_from() and svm_vm_migrate_from() to conform to
+the names used by kvm_x86_ops, and opportunistically use "sev" instead of
+"svm" to more precisely identify the role of the hooks.
+
+svm_vm_copy_asid_from() in particular was poorly named as the function
+does much more than simply copy the ASID.
+
+No functional change intended.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20220128005208.4008533-21-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 559c7c75c326ee3e74507910dd15b05dc6a5859d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/sev.c
+#	arch/x86/kvm/svm/svm.c
+#	arch/x86/kvm/svm/svm.h
+diff --cc arch/x86/kvm/svm/sev.c
+index b0aca769f0c7,4662e5fd7559..000000000000
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@@ -1544,7 -1544,224 +1544,228 @@@ static bool is_cmd_allowed_from_mirror(
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +int svm_mem_enc_op(struct kvm *kvm, void __user *argp)
+++=======
++ static int sev_lock_two_vms(struct kvm *dst_kvm, struct kvm *src_kvm)
++ {
++ 	struct kvm_sev_info *dst_sev = &to_kvm_svm(dst_kvm)->sev_info;
++ 	struct kvm_sev_info *src_sev = &to_kvm_svm(src_kvm)->sev_info;
++ 	int r = -EBUSY;
++ 
++ 	if (dst_kvm == src_kvm)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Bail if these VMs are already involved in a migration to avoid
++ 	 * deadlock between two VMs trying to migrate to/from each other.
++ 	 */
++ 	if (atomic_cmpxchg_acquire(&dst_sev->migration_in_progress, 0, 1))
++ 		return -EBUSY;
++ 
++ 	if (atomic_cmpxchg_acquire(&src_sev->migration_in_progress, 0, 1))
++ 		goto release_dst;
++ 
++ 	r = -EINTR;
++ 	if (mutex_lock_killable(&dst_kvm->lock))
++ 		goto release_src;
++ 	if (mutex_lock_killable_nested(&src_kvm->lock, SINGLE_DEPTH_NESTING))
++ 		goto unlock_dst;
++ 	return 0;
++ 
++ unlock_dst:
++ 	mutex_unlock(&dst_kvm->lock);
++ release_src:
++ 	atomic_set_release(&src_sev->migration_in_progress, 0);
++ release_dst:
++ 	atomic_set_release(&dst_sev->migration_in_progress, 0);
++ 	return r;
++ }
++ 
++ static void sev_unlock_two_vms(struct kvm *dst_kvm, struct kvm *src_kvm)
++ {
++ 	struct kvm_sev_info *dst_sev = &to_kvm_svm(dst_kvm)->sev_info;
++ 	struct kvm_sev_info *src_sev = &to_kvm_svm(src_kvm)->sev_info;
++ 
++ 	mutex_unlock(&dst_kvm->lock);
++ 	mutex_unlock(&src_kvm->lock);
++ 	atomic_set_release(&dst_sev->migration_in_progress, 0);
++ 	atomic_set_release(&src_sev->migration_in_progress, 0);
++ }
++ 
++ 
++ static int sev_lock_vcpus_for_migration(struct kvm *kvm)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	unsigned long i, j;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		if (mutex_lock_killable(&vcpu->mutex))
++ 			goto out_unlock;
++ 	}
++ 
++ 	return 0;
++ 
++ out_unlock:
++ 	kvm_for_each_vcpu(j, vcpu, kvm) {
++ 		if (i == j)
++ 			break;
++ 
++ 		mutex_unlock(&vcpu->mutex);
++ 	}
++ 	return -EINTR;
++ }
++ 
++ static void sev_unlock_vcpus_for_migration(struct kvm *kvm)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	unsigned long i;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		mutex_unlock(&vcpu->mutex);
++ 	}
++ }
++ 
++ static void sev_migrate_from(struct kvm_sev_info *dst,
++ 			      struct kvm_sev_info *src)
++ {
++ 	dst->active = true;
++ 	dst->asid = src->asid;
++ 	dst->handle = src->handle;
++ 	dst->pages_locked = src->pages_locked;
++ 	dst->enc_context_owner = src->enc_context_owner;
++ 
++ 	src->asid = 0;
++ 	src->active = false;
++ 	src->handle = 0;
++ 	src->pages_locked = 0;
++ 	src->enc_context_owner = NULL;
++ 
++ 	list_cut_before(&dst->regions_list, &src->regions_list, &src->regions_list);
++ }
++ 
++ static int sev_es_migrate_from(struct kvm *dst, struct kvm *src)
++ {
++ 	unsigned long i;
++ 	struct kvm_vcpu *dst_vcpu, *src_vcpu;
++ 	struct vcpu_svm *dst_svm, *src_svm;
++ 
++ 	if (atomic_read(&src->online_vcpus) != atomic_read(&dst->online_vcpus))
++ 		return -EINVAL;
++ 
++ 	kvm_for_each_vcpu(i, src_vcpu, src) {
++ 		if (!src_vcpu->arch.guest_state_protected)
++ 			return -EINVAL;
++ 	}
++ 
++ 	kvm_for_each_vcpu(i, src_vcpu, src) {
++ 		src_svm = to_svm(src_vcpu);
++ 		dst_vcpu = kvm_get_vcpu(dst, i);
++ 		dst_svm = to_svm(dst_vcpu);
++ 
++ 		/*
++ 		 * Transfer VMSA and GHCB state to the destination.  Nullify and
++ 		 * clear source fields as appropriate, the state now belongs to
++ 		 * the destination.
++ 		 */
++ 		memcpy(&dst_svm->sev_es, &src_svm->sev_es, sizeof(src_svm->sev_es));
++ 		dst_svm->vmcb->control.ghcb_gpa = src_svm->vmcb->control.ghcb_gpa;
++ 		dst_svm->vmcb->control.vmsa_pa = src_svm->vmcb->control.vmsa_pa;
++ 		dst_vcpu->arch.guest_state_protected = true;
++ 
++ 		memset(&src_svm->sev_es, 0, sizeof(src_svm->sev_es));
++ 		src_svm->vmcb->control.ghcb_gpa = INVALID_PAGE;
++ 		src_svm->vmcb->control.vmsa_pa = INVALID_PAGE;
++ 		src_vcpu->arch.guest_state_protected = false;
++ 	}
++ 	to_kvm_svm(src)->sev_info.es_active = false;
++ 	to_kvm_svm(dst)->sev_info.es_active = true;
++ 
++ 	return 0;
++ }
++ 
++ int sev_vm_move_enc_context_from(struct kvm *kvm, unsigned int source_fd)
++ {
++ 	struct kvm_sev_info *dst_sev = &to_kvm_svm(kvm)->sev_info;
++ 	struct kvm_sev_info *src_sev, *cg_cleanup_sev;
++ 	struct file *source_kvm_file;
++ 	struct kvm *source_kvm;
++ 	bool charged = false;
++ 	int ret;
++ 
++ 	source_kvm_file = fget(source_fd);
++ 	if (!file_is_kvm(source_kvm_file)) {
++ 		ret = -EBADF;
++ 		goto out_fput;
++ 	}
++ 
++ 	source_kvm = source_kvm_file->private_data;
++ 	ret = sev_lock_two_vms(kvm, source_kvm);
++ 	if (ret)
++ 		goto out_fput;
++ 
++ 	if (sev_guest(kvm) || !sev_guest(source_kvm)) {
++ 		ret = -EINVAL;
++ 		goto out_unlock;
++ 	}
++ 
++ 	src_sev = &to_kvm_svm(source_kvm)->sev_info;
++ 
++ 	/*
++ 	 * VMs mirroring src's encryption context rely on it to keep the
++ 	 * ASID allocated, but below we are clearing src_sev->asid.
++ 	 */
++ 	if (src_sev->num_mirrored_vms) {
++ 		ret = -EBUSY;
++ 		goto out_unlock;
++ 	}
++ 
++ 	dst_sev->misc_cg = get_current_misc_cg();
++ 	cg_cleanup_sev = dst_sev;
++ 	if (dst_sev->misc_cg != src_sev->misc_cg) {
++ 		ret = sev_misc_cg_try_charge(dst_sev);
++ 		if (ret)
++ 			goto out_dst_cgroup;
++ 		charged = true;
++ 	}
++ 
++ 	ret = sev_lock_vcpus_for_migration(kvm);
++ 	if (ret)
++ 		goto out_dst_cgroup;
++ 	ret = sev_lock_vcpus_for_migration(source_kvm);
++ 	if (ret)
++ 		goto out_dst_vcpu;
++ 
++ 	if (sev_es_guest(source_kvm)) {
++ 		ret = sev_es_migrate_from(kvm, source_kvm);
++ 		if (ret)
++ 			goto out_source_vcpu;
++ 	}
++ 	sev_migrate_from(dst_sev, src_sev);
++ 	kvm_vm_dead(source_kvm);
++ 	cg_cleanup_sev = src_sev;
++ 	ret = 0;
++ 
++ out_source_vcpu:
++ 	sev_unlock_vcpus_for_migration(source_kvm);
++ out_dst_vcpu:
++ 	sev_unlock_vcpus_for_migration(kvm);
++ out_dst_cgroup:
++ 	/* Operates on the source on success, on the destination on failure.  */
++ 	if (charged)
++ 		sev_misc_cg_uncharge(cg_cleanup_sev);
++ 	put_misc_cg(cg_cleanup_sev->misc_cg);
++ 	cg_cleanup_sev->misc_cg = NULL;
++ out_unlock:
++ 	sev_unlock_two_vms(kvm, source_kvm);
++ out_fput:
++ 	if (source_kvm_file)
++ 		fput(source_kvm_file);
++ 	return ret;
++ }
++ 
++ int sev_mem_enc_ioctl(struct kvm *kvm, void __user *argp)
+++>>>>>>> 559c7c75c326 (KVM: SVM: Rename SEV implemenations to conform to kvm_x86_ops hooks)
+  {
+  	struct kvm_sev_cmd sev_cmd;
+  	int r;
+diff --cc arch/x86/kvm/svm/svm.c
+index 11c1fc4d6fd4,10e38bbe174a..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -4564,11 -4605,12 +4564,20 @@@ static struct kvm_x86_ops svm_x86_ops _
+  	.leave_smm = svm_leave_smm,
+  	.enable_smi_window = svm_enable_smi_window,
+  
+++<<<<<<< HEAD
+ +	.mem_enc_op = svm_mem_enc_op,
+ +	.mem_enc_reg_region = svm_register_enc_region,
+ +	.mem_enc_unreg_region = svm_unregister_enc_region,
+ +
+ +	.vm_copy_enc_context_from = svm_vm_copy_asid_from,
+++=======
++ 	.mem_enc_ioctl = sev_mem_enc_ioctl,
++ 	.mem_enc_register_region = sev_mem_enc_register_region,
++ 	.mem_enc_unregister_region = sev_mem_enc_unregister_region,
++ 
++ 	.vm_copy_enc_context_from = sev_vm_copy_enc_context_from,
++ 	.vm_move_enc_context_from = sev_vm_move_enc_context_from,
+++>>>>>>> 559c7c75c326 (KVM: SVM: Rename SEV implemenations to conform to kvm_x86_ops hooks)
+  
+  	.can_emulate_instruction = svm_can_emulate_instruction,
+  
+diff --cc arch/x86/kvm/svm/svm.h
+index 0f269935a4ae,cb6b45bce772..000000000000
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@@ -597,12 -587,13 +597,22 @@@ void svm_vcpu_unblocking(struct kvm_vcp
+  extern unsigned int max_sev_asid;
+  
+  void sev_vm_destroy(struct kvm *kvm);
+++<<<<<<< HEAD
+ +int svm_mem_enc_op(struct kvm *kvm, void __user *argp);
+ +int svm_register_enc_region(struct kvm *kvm,
+ +			    struct kvm_enc_region *range);
+ +int svm_unregister_enc_region(struct kvm *kvm,
+ +			      struct kvm_enc_region *range);
+ +int svm_vm_copy_asid_from(struct kvm *kvm, unsigned int source_fd);
+++=======
++ int sev_mem_enc_ioctl(struct kvm *kvm, void __user *argp);
++ int sev_mem_enc_register_region(struct kvm *kvm,
++ 				struct kvm_enc_region *range);
++ int sev_mem_enc_unregister_region(struct kvm *kvm,
++ 				  struct kvm_enc_region *range);
++ int sev_vm_copy_enc_context_from(struct kvm *kvm, unsigned int source_fd);
++ int sev_vm_move_enc_context_from(struct kvm *kvm, unsigned int source_fd);
+++>>>>>>> 559c7c75c326 (KVM: SVM: Rename SEV implemenations to conform to kvm_x86_ops hooks)
+  void pre_sev_run(struct vcpu_svm *svm, int cpu);
+  void __init sev_set_cpu_caps(void);
+  void __init sev_hardware_setup(void);
+* Unmerged path arch/x86/kvm/svm/sev.c
+* Unmerged path arch/x86/kvm/svm/svm.c
+* Unmerged path arch/x86/kvm/svm/svm.h
