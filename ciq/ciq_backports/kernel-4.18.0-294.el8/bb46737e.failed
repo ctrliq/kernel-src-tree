@@ -1,0 +1,288 @@
+scsi: qla2xxx: Fix regression warnings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Nilesh Javali <njavali@marvell.com>
+commit bb46737ec09e9a072424bf46def2977c5b6b925d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bb46737e.failed
+
+drivers/scsi/qla2xxx/qla_dbg.c:2542:7: warning: The scope of the variable 'pbuf'
+can be reduced. [variableScope]
+drivers/scsi/qla2xxx/qla_init.c:3615:6: warning: Variable 'rc' is assigned a
+value that is never used. [unreadVariable]
+drivers/scsi/qla2xxx/qla_isr.c:81:11-29: WARNING: dma_alloc_coherent use in
+rsp_els already zeroes out memory, so memset is not needed
+drivers/scsi/qla2xxx/qla_mbx.c:4889:15-33: WARNING: dma_alloc_coherent use in
+els_cmd_map already zeroes out memory, so memset is not needed
+
+[mkp: added newline after variable declaration]
+
+Link: https://lore.kernel.org/r/20200403084018.30766-2-njavali@marvell.com
+	Reported-by: kbuild test robot <lkp@intel.com>
+	Signed-off-by: Nilesh Javali <njavali@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit bb46737ec09e9a072424bf46def2977c5b6b925d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_isr.c
+#	drivers/scsi/qla2xxx/qla_mbx.c
+diff --cc drivers/scsi/qla2xxx/qla_isr.c
+index a543bfc41c3e,8a78d395bbc8..000000000000
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@@ -31,6 -31,143 +31,146 @@@ const char *const port_state_str[] = 
+  	"ONLINE"
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void qla24xx_purex_iocb(scsi_qla_host_t *vha, void *pkt,
++ 	void (*process_item)(struct scsi_qla_host *vha, void *pkt))
++ {
++ 	struct purex_list *list = &vha->purex_list;
++ 	struct purex_item *item;
++ 	ulong flags;
++ 
++ 	item = kzalloc(sizeof(*item), GFP_KERNEL);
++ 	if (!item) {
++ 		ql_log(ql_log_warn, vha, 0x5092,
++ 		    ">> Failed allocate purex list item.\n");
++ 		return;
++ 	}
++ 
++ 	item->vha = vha;
++ 	item->process_item = process_item;
++ 	memcpy(&item->iocb, pkt, sizeof(item->iocb));
++ 
++ 	spin_lock_irqsave(&list->lock, flags);
++ 	list_add_tail(&item->list, &list->head);
++ 	spin_unlock_irqrestore(&list->lock, flags);
++ 
++ 	set_bit(PROCESS_PUREX_IOCB, &vha->dpc_flags);
++ }
++ 
++ static void
++ qla24xx_process_abts(struct scsi_qla_host *vha, void *pkt)
++ {
++ 	struct abts_entry_24xx *abts = pkt;
++ 	struct qla_hw_data *ha = vha->hw;
++ 	struct els_entry_24xx *rsp_els;
++ 	struct abts_entry_24xx *abts_rsp;
++ 	dma_addr_t dma;
++ 	uint32_t fctl;
++ 	int rval;
++ 
++ 	ql_dbg(ql_dbg_init, vha, 0x0286, "%s: entered.\n", __func__);
++ 
++ 	ql_log(ql_log_warn, vha, 0x0287,
++ 	    "Processing ABTS xchg=%#x oxid=%#x rxid=%#x seqid=%#x seqcnt=%#x\n",
++ 	    abts->rx_xch_addr_to_abort, abts->ox_id, abts->rx_id,
++ 	    abts->seq_id, abts->seq_cnt);
++ 	ql_dbg(ql_dbg_init + ql_dbg_verbose, vha, 0x0287,
++ 	    "-------- ABTS RCV -------\n");
++ 	ql_dump_buffer(ql_dbg_init + ql_dbg_verbose, vha, 0x0287,
++ 	    (uint8_t *)abts, sizeof(*abts));
++ 
++ 	rsp_els = dma_alloc_coherent(&ha->pdev->dev, sizeof(*rsp_els), &dma,
++ 	    GFP_KERNEL);
++ 	if (!rsp_els) {
++ 		ql_log(ql_log_warn, vha, 0x0287,
++ 		    "Failed allocate dma buffer ABTS/ELS RSP.\n");
++ 		return;
++ 	}
++ 
++ 	/* terminate exchange */
++ 	rsp_els->entry_type = ELS_IOCB_TYPE;
++ 	rsp_els->entry_count = 1;
++ 	rsp_els->nport_handle = ~0;
++ 	rsp_els->rx_xchg_address = abts->rx_xch_addr_to_abort;
++ 	rsp_els->control_flags = EPD_RX_XCHG;
++ 	ql_dbg(ql_dbg_init, vha, 0x0283,
++ 	    "Sending ELS Response to terminate exchange %#x...\n",
++ 	    abts->rx_xch_addr_to_abort);
++ 	ql_dbg(ql_dbg_init + ql_dbg_verbose, vha, 0x0283,
++ 	    "-------- ELS RSP -------\n");
++ 	ql_dump_buffer(ql_dbg_init + ql_dbg_verbose, vha, 0x0283,
++ 	    (uint8_t *)rsp_els, sizeof(*rsp_els));
++ 	rval = qla2x00_issue_iocb(vha, rsp_els, dma, 0);
++ 	if (rval) {
++ 		ql_log(ql_log_warn, vha, 0x0288,
++ 		    "%s: iocb failed to execute -> %x\n", __func__, rval);
++ 	} else if (rsp_els->comp_status) {
++ 		ql_log(ql_log_warn, vha, 0x0289,
++ 		    "%s: iocb failed to complete -> completion=%#x subcode=(%#x,%#x)\n",
++ 		    __func__, rsp_els->comp_status,
++ 		    rsp_els->error_subcode_1, rsp_els->error_subcode_2);
++ 	} else {
++ 		ql_dbg(ql_dbg_init, vha, 0x028a,
++ 		    "%s: abort exchange done.\n", __func__);
++ 	}
++ 
++ 	/* send ABTS response */
++ 	abts_rsp = (void *)rsp_els;
++ 	memset(abts_rsp, 0, sizeof(*abts_rsp));
++ 	abts_rsp->entry_type = ABTS_RSP_TYPE;
++ 	abts_rsp->entry_count = 1;
++ 	abts_rsp->nport_handle = abts->nport_handle;
++ 	abts_rsp->vp_idx = abts->vp_idx;
++ 	abts_rsp->sof_type = abts->sof_type & 0xf0;
++ 	abts_rsp->rx_xch_addr = abts->rx_xch_addr;
++ 	abts_rsp->d_id[0] = abts->s_id[0];
++ 	abts_rsp->d_id[1] = abts->s_id[1];
++ 	abts_rsp->d_id[2] = abts->s_id[2];
++ 	abts_rsp->r_ctl = FC_ROUTING_BLD | FC_R_CTL_BLD_BA_ACC;
++ 	abts_rsp->s_id[0] = abts->d_id[0];
++ 	abts_rsp->s_id[1] = abts->d_id[1];
++ 	abts_rsp->s_id[2] = abts->d_id[2];
++ 	abts_rsp->cs_ctl = abts->cs_ctl;
++ 	/* include flipping bit23 in fctl */
++ 	fctl = ~(abts->f_ctl[2] | 0x7F) << 16 |
++ 	    FC_F_CTL_LAST_SEQ | FC_F_CTL_END_SEQ | FC_F_CTL_SEQ_INIT;
++ 	abts_rsp->f_ctl[0] = fctl >> 0 & 0xff;
++ 	abts_rsp->f_ctl[1] = fctl >> 8 & 0xff;
++ 	abts_rsp->f_ctl[2] = fctl >> 16 & 0xff;
++ 	abts_rsp->type = FC_TYPE_BLD;
++ 	abts_rsp->rx_id = abts->rx_id;
++ 	abts_rsp->ox_id = abts->ox_id;
++ 	abts_rsp->payload.ba_acc.aborted_rx_id = abts->rx_id;
++ 	abts_rsp->payload.ba_acc.aborted_ox_id = abts->ox_id;
++ 	abts_rsp->payload.ba_acc.high_seq_cnt = ~0;
++ 	abts_rsp->rx_xch_addr_to_abort = abts->rx_xch_addr_to_abort;
++ 	ql_dbg(ql_dbg_init, vha, 0x028b,
++ 	    "Sending BA ACC response to ABTS %#x...\n",
++ 	    abts->rx_xch_addr_to_abort);
++ 	ql_dbg(ql_dbg_init + ql_dbg_verbose, vha, 0x028b,
++ 	    "-------- ELS RSP -------\n");
++ 	ql_dump_buffer(ql_dbg_init + ql_dbg_verbose, vha, 0x028b,
++ 	    (uint8_t *)abts_rsp, sizeof(*abts_rsp));
++ 	rval = qla2x00_issue_iocb(vha, abts_rsp, dma, 0);
++ 	if (rval) {
++ 		ql_log(ql_log_warn, vha, 0x028c,
++ 		    "%s: iocb failed to execute -> %x\n", __func__, rval);
++ 	} else if (abts_rsp->comp_status) {
++ 		ql_log(ql_log_warn, vha, 0x028d,
++ 		    "%s: iocb failed to complete -> completion=%#x subcode=(%#x,%#x)\n",
++ 		    __func__, abts_rsp->comp_status,
++ 		    abts_rsp->payload.error.subcode1,
++ 		    abts_rsp->payload.error.subcode2);
++ 	} else {
++ 		ql_dbg(ql_dbg_init, vha, 0x028ea,
++ 		    "%s: done.\n", __func__);
++ 	}
++ 
++ 	dma_free_coherent(&ha->pdev->dev, sizeof(*rsp_els), rsp_els, dma);
++ }
++ 
+++>>>>>>> bb46737ec09e (scsi: qla2xxx: Fix regression warnings)
+  /**
+   * qla2100_intr_handler() - Process interrupts for the ISP2100 and ISP2200.
+   * @irq: interrupt number
+diff --cc drivers/scsi/qla2xxx/qla_mbx.c
+index 290775a6bef6,4ed90437e8c4..000000000000
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@@ -4859,6 -4868,62 +4859,65 @@@ qla24xx_get_port_login_templ(scsi_qla_h
+  }
+  
+  int
+++<<<<<<< HEAD
+++=======
++ qla25xx_set_els_cmds_supported(scsi_qla_host_t *vha)
++ {
++ 	int rval;
++ 	mbx_cmd_t mc;
++ 	mbx_cmd_t *mcp = &mc;
++ 	uint8_t *els_cmd_map;
++ 	dma_addr_t els_cmd_map_dma;
++ 	uint cmd_opcode = ELS_COMMAND_RDP;
++ 	uint index = cmd_opcode / 8;
++ 	uint bit = cmd_opcode % 8;
++ 	struct qla_hw_data *ha = vha->hw;
++ 
++ 	if (!IS_QLA25XX(ha) && !IS_QLA2031(ha) && !IS_QLA27XX(ha))
++ 		return QLA_SUCCESS;
++ 
++ 	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1197,
++ 	    "Entered %s.\n", __func__);
++ 
++ 	els_cmd_map = dma_alloc_coherent(&ha->pdev->dev, ELS_CMD_MAP_SIZE,
++ 	    &els_cmd_map_dma, GFP_KERNEL);
++ 	if (!els_cmd_map) {
++ 		ql_log(ql_log_warn, vha, 0x7101,
++ 		    "Failed to allocate RDP els command param.\n");
++ 		return QLA_MEMORY_ALLOC_FAILED;
++ 	}
++ 
++ 	els_cmd_map[index] |= 1 << bit;
++ 
++ 	mcp->mb[0] = MBC_SET_RNID_PARAMS;
++ 	mcp->mb[1] = RNID_TYPE_ELS_CMD << 8;
++ 	mcp->mb[2] = MSW(LSD(els_cmd_map_dma));
++ 	mcp->mb[3] = LSW(LSD(els_cmd_map_dma));
++ 	mcp->mb[6] = MSW(MSD(els_cmd_map_dma));
++ 	mcp->mb[7] = LSW(MSD(els_cmd_map_dma));
++ 	mcp->out_mb = MBX_7|MBX_6|MBX_3|MBX_2|MBX_1|MBX_0;
++ 	mcp->in_mb = MBX_1|MBX_0;
++ 	mcp->tov = MBX_TOV_SECONDS;
++ 	mcp->flags = MBX_DMA_OUT;
++ 	mcp->buf_size = ELS_CMD_MAP_SIZE;
++ 	rval = qla2x00_mailbox_command(vha, mcp);
++ 
++ 	if (rval != QLA_SUCCESS) {
++ 		ql_dbg(ql_dbg_mbx, vha, 0x118d,
++ 		    "Failed=%x (%x,%x).\n", rval, mcp->mb[0], mcp->mb[1]);
++ 	} else {
++ 		ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x118c,
++ 		    "Done %s.\n", __func__);
++ 	}
++ 
++ 	dma_free_coherent(&ha->pdev->dev, DMA_POOL_SIZE,
++ 	   els_cmd_map, els_cmd_map_dma);
++ 
++ 	return rval;
++ }
++ 
++ int
+++>>>>>>> bb46737ec09e (scsi: qla2xxx: Fix regression warnings)
+  qla24xx_get_buffer_credits(scsi_qla_host_t *vha, struct buffer_credit_24xx *bbc,
+  	dma_addr_t bbc_dma)
+  {
+diff --git a/drivers/scsi/qla2xxx/qla_dbg.c b/drivers/scsi/qla2xxx/qla_dbg.c
+index f301a8048b2f..bf1e98f11990 100644
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@ -2539,7 +2539,6 @@ ql_dbg(uint level, scsi_qla_host_t *vha, uint id, const char *fmt, ...)
+ {
+ 	va_list va;
+ 	struct va_format vaf;
+-	char pbuf[64];
+ 
+ 	va_start(va, fmt);
+ 
+@@ -2547,6 +2546,8 @@ ql_dbg(uint level, scsi_qla_host_t *vha, uint id, const char *fmt, ...)
+ 	vaf.va = &va;
+ 
+ 	if (!ql_mask_match(level)) {
++		char pbuf[64];
++
+ 		if (vha != NULL) {
+ 			const struct pci_dev *pdev = vha->hw->pdev;
+ 			/* <module-name> <msg-id>:<host> Message */
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index 295890a808b2..7173c0352129 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -3607,8 +3607,6 @@ qla24xx_detect_sfp(scsi_qla_host_t *vha)
+ 			ha->lr_distance = LR_DISTANCE_5K;
+ 	}
+ 
+-	if (!vha->flags.init_done)
+-		rc = QLA_SUCCESS;
+ out:
+ 	ql_dbg(ql_dbg_async, vha, 0x507b,
+ 	    "SFP detect: %s-Range SFP %s (nvr=%x ll=%x lr=%x lrd=%x).\n",
+* Unmerged path drivers/scsi/qla2xxx/qla_isr.c
+* Unmerged path drivers/scsi/qla2xxx/qla_mbx.c
