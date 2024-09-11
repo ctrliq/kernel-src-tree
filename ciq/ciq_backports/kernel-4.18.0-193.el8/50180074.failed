@@ -1,0 +1,128 @@
+net/tls: add kernel-driven resync mechanism for TX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] tls: add kernel-driven resync mechanism for TX (Sabrina Dubroca) [1760375]
+Rebuild_FUZZ: 95.83%
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 50180074099fcda752d9d56282d23242b126ebc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/50180074.failed
+
+TLS offload drivers keep track of TCP seq numbers to make sure
+the packets are fed into the HW in order.
+
+When packets get dropped on the way through the stack, the driver
+will get out of sync and have to use fallback encryption, but unless
+TCP seq number is resynced it will never match the packets correctly
+(or even worse - use incorrect record sequence number after TCP seq
+wraps).
+
+Existing drivers (mlx5) feed the entire record on every out-of-order
+event, allowing FW/HW to always be in sync.
+
+This patch adds an alternative, more akin to the RX resync.  When
+driver sees a frame which is past its expected sequence number the
+stream must have gotten out of order (if the sequence number is
+smaller than expected its likely a retransmission which doesn't
+require resync).  Driver will ask the stack to perform TX sync
+before it submits the next full record, and fall back to software
+crypto until stack has performed the sync.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 50180074099fcda752d9d56282d23242b126ebc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/tls-offload.rst
+* Unmerged path Documentation/networking/tls-offload.rst
+* Unmerged path Documentation/networking/tls-offload.rst
+diff --git a/include/net/tls.h b/include/net/tls.h
+index 654ae56c8ae2..12a2ebc48eda 100644
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -207,6 +207,11 @@ struct tls_offload_context_tx {
+ 
+ enum tls_context_flags {
+ 	TLS_RX_SYNC_RUNNING = 0,
++	/* Unlike RX where resync is driven entirely by the core in TX only
++	 * the driver knows when things went out of sync, so we need the flag
++	 * to be atomic.
++	 */
++	TLS_TX_SYNC_SCHED = 1,
+ };
+ 
+ struct cipher_context {
+@@ -564,6 +569,24 @@ static inline void tls_offload_rx_resync_request(struct sock *sk, __be32 seq)
+ }
+ 
+ 
++static inline void tls_offload_tx_resync_request(struct sock *sk)
++{
++	struct tls_context *tls_ctx = tls_get_ctx(sk);
++
++	WARN_ON(test_and_set_bit(TLS_TX_SYNC_SCHED, &tls_ctx->flags));
++}
++
++/* Driver's seq tracking has to be disabled until resync succeeded */
++static inline bool tls_offload_tx_resync_pending(struct sock *sk)
++{
++	struct tls_context *tls_ctx = tls_get_ctx(sk);
++	bool ret;
++
++	ret = test_bit(TLS_TX_SYNC_SCHED, &tls_ctx->flags);
++	smp_mb__after_atomic();
++	return ret;
++}
++
+ int tls_proccess_cmsg(struct sock *sk, struct msghdr *msg,
+ 		      unsigned char *record_type);
+ void tls_register_device(struct tls_device *device);
+diff --git a/net/tls/tls_device.c b/net/tls/tls_device.c
+index 330d54f9f11e..1da80cff8d0f 100644
+--- a/net/tls/tls_device.c
++++ b/net/tls/tls_device.c
+@@ -209,6 +209,29 @@ void tls_device_free_resources_tx(struct sock *sk)
+ 	tls_free_partial_record(sk, tls_ctx);
+ }
+ 
++static void tls_device_resync_tx(struct sock *sk, struct tls_context *tls_ctx,
++				 u32 seq)
++{
++	struct net_device *netdev;
++	struct sk_buff *skb;
++	u8 *rcd_sn;
++
++	skb = tcp_write_queue_tail(sk);
++	if (skb)
++		TCP_SKB_CB(skb)->eor = 1;
++
++	rcd_sn = tls_ctx->tx.rec_seq;
++
++	down_read(&device_offload_lock);
++	netdev = tls_ctx->netdev;
++	if (netdev)
++		netdev->tlsdev_ops->tls_dev_resync(netdev, sk, seq, rcd_sn,
++						   TLS_OFFLOAD_CTX_DIR_TX);
++	up_read(&device_offload_lock);
++
++	clear_bit_unlock(TLS_TX_SYNC_SCHED, &tls_ctx->flags);
++}
++
+ static void tls_append_frag(struct tls_record_info *record,
+ 			    struct page_frag *pfrag,
+ 			    int size)
+@@ -264,6 +287,10 @@ static int tls_push_record(struct sock *sk,
+ 	list_add_tail(&record->list, &offload_ctx->records_list);
+ 	spin_unlock_irq(&offload_ctx->lock);
+ 	offload_ctx->open_record = NULL;
++
++	if (test_bit(TLS_TX_SYNC_SCHED, &ctx->flags))
++		tls_device_resync_tx(sk, ctx, tp->write_seq);
++
+ 	tls_advance_record_sn(sk, prot, &ctx->tx);
+ 
+ 	for (i = 0; i < record->num_frags; i++) {
