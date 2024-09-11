@@ -1,0 +1,2599 @@
+ethtool: extend coalesce setting uAPI with CQE mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Yufeng Mo <moyufeng@huawei.com>
+commit f3ccfda1931977b80267ba54070a1aeafa18f6ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/f3ccfda1.failed
+
+In order to support more coalesce parameters through netlink,
+add two new parameter kernel_coal and extack for .set_coalesce
+and .get_coalesce, then some extra info can return to user with
+the netlink API.
+
+	Signed-off-by: Yufeng Mo <moyufeng@huawei.com>
+	Signed-off-by: Huazhong Tan <tanhuazhong@huawei.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit f3ccfda1931977b80267ba54070a1aeafa18f6ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/freescale/dpaa/dpaa_ethtool.c
+#	drivers/net/ethernet/freescale/enetc/enetc_ethtool.c
+#	drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
+#	drivers/net/ethernet/huawei/hinic/hinic_ethtool.c
+#	drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+#	drivers/net/ethernet/qlogic/qede/qede.h
+#	drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+#	drivers/net/ethernet/qlogic/qlge/qlge_ethtool.c
+#	drivers/net/ethernet/ti/cpsw_ethtool.c
+#	drivers/net/ethernet/ti/cpsw_new.c
+#	drivers/net/ethernet/ti/cpsw_priv.h
+#	drivers/net/ethernet/xilinx/ll_temac_main.c
+#	drivers/net/virtio_net.c
+#	drivers/net/wireless/ath/wil6210/ethtool.c
+diff --cc drivers/net/ethernet/freescale/dpaa/dpaa_ethtool.c
+index cc8fe9532885,763d2c7b5fb1..000000000000
+--- a/drivers/net/ethernet/freescale/dpaa/dpaa_ethtool.c
++++ b/drivers/net/ethernet/freescale/dpaa/dpaa_ethtool.c
+@@@ -491,7 -477,113 +491,114 @@@ static int dpaa_set_rxnfc(struct net_de
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int dpaa_get_ts_info(struct net_device *net_dev,
++ 			    struct ethtool_ts_info *info)
++ {
++ 	struct device *dev = net_dev->dev.parent;
++ 	struct device_node *mac_node = dev->of_node;
++ 	struct device_node *fman_node = NULL, *ptp_node = NULL;
++ 	struct platform_device *ptp_dev = NULL;
++ 	struct ptp_qoriq *ptp = NULL;
++ 
++ 	info->phc_index = -1;
++ 
++ 	fman_node = of_get_parent(mac_node);
++ 	if (fman_node)
++ 		ptp_node = of_parse_phandle(fman_node, "ptimer-handle", 0);
++ 
++ 	if (ptp_node)
++ 		ptp_dev = of_find_device_by_node(ptp_node);
++ 
++ 	if (ptp_dev)
++ 		ptp = platform_get_drvdata(ptp_dev);
++ 
++ 	if (ptp)
++ 		info->phc_index = ptp->phc_index;
++ 
++ 	info->so_timestamping = SOF_TIMESTAMPING_TX_HARDWARE |
++ 				SOF_TIMESTAMPING_RX_HARDWARE |
++ 				SOF_TIMESTAMPING_RAW_HARDWARE;
++ 	info->tx_types = (1 << HWTSTAMP_TX_OFF) |
++ 			 (1 << HWTSTAMP_TX_ON);
++ 	info->rx_filters = (1 << HWTSTAMP_FILTER_NONE) |
++ 			   (1 << HWTSTAMP_FILTER_ALL);
++ 
++ 	return 0;
++ }
++ 
++ static int dpaa_get_coalesce(struct net_device *dev,
++ 			     struct ethtool_coalesce *c,
++ 			     struct kernel_ethtool_coalesce *kernel_coal,
++ 			     struct netlink_ext_ack *extack)
++ {
++ 	struct qman_portal *portal;
++ 	u32 period;
++ 	u8 thresh;
++ 
++ 	portal = qman_get_affine_portal(smp_processor_id());
++ 	qman_portal_get_iperiod(portal, &period);
++ 	qman_dqrr_get_ithresh(portal, &thresh);
++ 
++ 	c->rx_coalesce_usecs = period;
++ 	c->rx_max_coalesced_frames = thresh;
++ 
++ 	return 0;
++ }
++ 
++ static int dpaa_set_coalesce(struct net_device *dev,
++ 			     struct ethtool_coalesce *c,
++ 			     struct kernel_ethtool_coalesce *kernel_coal,
++ 			     struct netlink_ext_ack *extack)
++ {
++ 	const cpumask_t *cpus = qman_affine_cpus();
++ 	bool needs_revert[NR_CPUS] = {false};
++ 	struct qman_portal *portal;
++ 	u32 period, prev_period;
++ 	u8 thresh, prev_thresh;
++ 	int cpu, res;
++ 
++ 	period = c->rx_coalesce_usecs;
++ 	thresh = c->rx_max_coalesced_frames;
++ 
++ 	/* save previous values */
++ 	portal = qman_get_affine_portal(smp_processor_id());
++ 	qman_portal_get_iperiod(portal, &prev_period);
++ 	qman_dqrr_get_ithresh(portal, &prev_thresh);
++ 
++ 	/* set new values */
++ 	for_each_cpu_and(cpu, cpus, cpu_online_mask) {
++ 		portal = qman_get_affine_portal(cpu);
++ 		res = qman_portal_set_iperiod(portal, period);
++ 		if (res)
++ 			goto revert_values;
++ 		res = qman_dqrr_set_ithresh(portal, thresh);
++ 		if (res) {
++ 			qman_portal_set_iperiod(portal, prev_period);
++ 			goto revert_values;
++ 		}
++ 		needs_revert[cpu] = true;
++ 	}
++ 
++ 	return 0;
++ 
++ revert_values:
++ 	/* restore previous values */
++ 	for_each_cpu_and(cpu, cpus, cpu_online_mask) {
++ 		if (!needs_revert[cpu])
++ 			continue;
++ 		portal = qman_get_affine_portal(cpu);
++ 		/* previous values will not fail, ignore return value */
++ 		qman_portal_set_iperiod(portal, prev_period);
++ 		qman_dqrr_set_ithresh(portal, prev_thresh);
++ 	}
++ 
++ 	return res;
++ }
++ 
+++>>>>>>> f3ccfda19319 (ethtool: extend coalesce setting uAPI with CQE mode)
+  const struct ethtool_ops dpaa_ethtool_ops = {
+ -	.supported_coalesce_params = ETHTOOL_COALESCE_RX_USECS |
+ -				     ETHTOOL_COALESCE_RX_MAX_FRAMES,
+  	.get_drvinfo = dpaa_get_drvinfo,
+  	.get_msglevel = dpaa_get_msglevel,
+  	.set_msglevel = dpaa_set_msglevel,
+diff --cc drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
+index c02157312fa9,049be076fd18..000000000000
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
+@@@ -840,31 -1178,24 +840,38 @@@ static void hns3_get_channels(struct ne
+  		h->ae_algo->ops->get_channels(h, ch);
+  }
+  
+++<<<<<<< HEAD
+ +static int hns3_get_coalesce_per_queue(struct net_device *netdev, u32 queue,
+ +				       struct ethtool_coalesce *cmd)
+++=======
++ static int hns3_get_coalesce(struct net_device *netdev,
++ 			     struct ethtool_coalesce *cmd,
++ 			     struct kernel_ethtool_coalesce *kernel_coal,
++ 			     struct netlink_ext_ack *extack)
+++>>>>>>> f3ccfda19319 (ethtool: extend coalesce setting uAPI with CQE mode)
+  {
+ +	struct hns3_enet_tqp_vector *tx_vector, *rx_vector;
+  	struct hns3_nic_priv *priv = netdev_priv(netdev);
+ -	struct hns3_enet_coalesce *tx_coal = &priv->tx_coal;
+ -	struct hns3_enet_coalesce *rx_coal = &priv->rx_coal;
+  	struct hnae3_handle *h = priv->ae_handle;
+ +	u16 queue_num = h->kinfo.num_tqps;
+  
+ -	if (hns3_nic_resetting(netdev))
+ -		return -EBUSY;
+ +	if (queue >= queue_num) {
+ +		netdev_err(netdev,
+ +			   "Invalid queue value %d! Queue max id=%d\n",
+ +			   queue, queue_num - 1);
+ +		return -EINVAL;
+ +	}
+  
+ -	cmd->use_adaptive_tx_coalesce = tx_coal->adapt_enable;
+ -	cmd->use_adaptive_rx_coalesce = rx_coal->adapt_enable;
+ +	tx_vector = priv->ring_data[queue].ring->tqp_vector;
+ +	rx_vector = priv->ring_data[queue_num + queue].ring->tqp_vector;
+  
+ -	cmd->tx_coalesce_usecs = tx_coal->int_gl;
+ -	cmd->rx_coalesce_usecs = rx_coal->int_gl;
+ +	cmd->use_adaptive_tx_coalesce =
+ +			tx_vector->tx_group.coal.gl_adapt_enable;
+ +	cmd->use_adaptive_rx_coalesce =
+ +			rx_vector->rx_group.coal.gl_adapt_enable;
+ +
+ +	cmd->tx_coalesce_usecs = tx_vector->tx_group.coal.int_gl;
+ +	cmd->rx_coalesce_usecs = rx_vector->rx_group.coal.int_gl;
+  
+  	cmd->tx_coalesce_usecs_high = h->kinfo.int_rl_setting;
+  	cmd->rx_coalesce_usecs_high = h->kinfo.int_rl_setting;
+@@@ -1002,9 -1356,21 +1009,11 @@@ static void hns3_set_coalesce_per_queue
+  }
+  
+  static int hns3_set_coalesce(struct net_device *netdev,
+- 			     struct ethtool_coalesce *cmd)
++ 			     struct ethtool_coalesce *cmd,
++ 			     struct kernel_ethtool_coalesce *kernel_coal,
++ 			     struct netlink_ext_ack *extack)
+  {
+  	struct hnae3_handle *h = hns3_get_handle(netdev);
+ -	struct hns3_nic_priv *priv = netdev_priv(netdev);
+ -	struct hns3_enet_coalesce *tx_coal = &priv->tx_coal;
+ -	struct hns3_enet_coalesce *rx_coal = &priv->rx_coal;
+  	u16 queue_num = h->kinfo.num_tqps;
+  	int ret;
+  	int i;
+diff --cc drivers/net/ethernet/qlogic/qede/qede.h
+index 46df3284e91b,f90dcfe9ee68..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede.h
++++ b/drivers/net/ethernet/qlogic/qede/qede.h
+@@@ -582,6 -580,11 +582,14 @@@ int qede_add_tc_flower_fltr(struct qede
+  			    struct flow_cls_offload *f);
+  
+  void qede_forced_speed_maps_init(void);
+++<<<<<<< HEAD
+++=======
++ int qede_set_coalesce(struct net_device *dev, struct ethtool_coalesce *coal,
++ 		      struct kernel_ethtool_coalesce *kernel_coal,
++ 		      struct netlink_ext_ack *extack);
++ int qede_set_per_coalesce(struct net_device *dev, u32 queue,
++ 			  struct ethtool_coalesce *coal);
+++>>>>>>> f3ccfda19319 (ethtool: extend coalesce setting uAPI with CQE mode)
+  
+  #define RX_RING_SIZE_POW	13
+  #define RX_RING_SIZE		((u16)BIT(RX_RING_SIZE_POW))
+diff --cc drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+index bedbb85a179a,8284c4c1528f..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+@@@ -819,8 -821,9 +821,14 @@@ out
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +static int qede_set_coalesce(struct net_device *dev,
+ +			     struct ethtool_coalesce *coal)
+++=======
++ int qede_set_coalesce(struct net_device *dev, struct ethtool_coalesce *coal,
++ 		      struct kernel_ethtool_coalesce *kernel_coal,
++ 		      struct netlink_ext_ack *extack)
+++>>>>>>> f3ccfda19319 (ethtool: extend coalesce setting uAPI with CQE mode)
+  {
+  	struct qede_dev *edev = netdev_priv(dev);
+  	struct qede_fastpath *fp;
+diff --cc drivers/net/ethernet/qlogic/qlge/qlge_ethtool.c
+index 5edbd532127d,12efcd1057ba..000000000000
+--- a/drivers/net/ethernet/qlogic/qlge/qlge_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qlge/qlge_ethtool.c
+@@@ -595,32 -599,34 +595,39 @@@ static void ql_self_test(struct net_dev
+  	}
+  }
+  
+ -static int qlge_get_regs_len(struct net_device *ndev)
+ +static int ql_get_regs_len(struct net_device *ndev)
+  {
+ -	struct qlge_adapter *qdev = netdev_to_qdev(ndev);
+ +	struct ql_adapter *qdev = netdev_priv(ndev);
+  
+  	if (!test_bit(QL_FRC_COREDUMP, &qdev->flags))
+ -		return sizeof(struct qlge_mpi_coredump);
+ +		return sizeof(struct ql_mpi_coredump);
+  	else
+ -		return sizeof(struct qlge_reg_dump);
+ +		return sizeof(struct ql_reg_dump);
+  }
+  
+ -static void qlge_get_regs(struct net_device *ndev,
+ -			  struct ethtool_regs *regs, void *p)
+ +static void ql_get_regs(struct net_device *ndev,
+ +			struct ethtool_regs *regs, void *p)
+  {
+ -	struct qlge_adapter *qdev = netdev_to_qdev(ndev);
+ +	struct ql_adapter *qdev = netdev_priv(ndev);
+  
+ -	qlge_get_dump(qdev, p);
+ +	ql_get_dump(qdev, p);
+ +	qdev->core_is_dumped = 0;
+  	if (!test_bit(QL_FRC_COREDUMP, &qdev->flags))
+ -		regs->len = sizeof(struct qlge_mpi_coredump);
+ +		regs->len = sizeof(struct ql_mpi_coredump);
+  	else
+ -		regs->len = sizeof(struct qlge_reg_dump);
+ +		regs->len = sizeof(struct ql_reg_dump);
+  }
+  
+++<<<<<<< HEAD:drivers/net/ethernet/qlogic/qlge/qlge_ethtool.c
+ +static int ql_get_coalesce(struct net_device *dev, struct ethtool_coalesce *c)
+++=======
++ static int qlge_get_coalesce(struct net_device *ndev,
++ 			     struct ethtool_coalesce *c,
++ 			     struct kernel_ethtool_coalesce *kernel_coal,
++ 			     struct netlink_ext_ack *extack)
+++>>>>>>> f3ccfda19319 (ethtool: extend coalesce setting uAPI with CQE mode):drivers/staging/qlge/qlge_ethtool.c
+  {
+ -	struct qlge_adapter *qdev = netdev_to_qdev(ndev);
+ +	struct ql_adapter *qdev = netdev_priv(dev);
+  
+  	c->rx_coalesce_usecs = qdev->rx_coalesce_usecs;
+  	c->tx_coalesce_usecs = qdev->tx_coalesce_usecs;
+@@@ -641,9 -647,12 +648,16 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:drivers/net/ethernet/qlogic/qlge/qlge_ethtool.c
+ +static int ql_set_coalesce(struct net_device *ndev, struct ethtool_coalesce *c)
+++=======
++ static int qlge_set_coalesce(struct net_device *ndev,
++ 			     struct ethtool_coalesce *c,
++ 			     struct kernel_ethtool_coalesce *kernel_coal,
++ 			     struct netlink_ext_ack *extack)
+++>>>>>>> f3ccfda19319 (ethtool: extend coalesce setting uAPI with CQE mode):drivers/staging/qlge/qlge_ethtool.c
+  {
+ -	struct qlge_adapter *qdev = netdev_to_qdev(ndev);
+ +	struct ql_adapter *qdev = netdev_priv(ndev);
+  
+  	/* Validate user parameters. */
+  	if (c->rx_coalesce_usecs > qdev->rx_ring_size / 2)
+diff --cc drivers/net/ethernet/xilinx/ll_temac_main.c
+index 60abc9250f56,463094ced104..000000000000
+--- a/drivers/net/ethernet/xilinx/ll_temac_main.c
++++ b/drivers/net/ethernet/xilinx/ll_temac_main.c
+@@@ -967,8 -1272,93 +967,95 @@@ static const struct attribute_group tem
+  	.attrs = temac_device_attrs,
+  };
+  
+++<<<<<<< HEAD
+ +/* ethtool support */
+++=======
++ /* ---------------------------------------------------------------------
++  * ethtool support
++  */
++ 
++ static void ll_temac_ethtools_get_ringparam(struct net_device *ndev,
++ 					    struct ethtool_ringparam *ering)
++ {
++ 	struct temac_local *lp = netdev_priv(ndev);
++ 
++ 	ering->rx_max_pending = RX_BD_NUM_MAX;
++ 	ering->rx_mini_max_pending = 0;
++ 	ering->rx_jumbo_max_pending = 0;
++ 	ering->tx_max_pending = TX_BD_NUM_MAX;
++ 	ering->rx_pending = lp->rx_bd_num;
++ 	ering->rx_mini_pending = 0;
++ 	ering->rx_jumbo_pending = 0;
++ 	ering->tx_pending = lp->tx_bd_num;
++ }
++ 
++ static int ll_temac_ethtools_set_ringparam(struct net_device *ndev,
++ 					   struct ethtool_ringparam *ering)
++ {
++ 	struct temac_local *lp = netdev_priv(ndev);
++ 
++ 	if (ering->rx_pending > RX_BD_NUM_MAX ||
++ 	    ering->rx_mini_pending ||
++ 	    ering->rx_jumbo_pending ||
++ 	    ering->rx_pending > TX_BD_NUM_MAX)
++ 		return -EINVAL;
++ 
++ 	if (netif_running(ndev))
++ 		return -EBUSY;
++ 
++ 	lp->rx_bd_num = ering->rx_pending;
++ 	lp->tx_bd_num = ering->tx_pending;
++ 	return 0;
++ }
++ 
++ static int
++ ll_temac_ethtools_get_coalesce(struct net_device *ndev,
++ 			       struct ethtool_coalesce *ec,
++ 			       struct kernel_ethtool_coalesce *kernel_coal,
++ 			       struct netlink_ext_ack *extack)
++ {
++ 	struct temac_local *lp = netdev_priv(ndev);
++ 
++ 	ec->rx_max_coalesced_frames = lp->coalesce_count_rx;
++ 	ec->tx_max_coalesced_frames = lp->coalesce_count_tx;
++ 	ec->rx_coalesce_usecs = (lp->coalesce_delay_rx * 512) / 100;
++ 	ec->tx_coalesce_usecs = (lp->coalesce_delay_tx * 512) / 100;
++ 	return 0;
++ }
++ 
++ static int
++ ll_temac_ethtools_set_coalesce(struct net_device *ndev,
++ 			       struct ethtool_coalesce *ec,
++ 			       struct kernel_ethtool_coalesce *kernel_coal,
++ 			       struct netlink_ext_ack *extack)
++ {
++ 	struct temac_local *lp = netdev_priv(ndev);
++ 
++ 	if (netif_running(ndev)) {
++ 		netdev_err(ndev,
++ 			   "Please stop netif before applying configuration\n");
++ 		return -EFAULT;
++ 	}
++ 
++ 	if (ec->rx_max_coalesced_frames)
++ 		lp->coalesce_count_rx = ec->rx_max_coalesced_frames;
++ 	if (ec->tx_max_coalesced_frames)
++ 		lp->coalesce_count_tx = ec->tx_max_coalesced_frames;
++ 	/* With typical LocalLink clock speed of 200 MHz and
++ 	 * C_PRESCALAR=1023, each delay count corresponds to 5.12 us.
++ 	 */
++ 	if (ec->rx_coalesce_usecs)
++ 		lp->coalesce_delay_rx =
++ 			min(255U, (ec->rx_coalesce_usecs * 100) / 512);
++ 	if (ec->tx_coalesce_usecs)
++ 		lp->coalesce_delay_tx =
++ 			min(255U, (ec->tx_coalesce_usecs * 100) / 512);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> f3ccfda19319 (ethtool: extend coalesce setting uAPI with CQE mode)
+  static const struct ethtool_ops temac_ethtool_ops = {
+ -	.supported_coalesce_params = ETHTOOL_COALESCE_USECS |
+ -				     ETHTOOL_COALESCE_MAX_FRAMES,
+  	.nway_reset = phy_ethtool_nway_reset,
+  	.get_link = ethtool_op_get_link,
+  	.get_ts_info = ethtool_op_get_ts_info,
+diff --cc drivers/net/virtio_net.c
+index 20814dd573ad,b4ae2ac8a249..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -2244,6 -2319,48 +2244,51 @@@ static int virtnet_get_link_ksettings(s
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int virtnet_set_coalesce(struct net_device *dev,
++ 				struct ethtool_coalesce *ec,
++ 				struct kernel_ethtool_coalesce *kernel_coal,
++ 				struct netlink_ext_ack *extack)
++ {
++ 	struct virtnet_info *vi = netdev_priv(dev);
++ 	int i, napi_weight;
++ 
++ 	if (ec->tx_max_coalesced_frames > 1 ||
++ 	    ec->rx_max_coalesced_frames != 1)
++ 		return -EINVAL;
++ 
++ 	napi_weight = ec->tx_max_coalesced_frames ? NAPI_POLL_WEIGHT : 0;
++ 	if (napi_weight ^ vi->sq[0].napi.weight) {
++ 		if (dev->flags & IFF_UP)
++ 			return -EBUSY;
++ 		for (i = 0; i < vi->max_queue_pairs; i++)
++ 			vi->sq[i].napi.weight = napi_weight;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int virtnet_get_coalesce(struct net_device *dev,
++ 				struct ethtool_coalesce *ec,
++ 				struct kernel_ethtool_coalesce *kernel_coal,
++ 				struct netlink_ext_ack *extack)
++ {
++ 	struct ethtool_coalesce ec_default = {
++ 		.cmd = ETHTOOL_GCOALESCE,
++ 		.rx_max_coalesced_frames = 1,
++ 	};
++ 	struct virtnet_info *vi = netdev_priv(dev);
++ 
++ 	memcpy(ec, &ec_default, sizeof(ec_default));
++ 
++ 	if (vi->sq[0].napi.weight)
++ 		ec->tx_max_coalesced_frames = 1;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> f3ccfda19319 (ethtool: extend coalesce setting uAPI with CQE mode)
+  static void virtnet_init_settings(struct net_device *dev)
+  {
+  	struct virtnet_info *vi = netdev_priv(dev);
+diff --cc drivers/net/wireless/ath/wil6210/ethtool.c
+index e7ff41e623d2,29a9f17c2df0..000000000000
+--- a/drivers/net/wireless/ath/wil6210/ethtool.c
++++ b/drivers/net/wireless/ath/wil6210/ethtool.c
+@@@ -22,28 -11,11 +22,36 @@@
+  
+  #include "wil6210.h"
+  
+++<<<<<<< HEAD
+ +static int wil_ethtoolops_begin(struct net_device *ndev)
+ +{
+ +	struct wil6210_priv *wil = ndev_to_wil(ndev);
+ +
+ +	mutex_lock(&wil->mutex);
+ +
+ +	wil_dbg_misc(wil, "ethtoolops_begin\n");
+ +
+ +	return 0;
+ +}
+ +
+ +static void wil_ethtoolops_complete(struct net_device *ndev)
+ +{
+ +	struct wil6210_priv *wil = ndev_to_wil(ndev);
+ +
+ +	wil_dbg_misc(wil, "ethtoolops_complete\n");
+ +
+ +	mutex_unlock(&wil->mutex);
+ +}
+ +
+ +static int wil_ethtoolops_get_coalesce(struct net_device *ndev,
+ +				       struct ethtool_coalesce *cp)
+++=======
++ static int
++ wil_ethtoolops_get_coalesce(struct net_device *ndev,
++ 			    struct ethtool_coalesce *cp,
++ 			    struct kernel_ethtool_coalesce *kernel_coal,
++ 			    struct netlink_ext_ack *extack)
+++>>>>>>> f3ccfda19319 (ethtool: extend coalesce setting uAPI with CQE mode)
+  {
+  	struct wil6210_priv *wil = ndev_to_wil(ndev);
+  	u32 tx_itr_en, tx_itr_val = 0;
+@@@ -68,11 -41,18 +76,14 @@@
+  
+  	cp->tx_coalesce_usecs = tx_itr_val;
+  	cp->rx_coalesce_usecs = rx_itr_val;
+ -	ret = 0;
+ -
+ -out:
+ -	mutex_unlock(&wil->mutex);
+ -	return ret;
+ +	return 0;
+  }
+  
+- static int wil_ethtoolops_set_coalesce(struct net_device *ndev,
+- 				       struct ethtool_coalesce *cp)
++ static int
++ wil_ethtoolops_set_coalesce(struct net_device *ndev,
++ 			    struct ethtool_coalesce *cp,
++ 			    struct kernel_ethtool_coalesce *kernel_coal,
++ 			    struct netlink_ext_ack *extack)
+  {
+  	struct wil6210_priv *wil = ndev_to_wil(ndev);
+  	struct wireless_dev *wdev = ndev->ieee80211_ptr;
+* Unmerged path drivers/net/ethernet/freescale/enetc/enetc_ethtool.c
+* Unmerged path drivers/net/ethernet/huawei/hinic/hinic_ethtool.c
+* Unmerged path drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_ethtool.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_priv.h
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_ethtool.c b/drivers/infiniband/ulp/ipoib/ipoib_ethtool.c
+index 823f6831e7ea..a09ca21f7dff 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_ethtool.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_ethtool.c
+@@ -72,7 +72,9 @@ static void ipoib_get_drvinfo(struct net_device *netdev,
+ }
+ 
+ static int ipoib_get_coalesce(struct net_device *dev,
+-			      struct ethtool_coalesce *coal)
++			      struct ethtool_coalesce *coal,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
+ 
+@@ -83,7 +85,9 @@ static int ipoib_get_coalesce(struct net_device *dev,
+ }
+ 
+ static int ipoib_set_coalesce(struct net_device *dev,
+-			      struct ethtool_coalesce *coal)
++			      struct ethtool_coalesce *coal,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
+ 	int ret;
+diff --git a/drivers/net/ethernet/amazon/ena/ena_ethtool.c b/drivers/net/ethernet/amazon/ena/ena_ethtool.c
+index 4beaf66b15c2..a8dd5ae1f616 100644
+--- a/drivers/net/ethernet/amazon/ena/ena_ethtool.c
++++ b/drivers/net/ethernet/amazon/ena/ena_ethtool.c
+@@ -352,7 +352,9 @@ static int ena_get_link_ksettings(struct net_device *netdev,
+ }
+ 
+ static int ena_get_coalesce(struct net_device *net_dev,
+-			    struct ethtool_coalesce *coalesce)
++			    struct ethtool_coalesce *coalesce,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct ena_adapter *adapter = netdev_priv(net_dev);
+ 	struct ena_com_dev *ena_dev = adapter->ena_dev;
+@@ -397,7 +399,9 @@ static void ena_update_rx_rings_nonadaptive_intr_moderation(struct ena_adapter *
+ }
+ 
+ static int ena_set_coalesce(struct net_device *net_dev,
+-			    struct ethtool_coalesce *coalesce)
++			    struct ethtool_coalesce *coalesce,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct ena_adapter *adapter = netdev_priv(net_dev);
+ 	struct ena_com_dev *ena_dev = adapter->ena_dev;
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+index a880f10e3e70..a000cfe7de38 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+@@ -429,7 +429,9 @@ static void xgbe_set_msglevel(struct net_device *netdev, u32 msglevel)
+ }
+ 
+ static int xgbe_get_coalesce(struct net_device *netdev,
+-			     struct ethtool_coalesce *ec)
++			     struct ethtool_coalesce *ec,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
+ 
+@@ -444,7 +446,9 @@ static int xgbe_get_coalesce(struct net_device *netdev,
+ }
+ 
+ static int xgbe_set_coalesce(struct net_device *netdev,
+-			     struct ethtool_coalesce *ec)
++			     struct ethtool_coalesce *ec,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
+ 	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c b/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+index 204587980b6a..4bbc9e71bca1 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+@@ -418,7 +418,9 @@ static int aq_ethtool_set_rxnfc(struct net_device *ndev,
+ }
+ 
+ static int aq_ethtool_get_coalesce(struct net_device *ndev,
+-				   struct ethtool_coalesce *coal)
++				   struct ethtool_coalesce *coal,
++				   struct kernel_ethtool_coalesce *kernel_coal,
++				   struct netlink_ext_ack *extack)
+ {
+ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
+ 	struct aq_nic_cfg_s *cfg;
+@@ -442,7 +444,9 @@ static int aq_ethtool_get_coalesce(struct net_device *ndev,
+ }
+ 
+ static int aq_ethtool_set_coalesce(struct net_device *ndev,
+-				   struct ethtool_coalesce *coal)
++				   struct ethtool_coalesce *coal,
++				   struct kernel_ethtool_coalesce *kernel_coal,
++				   struct netlink_ext_ack *extack)
+ {
+ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
+ 	struct aq_nic_cfg_s *cfg;
+diff --git a/drivers/net/ethernet/broadcom/bcmsysport.c b/drivers/net/ethernet/broadcom/bcmsysport.c
+index 2e492a6512c0..d92a344bc8ce 100644
+--- a/drivers/net/ethernet/broadcom/bcmsysport.c
++++ b/drivers/net/ethernet/broadcom/bcmsysport.c
+@@ -602,7 +602,9 @@ static void bcm_sysport_set_tx_coalesce(struct bcm_sysport_tx_ring *ring,
+ }
+ 
+ static int bcm_sysport_get_coalesce(struct net_device *dev,
+-				    struct ethtool_coalesce *ec)
++				    struct ethtool_coalesce *ec,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct bcm_sysport_priv *priv = netdev_priv(dev);
+ 	u32 reg;
+@@ -622,7 +624,9 @@ static int bcm_sysport_get_coalesce(struct net_device *dev,
+ }
+ 
+ static int bcm_sysport_set_coalesce(struct net_device *dev,
+-				    struct ethtool_coalesce *ec)
++				    struct ethtool_coalesce *ec,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct bcm_sysport_priv *priv = netdev_priv(dev);
+ 	struct dim_cq_moder moder;
+diff --git a/drivers/net/ethernet/broadcom/bnx2.c b/drivers/net/ethernet/broadcom/bnx2.c
+index 2ba73d25ec15..607fe3b9faeb 100644
+--- a/drivers/net/ethernet/broadcom/bnx2.c
++++ b/drivers/net/ethernet/broadcom/bnx2.c
+@@ -7243,8 +7243,10 @@ bnx2_set_eeprom(struct net_device *dev, struct ethtool_eeprom *eeprom,
+ 	return rc;
+ }
+ 
+-static int
+-bnx2_get_coalesce(struct net_device *dev, struct ethtool_coalesce *coal)
++static int bnx2_get_coalesce(struct net_device *dev,
++			     struct ethtool_coalesce *coal,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct bnx2 *bp = netdev_priv(dev);
+ 
+@@ -7265,8 +7267,10 @@ bnx2_get_coalesce(struct net_device *dev, struct ethtool_coalesce *coal)
+ 	return 0;
+ }
+ 
+-static int
+-bnx2_set_coalesce(struct net_device *dev, struct ethtool_coalesce *coal)
++static int bnx2_set_coalesce(struct net_device *dev,
++			     struct ethtool_coalesce *coal,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct bnx2 *bp = netdev_priv(dev);
+ 
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_ethtool.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_ethtool.c
+index d4e4ca08321c..c93044db066b 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_ethtool.c
+@@ -1884,7 +1884,9 @@ static int bnx2x_set_eeprom(struct net_device *dev,
+ }
+ 
+ static int bnx2x_get_coalesce(struct net_device *dev,
+-			      struct ethtool_coalesce *coal)
++			      struct ethtool_coalesce *coal,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct bnx2x *bp = netdev_priv(dev);
+ 
+@@ -1897,7 +1899,9 @@ static int bnx2x_get_coalesce(struct net_device *dev,
+ }
+ 
+ static int bnx2x_set_coalesce(struct net_device *dev,
+-			      struct ethtool_coalesce *coal)
++			      struct ethtool_coalesce *coal,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct bnx2x *bp = netdev_priv(dev);
+ 
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+index abcf383c3bac..40c077f206b2 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@ -45,7 +45,9 @@ static void bnxt_set_msglevel(struct net_device *dev, u32 value)
+ }
+ 
+ static int bnxt_get_coalesce(struct net_device *dev,
+-			     struct ethtool_coalesce *coal)
++			     struct ethtool_coalesce *coal,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct bnxt *bp = netdev_priv(dev);
+ 	struct bnxt_coal *hw_coal;
+@@ -75,7 +77,9 @@ static int bnxt_get_coalesce(struct net_device *dev,
+ }
+ 
+ static int bnxt_set_coalesce(struct net_device *dev,
+-			     struct ethtool_coalesce *coal)
++			     struct ethtool_coalesce *coal,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct bnxt *bp = netdev_priv(dev);
+ 	bool update_stats = false;
+diff --git a/drivers/net/ethernet/broadcom/genet/bcmgenet.c b/drivers/net/ethernet/broadcom/genet/bcmgenet.c
+index 231c7ca5d58a..c5ec29140e9f 100644
+--- a/drivers/net/ethernet/broadcom/genet/bcmgenet.c
++++ b/drivers/net/ethernet/broadcom/genet/bcmgenet.c
+@@ -600,7 +600,9 @@ static void bcmgenet_set_msglevel(struct net_device *dev, u32 level)
+ }
+ 
+ static int bcmgenet_get_coalesce(struct net_device *dev,
+-				 struct ethtool_coalesce *ec)
++				 struct ethtool_coalesce *ec,
++				 struct kernel_ethtool_coalesce *kernel_coal,
++				 struct netlink_ext_ack *extack)
+ {
+ 	struct bcmgenet_priv *priv = netdev_priv(dev);
+ 	struct bcmgenet_rx_ring *ring;
+@@ -662,7 +664,9 @@ static void bcmgenet_set_ring_rx_coalesce(struct bcmgenet_rx_ring *ring,
+ }
+ 
+ static int bcmgenet_set_coalesce(struct net_device *dev,
+-				 struct ethtool_coalesce *ec)
++				 struct ethtool_coalesce *ec,
++				 struct kernel_ethtool_coalesce *kernel_coal,
++				 struct netlink_ext_ack *extack)
+ {
+ 	struct bcmgenet_priv *priv = netdev_priv(dev);
+ 	unsigned int i;
+diff --git a/drivers/net/ethernet/broadcom/tg3.c b/drivers/net/ethernet/broadcom/tg3.c
+index 32ceeb05134b..4735020c85a3 100644
+--- a/drivers/net/ethernet/broadcom/tg3.c
++++ b/drivers/net/ethernet/broadcom/tg3.c
+@@ -14048,7 +14048,10 @@ static int tg3_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+ 	return -EOPNOTSUPP;
+ }
+ 
+-static int tg3_get_coalesce(struct net_device *dev, struct ethtool_coalesce *ec)
++static int tg3_get_coalesce(struct net_device *dev,
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct tg3 *tp = netdev_priv(dev);
+ 
+@@ -14056,7 +14059,10 @@ static int tg3_get_coalesce(struct net_device *dev, struct ethtool_coalesce *ec)
+ 	return 0;
+ }
+ 
+-static int tg3_set_coalesce(struct net_device *dev, struct ethtool_coalesce *ec)
++static int tg3_set_coalesce(struct net_device *dev,
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct tg3 *tp = netdev_priv(dev);
+ 	u32 max_rxcoal_tick_int = 0, max_txcoal_tick_int = 0;
+diff --git a/drivers/net/ethernet/brocade/bna/bnad_ethtool.c b/drivers/net/ethernet/brocade/bna/bnad_ethtool.c
+index 31032de5843b..432cf5c5e6e9 100644
+--- a/drivers/net/ethernet/brocade/bna/bnad_ethtool.c
++++ b/drivers/net/ethernet/brocade/bna/bnad_ethtool.c
+@@ -316,8 +316,10 @@ bnad_get_wol(struct net_device *netdev, struct ethtool_wolinfo *wolinfo)
+ 	wolinfo->wolopts = 0;
+ }
+ 
+-static int
+-bnad_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *coalesce)
++static int bnad_get_coalesce(struct net_device *netdev,
++			     struct ethtool_coalesce *coalesce,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct bnad *bnad = netdev_priv(netdev);
+ 	unsigned long flags;
+@@ -337,8 +339,10 @@ bnad_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *coalesce)
+ 	return 0;
+ }
+ 
+-static int
+-bnad_set_coalesce(struct net_device *netdev, struct ethtool_coalesce *coalesce)
++static int bnad_set_coalesce(struct net_device *netdev,
++			     struct ethtool_coalesce *coalesce,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct bnad *bnad = netdev_priv(netdev);
+ 	unsigned long flags;
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c b/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c
+index 06f7449c569d..24a0c9afb9eb 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c
+@@ -2169,7 +2169,9 @@ static int octnet_set_intrmod_cfg(struct lio *lio,
+ }
+ 
+ static int lio_get_intr_coalesce(struct net_device *netdev,
+-				 struct ethtool_coalesce *intr_coal)
++				 struct ethtool_coalesce *intr_coal,
++				 struct kernel_ethtool_coalesce *kernel_coal,
++				 struct netlink_ext_ack *extack)
+ {
+ 	struct lio *lio = GET_LIO(netdev);
+ 	struct octeon_device *oct = lio->oct_dev;
+@@ -2473,7 +2475,9 @@ oct_cfg_tx_intrcnt(struct lio *lio,
+ }
+ 
+ static int lio_set_intr_coalesce(struct net_device *netdev,
+-				 struct ethtool_coalesce *intr_coal)
++				 struct ethtool_coalesce *intr_coal,
++				 struct kernel_ethtool_coalesce *kernel_coal,
++				 struct netlink_ext_ack *extack)
+ {
+ 	struct lio *lio = GET_LIO(netdev);
+ 	int ret;
+diff --git a/drivers/net/ethernet/cavium/thunder/nicvf_ethtool.c b/drivers/net/ethernet/cavium/thunder/nicvf_ethtool.c
+index 5603f5ab1fee..eaf8c71f23cc 100644
+--- a/drivers/net/ethernet/cavium/thunder/nicvf_ethtool.c
++++ b/drivers/net/ethernet/cavium/thunder/nicvf_ethtool.c
+@@ -460,7 +460,9 @@ static void nicvf_get_regs(struct net_device *dev,
+ }
+ 
+ static int nicvf_get_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *cmd)
++			      struct ethtool_coalesce *cmd,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct nicvf *nic = netdev_priv(netdev);
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb/cxgb2.c b/drivers/net/ethernet/chelsio/cxgb/cxgb2.c
+index a69676f41fd3..2a9b3da3199b 100644
+--- a/drivers/net/ethernet/chelsio/cxgb/cxgb2.c
++++ b/drivers/net/ethernet/chelsio/cxgb/cxgb2.c
+@@ -751,7 +751,9 @@ static int set_sge_param(struct net_device *dev, struct ethtool_ringparam *e)
+ 	return 0;
+ }
+ 
+-static int set_coalesce(struct net_device *dev, struct ethtool_coalesce *c)
++static int set_coalesce(struct net_device *dev, struct ethtool_coalesce *c,
++			struct kernel_ethtool_coalesce *kernel_coal,
++			struct netlink_ext_ack *extack)
+ {
+ 	struct adapter *adapter = dev->ml_priv;
+ 
+@@ -762,7 +764,9 @@ static int set_coalesce(struct net_device *dev, struct ethtool_coalesce *c)
+ 	return 0;
+ }
+ 
+-static int get_coalesce(struct net_device *dev, struct ethtool_coalesce *c)
++static int get_coalesce(struct net_device *dev, struct ethtool_coalesce *c,
++			struct kernel_ethtool_coalesce *kernel_coal,
++			struct netlink_ext_ack *extack)
+ {
+ 	struct adapter *adapter = dev->ml_priv;
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb3/cxgb3_main.c b/drivers/net/ethernet/chelsio/cxgb3/cxgb3_main.c
+index 1dc9a4da7ef1..d6b14bca5da6 100644
+--- a/drivers/net/ethernet/chelsio/cxgb3/cxgb3_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb3/cxgb3_main.c
+@@ -1997,7 +1997,9 @@ static int set_sge_param(struct net_device *dev, struct ethtool_ringparam *e)
+ 	return 0;
+ }
+ 
+-static int set_coalesce(struct net_device *dev, struct ethtool_coalesce *c)
++static int set_coalesce(struct net_device *dev, struct ethtool_coalesce *c,
++			struct kernel_ethtool_coalesce *kernel_coal,
++			struct netlink_ext_ack *extack)
+ {
+ 	struct port_info *pi = netdev_priv(dev);
+ 	struct adapter *adapter = pi->adapter;
+@@ -2018,7 +2020,9 @@ static int set_coalesce(struct net_device *dev, struct ethtool_coalesce *c)
+ 	return 0;
+ }
+ 
+-static int get_coalesce(struct net_device *dev, struct ethtool_coalesce *c)
++static int get_coalesce(struct net_device *dev, struct ethtool_coalesce *c,
++			struct kernel_ethtool_coalesce *kernel_coal,
++			struct netlink_ext_ack *extack)
+ {
+ 	struct port_info *pi = netdev_priv(dev);
+ 	struct adapter *adapter = pi->adapter;
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_ethtool.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_ethtool.c
+index f1b889598a1f..e55df9928934 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_ethtool.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_ethtool.c
+@@ -1159,7 +1159,9 @@ static int set_dbqtimer_tickval(struct net_device *dev,
+ }
+ 
+ static int set_coalesce(struct net_device *dev,
+-			struct ethtool_coalesce *coalesce)
++			struct ethtool_coalesce *coalesce,
++			struct kernel_ethtool_coalesce *kernel_coal,
++			struct netlink_ext_ack *extack)
+ {
+ 	int ret;
+ 
+@@ -1175,7 +1177,9 @@ static int set_coalesce(struct net_device *dev,
+ 				    coalesce->tx_coalesce_usecs);
+ }
+ 
+-static int get_coalesce(struct net_device *dev, struct ethtool_coalesce *c)
++static int get_coalesce(struct net_device *dev, struct ethtool_coalesce *c,
++			struct kernel_ethtool_coalesce *kernel_coal,
++			struct netlink_ext_ack *extack)
+ {
+ 	const struct port_info *pi = netdev_priv(dev);
+ 	const struct adapter *adap = pi->adapter;
+diff --git a/drivers/net/ethernet/chelsio/cxgb4vf/cxgb4vf_main.c b/drivers/net/ethernet/chelsio/cxgb4vf/cxgb4vf_main.c
+index b39a61d894fc..9330c5e78120 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4vf/cxgb4vf_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4vf/cxgb4vf_main.c
+@@ -1648,7 +1648,9 @@ static int cxgb4vf_set_ringparam(struct net_device *dev,
+  * interrupt holdoff timer to be read on all of the device's Queue Sets.
+  */
+ static int cxgb4vf_get_coalesce(struct net_device *dev,
+-				struct ethtool_coalesce *coalesce)
++				struct ethtool_coalesce *coalesce,
++				struct kernel_ethtool_coalesce *kernel_coal,
++				struct netlink_ext_ack *extack)
+ {
+ 	const struct port_info *pi = netdev_priv(dev);
+ 	const struct adapter *adapter = pi->adapter;
+@@ -1668,7 +1670,9 @@ static int cxgb4vf_get_coalesce(struct net_device *dev,
+  * the interrupt holdoff timer on any of the device's Queue Sets.
+  */
+ static int cxgb4vf_set_coalesce(struct net_device *dev,
+-				struct ethtool_coalesce *coalesce)
++				struct ethtool_coalesce *coalesce,
++				struct kernel_ethtool_coalesce *kernel_coal,
++				struct netlink_ext_ack *extack)
+ {
+ 	const struct port_info *pi = netdev_priv(dev);
+ 	struct adapter *adapter = pi->adapter;
+diff --git a/drivers/net/ethernet/cisco/enic/enic_ethtool.c b/drivers/net/ethernet/cisco/enic/enic_ethtool.c
+index ebd5c2cf1efe..a3a715699f33 100644
+--- a/drivers/net/ethernet/cisco/enic/enic_ethtool.c
++++ b/drivers/net/ethernet/cisco/enic/enic_ethtool.c
+@@ -299,7 +299,9 @@ static void enic_set_msglevel(struct net_device *netdev, u32 value)
+ }
+ 
+ static int enic_get_coalesce(struct net_device *netdev,
+-	struct ethtool_coalesce *ecmd)
++			     struct ethtool_coalesce *ecmd,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct enic *enic = netdev_priv(netdev);
+ 	struct enic_rx_coal *rxcoal = &enic->rx_coalesce_setting;
+@@ -363,7 +365,9 @@ static int enic_coalesce_valid(struct enic *enic,
+ }
+ 
+ static int enic_set_coalesce(struct net_device *netdev,
+-	struct ethtool_coalesce *ecmd)
++			     struct ethtool_coalesce *ecmd,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct enic *enic = netdev_priv(netdev);
+ 	u32 tx_coalesce_usecs;
+diff --git a/drivers/net/ethernet/cortina/gemini.c b/drivers/net/ethernet/cortina/gemini.c
+index d9a7739f2937..905780a5798a 100644
+--- a/drivers/net/ethernet/cortina/gemini.c
++++ b/drivers/net/ethernet/cortina/gemini.c
+@@ -2120,7 +2120,9 @@ static int gmac_set_ringparam(struct net_device *netdev,
+ }
+ 
+ static int gmac_get_coalesce(struct net_device *netdev,
+-			     struct ethtool_coalesce *ecmd)
++			     struct ethtool_coalesce *ecmd,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct gemini_ethernet_port *port = netdev_priv(netdev);
+ 
+@@ -2132,7 +2134,9 @@ static int gmac_get_coalesce(struct net_device *netdev,
+ }
+ 
+ static int gmac_set_coalesce(struct net_device *netdev,
+-			     struct ethtool_coalesce *ecmd)
++			     struct ethtool_coalesce *ecmd,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct gemini_ethernet_port *port = netdev_priv(netdev);
+ 
+diff --git a/drivers/net/ethernet/emulex/benet/be_ethtool.c b/drivers/net/ethernet/emulex/benet/be_ethtool.c
+index f0c00e342280..36a2b9a482d9 100644
+--- a/drivers/net/ethernet/emulex/benet/be_ethtool.c
++++ b/drivers/net/ethernet/emulex/benet/be_ethtool.c
+@@ -316,7 +316,9 @@ static int be_read_dump_data(struct be_adapter *adapter, u32 dump_len,
+ }
+ 
+ static int be_get_coalesce(struct net_device *netdev,
+-			   struct ethtool_coalesce *et)
++			   struct ethtool_coalesce *et,
++			   struct kernel_ethtool_coalesce *kernel_coal,
++			   struct netlink_ext_ack *extack)
+ {
+ 	struct be_adapter *adapter = netdev_priv(netdev);
+ 	struct be_aic_obj *aic = &adapter->aic_obj[0];
+@@ -339,7 +341,9 @@ static int be_get_coalesce(struct net_device *netdev,
+  * eqd cmd is issued in the worker thread.
+  */
+ static int be_set_coalesce(struct net_device *netdev,
+-			   struct ethtool_coalesce *et)
++			   struct ethtool_coalesce *et,
++			   struct kernel_ethtool_coalesce *kernel_coal,
++			   struct netlink_ext_ack *extack)
+ {
+ 	struct be_adapter *adapter = netdev_priv(netdev);
+ 	struct be_aic_obj *aic = &adapter->aic_obj[0];
+* Unmerged path drivers/net/ethernet/freescale/dpaa/dpaa_ethtool.c
+* Unmerged path drivers/net/ethernet/freescale/enetc/enetc_ethtool.c
+diff --git a/drivers/net/ethernet/freescale/fec_main.c b/drivers/net/ethernet/freescale/fec_main.c
+index 9b9290d8b514..5206013c106d 100644
+--- a/drivers/net/ethernet/freescale/fec_main.c
++++ b/drivers/net/ethernet/freescale/fec_main.c
+@@ -2432,8 +2432,10 @@ static void fec_enet_itr_coal_set(struct net_device *ndev)
+ 	}
+ }
+ 
+-static int
+-fec_enet_get_coalesce(struct net_device *ndev, struct ethtool_coalesce *ec)
++static int fec_enet_get_coalesce(struct net_device *ndev,
++				 struct ethtool_coalesce *ec,
++				 struct kernel_ethtool_coalesce *kernel_coal,
++				 struct netlink_ext_ack *extack)
+ {
+ 	struct fec_enet_private *fep = netdev_priv(ndev);
+ 
+@@ -2449,8 +2451,10 @@ fec_enet_get_coalesce(struct net_device *ndev, struct ethtool_coalesce *ec)
+ 	return 0;
+ }
+ 
+-static int
+-fec_enet_set_coalesce(struct net_device *ndev, struct ethtool_coalesce *ec)
++static int fec_enet_set_coalesce(struct net_device *ndev,
++				 struct ethtool_coalesce *ec,
++				 struct kernel_ethtool_coalesce *kernel_coal,
++				 struct netlink_ext_ack *extack)
+ {
+ 	struct fec_enet_private *fep = netdev_priv(ndev);
+ 	unsigned int cycle;
+@@ -2501,7 +2505,7 @@ static void fec_enet_itr_coal_init(struct net_device *ndev)
+ 	ec.tx_coalesce_usecs = FEC_ITR_ICTT_DEFAULT;
+ 	ec.tx_max_coalesced_frames = FEC_ITR_ICFT_DEFAULT;
+ 
+-	fec_enet_set_coalesce(ndev, &ec);
++	fec_enet_set_coalesce(ndev, &ec, NULL, NULL);
+ }
+ 
+ static int fec_enet_get_tunable(struct net_device *netdev,
+diff --git a/drivers/net/ethernet/freescale/gianfar_ethtool.c b/drivers/net/ethernet/freescale/gianfar_ethtool.c
+index 11cb7b9ed9b2..e5e7f7fdecb5 100644
+--- a/drivers/net/ethernet/freescale/gianfar_ethtool.c
++++ b/drivers/net/ethernet/freescale/gianfar_ethtool.c
+@@ -263,7 +263,9 @@ static unsigned int gfar_ticks2usecs(struct gfar_private *priv,
+ /* Get the coalescing parameters, and put them in the cvals
+  * structure.  */
+ static int gfar_gcoalesce(struct net_device *dev,
+-			  struct ethtool_coalesce *cvals)
++			  struct ethtool_coalesce *cvals,
++			  struct kernel_ethtool_coalesce *kernel_coal,
++			  struct netlink_ext_ack *extack)
+ {
+ 	struct gfar_private *priv = netdev_priv(dev);
+ 	struct gfar_priv_rx_q *rx_queue = NULL;
+@@ -329,7 +331,9 @@ static int gfar_gcoalesce(struct net_device *dev,
+  * in order for coalescing to be active
+  */
+ static int gfar_scoalesce(struct net_device *dev,
+-			  struct ethtool_coalesce *cvals)
++			  struct ethtool_coalesce *cvals,
++			  struct kernel_ethtool_coalesce *kernel_coal,
++			  struct netlink_ext_ack *extack)
+ {
+ 	struct gfar_private *priv = netdev_priv(dev);
+ 	int i, err = 0;
+diff --git a/drivers/net/ethernet/hisilicon/hip04_eth.c b/drivers/net/ethernet/hisilicon/hip04_eth.c
+index 54f00fa75385..2ee9c4ee26ad 100644
+--- a/drivers/net/ethernet/hisilicon/hip04_eth.c
++++ b/drivers/net/ethernet/hisilicon/hip04_eth.c
+@@ -702,7 +702,9 @@ static void hip04_tx_timeout_task(struct work_struct *work)
+ }
+ 
+ static int hip04_get_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct hip04_priv *priv = netdev_priv(netdev);
+ 
+@@ -713,7 +715,9 @@ static int hip04_get_coalesce(struct net_device *netdev,
+ }
+ 
+ static int hip04_set_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct hip04_priv *priv = netdev_priv(netdev);
+ 
+diff --git a/drivers/net/ethernet/hisilicon/hns/hns_ethtool.c b/drivers/net/ethernet/hisilicon/hns/hns_ethtool.c
+index ce15d2350db9..434ef327fe43 100644
+--- a/drivers/net/ethernet/hisilicon/hns/hns_ethtool.c
++++ b/drivers/net/ethernet/hisilicon/hns/hns_ethtool.c
+@@ -727,11 +727,15 @@ static int hns_set_pauseparam(struct net_device *net_dev,
+  * hns_get_coalesce - get coalesce info.
+  * @dev: net device
+  * @ec: coalesce info.
++ * @kernel_coal: ethtool CQE mode setting structure
++ * @extack: extack for reporting error messages
+  *
+  * Return 0 on success, negative on failure.
+  */
+ static int hns_get_coalesce(struct net_device *net_dev,
+-			    struct ethtool_coalesce *ec)
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct hns_nic_priv *priv = netdev_priv(net_dev);
+ 	struct hnae_ae_ops *ops;
+@@ -771,11 +775,15 @@ static int hns_get_coalesce(struct net_device *net_dev,
+  * hns_set_coalesce - set coalesce info.
+  * @dev: net device
+  * @ec: coalesce info.
++ * @kernel_coal: ethtool CQE mode setting structure
++ * @extack: extack for reporting error messages
+  *
+  * Return 0 on success, negative on failure.
+  */
+ static int hns_set_coalesce(struct net_device *net_dev,
+-			    struct ethtool_coalesce *ec)
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct hns_nic_priv *priv = netdev_priv(net_dev);
+ 	struct hnae_ae_ops *ops;
+* Unmerged path drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
+* Unmerged path drivers/net/ethernet/huawei/hinic/hinic_ethtool.c
+diff --git a/drivers/net/ethernet/intel/e1000/e1000_ethtool.c b/drivers/net/ethernet/intel/e1000/e1000_ethtool.c
+index bdb3f8e65ed4..5cc071d67bcf 100644
+--- a/drivers/net/ethernet/intel/e1000/e1000_ethtool.c
++++ b/drivers/net/ethernet/intel/e1000/e1000_ethtool.c
+@@ -1742,7 +1742,9 @@ static int e1000_set_phys_id(struct net_device *netdev,
+ }
+ 
+ static int e1000_get_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct e1000_adapter *adapter = netdev_priv(netdev);
+ 
+@@ -1758,7 +1760,9 @@ static int e1000_get_coalesce(struct net_device *netdev,
+ }
+ 
+ static int e1000_set_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct e1000_adapter *adapter = netdev_priv(netdev);
+ 	struct e1000_hw *hw = &adapter->hw;
+diff --git a/drivers/net/ethernet/intel/e1000e/ethtool.c b/drivers/net/ethernet/intel/e1000e/ethtool.c
+index 06442e6bef73..9b2071d3ebdc 100644
+--- a/drivers/net/ethernet/intel/e1000e/ethtool.c
++++ b/drivers/net/ethernet/intel/e1000e/ethtool.c
+@@ -1991,7 +1991,9 @@ static int e1000_set_phys_id(struct net_device *netdev,
+ }
+ 
+ static int e1000_get_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct e1000_adapter *adapter = netdev_priv(netdev);
+ 
+@@ -2004,7 +2006,9 @@ static int e1000_get_coalesce(struct net_device *netdev,
+ }
+ 
+ static int e1000_set_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct e1000_adapter *adapter = netdev_priv(netdev);
+ 
+diff --git a/drivers/net/ethernet/intel/fm10k/fm10k_ethtool.c b/drivers/net/ethernet/intel/fm10k/fm10k_ethtool.c
+index 908fefaa6b85..57b78566c364 100644
+--- a/drivers/net/ethernet/intel/fm10k/fm10k_ethtool.c
++++ b/drivers/net/ethernet/intel/fm10k/fm10k_ethtool.c
+@@ -631,7 +631,9 @@ static int fm10k_set_ringparam(struct net_device *netdev,
+ }
+ 
+ static int fm10k_get_coalesce(struct net_device *dev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct fm10k_intfc *interface = netdev_priv(dev);
+ 
+@@ -645,7 +647,9 @@ static int fm10k_get_coalesce(struct net_device *dev,
+ }
+ 
+ static int fm10k_set_coalesce(struct net_device *dev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct fm10k_intfc *interface = netdev_priv(dev);
+ 	u16 tx_itr, rx_itr;
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_ethtool.c b/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+index 2c9e4eeb7270..513ba6974355 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+@@ -2812,13 +2812,17 @@ static int __i40e_get_coalesce(struct net_device *netdev,
+  * i40e_get_coalesce - get a netdev's coalesce settings
+  * @netdev: the netdev to check
+  * @ec: ethtool coalesce data structure
++ * @kernel_coal: ethtool CQE mode setting structure
++ * @extack: extack for reporting error messages
+  *
+  * Gets the coalesce settings for a particular netdev. Note that if user has
+  * modified per-queue settings, this only guarantees to represent queue 0. See
+  * __i40e_get_coalesce for more details.
+  **/
+ static int i40e_get_coalesce(struct net_device *netdev,
+-			     struct ethtool_coalesce *ec)
++			     struct ethtool_coalesce *ec,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	return __i40e_get_coalesce(netdev, ec, -1);
+ }
+@@ -2986,11 +2990,15 @@ static int __i40e_set_coalesce(struct net_device *netdev,
+  * i40e_set_coalesce - set coalesce settings for every queue on the netdev
+  * @netdev: the netdev to change
+  * @ec: ethtool coalesce settings
++ * @kernel_coal: ethtool CQE mode setting structure
++ * @extack: extack for reporting error messages
+  *
+  * This will set each queue to the same coalesce settings.
+  **/
+ static int i40e_set_coalesce(struct net_device *netdev,
+-			     struct ethtool_coalesce *ec)
++			     struct ethtool_coalesce *ec,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	return __i40e_set_coalesce(netdev, ec, -1);
+ }
+diff --git a/drivers/net/ethernet/intel/iavf/iavf_ethtool.c b/drivers/net/ethernet/intel/iavf/iavf_ethtool.c
+index af43fbd8cb75..77b66f0285eb 100644
+--- a/drivers/net/ethernet/intel/iavf/iavf_ethtool.c
++++ b/drivers/net/ethernet/intel/iavf/iavf_ethtool.c
+@@ -685,6 +685,8 @@ static int __iavf_get_coalesce(struct net_device *netdev,
+  * iavf_get_coalesce - Get interrupt coalescing settings
+  * @netdev: network interface device structure
+  * @ec: ethtool coalesce structure
++ * @kernel_coal: ethtool CQE mode setting structure
++ * @extack: extack for reporting error messages
+  *
+  * Returns current coalescing settings. This is referred to elsewhere in the
+  * driver as Interrupt Throttle Rate, as this is how the hardware describes
+@@ -692,7 +694,9 @@ static int __iavf_get_coalesce(struct net_device *netdev,
+  * only represents the settings of queue 0.
+  **/
+ static int iavf_get_coalesce(struct net_device *netdev,
+-			     struct ethtool_coalesce *ec)
++			     struct ethtool_coalesce *ec,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	return __iavf_get_coalesce(netdev, ec, -1);
+ }
+@@ -804,11 +808,15 @@ static int __iavf_set_coalesce(struct net_device *netdev,
+  * iavf_set_coalesce - Set interrupt coalescing settings
+  * @netdev: network interface device structure
+  * @ec: ethtool coalesce structure
++ * @kernel_coal: ethtool CQE mode setting structure
++ * @extack: extack for reporting error messages
+  *
+  * Change current coalescing settings for every queue.
+  **/
+ static int iavf_set_coalesce(struct net_device *netdev,
+-			     struct ethtool_coalesce *ec)
++			     struct ethtool_coalesce *ec,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	return __iavf_set_coalesce(netdev, ec, -1);
+ }
+diff --git a/drivers/net/ethernet/intel/ice/ice_ethtool.c b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+index f170f0a287d3..2efc32eb0bfe 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@ -3582,8 +3582,10 @@ __ice_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec,
+ 	return 0;
+ }
+ 
+-static int
+-ice_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec)
++static int ice_get_coalesce(struct net_device *netdev,
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	return __ice_get_coalesce(netdev, ec, -1);
+ }
+@@ -3800,8 +3802,10 @@ __ice_set_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec,
+ 	return 0;
+ }
+ 
+-static int
+-ice_set_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec)
++static int ice_set_coalesce(struct net_device *netdev,
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	return __ice_set_coalesce(netdev, ec, -1);
+ }
+diff --git a/drivers/net/ethernet/intel/igb/igb_ethtool.c b/drivers/net/ethernet/intel/igb/igb_ethtool.c
+index 7545da216d8b..e14e8b785ec6 100644
+--- a/drivers/net/ethernet/intel/igb/igb_ethtool.c
++++ b/drivers/net/ethernet/intel/igb/igb_ethtool.c
+@@ -2182,7 +2182,9 @@ static int igb_set_phys_id(struct net_device *netdev,
+ }
+ 
+ static int igb_set_coalesce(struct net_device *netdev,
+-			    struct ethtool_coalesce *ec)
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct igb_adapter *adapter = netdev_priv(netdev);
+ 	int i;
+@@ -2238,7 +2240,9 @@ static int igb_set_coalesce(struct net_device *netdev,
+ }
+ 
+ static int igb_get_coalesce(struct net_device *netdev,
+-			    struct ethtool_coalesce *ec)
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct igb_adapter *adapter = netdev_priv(netdev);
+ 
+diff --git a/drivers/net/ethernet/intel/igbvf/ethtool.c b/drivers/net/ethernet/intel/igbvf/ethtool.c
+index f4835eb62fee..06e5bd646a0e 100644
+--- a/drivers/net/ethernet/intel/igbvf/ethtool.c
++++ b/drivers/net/ethernet/intel/igbvf/ethtool.c
+@@ -314,7 +314,9 @@ static int igbvf_set_wol(struct net_device *netdev,
+ }
+ 
+ static int igbvf_get_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct igbvf_adapter *adapter = netdev_priv(netdev);
+ 
+@@ -327,7 +329,9 @@ static int igbvf_get_coalesce(struct net_device *netdev,
+ }
+ 
+ static int igbvf_set_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct igbvf_adapter *adapter = netdev_priv(netdev);
+ 	struct e1000_hw *hw = &adapter->hw;
+diff --git a/drivers/net/ethernet/intel/igc/igc_ethtool.c b/drivers/net/ethernet/intel/igc/igc_ethtool.c
+index 8722294ab90c..80e312a26325 100644
+--- a/drivers/net/ethernet/intel/igc/igc_ethtool.c
++++ b/drivers/net/ethernet/intel/igc/igc_ethtool.c
+@@ -873,7 +873,9 @@ static void igc_ethtool_get_stats(struct net_device *netdev,
+ }
+ 
+ static int igc_ethtool_get_coalesce(struct net_device *netdev,
+-				    struct ethtool_coalesce *ec)
++				    struct ethtool_coalesce *ec,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct igc_adapter *adapter = netdev_priv(netdev);
+ 
+@@ -893,7 +895,9 @@ static int igc_ethtool_get_coalesce(struct net_device *netdev,
+ }
+ 
+ static int igc_ethtool_set_coalesce(struct net_device *netdev,
+-				    struct ethtool_coalesce *ec)
++				    struct ethtool_coalesce *ec,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct igc_adapter *adapter = netdev_priv(netdev);
+ 	int i;
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
+index 4ceaca0f6ce3..fc26e4ddeb0d 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
+@@ -2358,7 +2358,9 @@ static int ixgbe_set_phys_id(struct net_device *netdev,
+ }
+ 
+ static int ixgbe_get_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
+ 
+@@ -2412,7 +2414,9 @@ static bool ixgbe_update_rsc(struct ixgbe_adapter *adapter)
+ }
+ 
+ static int ixgbe_set_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
+ 	struct ixgbe_q_vector *q_vector;
+diff --git a/drivers/net/ethernet/intel/ixgbevf/ethtool.c b/drivers/net/ethernet/intel/ixgbevf/ethtool.c
+index e49fb1cd9a99..8380f905e708 100644
+--- a/drivers/net/ethernet/intel/ixgbevf/ethtool.c
++++ b/drivers/net/ethernet/intel/ixgbevf/ethtool.c
+@@ -787,7 +787,9 @@ static int ixgbevf_nway_reset(struct net_device *netdev)
+ }
+ 
+ static int ixgbevf_get_coalesce(struct net_device *netdev,
+-				struct ethtool_coalesce *ec)
++				struct ethtool_coalesce *ec,
++				struct kernel_ethtool_coalesce *kernel_coal,
++				struct netlink_ext_ack *extack)
+ {
+ 	struct ixgbevf_adapter *adapter = netdev_priv(netdev);
+ 
+@@ -811,7 +813,9 @@ static int ixgbevf_get_coalesce(struct net_device *netdev,
+ }
+ 
+ static int ixgbevf_set_coalesce(struct net_device *netdev,
+-				struct ethtool_coalesce *ec)
++				struct ethtool_coalesce *ec,
++				struct kernel_ethtool_coalesce *kernel_coal,
++				struct netlink_ext_ack *extack)
+ {
+ 	struct ixgbevf_adapter *adapter = netdev_priv(netdev);
+ 	struct ixgbevf_q_vector *q_vector;
+diff --git a/drivers/net/ethernet/jme.c b/drivers/net/ethernet/jme.c
+index 6c65175dd53c..2bed364625fe 100644
+--- a/drivers/net/ethernet/jme.c
++++ b/drivers/net/ethernet/jme.c
+@@ -2432,8 +2432,10 @@ jme_get_regs(struct net_device *netdev, struct ethtool_regs *regs, void *p)
+ 	mdio_memcpy(jme, p32, JME_PHY_REG_NR);
+ }
+ 
+-static int
+-jme_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *ecmd)
++static int jme_get_coalesce(struct net_device *netdev,
++			    struct ethtool_coalesce *ecmd,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct jme_adapter *jme = netdev_priv(netdev);
+ 
+@@ -2469,8 +2471,10 @@ jme_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *ecmd)
+ 	return 0;
+ }
+ 
+-static int
+-jme_set_coalesce(struct net_device *netdev, struct ethtool_coalesce *ecmd)
++static int jme_set_coalesce(struct net_device *netdev,
++			    struct ethtool_coalesce *ecmd,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct jme_adapter *jme = netdev_priv(netdev);
+ 	struct dynpcc_info *dpi = &(jme->dpi);
+diff --git a/drivers/net/ethernet/marvell/mv643xx_eth.c b/drivers/net/ethernet/marvell/mv643xx_eth.c
+index 6179bef41ec6..8772a715952f 100644
+--- a/drivers/net/ethernet/marvell/mv643xx_eth.c
++++ b/drivers/net/ethernet/marvell/mv643xx_eth.c
+@@ -1627,8 +1627,10 @@ static void mv643xx_eth_get_drvinfo(struct net_device *dev,
+ 	strlcpy(drvinfo->bus_info, "platform", sizeof(drvinfo->bus_info));
+ }
+ 
+-static int
+-mv643xx_eth_get_coalesce(struct net_device *dev, struct ethtool_coalesce *ec)
++static int mv643xx_eth_get_coalesce(struct net_device *dev,
++				    struct ethtool_coalesce *ec,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct mv643xx_eth_private *mp = netdev_priv(dev);
+ 
+@@ -1638,8 +1640,10 @@ mv643xx_eth_get_coalesce(struct net_device *dev, struct ethtool_coalesce *ec)
+ 	return 0;
+ }
+ 
+-static int
+-mv643xx_eth_set_coalesce(struct net_device *dev, struct ethtool_coalesce *ec)
++static int mv643xx_eth_set_coalesce(struct net_device *dev,
++				    struct ethtool_coalesce *ec,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct mv643xx_eth_private *mp = netdev_priv(dev);
+ 
+diff --git a/drivers/net/ethernet/marvell/mvneta.c b/drivers/net/ethernet/marvell/mvneta.c
+index aa243112d05c..304c49ad6c9b 100644
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@ -3826,8 +3826,11 @@ static int mvneta_ethtool_nway_reset(struct net_device *dev)
+ }
+ 
+ /* Set interrupt coalescing for ethtools */
+-static int mvneta_ethtool_set_coalesce(struct net_device *dev,
+-				       struct ethtool_coalesce *c)
++static int
++mvneta_ethtool_set_coalesce(struct net_device *dev,
++			    struct ethtool_coalesce *c,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct mvneta_port *pp = netdev_priv(dev);
+ 	int queue;
+@@ -3850,8 +3853,11 @@ static int mvneta_ethtool_set_coalesce(struct net_device *dev,
+ }
+ 
+ /* get coalescing for ethtools */
+-static int mvneta_ethtool_get_coalesce(struct net_device *dev,
+-				       struct ethtool_coalesce *c)
++static int
++mvneta_ethtool_get_coalesce(struct net_device *dev,
++			    struct ethtool_coalesce *c,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct mvneta_port *pp = netdev_priv(dev);
+ 
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index e29e898961a0..9638dce58ba2 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -3650,8 +3650,11 @@ static int mvpp2_ethtool_nway_reset(struct net_device *dev)
+ }
+ 
+ /* Set interrupt coalescing for ethtools */
+-static int mvpp2_ethtool_set_coalesce(struct net_device *dev,
+-				      struct ethtool_coalesce *c)
++static int
++mvpp2_ethtool_set_coalesce(struct net_device *dev,
++			   struct ethtool_coalesce *c,
++			   struct kernel_ethtool_coalesce *kernel_coal,
++			   struct netlink_ext_ack *extack)
+ {
+ 	struct mvpp2_port *port = netdev_priv(dev);
+ 	int queue;
+@@ -3683,8 +3686,11 @@ static int mvpp2_ethtool_set_coalesce(struct net_device *dev,
+ }
+ 
+ /* get coalescing for ethtools */
+-static int mvpp2_ethtool_get_coalesce(struct net_device *dev,
+-				      struct ethtool_coalesce *c)
++static int
++mvpp2_ethtool_get_coalesce(struct net_device *dev,
++			   struct ethtool_coalesce *c,
++			   struct kernel_ethtool_coalesce *kernel_coal,
++			   struct netlink_ext_ack *extack)
+ {
+ 	struct mvpp2_port *port = netdev_priv(dev);
+ 
+* Unmerged path drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+diff --git a/drivers/net/ethernet/marvell/skge.c b/drivers/net/ethernet/marvell/skge.c
+index da9c3d9e607b..4e92f2a9e378 100644
+--- a/drivers/net/ethernet/marvell/skge.c
++++ b/drivers/net/ethernet/marvell/skge.c
+@@ -625,7 +625,9 @@ static inline u32 skge_usecs2clk(const struct skge_hw *hw, u32 usec)
+ }
+ 
+ static int skge_get_coalesce(struct net_device *dev,
+-			     struct ethtool_coalesce *ecmd)
++			     struct ethtool_coalesce *ecmd,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct skge_port *skge = netdev_priv(dev);
+ 	struct skge_hw *hw = skge->hw;
+@@ -649,7 +651,9 @@ static int skge_get_coalesce(struct net_device *dev,
+ 
+ /* Note: interrupt timer is per board, but can turn on/off per port */
+ static int skge_set_coalesce(struct net_device *dev,
+-			     struct ethtool_coalesce *ecmd)
++			     struct ethtool_coalesce *ecmd,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct skge_port *skge = netdev_priv(dev);
+ 	struct skge_hw *hw = skge->hw;
+diff --git a/drivers/net/ethernet/marvell/sky2.c b/drivers/net/ethernet/marvell/sky2.c
+index 8c97c8439230..0e01b4486d17 100644
+--- a/drivers/net/ethernet/marvell/sky2.c
++++ b/drivers/net/ethernet/marvell/sky2.c
+@@ -4063,7 +4063,9 @@ static int sky2_set_pauseparam(struct net_device *dev,
+ }
+ 
+ static int sky2_get_coalesce(struct net_device *dev,
+-			     struct ethtool_coalesce *ecmd)
++			     struct ethtool_coalesce *ecmd,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct sky2_port *sky2 = netdev_priv(dev);
+ 	struct sky2_hw *hw = sky2->hw;
+@@ -4098,7 +4100,9 @@ static int sky2_get_coalesce(struct net_device *dev,
+ 
+ /* Note: this affect both ports */
+ static int sky2_set_coalesce(struct net_device *dev,
+-			     struct ethtool_coalesce *ecmd)
++			     struct ethtool_coalesce *ecmd,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct sky2_port *sky2 = netdev_priv(dev);
+ 	struct sky2_hw *hw = sky2->hw;
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+index 3616b77caa0a..ef518b1040f7 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+@@ -998,7 +998,9 @@ mlx4_en_set_link_ksettings(struct net_device *dev,
+ }
+ 
+ static int mlx4_en_get_coalesce(struct net_device *dev,
+-			      struct ethtool_coalesce *coal)
++				struct ethtool_coalesce *coal,
++				struct kernel_ethtool_coalesce *kernel_coal,
++				struct netlink_ext_ack *extack)
+ {
+ 	struct mlx4_en_priv *priv = netdev_priv(dev);
+ 
+@@ -1020,7 +1022,9 @@ static int mlx4_en_get_coalesce(struct net_device *dev,
+ }
+ 
+ static int mlx4_en_set_coalesce(struct net_device *dev,
+-			      struct ethtool_coalesce *coal)
++				struct ethtool_coalesce *coal,
++				struct kernel_ethtool_coalesce *kernel_coal,
++				struct netlink_ext_ack *extack)
+ {
+ 	struct mlx4_en_priv *priv = netdev_priv(dev);
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index 33f37d7bc5d1..d286327a1cea 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -525,7 +525,9 @@ int mlx5e_ethtool_get_coalesce(struct mlx5e_priv *priv,
+ }
+ 
+ static int mlx5e_get_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *coal)
++			      struct ethtool_coalesce *coal,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct mlx5e_priv *priv = netdev_priv(netdev);
+ 
+@@ -646,7 +648,9 @@ int mlx5e_ethtool_set_coalesce(struct mlx5e_priv *priv,
+ }
+ 
+ static int mlx5e_set_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *coal)
++			      struct ethtool_coalesce *coal,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct mlx5e_priv *priv    = netdev_priv(netdev);
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index d965290ea8be..65edc7291e7d 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -249,7 +249,9 @@ static int mlx5e_rep_set_channels(struct net_device *dev,
+ }
+ 
+ static int mlx5e_rep_get_coalesce(struct net_device *netdev,
+-				  struct ethtool_coalesce *coal)
++				  struct ethtool_coalesce *coal,
++				  struct kernel_ethtool_coalesce *kernel_coal,
++				  struct netlink_ext_ack *extack)
+ {
+ 	struct mlx5e_priv *priv = netdev_priv(netdev);
+ 
+@@ -257,7 +259,9 @@ static int mlx5e_rep_get_coalesce(struct net_device *netdev,
+ }
+ 
+ static int mlx5e_rep_set_coalesce(struct net_device *netdev,
+-				  struct ethtool_coalesce *coal)
++				  struct ethtool_coalesce *coal,
++				  struct kernel_ethtool_coalesce *kernel_coal,
++				  struct netlink_ext_ack *extack)
+ {
+ 	struct mlx5e_priv *priv = netdev_priv(netdev);
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ethtool.c
+index 97d96fc38a65..d89d5644de52 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ethtool.c
+@@ -99,7 +99,9 @@ static void mlx5i_get_channels(struct net_device *dev,
+ }
+ 
+ static int mlx5i_set_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *coal)
++			      struct ethtool_coalesce *coal,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
+ 
+@@ -107,7 +109,9 @@ static int mlx5i_set_coalesce(struct net_device *netdev,
+ }
+ 
+ static int mlx5i_get_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *coal)
++			      struct ethtool_coalesce *coal,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
+ 
+diff --git a/drivers/net/ethernet/myricom/myri10ge/myri10ge.c b/drivers/net/ethernet/myricom/myri10ge/myri10ge.c
+index e882d3b48e8f..fafd443976c6 100644
+--- a/drivers/net/ethernet/myricom/myri10ge/myri10ge.c
++++ b/drivers/net/ethernet/myricom/myri10ge/myri10ge.c
+@@ -1664,8 +1664,10 @@ myri10ge_get_drvinfo(struct net_device *netdev, struct ethtool_drvinfo *info)
+ 	strlcpy(info->bus_info, pci_name(mgp->pdev), sizeof(info->bus_info));
+ }
+ 
+-static int
+-myri10ge_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *coal)
++static int myri10ge_get_coalesce(struct net_device *netdev,
++				 struct ethtool_coalesce *coal,
++				 struct kernel_ethtool_coalesce *kernel_coal,
++				 struct netlink_ext_ack *extack)
+ {
+ 	struct myri10ge_priv *mgp = netdev_priv(netdev);
+ 
+@@ -1673,8 +1675,10 @@ myri10ge_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *coal)
+ 	return 0;
+ }
+ 
+-static int
+-myri10ge_set_coalesce(struct net_device *netdev, struct ethtool_coalesce *coal)
++static int myri10ge_set_coalesce(struct net_device *netdev,
++				 struct ethtool_coalesce *coal,
++				 struct kernel_ethtool_coalesce *kernel_coal,
++				 struct netlink_ext_ack *extack)
+ {
+ 	struct myri10ge_priv *mgp = netdev_priv(netdev);
+ 
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+index 6eb9fb9a1814..9f1768cfc351 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+@@ -1087,7 +1087,9 @@ static void nfp_net_get_regs(struct net_device *netdev,
+ }
+ 
+ static int nfp_net_get_coalesce(struct net_device *netdev,
+-				struct ethtool_coalesce *ec)
++				struct ethtool_coalesce *ec,
++				struct kernel_ethtool_coalesce *kernel_coal,
++				struct netlink_ext_ack *extack)
+ {
+ 	struct nfp_net *nn = netdev_priv(netdev);
+ 
+@@ -1336,7 +1338,9 @@ nfp_port_get_module_eeprom(struct net_device *netdev,
+ }
+ 
+ static int nfp_net_set_coalesce(struct net_device *netdev,
+-				struct ethtool_coalesce *ec)
++				struct ethtool_coalesce *ec,
++				struct kernel_ethtool_coalesce *kernel_coal,
++				struct netlink_ext_ack *extack)
+ {
+ 	struct nfp_net *nn = netdev_priv(netdev);
+ 	unsigned int factor;
+diff --git a/drivers/net/ethernet/ni/nixge.c b/drivers/net/ethernet/ni/nixge.c
+index 09f674ec0f9e..33b099a7c4f8 100644
+--- a/drivers/net/ethernet/ni/nixge.c
++++ b/drivers/net/ethernet/ni/nixge.c
+@@ -939,8 +939,11 @@ static void nixge_ethtools_get_drvinfo(struct net_device *ndev,
+ 	strlcpy(ed->bus_info, "platform", sizeof(ed->driver));
+ }
+ 
+-static int nixge_ethtools_get_coalesce(struct net_device *ndev,
+-				       struct ethtool_coalesce *ecoalesce)
++static int
++nixge_ethtools_get_coalesce(struct net_device *ndev,
++			    struct ethtool_coalesce *ecoalesce,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct nixge_priv *priv = netdev_priv(ndev);
+ 	u32 regval = 0;
+@@ -954,8 +957,11 @@ static int nixge_ethtools_get_coalesce(struct net_device *ndev,
+ 	return 0;
+ }
+ 
+-static int nixge_ethtools_set_coalesce(struct net_device *ndev,
+-				       struct ethtool_coalesce *ecoalesce)
++static int
++nixge_ethtools_set_coalesce(struct net_device *ndev,
++			    struct ethtool_coalesce *ecoalesce,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct nixge_priv *priv = netdev_priv(ndev);
+ 
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic_ethtool.c b/drivers/net/ethernet/pensando/ionic/ionic_ethtool.c
+index ea01252b6132..6b45cae39a20 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic_ethtool.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_ethtool.c
+@@ -406,7 +406,9 @@ static int ionic_set_fecparam(struct net_device *netdev,
+ }
+ 
+ static int ionic_get_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *coalesce)
++			      struct ethtool_coalesce *coalesce,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct ionic_lif *lif = netdev_priv(netdev);
+ 
+@@ -424,7 +426,9 @@ static int ionic_get_coalesce(struct net_device *netdev,
+ }
+ 
+ static int ionic_set_coalesce(struct net_device *netdev,
+-			      struct ethtool_coalesce *coalesce)
++			      struct ethtool_coalesce *coalesce,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct ionic_lif *lif = netdev_priv(netdev);
+ 	struct ionic_identity *ident;
+diff --git a/drivers/net/ethernet/qlogic/netxen/netxen_nic_ethtool.c b/drivers/net/ethernet/qlogic/netxen/netxen_nic_ethtool.c
+index 3157f97dd782..814f1a2623a7 100644
+--- a/drivers/net/ethernet/qlogic/netxen/netxen_nic_ethtool.c
++++ b/drivers/net/ethernet/qlogic/netxen/netxen_nic_ethtool.c
+@@ -746,7 +746,9 @@ netxen_nic_set_wol(struct net_device *dev, struct ethtool_wolinfo *wol)
+  * firmware coalescing to default.
+  */
+ static int netxen_set_intr_coalesce(struct net_device *netdev,
+-			struct ethtool_coalesce *ethcoal)
++				    struct ethtool_coalesce *ethcoal,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct netxen_adapter *adapter = netdev_priv(netdev);
+ 
+@@ -807,7 +809,9 @@ static int netxen_set_intr_coalesce(struct net_device *netdev,
+ }
+ 
+ static int netxen_get_intr_coalesce(struct net_device *netdev,
+-			struct ethtool_coalesce *ethcoal)
++				    struct ethtool_coalesce *ethcoal,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct netxen_adapter *adapter = netdev_priv(netdev);
+ 
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede.h
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+index 7f7deeaf1cf0..649d510e48f0 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+@@ -1524,7 +1524,9 @@ qlcnic_set_wol(struct net_device *dev, struct ethtool_wolinfo *wol)
+  * firmware coalescing to default.
+  */
+ static int qlcnic_set_intr_coalesce(struct net_device *netdev,
+-			struct ethtool_coalesce *ethcoal)
++				    struct ethtool_coalesce *ethcoal,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
+ 	int err;
+@@ -1565,7 +1567,9 @@ static int qlcnic_set_intr_coalesce(struct net_device *netdev,
+ }
+ 
+ static int qlcnic_get_intr_coalesce(struct net_device *netdev,
+-			struct ethtool_coalesce *ethcoal)
++				    struct ethtool_coalesce *ethcoal,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
+ 
+* Unmerged path drivers/net/ethernet/qlogic/qlge/qlge_ethtool.c
+diff --git a/drivers/net/ethernet/realtek/r8169_main.c b/drivers/net/ethernet/realtek/r8169_main.c
+index 2be54ad7863c..72df5ba2b51a 100644
+--- a/drivers/net/ethernet/realtek/r8169_main.c
++++ b/drivers/net/ethernet/realtek/r8169_main.c
+@@ -1753,7 +1753,10 @@ rtl_coalesce_info(struct rtl8169_private *tp)
+ 	return ERR_PTR(-ELNRNG);
+ }
+ 
+-static int rtl_get_coalesce(struct net_device *dev, struct ethtool_coalesce *ec)
++static int rtl_get_coalesce(struct net_device *dev,
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct rtl8169_private *tp = netdev_priv(dev);
+ 	const struct rtl_coalesce_info *ci;
+@@ -1811,7 +1814,10 @@ static int rtl_coalesce_choose_scale(struct rtl8169_private *tp, u32 usec,
+ 	return -ERANGE;
+ }
+ 
+-static int rtl_set_coalesce(struct net_device *dev, struct ethtool_coalesce *ec)
++static int rtl_set_coalesce(struct net_device *dev,
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct rtl8169_private *tp = netdev_priv(dev);
+ 	u32 tx_fr = ec->tx_max_coalesced_frames;
+diff --git a/drivers/net/ethernet/samsung/sxgbe/sxgbe_ethtool.c b/drivers/net/ethernet/samsung/sxgbe/sxgbe_ethtool.c
+index 542b67d436df..9f497898c2a8 100644
+--- a/drivers/net/ethernet/samsung/sxgbe/sxgbe_ethtool.c
++++ b/drivers/net/ethernet/samsung/sxgbe/sxgbe_ethtool.c
+@@ -277,7 +277,9 @@ static u32 sxgbe_usec2riwt(u32 usec, struct sxgbe_priv_data *priv)
+ }
+ 
+ static int sxgbe_get_coalesce(struct net_device *dev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct sxgbe_priv_data *priv = netdev_priv(dev);
+ 
+@@ -288,7 +290,9 @@ static int sxgbe_get_coalesce(struct net_device *dev,
+ }
+ 
+ static int sxgbe_set_coalesce(struct net_device *dev,
+-			      struct ethtool_coalesce *ec)
++			      struct ethtool_coalesce *ec,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct sxgbe_priv_data *priv = netdev_priv(dev);
+ 	unsigned int rx_riwt;
+diff --git a/drivers/net/ethernet/sfc/ethtool.c b/drivers/net/ethernet/sfc/ethtool.c
+index 12a91c559aa2..286056a063aa 100644
+--- a/drivers/net/ethernet/sfc/ethtool.c
++++ b/drivers/net/ethernet/sfc/ethtool.c
+@@ -97,7 +97,9 @@ static void efx_ethtool_get_regs(struct net_device *net_dev,
+  */
+ 
+ static int efx_ethtool_get_coalesce(struct net_device *net_dev,
+-				    struct ethtool_coalesce *coalesce)
++				    struct ethtool_coalesce *coalesce,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct efx_nic *efx = netdev_priv(net_dev);
+ 	unsigned int tx_usecs, rx_usecs;
+@@ -115,7 +117,9 @@ static int efx_ethtool_get_coalesce(struct net_device *net_dev,
+ }
+ 
+ static int efx_ethtool_set_coalesce(struct net_device *net_dev,
+-				    struct ethtool_coalesce *coalesce)
++				    struct ethtool_coalesce *coalesce,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct efx_nic *efx = netdev_priv(net_dev);
+ 	struct efx_channel *channel;
+diff --git a/drivers/net/ethernet/sfc/falcon/ethtool.c b/drivers/net/ethernet/sfc/falcon/ethtool.c
+index dfd23a88976a..c77d4c875408 100644
+--- a/drivers/net/ethernet/sfc/falcon/ethtool.c
++++ b/drivers/net/ethernet/sfc/falcon/ethtool.c
+@@ -577,7 +577,9 @@ static int ef4_ethtool_nway_reset(struct net_device *net_dev)
+  */
+ 
+ static int ef4_ethtool_get_coalesce(struct net_device *net_dev,
+-				    struct ethtool_coalesce *coalesce)
++				    struct ethtool_coalesce *coalesce,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct ef4_nic *efx = netdev_priv(net_dev);
+ 	unsigned int tx_usecs, rx_usecs;
+@@ -595,7 +597,9 @@ static int ef4_ethtool_get_coalesce(struct net_device *net_dev,
+ }
+ 
+ static int ef4_ethtool_set_coalesce(struct net_device *net_dev,
+-				    struct ethtool_coalesce *coalesce)
++				    struct ethtool_coalesce *coalesce,
++				    struct kernel_ethtool_coalesce *kernel_coal,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct ef4_nic *efx = netdev_priv(net_dev);
+ 	struct ef4_channel *channel;
+diff --git a/drivers/net/ethernet/socionext/netsec.c b/drivers/net/ethernet/socionext/netsec.c
+index e080d3e7c582..63c23f878c12 100644
+--- a/drivers/net/ethernet/socionext/netsec.c
++++ b/drivers/net/ethernet/socionext/netsec.c
+@@ -487,7 +487,9 @@ static void netsec_et_get_drvinfo(struct net_device *net_device,
+ }
+ 
+ static int netsec_et_get_coalesce(struct net_device *net_device,
+-				  struct ethtool_coalesce *et_coalesce)
++				  struct ethtool_coalesce *et_coalesce,
++				  struct kernel_ethtool_coalesce *kernel_coal,
++				  struct netlink_ext_ack *extack)
+ {
+ 	struct netsec_priv *priv = netdev_priv(net_device);
+ 
+@@ -497,7 +499,9 @@ static int netsec_et_get_coalesce(struct net_device *net_device,
+ }
+ 
+ static int netsec_et_set_coalesce(struct net_device *net_device,
+-				  struct ethtool_coalesce *et_coalesce)
++				  struct ethtool_coalesce *et_coalesce,
++				  struct kernel_ethtool_coalesce *kernel_coal,
++				  struct netlink_ext_ack *extack)
+ {
+ 	struct netsec_priv *priv = netdev_priv(net_device);
+ 
+@@ -1208,7 +1212,7 @@ static int netsec_start_gmac(struct netsec_priv *priv)
+ 	netsec_write(priv, NETSEC_REG_NRM_RX_INTEN_CLR, ~0);
+ 	netsec_write(priv, NETSEC_REG_NRM_TX_INTEN_CLR, ~0);
+ 
+-	netsec_et_set_coalesce(priv->ndev, &priv->et_coalesce);
++	netsec_et_set_coalesce(priv->ndev, &priv->et_coalesce, NULL, NULL);
+ 
+ 	if (netsec_mac_write(priv, GMAC_REG_OMR, value))
+ 		return -ETIMEDOUT;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
+index 0180af2b2375..b23bad483d87 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
+@@ -806,7 +806,9 @@ static int __stmmac_get_coalesce(struct net_device *dev,
+ }
+ 
+ static int stmmac_get_coalesce(struct net_device *dev,
+-			       struct ethtool_coalesce *ec)
++			       struct ethtool_coalesce *ec,
++			       struct kernel_ethtool_coalesce *kernel_coal,
++			       struct netlink_ext_ack *extack)
+ {
+ 	return __stmmac_get_coalesce(dev, ec, -1);
+ }
+@@ -890,7 +892,9 @@ static int __stmmac_set_coalesce(struct net_device *dev,
+ }
+ 
+ static int stmmac_set_coalesce(struct net_device *dev,
+-			       struct ethtool_coalesce *ec)
++			       struct ethtool_coalesce *ec,
++			       struct kernel_ethtool_coalesce *kernel_coal,
++			       struct netlink_ext_ack *extack)
+ {
+ 	return __stmmac_set_coalesce(dev, ec, -1);
+ }
+diff --git a/drivers/net/ethernet/synopsys/dwc-xlgmac-ethtool.c b/drivers/net/ethernet/synopsys/dwc-xlgmac-ethtool.c
+index fde722136869..20a745e9fb37 100644
+--- a/drivers/net/ethernet/synopsys/dwc-xlgmac-ethtool.c
++++ b/drivers/net/ethernet/synopsys/dwc-xlgmac-ethtool.c
+@@ -146,8 +146,11 @@ static void xlgmac_ethtool_get_channels(struct net_device *netdev,
+ 	channel->tx_count = pdata->tx_q_count;
+ }
+ 
+-static int xlgmac_ethtool_get_coalesce(struct net_device *netdev,
+-				       struct ethtool_coalesce *ec)
++static int
++xlgmac_ethtool_get_coalesce(struct net_device *netdev,
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct xlgmac_pdata *pdata = netdev_priv(netdev);
+ 
+@@ -159,8 +162,11 @@ static int xlgmac_ethtool_get_coalesce(struct net_device *netdev,
+ 	return 0;
+ }
+ 
+-static int xlgmac_ethtool_set_coalesce(struct net_device *netdev,
+-				       struct ethtool_coalesce *ec)
++static int
++xlgmac_ethtool_set_coalesce(struct net_device *netdev,
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct xlgmac_pdata *pdata = netdev_priv(netdev);
+ 	struct xlgmac_hw_ops *hw_ops = &pdata->hw_ops;
+diff --git a/drivers/net/ethernet/tehuti/tehuti.c b/drivers/net/ethernet/tehuti/tehuti.c
+index 163d8d16bc24..5a8d9a64d1dd 100644
+--- a/drivers/net/ethernet/tehuti/tehuti.c
++++ b/drivers/net/ethernet/tehuti/tehuti.c
+@@ -2172,8 +2172,10 @@ bdx_get_drvinfo(struct net_device *netdev, struct ethtool_drvinfo *drvinfo)
+  * @netdev
+  * @ecoal
+  */
+-static int
+-bdx_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *ecoal)
++static int bdx_get_coalesce(struct net_device *netdev,
++			    struct ethtool_coalesce *ecoal,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	u32 rdintcm;
+ 	u32 tdintcm;
+@@ -2201,8 +2203,10 @@ bdx_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *ecoal)
+  * @netdev
+  * @ecoal
+  */
+-static int
+-bdx_set_coalesce(struct net_device *netdev, struct ethtool_coalesce *ecoal)
++static int bdx_set_coalesce(struct net_device *netdev,
++			    struct ethtool_coalesce *ecoal,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	u32 rdintcm;
+ 	u32 tdintcm;
+diff --git a/drivers/net/ethernet/ti/cpsw.c b/drivers/net/ethernet/ti/cpsw.c
+index 3e34cb8ac1d3..49ae576ed25d 100644
+--- a/drivers/net/ethernet/ti/cpsw.c
++++ b/drivers/net/ethernet/ti/cpsw.c
+@@ -1661,7 +1661,7 @@ static int cpsw_ndo_open(struct net_device *ndev)
+ 		struct ethtool_coalesce coal;
+ 
+ 		coal.rx_coalesce_usecs = cpsw->coal_intvl;
+-		cpsw_set_coalesce(ndev, &coal);
++		cpsw_set_coalesce(ndev, &coal, NULL, NULL);
+ 	}
+ 
+ 	cpdma_ctlr_start(cpsw->dma);
+* Unmerged path drivers/net/ethernet/ti/cpsw_ethtool.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_priv.h
+diff --git a/drivers/net/ethernet/ti/davinci_emac.c b/drivers/net/ethernet/ti/davinci_emac.c
+index aaafbc73988b..e231c64fe973 100644
+--- a/drivers/net/ethernet/ti/davinci_emac.c
++++ b/drivers/net/ethernet/ti/davinci_emac.c
+@@ -397,12 +397,16 @@ static void emac_get_drvinfo(struct net_device *ndev,
+  * emac_get_coalesce - Get interrupt coalesce settings for this device
+  * @ndev : The DaVinci EMAC network adapter
+  * @coal : ethtool coalesce settings structure
++ * @kernel_coal: ethtool CQE mode setting structure
++ * @extack: extack for reporting error messages
+  *
+  * Fetch the current interrupt coalesce settings
+  *
+  */
+ static int emac_get_coalesce(struct net_device *ndev,
+-				struct ethtool_coalesce *coal)
++			     struct ethtool_coalesce *coal,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct emac_priv *priv = netdev_priv(ndev);
+ 
+@@ -415,12 +419,16 @@ static int emac_get_coalesce(struct net_device *ndev,
+  * emac_set_coalesce - Set interrupt coalesce settings for this device
+  * @ndev : The DaVinci EMAC network adapter
+  * @coal : ethtool coalesce settings structure
++ * @kernel_coal: ethtool CQE mode setting structure
++ * @extack: extack for reporting error messages
+  *
+  * Set interrupt coalesce parameters
+  *
+  */
+ static int emac_set_coalesce(struct net_device *ndev,
+-				struct ethtool_coalesce *coal)
++			     struct ethtool_coalesce *coal,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct emac_priv *priv = netdev_priv(ndev);
+ 	u32 int_ctrl, num_interrupts = 0;
+@@ -1475,7 +1483,7 @@ static int emac_dev_open(struct net_device *ndev)
+ 		struct ethtool_coalesce coal;
+ 
+ 		coal.rx_coalesce_usecs = (priv->coal_intvl << 4);
+-		emac_set_coalesce(ndev, &coal);
++		emac_set_coalesce(ndev, &coal, NULL, NULL);
+ 	}
+ 
+ 	cpdma_ctlr_start(priv->dma);
+diff --git a/drivers/net/ethernet/via/via-velocity.c b/drivers/net/ethernet/via/via-velocity.c
+index ef9538ee53d0..ce3805c0ea37 100644
+--- a/drivers/net/ethernet/via/via-velocity.c
++++ b/drivers/net/ethernet/via/via-velocity.c
+@@ -3527,7 +3527,9 @@ static void set_pending_timer_val(int *val, u32 us)
+ 
+ 
+ static int velocity_get_coalesce(struct net_device *dev,
+-		struct ethtool_coalesce *ecmd)
++				 struct ethtool_coalesce *ecmd,
++				 struct kernel_ethtool_coalesce *kernel_coal,
++				 struct netlink_ext_ack *extack)
+ {
+ 	struct velocity_info *vptr = netdev_priv(dev);
+ 
+@@ -3541,7 +3543,9 @@ static int velocity_get_coalesce(struct net_device *dev,
+ }
+ 
+ static int velocity_set_coalesce(struct net_device *dev,
+-		struct ethtool_coalesce *ecmd)
++				 struct ethtool_coalesce *ecmd,
++				 struct kernel_ethtool_coalesce *kernel_coal,
++				 struct netlink_ext_ack *extack)
+ {
+ 	struct velocity_info *vptr = netdev_priv(dev);
+ 	int max_us = 0x3f * 64;
+* Unmerged path drivers/net/ethernet/xilinx/ll_temac_main.c
+diff --git a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+index f24f48f33802..25d339e4404a 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
++++ b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+@@ -1215,6 +1215,8 @@ axienet_ethtools_set_pauseparam(struct net_device *ndev,
+  * axienet_ethtools_get_coalesce - Get DMA interrupt coalescing count.
+  * @ndev:	Pointer to net_device structure
+  * @ecoalesce:	Pointer to ethtool_coalesce structure
++ * @kernel_coal: ethtool CQE mode setting structure
++ * @extack:	extack for reporting error messages
+  *
+  * This implements ethtool command for getting the DMA interrupt coalescing
+  * count on Tx and Rx paths. Issue "ethtool -c ethX" under linux prompt to
+@@ -1222,8 +1224,11 @@ axienet_ethtools_set_pauseparam(struct net_device *ndev,
+  *
+  * Return: 0 always
+  */
+-static int axienet_ethtools_get_coalesce(struct net_device *ndev,
+-					 struct ethtool_coalesce *ecoalesce)
++static int
++axienet_ethtools_get_coalesce(struct net_device *ndev,
++			      struct ethtool_coalesce *ecoalesce,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	u32 regval = 0;
+ 	struct axienet_local *lp = netdev_priv(ndev);
+@@ -1240,6 +1245,8 @@ static int axienet_ethtools_get_coalesce(struct net_device *ndev,
+  * axienet_ethtools_set_coalesce - Set DMA interrupt coalescing count.
+  * @ndev:	Pointer to net_device structure
+  * @ecoalesce:	Pointer to ethtool_coalesce structure
++ * @kernel_coal: ethtool CQE mode setting structure
++ * @extack:	extack for reporting error messages
+  *
+  * This implements ethtool command for setting the DMA interrupt coalescing
+  * count on Tx and Rx paths. Issue "ethtool -C ethX rx-frames 5" under linux
+@@ -1247,8 +1254,11 @@ static int axienet_ethtools_get_coalesce(struct net_device *ndev,
+  *
+  * Return: 0, on success, Non-zero error value on failure.
+  */
+-static int axienet_ethtools_set_coalesce(struct net_device *ndev,
+-					 struct ethtool_coalesce *ecoalesce)
++static int
++axienet_ethtools_set_coalesce(struct net_device *ndev,
++			      struct ethtool_coalesce *ecoalesce,
++			      struct kernel_ethtool_coalesce *kernel_coal,
++			      struct netlink_ext_ack *extack)
+ {
+ 	struct axienet_local *lp = netdev_priv(ndev);
+ 
+diff --git a/drivers/net/netdevsim/ethtool.c b/drivers/net/netdevsim/ethtool.c
+index 166f0d6cbcf7..02d48af60c2e 100644
+--- a/drivers/net/netdevsim/ethtool.c
++++ b/drivers/net/netdevsim/ethtool.c
+@@ -43,7 +43,9 @@ nsim_set_pauseparam(struct net_device *dev, struct ethtool_pauseparam *pause)
+ }
+ 
+ static int nsim_get_coalesce(struct net_device *dev,
+-			     struct ethtool_coalesce *coal)
++			     struct ethtool_coalesce *coal,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct netdevsim *ns = netdev_priv(dev);
+ 
+@@ -52,7 +54,9 @@ static int nsim_get_coalesce(struct net_device *dev,
+ }
+ 
+ static int nsim_set_coalesce(struct net_device *dev,
+-			     struct ethtool_coalesce *coal)
++			     struct ethtool_coalesce *coal,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct netdevsim *ns = netdev_priv(dev);
+ 
+diff --git a/drivers/net/tun.c b/drivers/net/tun.c
+index a878bb7dee22..877651e3d316 100644
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@ -3600,7 +3600,9 @@ static void tun_set_msglevel(struct net_device *dev, u32 value)
+ }
+ 
+ static int tun_get_coalesce(struct net_device *dev,
+-			    struct ethtool_coalesce *ec)
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct tun_struct *tun = netdev_priv(dev);
+ 
+@@ -3610,7 +3612,9 @@ static int tun_get_coalesce(struct net_device *dev,
+ }
+ 
+ static int tun_set_coalesce(struct net_device *dev,
+-			    struct ethtool_coalesce *ec)
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_coal,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct tun_struct *tun = netdev_priv(dev);
+ 
+diff --git a/drivers/net/usb/r8152.c b/drivers/net/usb/r8152.c
+index f12a217f398c..fb4122686c04 100644
+--- a/drivers/net/usb/r8152.c
++++ b/drivers/net/usb/r8152.c
+@@ -6213,7 +6213,9 @@ static int rtl8152_nway_reset(struct net_device *dev)
+ }
+ 
+ static int rtl8152_get_coalesce(struct net_device *netdev,
+-				struct ethtool_coalesce *coalesce)
++				struct ethtool_coalesce *coalesce,
++				struct kernel_ethtool_coalesce *kernel_coal,
++				struct netlink_ext_ack *extack)
+ {
+ 	struct r8152 *tp = netdev_priv(netdev);
+ 
+@@ -6232,7 +6234,9 @@ static int rtl8152_get_coalesce(struct net_device *netdev,
+ }
+ 
+ static int rtl8152_set_coalesce(struct net_device *netdev,
+-				struct ethtool_coalesce *coalesce)
++				struct ethtool_coalesce *coalesce,
++				struct kernel_ethtool_coalesce *kernel_coal,
++				struct netlink_ext_ack *extack)
+ {
+ 	struct r8152 *tp = netdev_priv(netdev);
+ 	int ret;
+* Unmerged path drivers/net/virtio_net.c
+diff --git a/drivers/net/vmxnet3/vmxnet3_ethtool.c b/drivers/net/vmxnet3/vmxnet3_ethtool.c
+index b229cd471920..96c5cfb4ea79 100644
+--- a/drivers/net/vmxnet3/vmxnet3_ethtool.c
++++ b/drivers/net/vmxnet3/vmxnet3_ethtool.c
+@@ -1053,8 +1053,10 @@ vmxnet3_set_rss(struct net_device *netdev, const u32 *p, const u8 *key,
+ }
+ #endif
+ 
+-static int
+-vmxnet3_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec)
++static int vmxnet3_get_coalesce(struct net_device *netdev,
++				struct ethtool_coalesce *ec,
++				struct kernel_ethtool_coalesce *kernel_coal,
++				struct netlink_ext_ack *extack)
+ {
+ 	struct vmxnet3_adapter *adapter = netdev_priv(netdev);
+ 
+@@ -1088,8 +1090,10 @@ vmxnet3_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec)
+ 	return 0;
+ }
+ 
+-static int
+-vmxnet3_set_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec)
++static int vmxnet3_set_coalesce(struct net_device *netdev,
++				struct ethtool_coalesce *ec,
++				struct kernel_ethtool_coalesce *kernel_coal,
++				struct netlink_ext_ack *extack)
+ {
+ 	struct vmxnet3_adapter *adapter = netdev_priv(netdev);
+ 	struct Vmxnet3_DriverShared *shared = adapter->shared;
+* Unmerged path drivers/net/wireless/ath/wil6210/ethtool.c
+diff --git a/drivers/s390/net/qeth_ethtool.c b/drivers/s390/net/qeth_ethtool.c
+index 2c4cb300a8fc..5bbd6dda1793 100644
+--- a/drivers/s390/net/qeth_ethtool.c
++++ b/drivers/s390/net/qeth_ethtool.c
+@@ -123,7 +123,9 @@ static void __qeth_set_coalesce(struct net_device *dev,
+ }
+ 
+ static int qeth_set_coalesce(struct net_device *dev,
+-			     struct ethtool_coalesce *coal)
++			     struct ethtool_coalesce *coal,
++			     struct kernel_ethtool_coalesce *kernel_coal,
++			     struct netlink_ext_ack *extack)
+ {
+ 	struct qeth_card *card = dev->ml_priv;
+ 	struct qeth_qdio_out_q *queue;
+diff --git a/include/linux/ethtool.h b/include/linux/ethtool.h
+index 1c3b03683698..714e97891296 100644
+--- a/include/linux/ethtool.h
++++ b/include/linux/ethtool.h
+@@ -15,6 +15,7 @@
+ 
+ #include <linux/bitmap.h>
+ #include <linux/compat.h>
++#include <linux/netlink.h>
+ #include <uapi/linux/ethtool.h>
+ 
+ #include <linux/rh_kabi.h>
+@@ -481,8 +482,14 @@ struct ethtool_ops {
+ 			      struct ethtool_eeprom *, u8 *);
+ 	int	(*set_eeprom)(struct net_device *,
+ 			      struct ethtool_eeprom *, u8 *);
+-	int	(*get_coalesce)(struct net_device *, struct ethtool_coalesce *);
+-	int	(*set_coalesce)(struct net_device *, struct ethtool_coalesce *);
++	int	(*get_coalesce)(struct net_device *,
++				struct ethtool_coalesce *,
++				struct kernel_ethtool_coalesce *,
++				struct netlink_ext_ack *);
++	int	(*set_coalesce)(struct net_device *,
++				struct ethtool_coalesce *,
++				struct kernel_ethtool_coalesce *,
++				struct netlink_ext_ack *);
+ 	void	(*get_ringparam)(struct net_device *,
+ 				 struct ethtool_ringparam *);
+ 	int	(*set_ringparam)(struct net_device *,
+diff --git a/net/ethtool/coalesce.c b/net/ethtool/coalesce.c
+index e6bc53634e68..46776ea42a92 100644
+--- a/net/ethtool/coalesce.c
++++ b/net/ethtool/coalesce.c
+@@ -62,6 +62,7 @@ static int coalesce_prepare_data(const struct ethnl_req_info *req_base,
+ 				 struct genl_info *info)
+ {
+ 	struct coalesce_reply_data *data = COALESCE_REPDATA(reply_base);
++	struct netlink_ext_ack *extack = info ? info->extack : NULL;
+ 	struct net_device *dev = reply_base->dev;
+ 	int ret;
+ 
+@@ -71,7 +72,8 @@ static int coalesce_prepare_data(const struct ethnl_req_info *req_base,
+ 	ret = ethnl_ops_begin(dev);
+ 	if (ret < 0)
+ 		return ret;
+-	ret = dev->ethtool_ops->get_coalesce(dev, &data->coalesce);
++	ret = dev->ethtool_ops->get_coalesce(dev, &data->coalesce,
++					     &data->kernel_coalesce, extack);
+ 	ethnl_ops_complete(dev);
+ 
+ 	return ret;
+@@ -266,7 +268,8 @@ int ethnl_set_coalesce(struct sk_buff *skb, struct genl_info *info)
+ 	ret = ethnl_ops_begin(dev);
+ 	if (ret < 0)
+ 		goto out_rtnl;
+-	ret = ops->get_coalesce(dev, &coalesce);
++	ret = ops->get_coalesce(dev, &coalesce, &kernel_coalesce,
++				info->extack);
+ 	if (ret < 0)
+ 		goto out_ops;
+ 
+@@ -322,7 +325,8 @@ int ethnl_set_coalesce(struct sk_buff *skb, struct genl_info *info)
+ 	if (!mod)
+ 		goto out_ops;
+ 
+-	ret = dev->ethtool_ops->set_coalesce(dev, &coalesce);
++	ret = dev->ethtool_ops->set_coalesce(dev, &coalesce, &kernel_coalesce,
++					     info->extack);
+ 	if (ret < 0)
+ 		goto out_ops;
+ 	ethtool_notify(dev, ETHTOOL_MSG_COALESCE_NTF, NULL);
+diff --git a/net/ethtool/ioctl.c b/net/ethtool/ioctl.c
+index 146bb9c62327..1d48f0cb29ef 100644
+--- a/net/ethtool/ioctl.c
++++ b/net/ethtool/ioctl.c
+@@ -1605,12 +1605,14 @@ static noinline_for_stack int ethtool_get_coalesce(struct net_device *dev,
+ 						   void __user *useraddr)
+ {
+ 	struct ethtool_coalesce coalesce = { .cmd = ETHTOOL_GCOALESCE };
++	struct kernel_ethtool_coalesce kernel_coalesce = {};
+ 	int ret;
+ 
+ 	if (!dev->ethtool_ops->get_coalesce)
+ 		return -EOPNOTSUPP;
+ 
+-	ret = dev->ethtool_ops->get_coalesce(dev, &coalesce);
++	ret = dev->ethtool_ops->get_coalesce(dev, &coalesce, &kernel_coalesce,
++					     NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1680,19 +1682,26 @@ ethtool_set_coalesce_supported(struct net_device *dev,
+ static noinline_for_stack int ethtool_set_coalesce(struct net_device *dev,
+ 						   void __user *useraddr)
+ {
++	struct kernel_ethtool_coalesce kernel_coalesce = {};
+ 	struct ethtool_coalesce coalesce;
+ 	int ret;
+ 
+-	if (!dev->ethtool_ops->set_coalesce)
++	if (!dev->ethtool_ops->set_coalesce && !dev->ethtool_ops->get_coalesce)
+ 		return -EOPNOTSUPP;
+ 
++	ret = dev->ethtool_ops->get_coalesce(dev, &coalesce, &kernel_coalesce,
++					     NULL);
++	if (ret)
++		return ret;
++
+ 	if (copy_from_user(&coalesce, useraddr, sizeof(coalesce)))
+ 		return -EFAULT;
+ 
+ 	if (!ethtool_set_coalesce_supported(dev, &coalesce))
+ 		return -EOPNOTSUPP;
+ 
+-	ret = dev->ethtool_ops->set_coalesce(dev, &coalesce);
++	ret = dev->ethtool_ops->set_coalesce(dev, &coalesce, &kernel_coalesce,
++					     NULL);
+ 	if (!ret)
+ 		ethtool_notify(dev, ETHTOOL_MSG_COALESCE_NTF, NULL);
+ 	return ret;
