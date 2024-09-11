@@ -1,0 +1,148 @@
+genirq/PM: Introduce IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Maulik Shah <mkshah@codeaurora.org>
+commit 90428a8eb4947f9c7c905a178f3520dc7e2ee6d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/90428a8e.failed
+
+An interrupt that is disabled/masked but set for wakeup may still need to
+be able to wake up the system from sleep states like "suspend to RAM".
+
+To that effect, introduce the IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND flag.
+If the irqchip have this flag set, the irq PM code will enable/unmask
+the irqs that are marked for wakeup, but that are in a disabled state.
+
+On resume, such irqs will be restored back to their disabled state.
+
+	Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Maulik Shah <mkshah@codeaurora.org>
+[maz: commit message fix-up]
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+	Tested-by: Stephen Boyd <swboyd@chromium.org>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Douglas Anderson <dianders@chromium.org>
+Link: https://lore.kernel.org/r/1601267524-20199-4-git-send-email-mkshah@codeaurora.org
+(cherry picked from commit 90428a8eb4947f9c7c905a178f3520dc7e2ee6d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/irq.h
+#	kernel/irq/debugfs.c
+diff --cc include/linux/irq.h
+index 873a8c69545e,a8b84b88e673..000000000000
+--- a/include/linux/irq.h
++++ b/include/linux/irq.h
+@@@ -213,6 -213,10 +213,13 @@@ struct irq_data 
+   *				  required
+   * IRQD_HANDLE_ENFORCE_IRQCTX	- Enforce that handle_irq_*() is only invoked
+   *				  from actual interrupt context.
+++<<<<<<< HEAD
+++=======
++  * IRQD_AFFINITY_ON_ACTIVATE	- Affinity is set on activation. Don't call
++  *				  irq_chip::irq_set_affinity() when deactivated.
++  * IRQD_IRQ_ENABLED_ON_SUSPEND	- Interrupt is enabled on suspend by irq pm if
++  *				  irqchip have flag IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND set.
+++>>>>>>> 90428a8eb494 (genirq/PM: Introduce IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND flag)
+   */
+  enum {
+  	IRQD_TRIGGER_MASK		= 0xf,
+@@@ -237,6 -241,8 +244,11 @@@
+  	IRQD_CAN_RESERVE		= (1 << 26),
+  	IRQD_MSI_NOMASK_QUIRK		= (1 << 27),
+  	IRQD_HANDLE_ENFORCE_IRQCTX	= (1 << 28),
+++<<<<<<< HEAD
+++=======
++ 	IRQD_AFFINITY_ON_ACTIVATE	= (1 << 29),
++ 	IRQD_IRQ_ENABLED_ON_SUSPEND	= (1 << 30),
+++>>>>>>> 90428a8eb494 (genirq/PM: Introduce IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND flag)
+  };
+  
+  #define __irqd_to_state(d) ACCESS_PRIVATE((d)->common, state_use_accessors)
+diff --cc kernel/irq/debugfs.c
+index 216db115b68a,b6e10945e8be..000000000000
+--- a/kernel/irq/debugfs.c
++++ b/kernel/irq/debugfs.c
+@@@ -120,6 -122,12 +121,15 @@@ static const struct irq_bit_descr irqda
+  
+  	BIT_MASK_DESCR(IRQD_WAKEUP_STATE),
+  	BIT_MASK_DESCR(IRQD_WAKEUP_ARMED),
+++<<<<<<< HEAD
+++=======
++ 
++ 	BIT_MASK_DESCR(IRQD_DEFAULT_TRIGGER_SET),
++ 
++ 	BIT_MASK_DESCR(IRQD_HANDLE_ENFORCE_IRQCTX),
++ 
++ 	BIT_MASK_DESCR(IRQD_IRQ_ENABLED_ON_SUSPEND),
+++>>>>>>> 90428a8eb494 (genirq/PM: Introduce IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND flag)
+  };
+  
+  static const struct irq_bit_descr irqdesc_states[] = {
+* Unmerged path include/linux/irq.h
+* Unmerged path kernel/irq/debugfs.c
+diff --git a/kernel/irq/pm.c b/kernel/irq/pm.c
+index 8f557fa1f4fe..a0559cc6573f 100644
+--- a/kernel/irq/pm.c
++++ b/kernel/irq/pm.c
+@@ -69,12 +69,26 @@ void irq_pm_remove_action(struct irq_desc *desc, struct irqaction *action)
+ 
+ static bool suspend_device_irq(struct irq_desc *desc)
+ {
++	unsigned long chipflags = irq_desc_get_chip(desc)->flags;
++	struct irq_data *irqd = &desc->irq_data;
++
+ 	if (!desc->action || irq_desc_is_chained(desc) ||
+ 	    desc->no_suspend_depth)
+ 		return false;
+ 
+-	if (irqd_is_wakeup_set(&desc->irq_data)) {
+-		irqd_set(&desc->irq_data, IRQD_WAKEUP_ARMED);
++	if (irqd_is_wakeup_set(irqd)) {
++		irqd_set(irqd, IRQD_WAKEUP_ARMED);
++
++		if ((chipflags & IRQCHIP_ENABLE_WAKEUP_ON_SUSPEND) &&
++		     irqd_irq_disabled(irqd)) {
++			/*
++			 * Interrupt marked for wakeup is in disabled state.
++			 * Enable interrupt here to unmask/enable in irqchip
++			 * to be able to resume with such interrupts.
++			 */
++			__enable_irq(desc);
++			irqd_set(irqd, IRQD_IRQ_ENABLED_ON_SUSPEND);
++		}
+ 		/*
+ 		 * We return true here to force the caller to issue
+ 		 * synchronize_irq(). We need to make sure that the
+@@ -93,7 +107,7 @@ static bool suspend_device_irq(struct irq_desc *desc)
+ 	 * chip level. The chip implementation indicates that with
+ 	 * IRQCHIP_MASK_ON_SUSPEND.
+ 	 */
+-	if (irq_desc_get_chip(desc)->flags & IRQCHIP_MASK_ON_SUSPEND)
++	if (chipflags & IRQCHIP_MASK_ON_SUSPEND)
+ 		mask_irq(desc);
+ 	return true;
+ }
+@@ -137,7 +151,19 @@ EXPORT_SYMBOL_GPL(suspend_device_irqs);
+ 
+ static void resume_irq(struct irq_desc *desc)
+ {
+-	irqd_clear(&desc->irq_data, IRQD_WAKEUP_ARMED);
++	struct irq_data *irqd = &desc->irq_data;
++
++	irqd_clear(irqd, IRQD_WAKEUP_ARMED);
++
++	if (irqd_is_enabled_on_suspend(irqd)) {
++		/*
++		 * Interrupt marked for wakeup was enabled during suspend
++		 * entry. Disable such interrupts to restore them back to
++		 * original state.
++		 */
++		__disable_irq(desc);
++		irqd_clear(irqd, IRQD_IRQ_ENABLED_ON_SUSPEND);
++	}
+ 
+ 	if (desc->istate & IRQS_SUSPENDED)
+ 		goto resume;
