@@ -1,0 +1,733 @@
+Bluetooth: hci_qca: Replace devm_gpiod_get() with devm_gpiod_get_optional()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Rocky Liao <rjliao@codeaurora.org>
+commit 77131dfec6af114efd32610b4a6bbecd934e37d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/77131dfe.failed
+
+This patch replaces devm_gpiod_get() with devm_gpiod_get_optional() to get
+bt_en and replaces devm_clk_get() with devm_clk_get_optional() to get
+susclk. It also uses NULL check to determine whether the resource is
+available or not.
+
+Fixes: 8a208b24d770 ("Bluetooth: hci_qca: Make bt_en and susclk not mandatory for QCA Rome")
+	Signed-off-by: Rocky Liao <rjliao@codeaurora.org>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 77131dfec6af114efd32610b4a6bbecd934e37d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/bluetooth/hci_qca.c
+diff --cc drivers/bluetooth/hci_qca.c
+index c7723b08787d,439392b1c043..000000000000
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@@ -909,6 -1271,307 +909,310 @@@ static inline void host_set_baudrate(st
+  		hci_uart_set_baudrate(hu, speed);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int qca_send_power_pulse(struct hci_uart *hu, bool on)
++ {
++ 	int ret;
++ 	int timeout = msecs_to_jiffies(CMD_TRANS_TIMEOUT_MS);
++ 	u8 cmd = on ? QCA_WCN3990_POWERON_PULSE : QCA_WCN3990_POWEROFF_PULSE;
++ 
++ 	/* These power pulses are single byte command which are sent
++ 	 * at required baudrate to wcn3990. On wcn3990, we have an external
++ 	 * circuit at Tx pin which decodes the pulse sent at specific baudrate.
++ 	 * For example, wcn3990 supports RF COEX antenna for both Wi-Fi/BT
++ 	 * and also we use the same power inputs to turn on and off for
++ 	 * Wi-Fi/BT. Powering up the power sources will not enable BT, until
++ 	 * we send a power on pulse at 115200 bps. This algorithm will help to
++ 	 * save power. Disabling hardware flow control is mandatory while
++ 	 * sending power pulses to SoC.
++ 	 */
++ 	bt_dev_dbg(hu->hdev, "sending power pulse %02x to controller", cmd);
++ 
++ 	serdev_device_write_flush(hu->serdev);
++ 	hci_uart_set_flow_control(hu, true);
++ 	ret = serdev_device_write_buf(hu->serdev, &cmd, sizeof(cmd));
++ 	if (ret < 0) {
++ 		bt_dev_err(hu->hdev, "failed to send power pulse %02x", cmd);
++ 		return ret;
++ 	}
++ 
++ 	serdev_device_wait_until_sent(hu->serdev, timeout);
++ 	hci_uart_set_flow_control(hu, false);
++ 
++ 	/* Give to controller time to boot/shutdown */
++ 	if (on)
++ 		msleep(100);
++ 	else
++ 		msleep(10);
++ 
++ 	return 0;
++ }
++ 
++ static unsigned int qca_get_speed(struct hci_uart *hu,
++ 				  enum qca_speed_type speed_type)
++ {
++ 	unsigned int speed = 0;
++ 
++ 	if (speed_type == QCA_INIT_SPEED) {
++ 		if (hu->init_speed)
++ 			speed = hu->init_speed;
++ 		else if (hu->proto->init_speed)
++ 			speed = hu->proto->init_speed;
++ 	} else {
++ 		if (hu->oper_speed)
++ 			speed = hu->oper_speed;
++ 		else if (hu->proto->oper_speed)
++ 			speed = hu->proto->oper_speed;
++ 	}
++ 
++ 	return speed;
++ }
++ 
++ static int qca_check_speeds(struct hci_uart *hu)
++ {
++ 	if (qca_is_wcn399x(qca_soc_type(hu))) {
++ 		if (!qca_get_speed(hu, QCA_INIT_SPEED) &&
++ 		    !qca_get_speed(hu, QCA_OPER_SPEED))
++ 			return -EINVAL;
++ 	} else {
++ 		if (!qca_get_speed(hu, QCA_INIT_SPEED) ||
++ 		    !qca_get_speed(hu, QCA_OPER_SPEED))
++ 			return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int qca_set_speed(struct hci_uart *hu, enum qca_speed_type speed_type)
++ {
++ 	unsigned int speed, qca_baudrate;
++ 	struct qca_data *qca = hu->priv;
++ 	int ret = 0;
++ 
++ 	if (speed_type == QCA_INIT_SPEED) {
++ 		speed = qca_get_speed(hu, QCA_INIT_SPEED);
++ 		if (speed)
++ 			host_set_baudrate(hu, speed);
++ 	} else {
++ 		enum qca_btsoc_type soc_type = qca_soc_type(hu);
++ 
++ 		speed = qca_get_speed(hu, QCA_OPER_SPEED);
++ 		if (!speed)
++ 			return 0;
++ 
++ 		/* Disable flow control for wcn3990 to deassert RTS while
++ 		 * changing the baudrate of chip and host.
++ 		 */
++ 		if (qca_is_wcn399x(soc_type))
++ 			hci_uart_set_flow_control(hu, true);
++ 
++ 		if (soc_type == QCA_WCN3990) {
++ 			reinit_completion(&qca->drop_ev_comp);
++ 			set_bit(QCA_DROP_VENDOR_EVENT, &qca->flags);
++ 		}
++ 
++ 		qca_baudrate = qca_get_baudrate_value(speed);
++ 		bt_dev_dbg(hu->hdev, "Set UART speed to %d", speed);
++ 		ret = qca_set_baudrate(hu->hdev, qca_baudrate);
++ 		if (ret)
++ 			goto error;
++ 
++ 		host_set_baudrate(hu, speed);
++ 
++ error:
++ 		if (qca_is_wcn399x(soc_type))
++ 			hci_uart_set_flow_control(hu, false);
++ 
++ 		if (soc_type == QCA_WCN3990) {
++ 			/* Wait for the controller to send the vendor event
++ 			 * for the baudrate change command.
++ 			 */
++ 			if (!wait_for_completion_timeout(&qca->drop_ev_comp,
++ 						 msecs_to_jiffies(100))) {
++ 				bt_dev_err(hu->hdev,
++ 					   "Failed to change controller baudrate\n");
++ 				ret = -ETIMEDOUT;
++ 			}
++ 
++ 			clear_bit(QCA_DROP_VENDOR_EVENT, &qca->flags);
++ 		}
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int qca_send_crashbuffer(struct hci_uart *hu)
++ {
++ 	struct qca_data *qca = hu->priv;
++ 	struct sk_buff *skb;
++ 
++ 	skb = bt_skb_alloc(QCA_CRASHBYTE_PACKET_LEN, GFP_KERNEL);
++ 	if (!skb) {
++ 		bt_dev_err(hu->hdev, "Failed to allocate memory for skb packet");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	/* We forcefully crash the controller, by sending 0xfb byte for
++ 	 * 1024 times. We also might have chance of losing data, To be
++ 	 * on safer side we send 1096 bytes to the SoC.
++ 	 */
++ 	memset(skb_put(skb, QCA_CRASHBYTE_PACKET_LEN), QCA_MEMDUMP_BYTE,
++ 	       QCA_CRASHBYTE_PACKET_LEN);
++ 	hci_skb_pkt_type(skb) = HCI_COMMAND_PKT;
++ 	bt_dev_info(hu->hdev, "crash the soc to collect controller dump");
++ 	skb_queue_tail(&qca->txq, skb);
++ 	hci_uart_tx_wakeup(hu);
++ 
++ 	return 0;
++ }
++ 
++ static void qca_wait_for_dump_collection(struct hci_dev *hdev)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 
++ 	wait_on_bit_timeout(&qca->flags, QCA_MEMDUMP_COLLECTION,
++ 			    TASK_UNINTERRUPTIBLE, MEMDUMP_TIMEOUT_MS);
++ 
++ 	clear_bit(QCA_MEMDUMP_COLLECTION, &qca->flags);
++ }
++ 
++ static void qca_hw_error(struct hci_dev *hdev, u8 code)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 	struct qca_memdump_data *qca_memdump = qca->qca_memdump;
++ 	char *memdump_buf = NULL;
++ 
++ 	set_bit(QCA_HW_ERROR_EVENT, &qca->flags);
++ 	bt_dev_info(hdev, "mem_dump_status: %d", qca->memdump_state);
++ 
++ 	if (qca->memdump_state == QCA_MEMDUMP_IDLE) {
++ 		/* If hardware error event received for other than QCA
++ 		 * soc memory dump event, then we need to crash the SOC
++ 		 * and wait here for 8 seconds to get the dump packets.
++ 		 * This will block main thread to be on hold until we
++ 		 * collect dump.
++ 		 */
++ 		set_bit(QCA_MEMDUMP_COLLECTION, &qca->flags);
++ 		qca_send_crashbuffer(hu);
++ 		qca_wait_for_dump_collection(hdev);
++ 	} else if (qca->memdump_state == QCA_MEMDUMP_COLLECTING) {
++ 		/* Let us wait here until memory dump collected or
++ 		 * memory dump timer expired.
++ 		 */
++ 		bt_dev_info(hdev, "waiting for dump to complete");
++ 		qca_wait_for_dump_collection(hdev);
++ 	}
++ 
++ 	if (qca->memdump_state != QCA_MEMDUMP_COLLECTED) {
++ 		bt_dev_err(hu->hdev, "clearing allocated memory due to memdump timeout");
++ 		mutex_lock(&qca->hci_memdump_lock);
++ 		if (qca_memdump)
++ 			memdump_buf = qca_memdump->memdump_buf_head;
++ 		vfree(memdump_buf);
++ 		kfree(qca_memdump);
++ 		qca->qca_memdump = NULL;
++ 		qca->memdump_state = QCA_MEMDUMP_TIMEOUT;
++ 		cancel_delayed_work(&qca->ctrl_memdump_timeout);
++ 		skb_queue_purge(&qca->rx_memdump_q);
++ 		mutex_unlock(&qca->hci_memdump_lock);
++ 		cancel_work_sync(&qca->ctrl_memdump_evt);
++ 	}
++ 
++ 	clear_bit(QCA_HW_ERROR_EVENT, &qca->flags);
++ }
++ 
++ static void qca_cmd_timeout(struct hci_dev *hdev)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 
++ 	if (qca->memdump_state == QCA_MEMDUMP_IDLE)
++ 		qca_send_crashbuffer(hu);
++ 	else
++ 		bt_dev_info(hdev, "Dump collection is in process");
++ }
++ 
++ static int qca_wcn3990_init(struct hci_uart *hu)
++ {
++ 	struct qca_serdev *qcadev;
++ 	int ret;
++ 
++ 	/* Check for vregs status, may be hci down has turned
++ 	 * off the voltage regulator.
++ 	 */
++ 	qcadev = serdev_device_get_drvdata(hu->serdev);
++ 	if (!qcadev->bt_power->vregs_on) {
++ 		serdev_device_close(hu->serdev);
++ 		ret = qca_regulator_enable(qcadev);
++ 		if (ret)
++ 			return ret;
++ 
++ 		ret = serdev_device_open(hu->serdev);
++ 		if (ret) {
++ 			bt_dev_err(hu->hdev, "failed to open port");
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	/* Forcefully enable wcn3990 to enter in to boot mode. */
++ 	host_set_baudrate(hu, 2400);
++ 	ret = qca_send_power_pulse(hu, false);
++ 	if (ret)
++ 		return ret;
++ 
++ 	qca_set_speed(hu, QCA_INIT_SPEED);
++ 	ret = qca_send_power_pulse(hu, true);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Now the device is in ready state to communicate with host.
++ 	 * To sync host with device we need to reopen port.
++ 	 * Without this, we will have RTS and CTS synchronization
++ 	 * issues.
++ 	 */
++ 	serdev_device_close(hu->serdev);
++ 	ret = serdev_device_open(hu->serdev);
++ 	if (ret) {
++ 		bt_dev_err(hu->hdev, "failed to open port");
++ 		return ret;
++ 	}
++ 
++ 	hci_uart_set_flow_control(hu, false);
++ 
++ 	return 0;
++ }
++ 
++ static int qca_power_on(struct hci_dev *hdev)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	enum qca_btsoc_type soc_type = qca_soc_type(hu);
++ 	struct qca_serdev *qcadev;
++ 	int ret = 0;
++ 
++ 	/* Non-serdev device usually is powered by external power
++ 	 * and don't need additional action in driver for power on
++ 	 */
++ 	if (!hu->serdev)
++ 		return 0;
++ 
++ 	if (qca_is_wcn399x(soc_type)) {
++ 		ret = qca_wcn3990_init(hu);
++ 	} else {
++ 		qcadev = serdev_device_get_drvdata(hu->serdev);
++ 		if (qcadev->bt_en) {
++ 			gpiod_set_value_cansleep(qcadev->bt_en, 1);
++ 			/* Controller needs time to bootup. */
++ 			msleep(150);
++ 		}
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 77131dfec6af (Bluetooth: hci_qca: Replace devm_gpiod_get() with devm_gpiod_get_optional())
+  static int qca_setup(struct hci_uart *hu)
+  {
+  	struct hci_dev *hdev = hu->hdev;
+@@@ -988,6 -1688,166 +1292,169 @@@ static const struct hci_uart_proto qca_
+  	.dequeue	= qca_dequeue,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct qca_vreg_data qca_soc_data_wcn3990 = {
++ 	.soc_type = QCA_WCN3990,
++ 	.vregs = (struct qca_vreg []) {
++ 		{ "vddio", 15000  },
++ 		{ "vddxo", 80000  },
++ 		{ "vddrf", 300000 },
++ 		{ "vddch0", 450000 },
++ 	},
++ 	.num_vregs = 4,
++ };
++ 
++ static const struct qca_vreg_data qca_soc_data_wcn3991 = {
++ 	.soc_type = QCA_WCN3991,
++ 	.vregs = (struct qca_vreg []) {
++ 		{ "vddio", 15000  },
++ 		{ "vddxo", 80000  },
++ 		{ "vddrf", 300000 },
++ 		{ "vddch0", 450000 },
++ 	},
++ 	.num_vregs = 4,
++ };
++ 
++ static const struct qca_vreg_data qca_soc_data_wcn3998 = {
++ 	.soc_type = QCA_WCN3998,
++ 	.vregs = (struct qca_vreg []) {
++ 		{ "vddio", 10000  },
++ 		{ "vddxo", 80000  },
++ 		{ "vddrf", 300000 },
++ 		{ "vddch0", 450000 },
++ 	},
++ 	.num_vregs = 4,
++ };
++ 
++ static void qca_power_shutdown(struct hci_uart *hu)
++ {
++ 	struct qca_serdev *qcadev;
++ 	struct qca_data *qca = hu->priv;
++ 	unsigned long flags;
++ 	enum qca_btsoc_type soc_type = qca_soc_type(hu);
++ 
++ 	qcadev = serdev_device_get_drvdata(hu->serdev);
++ 
++ 	/* From this point we go into power off state. But serial port is
++ 	 * still open, stop queueing the IBS data and flush all the buffered
++ 	 * data in skb's.
++ 	 */
++ 	spin_lock_irqsave(&qca->hci_ibs_lock, flags);
++ 	clear_bit(QCA_IBS_ENABLED, &qca->flags);
++ 	qca_flush(hu);
++ 	spin_unlock_irqrestore(&qca->hci_ibs_lock, flags);
++ 
++ 	hu->hdev->hw_error = NULL;
++ 	hu->hdev->cmd_timeout = NULL;
++ 
++ 	/* Non-serdev device usually is powered by external power
++ 	 * and don't need additional action in driver for power down
++ 	 */
++ 	if (!hu->serdev)
++ 		return;
++ 
++ 	if (qca_is_wcn399x(soc_type)) {
++ 		host_set_baudrate(hu, 2400);
++ 		qca_send_power_pulse(hu, false);
++ 		qca_regulator_disable(qcadev);
++ 	} else if (qcadev->bt_en) {
++ 		gpiod_set_value_cansleep(qcadev->bt_en, 0);
++ 	}
++ }
++ 
++ static int qca_power_off(struct hci_dev *hdev)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 	enum qca_btsoc_type soc_type = qca_soc_type(hu);
++ 
++ 	/* Stop sending shutdown command if soc crashes. */
++ 	if (qca_is_wcn399x(soc_type)
++ 		&& qca->memdump_state == QCA_MEMDUMP_IDLE) {
++ 		qca_send_pre_shutdown_cmd(hdev);
++ 		usleep_range(8000, 10000);
++ 	}
++ 
++ 	qca->memdump_state = QCA_MEMDUMP_IDLE;
++ 	qca_power_shutdown(hu);
++ 	return 0;
++ }
++ 
++ static int qca_regulator_enable(struct qca_serdev *qcadev)
++ {
++ 	struct qca_power *power = qcadev->bt_power;
++ 	int ret;
++ 
++ 	/* Already enabled */
++ 	if (power->vregs_on)
++ 		return 0;
++ 
++ 	BT_DBG("enabling %d regulators)", power->num_vregs);
++ 
++ 	ret = regulator_bulk_enable(power->num_vregs, power->vreg_bulk);
++ 	if (ret)
++ 		return ret;
++ 
++ 	power->vregs_on = true;
++ 
++ 	ret = clk_prepare_enable(qcadev->susclk);
++ 	if (ret)
++ 		qca_regulator_disable(qcadev);
++ 
++ 	return ret;
++ }
++ 
++ static void qca_regulator_disable(struct qca_serdev *qcadev)
++ {
++ 	struct qca_power *power;
++ 
++ 	if (!qcadev)
++ 		return;
++ 
++ 	power = qcadev->bt_power;
++ 
++ 	/* Already disabled? */
++ 	if (!power->vregs_on)
++ 		return;
++ 
++ 	regulator_bulk_disable(power->num_vregs, power->vreg_bulk);
++ 	power->vregs_on = false;
++ 
++ 	clk_disable_unprepare(qcadev->susclk);
++ }
++ 
++ static int qca_init_regulators(struct qca_power *qca,
++ 				const struct qca_vreg *vregs, size_t num_vregs)
++ {
++ 	struct regulator_bulk_data *bulk;
++ 	int ret;
++ 	int i;
++ 
++ 	bulk = devm_kcalloc(qca->dev, num_vregs, sizeof(*bulk), GFP_KERNEL);
++ 	if (!bulk)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < num_vregs; i++)
++ 		bulk[i].supply = vregs[i].name;
++ 
++ 	ret = devm_regulator_bulk_get(qca->dev, num_vregs, bulk);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	for (i = 0; i < num_vregs; i++) {
++ 		ret = regulator_set_load(bulk[i].consumer, vregs[i].load_uA);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	qca->vreg_bulk = bulk;
++ 	qca->num_vregs = num_vregs;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 77131dfec6af (Bluetooth: hci_qca: Replace devm_gpiod_get() with devm_gpiod_get_optional())
+  static int qca_serdev_probe(struct serdev_device *serdev)
+  {
+  	struct qca_serdev *qcadev;
+@@@ -998,47 -1861,194 +1465,113 @@@
+  		return -ENOMEM;
+  
+  	qcadev->serdev_hu.serdev = serdev;
+ -	data = device_get_match_data(&serdev->dev);
+  	serdev_device_set_drvdata(serdev, qcadev);
+ -	device_property_read_string(&serdev->dev, "firmware-name",
+ -					 &qcadev->firmware_name);
+ -	if (data && qca_is_wcn399x(data->soc_type)) {
+ -		qcadev->btsoc_type = data->soc_type;
+ -		qcadev->bt_power = devm_kzalloc(&serdev->dev,
+ -						sizeof(struct qca_power),
+ -						GFP_KERNEL);
+ -		if (!qcadev->bt_power)
+ -			return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	qcadev->bt_en = devm_gpiod_get(&serdev->dev, "enable",
+ +				       GPIOD_OUT_LOW);
+ +	if (IS_ERR(qcadev->bt_en)) {
+ +		dev_err(&serdev->dev, "failed to acquire enable gpio\n");
+ +		return PTR_ERR(qcadev->bt_en);
+++=======
++ 		qcadev->bt_power->dev = &serdev->dev;
++ 		err = qca_init_regulators(qcadev->bt_power, data->vregs,
++ 					  data->num_vregs);
++ 		if (err) {
++ 			BT_ERR("Failed to init regulators:%d", err);
++ 			return err;
++ 		}
++ 
++ 		qcadev->bt_power->vregs_on = false;
++ 
++ 		qcadev->susclk = devm_clk_get_optional(&serdev->dev, NULL);
++ 		if (IS_ERR(qcadev->susclk)) {
++ 			dev_err(&serdev->dev, "failed to acquire clk\n");
++ 			return PTR_ERR(qcadev->susclk);
++ 		}
++ 
++ 		device_property_read_u32(&serdev->dev, "max-speed",
++ 					 &qcadev->oper_speed);
++ 		if (!qcadev->oper_speed)
++ 			BT_DBG("UART will pick default operating speed");
++ 
++ 		err = hci_uart_register_device(&qcadev->serdev_hu, &qca_proto);
++ 		if (err) {
++ 			BT_ERR("wcn3990 serdev registration failed");
++ 			return err;
++ 		}
++ 	} else {
++ 		qcadev->btsoc_type = QCA_ROME;
++ 		qcadev->bt_en = devm_gpiod_get_optional(&serdev->dev, "enable",
++ 					       GPIOD_OUT_LOW);
++ 		if (!qcadev->bt_en) {
++ 			dev_warn(&serdev->dev, "failed to acquire enable gpio\n");
++ 			power_ctrl_enabled = false;
++ 		}
++ 
++ 		qcadev->susclk = devm_clk_get_optional(&serdev->dev, NULL);
++ 		if (!qcadev->susclk) {
++ 			dev_warn(&serdev->dev, "failed to acquire clk\n");
++ 		} else {
++ 			err = clk_set_rate(qcadev->susclk, SUSCLK_RATE_32KHZ);
++ 			if (err)
++ 				return err;
++ 
++ 			err = clk_prepare_enable(qcadev->susclk);
++ 			if (err)
++ 				return err;
++ 		}
++ 
++ 		err = hci_uart_register_device(&qcadev->serdev_hu, &qca_proto);
++ 		if (err) {
++ 			BT_ERR("Rome serdev registration failed");
++ 			if (qcadev->susclk)
++ 				clk_disable_unprepare(qcadev->susclk);
++ 			return err;
++ 		}
+++>>>>>>> 77131dfec6af (Bluetooth: hci_qca: Replace devm_gpiod_get() with devm_gpiod_get_optional())
+  	}
+  
+ -	if (power_ctrl_enabled) {
+ -		hdev = qcadev->serdev_hu.hdev;
+ -		set_bit(HCI_QUIRK_NON_PERSISTENT_SETUP, &hdev->quirks);
+ -		hdev->shutdown = qca_power_off;
+ +	qcadev->susclk = devm_clk_get(&serdev->dev, NULL);
+ +	if (IS_ERR(qcadev->susclk)) {
+ +		dev_err(&serdev->dev, "failed to acquire clk\n");
+ +		return PTR_ERR(qcadev->susclk);
+  	}
+  
+ -	return 0;
+ +	err = clk_set_rate(qcadev->susclk, SUSCLK_RATE_32KHZ);
+ +	if (err)
+ +		return err;
+ +
+ +	err = clk_prepare_enable(qcadev->susclk);
+ +	if (err)
+ +		return err;
+ +
+ +	err = hci_uart_register_device(&qcadev->serdev_hu, &qca_proto);
+ +	if (err)
+ +		clk_disable_unprepare(qcadev->susclk);
+ +
+ +	return err;
+  }
+  
+  static void qca_serdev_remove(struct serdev_device *serdev)
+  {
+  	struct qca_serdev *qcadev = serdev_device_get_drvdata(serdev);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (qca_is_wcn399x(qcadev->btsoc_type))
++ 		qca_power_shutdown(&qcadev->serdev_hu);
++ 	else if (qcadev->susclk)
++ 		clk_disable_unprepare(qcadev->susclk);
++ 
+++>>>>>>> 77131dfec6af (Bluetooth: hci_qca: Replace devm_gpiod_get() with devm_gpiod_get_optional())
+  	hci_uart_unregister_device(&qcadev->serdev_hu);
+ -}
+ -
+ -static int __maybe_unused qca_suspend(struct device *dev)
+ -{
+ -	struct hci_dev *hdev = container_of(dev, struct hci_dev, dev);
+ -	struct hci_uart *hu = hci_get_drvdata(hdev);
+ -	struct qca_data *qca = hu->priv;
+ -	unsigned long flags;
+ -	int ret = 0;
+ -	u8 cmd;
+ -
+ -	set_bit(QCA_SUSPENDING, &qca->flags);
+ -
+ -	/* Device is downloading patch or doesn't support in-band sleep. */
+ -	if (!test_bit(QCA_IBS_ENABLED, &qca->flags))
+ -		return 0;
+ -
+ -	cancel_work_sync(&qca->ws_awake_device);
+ -	cancel_work_sync(&qca->ws_awake_rx);
+ -
+ -	spin_lock_irqsave_nested(&qca->hci_ibs_lock,
+ -				 flags, SINGLE_DEPTH_NESTING);
+ -
+ -	switch (qca->tx_ibs_state) {
+ -	case HCI_IBS_TX_WAKING:
+ -		del_timer(&qca->wake_retrans_timer);
+ -		/* Fall through */
+ -	case HCI_IBS_TX_AWAKE:
+ -		del_timer(&qca->tx_idle_timer);
+ -
+ -		serdev_device_write_flush(hu->serdev);
+ -		cmd = HCI_IBS_SLEEP_IND;
+ -		ret = serdev_device_write_buf(hu->serdev, &cmd, sizeof(cmd));
+ -
+ -		if (ret < 0) {
+ -			BT_ERR("Failed to send SLEEP to device");
+ -			break;
+ -		}
+ -
+ -		qca->tx_ibs_state = HCI_IBS_TX_ASLEEP;
+ -		qca->ibs_sent_slps++;
+  
+ -		qca_wq_serial_tx_clock_vote_off(&qca->ws_tx_vote_off);
+ -		break;
+ -
+ -	case HCI_IBS_TX_ASLEEP:
+ -		break;
+ -
+ -	default:
+ -		BT_ERR("Spurious tx state %d", qca->tx_ibs_state);
+ -		ret = -EINVAL;
+ -		break;
+ -	}
+ -
+ -	spin_unlock_irqrestore(&qca->hci_ibs_lock, flags);
+ -
+ -	if (ret < 0)
+ -		goto error;
+ -
+ -	serdev_device_wait_until_sent(hu->serdev,
+ -				      msecs_to_jiffies(CMD_TRANS_TIMEOUT_MS));
+ -
+ -	/* Wait for HCI_IBS_SLEEP_IND sent by device to indicate its Tx is going
+ -	 * to sleep, so that the packet does not wake the system later.
+ -	 */
+ -
+ -	ret = wait_event_interruptible_timeout(qca->suspend_wait_q,
+ -			qca->rx_ibs_state == HCI_IBS_RX_ASLEEP,
+ -			msecs_to_jiffies(IBS_BTSOC_TX_IDLE_TIMEOUT_MS));
+ -
+ -	if (ret > 0)
+ -		return 0;
+ -
+ -	if (ret == 0)
+ -		ret = -ETIMEDOUT;
+ -
+ -error:
+ -	clear_bit(QCA_SUSPENDING, &qca->flags);
+ -
+ -	return ret;
+ -}
+ -
+ -static int __maybe_unused qca_resume(struct device *dev)
+ -{
+ -	struct hci_dev *hdev = container_of(dev, struct hci_dev, dev);
+ -	struct hci_uart *hu = hci_get_drvdata(hdev);
+ -	struct qca_data *qca = hu->priv;
+ -
+ -	clear_bit(QCA_SUSPENDING, &qca->flags);
+ -
+ -	return 0;
+ +	clk_disable_unprepare(qcadev->susclk);
+  }
+  
+ -static SIMPLE_DEV_PM_OPS(qca_pm_ops, qca_suspend, qca_resume);
+ -
+  static const struct of_device_id qca_bluetooth_of_match[] = {
+  	{ .compatible = "qcom,qca6174-bt" },
+ -	{ .compatible = "qcom,wcn3990-bt", .data = &qca_soc_data_wcn3990},
+ -	{ .compatible = "qcom,wcn3991-bt", .data = &qca_soc_data_wcn3991},
+ -	{ .compatible = "qcom,wcn3998-bt", .data = &qca_soc_data_wcn3998},
+  	{ /* sentinel */ }
+  };
+  MODULE_DEVICE_TABLE(of, qca_bluetooth_of_match);
+* Unmerged path drivers/bluetooth/hci_qca.c
