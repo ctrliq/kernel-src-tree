@@ -1,0 +1,655 @@
+bpf: Create anonymous bpf iterator
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit ac51d99bf81caac8d8881fe52098948110d0de68
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ac51d99b.failed
+
+A new bpf command BPF_ITER_CREATE is added.
+
+The anonymous bpf iterator is seq_file based.
+The seq_file private data are referenced by targets.
+The bpf_iter infrastructure allocated additional space
+at seq_file->private before the space used by targets
+to store some meta data, e.g.,
+  prog:       prog to run
+  session_id: an unique id for each opened seq_file
+  seq_num:    how many times bpf programs are queried in this session
+  done_stop:  an internal state to decide whether bpf program
+              should be called in seq_ops->stop() or not
+
+The seq_num will start from 0 for valid objects.
+The bpf program may see the same seq_num more than once if
+ - seq_file buffer overflow happens and the same object
+   is retried by bpf_seq_read(), or
+ - the bpf program explicitly requests a retry of the
+   same object
+
+Since module is not supported for bpf_iter, all target
+registeration happens at __init time, so there is no
+need to change bpf_iter_unreg_target() as it is used
+mostly in error path of the init function at which time
+no bpf iterators have been created yet.
+
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+Link: https://lore.kernel.org/bpf/20200509175905.2475770-1-yhs@fb.com
+(cherry picked from commit ac51d99bf81caac8d8881fe52098948110d0de68)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/bpf_iter.c
+#	kernel/bpf/syscall.c
+#	tools/include/uapi/linux/bpf.h
+diff --cc include/linux/bpf.h
+index 092cd57c664b,80b1b9d8a638..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -1159,6 -1142,9 +1159,12 @@@ struct bpf_iter_reg 
+  
+  int bpf_iter_reg_target(struct bpf_iter_reg *reg_info);
+  void bpf_iter_unreg_target(const char *target);
+++<<<<<<< HEAD
+++=======
++ bool bpf_iter_prog_supported(struct bpf_prog *prog);
++ int bpf_iter_link_attach(const union bpf_attr *attr, struct bpf_prog *prog);
++ int bpf_iter_new_fd(struct bpf_link *link);
+++>>>>>>> ac51d99bf81c (bpf: Create anonymous bpf iterator)
+  
+  int bpf_percpu_hash_copy(struct bpf_map *map, void *key, void *value);
+  int bpf_percpu_array_copy(struct bpf_map *map, void *key, void *value);
+diff --cc include/uapi/linux/bpf.h
+index 23b02c5c3e10,708763f702e1..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -115,6 -115,8 +115,11 @@@ enum bpf_cmd 
+  	BPF_LINK_UPDATE,
+  	BPF_LINK_GET_FD_BY_ID,
+  	BPF_LINK_GET_NEXT_ID,
+++<<<<<<< HEAD
+++=======
++ 	BPF_ENABLE_STATS,
++ 	BPF_ITER_CREATE,
+++>>>>>>> ac51d99bf81c (bpf: Create anonymous bpf iterator)
+  };
+  
+  enum bpf_map_type {
+@@@ -618,7 -611,15 +623,19 @@@ union bpf_attr 
+  		__u32		old_prog_fd;
+  	} link_update;
+  
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	struct { /* struct used by BPF_ENABLE_STATS command */
++ 		__u32		type;
++ 	} enable_stats;
++ 
++ 	struct { /* struct used by BPF_ITER_CREATE command */
++ 		__u32		link_fd;
++ 		__u32		flags;
++ 	} iter_create;
++ 
+++>>>>>>> ac51d99bf81c (bpf: Create anonymous bpf iterator)
+  } __attribute__((aligned(8)));
+  
+  /* The description below is an attempt at providing documentation to eBPF
+diff --cc kernel/bpf/bpf_iter.c
+index 5a8119d17d14,e7129b57865f..000000000000
+--- a/kernel/bpf/bpf_iter.c
++++ b/kernel/bpf/bpf_iter.c
+@@@ -12,11 -13,182 +13,179 @@@ struct bpf_iter_target_info 
+  	bpf_iter_init_seq_priv_t init_seq_private;
+  	bpf_iter_fini_seq_priv_t fini_seq_private;
+  	u32 seq_priv_size;
+ -	u32 btf_id;	/* cached value */
+ -};
+ -
+ -struct bpf_iter_link {
+ -	struct bpf_link link;
+ -	struct bpf_iter_target_info *tinfo;
+  };
+  
++ struct bpf_iter_priv_data {
++ 	struct bpf_iter_target_info *tinfo;
++ 	struct bpf_prog *prog;
++ 	u64 session_id;
++ 	u64 seq_num;
++ 	bool done_stop;
++ 	u8 target_private[] __aligned(8);
++ };
++ 
+  static struct list_head targets = LIST_HEAD_INIT(targets);
+  static DEFINE_MUTEX(targets_mutex);
+  
+++<<<<<<< HEAD
+++=======
++ /* protect bpf_iter_link changes */
++ static DEFINE_MUTEX(link_mutex);
++ 
++ /* incremented on every opened seq_file */
++ static atomic64_t session_id;
++ 
++ /* bpf_seq_read, a customized and simpler version for bpf iterator.
++  * no_llseek is assumed for this file.
++  * The following are differences from seq_read():
++  *  . fixed buffer size (PAGE_SIZE)
++  *  . assuming no_llseek
++  *  . stop() may call bpf program, handling potential overflow there
++  */
++ static ssize_t bpf_seq_read(struct file *file, char __user *buf, size_t size,
++ 			    loff_t *ppos)
++ {
++ 	struct seq_file *seq = file->private_data;
++ 	size_t n, offs, copied = 0;
++ 	int err = 0;
++ 	void *p;
++ 
++ 	mutex_lock(&seq->lock);
++ 
++ 	if (!seq->buf) {
++ 		seq->size = PAGE_SIZE;
++ 		seq->buf = kmalloc(seq->size, GFP_KERNEL);
++ 		if (!seq->buf) {
++ 			err = -ENOMEM;
++ 			goto done;
++ 		}
++ 	}
++ 
++ 	if (seq->count) {
++ 		n = min(seq->count, size);
++ 		err = copy_to_user(buf, seq->buf + seq->from, n);
++ 		if (err) {
++ 			err = -EFAULT;
++ 			goto done;
++ 		}
++ 		seq->count -= n;
++ 		seq->from += n;
++ 		copied = n;
++ 		goto done;
++ 	}
++ 
++ 	seq->from = 0;
++ 	p = seq->op->start(seq, &seq->index);
++ 	if (!p)
++ 		goto stop;
++ 	if (IS_ERR(p)) {
++ 		err = PTR_ERR(p);
++ 		seq->op->stop(seq, p);
++ 		seq->count = 0;
++ 		goto done;
++ 	}
++ 
++ 	err = seq->op->show(seq, p);
++ 	if (err > 0) {
++ 		seq->count = 0;
++ 	} else if (err < 0 || seq_has_overflowed(seq)) {
++ 		if (!err)
++ 			err = -E2BIG;
++ 		seq->op->stop(seq, p);
++ 		seq->count = 0;
++ 		goto done;
++ 	}
++ 
++ 	while (1) {
++ 		loff_t pos = seq->index;
++ 
++ 		offs = seq->count;
++ 		p = seq->op->next(seq, p, &seq->index);
++ 		if (pos == seq->index) {
++ 			pr_info_ratelimited("buggy seq_file .next function %ps "
++ 				"did not updated position index\n",
++ 				seq->op->next);
++ 			seq->index++;
++ 		}
++ 
++ 		if (IS_ERR_OR_NULL(p))
++ 			break;
++ 
++ 		if (seq->count >= size)
++ 			break;
++ 
++ 		err = seq->op->show(seq, p);
++ 		if (err > 0) {
++ 			seq->count = offs;
++ 		} else if (err < 0 || seq_has_overflowed(seq)) {
++ 			seq->count = offs;
++ 			if (offs == 0) {
++ 				if (!err)
++ 					err = -E2BIG;
++ 				seq->op->stop(seq, p);
++ 				goto done;
++ 			}
++ 			break;
++ 		}
++ 	}
++ stop:
++ 	offs = seq->count;
++ 	/* bpf program called if !p */
++ 	seq->op->stop(seq, p);
++ 	if (!p && seq_has_overflowed(seq)) {
++ 		seq->count = offs;
++ 		if (offs == 0) {
++ 			err = -E2BIG;
++ 			goto done;
++ 		}
++ 	}
++ 
++ 	n = min(seq->count, size);
++ 	err = copy_to_user(buf, seq->buf, n);
++ 	if (err) {
++ 		err = -EFAULT;
++ 		goto done;
++ 	}
++ 	copied = n;
++ 	seq->count -= n;
++ 	seq->from = n;
++ done:
++ 	if (!copied)
++ 		copied = err;
++ 	else
++ 		*ppos += copied;
++ 	mutex_unlock(&seq->lock);
++ 	return copied;
++ }
++ 
++ static int iter_release(struct inode *inode, struct file *file)
++ {
++ 	struct bpf_iter_priv_data *iter_priv;
++ 	struct seq_file *seq;
++ 
++ 	seq = file->private_data;
++ 	if (!seq)
++ 		return 0;
++ 
++ 	iter_priv = container_of(seq->private, struct bpf_iter_priv_data,
++ 				 target_private);
++ 
++ 	if (iter_priv->tinfo->fini_seq_private)
++ 		iter_priv->tinfo->fini_seq_private(seq->private);
++ 
++ 	bpf_prog_put(iter_priv->prog);
++ 	seq->private = iter_priv;
++ 
++ 	return seq_release_private(inode, file);
++ }
++ 
++ static const struct file_operations bpf_iter_fops = {
++ 	.llseek		= no_llseek,
++ 	.read		= bpf_seq_read,
++ 	.release	= iter_release,
++ };
++ 
+++>>>>>>> ac51d99bf81c (bpf: Create anonymous bpf iterator)
+  int bpf_iter_reg_target(struct bpf_iter_reg *reg_info)
+  {
+  	struct bpf_iter_target_info *tinfo;
+@@@ -57,3 -229,212 +226,215 @@@ void bpf_iter_unreg_target(const char *
+  
+  	WARN_ON(found == false);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void cache_btf_id(struct bpf_iter_target_info *tinfo,
++ 			 struct bpf_prog *prog)
++ {
++ 	tinfo->btf_id = prog->aux->attach_btf_id;
++ }
++ 
++ bool bpf_iter_prog_supported(struct bpf_prog *prog)
++ {
++ 	const char *attach_fname = prog->aux->attach_func_name;
++ 	u32 prog_btf_id = prog->aux->attach_btf_id;
++ 	const char *prefix = BPF_ITER_FUNC_PREFIX;
++ 	struct bpf_iter_target_info *tinfo;
++ 	int prefix_len = strlen(prefix);
++ 	bool supported = false;
++ 
++ 	if (strncmp(attach_fname, prefix, prefix_len))
++ 		return false;
++ 
++ 	mutex_lock(&targets_mutex);
++ 	list_for_each_entry(tinfo, &targets, list) {
++ 		if (tinfo->btf_id && tinfo->btf_id == prog_btf_id) {
++ 			supported = true;
++ 			break;
++ 		}
++ 		if (!strcmp(attach_fname + prefix_len, tinfo->target)) {
++ 			cache_btf_id(tinfo, prog);
++ 			supported = true;
++ 			break;
++ 		}
++ 	}
++ 	mutex_unlock(&targets_mutex);
++ 
++ 	return supported;
++ }
++ 
++ static void bpf_iter_link_release(struct bpf_link *link)
++ {
++ }
++ 
++ static void bpf_iter_link_dealloc(struct bpf_link *link)
++ {
++ 	struct bpf_iter_link *iter_link =
++ 		container_of(link, struct bpf_iter_link, link);
++ 
++ 	kfree(iter_link);
++ }
++ 
++ static int bpf_iter_link_replace(struct bpf_link *link,
++ 				 struct bpf_prog *new_prog,
++ 				 struct bpf_prog *old_prog)
++ {
++ 	int ret = 0;
++ 
++ 	mutex_lock(&link_mutex);
++ 	if (old_prog && link->prog != old_prog) {
++ 		ret = -EPERM;
++ 		goto out_unlock;
++ 	}
++ 
++ 	if (link->prog->type != new_prog->type ||
++ 	    link->prog->expected_attach_type != new_prog->expected_attach_type ||
++ 	    link->prog->aux->attach_btf_id != new_prog->aux->attach_btf_id) {
++ 		ret = -EINVAL;
++ 		goto out_unlock;
++ 	}
++ 
++ 	old_prog = xchg(&link->prog, new_prog);
++ 	bpf_prog_put(old_prog);
++ 
++ out_unlock:
++ 	mutex_unlock(&link_mutex);
++ 	return ret;
++ }
++ 
++ static const struct bpf_link_ops bpf_iter_link_lops = {
++ 	.release = bpf_iter_link_release,
++ 	.dealloc = bpf_iter_link_dealloc,
++ 	.update_prog = bpf_iter_link_replace,
++ };
++ 
++ int bpf_iter_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
++ {
++ 	struct bpf_link_primer link_primer;
++ 	struct bpf_iter_target_info *tinfo;
++ 	struct bpf_iter_link *link;
++ 	bool existed = false;
++ 	u32 prog_btf_id;
++ 	int err;
++ 
++ 	if (attr->link_create.target_fd || attr->link_create.flags)
++ 		return -EINVAL;
++ 
++ 	prog_btf_id = prog->aux->attach_btf_id;
++ 	mutex_lock(&targets_mutex);
++ 	list_for_each_entry(tinfo, &targets, list) {
++ 		if (tinfo->btf_id == prog_btf_id) {
++ 			existed = true;
++ 			break;
++ 		}
++ 	}
++ 	mutex_unlock(&targets_mutex);
++ 	if (!existed)
++ 		return -ENOENT;
++ 
++ 	link = kzalloc(sizeof(*link), GFP_USER | __GFP_NOWARN);
++ 	if (!link)
++ 		return -ENOMEM;
++ 
++ 	bpf_link_init(&link->link, BPF_LINK_TYPE_ITER, &bpf_iter_link_lops, prog);
++ 	link->tinfo = tinfo;
++ 
++ 	err  = bpf_link_prime(&link->link, &link_primer);
++ 	if (err) {
++ 		kfree(link);
++ 		return err;
++ 	}
++ 
++ 	return bpf_link_settle(&link_primer);
++ }
++ 
++ static void init_seq_meta(struct bpf_iter_priv_data *priv_data,
++ 			  struct bpf_iter_target_info *tinfo,
++ 			  struct bpf_prog *prog)
++ {
++ 	priv_data->tinfo = tinfo;
++ 	priv_data->prog = prog;
++ 	priv_data->session_id = atomic64_inc_return(&session_id);
++ 	priv_data->seq_num = 0;
++ 	priv_data->done_stop = false;
++ }
++ 
++ static int prepare_seq_file(struct file *file, struct bpf_iter_link *link)
++ {
++ 	struct bpf_iter_priv_data *priv_data;
++ 	struct bpf_iter_target_info *tinfo;
++ 	struct bpf_prog *prog;
++ 	u32 total_priv_dsize;
++ 	struct seq_file *seq;
++ 	int err = 0;
++ 
++ 	mutex_lock(&link_mutex);
++ 	prog = link->link.prog;
++ 	bpf_prog_inc(prog);
++ 	mutex_unlock(&link_mutex);
++ 
++ 	tinfo = link->tinfo;
++ 	total_priv_dsize = offsetof(struct bpf_iter_priv_data, target_private) +
++ 			   tinfo->seq_priv_size;
++ 	priv_data = __seq_open_private(file, tinfo->seq_ops, total_priv_dsize);
++ 	if (!priv_data) {
++ 		err = -ENOMEM;
++ 		goto release_prog;
++ 	}
++ 
++ 	if (tinfo->init_seq_private) {
++ 		err = tinfo->init_seq_private(priv_data->target_private);
++ 		if (err)
++ 			goto release_seq_file;
++ 	}
++ 
++ 	init_seq_meta(priv_data, tinfo, prog);
++ 	seq = file->private_data;
++ 	seq->private = priv_data->target_private;
++ 
++ 	return 0;
++ 
++ release_seq_file:
++ 	seq_release_private(file->f_inode, file);
++ 	file->private_data = NULL;
++ release_prog:
++ 	bpf_prog_put(prog);
++ 	return err;
++ }
++ 
++ int bpf_iter_new_fd(struct bpf_link *link)
++ {
++ 	struct file *file;
++ 	unsigned int flags;
++ 	int err, fd;
++ 
++ 	if (link->ops != &bpf_iter_link_lops)
++ 		return -EINVAL;
++ 
++ 	flags = O_RDONLY | O_CLOEXEC;
++ 	fd = get_unused_fd_flags(flags);
++ 	if (fd < 0)
++ 		return fd;
++ 
++ 	file = anon_inode_getfile("bpf_iter", &bpf_iter_fops, NULL, flags);
++ 	if (IS_ERR(file)) {
++ 		err = PTR_ERR(file);
++ 		goto free_fd;
++ 	}
++ 
++ 	err = prepare_seq_file(file,
++ 			       container_of(link, struct bpf_iter_link, link));
++ 	if (err)
++ 		goto free_file;
++ 
++ 	fd_install(fd, file);
++ 	return fd;
++ 
++ free_file:
++ 	fput(file);
++ free_fd:
++ 	put_unused_fd(fd);
++ 	return err;
++ }
+++>>>>>>> ac51d99bf81c (bpf: Create anonymous bpf iterator)
+diff --cc kernel/bpf/syscall.c
+index 59f26fbd43c1,a293e88ee01a..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -3919,6 -3887,83 +3919,86 @@@ static int bpf_link_get_fd_by_id(const 
+  	return fd;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ DEFINE_MUTEX(bpf_stats_enabled_mutex);
++ 
++ static int bpf_stats_release(struct inode *inode, struct file *file)
++ {
++ 	mutex_lock(&bpf_stats_enabled_mutex);
++ 	static_key_slow_dec(&bpf_stats_enabled_key.key);
++ 	mutex_unlock(&bpf_stats_enabled_mutex);
++ 	return 0;
++ }
++ 
++ static const struct file_operations bpf_stats_fops = {
++ 	.release = bpf_stats_release,
++ };
++ 
++ static int bpf_enable_runtime_stats(void)
++ {
++ 	int fd;
++ 
++ 	mutex_lock(&bpf_stats_enabled_mutex);
++ 
++ 	/* Set a very high limit to avoid overflow */
++ 	if (static_key_count(&bpf_stats_enabled_key.key) > INT_MAX / 2) {
++ 		mutex_unlock(&bpf_stats_enabled_mutex);
++ 		return -EBUSY;
++ 	}
++ 
++ 	fd = anon_inode_getfd("bpf-stats", &bpf_stats_fops, NULL, O_CLOEXEC);
++ 	if (fd >= 0)
++ 		static_key_slow_inc(&bpf_stats_enabled_key.key);
++ 
++ 	mutex_unlock(&bpf_stats_enabled_mutex);
++ 	return fd;
++ }
++ 
++ #define BPF_ENABLE_STATS_LAST_FIELD enable_stats.type
++ 
++ static int bpf_enable_stats(union bpf_attr *attr)
++ {
++ 
++ 	if (CHECK_ATTR(BPF_ENABLE_STATS))
++ 		return -EINVAL;
++ 
++ 	if (!capable(CAP_SYS_ADMIN))
++ 		return -EPERM;
++ 
++ 	switch (attr->enable_stats.type) {
++ 	case BPF_STATS_RUN_TIME:
++ 		return bpf_enable_runtime_stats();
++ 	default:
++ 		break;
++ 	}
++ 	return -EINVAL;
++ }
++ 
++ #define BPF_ITER_CREATE_LAST_FIELD iter_create.flags
++ 
++ static int bpf_iter_create(union bpf_attr *attr)
++ {
++ 	struct bpf_link *link;
++ 	int err;
++ 
++ 	if (CHECK_ATTR(BPF_ITER_CREATE))
++ 		return -EINVAL;
++ 
++ 	if (attr->iter_create.flags)
++ 		return -EINVAL;
++ 
++ 	link = bpf_link_get_from_fd(attr->iter_create.link_fd);
++ 	if (IS_ERR(link))
++ 		return PTR_ERR(link);
++ 
++ 	err = bpf_iter_new_fd(link);
++ 	bpf_link_put(link);
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> ac51d99bf81c (bpf: Create anonymous bpf iterator)
+  SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, size)
+  {
+  	union bpf_attr attr;
+@@@ -4043,6 -4088,12 +4123,15 @@@
+  		err = bpf_obj_get_next_id(&attr, uattr,
+  					  &link_idr, &link_idr_lock);
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case BPF_ENABLE_STATS:
++ 		err = bpf_enable_stats(&attr);
++ 		break;
++ 	case BPF_ITER_CREATE:
++ 		err = bpf_iter_create(&attr);
++ 		break;
+++>>>>>>> ac51d99bf81c (bpf: Create anonymous bpf iterator)
+  	default:
+  		err = -EINVAL;
+  		break;
+diff --cc tools/include/uapi/linux/bpf.h
+index dd7b920a75cd,708763f702e1..000000000000
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@@ -115,6 -115,8 +115,11 @@@ enum bpf_cmd 
+  	BPF_LINK_UPDATE,
+  	BPF_LINK_GET_FD_BY_ID,
+  	BPF_LINK_GET_NEXT_ID,
+++<<<<<<< HEAD
+++=======
++ 	BPF_ENABLE_STATS,
++ 	BPF_ITER_CREATE,
+++>>>>>>> ac51d99bf81c (bpf: Create anonymous bpf iterator)
+  };
+  
+  enum bpf_map_type {
+@@@ -601,6 -611,15 +606,18 @@@ union bpf_attr 
+  		__u32		old_prog_fd;
+  	} link_update;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct { /* struct used by BPF_ENABLE_STATS command */
++ 		__u32		type;
++ 	} enable_stats;
++ 
++ 	struct { /* struct used by BPF_ITER_CREATE command */
++ 		__u32		link_fd;
++ 		__u32		flags;
++ 	} iter_create;
++ 
+++>>>>>>> ac51d99bf81c (bpf: Create anonymous bpf iterator)
+  } __attribute__((aligned(8)));
+  
+  /* The description below is an attempt at providing documentation to eBPF
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/bpf_iter.c
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path tools/include/uapi/linux/bpf.h
