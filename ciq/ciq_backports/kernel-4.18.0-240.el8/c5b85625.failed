@@ -1,0 +1,111 @@
+io_uring: allow O_NONBLOCK async retry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit c5b856255cbc3b664d686a83fa9397a835e063de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c5b85625.failed
+
+We can assume that O_NONBLOCK is always honored, even if we don't
+have a ->read/write_iter() for the file type. Also unify the read/write
+checking for allowing async punt, having the write side factoring in the
+REQ_F_NOWAIT flag as well.
+
+	Cc: stable@vger.kernel.org
+Fixes: 490e89676a52 ("io_uring: only force async punt if poll based retry can't handle it")
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit c5b856255cbc3b664d686a83fa9397a835e063de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 0b681a205810,ebea82e09963..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1033,15 -2061,24 +1033,29 @@@ static bool io_file_supports_async(stru
+  	if (S_ISREG(mode) && file->f_op != &io_uring_fops)
+  		return true;
+  
+++<<<<<<< HEAD
+ +	return false;
+++=======
++ 	/* any ->read/write should understand O_NONBLOCK */
++ 	if (file->f_flags & O_NONBLOCK)
++ 		return true;
++ 
++ 	if (!(file->f_mode & FMODE_NOWAIT))
++ 		return false;
++ 
++ 	if (rw == READ)
++ 		return file->f_op->read_iter != NULL;
++ 
++ 	return file->f_op->write_iter != NULL;
+++>>>>>>> c5b856255cbc (io_uring: allow O_NONBLOCK async retry)
+  }
+  
+ -static int io_prep_rw(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ +static int io_prep_rw(struct io_kiocb *req, const struct sqe_submit *s,
+  		      bool force_nonblock)
+  {
+ +	const struct io_uring_sqe *sqe = s->sqe;
+  	struct io_ring_ctx *ctx = req->ctx;
+ -	struct kiocb *kiocb = &req->rw.kiocb;
+ +	struct kiocb *kiocb = &req->rw;
+  	unsigned ioprio;
+  	int ret;
+  
+@@@ -1459,20 -2722,36 +1473,33 @@@ static int io_write(struct io_kiocb *re
+  		}
+  		kiocb->ki_flags |= IOCB_WRITE;
+  
+ -		if (!force_nonblock)
+ -			current->signal->rlim[RLIMIT_FSIZE].rlim_cur = req->fsize;
+ -
+ -		if (req->file->f_op->write_iter)
+ -			ret2 = call_write_iter(req->file, kiocb, &iter);
+ +		if (file->f_op->write_iter)
+ +			ret2 = call_write_iter(file, kiocb, &iter);
+  		else
+ -			ret2 = loop_rw_iter(WRITE, req->file, kiocb, &iter);
+ -
+ -		if (!force_nonblock)
+ -			current->signal->rlim[RLIMIT_FSIZE].rlim_cur = RLIM_INFINITY;
+ -
+ -		/*
+ -		 * Raw bdev writes will return -EOPNOTSUPP for IOCB_NOWAIT. Just
+ -		 * retry them without IOCB_NOWAIT.
+ -		 */
+ -		if (ret2 == -EOPNOTSUPP && (kiocb->ki_flags & IOCB_NOWAIT))
+ -			ret2 = -EAGAIN;
+ +			ret2 = loop_rw_iter(WRITE, file, kiocb, &iter);
+  		if (!force_nonblock || ret2 != -EAGAIN) {
+ -			kiocb_done(kiocb, ret2);
+ +			io_rw_done(kiocb, ret2);
+  		} else {
+++<<<<<<< HEAD
+ +			/*
+ +			 * If ->needs_lock is true, we're already in async
+ +			 * context.
+ +			 */
+ +			if (!s->needs_lock)
+ +				io_async_list_note(WRITE, req, iov_count);
+ +			ret = -EAGAIN;
+++=======
++ copy_iov:
++ 			ret = io_setup_async_rw(req, io_size, iovec,
++ 						inline_vecs, &iter);
++ 			if (ret)
++ 				goto out_free;
++ 			/* any defer here is final, must blocking retry */
++ 			if (!(req->flags & REQ_F_NOWAIT) &&
++ 			    !file_can_poll(req->file))
++ 				req->flags |= REQ_F_MUST_PUNT;
++ 			return -EAGAIN;
+++>>>>>>> c5b856255cbc (io_uring: allow O_NONBLOCK async retry)
+  		}
+  	}
+  out_free:
+* Unmerged path fs/io_uring.c
