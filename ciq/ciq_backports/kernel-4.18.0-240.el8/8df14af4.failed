@@ -1,0 +1,113 @@
+kvm: x86: Add support for dynamic APICv activation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+commit 8df14af42f00a434c492c9964a8095bf59831a45
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8df14af4.failed
+
+Certain runtime conditions require APICv to be temporary deactivated
+during runtime.  The current implementation only support run-time
+deactivation of APICv when Hyper-V SynIC is enabled, which is not
+temporary.
+
+In addition, for AMD, when APICv is (de)activated at runtime,
+all vcpus in the VM have to operate in the same mode.  Thus the
+requesting vcpu must notify the others.
+
+So, introduce the following:
+ * A new KVM_REQ_APICV_UPDATE request bit
+ * Interfaces to request all vcpus to update APICv status
+ * A new interface to update APICV-related parameters for each vcpu
+
+	Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8df14af42f00a434c492c9964a8095bf59831a45)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+diff --cc arch/x86/include/asm/kvm_host.h
+index 5bd73b4f5d32,0189687877a7..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1480,6 -1482,11 +1482,14 @@@ gpa_t kvm_mmu_gva_to_gpa_system(struct 
+  				struct x86_exception *exception);
+  
+  void kvm_vcpu_deactivate_apicv(struct kvm_vcpu *vcpu);
+++<<<<<<< HEAD
+++=======
++ bool kvm_apicv_activated(struct kvm *kvm);
++ void kvm_apicv_init(struct kvm *kvm, bool enable);
++ void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu);
++ void kvm_request_apicv_update(struct kvm *kvm, bool activate,
++ 			      unsigned long bit);
+++>>>>>>> 8df14af42f00 (kvm: x86: Add support for dynamic APICv activation)
+  
+  int kvm_emulate_hypercall(struct kvm_vcpu *vcpu);
+  
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index caae36aa2ba4..a0c914eb6abb 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -29,6 +29,7 @@
+ #include "cpuid.h"
+ #include "pmu.h"
+ #include "hyperv.h"
++#include "lapic.h"
+ 
+ #include <linux/clocksource.h>
+ #include <linux/interrupt.h>
+@@ -7977,6 +7978,40 @@ void kvm_make_scan_ioapic_request(struct kvm *kvm)
+ 	kvm_make_all_cpus_request(kvm, KVM_REQ_SCAN_IOAPIC);
+ }
+ 
++void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
++{
++	if (!lapic_in_kernel(vcpu))
++		return;
++
++	vcpu->arch.apicv_active = kvm_apicv_activated(vcpu->kvm);
++	kvm_apic_update_apicv(vcpu);
++	kvm_x86_ops->refresh_apicv_exec_ctrl(vcpu);
++}
++EXPORT_SYMBOL_GPL(kvm_vcpu_update_apicv);
++
++/*
++ * NOTE: Do not hold any lock prior to calling this.
++ *
++ * In particular, kvm_request_apicv_update() expects kvm->srcu not to be
++ * locked, because it calls __x86_set_memory_region() which does
++ * synchronize_srcu(&kvm->srcu).
++ */
++void kvm_request_apicv_update(struct kvm *kvm, bool activate, ulong bit)
++{
++	if (activate) {
++		if (!test_and_clear_bit(bit, &kvm->arch.apicv_inhibit_reasons) ||
++		    !kvm_apicv_activated(kvm))
++			return;
++	} else {
++		if (test_and_set_bit(bit, &kvm->arch.apicv_inhibit_reasons) ||
++		    kvm_apicv_activated(kvm))
++			return;
++	}
++
++	kvm_make_all_cpus_request(kvm, KVM_REQ_APICV_UPDATE);
++}
++EXPORT_SYMBOL_GPL(kvm_request_apicv_update);
++
+ static void vcpu_scan_ioapic(struct kvm_vcpu *vcpu)
+ {
+ 	if (!kvm_apic_present(vcpu))
+@@ -8164,6 +8199,8 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		 */
+ 		if (kvm_check_request(KVM_REQ_HV_STIMER, vcpu))
+ 			kvm_hv_process_stimers(vcpu);
++		if (kvm_check_request(KVM_REQ_APICV_UPDATE, vcpu))
++			kvm_vcpu_update_apicv(vcpu);
+ 	}
+ 
+ 	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win) {
