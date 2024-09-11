@@ -1,0 +1,365 @@
+arm64: Relax ICC_PMR_EL1 accesses when ICC_CTLR_EL1.PMHE is clear
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit f226650494c6aa87526d12135b7de8b8c074f3de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f2266504.failed
+
+The GICv3 architecture specification is incredibly misleading when it
+comes to PMR and the requirement for a DSB. It turns out that this DSB
+is only required if the CPU interface sends an Upstream Control
+message to the redistributor in order to update the RD's view of PMR.
+
+This message is only sent when ICC_CTLR_EL1.PMHE is set, which isn't
+the case in Linux. It can still be set from EL3, so some special care
+is required. But the upshot is that in the (hopefuly large) majority
+of the cases, we can drop the DSB altogether.
+
+This relies on a new static key being set if the boot CPU has PMHE
+set. The drawback is that this static key has to be exported to
+modules.
+
+	Cc: Will Deacon <will@kernel.org>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: Julien Thierry <julien.thierry.kdev@gmail.com>
+	Cc: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit f226650494c6aa87526d12135b7de8b8c074f3de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/daifflags.h
+#	arch/arm64/include/asm/irqflags.h
+#	arch/arm64/include/asm/kvm_host.h
+#	arch/arm64/kvm/hyp/switch.c
+diff --cc arch/arm64/include/asm/daifflags.h
+index 16cdcea58d1e,53cd5fab79a8..000000000000
+--- a/arch/arm64/include/asm/daifflags.h
++++ b/arch/arm64/include/asm/daifflags.h
+@@@ -18,6 -7,8 +18,11 @@@
+  
+  #include <linux/irqflags.h>
+  
+++<<<<<<< HEAD
+++=======
++ #include <asm/arch_gicv3.h>
++ #include <asm/barrier.h>
+++>>>>>>> f226650494c6 (arm64: Relax ICC_PMR_EL1 accesses when ICC_CTLR_EL1.PMHE is clear)
+  #include <asm/cpufeature.h>
+  
+  #define DAIF_PROCCTX		0
+@@@ -61,36 -61,47 +66,57 @@@ static inline void local_daif_restore(u
+  	if (!irq_disabled) {
+  		trace_hardirqs_on();
+  
+++<<<<<<< HEAD
+ +		if (system_uses_irq_prio_masking())
+ +			arch_local_irq_enable();
+ +	} else if (!(flags & PSR_A_BIT)) {
+++=======
++ 		if (system_uses_irq_prio_masking()) {
++ 			gic_write_pmr(GIC_PRIO_IRQON);
++ 			pmr_sync();
++ 		}
++ 	} else if (system_uses_irq_prio_masking()) {
++ 		u64 pmr;
++ 
++ 		if (!(flags & PSR_A_BIT)) {
++ 			/*
++ 			 * If interrupts are disabled but we can take
++ 			 * asynchronous errors, we can take NMIs
++ 			 */
++ 			flags &= ~PSR_I_BIT;
++ 			pmr = GIC_PRIO_IRQOFF;
++ 		} else {
++ 			pmr = GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET;
++ 		}
++ 
+++>>>>>>> f226650494c6 (arm64: Relax ICC_PMR_EL1 accesses when ICC_CTLR_EL1.PMHE is clear)
+  		/*
+ -		 * There has been concern that the write to daif
+ -		 * might be reordered before this write to PMR.
+ -		 * From the ARM ARM DDI 0487D.a, section D1.7.1
+ -		 * "Accessing PSTATE fields":
+ -		 *   Writes to the PSTATE fields have side-effects on
+ -		 *   various aspects of the PE operation. All of these
+ -		 *   side-effects are guaranteed:
+ -		 *     - Not to be visible to earlier instructions in
+ -		 *       the execution stream.
+ -		 *     - To be visible to later instructions in the
+ -		 *       execution stream
+ -		 *
+ -		 * Also, writes to PMR are self-synchronizing, so no
+ -		 * interrupts with a lower priority than PMR is signaled
+ -		 * to the PE after the write.
+ -		 *
+ -		 * So we don't need additional synchronization here.
+ +		 * If interrupts are disabled but we can take
+ +		 * asynchronous errors, we can take NMIs
+  		 */
+ -		gic_write_pmr(pmr);
+ +		if (system_uses_irq_prio_masking()) {
+ +			flags &= ~PSR_I_BIT;
+ +			/*
+ +			 * There has been concern that the write to daif
+ +			 * might be reordered before this write to PMR.
+ +			 * From the ARM ARM DDI 0487D.a, section D1.7.1
+ +			 * "Accessing PSTATE fields":
+ +			 *   Writes to the PSTATE fields have side-effects on
+ +			 *   various aspects of the PE operation. All of these
+ +			 *   side-effects are guaranteed:
+ +			 *     - Not to be visible to earlier instructions in
+ +			 *       the execution stream.
+ +			 *     - To be visible to later instructions in the
+ +			 *       execution stream
+ +			 *
+ +			 * Also, writes to PMR are self-synchronizing, so no
+ +			 * interrupts with a lower priority than PMR is signaled
+ +			 * to the PE after the write.
+ +			 *
+ +			 * So we don't need additional synchronization here.
+ +			 */
+ +			arch_local_irq_disable();
+ +		}
+  	}
+  
+  	write_sysreg(flags, daif);
+diff --cc arch/arm64/include/asm/irqflags.h
+index a8de82f177b1,aa4b6521ef14..000000000000
+--- a/arch/arm64/include/asm/irqflags.h
++++ b/arch/arm64/include/asm/irqflags.h
+@@@ -16,9 -5,8 +16,10 @@@
+  #ifndef __ASM_IRQFLAGS_H
+  #define __ASM_IRQFLAGS_H
+  
+ +#ifdef __KERNEL__
+ +
+  #include <asm/alternative.h>
++ #include <asm/barrier.h>
+  #include <asm/ptrace.h>
+  #include <asm/sysreg.h>
+  
+@@@ -40,11 -28,15 +41,16 @@@
+   */
+  static inline void arch_local_irq_enable(void)
+  {
+ -	if (system_has_prio_mask_debugging()) {
+ -		u32 pmr = read_sysreg_s(SYS_ICC_PMR_EL1);
+ -
+ -		WARN_ON_ONCE(pmr != GIC_PRIO_IRQON && pmr != GIC_PRIO_IRQOFF);
+ -	}
+ -
+  	asm volatile(ALTERNATIVE(
+++<<<<<<< HEAD
+ +		"msr	daifclr, #2		// arch_local_irq_enable\n"
+ +		"nop",
+ +		"msr_s  " __stringify(SYS_ICC_PMR_EL1) ",%0\n"
+ +		"dsb	sy",
+++=======
++ 		"msr	daifclr, #2		// arch_local_irq_enable",
++ 		__msr_s(SYS_ICC_PMR_EL1, "%0"),
+++>>>>>>> f226650494c6 (arm64: Relax ICC_PMR_EL1 accesses when ICC_CTLR_EL1.PMHE is clear)
+  		ARM64_HAS_IRQ_PRIO_MASKING)
+  		:
+  		: "r" ((unsigned long) GIC_PRIO_IRQON)
+@@@ -114,31 -117,14 +122,39 @@@ static inline unsigned long arch_local_
+  static inline void arch_local_irq_restore(unsigned long flags)
+  {
+  	asm volatile(ALTERNATIVE(
+++<<<<<<< HEAD
+ +			"msr	daif, %0\n"
+ +			"nop",
+ +			"msr_s	" __stringify(SYS_ICC_PMR_EL1) ", %0\n"
+ +			"dsb	sy",
+ +			ARM64_HAS_IRQ_PRIO_MASKING)
+++=======
++ 		"msr	daif, %0",
++ 		__msr_s(SYS_ICC_PMR_EL1, "%0"),
++ 		ARM64_HAS_IRQ_PRIO_MASKING)
+++>>>>>>> f226650494c6 (arm64: Relax ICC_PMR_EL1 accesses when ICC_CTLR_EL1.PMHE is clear)
+  		:
+  		: "r" (flags)
+  		: "memory");
++ 
++ 	pmr_sync();
+  }
+  
+ -#endif /* __ASM_IRQFLAGS_H */
+ +static inline int arch_irqs_disabled_flags(unsigned long flags)
+ +{
+ +	int res;
+ +
+ +	asm volatile(ALTERNATIVE(
+ +			"and	%w0, %w1, #" __stringify(PSR_I_BIT) "\n"
+ +			"nop",
+ +			"cmp	%w1, #" __stringify(GIC_PRIO_IRQOFF) "\n"
+ +			"cset	%w0, ls",
+ +			ARM64_HAS_IRQ_PRIO_MASKING)
+ +		: "=&r" (res)
+ +		: "r" ((int) flags)
+ +		: "cc", "memory");
+ +
+ +	return res;
+ +}
+ +#endif
+ +#endif
+diff --cc arch/arm64/include/asm/kvm_host.h
+index 4ee1459d6b92,5ecb091c8576..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -581,6 -590,17 +581,20 @@@ static inline void kvm_clr_pmu_events(u
+  static inline void kvm_arm_vhe_guest_enter(void)
+  {
+  	local_daif_mask();
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * Having IRQs masked via PMR when entering the guest means the GIC
++ 	 * will not signal the CPU of interrupts of lower priority, and the
++ 	 * only way to get out will be via guest exceptions.
++ 	 * Naturally, we want to avoid this.
++ 	 *
++ 	 * local_daif_mask() already sets GIC_PRIO_PSR_I_SET, we just need a
++ 	 * dsb to ensure the redistributor is forwards EL2 IRQs to the CPU.
++ 	 */
++ 	pmr_sync();
+++>>>>>>> f226650494c6 (arm64: Relax ICC_PMR_EL1 accesses when ICC_CTLR_EL1.PMHE is clear)
+  }
+  
+  static inline void kvm_arm_vhe_guest_exit(void)
+diff --cc arch/arm64/kvm/hyp/switch.c
+index 831e5cb08fb5,402f18664f25..000000000000
+--- a/arch/arm64/kvm/hyp/switch.c
++++ b/arch/arm64/kvm/hyp/switch.c
+@@@ -23,6 -12,7 +23,10 @@@
+  
+  #include <kvm/arm_psci.h>
+  
+++<<<<<<< HEAD
+++=======
++ #include <asm/barrier.h>
+++>>>>>>> f226650494c6 (arm64: Relax ICC_PMR_EL1 accesses when ICC_CTLR_EL1.PMHE is clear)
+  #include <asm/cpufeature.h>
+  #include <asm/kprobes.h>
+  #include <asm/kvm_asm.h>
+@@@ -659,6 -584,17 +663,20 @@@ int __hyp_text __kvm_vcpu_run_nvhe(stru
+  	bool pmu_switch_needed;
+  	u64 exit_code;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Having IRQs masked via PMR when entering the guest means the GIC
++ 	 * will not signal the CPU of interrupts of lower priority, and the
++ 	 * only way to get out will be via guest exceptions.
++ 	 * Naturally, we want to avoid this.
++ 	 */
++ 	if (system_uses_irq_prio_masking()) {
++ 		gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
++ 		pmr_sync();
++ 	}
++ 
+++>>>>>>> f226650494c6 (arm64: Relax ICC_PMR_EL1 accesses when ICC_CTLR_EL1.PMHE is clear)
+  	vcpu = kern_hyp_va(vcpu);
+  
+  	host_ctxt = kern_hyp_va(vcpu->arch.host_cpu_context);
+diff --git a/arch/arm64/include/asm/barrier.h b/arch/arm64/include/asm/barrier.h
+index f66bb04fdf2d..1b3e1194b511 100644
+--- a/arch/arm64/include/asm/barrier.h
++++ b/arch/arm64/include/asm/barrier.h
+@@ -38,6 +38,18 @@
+ 						 SB_BARRIER_INSN"nop\n",	\
+ 						 ARM64_HAS_SB))
+ 
++#ifdef CONFIG_ARM64_PSEUDO_NMI
++#define pmr_sync()						\
++	do {							\
++		extern struct static_key_false gic_pmr_sync;	\
++								\
++		if (static_branch_unlikely(&gic_pmr_sync))	\
++			dsb(sy);				\
++	} while(0)
++#else
++#define pmr_sync()	do {} while (0)
++#endif
++
+ #define mb()		dsb(sy)
+ #define rmb()		dsb(ld)
+ #define wmb()		dsb(st)
+* Unmerged path arch/arm64/include/asm/daifflags.h
+* Unmerged path arch/arm64/include/asm/irqflags.h
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+diff --git a/arch/arm64/kernel/entry.S b/arch/arm64/kernel/entry.S
+index d675193f4a8f..ffbd84ce8960 100644
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@ -288,8 +288,10 @@ alternative_else_nop_endif
+ alternative_if ARM64_HAS_IRQ_PRIO_MASKING
+ 	ldr	x20, [sp, #S_PMR_SAVE]
+ 	msr_s	SYS_ICC_PMR_EL1, x20
+-	/* Ensure priority change is seen by redistributor */
+-	dsb	sy
++	mrs_s	x21, SYS_ICC_CTLR_EL1
++	tbz	x21, #6, .L__skip_pmr_sync\@	// Check for ICC_CTLR_EL1.PMHE
++	dsb	sy				// Ensure priority change is seen by redistributor
++.L__skip_pmr_sync\@:
+ alternative_else_nop_endif
+ 
+ 	ldp	x21, x22, [sp, #S_PC]		// load ELR, SPSR
+* Unmerged path arch/arm64/kvm/hyp/switch.c
+diff --git a/drivers/irqchip/irq-gic-v3.c b/drivers/irqchip/irq-gic-v3.c
+index 1e72e2637a10..697b4f2e5771 100644
+--- a/drivers/irqchip/irq-gic-v3.c
++++ b/drivers/irqchip/irq-gic-v3.c
+@@ -98,6 +98,15 @@ static DEFINE_STATIC_KEY_TRUE(supports_deactivate_key);
+  */
+ static DEFINE_STATIC_KEY_FALSE(supports_pseudo_nmis);
+ 
++/*
++ * Global static key controlling whether an update to PMR allowing more
++ * interrupts requires to be propagated to the redistributor (DSB SY).
++ * And this needs to be exported for modules to be able to enable
++ * interrupts...
++ */
++DEFINE_STATIC_KEY_FALSE(gic_pmr_sync);
++EXPORT_SYMBOL(gic_pmr_sync);
++
+ /* ppi_nmi_refs[n] == number of cpus having ppi[n + 16] set as NMI */
+ static refcount_t *ppi_nmi_refs;
+ 
+@@ -1471,6 +1480,17 @@ static void gic_enable_nmi_support(void)
+ 	for (i = 0; i < gic_data.ppi_nr; i++)
+ 		refcount_set(&ppi_nmi_refs[i], 0);
+ 
++	/*
++	 * Linux itself doesn't use 1:N distribution, so has no need to
++	 * set PMHE. The only reason to have it set is if EL3 requires it
++	 * (and we can't change it).
++	 */
++	if (gic_read_ctlr() & ICC_CTLR_EL1_PMHE_MASK)
++		static_branch_enable(&gic_pmr_sync);
++
++	pr_info("%s ICC_PMR_EL1 synchronisation\n",
++		static_branch_unlikely(&gic_pmr_sync) ? "Forcing" : "Relaxing");
++
+ 	static_branch_enable(&supports_pseudo_nmis);
+ 
+ 	if (static_branch_likely(&supports_deactivate_key))
+diff --git a/include/linux/irqchip/arm-gic-v3.h b/include/linux/irqchip/arm-gic-v3.h
+index 7acd8b7222d8..21644f6cd079 100644
+--- a/include/linux/irqchip/arm-gic-v3.h
++++ b/include/linux/irqchip/arm-gic-v3.h
+@@ -499,6 +499,8 @@
+ #define ICC_CTLR_EL1_EOImode_MASK	(1 << ICC_CTLR_EL1_EOImode_SHIFT)
+ #define ICC_CTLR_EL1_CBPR_SHIFT		0
+ #define ICC_CTLR_EL1_CBPR_MASK		(1 << ICC_CTLR_EL1_CBPR_SHIFT)
++#define ICC_CTLR_EL1_PMHE_SHIFT		6
++#define ICC_CTLR_EL1_PMHE_MASK		(1 << ICC_CTLR_EL1_PMHE_SHIFT)
+ #define ICC_CTLR_EL1_PRI_BITS_SHIFT	8
+ #define ICC_CTLR_EL1_PRI_BITS_MASK	(0x7 << ICC_CTLR_EL1_PRI_BITS_SHIFT)
+ #define ICC_CTLR_EL1_ID_BITS_SHIFT	11
