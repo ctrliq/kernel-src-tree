@@ -1,0 +1,119 @@
+io_uring: use __kernel_timespec in timeout ABI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit bdf200731145f07a6127cb16753e2e8fdc159cf4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/bdf20073.failed
+
+All system calls use struct __kernel_timespec instead of the old struct
+timespec, but this one was just added with the old-style ABI. Change it
+now to enforce the use of __kernel_timespec, avoiding ABI confusion and
+the need for compat handlers on 32-bit architectures.
+
+Any user space caller will have to use __kernel_timespec now, but this
+is unambiguous and works for any C library regardless of the time_t
+definition. A nicer way to specify the timeout would have been a less
+ambiguous 64-bit nanosecond value, but I suppose it's too late now to
+change that as this would impact both 32-bit and 64-bit users.
+
+Fixes: 5262f567987d ("io_uring: IORING_OP_TIMEOUT support")
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit bdf200731145f07a6127cb16753e2e8fdc159cf4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 3c3c73eab2a0,0bc167aca46d..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1838,6 -1864,81 +1838,84 @@@ static int io_poll_add(struct io_kiocb 
+  	return ipt.error;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static enum hrtimer_restart io_timeout_fn(struct hrtimer *timer)
++ {
++ 	struct io_ring_ctx *ctx;
++ 	struct io_kiocb *req;
++ 	unsigned long flags;
++ 
++ 	req = container_of(timer, struct io_kiocb, timeout.timer);
++ 	ctx = req->ctx;
++ 	atomic_inc(&ctx->cq_timeouts);
++ 
++ 	spin_lock_irqsave(&ctx->completion_lock, flags);
++ 	list_del(&req->list);
++ 
++ 	io_cqring_fill_event(ctx, req->user_data, -ETIME);
++ 	io_commit_cqring(ctx);
++ 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
++ 
++ 	io_cqring_ev_posted(ctx);
++ 
++ 	io_put_req(req);
++ 	return HRTIMER_NORESTART;
++ }
++ 
++ static int io_timeout(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	unsigned count, req_dist, tail_index;
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct list_head *entry;
++ 	struct timespec64 ts;
++ 
++ 	if (unlikely(ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 	if (sqe->flags || sqe->ioprio || sqe->buf_index || sqe->timeout_flags ||
++ 	    sqe->len != 1)
++ 		return -EINVAL;
++ 
++ 	if (get_timespec64(&ts, u64_to_user_ptr(sqe->addr)))
++ 		return -EFAULT;
++ 
++ 	/*
++ 	 * sqe->off holds how many events that need to occur for this
++ 	 * timeout event to be satisfied.
++ 	 */
++ 	count = READ_ONCE(sqe->off);
++ 	if (!count)
++ 		count = 1;
++ 
++ 	req->sequence = ctx->cached_sq_head + count - 1;
++ 	req->flags |= REQ_F_TIMEOUT;
++ 
++ 	/*
++ 	 * Insertion sort, ensuring the first entry in the list is always
++ 	 * the one we need first.
++ 	 */
++ 	tail_index = ctx->cached_cq_tail - ctx->rings->sq_dropped;
++ 	req_dist = req->sequence - tail_index;
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	list_for_each_prev(entry, &ctx->timeout_list) {
++ 		struct io_kiocb *nxt = list_entry(entry, struct io_kiocb, list);
++ 		unsigned dist;
++ 
++ 		dist = nxt->sequence - tail_index;
++ 		if (req_dist >= dist)
++ 			break;
++ 	}
++ 	list_add(&req->list, entry);
++ 	spin_unlock_irq(&ctx->completion_lock);
++ 
++ 	hrtimer_init(&req->timeout.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++ 	req->timeout.timer.function = io_timeout_fn;
++ 	hrtimer_start(&req->timeout.timer, timespec64_to_ktime(ts),
++ 			HRTIMER_MODE_REL);
++ 	return 0;
++ }
++ 
+++>>>>>>> bdf200731145 (io_uring: use __kernel_timespec in timeout ABI)
+  static int io_req_defer(struct io_ring_ctx *ctx, struct io_kiocb *req,
+  			const struct io_uring_sqe *sqe)
+  {
+* Unmerged path fs/io_uring.c
