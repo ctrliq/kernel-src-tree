@@ -1,0 +1,307 @@
+RDMA: Add and use rdma_for_each_port
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit ea1075edcbab7d92f4e4ccf5490043f796bf78be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ea1075ed.failed
+
+We have many loops iterating over all of the end port numbers on a struct
+ib_device, simplify them with a for_each helper.
+
+	Reviewed-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit ea1075edcbab7d92f4e4ccf5490043f796bf78be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+diff --cc drivers/infiniband/core/device.c
+index 8641d8bca5aa,71582f848a9c..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -429,12 -534,13 +427,18 @@@ static int setup_port_pkey_list(struct 
+  static void ib_policy_change_task(struct work_struct *work)
+  {
+  	struct ib_device *dev;
+ -	unsigned long index;
+  
+++<<<<<<< HEAD
+ +	down_read(&lists_rwsem);
+ +	list_for_each_entry(dev, &device_list, core_list) {
+ +		int i;
+++=======
++ 	down_read(&devices_rwsem);
++ 	xa_for_each_marked (&devices, index, dev, DEVICE_REGISTERED) {
++ 		unsigned int i;
+++>>>>>>> ea1075edcbab (RDMA: Add and use rdma_for_each_port)
+  
+- 		for (i = rdma_start_port(dev); i <= rdma_end_port(dev); i++) {
++ 		rdma_for_each_port (dev, i) {
+  			u64 sp;
+  			int ret = ib_get_cached_subnet_prefix(dev,
+  							      i,
+diff --git a/.clang-format b/.clang-format
+index f292d2e5b9ab..531caebff933 100644
+--- a/.clang-format
++++ b/.clang-format
+@@ -328,6 +328,7 @@ ForEachMacros:
+   - 'radix_tree_for_each_slot'
+   - 'radix_tree_for_each_tagged'
+   - 'rbtree_postorder_for_each_entry_safe'
++  - 'rdma_for_each_port'
+   - 'resource_list_for_each_entry'
+   - 'resource_list_for_each_entry_safe'
+   - 'rhl_for_each_entry_rcu'
+diff --git a/drivers/infiniband/core/cache.c b/drivers/infiniband/core/cache.c
+index f50de4cb4cd9..eece6790c9fb 100644
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@ -1427,7 +1427,7 @@ static void ib_cache_event(struct ib_event_handler *handler,
+ 
+ int ib_cache_setup_one(struct ib_device *device)
+ {
+-	int p;
++	unsigned int p;
+ 	int err;
+ 
+ 	rwlock_init(&device->cache.lock);
+@@ -1446,8 +1446,8 @@ int ib_cache_setup_one(struct ib_device *device)
+ 		return err;
+ 	}
+ 
+-	for (p = 0; p <= rdma_end_port(device) - rdma_start_port(device); ++p)
+-		ib_cache_update(device, p + rdma_start_port(device), true);
++	rdma_for_each_port (device, p)
++		ib_cache_update(device, p, true);
+ 
+ 	INIT_IB_EVENT_HANDLER(&device->cache.event_handler,
+ 			      device, ib_cache_event);
+diff --git a/drivers/infiniband/core/cma.c b/drivers/infiniband/core/cma.c
+index c43512752b8a..68c997be2429 100644
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@ -659,7 +659,7 @@ static int cma_acquire_dev_by_src_ip(struct rdma_id_private *id_priv)
+ 	struct cma_device *cma_dev;
+ 	enum ib_gid_type gid_type;
+ 	int ret = -ENODEV;
+-	u8 port;
++	unsigned int port;
+ 
+ 	if (dev_addr->dev_type != ARPHRD_INFINIBAND &&
+ 	    id_priv->id.ps == RDMA_PS_IPOIB)
+@@ -673,8 +673,7 @@ static int cma_acquire_dev_by_src_ip(struct rdma_id_private *id_priv)
+ 
+ 	mutex_lock(&lock);
+ 	list_for_each_entry(cma_dev, &dev_list, list) {
+-		for (port = rdma_start_port(cma_dev->device);
+-		     port <= rdma_end_port(cma_dev->device); port++) {
++		rdma_for_each_port (cma_dev->device, port) {
+ 			gidp = rdma_protocol_roce(cma_dev->device, port) ?
+ 			       &iboe_gid : &gid;
+ 			gid_type = cma_dev->default_gid_type[port - 1];
+@@ -4548,7 +4547,7 @@ static void cma_add_one(struct ib_device *device)
+ 	if (!cma_dev->default_roce_tos)
+ 		goto free_gid_type;
+ 
+-	for (i = rdma_start_port(device); i <= rdma_end_port(device); i++) {
++	rdma_for_each_port (device, i) {
+ 		supported_gids = roce_gid_type_mask_support(device, i);
+ 		WARN_ON(!supported_gids);
+ 		if (supported_gids & (1 << CMA_PREFERRED_ROCE_GID_TYPE))
+* Unmerged path drivers/infiniband/core/device.c
+diff --git a/drivers/infiniband/core/mad.c b/drivers/infiniband/core/mad.c
+index 7870823bac47..e742a6a2c138 100644
+--- a/drivers/infiniband/core/mad.c
++++ b/drivers/infiniband/core/mad.c
+@@ -3326,9 +3326,9 @@ static void ib_mad_init_device(struct ib_device *device)
+ 
+ static void ib_mad_remove_device(struct ib_device *device, void *client_data)
+ {
+-	int i;
++	unsigned int i;
+ 
+-	for (i = rdma_start_port(device); i <= rdma_end_port(device); i++) {
++	rdma_for_each_port (device, i) {
+ 		if (!rdma_cap_ib_mad(device, i))
+ 			continue;
+ 
+diff --git a/drivers/infiniband/core/nldev.c b/drivers/infiniband/core/nldev.c
+index efccd8e0fb77..62d3b139a295 100644
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@ -776,7 +776,7 @@ static int nldev_port_get_dumpit(struct sk_buff *skb,
+ 	u32 idx = 0;
+ 	u32 ifindex;
+ 	int err;
+-	u32 p;
++	unsigned int p;
+ 
+ 	err = nlmsg_parse(cb->nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
+ 			  nldev_policy, NULL);
+@@ -788,7 +788,7 @@ static int nldev_port_get_dumpit(struct sk_buff *skb,
+ 	if (!device)
+ 		return -EINVAL;
+ 
+-	for (p = rdma_start_port(device); p <= rdma_end_port(device); ++p) {
++	rdma_for_each_port (device, p) {
+ 		/*
+ 		 * The dumpit function returns all information from specific
+ 		 * index. This specific index is taken from the netlink
+diff --git a/drivers/infiniband/core/security.c b/drivers/infiniband/core/security.c
+index dad6a94a43f3..492702b83600 100644
+--- a/drivers/infiniband/core/security.c
++++ b/drivers/infiniband/core/security.c
+@@ -422,12 +422,15 @@ void ib_close_shared_qp_security(struct ib_qp_security *sec)
+ 
+ int ib_create_qp_security(struct ib_qp *qp, struct ib_device *dev)
+ {
+-	u8 i = rdma_start_port(dev);
++	unsigned int i;
+ 	bool is_ib = false;
+ 	int ret;
+ 
+-	while (i <= rdma_end_port(dev) && !is_ib)
++	rdma_for_each_port (dev, i) {
+ 		is_ib = rdma_protocol_ib(dev, i++);
++		if (is_ib)
++			break;
++	}
+ 
+ 	/* If this isn't an IB device don't create the security context */
+ 	if (!is_ib)
+@@ -561,9 +564,9 @@ void ib_security_cache_change(struct ib_device *device,
+ void ib_security_release_port_pkey_list(struct ib_device *device)
+ {
+ 	struct pkey_index_qp_list *pkey, *tmp_pkey;
+-	int i;
++	unsigned int i;
+ 
+-	for (i = rdma_start_port(device); i <= rdma_end_port(device); i++) {
++	rdma_for_each_port (device, i) {
+ 		list_for_each_entry_safe(pkey,
+ 					 tmp_pkey,
+ 					 &device->port_pkey_list[i].pkey_list,
+diff --git a/drivers/infiniband/core/sysfs.c b/drivers/infiniband/core/sysfs.c
+index 7e51b406e89a..682f43dd888c 100644
+--- a/drivers/infiniband/core/sysfs.c
++++ b/drivers/infiniband/core/sysfs.c
+@@ -1308,23 +1308,17 @@ static void ib_free_port_attrs(struct ib_device *device)
+ 
+ static int ib_setup_port_attrs(struct ib_device *device)
+ {
++	unsigned int port;
+ 	int ret;
+-	int i;
+ 
+ 	device->ports_kobj = kobject_create_and_add("ports", &device->dev.kobj);
+ 	if (!device->ports_kobj)
+ 		return -ENOMEM;
+ 
+-	if (rdma_cap_ib_switch(device)) {
+-		ret = add_port(device, 0);
++	rdma_for_each_port (device, port) {
++		ret = add_port(device, port);
+ 		if (ret)
+ 			goto err_put;
+-	} else {
+-		for (i = 1; i <= device->phys_port_cnt; ++i) {
+-			ret = add_port(device, i);
+-			if (ret)
+-				goto err_put;
+-		}
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/infiniband/core/user_mad.c b/drivers/infiniband/core/user_mad.c
+index 3ebd211a87ed..02b7947ab215 100644
+--- a/drivers/infiniband/core/user_mad.c
++++ b/drivers/infiniband/core/user_mad.c
+@@ -1323,14 +1323,15 @@ static void ib_umad_add_one(struct ib_device *device)
+ static void ib_umad_remove_one(struct ib_device *device, void *client_data)
+ {
+ 	struct ib_umad_device *umad_dev = client_data;
+-	int i;
++	unsigned int i;
+ 
+ 	if (!umad_dev)
+ 		return;
+ 
+-	for (i = 0; i <= rdma_end_port(device) - rdma_start_port(device); ++i) {
+-		if (rdma_cap_ib_mad(device, i + rdma_start_port(device)))
+-			ib_umad_kill_port(&umad_dev->ports[i]);
++	rdma_for_each_port (device, i) {
++		if (rdma_cap_ib_mad(device, i))
++			ib_umad_kill_port(
++				&umad_dev->ports[i - rdma_start_port(device)]);
+ 	}
+ 	/* balances kref_init() */
+ 	ib_umad_dev_put(umad_dev);
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_main.c b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+index ee4cca80f00b..48eda16db1a7 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -2495,7 +2495,7 @@ static void ipoib_add_one(struct ib_device *device)
+ 	struct list_head *dev_list;
+ 	struct net_device *dev;
+ 	struct ipoib_dev_priv *priv;
+-	int p;
++	unsigned int p;
+ 	int count = 0;
+ 
+ 	dev_list = kmalloc(sizeof(*dev_list), GFP_KERNEL);
+@@ -2504,7 +2504,7 @@ static void ipoib_add_one(struct ib_device *device)
+ 
+ 	INIT_LIST_HEAD(dev_list);
+ 
+-	for (p = rdma_start_port(device); p <= rdma_end_port(device); ++p) {
++	rdma_for_each_port (device, p) {
+ 		if (!rdma_protocol_ib(device, p))
+ 			continue;
+ 		dev = ipoib_add_port("ib%d", device, p);
+diff --git a/drivers/infiniband/ulp/srp/ib_srp.c b/drivers/infiniband/ulp/srp/ib_srp.c
+index 2e9fb3fb8eeb..d25ff42e5464 100644
+--- a/drivers/infiniband/ulp/srp/ib_srp.c
++++ b/drivers/infiniband/ulp/srp/ib_srp.c
+@@ -4117,7 +4117,8 @@ static void srp_add_one(struct ib_device *device)
+ 	struct srp_device *srp_dev;
+ 	struct ib_device_attr *attr = &device->attrs;
+ 	struct srp_host *host;
+-	int mr_page_shift, p;
++	int mr_page_shift;
++	unsigned int p;
+ 	u64 max_pages_per_mr;
+ 	unsigned int flags = 0;
+ 
+@@ -4184,7 +4185,7 @@ static void srp_add_one(struct ib_device *device)
+ 		WARN_ON_ONCE(srp_dev->global_rkey == 0);
+ 	}
+ 
+-	for (p = rdma_start_port(device); p <= rdma_end_port(device); ++p) {
++	rdma_for_each_port (device, p) {
+ 		host = srp_add_port(srp_dev, p);
+ 		if (host)
+ 			list_add_tail(&host->list, &srp_dev->dev_list);
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 2ff74f11eec0..210e9743019f 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2812,6 +2812,16 @@ static inline u8 rdma_start_port(const struct ib_device *device)
+ 	return rdma_cap_ib_switch(device) ? 0 : 1;
+ }
+ 
++/**
++ * rdma_for_each_port - Iterate over all valid port numbers of the IB device
++ * @device - The struct ib_device * to iterate over
++ * @iter - The unsigned int to store the port number
++ */
++#define rdma_for_each_port(device, iter)                                       \
++	for (iter = rdma_start_port(device + BUILD_BUG_ON_ZERO(!__same_type(   \
++						     unsigned int, iter)));    \
++	     iter <= rdma_end_port(device); (iter)++)
++
+ /**
+  * rdma_end_port - Return the last valid port number for the device
+  * specified
