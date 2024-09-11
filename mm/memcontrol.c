@@ -940,7 +940,7 @@ struct mem_cgroup *mem_cgroup_iter(struct mem_cgroup *root,
 		struct mem_cgroup_per_node *mz;
 
 		mz = mem_cgroup_nodeinfo(root, reclaim->pgdat->node_id);
-		iter = &mz->iter[reclaim->priority];
+		iter = &mz->iter;
 
 		if (prev && reclaim->generation != iter->generation)
 			goto out_unlock;
@@ -1040,15 +1040,11 @@ static void __invalidate_reclaim_iterators(struct mem_cgroup *from,
 	struct mem_cgroup_reclaim_iter *iter;
 	struct mem_cgroup_per_node *mz;
 	int nid;
-	int i;
 
 	for_each_node(nid) {
 		mz = mem_cgroup_nodeinfo(from, nid);
-		for (i = 0; i <= DEF_PRIORITY; i++) {
-			iter = &mz->iter[i];
-			cmpxchg(&iter->position,
-				dead_memcg, NULL);
-		}
+		iter = &mz->iter;
+		cmpxchg(&iter->position, dead_memcg, NULL);
 	}
 }
 
@@ -1516,7 +1512,6 @@ static int mem_cgroup_soft_reclaim(struct mem_cgroup *root_memcg,
 	unsigned long nr_scanned;
 	struct mem_cgroup_reclaim_cookie reclaim = {
 		.pgdat = pgdat,
-		.priority = 0,
 	};
 
 	excess = soft_limit_excess(root_memcg);

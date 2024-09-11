@@ -67,7 +67,6 @@ enum mem_cgroup_protection {
 
 struct mem_cgroup_reclaim_cookie {
 	pg_data_t *pgdat;
-	int priority;
 	unsigned int generation;
 };
 
@@ -131,7 +130,7 @@ struct mem_cgroup_per_node {
 
 	unsigned long		lru_zone_size[MAX_NR_ZONES][NR_LRU_LISTS];
 
-	struct mem_cgroup_reclaim_iter	iter[DEF_PRIORITY + 1];
+	struct mem_cgroup_reclaim_iter	iter;
 
 	struct rb_node		tree_node;	/* RB tree node */
 	unsigned long		usage_in_excess;/* Set to the value by which */
