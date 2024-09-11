@@ -1,0 +1,94 @@
+net: bridge: fdb: eliminate extra port state tests from fast-path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit 5d1fcaf35d74b4188d238e46f0be37c14a01f169
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/5d1fcaf3.failed
+
+When commit df1c0b8468b3 ("[BRIDGE]: Packets leaking out of
+disabled/blocked ports.") introduced the port state tests in
+br_fdb_update() it was to avoid learning/refreshing from STP BPDUs, it was
+also used to avoid learning/refreshing from user-space with NTF_USE. Those
+two tests are done for every packet entering the bridge if it's learning,
+but for the fast-path we already have them checked in br_handle_frame() and
+is unnecessary to do it again. Thus push the checks to the unlikely cases
+and drop them from br_fdb_update(), the new nbp_state_should_learn() helper
+is used to determine if the port state allows br_fdb_update() to be called.
+The two places which need to do it manually are:
+ - user-space add call with NTF_USE set
+ - link-local packet learning done in __br_handle_local_finish()
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5d1fcaf35d74b4188d238e46f0be37c14a01f169)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_input.c
+diff --cc net/bridge/br_input.c
+index 18553215b926,8944ceb47fe9..000000000000
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@@ -189,8 -181,11 +189,16 @@@ static void __br_handle_local_finish(st
+  	u16 vid = 0;
+  
+  	/* check if vlan is allowed, to avoid spoofing */
+++<<<<<<< HEAD
+ +	if (p->flags & BR_LEARNING && br_should_learn(p, skb, &vid))
+ +		br_fdb_update(p->br, p, eth_hdr(skb)->h_source, vid, false);
+++=======
++ 	if ((p->flags & BR_LEARNING) &&
++ 	    nbp_state_should_learn(p) &&
++ 	    !br_opt_get(p->br, BROPT_NO_LL_LEARN) &&
++ 	    br_should_learn(p, skb, &vid))
++ 		br_fdb_update(p->br, p, eth_hdr(skb)->h_source, vid, 0);
+++>>>>>>> 5d1fcaf35d74 (net: bridge: fdb: eliminate extra port state tests from fast-path)
+  }
+  
+  /* note: already called with rcu_read_lock */
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index 370f28b0575c..f03e34041bbd 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -573,11 +573,6 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
+ 	if (hold_time(br) == 0)
+ 		return;
+ 
+-	/* ignore packets unless we are using this port */
+-	if (!(source->state == BR_STATE_LEARNING ||
+-	      source->state == BR_STATE_FORWARDING))
+-		return;
+-
+ 	fdb = fdb_find_rcu(&br->fdb_hash_tbl, addr, vid);
+ 	if (likely(fdb)) {
+ 		/* attempt to update an entry for a local interface */
+@@ -896,6 +891,9 @@ static int __br_fdb_add(struct ndmsg *ndm, struct net_bridge *br,
+ 				br->dev->name);
+ 			return -EINVAL;
+ 		}
++		if (!nbp_state_should_learn(p))
++			return 0;
++
+ 		local_bh_disable();
+ 		rcu_read_lock();
+ 		br_fdb_update(br, p, addr, vid, true);
+* Unmerged path net/bridge/br_input.c
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 0d7a04845bcf..d1eecb49fe3c 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -499,6 +499,11 @@ static inline bool br_vlan_should_use(const struct net_bridge_vlan *v)
+ 	return true;
+ }
+ 
++static inline bool nbp_state_should_learn(const struct net_bridge_port *p)
++{
++	return p->state == BR_STATE_LEARNING || p->state == BR_STATE_FORWARDING;
++}
++
+ static inline int br_opt_get(const struct net_bridge *br,
+ 			     enum net_bridge_opts opt)
+ {
