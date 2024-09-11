@@ -1,0 +1,136 @@
+KVM: arm/arm64: Introduce helpers to manipulate page table entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Punit Agrawal <punit.agrawal@arm.com>
+commit f8df73388ee25b5e5f1d26249202e7126ca8139d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/f8df7338.failed
+
+Introduce helpers to abstract architectural handling of the conversion
+of pfn to page table entries and marking a PMD page table entry as a
+block entry.
+
+The helpers are introduced in preparation for supporting PUD hugepages
+at stage 2 - which are supported on arm64 but do not exist on arm.
+
+	Signed-off-by: Punit Agrawal <punit.agrawal@arm.com>
+	Reviewed-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Acked-by: Christoffer Dall <christoffer.dall@arm.com>
+	Cc: Russell King <linux@armlinux.org.uk>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Reviewed-by: Marc Zyngier <marc.zyngier@arm.com>
+	Signed-off-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+(cherry picked from commit f8df73388ee25b5e5f1d26249202e7126ca8139d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/arm/mmu.c
+diff --cc virt/kvm/arm/mmu.c
+index 22e88cffe24c,fb5325f7a1ac..000000000000
+--- a/virt/kvm/arm/mmu.c
++++ b/virt/kvm/arm/mmu.c
+@@@ -1618,28 -1580,46 +1618,57 @@@ static int user_mem_abort(struct kvm_vc
+  	if (mmu_notifier_retry(kvm, mmu_seq))
+  		goto out_unlock;
+  
+ -	if (vma_pagesize == PAGE_SIZE && !force_pte) {
+ -		/*
+ -		 * Only PMD_SIZE transparent hugepages(THP) are
+ -		 * currently supported. This code will need to be
+ -		 * updated to support other THP sizes.
+ -		 */
+ -		if (transparent_hugepage_adjust(&pfn, &fault_ipa))
+ -			vma_pagesize = PMD_SIZE;
+ -	}
+ +	if (!hugetlb && !force_pte)
+ +		hugetlb = transparent_hugepage_adjust(&pfn, &fault_ipa);
+  
+++<<<<<<< HEAD
+ +	if (hugetlb) {
+ +		pmd_t new_pmd = pfn_pmd(pfn, mem_type);
+ +		new_pmd = pmd_mkhuge(new_pmd);
+ +		if (writable) {
+++=======
++ 	if (writable)
++ 		kvm_set_pfn_dirty(pfn);
++ 
++ 	if (fault_status != FSC_PERM)
++ 		clean_dcache_guest_page(pfn, vma_pagesize);
++ 
++ 	if (exec_fault)
++ 		invalidate_icache_guest_page(pfn, vma_pagesize);
++ 
++ 	/*
++ 	 * If we took an execution fault we have made the
++ 	 * icache/dcache coherent above and should now let the s2
++ 	 * mapping be executable.
++ 	 *
++ 	 * Write faults (!exec_fault && FSC_PERM) are orthogonal to
++ 	 * execute permissions, and we preserve whatever we have.
++ 	 */
++ 	needs_exec = exec_fault ||
++ 		(fault_status == FSC_PERM && stage2_is_exec(kvm, fault_ipa));
++ 
++ 	if (vma_pagesize == PMD_SIZE) {
++ 		pmd_t new_pmd = kvm_pfn_pmd(pfn, mem_type);
++ 
++ 		new_pmd = kvm_pmd_mkhuge(new_pmd);
++ 
++ 		if (writable)
+++>>>>>>> f8df73388ee2 (KVM: arm/arm64: Introduce helpers to manipulate page table entries)
+  			new_pmd = kvm_s2pmd_mkwrite(new_pmd);
+ +			kvm_set_pfn_dirty(pfn);
+ +		}
+ +
+ +		if (fault_status != FSC_PERM)
+ +			clean_dcache_guest_page(pfn, PMD_SIZE);
+  
+ -		if (needs_exec)
+ +		if (exec_fault) {
+  			new_pmd = kvm_s2pmd_mkexec(new_pmd);
+ +			invalidate_icache_guest_page(pfn, PMD_SIZE);
+ +		} else if (fault_status == FSC_PERM) {
+ +			/* Preserve execute if XN was already cleared */
+ +			if (stage2_is_exec(kvm, fault_ipa))
+ +				new_pmd = kvm_s2pmd_mkexec(new_pmd);
+ +		}
+  
+  		ret = stage2_set_pmd_huge(kvm, memcache, fault_ipa, &new_pmd);
+  	} else {
+diff --git a/arch/arm/include/asm/kvm_mmu.h b/arch/arm/include/asm/kvm_mmu.h
+index aa04390ce4a5..b817f497f662 100644
+--- a/arch/arm/include/asm/kvm_mmu.h
++++ b/arch/arm/include/asm/kvm_mmu.h
+@@ -82,6 +82,11 @@ void kvm_clear_hyp_idmap(void);
+ #define kvm_mk_pud(pmdp)	__pud(__pa(pmdp) | PMD_TYPE_TABLE)
+ #define kvm_mk_pgd(pudp)	({ BUILD_BUG(); 0; })
+ 
++#define kvm_pfn_pte(pfn, prot)	pfn_pte(pfn, prot)
++#define kvm_pfn_pmd(pfn, prot)	pfn_pmd(pfn, prot)
++
++#define kvm_pmd_mkhuge(pmd)	pmd_mkhuge(pmd)
++
+ static inline pte_t kvm_s2pte_mkwrite(pte_t pte)
+ {
+ 	pte_val(pte) |= L_PTE_S2_RDWR;
+diff --git a/arch/arm64/include/asm/kvm_mmu.h b/arch/arm64/include/asm/kvm_mmu.h
+index 94acbfa0650c..2ba61d52f288 100644
+--- a/arch/arm64/include/asm/kvm_mmu.h
++++ b/arch/arm64/include/asm/kvm_mmu.h
+@@ -184,6 +184,11 @@ void kvm_clear_hyp_idmap(void);
+ #define kvm_mk_pgd(pudp)					\
+ 	__pgd(__phys_to_pgd_val(__pa(pudp)) | PUD_TYPE_TABLE)
+ 
++#define kvm_pfn_pte(pfn, prot)		pfn_pte(pfn, prot)
++#define kvm_pfn_pmd(pfn, prot)		pfn_pmd(pfn, prot)
++
++#define kvm_pmd_mkhuge(pmd)		pmd_mkhuge(pmd)
++
+ static inline pte_t kvm_s2pte_mkwrite(pte_t pte)
+ {
+ 	pte_val(pte) |= PTE_S2_RDWR;
+* Unmerged path virt/kvm/arm/mmu.c
