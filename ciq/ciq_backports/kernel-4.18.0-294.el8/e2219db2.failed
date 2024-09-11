@@ -1,0 +1,414 @@
+kunit: add debugfs /sys/kernel/debug/kunit/<suite>/results display
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Alan Maguire <alan.maguire@oracle.com>
+commit e2219db280e3fe52e5cc242e4225dd2685af3c56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e2219db2.failed
+
+add debugfs support for displaying kunit test suite results; this is
+especially useful for module-loaded tests to allow disentangling of
+test result display from other dmesg events.  debugfs support is
+provided if CONFIG_KUNIT_DEBUGFS=y.
+
+As well as printk()ing messages, we append them to a per-test log.
+
+	Signed-off-by: Alan Maguire <alan.maguire@oracle.com>
+	Reviewed-by: Brendan Higgins <brendanhiggins@google.com>
+	Reviewed-by: Frank Rowand <frank.rowand@sony.com>
+	Signed-off-by: Shuah Khan <skhan@linuxfoundation.org>
+(cherry picked from commit e2219db280e3fe52e5cc242e4225dd2685af3c56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/kunit/test.h
+#	lib/kunit/Makefile
+#	lib/kunit/test.c
+diff --cc include/kunit/test.h
+index dba48304b3bd,f7b2ed4c127e..000000000000
+--- a/include/kunit/test.h
++++ b/include/kunit/test.h
+@@@ -196,15 -211,25 +210,24 @@@ void kunit_init_test(struct kunit *test
+  
+  int kunit_run_tests(struct kunit_suite *suite);
+  
++ size_t kunit_suite_num_test_cases(struct kunit_suite *suite);
++ 
++ unsigned int kunit_test_case_num(struct kunit_suite *suite,
++ 				 struct kunit_case *test_case);
++ 
++ int __kunit_test_suites_init(struct kunit_suite **suites);
++ 
++ void __kunit_test_suites_exit(struct kunit_suite **suites);
++ 
+  /**
+ - * kunit_test_suites() - used to register one or more &struct kunit_suite
+ - *			 with KUnit.
+ + * kunit_test_suite() - used to register a &struct kunit_suite with KUnit.
+   *
+ - * @suites: a statically allocated list of &struct kunit_suite.
+ + * @suite: a statically allocated &struct kunit_suite.
+   *
+ - * Registers @suites with the test framework. See &struct kunit_suite for
+ + * Registers @suite with the test framework. See &struct kunit_suite for
+   * more information.
+   *
+ - * When builtin,  KUnit tests are all run as late_initcalls; this means
+ + * NOTE: Currently KUnit tests are all run as late_initcalls; this means
+   * that they cannot test anything where tests must run at a different init
+   * phase. One significant restriction resulting from this is that KUnit
+   * cannot reliably test anything that is initialize in the late_init phase;
+@@@ -216,12 -245,25 +239,34 @@@
+   * tests from the same place, and at the very least to do so after
+   * everything else is definitely initialized.
+   */
+++<<<<<<< HEAD
+ +#define kunit_test_suite(suite)						       \
+ +	static int kunit_suite_init##suite(void)			       \
+ +	{								       \
+ +		return kunit_run_tests(&suite);				       \
+ +	}								       \
+ +	late_initcall(kunit_suite_init##suite)
+++=======
++ #define kunit_test_suites(...)						\
++ 	static struct kunit_suite *suites[] = { __VA_ARGS__, NULL};	\
++ 	static int kunit_test_suites_init(void)				\
++ 	{								\
++ 		return __kunit_test_suites_init(suites);		\
++ 	}								\
++ 	late_initcall(kunit_test_suites_init);				\
++ 	static void __exit kunit_test_suites_exit(void)			\
++ 	{								\
++ 		return __kunit_test_suites_exit(suites);		\
++ 	}								\
++ 	module_exit(kunit_test_suites_exit)
++ 
++ #define kunit_test_suite(suite)	kunit_test_suites(&suite)
+++>>>>>>> e2219db280e3 (kunit: add debugfs /sys/kernel/debug/kunit/<suite>/results display)
++ 
++ #define kunit_suite_for_each_test_case(suite, test_case)		\
++ 	for (test_case = suite->test_cases; test_case->run_case; test_case++)
++ 
++ bool kunit_suite_has_succeeded(struct kunit_suite *suite);
+  
+  /*
+   * Like kunit_alloc_resource() below, but returns the struct kunit_resource
+diff --cc lib/kunit/Makefile
+index 769d9402b5d3,724b94311ca3..000000000000
+--- a/lib/kunit/Makefile
++++ b/lib/kunit/Makefile
+@@@ -3,7 -5,15 +3,15 @@@ obj-$(CONFIG_KUNIT) +=			test.o 
+  					assert.o \
+  					try-catch.o
+  
+++<<<<<<< HEAD
+ +obj-$(CONFIG_KUNIT_TEST) +=		test-test.o \
+ +					string-stream-test.o
+++=======
++ ifeq ($(CONFIG_KUNIT_DEBUGFS),y)
++ kunit-objs +=				debugfs.o
++ endif
++ 
++ obj-$(CONFIG_KUNIT_TEST) +=		kunit-test.o
+++>>>>>>> e2219db280e3 (kunit: add debugfs /sys/kernel/debug/kunit/<suite>/results display)
+  
+ -# string-stream-test compiles built-in only.
+ -ifeq ($(CONFIG_KUNIT_TEST),y)
+ -obj-$(CONFIG_KUNIT_TEST) +=		string-stream-test.o
+ -endif
+ -
+ -obj-$(CONFIG_KUNIT_EXAMPLE_TEST) +=	kunit-example-test.o
+ +obj-$(CONFIG_KUNIT_EXAMPLE_TEST) +=	example-test.o
+diff --cc lib/kunit/test.c
+index 58a6227bb12c,a3fa21f9d918..000000000000
+--- a/lib/kunit/test.c
++++ b/lib/kunit/test.c
+@@@ -173,14 -220,19 +220,17 @@@ void kunit_do_assertion(struct kunit *t
+  	if (assert->type == KUNIT_ASSERTION)
+  		kunit_abort(test);
+  }
+ -EXPORT_SYMBOL_GPL(kunit_do_assertion);
+  
+- void kunit_init_test(struct kunit *test, const char *name)
++ void kunit_init_test(struct kunit *test, const char *name, char *log)
+  {
+  	spin_lock_init(&test->lock);
+  	INIT_LIST_HEAD(&test->resources);
+  	test->name = name;
++ 	test->log = log;
++ 	if (test->log)
++ 		test->log[0] = '\0';
+  	test->success = true;
+  }
+ -EXPORT_SYMBOL_GPL(kunit_init_test);
+  
+  /*
+   * Initializes and runs test case. Does not clean up or do post validations.
+@@@ -319,7 -372,39 +370,38 @@@ int kunit_run_tests(struct kunit_suite 
+  
+  	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(kunit_run_tests);
+  
++ static void kunit_init_suite(struct kunit_suite *suite)
++ {
++ 	kunit_debugfs_create_suite(suite);
++ }
++ 
++ int __kunit_test_suites_init(struct kunit_suite **suites)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = 0; suites[i] != NULL; i++) {
++ 		kunit_init_suite(suites[i]);
++ 		kunit_run_tests(suites[i]);
++ 	}
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(__kunit_test_suites_init);
++ 
++ static void kunit_exit_suite(struct kunit_suite *suite)
++ {
++ 	kunit_debugfs_destroy_suite(suite);
++ }
++ 
++ void __kunit_test_suites_exit(struct kunit_suite **suites)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = 0; suites[i] != NULL; i++)
++ 		kunit_exit_suite(suites[i]);
++ }
++ EXPORT_SYMBOL_GPL(__kunit_test_suites_exit);
++ 
+  struct kunit_resource *kunit_alloc_and_get_resource(struct kunit *test,
+  						    kunit_resource_init_t init,
+  						    kunit_resource_free_t free,
+@@@ -478,3 -567,20 +560,23 @@@ void kunit_cleanup(struct kunit *test
+  		kunit_resource_free(test, resource);
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL_GPL(kunit_cleanup);
++ 
++ static int __init kunit_init(void)
++ {
++ 	kunit_debugfs_init();
++ 
++ 	return 0;
++ }
++ late_initcall(kunit_init);
++ 
++ static void __exit kunit_exit(void)
++ {
++ 	kunit_debugfs_cleanup();
++ }
++ module_exit(kunit_exit);
++ 
++ MODULE_LICENSE("GPL v2");
+++>>>>>>> e2219db280e3 (kunit: add debugfs /sys/kernel/debug/kunit/<suite>/results display)
+* Unmerged path include/kunit/test.h
+diff --git a/lib/kunit/Kconfig b/lib/kunit/Kconfig
+index af37016bfdd4..28d70d8aff71 100644
+--- a/lib/kunit/Kconfig
++++ b/lib/kunit/Kconfig
+@@ -14,6 +14,14 @@ menuconfig KUNIT
+ 
+ if KUNIT
+ 
++config KUNIT_DEBUGFS
++	bool "KUnit - Enable /sys/kernel/debug/kunit debugfs representation"
++	help
++	  Enable debugfs representation for kunit.  Currently this consists
++	  of /sys/kernel/debug/kunit/<test_suite>/results files for each
++	  test suite, which allow users to see results of the last test suite
++	  run that occurred.
++
+ config KUNIT_TEST
+ 	bool "KUnit test for KUnit"
+ 	help
+* Unmerged path lib/kunit/Makefile
+diff --git a/lib/kunit/debugfs.c b/lib/kunit/debugfs.c
+new file mode 100644
+index 000000000000..9214c493d8b7
+--- /dev/null
++++ b/lib/kunit/debugfs.c
+@@ -0,0 +1,116 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2020, Oracle and/or its affiliates.
++ *    Author: Alan Maguire <alan.maguire@oracle.com>
++ */
++
++#include <linux/debugfs.h>
++#include <linux/module.h>
++
++#include <kunit/test.h>
++
++#include "string-stream.h"
++
++#define KUNIT_DEBUGFS_ROOT             "kunit"
++#define KUNIT_DEBUGFS_RESULTS          "results"
++
++/*
++ * Create a debugfs representation of test suites:
++ *
++ * Path						Semantics
++ * /sys/kernel/debug/kunit/<testsuite>/results	Show results of last run for
++ *						testsuite
++ *
++ */
++
++static struct dentry *debugfs_rootdir;
++
++void kunit_debugfs_cleanup(void)
++{
++	debugfs_remove_recursive(debugfs_rootdir);
++}
++
++void kunit_debugfs_init(void)
++{
++	if (!debugfs_rootdir)
++		debugfs_rootdir = debugfs_create_dir(KUNIT_DEBUGFS_ROOT, NULL);
++}
++
++static void debugfs_print_result(struct seq_file *seq,
++				 struct kunit_suite *suite,
++				 struct kunit_case *test_case)
++{
++	if (!test_case || !test_case->log)
++		return;
++
++	seq_printf(seq, "%s", test_case->log);
++}
++
++/*
++ * /sys/kernel/debug/kunit/<testsuite>/results shows all results for testsuite.
++ */
++static int debugfs_print_results(struct seq_file *seq, void *v)
++{
++	struct kunit_suite *suite = (struct kunit_suite *)seq->private;
++	bool success = kunit_suite_has_succeeded(suite);
++	struct kunit_case *test_case;
++
++	if (!suite || !suite->log)
++		return 0;
++
++	seq_printf(seq, "%s", suite->log);
++
++	kunit_suite_for_each_test_case(suite, test_case)
++		debugfs_print_result(seq, suite, test_case);
++
++	seq_printf(seq, "%s %d - %s\n",
++		   kunit_status_to_string(success), 1, suite->name);
++	return 0;
++}
++
++static int debugfs_release(struct inode *inode, struct file *file)
++{
++	return single_release(inode, file);
++}
++
++static int debugfs_results_open(struct inode *inode, struct file *file)
++{
++	struct kunit_suite *suite;
++
++	suite = (struct kunit_suite *)inode->i_private;
++
++	return single_open(file, debugfs_print_results, suite);
++}
++
++static const struct file_operations debugfs_results_fops = {
++	.open = debugfs_results_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = debugfs_release,
++};
++
++void kunit_debugfs_create_suite(struct kunit_suite *suite)
++{
++	struct kunit_case *test_case;
++
++	/* Allocate logs before creating debugfs representation. */
++	suite->log = kzalloc(KUNIT_LOG_SIZE, GFP_KERNEL);
++	kunit_suite_for_each_test_case(suite, test_case)
++		test_case->log = kzalloc(KUNIT_LOG_SIZE, GFP_KERNEL);
++
++	suite->debugfs = debugfs_create_dir(suite->name, debugfs_rootdir);
++
++	debugfs_create_file(KUNIT_DEBUGFS_RESULTS, S_IFREG | 0444,
++			    suite->debugfs,
++			    suite, &debugfs_results_fops);
++}
++
++void kunit_debugfs_destroy_suite(struct kunit_suite *suite)
++{
++	struct kunit_case *test_case;
++
++	debugfs_remove_recursive(suite->debugfs);
++	kfree(suite->log);
++	kunit_suite_for_each_test_case(suite, test_case)
++		kfree(test_case->log);
++}
+diff --git a/lib/kunit/debugfs.h b/lib/kunit/debugfs.h
+new file mode 100644
+index 000000000000..dcc7d7556107
+--- /dev/null
++++ b/lib/kunit/debugfs.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2020, Oracle and/or its affiliates.
++ */
++
++#ifndef _KUNIT_DEBUGFS_H
++#define _KUNIT_DEBUGFS_H
++
++#include <kunit/test.h>
++
++#ifdef CONFIG_KUNIT_DEBUGFS
++
++void kunit_debugfs_create_suite(struct kunit_suite *suite);
++void kunit_debugfs_destroy_suite(struct kunit_suite *suite);
++void kunit_debugfs_init(void);
++void kunit_debugfs_cleanup(void);
++
++#else
++
++static inline void kunit_debugfs_create_suite(struct kunit_suite *suite) { }
++
++static inline void kunit_debugfs_destroy_suite(struct kunit_suite *suite) { }
++
++static inline void kunit_debugfs_init(void) { }
++
++static inline void kunit_debugfs_cleanup(void) { }
++
++#endif /* CONFIG_KUNIT_DEBUGFS */
++
++#endif /* _KUNIT_DEBUGFS_H */
+diff --git a/lib/kunit/test-test.c b/lib/kunit/test-test.c
+index 5a6cc0484eda..bacc8a806283 100644
+--- a/lib/kunit/test-test.c
++++ b/lib/kunit/test-test.c
+@@ -135,7 +135,7 @@ static void kunit_resource_test_init_resources(struct kunit *test)
+ {
+ 	struct kunit_test_resource_context *ctx = test->priv;
+ 
+-	kunit_init_test(&ctx->test, "testing_test_init_test");
++	kunit_init_test(&ctx->test, "testing_test_init_test", NULL);
+ 
+ 	KUNIT_EXPECT_TRUE(test, list_empty(&ctx->test.resources));
+ }
+@@ -302,7 +302,7 @@ static int kunit_resource_test_init(struct kunit *test)
+ 
+ 	test->priv = ctx;
+ 
+-	kunit_init_test(&ctx->test, "test_test_context");
++	kunit_init_test(&ctx->test, "test_test_context", NULL);
+ 
+ 	return 0;
+ }
+* Unmerged path lib/kunit/test.c
