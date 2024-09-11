@@ -1785,8 +1785,6 @@ static int vmx_get_msr_feature(struct kvm_msr_entry *msr)
 	default:
 		return 1;
 	}
-
-	return 0;
 }
 
 /*
