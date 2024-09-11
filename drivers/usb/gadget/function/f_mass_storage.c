@@ -3311,7 +3311,9 @@ static ssize_t fsg_opts_num_buffers_store(struct config_item *item,
 	if (ret)
 		goto end;
 
-	fsg_common_set_num_buffers(opts->common, num);
+	ret = fsg_common_set_num_buffers(opts->common, num);
+	if (ret)
+		goto end;
 	ret = len;
 
 end:
