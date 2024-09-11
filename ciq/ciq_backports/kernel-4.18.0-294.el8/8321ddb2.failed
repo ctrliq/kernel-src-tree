@@ -1,0 +1,106 @@
+xfs: don't drain buffer lru on freeze and read-only remount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Brian Foster <bfoster@redhat.com>
+commit 8321ddb2fa2964bffbc61400894a47dc3462323f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8321ddb2.failed
+
+xfs_buftarg_drain() is called from xfs_log_quiesce() to ensure the
+buffer cache is reclaimed during unmount. xfs_log_quiesce() is also
+called from xfs_quiesce_attr(), however, which means that cache
+state is completely drained for filesystem freeze and read-only
+remount. While technically harmless, this is unnecessarily
+heavyweight. Both freeze and read-only mounts allow reads and thus
+allow population of the buffer cache. Therefore, the transitional
+sequence in either case really only needs to quiesce outstanding
+writes to return the filesystem in a generally read-only state.
+
+Additionally, some users have reported that attempts to freeze a
+filesystem concurrent with a read-heavy workload causes the freeze
+process to stall for a significant amount of time. This occurs
+because, as mentioned above, the read workload repopulates the
+buffer LRU while the freeze task attempts to drain it.
+
+To improve this situation, replace the drain in xfs_log_quiesce()
+with a buffer I/O quiesce and lift the drain into the unmount path.
+This removes buffer LRU reclaim from freeze and read-only [re]mount,
+but ensures the LRU is still drained before the filesystem unmounts.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 8321ddb2fa2964bffbc61400894a47dc3462323f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf.c
+diff --cc fs/xfs/xfs_buf.c
+index 35e43fb9a30c,f6e5235df7c9..000000000000
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@@ -1611,13 -1815,13 +1611,19 @@@ xfs_buftarg_drain_rele
+  	return LRU_REMOVED;
+  }
+  
++ /*
++  * Wait for outstanding I/O on the buftarg to complete.
++  */
+  void
+- xfs_buftarg_drain(
++ xfs_buftarg_wait(
+  	struct xfs_buftarg	*btp)
+  {
+++<<<<<<< HEAD
+ +	LIST_HEAD(dispose);
+ +	int loop = 0;
+ +
+++=======
+++>>>>>>> 8321ddb2fa29 (xfs: don't drain buffer lru on freeze and read-only remount)
+  	/*
+  	 * First wait on the buftarg I/O count for all in-flight buffers to be
+  	 * released. This is critical as new buffers do not make the LRU until
+* Unmerged path fs/xfs/xfs_buf.c
+diff --git a/fs/xfs/xfs_buf.h b/fs/xfs/xfs_buf.h
+index dd720f158f3d..9361f0a08314 100644
+--- a/fs/xfs/xfs_buf.h
++++ b/fs/xfs/xfs_buf.h
+@@ -346,6 +346,7 @@ xfs_buf_update_cksum(struct xfs_buf *bp, unsigned long cksum_offset)
+ extern struct xfs_buftarg *xfs_alloc_buftarg(struct xfs_mount *,
+ 		struct block_device *, struct dax_device *);
+ extern void xfs_free_buftarg(struct xfs_buftarg *);
++extern void xfs_buftarg_wait(struct xfs_buftarg *);
+ extern void xfs_buftarg_drain(struct xfs_buftarg *);
+ extern int xfs_setsize_buftarg(struct xfs_buftarg *, unsigned int);
+ 
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index 36a8714368ea..16114a203bcb 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -1041,13 +1041,13 @@ xfs_log_quiesce(
+ 
+ 	/*
+ 	 * The superblock buffer is uncached and while xfs_ail_push_all_sync()
+-	 * will push it, xfs_buftarg_drain() will not wait for it. Further,
++	 * will push it, xfs_buftarg_wait() will not wait for it. Further,
+ 	 * xfs_buf_iowait() cannot be used because it was pushed with the
+ 	 * XBF_ASYNC flag set, so we need to use a lock/unlock pair to wait for
+ 	 * the IO to complete.
+ 	 */
+ 	xfs_ail_push_all_sync(mp->m_ail);
+-	xfs_buftarg_drain(mp->m_ddev_targp);
++	xfs_buftarg_wait(mp->m_ddev_targp);
+ 	xfs_buf_lock(mp->m_sb_bp);
+ 	xfs_buf_unlock(mp->m_sb_bp);
+ 
+@@ -1067,6 +1067,8 @@ xfs_log_unmount(
+ {
+ 	xfs_log_quiesce(mp);
+ 
++	xfs_buftarg_drain(mp->m_ddev_targp);
++
+ 	xfs_trans_ail_destroy(mp);
+ 
+ 	xfs_sysfs_del(&mp->m_log->l_kobj);
