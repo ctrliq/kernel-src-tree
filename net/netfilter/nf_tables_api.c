@@ -4086,6 +4086,9 @@ static int nf_tables_newset(struct net *net, struct sock *nlsk,
 			return err;
 	}
 
+	if (nla[NFTA_SET_EXPR])
+		desc.expr = true;
+
 	table = nft_table_lookup(net, nla[NFTA_SET_TABLE], family, genmask);
 	if (IS_ERR(table)) {
 		NL_SET_BAD_ATTR(extack, nla[NFTA_SET_TABLE]);
