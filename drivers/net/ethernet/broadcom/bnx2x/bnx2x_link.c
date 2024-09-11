@@ -11641,14 +11641,14 @@ static const struct bnx2x_phy phy_null = {
 	.speed_cap_mask	= 0,
 	.req_duplex	= 0,
 	.rsrv		= 0,
-	.config_init	= (config_init_t)NULL,
-	.read_status	= (read_status_t)NULL,
-	.link_reset	= (link_reset_t)NULL,
-	.config_loopback = (config_loopback_t)NULL,
-	.format_fw_ver	= (format_fw_ver_t)NULL,
-	.hw_reset	= (hw_reset_t)NULL,
-	.set_link_led	= (set_link_led_t)NULL,
-	.phy_specific_func = (phy_specific_func_t)NULL
+	.config_init	= NULL,
+	.read_status	= NULL,
+	.link_reset	= NULL,
+	.config_loopback = NULL,
+	.format_fw_ver	= NULL,
+	.hw_reset	= NULL,
+	.set_link_led	= NULL,
+	.phy_specific_func = NULL
 };
 
 static const struct bnx2x_phy phy_serdes = {
@@ -11678,12 +11678,12 @@ static const struct bnx2x_phy phy_serdes = {
 	.rsrv		= 0,
 	.config_init	= (config_init_t)bnx2x_xgxs_config_init,
 	.read_status	= (read_status_t)bnx2x_link_settings_status,
-	.link_reset	= (link_reset_t)bnx2x_int_link_reset,
-	.config_loopback = (config_loopback_t)NULL,
-	.format_fw_ver	= (format_fw_ver_t)NULL,
-	.hw_reset	= (hw_reset_t)NULL,
-	.set_link_led	= (set_link_led_t)NULL,
-	.phy_specific_func = (phy_specific_func_t)NULL
+	.link_reset	= bnx2x_int_link_reset,
+	.config_loopback = NULL,
+	.format_fw_ver	= NULL,
+	.hw_reset	= NULL,
+	.set_link_led	= NULL,
+	.phy_specific_func = NULL
 };
 
 static const struct bnx2x_phy phy_xgxs = {
@@ -11714,12 +11714,12 @@ static const struct bnx2x_phy phy_xgxs = {
 	.rsrv		= 0,
 	.config_init	= (config_init_t)bnx2x_xgxs_config_init,
 	.read_status	= (read_status_t)bnx2x_link_settings_status,
-	.link_reset	= (link_reset_t)bnx2x_int_link_reset,
-	.config_loopback = (config_loopback_t)bnx2x_set_xgxs_loopback,
-	.format_fw_ver	= (format_fw_ver_t)NULL,
-	.hw_reset	= (hw_reset_t)NULL,
-	.set_link_led	= (set_link_led_t)NULL,
-	.phy_specific_func = (phy_specific_func_t)bnx2x_xgxs_specific_func
+	.link_reset	= bnx2x_int_link_reset,
+	.config_loopback = bnx2x_set_xgxs_loopback,
+	.format_fw_ver	= NULL,
+	.hw_reset	= NULL,
+	.set_link_led	= NULL,
+	.phy_specific_func = bnx2x_xgxs_specific_func
 };
 static const struct bnx2x_phy phy_warpcore = {
 	.type		= PORT_HW_CFG_XGXS_EXT_PHY_TYPE_DIRECT,
@@ -11752,12 +11752,12 @@ static const struct bnx2x_phy phy_warpcore = {
 	/* rsrv = */0,
 	.config_init	= (config_init_t)bnx2x_warpcore_config_init,
 	.read_status	= (read_status_t)bnx2x_warpcore_read_status,
-	.link_reset	= (link_reset_t)bnx2x_warpcore_link_reset,
-	.config_loopback = (config_loopback_t)bnx2x_set_warpcore_loopback,
-	.format_fw_ver	= (format_fw_ver_t)NULL,
+	.link_reset	= bnx2x_warpcore_link_reset,
+	.config_loopback = bnx2x_set_warpcore_loopback,
+	.format_fw_ver	= NULL,
 	.hw_reset	= (hw_reset_t)bnx2x_warpcore_hw_reset,
-	.set_link_led	= (set_link_led_t)NULL,
-	.phy_specific_func = (phy_specific_func_t)NULL
+	.set_link_led	= NULL,
+	.phy_specific_func = NULL
 };
 
 
@@ -11783,12 +11783,12 @@ static const struct bnx2x_phy phy_7101 = {
 	.rsrv		= 0,
 	.config_init	= (config_init_t)bnx2x_7101_config_init,
 	.read_status	= (read_status_t)bnx2x_7101_read_status,
-	.link_reset	= (link_reset_t)bnx2x_common_ext_link_reset,
-	.config_loopback = (config_loopback_t)bnx2x_7101_config_loopback,
+	.link_reset	= bnx2x_common_ext_link_reset,
+	.config_loopback = bnx2x_7101_config_loopback,
 	.format_fw_ver	= (format_fw_ver_t)bnx2x_7101_format_ver,
 	.hw_reset	= (hw_reset_t)bnx2x_7101_hw_reset,
-	.set_link_led	= (set_link_led_t)bnx2x_7101_set_link_led,
-	.phy_specific_func = (phy_specific_func_t)NULL
+	.set_link_led	= bnx2x_7101_set_link_led,
+	.phy_specific_func = NULL
 };
 static const struct bnx2x_phy phy_8073 = {
 	.type		= PORT_HW_CFG_XGXS_EXT_PHY_TYPE_BCM8073,
@@ -11814,12 +11814,12 @@ static const struct bnx2x_phy phy_8073 = {
 	.rsrv		= 0,
 	.config_init	= (config_init_t)bnx2x_8073_config_init,
 	.read_status	= (read_status_t)bnx2x_8073_read_status,
-	.link_reset	= (link_reset_t)bnx2x_8073_link_reset,
-	.config_loopback = (config_loopback_t)NULL,
+	.link_reset	= bnx2x_8073_link_reset,
+	.config_loopback = NULL,
 	.format_fw_ver	= (format_fw_ver_t)bnx2x_format_ver,
-	.hw_reset	= (hw_reset_t)NULL,
-	.set_link_led	= (set_link_led_t)NULL,
-	.phy_specific_func = (phy_specific_func_t)bnx2x_8073_specific_func
+	.hw_reset	= NULL,
+	.set_link_led	= NULL,
+	.phy_specific_func = bnx2x_8073_specific_func
 };
 static const struct bnx2x_phy phy_8705 = {
 	.type		= PORT_HW_CFG_XGXS_EXT_PHY_TYPE_BCM8705,
@@ -11842,12 +11842,12 @@ static const struct bnx2x_phy phy_8705 = {
 	.rsrv		= 0,
 	.config_init	= (config_init_t)bnx2x_8705_config_init,
 	.read_status	= (read_status_t)bnx2x_8705_read_status,
-	.link_reset	= (link_reset_t)bnx2x_common_ext_link_reset,
-	.config_loopback = (config_loopback_t)NULL,
+	.link_reset	= bnx2x_common_ext_link_reset,
+	.config_loopback = NULL,
 	.format_fw_ver	= (format_fw_ver_t)bnx2x_null_format_ver,
-	.hw_reset	= (hw_reset_t)NULL,
-	.set_link_led	= (set_link_led_t)NULL,
-	.phy_specific_func = (phy_specific_func_t)NULL
+	.hw_reset	= NULL,
+	.set_link_led	= NULL,
+	.phy_specific_func = NULL
 };
 static const struct bnx2x_phy phy_8706 = {
 	.type		= PORT_HW_CFG_XGXS_EXT_PHY_TYPE_BCM8706,
@@ -11871,12 +11871,12 @@ static const struct bnx2x_phy phy_8706 = {
 	.rsrv		= 0,
 	.config_init	= (config_init_t)bnx2x_8706_config_init,
 	.read_status	= (read_status_t)bnx2x_8706_read_status,
-	.link_reset	= (link_reset_t)bnx2x_common_ext_link_reset,
-	.config_loopback = (config_loopback_t)NULL,
+	.link_reset	= bnx2x_common_ext_link_reset,
+	.config_loopback = NULL,
 	.format_fw_ver	= (format_fw_ver_t)bnx2x_format_ver,
-	.hw_reset	= (hw_reset_t)NULL,
-	.set_link_led	= (set_link_led_t)NULL,
-	.phy_specific_func = (phy_specific_func_t)NULL
+	.hw_reset	= NULL,
+	.set_link_led	= NULL,
+	.phy_specific_func = NULL
 };
 
 static const struct bnx2x_phy phy_8726 = {
@@ -11903,12 +11903,12 @@ static const struct bnx2x_phy phy_8726 = {
 	.rsrv		= 0,
 	.config_init	= (config_init_t)bnx2x_8726_config_init,
 	.read_status	= (read_status_t)bnx2x_8726_read_status,
-	.link_reset	= (link_reset_t)bnx2x_8726_link_reset,
-	.config_loopback = (config_loopback_t)bnx2x_8726_config_loopback,
+	.link_reset	= bnx2x_8726_link_reset,
+	.config_loopback = bnx2x_8726_config_loopback,
 	.format_fw_ver	= (format_fw_ver_t)bnx2x_format_ver,
-	.hw_reset	= (hw_reset_t)NULL,
-	.set_link_led	= (set_link_led_t)NULL,
-	.phy_specific_func = (phy_specific_func_t)NULL
+	.hw_reset	= NULL,
+	.set_link_led	= NULL,
+	.phy_specific_func = NULL
 };
 
 static const struct bnx2x_phy phy_8727 = {
@@ -11934,12 +11934,12 @@ static const struct bnx2x_phy phy_8727 = {
 	.rsrv		= 0,
 	.config_init	= (config_init_t)bnx2x_8727_config_init,
 	.read_status	= (read_status_t)bnx2x_8727_read_status,
-	.link_reset	= (link_reset_t)bnx2x_8727_link_reset,
-	.config_loopback = (config_loopback_t)NULL,
+	.link_reset	= bnx2x_8727_link_reset,
+	.config_loopback = NULL,
 	.format_fw_ver	= (format_fw_ver_t)bnx2x_format_ver,
 	.hw_reset	= (hw_reset_t)bnx2x_8727_hw_reset,
-	.set_link_led	= (set_link_led_t)bnx2x_8727_set_link_led,
-	.phy_specific_func = (phy_specific_func_t)bnx2x_8727_specific_func
+	.set_link_led	= bnx2x_8727_set_link_led,
+	.phy_specific_func = bnx2x_8727_specific_func
 };
 static const struct bnx2x_phy phy_8481 = {
 	.type		= PORT_HW_CFG_XGXS_EXT_PHY_TYPE_BCM8481,
@@ -11969,12 +11969,12 @@ static const struct bnx2x_phy phy_8481 = {
 	.rsrv		= 0,
 	.config_init	= (config_init_t)bnx2x_8481_config_init,
 	.read_status	= (read_status_t)bnx2x_848xx_read_status,
-	.link_reset	= (link_reset_t)bnx2x_8481_link_reset,
-	.config_loopback = (config_loopback_t)NULL,
+	.link_reset	= bnx2x_8481_link_reset,
+	.config_loopback = NULL,
 	.format_fw_ver	= (format_fw_ver_t)bnx2x_848xx_format_ver,
 	.hw_reset	= (hw_reset_t)bnx2x_8481_hw_reset,
-	.set_link_led	= (set_link_led_t)bnx2x_848xx_set_link_led,
-	.phy_specific_func = (phy_specific_func_t)NULL
+	.set_link_led	= bnx2x_848xx_set_link_led,
+	.phy_specific_func = NULL
 };
 
 static const struct bnx2x_phy phy_84823 = {
@@ -12006,12 +12006,12 @@ static const struct bnx2x_phy phy_84823 = {
 	.rsrv		= 0,
 	.config_init	= (config_init_t)bnx2x_848x3_config_init,
 	.read_status	= (read_status_t)bnx2x_848xx_read_status,
-	.link_reset	= (link_reset_t)bnx2x_848x3_link_reset,
-	.config_loopback = (config_loopback_t)NULL,
+	.link_reset	= bnx2x_848x3_link_reset,
+	.config_loopback = NULL,
 	.format_fw_ver	= (format_fw_ver_t)bnx2x_848xx_format_ver,
-	.hw_reset	= (hw_reset_t)NULL,
-	.set_link_led	= (set_link_led_t)bnx2x_848xx_set_link_led,
-	.phy_specific_func = (phy_specific_func_t)bnx2x_848xx_specific_func
+	.hw_reset	= NULL,
+	.set_link_led	= bnx2x_848xx_set_link_led,
+	.phy_specific_func = bnx2x_848xx_specific_func
 };
 
 static const struct bnx2x_phy phy_84833 = {
@@ -12041,12 +12041,12 @@ static const struct bnx2x_phy phy_84833 = {
 	.rsrv		= 0,
 	.config_init	= (config_init_t)bnx2x_848x3_config_init,
 	.read_status	= (read_status_t)bnx2x_848xx_read_status,
-	.link_reset	= (link_reset_t)bnx2x_848x3_link_reset,
-	.config_loopback = (config_loopback_t)NULL,
+	.link_reset	= bnx2x_848x3_link_reset,
+	.config_loopback = NULL,
 	.format_fw_ver	= (format_fw_ver_t)bnx2x_848xx_format_ver,
 	.hw_reset	= (hw_reset_t)bnx2x_84833_hw_reset_phy,
-	.set_link_led	= (set_link_led_t)bnx2x_848xx_set_link_led,
-	.phy_specific_func = (phy_specific_func_t)bnx2x_848xx_specific_func
+	.set_link_led	= bnx2x_848xx_set_link_led,
+	.phy_specific_func = bnx2x_848xx_specific_func
 };
 
 static const struct bnx2x_phy phy_84834 = {
@@ -12075,12 +12075,12 @@ static const struct bnx2x_phy phy_84834 = {
 	.rsrv		= 0,
 	.config_init	= (config_init_t)bnx2x_848x3_config_init,
 	.read_status	= (read_status_t)bnx2x_848xx_read_status,
-	.link_reset	= (link_reset_t)bnx2x_848x3_link_reset,
-	.config_loopback = (config_loopback_t)NULL,
+	.link_reset	= bnx2x_848x3_link_reset,
+	.config_loopback = NULL,
 	.format_fw_ver	= (format_fw_ver_t)bnx2x_848xx_format_ver,
 	.hw_reset	= (hw_reset_t)bnx2x_84833_hw_reset_phy,
-	.set_link_led	= (set_link_led_t)bnx2x_848xx_set_link_led,
-	.phy_specific_func = (phy_specific_func_t)bnx2x_848xx_specific_func
+	.set_link_led	= bnx2x_848xx_set_link_led,
+	.phy_specific_func = bnx2x_848xx_specific_func
 };
 
 static const struct bnx2x_phy phy_84858 = {
@@ -12109,12 +12109,12 @@ static const struct bnx2x_phy phy_84858 = {
 	.rsrv		= 0,
 	.config_init	= (config_init_t)bnx2x_848x3_config_init,
 	.read_status	= (read_status_t)bnx2x_848xx_read_status,
-	.link_reset	= (link_reset_t)bnx2x_848x3_link_reset,
-	.config_loopback = (config_loopback_t)NULL,
+	.link_reset	= bnx2x_848x3_link_reset,
+	.config_loopback = NULL,
 	.format_fw_ver	= (format_fw_ver_t)bnx2x_8485x_format_ver,
 	.hw_reset	= (hw_reset_t)bnx2x_84833_hw_reset_phy,
-	.set_link_led	= (set_link_led_t)bnx2x_848xx_set_link_led,
-	.phy_specific_func = (phy_specific_func_t)bnx2x_848xx_specific_func
+	.set_link_led	= bnx2x_848xx_set_link_led,
+	.phy_specific_func = bnx2x_848xx_specific_func
 };
 
 static const struct bnx2x_phy phy_54618se = {
@@ -12143,12 +12143,12 @@ static const struct bnx2x_phy phy_54618se = {
 	/* rsrv = */0,
 	.config_init	= (config_init_t)bnx2x_54618se_config_init,
 	.read_status	= (read_status_t)bnx2x_54618se_read_status,
-	.link_reset	= (link_reset_t)bnx2x_54618se_link_reset,
-	.config_loopback = (config_loopback_t)bnx2x_54618se_config_loopback,
-	.format_fw_ver	= (format_fw_ver_t)NULL,
-	.hw_reset	= (hw_reset_t)NULL,
-	.set_link_led	= (set_link_led_t)bnx2x_5461x_set_link_led,
-	.phy_specific_func = (phy_specific_func_t)bnx2x_54618se_specific_func
+	.link_reset	= bnx2x_54618se_link_reset,
+	.config_loopback = bnx2x_54618se_config_loopback,
+	.format_fw_ver	= NULL,
+	.hw_reset	= NULL,
+	.set_link_led	= bnx2x_5461x_set_link_led,
+	.phy_specific_func = bnx2x_54618se_specific_func
 };
 /*****************************************************************/
 /*                                                               */
