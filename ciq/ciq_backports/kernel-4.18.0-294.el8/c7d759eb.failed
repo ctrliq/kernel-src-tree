@@ -1,0 +1,856 @@
+ethtool: add tunnel info interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit c7d759eb7b12f91a25f4d3cd03ff5209046ddfc2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c7d759eb.failed
+
+Add an interface to report offloaded UDP ports via ethtool netlink.
+
+Now that core takes care of tracking which UDP tunnel ports the NICs
+are aware of we can quite easily export this information out to
+user space.
+
+The responsibility of writing the netlink dumps is split between
+ethtool code and udp_tunnel_nic.c - since udp_tunnel module may
+not always be loaded, yet we should always report the capabilities
+of the NIC.
+
+$ ethtool --show-tunnels eth0
+Tunnel information for eth0:
+  UDP port table 0:
+    Size: 4
+    Types: vxlan
+    No entries
+  UDP port table 1:
+    Size: 4
+    Types: geneve, vxlan-gpe
+    Entries (1):
+        port 1230, vxlan-gpe
+
+v4:
+ - back to v2, build fix is now directly in udp_tunnel.h
+v3:
+ - don't compile ETHTOOL_MSG_TUNNEL_INFO_GET in if CONFIG_INET
+   not set.
+v2:
+ - fix string set count,
+ - reorder enums in the uAPI,
+ - fix type of ETHTOOL_A_TUNNEL_UDP_TABLE_TYPES to bitset
+   in docs and comments.
+
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c7d759eb7b12f91a25f4d3cd03ff5209046ddfc2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/ethtool-netlink.rst
+#	include/net/udp_tunnel.h
+#	include/uapi/linux/ethtool.h
+#	include/uapi/linux/ethtool_netlink.h
+#	net/ethtool/Makefile
+#	net/ethtool/common.c
+#	net/ethtool/common.h
+#	net/ethtool/netlink.c
+#	net/ethtool/netlink.h
+#	net/ethtool/strset.c
+#	net/ipv4/udp_tunnel_nic.c
+diff --cc include/net/udp_tunnel.h
+index 6337b9f08993,dd20ce99740c..000000000000
+--- a/include/net/udp_tunnel.h
++++ b/include/net/udp_tunnel.h
+@@@ -182,4 -182,161 +182,164 @@@ static inline void udp_tunnel_encap_ena
+  		udp_encap_enable();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define UDP_TUNNEL_NIC_MAX_TABLES	4
++ 
++ enum udp_tunnel_nic_info_flags {
++ 	/* Device callbacks may sleep */
++ 	UDP_TUNNEL_NIC_INFO_MAY_SLEEP	= BIT(0),
++ 	/* Device only supports offloads when it's open, all ports
++ 	 * will be removed before close and re-added after open.
++ 	 */
++ 	UDP_TUNNEL_NIC_INFO_OPEN_ONLY	= BIT(1),
++ 	/* Device supports only IPv4 tunnels */
++ 	UDP_TUNNEL_NIC_INFO_IPV4_ONLY	= BIT(2),
++ };
++ 
++ /**
++  * struct udp_tunnel_nic_info - driver UDP tunnel offload information
++  * @set_port:	callback for adding a new port
++  * @unset_port:	callback for removing a port
++  * @sync_table:	callback for syncing the entire port table at once
++  * @flags:	device flags from enum udp_tunnel_nic_info_flags
++  * @tables:	UDP port tables this device has
++  * @tables.n_entries:		number of entries in this table
++  * @tables.tunnel_types:	types of tunnels this table accepts
++  *
++  * Drivers are expected to provide either @set_port and @unset_port callbacks
++  * or the @sync_table callback. Callbacks are invoked with rtnl lock held.
++  *
++  * Known limitations:
++  *  - UDP tunnel port notifications are fundamentally best-effort -
++  *    it is likely the driver will both see skbs which use a UDP tunnel port,
++  *    while not being a tunneled skb, and tunnel skbs from other ports -
++  *    drivers should only use these ports for non-critical RX-side offloads,
++  *    e.g. the checksum offload;
++  *  - none of the devices care about the socket family at present, so we don't
++  *    track it. Please extend this code if you care.
++  */
++ struct udp_tunnel_nic_info {
++ 	/* one-by-one */
++ 	int (*set_port)(struct net_device *dev,
++ 			unsigned int table, unsigned int entry,
++ 			struct udp_tunnel_info *ti);
++ 	int (*unset_port)(struct net_device *dev,
++ 			  unsigned int table, unsigned int entry,
++ 			  struct udp_tunnel_info *ti);
++ 
++ 	/* all at once */
++ 	int (*sync_table)(struct net_device *dev, unsigned int table);
++ 
++ 	unsigned int flags;
++ 
++ 	struct udp_tunnel_nic_table_info {
++ 		unsigned int n_entries;
++ 		unsigned int tunnel_types;
++ 	} tables[UDP_TUNNEL_NIC_MAX_TABLES];
++ };
++ 
++ /* UDP tunnel module dependencies
++  *
++  * Tunnel drivers are expected to have a hard dependency on the udp_tunnel
++  * module. NIC drivers are not, they just attach their
++  * struct udp_tunnel_nic_info to the netdev and wait for callbacks to come.
++  * Loading a tunnel driver will cause the udp_tunnel module to be loaded
++  * and only then will all the required state structures be allocated.
++  * Since we want a weak dependency from the drivers and the core to udp_tunnel
++  * we call things through the following stubs.
++  */
++ struct udp_tunnel_nic_ops {
++ 	void (*get_port)(struct net_device *dev, unsigned int table,
++ 			 unsigned int idx, struct udp_tunnel_info *ti);
++ 	void (*set_port_priv)(struct net_device *dev, unsigned int table,
++ 			      unsigned int idx, u8 priv);
++ 	void (*add_port)(struct net_device *dev, struct udp_tunnel_info *ti);
++ 	void (*del_port)(struct net_device *dev, struct udp_tunnel_info *ti);
++ 	void (*reset_ntf)(struct net_device *dev);
++ 
++ 	size_t (*dump_size)(struct net_device *dev, unsigned int table);
++ 	int (*dump_write)(struct net_device *dev, unsigned int table,
++ 			  struct sk_buff *skb);
++ };
++ 
++ #ifdef CONFIG_INET
++ extern const struct udp_tunnel_nic_ops *udp_tunnel_nic_ops;
++ #else
++ #define udp_tunnel_nic_ops	((struct udp_tunnel_nic_ops *)NULL)
++ #endif
++ 
++ static inline void
++ udp_tunnel_nic_get_port(struct net_device *dev, unsigned int table,
++ 			unsigned int idx, struct udp_tunnel_info *ti)
++ {
++ 	/* This helper is used from .sync_table, we indicate empty entries
++ 	 * by zero'ed @ti. Drivers which need to know the details of a port
++ 	 * when it gets deleted should use the .set_port / .unset_port
++ 	 * callbacks.
++ 	 * Zero out here, otherwise !CONFIG_INET causes uninitilized warnings.
++ 	 */
++ 	memset(ti, 0, sizeof(*ti));
++ 
++ 	if (udp_tunnel_nic_ops)
++ 		udp_tunnel_nic_ops->get_port(dev, table, idx, ti);
++ }
++ 
++ static inline void
++ udp_tunnel_nic_set_port_priv(struct net_device *dev, unsigned int table,
++ 			     unsigned int idx, u8 priv)
++ {
++ 	if (udp_tunnel_nic_ops)
++ 		udp_tunnel_nic_ops->set_port_priv(dev, table, idx, priv);
++ }
++ 
++ static inline void
++ udp_tunnel_nic_add_port(struct net_device *dev, struct udp_tunnel_info *ti)
++ {
++ 	if (udp_tunnel_nic_ops)
++ 		udp_tunnel_nic_ops->add_port(dev, ti);
++ }
++ 
++ static inline void
++ udp_tunnel_nic_del_port(struct net_device *dev, struct udp_tunnel_info *ti)
++ {
++ 	if (udp_tunnel_nic_ops)
++ 		udp_tunnel_nic_ops->del_port(dev, ti);
++ }
++ 
++ /**
++  * udp_tunnel_nic_reset_ntf() - device-originating reset notification
++  * @dev: network interface device structure
++  *
++  * Called by the driver to inform the core that the entire UDP tunnel port
++  * state has been lost, usually due to device reset. Core will assume device
++  * forgot all the ports and issue .set_port and .sync_table callbacks as
++  * necessary.
++  *
++  * This function must be called with rtnl lock held, and will issue all
++  * the callbacks before returning.
++  */
++ static inline void udp_tunnel_nic_reset_ntf(struct net_device *dev)
++ {
++ 	if (udp_tunnel_nic_ops)
++ 		udp_tunnel_nic_ops->reset_ntf(dev);
++ }
++ 
++ static inline size_t
++ udp_tunnel_nic_dump_size(struct net_device *dev, unsigned int table)
++ {
++ 	if (!udp_tunnel_nic_ops)
++ 		return 0;
++ 	return udp_tunnel_nic_ops->dump_size(dev, table);
++ }
++ 
++ static inline int
++ udp_tunnel_nic_dump_write(struct net_device *dev, unsigned int table,
++ 			  struct sk_buff *skb)
++ {
++ 	if (!udp_tunnel_nic_ops)
++ 		return 0;
++ 	return udp_tunnel_nic_ops->dump_write(dev, table, skb);
++ }
+++>>>>>>> c7d759eb7b12 (ethtool: add tunnel info interface)
+  #endif
+diff --cc include/uapi/linux/ethtool.h
+index 30dc4eb925a3,b4f2d134e713..000000000000
+--- a/include/uapi/linux/ethtool.h
++++ b/include/uapi/linux/ethtool.h
+@@@ -598,6 -664,12 +598,15 @@@ struct ethtool_pauseparam 
+   * @ETH_SS_PHY_STATS: Statistic names, for use with %ETHTOOL_GPHYSTATS
+   * @ETH_SS_PHY_TUNABLES: PHY tunable names
+   * @ETH_SS_LINK_MODES: link mode names
+++<<<<<<< HEAD
+++=======
++  * @ETH_SS_MSG_CLASSES: debug message class names
++  * @ETH_SS_WOL_MODES: wake-on-lan modes
++  * @ETH_SS_SOF_TIMESTAMPING: SOF_TIMESTAMPING_* flags
++  * @ETH_SS_TS_TX_TYPES: timestamping Tx types
++  * @ETH_SS_TS_RX_FILTERS: timestamping Rx filters
++  * @ETH_SS_UDP_TUNNEL_TYPES: UDP tunnel types
+++>>>>>>> c7d759eb7b12 (ethtool: add tunnel info interface)
+   */
+  enum ethtool_stringset {
+  	ETH_SS_TEST		= 0,
+@@@ -610,6 -682,15 +619,18 @@@
+  	ETH_SS_PHY_STATS,
+  	ETH_SS_PHY_TUNABLES,
+  	ETH_SS_LINK_MODES,
+++<<<<<<< HEAD
+++=======
++ 	ETH_SS_MSG_CLASSES,
++ 	ETH_SS_WOL_MODES,
++ 	ETH_SS_SOF_TIMESTAMPING,
++ 	ETH_SS_TS_TX_TYPES,
++ 	ETH_SS_TS_RX_FILTERS,
++ 	ETH_SS_UDP_TUNNEL_TYPES,
++ 
++ 	/* add new constants above here */
++ 	ETH_SS_COUNT
+++>>>>>>> c7d759eb7b12 (ethtool: add tunnel info interface)
+  };
+  
+  /**
+diff --cc net/ethtool/Makefile
+index f68387618973,7a849ff22dad..000000000000
+--- a/net/ethtool/Makefile
++++ b/net/ethtool/Makefile
+@@@ -1,3 -1,10 +1,14 @@@
+  # SPDX-License-Identifier: GPL-2.0-only
+  
+++<<<<<<< HEAD
+ +obj-y		+= ioctl.o common.o
+++=======
++ obj-y				+= ioctl.o common.o
++ 
++ obj-$(CONFIG_ETHTOOL_NETLINK)	+= ethtool_nl.o
++ 
++ ethtool_nl-y	:= netlink.o bitset.o strset.o linkinfo.o linkmodes.o \
++ 		   linkstate.o debug.o wol.o features.o privflags.o rings.o \
++ 		   channels.o coalesce.o pause.o eee.o tsinfo.o cabletest.o \
++ 		   tunnels.o
+++>>>>>>> c7d759eb7b12 (ethtool: add tunnel info interface)
+diff --cc net/ethtool/common.c
+index 9e667dc87e98,ed19573fccd7..000000000000
+--- a/net/ethtool/common.c
++++ b/net/ethtool/common.c
+@@@ -1,5 -1,10 +1,13 @@@
+  // SPDX-License-Identifier: GPL-2.0-only
+  
+++<<<<<<< HEAD
+++=======
++ #include <linux/ethtool_netlink.h>
++ #include <linux/net_tstamp.h>
++ #include <linux/phy.h>
++ #include <linux/rtnetlink.h>
++ 
+++>>>>>>> c7d759eb7b12 (ethtool: add tunnel info interface)
+  #include "common.h"
+  
+  const char netdev_features_strings[NETDEV_FEATURE_COUNT][ETH_GSTRING_LEN] = {
+@@@ -168,5 -176,235 +176,222 @@@ const char link_mode_names[][ETH_GSTRIN
+  	__DEFINE_LINK_MODE_NAME(400000, LR8_ER8_FR8, Full),
+  	__DEFINE_LINK_MODE_NAME(400000, DR8, Full),
+  	__DEFINE_LINK_MODE_NAME(400000, CR8, Full),
+ -	__DEFINE_SPECIAL_MODE_NAME(FEC_LLRS, "LLRS"),
+ -	__DEFINE_LINK_MODE_NAME(100000, KR, Full),
+ -	__DEFINE_LINK_MODE_NAME(100000, SR, Full),
+ -	__DEFINE_LINK_MODE_NAME(100000, LR_ER_FR, Full),
+ -	__DEFINE_LINK_MODE_NAME(100000, DR, Full),
+ -	__DEFINE_LINK_MODE_NAME(100000, CR, Full),
+ -	__DEFINE_LINK_MODE_NAME(200000, KR2, Full),
+ -	__DEFINE_LINK_MODE_NAME(200000, SR2, Full),
+ -	__DEFINE_LINK_MODE_NAME(200000, LR2_ER2_FR2, Full),
+ -	__DEFINE_LINK_MODE_NAME(200000, DR2, Full),
+ -	__DEFINE_LINK_MODE_NAME(200000, CR2, Full),
+ -	__DEFINE_LINK_MODE_NAME(400000, KR4, Full),
+ -	__DEFINE_LINK_MODE_NAME(400000, SR4, Full),
+ -	__DEFINE_LINK_MODE_NAME(400000, LR4_ER4_FR4, Full),
+ -	__DEFINE_LINK_MODE_NAME(400000, DR4, Full),
+ -	__DEFINE_LINK_MODE_NAME(400000, CR4, Full),
+  };
+  static_assert(ARRAY_SIZE(link_mode_names) == __ETHTOOL_LINK_MODE_MASK_NBITS);
+++<<<<<<< HEAD
+++=======
++ 
++ const char netif_msg_class_names[][ETH_GSTRING_LEN] = {
++ 	[NETIF_MSG_DRV_BIT]		= "drv",
++ 	[NETIF_MSG_PROBE_BIT]		= "probe",
++ 	[NETIF_MSG_LINK_BIT]		= "link",
++ 	[NETIF_MSG_TIMER_BIT]		= "timer",
++ 	[NETIF_MSG_IFDOWN_BIT]		= "ifdown",
++ 	[NETIF_MSG_IFUP_BIT]		= "ifup",
++ 	[NETIF_MSG_RX_ERR_BIT]		= "rx_err",
++ 	[NETIF_MSG_TX_ERR_BIT]		= "tx_err",
++ 	[NETIF_MSG_TX_QUEUED_BIT]	= "tx_queued",
++ 	[NETIF_MSG_INTR_BIT]		= "intr",
++ 	[NETIF_MSG_TX_DONE_BIT]		= "tx_done",
++ 	[NETIF_MSG_RX_STATUS_BIT]	= "rx_status",
++ 	[NETIF_MSG_PKTDATA_BIT]		= "pktdata",
++ 	[NETIF_MSG_HW_BIT]		= "hw",
++ 	[NETIF_MSG_WOL_BIT]		= "wol",
++ };
++ static_assert(ARRAY_SIZE(netif_msg_class_names) == NETIF_MSG_CLASS_COUNT);
++ 
++ const char wol_mode_names[][ETH_GSTRING_LEN] = {
++ 	[const_ilog2(WAKE_PHY)]		= "phy",
++ 	[const_ilog2(WAKE_UCAST)]	= "ucast",
++ 	[const_ilog2(WAKE_MCAST)]	= "mcast",
++ 	[const_ilog2(WAKE_BCAST)]	= "bcast",
++ 	[const_ilog2(WAKE_ARP)]		= "arp",
++ 	[const_ilog2(WAKE_MAGIC)]	= "magic",
++ 	[const_ilog2(WAKE_MAGICSECURE)]	= "magicsecure",
++ 	[const_ilog2(WAKE_FILTER)]	= "filter",
++ };
++ static_assert(ARRAY_SIZE(wol_mode_names) == WOL_MODE_COUNT);
++ 
++ const char sof_timestamping_names[][ETH_GSTRING_LEN] = {
++ 	[const_ilog2(SOF_TIMESTAMPING_TX_HARDWARE)]  = "hardware-transmit",
++ 	[const_ilog2(SOF_TIMESTAMPING_TX_SOFTWARE)]  = "software-transmit",
++ 	[const_ilog2(SOF_TIMESTAMPING_RX_HARDWARE)]  = "hardware-receive",
++ 	[const_ilog2(SOF_TIMESTAMPING_RX_SOFTWARE)]  = "software-receive",
++ 	[const_ilog2(SOF_TIMESTAMPING_SOFTWARE)]     = "software-system-clock",
++ 	[const_ilog2(SOF_TIMESTAMPING_SYS_HARDWARE)] = "hardware-legacy-clock",
++ 	[const_ilog2(SOF_TIMESTAMPING_RAW_HARDWARE)] = "hardware-raw-clock",
++ 	[const_ilog2(SOF_TIMESTAMPING_OPT_ID)]       = "option-id",
++ 	[const_ilog2(SOF_TIMESTAMPING_TX_SCHED)]     = "sched-transmit",
++ 	[const_ilog2(SOF_TIMESTAMPING_TX_ACK)]       = "ack-transmit",
++ 	[const_ilog2(SOF_TIMESTAMPING_OPT_CMSG)]     = "option-cmsg",
++ 	[const_ilog2(SOF_TIMESTAMPING_OPT_TSONLY)]   = "option-tsonly",
++ 	[const_ilog2(SOF_TIMESTAMPING_OPT_STATS)]    = "option-stats",
++ 	[const_ilog2(SOF_TIMESTAMPING_OPT_PKTINFO)]  = "option-pktinfo",
++ 	[const_ilog2(SOF_TIMESTAMPING_OPT_TX_SWHW)]  = "option-tx-swhw",
++ };
++ static_assert(ARRAY_SIZE(sof_timestamping_names) == __SOF_TIMESTAMPING_CNT);
++ 
++ const char ts_tx_type_names[][ETH_GSTRING_LEN] = {
++ 	[HWTSTAMP_TX_OFF]		= "off",
++ 	[HWTSTAMP_TX_ON]		= "on",
++ 	[HWTSTAMP_TX_ONESTEP_SYNC]	= "onestep-sync",
++ 	[HWTSTAMP_TX_ONESTEP_P2P]	= "onestep-p2p",
++ };
++ static_assert(ARRAY_SIZE(ts_tx_type_names) == __HWTSTAMP_TX_CNT);
++ 
++ const char ts_rx_filter_names[][ETH_GSTRING_LEN] = {
++ 	[HWTSTAMP_FILTER_NONE]			= "none",
++ 	[HWTSTAMP_FILTER_ALL]			= "all",
++ 	[HWTSTAMP_FILTER_SOME]			= "some",
++ 	[HWTSTAMP_FILTER_PTP_V1_L4_EVENT]	= "ptpv1-l4-event",
++ 	[HWTSTAMP_FILTER_PTP_V1_L4_SYNC]	= "ptpv1-l4-sync",
++ 	[HWTSTAMP_FILTER_PTP_V1_L4_DELAY_REQ]	= "ptpv1-l4-delay-req",
++ 	[HWTSTAMP_FILTER_PTP_V2_L4_EVENT]	= "ptpv2-l4-event",
++ 	[HWTSTAMP_FILTER_PTP_V2_L4_SYNC]	= "ptpv2-l4-sync",
++ 	[HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ]	= "ptpv2-l4-delay-req",
++ 	[HWTSTAMP_FILTER_PTP_V2_L2_EVENT]	= "ptpv2-l2-event",
++ 	[HWTSTAMP_FILTER_PTP_V2_L2_SYNC]	= "ptpv2-l2-sync",
++ 	[HWTSTAMP_FILTER_PTP_V2_L2_DELAY_REQ]	= "ptpv2-l2-delay-req",
++ 	[HWTSTAMP_FILTER_PTP_V2_EVENT]		= "ptpv2-event",
++ 	[HWTSTAMP_FILTER_PTP_V2_SYNC]		= "ptpv2-sync",
++ 	[HWTSTAMP_FILTER_PTP_V2_DELAY_REQ]	= "ptpv2-delay-req",
++ 	[HWTSTAMP_FILTER_NTP_ALL]		= "ntp-all",
++ };
++ static_assert(ARRAY_SIZE(ts_rx_filter_names) == __HWTSTAMP_FILTER_CNT);
++ 
++ const char udp_tunnel_type_names[][ETH_GSTRING_LEN] = {
++ 	[ETHTOOL_UDP_TUNNEL_TYPE_VXLAN]		= "vxlan",
++ 	[ETHTOOL_UDP_TUNNEL_TYPE_GENEVE]	= "geneve",
++ 	[ETHTOOL_UDP_TUNNEL_TYPE_VXLAN_GPE]	= "vxlan-gpe",
++ };
++ static_assert(ARRAY_SIZE(udp_tunnel_type_names) ==
++ 	      __ETHTOOL_UDP_TUNNEL_TYPE_CNT);
++ 
++ /* return false if legacy contained non-0 deprecated fields
++  * maxtxpkt/maxrxpkt. rest of ksettings always updated
++  */
++ bool
++ convert_legacy_settings_to_link_ksettings(
++ 	struct ethtool_link_ksettings *link_ksettings,
++ 	const struct ethtool_cmd *legacy_settings)
++ {
++ 	bool retval = true;
++ 
++ 	memset(link_ksettings, 0, sizeof(*link_ksettings));
++ 
++ 	/* This is used to tell users that driver is still using these
++ 	 * deprecated legacy fields, and they should not use
++ 	 * %ETHTOOL_GLINKSETTINGS/%ETHTOOL_SLINKSETTINGS
++ 	 */
++ 	if (legacy_settings->maxtxpkt ||
++ 	    legacy_settings->maxrxpkt)
++ 		retval = false;
++ 
++ 	ethtool_convert_legacy_u32_to_link_mode(
++ 		link_ksettings->link_modes.supported,
++ 		legacy_settings->supported);
++ 	ethtool_convert_legacy_u32_to_link_mode(
++ 		link_ksettings->link_modes.advertising,
++ 		legacy_settings->advertising);
++ 	ethtool_convert_legacy_u32_to_link_mode(
++ 		link_ksettings->link_modes.lp_advertising,
++ 		legacy_settings->lp_advertising);
++ 	link_ksettings->base.speed
++ 		= ethtool_cmd_speed(legacy_settings);
++ 	link_ksettings->base.duplex
++ 		= legacy_settings->duplex;
++ 	link_ksettings->base.port
++ 		= legacy_settings->port;
++ 	link_ksettings->base.phy_address
++ 		= legacy_settings->phy_address;
++ 	link_ksettings->base.autoneg
++ 		= legacy_settings->autoneg;
++ 	link_ksettings->base.mdio_support
++ 		= legacy_settings->mdio_support;
++ 	link_ksettings->base.eth_tp_mdix
++ 		= legacy_settings->eth_tp_mdix;
++ 	link_ksettings->base.eth_tp_mdix_ctrl
++ 		= legacy_settings->eth_tp_mdix_ctrl;
++ 	return retval;
++ }
++ 
++ int __ethtool_get_link(struct net_device *dev)
++ {
++ 	if (!dev->ethtool_ops->get_link)
++ 		return -EOPNOTSUPP;
++ 
++ 	return netif_running(dev) && dev->ethtool_ops->get_link(dev);
++ }
++ 
++ int ethtool_get_max_rxfh_channel(struct net_device *dev, u32 *max)
++ {
++ 	u32 dev_size, current_max = 0;
++ 	u32 *indir;
++ 	int ret;
++ 
++ 	if (!dev->ethtool_ops->get_rxfh_indir_size ||
++ 	    !dev->ethtool_ops->get_rxfh)
++ 		return -EOPNOTSUPP;
++ 	dev_size = dev->ethtool_ops->get_rxfh_indir_size(dev);
++ 	if (dev_size == 0)
++ 		return -EOPNOTSUPP;
++ 
++ 	indir = kcalloc(dev_size, sizeof(indir[0]), GFP_USER);
++ 	if (!indir)
++ 		return -ENOMEM;
++ 
++ 	ret = dev->ethtool_ops->get_rxfh(dev, indir, NULL, NULL);
++ 	if (ret)
++ 		goto out;
++ 
++ 	while (dev_size--)
++ 		current_max = max(current_max, indir[dev_size]);
++ 
++ 	*max = current_max;
++ 
++ out:
++ 	kfree(indir);
++ 	return ret;
++ }
++ 
++ int ethtool_check_ops(const struct ethtool_ops *ops)
++ {
++ 	if (WARN_ON(ops->set_coalesce && !ops->supported_coalesce_params))
++ 		return -EINVAL;
++ 	/* NOTE: sufficiently insane drivers may swap ethtool_ops at runtime,
++ 	 * the fact that ops are checked at registration time does not
++ 	 * mean the ops attached to a netdev later on are sane.
++ 	 */
++ 	return 0;
++ }
++ 
++ int __ethtool_get_ts_info(struct net_device *dev, struct ethtool_ts_info *info)
++ {
++ 	const struct ethtool_ops *ops = dev->ethtool_ops;
++ 	struct phy_device *phydev = dev->phydev;
++ 
++ 	memset(info, 0, sizeof(*info));
++ 	info->cmd = ETHTOOL_GET_TS_INFO;
++ 
++ 	if (phy_has_tsinfo(phydev))
++ 		return phy_ts_info(phydev, info);
++ 	if (ops->get_ts_info)
++ 		return ops->get_ts_info(dev, info);
++ 
++ 	info->so_timestamping = SOF_TIMESTAMPING_RX_SOFTWARE |
++ 				SOF_TIMESTAMPING_SOFTWARE;
++ 	info->phc_index = -1;
++ 
++ 	return 0;
++ }
++ 
++ const struct ethtool_phy_ops *ethtool_phy_ops;
++ 
++ void ethtool_set_ethtool_phy_ops(const struct ethtool_phy_ops *ops)
++ {
++ 	rtnl_lock();
++ 	ethtool_phy_ops = ops;
++ 	rtnl_unlock();
++ }
++ EXPORT_SYMBOL_GPL(ethtool_set_ethtool_phy_ops);
+++>>>>>>> c7d759eb7b12 (ethtool: add tunnel info interface)
+diff --cc net/ethtool/common.h
+index bbb788908cb1,3d9251c95a8b..000000000000
+--- a/net/ethtool/common.h
++++ b/net/ethtool/common.h
+@@@ -18,5 -23,21 +18,24 @@@ tunable_strings[__ETHTOOL_TUNABLE_COUNT
+  extern const char
+  phy_tunable_strings[__ETHTOOL_PHY_TUNABLE_COUNT][ETH_GSTRING_LEN];
+  extern const char link_mode_names[][ETH_GSTRING_LEN];
+++<<<<<<< HEAD
+++=======
++ extern const char netif_msg_class_names[][ETH_GSTRING_LEN];
++ extern const char wol_mode_names[][ETH_GSTRING_LEN];
++ extern const char sof_timestamping_names[][ETH_GSTRING_LEN];
++ extern const char ts_tx_type_names[][ETH_GSTRING_LEN];
++ extern const char ts_rx_filter_names[][ETH_GSTRING_LEN];
++ extern const char udp_tunnel_type_names[][ETH_GSTRING_LEN];
++ 
++ int __ethtool_get_link(struct net_device *dev);
++ 
++ bool convert_legacy_settings_to_link_ksettings(
++ 	struct ethtool_link_ksettings *link_ksettings,
++ 	const struct ethtool_cmd *legacy_settings);
++ int ethtool_get_max_rxfh_channel(struct net_device *dev, u32 *max);
++ int __ethtool_get_ts_info(struct net_device *dev, struct ethtool_ts_info *info);
++ 
++ extern const struct ethtool_phy_ops *ethtool_phy_ops;
+++>>>>>>> c7d759eb7b12 (ethtool: add tunnel info interface)
+  
+  #endif /* _ETHTOOL_COMMON_H */
+* Unmerged path Documentation/networking/ethtool-netlink.rst
+* Unmerged path include/uapi/linux/ethtool_netlink.h
+* Unmerged path net/ethtool/netlink.c
+* Unmerged path net/ethtool/netlink.h
+* Unmerged path net/ethtool/strset.c
+* Unmerged path net/ipv4/udp_tunnel_nic.c
+* Unmerged path Documentation/networking/ethtool-netlink.rst
+* Unmerged path include/net/udp_tunnel.h
+* Unmerged path include/uapi/linux/ethtool.h
+* Unmerged path include/uapi/linux/ethtool_netlink.h
+* Unmerged path net/ethtool/Makefile
+* Unmerged path net/ethtool/common.c
+* Unmerged path net/ethtool/common.h
+* Unmerged path net/ethtool/netlink.c
+* Unmerged path net/ethtool/netlink.h
+* Unmerged path net/ethtool/strset.c
+diff --git a/net/ethtool/tunnels.c b/net/ethtool/tunnels.c
+new file mode 100644
+index 000000000000..6b89255f1231
+--- /dev/null
++++ b/net/ethtool/tunnels.c
+@@ -0,0 +1,259 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/ethtool_netlink.h>
++#include <net/udp_tunnel.h>
++
++#include "bitset.h"
++#include "common.h"
++#include "netlink.h"
++
++static const struct nla_policy
++ethtool_tunnel_info_policy[ETHTOOL_A_TUNNEL_INFO_MAX + 1] = {
++	[ETHTOOL_A_TUNNEL_INFO_UNSPEC]		= { .type = NLA_REJECT },
++	[ETHTOOL_A_TUNNEL_INFO_HEADER]		= { .type = NLA_NESTED },
++};
++
++static_assert(ETHTOOL_UDP_TUNNEL_TYPE_VXLAN == ilog2(UDP_TUNNEL_TYPE_VXLAN));
++static_assert(ETHTOOL_UDP_TUNNEL_TYPE_GENEVE == ilog2(UDP_TUNNEL_TYPE_GENEVE));
++static_assert(ETHTOOL_UDP_TUNNEL_TYPE_VXLAN_GPE ==
++	      ilog2(UDP_TUNNEL_TYPE_VXLAN_GPE));
++
++static ssize_t
++ethnl_tunnel_info_reply_size(const struct ethnl_req_info *req_base,
++			     struct netlink_ext_ack *extack)
++{
++	bool compact = req_base->flags & ETHTOOL_FLAG_COMPACT_BITSETS;
++	const struct udp_tunnel_nic_info *info;
++	unsigned int i;
++	size_t size;
++	int ret;
++
++	info = req_base->dev->udp_tunnel_nic_info;
++	if (!info) {
++		NL_SET_ERR_MSG(extack,
++			       "device does not report tunnel offload info");
++		return -EOPNOTSUPP;
++	}
++
++	size =	nla_total_size(0); /* _INFO_UDP_PORTS */
++
++	for (i = 0; i < UDP_TUNNEL_NIC_MAX_TABLES; i++) {
++		if (!info->tables[i].n_entries)
++			return size;
++
++		size += nla_total_size(0); /* _UDP_TABLE */
++		size +=	nla_total_size(sizeof(u32)); /* _UDP_TABLE_SIZE */
++		ret = ethnl_bitset32_size(&info->tables[i].tunnel_types, NULL,
++					  __ETHTOOL_UDP_TUNNEL_TYPE_CNT,
++					  udp_tunnel_type_names, compact);
++		if (ret < 0)
++			return ret;
++		size += ret;
++
++		size += udp_tunnel_nic_dump_size(req_base->dev, i);
++	}
++
++	return size;
++}
++
++static int
++ethnl_tunnel_info_fill_reply(const struct ethnl_req_info *req_base,
++			     struct sk_buff *skb)
++{
++	bool compact = req_base->flags & ETHTOOL_FLAG_COMPACT_BITSETS;
++	const struct udp_tunnel_nic_info *info;
++	struct nlattr *ports, *table;
++	unsigned int i;
++
++	info = req_base->dev->udp_tunnel_nic_info;
++	if (!info)
++		return -EOPNOTSUPP;
++
++	ports = nla_nest_start(skb, ETHTOOL_A_TUNNEL_INFO_UDP_PORTS);
++	if (!ports)
++		return -EMSGSIZE;
++
++	for (i = 0; i < UDP_TUNNEL_NIC_MAX_TABLES; i++) {
++		if (!info->tables[i].n_entries)
++			break;
++
++		table = nla_nest_start(skb, ETHTOOL_A_TUNNEL_UDP_TABLE);
++		if (!table)
++			goto err_cancel_ports;
++
++		if (nla_put_u32(skb, ETHTOOL_A_TUNNEL_UDP_TABLE_SIZE,
++				info->tables[i].n_entries))
++			goto err_cancel_table;
++
++		if (ethnl_put_bitset32(skb, ETHTOOL_A_TUNNEL_UDP_TABLE_TYPES,
++				       &info->tables[i].tunnel_types, NULL,
++				       __ETHTOOL_UDP_TUNNEL_TYPE_CNT,
++				       udp_tunnel_type_names, compact))
++			goto err_cancel_table;
++
++		if (udp_tunnel_nic_dump_write(req_base->dev, i, skb))
++			goto err_cancel_table;
++
++		nla_nest_end(skb, table);
++	}
++
++	nla_nest_end(skb, ports);
++
++	return 0;
++
++err_cancel_table:
++	nla_nest_cancel(skb, table);
++err_cancel_ports:
++	nla_nest_cancel(skb, ports);
++	return -EMSGSIZE;
++}
++
++static int
++ethnl_tunnel_info_req_parse(struct ethnl_req_info *req_info,
++			    const struct nlmsghdr *nlhdr, struct net *net,
++			    struct netlink_ext_ack *extack, bool require_dev)
++{
++	struct nlattr *tb[ETHTOOL_A_TUNNEL_INFO_MAX + 1];
++	int ret;
++
++	ret = nlmsg_parse(nlhdr, GENL_HDRLEN, tb, ETHTOOL_A_TUNNEL_INFO_MAX,
++			  ethtool_tunnel_info_policy, extack);
++	if (ret < 0)
++		return ret;
++
++	return ethnl_parse_header_dev_get(req_info,
++					  tb[ETHTOOL_A_TUNNEL_INFO_HEADER],
++					  net, extack, require_dev);
++}
++
++int ethnl_tunnel_info_doit(struct sk_buff *skb, struct genl_info *info)
++{
++	struct ethnl_req_info req_info = {};
++	struct sk_buff *rskb;
++	void *reply_payload;
++	int reply_len;
++	int ret;
++
++	ret = ethnl_tunnel_info_req_parse(&req_info, info->nlhdr,
++					  genl_info_net(info), info->extack,
++					  true);
++	if (ret < 0)
++		return ret;
++
++	rtnl_lock();
++	ret = ethnl_tunnel_info_reply_size(&req_info, info->extack);
++	if (ret < 0)
++		goto err_unlock_rtnl;
++	reply_len = ret + ethnl_reply_header_size();
++
++	rskb = ethnl_reply_init(reply_len, req_info.dev,
++				ETHTOOL_MSG_TUNNEL_INFO_GET,
++				ETHTOOL_A_TUNNEL_INFO_HEADER,
++				info, &reply_payload);
++	if (!rskb) {
++		ret = -ENOMEM;
++		goto err_unlock_rtnl;
++	}
++
++	ret = ethnl_tunnel_info_fill_reply(&req_info, rskb);
++	if (ret)
++		goto err_free_msg;
++	rtnl_unlock();
++	dev_put(req_info.dev);
++	genlmsg_end(rskb, reply_payload);
++
++	return genlmsg_reply(rskb, info);
++
++err_free_msg:
++	nlmsg_free(rskb);
++err_unlock_rtnl:
++	rtnl_unlock();
++	dev_put(req_info.dev);
++	return ret;
++}
++
++struct ethnl_tunnel_info_dump_ctx {
++	struct ethnl_req_info	req_info;
++	int			pos_hash;
++	int			pos_idx;
++};
++
++int ethnl_tunnel_info_start(struct netlink_callback *cb)
++{
++	struct ethnl_tunnel_info_dump_ctx *ctx = (void *)cb->ctx;
++	int ret;
++
++	BUILD_BUG_ON(sizeof(*ctx) > sizeof(cb->ctx));
++
++	memset(ctx, 0, sizeof(*ctx));
++
++	ret = ethnl_tunnel_info_req_parse(&ctx->req_info, cb->nlh,
++					  sock_net(cb->skb->sk), cb->extack,
++					  false);
++	if (ctx->req_info.dev) {
++		dev_put(ctx->req_info.dev);
++		ctx->req_info.dev = NULL;
++	}
++
++	return ret;
++}
++
++int ethnl_tunnel_info_dumpit(struct sk_buff *skb, struct netlink_callback *cb)
++{
++	struct ethnl_tunnel_info_dump_ctx *ctx = (void *)cb->ctx;
++	struct net *net = sock_net(skb->sk);
++	int s_idx = ctx->pos_idx;
++	int h, idx = 0;
++	int ret = 0;
++	void *ehdr;
++
++	rtnl_lock();
++	cb->seq = net->dev_base_seq;
++	for (h = ctx->pos_hash; h < NETDEV_HASHENTRIES; h++, s_idx = 0) {
++		struct hlist_head *head;
++		struct net_device *dev;
++
++		head = &net->dev_index_head[h];
++		idx = 0;
++		hlist_for_each_entry(dev, head, index_hlist) {
++			if (idx < s_idx)
++				goto cont;
++
++			ehdr = ethnl_dump_put(skb, cb,
++					      ETHTOOL_MSG_TUNNEL_INFO_GET);
++			if (!ehdr) {
++				ret = -EMSGSIZE;
++				goto out;
++			}
++
++			ret = ethnl_fill_reply_header(skb, dev, ETHTOOL_A_TUNNEL_INFO_HEADER);
++			if (ret < 0) {
++				genlmsg_cancel(skb, ehdr);
++				goto out;
++			}
++
++			ctx->req_info.dev = dev;
++			ret = ethnl_tunnel_info_fill_reply(&ctx->req_info, skb);
++			ctx->req_info.dev = NULL;
++			if (ret < 0) {
++				genlmsg_cancel(skb, ehdr);
++				if (ret == -EOPNOTSUPP)
++					goto cont;
++				goto out;
++			}
++			genlmsg_end(skb, ehdr);
++cont:
++			idx++;
++		}
++	}
++out:
++	rtnl_unlock();
++
++	ctx->pos_hash = h;
++	ctx->pos_idx = idx;
++	nl_dump_check_consistent(cb, nlmsg_hdr(skb));
++
++	if (ret == -EMSGSIZE && skb->len)
++		return skb->len;
++	return ret;
++}
+* Unmerged path net/ipv4/udp_tunnel_nic.c
