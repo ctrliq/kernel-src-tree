@@ -1,0 +1,230 @@
+net/smc: fix sleep bug in smc_pnet_find_roce_resource()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ursula Braun <ubraun@linux.ibm.com>
+commit 92f3cb0e11dda530d1daa42d7a11af5a92ed89e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/92f3cb0e.failed
+
+Tests showed this BUG:
+[572555.252867] BUG: sleeping function called from invalid context at kernel/locking/mutex.c:935
+[572555.252876] in_atomic(): 1, irqs_disabled(): 0, non_block: 0, pid: 131031, name: smcapp
+[572555.252879] INFO: lockdep is turned off.
+[572555.252883] CPU: 1 PID: 131031 Comm: smcapp Tainted: G           O      5.7.0-rc3uschi+ #356
+[572555.252885] Hardware name: IBM 3906 M03 703 (LPAR)
+[572555.252887] Call Trace:
+[572555.252896]  [<00000000ac364554>] show_stack+0x94/0xe8
+[572555.252901]  [<00000000aca1f400>] dump_stack+0xa0/0xe0
+[572555.252906]  [<00000000ac3c8c10>] ___might_sleep+0x260/0x280
+[572555.252910]  [<00000000acdc0c98>] __mutex_lock+0x48/0x940
+[572555.252912]  [<00000000acdc15c2>] mutex_lock_nested+0x32/0x40
+[572555.252975]  [<000003ff801762d0>] mlx5_lag_get_roce_netdev+0x30/0xc0 [mlx5_core]
+[572555.252996]  [<000003ff801fb3aa>] mlx5_ib_get_netdev+0x3a/0xe0 [mlx5_ib]
+[572555.253007]  [<000003ff80063848>] smc_pnet_find_roce_resource+0x1d8/0x310 [smc]
+[572555.253011]  [<000003ff800602f0>] __smc_connect+0x1f0/0x3e0 [smc]
+[572555.253015]  [<000003ff80060634>] smc_connect+0x154/0x190 [smc]
+[572555.253022]  [<00000000acbed8d4>] __sys_connect+0x94/0xd0
+[572555.253025]  [<00000000acbef620>] __s390x_sys_socketcall+0x170/0x360
+[572555.253028]  [<00000000acdc6800>] system_call+0x298/0x2b8
+[572555.253030] INFO: lockdep is turned off.
+
+Function smc_pnet_find_rdma_dev() might be called from
+smc_pnet_find_roce_resource(). It holds the smc_ib_devices list
+spinlock while calling infiniband op get_netdev(). At least for mlx5
+the get_netdev operation wants mutex serialization, which conflicts
+with the smc_ib_devices spinlock.
+This patch switches the smc_ib_devices spinlock into a mutex to
+allow sleeping when calling get_netdev().
+
+Fixes: a4cf0443c414 ("smc: introduce SMC as an IB-client")
+	Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+	Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 92f3cb0e11dda530d1daa42d7a11af5a92ed89e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/smc_ib.c
+diff --cc net/smc/smc_ib.c
+index 3d87e3a22e90,7637fdebbb78..000000000000
+--- a/net/smc/smc_ib.c
++++ b/net/smc/smc_ib.c
+@@@ -590,15 -601,13 +591,23 @@@ static void smc_ib_add_dev(struct ib_de
+  /* callback function for ib_unregister_client() */
+  static void smc_ib_remove_dev(struct ib_device *ibdev, void *client_data)
+  {
+ -	struct smc_ib_device *smcibdev = client_data;
+ +	struct smc_ib_device *smcibdev;
+  
+++<<<<<<< HEAD
+ +	smcibdev = ib_get_client_data(ibdev, &smc_ib_client);
+ +	if (!smcibdev || smcibdev->ibdev != ibdev)
+ +		return;
+ +	ib_set_client_data(ibdev, &smc_ib_client, NULL);
+ +	spin_lock(&smc_ib_devices.lock);
+ +	list_del_init(&smcibdev->list); /* remove from smc_ib_devices */
+ +	spin_unlock(&smc_ib_devices.lock);
+++=======
++ 	mutex_lock(&smc_ib_devices.mutex);
++ 	list_del_init(&smcibdev->list); /* remove from smc_ib_devices */
++ 	mutex_unlock(&smc_ib_devices.mutex);
++ 	pr_warn_ratelimited("smc: removing ib device %s\n",
++ 			    smcibdev->ibdev->name);
+++>>>>>>> 92f3cb0e11dd (net/smc: fix sleep bug in smc_pnet_find_roce_resource())
+  	smc_smcr_terminate_all(smcibdev);
+  	smc_ib_cleanup_per_ibdev(smcibdev);
+  	ib_unregister_event_handler(&smcibdev->event_handler);
+diff --git a/net/smc/smc_core.c b/net/smc/smc_core.c
+index 399bc3ffb64e..dc77f316f344 100644
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@ -15,6 +15,7 @@
+ #include <linux/workqueue.h>
+ #include <linux/wait.h>
+ #include <linux/reboot.h>
++#include <linux/mutex.h>
+ #include <net/tcp.h>
+ #include <net/sock.h>
+ #include <rdma/ib_verbs.h>
+@@ -1605,14 +1606,14 @@ static void smc_core_going_away(void)
+ 	struct smc_ib_device *smcibdev;
+ 	struct smcd_dev *smcd;
+ 
+-	spin_lock(&smc_ib_devices.lock);
++	mutex_lock(&smc_ib_devices.mutex);
+ 	list_for_each_entry(smcibdev, &smc_ib_devices.list, list) {
+ 		int i;
+ 
+ 		for (i = 0; i < SMC_MAX_PORTS; i++)
+ 			set_bit(i, smcibdev->ports_going_away);
+ 	}
+-	spin_unlock(&smc_ib_devices.lock);
++	mutex_unlock(&smc_ib_devices.mutex);
+ 
+ 	spin_lock(&smcd_dev_list.lock);
+ 	list_for_each_entry(smcd, &smcd_dev_list.list, list) {
+* Unmerged path net/smc/smc_ib.c
+diff --git a/net/smc/smc_ib.h b/net/smc/smc_ib.h
+index e6a696ae15f3..ae6776e1e726 100644
+--- a/net/smc/smc_ib.h
++++ b/net/smc/smc_ib.h
+@@ -14,6 +14,7 @@
+ 
+ #include <linux/interrupt.h>
+ #include <linux/if_ether.h>
++#include <linux/mutex.h>
+ #include <linux/wait.h>
+ #include <rdma/ib_verbs.h>
+ #include <net/smc.h>
+@@ -25,7 +26,7 @@
+ 
+ struct smc_ib_devices {			/* list of smc ib devices definition */
+ 	struct list_head	list;
+-	spinlock_t		lock;	/* protects list of smc ib devices */
++	struct mutex		mutex;	/* protects list of smc ib devices */
+ };
+ 
+ extern struct smc_ib_devices	smc_ib_devices; /* list of smc ib devices */
+diff --git a/net/smc/smc_pnet.c b/net/smc/smc_pnet.c
+index ae595dc27284..acb2a1df59aa 100644
+--- a/net/smc/smc_pnet.c
++++ b/net/smc/smc_pnet.c
+@@ -12,6 +12,7 @@
+ #include <linux/module.h>
+ #include <linux/list.h>
+ #include <linux/ctype.h>
++#include <linux/mutex.h>
+ #include <net/netlink.h>
+ #include <net/genetlink.h>
+ 
+@@ -123,7 +124,7 @@ static int smc_pnet_remove_by_pnetid(struct net *net, char *pnet_name)
+ 		return rc;
+ 
+ 	/* remove ib devices */
+-	spin_lock(&smc_ib_devices.lock);
++	mutex_lock(&smc_ib_devices.mutex);
+ 	list_for_each_entry(ibdev, &smc_ib_devices.list, list) {
+ 		for (ibport = 0; ibport < SMC_MAX_PORTS; ibport++) {
+ 			if (ibdev->pnetid_by_user[ibport] &&
+@@ -137,7 +138,7 @@ static int smc_pnet_remove_by_pnetid(struct net *net, char *pnet_name)
+ 			}
+ 		}
+ 	}
+-	spin_unlock(&smc_ib_devices.lock);
++	mutex_unlock(&smc_ib_devices.mutex);
+ 	/* remove smcd devices */
+ 	spin_lock(&smcd_dev_list.lock);
+ 	list_for_each_entry(smcd_dev, &smcd_dev_list.list, list) {
+@@ -216,14 +217,14 @@ static bool smc_pnet_apply_ib(struct smc_ib_device *ib_dev, u8 ib_port,
+ 	u8 pnet_null[SMC_MAX_PNETID_LEN] = {0};
+ 	bool applied = false;
+ 
+-	spin_lock(&smc_ib_devices.lock);
++	mutex_lock(&smc_ib_devices.mutex);
+ 	if (smc_pnet_match(ib_dev->pnetid[ib_port - 1], pnet_null)) {
+ 		memcpy(ib_dev->pnetid[ib_port - 1], pnet_name,
+ 		       SMC_MAX_PNETID_LEN);
+ 		ib_dev->pnetid_by_user[ib_port - 1] = true;
+ 		applied = true;
+ 	}
+-	spin_unlock(&smc_ib_devices.lock);
++	mutex_unlock(&smc_ib_devices.mutex);
+ 	return applied;
+ }
+ 
+@@ -276,7 +277,7 @@ static struct smc_ib_device *smc_pnet_find_ib(char *ib_name)
+ {
+ 	struct smc_ib_device *ibdev;
+ 
+-	spin_lock(&smc_ib_devices.lock);
++	mutex_lock(&smc_ib_devices.mutex);
+ 	list_for_each_entry(ibdev, &smc_ib_devices.list, list) {
+ 		if (!strncmp(ibdev->ibdev->name, ib_name,
+ 			     sizeof(ibdev->ibdev->name)) ||
+@@ -287,7 +288,7 @@ static struct smc_ib_device *smc_pnet_find_ib(char *ib_name)
+ 	}
+ 	ibdev = NULL;
+ out:
+-	spin_unlock(&smc_ib_devices.lock);
++	mutex_unlock(&smc_ib_devices.mutex);
+ 	return ibdev;
+ }
+ 
+@@ -784,7 +785,7 @@ static void _smc_pnet_find_roce_by_pnetid(u8 *pnet_id,
+ 	int i;
+ 
+ 	ini->ib_dev = NULL;
+-	spin_lock(&smc_ib_devices.lock);
++	mutex_lock(&smc_ib_devices.mutex);
+ 	list_for_each_entry(ibdev, &smc_ib_devices.list, list) {
+ 		if (ibdev == known_dev)
+ 			continue;
+@@ -803,7 +804,7 @@ static void _smc_pnet_find_roce_by_pnetid(u8 *pnet_id,
+ 		}
+ 	}
+ out:
+-	spin_unlock(&smc_ib_devices.lock);
++	mutex_unlock(&smc_ib_devices.mutex);
+ }
+ 
+ /* find alternate roce device with same pnet_id and vlan_id */
+@@ -822,7 +823,7 @@ static void smc_pnet_find_rdma_dev(struct net_device *netdev,
+ {
+ 	struct smc_ib_device *ibdev;
+ 
+-	spin_lock(&smc_ib_devices.lock);
++	mutex_lock(&smc_ib_devices.mutex);
+ 	list_for_each_entry(ibdev, &smc_ib_devices.list, list) {
+ 		struct net_device *ndev;
+ 		int i;
+@@ -847,7 +848,7 @@ static void smc_pnet_find_rdma_dev(struct net_device *netdev,
+ 			}
+ 		}
+ 	}
+-	spin_unlock(&smc_ib_devices.lock);
++	mutex_unlock(&smc_ib_devices.mutex);
+ }
+ 
+ /* Determine the corresponding IB device port based on the hardware PNETID.
