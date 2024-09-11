@@ -1,0 +1,251 @@
+bpf: Support bpf tracing/iter programs for BPF_LINK_CREATE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit de4e05cac46d206f9090051ef09930514bff73e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/de4e05ca.failed
+
+Given a bpf program, the step to create an anonymous bpf iterator is:
+  - create a bpf_iter_link, which combines bpf program and the target.
+    In the future, there could be more information recorded in the link.
+    A link_fd will be returned to the user space.
+  - create an anonymous bpf iterator with the given link_fd.
+
+The bpf_iter_link can be pinned to bpffs mount file system to
+create a file based bpf iterator as well.
+
+The benefit to use of bpf_iter_link:
+  - using bpf link simplifies design and implementation as bpf link
+    is used for other tracing bpf programs.
+  - for file based bpf iterator, bpf_iter_link provides a standard
+    way to replace underlying bpf programs.
+  - for both anonymous and free based iterators, bpf link query
+    capability can be leveraged.
+
+The patch added support of tracing/iter programs for BPF_LINK_CREATE.
+A new link type BPF_LINK_TYPE_ITER is added to facilitate link
+querying. Currently, only prog_id is needed, so there is no
+additional in-kernel show_fdinfo() and fill_link_info() hook
+is needed for BPF_LINK_TYPE_ITER link.
+
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+Link: https://lore.kernel.org/bpf/20200509175901.2475084-1-yhs@fb.com
+(cherry picked from commit de4e05cac46d206f9090051ef09930514bff73e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/bpf_iter.c
+diff --cc include/linux/bpf.h
+index 092cd57c664b,e93d2d33c82c..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -1159,6 -1142,8 +1159,11 @@@ struct bpf_iter_reg 
+  
+  int bpf_iter_reg_target(struct bpf_iter_reg *reg_info);
+  void bpf_iter_unreg_target(const char *target);
+++<<<<<<< HEAD
+++=======
++ bool bpf_iter_prog_supported(struct bpf_prog *prog);
++ int bpf_iter_link_attach(const union bpf_attr *attr, struct bpf_prog *prog);
+++>>>>>>> de4e05cac46d (bpf: Support bpf tracing/iter programs for BPF_LINK_CREATE)
+  
+  int bpf_percpu_hash_copy(struct bpf_map *map, void *key, void *value);
+  int bpf_percpu_array_copy(struct bpf_map *map, void *key, void *value);
+diff --cc kernel/bpf/bpf_iter.c
+index 5a8119d17d14,03f5832909db..000000000000
+--- a/kernel/bpf/bpf_iter.c
++++ b/kernel/bpf/bpf_iter.c
+@@@ -12,8 -12,14 +12,13 @@@ struct bpf_iter_target_info 
+  	bpf_iter_init_seq_priv_t init_seq_private;
+  	bpf_iter_fini_seq_priv_t fini_seq_private;
+  	u32 seq_priv_size;
+ -	u32 btf_id;	/* cached value */
+  };
+  
++ struct bpf_iter_link {
++ 	struct bpf_link link;
++ 	struct bpf_iter_target_info *tinfo;
++ };
++ 
+  static struct list_head targets = LIST_HEAD_INIT(targets);
+  static DEFINE_MUTEX(targets_mutex);
+  
+@@@ -57,3 -63,95 +62,98 @@@ void bpf_iter_unreg_target(const char *
+  
+  	WARN_ON(found == false);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void cache_btf_id(struct bpf_iter_target_info *tinfo,
++ 			 struct bpf_prog *prog)
++ {
++ 	tinfo->btf_id = prog->aux->attach_btf_id;
++ }
++ 
++ bool bpf_iter_prog_supported(struct bpf_prog *prog)
++ {
++ 	const char *attach_fname = prog->aux->attach_func_name;
++ 	u32 prog_btf_id = prog->aux->attach_btf_id;
++ 	const char *prefix = BPF_ITER_FUNC_PREFIX;
++ 	struct bpf_iter_target_info *tinfo;
++ 	int prefix_len = strlen(prefix);
++ 	bool supported = false;
++ 
++ 	if (strncmp(attach_fname, prefix, prefix_len))
++ 		return false;
++ 
++ 	mutex_lock(&targets_mutex);
++ 	list_for_each_entry(tinfo, &targets, list) {
++ 		if (tinfo->btf_id && tinfo->btf_id == prog_btf_id) {
++ 			supported = true;
++ 			break;
++ 		}
++ 		if (!strcmp(attach_fname + prefix_len, tinfo->target)) {
++ 			cache_btf_id(tinfo, prog);
++ 			supported = true;
++ 			break;
++ 		}
++ 	}
++ 	mutex_unlock(&targets_mutex);
++ 
++ 	return supported;
++ }
++ 
++ static void bpf_iter_link_release(struct bpf_link *link)
++ {
++ }
++ 
++ static void bpf_iter_link_dealloc(struct bpf_link *link)
++ {
++ 	struct bpf_iter_link *iter_link =
++ 		container_of(link, struct bpf_iter_link, link);
++ 
++ 	kfree(iter_link);
++ }
++ 
++ static const struct bpf_link_ops bpf_iter_link_lops = {
++ 	.release = bpf_iter_link_release,
++ 	.dealloc = bpf_iter_link_dealloc,
++ };
++ 
++ int bpf_iter_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
++ {
++ 	struct bpf_link_primer link_primer;
++ 	struct bpf_iter_target_info *tinfo;
++ 	struct bpf_iter_link *link;
++ 	bool existed = false;
++ 	u32 prog_btf_id;
++ 	int err;
++ 
++ 	if (attr->link_create.target_fd || attr->link_create.flags)
++ 		return -EINVAL;
++ 
++ 	prog_btf_id = prog->aux->attach_btf_id;
++ 	mutex_lock(&targets_mutex);
++ 	list_for_each_entry(tinfo, &targets, list) {
++ 		if (tinfo->btf_id == prog_btf_id) {
++ 			existed = true;
++ 			break;
++ 		}
++ 	}
++ 	mutex_unlock(&targets_mutex);
++ 	if (!existed)
++ 		return -ENOENT;
++ 
++ 	link = kzalloc(sizeof(*link), GFP_USER | __GFP_NOWARN);
++ 	if (!link)
++ 		return -ENOMEM;
++ 
++ 	bpf_link_init(&link->link, BPF_LINK_TYPE_ITER, &bpf_iter_link_lops, prog);
++ 	link->tinfo = tinfo;
++ 
++ 	err  = bpf_link_prime(&link->link, &link_primer);
++ 	if (err) {
++ 		kfree(link);
++ 		return err;
++ 	}
++ 
++ 	return bpf_link_settle(&link_primer);
++ }
+++>>>>>>> de4e05cac46d (bpf: Support bpf tracing/iter programs for BPF_LINK_CREATE)
+* Unmerged path include/linux/bpf.h
+diff --git a/include/linux/bpf_types.h b/include/linux/bpf_types.h
+index 8345cdf553b8..29d22752fc87 100644
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -124,3 +124,4 @@ BPF_LINK_TYPE(BPF_LINK_TYPE_TRACING, tracing)
+ #ifdef CONFIG_CGROUP_BPF
+ BPF_LINK_TYPE(BPF_LINK_TYPE_CGROUP, cgroup)
+ #endif
++BPF_LINK_TYPE(BPF_LINK_TYPE_ITER, iter)
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 23b02c5c3e10..0ab426efcccc 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -233,6 +233,7 @@ enum bpf_link_type {
+ 	BPF_LINK_TYPE_RAW_TRACEPOINT = 1,
+ 	BPF_LINK_TYPE_TRACING = 2,
+ 	BPF_LINK_TYPE_CGROUP = 3,
++	BPF_LINK_TYPE_ITER = 4,
+ 
+ 	MAX_BPF_LINK_TYPE,
+ };
+* Unmerged path kernel/bpf/bpf_iter.c
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 59f26fbd43c1..49e9a35c477d 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -2773,6 +2773,8 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
+ 	case BPF_CGROUP_GETSOCKOPT:
+ 	case BPF_CGROUP_SETSOCKOPT:
+ 		return BPF_PROG_TYPE_CGROUP_SOCKOPT;
++	case BPF_TRACE_ITER:
++		return BPF_PROG_TYPE_TRACING;
+ 	default:
+ 		return BPF_PROG_TYPE_UNSPEC;
+ 	}
+@@ -3775,6 +3777,15 @@ static int bpf_map_do_batch(const union bpf_attr *attr,
+ 	return err;
+ }
+ 
++static int tracing_bpf_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
++{
++	if (attr->link_create.attach_type == BPF_TRACE_ITER &&
++	    prog->expected_attach_type == BPF_TRACE_ITER)
++		return bpf_iter_link_attach(attr, prog);
++
++	return -EINVAL;
++}
++
+ #define BPF_LINK_CREATE_LAST_FIELD link_create.flags
+ static int link_create(union bpf_attr *attr)
+ {
+@@ -3811,6 +3822,9 @@ static int link_create(union bpf_attr *attr)
+ 	case BPF_PROG_TYPE_CGROUP_SOCKOPT:
+ 		ret = cgroup_bpf_link_attach(attr, prog);
+ 		break;
++	case BPF_PROG_TYPE_TRACING:
++		ret = tracing_bpf_link_attach(attr, prog);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 	}
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index dd7b920a75cd..27260ef3c99d 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -227,6 +227,7 @@ enum bpf_link_type {
+ 	BPF_LINK_TYPE_RAW_TRACEPOINT = 1,
+ 	BPF_LINK_TYPE_TRACING = 2,
+ 	BPF_LINK_TYPE_CGROUP = 3,
++	BPF_LINK_TYPE_ITER = 4,
+ 
+ 	MAX_BPF_LINK_TYPE,
+ };
