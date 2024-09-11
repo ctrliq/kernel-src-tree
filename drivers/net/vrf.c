@@ -1279,6 +1279,7 @@ static void vrf_setup(struct net_device *dev)
 
 	/* default to no qdisc; user can add if desired */
 	dev->priv_flags |= IFF_NO_QUEUE;
+	dev->priv_flags |= IFF_NO_RX_HANDLER;
 
 	/* VRF devices do not care about MTU, but if the MTU is set
 	 * too low then the ipv4 and ipv6 protocols are disabled
