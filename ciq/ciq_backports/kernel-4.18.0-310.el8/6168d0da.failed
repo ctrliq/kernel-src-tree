@@ -1,0 +1,805 @@
+mm/lru: replace pgdat lru_lock with lruvec lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Alex Shi <alex.shi@linux.alibaba.com>
+commit 6168d0da2b479ce25a4647de194045de1bdd1f1d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/6168d0da.failed
+
+This patch moves per node lru_lock into lruvec, thus bring a lru_lock for
+each of memcg per node.  So on a large machine, each of memcg don't have
+to suffer from per node pgdat->lru_lock competition.  They could go fast
+with their self lru_lock.
+
+After move memcg charge before lru inserting, page isolation could
+serialize page's memcg, then per memcg lruvec lock is stable and could
+replace per node lru lock.
+
+In isolate_migratepages_block(), compact_unlock_should_abort and
+lock_page_lruvec_irqsave are open coded to work with compact_control.
+Also add a debug func in locking which may give some clues if there are
+sth out of hands.
+
+Daniel Jordan's testing show 62% improvement on modified readtwice case on
+his 2P * 10 core * 2 HT broadwell box.
+https://lore.kernel.org/lkml/20200915165807.kpp7uhiw7l3loofu@ca-dmjordan1.us.oracle.com/
+
+Hugh Dickins helped on the patch polish, thanks!
+
+[alex.shi@linux.alibaba.com: fix comment typo]
+  Link: https://lkml.kernel.org/r/5b085715-292a-4b43-50b3-d73dc90d1de5@linux.alibaba.com
+[alex.shi@linux.alibaba.com: use page_memcg()]
+  Link: https://lkml.kernel.org/r/5a4c2b72-7ee8-2478-fc0e-85eb83aafec4@linux.alibaba.com
+
+Link: https://lkml.kernel.org/r/1604566549-62481-18-git-send-email-alex.shi@linux.alibaba.com
+	Signed-off-by: Alex Shi <alex.shi@linux.alibaba.com>
+	Acked-by: Hugh Dickins <hughd@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Rong Chen <rong.a.chen@intel.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Yang Shi <yang.shi@linux.alibaba.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Cc: Daniel Jordan <daniel.m.jordan@oracle.com>
+	Cc: Alexander Duyck <alexander.duyck@gmail.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: "Huang, Ying" <ying.huang@intel.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Kirill A. Shutemov <kirill@shutemov.name>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Mika Penttilä <mika.penttila@nextfour.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Wei Yang <richard.weiyang@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6168d0da2b479ce25a4647de194045de1bdd1f1d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/compaction.c
+#	mm/huge_memory.c
+#	mm/memcontrol.c
+#	mm/swap.c
+diff --cc mm/compaction.c
+index 99256f4bcb1a,e5acb9714436..000000000000
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@@ -971,10 -980,34 +979,37 @@@ isolate_migratepages_block(struct compa
+  		if (!(cc->gfp_mask & __GFP_FS) && page_mapping(page))
+  			goto isolate_fail;
+  
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * Be careful not to clear PageLRU until after we're
++ 		 * sure the page is not being freed elsewhere -- the
++ 		 * page release code relies on it.
++ 		 */
++ 		if (unlikely(!get_page_unless_zero(page)))
++ 			goto isolate_fail;
++ 
++ 		if (__isolate_lru_page_prepare(page, isolate_mode) != 0)
++ 			goto isolate_fail_put;
++ 
++ 		/* Try isolate the page */
++ 		if (!TestClearPageLRU(page))
++ 			goto isolate_fail_put;
++ 
++ 		rcu_read_lock();
++ 		lruvec = mem_cgroup_page_lruvec(page, pgdat);
++ 
+++>>>>>>> 6168d0da2b47 (mm/lru: replace pgdat lru_lock with lruvec lock)
+  		/* If we already hold the lock, we can skip some rechecking */
+- 		if (!locked) {
+- 			locked = compact_lock_irqsave(&pgdat->lru_lock,
+- 								&flags, cc);
++ 		if (lruvec != locked) {
++ 			if (locked)
++ 				unlock_page_lruvec_irqrestore(locked, flags);
++ 
++ 			compact_lock_irqsave(&lruvec->lru_lock, &flags, cc);
++ 			locked = lruvec;
++ 			rcu_read_unlock();
++ 
++ 			lruvec_memcg_debug(lruvec, page);
+  
+  			/* Try get exclusive access under lock */
+  			if (!skip_updated) {
+@@@ -992,19 -1021,17 +1027,18 @@@
+  			 * and it's on LRU. It can only be a THP so the order
+  			 * is safe to read and it's 0 for tail pages.
+  			 */
+ -			if (unlikely(PageCompound(page) && !cc->alloc_contig)) {
+ +			if (unlikely(PageCompound(page))) {
+  				low_pfn += compound_nr(page) - 1;
+ -				SetPageLRU(page);
+ -				goto isolate_fail_put;
+ +				goto isolate_fail;
+  			}
+- 		}
+- 
+- 		lruvec = mem_cgroup_page_lruvec(page, pgdat);
++ 		} else
++ 			rcu_read_unlock();
+  
+ -		/* The whole page is taken off the LRU; skip the tail pages. */
+ -		if (PageCompound(page))
+ -			low_pfn += compound_nr(page) - 1;
+ +		/* Try isolate the page */
+ +		if (__isolate_lru_page(page, isolate_mode) != 0)
+ +			goto isolate_fail;
+ +
+ +		VM_BUG_ON_PAGE(PageCompound(page), page);
+  
+  		/* Successfully isolated */
+  		del_page_from_lru_list(page, lruvec, page_lru(page));
+@@@ -1029,6 -1057,15 +1063,18 @@@ isolate_success
+  		}
+  
+  		continue;
+++<<<<<<< HEAD
+++=======
++ 
++ isolate_fail_put:
++ 		/* Avoid potential deadlock in freeing page under lru_lock */
++ 		if (locked) {
++ 			unlock_page_lruvec_irqrestore(locked, flags);
++ 			locked = NULL;
++ 		}
++ 		put_page(page);
++ 
+++>>>>>>> 6168d0da2b47 (mm/lru: replace pgdat lru_lock with lruvec lock)
+  isolate_fail:
+  		if (!skip_on_failure)
+  			continue;
+@@@ -1065,9 -1102,15 +1111,17 @@@
+  	if (unlikely(low_pfn > end_pfn))
+  		low_pfn = end_pfn;
+  
+ -	page = NULL;
+ -
+  isolate_abort:
+  	if (locked)
+++<<<<<<< HEAD
+ +		spin_unlock_irqrestore(&pgdat->lru_lock, flags);
+++=======
++ 		unlock_page_lruvec_irqrestore(locked, flags);
++ 	if (page) {
++ 		SetPageLRU(page);
++ 		put_page(page);
++ 	}
+++>>>>>>> 6168d0da2b47 (mm/lru: replace pgdat lru_lock with lruvec lock)
+  
+  	/*
+  	 * Updated the cached scanner pfn once the pageblock has been scanned
+diff --cc mm/huge_memory.c
+index f8f2e337b025,3c4a8fc9102f..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -2275,6 -2359,27 +2275,30 @@@ static void remap_page(struct page *pag
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void lru_add_page_tail(struct page *head, struct page *tail,
++ 		struct lruvec *lruvec, struct list_head *list)
++ {
++ 	VM_BUG_ON_PAGE(!PageHead(head), head);
++ 	VM_BUG_ON_PAGE(PageCompound(tail), head);
++ 	VM_BUG_ON_PAGE(PageLRU(tail), head);
++ 	lockdep_assert_held(&lruvec->lru_lock);
++ 
++ 	if (list) {
++ 		/* page reclaim is reclaiming a huge page */
++ 		VM_WARN_ON(PageLRU(head));
++ 		get_page(tail);
++ 		list_add_tail(&tail->lru, list);
++ 	} else {
++ 		/* head is still on lru (and we have it frozen) */
++ 		VM_WARN_ON(!PageLRU(head));
++ 		SetPageLRU(tail);
++ 		list_add_tail(&tail->lru, &head->lru);
++ 	}
++ }
++ 
+++>>>>>>> 6168d0da2b47 (mm/lru: replace pgdat lru_lock with lruvec lock)
+  static void __split_huge_page_tail(struct page *head, int tail,
+  		struct lruvec *lruvec, struct list_head *list)
+  {
+@@@ -2338,10 -2446,9 +2362,9 @@@
+  }
+  
+  static void __split_huge_page(struct page *page, struct list_head *list,
+ -		pgoff_t end)
+ +		pgoff_t end, unsigned long flags)
+  {
+  	struct page *head = compound_head(page);
+- 	pg_data_t *pgdat = page_pgdat(head);
+  	struct lruvec *lruvec;
+  	struct address_space *swap_cache = NULL;
+  	unsigned long offset = 0;
+@@@ -2360,7 -2466,10 +2383,14 @@@
+  		xa_lock(&swap_cache->i_pages);
+  	}
+  
+++<<<<<<< HEAD
+ +	for (i = HPAGE_PMD_NR - 1; i >= 1; i--) {
+++=======
++ 	/* lock lru list/PageCompound, ref freezed by page_ref_freeze */
++ 	lruvec = lock_page_lruvec(head);
++ 
++ 	for (i = nr - 1; i >= 1; i--) {
+++>>>>>>> 6168d0da2b47 (mm/lru: replace pgdat lru_lock with lruvec lock)
+  		__split_huge_page_tail(head, i, lruvec, list);
+  		/* Some pages can be beyond i_size: drop them from page cache */
+  		if (head[i].index >= end) {
+@@@ -2379,8 -2488,10 +2409,13 @@@
+  	}
+  
+  	ClearPageCompound(head);
+++<<<<<<< HEAD
+++=======
++ 	unlock_page_lruvec(lruvec);
++ 	/* Caller disabled irqs, so they are still disabled here */
+++>>>>>>> 6168d0da2b47 (mm/lru: replace pgdat lru_lock with lruvec lock)
+  
+ -	split_page_owner(head, nr);
+ +	split_page_owner(head, HPAGE_PMD_NR);
+  
+  	/* See comment in __split_huge_page_tail() */
+  	if (PageAnon(head)) {
+diff --cc mm/memcontrol.c
+index 14c9acf4cc04,2f7824d0c897..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -20,15 -21,8 +20,20 @@@
+   * Unified hierarchy configuration model
+   * Copyright (C) 2015 Red Hat, Inc., Johannes Weiner
+   *
+++<<<<<<< HEAD
+ + * This program is free software; you can redistribute it and/or modify
+ + * it under the terms of the GNU General Public License as published by
+ + * the Free Software Foundation; either version 2 of the License, or
+ + * (at your option) any later version.
+ + *
+ + * This program is distributed in the hope that it will be useful,
+ + * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ + * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ + * GNU General Public License for more details.
+++=======
++  * Per memcg lru locking
++  * Copyright (C) 2020 Alibaba, Inc, Alex Shi
+++>>>>>>> 6168d0da2b47 (mm/lru: replace pgdat lru_lock with lruvec lock)
+   */
+  
+  #include <linux/page_counter.h>
+diff --cc mm/swap.c
+index 2f51fb81ed79,ba9fc21b24ea..000000000000
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@@ -203,30 -202,33 +201,39 @@@ int get_kernel_page(unsigned long start
+  EXPORT_SYMBOL_GPL(get_kernel_page);
+  
+  static void pagevec_lru_move_fn(struct pagevec *pvec,
+ -	void (*move_fn)(struct page *page, struct lruvec *lruvec))
+ +	void (*move_fn)(struct page *page, struct lruvec *lruvec, void *arg),
+ +	void *arg)
+  {
+  	int i;
+- 	struct pglist_data *pgdat = NULL;
+- 	struct lruvec *lruvec;
++ 	struct lruvec *lruvec = NULL;
+  	unsigned long flags = 0;
+  
+  	for (i = 0; i < pagevec_count(pvec); i++) {
+  		struct page *page = pvec->pages[i];
+- 		struct pglist_data *pagepgdat = page_pgdat(page);
+- 
+- 		if (pagepgdat != pgdat) {
+- 			if (pgdat)
+- 				spin_unlock_irqrestore(&pgdat->lru_lock, flags);
+- 			pgdat = pagepgdat;
+- 			spin_lock_irqsave(&pgdat->lru_lock, flags);
+- 		}
++ 		struct lruvec *new_lruvec;
+  
+++<<<<<<< HEAD
+ +		lruvec = mem_cgroup_page_lruvec(page, pgdat);
+ +		(*move_fn)(page, lruvec, arg);
+++=======
++ 		/* block memcg migration during page moving between lru */
++ 		if (!TestClearPageLRU(page))
++ 			continue;
++ 
++ 		new_lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
++ 		if (lruvec != new_lruvec) {
++ 			if (lruvec)
++ 				unlock_page_lruvec_irqrestore(lruvec, flags);
++ 			lruvec = lock_page_lruvec_irqsave(page, &flags);
++ 		}
++ 
++ 		(*move_fn)(page, lruvec);
++ 
++ 		SetPageLRU(page);
+++>>>>>>> 6168d0da2b47 (mm/lru: replace pgdat lru_lock with lruvec lock)
+  	}
+- 	if (pgdat)
+- 		spin_unlock_irqrestore(&pgdat->lru_lock, flags);
++ 	if (lruvec)
++ 		unlock_page_lruvec_irqrestore(lruvec, flags);
+  	release_pages(pvec->pages, pvec->nr);
+  	pagevec_reinit(pvec);
+  }
+@@@ -370,19 -364,17 +383,28 @@@ static inline void activate_page_drain(
+  {
+  }
+  
+ -static void activate_page(struct page *page)
+ +static bool need_activate_page_drain(int cpu)
+ +{
+ +	return false;
+ +}
+ +
+ +void activate_page(struct page *page)
+  {
+- 	pg_data_t *pgdat = page_pgdat(page);
++ 	struct lruvec *lruvec;
+  
+  	page = compound_head(page);
+++<<<<<<< HEAD
+ +	spin_lock_irq(&pgdat->lru_lock);
+ +	__activate_page(page, mem_cgroup_page_lruvec(page, pgdat), NULL);
+ +	spin_unlock_irq(&pgdat->lru_lock);
+++=======
++ 	if (TestClearPageLRU(page)) {
++ 		lruvec = lock_page_lruvec_irq(page);
++ 		__activate_page(page, lruvec);
++ 		unlock_page_lruvec_irq(lruvec);
++ 		SetPageLRU(page);
++ 	}
+++>>>>>>> 6168d0da2b47 (mm/lru: replace pgdat lru_lock with lruvec lock)
+  }
+  #endif
+  
+@@@ -815,10 -864,9 +837,16 @@@ void release_pages(struct page **pages
+  {
+  	int i;
+  	LIST_HEAD(pages_to_free);
+++<<<<<<< HEAD
+ +	struct pglist_data *locked_pgdat = NULL;
+ +	struct lruvec *lruvec;
+ +	unsigned long uninitialized_var(flags);
+ +	unsigned int uninitialized_var(lock_batch);
+++=======
++ 	struct lruvec *lruvec = NULL;
++ 	unsigned long flags;
++ 	unsigned int lock_batch;
+++>>>>>>> 6168d0da2b47 (mm/lru: replace pgdat lru_lock with lruvec lock)
+  
+  	for (i = 0; i < nr; i++) {
+  		struct page *page = pages[i];
+@@@ -1013,7 -1027,27 +1040,31 @@@ static void __pagevec_lru_add_fn(struc
+   */
+  void __pagevec_lru_add(struct pagevec *pvec)
+  {
+++<<<<<<< HEAD
+ +	pagevec_lru_move_fn(pvec, __pagevec_lru_add_fn, NULL);
+++=======
++ 	int i;
++ 	struct lruvec *lruvec = NULL;
++ 	unsigned long flags = 0;
++ 
++ 	for (i = 0; i < pagevec_count(pvec); i++) {
++ 		struct page *page = pvec->pages[i];
++ 		struct lruvec *new_lruvec;
++ 
++ 		new_lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
++ 		if (lruvec != new_lruvec) {
++ 			if (lruvec)
++ 				unlock_page_lruvec_irqrestore(lruvec, flags);
++ 			lruvec = lock_page_lruvec_irqsave(page, &flags);
++ 		}
++ 
++ 		__pagevec_lru_add_fn(page, lruvec);
++ 	}
++ 	if (lruvec)
++ 		unlock_page_lruvec_irqrestore(lruvec, flags);
++ 	release_pages(pvec->pages, pvec->nr);
++ 	pagevec_reinit(pvec);
+++>>>>>>> 6168d0da2b47 (mm/lru: replace pgdat lru_lock with lruvec lock)
+  }
+  
+  /**
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index da9b4f3ccbfd..3b0ce57d006f 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -533,6 +533,19 @@ struct mem_cgroup *get_mem_cgroup_from_mm(struct mm_struct *mm);
+ 
+ struct mem_cgroup *get_mem_cgroup_from_page(struct page *page);
+ 
++struct lruvec *lock_page_lruvec(struct page *page);
++struct lruvec *lock_page_lruvec_irq(struct page *page);
++struct lruvec *lock_page_lruvec_irqsave(struct page *page,
++						unsigned long *flags);
++
++#ifdef CONFIG_DEBUG_VM
++void lruvec_memcg_debug(struct lruvec *lruvec, struct page *page);
++#else
++static inline void lruvec_memcg_debug(struct lruvec *lruvec, struct page *page)
++{
++}
++#endif
++
+ static inline
+ struct mem_cgroup *mem_cgroup_from_css(struct cgroup_subsys_state *css){
+ 	return css ? container_of(css, struct mem_cgroup, css) : NULL;
+@@ -1061,6 +1074,31 @@ static inline void mem_cgroup_put(struct mem_cgroup *memcg)
+ {
+ }
+ 
++static inline struct lruvec *lock_page_lruvec(struct page *page)
++{
++	struct pglist_data *pgdat = page_pgdat(page);
++
++	spin_lock(&pgdat->__lruvec.lru_lock);
++	return &pgdat->__lruvec;
++}
++
++static inline struct lruvec *lock_page_lruvec_irq(struct page *page)
++{
++	struct pglist_data *pgdat = page_pgdat(page);
++
++	spin_lock_irq(&pgdat->__lruvec.lru_lock);
++	return &pgdat->__lruvec;
++}
++
++static inline struct lruvec *lock_page_lruvec_irqsave(struct page *page,
++		unsigned long *flagsp)
++{
++	struct pglist_data *pgdat = page_pgdat(page);
++
++	spin_lock_irqsave(&pgdat->__lruvec.lru_lock, *flagsp);
++	return &pgdat->__lruvec;
++}
++
+ static inline struct mem_cgroup *
+ mem_cgroup_iter(struct mem_cgroup *root,
+ 		struct mem_cgroup *prev,
+@@ -1300,6 +1338,10 @@ static inline
+ void count_memcg_event_mm(struct mm_struct *mm, enum vm_event_item idx)
+ {
+ }
++
++static inline void lruvec_memcg_debug(struct lruvec *lruvec, struct page *page)
++{
++}
+ #endif /* CONFIG_MEMCG */
+ 
+ /* idx can be of type enum memcg_stat_item or node_stat_item */
+@@ -1429,6 +1471,22 @@ static inline struct lruvec *parent_lruvec(struct lruvec *lruvec)
+ 	return mem_cgroup_lruvec(memcg, lruvec_pgdat(lruvec));
+ }
+ 
++static inline void unlock_page_lruvec(struct lruvec *lruvec)
++{
++	spin_unlock(&lruvec->lru_lock);
++}
++
++static inline void unlock_page_lruvec_irq(struct lruvec *lruvec)
++{
++	spin_unlock_irq(&lruvec->lru_lock);
++}
++
++static inline void unlock_page_lruvec_irqrestore(struct lruvec *lruvec,
++		unsigned long flags)
++{
++	spin_unlock_irqrestore(&lruvec->lru_lock, flags);
++}
++
+ #ifdef CONFIG_CGROUP_WRITEBACK
+ 
+ struct wb_domain *mem_cgroup_wb_domain(struct bdi_writeback *wb);
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index ae118ed2cb9b..c5e109fcb9d7 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -289,6 +289,8 @@ enum lruvec_flags {
+ 
+ struct lruvec {
+ 	struct list_head		lists[NR_LRU_LISTS];
++	/* per lruvec lru_lock for memcg */
++	spinlock_t			lru_lock;
+ 	/*
+ 	 * These track the cost of reclaiming one LRU - file or anon -
+ 	 * over the other. As the observed cost of reclaiming one LRU
+@@ -778,7 +780,6 @@ typedef struct pglist_data {
+ 
+ 	/* Write-intensive fields used by page reclaim */
+ 	ZONE_PADDING(_pad1_)
+-	spinlock_t		lru_lock;
+ 
+ #ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
+ 	/*
+* Unmerged path mm/compaction.c
+* Unmerged path mm/huge_memory.c
+* Unmerged path mm/memcontrol.c
+diff --git a/mm/mlock.c b/mm/mlock.c
+index f2110b001c21..c6961c2959c8 100644
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@ -262,12 +262,12 @@ static void __munlock_pagevec(struct pagevec *pvec, struct zone *zone)
+ 	int nr = pagevec_count(pvec);
+ 	int delta_munlocked = -nr;
+ 	struct pagevec pvec_putback;
++	struct lruvec *lruvec = NULL;
+ 	int pgrescued = 0;
+ 
+ 	pagevec_init(&pvec_putback);
+ 
+ 	/* Phase 1: page isolation */
+-	spin_lock_irq(&zone->zone_pgdat->lru_lock);
+ 	for (i = 0; i < nr; i++) {
+ 		struct page *page = pvec->pages[i];
+ 
+@@ -277,10 +277,16 @@ static void __munlock_pagevec(struct pagevec *pvec, struct zone *zone)
+ 			 * so we can spare the get_page() here.
+ 			 */
+ 			if (TestClearPageLRU(page)) {
+-				struct lruvec *lruvec;
++				struct lruvec *new_lruvec;
++
++				new_lruvec = mem_cgroup_page_lruvec(page,
++						page_pgdat(page));
++				if (new_lruvec != lruvec) {
++					if (lruvec)
++						unlock_page_lruvec_irq(lruvec);
++					lruvec = lock_page_lruvec_irq(page);
++				}
+ 
+-				lruvec = mem_cgroup_page_lruvec(page,
+-							page_pgdat(page));
+ 				del_page_from_lru_list(page, lruvec,
+ 							page_lru(page));
+ 				continue;
+@@ -299,8 +305,12 @@ static void __munlock_pagevec(struct pagevec *pvec, struct zone *zone)
+ 		pagevec_add(&pvec_putback, pvec->pages[i]);
+ 		pvec->pages[i] = NULL;
+ 	}
+-	__mod_zone_page_state(zone, NR_MLOCK, delta_munlocked);
+-	spin_unlock_irq(&zone->zone_pgdat->lru_lock);
++	if (lruvec) {
++		__mod_zone_page_state(zone, NR_MLOCK, delta_munlocked);
++		unlock_page_lruvec_irq(lruvec);
++	} else if (delta_munlocked) {
++		mod_zone_page_state(zone, NR_MLOCK, delta_munlocked);
++	}
+ 
+ 	/* Now we can release pins of pages that we are not munlocking */
+ 	pagevec_release(&pvec_putback);
+diff --git a/mm/mmzone.c b/mm/mmzone.c
+index 4686fdc23bb9..3750a90ed4a0 100644
+--- a/mm/mmzone.c
++++ b/mm/mmzone.c
+@@ -91,6 +91,7 @@ void lruvec_init(struct lruvec *lruvec)
+ 	enum lru_list lru;
+ 
+ 	memset(lruvec, 0, sizeof(struct lruvec));
++	spin_lock_init(&lruvec->lru_lock);
+ 
+ 	for_each_lru(lru)
+ 		INIT_LIST_HEAD(&lruvec->lists[lru]);
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 8c7425895151..23107337418f 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -6734,7 +6734,6 @@ static void __meminit pgdat_init_internals(struct pglist_data *pgdat)
+ 	init_waitqueue_head(&pgdat->pfmemalloc_wait);
+ 
+ 	pgdat_page_ext_init(pgdat);
+-	spin_lock_init(&pgdat->lru_lock);
+ 	lruvec_init(&pgdat->__lruvec);
+ }
+ 
+* Unmerged path mm/swap.c
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 2bebcfe61497..60c4efcaab9d 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1770,14 +1770,12 @@ int isolate_lru_page(struct page *page)
+ 	WARN_RATELIMIT(PageTail(page), "trying to isolate tail page");
+ 
+ 	if (TestClearPageLRU(page)) {
+-		pg_data_t *pgdat = page_pgdat(page);
+ 		struct lruvec *lruvec;
+ 
+ 		get_page(page);
+-		lruvec = mem_cgroup_page_lruvec(page, pgdat);
+-		spin_lock_irq(&pgdat->lru_lock);
++		lruvec = lock_page_lruvec_irq(page);
+ 		del_page_from_lru_list(page, lruvec, page_lru(page));
+-		spin_unlock_irq(&pgdat->lru_lock);
++		unlock_page_lruvec_irq(lruvec);
+ 		ret = 0;
+ 	}
+ 
+@@ -1844,7 +1842,6 @@ static int too_many_isolated(struct pglist_data *pgdat, int file,
+ static unsigned noinline_for_stack move_pages_to_lru(struct lruvec *lruvec,
+ 						     struct list_head *list)
+ {
+-	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+ 	int nr_pages, nr_moved = 0;
+ 	LIST_HEAD(pages_to_free);
+ 	struct page *page;
+@@ -1855,9 +1852,9 @@ static unsigned noinline_for_stack move_pages_to_lru(struct lruvec *lruvec,
+ 		VM_BUG_ON_PAGE(PageLRU(page), page);
+ 		list_del(&page->lru);
+ 		if (unlikely(!page_evictable(page))) {
+-			spin_unlock_irq(&pgdat->lru_lock);
++			spin_unlock_irq(&lruvec->lru_lock);
+ 			putback_lru_page(page);
+-			spin_lock_irq(&pgdat->lru_lock);
++			spin_lock_irq(&lruvec->lru_lock);
+ 			continue;
+ 		}
+ 
+@@ -1879,9 +1876,9 @@ static unsigned noinline_for_stack move_pages_to_lru(struct lruvec *lruvec,
+ 			__ClearPageActive(page);
+ 
+ 			if (unlikely(PageCompound(page))) {
+-				spin_unlock_irq(&pgdat->lru_lock);
++				spin_unlock_irq(&lruvec->lru_lock);
+ 				destroy_compound_page(page);
+-				spin_lock_irq(&pgdat->lru_lock);
++				spin_lock_irq(&lruvec->lru_lock);
+ 			} else
+ 				list_add(&page->lru, &pages_to_free);
+ 
+@@ -1958,7 +1955,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 
+ 	lru_add_drain();
+ 
+-	spin_lock_irq(&pgdat->lru_lock);
++	spin_lock_irq(&lruvec->lru_lock);
+ 
+ 	nr_taken = isolate_lru_pages(nr_to_scan, lruvec, &page_list,
+ 				     &nr_scanned, sc, lru);
+@@ -1970,7 +1967,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 	__count_memcg_events(lruvec_memcg(lruvec), item, nr_scanned);
+ 	__count_vm_events(PGSCAN_ANON + file, nr_scanned);
+ 
+-	spin_unlock_irq(&pgdat->lru_lock);
++	spin_unlock_irq(&lruvec->lru_lock);
+ 
+ 	if (nr_taken == 0)
+ 		return 0;
+@@ -1978,7 +1975,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 	nr_reclaimed = shrink_page_list(&page_list, pgdat, sc, 0,
+ 				&stat, false);
+ 
+-	spin_lock_irq(&pgdat->lru_lock);
++	spin_lock_irq(&lruvec->lru_lock);
+ 	move_pages_to_lru(lruvec, &page_list);
+ 
+ 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+@@ -1987,7 +1984,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 		__count_vm_events(item, nr_reclaimed);
+ 	__count_memcg_events(lruvec_memcg(lruvec), item, nr_reclaimed);
+ 	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
+-	spin_unlock_irq(&pgdat->lru_lock);
++	spin_unlock_irq(&lruvec->lru_lock);
+ 
+ 	lru_note_cost(lruvec, file, stat.nr_pageout);
+ 	mem_cgroup_uncharge_list(&page_list);
+@@ -2040,7 +2037,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
+ 
+ 	lru_add_drain();
+ 
+-	spin_lock_irq(&pgdat->lru_lock);
++	spin_lock_irq(&lruvec->lru_lock);
+ 
+ 	nr_taken = isolate_lru_pages(nr_to_scan, lruvec, &l_hold,
+ 				     &nr_scanned, sc, lru);
+@@ -2051,7 +2048,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
+ 		__count_vm_events(PGREFILL, nr_scanned);
+ 	__count_memcg_events(lruvec_memcg(lruvec), PGREFILL, nr_scanned);
+ 
+-	spin_unlock_irq(&pgdat->lru_lock);
++	spin_unlock_irq(&lruvec->lru_lock);
+ 
+ 	while (!list_empty(&l_hold)) {
+ 		cond_resched();
+@@ -2097,7 +2094,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
+ 	/*
+ 	 * Move pages back to the lru list.
+ 	 */
+-	spin_lock_irq(&pgdat->lru_lock);
++	spin_lock_irq(&lruvec->lru_lock);
+ 
+ 	nr_activate = move_pages_to_lru(lruvec, &l_active);
+ 	nr_deactivate = move_pages_to_lru(lruvec, &l_inactive);
+@@ -2108,7 +2105,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
+ 	__count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE, nr_deactivate);
+ 
+ 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+-	spin_unlock_irq(&pgdat->lru_lock);
++	spin_unlock_irq(&lruvec->lru_lock);
+ 
+ 	mem_cgroup_uncharge_list(&l_active);
+ 	free_unref_page_list(&l_active);
+@@ -2699,10 +2696,10 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+ 	/*
+ 	 * Determine the scan balance between anon and file LRUs.
+ 	 */
+-	spin_lock_irq(&pgdat->lru_lock);
++	spin_lock_irq(&target_lruvec->lru_lock);
+ 	sc->anon_cost = target_lruvec->anon_cost;
+ 	sc->file_cost = target_lruvec->file_cost;
+-	spin_unlock_irq(&pgdat->lru_lock);
++	spin_unlock_irq(&target_lruvec->lru_lock);
+ 
+ 	/*
+ 	 * Target desirable inactive:active list ratios for the anon
+@@ -4278,16 +4275,15 @@ int node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned int order)
+  */
+ void check_move_unevictable_pages(struct pagevec *pvec)
+ {
+-	struct lruvec *lruvec;
+-	struct pglist_data *pgdat = NULL;
++	struct lruvec *lruvec = NULL;
+ 	int pgscanned = 0;
+ 	int pgrescued = 0;
+ 	int i;
+ 
+ 	for (i = 0; i < pvec->nr; i++) {
+ 		struct page *page = pvec->pages[i];
+-		struct pglist_data *pagepgdat = page_pgdat(page);
+ 		int nr_pages;
++		struct lruvec *new_lruvec;
+ 
+ 		if (PageTransTail(page))
+ 			continue;
+@@ -4299,13 +4295,12 @@ void check_move_unevictable_pages(struct pagevec *pvec)
+ 		if (!TestClearPageLRU(page))
+ 			continue;
+ 
+-		if (pagepgdat != pgdat) {
+-			if (pgdat)
+-				spin_unlock_irq(&pgdat->lru_lock);
+-			pgdat = pagepgdat;
+-			spin_lock_irq(&pgdat->lru_lock);
++		new_lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
++		if (lruvec != new_lruvec) {
++			if (lruvec)
++				unlock_page_lruvec_irq(lruvec);
++			lruvec = lock_page_lruvec_irq(page);
+ 		}
+-		lruvec = mem_cgroup_page_lruvec(page, pgdat);
+ 
+ 		if (page_evictable(page) && PageUnevictable(page)) {
+ 			enum lru_list lru = page_lru_base_type(page);
+@@ -4319,10 +4314,10 @@ void check_move_unevictable_pages(struct pagevec *pvec)
+ 		SetPageLRU(page);
+ 	}
+ 
+-	if (pgdat) {
++	if (lruvec) {
+ 		__count_vm_events(UNEVICTABLE_PGRESCUED, pgrescued);
+ 		__count_vm_events(UNEVICTABLE_PGSCANNED, pgscanned);
+-		spin_unlock_irq(&pgdat->lru_lock);
++		unlock_page_lruvec_irq(lruvec);
+ 	} else if (pgscanned) {
+ 		count_vm_events(UNEVICTABLE_PGSCANNED, pgscanned);
+ 	}
