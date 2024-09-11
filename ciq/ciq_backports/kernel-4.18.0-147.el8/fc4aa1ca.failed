@@ -1,0 +1,219 @@
+net: vxlan: Free a leaked vetoed multicast rdst
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] vxlan: Free a leaked vetoed multicast rdst (Ivan Vecera) [1691695]
+Rebuild_FUZZ: 94.38%
+commit-author Petr Machata <petrm@mellanox.com>
+commit fc4aa1ca1628d31d1e2770b96a3bd8e25eef118d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/fc4aa1ca.failed
+
+When an rdst is rejected by a driver, the current code removes it from
+the remote list, but neglects to free it. This is triggered by
+tools/testing/selftests/drivers/net/mlxsw/vxlan_fdb_veto.sh and shows as
+the following kmemleak trace:
+
+unreferenced object 0xffff88817fa3d888 (size 96):
+  comm "softirq", pid 0, jiffies 4372702718 (age 165.252s)
+  hex dump (first 32 bytes):
+    02 00 00 00 c6 33 64 03 80 f5 a2 61 81 88 ff ff  .....3d....a....
+    06 df 71 ae ff ff ff ff 0c 00 00 00 04 d2 6a 6b  ..q...........jk
+  backtrace:
+    [<00000000296b27ac>] kmem_cache_alloc_trace+0x1ae/0x370
+    [<0000000075c86dc6>] vxlan_fdb_append.part.12+0x62/0x3b0 [vxlan]
+    [<00000000e0414b63>] vxlan_fdb_update+0xc61/0x1020 [vxlan]
+    [<00000000f330c4bd>] vxlan_fdb_add+0x2e8/0x3d0 [vxlan]
+    [<0000000008f81c2c>] rtnl_fdb_add+0x4c2/0xa10
+    [<00000000bdc4b270>] rtnetlink_rcv_msg+0x6dd/0x970
+    [<000000006701f2ce>] netlink_rcv_skb+0x290/0x410
+    [<00000000c08a5487>] rtnetlink_rcv+0x15/0x20
+    [<00000000d5f54b1e>] netlink_unicast+0x43f/0x5e0
+    [<00000000db4336bb>] netlink_sendmsg+0x789/0xcd0
+    [<00000000e1ee26b6>] sock_sendmsg+0xba/0x100
+    [<00000000ba409802>] ___sys_sendmsg+0x631/0x960
+    [<000000003c332113>] __sys_sendmsg+0xea/0x180
+    [<00000000f4139144>] __x64_sys_sendmsg+0x78/0xb0
+    [<000000006d1ddc59>] do_syscall_64+0x94/0x410
+    [<00000000c8defa9a>] entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+Move vxlan_dst_free() up and schedule a call thereof to plug this leak.
+
+Fixes: 61f46fe8c646 ("vxlan: Allow vetoing of FDB notifications")
+	Signed-off-by: Petr Machata <petrm@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fc4aa1ca1628d31d1e2770b96a3bd8e25eef118d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 36bd1c86ec20,c0cd1c022e77..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -942,11 -877,157 +942,160 @@@ static void vxlan_dst_free(struct rcu_h
+  	kfree(rd);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vxlan_fdb_update_existing(struct vxlan_dev *vxlan,
++ 				     union vxlan_addr *ip,
++ 				     __u16 state, __u16 flags,
++ 				     __be16 port, __be32 vni,
++ 				     __u32 ifindex, __u16 ndm_flags,
++ 				     struct vxlan_fdb *f,
++ 				     bool swdev_notify,
++ 				     struct netlink_ext_ack *extack)
++ {
++ 	__u16 fdb_flags = (ndm_flags & ~NTF_USE);
++ 	struct vxlan_rdst *rd = NULL;
++ 	struct vxlan_rdst oldrd;
++ 	int notify = 0;
++ 	int rc = 0;
++ 	int err;
++ 
++ 	/* Do not allow an externally learned entry to take over an entry added
++ 	 * by the user.
++ 	 */
++ 	if (!(fdb_flags & NTF_EXT_LEARNED) ||
++ 	    !(f->flags & NTF_VXLAN_ADDED_BY_USER)) {
++ 		if (f->state != state) {
++ 			f->state = state;
++ 			f->updated = jiffies;
++ 			notify = 1;
++ 		}
++ 		if (f->flags != fdb_flags) {
++ 			f->flags = fdb_flags;
++ 			f->updated = jiffies;
++ 			notify = 1;
++ 		}
++ 	}
++ 
++ 	if ((flags & NLM_F_REPLACE)) {
++ 		/* Only change unicasts */
++ 		if (!(is_multicast_ether_addr(f->eth_addr) ||
++ 		      is_zero_ether_addr(f->eth_addr))) {
++ 			rc = vxlan_fdb_replace(f, ip, port, vni,
++ 					       ifindex, &oldrd);
++ 			notify |= rc;
++ 		} else {
++ 			return -EOPNOTSUPP;
++ 		}
++ 	}
++ 	if ((flags & NLM_F_APPEND) &&
++ 	    (is_multicast_ether_addr(f->eth_addr) ||
++ 	     is_zero_ether_addr(f->eth_addr))) {
++ 		rc = vxlan_fdb_append(f, ip, port, vni, ifindex, &rd);
++ 
++ 		if (rc < 0)
++ 			return rc;
++ 		notify |= rc;
++ 	}
++ 
++ 	if (ndm_flags & NTF_USE)
++ 		f->used = jiffies;
++ 
++ 	if (notify) {
++ 		if (rd == NULL)
++ 			rd = first_remote_rtnl(f);
++ 
++ 		err = vxlan_fdb_notify(vxlan, f, rd, RTM_NEWNEIGH,
++ 				       swdev_notify, extack);
++ 		if (err)
++ 			goto err_notify;
++ 	}
++ 
++ 	return 0;
++ 
++ err_notify:
++ 	if ((flags & NLM_F_REPLACE) && rc)
++ 		*rd = oldrd;
++ 	else if ((flags & NLM_F_APPEND) && rc) {
++ 		list_del_rcu(&rd->list);
++ 		call_rcu(&rd->rcu, vxlan_dst_free);
++ 	}
++ 	return err;
++ }
++ 
++ static int vxlan_fdb_update_create(struct vxlan_dev *vxlan,
++ 				   const u8 *mac, union vxlan_addr *ip,
++ 				   __u16 state, __u16 flags,
++ 				   __be16 port, __be32 src_vni, __be32 vni,
++ 				   __u32 ifindex, __u16 ndm_flags,
++ 				   bool swdev_notify,
++ 				   struct netlink_ext_ack *extack)
++ {
++ 	__u16 fdb_flags = (ndm_flags & ~NTF_USE);
++ 	struct vxlan_fdb *f;
++ 	int rc;
++ 
++ 	/* Disallow replace to add a multicast entry */
++ 	if ((flags & NLM_F_REPLACE) &&
++ 	    (is_multicast_ether_addr(mac) || is_zero_ether_addr(mac)))
++ 		return -EOPNOTSUPP;
++ 
++ 	netdev_dbg(vxlan->dev, "add %pM -> %pIS\n", mac, ip);
++ 	rc = vxlan_fdb_create(vxlan, mac, ip, state, port, src_vni,
++ 			      vni, ifindex, fdb_flags, &f);
++ 	if (rc < 0)
++ 		return rc;
++ 
++ 	rc = vxlan_fdb_notify(vxlan, f, first_remote_rtnl(f), RTM_NEWNEIGH,
++ 			      swdev_notify, extack);
++ 	if (rc)
++ 		goto err_notify;
++ 
++ 	return 0;
++ 
++ err_notify:
++ 	vxlan_fdb_destroy(vxlan, f, false, false);
++ 	return rc;
++ }
++ 
++ /* Add new entry to forwarding table -- assumes lock held */
++ static int vxlan_fdb_update(struct vxlan_dev *vxlan,
++ 			    const u8 *mac, union vxlan_addr *ip,
++ 			    __u16 state, __u16 flags,
++ 			    __be16 port, __be32 src_vni, __be32 vni,
++ 			    __u32 ifindex, __u16 ndm_flags,
++ 			    bool swdev_notify,
++ 			    struct netlink_ext_ack *extack)
++ {
++ 	struct vxlan_fdb *f;
++ 
++ 	f = __vxlan_find_mac(vxlan, mac, src_vni);
++ 	if (f) {
++ 		if (flags & NLM_F_EXCL) {
++ 			netdev_dbg(vxlan->dev,
++ 				   "lost race to create %pM\n", mac);
++ 			return -EEXIST;
++ 		}
++ 
++ 		return vxlan_fdb_update_existing(vxlan, ip, state, flags, port,
++ 						 vni, ifindex, ndm_flags, f,
++ 						 swdev_notify, extack);
++ 	} else {
++ 		if (!(flags & NLM_F_CREATE))
++ 			return -ENOENT;
++ 
++ 		return vxlan_fdb_update_create(vxlan, mac, ip, state, flags,
++ 					       port, src_vni, vni, ifindex,
++ 					       ndm_flags, swdev_notify, extack);
++ 	}
++ }
++ 
+++>>>>>>> fc4aa1ca1628 (net: vxlan: Free a leaked vetoed multicast rdst)
+  static void vxlan_fdb_dst_destroy(struct vxlan_dev *vxlan, struct vxlan_fdb *f,
+ -				  struct vxlan_rdst *rd, bool swdev_notify)
+ +				  struct vxlan_rdst *rd)
+  {
+  	list_del_rcu(&rd->list);
+ -	vxlan_fdb_notify(vxlan, f, rd, RTM_DELNEIGH, swdev_notify, NULL);
+ +	vxlan_fdb_notify(vxlan, f, rd, RTM_DELNEIGH);
+  	call_rcu(&rd->rcu, vxlan_dst_free);
+  }
+  
+* Unmerged path drivers/net/vxlan.c
