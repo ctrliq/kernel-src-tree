@@ -1,0 +1,310 @@
+vfio/mdev: Synchronize device create/remove with parent removal
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Parav Pandit <parav@mellanox.com>
+commit 5715c4dd66a315515eedef3fc4cbe1bf4620f009
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5715c4dd.failed
+
+In following sequences, child devices created while removing mdev parent
+device can be left out, or it may lead to race of removing half
+initialized child mdev devices.
+
+issue-1:
+--------
+       cpu-0                         cpu-1
+       -----                         -----
+                                  mdev_unregister_device()
+                                    device_for_each_child()
+                                      mdev_device_remove_cb()
+                                        mdev_device_remove()
+create_store()
+  mdev_device_create()                   [...]
+    device_add()
+                                  parent_remove_sysfs_files()
+
+/* BUG: device added by cpu-0
+ * whose parent is getting removed
+ * and it won't process this mdev.
+ */
+
+issue-2:
+--------
+Below crash is observed when user initiated remove is in progress
+and mdev_unregister_driver() completes parent unregistration.
+
+       cpu-0                         cpu-1
+       -----                         -----
+remove_store()
+   mdev_device_remove()
+   active = false;
+                                  mdev_unregister_device()
+                                  parent device removed.
+   [...]
+   parents->ops->remove()
+ /*
+  * BUG: Accessing invalid parent.
+  */
+
+This is similar race like create() racing with mdev_unregister_device().
+
+BUG: unable to handle kernel paging request at ffffffffc0585668
+PGD e8f618067 P4D e8f618067 PUD e8f61a067 PMD 85adca067 PTE 0
+Oops: 0000 [#1] SMP PTI
+CPU: 41 PID: 37403 Comm: bash Kdump: loaded Not tainted 5.1.0-rc6-vdevbus+ #6
+Hardware name: Supermicro SYS-6028U-TR4+/X10DRU-i+, BIOS 2.0b 08/09/2016
+RIP: 0010:mdev_device_remove+0xfa/0x140 [mdev]
+Call Trace:
+ remove_store+0x71/0x90 [mdev]
+ kernfs_fop_write+0x113/0x1a0
+ vfs_write+0xad/0x1b0
+ ksys_write+0x5a/0xe0
+ do_syscall_64+0x5a/0x210
+ entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+Therefore, mdev core is improved as below to overcome above issues.
+
+Wait for any ongoing mdev create() and remove() to finish before
+unregistering parent device.
+This continues to allow multiple create and remove to progress in
+parallel for different mdev devices as most common case.
+At the same time guard parent removal while parent is being accessed by
+create() and remove() callbacks.
+create()/remove() and unregister_device() are synchronized by the rwsem.
+
+Refactor device removal code to mdev_device_remove_common() to avoid
+acquiring unreg_sem of the parent.
+
+Fixes: 7b96953bc640 ("vfio: Mediated device Core driver")
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 5715c4dd66a315515eedef3fc4cbe1bf4620f009)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/mdev/mdev_core.c
+diff --cc drivers/vfio/mdev/mdev_core.c
+index 8f5c5a01f6de,ae23151442cb..000000000000
+--- a/drivers/vfio/mdev/mdev_core.c
++++ b/drivers/vfio/mdev/mdev_core.c
+@@@ -103,56 -102,35 +103,86 @@@ static inline void mdev_put_parent(stru
+  		kref_put(&parent->ref, mdev_release_parent);
+  }
+  
+++<<<<<<< HEAD
+ +static int mdev_device_create_ops(struct kobject *kobj,
+ +				  struct mdev_device *mdev)
+ +{
+ +	struct mdev_parent *parent = mdev->parent;
+ +	int ret;
+ +
+ +	ret = parent->ops->create(kobj, mdev);
+ +	if (ret)
+ +		return ret;
+ +
+ +	ret = sysfs_create_groups(&mdev->dev.kobj,
+ +				  parent->ops->mdev_attr_groups);
+ +	if (ret)
+ +		parent->ops->remove(mdev);
+ +
+ +	return ret;
+ +}
+ +
+ +/*
+ + * mdev_device_remove_ops gets called from sysfs's 'remove' and when parent
+ + * device is being unregistered from mdev device framework.
+ + * - 'force_remove' is set to 'false' when called from sysfs's 'remove' which
+ + *   indicates that if the mdev device is active, used by VMM or userspace
+ + *   application, vendor driver could return error then don't remove the device.
+ + * - 'force_remove' is set to 'true' when called from mdev_unregister_device()
+ + *   which indicate that parent device is being removed from mdev device
+ + *   framework so remove mdev device forcefully.
+ + */
+ +static int mdev_device_remove_ops(struct mdev_device *mdev, bool force_remove)
+ +{
+ +	struct mdev_parent *parent = mdev->parent;
+ +	int ret;
+ +
+ +	/*
+ +	 * Vendor driver can return error if VMM or userspace application is
+ +	 * using this mdev device.
+ +	 */
+ +	ret = parent->ops->remove(mdev);
+ +	if (ret && !force_remove)
+ +		return ret;
+ +
+ +	sysfs_remove_groups(&mdev->dev.kobj, parent->ops->mdev_attr_groups);
+ +	return 0;
+++=======
++ /* Caller must hold parent unreg_sem read or write lock */
++ static void mdev_device_remove_common(struct mdev_device *mdev)
++ {
++ 	struct mdev_parent *parent;
++ 	struct mdev_type *type;
++ 	int ret;
++ 
++ 	type = to_mdev_type(mdev->type_kobj);
++ 	mdev_remove_sysfs_files(&mdev->dev, type);
++ 	device_del(&mdev->dev);
++ 	parent = mdev->parent;
++ 	lockdep_assert_held(&parent->unreg_sem);
++ 	ret = parent->ops->remove(mdev);
++ 	if (ret)
++ 		dev_err(&mdev->dev, "Remove failed: err=%d\n", ret);
++ 
++ 	/* Balances with device_initialize() */
++ 	put_device(&mdev->dev);
++ 	mdev_put_parent(parent);
+++>>>>>>> 5715c4dd66a3 (vfio/mdev: Synchronize device create/remove with parent removal)
+  }
+  
+  static int mdev_device_remove_cb(struct device *dev, void *data)
+  {
+++<<<<<<< HEAD
+ +	if (dev_is_mdev(dev))
+ +		mdev_device_remove(dev, true);
+++=======
++ 	if (dev_is_mdev(dev)) {
++ 		struct mdev_device *mdev;
+++>>>>>>> 5715c4dd66a3 (vfio/mdev: Synchronize device create/remove with parent removal)
+  
++ 		mdev = to_mdev_device(dev);
++ 		mdev_device_remove_common(mdev);
++ 	}
+  	return 0;
+  }
+  
+@@@ -275,7 -256,15 +308,19 @@@ static void mdev_device_free(struct mde
+  	kfree(mdev);
+  }
+  
+++<<<<<<< HEAD
+ +int mdev_device_create(struct kobject *kobj, struct device *dev, uuid_le uuid)
+++=======
++ static void mdev_device_release(struct device *dev)
++ {
++ 	struct mdev_device *mdev = to_mdev_device(dev);
++ 
++ 	mdev_device_free(mdev);
++ }
++ 
++ int mdev_device_create(struct kobject *kobj,
++ 		       struct device *dev, const guid_t *uuid)
+++>>>>>>> 5715c4dd66a3 (vfio/mdev: Synchronize device create/remove with parent removal)
+  {
+  	int ret;
+  	struct mdev_device *mdev, *tmp;
+@@@ -310,35 -299,46 +355,57 @@@
+  
+  	mdev->parent = parent;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Check if parent unregistration has started */
++ 	if (!down_read_trylock(&parent->unreg_sem)) {
++ 		mdev_device_free(mdev);
++ 		ret = -ENODEV;
++ 		goto mdev_fail;
++ 	}
++ 
++ 	device_initialize(&mdev->dev);
+++>>>>>>> 5715c4dd66a3 (vfio/mdev: Synchronize device create/remove with parent removal)
+  	mdev->dev.parent  = dev;
+  	mdev->dev.bus     = &mdev_bus_type;
+  	mdev->dev.release = mdev_device_release;
+ -	dev_set_name(&mdev->dev, "%pUl", uuid);
+ -	mdev->dev.groups = parent->ops->mdev_attr_groups;
+ -	mdev->type_kobj = kobj;
+ +	dev_set_name(&mdev->dev, "%pUl", uuid.b);
+  
+ -	ret = parent->ops->create(kobj, mdev);
+ -	if (ret)
+ -		goto ops_create_fail;
+ +	ret = device_register(&mdev->dev);
+ +	if (ret) {
+ +		put_device(&mdev->dev);
+ +		goto mdev_fail;
+ +	}
+  
+ -	ret = device_add(&mdev->dev);
+ +	ret = mdev_device_create_ops(kobj, mdev);
+  	if (ret)
+ -		goto add_fail;
+ +		goto create_fail;
+  
+  	ret = mdev_create_sysfs_files(&mdev->dev, type);
+ -	if (ret)
+ -		goto sysfs_fail;
+ +	if (ret) {
+ +		mdev_device_remove_ops(mdev, true);
+ +		goto create_fail;
+ +	}
+  
+ +	mdev->type_kobj = kobj;
+  	mdev->active = true;
+  	dev_dbg(&mdev->dev, "MDEV: created\n");
++ 	up_read(&parent->unreg_sem);
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+ +create_fail:
+ +	device_unregister(&mdev->dev);
+++=======
++ sysfs_fail:
++ 	device_del(&mdev->dev);
++ add_fail:
++ 	parent->ops->remove(mdev);
++ ops_create_fail:
++ 	up_read(&parent->unreg_sem);
++ 	put_device(&mdev->dev);
+++>>>>>>> 5715c4dd66a3 (vfio/mdev: Synchronize device create/remove with parent removal)
+  mdev_fail:
+  	mdev_put_parent(parent);
+  	return ret;
+@@@ -372,19 -370,13 +437,28 @@@ int mdev_device_remove(struct device *d
+  	mdev->active = false;
+  	mutex_unlock(&mdev_list_lock);
+  
+++<<<<<<< HEAD
+ +	type = to_mdev_type(mdev->type_kobj);
+ +	parent = mdev->parent;
+ +
+ +	ret = mdev_device_remove_ops(mdev, force_remove);
+ +	if (ret) {
+ +		mdev->active = true;
+ +		return ret;
+ +	}
+ +
+ +	mdev_remove_sysfs_files(dev, type);
+ +	device_unregister(dev);
+ +	mdev_put_parent(parent);
+++=======
++ 	parent = mdev->parent;
++ 	/* Check if parent unregistration has started */
++ 	if (!down_read_trylock(&parent->unreg_sem))
++ 		return -ENODEV;
+++>>>>>>> 5715c4dd66a3 (vfio/mdev: Synchronize device create/remove with parent removal)
+  
++ 	mdev_device_remove_common(mdev);
++ 	up_read(&parent->unreg_sem);
+  	return 0;
+  }
+  
+* Unmerged path drivers/vfio/mdev/mdev_core.c
+diff --git a/drivers/vfio/mdev/mdev_private.h b/drivers/vfio/mdev/mdev_private.h
+index 674b07b8b178..72b514da9204 100644
+--- a/drivers/vfio/mdev/mdev_private.h
++++ b/drivers/vfio/mdev/mdev_private.h
+@@ -23,6 +23,8 @@ struct mdev_parent {
+ 	struct list_head next;
+ 	struct kset *mdev_types_kset;
+ 	struct list_head type_list;
++	/* Synchronize device creation/removal with parent unregistration */
++	struct rw_semaphore unreg_sem;
+ };
+ 
+ struct mdev_device {
