@@ -1,0 +1,138 @@
+dma-direct: use dma_direct_map_page to implement dma_direct_map_sg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 17ac524719f3fc88c1a90528f4789e4b4f618512
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/17ac5247.failed
+
+No need to duplicate the mapping logic.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Tested-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Tested-by: Tony Luck <tony.luck@intel.com>
+(cherry picked from commit 17ac524719f3fc88c1a90528f4789e4b4f618512)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/dma/direct.c
+diff --cc kernel/dma/direct.c
+index a0ae9e05e04e,d45306473c90..000000000000
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@@ -133,10 -189,89 +133,93 @@@ void dma_direct_free(struct device *dev
+  
+  	if (force_dma_unencrypted())
+  		set_memory_encrypted((unsigned long)cpu_addr, 1 << page_order);
+ -	__dma_direct_free_pages(dev, size, virt_to_page(cpu_addr));
+ +	if (!dma_release_from_contiguous(dev, virt_to_page(cpu_addr), count))
+ +		free_pages((unsigned long)cpu_addr, page_order);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void *dma_direct_alloc(struct device *dev, size_t size,
++ 		dma_addr_t *dma_handle, gfp_t gfp, unsigned long attrs)
++ {
++ 	if (!dev_is_dma_coherent(dev))
++ 		return arch_dma_alloc(dev, size, dma_handle, gfp, attrs);
++ 	return dma_direct_alloc_pages(dev, size, dma_handle, gfp, attrs);
++ }
++ 
++ void dma_direct_free(struct device *dev, size_t size,
++ 		void *cpu_addr, dma_addr_t dma_addr, unsigned long attrs)
++ {
++ 	if (!dev_is_dma_coherent(dev))
++ 		arch_dma_free(dev, size, cpu_addr, dma_addr, attrs);
++ 	else
++ 		dma_direct_free_pages(dev, size, cpu_addr, dma_addr, attrs);
++ }
++ 
++ static void dma_direct_sync_single_for_device(struct device *dev,
++ 		dma_addr_t addr, size_t size, enum dma_data_direction dir)
++ {
++ 	if (dev_is_dma_coherent(dev))
++ 		return;
++ 	arch_sync_dma_for_device(dev, dma_to_phys(dev, addr), size, dir);
++ }
++ 
++ #if defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_DEVICE)
++ static void dma_direct_sync_sg_for_device(struct device *dev,
++ 		struct scatterlist *sgl, int nents, enum dma_data_direction dir)
++ {
++ 	struct scatterlist *sg;
++ 	int i;
++ 
++ 	if (dev_is_dma_coherent(dev))
++ 		return;
++ 
++ 	for_each_sg(sgl, sg, nents, i)
++ 		arch_sync_dma_for_device(dev, sg_phys(sg), sg->length, dir);
++ }
++ #endif
++ 
++ #if defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU) || \
++     defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU_ALL)
++ static void dma_direct_sync_single_for_cpu(struct device *dev,
++ 		dma_addr_t addr, size_t size, enum dma_data_direction dir)
++ {
++ 	if (dev_is_dma_coherent(dev))
++ 		return;
++ 	arch_sync_dma_for_cpu(dev, dma_to_phys(dev, addr), size, dir);
++ 	arch_sync_dma_for_cpu_all(dev);
++ }
++ 
++ static void dma_direct_sync_sg_for_cpu(struct device *dev,
++ 		struct scatterlist *sgl, int nents, enum dma_data_direction dir)
++ {
++ 	struct scatterlist *sg;
++ 	int i;
++ 
++ 	if (dev_is_dma_coherent(dev))
++ 		return;
++ 
++ 	for_each_sg(sgl, sg, nents, i)
++ 		arch_sync_dma_for_cpu(dev, sg_phys(sg), sg->length, dir);
++ 	arch_sync_dma_for_cpu_all(dev);
++ }
++ 
++ static void dma_direct_unmap_page(struct device *dev, dma_addr_t addr,
++ 		size_t size, enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
++ 		dma_direct_sync_single_for_cpu(dev, addr, size, dir);
++ }
++ 
++ static void dma_direct_unmap_sg(struct device *dev, struct scatterlist *sgl,
++ 		int nents, enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
++ 		dma_direct_sync_sg_for_cpu(dev, sgl, nents, dir);
++ }
++ #endif
++ 
+++>>>>>>> 17ac524719f3 (dma-direct: use dma_direct_map_page to implement dma_direct_map_sg)
+  dma_addr_t dma_direct_map_page(struct device *dev, struct page *page,
+  		unsigned long offset, size_t size, enum dma_data_direction dir,
+  		unsigned long attrs)
+@@@ -155,10 -296,9 +238,16 @@@ int dma_direct_map_sg(struct device *de
+  	struct scatterlist *sg;
+  
+  	for_each_sg(sgl, sg, nents, i) {
+++<<<<<<< HEAD
+ +		BUG_ON(!sg_page(sg));
+ +
+ +		sg_dma_address(sg) = phys_to_dma(dev, sg_phys(sg));
+ +		if (!check_addr(dev, sg_dma_address(sg), sg->length, __func__))
+++=======
++ 		sg->dma_address = dma_direct_map_page(dev, sg_page(sg),
++ 				sg->offset, sg->length, dir, attrs);
++ 		if (sg->dma_address == DMA_MAPPING_ERROR)
+++>>>>>>> 17ac524719f3 (dma-direct: use dma_direct_map_page to implement dma_direct_map_sg)
+  			return 0;
+  		sg_dma_len(sg) = sg->length;
+  	}
+* Unmerged path kernel/dma/direct.c
