@@ -1,0 +1,317 @@
+xfs: merge the projid fields in struct xfs_icdinode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit de7a866fd41b227b0aa6e9cbeb0dae221c12f542
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/de7a866f.failed
+
+There is no point in splitting the fields like this in an purely
+in-memory structure.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit de7a866fd41b227b0aa6e9cbeb0dae221c12f542)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_ioctl.c
+diff --cc fs/xfs/xfs_ioctl.c
+index 188424666f9f,bf1f3fceb7f1..000000000000
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@@ -1129,6 -1059,34 +1129,37 @@@ xfs_di2lxflags
+  	return flags;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ xfs_fill_fsxattr(
++ 	struct xfs_inode	*ip,
++ 	bool			attr,
++ 	struct fsxattr		*fa)
++ {
++ 	simple_fill_fsxattr(fa, xfs_ip2xflags(ip));
++ 	fa->fsx_extsize = ip->i_d.di_extsize << ip->i_mount->m_sb.sb_blocklog;
++ 	fa->fsx_cowextsize = ip->i_d.di_cowextsize <<
++ 			ip->i_mount->m_sb.sb_blocklog;
++ 	fa->fsx_projid = ip->i_d.di_projid;
++ 
++ 	if (attr) {
++ 		if (ip->i_afp) {
++ 			if (ip->i_afp->if_flags & XFS_IFEXTENTS)
++ 				fa->fsx_nextents = xfs_iext_count(ip->i_afp);
++ 			else
++ 				fa->fsx_nextents = ip->i_d.di_anextents;
++ 		} else
++ 			fa->fsx_nextents = 0;
++ 	} else {
++ 		if (ip->i_df.if_flags & XFS_IFEXTENTS)
++ 			fa->fsx_nextents = xfs_iext_count(&ip->i_df);
++ 		else
++ 			fa->fsx_nextents = ip->i_d.di_nextents;
++ 	}
++ }
++ 
+++>>>>>>> de7a866fd41b (xfs: merge the projid fields in struct xfs_icdinode)
+  STATIC int
+  xfs_ioc_fsgetxattr(
+  	xfs_inode_t		*ip,
+@@@ -1619,9 -1520,8 +1650,9 @@@ xfs_ioctl_setattr
+  		goto error_free_dquots;
+  	}
+  
+ +
+  	if (XFS_IS_QUOTA_RUNNING(mp) && XFS_IS_PQUOTA_ON(mp) &&
+- 	    xfs_get_projid(ip) != fa->fsx_projid) {
++ 	    ip->i_d.di_projid != fa->fsx_projid) {
+  		code = xfs_qm_vop_chown_reserve(tp, ip, udqp, NULL, pdqp,
+  				capable(CAP_FOWNER) ?  XFS_QMOPT_FORCE_RES : 0);
+  		if (code)	/* out of quota */
+diff --git a/fs/xfs/libxfs/xfs_inode_buf.c b/fs/xfs/libxfs/xfs_inode_buf.c
+index d31156718b20..019c9be677cc 100644
+--- a/fs/xfs/libxfs/xfs_inode_buf.c
++++ b/fs/xfs/libxfs/xfs_inode_buf.c
+@@ -213,13 +213,12 @@ xfs_inode_from_disk(
+ 	to->di_version = from->di_version;
+ 	if (to->di_version == 1) {
+ 		set_nlink(inode, be16_to_cpu(from->di_onlink));
+-		to->di_projid_lo = 0;
+-		to->di_projid_hi = 0;
++		to->di_projid = 0;
+ 		to->di_version = 2;
+ 	} else {
+ 		set_nlink(inode, be32_to_cpu(from->di_nlink));
+-		to->di_projid_lo = be16_to_cpu(from->di_projid_lo);
+-		to->di_projid_hi = be16_to_cpu(from->di_projid_hi);
++		to->di_projid = (prid_t)be16_to_cpu(from->di_projid_hi) << 16 |
++					be16_to_cpu(from->di_projid_lo);
+ 	}
+ 
+ 	to->di_format = from->di_format;
+@@ -279,8 +278,8 @@ xfs_inode_to_disk(
+ 	to->di_format = from->di_format;
+ 	to->di_uid = cpu_to_be32(from->di_uid);
+ 	to->di_gid = cpu_to_be32(from->di_gid);
+-	to->di_projid_lo = cpu_to_be16(from->di_projid_lo);
+-	to->di_projid_hi = cpu_to_be16(from->di_projid_hi);
++	to->di_projid_lo = cpu_to_be16(from->di_projid & 0xffff);
++	to->di_projid_hi = cpu_to_be16(from->di_projid >> 16);
+ 
+ 	memset(to->di_pad, 0, sizeof(to->di_pad));
+ 	to->di_atime.t_sec = cpu_to_be32(inode->i_atime.tv_sec);
+diff --git a/fs/xfs/libxfs/xfs_inode_buf.h b/fs/xfs/libxfs/xfs_inode_buf.h
+index c9ac69c82d21..fd94b1078722 100644
+--- a/fs/xfs/libxfs/xfs_inode_buf.h
++++ b/fs/xfs/libxfs/xfs_inode_buf.h
+@@ -21,8 +21,7 @@ struct xfs_icdinode {
+ 	uint16_t	di_flushiter;	/* incremented on flush */
+ 	uint32_t	di_uid;		/* owner's user id */
+ 	uint32_t	di_gid;		/* owner's group id */
+-	uint16_t	di_projid_lo;	/* lower part of owner's project id */
+-	uint16_t	di_projid_hi;	/* higher part of owner's project id */
++	uint32_t	di_projid;	/* owner's project id */
+ 	xfs_fsize_t	di_size;	/* number of bytes in file */
+ 	xfs_rfsblock_t	di_nblocks;	/* # of direct & btree blocks used */
+ 	xfs_extlen_t	di_extsize;	/* basic/minimum extent size for file */
+diff --git a/fs/xfs/xfs_dquot.c b/fs/xfs/xfs_dquot.c
+index b924dbd63a7d..c7ef1779a932 100644
+--- a/fs/xfs/xfs_dquot.c
++++ b/fs/xfs/xfs_dquot.c
+@@ -833,7 +833,7 @@ xfs_qm_id_for_quotatype(
+ 	case XFS_DQ_GROUP:
+ 		return ip->i_d.di_gid;
+ 	case XFS_DQ_PROJ:
+-		return xfs_get_projid(ip);
++		return ip->i_d.di_projid;
+ 	}
+ 	ASSERT(0);
+ 	return 0;
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 944add5ff8e0..ec302b7e48f3 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -1419,7 +1419,7 @@ xfs_inode_match_id(
+ 		return 0;
+ 
+ 	if ((eofb->eof_flags & XFS_EOF_FLAGS_PRID) &&
+-	    xfs_get_projid(ip) != eofb->eof_prid)
++	    ip->i_d.di_projid != eofb->eof_prid)
+ 		return 0;
+ 
+ 	return 1;
+@@ -1443,7 +1443,7 @@ xfs_inode_match_id_union(
+ 		return 1;
+ 
+ 	if ((eofb->eof_flags & XFS_EOF_FLAGS_PRID) &&
+-	    xfs_get_projid(ip) == eofb->eof_prid)
++	    ip->i_d.di_projid == eofb->eof_prid)
+ 		return 1;
+ 
+ 	return 0;
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 4a02e374d11e..a5733eb65eb3 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -815,7 +815,7 @@ xfs_ialloc(
+ 	ip->i_d.di_uid = xfs_kuid_to_uid(current_fsuid());
+ 	ip->i_d.di_gid = xfs_kgid_to_gid(current_fsgid());
+ 	inode->i_rdev = rdev;
+-	xfs_set_projid(ip, prid);
++	ip->i_d.di_projid = prid;
+ 
+ 	if (pip && XFS_INHERIT_GID(pip)) {
+ 		ip->i_d.di_gid = pip->i_d.di_gid;
+@@ -1423,7 +1423,7 @@ xfs_link(
+ 	 * the tree quota mechanism could be circumvented.
+ 	 */
+ 	if (unlikely((tdp->i_d.di_flags & XFS_DIFLAG_PROJINHERIT) &&
+-		     (xfs_get_projid(tdp) != xfs_get_projid(sip)))) {
++		     tdp->i_d.di_projid != sip->i_d.di_projid)) {
+ 		error = -EXDEV;
+ 		goto error_return;
+ 	}
+@@ -3276,7 +3276,7 @@ xfs_rename(
+ 	 * tree quota mechanism would be circumvented.
+ 	 */
+ 	if (unlikely((target_dp->i_d.di_flags & XFS_DIFLAG_PROJINHERIT) &&
+-		     (xfs_get_projid(target_dp) != xfs_get_projid(src_ip)))) {
++		     target_dp->i_d.di_projid != src_ip->i_d.di_projid)) {
+ 		error = -EXDEV;
+ 		goto out_trans_cancel;
+ 	}
+diff --git a/fs/xfs/xfs_inode.h b/fs/xfs/xfs_inode.h
+index 237a5948d3cd..5cfec47a4046 100644
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@ -174,30 +174,11 @@ xfs_iflags_test_and_set(xfs_inode_t *ip, unsigned short flags)
+ 	return ret;
+ }
+ 
+-/*
+- * Project quota id helpers (previously projid was 16bit only
+- * and using two 16bit values to hold new 32bit projid was chosen
+- * to retain compatibility with "old" filesystems).
+- */
+-static inline prid_t
+-xfs_get_projid(struct xfs_inode *ip)
+-{
+-	return (prid_t)ip->i_d.di_projid_hi << 16 | ip->i_d.di_projid_lo;
+-}
+-
+-static inline void
+-xfs_set_projid(struct xfs_inode *ip,
+-		prid_t projid)
+-{
+-	ip->i_d.di_projid_hi = (uint16_t) (projid >> 16);
+-	ip->i_d.di_projid_lo = (uint16_t) (projid & 0xffff);
+-}
+-
+ static inline prid_t
+ xfs_get_initial_prid(struct xfs_inode *dp)
+ {
+ 	if (dp->i_d.di_flags & XFS_DIFLAG_PROJINHERIT)
+-		return xfs_get_projid(dp);
++		return dp->i_d.di_projid;
+ 
+ 	return XFS_PROJID_DEFAULT;
+ }
+diff --git a/fs/xfs/xfs_inode_item.c b/fs/xfs/xfs_inode_item.c
+index a15db5d679ac..e6ffeb1b8a92 100644
+--- a/fs/xfs/xfs_inode_item.c
++++ b/fs/xfs/xfs_inode_item.c
+@@ -309,8 +309,8 @@ xfs_inode_to_log_dinode(
+ 	to->di_format = from->di_format;
+ 	to->di_uid = from->di_uid;
+ 	to->di_gid = from->di_gid;
+-	to->di_projid_lo = from->di_projid_lo;
+-	to->di_projid_hi = from->di_projid_hi;
++	to->di_projid_lo = from->di_projid & 0xffff;
++	to->di_projid_hi = from->di_projid >> 16;
+ 
+ 	memset(to->di_pad, 0, sizeof(to->di_pad));
+ 	memset(to->di_pad3, 0, sizeof(to->di_pad3));
+* Unmerged path fs/xfs/xfs_ioctl.c
+diff --git a/fs/xfs/xfs_iops.c b/fs/xfs/xfs_iops.c
+index 45a8f094a0e9..c3e0f8fcb760 100644
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@ -690,7 +690,7 @@ xfs_setattr_nonsize(
+ 		ASSERT(gdqp == NULL);
+ 		error = xfs_qm_vop_dqalloc(ip, xfs_kuid_to_uid(uid),
+ 					   xfs_kgid_to_gid(gid),
+-					   xfs_get_projid(ip),
++					   ip->i_d.di_projid,
+ 					   qflags, &udqp, &gdqp, NULL);
+ 		if (error)
+ 			return error;
+diff --git a/fs/xfs/xfs_itable.c b/fs/xfs/xfs_itable.c
+index 11771112a634..4b31c29b7e6b 100644
+--- a/fs/xfs/xfs_itable.c
++++ b/fs/xfs/xfs_itable.c
+@@ -84,7 +84,7 @@ xfs_bulkstat_one_int(
+ 	/* xfs_iget returns the following without needing
+ 	 * further change.
+ 	 */
+-	buf->bs_projectid = xfs_get_projid(ip);
++	buf->bs_projectid = ip->i_d.di_projid;
+ 	buf->bs_ino = ino;
+ 	buf->bs_uid = dic->di_uid;
+ 	buf->bs_gid = dic->di_gid;
+diff --git a/fs/xfs/xfs_qm.c b/fs/xfs/xfs_qm.c
+index ecd8ce152ab1..168f4ae4bdb8 100644
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@ -341,7 +341,7 @@ xfs_qm_dqattach_locked(
+ 	}
+ 
+ 	if (XFS_IS_PQUOTA_ON(mp) && !ip->i_pdquot) {
+-		error = xfs_qm_dqattach_one(ip, xfs_get_projid(ip), XFS_DQ_PROJ,
++		error = xfs_qm_dqattach_one(ip, ip->i_d.di_projid, XFS_DQ_PROJ,
+ 				doalloc, &ip->i_pdquot);
+ 		if (error)
+ 			goto done;
+@@ -1693,7 +1693,7 @@ xfs_qm_vop_dqalloc(
+ 		}
+ 	}
+ 	if ((flags & XFS_QMOPT_PQUOTA) && XFS_IS_PQUOTA_ON(mp)) {
+-		if (xfs_get_projid(ip) != prid) {
++		if (ip->i_d.di_projid != prid) {
+ 			xfs_iunlock(ip, lockflags);
+ 			error = xfs_qm_dqget(mp, (xfs_dqid_t)prid, XFS_DQ_PROJ,
+ 					true, &pq);
+@@ -1827,7 +1827,7 @@ xfs_qm_vop_chown_reserve(
+ 	}
+ 
+ 	if (XFS_IS_PQUOTA_ON(ip->i_mount) && pdqp &&
+-	    xfs_get_projid(ip) != be32_to_cpu(pdqp->q_core.d_id)) {
++	    ip->i_d.di_projid != be32_to_cpu(pdqp->q_core.d_id)) {
+ 		prjflags = XFS_QMOPT_ENOSPC;
+ 		pdq_delblks = pdqp;
+ 		if (delblks) {
+@@ -1928,7 +1928,7 @@ xfs_qm_vop_create_dqattach(
+ 	}
+ 	if (pdqp && XFS_IS_PQUOTA_ON(mp)) {
+ 		ASSERT(ip->i_pdquot == NULL);
+-		ASSERT(xfs_get_projid(ip) == be32_to_cpu(pdqp->q_core.d_id));
++		ASSERT(ip->i_d.di_projid == be32_to_cpu(pdqp->q_core.d_id));
+ 
+ 		ip->i_pdquot = xfs_qm_dqhold(pdqp);
+ 		xfs_trans_mod_dquot(tp, pdqp, XFS_TRANS_DQ_ICOUNT, 1);
+diff --git a/fs/xfs/xfs_qm_bhv.c b/fs/xfs/xfs_qm_bhv.c
+index 5d72e88598b4..ac8885d0f752 100644
+--- a/fs/xfs/xfs_qm_bhv.c
++++ b/fs/xfs/xfs_qm_bhv.c
+@@ -60,7 +60,7 @@ xfs_qm_statvfs(
+ 	xfs_mount_t		*mp = ip->i_mount;
+ 	xfs_dquot_t		*dqp;
+ 
+-	if (!xfs_qm_dqget(mp, xfs_get_projid(ip), XFS_DQ_PROJ, false, &dqp)) {
++	if (!xfs_qm_dqget(mp, ip->i_d.di_projid, XFS_DQ_PROJ, false, &dqp)) {
+ 		xfs_fill_statvfs_from_dquot(statp, dqp);
+ 		xfs_qm_dqput(dqp);
+ 	}
