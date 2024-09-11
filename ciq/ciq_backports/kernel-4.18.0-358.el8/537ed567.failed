@@ -1,0 +1,408 @@
+bridge: mrp: Implement the MRP Interconnect API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Horatiu Vultur <horatiu.vultur@microchip.com>
+commit 537ed5676d4648abc8ef75b5c04d773d961aee2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/537ed567.failed
+
+Thie patch adds support for MRP Interconnect. Similar with the MRP ring,
+if the HW can't generate MRP_InTest frames, then the SW will try to
+generate them. And if also the SW fails to generate the frames then an
+error is return to userspace.
+
+The forwarding/termination of MRP_In frames is happening in the kernel
+and is done by MRP instances.
+
+	Signed-off-by: Horatiu Vultur <horatiu.vultur@microchip.com>
+	Acked-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 537ed5676d4648abc8ef75b5c04d773d961aee2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_mrp.c
+diff --cc net/bridge/br_mrp.c
+index d673550412b4,b36689e6e7cb..000000000000
+--- a/net/bridge/br_mrp.c
++++ b/net/bridge/br_mrp.c
+@@@ -160,6 -202,46 +202,49 @@@ static struct sk_buff *br_mrp_alloc_tes
+  	return skb;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *br_mrp_alloc_in_test_skb(struct br_mrp *mrp,
++ 						struct net_bridge_port *p,
++ 						enum br_mrp_port_role_type port_role)
++ {
++ 	struct br_mrp_in_test_hdr *hdr = NULL;
++ 	struct sk_buff *skb = NULL;
++ 
++ 	if (!p)
++ 		return NULL;
++ 
++ 	skb = br_mrp_skb_alloc(p, p->dev->dev_addr, mrp_in_test_dmac);
++ 	if (!skb)
++ 		return NULL;
++ 
++ 	br_mrp_skb_tlv(skb, BR_MRP_TLV_HEADER_IN_TEST, sizeof(*hdr));
++ 	hdr = skb_put(skb, sizeof(*hdr));
++ 
++ 	hdr->id = cpu_to_be16(mrp->in_id);
++ 	ether_addr_copy(hdr->sa, p->br->dev->dev_addr);
++ 	hdr->port_role = cpu_to_be16(port_role);
++ 	hdr->state = cpu_to_be16(mrp->in_state);
++ 	hdr->transitions = cpu_to_be16(mrp->in_transitions);
++ 	hdr->timestamp = cpu_to_be32(jiffies_to_msecs(jiffies));
++ 
++ 	br_mrp_skb_common(skb, mrp);
++ 	br_mrp_skb_tlv(skb, BR_MRP_TLV_HEADER_END, 0x0);
++ 
++ 	return skb;
++ }
++ 
++ /* This function is continuously called in the following cases:
++  * - when node role is MRM, in this case test_monitor is always set to false
++  *   because it needs to notify the userspace that the ring is open and needs to
++  *   send MRP_Test frames
++  * - when node role is MRA, there are 2 subcases:
++  *     - when MRA behaves as MRM, in this case is similar with MRM role
++  *     - when MRA behaves as MRC, in this case test_monitor is set to true,
++  *       because it needs to detect when it stops seeing MRP_Test frames
++  *       from MRM node but it doesn't need to send MRP_Test frames.
++  */
+++>>>>>>> 537ed5676d46 (bridge: mrp: Implement the MRP Interconnect API)
+  static void br_mrp_test_work_expired(struct work_struct *work)
+  {
+  	struct delayed_work *del_work = to_delayed_work(work);
+@@@ -227,8 -398,12 +389,12 @@@ static void br_mrp_del_impl(struct net_
+  
+  	/* Stop sending MRP_Test frames */
+  	cancel_delayed_work_sync(&mrp->test_work);
+ -	br_mrp_switchdev_send_ring_test(br, mrp, 0, 0, 0, 0);
+ +	br_mrp_switchdev_send_ring_test(br, mrp, 0, 0, 0);
+  
++ 	/* Stop sending MRP_InTest frames if has an interconnect role */
++ 	cancel_delayed_work_sync(&mrp->in_test_work);
++ 	br_mrp_switchdev_send_in_test(br, mrp, 0, 0, 0);
++ 
+  	br_mrp_switchdev_del(br, mrp);
+  
+  	/* Reset the ports */
+@@@ -515,8 -880,135 +868,140 @@@ static void br_mrp_mrm_process(struct b
+  		br_mrp_ring_port_open(port->dev, false);
+  }
+  
+++<<<<<<< HEAD
+ +/* This will just forward the frame to the other mrp ring port(MRC role) or will
+ + * not do anything.
+++=======
++ /* Determin if the test hdr has a better priority than the node */
++ static bool br_mrp_test_better_than_own(struct br_mrp *mrp,
++ 					struct net_bridge *br,
++ 					const struct br_mrp_ring_test_hdr *hdr)
++ {
++ 	u16 prio = be16_to_cpu(hdr->prio);
++ 
++ 	if (prio < mrp->prio ||
++ 	    (prio == mrp->prio &&
++ 	    ether_addr_to_u64(hdr->sa) < ether_addr_to_u64(br->dev->dev_addr)))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /* Process only MRP Test frame. All the other MRP frames are processed by
++  * userspace application
++  * note: already called with rcu_read_lock
++  */
++ static void br_mrp_mra_process(struct br_mrp *mrp, struct net_bridge *br,
++ 			       struct net_bridge_port *port,
++ 			       struct sk_buff *skb)
++ {
++ 	const struct br_mrp_ring_test_hdr *test_hdr;
++ 	struct br_mrp_ring_test_hdr _test_hdr;
++ 	const struct br_mrp_tlv_hdr *hdr;
++ 	struct br_mrp_tlv_hdr _hdr;
++ 
++ 	/* Each MRP header starts with a version field which is 16 bits.
++ 	 * Therefore skip the version and get directly the TLV header.
++ 	 */
++ 	hdr = skb_header_pointer(skb, sizeof(uint16_t), sizeof(_hdr), &_hdr);
++ 	if (!hdr)
++ 		return;
++ 
++ 	if (hdr->type != BR_MRP_TLV_HEADER_RING_TEST)
++ 		return;
++ 
++ 	test_hdr = skb_header_pointer(skb, sizeof(uint16_t) + sizeof(_hdr),
++ 				      sizeof(_test_hdr), &_test_hdr);
++ 	if (!test_hdr)
++ 		return;
++ 
++ 	/* Only frames that have a better priority than the node will
++ 	 * clear the miss counter because otherwise the node will need to behave
++ 	 * as MRM.
++ 	 */
++ 	if (br_mrp_test_better_than_own(mrp, br, test_hdr))
++ 		mrp->test_count_miss = 0;
++ }
++ 
++ /* Process only MRP InTest frame. All the other MRP frames are processed by
++  * userspace application
++  * note: already called with rcu_read_lock
++  */
++ static bool br_mrp_mim_process(struct br_mrp *mrp, struct net_bridge_port *port,
++ 			       struct sk_buff *skb)
++ {
++ 	const struct br_mrp_in_test_hdr *in_hdr;
++ 	struct br_mrp_in_test_hdr _in_hdr;
++ 	const struct br_mrp_tlv_hdr *hdr;
++ 	struct br_mrp_tlv_hdr _hdr;
++ 
++ 	/* Each MRP header starts with a version field which is 16 bits.
++ 	 * Therefore skip the version and get directly the TLV header.
++ 	 */
++ 	hdr = skb_header_pointer(skb, sizeof(uint16_t), sizeof(_hdr), &_hdr);
++ 	if (!hdr)
++ 		return false;
++ 
++ 	/* The check for InTest frame type was already done */
++ 	in_hdr = skb_header_pointer(skb, sizeof(uint16_t) + sizeof(_hdr),
++ 				    sizeof(_in_hdr), &_in_hdr);
++ 	if (!in_hdr)
++ 		return false;
++ 
++ 	/* It needs to process only it's own InTest frames. */
++ 	if (mrp->in_id != ntohs(in_hdr->id))
++ 		return false;
++ 
++ 	mrp->in_test_count_miss = 0;
++ 
++ 	/* Notify the userspace that the ring is closed only when the ring is
++ 	 * not closed
++ 	 */
++ 	if (mrp->in_state != BR_MRP_IN_STATE_CLOSED)
++ 		br_mrp_in_port_open(port->dev, false);
++ 
++ 	return true;
++ }
++ 
++ /* Get the MRP frame type
++  * note: already called with rcu_read_lock
++  */
++ static u8 br_mrp_get_frame_type(struct sk_buff *skb)
++ {
++ 	const struct br_mrp_tlv_hdr *hdr;
++ 	struct br_mrp_tlv_hdr _hdr;
++ 
++ 	/* Each MRP header starts with a version field which is 16 bits.
++ 	 * Therefore skip the version and get directly the TLV header.
++ 	 */
++ 	hdr = skb_header_pointer(skb, sizeof(uint16_t), sizeof(_hdr), &_hdr);
++ 	if (!hdr)
++ 		return 0xff;
++ 
++ 	return hdr->type;
++ }
++ 
++ static bool br_mrp_mrm_behaviour(struct br_mrp *mrp)
++ {
++ 	if (mrp->ring_role == BR_MRP_RING_ROLE_MRM ||
++ 	    (mrp->ring_role == BR_MRP_RING_ROLE_MRA && !mrp->test_monitor))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static bool br_mrp_mrc_behaviour(struct br_mrp *mrp)
++ {
++ 	if (mrp->ring_role == BR_MRP_RING_ROLE_MRC ||
++ 	    (mrp->ring_role == BR_MRP_RING_ROLE_MRA && mrp->test_monitor))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /* This will just forward the frame to the other mrp ring ports, depending on
++  * the frame type, ring role and interconnect role
+++>>>>>>> 537ed5676d46 (bridge: mrp: Implement the MRP Interconnect API)
+   * note: already called with rcu_read_lock
+   */
+  static int br_mrp_rcv(struct net_bridge_port *p,
+@@@ -544,30 -1036,134 +1029,147 @@@
+  	s_port = rcu_dereference(mrp->s_port);
+  	if (!s_port)
+  		return 0;
++ 	s_dst = s_port;
+  
+++<<<<<<< HEAD
+ +	/* If the role is MRM then don't forward the frames */
+ +	if (mrp->ring_role == BR_MRP_RING_ROLE_MRM) {
+ +		br_mrp_mrm_process(mrp, p, skb);
+ +		return 1;
+ +	}
+ +
+ +	/* Clone the frame and forward it on the other MRP port */
+ +	nskb = skb_clone(skb, GFP_ATOMIC);
+ +	if (!nskb)
+ +		return 0;
+++=======
++ 	/* If the frame is a ring frame then it is not required to check the
++ 	 * interconnect role and ports to process or forward the frame
++ 	 */
++ 	if (br_mrp_ring_frame(skb)) {
++ 		/* If the role is MRM then don't forward the frames */
++ 		if (mrp->ring_role == BR_MRP_RING_ROLE_MRM) {
++ 			br_mrp_mrm_process(mrp, p, skb);
++ 			goto no_forward;
++ 		}
+  
+- 	p_dev = p_port->dev;
+- 	s_dev = s_port->dev;
++ 		/* If the role is MRA then don't forward the frames if it
++ 		 * behaves as MRM node
++ 		 */
++ 		if (mrp->ring_role == BR_MRP_RING_ROLE_MRA) {
++ 			if (!mrp->test_monitor) {
++ 				br_mrp_mrm_process(mrp, p, skb);
++ 				goto no_forward;
++ 			}
+  
+- 	if (p_dev == dev)
+- 		d_dev = s_dev;
+- 	else
+- 		d_dev = p_dev;
++ 			br_mrp_mra_process(mrp, br, p, skb);
++ 		}
++ 
++ 		goto forward;
++ 	}
++ 
++ 	if (br_mrp_in_frame(skb)) {
++ 		u8 in_type = br_mrp_get_frame_type(skb);
+++>>>>>>> 537ed5676d46 (bridge: mrp: Implement the MRP Interconnect API)
++ 
++ 		i_port = rcu_dereference(mrp->i_port);
++ 		i_dst = i_port;
++ 
++ 		/* If the ring port is in block state it should not forward
++ 		 * In_Test frames
++ 		 */
++ 		if (br_mrp_is_ring_port(p_port, s_port, p) &&
++ 		    p->state == BR_STATE_BLOCKING &&
++ 		    in_type == BR_MRP_TLV_HEADER_IN_TEST)
++ 			goto no_forward;
++ 
++ 		/* Nodes that behaves as MRM needs to stop forwarding the
++ 		 * frames in case the ring is closed, otherwise will be a loop.
++ 		 * In this case the frame is no forward between the ring ports.
++ 		 */
++ 		if (br_mrp_mrm_behaviour(mrp) &&
++ 		    br_mrp_is_ring_port(p_port, s_port, p) &&
++ 		    (s_port->state != BR_STATE_FORWARDING ||
++ 		     p_port->state != BR_STATE_FORWARDING)) {
++ 			p_dst = NULL;
++ 			s_dst = NULL;
++ 		}
++ 
++ 		/* A node that behaves as MRC and doesn't have a interconnect
++ 		 * role then it should forward all frames between the ring ports
++ 		 * because it doesn't have an interconnect port
++ 		 */
++ 		if (br_mrp_mrc_behaviour(mrp) &&
++ 		    mrp->in_role == BR_MRP_IN_ROLE_DISABLED)
++ 			goto forward;
++ 
++ 		if (mrp->in_role == BR_MRP_IN_ROLE_MIM) {
++ 			if (in_type == BR_MRP_TLV_HEADER_IN_TEST) {
++ 				/* MIM should not forward it's own InTest
++ 				 * frames
++ 				 */
++ 				if (br_mrp_mim_process(mrp, p, skb)) {
++ 					goto no_forward;
++ 				} else {
++ 					if (br_mrp_is_ring_port(p_port, s_port,
++ 								p))
++ 						i_dst = NULL;
++ 
++ 					if (br_mrp_is_in_port(i_port, p))
++ 						goto no_forward;
++ 				}
++ 			} else {
++ 				/* MIM should forward IntLinkChange and
++ 				 * IntTopoChange between ring ports but MIM
++ 				 * should not forward IntLinkChange and
++ 				 * IntTopoChange if the frame was received at
++ 				 * the interconnect port
++ 				 */
++ 				if (br_mrp_is_ring_port(p_port, s_port, p))
++ 					i_dst = NULL;
++ 
++ 				if (br_mrp_is_in_port(i_port, p))
++ 					goto no_forward;
++ 			}
++ 		}
++ 
++ 		if (mrp->in_role == BR_MRP_IN_ROLE_MIC) {
++ 			/* MIC should forward InTest frames on all ports
++ 			 * regardless of the received port
++ 			 */
++ 			if (in_type == BR_MRP_TLV_HEADER_IN_TEST)
++ 				goto forward;
++ 
++ 			/* MIC should forward IntLinkChange frames only if they
++ 			 * are received on ring ports to all the ports
++ 			 */
++ 			if (br_mrp_is_ring_port(p_port, s_port, p) &&
++ 			    (in_type == BR_MRP_TLV_HEADER_IN_LINK_UP ||
++ 			     in_type == BR_MRP_TLV_HEADER_IN_LINK_DOWN))
++ 				goto forward;
++ 
++ 			/* Should forward the InTopo frames only between the
++ 			 * ring ports
++ 			 */
++ 			if (in_type == BR_MRP_TLV_HEADER_IN_TOPO) {
++ 				i_dst = NULL;
++ 				goto forward;
++ 			}
++ 
++ 			/* In all the other cases don't forward the frames */
++ 			goto no_forward;
++ 		}
++ 	}
+  
+- 	nskb->dev = d_dev;
+- 	skb_push(nskb, ETH_HLEN);
+- 	dev_queue_xmit(nskb);
++ forward:
++ 	if (p_dst)
++ 		br_forward(p_dst, skb, true, false);
++ 	if (s_dst)
++ 		br_forward(s_dst, skb, true, false);
++ 	if (i_dst)
++ 		br_forward(i_dst, skb, true, false);
+  
++ no_forward:
+  	return 1;
+  }
+  
+* Unmerged path net/bridge/br_mrp.c
+diff --git a/net/bridge/br_private_mrp.h b/net/bridge/br_private_mrp.h
+index ab744ac18d94..8bdc8c4ea832 100644
+--- a/net/bridge/br_private_mrp.h
++++ b/net/bridge/br_private_mrp.h
+@@ -42,6 +42,10 @@ int br_mrp_set_ring_state(struct net_bridge *br,
+ 			  struct br_mrp_ring_state *state);
+ int br_mrp_set_ring_role(struct net_bridge *br, struct br_mrp_ring_role *role);
+ int br_mrp_start_test(struct net_bridge *br, struct br_mrp_start_test *test);
++int br_mrp_set_in_state(struct net_bridge *br, struct br_mrp_in_state *state);
++int br_mrp_set_in_role(struct net_bridge *br, struct br_mrp_in_role *role);
++int br_mrp_start_in_test(struct net_bridge *br,
++			 struct br_mrp_start_in_test *test);
+ 
+ /* br_mrp_switchdev.c */
+ int br_mrp_switchdev_add(struct net_bridge *br, struct br_mrp *mrp);
