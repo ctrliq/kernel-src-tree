@@ -1,0 +1,153 @@
+s390/stp: add support for leap seconds
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Sven Schnelle <svens@linux.ibm.com>
+commit b2539aa0d7ff1e42c74a9dd8c73ec1c2771c9e5d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b2539aa0.failed
+
+In the current implementation, leap seconds are only synchronized
+during the bootup process when the STP clock is synced. If the Leap
+second offset (LSO) changes the machine must be rebooted, which is
+not desired. This patch adds the required code to handle Leap second
+changes during runtime. If the Leap second changes, a Configuration
+change machine check is triggered. The STP code than schedules a Leap
+second insertion/deletion with do_adjtimex().
+
+	Signed-off-by: Sven Schnelle <svens@linux.ibm.com>
+	Reviewed-by: Alexander Egorenkov <egorenar@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit b2539aa0d7ff1e42c74a9dd8c73ec1c2771c9e5d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/time.c
+diff --cc arch/s390/kernel/time.c
+index c9ae00612d13,49648d574b35..000000000000
+--- a/arch/s390/kernel/time.c
++++ b/arch/s390/kernel/time.c
+@@@ -688,7 -713,9 +762,13 @@@ static void stp_work_fn(struct work_str
+  		 * There is a usable clock but the synchonization failed.
+  		 * Retry after a second.
+  		 */
+++<<<<<<< HEAD
+ +		mod_timer(&stp_timer, jiffies + HZ);
+++=======
++ 		mod_timer(&stp_timer, jiffies + msecs_to_jiffies(MSEC_PER_SEC));
++ 	else if (stp_info.lu)
++ 		stp_check_leap();
+++>>>>>>> b2539aa0d7ff (s390/stp: add support for leap seconds)
+  
+  out_unlock:
+  	mutex_unlock(&stp_work_mutex);
+diff --git a/arch/s390/include/asm/cio.h b/arch/s390/include/asm/cio.h
+index b5bfb3123cb1..953a7316b30a 100644
+--- a/arch/s390/include/asm/cio.h
++++ b/arch/s390/include/asm/cio.h
+@@ -372,6 +372,7 @@ struct gen_pool *cio_gp_dma_create(struct device *dma_dev, int nr_pages);
+ /* Function from drivers/s390/cio/chsc.c */
+ int chsc_sstpc(void *page, unsigned int op, u16 ctrl, u64 *clock_delta);
+ int chsc_sstpi(void *page, void *result, size_t size);
++int chsc_stzi(void *page, void *result, size_t size);
+ int chsc_sgib(u32 origin);
+ 
+ #endif
+diff --git a/arch/s390/include/asm/stp.h b/arch/s390/include/asm/stp.h
+index a5c0bc1e5b90..ba07463897c1 100644
+--- a/arch/s390/include/asm/stp.h
++++ b/arch/s390/include/asm/stp.h
+@@ -25,7 +25,9 @@ struct stp_irq_parm {
+ 
+ struct stp_sstpi {
+ 	u32		: 32;
+-	u32		:  8;
++	u32 tu		:  1;
++	u32 lu		:  1;
++	u32		:  6;
+ 	u32 stratum	:  8;
+ 	u32 vbits	: 16;
+ 	u32 leaps	: 16;
+@@ -46,6 +48,48 @@ struct stp_sstpi {
+ 	u32 rsvd[48];
+ } __packed;
+ 
++struct stp_tzib {
++	u32 tzan	: 16;
++	u32		: 16;
++	u32 tzo		: 16;
++	u32 dsto	: 16;
++	u32 stn;
++	u32 dstn;
++	u64 dst_on_alg;
++	u64 dst_off_alg;
++} __packed;
++
++struct stp_tcpib {
++	u32 atcode	: 4;
++	u32 ntcode	: 4;
++	u32 d		: 1;
++	u32		: 23;
++	s32 tto;
++	struct stp_tzib atzib;
++	struct stp_tzib ntzib;
++	s32 adst_offset : 16;
++	s32 ndst_offset : 16;
++	u32 rsvd1;
++	u64 ntzib_update;
++	u64 ndsto_update;
++} __packed;
++
++struct stp_lsoib {
++	u32 p		: 1;
++	u32		: 31;
++	s32 also	: 16;
++	s32 nlso	: 16;
++	u64 nlsout;
++} __packed;
++
++struct stp_stzi {
++	u32 rsvd0[3];
++	u64 data_ts;
++	u32 rsvd1[22];
++	struct stp_tcpib tcpib;
++	struct stp_lsoib lsoib;
++} __packed;
++
+ /* Functions needed by the machine check handler */
+ int stp_sync_check(void);
+ int stp_island_check(void);
+* Unmerged path arch/s390/kernel/time.c
+diff --git a/drivers/s390/cio/chsc.c b/drivers/s390/cio/chsc.c
+index bb8c776e62eb..f44aed44d4fb 100644
+--- a/drivers/s390/cio/chsc.c
++++ b/drivers/s390/cio/chsc.c
+@@ -1258,6 +1258,27 @@ int chsc_sstpi(void *page, void *result, size_t size)
+ 	return (rr->response.code == 0x0001) ? 0 : -EIO;
+ }
+ 
++int chsc_stzi(void *page, void *result, size_t size)
++{
++	struct {
++		struct chsc_header request;
++		unsigned int rsvd0[3];
++		struct chsc_header response;
++		char data[];
++	} *rr;
++	int rc;
++
++	memset(page, 0, PAGE_SIZE);
++	rr = page;
++	rr->request.length = 0x0010;
++	rr->request.code = 0x003e;
++	rc = chsc(rr);
++	if (rc)
++		return -EIO;
++	memcpy(result, &rr->data, size);
++	return (rr->response.code == 0x0001) ? 0 : -EIO;
++}
++
+ int chsc_siosl(struct subchannel_id schid)
+ {
+ 	struct {
