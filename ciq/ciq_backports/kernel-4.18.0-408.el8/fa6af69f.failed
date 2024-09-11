@@ -1,0 +1,272 @@
+x86/traps: Demand-populate PASID MSR via #GP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Fenghua Yu <fenghua.yu@intel.com>
+commit fa6af69f38d3f409bedc55d0112eec36ed526d4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/fa6af69f.failed
+
+All tasks start with PASID state disabled. This means that the first
+time they execute an ENQCMD instruction they will take a #GP fault.
+
+Modify the #GP fault handler to check if the "mm" for the task has
+already been allocated a PASID. If so, try to fix the #GP fault by
+loading the IA32_PASID MSR.
+
+	Signed-off-by: Fenghua Yu <fenghua.yu@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Tony Luck <tony.luck@intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/20220207230254.3342514-9-fenghua.yu@intel.com
+(cherry picked from commit fa6af69f38d3f409bedc55d0112eec36ed526d4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/traps.c
+diff --cc arch/x86/kernel/traps.c
+index 7927259107ca,7ef00dee35be..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -37,12 -37,9 +37,13 @@@
+  #include <linux/mm.h>
+  #include <linux/smp.h>
+  #include <linux/io.h>
+ +
+ +#if defined(CONFIG_EDAC)
+ +#include <linux/edac.h>
+ +#endif
+  #include <linux/hardirq.h>
+  #include <linux/atomic.h>
++ #include <linux/ioasid.h>
+  
+  #include <asm/stacktrace.h>
+  #include <asm/processor.h>
+@@@ -399,88 -477,151 +400,149 @@@ dotraplinkage void do_bounds(struct pt_
+  	cond_local_irq_enable(regs);
+  
+  	if (!user_mode(regs))
+ -		die("bounds", regs, 0);
+ -
+ -	do_trap(X86_TRAP_BR, SIGSEGV, "bounds", regs, 0, 0, NULL);
+ +		die("bounds", regs, error_code);
+  
+ -	cond_local_irq_disable(regs);
+ -}
+ -
+ -enum kernel_gp_hint {
+ -	GP_NO_HINT,
+ -	GP_NON_CANONICAL,
+ -	GP_CANONICAL
+ -};
+ -
+ -/*
+ - * When an uncaught #GP occurs, try to determine the memory address accessed by
+ - * the instruction and return that address to the caller. Also, try to figure
+ - * out whether any part of the access to that address was non-canonical.
+ - */
+ -static enum kernel_gp_hint get_kernel_gp_address(struct pt_regs *regs,
+ -						 unsigned long *addr)
+ -{
+ -	u8 insn_buf[MAX_INSN_SIZE];
+ -	struct insn insn;
+ -	int ret;
+ -
+ -	if (copy_from_kernel_nofault(insn_buf, (void *)regs->ip,
+ -			MAX_INSN_SIZE))
+ -		return GP_NO_HINT;
+ -
+ -	ret = insn_decode_kernel(&insn, insn_buf);
+ -	if (ret < 0)
+ -		return GP_NO_HINT;
+ -
+ -	*addr = (unsigned long)insn_get_addr_ref(&insn, regs);
+ -	if (*addr == -1UL)
+ -		return GP_NO_HINT;
+ +	if (!cpu_feature_enabled(X86_FEATURE_MPX)) {
+ +		/* The exception is not from Intel MPX */
+ +		goto exit_trap;
+ +	}
+  
+ -#ifdef CONFIG_X86_64
+  	/*
+ -	 * Check that:
+ -	 *  - the operand is not in the kernel half
+ -	 *  - the last byte of the operand is not in the user canonical half
+ +	 * We need to look at BNDSTATUS to resolve this exception.
+ +	 * A NULL here might mean that it is in its 'init state',
+ +	 * which is all zeros which indicates MPX was not
+ +	 * responsible for the exception.
+  	 */
+ -	if (*addr < ~__VIRTUAL_MASK &&
+ -	    *addr + insn.opnd_bytes - 1 > __VIRTUAL_MASK)
+ -		return GP_NON_CANONICAL;
+ -#endif
+ -
+ -	return GP_CANONICAL;
+ -}
+ -
+ -#define GPFSTR "general protection fault"
+ +	bndcsr = get_xsave_field_ptr(XFEATURE_BNDCSR);
+ +	if (!bndcsr)
+ +		goto exit_trap;
+  
+ -static bool fixup_iopl_exception(struct pt_regs *regs)
+ -{
+ -	struct thread_struct *t = &current->thread;
+ -	unsigned char byte;
+ -	unsigned long ip;
+ -
+ -	if (!IS_ENABLED(CONFIG_X86_IOPL_IOPERM) || t->iopl_emul != 3)
+ -		return false;
+ -
+ -	if (insn_get_effective_ip(regs, &ip))
+ -		return false;
+ -
+ -	if (get_user(byte, (const char __user *)ip))
+ -		return false;
+ +	trace_bounds_exception_mpx(bndcsr);
+ +	/*
+ +	 * The error code field of the BNDSTATUS register communicates status
+ +	 * information of a bound range exception #BR or operation involving
+ +	 * bound directory.
+ +	 */
+ +	switch (bndcsr->bndstatus & MPX_BNDSTA_ERROR_CODE) {
+ +	case 2:	/* Bound directory has invalid entry. */
+ +		if (mpx_handle_bd_fault())
+ +			goto exit_trap;
+ +		break; /* Success, it was handled */
+ +	case 1: /* Bound violation. */
+ +	{
+ +		struct task_struct *tsk = current;
+ +		struct mpx_fault_info mpx;
+ +
+ +		if (mpx_fault_info(&mpx, regs)) {
+ +			/*
+ +			 * We failed to decode the MPX instruction.  Act as if
+ +			 * the exception was not caused by MPX.
+ +			 */
+ +			goto exit_trap;
+ +		}
+ +		/*
+ +		 * Success, we decoded the instruction and retrieved
+ +		 * an 'mpx' containing the address being accessed
+ +		 * which caused the exception.  This information
+ +		 * allows and application to possibly handle the
+ +		 * #BR exception itself.
+ +		 */
+ +		if (!do_trap_no_signal(tsk, X86_TRAP_BR, "bounds", regs,
+ +				       error_code))
+ +			break;
+  
+ -	if (byte != 0xfa && byte != 0xfb)
+ -		return false;
+ +		show_signal(tsk, SIGSEGV, "trap ", "bounds", regs, error_code);
+  
+ -	if (!t->iopl_warn && printk_ratelimit()) {
+ -		pr_err("%s[%d] attempts to use CLI/STI, pretending it's a NOP, ip:%lx",
+ -		       current->comm, task_pid_nr(current), ip);
+ -		print_vma_addr(KERN_CONT " in ", ip);
+ -		pr_cont("\n");
+ -		t->iopl_warn = 1;
+ +		force_sig_bnderr(mpx.addr, mpx.lower, mpx.upper);
+ +		break;
+ +	}
+ +	case 0: /* No exception caused by Intel MPX operations. */
+ +		goto exit_trap;
+ +	default:
+ +		die("bounds", regs, error_code);
+  	}
+  
+ -	regs->ip += 1;
+ -	return true;
+ +	return;
+ +
+ +exit_trap:
+ +	/*
+ +	 * This path out is for all the cases where we could not
+ +	 * handle the exception in some way (like allocating a
+ +	 * table or telling userspace about it.  We will also end
+ +	 * up here if the kernel has MPX turned off at compile
+ +	 * time..
+ +	 */
+ +	do_trap(X86_TRAP_BR, SIGSEGV, "bounds", regs, error_code, 0, NULL);
+  }
+  
+++<<<<<<< HEAD
+ +dotraplinkage void
+ +do_general_protection(struct pt_regs *regs, long error_code)
+++=======
++ /*
++  * The unprivileged ENQCMD instruction generates #GPs if the
++  * IA32_PASID MSR has not been populated.  If possible, populate
++  * the MSR from a PASID previously allocated to the mm.
++  */
++ static bool try_fixup_enqcmd_gp(void)
++ {
++ #ifdef CONFIG_IOMMU_SVA
++ 	u32 pasid;
++ 
++ 	/*
++ 	 * MSR_IA32_PASID is managed using XSAVE.  Directly
++ 	 * writing to the MSR is only possible when fpregs
++ 	 * are valid and the fpstate is not.  This is
++ 	 * guaranteed when handling a userspace exception
++ 	 * in *before* interrupts are re-enabled.
++ 	 */
++ 	lockdep_assert_irqs_disabled();
++ 
++ 	/*
++ 	 * Hardware without ENQCMD will not generate
++ 	 * #GPs that can be fixed up here.
++ 	 */
++ 	if (!cpu_feature_enabled(X86_FEATURE_ENQCMD))
++ 		return false;
++ 
++ 	pasid = current->mm->pasid;
++ 
++ 	/*
++ 	 * If the mm has not been allocated a
++ 	 * PASID, the #GP can not be fixed up.
++ 	 */
++ 	if (!pasid_valid(pasid))
++ 		return false;
++ 
++ 	/*
++ 	 * Did this thread already have its PASID activated?
++ 	 * If so, the #GP must be from something else.
++ 	 */
++ 	if (current->pasid_activated)
++ 		return false;
++ 
++ 	wrmsrl(MSR_IA32_PASID, pasid | MSR_IA32_PASID_VALID);
++ 	current->pasid_activated = 1;
++ 
++ 	return true;
++ #else
++ 	return false;
++ #endif
++ }
++ 
++ DEFINE_IDTENTRY_ERRORCODE(exc_general_protection)
+++>>>>>>> fa6af69f38d3 (x86/traps: Demand-populate PASID MSR via #GP)
+  {
+ -	char desc[sizeof(GPFSTR) + 50 + 2*sizeof(unsigned long) + 1] = GPFSTR;
+ -	enum kernel_gp_hint hint = GP_NO_HINT;
+ +	const char *desc = "general protection fault";
+  	struct task_struct *tsk;
+ -	unsigned long gp_addr;
+ -	int ret;
+  
+++<<<<<<< HEAD
+ +	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+++=======
++ 	if (user_mode(regs) && try_fixup_enqcmd_gp())
++ 		return;
++ 
+++>>>>>>> fa6af69f38d3 (x86/traps: Demand-populate PASID MSR via #GP)
+  	cond_local_irq_enable(regs);
+  
+  	if (static_cpu_has(X86_FEATURE_UMIP)) {
+* Unmerged path arch/x86/kernel/traps.c
