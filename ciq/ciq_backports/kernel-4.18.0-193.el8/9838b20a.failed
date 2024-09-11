@@ -1,0 +1,338 @@
+net: sched: take rtnl lock in tc_setup_flow_action()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: take rtnl lock in tc_setup_flow_action() (Ivan Vecera) [1739606]
+Rebuild_FUZZ: 94.95%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 9838b20a7fb28c69fa66ac8e68d967ffe1d0ecad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/9838b20a.failed
+
+In order to allow using new flow_action infrastructure from unlocked
+classifiers, modify tc_setup_flow_action() to accept new 'rtnl_held'
+argument. Take rtnl lock before accessing tc_action data. This is necessary
+to protect from concurrent action replace.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9838b20a7fb28c69fa66ac8e68d967ffe1d0ecad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_flower.c
+index 3eb4f57be10d,fb305bd45d93..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -418,40 -452,49 +418,41 @@@ static int fl_hw_replace_filter(struct 
+  	cls_flower.rule->match.key = &f->mkey;
+  	cls_flower.classid = f->res.classid;
+  
+- 	err = tc_setup_flow_action(&cls_flower.rule->action, &f->exts);
++ 	err = tc_setup_flow_action(&cls_flower.rule->action, &f->exts,
++ 				   true);
+  	if (err) {
+  		kfree(cls_flower.rule);
+ -		if (skip_sw)
+ +		if (skip_sw) {
+  			NL_SET_ERR_MSG_MOD(extack, "Failed to setup flow action");
+ -		else
+ -			err = 0;
+ -		goto errout;
+ +			return err;
+ +		}
+ +		return 0;
+  	}
+  
+ -	err = tc_setup_cb_add(block, tp, TC_SETUP_CLSFLOWER, &cls_flower,
+ -			      skip_sw, &f->flags, &f->in_hw_count, true);
+ +	err = tc_setup_cb_call(block, TC_SETUP_CLSFLOWER, &cls_flower, skip_sw);
+  	kfree(cls_flower.rule);
+  
+ -	if (err) {
+ -		fl_hw_destroy_filter(tp, f, true, NULL);
+ -		goto errout;
+ -	}
+ -
+ -	if (skip_sw && !(f->flags & TCA_CLS_FLAGS_IN_HW)) {
+ -		err = -EINVAL;
+ -		goto errout;
+ +	if (err < 0) {
+ +		fl_hw_destroy_filter(tp, f, NULL);
+ +		return err;
+ +	} else if (err > 0) {
+ +		f->in_hw_count = err;
+ +		tcf_block_offload_inc(block, &f->flags);
+  	}
+  
+ -errout:
+ -	if (!rtnl_held)
+ -		rtnl_unlock();
+ +	if (skip_sw && !(f->flags & TCA_CLS_FLAGS_IN_HW))
+ +		return -EINVAL;
+  
+ -	return err;
+ +	return 0;
+  }
+  
+ -static void fl_hw_update_stats(struct tcf_proto *tp, struct cls_fl_filter *f,
+ -			       bool rtnl_held)
+ +static void fl_hw_update_stats(struct tcf_proto *tp, struct cls_fl_filter *f)
+  {
+ +	struct tc_cls_flower_offload cls_flower = {};
+  	struct tcf_block *block = tp->chain->block;
+ -	struct flow_cls_offload cls_flower = {};
+ -
+ -	if (!rtnl_held)
+ -		rtnl_lock();
+  
+  	tc_cls_common_offload_init(&cls_flower.common, tp, f->flags, NULL);
+ -	cls_flower.command = FLOW_CLS_STATS;
+ +	cls_flower.command = TC_CLSFLOWER_STATS;
+  	cls_flower.cookie = (unsigned long) f;
+  	cls_flower.classid = f->res.classid;
+  
+@@@ -1618,65 -1757,95 +1619,76 @@@ static void fl_walk(struct tcf_proto *t
+  			arg->stop = 1;
+  			break;
+  		}
+ -		__fl_put(f);
+ +		arg->cookie = (unsigned long)f->handle + 1;
+  		arg->count++;
+  	}
+ -	arg->cookie = id;
+  }
+  
+ -static struct cls_fl_filter *
+ -fl_get_next_hw_filter(struct tcf_proto *tp, struct cls_fl_filter *f, bool add)
+ -{
+ -	struct cls_fl_head *head = fl_head_dereference(tp);
+ -
+ -	spin_lock(&tp->lock);
+ -	if (list_empty(&head->hw_filters)) {
+ -		spin_unlock(&tp->lock);
+ -		return NULL;
+ -	}
+ -
+ -	if (!f)
+ -		f = list_entry(&head->hw_filters, struct cls_fl_filter,
+ -			       hw_list);
+ -	list_for_each_entry_continue(f, &head->hw_filters, hw_list) {
+ -		if (!(add && f->deleted) && refcount_inc_not_zero(&f->refcnt)) {
+ -			spin_unlock(&tp->lock);
+ -			return f;
+ -		}
+ -	}
+ -
+ -	spin_unlock(&tp->lock);
+ -	return NULL;
+ -}
+ -
+ -static int fl_reoffload(struct tcf_proto *tp, bool add, flow_setup_cb_t *cb,
+ +static int fl_reoffload(struct tcf_proto *tp, bool add, tc_setup_cb_t *cb,
+  			void *cb_priv, struct netlink_ext_ack *extack)
+  {
+ +	struct cls_fl_head *head = fl_head_dereference(tp);
+ +	struct tc_cls_flower_offload cls_flower = {};
+  	struct tcf_block *block = tp->chain->block;
+ -	struct flow_cls_offload cls_flower = {};
+ -	struct cls_fl_filter *f = NULL;
+ +	struct fl_flow_mask *mask;
+ +	struct cls_fl_filter *f;
+  	int err;
+  
+ -	/* hw_filters list can only be changed by hw offload functions after
+ -	 * obtaining rtnl lock. Make sure it is not changed while reoffload is
+ -	 * iterating it.
+ -	 */
+ -	ASSERT_RTNL();
+ -
+ -	while ((f = fl_get_next_hw_filter(tp, f, add))) {
+ -		cls_flower.rule =
+ -			flow_rule_alloc(tcf_exts_num_actions(&f->exts));
+ -		if (!cls_flower.rule) {
+ -			__fl_put(f);
+ -			return -ENOMEM;
+ -		}
+ -
+ -		tc_cls_common_offload_init(&cls_flower.common, tp, f->flags,
+ -					   extack);
+ -		cls_flower.command = add ?
+ -			FLOW_CLS_REPLACE : FLOW_CLS_DESTROY;
+ -		cls_flower.cookie = (unsigned long)f;
+ -		cls_flower.rule->match.dissector = &f->mask->dissector;
+ -		cls_flower.rule->match.mask = &f->mask->key;
+ -		cls_flower.rule->match.key = &f->mkey;
+ -
+ +	list_for_each_entry(mask, &head->masks, list) {
+ +		list_for_each_entry(f, &mask->filters, list) {
+ +			if (tc_skip_hw(f->flags))
+ +				continue;
+ +
+ +			cls_flower.rule =
+ +				flow_rule_alloc(tcf_exts_num_actions(&f->exts));
+ +			if (!cls_flower.rule)
+ +				return -ENOMEM;
+ +
+ +			tc_cls_common_offload_init(&cls_flower.common, tp,
+ +						   f->flags, extack);
+ +			cls_flower.command = add ?
+ +				TC_CLSFLOWER_REPLACE : TC_CLSFLOWER_DESTROY;
+ +			cls_flower.cookie = (unsigned long)f;
+ +			cls_flower.rule->match.dissector = &mask->dissector;
+ +			cls_flower.rule->match.mask = &mask->key;
+ +			cls_flower.rule->match.key = &f->mkey;
+ +
+++<<<<<<< HEAD
+ +			err = tc_setup_flow_action(&cls_flower.rule->action,
+ +						   &f->exts);
+ +			if (err) {
+ +				kfree(cls_flower.rule);
+ +				if (tc_skip_sw(f->flags)) {
+ +					NL_SET_ERR_MSG_MOD(extack, "Failed to setup flow action");
+ +					return err;
+ +				}
+ +				continue;
+++=======
++ 		err = tc_setup_flow_action(&cls_flower.rule->action, &f->exts,
++ 					   true);
++ 		if (err) {
++ 			kfree(cls_flower.rule);
++ 			if (tc_skip_sw(f->flags)) {
++ 				NL_SET_ERR_MSG_MOD(extack, "Failed to setup flow action");
++ 				__fl_put(f);
++ 				return err;
+++>>>>>>> 9838b20a7fb2 (net: sched: take rtnl lock in tc_setup_flow_action())
+  			}
+ -			goto next_flow;
+ -		}
+  
+ -		cls_flower.classid = f->res.classid;
+ +			cls_flower.classid = f->res.classid;
+  
+ -		err = tc_setup_cb_reoffload(block, tp, add, cb,
+ -					    TC_SETUP_CLSFLOWER, &cls_flower,
+ -					    cb_priv, &f->flags,
+ -					    &f->in_hw_count);
+ -		kfree(cls_flower.rule);
+ +			err = cb(TC_SETUP_CLSFLOWER, &cls_flower, cb_priv);
+ +			kfree(cls_flower.rule);
+  
+ -		if (err) {
+ -			__fl_put(f);
+ -			return err;
+ +			if (err) {
+ +				if (add && tc_skip_sw(f->flags))
+ +					return err;
+ +				continue;
+ +			}
+ +
+ +			tc_cls_offload_cnt_update(block, &f->in_hw_count,
+ +						  &f->flags, add);
+  		}
+ -next_flow:
+ -		__fl_put(f);
+  	}
+  
+  	return 0;
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index 835bbad70a4b..8686dfc9fc34 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -607,7 +607,7 @@ tcf_match_indev(struct sk_buff *skb, int ifindex)
+ #endif /* CONFIG_NET_CLS_IND */
+ 
+ int tc_setup_flow_action(struct flow_action *flow_action,
+-			 const struct tcf_exts *exts);
++			 const struct tcf_exts *exts, bool rtnl_held);
+ int tc_setup_cb_call(struct tcf_block *block, enum tc_setup_type type,
+ 		     void *type_data, bool err_stop);
+ unsigned int tcf_exts_num_actions(struct tcf_exts *exts);
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index 081ac3d0fb50..6d938f6467cb 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -3269,14 +3269,17 @@ int tc_setup_cb_call(struct tcf_block *block, enum tc_setup_type type,
+ EXPORT_SYMBOL(tc_setup_cb_call);
+ 
+ int tc_setup_flow_action(struct flow_action *flow_action,
+-			 const struct tcf_exts *exts)
++			 const struct tcf_exts *exts, bool rtnl_held)
+ {
+ 	const struct tc_action *act;
+-	int i, j, k;
++	int i, j, k, err = 0;
+ 
+ 	if (!exts)
+ 		return 0;
+ 
++	if (!rtnl_held)
++		rtnl_lock();
++
+ 	j = 0;
+ 	tcf_exts_for_each_action(i, act, exts) {
+ 		struct flow_action_entry *entry;
+@@ -3321,6 +3324,7 @@ int tc_setup_flow_action(struct flow_action *flow_action,
+ 				entry->vlan.prio = tcf_vlan_push_prio(act);
+ 				break;
+ 			default:
++				err = -EOPNOTSUPP;
+ 				goto err_out;
+ 			}
+ 		} else if (is_tcf_tunnel_set(act)) {
+@@ -3338,6 +3342,7 @@ int tc_setup_flow_action(struct flow_action *flow_action,
+ 					entry->id = FLOW_ACTION_ADD;
+ 					break;
+ 				default:
++					err = -EOPNOTSUPP;
+ 					goto err_out;
+ 				}
+ 				entry->mangle.htype = tcf_pedit_htype(act, k);
+@@ -3365,15 +3370,19 @@ int tc_setup_flow_action(struct flow_action *flow_action,
+ 			entry->police.rate_bytes_ps =
+ 				tcf_police_rate_bytes_ps(act);
+ 		} else {
++			err = -EOPNOTSUPP;
+ 			goto err_out;
+ 		}
+ 
+ 		if (!is_tcf_pedit(act))
+ 			j++;
+ 	}
+-	return 0;
++
+ err_out:
+-	return -EOPNOTSUPP;
++	if (!rtnl_held)
++		rtnl_unlock();
++
++	return err;
+ }
+ EXPORT_SYMBOL(tc_setup_flow_action);
+ 
+* Unmerged path net/sched/cls_flower.c
+diff --git a/net/sched/cls_matchall.c b/net/sched/cls_matchall.c
+index 0d898af13b5f..554e1527d056 100644
+--- a/net/sched/cls_matchall.c
++++ b/net/sched/cls_matchall.c
+@@ -101,7 +101,7 @@ static int mall_replace_hw_filter(struct tcf_proto *tp,
+ 	cls_mall.command = TC_CLSMATCHALL_REPLACE;
+ 	cls_mall.cookie = cookie;
+ 
+-	err = tc_setup_flow_action(&cls_mall.rule->action, &head->exts);
++	err = tc_setup_flow_action(&cls_mall.rule->action, &head->exts, true);
+ 	if (err) {
+ 		kfree(cls_mall.rule);
+ 		mall_destroy_hw_filter(tp, head, cookie, NULL);
+@@ -306,7 +306,7 @@ static int mall_reoffload(struct tcf_proto *tp, bool add, tc_setup_cb_t *cb,
+ 		TC_CLSMATCHALL_REPLACE : TC_CLSMATCHALL_DESTROY;
+ 	cls_mall.cookie = (unsigned long)head;
+ 
+-	err = tc_setup_flow_action(&cls_mall.rule->action, &head->exts);
++	err = tc_setup_flow_action(&cls_mall.rule->action, &head->exts, true);
+ 	if (err) {
+ 		kfree(cls_mall.rule);
+ 		if (add && tc_skip_sw(head->flags)) {
