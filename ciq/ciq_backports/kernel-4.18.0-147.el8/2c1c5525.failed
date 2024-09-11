@@ -1,0 +1,166 @@
+drm/i915/dsi: Use a fuzzy check for burst mode clock check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Hans de Goede <hdegoede@redhat.com>
+commit 2c1c55252647abd989b94f725b190c700312d053
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/2c1c5525.failed
+
+Prior to this commit we fail to init the DSI panel on the GPD MicroPC:
+https://www.indiegogo.com/projects/gpd-micropc-6-inch-handheld-industry-laptop#/
+
+The problem is intel_dsi_vbt_init() failing with the following error:
+*ERROR* Burst mode freq is less than computed
+
+The pclk in the VBT panel modeline is 70000, together with 24 bpp and
+4 lines this results in a bitrate value of 70000 * 24 / 4 = 420000.
+But the target_burst_mode_freq in the VBT is 418000.
+
+This commit works around this problem by adding an intel_fuzzy_clock_check
+when target_burst_mode_freq < bitrate and setting target_burst_mode_freq to
+bitrate when that checks succeeds, fixing the panel not working.
+
+	Cc: stable@vger.kernel.org
+	Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190524174028.21659-2-hdegoede@redhat.com
+(cherry picked from commit 2c1c55252647abd989b94f725b190c700312d053)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_dsi_vbt.c
+diff --cc drivers/gpu/drm/i915/intel_dsi_vbt.c
+index 4d6ffa7b3e7b,7cdde1d04f4b..000000000000
+--- a/drivers/gpu/drm/i915/intel_dsi_vbt.c
++++ b/drivers/gpu/drm/i915/intel_dsi_vbt.c
+@@@ -746,6 -799,99 +746,102 @@@ bool intel_dsi_vbt_init(struct intel_ds
+  		DIV_ROUND_UP(2 * tlpx_ui + trail_cnt * 2 + 8,
+  			8);
+  	intel_dsi->clk_hs_to_lp_count += extra_byte_count;
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ bool intel_dsi_vbt_init(struct intel_dsi *intel_dsi, u16 panel_id)
++ {
++ 	struct drm_device *dev = intel_dsi->base.base.dev;
++ 	struct drm_i915_private *dev_priv = to_i915(dev);
++ 	struct mipi_config *mipi_config = dev_priv->vbt.dsi.config;
++ 	struct mipi_pps_data *pps = dev_priv->vbt.dsi.pps;
++ 	struct drm_display_mode *mode = dev_priv->vbt.lfp_lvds_vbt_mode;
++ 	u16 burst_mode_ratio;
++ 	enum port port;
++ 
++ 	DRM_DEBUG_KMS("\n");
++ 
++ 	intel_dsi->eotp_pkt = mipi_config->eot_pkt_disabled ? 0 : 1;
++ 	intel_dsi->clock_stop = mipi_config->enable_clk_stop ? 1 : 0;
++ 	intel_dsi->lane_count = mipi_config->lane_cnt + 1;
++ 	intel_dsi->pixel_format =
++ 			pixel_format_from_register_bits(
++ 				mipi_config->videomode_color_format << 7);
++ 
++ 	intel_dsi->dual_link = mipi_config->dual_link;
++ 	intel_dsi->pixel_overlap = mipi_config->pixel_overlap;
++ 	intel_dsi->operation_mode = mipi_config->is_cmd_mode;
++ 	intel_dsi->video_mode_format = mipi_config->video_transfer_mode;
++ 	intel_dsi->escape_clk_div = mipi_config->byte_clk_sel;
++ 	intel_dsi->lp_rx_timeout = mipi_config->lp_rx_timeout;
++ 	intel_dsi->hs_tx_timeout = mipi_config->hs_tx_timeout;
++ 	intel_dsi->turn_arnd_val = mipi_config->turn_around_timeout;
++ 	intel_dsi->rst_timer_val = mipi_config->device_reset_timer;
++ 	intel_dsi->init_count = mipi_config->master_init_timer;
++ 	intel_dsi->bw_timer = mipi_config->dbi_bw_timer;
++ 	intel_dsi->video_frmt_cfg_bits =
++ 		mipi_config->bta_enabled ? DISABLE_VIDEO_BTA : 0;
++ 	intel_dsi->bgr_enabled = mipi_config->rgb_flip;
++ 
++ 	/* Starting point, adjusted depending on dual link and burst mode */
++ 	intel_dsi->pclk = mode->clock;
++ 
++ 	/* In dual link mode each port needs half of pixel clock */
++ 	if (intel_dsi->dual_link) {
++ 		intel_dsi->pclk /= 2;
++ 
++ 		/* we can enable pixel_overlap if needed by panel. In this
++ 		 * case we need to increase the pixelclock for extra pixels
++ 		 */
++ 		if (intel_dsi->dual_link == DSI_DUAL_LINK_FRONT_BACK) {
++ 			intel_dsi->pclk += DIV_ROUND_UP(mode->vtotal * intel_dsi->pixel_overlap * 60, 1000);
++ 		}
++ 	}
++ 
++ 	/* Burst Mode Ratio
++ 	 * Target ddr frequency from VBT / non burst ddr freq
++ 	 * multiply by 100 to preserve remainder
++ 	 */
++ 	if (intel_dsi->video_mode_format == VIDEO_MODE_BURST) {
++ 		if (mipi_config->target_burst_mode_freq) {
++ 			u32 bitrate = intel_dsi_bitrate(intel_dsi);
++ 
++ 			/*
++ 			 * Sometimes the VBT contains a slightly lower clock,
++ 			 * then the bitrate we have calculated, in this case
++ 			 * just replace it with the calculated bitrate.
++ 			 */
++ 			if (mipi_config->target_burst_mode_freq < bitrate &&
++ 			    intel_fuzzy_clock_check(
++ 					mipi_config->target_burst_mode_freq,
++ 					bitrate))
++ 				mipi_config->target_burst_mode_freq = bitrate;
++ 
++ 			if (mipi_config->target_burst_mode_freq < bitrate) {
++ 				DRM_ERROR("Burst mode freq is less than computed\n");
++ 				return false;
++ 			}
++ 
++ 			burst_mode_ratio = DIV_ROUND_UP(
++ 				mipi_config->target_burst_mode_freq * 100,
++ 				bitrate);
++ 
++ 			intel_dsi->pclk = DIV_ROUND_UP(intel_dsi->pclk * burst_mode_ratio, 100);
++ 		} else {
++ 			DRM_ERROR("Burst mode target is not set\n");
++ 			return false;
++ 		}
++ 	} else
++ 		burst_mode_ratio = 100;
++ 
++ 	intel_dsi->burst_mode_ratio = burst_mode_ratio;
++ 
++ 	if (INTEL_GEN(dev_priv) >= 11)
++ 		icl_dphy_param_init(intel_dsi);
++ 	else
++ 		vlv_dphy_param_init(intel_dsi);
+++>>>>>>> 2c1c55252647 (drm/i915/dsi: Use a fuzzy check for burst mode clock check)
+  
+  	DRM_DEBUG_KMS("Pclk %d\n", intel_dsi->pclk);
+  	DRM_DEBUG_KMS("Pixel overlap %d\n", intel_dsi->pixel_overlap);
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 98867581a27e..99c3823d1087 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -11117,7 +11117,7 @@ intel_modeset_pipe_config(struct drm_crtc *crtc,
+ 	return ret;
+ }
+ 
+-static bool intel_fuzzy_clock_check(int clock1, int clock2)
++bool intel_fuzzy_clock_check(int clock1, int clock2)
+ {
+ 	int diff;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index b8eefbffc77d..da57d6854934 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1567,6 +1567,7 @@ int vlv_force_pll_on(struct drm_i915_private *dev_priv, enum pipe pipe,
+ 		     const struct dpll *dpll);
+ void vlv_force_pll_off(struct drm_i915_private *dev_priv, enum pipe pipe);
+ int lpt_get_iclkip(struct drm_i915_private *dev_priv);
++bool intel_fuzzy_clock_check(int clock1, int clock2);
+ 
+ /* modesetting asserts */
+ void assert_panel_unlocked(struct drm_i915_private *dev_priv,
+* Unmerged path drivers/gpu/drm/i915/intel_dsi_vbt.c
