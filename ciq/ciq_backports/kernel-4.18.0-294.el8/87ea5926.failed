@@ -1,0 +1,191 @@
+device connection: Remove device_connection_add()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Heikki Krogerus <heikki.krogerus@linux.intel.com>
+commit 87ea5926247f7e15f0b5bc5b36cb210536177d77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/87ea5926.failed
+
+All the users of that API have now been converted to use
+software fwnodes instead.
+
+	Signed-off-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+Link: https://lore.kernel.org/r/20200904125123.83725-3-heikki.krogerus@linux.intel.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 87ea5926247f7e15f0b5bc5b36cb210536177d77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/devcon.c
+#	include/linux/device.h
+diff --cc drivers/base/devcon.c
+index 5bf9537bd738,94ab22a451ce..000000000000
+--- a/drivers/base/devcon.c
++++ b/drivers/base/devcon.c
+@@@ -99,139 -96,6 +96,112 @@@ EXPORT_SYMBOL_GPL(fwnode_connection_fin
+  void *device_connection_find_match(struct device *dev, const char *con_id,
+  				   void *data, devcon_match_fn_t match)
+  {
+- 	struct fwnode_handle *fwnode = dev_fwnode(dev);
+- 	const char *devname = dev_name(dev);
+- 	struct device_connection *con;
+- 	void *ret = NULL;
+- 	int ep;
+- 
+- 	if (!match)
+- 		return NULL;
+- 
+- 	ret = fwnode_connection_find_match(fwnode, con_id, data, match);
+- 	if (ret)
+- 		return ret;
+- 
+- 	mutex_lock(&devcon_lock);
+- 
+- 	list_for_each_entry(con, &devcon_list, list) {
+- 		ep = match_string(con->endpoint, 2, devname);
+- 		if (ep < 0)
+- 			continue;
+- 
+- 		if (con_id && strcmp(con->id, con_id))
+- 			continue;
+- 
+- 		ret = match(con, !ep, data);
+- 		if (ret)
+- 			break;
+- 	}
+- 
+- 	mutex_unlock(&devcon_lock);
+- 
+- 	return ret;
++ 	return fwnode_connection_find_match(dev_fwnode(dev), con_id, data, match);
+  }
+  EXPORT_SYMBOL_GPL(device_connection_find_match);
+++<<<<<<< HEAD
+ +
+ +extern struct bus_type platform_bus_type;
+ +extern struct bus_type pci_bus_type;
+ +extern struct bus_type i2c_bus_type;
+ +extern struct bus_type spi_bus_type;
+ +
+ +static struct bus_type *generic_match_buses[] = {
+ +	&platform_bus_type,
+ +#ifdef CONFIG_PCI
+ +	&pci_bus_type,
+ +#endif
+ +#ifdef CONFIG_I2C
+ +	&i2c_bus_type,
+ +#endif
+ +#ifdef CONFIG_SPI_MASTER
+ +	&spi_bus_type,
+ +#endif
+ +	NULL,
+ +};
+ +
+ +static int device_fwnode_match(struct device *dev, void *fwnode)
+ +{
+ +	return dev_fwnode(dev) == fwnode;
+ +}
+ +
+ +static void *device_connection_fwnode_match(struct device_connection *con)
+ +{
+ +	struct bus_type *bus;
+ +	struct device *dev;
+ +
+ +	for (bus = generic_match_buses[0]; bus; bus++) {
+ +		dev = bus_find_device(bus, NULL, (void *)con->fwnode,
+ +				      device_fwnode_match);
+ +		if (dev && !strncmp(dev_name(dev), con->id, strlen(con->id)))
+ +			return dev;
+ +
+ +		put_device(dev);
+ +	}
+ +	return NULL;
+ +}
+ +
+ +/* This tries to find the device from the most common bus types by name. */
+ +static void *generic_match(struct device_connection *con, int ep, void *data)
+ +{
+ +	struct bus_type *bus;
+ +	struct device *dev;
+ +
+ +	if (con->fwnode)
+ +		return device_connection_fwnode_match(con);
+ +
+ +	for (bus = generic_match_buses[0]; bus; bus++) {
+ +		dev = bus_find_device_by_name(bus, NULL, con->endpoint[ep]);
+ +		if (dev)
+ +			return dev;
+ +	}
+ +
+ +	/*
+ +	 * We only get called if a connection was found, tell the caller to
+ +	 * wait for the other device to show up.
+ +	 */
+ +	return ERR_PTR(-EPROBE_DEFER);
+ +}
+ +
+ +/**
+ + * device_connection_find - Find two devices connected together
+ + * @dev: Device with the connection
+ + * @con_id: Identifier for the connection
+ + *
+ + * Find a connection with unique identifier @con_id between @dev and
+ + * another device. On success returns handle to the device that is connected
+ + * to @dev, with the reference count for the found device incremented. Returns
+ + * NULL if no matching connection was found, or ERR_PTR(-EPROBE_DEFER) when a
+ + * connection was found but the other device has not been enumerated yet.
+ + */
+ +struct device *device_connection_find(struct device *dev, const char *con_id)
+ +{
+ +	return device_connection_find_match(dev, con_id, NULL, generic_match);
+ +}
+ +EXPORT_SYMBOL_GPL(device_connection_find);
+ +
+ +/**
+ + * device_connection_add - Register a connection description
+ + * @con: The connection description to be registered
+ + */
+ +void device_connection_add(struct device_connection *con)
+ +{
+ +	mutex_lock(&devcon_lock);
+ +	list_add_tail(&con->list, &devcon_list);
+ +	mutex_unlock(&devcon_lock);
+ +}
+ +EXPORT_SYMBOL_GPL(device_connection_add);
+ +
+ +/**
+ + * device_connections_remove - Unregister connection description
+ + * @con: The connection description to be unregistered
+ + */
+ +void device_connection_remove(struct device_connection *con)
+ +{
+ +	mutex_lock(&devcon_lock);
+ +	list_del(&con->list);
+ +	mutex_unlock(&devcon_lock);
+ +}
+ +EXPORT_SYMBOL_GPL(device_connection_remove);
+++=======
+++>>>>>>> 87ea5926247f (device connection: Remove device_connection_add())
+diff --cc include/linux/device.h
+index 00d8e9c254e7,ea37debb0a98..000000000000
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@@ -947,11 -317,6 +945,14 @@@ void *fwnode_connection_find_match(stru
+  void *device_connection_find_match(struct device *dev, const char *con_id,
+  				   void *data, devcon_match_fn_t match);
+  
+++<<<<<<< HEAD
+ +struct device *device_connection_find(struct device *dev, const char *con_id);
+ +
+ +void device_connection_add(struct device_connection *con);
+ +void device_connection_remove(struct device_connection *con);
+ +
+++=======
+++>>>>>>> 87ea5926247f (device connection: Remove device_connection_add())
+  /**
+   * enum device_link_state - Device link states.
+   * @DL_STATE_NONE: The presence of the drivers is not being tracked.
+* Unmerged path drivers/base/devcon.c
+* Unmerged path include/linux/device.h
