@@ -1,0 +1,151 @@
+x86/bugs: Add AMD retbleed= boot parameter
+
+jira LE-1907
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23825
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Alexandre Chartre <alexandre.chartre@oracle.com>
+commit 7fbf47c7ce50b38a64576b150e7011ae73d54669
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/7fbf47c7.failed
+
+Add the "retbleed=<value>" boot parameter to select a mitigation for
+RETBleed. Possible values are "off", "auto" and "unret"
+(JMP2RET mitigation). The default value is "auto".
+
+Currently, "retbleed=auto" will select the unret mitigation on
+AMD and Hygon and no mitigation on Intel (JMP2RET is not effective on
+Intel).
+
+  [peterz: rebase; add hygon]
+  [jpoimboe: cleanups]
+
+	Signed-off-by: Alexandre Chartre <alexandre.chartre@oracle.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@kernel.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit 7fbf47c7ce50b38a64576b150e7011ae73d54669)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/Kconfig
+index 99fd014c3c57,e35eecfb74f2..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -471,6 -472,22 +471,25 @@@ config RETPOLIN
+  	  branches. Requires a compiler with -mindirect-branch=thunk-extern
+  	  support for full protection. The kernel may run slower.
+  
+++<<<<<<< HEAD
+++=======
++ config CC_HAS_SLS
++ 	def_bool $(cc-option,-mharden-sls=all)
++ 
++ config CC_HAS_RETURN_THUNK
++ 	def_bool $(cc-option,-mfunction-return=thunk-extern)
++ 
++ config SLS
++ 	bool "Mitigate Straight-Line-Speculation"
++ 	depends on CC_HAS_SLS && X86_64
++ 	select OBJTOOL if HAVE_OBJTOOL
++ 	default n
++ 	help
++ 	  Compile the kernel with straight-line-speculation options to guard
++ 	  against straight line speculation. The kernel image might be slightly
++ 	  larger.
++ 
+++>>>>>>> 7fbf47c7ce50 (x86/bugs: Add AMD retbleed= boot parameter)
+  config X86_CPU_RESCTRL
+  	bool "x86 CPU resource control support"
+  	depends on X86 && (CPU_SUP_INTEL || CPU_SUP_AMD)
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 951579a17911,bdeb732ff2d9..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -105,24 -119,20 +106,30 @@@ void __init check_bugs(void
+  	if (boot_cpu_has(X86_FEATURE_STIBP))
+  		x86_spec_ctrl_mask |= SPEC_CTRL_STIBP;
+  
+ +	/* IBRS initialization */
+ +	spec_ctrl_init();
+ +
+  	/* Select the proper CPU mitigations before patching alternatives: */
+  	spectre_v1_select_mitigation();
++ 	retbleed_select_mitigation();
++ 	/*
++ 	 * spectre_v2_select_mitigation() relies on the state set by
++ 	 * retbleed_select_mitigation(); specifically the STIBP selection is
++ 	 * forced for UNRET.
++ 	 */
+  	spectre_v2_select_mitigation();
+ +	spec_ctrl_cpu_init();
+  	ssb_select_mitigation();
+  	l1tf_select_mitigation();
+ -	md_clear_select_mitigation();
+ +	mds_select_mitigation();
+ +	taa_select_mitigation();
+  	srbds_select_mitigation();
+ -	l1d_flush_select_mitigation();
+ +
+ +	/*
+ +	 * As MDS and TAA mitigations are inter-related, update and print their
+ +	 * mitigation after TAA mitigation selection is done.
+ +	 */
+ +	md_clear_update_mitigation();
+  
+  	arch_smt_update();
+  
+@@@ -1873,6 -2095,16 +1974,19 @@@ static ssize_t srbds_show_state(char *b
+  	return sprintf(buf, "%s\n", srbds_strings[srbds_mitigation]);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t retbleed_show_state(char *buf)
++ {
++ 	if (retbleed_mitigation == RETBLEED_MITIGATION_UNRET &&
++ 	    (boot_cpu_data.x86_vendor != X86_VENDOR_AMD &&
++ 	     boot_cpu_data.x86_vendor != X86_VENDOR_HYGON))
++ 		return sprintf(buf, "Vulnerable: untrained return thunk on non-Zen uarch\n");
++ 
++ 	return sprintf(buf, "%s\n", retbleed_strings[retbleed_mitigation]);
++ }
++ 
+++>>>>>>> 7fbf47c7ce50 (x86/bugs: Add AMD retbleed= boot parameter)
+  static ssize_t cpu_show_common(struct device *dev, struct device_attribute *attr,
+  			       char *buf, unsigned int bug)
+  {
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index e078ec640fa5..a079a0ae0f21 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -4546,6 +4546,21 @@
+ 
+ 	retain_initrd	[RAM] Keep initrd memory after extraction
+ 
++	retbleed=	[X86] Control mitigation of RETBleed (Arbitrary
++			Speculative Code Execution with Return Instructions)
++			vulnerability.
++
++			off         - unconditionally disable
++			auto        - automatically select a migitation
++			unret       - force enable untrained return thunks,
++				      only effective on AMD Zen {1,2}
++				      based systems.
++
++			Selecting 'auto' will choose a mitigation method at run
++			time according to the CPU.
++
++			Not specifying this option is equivalent to retbleed=auto.
++
+ 	rfkill.default_state=
+ 		0	"airplane mode".  All wifi, bluetooth, wimax, gps, fm,
+ 			etc. communication is blocked by default.
+* Unmerged path arch/x86/Kconfig
+* Unmerged path arch/x86/kernel/cpu/bugs.c
