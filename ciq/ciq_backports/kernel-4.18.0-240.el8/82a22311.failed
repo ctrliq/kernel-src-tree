@@ -1,0 +1,189 @@
+XArray: Fix xas_pause at ULONG_MAX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Matthew Wilcox (Oracle) <willy@infradead.org>
+commit 82a22311b7a68a78709699dc8c098953b70e4fd2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/82a22311.failed
+
+If we were unlucky enough to call xas_pause() when the index was at
+ULONG_MAX (or a multi-slot entry which ends at ULONG_MAX), we would
+wrap the index back around to 0 and restart the iteration from the
+beginning.  Use the XAS_BOUNDS state to indicate that we should just
+stop the iteration.
+
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+(cherry picked from commit 82a22311b7a68a78709699dc8c098953b70e4fd2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/test_xarray.c
+diff --cc lib/test_xarray.c
+index 0436f0c804e5,c477f22a95cd..000000000000
+--- a/lib/test_xarray.c
++++ b/lib/test_xarray.c
+@@@ -978,6 -1055,104 +978,107 @@@ static noinline void check_find(struct 
+  	check_multi_find_2(xa);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* See find_swap_entry() in mm/shmem.c */
++ static noinline unsigned long xa_find_entry(struct xarray *xa, void *item)
++ {
++ 	XA_STATE(xas, xa, 0);
++ 	unsigned int checked = 0;
++ 	void *entry;
++ 
++ 	rcu_read_lock();
++ 	xas_for_each(&xas, entry, ULONG_MAX) {
++ 		if (xas_retry(&xas, entry))
++ 			continue;
++ 		if (entry == item)
++ 			break;
++ 		checked++;
++ 		if ((checked % 4) != 0)
++ 			continue;
++ 		xas_pause(&xas);
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return entry ? xas.xa_index : -1;
++ }
++ 
++ static noinline void check_find_entry(struct xarray *xa)
++ {
++ #ifdef CONFIG_XARRAY_MULTI
++ 	unsigned int order;
++ 	unsigned long offset, index;
++ 
++ 	for (order = 0; order < 20; order++) {
++ 		for (offset = 0; offset < (1UL << (order + 3));
++ 		     offset += (1UL << order)) {
++ 			for (index = 0; index < (1UL << (order + 5));
++ 			     index += (1UL << order)) {
++ 				xa_store_order(xa, index, order,
++ 						xa_mk_index(index), GFP_KERNEL);
++ 				XA_BUG_ON(xa, xa_load(xa, index) !=
++ 						xa_mk_index(index));
++ 				XA_BUG_ON(xa, xa_find_entry(xa,
++ 						xa_mk_index(index)) != index);
++ 			}
++ 			XA_BUG_ON(xa, xa_find_entry(xa, xa) != -1);
++ 			xa_destroy(xa);
++ 		}
++ 	}
++ #endif
++ 
++ 	XA_BUG_ON(xa, xa_find_entry(xa, xa) != -1);
++ 	xa_store_index(xa, ULONG_MAX, GFP_KERNEL);
++ 	XA_BUG_ON(xa, xa_find_entry(xa, xa) != -1);
++ 	XA_BUG_ON(xa, xa_find_entry(xa, xa_mk_index(ULONG_MAX)) != -1);
++ 	xa_erase_index(xa, ULONG_MAX);
++ 	XA_BUG_ON(xa, !xa_empty(xa));
++ }
++ 
++ static noinline void check_move_tiny(struct xarray *xa)
++ {
++ 	XA_STATE(xas, xa, 0);
++ 
++ 	XA_BUG_ON(xa, !xa_empty(xa));
++ 	rcu_read_lock();
++ 	XA_BUG_ON(xa, xas_next(&xas) != NULL);
++ 	XA_BUG_ON(xa, xas_next(&xas) != NULL);
++ 	rcu_read_unlock();
++ 	xa_store_index(xa, 0, GFP_KERNEL);
++ 	rcu_read_lock();
++ 	xas_set(&xas, 0);
++ 	XA_BUG_ON(xa, xas_next(&xas) != xa_mk_index(0));
++ 	XA_BUG_ON(xa, xas_next(&xas) != NULL);
++ 	xas_set(&xas, 0);
++ 	XA_BUG_ON(xa, xas_prev(&xas) != xa_mk_index(0));
++ 	XA_BUG_ON(xa, xas_prev(&xas) != NULL);
++ 	rcu_read_unlock();
++ 	xa_erase_index(xa, 0);
++ 	XA_BUG_ON(xa, !xa_empty(xa));
++ }
++ 
++ static noinline void check_move_max(struct xarray *xa)
++ {
++ 	XA_STATE(xas, xa, 0);
++ 
++ 	xa_store_index(xa, ULONG_MAX, GFP_KERNEL);
++ 	rcu_read_lock();
++ 	XA_BUG_ON(xa, xas_find(&xas, ULONG_MAX) != xa_mk_index(ULONG_MAX));
++ 	XA_BUG_ON(xa, xas_find(&xas, ULONG_MAX) != NULL);
++ 	rcu_read_unlock();
++ 
++ 	xas_set(&xas, 0);
++ 	rcu_read_lock();
++ 	XA_BUG_ON(xa, xas_find(&xas, ULONG_MAX) != xa_mk_index(ULONG_MAX));
++ 	xas_pause(&xas);
++ 	XA_BUG_ON(xa, xas_find(&xas, ULONG_MAX) != NULL);
++ 	rcu_read_unlock();
++ 
++ 	xa_erase_index(xa, ULONG_MAX);
++ 	XA_BUG_ON(xa, !xa_empty(xa));
++ }
++ 
+++>>>>>>> 82a22311b7a6 (XArray: Fix xas_pause at ULONG_MAX)
+  static noinline void check_move_small(struct xarray *xa, unsigned long idx)
+  {
+  	XA_STATE(xas, xa, 0);
+@@@ -1085,6 -1260,9 +1186,12 @@@ static noinline void check_move(struct 
+  
+  	xa_destroy(xa);
+  
+++<<<<<<< HEAD
+++=======
++ 	check_move_tiny(xa);
++ 	check_move_max(xa);
++ 
+++>>>>>>> 82a22311b7a6 (XArray: Fix xas_pause at ULONG_MAX)
+  	for (i = 0; i < 16; i++)
+  		check_move_small(xa, 1UL << i);
+  
+* Unmerged path lib/test_xarray.c
+diff --git a/lib/xarray.c b/lib/xarray.c
+index 3fdc1d4bf44d..b25ef27e2c0c 100644
+--- a/lib/xarray.c
++++ b/lib/xarray.c
+@@ -967,6 +967,7 @@ void xas_pause(struct xa_state *xas)
+ 	if (xas_invalid(xas))
+ 		return;
+ 
++	xas->xa_node = XAS_RESTART;
+ 	if (node) {
+ 		unsigned int offset = xas->xa_offset;
+ 		while (++offset < XA_CHUNK_SIZE) {
+@@ -974,10 +975,11 @@ void xas_pause(struct xa_state *xas)
+ 				break;
+ 		}
+ 		xas->xa_index += (offset - xas->xa_offset) << node->shift;
++		if (xas->xa_index == 0)
++			xas->xa_node = XAS_BOUNDS;
+ 	} else {
+ 		xas->xa_index++;
+ 	}
+-	xas->xa_node = XAS_RESTART;
+ }
+ EXPORT_SYMBOL_GPL(xas_pause);
+ 
+@@ -1075,13 +1077,13 @@ void *xas_find(struct xa_state *xas, unsigned long max)
+ {
+ 	void *entry;
+ 
+-	if (xas_error(xas))
++	if (xas_error(xas) || xas->xa_node == XAS_BOUNDS)
+ 		return NULL;
+ 
+ 	if (!xas->xa_node) {
+ 		xas->xa_index = 1;
+ 		return set_bounds(xas);
+-	} else if (xas_top(xas->xa_node)) {
++	} else if (xas->xa_node == XAS_RESTART) {
+ 		entry = xas_load(xas);
+ 		if (entry || xas_not_node(xas->xa_node))
+ 			return entry;
