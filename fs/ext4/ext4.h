@@ -1044,8 +1044,6 @@ struct ext4_inode_info {
 	/* allocation reservation info for delalloc */
 	/* In case of bigalloc, this refer to clusters rather than blocks */
 	unsigned int i_reserved_data_blocks;
-	ext4_lblk_t i_da_metadata_calc_last_lblock;
-	int i_da_metadata_calc_len;
 
 	/* pending cluster reservations for bigalloc file systems */
 	struct ext4_pending_tree i_pending_tree;
@@ -2584,7 +2582,6 @@ extern int ext4_issue_zeroout(struct inode *inode, ext4_lblk_t lblk,
 /* indirect.c */
 extern int ext4_ind_map_blocks(handle_t *handle, struct inode *inode,
 				struct ext4_map_blocks *map, int flags);
-extern int ext4_ind_calc_metadata_amount(struct inode *inode, sector_t lblock);
 extern int ext4_ind_trans_blocks(struct inode *inode, int nrblocks);
 extern void ext4_ind_truncate(handle_t *, struct inode *inode);
 extern int ext4_ind_remove_space(handle_t *handle, struct inode *inode,
@@ -3236,8 +3233,6 @@ extern int ext4_convert_unwritten_extents(handle_t *handle, struct inode *inode,
 					  loff_t offset, ssize_t len);
 extern int ext4_map_blocks(handle_t *handle, struct inode *inode,
 			   struct ext4_map_blocks *map, int flags);
-extern int ext4_ext_calc_metadata_amount(struct inode *inode,
-					 ext4_lblk_t lblocks);
 extern int ext4_ext_calc_credits_for_single_extent(struct inode *inode,
 						   int num,
 						   struct ext4_ext_path *path);
