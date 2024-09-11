@@ -1,0 +1,377 @@
+swiotlb: split up the global swiotlb lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Tianyu Lan <Tianyu.Lan@microsoft.com>
+commit 20347fca71a387a3751f7bb270062616ddc5317a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/20347fca.failed
+
+Traditionally swiotlb was not performance critical because it was only
+used for slow devices. But in some setups, like TDX/SEV confidential
+guests, all IO has to go through swiotlb. Currently swiotlb only has a
+single lock. Under high IO load with multiple CPUs this can lead to
+significat lock contention on the swiotlb lock.
+
+This patch splits the swiotlb bounce buffer pool into individual areas
+which have their own lock. Each CPU tries to allocate in its own area
+first. Only if that fails does it search other areas. On freeing the
+allocation is freed into the area where the memory was originally
+allocated from.
+
+Area number can be set via swiotlb kernel parameter and is default
+to be possible cpu number. If possible cpu number is not power of
+2, area number will be round up to the next power of 2.
+
+This idea from Andi Kleen patch(https://github.com/intel/tdx/commit/
+4529b5784c141782c72ec9bd9a92df2b68cb7d45).
+
+Based-on-idea-by: Andi Kleen <ak@linux.intel.com>
+	Signed-off-by: Tianyu Lan <Tianyu.Lan@microsoft.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 20347fca71a387a3751f7bb270062616ddc5317a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/dma/swiotlb.c
+diff --cc kernel/dma/swiotlb.c
+index 623d86fa3853,dcf1459ce723..000000000000
+--- a/kernel/dma/swiotlb.c
++++ b/kernel/dma/swiotlb.c
+@@@ -195,7 -244,8 +247,12 @@@ void __init swiotlb_update_mem_attribut
+  }
+  
+  static void swiotlb_init_io_tlb_mem(struct io_tlb_mem *mem, phys_addr_t start,
+++<<<<<<< HEAD
+ +				    unsigned long nslabs, bool late_alloc)
+++=======
++ 		unsigned long nslabs, unsigned int flags,
++ 		bool late_alloc, unsigned int nareas)
+++>>>>>>> 20347fca71a3 (swiotlb: split up the global swiotlb lock)
+  {
+  	void *vaddr = phys_to_virt(start);
+  	unsigned long bytes = nslabs << IO_TLB_SHIFT, i;
+@@@ -205,11 -255,17 +262,18 @@@
+  	mem->end = mem->start + bytes;
+  	mem->index = 0;
+  	mem->late_alloc = late_alloc;
++ 	mem->nareas = nareas;
++ 	mem->area_nslabs = nslabs / mem->nareas;
+  
+ -	mem->force_bounce = swiotlb_force_bounce || (flags & SWIOTLB_FORCE);
+ +	if (swiotlb_force == SWIOTLB_FORCE)
+ +		mem->force_bounce = true;
+  
+  	spin_lock_init(&mem->lock);
++ 	for (i = 0; i < mem->nareas; i++) {
++ 		spin_lock_init(&mem->areas[i].lock);
++ 		mem->areas[i].index = 0;
++ 	}
++ 
+  	for (i = 0; i < mem->nslabs; i++) {
+  		mem->slots[i].list = IO_TLB_SEGSIZE - io_tlb_offset(i);
+  		mem->slots[i].orig_addr = INVALID_PHYS_ADDR;
+@@@ -228,17 -284,61 +292,61 @@@
+  	return;
+  }
+  
+ -/*
+ - * Statically reserve bounce buffer space and initialize bounce buffer data
+ - * structures for the software IO TLB used to implement the DMA API.
+ - */
+ -void __init swiotlb_init_remap(bool addressing_limit, unsigned int flags,
+ -		int (*remap)(void *tlb, unsigned long nslabs))
+ +int __init swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose)
+  {
+  	struct io_tlb_mem *mem = &io_tlb_default_mem;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long nslabs;
+++>>>>>>> 20347fca71a3 (swiotlb: split up the global swiotlb lock)
+  	size_t alloc_size;
+ -	size_t bytes;
+ -	void *tlb;
+  
+ -	if (!addressing_limit && !swiotlb_force_bounce)
+ -		return;
+ -	if (swiotlb_force_disable)
+ -		return;
+ +	if (swiotlb_force == SWIOTLB_NO_FORCE)
+ +		return 0;
+  
+++<<<<<<< HEAD
+ +	/* protect against double initialization */
+ +	if (WARN_ON_ONCE(mem->nslabs))
+ +		return -ENOMEM;
+++=======
++ 	/*
++ 	 * default_nslabs maybe changed when adjust area number.
++ 	 * So allocate bounce buffer after adjusting area number.
++ 	 */
++ 	if (!default_nareas)
++ 		swiotlb_adjust_nareas(num_possible_cpus());
++ 
++ 	nslabs = default_nslabs;
++ 	if (nslabs < IO_TLB_MIN_SLABS)
++ 		panic("%s: nslabs = %lu too small\n", __func__, nslabs);
++ 
++ 	/*
++ 	 * By default allocate the bounce buffer memory from low memory, but
++ 	 * allow to pick a location everywhere for hypervisors with guest
++ 	 * memory encryption.
++ 	 */
++ retry:
++ 	bytes = PAGE_ALIGN(nslabs << IO_TLB_SHIFT);
++ 	if (flags & SWIOTLB_ANY)
++ 		tlb = memblock_alloc(bytes, PAGE_SIZE);
++ 	else
++ 		tlb = memblock_alloc_low(bytes, PAGE_SIZE);
++ 	if (!tlb) {
++ 		pr_warn("%s: Failed to allocate %zu bytes tlb structure\n",
++ 			__func__, bytes);
++ 		return;
++ 	}
++ 
++ 	if (remap && remap(tlb, nslabs) < 0) {
++ 		memblock_free(tlb, PAGE_ALIGN(bytes));
++ 
++ 		nslabs = ALIGN(nslabs >> 1, IO_TLB_SEGSIZE);
++ 		if (nslabs < IO_TLB_MIN_SLABS)
++ 			panic("%s: Failed to remap %zu bytes\n",
++ 			      __func__, bytes);
++ 		goto retry;
++ 	}
+++>>>>>>> 20347fca71a3 (swiotlb: split up the global swiotlb lock)
+  
+  	alloc_size = PAGE_ALIGN(array_size(sizeof(*mem->slots), nslabs));
+  	mem->slots = memblock_alloc(alloc_size, PAGE_SIZE);
+@@@ -246,38 -346,21 +354,48 @@@
+  		panic("%s: Failed to allocate %zu bytes align=0x%lx\n",
+  		      __func__, alloc_size, PAGE_SIZE);
+  
+++<<<<<<< HEAD
+ +	swiotlb_init_io_tlb_mem(mem, __pa(tlb), nslabs, false);
+++=======
++ 	mem->areas = memblock_alloc(sizeof(struct io_tlb_area) *
++ 		default_nareas, SMP_CACHE_BYTES);
++ 	if (!mem->areas)
++ 		panic("%s: Failed to allocate mem->areas.\n", __func__);
++ 
++ 	swiotlb_init_io_tlb_mem(mem, __pa(tlb), nslabs, flags, false,
++ 				default_nareas);
+++>>>>>>> 20347fca71a3 (swiotlb: split up the global swiotlb lock)
+  
+ -	if (flags & SWIOTLB_VERBOSE)
+ +	if (verbose)
+  		swiotlb_print_info();
+ +	return 0;
+  }
+  
+ -void __init swiotlb_init(bool addressing_limit, unsigned int flags)
+ +/*
+ + * Statically reserve bounce buffer space and initialize bounce buffer data
+ + * structures for the software IO TLB used to implement the DMA API.
+ + */
+ +void  __init
+ +swiotlb_init(int verbose)
+  {
+ -	swiotlb_init_remap(addressing_limit, flags, NULL);
+ +	size_t bytes = PAGE_ALIGN(default_nslabs << IO_TLB_SHIFT);
+ +	void *tlb;
+ +
+ +	if (swiotlb_force == SWIOTLB_NO_FORCE)
+ +		return;
+ +
+ +	/* Get IO TLB memory from the low pages */
+ +	tlb = memblock_alloc_low_nopanic(bytes, PAGE_SIZE);
+ +	if (!tlb)
+ +		goto fail;
+ +	if (swiotlb_init_with_tbl(tlb, default_nslabs, verbose))
+ +		goto fail_free_mem;
+ +	return;
+ +
+ +fail_free_mem:
+ +	memblock_free_early(__pa(tlb), bytes);
+ +fail:
+ +	pr_warn("Cannot allocate buffer");
+  }
+  
+  /*
+@@@ -285,20 -368,22 +403,25 @@@
+   * initialize the swiotlb later using the slab allocator if needed.
+   * This should be just like above, but with some error catching.
+   */
+ -int swiotlb_init_late(size_t size, gfp_t gfp_mask,
+ -		int (*remap)(void *tlb, unsigned long nslabs))
+ +int swiotlb_init_late(size_t size, gfp_t gfp_mask)
+  {
+ -	struct io_tlb_mem *mem = &io_tlb_default_mem;
+  	unsigned long nslabs = ALIGN(size >> IO_TLB_SHIFT, IO_TLB_SEGSIZE);
+ +	unsigned long bytes;
+  	unsigned char *vstart = NULL;
+++<<<<<<< HEAD
+ +	unsigned int order;
+++=======
++ 	unsigned int order, area_order;
++ 	bool retried = false;
+++>>>>>>> 20347fca71a3 (swiotlb: split up the global swiotlb lock)
+  	int rc = 0;
+  
+ -	if (swiotlb_force_disable)
+ +	if (swiotlb_force == SWIOTLB_NO_FORCE)
+  		return 0;
+  
+ -retry:
+  	order = get_order(nslabs << IO_TLB_SHIFT);
+  	nslabs = SLABS_PER_PAGE << order;
+ +	bytes = nslabs << IO_TLB_SHIFT;
+  
+  	while ((SLABS_PER_PAGE << order) > IO_TLB_MIN_SLABS) {
+  		vstart = (void *)__get_free_pages(gfp_mask | __GFP_NOWARN,
+@@@ -311,38 -398,42 +434,57 @@@
+  	if (!vstart)
+  		return -ENOMEM;
+  
+ -	if (remap)
+ -		rc = remap(vstart, nslabs);
+ -	if (rc) {
+ -		free_pages((unsigned long)vstart, order);
+ -
+ -		nslabs = ALIGN(nslabs >> 1, IO_TLB_SEGSIZE);
+ -		if (nslabs < IO_TLB_MIN_SLABS)
+ -			return rc;
+ -		retried = true;
+ -		goto retry;
+ -	}
+ -
+ -	if (retried) {
+ +	if (order != get_order(bytes)) {
+  		pr_warn("only able to allocate %ld MB\n",
+  			(PAGE_SIZE << order) >> 20);
+ +		nslabs = SLABS_PER_PAGE << order;
+  	}
+ +	rc = swiotlb_late_init_with_tbl(vstart, nslabs);
+ +	if (rc)
+ +		free_pages((unsigned long)vstart, order);
+ +
+ +	return rc;
+ +}
+ +
+ +int
+ +swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs)
+ +{
+ +	struct io_tlb_mem *mem = &io_tlb_default_mem;
+ +	unsigned long bytes = nslabs << IO_TLB_SHIFT;
+ +
+ +	if (swiotlb_force == SWIOTLB_NO_FORCE)
+ +		return 0;
+ +
+ +	/* protect against double initialization */
+ +	if (WARN_ON_ONCE(mem->nslabs))
+ +		return -ENOMEM;
+  
++ 	if (!default_nareas)
++ 		swiotlb_adjust_nareas(num_possible_cpus());
++ 
++ 	area_order = get_order(array_size(sizeof(*mem->areas),
++ 		default_nareas));
++ 	mem->areas = (struct io_tlb_area *)
++ 		__get_free_pages(GFP_KERNEL | __GFP_ZERO, area_order);
++ 	if (!mem->areas)
++ 		goto error_area;
++ 
+  	mem->slots = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
+  		get_order(array_size(sizeof(*mem->slots), nslabs)));
+  	if (!mem->slots)
+++<<<<<<< HEAD
+ +		return -ENOMEM;
+ +
+ +	set_memory_decrypted((unsigned long)tlb, bytes >> PAGE_SHIFT);
+ +	swiotlb_init_io_tlb_mem(mem, virt_to_phys(tlb), nslabs, true);
+++=======
++ 		goto error_slots;
++ 
++ 	set_memory_decrypted((unsigned long)vstart,
++ 			     (nslabs << IO_TLB_SHIFT) >> PAGE_SHIFT);
++ 	swiotlb_init_io_tlb_mem(mem, virt_to_phys(vstart), nslabs, 0, true,
++ 				default_nareas);
+++>>>>>>> 20347fca71a3 (swiotlb: split up the global swiotlb lock)
+  
+  	swiotlb_print_info();
+  	return 0;
+@@@ -353,8 -450,9 +501,9 @@@ void __init swiotlb_exit(void
+  	struct io_tlb_mem *mem = &io_tlb_default_mem;
+  	unsigned long tbl_vaddr;
+  	size_t tbl_size, slots_size;
++ 	unsigned int area_order;
+  
+ -	if (swiotlb_force_bounce)
+ +	if (swiotlb_force == SWIOTLB_FORCE)
+  		return;
+  
+  	if (!mem->nslabs)
+@@@ -831,10 -976,18 +1031,23 @@@ static int rmem_swiotlb_device_init(str
+  			return -ENOMEM;
+  		}
+  
++ 		mem->areas = kcalloc(nareas, sizeof(*mem->areas),
++ 				GFP_KERNEL);
++ 		if (!mem->areas) {
++ 			kfree(mem);
++ 			kfree(mem->slots);
++ 			return -ENOMEM;
++ 		}
++ 
+  		set_memory_decrypted((unsigned long)phys_to_virt(rmem->base),
+  				     rmem->size >> PAGE_SHIFT);
+++<<<<<<< HEAD
+ +		swiotlb_init_io_tlb_mem(mem, rmem->base, nslabs, false);
+ +		mem->force_bounce = true;
+++=======
++ 		swiotlb_init_io_tlb_mem(mem, rmem->base, nslabs, SWIOTLB_FORCE,
++ 					false, nareas);
+++>>>>>>> 20347fca71a3 (swiotlb: split up the global swiotlb lock)
+  		mem->for_alloc = true;
+  
+  		rmem->priv = mem;
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index de7f8625946b..89ee43b70da0 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -5173,8 +5173,10 @@
+ 			it if 0 is given (See Documentation/cgroup-v1/memory.txt)
+ 
+ 	swiotlb=	[ARM,IA-64,PPC,MIPS,X86]
+-			Format: { <int> | force | noforce }
++			Format: { <int> [,<int>] | force | noforce }
+ 			<int> -- Number of I/O TLB slabs
++			<int> -- Second integer after comma. Number of swiotlb
++				 areas with their own lock. Must be power of 2.
+ 			force -- force using of bounce buffers even if they
+ 			         wouldn't be automatically used by the kernel
+ 			noforce -- Never use bounce buffers (for debugging)
+diff --git a/include/linux/swiotlb.h b/include/linux/swiotlb.h
+index 2d8f1b3753d4..3ebcad775a74 100644
+--- a/include/linux/swiotlb.h
++++ b/include/linux/swiotlb.h
+@@ -90,6 +90,8 @@ dma_addr_t swiotlb_map(struct device *dev, phys_addr_t phys,
+  * @late_alloc:	%true if allocated using the page allocator
+  * @force_bounce: %true if swiotlb bouncing is forced
+  * @for_alloc:  %true if the pool is used for memory allocation
++ * @nareas:  The area number in the pool.
++ * @area_nslabs: The slot number in the area.
+  */
+ struct io_tlb_mem {
+ 	phys_addr_t start;
+@@ -103,6 +105,9 @@ struct io_tlb_mem {
+ 	bool late_alloc;
+ 	bool force_bounce;
+ 	bool for_alloc;
++	unsigned int nareas;
++	unsigned int area_nslabs;
++	struct io_tlb_area *areas;
+ 	struct io_tlb_slot {
+ 		phys_addr_t orig_addr;
+ 		size_t alloc_size;
+* Unmerged path kernel/dma/swiotlb.c
