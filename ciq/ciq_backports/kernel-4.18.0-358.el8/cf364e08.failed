@@ -1,0 +1,151 @@
+KVM: arm64: Upgrade VMID accesses to {READ,WRITE}_ONCE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit cf364e08ea1c5dd217afb658d510aaef7d0cc6f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/cf364e08.failed
+
+Since TLB invalidation can run in parallel with VMID allocation,
+we need to be careful and avoid any sort of load/store tearing.
+Use {READ,WRITE}_ONCE consistently to avoid any surprise.
+
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Jade Alglave <jade.alglave@arm.com>
+	Cc: Shameer Kolothum <shameerali.kolothum.thodi@huawei.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+	Signed-off-by: Will Deacon <will@kernel.org>
+	Reviewed-by: Quentin Perret <qperret@google.com>
+Link: https://lore.kernel.org/r/20210806113109.2475-6-will@kernel.org
+(cherry picked from commit cf364e08ea1c5dd217afb658d510aaef7d0cc6f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_mmu.h
+#	arch/arm64/kvm/hyp/nvhe/mem_protect.c
+#	arch/arm64/kvm/mmu.c
+diff --cc arch/arm64/include/asm/kvm_mmu.h
+index a6196c98d5d0,02d378887743..000000000000
+--- a/arch/arm64/include/asm/kvm_mmu.h
++++ b/arch/arm64/include/asm/kvm_mmu.h
+@@@ -559,37 -253,18 +559,50 @@@ static inline int hyp_map_aux_data(void
+  #define kvm_phys_to_vttbr(addr)		phys_to_ttbr(addr)
+  
+  /*
+++<<<<<<< HEAD
+ + * Get the magic number 'x' for VTTBR:BADDR of this KVM instance.
+ + * With v8.2 LVA extensions, 'x' should be a minimum of 6 with
+ + * 52bit IPS.
+ + */
+ +static inline int arm64_vttbr_x(u32 ipa_shift, u32 levels)
+++=======
++  * When this is (directly or indirectly) used on the TLB invalidation
++  * path, we rely on a previously issued DSB so that page table updates
++  * and VMID reads are correctly ordered.
++  */
++ static __always_inline u64 kvm_get_vttbr(struct kvm_s2_mmu *mmu)
+++>>>>>>> cf364e08ea1c (KVM: arm64: Upgrade VMID accesses to {READ,WRITE}_ONCE)
+  {
+ -	struct kvm_vmid *vmid = &mmu->vmid;
+ +	int x = ARM64_VTTBR_X(ipa_shift, levels);
+ +
+ +	return (IS_ENABLED(CONFIG_ARM64_PA_BITS_52) && x < 6) ? 6 : x;
+ +}
+ +
+ +static inline u64 vttbr_baddr_mask(u32 ipa_shift, u32 levels)
+ +{
+ +	unsigned int x = arm64_vttbr_x(ipa_shift, levels);
+ +
+ +	return GENMASK_ULL(PHYS_MASK_SHIFT - 1, x);
+ +}
+ +
+ +static inline u64 kvm_vttbr_baddr_mask(struct kvm *kvm)
+ +{
+ +	return vttbr_baddr_mask(kvm_phys_shift(kvm), kvm_stage2_levels(kvm));
+ +}
+ +
+ +static __always_inline u64 kvm_get_vttbr(struct kvm *kvm)
+ +{
+ +	struct kvm_vmid *vmid = &kvm->arch.vmid;
+  	u64 vmid_field, baddr;
+  	u64 cnp = system_supports_cnp() ? VTTBR_CNP_BIT : 0;
+  
+++<<<<<<< HEAD
+ +	baddr = kvm->arch.pgd_phys;
+ +	vmid_field = (u64)vmid->vmid << VTTBR_VMID_SHIFT;
+++=======
++ 	baddr = mmu->pgd_phys;
++ 	vmid_field = (u64)READ_ONCE(vmid->vmid) << VTTBR_VMID_SHIFT;
+++>>>>>>> cf364e08ea1c (KVM: arm64: Upgrade VMID accesses to {READ,WRITE}_ONCE)
+  	return kvm_phys_to_vttbr(baddr) | vmid_field | cnp;
+  }
+  
+diff --cc arch/arm64/kvm/mmu.c
+index da158928567b,d9152717cbd9..000000000000
+--- a/arch/arm64/kvm/mmu.c
++++ b/arch/arm64/kvm/mmu.c
+@@@ -888,18 -465,34 +888,34 @@@ int kvm_alloc_stage2_pgd(struct kvm *kv
+  		return -EINVAL;
+  	}
+  
+ -	pgt = kzalloc(sizeof(*pgt), GFP_KERNEL);
+ -	if (!pgt)
+ +	/* Allocate the HW PGD, making sure that each page gets its own refcount */
+ +	pgd = alloc_pages_exact(stage2_pgd_size(kvm), GFP_KERNEL | __GFP_ZERO);
+ +	if (!pgd)
+  		return -ENOMEM;
+  
+ -	err = kvm_pgtable_stage2_init(pgt, &kvm->arch, &kvm_s2_mm_ops);
+ -	if (err)
+ -		goto out_free_pgtable;
+ +	pgd_phys = virt_to_phys(pgd);
+ +	if (WARN_ON(pgd_phys & ~kvm_vttbr_baddr_mask(kvm)))
+ +		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	kvm->arch.pgd = pgd;
+ +	kvm->arch.pgd_phys = pgd_phys;
+++=======
++ 	mmu->last_vcpu_ran = alloc_percpu(typeof(*mmu->last_vcpu_ran));
++ 	if (!mmu->last_vcpu_ran) {
++ 		err = -ENOMEM;
++ 		goto out_destroy_pgtable;
++ 	}
++ 
++ 	for_each_possible_cpu(cpu)
++ 		*per_cpu_ptr(mmu->last_vcpu_ran, cpu) = -1;
++ 
++ 	mmu->arch = &kvm->arch;
++ 	mmu->pgt = pgt;
++ 	mmu->pgd_phys = __pa(pgt->pgd);
++ 	WRITE_ONCE(mmu->vmid.vmid_gen, 0);
+++>>>>>>> cf364e08ea1c (KVM: arm64: Upgrade VMID accesses to {READ,WRITE}_ONCE)
+  	return 0;
+ -
+ -out_destroy_pgtable:
+ -	kvm_pgtable_stage2_destroy(pgt);
+ -out_free_pgtable:
+ -	kfree(pgt);
+ -	return err;
+  }
+  
+  static void stage2_unmap_memslot(struct kvm *kvm,
+* Unmerged path arch/arm64/kvm/hyp/nvhe/mem_protect.c
+* Unmerged path arch/arm64/include/asm/kvm_mmu.h
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index 4ecdde00c1d0..7df31c834f33 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -528,7 +528,7 @@ static void update_vmid(struct kvm_vmid *vmid)
+ 		kvm_call_hyp(__kvm_flush_vm_context);
+ 	}
+ 
+-	vmid->vmid = kvm_next_vmid;
++	WRITE_ONCE(vmid->vmid, kvm_next_vmid);
+ 	kvm_next_vmid++;
+ 	kvm_next_vmid &= (1 << kvm_get_vmid_bits()) - 1;
+ 
+* Unmerged path arch/arm64/kvm/hyp/nvhe/mem_protect.c
+* Unmerged path arch/arm64/kvm/mmu.c
