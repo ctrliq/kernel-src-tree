@@ -1,0 +1,165 @@
+KVM: x86/xen: Add event channel interrupt vector upcall
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author David Woodhouse <dwmw@amazon.co.uk>
+commit 40da8ccd724f7ca2f08550a46268bc3a91cc8869
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/40da8ccd.failed
+
+It turns out that we can't handle event channels *entirely* in userspace
+by delivering them as ExtINT, because KVM is a bit picky about when it
+accepts ExtINT interrupts from a legacy PIC. The in-kernel local APIC
+has to have LVT0 configured in APIC_MODE_EXTINT and unmasked, which
+isn't necessarily the case for Xen guests especially on secondary CPUs.
+
+To cope with this, add kvm_xen_get_interrupt() which checks the
+evtchn_pending_upcall field in the Xen vcpu_info, and delivers the Xen
+upcall vector (configured by KVM_XEN_ATTR_TYPE_UPCALL_VECTOR) if it's
+set regardless of LAPIC LVT0 configuration. This gives us the minimum
+support we need for completely userspace-based implementation of event
+channels.
+
+This does mean that vcpu_enter_guest() needs to check for the
+evtchn_pending_upcall flag being set, because it can't rely on someone
+having set KVM_REQ_EVENT unless we were to add some way for userspace to
+do so manually.
+
+	Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+(cherry picked from commit 40da8ccd724f7ca2f08550a46268bc3a91cc8869)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/xen.c
+#	arch/x86/kvm/xen.h
+#	include/uapi/linux/kvm.h
+diff --cc arch/x86/include/asm/kvm_host.h
+index 3e713240c995,b37afd856bab..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -912,6 -909,14 +912,17 @@@ struct msr_bitmap_range 
+  	unsigned long *bitmap;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Xen emulation context */
++ struct kvm_xen {
++ 	bool long_mode;
++ 	bool shinfo_set;
++ 	u8 upcall_vector;
++ 	struct gfn_to_hva_cache shinfo_cache;
++ };
++ 
+++>>>>>>> 40da8ccd724f (KVM: x86/xen: Add event channel interrupt vector upcall)
+  enum kvm_irqchip_mode {
+  	KVM_IRQCHIP_NONE,
+  	KVM_IRQCHIP_KERNEL,       /* created with KVM_CREATE_IRQCHIP */
+diff --cc include/uapi/linux/kvm.h
+index a9fa79abd23a,4d4cd001c908..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -1556,6 -1584,46 +1556,49 @@@ struct kvm_pv_cmd 
+  /* Available with KVM_CAP_X86_MSR_FILTER */
+  #define KVM_X86_SET_MSR_FILTER	_IOW(KVMIO,  0xc6, struct kvm_msr_filter)
+  
+++<<<<<<< HEAD
+++=======
++ /* Available with KVM_CAP_DIRTY_LOG_RING */
++ #define KVM_RESET_DIRTY_RINGS		_IO(KVMIO, 0xc7)
++ 
++ /* Per-VM Xen attributes */
++ #define KVM_XEN_HVM_GET_ATTR	_IOWR(KVMIO, 0xc8, struct kvm_xen_hvm_attr)
++ #define KVM_XEN_HVM_SET_ATTR	_IOW(KVMIO,  0xc9, struct kvm_xen_hvm_attr)
++ 
++ struct kvm_xen_hvm_attr {
++ 	__u16 type;
++ 	__u16 pad[3];
++ 	union {
++ 		__u8 long_mode;
++ 		__u8 vector;
++ 		struct {
++ 			__u64 gfn;
++ 		} shared_info;
++ 		__u64 pad[8];
++ 	} u;
++ };
++ 
++ #define KVM_XEN_ATTR_TYPE_LONG_MODE		0x0
++ #define KVM_XEN_ATTR_TYPE_SHARED_INFO		0x1
++ #define KVM_XEN_ATTR_TYPE_UPCALL_VECTOR		0x2
++ 
++ /* Per-vCPU Xen attributes */
++ #define KVM_XEN_VCPU_GET_ATTR	_IOWR(KVMIO, 0xca, struct kvm_xen_vcpu_attr)
++ #define KVM_XEN_VCPU_SET_ATTR	_IOW(KVMIO,  0xcb, struct kvm_xen_vcpu_attr)
++ 
++ struct kvm_xen_vcpu_attr {
++ 	__u16 type;
++ 	__u16 pad[3];
++ 	union {
++ 		__u64 gpa;
++ 		__u64 pad[8];
++ 	} u;
++ };
++ 
++ #define KVM_XEN_VCPU_ATTR_TYPE_VCPU_INFO	0x0
++ #define KVM_XEN_VCPU_ATTR_TYPE_VCPU_TIME_INFO	0x1
++ 
+++>>>>>>> 40da8ccd724f (KVM: x86/xen: Add event channel interrupt vector upcall)
+  /* Secure Encrypted Virtualization command */
+  enum sev_cmd_id {
+  	/* Guest initialization commands */
+* Unmerged path arch/x86/kvm/xen.c
+* Unmerged path arch/x86/kvm/xen.h
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/kvm/irq.c b/arch/x86/kvm/irq.c
+index 814698e5b152..24668b51b5c8 100644
+--- a/arch/x86/kvm/irq.c
++++ b/arch/x86/kvm/irq.c
+@@ -14,6 +14,7 @@
+ #include "irq.h"
+ #include "i8254.h"
+ #include "x86.h"
++#include "xen.h"
+ 
+ /*
+  * check if there are pending timer events
+@@ -56,6 +57,9 @@ int kvm_cpu_has_extint(struct kvm_vcpu *v)
+ 	if (!lapic_in_kernel(v))
+ 		return v->arch.interrupt.injected;
+ 
++	if (kvm_xen_has_interrupt(v))
++		return 1;
++
+ 	if (!kvm_apic_accept_pic_intr(v))
+ 		return 0;
+ 
+@@ -110,6 +114,9 @@ static int kvm_cpu_get_extint(struct kvm_vcpu *v)
+ 	if (!lapic_in_kernel(v))
+ 		return v->arch.interrupt.nr;
+ 
++	if (kvm_xen_has_interrupt(v))
++		return v->kvm->arch.xen.upcall_vector;
++
+ 	if (irqchip_split(v->kvm)) {
+ 		int vector = v->arch.pending_external_vector;
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 9ebc64032528..d0db192d7c6b 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8892,7 +8892,8 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 			kvm_x86_ops.msr_filter_changed(vcpu);
+ 	}
+ 
+-	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win) {
++	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win ||
++	    kvm_xen_has_interrupt(vcpu)) {
+ 		++vcpu->stat.req_event;
+ 		kvm_apic_accept_events(vcpu);
+ 		if (vcpu->arch.mp_state == KVM_MP_STATE_INIT_RECEIVED) {
+* Unmerged path arch/x86/kvm/xen.c
+* Unmerged path arch/x86/kvm/xen.h
+* Unmerged path include/uapi/linux/kvm.h
