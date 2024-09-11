@@ -1,0 +1,238 @@
+tracing: Partial revert of "tracing: Centralize preemptirq tracepoints and unify their usage"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Steven Rostedt (VMware) <rostedt@goodmis.org>
+commit bff1b208a5d1dbb2355822ef859edcb9be0379e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bff1b208.failed
+
+Joel Fernandes created a nice patch that cleaned up the duplicate hooks used
+by lockdep and irqsoff latency tracer. It made both use tracepoints. But it
+caused lockdep to trigger several false positives. We have not figured out
+why yet, but removing lockdep from using the trace event hooks and just call
+its helper functions directly (like it use to), makes the problem go away.
+
+This is a partial revert of the clean up patch c3bc8fd637a9 ("tracing:
+Centralize preemptirq tracepoints and unify their usage") that adds direct
+calls for lockdep, but also keeps most of the clean up done to get rid of
+the horrible preprocessor if statements.
+
+Link: http://lkml.kernel.org/r/20180806155058.5ee875f4@gandalf.local.home
+
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Reviewed-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+Fixes: c3bc8fd637a9 ("tracing: Centralize preemptirq tracepoints and unify their usage")
+	Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+(cherry picked from commit bff1b208a5d1dbb2355822ef859edcb9be0379e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/irqflags.h
+#	init/main.c
+#	kernel/locking/lockdep.c
+#	kernel/trace/trace_preemptirq.c
+diff --cc include/linux/irqflags.h
+index 9700f00bbc04,21619c92c377..000000000000
+--- a/include/linux/irqflags.h
++++ b/include/linux/irqflags.h
+@@@ -15,9 -15,20 +15,22 @@@
+  #include <linux/typecheck.h>
+  #include <asm/irqflags.h>
+  
+ -/* Currently trace_softirqs_on/off is used only by lockdep */
+ -#ifdef CONFIG_PROVE_LOCKING
+ +#ifdef CONFIG_TRACE_IRQFLAGS
+    extern void trace_softirqs_on(unsigned long ip);
+    extern void trace_softirqs_off(unsigned long ip);
+++<<<<<<< HEAD
+++=======
++   extern void lockdep_hardirqs_on(unsigned long ip);
++   extern void lockdep_hardirqs_off(unsigned long ip);
++ #else
++   static inline void trace_softirqs_on(unsigned long ip) { }
++   static inline void trace_softirqs_off(unsigned long ip) { }
++   static inline void lockdep_hardirqs_on(unsigned long ip) { }
++   static inline void lockdep_hardirqs_off(unsigned long ip) { }
++ #endif
++ 
++ #ifdef CONFIG_TRACE_IRQFLAGS
+++>>>>>>> bff1b208a5d1 (tracing: Partial revert of "tracing: Centralize preemptirq tracepoints and unify their usage")
+    extern void trace_hardirqs_on(void);
+    extern void trace_hardirqs_off(void);
+  # define trace_hardirq_context(p)	((p)->hardirq_context)
+diff --cc init/main.c
+index 9a8e05eb7480,5d42e577643a..000000000000
+--- a/init/main.c
++++ b/init/main.c
+@@@ -663,6 -648,7 +663,10 @@@ asmlinkage __visible void __init start_
+  	profile_init();
+  	call_function_init();
+  	WARN(!irqs_disabled(), "Interrupts were enabled early\n");
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> bff1b208a5d1 (tracing: Partial revert of "tracing: Centralize preemptirq tracepoints and unify their usage")
+  	early_boot_irqs_disabled = false;
+  	local_irq_enable();
+  
+diff --cc kernel/locking/lockdep.c
+index 5648ed245897,e406c5fdb41e..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -3636,10 -2840,8 +3636,14 @@@ static void __trace_hardirqs_on_caller(
+  	debug_atomic_inc(hardirqs_on_events);
+  }
+  
+++<<<<<<< HEAD
+ +__visible void trace_hardirqs_on_caller(unsigned long ip)
+++=======
++ void lockdep_hardirqs_on(unsigned long ip)
+++>>>>>>> bff1b208a5d1 (tracing: Partial revert of "tracing: Centralize preemptirq tracepoints and unify their usage")
+  {
+ +	time_hardirqs_on(CALLER_ADDR0, ip);
+ +
+  	if (unlikely(!debug_locks || current->lockdep_recursion))
+  		return;
+  
+@@@ -3689,7 -2884,7 +3693,11 @@@ EXPORT_SYMBOL(trace_hardirqs_on)
+  /*
+   * Hardirqs were disabled:
+   */
+++<<<<<<< HEAD
+ +__visible void trace_hardirqs_off_caller(unsigned long ip)
+++=======
++ void lockdep_hardirqs_off(unsigned long ip)
+++>>>>>>> bff1b208a5d1 (tracing: Partial revert of "tracing: Centralize preemptirq tracepoints and unify their usage")
+  {
+  	struct task_struct *curr = current;
+  
+@@@ -5345,99 -4286,33 +5353,102 @@@ static void __lockdep_reset_lock(struc
+  	 * Debug check: in the end all mapped classes should
+  	 * be gone.
+  	 */
+ +	if (WARN_ON_ONCE(lock_class_cache_is_registered(lock)))
+ +		debug_locks_off();
+ +}
+ +
+ +/*
+ + * Remove all information lockdep has about a lock if debug_locks == 1. Free
+ + * released data structures from RCU context.
+ + */
+ +static void lockdep_reset_lock_reg(struct lockdep_map *lock)
+ +{
+ +	struct pending_free *pf;
+ +	unsigned long flags;
+ +	int locked;
+ +
+ +	raw_local_irq_save(flags);
+  	locked = graph_lock();
+ -	for (i = 0; i < CLASSHASH_SIZE; i++) {
+ -		head = classhash_table + i;
+ -		hlist_for_each_entry_rcu(class, head, hash_entry) {
+ -			int match = 0;
+ +	if (!locked)
+ +		goto out_irq;
+  
+ -			for (j = 0; j < NR_LOCKDEP_CACHING_CLASSES; j++)
+ -				match |= class == lock->class_cache[j];
+ -
+ -			if (unlikely(match)) {
+ -				if (debug_locks_off_graph_unlock()) {
+ -					/*
+ -					 * We all just reset everything, how did it match?
+ -					 */
+ -					WARN_ON(1);
+ -				}
+ -				goto out_restore;
+ -			}
+ +	pf = get_pending_free();
+ +	__lockdep_reset_lock(pf, lock);
+ +	call_rcu_zapped(pf);
+ +
+ +	graph_unlock();
+ +out_irq:
+ +	raw_local_irq_restore(flags);
+ +}
+ +
+++<<<<<<< HEAD
+ +/*
+ + * Reset a lock. Does not sleep. Ignores debug_locks. Must only be used by the
+ + * lockdep selftests.
+ + */
+ +static void lockdep_reset_lock_imm(struct lockdep_map *lock)
+ +{
+ +	struct pending_free *pf = delayed_free.pf;
+ +	unsigned long flags;
+ +
+ +	raw_local_irq_save(flags);
+ +	arch_spin_lock(&lockdep_lock);
+ +	__lockdep_reset_lock(pf, lock);
+ +	__free_zapped_classes(pf);
+ +	arch_spin_unlock(&lockdep_lock);
+ +	raw_local_irq_restore(flags);
+ +}
+ +
+ +void lockdep_reset_lock(struct lockdep_map *lock)
+ +{
+ +	init_data_structures_once();
+ +
+ +	if (inside_selftest())
+ +		lockdep_reset_lock_imm(lock);
+ +	else
+ +		lockdep_reset_lock_reg(lock);
+ +}
+ +
+ +/* Unregister a dynamically allocated key. */
+ +void lockdep_unregister_key(struct lock_class_key *key)
+ +{
+ +	struct hlist_head *hash_head = keyhashentry(key);
+ +	struct lock_class_key *k;
+ +	struct pending_free *pf;
+ +	unsigned long flags;
+ +	bool found = false;
+ +
+ +	might_sleep();
+ +
+ +	if (WARN_ON_ONCE(static_obj(key)))
+ +		return;
+ +
+ +	raw_local_irq_save(flags);
+ +	if (!graph_lock())
+ +		goto out_irq;
+ +
+ +	pf = get_pending_free();
+ +	hlist_for_each_entry_rcu(k, hash_head, hash_entry) {
+ +		if (k == key) {
+ +			hlist_del_rcu(&k->hash_entry);
+ +			found = true;
+ +			break;
+  		}
+  	}
+ -	if (locked)
+ -		graph_unlock();
+ -
+ -out_restore:
+ +	WARN_ON_ONCE(!found);
+ +	__lockdep_free_key_range(pf, key, 1);
+ +	call_rcu_zapped(pf);
+ +	graph_unlock();
+ +out_irq:
+  	raw_local_irq_restore(flags);
+ +
+ +	/* Wait until is_dynamic_key() has finished accessing k->hash_entry. */
+ +	synchronize_rcu();
+  }
+ +EXPORT_SYMBOL_GPL(lockdep_unregister_key);
+  
+++=======
+++>>>>>>> bff1b208a5d1 (tracing: Partial revert of "tracing: Centralize preemptirq tracepoints and unify their usage")
+  void __init lockdep_init(void)
+  {
+  	printk("Lock dependency validator: Copyright (c) 2006 Red Hat, Inc., Ingo Molnar\n");
+* Unmerged path kernel/trace/trace_preemptirq.c
+* Unmerged path include/linux/irqflags.h
+* Unmerged path init/main.c
+* Unmerged path kernel/locking/lockdep.c
+* Unmerged path kernel/trace/trace_preemptirq.c
