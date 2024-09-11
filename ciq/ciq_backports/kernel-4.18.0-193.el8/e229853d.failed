@@ -1,0 +1,268 @@
+ALSA: firewire-lib: schedule hardware IRQ according to the size of PCM period
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Takashi Sakamoto <o-takashi@sakamocchi.jp>
+commit e229853d505d7ab77e9b68b0ac91d19f48fe6d80
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/e229853d.failed
+
+ALSA IEC 61883-1/6 packet streaming engine controls 1394 OHCI controller
+to generate hardware IRQ for fixed number of isochronous packets (=16)
+since its first commit.
+
+This commit allow the engine to generate it for variable period according
+to the number of event to handle. For outgoing stream, internal
+calculator is used to check the accumulated events. For incoming stream,
+the number of data block in the packet of stream is used to check the
+accumulated events. When it's unavailable, fixed number of packet
+roughly calculated in advance is used instead of event counting.
+
+	Signed-off-by: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+Link: https://lore.kernel.org/r/20191017155424.885-11-o-takashi@sakamocchi.jp
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit e229853d505d7ab77e9b68b0ac91d19f48fe6d80)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/firewire/amdtp-stream.c
+diff --cc sound/firewire/amdtp-stream.c
+index 1e174e012d5f,fd7c3e4d5374..000000000000
+--- a/sound/firewire/amdtp-stream.c
++++ b/sound/firewire/amdtp-stream.c
+@@@ -52,10 -52,6 +52,13 @@@
+  #define CIP_FMT_AM		0x10
+  #define AMDTP_FDF_NO_DATA	0xff
+  
+++<<<<<<< HEAD
+ +/* TODO: make these configurable */
+ +#define INTERRUPT_INTERVAL	16
+ +#define QUEUE_LENGTH		48
+ +
+++=======
+++>>>>>>> e229853d505d (ALSA: firewire-lib: schedule hardware IRQ according to the size of PCM period)
+  // For iso header, tstamp and 2 CIP header.
+  #define IR_CTX_HEADER_SIZE_CIP		16
+  // For iso header and tstamp.
+@@@ -700,7 -777,9 +704,13 @@@ static void out_stream_callback(struct 
+  {
+  	struct amdtp_stream *s = private_data;
+  	const __be32 *ctx_header = header;
+++<<<<<<< HEAD
+ +	unsigned int packets = header_length / sizeof(*ctx_header);
+++=======
++ 	unsigned int events_per_period = s->events_per_period;
++ 	unsigned int event_count = s->event_count;
++ 	unsigned int packets;
+++>>>>>>> e229853d505d (ALSA: firewire-lib: schedule hardware IRQ according to the size of PCM period)
+  	int i;
+  
+  	if (s->packet_index < 0)
+@@@ -716,30 -799,31 +726,42 @@@
+  			struct fw_iso_packet params;
+  			__be32 header[IT_PKT_HEADER_SIZE_CIP / sizeof(__be32)];
+  		} template = { {0}, {0} };
+++<<<<<<< HEAD
+ +		struct snd_pcm_substream *pcm;
+++=======
++ 		bool sched_irq = false;
+++>>>>>>> e229853d505d (ALSA: firewire-lib: schedule hardware IRQ according to the size of PCM period)
+  
+ -		if (s->ctx_data.rx.syt_override < 0)
+ -			syt = desc->syt;
+ -		else
+ -			syt = s->ctx_data.rx.syt_override;
+ +		cycle = compute_it_cycle(*ctx_header);
+ +		syt = calculate_syt(s, cycle);
+ +		data_blocks = calculate_data_blocks(s, syt);
+ +		buffer = s->buffer.packets[s->packet_index].buffer;
+ +		pcm_frames = s->process_data_blocks(s, buffer, data_blocks,
+ +						    &syt);
+  
+ -		build_it_pkt_header(s, desc->cycle, &template.params,
+ -				    desc->data_blocks, desc->data_block_counter,
+ +		build_it_pkt_header(s, cycle, &template.params, data_blocks,
+  				    syt, i);
+  
+- 		if (queue_out_packet(s, &template.params) < 0) {
++ 		event_count += desc->data_blocks;
++ 		if (event_count >= events_per_period) {
++ 			event_count -= events_per_period;
++ 			sched_irq = true;
++ 		}
++ 
++ 		if (queue_out_packet(s, &template.params, sched_irq) < 0) {
+  			cancel_stream(s);
+  			return;
+  		}
+ +
+ +		pcm = READ_ONCE(s->pcm);
+ +		if (pcm && pcm_frames > 0)
+ +			update_pcm_pointers(s, pcm, pcm_frames);
+ +
+ +		++ctx_header;
+  	}
+  
++ 	s->event_count = event_count;
++ 
+  	fw_iso_context_queue_flush(s->context);
+  }
+  
+@@@ -748,59 -832,53 +770,93 @@@ static void in_stream_callback(struct f
+  			       void *private_data)
+  {
+  	struct amdtp_stream *s = private_data;
+++<<<<<<< HEAD
+ +	unsigned int i, packets;
+ +	__be32 *ctx_header = header;
+++=======
++ 	__be32 *ctx_header = header;
++ 	unsigned int events_per_period = s->events_per_period;
++ 	unsigned int event_count = s->event_count;
++ 	unsigned int packets;
++ 	int i;
++ 	int err;
+++>>>>>>> e229853d505d (ALSA: firewire-lib: schedule hardware IRQ according to the size of PCM period)
+  
+  	if (s->packet_index < 0)
+  		return;
+  
+ -	// Calculate the number of packets in buffer and check XRUN.
+ +	// The number of packets in buffer.
+  	packets = header_length / s->ctx_data.tx.ctx_header_size;
+  
+ -	err = generate_device_pkt_descs(s, s->pkt_descs, ctx_header, packets);
+ -	if (err < 0) {
+ -		if (err != -EAGAIN) {
+ -			cancel_stream(s);
+ -			return;
+ +	for (i = 0; i < packets; i++) {
+ +		u32 cycle;
+ +		unsigned int payload_length;
+ +		unsigned int data_blocks;
+ +		unsigned int syt;
+ +		__be32 *buffer;
+ +		unsigned int pcm_frames = 0;
+ +		struct fw_iso_packet params = {0};
+ +		struct snd_pcm_substream *pcm;
+ +		int err;
+ +
+ +		cycle = compute_cycle_count(ctx_header[1]);
+ +		err = parse_ir_ctx_header(s, cycle, ctx_header, &payload_length,
+ +					  &data_blocks, &syt, i);
+ +		if (err < 0 && err != -EAGAIN)
+ +			break;
+ +
+ +		if (err >= 0) {
+ +			buffer = s->buffer.packets[s->packet_index].buffer;
+ +			pcm_frames = s->process_data_blocks(s, buffer,
+ +							    data_blocks, &syt);
+ +
+ +			if (!(s->flags & CIP_DBC_IS_END_EVENT)) {
+ +				s->data_block_counter += data_blocks;
+ +				s->data_block_counter &= 0xff;
+ +			}
+  		}
+ -	} else {
+ -		process_ctx_payloads(s, s->pkt_descs, packets);
+ +
+ +		if (queue_in_packet(s, &params) < 0)
+ +			break;
+ +
+ +		pcm = READ_ONCE(s->pcm);
+ +		if (pcm && pcm_frames > 0)
+ +			update_pcm_pointers(s, pcm, pcm_frames);
+ +
+ +		ctx_header += s->ctx_data.tx.ctx_header_size / sizeof(*ctx_header);
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Queueing error or detecting invalid payload. */
+ +	if (i < packets) {
+ +		cancel_stream(s);
+ +		return;
+++=======
++ 	for (i = 0; i < packets; ++i) {
++ 		const struct pkt_desc *desc = s->pkt_descs + i;
++ 		struct fw_iso_packet params = {0};
++ 		bool sched_irq = false;
++ 
++ 		if (err >= 0) {
++ 			event_count += desc->data_blocks;
++ 			if (event_count >= events_per_period) {
++ 				event_count -= events_per_period;
++ 				sched_irq = true;
++ 			}
++ 		} else {
++ 			sched_irq =
++ 				!((s->packet_index + 1) % s->idle_irq_interval);
++ 		}
++ 
++ 		if (queue_in_packet(s, &params, sched_irq) < 0) {
++ 			cancel_stream(s);
++ 			return;
++ 		}
+++>>>>>>> e229853d505d (ALSA: firewire-lib: schedule hardware IRQ according to the size of PCM period)
+  	}
+  
++ 	s->event_count = event_count;
++ 
+  	fw_iso_context_queue_flush(s->context);
+  }
+  
+@@@ -859,6 -938,8 +915,11 @@@ static int amdtp_stream_start(struct am
+  		[CIP_SFC_88200]  = {  0,   67 },
+  		[CIP_SFC_176400] = {  0,   67 },
+  	};
+++<<<<<<< HEAD
+++=======
++ 	unsigned int events_per_buffer = d->events_per_buffer;
++ 	unsigned int events_per_period = d->events_per_period;
+++>>>>>>> e229853d505d (ALSA: firewire-lib: schedule hardware IRQ according to the size of PCM period)
+  	unsigned int ctx_header_size;
+  	unsigned int max_ctx_payload_size;
+  	enum dma_data_direction dir;
+@@@ -904,7 -985,23 +965,27 @@@
+  			max_ctx_payload_size -= IT_PKT_HEADER_SIZE_CIP;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = iso_packets_buffer_init(&s->buffer, s->unit, QUEUE_LENGTH,
+++=======
++ 	// This is a case that AMDTP streams in domain run just for MIDI
++ 	// substream. Use the number of events equivalent to 10 msec as
++ 	// interval of hardware IRQ.
++ 	if (events_per_period == 0)
++ 		events_per_period = amdtp_rate_table[s->sfc] / 100;
++ 	if (events_per_buffer == 0)
++ 		events_per_buffer = events_per_period * 3;
++ 
++ 	s->idle_irq_interval =
++ 			DIV_ROUND_UP(CYCLES_PER_SECOND * events_per_period,
++ 				     amdtp_rate_table[s->sfc]);
++ 	s->queue_size = DIV_ROUND_UP(CYCLES_PER_SECOND * events_per_buffer,
++ 				     amdtp_rate_table[s->sfc]);
++ 	s->events_per_period = events_per_period;
++ 	s->event_count = 0;
++ 
++ 	err = iso_packets_buffer_init(&s->buffer, s->unit, s->queue_size,
+++>>>>>>> e229853d505d (ALSA: firewire-lib: schedule hardware IRQ according to the size of PCM period)
+  				      max_ctx_payload_size, dir);
+  	if (err < 0)
+  		goto err_unlock;
+* Unmerged path sound/firewire/amdtp-stream.c
+diff --git a/sound/firewire/amdtp-stream.h b/sound/firewire/amdtp-stream.h
+index 7032772c4f90..48e5ee741544 100644
+--- a/sound/firewire/amdtp-stream.h
++++ b/sound/firewire/amdtp-stream.h
+@@ -142,6 +142,9 @@ struct amdtp_stream {
+ 			unsigned int fdf;
+ 		} rx;
+ 	} ctx_data;
++	unsigned int event_count;
++	unsigned int events_per_period;
++	unsigned int idle_irq_interval;
+ 
+ 	/* For CIP headers. */
+ 	unsigned int source_node_id_field;
