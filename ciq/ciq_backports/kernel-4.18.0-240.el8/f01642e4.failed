@@ -1,0 +1,227 @@
+perf metricgroup: Support multiple events for metricgroup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jin Yao <yao.jin@linux.intel.com>
+commit f01642e4912bb80a01d693f4cc6fb0897207a090
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f01642e4.failed
+
+Some uncore metrics don't work as expected. For example, on
+cascadelakex:
+
+  root@lkp-csl-2sp2:~# perf stat -M UNC_M_PMM_BANDWIDTH.TOTAL -a -- sleep 1
+
+   Performance counter stats for 'system wide':
+
+           1841092      unc_m_pmm_rpq_inserts
+           3680816      unc_m_pmm_wpq_inserts
+
+       1.001775055 seconds time elapsed
+
+  root@lkp-csl-2sp2:~# perf stat -M UNC_M_PMM_READ_LATENCY -a -- sleep 1
+
+   Performance counter stats for 'system wide':
+
+         860649746      unc_m_pmm_rpq_occupancy.all
+           1840557      unc_m_pmm_rpq_inserts
+       12790627455      unc_m_clockticks
+
+       1.001773348 seconds time elapsed
+
+No metrics 'UNC_M_PMM_BANDWIDTH.TOTAL' or 'UNC_M_PMM_READ_LATENCY' are
+reported.
+
+The issue is, the case of an alias expanding to mulitple events is not
+supported, typically the uncore events.  (see comments in
+find_evsel_group()).
+
+For UNC_M_PMM_BANDWIDTH.TOTAL in above example, the expanded event group
+is '{unc_m_pmm_rpq_inserts,unc_m_pmm_wpq_inserts}:W', but the actual
+events passed to find_evsel_group are:
+
+  unc_m_pmm_rpq_inserts
+  unc_m_pmm_rpq_inserts
+  unc_m_pmm_rpq_inserts
+  unc_m_pmm_rpq_inserts
+  unc_m_pmm_rpq_inserts
+  unc_m_pmm_rpq_inserts
+  unc_m_pmm_wpq_inserts
+  unc_m_pmm_wpq_inserts
+  unc_m_pmm_wpq_inserts
+  unc_m_pmm_wpq_inserts
+  unc_m_pmm_wpq_inserts
+  unc_m_pmm_wpq_inserts
+
+For this multiple events case, it's not supported well.
+
+This patch introduces a new field 'metric_leader' in struct evsel. The
+first event is considered as a metric leader. For the rest of same
+events, they point to the first event via it's metric_leader field in
+struct evsel.
+
+This design is for adding the counting results of all same events to the
+first event in group (the metric_leader).
+
+With this patch,
+
+  root@lkp-csl-2sp2:~# perf stat -M UNC_M_PMM_BANDWIDTH.TOTAL -a -- sleep 1
+
+   Performance counter stats for 'system wide':
+
+           1842108      unc_m_pmm_rpq_inserts     #    337.2 MB/sec  UNC_M_PMM_BANDWIDTH.TOTAL
+           3682209      unc_m_pmm_wpq_inserts
+
+       1.001819706 seconds time elapsed
+
+  root@lkp-csl-2sp2:~# perf stat -M UNC_M_PMM_READ_LATENCY -a -- sleep 1
+
+   Performance counter stats for 'system wide':
+
+         861970685      unc_m_pmm_rpq_occupancy.all #    219.4 ns  UNC_M_PMM_READ_LATENCY
+           1842772      unc_m_pmm_rpq_inserts
+       12790196356      unc_m_clockticks
+
+       1.001749103 seconds time elapsed
+
+Now we can see the correct metrics 'UNC_M_PMM_BANDWIDTH.TOTAL' and
+'UNC_M_PMM_READ_LATENCY'.
+
+	Signed-off-by: Jin Yao <yao.jin@linux.intel.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Kan Liang <kan.liang@linux.intel.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lore.kernel.org/lkml/20190828055932.8269-5-yao.jin@linux.intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit f01642e4912bb80a01d693f4cc6fb0897207a090)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evsel.h
+#	tools/perf/util/metricgroup.c
+#	tools/perf/util/stat-shadow.c
+diff --cc tools/perf/util/evsel.h
+index 139ed11fb6f6,68321d10eb2d..000000000000
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@@ -162,7 -167,8 +162,12 @@@ struct perf_evsel 
+  	bool			merged_stat;
+  	const char *		metric_expr;
+  	const char *		metric_name;
+++<<<<<<< HEAD
+ +	struct perf_evsel	**metric_events;
+++=======
++ 	struct evsel		**metric_events;
++ 	struct evsel		*metric_leader;
+++>>>>>>> f01642e4912b (perf metricgroup: Support multiple events for metricgroup)
+  	bool			collect_stat;
+  	bool			weak_group;
+  	bool			percore;
+diff --cc tools/perf/util/metricgroup.c
+index fe6f7545a885,a7c0424dbda3..000000000000
+--- a/tools/perf/util/metricgroup.c
++++ b/tools/perf/util/metricgroup.c
+@@@ -94,50 -87,39 +94,63 @@@ struct egroup 
+  	const char **ids;
+  	const char *metric_name;
+  	const char *metric_expr;
+ -	const char *metric_unit;
+  };
+  
+++<<<<<<< HEAD
+ +static bool record_evsel(int *ind, struct perf_evsel **start,
+ +			 int idnum,
+ +			 struct perf_evsel **metric_events,
+ +			 struct perf_evsel *ev)
+ +{
+ +	metric_events[*ind] = ev;
+ +	if (*ind == 0)
+ +		*start = ev;
+ +	if (++*ind == idnum) {
+ +		metric_events[*ind] = NULL;
+ +		return true;
+ +	}
+ +	return false;
+ +}
+ +
+ +static struct perf_evsel *find_evsel_group(struct perf_evlist *perf_evlist,
+ +					   const char **ids,
+ +					   int idnum,
+ +					   struct perf_evsel **metric_events)
+ +{
+ +	struct perf_evsel *ev, *start = NULL;
+ +	int ind = 0;
+++=======
++ static struct evsel *find_evsel_group(struct evlist *perf_evlist,
++ 				      const char **ids,
++ 				      int idnum,
++ 				      struct evsel **metric_events)
++ {
++ 	struct evsel *ev;
++ 	int i = 0;
++ 	bool leader_found;
+++>>>>>>> f01642e4912b (perf metricgroup: Support multiple events for metricgroup)
+  
+  	evlist__for_each_entry (perf_evlist, ev) {
+- 		if (ev->collect_stat)
+- 			continue;
+- 		if (!strcmp(ev->name, ids[ind])) {
+- 			if (record_evsel(&ind, &start, idnum,
+- 					 metric_events, ev))
+- 				return start;
++ 		if (!strcmp(ev->name, ids[i])) {
++ 			if (!metric_events[i])
++ 				metric_events[i] = ev;
+  		} else {
+- 			/*
+- 			 * We saw some other event that is not
+- 			 * in our list of events. Discard
+- 			 * the whole match and start again.
+- 			 */
+- 			ind = 0;
+- 			start = NULL;
+- 			if (!strcmp(ev->name, ids[ind])) {
+- 				if (record_evsel(&ind, &start, idnum,
+- 						 metric_events, ev))
+- 					return start;
++ 			if (++i == idnum) {
++ 				/* Discard the whole match and start again */
++ 				i = 0;
++ 				memset(metric_events, 0,
++ 				       sizeof(struct evsel *) * idnum);
++ 				continue;
++ 			}
++ 
++ 			if (!strcmp(ev->name, ids[i]))
++ 				metric_events[i] = ev;
++ 			else {
++ 				/* Discard the whole match and start again */
++ 				i = 0;
++ 				memset(metric_events, 0,
++ 				       sizeof(struct evsel *) * idnum);
++ 				continue;
+  			}
+  		}
+  	}
+diff --cc tools/perf/util/stat-shadow.c
+index accb1bf1cfd8,70c87fdb2a43..000000000000
+--- a/tools/perf/util/stat-shadow.c
++++ b/tools/perf/util/stat-shadow.c
+@@@ -731,8 -741,7 +740,11 @@@ static void generic_metric(struct perf_
+  	for (i = 0; metric_events[i]; i++) {
+  		struct saved_value *v;
+  		struct stats *stats;
+++<<<<<<< HEAD
+ +		double scale;
+++=======
++ 		u64 metric_total = 0;
+++>>>>>>> f01642e4912b (perf metricgroup: Support multiple events for metricgroup)
+  
+  		if (!strcmp(metric_events[i]->name, "duration_time")) {
+  			stats = &walltime_nsecs_stats;
+* Unmerged path tools/perf/util/evsel.h
+* Unmerged path tools/perf/util/metricgroup.c
+* Unmerged path tools/perf/util/stat-shadow.c
