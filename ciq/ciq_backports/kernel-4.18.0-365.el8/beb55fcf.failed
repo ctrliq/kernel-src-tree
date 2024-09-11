@@ -1,0 +1,128 @@
+bnxt_en: fix read of stored FW_PSID version on P5 devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Edwin Peer <edwin.peer@broadcom.com>
+commit beb55fcf950f5454715df05234bb2b2914bc97ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/beb55fcf.failed
+
+P5 devices store NVM arrays using a different internal representation.
+This implementation detail permeates into the HWRM API, requiring the
+caller to explicitly index the array elements in HWRM_NVM_GET_VARIABLE
+on these devices. Conversely, older devices do not support the indexed
+mode of operation and require reading the raw NVM content.
+
+Fixes: db28b6c77f40 ("bnxt_en: Fix devlink info's stored fw.psid version format.")
+	Signed-off-by: Edwin Peer <edwin.peer@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit beb55fcf950f5454715df05234bb2b2914bc97ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+index 8b7f6a0ad401,cb20e627282a..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@@ -351,31 -352,58 +351,69 @@@ static void bnxt_copy_from_nvm_data(uni
+  		dst->vu8 = (u8)val32;
+  }
+  
+- static int bnxt_hwrm_get_nvm_cfg_ver(struct bnxt *bp,
+- 				     union devlink_param_value *nvm_cfg_ver)
++ static int bnxt_hwrm_get_nvm_cfg_ver(struct bnxt *bp, u32 *nvm_cfg_ver)
+  {
+++<<<<<<< HEAD
+ +	struct hwrm_nvm_get_variable_input req = {0};
+++=======
++ 	struct hwrm_nvm_get_variable_input *req;
++ 	u16 bytes = BNXT_NVM_CFG_VER_BYTES;
++ 	u16 bits = BNXT_NVM_CFG_VER_BITS;
++ 	union devlink_param_value ver;
+++>>>>>>> beb55fcf950f (bnxt_en: fix read of stored FW_PSID version on P5 devices)
+  	union bnxt_nvm_data *data;
+  	dma_addr_t data_dma_addr;
+- 	int rc;
++ 	int rc, i = 2;
++ 	u16 dim = 1;
+  
+ -	rc = hwrm_req_init(bp, req, HWRM_NVM_GET_VARIABLE);
+ -	if (rc)
+ -		return rc;
+ +	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_NVM_GET_VARIABLE, -1, -1);
+ +	data = dma_alloc_coherent(&bp->pdev->dev, sizeof(*data),
+ +				  &data_dma_addr, GFP_KERNEL);
+ +	if (!data)
+ +		return -ENOMEM;
+  
+ -	data = hwrm_req_dma_slice(bp, req, sizeof(*data), &data_dma_addr);
+ -	if (!data) {
+ -		rc = -ENOMEM;
+ -		goto exit;
+ -	}
+ +	req.dest_data_addr = cpu_to_le64(data_dma_addr);
+ +	req.data_len = cpu_to_le16(BNXT_NVM_CFG_VER_BITS);
+ +	req.option_num = cpu_to_le16(NVM_OFF_NVM_CFG_VER);
+  
+++<<<<<<< HEAD
+ +	rc = hwrm_send_message_silent(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
+ +	if (!rc)
+ +		bnxt_copy_from_nvm_data(nvm_cfg_ver, data,
+ +					BNXT_NVM_CFG_VER_BITS,
+ +					BNXT_NVM_CFG_VER_BYTES);
+++=======
++ 	/* earlier devices present as an array of raw bytes */
++ 	if (!BNXT_CHIP_P5(bp)) {
++ 		dim = 0;
++ 		i = 0;
++ 		bits *= 3;  /* array of 3 version components */
++ 		bytes *= 4; /* copy whole word */
++ 	}
++ 
++ 	hwrm_req_hold(bp, req);
++ 	req->dest_data_addr = cpu_to_le64(data_dma_addr);
++ 	req->data_len = cpu_to_le16(bits);
++ 	req->option_num = cpu_to_le16(NVM_OFF_NVM_CFG_VER);
++ 	req->dimensions = cpu_to_le16(dim);
++ 
++ 	while (i >= 0) {
++ 		req->index_0 = cpu_to_le16(i--);
++ 		rc = hwrm_req_send_silent(bp, req);
++ 		if (rc)
++ 			goto exit;
++ 		bnxt_copy_from_nvm_data(&ver, data, bits, bytes);
++ 
++ 		if (BNXT_CHIP_P5(bp)) {
++ 			*nvm_cfg_ver <<= 8;
++ 			*nvm_cfg_ver |= ver.vu8;
++ 		} else {
++ 			*nvm_cfg_ver = ver.vu32;
++ 		}
++ 	}
+++>>>>>>> beb55fcf950f (bnxt_en: fix read of stored FW_PSID version on P5 devices)
+  
+ -exit:
+ -	hwrm_req_drop(bp, req);
+ +	dma_free_coherent(&bp->pdev->dev, sizeof(*data), data, data_dma_addr);
+  	return rc;
+  }
+  
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
+index d22cab5d6856..d889f240da2b 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
+@@ -40,8 +40,8 @@ static inline void bnxt_link_bp_to_dl(struct bnxt *bp, struct devlink *dl)
+ #define NVM_OFF_ENABLE_SRIOV		401
+ #define NVM_OFF_NVM_CFG_VER		602
+ 
+-#define BNXT_NVM_CFG_VER_BITS		24
+-#define BNXT_NVM_CFG_VER_BYTES		4
++#define BNXT_NVM_CFG_VER_BITS		8
++#define BNXT_NVM_CFG_VER_BYTES		1
+ 
+ #define BNXT_MSIX_VEC_MAX	512
+ #define BNXT_MSIX_VEC_MIN_MAX	128
