@@ -1,0 +1,162 @@
+drm/i915: Introduce .{enable,disable}_clock() encoder vfuncs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit c133df699412ef2ab06509507a970a8e2533a716
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/c133df69.failed
+
+The current code dealing with the clock routing for DDI encoders
+is a maintenance nightmare. Let's start cleaning it up by allowing
+the encoder to provide vfuncs for enablign/disabling the clock.
+
+We leave them initially unimplemented, falling back to the old
+if-else approach.
+
+v2: Convert the FDI enable sequence
+
+	Reviewed-by: Lucas De Marchi <lucas.demarchi@intel.com> #v2
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210205214634.19341-3-ville.syrjala@linux.intel.com
+(cherry picked from commit c133df699412ef2ab06509507a970a8e2533a716)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_ddi.h
+#	drivers/gpu/drm/i915/display/intel_display_types.h
+#	drivers/gpu/drm/i915/display/intel_fdi.c
+diff --cc drivers/gpu/drm/i915/display/intel_ddi.h
+index 077e9dbbe367,1aa0eedbf342..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_ddi.h
++++ b/drivers/gpu/drm/i915/display/intel_ddi.h
+@@@ -21,8 -28,12 +21,17 @@@ void intel_ddi_fdi_post_disable(struct 
+  				struct intel_encoder *intel_encoder,
+  				const struct intel_crtc_state *old_crtc_state,
+  				const struct drm_connector_state *old_conn_state);
+++<<<<<<< HEAD
+ +void hsw_fdi_link_train(struct intel_encoder *encoder,
+ +			const struct intel_crtc_state *crtc_state);
+++=======
++ void intel_ddi_enable_clock(struct intel_encoder *encoder,
++ 			    const struct intel_crtc_state *crtc_state);
++ void intel_prepare_dp_ddi_buffers(struct intel_encoder *encoder,
++ 				  const struct intel_crtc_state *crtc_state);
++ void intel_wait_ddi_buf_idle(struct drm_i915_private *dev_priv,
++ 			     enum port port);
+++>>>>>>> c133df699412 (drm/i915: Introduce .{enable,disable}_clock() encoder vfuncs)
+  void intel_ddi_init(struct drm_i915_private *dev_priv, enum port port);
+  bool intel_ddi_get_hw_state(struct intel_encoder *encoder, enum pipe *pipe);
+  void intel_ddi_enable_transcoder_func(struct intel_encoder *encoder,
+diff --cc drivers/gpu/drm/i915/display/intel_display_types.h
+index 2a8fc2d9b12a,07b7f5eae587..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@@ -198,6 -215,17 +198,20 @@@ struct intel_encoder 
+  	 * device interrupts are disabled.
+  	 */
+  	void (*suspend)(struct intel_encoder *);
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Called during system reboot/shutdown after all the
++ 	 * encoders have been disabled and suspended.
++ 	 */
++ 	void (*shutdown)(struct intel_encoder *encoder);
++ 	/*
++ 	 * Enable/disable the clock to the port.
++ 	 */
++ 	void (*enable_clock)(struct intel_encoder *encoder,
++ 			     const struct intel_crtc_state *crtc_state);
++ 	void (*disable_clock)(struct intel_encoder *encoder);
+++>>>>>>> c133df699412 (drm/i915: Introduce .{enable,disable}_clock() encoder vfuncs)
+  	enum hpd_pin hpd_pin;
+  	enum intel_display_power_domain power_domain;
+  	/* for communication with audio component; protected by av_mutex */
+* Unmerged path drivers/gpu/drm/i915/display/intel_fdi.c
+diff --git a/drivers/gpu/drm/i915/display/intel_ddi.c b/drivers/gpu/drm/i915/display/intel_ddi.c
+index 87726ca7041c..12457061d39e 100644
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@ -3045,6 +3045,23 @@ static void intel_ddi_clk_disable(struct intel_encoder *encoder)
+ 	}
+ }
+ 
++void intel_ddi_enable_clock(struct intel_encoder *encoder,
++			    const struct intel_crtc_state *crtc_state)
++{
++	if (encoder->enable_clock)
++		encoder->enable_clock(encoder, crtc_state);
++	else
++		intel_ddi_clk_select(encoder, crtc_state);
++}
++
++static void intel_ddi_disable_clock(struct intel_encoder *encoder)
++{
++	if (encoder->disable_clock)
++		encoder->disable_clock(encoder);
++	else
++		intel_ddi_clk_disable(encoder);
++}
++
+ static void
+ icl_program_mg_dp_mode(struct intel_digital_port *dig_port,
+ 		       const struct intel_crtc_state *crtc_state)
+@@ -3231,7 +3248,7 @@ static void tgl_ddi_pre_enable_dp(struct intel_atomic_state *state,
+ 	 * hsw_crtc_enable()->intel_enable_shared_dpll().  We need only
+ 	 * configure the PLL to port mapping here.
+ 	 */
+-	intel_ddi_clk_select(encoder, crtc_state);
++	intel_ddi_enable_clock(encoder, crtc_state);
+ 
+ 	/* 5. If IO power is controlled through PWR_WELL_CTL, Enable IO Power */
+ 	if (!intel_phy_is_tc(dev_priv, phy) ||
+@@ -3352,7 +3369,7 @@ static void hsw_ddi_pre_enable_dp(struct intel_atomic_state *state,
+ 
+ 	intel_edp_panel_on(intel_dp);
+ 
+-	intel_ddi_clk_select(encoder, crtc_state);
++	intel_ddi_enable_clock(encoder, crtc_state);
+ 
+ 	if (!intel_phy_is_tc(dev_priv, phy) ||
+ 	    dig_port->tc_mode != TC_PORT_TBT_ALT)
+@@ -3432,7 +3449,7 @@ static void intel_ddi_pre_enable_hdmi(struct intel_atomic_state *state,
+ 	int level = intel_ddi_hdmi_level(encoder);
+ 
+ 	intel_dp_dual_mode_set_tmds_output(intel_hdmi, true);
+-	intel_ddi_clk_select(encoder, crtc_state);
++	intel_ddi_enable_clock(encoder, crtc_state);
+ 
+ 	intel_display_power_get(dev_priv, dig_port->ddi_io_power_domain);
+ 
+@@ -3599,7 +3616,7 @@ static void intel_ddi_post_disable_dp(struct intel_atomic_state *state,
+ 		intel_display_power_put_unchecked(dev_priv,
+ 						  dig_port->ddi_io_power_domain);
+ 
+-	intel_ddi_clk_disable(encoder);
++	intel_ddi_disable_clock(encoder);
+ }
+ 
+ static void intel_ddi_post_disable_hdmi(struct intel_atomic_state *state,
+@@ -3621,7 +3638,7 @@ static void intel_ddi_post_disable_hdmi(struct intel_atomic_state *state,
+ 	intel_display_power_put_unchecked(dev_priv,
+ 					  dig_port->ddi_io_power_domain);
+ 
+-	intel_ddi_clk_disable(encoder);
++	intel_ddi_disable_clock(encoder);
+ 
+ 	intel_dp_dual_mode_set_tmds_output(intel_hdmi, false);
+ }
+@@ -3701,7 +3718,7 @@ void intel_ddi_fdi_post_disable(struct intel_atomic_state *state,
+ 	intel_de_write(dev_priv, FDI_RX_CTL(PIPE_A), val);
+ 
+ 	intel_disable_ddi_buf(encoder, old_crtc_state);
+-	intel_ddi_clk_disable(encoder);
++	intel_ddi_disable_clock(encoder);
+ 
+ 	val = intel_de_read(dev_priv, FDI_RX_MISC(PIPE_A));
+ 	val &= ~(FDI_RX_PWRDN_LANE1_MASK | FDI_RX_PWRDN_LANE0_MASK);
+* Unmerged path drivers/gpu/drm/i915/display/intel_ddi.h
+* Unmerged path drivers/gpu/drm/i915/display/intel_display_types.h
+* Unmerged path drivers/gpu/drm/i915/display/intel_fdi.c
