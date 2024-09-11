@@ -30,6 +30,7 @@ const struct qed_fcoe_ops *qed_ops;
 
 static int qedf_probe(struct pci_dev *pdev, const struct pci_device_id *id);
 static void qedf_remove(struct pci_dev *pdev);
+static void qedf_shutdown(struct pci_dev *pdev);
 
 /*
  * Driver module parameters.
@@ -3138,6 +3139,7 @@ static struct pci_driver qedf_pci_driver = {
 	.id_table = qedf_pci_tbl,
 	.probe = qedf_probe,
 	.remove = qedf_remove,
+	.shutdown = qedf_shutdown,
 };
 
 static int __qedf_probe(struct pci_dev *pdev, int mode)
@@ -3751,6 +3753,11 @@ void qedf_get_protocol_tlv_data(void *dev, void *data)
 
 	fcoe->scsi_tsk_full_set = true;
 	fcoe->scsi_tsk_full = qedf->task_set_fulls;
+}
+
+static void qedf_shutdown(struct pci_dev *pdev)
+{
+	__qedf_remove(pdev, QEDF_MODE_NORMAL);
 }
 
 /* Generic TLV data callback */
