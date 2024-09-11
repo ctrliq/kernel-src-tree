@@ -822,7 +822,8 @@ static u8 srp_get_subnet_timeout(struct srp_host *host)
 	return subnet_timeout;
 }
 
-static int srp_send_req(struct srp_rdma_ch *ch, bool multich)
+static int srp_send_req(struct srp_rdma_ch *ch, uint32_t max_iu_len,
+			bool multich)
 {
 	struct srp_target_port *target = ch->target;
 	struct {
@@ -851,7 +852,7 @@ static int srp_send_req(struct srp_rdma_ch *ch, bool multich)
 
 	req->ib_req.opcode = SRP_LOGIN_REQ;
 	req->ib_req.tag = 0;
-	req->ib_req.req_it_iu_len = cpu_to_be32(target->max_iu_len);
+	req->ib_req.req_it_iu_len = cpu_to_be32(max_iu_len);
 	req->ib_req.req_buf_fmt	= cpu_to_be16(SRP_BUF_FORMAT_DIRECT |
 					      SRP_BUF_FORMAT_INDIRECT);
 	req->ib_req.req_flags = (multich ? SRP_MULTICHAN_MULTI :
@@ -1144,7 +1145,8 @@ static int srp_connected_ch(struct srp_target_port *target)
 	return c;
 }
 
-static int srp_connect_ch(struct srp_rdma_ch *ch, bool multich)
+static int srp_connect_ch(struct srp_rdma_ch *ch, uint32_t max_iu_len,
+			  bool multich)
 {
 	struct srp_target_port *target = ch->target;
 	int ret;
@@ -1157,7 +1159,7 @@ static int srp_connect_ch(struct srp_rdma_ch *ch, bool multich)
 
 	while (1) {
 		init_completion(&ch->done);
-		ret = srp_send_req(ch, multich);
+		ret = srp_send_req(ch, max_iu_len, multich);
 		if (ret)
 			goto out;
 		ret = wait_for_completion_interruptible(&ch->done);
@@ -1343,6 +1345,16 @@ static void srp_terminate_io(struct srp_rport *rport)
 	}
 }
 
+/* Calculate maximum initiator to target information unit length. */
+static uint32_t srp_max_it_iu_len(int cmd_sg_cnt)
+{
+	uint32_t max_iu_len = sizeof(struct srp_cmd) + SRP_MAX_ADD_CDB_LEN +
+		sizeof(struct srp_indirect_buf) +
+		cmd_sg_cnt * sizeof(struct srp_direct_buf);
+
+	return max_iu_len;
+}
+
 /*
  * It is up to the caller to ensure that srp_rport_reconnect() calls are
  * serialized and that no concurrent srp_queuecommand(), srp_abort(),
@@ -1356,6 +1368,7 @@ static int srp_rport_reconnect(struct srp_rport *rport)
 {
 	struct srp_target_port *target = rport->lld_data;
 	struct srp_rdma_ch *ch;
+	uint32_t max_iu_len = srp_max_it_iu_len(target->cmd_sg_cnt);
 	int i, j, ret = 0;
 	bool multich = false;
 
@@ -1401,7 +1414,7 @@ static int srp_rport_reconnect(struct srp_rport *rport)
 		ch = &target->ch[i];
 		if (ret)
 			break;
-		ret = srp_connect_ch(ch, multich);
+		ret = srp_connect_ch(ch, max_iu_len, multich);
 		multich = true;
 	}
 
@@ -2315,7 +2328,7 @@ static int srp_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *scmnd)
 
 	req = &ch->req_ring[idx];
 	dev = target->srp_host->srp_dev->dev;
-	ib_dma_sync_single_for_cpu(dev, iu->dma, target->max_iu_len,
+	ib_dma_sync_single_for_cpu(dev, iu->dma, ch->max_it_iu_len,
 				   DMA_TO_DEVICE);
 
 	scmnd->host_scribble = (void *) req;
@@ -2352,7 +2365,7 @@ static int srp_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *scmnd)
 		goto err_iu;
 	}
 
-	ib_dma_sync_single_for_device(dev, iu->dma, target->max_iu_len,
+	ib_dma_sync_single_for_device(dev, iu->dma, ch->max_it_iu_len,
 				      DMA_TO_DEVICE);
 
 	if (srp_post_send(ch, iu, len)) {
@@ -2420,7 +2433,7 @@ static int srp_alloc_iu_bufs(struct srp_rdma_ch *ch)
 
 	for (i = 0; i < target->queue_size; ++i) {
 		ch->tx_ring[i] = srp_alloc_iu(target->srp_host,
-					      target->max_iu_len,
+					      ch->max_it_iu_len,
 					      GFP_KERNEL, DMA_TO_DEVICE);
 		if (!ch->tx_ring[i])
 			goto err;
@@ -2486,6 +2499,9 @@ static void srp_cm_rep_handler(struct ib_cm_id *cm_id,
 	if (lrsp->opcode == SRP_LOGIN_RSP) {
 		ch->max_ti_iu_len = be32_to_cpu(lrsp->max_ti_iu_len);
 		ch->req_lim       = be32_to_cpu(lrsp->req_lim_delta);
+		ch->max_it_iu_len = srp_max_it_iu_len(target->cmd_sg_cnt);
+		WARN_ON_ONCE(ch->max_it_iu_len >
+			     be32_to_cpu(lrsp->max_it_iu_len));
 
 		/*
 		 * Reserve credits for task management so we don't
@@ -3732,6 +3748,7 @@ static ssize_t srp_create_target(struct device *dev,
 	int ret, node_idx, node, cpu, i;
 	unsigned int max_sectors_per_mr, mr_per_cmd = 0;
 	bool multich = false;
+	uint32_t max_iu_len;
 
 	target_host = scsi_host_alloc(&srp_template,
 				      sizeof (struct srp_target_port));
@@ -3837,10 +3854,7 @@ static ssize_t srp_create_target(struct device *dev,
 	target->mr_per_cmd = mr_per_cmd;
 	target->indirect_size = target->sg_tablesize *
 				sizeof (struct srp_direct_buf);
-	target->max_iu_len = sizeof (struct srp_cmd) +
-			     SRP_MAX_ADD_CDB_LEN +
-			     sizeof (struct srp_indirect_buf) +
-			     target->cmd_sg_cnt * sizeof (struct srp_direct_buf);
+	max_iu_len = srp_max_it_iu_len(target->cmd_sg_cnt);
 
 	INIT_WORK(&target->tl_err_work, srp_tl_err_work);
 	INIT_WORK(&target->remove_work, srp_remove_work);
@@ -3895,7 +3909,7 @@ static ssize_t srp_create_target(struct device *dev,
 			if (ret)
 				goto err_disconnect;
 
-			ret = srp_connect_ch(ch, multich);
+			ret = srp_connect_ch(ch, max_iu_len, multich);
 			if (ret) {
 				char dst[64];
 
