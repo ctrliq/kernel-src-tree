@@ -1,0 +1,191 @@
+bpf: Emit audit messages upon successful prog load and unload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 91e6015b082b08a74e5d9d326f651e5890a93519
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/91e6015b.failed
+
+Allow for audit messages to be emitted upon BPF program load and
+unload for having a timeline of events. The load itself is in
+syscall context, so additional info about the process initiating
+the BPF prog creation can be logged and later directly correlated
+to the unload event.
+
+The only info really needed from BPF side is the globally unique
+prog ID where then audit user space tooling can query / dump all
+info needed about the specific BPF program right upon load event
+and enrich the record, thus these changes needed here can be kept
+small and non-intrusive to the core.
+
+Raw example output:
+
+  # auditctl -D
+  # auditctl -a always,exit -F arch=x86_64 -S bpf
+  # ausearch --start recent -m 1334
+  [...]
+  ----
+  time->Wed Nov 20 12:45:51 2019
+  type=PROCTITLE msg=audit(1574271951.590:8974): proctitle="./test_verifier"
+  type=SYSCALL msg=audit(1574271951.590:8974): arch=c000003e syscall=321 success=yes exit=14 a0=5 a1=7ffe2d923e80 a2=78 a3=0 items=0 ppid=742 pid=949 auid=0 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=2 comm="test_verifier" exe="/root/bpf-next/tools/testing/selftests/bpf/test_verifier" subj=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023 key=(null)
+  type=UNKNOWN[1334] msg=audit(1574271951.590:8974): auid=0 uid=0 gid=0 ses=2 subj=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023 pid=949 comm="test_verifier" exe="/root/bpf-next/tools/testing/selftests/bpf/test_verifier" prog-id=3260 event=LOAD
+  ----
+  time->Wed Nov 20 12:45:51 2019
+type=UNKNOWN[1334] msg=audit(1574271951.590:8975): prog-id=3260 event=UNLOAD
+  ----
+  [...]
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20191120213816.8186-1-jolsa@kernel.org
+(cherry picked from commit 91e6015b082b08a74e5d9d326f651e5890a93519)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/syscall.c
+diff --cc kernel/bpf/syscall.c
+index bb8784873321,17f4254495f2..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -23,9 -23,8 +23,14 @@@
+  #include <linux/timekeeping.h>
+  #include <linux/ctype.h>
+  #include <linux/nospec.h>
+++<<<<<<< HEAD
+ +#include <linux/init.h>
+ +
+ +#include <linux/rh_features.h>
+++=======
++ #include <linux/audit.h>
++ #include <uapi/linux/btf.h>
+++>>>>>>> 91e6015b082b (bpf: Emit audit messages upon successful prog load and unload)
+  
+  #define IS_FD_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PROG_ARRAY || \
+  			   (map)->map_type == BPF_MAP_TYPE_PERF_EVENT_ARRAY || \
+@@@ -1339,18 -1447,26 +1372,19 @@@ static void __bpf_prog_put_rcu(struct r
+  	bpf_prog_free(aux->prog);
+  }
+  
+ -static void __bpf_prog_put_noref(struct bpf_prog *prog, bool deferred)
+ -{
+ -	bpf_prog_kallsyms_del_all(prog);
+ -	btf_put(prog->aux->btf);
+ -	bpf_prog_free_linfo(prog);
+ -
+ -	if (deferred)
+ -		call_rcu(&prog->aux->rcu, __bpf_prog_put_rcu);
+ -	else
+ -		__bpf_prog_put_rcu(&prog->aux->rcu);
+ -}
+ -
+  static void __bpf_prog_put(struct bpf_prog *prog, bool do_idr_lock)
+  {
+ -	if (atomic64_dec_and_test(&prog->aux->refcnt)) {
+ +	if (atomic_dec_and_test(&prog->aux->refcnt)) {
+  		perf_event_bpf_event(prog, PERF_BPF_EVENT_PROG_UNLOAD, 0);
++ 		bpf_audit_prog(prog, BPF_EVENT_UNLOAD);
+  		/* bpf_prog_free_id() must be called first */
+  		bpf_prog_free_id(prog, do_idr_lock);
+ -		__bpf_prog_put_noref(prog, true);
+ +		bpf_prog_kallsyms_del_all(prog);
+ +		btf_put(prog->aux->btf);
+ +		kvfree(prog->aux->func_info);
+ +		bpf_prog_free_linfo(prog);
+ +
+ +		call_rcu(&prog->aux->rcu, __bpf_prog_put_rcu);
+  	}
+  }
+  
+@@@ -1682,20 -1857,27 +1716,28 @@@ static int bpf_prog_load(union bpf_att
+  	if (err)
+  		goto free_used_maps;
+  
+ -	/* Upon success of bpf_prog_alloc_id(), the BPF prog is
+ -	 * effectively publicly exposed. However, retrieving via
+ -	 * bpf_prog_get_fd_by_id() will take another reference,
+ -	 * therefore it cannot be gone underneath us.
+ -	 *
+ -	 * Only for the time /after/ successful bpf_prog_new_fd()
+ -	 * and before returning to userspace, we might just hold
+ -	 * one reference and any parallel close on that fd could
+ -	 * rip everything out. Hence, below notifications must
+ -	 * happen before bpf_prog_new_fd().
+ -	 *
+ -	 * Also, any failure handling from this point onwards must
+ -	 * be using bpf_prog_put() given the program is exposed.
+ -	 */
+ +	err = bpf_prog_new_fd(prog);
+ +	if (err < 0) {
+ +		/* failed to allocate fd.
+ +		 * bpf_prog_put() is needed because the above
+ +		 * bpf_prog_alloc_id() has published the prog
+ +		 * to the userspace and the userspace may
+ +		 * have refcnt-ed it through BPF_PROG_GET_FD_BY_ID.
+ +		 */
+ +		bpf_prog_put(prog);
+ +		return err;
+ +	}
+ +
+  	bpf_prog_kallsyms_add(prog);
+  	perf_event_bpf_event(prog, PERF_BPF_EVENT_PROG_LOAD, 0);
+++<<<<<<< HEAD
+++=======
++ 	bpf_audit_prog(prog, BPF_EVENT_LOAD);
++ 
++ 	err = bpf_prog_new_fd(prog);
++ 	if (err < 0)
++ 		bpf_prog_put(prog);
+++>>>>>>> 91e6015b082b (bpf: Emit audit messages upon successful prog load and unload)
+  	return err;
+  
+  free_used_maps:
+diff --git a/include/linux/audit.h b/include/linux/audit.h
+index 0f62bf6a4d93..0b28b67b0ce4 100644
+--- a/include/linux/audit.h
++++ b/include/linux/audit.h
+@@ -175,6 +175,7 @@ extern void		    audit_log_path_denied(int type,
+ 						  const char *operation);
+ extern void		    audit_log_lost(const char *message);
+ 
++extern void audit_log_task(struct audit_buffer *ab);
+ extern int audit_log_task_context(struct audit_buffer *ab);
+ extern void audit_log_task_info(struct audit_buffer *ab);
+ 
+@@ -235,6 +236,8 @@ static inline void audit_log_key(struct audit_buffer *ab, char *key)
+ { }
+ static inline void audit_log_path_denied(int type, const char *operation)
+ { }
++static inline void audit_log_task(struct audit_buffer *ab)
++{ }
+ static inline int audit_log_task_context(struct audit_buffer *ab)
+ {
+ 	return 0;
+diff --git a/include/uapi/linux/audit.h b/include/uapi/linux/audit.h
+index 498af46d77d0..88f55852e128 100644
+--- a/include/uapi/linux/audit.h
++++ b/include/uapi/linux/audit.h
+@@ -116,6 +116,7 @@
+ #define AUDIT_FANOTIFY		1331	/* Fanotify access decision */
+ #define AUDIT_TIME_INJOFFSET	1332	/* Timekeeping offset injected */
+ #define AUDIT_TIME_ADJNTPVAL	1333	/* NTP value adjustment */
++#define AUDIT_BPF		1334	/* BPF subsystem */
+ 
+ #define AUDIT_AVC		1400	/* SE Linux avc denial or grant */
+ #define AUDIT_SELINUX_ERR	1401	/* Internal SE Linux Errors */
+diff --git a/kernel/auditsc.c b/kernel/auditsc.c
+index ac8244b69da0..4629f09a0951 100644
+--- a/kernel/auditsc.c
++++ b/kernel/auditsc.c
+@@ -2545,7 +2545,7 @@ void __audit_ntp_log(const struct audit_ntp_data *ad)
+ 	audit_log_ntp_val(ad, "adjust",	AUDIT_NTP_ADJUST);
+ }
+ 
+-static void audit_log_task(struct audit_buffer *ab)
++void audit_log_task(struct audit_buffer *ab)
+ {
+ 	kuid_t auid, uid;
+ 	kgid_t gid;
+* Unmerged path kernel/bpf/syscall.c
