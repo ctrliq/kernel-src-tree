@@ -1,0 +1,363 @@
+net: atlantic: automatically downgrade the number of queues if necessary
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mark Starovoytov <mstarovoitov@marvell.com>
+commit 14ef766b13822001087d468aa41f22caa2a42022
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/14ef766b.failed
+
+This patch adds support for automatic queue number downgrade.
+
+On A2: this is a must have, because only TC0/TC1 support more than 4Q.
+Other TCs support 4Qs maximum.
+Thus, on A2 we must downgrade the number of queues per TC to 4, if more
+than 2 TCs are requested.
+
+On A1: this allows using 8TCs even on systems with cpu count >= 8, when
+we have 8 queues by default.
+We will just automatically switch to 8TCx4Q mode in this case.
+
+	Signed-off-by: Mark Starovoytov <mstarovoitov@marvell.com>
+	Signed-off-by: Igor Russkikh <irusskikh@marvell.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 14ef766b13822001087d468aa41f22caa2a42022)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+#	drivers/net/ethernet/aquantia/atlantic/aq_main.c
+#	drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+index a64230722f5c,743d3b13b39d..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+@@@ -543,25 -793,18 +543,38 @@@ static int aq_set_ringparam(struct net_
+  		dev_close(ndev);
+  	}
+  
+++<<<<<<< HEAD
+ +	aq_nic_free_vectors(aq_nic);
+ +
+ +	aq_nic_cfg->rxds = max(ring->rx_pending, hw_caps->rxds_min);
+ +	aq_nic_cfg->rxds = min(aq_nic_cfg->rxds, hw_caps->rxds_max);
+ +	aq_nic_cfg->rxds = ALIGN(aq_nic_cfg->rxds, AQ_HW_RXD_MULTIPLE);
+++=======
++ 	cfg->rxds = max(ring->rx_pending, hw_caps->rxds_min);
++ 	cfg->rxds = min(cfg->rxds, hw_caps->rxds_max);
++ 	cfg->rxds = ALIGN(cfg->rxds, AQ_HW_RXD_MULTIPLE);
+ -
+ -	cfg->txds = max(ring->tx_pending, hw_caps->txds_min);
+ -	cfg->txds = min(cfg->txds, hw_caps->txds_max);
+ -	cfg->txds = ALIGN(cfg->txds, AQ_HW_TXD_MULTIPLE);
+ -
+++>>>>>>> 14ef766b1382 (net: atlantic: automatically downgrade the number of queues if necessary)
+ +
+ +	aq_nic_cfg->txds = max(ring->tx_pending, hw_caps->txds_min);
+ +	aq_nic_cfg->txds = min(aq_nic_cfg->txds, hw_caps->txds_max);
+ +	aq_nic_cfg->txds = ALIGN(aq_nic_cfg->txds, AQ_HW_TXD_MULTIPLE);
+ +
+++<<<<<<< HEAD
+ +	for (aq_nic->aq_vecs = 0; aq_nic->aq_vecs < aq_nic_cfg->vecs;
+ +	     aq_nic->aq_vecs++) {
+ +		aq_nic->aq_vec[aq_nic->aq_vecs] =
+ +		    aq_vec_alloc(aq_nic, aq_nic->aq_vecs, aq_nic_cfg);
+ +		if (unlikely(!aq_nic->aq_vec[aq_nic->aq_vecs])) {
+ +			err = -ENOMEM;
+ +			goto err_exit;
+ +		}
+ +	}
+++=======
++ 	err = aq_nic_realloc_vectors(aq_nic);
++ 	if (err)
++ 		goto err_exit;
++ 
+++>>>>>>> 14ef766b1382 (net: atlantic: automatically downgrade the number of queues if necessary)
+  	if (ndev_running)
+  		err = dev_open(ndev, NULL);
+  
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_main.c
+index 25a59894105a,57a116ccad55..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_main.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_main.c
+@@@ -229,6 -332,65 +229,68 @@@ static int aq_ndo_vlan_rx_kill_vid(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int aq_validate_mqprio_opt(struct aq_nic_s *self,
++ 				  struct tc_mqprio_qopt_offload *mqprio,
++ 				  const unsigned int num_tc)
++ {
++ 	const bool has_min_rate = !!(mqprio->flags & TC_MQPRIO_F_MIN_RATE);
++ 	struct aq_nic_cfg_s *aq_nic_cfg = aq_nic_get_cfg(self);
++ 	const unsigned int tcs_max = min_t(u8, aq_nic_cfg->aq_hw_caps->tcs_max,
++ 					   AQ_CFG_TCS_MAX);
++ 	int i;
++ 
++ 	if (num_tc > tcs_max) {
++ 		netdev_err(self->ndev, "Too many TCs requested\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (num_tc != 0 && !is_power_of_2(num_tc)) {
++ 		netdev_err(self->ndev, "TC count should be power of 2\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	for (i = 0; i < num_tc; i++) {
++ 		if (has_min_rate && mqprio->min_rate[i]) {
++ 			netdev_err(self->ndev,
++ 				   "Min tx rate is not supported\n");
++ 			return -EOPNOTSUPP;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int aq_ndo_setup_tc(struct net_device *dev, enum tc_setup_type type,
++ 			   void *type_data)
++ {
++ 	struct tc_mqprio_qopt_offload *mqprio = type_data;
++ 	struct aq_nic_s *aq_nic = netdev_priv(dev);
++ 	int err;
++ 	int i;
++ 
++ 	if (type != TC_SETUP_QDISC_MQPRIO)
++ 		return -EOPNOTSUPP;
++ 
++ 	err = aq_validate_mqprio_opt(aq_nic, mqprio, mqprio->qopt.num_tc);
++ 	if (err)
++ 		return err;
++ 
++ 	if (mqprio->flags & TC_MQPRIO_F_MAX_RATE) {
++ 		for (i = 0; i < mqprio->qopt.num_tc; i++) {
++ 			u64 max_rate = mqprio->max_rate[i];
++ 
++ 			do_div(max_rate, AQ_MBPS_DIVISOR);
++ 			aq_nic_setup_tc_max_rate(aq_nic, i, (u32)max_rate);
++ 		}
++ 	}
++ 
++ 	return aq_nic_setup_tc_mqprio(aq_nic, mqprio->qopt.num_tc,
++ 				      mqprio->qopt.prio_tc_map);
++ }
++ 
+++>>>>>>> 14ef766b1382 (net: atlantic: automatically downgrade the number of queues if necessary)
+  static const struct net_device_ops aq_ndev_ops = {
+  	.ndo_open = aq_ndev_open,
+  	.ndo_stop = aq_ndev_close,
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+index ed7d344e3ed7,0973214db20f..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+@@@ -76,9 -108,9 +103,8 @@@ void aq_nic_cfg_start(struct aq_nic_s *
+  
+  	cfg->rxpageorder = AQ_CFG_RX_PAGEORDER;
+  	cfg->is_rss = AQ_CFG_IS_RSS_DEF;
+- 	cfg->num_rss_queues = AQ_CFG_NUM_RSS_QUEUES_DEF;
+  	cfg->aq_rss.base_cpu_number = AQ_CFG_RSS_BASE_CPU_NUM_DEF;
+ -	cfg->fc.req = AQ_CFG_FC_MODE;
+ -	cfg->wol = AQ_CFG_WOL_MODES;
+ +	cfg->flow_control = AQ_CFG_FC_MODE;
+  
+  	cfg->mtu = AQ_CFG_MTU_DEF;
+  	cfg->link_speed_msk = AQ_CFG_SPEED_MSK;
+@@@ -1017,42 -1223,20 +1026,59 @@@ void aq_nic_free_vectors(struct aq_nic_
+  err_exit:;
+  }
+  
+++<<<<<<< HEAD
+ +int aq_nic_change_pm_state(struct aq_nic_s *self, pm_message_t *pm_msg)
+ +{
+ +	int err = 0;
+ +
+ +	if (!netif_running(self->ndev)) {
+ +		err = 0;
+ +		goto out;
+ +	}
+ +	rtnl_lock();
+ +	if (pm_msg->event & PM_EVENT_SLEEP || pm_msg->event & PM_EVENT_FREEZE) {
+ +		self->power_state = AQ_HW_POWER_STATE_D3;
+ +		netif_device_detach(self->ndev);
+ +		netif_tx_stop_all_queues(self->ndev);
+ +
+ +		err = aq_nic_stop(self);
+ +		if (err < 0)
+ +			goto err_exit;
+ +
+ +		aq_nic_deinit(self);
+ +	} else {
+ +		err = aq_nic_init(self);
+ +		if (err < 0)
+ +			goto err_exit;
+ +
+ +		err = aq_nic_start(self);
+ +		if (err < 0)
+ +			goto err_exit;
+ +
+ +		netif_device_attach(self->ndev);
+ +		netif_tx_start_all_queues(self->ndev);
+ +	}
+ +
+ +err_exit:
+ +	rtnl_unlock();
+ +out:
+ +	return err;
+++=======
++ int aq_nic_realloc_vectors(struct aq_nic_s *self)
++ {
++ 	struct aq_nic_cfg_s *cfg = aq_nic_get_cfg(self);
++ 
++ 	aq_nic_free_vectors(self);
++ 
++ 	for (self->aq_vecs = 0; self->aq_vecs < cfg->vecs; self->aq_vecs++) {
++ 		self->aq_vec[self->aq_vecs] = aq_vec_alloc(self, self->aq_vecs,
++ 							   cfg);
++ 		if (unlikely(!self->aq_vec[self->aq_vecs]))
++ 			return -ENOMEM;
++ 	}
++ 
++ 	return 0;
+++>>>>>>> 14ef766b1382 (net: atlantic: automatically downgrade the number of queues if necessary)
+  }
+  
+  void aq_nic_shutdown(struct aq_nic_s *self)
+@@@ -1076,3 -1261,116 +1102,119 @@@
+  err_exit:
+  	rtnl_unlock();
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ u8 aq_nic_reserve_filter(struct aq_nic_s *self, enum aq_rx_filter_type type)
++ {
++ 	u8 location = 0xFF;
++ 	u32 fltr_cnt;
++ 	u32 n_bit;
++ 
++ 	switch (type) {
++ 	case aq_rx_filter_ethertype:
++ 		location = AQ_RX_LAST_LOC_FETHERT - AQ_RX_FIRST_LOC_FETHERT -
++ 			   self->aq_hw_rx_fltrs.fet_reserved_count;
++ 		self->aq_hw_rx_fltrs.fet_reserved_count++;
++ 		break;
++ 	case aq_rx_filter_l3l4:
++ 		fltr_cnt = AQ_RX_LAST_LOC_FL3L4 - AQ_RX_FIRST_LOC_FL3L4;
++ 		n_bit = fltr_cnt - self->aq_hw_rx_fltrs.fl3l4.reserved_count;
++ 
++ 		self->aq_hw_rx_fltrs.fl3l4.active_ipv4 |= BIT(n_bit);
++ 		self->aq_hw_rx_fltrs.fl3l4.reserved_count++;
++ 		location = n_bit;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	return location;
++ }
++ 
++ void aq_nic_release_filter(struct aq_nic_s *self, enum aq_rx_filter_type type,
++ 			   u32 location)
++ {
++ 	switch (type) {
++ 	case aq_rx_filter_ethertype:
++ 		self->aq_hw_rx_fltrs.fet_reserved_count--;
++ 		break;
++ 	case aq_rx_filter_l3l4:
++ 		self->aq_hw_rx_fltrs.fl3l4.reserved_count--;
++ 		self->aq_hw_rx_fltrs.fl3l4.active_ipv4 &= ~BIT(location);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ }
++ 
++ int aq_nic_setup_tc_mqprio(struct aq_nic_s *self, u32 tcs, u8 *prio_tc_map)
++ {
++ 	struct aq_nic_cfg_s *cfg = &self->aq_nic_cfg;
++ 	const unsigned int prev_vecs = cfg->vecs;
++ 	bool ndev_running;
++ 	int err = 0;
++ 	int i;
++ 
++ 	/* if already the same configuration or
++ 	 * disable request (tcs is 0) and we already is disabled
++ 	 */
++ 	if (tcs == cfg->tcs || (tcs == 0 && !cfg->is_qos))
++ 		return 0;
++ 
++ 	ndev_running = netif_running(self->ndev);
++ 	if (ndev_running)
++ 		dev_close(self->ndev);
++ 
++ 	cfg->tcs = tcs;
++ 	if (cfg->tcs == 0)
++ 		cfg->tcs = 1;
++ 	if (prio_tc_map)
++ 		memcpy(cfg->prio_tc_map, prio_tc_map, sizeof(cfg->prio_tc_map));
++ 	else
++ 		for (i = 0; i < sizeof(cfg->prio_tc_map); i++)
++ 			cfg->prio_tc_map[i] = cfg->tcs * i / 8;
++ 
++ 	cfg->is_qos = (tcs != 0 ? true : false);
++ 	cfg->is_ptp = (cfg->tcs <= AQ_HW_PTP_TC);
++ 	if (!cfg->is_ptp)
++ 		netdev_warn(self->ndev, "%s\n",
++ 			    "PTP is auto disabled due to requested TC count.");
++ 
++ 	netdev_set_num_tc(self->ndev, cfg->tcs);
++ 
++ 	/* Changing the number of TCs might change the number of vectors */
++ 	aq_nic_cfg_update_num_vecs(self);
++ 	if (prev_vecs != cfg->vecs) {
++ 		err = aq_nic_realloc_vectors(self);
++ 		if (err)
++ 			goto err_exit;
++ 	}
++ 
++ 	if (ndev_running)
++ 		err = dev_open(self->ndev, NULL);
++ 
++ err_exit:
++ 	return err;
++ }
++ 
++ int aq_nic_setup_tc_max_rate(struct aq_nic_s *self, const unsigned int tc,
++ 			     const u32 max_rate)
++ {
++ 	struct aq_nic_cfg_s *cfg = &self->aq_nic_cfg;
++ 
++ 	if (tc >= AQ_CFG_TCS_MAX)
++ 		return -EINVAL;
++ 
++ 	if (max_rate && max_rate < 10) {
++ 		netdev_warn(self->ndev,
++ 			"Setting %s to the minimum usable value of %dMbps.\n",
++ 			"max rate", 10);
++ 		cfg->tc_max_rate[tc] = 10;
++ 	} else {
++ 		cfg->tc_max_rate[tc] = max_rate;
++ 	}
++ 
++ 	return 0;
++ }
+++>>>>>>> 14ef766b1382 (net: atlantic: automatically downgrade the number of queues if necessary)
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_main.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_nic.h b/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
+index f6d04351e098..d74b058fa912 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
+@@ -136,6 +136,7 @@ int aq_nic_stop(struct aq_nic_s *self);
+ void aq_nic_deinit(struct aq_nic_s *self);
+ void aq_nic_free_hot_resources(struct aq_nic_s *self);
+ void aq_nic_free_vectors(struct aq_nic_s *self);
++int aq_nic_realloc_vectors(struct aq_nic_s *self);
+ int aq_nic_set_mtu(struct aq_nic_s *self, int new_mtu);
+ int aq_nic_set_mac(struct aq_nic_s *self, struct net_device *ndev);
+ int aq_nic_set_packet_filter(struct aq_nic_s *self, unsigned int flags);
