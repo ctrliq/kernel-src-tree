@@ -1,0 +1,215 @@
+x86/entry/64: Remove TRACE_IRQS_*_DEBUG
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 9628f26baef262a49d877e3785e8b88d241bc064
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9628f26b.failed
+
+Since INT3/#BP no longer runs on an IST, this workaround is no longer
+required.
+
+Tested by running lockdep+ftrace as described in the initial commit:
+
+  5963e317b1e9 ("ftrace/x86: Do not change stacks in DEBUG when calling lockdep")
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+	Reviewed-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Acked-by: Andy Lutomirski <luto@kernel.org>
+Link: https://lore.kernel.org/r/20200521202120.319418546@linutronix.de
+
+
+(cherry picked from commit 9628f26baef262a49d877e3785e8b88d241bc064)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/entry_64.S
+diff --cc arch/x86/entry/entry_64.S
+index 955c9ec809bc,fb7f12628346..000000000000
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@@ -401,80 -332,65 +363,95 @@@ END(spurious_entries_start
+  #endif
+  .endm
+  
+ -/**
+ - * idtentry_body - Macro to emit code calling the C function
+ - * @cfunc:		C function to be called
+ - * @has_error_code:	Hardware pushed error code on stack
+ +/*
+ + * Enters the IRQ stack if we're not already using it.  NMI-safe.  Clobbers
+ + * flags and puts old RSP into old_rsp, and leaves all other GPRs alone.
+ + * Requires kernel GSBASE.
+ + *
+ + * The invariant is that, if irq_count != -1, then the IRQ stack is in use.
+   */
+ -.macro idtentry_body cfunc has_error_code:req
+ +.macro ENTER_IRQ_STACK regs=1 old_rsp save_ret=0
+ +	DEBUG_ENTRY_ASSERT_IRQS_OFF
+ +
+ +	.if \save_ret
+ +	/*
+ +	 * If save_ret is set, the original stack contains one additional
+ +	 * entry -- the return address. Therefore, move the address one
+ +	 * entry below %rsp to \old_rsp.
+ +	 */
+++<<<<<<< HEAD
+ +	leaq	8(%rsp), \old_rsp
+ +	.else
+ +	movq	%rsp, \old_rsp
+ +	.endif
+++=======
+++	testb	$3, CS-ORIG_RAX(%rsp)
+++	jnz	.Lfrom_usermode_switch_stack_\@
+++
+++	/*
+++	 * paranoid_entry returns SWAPGS flag for paranoid_exit in EBX.
+++	 * EBX == 0 -> SWAPGS, EBX == 1 -> no SWAPGS
+++	 */
+++	call	paranoid_entry
++ 
+ -	call	error_entry
++ 	UNWIND_HINT_REGS
++ 
+ -	movq	%rsp, %rdi			/* pt_regs pointer into 1st argument*/
+++	TRACE_IRQS_OFF
+++>>>>>>> 9628f26baef2 (x86/entry/64: Remove TRACE_IRQS_*_DEBUG)
+  
+ -	.if \has_error_code == 1
+ -		movq	ORIG_RAX(%rsp), %rsi	/* get error code into 2nd argument*/
+ -		movq	$-1, ORIG_RAX(%rsp)	/* no syscall to restart */
+ +	.if \regs
+ +	UNWIND_HINT_REGS base=\old_rsp
+  	.endif
+  
+ -	call	\cfunc
+ +	incl	PER_CPU_VAR(irq_count)
+ +	jnz	.Lirq_stack_push_old_rsp_\@
+  
+ -	jmp	error_return
+ -.endm
+ +	/*
+ +	 * Right now, if we just incremented irq_count to zero, we've
+ +	 * claimed the IRQ stack but we haven't switched to it yet.
+ +	 *
+ +	 * If anything is added that can interrupt us here without using IST,
+ +	 * it must be *extremely* careful to limit its stack usage.  This
+ +	 * could include kprobes and a hypothetical future IST-less #DB
+ +	 * handler.
+ +	 *
+ +	 * The OOPS unwinder relies on the word at the top of the IRQ
+ +	 * stack linking back to the previous RSP for the entire time we're
+ +	 * on the IRQ stack.  For this to work reliably, we need to write
+ +	 * it before we actually move ourselves to the IRQ stack.
+ +	 */
+  
+ -/**
+ - * idtentry - Macro to generate entry stubs for simple IDT entries
+ - * @vector:		Vector number
+ - * @asmsym:		ASM symbol for the entry point
+ - * @cfunc:		C function to be called
+ - * @has_error_code:	Hardware pushed error code on stack
+ - *
+ - * The macro emits code to set up the kernel context for straight forward
+ - * and simple IDT entries. No IST stack, no paranoid entry checks.
+ - */
+ -.macro idtentry vector asmsym cfunc has_error_code:req
+ -SYM_CODE_START(\asmsym)
+ -	UNWIND_HINT_IRET_REGS offset=\has_error_code*8
+ -	ASM_CLAC
+ +	movq	\old_rsp, PER_CPU_VAR(irq_stack_backing_store + IRQ_STACK_SIZE - 8)
+ +	movq	PER_CPU_VAR(hardirq_stack_ptr), %rsp
+  
+ -	.if \has_error_code == 0
+ -		pushq	$-1			/* ORIG_RAX: no syscall to restart */
+ -	.endif
+ +#ifdef CONFIG_DEBUG_ENTRY
+ +	/*
+ +	 * If the first movq above becomes wrong due to IRQ stack layout
+ +	 * changes, the only way we'll notice is if we try to unwind right
+ +	 * here.  Assert that we set up the stack right to catch this type
+ +	 * of bug quickly.
+ +	 */
+ +	cmpq	-8(%rsp), \old_rsp
+ +	je	.Lirq_stack_okay\@
+ +	ud2
+ +	.Lirq_stack_okay\@:
+ +#endif
+  
+ -	.if \vector == X86_TRAP_BP
+ -		/*
+ -		 * If coming from kernel space, create a 6-word gap to allow the
+ -		 * int3 handler to emulate a call instruction.
+ -		 */
+ -		testb	$3, CS-ORIG_RAX(%rsp)
+ -		jnz	.Lfrom_usermode_no_gap_\@
+ -		.rept	6
+ -		pushq	5*8(%rsp)
+ -		.endr
+ -		UNWIND_HINT_IRET_REGS offset=8
+ -.Lfrom_usermode_no_gap_\@:
+ -	.endif
+ +.Lirq_stack_push_old_rsp_\@:
+ +	pushq	\old_rsp
+  
+ -	idtentry_body \cfunc \has_error_code
+ +	.if \regs
+ +	UNWIND_HINT_REGS indirect=1
+ +	.endif
+  
+ -_ASM_NOKPROBE(\asmsym)
+ -SYM_CODE_END(\asmsym)
+ +	.if \save_ret
+ +	/*
+ +	 * Push the return address to the stack. This return address can
+ +	 * be found at the "real" original RSP, which was offset by 8 at
+ +	 * the beginning of this macro.
+ +	 */
+ +	pushq	-8(\old_rsp)
+ +	.endif
+  .endm
+  
+  /*
+@@@ -1240,23 -879,23 +1217,32 @@@ END(paranoid_entry
+   *
+   * On entry, ebx is "no swapgs" flag (1: don't need swapgs, 0: need it)
+   */
+ -SYM_CODE_START_LOCAL(paranoid_exit)
+ +ENTRY(paranoid_exit)
+  	UNWIND_HINT_REGS
+  	DISABLE_INTERRUPTS(CLBR_ANY)
+++<<<<<<< HEAD
+ +	TRACE_IRQS_OFF_DEBUG
+ +	IBRS_EXIT_RESTORE_CLOBBER save_reg=%r13d
+++=======
++ 	TRACE_IRQS_OFF
+++>>>>>>> 9628f26baef2 (x86/entry/64: Remove TRACE_IRQS_*_DEBUG)
+  	testl	%ebx, %ebx			/* swapgs needed? */
+  	jnz	.Lparanoid_exit_no_swapgs
+  	TRACE_IRQS_IRETQ
+ -	/* Always restore stashed CR3 value (see paranoid_entry) */
+  	RESTORE_CR3	scratch_reg=%rbx save_reg=%r14
+  	SWAPGS_UNSAFE_STACK
+ -	jmp	restore_regs_and_return_to_kernel
+ +	jmp	.Lparanoid_exit_restore
+  .Lparanoid_exit_no_swapgs:
+++<<<<<<< HEAD
+ +	TRACE_IRQS_IRETQ_DEBUG
+++=======
++ 	TRACE_IRQS_IRETQ
++ 	/* Always restore stashed CR3 value (see paranoid_entry) */
+++>>>>>>> 9628f26baef2 (x86/entry/64: Remove TRACE_IRQS_*_DEBUG)
+  	RESTORE_CR3	scratch_reg=%rbx save_reg=%r14
+ +.Lparanoid_exit_restore:
+  	jmp restore_regs_and_return_to_kernel
+ -SYM_CODE_END(paranoid_exit)
+ +END(paranoid_exit)
+  
+  /*
+   * Save all registers in pt_regs, and switch GS if needed.
+* Unmerged path arch/x86/entry/entry_64.S
