@@ -1,0 +1,468 @@
+powerpc/book3s: Use config independent helpers for page table walk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+commit d6eacedd1f0ebf00bdf1c77715d194f7c1036fd4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d6eacedd.failed
+
+Even when we have HugeTLB and THP disabled, kernel linear map can still be
+mapped with hugepages. This is only an issue with radix translation because hash
+MMU doesn't map kernel linear range in linux page table and other kernel
+map areas are not mapped using hugepage.
+
+Add config independent helpers and put WARN_ON() when we don't expect things
+to be mapped via hugepages.
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit d6eacedd1f0ebf00bdf1c77715d194f7c1036fd4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/dump_linuxpagetables.c
+#	arch/powerpc/mm/pgtable.c
+diff --cc arch/powerpc/mm/dump_linuxpagetables.c
+index 876e2a3c79f2,abe60d25b4e6..000000000000
+--- a/arch/powerpc/mm/dump_linuxpagetables.c
++++ b/arch/powerpc/mm/dump_linuxpagetables.c
+@@@ -422,9 -313,8 +422,14 @@@ static void walk_pagetables(struct pg_s
+  	 * Traverse the linux pagetable structure and dump pages that are in
+  	 * the hash pagetable.
+  	 */
+++<<<<<<< HEAD:arch/powerpc/mm/dump_linuxpagetables.c
+ +	for (i = 0; i < PTRS_PER_PGD; i++, pgd++) {
+ +		addr = KERN_VIRT_START + i * PGDIR_SIZE;
+ +		if (!pgd_none(*pgd) && !pgd_huge(*pgd))
+++=======
++ 	for (i = 0; i < PTRS_PER_PGD; i++, pgd++, addr += PGDIR_SIZE) {
++ 		if (!pgd_none(*pgd) && !pgd_is_leaf(*pgd))
+++>>>>>>> d6eacedd1f0e (powerpc/book3s: Use config independent helpers for page table walk):arch/powerpc/mm/ptdump/ptdump.c
+  			/* pgd exists */
+  			walk_pud(st, pgd, addr);
+  		else
+diff --cc arch/powerpc/mm/pgtable.c
+index 3c6fefa8019e,2029e585e5c3..000000000000
+--- a/arch/powerpc/mm/pgtable.c
++++ b/arch/powerpc/mm/pgtable.c
+@@@ -345,59 -339,81 +345,137 @@@ pte_t *__find_linux_pte(pgd_t *pgdir, u
+  	 */
+  	if (pgd_none(pgd))
+  		return NULL;
+++<<<<<<< HEAD
+ +	else if (pgd_huge(pgd)) {
+ +		ret_pte = (pte_t *) pgdp;
+ +		goto out;
+ +	} else if (is_hugepd(__hugepd(pgd_val(pgd))))
+++=======
++ 
++ 	if (pgd_is_leaf(pgd)) {
++ 		ret_pte = (pte_t *)pgdp;
++ 		goto out;
++ 	}
++ 
++ 	if (is_hugepd(__hugepd(pgd_val(pgd)))) {
+++>>>>>>> d6eacedd1f0e (powerpc/book3s: Use config independent helpers for page table walk)
+  		hpdp = (hugepd_t *)&pgd;
+ -		goto out_huge;
+ +	else {
+ +		/*
+ +		 * Even if we end up with an unmap, the pgtable will not
+ +		 * be freed, because we do an rcu free and here we are
+ +		 * irq disabled
+ +		 */
+ +		pdshift = PUD_SHIFT;
+ +		pudp = pud_offset(&pgd, ea);
+ +		pud  = READ_ONCE(*pudp);
+ +
+ +		if (pud_none(pud))
+ +			return NULL;
+ +		else if (pud_huge(pud)) {
+ +			ret_pte = (pte_t *) pudp;
+ +			goto out;
+ +		} else if (is_hugepd(__hugepd(pud_val(pud))))
+ +			hpdp = (hugepd_t *)&pud;
+ +		else {
+ +			pdshift = PMD_SHIFT;
+ +			pmdp = pmd_offset(&pud, ea);
+ +			pmd  = READ_ONCE(*pmdp);
+ +			/*
+ +			 * A hugepage collapse is captured by pmd_none, because
+ +			 * it mark the pmd none and do a hpte invalidate.
+ +			 */
+ +			if (pmd_none(pmd))
+ +				return NULL;
+ +
+ +			if (pmd_trans_huge(pmd) || pmd_devmap(pmd)) {
+ +				if (is_thp)
+ +					*is_thp = true;
+ +				ret_pte = (pte_t *) pmdp;
+ +				goto out;
+ +			}
+ +			/*
+ +			 * pmd_large check below will handle the swap pmd pte
+ +			 * we need to do both the check because they are config
+ +			 * dependent.
+ +			 */
+ +			if (pmd_huge(pmd) || pmd_large(pmd)) {
+ +				ret_pte = (pte_t *) pmdp;
+ +				goto out;
+ +			} else if (is_hugepd(__hugepd(pmd_val(pmd))))
+ +				hpdp = (hugepd_t *)&pmd;
+ +			else
+ +				return pte_offset_kernel(&pmd, ea);
+ +		}
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * Even if we end up with an unmap, the pgtable will not
++ 	 * be freed, because we do an rcu free and here we are
++ 	 * irq disabled
++ 	 */
++ 	pdshift = PUD_SHIFT;
++ 	pudp = pud_offset(&pgd, ea);
++ 	pud  = READ_ONCE(*pudp);
++ 
++ 	if (pud_none(pud))
++ 		return NULL;
++ 
++ 	if (pud_is_leaf(pud)) {
++ 		ret_pte = (pte_t *)pudp;
++ 		goto out;
++ 	}
++ 
++ 	if (is_hugepd(__hugepd(pud_val(pud)))) {
++ 		hpdp = (hugepd_t *)&pud;
++ 		goto out_huge;
++ 	}
++ 
++ 	pdshift = PMD_SHIFT;
++ 	pmdp = pmd_offset(&pud, ea);
++ 	pmd  = READ_ONCE(*pmdp);
++ 
++ 	/*
++ 	 * A hugepage collapse is captured by this condition, see
++ 	 * pmdp_collapse_flush.
++ 	 */
++ 	if (pmd_none(pmd))
++ 		return NULL;
++ 
++ #ifdef CONFIG_PPC_BOOK3S_64
++ 	/*
++ 	 * A hugepage split is captured by this condition, see
++ 	 * pmdp_invalidate.
++ 	 *
++ 	 * Huge page modification can be caught here too.
++ 	 */
++ 	if (pmd_is_serializing(pmd))
++ 		return NULL;
++ #endif
++ 
++ 	if (pmd_trans_huge(pmd) || pmd_devmap(pmd)) {
++ 		if (is_thp)
++ 			*is_thp = true;
++ 		ret_pte = (pte_t *)pmdp;
++ 		goto out;
++ 	}
++ 
++ 	if (pmd_is_leaf(pmd)) {
++ 		ret_pte = (pte_t *)pmdp;
++ 		goto out;
++ 	}
++ 
++ 	if (is_hugepd(__hugepd(pmd_val(pmd)))) {
++ 		hpdp = (hugepd_t *)&pmd;
++ 		goto out_huge;
++ 	}
++ 
++ 	return pte_offset_kernel(&pmd, ea);
++ 
++ out_huge:
+++>>>>>>> d6eacedd1f0e (powerpc/book3s: Use config independent helpers for page table walk)
+  	if (!hpdp)
+  		return NULL;
+  
+diff --git a/arch/powerpc/include/asm/book3s/64/pgtable.h b/arch/powerpc/include/asm/book3s/64/pgtable.h
+index c633db70f5c8..299460cfba9e 100644
+--- a/arch/powerpc/include/asm/book3s/64/pgtable.h
++++ b/arch/powerpc/include/asm/book3s/64/pgtable.h
+@@ -1325,5 +1325,26 @@ static inline const int pud_pfn(pud_t pud)
+ 	return 0;
+ }
+ 
++/*
++ * Like pmd_huge() and pmd_large(), but works regardless of config options
++ */
++#define pmd_is_leaf pmd_is_leaf
++static inline bool pmd_is_leaf(pmd_t pmd)
++{
++	return !!(pmd_raw(pmd) & cpu_to_be64(_PAGE_PTE));
++}
++
++#define pud_is_leaf pud_is_leaf
++static inline bool pud_is_leaf(pud_t pud)
++{
++	return !!(pud_raw(pud) & cpu_to_be64(_PAGE_PTE));
++}
++
++#define pgd_is_leaf pgd_is_leaf
++static inline bool pgd_is_leaf(pgd_t pgd)
++{
++	return !!(pgd_raw(pgd) & cpu_to_be64(_PAGE_PTE));
++}
++
+ #endif /* __ASSEMBLY__ */
+ #endif /* _ASM_POWERPC_BOOK3S_64_PGTABLE_H_ */
+diff --git a/arch/powerpc/include/asm/pgtable.h b/arch/powerpc/include/asm/pgtable.h
+index b03a1ec5ba40..6ce8ba1476b5 100644
+--- a/arch/powerpc/include/asm/pgtable.h
++++ b/arch/powerpc/include/asm/pgtable.h
+@@ -81,6 +81,30 @@ static inline bool is_ioremap_addr(const void *x)
+ }
+ #endif /* CONFIG_PPC64 */
+ 
++#ifndef pmd_is_leaf
++#define pmd_is_leaf pmd_is_leaf
++static inline bool pmd_is_leaf(pmd_t pmd)
++{
++	return false;
++}
++#endif
++
++#ifndef pud_is_leaf
++#define pud_is_leaf pud_is_leaf
++static inline bool pud_is_leaf(pud_t pud)
++{
++	return false;
++}
++#endif
++
++#ifndef pgd_is_leaf
++#define pgd_is_leaf pgd_is_leaf
++static inline bool pgd_is_leaf(pgd_t pgd)
++{
++	return false;
++}
++#endif
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* _ASM_POWERPC_PGTABLE_H */
+diff --git a/arch/powerpc/include/asm/pte-walk.h b/arch/powerpc/include/asm/pte-walk.h
+index 2d633e9d686c..33fa5dd8ee6a 100644
+--- a/arch/powerpc/include/asm/pte-walk.h
++++ b/arch/powerpc/include/asm/pte-walk.h
+@@ -10,8 +10,20 @@ extern pte_t *__find_linux_pte(pgd_t *pgdir, unsigned long ea,
+ static inline pte_t *find_linux_pte(pgd_t *pgdir, unsigned long ea,
+ 				    bool *is_thp, unsigned *hshift)
+ {
++	pte_t *pte;
++
+ 	VM_WARN(!arch_irqs_disabled(), "%s called with irq enabled\n", __func__);
+-	return __find_linux_pte(pgdir, ea, is_thp, hshift);
++	pte = __find_linux_pte(pgdir, ea, is_thp, hshift);
++
++#if defined(CONFIG_DEBUG_VM) &&						\
++	!(defined(CONFIG_HUGETLB_PAGE) || defined(CONFIG_TRANSPARENT_HUGEPAGE))
++	/*
++	 * We should not find huge page if these configs are not enabled.
++	 */
++	if (hshift)
++		WARN_ON(*hshift);
++#endif
++	return pte;
+ }
+ 
+ static inline pte_t *find_init_mm_pte(unsigned long ea, unsigned *hshift)
+@@ -26,10 +38,22 @@ static inline pte_t *find_init_mm_pte(unsigned long ea, unsigned *hshift)
+ static inline pte_t *find_current_mm_pte(pgd_t *pgdir, unsigned long ea,
+ 					 bool *is_thp, unsigned *hshift)
+ {
++	pte_t *pte;
++
+ 	VM_WARN(!arch_irqs_disabled(), "%s called with irq enabled\n", __func__);
+ 	VM_WARN(pgdir != current->mm->pgd,
+ 		"%s lock less page table lookup called on wrong mm\n", __func__);
+-	return __find_linux_pte(pgdir, ea, is_thp, hshift);
++	pte = __find_linux_pte(pgdir, ea, is_thp, hshift);
++
++#if defined(CONFIG_DEBUG_VM) &&						\
++	!(defined(CONFIG_HUGETLB_PAGE) || defined(CONFIG_TRANSPARENT_HUGEPAGE))
++	/*
++	 * We should not find huge page if these configs are not enabled.
++	 */
++	if (hshift)
++		WARN_ON(*hshift);
++#endif
++	return pte;
+ }
+ 
+ #endif /* _ASM_POWERPC_PTE_WALK_H */
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_radix.c b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+index 2034e35ec3da..dbcf66e24599 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_radix.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+@@ -374,12 +374,6 @@ static void kvmppc_pte_free(pte_t *ptep)
+ 	kmem_cache_free(kvm_pte_cache, ptep);
+ }
+ 
+-/* Like pmd_huge() and pmd_large(), but works regardless of config options */
+-static inline int pmd_is_leaf(pmd_t pmd)
+-{
+-	return !!(pmd_val(pmd) & _PAGE_PTE);
+-}
+-
+ static pmd_t *kvmppc_pmd_alloc(void)
+ {
+ 	pmd_t *pmd;
+@@ -509,7 +503,7 @@ static void kvmppc_unmap_free_pud(struct kvm *kvm, pud_t *pud,
+ 	for (iu = 0; iu < PTRS_PER_PUD; ++iu, ++p) {
+ 		if (!pud_present(*p))
+ 			continue;
+-		if (pud_huge(*p)) {
++		if (pud_is_leaf(*p)) {
+ 			pud_clear(p);
+ 		} else {
+ 			pmd_t *pmd;
+@@ -608,7 +602,7 @@ int kvmppc_create_pte(struct kvm *kvm, pgd_t *pgtable, pte_t pte,
+ 		new_pud = pud_alloc_one(kvm->mm, gpa);
+ 
+ 	pmd = NULL;
+-	if (pud && pud_present(*pud) && !pud_huge(*pud))
++	if (pud && pud_present(*pud) && !pud_is_leaf(*pud))
+ 		pmd = pmd_offset(pud, gpa);
+ 	else if (level <= 1)
+ 		new_pmd = kvmppc_pmd_alloc();
+@@ -631,7 +625,7 @@ int kvmppc_create_pte(struct kvm *kvm, pgd_t *pgtable, pte_t pte,
+ 		new_pud = NULL;
+ 	}
+ 	pud = pud_offset(pgd, gpa);
+-	if (pud_huge(*pud)) {
++	if (pud_is_leaf(*pud)) {
+ 		unsigned long hgpa = gpa & PUD_MASK;
+ 
+ 		/* Check if we raced and someone else has set the same thing */
+diff --git a/arch/powerpc/mm/book3s64/radix_pgtable.c b/arch/powerpc/mm/book3s64/radix_pgtable.c
+index c27ff2daed34..ec22fa41b09c 100644
+--- a/arch/powerpc/mm/book3s64/radix_pgtable.c
++++ b/arch/powerpc/mm/book3s64/radix_pgtable.c
+@@ -202,14 +202,14 @@ void radix__change_memory_range(unsigned long start, unsigned long end,
+ 		pudp = pud_alloc(&init_mm, pgdp, idx);
+ 		if (!pudp)
+ 			continue;
+-		if (pud_huge(*pudp)) {
++		if (pud_is_leaf(*pudp)) {
+ 			ptep = (pte_t *)pudp;
+ 			goto update_the_pte;
+ 		}
+ 		pmdp = pmd_alloc(&init_mm, pudp, idx);
+ 		if (!pmdp)
+ 			continue;
+-		if (pmd_huge(*pmdp)) {
++		if (pmd_is_leaf(*pmdp)) {
+ 			ptep = pmdp_ptep(pmdp);
+ 			goto update_the_pte;
+ 		}
+@@ -807,7 +807,7 @@ static void remove_pmd_table(pmd_t *pmd_start, unsigned long addr,
+ 		if (!pmd_present(*pmd))
+ 			continue;
+ 
+-		if (pmd_huge(*pmd)) {
++		if (pmd_is_leaf(*pmd)) {
+ 			split_kernel_mapping(addr, end, PMD_SIZE, (pte_t *)pmd);
+ 			continue;
+ 		}
+@@ -832,7 +832,7 @@ static void remove_pud_table(pud_t *pud_start, unsigned long addr,
+ 		if (!pud_present(*pud))
+ 			continue;
+ 
+-		if (pud_huge(*pud)) {
++		if (pud_is_leaf(*pud)) {
+ 			split_kernel_mapping(addr, end, PUD_SIZE, (pte_t *)pud);
+ 			continue;
+ 		}
+@@ -858,7 +858,7 @@ static void __meminit remove_pagetable(unsigned long start, unsigned long end)
+ 		if (!pgd_present(*pgd))
+ 			continue;
+ 
+-		if (pgd_huge(*pgd)) {
++		if (pgd_is_leaf(*pgd)) {
+ 			split_kernel_mapping(addr, end, PGDIR_SIZE, (pte_t *)pgd);
+ 			continue;
+ 		}
+* Unmerged path arch/powerpc/mm/dump_linuxpagetables.c
+* Unmerged path arch/powerpc/mm/pgtable.c
+diff --git a/arch/powerpc/mm/pgtable_64.c b/arch/powerpc/mm/pgtable_64.c
+index 640fb82dc470..7181b231cbea 100644
+--- a/arch/powerpc/mm/pgtable_64.c
++++ b/arch/powerpc/mm/pgtable_64.c
+@@ -311,16 +311,20 @@ EXPORT_SYMBOL(__iounmap_at);
+ /* 4 level page table */
+ struct page *pgd_page(pgd_t pgd)
+ {
+-	if (pgd_huge(pgd))
++	if (pgd_is_leaf(pgd)) {
++		VM_WARN_ON(!pgd_huge(pgd));
+ 		return pte_page(pgd_pte(pgd));
++	}
+ 	return virt_to_page(pgd_page_vaddr(pgd));
+ }
+ #endif
+ 
+ struct page *pud_page(pud_t pud)
+ {
+-	if (pud_huge(pud))
++	if (pud_is_leaf(pud)) {
++		VM_WARN_ON(!pud_huge(pud));
+ 		return pte_page(pud_pte(pud));
++	}
+ 	return virt_to_page(pud_page_vaddr(pud));
+ }
+ 
+@@ -330,8 +334,10 @@ struct page *pud_page(pud_t pud)
+  */
+ struct page *pmd_page(pmd_t pmd)
+ {
+-	if (pmd_large(pmd) || pmd_huge(pmd) || pmd_devmap(pmd))
++	if (pmd_is_leaf(pmd)) {
++		VM_WARN_ON(!(pmd_large(pmd) || pmd_huge(pmd) || pmd_devmap(pmd)));
+ 		return pte_page(pmd_pte(pmd));
++	}
+ 	return virt_to_page(pmd_page_vaddr(pmd));
+ }
+ 
+diff --git a/arch/powerpc/xmon/xmon.c b/arch/powerpc/xmon/xmon.c
+index 9aed919c051b..1a66899aa0a0 100644
+--- a/arch/powerpc/xmon/xmon.c
++++ b/arch/powerpc/xmon/xmon.c
+@@ -3064,7 +3064,7 @@ static void show_pte(unsigned long addr)
+ 
+ 	printf("pgd  @ 0x%px\n", pgdir);
+ 
+-	if (pgd_huge(*pgdp)) {
++	if (pgd_is_leaf(*pgdp)) {
+ 		format_pte(pgdp, pgd_val(*pgdp));
+ 		return;
+ 	}
+@@ -3077,7 +3077,7 @@ static void show_pte(unsigned long addr)
+ 		return;
+ 	}
+ 
+-	if (pud_huge(*pudp)) {
++	if (pud_is_leaf(*pudp)) {
+ 		format_pte(pudp, pud_val(*pudp));
+ 		return;
+ 	}
+@@ -3091,7 +3091,7 @@ static void show_pte(unsigned long addr)
+ 		return;
+ 	}
+ 
+-	if (pmd_huge(*pmdp)) {
++	if (pmd_is_leaf(*pmdp)) {
+ 		format_pte(pmdp, pmd_val(*pmdp));
+ 		return;
+ 	}
