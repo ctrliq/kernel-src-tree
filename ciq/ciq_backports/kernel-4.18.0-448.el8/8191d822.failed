@@ -1,0 +1,106 @@
+xfs: avoid unnecessary waits in xfs_log_force_lsn()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 8191d8222c514c69a8e1ac46bd9812b9e0aab7d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/8191d822.failed
+
+Before waiting on a iclog in xfs_log_force_lsn(), we don't check to
+see if the iclog has already been completed and the contents on
+stable storage. We check for completed iclogs in xfs_log_force(), so
+we should do the same thing for xfs_log_force_lsn().
+
+This fixed some random up-to-30s pauses seen in unmounting
+filesystems in some tests. A log force ends up waiting on completed
+iclog, and that doesn't then get flushed (and hence the log force
+get completed) until the background log worker issues a log force
+that flushes the iclog in question. Then the unmount unblocks and
+continues.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 8191d8222c514c69a8e1ac46bd9812b9e0aab7d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_log.c
+diff --cc fs/xfs/xfs_log.c
+index 06474c360c0a,1c328efdca66..000000000000
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@@ -3233,20 -3233,13 +3261,27 @@@ xfs_log_force
+  		iclog = iclog->ic_prev;
+  	} else if (iclog->ic_state == XLOG_STATE_ACTIVE) {
+  		if (atomic_read(&iclog->ic_refcnt) == 0) {
+++<<<<<<< HEAD
+ +			/*
+ +			 * We are the only one with access to this iclog.
+ +			 *
+ +			 * Flush it out now.  There should be a roundoff of zero
+ +			 * to show that someone has already taken care of the
+ +			 * roundoff from the previous sync.
+ +			 */
+ +			atomic_inc(&iclog->ic_refcnt);
+ +			lsn = be64_to_cpu(iclog->ic_header.h_lsn);
+ +			xlog_state_switch_iclogs(log, iclog, 0);
+ +			if (xlog_state_release_iclog(log, iclog))
+++=======
++ 			/* We have exclusive access to this iclog. */
++ 			bool	completed;
++ 
++ 			if (xlog_force_and_check_iclog(iclog, &completed))
+++>>>>>>> 8191d8222c51 (xfs: avoid unnecessary waits in xfs_log_force_lsn())
+  				goto out_error;
+  
+- 			if (be64_to_cpu(iclog->ic_header.h_lsn) != lsn)
++ 			if (completed)
+  				goto out_unlock;
+  		} else {
+  			/*
+@@@ -3321,12 -3317,31 +3357,40 @@@ xlog_force_lsn
+  					&log->l_icloglock);
+  			return -EAGAIN;
+  		}
+++<<<<<<< HEAD
+ +		atomic_inc(&iclog->ic_refcnt);
+ +		xlog_state_switch_iclogs(log, iclog, 0);
+ +		if (xlog_state_release_iclog(log, iclog))
+ +			goto out_error;
+ +		if (log_flushed)
+ +			*log_flushed = 1;
+++=======
++ 		if (xlog_force_and_check_iclog(iclog, &completed))
++ 			goto out_error;
++ 		if (log_flushed)
++ 			*log_flushed = 1;
++ 		if (completed)
++ 			goto out_unlock;
++ 		break;
++ 	case XLOG_STATE_WANT_SYNC:
++ 		/*
++ 		 * This iclog may contain the checkpoint pushed by the
++ 		 * xlog_cil_force_seq() call, but there are other writers still
++ 		 * accessing it so it hasn't been pushed to disk yet. Like the
++ 		 * ACTIVE case above, we need to make sure caches are flushed
++ 		 * when this iclog is written.
++ 		 */
++ 		iclog->ic_flags |= XLOG_ICL_NEED_FLUSH | XLOG_ICL_NEED_FUA;
++ 		break;
++ 	default:
++ 		/*
++ 		 * The entire checkpoint was written by the CIL force and is on
++ 		 * its way to disk already. It will be stable when it
++ 		 * completes, so we don't need to manipulate caches here at all.
++ 		 * We just need to wait for completion if necessary.
++ 		 */
++ 		break;
+++>>>>>>> 8191d8222c51 (xfs: avoid unnecessary waits in xfs_log_force_lsn())
+  	}
+  
+  	if (flags & XFS_LOG_SYNC)
+* Unmerged path fs/xfs/xfs_log.c
