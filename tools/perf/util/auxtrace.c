@@ -2531,7 +2531,7 @@ static int parse_addr_filter(struct evsel *evsel, const char *filter,
 			goto out_exit;
 		}
 
-		if (perf_evsel__append_addr_filter(evsel, new_filter)) {
+		if (evsel__append_addr_filter(evsel, new_filter)) {
 			err = -ENOMEM;
 			goto out_exit;
 		}
@@ -2549,7 +2549,7 @@ out_exit:
 	return err;
 }
 
-static int perf_evsel__nr_addr_filter(struct evsel *evsel)
+static int evsel__nr_addr_filter(struct evsel *evsel)
 {
 	struct perf_pmu *pmu = evsel__find_pmu(evsel);
 	int nr_addr_filters = 0;
@@ -2570,7 +2570,7 @@ int auxtrace_parse_filters(struct evlist *evlist)
 
 	evlist__for_each_entry(evlist, evsel) {
 		filter = evsel->filter;
-		max_nr = perf_evsel__nr_addr_filter(evsel);
+		max_nr = evsel__nr_addr_filter(evsel);
 		if (!filter || !max_nr)
 			continue;
 		evsel->filter = NULL;
