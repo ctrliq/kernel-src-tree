@@ -1,0 +1,203 @@
+drm/amdgpu: avoid using invalidate semaphore for picasso
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author changzhu <Changfeng.Zhu@amd.com>
+commit 418899d6157516fb0b7acad5e37653e60b285852
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/418899d6.failed
+
+It may cause timeout waiting for sem acquire in VM flush when using
+invalidate semaphore for picasso. So it needs to avoid using invalidate
+semaphore for piasso.
+
+	Signed-off-by: changzhu <Changfeng.Zhu@amd.com>
+	Reviewed-by: Huang Rui <ray.huang@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 418899d6157516fb0b7acad5e37653e60b285852)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+diff --cc drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+index c0446af00cdd,a208b2883c03..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
+@@@ -391,44 -432,93 +391,105 @@@ static uint32_t gmc_v9_0_get_invalidate
+   *
+   * Flush the TLB for the requested page table using certain type.
+   */
+ -static void gmc_v9_0_flush_gpu_tlb(struct amdgpu_device *adev, uint32_t vmid,
+ -					uint32_t vmhub, uint32_t flush_type)
+ +static void gmc_v9_0_flush_gpu_tlb(struct amdgpu_device *adev,
+ +				uint32_t vmid, uint32_t flush_type)
+  {
+  	const unsigned eng = 17;
+ -	u32 j, tmp;
+ -	struct amdgpu_vmhub *hub;
+ -
+ -	BUG_ON(vmhub >= adev->num_vmhubs);
+ +	unsigned i, j;
+  
+ -	hub = &adev->vmhub[vmhub];
+ -	tmp = gmc_v9_0_get_invalidate_req(vmid, flush_type);
+ +	for (i = 0; i < AMDGPU_MAX_VMHUBS; ++i) {
+ +		struct amdgpu_vmhub *hub = &adev->vmhub[i];
+ +		u32 tmp = gmc_v9_0_get_invalidate_req(vmid, flush_type);
+  
+ -	/* This is necessary for a HW workaround under SRIOV as well
+ -	 * as GFXOFF under bare metal
+ -	 */
+ -	if (adev->gfx.kiq.ring.sched.ready &&
+ -			(amdgpu_sriov_runtime(adev) || !amdgpu_sriov_vf(adev)) &&
+ -			!adev->in_gpu_reset) {
+ -		uint32_t req = hub->vm_inv_eng0_req + eng;
+ -		uint32_t ack = hub->vm_inv_eng0_ack + eng;
+ +		/* This is necessary for a HW workaround under SRIOV as well
+ +		 * as GFXOFF under bare metal
+ +		 */
+ +		if (adev->gfx.kiq.ring.sched.ready &&
+ +		    (amdgpu_sriov_runtime(adev) || !amdgpu_sriov_vf(adev)) &&
+ +		    !adev->in_gpu_reset) {
+ +			uint32_t req = hub->vm_inv_eng0_req + eng;
+ +			uint32_t ack = hub->vm_inv_eng0_ack + eng;
+ +
+ +			amdgpu_virt_kiq_reg_write_reg_wait(adev, req, ack, tmp,
+ +							   1 << vmid);
+ +			continue;
+ +		}
+  
+++<<<<<<< HEAD
+ +		spin_lock(&adev->gmc.invalidate_lock);
+ +		WREG32_NO_KIQ(hub->vm_inv_eng0_req + eng, tmp);
+++=======
++ 		amdgpu_virt_kiq_reg_write_reg_wait(adev, req, ack, tmp,
++ 				1 << vmid);
++ 		return;
++ 	}
++ 
++ 	spin_lock(&adev->gmc.invalidate_lock);
++ 
++ 	/*
++ 	 * It may lose gpuvm invalidate acknowldege state across power-gating
++ 	 * off cycle, add semaphore acquire before invalidation and semaphore
++ 	 * release after invalidation to avoid entering power gated state
++ 	 * to WA the Issue
++ 	 */
++ 
++ 	/* TODO: It needs to continue working on debugging with semaphore for GFXHUB as well. */
++ 	if ((vmhub == AMDGPU_MMHUB_0 ||
++ 	     vmhub == AMDGPU_MMHUB_1) &&
++ 	    (!(adev->asic_type == CHIP_RAVEN &&
++ 	       adev->rev_id < 0x8 &&
++ 	       adev->pdev->device == 0x15d8))) {
+++>>>>>>> 418899d61575 (drm/amdgpu: avoid using invalidate semaphore for picasso)
+  		for (j = 0; j < adev->usec_timeout; j++) {
+ -			/* a read return value of 1 means semaphore acuqire */
+ -			tmp = RREG32_NO_KIQ(hub->vm_inv_eng0_sem + eng);
+ -			if (tmp & 0x1)
+ +			tmp = RREG32_NO_KIQ(hub->vm_inv_eng0_ack + eng);
+ +			if (tmp & (1 << vmid))
+  				break;
+  			udelay(1);
+  		}
+ +		spin_unlock(&adev->gmc.invalidate_lock);
+ +		if (j < adev->usec_timeout)
+ +			continue;
+  
+ -		if (j >= adev->usec_timeout)
+ -			DRM_ERROR("Timeout waiting for sem acquire in VM flush!\n");
+ +		DRM_ERROR("Timeout waiting for VM flush ACK!\n");
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	WREG32_NO_KIQ(hub->vm_inv_eng0_req + eng, tmp);
++ 
++ 	/*
++ 	 * Issue a dummy read to wait for the ACK register to be cleared
++ 	 * to avoid a false ACK due to the new fast GRBM interface.
++ 	 */
++ 	if (vmhub == AMDGPU_GFXHUB_0)
++ 		RREG32_NO_KIQ(hub->vm_inv_eng0_req + eng);
++ 
++ 	for (j = 0; j < adev->usec_timeout; j++) {
++ 		tmp = RREG32_NO_KIQ(hub->vm_inv_eng0_ack + eng);
++ 		if (tmp & (1 << vmid))
++ 			break;
++ 		udelay(1);
++ 	}
++ 
++ 	/* TODO: It needs to continue working on debugging with semaphore for GFXHUB as well. */
++ 	if ((vmhub == AMDGPU_MMHUB_0 ||
++ 	     vmhub == AMDGPU_MMHUB_1) &&
++ 	    (!(adev->asic_type == CHIP_RAVEN &&
++ 	       adev->rev_id < 0x8 &&
++ 	       adev->pdev->device == 0x15d8)))
++ 		/*
++ 		 * add semaphore release after invalidation,
++ 		 * write with 0 means semaphore release
++ 		 */
++ 		WREG32_NO_KIQ(hub->vm_inv_eng0_sem + eng, 0);
++ 
++ 	spin_unlock(&adev->gmc.invalidate_lock);
++ 
++ 	if (j < adev->usec_timeout)
++ 		return;
++ 
++ 	DRM_ERROR("Timeout waiting for VM flush ACK!\n");
+++>>>>>>> 418899d61575 (drm/amdgpu: avoid using invalidate semaphore for picasso)
+  }
+  
+  static uint64_t gmc_v9_0_emit_flush_gpu_tlb(struct amdgpu_ring *ring,
+@@@ -439,6 -529,23 +500,26 @@@
+  	uint32_t req = gmc_v9_0_get_invalidate_req(vmid, 0);
+  	unsigned eng = ring->vm_inv_eng;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * It may lose gpuvm invalidate acknowldege state across power-gating
++ 	 * off cycle, add semaphore acquire before invalidation and semaphore
++ 	 * release after invalidation to avoid entering power gated state
++ 	 * to WA the Issue
++ 	 */
++ 
++ 	/* TODO: It needs to continue working on debugging with semaphore for GFXHUB as well. */
++ 	if ((ring->funcs->vmhub == AMDGPU_MMHUB_0 ||
++ 	     ring->funcs->vmhub == AMDGPU_MMHUB_1) &&
++ 	    (!(adev->asic_type == CHIP_RAVEN &&
++ 	       adev->rev_id < 0x8 &&
++ 	       adev->pdev->device == 0x15d8)))
++ 		/* a read return value of 1 means semaphore acuqire */
++ 		amdgpu_ring_emit_reg_wait(ring,
++ 					  hub->vm_inv_eng0_sem + eng, 0x1, 0x1);
++ 
+++>>>>>>> 418899d61575 (drm/amdgpu: avoid using invalidate semaphore for picasso)
+  	amdgpu_ring_emit_wreg(ring, hub->ctx0_ptb_addr_lo32 + (2 * vmid),
+  			      lower_32_bits(pd_addr));
+  
+@@@ -449,6 -556,18 +530,21 @@@
+  					    hub->vm_inv_eng0_ack + eng,
+  					    req, 1 << vmid);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* TODO: It needs to continue working on debugging with semaphore for GFXHUB as well. */
++ 	if ((ring->funcs->vmhub == AMDGPU_MMHUB_0 ||
++ 	     ring->funcs->vmhub == AMDGPU_MMHUB_1) &&
++ 	    (!(adev->asic_type == CHIP_RAVEN &&
++ 	       adev->rev_id < 0x8 &&
++ 	       adev->pdev->device == 0x15d8)))
++ 		/*
++ 		 * add semaphore release after invalidation,
++ 		 * write with 0 means semaphore release
++ 		 */
++ 		amdgpu_ring_emit_wreg(ring, hub->vm_inv_eng0_sem + eng, 0);
++ 
+++>>>>>>> 418899d61575 (drm/amdgpu: avoid using invalidate semaphore for picasso)
+  	return pd_addr;
+  }
+  
+* Unmerged path drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c
