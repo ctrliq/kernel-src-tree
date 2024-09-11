@@ -1,0 +1,163 @@
+arm64: KVM: Trap VM ops when ARM64_WORKAROUND_CAVIUM_TX2_219_TVM is set
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [arm64] kvm: Trap VM ops when ARM64_WORKAROUND_CAVIUM_TX2_219_TVM is set (Auger Eric) [1771633]
+Rebuild_FUZZ: 94.81%
+commit-author Marc Zyngier <marc.zyngier@arm.com>
+commit d3ec3a08fa700c8b46abb137dce4e2514a6f9668
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d3ec3a08.failed
+
+In order to workaround the TX2-219 erratum, it is necessary to trap
+TTBRx_EL1 accesses to EL2. This is done by setting HCR_EL2.TVM on
+guest entry, which has the side effect of trapping all the other
+VM-related sysregs as well.
+
+To minimize the overhead, a fast path is used so that we don't
+have to go all the way back to the main sysreg handling code,
+unless the rest of the hypervisor expects to see these accesses.
+
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit d3ec3a08fa700c8b46abb137dce4e2514a6f9668)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/cpucaps.h
+diff --cc arch/arm64/include/asm/cpucaps.h
+index 1a8df16d556c,e81e0cbd728f..000000000000
+--- a/arch/arm64/include/asm/cpucaps.h
++++ b/arch/arm64/include/asm/cpucaps.h
+@@@ -51,11 -40,20 +51,25 @@@
+  #define ARM64_SSBD				30
+  #define ARM64_MISMATCHED_CACHE_TYPE		31
+  #define ARM64_HAS_STAGE2_FWB			32
+ -#define ARM64_HAS_CRC32				33
+ +#define ARM64_WORKAROUND_1188873		33
+  #define ARM64_SSBS				34
+ -#define ARM64_WORKAROUND_1418040		35
+ +#define ARM64_WORKAROUND_1165522		35
+  #define ARM64_HAS_SB				36
+++<<<<<<< HEAD
+ +
+ +#define ARM64_NCAPS				37
+++=======
++ #define ARM64_WORKAROUND_1165522		37
++ #define ARM64_HAS_ADDRESS_AUTH_ARCH		38
++ #define ARM64_HAS_ADDRESS_AUTH_IMP_DEF		39
++ #define ARM64_HAS_GENERIC_AUTH_ARCH		40
++ #define ARM64_HAS_GENERIC_AUTH_IMP_DEF		41
++ #define ARM64_HAS_IRQ_PRIO_MASKING		42
++ #define ARM64_HAS_DCPODP			43
++ #define ARM64_WORKAROUND_1463225		44
++ #define ARM64_WORKAROUND_CAVIUM_TX2_219_TVM	45
++ 
++ #define ARM64_NCAPS				46
+++>>>>>>> d3ec3a08fa70 (arm64: KVM: Trap VM ops when ARM64_WORKAROUND_CAVIUM_TX2_219_TVM is set)
+  
+  #endif /* __ASM_CPUCAPS_H */
+* Unmerged path arch/arm64/include/asm/cpucaps.h
+diff --git a/arch/arm64/kvm/hyp/switch.c b/arch/arm64/kvm/hyp/switch.c
+index 804884c166bf..5b3adca60a8c 100644
+--- a/arch/arm64/kvm/hyp/switch.c
++++ b/arch/arm64/kvm/hyp/switch.c
+@@ -133,6 +133,9 @@ static void __hyp_text __activate_traps(struct kvm_vcpu *vcpu)
+ {
+ 	u64 hcr = vcpu->arch.hcr_el2;
+ 
++	if (cpus_have_const_cap(ARM64_WORKAROUND_CAVIUM_TX2_219_TVM))
++		hcr |= HCR_TVM;
++
+ 	write_sysreg(hcr, hcr_el2);
+ 
+ 	if (cpus_have_const_cap(ARM64_HAS_RAS_EXTN) && (hcr & HCR_VSE))
+@@ -183,8 +186,10 @@ static void __hyp_text __deactivate_traps(struct kvm_vcpu *vcpu)
+ 	 * the crucial bit is "On taking a vSError interrupt,
+ 	 * HCR_EL2.VSE is cleared to 0."
+ 	 */
+-	if (vcpu->arch.hcr_el2 & HCR_VSE)
+-		vcpu->arch.hcr_el2 = read_sysreg(hcr_el2);
++	if (vcpu->arch.hcr_el2 & HCR_VSE) {
++		vcpu->arch.hcr_el2 &= ~HCR_VSE;
++		vcpu->arch.hcr_el2 |= read_sysreg(hcr_el2) & HCR_VSE;
++	}
+ 
+ 	if (has_vhe())
+ 		deactivate_traps_vhe();
+@@ -389,6 +394,61 @@ static bool __hyp_text __hyp_handle_fpsimd(struct kvm_vcpu *vcpu)
+ 	return true;
+ }
+ 
++static bool __hyp_text handle_tx2_tvm(struct kvm_vcpu *vcpu)
++{
++	u32 sysreg = esr_sys64_to_sysreg(kvm_vcpu_get_hsr(vcpu));
++	int rt = kvm_vcpu_sys_get_rt(vcpu);
++	u64 val = vcpu_get_reg(vcpu, rt);
++
++	/*
++	 * The normal sysreg handling code expects to see the traps,
++	 * let's not do anything here.
++	 */
++	if (vcpu->arch.hcr_el2 & HCR_TVM)
++		return false;
++
++	switch (sysreg) {
++	case SYS_SCTLR_EL1:
++		write_sysreg_el1(val, SYS_SCTLR);
++		break;
++	case SYS_TTBR0_EL1:
++		write_sysreg_el1(val, SYS_TTBR0);
++		break;
++	case SYS_TTBR1_EL1:
++		write_sysreg_el1(val, SYS_TTBR1);
++		break;
++	case SYS_TCR_EL1:
++		write_sysreg_el1(val, SYS_TCR);
++		break;
++	case SYS_ESR_EL1:
++		write_sysreg_el1(val, SYS_ESR);
++		break;
++	case SYS_FAR_EL1:
++		write_sysreg_el1(val, SYS_FAR);
++		break;
++	case SYS_AFSR0_EL1:
++		write_sysreg_el1(val, SYS_AFSR0);
++		break;
++	case SYS_AFSR1_EL1:
++		write_sysreg_el1(val, SYS_AFSR1);
++		break;
++	case SYS_MAIR_EL1:
++		write_sysreg_el1(val, SYS_MAIR);
++		break;
++	case SYS_AMAIR_EL1:
++		write_sysreg_el1(val, SYS_AMAIR);
++		break;
++	case SYS_CONTEXTIDR_EL1:
++		write_sysreg_el1(val, SYS_CONTEXTIDR);
++		break;
++	default:
++		return false;
++	}
++
++	__kvm_skip_instr(vcpu);
++	return true;
++}
++
+ /*
+  * Return true when we were able to fixup the guest exit and should return to
+  * the guest, false when we should restore the host state and return to the
+@@ -408,6 +468,11 @@ static bool __hyp_text fixup_guest_exit(struct kvm_vcpu *vcpu, u64 *exit_code)
+ 	if (*exit_code != ARM_EXCEPTION_TRAP)
+ 		goto exit;
+ 
++	if (cpus_have_const_cap(ARM64_WORKAROUND_CAVIUM_TX2_219_TVM) &&
++	    kvm_vcpu_trap_get_class(vcpu) == ESR_ELx_EC_SYS64 &&
++	    handle_tx2_tvm(vcpu))
++		return true;
++
+ 	/*
+ 	 * We trap the first access to the FP/SIMD to save the host context
+ 	 * and restore the guest context lazily.
