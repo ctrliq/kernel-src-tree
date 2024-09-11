@@ -1,0 +1,84 @@
+KVM: nVMX: Selectively use TLB_FLUSH_CURRENT for nested VM-Enter/VM-Exit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit c51e1ffee50121a2b2e00208f517a695493ee85d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c51e1ffe.failed
+
+Flush only the current context, as opposed to all contexts, when
+requesting a TLB flush to handle the scenario where a L1 does not expect
+a TLB flush, but one is required because L1 and L2 shared an ASID.  This
+occurs if EPT is disabled (no per-EPTP tag), VPID is enabled (hardware
+doesn't flush unconditionally) and vmcs02 does not have its own VPID due
+to exhaustion of available VPIDs.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200320212833.3507-27-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c51e1ffee50121a2b2e00208f517a695493ee85d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/nested.c
+diff --cc arch/x86/kvm/vmx/nested.c
+index cd775c31a62d,deddf0f0f6e7..000000000000
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@@ -1133,6 -1132,50 +1133,53 @@@ static bool nested_has_guest_tlb_tag(st
+  	       (nested_cpu_has_vpid(vmcs12) && to_vmx(vcpu)->nested.vpid02);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nested_vmx_transition_tlb_flush(struct kvm_vcpu *vcpu,
++ 					    struct vmcs12 *vmcs12,
++ 					    bool is_vmenter)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	/*
++ 	 * If VPID is disabled, linear and combined mappings are flushed on
++ 	 * VM-Enter/VM-Exit, and guest-physical mappings are valid only for
++ 	 * their associated EPTP.
++ 	 */
++ 	if (!enable_vpid)
++ 		return;
++ 
++ 	/*
++ 	 * If vmcs12 doesn't use VPID, L1 expects linear and combined mappings
++ 	 * for *all* contexts to be flushed on VM-Enter/VM-Exit.
++ 	 *
++ 	 * If VPID is enabled and used by vmc12, but L2 does not have a unique
++ 	 * TLB tag (ASID), i.e. EPT is disabled and KVM was unable to allocate
++ 	 * a VPID for L2, flush the current context as the effective ASID is
++ 	 * common to both L1 and L2.
++ 	 *
++ 	 * Defer the flush so that it runs after vmcs02.EPTP has been set by
++ 	 * KVM_REQ_LOAD_MMU_PGD (if nested EPT is enabled) and to avoid
++ 	 * redundant flushes further down the nested pipeline.
++ 	 *
++ 	 * If a TLB flush isn't required due to any of the above, and vpid12 is
++ 	 * changing then the new "virtual" VPID (vpid12) will reuse the same
++ 	 * "real" VPID (vpid02), and so needs to be sync'd.  There is no direct
++ 	 * mapping between vpid02 and vpid12, vpid02 is per-vCPU and reused for
++ 	 * all nested vCPUs.
++ 	 */
++ 	if (!nested_cpu_has_vpid(vmcs12)) {
++ 		kvm_make_request(KVM_REQ_TLB_FLUSH, vcpu);
++ 	} else if (!nested_has_guest_tlb_tag(vcpu)) {
++ 		kvm_make_request(KVM_REQ_TLB_FLUSH_CURRENT, vcpu);
++ 	} else if (is_vmenter &&
++ 		   vmcs12->virtual_processor_id != vmx->nested.last_vpid) {
++ 		vmx->nested.last_vpid = vmcs12->virtual_processor_id;
++ 		vpid_sync_context(nested_get_vpid02(vcpu));
++ 	}
++ }
++ 
+++>>>>>>> c51e1ffee501 (KVM: nVMX: Selectively use TLB_FLUSH_CURRENT for nested VM-Enter/VM-Exit)
+  static bool is_bitwise_subset(u64 superset, u64 subset, u64 mask)
+  {
+  	superset &= mask;
+* Unmerged path arch/x86/kvm/vmx/nested.c
