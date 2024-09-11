@@ -1519,8 +1519,8 @@ qla2x00_async_tm_cmd(fc_port_t *fcport, uint32_t flags, uint32_t lun,
 		lun = (uint16_t)tm_iocb->u.tmf.lun;
 
 		/* Issue Marker IOCB */
-		qla2x00_marker(vha, vha->hw->req_q_map[0],
-		    vha->hw->rsp_q_map[0], sp->fcport->loop_id, lun,
+		qla2x00_marker(vha, vha->hw->base_qpair,
+		    sp->fcport->loop_id, lun,
 		    flags == TCF_LUN_RESET ? MK_SYNC_ID_LUN : MK_SYNC_ID);
 	}
 
@@ -5786,11 +5786,6 @@ qla2x00_loop_resync(scsi_qla_host_t *vha)
 {
 	int rval = QLA_SUCCESS;
 	uint32_t wait_time;
-	struct req_que *req;
-	struct rsp_que *rsp;
-
-	req = vha->req;
-	rsp = req->rsp;
 
 	clear_bit(ISP_ABORT_RETRY, &vha->dpc_flags);
 	if (vha->flags.online) {
@@ -5803,8 +5798,8 @@ qla2x00_loop_resync(scsi_qla_host_t *vha)
 					 * Issue a marker after FW becomes
 					 * ready.
 					 */
-					qla2x00_marker(vha, req, rsp, 0, 0,
-						MK_SYNC_ALL);
+					qla2x00_marker(vha, vha->hw->base_qpair,
+					    0, 0, MK_SYNC_ALL);
 					vha->marker_needed = 0;
 				}
 
@@ -6528,8 +6523,6 @@ qla2x00_restart_isp(scsi_qla_host_t *vha)
 {
 	int status = 0;
 	struct qla_hw_data *ha = vha->hw;
-	struct req_que *req = ha->req_q_map[0];
-	struct rsp_que *rsp = ha->rsp_q_map[0];
 
 	/* If firmware needs to be loaded */
 	if (qla2x00_isp_firmware(vha)) {
@@ -6549,7 +6542,7 @@ qla2x00_restart_isp(scsi_qla_host_t *vha)
 		status = qla2x00_fw_ready(vha);
 		if (!status) {
 			/* Issue a marker after FW becomes ready. */
-			qla2x00_marker(vha, req, rsp, 0, 0, MK_SYNC_ALL);
+			qla2x00_marker(vha, ha->base_qpair, 0, 0, MK_SYNC_ALL);
 			set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
 		}
 
@@ -7601,22 +7594,15 @@ qla24xx_configure_vhba(scsi_qla_host_t *vha)
 	uint16_t mb[MAILBOX_REGISTER_COUNT];
 	struct qla_hw_data *ha = vha->hw;
 	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
-	struct req_que *req;
-	struct rsp_que *rsp;
 
 	if (!vha->vp_idx)
 		return -EINVAL;
 
 	rval = qla2x00_fw_ready(base_vha);
-	if (vha->qpair)
-		req = vha->qpair->req;
-	else
-		req = ha->req_q_map[0];
-	rsp = req->rsp;
 
 	if (rval == QLA_SUCCESS) {
 		clear_bit(RESET_MARKER_NEEDED, &vha->dpc_flags);
-		qla2x00_marker(vha, req, rsp, 0, 0, MK_SYNC_ALL);
+		qla2x00_marker(vha, ha->base_qpair, 0, 0, MK_SYNC_ALL);
 	}
 
 	vha->flags.management_server_logged_in = 0;
@@ -8006,8 +7992,6 @@ qla82xx_restart_isp(scsi_qla_host_t *vha)
 {
 	int status, rval;
 	struct qla_hw_data *ha = vha->hw;
-	struct req_que *req = ha->req_q_map[0];
-	struct rsp_que *rsp = ha->rsp_q_map[0];
 	struct scsi_qla_host *vp;
 	unsigned long flags;
 
@@ -8019,7 +8003,7 @@ qla82xx_restart_isp(scsi_qla_host_t *vha)
 		status = qla2x00_fw_ready(vha);
 		if (!status) {
 			/* Issue a marker after FW becomes ready. */
-			qla2x00_marker(vha, req, rsp, 0, 0, MK_SYNC_ALL);
+			qla2x00_marker(vha, ha->base_qpair, 0, 0, MK_SYNC_ALL);
 			vha->flags.online = 1;
 			set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
 		}
