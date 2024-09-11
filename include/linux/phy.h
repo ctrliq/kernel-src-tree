@@ -617,8 +617,11 @@ struct phy_device {
 			void (*phy_link_change)(struct phy_device *phydev, bool up))
 	void (*adjust_link)(struct net_device *dev);
 };
-#define to_phy_device(d) container_of(to_mdio_device(d), \
-				      struct phy_device, mdio)
+
+static inline struct phy_device *to_phy_device(const struct device *dev)
+{
+	return container_of(to_mdio_device(dev), struct phy_device, mdio);
+}
 
 /* A structure containing possible configuration parameters
  * for a TDR cable test. The driver does not need to implement
