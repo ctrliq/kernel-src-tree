@@ -1,0 +1,217 @@
+KVM: arm64: Disintegrate SPSR array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit fd85b66789aaa594a158f0a8aa4482c3ed0fed3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fd85b667.failed
+
+As we're about to move SPSR_EL1 into the VNCR page, we need to
+disassociate it from the rest of the 32bit cruft. Let's break
+the array into individual fields.
+
+	Reviewed-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit fd85b66789aaa594a158f0a8aa4482c3ed0fed3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_emulate.h
+#	arch/arm64/include/asm/kvm_host.h
+#	arch/arm64/kvm/guest.c
+#	arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
+#	arch/arm64/kvm/regmap.c
+diff --cc arch/arm64/include/asm/kvm_emulate.h
+index f395ff663f8a,5f959fedff09..000000000000
+--- a/arch/arm64/include/asm/kvm_emulate.h
++++ b/arch/arm64/include/asm/kvm_emulate.h
+@@@ -208,7 -176,7 +208,11 @@@ static inline unsigned long vcpu_read_s
+  	if (vcpu->arch.sysregs_loaded_on_cpu)
+  		return read_sysreg_el1(SYS_SPSR);
+  	else
+++<<<<<<< HEAD
+ +		return vcpu_gp_regs(vcpu)->spsr[KVM_SPSR_EL1];
+++=======
++ 		return vcpu->arch.ctxt.spsr_el1;
+++>>>>>>> fd85b66789aa (KVM: arm64: Disintegrate SPSR array)
+  }
+  
+  static inline void vcpu_write_spsr(struct kvm_vcpu *vcpu, unsigned long v)
+@@@ -221,7 -189,7 +225,11 @@@
+  	if (vcpu->arch.sysregs_loaded_on_cpu)
+  		write_sysreg_el1(v, SYS_SPSR);
+  	else
+++<<<<<<< HEAD
+ +		vcpu_gp_regs(vcpu)->spsr[KVM_SPSR_EL1] = v;
+++=======
++ 		vcpu->arch.ctxt.spsr_el1 = v;
+++>>>>>>> fd85b66789aa (KVM: arm64: Disintegrate SPSR array)
+  }
+  
+  /*
+diff --cc arch/arm64/include/asm/kvm_host.h
+index d8c4d368d7b0,dfb97ed2f680..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -232,7 -239,16 +232,20 @@@ enum vcpu_sysreg 
+  #define NR_COPRO_REGS	(NR_SYS_REGS * 2)
+  
+  struct kvm_cpu_context {
+++<<<<<<< HEAD
+ +	struct kvm_regs	gp_regs;
+++=======
++ 	struct user_pt_regs regs;	/* sp = sp_el0 */
++ 
++ 	u64	spsr_el1;		/* aka spsr_svc */
++ 	u64	spsr_abt;
++ 	u64	spsr_und;
++ 	u64	spsr_irq;
++ 	u64	spsr_fiq;
++ 
++ 	struct user_fpsimd_state fp_regs;
++ 
+++>>>>>>> fd85b66789aa (KVM: arm64: Disintegrate SPSR array)
+  	union {
+  		u64 sys_regs[NR_SYS_REGS];
+  		u32 copro[NR_COPRO_REGS];
+diff --cc arch/arm64/kvm/guest.c
+index a0778b6214ad,70215f3a6f89..000000000000
+--- a/arch/arm64/kvm/guest.c
++++ b/arch/arm64/kvm/guest.c
+@@@ -117,12 -107,63 +117,67 @@@ static int validate_core_offset(const s
+  	int size = core_reg_size_from_offset(vcpu, off);
+  
+  	if (size < 0)
+ -		return NULL;
+ +		return -EINVAL;
+  
+  	if (KVM_REG_SIZE(reg->id) != size)
+ -		return NULL;
+ +		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	switch (off) {
++ 	case KVM_REG_ARM_CORE_REG(regs.regs[0]) ...
++ 	     KVM_REG_ARM_CORE_REG(regs.regs[30]):
++ 		off -= KVM_REG_ARM_CORE_REG(regs.regs[0]);
++ 		off /= 2;
++ 		return &vcpu->arch.ctxt.regs.regs[off];
++ 
++ 	case KVM_REG_ARM_CORE_REG(regs.sp):
++ 		return &vcpu->arch.ctxt.regs.sp;
++ 
++ 	case KVM_REG_ARM_CORE_REG(regs.pc):
++ 		return &vcpu->arch.ctxt.regs.pc;
++ 
++ 	case KVM_REG_ARM_CORE_REG(regs.pstate):
++ 		return &vcpu->arch.ctxt.regs.pstate;
++ 
++ 	case KVM_REG_ARM_CORE_REG(sp_el1):
++ 		return __ctxt_sys_reg(&vcpu->arch.ctxt, SP_EL1);
++ 
++ 	case KVM_REG_ARM_CORE_REG(elr_el1):
++ 		return __ctxt_sys_reg(&vcpu->arch.ctxt, ELR_EL1);
++ 
++ 	case KVM_REG_ARM_CORE_REG(spsr[KVM_SPSR_EL1]):
++ 		return &vcpu->arch.ctxt.spsr_el1;
++ 
++ 	case KVM_REG_ARM_CORE_REG(spsr[KVM_SPSR_ABT]):
++ 		return &vcpu->arch.ctxt.spsr_abt;
++ 
++ 	case KVM_REG_ARM_CORE_REG(spsr[KVM_SPSR_UND]):
++ 		return &vcpu->arch.ctxt.spsr_und;
++ 
++ 	case KVM_REG_ARM_CORE_REG(spsr[KVM_SPSR_IRQ]):
++ 		return &vcpu->arch.ctxt.spsr_irq;
++ 
++ 	case KVM_REG_ARM_CORE_REG(spsr[KVM_SPSR_FIQ]):
++ 		return &vcpu->arch.ctxt.spsr_fiq;
++ 
++ 	case KVM_REG_ARM_CORE_REG(fp_regs.vregs[0]) ...
++ 	     KVM_REG_ARM_CORE_REG(fp_regs.vregs[31]):
++ 		off -= KVM_REG_ARM_CORE_REG(fp_regs.vregs[0]);
++ 		off /= 4;
++ 		return &vcpu->arch.ctxt.fp_regs.vregs[off];
++ 
++ 	case KVM_REG_ARM_CORE_REG(fp_regs.fpsr):
++ 		return &vcpu->arch.ctxt.fp_regs.fpsr;
++ 
++ 	case KVM_REG_ARM_CORE_REG(fp_regs.fpcr):
++ 		return &vcpu->arch.ctxt.fp_regs.fpcr;
++ 
++ 	default:
++ 		return NULL;
++ 	}
+++>>>>>>> fd85b66789aa (KVM: arm64: Disintegrate SPSR array)
+  }
+  
+  static int get_core_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg)
+diff --cc arch/arm64/kvm/regmap.c
+index 06fdf054b3d3,97c110810527..000000000000
+--- a/arch/arm64/kvm/regmap.c
++++ b/arch/arm64/kvm/regmap.c
+@@@ -158,8 -147,20 +158,25 @@@ unsigned long vcpu_read_spsr32(const st
+  {
+  	int spsr_idx = vcpu_spsr32_mode(vcpu);
+  
+++<<<<<<< HEAD
+ +	if (!vcpu->arch.sysregs_loaded_on_cpu)
+ +		return vcpu_gp_regs(vcpu)->spsr[spsr_idx];
+++=======
++ 	if (!vcpu->arch.sysregs_loaded_on_cpu) {
++ 		switch (spsr_idx) {
++ 		case KVM_SPSR_SVC:
++ 			return vcpu->arch.ctxt.spsr_el1;
++ 		case KVM_SPSR_ABT:
++ 			return vcpu->arch.ctxt.spsr_abt;
++ 		case KVM_SPSR_UND:
++ 			return vcpu->arch.ctxt.spsr_und;
++ 		case KVM_SPSR_IRQ:
++ 			return vcpu->arch.ctxt.spsr_irq;
++ 		case KVM_SPSR_FIQ:
++ 			return vcpu->arch.ctxt.spsr_fiq;
++ 		}
++ 	}
+++>>>>>>> fd85b66789aa (KVM: arm64: Disintegrate SPSR array)
+  
+  	switch (spsr_idx) {
+  	case KVM_SPSR_SVC:
+@@@ -182,7 -183,24 +199,28 @@@ void vcpu_write_spsr32(struct kvm_vcpu 
+  	int spsr_idx = vcpu_spsr32_mode(vcpu);
+  
+  	if (!vcpu->arch.sysregs_loaded_on_cpu) {
+++<<<<<<< HEAD
+ +		vcpu_gp_regs(vcpu)->spsr[spsr_idx] = v;
+++=======
++ 		switch (spsr_idx) {
++ 		case KVM_SPSR_SVC:
++ 			vcpu->arch.ctxt.spsr_el1 = v;
++ 			break;
++ 		case KVM_SPSR_ABT:
++ 			vcpu->arch.ctxt.spsr_abt = v;
++ 			break;
++ 		case KVM_SPSR_UND:
++ 			vcpu->arch.ctxt.spsr_und = v;
++ 			break;
++ 		case KVM_SPSR_IRQ:
++ 			vcpu->arch.ctxt.spsr_irq = v;
++ 			break;
++ 		case KVM_SPSR_FIQ:
++ 			vcpu->arch.ctxt.spsr_fiq = v;
++ 			break;
++ 		}
++ 
+++>>>>>>> fd85b66789aa (KVM: arm64: Disintegrate SPSR array)
+  		return;
+  	}
+  
+* Unmerged path arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
+* Unmerged path arch/arm64/include/asm/kvm_emulate.h
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+* Unmerged path arch/arm64/kvm/guest.c
+* Unmerged path arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
+* Unmerged path arch/arm64/kvm/regmap.c
