@@ -1,0 +1,483 @@
+all: replace find_next{,_zero}_bit with find_first{,_zero}_bit where appropriate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Yury Norov <yury.norov@gmail.com>
+commit b5c7e7ec7d3418af2544452b45cc67297c857a86
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/b5c7e7ec.failed
+
+find_first{,_zero}_bit is a more effective analogue of 'next' version if
+start == 0. This patch replaces 'next' with 'first' where things look
+trivial.
+
+	Signed-off-by: Yury Norov <yury.norov@gmail.com>
+	Tested-by: Wolfram Sang <wsa+renesas@sang-engineering.com>
+(cherry picked from commit b5c7e7ec7d3418af2544452b45cc67297c857a86)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/rnbd/rnbd-clt.c
+#	drivers/iio/adc/ad7124.c
+#	drivers/pci/controller/dwc/pci-dra7xx.c
+#	drivers/soc/ti/k3-ringacc.c
+#	drivers/virt/acrn/ioreq.c
+diff --cc drivers/pci/controller/dwc/pci-dra7xx.c
+index 91bb484f4ca0,279a6fa56584..000000000000
+--- a/drivers/pci/controller/dwc/pci-dra7xx.c
++++ b/drivers/pci/controller/dwc/pci-dra7xx.c
+@@@ -227,38 -202,72 +227,52 @@@ static const struct irq_domain_ops intx
+  	.xlate = pci_irqd_intx_xlate,
+  };
+  
+ -static int dra7xx_pcie_handle_msi(struct pcie_port *pp, int index)
+ +static int dra7xx_pcie_init_irq_domain(struct pcie_port *pp)
+  {
+  	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+ -	unsigned long val;
+ -	int pos;
+ +	struct device *dev = pci->dev;
+ +	struct dra7xx_pcie *dra7xx = to_dra7xx_pcie(pci);
+ +	struct device_node *node = dev->of_node;
+ +	struct device_node *pcie_intc_node =  of_get_next_child(node, NULL);
+  
+++<<<<<<< HEAD
+ +	if (!pcie_intc_node) {
+ +		dev_err(dev, "No PCIe Intc node found\n");
+ +		return -ENODEV;
+++=======
++ 	val = dw_pcie_readl_dbi(pci, PCIE_MSI_INTR0_STATUS +
++ 				   (index * MSI_REG_CTRL_BLOCK_SIZE));
++ 	if (!val)
++ 		return 0;
++ 
++ 	pos = find_first_bit(&val, MAX_MSI_IRQS_PER_CTRL);
++ 	while (pos != MAX_MSI_IRQS_PER_CTRL) {
++ 		generic_handle_domain_irq(pp->irq_domain,
++ 					  (index * MAX_MSI_IRQS_PER_CTRL) + pos);
++ 		pos++;
++ 		pos = find_next_bit(&val, MAX_MSI_IRQS_PER_CTRL, pos);
+++>>>>>>> b5c7e7ec7d34 (all: replace find_next{,_zero}_bit with find_first{,_zero}_bit where appropriate)
+  	}
+  
+ -	return 1;
+ -}
+ +	dra7xx->irq_domain = irq_domain_add_linear(pcie_intc_node, PCI_NUM_INTX,
+ +						   &intx_domain_ops, pp);
+ +	if (!dra7xx->irq_domain) {
+ +		dev_err(dev, "Failed to get a INTx IRQ domain\n");
+ +		return -ENODEV;
+ +	}
+  
+ -static void dra7xx_pcie_handle_msi_irq(struct pcie_port *pp)
+ -{
+ -	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+ -	int ret, i, count, num_ctrls;
+ -
+ -	num_ctrls = pp->num_vectors / MAX_MSI_IRQS_PER_CTRL;
+ -
+ -	/**
+ -	 * Need to make sure all MSI status bits read 0 before exiting.
+ -	 * Else, new MSI IRQs are not registered by the wrapper. Have an
+ -	 * upperbound for the loop and exit the IRQ in case of IRQ flood
+ -	 * to avoid locking up system in interrupt context.
+ -	 */
+ -	count = 0;
+ -	do {
+ -		ret = 0;
+ -
+ -		for (i = 0; i < num_ctrls; i++)
+ -			ret |= dra7xx_pcie_handle_msi(pp, i);
+ -		count++;
+ -	} while (ret && count <= 1000);
+ -
+ -	if (count > 1000)
+ -		dev_warn_ratelimited(pci->dev,
+ -				     "Too many MSI IRQs to handle\n");
+ +	return 0;
+  }
+  
+ -static void dra7xx_pcie_msi_irq_handler(struct irq_desc *desc)
+ +static irqreturn_t dra7xx_pcie_msi_irq_handler(int irq, void *arg)
+  {
+ -	struct irq_chip *chip = irq_desc_get_chip(desc);
+ -	struct dra7xx_pcie *dra7xx;
+ -	struct dw_pcie *pci;
+ -	struct pcie_port *pp;
+ +	struct dra7xx_pcie *dra7xx = arg;
+ +	struct dw_pcie *pci = dra7xx->pci;
+ +	struct pcie_port *pp = &pci->pp;
+  	unsigned long reg;
+ -	u32 bit;
+ -
+ -	chained_irq_enter(chip, desc);
+ -
+ -	pp = irq_desc_get_handler_data(desc);
+ -	pci = to_dw_pcie_from_pp(pp);
+ -	dra7xx = to_dra7xx_pcie(pci);
+ +	u32 virq, bit;
+  
+  	reg = dra7xx_pcie_readl(dra7xx, PCIECTRL_DRA7XX_CONF_IRQSTATUS_MSI);
+ -	dra7xx_pcie_writel(dra7xx, PCIECTRL_DRA7XX_CONF_IRQSTATUS_MSI, reg);
+  
+  	switch (reg) {
+  	case MSI:
+* Unmerged path drivers/block/rnbd/rnbd-clt.c
+* Unmerged path drivers/iio/adc/ad7124.c
+* Unmerged path drivers/soc/ti/k3-ringacc.c
+* Unmerged path drivers/virt/acrn/ioreq.c
+diff --git a/arch/powerpc/platforms/pasemi/dma_lib.c b/arch/powerpc/platforms/pasemi/dma_lib.c
+index 6e0a7ea3011e..38899f33f52f 100644
+--- a/arch/powerpc/platforms/pasemi/dma_lib.c
++++ b/arch/powerpc/platforms/pasemi/dma_lib.c
+@@ -389,7 +389,7 @@ int pasemi_dma_alloc_flag(void)
+ 	int bit;
+ 
+ retry:
+-	bit = find_next_bit(flags_free, MAX_FLAGS, 0);
++	bit = find_first_bit(flags_free, MAX_FLAGS);
+ 	if (bit >= MAX_FLAGS)
+ 		return -ENOSPC;
+ 	if (!test_and_clear_bit(bit, flags_free))
+@@ -454,7 +454,7 @@ int pasemi_dma_alloc_fun(void)
+ 	int bit;
+ 
+ retry:
+-	bit = find_next_bit(fun_free, MAX_FLAGS, 0);
++	bit = find_first_bit(fun_free, MAX_FLAGS);
+ 	if (bit >= MAX_FLAGS)
+ 		return -ENOSPC;
+ 	if (!test_and_clear_bit(bit, fun_free))
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index 6321aab19dd3..62c648e95bb4 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -2024,7 +2024,7 @@ static unsigned long kvm_s390_next_dirty_cmma(struct kvm_memslots *slots,
+ 	while ((slotidx > 0) && (ofs >= ms->npages)) {
+ 		slotidx--;
+ 		ms = slots->memslots + slotidx;
+-		ofs = find_next_bit(kvm_second_dirty_bitmap(ms), ms->npages, 0);
++		ofs = find_first_bit(kvm_second_dirty_bitmap(ms), ms->npages);
+ 	}
+ 	return ms->base_gfn + ofs;
+ }
+* Unmerged path drivers/block/rnbd/rnbd-clt.c
+diff --git a/drivers/dma/ti/edma.c b/drivers/dma/ti/edma.c
+index 6de83d245919..22a32d39c017 100644
+--- a/drivers/dma/ti/edma.c
++++ b/drivers/dma/ti/edma.c
+@@ -1576,7 +1576,7 @@ static irqreturn_t dma_ccerr_handler(int irq, void *data)
+ 
+ 			dev_dbg(ecc->dev, "EMR%d 0x%08x\n", j, val);
+ 			emr = val;
+-			for (i = find_next_bit(&emr, 32, 0); i < 32;
++			for (i = find_first_bit(&emr, 32); i < 32;
+ 			     i = find_next_bit(&emr, 32, i + 1)) {
+ 				int k = (j << 5) + i;
+ 
+* Unmerged path drivers/iio/adc/ad7124.c
+diff --git a/drivers/infiniband/hw/irdma/hw.c b/drivers/infiniband/hw/irdma/hw.c
+index d077eb399556..01c1431beec1 100644
+--- a/drivers/infiniband/hw/irdma/hw.c
++++ b/drivers/infiniband/hw/irdma/hw.c
+@@ -1709,14 +1709,14 @@ static enum irdma_status_code irdma_setup_init_state(struct irdma_pci_f *rf)
+  */
+ static void irdma_get_used_rsrc(struct irdma_device *iwdev)
+ {
+-	iwdev->rf->used_pds = find_next_zero_bit(iwdev->rf->allocated_pds,
+-						 iwdev->rf->max_pd, 0);
+-	iwdev->rf->used_qps = find_next_zero_bit(iwdev->rf->allocated_qps,
+-						 iwdev->rf->max_qp, 0);
+-	iwdev->rf->used_cqs = find_next_zero_bit(iwdev->rf->allocated_cqs,
+-						 iwdev->rf->max_cq, 0);
+-	iwdev->rf->used_mrs = find_next_zero_bit(iwdev->rf->allocated_mrs,
+-						 iwdev->rf->max_mr, 0);
++	iwdev->rf->used_pds = find_first_zero_bit(iwdev->rf->allocated_pds,
++						 iwdev->rf->max_pd);
++	iwdev->rf->used_qps = find_first_zero_bit(iwdev->rf->allocated_qps,
++						 iwdev->rf->max_qp);
++	iwdev->rf->used_cqs = find_first_zero_bit(iwdev->rf->allocated_cqs,
++						 iwdev->rf->max_cq);
++	iwdev->rf->used_mrs = find_first_zero_bit(iwdev->rf->allocated_mrs,
++						 iwdev->rf->max_mr);
+ }
+ 
+ void irdma_ctrl_deinit_hw(struct irdma_pci_f *rf)
+diff --git a/drivers/media/cec/cec-core.c b/drivers/media/cec/cec-core.c
+index db7adffcdc76..abdbe103fb58 100644
+--- a/drivers/media/cec/cec-core.c
++++ b/drivers/media/cec/cec-core.c
+@@ -106,7 +106,7 @@ static int __must_check cec_devnode_register(struct cec_devnode *devnode,
+ 
+ 	/* Part 1: Find a free minor number */
+ 	mutex_lock(&cec_devnode_lock);
+-	minor = find_next_zero_bit(cec_devnode_nums, CEC_NUM_DEVICES, 0);
++	minor = find_first_zero_bit(cec_devnode_nums, CEC_NUM_DEVICES);
+ 	if (minor == CEC_NUM_DEVICES) {
+ 		mutex_unlock(&cec_devnode_lock);
+ 		pr_err("could not get a free minor\n");
+diff --git a/drivers/media/media-devnode.c b/drivers/media/media-devnode.c
+index 6b87a721dc49..5c6c1e1fdbff 100644
+--- a/drivers/media/media-devnode.c
++++ b/drivers/media/media-devnode.c
+@@ -225,7 +225,7 @@ int __must_check media_devnode_register(struct media_device *mdev,
+ 
+ 	/* Part 1: Find a free minor number */
+ 	mutex_lock(&media_devnode_lock);
+-	minor = find_next_zero_bit(media_devnode_nums, MEDIA_NUM_DEVICES, 0);
++	minor = find_first_zero_bit(media_devnode_nums, MEDIA_NUM_DEVICES);
+ 	if (minor == MEDIA_NUM_DEVICES) {
+ 		mutex_unlock(&media_devnode_lock);
+ 		pr_err("could not get a free minor\n");
+* Unmerged path drivers/pci/controller/dwc/pci-dra7xx.c
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index b889d3dd4b12..521c0073511d 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -17981,8 +17981,8 @@ lpfc_sli4_alloc_xri(struct lpfc_hba *phba)
+ 	 * the driver starts at 0 each time.
+ 	 */
+ 	spin_lock_irq(&phba->hbalock);
+-	xri = find_next_zero_bit(phba->sli4_hba.xri_bmask,
+-				 phba->sli4_hba.max_cfg_param.max_xri, 0);
++	xri = find_first_zero_bit(phba->sli4_hba.xri_bmask,
++				 phba->sli4_hba.max_cfg_param.max_xri);
+ 	if (xri >= phba->sli4_hba.max_cfg_param.max_xri) {
+ 		spin_unlock_irq(&phba->hbalock);
+ 		return NO_XRI;
+@@ -19659,7 +19659,7 @@ lpfc_sli4_alloc_rpi(struct lpfc_hba *phba)
+ 	max_rpi = phba->sli4_hba.max_cfg_param.max_rpi;
+ 	rpi_limit = phba->sli4_hba.next_rpi;
+ 
+-	rpi = find_next_zero_bit(phba->sli4_hba.rpi_bmask, rpi_limit, 0);
++	rpi = find_first_zero_bit(phba->sli4_hba.rpi_bmask, rpi_limit);
+ 	if (rpi >= rpi_limit)
+ 		rpi = LPFC_RPI_ALLOC_ERROR;
+ 	else {
+@@ -20302,8 +20302,8 @@ lpfc_sli4_fcf_rr_next_index_get(struct lpfc_hba *phba)
+ 		 * have been tested so that we can detect when we should
+ 		 * change the priority level.
+ 		 */
+-		next_fcf_index = find_next_bit(phba->fcf.fcf_rr_bmask,
+-					       LPFC_SLI4_FCF_TBL_INDX_MAX, 0);
++		next_fcf_index = find_first_bit(phba->fcf.fcf_rr_bmask,
++					       LPFC_SLI4_FCF_TBL_INDX_MAX);
+ 	}
+ 
+ 
+* Unmerged path drivers/soc/ti/k3-ringacc.c
+diff --git a/drivers/tty/n_tty.c b/drivers/tty/n_tty.c
+index 74040d3b9ad2..fec6f27763c4 100644
+--- a/drivers/tty/n_tty.c
++++ b/drivers/tty/n_tty.c
+@@ -2041,7 +2041,7 @@ static int canon_copy_from_read_buf(struct tty_struct *tty,
+ 	more = n - (size - tail);
+ 	if (eol == N_TTY_BUF_SIZE && more) {
+ 		/* scan wrapped without finding set bit */
+-		eol = find_next_bit(ldata->read_flags, more, 0);
++		eol = find_first_bit(ldata->read_flags, more);
+ 		found = eol != more;
+ 	} else
+ 		found = eol != size;
+* Unmerged path drivers/virt/acrn/ioreq.c
+diff --git a/fs/f2fs/segment.c b/fs/f2fs/segment.c
+index 9efce174c51a..f9a6dae090ea 100644
+--- a/fs/f2fs/segment.c
++++ b/fs/f2fs/segment.c
+@@ -2068,8 +2068,8 @@ static void get_new_segment(struct f2fs_sb_info *sbi,
+ 	secno = find_next_zero_bit(free_i->free_secmap, MAIN_SECS(sbi), hint);
+ 	if (secno >= MAIN_SECS(sbi)) {
+ 		if (dir == ALLOC_RIGHT) {
+-			secno = find_next_zero_bit(free_i->free_secmap,
+-							MAIN_SECS(sbi), 0);
++			secno = find_first_zero_bit(free_i->free_secmap,
++							MAIN_SECS(sbi));
+ 			f2fs_bug_on(sbi, secno >= MAIN_SECS(sbi));
+ 		} else {
+ 			go_left = 1;
+@@ -2084,8 +2084,8 @@ static void get_new_segment(struct f2fs_sb_info *sbi,
+ 			left_start--;
+ 			continue;
+ 		}
+-		left_start = find_next_zero_bit(free_i->free_secmap,
+-							MAIN_SECS(sbi), 0);
++		left_start = find_first_zero_bit(free_i->free_secmap,
++							MAIN_SECS(sbi));
+ 		f2fs_bug_on(sbi, left_start >= MAIN_SECS(sbi));
+ 		break;
+ 	}
+diff --git a/fs/ocfs2/cluster/heartbeat.c b/fs/ocfs2/cluster/heartbeat.c
+index ea8c551bcd7e..b6f7bae46aff 100644
+--- a/fs/ocfs2/cluster/heartbeat.c
++++ b/fs/ocfs2/cluster/heartbeat.c
+@@ -405,7 +405,7 @@ static void o2hb_nego_timeout(struct work_struct *work)
+ 
+ 	o2hb_fill_node_map(live_node_bitmap, sizeof(live_node_bitmap));
+ 	/* lowest node as master node to make negotiate decision. */
+-	master_node = find_next_bit(live_node_bitmap, O2NM_MAX_NODES, 0);
++	master_node = find_first_bit(live_node_bitmap, O2NM_MAX_NODES);
+ 
+ 	if (master_node == o2nm_this_node()) {
+ 		if (!test_bit(master_node, reg->hr_nego_node_bitmap)) {
+diff --git a/fs/ocfs2/dlm/dlmdomain.c b/fs/ocfs2/dlm/dlmdomain.c
+index 2acd58ba9b7b..15313287bdcd 100644
+--- a/fs/ocfs2/dlm/dlmdomain.c
++++ b/fs/ocfs2/dlm/dlmdomain.c
+@@ -1063,7 +1063,7 @@ static int dlm_send_regions(struct dlm_ctxt *dlm, unsigned long *node_map)
+ 	int status, ret = 0, i;
+ 	char *p;
+ 
+-	if (find_next_bit(node_map, O2NM_MAX_NODES, 0) >= O2NM_MAX_NODES)
++	if (find_first_bit(node_map, O2NM_MAX_NODES) >= O2NM_MAX_NODES)
+ 		goto bail;
+ 
+ 	qr = kzalloc(sizeof(struct dlm_query_region), GFP_KERNEL);
+@@ -1235,7 +1235,7 @@ static int dlm_send_nodeinfo(struct dlm_ctxt *dlm, unsigned long *node_map)
+ 	struct o2nm_node *node;
+ 	int ret = 0, status, count, i;
+ 
+-	if (find_next_bit(node_map, O2NM_MAX_NODES, 0) >= O2NM_MAX_NODES)
++	if (find_first_bit(node_map, O2NM_MAX_NODES) >= O2NM_MAX_NODES)
+ 		goto bail;
+ 
+ 	qn = kzalloc(sizeof(struct dlm_query_nodeinfo), GFP_KERNEL);
+diff --git a/fs/ocfs2/dlm/dlmmaster.c b/fs/ocfs2/dlm/dlmmaster.c
+index aaca0949fe53..07e4a12964f4 100644
+--- a/fs/ocfs2/dlm/dlmmaster.c
++++ b/fs/ocfs2/dlm/dlmmaster.c
+@@ -878,7 +878,7 @@ struct dlm_lock_resource * dlm_get_lock_resource(struct dlm_ctxt *dlm,
+ 		 * to see if there are any nodes that still need to be
+ 		 * considered.  these will not appear in the mle nodemap
+ 		 * but they might own this lockres.  wait on them. */
+-		bit = find_next_bit(dlm->recovery_map, O2NM_MAX_NODES, 0);
++		bit = find_first_bit(dlm->recovery_map, O2NM_MAX_NODES);
+ 		if (bit < O2NM_MAX_NODES) {
+ 			mlog(0, "%s: res %.*s, At least one node (%d) "
+ 			     "to recover before lock mastery can begin\n",
+@@ -929,7 +929,7 @@ struct dlm_lock_resource * dlm_get_lock_resource(struct dlm_ctxt *dlm,
+ 		dlm_wait_for_recovery(dlm);
+ 
+ 		spin_lock(&dlm->spinlock);
+-		bit = find_next_bit(dlm->recovery_map, O2NM_MAX_NODES, 0);
++		bit = find_first_bit(dlm->recovery_map, O2NM_MAX_NODES);
+ 		if (bit < O2NM_MAX_NODES) {
+ 			mlog(0, "%s: res %.*s, At least one node (%d) "
+ 			     "to recover before lock mastery can begin\n",
+@@ -1096,7 +1096,7 @@ static int dlm_wait_for_lock_mastery(struct dlm_ctxt *dlm,
+ 		sleep = 1;
+ 		/* have all nodes responded? */
+ 		if (voting_done && !*blocked) {
+-			bit = find_next_bit(mle->maybe_map, O2NM_MAX_NODES, 0);
++			bit = find_first_bit(mle->maybe_map, O2NM_MAX_NODES);
+ 			if (dlm->node_num <= bit) {
+ 				/* my node number is lowest.
+ 			 	 * now tell other nodes that I am
+@@ -1251,8 +1251,8 @@ static int dlm_restart_lock_mastery(struct dlm_ctxt *dlm,
+ 		} else {
+ 			mlog(ML_ERROR, "node down! %d\n", node);
+ 			if (blocked) {
+-				int lowest = find_next_bit(mle->maybe_map,
+-						       O2NM_MAX_NODES, 0);
++				int lowest = find_first_bit(mle->maybe_map,
++						       O2NM_MAX_NODES);
+ 
+ 				/* act like it was never there */
+ 				clear_bit(node, mle->maybe_map);
+@@ -1812,7 +1812,7 @@ int dlm_assert_master_handler(struct o2net_msg *msg, u32 len, void *data,
+ 		     "MLE for it! (%.*s)\n", assert->node_idx,
+ 		     namelen, name);
+ 	} else {
+-		int bit = find_next_bit (mle->maybe_map, O2NM_MAX_NODES, 0);
++		int bit = find_first_bit(mle->maybe_map, O2NM_MAX_NODES);
+ 		if (bit >= O2NM_MAX_NODES) {
+ 			/* not necessarily an error, though less likely.
+ 			 * could be master just re-asserting. */
+@@ -2538,7 +2538,7 @@ static int dlm_is_lockres_migratable(struct dlm_ctxt *dlm,
+ 	}
+ 
+ 	if (!nonlocal) {
+-		node_ref = find_next_bit(res->refmap, O2NM_MAX_NODES, 0);
++		node_ref = find_first_bit(res->refmap, O2NM_MAX_NODES);
+ 		if (node_ref >= O2NM_MAX_NODES)
+ 			return 0;
+ 	}
+@@ -3323,7 +3323,7 @@ static void dlm_clean_block_mle(struct dlm_ctxt *dlm,
+ 	BUG_ON(mle->type != DLM_MLE_BLOCK);
+ 
+ 	spin_lock(&mle->spinlock);
+-	bit = find_next_bit(mle->maybe_map, O2NM_MAX_NODES, 0);
++	bit = find_first_bit(mle->maybe_map, O2NM_MAX_NODES);
+ 	if (bit != dead_node) {
+ 		mlog(0, "mle found, but dead node %u would not have been "
+ 		     "master\n", dead_node);
+@@ -3562,7 +3562,7 @@ void dlm_force_free_mles(struct dlm_ctxt *dlm)
+ 	spin_lock(&dlm->master_lock);
+ 
+ 	BUG_ON(dlm->dlm_state != DLM_CTXT_LEAVING);
+-	BUG_ON((find_next_bit(dlm->domain_map, O2NM_MAX_NODES, 0) < O2NM_MAX_NODES));
++	BUG_ON((find_first_bit(dlm->domain_map, O2NM_MAX_NODES) < O2NM_MAX_NODES));
+ 
+ 	for (i = 0; i < DLM_HASH_BUCKETS; i++) {
+ 		bucket = dlm_master_hash(dlm, i);
+diff --git a/fs/ocfs2/dlm/dlmrecovery.c b/fs/ocfs2/dlm/dlmrecovery.c
+index 802636d50365..0003201c95d2 100644
+--- a/fs/ocfs2/dlm/dlmrecovery.c
++++ b/fs/ocfs2/dlm/dlmrecovery.c
+@@ -475,7 +475,7 @@ static int dlm_do_recovery(struct dlm_ctxt *dlm)
+ 	if (dlm->reco.dead_node == O2NM_INVALID_NODE_NUM) {
+ 		int bit;
+ 
+-		bit = find_next_bit (dlm->recovery_map, O2NM_MAX_NODES, 0);
++		bit = find_first_bit(dlm->recovery_map, O2NM_MAX_NODES);
+ 		if (bit >= O2NM_MAX_NODES || bit < 0)
+ 			dlm_set_reco_dead_node(dlm, O2NM_INVALID_NODE_NUM);
+ 		else
+diff --git a/fs/ocfs2/dlm/dlmthread.c b/fs/ocfs2/dlm/dlmthread.c
+index 838a06d4066a..2007f910bfad 100644
+--- a/fs/ocfs2/dlm/dlmthread.c
++++ b/fs/ocfs2/dlm/dlmthread.c
+@@ -111,7 +111,7 @@ int __dlm_lockres_unused(struct dlm_lock_resource *res)
+ 		return 0;
+ 
+ 	/* Another node has this resource with this node as the master */
+-	bit = find_next_bit(res->refmap, O2NM_MAX_NODES, 0);
++	bit = find_first_bit(res->refmap, O2NM_MAX_NODES);
+ 	if (bit < O2NM_MAX_NODES)
+ 		return 0;
+ 
+diff --git a/lib/genalloc.c b/lib/genalloc.c
+index 39188369c3f5..48ed73fefbd5 100644
+--- a/lib/genalloc.c
++++ b/lib/genalloc.c
+@@ -251,7 +251,7 @@ void gen_pool_destroy(struct gen_pool *pool)
+ 		list_del(&chunk->next_chunk);
+ 
+ 		end_bit = chunk_size(chunk) >> order;
+-		bit = find_next_bit(chunk->bits, end_bit, 0);
++		bit = find_first_bit(chunk->bits, end_bit);
+ 		BUG_ON(bit < end_bit);
+ 
+ 		vfree(chunk);
+diff --git a/net/ncsi/ncsi-manage.c b/net/ncsi/ncsi-manage.c
+index 091284760d21..6326c159c7e3 100644
+--- a/net/ncsi/ncsi-manage.c
++++ b/net/ncsi/ncsi-manage.c
+@@ -554,7 +554,7 @@ static int clear_one_vid(struct ncsi_dev_priv *ndp, struct ncsi_channel *nc,
+ 	bitmap = &ncf->bitmap;
+ 
+ 	spin_lock_irqsave(&nc->lock, flags);
+-	index = find_next_bit(bitmap, ncf->n_vids, 0);
++	index = find_first_bit(bitmap, ncf->n_vids);
+ 	if (index >= ncf->n_vids) {
+ 		spin_unlock_irqrestore(&nc->lock, flags);
+ 		return -1;
+@@ -613,7 +613,7 @@ static int set_one_vid(struct ncsi_dev_priv *ndp, struct ncsi_channel *nc,
+ 		return -1;
+ 	}
+ 
+-	index = find_next_zero_bit(bitmap, ncf->n_vids, 0);
++	index = find_first_zero_bit(bitmap, ncf->n_vids);
+ 	if (index < 0 || index >= ncf->n_vids) {
+ 		netdev_err(ndp->ndev.dev,
+ 			   "Channel %u already has all VLAN filters set\n",
