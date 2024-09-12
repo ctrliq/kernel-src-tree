@@ -1,0 +1,219 @@
+sched/cputime: Spare a seqcount lock/unlock cycle on context switch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.13.1.el8_6
+commit-author Frederic Weisbecker <frederic@kernel.org>
+commit 8d495477d62e4397207f22a432fcaa86d9f2bc2d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.13.1.el8_6/8d495477.failed
+
+On context switch we are locking the vtime seqcount of the scheduling-out
+task twice:
+
+ * On vtime_task_switch_common(), when we flush the pending vtime through
+   vtime_account_system()
+
+ * On arch_vtime_task_switch() to reset the vtime state.
+
+This is pointless as these actions can be performed without the need
+to unlock/lock in the middle. The reason these steps are separated is to
+consolidate a very small amount of common code between
+CONFIG_VIRT_CPU_ACCOUNTING_GEN and CONFIG_VIRT_CPU_ACCOUNTING_NATIVE.
+
+Performance in this fast path is definitely a priority over artificial
+code factorization so split the task switch code between GEN and
+NATIVE and mutualize the parts than can run under a single seqcount
+locked block.
+
+As a side effect, vtime_account_idle() becomes included in the seqcount
+protection. This happens to be a welcome preparation in order to
+properly support kcpustat under vtime in the future and fetch
+CPUTIME_IDLE without race.
+
+	Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Wanpeng Li <wanpengli@tencent.com>
+	Cc: Yauheni Kaliuta <yauheni.kaliuta@redhat.com>
+Link: https://lkml.kernel.org/r/20191003161745.28464-3-frederic@kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8d495477d62e4397207f22a432fcaa86d9f2bc2d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/vtime.h
+diff --cc include/linux/vtime.h
+index 70fe7eb64f20,d9160ab3667a..000000000000
+--- a/include/linux/vtime.h
++++ b/include/linux/vtime.h
+@@@ -11,11 -11,15 +11,19 @@@
+  struct task_struct;
+  
+  /*
+ - * vtime_accounting_cpu_enabled() definitions/declarations
+ + * vtime_accounting_enabled_this_cpu() definitions/declarations
+   */
+  #if defined(CONFIG_VIRT_CPU_ACCOUNTING_NATIVE)
+++<<<<<<< HEAD
+ +static inline bool vtime_accounting_enabled_this_cpu(void) { return true; }
+++=======
++ 
++ static inline bool vtime_accounting_cpu_enabled(void) { return true; }
++ extern void vtime_task_switch(struct task_struct *prev);
++ 
+++>>>>>>> 8d495477d62e (sched/cputime: Spare a seqcount lock/unlock cycle on context switch)
+  #elif defined(CONFIG_VIRT_CPU_ACCOUNTING_GEN)
++ 
+  /*
+   * Checks if vtime is enabled on some CPU. Cputime readers want to be careful
+   * in that case and compute the tickless cputime.
+@@@ -27,43 -31,38 +35,60 @@@ static inline bool vtime_accounting_ena
+  	return context_tracking_is_enabled();
+  }
+  
+ -static inline bool vtime_accounting_cpu_enabled(void)
+ +static inline bool vtime_accounting_enabled_cpu(int cpu)
+  {
+ -	if (vtime_accounting_enabled()) {
+ -		if (context_tracking_cpu_is_enabled())
+ -			return true;
+ -	}
+ +	return (vtime_accounting_enabled() && context_tracking_enabled_cpu(cpu));
+ +}
+  
+ -	return false;
+ +static inline bool vtime_accounting_enabled_this_cpu(void)
+ +{
+ +	return (vtime_accounting_enabled() && context_tracking_enabled_this_cpu());
+  }
+++<<<<<<< HEAD
+ +#else /* !CONFIG_VIRT_CPU_ACCOUNTING */
+ +static inline bool vtime_accounting_enabled_cpu(int cpu) {return false; }
+ +static inline bool vtime_accounting_enabled_this_cpu(void) { return false; }
+ +#endif
+++=======
+++>>>>>>> 8d495477d62e (sched/cputime: Spare a seqcount lock/unlock cycle on context switch)
+  
++ extern void vtime_task_switch_generic(struct task_struct *prev);
++ 
++ static inline void vtime_task_switch(struct task_struct *prev)
++ {
++ 	if (vtime_accounting_cpu_enabled())
++ 		vtime_task_switch_generic(prev);
++ }
++ 
++ #else /* !CONFIG_VIRT_CPU_ACCOUNTING */
++ 
++ static inline bool vtime_accounting_cpu_enabled(void) { return false; }
++ static inline void vtime_task_switch(struct task_struct *prev) { }
++ 
++ #endif
+  
+  /*
+   * Common vtime APIs
+   */
+  #ifdef CONFIG_VIRT_CPU_ACCOUNTING
+++<<<<<<< HEAD
+ +
+ +#ifdef __ARCH_HAS_VTIME_TASK_SWITCH
+ +extern void vtime_task_switch(struct task_struct *prev);
+ +#else
+ +extern void vtime_common_task_switch(struct task_struct *prev);
+ +static inline void vtime_task_switch(struct task_struct *prev)
+ +{
+ +	if (vtime_accounting_enabled_this_cpu())
+ +		vtime_common_task_switch(prev);
+ +}
+ +#endif /* __ARCH_HAS_VTIME_TASK_SWITCH */
+ +
+++=======
+++>>>>>>> 8d495477d62e (sched/cputime: Spare a seqcount lock/unlock cycle on context switch)
+  extern void vtime_account_kernel(struct task_struct *tsk);
+  extern void vtime_account_idle(struct task_struct *tsk);
+- 
+  #else /* !CONFIG_VIRT_CPU_ACCOUNTING */
+- 
+- static inline void vtime_task_switch(struct task_struct *prev) { }
+  static inline void vtime_account_kernel(struct task_struct *tsk) { }
+  #endif /* !CONFIG_VIRT_CPU_ACCOUNTING */
+  
+* Unmerged path include/linux/vtime.h
+diff --git a/kernel/sched/cputime.c b/kernel/sched/cputime.c
+index 747f703a8f36..804346bf4332 100644
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@ -404,9 +404,10 @@ static inline void irqtime_account_process_tick(struct task_struct *p, int user_
+ /*
+  * Use precise platform statistics if available:
+  */
+-#ifdef CONFIG_VIRT_CPU_ACCOUNTING
++#ifdef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
++
+ # ifndef __ARCH_HAS_VTIME_TASK_SWITCH
+-void vtime_common_task_switch(struct task_struct *prev)
++void vtime_task_switch(struct task_struct *prev)
+ {
+ 	if (is_idle_task(prev))
+ 		vtime_account_idle(prev);
+@@ -417,10 +418,7 @@ void vtime_common_task_switch(struct task_struct *prev)
+ 	arch_vtime_task_switch(prev);
+ }
+ # endif
+-#endif /* CONFIG_VIRT_CPU_ACCOUNTING */
+-
+ 
+-#ifdef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+ /*
+  * Archs that account the whole time spent in the idle task
+  * (outside irq) as idle time can rely on this and just implement
+@@ -687,6 +685,16 @@ static void vtime_account_guest(struct task_struct *tsk,
+ 	}
+ }
+ 
++static void __vtime_account_kernel(struct task_struct *tsk,
++				   struct vtime *vtime)
++{
++	/* We might have scheduled out from guest path */
++	if (tsk->flags & PF_VCPU)
++		vtime_account_guest(tsk, vtime);
++	else
++		vtime_account_system(tsk, vtime);
++}
++
+ void vtime_account_kernel(struct task_struct *tsk)
+ {
+ 	struct vtime *vtime = &tsk->vtime;
+@@ -695,11 +703,7 @@ void vtime_account_kernel(struct task_struct *tsk)
+ 		return;
+ 
+ 	write_seqcount_begin(&vtime->seqcount);
+-	/* We might have scheduled out from guest path */
+-	if (tsk->flags & PF_VCPU)
+-		vtime_account_guest(tsk, vtime);
+-	else
+-		vtime_account_system(tsk, vtime);
++	__vtime_account_kernel(tsk, vtime);
+ 	write_seqcount_end(&vtime->seqcount);
+ }
+ 
+@@ -760,11 +764,15 @@ void vtime_account_idle(struct task_struct *tsk)
+ 	account_idle_time(get_vtime_delta(&tsk->vtime));
+ }
+ 
+-void arch_vtime_task_switch(struct task_struct *prev)
++void vtime_task_switch_generic(struct task_struct *prev)
+ {
+ 	struct vtime *vtime = &prev->vtime;
+ 
+ 	write_seqcount_begin(&vtime->seqcount);
++	if (is_idle_task(prev))
++		vtime_account_idle(prev);
++	else
++		__vtime_account_kernel(prev, vtime);
+ 	vtime->state = VTIME_INACTIVE;
+ 	prev->task_struct_rh->vtime_cpu = -1;
+ 	write_seqcount_end(&vtime->seqcount);
