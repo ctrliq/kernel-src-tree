@@ -1,0 +1,484 @@
+rxrpc: Offload the completion of service conn security to the I/O thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 2953d3b8d8fd1188034c54862b74402b0b846695
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/2953d3b8.failed
+
+Offload the completion of the challenge/response cycle on a service
+connection to the I/O thread.  After the RESPONSE packet has been
+successfully decrypted and verified by the work queue, offloading the
+changing of the call states to the I/O thread makes iteration over the
+conn's channel list simpler.
+
+Do this by marking the RESPONSE skbuff and putting it onto the receive
+queue for the I/O thread to collect.  We put it on the front of the queue
+as we've already received the packet for it.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit 2953d3b8d8fd1188034c54862b74402b0b846695)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/trace/events/rxrpc.h
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/conn_event.c
+#	net/rxrpc/io_thread.c
+diff --cc include/trace/events/rxrpc.h
+index 2a52121d73a0,85671f4a77de..000000000000
+--- a/include/trace/events/rxrpc.h
++++ b/include/trace/events/rxrpc.h
+@@@ -16,44 -16,224 +16,72 @@@
+  /*
+   * Declare tracing information enums and their string mappings for display.
+   */
+ -#define rxrpc_abort_reasons \
+ -	/* AFS errors */						\
+ -	EM(afs_abort_general_error,		"afs-error")		\
+ -	EM(afs_abort_interrupted,		"afs-intr")		\
+ -	EM(afs_abort_oom,			"afs-oom")		\
+ -	EM(afs_abort_op_not_supported,		"afs-op-notsupp")	\
+ -	EM(afs_abort_probeuuid_negative,	"afs-probeuuid-neg")	\
+ -	EM(afs_abort_send_data_error,		"afs-send-data")	\
+ -	EM(afs_abort_unmarshal_error,		"afs-unmarshal")	\
+ -	/* rxperf errors */						\
+ -	EM(rxperf_abort_general_error,		"rxperf-error")		\
+ -	EM(rxperf_abort_oom,			"rxperf-oom")		\
+ -	EM(rxperf_abort_op_not_supported,	"rxperf-op-notsupp")	\
+ -	EM(rxperf_abort_unmarshal_error,	"rxperf-unmarshal")	\
+ -	/* RxKAD security errors */					\
+ -	EM(rxkad_abort_1_short_check,		"rxkad1-short-check")	\
+ -	EM(rxkad_abort_1_short_data,		"rxkad1-short-data")	\
+ -	EM(rxkad_abort_1_short_encdata,		"rxkad1-short-encdata")	\
+ -	EM(rxkad_abort_1_short_header,		"rxkad1-short-hdr")	\
+ -	EM(rxkad_abort_2_short_check,		"rxkad2-short-check")	\
+ -	EM(rxkad_abort_2_short_data,		"rxkad2-short-data")	\
+ -	EM(rxkad_abort_2_short_header,		"rxkad2-short-hdr")	\
+ -	EM(rxkad_abort_2_short_len,		"rxkad2-short-len")	\
+ -	EM(rxkad_abort_bad_checksum,		"rxkad2-bad-cksum")	\
+ -	EM(rxkad_abort_chall_key_expired,	"rxkad-chall-key-exp")	\
+ -	EM(rxkad_abort_chall_level,		"rxkad-chall-level")	\
+ -	EM(rxkad_abort_chall_no_key,		"rxkad-chall-nokey")	\
+ -	EM(rxkad_abort_chall_short,		"rxkad-chall-short")	\
+ -	EM(rxkad_abort_chall_version,		"rxkad-chall-version")	\
+ -	EM(rxkad_abort_resp_bad_callid,		"rxkad-resp-bad-callid") \
+ -	EM(rxkad_abort_resp_bad_checksum,	"rxkad-resp-bad-cksum")	\
+ -	EM(rxkad_abort_resp_bad_param,		"rxkad-resp-bad-param")	\
+ -	EM(rxkad_abort_resp_call_ctr,		"rxkad-resp-call-ctr") \
+ -	EM(rxkad_abort_resp_call_state,		"rxkad-resp-call-state") \
+ -	EM(rxkad_abort_resp_key_expired,	"rxkad-resp-key-exp")	\
+ -	EM(rxkad_abort_resp_key_rejected,	"rxkad-resp-key-rej")	\
+ -	EM(rxkad_abort_resp_level,		"rxkad-resp-level")	\
+ -	EM(rxkad_abort_resp_nokey,		"rxkad-resp-nokey")	\
+ -	EM(rxkad_abort_resp_ooseq,		"rxkad-resp-ooseq")	\
+ -	EM(rxkad_abort_resp_short,		"rxkad-resp-short")	\
+ -	EM(rxkad_abort_resp_short_tkt,		"rxkad-resp-short-tkt")	\
+ -	EM(rxkad_abort_resp_tkt_aname,		"rxkad-resp-tk-aname")	\
+ -	EM(rxkad_abort_resp_tkt_expired,	"rxkad-resp-tk-exp")	\
+ -	EM(rxkad_abort_resp_tkt_future,		"rxkad-resp-tk-future")	\
+ -	EM(rxkad_abort_resp_tkt_inst,		"rxkad-resp-tk-inst")	\
+ -	EM(rxkad_abort_resp_tkt_len,		"rxkad-resp-tk-len")	\
+ -	EM(rxkad_abort_resp_tkt_realm,		"rxkad-resp-tk-realm")	\
+ -	EM(rxkad_abort_resp_tkt_short,		"rxkad-resp-tk-short")	\
+ -	EM(rxkad_abort_resp_tkt_sinst,		"rxkad-resp-tk-sinst")	\
+ -	EM(rxkad_abort_resp_tkt_sname,		"rxkad-resp-tk-sname")	\
+ -	EM(rxkad_abort_resp_unknown_tkt,	"rxkad-resp-unknown-tkt") \
+ -	EM(rxkad_abort_resp_version,		"rxkad-resp-version")	\
+ -	/* rxrpc errors */						\
+ -	EM(rxrpc_abort_call_improper_term,	"call-improper-term")	\
+ -	EM(rxrpc_abort_call_reset,		"call-reset")		\
+ -	EM(rxrpc_abort_call_sendmsg,		"call-sendmsg")		\
+ -	EM(rxrpc_abort_call_sock_release,	"call-sock-rel")	\
+ -	EM(rxrpc_abort_call_sock_release_tba,	"call-sock-rel-tba")	\
+ -	EM(rxrpc_abort_call_timeout,		"call-timeout")		\
+ -	EM(rxrpc_abort_no_service_key,		"no-serv-key")		\
+ -	EM(rxrpc_abort_nomem,			"nomem")		\
+ -	EM(rxrpc_abort_service_not_offered,	"serv-not-offered")	\
+ -	EM(rxrpc_abort_shut_down,		"shut-down")		\
+ -	EM(rxrpc_abort_unsupported_security,	"unsup-sec")		\
+ -	EM(rxrpc_badmsg_bad_abort,		"bad-abort")		\
+ -	EM(rxrpc_badmsg_bad_jumbo,		"bad-jumbo")		\
+ -	EM(rxrpc_badmsg_short_ack,		"short-ack")		\
+ -	EM(rxrpc_badmsg_short_ack_info,		"short-ack-info")	\
+ -	EM(rxrpc_badmsg_short_hdr,		"short-hdr")		\
+ -	EM(rxrpc_badmsg_unsupported_packet,	"unsup-pkt")		\
+ -	EM(rxrpc_badmsg_zero_call,		"zero-call")		\
+ -	EM(rxrpc_badmsg_zero_seq,		"zero-seq")		\
+ -	EM(rxrpc_badmsg_zero_service,		"zero-service")		\
+ -	EM(rxrpc_eproto_ackr_outside_window,	"ackr-out-win")		\
+ -	EM(rxrpc_eproto_ackr_sack_overflow,	"ackr-sack-over")	\
+ -	EM(rxrpc_eproto_ackr_short_sack,	"ackr-short-sack")	\
+ -	EM(rxrpc_eproto_ackr_zero,		"ackr-zero")		\
+ -	EM(rxrpc_eproto_bad_upgrade,		"bad-upgrade")		\
+ -	EM(rxrpc_eproto_data_after_last,	"data-after-last")	\
+ -	EM(rxrpc_eproto_different_last,		"diff-last")		\
+ -	EM(rxrpc_eproto_early_reply,		"early-reply")		\
+ -	EM(rxrpc_eproto_improper_term,		"improper-term")	\
+ -	EM(rxrpc_eproto_no_client_call,		"no-cl-call")		\
+ -	EM(rxrpc_eproto_no_client_conn,		"no-cl-conn")		\
+ -	EM(rxrpc_eproto_no_service_call,	"no-sv-call")		\
+ -	EM(rxrpc_eproto_reupgrade,		"re-upgrade")		\
+ -	EM(rxrpc_eproto_rxnull_challenge,	"rxnull-chall")		\
+ -	EM(rxrpc_eproto_rxnull_response,	"rxnull-resp")		\
+ -	EM(rxrpc_eproto_tx_rot_last,		"tx-rot-last")		\
+ -	EM(rxrpc_eproto_unexpected_ack,		"unex-ack")		\
+ -	EM(rxrpc_eproto_unexpected_ackall,	"unex-ackall")		\
+ -	EM(rxrpc_eproto_unexpected_implicit_end, "unex-impl-end")	\
+ -	EM(rxrpc_eproto_unexpected_reply,	"unex-reply")		\
+ -	EM(rxrpc_eproto_wrong_security,		"wrong-sec")		\
+ -	EM(rxrpc_recvmsg_excess_data,		"recvmsg-excess")	\
+ -	EM(rxrpc_recvmsg_short_data,		"recvmsg-short")	\
+ -	E_(rxrpc_sendmsg_late_send,		"sendmsg-late")
+ -
+ -#define rxrpc_call_poke_traces \
+ -	EM(rxrpc_call_poke_abort,		"Abort")	\
+ -	EM(rxrpc_call_poke_complete,		"Compl")	\
+ -	EM(rxrpc_call_poke_error,		"Error")	\
+ -	EM(rxrpc_call_poke_idle,		"Idle")		\
+ -	EM(rxrpc_call_poke_start,		"Start")	\
+ -	EM(rxrpc_call_poke_timer,		"Timer")	\
+ -	E_(rxrpc_call_poke_timer_now,		"Timer-now")
+ -
+  #define rxrpc_skb_traces \
+++<<<<<<< HEAD
+ +	EM(rxrpc_skb_ack,			"ACK") \
+ +	EM(rxrpc_skb_cleaned,			"CLN") \
+ +	EM(rxrpc_skb_cloned_jumbo,		"CLJ") \
+ +	EM(rxrpc_skb_freed,			"FRE") \
+ +	EM(rxrpc_skb_got,			"GOT") \
+ +	EM(rxrpc_skb_lost,			"*L*") \
+ +	EM(rxrpc_skb_new,			"NEW") \
+ +	EM(rxrpc_skb_purged,			"PUR") \
+ +	EM(rxrpc_skb_received,			"RCV") \
+ +	EM(rxrpc_skb_rotated,			"ROT") \
+ +	EM(rxrpc_skb_seen,			"SEE") \
+ +	EM(rxrpc_skb_unshared,			"UNS") \
+ +	E_(rxrpc_skb_unshared_nomem,		"US0")
+++=======
++ 	EM(rxrpc_skb_eaten_by_unshare,		"ETN unshare  ") \
++ 	EM(rxrpc_skb_eaten_by_unshare_nomem,	"ETN unshar-nm") \
++ 	EM(rxrpc_skb_get_conn_secured,		"GET conn-secd") \
++ 	EM(rxrpc_skb_get_conn_work,		"GET conn-work") \
++ 	EM(rxrpc_skb_get_local_work,		"GET locl-work") \
++ 	EM(rxrpc_skb_get_reject_work,		"GET rej-work ") \
++ 	EM(rxrpc_skb_get_to_recvmsg,		"GET to-recv  ") \
++ 	EM(rxrpc_skb_get_to_recvmsg_oos,	"GET to-recv-o") \
++ 	EM(rxrpc_skb_new_encap_rcv,		"NEW encap-rcv") \
++ 	EM(rxrpc_skb_new_error_report,		"NEW error-rpt") \
++ 	EM(rxrpc_skb_new_jumbo_subpacket,	"NEW jumbo-sub") \
++ 	EM(rxrpc_skb_new_unshared,		"NEW unshared ") \
++ 	EM(rxrpc_skb_put_conn_secured,		"PUT conn-secd") \
++ 	EM(rxrpc_skb_put_conn_work,		"PUT conn-work") \
++ 	EM(rxrpc_skb_put_error_report,		"PUT error-rep") \
++ 	EM(rxrpc_skb_put_input,			"PUT input    ") \
++ 	EM(rxrpc_skb_put_jumbo_subpacket,	"PUT jumbo-sub") \
++ 	EM(rxrpc_skb_put_purge,			"PUT purge    ") \
++ 	EM(rxrpc_skb_put_rotate,		"PUT rotate   ") \
++ 	EM(rxrpc_skb_put_unknown,		"PUT unknown  ") \
++ 	EM(rxrpc_skb_see_conn_work,		"SEE conn-work") \
++ 	EM(rxrpc_skb_see_recvmsg,		"SEE recvmsg  ") \
++ 	EM(rxrpc_skb_see_reject,		"SEE reject   ") \
++ 	EM(rxrpc_skb_see_rotate,		"SEE rotate   ") \
++ 	E_(rxrpc_skb_see_version,		"SEE version  ")
+++>>>>>>> 2953d3b8d8fd (rxrpc: Offload the completion of service conn security to the I/O thread)
+  
+  #define rxrpc_local_traces \
+ -	EM(rxrpc_local_free,			"FREE        ") \
+ -	EM(rxrpc_local_get_call,		"GET call    ") \
+ -	EM(rxrpc_local_get_client_conn,		"GET conn-cln") \
+ -	EM(rxrpc_local_get_for_use,		"GET for-use ") \
+ -	EM(rxrpc_local_get_peer,		"GET peer    ") \
+ -	EM(rxrpc_local_get_prealloc_conn,	"GET conn-pre") \
+ -	EM(rxrpc_local_new,			"NEW         ") \
+ -	EM(rxrpc_local_put_bind,		"PUT bind    ") \
+ -	EM(rxrpc_local_put_call,		"PUT call    ") \
+ -	EM(rxrpc_local_put_for_use,		"PUT for-use ") \
+ -	EM(rxrpc_local_put_kill_conn,		"PUT conn-kil") \
+ -	EM(rxrpc_local_put_peer,		"PUT peer    ") \
+ -	EM(rxrpc_local_put_prealloc_conn,	"PUT conn-pre") \
+ -	EM(rxrpc_local_put_release_sock,	"PUT rel-sock") \
+ -	EM(rxrpc_local_stop,			"STOP        ") \
+ -	EM(rxrpc_local_stopped,			"STOPPED     ") \
+ -	EM(rxrpc_local_unuse_bind,		"UNU bind    ") \
+ -	EM(rxrpc_local_unuse_conn_work,		"UNU conn-wrk") \
+ -	EM(rxrpc_local_unuse_peer_keepalive,	"UNU peer-kpa") \
+ -	EM(rxrpc_local_unuse_release_sock,	"UNU rel-sock") \
+ -	EM(rxrpc_local_use_conn_work,		"USE conn-wrk") \
+ -	EM(rxrpc_local_use_lookup,		"USE lookup  ") \
+ -	E_(rxrpc_local_use_peer_keepalive,	"USE peer-kpa")
+ +	EM(rxrpc_local_got,			"GOT") \
+ +	EM(rxrpc_local_new,			"NEW") \
+ +	EM(rxrpc_local_processing,		"PRO") \
+ +	EM(rxrpc_local_put,			"PUT") \
+ +	EM(rxrpc_local_queued,			"QUE") \
+ +	E_(rxrpc_local_tx_ack,			"TAK")
+  
+  #define rxrpc_peer_traces \
+ -	EM(rxrpc_peer_free,			"FREE        ") \
+ -	EM(rxrpc_peer_get_accept,		"GET accept  ") \
+ -	EM(rxrpc_peer_get_activate_call,	"GET act-call") \
+ -	EM(rxrpc_peer_get_bundle,		"GET bundle  ") \
+ -	EM(rxrpc_peer_get_client_conn,		"GET cln-conn") \
+ -	EM(rxrpc_peer_get_input,		"GET input   ") \
+ -	EM(rxrpc_peer_get_input_error,		"GET inpt-err") \
+ -	EM(rxrpc_peer_get_keepalive,		"GET keepaliv") \
+ -	EM(rxrpc_peer_get_lookup_client,	"GET look-cln") \
+ -	EM(rxrpc_peer_get_service_conn,		"GET srv-conn") \
+ -	EM(rxrpc_peer_new_client,		"NEW client  ") \
+ -	EM(rxrpc_peer_new_prealloc,		"NEW prealloc") \
+ -	EM(rxrpc_peer_put_bundle,		"PUT bundle  ") \
+ -	EM(rxrpc_peer_put_call,			"PUT call    ") \
+ -	EM(rxrpc_peer_put_conn,			"PUT conn    ") \
+ -	EM(rxrpc_peer_put_discard_tmp,		"PUT disc-tmp") \
+ -	EM(rxrpc_peer_put_input,		"PUT input   ") \
+ -	EM(rxrpc_peer_put_input_error,		"PUT inpt-err") \
+ -	E_(rxrpc_peer_put_keepalive,		"PUT keepaliv")
+ -
+ -#define rxrpc_bundle_traces \
+ -	EM(rxrpc_bundle_free,			"FREE        ") \
+ -	EM(rxrpc_bundle_get_client_call,	"GET clt-call") \
+ -	EM(rxrpc_bundle_get_client_conn,	"GET clt-conn") \
+ -	EM(rxrpc_bundle_get_service_conn,	"GET svc-conn") \
+ -	EM(rxrpc_bundle_put_conn,		"PUT conn    ") \
+ -	EM(rxrpc_bundle_put_discard,		"PUT discard ") \
+ -	E_(rxrpc_bundle_new,			"NEW         ")
+ +	EM(rxrpc_peer_got,			"GOT") \
+ +	EM(rxrpc_peer_new,			"NEW") \
+ +	EM(rxrpc_peer_processing,		"PRO") \
+ +	E_(rxrpc_peer_put,			"PUT")
+  
+  #define rxrpc_conn_traces \
+ -	EM(rxrpc_conn_free,			"FREE        ") \
+ -	EM(rxrpc_conn_get_activate_call,	"GET act-call") \
+ -	EM(rxrpc_conn_get_call_input,		"GET inp-call") \
+ -	EM(rxrpc_conn_get_conn_input,		"GET inp-conn") \
+ -	EM(rxrpc_conn_get_idle,			"GET idle    ") \
+ -	EM(rxrpc_conn_get_poke_abort,		"GET pk-abort") \
+ -	EM(rxrpc_conn_get_poke_timer,		"GET poke    ") \
+ -	EM(rxrpc_conn_get_service_conn,		"GET svc-conn") \
+ -	EM(rxrpc_conn_new_client,		"NEW client  ") \
+ -	EM(rxrpc_conn_new_service,		"NEW service ") \
+ -	EM(rxrpc_conn_put_call,			"PUT call    ") \
+ -	EM(rxrpc_conn_put_call_input,		"PUT inp-call") \
+ -	EM(rxrpc_conn_put_conn_input,		"PUT inp-conn") \
+ -	EM(rxrpc_conn_put_discard,		"PUT discard ") \
+ -	EM(rxrpc_conn_put_discard_idle,		"PUT disc-idl") \
+ -	EM(rxrpc_conn_put_local_dead,		"PUT loc-dead") \
+ -	EM(rxrpc_conn_put_noreuse,		"PUT noreuse ") \
+ -	EM(rxrpc_conn_put_poke,			"PUT poke    ") \
+ -	EM(rxrpc_conn_put_service_reaped,	"PUT svc-reap") \
+ -	EM(rxrpc_conn_put_unbundle,		"PUT unbundle") \
+ -	EM(rxrpc_conn_put_unidle,		"PUT unidle  ") \
+ -	EM(rxrpc_conn_put_work,			"PUT work    ") \
+ -	EM(rxrpc_conn_queue_challenge,		"QUE chall   ") \
+ -	EM(rxrpc_conn_queue_retry_work,		"QUE retry-wk") \
+ -	EM(rxrpc_conn_queue_rx_work,		"QUE rx-work ") \
+ -	EM(rxrpc_conn_see_new_service_conn,	"SEE new-svc ") \
+ -	EM(rxrpc_conn_see_reap_service,		"SEE reap-svc") \
+ -	E_(rxrpc_conn_see_work,			"SEE work    ")
+ +	EM(rxrpc_conn_got,			"GOT") \
+ +	EM(rxrpc_conn_new_client,		"NWc") \
+ +	EM(rxrpc_conn_new_service,		"NWs") \
+ +	EM(rxrpc_conn_put_client,		"PTc") \
+ +	EM(rxrpc_conn_put_service,		"PTs") \
+ +	EM(rxrpc_conn_queued,			"QUE") \
+ +	EM(rxrpc_conn_reap_service,		"RPs") \
+ +	E_(rxrpc_conn_seen,			"SEE")
+  
+  #define rxrpc_client_traces \
+  	EM(rxrpc_client_activate_chans,		"Activa") \
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,e508ec221b75..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -36,6 -36,9 +36,12 @@@ struct rxrpc_txbuf
+   * to pass supplementary information.
+   */
+  enum rxrpc_skb_mark {
+++<<<<<<< HEAD
+++=======
++ 	RXRPC_SKB_MARK_PACKET,		/* Received packet */
++ 	RXRPC_SKB_MARK_ERROR,		/* Error notification */
++ 	RXRPC_SKB_MARK_SERVICE_CONN_SECURED, /* Service connection response has been verified */
+++>>>>>>> 2953d3b8d8fd (rxrpc: Offload the completion of service conn security to the I/O thread)
+  	RXRPC_SKB_MARK_REJECT_BUSY,	/* Reject with BUSY */
+  	RXRPC_SKB_MARK_REJECT_ABORT,	/* Reject with ABORT (code in skb->priority) */
+  };
+diff --cc net/rxrpc/conn_event.c
+index abf03a5b1d31,b2042702ca9a..000000000000
+--- a/net/rxrpc/conn_event.c
++++ b/net/rxrpc/conn_event.c
+@@@ -278,16 -245,13 +278,16 @@@ static void rxrpc_call_is_secure(struc
+   * connection-level Rx packet processor
+   */
+  static int rxrpc_process_event(struct rxrpc_connection *conn,
+ -			       struct sk_buff *skb)
+ +			       struct sk_buff *skb,
+ +			       u32 *_abort_code)
+  {
+  	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
+- 	int loop, ret;
++ 	int ret;
+  
+ -	if (conn->state == RXRPC_CONN_ABORTED)
+ +	if (conn->state >= RXRPC_CONN_REMOTELY_ABORTED) {
+ +		_leave(" = -ECONNABORTED [%u]", conn->state);
+  		return -ECONNABORTED;
+ +	}
+  
+  	_enter("{%d},{%u,%%%u},", conn->debug_id, sp->hdr.type, sp->hdr.serial);
+  
+@@@ -324,22 -269,21 +324,38 @@@
+  		if (ret < 0)
+  			return ret;
+  
+++<<<<<<< HEAD
+ +		spin_lock(&conn->bundle->channel_lock);
+ +		spin_lock_bh(&conn->state_lock);
+ +
+ +		if (conn->state == RXRPC_CONN_SERVICE_CHALLENGING) {
+ +			conn->state = RXRPC_CONN_SERVICE;
+ +			spin_unlock_bh(&conn->state_lock);
+ +			for (loop = 0; loop < RXRPC_MAXCALLS; loop++)
+ +				rxrpc_call_is_secure(
+ +					rcu_dereference_protected(
+ +						conn->channels[loop].call,
+ +						lockdep_is_held(&conn->bundle->channel_lock)));
+ +		} else {
+ +			spin_unlock_bh(&conn->state_lock);
+ +		}
+- 
+- 		spin_unlock(&conn->bundle->channel_lock);
+++=======
++ 		spin_lock(&conn->state_lock);
++ 		if (conn->state == RXRPC_CONN_SERVICE_CHALLENGING)
++ 			conn->state = RXRPC_CONN_SERVICE;
++ 		spin_unlock(&conn->state_lock);
+++>>>>>>> 2953d3b8d8fd (rxrpc: Offload the completion of service conn security to the I/O thread)
++ 
++ 		if (conn->state == RXRPC_CONN_SERVICE) {
++ 			/* Offload call state flipping to the I/O thread.  As
++ 			 * we've already received the packet, put it on the
++ 			 * front of the queue.
++ 			 */
++ 			skb->mark = RXRPC_SKB_MARK_SERVICE_CONN_SECURED;
++ 			rxrpc_get_skb(skb, rxrpc_skb_get_conn_secured);
++ 			skb_queue_head(&conn->local->rx_queue, skb);
++ 			rxrpc_wake_up_io_thread(conn->local);
++ 		}
+  		return 0;
+  
+  	default:
+@@@ -472,14 -378,92 +488,99 @@@ void rxrpc_process_connection(struct wo
+  	struct rxrpc_connection *conn =
+  		container_of(work, struct rxrpc_connection, processor);
+  
+ -	rxrpc_see_connection(conn, rxrpc_conn_see_work);
+ +	rxrpc_see_connection(conn);
+  
+ -	if (__rxrpc_use_local(conn->local, rxrpc_local_use_conn_work)) {
+ +	if (__rxrpc_use_local(conn->params.local)) {
+  		rxrpc_do_process_connection(conn);
+ -		rxrpc_unuse_local(conn->local, rxrpc_local_unuse_conn_work);
+ +		rxrpc_unuse_local(conn->params.local);
+  	}
+++<<<<<<< HEAD
+ +
+ +	rxrpc_put_connection(conn);
+ +	_leave("");
+ +	return;
+++=======
++ }
++ 
++ /*
++  * post connection-level events to the connection
++  * - this includes challenges, responses, some aborts and call terminal packet
++  *   retransmission.
++  */
++ static void rxrpc_post_packet_to_conn(struct rxrpc_connection *conn,
++ 				      struct sk_buff *skb)
++ {
++ 	_enter("%p,%p", conn, skb);
++ 
++ 	rxrpc_get_skb(skb, rxrpc_skb_get_conn_work);
++ 	skb_queue_tail(&conn->rx_queue, skb);
++ 	rxrpc_queue_conn(conn, rxrpc_conn_queue_rx_work);
++ }
++ 
++ /*
++  * Input a connection-level packet.
++  */
++ bool rxrpc_input_conn_packet(struct rxrpc_connection *conn, struct sk_buff *skb)
++ {
++ 	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
++ 
++ 	switch (sp->hdr.type) {
++ 	case RXRPC_PACKET_TYPE_BUSY:
++ 		/* Just ignore BUSY packets for now. */
++ 		return true;
++ 
++ 	case RXRPC_PACKET_TYPE_ABORT:
++ 		if (rxrpc_is_conn_aborted(conn))
++ 			return true;
++ 		rxrpc_input_conn_abort(conn, skb);
++ 		rxrpc_abort_calls(conn);
++ 		return true;
++ 
++ 	case RXRPC_PACKET_TYPE_CHALLENGE:
++ 	case RXRPC_PACKET_TYPE_RESPONSE:
++ 		if (rxrpc_is_conn_aborted(conn)) {
++ 			if (conn->completion == RXRPC_CALL_LOCALLY_ABORTED)
++ 				rxrpc_send_conn_abort(conn);
++ 			return true;
++ 		}
++ 		rxrpc_post_packet_to_conn(conn, skb);
++ 		return true;
++ 
++ 	default:
++ 		WARN_ON_ONCE(1);
++ 		return true;
++ 	}
++ }
++ 
++ /*
++  * Input a connection event.
++  */
++ void rxrpc_input_conn_event(struct rxrpc_connection *conn, struct sk_buff *skb)
++ {
++ 	unsigned int loop;
++ 
++ 	if (test_and_clear_bit(RXRPC_CONN_EV_ABORT_CALLS, &conn->events))
++ 		rxrpc_abort_calls(conn);
++ 
++ 	switch (skb->mark) {
++ 	case RXRPC_SKB_MARK_SERVICE_CONN_SECURED:
++ 		if (conn->state != RXRPC_CONN_SERVICE)
++ 			break;
++ 
++ 		spin_lock(&conn->bundle->channel_lock);
++ 
++ 		for (loop = 0; loop < RXRPC_MAXCALLS; loop++)
++ 			rxrpc_call_is_secure(
++ 				rcu_dereference_protected(
++ 					conn->channels[loop].call,
++ 					lockdep_is_held(&conn->bundle->channel_lock)));
++ 
++ 		spin_unlock(&conn->bundle->channel_lock);
++ 		break;
++ 	}
++ 
++ 	/* Process delayed ACKs whose time has come. */
++ 	if (conn->flags & RXRPC_CONN_FINAL_ACK_MASK)
++ 		rxrpc_process_delayed_final_acks(conn, false);
+++>>>>>>> 2953d3b8d8fd (rxrpc: Offload the completion of service conn security to the I/O thread)
+  }
+* Unmerged path net/rxrpc/io_thread.c
+* Unmerged path include/trace/events/rxrpc.h
+* Unmerged path net/rxrpc/ar-internal.h
+* Unmerged path net/rxrpc/conn_event.c
+* Unmerged path net/rxrpc/io_thread.c
