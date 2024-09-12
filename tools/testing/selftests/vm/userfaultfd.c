@@ -821,7 +821,7 @@ static int faulting_process(int signal_test)
 	unsigned long split_nr_pages;
 	unsigned long lastnr;
 	struct sigaction act;
-	unsigned long signalled = 0;
+	volatile unsigned long signalled = 0;
 
 	if (test_type != TEST_HUGETLB)
 		split_nr_pages = (nr_pages + 1) / 2;
@@ -841,7 +841,7 @@ static int faulting_process(int signal_test)
 	}
 
 	for (nr = 0; nr < split_nr_pages; nr++) {
-		int steps = 1;
+		volatile int steps = 1;
 		unsigned long offset = nr * page_size;
 
 		if (signal_test) {
