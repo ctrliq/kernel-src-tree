@@ -1,0 +1,121 @@
+blk-mq: use quiesced elevator switch when reinitializing queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-535.el8
+commit-author Keith Busch <kbusch@kernel.org>
+commit 8237c01f1696bc53c470493bf1fe092a107648a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-535.el8/8237c01f.failed
+
+The hctx's run_work may be racing with the elevator switch when
+reinitializing hardware queues. The queue is merely frozen in this
+context, but that only prevents requests from allocating and doesn't
+stop the hctx work from running. The work may get an elevator pointer
+that's being torn down, and can result in use-after-free errors and
+kernel panics (example below). Use the quiesced elevator switch instead,
+and make the previous one static since it is now only used locally.
+
+  nvme nvme0: resetting controller
+  nvme nvme0: 32/0/0 default/read/poll queues
+  BUG: kernel NULL pointer dereference, address: 0000000000000008
+  #PF: supervisor read access in kernel mode
+  #PF: error_code(0x0000) - not-present page
+  PGD 80000020c8861067 P4D 80000020c8861067 PUD 250f8c8067 PMD 0
+  Oops: 0000 [#1] SMP PTI
+  Workqueue: kblockd blk_mq_run_work_fn
+  RIP: 0010:kyber_has_work+0x29/0x70
+
+...
+
+  Call Trace:
+   __blk_mq_do_dispatch_sched+0x83/0x2b0
+   __blk_mq_sched_dispatch_requests+0x12e/0x170
+   blk_mq_sched_dispatch_requests+0x30/0x60
+   __blk_mq_run_hw_queue+0x2b/0x50
+   process_one_work+0x1ef/0x380
+   worker_thread+0x2d/0x3e0
+
+	Signed-off-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20220927155652.3260724-1-kbusch@fb.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 8237c01f1696bc53c470493bf1fe092a107648a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk.h
+diff --cc block/blk.h
+index 7b134702b1d3,5350bf363035..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -201,10 -270,8 +201,15 @@@ void blk_account_io_done(struct reques
+  
+  void blk_insert_flush(struct request *rq);
+  
+++<<<<<<< HEAD
+ +void elevator_init_mq(struct request_queue *q);
+ +int elevator_switch_mq(struct request_queue *q,
+ +			      struct elevator_type *new_e);
+ +void __elevator_exit(struct request_queue *, struct elevator_queue *);
+++=======
++ int elevator_switch(struct request_queue *q, struct elevator_type *new_e);
++ void elevator_exit(struct request_queue *q);
+++>>>>>>> 8237c01f1696 (blk-mq: use quiesced elevator switch when reinitializing queues)
+  int elv_register_queue(struct request_queue *q, bool uevent);
+  void elv_unregister_queue(struct request_queue *q);
+  
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 4ccb2724b338..f995266a4832 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -3793,14 +3793,14 @@ static bool blk_mq_elv_switch_none(struct list_head *head,
+ 
+ 	mutex_lock(&q->sysfs_lock);
+ 	/*
+-	 * After elevator_switch_mq, the previous elevator_queue will be
++	 * After elevator_switch, the previous elevator_queue will be
+ 	 * released by elevator_release. The reference of the io scheduler
+ 	 * module get by elevator_get will also be put. So we need to get
+ 	 * a reference of the io scheduler module here to prevent it to be
+ 	 * removed.
+ 	 */
+ 	__module_get(qe->type->elevator_owner);
+-	elevator_switch_mq(q, NULL);
++	elevator_switch(q, NULL);
+ 	mutex_unlock(&q->sysfs_lock);
+ 
+ 	return true;
+@@ -3825,7 +3825,7 @@ static void blk_mq_elv_switch_back(struct list_head *head,
+ 	kfree(qe);
+ 
+ 	mutex_lock(&q->sysfs_lock);
+-	elevator_switch_mq(q, t);
++	elevator_switch(q, t);
+ 	mutex_unlock(&q->sysfs_lock);
+ }
+ 
+* Unmerged path block/blk.h
+diff --git a/block/elevator.c b/block/elevator.c
+index 644ddaf56be0..edc10f2abace 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -598,7 +598,7 @@ void elv_unregister(struct elevator_type *e)
+ }
+ EXPORT_SYMBOL_GPL(elv_unregister);
+ 
+-int elevator_switch_mq(struct request_queue *q,
++static int elevator_switch_mq(struct request_queue *q,
+ 			      struct elevator_type *new_e)
+ {
+ 	int ret;
+@@ -734,7 +734,7 @@ void elevator_init_mq(struct request_queue *q)
+  * need for the new one. this way we have a chance of going back to the old
+  * one, if the new one fails init for some reason.
+  */
+-static int elevator_switch(struct request_queue *q, struct elevator_type *new_e)
++int elevator_switch(struct request_queue *q, struct elevator_type *new_e)
+ {
+ 	int err;
+ 
