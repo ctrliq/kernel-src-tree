@@ -1,0 +1,287 @@
+cpufreq: Make cpufreq_unregister_driver() return void
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-506.el8
+commit-author Uwe Kleine-König <u.kleine-koenig@pengutronix.de>
+commit dd329e1e21b54c73f58a440b6164d04d8a7fc542
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-506.el8/dd329e1e.failed
+
+All but a few drivers ignore the return value of
+cpufreq_unregister_driver(). Those few that don't only call it after
+cpufreq_register_driver() succeeded, in which case the call doesn't
+fail.
+
+Make the function return no value and add a WARN_ON for the case that
+the function is called in an invalid situation (i.e. without a previous
+successful call to cpufreq_register_driver()).
+
+	Signed-off-by: Uwe Kleine-König <u.kleine-koenig@pengutronix.de>
+	Acked-by: Florian Fainelli <f.fainelli@gmail.com> # brcmstb-avs-cpufreq.c
+	Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Reviewed-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit dd329e1e21b54c73f58a440b6164d04d8a7fc542)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/amd-pstate.c
+#	drivers/cpufreq/brcmstb-avs-cpufreq.c
+#	drivers/cpufreq/mediatek-cpufreq-hw.c
+#	drivers/cpufreq/qcom-cpufreq-hw.c
+diff --cc drivers/cpufreq/amd-pstate.c
+index 40f383483c5b,70debd5a9f40..000000000000
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@@ -643,7 -764,142 +643,146 @@@ static ssize_t show_amd_pstate_highest_
+  
+  	perf = READ_ONCE(cpudata->highest_perf);
+  
+++<<<<<<< HEAD
+ +	return sprintf(&buf[0], "%u\n", perf);
+++=======
++ 	return sysfs_emit(buf, "%u\n", perf);
++ }
++ 
++ static ssize_t show_energy_performance_available_preferences(
++ 				struct cpufreq_policy *policy, char *buf)
++ {
++ 	int i = 0;
++ 	int offset = 0;
++ 
++ 	while (energy_perf_strings[i] != NULL)
++ 		offset += sysfs_emit_at(buf, offset, "%s ", energy_perf_strings[i++]);
++ 
++ 	sysfs_emit_at(buf, offset, "\n");
++ 
++ 	return offset;
++ }
++ 
++ static ssize_t store_energy_performance_preference(
++ 		struct cpufreq_policy *policy, const char *buf, size_t count)
++ {
++ 	struct amd_cpudata *cpudata = policy->driver_data;
++ 	char str_preference[21];
++ 	ssize_t ret;
++ 
++ 	ret = sscanf(buf, "%20s", str_preference);
++ 	if (ret != 1)
++ 		return -EINVAL;
++ 
++ 	ret = match_string(energy_perf_strings, -1, str_preference);
++ 	if (ret < 0)
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&amd_pstate_limits_lock);
++ 	ret = amd_pstate_set_energy_pref_index(cpudata, ret);
++ 	mutex_unlock(&amd_pstate_limits_lock);
++ 
++ 	return ret ?: count;
++ }
++ 
++ static ssize_t show_energy_performance_preference(
++ 				struct cpufreq_policy *policy, char *buf)
++ {
++ 	struct amd_cpudata *cpudata = policy->driver_data;
++ 	int preference;
++ 
++ 	preference = amd_pstate_get_energy_pref_index(cpudata);
++ 	if (preference < 0)
++ 		return preference;
++ 
++ 	return sysfs_emit(buf, "%s\n", energy_perf_strings[preference]);
++ }
++ 
++ static ssize_t amd_pstate_show_status(char *buf)
++ {
++ 	if (!current_pstate_driver)
++ 		return sysfs_emit(buf, "disable\n");
++ 
++ 	return sysfs_emit(buf, "%s\n", amd_pstate_mode_string[cppc_state]);
++ }
++ 
++ static void amd_pstate_driver_cleanup(void)
++ {
++ 	current_pstate_driver = NULL;
++ }
++ 
++ static int amd_pstate_update_status(const char *buf, size_t size)
++ {
++ 	int ret = 0;
++ 	int mode_idx;
++ 
++ 	if (size > 7 || size < 6)
++ 		return -EINVAL;
++ 	mode_idx = get_mode_idx_from_str(buf, size);
++ 
++ 	switch(mode_idx) {
++ 	case AMD_PSTATE_DISABLE:
++ 		if (!current_pstate_driver)
++ 			return -EINVAL;
++ 		if (cppc_state == AMD_PSTATE_ACTIVE)
++ 			return -EBUSY;
++ 		cpufreq_unregister_driver(current_pstate_driver);
++ 		amd_pstate_driver_cleanup();
++ 		break;
++ 	case AMD_PSTATE_PASSIVE:
++ 		if (current_pstate_driver) {
++ 			if (current_pstate_driver == &amd_pstate_driver)
++ 				return 0;
++ 			cpufreq_unregister_driver(current_pstate_driver);
++ 			cppc_state = AMD_PSTATE_PASSIVE;
++ 			current_pstate_driver = &amd_pstate_driver;
++ 		}
++ 
++ 		ret = cpufreq_register_driver(current_pstate_driver);
++ 		break;
++ 	case AMD_PSTATE_ACTIVE:
++ 		if (current_pstate_driver) {
++ 			if (current_pstate_driver == &amd_pstate_epp_driver)
++ 				return 0;
++ 			cpufreq_unregister_driver(current_pstate_driver);
++ 			current_pstate_driver = &amd_pstate_epp_driver;
++ 			cppc_state = AMD_PSTATE_ACTIVE;
++ 		}
++ 
++ 		ret = cpufreq_register_driver(current_pstate_driver);
++ 		break;
++ 	default:
++ 		ret = -EINVAL;
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static ssize_t show_status(struct kobject *kobj,
++ 			   struct kobj_attribute *attr, char *buf)
++ {
++ 	ssize_t ret;
++ 
++ 	mutex_lock(&amd_pstate_driver_lock);
++ 	ret = amd_pstate_show_status(buf);
++ 	mutex_unlock(&amd_pstate_driver_lock);
++ 
++ 	return ret;
++ }
++ 
++ static ssize_t store_status(struct kobject *a, struct kobj_attribute *b,
++ 			    const char *buf, size_t count)
++ {
++ 	char *p = memchr(buf, '\n', count);
++ 	int ret;
++ 
++ 	mutex_lock(&amd_pstate_driver_lock);
++ 	ret = amd_pstate_update_status(buf, p ? p - buf : count);
++ 	mutex_unlock(&amd_pstate_driver_lock);
++ 
++ 	return ret < 0 ? ret : count;
+++>>>>>>> dd329e1e21b5 (cpufreq: Make cpufreq_unregister_driver() return void)
+  }
+  
+  cpufreq_freq_attr_ro(amd_pstate_max_freq);
+diff --cc drivers/cpufreq/brcmstb-avs-cpufreq.c
+index b3076afe62ba,ffea6402189d..000000000000
+--- a/drivers/cpufreq/brcmstb-avs-cpufreq.c
++++ b/drivers/cpufreq/brcmstb-avs-cpufreq.c
+@@@ -708,16 -751,9 +708,20 @@@ static int brcm_avs_cpufreq_probe(struc
+  
+  static int brcm_avs_cpufreq_remove(struct platform_device *pdev)
+  {
+++<<<<<<< HEAD
+ +	struct private_data *priv;
+ +	int ret;
+ +
+ +	ret = cpufreq_unregister_driver(&brcm_avs_driver);
+ +	if (ret)
+ +		return ret;
+++=======
++ 	cpufreq_unregister_driver(&brcm_avs_driver);
+++>>>>>>> dd329e1e21b5 (cpufreq: Make cpufreq_unregister_driver() return void)
+  
+ -	brcm_avs_prepare_uninit(pdev);
+ +	priv = platform_get_drvdata(pdev);
+ +	iounmap(priv->base);
+ +	iounmap(priv->avs_intr_base);
+  
+  	return 0;
+  }
+* Unmerged path drivers/cpufreq/mediatek-cpufreq-hw.c
+* Unmerged path drivers/cpufreq/qcom-cpufreq-hw.c
+* Unmerged path drivers/cpufreq/amd-pstate.c
+* Unmerged path drivers/cpufreq/brcmstb-avs-cpufreq.c
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index f4fbe4bfec1f..47a90ab9f4d2 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -2845,12 +2845,12 @@ EXPORT_SYMBOL_GPL(cpufreq_register_driver);
+  * Returns zero if successful, and -EINVAL if the cpufreq_driver is
+  * currently not initialised.
+  */
+-int cpufreq_unregister_driver(struct cpufreq_driver *driver)
++void cpufreq_unregister_driver(struct cpufreq_driver *driver)
+ {
+ 	unsigned long flags;
+ 
+-	if (!cpufreq_driver || (driver != cpufreq_driver))
+-		return -EINVAL;
++	if (WARN_ON(!cpufreq_driver || (driver != cpufreq_driver)))
++		return;
+ 
+ 	pr_debug("unregistering driver %s\n", driver->name);
+ 
+@@ -2866,8 +2866,6 @@ int cpufreq_unregister_driver(struct cpufreq_driver *driver)
+ 
+ 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ 	cpus_read_unlock();
+-
+-	return 0;
+ }
+ EXPORT_SYMBOL_GPL(cpufreq_unregister_driver);
+ 
+diff --git a/drivers/cpufreq/davinci-cpufreq.c b/drivers/cpufreq/davinci-cpufreq.c
+index 1f52f2dd4f2f..25e50be36c5f 100644
+--- a/drivers/cpufreq/davinci-cpufreq.c
++++ b/drivers/cpufreq/davinci-cpufreq.c
+@@ -144,7 +144,9 @@ static int __exit davinci_cpufreq_remove(struct platform_device *pdev)
+ 	if (cpufreq.asyncclk)
+ 		clk_put(cpufreq.asyncclk);
+ 
+-	return cpufreq_unregister_driver(&davinci_driver);
++	cpufreq_unregister_driver(&davinci_driver);
++
++	return 0;
+ }
+ 
+ static struct platform_driver davinci_cpufreq_driver = {
+* Unmerged path drivers/cpufreq/mediatek-cpufreq-hw.c
+diff --git a/drivers/cpufreq/omap-cpufreq.c b/drivers/cpufreq/omap-cpufreq.c
+index 71e81bbf031b..9792f6ccd61c 100644
+--- a/drivers/cpufreq/omap-cpufreq.c
++++ b/drivers/cpufreq/omap-cpufreq.c
+@@ -190,7 +190,9 @@ static int omap_cpufreq_probe(struct platform_device *pdev)
+ 
+ static int omap_cpufreq_remove(struct platform_device *pdev)
+ {
+-	return cpufreq_unregister_driver(&omap_driver);
++	cpufreq_unregister_driver(&omap_driver);
++
++	return 0;
+ }
+ 
+ static struct platform_driver omap_cpufreq_platdrv = {
+* Unmerged path drivers/cpufreq/qcom-cpufreq-hw.c
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index 9bf76b2cd807..febb315f84d8 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -437,7 +437,7 @@ struct cpufreq_driver {
+ #define CPUFREQ_NEED_UPDATE_LIMITS		BIT(8)
+ 
+ int cpufreq_register_driver(struct cpufreq_driver *driver_data);
+-int cpufreq_unregister_driver(struct cpufreq_driver *driver_data);
++void cpufreq_unregister_driver(struct cpufreq_driver *driver_data);
+ 
+ bool cpufreq_driver_test_flags(u16 flags);
+ const char *cpufreq_get_current_driver(void);
