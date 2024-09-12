@@ -1,0 +1,369 @@
+mlxsw: spectrum_acl_tcam: Fix stack corruption
+
+jira LE-1907
+cve CVE-2024-26586
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Ido Schimmel <idosch@nvidia.com>
+commit 483ae90d8f976f8339cf81066312e1329f2d3706
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/483ae90d.failed
+
+When tc filters are first added to a net device, the corresponding local
+port gets bound to an ACL group in the device. The group contains a list
+of ACLs. In turn, each ACL points to a different TCAM region where the
+filters are stored. During forwarding, the ACLs are sequentially
+evaluated until a match is found.
+
+One reason to place filters in different regions is when they are added
+with decreasing priorities and in an alternating order so that two
+consecutive filters can never fit in the same region because of their
+key usage.
+
+In Spectrum-2 and newer ASICs the firmware started to report that the
+maximum number of ACLs in a group is more than 16, but the layout of the
+register that configures ACL groups (PAGT) was not updated to account
+for that. It is therefore possible to hit stack corruption [1] in the
+rare case where more than 16 ACLs in a group are required.
+
+Fix by limiting the maximum ACL group size to the minimum between what
+the firmware reports and the maximum ACLs that fit in the PAGT register.
+
+Add a test case to make sure the machine does not crash when this
+condition is hit.
+
+[1]
+Kernel panic - not syncing: stack-protector: Kernel stack is corrupted in: mlxsw_sp_acl_tcam_group_update+0x116/0x120
+[...]
+ dump_stack_lvl+0x36/0x50
+ panic+0x305/0x330
+ __stack_chk_fail+0x15/0x20
+ mlxsw_sp_acl_tcam_group_update+0x116/0x120
+ mlxsw_sp_acl_tcam_group_region_attach+0x69/0x110
+ mlxsw_sp_acl_tcam_vchunk_get+0x492/0xa20
+ mlxsw_sp_acl_tcam_ventry_add+0x25/0xe0
+ mlxsw_sp_acl_rule_add+0x47/0x240
+ mlxsw_sp_flower_replace+0x1a9/0x1d0
+ tc_setup_cb_add+0xdc/0x1c0
+ fl_hw_replace_filter+0x146/0x1f0
+ fl_change+0xc17/0x1360
+ tc_new_tfilter+0x472/0xb90
+ rtnetlink_rcv_msg+0x313/0x3b0
+ netlink_rcv_skb+0x58/0x100
+ netlink_unicast+0x244/0x390
+ netlink_sendmsg+0x1e4/0x440
+ ____sys_sendmsg+0x164/0x260
+ ___sys_sendmsg+0x9a/0xe0
+ __sys_sendmsg+0x7a/0xc0
+ do_syscall_64+0x40/0xe0
+ entry_SYSCALL_64_after_hwframe+0x63/0x6b
+
+Fixes: c3ab435466d5 ("mlxsw: spectrum: Extend to support Spectrum-2 ASIC")
+	Reported-by: Orel Hagag <orelh@nvidia.com>
+	Signed-off-by: Ido Schimmel <idosch@nvidia.com>
+	Reviewed-by: Amit Cohen <amcohen@nvidia.com>
+	Signed-off-by: Petr Machata <petrm@nvidia.com>
+	Acked-by: Paolo Abeni <pabeni@redhat.com>
+Link: https://lore.kernel.org/r/2d91c89afba59c22587b444994ae419dbea8d876.1705502064.git.petrm@nvidia.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 483ae90d8f976f8339cf81066312e1329f2d3706)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
+#	tools/testing/selftests/drivers/net/mlxsw/spectrum-2/tc_flower.sh
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
+index 81cf60bd57f0,50ea1eff02b2..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
+@@@ -1581,6 -1447,155 +1581,158 @@@ mlxsw_sp_acl_tcam_vregion_rehash(struc
+  		mlxsw_sp_acl_tcam_vregion_rehash_end(mlxsw_sp, vregion, ctx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ mlxsw_sp_acl_tcam_region_rehash_intrvl_get(struct devlink *devlink, u32 id,
++ 					   struct devlink_param_gset_ctx *ctx)
++ {
++ 	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
++ 	struct mlxsw_sp_acl_tcam *tcam;
++ 	struct mlxsw_sp *mlxsw_sp;
++ 
++ 	mlxsw_sp = mlxsw_core_driver_priv(mlxsw_core);
++ 	tcam = mlxsw_sp_acl_to_tcam(mlxsw_sp->acl);
++ 	ctx->val.vu32 = tcam->vregion_rehash_intrvl;
++ 
++ 	return 0;
++ }
++ 
++ static int
++ mlxsw_sp_acl_tcam_region_rehash_intrvl_set(struct devlink *devlink, u32 id,
++ 					   struct devlink_param_gset_ctx *ctx)
++ {
++ 	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
++ 	struct mlxsw_sp_acl_tcam_vregion *vregion;
++ 	struct mlxsw_sp_acl_tcam *tcam;
++ 	struct mlxsw_sp *mlxsw_sp;
++ 	u32 val = ctx->val.vu32;
++ 
++ 	if (val < MLXSW_SP_ACL_TCAM_VREGION_REHASH_INTRVL_MIN && val)
++ 		return -EINVAL;
++ 
++ 	mlxsw_sp = mlxsw_core_driver_priv(mlxsw_core);
++ 	tcam = mlxsw_sp_acl_to_tcam(mlxsw_sp->acl);
++ 	tcam->vregion_rehash_intrvl = val;
++ 	mutex_lock(&tcam->lock);
++ 	list_for_each_entry(vregion, &tcam->vregion_list, tlist) {
++ 		if (val)
++ 			mlxsw_core_schedule_dw(&vregion->rehash.dw, 0);
++ 		else
++ 			cancel_delayed_work_sync(&vregion->rehash.dw);
++ 	}
++ 	mutex_unlock(&tcam->lock);
++ 	return 0;
++ }
++ 
++ static const struct devlink_param mlxsw_sp_acl_tcam_rehash_params[] = {
++ 	DEVLINK_PARAM_DRIVER(MLXSW_DEVLINK_PARAM_ID_ACL_REGION_REHASH_INTERVAL,
++ 			     "acl_region_rehash_interval",
++ 			     DEVLINK_PARAM_TYPE_U32,
++ 			     BIT(DEVLINK_PARAM_CMODE_RUNTIME),
++ 			     mlxsw_sp_acl_tcam_region_rehash_intrvl_get,
++ 			     mlxsw_sp_acl_tcam_region_rehash_intrvl_set,
++ 			     NULL),
++ };
++ 
++ static int mlxsw_sp_acl_tcam_rehash_params_register(struct mlxsw_sp *mlxsw_sp)
++ {
++ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
++ 
++ 	if (!mlxsw_sp->acl_tcam_ops->region_rehash_hints_get)
++ 		return 0;
++ 
++ 	return devl_params_register(devlink, mlxsw_sp_acl_tcam_rehash_params,
++ 				    ARRAY_SIZE(mlxsw_sp_acl_tcam_rehash_params));
++ }
++ 
++ static void
++ mlxsw_sp_acl_tcam_rehash_params_unregister(struct mlxsw_sp *mlxsw_sp)
++ {
++ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
++ 
++ 	if (!mlxsw_sp->acl_tcam_ops->region_rehash_hints_get)
++ 		return;
++ 
++ 	devl_params_unregister(devlink, mlxsw_sp_acl_tcam_rehash_params,
++ 			       ARRAY_SIZE(mlxsw_sp_acl_tcam_rehash_params));
++ }
++ 
++ int mlxsw_sp_acl_tcam_init(struct mlxsw_sp *mlxsw_sp,
++ 			   struct mlxsw_sp_acl_tcam *tcam)
++ {
++ 	const struct mlxsw_sp_acl_tcam_ops *ops = mlxsw_sp->acl_tcam_ops;
++ 	u64 max_tcam_regions;
++ 	u64 max_regions;
++ 	u64 max_groups;
++ 	int err;
++ 
++ 	mutex_init(&tcam->lock);
++ 	tcam->vregion_rehash_intrvl =
++ 			MLXSW_SP_ACL_TCAM_VREGION_REHASH_INTRVL_DFLT;
++ 	INIT_LIST_HEAD(&tcam->vregion_list);
++ 
++ 	err = mlxsw_sp_acl_tcam_rehash_params_register(mlxsw_sp);
++ 	if (err)
++ 		goto err_rehash_params_register;
++ 
++ 	max_tcam_regions = MLXSW_CORE_RES_GET(mlxsw_sp->core,
++ 					      ACL_MAX_TCAM_REGIONS);
++ 	max_regions = MLXSW_CORE_RES_GET(mlxsw_sp->core, ACL_MAX_REGIONS);
++ 
++ 	/* Use 1:1 mapping between ACL region and TCAM region */
++ 	if (max_tcam_regions < max_regions)
++ 		max_regions = max_tcam_regions;
++ 
++ 	tcam->used_regions = bitmap_zalloc(max_regions, GFP_KERNEL);
++ 	if (!tcam->used_regions) {
++ 		err = -ENOMEM;
++ 		goto err_alloc_used_regions;
++ 	}
++ 	tcam->max_regions = max_regions;
++ 
++ 	max_groups = MLXSW_CORE_RES_GET(mlxsw_sp->core, ACL_MAX_GROUPS);
++ 	tcam->used_groups = bitmap_zalloc(max_groups, GFP_KERNEL);
++ 	if (!tcam->used_groups) {
++ 		err = -ENOMEM;
++ 		goto err_alloc_used_groups;
++ 	}
++ 	tcam->max_groups = max_groups;
++ 	tcam->max_group_size = MLXSW_CORE_RES_GET(mlxsw_sp->core,
++ 						  ACL_MAX_GROUP_SIZE);
++ 	tcam->max_group_size = min_t(unsigned int, tcam->max_group_size,
++ 				     MLXSW_REG_PAGT_ACL_MAX_NUM);
++ 
++ 	err = ops->init(mlxsw_sp, tcam->priv, tcam);
++ 	if (err)
++ 		goto err_tcam_init;
++ 
++ 	return 0;
++ 
++ err_tcam_init:
++ 	bitmap_free(tcam->used_groups);
++ err_alloc_used_groups:
++ 	bitmap_free(tcam->used_regions);
++ err_alloc_used_regions:
++ 	mlxsw_sp_acl_tcam_rehash_params_unregister(mlxsw_sp);
++ err_rehash_params_register:
++ 	mutex_destroy(&tcam->lock);
++ 	return err;
++ }
++ 
++ void mlxsw_sp_acl_tcam_fini(struct mlxsw_sp *mlxsw_sp,
++ 			    struct mlxsw_sp_acl_tcam *tcam)
++ {
++ 	const struct mlxsw_sp_acl_tcam_ops *ops = mlxsw_sp->acl_tcam_ops;
++ 
++ 	ops->fini(mlxsw_sp, tcam->priv);
++ 	bitmap_free(tcam->used_groups);
++ 	bitmap_free(tcam->used_regions);
++ 	mlxsw_sp_acl_tcam_rehash_params_unregister(mlxsw_sp);
++ 	mutex_destroy(&tcam->lock);
++ }
++ 
+++>>>>>>> 483ae90d8f97 (mlxsw: spectrum_acl_tcam: Fix stack corruption)
+  static const enum mlxsw_afk_element mlxsw_sp_acl_tcam_pattern_ipv4[] = {
+  	MLXSW_AFK_ELEMENT_SRC_SYS_PORT,
+  	MLXSW_AFK_ELEMENT_DMAC_32_47,
+diff --cc tools/testing/selftests/drivers/net/mlxsw/spectrum-2/tc_flower.sh
+index fb850e0ec837,616d3581419c..000000000000
+--- a/tools/testing/selftests/drivers/net/mlxsw/spectrum-2/tc_flower.sh
++++ b/tools/testing/selftests/drivers/net/mlxsw/spectrum-2/tc_flower.sh
+@@@ -10,7 -10,8 +10,12 @@@ lib_dir=$(dirname $0)/../../../../net/f
+  ALL_TESTS="single_mask_test identical_filters_test two_masks_test \
+  	multiple_masks_test ctcam_edge_cases_test delta_simple_test \
+  	delta_two_masks_one_key_test delta_simple_rehash_test \
+++<<<<<<< HEAD
+ +	bloom_simple_test bloom_complex_test bloom_delta_test"
+++=======
++ 	bloom_simple_test bloom_complex_test bloom_delta_test \
++ 	max_erp_entries_test max_group_size_test"
+++>>>>>>> 483ae90d8f97 (mlxsw: spectrum_acl_tcam: Fix stack corruption)
+  NUM_NETIFS=2
+  source $lib_dir/lib.sh
+  source $lib_dir/tc_common.sh
+@@@ -983,6 -984,109 +988,112 @@@ bloom_delta_test(
+  	log_test "bloom delta test ($tcflags)"
+  }
+  
+++<<<<<<< HEAD
+++=======
++ max_erp_entries_test()
++ {
++ 	# The number of eRP entries is limited. Once the maximum number of eRPs
++ 	# has been reached, filters cannot be added. This test verifies that
++ 	# when this limit is reached, inserstion fails without crashing.
++ 
++ 	RET=0
++ 
++ 	local num_masks=32
++ 	local num_regions=15
++ 	local chain_failed
++ 	local mask_failed
++ 	local ret
++ 
++ 	if [[ "$tcflags" != "skip_sw" ]]; then
++ 		return 0;
++ 	fi
++ 
++ 	for ((i=1; i < $num_regions; i++)); do
++ 		for ((j=$num_masks; j >= 0; j--)); do
++ 			tc filter add dev $h2 ingress chain $i protocol ip \
++ 				pref $i	handle $j flower $tcflags \
++ 				dst_ip 192.1.0.0/$j &> /dev/null
++ 			ret=$?
++ 
++ 			if [ $ret -ne 0 ]; then
++ 				chain_failed=$i
++ 				mask_failed=$j
++ 				break 2
++ 			fi
++ 		done
++ 	done
++ 
++ 	# We expect to exceed the maximum number of eRP entries, so that
++ 	# insertion eventually fails. Otherwise, the test should be adjusted to
++ 	# add more filters.
++ 	check_fail $ret "expected to exceed number of eRP entries"
++ 
++ 	for ((; i >= 1; i--)); do
++ 		for ((j=0; j <= $num_masks; j++)); do
++ 			tc filter del dev $h2 ingress chain $i protocol ip \
++ 				pref $i handle $j flower &> /dev/null
++ 		done
++ 	done
++ 
++ 	log_test "max eRP entries test ($tcflags). " \
++ 		"max chain $chain_failed, mask $mask_failed"
++ }
++ 
++ max_group_size_test()
++ {
++ 	# The number of ACLs in an ACL group is limited. Once the maximum
++ 	# number of ACLs has been reached, filters cannot be added. This test
++ 	# verifies that when this limit is reached, insertion fails without
++ 	# crashing.
++ 
++ 	RET=0
++ 
++ 	local num_acls=32
++ 	local max_size
++ 	local ret
++ 
++ 	if [[ "$tcflags" != "skip_sw" ]]; then
++ 		return 0;
++ 	fi
++ 
++ 	for ((i=1; i < $num_acls; i++)); do
++ 		if [[ $(( i % 2 )) == 1 ]]; then
++ 			tc filter add dev $h2 ingress pref $i proto ipv4 \
++ 				flower $tcflags dst_ip 198.51.100.1/32 \
++ 				ip_proto tcp tcp_flags 0x01/0x01 \
++ 				action drop &> /dev/null
++ 		else
++ 			tc filter add dev $h2 ingress pref $i proto ipv6 \
++ 				flower $tcflags dst_ip 2001:db8:1::1/128 \
++ 				action drop &> /dev/null
++ 		fi
++ 
++ 		ret=$?
++ 		[[ $ret -ne 0 ]] && max_size=$((i - 1)) && break
++ 	done
++ 
++ 	# We expect to exceed the maximum number of ACLs in a group, so that
++ 	# insertion eventually fails. Otherwise, the test should be adjusted to
++ 	# add more filters.
++ 	check_fail $ret "expected to exceed number of ACLs in a group"
++ 
++ 	for ((; i >= 1; i--)); do
++ 		if [[ $(( i % 2 )) == 1 ]]; then
++ 			tc filter del dev $h2 ingress pref $i proto ipv4 \
++ 				flower $tcflags dst_ip 198.51.100.1/32 \
++ 				ip_proto tcp tcp_flags 0x01/0x01 \
++ 				action drop &> /dev/null
++ 		else
++ 			tc filter del dev $h2 ingress pref $i proto ipv6 \
++ 				flower $tcflags dst_ip 2001:db8:1::1/128 \
++ 				action drop &> /dev/null
++ 		fi
++ 	done
++ 
++ 	log_test "max ACL group size test ($tcflags). max size $max_size"
++ }
++ 
+++>>>>>>> 483ae90d8f97 (mlxsw: spectrum_acl_tcam: Fix stack corruption)
+  setup_prepare()
+  {
+  	h1=${NETIFS[p1]}
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_tcam.c
+* Unmerged path tools/testing/selftests/drivers/net/mlxsw/spectrum-2/tc_flower.sh
