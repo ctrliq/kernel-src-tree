@@ -1,0 +1,172 @@
+x86/boot: Derive file size from _edata symbol
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit aeb92067f6ae994b541d7f9752fe54ed3d108bcc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/aeb92067.failed
+
+Tweak the linker script so that the value of _edata represents the
+decompressor binary's file size rounded up to the appropriate alignment.
+This removes the need to calculate it in the build tool, and will make
+it easier to refer to the file size from the header directly in
+subsequent changes to the PE header layout.
+
+While adding _edata to the sed regex that parses the compressed
+vmlinux's symbol list, tweak the regex a bit for conciseness.
+
+This change has no impact on the resulting bzImage binary when
+configured with CONFIG_EFI_STUB=y.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20230915171623.655440-14-ardb@google.com
+(cherry picked from commit aeb92067f6ae994b541d7f9752fe54ed3d108bcc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/Makefile
+#	arch/x86/boot/tools/build.c
+diff --cc arch/x86/boot/Makefile
+index e47ccf98cfb0,cc04917b1ac6..000000000000
+--- a/arch/x86/boot/Makefile
++++ b/arch/x86/boot/Makefile
+@@@ -89,7 -89,7 +89,11 @@@ $(obj)/vmlinux.bin: $(obj)/compressed/v
+  
+  SETUP_OBJS = $(addprefix $(obj)/,$(setup-y))
+  
+++<<<<<<< HEAD
+ +sed-zoffset := -e 's/^\([0-9a-fA-F]*\) [ABCDGRSTVW] \(startup_32\|startup_64\|efi32_stub_entry\|efi64_stub_entry\|efi_pe_entry\|input_data\|_end\|_ehead\|_text\|z_.*\)$$/\#define ZO_\2 0x\1/p'
+++=======
++ sed-zoffset := -e 's/^\([0-9a-fA-F]*\) [a-zA-Z] \(startup_32\|efi.._stub_entry\|efi\(32\)\?_pe_entry\|input_data\|kernel_info\|_end\|_ehead\|_text\|_edata\|z_.*\)$$/\#define ZO_\2 0x\1/p'
+++>>>>>>> aeb92067f6ae (x86/boot: Derive file size from _edata symbol)
+  
+  quiet_cmd_zoffset = ZOFFSET $@
+        cmd_zoffset = $(NM) $< | sed -n $(sed-zoffset) > $@
+diff --cc arch/x86/boot/tools/build.c
+index db1a6f7dea68,e792c6c5a634..000000000000
+--- a/arch/x86/boot/tools/build.c
++++ b/arch/x86/boot/tools/build.c
+@@@ -48,13 -48,12 +48,20 @@@ typedef unsigned int   u32
+  u8 buf[SETUP_SECT_MAX*512];
+  
+  #define PECOFF_RELOC_RESERVE 0x20
+ -#define PECOFF_COMPAT_RESERVE 0x20
+  
+++<<<<<<< HEAD
+ +unsigned long efi32_stub_entry;
+ +unsigned long efi64_stub_entry;
+ +unsigned long efi_pe_entry;
+ +unsigned long startup_64;
+ +unsigned long _ehead;
+ +unsigned long _end;
+++=======
++ static unsigned long efi_pe_entry;
++ static unsigned long efi32_pe_entry;
++ static unsigned long _edata;
++ static unsigned long _end;
+++>>>>>>> aeb92067f6ae (x86/boot: Derive file size from _edata symbol)
+  
+  /*----------------------------------------------------------------------*/
+  
+@@@ -305,11 -307,9 +312,16 @@@ static void parse_zoffset(char *fname
+  	p = (char *)buf;
+  
+  	while (p && *p) {
+ +		PARSE_ZOFS(p, efi32_stub_entry);
+ +		PARSE_ZOFS(p, efi64_stub_entry);
+  		PARSE_ZOFS(p, efi_pe_entry);
+++<<<<<<< HEAD
+ +		PARSE_ZOFS(p, startup_64);
+ +		PARSE_ZOFS(p, _ehead);
+++=======
++ 		PARSE_ZOFS(p, efi32_pe_entry);
++ 		PARSE_ZOFS(p, _edata);
+++>>>>>>> aeb92067f6ae (x86/boot: Derive file size from _edata symbol)
+  		PARSE_ZOFS(p, _end);
+  
+  		p = strchr(p, '\n');
+@@@ -320,9 -320,8 +332,8 @@@
+  
+  int main(int argc, char ** argv)
+  {
+ -	unsigned int i, sz, setup_sectors;
+ +	unsigned int i, sz, setup_sectors, init_sz;
+  	int c;
+- 	u32 sys_size;
+  	struct stat sb;
+  	FILE *file, *dest;
+  	int fd;
+@@@ -373,37 -376,8 +387,41 @@@
+  	kernel = mmap(NULL, sz, PROT_READ, MAP_SHARED, fd, 0);
+  	if (kernel == MAP_FAILED)
+  		die("Unable to mmap '%s': %m", argv[2]);
+++<<<<<<< HEAD
+ +	/* Number of 16-byte paragraphs, including space for a 4-byte CRC */
+ +	sys_size = (sz + 15 + 4) / 16;
+ +
+ +	/* Patch the setup code with the appropriate size parameters */
+ +	buf[0x1f1] = setup_sectors-1;
+ +	put_unaligned_le32(sys_size, &buf[0x1f4]);
+ +
+ +	init_sz = get_unaligned_le32(&buf[0x260]);
+ +#ifdef CONFIG_EFI_STUB
+ +	/*
+ +	 * The decompression buffer will start at ImageBase. When relocating
+ +	 * the compressed kernel to its end, we must ensure that the head
+ +	 * section does not get overwritten.  The head section occupies
+ +	 * [i, i + _ehead), and the destination is [init_sz - _end, init_sz).
+ +	 *
+ +	 * At present these should never overlap, because 'i' is at most 32k
+ +	 * because of SETUP_SECT_MAX, '_ehead' is less than 1k, and the
+ +	 * calculation of INIT_SIZE in boot/header.S ensures that
+ +	 * 'init_sz - _end' is at least 64k.
+ +	 *
+ +	 * For future-proofing, increase init_sz if necessary.
+ +	 */
+++=======
++ 	update_pecoff_text(setup_sectors * 512, i + _edata);
+++>>>>>>> aeb92067f6ae (x86/boot: Derive file size from _edata symbol)
+ +
+ +	if (init_sz - _end < i + _ehead) {
+ +		init_sz = (i + _ehead + _end + 4095) & ~4095;
+ +		put_unaligned_le32(init_sz, &buf[0x260]);
+ +	}
+ +#endif
+ +	update_pecoff_text(setup_sectors * 512, i + (sys_size * 16), init_sz);
+  
+ +	efi_stub_entry_update();
+  
+  	crc = partial_crc32(buf, i, crc);
+  	if (fwrite(buf, 1, i, dest) != i)
+* Unmerged path arch/x86/boot/Makefile
+diff --git a/arch/x86/boot/compressed/vmlinux.lds.S b/arch/x86/boot/compressed/vmlinux.lds.S
+index 3a8b5cacac6f..c68a69c29416 100644
+--- a/arch/x86/boot/compressed/vmlinux.lds.S
++++ b/arch/x86/boot/compressed/vmlinux.lds.S
+@@ -53,6 +53,9 @@ SECTIONS
+ 		_data = . ;
+ 		*(.data)
+ 		*(.data.*)
++
++		/* Add 4 bytes of extra space for a CRC-32 checksum */
++		. = ALIGN(. + 4, 0x20);
+ 		_edata = . ;
+ 	}
+ 	. = ALIGN(L1_CACHE_BYTES);
+diff --git a/arch/x86/boot/header.S b/arch/x86/boot/header.S
+index 941d1e9413b4..edc114d5a828 100644
+--- a/arch/x86/boot/header.S
++++ b/arch/x86/boot/header.S
+@@ -263,7 +263,7 @@ sentinel:	.byte 0xff, 0xff        /* Used to detect broken loaders */
+ hdr:
+ setup_sects:	.byte 0			/* Filled in by build.c */
+ root_flags:	.word ROOT_RDONLY
+-syssize:	.long 0			/* Filled in by build.c */
++syssize:	.long ZO__edata / 16
+ ram_size:	.word 0			/* Obsolete */
+ vid_mode:	.word SVGA_MODE
+ root_dev:	.word 0			/* Default to major/minor 0/0 */
+* Unmerged path arch/x86/boot/tools/build.c
