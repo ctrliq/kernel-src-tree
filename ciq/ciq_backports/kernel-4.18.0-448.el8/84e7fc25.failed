@@ -1,0 +1,142 @@
+sfc: attach/detach EF100 representors along with their owning PF
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Edward Cree <ecree.xilinx@gmail.com>
+commit 84e7fc2591f72987b43da91b3fdb01a196204379
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/84e7fc25.failed
+
+Since representors piggy-back on the PF's queues for TX, they can
+ only accept new TXes while the PF is up.  Thus, any operation which
+ detaches the PF must first detach all its VFreps.
+
+	Signed-off-by: Edward Cree <ecree.xilinx@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 84e7fc2591f72987b43da91b3fdb01a196204379)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ef100_rep.c
+* Unmerged path drivers/net/ethernet/sfc/ef100_rep.c
+diff --git a/drivers/net/ethernet/sfc/ef100_netdev.c b/drivers/net/ethernet/sfc/ef100_netdev.c
+index 7a80979f4ab7..ff4ddf0c5b34 100644
+--- a/drivers/net/ethernet/sfc/ef100_netdev.c
++++ b/drivers/net/ethernet/sfc/ef100_netdev.c
+@@ -84,6 +84,7 @@ static int ef100_net_stop(struct net_device *net_dev)
+ 	netif_dbg(efx, ifdown, efx->net_dev, "closing on CPU %d\n",
+ 		  raw_smp_processor_id());
+ 
++	efx_detach_reps(efx);
+ 	netif_stop_queue(net_dev);
+ 	efx_stop_all(efx);
+ 	efx_mcdi_mac_fini_stats(efx);
+@@ -175,6 +176,8 @@ static int ef100_net_open(struct net_device *net_dev)
+ 	mutex_unlock(&efx->mac_lock);
+ 
+ 	efx->state = STATE_NET_UP;
++	if (netif_running(efx->net_dev))
++		efx_attach_reps(efx);
+ 
+ 	return 0;
+ 
+* Unmerged path drivers/net/ethernet/sfc/ef100_rep.c
+diff --git a/drivers/net/ethernet/sfc/efx.h b/drivers/net/ethernet/sfc/efx.h
+index c05a83da9e44..4239c7ece123 100644
+--- a/drivers/net/ethernet/sfc/efx.h
++++ b/drivers/net/ethernet/sfc/efx.h
+@@ -12,6 +12,7 @@
+ #include "net_driver.h"
+ #include "ef100_rx.h"
+ #include "ef100_tx.h"
++#include "efx_common.h"
+ #include "filter.h"
+ 
+ int efx_net_open(struct net_device *net_dev);
+@@ -206,6 +207,9 @@ static inline void efx_device_detach_sync(struct efx_nic *efx)
+ {
+ 	struct net_device *dev = efx->net_dev;
+ 
++	/* We must stop reps (which use our TX) before we stop ourselves. */
++	efx_detach_reps(efx);
++
+ 	/* Lock/freeze all TX queues so that we can be sure the
+ 	 * TX scheduler is stopped when we're done and before
+ 	 * netif_device_present() becomes false.
+@@ -217,8 +221,11 @@ static inline void efx_device_detach_sync(struct efx_nic *efx)
+ 
+ static inline void efx_device_attach_if_not_resetting(struct efx_nic *efx)
+ {
+-	if ((efx->state != STATE_DISABLED) && !efx->reset_pending)
++	if ((efx->state != STATE_DISABLED) && !efx->reset_pending) {
+ 		netif_device_attach(efx->net_dev);
++		if (efx->state == STATE_NET_UP)
++			efx_attach_reps(efx);
++	}
+ }
+ 
+ static inline bool efx_rwsem_assert_write_locked(struct rw_semaphore *sem)
+diff --git a/drivers/net/ethernet/sfc/efx_common.c b/drivers/net/ethernet/sfc/efx_common.c
+index c4c1b2763d85..2dbfe132a63f 100644
+--- a/drivers/net/ethernet/sfc/efx_common.c
++++ b/drivers/net/ethernet/sfc/efx_common.c
+@@ -23,6 +23,7 @@
+ #include "mcdi_port_common.h"
+ #include "io.h"
+ #include "mcdi_pcol.h"
++#include "ef100_rep.h"
+ 
+ static unsigned int debug = (NETIF_MSG_DRV | NETIF_MSG_PROBE |
+ 			     NETIF_MSG_LINK | NETIF_MSG_IFDOWN |
+@@ -1392,3 +1393,38 @@ int efx_get_phys_port_name(struct net_device *net_dev, char *name, size_t len)
+ 		return -EINVAL;
+ 	return 0;
+ }
++
++void efx_detach_reps(struct efx_nic *efx)
++{
++	struct net_device *rep_dev;
++	struct efx_rep *efv;
++
++	ASSERT_RTNL();
++	netif_dbg(efx, drv, efx->net_dev, "Detaching VF representors\n");
++	list_for_each_entry(efv, &efx->vf_reps, list) {
++		rep_dev = efv->net_dev;
++		if (!rep_dev)
++			continue;
++		netif_carrier_off(rep_dev);
++		/* See efx_device_detach_sync() */
++		netif_tx_lock_bh(rep_dev);
++		netif_tx_stop_all_queues(rep_dev);
++		netif_tx_unlock_bh(rep_dev);
++	}
++}
++
++void efx_attach_reps(struct efx_nic *efx)
++{
++	struct net_device *rep_dev;
++	struct efx_rep *efv;
++
++	ASSERT_RTNL();
++	netif_dbg(efx, drv, efx->net_dev, "Attaching VF representors\n");
++	list_for_each_entry(efv, &efx->vf_reps, list) {
++		rep_dev = efv->net_dev;
++		if (!rep_dev)
++			continue;
++		netif_tx_wake_all_queues(rep_dev);
++		netif_carrier_on(rep_dev);
++	}
++}
+diff --git a/drivers/net/ethernet/sfc/efx_common.h b/drivers/net/ethernet/sfc/efx_common.h
+index 93babc1a2678..2c54dac3e662 100644
+--- a/drivers/net/ethernet/sfc/efx_common.h
++++ b/drivers/net/ethernet/sfc/efx_common.h
+@@ -111,4 +111,7 @@ int efx_get_phys_port_id(struct net_device *net_dev,
+ 
+ int efx_get_phys_port_name(struct net_device *net_dev,
+ 			   char *name, size_t len);
++
++void efx_detach_reps(struct efx_nic *efx);
++void efx_attach_reps(struct efx_nic *efx);
+ #endif
