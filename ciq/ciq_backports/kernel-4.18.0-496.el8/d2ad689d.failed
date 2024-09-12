@@ -1,0 +1,90 @@
+net/sched: taprio: calculate budgets per traffic class
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit d2ad689dec10d4f61647f6963e2c94113049ed6c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/d2ad689d.failed
+
+Currently taprio assumes that the budget for a traffic class expires at
+the end of the current interval as if the next interval contains a "gate
+close" event for this traffic class.
+
+This is, however, an unfounded assumption. Allow schedule entry
+intervals to be fused together for a particular traffic class by
+calculating the budget until the gate *actually* closes.
+
+This means we need to keep budgets per traffic class, and we also need
+to update the budget consumption procedure.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Reviewed-by: Kurt Kanzenbach <kurt@linutronix.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d2ad689dec10d4f61647f6963e2c94113049ed6c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_taprio.c
+diff --cc net/sched/sch_taprio.c
+index f060d7e1bd80,08099c1747cc..000000000000
+--- a/net/sched/sch_taprio.c
++++ b/net/sched/sch_taprio.c
+@@@ -554,11 -563,48 +554,54 @@@ static struct sk_buff *taprio_peek(stru
+  	return NULL;
+  }
+  
+- static void taprio_set_budget(struct taprio_sched *q, struct sched_entry *entry)
++ static void taprio_set_budgets(struct taprio_sched *q,
++ 			       struct sched_gate_list *sched,
++ 			       struct sched_entry *entry)
+  {
+++<<<<<<< HEAD
+ +	atomic_set(&entry->budget,
+ +		   div64_u64((u64)entry->interval * 1000,
+ +			     atomic64_read(&q->picos_per_byte)));
+++=======
++ 	struct net_device *dev = qdisc_dev(q->root);
++ 	int num_tc = netdev_get_num_tc(dev);
++ 	int tc, budget;
++ 
++ 	for (tc = 0; tc < num_tc; tc++) {
++ 		/* Traffic classes which never close have infinite budget */
++ 		if (entry->gate_duration[tc] == sched->cycle_time)
++ 			budget = INT_MAX;
++ 		else
++ 			budget = div64_u64((u64)entry->gate_duration[tc] * PSEC_PER_NSEC,
++ 					   atomic64_read(&q->picos_per_byte));
++ 
++ 		atomic_set(&entry->budget[tc], budget);
++ 	}
++ }
++ 
++ /* When an skb is sent, it consumes from the budget of all traffic classes */
++ static int taprio_update_budgets(struct sched_entry *entry, size_t len,
++ 				 int tc_consumed, int num_tc)
++ {
++ 	int tc, budget, new_budget = 0;
++ 
++ 	for (tc = 0; tc < num_tc; tc++) {
++ 		budget = atomic_read(&entry->budget[tc]);
++ 		/* Don't consume from infinite budget */
++ 		if (budget == INT_MAX) {
++ 			if (tc == tc_consumed)
++ 				new_budget = budget;
++ 			continue;
++ 		}
++ 
++ 		if (tc == tc_consumed)
++ 			new_budget = atomic_sub_return(len, &entry->budget[tc]);
++ 		else
++ 			atomic_sub(len, &entry->budget[tc]);
++ 	}
++ 
++ 	return new_budget;
+++>>>>>>> d2ad689dec10 (net/sched: taprio: calculate budgets per traffic class)
+  }
+  
+  static struct sk_buff *taprio_dequeue_from_txq(struct Qdisc *sch, int txq,
+* Unmerged path net/sched/sch_taprio.c
