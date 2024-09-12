@@ -1,0 +1,136 @@
+x86/speculation: Fill RSB on vmexit for IBRS
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Josh Poimboeuf <jpoimboe@kernel.org>
+commit 9756bba28470722dacb79ffce554336dd1f6a6cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/9756bba2.failed
+
+Prevent RSB underflow/poisoning attacks with RSB.  While at it, add a
+bunch of comments to attempt to document the current state of tribal
+knowledge about RSB attacks and what exactly is being mitigated.
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@kernel.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit 9756bba28470722dacb79ffce554336dd1f6a6cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpufeatures.h
+#	arch/x86/kernel/cpu/bugs.c
+#	arch/x86/kvm/vmx/vmenter.S
+diff --cc arch/x86/include/asm/cpufeatures.h
+index 48e29f583729,d143f018eda1..000000000000
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@@ -200,10 -201,10 +200,15 @@@
+  #define X86_FEATURE_INVPCID_SINGLE	( 7*32+ 7) /* Effectively INVPCID && CR4.PCIDE=1 */
+  #define X86_FEATURE_HW_PSTATE		( 7*32+ 8) /* AMD HW-PState */
+  #define X86_FEATURE_PROC_FEEDBACK	( 7*32+ 9) /* AMD ProcFeedbackInterface */
+ -#define X86_FEATURE_XCOMPACTED		( 7*32+10) /* "" Use compacted XSTATE (XSAVES or XSAVEC) */
+ +/* FREE!                                ( 7*32+10) */
+  #define X86_FEATURE_PTI			( 7*32+11) /* Kernel Page Table Isolation enabled */
+++<<<<<<< HEAD
+ +/* FREE!				( 7*32+12) */
+ +/* FREE!				( 7*32+13) */
+++=======
++ #define X86_FEATURE_KERNEL_IBRS		( 7*32+12) /* "" Set/clear IBRS on kernel entry/exit */
++ #define X86_FEATURE_RSB_VMEXIT		( 7*32+13) /* "" Fill RSB on VM-Exit */
+++>>>>>>> 9756bba28470 (x86/speculation: Fill RSB on vmexit for IBRS)
+  #define X86_FEATURE_INTEL_PPIN		( 7*32+14) /* Intel Processor Inventory Number */
+  #define X86_FEATURE_CDP_L2		( 7*32+15) /* Code and Data Prioritization L2 */
+  #define X86_FEATURE_MSR_SPEC_CTRL	( 7*32+16) /* "" MSR SPEC_CTRL is implemented */
+diff --cc arch/x86/kernel/cpu/bugs.c
+index ff842ff87312,fcbd072a5e36..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -1217,10 -1442,33 +1247,40 @@@ static void __init spectre_v2_select_mi
+  	pr_info("Spectre v2 / SpectreRSB mitigation: Filling RSB on context switch\n");
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * Retpoline means the kernel is safe because it has no indirect
+ +	 * branches. Enhanced IBRS protects firmware too, so, enable restricted
+ +	 * speculation around firmware calls only when Enhanced IBRS isn't
+ +	 * supported or kernel IBRS isn't enabled.
+++=======
++ 	 * Similar to context switches, there are two types of RSB attacks
++ 	 * after vmexit:
++ 	 *
++ 	 * 1) RSB underflow
++ 	 *
++ 	 * 2) Poisoned RSB entry
++ 	 *
++ 	 * When retpoline is enabled, both are mitigated by filling/clearing
++ 	 * the RSB.
++ 	 *
++ 	 * When IBRS is enabled, while #1 would be mitigated by the IBRS branch
++ 	 * prediction isolation protections, RSB still needs to be cleared
++ 	 * because of #2.  Note that SMEP provides no protection here, unlike
++ 	 * user-space-poisoned RSB entries.
++ 	 *
++ 	 * eIBRS, on the other hand, has RSB-poisoning protections, so it
++ 	 * doesn't need RSB clearing after vmexit.
++ 	 */
++ 	if (boot_cpu_has(X86_FEATURE_RETPOLINE) ||
++ 	    boot_cpu_has(X86_FEATURE_KERNEL_IBRS))
++ 		setup_force_cpu_cap(X86_FEATURE_RSB_VMEXIT);
++ 
++ 	/*
++ 	 * Retpoline protects the kernel, but doesn't protect firmware.  IBRS
++ 	 * and Enhanced IBRS protect firmware too, so enable IBRS around
++ 	 * firmware calls only when IBRS / Enhanced IBRS aren't otherwise
++ 	 * enabled.
+++>>>>>>> 9756bba28470 (x86/speculation: Fill RSB on vmexit for IBRS)
+  	 *
+  	 * Use "mode" to check Enhanced IBRS instead of boot_cpu_has(), because
+  	 * the user might select retpoline on the kernel command line and if
+diff --cc arch/x86/kvm/vmx/vmenter.S
+index fd0a4aadb374,4c743fa98a1f..000000000000
+--- a/arch/x86/kvm/vmx/vmenter.S
++++ b/arch/x86/kvm/vmx/vmenter.S
+@@@ -216,8 -189,30 +216,34 @@@ SYM_FUNC_START(__vmx_vcpu_run
+  
+  	/* "POP" @regs. */
+  	add $WORD_SIZE, %_ASM_SP
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * IMPORTANT: RSB filling and SPEC_CTRL handling must be done before
++ 	 * the first unbalanced RET after vmexit!
++ 	 *
++ 	 * For retpoline or IBRS, RSB filling is needed to prevent poisoned RSB
++ 	 * entries and (in some cases) RSB underflow.
++ 	 *
++ 	 * eIBRS has its own protection against poisoned RSB, so it doesn't
++ 	 * need the RSB filling sequence.  But it does need to be enabled
++ 	 * before the first unbalanced RET.
++          */
++ 
++ 	FILL_RETURN_BUFFER %_ASM_CX, RSB_CLEAR_LOOPS, X86_FEATURE_RSB_VMEXIT
++ 
++ 	pop %_ASM_ARG2	/* @flags */
++ 	pop %_ASM_ARG1	/* @vmx */
++ 
++ 	call vmx_spec_ctrl_restore_host
++ 
++ 	/* Put return value in AX */
++ 	mov %_ASM_BX, %_ASM_AX
++ 
+++>>>>>>> 9756bba28470 (x86/speculation: Fill RSB on vmexit for IBRS)
+  	pop %_ASM_BX
+ +
+  #ifdef CONFIG_X86_64
+  	pop %r12
+  	pop %r13
+* Unmerged path arch/x86/include/asm/cpufeatures.h
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+* Unmerged path arch/x86/kvm/vmx/vmenter.S
