@@ -108,7 +108,7 @@ static int broadwell_rt286_hw_params(struct snd_pcm_substream *substream,
 		SND_SOC_CLOCK_IN);
 
 	if (ret < 0) {
-		dev_err(rtd->dev, "can't set codec sysclk configuration\n");
+		dev_err(rtd->dev, "set codec sysclk failed: %d\n", ret);
 		return ret;
 	}
 
