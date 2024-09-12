@@ -1,0 +1,181 @@
+netfilter: nf_tables: reject table flag and netdev basechain updates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-427.33.1.el9_4
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 1e1fb6f00f52812277963365d9bd835b9b0ea4e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.33.1.el9_4/1e1fb6f0.failed
+
+netdev basechain updates are stored in the transaction object hook list.
+When setting on the table dormant flag, it iterates over the existing
+hooks in the basechain. Thus, skipping the hooks that are being
+added/deleted in this transaction, which leaves hook registration in
+inconsistent state.
+
+Reject table flag updates in combination with netdev basechain updates
+in the same batch:
+
+- Update table flags and add/delete basechain: Check from basechain update
+  path if there are pending flag updates for this table.
+- add/delete basechain and update table flags: Iterate over the transaction
+  list to search for basechain updates from the table update path.
+
+In both cases, the batch is rejected. Based on suggestion from Florian Westphal.
+
+Fixes: b9703ed44ffb ("netfilter: nf_tables: support for adding new devices to an existing netdev chain")
+Fixes: 7d937b107108f ("netfilter: nf_tables: support for deleting devices in an existing netdev chain")
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 1e1fb6f00f52812277963365d9bd835b9b0ea4e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+diff --cc net/netfilter/nf_tables_api.c
+index e60b4ceb3116,086d85fffeb1..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -1136,9 -1195,30 +1136,28 @@@ static void nf_tables_table_disable(str
+  #define __NFT_TABLE_F_INTERNAL		(NFT_TABLE_F_MASK + 1)
+  #define __NFT_TABLE_F_WAS_DORMANT	(__NFT_TABLE_F_INTERNAL << 0)
+  #define __NFT_TABLE_F_WAS_AWAKEN	(__NFT_TABLE_F_INTERNAL << 1)
+ -#define __NFT_TABLE_F_WAS_ORPHAN	(__NFT_TABLE_F_INTERNAL << 2)
+  #define __NFT_TABLE_F_UPDATE		(__NFT_TABLE_F_WAS_DORMANT | \
+ -					 __NFT_TABLE_F_WAS_AWAKEN | \
+ -					 __NFT_TABLE_F_WAS_ORPHAN)
+ +					 __NFT_TABLE_F_WAS_AWAKEN)
+  
++ static bool nft_table_pending_update(const struct nft_ctx *ctx)
++ {
++ 	struct nftables_pernet *nft_net = nft_pernet(ctx->net);
++ 	struct nft_trans *trans;
++ 
++ 	if (ctx->table->flags & __NFT_TABLE_F_UPDATE)
++ 		return true;
++ 
++ 	list_for_each_entry(trans, &nft_net->commit_list, list) {
++ 		if ((trans->msg_type == NFT_MSG_NEWCHAIN ||
++ 		     trans->msg_type == NFT_MSG_DELCHAIN) &&
++ 		    trans->ctx.table == ctx->table &&
++ 		    nft_trans_chain_update(trans))
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
+  static int nf_tables_updtable(struct nft_ctx *ctx)
+  {
+  	struct nft_trans *trans;
+@@@ -2519,13 -2650,39 +2538,38 @@@ static int nf_tables_updchain(struct nf
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (table->flags & __NFT_TABLE_F_UPDATE &&
++ 	    !list_empty(&hook.list)) {
++ 		NL_SET_BAD_ATTR(extack, attr);
++ 		err = -EOPNOTSUPP;
++ 		goto err_hooks;
++ 	}
++ 
++ 	if (!(table->flags & NFT_TABLE_F_DORMANT) &&
++ 	    nft_is_base_chain(chain) &&
++ 	    !list_empty(&hook.list)) {
++ 		basechain = nft_base_chain(chain);
++ 		ops = &basechain->ops;
++ 
++ 		if (nft_base_chain_netdev(table->family, basechain->ops.hooknum)) {
++ 			err = nft_netdev_register_hooks(ctx->net, &hook.list);
++ 			if (err < 0)
++ 				goto err_hooks;
++ 		}
++ 	}
++ 
++ 	unregister = true;
++ 
+++>>>>>>> 1e1fb6f00f52 (netfilter: nf_tables: reject table flag and netdev basechain updates)
+  	if (nla[NFTA_CHAIN_COUNTERS]) {
+ -		if (!nft_is_base_chain(chain)) {
+ -			err = -EOPNOTSUPP;
+ -			goto err_hooks;
+ -		}
+ +		if (!nft_is_base_chain(chain))
+ +			return -EOPNOTSUPP;
+  
+  		stats = nft_stats_alloc(nla[NFTA_CHAIN_COUNTERS]);
+ -		if (IS_ERR(stats)) {
+ -			err = PTR_ERR(stats);
+ -			goto err_hooks;
+ -		}
+ +		if (IS_ERR(stats))
+ +			return PTR_ERR(stats);
+  	}
+  
+  	err = -ENOMEM;
+@@@ -2698,6 -2874,59 +2742,62 @@@ static int nf_tables_newchain(struct sk
+  	return nf_tables_addchain(&ctx, family, genmask, policy, flags, extack);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nft_delchain_hook(struct nft_ctx *ctx,
++ 			     struct nft_base_chain *basechain,
++ 			     struct netlink_ext_ack *extack)
++ {
++ 	const struct nft_chain *chain = &basechain->chain;
++ 	const struct nlattr * const *nla = ctx->nla;
++ 	struct nft_chain_hook chain_hook = {};
++ 	struct nft_hook *this, *hook;
++ 	LIST_HEAD(chain_del_list);
++ 	struct nft_trans *trans;
++ 	int err;
++ 
++ 	if (ctx->table->flags & __NFT_TABLE_F_UPDATE)
++ 		return -EOPNOTSUPP;
++ 
++ 	err = nft_chain_parse_hook(ctx->net, basechain, nla, &chain_hook,
++ 				   ctx->family, chain->flags, extack);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	list_for_each_entry(this, &chain_hook.list, list) {
++ 		hook = nft_hook_list_find(&basechain->hook_list, this);
++ 		if (!hook) {
++ 			err = -ENOENT;
++ 			goto err_chain_del_hook;
++ 		}
++ 		list_move(&hook->list, &chain_del_list);
++ 	}
++ 
++ 	trans = nft_trans_alloc(ctx, NFT_MSG_DELCHAIN,
++ 				sizeof(struct nft_trans_chain));
++ 	if (!trans) {
++ 		err = -ENOMEM;
++ 		goto err_chain_del_hook;
++ 	}
++ 
++ 	nft_trans_basechain(trans) = basechain;
++ 	nft_trans_chain_update(trans) = true;
++ 	INIT_LIST_HEAD(&nft_trans_chain_hooks(trans));
++ 	list_splice(&chain_del_list, &nft_trans_chain_hooks(trans));
++ 	nft_chain_release_hook(&chain_hook);
++ 
++ 	nft_trans_commit_list_add_tail(ctx->net, trans);
++ 
++ 	return 0;
++ 
++ err_chain_del_hook:
++ 	list_splice(&chain_del_list, &basechain->hook_list);
++ 	nft_chain_release_hook(&chain_hook);
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 1e1fb6f00f52 (netfilter: nf_tables: reject table flag and netdev basechain updates)
+  static int nf_tables_delchain(struct sk_buff *skb, const struct nfnl_info *info,
+  			      const struct nlattr * const nla[])
+  {
+* Unmerged path net/netfilter/nf_tables_api.c
