@@ -1258,6 +1258,12 @@ xfs_qm_flush_one(
 			error = -EINVAL;
 			goto out_unlock;
 		}
+
+		if (!(bp->b_flags & _XBF_DELWRI_Q)) {
+			error = -EAGAIN;
+			xfs_buf_relse(bp);
+			goto out_unlock;
+		}
 		xfs_buf_unlock(bp);
 
 		xfs_buf_delwri_pushbuf(bp, buffer_list);
@@ -1337,7 +1343,7 @@ xfs_qm_quotacheck(
 		 * caches.  We must purge them before disabling quota and
 		 * tearing down the quotainfo, or else the dquots will leak.
 		 */
-		xfs_qm_dqpurge_all(mp);
+		xfs_qm_dqpurge_all(mp, XFS_QMOPT_QUOTALL);
 		goto error_return;
 	}
 

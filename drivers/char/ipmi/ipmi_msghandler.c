@@ -5156,10 +5156,10 @@ struct ipmi_smi_msg *ipmi_alloc_smi_msg(void)
 	if (rv) {
 		rv->done = free_smi_msg;
 		rv->user_data = NULL;
+		RH_KABI_AUX_SET_SIZE(rv, ipmi_smi_msg);
 		if (RH_KABI_AUX(rv, ipmi_smi_msg, type))
 			rv->_rh.type = IPMI_SMI_MSG_TYPE_NORMAL;
 		atomic_inc(&smi_msg_inuse_count);
-		RH_KABI_AUX_SET_SIZE(rv, ipmi_smi_msg);
 	}
 
 	return rv;

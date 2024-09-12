@@ -780,7 +780,9 @@ static bool access_pmcr(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
 		val |= p->regval & ARMV8_PMU_PMCR_MASK;
 		if (!system_supports_32bit_el0())
 			val |= ARMV8_PMU_PMCR_LC;
-		__vcpu_sys_reg(vcpu, PMCR_EL0) = val;
+		/* The reset bits don't indicate any state, and shouldn't be saved. */
+		__vcpu_sys_reg(vcpu, PMCR_EL0) = val & ~(ARMV8_PMU_PMCR_C | ARMV8_PMU_PMCR_P);
+
 		kvm_pmu_handle_pmcr(vcpu, val);
 	} else {
 		/* PMCR.P & PMCR.C are RAZ */
@@ -840,6 +842,25 @@ static bool pmu_counter_idx_valid(struct kvm_vcpu *vcpu, u64 idx)
 	}
 
 	return true;
+}
+
+static int get_pmu_evcntr(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r,
+			  const struct kvm_one_reg *reg, void __user *uaddr)
+{
+	u64 idx, val;
+
+	if (r->CRn == 9 && r->CRm == 13 && r->Op2 == 0)
+		/* PMCCNTR_EL0 */
+		idx = ARMV8_PMU_CYCLE_IDX;
+	else
+		/* PMEVCNTRn_EL0 */
+		idx = ((r->CRm & 3) << 3) | (r->Op2 & 7);
+
+	val = kvm_pmu_get_counter_value(vcpu, idx);
+	if (copy_to_user(uaddr, &val, KVM_REG_SIZE(reg->id)) != 0)
+		return -EFAULT;
+
+	return 0;
 }
 
 static bool access_pmu_evcntr(struct kvm_vcpu *vcpu,
@@ -1065,7 +1086,8 @@ static bool access_pmuserenr(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
 /* Macro to expand the PMEVCNTRn_EL0 register */
 #define PMU_PMEVCNTR_EL0(n)						\
 	{ SYS_DESC(SYS_PMEVCNTRn_EL0(n)),					\
-	  access_pmu_evcntr, reset_unknown, (PMEVCNTR0_EL0 + n), }
+	  access_pmu_evcntr, reset_unknown, (PMEVCNTR0_EL0 + n),		\
+	  0, get_pmu_evcntr }
 
 /* Macro to expand the PMEVTYPERn_EL0 register */
 #define PMU_PMEVTYPER_EL0(n)						\
@@ -1669,7 +1691,8 @@ static const struct sys_reg_desc sys_reg_descs[] = {
 	{ SYS_DESC(SYS_PMSELR_EL0), access_pmselr, reset_unknown, PMSELR_EL0 },
 	{ SYS_DESC(SYS_PMCEID0_EL0), access_pmceid },
 	{ SYS_DESC(SYS_PMCEID1_EL0), access_pmceid },
-	{ SYS_DESC(SYS_PMCCNTR_EL0), access_pmu_evcntr, reset_unknown, PMCCNTR_EL0 },
+	{ SYS_DESC(SYS_PMCCNTR_EL0), access_pmu_evcntr, reset_unknown, PMCCNTR_EL0,
+	  0, get_pmu_evcntr },
 	{ SYS_DESC(SYS_PMXEVTYPER_EL0), access_pmu_evtyper },
 	{ SYS_DESC(SYS_PMXEVCNTR_EL0), access_pmu_evcntr },
 	/*

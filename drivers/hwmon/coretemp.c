@@ -469,7 +469,7 @@ static int create_core_data(struct platform_device *pdev, unsigned int cpu,
 	u32 eax, edx;
 	int err, index, attr_no;
 
-	if (!housekeeping_cpu(cpu, HK_TYPE_MISC))
+	if (!housekeeping_cpu(cpu, HK_FLAG_MISC))
 		return 0;
 
 	/*

@@ -115,20 +115,20 @@ EXPORT_SYMBOL_GPL(pci_proc_domain);
 
 /* Modify PCI: Register I/O address translation parameters */
 int zpci_register_ioat(struct zpci_dev *zdev, u8 dmaas,
-		       u64 base, u64 limit, u64 iota)
+		       u64 base, u64 limit, u64 iota, u8 *status)
 {
 	u64 req = ZPCI_CREATE_REQ(zdev->fh, dmaas, ZPCI_MOD_FC_REG_IOAT);
 	struct zpci_fib fib = {0};
-	u8 cc, status;
+	u8 cc;
 
 	WARN_ON_ONCE(iota & 0x3fff);
 	fib.pba = base;
 	fib.pal = limit;
 	fib.iota = iota | ZPCI_IOTA_RTTO_FLAG;
 	fib.gd = zdev->gisa;
-	cc = zpci_mod_fc(req, &fib, &status);
+	cc = zpci_mod_fc(req, &fib, status);
 	if (cc)
-		zpci_dbg(3, "reg ioat fid:%x, cc:%d, status:%d\n", zdev->fid, cc, status);
+		zpci_dbg(3, "reg ioat fid:%x, cc:%d, status:%d\n", zdev->fid, cc, *status);
 	return cc;
 }
 EXPORT_SYMBOL_GPL(zpci_register_ioat);
@@ -658,6 +658,7 @@ static int zpci_restore(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct zpci_dev *zdev = to_zpci(pdev);
+	u8 status;
 	int ret = 0;
 	u32 fh = zdev->fh;
 
@@ -671,7 +672,7 @@ static int zpci_restore(struct device *dev)
 
 	zpci_map_resources(pdev);
 	zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
-			   (u64) zdev->dma_table);
+			   (u64) zdev->dma_table, &status);
 
 out:
 	return ret;
@@ -813,6 +814,7 @@ EXPORT_SYMBOL_GPL(zpci_disable_device);
  */
 int zpci_hot_reset_device(struct zpci_dev *zdev)
 {
+	u8 status;
 	int rc;
 
 	zpci_dbg(3, "rst fid:%x, fh:%x\n", zdev->fid, zdev->fh);
@@ -836,7 +838,7 @@ int zpci_hot_reset_device(struct zpci_dev *zdev)
 
 	if (zdev->dma_table)
 		rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
-					virt_to_phys(zdev->dma_table));
+					virt_to_phys(zdev->dma_table), &status);
 	else
 		rc = zpci_dma_init_device(zdev);
 	if (rc) {
