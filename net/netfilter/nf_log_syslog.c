@@ -43,6 +43,12 @@ struct arppayload {
 	unsigned char ip_dst[4];
 };
 
+/* Guard against containers flooding syslog. */
+static bool nf_log_allowed(const struct net *net)
+{
+	return net_eq(net, &init_net) || sysctl_nf_log_all_netns;
+}
+
 static void nf_log_dump_vlan(struct nf_log_buf *m, const struct sk_buff *skb)
 {
 	u16 vid;
@@ -136,8 +142,7 @@ static void nf_log_arp_packet(struct net *net, u_int8_t pf,
 {
 	struct nf_log_buf *m;
 
-	/* FIXME: Disabled from containers until syslog ns is supported */
-	if (!net_eq(net, &init_net) && !sysctl_nf_log_all_netns)
+	if (!nf_log_allowed(net))
 		return;
 
 	m = nf_log_buf_open();
@@ -834,8 +839,7 @@ static void nf_log_ip_packet(struct net *net, u_int8_t pf,
 {
 	struct nf_log_buf *m;
 
-	/* FIXME: Disabled from containers until syslog ns is supported */
-	if (!net_eq(net, &init_net) && !sysctl_nf_log_all_netns)
+	if (!nf_log_allowed(net))
 		return;
 
 	m = nf_log_buf_open();
@@ -870,8 +874,7 @@ static void nf_log_ip6_packet(struct net *net, u_int8_t pf,
 {
 	struct nf_log_buf *m;
 
-	/* FIXME: Disabled from containers until syslog ns is supported */
-	if (!net_eq(net, &init_net) && !sysctl_nf_log_all_netns)
+	if (!nf_log_allowed(net))
 		return;
 
 	m = nf_log_buf_open();
@@ -907,8 +910,7 @@ static void nf_log_unknown_packet(struct net *net, u_int8_t pf,
 {
 	struct nf_log_buf *m;
 
-	/* FIXME: Disabled from containers until syslog ns is supported */
-	if (!net_eq(net, &init_net) && !sysctl_nf_log_all_netns)
+	if (!nf_log_allowed(net))
 		return;
 
 	m = nf_log_buf_open();
