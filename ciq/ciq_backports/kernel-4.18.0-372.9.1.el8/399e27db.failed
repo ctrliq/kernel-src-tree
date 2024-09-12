@@ -1,0 +1,797 @@
+ice: support immediate firmware activation via devlink reload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 399e27dbbd9e945e136cd8f6415b03258a094f7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/399e27db.failed
+
+The ice hardware contains an embedded chip with firmware which can be
+updated using devlink flash. The firmware which runs on this chip is
+referred to as the Embedded Management Processor firmware (EMP
+firmware).
+
+Activating the new firmware image currently requires that the system be
+rebooted. This is not ideal as rebooting the system can cause unwanted
+downtime.
+
+In practical terms, activating the firmware does not always require a
+full system reboot. In many cases it is possible to activate the EMP
+firmware immediately. There are a couple of different scenarios to
+cover.
+
+ * The EMP firmware itself can be reloaded by issuing a special update
+   to the device called an Embedded Management Processor reset (EMP
+   reset). This reset causes the device to reset and reload the EMP
+   firmware.
+
+ * PCI configuration changes are only reloaded after a cold PCIe reset.
+   Unfortunately there is no generic way to trigger this for a PCIe
+   device without a system reboot.
+
+When performing a flash update, firmware is capable of responding with
+some information about the specific update requirements.
+
+The driver updates the flash by programming a secondary inactive bank
+with the contents of the new image, and then issuing a command to
+request to switch the active bank starting from the next load.
+
+The response to the final command for updating the inactive NVM flash
+bank includes an indication of the minimum reset required to fully
+update the device. This can be one of the following:
+
+ * A full power on is required
+ * A cold PCIe reset is required
+ * An EMP reset is required
+
+The response to the command to switch flash banks includes an indication
+of whether or not the firmware will allow an EMP reset request.
+
+For most updates, an EMP reset is sufficient to load the new EMP
+firmware without issues. In some cases, this reset is not sufficient
+because the PCI configuration space has changed. When this could cause
+incompatibility with the new EMP image, the firmware is capable of
+rejecting the EMP reset request.
+
+Add logic to ice_fw_update.c to handle the response data flash update
+AdminQ commands.
+
+For the reset level, issue a devlink status notification informing the
+user of how to complete the update with a simple suggestion like
+"Activate new firmware by rebooting the system".
+
+Cache the status of whether or not firmware will restrict the EMP reset
+for use in implementing devlink reload.
+
+Implement support for devlink reload with the "fw_activate" flag. This
+allows user space to request the firmware be activated immediately.
+
+For the .reload_down handler, we will issue a request for the EMP reset
+using the appropriate firmware AdminQ command. If we know that the
+firmware will not allow an EMP reset, simply exit with a suitable
+netlink extended ACK message indicating that the EMP reset is not
+available.
+
+For the .reload_up handler, simply wait until the driver has finished
+resetting. Logic to handle processing of an EMP reset already exists in
+the driver as part of its reset and rebuild flows.
+
+Implement support for the devlink reload interface with the
+"fw_activate" action. This allows userspace to request activation of
+firmware without a reboot.
+
+Note that support for indicating the required reset and EMP reset
+restriction is not supported on old versions of firmware. The driver can
+determine if the two features are supported by checking the device
+capabilities report. I confirmed support has existed since at least
+version 5.5.2 as reported by the 'fw.mgmt' version. Support to issue the
+EMP reset request has existed in all version of the EMP firmware for the
+ice hardware.
+
+Check the device capabilities report to determine whether or not the
+indications are reported by the running firmware. If the reset
+requirement indication is not supported, always assume a full power on
+is necessary. If the reset restriction capability is not supported,
+always assume the EMP reset is available.
+
+Users can verify if the EMP reset has activated the firmware by using
+the devlink info report to check that the 'running' firmware version has
+updated. For example a user might do the following:
+
+ # Check current version
+ $ devlink dev info
+
+ # Update the device
+ $ devlink dev flash pci/0000:af:00.0 file firmware.bin
+
+ # Confirm stored version updated
+ $ devlink dev info
+
+ # Reload to activate new firmware
+ $ devlink dev reload pci/0000:af:00.0 action fw_activate
+
+ # Confirm running version updated
+ $ devlink dev info
+
+Finally, this change does *not* implement basic driver-only reload
+support. I did look into trying to do this. However, it requires
+significant refactor of how the ice driver probes and loads everything.
+The ice driver probe and allocation flows were not designed with such
+a reload in mind. Refactoring the flow to support this is beyond the
+scope of this change.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Gurucharan G <gurucharanx.g@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 399e27dbbd9e945e136cd8f6415b03258a094f7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_devlink.c
+#	drivers/net/ethernet/intel/ice/ice_fw_update.c
+#	drivers/net/ethernet/intel/ice/ice_fw_update.h
+#	drivers/net/ethernet/intel/ice/ice_main.c
+#	drivers/net/ethernet/intel/ice/ice_nvm.c
+#	drivers/net/ethernet/intel/ice/ice_nvm.h
+diff --cc drivers/net/ethernet/intel/ice/ice_devlink.c
+index 021c315fa8d4,5aa18219920b..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_devlink.c
++++ b/drivers/net/ethernet/intel/ice/ice_devlink.c
+@@@ -373,53 -371,97 +373,147 @@@ out_free_ctx
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * ice_devlink_flash_update - Update firmware stored in flash on the device
+ + * @devlink: pointer to devlink associated with device to update
+ + * @params: flash update parameters
+ + * @extack: netlink extended ACK structure
+ + *
+ + * Perform a device flash update. The bulk of the update logic is contained
+ + * within the ice_flash_pldm_image function.
+ + *
+ + * Returns: zero on success, or an error code on failure.
+ + */
+ +static int
+ +ice_devlink_flash_update(struct devlink *devlink,
+ +			 struct devlink_flash_update_params *params,
+ +			 struct netlink_ext_ack *extack)
+ +{
+ +	struct ice_pf *pf = devlink_priv(devlink);
+ +	struct ice_hw *hw = &pf->hw;
+ +	u8 preservation;
+ +	int err;
+ +
+ +	if (!params->overwrite_mask) {
+ +		/* preserve all settings and identifiers */
+ +		preservation = ICE_AQC_NVM_PRESERVE_ALL;
+ +	} else if (params->overwrite_mask == DEVLINK_FLASH_OVERWRITE_SETTINGS) {
+ +		/* overwrite settings, but preserve the vital device identifiers */
+ +		preservation = ICE_AQC_NVM_PRESERVE_SELECTED;
+ +	} else if (params->overwrite_mask == (DEVLINK_FLASH_OVERWRITE_SETTINGS |
+ +					      DEVLINK_FLASH_OVERWRITE_IDENTIFIERS)) {
+ +		/* overwrite both settings and identifiers, preserve nothing */
+ +		preservation = ICE_AQC_NVM_NO_PRESERVATION;
+ +	} else {
+ +		NL_SET_ERR_MSG_MOD(extack, "Requested overwrite mask is not supported");
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	if (!hw->dev_caps.common_cap.nvm_unified_update) {
+ +		NL_SET_ERR_MSG_MOD(extack, "Current firmware does not support unified update");
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	err = ice_check_for_pending_update(pf, NULL, extack);
+ +	if (err)
+ +		return err;
+ +
+ +	devlink_flash_update_status_notify(devlink, "Preparing to flash", NULL, 0, 0);
+ +
+ +	return ice_flash_pldm_image(pf, params->fw, preservation, extack);
+++=======
++  * ice_devlink_reload_empr_start - Start EMP reset to activate new firmware
++  * @devlink: pointer to the devlink instance to reload
++  * @netns_change: if true, the network namespace is changing
++  * @action: the action to perform. Must be DEVLINK_RELOAD_ACTION_FW_ACTIVATE
++  * @limit: limits on what reload should do, such as not resetting
++  * @extack: netlink extended ACK structure
++  *
++  * Allow user to activate new Embedded Management Processor firmware by
++  * issuing device specific EMP reset. Called in response to
++  * a DEVLINK_CMD_RELOAD with the DEVLINK_RELOAD_ACTION_FW_ACTIVATE.
++  *
++  * Note that teardown and rebuild of the driver state happens automatically as
++  * part of an interrupt and watchdog task. This is because all physical
++  * functions on the device must be able to reset when an EMP reset occurs from
++  * any source.
++  */
++ static int
++ ice_devlink_reload_empr_start(struct devlink *devlink, bool netns_change,
++ 			      enum devlink_reload_action action,
++ 			      enum devlink_reload_limit limit,
++ 			      struct netlink_ext_ack *extack)
++ {
++ 	struct ice_pf *pf = devlink_priv(devlink);
++ 	struct device *dev = ice_pf_to_dev(pf);
++ 	struct ice_hw *hw = &pf->hw;
++ 	u8 pending;
++ 	int err;
++ 
++ 	err = ice_get_pending_updates(pf, &pending, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	/* pending is a bitmask of which flash banks have a pending update,
++ 	 * including the main NVM bank, the Option ROM bank, and the netlist
++ 	 * bank. If any of these bits are set, then there is a pending update
++ 	 * waiting to be activated.
++ 	 */
++ 	if (!pending) {
++ 		NL_SET_ERR_MSG_MOD(extack, "No pending firmware update");
++ 		return -ECANCELED;
++ 	}
++ 
++ 	if (pf->fw_emp_reset_disabled) {
++ 		NL_SET_ERR_MSG_MOD(extack, "EMP reset is not available. To activate firmware, a reboot or power cycle is needed");
++ 		return -ECANCELED;
++ 	}
++ 
++ 	dev_dbg(dev, "Issuing device EMP reset to activate firmware\n");
++ 
++ 	err = ice_aq_nvm_update_empr(hw);
++ 	if (err) {
++ 		dev_err(dev, "Failed to trigger EMP device reset to reload firmware, err %d aq_err %s\n",
++ 			err, ice_aq_str(hw->adminq.sq_last_status));
++ 		NL_SET_ERR_MSG_MOD(extack, "Failed to trigger EMP device reset to reload firmware");
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * ice_devlink_reload_empr_finish - Wait for EMP reset to finish
++  * @devlink: pointer to the devlink instance reloading
++  * @action: the action requested
++  * @limit: limits imposed by userspace, such as not resetting
++  * @actions_performed: on return, indicate what actions actually performed
++  * @extack: netlink extended ACK structure
++  *
++  * Wait for driver to finish rebuilding after EMP reset is completed. This
++  * includes time to wait for both the actual device reset as well as the time
++  * for the driver's rebuild to complete.
++  */
++ static int
++ ice_devlink_reload_empr_finish(struct devlink *devlink,
++ 			       enum devlink_reload_action action,
++ 			       enum devlink_reload_limit limit,
++ 			       u32 *actions_performed,
++ 			       struct netlink_ext_ack *extack)
++ {
++ 	struct ice_pf *pf = devlink_priv(devlink);
++ 	int err;
++ 
++ 	*actions_performed = BIT(DEVLINK_RELOAD_ACTION_FW_ACTIVATE);
++ 
++ 	err = ice_wait_for_reset(pf, 60 * HZ);
++ 	if (err) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Device still resetting after 1 minute");
++ 		return err;
++ 	}
++ 
++ 	return 0;
+++>>>>>>> 399e27dbbd9e (ice: support immediate firmware activation via devlink reload)
+  }
+  
+  static const struct devlink_ops ice_devlink_ops = {
+@@@ -583,8 -629,9 +681,14 @@@ struct ice_pf *ice_allocate_pf(struct d
+  void ice_devlink_register(struct ice_pf *pf)
+  {
+  	struct devlink *devlink = priv_to_devlink(pf);
+++<<<<<<< HEAD
+ +	struct device *dev = ice_pf_to_dev(pf);
+ +	devlink_register(devlink, dev);
+++=======
++ 
++ 	devlink_set_features(devlink, DEVLINK_F_RELOAD);
++ 	devlink_register(devlink);
+++>>>>>>> 399e27dbbd9e (ice: support immediate firmware activation via devlink reload)
+  }
+  
+  /**
+diff --cc drivers/net/ethernet/intel/ice/ice_fw_update.c
+index ff801f4064a0,665a344fb9c0..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_fw_update.c
++++ b/drivers/net/ethernet/intel/ice/ice_fw_update.c
+@@@ -524,17 -562,16 +566,23 @@@ ice_switch_flash_banks(struct ice_pf *p
+  	struct device *dev = ice_pf_to_dev(pf);
+  	struct ice_rq_event_info event;
+  	struct ice_hw *hw = &pf->hw;
+ +	enum ice_status status;
+  	u16 completion_retval;
++ 	u8 response_flags;
+  	int err;
+  
+  	memset(&event, 0, sizeof(event));
+  
+++<<<<<<< HEAD
+ +	status = ice_nvm_write_activate(hw, activate_flags);
+ +	if (status) {
+++=======
++ 	err = ice_nvm_write_activate(hw, activate_flags, &response_flags);
++ 	if (err) {
+++>>>>>>> 399e27dbbd9e (ice: support immediate firmware activation via devlink reload)
+  		dev_err(dev, "Failed to switch active flash banks, err %d aq_err %s\n",
+ -			err, ice_aq_str(hw->adminq.sq_last_status));
+ +			status,
+ +			ice_aq_str(hw->adminq.sq_last_status));
+  		NL_SET_ERR_MSG_MOD(extack, "Failed to switch active flash banks");
+  		return -EIO;
+  	}
+@@@ -648,96 -745,22 +756,112 @@@ static const struct pldmfw_ops ice_fwu_
+  };
+  
+  /**
+++<<<<<<< HEAD
+ + * ice_flash_pldm_image - Write a PLDM-formatted firmware image to the device
+ + * @pf: private device driver structure
+ + * @fw: firmware object pointing to the relevant firmware file
+ + * @preservation: preservation level to request from firmware
+ + * @extack: netlink extended ACK structure
+ + *
+ + * Parse the data for a given firmware file, verifying that it is a valid PLDM
+ + * formatted image that matches this device.
+ + *
+ + * Extract the device record Package Data and Component Tables and send them
+ + * to the firmware. Extract and write the flash data for each of the three
+ + * main flash components, "fw.mgmt", "fw.undi", and "fw.netlist". Notify
+ + * firmware once the data is written to the inactive banks.
+ + *
+ + * Returns: zero on success or a negative error code on failure.
+ + */
+ +int ice_flash_pldm_image(struct ice_pf *pf, const struct firmware *fw,
+ +			 u8 preservation, struct netlink_ext_ack *extack)
+ +{
+ +	struct device *dev = ice_pf_to_dev(pf);
+ +	struct ice_hw *hw = &pf->hw;
+ +	struct ice_fwu_priv priv;
+ +	enum ice_status status;
+ +	int err;
+ +
+ +	switch (preservation) {
+ +	case ICE_AQC_NVM_PRESERVE_ALL:
+ +	case ICE_AQC_NVM_PRESERVE_SELECTED:
+ +	case ICE_AQC_NVM_NO_PRESERVATION:
+ +	case ICE_AQC_NVM_FACTORY_DEFAULT:
+ +		break;
+ +	default:
+ +		WARN(1, "Unexpected preservation level request %u", preservation);
+ +		return -EINVAL;
+ +	}
+ +
+ +	memset(&priv, 0, sizeof(priv));
+ +
+ +	priv.context.ops = &ice_fwu_ops;
+ +	priv.context.dev = dev;
+ +	priv.extack = extack;
+ +	priv.pf = pf;
+ +	priv.activate_flags = preservation;
+ +
+ +	status = ice_acquire_nvm(hw, ICE_RES_WRITE);
+ +	if (status) {
+ +		dev_err(dev, "Failed to acquire device flash lock, err %d aq_err %s\n",
+ +			status,
+ +			ice_aq_str(hw->adminq.sq_last_status));
+ +		NL_SET_ERR_MSG_MOD(extack, "Failed to acquire device flash lock");
+ +		return -EIO;
+ +	}
+ +
+ +	err = pldmfw_flash_image(&priv.context, fw);
+ +	if (err == -ENOENT) {
+ +		dev_err(dev, "Firmware image has no record matching this device\n");
+ +		NL_SET_ERR_MSG_MOD(extack, "Firmware image has no record matching this device");
+ +	} else if (err) {
+ +		/* Do not set a generic extended ACK message here. A more
+ +		 * specific message may already have been set by one of our
+ +		 * ops.
+ +		 */
+ +		dev_err(dev, "Failed to flash PLDM image, err %d", err);
+ +	}
+ +
+ +	ice_release_nvm(hw);
+ +
+ +	return err;
+ +}
+ +
+ +/**
+ + * ice_check_for_pending_update - Check for a pending flash update
+++=======
++  * ice_get_pending_updates - Check if the component has a pending update
+++>>>>>>> 399e27dbbd9e (ice: support immediate firmware activation via devlink reload)
+   * @pf: the PF driver structure
+-  * @component: if not NULL, the name of the component being updated
+-  * @extack: Netlink extended ACK structure
++  * @pending: on return, bitmap of updates pending
++  * @extack: Netlink extended ACK
+   *
+++<<<<<<< HEAD
+ + * Check whether the device already has a pending flash update. If such an
+ + * update is found, cancel it so that the requested update may proceed.
+++=======
++  * Check if the device has any pending updates on any flash components.
+++>>>>>>> 399e27dbbd9e (ice: support immediate firmware activation via devlink reload)
+   *
+-  * Returns: zero on success, or a negative error code on failure.
++  * Returns: zero on success, or a negative error code on failure. Updates
++  * pending with the bitmap of pending updates.
+   */
+++<<<<<<< HEAD
+ +int ice_check_for_pending_update(struct ice_pf *pf, const char *component,
+ +				 struct netlink_ext_ack *extack)
+++=======
++ int ice_get_pending_updates(struct ice_pf *pf, u8 *pending,
++ 			    struct netlink_ext_ack *extack)
+++>>>>>>> 399e27dbbd9e (ice: support immediate firmware activation via devlink reload)
+  {
+- 	struct devlink *devlink = priv_to_devlink(pf);
+  	struct device *dev = ice_pf_to_dev(pf);
+  	struct ice_hw_dev_caps *dev_caps;
+  	struct ice_hw *hw = &pf->hw;
+++<<<<<<< HEAD
+ +	enum ice_status status;
+ +	u8 pending = 0;
+++=======
+++>>>>>>> 399e27dbbd9e (ice: support immediate firmware activation via devlink reload)
+  	int err;
+  
+  	dev_caps = kzalloc(sizeof(*dev_caps), GFP_KERNEL);
+@@@ -749,16 -772,18 +873,18 @@@
+  	 * may have changed, e.g. if an update was previously completed and
+  	 * the system has not yet rebooted.
+  	 */
+ -	err = ice_discover_dev_caps(hw, dev_caps);
+ -	if (err) {
+ +	status = ice_discover_dev_caps(hw, dev_caps);
+ +	if (status) {
+  		NL_SET_ERR_MSG_MOD(extack, "Unable to read device capabilities");
+  		kfree(dev_caps);
+ -		return err;
+ +		return -EIO;
+  	}
+  
++ 	*pending = 0;
++ 
+  	if (dev_caps->common_cap.nvm_update_pending_nvm) {
+  		dev_info(dev, "The fw.mgmt flash component has a pending update\n");
+- 		pending |= ICE_AQC_NVM_ACTIV_SEL_NVM;
++ 		*pending |= ICE_AQC_NVM_ACTIV_SEL_NVM;
+  	}
+  
+  	if (dev_caps->common_cap.nvm_update_pending_orom) {
+@@@ -812,5 -864,96 +966,10 @@@ ice_cancel_pending_update(struct ice_p
+  
+  	ice_release_nvm(hw);
+  
++ 	/* Since we've canceled the pending update, we no longer know if EMP
++ 	 * reset is restricted.
++ 	 */
++ 	pf->fw_emp_reset_disabled = false;
++ 
+  	return err;
+  }
+ -
+ -/**
+ - * ice_devlink_flash_update - Write a firmware image to the device
+ - * @devlink: pointer to devlink associated with the device to update
+ - * @params: devlink flash update parameters
+ - * @extack: netlink extended ACK structure
+ - *
+ - * Parse the data for a given firmware file, verifying that it is a valid PLDM
+ - * formatted image that matches this device.
+ - *
+ - * Extract the device record Package Data and Component Tables and send them
+ - * to the firmware. Extract and write the flash data for each of the three
+ - * main flash components, "fw.mgmt", "fw.undi", and "fw.netlist". Notify
+ - * firmware once the data is written to the inactive banks.
+ - *
+ - * Returns: zero on success or a negative error code on failure.
+ - */
+ -int ice_devlink_flash_update(struct devlink *devlink,
+ -			     struct devlink_flash_update_params *params,
+ -			     struct netlink_ext_ack *extack)
+ -{
+ -	struct ice_pf *pf = devlink_priv(devlink);
+ -	struct device *dev = ice_pf_to_dev(pf);
+ -	struct ice_hw *hw = &pf->hw;
+ -	struct ice_fwu_priv priv;
+ -	u8 preservation;
+ -	int err;
+ -
+ -	if (!params->overwrite_mask) {
+ -		/* preserve all settings and identifiers */
+ -		preservation = ICE_AQC_NVM_PRESERVE_ALL;
+ -	} else if (params->overwrite_mask == DEVLINK_FLASH_OVERWRITE_SETTINGS) {
+ -		/* overwrite settings, but preserve the vital device identifiers */
+ -		preservation = ICE_AQC_NVM_PRESERVE_SELECTED;
+ -	} else if (params->overwrite_mask == (DEVLINK_FLASH_OVERWRITE_SETTINGS |
+ -					      DEVLINK_FLASH_OVERWRITE_IDENTIFIERS)) {
+ -		/* overwrite both settings and identifiers, preserve nothing */
+ -		preservation = ICE_AQC_NVM_NO_PRESERVATION;
+ -	} else {
+ -		NL_SET_ERR_MSG_MOD(extack, "Requested overwrite mask is not supported");
+ -		return -EOPNOTSUPP;
+ -	}
+ -
+ -	if (!hw->dev_caps.common_cap.nvm_unified_update) {
+ -		NL_SET_ERR_MSG_MOD(extack, "Current firmware does not support unified update");
+ -		return -EOPNOTSUPP;
+ -	}
+ -
+ -	memset(&priv, 0, sizeof(priv));
+ -
+ -	priv.context.ops = &ice_fwu_ops;
+ -	priv.context.dev = dev;
+ -	priv.extack = extack;
+ -	priv.pf = pf;
+ -	priv.activate_flags = preservation;
+ -
+ -	devlink_flash_update_status_notify(devlink, "Preparing to flash", NULL, 0, 0);
+ -
+ -	err = ice_cancel_pending_update(pf, NULL, extack);
+ -	if (err)
+ -		return err;
+ -
+ -	err = ice_acquire_nvm(hw, ICE_RES_WRITE);
+ -	if (err) {
+ -		dev_err(dev, "Failed to acquire device flash lock, err %d aq_err %s\n",
+ -			err, ice_aq_str(hw->adminq.sq_last_status));
+ -		NL_SET_ERR_MSG_MOD(extack, "Failed to acquire device flash lock");
+ -		return err;
+ -	}
+ -
+ -	err = pldmfw_flash_image(&priv.context, params->fw);
+ -	if (err == -ENOENT) {
+ -		dev_err(dev, "Firmware image has no record matching this device\n");
+ -		NL_SET_ERR_MSG_MOD(extack, "Firmware image has no record matching this device");
+ -	} else if (err) {
+ -		/* Do not set a generic extended ACK message here. A more
+ -		 * specific message may already have been set by one of our
+ -		 * ops.
+ -		 */
+ -		dev_err(dev, "Failed to flash PLDM image, err %d", err);
+ -	}
+ -
+ -	ice_release_nvm(hw);
+ -
+ -	return err;
+ -}
+diff --cc drivers/net/ethernet/intel/ice/ice_fw_update.h
+index c6390f6851ff,750574885716..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_fw_update.h
++++ b/drivers/net/ethernet/intel/ice/ice_fw_update.h
+@@@ -4,9 -4,10 +4,17 @@@
+  #ifndef _ICE_FW_UPDATE_H_
+  #define _ICE_FW_UPDATE_H_
+  
+++<<<<<<< HEAD
+ +int ice_flash_pldm_image(struct ice_pf *pf, const struct firmware *fw,
+ +			 u8 preservation, struct netlink_ext_ack *extack);
+ +int ice_check_for_pending_update(struct ice_pf *pf, const char *component,
+ +				 struct netlink_ext_ack *extack);
+++=======
++ int ice_devlink_flash_update(struct devlink *devlink,
++ 			     struct devlink_flash_update_params *params,
++ 			     struct netlink_ext_ack *extack);
++ int ice_get_pending_updates(struct ice_pf *pf, u8 *pending,
++ 			    struct netlink_ext_ack *extack);
+++>>>>>>> 399e27dbbd9e (ice: support immediate firmware activation via devlink reload)
+  
+  #endif
+diff --cc drivers/net/ethernet/intel/ice/ice_main.c
+index a13eae346070,452fa28f8967..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@@ -6422,10 -6594,17 +6422,24 @@@ static void ice_rebuild(struct ice_pf *
+  
+  	dev_dbg(dev, "rebuilding PF after reset_type=%d\n", reset_type);
+  
+++<<<<<<< HEAD
+ +	ret = ice_init_all_ctrlq(hw);
+ +	if (ret) {
+ +		dev_err(dev, "control queues init failed %d\n",
+ +			ret);
+++=======
++ 	if (reset_type == ICE_RESET_EMPR) {
++ 		/* If an EMP reset has occurred, any previously pending flash
++ 		 * update will have completed. We no longer know whether or
++ 		 * not the NVM update EMP reset is restricted.
++ 		 */
++ 		pf->fw_emp_reset_disabled = false;
++ 	}
++ 
++ 	err = ice_init_all_ctrlq(hw);
++ 	if (err) {
++ 		dev_err(dev, "control queues init failed %d\n", err);
+++>>>>>>> 399e27dbbd9e (ice: support immediate firmware activation via devlink reload)
+  		goto err_init_ctrlq;
+  	}
+  
+diff --cc drivers/net/ethernet/intel/ice/ice_nvm.c
+index fee37a5844cf,cd739a2c64e8..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_nvm.c
++++ b/drivers/net/ethernet/intel/ice/ice_nvm.c
+@@@ -1092,8 -1110,15 +1093,19 @@@ enum ice_status ice_nvm_validate_checks
+   *
+   * Update the control word with the required banks' validity bits
+   * and dumps the Shadow RAM to flash (0x0707)
++  *
++  * cmd_flags controls which banks to activate, and the preservation level to
++  * use when activating the NVM bank.
++  *
++  * On successful return of the firmware command, the response_flags variable
++  * is updated with the flags reported by firmware indicating certain status,
++  * such as whether EMP reset is enabled.
+   */
+++<<<<<<< HEAD
+ +enum ice_status ice_nvm_write_activate(struct ice_hw *hw, u8 cmd_flags)
+++=======
++ int ice_nvm_write_activate(struct ice_hw *hw, u8 cmd_flags, u8 *response_flags)
+++>>>>>>> 399e27dbbd9e (ice: support immediate firmware activation via devlink reload)
+  {
+  	struct ice_aqc_nvm *cmd;
+  	struct ice_aq_desc desc;
+diff --cc drivers/net/ethernet/intel/ice/ice_nvm.h
+index c6f05f43d593,856d1ad4398b..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_nvm.h
++++ b/drivers/net/ethernet/intel/ice/ice_nvm.h
+@@@ -35,15 -31,15 +35,22 @@@ enum ice_statu
+  ice_aq_update_nvm(struct ice_hw *hw, u16 module_typeid, u32 offset,
+  		  u16 length, void *data, bool last_command, u8 command_flags,
+  		  struct ice_sq_cd *cd);
+ -int
+ +enum ice_status
+  ice_aq_erase_nvm(struct ice_hw *hw, u16 module_typeid, struct ice_sq_cd *cd);
+++<<<<<<< HEAD
+ +enum ice_status ice_nvm_validate_checksum(struct ice_hw *hw);
+ +enum ice_status ice_nvm_write_activate(struct ice_hw *hw, u8 cmd_flags);
+ +enum ice_status ice_aq_nvm_update_empr(struct ice_hw *hw);
+ +enum ice_status
+++=======
++ int ice_nvm_validate_checksum(struct ice_hw *hw);
++ int ice_nvm_write_activate(struct ice_hw *hw, u8 cmd_flags, u8 *response_flags);
++ int ice_aq_nvm_update_empr(struct ice_hw *hw);
++ int
+++>>>>>>> 399e27dbbd9e (ice: support immediate firmware activation via devlink reload)
+  ice_nvm_set_pkg_data(struct ice_hw *hw, bool del_pkg_data_flag, u8 *data,
+  		     u16 length, struct ice_sq_cd *cd);
+ -int
+ +enum ice_status
+  ice_nvm_pass_component_tbl(struct ice_hw *hw, u8 *data, u16 length,
+  			   u8 transfer_flag, u8 *comp_response,
+  			   u8 *comp_response_code, struct ice_sq_cd *cd);
+diff --git a/Documentation/networking/devlink/ice.rst b/Documentation/networking/devlink/ice.rst
+index 6848593e2015..c0d0735bf8e2 100644
+--- a/Documentation/networking/devlink/ice.rst
++++ b/Documentation/networking/devlink/ice.rst
+@@ -26,8 +26,10 @@ The ``ice`` driver reports the following versions
+     * - ``fw.mgmt``
+       - running
+       - 2.1.7
+-      - 3-digit version number of the management firmware that controls the
+-        PHY, link, etc.
++      - 3-digit version number of the management firmware running on the
++        Embedded Management Processor of the device. It controls the PHY,
++        link, access to device resources, etc. Intel documentation refers to
++        this as the EMP firmware.
+     * - ``fw.mgmt.api``
+       - running
+       - 1.5.1
+@@ -118,6 +120,24 @@ preserving settings, and thus ``DEVLINK_FLASH_OVERWRITE_IDENTIFIERS`` on its
+ own will be rejected. If no overwrite mask is provided, the firmware will be
+ instructed to preserve all settings and identifying fields when updating.
+ 
++Reload
++======
++
++The ``ice`` driver supports activating new firmware after a flash update
++using ``DEVLINK_CMD_RELOAD`` with the ``DEVLINK_RELOAD_ACTION_FW_ACTIVATE``
++action.
++
++.. code:: shell
++
++    $ devlink dev reload pci/0000:01:00.0 reload action fw_activate
++
++The new firmware is activated by issuing a device specific Embedded
++Management Processor reset which requests the device to reset and reload the
++EMP firmware image.
++
++The driver does not currently support reloading the driver via
++``DEVLINK_RELOAD_ACTION_DRIVER_REINIT``.
++
+ Regions
+ =======
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice.h b/drivers/net/ethernet/intel/ice/ice.h
+index 7f60707725ce..a2095d2c2eae 100644
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -481,6 +481,7 @@ struct ice_pf {
+ 	spinlock_t aq_wait_lock;
+ 	struct hlist_head aq_wait_list;
+ 	wait_queue_head_t aq_wait_queue;
++	bool fw_emp_reset_disabled;
+ 
+ 	wait_queue_head_t reset_wait_queue;
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h b/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
+index 9d8f3ebd4496..091125542e42 100644
+--- a/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
++++ b/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
+@@ -117,6 +117,8 @@ struct ice_aqc_list_caps_elem {
+ #define ICE_AQC_CAPS_NET_VER				0x004C
+ #define ICE_AQC_CAPS_PENDING_NET_VER			0x004D
+ #define ICE_AQC_CAPS_RDMA				0x0051
++#define ICE_AQC_CAPS_PCIE_RESET_AVOIDANCE		0x0076
++#define ICE_AQC_CAPS_POST_UPDATE_RESET_RESTRICT		0x0077
+ #define ICE_AQC_CAPS_NVM_MGMT				0x0080
+ 
+ 	u8 major_ver;
+@@ -1407,6 +1409,11 @@ struct ice_aqc_nvm {
+ #define ICE_AQC_NVM_REVERT_LAST_ACTIV	BIT(6) /* Write Activate only */
+ #define ICE_AQC_NVM_ACTIV_SEL_MASK	ICE_M(0x7, 3)
+ #define ICE_AQC_NVM_FLASH_ONLY		BIT(7)
++#define ICE_AQC_NVM_RESET_LVL_M		ICE_M(0x3, 0) /* Write reply only */
++#define ICE_AQC_NVM_POR_FLAG		0
++#define ICE_AQC_NVM_PERST_FLAG		1
++#define ICE_AQC_NVM_EMPR_FLAG		2
++#define ICE_AQC_NVM_EMPR_ENA		BIT(0) /* Write Activate reply only */
+ 	__le16 module_typeid;
+ 	__le16 length;
+ #define ICE_AQC_NVM_ERASE_LEN	0xFFFF
+diff --git a/drivers/net/ethernet/intel/ice/ice_common.c b/drivers/net/ethernet/intel/ice/ice_common.c
+index 1c7ece0676d5..67ace8b322b8 100644
+--- a/drivers/net/ethernet/intel/ice/ice_common.c
++++ b/drivers/net/ethernet/intel/ice/ice_common.c
+@@ -2051,6 +2051,18 @@ ice_parse_common_caps(struct ice_hw *hw, struct ice_hw_common_caps *caps,
+ 		ice_debug(hw, ICE_DBG_INIT, "%s: max_mtu = %d\n",
+ 			  prefix, caps->max_mtu);
+ 		break;
++	case ICE_AQC_CAPS_PCIE_RESET_AVOIDANCE:
++		caps->pcie_reset_avoidance = (number > 0);
++		ice_debug(hw, ICE_DBG_INIT,
++			  "%s: pcie_reset_avoidance = %d\n", prefix,
++			  caps->pcie_reset_avoidance);
++		break;
++	case ICE_AQC_CAPS_POST_UPDATE_RESET_RESTRICT:
++		caps->reset_restrict_support = (number == 1);
++		ice_debug(hw, ICE_DBG_INIT,
++			  "%s: reset_restrict_support = %d\n", prefix,
++			  caps->reset_restrict_support);
++		break;
+ 	default:
+ 		/* Not one of the recognized common capabilities */
+ 		found = false;
+* Unmerged path drivers/net/ethernet/intel/ice/ice_devlink.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_fw_update.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_fw_update.h
+* Unmerged path drivers/net/ethernet/intel/ice/ice_main.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_nvm.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_nvm.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_type.h b/drivers/net/ethernet/intel/ice/ice_type.h
+index b02cc6398b7e..151522595d4d 100644
+--- a/drivers/net/ethernet/intel/ice/ice_type.h
++++ b/drivers/net/ethernet/intel/ice/ice_type.h
+@@ -277,6 +277,10 @@ struct ice_hw_common_caps {
+ #define ICE_NVM_PENDING_NETLIST			BIT(2)
+ 	bool nvm_unified_update;
+ #define ICE_NVM_MGMT_UNIFIED_UPD_SUPPORT	BIT(3)
++	/* PCIe reset avoidance */
++	bool pcie_reset_avoidance;
++	/* Post update reset restriction */
++	bool reset_restrict_support;
+ };
+ 
+ /* IEEE 1588 TIME_SYNC specific info */
