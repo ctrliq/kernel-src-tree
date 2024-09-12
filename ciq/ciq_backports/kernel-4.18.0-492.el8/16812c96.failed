@@ -1,0 +1,146 @@
+iommu/vt-d: Fix an IOMMU perfmon warning when CPU hotplug
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-492.el8
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit 16812c96550c30a8d5743167ef4e462d6fbe7472
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-492.el8/16812c96.failed
+
+A warning can be triggered when hotplug CPU 0.
+$ echo 0 > /sys/devices/system/cpu/cpu0/online
+
+ ------------[ cut here ]------------
+ Voluntary context switch within RCU read-side critical section!
+ WARNING: CPU: 0 PID: 19 at kernel/rcu/tree_plugin.h:318
+          rcu_note_context_switch+0x4f4/0x580
+ RIP: 0010:rcu_note_context_switch+0x4f4/0x580
+ Call Trace:
+  <TASK>
+  ? perf_event_update_userpage+0x104/0x150
+  __schedule+0x8d/0x960
+  ? perf_event_set_state.part.82+0x11/0x50
+  schedule+0x44/0xb0
+  schedule_timeout+0x226/0x310
+  ? __perf_event_disable+0x64/0x1a0
+  ? _raw_spin_unlock+0x14/0x30
+  wait_for_completion+0x94/0x130
+  __wait_rcu_gp+0x108/0x130
+  synchronize_rcu+0x67/0x70
+  ? invoke_rcu_core+0xb0/0xb0
+  ? __bpf_trace_rcu_stall_warning+0x10/0x10
+  perf_pmu_migrate_context+0x121/0x370
+  iommu_pmu_cpu_offline+0x6a/0xa0
+  ? iommu_pmu_del+0x1e0/0x1e0
+  cpuhp_invoke_callback+0x129/0x510
+  cpuhp_thread_fun+0x94/0x150
+  smpboot_thread_fn+0x183/0x220
+  ? sort_range+0x20/0x20
+  kthread+0xe6/0x110
+  ? kthread_complete_and_exit+0x20/0x20
+  ret_from_fork+0x1f/0x30
+  </TASK>
+ ---[ end trace 0000000000000000 ]---
+
+The synchronize_rcu() will be invoked in the perf_pmu_migrate_context(),
+when migrating a PMU to a new CPU. However, the current for_each_iommu()
+is within RCU read-side critical section.
+
+Two methods were considered to fix the issue.
+- Use the dmar_global_lock to replace the RCU read lock when going
+  through the drhd list. But it triggers a lockdep warning.
+- Use the cpuhp_setup_state_multi() to set up a dedicated state for each
+  IOMMU PMU. The lock can be avoided.
+
+The latter method is implemented in this patch. Since each IOMMU PMU has
+a dedicated state, add cpuhp_node and cpu in struct iommu_pmu to track
+the state. The state can be dynamically allocated now. Remove the
+CPUHP_AP_PERF_X86_IOMMU_PERF_ONLINE.
+
+Fixes: 46284c6ceb5e ("iommu/vt-d: Support cpumask for IOMMU perfmon")
+	Reported-by: Ammy Yi <ammy.yi@intel.com>
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+Link: https://lore.kernel.org/r/20230328182028.1366416-1-kan.liang@linux.intel.com
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+Link: https://lore.kernel.org/r/20230329134721.469447-4-baolu.lu@linux.intel.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 16812c96550c30a8d5743167ef4e462d6fbe7472)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel/perfmon.c
+#	include/linux/cpuhotplug.h
+#	include/linux/intel-iommu.h
+diff --cc include/linux/cpuhotplug.h
+index 0547ff9b75cc,5b2f8147d1ae..000000000000
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@@ -162,9 -217,8 +162,13 @@@ enum cpuhp_state 
+  	CPUHP_AP_PERF_X86_RAPL_ONLINE,
+  	CPUHP_AP_PERF_X86_CQM_ONLINE,
+  	CPUHP_AP_PERF_X86_CSTATE_ONLINE,
+++<<<<<<< HEAD
+ +	/* kABI: CPUHP_AP_PERF_X86_IDXD_ONLINE, */
+++=======
++ 	CPUHP_AP_PERF_X86_IDXD_ONLINE,
+++>>>>>>> 16812c96550c (iommu/vt-d: Fix an IOMMU perfmon warning when CPU hotplug)
+  	CPUHP_AP_PERF_S390_CF_ONLINE,
+ +	/* kABI: CPUHP_AP_PERF_S390_CFD_ONLINE, */
+  	CPUHP_AP_PERF_S390_SF_ONLINE,
+  	CPUHP_AP_PERF_ARM_CCI_ONLINE,
+  	CPUHP_AP_PERF_ARM_CCN_ONLINE,
+diff --cc include/linux/intel-iommu.h
+index b9494fd422a2,694ab9b7d3e9..000000000000
+--- a/include/linux/intel-iommu.h
++++ b/include/linux/intel-iommu.h
+@@@ -582,6 -612,42 +582,45 @@@ struct dmar_domain 
+  					   iommu core */
+  };
+  
+++<<<<<<< HEAD:include/linux/intel-iommu.h
+++=======
++ /*
++  * In theory, the VT-d 4.0 spec can support up to 2 ^ 16 counters.
++  * But in practice, there are only 14 counters for the existing
++  * platform. Setting the max number of counters to 64 should be good
++  * enough for a long time. Also, supporting more than 64 counters
++  * requires more extras, e.g., extra freeze and overflow registers,
++  * which is not necessary for now.
++  */
++ #define IOMMU_PMU_IDX_MAX		64
++ 
++ struct iommu_pmu {
++ 	struct intel_iommu	*iommu;
++ 	u32			num_cntr;	/* Number of counters */
++ 	u32			num_eg;		/* Number of event group */
++ 	u32			cntr_width;	/* Counter width */
++ 	u32			cntr_stride;	/* Counter Stride */
++ 	u32			filter;		/* Bitmask of filter support */
++ 	void __iomem		*base;		/* the PerfMon base address */
++ 	void __iomem		*cfg_reg;	/* counter configuration base address */
++ 	void __iomem		*cntr_reg;	/* counter 0 address*/
++ 	void __iomem		*overflow;	/* overflow status register */
++ 
++ 	u64			*evcap;		/* Indicates all supported events */
++ 	u32			**cntr_evcap;	/* Supported events of each counter. */
++ 
++ 	struct pmu		pmu;
++ 	DECLARE_BITMAP(used_mask, IOMMU_PMU_IDX_MAX);
++ 	struct perf_event	*event_list[IOMMU_PMU_IDX_MAX];
++ 	unsigned char		irq_name[16];
++ 	struct hlist_node	cpuhp_node;
++ 	int			cpu;
++ };
++ 
++ #define IOMMU_IRQ_ID_OFFSET_PRQ		(DMAR_UNITS_SUPPORTED)
++ #define IOMMU_IRQ_ID_OFFSET_PERF	(2 * DMAR_UNITS_SUPPORTED)
++ 
+++>>>>>>> 16812c96550c (iommu/vt-d: Fix an IOMMU perfmon warning when CPU hotplug):drivers/iommu/intel/iommu.h
+  struct intel_iommu {
+  	void __iomem	*reg; /* Pointer to hardware regs, virtual addr */
+  	u64 		reg_phys; /* physical address of hw register set */
+* Unmerged path drivers/iommu/intel/perfmon.c
+* Unmerged path drivers/iommu/intel/perfmon.c
+* Unmerged path include/linux/cpuhotplug.h
+* Unmerged path include/linux/intel-iommu.h
