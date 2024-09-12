@@ -1,0 +1,236 @@
+scsi: scsi_debug: Use blk_mq_tagset_busy_iter() in stop_all_queued()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-535.el8
+commit-author John Garry <john.g.garry@oracle.com>
+commit 9c559c9b4748fed11687694e65e5d6d1eb2919cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-535.el8/9c559c9b.failed
+
+Instead of iterating all deferred commands in the submission queue
+structures, use blk_mq_tagset_busy_iter(), which is a standard API for
+this.
+
+	Signed-off-by: John Garry <john.g.garry@oracle.com>
+Link: https://lore.kernel.org/r/20230327074310.1862889-9-john.g.garry@oracle.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 9c559c9b4748fed11687694e65e5d6d1eb2919cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_debug.c
+diff --cc drivers/scsi/scsi_debug.c
+index 58c45f546123,9e1586b127bc..000000000000
+--- a/drivers/scsi/scsi_debug.c
++++ b/drivers/scsi/scsi_debug.c
+@@@ -5242,121 -5248,112 +5242,143 @@@ static void scsi_debug_slave_destroy(st
+  	}
+  }
+  
+ -/* Returns true if we require the queued memory to be freed by the caller. */
+ -static bool stop_qc_helper(struct sdebug_defer *sd_dp,
+ +static void stop_qc_helper(struct sdebug_defer *sd_dp,
+  			   enum sdeb_defer_type defer_t)
+  {
+ -	if (defer_t == SDEB_DEFER_HRT) {
+ -		int res = hrtimer_try_to_cancel(&sd_dp->hrt);
+ -
+ -		switch (res) {
+ -		case 0: /* Not active, it must have already run */
+ -		case -1: /* -1 It's executing the CB */
+ -			return false;
+ -		case 1: /* Was active, we've now cancelled */
+ -		default:
+ -			return true;
+ -		}
+ -	} else if (defer_t == SDEB_DEFER_WQ) {
+ -		/* Cancel if pending */
+ -		if (cancel_work_sync(&sd_dp->ew.work))
+ -			return true;
+ -		/* Was not pending, so it must have run */
+ -		return false;
+ -	} else if (defer_t == SDEB_DEFER_POLL) {
+ -		return true;
+ -	}
+ -
+ -	return false;
+ +	if (!sd_dp)
+ +		return;
+ +	if (defer_t == SDEB_DEFER_HRT)
+ +		hrtimer_cancel(&sd_dp->hrt);
+ +	else if (defer_t == SDEB_DEFER_WQ)
+ +		cancel_work_sync(&sd_dp->ew.work);
+  }
+  
+ -
+ -static bool scsi_debug_stop_cmnd(struct scsi_cmnd *cmnd, int *sqa_idx)
+ +/* If @cmnd found deletes its timer or work queue and returns true; else
+ +   returns false */
+ +static bool stop_queued_cmnd(struct scsi_cmnd *cmnd)
+  {
+ +	unsigned long iflags;
+ +	int j, k, qmax, r_qmax;
+  	enum sdeb_defer_type l_defer_t;
+ +	struct sdebug_queue *sqp;
+  	struct sdebug_queued_cmd *sqcp;
+ +	struct sdebug_dev_info *devip;
+  	struct sdebug_defer *sd_dp;
+ -	struct sdebug_scsi_cmd *sdsc = scsi_cmd_priv(cmnd);
+ -
+ -	lockdep_assert_held(&sdsc->lock);
+ -
+ -	sqcp = TO_QUEUED_CMD(cmnd);
+ -	if (!sqcp)
+ -		return false;
+ -	sd_dp = &sqcp->sd_dp;
+ -	if (sqa_idx)
+ -		*sqa_idx = sd_dp->sqa_idx;
+ -	l_defer_t = READ_ONCE(sd_dp->defer_t);
+ -	ASSIGN_QUEUED_CMD(cmnd, NULL);
+  
+ -	if (stop_qc_helper(sd_dp, l_defer_t))
+ -		sdebug_free_queued_cmd(sqcp);
+ -
+ -	return true;
+ -}
+ -
+ -/*
+ - * Called from scsi_debug_abort() only, which is for timed-out cmd.
+ - */
+ -static bool scsi_debug_abort_cmnd(struct scsi_cmnd *cmnd)
+ -{
+ -	struct sdebug_scsi_cmd *sdsc = scsi_cmd_priv(cmnd);
+ -	struct sdebug_queue *sqp = get_queue(cmnd);
+ -	unsigned long flags, iflags;
+ -	int k = -1;
+ -	bool res;
+ -
+ -	spin_lock_irqsave(&sdsc->lock, flags);
+ -	res = scsi_debug_stop_cmnd(cmnd, &k);
+ -	spin_unlock_irqrestore(&sdsc->lock, flags);
+ -
+ -	if (k >= 0) {
+ +	for (j = 0, sqp = sdebug_q_arr; j < submit_queues; ++j, ++sqp) {
+  		spin_lock_irqsave(&sqp->qc_lock, iflags);
+ -		clear_bit(k, sqp->in_use_bm);
+ -		sqp->qc_arr[k] = NULL;
+ +		qmax = sdebug_max_queue;
+ +		r_qmax = atomic_read(&retired_max_queue);
+ +		if (r_qmax > qmax)
+ +			qmax = r_qmax;
+ +		for (k = 0; k < qmax; ++k) {
+ +			if (test_bit(k, sqp->in_use_bm)) {
+ +				sqcp = &sqp->qc_arr[k];
+ +				if (cmnd != sqcp->a_cmnd)
+ +					continue;
+ +				/* found */
+ +				devip = (struct sdebug_dev_info *)
+ +						cmnd->device->hostdata;
+ +				if (devip)
+ +					atomic_dec(&devip->num_in_q);
+ +				sqcp->a_cmnd = NULL;
+ +				sd_dp = sqcp->sd_dp;
+ +				if (sd_dp) {
+ +					l_defer_t = READ_ONCE(sd_dp->defer_t);
+ +					WRITE_ONCE(sd_dp->defer_t, SDEB_DEFER_NONE);
+ +				} else
+ +					l_defer_t = SDEB_DEFER_NONE;
+ +				spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +				stop_qc_helper(sd_dp, l_defer_t);
+ +				clear_bit(k, sqp->in_use_bm);
+ +				return true;
+ +			}
+ +		}
+  		spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+  	}
+ -
+ -	return res;
+ +	return false;
+  }
+  
++ /*
++  * All we can do is set the cmnd as internally aborted and wait for it to
++  * finish. We cannot call scsi_done() as normal completion path may do that.
++  */
++ static bool sdebug_stop_cmnd(struct request *rq, void *data)
++ {
++ 	scsi_debug_abort_cmnd(blk_mq_rq_to_pdu(rq));
++ 
++ 	return true;
++ }
++ 
+  /* Deletes (stops) timers or work queues of all queued commands */
+  static void stop_all_queued(void)
+  {
+++<<<<<<< HEAD
+ +	unsigned long iflags;
+ +	int j, k;
+ +	enum sdeb_defer_type l_defer_t;
+ +	struct sdebug_queue *sqp;
+ +	struct sdebug_queued_cmd *sqcp;
+ +	struct sdebug_dev_info *devip;
+ +	struct sdebug_defer *sd_dp;
+ +
+ +	for (j = 0, sqp = sdebug_q_arr; j < submit_queues; ++j, ++sqp) {
+ +		spin_lock_irqsave(&sqp->qc_lock, iflags);
+ +		for (k = 0; k < SDEBUG_CANQUEUE; ++k) {
+ +			if (test_bit(k, sqp->in_use_bm)) {
+ +				sqcp = &sqp->qc_arr[k];
+ +				if (sqcp->a_cmnd == NULL)
+ +					continue;
+ +				devip = (struct sdebug_dev_info *)
+ +					sqcp->a_cmnd->device->hostdata;
+ +				if (devip)
+ +					atomic_dec(&devip->num_in_q);
+ +				sqcp->a_cmnd = NULL;
+ +				sd_dp = sqcp->sd_dp;
+ +				if (sd_dp) {
+ +					l_defer_t = READ_ONCE(sd_dp->defer_t);
+ +					WRITE_ONCE(sd_dp->defer_t, SDEB_DEFER_NONE);
+ +				} else
+ +					l_defer_t = SDEB_DEFER_NONE;
+ +				spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +				stop_qc_helper(sd_dp, l_defer_t);
+ +				clear_bit(k, sqp->in_use_bm);
+ +				spin_lock_irqsave(&sqp->qc_lock, iflags);
+ +			}
+ +		}
+ +		spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+++=======
++ 	struct sdebug_host_info *sdhp;
++ 
++ 	mutex_lock(&sdebug_host_list_mutex);
++ 	list_for_each_entry(sdhp, &sdebug_host_list, host_list) {
++ 		struct Scsi_Host *shost = sdhp->shost;
++ 
++ 		blk_mq_tagset_busy_iter(&shost->tag_set, sdebug_stop_cmnd, NULL);
+++>>>>>>> 9c559c9b4748 (scsi: scsi_debug: Use blk_mq_tagset_busy_iter() in stop_all_queued())
+  	}
++ 	mutex_unlock(&sdebug_host_list_mutex);
+  }
+  
+ +/* Free queued command memory on heap */
+ +static void free_all_queued(void)
+ +{
+ +	int j, k;
+ +	struct sdebug_queue *sqp;
+ +	struct sdebug_queued_cmd *sqcp;
+ +
+ +	for (j = 0, sqp = sdebug_q_arr; j < submit_queues; ++j, ++sqp) {
+ +		for (k = 0; k < SDEBUG_CANQUEUE; ++k) {
+ +			sqcp = &sqp->qc_arr[k];
+ +			kfree(sqcp->sd_dp);
+ +			sqcp->sd_dp = NULL;
+ +		}
+ +	}
+ +}
+ +
+  static int scsi_debug_abort(struct scsi_cmnd *SCpnt)
+  {
+ -	bool ok = scsi_debug_abort_cmnd(SCpnt);
+ +	bool ok;
+  
+  	++num_aborts;
+  
+* Unmerged path drivers/scsi/scsi_debug.c
