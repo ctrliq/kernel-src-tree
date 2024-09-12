@@ -1,0 +1,156 @@
+dm-integrity, dm-verity: reduce stack usage for recheck
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-546.el8
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit 66ad2fbcdbeab0edfd40c5d94f32f053b98c2320
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-546.el8/66ad2fbc.failed
+
+The newly added integrity_recheck() function has another larger stack
+allocation, just like its caller integrity_metadata(). When it gets
+inlined, the combination of the two exceeds the warning limit for 32-bit
+architectures and possibly risks an overflow when this is called from
+a deep call chain through a file system:
+
+drivers/md/dm-integrity.c:1767:13: error: stack frame size (1048) exceeds limit (1024) in 'integrity_metadata' [-Werror,-Wframe-larger-than]
+ 1767 | static void integrity_metadata(struct work_struct *w)
+
+Since the caller at this point is done using its checksum buffer,
+just reuse the same buffer in the new function to avoid the double
+allocation.
+
+[Mikulas: add "noinline" to integrity_recheck and verity_recheck.
+These functions are only called on error, so they shouldn't bloat the
+stack frame or code size of the caller.]
+
+Fixes: c88f5e553fe3 ("dm-integrity: recheck the integrity tag after a failure")
+Fixes: 9177f3c0dea6 ("dm-verity: recheck the hash after a failure")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 66ad2fbcdbeab0edfd40c5d94f32f053b98c2320)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-integrity.c
+diff --cc drivers/md/dm-integrity.c
+index f8a57682f671,1fc901df84eb..000000000000
+--- a/drivers/md/dm-integrity.c
++++ b/drivers/md/dm-integrity.c
+@@@ -1695,6 -1691,77 +1695,80 @@@ failed
+  	get_random_bytes(result, ic->tag_size);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static noinline void integrity_recheck(struct dm_integrity_io *dio, char *checksum)
++ {
++ 	struct bio *bio = dm_bio_from_per_bio_data(dio, sizeof(struct dm_integrity_io));
++ 	struct dm_integrity_c *ic = dio->ic;
++ 	struct bvec_iter iter;
++ 	struct bio_vec bv;
++ 	sector_t sector, logical_sector, area, offset;
++ 	struct page *page;
++ 	void *buffer;
++ 
++ 	get_area_and_offset(ic, dio->range.logical_sector, &area, &offset);
++ 	dio->metadata_block = get_metadata_sector_and_offset(ic, area, offset,
++ 							     &dio->metadata_offset);
++ 	sector = get_data_sector(ic, area, offset);
++ 	logical_sector = dio->range.logical_sector;
++ 
++ 	page = mempool_alloc(&ic->recheck_pool, GFP_NOIO);
++ 	buffer = page_to_virt(page);
++ 
++ 	__bio_for_each_segment(bv, bio, iter, dio->bio_details.bi_iter) {
++ 		unsigned pos = 0;
++ 
++ 		do {
++ 			char *mem;
++ 			int r;
++ 			struct dm_io_request io_req;
++ 			struct dm_io_region io_loc;
++ 			io_req.bi_opf = REQ_OP_READ;
++ 			io_req.mem.type = DM_IO_KMEM;
++ 			io_req.mem.ptr.addr = buffer;
++ 			io_req.notify.fn = NULL;
++ 			io_req.client = ic->io;
++ 			io_loc.bdev = ic->dev->bdev;
++ 			io_loc.sector = sector;
++ 			io_loc.count = ic->sectors_per_block;
++ 
++ 			r = dm_io(&io_req, 1, &io_loc, NULL);
++ 			if (unlikely(r)) {
++ 				dio->bi_status = errno_to_blk_status(r);
++ 				goto free_ret;
++ 			}
++ 
++ 			integrity_sector_checksum(ic, logical_sector, buffer, checksum);
++ 			r = dm_integrity_rw_tag(ic, checksum, &dio->metadata_block,
++ 						&dio->metadata_offset, ic->tag_size, TAG_CMP);
++ 			if (r) {
++ 				if (r > 0) {
++ 					DMERR_LIMIT("%pg: Checksum failed at sector 0x%llx",
++ 						    bio->bi_bdev, logical_sector);
++ 					atomic64_inc(&ic->number_of_mismatches);
++ 					dm_audit_log_bio(DM_MSG_PREFIX, "integrity-checksum",
++ 							 bio, logical_sector, 0);
++ 					r = -EILSEQ;
++ 				}
++ 				dio->bi_status = errno_to_blk_status(r);
++ 				goto free_ret;
++ 			}
++ 
++ 			mem = bvec_kmap_local(&bv);
++ 			memcpy(mem + pos, buffer, ic->sectors_per_block << SECTOR_SHIFT);
++ 			kunmap_local(mem);
++ 
++ 			pos += ic->sectors_per_block << SECTOR_SHIFT;
++ 			sector += ic->sectors_per_block;
++ 			logical_sector += ic->sectors_per_block;
++ 		} while (pos < bv.bv_len);
++ 	}
++ free_ret:
++ 	mempool_free(page, &ic->recheck_pool);
++ }
++ 
+++>>>>>>> 66ad2fbcdbea (dm-integrity, dm-verity: reduce stack usage for recheck)
+  static void integrity_metadata(struct work_struct *w)
+  {
+  	struct dm_integrity_io *dio = container_of(w, struct dm_integrity_io, work);
+@@@ -1779,11 -1849,8 +1853,16 @@@ again
+  						checksums_ptr - checksums, dio->op == REQ_OP_READ ? TAG_CMP : TAG_WRITE);
+  			if (unlikely(r)) {
+  				if (r > 0) {
+++<<<<<<< HEAD
+ +					char b[BDEVNAME_SIZE];
+ +					DMERR_LIMIT("%s: Checksum failed at sector 0x%llx", bio_devname(bio, b),
+ +						    (sector - ((r + ic->tag_size - 1) / ic->tag_size)));
+ +					r = -EILSEQ;
+ +					atomic64_inc(&ic->number_of_mismatches);
+++=======
++ 					integrity_recheck(dio, checksums);
++ 					goto skip_io;
+++>>>>>>> 66ad2fbcdbea (dm-integrity, dm-verity: reduce stack usage for recheck)
+  				}
+  				if (likely(checksums != checksums_onstack))
+  					kfree(checksums);
+* Unmerged path drivers/md/dm-integrity.c
+diff --git a/drivers/md/dm-verity-target.c b/drivers/md/dm-verity-target.c
+index 9f51192fa2a4..c13844a9e778 100644
+--- a/drivers/md/dm-verity-target.c
++++ b/drivers/md/dm-verity-target.c
+@@ -482,8 +482,8 @@ static int verity_recheck_copy(struct dm_verity *v, struct dm_verity_io *io,
+ 	return 0;
+ }
+ 
+-static int verity_recheck(struct dm_verity *v, struct dm_verity_io *io,
+-			  struct bvec_iter start, sector_t cur_block)
++static noinline int verity_recheck(struct dm_verity *v, struct dm_verity_io *io,
++				   struct bvec_iter start, sector_t cur_block)
+ {
+ 	struct page *page;
+ 	void *buffer;
