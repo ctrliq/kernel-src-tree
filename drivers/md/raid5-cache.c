@@ -1270,6 +1270,7 @@ static void r5l_log_flush_endio(struct bio *bio)
 
 	if (bio->bi_status)
 		md_error(log->rdev->mddev, log->rdev);
+	bio_uninit(bio);
 
 	spin_lock_irqsave(&log->io_list_lock, flags);
 	list_for_each_entry(io, &log->flushing_ios, log_sibling)
