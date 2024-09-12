@@ -814,8 +814,10 @@ svc_stop_kthreads(struct svc_serv *serv, struct svc_pool *pool, int nrservs)
 			break;
 		rqstp = kthread_data(task);
 		/* Did we lose a race to svo_function threadfn? */
-		if (kthread_stop(task) == -EINTR)
+		if (kthread_stop(task) == -EINTR) {
 			svc_exit_thread(rqstp);
+			module_put(serv->sv_ops->svo_module);
+		}
 		nrservs++;
 	} while (nrservs < 0);
 	return 0;
