@@ -441,7 +441,7 @@ int mlx5e_rss_lro_set_param(struct mlx5e_rss *rss, struct mlx5e_lro_param *lro_p
 			goto inner_tir;
 		err = mlx5e_tir_modify(tir, builder);
 		if (err) {
-			mlx5e_rss_warn(rss->mdev, "Failed to update LRO state of indirect TIR %#x for traffic type %d: err = %d\n",
+			mlx5e_rss_warn(rss->mdev, "Failed to update packet merge state of indirect TIR %#x for traffic type %d: err = %d\n",
 				       mlx5e_tir_get_tirn(tir), tt, err);
 			if (!final_err)
 				final_err = err;
@@ -456,7 +456,7 @@ inner_tir:
 			continue;
 		err = mlx5e_tir_modify(tir, builder);
 		if (err) {
-			mlx5e_rss_warn(rss->mdev, "Failed to update LRO state of inner indirect TIR %#x for traffic type %d: err = %d\n",
+			mlx5e_rss_warn(rss->mdev, "Failed to update packet merge state of inner indirect TIR %#x for traffic type %d: err = %d\n",
 				       mlx5e_tir_get_tirn(tir), tt, err);
 			if (!final_err)
 				final_err = err;
