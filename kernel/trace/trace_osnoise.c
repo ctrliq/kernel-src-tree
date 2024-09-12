@@ -1409,7 +1409,7 @@ static void notify_new_max_latency(u64 latency)
 	rcu_read_lock();
 	list_for_each_entry_rcu(inst, &osnoise_instances, list) {
 		tr = inst->tr;
-		if (tr->max_latency < latency)
+		if (tracer_tracing_is_on(tr) && tr->max_latency < latency)
 			tr->max_latency = latency;
 	}
 	rcu_read_unlock();
@@ -2024,7 +2024,7 @@ static int start_kthread(unsigned int cpu)
 		snprintf(comm, 24, "osnoise/%d", cpu);
 	}
 
-	kthread = kthread_create_on_cpu(func, NULL, cpu, comm);
+	kthread = kthread_run_on_cpu(func, NULL, cpu, comm);
 
 	if (IS_ERR(kthread)) {
 		pr_err(BANNER "could not start sampling thread\n");
@@ -2033,7 +2033,6 @@ static int start_kthread(unsigned int cpu)
 	}
 
 	per_cpu(per_cpu_osnoise_var, cpu).kthread = kthread;
-	wake_up_process(kthread);
 
 	return 0;
 }
@@ -2743,7 +2742,7 @@ static int osnoise_create_cpu_timerlat_fd(struct dentry *top_dir)
 		if (!cpu_dir)
 			goto out_clean;
 
-		timerlat_fd = trace_create_file("timerlat_fd", TRACE_MODE_READ,
+		timerlat_fd = trace_create_file("timerlat_fd", 0440,
 						cpu_dir, NULL, &timerlat_fd_fops);
 		if (!timerlat_fd)
 			goto out_clean;
