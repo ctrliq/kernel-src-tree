@@ -1,0 +1,330 @@
+ACPI: ARM Performance Monitoring Unit Table (APMT) initial support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-529.el8
+commit-author Besar Wicaksono <bwicaksono@nvidia.com>
+commit 6251d38059ae22304ede4f3748af9f795bdbf4fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-529.el8/6251d380.failed
+
+ARM Performance Monitoring Unit Table describes the properties of PMU
+support in ARM-based system. The APMT table contains a list of nodes,
+each represents a PMU in the system that conforms to ARM CoreSight PMU
+architecture. The properties of each node include information required
+to access the PMU (e.g. MMIO base address, interrupt number) and also
+identification. For more detailed information, please refer to the
+specification below:
+ * APMT: https://developer.arm.com/documentation/den0117/latest
+ * ARM Coresight PMU:
+        https://developer.arm.com/documentation/ihi0091/latest
+
+The initial support adds the detection of APMT table and generic
+infrastructure to create platform devices for ARM CoreSight PMUs.
+Similar to IORT the root pointer of APMT is preserved during runtime
+and each PMU platform device is given a pointer to the corresponding
+APMT node.
+
+	Signed-off-by: Besar Wicaksono <bwicaksono@nvidia.com>
+	Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Reviewed-by: Sudeep Holla <sudeep.holla@arm.com>
+Link: https://lore.kernel.org/r/20220929002834.32664-1-bwicaksono@nvidia.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 6251d38059ae22304ede4f3748af9f795bdbf4fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/arm64/Kconfig
+#	drivers/acpi/arm64/Makefile
+#	drivers/acpi/bus.c
+diff --cc drivers/acpi/arm64/Kconfig
+index 5a6f80fce0d6,b3ed6212244c..000000000000
+--- a/drivers/acpi/arm64/Kconfig
++++ b/drivers/acpi/arm64/Kconfig
+@@@ -7,3 -8,16 +7,19 @@@ config ACPI_IOR
+  
+  config ACPI_GTDT
+  	bool
+++<<<<<<< HEAD
+++=======
++ 
++ config ACPI_AGDI
++ 	bool "Arm Generic Diagnostic Dump and Reset Device Interface"
++ 	depends on ARM_SDE_INTERFACE
++ 	help
++ 	  Arm Generic Diagnostic Dump and Reset Device Interface (AGDI) is
++ 	  a standard that enables issuing a non-maskable diagnostic dump and
++ 	  reset command.
++ 
++ 	  If set, the kernel parses AGDI table and listens for the command.
++ 
++ config ACPI_APMT
++ 	bool
+++>>>>>>> 6251d38059ae (ACPI: ARM Performance Monitoring Unit Table (APMT) initial support)
+diff --cc drivers/acpi/arm64/Makefile
+index 1017def2ea12,e21a9e84e394..000000000000
+--- a/drivers/acpi/arm64/Makefile
++++ b/drivers/acpi/arm64/Makefile
+@@@ -1,2 -1,6 +1,7 @@@
+ -# SPDX-License-Identifier: GPL-2.0-only
+ -obj-$(CONFIG_ACPI_AGDI) 	+= agdi.o
+  obj-$(CONFIG_ACPI_IORT) 	+= iort.o
+  obj-$(CONFIG_ACPI_GTDT) 	+= gtdt.o
+++<<<<<<< HEAD
+++=======
++ obj-$(CONFIG_ACPI_APMT) 	+= apmt.o
++ obj-y				+= dma.o
+++>>>>>>> 6251d38059ae (ACPI: ARM Performance Monitoring Unit Table (APMT) initial support)
+diff --cc drivers/acpi/bus.c
+index 840d536285fd,351208eda9be..000000000000
+--- a/drivers/acpi/bus.c
++++ b/drivers/acpi/bus.c
+@@@ -37,7 -26,10 +37,12 @@@
+  #include <asm/mpspec.h>
+  #include <linux/dmi.h>
+  #endif
+++<<<<<<< HEAD
+++=======
++ #include <linux/acpi_agdi.h>
++ #include <linux/acpi_apmt.h>
+++>>>>>>> 6251d38059ae (ACPI: ARM Performance Monitoring Unit Table (APMT) initial support)
+  #include <linux/acpi_iort.h>
+ -#include <linux/acpi_viot.h>
+  #include <linux/pci.h>
+  #include <acpi/apei.h>
+  #include <linux/suspend.h>
+@@@ -1429,6 -1422,9 +1434,12 @@@ static int __init acpi_init(void
+  	acpi_wakeup_device_init();
+  	acpi_debugger_init();
+  	acpi_setup_sb_notify_handler();
+++<<<<<<< HEAD
+++=======
++ 	acpi_viot_init();
++ 	acpi_agdi_init();
++ 	acpi_apmt_init();
+++>>>>>>> 6251d38059ae (ACPI: ARM Performance Monitoring Unit Table (APMT) initial support)
+  	return 0;
+  }
+  
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index c1f0f61dc3d3..7145a73106df 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1,5 +1,6 @@
+ config ARM64
+ 	def_bool y
++	select ACPI_APMT if ACPI
+ 	select ACPI_CCA_REQUIRED if ACPI
+ 	select ACPI_GENERIC_GSI if ACPI
+ 	select ACPI_GTDT if ACPI
+* Unmerged path drivers/acpi/arm64/Kconfig
+* Unmerged path drivers/acpi/arm64/Makefile
+diff --git a/drivers/acpi/arm64/apmt.c b/drivers/acpi/arm64/apmt.c
+new file mode 100644
+index 000000000000..f55167ca51e7
+--- /dev/null
++++ b/drivers/acpi/arm64/apmt.c
+@@ -0,0 +1,177 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ARM APMT table support.
++ * Design document number: ARM DEN0117.
++ *
++ * Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES.
++ *
++ */
++
++#define pr_fmt(fmt)	"ACPI: APMT: " fmt
++
++#include <linux/acpi.h>
++#include <linux/acpi_apmt.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/platform_device.h>
++
++#define DEV_NAME "arm-cs-arch-pmu"
++
++/* There can be up to 3 resources: page 0 and 1 address, and interrupt. */
++#define DEV_MAX_RESOURCE_COUNT 3
++
++/* Root pointer to the mapped APMT table */
++static struct acpi_table_header *apmt_table;
++
++static int __init apmt_init_resources(struct resource *res,
++					      struct acpi_apmt_node *node)
++{
++	int irq, trigger;
++	int num_res = 0;
++
++	res[num_res].start = node->base_address0;
++	res[num_res].end = node->base_address0 + SZ_4K - 1;
++	res[num_res].flags = IORESOURCE_MEM;
++
++	num_res++;
++
++	res[num_res].start = node->base_address1;
++	res[num_res].end = node->base_address1 + SZ_4K - 1;
++	res[num_res].flags = IORESOURCE_MEM;
++
++	num_res++;
++
++	if (node->ovflw_irq != 0) {
++		trigger = (node->ovflw_irq_flags & ACPI_APMT_OVFLW_IRQ_FLAGS_MODE);
++		trigger = (trigger == ACPI_APMT_OVFLW_IRQ_FLAGS_MODE_LEVEL) ?
++			ACPI_LEVEL_SENSITIVE : ACPI_EDGE_SENSITIVE;
++		irq = acpi_register_gsi(NULL, node->ovflw_irq, trigger,
++						ACPI_ACTIVE_HIGH);
++
++		if (irq <= 0) {
++			pr_warn("APMT could not register gsi hwirq %d\n", irq);
++			return num_res;
++		}
++
++		res[num_res].start = irq;
++		res[num_res].end = irq;
++		res[num_res].flags = IORESOURCE_IRQ;
++
++		num_res++;
++	}
++
++	return num_res;
++}
++
++/**
++ * apmt_add_platform_device() - Allocate a platform device for APMT node
++ * @node: Pointer to device ACPI APMT node
++ *
++ * Returns: 0 on success, <0 failure
++ */
++static int __init apmt_add_platform_device(struct acpi_apmt_node *node,
++							struct fwnode_handle *fwnode)
++{
++	struct platform_device *pdev;
++	int ret, count;
++	struct resource res[DEV_MAX_RESOURCE_COUNT];
++
++	pdev = platform_device_alloc(DEV_NAME, PLATFORM_DEVID_AUTO);
++	if (!pdev)
++		return -ENOMEM;
++
++	memset(res, 0, sizeof(res));
++
++	count = apmt_init_resources(res, node);
++
++	ret = platform_device_add_resources(pdev, res, count);
++	if (ret)
++		goto dev_put;
++
++	/*
++	 * Add a copy of APMT node pointer to platform_data to be used to
++	 * retrieve APMT data information.
++	 */
++	ret = platform_device_add_data(pdev, &node, sizeof(node));
++	if (ret)
++		goto dev_put;
++
++	pdev->dev.fwnode = fwnode;
++
++	ret = platform_device_add(pdev);
++
++	if (ret)
++		goto dev_put;
++
++	return 0;
++
++dev_put:
++	platform_device_put(pdev);
++
++	return ret;
++}
++
++static int __init apmt_init_platform_devices(void)
++{
++	struct acpi_apmt_node *apmt_node;
++	struct acpi_table_apmt *apmt;
++	struct fwnode_handle *fwnode;
++	u64 offset, end;
++	int ret;
++
++	/*
++	 * apmt_table and apmt both point to the start of APMT table, but
++	 * have different struct types
++	 */
++	apmt = (struct acpi_table_apmt *)apmt_table;
++	offset = sizeof(*apmt);
++	end = apmt->header.length;
++
++	while (offset < end) {
++		apmt_node = ACPI_ADD_PTR(struct acpi_apmt_node, apmt,
++				 offset);
++
++		fwnode = acpi_alloc_fwnode_static();
++		if (!fwnode)
++			return -ENOMEM;
++
++		ret = apmt_add_platform_device(apmt_node, fwnode);
++		if (ret) {
++			acpi_free_fwnode_static(fwnode);
++			return ret;
++		}
++
++		offset += apmt_node->length;
++	}
++
++	return 0;
++}
++
++void __init acpi_apmt_init(void)
++{
++	acpi_status status;
++	int ret;
++
++	/**
++	 * APMT table nodes will be used at runtime after the apmt init,
++	 * so we don't need to call acpi_put_table() to release
++	 * the APMT table mapping.
++	 */
++	status = acpi_get_table(ACPI_SIG_APMT, 0, &apmt_table);
++
++	if (ACPI_FAILURE(status)) {
++		if (status != AE_NOT_FOUND) {
++			const char *msg = acpi_format_exception(status);
++
++			pr_err("Failed to get APMT table, %s\n", msg);
++		}
++
++		return;
++	}
++
++	ret = apmt_init_platform_devices();
++	if (ret) {
++		pr_err("Failed to initialize APMT platform devices, ret: %d\n", ret);
++		acpi_put_table(apmt_table);
++	}
++}
+* Unmerged path drivers/acpi/bus.c
+diff --git a/include/linux/acpi_apmt.h b/include/linux/acpi_apmt.h
+new file mode 100644
+index 000000000000..40bd634d082f
+--- /dev/null
++++ b/include/linux/acpi_apmt.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0
++ *
++ * ARM CoreSight PMU driver.
++ * Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES.
++ *
++ */
++
++#ifndef __ACPI_APMT_H__
++#define __ACPI_APMT_H__
++
++#include <linux/acpi.h>
++
++#ifdef CONFIG_ACPI_APMT
++void acpi_apmt_init(void);
++#else
++static inline void acpi_apmt_init(void) { }
++#endif /* CONFIG_ACPI_APMT */
++
++#endif /* __ACPI_APMT_H__ */
