@@ -1,0 +1,89 @@
+tracing/histogram: Fix sorting on old "cpu" value
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-507.el8
+commit-author Steven Rostedt (Google) <rostedt@goodmis.org>
+commit 1d1898f65616c4601208963c3376c1d828cbf2c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-507.el8/1d1898f6.failed
+
+When trying to add a histogram against an event with the "cpu" field, it
+was impossible due to "cpu" being a keyword to key off of the running CPU.
+So to fix this, it was changed to "common_cpu" to match the other generic
+fields (like "common_pid"). But since some scripts used "cpu" for keying
+off of the CPU (for events that did not have "cpu" as a field, which is
+most of them), a backward compatibility trick was added such that if "cpu"
+was used as a key, and the event did not have "cpu" as a field name, then
+it would fallback and switch over to "common_cpu".
+
+This fix has a couple of subtle bugs. One was that when switching over to
+"common_cpu", it did not change the field name, it just set a flag. But
+the code still found a "cpu" field. The "cpu" field is used for filtering
+and is returned when the event does not have a "cpu" field.
+
+This was found by:
+
+  # cd /sys/kernel/tracing
+  # echo hist:key=cpu,pid:sort=cpu > events/sched/sched_wakeup/trigger
+  # cat events/sched/sched_wakeup/hist
+
+Which showed the histogram unsorted:
+
+{ cpu:         19, pid:       1175 } hitcount:          1
+{ cpu:          6, pid:        239 } hitcount:          2
+{ cpu:         23, pid:       1186 } hitcount:         14
+{ cpu:         12, pid:        249 } hitcount:          2
+{ cpu:          3, pid:        994 } hitcount:          5
+
+Instead of hard coding the "cpu" checks, take advantage of the fact that
+trace_event_field_field() returns a special field for "cpu" and "CPU" if
+the event does not have "cpu" as a field. This special field has the
+"filter_type" of "FILTER_CPU". Check that to test if the returned field is
+of the CPU type instead of doing the string compare.
+
+Also, fix the sorting bug by testing for the hist_field flag of
+HIST_FIELD_FL_CPU when setting up the sort routine. Otherwise it will use
+the special CPU field to know what compare routine to use, and since that
+special field does not have a size, it returns tracing_map_cmp_none.
+
+	Cc: stable@vger.kernel.org
+Fixes: 1e3bac71c505 ("tracing/histogram: Rename "cpu" to "common_cpu"")
+	Reported-by: Daniel Bristot de Oliveira <bristot@kernel.org>
+	Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+(cherry picked from commit 1d1898f65616c4601208963c3376c1d828cbf2c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_events_hist.c
+diff --cc kernel/trace/trace_events_hist.c
+index 8c9a20db1b9a,dc7f733b4cb3..000000000000
+--- a/kernel/trace/trace_events_hist.c
++++ b/kernel/trace/trace_events_hist.c
+@@@ -2523,9 -2286,19 +2523,25 @@@ parse_field(struct hist_trigger_data *h
+  	else {
+  		field = trace_find_event_field(file->event_call, field_name);
+  		if (!field || !field->size) {
+++<<<<<<< HEAD
+ +			hist_err("Couldn't find field: ", field_name);
+ +			field = ERR_PTR(-EINVAL);
+ +			goto out;
+++=======
++ 			/*
++ 			 * For backward compatibility, if field_name
++ 			 * was "cpu", then we treat this the same as
++ 			 * common_cpu. This also works for "CPU".
++ 			 */
++ 			if (field && field->filter_type == FILTER_CPU) {
++ 				*flags |= HIST_FIELD_FL_CPU;
++ 			} else {
++ 				hist_err(tr, HIST_ERR_FIELD_NOT_FOUND,
++ 					 errpos(field_name));
++ 				field = ERR_PTR(-EINVAL);
++ 				goto out;
++ 			}
+++>>>>>>> 1d1898f65616 (tracing/histogram: Fix sorting on old "cpu" value)
+  		}
+  	}
+   out:
+* Unmerged path kernel/trace/trace_events_hist.c
