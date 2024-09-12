@@ -1,0 +1,213 @@
+x86/sev: Register GHCB memory when SEV-SNP is active
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Brijesh Singh <brijesh.singh@amd.com>
+commit 95d33bfaa3e169cfec1926e0d0f0c6b0ea75d763
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/95d33bfa.failed
+
+The SEV-SNP guest is required by the GHCB spec to register the GHCB's
+Guest Physical Address (GPA). This is because the hypervisor may prefer
+that a guest uses a consistent and/or specific GPA for the GHCB associated
+with a vCPU. For more information, see the GHCB specification section
+"GHCB GPA Registration".
+
+  [ bp: Cleanup comments. ]
+
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20220307213356.2797205-18-brijesh.singh@amd.com
+(cherry picked from commit 95d33bfaa3e169cfec1926e0d0f0c6b0ea75d763)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/sev.h
+#	arch/x86/kernel/cpu/common.c
+#	arch/x86/kernel/sev-shared.c
+diff --cc arch/x86/include/asm/sev.h
+index 45ba3d868cd3,48df02713ee0..000000000000
+--- a/arch/x86/include/asm/sev.h
++++ b/arch/x86/include/asm/sev.h
+@@@ -114,6 -130,8 +115,11 @@@ static inline int sev_es_setup_ap_jump_
+  static inline void sev_es_nmi_complete(void) { }
+  static inline int sev_es_efi_map_ghcbs(pgd_t *pgd) { return 0; }
+  static inline int pvalidate(unsigned long vaddr, bool rmp_psize, bool validate) { return 0; }
+++<<<<<<< HEAD
+++=======
++ static inline int rmpadjust(unsigned long vaddr, bool rmp_psize, unsigned long attrs) { return 0; }
++ static inline void setup_ghcb(void) { }
+++>>>>>>> 95d33bfaa3e1 (x86/sev: Register GHCB memory when SEV-SNP is active)
+  #endif
+  
+  #endif
+diff --cc arch/x86/kernel/cpu/common.c
+index 54eadbbc684d,9e4552133872..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -54,9 -57,10 +54,14 @@@
+  #include <asm/microcode_intel.h>
+  #include <asm/intel-family.h>
+  #include <asm/cpu_device_id.h>
+ +
+  #include <asm/uv/uv.h>
+  #include <asm/sigframe.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/traps.h>
++ #include <asm/sev.h>
+++>>>>>>> 95d33bfaa3e1 (x86/sev: Register GHCB memory when SEV-SNP is active)
+  
+  #include "cpu.h"
+  
+diff --cc arch/x86/kernel/sev-shared.c
+index 91ece8db542a,3aaef1a18ffe..000000000000
+--- a/arch/x86/kernel/sev-shared.c
++++ b/arch/x86/kernel/sev-shared.c
+@@@ -48,6 -48,42 +48,45 @@@ static void __noreturn sev_es_terminate
+  		asm volatile("hlt\n" : : : "memory");
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The hypervisor features are available from GHCB version 2 onward.
++  */
++ static u64 get_hv_features(void)
++ {
++ 	u64 val;
++ 
++ 	if (ghcb_version < 2)
++ 		return 0;
++ 
++ 	sev_es_wr_ghcb_msr(GHCB_MSR_HV_FT_REQ);
++ 	VMGEXIT();
++ 
++ 	val = sev_es_rd_ghcb_msr();
++ 	if (GHCB_RESP_CODE(val) != GHCB_MSR_HV_FT_RESP)
++ 		return 0;
++ 
++ 	return GHCB_MSR_HV_FT_RESP_VAL(val);
++ }
++ 
++ static void snp_register_ghcb_early(unsigned long paddr)
++ {
++ 	unsigned long pfn = paddr >> PAGE_SHIFT;
++ 	u64 val;
++ 
++ 	sev_es_wr_ghcb_msr(GHCB_MSR_REG_GPA_REQ_VAL(pfn));
++ 	VMGEXIT();
++ 
++ 	val = sev_es_rd_ghcb_msr();
++ 
++ 	/* If the response GPA is not ours then abort the guest */
++ 	if ((GHCB_RESP_CODE(val) != GHCB_MSR_REG_GPA_RESP) ||
++ 	    (GHCB_MSR_REG_GPA_RESP_VAL(val) != pfn))
++ 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_REGISTER);
++ }
++ 
+++>>>>>>> 95d33bfaa3e1 (x86/sev: Register GHCB memory when SEV-SNP is active)
+  static bool sev_es_negotiate_protocol(void)
+  {
+  	u64 val;
+* Unmerged path arch/x86/include/asm/sev.h
+* Unmerged path arch/x86/kernel/cpu/common.c
+diff --git a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
+index b381f48d4860..15d549ac9344 100644
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@ -584,8 +584,10 @@ static void startup_64_load_idt(unsigned long physbase)
+ void early_setup_idt(void)
+ {
+ 	/* VMM Communication Exception */
+-	if (IS_ENABLED(CONFIG_AMD_MEM_ENCRYPT))
++	if (IS_ENABLED(CONFIG_AMD_MEM_ENCRYPT)) {
++		setup_ghcb();
+ 		set_bringup_idt_handler(bringup_idt_table, X86_TRAP_VC, vc_boot_ghcb);
++	}
+ 
+ 	bringup_idt_descr.address = (unsigned long)bringup_idt_table;
+ 	native_load_idt(&bringup_idt_descr);
+* Unmerged path arch/x86/kernel/sev-shared.c
+diff --git a/arch/x86/kernel/sev.c b/arch/x86/kernel/sev.c
+index 9f3a4a57b1e6..a25894e19b29 100644
+--- a/arch/x86/kernel/sev.c
++++ b/arch/x86/kernel/sev.c
+@@ -42,7 +42,7 @@ static struct ghcb boot_ghcb_page __bss_decrypted __aligned(PAGE_SIZE);
+  * Needs to be in the .data section because we need it NULL before bss is
+  * cleared
+  */
+-static struct ghcb __initdata *boot_ghcb;
++static struct ghcb *boot_ghcb __section(".data");
+ 
+ /* #VC handler runtime per-CPU data */
+ struct sev_es_runtime_data {
+@@ -630,15 +630,39 @@ static enum es_result vc_handle_msr(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
+ 	return ret;
+ }
+ 
+-/*
+- * This function runs on the first #VC exception after the kernel
+- * switched to virtual addresses.
+- */
+-static bool __init sev_es_setup_ghcb(void)
++static void snp_register_per_cpu_ghcb(void)
+ {
++	struct sev_es_runtime_data *data;
++	struct ghcb *ghcb;
++
++	data = this_cpu_read(runtime_data);
++	ghcb = &data->ghcb_page;
++
++	snp_register_ghcb_early(__pa(ghcb));
++}
++
++void setup_ghcb(void)
++{
++	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
++		return;
++
+ 	/* First make sure the hypervisor talks a supported protocol. */
+ 	if (!sev_es_negotiate_protocol())
+-		return false;
++		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_GEN_REQ);
++
++	/*
++	 * Check whether the runtime #VC exception handler is active. It uses
++	 * the per-CPU GHCB page which is set up by sev_es_init_vc_handling().
++	 *
++	 * If SNP is active, register the per-CPU GHCB page so that the runtime
++	 * exception handler can use it.
++	 */
++	if (initial_vc_handler == (unsigned long)kernel_exc_vmm_communication) {
++		if (cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
++			snp_register_per_cpu_ghcb();
++
++		return;
++	}
+ 
+ 	/*
+ 	 * Clear the boot_ghcb. The first exception comes in before the bss
+@@ -649,7 +673,9 @@ static bool __init sev_es_setup_ghcb(void)
+ 	/* Alright - Make the boot-ghcb public */
+ 	boot_ghcb = &boot_ghcb_page;
+ 
+-	return true;
++	/* SNP guest requires that GHCB GPA must be registered. */
++	if (cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
++		snp_register_ghcb_early(__pa(&boot_ghcb_page));
+ }
+ 
+ #ifdef CONFIG_HOTPLUG_CPU
+@@ -1447,10 +1473,6 @@ bool __init handle_vc_boot_ghcb(struct pt_regs *regs)
+ 	struct es_em_ctxt ctxt;
+ 	enum es_result result;
+ 
+-	/* Do initial setup or terminate the guest */
+-	if (unlikely(boot_ghcb == NULL && !sev_es_setup_ghcb()))
+-		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_GEN_REQ);
+-
+ 	vc_ghcb_invalidate(boot_ghcb);
+ 
+ 	result = vc_init_em_ctxt(&ctxt, regs, exit_code);
