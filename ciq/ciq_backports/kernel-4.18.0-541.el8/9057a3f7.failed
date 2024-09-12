@@ -1,0 +1,254 @@
+EDAC/ghes: Prepare to make ghes_edac a proper module
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-541.el8
+commit-author Jia He <justin.he@arm.com>
+commit 9057a3f7ac360e068ceb261938e9ae2b1a7e654c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-541.el8/9057a3f7.failed
+
+To make ghes_edac a proper module, prepare to decouple its dependencies
+from GHES.
+
+Move the ghes_edac.force_load parameter to ghes.c in order to
+properly control whether ghes_edac should be force-loaded: In
+ghes_edac_register() it is too late to set the module flag.
+
+Introduce a helper ghes_get_devices(), which returns the list of GHES
+devices which got probed when the platform-check passes on the system.
+
+The previous force_load check is not needed in ghes_edac_unregister()
+since it will be checked in the module's init function of ghes_edac
+later.
+
+  [ bp: Massage. ]
+
+	Suggested-by: Toshi Kani <toshi.kani@hpe.com>
+	Suggested-by: Borislav Petkov <bp@alien8.de>
+	Signed-off-by: Jia He <justin.he@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20221010023559.69655-4-justin.he@arm.com
+(cherry picked from commit 9057a3f7ac360e068ceb261938e9ae2b1a7e654c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/apei/ghes.c
+#	drivers/edac/ghes_edac.c
+diff --cc drivers/acpi/apei/ghes.c
+index 0b21f8827cc4,acab512741f6..000000000000
+--- a/drivers/acpi/apei/ghes.c
++++ b/drivers/acpi/apei/ghes.c
+@@@ -1462,8 -1464,14 +1482,12 @@@ static int ghes_remove(struct platform_
+  
+  	ghes_edac_unregister(ghes);
+  
++ 	mutex_lock(&ghes_devs_mutex);
++ 	list_del(&ghes->elist);
++ 	mutex_unlock(&ghes_devs_mutex);
++ 
+  	kfree(ghes);
+  
+ -	platform_set_drvdata(ghes_dev, NULL);
+ -
+  	return 0;
+  }
+  
+@@@ -1512,9 -1522,42 +1536,41 @@@ static int __init ghes_init(void
+  		pr_info(GHES_PFX "APEI firmware first mode is enabled by APEI bit.\n");
+  	else
+  		pr_info(GHES_PFX "Failed to enable APEI firmware first mode.\n");
+ -}
+  
+++<<<<<<< HEAD
+ +	return 0;
+ +err:
+ +	return rc;
+++=======
++ /*
++  * Known x86 systems that prefer GHES error reporting:
++  */
++ static struct acpi_platform_list plat_list[] = {
++ 	{"HPE   ", "Server  ", 0, ACPI_SIG_FADT, all_versions},
++ 	{ } /* End */
++ };
++ 
++ struct list_head *ghes_get_devices(void)
++ {
++ 	int idx = -1;
++ 
++ 	if (IS_ENABLED(CONFIG_X86)) {
++ 		idx = acpi_match_platform_list(plat_list);
++ 		if (idx < 0) {
++ 			if (!ghes_edac_force_enable)
++ 				return NULL;
++ 
++ 			pr_warn_once("Force-loading ghes_edac on an unsupported platform. You're on your own!\n");
++ 		}
++ 	}
++ 
++ 	return &ghes_devs;
++ }
++ EXPORT_SYMBOL_GPL(ghes_get_devices);
++ 
++ void ghes_register_report_chain(struct notifier_block *nb)
++ {
++ 	atomic_notifier_chain_register(&ghes_report_chain, nb);
+++>>>>>>> 9057a3f7ac36 (EDAC/ghes: Prepare to make ghes_edac a proper module)
+  }
+ -EXPORT_SYMBOL_GPL(ghes_register_report_chain);
+ -
+ -void ghes_unregister_report_chain(struct notifier_block *nb)
+ -{
+ -	atomic_notifier_chain_unregister(&ghes_report_chain, nb);
+ -}
+ -EXPORT_SYMBOL_GPL(ghes_unregister_report_chain);
+ +device_initcall(ghes_init);
+diff --cc drivers/edac/ghes_edac.c
+index 0365a010a90d,b85a545d1cb0..000000000000
+--- a/drivers/edac/ghes_edac.c
++++ b/drivers/edac/ghes_edac.c
+@@@ -45,9 -54,7 +45,13 @@@ static DEFINE_MUTEX(ghes_reg_mutex)
+   */
+  static DEFINE_SPINLOCK(ghes_lock);
+  
+++<<<<<<< HEAD
+ +/* "ghes_edac.force_load=1" skips the platform check */
+ +static bool __read_mostly force_load;
+ +module_param(force_load, bool, 0);
+++=======
++ static bool system_scanned;
+++>>>>>>> 9057a3f7ac36 (EDAC/ghes: Prepare to make ghes_edac a proper module)
+  
+  /* Memory Device - Type 17 of SMBIOS spec */
+  struct memdev_dmi_entry {
+@@@ -473,14 -374,13 +477,20 @@@ void ghes_edac_report_mem_error(int sev
+  
+  unlock:
+  	spin_unlock_irqrestore(&ghes_lock, flags);
+ -
+ -	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Known systems that are safe to enable this module.
+ + */
+ +static struct acpi_platform_list plat_list[] = {
+ +	{"HPE   ", "Server  ", 0, ACPI_SIG_FADT, all_versions},
+ +	{ } /* End */
+++=======
++ static struct notifier_block ghes_edac_mem_err_nb = {
++ 	.notifier_call	= ghes_edac_report_mem_error,
++ 	.priority	= 0,
+++>>>>>>> 9057a3f7ac36 (EDAC/ghes: Prepare to make ghes_edac a proper module)
+  };
+  
+  int ghes_edac_register(struct ghes *ghes, struct device *dev)
+@@@ -490,19 -389,9 +500,24 @@@
+  	struct mem_ctl_info *mci;
+  	struct ghes_pvt *pvt;
+  	struct edac_mc_layer layers[1];
+ +	struct ghes_edac_dimm_fill dimm_fill;
+  	unsigned long flags;
+++<<<<<<< HEAD
+ +	int idx = -1;
+ +
+ +	if (IS_ENABLED(CONFIG_X86)) {
+ +		/* Check if safe to enable on this system */
+ +		idx = acpi_match_platform_list(plat_list);
+ +		if (!force_load && idx < 0)
+ +			return -ENODEV;
+ +	} else {
+ +		idx = 0;
+ +	}
+ +
+++=======
++ 	int rc = 0;
++ 
+++>>>>>>> 9057a3f7ac36 (EDAC/ghes: Prepare to make ghes_edac a proper module)
+  	/* finish another registration/unregistration instance first */
+  	mutex_lock(&ghes_reg_mutex);
+  
+@@@ -547,19 -435,35 +562,24 @@@
+  		pr_info("This system has a very crappy BIOS: It doesn't even list the DIMMS.\n");
+  		pr_info("Its SMBIOS info is wrong. It is doubtful that the error report would\n");
+  		pr_info("work on such system. Use this driver with caution\n");
+++<<<<<<< HEAD
+ +	} else if (idx < 0) {
+ +		pr_info("This EDAC driver relies on BIOS to enumerate memory and get error reports.\n");
+ +		pr_info("Unfortunately, not all BIOSes reflect the memory layout correctly.\n");
+ +		pr_info("So, the end result of using this driver varies from vendor to vendor.\n");
+ +		pr_info("If you find incorrect reports, please contact your hardware vendor\n");
+ +		pr_info("to correct its BIOS.\n");
+ +		pr_info("This system has %d DIMM sockets.\n", num_dimm);
+++=======
+++>>>>>>> 9057a3f7ac36 (EDAC/ghes: Prepare to make ghes_edac a proper module)
+  	}
+  
++ 	pr_info("This system has %d DIMM sockets.\n", ghes_hw.num_dimms);
++ 
+  	if (!fake) {
+ -		struct dimm_info *src, *dst;
+ -		int i = 0;
+ -
+ -		mci_for_each_dimm(mci, dst) {
+ -			src = &ghes_hw.dimms[i];
+ -
+ -			dst->idx	   = src->idx;
+ -			dst->smbios_handle = src->smbios_handle;
+ -			dst->nr_pages	   = src->nr_pages;
+ -			dst->mtype	   = src->mtype;
+ -			dst->edac_mode	   = src->edac_mode;
+ -			dst->dtype	   = src->dtype;
+ -			dst->grain	   = src->grain;
+ -
+ -			/*
+ -			 * If no src->label, preserve default label assigned
+ -			 * from EDAC core.
+ -			 */
+ -			if (strlen(src->label))
+ -				memcpy(dst->label, src->label, sizeof(src->label));
+ -
+ -			i++;
+ -		}
+ -
+ +		dimm_fill.count = 0;
+ +		dimm_fill.mci = mci;
+ +		dmi_walk(ghes_edac_dmidecode, &dimm_fill);
+  	} else {
+  		struct dimm_info *dimm = edac_get_dimm(mci, 0, 0, 0);
+  
+* Unmerged path drivers/acpi/apei/ghes.c
+* Unmerged path drivers/edac/ghes_edac.c
+diff --git a/include/acpi/ghes.h b/include/acpi/ghes.h
+index 292a5c40bd0c..e2963a835f77 100644
+--- a/include/acpi/ghes.h
++++ b/include/acpi/ghes.h
+@@ -27,6 +27,8 @@ struct ghes {
+ 		struct timer_list timer;
+ 		unsigned int irq;
+ 	};
++	struct device *dev;
++	struct list_head elist;
+ };
+ 
+ struct ghes_estatus_node {
+@@ -82,6 +84,8 @@ int ghes_edac_register(struct ghes *ghes, struct device *dev);
+ 
+ void ghes_edac_unregister(struct ghes *ghes);
+ 
++struct list_head *ghes_get_devices(void);
++
+ #else
+ static inline void ghes_edac_report_mem_error(int sev,
+ 				       struct cper_sec_mem_err *mem_err)
+@@ -96,6 +100,8 @@ static inline int ghes_edac_register(struct ghes *ghes, struct device *dev)
+ static inline void ghes_edac_unregister(struct ghes *ghes)
+ {
+ }
++
++static inline struct list_head *ghes_get_devices(void) { return NULL; }
+ #endif
+ 
+ static inline int acpi_hest_get_version(struct acpi_hest_generic_data *gdata)
