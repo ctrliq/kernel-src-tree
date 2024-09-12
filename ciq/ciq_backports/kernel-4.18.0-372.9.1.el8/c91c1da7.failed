@@ -1,0 +1,166 @@
+net/mlx5e: Fix mutual exclusion between CQE compression and HW TS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Aya Levin <ayal@nvidia.com>
+commit c91c1da72b47fc4c5e353cdd9099ba94ae07d2fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/c91c1da7.failed
+
+Some profiles of the driver don't support a dedicated PTP-RQ, hence can't
+support HW TS and CQE compression simultaneously. When HW TS is enabled
+the COE compression is disabled, and should be restored when the HW TS
+is turned off. Add rx_filter as an input to modifying CQE compression to
+enforce this restriction.
+
+Fixes: 256f79d13c1d ("net/mlx5e: Fix HW TS with CQE compression according to profile")
+	Signed-off-by: Aya Levin <ayal@nvidia.com>
+	Reviewed-by: Moshe Shemesh <moshe@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit c91c1da72b47fc4c5e353cdd9099ba94ae07d2fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index f0d51e7c3d41,306fb5d6a36d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@@ -1907,10 -1884,10 +1907,10 @@@ static int set_pflag_rx_cqe_based_moder
+  	return set_pflag_cqe_based_moder(netdev, enable, true);
+  }
+  
+- int mlx5e_modify_rx_cqe_compression_locked(struct mlx5e_priv *priv, bool new_val)
++ int mlx5e_modify_rx_cqe_compression_locked(struct mlx5e_priv *priv, bool new_val, bool rx_filter)
+  {
+  	bool curr_val = MLX5E_GET_PFLAG(&priv->channels.params, MLX5E_PFLAG_RX_CQE_COMPRESS);
+ -	struct mlx5e_params new_params;
+ +	struct mlx5e_channels new_channels = {};
+  	int err = 0;
+  
+  	if (!MLX5_CAP_GEN(priv->mdev, cqe_compression))
+@@@ -1919,15 -1896,22 +1919,34 @@@
+  	if (curr_val == new_val)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	new_channels.params = priv->channels.params;
+ +	MLX5E_SET_PFLAG(&new_channels.params, MLX5E_PFLAG_RX_CQE_COMPRESS, new_val);
+ +
+ +	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+ +		priv->channels.params = new_channels.params;
+ +		return 0;
+ +	}
+ +
+ +	err = mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
+++=======
++ 	if (new_val && !priv->profile->rx_ptp_support && rx_filter) {
++ 		netdev_err(priv->netdev,
++ 			   "Profile doesn't support enabling of CQE compression while hardware time-stamping is enabled.\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	new_params = priv->channels.params;
++ 	MLX5E_SET_PFLAG(&new_params, MLX5E_PFLAG_RX_CQE_COMPRESS, new_val);
++ 	if (rx_filter)
++ 		new_params.ptp_rx = new_val;
++ 
++ 	if (new_params.ptp_rx == priv->channels.params.ptp_rx)
++ 		err = mlx5e_safe_switch_params(priv, &new_params, NULL, NULL, true);
++ 	else
++ 		err = mlx5e_safe_switch_params(priv, &new_params, mlx5e_ptp_rx_manage_fs_ctx,
++ 					       &new_params.ptp_rx, true);
+++>>>>>>> c91c1da72b47 (net/mlx5e: Fix mutual exclusion between CQE compression and HW TS)
+  	if (err)
+  		return err;
+  
+@@@ -1948,12 -1933,8 +1968,17 @@@ static int set_pflag_rx_cqe_compress(st
+  	if (!MLX5_CAP_GEN(mdev, cqe_compression))
+  		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	if (enable && priv->tstamp.rx_filter != HWTSTAMP_FILTER_NONE) {
+ +		netdev_err(netdev, "Can't enable cqe compression while timestamping is enabled.\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	err = mlx5e_modify_rx_cqe_compression_locked(priv, enable);
+++=======
++ 	rx_filter = priv->tstamp.rx_filter != HWTSTAMP_FILTER_NONE;
++ 	err = mlx5e_modify_rx_cqe_compression_locked(priv, enable, rx_filter);
+++>>>>>>> c91c1da72b47 (net/mlx5e: Fix mutual exclusion between CQE compression and HW TS)
+  	if (err)
+  		return err;
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 93bb9b1ec6c1,3fd515e7bf30..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -3991,6 -3540,47 +3991,50 @@@ static int mlx5e_change_nic_mtu(struct 
+  	return mlx5e_change_mtu(netdev, new_mtu, mlx5e_set_dev_port_mtu_ctx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int mlx5e_ptp_rx_manage_fs_ctx(struct mlx5e_priv *priv, void *ctx)
++ {
++ 	bool set  = *(bool *)ctx;
++ 
++ 	return mlx5e_ptp_rx_manage_fs(priv, set);
++ }
++ 
++ static int mlx5e_hwstamp_config_no_ptp_rx(struct mlx5e_priv *priv, bool rx_filter)
++ {
++ 	bool rx_cqe_compress_def = priv->channels.params.rx_cqe_compress_def;
++ 	int err;
++ 
++ 	if (!rx_filter)
++ 		/* Reset CQE compression to Admin default */
++ 		return mlx5e_modify_rx_cqe_compression_locked(priv, rx_cqe_compress_def, false);
++ 
++ 	if (!MLX5E_GET_PFLAG(&priv->channels.params, MLX5E_PFLAG_RX_CQE_COMPRESS))
++ 		return 0;
++ 
++ 	/* Disable CQE compression */
++ 	netdev_warn(priv->netdev, "Disabling RX cqe compression\n");
++ 	err = mlx5e_modify_rx_cqe_compression_locked(priv, false, true);
++ 	if (err)
++ 		netdev_err(priv->netdev, "Failed disabling cqe compression err=%d\n", err);
++ 
++ 	return err;
++ }
++ 
++ static int mlx5e_hwstamp_config_ptp_rx(struct mlx5e_priv *priv, bool ptp_rx)
++ {
++ 	struct mlx5e_params new_params;
++ 
++ 	if (ptp_rx == priv->channels.params.ptp_rx)
++ 		return 0;
++ 
++ 	new_params = priv->channels.params;
++ 	new_params.ptp_rx = ptp_rx;
++ 	return mlx5e_safe_switch_params(priv, &new_params, mlx5e_ptp_rx_manage_fs_ctx,
++ 					&new_params.ptp_rx, true);
++ }
++ 
+++>>>>>>> c91c1da72b47 (net/mlx5e: Fix mutual exclusion between CQE compression and HW TS)
+  int mlx5e_hwstamp_set(struct mlx5e_priv *priv, struct ifreq *ifr)
+  {
+  	struct hwtstamp_config config;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 73a162266789..944b361918f3 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -936,7 +936,7 @@ void mlx5e_set_rx_mode_work(struct work_struct *work);
+ 
+ int mlx5e_hwstamp_set(struct mlx5e_priv *priv, struct ifreq *ifr);
+ int mlx5e_hwstamp_get(struct mlx5e_priv *priv, struct ifreq *ifr);
+-int mlx5e_modify_rx_cqe_compression_locked(struct mlx5e_priv *priv, bool val);
++int mlx5e_modify_rx_cqe_compression_locked(struct mlx5e_priv *priv, bool val, bool rx_filter);
+ 
+ int mlx5e_vlan_rx_add_vid(struct net_device *dev, __always_unused __be16 proto,
+ 			  u16 vid);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
