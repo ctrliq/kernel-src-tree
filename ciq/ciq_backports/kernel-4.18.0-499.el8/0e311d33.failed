@@ -1,0 +1,111 @@
+KVM: SVM: Introduce hybrid-AVIC mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-499.el8
+commit-author Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+commit 0e311d33bfbef86da130674e8528cc23e6acfe16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-499.el8/0e311d33.failed
+
+Currently, AVIC is inhibited when booting a VM w/ x2APIC support.
+because AVIC cannot virtualize x2APIC MSR register accesses.
+However, the AVIC doorbell can be used to accelerate interrupt
+injection into a running vCPU, while all guest accesses to x2APIC MSRs
+will be intercepted and emulated by KVM.
+
+With hybrid-AVIC support, the APICV_INHIBIT_REASON_X2APIC is
+no longer enforced.
+
+	Suggested-by: Maxim Levitsky <mlevitsk@redhat.com>
+	Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+	Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+Message-Id: <20220519102709.24125-14-suravee.suthikulpanit@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 0e311d33bfbef86da130674e8528cc23e6acfe16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/svm.c
+diff --cc arch/x86/kvm/svm/svm.c
+index 86f1cc4be9f5,bb0457c1e41c..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -4063,21 -4191,6 +4062,24 @@@ static void svm_vcpu_after_set_cpuid(st
+  			vcpu->arch.reserved_gpa_bits &= ~(1UL << (best->ebx & 0x3f));
+  	}
+  
+++<<<<<<< HEAD
+ +	if (kvm_vcpu_apicv_active(vcpu)) {
+ +		/*
+ +		 * AVIC does not work with an x2APIC mode guest. If the X2APIC feature
+ +		 * is exposed to the guest, disable AVIC.
+ +		 */
+ +		if (guest_cpuid_has(vcpu, X86_FEATURE_X2APIC))
+ +			kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_X2APIC);
+ +
+ +		/*
+ +		 * Currently, AVIC does not work with nested virtualization.
+ +		 * So, we disable AVIC when cpuid for SVM is set in the L1 guest.
+ +		 */
+ +		if (nested && guest_cpuid_has(vcpu, X86_FEATURE_SVM))
+ +			kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_NESTED);
+ +	}
+++=======
+++>>>>>>> 0e311d33bfbe (KVM: SVM: Introduce hybrid-AVIC mode)
+  	init_vmcb_after_set_cpuid(vcpu);
+  }
+  
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 7a0e5b3aad7a..30289daded18 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1101,11 +1101,6 @@ enum kvm_apicv_inhibit {
+ 	 */
+ 	APICV_INHIBIT_REASON_PIT_REINJ,
+ 
+-	/*
+-	 * AVIC is inhibited because the guest has x2apic in its CPUID.
+-	 */
+-	APICV_INHIBIT_REASON_X2APIC,
+-
+ 	/*
+ 	 * AVIC is disabled because SEV doesn't support it.
+ 	 */
+diff --git a/arch/x86/kvm/svm/avic.c b/arch/x86/kvm/svm/avic.c
+index 748e1888937f..83766ad4cc0a 100644
+--- a/arch/x86/kvm/svm/avic.c
++++ b/arch/x86/kvm/svm/avic.c
+@@ -81,12 +81,22 @@ static void avic_activate_vmcb(struct vcpu_svm *svm)
+ 	vmcb->control.avic_physical_id &= ~AVIC_PHYSICAL_MAX_INDEX_MASK;
+ 
+ 	vmcb->control.int_ctl |= AVIC_ENABLE_MASK;
+-	if (apic_x2apic_mode(svm->vcpu.arch.apic)) {
++
++	/* Note:
++	 * KVM can support hybrid-AVIC mode, where KVM emulates x2APIC
++	 * MSR accesses, while interrupt injection to a running vCPU
++	 * can be achieved using AVIC doorbell. The AVIC hardware still
++	 * accelerate MMIO accesses, but this does not cause any harm
++	 * as the guest is not supposed to access xAPIC mmio when uses x2APIC.
++	 */
++	if (apic_x2apic_mode(svm->vcpu.arch.apic) &&
++	    avic_mode == AVIC_MODE_X2) {
+ 		vmcb->control.int_ctl |= X2APIC_MODE_MASK;
+ 		vmcb->control.avic_physical_id |= X2AVIC_MAX_PHYSICAL_ID;
+ 		/* Disabling MSR intercept for x2APIC registers */
+ 		svm_set_x2apic_msr_interception(svm, false);
+ 	} else {
++		/* For xAVIC and hybrid-xAVIC modes */
+ 		vmcb->control.avic_physical_id |= AVIC_MAX_PHYSICAL_ID;
+ 		/* Enabling MSR intercept for x2APIC registers */
+ 		svm_set_x2apic_msr_interception(svm, true);
+@@ -961,7 +971,6 @@ bool avic_check_apicv_inhibit_reasons(enum kvm_apicv_inhibit reason)
+ 			  BIT(APICV_INHIBIT_REASON_NESTED) |
+ 			  BIT(APICV_INHIBIT_REASON_IRQWIN) |
+ 			  BIT(APICV_INHIBIT_REASON_PIT_REINJ) |
+-			  BIT(APICV_INHIBIT_REASON_X2APIC) |
+ 			  BIT(APICV_INHIBIT_REASON_BLOCKIRQ) |
+ 			  BIT(APICV_INHIBIT_REASON_SEV      |
+ 			  BIT(APICV_INHIBIT_REASON_APIC_ID_MODIFIED) |
+* Unmerged path arch/x86/kvm/svm/svm.c
