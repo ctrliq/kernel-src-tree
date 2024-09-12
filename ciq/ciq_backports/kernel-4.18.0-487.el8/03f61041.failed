@@ -1,0 +1,156 @@
+skbuff: Switch structure bounds to struct_group()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-487.el8
+commit-author Kees Cook <keescook@chromium.org>
+commit 03f61041c17914355dde7261be9ccdc821ddd454
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-487.el8/03f61041.failed
+
+In preparation for FORTIFY_SOURCE performing compile-time and run-time
+field bounds checking for memcpy(), memmove(), and memset(), avoid
+intentionally writing across neighboring fields.
+
+Replace the existing empty member position markers "headers_start" and
+"headers_end" with a struct_group(). This will allow memcpy() and sizeof()
+to more easily reason about sizes, and improve readability.
+
+"pahole" shows no size nor member offset changes to struct sk_buff.
+"objdump -d" shows no object code changes (outside of WARNs affected by
+source line number changes).
+
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: Gustavo A. R. Silva <gustavoars@kernel.org>
+	Reviewed-by: Jason A. Donenfeld <Jason@zx2c4.com> # drivers/net/wireguard/*
+Link: https://lore.kernel.org/lkml/20210728035006.GD35706@embeddedor
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 03f61041c17914355dde7261be9ccdc821ddd454)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireguard/queueing.h
+#	include/linux/skbuff.h
+diff --cc include/linux/skbuff.h
+index cefc7aee89ff,eba256af64a5..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -796,30 -805,21 +796,33 @@@ struct sk_buff 
+  				fclone:2,
+  				peeked:1,
+  				head_frag:1,
+ -				pfmemalloc:1,
+ -				pp_recycle:1; /* page_pool recycle indicator */
+ +				RH_KABI_RENAME(xmit_more,
+ +					       rh_reserved_xmit_more):1,
+ +				pfmemalloc:1;
+  #ifdef CONFIG_SKB_EXTENSIONS
+ -	__u8			active_extensions;
+ +	/* RHEL: We have 1 byte hole here */
+ +	RH_KABI_FILL_HOLE(__u8	active_extensions)
+  #endif
+++<<<<<<< HEAD
+ +	/* fields enclosed in headers_start/headers_end are copied
+++=======
++ 
++ 	/* Fields enclosed in headers group are copied
+++>>>>>>> 03f61041c179 (skbuff: Switch structure bounds to struct_group())
+  	 * using a single memcpy() in __copy_skb_header()
+  	 */
+- 	/* private: */
+- 	__u32			headers_start[0];
+- 	/* public: */
++ 	struct_group(headers,
+  
+ -	/* private: */
+ +/* if you move pkt_type around you also must adapt those constants */
+ +#ifdef __BIG_ENDIAN_BITFIELD
+ +#define PKT_TYPE_MAX	(7 << 5)
+ +#else
+ +#define PKT_TYPE_MAX	7
+ +#endif
+ +#define PKT_TYPE_OFFSET()	offsetof(struct sk_buff, __pkt_type_offset)
+ +
+  	__u8			__pkt_type_offset[0];
+ -	/* public: */
+ -	__u8			pkt_type:3; /* see PKT_TYPE_MAX */
+ +	__u8			pkt_type:3;
+  	__u8			ignore_df:1;
+  	__u8			nf_trace:1;
+  	__u8			ip_summed:2;
+@@@ -921,32 -915,12 +924,30 @@@
+  	__u16			network_header;
+  	__u16			mac_header;
+  
+ -#ifdef CONFIG_KCOV
+ -	u64			kcov_handle;
+ +#ifndef __GENKSYMS__
+ +	/* RHEL kABI: if a new field needs to be copied by
+ +	 * __copy_skb_header, append it here (after the existing ones)
+ +	 * and update the size of the *non-__GENKSYMS__* rh_reserved
+ +	 * padding. Be mindful of alignments, and use pahole to check.
+ +	 */
+ +	char rh_reserved_start[0];
+  #endif
+  
+- 	/* private: */
+- 	__u32			headers_end[0];
+- 	/* public: */
++ 	); /* end headers group */
+  
+ +#ifdef __GENKSYMS__
+ +	char rh_reserved[RH_KABI_SKBUFF_RESERVED];
+ +#else
+ +	char rh_reserved[RH_KABI_SKBUFF_RESERVED];
+ +
+ +	/* RHEL kABI: add new fields that don't need to be copied by
+ +	 * __copy_skb_header here (just above rh_reserved_end), and
+ +	 * update the size of the rh_reserved array. Be mindful of
+ +	 * alignments, and use pahole to check.
+ +	 */
+ +	char rh_reserved_end[0];
+ +#endif
+ +
+  	/* These elements must be at the end, see alloc_skb() for details.  */
+  	sk_buff_data_t		tail;
+  	sk_buff_data_t		end;
+* Unmerged path drivers/net/wireguard/queueing.h
+* Unmerged path drivers/net/wireguard/queueing.h
+* Unmerged path include/linux/skbuff.h
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 5839d8457b4b..c3543468c300 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -1103,12 +1103,10 @@ void napi_consume_skb(struct sk_buff *skb, int budget)
+ }
+ EXPORT_SYMBOL(napi_consume_skb);
+ 
+-/* Make sure a field is enclosed inside headers_start/headers_end section */
++/* Make sure a field is contained by headers group */
+ #define CHECK_SKB_FIELD(field) \
+-	BUILD_BUG_ON(offsetof(struct sk_buff, field) <		\
+-		     offsetof(struct sk_buff, headers_start));	\
+-	BUILD_BUG_ON(offsetof(struct sk_buff, field) >		\
+-		     offsetof(struct sk_buff, headers_end));	\
++	BUILD_BUG_ON(offsetof(struct sk_buff, field) !=		\
++		     offsetof(struct sk_buff, headers.field));	\
+ 
+ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+ {
+@@ -1123,14 +1121,12 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+ #endif
+ 	__nf_copy(new, old, false);
+ 
+-	/* Note : this field could be in headers_start/headers_end section
++	/* Note : this field could be in the headers group.
+ 	 * It is not yet because we do not want to have a 16 bit hole
+ 	 */
+ 	new->queue_mapping = old->queue_mapping;
+ 
+-	memcpy(&new->headers_start, &old->headers_start,
+-	       offsetof(struct sk_buff, headers_end) -
+-	       offsetof(struct sk_buff, headers_start));
++	memcpy(&new->headers, &old->headers, sizeof(new->headers));
+ 	CHECK_SKB_FIELD(protocol);
+ 	CHECK_SKB_FIELD(csum);
+ 	CHECK_SKB_FIELD(hash);
