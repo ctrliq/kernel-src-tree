@@ -183,8 +183,8 @@ nla_put_failure:
 	return -1;
 }
 
-static int ctnetlink_dump_protoinfo(struct sk_buff *skb, struct nf_conn *ct,
-				    bool destroy)
+static int __ctnetlink_dump_protoinfo(struct sk_buff *skb, struct nf_conn *ct,
+				      bool destroy)
 {
 	const struct nf_conntrack_l4proto *l4proto;
 	struct nlattr *nest_proto;
@@ -206,6 +206,18 @@ static int ctnetlink_dump_protoinfo(struct sk_buff *skb, struct nf_conn *ct,
 
 nla_put_failure:
 	return -1;
+}
+
+static int ctnetlink_dump_protoinfo(struct sk_buff *skb, struct nf_conn *ct,
+				    bool destroy)
+{
+	int ret;
+
+	rcu_read_lock();
+	ret = __ctnetlink_dump_protoinfo(skb, ct, destroy);
+	rcu_read_unlock();
+
+	return ret;
 }
 
 static int ctnetlink_dump_helpinfo(struct sk_buff *skb,
