@@ -1,0 +1,374 @@
+vfio: Change vfio_group->group_rwsem to a mutex
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit c82e81ab2569559ad873b3061217c2f37560682b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/c82e81ab.failed
+
+These days not much is using the read side:
+ - device first open
+ - ioctl_get_status
+ - device FD release
+ - check enforced_coherent
+
+None of this is performance, so just make it into a normal mutex.
+
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+	Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Link: https://lore.kernel.org/r/2-v1-917e3647f123+b1a-vfio_group_users_jgg@nvidia.com
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit c82e81ab2569559ad873b3061217c2f37560682b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/container.c
+#	drivers/vfio/vfio.h
+#	drivers/vfio/vfio_main.c
+diff --cc drivers/vfio/vfio.h
+index 503bea6c843d,4a1bac1359a9..000000000000
+--- a/drivers/vfio/vfio.h
++++ b/drivers/vfio/vfio.h
+@@@ -28,6 -38,31 +28,34 @@@ enum vfio_group_type 
+  	VFIO_NO_IOMMU,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct vfio_group {
++ 	struct device 			dev;
++ 	struct cdev			cdev;
++ 	/*
++ 	 * When drivers is non-zero a driver is attached to the struct device
++ 	 * that provided the iommu_group and thus the iommu_group is a valid
++ 	 * pointer. When drivers is 0 the driver is being detached. Once users
++ 	 * reaches 0 then the iommu_group is invalid.
++ 	 */
++ 	refcount_t			drivers;
++ 	unsigned int			container_users;
++ 	struct iommu_group		*iommu_group;
++ 	struct vfio_container		*container;
++ 	struct list_head		device_list;
++ 	struct mutex			device_lock;
++ 	struct list_head		vfio_next;
++ 	struct list_head		container_next;
++ 	enum vfio_group_type		type;
++ 	struct mutex			group_lock;
++ 	struct kvm			*kvm;
++ 	struct file			*opened_file;
++ 	struct swait_queue_head		opened_file_wait;
++ 	struct blocking_notifier_head	notifier;
++ };
++ 
+++>>>>>>> c82e81ab2569 (vfio: Change vfio_group->group_rwsem to a mutex)
+  /* events for the backend driver notify callback */
+  enum vfio_iommu_notify_type {
+  	VFIO_IOMMU_CONTAINER_CLOSE = 0,
+diff --cc drivers/vfio/vfio_main.c
+index eb849d5b81b0,9207e6c0e3cb..000000000000
+--- a/drivers/vfio/vfio_main.c
++++ b/drivers/vfio/vfio_main.c
+@@@ -378,8 -187,9 +379,14 @@@ static struct vfio_group *vfio_group_al
+  	cdev_init(&group->cdev, &vfio_group_fops);
+  	group->cdev.owner = THIS_MODULE;
+  
+++<<<<<<< HEAD
+ +	refcount_set(&group->users, 1);
+ +	init_rwsem(&group->group_rwsem);
+++=======
++ 	refcount_set(&group->drivers, 1);
++ 	mutex_init(&group->group_lock);
++ 	init_swait_queue_head(&group->opened_file_wait);
+++>>>>>>> c82e81ab2569 (vfio: Change vfio_group->group_rwsem to a mutex)
+  	INIT_LIST_HEAD(&group->device_list);
+  	mutex_init(&group->device_lock);
+  	group->iommu_group = iommu_group;
+@@@ -983,84 -662,55 +990,118 @@@ static void __vfio_group_unset_containe
+   * the group, we know that still exists, therefore the only valid
+   * transition here is 1->0.
+   */
+ -static int vfio_group_ioctl_unset_container(struct vfio_group *group)
+ +static int vfio_group_unset_container(struct vfio_group *group)
+  {
+ -	int ret = 0;
+ +	lockdep_assert_held_write(&group->group_rwsem);
+  
+++<<<<<<< HEAD
+ +	if (!group->container)
+ +		return -EINVAL;
+ +	if (group->container_users != 1)
+ +		return -EBUSY;
+ +	__vfio_group_unset_container(group);
+ +	return 0;
+++=======
++ 	mutex_lock(&group->group_lock);
++ 	if (!group->container) {
++ 		ret = -EINVAL;
++ 		goto out_unlock;
++ 	}
++ 	if (group->container_users != 1) {
++ 		ret = -EBUSY;
++ 		goto out_unlock;
++ 	}
++ 	vfio_group_detach_container(group);
++ 
++ out_unlock:
++ 	mutex_unlock(&group->group_lock);
++ 	return ret;
+++>>>>>>> c82e81ab2569 (vfio: Change vfio_group->group_rwsem to a mutex)
+  }
+  
+ -static int vfio_group_ioctl_set_container(struct vfio_group *group,
+ -					  int __user *arg)
+ +static int vfio_group_set_container(struct vfio_group *group, int container_fd)
+  {
+ -	struct vfio_container *container;
+  	struct fd f;
+ -	int ret;
+ -	int fd;
+ +	struct vfio_container *container;
+ +	struct vfio_iommu_driver *driver;
+ +	int ret = 0;
+  
+ -	if (get_user(fd, arg))
+ -		return -EFAULT;
+ +	lockdep_assert_held_write(&group->group_rwsem);
+ +
+ +	if (group->container || WARN_ON(group->container_users))
+ +		return -EINVAL;
+ +
+ +	if (group->type == VFIO_NO_IOMMU && !capable(CAP_SYS_RAWIO))
+ +		return -EPERM;
+  
+ -	f = fdget(fd);
+ +	f = fdget(container_fd);
+  	if (!f.file)
+  		return -EBADF;
+  
+++<<<<<<< HEAD
+ +	/* Sanity check, is this really our fd? */
+ +	if (f.file->f_op != &vfio_fops) {
+ +		fdput(f);
+ +		return -EINVAL;
+ +	}
+ +
+ +	container = f.file->private_data;
+ +	WARN_ON(!container); /* fget ensures we don't race vfio_release */
+ +
+ +	down_write(&container->group_lock);
+ +
+ +	/* Real groups and fake groups cannot mix */
+ +	if (!list_empty(&container->group_list) &&
+ +	    container->noiommu != (group->type == VFIO_NO_IOMMU)) {
+ +		ret = -EPERM;
+ +		goto unlock_out;
+ +	}
+ +
+ +	if (group->type == VFIO_IOMMU) {
+ +		ret = iommu_group_claim_dma_owner(group->iommu_group, f.file);
+ +		if (ret)
+ +			goto unlock_out;
+ +	}
+ +
+ +	driver = container->iommu_driver;
+ +	if (driver) {
+ +		ret = driver->ops->attach_group(container->iommu_data,
+ +						group->iommu_group,
+ +						group->type);
+ +		if (ret) {
+ +			if (group->type == VFIO_IOMMU)
+ +				iommu_group_release_dma_owner(
+ +					group->iommu_group);
+ +			goto unlock_out;
+ +		}
+ +	}
+ +
+ +	group->container = container;
+ +	group->container_users = 1;
+ +	container->noiommu = (group->type == VFIO_NO_IOMMU);
+ +	list_add(&group->container_next, &container->group_list);
+ +
+ +	/* Get a reference on the container and mark a user within the group */
+ +	vfio_container_get(container);
+ +
+ +unlock_out:
+ +	up_write(&container->group_lock);
+++=======
++ 	mutex_lock(&group->group_lock);
++ 	if (group->container || WARN_ON(group->container_users)) {
++ 		ret = -EINVAL;
++ 		goto out_unlock;
++ 	}
++ 	container = vfio_container_from_file(f.file);
++ 	ret = -EINVAL;
++ 	if (container) {
++ 		ret = vfio_container_attach_group(container, group);
++ 		goto out_unlock;
++ 	}
++ 
++ out_unlock:
++ 	mutex_unlock(&group->group_lock);
+++>>>>>>> c82e81ab2569 (vfio: Change vfio_group->group_rwsem to a mutex)
+  	fdput(f);
+  	return ret;
+  }
+@@@ -1186,10 -789,9 +1227,16 @@@ static struct file *vfio_device_open(st
+  
+  err_close_device:
+  	mutex_lock(&device->dev_set->lock);
+++<<<<<<< HEAD
+ +	down_read(&device->group->group_rwsem);
+ +	if (device->open_count == 1) {
+ +		if (device->ops->close_device)
+ +			device->ops->close_device(device);
+++=======
++ 	mutex_lock(&device->group->group_lock);
++ 	if (device->open_count == 1 && device->ops->close_device) {
++ 		device->ops->close_device(device);
+++>>>>>>> c82e81ab2569 (vfio: Change vfio_group->group_rwsem to a mutex)
+  
+  		vfio_device_container_unregister(device);
+  	}
+@@@ -1238,6 -847,33 +1285,36 @@@ err_put_device
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vfio_group_ioctl_get_status(struct vfio_group *group,
++ 				       struct vfio_group_status __user *arg)
++ {
++ 	unsigned long minsz = offsetofend(struct vfio_group_status, flags);
++ 	struct vfio_group_status status;
++ 
++ 	if (copy_from_user(&status, arg, minsz))
++ 		return -EFAULT;
++ 
++ 	if (status.argsz < minsz)
++ 		return -EINVAL;
++ 
++ 	status.flags = 0;
++ 
++ 	mutex_lock(&group->group_lock);
++ 	if (group->container)
++ 		status.flags |= VFIO_GROUP_FLAGS_CONTAINER_SET |
++ 				VFIO_GROUP_FLAGS_VIABLE;
++ 	else if (!iommu_group_dma_owner_claimed(group->iommu_group))
++ 		status.flags |= VFIO_GROUP_FLAGS_VIABLE;
++ 	mutex_unlock(&group->group_lock);
++ 
++ 	if (copy_to_user(arg, &status, minsz))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ 
+++>>>>>>> c82e81ab2569 (vfio: Change vfio_group->group_rwsem to a mutex)
+  static long vfio_group_fops_unl_ioctl(struct file *filep,
+  				      unsigned int cmd, unsigned long arg)
+  {
+@@@ -1317,12 -900,15 +1394,12 @@@ static int vfio_group_fops_open(struct 
+  		container_of(inode->i_cdev, struct vfio_group, cdev);
+  	int ret;
+  
+- 	down_write(&group->group_rwsem);
++ 	mutex_lock(&group->group_lock);
+  
+ -	/*
+ -	 * drivers can be zero if this races with vfio_device_remove_group(), it
+ -	 * will be stable at 0 under the group rwsem
+ -	 */
+ -	if (refcount_read(&group->drivers) == 0) {
+ +	/* users can be zero if this races with vfio_group_put() */
+ +	if (!refcount_inc_not_zero(&group->users)) {
+  		ret = -ENODEV;
+ -		goto out_unlock;
+ +		goto err_unlock;
+  	}
+  
+  	if (group->type == VFIO_NO_IOMMU && !capable(CAP_SYS_RAWIO)) {
+@@@ -1339,13 -925,9 +1416,19 @@@
+  	}
+  	group->opened_file = filep;
+  	filep->private_data = group;
+++<<<<<<< HEAD
+ +
+ +	up_write(&group->group_rwsem);
+ +	return 0;
+ +err_put:
+ +	vfio_group_put(group);
+ +err_unlock:
+ +	up_write(&group->group_rwsem);
+++=======
++ 	ret = 0;
++ out_unlock:
++ 	mutex_unlock(&group->group_lock);
+++>>>>>>> c82e81ab2569 (vfio: Change vfio_group->group_rwsem to a mutex)
+  	return ret;
+  }
+  
+@@@ -1361,14 -943,11 +1444,19 @@@ static int vfio_group_fops_release(stru
+  	 * is only called when there are no open devices.
+  	 */
+  	WARN_ON(group->notifier.head);
+ -	if (group->container)
+ -		vfio_group_detach_container(group);
+ +	if (group->container) {
+ +		WARN_ON(group->container_users != 1);
+ +		__vfio_group_unset_container(group);
+ +	}
+  	group->opened_file = NULL;
+++<<<<<<< HEAD
+ +	up_write(&group->group_rwsem);
+ +
+ +	vfio_group_put(group);
+++=======
++ 	mutex_unlock(&group->group_lock);
++ 	swake_up_one(&group->opened_file_wait);
+++>>>>>>> c82e81ab2569 (vfio: Change vfio_group->group_rwsem to a mutex)
+  
+  	return 0;
+  }
+@@@ -1390,14 -1002,12 +1478,23 @@@ static int vfio_device_fops_release(str
+  
+  	mutex_lock(&device->dev_set->lock);
+  	vfio_assert_device_open(device);
+++<<<<<<< HEAD
+ +	down_read(&device->group->group_rwsem);
+ +	if (device->open_count == 1) {
+ +		if (device->ops->close_device)
+ +			device->ops->close_device(device);
+ +
+ +		vfio_device_container_unregister(device);
+ +	}
+ +	up_read(&device->group->group_rwsem);
+++=======
++ 	mutex_lock(&device->group->group_lock);
++ 	if (device->open_count == 1 && device->ops->close_device)
++ 		device->ops->close_device(device);
++ 
++ 	vfio_device_container_unregister(device);
++ 	mutex_unlock(&device->group->group_lock);
+++>>>>>>> c82e81ab2569 (vfio: Change vfio_group->group_rwsem to a mutex)
+  	device->open_count--;
+  	if (device->open_count == 0)
+  		device->kvm = NULL;
+@@@ -2061,10 -1581,10 +2158,10 @@@ bool vfio_file_enforced_coherent(struc
+  	if (file->f_op != &vfio_group_fops)
+  		return true;
+  
+- 	down_read(&group->group_rwsem);
++ 	mutex_lock(&group->group_lock);
+  	if (group->container) {
+ -		ret = vfio_container_ioctl_check_extension(group->container,
+ -							   VFIO_DMA_CC_IOMMU);
+ +		ret = vfio_ioctl_check_extension(group->container,
+ +						 VFIO_DMA_CC_IOMMU);
+  	} else {
+  		/*
+  		 * Since the coherency state is determined only once a container
+* Unmerged path drivers/vfio/container.c
+* Unmerged path drivers/vfio/container.c
+* Unmerged path drivers/vfio/vfio.h
+* Unmerged path drivers/vfio/vfio_main.c
