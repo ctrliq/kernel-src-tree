@@ -1,0 +1,168 @@
+drm/i915: Update memory bandwidth formulae
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Radhakrishna Sripada <radhakrishna.sripada@intel.com>
+commit c64a9a7c05beb2b71b7496d873654f88e1a08593
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/c64a9a7c.failed
+
+The formulae has been updated to include more variables. Make
+sure the code carries the same.
+
+Bspec: 64631, 54023
+
+v2: Make GEN11 follow the default route and fix calculation of
+    maxdebw(RK)
+v3: Fix div by zero on default case
+    Correct indent for fallthrough(Jani)
+v4: Fix div by zero on gen11.
+v5: Fix 0 max_numchannels case
+v6:
+    - Split gen11/gen12 algorithms
+    - Fix RKL deburst value
+    - Fix difference b/ween ICL and TGL algorithms
+    - Protect deinterleave from being 0
+    - Warn when numchannels exceeds max_numchannels
+    - Fix scaling of clk_max from different units
+    - s/deinterleave/channelwidth/ in calculating peakbw
+    - Fix off by one for num_planes TGL+
+    - Fix SAGV check
+v7: Fix div by zero error on gen11
+v8: Even though the algorithm for gen11 says that we need to return
+    derated bw for a qgv point whose planes are less than no of active
+    planes, we return 0 for deratedbw when only one plane is allowed.
+    We modify the algorithm to accommodate the case where no of active
+    planes are same as the min no of planes supported by a qgv point.
+v9: Fix dclk scaling for dg1
+
+	Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Suggested-by: Matt Roper <matthew.d.roper@intel.com>
+	Signed-off-by: Radhakrishna Sripada <radhakrishna.sripada@intel.com>
+	Reviewed-by: Anusha Srivatsa <anusha.srivatsa@intel.com>
+	Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20211015210041.16858-1-radhakrishna.sripada@intel.com
+(cherry picked from commit c64a9a7c05beb2b71b7496d873654f88e1a08593)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_bw.c
+diff --cc drivers/gpu/drm/i915/display/intel_bw.c
+index c561cd3bf534,15c006194c85..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_bw.c
++++ b/drivers/gpu/drm/i915/display/intel_bw.c
+@@@ -27,8 -27,46 +27,49 @@@ struct intel_qgv_info 
+  	u8 num_points;
+  	u8 num_psf_points;
+  	u8 t_bl;
++ 	u8 max_numchannels;
++ 	u8 channel_width;
++ 	u8 deinterleave;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int dg1_mchbar_read_qgv_point_info(struct drm_i915_private *dev_priv,
++ 					  struct intel_qgv_point *sp,
++ 					  int point)
++ {
++ 	u32 dclk_ratio, dclk_reference;
++ 	u32 val;
++ 
++ 	val = intel_uncore_read(&dev_priv->uncore, SA_PERF_STATUS_0_0_0_MCHBAR_PC);
++ 	dclk_ratio = REG_FIELD_GET(DG1_QCLK_RATIO_MASK, val);
++ 	if (val & DG1_QCLK_REFERENCE)
++ 		dclk_reference = 6; /* 6 * 16.666 MHz = 100 MHz */
++ 	else
++ 		dclk_reference = 8; /* 8 * 16.666 MHz = 133 MHz */
++ 	sp->dclk = DIV_ROUND_UP((16667 * dclk_ratio * dclk_reference) + 500, 1000);
++ 
++ 	val = intel_uncore_read(&dev_priv->uncore, SKL_MC_BIOS_DATA_0_0_0_MCHBAR_PCU);
++ 	if (val & DG1_GEAR_TYPE)
++ 		sp->dclk *= 2;
++ 
++ 	if (sp->dclk == 0)
++ 		return -EINVAL;
++ 
++ 	val = intel_uncore_read(&dev_priv->uncore, MCHBAR_CH0_CR_TC_PRE_0_0_0_MCHBAR);
++ 	sp->t_rp = REG_FIELD_GET(DG1_DRAM_T_RP_MASK, val);
++ 	sp->t_rdpre = REG_FIELD_GET(DG1_DRAM_T_RDPRE_MASK, val);
++ 
++ 	val = intel_uncore_read(&dev_priv->uncore, MCHBAR_CH0_CR_TC_PRE_0_0_0_MCHBAR_HIGH);
++ 	sp->t_rcd = REG_FIELD_GET(DG1_DRAM_T_RCD_MASK, val);
++ 	sp->t_ras = REG_FIELD_GET(DG1_DRAM_T_RAS_MASK, val);
++ 
++ 	sp->t_rc = sp->t_rp + sp->t_ras;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c64a9a7c05be (drm/i915: Update memory bandwidth formulae)
+  static int icl_pcode_read_qgv_point_info(struct drm_i915_private *dev_priv,
+  					 struct intel_qgv_point *sp,
+  					 int point)
+@@@ -106,13 -147,34 +150,34 @@@ static int icl_get_qgv_points(struct dr
+  	qi->num_points = dram_info->num_qgv_points;
+  	qi->num_psf_points = dram_info->num_psf_gv_points;
+  
+ -	if (DISPLAY_VER(dev_priv) == 12)
+ +	if (DISPLAY_VER(dev_priv) >= 12)
+  		switch (dram_info->type) {
+  		case INTEL_DRAM_DDR4:
+- 			qi->t_bl = 4;
++ 			qi->t_bl = is_y_tile ? 8 : 4;
++ 			qi->max_numchannels = 2;
++ 			qi->channel_width = 64;
++ 			qi->deinterleave = is_y_tile ? 1 : 2;
+  			break;
+  		case INTEL_DRAM_DDR5:
+- 			qi->t_bl = 8;
++ 			qi->t_bl = is_y_tile ? 16 : 8;
++ 			qi->max_numchannels = 4;
++ 			qi->channel_width = 32;
++ 			qi->deinterleave = is_y_tile ? 1 : 2;
++ 			break;
++ 		case INTEL_DRAM_LPDDR4:
++ 			if (IS_ROCKETLAKE(dev_priv)) {
++ 				qi->t_bl = 8;
++ 				qi->max_numchannels = 4;
++ 				qi->channel_width = 32;
++ 				qi->deinterleave = 2;
++ 				break;
++ 			}
++ 			fallthrough;
++ 		case INTEL_DRAM_LPDDR5:
++ 			qi->t_bl = 16;
++ 			qi->max_numchannels = 8;
++ 			qi->channel_width = 16;
++ 			qi->deinterleave = is_y_tile ? 2 : 4;
+  			break;
+  		default:
+  			qi->t_bl = 16;
+@@@ -350,14 -553,16 +532,21 @@@ void intel_bw_init_hw(struct drm_i915_p
+  	if (!HAS_DISPLAY(dev_priv))
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (IS_ALDERLAKE_P(dev_priv))
+ +		icl_get_bw_info(dev_priv, &adlp_sa_info);
+++=======
++ 	if (IS_DG2(dev_priv))
++ 		dg2_get_bw_info(dev_priv);
++ 	else if (IS_ALDERLAKE_P(dev_priv))
++ 		tgl_get_bw_info(dev_priv, &adlp_sa_info);
+++>>>>>>> c64a9a7c05be (drm/i915: Update memory bandwidth formulae)
+  	else if (IS_ALDERLAKE_S(dev_priv))
+- 		icl_get_bw_info(dev_priv, &adls_sa_info);
++ 		tgl_get_bw_info(dev_priv, &adls_sa_info);
+  	else if (IS_ROCKETLAKE(dev_priv))
+- 		icl_get_bw_info(dev_priv, &rkl_sa_info);
++ 		tgl_get_bw_info(dev_priv, &rkl_sa_info);
+  	else if (DISPLAY_VER(dev_priv) == 12)
+- 		icl_get_bw_info(dev_priv, &tgl_sa_info);
++ 		tgl_get_bw_info(dev_priv, &tgl_sa_info);
+  	else if (DISPLAY_VER(dev_priv) == 11)
+  		icl_get_bw_info(dev_priv, &icl_sa_info);
+  }
+* Unmerged path drivers/gpu/drm/i915/display/intel_bw.c
