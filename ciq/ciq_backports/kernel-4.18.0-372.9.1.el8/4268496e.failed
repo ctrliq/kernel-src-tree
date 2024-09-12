@@ -1,0 +1,145 @@
+ext4: ensure enough credits in ext4_ext_shift_path_extents
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author yangerkun <yangerkun@huawei.com>
+commit 4268496e48dc681cfa53b92357314b5d7221e625
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/4268496e.failed
+
+Like ext4_ext_rm_leaf, we can ensure that there are enough credits
+before every call that will consume credits.  As part of this fix we
+fold the functionality of ext4_access_path() into
+ext4_ext_shift_path_extents().  This change is needed as a preparation
+for the next bugfix patch.
+
+	Cc: stable@kernel.org
+Link: https://lore.kernel.org/r/20210903062748.4118886-3-yangerkun@huawei.com
+	Signed-off-by: yangerkun <yangerkun@huawei.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 4268496e48dc681cfa53b92357314b5d7221e625)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/extents.c
+diff --cc fs/ext4/extents.c
+index 674bf6b7b83e,6b080f61342a..000000000000
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@@ -5162,68 -4955,30 +5162,38 @@@ int ext4_fiemap(struct inode *inode, st
+  		error = ext4_ext_precache(inode);
+  		if (error)
+  			return error;
+ -		fieinfo->fi_flags &= ~FIEMAP_FLAG_CACHE;
+  	}
+  
+ -	error = fiemap_prep(inode, fieinfo, start, &len, 0);
+ -	if (error)
+ -		return error;
+ +	/* fallback to generic here if not in extents fmt */
+ +	if (!(ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS)))
+ +		return generic_block_fiemap(inode, fieinfo, start, len,
+ +			ext4_get_block);
+  
+ -	error = ext4_fiemap_check_ranges(inode, start, &len);
+ -	if (error)
+ -		return error;
+ +	if (fiemap_check_flags(fieinfo, EXT4_FIEMAP_FLAGS))
+ +		return -EBADR;
+  
+ -	start_blk = start >> inode->i_sb->s_blocksize_bits;
+ -	last_blk = (start + len - 1) >> inode->i_sb->s_blocksize_bits;
+ -	if (last_blk >= EXT_MAX_BLOCKS)
+ -		last_blk = EXT_MAX_BLOCKS-1;
+ -	len_blks = ((ext4_lblk_t) last_blk) - start_blk + 1;
+ +	if (fieinfo->fi_flags & FIEMAP_FLAG_XATTR) {
+ +		error = ext4_xattr_fiemap(inode, fieinfo);
+ +	} else {
+ +		ext4_lblk_t len_blks;
+ +		__u64 last_blk;
+  
+ -	/*
+ -	 * Walk the extent tree gathering extent information
+ -	 * and pushing extents back to the user.
+ -	 */
+ -	return ext4_fill_es_cache_info(inode, start_blk, len_blks, fieinfo);
+ +		start_blk = start >> inode->i_sb->s_blocksize_bits;
+ +		last_blk = (start + len - 1) >> inode->i_sb->s_blocksize_bits;
+ +		if (last_blk >= EXT_MAX_BLOCKS)
+ +			last_blk = EXT_MAX_BLOCKS-1;
+ +		len_blks = ((ext4_lblk_t) last_blk) - start_blk + 1;
+ +
+ +		/*
+ +		 * Walk the extent tree gathering extent information
+ +		 * and pushing extents back to the user.
+ +		 */
+ +		error = ext4_fill_fiemap_extents(inode, start_blk,
+ +						 len_blks, fieinfo);
+ +	}
+ +	return error;
+  }
+  
+- /*
+-  * ext4_access_path:
+-  * Function to access the path buffer for marking it dirty.
+-  * It also checks if there are sufficient credits left in the journal handle
+-  * to update path.
+-  */
+- static int
+- ext4_access_path(handle_t *handle, struct inode *inode,
+- 		struct ext4_ext_path *path)
+- {
+- 	int credits, err;
+- 
+- 	if (!ext4_handle_valid(handle))
+- 		return 0;
+- 
+- 	/*
+- 	 * Check if need to extend journal credits
+- 	 * 3 for leaf, sb, and inode plus 2 (bmap and group
+- 	 * descriptor) for each block group; assume two block
+- 	 * groups
+- 	 */
+- 	credits = ext4_writepage_trans_blocks(inode);
+- 	err = ext4_datasem_ensure_credits(handle, inode, 7, credits, 0);
+- 	if (err < 0)
+- 		return err;
+- 
+- 	err = ext4_ext_get_access(handle, inode, path);
+- 	return err;
+- }
+- 
+  /*
+   * ext4_ext_shift_path_extents:
+   * Shift the extents of a path structure lying between path[depth].p_ext
+@@@ -5237,7 -4992,8 +5207,12 @@@ ext4_ext_shift_path_extents(struct ext4
+  {
+  	int depth, err = 0;
+  	struct ext4_extent *ex_start, *ex_last;
+++<<<<<<< HEAD
+ +	bool update = 0;
+++=======
++ 	bool update = false;
++ 	int credits, restart_credits;
+++>>>>>>> 4268496e48dc (ext4: ensure enough credits in ext4_ext_shift_path_extents)
+  	depth = path->p_depth;
+  
+  	while (depth >= 0) {
+@@@ -5252,8 -5017,9 +5236,14 @@@
+  			if (err)
+  				goto out;
+  
+++<<<<<<< HEAD
+ +			if (ex_start == EXT_FIRST_EXTENT(path[depth].p_hdr))
+ +				update = 1;
+++=======
++ 			err = ext4_ext_get_access(handle, inode, path + depth);
++ 			if (err)
++ 				goto out;
+++>>>>>>> 4268496e48dc (ext4: ensure enough credits in ext4_ext_shift_path_extents)
+  
+  			while (ex_start <= ex_last) {
+  				if (SHIFT == SHIFT_LEFT) {
+* Unmerged path fs/ext4/extents.c
