@@ -1,0 +1,289 @@
+vt_kdsetmode: extend console locking
+
+jira LE-1907
+cve CVE-2021-3753
+Rebuild_History Non-Buildable kernel-4.18.0-524.el8
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit 2287a51ba822384834dafc1c798453375d1107c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-524.el8/2287a51b.failed
+
+As per the long-suffering comment.
+
+	Reported-by: Minh Yuan <yuanmingbuaa@gmail.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Jiri Slaby <jirislaby@kernel.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2287a51ba822384834dafc1c798453375d1107c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/vt/vt_ioctl.c
+diff --cc drivers/tty/vt/vt_ioctl.c
+index 33d9d0c2947c,3639bb6dc372..000000000000
+--- a/drivers/tty/vt/vt_ioctl.c
++++ b/drivers/tty/vt/vt_ioctl.c
+@@@ -241,10 -240,254 +241,261 @@@ int vt_waitactive(int n
+  #define GPLAST 0x3df
+  #define GPNUM (GPLAST - GPFIRST + 1)
+  
+++<<<<<<< HEAD
+ +
+ +
+ +static inline int 
+ +do_unimap_ioctl(int cmd, struct unimapdesc __user *user_ud, int perm, struct vc_data *vc)
+++=======
++ /*
++  * currently, setting the mode from KD_TEXT to KD_GRAPHICS doesn't do a whole
++  * lot. i'm not sure if it should do any restoration of modes or what...
++  *
++  * XXX It should at least call into the driver, fbdev's definitely need to
++  * restore their engine state. --BenH
++  *
++  * Called with the console lock held.
++  */
++ static int vt_kdsetmode(struct vc_data *vc, unsigned long mode)
++ {
++ 	switch (mode) {
++ 	case KD_GRAPHICS:
++ 		break;
++ 	case KD_TEXT0:
++ 	case KD_TEXT1:
++ 		mode = KD_TEXT;
++ 		fallthrough;
++ 	case KD_TEXT:
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (vc->vc_mode == mode)
++ 		return 0;
++ 
++ 	vc->vc_mode = mode;
++ 	if (vc->vc_num != fg_console)
++ 		return 0;
++ 
++ 	/* explicitly blank/unblank the screen if switching modes */
++ 	if (mode == KD_TEXT)
++ 		do_unblank_screen(1);
++ 	else
++ 		do_blank_screen(1);
++ 
++ 	return 0;
++ }
++ 
++ static int vt_k_ioctl(struct tty_struct *tty, unsigned int cmd,
++ 		unsigned long arg, bool perm)
++ {
++ 	struct vc_data *vc = tty->driver_data;
++ 	void __user *up = (void __user *)arg;
++ 	unsigned int console = vc->vc_num;
++ 	int ret;
++ 
++ 	switch (cmd) {
++ 	case KIOCSOUND:
++ 		if (!perm)
++ 			return -EPERM;
++ 		/*
++ 		 * The use of PIT_TICK_RATE is historic, it used to be
++ 		 * the platform-dependent CLOCK_TICK_RATE between 2.6.12
++ 		 * and 2.6.36, which was a minor but unfortunate ABI
++ 		 * change. kd_mksound is locked by the input layer.
++ 		 */
++ 		if (arg)
++ 			arg = PIT_TICK_RATE / arg;
++ 		kd_mksound(arg, 0);
++ 		break;
++ 
++ 	case KDMKTONE:
++ 		if (!perm)
++ 			return -EPERM;
++ 	{
++ 		unsigned int ticks, count;
++ 
++ 		/*
++ 		 * Generate the tone for the appropriate number of ticks.
++ 		 * If the time is zero, turn off sound ourselves.
++ 		 */
++ 		ticks = msecs_to_jiffies((arg >> 16) & 0xffff);
++ 		count = ticks ? (arg & 0xffff) : 0;
++ 		if (count)
++ 			count = PIT_TICK_RATE / count;
++ 		kd_mksound(count, ticks);
++ 		break;
++ 	}
++ 
++ 	case KDGKBTYPE:
++ 		/*
++ 		 * this is naïve.
++ 		 */
++ 		return put_user(KB_101, (char __user *)arg);
++ 
++ 		/*
++ 		 * These cannot be implemented on any machine that implements
++ 		 * ioperm() in user level (such as Alpha PCs) or not at all.
++ 		 *
++ 		 * XXX: you should never use these, just call ioperm directly..
++ 		 */
++ #ifdef CONFIG_X86
++ 	case KDADDIO:
++ 	case KDDELIO:
++ 		/*
++ 		 * KDADDIO and KDDELIO may be able to add ports beyond what
++ 		 * we reject here, but to be safe...
++ 		 *
++ 		 * These are locked internally via sys_ioperm
++ 		 */
++ 		if (arg < GPFIRST || arg > GPLAST)
++ 			return -EINVAL;
++ 
++ 		return ksys_ioperm(arg, 1, (cmd == KDADDIO)) ? -ENXIO : 0;
++ 
++ 	case KDENABIO:
++ 	case KDDISABIO:
++ 		return ksys_ioperm(GPFIRST, GPNUM,
++ 				  (cmd == KDENABIO)) ? -ENXIO : 0;
++ #endif
++ 
++ 	/* Linux m68k/i386 interface for setting the keyboard delay/repeat rate */
++ 
++ 	case KDKBDREP:
++ 	{
++ 		struct kbd_repeat kbrep;
++ 
++ 		if (!capable(CAP_SYS_TTY_CONFIG))
++ 			return -EPERM;
++ 
++ 		if (copy_from_user(&kbrep, up, sizeof(struct kbd_repeat)))
++ 			return -EFAULT;
++ 
++ 		ret = kbd_rate(&kbrep);
++ 		if (ret)
++ 			return ret;
++ 		if (copy_to_user(up, &kbrep, sizeof(struct kbd_repeat)))
++ 			return -EFAULT;
++ 		break;
++ 	}
++ 
++ 	case KDSETMODE:
++ 		if (!perm)
++ 			return -EPERM;
++ 
++ 		console_lock();
++ 		ret = vt_kdsetmode(vc, arg);
++ 		console_unlock();
++ 		return ret;
++ 
++ 	case KDGETMODE:
++ 		return put_user(vc->vc_mode, (int __user *)arg);
++ 
++ 	case KDMAPDISP:
++ 	case KDUNMAPDISP:
++ 		/*
++ 		 * these work like a combination of mmap and KDENABIO.
++ 		 * this could be easily finished.
++ 		 */
++ 		return -EINVAL;
++ 
++ 	case KDSKBMODE:
++ 		if (!perm)
++ 			return -EPERM;
++ 		ret = vt_do_kdskbmode(console, arg);
++ 		if (ret)
++ 			return ret;
++ 		tty_ldisc_flush(tty);
++ 		break;
++ 
++ 	case KDGKBMODE:
++ 		return put_user(vt_do_kdgkbmode(console), (int __user *)arg);
++ 
++ 	/* this could be folded into KDSKBMODE, but for compatibility
++ 	   reasons it is not so easy to fold KDGKBMETA into KDGKBMODE */
++ 	case KDSKBMETA:
++ 		return vt_do_kdskbmeta(console, arg);
++ 
++ 	case KDGKBMETA:
++ 		/* FIXME: should review whether this is worth locking */
++ 		return put_user(vt_do_kdgkbmeta(console), (int __user *)arg);
++ 
++ 	case KDGETKEYCODE:
++ 	case KDSETKEYCODE:
++ 		if(!capable(CAP_SYS_TTY_CONFIG))
++ 			perm = 0;
++ 		return vt_do_kbkeycode_ioctl(cmd, up, perm);
++ 
++ 	case KDGKBENT:
++ 	case KDSKBENT:
++ 		return vt_do_kdsk_ioctl(cmd, up, perm, console);
++ 
++ 	case KDGKBSENT:
++ 	case KDSKBSENT:
++ 		return vt_do_kdgkb_ioctl(cmd, up, perm);
++ 
++ 	/* Diacritical processing. Handled in keyboard.c as it has
++ 	   to operate on the keyboard locks and structures */
++ 	case KDGKBDIACR:
++ 	case KDGKBDIACRUC:
++ 	case KDSKBDIACR:
++ 	case KDSKBDIACRUC:
++ 		return vt_do_diacrit(cmd, up, perm);
++ 
++ 	/* the ioctls below read/set the flags usually shown in the leds */
++ 	/* don't use them - they will go away without warning */
++ 	case KDGKBLED:
++ 	case KDSKBLED:
++ 	case KDGETLED:
++ 	case KDSETLED:
++ 		return vt_do_kdskled(console, cmd, arg, perm);
++ 
++ 	/*
++ 	 * A process can indicate its willingness to accept signals
++ 	 * generated by pressing an appropriate key combination.
++ 	 * Thus, one can have a daemon that e.g. spawns a new console
++ 	 * upon a keypress and then changes to it.
++ 	 * See also the kbrequest field of inittab(5).
++ 	 */
++ 	case KDSIGACCEPT:
++ 		if (!perm || !capable(CAP_KILL))
++ 			return -EPERM;
++ 		if (!valid_signal(arg) || arg < 1 || arg == SIGKILL)
++ 			return -EINVAL;
++ 
++ 		spin_lock_irq(&vt_spawn_con.lock);
++ 		put_pid(vt_spawn_con.pid);
++ 		vt_spawn_con.pid = get_pid(task_pid(current));
++ 		vt_spawn_con.sig = arg;
++ 		spin_unlock_irq(&vt_spawn_con.lock);
++ 		break;
++ 
++ 	case KDFONTOP: {
++ 		struct console_font_op op;
++ 
++ 		if (copy_from_user(&op, up, sizeof(op)))
++ 			return -EFAULT;
++ 		if (!perm && op.op != KD_FONT_OP_GET)
++ 			return -EPERM;
++ 		ret = con_font_op(vc, &op);
++ 		if (ret)
++ 			return ret;
++ 		if (copy_to_user(up, &op, sizeof(op)))
++ 			return -EFAULT;
++ 		break;
++ 	}
++ 
++ 	default:
++ 		return -ENOIOCTLCMD;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static inline int do_unimap_ioctl(int cmd, struct unimapdesc __user *user_ud,
++ 		bool perm, struct vc_data *vc)
+++>>>>>>> 2287a51ba822 (vt_kdsetmode: extend console locking)
+  {
+  	struct unimapdesc tmp;
+  
+* Unmerged path drivers/tty/vt/vt_ioctl.c
