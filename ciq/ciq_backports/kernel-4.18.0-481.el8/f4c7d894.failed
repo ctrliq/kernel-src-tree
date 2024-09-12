@@ -1,0 +1,87 @@
+net: stmmac: fix unbalanced ptp clock issue in suspend/resume flow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Biao Huang <biao.huang@mediatek.com>
+commit f4c7d8948e866918d61493264dbbd67e45ef2bda
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/f4c7d894.failed
+
+Current stmmac driver will prepare/enable ptp_ref clock in
+stmmac_init_tstamp_counter().
+
+The stmmac_pltfr_noirq_suspend will disable it once in suspend flow.
+
+But in resume flow,
+	stmmac_pltfr_noirq_resume --> stmmac_init_tstamp_counter
+	stmmac_resume --> stmmac_hw_setup --> stmmac_init_ptp --> stmmac_init_tstamp_counter
+ptp_ref clock reference counter increases twice, which leads to unbalance
+ptp clock when resume back.
+
+Move ptp_ref clock prepare/enable out of stmmac_init_tstamp_counter to fix it.
+
+Fixes: 0735e639f129d ("net: stmmac: skip only stmmac_ptp_register when resume from suspend")
+	Signed-off-by: Biao Huang <biao.huang@mediatek.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f4c7d8948e866918d61493264dbbd67e45ef2bda)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+diff --cc drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 76883fb002a4,c5f33630e771..000000000000
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@@ -2880,13 -3261,21 +2871,31 @@@ static int stmmac_hw_setup(struct net_d
+  
+  	stmmac_mmc_setup(priv);
+  
+++<<<<<<< HEAD
+ +	if (init_ptp) {
+ +		ret = stmmac_init_ptp(priv);
+ +		if (ret == -EOPNOTSUPP)
+ +			netdev_warn(priv->dev, "PTP not supported by HW\n");
+ +		else if (ret)
+ +			netdev_warn(priv->dev, "PTP init failed\n");
+ +	}
+++=======
++ 	if (ptp_register) {
++ 		ret = clk_prepare_enable(priv->plat->clk_ptp_ref);
++ 		if (ret < 0)
++ 			netdev_warn(priv->dev,
++ 				    "failed to enable PTP reference clock: %pe\n",
++ 				    ERR_PTR(ret));
++ 	}
++ 
++ 	ret = stmmac_init_ptp(priv);
++ 	if (ret == -EOPNOTSUPP)
++ 		netdev_info(priv->dev, "PTP not supported by HW\n");
++ 	else if (ret)
++ 		netdev_warn(priv->dev, "PTP init failed\n");
++ 	else if (ptp_register)
++ 		stmmac_ptp_register(priv);
+++>>>>>>> f4c7d8948e86 (net: stmmac: fix unbalanced ptp clock issue in suspend/resume flow)
+  
+  	priv->eee_tw_timer = STMMAC_DEFAULT_TWT_LS;
+  
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_platform.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_platform.c
+index 363ccf24d6f2..527d816aeb65 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_platform.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_platform.c
+@@ -820,7 +820,13 @@ static int __maybe_unused stmmac_pltfr_noirq_resume(struct device *dev)
+ 		if (ret)
+ 			return ret;
+ 
+-		stmmac_init_tstamp_counter(priv, priv->systime_flags);
++		ret = clk_prepare_enable(priv->plat->clk_ptp_ref);
++		if (ret < 0) {
++			netdev_warn(priv->dev,
++				    "failed to enable PTP reference clock: %pe\n",
++				    ERR_PTR(ret));
++			return ret;
++		}
+ 	}
+ 
+ 	return 0;
