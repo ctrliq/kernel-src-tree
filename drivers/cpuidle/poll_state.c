@@ -14,7 +14,10 @@
 static int __cpuidle poll_idle(struct cpuidle_device *dev,
 			       struct cpuidle_driver *drv, int index)
 {
-	u64 time_start = local_clock();
+	u64 time_start;
+
+	instrumentation_begin();
+	time_start = local_clock();
 
 	dev->poll_time_limit = false;
 
@@ -38,6 +41,7 @@ static int __cpuidle poll_idle(struct cpuidle_device *dev,
 		}
 	}
 	current_clr_polling();
+	instrumentation_end();
 
 	return index;
 }
