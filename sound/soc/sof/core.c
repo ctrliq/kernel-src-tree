@@ -335,6 +335,13 @@ int snd_sof_device_probe(struct device *dev, struct snd_sof_pdata *plat_data)
 #endif
 	dev_set_drvdata(dev, sdev);
 
+	/* check IPC support */
+	if (!(BIT(plat_data->ipc_type) & plat_data->desc->ipc_supported_mask)) {
+		dev_err(dev, "ipc_type %d is not supported on this platform, mask is %#x\n",
+			plat_data->ipc_type, plat_data->desc->ipc_supported_mask);
+		return -EINVAL;
+	}
+
 	/* init ops, if necessary */
 	sof_ops_init(sdev);
 
