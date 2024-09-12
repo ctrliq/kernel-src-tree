@@ -1,0 +1,367 @@
+net: devlink: make sure that devlink_try_get() works with valid pointer during xarray iteration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Jiri Pirko <jiri@nvidia.com>
+commit 30bab7cdb56da4819ff081ad658646f2df16c098
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/30bab7cd.failed
+
+Remove dependency on devlink_mutex during devlinks xarray iteration.
+
+The reason is that devlink_register/unregister() functions taking
+devlink_mutex would deadlock during devlink reload operation of devlink
+instance which registers/unregisters nested devlink instances.
+
+The devlinks xarray consistency is ensured internally by xarray.
+There is a reference taken when working with devlink using
+devlink_try_get(). But there is no guarantee that devlink pointer
+picked during xarray iteration is not freed before devlink_try_get()
+is called.
+
+Make sure that devlink_try_get() works with valid pointer.
+Achieve it by:
+1) Splitting devlink_put() so the completion is sent only
+   after grace period. Completion unblocks the devlink_unregister()
+   routine, which is followed-up by devlink_free()
+2) During devlinks xa_array iteration, get devlink pointer from xa_array
+   holding RCU read lock and taking reference using devlink_try_get()
+   before unlock.
+
+	Signed-off-by: Jiri Pirko <jiri@nvidia.com>
+	Reviewed-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 30bab7cdb56da4819ff081ad658646f2df16c098)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/devlink.c
+diff --cc net/core/devlink.c
+index 571e4c3d21fd,c7abd928f389..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -1968,6 -2095,319 +2006,322 @@@ static int devlink_nl_cmd_rate_del_doit
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct devlink_linecard_type {
++ 	const char *type;
++ 	const void *priv;
++ };
++ 
++ static int devlink_nl_linecard_fill(struct sk_buff *msg,
++ 				    struct devlink *devlink,
++ 				    struct devlink_linecard *linecard,
++ 				    enum devlink_command cmd, u32 portid,
++ 				    u32 seq, int flags,
++ 				    struct netlink_ext_ack *extack)
++ {
++ 	struct devlink_linecard_type *linecard_type;
++ 	struct nlattr *attr;
++ 	void *hdr;
++ 	int i;
++ 
++ 	hdr = genlmsg_put(msg, portid, seq, &devlink_nl_family, flags, cmd);
++ 	if (!hdr)
++ 		return -EMSGSIZE;
++ 
++ 	if (devlink_nl_put_handle(msg, devlink))
++ 		goto nla_put_failure;
++ 	if (nla_put_u32(msg, DEVLINK_ATTR_LINECARD_INDEX, linecard->index))
++ 		goto nla_put_failure;
++ 	if (nla_put_u8(msg, DEVLINK_ATTR_LINECARD_STATE, linecard->state))
++ 		goto nla_put_failure;
++ 	if (linecard->type &&
++ 	    nla_put_string(msg, DEVLINK_ATTR_LINECARD_TYPE, linecard->type))
++ 		goto nla_put_failure;
++ 
++ 	if (linecard->types_count) {
++ 		attr = nla_nest_start(msg,
++ 				      DEVLINK_ATTR_LINECARD_SUPPORTED_TYPES);
++ 		if (!attr)
++ 			goto nla_put_failure;
++ 		for (i = 0; i < linecard->types_count; i++) {
++ 			linecard_type = &linecard->types[i];
++ 			if (nla_put_string(msg, DEVLINK_ATTR_LINECARD_TYPE,
++ 					   linecard_type->type)) {
++ 				nla_nest_cancel(msg, attr);
++ 				goto nla_put_failure;
++ 			}
++ 		}
++ 		nla_nest_end(msg, attr);
++ 	}
++ 
++ 	genlmsg_end(msg, hdr);
++ 	return 0;
++ 
++ nla_put_failure:
++ 	genlmsg_cancel(msg, hdr);
++ 	return -EMSGSIZE;
++ }
++ 
++ static void devlink_linecard_notify(struct devlink_linecard *linecard,
++ 				    enum devlink_command cmd)
++ {
++ 	struct devlink *devlink = linecard->devlink;
++ 	struct sk_buff *msg;
++ 	int err;
++ 
++ 	WARN_ON(cmd != DEVLINK_CMD_LINECARD_NEW &&
++ 		cmd != DEVLINK_CMD_LINECARD_DEL);
++ 
++ 	if (!xa_get_mark(&devlinks, devlink->index, DEVLINK_REGISTERED))
++ 		return;
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg)
++ 		return;
++ 
++ 	err = devlink_nl_linecard_fill(msg, devlink, linecard, cmd, 0, 0, 0,
++ 				       NULL);
++ 	if (err) {
++ 		nlmsg_free(msg);
++ 		return;
++ 	}
++ 
++ 	genlmsg_multicast_netns(&devlink_nl_family, devlink_net(devlink),
++ 				msg, 0, DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
++ }
++ 
++ static int devlink_nl_cmd_linecard_get_doit(struct sk_buff *skb,
++ 					    struct genl_info *info)
++ {
++ 	struct devlink_linecard *linecard = info->user_ptr[1];
++ 	struct devlink *devlink = linecard->devlink;
++ 	struct sk_buff *msg;
++ 	int err;
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg)
++ 		return -ENOMEM;
++ 
++ 	mutex_lock(&linecard->state_lock);
++ 	err = devlink_nl_linecard_fill(msg, devlink, linecard,
++ 				       DEVLINK_CMD_LINECARD_NEW,
++ 				       info->snd_portid, info->snd_seq, 0,
++ 				       info->extack);
++ 	mutex_unlock(&linecard->state_lock);
++ 	if (err) {
++ 		nlmsg_free(msg);
++ 		return err;
++ 	}
++ 
++ 	return genlmsg_reply(msg, info);
++ }
++ 
++ static int devlink_nl_cmd_linecard_get_dumpit(struct sk_buff *msg,
++ 					      struct netlink_callback *cb)
++ {
++ 	struct devlink_linecard *linecard;
++ 	struct devlink *devlink;
++ 	int start = cb->args[0];
++ 	unsigned long index;
++ 	int idx = 0;
++ 	int err;
++ 
++ 	mutex_lock(&devlink_mutex);
++ 	devlinks_xa_for_each_registered_get(index, devlink) {
++ 		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
++ 			goto retry;
++ 
++ 		mutex_lock(&devlink->linecards_lock);
++ 		list_for_each_entry(linecard, &devlink->linecard_list, list) {
++ 			if (idx < start) {
++ 				idx++;
++ 				continue;
++ 			}
++ 			mutex_lock(&linecard->state_lock);
++ 			err = devlink_nl_linecard_fill(msg, devlink, linecard,
++ 						       DEVLINK_CMD_LINECARD_NEW,
++ 						       NETLINK_CB(cb->skb).portid,
++ 						       cb->nlh->nlmsg_seq,
++ 						       NLM_F_MULTI,
++ 						       cb->extack);
++ 			mutex_unlock(&linecard->state_lock);
++ 			if (err) {
++ 				mutex_unlock(&devlink->linecards_lock);
++ 				devlink_put(devlink);
++ 				goto out;
++ 			}
++ 			idx++;
++ 		}
++ 		mutex_unlock(&devlink->linecards_lock);
++ retry:
++ 		devlink_put(devlink);
++ 	}
++ out:
++ 	mutex_unlock(&devlink_mutex);
++ 
++ 	cb->args[0] = idx;
++ 	return msg->len;
++ }
++ 
++ static struct devlink_linecard_type *
++ devlink_linecard_type_lookup(struct devlink_linecard *linecard,
++ 			     const char *type)
++ {
++ 	struct devlink_linecard_type *linecard_type;
++ 	int i;
++ 
++ 	for (i = 0; i < linecard->types_count; i++) {
++ 		linecard_type = &linecard->types[i];
++ 		if (!strcmp(type, linecard_type->type))
++ 			return linecard_type;
++ 	}
++ 	return NULL;
++ }
++ 
++ static int devlink_linecard_type_set(struct devlink_linecard *linecard,
++ 				     const char *type,
++ 				     struct netlink_ext_ack *extack)
++ {
++ 	const struct devlink_linecard_ops *ops = linecard->ops;
++ 	struct devlink_linecard_type *linecard_type;
++ 	int err;
++ 
++ 	mutex_lock(&linecard->state_lock);
++ 	if (linecard->state == DEVLINK_LINECARD_STATE_PROVISIONING) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Line card is currently being provisioned");
++ 		err = -EBUSY;
++ 		goto out;
++ 	}
++ 	if (linecard->state == DEVLINK_LINECARD_STATE_UNPROVISIONING) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Line card is currently being unprovisioned");
++ 		err = -EBUSY;
++ 		goto out;
++ 	}
++ 
++ 	linecard_type = devlink_linecard_type_lookup(linecard, type);
++ 	if (!linecard_type) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Unsupported line card type provided");
++ 		err = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (linecard->state != DEVLINK_LINECARD_STATE_UNPROVISIONED &&
++ 	    linecard->state != DEVLINK_LINECARD_STATE_PROVISIONING_FAILED) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Line card already provisioned");
++ 		err = -EBUSY;
++ 		/* Check if the line card is provisioned in the same
++ 		 * way the user asks. In case it is, make the operation
++ 		 * to return success.
++ 		 */
++ 		if (ops->same_provision &&
++ 		    ops->same_provision(linecard, linecard->priv,
++ 					linecard_type->type,
++ 					linecard_type->priv))
++ 			err = 0;
++ 		goto out;
++ 	}
++ 
++ 	linecard->state = DEVLINK_LINECARD_STATE_PROVISIONING;
++ 	linecard->type = linecard_type->type;
++ 	devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 	mutex_unlock(&linecard->state_lock);
++ 	err = ops->provision(linecard, linecard->priv, linecard_type->type,
++ 			     linecard_type->priv, extack);
++ 	if (err) {
++ 		/* Provisioning failed. Assume the linecard is unprovisioned
++ 		 * for future operations.
++ 		 */
++ 		mutex_lock(&linecard->state_lock);
++ 		linecard->state = DEVLINK_LINECARD_STATE_UNPROVISIONED;
++ 		linecard->type = NULL;
++ 		devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 		mutex_unlock(&linecard->state_lock);
++ 	}
++ 	return err;
++ 
++ out:
++ 	mutex_unlock(&linecard->state_lock);
++ 	return err;
++ }
++ 
++ static int devlink_linecard_type_unset(struct devlink_linecard *linecard,
++ 				       struct netlink_ext_ack *extack)
++ {
++ 	int err;
++ 
++ 	mutex_lock(&linecard->state_lock);
++ 	if (linecard->state == DEVLINK_LINECARD_STATE_PROVISIONING) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Line card is currently being provisioned");
++ 		err = -EBUSY;
++ 		goto out;
++ 	}
++ 	if (linecard->state == DEVLINK_LINECARD_STATE_UNPROVISIONING) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Line card is currently being unprovisioned");
++ 		err = -EBUSY;
++ 		goto out;
++ 	}
++ 	if (linecard->state == DEVLINK_LINECARD_STATE_PROVISIONING_FAILED) {
++ 		linecard->state = DEVLINK_LINECARD_STATE_UNPROVISIONED;
++ 		linecard->type = NULL;
++ 		devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 		err = 0;
++ 		goto out;
++ 	}
++ 
++ 	if (linecard->state == DEVLINK_LINECARD_STATE_UNPROVISIONED) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Line card is not provisioned");
++ 		err = 0;
++ 		goto out;
++ 	}
++ 	linecard->state = DEVLINK_LINECARD_STATE_UNPROVISIONING;
++ 	devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 	mutex_unlock(&linecard->state_lock);
++ 	err = linecard->ops->unprovision(linecard, linecard->priv,
++ 					 extack);
++ 	if (err) {
++ 		/* Unprovisioning failed. Assume the linecard is unprovisioned
++ 		 * for future operations.
++ 		 */
++ 		mutex_lock(&linecard->state_lock);
++ 		linecard->state = DEVLINK_LINECARD_STATE_UNPROVISIONED;
++ 		linecard->type = NULL;
++ 		devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 		mutex_unlock(&linecard->state_lock);
++ 	}
++ 	return err;
++ 
++ out:
++ 	mutex_unlock(&linecard->state_lock);
++ 	return err;
++ }
++ 
++ static int devlink_nl_cmd_linecard_set_doit(struct sk_buff *skb,
++ 					    struct genl_info *info)
++ {
++ 	struct devlink_linecard *linecard = info->user_ptr[1];
++ 	struct netlink_ext_ack *extack = info->extack;
++ 	int err;
++ 
++ 	if (info->attrs[DEVLINK_ATTR_LINECARD_TYPE]) {
++ 		const char *type;
++ 
++ 		type = nla_data(info->attrs[DEVLINK_ATTR_LINECARD_TYPE]);
++ 		if (strcmp(type, "")) {
++ 			err = devlink_linecard_type_set(linecard, type, extack);
++ 			if (err)
++ 				return err;
++ 		} else {
++ 			err = devlink_linecard_type_unset(linecard, extack);
++ 			if (err)
++ 				return err;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 30bab7cdb56d (net: devlink: make sure that devlink_try_get() works with valid pointer during xarray iteration)
+  static int devlink_nl_sb_fill(struct sk_buff *msg, struct devlink *devlink,
+  			      struct devlink_sb *devlink_sb,
+  			      enum devlink_command cmd, u32 portid,
+* Unmerged path net/core/devlink.c
