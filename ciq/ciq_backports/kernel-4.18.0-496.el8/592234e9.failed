@@ -1,0 +1,291 @@
+wifi: mac80211: Fix iTXQ AMPDU fragmentation handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Alexander Wetzel <alexander@wetzel-home.de>
+commit 592234e941f1addaa598601c9227e3b72d608625
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/592234e9.failed
+
+mac80211 must not enable aggregation wile transmitting a fragmented
+MPDU. Enforce that for mac80211 internal TX queues (iTXQs).
+
+	Reported-by: kernel test robot <oliver.sang@intel.com>
+Link: https://lore.kernel.org/oe-lkp/202301021738.7cd3e6ae-oliver.sang@intel.com
+	Signed-off-by: Alexander Wetzel <alexander@wetzel-home.de>
+Link: https://lore.kernel.org/r/20230106223141.98696-1-alexander@wetzel-home.de
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 592234e941f1addaa598601c9227e3b72d608625)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/tx.c
+diff --cc net/mac80211/tx.c
+index af821ca35576,defe97a31724..000000000000
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@@ -3585,6 -3580,146 +3583,149 @@@ ieee80211_xmit_fast_finish(struct ieee8
+  	return TX_CONTINUE;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static netdev_features_t
++ ieee80211_sdata_netdev_features(struct ieee80211_sub_if_data *sdata)
++ {
++ 	if (sdata->vif.type != NL80211_IFTYPE_AP_VLAN)
++ 		return sdata->vif.netdev_features;
++ 
++ 	if (!sdata->bss)
++ 		return 0;
++ 
++ 	sdata = container_of(sdata->bss, struct ieee80211_sub_if_data, u.ap);
++ 	return sdata->vif.netdev_features;
++ }
++ 
++ static struct sk_buff *
++ ieee80211_tx_skb_fixup(struct sk_buff *skb, netdev_features_t features)
++ {
++ 	if (skb_is_gso(skb)) {
++ 		struct sk_buff *segs;
++ 
++ 		segs = skb_gso_segment(skb, features);
++ 		if (!segs)
++ 			return skb;
++ 		if (IS_ERR(segs))
++ 			goto free;
++ 
++ 		consume_skb(skb);
++ 		return segs;
++ 	}
++ 
++ 	if (skb_needs_linearize(skb, features) && __skb_linearize(skb))
++ 		goto free;
++ 
++ 	if (skb->ip_summed == CHECKSUM_PARTIAL) {
++ 		int ofs = skb_checksum_start_offset(skb);
++ 
++ 		if (skb->encapsulation)
++ 			skb_set_inner_transport_header(skb, ofs);
++ 		else
++ 			skb_set_transport_header(skb, ofs);
++ 
++ 		if (skb_csum_hwoffload_help(skb, features))
++ 			goto free;
++ 	}
++ 
++ 	skb_mark_not_on_list(skb);
++ 	return skb;
++ 
++ free:
++ 	kfree_skb(skb);
++ 	return NULL;
++ }
++ 
++ static void __ieee80211_xmit_fast(struct ieee80211_sub_if_data *sdata,
++ 				  struct sta_info *sta,
++ 				  struct ieee80211_fast_tx *fast_tx,
++ 				  struct sk_buff *skb, u8 tid, bool ampdu)
++ {
++ 	struct ieee80211_local *local = sdata->local;
++ 	struct ieee80211_hdr *hdr = (void *)fast_tx->hdr;
++ 	struct ieee80211_tx_info *info;
++ 	struct ieee80211_tx_data tx;
++ 	ieee80211_tx_result r;
++ 	int hw_headroom = sdata->local->hw.extra_tx_headroom;
++ 	int extra_head = fast_tx->hdr_len - (ETH_HLEN - 2);
++ 	struct ethhdr eth;
++ 
++ 	skb = skb_share_check(skb, GFP_ATOMIC);
++ 	if (unlikely(!skb))
++ 		return;
++ 
++ 	if ((hdr->frame_control & cpu_to_le16(IEEE80211_STYPE_QOS_DATA)) &&
++ 	    ieee80211_amsdu_aggregate(sdata, sta, fast_tx, skb))
++ 		return;
++ 
++ 	/* will not be crypto-handled beyond what we do here, so use false
++ 	 * as the may-encrypt argument for the resize to not account for
++ 	 * more room than we already have in 'extra_head'
++ 	 */
++ 	if (unlikely(ieee80211_skb_resize(sdata, skb,
++ 					  max_t(int, extra_head + hw_headroom -
++ 						     skb_headroom(skb), 0),
++ 					  ENCRYPT_NO)))
++ 		goto free;
++ 
++ 	memcpy(&eth, skb->data, ETH_HLEN - 2);
++ 	hdr = skb_push(skb, extra_head);
++ 	memcpy(skb->data, fast_tx->hdr, fast_tx->hdr_len);
++ 	memcpy(skb->data + fast_tx->da_offs, eth.h_dest, ETH_ALEN);
++ 	memcpy(skb->data + fast_tx->sa_offs, eth.h_source, ETH_ALEN);
++ 
++ 	info = IEEE80211_SKB_CB(skb);
++ 	memset(info, 0, sizeof(*info));
++ 	info->band = fast_tx->band;
++ 	info->control.vif = &sdata->vif;
++ 	info->flags = IEEE80211_TX_CTL_FIRST_FRAGMENT |
++ 		      IEEE80211_TX_CTL_DONTFRAG;
++ 	info->control.flags = IEEE80211_TX_CTRL_FAST_XMIT |
++ 			      u32_encode_bits(IEEE80211_LINK_UNSPECIFIED,
++ 					      IEEE80211_TX_CTRL_MLO_LINK);
++ 
++ #ifdef CONFIG_MAC80211_DEBUGFS
++ 	if (local->force_tx_status)
++ 		info->flags |= IEEE80211_TX_CTL_REQ_TX_STATUS;
++ #endif
++ 
++ 	if (hdr->frame_control & cpu_to_le16(IEEE80211_STYPE_QOS_DATA)) {
++ 		tid = skb->priority & IEEE80211_QOS_CTL_TAG1D_MASK;
++ 		*ieee80211_get_qos_ctl(hdr) = tid;
++ 	}
++ 
++ 	__skb_queue_head_init(&tx.skbs);
++ 
++ 	tx.flags = IEEE80211_TX_UNICAST;
++ 	tx.local = local;
++ 	tx.sdata = sdata;
++ 	tx.sta = sta;
++ 	tx.key = fast_tx->key;
++ 
++ 	if (ieee80211_queue_skb(local, sdata, sta, skb))
++ 		return;
++ 
++ 	tx.skb = skb;
++ 	r = ieee80211_xmit_fast_finish(sdata, sta, fast_tx->pn_offs,
++ 				       fast_tx->key, &tx);
++ 	tx.skb = NULL;
++ 	if (r == TX_DROP)
++ 		goto free;
++ 
++ 	if (sdata->vif.type == NL80211_IFTYPE_AP_VLAN)
++ 		sdata = container_of(sdata->bss,
++ 				     struct ieee80211_sub_if_data, u.ap);
++ 
++ 	__skb_queue_tail(&tx.skbs, skb);
++ 	ieee80211_tx_frags(local, &sdata->vif, sta, &tx.skbs, false);
++ 	return;
++ 
++ free:
++ 	kfree_skb(skb);
++ }
++ 
+++>>>>>>> 592234e941f1 (wifi: mac80211: Fix iTXQ AMPDU fragmentation handling)
+  static bool ieee80211_xmit_fast(struct ieee80211_sub_if_data *sdata,
+  				struct sta_info *sta,
+  				struct ieee80211_fast_tx *fast_tx,
+@@@ -3723,17 -3789,18 +3864,20 @@@ struct sk_buff *ieee80211_tx_dequeue(st
+  		return NULL;
+  
+  begin:
+ -	spin_lock(&local->queue_stop_reason_lock);
+ -	q_stopped = local->queue_stop_reasons[q];
+ -	spin_unlock(&local->queue_stop_reason_lock);
+ +	spin_lock_bh(&fq->lock);
+  
+ -	if (unlikely(q_stopped)) {
+ -		/* mark for waking later */
+ -		set_bit(IEEE80211_TXQ_DIRTY, &txqi->flags);
+ -		return NULL;
+ -	}
+++<<<<<<< HEAD
+ +	if (test_bit(IEEE80211_TXQ_STOP, &txqi->flags) ||
+ +	    test_bit(IEEE80211_TXQ_STOP_NETIF_TX, &txqi->flags))
+ +		goto out;
+  
+ -	spin_lock_bh(&fq->lock);
+ +	if (vif->txqs_stopped[txq->ac]) {
+ +		set_bit(IEEE80211_TXQ_STOP_NETIF_TX, &txqi->flags);
+ +		goto out;
+ +	}
+  
+++=======
+++>>>>>>> 592234e941f1 (wifi: mac80211: Fix iTXQ AMPDU fragmentation handling)
+  	/* Make sure fragments stay together. */
+  	skb = __skb_dequeue(&txqi->frags);
+  	if (unlikely(skb)) {
+@@@ -4535,17 -4592,14 +4681,22 @@@ static void ieee80211_8023_xmit(struct 
+  			tid_tx->last_tx = jiffies;
+  	}
+  
+ -	skb = ieee80211_tx_skb_fixup(skb, ieee80211_sdata_netdev_features(sdata));
+ -	if (!skb)
+ -		return;
+ +	if (unlikely(skb->sk &&
+ +		     skb_shinfo(skb)->tx_flags & SKBTX_WIFI_STATUS))
+ +		info->ack_frame_id = ieee80211_store_ack_skb(local, skb,
+ +							     &info->flags, NULL);
+  
+++<<<<<<< HEAD
+ +	info->hw_queue = sdata->vif.hw_queue[skb_get_queue_mapping(skb)];
+++=======
++ 	info = IEEE80211_SKB_CB(skb);
++ 	memset(info, 0, sizeof(*info));
+++>>>>>>> 592234e941f1 (wifi: mac80211: Fix iTXQ AMPDU fragmentation handling)
+  
+ -	info->hw_queue = sdata->vif.hw_queue[queue];
+ +	dev_sw_netstats_tx_add(dev, 1, skb->len);
+ +
+ +	sta->deflink.tx_stats.bytes[skb_get_queue_mapping(skb)] += skb->len;
+ +	sta->deflink.tx_stats.packets[skb_get_queue_mapping(skb)]++;
+  
+  	if (sdata->vif.type == NL80211_IFTYPE_AP_VLAN)
+  		sdata = container_of(sdata->bss,
+diff --git a/net/mac80211/agg-tx.c b/net/mac80211/agg-tx.c
+index 3dbb724d7dc4..f9514bacbd4a 100644
+--- a/net/mac80211/agg-tx.c
++++ b/net/mac80211/agg-tx.c
+@@ -511,8 +511,6 @@ void ieee80211_tx_ba_session_handle_start(struct sta_info *sta, int tid)
+ 	 */
+ 	clear_bit(HT_AGG_STATE_WANT_START, &tid_tx->state);
+ 
+-	ieee80211_agg_stop_txq(sta, tid);
+-
+ 	/*
+ 	 * Make sure no packets are being processed. This ensures that
+ 	 * we have a valid starting sequence number and that in-flight
+diff --git a/net/mac80211/ht.c b/net/mac80211/ht.c
+index 83bc41346ae7..5315ab750280 100644
+--- a/net/mac80211/ht.c
++++ b/net/mac80211/ht.c
+@@ -391,6 +391,37 @@ void ieee80211_ba_session_work(struct work_struct *work)
+ 
+ 		tid_tx = sta->ampdu_mlme.tid_start_tx[tid];
+ 		if (!blocked && tid_tx) {
++			struct txq_info *txqi = to_txq_info(sta->sta.txq[tid]);
++			struct ieee80211_sub_if_data *sdata =
++				vif_to_sdata(txqi->txq.vif);
++			struct fq *fq = &sdata->local->fq;
++
++			spin_lock_bh(&fq->lock);
++
++			/* Allow only frags to be dequeued */
++			set_bit(IEEE80211_TXQ_STOP, &txqi->flags);
++
++			if (!skb_queue_empty(&txqi->frags)) {
++				/* Fragmented Tx is ongoing, wait for it to
++				 * finish. Reschedule worker to retry later.
++				 */
++
++				spin_unlock_bh(&fq->lock);
++				spin_unlock_bh(&sta->lock);
++
++				/* Give the task working on the txq a chance
++				 * to send out the queued frags
++				 */
++				synchronize_net();
++
++				mutex_unlock(&sta->ampdu_mlme.mtx);
++
++				ieee80211_queue_work(&sdata->local->hw, work);
++				return;
++			}
++
++			spin_unlock_bh(&fq->lock);
++
+ 			/*
+ 			 * Assign it over to the normal tid_tx array
+ 			 * where it "goes live".
+* Unmerged path net/mac80211/tx.c
