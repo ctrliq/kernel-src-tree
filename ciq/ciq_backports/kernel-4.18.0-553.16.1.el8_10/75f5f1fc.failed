@@ -1,0 +1,132 @@
+perf record: Introduce compressor at mmap buffer object
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Alexey Bayduraev <alexey.v.bayduraev@linux.intel.com>
+commit 75f5f1fcb9c0f0f542f44d993de18047b2b7f37f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/75f5f1fc.failed
+
+Introduce compressor object into mmap object so it could be used to
+pack the data stream from the corresponding kernel data buffer.
+Initialize and make use of the introduced per mmap compressor.
+
+	Signed-off-by: Alexey Bayduraev <alexey.v.bayduraev@linux.intel.com>
+	Tested-by: Jiri Olsa <jolsa@kernel.org>
+	Acked-by: Andi Kleen <ak@linux.intel.com>
+	Acked-by: Namhyung Kim <namhyung@gmail.com>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Alexander Antonov <alexander.antonov@linux.intel.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Alexei Budankov <abudankov@huawei.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Riccardo Mancini <rickyman7@gmail.com>
+Link: https://lore.kernel.org/r/80edc286cf6543139a7d5a91217605123aa0b50d.1642440724.git.alexey.v.bayduraev@linux.intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 75f5f1fcb9c0f0f542f44d993de18047b2b7f37f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/mmap.h
+diff --cc tools/perf/util/mmap.h
+index 9d5f589f02ae,cd8b0777473b..000000000000
+--- a/tools/perf/util/mmap.h
++++ b/tools/perf/util/mmap.h
+@@@ -43,6 -46,8 +44,11 @@@ struct mmap 
+  	struct mmap_cpu_mask	affinity_mask;
+  	void		*data;
+  	int		comp_level;
+++<<<<<<< HEAD
+++=======
++ 	struct perf_data_file *file;
++ 	struct zstd_data      zstd_data;
+++>>>>>>> 75f5f1fcb9c0 (perf record: Introduce compressor at mmap buffer object)
+  };
+  
+  struct mmap_params {
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index a12318efae5a..77c0f9e08aff 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -175,8 +175,8 @@ static int record__write(struct record *rec, struct mmap *map __maybe_unused,
+ 
+ static int record__aio_enabled(struct record *rec);
+ static int record__comp_enabled(struct record *rec);
+-static size_t zstd_compress(struct perf_session *session, void *dst, size_t dst_size,
+-			    void *src, size_t src_size);
++static size_t zstd_compress(struct perf_session *session, struct mmap *map,
++			    void *dst, size_t dst_size, void *src, size_t src_size);
+ 
+ #ifdef HAVE_AIO_SUPPORT
+ static int record__aio_write(struct aiocb *cblock, int trace_fd,
+@@ -310,7 +310,7 @@ static int record__aio_pushfn(struct mmap *map, void *to, void *buf, size_t size
+ 	 */
+ 
+ 	if (record__comp_enabled(aio->rec)) {
+-		size = zstd_compress(aio->rec->session, aio->data + aio->size,
++		size = zstd_compress(aio->rec->session, NULL, aio->data + aio->size,
+ 				     mmap__mmap_len(map) - aio->size,
+ 				     buf, size);
+ 	} else {
+@@ -537,7 +537,7 @@ static int record__pushfn(struct mmap *map, void *to, void *bf, size_t size)
+ 	struct record *rec = to;
+ 
+ 	if (record__comp_enabled(rec)) {
+-		size = zstd_compress(rec->session, map->data, mmap__mmap_len(map), bf, size);
++		size = zstd_compress(rec->session, map, map->data, mmap__mmap_len(map), bf, size);
+ 		bf   = map->data;
+ 	}
+ 
+@@ -1091,13 +1091,17 @@ static size_t process_comp_header(void *record, size_t increment)
+ 	return size;
+ }
+ 
+-static size_t zstd_compress(struct perf_session *session, void *dst, size_t dst_size,
+-			    void *src, size_t src_size)
++static size_t zstd_compress(struct perf_session *session, struct mmap *map,
++			    void *dst, size_t dst_size, void *src, size_t src_size)
+ {
+ 	size_t compressed;
+ 	size_t max_record_size = PERF_SAMPLE_MAX_SIZE - sizeof(struct perf_record_compressed) - 1;
++	struct zstd_data *zstd_data = &session->zstd_data;
+ 
+-	compressed = zstd_compress_stream_to_records(&session->zstd_data, dst, dst_size, src, src_size,
++	if (map && map->file)
++		zstd_data = &map->zstd_data;
++
++	compressed = zstd_compress_stream_to_records(zstd_data, dst, dst_size, src, src_size,
+ 						     max_record_size, process_comp_header);
+ 
+ 	session->bytes_transferred += src_size;
+diff --git a/tools/perf/util/mmap.c b/tools/perf/util/mmap.c
+index 1b08392e2395..21500b1542c9 100644
+--- a/tools/perf/util/mmap.c
++++ b/tools/perf/util/mmap.c
+@@ -231,6 +231,10 @@ void mmap__munmap(struct mmap *map)
+ {
+ 	bitmap_free(map->affinity_mask.bits);
+ 
++#ifndef PYTHON_PERF
++	zstd_fini(&map->zstd_data);
++#endif
++
+ 	perf_mmap__aio_munmap(map);
+ 	if (map->data != NULL) {
+ 		munmap(map->data, mmap__mmap_len(map));
+@@ -292,6 +296,12 @@ int mmap__mmap(struct mmap *map, struct mmap_params *mp, int fd, int cpu)
+ 	map->core.flush = mp->flush;
+ 
+ 	map->comp_level = mp->comp_level;
++#ifndef PYTHON_PERF
++	if (zstd_init(&map->zstd_data, map->comp_level)) {
++		pr_debug2("failed to init mmap commpressor, error %d\n", errno);
++		return -1;
++	}
++#endif
+ 
+ 	if (map->comp_level && !perf_mmap__aio_enabled(map)) {
+ 		map->data = mmap(NULL, mmap__mmap_len(map), PROT_READ|PROT_WRITE,
+* Unmerged path tools/perf/util/mmap.h
