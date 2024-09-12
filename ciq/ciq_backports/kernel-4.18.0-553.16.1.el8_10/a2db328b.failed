@@ -1,0 +1,190 @@
+null_blk: fix null-ptr-dereference while configuring 'power' and 'submit_queues'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit a2db328b0839312c169eb42746ec46fc1ab53ed2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/a2db328b.failed
+
+Writing 'power' and 'submit_queues' concurrently will trigger kernel
+panic:
+
+Test script:
+
+modprobe null_blk nr_devices=0
+mkdir -p /sys/kernel/config/nullb/nullb0
+while true; do echo 1 > submit_queues; echo 4 > submit_queues; done &
+while true; do echo 1 > power; echo 0 > power; done
+
+Test result:
+
+BUG: kernel NULL pointer dereference, address: 0000000000000148
+Oops: 0000 [#1] PREEMPT SMP
+RIP: 0010:__lock_acquire+0x41d/0x28f0
+Call Trace:
+ <TASK>
+ lock_acquire+0x121/0x450
+ down_write+0x5f/0x1d0
+ simple_recursive_removal+0x12f/0x5c0
+ blk_mq_debugfs_unregister_hctxs+0x7c/0x100
+ blk_mq_update_nr_hw_queues+0x4a3/0x720
+ nullb_update_nr_hw_queues+0x71/0xf0 [null_blk]
+ nullb_device_submit_queues_store+0x79/0xf0 [null_blk]
+ configfs_write_iter+0x119/0x1e0
+ vfs_write+0x326/0x730
+ ksys_write+0x74/0x150
+
+This is because del_gendisk() can concurrent with
+blk_mq_update_nr_hw_queues():
+
+nullb_device_power_store	nullb_apply_submit_queues
+ null_del_dev
+ del_gendisk
+				 nullb_update_nr_hw_queues
+				  if (!dev->nullb)
+				  // still set while gendisk is deleted
+				   return 0
+				  blk_mq_update_nr_hw_queues
+ dev->nullb = NULL
+
+Fix this problem by resuing the global mutex to protect
+nullb_device_power_store() and nullb_update_nr_hw_queues() from configfs.
+
+Fixes: 45919fbfe1c4 ("null_blk: Enable modifying 'submit_queues' after an instance has been configured")
+Reported-and-tested-by: Yi Zhang <yi.zhang@redhat.com>
+Closes: https://lore.kernel.org/all/CAHj4cs9LgsHLnjg8z06LQ3Pr5cax-+Ps+xT7AP7TPnEjStuwZA@mail.gmail.com/
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+	Reviewed-by: Zhu Yanjun <yanjun.zhu@linux.dev>
+Link: https://lore.kernel.org/r/20240523153934.1937851-1-yukuai1@huaweicloud.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit a2db328b0839312c169eb42746ec46fc1ab53ed2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/null_blk_main.c
+diff --cc drivers/block/null_blk_main.c
+index 737b4e4d4b8a,eb023d267369..000000000000
+--- a/drivers/block/null_blk_main.c
++++ b/drivers/block/null_blk_main.c
+@@@ -2029,33 -1946,45 +2044,37 @@@ static int null_add_dev(struct nullb_de
+  
+  	nullb->q->queuedata = nullb;
+  	blk_queue_flag_set(QUEUE_FLAG_NONROT, nullb->q);
+ +	blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, nullb->q);
+  
+++<<<<<<< HEAD:drivers/block/null_blk_main.c
+ +	mutex_lock(&lock);
+ +	rv = ida_simple_get(&nullb_indexes, 0, 0, GFP_KERNEL);
+ +	if (rv < 0) {
+ +		mutex_unlock(&lock);
+ +		goto out_cleanup_zone;
+ +	}
+++=======
++ 	rv = ida_alloc(&nullb_indexes, GFP_KERNEL);
++ 	if (rv < 0)
++ 		goto out_cleanup_disk;
++ 
+++>>>>>>> a2db328b0839 (null_blk: fix null-ptr-dereference while configuring 'power' and 'submit_queues'):drivers/block/null_blk/main.c
+  	nullb->index = rv;
+  	dev->index = rv;
+- 	mutex_unlock(&lock);
+  
+ -	if (config_item_name(&dev->group.cg_item)) {
+ -		/* Use configfs dir name as the device name */
+ -		snprintf(nullb->disk_name, sizeof(nullb->disk_name),
+ -			 "%s", config_item_name(&dev->group.cg_item));
+ -	} else {
+ -		sprintf(nullb->disk_name, "nullb%d", nullb->index);
+ -	}
+ +	blk_queue_logical_block_size(nullb->q, dev->blocksize);
+ +	blk_queue_physical_block_size(nullb->q, dev->blocksize);
+  
+ -	set_capacity(nullb->disk,
+ -		((sector_t)nullb->dev->size * SZ_1M) >> SECTOR_SHIFT);
+ -	nullb->disk->major = null_major;
+ -	nullb->disk->first_minor = nullb->index;
+ -	nullb->disk->minors = 1;
+ -	nullb->disk->fops = &null_ops;
+ -	nullb->disk->private_data = nullb;
+ -	strscpy_pad(nullb->disk->disk_name, nullb->disk_name, DISK_NAME_LEN);
+ +	null_config_discard(nullb);
+  
+ -	if (nullb->dev->zoned) {
+ -		rv = null_register_zoned_dev(nullb);
+ -		if (rv)
+ -			goto out_ida_free;
+ -	}
+ +	sprintf(nullb->disk_name, "nullb%d", nullb->index);
+  
+ -	rv = add_disk(nullb->disk);
+ +	rv = null_gendisk_register(nullb);
+  	if (rv)
+  		goto out_ida_free;
+  
+- 	mutex_lock(&lock);
+  	list_add_tail(&nullb->list, &nullb_list);
+- 	mutex_unlock(&lock);
+  
+ -	pr_info("disk %s created\n", nullb->disk_name);
+ -
+  	return 0;
+  
+  out_ida_free:
+@@@ -2076,6 -2005,51 +2095,54 @@@ out
+  	return rv;
+  }
+  
+++<<<<<<< HEAD:drivers/block/null_blk_main.c
+++=======
++ static struct nullb *null_find_dev_by_name(const char *name)
++ {
++ 	struct nullb *nullb = NULL, *nb;
++ 
++ 	mutex_lock(&lock);
++ 	list_for_each_entry(nb, &nullb_list, list) {
++ 		if (strcmp(nb->disk_name, name) == 0) {
++ 			nullb = nb;
++ 			break;
++ 		}
++ 	}
++ 	mutex_unlock(&lock);
++ 
++ 	return nullb;
++ }
++ 
++ static int null_create_dev(void)
++ {
++ 	struct nullb_device *dev;
++ 	int ret;
++ 
++ 	dev = null_alloc_dev();
++ 	if (!dev)
++ 		return -ENOMEM;
++ 
++ 	mutex_lock(&lock);
++ 	ret = null_add_dev(dev);
++ 	mutex_unlock(&lock);
++ 	if (ret) {
++ 		null_free_dev(dev);
++ 		return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void null_destroy_dev(struct nullb *nullb)
++ {
++ 	struct nullb_device *dev = nullb->dev;
++ 
++ 	null_del_dev(nullb);
++ 	null_free_device_storage(dev, false);
++ 	null_free_dev(dev);
++ }
++ 
+++>>>>>>> a2db328b0839 (null_blk: fix null-ptr-dereference while configuring 'power' and 'submit_queues'):drivers/block/null_blk/main.c
+  static int __init null_init(void)
+  {
+  	int ret = 0;
+* Unmerged path drivers/block/null_blk_main.c
