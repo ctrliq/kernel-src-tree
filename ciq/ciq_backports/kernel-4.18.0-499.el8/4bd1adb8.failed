@@ -1,0 +1,331 @@
+ASoC: SOF: introduce new DEBUG_NOCODEC mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-499.el8
+commit-author Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+commit 4bd1adb85a09c249ddb4610e8412bf0f4484a371
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-499.el8/4bd1adb8.failed
+
+The existing NOCODEC mode enforces a build-time mutual exclusion with
+the HDaudio link support, mostly to avoid any dependency on the
+snd_hdac library and references to HDAudio codec/i915 stuff.
+
+This is very useful to track dependencies and test a minimal
+configuration, but very painful for developers and CI: a recompilation
+and reinstall of the kernel modules is required.
+
+This patch suggests an alternate middle ground where the selection of
+the machine driver and all codec-related actions are bypassed at
+run-time, contingent on a kernel module parameter being set.
+
+For example setting BIT(10) with
+'options snd_sof sof_debug=0x401'
+is enough to switch from an HDaudio card to a nocodec one.
+
+This new DEBUG_NOCODEC mode is not suitable for distributions and
+end-users. It's not even recommended on all platforms, i.e. the
+NOCODEC mode is known not to work on specific devices where the BIOS
+did not configure support for I2S/DMIC interfaces. The usual
+development devices such as Chromebooks, Up boards and Intel RVP are
+the only recommended platforms where this mode can be supported.
+
+Note that the dynamic switch between HDaudio and nocodec may not
+always possible depending on hardware layout, pin-mux options, and
+BIOS settings. The audio subsustems on Intel platforms has to support
+4 types of interfaces and pin-mux can be complicated.
+
+Reviewers might ask: why didn't we do this earlier? The main reason is
+that all the codec-related configurations were not cleanly separated
+out in the sof/intel directory. With all the cleanups done recently,
+adding this opt-in behavior is relatively straightforward.
+
+Tested on UpExtreme (WHL) and UpExtreme i11 (TGL).
+
+	Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Reviewed-by: Rander Wang <rander.wang@intel.com>
+	Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+	Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+	Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Link: https://lore.kernel.org/r/20221027193540.259520-22-pierre-louis.bossart@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 4bd1adb85a09c249ddb4610e8412bf0f4484a371)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/intel/hda-codec.c
+diff --cc sound/soc/sof/intel/hda-codec.c
+index 054ae8172679,1882b9ac3c3b..000000000000
+--- a/sound/soc/sof/intel/hda-codec.c
++++ b/sound/soc/sof/intel/hda-codec.c
+@@@ -246,7 -233,166 +258,170 @@@ void hda_codec_probe_bus(struct snd_sof
+  		}
+  	}
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(hda_codec_probe_bus);
+++=======
++ EXPORT_SYMBOL_NS_GPL(hda_codec_probe_bus, SND_SOC_SOF_HDA_AUDIO_CODEC);
++ 
++ void hda_codec_check_for_state_change(struct snd_sof_dev *sdev)
++ {
++ 	struct hdac_bus *bus = sof_to_bus(sdev);
++ 	unsigned int codec_mask;
++ 
++ 	codec_mask = snd_hdac_chip_readw(bus, STATESTS);
++ 	if (codec_mask) {
++ 		hda_codec_jack_check(sdev);
++ 		snd_hdac_chip_writew(bus, STATESTS, codec_mask);
++ 	}
++ }
++ EXPORT_SYMBOL_NS_GPL(hda_codec_check_for_state_change, SND_SOC_SOF_HDA_AUDIO_CODEC);
++ 
++ void hda_codec_detect_mask(struct snd_sof_dev *sdev)
++ {
++ 	struct hdac_bus *bus = sof_to_bus(sdev);
++ 
++ 	if (IS_ENABLED(CONFIG_SND_SOC_SOF_NOCODEC_DEBUG_SUPPORT) &&
++ 	    sof_debug_check_flag(SOF_DBG_FORCE_NOCODEC))
++ 		return;
++ 
++ 	/* Accept unsolicited responses */
++ 	snd_hdac_chip_updatel(bus, GCTL, AZX_GCTL_UNSOL, AZX_GCTL_UNSOL);
++ 
++ 	/* detect codecs */
++ 	if (!bus->codec_mask) {
++ 		bus->codec_mask = snd_hdac_chip_readw(bus, STATESTS);
++ 		dev_dbg(bus->dev, "codec_mask = 0x%lx\n", bus->codec_mask);
++ 	}
++ 
++ 	if (hda_codec_mask != -1) {
++ 		bus->codec_mask &= hda_codec_mask;
++ 		dev_dbg(bus->dev, "filtered codec_mask = 0x%lx\n",
++ 			bus->codec_mask);
++ 	}
++ }
++ EXPORT_SYMBOL_NS_GPL(hda_codec_detect_mask, SND_SOC_SOF_HDA_AUDIO_CODEC);
++ 
++ void hda_codec_init_cmd_io(struct snd_sof_dev *sdev)
++ {
++ 	struct hdac_bus *bus = sof_to_bus(sdev);
++ 
++ 	if (IS_ENABLED(CONFIG_SND_SOC_SOF_NOCODEC_DEBUG_SUPPORT) &&
++ 	    sof_debug_check_flag(SOF_DBG_FORCE_NOCODEC))
++ 		return;
++ 
++ 	/* initialize the codec command I/O */
++ 	snd_hdac_bus_init_cmd_io(bus);
++ }
++ EXPORT_SYMBOL_NS_GPL(hda_codec_init_cmd_io, SND_SOC_SOF_HDA_AUDIO_CODEC);
++ 
++ void hda_codec_resume_cmd_io(struct snd_sof_dev *sdev)
++ {
++ 	struct hdac_bus *bus = sof_to_bus(sdev);
++ 
++ 	if (IS_ENABLED(CONFIG_SND_SOC_SOF_NOCODEC_DEBUG_SUPPORT) &&
++ 	    sof_debug_check_flag(SOF_DBG_FORCE_NOCODEC))
++ 		return;
++ 
++ 	/* set up CORB/RIRB buffers if was on before suspend */
++ 	if (bus->cmd_dma_state)
++ 		snd_hdac_bus_init_cmd_io(bus);
++ }
++ EXPORT_SYMBOL_NS_GPL(hda_codec_resume_cmd_io, SND_SOC_SOF_HDA_AUDIO_CODEC);
++ 
++ void hda_codec_stop_cmd_io(struct snd_sof_dev *sdev)
++ {
++ 	struct hdac_bus *bus = sof_to_bus(sdev);
++ 
++ 	if (IS_ENABLED(CONFIG_SND_SOC_SOF_NOCODEC_DEBUG_SUPPORT) &&
++ 	    sof_debug_check_flag(SOF_DBG_FORCE_NOCODEC))
++ 		return;
++ 
++ 	/* initialize the codec command I/O */
++ 	snd_hdac_bus_stop_cmd_io(bus);
++ }
++ EXPORT_SYMBOL_NS_GPL(hda_codec_stop_cmd_io, SND_SOC_SOF_HDA_AUDIO_CODEC);
++ 
++ void hda_codec_suspend_cmd_io(struct snd_sof_dev *sdev)
++ {
++ 	struct hdac_bus *bus = sof_to_bus(sdev);
++ 
++ 	if (IS_ENABLED(CONFIG_SND_SOC_SOF_NOCODEC_DEBUG_SUPPORT) &&
++ 	    sof_debug_check_flag(SOF_DBG_FORCE_NOCODEC))
++ 		return;
++ 
++ 	/* stop the CORB/RIRB DMA if it is On */
++ 	if (bus->cmd_dma_state)
++ 		snd_hdac_bus_stop_cmd_io(bus);
++ 
++ }
++ EXPORT_SYMBOL_NS_GPL(hda_codec_suspend_cmd_io, SND_SOC_SOF_HDA_AUDIO_CODEC);
++ 
++ void hda_codec_rirb_status_clear(struct snd_sof_dev *sdev)
++ {
++ 	struct hdac_bus *bus = sof_to_bus(sdev);
++ 
++ 	if (IS_ENABLED(CONFIG_SND_SOC_SOF_NOCODEC_DEBUG_SUPPORT) &&
++ 	    sof_debug_check_flag(SOF_DBG_FORCE_NOCODEC))
++ 		return;
++ 
++ 	/* clear rirb status */
++ 	snd_hdac_chip_writeb(bus, RIRBSTS, RIRB_INT_MASK);
++ }
++ EXPORT_SYMBOL_NS_GPL(hda_codec_rirb_status_clear, SND_SOC_SOF_HDA_AUDIO_CODEC);
++ 
++ void hda_codec_set_codec_wakeup(struct snd_sof_dev *sdev, bool status)
++ {
++ 	struct hdac_bus *bus = sof_to_bus(sdev);
++ 
++ 	if (sof_debug_check_flag(SOF_DBG_FORCE_NOCODEC))
++ 		return;
++ 
++ 	snd_hdac_set_codec_wakeup(bus, status);
++ }
++ EXPORT_SYMBOL_NS_GPL(hda_codec_set_codec_wakeup, SND_SOC_SOF_HDA_AUDIO_CODEC);
++ 
++ bool hda_codec_check_rirb_status(struct snd_sof_dev *sdev)
++ {
++ 	struct hdac_bus *bus = sof_to_bus(sdev);
++ 	bool active = false;
++ 	u32 rirb_status;
++ 
++ 	if (IS_ENABLED(CONFIG_SND_SOC_SOF_NOCODEC_DEBUG_SUPPORT) &&
++ 	    sof_debug_check_flag(SOF_DBG_FORCE_NOCODEC))
++ 		return false;
++ 
++ 	rirb_status = snd_hdac_chip_readb(bus, RIRBSTS);
++ 	if (rirb_status & RIRB_INT_MASK) {
++ 		/*
++ 		 * Clearing the interrupt status here ensures
++ 		 * that no interrupt gets masked after the RIRB
++ 		 * wp is read in snd_hdac_bus_update_rirb.
++ 		 */
++ 		snd_hdac_chip_writeb(bus, RIRBSTS,
++ 				     RIRB_INT_MASK);
++ 		active = true;
++ 		if (rirb_status & RIRB_INT_RESPONSE)
++ 			snd_hdac_bus_update_rirb(bus);
++ 	}
++ 	return active;
++ }
++ EXPORT_SYMBOL_NS_GPL(hda_codec_check_rirb_status, SND_SOC_SOF_HDA_AUDIO_CODEC);
++ 
++ void hda_codec_device_remove(struct snd_sof_dev *sdev)
++ {
++ 	struct hdac_bus *bus = sof_to_bus(sdev);
++ 
++ 	if (IS_ENABLED(CONFIG_SND_SOC_SOF_NOCODEC_DEBUG_SUPPORT) &&
++ 	    sof_debug_check_flag(SOF_DBG_FORCE_NOCODEC))
++ 		return;
++ 
++ 	/* codec removal, invoke bus_device_remove */
++ 	snd_hdac_ext_bus_device_remove(bus);
++ }
++ EXPORT_SYMBOL_NS_GPL(hda_codec_device_remove, SND_SOC_SOF_HDA_AUDIO_CODEC);
++ 
++ #endif /* CONFIG_SND_SOC_SOF_HDA_AUDIO_CODEC */
+++>>>>>>> 4bd1adb85a09 (ASoC: SOF: introduce new DEBUG_NOCODEC mode)
+  
+  #if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA_AUDIO_CODEC) && IS_ENABLED(CONFIG_SND_HDA_CODEC_HDMI)
+  
+diff --git a/sound/soc/sof/Kconfig b/sound/soc/sof/Kconfig
+index 37f7df5fde17..0b9beb74b0f6 100644
+--- a/sound/soc/sof/Kconfig
++++ b/sound/soc/sof/Kconfig
+@@ -97,13 +97,13 @@ config SND_SOC_SOF_NOCODEC
+ 	tristate
+ 
+ config SND_SOC_SOF_NOCODEC_SUPPORT
+-	bool "SOF nocodec mode support"
++	bool "SOF nocodec static mode support"
+ 	help
+ 	  This adds support for a dummy/nocodec machine driver fallback
+ 	  option if no known codec is detected. This is typically only
+ 	  enabled for developers or devices where the sound card is
+ 	  controlled externally.
+-	  This option is mutually exclusive with the Intel HDAudio support.
++	  This option is mutually exclusive at build time with the Intel HDAudio support.
+ 	  Selecting it may have negative impacts and prevent e.g. microphone
+ 	  functionality from being enabled on Intel CoffeeLake and later
+ 	  platforms.
+@@ -136,6 +136,19 @@ config SND_SOC_SOF_DEBUG
+ 
+ if SND_SOC_SOF_DEBUG
+ 
++config SND_SOC_SOF_NOCODEC_DEBUG_SUPPORT
++	bool "SOF nocodec debug mode support"
++	depends on !SND_SOC_SOF_NOCODEC_SUPPORT
++	help
++	  This adds support for a dummy/nocodec machine driver fallback
++	  option.
++	  Unlike the SND_SOC_SOF_NOCODEC_SUPPORT, this option is NOT
++	  mutually exclusive at build with the Intel HDAudio support. The
++	  selection will be done depending on command line or modprobe.d settings
++	  Distributions should not select this option!
++	  Say Y if you need this nocodec debug fallback option.
++	  If unsure select "N".
++
+ config SND_SOC_SOF_FORCE_NOCODEC_MODE
+ 	bool "SOF force nocodec Mode"
+ 	depends on SND_SOC_SOF_NOCODEC_SUPPORT
+@@ -239,6 +252,7 @@ config SND_SOC_SOF
+ 	tristate
+ 	select SND_SOC_TOPOLOGY
+ 	select SND_SOC_SOF_NOCODEC if SND_SOC_SOF_NOCODEC_SUPPORT
++	select SND_SOC_SOF_NOCODEC if SND_SOC_SOF_NOCODEC_DEBUG_SUPPORT
+ 	help
+ 	  This option is not user-selectable but automagically handled by
+ 	  'select' statements at a higher level.
+diff --git a/sound/soc/sof/intel/Kconfig b/sound/soc/sof/intel/Kconfig
+index 7af495fb6125..36a0e2bf30ff 100644
+--- a/sound/soc/sof/intel/Kconfig
++++ b/sound/soc/sof/intel/Kconfig
+@@ -277,7 +277,7 @@ if SND_SOC_SOF_HDA_COMMON
+ 
+ config SND_SOC_SOF_HDA_LINK
+ 	bool "SOF support for HDA Links(HDA/HDMI)"
+-	depends on SND_SOC_SOF_NOCODEC=n
++	depends on SND_SOC_SOF_NOCODEC_SUPPORT=n
+ 	select SND_SOC_SOF_PROBE_WORK_QUEUE
+ 	help
+ 	  This adds support for HDA links(HDA/HDMI) with Sound Open Firmware
+* Unmerged path sound/soc/sof/intel/hda-codec.c
+diff --git a/sound/soc/sof/sof-audio.c b/sound/soc/sof/sof-audio.c
+index 2956dcd25e1d..02fb02ba6f49 100644
+--- a/sound/soc/sof/sof-audio.c
++++ b/sound/soc/sof/sof-audio.c
+@@ -803,6 +803,10 @@ int sof_machine_check(struct snd_sof_dev *sdev)
+ 
+ 	if (!IS_ENABLED(CONFIG_SND_SOC_SOF_FORCE_NOCODEC_MODE)) {
+ 
++		if (IS_ENABLED(CONFIG_SND_SOC_SOF_NOCODEC_DEBUG_SUPPORT) &&
++		    sof_debug_check_flag(SOF_DBG_FORCE_NOCODEC))
++			goto nocodec;
++
+ 		/* find machine */
+ 		mach = snd_sof_machine_select(sdev);
+ 		if (mach) {
+@@ -819,6 +823,7 @@ int sof_machine_check(struct snd_sof_dev *sdev)
+ 		dev_warn(sdev->dev, "Force to use nocodec mode\n");
+ 	}
+ 
++nocodec:
+ 	/* select nocodec mode */
+ 	dev_warn(sdev->dev, "Using nocodec machine driver\n");
+ 	mach = devm_kzalloc(sdev->dev, sizeof(*mach), GFP_KERNEL);
+diff --git a/sound/soc/sof/sof-priv.h b/sound/soc/sof/sof-priv.h
+index f406651160b1..eae5832afd28 100644
+--- a/sound/soc/sof/sof-priv.h
++++ b/sound/soc/sof/sof-priv.h
+@@ -43,6 +43,9 @@
+ #define SOF_DBG_PRINT_IPC_SUCCESS_LOGS		BIT(9) /* print IPC success
+ 							* in dmesg logs
+ 							*/
++#define SOF_DBG_FORCE_NOCODEC			BIT(10) /* ignore all codec-related
++							 * configurations
++							 */
+ 
+ /* Flag definitions used for controlling the DSP dump behavior */
+ #define SOF_DBG_DUMP_REGS		BIT(0)
