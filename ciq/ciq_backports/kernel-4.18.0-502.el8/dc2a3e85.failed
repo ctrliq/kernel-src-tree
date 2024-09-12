@@ -1,0 +1,250 @@
+x86/resctrl: Add interface to read mbm_total_bytes_config
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Babu Moger <babu.moger@amd.com>
+commit dc2a3e857981f859889933cf66ded117d74edff1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/dc2a3e85.failed
+
+The event configuration can be viewed by the user by reading the
+configuration file /sys/fs/resctrl/info/L3_MON/mbm_total_bytes_config.  The
+event configuration settings are domain specific and will affect all the CPUs in
+the domain.
+
+Following are the types of events supported:
+
+  ====  ===========================================================
+  Bits   Description
+  ====  ===========================================================
+  6      Dirty Victims from the QOS domain to all types of memory
+  5      Reads to slow memory in the non-local NUMA domain
+  4      Reads to slow memory in the local NUMA domain
+  3      Non-temporal writes to non-local NUMA domain
+  2      Non-temporal writes to local NUMA domain
+  1      Reads to memory in the non-local NUMA domain
+  0      Reads to memory in the local NUMA domain
+  ====  ===========================================================
+
+By default, the mbm_total_bytes_config is set to 0x7f to count all the
+event types.
+
+For example:
+
+  $cat /sys/fs/resctrl/info/L3_MON/mbm_total_bytes_config
+  0=0x7f;1=0x7f;2=0x7f;3=0x7f
+
+In this case, the event mbm_total_bytes is configured with 0x7f on
+domains 0 to 3.
+
+	Signed-off-by: Babu Moger <babu.moger@amd.com>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lore.kernel.org/r/20230113152039.770054-10-babu.moger@amd.com
+(cherry picked from commit dc2a3e857981f859889933cf66ded117d74edff1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/msr-index.h
+diff --cc arch/x86/include/asm/msr-index.h
+index 8e65f9c8bdf4,2e5f57c93605..000000000000
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@@ -1030,6 -1061,8 +1030,11 @@@
+  
+  /* - AMD: */
+  #define MSR_IA32_MBA_BW_BASE		0xc0000200
+++<<<<<<< HEAD
+++=======
++ #define MSR_IA32_SMBA_BW_BASE		0xc0000280
++ #define MSR_IA32_EVT_CFG_BASE		0xc0000400
+++>>>>>>> dc2a3e857981 (x86/resctrl: Add interface to read mbm_total_bytes_config)
+  
+  /* MSR_IA32_VMX_MISC bits */
+  #define MSR_IA32_VMX_MISC_INTEL_PT                 (1ULL << 14)
+* Unmerged path arch/x86/include/asm/msr-index.h
+diff --git a/arch/x86/kernel/cpu/resctrl/internal.h b/arch/x86/kernel/cpu/resctrl/internal.h
+index 8dea635659c1..df8f901f2c4b 100644
+--- a/arch/x86/kernel/cpu/resctrl/internal.h
++++ b/arch/x86/kernel/cpu/resctrl/internal.h
+@@ -38,6 +38,29 @@
+  */
+ #define MBM_CNTR_WIDTH_OFFSET_MAX (62 - MBM_CNTR_WIDTH_BASE)
+ 
++/* Reads to Local DRAM Memory */
++#define READS_TO_LOCAL_MEM		BIT(0)
++
++/* Reads to Remote DRAM Memory */
++#define READS_TO_REMOTE_MEM		BIT(1)
++
++/* Non-Temporal Writes to Local Memory */
++#define NON_TEMP_WRITE_TO_LOCAL_MEM	BIT(2)
++
++/* Non-Temporal Writes to Remote Memory */
++#define NON_TEMP_WRITE_TO_REMOTE_MEM	BIT(3)
++
++/* Reads to Local Memory the system identifies as "Slow Memory" */
++#define READS_TO_LOCAL_S_MEM		BIT(4)
++
++/* Reads to Remote Memory the system identifies as "Slow Memory" */
++#define READS_TO_REMOTE_S_MEM		BIT(5)
++
++/* Dirty Victims to All Types of Memory */
++#define DIRTY_VICTIMS_TO_ALL_MEM	BIT(6)
++
++/* Max event bits supported */
++#define MAX_EVT_CONFIG_BITS		GENMASK(6, 0)
+ 
+ struct rdt_fs_context {
+ 	struct kernfs_fs_context	kfc;
+@@ -631,5 +654,6 @@ bool has_busy_rmid(struct rdt_resource *r, struct rdt_domain *d);
+ void __check_limbo(struct rdt_domain *d, bool force_free);
+ void rdt_domain_reconfigure_cdp(struct rdt_resource *r);
+ void __init thread_throttle_mode_init(void);
++void __init mbm_config_rftype_init(const char *config);
+ 
+ #endif /* _ASM_X86_RESCTRL_INTERNAL_H */
+diff --git a/arch/x86/kernel/cpu/resctrl/monitor.c b/arch/x86/kernel/cpu/resctrl/monitor.c
+index 3b6b1365b5d9..949fab1b38df 100644
+--- a/arch/x86/kernel/cpu/resctrl/monitor.c
++++ b/arch/x86/kernel/cpu/resctrl/monitor.c
+@@ -716,8 +716,10 @@ int __init rdt_get_mon_l3_config(struct rdt_resource *r)
+ 		return ret;
+ 
+ 	if (rdt_cpu_has(X86_FEATURE_BMEC)) {
+-		if (rdt_cpu_has(X86_FEATURE_CQM_MBM_TOTAL))
++		if (rdt_cpu_has(X86_FEATURE_CQM_MBM_TOTAL)) {
+ 			mbm_total_event.configurable = true;
++			mbm_config_rftype_init("mbm_total_bytes_config");
++		}
+ 		if (rdt_cpu_has(X86_FEATURE_CQM_MBM_LOCAL))
+ 			mbm_local_event.configurable = true;
+ 	}
+diff --git a/arch/x86/kernel/cpu/resctrl/rdtgroup.c b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index 2b966c66b88f..8399f0c7136e 100644
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@ -1486,6 +1486,93 @@ static int rdtgroup_size_show(struct kernfs_open_file *of,
+ 	return ret;
+ }
+ 
++struct mon_config_info {
++	u32 evtid;
++	u32 mon_config;
++};
++
++#define INVALID_CONFIG_INDEX   UINT_MAX
++
++/**
++ * mon_event_config_index_get - get the hardware index for the
++ *                              configurable event
++ * @evtid: event id.
++ *
++ * Return: 0 for evtid == QOS_L3_MBM_TOTAL_EVENT_ID
++ *         1 for evtid == QOS_L3_MBM_LOCAL_EVENT_ID
++ *         INVALID_CONFIG_INDEX for invalid evtid
++ */
++static inline unsigned int mon_event_config_index_get(u32 evtid)
++{
++	switch (evtid) {
++	case QOS_L3_MBM_TOTAL_EVENT_ID:
++		return 0;
++	case QOS_L3_MBM_LOCAL_EVENT_ID:
++		return 1;
++	default:
++		/* Should never reach here */
++		return INVALID_CONFIG_INDEX;
++	}
++}
++
++static void mon_event_config_read(void *info)
++{
++	struct mon_config_info *mon_info = info;
++	unsigned int index;
++	u32 h;
++
++	index = mon_event_config_index_get(mon_info->evtid);
++	if (index == INVALID_CONFIG_INDEX) {
++		pr_warn_once("Invalid event id %d\n", mon_info->evtid);
++		return;
++	}
++	rdmsr(MSR_IA32_EVT_CFG_BASE + index, mon_info->mon_config, h);
++
++	/* Report only the valid event configuration bits */
++	mon_info->mon_config &= MAX_EVT_CONFIG_BITS;
++}
++
++static void mondata_config_read(struct rdt_domain *d, struct mon_config_info *mon_info)
++{
++	smp_call_function_any(&d->cpu_mask, mon_event_config_read, mon_info, 1);
++}
++
++static int mbm_config_show(struct seq_file *s, struct rdt_resource *r, u32 evtid)
++{
++	struct mon_config_info mon_info = {0};
++	struct rdt_domain *dom;
++	bool sep = false;
++
++	mutex_lock(&rdtgroup_mutex);
++
++	list_for_each_entry(dom, &r->domains, list) {
++		if (sep)
++			seq_puts(s, ";");
++
++		memset(&mon_info, 0, sizeof(struct mon_config_info));
++		mon_info.evtid = evtid;
++		mondata_config_read(dom, &mon_info);
++
++		seq_printf(s, "%d=0x%02x", dom->id, mon_info.mon_config);
++		sep = true;
++	}
++	seq_puts(s, "\n");
++
++	mutex_unlock(&rdtgroup_mutex);
++
++	return 0;
++}
++
++static int mbm_total_bytes_config_show(struct kernfs_open_file *of,
++				       struct seq_file *seq, void *v)
++{
++	struct rdt_resource *r = of->kn->parent->priv;
++
++	mbm_config_show(seq, r, QOS_L3_MBM_TOTAL_EVENT_ID);
++
++	return 0;
++}
++
+ /* rdtgroup information files for one cache resource. */
+ static struct rftype res_common_files[] = {
+ 	{
+@@ -1584,6 +1671,12 @@ static struct rftype res_common_files[] = {
+ 		.seq_show	= max_threshold_occ_show,
+ 		.fflags		= RF_MON_INFO | RFTYPE_RES_CACHE,
+ 	},
++	{
++		.name		= "mbm_total_bytes_config",
++		.mode		= 0444,
++		.kf_ops		= &rdtgroup_kf_single_ops,
++		.seq_show	= mbm_total_bytes_config_show,
++	},
+ 	{
+ 		.name		= "cpus",
+ 		.mode		= 0644,
+@@ -1690,6 +1783,15 @@ void __init thread_throttle_mode_init(void)
+ 	rft->fflags = RF_CTRL_INFO | RFTYPE_RES_MB;
+ }
+ 
++void __init mbm_config_rftype_init(const char *config)
++{
++	struct rftype *rft;
++
++	rft = rdtgroup_get_rftype_by_name(config);
++	if (rft)
++		rft->fflags = RF_MON_INFO | RFTYPE_RES_CACHE;
++}
++
+ /**
+  * rdtgroup_kn_mode_restrict - Restrict user access to named resctrl file
+  * @r: The resource group with which the file is associated.
