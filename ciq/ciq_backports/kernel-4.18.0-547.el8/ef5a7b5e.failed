@@ -1,0 +1,288 @@
+efi/x86: Remove GDT setup from efi_main
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Arvind Sankar <nivedita@alum.mit.edu>
+commit ef5a7b5eb13ed88ba9690ab27def3a085332cc8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/ef5a7b5e.failed
+
+The 64-bit kernel will already load a GDT in startup_64, which is the
+next function to execute after return from efi_main.
+
+Add GDT setup code to the 32-bit kernel's startup_32 as well. Doing it
+in the head code has the advantage that we can avoid potentially
+corrupting the GDT during copy/decompression. This also removes
+dependence on having a specific GDT layout setup by the bootloader.
+
+Both startup_32 and startup_64 now clear interrupts on entry, so we can
+remove that from efi_main as well.
+
+	Signed-off-by: Arvind Sankar <nivedita@alum.mit.edu>
+Link: https://lore.kernel.org/r/20200202171353.3736319-6-nivedita@alum.mit.edu
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+(cherry picked from commit ef5a7b5eb13ed88ba9690ab27def3a085332cc8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/eboot.c
+#	arch/x86/boot/compressed/head_32.S
+diff --cc arch/x86/boot/compressed/eboot.c
+index 19db743a88f9,c92fe0b75cec..000000000000
+--- a/arch/x86/boot/compressed/eboot.c
++++ b/arch/x86/boot/compressed/eboot.c
+@@@ -845,27 -708,15 +845,32 @@@ static efi_status_t exit_boot(struct bo
+   * On success we return a pointer to a boot_params structure, and NULL
+   * on failure.
+   */
+ -struct boot_params *efi_main(efi_handle_t handle,
+ -			     efi_system_table_t *sys_table_arg,
+ -			     struct boot_params *boot_params)
+ +struct boot_params *
+ +efi_main(struct efi_config *c, struct boot_params *boot_params)
+  {
+++<<<<<<< HEAD
+ +	unsigned long bzimage_addr = (unsigned long)startup_32;
+ +	struct desc_ptr *gdt = NULL;
+ +	efi_loaded_image_t *image;
+ +	struct setup_header *hdr = &boot_params->hdr;
+ +	efi_status_t status;
+ +	struct desc_struct *desc;
+ +	void *handle;
+ +	efi_system_table_t *_table;
+ +	bool is64;
+++=======
++ 	struct setup_header *hdr = &boot_params->hdr;
++ 	efi_status_t status;
+++>>>>>>> ef5a7b5eb13e (efi/x86: Remove GDT setup from efi_main)
+  	unsigned long cmdline_paddr;
+  
+ -	sys_table = sys_table_arg;
+ +	efi_early = c;
+ +
+ +	_table = (efi_system_table_t *)(unsigned long)efi_early->table;
+ +	handle = (void *)(unsigned long)efi_early->image_handle;
+ +	is64 = efi_early->is64;
+ +
+ +	sys_table = _table;
+  
+  	/* Check if we were booted by the EFI firmware */
+  	if (sys_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+@@@ -928,119 -749,38 +933,56 @@@
+  
+  	setup_efi_pci(boot_params);
+  
+ -	setup_quirks(boot_params);
+ +	setup_quirks(boot_params, bzimage_addr, hdr->init_size);
+ +
+++<<<<<<< HEAD
+ +	status = efi_call_early(allocate_pool, EFI_LOADER_DATA,
+ +				sizeof(*gdt), (void **)&gdt);
+ +	if (status != EFI_SUCCESS) {
+ +		efi_printk(sys_table, "Failed to allocate memory for 'gdt' structure\n");
+ +		goto fail;
+ +	}
+ +
+ +	gdt->size = 0x800;
+ +	status = efi_low_alloc(sys_table, gdt->size, 8,
+ +			   (unsigned long *)&gdt->address);
+ +	if (status != EFI_SUCCESS) {
+ +		efi_printk(sys_table, "Failed to allocate memory for 'gdt'\n");
+ +		goto fail;
+ +	}
+  
+ +	status = exit_boot(boot_params, handle, is64);
+- 	if (status != EFI_SUCCESS) {
+- 		efi_printk(sys_table, "exit_boot() failed!\n");
+- 		goto fail;
+- 	}
+++=======
++ 	/*
++ 	 * If the kernel isn't already loaded at the preferred load
++ 	 * address, relocate it.
++ 	 */
++ 	if (hdr->pref_address != hdr->code32_start) {
++ 		unsigned long bzimage_addr = hdr->code32_start;
++ 		status = efi_relocate_kernel(&bzimage_addr,
++ 					     hdr->init_size, hdr->init_size,
++ 					     hdr->pref_address,
++ 					     hdr->kernel_alignment,
++ 					     LOAD_PHYSICAL_ADDR);
++ 		if (status != EFI_SUCCESS) {
++ 			efi_printk("efi_relocate_kernel() failed!\n");
++ 			goto fail;
++ 		}
+  
+- 	memset((char *)gdt->address, 0x0, gdt->size);
+- 	desc = (struct desc_struct *)gdt->address;
+- 
+- 	/* The first GDT is a dummy. */
+- 	desc++;
+- 
+- 	if (IS_ENABLED(CONFIG_X86_64)) {
+- 		/* __KERNEL32_CS */
+- 		desc->limit0	= 0xffff;
+- 		desc->base0	= 0x0000;
+- 		desc->base1	= 0x0000;
+- 		desc->type	= SEG_TYPE_CODE | SEG_TYPE_EXEC_READ;
+- 		desc->s		= DESC_TYPE_CODE_DATA;
+- 		desc->dpl	= 0;
+- 		desc->p		= 1;
+- 		desc->limit1	= 0xf;
+- 		desc->avl	= 0;
+- 		desc->l		= 0;
+- 		desc->d		= SEG_OP_SIZE_32BIT;
+- 		desc->g		= SEG_GRANULARITY_4KB;
+- 		desc->base2	= 0x00;
+- 
+- 		desc++;
+- 	} else {
+- 		/* Second entry is unused on 32-bit */
+- 		desc++;
++ 		hdr->pref_address = hdr->code32_start;
++ 		hdr->code32_start = bzimage_addr;
+  	}
+  
+- 	/* __KERNEL_CS */
+- 	desc->limit0	= 0xffff;
+- 	desc->base0	= 0x0000;
+- 	desc->base1	= 0x0000;
+- 	desc->type	= SEG_TYPE_CODE | SEG_TYPE_EXEC_READ;
+- 	desc->s		= DESC_TYPE_CODE_DATA;
+- 	desc->dpl	= 0;
+- 	desc->p		= 1;
+- 	desc->limit1	= 0xf;
+- 	desc->avl	= 0;
+- 
+- 	if (IS_ENABLED(CONFIG_X86_64)) {
+- 		desc->l = 1;
+- 		desc->d = 0;
+- 	} else {
+- 		desc->l = 0;
+- 		desc->d = SEG_OP_SIZE_32BIT;
+- 	}
+- 	desc->g		= SEG_GRANULARITY_4KB;
+- 	desc->base2	= 0x00;
+- 	desc++;
+- 
+- 	/* __KERNEL_DS */
+- 	desc->limit0	= 0xffff;
+- 	desc->base0	= 0x0000;
+- 	desc->base1	= 0x0000;
+- 	desc->type	= SEG_TYPE_DATA | SEG_TYPE_READ_WRITE;
+- 	desc->s		= DESC_TYPE_CODE_DATA;
+- 	desc->dpl	= 0;
+- 	desc->p		= 1;
+- 	desc->limit1	= 0xf;
+- 	desc->avl	= 0;
+- 	desc->l		= 0;
+- 	desc->d		= SEG_OP_SIZE_32BIT;
+- 	desc->g		= SEG_GRANULARITY_4KB;
+- 	desc->base2	= 0x00;
+- 	desc++;
+- 
+- 	if (IS_ENABLED(CONFIG_X86_64)) {
+- 		/* Task segment value */
+- 		desc->limit0	= 0x0000;
+- 		desc->base0	= 0x0000;
+- 		desc->base1	= 0x0000;
+- 		desc->type	= SEG_TYPE_TSS;
+- 		desc->s		= 0;
+- 		desc->dpl	= 0;
+- 		desc->p		= 1;
+- 		desc->limit1	= 0x0;
+- 		desc->avl	= 0;
+- 		desc->l		= 0;
+- 		desc->d		= 0;
+- 		desc->g		= SEG_GRANULARITY_4KB;
+- 		desc->base2	= 0x00;
+- 		desc++;
++ 	status = exit_boot(boot_params, handle);
+++>>>>>>> ef5a7b5eb13e (efi/x86: Remove GDT setup from efi_main)
++ 	if (status != EFI_SUCCESS) {
+ -		efi_printk("exit_boot() failed!\n");
+++		efi_printk(sys_table, "exit_boot() failed!\n");
++ 		goto fail;
+  	}
+  
+- 	asm volatile("cli");
+- 	asm volatile ("lgdt %0" : : "m" (*gdt));
+- 
+  	return boot_params;
+  fail:
+ -	efi_printk("efi_main() failed!\n");
+ +	efi_printk(sys_table, "efi_main() failed!\n");
+  
+ -	for (;;)
+ -		asm("hlt");
+ +	return NULL;
+  }
+diff --cc arch/x86/boot/compressed/head_32.S
+index cfd9c4fe1b7d,356060c5332c..000000000000
+--- a/arch/x86/boot/compressed/head_32.S
++++ b/arch/x86/boot/compressed/head_32.S
+@@@ -56,26 -57,13 +56,29 @@@
+   */
+  	.hidden _bss
+  	.hidden _ebss
+ -	.hidden _got
+ -	.hidden _egot
+ +	.hidden _end
+  
+  	__HEAD
+ -SYM_FUNC_START(startup_32)
+ +ENTRY(startup_32)
+  	cld
+ +	/*
+ +	 * Test KEEP_SEGMENTS flag to see if the bootloader is asking
+ +	 * us to not reload segments
+ +	 */
+ +	testb	$KEEP_SEGMENTS, BP_loadflags(%esi)
+ +	jnz	1f
+ +
+  	cli
+++<<<<<<< HEAD
+ +	movl	$__BOOT_DS, %eax
+ +	movl	%eax, %ds
+ +	movl	%eax, %es
+ +	movl	%eax, %fs
+ +	movl	%eax, %gs
+ +	movl	%eax, %ss
+ +1:
+++=======
+++>>>>>>> ef5a7b5eb13e (efi/x86: Remove GDT setup from efi_main)
+  
+  /*
+   * Calculate the delta between where we were compiled to run
+@@@ -245,16 -216,19 +271,27 @@@ ENDPROC(efi32_stub_entry
+   */
+  	xorl	%ebx, %ebx
+  	jmp	*%eax
+ -SYM_FUNC_END(.Lrelocated)
+ +
+ +#ifdef CONFIG_EFI_STUB
+ +	.data
+ +efi32_config:
+ +	.fill 5,8,0
+ +	.long efi_call_phys
+ +	.long 0
+ +	.byte 0
+ +#endif
+  
++ 	.data
++ 	.balign	8
++ SYM_DATA_START_LOCAL(gdt)
++ 	.word	gdt_end - gdt - 1
++ 	.long	0
++ 	.word	0
++ 	.quad	0x0000000000000000	/* Reserved */
++ 	.quad	0x00cf9a000000ffff	/* __KERNEL_CS */
++ 	.quad	0x00cf92000000ffff	/* __KERNEL_DS */
++ SYM_DATA_END_LABEL(gdt, SYM_L_LOCAL, gdt_end)
++ 
+  /*
+   * Stack and heap for uncompression
+   */
+* Unmerged path arch/x86/boot/compressed/eboot.c
+* Unmerged path arch/x86/boot/compressed/head_32.S
