@@ -1,0 +1,129 @@
+ice: pass mbxdata to ice_is_malicious_vf()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-535.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit afc24d6584fbd246d98c0feb464b94da67661e3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-535.el8/afc24d65.failed
+
+The ice_is_malicious_vf() function takes information about the current
+state of the mailbox during a single interrupt. This information includes
+the number of messages processed so far, as well as the number of pending
+messages not yet processed.
+
+A future refactor is going to make ice_vc_process_vf_msg() call
+ice_is_malicious_vf() instead of having it called separately in ice_main.c
+This change will require passing all the necessary arguments into
+ice_vc_process_vf_msg().
+
+To make this simpler, have the main loop fill in the struct ice_mbx_data
+and pass that rather than passing in the num_msg_proc and num_msg_pending.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+	Tested-by: Marek Szlosek <marek.szlosek@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit afc24d6584fbd246d98c0feb464b94da67661e3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_sriov.c
+diff --cc drivers/net/ethernet/intel/ice/ice_sriov.c
+index 33fbbf188926,5ae923ea979c..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_sriov.c
++++ b/drivers/net/ethernet/intel/ice/ice_sriov.c
+@@@ -1790,8 -1790,7 +1789,12 @@@ ice_is_malicious_vf(struct ice_pf *pf, 
+  {
+  	s16 vf_id = le16_to_cpu(event->desc.retval);
+  	struct device *dev = ice_pf_to_dev(pf);
+++<<<<<<< HEAD
+ +	struct ice_mbx_data mbxdata;
+ +	bool malvf = false;
+++=======
++ 	bool report_malvf = false;
+++>>>>>>> afc24d6584fb (ice: pass mbxdata to ice_is_malicious_vf())
+  	struct ice_vf *vf;
+  	int status;
+  
+@@@ -1802,14 -1801,9 +1805,20 @@@
+  	if (test_bit(ICE_VF_STATE_DIS, vf->vf_states))
+  		goto out_put_vf;
+  
+++<<<<<<< HEAD
+ +	mbxdata.num_msg_proc = num_msg_proc;
+ +	mbxdata.num_pending_arq = num_msg_pending;
+ +	mbxdata.max_num_msgs_mbx = pf->hw.mailboxq.num_rq_entries;
+ +#define ICE_MBX_OVERFLOW_WATERMARK 64
+ +	mbxdata.async_watermark_val = ICE_MBX_OVERFLOW_WATERMARK;
+ +
+ +	/* check to see if we have a malicious VF */
+ +	status = ice_mbx_vf_state_handler(&pf->hw, &mbxdata, &vf->mbx_info, &malvf);
+++=======
++ 	/* check to see if we have a newly malicious VF */
++ 	status = ice_mbx_vf_state_handler(&pf->hw, mbxdata, &vf->mbx_info,
++ 					  &report_malvf);
+++>>>>>>> afc24d6584fb (ice: pass mbxdata to ice_is_malicious_vf())
+  	if (status)
+  		goto out_put_vf;
+  
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index 64dc188a9607..4f8142aea578 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -1415,6 +1415,8 @@ static void ice_aq_cancel_waiting_tasks(struct ice_pf *pf)
+ 	wake_up(&pf->aq_wait_queue);
+ }
+ 
++#define ICE_MBX_OVERFLOW_WATERMARK 64
++
+ /**
+  * __ice_clean_ctrlq - helper function to clean controlq rings
+  * @pf: ptr to struct ice_pf
+@@ -1505,6 +1507,7 @@ static int __ice_clean_ctrlq(struct ice_pf *pf, enum ice_ctl_q q_type)
+ 		return 0;
+ 
+ 	do {
++		struct ice_mbx_data data = {};
+ 		u16 opcode;
+ 		int ret;
+ 
+@@ -1531,7 +1534,12 @@ static int __ice_clean_ctrlq(struct ice_pf *pf, enum ice_ctl_q q_type)
+ 			ice_vf_lan_overflow_event(pf, &event);
+ 			break;
+ 		case ice_mbx_opc_send_msg_to_pf:
+-			if (!ice_is_malicious_vf(pf, &event, i, pending))
++			data.num_msg_proc = i;
++			data.num_pending_arq = pending;
++			data.max_num_msgs_mbx = hw->mailboxq.num_rq_entries;
++			data.async_watermark_val = ICE_MBX_OVERFLOW_WATERMARK;
++
++			if (!ice_is_malicious_vf(pf, &event, &data))
+ 				ice_vc_process_vf_msg(pf, &event);
+ 			break;
+ 		case ice_aqc_opc_fw_logging:
+* Unmerged path drivers/net/ethernet/intel/ice/ice_sriov.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_sriov.h b/drivers/net/ethernet/intel/ice/ice_sriov.h
+index 1082b0691a3f..8fa61d954fae 100644
+--- a/drivers/net/ethernet/intel/ice/ice_sriov.h
++++ b/drivers/net/ethernet/intel/ice/ice_sriov.h
+@@ -36,7 +36,7 @@ void ice_free_vfs(struct ice_pf *pf);
+ void ice_restore_all_vfs_msi_state(struct pci_dev *pdev);
+ bool
+ ice_is_malicious_vf(struct ice_pf *pf, struct ice_rq_event_info *event,
+-		    u16 num_msg_proc, u16 num_msg_pending);
++		    struct ice_mbx_data *mbxdata);
+ 
+ int
+ ice_set_vf_port_vlan(struct net_device *netdev, int vf_id, u16 vlan_id, u8 qos,
+@@ -75,8 +75,7 @@ static inline void ice_restore_all_vfs_msi_state(struct pci_dev *pdev) { }
+ static inline bool
+ ice_is_malicious_vf(struct ice_pf __always_unused *pf,
+ 		    struct ice_rq_event_info __always_unused *event,
+-		    u16 __always_unused num_msg_proc,
+-		    u16 __always_unused num_msg_pending)
++		    struct ice_mbx_data *mbxdata)
+ {
+ 	return false;
+ }
