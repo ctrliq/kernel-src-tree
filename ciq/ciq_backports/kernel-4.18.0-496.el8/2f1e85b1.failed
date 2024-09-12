@@ -1,0 +1,188 @@
+net: sched: use queue_mapping to pick tx queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Tonghao Zhang <xiangxia.m.yue@gmail.com>
+commit 2f1e85b1aee459b7d0fd981839042c6a38ffaf0c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/2f1e85b1.failed
+
+This patch fixes issue:
+* If we install tc filters with act_skbedit in clsact hook.
+  It doesn't work, because netdev_core_pick_tx() overwrites
+  queue_mapping.
+
+  $ tc filter ... action skbedit queue_mapping 1
+
+And this patch is useful:
+* We can use FQ + EDT to implement efficient policies. Tx queues
+  are picked by xps, ndo_select_queue of netdev driver, or skb hash
+  in netdev_core_pick_tx(). In fact, the netdev driver, and skb
+  hash are _not_ under control. xps uses the CPUs map to select Tx
+  queues, but we can't figure out which task_struct of pod/containter
+  running on this cpu in most case. We can use clsact filters to classify
+  one pod/container traffic to one Tx queue. Why ?
+
+  In containter networking environment, there are two kinds of pod/
+  containter/net-namespace. One kind (e.g. P1, P2), the high throughput
+  is key in these applications. But avoid running out of network resource,
+  the outbound traffic of these pods is limited, using or sharing one
+  dedicated Tx queues assigned HTB/TBF/FQ Qdisc. Other kind of pods
+  (e.g. Pn), the low latency of data access is key. And the traffic is not
+  limited. Pods use or share other dedicated Tx queues assigned FIFO Qdisc.
+  This choice provides two benefits. First, contention on the HTB/FQ Qdisc
+  lock is significantly reduced since fewer CPUs contend for the same queue.
+  More importantly, Qdisc contention can be eliminated completely if each
+  CPU has its own FIFO Qdisc for the second kind of pods.
+
+  There must be a mechanism in place to support classifying traffic based on
+  pods/container to different Tx queues. Note that clsact is outside of Qdisc
+  while Qdisc can run a classifier to select a sub-queue under the lock.
+
+  In general recording the decision in the skb seems a little heavy handed.
+  This patch introduces a per-CPU variable, suggested by Eric.
+
+  The xmit.skip_txqueue flag is firstly cleared in __dev_queue_xmit().
+  - Tx Qdisc may install that skbedit actions, then xmit.skip_txqueue flag
+    is set in qdisc->enqueue() though tx queue has been selected in
+    netdev_tx_queue_mapping() or netdev_core_pick_tx(). That flag is cleared
+    firstly in __dev_queue_xmit(), is useful:
+  - Avoid picking Tx queue with netdev_tx_queue_mapping() in next netdev
+    in such case: eth0 macvlan - eth0.3 vlan - eth0 ixgbe-phy:
+    For example, eth0, macvlan in pod, which root Qdisc install skbedit
+    queue_mapping, send packets to eth0.3, vlan in host. In __dev_queue_xmit() of
+    eth0.3, clear the flag, does not select tx queue according to skb->queue_mapping
+    because there is no filters in clsact or tx Qdisc of this netdev.
+    Same action taked in eth0, ixgbe in Host.
+  - Avoid picking Tx queue for next packet. If we set xmit.skip_txqueue
+    in tx Qdisc (qdisc->enqueue()), the proper way to clear it is clearing it
+    in __dev_queue_xmit when processing next packets.
+
+  For performance reasons, use the static key. If user does not config the NET_EGRESS,
+  the patch will not be compiled.
+
+  +----+      +----+      +----+
+  | P1 |      | P2 |      | Pn |
+  +----+      +----+      +----+
+    |           |           |
+    +-----------+-----------+
+                |
+                | clsact/skbedit
+                |      MQ
+                v
+    +-----------+-----------+
+    | q0        | q1        | qn
+    v           v           v
+  HTB/FQ      HTB/FQ  ...  FIFO
+
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Cc: Cong Wang <xiyou.wangcong@gmail.com>
+	Cc: Jiri Pirko <jiri@resnulli.us>
+	Cc: "David S. Miller" <davem@davemloft.net>
+	Cc: Jakub Kicinski <kuba@kernel.org>
+	Cc: Jonathan Lemon <jonathan.lemon@gmail.com>
+	Cc: Eric Dumazet <edumazet@google.com>
+	Cc: Alexander Lobakin <alobakin@pm.me>
+	Cc: Paolo Abeni <pabeni@redhat.com>
+	Cc: Talal Ahmad <talalahmad@google.com>
+	Cc: Kevin Hao <haokexin@gmail.com>
+	Cc: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+	Cc: Antoine Tenart <atenart@kernel.org>
+	Cc: Wei Wang <weiwan@google.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Suggested-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Tonghao Zhang <xiangxia.m.yue@gmail.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit 2f1e85b1aee459b7d0fd981839042c6a38ffaf0c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index 2419f560d93e,4a77ebda4fb1..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4268,13 -4134,26 +4287,32 @@@ static int __dev_queue_xmit(struct sk_b
+  	qdisc_pkt_len_init(skb);
+  #ifdef CONFIG_NET_CLS_ACT
+  	skb->tc_at_ingress = 0;
+ -#endif
+ -#ifdef CONFIG_NET_EGRESS
+ +# ifdef CONFIG_NET_EGRESS
+  	if (static_branch_unlikely(&egress_needed_key)) {
+++<<<<<<< HEAD
+ +		skb = sch_handle_egress(skb, &rc, dev);
+ +		if (!skb)
+ +			goto out;
+++=======
++ 		if (nf_hook_egress_active()) {
++ 			skb = nf_hook_egress(skb, &rc, dev);
++ 			if (!skb)
++ 				goto out;
++ 		}
++ 
++ 		netdev_xmit_skip_txqueue(false);
++ 
++ 		nf_skip_egress(skb, true);
++ 		skb = sch_handle_egress(skb, &rc, dev);
++ 		if (!skb)
++ 			goto out;
++ 		nf_skip_egress(skb, false);
++ 
++ 		if (netdev_xmit_txqueue_skipped())
++ 			txq = netdev_tx_queue_mapping(dev, skb);
+++>>>>>>> 2f1e85b1aee4 (net: sched: use queue_mapping to pick tx queue)
+  	}
+ +# endif
+  #endif
+  	/* If device/qdisc don't need skb->dst, release it right now while
+  	 * its hot in this cpu cache.
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index f103d259c23b..4f6c0bf2520c 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -3370,6 +3370,9 @@ struct softnet_data {
+ 	struct {
+ 		u16 recursion;
+ 		u8  more;
++#ifdef CONFIG_NET_EGRESS
++		u8  skip_txqueue;
++#endif
+ 	} xmit;
+ #ifdef CONFIG_RPS
+ 	/* input_queue_head should be written by cpu owning this struct,
+diff --git a/include/linux/rtnetlink.h b/include/linux/rtnetlink.h
+index bb9cb84114c1..e87c2dccc4d5 100644
+--- a/include/linux/rtnetlink.h
++++ b/include/linux/rtnetlink.h
+@@ -100,6 +100,7 @@ void net_dec_ingress_queue(void);
+ #ifdef CONFIG_NET_EGRESS
+ void net_inc_egress_queue(void);
+ void net_dec_egress_queue(void);
++void netdev_xmit_skip_txqueue(bool skip);
+ #endif
+ 
+ void rtnetlink_init(void);
+* Unmerged path net/core/dev.c
+diff --git a/net/sched/act_skbedit.c b/net/sched/act_skbedit.c
+index f6ca4a336c39..2cbcb29392e5 100644
+--- a/net/sched/act_skbedit.c
++++ b/net/sched/act_skbedit.c
+@@ -69,8 +69,12 @@ static int tcf_skbedit_act(struct sk_buff *skb, const struct tc_action *a,
+ 		}
+ 	}
+ 	if (params->flags & SKBEDIT_F_QUEUE_MAPPING &&
+-	    skb->dev->real_num_tx_queues > params->queue_mapping)
++	    skb->dev->real_num_tx_queues > params->queue_mapping) {
++#ifdef CONFIG_NET_EGRESS
++		netdev_xmit_skip_txqueue(true);
++#endif
+ 		skb_set_queue_mapping(skb, params->queue_mapping);
++	}
+ 	if (params->flags & SKBEDIT_F_MARK) {
+ 		skb->mark &= ~params->mask;
+ 		skb->mark |= params->mark & params->mask;
