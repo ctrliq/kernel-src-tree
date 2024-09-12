@@ -1,0 +1,191 @@
+fsnotify: add super block object type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-534.el8
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 1e6cb72399fd58b38a1c11055ef18fe01f535cda
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-534.el8/1e6cb723.failed
+
+Add the infrastructure to attach a mark to a super_block struct
+and detach all attached marks when super block is destroyed.
+
+This is going to be used by fanotify backend to setup super block
+marks.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 1e6cb72399fd58b38a1c11055ef18fe01f535cda)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/super.c
+#	include/linux/fs.h
+#	include/linux/fsnotify_backend.h
+diff --cc fs/super.c
+index 6935943b278f,ca53a08497ed..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -446,12 -442,10 +446,16 @@@ void generic_shutdown_super(struct supe
+  		sync_filesystem(sb);
+  		sb->s_flags &= ~SB_ACTIVE;
+  
+++<<<<<<< HEAD
+++=======
++ 		fsnotify_sb_delete(sb);
+++>>>>>>> 1e6cb72399fd (fsnotify: add super block object type)
+  		cgroup_writeback_umount();
+  
+ +		/* evict all inodes with zero refcount */
+  		evict_inodes(sb);
+ +		/* only nonzero refcount inodes can have marks */
+ +		fsnotify_unmount_inodes(sb);
+  
+  		if (sb->s_dio_done_wq) {
+  			destroy_workqueue(sb->s_dio_done_wq);
+diff --cc include/linux/fs.h
+index 7e4e4441f3b5,2c14801d0aa3..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1546,9 -1465,10 +1546,16 @@@ struct super_block 
+  	spinlock_t		s_inode_wblist_lock;
+  	struct list_head	s_inodes_wb;	/* writeback inodes */
+  
+++<<<<<<< HEAD
+ +	/* Time limits for c/m/atime in seconds */
+ +	RH_KABI_EXTEND(time64_t	s_time_min)
+ +	RH_KABI_EXTEND(time64_t	s_time_max)
+++=======
++ #ifdef CONFIG_FSNOTIFY
++ 	__u32			s_fsnotify_mask;
++ 	struct fsnotify_mark_connector __rcu	*s_fsnotify_marks;
++ #endif
+++>>>>>>> 1e6cb72399fd (fsnotify: add super block object type)
+  } __randomize_layout;
+  
+  /* Helper functions so that in most cases filesystems will
+diff --cc include/linux/fsnotify_backend.h
+index f12a9fb53759,81b88fc9df31..000000000000
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@@ -345,7 -338,7 +348,11 @@@ extern int fsnotify(struct inode *to_te
+  extern int __fsnotify_parent(const struct path *path, struct dentry *dentry, __u32 mask);
+  extern void __fsnotify_inode_delete(struct inode *inode);
+  extern void __fsnotify_vfsmount_delete(struct vfsmount *mnt);
+++<<<<<<< HEAD
+ +extern void fsnotify_nameremove(struct dentry *dentry, int isdir);
+++=======
++ extern void fsnotify_sb_delete(struct super_block *sb);
+++>>>>>>> 1e6cb72399fd (fsnotify: add super block object type)
+  extern u32 fsnotify_get_cookie(void);
+  
+  static inline int fsnotify_inode_watches_children(struct inode *inode)
+@@@ -498,7 -492,7 +509,11 @@@ static inline void __fsnotify_inode_del
+  static inline void __fsnotify_vfsmount_delete(struct vfsmount *mnt)
+  {}
+  
+++<<<<<<< HEAD
+ +static inline void fsnotify_nameremove(struct dentry *dentry, int isdir)
+++=======
++ static inline void fsnotify_sb_delete(struct super_block *sb)
+++>>>>>>> 1e6cb72399fd (fsnotify: add super block object type)
+  {}
+  
+  static inline void fsnotify_update_flags(struct dentry *dentry)
+diff --git a/fs/notify/fdinfo.c b/fs/notify/fdinfo.c
+index 70412f5c6538..7df9ad4d8433 100644
+--- a/fs/notify/fdinfo.c
++++ b/fs/notify/fdinfo.c
+@@ -125,6 +125,11 @@ static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
+ 
+ 		seq_printf(m, "fanotify mnt_id:%x mflags:%x mask:%x ignored_mask:%x\n",
+ 			   mnt->mnt_id, mflags, mark->mask, mark->ignored_mask);
++	} else if (mark->connector->type == FSNOTIFY_OBJ_TYPE_SB) {
++		struct super_block *sb = fsnotify_conn_sb(mark->connector);
++
++		seq_printf(m, "fanotify sdev:%x mflags:%x mask:%x ignored_mask:%x\n",
++			   sb->s_dev, mflags, mark->mask, mark->ignored_mask);
+ 	}
+ }
+ 
+diff --git a/fs/notify/fsnotify.c b/fs/notify/fsnotify.c
+index fd1e8c7393b7..3c50cc405dc3 100644
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -48,7 +48,7 @@ void __fsnotify_vfsmount_delete(struct vfsmount *mnt)
+  * Called during unmount with no locks held, so needs to be safe against
+  * concurrent modifiers. We temporarily drop sb->s_inode_list_lock and CAN block.
+  */
+-void fsnotify_unmount_inodes(struct super_block *sb)
++static void fsnotify_unmount_inodes(struct super_block *sb)
+ {
+ 	struct inode *inode, *iput_inode = NULL;
+ 
+@@ -105,6 +105,12 @@ void fsnotify_unmount_inodes(struct super_block *sb)
+ 		       !atomic_long_read(&sb->s_fsnotify_inode_refs));
+ }
+ 
++void fsnotify_sb_delete(struct super_block *sb)
++{
++	fsnotify_unmount_inodes(sb);
++	fsnotify_clear_marks_by_sb(sb);
++}
++
+ /*
+  * fsnotify_nameremove - a filename was removed from a directory
+  *
+diff --git a/fs/notify/fsnotify.h b/fs/notify/fsnotify.h
+index 7902653dd577..5a00121fb219 100644
+--- a/fs/notify/fsnotify.h
++++ b/fs/notify/fsnotify.h
+@@ -21,6 +21,12 @@ static inline struct mount *fsnotify_conn_mount(
+ 	return container_of(conn->obj, struct mount, mnt_fsnotify_marks);
+ }
+ 
++static inline struct super_block *fsnotify_conn_sb(
++				struct fsnotify_mark_connector *conn)
++{
++	return container_of(conn->obj, struct super_block, s_fsnotify_marks);
++}
++
+ /* destroy all events sitting in this groups notification queue */
+ extern void fsnotify_flush_notify(struct fsnotify_group *group);
+ 
+@@ -43,6 +49,11 @@ static inline void fsnotify_clear_marks_by_mount(struct vfsmount *mnt)
+ {
+ 	fsnotify_destroy_marks(&real_mount(mnt)->mnt_fsnotify_marks);
+ }
++/* run the list of all marks associated with sb and destroy them */
++static inline void fsnotify_clear_marks_by_sb(struct super_block *sb)
++{
++	fsnotify_destroy_marks(&sb->s_fsnotify_marks);
++}
+ /* Wait until all marks queued for destruction are destroyed */
+ extern void fsnotify_wait_marks_destroyed(void);
+ 
+diff --git a/fs/notify/mark.c b/fs/notify/mark.c
+index 09535f6423fc..d2dd16cb5989 100644
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@ -115,6 +115,8 @@ static __u32 *fsnotify_conn_mask_p(struct fsnotify_mark_connector *conn)
+ 		return &fsnotify_conn_inode(conn)->i_fsnotify_mask;
+ 	else if (conn->type == FSNOTIFY_OBJ_TYPE_VFSMOUNT)
+ 		return &fsnotify_conn_mount(conn)->mnt_fsnotify_mask;
++	else if (conn->type == FSNOTIFY_OBJ_TYPE_SB)
++		return &fsnotify_conn_sb(conn)->s_fsnotify_mask;
+ 	return NULL;
+ }
+ 
+@@ -195,6 +197,8 @@ static void *fsnotify_detach_connector_from_object(
+ 		atomic_long_inc(&inode->i_sb->s_fsnotify_inode_refs);
+ 	} else if (conn->type == FSNOTIFY_OBJ_TYPE_VFSMOUNT) {
+ 		fsnotify_conn_mount(conn)->mnt_fsnotify_mask = 0;
++	} else if (conn->type == FSNOTIFY_OBJ_TYPE_SB) {
++		fsnotify_conn_sb(conn)->s_fsnotify_mask = 0;
+ 	}
+ 
+ 	rcu_assign_pointer(*(conn->obj), NULL);
+* Unmerged path fs/super.c
+* Unmerged path include/linux/fs.h
+* Unmerged path include/linux/fsnotify_backend.h
