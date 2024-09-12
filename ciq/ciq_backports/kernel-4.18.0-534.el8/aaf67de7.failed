@@ -1,0 +1,146 @@
+ceph: fix potential use-after-free bug when trimming caps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-534.el8
+commit-author Xiubo Li <xiubli@redhat.com>
+commit aaf67de78807c59c35bafb5003d4fb457c764800
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-534.el8/aaf67de7.failed
+
+When trimming the caps and just after the 'session->s_cap_lock' is
+released in ceph_iterate_session_caps() the cap maybe removed by
+another thread, and when using the stale cap memory in the callbacks
+it will trigger use-after-free crash.
+
+We need to check the existence of the cap just after the 'ci->i_ceph_lock'
+being acquired. And do nothing if it's already removed.
+
+	Cc: stable@vger.kernel.org
+Link: https://tracker.ceph.com/issues/43272
+	Signed-off-by: Xiubo Li <xiubli@redhat.com>
+	Reviewed-by: Luís Henriques <lhenriques@suse.de>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit aaf67de78807c59c35bafb5003d4fb457c764800)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/mds_client.c
+diff --cc fs/ceph/mds_client.c
+index e802fffad9d9,54e3c2ab21d2..000000000000
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@@ -1621,8 -1645,10 +1621,10 @@@ int ceph_iterate_session_caps(struct ce
+  	spin_lock(&session->s_cap_lock);
+  	p = session->s_caps.next;
+  	while (p != &session->s_caps) {
++ 		int mds;
++ 
+  		cap = list_entry(p, struct ceph_cap, session_caps);
+ -		inode = igrab(&cap->ci->netfs.inode);
+ +		inode = igrab(&cap->ci->vfs_inode);
+  		if (!inode) {
+  			p = p->next;
+  			continue;
+@@@ -1677,15 -1703,21 +1679,26 @@@ static int remove_session_caps_cb(struc
+  {
+  	struct ceph_inode_info *ci = ceph_inode(inode);
+  	bool invalidate = false;
+- 	int iputs;
++ 	struct ceph_cap *cap;
++ 	int iputs = 0;
+  
+++<<<<<<< HEAD
+ +	dout("removing cap %p, ci is %p, inode is %p\n",
+ +	     cap, ci, &ci->vfs_inode);
+++=======
+++>>>>>>> aaf67de78807 (ceph: fix potential use-after-free bug when trimming caps)
+  	spin_lock(&ci->i_ceph_lock);
+- 	iputs = ceph_purge_inode_cap(inode, cap, &invalidate);
++ 	cap = __get_cap_for_mds(ci, mds);
++ 	if (cap) {
++ 		dout(" removing cap %p, ci is %p, inode is %p\n",
++ 		     cap, ci, &ci->netfs.inode);
++ 
++ 		iputs = ceph_purge_inode_cap(inode, cap, &invalidate);
++ 	}
+  	spin_unlock(&ci->i_ceph_lock);
+  
+- 	wake_up_all(&ci->i_cap_wq);
++ 	if (cap)
++ 		wake_up_all(&ci->i_cap_wq);
+  	if (invalidate)
+  		ceph_queue_invalidate(inode);
+  	while (iputs--)
+diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
+index 2a93a4fe23af..a234af418805 100644
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -430,7 +430,7 @@ void ceph_reservation_status(struct ceph_fs_client *fsc,
+  *
+  * Called with i_ceph_lock held.
+  */
+-static struct ceph_cap *__get_cap_for_mds(struct ceph_inode_info *ci, int mds)
++struct ceph_cap *__get_cap_for_mds(struct ceph_inode_info *ci, int mds)
+ {
+ 	struct ceph_cap *cap;
+ 	struct rb_node *n = ci->i_caps.rb_node;
+diff --git a/fs/ceph/debugfs.c b/fs/ceph/debugfs.c
+index 8f29ee445184..fbe0681b835e 100644
+--- a/fs/ceph/debugfs.c
++++ b/fs/ceph/debugfs.c
+@@ -249,14 +249,20 @@ static int metrics_caps_show(struct seq_file *s, void *p)
+ 	return 0;
+ }
+ 
+-static int caps_show_cb(struct inode *inode, struct ceph_cap *cap, void *p)
++static int caps_show_cb(struct inode *inode, int mds, void *p)
+ {
++	struct ceph_inode_info *ci = ceph_inode(inode);
+ 	struct seq_file *s = p;
+-
+-	seq_printf(s, "0x%-17llx%-3d%-17s%-17s\n", ceph_ino(inode),
+-		   cap->session->s_mds,
+-		   ceph_cap_string(cap->issued),
+-		   ceph_cap_string(cap->implemented));
++	struct ceph_cap *cap;
++
++	spin_lock(&ci->i_ceph_lock);
++	cap = __get_cap_for_mds(ci, mds);
++	if (cap)
++		seq_printf(s, "0x%-17llx%-3d%-17s%-17s\n", ceph_ino(inode),
++			   cap->session->s_mds,
++			   ceph_cap_string(cap->issued),
++			   ceph_cap_string(cap->implemented));
++	spin_unlock(&ci->i_ceph_lock);
+ 	return 0;
+ }
+ 
+* Unmerged path fs/ceph/mds_client.c
+diff --git a/fs/ceph/mds_client.h b/fs/ceph/mds_client.h
+index fbe668f17640..e4ae1dd12a63 100644
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@ -531,8 +531,7 @@ extern void ceph_flush_cap_releases(struct ceph_mds_client *mdsc,
+ extern void ceph_queue_cap_reclaim_work(struct ceph_mds_client *mdsc);
+ extern void ceph_reclaim_caps_nr(struct ceph_mds_client *mdsc, int nr);
+ extern int ceph_iterate_session_caps(struct ceph_mds_session *session,
+-				     int (*cb)(struct inode *,
+-					       struct ceph_cap *, void *),
++				     int (*cb)(struct inode *, int mds, void *),
+ 				     void *arg);
+ extern void ceph_mdsc_pre_umount(struct ceph_mds_client *mdsc);
+ 
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index 29732d3dea4a..25bb105aa45f 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -1190,6 +1190,8 @@ extern void ceph_kick_flushing_caps(struct ceph_mds_client *mdsc,
+ 				    struct ceph_mds_session *session);
+ void ceph_kick_flushing_inode_caps(struct ceph_mds_session *session,
+ 				   struct ceph_inode_info *ci);
++extern struct ceph_cap *__get_cap_for_mds(struct ceph_inode_info *ci,
++					  int mds);
+ extern struct ceph_cap *ceph_get_cap_for_mds(struct ceph_inode_info *ci,
+ 					     int mds);
+ extern void ceph_take_cap_refs(struct ceph_inode_info *ci, int caps,
