@@ -1,0 +1,282 @@
+ice: xsk: allocate separate memory for XDP SW ring
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+commit 617f3e1b588c802517c236087561c6bcb0b4afd6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/617f3e1b.failed
+
+Currently, the zero-copy data path is reusing the memory region that was
+initially allocated for an array of struct ice_rx_buf for its own
+purposes. This is error prone as it is based on the ice_rx_buf struct
+always being the same size or bigger than what the zero-copy path needs.
+There can also be old values present in that array giving rise to errors
+when the zero-copy path uses it.
+
+Fix this by freeing the ice_rx_buf region and allocating a new array for
+the zero-copy path that has the right length and is initialized to zero.
+
+Fixes: 57f7f8b6bc0b ("ice: Use xdp_buf instead of rx_buf for xsk zero-copy")
+	Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Tested-by: Kiran Bhandare <kiranx.bhandare@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 617f3e1b588c802517c236087561c6bcb0b4afd6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_xsk.c
+diff --cc drivers/net/ethernet/intel/ice/ice_xsk.c
+index 295bfdac4d32,c124229d98fe..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_xsk.c
++++ b/drivers/net/ethernet/intel/ice/ice_xsk.c
+@@@ -367,24 -372,21 +372,28 @@@ bool ice_alloc_rx_bufs_zc(struct ice_rx
+  {
+  	union ice_32b_rx_flex_desc *rx_desc;
+  	u16 ntu = rx_ring->next_to_use;
+ -	struct xdp_buff **xdp;
+ -	u32 nb_buffs, i;
+ +	struct ice_rx_buf *rx_buf;
+ +	bool ok = true;
+  	dma_addr_t dma;
+  
+ +	if (!count)
+ +		return true;
+ +
+  	rx_desc = ICE_RX_DESC(rx_ring, ntu);
+++<<<<<<< HEAD
+ +	rx_buf = &rx_ring->rx_buf[ntu];
+++=======
++ 	xdp = ice_xdp_buf(rx_ring, ntu);
+++>>>>>>> 617f3e1b588c (ice: xsk: allocate separate memory for XDP SW ring)
+  
+ -	nb_buffs = min_t(u16, count, rx_ring->count - ntu);
+ -	nb_buffs = xsk_buff_alloc_batch(rx_ring->xsk_pool, xdp, nb_buffs);
+ -	if (!nb_buffs)
+ -		return false;
+ +	do {
+ +		rx_buf->xdp = xsk_buff_alloc(rx_ring->xsk_pool);
+ +		if (!rx_buf->xdp) {
+ +			ok = false;
+ +			break;
+ +		}
+  
+ -	i = nb_buffs;
+ -	while (i--) {
+ -		dma = xsk_buff_xdp_get_dma(*xdp);
+ +		dma = xsk_buff_xdp_get_dma(rx_buf->xdp);
+  		rx_desc->read.pkt_addr = cpu_to_le64(dma);
+  		rx_desc->wb.status_error0 = 0;
+  
+@@@ -424,19 -424,18 +433,31 @@@ static void ice_bump_ntc(struct ice_rx_
+  /**
+   * ice_construct_skb_zc - Create an sk_buff from zero-copy buffer
+   * @rx_ring: Rx ring
+++<<<<<<< HEAD
+ + * @rx_buf: zero-copy Rx buffer
+++=======
++  * @xdp: Pointer to XDP buffer
+++>>>>>>> 617f3e1b588c (ice: xsk: allocate separate memory for XDP SW ring)
+   *
+   * This function allocates a new skb from a zero-copy Rx buffer.
+   *
+   * Returns the skb on success, NULL on failure.
+   */
+  static struct sk_buff *
+++<<<<<<< HEAD
+ +ice_construct_skb_zc(struct ice_rx_ring *rx_ring, struct ice_rx_buf *rx_buf)
+ +{
+ +	unsigned int metasize = rx_buf->xdp->data - rx_buf->xdp->data_meta;
+ +	unsigned int datasize = rx_buf->xdp->data_end - rx_buf->xdp->data;
+ +	unsigned int datasize_hard = rx_buf->xdp->data_end -
+ +				     rx_buf->xdp->data_hard_start;
+++=======
++ ice_construct_skb_zc(struct ice_rx_ring *rx_ring, struct xdp_buff *xdp)
++ {
++ 	unsigned int datasize_hard = xdp->data_end - xdp->data_hard_start;
++ 	unsigned int metasize = xdp->data - xdp->data_meta;
++ 	unsigned int datasize = xdp->data_end - xdp->data;
+++>>>>>>> 617f3e1b588c (ice: xsk: allocate separate memory for XDP SW ring)
+  	struct sk_buff *skb;
+  
+  	skb = __napi_alloc_skb(&rx_ring->q_vector->napi, datasize_hard,
+@@@ -449,8 -448,7 +470,12 @@@
+  	if (metasize)
+  		skb_metadata_set(skb, metasize);
+  
+++<<<<<<< HEAD
+ +	xsk_buff_free(rx_buf->xdp);
+ +	rx_buf->xdp = NULL;
+++=======
++ 	xsk_buff_free(xdp);
+++>>>>>>> 617f3e1b588c (ice: xsk: allocate separate memory for XDP SW ring)
+  	return skb;
+  }
+  
+@@@ -527,7 -519,13 +552,11 @@@ int ice_clean_rx_irq_zc(struct ice_rx_r
+  	while (likely(total_rx_packets < (unsigned int)budget)) {
+  		union ice_32b_rx_flex_desc *rx_desc;
+  		unsigned int size, xdp_res = 0;
+++<<<<<<< HEAD
+ +		struct ice_rx_buf *rx_buf;
+++=======
++ 		struct xdp_buff *xdp;
+++>>>>>>> 617f3e1b588c (ice: xsk: allocate separate memory for XDP SW ring)
+  		struct sk_buff *skb;
+  		u16 stat_err_bits;
+  		u16 vlan_tag = 0;
+@@@ -550,18 -548,17 +579,31 @@@
+  		if (!size)
+  			break;
+  
+++<<<<<<< HEAD
+ +		rx_buf = &rx_ring->rx_buf[rx_ring->next_to_clean];
+ +		rx_buf->xdp->data_end = rx_buf->xdp->data + size;
+ +		xsk_buff_dma_sync_for_cpu(rx_buf->xdp, rx_ring->xsk_pool);
+ +
+ +		xdp_res = ice_run_xdp_zc(rx_ring, rx_buf->xdp);
+++=======
++ 		xdp = *ice_xdp_buf(rx_ring, rx_ring->next_to_clean);
++ 		xsk_buff_set_size(xdp, size);
++ 		xsk_buff_dma_sync_for_cpu(xdp, rx_ring->xsk_pool);
++ 
++ 		xdp_res = ice_run_xdp_zc(rx_ring, xdp, xdp_prog, xdp_ring);
+++>>>>>>> 617f3e1b588c (ice: xsk: allocate separate memory for XDP SW ring)
+  		if (xdp_res) {
+  			if (xdp_res & (ICE_XDP_TX | ICE_XDP_REDIR))
+  				xdp_xmit |= xdp_res;
+  			else
+++<<<<<<< HEAD
+ +				xsk_buff_free(rx_buf->xdp);
+ +
+ +			rx_buf->xdp = NULL;
+++=======
++ 				xsk_buff_free(xdp);
++ 
+++>>>>>>> 617f3e1b588c (ice: xsk: allocate separate memory for XDP SW ring)
+  			total_rx_bytes += size;
+  			total_rx_packets++;
+  			cleaned_count++;
+@@@ -816,15 -813,14 +858,22 @@@ bool ice_xsk_any_rx_ring_ena(struct ice
+   */
+  void ice_xsk_clean_rx_ring(struct ice_rx_ring *rx_ring)
+  {
+ -	u16 count_mask = rx_ring->count - 1;
+ -	u16 ntc = rx_ring->next_to_clean;
+ -	u16 ntu = rx_ring->next_to_use;
+ +	u16 i;
+ +
+++<<<<<<< HEAD
+ +	for (i = 0; i < rx_ring->count; i++) {
+ +		struct ice_rx_buf *rx_buf = &rx_ring->rx_buf[i];
+ +
+ +		if (!rx_buf->xdp)
+ +			continue;
+  
+ +		rx_buf->xdp = NULL;
+++=======
++ 	for ( ; ntc != ntu; ntc = (ntc + 1) & count_mask) {
++ 		struct xdp_buff *xdp = *ice_xdp_buf(rx_ring, ntc);
++ 
++ 		xsk_buff_free(xdp);
+++>>>>>>> 617f3e1b588c (ice: xsk: allocate separate memory for XDP SW ring)
+  	}
+  }
+  
+diff --git a/drivers/net/ethernet/intel/ice/ice_base.c b/drivers/net/ethernet/intel/ice/ice_base.c
+index 795adc3a77d2..65c7ec12bcf4 100644
+--- a/drivers/net/ethernet/intel/ice/ice_base.c
++++ b/drivers/net/ethernet/intel/ice/ice_base.c
+@@ -6,6 +6,18 @@
+ #include "ice_lib.h"
+ #include "ice_dcb_lib.h"
+ 
++static bool ice_alloc_rx_buf_zc(struct ice_rx_ring *rx_ring)
++{
++	rx_ring->xdp_buf = kcalloc(rx_ring->count, sizeof(*rx_ring->xdp_buf), GFP_KERNEL);
++	return !!rx_ring->xdp_buf;
++}
++
++static bool ice_alloc_rx_buf(struct ice_rx_ring *rx_ring)
++{
++	rx_ring->rx_buf = kcalloc(rx_ring->count, sizeof(*rx_ring->rx_buf), GFP_KERNEL);
++	return !!rx_ring->rx_buf;
++}
++
+ /**
+  * __ice_vsi_get_qs_contig - Assign a contiguous chunk of queues to VSI
+  * @qs_cfg: gathered variables needed for PF->VSI queues assignment
+@@ -456,8 +468,11 @@ int ice_vsi_cfg_rxq(struct ice_rx_ring *ring)
+ 			xdp_rxq_info_reg(&ring->xdp_rxq, ring->netdev,
+ 					 ring->q_index, ring->q_vector->napi.napi_id);
+ 
++		kfree(ring->rx_buf);
+ 		ring->xsk_pool = ice_xsk_pool(ring);
+ 		if (ring->xsk_pool) {
++			if (!ice_alloc_rx_buf_zc(ring))
++				return -ENOMEM;
+ 			xdp_rxq_info_unreg_mem_model(&ring->xdp_rxq);
+ 
+ 			ring->rx_buf_len =
+@@ -472,6 +487,8 @@ int ice_vsi_cfg_rxq(struct ice_rx_ring *ring)
+ 			dev_info(dev, "Registered XDP mem model MEM_TYPE_XSK_BUFF_POOL on Rx ring %d\n",
+ 				 ring->q_index);
+ 		} else {
++			if (!ice_alloc_rx_buf(ring))
++				return -ENOMEM;
+ 			if (!xdp_rxq_info_is_reg(&ring->xdp_rxq))
+ 				/* coverity[check_return] */
+ 				xdp_rxq_info_reg(&ring->xdp_rxq,
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.c b/drivers/net/ethernet/intel/ice/ice_txrx.c
+index f22cd78723eb..c180550e6369 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@ -432,7 +432,10 @@ void ice_clean_rx_ring(struct ice_rx_ring *rx_ring)
+ 	}
+ 
+ rx_skip_free:
+-	memset(rx_ring->rx_buf, 0, sizeof(*rx_ring->rx_buf) * rx_ring->count);
++	if (rx_ring->xsk_pool)
++		memset(rx_ring->xdp_buf, 0, array_size(rx_ring->count, sizeof(*rx_ring->xdp_buf)));
++	else
++		memset(rx_ring->rx_buf, 0, array_size(rx_ring->count, sizeof(*rx_ring->rx_buf)));
+ 
+ 	/* Zero out the descriptor ring */
+ 	size = ALIGN(rx_ring->count * sizeof(union ice_32byte_rx_desc),
+@@ -459,8 +462,13 @@ void ice_free_rx_ring(struct ice_rx_ring *rx_ring)
+ 		if (xdp_rxq_info_is_reg(&rx_ring->xdp_rxq))
+ 			xdp_rxq_info_unreg(&rx_ring->xdp_rxq);
+ 	rx_ring->xdp_prog = NULL;
+-	devm_kfree(rx_ring->dev, rx_ring->rx_buf);
+-	rx_ring->rx_buf = NULL;
++	if (rx_ring->xsk_pool) {
++		kfree(rx_ring->xdp_buf);
++		rx_ring->xdp_buf = NULL;
++	} else {
++		kfree(rx_ring->rx_buf);
++		rx_ring->rx_buf = NULL;
++	}
+ 
+ 	if (rx_ring->desc) {
+ 		size = ALIGN(rx_ring->count * sizeof(union ice_32byte_rx_desc),
+@@ -488,8 +496,7 @@ int ice_setup_rx_ring(struct ice_rx_ring *rx_ring)
+ 	/* warn if we are about to overwrite the pointer */
+ 	WARN_ON(rx_ring->rx_buf);
+ 	rx_ring->rx_buf =
+-		devm_kcalloc(dev, sizeof(*rx_ring->rx_buf), rx_ring->count,
+-			     GFP_KERNEL);
++		kcalloc(rx_ring->count, sizeof(*rx_ring->rx_buf), GFP_KERNEL);
+ 	if (!rx_ring->rx_buf)
+ 		return -ENOMEM;
+ 
+@@ -518,7 +525,7 @@ int ice_setup_rx_ring(struct ice_rx_ring *rx_ring)
+ 	return 0;
+ 
+ err:
+-	devm_kfree(dev, rx_ring->rx_buf);
++	kfree(rx_ring->rx_buf);
+ 	rx_ring->rx_buf = NULL;
+ 	return -ENOMEM;
+ }
+* Unmerged path drivers/net/ethernet/intel/ice/ice_xsk.c
