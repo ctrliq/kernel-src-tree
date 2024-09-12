@@ -1,0 +1,98 @@
+s390/vfio-ap: allow deconfigured queue to be passed through to a guest
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-523.el8
+commit-author Tony Krowiak <akrowiak@linux.ibm.com>
+commit c51f8c6bb5c8a4878310d55e3a0b91747954b43d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-523.el8/c51f8c6b.failed
+
+When a queue is reset, the status response code returned from the reset
+operation is stored in the reset_rc field of the vfio_ap_queue structure
+representing the queue being reset. This field is later used to decide
+whether the queue should be passed through to a guest. If the reset_rc
+field is a non-zero value, the queue will be filtered from the list of
+queues passed through.
+
+When an adapter is deconfigured, all queues associated with that adapter
+are reset. That being the case, it is not necessary to filter those queues;
+so, if the status response code returned from a reset operation indicates
+the queue is deconfigured, the reset_rc field of the vfio_ap_queue
+structure will be set to zero so it will be passed through (i.e., not
+filtered).
+
+	Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Reviewed-by: Jason J. Herne <jjherne@linux.ibm.com>
+	Acked-by: Halil Pasic <pasic@linux.ibm.com>
+	Tested-by: Viktor Mihajlovski <mihajlov@linux.ibm.com>
+Link: https://lore.kernel.org/r/20230815184333.6554-5-akrowiak@linux.ibm.com
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit c51f8c6bb5c8a4878310d55e3a0b91747954b43d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/vfio_ap_ops.c
+diff --cc drivers/s390/crypto/vfio_ap_ops.c
+index ef0d06898296,a489536c508a..000000000000
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@@ -1594,28 -1655,37 +1594,51 @@@ retry_zapq
+  	switch (status.response_code) {
+  	case AP_RESPONSE_NORMAL:
+  		ret = 0;
+ -		if (!status.irq_enabled)
+ -			vfio_ap_free_aqic_resources(q);
+ -		if (!status.queue_empty || status.irq_enabled) {
+ +		/* if the reset has not completed, wait for it to take effect */
+ +		if (!status.queue_empty || status.irq_enabled)
+  			ret = apq_reset_check(q);
+ -			if (status.irq_enabled && ret == 0)
+ -				vfio_ap_free_aqic_resources(q);
+ -		}
+  		break;
+  	case AP_RESPONSE_RESET_IN_PROGRESS:
+++<<<<<<< HEAD
+ +		if (retry--) {
+ +			msleep(20);
+ +			goto retry_zapq;
+ +		}
+ +		ret = -EBUSY;
+++=======
++ 	case AP_RESPONSE_BUSY:
++ 		/*
++ 		 * There is a reset issued by another process in progress. Let's wait
++ 		 * for that to complete. Since we have no idea whether it was a RAPQ or
++ 		 * ZAPQ, then if it completes successfully, let's issue the ZAPQ.
++ 		 */
++ 		ret = apq_reset_check(q);
++ 		if (ret)
++ 			break;
++ 		goto retry_zapq;
++ 	case AP_RESPONSE_DECONFIGURED:
++ 		/*
++ 		 * When an AP adapter is deconfigured, the associated
++ 		 * queues are reset, so let's set the status response code to 0
++ 		 * so the queue may be passed through (i.e., not filtered) and
++ 		 * return a value indicating the reset completed successfully.
++ 		 */
++ 		q->reset_rc = 0;
++ 		ret = 0;
++ 		vfio_ap_free_aqic_resources(q);
+++>>>>>>> c51f8c6bb5c8 (s390/vfio-ap: allow deconfigured queue to be passed through to a guest)
+  		break;
+ +	case AP_RESPONSE_Q_NOT_AVAIL:
+ +	case AP_RESPONSE_DECONFIGURED:
+ +	case AP_RESPONSE_CHECKSTOPPED:
+ +		WARN_ONCE(status.irq_enabled,
+ +			  "PQAP/ZAPQ for %02x.%04x failed with rc=%u while IRQ enabled",
+ +			  AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn),
+ +			  status.response_code);
+ +		ret = -EBUSY;
+ +		goto free_resources;
+  	default:
+ +		/* things are really broken, give up */
+  		WARN(true,
+  		     "PQAP/ZAPQ for %02x.%04x failed with invalid rc=%u\n",
+  		     AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn),
+* Unmerged path drivers/s390/crypto/vfio_ap_ops.c
