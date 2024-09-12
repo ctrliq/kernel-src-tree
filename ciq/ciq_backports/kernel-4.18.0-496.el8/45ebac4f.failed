@@ -1,0 +1,142 @@
+wifi: mac80211: Parse station profile from association response
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Ilan Peer <ilan.peer@intel.com>
+commit 45ebac4f059b92906e7e86dd1a780739f883857c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/45ebac4f.failed
+
+When processing an association response frame for a Multi-Link
+connection, extract the per station profile for each additional
+link, and use it for parsing the link elements.
+
+As the Multi-Link element might be fragmented, add support for
+reassembling a fragmented element. To simplify memory management
+logic, extend 'struct ieee802_11_elems' to hold a scratch buffer,
+which is used for the defragmentation. Once an element is
+reconstructed in the scratch area, point the corresponding element
+pointer to it. Currently only defragmentation of Multi-Link element
+and the contained per-STA profile subelement is supported.
+
+	Signed-off-by: Ilan Peer <ilan.peer@intel.com>
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 45ebac4f059b92906e7e86dd1a780739f883857c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/util.c
+diff --cc net/mac80211/util.c
+index 056ed0cae360,40b75fa82b15..000000000000
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@@ -1492,7 -1645,7 +1633,11 @@@ ieee802_11_parse_elems_full(struct ieee
+  	const struct element *non_inherit = NULL;
+  	u8 *nontransmitted_profile;
+  	int nontransmitted_profile_len = 0;
+++<<<<<<< HEAD
+ +	size_t scratch_len = params->len;
+++=======
++ 	size_t scratch_len = params->scratch_len ?: 2 * params->len;
+++>>>>>>> 45ebac4f059b (wifi: mac80211: Parse station profile from association response)
+  
+  	elems = kzalloc(sizeof(*elems) + scratch_len, GFP_ATOMIC);
+  	if (!elems)
+diff --git a/include/linux/ieee80211.h b/include/linux/ieee80211.h
+index 4ce4ac6e39dc..f7f7f1b5dca2 100644
+--- a/include/linux/ieee80211.h
++++ b/include/linux/ieee80211.h
+@@ -4669,6 +4669,7 @@ static inline bool ieee80211_mle_size_ok(const u8 *data, size_t len)
+ 
+ enum ieee80211_mle_subelems {
+ 	IEEE80211_MLE_SUBELEM_PER_STA_PROFILE		= 0,
++	IEEE80211_MLE_SUBELEM_FRAGMENT		        = 254,
+ };
+ 
+ #define IEEE80211_MLE_STA_CONTROL_LINK_ID			0x000f
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index f9001c90abd9..620411b7efca 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1708,6 +1708,17 @@ struct ieee802_11_elems {
+ 	u8 tx_pwr_env_num;
+ 	u8 eht_cap_len;
+ 
++	/* mult-link element can be de-fragmented and thus u8 is not sufficient */
++	size_t multi_link_len;
++
++	/*
++	 * store the per station profile pointer and length in case that the
++	 * parsing also handled Multi-Link element parsing for a specific link
++	 * ID.
++	 */
++	struct ieee80211_mle_per_sta_profile *prof;
++	size_t sta_prof_len;
++
+ 	/* whether a parse error occurred while retrieving these elements */
+ 	bool parse_error;
+ 
+@@ -2206,9 +2217,13 @@ static inline void ieee80211_tx_skb(struct ieee80211_sub_if_data *sdata,
+  *	represent a non-transmitting BSS in which case the data
+  *	for that non-transmitting BSS is returned
+  * @link_id: the link ID to parse elements for, if a STA profile
+- *	is present in the multi-link element, or -1 to ignore
++ *	is present in the multi-link element, or -1 to ignore;
++ *	note that the code currently assumes parsing an association
++ *	(or re-association) response frame if this is given
+  * @from_ap: frame is received from an AP (currently used only
+  *	for EHT capabilities parsing)
++ * @scratch_len: if non zero, specifies the requested length of the scratch
++ *      buffer; otherwise, 'len' is used.
+  */
+ struct ieee80211_elems_parse_params {
+ 	const u8 *start;
+@@ -2219,6 +2234,7 @@ struct ieee80211_elems_parse_params {
+ 	struct cfg80211_bss *bss;
+ 	int link_id;
+ 	bool from_ap;
++	size_t scratch_len;
+ };
+ 
+ struct ieee802_11_elems *
+diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
+index 0125b3e6175b..ad9e9d86f447 100644
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@ -3923,11 +3923,12 @@ static bool ieee80211_assoc_config_link(struct ieee80211_link_data *link,
+ 	struct ieee80211_mgd_assoc_data *assoc_data = sdata->u.mgd.assoc_data;
+ 	struct ieee80211_bss_conf *bss_conf = link->conf;
+ 	struct ieee80211_local *local = sdata->local;
++	unsigned int link_id = link->link_id;
+ 	struct ieee80211_elems_parse_params parse_params = {
+ 		.start = elem_start,
+ 		.len = elem_len,
+ 		.bss = cbss,
+-		.link_id = link == &sdata->deflink ? -1 : link->link_id,
++		.link_id = link_id == assoc_data->assoc_link_id ? -1 : link_id,
+ 		.from_ap = true,
+ 	};
+ 	bool is_6ghz = cbss->channel->band == NL80211_BAND_6GHZ;
+@@ -3942,8 +3943,18 @@ static bool ieee80211_assoc_config_link(struct ieee80211_link_data *link,
+ 	if (!elems)
+ 		return false;
+ 
+-	/* FIXME: use from STA profile element after parsing that */
+-	capab_info = le16_to_cpu(mgmt->u.assoc_resp.capab_info);
++	if (link_id == assoc_data->assoc_link_id) {
++		capab_info = le16_to_cpu(mgmt->u.assoc_resp.capab_info);
++	} else if (!elems->prof) {
++		ret = false;
++		goto out;
++	} else {
++		const u8 *ptr = elems->prof->variable +
++				elems->prof->sta_info_len - 1;
++
++		/* FIXME: need to also handle the status code */
++		capab_info = get_unaligned_le16(ptr);
++	}
+ 
+ 	if (!is_s1g && !elems->supp_rates) {
+ 		sdata_info(sdata, "no SuppRates element in AssocResp\n");
+* Unmerged path net/mac80211/util.c
