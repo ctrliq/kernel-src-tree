@@ -1,0 +1,181 @@
+x86/resctrl: Make ctrlval arrays the same size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author James Morse <james.morse@arm.com>
+commit 141739aa73505539f315d15068b9c0707ab5ecb4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/141739aa.failed
+
+The CODE and DATA resources report a num_closid that is half the actual
+size supported by the hardware. This behaviour is visible to user-space
+when CDP is enabled.
+
+The CODE and DATA resources have their own ctrlval arrays which are
+half the size of the underlying hardware because num_closid was already
+adjusted. One holds the odd configurations values, the other even.
+
+Before the CDP resources can be merged, the 'half the closids' behaviour
+needs to be implemented by schemata_list_create(), but this causes the
+ctrl_val[] array to be full sized.
+
+Remove the logic from the architecture specific rdt_get_cdp_config()
+setup, and add it to schemata_list_create(). Functions that walk all the
+configurations, such as domain_setup_ctrlval() and reset_all_ctrls(),
+take num_closid directly from struct rdt_hw_resource also have
+to halve num_closid as only the lower half of each array is in
+use. domain_setup_ctrlval() and reset_all_ctrls() both copy struct
+rdt_hw_resource's num_closid to a struct msr_param. Correct the value
+here.
+
+This is temporary as a subsequent patch will merge all three ctrl_val[]
+arrays such that when CDP is in use, the CODA/DATA layout in the array
+matches the hardware. reset_all_ctrls()'s loop over the whole of
+ctrl_val[] is not touched as this is harmless, and will be required as
+it is once the resources are merged.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Jamie Iles <jamie@nuviainc.com>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Tested-by: Babu Moger <babu.moger@amd.com>
+Link: https://lkml.kernel.org/r/20210728170637.25610-19-james.morse@arm.com
+(cherry picked from commit 141739aa73505539f315d15068b9c0707ab5ecb4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/core.c
+#	arch/x86/kernel/cpu/resctrl/rdtgroup.c
+diff --cc arch/x86/kernel/cpu/resctrl/core.c
+index 916eb976301b,9f8be5ee5e8a..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/core.c
++++ b/arch/x86/kernel/cpu/resctrl/core.c
+@@@ -341,10 -358,12 +341,14 @@@ static void rdt_get_cache_alloc_cfg(in
+  
+  static void rdt_get_cdp_config(int level, int type)
+  {
+ -	struct rdt_resource *r_l = &rdt_resources_all[level].r_resctrl;
+ -	struct rdt_hw_resource *hw_res_l = resctrl_to_arch_res(r_l);
+ -	struct rdt_resource *r = &rdt_resources_all[type].r_resctrl;
+ -	struct rdt_hw_resource *hw_res = resctrl_to_arch_res(r);
+ +	struct rdt_resource *r_l = &rdt_resources_all[level];
+ +	struct rdt_resource *r = &rdt_resources_all[type];
+  
+++<<<<<<< HEAD
+ +	r->num_closid = r_l->num_closid / 2;
+++=======
++ 	hw_res->num_closid = hw_res_l->num_closid;
+++>>>>>>> 141739aa7350 (x86/resctrl: Make ctrlval arrays the same size)
+  	r->cache.cbm_len = r_l->cache.cbm_len;
+  	r->default_ctrl = r_l->default_ctrl;
+  	r->cache.shareable_bits = r_l->cache.shareable_bits;
+@@@ -510,8 -548,16 +514,21 @@@ static int domain_setup_ctrlval(struct 
+  	setup_default_ctrlval(r, dc, dm);
+  
+  	m.low = 0;
+++<<<<<<< HEAD
+ +	m.high = r->num_closid;
+ +	r->msr_update(d, &m, r);
+++=======
++ 	m.high = hw_res->num_closid;
++ 
++ 	/*
++ 	 * temporary: the array is full-size, but cat_wrmsr() still re-maps
++ 	 * the index.
++ 	 */
++ 	if (hw_res->conf_type != CDP_NONE)
++ 		m.high /= 2;
++ 
++ 	hw_res->msr_update(d, &m, r);
+++>>>>>>> 141739aa7350 (x86/resctrl: Make ctrlval arrays the same size)
+  	return 0;
+  }
+  
+diff --cc arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index a8731279ffbf,299af12c9fe4..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@@ -2122,6 -2140,60 +2122,63 @@@ static int rdt_enable_ctx(struct rdt_fs
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int schemata_list_create(void)
++ {
++ 	struct resctrl_schema *s;
++ 	struct rdt_resource *r;
++ 	int ret, cl;
++ 
++ 	for_each_alloc_enabled_rdt_resource(r) {
++ 		s = kzalloc(sizeof(*s), GFP_KERNEL);
++ 		if (!s)
++ 			return -ENOMEM;
++ 
++ 		s->res = r;
++ 		s->conf_type = resctrl_to_arch_res(r)->conf_type;
++ 		s->num_closid = resctrl_arch_get_num_closid(r);
++ 		if (resctrl_arch_get_cdp_enabled(r->rid))
++ 			s->num_closid /= 2;
++ 
++ 		ret = snprintf(s->name, sizeof(s->name), r->name);
++ 		if (ret >= sizeof(s->name)) {
++ 			kfree(s);
++ 			return -EINVAL;
++ 		}
++ 
++ 		cl = strlen(s->name);
++ 
++ 		/*
++ 		 * If CDP is supported by this resource, but not enabled,
++ 		 * include the suffix. This ensures the tabular format of the
++ 		 * schemata file does not change between mounts of the
++ 		 * filesystem.
++ 		 */
++ 		if (r->cdp_capable && !resctrl_arch_get_cdp_enabled(r->rid))
++ 			cl += 4;
++ 
++ 		if (cl > max_name_width)
++ 			max_name_width = cl;
++ 
++ 		INIT_LIST_HEAD(&s->list);
++ 		list_add(&s->list, &resctrl_schema_all);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void schemata_list_destroy(void)
++ {
++ 	struct resctrl_schema *s, *tmp;
++ 
++ 	list_for_each_entry_safe(s, tmp, &resctrl_schema_all, list) {
++ 		list_del(&s->list);
++ 		kfree(s);
++ 	}
++ }
++ 
+++>>>>>>> 141739aa7350 (x86/resctrl: Make ctrlval arrays the same size)
+  static int rdt_get_tree(struct fs_context *fc)
+  {
+  	struct rdt_fs_context *ctx = rdt_fc2context(fc);
+@@@ -2294,8 -2376,15 +2351,15 @@@ static int reset_all_ctrls(struct rdt_r
+  
+  	msr_param.res = r;
+  	msr_param.low = 0;
+ -	msr_param.high = hw_res->num_closid;
+ +	msr_param.high = r->num_closid;
+  
++ 	/*
++ 	 * temporary: the array is full-sized, but cat_wrmsr() still re-maps
++ 	 * the index.
++ 	 */
++ 	if (hw_res->cdp_enabled)
++ 		msr_param.high /= 2;
++ 
+  	/*
+  	 * Disable resource control for this resource by setting all
+  	 * CBMs in all domains to the maximum mask value. Pick one CPU
+* Unmerged path arch/x86/kernel/cpu/resctrl/core.c
+* Unmerged path arch/x86/kernel/cpu/resctrl/rdtgroup.c
