@@ -1,0 +1,173 @@
+net: make default_rps_mask a per netns attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 50bcfe8df7c73ce51762f65d218b4ef0cc5da3ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/50bcfe8d.failed
+
+That really was meant to be a per netns attribute from the beginning.
+
+The idea is that once proper isolation is in place in the main
+namespace, additional demux in the child namespaces will be redundant.
+Let's make child netns default rps mask empty by default.
+
+To avoid bloating the netns with a possibly large cpumask, allocate
+it on-demand during the first write operation.
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 50bcfe8df7c73ce51762f65d218b4ef0cc5da3ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/net-sysfs.c
+#	net/core/sysctl_net_core.c
+diff --cc net/core/net-sysfs.c
+index 10667cc2a611,15e3f4606b5f..000000000000
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@@ -1074,6 -1095,10 +1086,13 @@@ static int rx_queue_add_kobject(struct 
+  			goto err;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	error = rx_queue_default_mask(dev, queue);
++ 	if (error)
++ 		goto err;
++ 
+++>>>>>>> 50bcfe8df7c7 (net: make default_rps_mask a per netns attribute)
+  	kobject_uevent(kobj, KOBJ_ADD);
+  
+  	return error;
+diff --cc net/core/sysctl_net_core.c
+index 5ff9b3d67973,74842b453407..000000000000
+--- a/net/core/sysctl_net_core.c
++++ b/net/core/sysctl_net_core.c
+@@@ -36,9 -36,94 +36,60 @@@ static int net_msg_warn;	/* Unused, bu
+  int sysctl_fb_tunnels_only_for_init_net __read_mostly = 0;
+  EXPORT_SYMBOL(sysctl_fb_tunnels_only_for_init_net);
+  
+ -/* 0 - Keep current behavior:
+ - *     IPv4: inherit all current settings from init_net
+ - *     IPv6: reset all settings to default
+ - * 1 - Both inherit all current settings from init_net
+ - * 2 - Both reset all settings to default
+ - * 3 - Both inherit all settings from current netns
+ - */
+ -int sysctl_devconf_inherit_init_net __read_mostly;
+ -EXPORT_SYMBOL(sysctl_devconf_inherit_init_net);
+ -
+ -#if IS_ENABLED(CONFIG_NET_FLOW_LIMIT) || IS_ENABLED(CONFIG_RPS)
+ -static void dump_cpumask(void *buffer, size_t *lenp, loff_t *ppos,
+ -			 struct cpumask *mask)
+ -{
+ -	char kbuf[128];
+ -	int len;
+ -
+ -	if (*ppos || !*lenp) {
+ -		*lenp = 0;
+ -		return;
+ -	}
+ -
+ -	len = min(sizeof(kbuf) - 1, *lenp);
+ -	len = scnprintf(kbuf, len, "%*pb", cpumask_pr_args(mask));
+ -	if (!len) {
+ -		*lenp = 0;
+ -		return;
+ -	}
+ -
+ -	if (len < *lenp)
+ -		kbuf[len++] = '\n';
+ -	memcpy(buffer, kbuf, len);
+ -	*lenp = len;
+ -	*ppos += len;
+ -}
+ -#endif
+ -
+  #ifdef CONFIG_RPS
+++<<<<<<< HEAD
+++=======
++ 
++ static struct cpumask *rps_default_mask_cow_alloc(struct net *net)
++ {
++ 	struct cpumask *rps_default_mask;
++ 
++ 	if (net->core.rps_default_mask)
++ 		return net->core.rps_default_mask;
++ 
++ 	rps_default_mask = kzalloc(cpumask_size(), GFP_KERNEL);
++ 	if (!rps_default_mask)
++ 		return NULL;
++ 
++ 	/* pairs with READ_ONCE in rx_queue_default_mask() */
++ 	WRITE_ONCE(net->core.rps_default_mask, rps_default_mask);
++ 	return rps_default_mask;
++ }
++ 
++ static int rps_default_mask_sysctl(struct ctl_table *table, int write,
++ 				   void *buffer, size_t *lenp, loff_t *ppos)
++ {
++ 	struct net *net = (struct net *)table->data;
++ 	int err = 0;
++ 
++ 	rtnl_lock();
++ 	if (write) {
++ 		struct cpumask *rps_default_mask = rps_default_mask_cow_alloc(net);
++ 
++ 		err = -ENOMEM;
++ 		if (!rps_default_mask)
++ 			goto done;
++ 
++ 		err = cpumask_parse(buffer, rps_default_mask);
++ 		if (err)
++ 			goto done;
++ 
++ 		err = rps_cpumask_housekeeping(rps_default_mask);
++ 		if (err)
++ 			goto done;
++ 	} else {
++ 		dump_cpumask(buffer, lenp, ppos,
++ 			     net->core.rps_default_mask ? : cpu_none_mask);
++ 	}
++ 
++ done:
++ 	rtnl_unlock();
++ 	return err;
++ }
++ 
+++>>>>>>> 50bcfe8df7c7 (net: make default_rps_mask a per netns attribute)
+  static int rps_sock_flow_sysctl(struct ctl_table *table, int write,
+ -				void *buffer, size_t *lenp, loff_t *ppos)
+ +				void __user *buffer, size_t *lenp, loff_t *ppos)
+  {
+  	unsigned int orig_size, size;
+  	int ret, i;
+diff --git a/include/net/netns/core.h b/include/net/netns/core.h
+index 00760e4efed7..22cf0d093da4 100644
+--- a/include/net/netns/core.h
++++ b/include/net/netns/core.h
+@@ -4,6 +4,7 @@
+ 
+ struct ctl_table_header;
+ struct prot_inuse;
++struct cpumask;
+ 
+ struct netns_core {
+ 	/* core sysctls */
+@@ -16,6 +17,10 @@ struct netns_core {
+ 	int __percpu *sock_inuse;
+ 	struct prot_inuse __percpu *prot_inuse;
+ #endif
++
++#if IS_ENABLED(CONFIG_RPS) && IS_ENABLED(CONFIG_SYSCTL)
++	struct cpumask *rps_default_mask;
++#endif
+ };
+ 
+ #endif
+* Unmerged path net/core/net-sysfs.c
+* Unmerged path net/core/sysctl_net_core.c
