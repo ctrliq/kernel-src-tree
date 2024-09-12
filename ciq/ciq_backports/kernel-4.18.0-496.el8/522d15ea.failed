@@ -1,0 +1,269 @@
+net/sched: taprio: only pass gate mask per TXQ for igc, stmmac, tsnep, am65_cpsw
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit 522d15ea831f88717084304f105b1d195104880e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/522d15ea.failed
+
+There are 2 classes of in-tree drivers currently:
+
+- those who act upon struct tc_taprio_sched_entry :: gate_mask as if it
+  holds a bit mask of TXQs
+
+- those who act upon the gate_mask as if it holds a bit mask of TCs
+
+When it comes to the standard, IEEE 802.1Q-2018 does say this in the
+second paragraph of section 8.6.8.4 Enhancements for scheduled traffic:
+
+| A gate control list associated with each Port contains an ordered list
+| of gate operations. Each gate operation changes the transmission gate
+| state for the gate associated with each of the Port's traffic class
+| queues and allows associated control operations to be scheduled.
+
+In typically obtuse language, it refers to a "traffic class queue"
+rather than a "traffic class" or a "queue". But careful reading of
+802.1Q clarifies that "traffic class" and "queue" are in fact
+synonymous (see 8.6.6 Queuing frames):
+
+| A queue in this context is not necessarily a single FIFO data structure.
+| A queue is a record of all frames of a given traffic class awaiting
+| transmission on a given Bridge Port. The structure of this record is not
+| specified.
+
+i.o.w. their definition of "queue" isn't the Linux TX queue.
+
+The gate_mask really is input into taprio via its UAPI as a mask of
+traffic classes, but taprio_sched_to_offload() converts it into a TXQ
+mask.
+
+The breakdown of drivers which handle TC_SETUP_QDISC_TAPRIO is:
+
+- hellcreek, felix, sja1105: these are DSA switches, it's not even very
+  clear what TXQs correspond to, other than purely software constructs.
+  Only the mqprio configuration with 8 TCs and 1 TXQ per TC makes sense.
+  So it's fine to convert these to a gate mask per TC.
+
+- enetc: I have the hardware and can confirm that the gate mask is per
+  TC, and affects all TXQs (BD rings) configured for that priority.
+
+- igc: in igc_save_qbv_schedule(), the gate_mask is clearly interpreted
+  to be per-TXQ.
+
+- tsnep: Gerhard Engleder clarifies that even though this hardware
+  supports at most 1 TXQ per TC, the TXQ indices may be different from
+  the TC values themselves, and it is the TXQ indices that matter to
+  this hardware. So keep it per-TXQ as well.
+
+- stmmac: I have a GMAC datasheet, and in the EST section it does
+  specify that the gate events are per TXQ rather than per TC.
+
+- lan966x: again, this is a switch, and while not a DSA one, the way in
+  which it implements lan966x_mqprio_add() - by only allowing num_tc ==
+  NUM_PRIO_QUEUES (8) - makes it clear to me that TXQs are a purely
+  software construct here as well. They seem to map 1:1 with TCs.
+
+- am65_cpsw: from looking at am65_cpsw_est_set_sched_cmds(), I get the
+  impression that the fetch_allow variable is treated like a prio_mask.
+  This definitely sounds closer to a per-TC gate mask rather than a
+  per-TXQ one, and TI documentation does seem to recomment an identity
+  mapping between TCs and TXQs. However, Roger Quadros would like to do
+  some testing before making changes, so I'm leaving this driver to
+  operate as it did before, for now. Link with more details at the end.
+
+Based on this breakdown, we have 5 drivers with a gate mask per TC and
+4 with a gate mask per TXQ. So let's make the gate mask per TXQ the
+opt-in and the gate mask per TC the default.
+
+Benefit from the TC_QUERY_CAPS feature that Jakub suggested we add, and
+query the device driver before calling the proper ndo_setup_tc(), and
+figure out if it expects one or the other format.
+
+Link: https://patchwork.kernel.org/project/netdevbpf/patch/20230202003621.2679603-15-vladimir.oltean@nxp.com/#25193204
+	Cc: Horatiu Vultur <horatiu.vultur@microchip.com>
+	Cc: Siddharth Vadapalli <s-vadapalli@ti.com>
+	Cc: Roger Quadros <rogerq@kernel.org>
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Acked-by: Kurt Kanzenbach <kurt@linutronix.de> # hellcreek
+	Reviewed-by: Gerhard Engleder <gerhard@engleder-embedded.com>
+	Reviewed-by: Simon Horman <simon.horman@corigine.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 522d15ea831f88717084304f105b1d195104880e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/engleder/tsnep_tc.c
+#	drivers/net/ethernet/ti/am65-cpsw-qos.c
+* Unmerged path drivers/net/ethernet/engleder/tsnep_tc.c
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-qos.c
+* Unmerged path drivers/net/ethernet/engleder/tsnep_tc.c
+diff --git a/drivers/net/ethernet/intel/igc/igc_main.c b/drivers/net/ethernet/intel/igc/igc_main.c
+index bcd50428b1cf..b7caf5c7ba7e 100644
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@ -6015,12 +6015,35 @@ static int igc_tsn_enable_cbs(struct igc_adapter *adapter,
+ 	return igc_tsn_offload_apply(adapter);
+ }
+ 
++static int igc_tc_query_caps(struct igc_adapter *adapter,
++			     struct tc_query_caps_base *base)
++{
++	struct igc_hw *hw = &adapter->hw;
++
++	switch (base->type) {
++	case TC_SETUP_QDISC_TAPRIO: {
++		struct tc_taprio_caps *caps = base->caps;
++
++		if (hw->mac.type != igc_i225)
++			return -EOPNOTSUPP;
++
++		caps->gate_mask_per_txq = true;
++
++		return 0;
++	}
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ static int igc_setup_tc(struct net_device *dev, enum tc_setup_type type,
+ 			void *type_data)
+ {
+ 	struct igc_adapter *adapter = netdev_priv(dev);
+ 
+ 	switch (type) {
++	case TC_QUERY_CAPS:
++		return igc_tc_query_caps(adapter, type_data);
+ 	case TC_SETUP_QDISC_TAPRIO:
+ 		return igc_tsn_enable_qbv_scheduling(adapter, type_data);
+ 
+diff --git a/drivers/net/ethernet/stmicro/stmmac/hwif.h b/drivers/net/ethernet/stmicro/stmmac/hwif.h
+index f01c3ffd40f1..641e6460057c 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/hwif.h
++++ b/drivers/net/ethernet/stmicro/stmmac/hwif.h
+@@ -567,6 +567,7 @@ struct tc_cbs_qopt_offload;
+ struct flow_cls_offload;
+ struct tc_taprio_qopt_offload;
+ struct tc_etf_qopt_offload;
++struct tc_query_caps_base;
+ 
+ struct stmmac_tc_ops {
+ 	int (*init)(struct stmmac_priv *priv);
+@@ -580,6 +581,8 @@ struct stmmac_tc_ops {
+ 			    struct tc_taprio_qopt_offload *qopt);
+ 	int (*setup_etf)(struct stmmac_priv *priv,
+ 			 struct tc_etf_qopt_offload *qopt);
++	int (*query_caps)(struct stmmac_priv *priv,
++			  struct tc_query_caps_base *base);
+ };
+ 
+ #define stmmac_tc_init(__priv, __args...) \
+@@ -594,6 +597,8 @@ struct stmmac_tc_ops {
+ 	stmmac_do_callback(__priv, tc, setup_taprio, __args)
+ #define stmmac_tc_setup_etf(__priv, __args...) \
+ 	stmmac_do_callback(__priv, tc, setup_etf, __args)
++#define stmmac_tc_query_caps(__priv, __args...) \
++	stmmac_do_callback(__priv, tc, query_caps, __args)
+ 
+ struct stmmac_counters;
+ 
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 22162a806df9..c2d3f5d4a04c 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -4852,6 +4852,8 @@ static int stmmac_setup_tc(struct net_device *ndev, enum tc_setup_type type,
+ 	struct stmmac_priv *priv = netdev_priv(ndev);
+ 
+ 	switch (type) {
++	case TC_QUERY_CAPS:
++		return stmmac_tc_query_caps(priv, priv, type_data);
+ 	case TC_SETUP_BLOCK:
+ 		return flow_block_cb_setup_simple(type_data,
+ 						  &stmmac_block_cb_list,
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c
+index 9b47ff4872e5..8784577fad8a 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c
+@@ -1110,6 +1110,25 @@ static int tc_setup_etf(struct stmmac_priv *priv,
+ 	return 0;
+ }
+ 
++static int tc_query_caps(struct stmmac_priv *priv,
++			 struct tc_query_caps_base *base)
++{
++	switch (base->type) {
++	case TC_SETUP_QDISC_TAPRIO: {
++		struct tc_taprio_caps *caps = base->caps;
++
++		if (!priv->dma_cap.estsel)
++			return -EOPNOTSUPP;
++
++		caps->gate_mask_per_txq = true;
++
++		return 0;
++	}
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ const struct stmmac_tc_ops dwmac510_tc_ops = {
+ 	.init = tc_init,
+ 	.setup_cls_u32 = tc_setup_cls_u32,
+@@ -1117,4 +1136,5 @@ const struct stmmac_tc_ops dwmac510_tc_ops = {
+ 	.setup_cls = tc_setup_cls,
+ 	.setup_taprio = tc_setup_taprio,
+ 	.setup_etf = tc_setup_etf,
++	.query_caps = tc_query_caps,
+ };
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-qos.c
+diff --git a/include/net/pkt_sched.h b/include/net/pkt_sched.h
+index b7fb1013ef01..1be17fbcfb41 100644
+--- a/include/net/pkt_sched.h
++++ b/include/net/pkt_sched.h
+@@ -157,6 +157,7 @@ struct tc_etf_qopt_offload {
+ 
+ struct tc_taprio_caps {
+ 	bool supports_queue_max_sdu:1;
++	bool gate_mask_per_txq:1;
+ };
+ 
+ struct tc_taprio_sched_entry {
+diff --git a/net/sched/sch_taprio.c b/net/sched/sch_taprio.c
+index 198402ce9d2c..cfa4c896a717 100644
+--- a/net/sched/sch_taprio.c
++++ b/net/sched/sch_taprio.c
+@@ -1201,7 +1201,8 @@ static u32 tc_map_to_queue_mask(struct net_device *dev, u32 tc_mask)
+ 
+ static void taprio_sched_to_offload(struct net_device *dev,
+ 				    struct sched_gate_list *sched,
+-				    struct tc_taprio_qopt_offload *offload)
++				    struct tc_taprio_qopt_offload *offload,
++				    const struct tc_taprio_caps *caps)
+ {
+ 	struct sched_entry *entry;
+ 	int i = 0;
+@@ -1215,7 +1216,11 @@ static void taprio_sched_to_offload(struct net_device *dev,
+ 
+ 		e->command = entry->command;
+ 		e->interval = entry->interval;
+-		e->gate_mask = tc_map_to_queue_mask(dev, entry->gate_mask);
++		if (caps->gate_mask_per_txq)
++			e->gate_mask = tc_map_to_queue_mask(dev,
++							    entry->gate_mask);
++		else
++			e->gate_mask = entry->gate_mask;
+ 
+ 		i++;
+ 	}
+@@ -1260,7 +1265,7 @@ static int taprio_enable_offload(struct net_device *dev,
+ 	}
+ 	offload->enable = 1;
+ 	mqprio_qopt_reconstruct(dev, &offload->mqprio.qopt);
+-	taprio_sched_to_offload(dev, sched, offload);
++	taprio_sched_to_offload(dev, sched, offload, &caps);
+ 
+ 	for (tc = 0; tc < TC_MAX_QUEUE; tc++)
+ 		offload->max_sdu[tc] = q->max_sdu[tc];
