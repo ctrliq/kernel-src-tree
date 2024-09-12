@@ -1,0 +1,305 @@
+net/mlx5: Lag, Add single RDMA device in multiport mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-508.el8
+commit-author Mark Bloch <mbloch@nvidia.com>
+commit 27f9e0ccb6da0857a323c1d19a23b6666ddefe05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-508.el8/27f9e0cc.failed
+
+In MultiPort E-Switch mode a single RDMA is created. This device has multiple
+RDMA ports that represent the uplink ports that are connected to the E-Switch.
+Account for this when creating the RDMA device so it has an additional port for
+the non native uplink.
+
+As a side effect of this patch, use shared fdb in multiport eswitch mode.
+
+	Signed-off-by: Mark Bloch <mbloch@nvidia.com>
+	Reviewed-by: Roi Dayan <roid@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 27f9e0ccb6da0857a323c1d19a23b6666ddefe05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/lag/mpesw.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/lag/mpesw.c
+index 3799f89ed1a6,0c0ef600f643..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lag/mpesw.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lag/mpesw.c
+@@@ -5,31 -5,112 +5,66 @@@
+  #include <net/nexthop.h>
+  #include "lag/lag.h"
+  #include "eswitch.h"
+ -#include "esw/acl/ofld.h"
+  #include "lib/mlx5.h"
+  
+ -static void mlx5_mpesw_metadata_cleanup(struct mlx5_lag *ldev)
+ -{
+ -	struct mlx5_core_dev *dev;
+ -	struct mlx5_eswitch *esw;
+ -	u32 pf_metadata;
+ -	int i;
+ -
+ -	for (i = 0; i < ldev->ports; i++) {
+ -		dev = ldev->pf[i].dev;
+ -		esw = dev->priv.eswitch;
+ -		pf_metadata = ldev->lag_mpesw.pf_metadata[i];
+ -		if (!pf_metadata)
+ -			continue;
+ -		mlx5_esw_acl_ingress_vport_metadata_update(esw, MLX5_VPORT_UPLINK, 0);
+ -		mlx5_notifier_call_chain(dev->priv.events, MLX5_DEV_EVENT_MULTIPORT_ESW,
+ -					 (void *)0);
+ -		mlx5_esw_match_metadata_free(esw, pf_metadata);
+ -		ldev->lag_mpesw.pf_metadata[i] = 0;
+ -	}
+ -}
+ -
+ -static int mlx5_mpesw_metadata_set(struct mlx5_lag *ldev)
+ -{
+ -	struct mlx5_core_dev *dev;
+ -	struct mlx5_eswitch *esw;
+ -	u32 pf_metadata;
+ -	int i, err;
+ -
+ -	for (i = 0; i < ldev->ports; i++) {
+ -		dev = ldev->pf[i].dev;
+ -		esw = dev->priv.eswitch;
+ -		pf_metadata = mlx5_esw_match_metadata_alloc(esw);
+ -		if (!pf_metadata) {
+ -			err = -ENOSPC;
+ -			goto err_metadata;
+ -		}
+ -
+ -		ldev->lag_mpesw.pf_metadata[i] = pf_metadata;
+ -		err = mlx5_esw_acl_ingress_vport_metadata_update(esw, MLX5_VPORT_UPLINK,
+ -								 pf_metadata);
+ -		if (err)
+ -			goto err_metadata;
+ -	}
+ -
+ -	for (i = 0; i < ldev->ports; i++) {
+ -		dev = ldev->pf[i].dev;
+ -		mlx5_notifier_call_chain(dev->priv.events, MLX5_DEV_EVENT_MULTIPORT_ESW,
+ -					 (void *)0);
+ -	}
+ -
+ -	return 0;
+ -
+ -err_metadata:
+ -	mlx5_mpesw_metadata_cleanup(ldev);
+ -	return err;
+ -}
+ -
+ -static int enable_mpesw(struct mlx5_lag *ldev)
+ +static int add_mpesw_rule(struct mlx5_lag *ldev)
+  {
+- 	struct mlx5_core_dev *dev = ldev->pf[MLX5_LAG_P1].dev;
++ 	struct mlx5_core_dev *dev0 = ldev->pf[MLX5_LAG_P1].dev;
++ 	struct mlx5_core_dev *dev1 = ldev->pf[MLX5_LAG_P2].dev;
+  	int err;
+  
+ -	if (ldev->mode != MLX5_LAG_MODE_NONE)
+ -		return -EINVAL;
+ +	if (atomic_add_return(1, &ldev->lag_mpesw.mpesw_rule_count) != 1)
+ +		return 0;
+  
+++<<<<<<< HEAD
+ +	if (ldev->mode != MLX5_LAG_MODE_NONE) {
+ +		err = -EINVAL;
+ +		goto out_err;
+ +	}
+++=======
++ 	if (mlx5_eswitch_mode(dev0) != MLX5_ESWITCH_OFFLOADS ||
++ 	    !MLX5_CAP_PORT_SELECTION(dev0, port_select_flow_table) ||
++ 	    !MLX5_CAP_GEN(dev0, create_lag_when_not_master_up) ||
++ 	    !mlx5_lag_check_prereq(ldev))
++ 		return -EOPNOTSUPP;
+  
+- 	err = mlx5_activate_lag(ldev, NULL, MLX5_LAG_MODE_MPESW, false);
++ 	err = mlx5_mpesw_metadata_set(ldev);
++ 	if (err)
++ 		return err;
+++>>>>>>> 27f9e0ccb6da (net/mlx5: Lag, Add single RDMA device in multiport mode)
++ 
++ 	mlx5_lag_remove_devices(ldev);
++ 
++ 	err = mlx5_activate_lag(ldev, NULL, MLX5_LAG_MODE_MPESW, true);
+  	if (err) {
+- 		mlx5_core_warn(dev, "Failed to create LAG in MPESW mode (%d)\n", err);
+- 		goto out_err;
++ 		mlx5_core_warn(dev0, "Failed to create LAG in MPESW mode (%d)\n", err);
++ 		goto err_add_devices;
+  	}
+  
++ 	dev0->priv.flags &= ~MLX5_PRIV_FLAGS_DISABLE_IB_ADEV;
++ 	mlx5_rescan_drivers_locked(dev0);
++ 	err = mlx5_eswitch_reload_reps(dev0->priv.eswitch);
++ 	if (!err)
++ 		err = mlx5_eswitch_reload_reps(dev1->priv.eswitch);
++ 	if (err)
++ 		goto err_rescan_drivers;
++ 
+  	return 0;
+  
+++<<<<<<< HEAD
+ +out_err:
+ +	atomic_dec(&ldev->lag_mpesw.mpesw_rule_count);
+++=======
++ err_rescan_drivers:
++ 	dev0->priv.flags |= MLX5_PRIV_FLAGS_DISABLE_IB_ADEV;
++ 	mlx5_rescan_drivers_locked(dev0);
++ 	mlx5_deactivate_lag(ldev);
++ err_add_devices:
++ 	mlx5_lag_add_devices(ldev);
++ 	mlx5_eswitch_reload_reps(dev0->priv.eswitch);
++ 	mlx5_eswitch_reload_reps(dev1->priv.eswitch);
++ 	mlx5_mpesw_metadata_cleanup(ldev);
+++>>>>>>> 27f9e0ccb6da (net/mlx5: Lag, Add single RDMA device in multiport mode)
+  	return err;
+  }
+  
+@@@ -45,13 -127,20 +80,18 @@@ static void mlx5_mpesw_work(struct work
+  	struct mlx5_mpesw_work_st *mpesww = container_of(work, struct mlx5_mpesw_work_st, work);
+  	struct mlx5_lag *ldev = mpesww->lag;
+  
++ 	mlx5_dev_list_lock();
+  	mutex_lock(&ldev->lock);
+ -	if (ldev->mode_changes_in_progress) {
+ -		mpesww->result = -EAGAIN;
+ -		goto unlock;
+ -	}
+ -
+  	if (mpesww->op == MLX5_MPESW_OP_ENABLE)
+ -		mpesww->result = enable_mpesw(ldev);
+ +		mpesww->result = add_mpesw_rule(ldev);
+  	else if (mpesww->op == MLX5_MPESW_OP_DISABLE)
+ -		disable_mpesw(ldev);
+ -unlock:
+ +		del_mpesw_rule(ldev);
+  	mutex_unlock(&ldev->lock);
+++<<<<<<< HEAD
+ +
+++=======
++ 	mlx5_dev_list_unlock();
+++>>>>>>> 27f9e0ccb6da (net/mlx5: Lag, Add single RDMA device in multiport mode)
+  	complete(&mpesww->comp);
+  }
+  
+@@@ -118,13 -207,4 +158,17 @@@ bool mlx5_lag_mpesw_is_activated(struc
+  
+  	return ldev && ldev->mode == MLX5_LAG_MODE_MPESW;
+  }
+++<<<<<<< HEAD
+ +
+ +void mlx5_lag_mpesw_init(struct mlx5_lag *ldev)
+ +{
+ +	atomic_set(&ldev->lag_mpesw.mpesw_rule_count, 0);
+ +}
+ +
+ +void mlx5_lag_mpesw_cleanup(struct mlx5_lag *ldev)
+ +{
+ +	WARN_ON(atomic_read(&ldev->lag_mpesw.mpesw_rule_count));
+ +}
+++=======
++ EXPORT_SYMBOL(mlx5_lag_is_mpesw);
+++>>>>>>> 27f9e0ccb6da (net/mlx5: Lag, Add single RDMA device in multiport mode)
+diff --git a/drivers/infiniband/hw/mlx5/ib_rep.c b/drivers/infiniband/hw/mlx5/ib_rep.c
+index 52821485371a..ddcfc116b19a 100644
+--- a/drivers/infiniband/hw/mlx5/ib_rep.c
++++ b/drivers/infiniband/hw/mlx5/ib_rep.c
+@@ -37,6 +37,7 @@ mlx5_ib_vport_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+ 	const struct mlx5_ib_profile *profile;
+ 	struct mlx5_core_dev *peer_dev;
+ 	struct mlx5_ib_dev *ibdev;
++	int second_uplink = false;
+ 	u32 peer_num_ports;
+ 	int vport_index;
+ 	int ret;
+@@ -47,17 +48,24 @@ mlx5_ib_vport_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+ 		peer_dev = mlx5_lag_get_peer_mdev(dev);
+ 		peer_num_ports = mlx5_eswitch_get_total_vports(peer_dev);
+ 		if (mlx5_lag_is_master(dev)) {
+-			/* Only 1 ib port is the representor for both uplinks */
+-			num_ports += peer_num_ports - 1;
++			if (mlx5_lag_is_mpesw(dev))
++				num_ports += peer_num_ports;
++			else
++				num_ports += peer_num_ports - 1;
++
+ 		} else {
+-			if (rep->vport == MLX5_VPORT_UPLINK)
+-				return 0;
++			if (rep->vport == MLX5_VPORT_UPLINK) {
++				if (!mlx5_lag_is_mpesw(dev))
++					return 0;
++				second_uplink = true;
++			}
++
+ 			vport_index += peer_num_ports;
+ 			dev = peer_dev;
+ 		}
+ 	}
+ 
+-	if (rep->vport == MLX5_VPORT_UPLINK)
++	if (rep->vport == MLX5_VPORT_UPLINK && !second_uplink)
+ 		profile = &raw_eth_profile;
+ 	else
+ 		return mlx5_ib_set_vport_rep(dev, rep, vport_index);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.c b/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.c
+index dbf218cac535..aa218344a9b1 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.c
+@@ -646,7 +646,7 @@ int mlx5_activate_lag(struct mlx5_lag *ldev,
+ 	return 0;
+ }
+ 
+-static int mlx5_deactivate_lag(struct mlx5_lag *ldev)
++int mlx5_deactivate_lag(struct mlx5_lag *ldev)
+ {
+ 	struct mlx5_core_dev *dev0 = ldev->pf[MLX5_LAG_P1].dev;
+ 	struct mlx5_core_dev *dev1 = ldev->pf[MLX5_LAG_P2].dev;
+@@ -723,7 +723,7 @@ static bool mlx5_lag_check_prereq(struct mlx5_lag *ldev)
+ 	return true;
+ }
+ 
+-static void mlx5_lag_add_devices(struct mlx5_lag *ldev)
++void mlx5_lag_add_devices(struct mlx5_lag *ldev)
+ {
+ 	int i;
+ 
+@@ -740,7 +740,7 @@ static void mlx5_lag_add_devices(struct mlx5_lag *ldev)
+ 	}
+ }
+ 
+-static void mlx5_lag_remove_devices(struct mlx5_lag *ldev)
++void mlx5_lag_remove_devices(struct mlx5_lag *ldev)
+ {
+ 	int i;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.h b/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.h
+index 66013bef9939..127a42db8fe9 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lag/lag.h
+@@ -119,5 +119,8 @@ void mlx5_infer_tx_enabled(struct lag_tracker *tracker, u8 num_ports,
+ void mlx5_ldev_add_debugfs(struct mlx5_core_dev *dev);
+ void mlx5_ldev_remove_debugfs(struct dentry *dbg);
+ void mlx5_disable_lag(struct mlx5_lag *ldev);
++void mlx5_lag_remove_devices(struct mlx5_lag *ldev);
++int mlx5_deactivate_lag(struct mlx5_lag *ldev);
++void mlx5_lag_add_devices(struct mlx5_lag *ldev);
+ 
+ #endif /* __MLX5_LAG_H__ */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/lag/mpesw.c
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 8036ef5e42fe..2c92d9089538 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -1166,6 +1166,7 @@ bool mlx5_lag_is_active(struct mlx5_core_dev *dev);
+ bool mlx5_lag_mode_is_hash(struct mlx5_core_dev *dev);
+ bool mlx5_lag_is_master(struct mlx5_core_dev *dev);
+ bool mlx5_lag_is_shared_fdb(struct mlx5_core_dev *dev);
++bool mlx5_lag_is_mpesw(struct mlx5_core_dev *dev);
+ struct net_device *mlx5_lag_get_roce_netdev(struct mlx5_core_dev *dev);
+ u8 mlx5_lag_get_slave_port(struct mlx5_core_dev *dev,
+ 			   struct net_device *slave);
