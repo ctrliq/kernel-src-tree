@@ -1,0 +1,249 @@
+x86/paravirt: Add new features for paravirt patching
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Juergen Gross <jgross@suse.com>
+commit 4e6292114c741221479046515b1aa8145cf1e3f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/4e629211.failed
+
+For being able to switch paravirt patching from special cased custom
+code sequences to ALTERNATIVE handling some X86_FEATURE_* are needed
+as new features. This enables to have the standard indirect pv call
+as the default code and to patch that with the non-Xen custom code
+sequence via ALTERNATIVE patching later.
+
+Make sure paravirt patching is performed before alternatives patching.
+
+	Signed-off-by: Juergen Gross <jgross@suse.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20210311142319.4723-9-jgross@suse.com
+(cherry picked from commit 4e6292114c741221479046515b1aa8145cf1e3f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/paravirt.h
+#	arch/x86/kernel/paravirt-spinlocks.c
+diff --cc arch/x86/include/asm/paravirt.h
+index e9f118dae8cc,def450f46097..000000000000
+--- a/arch/x86/include/asm/paravirt.h
++++ b/arch/x86/include/asm/paravirt.h
+@@@ -15,11 -15,92 +15,94 @@@
+  #include <linux/bug.h>
+  #include <linux/types.h>
+  #include <linux/cpumask.h>
+ -#include <linux/static_call_types.h>
+  #include <asm/frame.h>
+  
+++<<<<<<< HEAD
+++=======
++ u64 dummy_steal_clock(int cpu);
++ u64 dummy_sched_clock(void);
++ 
++ DECLARE_STATIC_CALL(pv_steal_clock, dummy_steal_clock);
++ DECLARE_STATIC_CALL(pv_sched_clock, dummy_sched_clock);
++ 
++ void paravirt_set_sched_clock(u64 (*func)(void));
++ 
++ static inline u64 paravirt_sched_clock(void)
++ {
++ 	return static_call(pv_sched_clock)();
++ }
++ 
++ struct static_key;
++ extern struct static_key paravirt_steal_enabled;
++ extern struct static_key paravirt_steal_rq_enabled;
++ 
++ __visible void __native_queued_spin_unlock(struct qspinlock *lock);
++ bool pv_is_native_spin_unlock(void);
++ __visible bool __native_vcpu_is_preempted(long cpu);
++ bool pv_is_native_vcpu_is_preempted(void);
++ 
++ static inline u64 paravirt_steal_clock(int cpu)
++ {
++ 	return static_call(pv_steal_clock)(cpu);
++ }
++ 
++ #ifdef CONFIG_PARAVIRT_SPINLOCKS
++ void __init paravirt_set_cap(void);
++ #endif
++ 
++ /* The paravirtualized I/O functions */
++ static inline void slow_down_io(void)
++ {
++ 	pv_ops.cpu.io_delay();
++ #ifdef REALLY_SLOW_IO
++ 	pv_ops.cpu.io_delay();
++ 	pv_ops.cpu.io_delay();
++ 	pv_ops.cpu.io_delay();
++ #endif
++ }
++ 
++ void native_flush_tlb_local(void);
++ void native_flush_tlb_global(void);
++ void native_flush_tlb_one_user(unsigned long addr);
++ void native_flush_tlb_others(const struct cpumask *cpumask,
++ 			     const struct flush_tlb_info *info);
++ 
++ static inline void __flush_tlb_local(void)
++ {
++ 	PVOP_VCALL0(mmu.flush_tlb_user);
++ }
++ 
++ static inline void __flush_tlb_global(void)
++ {
++ 	PVOP_VCALL0(mmu.flush_tlb_kernel);
++ }
++ 
++ static inline void __flush_tlb_one_user(unsigned long addr)
++ {
++ 	PVOP_VCALL1(mmu.flush_tlb_one_user, addr);
++ }
++ 
++ static inline void __flush_tlb_others(const struct cpumask *cpumask,
++ 				      const struct flush_tlb_info *info)
++ {
++ 	PVOP_VCALL2(mmu.flush_tlb_others, cpumask, info);
++ }
++ 
++ static inline void paravirt_tlb_remove_table(struct mmu_gather *tlb, void *table)
++ {
++ 	PVOP_VCALL2(mmu.tlb_remove_table, tlb, table);
++ }
++ 
++ static inline void paravirt_arch_exit_mmap(struct mm_struct *mm)
++ {
++ 	PVOP_VCALL1(mmu.exit_mmap, mm);
++ }
++ 
++ #ifdef CONFIG_PARAVIRT_XXL
+++>>>>>>> 4e6292114c74 (x86/paravirt: Add new features for paravirt patching)
+  static inline void load_sp0(unsigned long sp0)
+  {
+ -	PVOP_VCALL1(cpu.load_sp0, sp0);
+ +	PVOP_VCALL1(pv_cpu_ops.load_sp0, sp0);
+  }
+  
+  /* The paravirtualized CPUID instruction. */
+@@@ -975,6 -811,13 +1058,16 @@@ static inline void paravirt_arch_dup_mm
+  static inline void paravirt_arch_exit_mmap(struct mm_struct *mm)
+  {
+  }
+++<<<<<<< HEAD
+++=======
++ #endif
++ 
++ #ifndef CONFIG_PARAVIRT_SPINLOCKS
++ static inline void paravirt_set_cap(void)
++ {
++ }
++ #endif
+++>>>>>>> 4e6292114c74 (x86/paravirt: Add new features for paravirt patching)
+  #endif /* __ASSEMBLY__ */
+ +#endif /* !CONFIG_PARAVIRT */
+  #endif /* _ASM_X86_PARAVIRT_H */
+diff --cc arch/x86/kernel/paravirt-spinlocks.c
+index 71f2d1125ec0,9e1ea99ad9df..000000000000
+--- a/arch/x86/kernel/paravirt-spinlocks.c
++++ b/arch/x86/kernel/paravirt-spinlocks.c
+@@@ -33,13 -33,11 +33,24 @@@ bool pv_is_native_vcpu_is_preempted(voi
+  		__raw_callee_save___native_vcpu_is_preempted;
+  }
+  
+++<<<<<<< HEAD
+ +struct pv_lock_ops pv_lock_ops = {
+ +#ifdef CONFIG_SMP
+ +	.queued_spin_lock_slowpath = native_queued_spin_lock_slowpath,
+ +	.queued_spin_unlock = PV_CALLEE_SAVE(__native_queued_spin_unlock),
+ +	.wait = paravirt_nop,
+ +	.kick = paravirt_nop,
+ +	.vcpu_is_preempted = PV_CALLEE_SAVE(__native_vcpu_is_preempted),
+ +#endif /* SMP */
+ +};
+ +EXPORT_SYMBOL(pv_lock_ops);
+++=======
++ void __init paravirt_set_cap(void)
++ {
++ 	if (!pv_is_native_spin_unlock())
++ 		setup_force_cpu_cap(X86_FEATURE_PVUNLOCK);
++ 
++ 	if (!pv_is_native_vcpu_is_preempted())
++ 		setup_force_cpu_cap(X86_FEATURE_VCPUPREEMPT);
++ }
+++>>>>>>> 4e6292114c74 (x86/paravirt: Add new features for paravirt patching)
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index 36dab779a163..5ac789f773d3 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -235,6 +235,8 @@
+ #define X86_FEATURE_EPT_AD		( 8*32+17) /* Intel Extended Page Table access-dirty bit */
+ #define X86_FEATURE_VMCALL		( 8*32+18) /* "" Hypervisor supports the VMCALL instruction */
+ #define X86_FEATURE_VMW_VMMCALL		( 8*32+19) /* "" VMware prefers VMMCALL hypercall instruction */
++#define X86_FEATURE_PVUNLOCK		( 8*32+20) /* "" PV unlock function */
++#define X86_FEATURE_VCPUPREEMPT		( 8*32+21) /* "" PV vcpu_is_preempted function */
+ 
+ /* Intel-defined CPU features, CPUID level 0x00000007:0 (EBX), word 9 */
+ #define X86_FEATURE_FSGSBASE		( 9*32+ 0) /* RDFSBASE, WRFSBASE, RDGSBASE, WRGSBASE instructions*/
+* Unmerged path arch/x86/include/asm/paravirt.h
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 4fce58044a3f..a27ee7bc4807 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -25,6 +25,7 @@
+ #include <asm/insn.h>
+ #include <asm/io.h>
+ #include <asm/fixmap.h>
++#include <asm/paravirt.h>
+ 
+ int __read_mostly alternatives_patched;
+ 
+@@ -630,6 +631,33 @@ void __init alternative_instructions(void)
+ 	 * patching.
+ 	 */
+ 
++	/*
++	 * Paravirt patching and alternative patching can be combined to
++	 * replace a function call with a short direct code sequence (e.g.
++	 * by setting a constant return value instead of doing that in an
++	 * external function).
++	 * In order to make this work the following sequence is required:
++	 * 1. set (artificial) features depending on used paravirt
++	 *    functions which can later influence alternative patching
++	 * 2. apply paravirt patching (generally replacing an indirect
++	 *    function call with a direct one)
++	 * 3. apply alternative patching (e.g. replacing a direct function
++	 *    call with a custom code sequence)
++	 * Doing paravirt patching after alternative patching would clobber
++	 * the optimization of the custom code with a function call again.
++	 */
++	paravirt_set_cap();
++
++	/*
++	 * First patch paravirt functions, such that we overwrite the indirect
++	 * call with the direct call.
++	 */
++	apply_paravirt(__parainstructions, __parainstructions_end);
++
++	/*
++	 * Then patch alternatives, such that those paravirt calls that are in
++	 * alternatives can be overwritten by their immediate fragments.
++	 */
+ 	apply_alternatives(__alt_instructions, __alt_instructions_end);
+ 
+ #ifdef CONFIG_SMP
+@@ -647,8 +675,6 @@ void __init alternative_instructions(void)
+ 				(unsigned long)__smp_locks_end);
+ #endif
+ 
+-	apply_paravirt(__parainstructions, __parainstructions_end);
+-
+ 	restart_nmi();
+ 	alternatives_patched = 1;
+ }
+* Unmerged path arch/x86/kernel/paravirt-spinlocks.c
