@@ -1,0 +1,239 @@
+ice: Reject pin requests with unsupported flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-427.33.1.el9_4
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit be2a9d12e6dad894b27361c06ea3752d67a45b49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.33.1.el9_4/be2a9d12.failed
+
+The driver receives requests for configuring pins via the .enable
+callback of the PTP clock object. These requests come into the driver
+with flags which modify the requested behavior from userspace. Current
+implementation in ice does not reject flags that it doesn't support.
+This causes the driver to incorrectly apply requests with such flags as
+PTP_PEROUT_DUTY_CYCLE, or any future flags added by the kernel which it
+is not yet aware of.
+
+Fix this by properly validating flags in both ice_ptp_cfg_perout and
+ice_ptp_cfg_extts. Ensure that we check by bit-wise negating supported
+flags rather than just checking and rejecting known un-supported flags.
+This is preferable, as it ensures better compatibility with future
+kernels.
+
+Fixes: 172db5f91d5f ("ice: add support for auxiliary input/output pins")
+	Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Signed-off-by: Karol Kolacinski <karol.kolacinski@intel.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+	Tested-by: Pucha Himasekhar Reddy <himasekharx.reddy.pucha@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Link: https://patch.msgid.link/20240702171459.2606611-4-anthony.l.nguyen@intel.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit be2a9d12e6dad894b27361c06ea3752d67a45b49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_ptp.c
+diff --cc drivers/net/ethernet/intel/ice/ice_ptp.c
+index 7cbb64940487,fefaf52fd677..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@@ -1465,21 -1588,27 +1465,42 @@@ void ice_ptp_extts_event(struct ice_pf 
+  /**
+   * ice_ptp_cfg_extts - Configure EXTTS pin and channel
+   * @pf: Board private structure
+ + * @ena: true to enable; false to disable
+   * @chan: GPIO channel (0-3)
+++<<<<<<< HEAD
+ + * @gpio_pin: GPIO pin
+ + * @extts_flags: request flags from the ptp_extts_request.flags
+ + */
+ +static int
+ +ice_ptp_cfg_extts(struct ice_pf *pf, bool ena, unsigned int chan, u32 gpio_pin,
+ +		  unsigned int extts_flags)
+++=======
++  * @config: desired EXTTS configuration.
++  * @store: If set to true, the values will be stored
++  *
++  * Configure an external timestamp event on the requested channel.
++  *
++  * Return: 0 on success, -EOPNOTUSPP on unsupported flags
++  */
++ static int ice_ptp_cfg_extts(struct ice_pf *pf, unsigned int chan,
++ 			     struct ice_extts_channel *config, bool store)
+++>>>>>>> be2a9d12e6da (ice: Reject pin requests with unsupported flags)
+  {
+  	u32 func, aux_reg, gpio_reg, irq_reg;
+  	struct ice_hw *hw = &pf->hw;
+  	u8 tmr_idx;
+  
+++<<<<<<< HEAD
+ +	if (chan > (unsigned int)pf->ptp.info.n_ext_ts)
+ +		return -EINVAL;
+++=======
++ 	/* Reject requests with unsupported flags */
++ 	if (config->flags & ~(PTP_ENABLE_FEATURE |
++ 			      PTP_RISING_EDGE |
++ 			      PTP_FALLING_EDGE |
++ 			      PTP_STRICT_FLAGS))
++ 		return -EOPNOTSUPP;
+++>>>>>>> be2a9d12e6da (ice: Reject pin requests with unsupported flags)
+  
+  	tmr_idx = hw->func_caps.ts_func_info.tmr_index_owned;
+  
+@@@ -1518,11 -1646,51 +1539,55 @@@
+  
+  	wr32(hw, PFINT_OICR_ENA, irq_reg);
+  	wr32(hw, GLTSYN_AUX_IN(chan, tmr_idx), aux_reg);
+ -	wr32(hw, GLGEN_GPIO_CTL(config->gpio_pin), gpio_reg);
+ +	wr32(hw, GLGEN_GPIO_CTL(gpio_pin), gpio_reg);
+  
+++<<<<<<< HEAD
+++	return 0;
+++=======
++ 	if (store)
++ 		memcpy(&pf->ptp.extts_channels[chan], config, sizeof(*config));
++ 
+  	return 0;
+  }
+  
++ /**
++  * ice_ptp_disable_all_extts - Disable all EXTTS channels
++  * @pf: Board private structure
++  */
++ static void ice_ptp_disable_all_extts(struct ice_pf *pf)
++ {
++ 	struct ice_extts_channel extts_cfg = {};
++ 	int i;
++ 
++ 	for (i = 0; i < pf->ptp.info.n_ext_ts; i++) {
++ 		if (pf->ptp.extts_channels[i].ena) {
++ 			extts_cfg.gpio_pin = pf->ptp.extts_channels[i].gpio_pin;
++ 			extts_cfg.ena = false;
++ 			ice_ptp_cfg_extts(pf, i, &extts_cfg, false);
++ 		}
++ 	}
++ 
++ 	synchronize_irq(pf->oicr_irq.virq);
++ }
++ 
++ /**
++  * ice_ptp_enable_all_extts - Enable all EXTTS channels
++  * @pf: Board private structure
++  *
++  * Called during reset to restore user configuration.
++  */
++ static void ice_ptp_enable_all_extts(struct ice_pf *pf)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < pf->ptp.info.n_ext_ts; i++) {
++ 		if (pf->ptp.extts_channels[i].ena)
++ 			ice_ptp_cfg_extts(pf, i, &pf->ptp.extts_channels[i],
++ 					  false);
++ 	}
+++>>>>>>> be2a9d12e6da (ice: Reject pin requests with unsupported flags)
++ }
++ 
+  /**
+   * ice_ptp_cfg_clkout - Configure clock to generate periodic wave
+   * @pf: Board private structure
+@@@ -1713,9 -1886,12 +1781,14 @@@ ice_ptp_gpio_enable_e810(struct ptp_clo
+  				       rq->perout.start.nsec);
+  		clk_cfg.ena = !!on;
+  
+++<<<<<<< HEAD
+ +		err = ice_ptp_cfg_clkout(pf, chan, &clk_cfg, true);
+ +		break;
+++=======
++ 		return ice_ptp_cfg_clkout(pf, chan, &clk_cfg, true);
++ 	}
+++>>>>>>> be2a9d12e6da (ice: Reject pin requests with unsupported flags)
+  	case PTP_CLK_REQ_EXTTS:
+ -	{
+ -		struct ice_extts_channel extts_cfg = {};
+ -
+  		chan = rq->extts.index;
+  		if (sma_pres) {
+  			if (chan < ice_pin_desc_e810t[SMA2].chan)
+@@@ -1731,9 -1907,12 +1804,18 @@@
+  			gpio_pin = chan;
+  		}
+  
+++<<<<<<< HEAD
+ +		err = ice_ptp_cfg_extts(pf, !!on, chan, gpio_pin,
+ +					rq->extts.flags);
+ +		break;
+++=======
++ 		extts_cfg.flags = rq->extts.flags;
++ 		extts_cfg.gpio_pin = gpio_pin;
++ 		extts_cfg.ena = !!on;
++ 
++ 		return ice_ptp_cfg_extts(pf, chan, &extts_cfg, true);
++ 	}
+++>>>>>>> be2a9d12e6da (ice: Reject pin requests with unsupported flags)
+  	default:
+  		return -EOPNOTSUPP;
+  	}
+@@@ -1751,21 -1928,29 +1831,46 @@@ static int ice_ptp_gpio_enable_e823(str
+  				    struct ptp_clock_request *rq, int on)
+  {
+  	struct ice_pf *pf = ptp_info_to_pf(info);
+++<<<<<<< HEAD
+ +	struct ice_perout_channel clk_cfg = {0};
+ +	int err;
+ +
+ +	switch (rq->type) {
+ +	case PTP_CLK_REQ_PPS:
+++=======
++ 
++ 	switch (rq->type) {
++ 	case PTP_CLK_REQ_PPS:
++ 	{
++ 		struct ice_perout_channel clk_cfg = {};
++ 
++ 		clk_cfg.flags = rq->perout.flags;
+++>>>>>>> be2a9d12e6da (ice: Reject pin requests with unsupported flags)
+  		clk_cfg.gpio_pin = PPS_PIN_INDEX;
+  		clk_cfg.period = NSEC_PER_SEC;
+  		clk_cfg.ena = !!on;
+  
+++<<<<<<< HEAD
+ +		err = ice_ptp_cfg_clkout(pf, PPS_CLK_GEN_CHAN, &clk_cfg, true);
+ +		break;
+ +	case PTP_CLK_REQ_EXTTS:
+ +		err = ice_ptp_cfg_extts(pf, !!on, rq->extts.index,
+ +					TIME_SYNC_PIN_INDEX, rq->extts.flags);
+ +		break;
+++=======
++ 		return ice_ptp_cfg_clkout(pf, PPS_CLK_GEN_CHAN, &clk_cfg, true);
++ 	}
++ 	case PTP_CLK_REQ_EXTTS:
++ 	{
++ 		struct ice_extts_channel extts_cfg = {};
++ 
++ 		extts_cfg.flags = rq->extts.flags;
++ 		extts_cfg.gpio_pin = TIME_SYNC_PIN_INDEX;
++ 		extts_cfg.ena = !!on;
++ 
++ 		return ice_ptp_cfg_extts(pf, rq->extts.index, &extts_cfg, true);
++ 	}
+++>>>>>>> be2a9d12e6da (ice: Reject pin requests with unsupported flags)
+  	default:
+  		return -EOPNOTSUPP;
+  	}
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp.h b/drivers/net/ethernet/intel/ice/ice_ptp.h
+index 7012808e4497..39893bfb0044 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.h
+@@ -29,6 +29,7 @@ enum ice_ptp_pin_e810t {
+ struct ice_perout_channel {
+ 	bool ena;
+ 	u32 gpio_pin;
++	u32 flags;
+ 	u64 period;
+ 	u64 start_time;
+ };
