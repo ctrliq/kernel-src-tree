@@ -1,0 +1,174 @@
+x86/sev: Check the VMPL level
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Brijesh Singh <brijesh.singh@amd.com>
+commit 81cc3df9a90e7817494421ecc48ede6bd5e8132b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/81cc3df9.failed
+
+The Virtual Machine Privilege Level (VMPL) feature in the SEV-SNP
+architecture allows a guest VM to divide its address space into four
+levels. The level can be used to provide hardware isolated abstraction
+layers within a VM. VMPL0 is the highest privilege level, and VMPL3 is
+the least privilege level. Certain operations must be done by the VMPL0
+software, such as:
+
+* Validate or invalidate memory range (PVALIDATE instruction)
+* Allocate VMSA page (RMPADJUST instruction when VMSA=1)
+
+The initial SNP support requires that the guest kernel is running at
+VMPL0. Add such a check to verify the guest is running at level 0 before
+continuing the boot. There is no easy method to query the current VMPL
+level, so use the RMPADJUST instruction to determine whether the guest
+is running at the VMPL0.
+
+  [ bp: Massage commit message. ]
+
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20220307213356.2797205-15-brijesh.singh@amd.com
+(cherry picked from commit 81cc3df9a90e7817494421ecc48ede6bd5e8132b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/sev.c
+diff --cc arch/x86/boot/compressed/sev.c
+index 213b126ba7e3,eb421787d50a..000000000000
+--- a/arch/x86/boot/compressed/sev.c
++++ b/arch/x86/boot/compressed/sev.c
+@@@ -202,3 -198,76 +202,79 @@@ finish
+  	else if (result != ES_RETRY)
+  		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_GEN_REQ);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void enforce_vmpl0(void)
++ {
++ 	u64 attrs;
++ 	int err;
++ 
++ 	/*
++ 	 * RMPADJUST modifies RMP permissions of a lesser-privileged (numerically
++ 	 * higher) privilege level. Here, clear the VMPL1 permission mask of the
++ 	 * GHCB page. If the guest is not running at VMPL0, this will fail.
++ 	 *
++ 	 * If the guest is running at VMPL0, it will succeed. Even if that operation
++ 	 * modifies permission bits, it is still ok to do so currently because Linux
++ 	 * SNP guests are supported only on VMPL0 so VMPL1 or higher permission masks
++ 	 * changing is a don't-care.
++ 	 */
++ 	attrs = 1;
++ 	if (rmpadjust((unsigned long)&boot_ghcb_page, RMP_PG_SIZE_4K, attrs))
++ 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_NOT_VMPL0);
++ }
++ 
++ void sev_enable(struct boot_params *bp)
++ {
++ 	unsigned int eax, ebx, ecx, edx;
++ 	struct msr m;
++ 
++ 	/* Check for the SME/SEV support leaf */
++ 	eax = 0x80000000;
++ 	ecx = 0;
++ 	native_cpuid(&eax, &ebx, &ecx, &edx);
++ 	if (eax < 0x8000001f)
++ 		return;
++ 
++ 	/*
++ 	 * Check for the SME/SEV feature:
++ 	 *   CPUID Fn8000_001F[EAX]
++ 	 *   - Bit 0 - Secure Memory Encryption support
++ 	 *   - Bit 1 - Secure Encrypted Virtualization support
++ 	 *   CPUID Fn8000_001F[EBX]
++ 	 *   - Bits 5:0 - Pagetable bit position used to indicate encryption
++ 	 */
++ 	eax = 0x8000001f;
++ 	ecx = 0;
++ 	native_cpuid(&eax, &ebx, &ecx, &edx);
++ 	/* Check whether SEV is supported */
++ 	if (!(eax & BIT(1)))
++ 		return;
++ 
++ 	/* Set the SME mask if this is an SEV guest. */
++ 	boot_rdmsr(MSR_AMD64_SEV, &m);
++ 	sev_status = m.q;
++ 	if (!(sev_status & MSR_AMD64_SEV_ENABLED))
++ 		return;
++ 
++ 	/* Negotiate the GHCB protocol version. */
++ 	if (sev_status & MSR_AMD64_SEV_ES_ENABLED) {
++ 		if (!sev_es_negotiate_protocol())
++ 			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_PROT_UNSUPPORTED);
++ 	}
++ 
++ 	/*
++ 	 * SNP is supported in v2 of the GHCB spec which mandates support for HV
++ 	 * features.
++ 	 */
++ 	if (sev_status & MSR_AMD64_SEV_SNP_ENABLED) {
++ 		if (!(get_hv_features() & GHCB_HV_FT_SNP))
++ 			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
++ 
++ 		enforce_vmpl0();
++ 	}
++ 
++ 	sme_me_mask = BIT_ULL(ebx & 0x3f);
++ }
+++>>>>>>> 81cc3df9a90e (x86/sev: Check the VMPL level)
+* Unmerged path arch/x86/boot/compressed/sev.c
+diff --git a/arch/x86/include/asm/sev-common.h b/arch/x86/include/asm/sev-common.h
+index 94f0ea574049..4a8b82dd0de8 100644
+--- a/arch/x86/include/asm/sev-common.h
++++ b/arch/x86/include/asm/sev-common.h
+@@ -83,6 +83,7 @@
+ #define GHCB_TERM_REGISTER		0	/* GHCB GPA registration failure */
+ #define GHCB_TERM_PSC			1	/* Page State Change failure */
+ #define GHCB_TERM_PVALIDATE		2	/* Pvalidate failure */
++#define GHCB_TERM_NOT_VMPL0		3	/* SNP guest is not running at VMPL-0 */
+ 
+ #define GHCB_RESP_CODE(v)		((v) & GHCB_MSR_INFO_MASK)
+ 
+diff --git a/arch/x86/include/asm/sev.h b/arch/x86/include/asm/sev.h
+index 45ba3d868cd3..2d2a2f77a9aa 100644
+--- a/arch/x86/include/asm/sev.h
++++ b/arch/x86/include/asm/sev.h
+@@ -63,6 +63,9 @@ extern bool handle_vc_boot_ghcb(struct pt_regs *regs);
+ /* Software defined (when rFlags.CF = 1) */
+ #define PVALIDATE_FAIL_NOUPDATE		255
+ 
++/* RMP page size */
++#define RMP_PG_SIZE_4K			0
++
+ #ifdef CONFIG_AMD_MEM_ENCRYPT
+ extern struct static_key_false sev_es_enable_key;
+ extern void __sev_es_ist_enter(struct pt_regs *regs);
+@@ -90,6 +93,18 @@ extern enum es_result sev_es_ghcb_hv_call(struct ghcb *ghcb,
+ 					  struct es_em_ctxt *ctxt,
+ 					  u64 exit_code, u64 exit_info_1,
+ 					  u64 exit_info_2);
++static inline int rmpadjust(unsigned long vaddr, bool rmp_psize, unsigned long attrs)
++{
++	int rc;
++
++	/* "rmpadjust" mnemonic support in binutils 2.36 and newer */
++	asm volatile(".byte 0xF3,0x0F,0x01,0xFE\n\t"
++		     : "=a"(rc)
++		     : "a"(vaddr), "c"(rmp_psize), "d"(attrs)
++		     : "memory", "cc");
++
++	return rc;
++}
+ static inline int pvalidate(unsigned long vaddr, bool rmp_psize, bool validate)
+ {
+ 	bool no_rmpupdate;
+@@ -114,6 +129,7 @@ static inline int sev_es_setup_ap_jump_table(struct real_mode_header *rmh) { ret
+ static inline void sev_es_nmi_complete(void) { }
+ static inline int sev_es_efi_map_ghcbs(pgd_t *pgd) { return 0; }
+ static inline int pvalidate(unsigned long vaddr, bool rmp_psize, bool validate) { return 0; }
++static inline int rmpadjust(unsigned long vaddr, bool rmp_psize, unsigned long attrs) { return 0; }
+ #endif
+ 
+ #endif
