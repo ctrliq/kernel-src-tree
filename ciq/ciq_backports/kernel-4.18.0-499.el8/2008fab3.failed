@@ -1,0 +1,273 @@
+KVM: x86: Inhibit APIC memslot if x2APIC and AVIC are enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-499.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 2008fab3453019fd89fa06029be95d30e1a8e66c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-499.el8/2008fab3.failed
+
+Free the APIC access page memslot if any vCPU enables x2APIC and SVM's
+AVIC is enabled to prevent accesses to the virtual APIC on vCPUs with
+x2APIC enabled.  On AMD, if its "hybrid" mode is enabled (AVIC is enabled
+when x2APIC is enabled even without x2AVIC support), keeping the APIC
+access page memslot results in the guest being able to access the virtual
+APIC page as x2APIC is fully emulated by KVM.  I.e. hardware isn't aware
+that the guest is operating in x2APIC mode.
+
+Exempt nested SVM's update of APICv state from the new logic as x2APIC
+can't be toggled on VM-Exit.  In practice, invoking the x2APIC logic
+should be harmless precisely because it should be a glorified nop, but
+play it safe to avoid latent bugs, e.g. with dropping the vCPU's SRCU
+lock.
+
+Intel doesn't suffer from the same issue as APICv has fully independent
+VMCS controls for xAPIC vs. x2APIC virtualization.  Technically, KVM
+should provide bus error semantics and not memory semantics for the APIC
+page when x2APIC is enabled, but KVM already provides memory semantics in
+other scenarios, e.g. if APICv/AVIC is enabled and the APIC is hardware
+disabled (via APIC_BASE MSR).
+
+Note, checking apic_access_memslot_enabled without taking locks relies
+it being set during vCPU creation (before kvm_vcpu_reset()).  vCPUs can
+race to set the inhibit and delete the memslot, i.e. can get false
+positives, but can't get false negatives as apic_access_memslot_enabled
+can't be toggled "on" once any vCPU reaches KVM_RUN.
+
+Opportunistically drop the "can" while updating avic_activate_vmcb()'s
+comment, i.e. to state that KVM _does_ support the hybrid mode.  Move
+the "Note:" down a line to conform to preferred kernel/KVM multi-line
+comment style.
+
+Opportunistically update the apicv_update_lock comment, as it isn't
+actually used to protect apic_access_memslot_enabled (which is protected
+by slots_lock).
+
+Fixes: 0e311d33bfbe ("KVM: SVM: Introduce hybrid-AVIC mode")
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+Message-Id: <20230106011306.85230-11-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 2008fab3453019fd89fa06029be95d30e1a8e66c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/avic.c
+#	arch/x86/kvm/svm/nested.c
+#	arch/x86/kvm/svm/svm.c
+diff --cc arch/x86/kvm/svm/avic.c
+index d59e6b7fc313,0a75993afed6..000000000000
+--- a/arch/x86/kvm/svm/avic.c
++++ b/arch/x86/kvm/svm/avic.c
+@@@ -81,7 -71,16 +81,20 @@@ static void avic_activate_vmcb(struct v
+  	vmcb->control.avic_physical_id &= ~AVIC_PHYSICAL_MAX_INDEX_MASK;
+  
+  	vmcb->control.int_ctl |= AVIC_ENABLE_MASK;
+++<<<<<<< HEAD
+ +	if (apic_x2apic_mode(svm->vcpu.arch.apic)) {
+++=======
++ 
++ 	/*
++ 	 * Note: KVM supports hybrid-AVIC mode, where KVM emulates x2APIC MSR
++ 	 * accesses, while interrupt injection to a running vCPU can be
++ 	 * achieved using AVIC doorbell.  KVM disables the APIC access page
++ 	 * (deletes the memslot) if any vCPU has x2APIC enabled, thus enabling
++ 	 * AVIC in hybrid mode activates only the doorbell mechanism.
++ 	 */
++ 	if (apic_x2apic_mode(svm->vcpu.arch.apic) &&
++ 	    avic_mode == AVIC_MODE_X2) {
+++>>>>>>> 2008fab34530 (KVM: x86: Inhibit APIC memslot if x2APIC and AVIC are enabled)
+  		vmcb->control.int_ctl |= X2APIC_MODE_MASK;
+  		vmcb->control.avic_physical_id |= X2AVIC_MAX_PHYSICAL_ID;
+  		/* Disabling MSR intercept for x2APIC registers */
+diff --cc arch/x86/kvm/svm/nested.c
+index 76ad2a7a3591,34ac03969f28..000000000000
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
+@@@ -1041,6 -1101,13 +1041,16 @@@ int nested_svm_vmexit(struct vcpu_svm *
+  	if (unlikely(vmcb01->save.rflags & X86_EFLAGS_TF))
+  		kvm_queue_exception(&(svm->vcpu), DB_VECTOR);
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Un-inhibit the AVIC right away, so that other vCPUs can start
++ 	 * to benefit from it right away.
++ 	 */
++ 	if (kvm_apicv_activated(vcpu->kvm))
++ 		__kvm_vcpu_update_apicv(vcpu);
++ 
+++>>>>>>> 2008fab34530 (KVM: x86: Inhibit APIC memslot if x2APIC and AVIC are enabled)
+  	return 0;
+  }
+  
+diff --cc arch/x86/kvm/svm/svm.c
+index 511235200d8c,7651d665723e..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -4950,6 -5027,9 +4950,12 @@@ static __init int svm_hardware_setup(vo
+  	if (!enable_apicv) {
+  		svm_x86_ops.vcpu_blocking = NULL;
+  		svm_x86_ops.vcpu_unblocking = NULL;
+++<<<<<<< HEAD
+++=======
++ 		svm_x86_ops.vcpu_get_apicv_inhibit_reasons = NULL;
++ 	} else if (avic_mode == AVIC_MODE_X1) {
++ 		svm_x86_ops.allow_apicv_in_x2apic_without_x2apic_virtualization = true;
+++>>>>>>> 2008fab34530 (KVM: x86: Inhibit APIC memslot if x2APIC and AVIC are enabled)
+  	}
+  
+  	if (vls) {
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 7a0e5b3aad7a..3497d3dc25e5 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1147,10 +1147,11 @@ struct kvm_arch {
+ 	struct kvm_apic_map __rcu *apic_map;
+ 	atomic_t apic_map_dirty;
+ 
+-	/* Protects apic_access_memslot_enabled and apicv_inhibit_reasons */
+-	struct rw_semaphore apicv_update_lock;
+-
+ 	bool apic_access_memslot_enabled;
++	bool apic_access_memslot_inhibited;
++
++	/* Protects apicv_inhibit_reasons */
++	struct rw_semaphore apicv_update_lock;
+ 	unsigned long apicv_inhibit_reasons;
+ 
+ 	gpa_t wall_clock;
+@@ -1467,6 +1468,7 @@ struct kvm_x86_ops {
+ 	void (*enable_irq_window)(struct kvm_vcpu *vcpu);
+ 	void (*update_cr8_intercept)(struct kvm_vcpu *vcpu, int tpr, int irr);
+ 	bool (*check_apicv_inhibit_reasons)(enum kvm_apicv_inhibit reason);
++	bool allow_apicv_in_x2apic_without_x2apic_virtualization;
+ 	void (*refresh_apicv_exec_ctrl)(struct kvm_vcpu *vcpu);
+ 	void (*hwapic_irr_update)(struct kvm_vcpu *vcpu, int max_irr);
+ 	void (*hwapic_isr_update)(struct kvm_vcpu *vcpu, int isr);
+@@ -1865,7 +1867,7 @@ gpa_t kvm_mmu_gva_to_gpa_system(struct kvm_vcpu *vcpu, gva_t gva,
+ 
+ bool kvm_apicv_activated(struct kvm *kvm);
+ bool kvm_vcpu_apicv_activated(struct kvm_vcpu *vcpu);
+-void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu);
++void __kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu);
+ void __kvm_set_or_clear_apicv_inhibit(struct kvm *kvm,
+ 				      enum kvm_apicv_inhibit reason, bool set);
+ void kvm_set_or_clear_apicv_inhibit(struct kvm *kvm,
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 089f143b7902..6dd40596aaad 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -2411,7 +2411,8 @@ int kvm_alloc_apic_access_page(struct kvm *kvm)
+ 	int ret = 0;
+ 
+ 	mutex_lock(&kvm->slots_lock);
+-	if (kvm->arch.apic_access_memslot_enabled)
++	if (kvm->arch.apic_access_memslot_enabled ||
++	    kvm->arch.apic_access_memslot_inhibited)
+ 		goto out;
+ 
+ 	hva = __x86_set_memory_region(kvm, APIC_ACCESS_PAGE_PRIVATE_MEMSLOT,
+@@ -2439,6 +2440,41 @@ int kvm_alloc_apic_access_page(struct kvm *kvm)
+ }
+ EXPORT_SYMBOL_GPL(kvm_alloc_apic_access_page);
+ 
++void kvm_inhibit_apic_access_page(struct kvm_vcpu *vcpu)
++{
++	struct kvm *kvm = vcpu->kvm;
++
++	if (!kvm->arch.apic_access_memslot_enabled)
++		return;
++
++	kvm_vcpu_srcu_read_unlock(vcpu);
++
++	mutex_lock(&kvm->slots_lock);
++
++	if (kvm->arch.apic_access_memslot_enabled) {
++		__x86_set_memory_region(kvm, APIC_ACCESS_PAGE_PRIVATE_MEMSLOT, 0, 0);
++		/*
++		 * Clear "enabled" after the memslot is deleted so that a
++		 * different vCPU doesn't get a false negative when checking
++		 * the flag out of slots_lock.  No additional memory barrier is
++		 * needed as modifying memslots requires waiting other vCPUs to
++		 * drop SRCU (see above), and false positives are ok as the
++		 * flag is rechecked after acquiring slots_lock.
++		 */
++		kvm->arch.apic_access_memslot_enabled = false;
++
++		/*
++		 * Mark the memslot as inhibited to prevent reallocating the
++		 * memslot during vCPU creation, e.g. if a vCPU is hotplugged.
++		 */
++		kvm->arch.apic_access_memslot_inhibited = true;
++	}
++
++	mutex_unlock(&kvm->slots_lock);
++
++	kvm_vcpu_srcu_read_lock(vcpu);
++}
++
+ void kvm_lapic_reset(struct kvm_vcpu *vcpu, bool init_event)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+diff --git a/arch/x86/kvm/lapic.h b/arch/x86/kvm/lapic.h
+index f0dda37ef2aa..54c84f84b4cb 100644
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -98,6 +98,7 @@ int kvm_apic_set_irq(struct kvm_vcpu *vcpu, struct kvm_lapic_irq *irq,
+ int kvm_apic_local_deliver(struct kvm_lapic *apic, int lvt_type);
+ void kvm_apic_update_apicv(struct kvm_vcpu *vcpu);
+ int kvm_alloc_apic_access_page(struct kvm *kvm);
++void kvm_inhibit_apic_access_page(struct kvm_vcpu *vcpu);
+ 
+ bool kvm_irq_delivery_to_apic_fast(struct kvm *kvm, struct kvm_lapic *src,
+ 		struct kvm_lapic_irq *irq, int *r, struct dest_map *dest_map);
+* Unmerged path arch/x86/kvm/svm/avic.c
+* Unmerged path arch/x86/kvm/svm/nested.c
+* Unmerged path arch/x86/kvm/svm/svm.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index d5c8a8210410..c7c81fe24e6a 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -9478,7 +9478,7 @@ void kvm_make_scan_ioapic_request(struct kvm *kvm)
+ 	kvm_make_all_cpus_request(kvm, KVM_REQ_SCAN_IOAPIC);
+ }
+ 
+-void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
++void __kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
+ {
+ 	bool activate;
+ 
+@@ -9512,7 +9512,30 @@ void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
+ 	preempt_enable();
+ 	up_read(&vcpu->kvm->arch.apicv_update_lock);
+ }
+-EXPORT_SYMBOL_GPL(kvm_vcpu_update_apicv);
++EXPORT_SYMBOL_GPL(__kvm_vcpu_update_apicv);
++
++static void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
++{
++	if (!lapic_in_kernel(vcpu))
++		return;
++
++	/*
++	 * Due to sharing page tables across vCPUs, the xAPIC memslot must be
++	 * deleted if any vCPU has xAPIC virtualization and x2APIC enabled, but
++	 * and hardware doesn't support x2APIC virtualization.  E.g. some AMD
++	 * CPUs support AVIC but not x2APIC.  KVM still allows enabling AVIC in
++	 * this case so that KVM can the AVIC doorbell to inject interrupts to
++	 * running vCPUs, but KVM must not create SPTEs for the APIC base as
++	 * the vCPU would incorrectly be able to access the vAPIC page via MMIO
++	 * despite being in x2APIC mode.  For simplicity, inhibiting the APIC
++	 * access page is sticky.
++	 */
++	if (apic_x2apic_mode(vcpu->arch.apic) &&
++	    kvm_x86_ops.allow_apicv_in_x2apic_without_x2apic_virtualization)
++		kvm_inhibit_apic_access_page(vcpu);
++
++	__kvm_vcpu_update_apicv(vcpu);
++}
+ 
+ void __kvm_set_or_clear_apicv_inhibit(struct kvm *kvm,
+ 				      enum kvm_apicv_inhibit reason, bool set)
