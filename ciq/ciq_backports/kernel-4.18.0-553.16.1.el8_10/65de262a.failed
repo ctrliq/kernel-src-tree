@@ -1,0 +1,354 @@
+cifs: fix missed refcounting of ipc tcon
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Paulo Alcantara <pc@cjr.nz>
+commit 65de262a209da0951eb9bc60b3b7faf3bbffa38a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/65de262a.failed
+
+Fix missed refcounting of IPC tcon used for getting domain-based DFS
+root referrals.  We want to keep it alive as long as mount is active
+and can be refreshed.  For standalone DFS root referrals it wouldn't
+be a problem as the client ends up having an IPC tcon for both mount
+and cache.
+
+Fixes: c88f7dcd6d64 ("cifs: support nested dfs links over reconnect")
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@cjr.nz>
+	Reviewed-by: Enzo Matsumiya <ematsumiya@suse.de>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 65de262a209da0951eb9bc60b3b7faf3bbffa38a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+diff --cc fs/cifs/connect.c
+index 38c049c01496,90f38fb9baa0..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -3542,117 -3365,215 +3542,284 @@@ int cifs_mount(struct cifs_sb_info *cif
+  	 * to respond with PATH_NOT_COVERED to requests that include the prefix.
+  	 */
+  	if ((cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_DFS) ||
+ -	    dfs_cache_find(mnt_ctx->xid, mnt_ctx->ses, cifs_sb->local_nls, cifs_remap(cifs_sb),
+ -			   ctx->UNC + 1, NULL, root_tl)) {
+ +	    dfs_cache_find(xid, ses, cifs_sb->local_nls, cifs_remap(cifs_sb), ctx->UNC + 1, NULL,
+ +			   NULL)) {
+  		if (rc)
+ -			return rc;
+ +			goto error;
+  		/* Check if it is fully accessible and then mount it */
+ -		rc = is_path_remote(mnt_ctx);
+ +		rc = is_path_remote(cifs_sb, ctx, xid, server, tcon);
+  		if (!rc)
+ -			*isdfs = false;
+ -		else if (rc != -EREMOTE)
+ -			return rc;
+ -	}
+ -	return 0;
+ -}
+ -
+ -static int connect_dfs_target(struct mount_ctx *mnt_ctx, const char *full_path,
+ -			      const char *ref_path, struct dfs_cache_tgt_iterator *tit)
+ -{
+ -	int rc;
+ -	struct dfs_info3_param ref = {};
+ -	struct cifs_sb_info *cifs_sb = mnt_ctx->cifs_sb;
+ -	char *oldmnt = cifs_sb->ctx->mount_options;
+ -
+ -	rc = dfs_cache_get_tgt_referral(ref_path, tit, &ref);
+ -	if (rc)
+ -		goto out;
+ -
+ -	rc = expand_dfs_referral(mnt_ctx, full_path, &ref);
+ -	if (rc)
+ -		goto out;
+ -
+ -	/* Connect to new target only if we were redirected (e.g. mount options changed) */
+ -	if (oldmnt != cifs_sb->ctx->mount_options) {
+ -		mount_put_conns(mnt_ctx);
+ -		rc = mount_get_dfs_conns(mnt_ctx);
+ -	}
+ -	if (!rc) {
+ -		if (cifs_is_referral_server(mnt_ctx->tcon, &ref))
+ -			set_root_ses(mnt_ctx);
+ -		rc = dfs_cache_update_tgthint(mnt_ctx->xid, mnt_ctx->root_ses, cifs_sb->local_nls,
+ -					      cifs_remap(cifs_sb), ref_path, tit);
+ +			goto out;
+ +		if (rc != -EREMOTE)
+ +			goto error;
+  	}
+  
+++<<<<<<< HEAD
+ +	mount_put_conns(cifs_sb, xid, server, ses, tcon);
+++=======
++ out:
++ 	free_dfs_info_param(&ref);
++ 	return rc;
++ }
++ 
++ static int connect_dfs_root(struct mount_ctx *mnt_ctx, struct dfs_cache_tgt_list *root_tl)
++ {
++ 	int rc;
++ 	char *full_path;
++ 	struct cifs_sb_info *cifs_sb = mnt_ctx->cifs_sb;
++ 	struct smb3_fs_context *ctx = mnt_ctx->fs_ctx;
++ 	struct dfs_cache_tgt_iterator *tit;
++ 
++ 	/* Put initial connections as they might be shared with other mounts.  We need unique dfs
++ 	 * connections per mount to properly failover, so mount_get_dfs_conns() must be used from
++ 	 * now on.
++ 	 */
++ 	mount_put_conns(mnt_ctx);
++ 	mount_get_dfs_conns(mnt_ctx);
++ 	set_root_ses(mnt_ctx);
++ 
++ 	full_path = build_unc_path_to_root(ctx, cifs_sb, true);
++ 	if (IS_ERR(full_path))
++ 		return PTR_ERR(full_path);
++ 
++ 	mnt_ctx->origin_fullpath = dfs_cache_canonical_path(ctx->UNC, cifs_sb->local_nls,
++ 							    cifs_remap(cifs_sb));
++ 	if (IS_ERR(mnt_ctx->origin_fullpath)) {
++ 		rc = PTR_ERR(mnt_ctx->origin_fullpath);
++ 		mnt_ctx->origin_fullpath = NULL;
++ 		goto out;
++ 	}
++ 
++ 	/* Try all dfs root targets */
++ 	for (rc = -ENOENT, tit = dfs_cache_get_tgt_iterator(root_tl);
++ 	     tit; tit = dfs_cache_get_next_tgt(root_tl, tit)) {
++ 		rc = connect_dfs_target(mnt_ctx, full_path, mnt_ctx->origin_fullpath + 1, tit);
++ 		if (!rc) {
++ 			mnt_ctx->leaf_fullpath = kstrdup(mnt_ctx->origin_fullpath, GFP_KERNEL);
++ 			if (!mnt_ctx->leaf_fullpath)
++ 				rc = -ENOMEM;
++ 			break;
++ 		}
++ 	}
++ 
++ out:
++ 	kfree(full_path);
++ 	return rc;
++ }
++ 
++ static int __follow_dfs_link(struct mount_ctx *mnt_ctx)
++ {
++ 	int rc;
++ 	struct cifs_sb_info *cifs_sb = mnt_ctx->cifs_sb;
++ 	struct smb3_fs_context *ctx = mnt_ctx->fs_ctx;
++ 	char *full_path;
++ 	struct dfs_cache_tgt_list tl = DFS_CACHE_TGT_LIST_INIT(tl);
++ 	struct dfs_cache_tgt_iterator *tit;
++ 
++ 	full_path = build_unc_path_to_root(ctx, cifs_sb, true);
++ 	if (IS_ERR(full_path))
++ 		return PTR_ERR(full_path);
++ 
++ 	kfree(mnt_ctx->leaf_fullpath);
++ 	mnt_ctx->leaf_fullpath = dfs_cache_canonical_path(full_path, cifs_sb->local_nls,
++ 							  cifs_remap(cifs_sb));
++ 	if (IS_ERR(mnt_ctx->leaf_fullpath)) {
++ 		rc = PTR_ERR(mnt_ctx->leaf_fullpath);
++ 		mnt_ctx->leaf_fullpath = NULL;
++ 		goto out;
++ 	}
++ 
++ 	/* Get referral from dfs link */
++ 	rc = dfs_cache_find(mnt_ctx->xid, mnt_ctx->root_ses, cifs_sb->local_nls,
++ 			    cifs_remap(cifs_sb), mnt_ctx->leaf_fullpath + 1, NULL, &tl);
++ 	if (rc)
++ 		goto out;
++ 
++ 	/* Try all dfs link targets */
++ 	for (rc = -ENOENT, tit = dfs_cache_get_tgt_iterator(&tl);
++ 	     tit; tit = dfs_cache_get_next_tgt(&tl, tit)) {
++ 		rc = connect_dfs_target(mnt_ctx, full_path, mnt_ctx->leaf_fullpath + 1, tit);
++ 		if (!rc) {
++ 			rc = is_path_remote(mnt_ctx);
++ 			break;
++ 		}
++ 	}
++ 
++ out:
++ 	kfree(full_path);
++ 	dfs_cache_free_tgts(&tl);
++ 	return rc;
++ }
++ 
++ static int follow_dfs_link(struct mount_ctx *mnt_ctx)
++ {
++ 	int rc;
++ 	struct cifs_sb_info *cifs_sb = mnt_ctx->cifs_sb;
++ 	struct smb3_fs_context *ctx = mnt_ctx->fs_ctx;
++ 	char *full_path;
++ 	int num_links = 0;
++ 
++ 	full_path = build_unc_path_to_root(ctx, cifs_sb, true);
++ 	if (IS_ERR(full_path))
++ 		return PTR_ERR(full_path);
++ 
++ 	kfree(mnt_ctx->origin_fullpath);
++ 	mnt_ctx->origin_fullpath = dfs_cache_canonical_path(full_path, cifs_sb->local_nls,
++ 							    cifs_remap(cifs_sb));
++ 	kfree(full_path);
++ 
++ 	if (IS_ERR(mnt_ctx->origin_fullpath)) {
++ 		rc = PTR_ERR(mnt_ctx->origin_fullpath);
++ 		mnt_ctx->origin_fullpath = NULL;
++ 		return rc;
++ 	}
++ 
++ 	do {
++ 		rc = __follow_dfs_link(mnt_ctx);
++ 		if (!rc || rc != -EREMOTE)
++ 			break;
++ 	} while (rc = -ELOOP, ++num_links < MAX_NESTED_LINKS);
++ 
++ 	return rc;
++ }
++ 
++ /* Set up DFS referral paths for failover */
++ static void setup_server_referral_paths(struct mount_ctx *mnt_ctx)
++ {
++ 	struct TCP_Server_Info *server = mnt_ctx->server;
++ 
++ 	server->origin_fullpath = mnt_ctx->origin_fullpath;
++ 	server->leaf_fullpath = mnt_ctx->leaf_fullpath;
++ 	server->current_fullpath = mnt_ctx->leaf_fullpath;
++ 	mnt_ctx->origin_fullpath = mnt_ctx->leaf_fullpath = NULL;
++ }
++ 
++ int cifs_mount(struct cifs_sb_info *cifs_sb, struct smb3_fs_context *ctx)
++ {
++ 	int rc;
++ 	struct mount_ctx mnt_ctx = { .cifs_sb = cifs_sb, .fs_ctx = ctx, };
++ 	struct dfs_cache_tgt_list tl = DFS_CACHE_TGT_LIST_INIT(tl);
++ 	bool isdfs;
++ 
++ 	rc = is_dfs_mount(&mnt_ctx, &isdfs, &tl);
++ 	if (rc)
++ 		goto error;
++ 	if (!isdfs)
++ 		goto out;
++ 
++ 	uuid_gen(&mnt_ctx.mount_id);
++ 	rc = connect_dfs_root(&mnt_ctx, &tl);
++ 	dfs_cache_free_tgts(&tl);
++ 
++ 	if (rc)
++ 		goto error;
++ 
++ 	rc = is_path_remote(&mnt_ctx);
++ 	if (rc == -EREMOTE)
++ 		rc = follow_dfs_link(&mnt_ctx);
++ 	if (rc)
++ 		goto error;
++ 
++ 	setup_server_referral_paths(&mnt_ctx);
+++>>>>>>> 65de262a209d (cifs: fix missed refcounting of ipc tcon)
+ +	/*
+ +	 * Ignore error check here because we may failover to other targets from cached a
+ +	 * referral.
+ +	 */
+ +	(void)mount_get_dfs_conns(ctx, cifs_sb, &xid, &server, &ses, &tcon);
+ +
+ +	/* Get path of DFS root */
+ +	ref_path = build_unc_path_to_root(ctx, cifs_sb, false);
+ +	if (IS_ERR(ref_path)) {
+ +		rc = PTR_ERR(ref_path);
+ +		ref_path = NULL;
+ +		goto error;
+ +	}
+ +
+ +	uuid_gen(&mount_id);
+ +	set_root_ses(cifs_sb, &mount_id, ses, &root_ses);
+ +	do {
+ +		/* Save full path of last DFS path we used to resolve final target server */
+ +		kfree(full_path);
+ +		full_path = build_unc_path_to_root(ctx, cifs_sb, !!count);
+ +		if (IS_ERR(full_path)) {
+ +			rc = PTR_ERR(full_path);
+ +			full_path = NULL;
+ +			break;
+ +		}
+ +		/* Chase referral */
+ +		oldmnt = cifs_sb->ctx->mount_options;
+ +		rc = expand_dfs_referral(xid, root_ses, ctx, cifs_sb, ref_path + 1);
+ +		if (rc)
+ +			break;
+ +		/* Connect to new DFS target only if we were redirected */
+ +		if (oldmnt != cifs_sb->ctx->mount_options) {
+ +			mount_put_conns(cifs_sb, xid, server, ses, tcon);
+ +			rc = mount_get_dfs_conns(ctx, cifs_sb, &xid, &server, &ses, &tcon);
+ +		}
+ +		if (rc && !server && !ses) {
+ +			/* Failed to connect. Try to connect to other targets in the referral. */
+ +			rc = do_dfs_failover(ref_path + 1, full_path, cifs_sb, ctx, root_ses, &xid,
+ +					     &server, &ses, &tcon);
+ +		}
+ +		if (rc == -EACCES || rc == -EOPNOTSUPP || !server || !ses)
+ +			break;
+ +		if (!tcon)
+ +			continue;
+ +
+ +		/* Make sure that requests go through new root servers */
+ +		rc = is_referral_server(ref_path + 1, cifs_sb, tcon, &ref_server);
+ +		if (rc)
+ +			break;
+ +		if (ref_server)
+ +			set_root_ses(cifs_sb, &mount_id, ses, &root_ses);
+ +
+ +		/* Get next dfs path and then continue chasing them if -EREMOTE */
+ +		rc = next_dfs_prepath(cifs_sb, ctx, xid, server, tcon, &ref_path);
+ +		/* Prevent recursion on broken link referrals */
+ +		if (rc == -EREMOTE && ++count > MAX_NESTED_LINKS)
+ +			rc = -ELOOP;
+ +	} while (rc == -EREMOTE);
+ +
+ +	if (rc || !tcon) {
+ +		rc = rc ? rc : -ENOENT;
+ +		goto error;
+ +	}
+ +
+ +	kfree(ref_path);
+ +	/*
+ +	 * Store DFS full path in both superblock and tree connect structures.
+ +	 *
+ +	 * For DFS root mounts, the prefix path (cifs_sb->prepath) is preserved during reconnect so
+ +	 * only the root path is set in cifs_sb->origin_fullpath and tcon->dfs_path. And for DFS
+ +	 * links, the prefix path is included in both and may be changed during reconnect.  See
+ +	 * cifs_tree_connect().
+ +	 */
+ +	ref_path = dfs_cache_canonical_path(full_path, cifs_sb->local_nls, cifs_remap(cifs_sb));
+ +	kfree(full_path);
+ +	full_path = NULL;
+ +
+ +	if (IS_ERR(ref_path)) {
+ +		rc = PTR_ERR(ref_path);
+ +		ref_path = NULL;
+ +		goto error;
+ +	}
+ +	cifs_sb->origin_fullpath = ref_path;
+ +
+ +	ref_path = kstrdup(cifs_sb->origin_fullpath, GFP_KERNEL);
+ +	if (!ref_path) {
+ +		rc = -ENOMEM;
+ +		goto error;
+ +	}
+ +	spin_lock(&cifs_tcp_ses_lock);
+ +	tcon->dfs_path = ref_path;
+ +	ref_path = NULL;
+ +	spin_unlock(&cifs_tcp_ses_lock);
+ +
+  	/*
+ -	 * After reconnecting to a different server, unique ids won't match anymore, so we disable
+ -	 * serverino. This prevents dentry revalidation to think the dentry are stale (ESTALE).
+ +	 * After reconnecting to a different server, unique ids won't
+ +	 * match anymore, so we disable serverino. This prevents
+ +	 * dentry revalidation to think the dentry are stale (ESTALE).
+  	 */
+  	cifs_autodisable_serverino(cifs_sb);
+  	/*
+* Unmerged path fs/cifs/connect.c
