@@ -1,0 +1,568 @@
+x86/bhi: Add support for clearing branch history at syscall entry
+
+jira LE-1907
+cve CVE-2024-2201
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+commit 7390db8aea0d64e9deb28b8e1ce716f5020c7ee5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/7390db8a.failed
+
+Branch History Injection (BHI) attacks may allow a malicious application to
+influence indirect branch prediction in kernel by poisoning the branch
+history. eIBRS isolates indirect branch targets in ring0.  The BHB can
+still influence the choice of indirect branch predictor entry, and although
+branch predictor entries are isolated between modes when eIBRS is enabled,
+the BHB itself is not isolated between modes.
+
+Alder Lake and new processors supports a hardware control BHI_DIS_S to
+mitigate BHI.  For older processors Intel has released a software sequence
+to clear the branch history on parts that don't support BHI_DIS_S. Add
+support to execute the software sequence at syscall entry and VMexit to
+overwrite the branch history.
+
+For now, branch history is not cleared at interrupt entry, as malicious
+applications are not believed to have sufficient control over the
+registers, since previous register state is cleared at interrupt
+entry. Researchers continue to poke at this area and it may become
+necessary to clear at interrupt entry as well in the future.
+
+This mitigation is only defined here. It is enabled later.
+
+	Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Co-developed-by: Daniel Sneddon <daniel.sneddon@linux.intel.com>
+	Signed-off-by: Daniel Sneddon <daniel.sneddon@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Alexandre Chartre <alexandre.chartre@oracle.com>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@kernel.org>
+
+(cherry picked from commit 7390db8aea0d64e9deb28b8e1ce716f5020c7ee5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/common.c
+#	arch/x86/entry/entry_64.S
+#	arch/x86/entry/entry_64_compat.S
+#	arch/x86/include/asm/syscall.h
+diff --cc arch/x86/entry/common.c
+index e4c53879dd35,6de50b80702e..000000000000
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@@ -320,61 -150,183 +320,184 @@@ early_param("ia32_emulation", ia32_emul
+  #endif
+  
+  /*
+ - * Invoke a 32-bit syscall.  Called with IRQs on in CONTEXT_KERNEL.
+ + * Does a 32-bit syscall.  Called with IRQs on in CONTEXT_KERNEL.  Does
+ + * all entry and exit work and returns with IRQs off.  This function is
+ + * extremely hot in workloads that use it, and it's usually called from
+ + * do_fast_syscall_32, so forcibly inline it to improve performance.
+   */
+ -static __always_inline void do_syscall_32_irqs_on(struct pt_regs *regs, int nr)
+ +static __always_inline void do_syscall_32_irqs_on(struct pt_regs *regs)
+  {
+ -	/*
+ -	 * Convert negative numbers to very high and thus out of range
+ -	 * numbers for comparisons.
+ -	 */
+ -	unsigned int unr = nr;
+ -
+ -	if (likely(unr < IA32_NR_syscalls)) {
+ -		unr = array_index_nospec(unr, IA32_NR_syscalls);
+ -		regs->ax = ia32_sys_call(regs, unr);
+ -	} else if (nr != -1) {
+ -		regs->ax = __ia32_sys_ni_syscall(regs);
+ -	}
+ -}
+ +	struct thread_info *ti = current_thread_info();
+ +	unsigned int nr = (unsigned int)regs->orig_ax;
+  
+  #ifdef CONFIG_IA32_EMULATION
+ -static __always_inline bool int80_is_external(void)
+ -{
+ -	const unsigned int offs = (0x80 / 32) * 0x10;
+ -	const u32 bit = BIT(0x80 % 32);
+ +	ti->status |= TS_COMPAT;
+ +#endif
+  
+++<<<<<<< HEAD
+ +	if (READ_ONCE(ti->flags) & _TIF_WORK_SYSCALL_ENTRY) {
+++=======
++ 	/* The local APIC on XENPV guests is fake */
++ 	if (cpu_feature_enabled(X86_FEATURE_XENPV))
++ 		return false;
++ 
++ 	/*
++ 	 * If vector 0x80 is set in the APIC ISR then this is an external
++ 	 * interrupt. Either from broken hardware or injected by a VMM.
++ 	 *
++ 	 * Note: In guest mode this is only valid for secure guests where
++ 	 * the secure module fully controls the vAPIC exposed to the guest.
++ 	 */
++ 	return apic_read(APIC_ISR + offs) & bit;
++ }
++ 
++ /**
++  * do_int80_emulation - 32-bit legacy syscall C entry from asm
++  *
++  * This entry point can be used by 32-bit and 64-bit programs to perform
++  * 32-bit system calls.  Instances of INT $0x80 can be found inline in
++  * various programs and libraries.  It is also used by the vDSO's
++  * __kernel_vsyscall fallback for hardware that doesn't support a faster
++  * entry method.  Restarted 32-bit system calls also fall back to INT
++  * $0x80 regardless of what instruction was originally used to do the
++  * system call.
++  *
++  * This is considered a slow path.  It is not used by most libc
++  * implementations on modern hardware except during process startup.
++  *
++  * The arguments for the INT $0x80 based syscall are on stack in the
++  * pt_regs structure:
++  *   eax:				system call number
++  *   ebx, ecx, edx, esi, edi, ebp:	arg1 - arg 6
++  */
++ __visible noinstr void do_int80_emulation(struct pt_regs *regs)
++ {
++ 	int nr;
++ 
++ 	/* Kernel does not use INT $0x80! */
++ 	if (unlikely(!user_mode(regs))) {
++ 		irqentry_enter(regs);
++ 		instrumentation_begin();
++ 		panic("Unexpected external interrupt 0x80\n");
++ 	}
++ 
++ 	/*
++ 	 * Establish kernel context for instrumentation, including for
++ 	 * int80_is_external() below which calls into the APIC driver.
++ 	 * Identical for soft and external interrupts.
++ 	 */
++ 	enter_from_user_mode(regs);
++ 
++ 	instrumentation_begin();
++ 	add_random_kstack_offset();
++ 
++ 	/* Validate that this is a soft interrupt to the extent possible */
++ 	if (unlikely(int80_is_external()))
++ 		panic("Unexpected external interrupt 0x80\n");
++ 
++ 	/*
++ 	 * The low level idtentry code pushed -1 into regs::orig_ax
++ 	 * and regs::ax contains the syscall number.
++ 	 *
++ 	 * User tracing code (ptrace or signal handlers) might assume
++ 	 * that the regs::orig_ax contains a 32-bit number on invoking
++ 	 * a 32-bit syscall.
++ 	 *
++ 	 * Establish the syscall convention by saving the 32bit truncated
++ 	 * syscall number in regs::orig_ax and by invalidating regs::ax.
++ 	 */
++ 	regs->orig_ax = regs->ax & GENMASK(31, 0);
++ 	regs->ax = -ENOSYS;
++ 
++ 	nr = syscall_32_enter(regs);
++ 
++ 	local_irq_enable();
++ 	nr = syscall_enter_from_user_mode_work(regs, nr);
++ 	do_syscall_32_irqs_on(regs, nr);
++ 
++ 	instrumentation_end();
++ 	syscall_exit_to_user_mode(regs);
++ }
++ #else /* CONFIG_IA32_EMULATION */
++ 
++ /* Handles int $0x80 on a 32bit kernel */
++ __visible noinstr void do_int80_syscall_32(struct pt_regs *regs)
++ {
++ 	int nr = syscall_32_enter(regs);
++ 
++ 	add_random_kstack_offset();
++ 	/*
++ 	 * Subtlety here: if ptrace pokes something larger than 2^31-1 into
++ 	 * orig_ax, the int return value truncates it. This matches
++ 	 * the semantics of syscall_get_nr().
++ 	 */
++ 	nr = syscall_enter_from_user_mode(regs, nr);
++ 	instrumentation_begin();
++ 
++ 	do_syscall_32_irqs_on(regs, nr);
++ 
++ 	instrumentation_end();
++ 	syscall_exit_to_user_mode(regs);
++ }
++ #endif /* !CONFIG_IA32_EMULATION */
++ 
++ static noinstr bool __do_fast_syscall_32(struct pt_regs *regs)
++ {
++ 	int nr = syscall_32_enter(regs);
++ 	int res;
++ 
++ 	add_random_kstack_offset();
++ 	/*
++ 	 * This cannot use syscall_enter_from_user_mode() as it has to
++ 	 * fetch EBP before invoking any of the syscall entry work
++ 	 * functions.
++ 	 */
++ 	syscall_enter_from_user_mode_prepare(regs);
++ 
++ 	instrumentation_begin();
++ 	/* Fetch EBP from where the vDSO stashed it. */
++ 	if (IS_ENABLED(CONFIG_X86_64)) {
+++>>>>>>> 7390db8aea0d (x86/bhi: Add support for clearing branch history at syscall entry)
+  		/*
+ -		 * Micro-optimization: the pointer we're following is
+ -		 * explicitly 32 bits, so it can't be out of range.
+ +		 * Subtlety here: if ptrace pokes something larger than
+ +		 * 2^32-1 into orig_ax, this truncates it.  This may or
+ +		 * may not be necessary, but it matches the old asm
+ +		 * behavior.
+  		 */
+ -		res = __get_user(*(u32 *)&regs->bp,
+ -			 (u32 __user __force *)(unsigned long)(u32)regs->sp);
+ -	} else {
+ -		res = get_user(*(u32 *)&regs->bp,
+ -		       (u32 __user __force *)(unsigned long)(u32)regs->sp);
+ +		nr = syscall_trace_enter(regs);
+  	}
+  
+ -	if (res) {
+ -		/* User code screwed up. */
+ -		regs->ax = -EFAULT;
+ -
+ -		local_irq_disable();
+ -		instrumentation_end();
+ -		irqentry_exit_to_user_mode(regs);
+ -		return false;
+ +	if (likely(nr < IA32_NR_syscalls)) {
+ +		nr = array_index_nospec(nr, IA32_NR_syscalls);
+ +#ifdef CONFIG_IA32_EMULATION
+ +		regs->ax = ia32_sys_call_table[nr](regs);
+ +#else
+ +		/*
+ +		 * It's possible that a 32-bit syscall implementation
+ +		 * takes a 64-bit parameter but nonetheless assumes that
+ +		 * the high bits are zero.  Make sure we zero-extend all
+ +		 * of the args.
+ +		 */
+ +		regs->ax = ia32_sys_call_table[nr](
+ +			(unsigned int)regs->bx, (unsigned int)regs->cx,
+ +			(unsigned int)regs->dx, (unsigned int)regs->si,
+ +			(unsigned int)regs->di, (unsigned int)regs->bp);
+ +#endif /* CONFIG_IA32_EMULATION */
+  	}
+  
+ -	nr = syscall_enter_from_user_mode_work(regs, nr);
+ -
+ -	/* Now this is just like a normal syscall. */
+ -	do_syscall_32_irqs_on(regs, nr);
+ +	syscall_return_slowpath(regs);
+ +}
+  
+ -	instrumentation_end();
+ -	syscall_exit_to_user_mode(regs);
+ -	return true;
+ +/* Handles int $0x80 */
+ +__visible void do_int80_syscall_32(struct pt_regs *regs)
+ +{
+ +	enter_from_user_mode();
+ +	local_irq_enable();
+ +	do_syscall_32_irqs_on(regs);
+  }
+  
+ -/* Returns true to return using SYSEXIT/SYSRETL, or false to use IRET */
+ -__visible noinstr bool do_fast_syscall_32(struct pt_regs *regs)
+ +/* Returns 0 to return using IRET or 1 to return using SYSEXIT/SYSRETL. */
+ +__visible long do_fast_syscall_32(struct pt_regs *regs)
+  {
+  	/*
+  	 * Called using the internal vDSO SYSENTER/SYSCALL32 calling
+diff --cc arch/x86/entry/entry_64.S
+index 20ae3965f651,1b5be07f8669..000000000000
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@@ -1874,5 -1489,66 +1875,71 @@@ SYM_CODE_START(rewind_stack_do_exit
+  	leaq	-PTREGS_SIZE(%rax), %rsp
+  	UNWIND_HINT_REGS
+  
+++<<<<<<< HEAD
+ +	call	do_exit
+ +SYM_CODE_END(rewind_stack_do_exit)
+++=======
++ 	call	make_task_dead
++ SYM_CODE_END(rewind_stack_and_make_dead)
++ .popsection
++ 
++ /*
++  * This sequence executes branches in order to remove user branch information
++  * from the branch history tracker in the Branch Predictor, therefore removing
++  * user influence on subsequent BTB lookups.
++  *
++  * It should be used on parts prior to Alder Lake. Newer parts should use the
++  * BHI_DIS_S hardware control instead. If a pre-Alder Lake part is being
++  * virtualized on newer hardware the VMM should protect against BHI attacks by
++  * setting BHI_DIS_S for the guests.
++  *
++  * CALLs/RETs are necessary to prevent Loop Stream Detector(LSD) from engaging
++  * and not clearing the branch history. The call tree looks like:
++  *
++  * call 1
++  *    call 2
++  *      call 2
++  *        call 2
++  *          call 2
++  * 	      call 2
++  * 	      ret
++  * 	    ret
++  *        ret
++  *      ret
++  *    ret
++  * ret
++  *
++  * This means that the stack is non-constant and ORC can't unwind it with %rsp
++  * alone.  Therefore we unconditionally set up the frame pointer, which allows
++  * ORC to unwind properly.
++  *
++  * The alignment is for performance and not for safety, and may be safely
++  * refactored in the future if needed.
++  */
++ SYM_FUNC_START(clear_bhb_loop)
++ 	push	%rbp
++ 	mov	%rsp, %rbp
++ 	movl	$5, %ecx
++ 	ANNOTATE_INTRA_FUNCTION_CALL
++ 	call	1f
++ 	jmp	5f
++ 	.align 64, 0xcc
++ 	ANNOTATE_INTRA_FUNCTION_CALL
++ 1:	call	2f
++ 	RET
++ 	.align 64, 0xcc
++ 2:	movl	$5, %eax
++ 3:	jmp	4f
++ 	nop
++ 4:	sub	$1, %eax
++ 	jnz	3b
++ 	sub	$1, %ecx
++ 	jnz	1b
++ 	RET
++ 5:	lfence
++ 	pop	%rbp
++ 	RET
++ SYM_FUNC_END(clear_bhb_loop)
++ EXPORT_SYMBOL_GPL(clear_bhb_loop)
++ STACK_FRAME_NON_STANDARD(clear_bhb_loop)
+++>>>>>>> 7390db8aea0d (x86/bhi: Add support for clearing branch history at syscall entry)
+diff --cc arch/x86/entry/entry_64_compat.S
+index 0f87d59822e5,c779046cc3fe..000000000000
+--- a/arch/x86/entry/entry_64_compat.S
++++ b/arch/x86/entry/entry_64_compat.S
+@@@ -323,106 -278,17 +325,121 @@@ SYM_INNER_LABEL(entry_SYSRETL_compat_en
+  SYM_CODE_END(entry_SYSCALL_compat)
+  
+  /*
+++<<<<<<< HEAD
+ + * 32-bit legacy system call entry.
+ + *
+ + * 32-bit x86 Linux system calls traditionally used the INT $0x80
+ + * instruction.  INT $0x80 lands here.
+ + *
+ + * This entry point can be used by 32-bit and 64-bit programs to perform
+ + * 32-bit system calls.  Instances of INT $0x80 can be found inline in
+ + * various programs and libraries.  It is also used by the vDSO's
+ + * __kernel_vsyscall fallback for hardware that doesn't support a faster
+ + * entry method.  Restarted 32-bit system calls also fall back to INT
+ + * $0x80 regardless of what instruction was originally used to do the
+ + * system call.
+ + *
+ + * This is considered a slow path.  It is not used by most libc
+ + * implementations on modern hardware except during process startup.
+ + *
+ + * Arguments:
+ + * eax  system call number
+ + * ebx  arg1
+ + * ecx  arg2
+ + * edx  arg3
+ + * esi  arg4
+ + * edi  arg5
+ + * ebp  arg6
+ + */
+ +SYM_CODE_START(entry_INT80_compat)
+ +	/*
+ +	 * Interrupts are off on entry.
+ +	 */
+ +	ASM_CLAC			/* Do this early to minimize exposure */
+ +	SWAPGS
+ +
+ +	/*
+ +	 * User tracing code (ptrace or signal handlers) might assume that
+ +	 * the saved RAX contains a 32-bit number when we're invoking a 32-bit
+ +	 * syscall.  Just in case the high bits are nonzero, zero-extend
+ +	 * the syscall number.  (This could almost certainly be deleted
+ +	 * with no ill effects.)
+ +	 */
+ +	movl	%eax, %eax
+ +
+ +	/* switch to thread stack expects orig_ax and rdi to be pushed */
+ +	pushq	%rax			/* pt_regs->orig_ax */
+ +	pushq	%rdi			/* pt_regs->di */
+ +
+ +	/* Need to switch before accessing the thread stack. */
+ +	SWITCH_TO_KERNEL_CR3 scratch_reg=%rdi
+ +	movq	%rsp, %rdi
+ +	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+ +
+ +	pushq	6*8(%rdi)		/* regs->ss */
+ +	pushq	5*8(%rdi)		/* regs->rsp */
+ +	pushq	4*8(%rdi)		/* regs->eflags */
+ +	pushq	3*8(%rdi)		/* regs->cs */
+ +	pushq	2*8(%rdi)		/* regs->ip */
+ +	pushq	1*8(%rdi)		/* regs->orig_ax */
+ +	pushq	(%rdi)			/* pt_regs->di */
+ +	pushq	%rsi			/* pt_regs->si */
+ +	xorl	%esi, %esi		/* nospec   si */
+ +	pushq	%rdx			/* pt_regs->dx */
+ +	xorl	%edx, %edx		/* nospec   dx */
+ +	pushq	%rcx			/* pt_regs->cx */
+ +	xorl	%ecx, %ecx		/* nospec   cx */
+ +	pushq	$-ENOSYS		/* pt_regs->ax */
+ +	pushq   %r8			/* pt_regs->r8 */
+ +	xorl	%r8d, %r8d		/* nospec   r8 */
+ +	pushq   %r9			/* pt_regs->r9 */
+ +	xorl	%r9d, %r9d		/* nospec   r9 */
+ +	pushq   %r10			/* pt_regs->r10*/
+ +	xorl	%r10d, %r10d		/* nospec   r10 */
+ +	pushq   %r11			/* pt_regs->r11 */
+ +	xorl	%r11d, %r11d		/* nospec   r11 */
+ +	pushq   %rbx                    /* pt_regs->rbx */
+ +	xorl	%ebx, %ebx		/* nospec   rbx */
+ +	pushq   %rbp                    /* pt_regs->rbp */
+ +	xorl	%ebp, %ebp		/* nospec   rbp */
+ +	pushq   %r12                    /* pt_regs->r12 */
+ +	xorl	%r12d, %r12d		/* nospec   r12 */
+ +	pushq   %r13                    /* pt_regs->r13 */
+ +	xorl	%r13d, %r13d		/* nospec   r13 */
+ +	pushq   %r14                    /* pt_regs->r14 */
+ +	xorl	%r14d, %r14d		/* nospec   r14 */
+ +	pushq   %r15                    /* pt_regs->r15 */
+ +	xorl	%r15d, %r15d		/* nospec   r15 */
+ +	cld
+ +
+ +	IBRS_ENTER
+ +	UNTRAIN_RET
+ +
+ +	/*
+ +	 * User mode is traced as though IRQs are on, and the interrupt
+ +	 * gate turned them off.
+ +	 */
+ +	TRACE_IRQS_OFF
+ +
+ +	movq	%rsp, %rdi
+ +	call	do_int80_syscall_32
+ +.Lsyscall_32_done:
+ +
+ +	/* Go back to user mode. */
+ +	TRACE_IRQS_ON
+ +	jmp	swapgs_restore_regs_and_return_to_usermode
+ +SYM_CODE_END(entry_INT80_compat)
+++=======
++  * int 0x80 is used by 32 bit mode as a system call entry. Normally idt entries
++  * point to C routines, however since this is a system call interface the branch
++  * history needs to be scrubbed to protect against BHI attacks, and that
++  * scrubbing needs to take place in assembly code prior to entering any C
++  * routines.
++  */
++ SYM_CODE_START(int80_emulation)
++ 	ANNOTATE_NOENDBR
++ 	UNWIND_HINT_FUNC
++ 	CLEAR_BRANCH_HISTORY
++ 	jmp do_int80_emulation
++ SYM_CODE_END(int80_emulation)
+++>>>>>>> 7390db8aea0d (x86/bhi: Add support for clearing branch history at syscall entry)
+diff --cc arch/x86/include/asm/syscall.h
+index 435f3f09279c,2fc7bc3863ff..000000000000
+--- a/arch/x86/include/asm/syscall.h
++++ b/arch/x86/include/asm/syscall.h
+@@@ -243,6 -123,14 +243,13 @@@ static inline int syscall_get_arch(stru
+  		task->thread_info.status & TS_COMPAT)
+  		? AUDIT_ARCH_I386 : AUDIT_ARCH_X86_64;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ bool do_syscall_64(struct pt_regs *regs, int nr);
++ void do_int80_emulation(struct pt_regs *regs);
++ 
+++>>>>>>> 7390db8aea0d (x86/bhi: Add support for clearing branch history at syscall entry)
+  #endif	/* CONFIG_X86_32 */
+  
+ -void do_int80_syscall_32(struct pt_regs *regs);
+ -bool do_fast_syscall_32(struct pt_regs *regs);
+ -bool do_SYSENTER_32(struct pt_regs *regs);
+ -
+  #endif	/* _ASM_X86_SYSCALL_H */
+* Unmerged path arch/x86/entry/common.c
+* Unmerged path arch/x86/entry/entry_64.S
+* Unmerged path arch/x86/entry/entry_64_compat.S
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index fff57d23f577..7cdb4ed32059 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -442,11 +442,12 @@
+ 
+ /*
+  * Extended auxiliary flags: Linux defined - for features scattered in various
+- * CPUID levels like 0x80000022, etc.
++ * CPUID levels like 0x80000022, etc and Linux defined features.
+  *
+  * Reuse free bits when adding new feature flags!
+  */
+ #define X86_FEATURE_AMD_LBR_PMC_FREEZE	(21*32+ 0) /* AMD LBR and PMC Freeze */
++#define X86_FEATURE_CLEAR_BHB_LOOP	(21*32+ 1) /* "" Clear branch history at syscall entry using SW loop */
+ 
+ /*
+  * BUG word(s)
+diff --git a/arch/x86/include/asm/nospec-branch.h b/arch/x86/include/asm/nospec-branch.h
+index 9d381b856139..929776863f37 100644
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@ -215,6 +215,14 @@
+ 	ALTERNATIVE "", __stringify(verw _ASM_RIP(mds_verw_sel)), X86_FEATURE_CLEAR_CPU_BUF
+ .endm
+ 
++#ifdef CONFIG_X86_64
++.macro CLEAR_BRANCH_HISTORY
++	ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_LOOP
++.endm
++#else
++#define CLEAR_BRANCH_HISTORY
++#endif
++
+ #else /* __ASSEMBLY__ */
+ 
+ #define ANNOTATE_RETPOLINE_SAFE					\
+@@ -250,6 +258,10 @@ extern void srso_alias_return_thunk(void);
+ extern void entry_untrain_ret(void);
+ extern void entry_ibpb(void);
+ 
++#ifdef CONFIG_X86_64
++extern void clear_bhb_loop(void);
++#endif
++
+ extern void (*x86_return_thunk)(void);
+ 
+ #ifdef CONFIG_RETPOLINE
+* Unmerged path arch/x86/include/asm/syscall.h
+diff --git a/arch/x86/kvm/vmx/vmenter.S b/arch/x86/kvm/vmx/vmenter.S
+index b86dc4e6ef99..41f7d35751ff 100644
+--- a/arch/x86/kvm/vmx/vmenter.S
++++ b/arch/x86/kvm/vmx/vmenter.S
+@@ -239,6 +239,8 @@ SYM_INNER_LABEL(vmx_vmexit, SYM_L_GLOBAL)
+ 
+ 	call vmx_spec_ctrl_restore_host
+ 
++	CLEAR_BRANCH_HISTORY
++
+ 	/* Put return value in AX */
+ 	mov %_ASM_BX, %_ASM_AX
+ 
