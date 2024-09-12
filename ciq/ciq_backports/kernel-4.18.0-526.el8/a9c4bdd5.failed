@@ -1,0 +1,122 @@
+tracing: Acquire buffer from temparary trace sequence
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-526.el8
+commit-author Linyu Yuan <quic_linyyuan@quicinc.com>
+commit a9c4bdd505630469f93f5efedfc7a9ca254996c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-526.el8/a9c4bdd5.failed
+
+there is one dwc3 trace event declare as below,
+DECLARE_EVENT_CLASS(dwc3_log_event,
+	TP_PROTO(u32 event, struct dwc3 *dwc),
+	TP_ARGS(event, dwc),
+	TP_STRUCT__entry(
+		__field(u32, event)
+		__field(u32, ep0state)
+		__dynamic_array(char, str, DWC3_MSG_MAX)
+	),
+	TP_fast_assign(
+		__entry->event = event;
+		__entry->ep0state = dwc->ep0state;
+	),
+	TP_printk("event (%08x): %s", __entry->event,
+			dwc3_decode_event(__get_str(str), DWC3_MSG_MAX,
+				__entry->event, __entry->ep0state))
+);
+the problem is when trace function called, it will allocate up to
+DWC3_MSG_MAX bytes from trace event buffer, but never fill the buffer
+during fast assignment, it only fill the buffer when output function are
+called, so this means if output function are not called, the buffer will
+never used.
+
+add __get_buf(len) which acquiree buffer from iter->tmp_seq when trace
+output function called, it allow user write string to acquired buffer.
+
+the mentioned dwc3 trace event will changed as below,
+DECLARE_EVENT_CLASS(dwc3_log_event,
+	TP_PROTO(u32 event, struct dwc3 *dwc),
+	TP_ARGS(event, dwc),
+	TP_STRUCT__entry(
+		__field(u32, event)
+		__field(u32, ep0state)
+	),
+	TP_fast_assign(
+		__entry->event = event;
+		__entry->ep0state = dwc->ep0state;
+	),
+	TP_printk("event (%08x): %s", __entry->event,
+		dwc3_decode_event(__get_buf(DWC3_MSG_MAX), DWC3_MSG_MAX,
+				__entry->event, __entry->ep0state))
+);.
+
+Link: https://lore.kernel.org/linux-trace-kernel/1675065249-23368-1-git-send-email-quic_linyyuan@quicinc.com
+
+	Cc: Masami Hiramatsu <mhiramat@kernel.org>
+	Signed-off-by: Linyu Yuan <quic_linyyuan@quicinc.com>
+	Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+(cherry picked from commit a9c4bdd505630469f93f5efedfc7a9ca254996c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/trace/stages/stage3_trace_output.h
+#	include/trace/stages/stage7_class_define.h
+* Unmerged path include/trace/stages/stage3_trace_output.h
+* Unmerged path include/trace/stages/stage7_class_define.h
+diff --git a/include/linux/trace_seq.h b/include/linux/trace_seq.h
+index 6c30508fca19..d23c17882a69 100644
+--- a/include/linux/trace_seq.h
++++ b/include/linux/trace_seq.h
+@@ -95,6 +95,7 @@ extern void trace_seq_bitmask(struct trace_seq *s, const unsigned long *maskp,
+ extern int trace_seq_hex_dump(struct trace_seq *s, const char *prefix_str,
+ 			      int prefix_type, int rowsize, int groupsize,
+ 			      const void *buf, size_t len, bool ascii);
++char *trace_seq_acquire(struct trace_seq *s, unsigned int len);
+ 
+ #else /* CONFIG_TRACING */
+ static inline void trace_seq_printf(struct trace_seq *s, const char *fmt, ...)
+@@ -138,6 +139,10 @@ static inline int trace_seq_path(struct trace_seq *s, const struct path *path)
+ {
+ 	return 0;
+ }
++static inline char *trace_seq_acquire(struct trace_seq *s, unsigned int len)
++{
++	return NULL;
++}
+ #endif /* CONFIG_TRACING */
+ 
+ #endif /* _LINUX_TRACE_SEQ_H */
+* Unmerged path include/trace/stages/stage3_trace_output.h
+* Unmerged path include/trace/stages/stage7_class_define.h
+diff --git a/kernel/trace/trace_seq.c b/kernel/trace/trace_seq.c
+index 2e42cd703a1b..4c049da4bd41 100644
+--- a/kernel/trace/trace_seq.c
++++ b/kernel/trace/trace_seq.c
+@@ -405,3 +405,26 @@ int trace_seq_hex_dump(struct trace_seq *s, const char *prefix_str,
+ 	return 1;
+ }
+ EXPORT_SYMBOL(trace_seq_hex_dump);
++
++/*
++ * trace_seq_acquire - acquire seq buffer with size len
++ * @s: trace sequence descriptor
++ * @len: size of buffer to be acquired
++ *
++ * acquire buffer with size of @len from trace_seq for output usage,
++ * user can fill string into that buffer.
++ *
++ * Returns start address of acquired buffer.
++ *
++ * it allow multiple usage in one trace output function call.
++ */
++char *trace_seq_acquire(struct trace_seq *s, unsigned int len)
++{
++	char *ret = trace_seq_buffer_ptr(s);
++
++	if (!WARN_ON_ONCE(seq_buf_buffer_left(&s->seq) < len))
++		seq_buf_commit(&s->seq, len);
++
++	return ret;
++}
++EXPORT_SYMBOL(trace_seq_acquire);
