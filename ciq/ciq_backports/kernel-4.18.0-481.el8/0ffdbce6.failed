@@ -1,0 +1,139 @@
+powerpc/bpf: Handle large branch ranges with BPF_EXIT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+commit 0ffdbce6f4a89bb7c0002904d6438ec83cf05ce7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/0ffdbce6.failed
+
+In some scenarios, it is possible that the program epilogue is outside
+the branch range for a BPF_EXIT instruction. Instead of rejecting such
+programs, emit epilogue as an alternate exit point from the program.
+Track the location of the same so that subsequent exits can take either
+of the two paths.
+
+	Reported-by: Jordan Niethe <jniethe5@gmail.com>
+	Signed-off-by: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/33aa2e92645a92712be23b18035a2c6dcb92ff8d.1644834730.git.naveen.n.rao@linux.vnet.ibm.com
+
+(cherry picked from commit 0ffdbce6f4a89bb7c0002904d6438ec83cf05ce7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/net/bpf_jit.h
+#	arch/powerpc/net/bpf_jit_comp32.c
+diff --cc arch/powerpc/net/bpf_jit.h
+index d22140878361,e58cf29bb0cf..000000000000
+--- a/arch/powerpc/net/bpf_jit.h
++++ b/arch/powerpc/net/bpf_jit.h
+@@@ -141,8 -147,16 +141,13 @@@ struct codegen_context 
+  	unsigned int idx;
+  	unsigned int stack_size;
+  	int b2p[ARRAY_SIZE(b2p)];
+++<<<<<<< HEAD
+++=======
++ 	unsigned int exentry_idx;
++ 	unsigned int alt_exit_addr;
+++>>>>>>> 0ffdbce6f4a8 (powerpc/bpf: Handle large branch ranges with BPF_EXIT)
+  };
+  
+ -#ifdef CONFIG_PPC32
+ -#define BPF_FIXUP_LEN	3 /* Three instructions => 12 bytes */
+ -#else
+ -#define BPF_FIXUP_LEN	2 /* Two instructions => 8 bytes */
+ -#endif
+ -
+  static inline void bpf_flush_icache(void *start, void *end)
+  {
+  	smp_wmb();	/* smp write barrier */
+@@@ -170,7 -184,11 +175,8 @@@ int bpf_jit_build_body(struct bpf_prog 
+  void bpf_jit_build_prologue(u32 *image, struct codegen_context *ctx);
+  void bpf_jit_build_epilogue(u32 *image, struct codegen_context *ctx);
+  void bpf_jit_realloc_regs(struct codegen_context *ctx);
++ int bpf_jit_emit_exit_insn(u32 *image, struct codegen_context *ctx, int tmp_reg, long exit_addr);
+  
+ -int bpf_add_extable_entry(struct bpf_prog *fp, u32 *image, int pass, struct codegen_context *ctx,
+ -			  int insn_idx, int jmp_off, int dst_reg);
+ -
+  #endif
+  
+  #endif
+* Unmerged path arch/powerpc/net/bpf_jit_comp32.c
+* Unmerged path arch/powerpc/net/bpf_jit.h
+diff --git a/arch/powerpc/net/bpf_jit_comp.c b/arch/powerpc/net/bpf_jit_comp.c
+index 16ef5fa3992f..dcd1f55654c5 100644
+--- a/arch/powerpc/net/bpf_jit_comp.c
++++ b/arch/powerpc/net/bpf_jit_comp.c
+@@ -89,6 +89,22 @@ static int bpf_jit_fixup_addresses(struct bpf_prog *fp, u32 *image,
+ 	return 0;
+ }
+ 
++int bpf_jit_emit_exit_insn(u32 *image, struct codegen_context *ctx, int tmp_reg, long exit_addr)
++{
++	if (!exit_addr || is_offset_in_branch_range(exit_addr - (ctx->idx * 4))) {
++		PPC_JMP(exit_addr);
++	} else if (ctx->alt_exit_addr) {
++		if (WARN_ON(!is_offset_in_branch_range((long)ctx->alt_exit_addr - (ctx->idx * 4))))
++			return -1;
++		PPC_JMP(ctx->alt_exit_addr);
++	} else {
++		ctx->alt_exit_addr = ctx->idx * 4;
++		bpf_jit_build_epilogue(image, ctx);
++	}
++
++	return 0;
++}
++
+ struct powerpc64_jit_data {
+ 	struct bpf_binary_header *header;
+ 	u32 *addrs;
+@@ -176,8 +192,10 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *fp)
+ 	 * If we have seen a tail call, we need a second pass.
+ 	 * This is because bpf_jit_emit_common_epilogue() is called
+ 	 * from bpf_jit_emit_tail_call() with a not yet stable ctx->seen.
++	 * We also need a second pass if we ended up with too large
++	 * a program so as to ensure BPF_EXIT branches are in range.
+ 	 */
+-	if (cgctx.seen & SEEN_TAILCALL) {
++	if (cgctx.seen & SEEN_TAILCALL || !is_offset_in_branch_range((long)cgctx.idx * 4)) {
+ 		cgctx.idx = 0;
+ 		if (bpf_jit_build_body(fp, 0, &cgctx, addrs, false)) {
+ 			fp = org_fp;
+@@ -192,6 +210,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *fp)
+ 	 * calculate total size from idx.
+ 	 */
+ 	bpf_jit_build_prologue(0, &cgctx);
++	addrs[fp->len] = cgctx.idx * 4;
+ 	bpf_jit_build_epilogue(0, &cgctx);
+ 
+ 	proglen = cgctx.idx * 4;
+@@ -226,6 +245,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *fp)
+ 	for (pass = 1; pass < 3; pass++) {
+ 		/* Now build the prologue, body code & epilogue for real. */
+ 		cgctx.idx = 0;
++		cgctx.alt_exit_addr = 0;
+ 		bpf_jit_build_prologue(code_base, &cgctx);
+ 		bpf_jit_build_body(fp, code_base, &cgctx, addrs, extra_pass);
+ 		bpf_jit_build_epilogue(code_base, &cgctx);
+* Unmerged path arch/powerpc/net/bpf_jit_comp32.c
+diff --git a/arch/powerpc/net/bpf_jit_comp64.c b/arch/powerpc/net/bpf_jit_comp64.c
+index cbb5838adebc..cdb28194bc03 100644
+--- a/arch/powerpc/net/bpf_jit_comp64.c
++++ b/arch/powerpc/net/bpf_jit_comp64.c
+@@ -826,8 +826,11 @@ int bpf_jit_build_body(struct bpf_prog *fp, u32 *image, struct codegen_context *
+ 			 * the epilogue. If we _are_ the last instruction,
+ 			 * we'll just fall through to the epilogue.
+ 			 */
+-			if (i != flen - 1)
+-				PPC_JMP(exit_addr);
++			if (i != flen - 1) {
++				ret = bpf_jit_emit_exit_insn(image, ctx, b2p[TMP_REG_1], exit_addr);
++				if (ret)
++					return ret;
++			}
+ 			/* else fall through to the epilogue */
+ 			break;
+ 
