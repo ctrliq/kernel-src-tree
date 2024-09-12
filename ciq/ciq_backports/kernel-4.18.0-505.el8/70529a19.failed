@@ -1,0 +1,700 @@
+fanotify: define struct members to hold response decision context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-505.el8
+commit-author Richard Guy Briggs <rgb@redhat.com>
+commit 70529a199574c15a40f46b14256633b02ba10ca2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-505.el8/70529a19.failed
+
+This patch adds a flag, FAN_INFO and an extensible buffer to provide
+additional information about response decisions.  The buffer contains
+one or more headers defining the information type and the length of the
+following information.  The patch defines one additional information
+type, FAN_RESPONSE_INFO_AUDIT_RULE, to audit a rule number.  This will
+allow for the creation of other information types in the future if other
+users of the API identify different needs.
+
+The kernel can be tested if it supports a given info type by supplying
+the complete info extension but setting fd to FAN_NOFD.  It will return
+the expected size but not issue an audit record.
+
+	Suggested-by: Steve Grubb <sgrubb@redhat.com>
+Link: https://lore.kernel.org/r/2745105.e9J7NaK4W3@x2
+	Suggested-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20201001101219.GE17860@quack2.suse.cz
+	Tested-by: Steve Grubb <sgrubb@redhat.com>
+	Acked-by: Steve Grubb <sgrubb@redhat.com>
+	Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+Message-Id: <10177cfcae5480926b7176321a28d9da6835b667.1675373475.git.rgb@redhat.com>
+(cherry picked from commit 70529a199574c15a40f46b14256633b02ba10ca2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fanotify/fanotify.c
+#	fs/notify/fanotify/fanotify_user.c
+#	include/uapi/linux/fanotify.h
+diff --cc fs/notify/fanotify/fanotify.c
+index 3d7ae3d3bdf1,24ec1d66d5a8..000000000000
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@@ -166,16 -334,383 +166,365 @@@ static u32 fanotify_group_event_mask(st
+  			continue;
+  
+  		marks_mask |= mark->mask;
+ -
+ -		/* Record the mark types of this group that matched the event */
+ -		*match_mask |= 1U << type;
+ +		marks_ignored_mask |= mark->ignored_mask;
+  	}
+  
+ -	test_mask = event_mask & marks_mask & ~marks_ignore_mask;
+ -
+ -	/*
+ -	 * For dirent modification events (create/delete/move) that do not carry
+ -	 * the child entry name information, we report FAN_ONDIR for mkdir/rmdir
+ -	 * so user can differentiate them from creat/unlink.
+ -	 *
+ -	 * For backward compatibility and consistency, do not report FAN_ONDIR
+ -	 * to user in legacy fanotify mode (reporting fd) and report FAN_ONDIR
+ -	 * to user in fid mode for all event types.
+ -	 *
+ -	 * We never report FAN_EVENT_ON_CHILD to user, but we do pass it in to
+ -	 * fanotify_alloc_event() when group is reporting fid as indication
+ -	 * that event happened on child.
+ -	 */
+ -	if (fid_mode) {
+ -		/* Do not report event flags without any event */
+ -		if (!(test_mask & ~FANOTIFY_EVENT_FLAGS))
+ -			return 0;
+ -	} else {
+ -		user_mask &= ~FANOTIFY_EVENT_FLAGS;
+ -	}
+ -
+ -	return test_mask & user_mask;
+ +	return event_mask & FANOTIFY_OUTGOING_EVENTS & marks_mask &
+ +		~marks_ignored_mask;
+  }
+  
+++<<<<<<< HEAD
+ +struct fanotify_event *fanotify_alloc_event(struct fsnotify_group *group,
+ +						 struct inode *inode, u32 mask,
+ +						 const struct path *path)
+++=======
++ /*
++  * Check size needed to encode fanotify_fh.
++  *
++  * Return size of encoded fh without fanotify_fh header.
++  * Return 0 on failure to encode.
++  */
++ static int fanotify_encode_fh_len(struct inode *inode)
++ {
++ 	int dwords = 0;
++ 	int fh_len;
++ 
++ 	if (!inode)
++ 		return 0;
++ 
++ 	exportfs_encode_inode_fh(inode, NULL, &dwords, NULL);
++ 	fh_len = dwords << 2;
++ 
++ 	/*
++ 	 * struct fanotify_error_event might be preallocated and is
++ 	 * limited to MAX_HANDLE_SZ.  This should never happen, but
++ 	 * safeguard by forcing an invalid file handle.
++ 	 */
++ 	if (WARN_ON_ONCE(fh_len > MAX_HANDLE_SZ))
++ 		return 0;
++ 
++ 	return fh_len;
++ }
++ 
++ /*
++  * Encode fanotify_fh.
++  *
++  * Return total size of encoded fh including fanotify_fh header.
++  * Return 0 on failure to encode.
++  */
++ static int fanotify_encode_fh(struct fanotify_fh *fh, struct inode *inode,
++ 			      unsigned int fh_len, unsigned int *hash,
++ 			      gfp_t gfp)
++ {
++ 	int dwords, type = 0;
++ 	char *ext_buf = NULL;
++ 	void *buf = fh->buf;
++ 	int err;
++ 
++ 	fh->type = FILEID_ROOT;
++ 	fh->len = 0;
++ 	fh->flags = 0;
++ 
++ 	/*
++ 	 * Invalid FHs are used by FAN_FS_ERROR for errors not
++ 	 * linked to any inode. The f_handle won't be reported
++ 	 * back to userspace.
++ 	 */
++ 	if (!inode)
++ 		goto out;
++ 
++ 	/*
++ 	 * !gpf means preallocated variable size fh, but fh_len could
++ 	 * be zero in that case if encoding fh len failed.
++ 	 */
++ 	err = -ENOENT;
++ 	if (fh_len < 4 || WARN_ON_ONCE(fh_len % 4) || fh_len > MAX_HANDLE_SZ)
++ 		goto out_err;
++ 
++ 	/* No external buffer in a variable size allocated fh */
++ 	if (gfp && fh_len > FANOTIFY_INLINE_FH_LEN) {
++ 		/* Treat failure to allocate fh as failure to encode fh */
++ 		err = -ENOMEM;
++ 		ext_buf = kmalloc(fh_len, gfp);
++ 		if (!ext_buf)
++ 			goto out_err;
++ 
++ 		*fanotify_fh_ext_buf_ptr(fh) = ext_buf;
++ 		buf = ext_buf;
++ 		fh->flags |= FANOTIFY_FH_FLAG_EXT_BUF;
++ 	}
++ 
++ 	dwords = fh_len >> 2;
++ 	type = exportfs_encode_inode_fh(inode, buf, &dwords, NULL);
++ 	err = -EINVAL;
++ 	if (!type || type == FILEID_INVALID || fh_len != dwords << 2)
++ 		goto out_err;
++ 
++ 	fh->type = type;
++ 	fh->len = fh_len;
++ 
++ out:
++ 	/*
++ 	 * Mix fh into event merge key.  Hash might be NULL in case of
++ 	 * unhashed FID events (i.e. FAN_FS_ERROR).
++ 	 */
++ 	if (hash)
++ 		*hash ^= fanotify_hash_fh(fh);
++ 
++ 	return FANOTIFY_FH_HDR_LEN + fh_len;
++ 
++ out_err:
++ 	pr_warn_ratelimited("fanotify: failed to encode fid (type=%d, len=%d, err=%i)\n",
++ 			    type, fh_len, err);
++ 	kfree(ext_buf);
++ 	*fanotify_fh_ext_buf_ptr(fh) = NULL;
++ 	/* Report the event without a file identifier on encode error */
++ 	fh->type = FILEID_INVALID;
++ 	fh->len = 0;
++ 	return 0;
++ }
++ 
++ /*
++  * FAN_REPORT_FID is ambiguous in that it reports the fid of the child for
++  * some events and the fid of the parent for create/delete/move events.
++  *
++  * With the FAN_REPORT_TARGET_FID flag, the fid of the child is reported
++  * also in create/delete/move events in addition to the fid of the parent
++  * and the name of the child.
++  */
++ static inline bool fanotify_report_child_fid(unsigned int fid_mode, u32 mask)
++ {
++ 	if (mask & ALL_FSNOTIFY_DIRENT_EVENTS)
++ 		return (fid_mode & FAN_REPORT_TARGET_FID);
++ 
++ 	return (fid_mode & FAN_REPORT_FID) && !(mask & FAN_ONDIR);
++ }
++ 
++ /*
++  * The inode to use as identifier when reporting fid depends on the event
++  * and the group flags.
++  *
++  * With the group flag FAN_REPORT_TARGET_FID, always report the child fid.
++  *
++  * Without the group flag FAN_REPORT_TARGET_FID, report the modified directory
++  * fid on dirent events and the child fid otherwise.
++  *
++  * For example:
++  * FS_ATTRIB reports the child fid even if reported on a watched parent.
++  * FS_CREATE reports the modified dir fid without FAN_REPORT_TARGET_FID.
++  *       and reports the created child fid with FAN_REPORT_TARGET_FID.
++  */
++ static struct inode *fanotify_fid_inode(u32 event_mask, const void *data,
++ 					int data_type, struct inode *dir,
++ 					unsigned int fid_mode)
++ {
++ 	if ((event_mask & ALL_FSNOTIFY_DIRENT_EVENTS) &&
++ 	    !(fid_mode & FAN_REPORT_TARGET_FID))
++ 		return dir;
++ 
++ 	return fsnotify_data_inode(data, data_type);
++ }
++ 
++ /*
++  * The inode to use as identifier when reporting dir fid depends on the event.
++  * Report the modified directory inode on dirent modification events.
++  * Report the "victim" inode if "victim" is a directory.
++  * Report the parent inode if "victim" is not a directory and event is
++  * reported to parent.
++  * Otherwise, do not report dir fid.
++  */
++ static struct inode *fanotify_dfid_inode(u32 event_mask, const void *data,
++ 					 int data_type, struct inode *dir)
++ {
++ 	struct inode *inode = fsnotify_data_inode(data, data_type);
++ 
++ 	if (event_mask & ALL_FSNOTIFY_DIRENT_EVENTS)
++ 		return dir;
++ 
++ 	if (inode && S_ISDIR(inode->i_mode))
++ 		return inode;
++ 
++ 	return dir;
++ }
++ 
++ static struct fanotify_event *fanotify_alloc_path_event(const struct path *path,
++ 							unsigned int *hash,
++ 							gfp_t gfp)
++ {
++ 	struct fanotify_path_event *pevent;
++ 
++ 	pevent = kmem_cache_alloc(fanotify_path_event_cachep, gfp);
++ 	if (!pevent)
++ 		return NULL;
++ 
++ 	pevent->fae.type = FANOTIFY_EVENT_TYPE_PATH;
++ 	pevent->path = *path;
++ 	*hash ^= fanotify_hash_path(path);
++ 	path_get(path);
++ 
++ 	return &pevent->fae;
++ }
++ 
++ static struct fanotify_event *fanotify_alloc_perm_event(const struct path *path,
++ 							gfp_t gfp)
++ {
++ 	struct fanotify_perm_event *pevent;
++ 
++ 	pevent = kmem_cache_alloc(fanotify_perm_event_cachep, gfp);
++ 	if (!pevent)
++ 		return NULL;
++ 
++ 	pevent->fae.type = FANOTIFY_EVENT_TYPE_PATH_PERM;
++ 	pevent->response = 0;
++ 	pevent->hdr.type = FAN_RESPONSE_INFO_NONE;
++ 	pevent->hdr.pad = 0;
++ 	pevent->hdr.len = 0;
++ 	pevent->state = FAN_EVENT_INIT;
++ 	pevent->path = *path;
++ 	path_get(path);
++ 
++ 	return &pevent->fae;
++ }
++ 
++ static struct fanotify_event *fanotify_alloc_fid_event(struct inode *id,
++ 						       __kernel_fsid_t *fsid,
++ 						       unsigned int *hash,
++ 						       gfp_t gfp)
++ {
++ 	struct fanotify_fid_event *ffe;
++ 
++ 	ffe = kmem_cache_alloc(fanotify_fid_event_cachep, gfp);
++ 	if (!ffe)
++ 		return NULL;
++ 
++ 	ffe->fae.type = FANOTIFY_EVENT_TYPE_FID;
++ 	ffe->fsid = *fsid;
++ 	*hash ^= fanotify_hash_fsid(fsid);
++ 	fanotify_encode_fh(&ffe->object_fh, id, fanotify_encode_fh_len(id),
++ 			   hash, gfp);
++ 
++ 	return &ffe->fae;
++ }
++ 
++ static struct fanotify_event *fanotify_alloc_name_event(struct inode *dir,
++ 							__kernel_fsid_t *fsid,
++ 							const struct qstr *name,
++ 							struct inode *child,
++ 							struct dentry *moved,
++ 							unsigned int *hash,
++ 							gfp_t gfp)
++ {
++ 	struct fanotify_name_event *fne;
++ 	struct fanotify_info *info;
++ 	struct fanotify_fh *dfh, *ffh;
++ 	struct inode *dir2 = moved ? d_inode(moved->d_parent) : NULL;
++ 	const struct qstr *name2 = moved ? &moved->d_name : NULL;
++ 	unsigned int dir_fh_len = fanotify_encode_fh_len(dir);
++ 	unsigned int dir2_fh_len = fanotify_encode_fh_len(dir2);
++ 	unsigned int child_fh_len = fanotify_encode_fh_len(child);
++ 	unsigned long name_len = name ? name->len : 0;
++ 	unsigned long name2_len = name2 ? name2->len : 0;
++ 	unsigned int len, size;
++ 
++ 	/* Reserve terminating null byte even for empty name */
++ 	size = sizeof(*fne) + name_len + name2_len + 2;
++ 	if (dir_fh_len)
++ 		size += FANOTIFY_FH_HDR_LEN + dir_fh_len;
++ 	if (dir2_fh_len)
++ 		size += FANOTIFY_FH_HDR_LEN + dir2_fh_len;
++ 	if (child_fh_len)
++ 		size += FANOTIFY_FH_HDR_LEN + child_fh_len;
++ 	fne = kmalloc(size, gfp);
++ 	if (!fne)
++ 		return NULL;
++ 
++ 	fne->fae.type = FANOTIFY_EVENT_TYPE_FID_NAME;
++ 	fne->fsid = *fsid;
++ 	*hash ^= fanotify_hash_fsid(fsid);
++ 	info = &fne->info;
++ 	fanotify_info_init(info);
++ 	if (dir_fh_len) {
++ 		dfh = fanotify_info_dir_fh(info);
++ 		len = fanotify_encode_fh(dfh, dir, dir_fh_len, hash, 0);
++ 		fanotify_info_set_dir_fh(info, len);
++ 	}
++ 	if (dir2_fh_len) {
++ 		dfh = fanotify_info_dir2_fh(info);
++ 		len = fanotify_encode_fh(dfh, dir2, dir2_fh_len, hash, 0);
++ 		fanotify_info_set_dir2_fh(info, len);
++ 	}
++ 	if (child_fh_len) {
++ 		ffh = fanotify_info_file_fh(info);
++ 		len = fanotify_encode_fh(ffh, child, child_fh_len, hash, 0);
++ 		fanotify_info_set_file_fh(info, len);
++ 	}
++ 	if (name_len) {
++ 		fanotify_info_copy_name(info, name);
++ 		*hash ^= full_name_hash((void *)name_len, name->name, name_len);
++ 	}
++ 	if (name2_len) {
++ 		fanotify_info_copy_name2(info, name2);
++ 		*hash ^= full_name_hash((void *)name2_len, name2->name,
++ 					name2_len);
++ 	}
++ 
++ 	pr_debug("%s: size=%u dir_fh_len=%u child_fh_len=%u name_len=%u name='%.*s'\n",
++ 		 __func__, size, dir_fh_len, child_fh_len,
++ 		 info->name_len, info->name_len, fanotify_info_name(info));
++ 
++ 	if (dir2_fh_len) {
++ 		pr_debug("%s: dir2_fh_len=%u name2_len=%u name2='%.*s'\n",
++ 			 __func__, dir2_fh_len, info->name2_len,
++ 			 info->name2_len, fanotify_info_name2(info));
++ 	}
++ 
++ 	return &fne->fae;
++ }
++ 
++ static struct fanotify_event *fanotify_alloc_error_event(
++ 						struct fsnotify_group *group,
++ 						__kernel_fsid_t *fsid,
++ 						const void *data, int data_type,
++ 						unsigned int *hash)
++ {
++ 	struct fs_error_report *report =
++ 			fsnotify_data_error_report(data, data_type);
++ 	struct inode *inode;
++ 	struct fanotify_error_event *fee;
++ 	int fh_len;
++ 
++ 	if (WARN_ON_ONCE(!report))
++ 		return NULL;
++ 
++ 	fee = mempool_alloc(&group->fanotify_data.error_events_pool, GFP_NOFS);
++ 	if (!fee)
++ 		return NULL;
++ 
++ 	fee->fae.type = FANOTIFY_EVENT_TYPE_FS_ERROR;
++ 	fee->error = report->error;
++ 	fee->err_count = 1;
++ 	fee->fsid = *fsid;
++ 
++ 	inode = report->inode;
++ 	fh_len = fanotify_encode_fh_len(inode);
++ 
++ 	/* Bad fh_len. Fallback to using an invalid fh. Should never happen. */
++ 	if (!fh_len && inode)
++ 		inode = NULL;
++ 
++ 	fanotify_encode_fh(&fee->object_fh, inode, fh_len, NULL, 0);
++ 
++ 	*hash ^= fanotify_hash_fsid(fsid);
++ 
++ 	return &fee->fae;
++ }
++ 
++ static struct fanotify_event *fanotify_alloc_event(
++ 				struct fsnotify_group *group,
++ 				u32 mask, const void *data, int data_type,
++ 				struct inode *dir, const struct qstr *file_name,
++ 				__kernel_fsid_t *fsid, u32 match_mask)
+++>>>>>>> 70529a199574 (fanotify: define struct members to hold response decision context)
+  {
+  	struct fanotify_event *event = NULL;
+  	gfp_t gfp = GFP_KERNEL_ACCOUNT;
+diff --cc fs/notify/fanotify/fanotify_user.c
+index 8f76ba1a748b,8f430bfad487..000000000000
+--- a/fs/notify/fanotify/fanotify_user.c
++++ b/fs/notify/fanotify/fanotify_user.c
+@@@ -118,34 -283,24 +118,55 @@@ static int create_fd(struct fsnotify_gr
+  	return client_fd;
+  }
+  
+++<<<<<<< HEAD
+ +static int fill_event_metadata(struct fsnotify_group *group,
+ +			       struct fanotify_event_metadata *metadata,
+ +			       struct fsnotify_event *fsn_event,
+ +			       struct file **file)
+ +{
+ +	int ret = 0;
+ +	struct fanotify_event *event;
+ +
+ +	pr_debug("%s: group=%p metadata=%p event=%p\n", __func__,
+ +		 group, metadata, fsn_event);
+ +
+ +	*file = NULL;
+ +	event = container_of(fsn_event, struct fanotify_event, fse);
+ +	metadata->event_len = FAN_EVENT_METADATA_LEN;
+ +	metadata->metadata_len = FAN_EVENT_METADATA_LEN;
+ +	metadata->vers = FANOTIFY_METADATA_VERSION;
+ +	metadata->reserved = 0;
+ +	metadata->mask = fsn_event->mask & FANOTIFY_OUTGOING_EVENTS;
+ +	metadata->pid = pid_vnr(event->pid);
+ +	if (unlikely(fsn_event->mask & FAN_Q_OVERFLOW))
+ +		metadata->fd = FAN_NOFD;
+ +	else {
+ +		metadata->fd = create_fd(group, event, file);
+ +		if (metadata->fd < 0)
+ +			ret = metadata->fd;
+ +	}
+ +
+ +	return ret;
+++=======
++ static int process_access_response_info(const char __user *info,
++ 					size_t info_len,
++ 				struct fanotify_response_info_audit_rule *friar)
++ {
++ 	if (info_len != sizeof(*friar))
++ 		return -EINVAL;
++ 
++ 	if (copy_from_user(friar, info, sizeof(*friar)))
++ 		return -EFAULT;
++ 
++ 	if (friar->hdr.type != FAN_RESPONSE_INFO_AUDIT_RULE)
++ 		return -EINVAL;
++ 	if (friar->hdr.pad != 0)
++ 		return -EINVAL;
++ 	if (friar->hdr.len != sizeof(*friar))
++ 		return -EINVAL;
++ 
++ 	return info_len;
+++>>>>>>> 70529a199574 (fanotify: define struct members to hold response decision context)
+  }
+  
+  /*
+@@@ -153,8 -308,8 +174,13 @@@
+   * drop group->notification_lock.
+   */
+  static void finish_permission_event(struct fsnotify_group *group,
+++<<<<<<< HEAD
+ +				    struct fanotify_perm_event *event,
+ +				    unsigned int response)
+++=======
++ 				    struct fanotify_perm_event *event, u32 response,
++ 				    struct fanotify_response_info_audit_rule *friar)
+++>>>>>>> 70529a199574 (fanotify: define struct members to hold response decision context)
+  				    __releases(&group->notification_lock)
+  {
+  	bool destroy = false;
+@@@ -175,10 -335,12 +206,19 @@@ static int process_access_response(stru
+  {
+  	struct fanotify_perm_event *event;
+  	int fd = response_struct->fd;
+++<<<<<<< HEAD
+ +	int response = response_struct->response;
+ +
+ +	pr_debug("%s: group=%p fd=%d response=%d\n", __func__, group,
+ +		 fd, response);
+++=======
++ 	u32 response = response_struct->response;
++ 	int ret = info_len;
++ 	struct fanotify_response_info_audit_rule friar;
++ 
++ 	pr_debug("%s: group=%p fd=%d response=%u buf=%p size=%zu\n", __func__,
++ 		 group, fd, response, info, info_len);
+++>>>>>>> 70529a199574 (fanotify: define struct members to hold response decision context)
+  	/*
+  	 * make sure the response is valid, if invalid we do nothing and either
+  	 * userspace can send a valid response or we will clean it up after the
+@@@ -329,7 -844,7 +382,11 @@@ static ssize_t fanotify_read(struct fil
+  			if (ret <= 0) {
+  				spin_lock(&group->notification_lock);
+  				finish_permission_event(group,
+++<<<<<<< HEAD
+ +					FANOTIFY_PE(kevent), FAN_DENY);
+++=======
++ 					FANOTIFY_PERM(event), FAN_DENY, NULL);
+++>>>>>>> 70529a199574 (fanotify: define struct members to hold response decision context)
+  				wake_up(&group->fanotify_data.access_waitq);
+  			} else {
+  				spin_lock(&group->notification_lock);
+@@@ -361,17 -878,21 +420,30 @@@ static ssize_t fanotify_write(struct fi
+  
+  	group = file->private_data;
+  
+++<<<<<<< HEAD
+ +	if (count > sizeof(response))
+ +		count = sizeof(response);
+ +
+ +	pr_debug("%s: group=%p count=%zu\n", __func__, group, count);
+ +
+ +	if (copy_from_user(&response, buf, count))
+++=======
++ 	pr_debug("%s: group=%p count=%zu\n", __func__, group, count);
++ 
++ 	if (count < sizeof(response))
++ 		return -EINVAL;
++ 
++ 	if (copy_from_user(&response, buf, sizeof(response)))
+++>>>>>>> 70529a199574 (fanotify: define struct members to hold response decision context)
+  		return -EFAULT;
+  
+- 	ret = process_access_response(group, &response);
++ 	info_len = count - sizeof(response);
++ 
++ 	ret = process_access_response(group, &response, info_buf, info_len);
+  	if (ret < 0)
+  		count = ret;
++ 	else
++ 		count = sizeof(response) + ret;
+  
+  	return count;
+  }
+@@@ -413,8 -936,8 +485,13 @@@ static int fanotify_release(struct inod
+  			spin_unlock(&group->notification_lock);
+  			fsnotify_destroy_event(group, fsn_event);
+  		} else {
+++<<<<<<< HEAD
+ +			finish_permission_event(group, FANOTIFY_PE(fsn_event),
+ +						FAN_ALLOW);
+++=======
++ 			finish_permission_event(group, FANOTIFY_PERM(event),
++ 						FAN_ALLOW, NULL);
+++>>>>>>> 70529a199574 (fanotify: define struct members to hold response decision context)
+  		}
+  		spin_lock(&group->notification_lock);
+  	}
+diff --cc include/uapi/linux/fanotify.h
+index 607073a627dc,cd14c94e9a1e..000000000000
+--- a/include/uapi/linux/fanotify.h
++++ b/include/uapi/linux/fanotify.h
+@@@ -104,6 -137,71 +104,74 @@@ struct fanotify_event_metadata 
+  	__s32 pid;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define FAN_EVENT_INFO_TYPE_FID		1
++ #define FAN_EVENT_INFO_TYPE_DFID_NAME	2
++ #define FAN_EVENT_INFO_TYPE_DFID	3
++ #define FAN_EVENT_INFO_TYPE_PIDFD	4
++ #define FAN_EVENT_INFO_TYPE_ERROR	5
++ 
++ /* Special info types for FAN_RENAME */
++ #define FAN_EVENT_INFO_TYPE_OLD_DFID_NAME	10
++ /* Reserved for FAN_EVENT_INFO_TYPE_OLD_DFID	11 */
++ #define FAN_EVENT_INFO_TYPE_NEW_DFID_NAME	12
++ /* Reserved for FAN_EVENT_INFO_TYPE_NEW_DFID	13 */
++ 
++ /* Variable length info record following event metadata */
++ struct fanotify_event_info_header {
++ 	__u8 info_type;
++ 	__u8 pad;
++ 	__u16 len;
++ };
++ 
++ /*
++  * Unique file identifier info record.
++  * This structure is used for records of types FAN_EVENT_INFO_TYPE_FID,
++  * FAN_EVENT_INFO_TYPE_DFID and FAN_EVENT_INFO_TYPE_DFID_NAME.
++  * For FAN_EVENT_INFO_TYPE_DFID_NAME there is additionally a null terminated
++  * name immediately after the file handle.
++  */
++ struct fanotify_event_info_fid {
++ 	struct fanotify_event_info_header hdr;
++ 	__kernel_fsid_t fsid;
++ 	/*
++ 	 * Following is an opaque struct file_handle that can be passed as
++ 	 * an argument to open_by_handle_at(2).
++ 	 */
++ 	unsigned char handle[];
++ };
++ 
++ /*
++  * This structure is used for info records of type FAN_EVENT_INFO_TYPE_PIDFD.
++  * It holds a pidfd for the pid that was responsible for generating an event.
++  */
++ struct fanotify_event_info_pidfd {
++ 	struct fanotify_event_info_header hdr;
++ 	__s32 pidfd;
++ };
++ 
++ struct fanotify_event_info_error {
++ 	struct fanotify_event_info_header hdr;
++ 	__s32 error;
++ 	__u32 error_count;
++ };
++ 
++ /*
++  * User space may need to record additional information about its decision.
++  * The extra information type records what kind of information is included.
++  * The default is none. We also define an extra information buffer whose
++  * size is determined by the extra information type.
++  *
++  * If the information type is Audit Rule, then the information following
++  * is the rule number that triggered the user space decision that
++  * requires auditing.
++  */
++ 
++ #define FAN_RESPONSE_INFO_NONE		0
++ #define FAN_RESPONSE_INFO_AUDIT_RULE	1
++ 
+++>>>>>>> 70529a199574 (fanotify: define struct members to hold response decision context)
+  struct fanotify_response {
+  	__s32 fd;
+  	__u32 response;
+* Unmerged path fs/notify/fanotify/fanotify.c
+diff --git a/fs/notify/fanotify/fanotify.h b/fs/notify/fanotify/fanotify.h
+index 7b84ea462af0..0af389b7edcc 100644
+--- a/fs/notify/fanotify/fanotify.h
++++ b/fs/notify/fanotify/fanotify.h
+@@ -42,6 +42,10 @@ struct fanotify_perm_event {
+ 	unsigned short response;	/* userspace answer to the event */
+ 	unsigned short state;		/* state of the event */
+ 	int fd;		/* fd we passed to userspace for this event */
++	union {
++		struct fanotify_response_info_header hdr;
++		struct fanotify_response_info_audit_rule audit_rule;
++	};
+ };
+ 
+ static inline struct fanotify_perm_event *
+* Unmerged path fs/notify/fanotify/fanotify_user.c
+diff --git a/include/linux/fanotify.h b/include/linux/fanotify.h
+index 2469815a3b65..c50523693ae6 100644
+--- a/include/linux/fanotify.h
++++ b/include/linux/fanotify.h
+@@ -53,6 +53,11 @@
+ #define ALL_FANOTIFY_EVENT_BITS		(FANOTIFY_OUTGOING_EVENTS | \
+ 					 FANOTIFY_EVENT_FLAGS)
+ 
++/* These masks check for invalid bits in permission responses. */
++#define FANOTIFY_RESPONSE_ACCESS (FAN_ALLOW | FAN_DENY)
++#define FANOTIFY_RESPONSE_FLAGS (FAN_AUDIT | FAN_INFO)
++#define FANOTIFY_RESPONSE_VALID_MASK (FANOTIFY_RESPONSE_ACCESS | FANOTIFY_RESPONSE_FLAGS)
++
+ /* Do not use these old uapi constants internally */
+ #undef FAN_ALL_CLASS_BITS
+ #undef FAN_ALL_INIT_FLAGS
+* Unmerged path include/uapi/linux/fanotify.h
