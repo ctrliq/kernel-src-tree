@@ -957,7 +957,7 @@ static void stmmac_validate(struct phylink_config *config,
 
 	/* If PCS is supported, check which modes it supports. */
 	if (priv->hw->xpcs)
-		xpcs_validate(&priv->hw->xpcs_args, supported, state);
+		xpcs_validate(priv->hw->xpcs_args, supported, state);
 }
 
 static void stmmac_mac_pcs_get_state(struct phylink_config *config,
@@ -966,7 +966,7 @@ static void stmmac_mac_pcs_get_state(struct phylink_config *config,
 	struct stmmac_priv *priv = netdev_priv(to_net_dev(config->dev));
 
 	state->link = 0;
-	stmmac_xpcs_get_state(priv, &priv->hw->xpcs_args, state);
+	stmmac_xpcs_get_state(priv, priv->hw->xpcs_args, state);
 }
 
 static void stmmac_mac_config(struct phylink_config *config, unsigned int mode,
@@ -974,7 +974,7 @@ static void stmmac_mac_config(struct phylink_config *config, unsigned int mode,
 {
 	struct stmmac_priv *priv = netdev_priv(to_net_dev(config->dev));
 
-	stmmac_xpcs_config(priv, &priv->hw->xpcs_args, state);
+	stmmac_xpcs_config(priv, priv->hw->xpcs_args, state);
 }
 
 static void stmmac_mac_an_restart(struct phylink_config *config)
@@ -1021,7 +1021,7 @@ static void stmmac_mac_link_up(struct phylink_config *config,
 	struct stmmac_priv *priv = netdev_priv(to_net_dev(config->dev));
 	u32 ctrl;
 
-	stmmac_xpcs_link_up(priv, &priv->hw->xpcs_args, speed, interface);
+	stmmac_xpcs_link_up(priv, priv->hw->xpcs_args, speed, interface);
 
 	ctrl = readl(priv->ioaddr + MAC_CTRL_REG);
 	ctrl &= ~priv->hw->link.speed_mask;
@@ -3221,7 +3221,7 @@ static int stmmac_open(struct net_device *dev)
 	if (priv->hw->pcs != STMMAC_PCS_TBI &&
 	    priv->hw->pcs != STMMAC_PCS_RTBI &&
 	    (!priv->hw->xpcs ||
-	     xpcs_get_an_mode(&priv->hw->xpcs_args, mode) != DW_AN_C73)) {
+	     xpcs_get_an_mode(priv->hw->xpcs_args, mode) != DW_AN_C73)) {
 		ret = stmmac_init_phy(dev);
 		if (ret) {
 			netdev_err(priv->dev,
