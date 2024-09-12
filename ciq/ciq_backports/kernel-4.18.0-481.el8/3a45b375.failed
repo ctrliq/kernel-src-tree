@@ -1,0 +1,330 @@
+x86/sev: Register SEV-SNP guest request platform device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Brijesh Singh <brijesh.singh@amd.com>
+commit 3a45b3753849c4a12cca2dd176c0192cd2a63e62
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/3a45b375.failed
+
+Version 2 of the GHCB specification provides a Non Automatic Exit (NAE)
+event type that can be used by the SEV-SNP guest to communicate with the
+PSP without risk from a malicious hypervisor who wishes to read, alter,
+drop or replay the messages sent.
+
+SNP_LAUNCH_UPDATE can insert two special pages into the guest’s memory:
+the secrets page and the CPUID page. The PSP firmware populates the
+contents of the secrets page. The secrets page contains encryption keys
+used by the guest to interact with the firmware. Because the secrets
+page is encrypted with the guest’s memory encryption key, the hypervisor
+cannot read the keys. See SEV-SNP firmware spec for further details on
+the secrets page format.
+
+Create a platform device that the SEV-SNP guest driver can bind to get
+the platform resources such as encryption key and message id to use to
+communicate with the PSP. The SEV-SNP guest driver provides a userspace
+interface to get the attestation report, key derivation, extended
+attestation report etc.
+
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20220307213356.2797205-43-brijesh.singh@amd.com
+(cherry picked from commit 3a45b3753849c4a12cca2dd176c0192cd2a63e62)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/sev.h
+#	arch/x86/kernel/sev.c
+diff --cc arch/x86/include/asm/sev.h
+index 904ff9242b92,9c2d33f1cfee..000000000000
+--- a/arch/x86/include/asm/sev.h
++++ b/arch/x86/include/asm/sev.h
+@@@ -81,6 -82,23 +81,26 @@@ extern bool handle_vc_boot_ghcb(struct 
+  /* Software defined (when rFlags.CF = 1) */
+  #define PVALIDATE_FAIL_NOUPDATE		255
+  
+++<<<<<<< HEAD
+++=======
++ /* RMP page size */
++ #define RMP_PG_SIZE_4K			0
++ 
++ #define RMPADJUST_VMSA_PAGE_BIT		BIT(16)
++ 
++ /* SNP Guest message request */
++ struct snp_req_data {
++ 	unsigned long req_gpa;
++ 	unsigned long resp_gpa;
++ 	unsigned long data_gpa;
++ 	unsigned int data_npages;
++ };
++ 
++ struct snp_guest_platform_data {
++ 	u64 secrets_gpa;
++ };
++ 
+++>>>>>>> 3a45b3753849 (x86/sev: Register SEV-SNP guest request platform device)
+  #ifdef CONFIG_AMD_MEM_ENCRYPT
+  extern struct static_key_false sev_es_enable_key;
+  extern void __sev_es_ist_enter(struct pt_regs *regs);
+diff --cc arch/x86/kernel/sev.c
+index 9f3a4a57b1e6,ace43e116b40..000000000000
+--- a/arch/x86/kernel/sev.c
++++ b/arch/x86/kernel/sev.c
+@@@ -19,6 -18,10 +19,13 @@@
+  #include <linux/memblock.h>
+  #include <linux/kernel.h>
+  #include <linux/mm.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/cpumask.h>
++ #include <linux/efi.h>
++ #include <linux/platform_device.h>
++ #include <linux/io.h>
+++>>>>>>> 3a45b3753849 (x86/sev: Register SEV-SNP guest request platform device)
+  
+  #include <asm/cpu_entry_area.h>
+  #include <asm/stacktrace.h>
+@@@ -1492,3 -1985,237 +1499,240 @@@ fail
+  	while (true)
+  		halt();
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Initial set up of SNP relies on information provided by the
++  * Confidential Computing blob, which can be passed to the kernel
++  * in the following ways, depending on how it is booted:
++  *
++  * - when booted via the boot/decompress kernel:
++  *   - via boot_params
++  *
++  * - when booted directly by firmware/bootloader (e.g. CONFIG_PVH):
++  *   - via a setup_data entry, as defined by the Linux Boot Protocol
++  *
++  * Scan for the blob in that order.
++  */
++ static __init struct cc_blob_sev_info *find_cc_blob(struct boot_params *bp)
++ {
++ 	struct cc_blob_sev_info *cc_info;
++ 
++ 	/* Boot kernel would have passed the CC blob via boot_params. */
++ 	if (bp->cc_blob_address) {
++ 		cc_info = (struct cc_blob_sev_info *)(unsigned long)bp->cc_blob_address;
++ 		goto found_cc_info;
++ 	}
++ 
++ 	/*
++ 	 * If kernel was booted directly, without the use of the
++ 	 * boot/decompression kernel, the CC blob may have been passed via
++ 	 * setup_data instead.
++ 	 */
++ 	cc_info = find_cc_blob_setup_data(bp);
++ 	if (!cc_info)
++ 		return NULL;
++ 
++ found_cc_info:
++ 	if (cc_info->magic != CC_BLOB_SEV_HDR_MAGIC)
++ 		snp_abort();
++ 
++ 	return cc_info;
++ }
++ 
++ bool __init snp_init(struct boot_params *bp)
++ {
++ 	struct cc_blob_sev_info *cc_info;
++ 
++ 	if (!bp)
++ 		return false;
++ 
++ 	cc_info = find_cc_blob(bp);
++ 	if (!cc_info)
++ 		return false;
++ 
++ 	setup_cpuid_table(cc_info);
++ 
++ 	/*
++ 	 * The CC blob will be used later to access the secrets page. Cache
++ 	 * it here like the boot kernel does.
++ 	 */
++ 	bp->cc_blob_address = (u32)(unsigned long)cc_info;
++ 
++ 	return true;
++ }
++ 
++ void __init snp_abort(void)
++ {
++ 	sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
++ }
++ 
++ static void dump_cpuid_table(void)
++ {
++ 	const struct snp_cpuid_table *cpuid_table = snp_cpuid_get_table();
++ 	int i = 0;
++ 
++ 	pr_info("count=%d reserved=0x%x reserved2=0x%llx\n",
++ 		cpuid_table->count, cpuid_table->__reserved1, cpuid_table->__reserved2);
++ 
++ 	for (i = 0; i < SNP_CPUID_COUNT_MAX; i++) {
++ 		const struct snp_cpuid_fn *fn = &cpuid_table->fn[i];
++ 
++ 		pr_info("index=%3d fn=0x%08x subfn=0x%08x: eax=0x%08x ebx=0x%08x ecx=0x%08x edx=0x%08x xcr0_in=0x%016llx xss_in=0x%016llx reserved=0x%016llx\n",
++ 			i, fn->eax_in, fn->ecx_in, fn->eax, fn->ebx, fn->ecx,
++ 			fn->edx, fn->xcr0_in, fn->xss_in, fn->__reserved);
++ 	}
++ }
++ 
++ /*
++  * It is useful from an auditing/testing perspective to provide an easy way
++  * for the guest owner to know that the CPUID table has been initialized as
++  * expected, but that initialization happens too early in boot to print any
++  * sort of indicator, and there's not really any other good place to do it,
++  * so do it here.
++  */
++ static int __init report_cpuid_table(void)
++ {
++ 	const struct snp_cpuid_table *cpuid_table = snp_cpuid_get_table();
++ 
++ 	if (!cpuid_table->count)
++ 		return 0;
++ 
++ 	pr_info("Using SNP CPUID table, %d entries present.\n",
++ 		cpuid_table->count);
++ 
++ 	if (sev_cfg.debug)
++ 		dump_cpuid_table();
++ 
++ 	return 0;
++ }
++ arch_initcall(report_cpuid_table);
++ 
++ static int __init init_sev_config(char *str)
++ {
++ 	char *s;
++ 
++ 	while ((s = strsep(&str, ","))) {
++ 		if (!strcmp(s, "debug")) {
++ 			sev_cfg.debug = true;
++ 			continue;
++ 		}
++ 
++ 		pr_info("SEV command-line option '%s' was not recognized\n", s);
++ 	}
++ 
++ 	return 1;
++ }
++ __setup("sev=", init_sev_config);
++ 
++ int snp_issue_guest_request(u64 exit_code, struct snp_req_data *input, unsigned long *fw_err)
++ {
++ 	struct ghcb_state state;
++ 	struct es_em_ctxt ctxt;
++ 	unsigned long flags;
++ 	struct ghcb *ghcb;
++ 	int ret;
++ 
++ 	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
++ 		return -ENODEV;
++ 
++ 	if (!fw_err)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * __sev_get_ghcb() needs to run with IRQs disabled because it is using
++ 	 * a per-CPU GHCB.
++ 	 */
++ 	local_irq_save(flags);
++ 
++ 	ghcb = __sev_get_ghcb(&state);
++ 	if (!ghcb) {
++ 		ret = -EIO;
++ 		goto e_restore_irq;
++ 	}
++ 
++ 	vc_ghcb_invalidate(ghcb);
++ 
++ 	if (exit_code == SVM_VMGEXIT_EXT_GUEST_REQUEST) {
++ 		ghcb_set_rax(ghcb, input->data_gpa);
++ 		ghcb_set_rbx(ghcb, input->data_npages);
++ 	}
++ 
++ 	ret = sev_es_ghcb_hv_call(ghcb, true, &ctxt, exit_code, input->req_gpa, input->resp_gpa);
++ 	if (ret)
++ 		goto e_put;
++ 
++ 	if (ghcb->save.sw_exit_info_2) {
++ 		/* Number of expected pages are returned in RBX */
++ 		if (exit_code == SVM_VMGEXIT_EXT_GUEST_REQUEST &&
++ 		    ghcb->save.sw_exit_info_2 == SNP_GUEST_REQ_INVALID_LEN)
++ 			input->data_npages = ghcb_get_rbx(ghcb);
++ 
++ 		*fw_err = ghcb->save.sw_exit_info_2;
++ 
++ 		ret = -EIO;
++ 	}
++ 
++ e_put:
++ 	__sev_put_ghcb(&state);
++ e_restore_irq:
++ 	local_irq_restore(flags);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(snp_issue_guest_request);
++ 
++ static struct platform_device guest_req_device = {
++ 	.name		= "snp-guest",
++ 	.id		= -1,
++ };
++ 
++ static u64 get_secrets_page(void)
++ {
++ 	u64 pa_data = boot_params.cc_blob_address;
++ 	struct cc_blob_sev_info info;
++ 	void *map;
++ 
++ 	/*
++ 	 * The CC blob contains the address of the secrets page, check if the
++ 	 * blob is present.
++ 	 */
++ 	if (!pa_data)
++ 		return 0;
++ 
++ 	map = early_memremap(pa_data, sizeof(info));
++ 	memcpy(&info, map, sizeof(info));
++ 	early_memunmap(map, sizeof(info));
++ 
++ 	/* smoke-test the secrets page passed */
++ 	if (!info.secrets_phys || info.secrets_len != PAGE_SIZE)
++ 		return 0;
++ 
++ 	return info.secrets_phys;
++ }
++ 
++ static int __init snp_init_platform_device(void)
++ {
++ 	struct snp_guest_platform_data data;
++ 	u64 gpa;
++ 
++ 	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
++ 		return -ENODEV;
++ 
++ 	gpa = get_secrets_page();
++ 	if (!gpa)
++ 		return -ENODEV;
++ 
++ 	data.secrets_gpa = gpa;
++ 	if (platform_device_add_data(&guest_req_device, &data, sizeof(data)))
++ 		return -ENODEV;
++ 
++ 	if (platform_device_register(&guest_req_device))
++ 		return -ENODEV;
++ 
++ 	pr_info("SNP guest platform device initialized.\n");
++ 	return 0;
++ }
++ device_initcall(snp_init_platform_device);
+++>>>>>>> 3a45b3753849 (x86/sev: Register SEV-SNP guest request platform device)
+* Unmerged path arch/x86/include/asm/sev.h
+* Unmerged path arch/x86/kernel/sev.c
