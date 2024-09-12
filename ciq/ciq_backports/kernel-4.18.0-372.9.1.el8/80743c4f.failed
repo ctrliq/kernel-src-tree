@@ -1,0 +1,418 @@
+net/mlx5e: Add TX max rate support for MQPRIO channel mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Tariq Toukan <tariqt@nvidia.com>
+commit 80743c4f8d34fcfdb3b6a35926316207813659ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/80743c4f.failed
+
+Add driver max_rate support for the MQPRIO bw_rlimit shaper
+in channel mode.
+
+	Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+	Reviewed-by: Maxim Mikityanskiy <maximmi@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 80743c4f8d34fcfdb3b6a35926316207813659ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 0ab66168d8dc,a3a4fece0cac..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -252,11 -247,18 +252,22 @@@ struct mlx5e_params 
+  	u8  rq_wq_type;
+  	u8  log_rq_mtu_frames;
+  	u16 num_channels;
+++<<<<<<< HEAD
+ +	u8  num_tc;
+++=======
++ 	struct {
++ 		u16 mode;
++ 		u8 num_tc;
++ 		struct netdev_tc_txq tc_to_txq[TC_MAX_QUEUE];
++ 		struct {
++ 			struct mlx5e_mqprio_rl *rl;
++ 		} channel;
++ 	} mqprio;
+++>>>>>>> 80743c4f8d34 (net/mlx5e: Add TX max rate support for MQPRIO channel mode)
+  	bool rx_cqe_compress_def;
+ -	bool tunneled_offload_en;
+  	struct dim_cq_moder rx_cq_moderation;
+  	struct dim_cq_moder tx_cq_moderation;
+ +	bool tunneled_offload_en;
+  	bool lro_en;
+  	u8  tx_min_inline_mode;
+  	bool vlan_strip_disable;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index ac7110bf7c94,e81e5505207c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -1714,11 -1741,17 +1744,17 @@@ static int mlx5e_open_sqs(struct mlx5e_
+  {
+  	int err, tc;
+  
+ -	for (tc = 0; tc < mlx5e_get_dcb_num_tc(params); tc++) {
+ +	for (tc = 0; tc < params->num_tc; tc++) {
+  		int txq_ix = c->ix + tc * params->num_channels;
++ 		u32 qos_queue_group_id;
++ 
++ 		err = mlx5e_txq_get_qos_node_hw_id(params, txq_ix, &qos_queue_group_id);
++ 		if (err)
++ 			goto err_close_sqs;
+  
+  		err = mlx5e_open_txqsq(c, c->priv->tisn[c->lag_port][tc], txq_ix,
+- 				       params, &cparam->txq_sq, &c->sq[tc], tc, 0,
++ 				       params, &cparam->txq_sq, &c->sq[tc], tc,
++ 				       qos_queue_group_id,
+  				       &c->priv->channel_stats[c->ix].sq[tc]);
+  		if (err)
+  			goto err_close_sqs;
+@@@ -3372,20 -2910,191 +3415,197 @@@ static int mlx5e_modify_channels_vsd(st
+  	return 0;
+  }
+  
+ -static void mlx5e_mqprio_build_default_tc_to_txq(struct netdev_tc_txq *tc_to_txq,
+ -						 int ntc, int nch)
+ +static int mlx5e_setup_tc_mqprio(struct mlx5e_priv *priv,
+ +				 struct tc_mqprio_qopt *mqprio)
+  {
+++<<<<<<< HEAD
+ +	struct mlx5e_channels new_channels = {};
+++=======
++ 	int tc;
++ 
++ 	memset(tc_to_txq, 0, sizeof(*tc_to_txq) * TC_MAX_QUEUE);
++ 
++ 	/* Map netdev TCs to offset 0.
++ 	 * We have our own UP to TXQ mapping for DCB mode of QoS
++ 	 */
++ 	for (tc = 0; tc < ntc; tc++) {
++ 		tc_to_txq[tc] = (struct netdev_tc_txq) {
++ 			.count = nch,
++ 			.offset = 0,
++ 		};
++ 	}
++ }
++ 
++ static void mlx5e_mqprio_build_tc_to_txq(struct netdev_tc_txq *tc_to_txq,
++ 					 struct tc_mqprio_qopt *qopt)
++ {
++ 	int tc;
++ 
++ 	for (tc = 0; tc < TC_MAX_QUEUE; tc++) {
++ 		tc_to_txq[tc] = (struct netdev_tc_txq) {
++ 			.count = qopt->count[tc],
++ 			.offset = qopt->offset[tc],
++ 		};
++ 	}
++ }
++ 
++ static void mlx5e_params_mqprio_dcb_set(struct mlx5e_params *params, u8 num_tc)
++ {
++ 	params->mqprio.mode = TC_MQPRIO_MODE_DCB;
++ 	params->mqprio.num_tc = num_tc;
++ 	params->mqprio.channel.rl = NULL;
++ 	mlx5e_mqprio_build_default_tc_to_txq(params->mqprio.tc_to_txq, num_tc,
++ 					     params->num_channels);
++ }
++ 
++ static void mlx5e_params_mqprio_channel_set(struct mlx5e_params *params,
++ 					    struct tc_mqprio_qopt *qopt,
++ 					    struct mlx5e_mqprio_rl *rl)
++ {
++ 	params->mqprio.mode = TC_MQPRIO_MODE_CHANNEL;
++ 	params->mqprio.num_tc = qopt->num_tc;
++ 	params->mqprio.channel.rl = rl;
++ 	mlx5e_mqprio_build_tc_to_txq(params->mqprio.tc_to_txq, qopt);
++ }
++ 
++ static void mlx5e_params_mqprio_reset(struct mlx5e_params *params)
++ {
++ 	mlx5e_params_mqprio_dcb_set(params, 1);
++ }
++ 
++ static int mlx5e_setup_tc_mqprio_dcb(struct mlx5e_priv *priv,
++ 				     struct tc_mqprio_qopt *mqprio)
++ {
++ 	struct mlx5e_params new_params;
+++>>>>>>> 80743c4f8d34 (net/mlx5e: Add TX max rate support for MQPRIO channel mode)
+  	u8 tc = mqprio->num_tc;
+ -	int err;
+ +	int err = 0;
+  
+  	mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
+  
+  	if (tc && tc != MLX5E_MAX_NUM_TC)
+  		return -EINVAL;
+  
+ -	new_params = priv->channels.params;
+ -	mlx5e_params_mqprio_dcb_set(&new_params, tc ? tc : 1);
+ +	mutex_lock(&priv->state_lock);
+  
+++<<<<<<< HEAD
+++=======
++ 	err = mlx5e_safe_switch_params(priv, &new_params,
++ 				       mlx5e_num_channels_changed_ctx, NULL, true);
++ 
++ 	priv->max_opened_tc = max_t(u8, priv->max_opened_tc,
++ 				    mlx5e_get_dcb_num_tc(&priv->channels.params));
++ 	return err;
++ }
++ 
++ static int mlx5e_mqprio_channel_validate(struct mlx5e_priv *priv,
++ 					 struct tc_mqprio_qopt_offload *mqprio)
++ {
++ 	struct net_device *netdev = priv->netdev;
++ 	struct mlx5e_ptp *ptp_channel;
++ 	int agg_count = 0;
++ 	int i;
++ 
++ 	ptp_channel = priv->channels.ptp;
++ 	if (ptp_channel && test_bit(MLX5E_PTP_STATE_TX, ptp_channel->state)) {
++ 		netdev_err(netdev,
++ 			   "Cannot activate MQPRIO mode channel since it conflicts with TX port TS\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (mqprio->qopt.offset[0] != 0 || mqprio->qopt.num_tc < 1 ||
++ 	    mqprio->qopt.num_tc > MLX5E_MAX_NUM_MQPRIO_CH_TC)
++ 		return -EINVAL;
++ 
++ 	for (i = 0; i < mqprio->qopt.num_tc; i++) {
++ 		if (!mqprio->qopt.count[i]) {
++ 			netdev_err(netdev, "Zero size for queue-group (%d) is not supported\n", i);
++ 			return -EINVAL;
++ 		}
++ 		if (mqprio->min_rate[i]) {
++ 			netdev_err(netdev, "Min tx rate is not supported\n");
++ 			return -EINVAL;
++ 		}
++ 
++ 		if (mqprio->max_rate[i]) {
++ 			int err;
++ 
++ 			err = mlx5e_qos_bytes_rate_check(priv->mdev, mqprio->max_rate[i]);
++ 			if (err)
++ 				return err;
++ 		}
++ 
++ 		if (mqprio->qopt.offset[i] != agg_count) {
++ 			netdev_err(netdev, "Discontinuous queues config is not supported\n");
++ 			return -EINVAL;
++ 		}
++ 		agg_count += mqprio->qopt.count[i];
++ 	}
++ 
++ 	if (priv->channels.params.num_channels < agg_count) {
++ 		netdev_err(netdev, "Num of queues (%d) exceeds available (%d)\n",
++ 			   agg_count, priv->channels.params.num_channels);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static bool mlx5e_mqprio_rate_limit(struct tc_mqprio_qopt_offload *mqprio)
++ {
++ 	int tc;
++ 
++ 	for (tc = 0; tc < mqprio->qopt.num_tc; tc++)
++ 		if (mqprio->max_rate[tc])
++ 			return true;
++ 	return false;
++ }
++ 
++ static int mlx5e_setup_tc_mqprio_channel(struct mlx5e_priv *priv,
++ 					 struct tc_mqprio_qopt_offload *mqprio)
++ {
++ 	mlx5e_fp_preactivate preactivate;
++ 	struct mlx5e_params new_params;
++ 	struct mlx5e_mqprio_rl *rl;
++ 	bool nch_changed;
++ 	int err;
++ 
++ 	err = mlx5e_mqprio_channel_validate(priv, mqprio);
++ 	if (err)
++ 		return err;
++ 
++ 	rl = NULL;
++ 	if (mlx5e_mqprio_rate_limit(mqprio)) {
++ 		rl = mlx5e_mqprio_rl_alloc();
++ 		if (!rl)
++ 			return -ENOMEM;
++ 		err = mlx5e_mqprio_rl_init(rl, priv->mdev, mqprio->qopt.num_tc,
++ 					   mqprio->max_rate);
++ 		if (err) {
++ 			mlx5e_mqprio_rl_free(rl);
++ 			return err;
++ 		}
++ 	}
++ 
++ 	new_params = priv->channels.params;
++ 	mlx5e_params_mqprio_channel_set(&new_params, &mqprio->qopt, rl);
++ 
++ 	nch_changed = mlx5e_get_dcb_num_tc(&priv->channels.params) > 1;
++ 	preactivate = nch_changed ? mlx5e_num_channels_changed_ctx :
++ 		mlx5e_update_netdev_queues_ctx;
++ 	err = mlx5e_safe_switch_params(priv, &new_params, preactivate, NULL, true);
++ 	if (err && rl) {
++ 		mlx5e_mqprio_rl_cleanup(rl);
++ 		mlx5e_mqprio_rl_free(rl);
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static int mlx5e_setup_tc_mqprio(struct mlx5e_priv *priv,
++ 				 struct tc_mqprio_qopt_offload *mqprio)
++ {
+++>>>>>>> 80743c4f8d34 (net/mlx5e: Add TX max rate support for MQPRIO channel mode)
+  	/* MQPRIO is another toplevel qdisc that can't be attached
+  	 * simultaneously with the offloaded HTB.
+  	 */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/qos.c b/drivers/net/ethernet/mellanox/mlx5/core/en/qos.c
+index 1d44f53ab34b..e5719bad58fd 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/qos.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/qos.c
+@@ -7,6 +7,21 @@
+ 
+ #define BYTES_IN_MBIT 125000
+ 
++int mlx5e_qos_bytes_rate_check(struct mlx5_core_dev *mdev, u64 nbytes)
++{
++	if (nbytes < BYTES_IN_MBIT) {
++		qos_warn(mdev, "Input rate (%llu Bytes/sec) below minimum supported (%u Bytes/sec)\n",
++			 nbytes, BYTES_IN_MBIT);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static u32 mlx5e_qos_bytes2mbits(struct mlx5_core_dev *mdev, u64 nbytes)
++{
++	return div_u64(nbytes, BYTES_IN_MBIT);
++}
++
+ int mlx5e_qos_max_leaf_nodes(struct mlx5_core_dev *mdev)
+ {
+ 	return min(MLX5E_QOS_MAX_LEAF_NODES, mlx5_qos_max_leaf_nodes(mdev));
+@@ -980,3 +995,87 @@ int mlx5e_htb_node_modify(struct mlx5e_priv *priv, u16 classid, u64 rate, u64 ce
+ 
+ 	return err;
+ }
++
++struct mlx5e_mqprio_rl {
++	struct mlx5_core_dev *mdev;
++	u32 root_id;
++	u32 *leaves_id;
++	u8 num_tc;
++};
++
++struct mlx5e_mqprio_rl *mlx5e_mqprio_rl_alloc(void)
++{
++	return kvzalloc(sizeof(struct mlx5e_mqprio_rl), GFP_KERNEL);
++}
++
++void mlx5e_mqprio_rl_free(struct mlx5e_mqprio_rl *rl)
++{
++	kvfree(rl);
++}
++
++int mlx5e_mqprio_rl_init(struct mlx5e_mqprio_rl *rl, struct mlx5_core_dev *mdev, u8 num_tc,
++			 u64 max_rate[])
++{
++	int err;
++	int tc;
++
++	if (!mlx5_qos_is_supported(mdev)) {
++		qos_warn(mdev, "Missing QoS capabilities. Try disabling SRIOV or use a supported device.");
++		return -EOPNOTSUPP;
++	}
++	if (num_tc > mlx5e_qos_max_leaf_nodes(mdev))
++		return -EINVAL;
++
++	rl->mdev = mdev;
++	rl->num_tc = num_tc;
++	rl->leaves_id = kvcalloc(num_tc, sizeof(*rl->leaves_id), GFP_KERNEL);
++	if (!rl->leaves_id)
++		return -ENOMEM;
++
++	err = mlx5_qos_create_root_node(mdev, &rl->root_id);
++	if (err)
++		goto err_free_leaves;
++
++	qos_dbg(mdev, "Root created, id %#x\n", rl->root_id);
++
++	for (tc = 0; tc < num_tc; tc++) {
++		u32 max_average_bw;
++
++		max_average_bw = mlx5e_qos_bytes2mbits(mdev, max_rate[tc]);
++		err = mlx5_qos_create_leaf_node(mdev, rl->root_id, 0, max_average_bw,
++						&rl->leaves_id[tc]);
++		if (err)
++			goto err_destroy_leaves;
++
++		qos_dbg(mdev, "Leaf[%d] created, id %#x, max average bw %u Mbits/sec\n",
++			tc, rl->leaves_id[tc], max_average_bw);
++	}
++	return 0;
++
++err_destroy_leaves:
++	while (--tc >= 0)
++		mlx5_qos_destroy_node(mdev, rl->leaves_id[tc]);
++	mlx5_qos_destroy_node(mdev, rl->root_id);
++err_free_leaves:
++	kvfree(rl->leaves_id);
++	return err;
++}
++
++void mlx5e_mqprio_rl_cleanup(struct mlx5e_mqprio_rl *rl)
++{
++	int tc;
++
++	for (tc = 0; tc < rl->num_tc; tc++)
++		mlx5_qos_destroy_node(rl->mdev, rl->leaves_id[tc]);
++	mlx5_qos_destroy_node(rl->mdev, rl->root_id);
++	kvfree(rl->leaves_id);
++}
++
++int mlx5e_mqprio_rl_get_node_hw_id(struct mlx5e_mqprio_rl *rl, int tc, u32 *hw_id)
++{
++	if (tc >= rl->num_tc)
++		return -EINVAL;
++
++	*hw_id = rl->leaves_id[tc];
++	return 0;
++}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/qos.h b/drivers/net/ethernet/mellanox/mlx5/core/en/qos.h
+index 757682b7c0e0..b7558907ba20 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/qos.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/qos.h
+@@ -12,6 +12,7 @@ struct mlx5e_priv;
+ struct mlx5e_channels;
+ struct mlx5e_channel;
+ 
++int mlx5e_qos_bytes_rate_check(struct mlx5_core_dev *mdev, u64 nbytes);
+ int mlx5e_qos_max_leaf_nodes(struct mlx5_core_dev *mdev);
+ int mlx5e_qos_cur_leaf_nodes(struct mlx5e_priv *priv);
+ 
+@@ -41,4 +42,12 @@ int mlx5e_htb_leaf_del_last(struct mlx5e_priv *priv, u16 classid, bool force,
+ int mlx5e_htb_node_modify(struct mlx5e_priv *priv, u16 classid, u64 rate, u64 ceil,
+ 			  struct netlink_ext_ack *extack);
+ 
++/* MQPRIO TX rate limit */
++struct mlx5e_mqprio_rl;
++struct mlx5e_mqprio_rl *mlx5e_mqprio_rl_alloc(void);
++void mlx5e_mqprio_rl_free(struct mlx5e_mqprio_rl *rl);
++int mlx5e_mqprio_rl_init(struct mlx5e_mqprio_rl *rl, struct mlx5_core_dev *mdev, u8 num_tc,
++			 u64 max_rate[]);
++void mlx5e_mqprio_rl_cleanup(struct mlx5e_mqprio_rl *rl);
++int mlx5e_mqprio_rl_get_node_hw_id(struct mlx5e_mqprio_rl *rl, int tc, u32 *hw_id);
+ #endif
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
