@@ -1,0 +1,174 @@
+efi/libstub/x86: Avoid overflowing code32_start on PE entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-541.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit 04a7d0e15606769ef58d5cee912c5d08d93ded92
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-541.el8/04a7d0e1.failed
+
+When using the native PE entry point (as opposed to the EFI handover
+protocol entry point that is used more widely), we set code32_start,
+which is a 32-bit wide field, to the effective symbol address of
+startup_32, which could overflow given that the EFI loader may have
+located the running image anywhere in memory, and we haven't reached
+the point yet where we relocate ourselves.
+
+Since we relocate ourselves if code32_start != pref_address, this
+isn't likely to lead to problems in practice, given how unlikely
+it is that the truncated effective address of startup_32 happens
+to equal pref_address. But it is better to defer the assignment
+of code32_start to after the relocation, when it is guaranteed to
+fit.
+
+While at it, move the call to efi_relocate_kernel() to an earlier
+stage so it is more likely that our preferred offset in memory has
+not been occupied by other memory allocations done in the mean time.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+(cherry picked from commit 04a7d0e15606769ef58d5cee912c5d08d93ded92)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/eboot.c
+diff --cc arch/x86/boot/compressed/eboot.c
+index 839950619e70,55637135b50c..000000000000
+--- a/arch/x86/boot/compressed/eboot.c
++++ b/arch/x86/boot/compressed/eboot.c
+@@@ -475,14 -439,15 +475,19 @@@ struct boot_params *make_boot_params(st
+  	boot_params->ext_ramdisk_image = (u64)ramdisk_addr >> 32;
+  	boot_params->ext_ramdisk_size  = (u64)ramdisk_size >> 32;
+  
+++<<<<<<< HEAD
+ +	return boot_params;
+++=======
++ 	efi_stub_entry(handle, sys_table, boot_params);
++ 	/* not reached */
+++>>>>>>> 04a7d0e15606 (efi/libstub/x86: Avoid overflowing code32_start on PE entry)
+  
+  fail2:
+ -	efi_free(options_size, hdr->cmd_line_ptr);
+ +	efi_free(sys_table, options_size, hdr->cmd_line_ptr);
+  fail:
+ -	efi_free(0x4000, (unsigned long)boot_params);
+ +	efi_free(sys_table, 0x4000, (unsigned long)boot_params);
+  
+ -	return status;
+ +	return NULL;
+  }
+  
+  static void add_e820ext(struct boot_params *params,
+@@@ -744,36 -701,38 +749,57 @@@ static efi_status_t exit_boot(struct bo
+   * On success we return a pointer to a boot_params structure, and NULL
+   * on failure.
+   */
+ -struct boot_params *efi_main(efi_handle_t handle,
+ -			     efi_system_table_t *sys_table_arg,
+ -			     struct boot_params *boot_params)
+ +struct boot_params *
+ +efi_main(struct efi_config *c, struct boot_params *boot_params)
+  {
+++<<<<<<< HEAD
+ +	struct desc_ptr *gdt = NULL;
+ +	efi_loaded_image_t *image;
+++=======
++ 	unsigned long bzimage_addr = (unsigned long)startup_32;
+++>>>>>>> 04a7d0e15606 (efi/libstub/x86: Avoid overflowing code32_start on PE entry)
+  	struct setup_header *hdr = &boot_params->hdr;
+  	efi_status_t status;
+ +	struct desc_struct *desc;
+ +	void *handle;
+ +	efi_system_table_t *_table;
+ +	bool is64;
+  	unsigned long cmdline_paddr;
+  
+ -	sys_table = sys_table_arg;
+ +	efi_early = c;
+ +
+ +	_table = (efi_system_table_t *)(unsigned long)efi_early->table;
+ +	handle = (void *)(unsigned long)efi_early->image_handle;
+ +	is64 = efi_early->is64;
+ +
+ +	sys_table = _table;
+  
+  	/* Check if we were booted by the EFI firmware */
+  	if (sys_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+  		goto fail;
+  
+ +	if (is64)
+ +		setup_boot_services64(efi_early);
+ +	else
+ +		setup_boot_services32(efi_early);
+ +
++ 	/*
++ 	 * If the kernel isn't already loaded at the preferred load
++ 	 * address, relocate it.
++ 	 */
++ 	if (bzimage_addr != hdr->pref_address) {
++ 		status = efi_relocate_kernel(&bzimage_addr,
++ 					     hdr->init_size, hdr->init_size,
++ 					     hdr->pref_address,
++ 					     hdr->kernel_alignment,
++ 					     LOAD_PHYSICAL_ADDR);
++ 		if (status != EFI_SUCCESS) {
++ 			efi_printk("efi_relocate_kernel() failed!\n");
++ 			goto fail;
++ 		}
++ 	}
++ 	hdr->code32_start = (u32)bzimage_addr;
++ 
+  	/*
+  	 * make_boot_params() may have been called before efi_main(), in which
+  	 * case this is the second time we parse the cmdline. This is ok,
+@@@ -800,44 -762,9 +826,48 @@@
+  
+  	setup_quirks(boot_params);
+  
+++<<<<<<< HEAD
+ +	status = efi_call_early(allocate_pool, EFI_LOADER_DATA,
+ +				sizeof(*gdt), (void **)&gdt);
+ +	if (status != EFI_SUCCESS) {
+ +		efi_printk(sys_table, "Failed to allocate memory for 'gdt' structure\n");
+ +		goto fail;
+ +	}
+ +
+ +	gdt->size = 0x800;
+ +	status = efi_low_alloc(sys_table, gdt->size, 8,
+ +			   (unsigned long *)&gdt->address);
+ +	if (status != EFI_SUCCESS) {
+ +		efi_printk(sys_table, "Failed to allocate memory for 'gdt'\n");
+ +		goto fail;
+ +	}
+ +
+ +	/*
+ +	 * If the kernel isn't already loaded at the preferred load
+ +	 * address, relocate it.
+ +	 */
+ +	if (hdr->pref_address != hdr->code32_start) {
+ +		unsigned long bzimage_addr = hdr->code32_start;
+ +		status = efi_relocate_kernel(sys_table, &bzimage_addr,
+ +					     hdr->init_size, hdr->init_size,
+ +					     hdr->pref_address,
+ +					     hdr->kernel_alignment,
+ +					     LOAD_PHYSICAL_ADDR);
+ +		if (status != EFI_SUCCESS) {
+ +			efi_printk(sys_table, "efi_relocate_kernel() failed!\n");
+ +			goto fail;
+ +		}
+ +
+ +		hdr->pref_address = hdr->code32_start;
+ +		hdr->code32_start = bzimage_addr;
+ +	}
+ +
+ +	status = exit_boot(boot_params, handle, is64);
+++=======
++ 	status = exit_boot(boot_params, handle);
+++>>>>>>> 04a7d0e15606 (efi/libstub/x86: Avoid overflowing code32_start on PE entry)
+  	if (status != EFI_SUCCESS) {
+ -		efi_printk("exit_boot() failed!\n");
+ +		efi_printk(sys_table, "exit_boot() failed!\n");
+  		goto fail;
+  	}
+  
+* Unmerged path arch/x86/boot/compressed/eboot.c
