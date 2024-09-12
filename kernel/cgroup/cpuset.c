@@ -168,6 +168,9 @@ struct cpuset {
 	 */
 	int use_parent_ecpus;
 	int child_ecpus_count;
+
+	/* Handle for cpuset.cpus.partition */
+	struct cgroup_file partition_file;
 };
 
 /*
@@ -269,6 +272,16 @@ static inline int is_spread_slab(const struct cpuset *cs)
 static inline int is_partition_root(const struct cpuset *cs)
 {
 	return cs->partition_root_state > 0;
+}
+
+/*
+ * Send notification event of whenever partition_root_state changes.
+ */
+static inline void notify_partition_change(struct cpuset *cs,
+					   int old_prs, int new_prs)
+{
+	if (old_prs != new_prs)
+		cgroup_file_notify(&cs->partition_file);
 }
 
 static struct cpuset top_cpuset = {
@@ -1197,7 +1210,7 @@ static int update_parent_subparts_cpumask(struct cpuset *cpuset, int cmd,
 	struct cpuset *parent = parent_cs(cpuset);
 	int adding;	/* Moving cpus from effective_cpus to subparts_cpus */
 	int deleting;	/* Moving cpus from subparts_cpus to effective_cpus */
-	int new_prs;
+	int old_prs, new_prs;
 	bool part_error = false;	/* Partition error? */
 
 	percpu_rwsem_assert_held(&cpuset_rwsem);
@@ -1233,7 +1246,7 @@ static int update_parent_subparts_cpumask(struct cpuset *cpuset, int cmd,
 	 * A cpumask update cannot make parent's effective_cpus become empty.
 	 */
 	adding = deleting = false;
-	new_prs = cpuset->partition_root_state;
+	old_prs = new_prs = cpuset->partition_root_state;
 	if (cmd == partcmd_enable) {
 		cpumask_copy(tmp->addmask, cpuset->cpus_allowed);
 		adding = true;
@@ -1323,7 +1336,7 @@ static int update_parent_subparts_cpumask(struct cpuset *cpuset, int cmd,
 				       parent->subparts_cpus);
 	}
 
-	if (!adding && !deleting && (new_prs == cpuset->partition_root_state))
+	if (!adding && !deleting && (new_prs == old_prs))
 		return 0;
 
 	/*
@@ -1351,9 +1364,11 @@ static int update_parent_subparts_cpumask(struct cpuset *cpuset, int cmd,
 
 	parent->nr_subparts_cpus = cpumask_weight(parent->subparts_cpus);
 
-	if (cpuset->partition_root_state != new_prs)
+	if (old_prs != new_prs)
 		cpuset->partition_root_state = new_prs;
+
 	spin_unlock_irq(&callback_lock);
+	notify_partition_change(cpuset, old_prs, new_prs);
 
 	return cmd == partcmd_update;
 }
@@ -1375,7 +1390,7 @@ static void update_cpumasks_hier(struct cpuset *cs, struct tmpmasks *tmp)
 	struct cpuset *cp;
 	struct cgroup_subsys_state *pos_css;
 	bool need_rebuild_sched_domains = false;
-	int new_prs;
+	int old_prs, new_prs;
 
 	rcu_read_lock();
 	cpuset_for_each_descendant_pre(cp, pos_css, cs) {
@@ -1415,8 +1430,8 @@ static void update_cpumasks_hier(struct cpuset *cs, struct tmpmasks *tmp)
 		 * update_tasks_cpumask() again for tasks in the parent
 		 * cpuset if the parent's subparts_cpus changes.
 		 */
-		new_prs = cp->partition_root_state;
-		if ((cp != cs) && new_prs) {
+		old_prs = new_prs = cp->partition_root_state;
+		if ((cp != cs) && old_prs) {
 			switch (parent->partition_root_state) {
 			case PRS_DISABLED:
 				/*
@@ -1487,10 +1502,11 @@ static void update_cpumasks_hier(struct cpuset *cs, struct tmpmasks *tmp)
 			}
 		}
 
-		if (new_prs != cp->partition_root_state)
+		if (new_prs != old_prs)
 			cp->partition_root_state = new_prs;
 
 		spin_unlock_irq(&callback_lock);
+		notify_partition_change(cp, old_prs, new_prs);
 
 		WARN_ON(!is_in_v2_mode() &&
 			!cpumask_equal(cp->cpus_allowed, cp->effective_cpus));
@@ -2078,6 +2094,7 @@ out:
 		spin_lock_irq(&callback_lock);
 		cs->partition_root_state = new_prs;
 		spin_unlock_irq(&callback_lock);
+		notify_partition_change(cs, old_prs, new_prs);
 	}
 
 	free_cpumasks(NULL, &tmpmask);
@@ -2768,6 +2785,7 @@ static struct cftype dfl_files[] = {
 		.write = sched_partition_write,
 		.private = FILE_PARTITION_ROOT,
 		.flags = CFTYPE_NOT_ON_ROOT,
+		.file_offset = offsetof(struct cpuset, partition_file),
 	},
 
 	{
@@ -3172,11 +3190,17 @@ retry:
 		 */
 		if ((parent->partition_root_state == PRS_ERROR) ||
 		     cpumask_empty(&new_cpus)) {
+			int old_prs;
+
 			update_parent_subparts_cpumask(cs, partcmd_disable,
 						       NULL, tmp);
-			spin_lock_irq(&callback_lock);
-			cs->partition_root_state = PRS_ERROR;
-			spin_unlock_irq(&callback_lock);
+			old_prs = cs->partition_root_state;
+			if (old_prs != PRS_ERROR) {
+				spin_lock_irq(&callback_lock);
+				cs->partition_root_state = PRS_ERROR;
+				spin_unlock_irq(&callback_lock);
+				notify_partition_change(cs, old_prs, PRS_ERROR);
+			}
 		}
 		cpuset_force_rebuild();
 	}
