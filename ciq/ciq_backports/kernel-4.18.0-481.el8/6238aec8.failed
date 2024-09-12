@@ -1,0 +1,117 @@
+NFS: don't store 'struct cred *' in struct nfs_access_entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author NeilBrown <neilb@suse.de>
+commit 6238aec83f3fb12132f964937e5bbcf248fea8f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/6238aec8.failed
+
+Storing the 'struct cred *' in nfs_access_entry is problematic.
+An active 'cred' can keep a 'struct key *' active, and a quota is
+imposed on the number of such keys that a user can maintain.
+Cached 'nfs_access_entry' structs have indefinite lifetime, and having
+these keep 'struct key's alive imposes on that quota.
+
+So remove the 'struct cred *' and replace it with the fields we need:
+  kuid_t, kgid_t, and struct group_info *
+
+This makes the 'struct nfs_access_entry' 64 bits larger.
+
+New function "access_cmp" is introduced which is identical to
+cred_fscmp() except that the second arg is an 'nfs_access_entry', rather
+than a 'cred'
+
+Fixes: b68572e07c58 ("NFS: change access cache to use 'struct cred'.")
+	Signed-off-by: NeilBrown <neilb@suse.de>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 6238aec83f3fb12132f964937e5bbcf248fea8f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/dir.c
+diff --cc fs/nfs/dir.c
+index 0ab405849d16,7dee3fd10382..000000000000
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@@ -2883,10 -2765,10 +2920,10 @@@ static int nfs_access_get_cached_rcu(st
+  	rcu_read_lock();
+  	if (nfsi->cache_validity & NFS_INO_INVALID_ACCESS)
+  		goto out;
+ -	lh = rcu_dereference(list_tail_rcu(&nfsi->access_cache_entry_lru));
+ +	lh = rcu_dereference(nfsi->access_cache_entry_lru.prev);
+  	cache = list_entry(lh, struct nfs_access_entry, lru);
+  	if (lh == &nfsi->access_cache_entry_lru ||
+- 	    cred_fscmp(cred, cache->cred) != 0)
++ 	    access_cmp(cred, cache) != 0)
+  		cache = NULL;
+  	if (cache == NULL)
+  		goto out;
+@@@ -2926,7 -2810,7 +2963,11 @@@ static void nfs_access_add_rbtree(struc
+  	while (*p != NULL) {
+  		parent = *p;
+  		entry = rb_entry(parent, struct nfs_access_entry, rb_node);
+++<<<<<<< HEAD
+ +		cmp = cred_fscmp(set->cred, entry->cred);
+++=======
++ 		cmp = access_cmp(cred, entry);
+++>>>>>>> 6238aec83f3f (NFS: don't store 'struct cred *' in struct nfs_access_entry)
+  
+  		if (cmp < 0)
+  			p = &parent->rb_left;
+@@@ -2954,7 -2839,9 +2995,13 @@@ void nfs_access_add_cache(struct inode 
+  	if (cache == NULL)
+  		return;
+  	RB_CLEAR_NODE(&cache->rb_node);
+++<<<<<<< HEAD
+ +	cache->cred = get_cred(set->cred);
+++=======
++ 	cache->fsuid = cred->fsuid;
++ 	cache->fsgid = cred->fsgid;
++ 	cache->group_info = get_group_info(cred->group_info);
+++>>>>>>> 6238aec83f3f (NFS: don't store 'struct cred *' in struct nfs_access_entry)
+  	cache->mask = set->mask;
+  
+  	/* The above field assignments must be visible
+@@@ -3047,8 -2934,7 +3094,12 @@@ static int nfs_do_access(struct inode *
+  		cache.mask |= NFS_ACCESS_DELETE | NFS_ACCESS_LOOKUP;
+  	else
+  		cache.mask |= NFS_ACCESS_EXECUTE;
+++<<<<<<< HEAD
+ +	cache.cred = cred;
+ +	status = NFS_PROTO(inode)->access(inode, &cache);
+++=======
++ 	status = NFS_PROTO(inode)->access(inode, &cache, cred);
+++>>>>>>> 6238aec83f3f (NFS: don't store 'struct cred *' in struct nfs_access_entry)
+  	if (status != 0) {
+  		if (status == -ESTALE) {
+  			if (!S_ISDIR(inode->i_mode))
+* Unmerged path fs/nfs/dir.c
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 82b7b1868222..97f19501e4ac 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -2649,7 +2649,6 @@ static int nfs4_opendata_access(const struct cred *cred,
+ 	} else if ((fmode & FMODE_READ) && !opendata->file_created)
+ 		mask = NFS4_ACCESS_READ;
+ 
+-	cache.cred = cred;
+ 	nfs_access_set_mask(&cache, opendata->o_res.access_result);
+ 	nfs_access_add_cache(state->inode, &cache);
+ 
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index 94a6b834caf8..b01988a4b0bf 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -61,7 +61,9 @@
+ struct nfs_access_entry {
+ 	struct rb_node		rb_node;
+ 	struct list_head	lru;
+-	const struct cred *	cred;
++	kuid_t			fsuid;
++	kgid_t			fsgid;
++	struct group_info	*group_info;
+ 	__u32			mask;
+ 	struct rcu_head		rcu_head;
+ };
