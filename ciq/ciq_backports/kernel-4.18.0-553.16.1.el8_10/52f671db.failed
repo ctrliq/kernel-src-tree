@@ -1,0 +1,97 @@
+net/sched: act_mirred: use the backlog for mirred ingress
+
+jira LE-1907
+cve CVE-2024-26740
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit 52f671db18823089a02f07efc04efdb2272ddc17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/52f671db.failed
+
+The test Davide added in commit ca22da2fbd69 ("act_mirred: use the backlog
+for nested calls to mirred ingress") hangs our testing VMs every 10 or so
+runs, with the familiar tcp_v4_rcv -> tcp_v4_rcv deadlock reported by
+lockdep.
+
+The problem as previously described by Davide (see Link) is that
+if we reverse flow of traffic with the redirect (egress -> ingress)
+we may reach the same socket which generated the packet. And we may
+still be holding its socket lock. The common solution to such deadlocks
+is to put the packet in the Rx backlog, rather than run the Rx path
+inline. Do that for all egress -> ingress reversals, not just once
+we started to nest mirred calls.
+
+In the past there was a concern that the backlog indirection will
+lead to loss of error reporting / less accurate stats. But the current
+workaround does not seem to address the issue.
+
+Fixes: 53592b364001 ("net/sched: act_mirred: Implement ingress actions")
+	Cc: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Suggested-by: Davide Caratti <dcaratti@redhat.com>
+Link: https://lore.kernel.org/netdev/33dc43f587ec1388ba456b4915c75f02a8aae226.1663945716.git.dcaratti@redhat.com/
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 52f671db18823089a02f07efc04efdb2272ddc17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_mirred.c
+diff --cc net/sched/act_mirred.c
+index 559044316ee7,291d47c9eb69..000000000000
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@@ -308,24 -306,20 +304,32 @@@ TC_INDIRECT_SCOPE int tcf_mirred_act(st
+  		}
+  	}
+  
+ -	skb_to_send->skb_iif = skb->dev->ifindex;
+ -	skb_to_send->dev = dev;
+ +	skb2->skb_iif = skb->dev->ifindex;
+ +	skb2->dev = dev;
+  
+ +	/* mirror is always swallowed */
+  	if (is_redirect) {
+ -		if (skb == skb_to_send)
+ -			retval = TC_ACT_CONSUMED;
+ -
+ +		skb_set_redirected(skb2, skb2->tc_at_ingress);
+ +
+++<<<<<<< HEAD
+ +		/* let's the caller reinsert the packet, if possible */
+ +		if (use_reinsert) {
+ +			err = tcf_mirred_forward(want_ingress, skb);
+ +			if (err)
+ +				tcf_action_inc_overlimit_qstats(&m->common);
+ +			__this_cpu_dec(mirred_nest_level);
+ +			return TC_ACT_CONSUMED;
+ +		}
+++=======
++ 		skb_set_redirected(skb_to_send, skb_to_send->tc_at_ingress);
++ 
++ 		err = tcf_mirred_forward(at_ingress, want_ingress, skb_to_send);
++ 	} else {
++ 		err = tcf_mirred_forward(at_ingress, want_ingress, skb_to_send);
+++>>>>>>> 52f671db1882 (net/sched: act_mirred: use the backlog for mirred ingress)
+  	}
+  
+ +	err = tcf_mirred_forward(want_ingress, skb2);
+  	if (err) {
+  out:
+  		tcf_action_inc_overlimit_qstats(&m->common);
+* Unmerged path net/sched/act_mirred.c
+diff --git a/tools/testing/selftests/net/forwarding/tc_actions.sh b/tools/testing/selftests/net/forwarding/tc_actions.sh
+index a96cff8e7219..1bb8011680ec 100755
+--- a/tools/testing/selftests/net/forwarding/tc_actions.sh
++++ b/tools/testing/selftests/net/forwarding/tc_actions.sh
+@@ -233,9 +233,6 @@ mirred_egress_to_ingress_tcp_test()
+ 	check_err $? "didn't mirred redirect ICMP"
+ 	tc_check_packets "dev $h1 ingress" 102 10
+ 	check_err $? "didn't drop mirred ICMP"
+-	local overlimits=$(tc_rule_stats_get ${h1} 101 egress .overlimits)
+-	test ${overlimits} = 10
+-	check_err $? "wrong overlimits, expected 10 got ${overlimits}"
+ 
+ 	tc filter del dev $h1 egress protocol ip pref 100 handle 100 flower
+ 	tc filter del dev $h1 egress protocol ip pref 101 handle 101 flower
