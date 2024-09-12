@@ -1,0 +1,129 @@
+s390/pkey: fix PKEY_TYPE_EP11_AES handling in PKEY_GENSECK2 IOCTL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-516.el8
+commit-author Holger Dengler <dengler@linux.ibm.com>
+commit fb249ce7f7bfd8621a38e4ad401ba74b680786d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-516.el8/fb249ce7.failed
+
+Commit 'fa6999e326fe ("s390/pkey: support CCA and EP11 secure ECC
+private keys")' introduced PKEY_TYPE_EP11_AES for the PKEY_GENSECK2
+IOCTL, to enable userspace to generate securekey blobs of this
+type. Unfortunately, all PKEY_GENSECK2 IOCTL requests for
+PKEY_TYPE_EP11_AES return with an error (-EINVAL). Fix the handling
+for PKEY_TYPE_EP11_AES in PKEY_GENSECK2 IOCTL, so that userspace can
+generate securekey blobs of this type.
+
+The start of the header and the keyblob, as well as the length need
+special handling, depending on the internal keyversion. Add a helper
+function that splits an uninitialized buffer into start and size of
+the header as well as start and size of the payload, depending on the
+requested keyversion.
+
+Do the header-related calculations and the raw genkey request handling
+in separate functions. Use the raw genkey request function for
+internal purposes.
+
+Fixes: fa6999e326fe ("s390/pkey: support CCA and EP11 secure ECC private keys")
+	Signed-off-by: Holger Dengler <dengler@linux.ibm.com>
+	Reviewed-by: Ingo Franzki <ifranzki@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit fb249ce7f7bfd8621a38e4ad401ba74b680786d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/zcrypt_ep11misc.c
+diff --cc drivers/s390/crypto/zcrypt_ep11misc.c
+index 33f111022bdf,51f6753e01c5..000000000000
+--- a/drivers/s390/crypto/zcrypt_ep11misc.c
++++ b/drivers/s390/crypto/zcrypt_ep11misc.c
+@@@ -1224,9 -1298,9 +1299,15 @@@ int ep11_clr2keyblob(u16 card, u16 doma
+  	}
+  
+  	/* Step 1: generate AES 256 bit random kek key */
+++<<<<<<< HEAD
+ +	rc = ep11_genaeskey(card, domain, 256,
+ +			    0x00006c00, /* EN/DECRYTP, WRAP/UNWRAP */
+ +			    kek, &keklen);
+++=======
++ 	rc = _ep11_genaeskey(card, domain, 256,
++ 			     0x00006c00, /* EN/DECRYPT, WRAP/UNWRAP */
++ 			     kek, &keklen);
+++>>>>>>> fb249ce7f7bf (s390/pkey: fix PKEY_TYPE_EP11_AES handling in PKEY_GENSECK2 IOCTL)
+  	if (rc) {
+  		DEBUG_ERR(
+  			"%s generate kek key failed, rc=%d\n",
+diff --git a/drivers/s390/crypto/pkey_api.c b/drivers/s390/crypto/pkey_api.c
+index 8dffc978fc35..51772f768e9f 100644
+--- a/drivers/s390/crypto/pkey_api.c
++++ b/drivers/s390/crypto/pkey_api.c
+@@ -565,6 +565,11 @@ static int pkey_genseckey2(const struct pkey_apqn *apqns, size_t nr_apqns,
+ 		if (*keybufsize < MINEP11AESKEYBLOBSIZE)
+ 			return -EINVAL;
+ 		break;
++	case PKEY_TYPE_EP11_AES:
++		if (*keybufsize < (sizeof(struct ep11kblob_header) +
++				   MINEP11AESKEYBLOBSIZE))
++			return -EINVAL;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -581,9 +586,10 @@ static int pkey_genseckey2(const struct pkey_apqn *apqns, size_t nr_apqns,
+ 	for (i = 0, rc = -ENODEV; i < nr_apqns; i++) {
+ 		card = apqns[i].card;
+ 		dom = apqns[i].domain;
+-		if (ktype == PKEY_TYPE_EP11) {
++		if (ktype == PKEY_TYPE_EP11 ||
++		    ktype == PKEY_TYPE_EP11_AES) {
+ 			rc = ep11_genaeskey(card, dom, ksize, kflags,
+-					    keybuf, keybufsize);
++					    keybuf, keybufsize, ktype);
+ 		} else if (ktype == PKEY_TYPE_CCA_DATA) {
+ 			rc = cca_genseckey(card, dom, ksize, keybuf);
+ 			*keybufsize = (rc ? 0 : SECKEYBLOBSIZE);
+@@ -1331,7 +1337,7 @@ static long pkey_unlocked_ioctl(struct file *filp, unsigned int cmd,
+ 		apqns = _copy_apqns_from_user(kgs.apqns, kgs.apqn_entries);
+ 		if (IS_ERR(apqns))
+ 			return PTR_ERR(apqns);
+-		kkey = kmalloc(klen, GFP_KERNEL);
++		kkey = kzalloc(klen, GFP_KERNEL);
+ 		if (!kkey) {
+ 			kfree(apqns);
+ 			return -ENOMEM;
+@@ -1987,7 +1993,8 @@ static ssize_t pkey_ep11_aes_attr_read(enum pkey_key_size keybits,
+ 	for (i = 0, rc = -ENODEV; i < nr_apqns; i++) {
+ 		card = apqns[i] >> 16;
+ 		dom = apqns[i] & 0xFFFF;
+-		rc = ep11_genaeskey(card, dom, keybits, 0, buf, &keysize);
++		rc = ep11_genaeskey(card, dom, keybits, 0, buf, &keysize,
++				    PKEY_TYPE_EP11);
+ 		if (rc == 0)
+ 			break;
+ 	}
+@@ -1997,7 +2004,8 @@ static ssize_t pkey_ep11_aes_attr_read(enum pkey_key_size keybits,
+ 	if (is_xts) {
+ 		keysize = MAXEP11AESKEYBLOBSIZE;
+ 		buf += MAXEP11AESKEYBLOBSIZE;
+-		rc = ep11_genaeskey(card, dom, keybits, 0, buf, &keysize);
++		rc = ep11_genaeskey(card, dom, keybits, 0, buf, &keysize,
++				    PKEY_TYPE_EP11);
+ 		if (rc == 0)
+ 			return 2 * MAXEP11AESKEYBLOBSIZE;
+ 	}
+* Unmerged path drivers/s390/crypto/zcrypt_ep11misc.c
+diff --git a/drivers/s390/crypto/zcrypt_ep11misc.h b/drivers/s390/crypto/zcrypt_ep11misc.h
+index 912b3918c10a..ed328c354bad 100644
+--- a/drivers/s390/crypto/zcrypt_ep11misc.h
++++ b/drivers/s390/crypto/zcrypt_ep11misc.h
+@@ -107,7 +107,7 @@ int ep11_get_domain_info(u16 card, u16 domain, struct ep11_domain_info *info);
+  * Generate (random) EP11 AES secure key.
+  */
+ int ep11_genaeskey(u16 card, u16 domain, u32 keybitsize, u32 keygenflags,
+-		   u8 *keybuf, size_t *keybufsize);
++		   u8 *keybuf, size_t *keybufsize, u32 keybufver);
+ 
+ /*
+  * Generate EP11 AES secure key with given clear key value.
