@@ -1,0 +1,814 @@
+drm/i915/gvt: use atomic operations to change the vGPU status
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+Rebuild_CHGLOG: - Revert "drm/i915/gvt: use atomic operations to change the vGPU status" (Jocelyn Falempe) [2160452]
+Rebuild_FUZZ: 93.13%
+commit-author Zhi Wang <zhi.a.wang@intel.com>
+commit a06d4b9e15c0ea4e05b200cfb1f1050e785a5e87
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/a06d4b9e.failed
+
+Several vGPU status are used to decide the availability of GVT-g core
+logics when creating a vGPU. Use atomic operations on changing the vGPU
+status to avoid the racing.
+
+	Cc: Zhenyu Wang <zhenyuw@linux.intel.com>
+	Cc: Kevin Tian <kevin.tian@intel.com>
+	Cc: Jason Gunthorpe <jgg@nvidia.com>
+	Cc: intel-gvt-dev@lists.freedesktop.org
+	Suggested-by: Alex Williamson <alex.williamson@redhat.com>
+	Signed-off-by: Zhi Wang <zhi.a.wang@intel.com>
+	Reviewed-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+	Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+	Signed-off-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20221110122034.3382-2-zhi.a.wang@intel.com
+(cherry picked from commit a06d4b9e15c0ea4e05b200cfb1f1050e785a5e87)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gvt/kvmgt.c
+diff --cc drivers/gpu/drm/i915/gvt/kvmgt.c
+index e573a15817c1,8ae7039b3683..000000000000
+--- a/drivers/gpu/drm/i915/gvt/kvmgt.c
++++ b/drivers/gpu/drm/i915/gvt/kvmgt.c
+@@@ -838,10 -638,10 +838,10 @@@ static bool __kvmgt_vgpu_exist(struct i
+  
+  	mutex_lock(&vgpu->gvt->lock);
+  	for_each_active_vgpu(vgpu->gvt, itr, id) {
+- 		if (!itr->attached)
++ 		if (!test_bit(INTEL_VGPU_STATUS_ATTACHED, itr->status))
+  			continue;
+  
+ -		if (vgpu->vfio_device.kvm == itr->vfio_device.kvm) {
+ +		if (vgpu->kvm == itr->kvm) {
+  			ret = true;
+  			goto out;
+  		}
+@@@ -851,74 -651,27 +851,86 @@@ out
+  	return ret;
+  }
+  
+ -static int intel_vgpu_open_device(struct vfio_device *vfio_dev)
+ +static int intel_vgpu_open(struct mdev_device *mdev)
+  {
+ -	struct intel_vgpu *vgpu = vfio_dev_to_vgpu(vfio_dev);
+ -
+ +	struct intel_vgpu *vgpu = mdev_get_drvdata(mdev);
+ +	unsigned long events;
+ +	int ret;
+ +	struct vfio_group *vfio_group;
+ +
+++<<<<<<< HEAD
+ +	vgpu->iommu_notifier.notifier_call = intel_vgpu_iommu_notifier;
+ +	vgpu->group_notifier.notifier_call = intel_vgpu_group_notifier;
+ +
+ +	events = VFIO_IOMMU_NOTIFY_DMA_UNMAP;
+ +	ret = vfio_register_notifier(mdev_dev(mdev), VFIO_IOMMU_NOTIFY, &events,
+ +				&vgpu->iommu_notifier);
+ +	if (ret != 0) {
+ +		gvt_vgpu_err("vfio_register_notifier for iommu failed: %d\n",
+ +			ret);
+ +		goto out;
+++=======
++ 	if (!vgpu->vfio_device.kvm ||
++ 	    vgpu->vfio_device.kvm->mm != current->mm) {
++ 		gvt_vgpu_err("KVM is required to use Intel vGPU\n");
++ 		return -ESRCH;
+++>>>>>>> a06d4b9e15c0 (drm/i915/gvt: use atomic operations to change the vGPU status)
+  	}
+  
+ +	events = VFIO_GROUP_NOTIFY_SET_KVM;
+ +	ret = vfio_register_notifier(mdev_dev(mdev), VFIO_GROUP_NOTIFY, &events,
+ +				&vgpu->group_notifier);
+ +	if (ret != 0) {
+ +		gvt_vgpu_err("vfio_register_notifier for group failed: %d\n",
+ +			ret);
+ +		goto undo_iommu;
+ +	}
+ +
+ +	vfio_group = vfio_group_get_external_user_from_dev(mdev_dev(mdev));
+ +	if (IS_ERR_OR_NULL(vfio_group)) {
+ +		ret = !vfio_group ? -EFAULT : PTR_ERR(vfio_group);
+ +		gvt_vgpu_err("vfio_group_get_external_user_from_dev failed\n");
+ +		goto undo_register;
+ +	}
+ +	vgpu->vfio_group = vfio_group;
+ +
+ +	/* Take a module reference as mdev core doesn't take
+ +	 * a reference for vendor driver.
+ +	 */
+ +	if (!try_module_get(THIS_MODULE)) {
+ +		ret = -ENODEV;
+ +		goto undo_group;
+ +	}
+ +
+ +	ret = -EEXIST;
+ +	if (vgpu->attached)
+ +		goto undo_group;
+ +
+ +	ret = -ESRCH;
+ +	if (!vgpu->kvm || vgpu->kvm->mm != current->mm) {
+ +		gvt_vgpu_err("KVM is required to use Intel vGPU\n");
+ +		goto undo_group;
+ +	}
+ +
+ +	ret = -EEXIST;
+  	if (__kvmgt_vgpu_exist(vgpu))
+ -		return -EEXIST;
+ +		goto undo_group;
+ +
+++<<<<<<< HEAD
+ +	vgpu->attached = true;
+ +	kvm_get_kvm(vgpu->kvm);
+  
+ +	kvmgt_protect_table_init(vgpu);
+ +	gvt_cache_init(vgpu);
+ +
+++=======
+++>>>>>>> a06d4b9e15c0 (drm/i915/gvt: use atomic operations to change the vGPU status)
+  	vgpu->track_node.track_write = kvmgt_page_track_write;
+  	vgpu->track_node.track_flush_slot = kvmgt_page_track_flush_slot;
+ -	kvm_get_kvm(vgpu->vfio_device.kvm);
+ -	kvm_page_track_register_notifier(vgpu->vfio_device.kvm,
+ -					 &vgpu->track_node);
+ +	kvm_page_track_register_notifier(vgpu->kvm, &vgpu->track_node);
+  
++ 	set_bit(INTEL_VGPU_STATUS_ATTACHED, vgpu->status);
++ 
+  	debugfs_create_ulong(KVMGT_DEBUGFS_FILENAME, 0444, vgpu->debugfs,
+  			     &vgpu->nr_cache_entries);
+  
+@@@ -953,31 -691,13 +965,37 @@@ static void intel_vgpu_release_msi_even
+  	}
+  }
+  
+ -static void intel_vgpu_close_device(struct vfio_device *vfio_dev)
+ +static void __intel_vgpu_release(struct intel_vgpu *vgpu)
+  {
+ -	struct intel_vgpu *vgpu = vfio_dev_to_vgpu(vfio_dev);
+ +	struct drm_i915_private *i915 = vgpu->gvt->gt->i915;
+ +	int ret;
+  
+++<<<<<<< HEAD
+ +	if (!vgpu->attached)
+ +		return;
+ +
+ +	if (atomic_cmpxchg(&vgpu->released, 0, 1))
+ +		return;
+ +
+ +	intel_gvt_release_vgpu(vgpu);
+ +
+ +	ret = vfio_unregister_notifier(mdev_dev(vgpu->mdev), VFIO_IOMMU_NOTIFY,
+ +					&vgpu->iommu_notifier);
+ +	drm_WARN(&i915->drm, ret,
+ +		 "vfio_unregister_notifier for iommu failed: %d\n", ret);
+ +
+ +	ret = vfio_unregister_notifier(mdev_dev(vgpu->mdev), VFIO_GROUP_NOTIFY,
+ +					&vgpu->group_notifier);
+ +	drm_WARN(&i915->drm, ret,
+ +		 "vfio_unregister_notifier for group failed: %d\n", ret);
+ +
+ +	/* dereference module reference taken at open */
+ +	module_put(THIS_MODULE);
+++=======
++ 	intel_gvt_release_vgpu(vgpu);
++ 
++ 	clear_bit(INTEL_VGPU_STATUS_ATTACHED, vgpu->status);
+++>>>>>>> a06d4b9e15c0 (drm/i915/gvt: use atomic operations to change the vGPU status)
+  
+  	debugfs_remove(debugfs_lookup(KVMGT_DEBUGFS_FILENAME, vgpu->debugfs));
+  
+@@@ -986,26 -708,12 +1004,29 @@@
+  	kvmgt_protect_table_destroy(vgpu);
+  	gvt_cache_destroy(vgpu);
+  
+ -	WARN_ON(vgpu->nr_cache_entries);
+ +	intel_vgpu_release_msi_eventfd_ctx(vgpu);
+++<<<<<<< HEAD
+ +	vfio_group_put_external_user(vgpu->vfio_group);
+  
+ -	vgpu->gfn_cache = RB_ROOT;
+ -	vgpu->dma_addr_cache = RB_ROOT;
+ +	vgpu->kvm = NULL;
+ +	vgpu->attached = false;
+++=======
+++>>>>>>> a06d4b9e15c0 (drm/i915/gvt: use atomic operations to change the vGPU status)
+ +}
+  
+ -	intel_vgpu_release_msi_eventfd_ctx(vgpu);
+ +static void intel_vgpu_release(struct mdev_device *mdev)
+ +{
+ +	struct intel_vgpu *vgpu = mdev_get_drvdata(mdev);
+ +
+ +	__intel_vgpu_release(vgpu);
+ +}
+ +
+ +static void intel_vgpu_release_work(struct work_struct *work)
+ +{
+ +	struct intel_vgpu *vgpu =
+ +		container_of(work, struct intel_vgpu, release_work);
+ +
+ +	__intel_vgpu_release(vgpu);
+  }
+  
+  static u64 intel_vgpu_get_bar_addr(struct intel_vgpu *vgpu, int bar)
+@@@ -1731,19 -1435,113 +1752,126 @@@ static const struct attribute_group *in
+  	NULL,
+  };
+  
+++<<<<<<< HEAD
+ +const struct mdev_parent_ops intel_vgpu_mdev_ops = {
+ +	.mdev_attr_groups       = intel_vgpu_groups,
+ +	.supported_type_groups	= gvt_vgpu_type_groups,
+ +	.create			= intel_vgpu_create,
+++=======
++ static int intel_vgpu_init_dev(struct vfio_device *vfio_dev)
++ {
++ 	struct mdev_device *mdev = to_mdev_device(vfio_dev->dev);
++ 	struct intel_vgpu *vgpu = vfio_dev_to_vgpu(vfio_dev);
++ 	struct intel_vgpu_type *type =
++ 		container_of(mdev->type, struct intel_vgpu_type, type);
++ 	int ret;
++ 
++ 	vgpu->gvt = kdev_to_i915(mdev->type->parent->dev)->gvt;
++ 	ret = intel_gvt_create_vgpu(vgpu, type->conf);
++ 	if (ret)
++ 		return ret;
++ 
++ 	kvmgt_protect_table_init(vgpu);
++ 	gvt_cache_init(vgpu);
++ 
++ 	return 0;
++ }
++ 
++ static void intel_vgpu_release_dev(struct vfio_device *vfio_dev)
++ {
++ 	struct intel_vgpu *vgpu = vfio_dev_to_vgpu(vfio_dev);
++ 
++ 	intel_gvt_destroy_vgpu(vgpu);
++ }
++ 
++ static const struct vfio_device_ops intel_vgpu_dev_ops = {
++ 	.init		= intel_vgpu_init_dev,
++ 	.release	= intel_vgpu_release_dev,
++ 	.open_device	= intel_vgpu_open_device,
++ 	.close_device	= intel_vgpu_close_device,
++ 	.read		= intel_vgpu_read,
++ 	.write		= intel_vgpu_write,
++ 	.mmap		= intel_vgpu_mmap,
++ 	.ioctl		= intel_vgpu_ioctl,
++ 	.dma_unmap	= intel_vgpu_dma_unmap,
++ 	.bind_iommufd	= vfio_iommufd_emulated_bind,
++ 	.unbind_iommufd = vfio_iommufd_emulated_unbind,
++ 	.attach_ioas	= vfio_iommufd_emulated_attach_ioas,
++ };
++ 
++ static int intel_vgpu_probe(struct mdev_device *mdev)
++ {
++ 	struct intel_vgpu *vgpu;
++ 	int ret;
++ 
++ 	vgpu = vfio_alloc_device(intel_vgpu, vfio_device, &mdev->dev,
++ 				 &intel_vgpu_dev_ops);
++ 	if (IS_ERR(vgpu)) {
++ 		gvt_err("failed to create intel vgpu: %ld\n", PTR_ERR(vgpu));
++ 		return PTR_ERR(vgpu);
++ 	}
++ 
++ 	dev_set_drvdata(&mdev->dev, vgpu);
++ 	ret = vfio_register_emulated_iommu_dev(&vgpu->vfio_device);
++ 	if (ret)
++ 		goto out_put_vdev;
++ 
++ 	gvt_dbg_core("intel_vgpu_create succeeded for mdev: %s\n",
++ 		     dev_name(mdev_dev(mdev)));
++ 	return 0;
++ 
++ out_put_vdev:
++ 	vfio_put_device(&vgpu->vfio_device);
++ 	return ret;
++ }
++ 
++ static void intel_vgpu_remove(struct mdev_device *mdev)
++ {
++ 	struct intel_vgpu *vgpu = dev_get_drvdata(&mdev->dev);
++ 
++ 	vfio_unregister_group_dev(&vgpu->vfio_device);
++ 	vfio_put_device(&vgpu->vfio_device);
++ }
++ 
++ static unsigned int intel_vgpu_get_available(struct mdev_type *mtype)
++ {
++ 	struct intel_vgpu_type *type =
++ 		container_of(mtype, struct intel_vgpu_type, type);
++ 	struct intel_gvt *gvt = kdev_to_i915(mtype->parent->dev)->gvt;
++ 	unsigned int low_gm_avail, high_gm_avail, fence_avail;
++ 
++ 	mutex_lock(&gvt->lock);
++ 	low_gm_avail = gvt_aperture_sz(gvt) - HOST_LOW_GM_SIZE -
++ 		gvt->gm.vgpu_allocated_low_gm_size;
++ 	high_gm_avail = gvt_hidden_sz(gvt) - HOST_HIGH_GM_SIZE -
++ 		gvt->gm.vgpu_allocated_high_gm_size;
++ 	fence_avail = gvt_fence_sz(gvt) - HOST_FENCE -
++ 		gvt->fence.vgpu_allocated_fence_num;
++ 	mutex_unlock(&gvt->lock);
++ 
++ 	return min3(low_gm_avail / type->conf->low_mm,
++ 		    high_gm_avail / type->conf->high_mm,
++ 		    fence_avail / type->conf->fence);
++ }
++ 
++ static struct mdev_driver intel_vgpu_mdev_driver = {
++ 	.device_api	= VFIO_DEVICE_API_PCI_STRING,
++ 	.driver = {
++ 		.name		= "intel_vgpu_mdev",
++ 		.owner		= THIS_MODULE,
++ 		.dev_groups	= intel_vgpu_groups,
++ 	},
++ 	.probe			= intel_vgpu_probe,
+++>>>>>>> a06d4b9e15c0 (drm/i915/gvt: use atomic operations to change the vGPU status)
+  	.remove			= intel_vgpu_remove,
+ -	.get_available		= intel_vgpu_get_available,
+ -	.show_description	= intel_vgpu_show_description,
+ +
+ +	.open			= intel_vgpu_open,
+ +	.release		= intel_vgpu_release,
+ +
+ +	.read			= intel_vgpu_read,
+ +	.write			= intel_vgpu_write,
+ +	.mmap			= intel_vgpu_mmap,
+ +	.ioctl			= intel_vgpu_ioctl,
+  };
+  
+  int intel_gvt_page_track_add(struct intel_vgpu *info, u64 gfn)
+@@@ -1945,9 -1743,264 +2073,258 @@@ void intel_gvt_dma_unmap_guest_page(str
+  	mutex_unlock(&vgpu->cache_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void init_device_info(struct intel_gvt *gvt)
++ {
++ 	struct intel_gvt_device_info *info = &gvt->device_info;
++ 	struct pci_dev *pdev = to_pci_dev(gvt->gt->i915->drm.dev);
++ 
++ 	info->max_support_vgpus = 8;
++ 	info->cfg_space_size = PCI_CFG_SPACE_EXP_SIZE;
++ 	info->mmio_size = 2 * 1024 * 1024;
++ 	info->mmio_bar = 0;
++ 	info->gtt_start_offset = 8 * 1024 * 1024;
++ 	info->gtt_entry_size = 8;
++ 	info->gtt_entry_size_shift = 3;
++ 	info->gmadr_bytes_in_cmd = 8;
++ 	info->max_surface_size = 36 * 1024 * 1024;
++ 	info->msi_cap_offset = pdev->msi_cap;
++ }
++ 
++ static void intel_gvt_test_and_emulate_vblank(struct intel_gvt *gvt)
++ {
++ 	struct intel_vgpu *vgpu;
++ 	int id;
++ 
++ 	mutex_lock(&gvt->lock);
++ 	idr_for_each_entry((&(gvt)->vgpu_idr), (vgpu), (id)) {
++ 		if (test_and_clear_bit(INTEL_GVT_REQUEST_EMULATE_VBLANK + id,
++ 				       (void *)&gvt->service_request)) {
++ 			if (test_bit(INTEL_VGPU_STATUS_ACTIVE, vgpu->status))
++ 				intel_vgpu_emulate_vblank(vgpu);
++ 		}
++ 	}
++ 	mutex_unlock(&gvt->lock);
++ }
++ 
++ static int gvt_service_thread(void *data)
++ {
++ 	struct intel_gvt *gvt = (struct intel_gvt *)data;
++ 	int ret;
++ 
++ 	gvt_dbg_core("service thread start\n");
++ 
++ 	while (!kthread_should_stop()) {
++ 		ret = wait_event_interruptible(gvt->service_thread_wq,
++ 				kthread_should_stop() || gvt->service_request);
++ 
++ 		if (kthread_should_stop())
++ 			break;
++ 
++ 		if (WARN_ONCE(ret, "service thread is waken up by signal.\n"))
++ 			continue;
++ 
++ 		intel_gvt_test_and_emulate_vblank(gvt);
++ 
++ 		if (test_bit(INTEL_GVT_REQUEST_SCHED,
++ 				(void *)&gvt->service_request) ||
++ 			test_bit(INTEL_GVT_REQUEST_EVENT_SCHED,
++ 					(void *)&gvt->service_request)) {
++ 			intel_gvt_schedule(gvt);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void clean_service_thread(struct intel_gvt *gvt)
++ {
++ 	kthread_stop(gvt->service_thread);
++ }
++ 
++ static int init_service_thread(struct intel_gvt *gvt)
++ {
++ 	init_waitqueue_head(&gvt->service_thread_wq);
++ 
++ 	gvt->service_thread = kthread_run(gvt_service_thread,
++ 			gvt, "gvt_service_thread");
++ 	if (IS_ERR(gvt->service_thread)) {
++ 		gvt_err("fail to start service thread.\n");
++ 		return PTR_ERR(gvt->service_thread);
++ 	}
++ 	return 0;
++ }
++ 
++ /**
++  * intel_gvt_clean_device - clean a GVT device
++  * @i915: i915 private
++  *
++  * This function is called at the driver unloading stage, to free the
++  * resources owned by a GVT device.
++  *
++  */
++ static void intel_gvt_clean_device(struct drm_i915_private *i915)
++ {
++ 	struct intel_gvt *gvt = fetch_and_zero(&i915->gvt);
++ 
++ 	if (drm_WARN_ON(&i915->drm, !gvt))
++ 		return;
++ 
++ 	mdev_unregister_parent(&gvt->parent);
++ 	intel_gvt_destroy_idle_vgpu(gvt->idle_vgpu);
++ 	intel_gvt_clean_vgpu_types(gvt);
++ 
++ 	intel_gvt_debugfs_clean(gvt);
++ 	clean_service_thread(gvt);
++ 	intel_gvt_clean_cmd_parser(gvt);
++ 	intel_gvt_clean_sched_policy(gvt);
++ 	intel_gvt_clean_workload_scheduler(gvt);
++ 	intel_gvt_clean_gtt(gvt);
++ 	intel_gvt_free_firmware(gvt);
++ 	intel_gvt_clean_mmio_info(gvt);
++ 	idr_destroy(&gvt->vgpu_idr);
++ 
++ 	kfree(i915->gvt);
++ }
++ 
++ /**
++  * intel_gvt_init_device - initialize a GVT device
++  * @i915: drm i915 private data
++  *
++  * This function is called at the initialization stage, to initialize
++  * necessary GVT components.
++  *
++  * Returns:
++  * Zero on success, negative error code if failed.
++  *
++  */
++ static int intel_gvt_init_device(struct drm_i915_private *i915)
++ {
++ 	struct intel_gvt *gvt;
++ 	struct intel_vgpu *vgpu;
++ 	int ret;
++ 
++ 	if (drm_WARN_ON(&i915->drm, i915->gvt))
++ 		return -EEXIST;
++ 
++ 	gvt = kzalloc(sizeof(struct intel_gvt), GFP_KERNEL);
++ 	if (!gvt)
++ 		return -ENOMEM;
++ 
++ 	gvt_dbg_core("init gvt device\n");
++ 
++ 	idr_init_base(&gvt->vgpu_idr, 1);
++ 	spin_lock_init(&gvt->scheduler.mmio_context_lock);
++ 	mutex_init(&gvt->lock);
++ 	mutex_init(&gvt->sched_lock);
++ 	gvt->gt = to_gt(i915);
++ 	i915->gvt = gvt;
++ 
++ 	init_device_info(gvt);
++ 
++ 	ret = intel_gvt_setup_mmio_info(gvt);
++ 	if (ret)
++ 		goto out_clean_idr;
++ 
++ 	intel_gvt_init_engine_mmio_context(gvt);
++ 
++ 	ret = intel_gvt_load_firmware(gvt);
++ 	if (ret)
++ 		goto out_clean_mmio_info;
++ 
++ 	ret = intel_gvt_init_irq(gvt);
++ 	if (ret)
++ 		goto out_free_firmware;
++ 
++ 	ret = intel_gvt_init_gtt(gvt);
++ 	if (ret)
++ 		goto out_free_firmware;
++ 
++ 	ret = intel_gvt_init_workload_scheduler(gvt);
++ 	if (ret)
++ 		goto out_clean_gtt;
++ 
++ 	ret = intel_gvt_init_sched_policy(gvt);
++ 	if (ret)
++ 		goto out_clean_workload_scheduler;
++ 
++ 	ret = intel_gvt_init_cmd_parser(gvt);
++ 	if (ret)
++ 		goto out_clean_sched_policy;
++ 
++ 	ret = init_service_thread(gvt);
++ 	if (ret)
++ 		goto out_clean_cmd_parser;
++ 
++ 	ret = intel_gvt_init_vgpu_types(gvt);
++ 	if (ret)
++ 		goto out_clean_thread;
++ 
++ 	vgpu = intel_gvt_create_idle_vgpu(gvt);
++ 	if (IS_ERR(vgpu)) {
++ 		ret = PTR_ERR(vgpu);
++ 		gvt_err("failed to create idle vgpu\n");
++ 		goto out_clean_types;
++ 	}
++ 	gvt->idle_vgpu = vgpu;
++ 
++ 	intel_gvt_debugfs_init(gvt);
++ 
++ 	ret = mdev_register_parent(&gvt->parent, i915->drm.dev,
++ 				   &intel_vgpu_mdev_driver,
++ 				   gvt->mdev_types, gvt->num_types);
++ 	if (ret)
++ 		goto out_destroy_idle_vgpu;
++ 
++ 	gvt_dbg_core("gvt device initialization is done\n");
++ 	return 0;
++ 
++ out_destroy_idle_vgpu:
++ 	intel_gvt_destroy_idle_vgpu(gvt->idle_vgpu);
++ 	intel_gvt_debugfs_clean(gvt);
++ out_clean_types:
++ 	intel_gvt_clean_vgpu_types(gvt);
++ out_clean_thread:
++ 	clean_service_thread(gvt);
++ out_clean_cmd_parser:
++ 	intel_gvt_clean_cmd_parser(gvt);
++ out_clean_sched_policy:
++ 	intel_gvt_clean_sched_policy(gvt);
++ out_clean_workload_scheduler:
++ 	intel_gvt_clean_workload_scheduler(gvt);
++ out_clean_gtt:
++ 	intel_gvt_clean_gtt(gvt);
++ out_free_firmware:
++ 	intel_gvt_free_firmware(gvt);
++ out_clean_mmio_info:
++ 	intel_gvt_clean_mmio_info(gvt);
++ out_clean_idr:
++ 	idr_destroy(&gvt->vgpu_idr);
++ 	kfree(gvt);
++ 	i915->gvt = NULL;
++ 	return ret;
++ }
++ 
++ static void intel_gvt_pm_resume(struct drm_i915_private *i915)
++ {
++ 	struct intel_gvt *gvt = i915->gvt;
++ 
++ 	intel_gvt_restore_fence(gvt);
++ 	intel_gvt_restore_mmio(gvt);
++ 	intel_gvt_restore_ggtt(gvt);
++ }
++ 
++ static const struct intel_vgpu_ops intel_gvt_vgpu_ops = {
++ 	.init_device	= intel_gvt_init_device,
++ 	.clean_device	= intel_gvt_clean_device,
++ 	.pm_resume	= intel_gvt_pm_resume,
++ };
++ 
+++>>>>>>> a06d4b9e15c0 (drm/i915/gvt: use atomic operations to change the vGPU status)
+  static int __init kvmgt_init(void)
+  {
+ -	int ret;
+ -
+ -	ret = intel_gvt_set_ops(&intel_gvt_vgpu_ops);
+ -	if (ret)
+ -		return ret;
+ -
+ -	ret = mdev_register_driver(&intel_vgpu_mdev_driver);
+ -	if (ret)
+ -		intel_gvt_clear_ops(&intel_gvt_vgpu_ops);
+ -	return ret;
+ +	return intel_gvt_set_ops(&intel_gvt_vgpu_ops);
+  }
+  
+  static void __exit kvmgt_exit(void)
+diff --git a/drivers/gpu/drm/i915/gvt/debugfs.c b/drivers/gpu/drm/i915/gvt/debugfs.c
+index c96e6ce3536f..6e09d71179f0 100644
+--- a/drivers/gpu/drm/i915/gvt/debugfs.c
++++ b/drivers/gpu/drm/i915/gvt/debugfs.c
+@@ -151,6 +151,22 @@ DEFINE_SIMPLE_ATTRIBUTE(vgpu_scan_nonprivbb_fops,
+ 			vgpu_scan_nonprivbb_get, vgpu_scan_nonprivbb_set,
+ 			"0x%llx\n");
+ 
++static int vgpu_status_get(void *data, u64 *val)
++{
++	struct intel_vgpu *vgpu = (struct intel_vgpu *)data;
++
++	*val = 0;
++
++	if (test_bit(INTEL_VGPU_STATUS_ATTACHED, vgpu->status))
++		*val |= (1 << INTEL_VGPU_STATUS_ATTACHED);
++	if (test_bit(INTEL_VGPU_STATUS_ACTIVE, vgpu->status))
++		*val |= (1 << INTEL_VGPU_STATUS_ACTIVE);
++
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(vgpu_status_fops, vgpu_status_get, NULL, "0x%llx\n");
++
+ /**
+  * intel_gvt_debugfs_add_vgpu - register debugfs entries for a vGPU
+  * @vgpu: a vGPU
+@@ -162,11 +178,12 @@ void intel_gvt_debugfs_add_vgpu(struct intel_vgpu *vgpu)
+ 	snprintf(name, 16, "vgpu%d", vgpu->id);
+ 	vgpu->debugfs = debugfs_create_dir(name, vgpu->gvt->debugfs_root);
+ 
+-	debugfs_create_bool("active", 0444, vgpu->debugfs, &vgpu->active);
+ 	debugfs_create_file("mmio_diff", 0444, vgpu->debugfs, vgpu,
+ 			    &vgpu_mmio_diff_fops);
+ 	debugfs_create_file("scan_nonprivbb", 0644, vgpu->debugfs, vgpu,
+ 			    &vgpu_scan_nonprivbb_fops);
++	debugfs_create_file("status", 0644, vgpu->debugfs, vgpu,
++			    &vgpu_status_fops);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/i915/gvt/dmabuf.c b/drivers/gpu/drm/i915/gvt/dmabuf.c
+index 01e54b45c5c1..77f0522d2de9 100644
+--- a/drivers/gpu/drm/i915/gvt/dmabuf.c
++++ b/drivers/gpu/drm/i915/gvt/dmabuf.c
+@@ -134,7 +134,8 @@ static void dmabuf_gem_object_free(struct kref *kref)
+ 	struct list_head *pos;
+ 	struct intel_vgpu_dmabuf_obj *dmabuf_obj;
+ 
+-	if (vgpu && vgpu->active && !list_empty(&vgpu->dmabuf_obj_list_head)) {
++	if (vgpu && test_bit(INTEL_VGPU_STATUS_ACTIVE, vgpu->status) &&
++	    !list_empty(&vgpu->dmabuf_obj_list_head)) {
+ 		list_for_each(pos, &vgpu->dmabuf_obj_list_head) {
+ 			dmabuf_obj = list_entry(pos, struct intel_vgpu_dmabuf_obj, list);
+ 			if (dmabuf_obj == obj) {
+diff --git a/drivers/gpu/drm/i915/gvt/gtt.c b/drivers/gpu/drm/i915/gvt/gtt.c
+index 1234f22e71ca..96fccfc03899 100644
+--- a/drivers/gpu/drm/i915/gvt/gtt.c
++++ b/drivers/gpu/drm/i915/gvt/gtt.c
+@@ -55,7 +55,7 @@ static bool intel_gvt_is_valid_gfn(struct intel_vgpu *vgpu, unsigned long gfn)
+ 	int idx;
+ 	bool ret;
+ 
+-	if (!vgpu->attached)
++	if (!test_bit(INTEL_VGPU_STATUS_ATTACHED, vgpu->status))
+ 		return false;
+ 
+ 	idx = srcu_read_lock(&kvm->srcu);
+@@ -1183,7 +1183,7 @@ static int is_2MB_gtt_possible(struct intel_vgpu *vgpu,
+ 	if (!HAS_PAGE_SIZES(vgpu->gvt->gt->i915, I915_GTT_PAGE_SIZE_2M))
+ 		return 0;
+ 
+-	if (!vgpu->attached)
++	if (!test_bit(INTEL_VGPU_STATUS_ATTACHED, vgpu->status))
+ 		return -EINVAL;
+ 	pfn = gfn_to_pfn(vgpu->kvm, ops->get_pfn(entry));
+ 	if (is_error_noslot_pfn(pfn))
+diff --git a/drivers/gpu/drm/i915/gvt/gvt.h b/drivers/gpu/drm/i915/gvt/gvt.h
+index 8565189e0c0d..49897e154e7e 100644
+--- a/drivers/gpu/drm/i915/gvt/gvt.h
++++ b/drivers/gpu/drm/i915/gvt/gvt.h
+@@ -171,12 +171,17 @@ struct intel_vgpu_submission {
+ 
+ #define KVMGT_DEBUGFS_FILENAME		"kvmgt_nr_cache_entries"
+ 
++enum {
++	INTEL_VGPU_STATUS_ATTACHED = 0,
++	INTEL_VGPU_STATUS_ACTIVE,
++	INTEL_VGPU_STATUS_NR_BITS,
++};
++
+ struct intel_vgpu {
+ 	struct intel_gvt *gvt;
+ 	struct mutex vgpu_lock;
+ 	int id;
+-	bool active;
+-	bool attached;
++	DECLARE_BITMAP(status, INTEL_VGPU_STATUS_NR_BITS);
+ 	bool pv_notified;
+ 	bool failsafe;
+ 	unsigned int resetting_eng;
+@@ -472,7 +477,7 @@ void intel_vgpu_write_fence(struct intel_vgpu *vgpu,
+ 
+ #define for_each_active_vgpu(gvt, vgpu, id) \
+ 	idr_for_each_entry((&(gvt)->vgpu_idr), (vgpu), (id)) \
+-		for_each_if(vgpu->active)
++		for_each_if(test_bit(INTEL_VGPU_STATUS_ACTIVE, vgpu->status))
+ 
+ static inline void intel_vgpu_write_pci_bar(struct intel_vgpu *vgpu,
+ 					    u32 offset, u32 val, bool low)
+@@ -730,7 +735,7 @@ static inline bool intel_gvt_mmio_is_cmd_write_patch(
+ static inline int intel_gvt_read_gpa(struct intel_vgpu *vgpu, unsigned long gpa,
+ 		void *buf, unsigned long len)
+ {
+-	if (!vgpu->attached)
++	if (!test_bit(INTEL_VGPU_STATUS_ATTACHED, vgpu->status))
+ 		return -ESRCH;
+ 	return vfio_dma_rw(vgpu->vfio_group, gpa, buf, len, false);
+ }
+@@ -748,7 +753,7 @@ static inline int intel_gvt_read_gpa(struct intel_vgpu *vgpu, unsigned long gpa,
+ static inline int intel_gvt_write_gpa(struct intel_vgpu *vgpu,
+ 		unsigned long gpa, void *buf, unsigned long len)
+ {
+-	if (!vgpu->attached)
++	if (!test_bit(INTEL_VGPU_STATUS_ATTACHED, vgpu->status))
+ 		return -ESRCH;
+ 	return vfio_dma_rw(vgpu->vfio_group, gpa, buf, len, true);
+ }
+diff --git a/drivers/gpu/drm/i915/gvt/interrupt.c b/drivers/gpu/drm/i915/gvt/interrupt.c
+index a6b2021b665f..68eca023bbc6 100644
+--- a/drivers/gpu/drm/i915/gvt/interrupt.c
++++ b/drivers/gpu/drm/i915/gvt/interrupt.c
+@@ -433,7 +433,7 @@ static int inject_virtual_interrupt(struct intel_vgpu *vgpu)
+ 	 * enabled by guest. so if msi_trigger is null, success is still
+ 	 * returned and don't inject interrupt into guest.
+ 	 */
+-	if (!vgpu->attached)
++	if (!test_bit(INTEL_VGPU_STATUS_ATTACHED, vgpu->status))
+ 		return -ESRCH;
+ 	if (vgpu->msi_trigger && eventfd_signal(vgpu->msi_trigger, 1) != 1)
+ 		return -EFAULT;
+* Unmerged path drivers/gpu/drm/i915/gvt/kvmgt.c
+diff --git a/drivers/gpu/drm/i915/gvt/scheduler.c b/drivers/gpu/drm/i915/gvt/scheduler.c
+index 8342d95f56cb..e28655970000 100644
+--- a/drivers/gpu/drm/i915/gvt/scheduler.c
++++ b/drivers/gpu/drm/i915/gvt/scheduler.c
+@@ -867,7 +867,8 @@ pick_next_workload(struct intel_gvt *gvt, struct intel_engine_cs *engine)
+ 		goto out;
+ 	}
+ 
+-	if (!scheduler->current_vgpu->active ||
++	if (!test_bit(INTEL_VGPU_STATUS_ACTIVE,
++		      scheduler->current_vgpu->status) ||
+ 	    list_empty(workload_q_head(scheduler->current_vgpu, engine)))
+ 		goto out;
+ 
+diff --git a/drivers/gpu/drm/i915/gvt/vgpu.c b/drivers/gpu/drm/i915/gvt/vgpu.c
+index 46da19b3225d..5198e92cf2f0 100644
+--- a/drivers/gpu/drm/i915/gvt/vgpu.c
++++ b/drivers/gpu/drm/i915/gvt/vgpu.c
+@@ -213,9 +213,7 @@ static void intel_gvt_update_vgpu_types(struct intel_gvt *gvt)
+  */
+ void intel_gvt_activate_vgpu(struct intel_vgpu *vgpu)
+ {
+-	mutex_lock(&vgpu->vgpu_lock);
+-	vgpu->active = true;
+-	mutex_unlock(&vgpu->vgpu_lock);
++	set_bit(INTEL_VGPU_STATUS_ACTIVE, vgpu->status);
+ }
+ 
+ /**
+@@ -230,7 +228,7 @@ void intel_gvt_deactivate_vgpu(struct intel_vgpu *vgpu)
+ {
+ 	mutex_lock(&vgpu->vgpu_lock);
+ 
+-	vgpu->active = false;
++	clear_bit(INTEL_VGPU_STATUS_ACTIVE, vgpu->status);
+ 
+ 	if (atomic_read(&vgpu->submission.running_workload_num)) {
+ 		mutex_unlock(&vgpu->vgpu_lock);
+@@ -275,7 +273,8 @@ void intel_gvt_destroy_vgpu(struct intel_vgpu *vgpu)
+ 	struct intel_gvt *gvt = vgpu->gvt;
+ 	struct drm_i915_private *i915 = gvt->gt->i915;
+ 
+-	drm_WARN(&i915->drm, vgpu->active, "vGPU is still active!\n");
++	drm_WARN(&i915->drm, test_bit(INTEL_VGPU_STATUS_ACTIVE, vgpu->status),
++		 "vGPU is still active!\n");
+ 
+ 	/*
+ 	 * remove idr first so later clean can judge if need to stop
+@@ -338,8 +337,7 @@ struct intel_vgpu *intel_gvt_create_idle_vgpu(struct intel_gvt *gvt)
+ 	if (ret)
+ 		goto out_free_vgpu;
+ 
+-	vgpu->active = false;
+-
++	clear_bit(INTEL_VGPU_STATUS_ACTIVE, vgpu->status);
+ 	return vgpu;
+ 
+ out_free_vgpu:
