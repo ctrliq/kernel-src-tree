@@ -1,0 +1,303 @@
+x86/sev: Move common memory encryption code to mem_encrypt.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+commit 20f07a044a76aebaaa0603038857229b5c460d69
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/20f07a04.failed
+
+SEV and TDX both protect guest memory from host accesses. They both use
+guest physical address bits to communicate to the hardware which pages
+receive protection or not. SEV and TDX both assume that all I/O (real
+devices and virtio) must be performed to pages *without* protection.
+
+To add this support, AMD SEV code forces force_dma_unencrypted() to
+decrypt DMA pages when DMA pages were allocated for I/O. It also uses
+swiotlb_update_mem_attributes() to update decryption bits in SWIOTLB DMA
+buffers.
+
+Since TDX also uses a similar memory sharing design, all the above
+mentioned changes can be reused. So move force_dma_unencrypted(),
+SWIOTLB update code and virtio changes out of mem_encrypt_amd.c to
+mem_encrypt.c.
+
+Introduce a new config option X86_MEM_ENCRYPT that can be selected by
+platforms which use x86 memory encryption features (needed in both AMD
+SEV and Intel TDX guest platforms).
+
+Since the code is moved from mem_encrypt_amd.c, inherit the same make
+flags.
+
+This is preparation for enabling TDX memory encryption support and it
+has no functional changes.
+
+Co-developed-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+	Signed-off-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Andi Kleen <ak@linux.intel.com>
+	Reviewed-by: Tony Luck <tony.luck@intel.com>
+	Reviewed-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Tested-by: Tom Lendacky <thomas.lendacky@amd.com>
+Link: https://lore.kernel.org/r/20211206135505.75045-4-kirill.shutemov@linux.intel.com
+(cherry picked from commit 20f07a044a76aebaaa0603038857229b5c460d69)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+#	arch/x86/mm/mem_encrypt_amd.c
+diff --cc arch/x86/Kconfig
+index 970d47f5992e,793e9b42ace0..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -1522,11 -1533,11 +1528,19 @@@ config AMD_MEM_ENCRYP
+  	bool "AMD Secure Memory Encryption (SME) support"
+  	depends on X86_64 && CPU_SUP_AMD
+  	select DMA_COHERENT_POOL
+++<<<<<<< HEAD
+ +	select DYNAMIC_PHYSICAL_MASK
+ +	select ARCH_HAS_FORCE_DMA_UNENCRYPTED
+ +	select INSTRUCTION_DECODER
+ +	select ARCH_HAS_CC_PLATFORM
+ +	---help---
+++=======
++ 	select ARCH_USE_MEMREMAP_PROT
++ 	select INSTRUCTION_DECODER
++ 	select ARCH_HAS_CC_PLATFORM
++ 	select X86_MEM_ENCRYPT
++ 	help
+++>>>>>>> 20f07a044a76 (x86/sev: Move common memory encryption code to mem_encrypt.c)
+  	  Say yes to enable support for the encryption of system memory.
+  	  This requires an AMD processor that supports Secure Memory
+  	  Encryption (SME).
+diff --cc arch/x86/mm/mem_encrypt_amd.c
+index 48e92fcc23e3,2b2d018ea345..000000000000
+--- a/arch/x86/mm/mem_encrypt_amd.c
++++ b/arch/x86/mm/mem_encrypt_amd.c
+@@@ -412,53 -413,6 +412,56 @@@ void __init early_set_mem_enc_dec_hyper
+  	notify_range_enc_status_changed(vaddr, npages, enc);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * SME and SEV are very similar but they are not the same, so there are
+ + * times that the kernel will need to distinguish between SME and SEV. The
+ + * cc_platform_has() function is used for this.  When a distinction isn't
+ + * needed, the CC_ATTR_MEM_ENCRYPT attribute can be used.
+ + *
+ + * The trampoline code is a good example for this requirement.  Before
+ + * paging is activated, SME will access all memory as decrypted, but SEV
+ + * will access all memory as encrypted.  So, when APs are being brought
+ + * up under SME the trampoline area cannot be encrypted, whereas under SEV
+ + * the trampoline area must be encrypted.
+ + */
+ +
+ +/* Keep sme_active in order to break Red Hat kABI */
+ +bool sme_active(void)
+ +{
+ +       return sme_me_mask && !cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT);
+ +}
+ +EXPORT_SYMBOL(sme_active);
+ +
+ +/* Override for DMA direct allocation check - ARCH_HAS_FORCE_DMA_UNENCRYPTED */
+ +bool force_dma_unencrypted(struct device *dev)
+ +{
+ +	/*
+ +	 * For SEV, all DMA must be to unencrypted addresses.
+ +	 */
+ +	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
+ +		return true;
+ +
+ +	/*
+ +	 * For SME, all DMA must be to unencrypted addresses if the
+ +	 * device does not support DMA to addresses that include the
+ +	 * encryption mask.
+ +	 */
+ +	if (cc_platform_has(CC_ATTR_HOST_MEM_ENCRYPT)) {
+ +		u64 dma_enc_mask = DMA_BIT_MASK(__ffs64(sme_me_mask));
+ +		u64 dma_dev_mask = min_not_zero(dev->coherent_dma_mask,
+ +						dev->bus_dma_limit);
+ +
+ +		if (dma_dev_mask <= dma_enc_mask)
+ +			return true;
+ +	}
+ +
+ +	return false;
+ +}
+ +
+ +/* Architecture __weak replacement functions */
+++=======
+++>>>>>>> 20f07a044a76 (x86/sev: Move common memory encryption code to mem_encrypt.c)
+  void __init mem_encrypt_free_decrypted_mem(void)
+  {
+  	unsigned long vaddr, vaddr_end, npages;
+@@@ -482,39 -436,3 +485,42 @@@
+  
+  	free_init_pages("unused decrypted", vaddr, vaddr_end);
+  }
+++<<<<<<< HEAD
+ +
+ +static void print_mem_encrypt_feature_info(void)
+ +{
+ +	pr_info("AMD Memory Encryption Features active:");
+ +
+ +	/* Secure Memory Encryption */
+ +	if (cc_platform_has(CC_ATTR_HOST_MEM_ENCRYPT)) {
+ +		/*
+ +		 * SME is mutually exclusive with any of the SEV
+ +		 * features below.
+ +		 */
+ +		pr_cont(" SME\n");
+ +		return;
+ +	}
+ +
+ +	/* Secure Encrypted Virtualization */
+ +	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
+ +		pr_cont(" SEV");
+ +
+ +	/* Encrypted Register State */
+ +	if (cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
+ +		pr_cont(" SEV-ES");
+ +
+ +	pr_cont("\n");
+ +}
+ +
+ +void __init mem_encrypt_init(void)
+ +{
+ +	if (!sme_me_mask)
+ +		return;
+ +
+ +	/* Call into SWIOTLB to update the SWIOTLB DMA buffers */
+ +	swiotlb_update_mem_attributes();
+ +
+ +	print_mem_encrypt_feature_info();
+ +}
+++=======
+++>>>>>>> 20f07a044a76 (x86/sev: Move common memory encryption code to mem_encrypt.c)
+* Unmerged path arch/x86/Kconfig
+diff --git a/arch/x86/mm/Makefile b/arch/x86/mm/Makefile
+index 66d0bf8a33de..efcf6160200b 100644
+--- a/arch/x86/mm/Makefile
++++ b/arch/x86/mm/Makefile
+@@ -1,9 +1,11 @@
+ # SPDX-License-Identifier: GPL-2.0
+ # Kernel does not boot with instrumentation of tlb.c and mem_encrypt*.c
+ KCOV_INSTRUMENT_tlb.o			:= n
++KCOV_INSTRUMENT_mem_encrypt.o		:= n
+ KCOV_INSTRUMENT_mem_encrypt_amd.o	:= n
+ KCOV_INSTRUMENT_mem_encrypt_identity.o	:= n
+ 
++KASAN_SANITIZE_mem_encrypt.o		:= n
+ KASAN_SANITIZE_mem_encrypt_amd.o	:= n
+ KASAN_SANITIZE_mem_encrypt_identity.o	:= n
+ 
+@@ -12,6 +14,7 @@ KASAN_SANITIZE_mem_encrypt_identity.o	:= n
+ KCSAN_SANITIZE := n
+ 
+ ifdef CONFIG_FUNCTION_TRACER
++CFLAGS_REMOVE_mem_encrypt.o		= -pg
+ CFLAGS_REMOVE_mem_encrypt_amd.o		= -pg
+ CFLAGS_REMOVE_mem_encrypt_identity.o	= -pg
+ endif
+@@ -54,6 +57,8 @@ obj-$(CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS)	+= pkeys.o
+ obj-$(CONFIG_RANDOMIZE_MEMORY)			+= kaslr.o
+ obj-$(CONFIG_PAGE_TABLE_ISOLATION)		+= pti.o
+ 
++obj-$(CONFIG_X86_MEM_ENCRYPT)	+= mem_encrypt.o
+ obj-$(CONFIG_AMD_MEM_ENCRYPT)	+= mem_encrypt_amd.o
++
+ obj-$(CONFIG_AMD_MEM_ENCRYPT)	+= mem_encrypt_identity.o
+ obj-$(CONFIG_AMD_MEM_ENCRYPT)	+= mem_encrypt_boot.o
+diff --git a/arch/x86/mm/mem_encrypt.c b/arch/x86/mm/mem_encrypt.c
+new file mode 100644
+index 000000000000..50d209939c66
+--- /dev/null
++++ b/arch/x86/mm/mem_encrypt.c
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Memory Encryption Support Common Code
++ *
++ * Copyright (C) 2016 Advanced Micro Devices, Inc.
++ *
++ * Author: Tom Lendacky <thomas.lendacky@amd.com>
++ */
++
++#include <linux/dma-direct.h>
++#include <linux/dma-mapping.h>
++#include <linux/swiotlb.h>
++#include <linux/cc_platform.h>
++#include <linux/mem_encrypt.h>
++#include <linux/virtio_config.h>
++
++/* Override for DMA direct allocation check - ARCH_HAS_FORCE_DMA_UNENCRYPTED */
++bool force_dma_unencrypted(struct device *dev)
++{
++	/*
++	 * For SEV, all DMA must be to unencrypted addresses.
++	 */
++	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
++		return true;
++
++	/*
++	 * For SME, all DMA must be to unencrypted addresses if the
++	 * device does not support DMA to addresses that include the
++	 * encryption mask.
++	 */
++	if (cc_platform_has(CC_ATTR_HOST_MEM_ENCRYPT)) {
++		u64 dma_enc_mask = DMA_BIT_MASK(__ffs64(sme_me_mask));
++		u64 dma_dev_mask = min_not_zero(dev->coherent_dma_mask,
++						dev->bus_dma_limit);
++
++		if (dma_dev_mask <= dma_enc_mask)
++			return true;
++	}
++
++	return false;
++}
++
++static void print_mem_encrypt_feature_info(void)
++{
++	pr_info("AMD Memory Encryption Features active:");
++
++	/* Secure Memory Encryption */
++	if (cc_platform_has(CC_ATTR_HOST_MEM_ENCRYPT)) {
++		/*
++		 * SME is mutually exclusive with any of the SEV
++		 * features below.
++		 */
++		pr_cont(" SME\n");
++		return;
++	}
++
++	/* Secure Encrypted Virtualization */
++	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
++		pr_cont(" SEV");
++
++	/* Encrypted Register State */
++	if (cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
++		pr_cont(" SEV-ES");
++
++	pr_cont("\n");
++}
++
++/* Architecture __weak replacement functions */
++void __init mem_encrypt_init(void)
++{
++	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT))
++		return;
++
++	/* Call into SWIOTLB to update the SWIOTLB DMA buffers */
++	swiotlb_update_mem_attributes();
++
++	print_mem_encrypt_feature_info();
++}
++
++int arch_has_restricted_virtio_memory_access(void)
++{
++	return cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT);
++}
++EXPORT_SYMBOL_GPL(arch_has_restricted_virtio_memory_access);
+* Unmerged path arch/x86/mm/mem_encrypt_amd.c
