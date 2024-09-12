@@ -1,0 +1,334 @@
+overflow: Introduce overflows_type() and castable_to_type()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+Rebuild_CHGLOG: - Revert "overflow: Introduce overflows_type() and castable_to_type()" (Jocelyn Falempe) [2160452]
+Rebuild_FUZZ: 92.91%
+commit-author Kees Cook <keescook@chromium.org>
+commit 4b21d25bf519c9487935a664886956bb18f04f6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/4b21d25b.failed
+
+Implement a robust overflows_type() macro to test if a variable or
+constant value would overflow another variable or type. This can be
+used as a constant expression for static_assert() (which requires a
+constant expression[1][2]) when used on constant values. This must be
+constructed manually, since __builtin_add_overflow() does not produce
+a constant expression[3].
+
+Additionally adds castable_to_type(), similar to __same_type(), but for
+checking if a constant value would overflow if cast to a given type.
+
+Add unit tests for overflows_type(), __same_type(), and castable_to_type()
+to the existing KUnit "overflow" test:
+
+[16:03:33] ================== overflow (21 subtests) ==================
+...
+[16:03:33] [PASSED] overflows_type_test
+[16:03:33] [PASSED] same_type_test
+[16:03:33] [PASSED] castable_to_type_test
+[16:03:33] ==================== [PASSED] overflow =====================
+[16:03:33] ============================================================
+[16:03:33] Testing complete. Ran 21 tests: passed: 21
+[16:03:33] Elapsed time: 24.022s total, 0.002s configuring, 22.598s building, 0.767s running
+
+[1] https://en.cppreference.com/w/c/language/_Static_assert
+[2] C11 standard (ISO/IEC 9899:2011): 6.7.10 Static assertions
+[3] https://gcc.gnu.org/onlinedocs/gcc/Integer-Overflow-Builtins.html
+    6.56 Built-in Functions to Perform Arithmetic with Overflow Checking
+    Built-in Function: bool __builtin_add_overflow (type1 a, type2 b,
+
+	Cc: Luc Van Oostenryck <luc.vanoostenryck@gmail.com>
+	Cc: Nathan Chancellor <nathan@kernel.org>
+	Cc: Nick Desaulniers <ndesaulniers@google.com>
+	Cc: Tom Rix <trix@redhat.com>
+	Cc: Daniel Latypov <dlatypov@google.com>
+	Cc: Vitor Massaru Iha <vitor@massaru.org>
+	Cc: "Gustavo A. R. Silva" <gustavoars@kernel.org>
+	Cc: Jani Nikula <jani.nikula@intel.com>
+	Cc: Mauro Carvalho Chehab <mchehab@kernel.org>
+	Cc: linux-hardening@vger.kernel.org
+	Cc: llvm@lists.linux.dev
+Co-developed-by: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+	Signed-off-by: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+Link: https://lore.kernel.org/r/20221024201125.1416422-1-gwan-gyeong.mun@intel.com
+(cherry picked from commit 4b21d25bf519c9487935a664886956bb18f04f6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/compiler.h
+#	include/linux/overflow.h
+#	lib/Makefile
+#	lib/overflow_kunit.c
+diff --cc include/linux/compiler.h
+index 24a0e7ee0618,947a60b801db..000000000000
+--- a/include/linux/compiler.h
++++ b/include/linux/compiler.h
+@@@ -395,64 -228,22 +395,69 @@@ unsigned long read_word_at_a_time(cons
+  
+  #endif /* __ASSEMBLY__ */
+  
+ -/* &a[0] degrades to a pointer: a different type from an array */
+ -#define __must_be_array(a)	BUILD_BUG_ON_ZERO(__same_type((a), &(a)[0]))
+ +#ifndef __optimize
+ +# define __optimize(level)
+ +#endif
+  
+ +/* Compile time object size, -1 for unknown */
+ +#ifndef __compiletime_object_size
+ +# define __compiletime_object_size(obj) -1
+ +#endif
+ +#ifndef __compiletime_warning
+ +# define __compiletime_warning(message)
+ +#endif
+ +#ifndef __compiletime_error
+ +# define __compiletime_error(message)
+  /*
+ - * Whether 'type' is a signed type or an unsigned type. Supports scalar types,
+ - * bool and also pointer types.
+ + * Sparse complains of variable sized arrays due to the temporary variable in
+ + * __compiletime_assert. Unfortunately we can't just expand it out to make
+ + * sparse see a constant array size without breaking compiletime_assert on old
+ + * versions of GCC (e.g. 4.2.4), so hide the array from sparse altogether.
+   */
+++<<<<<<< HEAD
+ +# ifndef __CHECKER__
+ +#  define __compiletime_error_fallback(condition) \
+ +	do { ((void)sizeof(char[1 - 2 * condition])); } while (0)
+ +# endif
+ +#endif
+ +#ifndef __compiletime_error_fallback
+ +# define __compiletime_error_fallback(condition) do { } while (0)
+ +#endif
+++=======
++ #define is_signed_type(type) (((type)(-1)) < (__force type)1)
++ #define is_unsigned_type(type) (!is_signed_type(type))
+++>>>>>>> 4b21d25bf519 (overflow: Introduce overflows_type() and castable_to_type())
+ +
+ +#ifdef __OPTIMIZE__
+ +# define __compiletime_assert(condition, msg, prefix, suffix)		\
+ +	do {								\
+ +		bool __cond = !(condition);				\
+ +		extern void prefix ## suffix(void) __compiletime_error(msg); \
+ +		if (__cond)						\
+ +			prefix ## suffix();				\
+ +		__compiletime_error_fallback(__cond);			\
+ +	} while (0)
+ +#else
+ +# define __compiletime_assert(condition, msg, prefix, suffix) do { } while (0)
+ +#endif
+  
+ -/*
+ - * This is needed in functions which generate the stack canary, see
+ - * arch/x86/kernel/smpboot.c::start_secondary() for an example.
+ +#define _compiletime_assert(condition, msg, prefix, suffix) \
+ +	__compiletime_assert(condition, msg, prefix, suffix)
+ +
+ +/**
+ + * compiletime_assert - break build and emit msg if condition is false
+ + * @condition: a compile-time constant condition to check
+ + * @msg:       a message to emit if condition is false
+ + *
+ + * In tradition of POSIX assert, this macro will break the build if the
+ + * supplied condition is *false*, emitting the supplied error message if the
+ + * compiler has support to do so.
+   */
+ -#define prevent_tail_call_optimization()	mb()
+ +#define compiletime_assert(condition, msg) \
+ +	_compiletime_assert(condition, msg, __compiletime_assert_, __LINE__)
+  
+ -#include <asm/rwonce.h>
+ +#define compiletime_assert_atomic_type(t)				\
+ +	compiletime_assert(__native_word(t),				\
+ +		"Need native word sized stores/loads for atomicity.")
+  
+  #endif /* __LINUX_COMPILER_H */
+diff --cc include/linux/overflow.h
+index 51bbd1bccb47,0e33b5cbdb9f..000000000000
+--- a/include/linux/overflow.h
++++ b/include/linux/overflow.h
+@@@ -228,11 -122,118 +228,124 @@@
+  	typeof(d) _d = d;						\
+  	u64 _a_full = _a;						\
+  	unsigned int _to_shift =					\
+ -		is_non_negative(_s) && _s < 8 * sizeof(*d) ? _s : 0;	\
+ +		_s >= 0 && _s < 8 * sizeof(*d) ? _s : 0;		\
+  	*_d = (_a_full << _to_shift);					\
+++<<<<<<< HEAD
+ +	(_to_shift != _s || *_d < 0 || _a < 0 ||			\
+ +		(*_d >> _to_shift) != _a);				\
+ +})
+++=======
++ 	(_to_shift != _s || is_negative(*_d) || is_negative(_a) ||	\
++ 	(*_d >> _to_shift) != _a);					\
++ }))
++ 
++ #define __overflows_type_constexpr(x, T) (			\
++ 	is_unsigned_type(typeof(x)) ?				\
++ 		(x) > type_max(typeof(T)) :			\
++ 	is_unsigned_type(typeof(T)) ?				\
++ 		(x) < 0 || (x) > type_max(typeof(T)) :		\
++ 	(x) < type_min(typeof(T)) || (x) > type_max(typeof(T)))
++ 
++ #define __overflows_type(x, T)		({	\
++ 	typeof(T) v = 0;			\
++ 	check_add_overflow((x), v, &v);		\
++ })
++ 
++ /**
++  * overflows_type - helper for checking the overflows between value, variables,
++  *		    or data type
++  *
++  * @n: source constant value or variable to be checked
++  * @T: destination variable or data type proposed to store @x
++  *
++  * Compares the @x expression for whether or not it can safely fit in
++  * the storage of the type in @T. @x and @T can have different types.
++  * If @x is a constant expression, this will also resolve to a constant
++  * expression.
++  *
++  * Returns: true if overflow can occur, false otherwise.
++  */
++ #define overflows_type(n, T)					\
++ 	__builtin_choose_expr(__is_constexpr(n),		\
++ 			      __overflows_type_constexpr(n, T),	\
++ 			      __overflows_type(n, T))
++ 
++ /**
++  * castable_to_type - like __same_type(), but also allows for casted literals
++  *
++  * @n: variable or constant value
++  * @T: variable or data type
++  *
++  * Unlike the __same_type() macro, this allows a constant value as the
++  * first argument. If this value would not overflow into an assignment
++  * of the second argument's type, it returns true. Otherwise, this falls
++  * back to __same_type().
++  */
++ #define castable_to_type(n, T)						\
++ 	__builtin_choose_expr(__is_constexpr(n),			\
++ 			      !__overflows_type_constexpr(n, T),	\
++ 			      __same_type(n, T))
++ 
++ /**
++  * size_mul() - Calculate size_t multiplication with saturation at SIZE_MAX
++  * @factor1: first factor
++  * @factor2: second factor
++  *
++  * Returns: calculate @factor1 * @factor2, both promoted to size_t,
++  * with any overflow causing the return value to be SIZE_MAX. The
++  * lvalue must be size_t to avoid implicit type conversion.
++  */
++ static inline size_t __must_check size_mul(size_t factor1, size_t factor2)
++ {
++ 	size_t bytes;
++ 
++ 	if (check_mul_overflow(factor1, factor2, &bytes))
++ 		return SIZE_MAX;
++ 
++ 	return bytes;
++ }
++ 
++ /**
++  * size_add() - Calculate size_t addition with saturation at SIZE_MAX
++  * @addend1: first addend
++  * @addend2: second addend
++  *
++  * Returns: calculate @addend1 + @addend2, both promoted to size_t,
++  * with any overflow causing the return value to be SIZE_MAX. The
++  * lvalue must be size_t to avoid implicit type conversion.
++  */
++ static inline size_t __must_check size_add(size_t addend1, size_t addend2)
++ {
++ 	size_t bytes;
++ 
++ 	if (check_add_overflow(addend1, addend2, &bytes))
++ 		return SIZE_MAX;
++ 
++ 	return bytes;
++ }
++ 
++ /**
++  * size_sub() - Calculate size_t subtraction with saturation at SIZE_MAX
++  * @minuend: value to subtract from
++  * @subtrahend: value to subtract from @minuend
++  *
++  * Returns: calculate @minuend - @subtrahend, both promoted to size_t,
++  * with any overflow causing the return value to be SIZE_MAX. For
++  * composition with the size_add() and size_mul() helpers, neither
++  * argument may be SIZE_MAX (or the result with be forced to SIZE_MAX).
++  * The lvalue must be size_t to avoid implicit type conversion.
++  */
++ static inline size_t __must_check size_sub(size_t minuend, size_t subtrahend)
++ {
++ 	size_t bytes;
++ 
++ 	if (minuend == SIZE_MAX || subtrahend == SIZE_MAX ||
++ 	    check_sub_overflow(minuend, subtrahend, &bytes))
++ 		return SIZE_MAX;
++ 
++ 	return bytes;
++ }
+++>>>>>>> 4b21d25bf519 (overflow: Introduce overflows_type() and castable_to_type())
+  
+  /**
+   * array_size() - Calculate size of 2-dimensional array.
+diff --cc lib/Makefile
+index 83b51bd6948f,322178b9f7fb..000000000000
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@@ -331,6 -373,16 +331,19 @@@ obj-$(CONFIG_BITS_KUNIT_TEST) += test_b
+  obj-$(CONFIG_CMDLINE_KUNIT_TEST) += cmdline_kunit.o
+  obj-$(CONFIG_SLUB_KUNIT_TEST) += slub_kunit.o
+  obj-$(CONFIG_MEMCPY_KUNIT_TEST) += memcpy_kunit.o
+++<<<<<<< HEAD
+++=======
++ obj-$(CONFIG_IS_SIGNED_TYPE_KUNIT_TEST) += is_signed_type_kunit.o
++ CFLAGS_overflow_kunit.o = $(call cc-disable-warning, tautological-constant-out-of-range-compare)
++ obj-$(CONFIG_OVERFLOW_KUNIT_TEST) += overflow_kunit.o
++ CFLAGS_stackinit_kunit.o += $(call cc-disable-warning, switch-unreachable)
++ obj-$(CONFIG_STACKINIT_KUNIT_TEST) += stackinit_kunit.o
++ obj-$(CONFIG_FORTIFY_KUNIT_TEST) += fortify_kunit.o
++ obj-$(CONFIG_STRSCPY_KUNIT_TEST) += strscpy_kunit.o
++ obj-$(CONFIG_SIPHASH_KUNIT_TEST) += siphash_kunit.o
++ 
++ obj-$(CONFIG_GENERIC_LIB_DEVMEM_IS_ALLOWED) += devmem_is_allowed.o
+++>>>>>>> 4b21d25bf519 (overflow: Introduce overflows_type() and castable_to_type())
+  
+  # FORTIFY_SOURCE compile-time behavior tests
+  TEST_FORTIFY_SRCS = $(wildcard $(srctree)/$(src)/test_fortify/*-*.c)
+* Unmerged path lib/overflow_kunit.c
+diff --git a/drivers/gpu/drm/i915/i915_user_extensions.c b/drivers/gpu/drm/i915/i915_user_extensions.c
+index c822d0aafd2d..e3f808372c47 100644
+--- a/drivers/gpu/drm/i915/i915_user_extensions.c
++++ b/drivers/gpu/drm/i915/i915_user_extensions.c
+@@ -51,7 +51,7 @@ int i915_user_extensions(struct i915_user_extension __user *ext,
+ 			return err;
+ 
+ 		if (get_user(next, &ext->next_extension) ||
+-		    overflows_type(next, ext))
++		    overflows_type(next, uintptr_t))
+ 			return -EFAULT;
+ 
+ 		ext = u64_to_user_ptr(next);
+diff --git a/drivers/gpu/drm/i915/i915_utils.h b/drivers/gpu/drm/i915/i915_utils.h
+index c10d68cdc3ca..d14b7faee054 100644
+--- a/drivers/gpu/drm/i915/i915_utils.h
++++ b/drivers/gpu/drm/i915/i915_utils.h
+@@ -111,10 +111,6 @@ bool i915_error_injected(void);
+ #define range_overflows_end_t(type, start, size, max) \
+ 	range_overflows_end((type)(start), (type)(size), (type)(max))
+ 
+-/* Note we don't consider signbits :| */
+-#define overflows_type(x, T) \
+-	(sizeof(x) > sizeof(T) && (x) >> BITS_PER_TYPE(T))
+-
+ #define ptr_mask_bits(ptr, n) ({					\
+ 	unsigned long __v = (unsigned long)(ptr);			\
+ 	(typeof(ptr))(__v & -BIT(n));					\
+* Unmerged path include/linux/compiler.h
+* Unmerged path include/linux/overflow.h
+* Unmerged path lib/Makefile
+* Unmerged path lib/overflow_kunit.c
