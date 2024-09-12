@@ -1,0 +1,147 @@
+xfs: xfs_bmap_punch_delalloc_range() should take a byte range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-477.21.1.el8_8
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 7348b322332d8602a4133f0b861334ea021b134a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-477.21.1.el8_8/7348b322.failed
+
+All the callers of xfs_bmap_punch_delalloc_range() jump through
+hoops to convert a byte range to filesystem blocks before calling
+xfs_bmap_punch_delalloc_range(). Instead, pass the byte range to
+xfs_bmap_punch_delalloc_range() and have it do the conversion to
+filesystem blocks internally.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 7348b322332d8602a4133f0b861334ea021b134a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+#	fs/xfs/xfs_iomap.c
+diff --cc fs/xfs/xfs_aops.c
+index 60870f8fd954,6aadc5815068..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -437,29 -450,26 +436,41 @@@ xfs_prepare_ioend
+   * see a ENOSPC in writeback).
+   */
+  static void
+ -xfs_discard_folio(
+ -	struct folio		*folio,
+ -	loff_t			pos)
+ +xfs_discard_page(
+ +	struct page		*page)
+  {
+++<<<<<<< HEAD
+ +	struct inode		*inode = page->mapping->host;
+ +	struct xfs_inode	*ip = XFS_I(inode);
+ +	struct xfs_mount	*mp = ip->i_mount;
+ +	loff_t			offset = page_offset(page);
+ +	xfs_fileoff_t		start_fsb = XFS_B_TO_FSBT(mp, offset);
+++=======
++ 	struct xfs_inode	*ip = XFS_I(folio->mapping->host);
++ 	struct xfs_mount	*mp = ip->i_mount;
+++>>>>>>> 7348b322332d (xfs: xfs_bmap_punch_delalloc_range() should take a byte range)
+  	int			error;
+  
+ -	if (xfs_is_shutdown(mp))
+ -		return;
+ +	if (XFS_FORCED_SHUTDOWN(mp))
+ +		goto out_invalidate;
+  
+  	xfs_alert_ratelimited(mp,
+ -		"page discard on page "PTR_FMT", inode 0x%llx, pos %llu.",
+ -			folio, ip->i_ino, pos);
+ -
+ +		"page discard on page "PTR_FMT", inode 0x%llx, offset %llu.",
+ +			page, ip->i_ino, offset);
+ +
+++<<<<<<< HEAD
+ +	error = xfs_bmap_punch_delalloc_range(ip, start_fsb,
+ +			PAGE_SIZE / i_blocksize(inode));
+ +	if (error && !XFS_FORCED_SHUTDOWN(mp))
+++=======
++ 	error = xfs_bmap_punch_delalloc_range(ip, pos,
++ 			round_up(pos, folio_size(folio)));
++ 
++ 	if (error && !xfs_is_shutdown(mp))
+++>>>>>>> 7348b322332d (xfs: xfs_bmap_punch_delalloc_range() should take a byte range)
+  		xfs_alert(mp, "page discard unable to remove delalloc mapping.");
+ +out_invalidate:
+ +	iomap_invalidatepage(page, 0, PAGE_SIZE);
+  }
+  
+  static const struct iomap_writeback_ops xfs_writeback_ops = {
+diff --cc fs/xfs/xfs_iomap.c
+index d8cd2583dedb,09676ff6940e..000000000000
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@@ -1076,6 -1121,16 +1076,19 @@@ out_unlock
+  }
+  
+  static int
+++<<<<<<< HEAD
+++=======
++ xfs_buffered_write_delalloc_punch(
++ 	struct inode		*inode,
++ 	loff_t			offset,
++ 	loff_t			length)
++ {
++ 	return xfs_bmap_punch_delalloc_range(XFS_I(inode), offset,
++ 			offset + length);
++ }
++ 
++ static int
+++>>>>>>> 7348b322332d (xfs: xfs_bmap_punch_delalloc_range() should take a byte range)
+  xfs_buffered_write_iomap_end(
+  	struct inode		*inode,
+  	loff_t			offset,
+* Unmerged path fs/xfs/xfs_aops.c
+diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+index 1636c08bf4aa..ee0037623cd9 100644
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -589,11 +589,13 @@ xfs_getbmap(
+ int
+ xfs_bmap_punch_delalloc_range(
+ 	struct xfs_inode	*ip,
+-	xfs_fileoff_t		start_fsb,
+-	xfs_fileoff_t		length)
++	xfs_off_t		start_byte,
++	xfs_off_t		end_byte)
+ {
++	struct xfs_mount	*mp = ip->i_mount;
+ 	struct xfs_ifork	*ifp = &ip->i_df;
+-	xfs_fileoff_t		end_fsb = start_fsb + length;
++	xfs_fileoff_t		start_fsb = XFS_B_TO_FSBT(mp, start_byte);
++	xfs_fileoff_t		end_fsb = XFS_B_TO_FSB(mp, end_byte);
+ 	struct xfs_bmbt_irec	got, del;
+ 	struct xfs_iext_cursor	icur;
+ 	int			error = 0;
+@@ -606,7 +608,7 @@ xfs_bmap_punch_delalloc_range(
+ 
+ 	while (got.br_startoff + got.br_blockcount > start_fsb) {
+ 		del = got;
+-		xfs_trim_extent(&del, start_fsb, length);
++		xfs_trim_extent(&del, start_fsb, end_fsb - start_fsb);
+ 
+ 		/*
+ 		 * A delete can push the cursor forward. Step back to the
+diff --git a/fs/xfs/xfs_bmap_util.h b/fs/xfs/xfs_bmap_util.h
+index 9f993168b55b..ca9000d38b90 100644
+--- a/fs/xfs/xfs_bmap_util.h
++++ b/fs/xfs/xfs_bmap_util.h
+@@ -31,7 +31,7 @@ xfs_bmap_rtalloc(struct xfs_bmalloca *ap)
+ #endif /* CONFIG_XFS_RT */
+ 
+ int	xfs_bmap_punch_delalloc_range(struct xfs_inode *ip,
+-		xfs_fileoff_t start_fsb, xfs_fileoff_t length);
++		xfs_off_t start_byte, xfs_off_t end_byte);
+ 
+ struct kgetbmap {
+ 	__s64		bmv_offset;	/* file offset of segment in blocks */
+* Unmerged path fs/xfs/xfs_iomap.c
