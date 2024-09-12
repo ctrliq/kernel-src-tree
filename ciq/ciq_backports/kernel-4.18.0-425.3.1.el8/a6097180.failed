@@ -1,0 +1,83 @@
+devtmpfs regression fix: reconfigure on each mount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author NeilBrown <neilb@suse.de>
+commit a6097180d884ddab769fb25588ea8598589c218c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/a6097180.failed
+
+Prior to Linux v5.4 devtmpfs used mount_single() which treats the given
+mount options as "remount" options, so it updates the configuration of
+the single super_block on each mount.
+
+Since that was changed, the mount options used for devtmpfs are ignored.
+This is a regression which affect systemd - which mounts devtmpfs with
+"-o mode=755,size=4m,nr_inodes=1m".
+
+This patch restores the "remount" effect by calling reconfigure_single()
+
+Fixes: d401727ea0d7 ("devtmpfs: don't mix {ramfs,shmem}_fill_super() with mount_single()")
+	Acked-by: Christian Brauner <christian.brauner@ubuntu.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: NeilBrown <neilb@suse.de>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a6097180d884ddab769fb25588ea8598589c218c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/fs_context.h
+diff --cc include/linux/fs_context.h
+index 675190f27b9a,13fa6f3df8e4..000000000000
+--- a/include/linux/fs_context.h
++++ b/include/linux/fs_context.h
+@@@ -145,6 -141,9 +145,12 @@@ extern int vfs_get_tree(struct fs_conte
+  extern void put_fs_context(struct fs_context *fc);
+  extern int vfs_parse_fs_param_source(struct fs_context *fc,
+  				     struct fs_parameter *param);
+++<<<<<<< HEAD
+++=======
++ extern void fc_drop_locked(struct fs_context *fc);
++ int reconfigure_single(struct super_block *s,
++ 		       int flags, void *data);
+++>>>>>>> a6097180d884 (devtmpfs regression fix: reconfigure on each mount)
+  
+  /*
+   * sget() wrappers to be called from the ->get_tree() op.
+diff --git a/drivers/base/devtmpfs.c b/drivers/base/devtmpfs.c
+index fc7b883f36c9..83b3324f353c 100644
+--- a/drivers/base/devtmpfs.c
++++ b/drivers/base/devtmpfs.c
+@@ -62,8 +62,15 @@ static struct dentry *public_dev_mount(struct file_system_type *fs_type, int fla
+ 		      const char *dev_name, void *data)
+ {
+ 	struct super_block *s = mnt->mnt_sb;
++	int err;
++
+ 	atomic_inc(&s->s_active);
+ 	down_write(&s->s_umount);
++	err = reconfigure_single(s, flags, data);
++	if (err < 0) {
++		deactivate_locked_super(s);
++		return ERR_PTR(err);
++	}
+ 	return dget(s->s_root);
+ }
+ 
+diff --git a/fs/super.c b/fs/super.c
+index 1b312487dfdb..6935943b278f 100644
+--- a/fs/super.c
++++ b/fs/super.c
+@@ -1471,8 +1471,8 @@ struct dentry *mount_nodev(struct file_system_type *fs_type,
+ }
+ EXPORT_SYMBOL(mount_nodev);
+ 
+-static int reconfigure_single(struct super_block *s,
+-			      int flags, void *data)
++int reconfigure_single(struct super_block *s,
++		       int flags, void *data)
+ {
+ 	struct fs_context *fc;
+ 	int ret;
+* Unmerged path include/linux/fs_context.h
