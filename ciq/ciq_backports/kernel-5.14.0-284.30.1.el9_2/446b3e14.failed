@@ -1,0 +1,139 @@
+rxrpc: Move packet reception processing into I/O thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 446b3e14525b477e441a6bb8ce56cea12512acc2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/446b3e14.failed
+
+Split the packet input handler to make the softirq side just dump the
+received packet into the local endpoint receive queue and then call the
+remainder of the input function from the I/O thread.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit 446b3e14525b477e441a6bb8ce56cea12512acc2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/call_object.c
+#	net/rxrpc/io_thread.c
+#	net/rxrpc/local_object.c
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,044815ba2b49..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -942,7 -951,19 +943,23 @@@ void rxrpc_unpublish_service_conn(struc
+  /*
+   * input.c
+   */
+++<<<<<<< HEAD
+ +int rxrpc_input_packet(struct sock *, struct sk_buff *);
+++=======
++ void rxrpc_input_call_packet(struct rxrpc_call *, struct sk_buff *);
++ void rxrpc_input_implicit_end_call(struct rxrpc_sock *, struct rxrpc_connection *,
++ 				   struct rxrpc_call *);
++ 
++ /*
++  * io_thread.c
++  */
++ int rxrpc_encap_rcv(struct sock *, struct sk_buff *);
++ int rxrpc_io_thread(void *data);
++ static inline void rxrpc_wake_up_io_thread(struct rxrpc_local *local)
++ {
++ 	wake_up_process(local->io_thread);
++ }
+++>>>>>>> 446b3e14525b (rxrpc: Move packet reception processing into I/O thread)
+  
+  /*
+   * insecure.c
+diff --cc net/rxrpc/call_object.c
+index ad495d0d21a8,57c8d4cc900a..000000000000
+--- a/net/rxrpc/call_object.c
++++ b/net/rxrpc/call_object.c
+@@@ -669,9 -613,32 +669,32 @@@ void rxrpc_cleanup_call(struct rxrpc_ca
+  		rxrpc_put_txbuf(txb, rxrpc_txbuf_put_cleaned);
+  	}
+  	rxrpc_put_txbuf(call->tx_pending, rxrpc_txbuf_put_cleaned);
+ -	rxrpc_free_skb(call->acks_soft_tbl, rxrpc_skb_put_ack);
+ -	rxrpc_put_connection(call->conn, rxrpc_conn_put_call);
+ -	rxrpc_put_peer(call->peer, rxrpc_peer_put_call);
+ -	call_rcu(&call->rcu, rxrpc_rcu_free_call);
+ -}
+ +	rxrpc_free_skb(call->acks_soft_tbl, rxrpc_skb_cleaned);
+  
+++<<<<<<< HEAD
+ +	call_rcu(&call->rcu, rxrpc_rcu_destroy_call);
+++=======
++ /*
++  * clean up a call
++  */
++ void rxrpc_cleanup_call(struct rxrpc_call *call)
++ {
++ 	memset(&call->sock_node, 0xcd, sizeof(call->sock_node));
++ 
++ 	ASSERTCMP(call->state, ==, RXRPC_CALL_COMPLETE);
++ 	ASSERT(test_bit(RXRPC_CALL_RELEASED, &call->flags));
++ 
++ 	del_timer_sync(&call->timer);
++ 	cancel_work(&call->processor);
++ 
++ 	if (rcu_read_lock_held() || work_busy(&call->processor))
++ 		/* Can't use the rxrpc workqueue as we need to cancel/flush
++ 		 * something that may be running/waiting there.
++ 		 */
++ 		schedule_work(&call->destroyer);
++ 	else
++ 		rxrpc_destroy_call(&call->destroyer);
+++>>>>>>> 446b3e14525b (rxrpc: Move packet reception processing into I/O thread)
+  }
+  
+  /*
+diff --cc net/rxrpc/local_object.c
+index 846558613c7f,6b4d77219f36..000000000000
+--- a/net/rxrpc/local_object.c
++++ b/net/rxrpc/local_object.c
+@@@ -138,7 -154,8 +138,12 @@@ static int rxrpc_open_socket(struct rxr
+  	}
+  
+  	tuncfg.encap_type = UDP_ENCAP_RXRPC;
+++<<<<<<< HEAD
+ +	tuncfg.encap_rcv = rxrpc_input_packet;
+++=======
++ 	tuncfg.encap_rcv = rxrpc_encap_rcv;
++ 	tuncfg.encap_err_rcv = rxrpc_encap_err_rcv;
+++>>>>>>> 446b3e14525b (rxrpc: Move packet reception processing into I/O thread)
+  	tuncfg.sk_user_data = local;
+  	setup_udp_tunnel_sock(net, local->socket, &tuncfg);
+  
+* Unmerged path net/rxrpc/io_thread.c
+* Unmerged path net/rxrpc/ar-internal.h
+diff --git a/net/rxrpc/call_event.c b/net/rxrpc/call_event.c
+index a95f4604cb29..f7c424b8ca78 100644
+--- a/net/rxrpc/call_event.c
++++ b/net/rxrpc/call_event.c
+@@ -83,7 +83,7 @@ void rxrpc_send_ACK(struct rxrpc_call *call, u8 ack_reason,
+ 	rxrpc_inc_stat(call->rxnet, stat_tx_acks[ack_reason]);
+ 
+ 	txb = rxrpc_alloc_txbuf(call, RXRPC_PACKET_TYPE_ACK,
+-				in_softirq() ? GFP_ATOMIC | __GFP_NOWARN : GFP_NOFS);
++				rcu_read_lock_held() ? GFP_ATOMIC | __GFP_NOWARN : GFP_NOFS);
+ 	if (!txb) {
+ 		kleave(" = -ENOMEM");
+ 		return;
+@@ -111,7 +111,7 @@ void rxrpc_send_ACK(struct rxrpc_call *call, u8 ack_reason,
+ 	spin_unlock_bh(&local->ack_tx_lock);
+ 	trace_rxrpc_send_ack(call, why, ack_reason, serial);
+ 
+-	if (in_task()) {
++	if (!rcu_read_lock_held()) {
+ 		rxrpc_transmit_ack_packets(call->peer->local);
+ 	} else {
+ 		rxrpc_get_local(local);
+* Unmerged path net/rxrpc/call_object.c
+* Unmerged path net/rxrpc/io_thread.c
+* Unmerged path net/rxrpc/local_object.c
