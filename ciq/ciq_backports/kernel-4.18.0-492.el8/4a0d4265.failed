@@ -1,0 +1,132 @@
+iommu/vt-d: Add IOMMU perfmon overflow handler support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-492.el8
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit 4a0d4265659b1078db3432cb80ceaf26ad921704
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-492.el8/4a0d4265.failed
+
+While enabled to count events and an event occurrence causes the counter
+value to increment and roll over to or past zero, this is termed a
+counter overflow. The overflow can trigger an interrupt. The IOMMU
+perfmon needs to handle the case properly.
+
+New HW IRQs are allocated for each IOMMU device for perfmon. The IRQ IDs
+are after the SVM range.
+
+In the overflow handler, the counter is not frozen. It's very unlikely
+that the same counter overflows again during the period. But it's
+possible that other counters overflow at the same time. Read the
+overflow register at the end of the handler and check whether there are
+more.
+
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+Link: https://lore.kernel.org/r/20230128200428.1459118-7-kan.liang@linux.intel.com
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 4a0d4265659b1078db3432cb80ceaf26ad921704)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel/perfmon.c
+#	include/linux/intel-iommu.h
+diff --cc include/linux/intel-iommu.h
+index b9494fd422a2,d7c61eb20f6f..000000000000
+--- a/include/linux/intel-iommu.h
++++ b/include/linux/intel-iommu.h
+@@@ -136,6 -126,17 +136,20 @@@
+  #define DMAR_MTRR_PHYSMASK8_REG 0x208
+  #define DMAR_MTRR_PHYSBASE9_REG 0x210
+  #define DMAR_MTRR_PHYSMASK9_REG 0x218
+++<<<<<<< HEAD:include/linux/intel-iommu.h
+++=======
++ #define DMAR_PERFCAP_REG	0x300
++ #define DMAR_PERFCFGOFF_REG	0x310
++ #define DMAR_PERFOVFOFF_REG	0x318
++ #define DMAR_PERFCNTROFF_REG	0x31c
++ #define DMAR_PERFINTRSTS_REG	0x324
++ #define DMAR_PERFINTRCTL_REG	0x328
++ #define DMAR_PERFEVNTCAP_REG	0x380
++ #define DMAR_ECMD_REG		0x400
++ #define DMAR_ECEO_REG		0x408
++ #define DMAR_ECRSP_REG		0x410
++ #define DMAR_ECCAP_REG		0x430
+++>>>>>>> 4a0d4265659b (iommu/vt-d: Add IOMMU perfmon overflow handler support):drivers/iommu/intel/iommu.h
+  #define DMAR_VCCAP_REG		0xe30 /* Virtual command capability register */
+  #define DMAR_VCMD_REG		0xe00 /* Virtual command register */
+  #define DMAR_VCRSP_REG		0xe10 /* Virtual command response register */
+@@@ -582,6 -612,40 +599,43 @@@ struct dmar_domain 
+  					   iommu core */
+  };
+  
+++<<<<<<< HEAD:include/linux/intel-iommu.h
+++=======
++ /*
++  * In theory, the VT-d 4.0 spec can support up to 2 ^ 16 counters.
++  * But in practice, there are only 14 counters for the existing
++  * platform. Setting the max number of counters to 64 should be good
++  * enough for a long time. Also, supporting more than 64 counters
++  * requires more extras, e.g., extra freeze and overflow registers,
++  * which is not necessary for now.
++  */
++ #define IOMMU_PMU_IDX_MAX		64
++ 
++ struct iommu_pmu {
++ 	struct intel_iommu	*iommu;
++ 	u32			num_cntr;	/* Number of counters */
++ 	u32			num_eg;		/* Number of event group */
++ 	u32			cntr_width;	/* Counter width */
++ 	u32			cntr_stride;	/* Counter Stride */
++ 	u32			filter;		/* Bitmask of filter support */
++ 	void __iomem		*base;		/* the PerfMon base address */
++ 	void __iomem		*cfg_reg;	/* counter configuration base address */
++ 	void __iomem		*cntr_reg;	/* counter 0 address*/
++ 	void __iomem		*overflow;	/* overflow status register */
++ 
++ 	u64			*evcap;		/* Indicates all supported events */
++ 	u32			**cntr_evcap;	/* Supported events of each counter. */
++ 
++ 	struct pmu		pmu;
++ 	DECLARE_BITMAP(used_mask, IOMMU_PMU_IDX_MAX);
++ 	struct perf_event	*event_list[IOMMU_PMU_IDX_MAX];
++ 	unsigned char		irq_name[16];
++ };
++ 
++ #define IOMMU_IRQ_ID_OFFSET_PRQ		(DMAR_UNITS_SUPPORTED)
++ #define IOMMU_IRQ_ID_OFFSET_PERF	(2 * DMAR_UNITS_SUPPORTED)
++ 
+++>>>>>>> 4a0d4265659b (iommu/vt-d: Add IOMMU perfmon overflow handler support):drivers/iommu/intel/iommu.h
+  struct intel_iommu {
+  	void __iomem	*reg; /* Pointer to hardware regs, virtual addr */
+  	u64 		reg_phys; /* physical address of hw register set */
+* Unmerged path drivers/iommu/intel/perfmon.c
+diff --git a/drivers/iommu/intel/dmar.c b/drivers/iommu/intel/dmar.c
+index 62429652d772..870412be739c 100644
+--- a/drivers/iommu/intel/dmar.c
++++ b/drivers/iommu/intel/dmar.c
+@@ -1889,6 +1889,8 @@ static inline int dmar_msi_reg(struct intel_iommu *iommu, int irq)
+ 		return DMAR_FECTL_REG;
+ 	else if (iommu->pr_irq == irq)
+ 		return DMAR_PECTL_REG;
++	else if (iommu->perf_irq == irq)
++		return DMAR_PERFINTRCTL_REG;
+ 	else
+ 		BUG();
+ }
+* Unmerged path drivers/iommu/intel/perfmon.c
+diff --git a/drivers/iommu/intel/svm.c b/drivers/iommu/intel/svm.c
+index fe5757ae6e60..7cf7a150e680 100644
+--- a/drivers/iommu/intel/svm.c
++++ b/drivers/iommu/intel/svm.c
+@@ -87,7 +87,7 @@ int intel_svm_enable_prq(struct intel_iommu *iommu)
+ 	}
+ 	iommu->prq = page_address(pages);
+ 
+-	irq = dmar_alloc_hwirq(DMAR_UNITS_SUPPORTED + iommu->seq_id, iommu->node, iommu);
++	irq = dmar_alloc_hwirq(IOMMU_IRQ_ID_OFFSET_PRQ + iommu->seq_id, iommu->node, iommu);
+ 	if (irq <= 0) {
+ 		pr_err("IOMMU: %s: Failed to create IRQ vector for page request queue\n",
+ 		       iommu->name);
+* Unmerged path include/linux/intel-iommu.h
