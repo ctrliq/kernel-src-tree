@@ -1,0 +1,100 @@
+scsi: scsi_debug: Get command abort feature working again
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-535.el8
+commit-author John Garry <john.g.garry@oracle.com>
+commit f037b5cb07138cd519f35fd08ebef2faf075959f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-535.el8/f037b5cb.failed
+
+The command abort feature allows us to test aborting a command which has
+timed-out.
+
+The idea is that for specific commands we just don't call scsi_done() and
+allow the request to timeout, which ensures SCSI EH kicks-in we try to
+abort the command.
+
+Since commit 4a0c6f432d15 ("scsi: scsi_debug: Add new defer type for
+mq_poll") this does not seem to work. The issue is that we clear the
+sd_dp->aborted flag in schedule_resp() before the completion callback has
+run. When the completion callback actually runs, it calls scsi_done() as
+normal as sd_dp->aborted unset. This is all very racy.
+
+Fix by not clearing sd_dp->aborted in schedule_resp(). Also move the call
+to blk_abort_request() from schedule_resp() to sdebug_q_cmd_complete(),
+which makes the code have a more logical sequence.
+
+I also note that this feature only works for commands which are classed as
+"SDEG_RES_IMMED_MASK", but only practically triggered with prior RW
+commands. So for my experiment I need to run fio to trigger the error on
+the "nth" command (see inject_on_this_cmd()), and then run something like
+sg_sync to queue a command to actually trigger the abort.
+
+	Signed-off-by: John Garry <john.g.garry@oracle.com>
+	Acked-by: Douglas Gilbert <dgilbert@interlog.com>
+Link: https://lore.kernel.org/r/20230313093114.1498305-11-john.g.garry@oracle.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit f037b5cb07138cd519f35fd08ebef2faf075959f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_debug.c
+diff --cc drivers/scsi/scsi_debug.c
+index 11c773f222f0,2b25c2090ac9..000000000000
+--- a/drivers/scsi/scsi_debug.c
++++ b/drivers/scsi/scsi_debug.c
+@@@ -4986,10 -4983,11 +4986,11 @@@ static void sdebug_q_cmd_complete(struc
+  	spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+  	if (unlikely(aborted)) {
+  		if (sdebug_verbose)
+- 			pr_info("bypassing scsi_done() due to aborted cmd\n");
++ 			pr_info("bypassing scsi_done() due to aborted cmd, kicking-off EH\n");
++ 		blk_abort_request(scsi_cmd_to_rq(scp));
+  		return;
+  	}
+ -	scsi_done(scp); /* callback to mid level */
+ +	scp->scsi_done(scp); /* callback to mid level */
+  }
+  
+  /* When high resolution timer goes off this function is called. */
+@@@ -5751,9 -5713,14 +5752,18 @@@ static int schedule_resp(struct scsi_cm
+  			sd_dp->issuing_cpu = raw_smp_processor_id();
+  	} else {	/* jdelay < 0, use work queue */
+  		if (unlikely((sdebug_opts & SDEBUG_OPT_CMD_ABORT) &&
+- 			     atomic_read(&sdeb_inject_pending)))
++ 			     atomic_read(&sdeb_inject_pending))) {
+  			sd_dp->aborted = true;
+++<<<<<<< HEAD
+ +		if (hipri) {
+++=======
++ 			atomic_set(&sdeb_inject_pending, 0);
++ 			sdev_printk(KERN_INFO, sdp, "abort request tag=%#x\n",
++ 				    blk_mq_unique_tag_to_tag(get_tag(cmnd)));
++ 		}
++ 
++ 		if (polled) {
+++>>>>>>> f037b5cb0713 (scsi: scsi_debug: Get command abort feature working again)
+  			sd_dp->cmpl_ts = ns_to_ktime(ns_from_boot);
+  			spin_lock_irqsave(&sqp->qc_lock, iflags);
+  			if (!sd_dp->init_poll) {
+@@@ -5777,17 -5744,8 +5787,10 @@@
+  		}
+  		if (sdebug_statistics)
+  			sd_dp->issuing_cpu = raw_smp_processor_id();
+- 		if (unlikely(sd_dp->aborted)) {
+- 			sdev_printk(KERN_INFO, sdp, "abort request tag %d\n",
+- 				    scsi_cmd_to_rq(cmnd)->tag);
+- 			blk_abort_request(scsi_cmd_to_rq(cmnd));
+- 			atomic_set(&sdeb_inject_pending, 0);
+- 			sd_dp->aborted = false;
+- 		}
+  	}
+ -
+ +	if (unlikely((SDEBUG_OPT_Q_NOISE & sdebug_opts) && scsi_result == device_qfull_result))
+ +		sdev_printk(KERN_INFO, sdp, "%s: num_in_q=%d +1, %s%s\n", __func__,
+ +			    num_in_q, (inject ? "<inject> " : ""), "status: TASK SET FULL");
+  	return 0;
+  
+  respond_in_thread:	/* call back to mid-layer using invocation thread */
+* Unmerged path drivers/scsi/scsi_debug.c
