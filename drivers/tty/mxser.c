@@ -2255,8 +2255,7 @@ intr_old:
 				} else if (*status & UART_LSR_OE) {
 					flag = TTY_OVERRUN;
 					port->icount.overrun++;
-				} else
-					flag = TTY_BREAK;
+				}
 			}
 			tty_insert_flip_char(&port->port, ch, flag);
 			cnt++;
