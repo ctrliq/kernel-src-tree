@@ -1,0 +1,826 @@
+netfilter: nftables: add catch-all set element support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-534.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit aaa31047a6d25da0fa101da1ed544e1247949b40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-534.el8/aaa31047.failed
+
+This patch extends the set infrastructure to add a special catch-all set
+element. If the lookup fails to find an element (or range) in the set,
+then the catch-all element is selected. Users can specify a mapping,
+expression(s) and timeout to be attached to the catch-all element.
+
+This patch adds a catchall list to the set, this list might contain more
+than one single catch-all element (e.g. in case that the catch-all
+element is removed and a new one is added in the same transaction).
+However, most of the time, there will be either one element or no
+elements at all in this list.
+
+The catch-all element is identified via NFT_SET_ELEM_CATCHALL flag and
+such special element has no NFTA_SET_ELEM_KEY attribute. There is a new
+nft_set_elem_catchall object that stores a reference to the dummy
+catch-all element (catchall->elem) whose layout is the same of the set
+element type to reuse the existing set element codebase.
+
+The set size does not apply to the catch-all element, users can define a
+catch-all element even if the set is full.
+
+The check for valid set element flags hava been updates to report
+EOPNOTSUPP in case userspace requests flags that are not supported when
+using new userspace nftables and old kernel.
+
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit aaa31047a6d25da0fa101da1ed544e1247949b40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+diff --cc net/netfilter/nf_tables_api.c
+index c52a1dd1b5bc,0b7fe0a902ff..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -4223,38 -4343,7 +4223,39 @@@ static int nf_tables_newset(struct net 
+  	err = nf_tables_set_alloc_name(&ctx, set, name);
+  	kfree(name);
+  	if (err < 0)
+ -		goto err_set_alloc_name;
+ +		goto err_set_name;
+ +
+ +	udata = NULL;
+ +	if (udlen) {
+ +		udata = set->data + size;
+ +		nla_memcpy(udata, nla[NFTA_SET_USERDATA], udlen);
+ +	}
+ +
+ +	INIT_LIST_HEAD(&set->bindings);
+++	INIT_LIST_HEAD(&set->catchall_list);
+ +	set->table = table;
+ +	write_pnet(&set->net, net);
+ +	set->ops = ops;
+ +	set->ktype = ktype;
+ +	set->klen = desc.klen;
+ +	set->dtype = dtype;
+ +	set->objtype = objtype;
+ +	set->dlen = desc.dlen;
+ +	set->flags = flags;
+ +	set->size = desc.size;
+ +	set->policy = policy;
+ +	set->udlen = udlen;
+ +	set->udata = udata;
+ +	set->timeout = timeout;
+ +	set->gc_int = gc_int;
+ +
+ +	set->field_count = desc.field_count;
+ +	for (i = 0; i < desc.field_count; i++)
+ +		set->field_len[i] = desc.field_len[i];
+ +
+ +	err = ops->init(set, &desc, nla);
+ +	if (err < 0)
+ +		goto err_set_init;
+  
+  	if (nla[NFTA_SET_EXPR]) {
+  		expr = nft_set_elem_expr_alloc(&ctx, set, nla[NFTA_SET_EXPR]);
+@@@ -4328,7 -4464,7 +4347,11 @@@ static void nft_set_destroy(const struc
+  		nft_expr_destroy(ctx, set->exprs[i]);
+  
+  	set->ops->destroy(set);
+++<<<<<<< HEAD
+ +	module_put(to_set_type(set->ops)->owner);
+++=======
++ 	nft_set_catchall_destroy(ctx, set);
+++>>>>>>> aaa31047a6d2 (netfilter: nftables: add catch-all set element support)
+  	kfree(set->name);
+  	kvfree(set);
+  }
+@@@ -4391,6 -4533,37 +4414,40 @@@ static int nf_tables_bind_check_setelem
+  					   set->dlen);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nf_tables_bind_check_setelem(const struct nft_ctx *ctx,
++ 					struct nft_set *set,
++ 					const struct nft_set_iter *iter,
++ 					struct nft_set_elem *elem)
++ {
++ 	return nft_setelem_data_validate(ctx, set, elem);
++ }
++ 
++ static int nft_set_catchall_bind_check(const struct nft_ctx *ctx,
++ 				       struct nft_set *set)
++ {
++ 	u8 genmask = nft_genmask_next(ctx->net);
++ 	struct nft_set_elem_catchall *catchall;
++ 	struct nft_set_elem elem;
++ 	struct nft_set_ext *ext;
++ 	int ret = 0;
++ 
++ 	list_for_each_entry_rcu(catchall, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 		if (!nft_set_elem_active(ext, genmask))
++ 			continue;
++ 
++ 		elem.priv = catchall->elem;
++ 		ret = nft_setelem_data_validate(ctx, set, &elem);
++ 		if (ret < 0)
++ 			break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> aaa31047a6d2 (netfilter: nftables: add catch-all set element support)
+  int nf_tables_bind_set(const struct nft_ctx *ctx, struct nft_set *set,
+  		       struct nft_set_binding *binding)
+  {
+@@@ -4899,6 -5068,65 +4986,68 @@@ static int nft_setelem_parse_key(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nft_setelem_parse_data(struct nft_ctx *ctx, struct nft_set *set,
++ 				  struct nft_data_desc *desc,
++ 				  struct nft_data *data,
++ 				  struct nlattr *attr)
++ {
++ 	int err;
++ 
++ 	err = nft_data_init(ctx, data, NFT_DATA_VALUE_MAXLEN, desc, attr);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (desc->type != NFT_DATA_VERDICT && desc->len != set->dlen) {
++ 		nft_data_release(data, desc->type);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void *nft_setelem_catchall_get(const struct net *net,
++ 				      const struct nft_set *set)
++ {
++ 	struct nft_set_elem_catchall *catchall;
++ 	u8 genmask = nft_genmask_cur(net);
++ 	struct nft_set_ext *ext;
++ 	void *priv = NULL;
++ 
++ 	list_for_each_entry_rcu(catchall, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 		if (!nft_set_elem_active(ext, genmask) ||
++ 		    nft_set_elem_expired(ext))
++ 			continue;
++ 
++ 		priv = catchall->elem;
++ 		break;
++ 	}
++ 
++ 	return priv;
++ }
++ 
++ static int nft_setelem_get(struct nft_ctx *ctx, struct nft_set *set,
++ 			   struct nft_set_elem *elem, u32 flags)
++ {
++ 	void *priv;
++ 
++ 	if (!(flags & NFT_SET_ELEM_CATCHALL)) {
++ 		priv = set->ops->get(ctx->net, set, elem, flags);
++ 		if (IS_ERR(priv))
++ 			return PTR_ERR(priv);
++ 	} else {
++ 		priv = nft_setelem_catchall_get(ctx->net, set);
++ 		if (!priv)
++ 			return -ENOENT;
++ 	}
++ 	elem->priv = priv;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> aaa31047a6d2 (netfilter: nftables: add catch-all set element support)
+  static int nft_get_set_elem(struct nft_ctx *ctx, struct nft_set *set,
+  			    const struct nlattr *attr)
+  {
+@@@ -5222,19 -5456,190 +5371,206 @@@ err_elem_expr_setup
+  	return -ENOMEM;
+  }
+  
+++<<<<<<< HEAD
+ +static bool nft_setelem_valid_key_end(const struct nft_set *set,
+ +				      struct nlattr **nla, u32 flags)
+ +{
+ +	if ((set->flags & (NFT_SET_CONCAT | NFT_SET_INTERVAL)) ==
+ +			  (NFT_SET_CONCAT | NFT_SET_INTERVAL)) {
+ +		if (flags & NFT_SET_ELEM_INTERVAL_END)
+ +			return false;
+ +	} else {
+ +		if (nla[NFTA_SET_ELEM_KEY_END])
+ +			return false;
+ +	}
+ +
+ +	return true;
+++=======
++ struct nft_set_ext *nft_set_catchall_lookup(const struct net *net,
++ 					    const struct nft_set *set)
++ {
++ 	struct nft_set_elem_catchall *catchall;
++ 	u8 genmask = nft_genmask_cur(net);
++ 	struct nft_set_ext *ext;
++ 
++ 	list_for_each_entry_rcu(catchall, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 		if (nft_set_elem_active(ext, genmask) &&
++ 		    !nft_set_elem_expired(ext))
++ 			return ext;
++ 	}
++ 
++ 	return NULL;
++ }
++ EXPORT_SYMBOL_GPL(nft_set_catchall_lookup);
++ 
++ void *nft_set_catchall_gc(const struct nft_set *set)
++ {
++ 	struct nft_set_elem_catchall *catchall, *next;
++ 	struct nft_set_ext *ext;
++ 	void *elem = NULL;
++ 
++ 	list_for_each_entry_safe(catchall, next, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 
++ 		if (!nft_set_elem_expired(ext) ||
++ 		    nft_set_elem_mark_busy(ext))
++ 			continue;
++ 
++ 		elem = catchall->elem;
++ 		list_del_rcu(&catchall->list);
++ 		kfree_rcu(catchall, rcu);
++ 		break;
++ 	}
++ 
++ 	return elem;
++ }
++ EXPORT_SYMBOL_GPL(nft_set_catchall_gc);
++ 
++ static int nft_setelem_catchall_insert(const struct net *net,
++ 				       struct nft_set *set,
++ 				       const struct nft_set_elem *elem,
++ 				       struct nft_set_ext **pext)
++ {
++ 	struct nft_set_elem_catchall *catchall;
++ 	u8 genmask = nft_genmask_next(net);
++ 	struct nft_set_ext *ext;
++ 
++ 	list_for_each_entry(catchall, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 		if (nft_set_elem_active(ext, genmask)) {
++ 			*pext = ext;
++ 			return -EEXIST;
++ 		}
++ 	}
++ 
++ 	catchall = kmalloc(sizeof(*catchall), GFP_KERNEL);
++ 	if (!catchall)
++ 		return -ENOMEM;
++ 
++ 	catchall->elem = elem->priv;
++ 	list_add_tail_rcu(&catchall->list, &set->catchall_list);
++ 
++ 	return 0;
++ }
++ 
++ static int nft_setelem_insert(const struct net *net,
++ 			      struct nft_set *set,
++ 			      const struct nft_set_elem *elem,
++ 			      struct nft_set_ext **ext, unsigned int flags)
++ {
++ 	int ret;
++ 
++ 	if (flags & NFT_SET_ELEM_CATCHALL)
++ 		ret = nft_setelem_catchall_insert(net, set, elem, ext);
++ 	else
++ 		ret = set->ops->insert(net, set, elem, ext);
++ 
++ 	return ret;
++ }
++ 
++ static bool nft_setelem_is_catchall(const struct nft_set *set,
++ 				    const struct nft_set_elem *elem)
++ {
++ 	struct nft_set_ext *ext = nft_set_elem_ext(set, elem->priv);
++ 
++ 	if (nft_set_ext_exists(ext, NFT_SET_EXT_FLAGS) &&
++ 	    *nft_set_ext_flags(ext) & NFT_SET_ELEM_CATCHALL)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static void nft_setelem_activate(struct net *net, struct nft_set *set,
++ 				 struct nft_set_elem *elem)
++ {
++ 	struct nft_set_ext *ext = nft_set_elem_ext(set, elem->priv);
++ 
++ 	if (nft_setelem_is_catchall(set, elem)) {
++ 		nft_set_elem_change_active(net, set, ext);
++ 		nft_set_elem_clear_busy(ext);
++ 	} else {
++ 		set->ops->activate(net, set, elem);
++ 	}
++ }
++ 
++ static int nft_setelem_catchall_deactivate(const struct net *net,
++ 					   struct nft_set *set,
++ 					   struct nft_set_elem *elem)
++ {
++ 	struct nft_set_elem_catchall *catchall;
++ 	struct nft_set_ext *ext;
++ 
++ 	list_for_each_entry(catchall, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 		if (!nft_is_active(net, ext) ||
++ 		    nft_set_elem_mark_busy(ext))
++ 			continue;
++ 
++ 		kfree(elem->priv);
++ 		elem->priv = catchall->elem;
++ 		nft_set_elem_change_active(net, set, ext);
++ 		return 0;
++ 	}
++ 
++ 	return -ENOENT;
++ }
++ 
++ static int __nft_setelem_deactivate(const struct net *net,
++ 				    struct nft_set *set,
++ 				    struct nft_set_elem *elem)
++ {
++ 	void *priv;
++ 
++ 	priv = set->ops->deactivate(net, set, elem);
++ 	if (!priv)
++ 		return -ENOENT;
++ 
++ 	kfree(elem->priv);
++ 	elem->priv = priv;
++ 	set->ndeact++;
++ 
++ 	return 0;
++ }
++ 
++ static int nft_setelem_deactivate(const struct net *net,
++ 				  struct nft_set *set,
++ 				  struct nft_set_elem *elem, u32 flags)
++ {
++ 	int ret;
++ 
++ 	if (flags & NFT_SET_ELEM_CATCHALL)
++ 		ret = nft_setelem_catchall_deactivate(net, set, elem);
++ 	else
++ 		ret = __nft_setelem_deactivate(net, set, elem);
++ 
++ 	return ret;
++ }
++ 
++ static void nft_setelem_catchall_remove(const struct net *net,
++ 					const struct nft_set *set,
++ 					const struct nft_set_elem *elem)
++ {
++ 	struct nft_set_elem_catchall *catchall, *next;
++ 
++ 	list_for_each_entry_safe(catchall, next, &set->catchall_list, list) {
++ 		if (catchall->elem == elem->priv) {
++ 			list_del_rcu(&catchall->list);
++ 			kfree_rcu(catchall);
++ 			break;
++ 		}
++ 	}
++ }
++ 
++ static void nft_setelem_remove(const struct net *net,
++ 			       const struct nft_set *set,
++ 			       const struct nft_set_elem *elem)
++ {
++ 	if (nft_setelem_is_catchall(set, elem))
++ 		nft_setelem_catchall_remove(net, set, elem);
++ 	else
++ 		set->ops->remove(net, set, elem);
+++>>>>>>> aaa31047a6d2 (netfilter: nftables: add catch-all set element support)
+  }
+  
+  static int nft_add_set_elem(struct nft_ctx *ctx, struct nft_set *set,
+@@@ -5272,11 -5673,12 +5605,20 @@@
+  	err = nft_setelem_parse_flags(set, nla[NFTA_SET_ELEM_FLAGS], &flags);
+  	if (err < 0)
+  		return err;
+++<<<<<<< HEAD
+ +	if (flags != 0) {
+ +		err = nft_set_ext_add(&tmpl, NFT_SET_EXT_FLAGS);
+ +		if (err < 0)
+ +			return err;
+ +	}
+++=======
++ 
++ 	if (!nla[NFTA_SET_ELEM_KEY] && !(flags & NFT_SET_ELEM_CATCHALL))
++ 		return -EINVAL;
++ 
++ 	if (flags != 0)
++ 		nft_set_ext_add(&tmpl, NFT_SET_EXT_FLAGS);
+++>>>>>>> aaa31047a6d2 (netfilter: nftables: add catch-all set element support)
+  
+  	if (set->flags & NFT_SET_MAP) {
+  		if (nla[NFTA_SET_ELEM_DATA] == NULL &&
+@@@ -5392,14 -5781,14 +5734,20 @@@
+  		num_exprs = set->num_exprs;
+  	}
+  
+- 	err = nft_setelem_parse_key(ctx, set, &elem.key.val,
+- 				    nla[NFTA_SET_ELEM_KEY]);
+- 	if (err < 0)
+- 		goto err_set_elem_expr;
++ 	if (nla[NFTA_SET_ELEM_KEY]) {
++ 		err = nft_setelem_parse_key(ctx, set, &elem.key.val,
++ 					    nla[NFTA_SET_ELEM_KEY]);
++ 		if (err < 0)
++ 			goto err_set_elem_expr;
+  
+++<<<<<<< HEAD
+ +	err = nft_set_ext_add_length(&tmpl, NFT_SET_EXT_KEY, set->klen);
+ +	if (err < 0)
+ +		goto err_parse_key;
+++=======
++ 		nft_set_ext_add_length(&tmpl, NFT_SET_EXT_KEY, set->klen);
++ 	}
+++>>>>>>> aaa31047a6d2 (netfilter: nftables: add catch-all set element support)
+  
+  	if (nla[NFTA_SET_ELEM_KEY_END]) {
+  		err = nft_setelem_parse_key(ctx, set, &elem.key_end.val,
+@@@ -5700,31 -6083,26 +6048,46 @@@ static int nft_del_setelem(struct nft_c
+  	if (err < 0)
+  		return err;
+  
+- 	if (nla[NFTA_SET_ELEM_KEY] == NULL)
++ 	err = nft_setelem_parse_flags(set, nla[NFTA_SET_ELEM_FLAGS], &flags);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (!nla[NFTA_SET_ELEM_KEY] && !(flags & NFT_SET_ELEM_CATCHALL))
+  		return -EINVAL;
+  
+ +	if (!nft_setelem_valid_key_end(set, nla, flags))
+ +		return -EINVAL;
+ +
+  	nft_set_ext_prepare(&tmpl);
+  
+++<<<<<<< HEAD
+ +	err = nft_setelem_parse_flags(set, nla[NFTA_SET_ELEM_FLAGS], &flags);
+ +	if (err < 0)
+ +		return err;
+ +	if (flags != 0) {
+ +		err = nft_set_ext_add(&tmpl, NFT_SET_EXT_FLAGS);
+ +		if (err < 0)
+ +			return err;
+ +	}
+++=======
++ 	if (flags != 0)
++ 		nft_set_ext_add(&tmpl, NFT_SET_EXT_FLAGS);
+++>>>>>>> aaa31047a6d2 (netfilter: nftables: add catch-all set element support)
+  
+- 	err = nft_setelem_parse_key(ctx, set, &elem.key.val,
+- 				    nla[NFTA_SET_ELEM_KEY]);
+- 	if (err < 0)
+- 		return err;
++ 	if (nla[NFTA_SET_ELEM_KEY]) {
++ 		err = nft_setelem_parse_key(ctx, set, &elem.key.val,
++ 					    nla[NFTA_SET_ELEM_KEY]);
++ 		if (err < 0)
++ 			return err;
+  
+++<<<<<<< HEAD
+ +	err = nft_set_ext_add_length(&tmpl, NFT_SET_EXT_KEY, set->klen);
+ +	if (err < 0)
+ +		goto fail_elem;
+++=======
++ 		nft_set_ext_add_length(&tmpl, NFT_SET_EXT_KEY, set->klen);
++ 	}
+++>>>>>>> aaa31047a6d2 (netfilter: nftables: add catch-all set element support)
+  
+  	if (nla[NFTA_SET_ELEM_KEY_END]) {
+  		err = nft_setelem_parse_key(ctx, set, &elem.key_end.val,
+@@@ -5752,18 -6128,14 +6115,14 @@@
+  	if (trans == NULL)
+  		goto fail_trans;
+  
+- 	priv = set->ops->deactivate(ctx->net, set, &elem);
+- 	if (priv == NULL) {
+- 		err = -ENOENT;
++ 	err = nft_setelem_deactivate(ctx->net, set, &elem, flags);
++ 	if (err < 0)
+  		goto fail_ops;
+- 	}
+- 	kfree(elem.priv);
+- 	elem.priv = priv;
+  
+ -	nft_setelem_data_deactivate(ctx->net, set, &elem);
+ +	nft_set_elem_deactivate(ctx->net, set, &elem);
+  
+  	nft_trans_elem(trans) = elem;
+ -	nft_trans_commit_list_add_tail(ctx->net, trans);
+ +	list_add_tail(&trans->list, &ctx->net->nft.commit_list);
+  	return 0;
+  
+  fail_ops:
+@@@ -5807,12 -6177,70 +6166,79 @@@ err1
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int nf_tables_delsetelem(struct net *net, struct sock *nlsk,
+ +				struct sk_buff *skb, const struct nlmsghdr *nlh,
+ +				const struct nlattr * const nla[],
+ +				struct netlink_ext_ack *extack)
+ +{
+ +	u8 genmask = nft_genmask_next(net);
+++=======
++ static int __nft_set_catchall_flush(const struct nft_ctx *ctx,
++ 				    struct nft_set *set,
++ 				    struct nft_set_elem *elem)
++ {
++ 	struct nft_trans *trans;
++ 
++ 	trans = nft_trans_alloc_gfp(ctx, NFT_MSG_DELSETELEM,
++ 				    sizeof(struct nft_trans_elem), GFP_KERNEL);
++ 	if (!trans)
++ 		return -ENOMEM;
++ 
++ 	nft_setelem_data_deactivate(ctx->net, set, elem);
++ 	nft_trans_elem_set(trans) = set;
++ 	nft_trans_elem(trans) = *elem;
++ 	nft_trans_commit_list_add_tail(ctx->net, trans);
++ 
++ 	return 0;
++ }
++ 
++ static int nft_set_catchall_flush(const struct nft_ctx *ctx,
++ 				  struct nft_set *set)
++ {
++ 	u8 genmask = nft_genmask_next(ctx->net);
++ 	struct nft_set_elem_catchall *catchall;
++ 	struct nft_set_elem elem;
++ 	struct nft_set_ext *ext;
++ 	int ret = 0;
++ 
++ 	list_for_each_entry_rcu(catchall, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 		if (!nft_set_elem_active(ext, genmask) ||
++ 		    nft_set_elem_mark_busy(ext))
++ 			continue;
++ 
++ 		elem.priv = catchall->elem;
++ 		ret = __nft_set_catchall_flush(ctx, set, &elem);
++ 		if (ret < 0)
++ 			break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int nft_set_flush(struct nft_ctx *ctx, struct nft_set *set, u8 genmask)
++ {
++ 	struct nft_set_iter iter = {
++ 		.genmask	= genmask,
++ 		.fn		= nft_setelem_flush,
++ 	};
++ 
++ 	set->ops->walk(ctx, set, &iter);
++ 	if (!iter.err)
++ 		iter.err = nft_set_catchall_flush(ctx, set);
++ 
++ 	return iter.err;
++ }
++ 
++ static int nf_tables_delsetelem(struct sk_buff *skb,
++ 				const struct nfnl_info *info,
++ 				const struct nlattr * const nla[])
++ {
++ 	struct netlink_ext_ack *extack = info->extack;
++ 	u8 genmask = nft_genmask_next(info->net);
++ 	struct net *net = info->net;
+++>>>>>>> aaa31047a6d2 (netfilter: nftables: add catch-all set element support)
+  	const struct nlattr *attr;
+  	struct nft_set *set;
+  	struct nft_ctx ctx;
+@@@ -8184,9 -8838,10 +8611,16 @@@ static int __nf_tables_abort(struct ne
+  		case NFT_MSG_DELSETELEM:
+  			te = (struct nft_trans_elem *)trans->data;
+  
+++<<<<<<< HEAD
+ +			nft_set_elem_activate(net, te->set, &te->elem);
+ +			te->set->ops->activate(net, te->set, &te->elem);
+ +			te->set->ndeact--;
+++=======
++ 			nft_setelem_data_activate(net, te->set, &te->elem);
++ 			nft_setelem_activate(net, te->set, &te->elem);
++ 			if (!nft_setelem_is_catchall(te->set, &te->elem))
++ 				te->set->ndeact--;
+++>>>>>>> aaa31047a6d2 (netfilter: nftables: add catch-all set element support)
+  
+  			nft_trans_destroy(trans);
+  			break;
+@@@ -8331,16 -9017,30 +8765,37 @@@ static int nf_tables_loop_check_setelem
+  	    *nft_set_ext_flags(ext) & NFT_SET_ELEM_INTERVAL_END)
+  		return 0;
+  
+ -	return nft_check_loops(ctx, ext);
+ +	data = nft_set_ext_data(ext);
+ +	switch (data->verdict.code) {
+ +	case NFT_JUMP:
+ +	case NFT_GOTO:
+ +		return nf_tables_check_loops(ctx, data->verdict.chain);
+ +	default:
+ +		return 0;
+ +	}
+  }
+  
++ static int nft_set_catchall_loops(const struct nft_ctx *ctx,
++ 				  struct nft_set *set)
++ {
++ 	u8 genmask = nft_genmask_next(ctx->net);
++ 	struct nft_set_elem_catchall *catchall;
++ 	struct nft_set_ext *ext;
++ 	int ret = 0;
++ 
++ 	list_for_each_entry_rcu(catchall, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 		if (!nft_set_elem_active(ext, genmask))
++ 			continue;
++ 
++ 		ret = nft_check_loops(ctx, ext);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 
++ 	return ret;
++ }
++ 
+  static int nf_tables_check_loops(const struct nft_ctx *ctx,
+  				 const struct nft_chain *chain)
+  {
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index afd104d4fe75..ef453c12de5f 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -497,6 +497,7 @@ struct nft_set {
+ 	u8				dlen;
+ 	u8				num_exprs;
+ 	struct nft_expr			*exprs[NFT_SET_EXPR_MAX];
++	struct list_head		catchall_list;
+ 	unsigned char			data[]
+ 		__attribute__((aligned(__alignof__(u64))));
+ };
+@@ -522,6 +523,10 @@ struct nft_set *nft_set_lookup_global(const struct net *net,
+ 				      const struct nlattr *nla_set_id,
+ 				      u8 genmask);
+ 
++struct nft_set_ext *nft_set_catchall_lookup(const struct net *net,
++					    const struct nft_set *set);
++void *nft_set_catchall_gc(const struct nft_set *set);
++
+ static inline unsigned long nft_set_gc_interval(const struct nft_set *set)
+ {
+ 	return set->gc_int ? msecs_to_jiffies(set->gc_int) : HZ;
+diff --git a/include/uapi/linux/netfilter/nf_tables.h b/include/uapi/linux/netfilter/nf_tables.h
+index 3e9dcd1da600..82504446757c 100644
+--- a/include/uapi/linux/netfilter/nf_tables.h
++++ b/include/uapi/linux/netfilter/nf_tables.h
+@@ -376,9 +376,11 @@ enum nft_set_attributes {
+  * enum nft_set_elem_flags - nf_tables set element flags
+  *
+  * @NFT_SET_ELEM_INTERVAL_END: element ends the previous interval
++ * @NFT_SET_ELEM_CATCHALL: special catch-all element
+  */
+ enum nft_set_elem_flags {
+ 	NFT_SET_ELEM_INTERVAL_END	= 0x1,
++	NFT_SET_ELEM_CATCHALL		= 0x2,
+ };
+ 
+ /**
+* Unmerged path net/netfilter/nf_tables_api.c
+diff --git a/net/netfilter/nft_lookup.c b/net/netfilter/nft_lookup.c
+index 828f87bb9145..02097dda10e9 100644
+--- a/net/netfilter/nft_lookup.c
++++ b/net/netfilter/nft_lookup.c
+@@ -33,13 +33,17 @@ void nft_lookup_eval(const struct nft_expr *expr,
+ 	const struct nft_lookup *priv = nft_expr_priv(expr);
+ 	const struct nft_set *set = priv->set;
+ 	const struct nft_set_ext *ext = NULL;
++	const struct net *net = nft_net(pkt);
+ 	bool found;
+ 
+-	found = set->ops->lookup(nft_net(pkt), set, &regs->data[priv->sreg],
+-				 &ext) ^ priv->invert;
++	found = set->ops->lookup(net, set, &regs->data[priv->sreg], &ext) ^
++				 priv->invert;
+ 	if (!found) {
+-		regs->verdict.code = NFT_BREAK;
+-		return;
++		ext = nft_set_catchall_lookup(net, set);
++		if (!ext) {
++			regs->verdict.code = NFT_BREAK;
++			return;
++		}
+ 	}
+ 
+ 	if (ext) {
+diff --git a/net/netfilter/nft_objref.c b/net/netfilter/nft_objref.c
+index 54e0f94498da..67df14f7491f 100644
+--- a/net/netfilter/nft_objref.c
++++ b/net/netfilter/nft_objref.c
+@@ -108,15 +108,18 @@ static void nft_objref_map_eval(const struct nft_expr *expr,
+ {
+ 	struct nft_objref_map *priv = nft_expr_priv(expr);
+ 	const struct nft_set *set = priv->set;
++	struct net *net = nft_net(pkt);
+ 	const struct nft_set_ext *ext;
+ 	struct nft_object *obj;
+ 	bool found;
+ 
+-	found = set->ops->lookup(nft_net(pkt), set, &regs->data[priv->sreg],
+-				 &ext);
++	found = set->ops->lookup(net, set, &regs->data[priv->sreg], &ext);
+ 	if (!found) {
+-		regs->verdict.code = NFT_BREAK;
+-		return;
++		ext = nft_set_catchall_lookup(net, set);
++		if (!ext) {
++			regs->verdict.code = NFT_BREAK;
++			return;
++		}
+ 	}
+ 	obj = *nft_set_ext_obj(ext);
+ 	obj->ops->eval(obj, regs, pkt);
+diff --git a/net/netfilter/nft_set_hash.c b/net/netfilter/nft_set_hash.c
+index 9457b5ab1164..30d427149929 100644
+--- a/net/netfilter/nft_set_hash.c
++++ b/net/netfilter/nft_set_hash.c
+@@ -337,6 +337,12 @@ static void nft_rhash_gc(struct work_struct *work)
+ 	rhashtable_walk_stop(&hti);
+ 	rhashtable_walk_exit(&hti);
+ 
++	he = nft_set_catchall_gc(set);
++	if (he) {
++		gcb = nft_set_gc_batch_check(set, gcb, GFP_ATOMIC);
++		if (gcb)
++			nft_set_gc_batch_add(gcb, he);
++	}
+ 	nft_set_gc_batch_complete(gcb);
+ 	queue_delayed_work(system_power_efficient_wq, &priv->gc_work,
+ 			   nft_set_gc_interval(set));
+diff --git a/net/netfilter/nft_set_pipapo.c b/net/netfilter/nft_set_pipapo.c
+index 0181617f9628..5e6158b2cefe 100644
+--- a/net/netfilter/nft_set_pipapo.c
++++ b/net/netfilter/nft_set_pipapo.c
+@@ -1438,11 +1438,11 @@ static void pipapo_gc(const struct nft_set *set, struct nft_pipapo_match *m)
+ {
+ 	struct nft_pipapo *priv = nft_set_priv(set);
+ 	int rules_f0, first_rule = 0;
++	struct nft_pipapo_elem *e;
+ 
+ 	while ((rules_f0 = pipapo_rules_same_key(m->f, first_rule))) {
+ 		union nft_pipapo_map_bucket rulemap[NFT_PIPAPO_MAX_FIELDS];
+ 		struct nft_pipapo_field *f;
+-		struct nft_pipapo_elem *e;
+ 		int i, start, rules_fx;
+ 
+ 		start = first_rule;
+@@ -1478,6 +1478,10 @@ static void pipapo_gc(const struct nft_set *set, struct nft_pipapo_match *m)
+ 		}
+ 	}
+ 
++	e = nft_set_catchall_gc(set);
++	if (e)
++		nft_set_elem_destroy(set, e, true);
++
+ 	priv->last_gc = jiffies;
+ }
+ 
+diff --git a/net/netfilter/nft_set_rbtree.c b/net/netfilter/nft_set_rbtree.c
+index 250279343935..2f3be1f2bb65 100644
+--- a/net/netfilter/nft_set_rbtree.c
++++ b/net/netfilter/nft_set_rbtree.c
+@@ -516,6 +516,12 @@ static void nft_rbtree_gc(struct work_struct *work)
+ 	write_seqcount_end(&priv->count);
+ 	write_unlock_bh(&priv->lock);
+ 
++	rbe = nft_set_catchall_gc(set);
++	if (rbe) {
++		gcb = nft_set_gc_batch_check(set, gcb, GFP_ATOMIC);
++		if (gcb)
++			nft_set_gc_batch_add(gcb, rbe);
++	}
+ 	nft_set_gc_batch_complete(gcb);
+ 
+ 	queue_delayed_work(system_power_efficient_wq, &priv->gc_work,
