@@ -1,0 +1,261 @@
+device property: Add helper to match multiple connections
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-500.el8
+commit-author Bjorn Andersson <bjorn.andersson@linaro.org>
+commit 7a20917d30fb627bebff6bacbe860ad4eb3a04d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-500.el8/7a20917d.failed
+
+In some cases multiple connections with the same connection id
+needs to be resolved from a fwnode graph.
+
+One such example is when separate hardware is used for performing muxing
+and/or orientation switching of the SuperSpeed and SBU lines in a USB
+Type-C connector. In this case the connector needs to belong to a graph
+with multiple matching remote endpoints, and the Type-C controller needs
+to be able to resolve them both.
+
+Add a new API that allows this kind of lookup.
+
+	Reviewed-by: Andy Shevchenko <andy.shevchenko@gmail.com>
+	Signed-off-by: Bjorn Andersson <bjorn.andersson@linaro.org>
+Link: https://lore.kernel.org/r/20220422222351.1297276-2-bjorn.andersson@linaro.org
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 7a20917d30fb627bebff6bacbe860ad4eb3a04d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/property.c
+#	include/linux/property.h
+diff --cc drivers/base/property.c
+index 84d4ed7dac6a,08da5ca49e9c..000000000000
+--- a/drivers/base/property.c
++++ b/drivers/base/property.c
+@@@ -1291,3 -1192,187 +1291,190 @@@ const void *device_get_match_data(struc
+  	return fwnode_call_ptr_op(dev_fwnode(dev), device_get_match_data, dev);
+  }
+  EXPORT_SYMBOL_GPL(device_get_match_data);
+++<<<<<<< HEAD
+++=======
++ 
++ static void *
++ fwnode_graph_devcon_match(struct fwnode_handle *fwnode, const char *con_id,
++ 			  void *data, devcon_match_fn_t match)
++ {
++ 	struct fwnode_handle *node;
++ 	struct fwnode_handle *ep;
++ 	void *ret;
++ 
++ 	fwnode_graph_for_each_endpoint(fwnode, ep) {
++ 		node = fwnode_graph_get_remote_port_parent(ep);
++ 		if (!fwnode_device_is_available(node)) {
++ 			fwnode_handle_put(node);
++ 			continue;
++ 		}
++ 
++ 		ret = match(node, con_id, data);
++ 		fwnode_handle_put(node);
++ 		if (ret) {
++ 			fwnode_handle_put(ep);
++ 			return ret;
++ 		}
++ 	}
++ 	return NULL;
++ }
++ 
++ static unsigned int fwnode_graph_devcon_matches(struct fwnode_handle *fwnode,
++ 						const char *con_id, void *data,
++ 						devcon_match_fn_t match,
++ 						void **matches,
++ 						unsigned int matches_len)
++ {
++ 	struct fwnode_handle *node;
++ 	struct fwnode_handle *ep;
++ 	unsigned int count = 0;
++ 	void *ret;
++ 
++ 	fwnode_graph_for_each_endpoint(fwnode, ep) {
++ 		if (matches && count >= matches_len) {
++ 			fwnode_handle_put(ep);
++ 			break;
++ 		}
++ 
++ 		node = fwnode_graph_get_remote_port_parent(ep);
++ 		if (!fwnode_device_is_available(node)) {
++ 			fwnode_handle_put(node);
++ 			continue;
++ 		}
++ 
++ 		ret = match(node, con_id, data);
++ 		fwnode_handle_put(node);
++ 		if (ret) {
++ 			if (matches)
++ 				matches[count] = ret;
++ 			count++;
++ 		}
++ 	}
++ 	return count;
++ }
++ 
++ static void *
++ fwnode_devcon_match(struct fwnode_handle *fwnode, const char *con_id,
++ 		    void *data, devcon_match_fn_t match)
++ {
++ 	struct fwnode_handle *node;
++ 	void *ret;
++ 	int i;
++ 
++ 	for (i = 0; ; i++) {
++ 		node = fwnode_find_reference(fwnode, con_id, i);
++ 		if (IS_ERR(node))
++ 			break;
++ 
++ 		ret = match(node, NULL, data);
++ 		fwnode_handle_put(node);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static unsigned int fwnode_devcon_matches(struct fwnode_handle *fwnode,
++ 					  const char *con_id, void *data,
++ 					  devcon_match_fn_t match,
++ 					  void **matches,
++ 					  unsigned int matches_len)
++ {
++ 	struct fwnode_handle *node;
++ 	unsigned int count = 0;
++ 	unsigned int i;
++ 	void *ret;
++ 
++ 	for (i = 0; ; i++) {
++ 		if (matches && count >= matches_len)
++ 			break;
++ 
++ 		node = fwnode_find_reference(fwnode, con_id, i);
++ 		if (IS_ERR(node))
++ 			break;
++ 
++ 		ret = match(node, NULL, data);
++ 		fwnode_handle_put(node);
++ 		if (ret) {
++ 			if (matches)
++ 				matches[count] = ret;
++ 			count++;
++ 		}
++ 	}
++ 
++ 	return count;
++ }
++ 
++ /**
++  * fwnode_connection_find_match - Find connection from a device node
++  * @fwnode: Device node with the connection
++  * @con_id: Identifier for the connection
++  * @data: Data for the match function
++  * @match: Function to check and convert the connection description
++  *
++  * Find a connection with unique identifier @con_id between @fwnode and another
++  * device node. @match will be used to convert the connection description to
++  * data the caller is expecting to be returned.
++  */
++ void *fwnode_connection_find_match(struct fwnode_handle *fwnode,
++ 				   const char *con_id, void *data,
++ 				   devcon_match_fn_t match)
++ {
++ 	void *ret;
++ 
++ 	if (!fwnode || !match)
++ 		return NULL;
++ 
++ 	ret = fwnode_graph_devcon_match(fwnode, con_id, data, match);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return fwnode_devcon_match(fwnode, con_id, data, match);
++ }
++ EXPORT_SYMBOL_GPL(fwnode_connection_find_match);
++ 
++ /**
++  * fwnode_connection_find_matches - Find connections from a device node
++  * @fwnode: Device node with the connection
++  * @con_id: Identifier for the connection
++  * @data: Data for the match function
++  * @match: Function to check and convert the connection description
++  * @matches: (Optional) array of pointers to fill with matches
++  * @matches_len: Length of @matches
++  *
++  * Find up to @matches_len connections with unique identifier @con_id between
++  * @fwnode and other device nodes. @match will be used to convert the
++  * connection description to data the caller is expecting to be returned
++  * through the @matches array.
++  * If @matches is NULL @matches_len is ignored and the total number of resolved
++  * matches is returned.
++  *
++  * Return: Number of matches resolved, or negative errno.
++  */
++ int fwnode_connection_find_matches(struct fwnode_handle *fwnode,
++ 				   const char *con_id, void *data,
++ 				   devcon_match_fn_t match,
++ 				   void **matches, unsigned int matches_len)
++ {
++ 	unsigned int count_graph;
++ 	unsigned int count_ref;
++ 
++ 	if (!fwnode || !match)
++ 		return -EINVAL;
++ 
++ 	count_graph = fwnode_graph_devcon_matches(fwnode, con_id, data, match,
++ 						  matches, matches_len);
++ 
++ 	if (matches) {
++ 		matches += count_graph;
++ 		matches_len -= count_graph;
++ 	}
++ 
++ 	count_ref = fwnode_devcon_matches(fwnode, con_id, data, match,
++ 					  matches, matches_len);
++ 
++ 	return count_graph + count_ref;
++ }
++ EXPORT_SYMBOL_GPL(fwnode_connection_find_matches);
+++>>>>>>> 7a20917d30fb (device property: Add helper to match multiple connections)
+diff --cc include/linux/property.h
+index cf6882921796,de7ff336d2c8..000000000000
+--- a/include/linux/property.h
++++ b/include/linux/property.h
+@@@ -428,6 -433,25 +428,28 @@@ unsigned int fwnode_graph_get_endpoint_
+  int fwnode_graph_parse_endpoint(const struct fwnode_handle *fwnode,
+  				struct fwnode_endpoint *endpoint);
+  
+++<<<<<<< HEAD
+++=======
++ typedef void *(*devcon_match_fn_t)(struct fwnode_handle *fwnode, const char *id,
++ 				   void *data);
++ 
++ void *fwnode_connection_find_match(struct fwnode_handle *fwnode,
++ 				   const char *con_id, void *data,
++ 				   devcon_match_fn_t match);
++ 
++ static inline void *device_connection_find_match(struct device *dev,
++ 						 const char *con_id, void *data,
++ 						 devcon_match_fn_t match)
++ {
++ 	return fwnode_connection_find_match(dev_fwnode(dev), con_id, data, match);
++ }
++ 
++ int fwnode_connection_find_matches(struct fwnode_handle *fwnode,
++ 				   const char *con_id, void *data,
++ 				   devcon_match_fn_t match,
++ 				   void **matches, unsigned int matches_len);
++ 
+++>>>>>>> 7a20917d30fb (device property: Add helper to match multiple connections)
+  /* -------------------------------------------------------------------------- */
+  /* Software fwnode support - when HW description is incomplete or missing */
+  
+* Unmerged path drivers/base/property.c
+* Unmerged path include/linux/property.h
