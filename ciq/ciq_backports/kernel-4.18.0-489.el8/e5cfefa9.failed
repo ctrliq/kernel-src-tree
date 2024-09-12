@@ -1,0 +1,422 @@
+block: fix scan partition for exclusively open device again
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-489.el8
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit e5cfefa97bccf956ea0bb6464c1f6c84fd7a8d9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-489.el8/e5cfefa9.failed
+
+As explained in commit 36369f46e917 ("block: Do not reread partition table
+on exclusively open device"), reread partition on the device that is
+exclusively opened by someone else is problematic.
+
+This patch will make sure partition scan will only be proceed if current
+thread open the device exclusively, or the device is not opened
+exclusively, and in the later case, other scanners and exclusive openers
+will be blocked temporarily until partition scan is done.
+
+Fixes: 10c70d95c0f2 ("block: remove the bd_openers checks in blk_drop_partitions")
+	Cc: <stable@vger.kernel.org>
+	Suggested-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20230217022200.3092987-3-yukuai1@huaweicloud.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit e5cfefa97bccf956ea0bb6464c1f6c84fd7a8d9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/genhd.c
+#	block/ioctl.c
+diff --cc block/genhd.c
+index 027a6f99af1b,c0a73cd76bb1..000000000000
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@@ -650,40 -335,120 +650,75 @@@ static char *bdevt_str(dev_t devt, cha
+  	return buf;
+  }
+  
+ -void disk_uevent(struct gendisk *disk, enum kobject_action action)
+ +static void blk_register_region(struct gendisk *disk)
+  {
+ -	struct block_device *part;
+ -	unsigned long idx;
+ -
+ -	rcu_read_lock();
+ -	xa_for_each(&disk->part_tbl, idx, part) {
+ -		if (bdev_is_partition(part) && !bdev_nr_sectors(part))
+ -			continue;
+ -		if (!kobject_get_unless_zero(&part->bd_device.kobj))
+ -			continue;
+ +	int i;
+  
+ -		rcu_read_unlock();
+ -		kobject_uevent(bdev_kobj(part), action);
+ -		put_device(&part->bd_device);
+ -		rcu_read_lock();
+ +	mutex_lock(&bdev_map_lock);
+ +	for (i = 0; i < disk->minors; i++) {
+ +		if (xa_insert(&bdev_map, disk_devt(disk) + i, disk, GFP_KERNEL))
+ +			WARN_ON_ONCE(1);
+  	}
+ -	rcu_read_unlock();
+ +	mutex_unlock(&bdev_map_lock);
+  }
+ -EXPORT_SYMBOL_GPL(disk_uevent);
+  
+ -int disk_scan_partitions(struct gendisk *disk, fmode_t mode)
+ +static void blk_unregister_region(struct gendisk *disk)
+  {
+++<<<<<<< HEAD
+ +	int i;
+ +
+ +	mutex_lock(&bdev_map_lock);
+ +	for (i = 0; i < disk->minors; i++)
+ +		xa_erase(&bdev_map, disk_devt(disk) + i);
+ +	mutex_unlock(&bdev_map_lock);
+++=======
++ 	struct block_device *bdev;
++ 	int ret = 0;
++ 
++ 	if (disk->flags & (GENHD_FL_NO_PART | GENHD_FL_HIDDEN))
++ 		return -EINVAL;
++ 	if (test_bit(GD_SUPPRESS_PART_SCAN, &disk->state))
++ 		return -EINVAL;
++ 	if (disk->open_partitions)
++ 		return -EBUSY;
++ 
++ 	set_bit(GD_NEED_PART_SCAN, &disk->state);
++ 	/*
++ 	 * If the device is opened exclusively by current thread already, it's
++ 	 * safe to scan partitons, otherwise, use bd_prepare_to_claim() to
++ 	 * synchronize with other exclusive openers and other partition
++ 	 * scanners.
++ 	 */
++ 	if (!(mode & FMODE_EXCL)) {
++ 		ret = bd_prepare_to_claim(disk->part0, disk_scan_partitions);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	bdev = blkdev_get_by_dev(disk_devt(disk), mode & ~FMODE_EXCL, NULL);
++ 	if (IS_ERR(bdev))
++ 		ret =  PTR_ERR(bdev);
++ 	else
++ 		blkdev_put(bdev, mode);
++ 
++ 	if (!(mode & FMODE_EXCL))
++ 		bd_abort_claiming(disk->part0, disk_scan_partitions);
++ 	return ret;
+++>>>>>>> e5cfefa97bcc (block: fix scan partition for exclusively open device again)
+  }
+  
+ -/**
+ - * device_add_disk - add disk information to kernel list
+ - * @parent: parent device for the disk
+ - * @disk: per-device partitioning information
+ - * @groups: Additional per-device sysfs groups
+ - *
+ - * This function registers the partitioning information in @disk
+ - * with the kernel.
+ - */
+ -int __must_check device_add_disk(struct device *parent, struct gendisk *disk,
+ -				 const struct attribute_group **groups)
+ -
+ +static void register_disk(struct device *parent, struct gendisk *disk,
+ +			  const struct attribute_group **groups)
+  {
+  	struct device *ddev = disk_to_dev(disk);
+ -	int ret;
+ -
+ -	/* Only makes sense for bio-based to set ->poll_bio */
+ -	if (queue_is_mq(disk->queue) && disk->fops->poll_bio)
+ -		return -EINVAL;
+ +	struct block_device *bdev;
+ +	struct disk_part_iter piter;
+ +	struct hd_struct *part;
+ +	int err;
+  
+ -	/*
+ -	 * The disk queue should now be all set with enough information about
+ -	 * the device for the elevator code to pick an adequate default
+ -	 * elevator if one is needed, that is, for devices requesting queue
+ -	 * registration.
+ -	 */
+ -	elevator_init_mq(disk->queue);
+ +	ddev->parent = parent;
+  
+ -	/*
+ -	 * If the driver provides an explicit major number it also must provide
+ -	 * the number of minors numbers supported, and those will be used to
+ -	 * setup the gendisk.
+ -	 * Otherwise just allocate the device numbers for both the whole device
+ -	 * and all partitions from the extended dev_t space.
+ -	 */
+ -	ret = -EINVAL;
+ -	if (disk->major) {
+ -		if (WARN_ON(!disk->minors))
+ -			goto out_exit_elevator;
+ -
+ -		if (disk->minors > DISK_MAX_PARTS) {
+ -			pr_err("block: can't allocate more than %d partitions\n",
+ -				DISK_MAX_PARTS);
+ -			disk->minors = DISK_MAX_PARTS;
+ -		}
+ -		if (disk->first_minor + disk->minors > MINORMASK + 1)
+ -			goto out_exit_elevator;
+ -	} else {
+ -		if (WARN_ON(disk->minors))
+ -			goto out_exit_elevator;
+ -
+ -		ret = blk_alloc_ext_minor();
+ -		if (ret < 0)
+ -			goto out_exit_elevator;
+ -		disk->major = BLOCK_EXT_MAJOR;
+ -		disk->first_minor = ret;
+ -	}
+ +	dev_set_name(ddev, "%s", disk->disk_name);
+  
+  	/* delay uevents, until we scanned partition table */
+  	dev_set_uevent_suppress(ddev, 1);
+@@@ -710,136 -480,91 +745,147 @@@
+  	 */
+  	pm_runtime_set_memalloc_noio(ddev, true);
+  
+ -	ret = blk_integrity_add(disk);
+ -	if (ret)
+ -		goto out_del_block_link;
+ -
+ -	disk->part0->bd_holder_dir =
+ -		kobject_create_and_add("holders", &ddev->kobj);
+ -	if (!disk->part0->bd_holder_dir) {
+ -		ret = -ENOMEM;
+ -		goto out_del_integrity;
+ -	}
+ +	disk->part0.holder_dir = kobject_create_and_add("holders", &ddev->kobj);
+  	disk->slave_dir = kobject_create_and_add("slaves", &ddev->kobj);
+ -	if (!disk->slave_dir) {
+ -		ret = -ENOMEM;
+ -		goto out_put_holder_dir;
+ +
+ +	if (disk->flags & GENHD_FL_HIDDEN)
+ +		return;
+ +
+ +	/* No minors to use for partitions */
+ +	if (!disk_part_scan_enabled(disk))
+ +		goto exit;
+ +
+ +	/* No such device (e.g., media were just removed) */
+ +	if (!get_capacity(disk))
+ +		goto exit;
+ +
+ +	bdev = bdget_disk(disk, 0);
+ +	if (!bdev)
+ +		goto exit;
+ +
+ +	bdev->bd_invalidated = 1;
+ +	set_bit(GD_NEED_PART_SCAN, &disk->state);
+ +	err = blkdev_get(bdev, FMODE_READ, NULL);
+ +	if (err < 0)
+ +		goto exit;
+ +	blkdev_put(bdev, FMODE_READ);
+ +
+ +exit:
+ +	/* announce disk after possible partitions are created */
+ +	dev_set_uevent_suppress(ddev, 0);
+ +	kobject_uevent(&ddev->kobj, KOBJ_ADD);
+ +
+ +	/* announce possible partitions */
+ +	disk_part_iter_init(&piter, disk, 0);
+ +	while ((part = disk_part_iter_next(&piter)))
+ +		kobject_uevent(&part_to_dev(part)->kobj, KOBJ_ADD);
+ +	disk_part_iter_exit(&piter);
+ +
+ +	if (disk->queue->backing_dev_info->dev) {
+ +		err = sysfs_create_link(&ddev->kobj,
+ +			  &disk->queue->backing_dev_info->dev->kobj,
+ +			  "bdi");
+ +		WARN_ON(err);
+  	}
+ +}
+  
+ -	ret = blk_register_queue(disk);
+ -	if (ret)
+ -		goto out_put_slave_dir;
+ +/**
+ + * __device_add_disk - add disk information to kernel list
+ + * @parent: parent device for the disk
+ + * @disk: per-device partitioning information
+ + * @groups: Additional per-device sysfs groups
+ + * @register_queue: register the queue if set to true
+ + *
+ + * This function registers the partitioning information in @disk
+ + * with the kernel.
+ + *
+ + * FIXME: error handling
+ + */
+ +static void __device_add_disk(struct device *parent, struct gendisk *disk,
+ +			      const struct attribute_group **groups,
+ +			      bool register_queue)
+ +{
+ +	dev_t devt;
+ +	int retval;
+  
+ -	if (!(disk->flags & GENHD_FL_HIDDEN)) {
+ -		ret = bdi_register(disk->bdi, "%u:%u",
+ -				   disk->major, disk->first_minor);
+ -		if (ret)
+ -			goto out_unregister_queue;
+ -		bdi_set_owner(disk->bdi, ddev);
+ -		ret = sysfs_create_link(&ddev->kobj,
+ -					&disk->bdi->dev->kobj, "bdi");
+ -		if (ret)
+ -			goto out_unregister_bdi;
+ +	/*
+ +	 * The disk queue should now be all set with enough information about
+ +	 * the device for the elevator code to pick an adequate default
+ +	 * elevator if one is needed, that is, for devices requesting queue
+ +	 * registration.
+ +	 */
+ +	if (register_queue)
+ +		elevator_init_mq(disk->queue);
+  
+++<<<<<<< HEAD
+ +	/* minors == 0 indicates to use ext devt from part0 and should
+ +	 * be accompanied with EXT_DEVT flag.  Make sure all
+ +	 * parameters make sense.
+ +	 */
+ +	WARN_ON(disk->minors && !(disk->major || disk->first_minor));
+ +	WARN_ON(!disk->minors &&
+ +		!(disk->flags & (GENHD_FL_EXT_DEVT | GENHD_FL_HIDDEN)));
+++=======
++ 		/* Make sure the first partition scan will be proceed */
++ 		if (get_capacity(disk) && !(disk->flags & GENHD_FL_NO_PART) &&
++ 		    !test_bit(GD_SUPPRESS_PART_SCAN, &disk->state))
++ 			set_bit(GD_NEED_PART_SCAN, &disk->state);
++ 
++ 		bdev_add(disk->part0, ddev->devt);
++ 		if (get_capacity(disk))
++ 			disk_scan_partitions(disk, FMODE_READ);
+++>>>>>>> e5cfefa97bcc (block: fix scan partition for exclusively open device again)
+  
+ -		/*
+ -		 * Announce the disk and partitions after all partitions are
+ -		 * created. (for hidden disks uevents remain suppressed forever)
+ -		 */
+ -		dev_set_uevent_suppress(ddev, 0);
+ -		disk_uevent(disk, KOBJ_ADD);
+ -	} else {
+ -		/*
+ -		 * Even if the block_device for a hidden gendisk is not
+ -		 * registered, it needs to have a valid bd_dev so that the
+ -		 * freeing of the dynamic major works.
+ +	disk->flags |= GENHD_FL_UP;
+ +
+ +	retval = blk_alloc_devt(&disk->part0, &devt);
+ +	if (retval) {
+ +		WARN_ON(1);
+ +		return;
+ +	}
+ +	disk->major = MAJOR(devt);
+ +	disk->first_minor = MINOR(devt);
+ +
+ +	disk_alloc_events(disk);
+ +
+ +	if (disk->flags & GENHD_FL_HIDDEN) {
+ +		/*
+ +		 * Don't let hidden disks show up in /proc/partitions,
+ +		 * and don't bother scanning for partitions either.
+  		 */
+ -		disk->part0->bd_dev = MKDEV(disk->major, disk->first_minor);
+ +		disk->flags |= GENHD_FL_SUPPRESS_PARTITION_INFO;
+ +		disk->flags |= GENHD_FL_NO_PART_SCAN;
+ +	} else {
+ +		struct backing_dev_info *bdi = disk->queue->backing_dev_info;
+ +		struct device *dev = disk_to_dev(disk);
+ +		int ret;
+ +
+ +		/* Register BDI before referencing it from bdev */
+ +		dev->devt = devt;
+ +		ret = bdi_register(bdi, "%u:%u", MAJOR(devt), MINOR(devt));
+ +		WARN_ON(ret);
+ +		bdi_set_owner(bdi, dev);
+ +		blk_register_region(disk);
+  	}
+ +	register_disk(parent, disk, groups);
+ +	if (register_queue)
+ +		blk_register_queue(disk);
+ +
+ +	/*
+ +	 * Take an extra ref on queue which will be put on disk_release()
+ +	 * so that it sticks around as long as @disk is there.
+ +	 */
+ +	WARN_ON_ONCE(!blk_get_queue(disk->queue));
+  
+ -	disk_update_readahead(disk);
+  	disk_add_events(disk);
+ -	set_bit(GD_ADDED, &disk->state);
+ -	return 0;
+ +	blk_integrity_add(disk);
+ +}
+  
+ -out_unregister_bdi:
+ -	if (!(disk->flags & GENHD_FL_HIDDEN))
+ -		bdi_unregister(disk->bdi);
+ -out_unregister_queue:
+ -	blk_unregister_queue(disk);
+ -	rq_qos_exit(disk->queue);
+ -out_put_slave_dir:
+ -	kobject_put(disk->slave_dir);
+ -	disk->slave_dir = NULL;
+ -out_put_holder_dir:
+ -	kobject_put(disk->part0->bd_holder_dir);
+ -out_del_integrity:
+ -	blk_integrity_del(disk);
+ -out_del_block_link:
+ -	if (!sysfs_deprecated)
+ -		sysfs_remove_link(block_depr, dev_name(ddev));
+ -out_device_del:
+ -	device_del(ddev);
+ -out_free_ext_minor:
+ -	if (disk->major == BLOCK_EXT_MAJOR)
+ -		blk_free_ext_minor(disk->first_minor);
+ -out_exit_elevator:
+ -	if (disk->queue->elevator)
+ -		elevator_exit(disk->queue);
+ -	return ret;
+ +void device_add_disk(struct device *parent, struct gendisk *disk,
+ +		     const struct attribute_group **groups)
+ +
+ +{
+ +	__device_add_disk(parent, disk, groups, true);
+  }
+  EXPORT_SYMBOL(device_add_disk);
+  
+diff --cc block/ioctl.c
+index f14584f0debf,9c5f637ff153..000000000000
+--- a/block/ioctl.c
++++ b/block/ioctl.c
+@@@ -530,10 -521,14 +530,18 @@@ static int blkdev_common_ioctl(struct b
+  	case BLKFRASET:
+  		if(!capable(CAP_SYS_ADMIN))
+  			return -EACCES;
+ -		bdev->bd_disk->bdi->ra_pages = (arg * 512) / PAGE_SIZE;
+ +		bdev->bd_bdi->ra_pages = (arg * 512) / PAGE_SIZE;
+  		return 0;
+  	case BLKRRPART:
+++<<<<<<< HEAD
+ +		return blkdev_reread_part(bdev, mode);
+++=======
++ 		if (!capable(CAP_SYS_ADMIN))
++ 			return -EACCES;
++ 		if (bdev_is_partition(bdev))
++ 			return -EINVAL;
++ 		return disk_scan_partitions(bdev->bd_disk, mode);
+++>>>>>>> e5cfefa97bcc (block: fix scan partition for exclusively open device again)
+  	case BLKTRACESTART:
+  	case BLKTRACESTOP:
+  	case BLKTRACETEARDOWN:
+* Unmerged path block/genhd.c
+* Unmerged path block/ioctl.c
