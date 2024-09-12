@@ -1,0 +1,195 @@
+arm64: Improve diagnostics when trapping BRK with FAULT_BRK_IMM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Will Deacon <will@kernel.org>
+commit 0fdb64c2a303e4d2562245501920241c0e507951
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/0fdb64c2.failed
+
+When generating instructions at runtime, for example due to kernel text
+patching or the BPF JIT, we can emit a trapping BRK instruction if we
+are asked to encode an invalid instruction such as an out-of-range]
+branch. This is indicative of a bug in the caller, and will result in a
+crash on executing the generated code. Unfortunately, the message from
+the crash is really unhelpful, and mumbles something about ptrace:
+
+  | Unexpected kernel BRK exception at EL1
+  | Internal error: ptrace BRK handler: f2000100 [#1] SMP
+
+We can do better than this. Install a break handler for FAULT_BRK_IMM,
+which is the immediate used to encode the "I've been asked to generate
+an invalid instruction" error, and triage the faulting PC to determine
+whether or not the failure occurred in the BPF JIT.
+
+Link: https://lore.kernel.org/r/20200915141707.GB26439@willie-the-truck
+	Reported-by: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 0fdb64c2a303e4d2562245501920241c0e507951)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/extable.h
+#	arch/arm64/mm/extable.c
+diff --cc arch/arm64/include/asm/extable.h
+index b618106dd1ee,b15eb4a3e6b2..000000000000
+--- a/arch/arm64/include/asm/extable.h
++++ b/arch/arm64/include/asm/extable.h
+@@@ -24,25 -22,24 +24,36 @@@ struct exception_table_entr
+  
+  #define ARCH_HAS_RELATIVE_EXTABLE
+  
+++<<<<<<< HEAD
+ +#define swap_ex_entry_fixup(a, b, tmp, delta)		\
+ +do {							\
+ +	(a)->fixup = (b)->fixup + (delta);		\
+ +	(b)->fixup = (tmp).fixup - (delta);		\
+ +	(a)->type = (b)->type;				\
+ +	(b)->type = (tmp).type;				\
+ +	(a)->data = (b)->data;				\
+ +	(b)->data = (tmp).data;				\
+ +} while (0)
+++=======
++ static inline bool in_bpf_jit(struct pt_regs *regs)
++ {
++ 	if (!IS_ENABLED(CONFIG_BPF_JIT))
++ 		return false;
++ 
++ 	return regs->pc >= BPF_JIT_REGION_START &&
++ 	       regs->pc < BPF_JIT_REGION_END;
++ }
+++>>>>>>> 0fdb64c2a303 (arm64: Improve diagnostics when trapping BRK with FAULT_BRK_IMM)
+  
+  #ifdef CONFIG_BPF_JIT
+ -int arm64_bpf_fixup_exception(const struct exception_table_entry *ex,
+ -			      struct pt_regs *regs);
+ +bool ex_handler_bpf(const struct exception_table_entry *ex,
+ +		    struct pt_regs *regs);
+  #else /* !CONFIG_BPF_JIT */
+  static inline
+ -int arm64_bpf_fixup_exception(const struct exception_table_entry *ex,
+ -			      struct pt_regs *regs)
+ +bool ex_handler_bpf(const struct exception_table_entry *ex,
+ +		    struct pt_regs *regs)
+  {
+ -	return 0;
+ +	return false;
+  }
+  #endif /* !CONFIG_BPF_JIT */
+  
+diff --cc arch/arm64/mm/extable.c
+index c2951b963335,aa0060178343..000000000000
+--- a/arch/arm64/mm/extable.c
++++ b/arch/arm64/mm/extable.c
+@@@ -6,38 -6,17 +6,52 @@@
+  #include <linux/extable.h>
+  #include <linux/uaccess.h>
+  
+ -int fixup_exception(struct pt_regs *regs)
+ +#include <asm/asm-extable.h>
+ +
+ +typedef bool (*ex_handler_t)(const struct exception_table_entry *,
+ +			     struct pt_regs *);
+ +
+ +static inline unsigned long
+ +get_ex_fixup(const struct exception_table_entry *ex)
+ +{
+++<<<<<<< HEAD
+ +	return ((unsigned long)&ex->fixup + ex->fixup);
+ +}
+ +
+ +static bool ex_handler_fixup(const struct exception_table_entry *ex,
+ +			     struct pt_regs *regs)
+  {
+ +	regs->pc = get_ex_fixup(ex);
+ +	return true;
+ +}
+ +
+ +bool fixup_exception(struct pt_regs *regs)
+ +{
+ +	const struct exception_table_entry *ex;
+ +
+ +	ex = search_exception_tables(instruction_pointer(regs));
+ +	if (!ex)
+ +		return false;
+ +
+ +	switch (ex->type) {
+ +	case EX_TYPE_FIXUP:
+ +		return ex_handler_fixup(ex, regs);
+ +	case EX_TYPE_BPF:
+ +		return ex_handler_bpf(ex, regs);
+ +	}
+ +
+ +	BUG();
+++=======
++ 	const struct exception_table_entry *fixup;
++ 
++ 	fixup = search_exception_tables(instruction_pointer(regs));
++ 	if (!fixup)
++ 		return 0;
++ 
++ 	if (in_bpf_jit(regs))
++ 		return arm64_bpf_fixup_exception(fixup, regs);
++ 
++ 	regs->pc = (unsigned long)&fixup->fixup + fixup->fixup;
++ 	return 1;
+++>>>>>>> 0fdb64c2a303 (arm64: Improve diagnostics when trapping BRK with FAULT_BRK_IMM)
+  }
+* Unmerged path arch/arm64/include/asm/extable.h
+diff --git a/arch/arm64/kernel/debug-monitors.c b/arch/arm64/kernel/debug-monitors.c
+index 404e82b0affc..6adb150ab7ea 100644
+--- a/arch/arm64/kernel/debug-monitors.c
++++ b/arch/arm64/kernel/debug-monitors.c
+@@ -402,7 +402,7 @@ void __init debug_traps_init(void)
+ 	hook_debug_fault_code(DBG_ESR_EVT_HWSS, single_step_handler, SIGTRAP,
+ 			      TRAP_TRACE, "single-step handler");
+ 	hook_debug_fault_code(DBG_ESR_EVT_BRK, brk_handler, SIGTRAP,
+-			      TRAP_BRKPT, "ptrace BRK handler");
++			      TRAP_BRKPT, "BRK handler");
+ }
+ 
+ /* Re-enable single step for syscall restarting. */
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index ace19f467da4..6172619a6f9a 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -45,6 +45,7 @@
+ #include <asm/daifflags.h>
+ #include <asm/debug-monitors.h>
+ #include <asm/esr.h>
++#include <asm/extable.h>
+ #include <asm/insn.h>
+ #include <asm/kprobes.h>
+ #include <asm/traps.h>
+@@ -1017,6 +1018,21 @@ static struct break_hook bug_break_hook = {
+ 	.imm = BUG_BRK_IMM,
+ };
+ 
++static int reserved_fault_handler(struct pt_regs *regs, unsigned int esr)
++{
++	pr_err("%s generated an invalid instruction at %pS!\n",
++		in_bpf_jit(regs) ? "BPF JIT" : "Kernel text patching",
++		(void *)instruction_pointer(regs));
++
++	/* We cannot handle this */
++	return DBG_HOOK_ERROR;
++}
++
++static struct break_hook fault_break_hook = {
++	.fn = reserved_fault_handler,
++	.imm = FAULT_BRK_IMM,
++};
++
+ #ifdef CONFIG_KASAN_SW_TAGS
+ 
+ #define KASAN_ESR_RECOVER	0x20
+@@ -1085,6 +1101,7 @@ int __init early_brk64(unsigned long addr, unsigned int esr,
+ void __init trap_init(void)
+ {
+ 	register_kernel_break_hook(&bug_break_hook);
++	register_kernel_break_hook(&fault_break_hook);
+ #ifdef CONFIG_KASAN_SW_TAGS
+ 	register_kernel_break_hook(&kasan_break_hook);
+ #endif
+* Unmerged path arch/arm64/mm/extable.c
