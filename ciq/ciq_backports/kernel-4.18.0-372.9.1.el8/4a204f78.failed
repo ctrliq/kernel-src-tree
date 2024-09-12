@@ -1,0 +1,167 @@
+KVM: SVM: Allow AVIC support on system w/ physical APIC ID > 255
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+commit 4a204f7895878363ca8211f50ec610408c8c70aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/4a204f78.failed
+
+Expand KVM's mask for the AVIC host physical ID to the full 12 bits defined
+by the architecture.  The number of bits consumed by hardware is model
+specific, e.g. early CPUs ignored bits 11:8, but there is no way for KVM
+to enumerate the "true" size.  So, KVM must allow using all bits, else it
+risks rejecting completely legal x2APIC IDs on newer CPUs.
+
+This means KVM relies on hardware to not assign x2APIC IDs that exceed the
+"true" width of the field, but presumably hardware is smart enough to tie
+the width to the max x2APIC ID.  KVM also relies on hardware to support at
+least 8 bits, as the legacy xAPIC ID is writable by software.  But, those
+assumptions are unavoidable due to the lack of any way to enumerate the
+"true" width.
+
+	Cc: stable@vger.kernel.org
+	Cc: Maxim Levitsky <mlevitsk@redhat.com>
+	Suggested-by: Sean Christopherson <seanjc@google.com>
+	Reviewed-by: Sean Christopherson <seanjc@google.com>
+Fixes: 44a95dae1d22 ("KVM: x86: Detect and Initialize AVIC support")
+	Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+Message-Id: <20220211000851.185799-1-suravee.suthikulpanit@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4a204f7895878363ca8211f50ec610408c8c70aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/svm.h
+#	arch/x86/kvm/svm/avic.c
+#	arch/x86/kvm/svm/svm.h
+diff --cc arch/x86/include/asm/svm.h
+index b00dbc5fac2b,7eb2df5417fb..000000000000
+--- a/arch/x86/include/asm/svm.h
++++ b/arch/x86/include/asm/svm.h
+@@@ -220,6 -220,42 +220,45 @@@ struct __attribute__ ((__packed__)) vmc
+  #define SVM_NESTED_CTL_SEV_ENABLE	BIT(1)
+  #define SVM_NESTED_CTL_SEV_ES_ENABLE	BIT(2)
+  
+++<<<<<<< HEAD
+++=======
++ 
++ /* AVIC */
++ #define AVIC_LOGICAL_ID_ENTRY_GUEST_PHYSICAL_ID_MASK	(0xFF)
++ #define AVIC_LOGICAL_ID_ENTRY_VALID_BIT			31
++ #define AVIC_LOGICAL_ID_ENTRY_VALID_MASK		(1 << 31)
++ 
++ #define AVIC_PHYSICAL_ID_ENTRY_HOST_PHYSICAL_ID_MASK	GENMASK_ULL(11, 0)
++ #define AVIC_PHYSICAL_ID_ENTRY_BACKING_PAGE_MASK	(0xFFFFFFFFFFULL << 12)
++ #define AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK		(1ULL << 62)
++ #define AVIC_PHYSICAL_ID_ENTRY_VALID_MASK		(1ULL << 63)
++ #define AVIC_PHYSICAL_ID_TABLE_SIZE_MASK		(0xFF)
++ 
++ #define AVIC_DOORBELL_PHYSICAL_ID_MASK			(0xFF)
++ 
++ #define AVIC_UNACCEL_ACCESS_WRITE_MASK		1
++ #define AVIC_UNACCEL_ACCESS_OFFSET_MASK		0xFF0
++ #define AVIC_UNACCEL_ACCESS_VECTOR_MASK		0xFFFFFFFF
++ 
++ enum avic_ipi_failure_cause {
++ 	AVIC_IPI_FAILURE_INVALID_INT_TYPE,
++ 	AVIC_IPI_FAILURE_TARGET_NOT_RUNNING,
++ 	AVIC_IPI_FAILURE_INVALID_TARGET,
++ 	AVIC_IPI_FAILURE_INVALID_BACKING_PAGE,
++ };
++ 
++ 
++ /*
++  * 0xff is broadcast, so the max index allowed for physical APIC ID
++  * table is 0xfe.  APIC IDs above 0xff are reserved.
++  */
++ #define AVIC_MAX_PHYSICAL_ID_COUNT	0xff
++ 
++ #define AVIC_HPA_MASK	~((0xFFFULL << 52) | 0xFFF)
++ #define VMCB_AVIC_APIC_BAR_MASK		0xFFFFFFFFFF000ULL
++ 
++ 
+++>>>>>>> 4a204f789587 (KVM: SVM: Allow AVIC support on system w/ physical APIC ID > 255)
+  struct vmcb_seg {
+  	u16 selector;
+  	u16 attrib;
+diff --cc arch/x86/kvm/svm/avic.c
+index 3eb2a8ac2ab4,b37b353ec086..000000000000
+--- a/arch/x86/kvm/svm/avic.c
++++ b/arch/x86/kvm/svm/avic.c
+@@@ -941,18 -867,25 +941,23 @@@ out
+  	return ret;
+  }
+  
+ -void __avic_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ +void avic_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+  {
+  	u64 entry;
+- 	/* ID = 0xff (broadcast), ID > 0xff (reserved) */
+  	int h_physical_id = kvm_cpu_get_apicid(cpu);
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Since the host physical APIC id is 8 bits,
+ +	 * we can support host APIC ID upto 255.
+ +	 */
+ +	if (WARN_ON(h_physical_id > AVIC_PHYSICAL_ID_ENTRY_HOST_PHYSICAL_ID_MASK))
+++=======
++ 	lockdep_assert_preemption_disabled();
++ 
++ 	if (WARN_ON(h_physical_id & ~AVIC_PHYSICAL_ID_ENTRY_HOST_PHYSICAL_ID_MASK))
+ -		return;
+ -
+ -	/*
+ -	 * No need to update anything if the vCPU is blocking, i.e. if the vCPU
+ -	 * is being scheduled in after being preempted.  The CPU entries in the
+ -	 * Physical APIC table and IRTE are consumed iff IsRun{ning} is '1'.
+ -	 * If the vCPU was migrated, its new CPU value will be stuffed when the
+ -	 * vCPU unblocks.
+ -	 */
+ -	if (kvm_vcpu_is_blocking(vcpu))
+++>>>>>>> 4a204f789587 (KVM: SVM: Allow AVIC support on system w/ physical APIC ID > 255)
+  		return;
+  
+  	entry = READ_ONCE(*(svm->avic_physical_id_cache));
+diff --cc arch/x86/kvm/svm/svm.h
+index 6d8d762d208f,e37bb3508cfa..000000000000
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@@ -501,24 -573,13 +501,31 @@@ extern struct kvm_x86_nested_ops svm_ne
+  #define AVIC_LOGICAL_ID_ENTRY_VALID_BIT			31
+  #define AVIC_LOGICAL_ID_ENTRY_VALID_MASK		(1 << 31)
+  
+++<<<<<<< HEAD
+ +#define AVIC_PHYSICAL_ID_ENTRY_HOST_PHYSICAL_ID_MASK	(0xFFULL)
+++=======
++ #define AVIC_PHYSICAL_ID_ENTRY_HOST_PHYSICAL_ID_MASK	GENMASK_ULL(11, 0)
+++>>>>>>> 4a204f789587 (KVM: SVM: Allow AVIC support on system w/ physical APIC ID > 255)
+  #define AVIC_PHYSICAL_ID_ENTRY_BACKING_PAGE_MASK	(0xFFFFFFFFFFULL << 12)
+  #define AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK		(1ULL << 62)
+  #define AVIC_PHYSICAL_ID_ENTRY_VALID_MASK		(1ULL << 63)
+  
+  #define VMCB_AVIC_APIC_BAR_MASK		0xFFFFFFFFFF000ULL
+  
+++<<<<<<< HEAD
+ +static inline bool avic_vcpu_is_running(struct kvm_vcpu *vcpu)
+ +{
+ +	struct vcpu_svm *svm = to_svm(vcpu);
+ +	u64 *entry = svm->avic_physical_id_cache;
+ +
+ +	if (!entry)
+ +		return false;
+ +
+ +	return (READ_ONCE(*entry) & AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK);
+ +}
+ +
+++=======
+++>>>>>>> 4a204f789587 (KVM: SVM: Allow AVIC support on system w/ physical APIC ID > 255)
+  int avic_ga_log_notifier(u32 ga_tag);
+  void avic_vm_destroy(struct kvm *kvm);
+  int avic_vm_init(struct kvm *kvm);
+* Unmerged path arch/x86/include/asm/svm.h
+* Unmerged path arch/x86/kvm/svm/avic.c
+* Unmerged path arch/x86/kvm/svm/svm.h
