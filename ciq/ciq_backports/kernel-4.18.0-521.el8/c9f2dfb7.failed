@@ -1,0 +1,115 @@
+kernfs: Use a per-fs rwsem to protect per-fs list of kernfs_super_info.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-521.el8
+Rebuild_CHGLOG: - kernfs: Use a per-fs rwsem to protect per-fs list of kernfs_super_info (Ian Kent) [RHEL-11484]
+Rebuild_FUZZ: 99.29%
+commit-author Imran Khan <imran.f.khan@oracle.com>
+commit c9f2dfb7b59e5a6db054f821a6e1a6db8fa57d64
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-521.el8/c9f2dfb7.failed
+
+Right now per-fs kernfs_rwsem protects list of kernfs_super_info instances
+for a kernfs_root. Since kernfs_rwsem is used to synchronize several other
+operations across kernfs and since most of these operations don't impact
+kernfs_super_info, we can use a separate per-fs rwsem to synchronize access
+to list of kernfs_super_info.
+This helps in reducing contention around kernfs_rwsem and also allows
+operations that change/access list of kernfs_super_info to proceed without
+contending for kernfs_rwsem.
+
+	Signed-off-by: Imran Khan <imran.f.khan@oracle.com>
+Link: https://lore.kernel.org/r/20230309110932.2889010-3-imran.f.khan@oracle.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit c9f2dfb7b59e5a6db054f821a6e1a6db8fa57d64)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/kernfs/dir.c
+#	fs/kernfs/kernfs-internal.h
+diff --cc fs/kernfs/dir.c
+index b34c33d03651,2cdb8516e528..000000000000
+--- a/fs/kernfs/dir.c
++++ b/fs/kernfs/dir.c
+@@@ -916,6 -943,8 +916,11 @@@ struct kernfs_root *kernfs_create_root(
+  
+  	idr_init(&root->ino_idr);
+  	init_rwsem(&root->kernfs_rwsem);
+++<<<<<<< HEAD
+++=======
++ 	init_rwsem(&root->kernfs_iattr_rwsem);
++ 	init_rwsem(&root->kernfs_supers_rwsem);
+++>>>>>>> c9f2dfb7b59e (kernfs: Use a per-fs rwsem to protect per-fs list of kernfs_super_info.)
+  	INIT_LIST_HEAD(&root->supers);
+  
+  	/*
+diff --cc fs/kernfs/kernfs-internal.h
+index 46bb832cee5c,a9b854cdfdb5..000000000000
+--- a/fs/kernfs/kernfs-internal.h
++++ b/fs/kernfs/kernfs-internal.h
+@@@ -46,6 -47,8 +46,11 @@@ struct kernfs_root 
+  
+  	wait_queue_head_t	deactivate_waitq;
+  	struct rw_semaphore	kernfs_rwsem;
+++<<<<<<< HEAD
+++=======
++ 	struct rw_semaphore	kernfs_iattr_rwsem;
++ 	struct rw_semaphore	kernfs_supers_rwsem;
+++>>>>>>> c9f2dfb7b59e (kernfs: Use a per-fs rwsem to protect per-fs list of kernfs_super_info.)
+  };
+  
+  /* +1 to avoid triggering overflow warning when negating it */
+* Unmerged path fs/kernfs/dir.c
+diff --git a/fs/kernfs/file.c b/fs/kernfs/file.c
+index 47b3e60100db..d6bdb05232c1 100644
+--- a/fs/kernfs/file.c
++++ b/fs/kernfs/file.c
+@@ -882,8 +882,8 @@ static void kernfs_notify_workfn(struct work_struct *work)
+ 
+ 	root = kernfs_root(kn);
+ 	/* kick fsnotify */
+-	down_write(&root->kernfs_rwsem);
+ 
++	down_read(&root->kernfs_supers_rwsem);
+ 	list_for_each_entry(info, &kernfs_root(kn)->supers, node) {
+ 		struct kernfs_node *parent;
+ 		struct inode *inode;
+@@ -919,7 +919,7 @@ static void kernfs_notify_workfn(struct work_struct *work)
+ 		iput(inode);
+ 	}
+ 
+-	up_write(&root->kernfs_rwsem);
++	up_read(&root->kernfs_supers_rwsem);
+ 	kernfs_put(kn);
+ 	goto repeat;
+ }
+* Unmerged path fs/kernfs/kernfs-internal.h
+diff --git a/fs/kernfs/mount.c b/fs/kernfs/mount.c
+index 8f3d23e042af..3bb06baf43b0 100644
+--- a/fs/kernfs/mount.c
++++ b/fs/kernfs/mount.c
+@@ -347,9 +347,9 @@ int kernfs_get_tree(struct fs_context *fc)
+ 		}
+ 		sb->s_flags |= SB_ACTIVE;
+ 
+-		down_write(&root->kernfs_rwsem);
++		down_write(&root->kernfs_supers_rwsem);
+ 		list_add(&info->node, &info->root->supers);
+-		up_write(&root->kernfs_rwsem);
++		up_write(&root->kernfs_supers_rwsem);
+ 	}
+ 
+ 	fc->root = dget(sb->s_root);
+@@ -376,9 +376,9 @@ void kernfs_kill_sb(struct super_block *sb)
+ 	struct kernfs_super_info *info = kernfs_info(sb);
+ 	struct kernfs_root *root = info->root;
+ 
+-	down_write(&root->kernfs_rwsem);
++	down_write(&root->kernfs_supers_rwsem);
+ 	list_del(&info->node);
+-	up_write(&root->kernfs_rwsem);
++	up_write(&root->kernfs_supers_rwsem);
+ 
+ 	/*
+ 	 * Remove the superblock from fs_supers/s_instances
