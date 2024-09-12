@@ -610,7 +610,6 @@ static bool mptcp_established_options_add_addr(struct sock *sk, struct sk_buff *
 	bool drop_other_suboptions = false;
 	unsigned int opt_size = *size;
 	bool echo;
-	bool port;
 	int len;
 
 	/* add addr will strip the existing options, be sure to avoid breaking
@@ -619,12 +618,12 @@ static bool mptcp_established_options_add_addr(struct sock *sk, struct sk_buff *
 	if (!mptcp_pm_should_add_signal(msk) ||
 	    (opts->suboptions & (OPTION_MPTCP_MPJ_ACK | OPTION_MPTCP_MPC_ACK)) ||
 	    !mptcp_pm_add_addr_signal(msk, skb, opt_size, remaining, &opts->addr,
-		    &echo, &port, &drop_other_suboptions))
+		    &echo, &drop_other_suboptions))
 		return false;
 
 	if (drop_other_suboptions)
 		remaining += opt_size;
-	len = mptcp_add_addr_len(opts->addr.family, echo, port);
+	len = mptcp_add_addr_len(opts->addr.family, echo, !!opts->addr.port);
 	if (remaining < len)
 		return false;
 
