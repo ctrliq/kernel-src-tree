@@ -1,0 +1,247 @@
+x86/traps: Print address on #GP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Jann Horn <jannh@google.com>
+commit 59c1dcbed5b51cab543be8f47b6d7d9cf107ec94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/59c1dcbe.failed
+
+A frequent cause of #GP exceptions are memory accesses to non-canonical
+addresses. Unlike #PF, #GP doesn't report a fault address in CR2, so the
+kernel doesn't currently print the fault address for a #GP.
+
+Luckily, the necessary infrastructure for decoding x86 instructions and
+computing the memory address being accessed is already present. Hook
+it up to the #GP handler so that the address operand of the faulting
+instruction can be figured out and printed.
+
+Distinguish two cases:
+
+  a) (Part of) the memory range being accessed lies in the non-canonical
+     address range; in this case, it is likely that the decoded address
+     is actually the one that caused the #GP.
+
+  b) The entire memory range of the decoded operand lies in canonical
+     address space; the #GP may or may not be related in some way to the
+     computed address. Print it, but with hedging language in the message.
+
+While it is already possible to compute the faulting address manually by
+disassembling the opcode dump and evaluating the instruction against the
+register dump, this should make it slightly easier to identify crashes
+at a glance.
+
+Note that the operand length which comes from the instruction decoder
+and is used to determine whether the access straddles into non-canonical
+address space, is currently somewhat unreliable; but it should be good
+enough, considering that Linux on x86-64 never maps the page directly
+before the start of the non-canonical range anyway, and therefore the
+case where a memory range begins in that page and potentially straddles
+into the non-canonical range should be fairly uncommon.
+
+In the case the address is still computed wrongly, it only influences
+whether the error message claims that the access is canonical.
+
+ [ bp: Remove ambiguous "we", massage, reflow comments and spacing. ]
+
+	Signed-off-by: Jann Horn <jannh@google.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Tested-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Konovalov <andreyknvl@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: kasan-dev@googlegroups.com
+	Cc: Masami Hiramatsu <mhiramat@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: x86-ml <x86@kernel.org>
+Link: https://lkml.kernel.org/r/20191218231150.12139-2-jannh@google.com
+(cherry picked from commit 59c1dcbed5b51cab543be8f47b6d7d9cf107ec94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/traps.c
+diff --cc arch/x86/kernel/traps.c
+index 462aa0afd7cd,108ab1ee069f..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -65,7 -56,8 +65,12 @@@
+  #include <asm/mpx.h>
+  #include <asm/vm86.h>
+  #include <asm/umip.h>
+++<<<<<<< HEAD
+ +#include <asm/vdso.h>
+++=======
++ #include <asm/insn.h>
++ #include <asm/insn-eval.h>
+++>>>>>>> 59c1dcbed5b5 (x86/traps: Print address on #GP)
+  
+  #ifdef CONFIG_X86_64
+  #include <asm/x86_init.h>
+@@@ -475,61 -520,53 +480,109 @@@ exit_trap
+  	do_trap(X86_TRAP_BR, SIGSEGV, "bounds", regs, error_code, 0, NULL);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * The unprivileged ENQCMD instruction generates #GPs if the
+ + * IA32_PASID MSR has not been populated.  If possible, populate
+ + * the MSR from a PASID previously allocated to the mm.
+ + */
+ +static bool try_fixup_enqcmd_gp(void)
+ +{
+ +#ifdef CONFIG_IOMMU_SVA
+ +	u32 pasid;
+ +
+ +	/*
+ +	 * MSR_IA32_PASID is managed using XSAVE.  Directly
+ +	 * writing to the MSR is only possible when fpregs
+ +	 * are valid and the fpstate is not.  This is
+ +	 * guaranteed when handling a userspace exception
+ +	 * in *before* interrupts are re-enabled.
+ +	 */
+ +	lockdep_assert_irqs_disabled();
+ +
+ +	/*
+ +	 * Hardware without ENQCMD will not generate
+ +	 * #GPs that can be fixed up here.
+ +	 */
+ +	if (!cpu_feature_enabled(X86_FEATURE_ENQCMD))
+ +		return false;
+ +
+ +	pasid = current->mm->pasid;
+ +
+ +	/*
+ +	 * If the mm has not been allocated a
+ +	 * PASID, the #GP can not be fixed up.
+ +	 */
+ +	if (!pasid_valid(pasid))
+ +		return false;
+ +
+ +	/*
+ +	 * Did this thread already have its PASID activated?
+ +	 * If so, the #GP must be from something else.
+ +	 */
+ +	if (current->pasid_activated)
+ +		return false;
+ +
+ +	wrmsrl(MSR_IA32_PASID, pasid | MSR_IA32_PASID_VALID);
+ +	current->pasid_activated = 1;
+ +
+ +	return true;
+ +#else
+ +	return false;
+ +#endif
+ +}
+ +
+ +dotraplinkage void
+ +do_general_protection(struct pt_regs *regs, long error_code)
+++=======
++ enum kernel_gp_hint {
++ 	GP_NO_HINT,
++ 	GP_NON_CANONICAL,
++ 	GP_CANONICAL
++ };
++ 
++ /*
++  * When an uncaught #GP occurs, try to determine the memory address accessed by
++  * the instruction and return that address to the caller. Also, try to figure
++  * out whether any part of the access to that address was non-canonical.
++  */
++ static enum kernel_gp_hint get_kernel_gp_address(struct pt_regs *regs,
++ 						 unsigned long *addr)
+++>>>>>>> 59c1dcbed5b5 (x86/traps: Print address on #GP)
+  {
+- 	const char *desc = "general protection fault";
++ 	u8 insn_buf[MAX_INSN_SIZE];
++ 	struct insn insn;
++ 
++ 	if (probe_kernel_read(insn_buf, (void *)regs->ip, MAX_INSN_SIZE))
++ 		return GP_NO_HINT;
++ 
++ 	kernel_insn_init(&insn, insn_buf, MAX_INSN_SIZE);
++ 	insn_get_modrm(&insn);
++ 	insn_get_sib(&insn);
++ 
++ 	*addr = (unsigned long)insn_get_addr_ref(&insn, regs);
++ 	if (*addr == -1UL)
++ 		return GP_NO_HINT;
++ 
++ #ifdef CONFIG_X86_64
++ 	/*
++ 	 * Check that:
++ 	 *  - the operand is not in the kernel half
++ 	 *  - the last byte of the operand is not in the user canonical half
++ 	 */
++ 	if (*addr < ~__VIRTUAL_MASK &&
++ 	    *addr + insn.opnd_bytes - 1 > __VIRTUAL_MASK)
++ 		return GP_NON_CANONICAL;
++ #endif
++ 
++ 	return GP_CANONICAL;
++ }
++ 
++ #define GPFSTR "general protection fault"
++ 
++ dotraplinkage void do_general_protection(struct pt_regs *regs, long error_code)
++ {
++ 	char desc[sizeof(GPFSTR) + 50 + 2*sizeof(unsigned long) + 1] = GPFSTR;
+  	struct task_struct *tsk;
+  
+  	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+@@@ -552,14 -585,41 +605,35 @@@
+  
+  	tsk = current;
+  	if (!user_mode(regs)) {
+++<<<<<<< HEAD
+ +		if (fixup_exception(regs, X86_TRAP_GP))
+++=======
++ 		enum kernel_gp_hint hint = GP_NO_HINT;
++ 		unsigned long gp_addr;
++ 
++ 		if (fixup_exception(regs, X86_TRAP_GP, error_code, 0))
+++>>>>>>> 59c1dcbed5b5 (x86/traps: Print address on #GP)
+  			return;
+  
+  		tsk->thread.error_code = error_code;
+  		tsk->thread.trap_nr = X86_TRAP_GP;
+ -
+ -		/*
+ -		 * To be potentially processing a kprobe fault and to
+ -		 * trust the result from kprobe_running(), we have to
+ -		 * be non-preemptible.
+ -		 */
+ -		if (!preemptible() && kprobe_running() &&
+ -		    kprobe_fault_handler(regs, X86_TRAP_GP))
+ -			return;
+ -
+  		if (notify_die(DIE_GPF, desc, regs, error_code,
+- 			       X86_TRAP_GP, SIGSEGV) != NOTIFY_STOP)
+- 			die(desc, regs, error_code);
++ 			       X86_TRAP_GP, SIGSEGV) == NOTIFY_STOP)
++ 			return;
++ 
++ 		if (error_code)
++ 			snprintf(desc, sizeof(desc), "segment-related " GPFSTR);
++ 		else
++ 			hint = get_kernel_gp_address(regs, &gp_addr);
++ 
++ 		if (hint != GP_NO_HINT)
++ 			snprintf(desc, sizeof(desc), GPFSTR ", %s 0x%lx",
++ 				 (hint == GP_NON_CANONICAL) ?
++ 				 "probably for non-canonical address" :
++ 				 "maybe for address",
++ 				 gp_addr);
++ 
++ 		die(desc, regs, error_code);
+  		return;
+  	}
+  
+* Unmerged path arch/x86/kernel/traps.c
