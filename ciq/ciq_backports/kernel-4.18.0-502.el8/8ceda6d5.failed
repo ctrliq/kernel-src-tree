@@ -1,0 +1,477 @@
+r8152: fix flow control issue of RTL8156A
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Hayes Wang <hayeswang@realtek.com>
+commit 8ceda6d5a1e5402fd852e6cc59a286ce3dc545ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/8ceda6d5.failed
+
+The feature of flow control becomes abnormal, if the device sends a
+pause frame and the tx/rx is disabled before sending a release frame. It
+causes the lost of packets.
+
+Set PLA_RX_FIFO_FULL and PLA_RX_FIFO_EMPTY to zeros before disabling the
+tx/rx. And, toggle FC_PATCH_TASK before enabling tx/rx to reset the flow
+control patch and timer. Then, the hardware could clear the state and
+the flow control becomes normal after enabling tx/rx.
+
+Besides, remove inline for fc_pause_on_auto() and fc_pause_off_auto().
+
+Fixes: 195aae321c82 ("r8152: support new chips")
+	Signed-off-by: Hayes Wang <hayeswang@realtek.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8ceda6d5a1e5402fd852e6cc59a286ce3dc545ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/r8152.c
+diff --cc drivers/net/usb/r8152.c
+index 61715b889582,afd50e90d1fe..000000000000
+--- a/drivers/net/usb/r8152.c
++++ b/drivers/net/usb/r8152.c
+@@@ -4839,6 -5986,131 +4839,134 @@@ static void rtl8153_disable(struct r815
+  	r8153_aldps_en(tp, true);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u32 fc_pause_on_auto(struct r8152 *tp)
++ {
++ 	return (ALIGN(mtu_to_size(tp->netdev->mtu), 1024) + 6 * 1024);
++ }
++ 
++ static u32 fc_pause_off_auto(struct r8152 *tp)
++ {
++ 	return (ALIGN(mtu_to_size(tp->netdev->mtu), 1024) + 14 * 1024);
++ }
++ 
++ static void r8156_fc_parameter(struct r8152 *tp)
++ {
++ 	u32 pause_on = tp->fc_pause_on ? tp->fc_pause_on : fc_pause_on_auto(tp);
++ 	u32 pause_off = tp->fc_pause_off ? tp->fc_pause_off : fc_pause_off_auto(tp);
++ 
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RX_FIFO_FULL, pause_on / 16);
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RX_FIFO_EMPTY, pause_off / 16);
++ }
++ 
++ static int rtl8156_enable(struct r8152 *tp)
++ {
++ 	u32 ocp_data;
++ 	u16 speed;
++ 
++ 	if (test_bit(RTL8152_UNPLUG, &tp->flags))
++ 		return -ENODEV;
++ 
++ 	r8156_fc_parameter(tp);
++ 	set_tx_qlen(tp);
++ 	rtl_set_eee_plus(tp);
++ 	r8153_set_rx_early_timeout(tp);
++ 	r8153_set_rx_early_size(tp);
++ 
++ 	speed = rtl8152_get_speed(tp);
++ 	rtl_set_ifg(tp, speed);
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL4);
++ 	if (speed & _2500bps)
++ 		ocp_data &= ~IDLE_SPDWN_EN;
++ 	else
++ 		ocp_data |= IDLE_SPDWN_EN;
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL4, ocp_data);
++ 
++ 	if (speed & _1000bps)
++ 		ocp_write_word(tp, MCU_TYPE_PLA, PLA_EEE_TXTWSYS, 0x11);
++ 	else if (speed & _500bps)
++ 		ocp_write_word(tp, MCU_TYPE_PLA, PLA_EEE_TXTWSYS, 0x3d);
++ 
++ 	if (tp->udev->speed == USB_SPEED_HIGH) {
++ 		/* USB 0xb45e[3:0] l1_nyet_hird */
++ 		ocp_data = ocp_read_word(tp, MCU_TYPE_USB, USB_L1_CTRL);
++ 		ocp_data &= ~0xf;
++ 		if (is_flow_control(speed))
++ 			ocp_data |= 0xf;
++ 		else
++ 			ocp_data |= 0x1;
++ 		ocp_write_word(tp, MCU_TYPE_USB, USB_L1_CTRL, ocp_data);
++ 	}
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_USB, USB_FW_TASK);
++ 	ocp_data &= ~FC_PATCH_TASK;
++ 	ocp_write_word(tp, MCU_TYPE_USB, USB_FW_TASK, ocp_data);
++ 	usleep_range(1000, 2000);
++ 	ocp_data |= FC_PATCH_TASK;
++ 	ocp_write_word(tp, MCU_TYPE_USB, USB_FW_TASK, ocp_data);
++ 
++ 	return rtl_enable(tp);
++ }
++ 
++ static void rtl8156_disable(struct r8152 *tp)
++ {
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RX_FIFO_FULL, 0);
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RX_FIFO_EMPTY, 0);
++ 
++ 	rtl8153_disable(tp);
++ }
++ 
++ static int rtl8156b_enable(struct r8152 *tp)
++ {
++ 	u32 ocp_data;
++ 	u16 speed;
++ 
++ 	if (test_bit(RTL8152_UNPLUG, &tp->flags))
++ 		return -ENODEV;
++ 
++ 	set_tx_qlen(tp);
++ 	rtl_set_eee_plus(tp);
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_USB, USB_RX_AGGR_NUM);
++ 	ocp_data &= ~RX_AGGR_NUM_MASK;
++ 	ocp_write_word(tp, MCU_TYPE_USB, USB_RX_AGGR_NUM, ocp_data);
++ 
++ 	r8153_set_rx_early_timeout(tp);
++ 	r8153_set_rx_early_size(tp);
++ 
++ 	speed = rtl8152_get_speed(tp);
++ 	rtl_set_ifg(tp, speed);
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL4);
++ 	if (speed & _2500bps)
++ 		ocp_data &= ~IDLE_SPDWN_EN;
++ 	else
++ 		ocp_data |= IDLE_SPDWN_EN;
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL4, ocp_data);
++ 
++ 	if (tp->udev->speed == USB_SPEED_HIGH) {
++ 		ocp_data = ocp_read_word(tp, MCU_TYPE_USB, USB_L1_CTRL);
++ 		ocp_data &= ~0xf;
++ 		if (is_flow_control(speed))
++ 			ocp_data |= 0xf;
++ 		else
++ 			ocp_data |= 0x1;
++ 		ocp_write_word(tp, MCU_TYPE_USB, USB_L1_CTRL, ocp_data);
++ 	}
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_USB, USB_FW_TASK);
++ 	ocp_data &= ~FC_PATCH_TASK;
++ 	ocp_write_word(tp, MCU_TYPE_USB, USB_FW_TASK, ocp_data);
++ 	usleep_range(1000, 2000);
++ 	ocp_data |= FC_PATCH_TASK;
++ 	ocp_write_word(tp, MCU_TYPE_USB, USB_FW_TASK, ocp_data);
++ 
++ 	return rtl_enable(tp);
++ }
++ 
+++>>>>>>> 8ceda6d5a1e5 (r8152: fix flow control issue of RTL8156A)
+  static int rtl8152_set_speed(struct r8152 *tp, u8 autoneg, u32 speed, u8 duplex,
+  			     u32 advertising)
+  {
+@@@ -5094,6 -6381,233 +5222,236 @@@ static void rtl8153b_down(struct r8152 
+  	r8153_aldps_en(tp, true);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void rtl8153c_change_mtu(struct r8152 *tp)
++ {
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RMS, mtu_to_size(tp->netdev->mtu));
++ 	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_MTPS, 10 * 1024 / 64);
++ 
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_TXFIFO_CTRL, 512 / 64);
++ 
++ 	/* Adjust the tx fifo free credit full threshold, otherwise
++ 	 * the fifo would be too small to send a jumbo frame packet.
++ 	 */
++ 	if (tp->netdev->mtu < 8000)
++ 		ocp_write_word(tp, MCU_TYPE_PLA, PLA_TXFIFO_FULL, 2048 / 8);
++ 	else
++ 		ocp_write_word(tp, MCU_TYPE_PLA, PLA_TXFIFO_FULL, 900 / 8);
++ }
++ 
++ static void rtl8153c_up(struct r8152 *tp)
++ {
++ 	u32 ocp_data;
++ 
++ 	if (test_bit(RTL8152_UNPLUG, &tp->flags))
++ 		return;
++ 
++ 	r8153b_u1u2en(tp, false);
++ 	r8153_u2p3en(tp, false);
++ 	r8153_aldps_en(tp, false);
++ 
++ 	rxdy_gated_en(tp, true);
++ 	r8153_teredo_off(tp);
++ 
++ 	ocp_data = ocp_read_dword(tp, MCU_TYPE_PLA, PLA_RCR);
++ 	ocp_data &= ~RCR_ACPT_ALL;
++ 	ocp_write_dword(tp, MCU_TYPE_PLA, PLA_RCR, ocp_data);
++ 
++ 	rtl8152_nic_reset(tp);
++ 	rtl_reset_bmu(tp);
++ 
++ 	ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL);
++ 	ocp_data &= ~NOW_IS_OOB;
++ 	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL, ocp_data);
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_SFF_STS_7);
++ 	ocp_data &= ~MCU_BORW_EN;
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_SFF_STS_7, ocp_data);
++ 
++ 	wait_oob_link_list_ready(tp);
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_SFF_STS_7);
++ 	ocp_data |= RE_INIT_LL;
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_SFF_STS_7, ocp_data);
++ 
++ 	wait_oob_link_list_ready(tp);
++ 
++ 	rtl_rx_vlan_en(tp, tp->netdev->features & NETIF_F_HW_VLAN_CTAG_RX);
++ 
++ 	rtl8153c_change_mtu(tp);
++ 
++ 	rtl8152_nic_reset(tp);
++ 
++ 	/* rx share fifo credit full threshold */
++ 	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_RXFIFO_CTRL0, 0x02);
++ 	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_RXFIFO_FULL, 0x08);
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RXFIFO_CTRL1, RXFIFO_THR2_NORMAL);
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RXFIFO_CTRL2, RXFIFO_THR3_NORMAL);
++ 
++ 	ocp_write_dword(tp, MCU_TYPE_USB, USB_RX_BUF_TH, RX_THR_B);
++ 
++ 	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_CRWECR, CRWECR_CONFIG);
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_CONFIG34);
++ 	ocp_data |= BIT(8);
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_CONFIG34, ocp_data);
++ 
++ 	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_CRWECR, CRWECR_NORAML);
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL3);
++ 	ocp_data &= ~PLA_MCU_SPDWN_EN;
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL3, ocp_data);
++ 
++ 	r8153_aldps_en(tp, true);
++ 	r8153b_u1u2en(tp, true);
++ }
++ 
++ static void rtl8156_change_mtu(struct r8152 *tp)
++ {
++ 	u32 rx_max_size = mtu_to_size(tp->netdev->mtu);
++ 
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RMS, rx_max_size);
++ 	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_MTPS, MTPS_JUMBO);
++ 	r8156_fc_parameter(tp);
++ 
++ 	/* TX share fifo free credit full threshold */
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_TXFIFO_CTRL, 512 / 64);
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_TXFIFO_FULL,
++ 		       ALIGN(rx_max_size + sizeof(struct tx_desc), 1024) / 16);
++ }
++ 
++ static void rtl8156_up(struct r8152 *tp)
++ {
++ 	u32 ocp_data;
++ 
++ 	if (test_bit(RTL8152_UNPLUG, &tp->flags))
++ 		return;
++ 
++ 	r8153b_u1u2en(tp, false);
++ 	r8153_u2p3en(tp, false);
++ 	r8153_aldps_en(tp, false);
++ 
++ 	rxdy_gated_en(tp, true);
++ 	r8153_teredo_off(tp);
++ 
++ 	ocp_data = ocp_read_dword(tp, MCU_TYPE_PLA, PLA_RCR);
++ 	ocp_data &= ~RCR_ACPT_ALL;
++ 	ocp_write_dword(tp, MCU_TYPE_PLA, PLA_RCR, ocp_data);
++ 
++ 	rtl8152_nic_reset(tp);
++ 	rtl_reset_bmu(tp);
++ 
++ 	ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL);
++ 	ocp_data &= ~NOW_IS_OOB;
++ 	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL, ocp_data);
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_SFF_STS_7);
++ 	ocp_data &= ~MCU_BORW_EN;
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_SFF_STS_7, ocp_data);
++ 
++ 	rtl_rx_vlan_en(tp, tp->netdev->features & NETIF_F_HW_VLAN_CTAG_RX);
++ 
++ 	rtl8156_change_mtu(tp);
++ 
++ 	switch (tp->version) {
++ 	case RTL_TEST_01:
++ 	case RTL_VER_10:
++ 	case RTL_VER_11:
++ 		ocp_data = ocp_read_word(tp, MCU_TYPE_USB, USB_BMU_CONFIG);
++ 		ocp_data |= ACT_ODMA;
++ 		ocp_write_word(tp, MCU_TYPE_USB, USB_BMU_CONFIG, ocp_data);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	/* share FIFO settings */
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_RXFIFO_FULL);
++ 	ocp_data &= ~RXFIFO_FULL_MASK;
++ 	ocp_data |= 0x08;
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RXFIFO_FULL, ocp_data);
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL3);
++ 	ocp_data &= ~PLA_MCU_SPDWN_EN;
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL3, ocp_data);
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_USB, USB_SPEED_OPTION);
++ 	ocp_data &= ~(RG_PWRDN_EN | ALL_SPEED_OFF);
++ 	ocp_write_word(tp, MCU_TYPE_USB, USB_SPEED_OPTION, ocp_data);
++ 
++ 	ocp_write_dword(tp, MCU_TYPE_USB, USB_RX_BUF_TH, 0x00600400);
++ 
++ 	if (tp->saved_wolopts != __rtl_get_wol(tp)) {
++ 		netif_warn(tp, ifup, tp->netdev, "wol setting is changed\n");
++ 		__rtl_set_wol(tp, tp->saved_wolopts);
++ 	}
++ 
++ 	r8153_aldps_en(tp, true);
++ 	r8153_u2p3en(tp, true);
++ 
++ 	if (tp->udev->speed >= USB_SPEED_SUPER)
++ 		r8153b_u1u2en(tp, true);
++ }
++ 
++ static void rtl8156_down(struct r8152 *tp)
++ {
++ 	u32 ocp_data;
++ 
++ 	if (test_bit(RTL8152_UNPLUG, &tp->flags)) {
++ 		rtl_drop_queued_tx(tp);
++ 		return;
++ 	}
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL3);
++ 	ocp_data |= PLA_MCU_SPDWN_EN;
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL3, ocp_data);
++ 
++ 	r8153b_u1u2en(tp, false);
++ 	r8153_u2p3en(tp, false);
++ 	r8153b_power_cut_en(tp, false);
++ 	r8153_aldps_en(tp, false);
++ 
++ 	ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL);
++ 	ocp_data &= ~NOW_IS_OOB;
++ 	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL, ocp_data);
++ 
++ 	/* RX FIFO settings for OOB */
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RXFIFO_FULL, 64 / 16);
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RX_FIFO_FULL, 1024 / 16);
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RX_FIFO_EMPTY, 4096 / 16);
++ 
++ 	rtl_disable(tp);
++ 	rtl_reset_bmu(tp);
++ 
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RMS, 1522);
++ 	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_MTPS, MTPS_DEFAULT);
++ 
++ 	/* Clear teredo wake event. bit[15:8] is the teredo wakeup
++ 	 * type. Set it to zero. bits[7:0] are the W1C bits about
++ 	 * the events. Set them to all 1 to clear them.
++ 	 */
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_TEREDO_WAKE_BASE, 0x00ff);
++ 
++ 	ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL);
++ 	ocp_data |= NOW_IS_OOB;
++ 	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL, ocp_data);
++ 
++ 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_SFF_STS_7);
++ 	ocp_data |= MCU_BORW_EN;
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_SFF_STS_7, ocp_data);
++ 
++ 	rtl_rx_vlan_en(tp, true);
++ 	rxdy_gated_en(tp, false);
++ 
++ 	ocp_data = ocp_read_dword(tp, MCU_TYPE_PLA, PLA_RCR);
++ 	ocp_data |= RCR_APM | RCR_AM | RCR_AB;
++ 	ocp_write_dword(tp, MCU_TYPE_PLA, PLA_RCR, ocp_data);
++ 
++ 	r8153_aldps_en(tp, true);
++ }
++ 
+++>>>>>>> 8ceda6d5a1e5 (r8152: fix flow control issue of RTL8156A)
+  static bool rtl8152_in_nway(struct r8152 *tp)
+  {
+  	u16 nway_state;
+@@@ -6707,6 -9349,67 +7065,70 @@@ static int rtl_ops_init(struct r8152 *t
+  		tp->eee_adv		= MDIO_EEE_1000T | MDIO_EEE_100TX;
+  		break;
+  
+++<<<<<<< HEAD
+++=======
++ 	case RTL_VER_11:
++ 		tp->eee_en		= true;
++ 		tp->eee_adv		= MDIO_EEE_1000T | MDIO_EEE_100TX;
++ 		fallthrough;
++ 	case RTL_VER_10:
++ 		ops->init		= r8156_init;
++ 		ops->enable		= rtl8156_enable;
++ 		ops->disable		= rtl8156_disable;
++ 		ops->up			= rtl8156_up;
++ 		ops->down		= rtl8156_down;
++ 		ops->unload		= rtl8153_unload;
++ 		ops->eee_get		= r8153_get_eee;
++ 		ops->eee_set		= r8152_set_eee;
++ 		ops->in_nway		= rtl8153_in_nway;
++ 		ops->hw_phy_cfg		= r8156_hw_phy_cfg;
++ 		ops->autosuspend_en	= rtl8156_runtime_enable;
++ 		ops->change_mtu		= rtl8156_change_mtu;
++ 		tp->rx_buf_sz		= 48 * 1024;
++ 		tp->support_2500full	= 1;
++ 		break;
++ 
++ 	case RTL_VER_12:
++ 	case RTL_VER_13:
++ 		tp->support_2500full	= 1;
++ 		fallthrough;
++ 	case RTL_VER_15:
++ 		tp->eee_en		= true;
++ 		tp->eee_adv		= MDIO_EEE_1000T | MDIO_EEE_100TX;
++ 		ops->init		= r8156b_init;
++ 		ops->enable		= rtl8156b_enable;
++ 		ops->disable		= rtl8153_disable;
++ 		ops->up			= rtl8156_up;
++ 		ops->down		= rtl8156_down;
++ 		ops->unload		= rtl8153_unload;
++ 		ops->eee_get		= r8153_get_eee;
++ 		ops->eee_set		= r8152_set_eee;
++ 		ops->in_nway		= rtl8153_in_nway;
++ 		ops->hw_phy_cfg		= r8156b_hw_phy_cfg;
++ 		ops->autosuspend_en	= rtl8156_runtime_enable;
++ 		ops->change_mtu		= rtl8156_change_mtu;
++ 		tp->rx_buf_sz		= 48 * 1024;
++ 		break;
++ 
++ 	case RTL_VER_14:
++ 		ops->init		= r8153c_init;
++ 		ops->enable		= rtl8153_enable;
++ 		ops->disable		= rtl8153_disable;
++ 		ops->up			= rtl8153c_up;
++ 		ops->down		= rtl8153b_down;
++ 		ops->unload		= rtl8153_unload;
++ 		ops->eee_get		= r8153_get_eee;
++ 		ops->eee_set		= r8152_set_eee;
++ 		ops->in_nway		= rtl8153_in_nway;
++ 		ops->hw_phy_cfg		= r8153c_hw_phy_cfg;
++ 		ops->autosuspend_en	= rtl8153c_runtime_enable;
++ 		ops->change_mtu		= rtl8153c_change_mtu;
++ 		tp->rx_buf_sz		= 32 * 1024;
++ 		tp->eee_en		= true;
++ 		tp->eee_adv		= MDIO_EEE_1000T | MDIO_EEE_100TX;
++ 		break;
++ 
+++>>>>>>> 8ceda6d5a1e5 (r8152: fix flow control issue of RTL8156A)
+  	default:
+  		ret = -ENODEV;
+  		dev_err(&tp->intf->dev, "Unknown Device\n");
+* Unmerged path drivers/net/usb/r8152.c
