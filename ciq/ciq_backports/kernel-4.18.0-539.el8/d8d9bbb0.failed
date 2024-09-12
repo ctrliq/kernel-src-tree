@@ -1,0 +1,94 @@
+xfs: reduce the number of atomic when locking a buffer after lookup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-539.el8
+commit-author Dave Chinner <dchinner@redhat.com>
+commit d8d9bbb0ee6c79191b704d88c8ae712b89e0d2bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-539.el8/d8d9bbb0.failed
+
+Avoid an extra atomic operation in the non-trylock case by only
+doing a trylock if the XBF_TRYLOCK flag is set. This follows the
+pattern in the IO path with NOWAIT semantics where the
+"trylock-fail-lock" path showed 5-10% reduced throughput compared to
+just using single lock call when not under NOWAIT conditions. So
+make that same change here, too.
+
+See commit 942491c9e6d6 ("xfs: fix AIM7 regression") for details.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+[hch: split from a larger patch]
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit d8d9bbb0ee6c79191b704d88c8ae712b89e0d2bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf.c
+diff --cc fs/xfs/xfs_buf.c
+index 76942b4321a4,374c4e508b12..000000000000
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@@ -637,46 -526,22 +637,58 @@@ xfs_buf_find
+  		WARN_ON(1);
+  		return -EFSCORRUPTED;
+  	}
+ +
+++<<<<<<< HEAD
+ +	pag = xfs_perag_get(btp->bt_mount,
+ +			    xfs_daddr_to_agno(btp->bt_mount, cmap.bm_bn));
+ +
+ +	spin_lock(&pag->pag_buf_lock);
+ +	bp = rhashtable_lookup_fast(&pag->pag_buf_hash, &cmap,
+ +				    xfs_buf_hash_params);
+ +	if (bp) {
+ +		atomic_inc(&bp->b_hold);
+ +		goto found;
+ +	}
+ +
+ +	/* No match found */
+ +	if (!new_bp) {
+ +		XFS_STATS_INC(btp->bt_mount, xb_miss_locked);
+ +		spin_unlock(&pag->pag_buf_lock);
+ +		xfs_perag_put(pag);
+ +		return -ENOENT;
+ +	}
+ +
+ +	/* the buffer keeps the perag reference until it is freed */
+ +	new_bp->b_pag = pag;
+ +	rhashtable_insert_fast(&pag->pag_buf_hash, &new_bp->b_rhash_head,
+ +			       xfs_buf_hash_params);
+ +	spin_unlock(&pag->pag_buf_lock);
+ +	*found_bp = new_bp;
+  	return 0;
+ -}
+  
+ +found:
+ +	spin_unlock(&pag->pag_buf_lock);
+ +	xfs_perag_put(pag);
+ +
+ +	if (!xfs_buf_trylock(bp)) {
+ +		if (flags & XBF_TRYLOCK) {
+ +			xfs_buf_rele(bp);
+ +			XFS_STATS_INC(btp->bt_mount, xb_busy_locked);
+++=======
++ static int
++ xfs_buf_find_lock(
++ 	struct xfs_buf          *bp,
++ 	xfs_buf_flags_t		flags)
++ {
++ 	if (flags & XBF_TRYLOCK) {
++ 		if (!xfs_buf_trylock(bp)) {
++ 			XFS_STATS_INC(bp->b_mount, xb_busy_locked);
+++>>>>>>> d8d9bbb0ee6c (xfs: reduce the number of atomic when locking a buffer after lookup)
+  			return -EAGAIN;
+  		}
++ 	} else {
+  		xfs_buf_lock(bp);
+ -		XFS_STATS_INC(bp->b_mount, xb_get_locked_waited);
+ +		XFS_STATS_INC(btp->bt_mount, xb_get_locked_waited);
+  	}
+  
+  	/*
+* Unmerged path fs/xfs/xfs_buf.c
