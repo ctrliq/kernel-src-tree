@@ -1,0 +1,225 @@
+dm thin metadata: Fix ABBA deadlock by resetting dm_bufio_client
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-524.el8
+commit-author Li Lingfeng <lilingfeng3@huawei.com>
+commit d48300120627a1cb98914738fff38b424625b8ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-524.el8/d4830012.failed
+
+As described in commit 8111964f1b85 ("dm thin: Fix ABBA deadlock between
+shrink_slab and dm_pool_abort_metadata"), ABBA deadlocks will be
+triggered because shrinker_rwsem currently needs to held by
+dm_pool_abort_metadata() as a side-effect of thin-pool metadata
+operation failure.
+
+The following three problem scenarios have been noticed:
+
+1) Described by commit 8111964f1b85 ("dm thin: Fix ABBA deadlock between
+   shrink_slab and dm_pool_abort_metadata")
+
+2) shrinker_rwsem and throttle->lock
+          P1(drop cache)                        P2(kworker)
+drop_caches_sysctl_handler
+ drop_slab
+  shrink_slab
+   down_read(&shrinker_rwsem)  - LOCK A
+   do_shrink_slab
+    super_cache_scan
+     prune_icache_sb
+      dispose_list
+       evict
+        ext4_evict_inode
+         ext4_clear_inode
+          ext4_discard_preallocations
+           ext4_mb_load_buddy_gfp
+            ext4_mb_init_cache
+             ext4_wait_block_bitmap
+              __ext4_error
+               ext4_handle_error
+                ext4_commit_super
+                 ...
+                 dm_submit_bio
+                                     do_worker
+                                      throttle_work_update
+                                       down_write(&t->lock) -- LOCK B
+                                      process_deferred_bios
+                                       commit
+                                        metadata_operation_failed
+                                         dm_pool_abort_metadata
+                                          dm_block_manager_create
+                                           dm_bufio_client_create
+                                            register_shrinker
+                                             down_write(&shrinker_rwsem)
+                                             -- LOCK A
+                 thin_map
+                  thin_bio_map
+                   thin_defer_bio_with_throttle
+                    throttle_lock
+                     down_read(&t->lock)  - LOCK B
+
+3) shrinker_rwsem and wait_on_buffer
+          P1(drop cache)                            P2(kworker)
+drop_caches_sysctl_handler
+ drop_slab
+  shrink_slab
+   down_read(&shrinker_rwsem)  - LOCK A
+   do_shrink_slab
+   ...
+    ext4_wait_block_bitmap
+     __ext4_error
+      ext4_handle_error
+       jbd2_journal_abort
+        jbd2_journal_update_sb_errno
+         jbd2_write_superblock
+          submit_bh
+           // LOCK B
+           // RELEASE B
+                             do_worker
+                              throttle_work_update
+                               down_write(&t->lock) - LOCK B
+                              process_deferred_bios
+                               process_bio
+                               commit
+                                metadata_operation_failed
+                                 dm_pool_abort_metadata
+                                  dm_block_manager_create
+                                   dm_bufio_client_create
+                                    register_shrinker
+                                     register_shrinker_prepared
+                                      down_write(&shrinker_rwsem)  - LOCK A
+                               bio_endio
+      wait_on_buffer
+       __wait_on_buffer
+
+Fix these by resetting dm_bufio_client without holding shrinker_rwsem.
+
+Fixes: 8111964f1b85 ("dm thin: Fix ABBA deadlock between shrink_slab and dm_pool_abort_metadata")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Li Lingfeng <lilingfeng3@huawei.com>
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit d48300120627a1cb98914738fff38b424625b8ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-thin-metadata.c
+#	drivers/md/persistent-data/dm-block-manager.c
+diff --cc drivers/md/dm-thin-metadata.c
+index 6253342e2acb,63d92d388ee6..000000000000
+--- a/drivers/md/dm-thin-metadata.c
++++ b/drivers/md/dm-thin-metadata.c
+@@@ -1881,15 -1898,6 +1896,18 @@@ int dm_pool_abort_metadata(struct dm_po
+  	if (unlikely(pmd->fail_io))
+  		return r;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Replacement block manager (new_bm) is created and old_bm destroyed outside of
+ +	 * pmd root_lock to avoid ABBA deadlock that would result (due to life-cycle of
+ +	 * shrinker associated with the block manager's bufio client vs pmd root_lock).
+ +	 * - must take shrinker_rwsem without holding pmd->root_lock
+ +	 */
+ +	new_bm = dm_block_manager_create(pmd->bdev, THIN_METADATA_BLOCK_SIZE << SECTOR_SHIFT,
+ +					 THIN_MAX_CONCURRENT_LOCKS);
+ +
+++=======
+++>>>>>>> d48300120627 (dm thin metadata: Fix ABBA deadlock by resetting dm_bufio_client)
+  	pmd_write_lock(pmd);
+  	if (pmd->fail_io) {
+  		pmd_write_unlock(pmd);
+diff --cc drivers/md/persistent-data/dm-block-manager.c
+index ab5db7df3a56,0e010e1204aa..000000000000
+--- a/drivers/md/persistent-data/dm-block-manager.c
++++ b/drivers/md/persistent-data/dm-block-manager.c
+@@@ -415,7 -421,13 +415,17 @@@ void dm_block_manager_destroy(struct dm
+  }
+  EXPORT_SYMBOL_GPL(dm_block_manager_destroy);
+  
+++<<<<<<< HEAD
+ +unsigned dm_bm_block_size(struct dm_block_manager *bm)
+++=======
++ void dm_block_manager_reset(struct dm_block_manager *bm)
++ {
++ 	dm_bufio_client_reset(bm->bufio);
++ }
++ EXPORT_SYMBOL_GPL(dm_block_manager_reset);
++ 
++ unsigned int dm_bm_block_size(struct dm_block_manager *bm)
+++>>>>>>> d48300120627 (dm thin metadata: Fix ABBA deadlock by resetting dm_bufio_client)
+  {
+  	return dm_bufio_get_block_size(bm->bufio);
+  }
+diff --git a/drivers/md/dm-bufio.c b/drivers/md/dm-bufio.c
+index d0368d2eb320..2faa413663bf 100644
+--- a/drivers/md/dm-bufio.c
++++ b/drivers/md/dm-bufio.c
+@@ -1764,6 +1764,13 @@ void dm_bufio_client_destroy(struct dm_bufio_client *c)
+ }
+ EXPORT_SYMBOL_GPL(dm_bufio_client_destroy);
+ 
++void dm_bufio_client_reset(struct dm_bufio_client *c)
++{
++	drop_buffers(c);
++	flush_work(&c->shrink_work);
++}
++EXPORT_SYMBOL_GPL(dm_bufio_client_reset);
++
+ void dm_bufio_set_sector_offset(struct dm_bufio_client *c, sector_t start)
+ {
+ 	c->start = start;
+* Unmerged path drivers/md/dm-thin-metadata.c
+* Unmerged path drivers/md/persistent-data/dm-block-manager.c
+diff --git a/drivers/md/persistent-data/dm-block-manager.h b/drivers/md/persistent-data/dm-block-manager.h
+index e728937f376a..644cd7015e28 100644
+--- a/drivers/md/persistent-data/dm-block-manager.h
++++ b/drivers/md/persistent-data/dm-block-manager.h
+@@ -35,6 +35,7 @@ struct dm_block_manager *dm_block_manager_create(
+ 	struct block_device *bdev, unsigned block_size,
+ 	unsigned max_held_per_thread);
+ void dm_block_manager_destroy(struct dm_block_manager *bm);
++void dm_block_manager_reset(struct dm_block_manager *bm);
+ 
+ unsigned dm_bm_block_size(struct dm_block_manager *bm);
+ dm_block_t dm_bm_nr_blocks(struct dm_block_manager *bm);
+diff --git a/drivers/md/persistent-data/dm-space-map.h b/drivers/md/persistent-data/dm-space-map.h
+index a015cd11f6e9..85aa0a3974fe 100644
+--- a/drivers/md/persistent-data/dm-space-map.h
++++ b/drivers/md/persistent-data/dm-space-map.h
+@@ -76,7 +76,8 @@ struct dm_space_map {
+ 
+ static inline void dm_sm_destroy(struct dm_space_map *sm)
+ {
+-	sm->destroy(sm);
++	if (sm)
++		sm->destroy(sm);
+ }
+ 
+ static inline int dm_sm_extend(struct dm_space_map *sm, dm_block_t extra_blocks)
+diff --git a/drivers/md/persistent-data/dm-transaction-manager.c b/drivers/md/persistent-data/dm-transaction-manager.c
+index 16643fc974e8..7083196cff3b 100644
+--- a/drivers/md/persistent-data/dm-transaction-manager.c
++++ b/drivers/md/persistent-data/dm-transaction-manager.c
+@@ -197,6 +197,9 @@ EXPORT_SYMBOL_GPL(dm_tm_create_non_blocking_clone);
+ 
+ void dm_tm_destroy(struct dm_transaction_manager *tm)
+ {
++	if (!tm)
++		return;
++
+ 	if (!tm->is_clone)
+ 		wipe_shadow_table(tm);
+ 
+diff --git a/include/linux/dm-bufio.h b/include/linux/dm-bufio.h
+index 1bfb98c378cc..c5b9a7852db1 100644
+--- a/include/linux/dm-bufio.h
++++ b/include/linux/dm-bufio.h
+@@ -37,6 +37,8 @@ dm_bufio_client_create(struct block_device *bdev, unsigned block_size,
+  */
+ void dm_bufio_client_destroy(struct dm_bufio_client *c);
+ 
++void dm_bufio_client_reset(struct dm_bufio_client *c);
++
+ /*
+  * Set the sector range.
+  * When this function is called, there must be no I/O in progress on the bufio
