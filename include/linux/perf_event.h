@@ -886,6 +886,7 @@ struct perf_event_pmu_context {
 
 	unsigned int			nr_events;
 	unsigned int			nr_cgroups;
+	unsigned int			nr_freq;
 
 	atomic_t			refcount; /* event <-> epc */
 	struct rcu_head			rcu_head;
@@ -899,6 +900,11 @@ struct perf_event_pmu_context {
 	 */
 	int				rotate_necessary;
 };
+
+static inline bool perf_pmu_ctx_is_active(struct perf_event_pmu_context *epc)
+{
+	return !list_empty(&epc->flexible_active) || !list_empty(&epc->pinned_active);
+}
 
 struct perf_event_groups {
 	struct rb_root	tree;
