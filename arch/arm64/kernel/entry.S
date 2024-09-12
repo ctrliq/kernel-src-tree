@@ -490,18 +490,18 @@ SYM_CODE_START(vectors)
 
 	kernel_ventry	1, sync				// Synchronous EL1h
 	kernel_ventry	1, irq				// IRQ EL1h
-	kernel_ventry	1, fiq_invalid			// FIQ EL1h
+	kernel_ventry	1, fiq				// FIQ EL1h
 	kernel_ventry	1, error			// Error EL1h
 
 	kernel_ventry	0, sync				// Synchronous 64-bit EL0
 	kernel_ventry	0, irq				// IRQ 64-bit EL0
-	kernel_ventry	0, fiq_invalid			// FIQ 64-bit EL0
+	kernel_ventry	0, fiq				// FIQ 64-bit EL0
 	kernel_ventry	0, error			// Error 64-bit EL0
 
 #ifdef CONFIG_COMPAT
 	kernel_ventry	0, sync_compat, 32		// Synchronous 32-bit EL0
 	kernel_ventry	0, irq_compat, 32		// IRQ 32-bit EL0
-	kernel_ventry	0, fiq_invalid_compat, 32	// FIQ 32-bit EL0
+	kernel_ventry	0, fiq_compat, 32		// FIQ 32-bit EL0
 	kernel_ventry	0, error_compat, 32		// Error 32-bit EL0
 #else
 	kernel_ventry	0, sync_invalid, 32		// Synchronous 32-bit EL0
@@ -567,12 +567,6 @@ SYM_CODE_START_LOCAL(el0_error_invalid)
 	inv_entry 0, BAD_ERROR
 SYM_CODE_END(el0_error_invalid)
 
-#ifdef CONFIG_COMPAT
-SYM_CODE_START_LOCAL(el0_fiq_invalid_compat)
-	inv_entry 0, BAD_FIQ, 32
-SYM_CODE_END(el0_fiq_invalid_compat)
-#endif
-
 SYM_CODE_START_LOCAL(el1_sync_invalid)
 	inv_entry 1, BAD_SYNC
 SYM_CODE_END(el1_sync_invalid)
@@ -632,6 +626,12 @@ alternative_else_nop_endif
 	kernel_exit 1
 SYM_CODE_END(el1_irq)
 
+SYM_CODE_START_LOCAL_NOALIGN(el1_fiq)
+	kernel_entry 1
+	el1_interrupt_handler handle_arch_fiq
+	kernel_exit 1
+SYM_CODE_END(el1_fiq)
+
 /*
  * EL0 mode handlers.
  */
@@ -657,6 +657,11 @@ SYM_CODE_START_LOCAL_NOALIGN(el0_irq_compat)
 	kernel_entry 0, 32
 	b	el0_irq_naked
 SYM_CODE_END(el0_irq_compat)
+
+SYM_CODE_START_LOCAL_NOALIGN(el0_fiq_compat)
+	kernel_entry 0, 32
+	b	el0_fiq_naked
+SYM_CODE_END(el0_fiq_compat)
 
 SYM_CODE_START_LOCAL_NOALIGN(el0_error_compat)
 	kernel_entry 0, 32
@@ -686,6 +691,13 @@ el0_irq_naked:
 #endif
 	b	ret_to_user
 SYM_CODE_END(el0_irq)
+
+SYM_CODE_START_LOCAL_NOALIGN(el0_fiq)
+	kernel_entry 0
+el0_fiq_naked:
+	el0_interrupt_handler handle_arch_fiq
+	b	ret_to_user
+SYM_CODE_END(el0_fiq)
 
 SYM_CODE_START_LOCAL(el1_error)
 	kernel_entry 1
