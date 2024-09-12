@@ -1,0 +1,242 @@
+net: openvswitch: add psample action
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-427.33.1.el9_4
+commit-author Adrian Moreno <amorenoz@redhat.com>
+commit aae0b82b46cb5004bdf82a000c004d69a0885c33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.33.1.el9_4/aae0b82b.failed
+
+Add support for a new action: psample.
+
+This action accepts a u32 group id and a variable-length cookie and uses
+the psample multicast group to make the packet available for
+observability.
+
+The maximum length of the user-defined cookie is set to 16, same as
+tc_cookie, to discourage using cookies that will not be offloadable.
+
+	Reviewed-by: Michal Kubiak <michal.kubiak@intel.com>
+	Reviewed-by: Aaron Conole <aconole@redhat.com>
+	Reviewed-by: Ilya Maximets <i.maximets@ovn.org>
+	Acked-by: Eelco Chaudron <echaudro@redhat.com>
+	Signed-off-by: Adrian Moreno <amorenoz@redhat.com>
+Link: https://patch.msgid.link/20240704085710.353845-6-amorenoz@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit aae0b82b46cb5004bdf82a000c004d69a0885c33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/netlink/specs/ovs_flow.yaml
+* Unmerged path Documentation/netlink/specs/ovs_flow.yaml
+* Unmerged path Documentation/netlink/specs/ovs_flow.yaml
+diff --git a/include/uapi/linux/openvswitch.h b/include/uapi/linux/openvswitch.h
+index 56973ce0e91e..4ae64fd876db 100644
+--- a/include/uapi/linux/openvswitch.h
++++ b/include/uapi/linux/openvswitch.h
+@@ -898,6 +898,31 @@ struct check_pkt_len_arg {
+ };
+ #endif
+ 
++#define OVS_PSAMPLE_COOKIE_MAX_SIZE 16
++/**
++ * enum ovs_psample_attr - Attributes for %OVS_ACTION_ATTR_PSAMPLE
++ * action.
++ *
++ * @OVS_PSAMPLE_ATTR_GROUP: 32-bit number to identify the source of the
++ * sample.
++ * @OVS_PSAMPLE_ATTR_COOKIE: An optional variable-length binary cookie that
++ * contains user-defined metadata. The maximum length is
++ * OVS_PSAMPLE_COOKIE_MAX_SIZE bytes.
++ *
++ * Sends the packet to the psample multicast group with the specified group and
++ * cookie. It is possible to combine this action with the
++ * %OVS_ACTION_ATTR_TRUNC action to limit the size of the sample.
++ */
++enum ovs_psample_attr {
++	OVS_PSAMPLE_ATTR_GROUP = 1,	/* u32 number. */
++	OVS_PSAMPLE_ATTR_COOKIE,	/* Optional, user specified cookie. */
++
++	/* private: */
++	__OVS_PSAMPLE_ATTR_MAX
++};
++
++#define OVS_PSAMPLE_ATTR_MAX (__OVS_PSAMPLE_ATTR_MAX - 1)
++
+ /**
+  * enum ovs_action_attr - Action types.
+  *
+@@ -950,6 +975,8 @@ struct check_pkt_len_arg {
+  * of l3 tunnel flag in the tun_flags field of OVS_ACTION_ATTR_ADD_MPLS
+  * argument.
+  * @OVS_ACTION_ATTR_DROP: Explicit drop action.
++ * @OVS_ACTION_ATTR_PSAMPLE: Send a sample of the packet to external observers
++ * via psample.
+  *
+  * Only a single header can be set with a single %OVS_ACTION_ATTR_SET.  Not all
+  * fields within a header are modifiable, e.g. the IPv4 protocol and fragment
+@@ -988,6 +1015,7 @@ enum ovs_action_attr {
+ 	OVS_ACTION_ATTR_ADD_MPLS,     /* struct ovs_action_add_mpls. */
+ 	OVS_ACTION_ATTR_DEC_TTL,      /* Nested OVS_DEC_TTL_ATTR_*. */
+ 	OVS_ACTION_ATTR_DROP,         /* u32 error code. */
++	OVS_ACTION_ATTR_PSAMPLE,      /* Nested OVS_PSAMPLE_ATTR_*. */
+ 
+ 	__OVS_ACTION_ATTR_MAX,	      /* Nothing past this will be accepted
+ 				       * from userspace. */
+diff --git a/net/openvswitch/Kconfig b/net/openvswitch/Kconfig
+index 29a7081858cd..2535f3f9f462 100644
+--- a/net/openvswitch/Kconfig
++++ b/net/openvswitch/Kconfig
+@@ -10,6 +10,7 @@ config OPENVSWITCH
+ 		   (NF_CONNTRACK && ((!NF_DEFRAG_IPV6 || NF_DEFRAG_IPV6) && \
+ 				     (!NF_NAT || NF_NAT) && \
+ 				     (!NETFILTER_CONNCOUNT || NETFILTER_CONNCOUNT)))
++	depends on PSAMPLE || !PSAMPLE
+ 	select LIBCRC32C
+ 	select MPLS
+ 	select NET_MPLS_GSO
+diff --git a/net/openvswitch/actions.c b/net/openvswitch/actions.c
+index dcb106173917..d6d15e60c67e 100644
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@ -24,6 +24,11 @@
+ #include <net/checksum.h>
+ #include <net/dsfield.h>
+ #include <net/mpls.h>
++
++#if IS_ENABLED(CONFIG_PSAMPLE)
++#include <net/psample.h>
++#endif
++
+ #include <net/sctp/checksum.h>
+ 
+ #include "datapath.h"
+@@ -1293,6 +1298,40 @@ static int execute_dec_ttl(struct sk_buff *skb, struct sw_flow_key *key)
+ 	return 0;
+ }
+ 
++#if IS_ENABLED(CONFIG_PSAMPLE)
++static void execute_psample(struct datapath *dp, struct sk_buff *skb,
++			    const struct nlattr *attr)
++{
++	struct psample_group psample_group = {};
++	struct psample_metadata md = {};
++	const struct nlattr *a;
++	int rem;
++
++	nla_for_each_attr(a, nla_data(attr), nla_len(attr), rem) {
++		switch (nla_type(a)) {
++		case OVS_PSAMPLE_ATTR_GROUP:
++			psample_group.group_num = nla_get_u32(a);
++			break;
++
++		case OVS_PSAMPLE_ATTR_COOKIE:
++			md.user_cookie = nla_data(a);
++			md.user_cookie_len = nla_len(a);
++			break;
++		}
++	}
++
++	psample_group.net = ovs_dp_get_net(dp);
++	md.in_ifindex = OVS_CB(skb)->input_vport->dev->ifindex;
++	md.trunc_size = skb->len - OVS_CB(skb)->cutlen;
++
++	psample_sample_packet(&psample_group, skb, 0, &md);
++}
++#else
++static void execute_psample(struct datapath *dp, struct sk_buff *skb,
++			    const struct nlattr *attr)
++{}
++#endif
++
+ /* Execute a list of actions against 'skb'. */
+ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+ 			      struct sw_flow_key *key,
+@@ -1496,6 +1535,15 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+ 			ovs_kfree_skb_reason(skb, reason);
+ 			return 0;
+ 		}
++
++		case OVS_ACTION_ATTR_PSAMPLE:
++			execute_psample(dp, skb, a);
++			OVS_CB(skb)->cutlen = 0;
++			if (nla_is_last(a, rem)) {
++				consume_skb(skb);
++				return 0;
++			}
++			break;
+ 		}
+ 
+ 		if (unlikely(err)) {
+diff --git a/net/openvswitch/flow_netlink.c b/net/openvswitch/flow_netlink.c
+index 50613d39b652..cde16a9dc052 100644
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@ -63,6 +63,7 @@ static bool actions_may_change_flow(const struct nlattr *actions)
+ 		case OVS_ACTION_ATTR_TRUNC:
+ 		case OVS_ACTION_ATTR_USERSPACE:
+ 		case OVS_ACTION_ATTR_DROP:
++		case OVS_ACTION_ATTR_PSAMPLE:
+ 			break;
+ 
+ 		case OVS_ACTION_ATTR_CT:
+@@ -2367,7 +2368,7 @@ static void ovs_nla_free_nested_actions(const struct nlattr *actions, int len)
+ 	/* Whenever new actions are added, the need to update this
+ 	 * function should be considered.
+ 	 */
+-	BUILD_BUG_ON(OVS_ACTION_ATTR_MAX != 24);
++	BUILD_BUG_ON(OVS_ACTION_ATTR_MAX != 25);
+ 
+ 	if (!actions)
+ 		return;
+@@ -3105,6 +3106,28 @@ static int validate_and_copy_check_pkt_len(struct net *net,
+ 	return 0;
+ }
+ 
++static int validate_psample(const struct nlattr *attr)
++{
++	static const struct nla_policy policy[OVS_PSAMPLE_ATTR_MAX + 1] = {
++		[OVS_PSAMPLE_ATTR_GROUP] = { .type = NLA_U32 },
++		[OVS_PSAMPLE_ATTR_COOKIE] = {
++			.type = NLA_BINARY,
++			.len = OVS_PSAMPLE_COOKIE_MAX_SIZE,
++		},
++	};
++	struct nlattr *a[OVS_PSAMPLE_ATTR_MAX + 1];
++	int err;
++
++	if (!IS_ENABLED(CONFIG_PSAMPLE))
++		return -EOPNOTSUPP;
++
++	err = nla_parse_nested(a, OVS_PSAMPLE_ATTR_MAX, attr, policy, NULL);
++	if (err)
++		return err;
++
++	return a[OVS_PSAMPLE_ATTR_GROUP] ? 0 : -EINVAL;
++}
++
+ static int copy_action(const struct nlattr *from,
+ 		       struct sw_flow_actions **sfa, bool log)
+ {
+@@ -3156,6 +3179,7 @@ static int __ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
+ 			[OVS_ACTION_ATTR_ADD_MPLS] = sizeof(struct ovs_action_add_mpls),
+ 			[OVS_ACTION_ATTR_DEC_TTL] = (u32)-1,
+ 			[OVS_ACTION_ATTR_DROP] = sizeof(u32),
++			[OVS_ACTION_ATTR_PSAMPLE] = (u32)-1,
+ 		};
+ 		const struct ovs_action_push_vlan *vlan;
+ 		int type = nla_type(a);
+@@ -3432,6 +3456,12 @@ static int __ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
+ 				return -EINVAL;
+ 			break;
+ 
++		case OVS_ACTION_ATTR_PSAMPLE:
++			err = validate_psample(a);
++			if (err)
++				return err;
++			break;
++
+ 		default:
+ 			OVS_NLERR(log, "Unknown Action type %d", type);
+ 			return -EINVAL;
