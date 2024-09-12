@@ -1,0 +1,174 @@
+wifi: mac80211: make sta airtime deficit field s32 instead of s64
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Felix Fietkau <nbd@nbd.name>
+commit 445452d438e2f40355e2ed1aa9894e7094237dc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/445452d4.failed
+
+32 bit is more than enough range for the airtime deficit
+
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+	Acked-by: Toke Høiland-Jørgensen <toke@toke.dk>
+Link: https://lore.kernel.org/r/20220625212411.36675-2-nbd@nbd.name
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 445452d438e2f40355e2ed1aa9894e7094237dc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/debugfs_sta.c
+#	net/mac80211/sta_info.h
+#	net/mac80211/tx.c
+diff --cc net/mac80211/debugfs_sta.c
+index 88d9cc945a21,d3397c1248d3..000000000000
+--- a/net/mac80211/debugfs_sta.c
++++ b/net/mac80211/debugfs_sta.c
+@@@ -202,7 -202,7 +202,11 @@@ static ssize_t sta_airtime_read(struct 
+  	size_t bufsz = 400;
+  	char *buf = kzalloc(bufsz, GFP_KERNEL), *p = buf;
+  	u64 rx_airtime = 0, tx_airtime = 0;
+++<<<<<<< HEAD
+ +	u64 v_t[IEEE80211_NUM_ACS];
+++=======
++ 	s32 deficit[IEEE80211_NUM_ACS];
+++>>>>>>> 445452d438e2 (wifi: mac80211: make sta airtime deficit field s32 instead of s64)
+  	ssize_t rv;
+  	int ac;
+  
+@@@ -219,9 -219,9 +223,15 @@@
+  
+  	p += scnprintf(p, bufsz + buf - p,
+  		"RX: %llu us\nTX: %llu us\nWeight: %u\n"
+++<<<<<<< HEAD
+ +		"Virt-T: VO: %lld us VI: %lld us BE: %lld us BK: %lld us\n",
+ +		rx_airtime, tx_airtime, sta->airtime[0].weight,
+ +		v_t[0], v_t[1], v_t[2], v_t[3]);
+++=======
++ 		"Deficit: VO: %d us VI: %d us BE: %d us BK: %d us\n",
++ 		rx_airtime, tx_airtime, sta->airtime_weight,
++ 		deficit[0], deficit[1], deficit[2], deficit[3]);
+++>>>>>>> 445452d438e2 (wifi: mac80211: make sta airtime deficit field s32 instead of s64)
+  
+  	rv = simple_read_from_buffer(userbuf, count, ppos, buf, p - buf);
+  	kfree(buf);
+diff --cc net/mac80211/sta_info.h
+index addc78b398f0,44ebf17f2808..000000000000
+--- a/net/mac80211/sta_info.h
++++ b/net/mac80211/sta_info.h
+@@@ -139,9 -138,7 +139,13 @@@ enum ieee80211_agg_stop_reason 
+  struct airtime_info {
+  	u64 rx_airtime;
+  	u64 tx_airtime;
+++<<<<<<< HEAD
+ +	u64 v_t;
+ +	u64 last_scheduled;
+ +	struct list_head list;
+++=======
++ 	s32 deficit;
+++>>>>>>> 445452d438e2 (wifi: mac80211: make sta airtime deficit field s32 instead of s64)
+  	atomic_t aql_tx_pending; /* Estimated airtime for frames pending */
+  	u32 aql_limit_low;
+  	u32 aql_limit_high;
+diff --cc net/mac80211/tx.c
+index 59b212870021,a615cadf7728..000000000000
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@@ -3787,47 -3803,59 +3787,75 @@@ EXPORT_SYMBOL(ieee80211_tx_dequeue)
+  struct ieee80211_txq *ieee80211_next_txq(struct ieee80211_hw *hw, u8 ac)
+  {
+  	struct ieee80211_local *local = hw_to_local(hw);
+ +	struct airtime_sched_info *air_sched;
+ +	u64 now = ktime_get_coarse_boottime_ns();
+  	struct ieee80211_txq *ret = NULL;
+ -	struct txq_info *txqi = NULL, *head = NULL;
+ -	bool found_eligible_txq = false;
+ +	struct airtime_info *air_info;
+ +	struct txq_info *txqi = NULL;
+ +	struct rb_node *node;
+ +	bool first = false;
+  
+ -	spin_lock_bh(&local->active_txq_lock[ac]);
+ +	air_sched = &local->airtime[ac];
+ +	spin_lock_bh(&air_sched->lock);
+  
+ - begin:
+ -	txqi = list_first_entry_or_null(&local->active_txqs[ac],
+ -					struct txq_info,
+ -					schedule_order);
+ -	if (!txqi)
+ -		goto out;
+ +	node = air_sched->schedule_pos;
+  
+ -	if (txqi == head) {
+ -		if (!found_eligible_txq)
+ -			goto out;
+ -		else
+ -			found_eligible_txq = false;
+ +begin:
+ +	if (!node) {
+ +		node = rb_first_cached(&air_sched->active_txqs);
+ +		first = true;
+ +	} else {
+ +		node = rb_next(node);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!node)
+++=======
++ 	if (!head)
++ 		head = txqi;
++ 
++ 	if (txqi->txq.sta) {
++ 		struct sta_info *sta = container_of(txqi->txq.sta,
++ 						    struct sta_info, sta);
++ 		bool aql_check = ieee80211_txq_airtime_check(hw, &txqi->txq);
++ 		s32 deficit = sta->airtime[txqi->txq.ac].deficit;
++ 
++ 		if (aql_check)
++ 			found_eligible_txq = true;
++ 
++ 		if (deficit < 0)
++ 			sta->airtime[txqi->txq.ac].deficit +=
++ 				sta->airtime_weight;
++ 
++ 		if (deficit < 0 || !aql_check) {
++ 			list_move_tail(&txqi->schedule_order,
++ 				       &local->active_txqs[txqi->txq.ac]);
++ 			goto begin;
++ 		}
++ 	}
++ 
++ 
++ 	if (txqi->schedule_round == local->schedule_round[ac])
+++>>>>>>> 445452d438e2 (wifi: mac80211: make sta airtime deficit field s32 instead of s64)
+  		goto out;
+  
+ -	list_del_init(&txqi->schedule_order);
+ -	txqi->schedule_round = local->schedule_round[ac];
+ -	ret = &txqi->txq;
+ +	txqi = container_of(node, struct txq_info, schedule_order);
+ +	air_info = to_airtime_info(&txqi->txq);
+ +
+ +	if (air_info->v_t > air_sched->v_t &&
+ +	    (!first || !airtime_catchup_v_t(air_sched, air_info->v_t, now)))
+ +		goto out;
+ +
+ +	if (!ieee80211_txq_airtime_check(hw, &txqi->txq)) {
+ +		first = false;
+ +		goto begin;
+ +	}
+  
+ +	air_sched->schedule_pos = node;
+ +	air_sched->last_schedule_activity = now;
+ +	ret = &txqi->txq;
+  out:
+ -	spin_unlock_bh(&local->active_txq_lock[ac]);
+ +	spin_unlock_bh(&air_sched->lock);
+  	return ret;
+  }
+  EXPORT_SYMBOL(ieee80211_next_txq);
+* Unmerged path net/mac80211/debugfs_sta.c
+* Unmerged path net/mac80211/sta_info.h
+* Unmerged path net/mac80211/tx.c
