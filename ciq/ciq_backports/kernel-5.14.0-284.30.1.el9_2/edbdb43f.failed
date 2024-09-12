@@ -1,0 +1,122 @@
+KVM: x86: Preserve TDP MMU roots until they are explicitly invalidated
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author Sean Christopherson <seanjc@google.com>
+commit edbdb43fc96b11b3bfa531be306a1993d9fe89ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/edbdb43f.failed
+
+Preserve TDP MMU roots until they are explicitly invalidated by gifting
+the TDP MMU itself a reference to a root when it is allocated.  Keeping a
+reference in the TDP MMU fixes a flaw where the TDP MMU exhibits terrible
+performance, and can potentially even soft-hang a vCPU, if a vCPU
+frequently unloads its roots, e.g. when KVM is emulating SMI+RSM.
+
+When KVM emulates something that invalidates _all_ TLB entries, e.g. SMI
+and RSM, KVM unloads all of the vCPUs roots (KVM keeps a small per-vCPU
+cache of previous roots).  Unloading roots is a simple way to ensure KVM
+flushes and synchronizes all roots for the vCPU, as KVM flushes and syncs
+when allocating a "new" root (from the vCPU's perspective).
+
+In the shadow MMU, KVM keeps track of all shadow pages, roots included, in
+a per-VM hash table.  Unloading a shadow MMU root just wipes it from the
+per-vCPU cache; the root is still tracked in the per-VM hash table.  When
+KVM loads a "new" root for the vCPU, KVM will find the old, unloaded root
+in the per-VM hash table.
+
+Unlike the shadow MMU, the TDP MMU doesn't track "inactive" roots in a
+per-VM structure, where "active" in this case means a root is either
+in-use or cached as a previous root by at least one vCPU.  When a TDP MMU
+root becomes inactive, i.e. the last vCPU reference to the root is put,
+KVM immediately frees the root (asterisk on "immediately" as the actual
+freeing may be done by a worker, but for all intents and purposes the root
+is gone).
+
+The TDP MMU behavior is especially problematic for 1-vCPU setups, as
+unloading all roots effectively frees all roots.  The issue is mitigated
+to some degree in multi-vCPU setups as a different vCPU usually holds a
+reference to an unloaded root and thus keeps the root alive, allowing the
+vCPU to reuse its old root after unloading (with a flush+sync).
+
+The TDP MMU flaw has been known for some time, as until very recently,
+KVM's handling of CR0.WP also triggered unloading of all roots.  The
+CR0.WP toggling scenario was eventually addressed by not unloading roots
+when _only_ CR0.WP is toggled, but such an approach doesn't Just Work
+for emulating SMM as KVM must emulate a full TLB flush on entry and exit
+to/from SMM.  Given that the shadow MMU plays nice with unloading roots
+at will, teaching the TDP MMU to do the same is far less complex than
+modifying KVM to track which roots need to be flushed before reuse.
+
+Note, preserving all possible TDP MMU roots is not a concern with respect
+to memory consumption.  Now that the role for direct MMUs doesn't include
+information about the guest, e.g. CR0.PG, CR0.WP, CR4.SMEP, etc., there
+are _at most_ six possible roots (where "guest_mode" here means L2):
+
+  1. 4-level !SMM !guest_mode
+  2. 4-level  SMM !guest_mode
+  3. 5-level !SMM !guest_mode
+  4. 5-level  SMM !guest_mode
+  5. 4-level !SMM guest_mode
+  6. 5-level !SMM guest_mode
+
+And because each vCPU can track 4 valid roots, a VM can already have all
+6 root combinations live at any given time.  Not to mention that, in
+practice, no sane VMM will advertise different guest.MAXPHYADDR values
+across vCPUs, i.e. KVM won't ever use both 4-level and 5-level roots for
+a single VM.  Furthermore, the vast majority of modern hypervisors will
+utilize EPT/NPT when available, thus the guest_mode=%true cases are also
+unlikely to be utilized.
+
+	Reported-by: Jeremi Piotrowski <jpiotrowski@linux.microsoft.com>
+Link: https://lore.kernel.org/all/959c5bce-beb5-b463-7158-33fc4a4f910c@linux.microsoft.com
+Link: https://lkml.kernel.org/r/20220209170020.1775368-1-pbonzini%40redhat.com
+Link: https://lore.kernel.org/all/20230322013731.102955-1-minipli@grsecurity.net
+Link: https://lore.kernel.org/all/000000000000a0bc2b05f9dd7fab@google.com
+Link: https://lore.kernel.org/all/000000000000eca0b905fa0f7756@google.com
+	Cc: Ben Gardon <bgardon@google.com>
+	Cc: David Matlack <dmatlack@google.com>
+	Cc: stable@vger.kernel.org
+	Tested-by: Jeremi Piotrowski <jpiotrowski@linux.microsoft.com>
+Link: https://lore.kernel.org/r/20230426220323.3079789-1-seanjc@google.com
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+(cherry picked from commit edbdb43fc96b11b3bfa531be306a1993d9fe89ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 1fb685de31e9,08340219c35a..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -48,13 -40,20 +48,27 @@@ static __always_inline bool kvm_lockdep
+  
+  void kvm_mmu_uninit_tdp_mmu(struct kvm *kvm)
+  {
+++<<<<<<< HEAD
+ +	if (!kvm->arch.tdp_mmu_enabled)
+ +		return;
+ +
+ +	/* Also waits for any queued work items.  */
+++=======
++ 	/*
++ 	 * Invalidate all roots, which besides the obvious, schedules all roots
++ 	 * for zapping and thus puts the TDP MMU's reference to each root, i.e.
++ 	 * ultimately frees all roots.
++ 	 */
++ 	kvm_tdp_mmu_invalidate_all_roots(kvm);
++ 
++ 	/*
++ 	 * Destroying a workqueue also first flushes the workqueue, i.e. no
++ 	 * need to invoke kvm_tdp_mmu_zap_invalidated_roots().
++ 	 */
+++>>>>>>> edbdb43fc96b (KVM: x86: Preserve TDP MMU roots until they are explicitly invalidated)
+  	destroy_workqueue(kvm->arch.tdp_mmu_zap_wq);
+  
+ -	WARN_ON(atomic64_read(&kvm->arch.tdp_mmu_pages));
+ +	WARN_ON(!list_empty(&kvm->arch.tdp_mmu_pages));
+  	WARN_ON(!list_empty(&kvm->arch.tdp_mmu_roots));
+  
+  	/*
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
