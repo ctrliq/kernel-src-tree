@@ -1,0 +1,164 @@
+x86/srso: Add IBPB_BRTYPE support
+
+jira LE-1907
+cve CVE-2023-20569
+Rebuild_History Non-Buildable kernel-4.18.0-521.el8
+commit-author Borislav Petkov (AMD) <bp@alien8.de>
+commit 79113e4060aba744787a81edb9014f2865193854
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-521.el8/79113e40.failed
+
+Add support for the synthetic CPUID flag which "if this bit is 1,
+it indicates that MSR 49h (PRED_CMD) bit 0 (IBPB) flushes all branch
+type predictions from the CPU branch predictor."
+
+This flag is there so that this capability in guests can be detected
+easily (otherwise one would have to track microcode revisions which is
+impossible for guests).
+
+It is also needed only for Zen3 and -4. The other two (Zen1 and -2)
+always flush branch type predictions by default.
+
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+(cherry picked from commit 79113e4060aba744787a81edb9014f2865193854)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpufeatures.h
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/include/asm/cpufeatures.h
+index b52ff6ff9447,8aebe95d2fad..000000000000
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@@ -426,11 -445,7 +426,15 @@@
+  #define X86_FEATURE_AUTOIBRS		(20*32+ 8) /* "" Automatic IBRS */
+  #define X86_FEATURE_NO_SMM_CTL_MSR	(20*32+ 9) /* "" SMM_CTL MSR is not present */
+  
+++<<<<<<< HEAD
+ +/* Word 21: reserved for future extension */
+ +
+ +/* RHEL specific auxillary flags, word 22 */
+ +#define X86_FEATURE_IBRS_EXIT_SET	(22*32+ 0) /* ""  Set IBRS on kernel exit */
+ +#define X86_FEATURE_IBRS_EXIT_SKIP	(22*32+ 1) /* ""  Skip SPEC_CTRL MSR write on exit */
+++=======
++ #define X86_FEATURE_IBPB_BRTYPE		(20*32+28) /* "" MSR_PRED_CMD[IBPB] flushes all branch type predictions */
+++>>>>>>> 79113e4060ab (x86/srso: Add IBPB_BRTYPE support)
+  
+  /*
+   * BUG word(s)
+diff --cc arch/x86/kernel/cpu/bugs.c
+index adea0002a1a8,ff61ef61277a..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -2309,6 -2188,105 +2309,108 @@@ static int __init l1tf_cmdline(char *st
+  early_param("l1tf", l1tf_cmdline);
+  
+  #undef pr_fmt
+++<<<<<<< HEAD
+++=======
++ #define pr_fmt(fmt)	"Speculative Return Stack Overflow: " fmt
++ 
++ enum srso_mitigation {
++ 	SRSO_MITIGATION_NONE,
++ 	SRSO_MITIGATION_MICROCODE,
++ 	SRSO_MITIGATION_SAFE_RET,
++ };
++ 
++ enum srso_mitigation_cmd {
++ 	SRSO_CMD_OFF,
++ 	SRSO_CMD_MICROCODE,
++ 	SRSO_CMD_SAFE_RET,
++ };
++ 
++ static const char * const srso_strings[] = {
++ 	[SRSO_MITIGATION_NONE]           = "Vulnerable",
++ 	[SRSO_MITIGATION_MICROCODE]      = "Mitigation: microcode",
++ 	[SRSO_MITIGATION_SAFE_RET]	 = "Mitigation: safe RET",
++ };
++ 
++ static enum srso_mitigation srso_mitigation __ro_after_init = SRSO_MITIGATION_NONE;
++ static enum srso_mitigation_cmd srso_cmd __ro_after_init = SRSO_CMD_SAFE_RET;
++ 
++ static int __init srso_parse_cmdline(char *str)
++ {
++ 	if (!str)
++ 		return -EINVAL;
++ 
++ 	if (!strcmp(str, "off"))
++ 		srso_cmd = SRSO_CMD_OFF;
++ 	else if (!strcmp(str, "microcode"))
++ 		srso_cmd = SRSO_CMD_MICROCODE;
++ 	else if (!strcmp(str, "safe-ret"))
++ 		srso_cmd = SRSO_CMD_SAFE_RET;
++ 	else
++ 		pr_err("Ignoring unknown SRSO option (%s).", str);
++ 
++ 	return 0;
++ }
++ early_param("spec_rstack_overflow", srso_parse_cmdline);
++ 
++ #define SRSO_NOTICE "WARNING: See https://kernel.org/doc/html/latest/admin-guide/hw-vuln/srso.html for mitigation options."
++ 
++ static void __init srso_select_mitigation(void)
++ {
++ 	bool has_microcode;
++ 
++ 	if (!boot_cpu_has_bug(X86_BUG_SRSO) || cpu_mitigations_off())
++ 		return;
++ 
++ 	/*
++ 	 * The first check is for the kernel running as a guest in order
++ 	 * for guests to verify whether IBPB is a viable mitigation.
++ 	 */
++ 	has_microcode = boot_cpu_has(X86_FEATURE_IBPB_BRTYPE) || cpu_has_ibpb_brtype_microcode();
++ 	if (!has_microcode) {
++ 		pr_warn("IBPB-extending microcode not applied!\n");
++ 		pr_warn(SRSO_NOTICE);
++ 	} else {
++ 		/*
++ 		 * Enable the synthetic (even if in a real CPUID leaf)
++ 		 * flag for guests.
++ 		 */
++ 		setup_force_cpu_cap(X86_FEATURE_IBPB_BRTYPE);
++ 	}
++ 
++ 	switch (srso_cmd) {
++ 	case SRSO_CMD_OFF:
++ 		return;
++ 
++ 	case SRSO_CMD_MICROCODE:
++ 		if (has_microcode) {
++ 			srso_mitigation = SRSO_MITIGATION_MICROCODE;
++ 			pr_warn(SRSO_NOTICE);
++ 		}
++ 		break;
++ 
++ 	case SRSO_CMD_SAFE_RET:
++ 		if (IS_ENABLED(CONFIG_CPU_SRSO)) {
++ 			if (boot_cpu_data.x86 == 0x19)
++ 				setup_force_cpu_cap(X86_FEATURE_SRSO_ALIAS);
++ 			else
++ 				setup_force_cpu_cap(X86_FEATURE_SRSO);
++ 			srso_mitigation = SRSO_MITIGATION_SAFE_RET;
++ 		} else {
++ 			pr_err("WARNING: kernel not compiled with CPU_SRSO.\n");
++ 			return;
++ 		}
++ 		break;
++ 
++ 	default:
++ 		break;
++ 
++ 	}
++ 
++ 	pr_info("%s%s\n", srso_strings[srso_mitigation], (has_microcode ? "" : ", no microcode"));
++ }
++ 
++ #undef pr_fmt
+++>>>>>>> 79113e4060ab (x86/srso: Add IBPB_BRTYPE support)
+  #define pr_fmt(fmt) fmt
+  
+  #ifdef CONFIG_SYSFS
+* Unmerged path arch/x86/include/asm/cpufeatures.h
+* Unmerged path arch/x86/kernel/cpu/bugs.c
