@@ -1,0 +1,183 @@
+regmap: Add bulk read/write callbacks into regmap_config
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Marek Vasut <marex@denx.de>
+commit d77e745613680c54708470402e2b623dcd769681
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/d77e7456.failed
+
+Currently the regmap_config structure only allows the user to implement
+single element register read/write using .reg_read/.reg_write callbacks.
+The regmap_bus already implements bulk counterparts of both, and is being
+misused as a workaround for the missing bulk read/write callbacks in
+regmap_config by a couple of drivers. To stop this misuse, add the bulk
+read/write callbacks to regmap_config and call them from the regmap core
+code.
+
+	Signed-off-by: Marek Vasut <marex@denx.de>
+	Cc: Jagan Teki <jagan@amarulasolutions.com>
+	Cc: Mark Brown <broonie@kernel.org>
+	Cc: Maxime Ripard <maxime@cerno.tech>
+	Cc: Robert Foss <robert.foss@linaro.org>
+	Cc: Sam Ravnborg <sam@ravnborg.org>
+	Cc: Thomas Zimmermann <tzimmermann@suse.de>
+To: dri-devel@lists.freedesktop.org
+Link: https://lore.kernel.org/r/20220430025145.640305-1-marex@denx.de
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit d77e745613680c54708470402e2b623dcd769681)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/regmap/regmap.c
+diff --cc drivers/base/regmap/regmap.c
+index a5fdb7dad64b,879a87a6461b..000000000000
+--- a/drivers/base/regmap/regmap.c
++++ b/drivers/base/regmap/regmap.c
+@@@ -1507,14 -1686,18 +1522,26 @@@ static int _regmap_raw_write_impl(struc
+  	size_t len;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	WARN_ON(!map->bus);
+ +
+ +	/* Check for unwritable registers before we start */
+ +	if (map->writeable_reg)
+ +		for (i = 0; i < val_len / map->format.val_bytes; i++)
+ +			if (!map->writeable_reg(map->dev,
+ +					       reg + regmap_get_offset(map, i)))
+++=======
++ 	/* Check for unwritable or noinc registers in range
++ 	 * before we start
++ 	 */
++ 	if (!regmap_writeable_noinc(map, reg)) {
++ 		for (i = 0; i < val_len / map->format.val_bytes; i++) {
++ 			unsigned int element =
++ 				reg + regmap_get_offset(map, i);
++ 			if (!regmap_writeable(map, element) ||
++ 				regmap_writeable_noinc(map, element))
+++>>>>>>> d77e74561368 (regmap: Add bulk read/write callbacks into regmap_config)
+  				return -EINVAL;
+ -		}
+ -	}
+  
+  	if (!map->cache_bypass && map->format.parse_val) {
+  		unsigned int ival;
+@@@ -2626,7 -2878,66 +2648,70 @@@ int regmap_raw_read(struct regmap *map
+  EXPORT_SYMBOL_GPL(regmap_raw_read);
+  
+  /**
+++<<<<<<< HEAD
+ + * regmap_field_read() - Read a value to a single register field
+++=======
++  * regmap_noinc_read(): Read data from a register without incrementing the
++  *			register number
++  *
++  * @map: Register map to read from
++  * @reg: Register to read from
++  * @val: Pointer to data buffer
++  * @val_len: Length of output buffer in bytes.
++  *
++  * The regmap API usually assumes that bulk read operations will read a
++  * range of registers. Some devices have certain registers for which a read
++  * operation read will read from an internal FIFO.
++  *
++  * The target register must be volatile but registers after it can be
++  * completely unrelated cacheable registers.
++  *
++  * This will attempt multiple reads as required to read val_len bytes.
++  *
++  * A value of zero will be returned on success, a negative errno will be
++  * returned in error cases.
++  */
++ int regmap_noinc_read(struct regmap *map, unsigned int reg,
++ 		      void *val, size_t val_len)
++ {
++ 	size_t read_len;
++ 	int ret;
++ 
++ 	if (val_len % map->format.val_bytes)
++ 		return -EINVAL;
++ 	if (!IS_ALIGNED(reg, map->reg_stride))
++ 		return -EINVAL;
++ 	if (val_len == 0)
++ 		return -EINVAL;
++ 
++ 	map->lock(map->lock_arg);
++ 
++ 	if (!regmap_volatile(map, reg) || !regmap_readable_noinc(map, reg)) {
++ 		ret = -EINVAL;
++ 		goto out_unlock;
++ 	}
++ 
++ 	while (val_len) {
++ 		if (map->max_raw_read && map->max_raw_read < val_len)
++ 			read_len = map->max_raw_read;
++ 		else
++ 			read_len = val_len;
++ 		ret = _regmap_raw_read(map, reg, val, read_len, true);
++ 		if (ret)
++ 			goto out_unlock;
++ 		val = ((u8 *)val) + read_len;
++ 		val_len -= read_len;
++ 	}
++ 
++ out_unlock:
++ 	map->unlock(map->lock_arg);
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(regmap_noinc_read);
++ 
++ /**
++  * regmap_field_read(): Read a value to a single register field
+++>>>>>>> d77e74561368 (regmap: Add bulk read/write callbacks into regmap_config)
+   *
+   * @field: Register field to read from
+   * @val: Pointer to store read value
+diff --git a/drivers/base/regmap/internal.h b/drivers/base/regmap/internal.h
+index c94244f57784..130d866dd228 100644
+--- a/drivers/base/regmap/internal.h
++++ b/drivers/base/regmap/internal.h
+@@ -109,6 +109,10 @@ struct regmap {
+ 	int (*reg_write)(void *context, unsigned int reg, unsigned int val);
+ 	int (*reg_update_bits)(void *context, unsigned int reg,
+ 			       unsigned int mask, unsigned int val);
++	/* Bulk read/write */
++	int (*read)(void *context, const void *reg_buf, size_t reg_size,
++		    void *val_buf, size_t val_size);
++	int (*write)(void *context, const void *data, size_t count);
+ 
+ 	bool defer_caching;
+ 
+* Unmerged path drivers/base/regmap/regmap.c
+diff --git a/include/linux/regmap.h b/include/linux/regmap.h
+index ad88f0dc7119..cc89c4c5cc7b 100644
+--- a/include/linux/regmap.h
++++ b/include/linux/regmap.h
+@@ -301,6 +301,12 @@ typedef void (*regmap_unlock)(void *);
+  *		     if the function require special handling with lock and reg
+  *		     handling and the operation cannot be represented as a simple
+  *		     update_bits operation on a bus such as SPI, I2C, etc.
++ * @read: Optional callback that if filled will be used to perform all the
++ *        bulk reads from the registers. Data is returned in the buffer used
++ *        to transmit data.
++ * @write: Same as above for writing.
++ * @max_raw_read: Max raw read size that can be used on the device.
++ * @max_raw_write: Max raw write size that can be used on the device.
+  * @fast_io:	  Register IO is fast. Use a spinlock instead of a mutex
+  *	     	  to perform locking. This field is ignored if custom lock/unlock
+  *	     	  functions are used (see fields lock/unlock of struct regmap_config).
+@@ -382,6 +388,12 @@ struct regmap_config {
+ 	int (*reg_write)(void *context, unsigned int reg, unsigned int val);
+ 	int (*reg_update_bits)(void *context, unsigned int reg,
+ 			       unsigned int mask, unsigned int val);
++	/* Bulk read/write */
++	int (*read)(void *context, const void *reg_buf, size_t reg_size,
++		    void *val_buf, size_t val_size);
++	int (*write)(void *context, const void *data, size_t count);
++	size_t max_raw_read;
++	size_t max_raw_write;
+ 
+ 	bool fast_io;
+ 
