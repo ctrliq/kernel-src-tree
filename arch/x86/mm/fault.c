@@ -967,7 +967,6 @@ bad_area_access_error(struct pt_regs *regs, unsigned long error_code,
 	}
 }
 
-/* Handle faults in the kernel portion of the address space */
 static void
 do_sigbus(struct pt_regs *regs, unsigned long error_code, unsigned long address,
 	  vm_fault_t fault)
