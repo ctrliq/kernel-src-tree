@@ -1,0 +1,253 @@
+net:mlx5e: Add PTP-TIR and PTP-RQT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Aya Levin <ayal@nvidia.com>
+commit 3adb60b6a3ed9f233daa632d35cec79fe4781372
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/3adb60b6.failed
+
+Add PTP-TIR and initiate its RQT to allow PTP-RQ to integrate into the
+safe-reopen flow on configuration change. Add rx_ptp_support flag on a
+profile and turn it on for ETH driver. With this flag set, create a
+redirect-RQT for PTP-RQ.
+
+	Signed-off-by: Aya Levin <ayal@nvidia.com>
+	Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 3adb60b6a3ed9f233daa632d35cec79fe4781372)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+index 28aa5ae118f4,460b167887bc..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+@@@ -35,20 -40,15 +35,29 @@@ struct mlx5e_port_ptp 
+  	struct mlx5e_priv         *priv;
+  	struct mlx5_core_dev      *mdev;
+  	struct hwtstamp_config    *tstamp;
+ -	DECLARE_BITMAP(state, MLX5E_PTP_STATE_NUM_STATES);
+ +	DECLARE_BITMAP(state, MLX5E_CHANNEL_NUM_STATES);
+ +	int                        ix;
+ +};
+ +
+++<<<<<<< HEAD
+ +struct mlx5e_ptp_params {
+ +	struct mlx5e_params        params;
+ +	struct mlx5e_sq_param      txq_sq_param;
+  };
+  
+ +int mlx5e_port_ptp_open(struct mlx5e_priv *priv, struct mlx5e_params *params,
+ +			u8 lag_port, struct mlx5e_port_ptp **cp);
+ +void mlx5e_port_ptp_close(struct mlx5e_port_ptp *c);
+ +void mlx5e_ptp_activate_channel(struct mlx5e_port_ptp *c);
+ +void mlx5e_ptp_deactivate_channel(struct mlx5e_port_ptp *c);
+++=======
++ int mlx5e_ptp_open(struct mlx5e_priv *priv, struct mlx5e_params *params,
++ 		   u8 lag_port, struct mlx5e_ptp **cp);
++ void mlx5e_ptp_close(struct mlx5e_ptp *c);
++ void mlx5e_ptp_activate_channel(struct mlx5e_ptp *c);
++ void mlx5e_ptp_deactivate_channel(struct mlx5e_ptp *c);
++ int mlx5e_ptp_get_rqn(struct mlx5e_ptp *c, u32 *rqn);
+++>>>>>>> 3adb60b6a3ed (net:mlx5e: Add PTP-TIR and PTP-RQT)
+  
+  enum {
+  	MLX5E_SKB_CB_CQE_HWTSTAMP  = BIT(0),
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 9cd4c188c5a0..71e63e7f32ee 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -840,6 +840,7 @@ struct mlx5e_priv {
+ 	struct mlx5e_tir           inner_indir_tir[MLX5E_NUM_INDIR_TIRS];
+ 	struct mlx5e_tir           direct_tir[MLX5E_MAX_NUM_CHANNELS];
+ 	struct mlx5e_tir           xsk_tir[MLX5E_MAX_NUM_CHANNELS];
++	struct mlx5e_tir           ptp_tir;
+ 	struct mlx5e_rss_params    rss_params;
+ 	u32                        tx_rates[MLX5E_MAX_NUM_SQS];
+ 
+@@ -919,6 +920,7 @@ struct mlx5e_profile {
+ 	const struct mlx5e_rx_handlers *rx_handlers;
+ 	int	max_tc;
+ 	u8	rq_groups;
++	bool	rx_ptp_support;
+ };
+ 
+ void mlx5e_build_ptys2ethtool_map(void);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+index f9afbdefded5..1ff1a5da576b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+@@ -528,3 +528,12 @@ void mlx5e_ptp_deactivate_channel(struct mlx5e_port_ptp *c)
+ 
+ 	napi_disable(&c->napi);
+ }
++
++int mlx5e_ptp_get_rqn(struct mlx5e_ptp *c, u32 *rqn)
++{
++	if (!c || !test_bit(MLX5E_PTP_STATE_RX, c->state))
++		return -EINVAL;
++
++	*rqn = c->rq.rqn;
++	return 0;
++}
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index fca0e8f30721..becd1bc82aa7 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2334,7 +2334,8 @@ static u32 mlx5e_get_direct_rqn(struct mlx5e_priv *priv, int ix,
+ }
+ 
+ static void mlx5e_redirect_rqts(struct mlx5e_priv *priv,
+-				struct mlx5e_redirect_rqt_param rrp)
++				struct mlx5e_redirect_rqt_param rrp,
++				struct mlx5e_redirect_rqt_param *ptp_rrp)
+ {
+ 	u32 rqtn;
+ 	int ix;
+@@ -2360,11 +2361,17 @@ static void mlx5e_redirect_rqts(struct mlx5e_priv *priv,
+ 		rqtn = priv->direct_tir[ix].rqt.rqtn;
+ 		mlx5e_redirect_rqt(priv, rqtn, 1, direct_rrp);
+ 	}
++	if (ptp_rrp) {
++		rqtn = priv->ptp_tir.rqt.rqtn;
++		mlx5e_redirect_rqt(priv, rqtn, 1, *ptp_rrp);
++	}
+ }
+ 
+ static void mlx5e_redirect_rqts_to_channels(struct mlx5e_priv *priv,
+ 					    struct mlx5e_channels *chs)
+ {
++	bool rx_ptp_support = priv->profile->rx_ptp_support;
++	struct mlx5e_redirect_rqt_param *ptp_rrp_p = NULL;
+ 	struct mlx5e_redirect_rqt_param rrp = {
+ 		.is_rss        = true,
+ 		{
+@@ -2374,12 +2381,22 @@ static void mlx5e_redirect_rqts_to_channels(struct mlx5e_priv *priv,
+ 			}
+ 		},
+ 	};
++	struct mlx5e_redirect_rqt_param ptp_rrp;
++
++	if (rx_ptp_support) {
++		u32 ptp_rqn;
+ 
+-	mlx5e_redirect_rqts(priv, rrp);
++		ptp_rrp.is_rss = false;
++		ptp_rrp.rqn = mlx5e_ptp_get_rqn(priv->channels.ptp, &ptp_rqn) ?
++			      priv->drop_rq.rqn : ptp_rqn;
++		ptp_rrp_p = &ptp_rrp;
++	}
++	mlx5e_redirect_rqts(priv, rrp, ptp_rrp_p);
+ }
+ 
+ static void mlx5e_redirect_rqts_to_drop(struct mlx5e_priv *priv)
+ {
++	bool rx_ptp_support = priv->profile->rx_ptp_support;
+ 	struct mlx5e_redirect_rqt_param drop_rrp = {
+ 		.is_rss = false,
+ 		{
+@@ -2387,7 +2404,7 @@ static void mlx5e_redirect_rqts_to_drop(struct mlx5e_priv *priv)
+ 		},
+ 	};
+ 
+-	mlx5e_redirect_rqts(priv, drop_rrp);
++	mlx5e_redirect_rqts(priv, drop_rrp, rx_ptp_support ? &drop_rrp : NULL);
+ }
+ 
+ static const struct mlx5e_tirc_config tirc_default_config[MLX5E_NUM_INDIR_TIRS] = {
+@@ -4949,10 +4966,18 @@ static int mlx5e_init_nic_rx(struct mlx5e_priv *priv)
+ 	if (unlikely(err))
+ 		goto err_destroy_xsk_rqts;
+ 
++	err = mlx5e_create_direct_rqts(priv, &priv->ptp_tir, 1);
++	if (err)
++		goto err_destroy_xsk_tirs;
++
++	err = mlx5e_create_direct_tirs(priv, &priv->ptp_tir, 1);
++	if (err)
++		goto err_destroy_ptp_rqt;
++
+ 	err = mlx5e_create_flow_steering(priv);
+ 	if (err) {
+ 		mlx5_core_warn(mdev, "create flow steering failed, %d\n", err);
+-		goto err_destroy_xsk_tirs;
++		goto err_destroy_ptp_direct_tir;
+ 	}
+ 
+ 	err = mlx5e_tc_nic_init(priv);
+@@ -4973,6 +4998,10 @@ static int mlx5e_init_nic_rx(struct mlx5e_priv *priv)
+ 	mlx5e_tc_nic_cleanup(priv);
+ err_destroy_flow_steering:
+ 	mlx5e_destroy_flow_steering(priv);
++err_destroy_ptp_direct_tir:
++	mlx5e_destroy_direct_tirs(priv, &priv->ptp_tir, 1);
++err_destroy_ptp_rqt:
++	mlx5e_destroy_direct_rqts(priv, &priv->ptp_tir, 1);
+ err_destroy_xsk_tirs:
+ 	mlx5e_destroy_direct_tirs(priv, priv->xsk_tir, max_nch);
+ err_destroy_xsk_rqts:
+@@ -4999,6 +5028,8 @@ static void mlx5e_cleanup_nic_rx(struct mlx5e_priv *priv)
+ 	mlx5e_accel_cleanup_rx(priv);
+ 	mlx5e_tc_nic_cleanup(priv);
+ 	mlx5e_destroy_flow_steering(priv);
++	mlx5e_destroy_direct_tirs(priv, &priv->ptp_tir, 1);
++	mlx5e_destroy_direct_rqts(priv, &priv->ptp_tir, 1);
+ 	mlx5e_destroy_direct_tirs(priv, priv->xsk_tir, max_nch);
+ 	mlx5e_destroy_direct_rqts(priv, priv->xsk_tir, max_nch);
+ 	mlx5e_destroy_direct_tirs(priv, priv->direct_tir, max_nch);
+@@ -5111,6 +5142,7 @@ static const struct mlx5e_profile mlx5e_nic_profile = {
+ 	.rq_groups	   = MLX5E_NUM_RQ_GROUPS(XSK),
+ 	.stats_grps	   = mlx5e_nic_stats_grps,
+ 	.stats_grps_num	   = mlx5e_nic_stats_grps_num,
++	.rx_ptp_support    = true,
+ };
+ 
+ /* mlx5e generic netdev management API (move to en_common.c) */
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index eac066e6462b..1ae5229b3a65 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -1075,6 +1075,7 @@ static const struct mlx5e_profile mlx5e_rep_profile = {
+ 	.rq_groups		= MLX5E_NUM_RQ_GROUPS(REGULAR),
+ 	.stats_grps		= mlx5e_rep_stats_grps,
+ 	.stats_grps_num		= mlx5e_rep_stats_grps_num,
++	.rx_ptp_support		= false,
+ };
+ 
+ static const struct mlx5e_profile mlx5e_uplink_rep_profile = {
+@@ -1095,6 +1096,7 @@ static const struct mlx5e_profile mlx5e_uplink_rep_profile = {
+ 	.rq_groups		= MLX5E_NUM_RQ_GROUPS(XSK),
+ 	.stats_grps		= mlx5e_ul_rep_stats_grps,
+ 	.stats_grps_num		= mlx5e_ul_rep_stats_grps_num,
++	.rx_ptp_support		= false,
+ };
+ 
+ /* e-Switch vport representors */
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+index e73e098ed210..e8d73c8c890d 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@ -473,6 +473,7 @@ static const struct mlx5e_profile mlx5i_nic_profile = {
+ 	.rq_groups	   = MLX5E_NUM_RQ_GROUPS(REGULAR),
+ 	.stats_grps        = mlx5i_stats_grps,
+ 	.stats_grps_num    = mlx5i_stats_grps_num,
++	.rx_ptp_support    = false,
+ };
+ 
+ /* mlx5i netdev NDos */
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
+index 3d0a18a0bed4..18ee21b06a00 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
+@@ -350,6 +350,7 @@ static const struct mlx5e_profile mlx5i_pkey_nic_profile = {
+ 	.rx_handlers       = &mlx5i_rx_handlers,
+ 	.max_tc		   = MLX5I_MAX_NUM_TC,
+ 	.rq_groups	   = MLX5E_NUM_RQ_GROUPS(REGULAR),
++	.rx_ptp_support	   = false,
+ };
+ 
+ const struct mlx5e_profile *mlx5i_pkey_get_profile(void)
