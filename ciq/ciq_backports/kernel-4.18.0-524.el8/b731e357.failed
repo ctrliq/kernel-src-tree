@@ -1,0 +1,185 @@
+mm/slub: fix a slab missed to be freed problem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-524.el8
+commit-author Feng Tang <feng.tang@intel.com>
+commit b731e3575f7a45a46512708f9fdf953b40c46a53
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-524.el8/b731e357.failed
+
+When enable kasan and kfence's in-kernel kunit test with slub_debug on,
+it caught a problem (in linux-next tree):
+
+ ------------[ cut here ]------------
+ kmem_cache_destroy test: Slab cache still has objects when called from test_exit+0x1a/0x30
+ WARNING: CPU: 3 PID: 240 at mm/slab_common.c:492 kmem_cache_destroy+0x16c/0x170
+ Modules linked in:
+ CPU: 3 PID: 240 Comm: kunit_try_catch Tainted: G    B            N 6.0.0-rc7-next-20220929 #52
+ Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.15.0-1 04/01/2014
+ RIP: 0010:kmem_cache_destroy+0x16c/0x170
+ Code: 41 5c 41 5d e9 a5 04 0b 00 c3 cc cc cc cc 48 8b 55 60 48 8b 4c 24 20 48 c7 c6 40 37 d2 82 48 c7 c7 e8 a0 33 83 e8 4e d7 14 01 <0f> 0b eb a7 41 56 41 89 d6 41 55 49 89 f5 41 54 49 89 fc 55 48 89
+ RSP: 0000:ffff88800775fea0 EFLAGS: 00010282
+ RAX: 0000000000000000 RBX: ffffffff83bdec48 RCX: 0000000000000000
+ RDX: 0000000000000001 RSI: 1ffff11000eebf9e RDI: ffffed1000eebfc6
+ RBP: ffff88804362fa00 R08: ffffffff81182e58 R09: ffff88800775fbdf
+ R10: ffffed1000eebf7b R11: 0000000000000001 R12: 000000008c800d00
+ R13: ffff888005e78040 R14: 0000000000000000 R15: ffff888005cdfad0
+ FS:  0000000000000000(0000) GS:ffff88807ed00000(0000) knlGS:0000000000000000
+ CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ CR2: 0000000000000000 CR3: 000000000360e001 CR4: 0000000000370ee0
+ DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+ DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+ Call Trace:
+  <TASK>
+  test_exit+0x1a/0x30
+  kunit_try_run_case+0xad/0xc0
+  kunit_generic_run_threadfn_adapter+0x26/0x50
+  kthread+0x17b/0x1b0
+
+It was biscted to commit c7323a5ad078 ("mm/slub: restrict sysfs
+validation to debug caches and make it safe")
+
+The problem is inside free_debug_processing(), under certain
+circumstances the slab can be removed from the partial list but not
+freed by discard_slab() and thus n->nr_slabs is not decreased
+accordingly. During shutdown, this non-zero n->nr_slabs is detected and
+reported.
+
+Specifically, the problem is that there are two checks for detecting a
+full partial list by comparing n->nr_partial >= s->min_partial where the
+latter check is affected by remove_partial() decreasing n->nr_partial
+between the checks. Reoganize the code so there is a single check
+upfront.
+
+Link: https://lore.kernel.org/all/20220930100730.250248-1-feng.tang@intel.com/
+Fixes: c7323a5ad078 ("mm/slub: restrict sysfs validation to debug caches and make it safe")
+	Signed-off-by: Feng Tang <feng.tang@intel.com>
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+(cherry picked from commit b731e3575f7a45a46512708f9fdf953b40c46a53)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slub.c
+diff --cc mm/slub.c
+index 4ece4a8929e7,90010407d17a..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -2724,6 -2768,113 +2724,116 @@@ static inline unsigned long node_nr_obj
+  {
+  	return atomic_long_read(&n->total_objects);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /* Supports checking bulk free of a constructed freelist */
++ static noinline void free_debug_processing(
++ 	struct kmem_cache *s, struct slab *slab,
++ 	void *head, void *tail, int bulk_cnt,
++ 	unsigned long addr)
++ {
++ 	struct kmem_cache_node *n = get_node(s, slab_nid(slab));
++ 	struct slab *slab_free = NULL;
++ 	void *object = head;
++ 	int cnt = 0;
++ 	unsigned long flags;
++ 	bool checks_ok = false;
++ 	depot_stack_handle_t handle = 0;
++ 
++ 	if (s->flags & SLAB_STORE_USER)
++ 		handle = set_track_prepare();
++ 
++ 	spin_lock_irqsave(&n->list_lock, flags);
++ 
++ 	if (s->flags & SLAB_CONSISTENCY_CHECKS) {
++ 		if (!check_slab(s, slab))
++ 			goto out;
++ 	}
++ 
++ 	if (slab->inuse < bulk_cnt) {
++ 		slab_err(s, slab, "Slab has %d allocated objects but %d are to be freed\n",
++ 			 slab->inuse, bulk_cnt);
++ 		goto out;
++ 	}
++ 
++ next_object:
++ 
++ 	if (++cnt > bulk_cnt)
++ 		goto out_cnt;
++ 
++ 	if (s->flags & SLAB_CONSISTENCY_CHECKS) {
++ 		if (!free_consistency_checks(s, slab, object, addr))
++ 			goto out;
++ 	}
++ 
++ 	if (s->flags & SLAB_STORE_USER)
++ 		set_track_update(s, object, TRACK_FREE, addr, handle);
++ 	trace(s, slab, object, 0);
++ 	/* Freepointer not overwritten by init_object(), SLAB_POISON moved it */
++ 	init_object(s, object, SLUB_RED_INACTIVE);
++ 
++ 	/* Reached end of constructed freelist yet? */
++ 	if (object != tail) {
++ 		object = get_freepointer(s, object);
++ 		goto next_object;
++ 	}
++ 	checks_ok = true;
++ 
++ out_cnt:
++ 	if (cnt != bulk_cnt)
++ 		slab_err(s, slab, "Bulk free expected %d objects but found %d\n",
++ 			 bulk_cnt, cnt);
++ 
++ out:
++ 	if (checks_ok) {
++ 		void *prior = slab->freelist;
++ 
++ 		/* Perform the actual freeing while we still hold the locks */
++ 		slab->inuse -= cnt;
++ 		set_freepointer(s, tail, prior);
++ 		slab->freelist = head;
++ 
++ 		/*
++ 		 * If the slab is empty, and node's partial list is full,
++ 		 * it should be discarded anyway no matter it's on full or
++ 		 * partial list.
++ 		 */
++ 		if (slab->inuse == 0 && n->nr_partial >= s->min_partial)
++ 			slab_free = slab;
++ 
++ 		if (!prior) {
++ 			/* was on full list */
++ 			remove_full(s, n, slab);
++ 			if (!slab_free) {
++ 				add_partial(n, slab, DEACTIVATE_TO_TAIL);
++ 				stat(s, FREE_ADD_PARTIAL);
++ 			}
++ 		} else if (slab_free) {
++ 			remove_partial(n, slab);
++ 			stat(s, FREE_REMOVE_PARTIAL);
++ 		}
++ 	}
++ 
++ 	if (slab_free) {
++ 		/*
++ 		 * Update the counters while still holding n->list_lock to
++ 		 * prevent spurious validation warnings
++ 		 */
++ 		dec_slabs_node(s, slab_nid(slab_free), slab_free->objects);
++ 	}
++ 
++ 	spin_unlock_irqrestore(&n->list_lock, flags);
++ 
++ 	if (!checks_ok)
++ 		slab_fix(s, "Object at 0x%p not freed", object);
++ 
++ 	if (slab_free) {
++ 		stat(s, FREE_SLAB);
++ 		free_slab(s, slab_free);
++ 	}
++ }
+++>>>>>>> b731e3575f7a (mm/slub: fix a slab missed to be freed problem)
+  #endif /* CONFIG_SLUB_DEBUG */
+  
+  #if defined(CONFIG_SLUB_DEBUG) || defined(CONFIG_SYSFS)
+* Unmerged path mm/slub.c
