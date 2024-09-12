@@ -1,0 +1,284 @@
+tty: n_gsm: fix deadlock and link starvation in outgoing data path
+
+jira LE-1907
+cve CVE-2023-6546
+Rebuild_History Non-Buildable kernel-4.18.0-541.el8
+commit-author Daniel Starke <daniel.starke@siemens.com>
+commit 0af021678d5d30c31f5a6b631f404ead3575212a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-541.el8/0af02167.failed
+
+The current implementation queues up new control and user packets as needed
+and processes this queue down to the ldisc in the same code path.
+That means that the upper and the lower layer are hard coupled in the code.
+Due to this deadlocks can happen as seen below while transmitting data,
+especially during ldisc congestion. Furthermore, the data channels starve
+the control channel on high transmission load on the ldisc.
+
+Introduce an additional control channel data queue to prevent timeouts and
+link hangups during ldisc congestion. This is being processed before the
+user channel data queue in gsm_data_kick(), i.e. with the highest priority.
+Put the queue to ldisc data path into a workqueue and trigger it whenever
+new data has been put into the transmission queue. Change
+gsm_dlci_data_sweep() accordingly to fill up the transmission queue until
+TX_THRESH_HI. This solves the locking issue, keeps latency low and provides
+good performance on high data load.
+Note that now all packets from a DLCI are removed from the internal queue
+if the associated DLCI was closed. This ensures that no data is sent by the
+introduced write task to an already closed DLCI.
+
+BUG: spinlock recursion on CPU#0, test_v24_loop/124
+ lock: serial8250_ports+0x3a8/0x7500, .magic: dead4ead, .owner: test_v24_loop/124, .owner_cpu: 0
+CPU: 0 PID: 124 Comm: test_v24_loop Tainted: G           O      5.18.0-rc2 #3
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.15.0-1 04/01/2014
+Call Trace:
+ <IRQ>
+ dump_stack_lvl+0x34/0x44
+ do_raw_spin_lock+0x76/0xa0
+ _raw_spin_lock_irqsave+0x72/0x80
+ uart_write_room+0x3b/0xc0
+ gsm_data_kick+0x14b/0x240 [n_gsm]
+ gsmld_write_wakeup+0x35/0x70 [n_gsm]
+ tty_wakeup+0x53/0x60
+ tty_port_default_wakeup+0x1b/0x30
+ serial8250_tx_chars+0x12f/0x220
+ serial8250_handle_irq.part.0+0xfe/0x150
+ serial8250_default_handle_irq+0x48/0x80
+ serial8250_interrupt+0x56/0xa0
+ __handle_irq_event_percpu+0x78/0x1f0
+ handle_irq_event+0x34/0x70
+ handle_fasteoi_irq+0x90/0x1e0
+ __common_interrupt+0x69/0x100
+ common_interrupt+0x48/0xc0
+ asm_common_interrupt+0x1e/0x40
+RIP: 0010:__do_softirq+0x83/0x34e
+Code: 2a 0a ff 0f b7 ed c7 44 24 10 0a 00 00 00 48 c7 c7 51 2a 64 82 e8 2d
+e2 d5 ff 65 66 c7 05 83 af 1e 7e 00 00 fb b8 ff ff ff ff <49> c7 c2 40 61
+80 82 0f bc c5 41 89 c4 41 83 c4 01 0f 84 e6 00 00
+RSP: 0018:ffffc90000003f98 EFLAGS: 00000286
+RAX: 00000000ffffffff RBX: 0000000000000000 RCX: 0000000000000000
+RDX: 0000000000000000 RSI: ffffffff82642a51 RDI: ffffffff825bb5e7
+RBP: 0000000000000200 R08: 00000008de3271a8 R09: 0000000000000000
+R10: 0000000000000001 R11: 0000000000000000 R12: 0000000000000000
+R13: 0000000000000030 R14: 0000000000000000 R15: 0000000000000000
+ ? __do_softirq+0x73/0x34e
+ irq_exit_rcu+0xb5/0x100
+ common_interrupt+0xa4/0xc0
+ </IRQ>
+ <TASK>
+ asm_common_interrupt+0x1e/0x40
+RIP: 0010:_raw_spin_unlock_irqrestore+0x2e/0x50
+Code: 00 55 48 89 fd 48 83 c7 18 53 48 89 f3 48 8b 74 24 10 e8 85 28 36 ff
+48 89 ef e8 cd 58 36 ff 80 e7 02 74 01 fb bf 01 00 00 00 <e8> 3d 97 33 ff
+65 8b 05 96 23 2b 7e 85 c0 74 03 5b 5d c3 0f 1f 44
+RSP: 0018:ffffc9000020fd08 EFLAGS: 00000202
+RAX: 0000000000000000 RBX: 0000000000000246 RCX: 0000000000000000
+RDX: 0000000000000004 RSI: ffffffff8257fd74 RDI: 0000000000000001
+RBP: ffff8880057de3a0 R08: 00000008de233000 R09: 0000000000000000
+R10: 0000000000000001 R11: 0000000000000000 R12: 0000000000000000
+R13: 0000000000000100 R14: 0000000000000202 R15: ffff8880057df0b8
+ ? _raw_spin_unlock_irqrestore+0x23/0x50
+ gsmtty_write+0x65/0x80 [n_gsm]
+ n_tty_write+0x33f/0x530
+ ? swake_up_all+0xe0/0xe0
+ file_tty_write.constprop.0+0x1b1/0x320
+ ? n_tty_flush_buffer+0xb0/0xb0
+ new_sync_write+0x10c/0x190
+ vfs_write+0x282/0x310
+ ksys_write+0x68/0xe0
+ do_syscall_64+0x3b/0x90
+ entry_SYSCALL_64_after_hwframe+0x44/0xae
+RIP: 0033:0x7f3e5e35c15c
+Code: 8b 7c 24 08 89 c5 e8 c5 ff ff ff 89 ef 89 44 24 08 e8 58 bc 02 00 8b
+44 24 08 48 83 c4 10 5d c3 48 63 ff b8 01 00 00 00 0f 05 <48> 3d 00 f0 ff
+ff 76 10 48 8b 15 fd fc 05 00 f7 d8 64 89 02 48 83
+RSP: 002b:00007ffcee77cd18 EFLAGS: 00000246 ORIG_RAX: 0000000000000001
+RAX: ffffffffffffffda RBX: 00007ffcee77cd70 RCX: 00007f3e5e35c15c
+RDX: 0000000000000100 RSI: 00007ffcee77cd90 RDI: 0000000000000003
+RBP: 0000000000000100 R08: 0000000000000000 R09: 7efefefefefefeff
+R10: 00007f3e5e3bddeb R11: 0000000000000246 R12: 00007ffcee77ce8f
+R13: 0000000000000001 R14: 000056214404e010 R15: 00007ffcee77cd90
+ </TASK>
+
+Fixes: e1eaea46bb40 ("tty: n_gsm line discipline")
+	Signed-off-by: Daniel Starke <daniel.starke@siemens.com>
+Link: https://lore.kernel.org/r/20220701122332.2039-1-daniel.starke@siemens.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 0af021678d5d30c31f5a6b631f404ead3575212a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/n_gsm.c
+diff --cc drivers/tty/n_gsm.c
+index 8ea93c6da6cd,79869f2b570c..000000000000
+--- a/drivers/tty/n_gsm.c
++++ b/drivers/tty/n_gsm.c
+@@@ -238,9 -252,11 +249,10 @@@ struct gsm_mux 
+  	unsigned int tx_bytes;		/* TX data outstanding */
+  #define TX_THRESH_HI		8192
+  #define TX_THRESH_LO		2048
+- 	struct list_head tx_list;	/* Pending data packets */
++ 	struct list_head tx_ctrl_list;	/* Pending control packets */
++ 	struct list_head tx_data_list;	/* Pending data packets */
+  
+  	/* Control messages */
+ -	struct timer_list kick_timer;	/* Kick TX queuing on timeout */
+  	struct timer_list t2_timer;	/* Retransmit timer for commands */
+  	int cretries;			/* Command retry counter */
+  	struct gsm_control *pending_cmd;/* Our current pending command */
+@@@ -896,9 -994,22 +990,26 @@@ static void __gsm_data_queue(struct gsm
+  	msg->data = dp;
+  
+  	/* Add to the actual output queue */
+- 	list_add_tail(&msg->list, &gsm->tx_list);
++ 	switch (msg->ctrl & ~PF) {
++ 	case UI:
++ 	case UIH:
++ 		if (msg->addr > 0) {
++ 			list_add_tail(&msg->list, &gsm->tx_data_list);
++ 			break;
++ 		}
++ 		fallthrough;
++ 	default:
++ 		list_add_tail(&msg->list, &gsm->tx_ctrl_list);
++ 		break;
++ 	}
+  	gsm->tx_bytes += msg->len;
+++<<<<<<< HEAD
+ +	gsm_data_kick(gsm, dlci);
+++=======
++ 
++ 	gsmld_write_trigger(gsm);
++ 	mod_timer(&gsm->kick_timer, jiffies + 10 * gsm->t1 * HZ / 100);
+++>>>>>>> 0af021678d5d (tty: n_gsm: fix deadlock and link starvation in outgoing data path)
+  }
+  
+  /**
+@@@ -1118,32 -1233,43 +1229,54 @@@ static int gsm_dlci_modem_output(struc
+   *	renegotiate DLCI priorities with optional stuff. Needs optimising.
+   */
+  
+ -static int gsm_dlci_data_sweep(struct gsm_mux *gsm)
+ +static void gsm_dlci_data_sweep(struct gsm_mux *gsm)
+  {
+++<<<<<<< HEAD
+ +	int len;
+++=======
+++>>>>>>> 0af021678d5d (tty: n_gsm: fix deadlock and link starvation in outgoing data path)
+  	/* Priority ordering: We should do priority with RR of the groups */
+- 	int i = 1;
+- 
+- 	while (i < NUM_DLCI) {
+- 		struct gsm_dlci *dlci;
++ 	int i, len, ret = 0;
++ 	bool sent;
++ 	struct gsm_dlci *dlci;
+  
+- 		if (gsm->tx_bytes > TX_THRESH_HI)
+- 			break;
+- 		dlci = gsm->dlci[i];
+- 		if (dlci == NULL || dlci->constipated) {
+- 			i++;
+- 			continue;
++ 	while (gsm->tx_bytes < TX_THRESH_HI) {
++ 		for (sent = false, i = 1; i < NUM_DLCI; i++) {
++ 			dlci = gsm->dlci[i];
++ 			/* skip unused or blocked channel */
++ 			if (!dlci || dlci->constipated)
++ 				continue;
++ 			/* skip channels with invalid state */
++ 			if (dlci->state != DLCI_OPEN)
++ 				continue;
++ 			/* count the sent data per adaption */
++ 			if (dlci->adaption < 3 && !dlci->net)
++ 				len = gsm_dlci_data_output(gsm, dlci);
++ 			else
++ 				len = gsm_dlci_data_output_framed(gsm, dlci);
++ 			/* on error exit */
++ 			if (len < 0)
++ 				return ret;
++ 			if (len > 0) {
++ 				ret++;
++ 				sent = true;
++ 				/* The lower DLCs can starve the higher DLCs! */
++ 				break;
++ 			}
++ 			/* try next */
+  		}
+- 		if (dlci->adaption < 3 && !dlci->net)
+- 			len = gsm_dlci_data_output(gsm, dlci);
+- 		else
+- 			len = gsm_dlci_data_output_framed(gsm, dlci);
+- 		if (len < 0)
++ 		if (!sent)
+  			break;
+++<<<<<<< HEAD
+ +		/* DLCI empty - try the next */
+ +		if (len == 0)
+ +			i++;
+ +	}
+++=======
++ 	};
++ 
++ 	return ret;
+++>>>>>>> 0af021678d5d (tty: n_gsm: fix deadlock and link starvation in outgoing data path)
+  }
+  
+  /**
+@@@ -1624,12 -1747,16 +1754,20 @@@ static void gsm_dlci_close(struct gsm_d
+  	dlci->constipated = true;
+  	if (dlci->addr != 0) {
+  		tty_port_tty_hangup(&dlci->port, false);
+++<<<<<<< HEAD
+ +		kfifo_reset(dlci->fifo);
+++=======
++ 		gsm_dlci_clear_queues(dlci->gsm, dlci);
++ 		/* Ensure that gsmtty_open() can return. */
++ 		tty_port_set_initialized(&dlci->port, 0);
++ 		wake_up_interruptible(&dlci->port.open_wait);
+++>>>>>>> 0af021678d5d (tty: n_gsm: fix deadlock and link starvation in outgoing data path)
+  	} else
+  		dlci->gsm->dead = true;
+- 	wake_up(&dlci->gsm->event);
+  	/* A DLCI 0 close is a MUX termination so we need to kick that
+  	   back to userspace somehow */
++ 	gsm_dlci_data_kick(dlci);
++ 	wake_up(&dlci->gsm->event);
+  }
+  
+  /**
+@@@ -2308,8 -2458,12 +2447,11 @@@ static void gsm_cleanup_mux(struct gsm_
+  	}
+  
+  	/* Finish outstanding timers, making sure they are done */
+ -	del_timer_sync(&gsm->kick_timer);
+  	del_timer_sync(&gsm->t2_timer);
+  
++ 	/* Finish writing to ldisc */
++ 	flush_work(&gsm->tx_work);
++ 
+  	/* Free up any link layer users and finally the control channel */
+  	if (gsm->has_devices) {
+  		gsm_unregister_devices(gsm_tty_driver, gsm->num);
+@@@ -2340,7 -2497,9 +2485,8 @@@ static int gsm_activate_mux(struct gsm_
+  	struct gsm_dlci *dlci;
+  	int ret;
+  
+ -	timer_setup(&gsm->kick_timer, gsm_kick_timer, 0);
+  	timer_setup(&gsm->t2_timer, gsm_control_retransmit, 0);
++ 	INIT_WORK(&gsm->tx_work, gsmld_write_task);
+  	init_waitqueue_head(&gsm->event);
+  	spin_lock_init(&gsm->control_lock);
+  	spin_lock_init(&gsm->tx_lock);
+@@@ -2740,7 -2945,9 +2928,8 @@@ static int gsmld_open(struct tty_struc
+  
+  	gsmld_attach_gsm(tty, gsm);
+  
+ -	timer_setup(&gsm->kick_timer, gsm_kick_timer, 0);
+  	timer_setup(&gsm->t2_timer, gsm_control_retransmit, 0);
++ 	INIT_WORK(&gsm->tx_work, gsmld_write_task);
+  
+  	return 0;
+  }
+* Unmerged path drivers/tty/n_gsm.c
