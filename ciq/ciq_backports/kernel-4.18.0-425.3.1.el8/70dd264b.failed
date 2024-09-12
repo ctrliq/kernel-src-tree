@@ -1,0 +1,148 @@
+spi: Create helper API to lookup ACPI info for spi device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Stefan Binding <sbinding@opensource.cirrus.com>
+commit 70dd264bc07aee4f89e65138db11e908701388dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/70dd264b.failed
+
+This can then be used to find a spi resource inside an
+ACPI node, and allocate a spi device.
+
+	Signed-off-by: Stefan Binding <sbinding@opensource.cirrus.com>
+	Reviewed-by: Hans de Goede <hdegoede@redhat.com>
+Link: https://lore.kernel.org/r/20220121172431.6876-3-sbinding@opensource.cirrus.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 70dd264bc07aee4f89e65138db11e908701388dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/spi/spi.h
+diff --cc include/linux/spi/spi.h
+index 79184c5b5147,d159cef12f1a..000000000000
+--- a/include/linux/spi/spi.h
++++ b/include/linux/spi/spi.h
+@@@ -14,8 -15,12 +14,14 @@@
+  #include <linux/scatterlist.h>
+  #include <linux/gpio/consumer.h>
+  
+++<<<<<<< HEAD
+++=======
++ #include <uapi/linux/spi/spi.h>
++ #include <linux/acpi.h>
++ 
+++>>>>>>> 70dd264bc07a (spi: Create helper API to lookup ACPI info for spi device)
+  struct dma_chan;
+ -struct software_node;
+ -struct ptp_system_timestamp;
+ +struct property_entry;
+  struct spi_controller;
+  struct spi_transfer;
+  struct spi_controller_mem_ops;
+@@@ -660,7 -760,10 +666,14 @@@ extern int devm_spi_register_controller
+  					struct spi_controller *ctlr);
+  extern void spi_unregister_controller(struct spi_controller *ctlr);
+  
+++<<<<<<< HEAD
+ +extern struct spi_controller *spi_busnum_to_master(u16 busnum);
+++=======
++ #if IS_ENABLED(CONFIG_ACPI)
++ extern struct spi_device *acpi_spi_device_alloc(struct spi_controller *ctlr,
++ 						struct acpi_device *adev);
++ #endif
+++>>>>>>> 70dd264bc07a (spi: Create helper API to lookup ACPI info for spi device)
+  
+  /*
+   * SPI resource management while processing a SPI message
+diff --git a/drivers/spi/spi.c b/drivers/spi/spi.c
+index d00029dc7264..1bb42410cfe2 100644
+--- a/drivers/spi/spi.c
++++ b/drivers/spi/spi.c
+@@ -1895,8 +1895,18 @@ static int acpi_spi_add_resource(struct acpi_resource *ares, void *data)
+ 	return 1;
+ }
+ 
+-static acpi_status acpi_register_spi_device(struct spi_controller *ctlr,
+-					    struct acpi_device *adev)
++/**
++ * acpi_spi_device_alloc - Allocate a spi device, and fill it in with ACPI information
++ * @ctlr: controller to which the spi device belongs
++ * @adev: ACPI Device for the spi device
++ *
++ * This should be used to allocate a new spi device from and ACPI Node.
++ * The caller is responsible for calling spi_add_device to register the spi device.
++ *
++ * Return: a pointer to the new device, or ERR_PTR on error.
++ */
++struct spi_device *acpi_spi_device_alloc(struct spi_controller *ctlr,
++					 struct acpi_device *adev)
+ {
+ 	acpi_handle parent_handle = NULL;
+ 	struct list_head resource_list;
+@@ -1904,10 +1914,6 @@ static acpi_status acpi_register_spi_device(struct spi_controller *ctlr,
+ 	struct spi_device *spi;
+ 	int ret;
+ 
+-	if (acpi_bus_get_status(adev) || !adev->status.present ||
+-	    acpi_device_enumerated(adev))
+-		return AE_OK;
+-
+ 	lookup.ctlr		= ctlr;
+ 	lookup.mode		= 0;
+ 	lookup.bits_per_word	= 0;
+@@ -1920,7 +1926,7 @@ static acpi_status acpi_register_spi_device(struct spi_controller *ctlr,
+ 
+ 	if (ret < 0)
+ 		/* found SPI in _CRS but it points to another controller */
+-		return AE_OK;
++		return ERR_PTR(-ENODEV);
+ 
+ 	if (!lookup.max_speed_hz &&
+ 	    !ACPI_FAILURE(acpi_get_parent(adev->handle, &parent_handle)) &&
+@@ -1930,13 +1936,13 @@ static acpi_status acpi_register_spi_device(struct spi_controller *ctlr,
+ 	}
+ 
+ 	if (!lookup.max_speed_hz)
+-		return AE_OK;
++		return ERR_PTR(-ENODEV);
+ 
+ 	spi = spi_alloc_device(ctlr);
+ 	if (!spi) {
+ 		dev_err(&ctlr->dev, "failed to allocate SPI device for %s\n",
+ 			dev_name(&adev->dev));
+-		return AE_NO_MEMORY;
++		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+ 	ACPI_COMPANION_SET(&spi->dev, adev);
+@@ -1946,6 +1952,27 @@ static acpi_status acpi_register_spi_device(struct spi_controller *ctlr,
+ 	spi->bits_per_word	= lookup.bits_per_word;
+ 	spi->chip_select	= lookup.chip_select;
+ 
++	return spi;
++}
++EXPORT_SYMBOL_GPL(acpi_spi_device_alloc);
++
++static acpi_status acpi_register_spi_device(struct spi_controller *ctlr,
++					    struct acpi_device *adev)
++{
++	struct spi_device *spi;
++
++	if (acpi_bus_get_status(adev) || !adev->status.present ||
++	    acpi_device_enumerated(adev))
++		return AE_OK;
++
++	spi = acpi_spi_device_alloc(ctlr, adev);
++	if (IS_ERR(spi)) {
++		if (PTR_ERR(spi) == -ENOMEM)
++			return AE_NO_MEMORY;
++		else
++			return AE_OK;
++	}
++
+ 	acpi_set_modalias(adev, acpi_device_hid(adev), spi->modalias,
+ 			  sizeof(spi->modalias));
+ 
+* Unmerged path include/linux/spi/spi.h
