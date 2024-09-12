@@ -42,7 +42,7 @@ struct subsys_private {
 	struct kset glue_dirs;
 	struct class *class;
 };
-#define to_subsys_private(obj) container_of(obj, struct subsys_private, subsys.kobj)
+#define to_subsys_private(obj) container_of_const(obj, struct subsys_private, subsys.kobj)
 
 struct driver_private {
 	struct kobject kobj;
