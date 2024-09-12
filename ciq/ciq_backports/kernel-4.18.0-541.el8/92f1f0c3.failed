@@ -1,0 +1,159 @@
+tty: n_gsm: add parameter negotiation support
+
+jira LE-1907
+cve CVE-2023-6546
+Rebuild_History Non-Buildable kernel-4.18.0-541.el8
+commit-author Daniel Starke <daniel.starke@siemens.com>
+commit 92f1f0c3290d994d753dde588698daf1ef91504b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-541.el8/92f1f0c3.failed
+
+n_gsm is based on the 3GPP 07.010 and its newer version is the 3GPP 27.010.
+See https://portal.3gpp.org/desktopmodules/Specifications/SpecificationDetails.aspx?specificationId=1516
+The changes from 07.010 to 27.010 are non-functional. Therefore, I refer to
+the newer 27.010 here. Chapter 5.1.8.1.1 describes the parameter negotiation
+messages and parameters. Chapter 5.4.1 states that the default parameters
+are to be used if no negotiation is performed. Chapter 5.4.6.3.1 describes
+the encoding of the parameter negotiation message. The meaning of the
+parameters and allowed value ranges can be found in chapter 5.7.
+
+Add parameter negotiation support accordingly. DLCI specific parameter
+configuration by the user requires additional ioctls. This is subject to
+another patch.
+
+	Signed-off-by: Daniel Starke <daniel.starke@siemens.com>
+	Reviewed-by: Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Link: https://lore.kernel.org/r/20221103091743.2119-3-daniel.starke@siemens.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 92f1f0c3290d994d753dde588698daf1ef91504b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/n_gsm.c
+diff --cc drivers/tty/n_gsm.c
+index f0df02192be6,cde1e846c81e..000000000000
+--- a/drivers/tty/n_gsm.c
++++ b/drivers/tty/n_gsm.c
+@@@ -30,8 -38,10 +30,9 @@@
+  #include <linux/sched/signal.h>
+  #include <linux/interrupt.h>
+  #include <linux/tty.h>
++ #include <linux/bitfield.h>
+  #include <linux/ctype.h>
+  #include <linux/mm.h>
+ -#include <linux/math.h>
+  #include <linux/string.h>
+  #include <linux/slab.h>
+  #include <linux/poll.h>
+@@@ -157,6 -186,35 +159,38 @@@ struct gsm_dlci 
+  	struct net_device *net; /* network interface, if created */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Parameter bits used for parameter negotiation according to 3GPP 27.010
++  * chapter 5.4.6.3.1.
++  */
++ 
++ struct gsm_dlci_param_bits {
++ 	u8 d_bits;
++ 	u8 i_cl_bits;
++ 	u8 p_bits;
++ 	u8 t_bits;
++ 	__le16 n_bits;
++ 	u8 na_bits;
++ 	u8 k_bits;
++ };
++ 
++ static_assert(sizeof(struct gsm_dlci_param_bits) == 8);
++ 
++ #define PN_D_FIELD_DLCI		GENMASK(5, 0)
++ #define PN_I_CL_FIELD_FTYPE	GENMASK(3, 0)
++ #define PN_I_CL_FIELD_ADAPTION	GENMASK(7, 4)
++ #define PN_P_FIELD_PRIO		GENMASK(5, 0)
++ #define PN_T_FIELD_T1		GENMASK(7, 0)
++ #define PN_N_FIELD_N1		GENMASK(15, 0)
++ #define PN_NA_FIELD_N2		GENMASK(7, 0)
++ #define PN_K_FIELD_K		GENMASK(2, 0)
++ 
++ /* Total number of supported devices */
++ #define GSM_TTY_MINORS		256
++ 
+++>>>>>>> 92f1f0c3290d (tty: n_gsm: add parameter negotiation support)
+  /* DLCI 0, 62/63 are special or reserved see gsmtty_open */
+  
+  #define NUM_DLCI		64
+@@@ -366,8 -439,14 +400,9 @@@ static const u8 gsm_fcs8[256] = 
+  #define INIT_FCS	0xFF
+  #define GOOD_FCS	0xCF
+  
++ static void gsm_dlci_close(struct gsm_dlci *dlci);
+  static int gsmld_output(struct gsm_mux *gsm, u8 *data, int len);
+  static int gsm_modem_update(struct gsm_dlci *dlci, u8 brk);
+ -static struct gsm_msg *gsm_data_alloc(struct gsm_mux *gsm, u8 addr, int len,
+ -								u8 ctrl);
+ -static int gsm_send_packet(struct gsm_mux *gsm, struct gsm_msg *msg);
+ -static void gsmld_write_trigger(struct gsm_mux *gsm);
+ -static void gsmld_write_task(struct work_struct *work);
+  
+  /**
+   *	gsm_fcs_add	-	update FCS
+@@@ -1675,9 -2089,36 +1937,35 @@@ static void gsm_dlci_open(struct gsm_dl
+  	wake_up(&dlci->gsm->event);
+  }
+  
++ /**
++  * gsm_dlci_negotiate	-	start parameter negotiation
++  * @dlci: DLCI to open
++  *
++  * Starts the parameter negotiation for the new DLCI. This needs to be done
++  * before the DLCI initialized the channel via SABM.
++  */
++ static int gsm_dlci_negotiate(struct gsm_dlci *dlci)
++ {
++ 	struct gsm_mux *gsm = dlci->gsm;
++ 	struct gsm_dlci_param_bits params;
++ 	int ret;
++ 
++ 	ret = gsm_encode_params(dlci, &params);
++ 	if (ret != 0)
++ 		return ret;
++ 
++ 	/* We cannot asynchronous wait for the command response with
++ 	 * gsm_command() and gsm_control_wait() at this point.
++ 	 */
++ 	ret = gsm_control_command(gsm, CMD_PN, (const u8 *)&params,
++ 				  sizeof(params));
++ 
++ 	return ret;
++ }
++ 
+  /**
+   *	gsm_dlci_t1		-	T1 timer expiry
+ - *	@t: timer contained in the DLCI that opened
+ + *	@dlci: DLCI that opened
+   *
+   *	The T1 timer handles retransmits of control frames (essentially of
+   *	SABM and DISC). We resend the command until the retry count runs out
+@@@ -1696,9 -2137,17 +1984,17 @@@ static void gsm_dlci_t1(struct timer_li
+  	struct gsm_mux *gsm = dlci->gsm;
+  
+  	switch (dlci->state) {
++ 	case DLCI_CONFIGURE:
++ 		if (dlci->retries && gsm_dlci_negotiate(dlci) == 0) {
++ 			dlci->retries--;
++ 			mod_timer(&dlci->t1, jiffies + gsm->t1 * HZ / 100);
++ 		} else {
++ 			gsm_dlci_begin_close(dlci); /* prevent half open link */
++ 		}
++ 		break;
+  	case DLCI_OPENING:
+ +		dlci->retries--;
+  		if (dlci->retries) {
+ -			dlci->retries--;
+  			gsm_command(dlci->gsm, dlci->addr, SABM|PF);
+  			mod_timer(&dlci->t1, jiffies + gsm->t1 * HZ / 100);
+  		} else if (!dlci->addr && gsm->control == (DM | PF)) {
+* Unmerged path drivers/tty/n_gsm.c
