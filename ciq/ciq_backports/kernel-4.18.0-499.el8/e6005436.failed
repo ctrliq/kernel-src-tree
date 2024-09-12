@@ -1,0 +1,88 @@
+NFS: Don't report ENOSPC write errors twice
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-499.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit e6005436f6cc9ed13288f936903f0151e5543485
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-499.el8/e6005436.failed
+
+Any errors reported by the write() system call need to be cleared from
+the file descriptor's error tracking. The current call to nfs_wb_all()
+causes the error to be reported, but since it doesn't call
+file_check_and_advance_wb_err(), we can end up reporting the same error
+a second time when the application calls fsync().
+
+Note that since Linux 4.13, the rule is that EIO may be reported for
+write(), but it must be reported by a subsequent fsync(), so let's just
+drop reporting it in write.
+
+The check for nfs_ctx_key_to_expire() is just a duplicate to the one
+already in nfs_write_end(), so let's drop that too.
+
+	Reported-by: ChenXiaoSong <chenxiaosong2@huawei.com>
+Fixes: ce368536dd61 ("nfs: nfs_file_write() should check for writeback errors")
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit e6005436f6cc9ed13288f936903f0151e5543485)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/file.c
+diff --cc fs/nfs/file.c
+index c4480266d4a3,87e4cd5e8fe2..000000000000
+--- a/fs/nfs/file.c
++++ b/fs/nfs/file.c
+@@@ -648,19 -644,40 +636,43 @@@ ssize_t nfs_file_write(struct kiocb *io
+  
+  	written = result;
+  	iocb->ki_pos += written;
+++<<<<<<< HEAD
+++=======
++ 	nfs_add_stats(inode, NFSIOS_NORMALWRITTENBYTES, written);
++ 
++ 	if (mntflags & NFS_MOUNT_WRITE_EAGER) {
++ 		result = filemap_fdatawrite_range(file->f_mapping,
++ 						  iocb->ki_pos - written,
++ 						  iocb->ki_pos - 1);
++ 		if (result < 0)
++ 			goto out;
++ 	}
++ 	if (mntflags & NFS_MOUNT_WRITE_WAIT) {
++ 		result = filemap_fdatawait_range(file->f_mapping,
++ 						 iocb->ki_pos - written,
++ 						 iocb->ki_pos - 1);
++ 		if (result < 0)
++ 			goto out;
++ 	}
+++>>>>>>> e6005436f6cc (NFS: Don't report ENOSPC write errors twice)
+  	result = generic_write_sync(iocb, written);
+  	if (result < 0)
+- 		goto out;
++ 		return result;
+  
++ out:
+  	/* Return error values */
+  	error = filemap_check_wb_err(file->f_mapping, since);
+- 	if (nfs_need_check_write(file, inode, error)) {
+- 		int err = nfs_wb_all(inode);
+- 		if (err < 0)
+- 			result = err;
++ 	switch (error) {
++ 	default:
++ 		break;
++ 	case -EDQUOT:
++ 	case -EFBIG:
++ 	case -ENOSPC:
++ 		nfs_wb_all(inode);
++ 		error = file_check_and_advance_wb_err(file);
++ 		if (error < 0)
++ 			result = error;
+  	}
+- 	nfs_add_stats(inode, NFSIOS_NORMALWRITTENBYTES, written);
+- out:
+  	return result;
+  
+  out_swapfile:
+* Unmerged path fs/nfs/file.c
