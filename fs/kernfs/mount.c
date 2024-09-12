@@ -88,9 +88,10 @@ static struct dentry *__kernfs_fh_to_dentry(struct super_block *sb,
 	case FILEID_INO32_GEN:
 	case FILEID_INO32_GEN_PARENT:
 		/*
-		 * blk_log_action() exposes (ino,gen) pair without type and
-		 * userland can call us with generic fid constructed from
-		 * them.  Combine it back to ID.  See blk_log_action().
+		 * blk_log_action() exposes "LOW32,HIGH32" pair without
+		 * type and userland can call us with generic fid
+		 * constructed from them.  Combine it back to ID.  See
+		 * blk_log_action().
 		 */
 		id = ((u64)fid->i32.gen << 32) | fid->i32.ino;
 		break;
@@ -389,18 +390,9 @@ void kernfs_kill_sb(struct super_block *sb)
 
 void __init kernfs_init(void)
 {
-
-	/*
-	 * the slab is freed in RCU context, so kernfs_find_and_get_node_by_ino
-	 * can access the slab lock free. This could introduce stale nodes,
-	 * please see how kernfs_find_and_get_node_by_ino filters out stale
-	 * nodes.
-	 */
 	kernfs_node_cache = kmem_cache_create("kernfs_node_cache",
 					      sizeof(struct kernfs_node),
-					      0,
-					      SLAB_PANIC | SLAB_TYPESAFE_BY_RCU,
-					      NULL);
+					      0, SLAB_PANIC, NULL);
 
 	/* Creates slab cache for kernfs inode attributes */
 	kernfs_iattrs_cache  = kmem_cache_create("kernfs_iattrs_cache",

@@ -110,6 +110,8 @@ static inline int ice_skb_pad(void)
 	(u16)((((R)->next_to_clean > (R)->next_to_use) ? 0 : (R)->count) + \
 	      (R)->next_to_clean - (R)->next_to_use - 1)
 
+#define ICE_RING_QUARTER(R) ((R)->count >> 2)
+
 #define ICE_TX_FLAGS_TSO	BIT(0)
 #define ICE_TX_FLAGS_HW_VLAN	BIT(1)
 #define ICE_TX_FLAGS_SW_VLAN	BIT(2)
@@ -187,6 +189,16 @@ struct ice_rxq_stats {
 	u64 non_eop_descs;
 	u64 alloc_page_failed;
 	u64 alloc_buf_failed;
+};
+
+struct ice_ring_stats {
+	struct rcu_head rcu;	/* to avoid race on free */
+	struct ice_q_stats stats;
+	struct u64_stats_sync syncp;
+	union {
+		struct ice_txq_stats tx_stats;
+		struct ice_rxq_stats rx_stats;
+	};
 };
 
 enum ice_ring_state_t {
@@ -281,9 +293,7 @@ struct ice_rx_ring {
 	u16 rx_buf_len;
 
 	/* stats structs */
-	struct ice_rxq_stats rx_stats;
-	struct ice_q_stats	stats;
-	struct u64_stats_sync syncp;
+	struct ice_ring_stats *ring_stats;
 
 	struct rcu_head rcu;		/* to avoid race on free */
 	/* CL4 - 3rd cacheline starts here */
@@ -323,10 +333,7 @@ struct ice_tx_ring {
 	u16 count;			/* Number of descriptors */
 	u16 q_index;			/* Queue number of ring */
 	/* stats structs */
-	struct ice_q_stats	stats;
-	struct u64_stats_sync syncp;
-	struct ice_txq_stats tx_stats;
-
+	struct ice_ring_stats *ring_stats;
 	/* CL3 - 3rd cacheline starts here */
 	struct rcu_head rcu;		/* to avoid race on free */
 	DECLARE_BITMAP(xps_state, ICE_TX_NBITS);	/* XPS Config State */
@@ -334,6 +341,8 @@ struct ice_tx_ring {
 	struct ice_ptp_tx *tx_tstamps;
 	spinlock_t tx_lock;
 	u32 txq_teid;			/* Added Tx queue TEID */
+	/* CL4 - 4th cacheline starts here */
+	u16 xdp_tx_active;
 #define ICE_TX_FLAGS_RING_XDP		BIT(0)
 #define ICE_TX_FLAGS_RING_VLAN_L2TAG1	BIT(1)
 #define ICE_TX_FLAGS_RING_VLAN_L2TAG2	BIT(2)

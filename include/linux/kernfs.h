@@ -166,8 +166,8 @@ struct kernfs_node {
 	void			*priv;
 
 	/*
-	 * 64bit unique ID.  Lower 32bits carry the inode number and lower
-	 * generation.
+	 * 64bit unique ID.  On 64bit ino setups, id is the ino.  On 32bit,
+	 * the low 32bits are ino and upper generation.
 	 */
 	RH_KABI_REPLACE(union kernfs_node_id	id,
 			u64			id)
@@ -209,8 +209,8 @@ struct kernfs_root {
 
 	/* private fields, do not use outside kernfs proper */
 	struct idr		ino_idr;
-	u32			last_ino;
-	u32			next_generation;
+	u32			RH_KABI_RENAME(next_generation, id_highbits);
+	RH_KABI_FILL_HOLE(u32	last_id_lowbits)
 	struct kernfs_syscall_ops *syscall_ops;
 
 	/* list of kernfs_super_info of this root, protected by kernfs_rwsem */
@@ -317,12 +317,20 @@ static inline enum kernfs_node_type kernfs_type(struct kernfs_node *kn)
 
 static inline ino_t kernfs_id_ino(u64 id)
 {
-	return (u32)id;
+	/* id is ino if ino_t is 64bit; otherwise, low 32bits */
+	if (sizeof(ino_t) >= sizeof(u64))
+		return id;
+	else
+		return (u32)id;
 }
 
 static inline u32 kernfs_id_gen(u64 id)
 {
-	return id >> 32;
+	/* gen is fixed at 1 if ino_t is 64bit; otherwise, high 32bits */
+	if (sizeof(ino_t) >= sizeof(u64))
+		return 1;
+	else
+		return id >> 32;
 }
 
 static inline ino_t kernfs_ino(struct kernfs_node *kn)

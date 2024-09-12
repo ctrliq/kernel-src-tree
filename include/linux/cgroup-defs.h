@@ -260,8 +260,7 @@ struct css_set {
 	 * List of csets participating in the on-going migration either as
 	 * source or destination.  Protected by cgroup_mutex.
 	 */
-	struct list_head mg_src_preload_node;
-	struct list_head mg_dst_preload_node;
+	struct list_head RH_KABI_RENAME(mg_preload_node, mg_src_preload_node);
 	struct list_head mg_node;
 
 	/*
@@ -286,6 +285,7 @@ struct css_set {
 	 *	  used by core kernel only.
 	 */
 	RH_KABI_EXTEND(struct list_head dying_tasks)
+	RH_KABI_EXTEND(struct list_head mg_dst_preload_node)
 };
 
 struct cgroup_base_stat {

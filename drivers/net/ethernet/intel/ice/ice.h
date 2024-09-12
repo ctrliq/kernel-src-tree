@@ -320,6 +320,11 @@ enum ice_vsi_state {
 	ICE_VSI_STATE_NBITS		/* must be last */
 };
 
+struct ice_vsi_stats {
+	struct ice_ring_stats **tx_ring_stats;  /* Tx ring stats array */
+	struct ice_ring_stats **rx_ring_stats;  /* Rx ring stats array */
+};
+
 /* struct that defines a VSI, associated with a dev */
 struct ice_vsi {
 	struct net_device *netdev;
@@ -347,7 +352,6 @@ struct ice_vsi {
 
 	struct ice_vf *vf;		/* VF associated with this VSI */
 
-	u16 ethtype;			/* Ethernet protocol for pause frame */
 	u16 num_gfltr;
 	u16 num_bfltr;
 
@@ -542,6 +546,7 @@ struct ice_pf {
 	u16 ctrl_vsi_idx;		/* control VSI index in pf->vsi array */
 
 	struct ice_vsi **vsi;		/* VSIs created by the driver */
+	struct ice_vsi_stats **vsi_stats;
 	struct ice_sw *first_sw;	/* first switch created by firmware */
 	u16 eswitch_mode;		/* current mode of eswitch */
 	struct ice_vfs vfs;
@@ -865,7 +870,7 @@ ice_fetch_u64_stats_per_ring(struct u64_stats_sync *syncp,
 int ice_up(struct ice_vsi *vsi);
 int ice_down(struct ice_vsi *vsi);
 int ice_down_up(struct ice_vsi *vsi);
-int ice_vsi_cfg(struct ice_vsi *vsi);
+int ice_vsi_cfg_lan(struct ice_vsi *vsi);
 struct ice_vsi *ice_lb_vsi_setup(struct ice_pf *pf, struct ice_port_info *pi);
 int ice_vsi_determine_xdp_res(struct ice_vsi *vsi);
 int ice_prepare_xdp_rings(struct ice_vsi *vsi, struct bpf_prog *prog);
@@ -908,6 +913,8 @@ int ice_open(struct net_device *netdev);
 int ice_open_internal(struct net_device *netdev);
 int ice_stop(struct net_device *netdev);
 void ice_service_task_schedule(struct ice_pf *pf);
+int ice_load(struct ice_pf *pf);
+void ice_unload(struct ice_pf *pf);
 
 /**
  * ice_set_rdma_cap - enable RDMA support

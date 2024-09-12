@@ -94,9 +94,11 @@ static const char * const ice_link_mode_str_high[] = {
 static void
 ice_dump_phy_type(struct ice_hw *hw, u64 low, u64 high, const char *prefix)
 {
+	u32 i;
+
 	ice_debug(hw, ICE_DBG_PHY, "%s: phy_type_low: 0x%016llx\n", prefix, low);
 
-	for (u32 i = 0; i < BITS_PER_TYPE(typeof(low)); i++) {
+	for (i = 0; i < BITS_PER_TYPE(typeof(low)); i++) {
 		if (low & BIT_ULL(i))
 			ice_debug(hw, ICE_DBG_PHY, "%s:   bit(%d): %s\n",
 				  prefix, i, ice_link_mode_str_low[i]);
@@ -104,7 +106,7 @@ ice_dump_phy_type(struct ice_hw *hw, u64 low, u64 high, const char *prefix)
 
 	ice_debug(hw, ICE_DBG_PHY, "%s: phy_type_high: 0x%016llx\n", prefix, high);
 
-	for (u32 i = 0; i < BITS_PER_TYPE(typeof(high)); i++) {
+	for (i = 0; i < BITS_PER_TYPE(typeof(high)); i++) {
 		if (high & BIT_ULL(i))
 			ice_debug(hw, ICE_DBG_PHY, "%s:   bit(%d): %s\n",
 				  prefix, i, ice_link_mode_str_high[i]);
@@ -1114,8 +1116,10 @@ int ice_init_hw(struct ice_hw *hw)
 	if (status)
 		goto err_unroll_cqinit;
 
-	hw->port_info = devm_kzalloc(ice_hw_to_dev(hw),
-				     sizeof(*hw->port_info), GFP_KERNEL);
+	if (!hw->port_info)
+		hw->port_info = devm_kzalloc(ice_hw_to_dev(hw),
+					     sizeof(*hw->port_info),
+					     GFP_KERNEL);
 	if (!hw->port_info) {
 		status = -ENOMEM;
 		goto err_unroll_cqinit;
@@ -1239,11 +1243,6 @@ void ice_deinit_hw(struct ice_hw *hw)
 	ice_free_seg(hw);
 	ice_free_hw_tbls(hw);
 	mutex_destroy(&hw->tnl_lock);
-
-	if (hw->port_info) {
-		devm_kfree(ice_hw_to_dev(hw), hw->port_info);
-		hw->port_info = NULL;
-	}
 
 	/* Attempt to disable FW logging before shutting down control queues */
 	ice_cfg_fw_log(hw, false);

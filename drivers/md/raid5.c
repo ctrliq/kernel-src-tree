@@ -6226,7 +6226,8 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 			md_write_end(mddev);
 		return true;
 	}
-	md_account_bio(mddev, &bi);
+	if (rw == WRITE)
+		md_account_bio(mddev, &bi);
 
 	/*
 	 * Lets start with the stripe with the lowest chunk offset in the first

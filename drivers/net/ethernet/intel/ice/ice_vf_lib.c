@@ -289,7 +289,7 @@ static int ice_vf_rebuild_vsi(struct ice_vf *vf)
 	if (WARN_ON(!vsi))
 		return -EINVAL;
 
-	if (ice_vsi_rebuild(vsi, true)) {
+	if (ice_vsi_rebuild(vsi, ICE_VSI_FLAG_INIT)) {
 		dev_err(ice_pf_to_dev(pf), "failed to rebuild VF %d VSI\n",
 			vf->vf_id);
 		return -EIO;
@@ -1199,11 +1199,16 @@ void ice_vf_ctrl_vsi_release(struct ice_vf *vf)
  */
 struct ice_vsi *ice_vf_ctrl_vsi_setup(struct ice_vf *vf)
 {
-	struct ice_port_info *pi = ice_vf_get_port_info(vf);
+	struct ice_vsi_cfg_params params = {};
 	struct ice_pf *pf = vf->pf;
 	struct ice_vsi *vsi;
 
-	vsi = ice_vsi_setup(pf, pi, ICE_VSI_CTRL, vf, NULL);
+	params.type = ICE_VSI_CTRL;
+	params.pi = ice_vf_get_port_info(vf);
+	params.vf = vf;
+	params.flags = ICE_VSI_FLAG_INIT;
+
+	vsi = ice_vsi_setup(pf, &params);
 	if (!vsi) {
 		dev_err(ice_pf_to_dev(pf), "Failed to create VF control VSI\n");
 		ice_vf_ctrl_invalidate_vsi(vf);
