@@ -1,0 +1,261 @@
+usb: dwc3: Resize TX FIFOs to meet EP bursting requirements
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Wesley Cheng <wcheng@codeaurora.org>
+commit 9f607a309fbe95fc1f77acce5af70766a7142537
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/9f607a30.failed
+
+Some devices have USB compositions which may require multiple endpoints
+that support EP bursting.  HW defined TX FIFO sizes may not always be
+sufficient for these compositions.  By utilizing flexible TX FIFO
+allocation, this allows for endpoints to request the required FIFO depth to
+achieve higher bandwidth.  With some higher bMaxBurst configurations, using
+a larger TX FIFO size results in better TX throughput.
+
+By introducing the check_config() callback, the resizing logic can fetch
+the maximum number of endpoints used in the USB composition (can contain
+multiple configurations), which helps ensure that the resizing logic can
+fulfill the configuration(s), or return an error to the gadget layer
+otherwise during bind time.
+
+	Signed-off-by: Wesley Cheng <wcheng@codeaurora.org>
+Link: https://lore.kernel.org/r/1625908395-5498-4-git-send-email-wcheng@codeaurora.org
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 9f607a309fbe95fc1f77acce5af70766a7142537)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/dwc3/gadget.c
+diff --cc drivers/usb/dwc3/gadget.c
+index 8e96dbf464fa,e56f1a6db2de..000000000000
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@@ -2521,14 -2682,8 +2706,15 @@@ static int dwc3_gadget_stop(struct usb_
+  	unsigned long		flags;
+  
+  	spin_lock_irqsave(&dwc->lock, flags);
+ +
+ +	if (pm_runtime_suspended(dwc->dev))
+ +		goto out;
+ +
+ +	__dwc3_gadget_stop(dwc);
+ +
+ +out:
+  	dwc->gadget_driver	= NULL;
++ 	dwc->max_cfg_eps = 0;
+  	spin_unlock_irqrestore(&dwc->lock, flags);
+  
+  	free_irq(dwc->irq_gadget, dwc->ev_buf);
+@@@ -2616,14 -2771,49 +2802,60 @@@ static int dwc3_gadget_vbus_draw(struc
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static void dwc3_gadget_async_callbacks(struct usb_gadget *g, bool enable)
+ +{
+ +	struct dwc3		*dwc = gadget_to_dwc(g);
+ +	unsigned long		flags;
+ +
+ +	spin_lock_irqsave(&dwc->lock, flags);
+ +	dwc->async_callbacks = enable;
+ +	spin_unlock_irqrestore(&dwc->lock, flags);
+++=======
++ /**
++  * dwc3_gadget_check_config - ensure dwc3 can support the USB configuration
++  * @g: pointer to the USB gadget
++  *
++  * Used to record the maximum number of endpoints being used in a USB composite
++  * device. (across all configurations)  This is to be used in the calculation
++  * of the TXFIFO sizes when resizing internal memory for individual endpoints.
++  * It will help ensured that the resizing logic reserves enough space for at
++  * least one max packet.
++  */
++ static int dwc3_gadget_check_config(struct usb_gadget *g)
++ {
++ 	struct dwc3 *dwc = gadget_to_dwc(g);
++ 	struct usb_ep *ep;
++ 	int fifo_size = 0;
++ 	int ram1_depth;
++ 	int ep_num = 0;
++ 
++ 	if (!dwc->do_fifo_resize)
++ 		return 0;
++ 
++ 	list_for_each_entry(ep, &g->ep_list, ep_list) {
++ 		/* Only interested in the IN endpoints */
++ 		if (ep->claimed && (ep->address & USB_DIR_IN))
++ 			ep_num++;
++ 	}
++ 
++ 	if (ep_num <= dwc->max_cfg_eps)
++ 		return 0;
++ 
++ 	/* Update the max number of eps in the composition */
++ 	dwc->max_cfg_eps = ep_num;
++ 
++ 	fifo_size = dwc3_gadget_calc_tx_fifo_size(dwc, dwc->max_cfg_eps);
++ 	/* Based on the equation, increment by one for every ep */
++ 	fifo_size += dwc->max_cfg_eps;
++ 
++ 	/* Check if we can fit a single fifo per endpoint */
++ 	ram1_depth = DWC3_RAM1_DEPTH(dwc->hwparams.hwparams7);
++ 	if (fifo_size > ram1_depth)
++ 		return -ENOMEM;
++ 
++ 	return 0;
+++>>>>>>> 9f607a309fbe (usb: dwc3: Resize TX FIFOs to meet EP bursting requirements)
+  }
+  
+  static const struct usb_gadget_ops dwc3_gadget_ops = {
+@@@ -2637,7 -2827,7 +2869,11 @@@
+  	.udc_set_ssp_rate	= dwc3_gadget_set_ssp_rate,
+  	.get_config_params	= dwc3_gadget_config_params,
+  	.vbus_draw		= dwc3_gadget_vbus_draw,
+++<<<<<<< HEAD
+ +	.udc_async_callbacks	= dwc3_gadget_async_callbacks,
+++=======
++ 	.check_config		= dwc3_gadget_check_config,
+++>>>>>>> 9f607a309fbe (usb: dwc3: Resize TX FIFOs to meet EP bursting requirements)
+  };
+  
+  /* -------------------------------------------------------------------------- */
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index 740338a4d4a3..84ecb888ec82 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -1273,6 +1273,7 @@ static void dwc3_get_properties(struct dwc3 *dwc)
+ 	u8			rx_max_burst_prd;
+ 	u8			tx_thr_num_pkt_prd;
+ 	u8			tx_max_burst_prd;
++	u8			tx_fifo_resize_max_num;
+ 	const char		*usb_psy_name;
+ 	int			ret;
+ 
+@@ -1288,6 +1289,13 @@ static void dwc3_get_properties(struct dwc3 *dwc)
+ 	 */
+ 	hird_threshold = 12;
+ 
++	/*
++	 * default to a TXFIFO size large enough to fit 6 max packets.  This
++	 * allows for systems with larger bus latencies to have some headroom
++	 * for endpoints that have a large bMaxBurst value.
++	 */
++	tx_fifo_resize_max_num = 6;
++
+ 	dwc->maximum_speed = usb_get_maximum_speed(dev);
+ 	dwc->max_ssp_rate = usb_get_maximum_ssp_rate(dev);
+ 	dwc->dr_mode = usb_get_dr_mode(dev);
+@@ -1331,6 +1339,11 @@ static void dwc3_get_properties(struct dwc3 *dwc)
+ 				&tx_thr_num_pkt_prd);
+ 	device_property_read_u8(dev, "snps,tx-max-burst-prd",
+ 				&tx_max_burst_prd);
++	dwc->do_fifo_resize = device_property_read_bool(dev,
++							"tx-fifo-resize");
++	if (dwc->do_fifo_resize)
++		device_property_read_u8(dev, "tx-fifo-max-num",
++					&tx_fifo_resize_max_num);
+ 
+ 	dwc->disable_scramble_quirk = device_property_read_bool(dev,
+ 				"snps,disable_scramble_quirk");
+@@ -1396,6 +1409,8 @@ static void dwc3_get_properties(struct dwc3 *dwc)
+ 	dwc->tx_max_burst_prd = tx_max_burst_prd;
+ 
+ 	dwc->imod_interval = 0;
++
++	dwc->tx_fifo_resize_max_num = tx_fifo_resize_max_num;
+ }
+ 
+ /* check whether the core supports IMOD */
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index 25ae5136331f..d79fa5057c9c 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -1026,6 +1026,7 @@ struct dwc3_scratchpad_array {
+  * @rx_max_burst_prd: max periodic ESS receive burst size
+  * @tx_thr_num_pkt_prd: periodic ESS transmit packet count
+  * @tx_max_burst_prd: max periodic ESS transmit burst size
++ * @tx_fifo_resize_max_num: max number of fifos allocated during txfifo resize
+  * @hsphy_interface: "utmi" or "ulpi"
+  * @connected: true when we're connected to a host, false otherwise
+  * @delayed_status: true when gadget driver asks for delayed status
+@@ -1040,6 +1041,7 @@ struct dwc3_scratchpad_array {
+  *	1	- utmi_l1_suspend_n
+  * @is_fpga: true when we are using the FPGA board
+  * @pending_events: true when we have pending IRQs to be handled
++ * @do_fifo_resize: true when txfifo resizing is enabled for dwc3 endpoints
+  * @pullups_connected: true when Run/Stop bit is set
+  * @setup_packet_pending: true when there's a Setup Packet in FIFO. Workaround
+  * @three_stage_setup: set if we perform a three phase setup
+@@ -1082,6 +1084,11 @@ struct dwc3_scratchpad_array {
+  * @dis_split_quirk: set to disable split boundary.
+  * @imod_interval: set the interrupt moderation interval in 250ns
+  *			increments or 0 to disable.
++ * @max_cfg_eps: current max number of IN eps used across all USB configs.
++ * @last_fifo_depth: last fifo depth used to determine next fifo ram start
++ *		     address.
++ * @num_ep_resized: carries the current number endpoints which have had its tx
++ *		    fifo resized.
+  */
+ struct dwc3 {
+ 	struct work_struct	drd_work;
+@@ -1236,6 +1243,7 @@ struct dwc3 {
+ 	u8			rx_max_burst_prd;
+ 	u8			tx_thr_num_pkt_prd;
+ 	u8			tx_max_burst_prd;
++	u8			tx_fifo_resize_max_num;
+ 
+ 	const char		*hsphy_interface;
+ 
+@@ -1249,6 +1257,7 @@ struct dwc3 {
+ 	unsigned		is_utmi_l1_suspend:1;
+ 	unsigned		is_fpga:1;
+ 	unsigned		pending_events:1;
++	unsigned		do_fifo_resize:1;
+ 	unsigned		pullups_connected:1;
+ 	unsigned		setup_packet_pending:1;
+ 	unsigned		three_stage_setup:1;
+@@ -1285,6 +1294,10 @@ struct dwc3 {
+ 	unsigned		async_callbacks:1;
+ 
+ 	u16			imod_interval;
++
++	int			max_cfg_eps;
++	int			last_fifo_depth;
++	int			num_ep_resized;
+ };
+ 
+ #define INCRX_BURST_MODE 0
+@@ -1516,6 +1529,7 @@ int dwc3_send_gadget_ep_cmd(struct dwc3_ep *dep, unsigned int cmd,
+ 		struct dwc3_gadget_ep_cmd_params *params);
+ int dwc3_send_gadget_generic_command(struct dwc3 *dwc, unsigned int cmd,
+ 		u32 param);
++void dwc3_gadget_clear_tx_fifos(struct dwc3 *dwc);
+ #else
+ static inline int dwc3_gadget_init(struct dwc3 *dwc)
+ { return 0; }
+@@ -1535,6 +1549,8 @@ static inline int dwc3_send_gadget_ep_cmd(struct dwc3_ep *dep, unsigned int cmd,
+ static inline int dwc3_send_gadget_generic_command(struct dwc3 *dwc,
+ 		int cmd, u32 param)
+ { return 0; }
++static inline void dwc3_gadget_clear_tx_fifos(struct dwc3 *dwc)
++{ }
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_USB_DWC3_DUAL_ROLE)
+diff --git a/drivers/usb/dwc3/ep0.c b/drivers/usb/dwc3/ep0.c
+index 9b52dc7563e8..fd8c3b0fa3b4 100644
+--- a/drivers/usb/dwc3/ep0.c
++++ b/drivers/usb/dwc3/ep0.c
+@@ -621,6 +621,8 @@ static int dwc3_ep0_set_config(struct dwc3 *dwc, struct usb_ctrlrequest *ctrl)
+ 		return -EINVAL;
+ 
+ 	case USB_STATE_ADDRESS:
++		dwc3_gadget_clear_tx_fifos(dwc);
++
+ 		ret = dwc3_ep0_delegate_req(dwc, ctrl);
+ 		/* if the cfg matches and the cfg is non zero */
+ 		if (cfg && (!ret || (ret == USB_GADGET_DELAYED_STATUS))) {
+* Unmerged path drivers/usb/dwc3/gadget.c
