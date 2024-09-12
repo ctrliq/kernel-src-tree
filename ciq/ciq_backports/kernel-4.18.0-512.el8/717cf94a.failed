@@ -1,0 +1,229 @@
+kvm: arm64: Remove __hyp_this_cpu_read
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-512.el8
+commit-author David Brazdil <dbrazdil@google.com>
+commit 717cf94adb54095d14a6674baea73123188f2901
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-512.el8/717cf94a.failed
+
+this_cpu_ptr is meant for use in kernel proper because it selects between
+TPIDR_EL1/2 based on nVHE/VHE. __hyp_this_cpu_ptr was used in hyp to always
+select TPIDR_EL2. Unify all users behind this_cpu_ptr and friends by
+selecting _EL2 register under __KVM_NVHE_HYPERVISOR__. VHE continues
+selecting the register using alternatives.
+
+Under CONFIG_DEBUG_PREEMPT, the kernel helpers perform a preemption check
+which is omitted by the hyp helpers. Preserve the behavior for nVHE by
+overriding the corresponding macros under __KVM_NVHE_HYPERVISOR__. Extend
+the checks into VHE hyp code.
+
+	Signed-off-by: David Brazdil <dbrazdil@google.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+	Acked-by: Andrew Scull <ascull@google.com>
+	Acked-by: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20200922204910.7265-5-dbrazdil@google.com
+(cherry picked from commit 717cf94adb54095d14a6674baea73123188f2901)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_asm.h
+diff --cc arch/arm64/include/asm/kvm_asm.h
+index 3a4cac2db943,c196eec25498..000000000000
+--- a/arch/arm64/include/asm/kvm_asm.h
++++ b/arch/arm64/include/asm/kvm_asm.h
+@@@ -156,28 -143,6 +156,31 @@@ extern u32 __kvm_get_mdcr_el2(void)
+  		addr;							\
+  	})
+  
+++<<<<<<< HEAD
+ +extern char __smccc_workaround_1_smc[__SMCCC_WORKAROUND_1_SMC_SZ];
+ +
+ +/*
+ + * Home-grown __this_cpu_{ptr,read} variants that always work at HYP,
+ + * provided that sym is really a *symbol* and not a pointer obtained from
+ + * a data structure. As for SHIFT_PERCPU_PTR(), the creative casting keeps
+ + * sparse quiet.
+ + */
+ +#define __hyp_this_cpu_ptr(sym)						\
+ +	({								\
+ +		void *__ptr;						\
+ +		__verify_pcpu_ptr(&sym);				\
+ +		__ptr = hyp_symbol_addr(sym);				\
+ +		__ptr += read_sysreg(tpidr_el2);			\
+ +		(typeof(sym) __kernel __force *)__ptr;			\
+ +	 })
+ +
+ +#define __hyp_this_cpu_read(sym)					\
+ +	({								\
+ +		*__hyp_this_cpu_ptr(sym);				\
+ +	 })
+ +
+++=======
+++>>>>>>> 717cf94adb54 (kvm: arm64: Remove __hyp_this_cpu_read)
+  #define __KVM_EXTABLE(from, to)						\
+  	"	.pushsection	__kvm_ex_table, \"a\"\n"		\
+  	"	.align		3\n"					\
+* Unmerged path arch/arm64/include/asm/kvm_asm.h
+diff --git a/arch/arm64/include/asm/percpu.h b/arch/arm64/include/asm/percpu.h
+index 6b81dd8cee01..8be07b5e0729 100644
+--- a/arch/arm64/include/asm/percpu.h
++++ b/arch/arm64/include/asm/percpu.h
+@@ -30,7 +30,16 @@ static inline void set_my_cpu_offset(unsigned long off)
+ 			:: "r" (off) : "memory");
+ }
+ 
+-static inline unsigned long __my_cpu_offset(void)
++static inline unsigned long __hyp_my_cpu_offset(void)
++{
++	/*
++	 * Non-VHE hyp code runs with preemption disabled. No need to hazard
++	 * the register access against barrier() as in __kern_my_cpu_offset.
++	 */
++	return read_sysreg(tpidr_el2);
++}
++
++static inline unsigned long __kern_my_cpu_offset(void)
+ {
+ 	unsigned long off;
+ 
+@@ -46,7 +55,12 @@ static inline unsigned long __my_cpu_offset(void)
+ 
+ 	return off;
+ }
+-#define __my_cpu_offset __my_cpu_offset()
++
++#ifdef __KVM_NVHE_HYPERVISOR__
++#define __my_cpu_offset __hyp_my_cpu_offset()
++#else
++#define __my_cpu_offset __kern_my_cpu_offset()
++#endif
+ 
+ #define PERCPU_RW_OPS(sz)						\
+ static inline unsigned long __percpu_read_##sz(void *ptr)		\
+@@ -238,4 +252,14 @@ PERCPU_RET_OP(add, add, ldadd)
+ 
+ #include <asm-generic/percpu.h>
+ 
++/* Redefine macros for nVHE hyp under DEBUG_PREEMPT to avoid its dependencies. */
++#if defined(__KVM_NVHE_HYPERVISOR__) && defined(CONFIG_DEBUG_PREEMPT)
++#undef	this_cpu_ptr
++#define	this_cpu_ptr		raw_cpu_ptr
++#undef	__this_cpu_read
++#define	__this_cpu_read		raw_cpu_read
++#undef	__this_cpu_write
++#define	__this_cpu_write	raw_cpu_write
++#endif
++
+ #endif /* __ASM_PERCPU_H */
+diff --git a/arch/arm64/kvm/hyp/include/hyp/debug-sr.h b/arch/arm64/kvm/hyp/include/hyp/debug-sr.h
+index 3e87d7489efd..bf6eefcaccea 100644
+--- a/arch/arm64/kvm/hyp/include/hyp/debug-sr.h
++++ b/arch/arm64/kvm/hyp/include/hyp/debug-sr.h
+@@ -146,7 +146,7 @@ static inline void __debug_switch_to_guest_common(struct kvm_vcpu *vcpu)
+ 	if (!(vcpu->arch.flags & KVM_ARM64_DEBUG_DIRTY))
+ 		return;
+ 
+-	host_ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
++	host_ctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
+ 	guest_ctxt = &vcpu->arch.ctxt;
+ 	host_dbg = &vcpu->arch.host_debug_state.regs;
+ 	guest_dbg = kern_hyp_va(vcpu->arch.debug_ptr);
+@@ -165,7 +165,7 @@ static inline void __debug_switch_to_host_common(struct kvm_vcpu *vcpu)
+ 	if (!(vcpu->arch.flags & KVM_ARM64_DEBUG_DIRTY))
+ 		return;
+ 
+-	host_ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
++	host_ctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
+ 	guest_ctxt = &vcpu->arch.ctxt;
+ 	host_dbg = &vcpu->arch.host_debug_state.regs;
+ 	guest_dbg = kern_hyp_va(vcpu->arch.debug_ptr);
+diff --git a/arch/arm64/kvm/hyp/include/hyp/switch.h b/arch/arm64/kvm/hyp/include/hyp/switch.h
+index 238c109f9a01..52c7b9734b9d 100644
+--- a/arch/arm64/kvm/hyp/include/hyp/switch.h
++++ b/arch/arm64/kvm/hyp/include/hyp/switch.h
+@@ -390,7 +390,7 @@ static inline bool __hyp_handle_ptrauth(struct kvm_vcpu *vcpu)
+ 	    !esr_is_ptrauth_trap(kvm_vcpu_get_esr(vcpu)))
+ 		return false;
+ 
+-	ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
++	ctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
+ 	__ptrauth_save_key(ctxt, APIA);
+ 	__ptrauth_save_key(ctxt, APIB);
+ 	__ptrauth_save_key(ctxt, APDA);
+@@ -503,7 +503,7 @@ static inline void __set_guest_arch_workaround_state(struct kvm_vcpu *vcpu)
+ 	 * guest wants it disabled, so be it...
+ 	 */
+ 	if (__needs_ssbd_off(vcpu) &&
+-	    __hyp_this_cpu_read(arm64_ssbd_callback_required))
++	    __this_cpu_read(arm64_ssbd_callback_required))
+ 		arm_smccc_1_1_smc(ARM_SMCCC_ARCH_WORKAROUND_2, 0, NULL);
+ }
+ 
+@@ -513,7 +513,7 @@ static inline void __set_host_arch_workaround_state(struct kvm_vcpu *vcpu)
+ 	 * If the guest has disabled the workaround, bring it back on.
+ 	 */
+ 	if (__needs_ssbd_off(vcpu) &&
+-	    __hyp_this_cpu_read(arm64_ssbd_callback_required))
++	    __this_cpu_read(arm64_ssbd_callback_required))
+ 		arm_smccc_1_1_smc(ARM_SMCCC_ARCH_WORKAROUND_2, 1, NULL);
+ }
+ 
+@@ -526,7 +526,7 @@ static inline void __kvm_unexpected_el2_exception(void)
+ 
+ 	entry = hyp_symbol_addr(__start___kvm_ex_table);
+ 	end = hyp_symbol_addr(__stop___kvm_ex_table);
+-	host_ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
++	host_ctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
+ 
+ 	while (entry < end) {
+ 		addr = (unsigned long)&entry->insn + entry->insn;
+diff --git a/arch/arm64/kvm/hyp/nvhe/switch.c b/arch/arm64/kvm/hyp/nvhe/switch.c
+index 6ea15e7c1532..13769d0b9a40 100644
+--- a/arch/arm64/kvm/hyp/nvhe/switch.c
++++ b/arch/arm64/kvm/hyp/nvhe/switch.c
+@@ -175,7 +175,7 @@ int __kvm_vcpu_run(struct kvm_vcpu *vcpu)
+ 
+ 	vcpu = kern_hyp_va(vcpu);
+ 
+-	host_ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
++	host_ctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
+ 	host_ctxt->__hyp_running_vcpu = vcpu;
+ 	guest_ctxt = &vcpu->arch.ctxt;
+ 
+diff --git a/arch/arm64/kvm/hyp/vhe/switch.c b/arch/arm64/kvm/hyp/vhe/switch.c
+index 8c97c98b2b31..de6b5c8dd7c9 100644
+--- a/arch/arm64/kvm/hyp/vhe/switch.c
++++ b/arch/arm64/kvm/hyp/vhe/switch.c
+@@ -111,7 +111,7 @@ static int __kvm_vcpu_run_vhe(struct kvm_vcpu *vcpu)
+ 	struct kvm_cpu_context *guest_ctxt;
+ 	u64 exit_code;
+ 
+-	host_ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
++	host_ctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
+ 	host_ctxt->__hyp_running_vcpu = vcpu;
+ 	guest_ctxt = &vcpu->arch.ctxt;
+ 
+diff --git a/arch/arm64/kvm/hyp/vhe/sysreg-sr.c b/arch/arm64/kvm/hyp/vhe/sysreg-sr.c
+index 996471e4c138..2a0b8c88d74f 100644
+--- a/arch/arm64/kvm/hyp/vhe/sysreg-sr.c
++++ b/arch/arm64/kvm/hyp/vhe/sysreg-sr.c
+@@ -66,7 +66,7 @@ void kvm_vcpu_load_sysregs_vhe(struct kvm_vcpu *vcpu)
+ 	struct kvm_cpu_context *guest_ctxt = &vcpu->arch.ctxt;
+ 	struct kvm_cpu_context *host_ctxt;
+ 
+-	host_ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
++	host_ctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
+ 	__sysreg_save_user_state(host_ctxt);
+ 
+ 	/*
+@@ -100,7 +100,7 @@ void kvm_vcpu_put_sysregs_vhe(struct kvm_vcpu *vcpu)
+ 	struct kvm_cpu_context *guest_ctxt = &vcpu->arch.ctxt;
+ 	struct kvm_cpu_context *host_ctxt;
+ 
+-	host_ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
++	host_ctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
+ 	deactivate_traps_vhe_put();
+ 
+ 	__sysreg_save_el1_state(guest_ctxt);
