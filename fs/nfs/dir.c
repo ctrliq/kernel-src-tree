@@ -141,6 +141,7 @@ struct nfs_cache_array_entry {
 };
 
 struct nfs_cache_array {
+	u64 change_attr;
 	u64 last_cookie;
 	unsigned int size;
 	unsigned char page_full : 1,
@@ -177,12 +178,14 @@ static void nfs_readdir_array_init(struct nfs_cache_array *array)
 	memset(array, 0, sizeof(struct nfs_cache_array));
 }
 
-static void nfs_readdir_page_init_array(struct page *page, u64 last_cookie)
+static void nfs_readdir_page_init_array(struct page *page, u64 last_cookie,
+					u64 change_attr)
 {
 	struct nfs_cache_array *array;
 
 	array = kmap_atomic(page);
 	nfs_readdir_array_init(array);
+	array->change_attr = change_attr;
 	array->last_cookie = last_cookie;
 	array->cookies_are_ordered = 1;
 	kunmap_atomic(array);
@@ -209,7 +212,7 @@ nfs_readdir_page_array_alloc(u64 last_cookie, gfp_t gfp_flags)
 {
 	struct page *page = alloc_page(gfp_flags);
 	if (page)
-		nfs_readdir_page_init_array(page, last_cookie);
+		nfs_readdir_page_init_array(page, last_cookie, 0);
 	return page;
 }
 
@@ -306,19 +309,43 @@ out:
 	return ret;
 }
 
+static bool nfs_readdir_page_validate(struct page *page, u64 last_cookie,
+				      u64 change_attr)
+{
+	struct nfs_cache_array *array = kmap_atomic(page);
+	int ret = true;
+
+	if (array->change_attr != change_attr)
+		ret = false;
+	if (array->size > 0 && array->array[0].cookie != last_cookie)
+		ret = false;
+	kunmap_atomic(array);
+	return ret;
+}
+
+static void nfs_readdir_page_unlock_and_put(struct page *page)
+{
+	unlock_page(page);
+	put_page(page);
+}
+
 static struct page *nfs_readdir_page_get_locked(struct address_space *mapping,
 						pgoff_t index, u64 last_cookie)
 {
 	struct page *page;
+	u64 change_attr;
 
 	page = grab_cache_page(mapping, index);
-	if (page && !PageUptodate(page)) {
-		nfs_readdir_page_init_array(page, last_cookie);
-		if (invalidate_inode_pages2_range(mapping, index + 1, -1) < 0)
-			nfs_zap_mapping(mapping->host, mapping);
-		SetPageUptodate(page);
+	if (!page)
+		return NULL;
+	change_attr = inode_peek_iversion_raw(mapping->host);
+	if (PageUptodate(page)) {
+		if (nfs_readdir_page_validate(page, last_cookie, change_attr))
+			return page;
+		nfs_readdir_clear_array(page);
 	}
-
+	nfs_readdir_page_init_array(page, last_cookie, change_attr);
+	SetPageUptodate(page);
 	return page;
 }
 
@@ -356,12 +383,6 @@ static void nfs_readdir_page_set_eof(struct page *page)
 	array = kmap_atomic(page);
 	nfs_readdir_array_set_eof(array);
 	kunmap_atomic(array);
-}
-
-static void nfs_readdir_page_unlock_and_put(struct page *page)
-{
-	unlock_page(page);
-	put_page(page);
 }
 
 static struct page *nfs_readdir_page_get_next(struct address_space *mapping,
@@ -420,16 +441,6 @@ out_eof:
 	return -EBADCOOKIE;
 }
 
-static bool
-nfs_readdir_inode_mapping_valid(struct nfs_inode *nfsi)
-{
-	if (nfsi->cache_validity & (NFS_INO_INVALID_CHANGE |
-				    NFS_INO_INVALID_DATA))
-		return false;
-	smp_rmb();
-	return !test_bit(NFS_INO_INVALIDATING, &nfsi->flags);
-}
-
 static bool nfs_readdir_array_cookie_in_range(struct nfs_cache_array *array,
 					      u64 cookie)
 {
@@ -458,8 +469,7 @@ static int nfs_readdir_search_for_cookie(struct nfs_cache_array *array,
 			struct nfs_inode *nfsi = NFS_I(file_inode(desc->file));
 
 			new_pos = nfs_readdir_page_offset(desc->page) + i;
-			if (desc->attr_gencount != nfsi->attr_gencount ||
-			    !nfs_readdir_inode_mapping_valid(nfsi)) {
+			if (desc->attr_gencount != nfsi->attr_gencount) {
 				desc->duped = 0;
 				desc->attr_gencount = nfsi->attr_gencount;
 			} else if (new_pos < desc->prev_index) {
@@ -1096,11 +1106,7 @@ static int nfs_readdir(struct file *file, struct dir_context *ctx)
 	 * to either find the entry with the appropriate number or
 	 * revalidate the cookie.
 	 */
-	if (ctx->pos == 0 || nfs_attribute_cache_expired(inode)) {
-		res = nfs_revalidate_mapping(inode, file->f_mapping);
-		if (res < 0)
-			goto out;
-	}
+	nfs_revalidate_mapping(inode, file->f_mapping);
 
 	res = -ENOMEM;
 	desc = kzalloc(sizeof(*desc), GFP_KERNEL);
