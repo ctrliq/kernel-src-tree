@@ -1,0 +1,196 @@
+x86/ibt,paravirt: Use text_gen_insn() for paravirt_patch()
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit ba27d1a80871eb8dbeddf34ec7d396c149cbb8d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/ba27d1a8.failed
+
+Less duplication is more better.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Link: https://lore.kernel.org/r/20220308154317.697253958@infradead.org
+(cherry picked from commit ba27d1a80871eb8dbeddf34ec7d396c149cbb8d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/text-patching.h
+#	arch/x86/kernel/paravirt.c
+diff --cc arch/x86/include/asm/text-patching.h
+index 47a8c6185e2b,c6015b407461..000000000000
+--- a/arch/x86/include/asm/text-patching.h
++++ b/arch/x86/include/asm/text-patching.h
+@@@ -71,7 -65,87 +71,91 @@@ static inline void int3_emulate_jmp(str
+  #define JMP8_INSN_SIZE		2
+  #define JMP8_INSN_OPCODE	0xEB
+  
+++<<<<<<< HEAD
+ +static inline void int3_emulate_push(struct pt_regs *regs, unsigned long val)
+++=======
++ #define DISP32_SIZE		4
++ 
++ static __always_inline int text_opcode_size(u8 opcode)
++ {
++ 	int size = 0;
++ 
++ #define __CASE(insn)	\
++ 	case insn##_INSN_OPCODE: size = insn##_INSN_SIZE; break
++ 
++ 	switch(opcode) {
++ 	__CASE(INT3);
++ 	__CASE(RET);
++ 	__CASE(CALL);
++ 	__CASE(JMP32);
++ 	__CASE(JMP8);
++ 	}
++ 
++ #undef __CASE
++ 
++ 	return size;
++ }
++ 
++ union text_poke_insn {
++ 	u8 text[POKE_MAX_OPCODE_SIZE];
++ 	struct {
++ 		u8 opcode;
++ 		s32 disp;
++ 	} __attribute__((packed));
++ };
++ 
++ static __always_inline
++ void __text_gen_insn(void *buf, u8 opcode, const void *addr, const void *dest, int size)
++ {
++ 	union text_poke_insn *insn = buf;
++ 
++ 	BUG_ON(size < text_opcode_size(opcode));
++ 
++ 	/*
++ 	 * Hide the addresses to avoid the compiler folding in constants when
++ 	 * referencing code, these can mess up annotations like
++ 	 * ANNOTATE_NOENDBR.
++ 	 */
++ 	OPTIMIZER_HIDE_VAR(insn);
++ 	OPTIMIZER_HIDE_VAR(addr);
++ 	OPTIMIZER_HIDE_VAR(dest);
++ 
++ 	insn->opcode = opcode;
++ 
++ 	if (size > 1) {
++ 		insn->disp = (long)dest - (long)(addr + size);
++ 		if (size == 2) {
++ 			/*
++ 			 * Ensure that for JMP8 the displacement
++ 			 * actually fits the signed byte.
++ 			 */
++ 			BUG_ON((insn->disp >> 31) != (insn->disp >> 7));
++ 		}
++ 	}
++ }
++ 
++ static __always_inline
++ void *text_gen_insn(u8 opcode, const void *addr, const void *dest)
++ {
++ 	static union text_poke_insn insn; /* per instance */
++ 	__text_gen_insn(&insn, opcode, addr, dest, text_opcode_size(opcode));
++ 	return &insn.text;
++ }
++ 
++ extern int after_bootmem;
++ extern __ro_after_init struct mm_struct *poking_mm;
++ extern __ro_after_init unsigned long poking_addr;
++ 
++ #ifndef CONFIG_UML_X86
++ static __always_inline
++ void int3_emulate_jmp(struct pt_regs *regs, unsigned long ip)
++ {
++ 	regs->ip = ip;
++ }
++ 
++ static __always_inline
++ void int3_emulate_push(struct pt_regs *regs, unsigned long val)
+++>>>>>>> ba27d1a80871 (x86/ibt,paravirt: Use text_gen_insn() for paravirt_patch())
+  {
+  	/*
+  	 * The int3 handler in entry_64.S adds a gap between the
+diff --cc arch/x86/kernel/paravirt.c
+index d251a7e52f03,06af2cf5181c..000000000000
+--- a/arch/x86/kernel/paravirt.c
++++ b/arch/x86/kernel/paravirt.c
+@@@ -74,51 -64,26 +74,60 @@@ void __init default_banner(void
+  }
+  
+  /* Undefined instruction for dealing with missing ops pointers. */
+ -noinstr void paravirt_BUG(void)
+ +static const unsigned char ud2a[] = { 0x0f, 0x0b };
+ +
+++<<<<<<< HEAD
+ +struct branch {
+ +	unsigned char opcode;
+ +	u32 delta;
+ +} __attribute__((packed));
+ +
+ +static unsigned paravirt_patch_call(void *insnbuf, const void *target,
+ +				    unsigned long addr, unsigned len)
+  {
+ -	BUG();
+ -}
+ +	const int call_len = 5;
+ +	struct branch *b = insnbuf;
+ +	unsigned long delta = (unsigned long)target - (addr+call_len);
+ +
+ +	if (len < call_len) {
+ +		pr_warn("paravirt: Failed to patch indirect CALL at %ps\n", (void *)addr);
+ +		/* Kernel might not be viable if patching fails, bail out: */
+ +		BUG_ON(1);
+ +	}
+ +
+ +	b->opcode = 0xe8; /* call */
+ +	b->delta = delta;
+ +	BUILD_BUG_ON(sizeof(*b) != call_len);
+  
+ +	return call_len;
+++=======
++ static unsigned paravirt_patch_call(void *insn_buff, const void *target,
++ 				    unsigned long addr, unsigned len)
++ {
++ 	__text_gen_insn(insn_buff, CALL_INSN_OPCODE,
++ 			(void *)addr, target, CALL_INSN_SIZE);
++ 	return CALL_INSN_SIZE;
+++>>>>>>> ba27d1a80871 (x86/ibt,paravirt: Use text_gen_insn() for paravirt_patch())
+  }
+  
+ -#ifdef CONFIG_PARAVIRT_XXL
+ -/* identity function, which can be inlined */
+ -u64 notrace _paravirt_ident_64(u64 x)
+ +static unsigned paravirt_patch_jmp(void *insnbuf, const void *target,
+ +				   unsigned long addr, unsigned len)
+  {
+ -	return x;
+ -}
+ +	struct branch *b = insnbuf;
+ +	unsigned long delta = (unsigned long)target - (addr+5);
+ +
+ +	if (len < 5) {
+ +#ifdef CONFIG_RETPOLINE
+ +		WARN_ONCE(1, "Failing to patch indirect JMP in %ps\n", (void *)addr);
+  #endif
+ +		return len;	/* call too long for patch site */
+ +	}
+ +
+ +	b->opcode = 0xe9;	/* jmp */
+ +	b->delta = delta;
+ +
+ +	return 5;
+ +}
+  
+  DEFINE_STATIC_KEY_TRUE(virt_spin_lock_key);
+  
+* Unmerged path arch/x86/include/asm/text-patching.h
+* Unmerged path arch/x86/kernel/paravirt.c
