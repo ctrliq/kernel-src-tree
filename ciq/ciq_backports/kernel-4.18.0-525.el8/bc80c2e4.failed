@@ -1,0 +1,127 @@
+PM: runtime: Do not call __rpm_callback() from rpm_idle()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-525.el8
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit bc80c2e438dcbfcf748452ec0f7ad5b79ff3ad88
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-525.el8/bc80c2e4.failed
+
+Calling __rpm_callback() from rpm_idle() after adding device links
+support to the former is a clear mistake.
+
+Not only it causes rpm_idle() to carry out unnecessary actions, but it
+is also against the assumption regarding the stability of PM-runtime
+status across __rpm_callback() invocations, because rpm_suspend() and
+rpm_resume() may run in parallel with __rpm_callback() when it is called
+by rpm_idle() and the device's PM-runtime status can be updated by any
+of them.
+
+Fixes: 21d5c57b3726 ("PM / runtime: Use device links")
+Link: https://lore.kernel.org/linux-pm/36aed941-a73e-d937-2721-4f0decd61ce0@quicinc.com
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Reviewed-by: Adrian Hunter <adrian.hunter@intel.com>
+(cherry picked from commit bc80c2e438dcbfcf748452ec0f7ad5b79ff3ad88)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/power/runtime.c
+diff --cc drivers/base/power/runtime.c
+index 5010f7889e75,14088b5adb55..000000000000
+--- a/drivers/base/power/runtime.c
++++ b/drivers/base/power/runtime.c
+@@@ -406,6 -422,89 +406,92 @@@ fail
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * rpm_idle - Notify device bus type if the device can be suspended.
++  * @dev: Device to notify the bus type about.
++  * @rpmflags: Flag bits.
++  *
++  * Check if the device's runtime PM status allows it to be suspended.  If
++  * another idle notification has been started earlier, return immediately.  If
++  * the RPM_ASYNC flag is set then queue an idle-notification request; otherwise
++  * run the ->runtime_idle() callback directly. If the ->runtime_idle callback
++  * doesn't exist or if it returns 0, call rpm_suspend with the RPM_AUTO flag.
++  *
++  * This function must be called under dev->power.lock with interrupts disabled.
++  */
++ static int rpm_idle(struct device *dev, int rpmflags)
++ {
++ 	int (*callback)(struct device *);
++ 	int retval;
++ 
++ 	trace_rpm_idle_rcuidle(dev, rpmflags);
++ 	retval = rpm_check_suspend_allowed(dev);
++ 	if (retval < 0)
++ 		;	/* Conditions are wrong. */
++ 
++ 	/* Idle notifications are allowed only in the RPM_ACTIVE state. */
++ 	else if (dev->power.runtime_status != RPM_ACTIVE)
++ 		retval = -EAGAIN;
++ 
++ 	/*
++ 	 * Any pending request other than an idle notification takes
++ 	 * precedence over us, except that the timer may be running.
++ 	 */
++ 	else if (dev->power.request_pending &&
++ 	    dev->power.request > RPM_REQ_IDLE)
++ 		retval = -EAGAIN;
++ 
++ 	/* Act as though RPM_NOWAIT is always set. */
++ 	else if (dev->power.idle_notification)
++ 		retval = -EINPROGRESS;
++ 	if (retval)
++ 		goto out;
++ 
++ 	/* Pending requests need to be canceled. */
++ 	dev->power.request = RPM_REQ_NONE;
++ 
++ 	callback = RPM_GET_CALLBACK(dev, runtime_idle);
++ 
++ 	/* If no callback assume success. */
++ 	if (!callback || dev->power.no_callbacks)
++ 		goto out;
++ 
++ 	/* Carry out an asynchronous or a synchronous idle notification. */
++ 	if (rpmflags & RPM_ASYNC) {
++ 		dev->power.request = RPM_REQ_IDLE;
++ 		if (!dev->power.request_pending) {
++ 			dev->power.request_pending = true;
++ 			queue_work(pm_wq, &dev->power.work);
++ 		}
++ 		trace_rpm_return_int_rcuidle(dev, _THIS_IP_, 0);
++ 		return 0;
++ 	}
++ 
++ 	dev->power.idle_notification = true;
++ 
++ 	if (dev->power.irq_safe)
++ 		spin_unlock(&dev->power.lock);
++ 	else
++ 		spin_unlock_irq(&dev->power.lock);
++ 
++ 	retval = callback(dev);
++ 
++ 	if (dev->power.irq_safe)
++ 		spin_lock(&dev->power.lock);
++ 	else
++ 		spin_lock_irq(&dev->power.lock);
++ 
++ 	dev->power.idle_notification = false;
++ 	wake_up_all(&dev->power.wait_queue);
++ 
++  out:
++ 	trace_rpm_return_int_rcuidle(dev, _THIS_IP_, retval);
++ 	return retval ? retval : rpm_suspend(dev, rpmflags | RPM_AUTO);
++ }
++ 
++ /**
+++>>>>>>> bc80c2e438dc (PM: runtime: Do not call __rpm_callback() from rpm_idle())
+   * rpm_callback - Run a given runtime PM callback for a given device.
+   * @cb: Runtime PM callback to run.
+   * @dev: Device to run the callback for.
+* Unmerged path drivers/base/power/runtime.c
