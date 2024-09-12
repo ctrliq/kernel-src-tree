@@ -1,0 +1,711 @@
+net: stmmac: add ethtool per-queue statistic framework
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Vijayakannan Ayyathurai <vijayakannan.ayyathurai@intel.com>
+commit 68e9c5dee1cf9f5651a894a151d72b7fc21172d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/68e9c5de.failed
+
+Adding generic ethtool per-queue statistic framework to display the
+statistics for each rx/tx queue. In future, users can avail it to add
+more per-queue specific counters. Number of rx/tx queues displayed is
+depending on the available rx/tx queues in that particular MAC config
+and this number is limited up to the MTL_MAX_{RX|TX}_QUEUES defined
+in the driver.
+
+Ethtool per-queue statistic display will look like below, when users
+start adding more counters.
+
+Example:
+ q0_tx_statA:
+ q0_tx_statB:
+ q0_tx_statC:
+ |
+ q0_tx_statX:
+ .
+ .
+ .
+ qMAX_tx_statA:
+ qMAX_tx_statB:
+ qMAX_tx_statC:
+ |
+ qMAX_tx_statX:
+
+ q0_rx_statA:
+ q0_rx_statB:
+ q0_rx_statC:
+ |
+ q0_rx_statX:
+ .
+ .
+ .
+ qMAX_rx_statA:
+ qMAX_rx_statB:
+ qMAX_rx_statC:
+ |
+ qMAX_rx_statX:
+
+In addition, this patch has the support on displaying the number of
+packets received and transmitted per queue.
+
+	Signed-off-by: Vijayakannan Ayyathurai <vijayakannan.ayyathurai@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 68e9c5dee1cf9f5651a894a151d72b7fc21172d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+diff --cc drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 122734a42850,7b3fcf558603..000000000000
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@@ -2130,11 -2500,14 +2130,12 @@@ static int stmmac_tx_clean(struct stmma
+  			} else {
+  				priv->dev->stats.tx_packets++;
+  				priv->xstats.tx_pkt_n++;
++ 				priv->xstats.txq_stats[queue].tx_pkt_n++;
+  			}
+ -			if (skb)
+ -				stmmac_get_tx_hwtstamp(priv, p, skb);
+ +			stmmac_get_tx_hwtstamp(priv, p, skb);
+  		}
+  
+ -		if (likely(tx_q->tx_skbuff_dma[entry].buf &&
+ -			   tx_q->tx_skbuff_dma[entry].buf_type != STMMAC_TXBUF_T_XDP_TX)) {
+ +		if (likely(tx_q->tx_skbuff_dma[entry].buf)) {
+  			if (tx_q->tx_skbuff_dma[entry].map_as_page)
+  				dma_unmap_page(priv->device,
+  					       tx_q->tx_skbuff_dma[entry].buf,
+@@@ -4122,6 -4538,484 +4123,487 @@@ static unsigned int stmmac_rx_buf2_len(
+  	return plen - len;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int stmmac_xdp_xmit_xdpf(struct stmmac_priv *priv, int queue,
++ 				struct xdp_frame *xdpf, bool dma_map)
++ {
++ 	struct stmmac_tx_queue *tx_q = &priv->tx_queue[queue];
++ 	unsigned int entry = tx_q->cur_tx;
++ 	struct dma_desc *tx_desc;
++ 	dma_addr_t dma_addr;
++ 	bool set_ic;
++ 
++ 	if (stmmac_tx_avail(priv, queue) < STMMAC_TX_THRESH(priv))
++ 		return STMMAC_XDP_CONSUMED;
++ 
++ 	if (likely(priv->extend_desc))
++ 		tx_desc = (struct dma_desc *)(tx_q->dma_etx + entry);
++ 	else if (tx_q->tbs & STMMAC_TBS_AVAIL)
++ 		tx_desc = &tx_q->dma_entx[entry].basic;
++ 	else
++ 		tx_desc = tx_q->dma_tx + entry;
++ 
++ 	if (dma_map) {
++ 		dma_addr = dma_map_single(priv->device, xdpf->data,
++ 					  xdpf->len, DMA_TO_DEVICE);
++ 		if (dma_mapping_error(priv->device, dma_addr))
++ 			return STMMAC_XDP_CONSUMED;
++ 
++ 		tx_q->tx_skbuff_dma[entry].buf_type = STMMAC_TXBUF_T_XDP_NDO;
++ 	} else {
++ 		struct page *page = virt_to_page(xdpf->data);
++ 
++ 		dma_addr = page_pool_get_dma_addr(page) + sizeof(*xdpf) +
++ 			   xdpf->headroom;
++ 		dma_sync_single_for_device(priv->device, dma_addr,
++ 					   xdpf->len, DMA_BIDIRECTIONAL);
++ 
++ 		tx_q->tx_skbuff_dma[entry].buf_type = STMMAC_TXBUF_T_XDP_TX;
++ 	}
++ 
++ 	tx_q->tx_skbuff_dma[entry].buf = dma_addr;
++ 	tx_q->tx_skbuff_dma[entry].map_as_page = false;
++ 	tx_q->tx_skbuff_dma[entry].len = xdpf->len;
++ 	tx_q->tx_skbuff_dma[entry].last_segment = true;
++ 	tx_q->tx_skbuff_dma[entry].is_jumbo = false;
++ 
++ 	tx_q->xdpf[entry] = xdpf;
++ 
++ 	stmmac_set_desc_addr(priv, tx_desc, dma_addr);
++ 
++ 	stmmac_prepare_tx_desc(priv, tx_desc, 1, xdpf->len,
++ 			       true, priv->mode, true, true,
++ 			       xdpf->len);
++ 
++ 	tx_q->tx_count_frames++;
++ 
++ 	if (tx_q->tx_count_frames % priv->tx_coal_frames[queue] == 0)
++ 		set_ic = true;
++ 	else
++ 		set_ic = false;
++ 
++ 	if (set_ic) {
++ 		tx_q->tx_count_frames = 0;
++ 		stmmac_set_tx_ic(priv, tx_desc);
++ 		priv->xstats.tx_set_ic_bit++;
++ 	}
++ 
++ 	stmmac_enable_dma_transmission(priv, priv->ioaddr);
++ 
++ 	entry = STMMAC_GET_ENTRY(entry, priv->dma_tx_size);
++ 	tx_q->cur_tx = entry;
++ 
++ 	return STMMAC_XDP_TX;
++ }
++ 
++ static int stmmac_xdp_get_tx_queue(struct stmmac_priv *priv,
++ 				   int cpu)
++ {
++ 	int index = cpu;
++ 
++ 	if (unlikely(index < 0))
++ 		index = 0;
++ 
++ 	while (index >= priv->plat->tx_queues_to_use)
++ 		index -= priv->plat->tx_queues_to_use;
++ 
++ 	return index;
++ }
++ 
++ static int stmmac_xdp_xmit_back(struct stmmac_priv *priv,
++ 				struct xdp_buff *xdp)
++ {
++ 	struct xdp_frame *xdpf = xdp_convert_buff_to_frame(xdp);
++ 	int cpu = smp_processor_id();
++ 	struct netdev_queue *nq;
++ 	int queue;
++ 	int res;
++ 
++ 	if (unlikely(!xdpf))
++ 		return STMMAC_XDP_CONSUMED;
++ 
++ 	queue = stmmac_xdp_get_tx_queue(priv, cpu);
++ 	nq = netdev_get_tx_queue(priv->dev, queue);
++ 
++ 	__netif_tx_lock(nq, cpu);
++ 	/* Avoids TX time-out as we are sharing with slow path */
++ 	nq->trans_start = jiffies;
++ 
++ 	res = stmmac_xdp_xmit_xdpf(priv, queue, xdpf, false);
++ 	if (res == STMMAC_XDP_TX)
++ 		stmmac_flush_tx_descriptors(priv, queue);
++ 
++ 	__netif_tx_unlock(nq);
++ 
++ 	return res;
++ }
++ 
++ static int __stmmac_xdp_run_prog(struct stmmac_priv *priv,
++ 				 struct bpf_prog *prog,
++ 				 struct xdp_buff *xdp)
++ {
++ 	u32 act;
++ 	int res;
++ 
++ 	act = bpf_prog_run_xdp(prog, xdp);
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		res = STMMAC_XDP_PASS;
++ 		break;
++ 	case XDP_TX:
++ 		res = stmmac_xdp_xmit_back(priv, xdp);
++ 		break;
++ 	case XDP_REDIRECT:
++ 		if (xdp_do_redirect(priv->dev, xdp, prog) < 0)
++ 			res = STMMAC_XDP_CONSUMED;
++ 		else
++ 			res = STMMAC_XDP_REDIRECT;
++ 		break;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 		fallthrough;
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(priv->dev, prog, act);
++ 		fallthrough;
++ 	case XDP_DROP:
++ 		res = STMMAC_XDP_CONSUMED;
++ 		break;
++ 	}
++ 
++ 	return res;
++ }
++ 
++ static struct sk_buff *stmmac_xdp_run_prog(struct stmmac_priv *priv,
++ 					   struct xdp_buff *xdp)
++ {
++ 	struct bpf_prog *prog;
++ 	int res;
++ 
++ 	prog = READ_ONCE(priv->xdp_prog);
++ 	if (!prog) {
++ 		res = STMMAC_XDP_PASS;
++ 		goto out;
++ 	}
++ 
++ 	res = __stmmac_xdp_run_prog(priv, prog, xdp);
++ out:
++ 	return ERR_PTR(-res);
++ }
++ 
++ static void stmmac_finalize_xdp_rx(struct stmmac_priv *priv,
++ 				   int xdp_status)
++ {
++ 	int cpu = smp_processor_id();
++ 	int queue;
++ 
++ 	queue = stmmac_xdp_get_tx_queue(priv, cpu);
++ 
++ 	if (xdp_status & STMMAC_XDP_TX)
++ 		stmmac_tx_timer_arm(priv, queue);
++ 
++ 	if (xdp_status & STMMAC_XDP_REDIRECT)
++ 		xdp_do_flush();
++ }
++ 
++ static struct sk_buff *stmmac_construct_skb_zc(struct stmmac_channel *ch,
++ 					       struct xdp_buff *xdp)
++ {
++ 	unsigned int metasize = xdp->data - xdp->data_meta;
++ 	unsigned int datasize = xdp->data_end - xdp->data;
++ 	struct sk_buff *skb;
++ 
++ 	skb = __napi_alloc_skb(&ch->rxtx_napi,
++ 			       xdp->data_end - xdp->data_hard_start,
++ 			       GFP_ATOMIC | __GFP_NOWARN);
++ 	if (unlikely(!skb))
++ 		return NULL;
++ 
++ 	skb_reserve(skb, xdp->data - xdp->data_hard_start);
++ 	memcpy(__skb_put(skb, datasize), xdp->data, datasize);
++ 	if (metasize)
++ 		skb_metadata_set(skb, metasize);
++ 
++ 	return skb;
++ }
++ 
++ static void stmmac_dispatch_skb_zc(struct stmmac_priv *priv, u32 queue,
++ 				   struct dma_desc *p, struct dma_desc *np,
++ 				   struct xdp_buff *xdp)
++ {
++ 	struct stmmac_channel *ch = &priv->channel[queue];
++ 	unsigned int len = xdp->data_end - xdp->data;
++ 	enum pkt_hash_types hash_type;
++ 	int coe = priv->hw->rx_csum;
++ 	struct sk_buff *skb;
++ 	u32 hash;
++ 
++ 	skb = stmmac_construct_skb_zc(ch, xdp);
++ 	if (!skb) {
++ 		priv->dev->stats.rx_dropped++;
++ 		return;
++ 	}
++ 
++ 	stmmac_get_rx_hwtstamp(priv, p, np, skb);
++ 	stmmac_rx_vlan(priv->dev, skb);
++ 	skb->protocol = eth_type_trans(skb, priv->dev);
++ 
++ 	if (unlikely(!coe))
++ 		skb_checksum_none_assert(skb);
++ 	else
++ 		skb->ip_summed = CHECKSUM_UNNECESSARY;
++ 
++ 	if (!stmmac_get_rx_hash(priv, p, &hash, &hash_type))
++ 		skb_set_hash(skb, hash, hash_type);
++ 
++ 	skb_record_rx_queue(skb, queue);
++ 	napi_gro_receive(&ch->rxtx_napi, skb);
++ 
++ 	priv->dev->stats.rx_packets++;
++ 	priv->dev->stats.rx_bytes += len;
++ }
++ 
++ static bool stmmac_rx_refill_zc(struct stmmac_priv *priv, u32 queue, u32 budget)
++ {
++ 	struct stmmac_rx_queue *rx_q = &priv->rx_queue[queue];
++ 	unsigned int entry = rx_q->dirty_rx;
++ 	struct dma_desc *rx_desc = NULL;
++ 	bool ret = true;
++ 
++ 	budget = min(budget, stmmac_rx_dirty(priv, queue));
++ 
++ 	while (budget-- > 0 && entry != rx_q->cur_rx) {
++ 		struct stmmac_rx_buffer *buf = &rx_q->buf_pool[entry];
++ 		dma_addr_t dma_addr;
++ 		bool use_rx_wd;
++ 
++ 		if (!buf->xdp) {
++ 			buf->xdp = xsk_buff_alloc(rx_q->xsk_pool);
++ 			if (!buf->xdp) {
++ 				ret = false;
++ 				break;
++ 			}
++ 		}
++ 
++ 		if (priv->extend_desc)
++ 			rx_desc = (struct dma_desc *)(rx_q->dma_erx + entry);
++ 		else
++ 			rx_desc = rx_q->dma_rx + entry;
++ 
++ 		dma_addr = xsk_buff_xdp_get_dma(buf->xdp);
++ 		stmmac_set_desc_addr(priv, rx_desc, dma_addr);
++ 		stmmac_set_desc_sec_addr(priv, rx_desc, 0, false);
++ 		stmmac_refill_desc3(priv, rx_q, rx_desc);
++ 
++ 		rx_q->rx_count_frames++;
++ 		rx_q->rx_count_frames += priv->rx_coal_frames[queue];
++ 		if (rx_q->rx_count_frames > priv->rx_coal_frames[queue])
++ 			rx_q->rx_count_frames = 0;
++ 
++ 		use_rx_wd = !priv->rx_coal_frames[queue];
++ 		use_rx_wd |= rx_q->rx_count_frames > 0;
++ 		if (!priv->use_riwt)
++ 			use_rx_wd = false;
++ 
++ 		dma_wmb();
++ 		stmmac_set_rx_owner(priv, rx_desc, use_rx_wd);
++ 
++ 		entry = STMMAC_GET_ENTRY(entry, priv->dma_rx_size);
++ 	}
++ 
++ 	if (rx_desc) {
++ 		rx_q->dirty_rx = entry;
++ 		rx_q->rx_tail_addr = rx_q->dma_rx_phy +
++ 				     (rx_q->dirty_rx * sizeof(struct dma_desc));
++ 		stmmac_set_rx_tail_ptr(priv, priv->ioaddr, rx_q->rx_tail_addr, queue);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int stmmac_rx_zc(struct stmmac_priv *priv, int limit, u32 queue)
++ {
++ 	struct stmmac_rx_queue *rx_q = &priv->rx_queue[queue];
++ 	unsigned int count = 0, error = 0, len = 0;
++ 	int dirty = stmmac_rx_dirty(priv, queue);
++ 	unsigned int next_entry = rx_q->cur_rx;
++ 	unsigned int desc_size;
++ 	struct bpf_prog *prog;
++ 	bool failure = false;
++ 	int xdp_status = 0;
++ 	int status = 0;
++ 
++ 	if (netif_msg_rx_status(priv)) {
++ 		void *rx_head;
++ 
++ 		netdev_dbg(priv->dev, "%s: descriptor ring:\n", __func__);
++ 		if (priv->extend_desc) {
++ 			rx_head = (void *)rx_q->dma_erx;
++ 			desc_size = sizeof(struct dma_extended_desc);
++ 		} else {
++ 			rx_head = (void *)rx_q->dma_rx;
++ 			desc_size = sizeof(struct dma_desc);
++ 		}
++ 
++ 		stmmac_display_ring(priv, rx_head, priv->dma_rx_size, true,
++ 				    rx_q->dma_rx_phy, desc_size);
++ 	}
++ 	while (count < limit) {
++ 		struct stmmac_rx_buffer *buf;
++ 		unsigned int buf1_len = 0;
++ 		struct dma_desc *np, *p;
++ 		int entry;
++ 		int res;
++ 
++ 		if (!count && rx_q->state_saved) {
++ 			error = rx_q->state.error;
++ 			len = rx_q->state.len;
++ 		} else {
++ 			rx_q->state_saved = false;
++ 			error = 0;
++ 			len = 0;
++ 		}
++ 
++ 		if (count >= limit)
++ 			break;
++ 
++ read_again:
++ 		buf1_len = 0;
++ 		entry = next_entry;
++ 		buf = &rx_q->buf_pool[entry];
++ 
++ 		if (dirty >= STMMAC_RX_FILL_BATCH) {
++ 			failure = failure ||
++ 				  !stmmac_rx_refill_zc(priv, queue, dirty);
++ 			dirty = 0;
++ 		}
++ 
++ 		if (priv->extend_desc)
++ 			p = (struct dma_desc *)(rx_q->dma_erx + entry);
++ 		else
++ 			p = rx_q->dma_rx + entry;
++ 
++ 		/* read the status of the incoming frame */
++ 		status = stmmac_rx_status(priv, &priv->dev->stats,
++ 					  &priv->xstats, p);
++ 		/* check if managed by the DMA otherwise go ahead */
++ 		if (unlikely(status & dma_own))
++ 			break;
++ 
++ 		/* Prefetch the next RX descriptor */
++ 		rx_q->cur_rx = STMMAC_GET_ENTRY(rx_q->cur_rx,
++ 						priv->dma_rx_size);
++ 		next_entry = rx_q->cur_rx;
++ 
++ 		if (priv->extend_desc)
++ 			np = (struct dma_desc *)(rx_q->dma_erx + next_entry);
++ 		else
++ 			np = rx_q->dma_rx + next_entry;
++ 
++ 		prefetch(np);
++ 
++ 		if (priv->extend_desc)
++ 			stmmac_rx_extended_status(priv, &priv->dev->stats,
++ 						  &priv->xstats,
++ 						  rx_q->dma_erx + entry);
++ 		if (unlikely(status == discard_frame)) {
++ 			xsk_buff_free(buf->xdp);
++ 			buf->xdp = NULL;
++ 			dirty++;
++ 			error = 1;
++ 			if (!priv->hwts_rx_en)
++ 				priv->dev->stats.rx_errors++;
++ 		}
++ 
++ 		if (unlikely(error && (status & rx_not_ls)))
++ 			goto read_again;
++ 		if (unlikely(error)) {
++ 			count++;
++ 			continue;
++ 		}
++ 
++ 		/* Ensure a valid XSK buffer before proceed */
++ 		if (!buf->xdp)
++ 			break;
++ 
++ 		/* XSK pool expects RX frame 1:1 mapped to XSK buffer */
++ 		if (likely(status & rx_not_ls)) {
++ 			xsk_buff_free(buf->xdp);
++ 			buf->xdp = NULL;
++ 			dirty++;
++ 			count++;
++ 			goto read_again;
++ 		}
++ 
++ 		/* XDP ZC Frame only support primary buffers for now */
++ 		buf1_len = stmmac_rx_buf1_len(priv, p, status, len);
++ 		len += buf1_len;
++ 
++ 		/* ACS is set; GMAC core strips PAD/FCS for IEEE 802.3
++ 		 * Type frames (LLC/LLC-SNAP)
++ 		 *
++ 		 * llc_snap is never checked in GMAC >= 4, so this ACS
++ 		 * feature is always disabled and packets need to be
++ 		 * stripped manually.
++ 		 */
++ 		if (likely(!(status & rx_not_ls)) &&
++ 		    (likely(priv->synopsys_id >= DWMAC_CORE_4_00) ||
++ 		     unlikely(status != llc_snap))) {
++ 			buf1_len -= ETH_FCS_LEN;
++ 			len -= ETH_FCS_LEN;
++ 		}
++ 
++ 		/* RX buffer is good and fit into a XSK pool buffer */
++ 		buf->xdp->data_end = buf->xdp->data + buf1_len;
++ 		xsk_buff_dma_sync_for_cpu(buf->xdp, rx_q->xsk_pool);
++ 
++ 		prog = READ_ONCE(priv->xdp_prog);
++ 		res = __stmmac_xdp_run_prog(priv, prog, buf->xdp);
++ 
++ 		switch (res) {
++ 		case STMMAC_XDP_PASS:
++ 			stmmac_dispatch_skb_zc(priv, queue, p, np, buf->xdp);
++ 			xsk_buff_free(buf->xdp);
++ 			break;
++ 		case STMMAC_XDP_CONSUMED:
++ 			xsk_buff_free(buf->xdp);
++ 			priv->dev->stats.rx_dropped++;
++ 			break;
++ 		case STMMAC_XDP_TX:
++ 		case STMMAC_XDP_REDIRECT:
++ 			xdp_status |= res;
++ 			break;
++ 		}
++ 
++ 		buf->xdp = NULL;
++ 		dirty++;
++ 		count++;
++ 	}
++ 
++ 	if (status & rx_not_ls) {
++ 		rx_q->state_saved = true;
++ 		rx_q->state.error = error;
++ 		rx_q->state.len = len;
++ 	}
++ 
++ 	stmmac_finalize_xdp_rx(priv, xdp_status);
++ 
++ 	priv->xstats.rx_pkt_n += count;
++ 	priv->xstats.rxq_stats[queue].rx_pkt_n += count;
++ 
++ 	if (xsk_uses_need_wakeup(rx_q->xsk_pool)) {
++ 		if (failure || stmmac_rx_dirty(priv, queue) > 0)
++ 			xsk_set_rx_need_wakeup(rx_q->xsk_pool);
++ 		else
++ 			xsk_clear_rx_need_wakeup(rx_q->xsk_pool);
++ 
++ 		return (int)count;
++ 	}
++ 
++ 	return failure ? limit : (int)count;
++ }
++ 
+++>>>>>>> 68e9c5dee1cf (net: stmmac: add ethtool per-queue statistic framework)
+  /**
+   * stmmac_rx - manage the receive process
+   * @priv: driver private structure
+diff --git a/drivers/net/ethernet/stmicro/stmmac/common.h b/drivers/net/ethernet/stmicro/stmmac/common.h
+index 2f8e5961a08a..c3f7ecbc1916 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/common.h
++++ b/drivers/net/ethernet/stmicro/stmmac/common.h
+@@ -63,6 +63,14 @@
+ #undef FRAME_FILTER_DEBUG
+ /* #define FRAME_FILTER_DEBUG */
+ 
++struct stmmac_txq_stats {
++	unsigned long tx_pkt_n;
++};
++
++struct stmmac_rxq_stats {
++	unsigned long rx_pkt_n;
++};
++
+ /* Extra statistic and debug information exposed by ethtool */
+ struct stmmac_extra_stats {
+ 	/* Transmit errors */
+@@ -194,6 +202,9 @@ struct stmmac_extra_stats {
+ 	unsigned long mtl_est_hlbf;
+ 	unsigned long mtl_est_btre;
+ 	unsigned long mtl_est_btrlm;
++	/* per queue statistics */
++	struct stmmac_txq_stats txq_stats[MTL_MAX_TX_QUEUES];
++	struct stmmac_rxq_stats rxq_stats[MTL_MAX_RX_QUEUES];
+ };
+ 
+ /* Safety Feature statistics exposed by ethtool */
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
+index 718d3fc35773..daf8ccb795d6 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
+@@ -271,6 +271,16 @@ static const struct stmmac_stats stmmac_mmc[] = {
+ };
+ #define STMMAC_MMC_STATS_LEN ARRAY_SIZE(stmmac_mmc)
+ 
++static const char stmmac_qstats_tx_string[][ETH_GSTRING_LEN] = {
++	"tx_pkt_n",
++#define STMMAC_TXQ_STATS ARRAY_SIZE(stmmac_qstats_tx_string)
++};
++
++static const char stmmac_qstats_rx_string[][ETH_GSTRING_LEN] = {
++	"rx_pkt_n",
++#define STMMAC_RXQ_STATS ARRAY_SIZE(stmmac_qstats_rx_string)
++};
++
+ static void stmmac_ethtool_getdrvinfo(struct net_device *dev,
+ 				      struct ethtool_drvinfo *info)
+ {
+@@ -524,6 +534,31 @@ stmmac_set_pauseparam(struct net_device *netdev,
+ 	}
+ }
+ 
++static void stmmac_get_per_qstats(struct stmmac_priv *priv, u64 *data)
++{
++	u32 tx_cnt = priv->plat->tx_queues_to_use;
++	u32 rx_cnt = priv->plat->rx_queues_to_use;
++	int q, stat;
++	char *p;
++
++	for (q = 0; q < tx_cnt; q++) {
++		p = (char *)priv + offsetof(struct stmmac_priv,
++					    xstats.txq_stats[q].tx_pkt_n);
++		for (stat = 0; stat < STMMAC_TXQ_STATS; stat++) {
++			*data++ = (*(u64 *)p);
++			p += sizeof(u64 *);
++		}
++	}
++	for (q = 0; q < rx_cnt; q++) {
++		p = (char *)priv + offsetof(struct stmmac_priv,
++					    xstats.rxq_stats[q].rx_pkt_n);
++		for (stat = 0; stat < STMMAC_RXQ_STATS; stat++) {
++			*data++ = (*(u64 *)p);
++			p += sizeof(u64 *);
++		}
++	}
++}
++
+ static void stmmac_get_ethtool_stats(struct net_device *dev,
+ 				 struct ethtool_stats *dummy, u64 *data)
+ {
+@@ -574,16 +609,21 @@ static void stmmac_get_ethtool_stats(struct net_device *dev,
+ 		data[j++] = (stmmac_gstrings_stats[i].sizeof_stat ==
+ 			     sizeof(u64)) ? (*(u64 *)p) : (*(u32 *)p);
+ 	}
++	stmmac_get_per_qstats(priv, &data[j]);
+ }
+ 
+ static int stmmac_get_sset_count(struct net_device *netdev, int sset)
+ {
+ 	struct stmmac_priv *priv = netdev_priv(netdev);
++	u32 tx_cnt = priv->plat->tx_queues_to_use;
++	u32 rx_cnt = priv->plat->rx_queues_to_use;
+ 	int i, len, safety_len = 0;
+ 
+ 	switch (sset) {
+ 	case ETH_SS_STATS:
+-		len = STMMAC_STATS_LEN;
++		len = STMMAC_STATS_LEN +
++		      STMMAC_TXQ_STATS * tx_cnt +
++		      STMMAC_RXQ_STATS * rx_cnt;
+ 
+ 		if (priv->dma_cap.rmon)
+ 			len += STMMAC_MMC_STATS_LEN;
+@@ -604,6 +644,28 @@ static int stmmac_get_sset_count(struct net_device *netdev, int sset)
+ 	}
+ }
+ 
++static void stmmac_get_qstats_string(struct stmmac_priv *priv, u8 *data)
++{
++	u32 tx_cnt = priv->plat->tx_queues_to_use;
++	u32 rx_cnt = priv->plat->rx_queues_to_use;
++	int q, stat;
++
++	for (q = 0; q < tx_cnt; q++) {
++		for (stat = 0; stat < STMMAC_TXQ_STATS; stat++) {
++			snprintf(data, ETH_GSTRING_LEN, "q%d_%s", q,
++				 stmmac_qstats_tx_string[stat]);
++			data += ETH_GSTRING_LEN;
++		}
++	}
++	for (q = 0; q < rx_cnt; q++) {
++		for (stat = 0; stat < STMMAC_RXQ_STATS; stat++) {
++			snprintf(data, ETH_GSTRING_LEN, "q%d_%s", q,
++				 stmmac_qstats_rx_string[stat]);
++			data += ETH_GSTRING_LEN;
++		}
++	}
++}
++
+ static void stmmac_get_strings(struct net_device *dev, u32 stringset, u8 *data)
+ {
+ 	int i;
+@@ -634,6 +696,7 @@ static void stmmac_get_strings(struct net_device *dev, u32 stringset, u8 *data)
+ 				ETH_GSTRING_LEN);
+ 			p += ETH_GSTRING_LEN;
+ 		}
++		stmmac_get_qstats_string(priv, p);
+ 		break;
+ 	default:
+ 		WARN_ON(1);
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
