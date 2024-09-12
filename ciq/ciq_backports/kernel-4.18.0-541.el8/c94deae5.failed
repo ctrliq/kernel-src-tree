@@ -1,0 +1,322 @@
+mxser: remove MOXA_GETMSTATUS ioctl
+
+jira LE-1907
+cve CVE-2023-6546
+Rebuild_History Non-Buildable kernel-4.18.0-541.el8
+commit-author Jiri Slaby <jslaby@suse.cz>
+commit c94deae5b708b21727eae5bc830cb176c05ec2e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-541.el8/c94deae5.failed
+
+1) MOXA_GETMSTATUS is broken at least since commit ecbbfd44a08f (TTY:
+   move tty buffers to tty_port) in 2012.
+   Even though it's mentioned in the mon_pa moxa utility, obviously
+   noone ever tried that in that timeframe.
+2) The ioctl definition was never exposed to userspace, so noone
+   should actually be reliably using this.
+
+Provided the above, remove this mxser-special ioctl.
+
+And remove the whole concept of mxser_ioctl_special as this was the last
+ioctl in there.
+
+	Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+Link: https://lore.kernel.org/r/20210618061516.662-29-jslaby@suse.cz
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit c94deae5b708b21727eae5bc830cb176c05ec2e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/mxser.c
+diff --cc drivers/tty/mxser.c
+index ff7a0e941388,1eb48141d6ca..000000000000
+--- a/drivers/tty/mxser.c
++++ b/drivers/tty/mxser.c
+@@@ -50,9 -50,7 +50,8 @@@
+   */
+  
+  #define MOXA			0x400
+ +#define MOXA_GETDATACOUNT	(MOXA + 23)
+  #define MOXA_HighSpeedOn	(MOXA + 61)
+- #define MOXA_GETMSTATUS		(MOXA + 65)
+  #define MOXA_SET_OP_MODE	(MOXA + 66)
+  #define MOXA_GET_OP_MODE	(MOXA + 67)
+  
+@@@ -392,17 -317,8 +391,9 @@@ struct mxser_board 
+  	struct mxser_port ports[MXSER_PORTS_PER_BOARD];
+  };
+  
+- struct mxser_mstatus {
+- 	tcflag_t cflag;
+- 	int cts;
+- 	int dsr;
+- 	int ri;
+- 	int dcd;
+- };
+- 
+  static struct mxser_board mxser_boards[MXSER_BOARDS];
+  static struct tty_driver *mxvar_sdriver;
+ +static struct mxser_log mxvar_log;
+  
+  static void mxser_enable_must_enchance_mode(unsigned long baseio)
+  {
+@@@ -1516,254 -1407,6 +1507,257 @@@ static int mxser_tiocmset(struct tty_st
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int __init mxser_program_mode(int port)
+ +{
+ +	int id, i, j, n;
+ +
+ +	outb(0, port);
+ +	outb(0, port);
+ +	outb(0, port);
+ +	(void)inb(port);
+ +	(void)inb(port);
+ +	outb(0, port);
+ +	(void)inb(port);
+ +
+ +	id = inb(port + 1) & 0x1F;
+ +	if ((id != C168_ASIC_ID) &&
+ +			(id != C104_ASIC_ID) &&
+ +			(id != C102_ASIC_ID) &&
+ +			(id != CI132_ASIC_ID) &&
+ +			(id != CI134_ASIC_ID) &&
+ +			(id != CI104J_ASIC_ID))
+ +		return -1;
+ +	for (i = 0, j = 0; i < 4; i++) {
+ +		n = inb(port + 2);
+ +		if (n == 'M') {
+ +			j = 1;
+ +		} else if ((j == 1) && (n == 1)) {
+ +			j = 2;
+ +			break;
+ +		} else
+ +			j = 0;
+ +	}
+ +	if (j != 2)
+ +		id = -2;
+ +	return id;
+ +}
+ +
+ +static void __init mxser_normal_mode(int port)
+ +{
+ +	int i, n;
+ +
+ +	outb(0xA5, port + 1);
+ +	outb(0x80, port + 3);
+ +	outb(12, port + 0);	/* 9600 bps */
+ +	outb(0, port + 1);
+ +	outb(0x03, port + 3);	/* 8 data bits */
+ +	outb(0x13, port + 4);	/* loop back mode */
+ +	for (i = 0; i < 16; i++) {
+ +		n = inb(port + 5);
+ +		if ((n & 0x61) == 0x60)
+ +			break;
+ +		if ((n & 1) == 1)
+ +			(void)inb(port);
+ +	}
+ +	outb(0x00, port + 4);
+ +}
+ +
+ +#define CHIP_SK 	0x01	/* Serial Data Clock  in Eprom */
+ +#define CHIP_DO 	0x02	/* Serial Data Output in Eprom */
+ +#define CHIP_CS 	0x04	/* Serial Chip Select in Eprom */
+ +#define CHIP_DI 	0x08	/* Serial Data Input  in Eprom */
+ +#define EN_CCMD 	0x000	/* Chip's command register     */
+ +#define EN0_RSARLO	0x008	/* Remote start address reg 0  */
+ +#define EN0_RSARHI	0x009	/* Remote start address reg 1  */
+ +#define EN0_RCNTLO	0x00A	/* Remote byte count reg WR    */
+ +#define EN0_RCNTHI	0x00B	/* Remote byte count reg WR    */
+ +#define EN0_DCFG	0x00E	/* Data configuration reg WR   */
+ +#define EN0_PORT	0x010	/* Rcv missed frame error counter RD */
+ +#define ENC_PAGE0	0x000	/* Select page 0 of chip registers   */
+ +#define ENC_PAGE3	0x0C0	/* Select page 3 of chip registers   */
+ +static int __init mxser_read_register(int port, unsigned short *regs)
+ +{
+ +	int i, k, value, id;
+ +	unsigned int j;
+ +
+ +	id = mxser_program_mode(port);
+ +	if (id < 0)
+ +		return id;
+ +	for (i = 0; i < 14; i++) {
+ +		k = (i & 0x3F) | 0x180;
+ +		for (j = 0x100; j > 0; j >>= 1) {
+ +			outb(CHIP_CS, port);
+ +			if (k & j) {
+ +				outb(CHIP_CS | CHIP_DO, port);
+ +				outb(CHIP_CS | CHIP_DO | CHIP_SK, port);	/* A? bit of read */
+ +			} else {
+ +				outb(CHIP_CS, port);
+ +				outb(CHIP_CS | CHIP_SK, port);	/* A? bit of read */
+ +			}
+ +		}
+ +		(void)inb(port);
+ +		value = 0;
+ +		for (k = 0, j = 0x8000; k < 16; k++, j >>= 1) {
+ +			outb(CHIP_CS, port);
+ +			outb(CHIP_CS | CHIP_SK, port);
+ +			if (inb(port) & CHIP_DI)
+ +				value |= j;
+ +		}
+ +		regs[i] = value;
+ +		outb(0, port);
+ +	}
+ +	mxser_normal_mode(port);
+ +	return id;
+ +}
+ +
+ +static int mxser_ioctl_special(unsigned int cmd, void __user *argp)
+ +{
+ +	struct mxser_port *ip;
+ +	struct tty_port *port;
+ +	struct tty_struct *tty;
+ +	int status;
+ +	unsigned int i, j;
+ +	int ret = 0;
+ +
+ +	switch (cmd) {
+ +	case MOXA_GETDATACOUNT:
+ +		/* The receive side is locked by port->slock but it isn't
+ +		   clear that an exact snapshot is worth copying here */
+ +		if (copy_to_user(argp, &mxvar_log, sizeof(mxvar_log)))
+ +			ret = -EFAULT;
+ +		return ret;
+ +	case MOXA_GETMSTATUS: {
+ +		struct mxser_mstatus ms, __user *msu = argp;
+ +		for (i = 0; i < MXSER_BOARDS; i++)
+ +			for (j = 0; j < MXSER_PORTS_PER_BOARD; j++) {
+ +				ip = &mxser_boards[i].ports[j];
+ +				port = &ip->port;
+ +				memset(&ms, 0, sizeof(ms));
+ +
+ +				mutex_lock(&port->mutex);
+ +				if (!ip->ioaddr)
+ +					goto copy;
+ +				
+ +				tty = tty_port_tty_get(port);
+ +
+ +				if (!tty)
+ +					ms.cflag = ip->normal_termios.c_cflag;
+ +				else
+ +					ms.cflag = tty->termios.c_cflag;
+ +				tty_kref_put(tty);
+ +				spin_lock_irq(&ip->slock);
+ +				status = inb(ip->ioaddr + UART_MSR);
+ +				spin_unlock_irq(&ip->slock);
+ +				if (status & UART_MSR_DCD)
+ +					ms.dcd = 1;
+ +				if (status & UART_MSR_DSR)
+ +					ms.dsr = 1;
+ +				if (status & UART_MSR_CTS)
+ +					ms.cts = 1;
+ +			copy:
+ +				mutex_unlock(&port->mutex);
+ +				if (copy_to_user(msu, &ms, sizeof(ms)))
+ +					return -EFAULT;
+ +				msu++;
+ +			}
+ +		return 0;
+ +	}
+ +	case MOXA_ASPP_MON_EXT: {
+ +		struct mxser_mon_ext *me; /* it's 2k, stack unfriendly */
+ +		unsigned int cflag, iflag, p;
+ +		u8 opmode;
+ +
+ +		me = kzalloc(sizeof(*me), GFP_KERNEL);
+ +		if (!me)
+ +			return -ENOMEM;
+ +
+ +		for (i = 0, p = 0; i < MXSER_BOARDS; i++) {
+ +			for (j = 0; j < MXSER_PORTS_PER_BOARD; j++, p++) {
+ +				if (p >= ARRAY_SIZE(me->rx_cnt)) {
+ +					i = MXSER_BOARDS;
+ +					break;
+ +				}
+ +				ip = &mxser_boards[i].ports[j];
+ +				port = &ip->port;
+ +
+ +				mutex_lock(&port->mutex);
+ +				if (!ip->ioaddr) {
+ +					mutex_unlock(&port->mutex);
+ +					continue;
+ +				}
+ +
+ +				spin_lock_irq(&ip->slock);
+ +				status = mxser_get_msr(ip->ioaddr, 0, p);
+ +
+ +				if (status & UART_MSR_TERI)
+ +					ip->icount.rng++;
+ +				if (status & UART_MSR_DDSR)
+ +					ip->icount.dsr++;
+ +				if (status & UART_MSR_DDCD)
+ +					ip->icount.dcd++;
+ +				if (status & UART_MSR_DCTS)
+ +					ip->icount.cts++;
+ +
+ +				ip->mon_data.modem_status = status;
+ +				me->rx_cnt[p] = ip->mon_data.rxcnt;
+ +				me->tx_cnt[p] = ip->mon_data.txcnt;
+ +				me->up_rxcnt[p] = ip->mon_data.up_rxcnt;
+ +				me->up_txcnt[p] = ip->mon_data.up_txcnt;
+ +				me->modem_status[p] =
+ +					ip->mon_data.modem_status;
+ +				spin_unlock_irq(&ip->slock);
+ +
+ +				tty = tty_port_tty_get(&ip->port);
+ +
+ +				if (!tty) {
+ +					cflag = ip->normal_termios.c_cflag;
+ +					iflag = ip->normal_termios.c_iflag;
+ +					me->baudrate[p] = tty_termios_baud_rate(&ip->normal_termios);
+ +				} else {
+ +					cflag = tty->termios.c_cflag;
+ +					iflag = tty->termios.c_iflag;
+ +					me->baudrate[p] = tty_get_baud_rate(tty);
+ +				}
+ +				tty_kref_put(tty);
+ +
+ +				me->databits[p] = cflag & CSIZE;
+ +				me->stopbits[p] = cflag & CSTOPB;
+ +				me->parity[p] = cflag & (PARENB | PARODD |
+ +						CMSPAR);
+ +
+ +				if (cflag & CRTSCTS)
+ +					me->flowctrl[p] |= 0x03;
+ +
+ +				if (iflag & (IXON | IXOFF))
+ +					me->flowctrl[p] |= 0x0C;
+ +
+ +				if (ip->type == PORT_16550A)
+ +					me->fifo[p] = 1;
+ +
+ +				if (ip->board->chip_flag == MOXA_MUST_MU860_HWID) {
+ +					opmode = inb(ip->opmode_ioaddr)>>((p % 4) * 2);
+ +					opmode &= OP_MODE_MASK;
+ +				} else {
+ +					opmode = RS232_MODE;
+ +				}
+ +				me->iftype[p] = opmode;
+ +				mutex_unlock(&port->mutex);
+ +			}
+ +		}
+ +		if (copy_to_user(argp, me, sizeof(*me)))
+ +			ret = -EFAULT;
+ +		kfree(me);
+ +		return ret;
+ +	}
+ +	default:
+ +		return -ENOIOCTLCMD;
+ +	}
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> c94deae5b708 (mxser: remove MOXA_GETMSTATUS ioctl)
+  static int mxser_cflags_changed(struct mxser_port *info, unsigned long arg,
+  		struct async_icount *cprev)
+  {
+* Unmerged path drivers/tty/mxser.c
