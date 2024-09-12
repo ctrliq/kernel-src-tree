@@ -1,0 +1,180 @@
+sctp: delete free member from struct sctp_sched_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-497.el8
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 7d802c8098c50fb7dcf5dfcb6466482e1f2b15e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-497.el8/7d802c80.failed
+
+After commit 9ed7bfc79542 ("sctp: fix memory leak in
+sctp_stream_outq_migrate()"), sctp_sched_set_sched() is the only
+place calling sched->free(), and it can actually be replaced by
+sched->free_sid() on each stream, and yet there's already a loop
+to traverse all streams in sctp_sched_set_sched().
+
+This patch adds a function sctp_sched_free_sched() where it calls
+sched->free_sid() for each stream to replace sched->free() calls
+in sctp_sched_set_sched() and then deletes the unused free member
+from struct sctp_sched_ops.
+
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+Link: https://lore.kernel.org/r/e10aac150aca2686cb0bd0570299ec716da5a5c0.1669849471.git.lucien.xin@gmail.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 7d802c8098c50fb7dcf5dfcb6466482e1f2b15e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sctp/stream_sched.h
+#	net/sctp/stream_sched.c
+#	net/sctp/stream_sched_prio.c
+#	net/sctp/stream_sched_rr.c
+diff --cc include/net/sctp/stream_sched.h
+index 5c5da48f65e7,fa00dc20a0d7..000000000000
+--- a/include/net/sctp/stream_sched.h
++++ b/include/net/sctp/stream_sched.h
+@@@ -41,8 -26,8 +41,13 @@@ struct sctp_sched_ops 
+  	int (*init)(struct sctp_stream *stream);
+  	/* Init a stream */
+  	int (*init_sid)(struct sctp_stream *stream, __u16 sid, gfp_t gfp);
+++<<<<<<< HEAD
+ +	/* Frees the entire thing */
+ +	void (*free)(struct sctp_stream *stream);
+++=======
++ 	/* free a stream */
++ 	void (*free_sid)(struct sctp_stream *stream, __u16 sid);
+++>>>>>>> 7d802c8098c5 (sctp: delete free member from struct sctp_sched_ops)
+  
+  	/* Enqueue a chunk */
+  	void (*enqueue)(struct sctp_outq *q, struct sctp_datamsg *msg);
+diff --cc net/sctp/stream_sched.c
+index 0e789c8940ee,330067002deb..000000000000
+--- a/net/sctp/stream_sched.c
++++ b/net/sctp/stream_sched.c
+@@@ -61,7 -46,7 +61,11 @@@ static int sctp_sched_fcfs_init_sid(str
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void sctp_sched_fcfs_free(struct sctp_stream *stream)
+++=======
++ static void sctp_sched_fcfs_free_sid(struct sctp_stream *stream, __u16 sid)
+++>>>>>>> 7d802c8098c5 (sctp: delete free member from struct sctp_sched_ops)
+  {
+  }
+  
+@@@ -111,7 -96,7 +115,11 @@@ static struct sctp_sched_ops sctp_sched
+  	.get = sctp_sched_fcfs_get,
+  	.init = sctp_sched_fcfs_init,
+  	.init_sid = sctp_sched_fcfs_init_sid,
+++<<<<<<< HEAD
+ +	.free = sctp_sched_fcfs_free,
+++=======
++ 	.free_sid = sctp_sched_fcfs_free_sid,
+++>>>>>>> 7d802c8098c5 (sctp: delete free member from struct sctp_sched_ops)
+  	.enqueue = sctp_sched_fcfs_enqueue,
+  	.dequeue = sctp_sched_fcfs_dequeue,
+  	.dequeue_done = sctp_sched_fcfs_dequeue_done,
+diff --cc net/sctp/stream_sched_prio.c
+index 2245083a98f2,42d4800f263d..000000000000
+--- a/net/sctp/stream_sched_prio.c
++++ b/net/sctp/stream_sched_prio.c
+@@@ -219,30 -204,22 +219,49 @@@ static int sctp_sched_prio_init_sid(str
+  	return sctp_sched_prio_set(stream, sid, 0, gfp);
+  }
+  
+++<<<<<<< HEAD
+ +static void sctp_sched_prio_free(struct sctp_stream *stream)
+ +{
+ +	struct sctp_stream_priorities *prio, *n;
+ +	LIST_HEAD(list);
+ +	int i;
+ +
+ +	/* As we don't keep a list of priorities, to avoid multiple
+ +	 * frees we have to do it in 3 steps:
+ +	 *   1. unsched everyone, so the lists are free to use in 2.
+ +	 *   2. build the list of the priorities
+ +	 *   3. free the list
+ +	 */
+ +	sctp_sched_prio_unsched_all(stream);
+ +	for (i = 0; i < stream->outcnt; i++) {
+ +		if (!SCTP_SO(stream, i)->ext)
+ +			continue;
+ +		prio = SCTP_SO(stream, i)->ext->prio_head;
+ +		if (prio && list_empty(&prio->prio_sched))
+ +			list_add(&prio->prio_sched, &list);
+ +	}
+ +	list_for_each_entry_safe(prio, n, &list, prio_sched) {
+ +		list_del_init(&prio->prio_sched);
+ +		kfree(prio);
+ +	}
+++=======
++ static void sctp_sched_prio_free_sid(struct sctp_stream *stream, __u16 sid)
++ {
++ 	struct sctp_stream_priorities *prio = SCTP_SO(stream, sid)->ext->prio_head;
++ 	int i;
++ 
++ 	if (!prio)
++ 		return;
++ 
++ 	SCTP_SO(stream, sid)->ext->prio_head = NULL;
++ 	for (i = 0; i < stream->outcnt; i++) {
++ 		if (SCTP_SO(stream, i)->ext &&
++ 		    SCTP_SO(stream, i)->ext->prio_head == prio)
++ 			return;
++ 	}
++ 
++ 	kfree(prio);
+++>>>>>>> 7d802c8098c5 (sctp: delete free member from struct sctp_sched_ops)
+  }
+  
+  static void sctp_sched_prio_enqueue(struct sctp_outq *q,
+@@@ -338,7 -315,7 +357,11 @@@ static struct sctp_sched_ops sctp_sched
+  	.get = sctp_sched_prio_get,
+  	.init = sctp_sched_prio_init,
+  	.init_sid = sctp_sched_prio_init_sid,
+++<<<<<<< HEAD
+ +	.free = sctp_sched_prio_free,
+++=======
++ 	.free_sid = sctp_sched_prio_free_sid,
+++>>>>>>> 7d802c8098c5 (sctp: delete free member from struct sctp_sched_ops)
+  	.enqueue = sctp_sched_prio_enqueue,
+  	.dequeue = sctp_sched_prio_dequeue,
+  	.dequeue_done = sctp_sched_prio_dequeue_done,
+diff --cc net/sctp/stream_sched_rr.c
+index 52ba743fa7a7,1f235e7f643a..000000000000
+--- a/net/sctp/stream_sched_rr.c
++++ b/net/sctp/stream_sched_rr.c
+@@@ -105,9 -90,8 +105,14 @@@ static int sctp_sched_rr_init_sid(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void sctp_sched_rr_free(struct sctp_stream *stream)
+ +{
+ +	sctp_sched_rr_unsched_all(stream);
+++=======
++ static void sctp_sched_rr_free_sid(struct sctp_stream *stream, __u16 sid)
++ {
+++>>>>>>> 7d802c8098c5 (sctp: delete free member from struct sctp_sched_ops)
+  }
+  
+  static void sctp_sched_rr_enqueue(struct sctp_outq *q,
+@@@ -192,7 -176,7 +197,11 @@@ static struct sctp_sched_ops sctp_sched
+  	.get = sctp_sched_rr_get,
+  	.init = sctp_sched_rr_init,
+  	.init_sid = sctp_sched_rr_init_sid,
+++<<<<<<< HEAD
+ +	.free = sctp_sched_rr_free,
+++=======
++ 	.free_sid = sctp_sched_rr_free_sid,
+++>>>>>>> 7d802c8098c5 (sctp: delete free member from struct sctp_sched_ops)
+  	.enqueue = sctp_sched_rr_enqueue,
+  	.dequeue = sctp_sched_rr_dequeue,
+  	.dequeue_done = sctp_sched_rr_dequeue_done,
+* Unmerged path include/net/sctp/stream_sched.h
+* Unmerged path net/sctp/stream_sched.c
+* Unmerged path net/sctp/stream_sched_prio.c
+* Unmerged path net/sctp/stream_sched_rr.c
