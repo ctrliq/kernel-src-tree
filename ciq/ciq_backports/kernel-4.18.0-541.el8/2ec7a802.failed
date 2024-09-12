@@ -1,0 +1,165 @@
+tty: n_gsm: add parameters used with parameter negotiation
+
+jira LE-1907
+cve CVE-2023-6546
+Rebuild_History Non-Buildable kernel-4.18.0-541.el8
+commit-author Daniel Starke <daniel.starke@siemens.com>
+commit 2ec7a802a04c545ceea96bf67ee818d8bb0349e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-541.el8/2ec7a802.failed
+
+n_gsm is based on the 3GPP 07.010 and its newer version is the 3GPP 27.010.
+See https://portal.3gpp.org/desktopmodules/Specifications/SpecificationDetails.aspx?specificationId=1516
+The changes from 07.010 to 27.010 are non-functional. Therefore, I refer to
+the newer 27.010 here. Chapter 5.4.6.3.1 describes the encoding of the
+parameter negotiation messages.
+
+Add the parameters used there to 'gsm_mux' and 'gsm_dlci' and initialize both
+according to the value ranges and recommended defaults defined in chapter 5.7.
+
+Replace the use of the DLC default values from the 'gsm_mux' fields with the DLC
+specific values from the 'gsm_dlci' fields where applicable.
+
+	Signed-off-by: Daniel Starke <daniel.starke@siemens.com>
+Link: https://lore.kernel.org/r/20221103091743.2119-2-daniel.starke@siemens.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 2ec7a802a04c545ceea96bf67ee818d8bb0349e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/n_gsm.c
+diff --cc drivers/tty/n_gsm.c
+index f0df02192be6,c217013b3e16..000000000000
+--- a/drivers/tty/n_gsm.c
++++ b/drivers/tty/n_gsm.c
+@@@ -936,41 -1078,48 +949,66 @@@ static int gsm_dlci_data_output(struct 
+  {
+  	struct gsm_msg *msg;
+  	u8 *dp;
+ -	int h, len, size;
+ -
+ -	/* for modem bits without break data */
+ -	h = ((dlci->adaption == 1) ? 0 : 1);
+ -
+ -	len = kfifo_len(&dlci->fifo);
+ -	if (len == 0)
+ -		return 0;
+ +	int len, total_size, size;
+ +	int h = dlci->adaption - 1;
+  
+ +	total_size = 0;
+ +	while (1) {
+ +		len = kfifo_len(dlci->fifo);
+ +		if (len == 0)
+ +			return total_size;
+ +
+ +		/* MTU/MRU count only the data bits */
+ +		if (len > gsm->mtu)
+ +			len = gsm->mtu;
+ +
+++<<<<<<< HEAD
+ +		size = len + h;
+ +
+ +		msg = gsm_data_alloc(gsm, dlci->addr, size, gsm->ftype);
+ +		/* FIXME: need a timer or something to kick this so it can't
+ +		   get stuck with no work outstanding and no buffer free */
+ +		if (msg == NULL)
+ +			return -ENOMEM;
+ +		dp = msg->data;
+ +		switch (dlci->adaption) {
+ +		case 1:	/* Unstructured */
+ +			break;
+ +		case 2:	/* Unstructed with modem bits.
+ +		Always one byte as we never send inline break data */
+ +			*dp++ = (gsm_encode_modem(dlci) << 1) | EA;
+ +			break;
+ +		}
+ +		WARN_ON(kfifo_out_locked(dlci->fifo, dp , len, &dlci->lock) != len);
+ +		__gsm_data_queue(dlci, msg);
+ +		total_size += size;
+++=======
++ 	/* MTU/MRU count only the data bits but watch adaption mode */
++ 	if ((len + h) > dlci->mtu)
++ 		len = dlci->mtu - h;
++ 
++ 	size = len + h;
++ 
++ 	msg = gsm_data_alloc(gsm, dlci->addr, size, dlci->ftype);
++ 	if (!msg)
++ 		return -ENOMEM;
++ 	dp = msg->data;
++ 	switch (dlci->adaption) {
++ 	case 1: /* Unstructured */
++ 		break;
++ 	case 2: /* Unstructured with modem bits.
++ 		 * Always one byte as we never send inline break data
++ 		 */
++ 		*dp++ = (gsm_encode_modem(dlci) << 1) | EA;
++ 		break;
++ 	default:
++ 		pr_err("%s: unsupported adaption %d\n", __func__,
++ 		       dlci->adaption);
++ 		break;
+++>>>>>>> 2ec7a802a04c (tty: n_gsm: add parameters used with parameter negotiation)
+  	}
+ -
+ -	WARN_ON(len != kfifo_out_locked(&dlci->fifo, dp, len,
+ -		&dlci->lock));
+ -
+ -	/* Notify upper layer about available send space. */
+ -	tty_port_tty_wakeup(&dlci->port);
+ -
+ -	__gsm_data_queue(dlci, msg);
+  	/* Bytes of data we used up */
+ -	return size;
+ +	return total_size;
+  }
+  
+  /**
+@@@ -1020,10 -1169,7 +1058,14 @@@ static int gsm_dlci_data_output_framed(
+  		last = 1;
+  
+  	size = len + overhead;
+++<<<<<<< HEAD
+ +	msg = gsm_data_alloc(gsm, dlci->addr, size, gsm->ftype);
+ +
+ +	/* FIXME: need a timer or something to kick this so it can't
+ +	   get stuck with no work outstanding and no buffer free */
+++=======
++ 	msg = gsm_data_alloc(gsm, dlci->addr, size, dlci->ftype);
+++>>>>>>> 2ec7a802a04c (tty: n_gsm: add parameters used with parameter negotiation)
+  	if (msg == NULL) {
+  		skb_queue_tail(&dlci->skb_list, dlci->skb);
+  		dlci->skb = NULL;
+@@@ -2474,10 -2672,12 +2525,12 @@@ static struct gsm_mux *gsm_alloc_mux(vo
+  
+  	gsm->t1 = T1;
+  	gsm->t2 = T2;
++ 	gsm->t3 = T3;
+  	gsm->n2 = N2;
++ 	gsm->k = K;
+  	gsm->ftype = UIH;
+  	gsm->adaption = 1;
+ -	gsm->encoding = GSM_ADV_OPT;
+ +	gsm->encoding = 1;
+  	gsm->mru = 64;	/* Default to encoding 1 so these should be 64 */
+  	gsm->mtu = 64;
+  	gsm->dead = true;	/* Avoid early tty opens */
+@@@ -3083,12 -3327,12 +3144,12 @@@ static int gsm_create_network(struct gs
+  	net = alloc_netdev(sizeof(struct gsm_mux_net), netname,
+  			   NET_NAME_UNKNOWN, gsm_mux_net_init);
+  	if (!net) {
+ -		pr_err("alloc_netdev failed\n");
+ +		pr_err("alloc_netdev failed");
+  		return -ENOMEM;
+  	}
+- 	net->mtu = dlci->gsm->mtu;
++ 	net->mtu = dlci->mtu;
+  	net->min_mtu = MIN_MTU;
+- 	net->max_mtu = dlci->gsm->mtu;
++ 	net->max_mtu = dlci->mtu;
+  	mux_net = netdev_priv(net);
+  	mux_net->dlci = dlci;
+  	kref_init(&mux_net->ref);
+* Unmerged path drivers/tty/n_gsm.c
