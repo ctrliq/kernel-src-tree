@@ -324,7 +324,7 @@ static struct platform_driver broadwell_audio = {
 	.probe = broadwell_audio_probe,
 	.remove = broadwell_audio_remove,
 	.driver = {
-		.name = "broadwell-audio",
+		.name = "bdw_rt286",
 		.pm = &snd_soc_pm_ops
 	},
 };
@@ -335,4 +335,4 @@ module_platform_driver(broadwell_audio)
 MODULE_AUTHOR("Liam Girdwood, Xingchao Wang");
 MODULE_DESCRIPTION("Intel SST Audio for WPT/Broadwell");
 MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:broadwell-audio");
+MODULE_ALIAS("platform:bdw_rt286");
