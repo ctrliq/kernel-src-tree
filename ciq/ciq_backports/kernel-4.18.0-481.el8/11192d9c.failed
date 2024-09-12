@@ -1,0 +1,328 @@
+memcg: flush stats only if updated
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Shakeel Butt <shakeelb@google.com>
+commit 11192d9c124d58d66449b163ed0d2cdff03761a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/11192d9c.failed
+
+At the moment, the kernel flushes the memcg stats on every refault and
+also on every reclaim iteration.  Although rstat maintains per-cpu
+update tree but on the flush the kernel still has to go through all the
+cpu rstat update tree to check if there is anything to flush.  This
+patch adds the tracking on the stats update side to make flush side more
+clever by skipping the flush if there is no update.
+
+The stats update codepath is very sensitive performance wise for many
+workloads and benchmarks.  So, we can not follow what the commit
+aa48e47e3906 ("memcg: infrastructure to flush memcg stats") did which
+was triggering async flush through queue_work() and caused a lot
+performance regression reports.  That got reverted by the commit
+1f828223b799 ("memcg: flush lruvec stats in the refault").
+
+In this patch we kept the stats update codepath very minimal and let the
+stats reader side to flush the stats only when the updates are over a
+specific threshold.  For now the threshold is (nr_cpus * CHARGE_BATCH).
+
+To evaluate the impact of this patch, an 8 GiB tmpfs file is created on
+a system with swap-on-zram and the file was pushed to swap through
+memory.force_empty interface.  On reading the whole file, the memcg stat
+flush in the refault code path is triggered.  With this patch, we
+observed 63% reduction in the read time of 8 GiB file.
+
+Link: https://lkml.kernel.org/r/20211001190040.48086-1-shakeelb@google.com
+	Signed-off-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Reviewed-by: "Michal Koutný" <mkoutny@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 11192d9c124d58d66449b163ed0d2cdff03761a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index 6bc1413fddb1,ae12fdd4bc0d..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -640,127 -631,53 +640,177 @@@ mem_cgroup_largest_soft_limit_node(stru
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Accessors to ensure that preemption is disabled on PREEMPT_RT because it can
+ + * not rely on this as part of an acquired spinlock_t lock. These functions are
+ + * never used in hardirq context on PREEMPT_RT and therefore disabling preemtion
+ + * is sufficient.
+ + */
+ +static void memcg_stats_lock(void)
+ +{
+ +#ifdef CONFIG_PREEMPT_RT
+ +      preempt_disable();
+ +#else
+ +      VM_BUG_ON(!irqs_disabled());
+ +#endif
+ +}
+ +
+ +static void __memcg_stats_lock(void)
+ +{
+ +#ifdef CONFIG_PREEMPT_RT
+ +      preempt_disable();
+ +#endif
+ +}
+ +
+ +static void memcg_stats_unlock(void)
+ +{
+ +#ifdef CONFIG_PREEMPT_RT
+ +      preempt_enable();
+ +#endif
+ +}
+ +
+ +/*
+ + * Return the active percpu stats memcg and optionally mem_cgroup_per_node.
+ + *
+ + * When percpu_stats_disabled, the percpu stats update is transferred to
+ + * its parent.
+ + */
+ +static inline struct mem_cgroup *
+ +percpu_stats_memcg(struct mem_cgroup *memcg, struct mem_cgroup_per_node **pn)
+ +{
+ +	if (likely(!memcg->percpu_stats_disabled))
+ +		return memcg;
+ +
+ +	do {
+ +		memcg = parent_mem_cgroup(memcg);
+ +	} while (memcg->percpu_stats_disabled);
+ +
+ +	if (pn) {
+ +		unsigned int nid = (*pn)->nid;
+ +
+ +		*pn = memcg->nodeinfo[nid];
+ +	}
+ +	return memcg;
+ +}
+ +
+ +/* Subset of vm_event_item to report for memcg event stats */
+ +static const unsigned int memcg_vm_event_stat[] = {
+ +	PGPGIN,
+ +	PGPGOUT,
+ +	PGSCAN_KSWAPD,
+ +	PGSCAN_DIRECT,
+ +	PGSTEAL_KSWAPD,
+ +	PGSTEAL_DIRECT,
+ +	PGFAULT,
+ +	PGMAJFAULT,
+ +	PGREFILL,
+ +	PGACTIVATE,
+ +	PGDEACTIVATE,
+ +	PGLAZYFREE,
+ +	PGLAZYFREED,
+ +#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ +	THP_FAULT_ALLOC,
+ +	THP_COLLAPSE_ALLOC,
+ +#endif
+ +};
+ +
+ +#define NR_MEMCG_EVENTS ARRAY_SIZE(memcg_vm_event_stat)
+ +static int mem_cgroup_events_index[NR_VM_EVENT_ITEMS] __read_mostly;
+ +
+ +static void init_memcg_events(void)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; i < NR_MEMCG_EVENTS; ++i)
+ +		mem_cgroup_events_index[memcg_vm_event_stat[i]] = i + 1;
+ +}
+ +
+ +static inline int memcg_events_index(enum vm_event_item idx)
+ +{
+ +	return mem_cgroup_events_index[idx] - 1;
+ +}
+ +
+ +struct memcg_vmstats_percpu {
+ +	/* Local (CPU and cgroup) page state & events */
+ +	long			state[MEMCG_NR_STAT];
+ +	unsigned long		events[NR_MEMCG_EVENTS];
+ +
+ +	/* Delta calculation for lockless upward propagation */
+ +	long			state_prev[MEMCG_NR_STAT];
+ +	unsigned long		events_prev[NR_MEMCG_EVENTS];
+ +
+ +	/* Cgroup1: threshold notifications & softlimit tree updates */
+ +	unsigned long		nr_page_events;
+ +	unsigned long		targets[MEM_CGROUP_NTARGETS];
+ +};
+ +
+ +struct memcg_vmstats {
+ +	/* Aggregated (CPU and subtree) page state & events */
+ +	long			state[MEMCG_NR_STAT];
+ +	unsigned long		events[NR_MEMCG_EVENTS];
+ +
+ +	/* Pending child counts during tree propagation */
+ +	long			state_pending[MEMCG_NR_STAT];
+ +	unsigned long		events_pending[NR_MEMCG_EVENTS];
+ +};
+ +
+ +unsigned long memcg_page_state(struct mem_cgroup *memcg, int idx)
+ +{
+ +	long x = READ_ONCE(memcg->vmstats->state[idx]);
+ +#ifdef CONFIG_SMP
+ +	if (x < 0)
+ +		x = 0;
+ +#endif
+ +	return x;
+++=======
++  * memcg and lruvec stats flushing
++  *
++  * Many codepaths leading to stats update or read are performance sensitive and
++  * adding stats flushing in such codepaths is not desirable. So, to optimize the
++  * flushing the kernel does:
++  *
++  * 1) Periodically and asynchronously flush the stats every 2 seconds to not let
++  *    rstat update tree grow unbounded.
++  *
++  * 2) Flush the stats synchronously on reader side only when there are more than
++  *    (MEMCG_CHARGE_BATCH * nr_cpus) update events. Though this optimization
++  *    will let stats be out of sync by atmost (MEMCG_CHARGE_BATCH * nr_cpus) but
++  *    only for 2 seconds due to (1).
++  */
++ static void flush_memcg_stats_dwork(struct work_struct *w);
++ static DECLARE_DEFERRABLE_WORK(stats_flush_dwork, flush_memcg_stats_dwork);
++ static DEFINE_SPINLOCK(stats_flush_lock);
++ static DEFINE_PER_CPU(unsigned int, stats_updates);
++ static atomic_t stats_flush_threshold = ATOMIC_INIT(0);
++ 
++ static inline void memcg_rstat_updated(struct mem_cgroup *memcg)
++ {
++ 	cgroup_rstat_updated(memcg->css.cgroup, smp_processor_id());
++ 	if (!(__this_cpu_inc_return(stats_updates) % MEMCG_CHARGE_BATCH))
++ 		atomic_inc(&stats_flush_threshold);
++ }
++ 
++ static void __mem_cgroup_flush_stats(void)
++ {
++ 	if (!spin_trylock(&stats_flush_lock))
++ 		return;
++ 
++ 	cgroup_rstat_flush_irqsafe(root_mem_cgroup->css.cgroup);
++ 	atomic_set(&stats_flush_threshold, 0);
++ 	spin_unlock(&stats_flush_lock);
++ }
++ 
++ void mem_cgroup_flush_stats(void)
++ {
++ 	if (atomic_read(&stats_flush_threshold) > num_online_cpus())
++ 		__mem_cgroup_flush_stats();
++ }
++ 
++ static void flush_memcg_stats_dwork(struct work_struct *w)
++ {
++ 	mem_cgroup_flush_stats();
++ 	queue_delayed_work(system_unbound_wq, &stats_flush_dwork, 2UL*HZ);
+++>>>>>>> 11192d9c124d (memcg: flush stats only if updated)
+  }
+  
+  /**
+@@@ -774,9 -691,8 +824,9 @@@ void __mod_memcg_state(struct mem_cgrou
+  	if (mem_cgroup_disabled())
+  		return;
+  
+ +	memcg = percpu_stats_memcg(memcg, NULL);
+  	__this_cpu_add(memcg->vmstats_percpu->state[idx], val);
+- 	cgroup_rstat_updated(memcg->css.cgroup, smp_processor_id());
++ 	memcg_rstat_updated(memcg);
+  }
+  
+  /* idx can be of type enum memcg_stat_item or node_stat_item. */
+@@@ -823,54 -715,17 +873,61 @@@ void __mod_memcg_lruvec_state(struct lr
+  {
+  	struct mem_cgroup_per_node *pn;
+  	struct mem_cgroup *memcg;
+ +	long x, threshold = MEMCG_CHARGE_BATCH;
+  
+  	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
+ -	memcg = pn->memcg;
+ +
+ +	__memcg_stats_lock();
+ +	/* Update lruvec */
+ +	if (!pn->memcg->percpu_stats_disabled)
+ +		__this_cpu_add(pn->lruvec_stat_local->count[idx], val);
+ +
+ +	memcg = percpu_stats_memcg(pn->memcg, &pn);
+ +
+ +	/*
+ +	 * The caller from rmap relay on disabled preemption becase they never
+ +	 * update their counter from in-interrupt context. For these two
+ +	 * counters we check that the update is never performed from an
+ +	 * interrupt context while other caller need to have disabled interrupt.
+ +	 */
+ +	if (IS_ENABLED(CONFIG_DEBUG_VM) && !IS_ENABLED(CONFIG_PREEMPT_RT)) {
+ +		switch (idx) {
+ +		case NR_ANON_MAPPED:
+ +		case NR_FILE_MAPPED:
+ +		case NR_ANON_THPS:
+ +		case NR_SHMEM_PMDMAPPED:
+ +		case NR_FILE_PMDMAPPED:
+ +			WARN_ON_ONCE(!in_task());
+ +			break;
+ +		default:
+ +			WARN_ON_ONCE(!irqs_disabled());
+ +		}
+ +	}
+  
+  	/* Update memcg */
+- 	__mod_memcg_state(memcg, idx, val);
++ 	__this_cpu_add(memcg->vmstats_percpu->state[idx], val);
+  
+++<<<<<<< HEAD
+ +	if (vmstat_item_in_bytes(idx))
+ +		threshold <<= PAGE_SHIFT;
+ +
+ +	x = val + __this_cpu_read(pn->lruvec_stat_cpu->count[idx]);
+ +	if (unlikely(abs(x) > threshold)) {
+ +		pg_data_t *pgdat = lruvec_pgdat(lruvec);
+ +		struct mem_cgroup_per_node *pi;
+ +
+ +		for (pi = pn; pi; pi = parent_nodeinfo(pi, pgdat->node_id))
+ +			atomic_long_add(x, &pi->lruvec_stat[idx]);
+ +		x = 0;
+ +	}
+ +	__this_cpu_write(pn->lruvec_stat_cpu->count[idx], x);
+ +	memcg_stats_unlock();
+++=======
++ 	/* Update lruvec */
++ 	__this_cpu_add(pn->lruvec_stats_percpu->state[idx], val);
++ 
++ 	memcg_rstat_updated(memcg);
+++>>>>>>> 11192d9c124d (memcg: flush stats only if updated)
+  }
+  
+  /**
+@@@ -950,17 -823,11 +1007,22 @@@ void __mod_lruvec_kmem_state(void *p, e
+  void __count_memcg_events(struct mem_cgroup *memcg, enum vm_event_item idx,
+  			  unsigned long count)
+  {
+ -	if (mem_cgroup_disabled())
+ +	int index = memcg_events_index(idx);
+ +
+ +	if (mem_cgroup_disabled() || index < 0)
+  		return;
+  
+++<<<<<<< HEAD
+ +	memcg_stats_lock();
+ +	memcg = percpu_stats_memcg(memcg, NULL);
+ +
+ +	__this_cpu_add(memcg->vmstats_percpu->events[index], count);
+ +	cgroup_rstat_updated(memcg->css.cgroup, smp_processor_id());
+ +	memcg_stats_unlock();
+++=======
++ 	__this_cpu_add(memcg->vmstats_percpu->events[idx], count);
++ 	memcg_rstat_updated(memcg);
+++>>>>>>> 11192d9c124d (memcg: flush stats only if updated)
+  }
+  
+  static unsigned long memcg_events(struct mem_cgroup *memcg, int event)
+* Unmerged path mm/memcontrol.c
