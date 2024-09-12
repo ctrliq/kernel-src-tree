@@ -1,0 +1,240 @@
+perf record: Introduce data transferred and compressed stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Alexey Bayduraev <alexey.v.bayduraev@linux.intel.com>
+commit 610fbc016531b7a09dcc98febd2a8f4a0cdd3190
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/610fbc01.failed
+
+Introduce bytes_transferred and bytes_compressed stats so they
+would capture statistics for the related data buffer transfers.
+
+	Reviewed-by: Riccardo Mancini <rickyman7@gmail.com>
+	Signed-off-by: Alexey Bayduraev <alexey.v.bayduraev@linux.intel.com>
+	Tested-by: Jiri Olsa <jolsa@kernel.org>
+	Tested-by: Riccardo Mancini <rickyman7@gmail.com>
+	Acked-by: Andi Kleen <ak@linux.intel.com>
+	Acked-by: Namhyung Kim <namhyung@gmail.com>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Alexander Antonov <alexander.antonov@linux.intel.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Alexei Budankov <abudankov@huawei.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: https://lore.kernel.org/r/b5d598034c507dfb7544d2125500280b7d434764.1642440724.git.alexey.v.bayduraev@linux.intel.com
+[ Use PRiu64 to print u64 values, fixing the build on 32-bit architectures ]
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 610fbc016531b7a09dcc98febd2a8f4a0cdd3190)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-record.c
+diff --cc tools/perf/builtin-record.c
+index a12318efae5a,d19d0639c3f1..000000000000
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@@ -87,6 -90,43 +87,46 @@@ struct switch_output 
+  	int		 cur_file;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct thread_mask {
++ 	struct mmap_cpu_mask	maps;
++ 	struct mmap_cpu_mask	affinity;
++ };
++ 
++ struct record_thread {
++ 	pid_t			tid;
++ 	struct thread_mask	*mask;
++ 	struct {
++ 		int		msg[2];
++ 		int		ack[2];
++ 	} pipes;
++ 	struct fdarray		pollfd;
++ 	int			ctlfd_pos;
++ 	int			nr_mmaps;
++ 	struct mmap		**maps;
++ 	struct mmap		**overwrite_maps;
++ 	struct record		*rec;
++ 	unsigned long long	samples;
++ 	unsigned long		waking;
++ 	u64			bytes_written;
++ 	u64			bytes_transferred;
++ 	u64			bytes_compressed;
++ };
++ 
++ static __thread struct record_thread *thread;
++ 
++ enum thread_msg {
++ 	THREAD_MSG__UNDEFINED = 0,
++ 	THREAD_MSG__READY,
++ 	THREAD_MSG__MAX,
++ };
++ 
++ static const char *thread_msg_tags[THREAD_MSG__MAX] = {
++ 	"UNDEFINED", "READY"
++ };
++ 
+++>>>>>>> 610fbc016531 (perf record: Introduce data transferred and compressed stats)
+  struct record {
+  	struct perf_tool	tool;
+  	struct record_opts	opts;
+@@@ -1096,12 -1401,21 +1136,17 @@@ static size_t zstd_compress(struct perf
+  {
+  	size_t compressed;
+  	size_t max_record_size = PERF_SAMPLE_MAX_SIZE - sizeof(struct perf_record_compressed) - 1;
+ -	struct zstd_data *zstd_data = &session->zstd_data;
+ -
+ -	if (map && map->file)
+ -		zstd_data = &map->zstd_data;
+  
+ -	compressed = zstd_compress_stream_to_records(zstd_data, dst, dst_size, src, src_size,
+ +	compressed = zstd_compress_stream_to_records(&session->zstd_data, dst, dst_size, src, src_size,
+  						     max_record_size, process_comp_header);
+  
+- 	session->bytes_transferred += src_size;
+- 	session->bytes_compressed  += compressed;
++ 	if (map && map->file) {
++ 		thread->bytes_transferred += src_size;
++ 		thread->bytes_compressed  += compressed;
++ 	} else {
++ 		session->bytes_transferred += src_size;
++ 		session->bytes_compressed  += compressed;
++ 	}
+  
+  	return compressed;
+  }
+@@@ -1638,6 -2016,125 +1683,128 @@@ static void record__uniquify_name(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int record__terminate_thread(struct record_thread *thread_data)
++ {
++ 	int err;
++ 	enum thread_msg ack = THREAD_MSG__UNDEFINED;
++ 	pid_t tid = thread_data->tid;
++ 
++ 	close(thread_data->pipes.msg[1]);
++ 	thread_data->pipes.msg[1] = -1;
++ 	err = read(thread_data->pipes.ack[0], &ack, sizeof(ack));
++ 	if (err > 0)
++ 		pr_debug2("threads[%d]: sent %s\n", tid, thread_msg_tags[ack]);
++ 	else
++ 		pr_warning("threads[%d]: failed to receive termination notification from %d\n",
++ 			   thread->tid, tid);
++ 
++ 	return 0;
++ }
++ 
++ static int record__start_threads(struct record *rec)
++ {
++ 	int t, tt, err, ret = 0, nr_threads = rec->nr_threads;
++ 	struct record_thread *thread_data = rec->thread_data;
++ 	sigset_t full, mask;
++ 	pthread_t handle;
++ 	pthread_attr_t attrs;
++ 
++ 	thread = &thread_data[0];
++ 
++ 	if (!record__threads_enabled(rec))
++ 		return 0;
++ 
++ 	sigfillset(&full);
++ 	if (sigprocmask(SIG_SETMASK, &full, &mask)) {
++ 		pr_err("Failed to block signals on threads start: %s\n", strerror(errno));
++ 		return -1;
++ 	}
++ 
++ 	pthread_attr_init(&attrs);
++ 	pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED);
++ 
++ 	for (t = 1; t < nr_threads; t++) {
++ 		enum thread_msg msg = THREAD_MSG__UNDEFINED;
++ 
++ #ifdef HAVE_PTHREAD_ATTR_SETAFFINITY_NP
++ 		pthread_attr_setaffinity_np(&attrs,
++ 					    MMAP_CPU_MASK_BYTES(&(thread_data[t].mask->affinity)),
++ 					    (cpu_set_t *)(thread_data[t].mask->affinity.bits));
++ #endif
++ 		if (pthread_create(&handle, &attrs, record__thread, &thread_data[t])) {
++ 			for (tt = 1; tt < t; tt++)
++ 				record__terminate_thread(&thread_data[t]);
++ 			pr_err("Failed to start threads: %s\n", strerror(errno));
++ 			ret = -1;
++ 			goto out_err;
++ 		}
++ 
++ 		err = read(thread_data[t].pipes.ack[0], &msg, sizeof(msg));
++ 		if (err > 0)
++ 			pr_debug2("threads[%d]: sent %s\n", rec->thread_data[t].tid,
++ 				  thread_msg_tags[msg]);
++ 		else
++ 			pr_warning("threads[%d]: failed to receive start notification from %d\n",
++ 				   thread->tid, rec->thread_data[t].tid);
++ 	}
++ 
++ 	sched_setaffinity(0, MMAP_CPU_MASK_BYTES(&thread->mask->affinity),
++ 			(cpu_set_t *)thread->mask->affinity.bits);
++ 
++ 	pr_debug("threads[%d]: started on cpu%d\n", thread->tid, sched_getcpu());
++ 
++ out_err:
++ 	pthread_attr_destroy(&attrs);
++ 
++ 	if (sigprocmask(SIG_SETMASK, &mask, NULL)) {
++ 		pr_err("Failed to unblock signals on threads start: %s\n", strerror(errno));
++ 		ret = -1;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int record__stop_threads(struct record *rec)
++ {
++ 	int t;
++ 	struct record_thread *thread_data = rec->thread_data;
++ 
++ 	for (t = 1; t < rec->nr_threads; t++)
++ 		record__terminate_thread(&thread_data[t]);
++ 
++ 	for (t = 0; t < rec->nr_threads; t++) {
++ 		rec->samples += thread_data[t].samples;
++ 		if (!record__threads_enabled(rec))
++ 			continue;
++ 		rec->session->bytes_transferred += thread_data[t].bytes_transferred;
++ 		rec->session->bytes_compressed += thread_data[t].bytes_compressed;
++ 		pr_debug("threads[%d]: samples=%lld, wakes=%ld, ", thread_data[t].tid,
++ 			 thread_data[t].samples, thread_data[t].waking);
++ 		if (thread_data[t].bytes_transferred && thread_data[t].bytes_compressed)
++ 			pr_debug("transferred=%" PRIu64 ", compressed=%" PRIu64 "\n",
++ 				 thread_data[t].bytes_transferred, thread_data[t].bytes_compressed);
++ 		else
++ 			pr_debug("written=%" PRIu64 "\n", thread_data[t].bytes_written);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static unsigned long record__waking(struct record *rec)
++ {
++ 	int t;
++ 	unsigned long waking = 0;
++ 	struct record_thread *thread_data = rec->thread_data;
++ 
++ 	for (t = 0; t < rec->nr_threads; t++)
++ 		waking += thread_data[t].waking;
++ 
++ 	return waking;
++ }
++ 
+++>>>>>>> 610fbc016531 (perf record: Introduce data transferred and compressed stats)
+  static int __cmd_record(struct record *rec, int argc, const char **argv)
+  {
+  	int err;
+* Unmerged path tools/perf/builtin-record.c
