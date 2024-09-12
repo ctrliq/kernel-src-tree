@@ -1,0 +1,87 @@
+tcp: Change SYN ACK retransmit behaviour to account for rehash
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Akhmat Karakotov <hmukos@yandex-team.ru>
+commit cb6cd2cec799356e5e2f75a8591894599a6ad49d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/cb6cd2ce.failed
+
+Disabling rehash behavior did not affect SYN ACK retransmits because hash
+was forcefully changed bypassing the sk_rethink_hash function. This patch
+adds a condition which checks for rehash mode before resetting hash.
+
+	Signed-off-by: Akhmat Karakotov <hmukos@yandex-team.ru>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cb6cd2cec799356e5e2f75a8591894599a6ad49d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/sock.c
+diff --cc net/core/sock.c
+index 84ad6223e38b,d6804685f17f..000000000000
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@@ -1273,6 -1421,41 +1273,44 @@@ set_rcvbuf
+  		ret = sock_bindtoindex_locked(sk, val);
+  		break;
+  
+++<<<<<<< HEAD
+++=======
++ 	case SO_BUF_LOCK:
++ 		if (val & ~SOCK_BUF_LOCK_MASK) {
++ 			ret = -EINVAL;
++ 			break;
++ 		}
++ 		sk->sk_userlocks = val | (sk->sk_userlocks &
++ 					  ~SOCK_BUF_LOCK_MASK);
++ 		break;
++ 
++ 	case SO_RESERVE_MEM:
++ 	{
++ 		int delta;
++ 
++ 		if (val < 0) {
++ 			ret = -EINVAL;
++ 			break;
++ 		}
++ 
++ 		delta = val - sk->sk_reserved_mem;
++ 		if (delta < 0)
++ 			sock_release_reserved_memory(sk, -delta);
++ 		else
++ 			ret = sock_reserve_memory(sk, delta);
++ 		break;
++ 	}
++ 
++ 	case SO_TXREHASH:
++ 		if (val < -1 || val > 1) {
++ 			ret = -EINVAL;
++ 			break;
++ 		}
++ 		/* Paired with READ_ONCE() in tcp_rtx_synack() */
++ 		WRITE_ONCE(sk->sk_txrehash, (u8)val);
++ 		break;
++ 
+++>>>>>>> cb6cd2cec799 (tcp: Change SYN ACK retransmit behaviour to account for rehash)
+  	default:
+  		ret = -ENOPROTOOPT;
+  		break;
+* Unmerged path net/core/sock.c
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index db4fef218e8d..346f591a6630 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -4096,7 +4096,9 @@ int tcp_rtx_synack(const struct sock *sk, struct request_sock *req)
+ 	struct flowi fl;
+ 	int res;
+ 
+-	tcp_rsk(req)->txhash = net_tx_rndhash();
++	/* Paired with WRITE_ONCE() in sock_setsockopt() */
++	if (READ_ONCE(sk->sk_txrehash) == SOCK_TXREHASH_ENABLED)
++		tcp_rsk(req)->txhash = net_tx_rndhash();
+ 	res = af_ops->send_synack(sk, NULL, &fl, req, NULL, TCP_SYNACK_NORMAL,
+ 				  NULL);
+ 	if (!res) {
