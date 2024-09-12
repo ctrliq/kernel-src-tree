@@ -1,0 +1,118 @@
+openvswitch: always update flow key after nat
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.13.1.el8_6
+commit-author Aaron Conole <aconole@redhat.com>
+commit 60b44ca6bd7518dd38fa2719bc9240378b6172c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.13.1.el8_6/60b44ca6.failed
+
+During NAT, a tuple collision may occur.  When this happens, openvswitch
+will make a second pass through NAT which will perform additional packet
+modification.  This will update the skb data, but not the flow key that
+OVS uses.  This means that future flow lookups, and packet matches will
+have incorrect data.  This has been supported since
+5d50aa83e2c8 ("openvswitch: support asymmetric conntrack").
+
+That commit failed to properly update the sw_flow_key attributes, since
+it only called the ovs_ct_nat_update_key once, rather than each time
+ovs_ct_nat_execute was called.  As these two operations are linked, the
+ovs_ct_nat_execute() function should always make sure that the
+sw_flow_key is updated after a successful call through NAT infrastructure.
+
+Fixes: 5d50aa83e2c8 ("openvswitch: support asymmetric conntrack")
+	Cc: Dumitru Ceara <dceara@redhat.com>
+	Cc: Numan Siddique <nusiddiq@redhat.com>
+	Signed-off-by: Aaron Conole <aconole@redhat.com>
+	Acked-by: Eelco Chaudron <echaudro@redhat.com>
+Link: https://lore.kernel.org/r/20220318124319.3056455-1-aconole@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 60b44ca6bd7518dd38fa2719bc9240378b6172c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/conntrack.c
+diff --cc net/openvswitch/conntrack.c
+index 7f89927f9480,4a947c13c813..000000000000
+--- a/net/openvswitch/conntrack.c
++++ b/net/openvswitch/conntrack.c
+@@@ -739,7 -733,58 +739,62 @@@ static bool skb_nfct_cached(struct net 
+  	return ct_executed;
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NF_NAT_NEEDED
+++=======
++ #if IS_ENABLED(CONFIG_NF_NAT)
++ static void ovs_nat_update_key(struct sw_flow_key *key,
++ 			       const struct sk_buff *skb,
++ 			       enum nf_nat_manip_type maniptype)
++ {
++ 	if (maniptype == NF_NAT_MANIP_SRC) {
++ 		__be16 src;
++ 
++ 		key->ct_state |= OVS_CS_F_SRC_NAT;
++ 		if (key->eth.type == htons(ETH_P_IP))
++ 			key->ipv4.addr.src = ip_hdr(skb)->saddr;
++ 		else if (key->eth.type == htons(ETH_P_IPV6))
++ 			memcpy(&key->ipv6.addr.src, &ipv6_hdr(skb)->saddr,
++ 			       sizeof(key->ipv6.addr.src));
++ 		else
++ 			return;
++ 
++ 		if (key->ip.proto == IPPROTO_UDP)
++ 			src = udp_hdr(skb)->source;
++ 		else if (key->ip.proto == IPPROTO_TCP)
++ 			src = tcp_hdr(skb)->source;
++ 		else if (key->ip.proto == IPPROTO_SCTP)
++ 			src = sctp_hdr(skb)->source;
++ 		else
++ 			return;
++ 
++ 		key->tp.src = src;
++ 	} else {
++ 		__be16 dst;
++ 
++ 		key->ct_state |= OVS_CS_F_DST_NAT;
++ 		if (key->eth.type == htons(ETH_P_IP))
++ 			key->ipv4.addr.dst = ip_hdr(skb)->daddr;
++ 		else if (key->eth.type == htons(ETH_P_IPV6))
++ 			memcpy(&key->ipv6.addr.dst, &ipv6_hdr(skb)->daddr,
++ 			       sizeof(key->ipv6.addr.dst));
++ 		else
++ 			return;
++ 
++ 		if (key->ip.proto == IPPROTO_UDP)
++ 			dst = udp_hdr(skb)->dest;
++ 		else if (key->ip.proto == IPPROTO_TCP)
++ 			dst = tcp_hdr(skb)->dest;
++ 		else if (key->ip.proto == IPPROTO_SCTP)
++ 			dst = sctp_hdr(skb)->dest;
++ 		else
++ 			return;
++ 
++ 		key->tp.dst = dst;
++ 	}
++ }
++ 
+++>>>>>>> 60b44ca6bd75 (openvswitch: always update flow key after nat)
+  /* Modelled after nf_nat_ipv[46]_fn().
+   * range is only used for new, uninitialized NAT state.
+   * Returns either NF_ACCEPT or NF_DROP.
+@@@ -929,13 -927,9 +937,9 @@@ static int ovs_ct_nat(struct net *net, 
+  		}
+  	}
+  
+- 	/* Mark NAT done if successful and update the flow key. */
+- 	if (err == NF_ACCEPT)
+- 		ovs_nat_update_key(key, skb, maniptype);
+- 
+  	return err;
+  }
+ -#else /* !CONFIG_NF_NAT */
+ +#else /* !CONFIG_NF_NAT_NEEDED */
+  static int ovs_ct_nat(struct net *net, struct sw_flow_key *key,
+  		      const struct ovs_conntrack_info *info,
+  		      struct sk_buff *skb, struct nf_conn *ct,
+* Unmerged path net/openvswitch/conntrack.c
