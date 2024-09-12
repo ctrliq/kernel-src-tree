@@ -1,0 +1,460 @@
+objtool/x86: Fix SRSO mess
+
+jira LE-1907
+cve CVE-2023-20569
+Rebuild_History Non-Buildable kernel-4.18.0-521.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 4ae68b26c3ab5a82aa271e6e9fc9b1a06e1d6b40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-521.el8/4ae68b26.failed
+
+Objtool --rethunk does two things:
+
+ - it collects all (tail) call's of __x86_return_thunk and places them
+   into .return_sites. These are typically compiler generated, but
+   RET also emits this same.
+
+ - it fudges the validation of the __x86_return_thunk symbol; because
+   this symbol is inside another instruction, it can't actually find
+   the instruction pointed to by the symbol offset and gets upset.
+
+Because these two things pertained to the same symbol, there was no
+pressing need to separate these two separate things.
+
+However, alas, along comes SRSO and more crazy things to deal with
+appeared.
+
+The SRSO patch itself added the following symbol names to identify as
+rethunk:
+
+  'srso_untrain_ret', 'srso_safe_ret' and '__ret'
+
+Where '__ret' is the old retbleed return thunk, 'srso_safe_ret' is a
+new similarly embedded return thunk, and 'srso_untrain_ret' is
+completely unrelated to anything the above does (and was only included
+because of that INT3 vs UD2 issue fixed previous).
+
+Clear things up by adding a second category for the embedded instruction
+thing.
+
+Fixes: fb3bd914b3ec ("x86/srso: Add a Speculative RAS Overflow mitigation")
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Link: https://lore.kernel.org/r/20230814121148.704502245@infradead.org
+(cherry picked from commit 4ae68b26c3ab5a82aa271e6e9fc9b1a06e1d6b40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/objtool/arch/x86/decode.c
+#	tools/objtool/check.c
+#	tools/objtool/include/objtool/elf.h
+diff --cc tools/objtool/arch/x86/decode.c
+index 603f71ad0722,cba8a7be040e..000000000000
+--- a/tools/objtool/arch/x86/decode.c
++++ b/tools/objtool/arch/x86/decode.c
+@@@ -599,4 -825,10 +599,13 @@@ void arch_initial_func_cfi_state(struc
+  bool arch_is_rethunk(struct symbol *sym)
+  {
+  	return !strcmp(sym->name, "__x86_return_thunk");
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ bool arch_is_embedded_insn(struct symbol *sym)
++ {
++ 	return !strcmp(sym->name, "__ret") ||
++ 	       !strcmp(sym->name, "srso_safe_ret");
+++>>>>>>> 4ae68b26c3ab (objtool/x86: Fix SRSO mess)
+  }
+diff --cc tools/objtool/check.c
+index 4b7db795960d,191656ee9fbc..000000000000
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@@ -256,35 -386,76 +256,39 @@@ static int decode_instructions(struct o
+  		    strncmp(sec->name, ".discard.", 9))
+  			sec->text = true;
+  
+ -		if (!strcmp(sec->name, ".noinstr.text") ||
+ -		    !strcmp(sec->name, ".entry.text") ||
+ -		    !strcmp(sec->name, ".cpuidle.text") ||
+ -		    !strncmp(sec->name, ".text..__x86.", 13))
+ -			sec->noinstr = true;
+ -
+ -		/*
+ -		 * .init.text code is ran before userspace and thus doesn't
+ -		 * strictly need retpolines, except for modules which are
+ -		 * loaded late, they very much do need retpoline in their
+ -		 * .init.text
+ -		 */
+ -		if (!strcmp(sec->name, ".init.text") && !opts.module)
+ -			sec->init = true;
+ -
+ -		for (offset = 0; offset < sec->sh.sh_size; offset += insn->len) {
+ -			if (!insns || idx == INSN_CHUNK_MAX) {
+ -				insns = calloc(sizeof(*insn), INSN_CHUNK_SIZE);
+ -				if (!insns) {
+ -					WARN("malloc failed");
+ -					return -1;
+ -				}
+ -				idx = 0;
+ -			} else {
+ -				idx++;
+ +		for (offset = 0; offset < sec->len; offset += insn->len) {
+ +			insn = malloc(sizeof(*insn));
+ +			if (!insn) {
+ +				WARN("malloc failed");
+ +				return -1;
+  			}
+ -			insn = &insns[idx];
+ -			insn->idx = idx;
+ -
+ +			memset(insn, 0, sizeof(*insn));
+ +			INIT_LIST_HEAD(&insn->alts);
+ +			INIT_LIST_HEAD(&insn->stack_ops);
+  			INIT_LIST_HEAD(&insn->call_node);
+ +			clear_insn_state(&insn->state);
+ +
+++<<<<<<< HEAD
+  			insn->sec = sec;
+  			insn->offset = offset;
+ -			insn->prev_len = prev_len;
+  
+ -			ret = arch_decode_instruction(file, sec, offset,
+ -						      sec->sh.sh_size - offset,
+ -						      insn);
+ +			ret = arch_decode_instruction(file->elf, sec, offset,
+ +						      sec->len - offset,
+ +						      &insn->len, &insn->type,
+ +						      &insn->immediate,
+ +						      &insn->stack_ops);
+  			if (ret)
+ -				return ret;
+ -
+ -			prev_len = insn->len;
+ +				goto err;
+  
+ -			/*
+ -			 * By default, "ud2" is a dead end unless otherwise
+ -			 * annotated, because GCC 7 inserts it for certain
+ -			 * divide-by-zero cases.
+ -			 */
+ -			if (insn->type == INSN_BUG)
+ -				insn->dead_end = true;
+ -
+ -			hash_add(file->insn_hash, &insn->hash, sec_offset_hash(sec, insn->offset));
+ -			nr_insns++;
+ +			hash_add(file->insn_hash, &insn->hash, insn->offset);
+ +			list_add_tail(&insn->list, &file->insn_list);
+  		}
+  
+ -//		printf("%s: last chunk used: %d\n", sec->name, (int)idx);
+ -
+ -		sec_for_each_sym(sec, func) {
+ -			if (func->type != STT_NOTYPE && func->type != STT_FUNC)
+ -				continue;
+ -
+ -			if (func->offset == sec->sh.sh_size) {
+ -				/* Heuristic: likely an "end" symbol */
+ -				if (func->type == STT_NOTYPE)
+ -					continue;
+ -				WARN("%s(): STT_FUNC at end of section",
+ -				     func->name);
+ -				return -1;
+ -			}
+ -
+ +		list_for_each_entry(func, &sec->symbol_list, list) {
+ +			if (func->type != STT_FUNC)
+++=======
++ 			if (func->embedded_insn || func->alias != func)
+++>>>>>>> 4ae68b26c3ab (objtool/x86: Fix SRSO mess)
+  				continue;
+  
+  			if (!find_insn(file, sec, func->offset)) {
+@@@ -617,11 -1288,199 +621,205 @@@ static int add_ignore_alternatives(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Symbols that replace INSN_CALL_DYNAMIC, every (tail) call to such a symbol
++  * will be added to the .retpoline_sites section.
++  */
++ __weak bool arch_is_retpoline(struct symbol *sym)
++ {
++ 	return false;
++ }
++ 
++ /*
++  * Symbols that replace INSN_RETURN, every (tail) call to such a symbol
++  * will be added to the .return_sites section.
++  */
+++>>>>>>> 4ae68b26c3ab (objtool/x86: Fix SRSO mess)
+  __weak bool arch_is_rethunk(struct symbol *sym)
+  {
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Symbols that are embedded inside other instructions, because sometimes crazy
++  * code exists. These are mostly ignored for validation purposes.
++  */
++ __weak bool arch_is_embedded_insn(struct symbol *sym)
++ {
++ 	return false;
++ }
++ 
++ static struct reloc *insn_reloc(struct objtool_file *file, struct instruction *insn)
++ {
++ 	struct reloc *reloc;
++ 
++ 	if (insn->no_reloc)
++ 		return NULL;
++ 
++ 	if (!file)
++ 		return NULL;
++ 
++ 	reloc = find_reloc_by_dest_range(file->elf, insn->sec,
++ 					 insn->offset, insn->len);
++ 	if (!reloc) {
++ 		insn->no_reloc = 1;
++ 		return NULL;
++ 	}
++ 
++ 	return reloc;
++ }
++ 
++ static void remove_insn_ops(struct instruction *insn)
++ {
++ 	struct stack_op *op, *next;
++ 
++ 	for (op = insn->stack_ops; op; op = next) {
++ 		next = op->next;
++ 		free(op);
++ 	}
++ 	insn->stack_ops = NULL;
++ }
++ 
++ static void annotate_call_site(struct objtool_file *file,
++ 			       struct instruction *insn, bool sibling)
++ {
++ 	struct reloc *reloc = insn_reloc(file, insn);
++ 	struct symbol *sym = insn_call_dest(insn);
++ 
++ 	if (!sym)
++ 		sym = reloc->sym;
++ 
++ 	/*
++ 	 * Alternative replacement code is just template code which is
++ 	 * sometimes copied to the original instruction. For now, don't
++ 	 * annotate it. (In the future we might consider annotating the
++ 	 * original instruction if/when it ever makes sense to do so.)
++ 	 */
++ 	if (!strcmp(insn->sec->name, ".altinstr_replacement"))
++ 		return;
++ 
++ 	if (sym->static_call_tramp) {
++ 		list_add_tail(&insn->call_node, &file->static_call_list);
++ 		return;
++ 	}
++ 
++ 	if (sym->retpoline_thunk) {
++ 		list_add_tail(&insn->call_node, &file->retpoline_call_list);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Many compilers cannot disable KCOV or sanitizer calls with a function
++ 	 * attribute so they need a little help, NOP out any such calls from
++ 	 * noinstr text.
++ 	 */
++ 	if (opts.hack_noinstr && insn->sec->noinstr && sym->profiling_func) {
++ 		if (reloc)
++ 			set_reloc_type(file->elf, reloc, R_NONE);
++ 
++ 		elf_write_insn(file->elf, insn->sec,
++ 			       insn->offset, insn->len,
++ 			       sibling ? arch_ret_insn(insn->len)
++ 			               : arch_nop_insn(insn->len));
++ 
++ 		insn->type = sibling ? INSN_RETURN : INSN_NOP;
++ 
++ 		if (sibling) {
++ 			/*
++ 			 * We've replaced the tail-call JMP insn by two new
++ 			 * insn: RET; INT3, except we only have a single struct
++ 			 * insn here. Mark it retpoline_safe to avoid the SLS
++ 			 * warning, instead of adding another insn.
++ 			 */
++ 			insn->retpoline_safe = true;
++ 		}
++ 
++ 		return;
++ 	}
++ 
++ 	if (opts.mcount && sym->fentry) {
++ 		if (sibling)
++ 			WARN_INSN(insn, "tail call to __fentry__ !?!?");
++ 		if (opts.mnop) {
++ 			if (reloc)
++ 				set_reloc_type(file->elf, reloc, R_NONE);
++ 
++ 			elf_write_insn(file->elf, insn->sec,
++ 				       insn->offset, insn->len,
++ 				       arch_nop_insn(insn->len));
++ 
++ 			insn->type = INSN_NOP;
++ 		}
++ 
++ 		list_add_tail(&insn->call_node, &file->mcount_loc_list);
++ 		return;
++ 	}
++ 
++ 	if (insn->type == INSN_CALL && !insn->sec->init)
++ 		list_add_tail(&insn->call_node, &file->call_list);
++ 
++ 	if (!sibling && dead_end_function(file, sym))
++ 		insn->dead_end = true;
++ }
++ 
++ static void add_call_dest(struct objtool_file *file, struct instruction *insn,
++ 			  struct symbol *dest, bool sibling)
++ {
++ 	insn->_call_dest = dest;
++ 	if (!dest)
++ 		return;
++ 
++ 	/*
++ 	 * Whatever stack impact regular CALLs have, should be undone
++ 	 * by the RETURN of the called function.
++ 	 *
++ 	 * Annotated intra-function calls retain the stack_ops but
++ 	 * are converted to JUMP, see read_intra_function_calls().
++ 	 */
++ 	remove_insn_ops(insn);
++ 
++ 	annotate_call_site(file, insn, sibling);
++ }
++ 
++ static void add_retpoline_call(struct objtool_file *file, struct instruction *insn)
++ {
++ 	/*
++ 	 * Retpoline calls/jumps are really dynamic calls/jumps in disguise,
++ 	 * so convert them accordingly.
++ 	 */
++ 	switch (insn->type) {
++ 	case INSN_CALL:
++ 		insn->type = INSN_CALL_DYNAMIC;
++ 		break;
++ 	case INSN_JUMP_UNCONDITIONAL:
++ 		insn->type = INSN_JUMP_DYNAMIC;
++ 		break;
++ 	case INSN_JUMP_CONDITIONAL:
++ 		insn->type = INSN_JUMP_DYNAMIC_CONDITIONAL;
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ 
++ 	insn->retpoline_safe = true;
++ 
++ 	/*
++ 	 * Whatever stack impact regular CALLs have, should be undone
++ 	 * by the RETURN of the called function.
++ 	 *
++ 	 * Annotated intra-function calls retain the stack_ops but
++ 	 * are converted to JUMP, see read_intra_function_calls().
++ 	 */
++ 	remove_insn_ops(insn);
++ 
++ 	annotate_call_site(file, insn, false);
++ }
++ 
+++>>>>>>> 4ae68b26c3ab (objtool/x86: Fix SRSO mess)
+  static void add_return_call(struct objtool_file *file, struct instruction *insn, bool add)
+  {
+  	/*
+@@@ -1474,6 -2476,62 +1672,65 @@@ static int read_intra_function_calls(st
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Return true if name matches an instrumentation function, where calls to that
++  * function from noinstr code can safely be removed, but compilers won't do so.
++  */
++ static bool is_profiling_func(const char *name)
++ {
++ 	/*
++ 	 * Many compilers cannot disable KCOV with a function attribute.
++ 	 */
++ 	if (!strncmp(name, "__sanitizer_cov_", 16))
++ 		return true;
++ 
++ 	/*
++ 	 * Some compilers currently do not remove __tsan_func_entry/exit nor
++ 	 * __tsan_atomic_signal_fence (used for barrier instrumentation) with
++ 	 * the __no_sanitize_thread attribute, remove them. Once the kernel's
++ 	 * minimum Clang version is 14.0, this can be removed.
++ 	 */
++ 	if (!strncmp(name, "__tsan_func_", 12) ||
++ 	    !strcmp(name, "__tsan_atomic_signal_fence"))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static int classify_symbols(struct objtool_file *file)
++ {
++ 	struct symbol *func;
++ 
++ 	for_each_sym(file, func) {
++ 		if (func->bind != STB_GLOBAL)
++ 			continue;
++ 
++ 		if (!strncmp(func->name, STATIC_CALL_TRAMP_PREFIX_STR,
++ 			     strlen(STATIC_CALL_TRAMP_PREFIX_STR)))
++ 			func->static_call_tramp = true;
++ 
++ 		if (arch_is_retpoline(func))
++ 			func->retpoline_thunk = true;
++ 
++ 		if (arch_is_rethunk(func))
++ 			func->return_thunk = true;
++ 
++ 		if (arch_is_embedded_insn(func))
++ 			func->embedded_insn = true;
++ 
++ 		if (arch_ftrace_match(func->name))
++ 			func->fentry = true;
++ 
++ 		if (is_profiling_func(func->name))
++ 			func->profiling_func = true;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 4ae68b26c3ab (objtool/x86: Fix SRSO mess)
+  static void mark_rodata(struct objtool_file *file)
+  {
+  	struct section *sec;
+* Unmerged path tools/objtool/include/objtool/elf.h
+diff --git a/tools/objtool/arch.h b/tools/objtool/arch.h
+index db35de49df32..b66f45c1e592 100644
+--- a/tools/objtool/arch.h
++++ b/tools/objtool/arch.h
+@@ -92,5 +92,6 @@ int arch_decode_instruction(struct elf *elf, struct section *sec,
+ bool arch_callee_saved_reg(unsigned char reg);
+ 
+ bool arch_is_rethunk(struct symbol *sym);
++bool arch_is_embedded_insn(struct symbol *sym);
+ 
+ #endif /* _ARCH_H */
+* Unmerged path tools/objtool/arch/x86/decode.c
+* Unmerged path tools/objtool/check.c
+* Unmerged path tools/objtool/include/objtool/elf.h
