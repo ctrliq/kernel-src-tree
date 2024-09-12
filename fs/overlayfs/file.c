@@ -508,7 +508,7 @@ static long ovl_fallocate(struct file *file, int mode, loff_t offset, loff_t len
 
 	inode_lock(inode);
 	/* Update mode */
-	ovl_copyattr(inode);
+	ovl_copyattr(ovl_inode_real(inode), inode);
 	ret = file_remove_privs(file);
 	if (ret)
 		goto out_unlock;
@@ -675,7 +675,7 @@ static loff_t ovl_copyfile(struct file *file_in, loff_t pos_in,
 	inode_lock(inode_out);
 	if (op != OVL_DEDUPE) {
 		/* Update mode */
-		ovl_copyattr(inode_out);
+		ovl_copyattr(ovl_inode_real(inode_out), inode_out);
 		ret = file_remove_privs(file_out);
 		if (ret)
 			goto out_unlock;

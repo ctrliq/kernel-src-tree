@@ -778,6 +778,23 @@ xfs_fs_sync_fs(
 		flush_delayed_work(&mp->m_log->l_work);
 	}
 
+	/*
+	 * RHEL8: Run a best effort blockgc scan to reduce the working set of
+	 * inodes that would require inactivation if reclaimed while frozen.
+	 * This is necessary because otherwise inactivation blocks on
+	 * transaction allocation while reclaim holds s_umount, which then
+	 * deadlocks with unfreeze.
+	 *
+	 * Mimic upstream behavior and do this here as it is the last
+	 * opportunity before the filesystem is completely frozen. The
+	 * unfortunate caveat is that we can't run a sync scan while under
+	 * PAGEFAULT protection because that would invert locking with a blocked
+	 * fault that might be holding an iolock for read (i.e. if the fault is
+	 * due to a file read into a mapped buffer).
+	 */
+	if (sb->s_writers.frozen == SB_FREEZE_PAGEFAULT)
+		xfs_blockgc_free_space(mp, NULL);
+
 	return 0;
 }
 
