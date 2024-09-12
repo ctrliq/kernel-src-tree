@@ -798,7 +798,7 @@ static int qat_alg_aead_dec(struct aead_request *areq)
 		return -EINVAL;
 
 	ret = qat_bl_sgl_to_bufl(ctx->inst->accel_dev, areq->src, areq->dst,
-				 &qat_req->buf, f);
+				 &qat_req->buf, NULL, f);
 	if (unlikely(ret))
 		return ret;
 
@@ -842,7 +842,7 @@ static int qat_alg_aead_enc(struct aead_request *areq)
 		return -EINVAL;
 
 	ret = qat_bl_sgl_to_bufl(ctx->inst->accel_dev, areq->src, areq->dst,
-				 &qat_req->buf, f);
+				 &qat_req->buf, NULL, f);
 	if (unlikely(ret))
 		return ret;
 
@@ -1028,7 +1028,7 @@ static int qat_alg_skcipher_encrypt(struct skcipher_request *req)
 		return 0;
 
 	ret = qat_bl_sgl_to_bufl(ctx->inst->accel_dev, req->src, req->dst,
-				 &qat_req->buf, f);
+				 &qat_req->buf, NULL, f);
 	if (unlikely(ret))
 		return ret;
 
@@ -1095,7 +1095,7 @@ static int qat_alg_skcipher_decrypt(struct skcipher_request *req)
 		return 0;
 
 	ret = qat_bl_sgl_to_bufl(ctx->inst->accel_dev, req->src, req->dst,
-				 &qat_req->buf, f);
+				 &qat_req->buf, NULL, f);
 	if (unlikely(ret))
 		return ret;
 
