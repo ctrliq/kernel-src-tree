@@ -1,0 +1,139 @@
+kvm: x86: Intercept #NM for saving IA32_XFD_ERR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.26.1.el8_6
+commit-author Jing Liu <jing2.liu@intel.com>
+commit ec5be88ab29fd9145c7ced20b58fb96f7c6b6890
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.26.1.el8_6/ec5be88a.failed
+
+Guest IA32_XFD_ERR is generally modified in two places:
+
+  - Set by CPU when #NM is triggered;
+  - Cleared by guest in its #NM handler;
+
+Intercept #NM for the first case when a nonzero value is written
+to IA32_XFD. Nonzero indicates that the guest is willing to do
+dynamic fpstate expansion for certain xfeatures, thus KVM needs to
+manage and virtualize guest XFD_ERR properly. The vcpu exception
+bitmap is updated in XFD write emulation according to guest_fpu::xfd.
+
+Save the current XFD_ERR value to the guest_fpu container in the #NM
+VM-exit handler. This must be done with interrupt disabled, otherwise
+the unsaved MSR value may be clobbered by host activity.
+
+The saving operation is conducted conditionally only when guest_fpu:xfd
+includes a non-zero value. Doing so also avoids misread on a platform
+which doesn't support XFD but #NM is triggered due to L1 interception.
+
+Queueing #NM to the guest is postponed to handle_exception_nmi(). This
+goes through the nested_vmx check so a virtual vmexit is queued instead
+when #NM is triggered in L2 but L1 wants to intercept it.
+
+Restore the host value (always ZERO outside of the host #NM
+handler) before enabling interrupt.
+
+Restore the guest value from the guest_fpu container right before
+entering the guest (with interrupt disabled).
+
+	Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Jing Liu <jing2.liu@intel.com>
+	Signed-off-by: Kevin Tian <kevin.tian@intel.com>
+	Signed-off-by: Yang Zhong <yang.zhong@intel.com>
+Message-Id: <20220105123532.12586-13-yang.zhong@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit ec5be88ab29fd9145c7ced20b58fb96f7c6b6890)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 73c997b364a8,84f6904cdb6e..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -35,7 -36,8 +35,12 @@@
+  #include <asm/debugreg.h>
+  #include <asm/desc.h>
+  #include <asm/fpu/api.h>
+++<<<<<<< HEAD
+ +#include <asm/traps.h>
+++=======
++ #include <asm/fpu/xstate.h>
++ #include <asm/idtentry.h>
+++>>>>>>> ec5be88ab29f (kvm: x86: Intercept #NM for saving IA32_XFD_ERR)
+  #include <asm/io.h>
+  #include <asm/irq_remapping.h>
+  #include <asm/kexec.h>
+@@@ -6350,9 -6424,29 +6379,29 @@@ static void handle_interrupt_nmi_irqoff
+  	kvm_after_interrupt(vcpu);
+  }
+  
++ static void handle_nm_fault_irqoff(struct kvm_vcpu *vcpu)
++ {
++ 	/*
++ 	 * Save xfd_err to guest_fpu before interrupt is enabled, so the
++ 	 * MSR value is not clobbered by the host activity before the guest
++ 	 * has chance to consume it.
++ 	 *
++ 	 * Do not blindly read xfd_err here, since this exception might
++ 	 * be caused by L1 interception on a platform which doesn't
++ 	 * support xfd at all.
++ 	 *
++ 	 * Do it conditionally upon guest_fpu::xfd. xfd_err matters
++ 	 * only when xfd contains a non-zero value.
++ 	 *
++ 	 * Queuing exception is done in vmx_handle_exit. See comment there.
++ 	 */
++ 	if (vcpu->arch.guest_fpu.fpstate->xfd)
++ 		rdmsrl(MSR_IA32_XFD_ERR, vcpu->arch.guest_fpu.xfd_err);
++ }
++ 
+  static void handle_exception_nmi_irqoff(struct vcpu_vmx *vmx)
+  {
+ -	const unsigned long nmi_entry = (unsigned long)asm_exc_nmi_noist;
+ +	const unsigned long nmi_entry = (unsigned long)nmi_noist;
+  	u32 intr_info = vmx_get_intr_info(&vmx->vcpu);
+  
+  	/* if exit due to PF check for async PF */
+diff --git a/arch/x86/kvm/vmx/vmcs.h b/arch/x86/kvm/vmx/vmcs.h
+index 6e5de2e2b0da..e325c290a816 100644
+--- a/arch/x86/kvm/vmx/vmcs.h
++++ b/arch/x86/kvm/vmx/vmcs.h
+@@ -129,6 +129,11 @@ static inline bool is_machine_check(u32 intr_info)
+ 	return is_exception_n(intr_info, MC_VECTOR);
+ }
+ 
++static inline bool is_nm_fault(u32 intr_info)
++{
++	return is_exception_n(intr_info, NM_VECTOR);
++}
++
+ /* Undocumented: icebp/int1 */
+ static inline bool is_icebp(u32 intr_info)
+ {
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 6042b4269d86..746b58919495 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -9592,6 +9592,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	if (test_thread_flag(TIF_NEED_FPU_LOAD))
+ 		switch_fpu_return();
+ 
++	if (vcpu->arch.guest_fpu.xfd_err)
++		wrmsrl(MSR_IA32_XFD_ERR, vcpu->arch.guest_fpu.xfd_err);
++
+ 	if (unlikely(vcpu->arch.switch_db_regs)) {
+ 		set_debugreg(0, 7);
+ 		set_debugreg(vcpu->arch.eff_db[0], 0);
+@@ -9647,6 +9650,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 
+ 	static_call(kvm_x86_handle_exit_irqoff)(vcpu);
+ 
++	if (vcpu->arch.guest_fpu.xfd_err)
++		wrmsrl(MSR_IA32_XFD_ERR, 0);
++
+ 	/*
+ 	 * Consume any pending interrupts, including the possible source of
+ 	 * VM-Exit on SVM and any ticks that occur between VM-Exit and now.
