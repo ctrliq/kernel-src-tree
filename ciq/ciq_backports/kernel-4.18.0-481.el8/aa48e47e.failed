@@ -1,0 +1,140 @@
+memcg: infrastructure to flush memcg stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Shakeel Butt <shakeelb@google.com>
+commit aa48e47e3906c332eaf1e5d7b58be11d3509ad9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/aa48e47e.failed
+
+At the moment memcg stats are read in four contexts:
+
+1. memcg stat user interfaces
+2. dirty throttling
+3. page fault
+4. memory reclaim
+
+Currently the kernel flushes the stats for first two cases.  Flushing the
+stats for remaining two casese may have performance impact.  Always
+flushing the memcg stats on the page fault code path may negatively
+impacts the performance of the applications.  In addition flushing in the
+memory reclaim code path, though treated as slowpath, can become the
+source of contention for the global lock taken for stat flushing because
+when system or memcg is under memory pressure, many tasks may enter the
+reclaim path.
+
+This patch uses following mechanisms to solve these challenges:
+
+1. Periodically flush the stats from root memcg every 2 seconds.  This
+   will time limit the out of sync stats.
+
+2. Asynchronously flush the stats after fixed number of stat updates.
+   In the worst case the stat can be out of sync by O(nr_cpus * BATCH) for
+   2 seconds.
+
+3. For avoiding thundering herd to flush the stats particularly from
+   the memory reclaim context, introduce memcg local spinlock and let only
+   one flusher active at a time.  This could have been done through
+   cgroup_rstat_lock lock but that lock is used by other subsystem and for
+   userspace reading memcg stats.  So, it is better to keep flushers
+   introduced by this patch decoupled from cgroup_rstat_lock.  However we
+   would have to use irqsafe version of rstat flush but that is fine as
+   this code path will be flushing for whole tree and do the work for
+   everyone.  No one will be waiting for that worker.
+
+[shakeelb@google.com: fix sleep-in-wrong context bug]
+  Link: https://lkml.kernel.org/r/20210716212137.1391164-2-shakeelb@google.com
+
+Link: https://lkml.kernel.org/r/20210714013948.270662-2-shakeelb@google.com
+	Signed-off-by: Shakeel Butt <shakeelb@google.com>
+	Tested-by: Marek Szyprowski <m.szyprowski@samsung.com>
+	Cc: Hillf Danton <hdanton@sina.com>
+	Cc: Huang Ying <ying.huang@intel.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Michal Koutný <mkoutny@suse.com>
+	Cc: Muchun Song <songmuchun@bytedance.com>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit aa48e47e3906c332eaf1e5d7b58be11d3509ad9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index 6bc1413fddb1,4d8c9afecf98..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -857,20 -680,10 +865,27 @@@ void __mod_memcg_lruvec_state(struct lr
+  	/* Update memcg */
+  	__mod_memcg_state(memcg, idx, val);
+  
+++<<<<<<< HEAD
+ +	if (vmstat_item_in_bytes(idx))
+ +		threshold <<= PAGE_SHIFT;
+ +
+ +	x = val + __this_cpu_read(pn->lruvec_stat_cpu->count[idx]);
+ +	if (unlikely(abs(x) > threshold)) {
+ +		pg_data_t *pgdat = lruvec_pgdat(lruvec);
+ +		struct mem_cgroup_per_node *pi;
+ +
+ +		for (pi = pn; pi; pi = parent_nodeinfo(pi, pgdat->node_id))
+ +			atomic_long_add(x, &pi->lruvec_stat[idx]);
+ +		x = 0;
+ +	}
+ +	__this_cpu_write(pn->lruvec_stat_cpu->count[idx], x);
+ +	memcg_stats_unlock();
+++=======
++ 	/* Update lruvec */
++ 	__this_cpu_add(pn->lruvec_stats_percpu->state[idx], val);
++ 	if (!(__this_cpu_inc_return(stats_flush_threshold) % MEMCG_CHARGE_BATCH))
++ 		queue_work(system_unbound_wq, &stats_flush_work);
+++>>>>>>> aa48e47e3906 (memcg: infrastructure to flush memcg stats)
+  }
+  
+  /**
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 99cbfe3d87a3..49612c9c2820 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -1028,6 +1028,8 @@ static inline unsigned long lruvec_page_state_local(struct lruvec *lruvec,
+ 	return x;
+ }
+ 
++void mem_cgroup_flush_stats(void);
++
+ void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
+ 			      int val);
+ void __mod_lruvec_kmem_state(void *p, enum node_stat_item idx, int val);
+@@ -1438,6 +1440,10 @@ static inline unsigned long lruvec_page_state_local(struct lruvec *lruvec,
+ 	return node_page_state(lruvec_pgdat(lruvec), idx);
+ }
+ 
++static inline void mem_cgroup_flush_stats(void)
++{
++}
++
+ static inline void __mod_memcg_lruvec_state(struct lruvec *lruvec,
+ 					    enum node_stat_item idx, int val)
+ {
+* Unmerged path mm/memcontrol.c
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 11f514f4fcf5..edadb7ef0867 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3052,6 +3052,12 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+ 	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
+ 
+ again:
++	/*
++	 * Flush the memory cgroup stats, so that we read accurate per-memcg
++	 * lruvec stats for heuristics.
++	 */
++	mem_cgroup_flush_stats();
++
+ 	memset(&sc->nr, 0, sizeof(sc->nr));
+ 
+ 	nr_reclaimed = sc->nr_reclaimed;
