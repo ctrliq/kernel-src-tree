@@ -1,0 +1,1011 @@
+net/mlx5e: Take RQT out of TIR and group RX resources
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Maxim Mikityanskiy <maximmi@nvidia.com>
+commit 0570c1c958178113bf0e35a00f1398c63fed9644
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/0570c1c9.failed
+
+RQT is not part of TIR, as multiple TIRs may point to the same RQT, as
+it happens with indir_tir and inner_indir_tir. These instances of a TIR
+don't use the embedded RQT.
+
+This commit takes RQT out of TIR, making them independent. The RQTs are
+placed into struct mlx5e_rx_res, and items in that struct are regrouped
+by functionality: RSS, channels and PTP.
+
+	Signed-off-by: Maxim Mikityanskiy <maximmi@nvidia.com>
+	Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 0570c1c958178113bf0e35a00f1398c63fed9644)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en/rx_res.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_rx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_arfs.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_fs_ethtool.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+#	drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 73a162266789,59fc8432202f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -1084,11 -1050,10 +1084,18 @@@ int mlx5e_create_indirect_rqt(struct ml
+  int mlx5e_create_indirect_tirs(struct mlx5e_priv *priv, bool inner_ttc);
+  void mlx5e_destroy_indirect_tirs(struct mlx5e_priv *priv);
+  
+++<<<<<<< HEAD
+ +int mlx5e_create_direct_rqts(struct mlx5e_priv *priv, struct mlx5e_tir *tirs, int n);
+ +void mlx5e_destroy_direct_rqts(struct mlx5e_priv *priv, struct mlx5e_tir *tirs, int n);
+ +int mlx5e_create_direct_tirs(struct mlx5e_priv *priv, struct mlx5e_tir *tirs, int n);
+ +void mlx5e_destroy_direct_tirs(struct mlx5e_priv *priv, struct mlx5e_tir *tirs, int n);
+ +void mlx5e_destroy_rqt(struct mlx5e_priv *priv, struct mlx5e_rqt *rqt);
+++=======
++ int mlx5e_create_direct_rqts(struct mlx5e_priv *priv);
++ void mlx5e_destroy_direct_rqts(struct mlx5e_priv *priv);
++ int mlx5e_create_direct_tirs(struct mlx5e_priv *priv);
++ void mlx5e_destroy_direct_tirs(struct mlx5e_priv *priv);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  
+  int mlx5e_create_tis(struct mlx5_core_dev *mdev, void *in, u32 *tisn);
+  void mlx5e_destroy_tis(struct mlx5_core_dev *mdev, u32 tisn);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+index f9afbdefded5,849ee3e147c4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+@@@ -441,14 -561,103 +441,102 @@@ close_cqs
+  	return err;
+  }
+  
+ -static void mlx5e_ptp_close_queues(struct mlx5e_ptp *c)
+ +static void mlx5e_ptp_close_queues(struct mlx5e_port_ptp *c)
+  {
+ -	if (test_bit(MLX5E_PTP_STATE_RX, c->state)) {
+ -		mlx5e_close_rq(&c->rq);
+ -		mlx5e_close_cq(&c->rq.cq);
+ -	}
+ -	if (test_bit(MLX5E_PTP_STATE_TX, c->state)) {
+ -		mlx5e_ptp_close_txqsqs(c);
+ -		mlx5e_ptp_close_tx_cqs(c);
+ -	}
+ +	mlx5e_ptp_close_txqsqs(c);
+ +	mlx5e_ptp_close_cqs(c);
+  }
+  
+++<<<<<<< HEAD
+ +int mlx5e_port_ptp_open(struct mlx5e_priv *priv, struct mlx5e_params *params,
+ +			u8 lag_port, struct mlx5e_port_ptp **cp)
+++=======
++ static int mlx5e_ptp_set_state(struct mlx5e_ptp *c, struct mlx5e_params *params)
++ {
++ 	if (MLX5E_GET_PFLAG(params, MLX5E_PFLAG_TX_PORT_TS))
++ 		__set_bit(MLX5E_PTP_STATE_TX, c->state);
++ 
++ 	if (params->ptp_rx)
++ 		__set_bit(MLX5E_PTP_STATE_RX, c->state);
++ 
++ 	return bitmap_empty(c->state, MLX5E_PTP_STATE_NUM_STATES) ? -EINVAL : 0;
++ }
++ 
++ static void mlx5e_ptp_rx_unset_fs(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_ptp_fs *ptp_fs = priv->fs.ptp_fs;
++ 
++ 	if (!ptp_fs->valid)
++ 		return;
++ 
++ 	mlx5e_fs_tt_redirect_del_rule(ptp_fs->l2_rule);
++ 	mlx5e_fs_tt_redirect_any_destroy(priv);
++ 
++ 	mlx5e_fs_tt_redirect_del_rule(ptp_fs->udp_v6_rule);
++ 	mlx5e_fs_tt_redirect_del_rule(ptp_fs->udp_v4_rule);
++ 	mlx5e_fs_tt_redirect_udp_destroy(priv);
++ 	ptp_fs->valid = false;
++ }
++ 
++ static int mlx5e_ptp_rx_set_fs(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_ptp_fs *ptp_fs = priv->fs.ptp_fs;
++ 	u32 tirn = priv->rx_res->ptp.tir.tirn;
++ 	struct mlx5_flow_handle *rule;
++ 	int err;
++ 
++ 	if (ptp_fs->valid)
++ 		return 0;
++ 
++ 	err = mlx5e_fs_tt_redirect_udp_create(priv);
++ 	if (err)
++ 		goto out_free;
++ 
++ 	rule = mlx5e_fs_tt_redirect_udp_add_rule(priv, MLX5E_TT_IPV4_UDP,
++ 						 tirn, PTP_EV_PORT);
++ 	if (IS_ERR(rule)) {
++ 		err = PTR_ERR(rule);
++ 		goto out_destroy_fs_udp;
++ 	}
++ 	ptp_fs->udp_v4_rule = rule;
++ 
++ 	rule = mlx5e_fs_tt_redirect_udp_add_rule(priv, MLX5E_TT_IPV6_UDP,
++ 						 tirn, PTP_EV_PORT);
++ 	if (IS_ERR(rule)) {
++ 		err = PTR_ERR(rule);
++ 		goto out_destroy_udp_v4_rule;
++ 	}
++ 	ptp_fs->udp_v6_rule = rule;
++ 
++ 	err = mlx5e_fs_tt_redirect_any_create(priv);
++ 	if (err)
++ 		goto out_destroy_udp_v6_rule;
++ 
++ 	rule = mlx5e_fs_tt_redirect_any_add_rule(priv, tirn, ETH_P_1588);
++ 	if (IS_ERR(rule)) {
++ 		err = PTR_ERR(rule);
++ 		goto out_destroy_fs_any;
++ 	}
++ 	ptp_fs->l2_rule = rule;
++ 	ptp_fs->valid = true;
++ 
++ 	return 0;
++ 
++ out_destroy_fs_any:
++ 	mlx5e_fs_tt_redirect_any_destroy(priv);
++ out_destroy_udp_v6_rule:
++ 	mlx5e_fs_tt_redirect_del_rule(ptp_fs->udp_v6_rule);
++ out_destroy_udp_v4_rule:
++ 	mlx5e_fs_tt_redirect_del_rule(ptp_fs->udp_v4_rule);
++ out_destroy_fs_udp:
++ 	mlx5e_fs_tt_redirect_udp_destroy(priv);
++ out_free:
++ 	return err;
++ }
++ 
++ int mlx5e_ptp_open(struct mlx5e_priv *priv, struct mlx5e_params *params,
++ 		   u8 lag_port, struct mlx5e_ptp **cp)
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  {
+  	struct net_device *netdev = priv->netdev;
+  	struct mlx5_core_dev *mdev = priv->mdev;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c
+index 313a708e351b,ab485d082729..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c
+@@@ -139,28 -184,14 +139,36 @@@ void mlx5e_deactivate_xsk(struct mlx5e_
+  	/* TX queue is disabled on close. */
+  }
+  
+ +static int mlx5e_redirect_xsk_rqt(struct mlx5e_priv *priv, u16 ix, u32 rqn)
+ +{
+ +	struct mlx5e_redirect_rqt_param direct_rrp = {
+ +		.is_rss = false,
+ +		{
+ +			.rqn = rqn,
+ +		},
+ +	};
+ +
+ +	u32 rqtn = priv->xsk_tir[ix].rqt.rqtn;
+ +
+ +	return mlx5e_redirect_rqt(priv, rqtn, 1, direct_rrp);
+ +}
+ +
+  int mlx5e_xsk_redirect_rqt_to_channel(struct mlx5e_priv *priv, struct mlx5e_channel *c)
+  {
+++<<<<<<< HEAD
+ +	return mlx5e_redirect_xsk_rqt(priv, c->ix, c->xskrq.rqn);
+++=======
++ 	return mlx5e_rqt_redirect_direct(&priv->rx_res->channels[c->ix].xsk_rqt, c->xskrq.rqn);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  }
+  
+  int mlx5e_xsk_redirect_rqt_to_drop(struct mlx5e_priv *priv, u16 ix)
+  {
+++<<<<<<< HEAD
+ +	return mlx5e_redirect_xsk_rqt(priv, ix, priv->drop_rq.rqn);
+++=======
++ 	return mlx5e_rqt_redirect_direct(&priv->rx_res->channels[ix].xsk_rqt, priv->drop_rq.rqn);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  }
+  
+  int mlx5e_xsk_redirect_rqts_to_channels(struct mlx5e_priv *priv, struct mlx5e_channels *chs)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_rx.c
+index 1d166cb4f6f5,15153317a083..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_rx.c
+@@@ -642,7 -635,7 +642,11 @@@ int mlx5e_ktls_add_rx(struct net_devic
+  	priv_rx->sw_stats = &priv->tls->sw_stats;
+  	mlx5e_set_ktls_rx_priv_ctx(tls_ctx, priv_rx);
+  
+++<<<<<<< HEAD
+ +	rqtn = priv->direct_tir[rxq].rqt.rqtn;
+++=======
++ 	rqtn = priv->rx_res->channels[rxq].direct_rqt.rqtn;
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  
+  	err = mlx5e_ktls_create_tir(mdev, &priv_rx->tirn, rqtn);
+  	if (err)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_arfs.c
+index 25403af32859,db6c6a96a6c9..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_arfs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_arfs.c
+@@@ -192,7 -192,6 +192,10 @@@ static int arfs_add_default_rule(struc
+  				 enum arfs_type type)
+  {
+  	struct arfs_table *arfs_t = &priv->fs.arfs->arfs_tables[type];
+++<<<<<<< HEAD
+ +	struct mlx5e_tir *tir = priv->indir_tir;
+++=======
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	struct mlx5_flow_destination dest = {};
+  	MLX5_DECLARE_FLOW_ACT(flow_act);
+  	enum mlx5e_traffic_types tt;
+@@@ -553,7 -552,7 +556,11 @@@ static struct mlx5_flow_handle *arfs_ad
+  		       16);
+  	}
+  	dest.type = MLX5_FLOW_DESTINATION_TYPE_TIR;
+++<<<<<<< HEAD
+ +	dest.tir_num = priv->direct_tir[arfs_rule->rxq].tirn;
+++=======
++ 	dest.tir_num = priv->rx_res->channels[arfs_rule->rxq].direct_tir.tirn;
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	rule = mlx5_add_flow_rules(ft, spec, &flow_act, &dest, 1);
+  	if (IS_ERR(rule)) {
+  		err = PTR_ERR(rule);
+@@@ -576,7 -575,7 +583,11 @@@ static void arfs_modify_rule_rq(struct 
+  	int err = 0;
+  
+  	dst.type = MLX5_FLOW_DESTINATION_TYPE_TIR;
+++<<<<<<< HEAD
+ +	dst.tir_num = priv->direct_tir[rxq].tirn;
+++=======
++ 	dst.tir_num = priv->rx_res->channels[rxq].direct_tir.tirn;
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	err =  mlx5_modify_rule_destination(rule, &dst, NULL);
+  	if (err)
+  		netdev_warn(priv->netdev,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+index 059efb0721cd,e79815763edf..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+@@@ -1296,7 -1320,7 +1296,11 @@@ err
+  void mlx5e_set_ttc_basic_params(struct mlx5e_priv *priv,
+  				struct ttc_params *ttc_params)
+  {
+++<<<<<<< HEAD
+ +	ttc_params->any_tt_tirn = priv->direct_tir[0].tirn;
+++=======
++ 	ttc_params->any_tt_tirn = priv->rx_res->channels[0].direct_tir.tirn;
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	ttc_params->inner_ttc = &priv->fs.inner_ttc;
+  }
+  
+@@@ -1755,7 -1786,7 +1759,11 @@@ int mlx5e_create_flow_steering(struct m
+  	if (mlx5e_tunnel_inner_ft_supported(priv->mdev)) {
+  		mlx5e_set_inner_ttc_ft_params(&ttc_params);
+  		for (tt = 0; tt < MLX5E_NUM_INDIR_TIRS; tt++)
+++<<<<<<< HEAD
+ +			ttc_params.indir_tirn[tt] = priv->inner_indir_tir[tt].tirn;
+++=======
++ 			ttc_params.indir_tirn[tt] = priv->rx_res->rss[tt].inner_indir_tir.tirn;
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  
+  		err = mlx5e_create_inner_ttc_table(priv, &ttc_params, &priv->fs.inner_ttc);
+  		if (err) {
+@@@ -1767,7 -1798,7 +1775,11 @@@
+  
+  	mlx5e_set_ttc_ft_params(&ttc_params);
+  	for (tt = 0; tt < MLX5E_NUM_INDIR_TIRS; tt++)
+++<<<<<<< HEAD
+ +		ttc_params.indir_tirn[tt] = priv->indir_tir[tt].tirn;
+++=======
++ 		ttc_params.indir_tirn[tt] = priv->rx_res->rss[tt].indir_tir.tirn;
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  
+  	err = mlx5e_create_ttc_table(priv, &ttc_params, &priv->fs.ttc);
+  	if (err) {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_fs_ethtool.c
+index b416a8ee2eed,32edb9119d38..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_fs_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_fs_ethtool.c
+@@@ -424,8 -424,6 +424,10 @@@ add_ethtool_flow_rule(struct mlx5e_pri
+  		u16 ix;
+  
+  		mlx5e_qid_get_ch_and_group(params, fs->ring_cookie, &ix, &group);
+++<<<<<<< HEAD
+ +		tir = group == MLX5E_RQ_GROUP_XSK ? priv->xsk_tir : priv->direct_tir;
+++=======
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  
+  		dst = kzalloc(sizeof(*dst), GFP_KERNEL);
+  		if (!dst) {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 15e30d82e985,0e387799ee93..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2233,8 -2210,9 +2233,14 @@@ int mlx5e_create_direct_rqts(struct mlx
+  	int err;
+  	int ix;
+  
+++<<<<<<< HEAD
+ +	for (ix = 0; ix < n; ix++) {
+ +		err = mlx5e_create_rqt(priv, 1 /*size */, &tirs[ix].rqt);
+++=======
++ 	for (ix = 0; ix < priv->max_nch; ix++) {
++ 		err = mlx5e_rqt_init_direct(&priv->rx_res->channels[ix].direct_rqt,
++ 					    priv->mdev, false, priv->drop_rq.rqn);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  		if (unlikely(err))
+  			goto err_destroy_rqts;
+  	}
+@@@ -2242,19 -2220,49 +2248,60 @@@
+  	return 0;
+  
+  err_destroy_rqts:
+++<<<<<<< HEAD
+ +	mlx5_core_warn(priv->mdev, "create rqts failed, %d\n", err);
+ +	for (ix--; ix >= 0; ix--)
+ +		mlx5e_destroy_rqt(priv, &tirs[ix].rqt);
+++=======
++ 	mlx5_core_warn(priv->mdev, "create direct rqts failed, %d\n", err);
++ 	while (--ix >= 0)
++ 		mlx5e_rqt_destroy(&priv->rx_res->channels[ix].direct_rqt);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  
+  	return err;
+  }
+  
+- void mlx5e_destroy_direct_rqts(struct mlx5e_priv *priv, struct mlx5e_tir *tirs, int n)
++ static int mlx5e_create_xsk_rqts(struct mlx5e_priv *priv)
+  {
+- 	int i;
++ 	int err;
++ 	int ix;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < n; i++)
+ +		mlx5e_destroy_rqt(priv, &tirs[i].rqt);
+++=======
++ 	for (ix = 0; ix < priv->max_nch; ix++) {
++ 		err = mlx5e_rqt_init_direct(&priv->rx_res->channels[ix].xsk_rqt,
++ 					    priv->mdev, false, priv->drop_rq.rqn);
++ 		if (unlikely(err))
++ 			goto err_destroy_rqts;
++ 	}
++ 
++ 	return 0;
++ 
++ err_destroy_rqts:
++ 	mlx5_core_warn(priv->mdev, "create xsk rqts failed, %d\n", err);
++ 	while (--ix >= 0)
++ 		mlx5e_rqt_destroy(&priv->rx_res->channels[ix].xsk_rqt);
++ 
++ 	return err;
++ }
++ 
++ void mlx5e_destroy_direct_rqts(struct mlx5e_priv *priv)
++ {
++ 	unsigned int ix;
++ 
++ 	for (ix = 0; ix < priv->max_nch; ix++)
++ 		mlx5e_rqt_destroy(&priv->rx_res->channels[ix].direct_rqt);
++ }
++ 
++ static void mlx5e_destroy_xsk_rqts(struct mlx5e_priv *priv)
++ {
++ 	unsigned int ix;
++ 
++ 	for (ix = 0; ix < priv->max_nch; ix++)
++ 		mlx5e_rqt_destroy(&priv->rx_res->channels[ix].xsk_rqt);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  }
+  
+  static int mlx5e_rx_hash_fn(int hfunc)
+@@@ -2348,48 -2291,36 +2395,70 @@@ static void mlx5e_redirect_rqts(struct 
+  	}
+  
+  	for (ix = 0; ix < priv->max_nch; ix++) {
+ -		u32 rqn = priv->drop_rq.rqn;
+ +		struct mlx5e_redirect_rqt_param direct_rrp = {
+ +			.is_rss = false,
+ +			{
+ +				.rqn    = mlx5e_get_direct_rqn(priv, ix, rrp)
+ +			},
+ +		};
+  
+ -		if (ix < chs->num)
+ -			rqn = chs->c[ix]->rq.rqn;
+ +		/* Direct RQ Tables */
+ +		if (!priv->direct_tir[ix].rqt.enabled)
+ +			continue;
+  
+++<<<<<<< HEAD
+ +		rqtn = priv->direct_tir[ix].rqt.rqtn;
+ +		mlx5e_redirect_rqt(priv, rqtn, 1, direct_rrp);
+++=======
++ 		mlx5e_rqt_redirect_direct(&res->channels[ix].direct_rqt, rqn);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	}
+ +}
+  
+ -	if (priv->profile->rx_ptp_support) {
+ -		u32 rqn;
+ +static void mlx5e_redirect_rqts_to_channels(struct mlx5e_priv *priv,
+ +					    struct mlx5e_channels *chs)
+ +{
+ +	struct mlx5e_redirect_rqt_param rrp = {
+ +		.is_rss        = true,
+ +		{
+ +			.rss = {
+ +				.channels  = chs,
+ +				.hfunc     = priv->rss_params.hfunc,
+ +			}
+ +		},
+ +	};
+  
+++<<<<<<< HEAD
+ +	mlx5e_redirect_rqts(priv, rrp);
+++=======
++ 		if (mlx5e_ptp_get_rqn(priv->channels.ptp, &rqn))
++ 			rqn = priv->drop_rq.rqn;
++ 
++ 		mlx5e_rqt_redirect_direct(&res->ptp.rqt, rqn);
++ 	}
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  }
+  
+  static void mlx5e_redirect_rqts_to_drop(struct mlx5e_priv *priv)
+  {
+ -	struct mlx5e_rx_res *res = priv->rx_res;
+ -	unsigned int ix;
+ +	struct mlx5e_redirect_rqt_param drop_rrp = {
+ +		.is_rss = false,
+ +		{
+ +			.rqn = priv->drop_rq.rqn,
+ +		},
+ +	};
+  
+++<<<<<<< HEAD
+ +	mlx5e_redirect_rqts(priv, drop_rrp);
+++=======
++ 	mlx5e_rqt_redirect_direct(&res->indir_rqt, priv->drop_rq.rqn);
++ 
++ 	for (ix = 0; ix < priv->max_nch; ix++)
++ 		mlx5e_rqt_redirect_direct(&res->channels[ix].direct_rqt, priv->drop_rq.rqn);
++ 
++ 	if (priv->profile->rx_ptp_support)
++ 		mlx5e_rqt_redirect_direct(&res->ptp.rqt, priv->drop_rq.rqn);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  }
+  
+  static const struct mlx5e_tirc_config tirc_default_config[MLX5E_NUM_INDIR_TIRS] = {
+@@@ -2504,11 -2436,11 +2573,19 @@@ void mlx5e_modify_tirs_hash(struct mlx5
+  		mlx5e_update_rx_hash_fields(&ttconfig, tt,
+  					    rss->rx_hash_fields[tt]);
+  		mlx5e_build_indir_tir_ctx_hash(rss, &ttconfig, tirc, false);
+++<<<<<<< HEAD
+ +		mlx5_core_modify_tir(mdev, priv->indir_tir[tt].tirn, in);
+ +	}
+ +
+ +	/* Verify inner tirs resources allocated */
+ +	if (!priv->inner_indir_tir[0].tirn)
+++=======
++ 		mlx5_core_modify_tir(mdev, res->rss[tt].indir_tir.tirn, in);
++ 	}
++ 
++ 	/* Verify inner tirs resources allocated */
++ 	if (!res->rss[0].inner_indir_tir.tirn)
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  		return;
+  
+  	for (tt = 0; tt < MLX5E_NUM_INDIR_TIRS; tt++) {
+@@@ -2516,7 -2448,7 +2593,11 @@@
+  		mlx5e_update_rx_hash_fields(&ttconfig, tt,
+  					    rss->rx_hash_fields[tt]);
+  		mlx5e_build_indir_tir_ctx_hash(rss, &ttconfig, tirc, true);
+++<<<<<<< HEAD
+ +		mlx5_core_modify_tir(mdev, priv->inner_indir_tir[tt].tirn, in);
+++=======
++ 		mlx5_core_modify_tir(mdev, res->rss[tt].inner_indir_tir.tirn, in);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	}
+  }
+  
+@@@ -2542,21 -2475,21 +2623,36 @@@ static int mlx5e_modify_tirs_lro(struc
+  	mlx5e_build_tir_ctx_lro(&priv->channels.params, tirc);
+  
+  	for (tt = 0; tt < MLX5E_NUM_INDIR_TIRS; tt++) {
+++<<<<<<< HEAD
+ +		err = mlx5_core_modify_tir(mdev, priv->indir_tir[tt].tirn, in);
+++=======
++ 		err = mlx5_core_modify_tir(mdev, res->rss[tt].indir_tir.tirn, in);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  		if (err)
+  			goto free_in;
+  
+  		/* Verify inner tirs resources allocated */
+++<<<<<<< HEAD
+ +		if (!priv->inner_indir_tir[0].tirn)
+ +			continue;
+ +
+ +		err = mlx5_core_modify_tir(mdev, priv->inner_indir_tir[tt].tirn, in);
+++=======
++ 		if (!res->rss[0].inner_indir_tir.tirn)
++ 			continue;
++ 
++ 		err = mlx5_core_modify_tir(mdev, res->rss[tt].inner_indir_tir.tirn, in);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  		if (err)
+  			goto free_in;
+  	}
+  
+  	for (ix = 0; ix < priv->max_nch; ix++) {
+++<<<<<<< HEAD
+ +		err = mlx5_core_modify_tir(mdev, priv->direct_tir[ix].tirn, in);
+++=======
++ 		err = mlx5_core_modify_tir(mdev, res->channels[ix].direct_tir.tirn, in);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  		if (err)
+  			goto free_in;
+  	}
+@@@ -3235,7 -3181,7 +3331,11 @@@ int mlx5e_create_indirect_tirs(struct m
+  
+  	for (tt = 0; tt < MLX5E_NUM_INDIR_TIRS; tt++) {
+  		memset(in, 0, inlen);
+++<<<<<<< HEAD
+ +		tir = &priv->indir_tir[tt];
+++=======
++ 		tir = &res->rss[tt].indir_tir;
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  		tirc = MLX5_ADDR_OF(create_tir_in, in, ctx);
+  		mlx5e_build_indir_tir_ctx(priv, tt, tirc);
+  		err = mlx5e_create_tir(priv->mdev, tir, in);
+@@@ -3250,7 -3196,7 +3350,11 @@@
+  
+  	for (i = 0; i < MLX5E_NUM_INDIR_TIRS; i++) {
+  		memset(in, 0, inlen);
+++<<<<<<< HEAD
+ +		tir = &priv->inner_indir_tir[i];
+++=======
++ 		tir = &res->rss[i].inner_indir_tir;
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  		tirc = MLX5_ADDR_OF(create_tir_in, in, ctx);
+  		mlx5e_build_inner_indir_tir_ctx(priv, i, tirc);
+  		err = mlx5e_create_tir(priv->mdev, tir, in);
+@@@ -3267,10 -3213,10 +3371,17 @@@ out
+  
+  err_destroy_inner_tirs:
+  	for (i--; i >= 0; i--)
+++<<<<<<< HEAD
+ +		mlx5e_destroy_tir(priv->mdev, &priv->inner_indir_tir[i]);
+ +
+ +	for (tt--; tt >= 0; tt--)
+ +		mlx5e_destroy_tir(priv->mdev, &priv->indir_tir[tt]);
+++=======
++ 		mlx5e_destroy_tir(priv->mdev, &res->rss[i].inner_indir_tir);
++ 
++ 	for (tt--; tt >= 0; tt--)
++ 		mlx5e_destroy_tir(priv->mdev, &res->rss[tt].indir_tir);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  
+  	kvfree(in);
+  
+@@@ -3319,22 -3294,31 +3459,41 @@@ void mlx5e_destroy_indirect_tirs(struc
+  	int i;
+  
+  	for (i = 0; i < MLX5E_NUM_INDIR_TIRS; i++)
+++<<<<<<< HEAD
+ +		mlx5e_destroy_tir(priv->mdev, &priv->indir_tir[i]);
+ +
+ +	/* Verify inner tirs resources allocated */
+ +	if (!priv->inner_indir_tir[0].tirn)
+ +		return;
+ +
+ +	for (i = 0; i < MLX5E_NUM_INDIR_TIRS; i++)
+ +		mlx5e_destroy_tir(priv->mdev, &priv->inner_indir_tir[i]);
+++=======
++ 		mlx5e_destroy_tir(priv->mdev, &res->rss[i].indir_tir);
++ 
++ 	/* Verify inner tirs resources allocated */
++ 	if (!res->rss[0].inner_indir_tir.tirn)
++ 		return;
++ 
++ 	for (i = 0; i < MLX5E_NUM_INDIR_TIRS; i++)
++ 		mlx5e_destroy_tir(priv->mdev, &res->rss[i].inner_indir_tir);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  }
+  
+- void mlx5e_destroy_direct_tirs(struct mlx5e_priv *priv, struct mlx5e_tir *tirs, int n)
++ void mlx5e_destroy_direct_tirs(struct mlx5e_priv *priv)
+  {
+- 	int i;
++ 	unsigned int ix;
+  
+- 	for (i = 0; i < n; i++)
+- 		mlx5e_destroy_tir(priv->mdev, &tirs[i]);
++ 	for (ix = 0; ix < priv->max_nch; ix++)
++ 		mlx5e_destroy_tir(priv->mdev, &priv->rx_res->channels[ix].direct_tir);
++ }
++ 
++ static void mlx5e_destroy_xsk_tirs(struct mlx5e_priv *priv)
++ {
++ 	unsigned int ix;
++ 
++ 	for (ix = 0; ix < priv->max_nch; ix++)
++ 		mlx5e_destroy_tir(priv->mdev, &priv->rx_res->channels[ix].xsk_tir);
+  }
+  
+  static int mlx5e_modify_channels_scatter_fcs(struct mlx5e_channels *chs, bool enable)
+@@@ -4999,10 -4926,13 +5158,9 @@@ static void mlx5e_nic_cleanup(struct ml
+  static int mlx5e_init_nic_rx(struct mlx5e_priv *priv)
+  {
+  	struct mlx5_core_dev *mdev = priv->mdev;
+- 	u16 max_nch = priv->max_nch;
+  	int err;
+  
+ -	priv->rx_res = kvzalloc(sizeof(*priv->rx_res), GFP_KERNEL);
+ -	if (!priv->rx_res)
+ -		return -ENOMEM;
+ -
+ -	mlx5e_build_rss_params(&priv->rx_res->rss_params, priv->channels.params.num_channels);
+ +	mlx5e_build_rss_params(&priv->rss_params, priv->channels.params.num_channels);
+  
+  	mlx5e_create_q_counters(priv);
+  
+@@@ -5016,7 -4946,7 +5174,11 @@@
+  	if (err)
+  		goto err_close_drop_rq;
+  
+++<<<<<<< HEAD
+ +	err = mlx5e_create_direct_rqts(priv, priv->direct_tir, max_nch);
+++=======
++ 	err = mlx5e_create_direct_rqts(priv);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	if (err)
+  		goto err_destroy_indirect_rqts;
+  
+@@@ -5024,18 -4954,27 +5186,42 @@@
+  	if (err)
+  		goto err_destroy_direct_rqts;
+  
+++<<<<<<< HEAD
+ +	err = mlx5e_create_direct_tirs(priv, priv->direct_tir, max_nch);
+ +	if (err)
+ +		goto err_destroy_indirect_tirs;
+ +
+ +	err = mlx5e_create_direct_rqts(priv, priv->xsk_tir, max_nch);
+ +	if (unlikely(err))
+ +		goto err_destroy_direct_tirs;
+ +
+ +	err = mlx5e_create_direct_tirs(priv, priv->xsk_tir, max_nch);
+ +	if (unlikely(err))
+ +		goto err_destroy_xsk_rqts;
+ +
+++=======
++ 	err = mlx5e_create_direct_tirs(priv);
++ 	if (err)
++ 		goto err_destroy_indirect_tirs;
++ 
++ 	err = mlx5e_create_xsk_rqts(priv);
++ 	if (unlikely(err))
++ 		goto err_destroy_direct_tirs;
++ 
++ 	err = mlx5e_create_xsk_tirs(priv);
++ 	if (unlikely(err))
++ 		goto err_destroy_xsk_rqts;
++ 
++ 	err = mlx5e_rqt_init_direct(&priv->rx_res->ptp.rqt, priv->mdev, false,
++ 				    priv->drop_rq.rqn);
++ 	if (err)
++ 		goto err_destroy_xsk_tirs;
++ 
++ 	err = mlx5e_create_direct_tir(priv, &priv->rx_res->ptp.tir, &priv->rx_res->ptp.rqt);
++ 	if (err)
++ 		goto err_destroy_ptp_rqt;
++ 
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	err = mlx5e_create_flow_steering(priv);
+  	if (err) {
+  		mlx5_core_warn(mdev, "create flow steering failed, %d\n", err);
+@@@ -5060,18 -4999,22 +5246,35 @@@ err_tc_nic_cleanup
+  	mlx5e_tc_nic_cleanup(priv);
+  err_destroy_flow_steering:
+  	mlx5e_destroy_flow_steering(priv);
+++<<<<<<< HEAD
+ +err_destroy_xsk_tirs:
+ +	mlx5e_destroy_direct_tirs(priv, priv->xsk_tir, max_nch);
+ +err_destroy_xsk_rqts:
+ +	mlx5e_destroy_direct_rqts(priv, priv->xsk_tir, max_nch);
+ +err_destroy_direct_tirs:
+ +	mlx5e_destroy_direct_tirs(priv, priv->direct_tir, max_nch);
+ +err_destroy_indirect_tirs:
+ +	mlx5e_destroy_indirect_tirs(priv);
+ +err_destroy_direct_rqts:
+ +	mlx5e_destroy_direct_rqts(priv, priv->direct_tir, max_nch);
+++=======
++ err_destroy_ptp_direct_tir:
++ 	mlx5e_destroy_tir(priv->mdev, &priv->rx_res->ptp.tir);
++ err_destroy_ptp_rqt:
++ 	mlx5e_rqt_destroy(&priv->rx_res->ptp.rqt);
++ err_destroy_xsk_tirs:
++ 	mlx5e_destroy_xsk_tirs(priv);
++ err_destroy_xsk_rqts:
++ 	mlx5e_destroy_xsk_rqts(priv);
++ err_destroy_direct_tirs:
++ 	mlx5e_destroy_direct_tirs(priv);
++ err_destroy_indirect_tirs:
++ 	mlx5e_destroy_indirect_tirs(priv);
++ err_destroy_direct_rqts:
++ 	mlx5e_destroy_direct_rqts(priv);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  err_destroy_indirect_rqts:
+ -	mlx5e_rqt_destroy(&priv->rx_res->indir_rqt);
+ +	mlx5e_destroy_rqt(priv, &priv->indir_rqt);
+  err_close_drop_rq:
+  	mlx5e_close_drop_rq(&priv->drop_rq);
+  err_destroy_q_counters:
+@@@ -5084,16 -5029,18 +5287,25 @@@ static void mlx5e_cleanup_nic_rx(struc
+  	mlx5e_accel_cleanup_rx(priv);
+  	mlx5e_tc_nic_cleanup(priv);
+  	mlx5e_destroy_flow_steering(priv);
+++<<<<<<< HEAD
+ +	mlx5e_destroy_direct_tirs(priv, priv->xsk_tir, max_nch);
+ +	mlx5e_destroy_direct_rqts(priv, priv->xsk_tir, max_nch);
+ +	mlx5e_destroy_direct_tirs(priv, priv->direct_tir, max_nch);
+ +	mlx5e_destroy_indirect_tirs(priv);
+ +	mlx5e_destroy_direct_rqts(priv, priv->direct_tir, max_nch);
+ +	mlx5e_destroy_rqt(priv, &priv->indir_rqt);
+++=======
++ 	mlx5e_destroy_tir(priv->mdev, &priv->rx_res->ptp.tir);
++ 	mlx5e_rqt_destroy(&priv->rx_res->ptp.rqt);
++ 	mlx5e_destroy_xsk_tirs(priv);
++ 	mlx5e_destroy_xsk_rqts(priv);
++ 	mlx5e_destroy_direct_tirs(priv);
++ 	mlx5e_destroy_indirect_tirs(priv);
++ 	mlx5e_destroy_direct_rqts(priv);
++ 	mlx5e_rqt_destroy(&priv->rx_res->indir_rqt);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	mlx5e_close_drop_rq(&priv->drop_rq);
+  	mlx5e_destroy_q_counters(priv);
+ -	kvfree(priv->rx_res);
+ -	priv->rx_res = NULL;
+  }
+  
+  static int mlx5e_init_nic_tx(struct mlx5e_priv *priv)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 98da6dcc9ee9,2c54951c240d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@@ -657,7 -655,7 +657,11 @@@ static int mlx5e_create_rep_ttc_table(s
+  					      MLX5_FLOW_NAMESPACE_KERNEL);
+  
+  	/* The inner_ttc in the ttc params is intentionally not set */
+++<<<<<<< HEAD
+ +	ttc_params.any_tt_tirn = priv->direct_tir[0].tirn;
+++=======
++ 	ttc_params.any_tt_tirn = res->channels[0].direct_tir.tirn;
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	mlx5e_set_ttc_ft_params(&ttc_params);
+  
+  	if (rep->vport != MLX5_VPORT_UPLINK)
+@@@ -665,7 -663,7 +669,11 @@@
+  		ttc_params.ft_attr.level = MLX5E_TTC_FT_LEVEL + 1;
+  
+  	for (tt = 0; tt < MLX5E_NUM_INDIR_TIRS; tt++)
+++<<<<<<< HEAD
+ +		ttc_params.indir_tirn[tt] = priv->indir_tir[tt].tirn;
+++=======
++ 		ttc_params.indir_tirn[tt] = res->rss[tt].indir_tir.tirn;
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  
+  	err = mlx5e_create_ttc_table(priv, &ttc_params, &priv->fs.ttc);
+  	if (err) {
+@@@ -761,10 -758,13 +769,9 @@@ int mlx5e_rep_bond_update(struct mlx5e_
+  static int mlx5e_init_rep_rx(struct mlx5e_priv *priv)
+  {
+  	struct mlx5_core_dev *mdev = priv->mdev;
+- 	u16 max_nch = priv->max_nch;
+  	int err;
+  
+ -	priv->rx_res = kvzalloc(sizeof(*priv->rx_res), GFP_KERNEL);
+ -	if (!priv->rx_res)
+ -		return -ENOMEM;
+ -
+ -	mlx5e_build_rss_params(&priv->rx_res->rss_params, priv->channels.params.num_channels);
+ +	mlx5e_build_rss_params(&priv->rss_params, priv->channels.params.num_channels);
+  
+  	mlx5e_init_l2_addr(priv);
+  
+@@@ -778,7 -778,7 +785,11 @@@
+  	if (err)
+  		goto err_close_drop_rq;
+  
+++<<<<<<< HEAD
+ +	err = mlx5e_create_direct_rqts(priv, priv->direct_tir, max_nch);
+++=======
++ 	err = mlx5e_create_direct_rqts(priv);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	if (err)
+  		goto err_destroy_indirect_rqts;
+  
+@@@ -786,7 -786,7 +797,11 @@@
+  	if (err)
+  		goto err_destroy_direct_rqts;
+  
+++<<<<<<< HEAD
+ +	err = mlx5e_create_direct_tirs(priv, priv->direct_tir, max_nch);
+++=======
++ 	err = mlx5e_create_direct_tirs(priv);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	if (err)
+  		goto err_destroy_indirect_tirs;
+  
+@@@ -811,15 -811,17 +826,23 @@@ err_destroy_root_ft
+  err_destroy_ttc_table:
+  	mlx5e_destroy_ttc_table(priv, &priv->fs.ttc);
+  err_destroy_direct_tirs:
+++<<<<<<< HEAD
+ +	mlx5e_destroy_direct_tirs(priv, priv->direct_tir, max_nch);
+ +err_destroy_indirect_tirs:
+ +	mlx5e_destroy_indirect_tirs(priv);
+ +err_destroy_direct_rqts:
+ +	mlx5e_destroy_direct_rqts(priv, priv->direct_tir, max_nch);
+++=======
++ 	mlx5e_destroy_direct_tirs(priv);
++ err_destroy_indirect_tirs:
++ 	mlx5e_destroy_indirect_tirs(priv);
++ err_destroy_direct_rqts:
++ 	mlx5e_destroy_direct_rqts(priv);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  err_destroy_indirect_rqts:
+ -	mlx5e_rqt_destroy(&priv->rx_res->indir_rqt);
+ +	mlx5e_destroy_rqt(priv, &priv->indir_rqt);
+  err_close_drop_rq:
+  	mlx5e_close_drop_rq(&priv->drop_rq);
+ -	kvfree(priv->rx_res);
+ -	priv->rx_res = NULL;
+  	return err;
+  }
+  
+@@@ -831,11 -831,13 +852,18 @@@ static void mlx5e_cleanup_rep_rx(struc
+  	rep_vport_rx_rule_destroy(priv);
+  	mlx5e_destroy_rep_root_ft(priv);
+  	mlx5e_destroy_ttc_table(priv, &priv->fs.ttc);
+++<<<<<<< HEAD
+ +	mlx5e_destroy_direct_tirs(priv, priv->direct_tir, max_nch);
+ +	mlx5e_destroy_indirect_tirs(priv);
+ +	mlx5e_destroy_direct_rqts(priv, priv->direct_tir, max_nch);
+ +	mlx5e_destroy_rqt(priv, &priv->indir_rqt);
+++=======
++ 	mlx5e_destroy_direct_tirs(priv);
++ 	mlx5e_destroy_indirect_tirs(priv);
++ 	mlx5e_destroy_direct_rqts(priv);
++ 	mlx5e_rqt_destroy(&priv->rx_res->indir_rqt);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	mlx5e_close_drop_rq(&priv->drop_rq);
+ -	kvfree(priv->rx_res);
+ -	priv->rx_res = NULL;
+  }
+  
+  static int mlx5e_init_ul_rep_rx(struct mlx5e_priv *priv)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+index f3988eec3041,6535c636ae22..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@@ -339,7 -333,7 +339,11 @@@ static int mlx5i_create_flow_steering(s
+  	mlx5e_set_ttc_basic_params(priv, &ttc_params);
+  	mlx5e_set_ttc_ft_params(&ttc_params);
+  	for (tt = 0; tt < MLX5E_NUM_INDIR_TIRS; tt++)
+++<<<<<<< HEAD
+ +		ttc_params.indir_tirn[tt] = priv->indir_tir[tt].tirn;
+++=======
++ 		ttc_params.indir_tirn[tt] = priv->rx_res->rss[tt].indir_tir.tirn;
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  
+  	err = mlx5e_create_ttc_table(priv, &ttc_params, &priv->fs.ttc);
+  	if (err) {
+@@@ -365,10 -359,13 +369,9 @@@ static void mlx5i_destroy_flow_steering
+  static int mlx5i_init_rx(struct mlx5e_priv *priv)
+  {
+  	struct mlx5_core_dev *mdev = priv->mdev;
+- 	u16 max_nch = priv->max_nch;
+  	int err;
+  
+ -	priv->rx_res = kvzalloc(sizeof(*priv->rx_res), GFP_KERNEL);
+ -	if (!priv->rx_res)
+ -		return -ENOMEM;
+ -
+ -	mlx5e_build_rss_params(&priv->rx_res->rss_params, priv->channels.params.num_channels);
+ +	mlx5e_build_rss_params(&priv->rss_params, priv->channels.params.num_channels);
+  
+  	mlx5e_create_q_counters(priv);
+  
+@@@ -382,7 -379,7 +385,11 @@@
+  	if (err)
+  		goto err_close_drop_rq;
+  
+++<<<<<<< HEAD
+ +	err = mlx5e_create_direct_rqts(priv, priv->direct_tir, max_nch);
+++=======
++ 	err = mlx5e_create_direct_rqts(priv);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	if (err)
+  		goto err_destroy_indirect_rqts;
+  
+@@@ -390,7 -387,7 +397,11 @@@
+  	if (err)
+  		goto err_destroy_direct_rqts;
+  
+++<<<<<<< HEAD
+ +	err = mlx5e_create_direct_tirs(priv, priv->direct_tir, max_nch);
+++=======
++ 	err = mlx5e_create_direct_tirs(priv);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	if (err)
+  		goto err_destroy_indirect_tirs;
+  
+@@@ -401,13 -398,13 +412,21 @@@
+  	return 0;
+  
+  err_destroy_direct_tirs:
+++<<<<<<< HEAD
+ +	mlx5e_destroy_direct_tirs(priv, priv->direct_tir, max_nch);
+ +err_destroy_indirect_tirs:
+ +	mlx5e_destroy_indirect_tirs(priv);
+ +err_destroy_direct_rqts:
+ +	mlx5e_destroy_direct_rqts(priv, priv->direct_tir, max_nch);
+++=======
++ 	mlx5e_destroy_direct_tirs(priv);
++ err_destroy_indirect_tirs:
++ 	mlx5e_destroy_indirect_tirs(priv);
++ err_destroy_direct_rqts:
++ 	mlx5e_destroy_direct_rqts(priv);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  err_destroy_indirect_rqts:
+ -	mlx5e_rqt_destroy(&priv->rx_res->indir_rqt);
+ +	mlx5e_destroy_rqt(priv, &priv->indir_rqt);
+  err_close_drop_rq:
+  	mlx5e_close_drop_rq(&priv->drop_rq);
+  err_destroy_q_counters:
+@@@ -417,15 -416,15 +436,20 @@@
+  
+  static void mlx5i_cleanup_rx(struct mlx5e_priv *priv)
+  {
+- 	u16 max_nch = priv->max_nch;
+- 
+  	mlx5i_destroy_flow_steering(priv);
+++<<<<<<< HEAD
+ +	mlx5e_destroy_direct_tirs(priv, priv->direct_tir, max_nch);
+ +	mlx5e_destroy_indirect_tirs(priv);
+ +	mlx5e_destroy_direct_rqts(priv, priv->direct_tir, max_nch);
+ +	mlx5e_destroy_rqt(priv, &priv->indir_rqt);
+++=======
++ 	mlx5e_destroy_direct_tirs(priv);
++ 	mlx5e_destroy_indirect_tirs(priv);
++ 	mlx5e_destroy_direct_rqts(priv);
++ 	mlx5e_rqt_destroy(&priv->rx_res->indir_rqt);
+++>>>>>>> 0570c1c95817 (net/mlx5e: Take RQT out of TIR and group RX resources)
+  	mlx5e_close_drop_rq(&priv->drop_rq);
+  	mlx5e_destroy_q_counters(priv);
+ -	kvfree(priv->rx_res);
+ -	priv->rx_res = NULL;
+  }
+  
+  /* The stats groups order is opposite to the update_stats() order calls */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/rx_res.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/rx_res.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_arfs.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_fs_ethtool.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
