@@ -1,0 +1,109 @@
+lib/sbitmap: allocate sb->map via kvzalloc_node
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.19.1.el8_6
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 863a66cdb4df25fd146d9851c3289072298566d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.19.1.el8_6/863a66cd.failed
+
+sbitmap has been used in scsi for replacing atomic operations on
+sdev->device_busy, so IOPS on some fast scsi storage can be improved.
+
+However, sdev->device_busy can be changed in fast path, so we have to
+allocate the sb->map statically. sdev->device_busy has been capped to 1024,
+but some drivers may configure the default depth as < 8, then
+cause each sbitmap word to hold only one bit. Finally 1024 * 128(
+sizeof(sbitmap_word)) bytes is needed for sb->map, given it is order 5
+allocation, sometimes it may fail.
+
+Avoid the issue by using kvzalloc_node() for allocating sb->map.
+
+	Cc: Ewan D. Milne <emilne@redhat.com>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Chaitanya Kulkarni <kch@nvidia.com>
+Link: https://lore.kernel.org/r/20220316012708.354668-1-ming.lei@redhat.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 863a66cdb4df25fd146d9851c3289072298566d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sbitmap.h
+#	lib/sbitmap.c
+diff --cc include/linux/sbitmap.h
+index d7c9ef86c2ea,8f5a86e210b9..000000000000
+--- a/include/linux/sbitmap.h
++++ b/include/linux/sbitmap.h
+@@@ -185,18 -173,8 +185,23 @@@ int sbitmap_init_node(struct sbitmap *s
+   */
+  static inline void sbitmap_free(struct sbitmap *sb)
+  {
+++<<<<<<< HEAD
+ +	unsigned int __percpu **alloc_hint_p;
+ +	struct sbitmap_word *map = sb->map;
+ +
+ +	/*
+ +	 * RHEL8: if map is NULL, can't access alloc_hint
+ +	 *        and kfree(--map) will panic, so check.
+ +	*/
+ +	alloc_hint_p = SB_ALLOC_HINT_PTR(sb);
+ +	if (alloc_hint_p)
+ +		free_percpu(*alloc_hint_p);
+ +	if (map)
+ +		kfree(--map);
+++=======
++ 	free_percpu(sb->alloc_hint);
++ 	kvfree(sb->map);
+++>>>>>>> 863a66cdb4df (lib/sbitmap: allocate sb->map via kvzalloc_node)
+  	sb->map = NULL;
+  }
+  
+diff --cc lib/sbitmap.c
+index a7f5c295c506,ae4fd4de9ebe..000000000000
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@@ -120,29 -103,19 +120,40 @@@ int sbitmap_init_node(struct sbitmap *s
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * RHEL8: sb->alloc_hint is kept in an additional sb->map array element prior
+ +         * to the actual sb->map due to KABI (it was not possible to add it to struct sbitmap)
+ +	 */
+ +	sb->map = kcalloc_node(sb->map_nr + 1, sizeof(*sb->map), flags, node);
+++=======
++ 	if (alloc_hint) {
++ 		if (init_alloc_hint(sb, flags))
++ 			return -ENOMEM;
++ 	} else {
++ 		sb->alloc_hint = NULL;
++ 	}
++ 
++ 	sb->map = kvzalloc_node(sb->map_nr * sizeof(*sb->map), flags, node);
+++>>>>>>> 863a66cdb4df (lib/sbitmap: allocate sb->map via kvzalloc_node)
+  	if (!sb->map) {
+ -		free_percpu(sb->alloc_hint);
+  		return -ENOMEM;
+  	}
+ +	sb->map++;
+ +
+ +	if (alloc_hint) {
+ +		if (init_alloc_hint(sb, flags)) {
+ +			kfree(--sb->map);
+ +			return -ENOMEM;
+ +		}
+ +	} else {
+ +		*SB_ALLOC_HINT_PTR(sb) = NULL;
+ +	}
+  
+ +	for (i = 0; i < sb->map_nr; i++) {
+ +		sb->map[i].depth = min(depth, bits_per_word);
+ +		depth -= sb->map[i].depth;
+ +	}
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(sbitmap_init_node);
+* Unmerged path include/linux/sbitmap.h
+* Unmerged path lib/sbitmap.c
