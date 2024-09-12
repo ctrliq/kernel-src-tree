@@ -1,0 +1,182 @@
+kernel/resource: make release_mem_region_adjustable() never fail
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-511.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit ec62d04e3fdc4ba3a7912cd7f6da1a4e787a0d75
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-511.el8/ec62d04e.failed
+
+Patch series "selective merging of system ram resources", v4.
+
+Some add_memory*() users add memory in small, contiguous memory blocks.
+Examples include virtio-mem, hyper-v balloon, and the XEN balloon.
+
+This can quickly result in a lot of memory resources, whereby the actual
+resource boundaries are not of interest (e.g., it might be relevant for
+DIMMs, exposed via /proc/iomem to user space).  We really want to merge
+added resources in this scenario where possible.
+
+Resources are effectively stored in a list-based tree.  Having a lot of
+resources not only wastes memory, it also makes traversing that tree more
+expensive, and makes /proc/iomem explode in size (e.g., requiring
+kexec-tools to manually merge resources when creating a kdump header.  The
+current kexec-tools resource count limit does not allow for more than
+~100GB of memory with a memory block size of 128MB on x86-64).
+
+Let's allow to selectively merge system ram resources by specifying a new
+flag for add_memory*().  Patch #5 contains a /proc/iomem example.  Only
+tested with virtio-mem.
+
+This patch (of 8):
+
+Let's make sure splitting a resource on memory hotunplug will never fail.
+This will become more relevant once we merge selected System RAM resources
+- then, we'll trigger that case more often on memory hotunplug.
+
+In general, this function is already unlikely to fail.  When we remove
+memory, we free up quite a lot of metadata (memmap, page tables, memory
+block device, etc.).  The only reason it could really fail would be when
+injecting allocation errors.
+
+All other error cases inside release_mem_region_adjustable() seem to be
+sanity checks if the function would be abused in different context - let's
+add WARN_ON_ONCE() in these cases so we can catch them.
+
+[natechancellor@gmail.com: fix use of ternary condition in release_mem_region_adjustable]
+  Link: https://lkml.kernel.org/r/20200922060748.2452056-1-natechancellor@gmail.com
+  Link: https://github.com/ClangBuiltLinux/linux/issues/1159
+
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Signed-off-by: Nathan Chancellor <natechancellor@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Ard Biesheuvel <ardb@kernel.org>
+	Cc: Pankaj Gupta <pankaj.gupta.linux@gmail.com>
+	Cc: Baoquan He <bhe@redhat.com>
+	Cc: Wei Yang <richardw.yang@linux.intel.com>
+	Cc: Anton Blanchard <anton@ozlabs.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+	Cc: Dave Jiang <dave.jiang@intel.com>
+	Cc: Eric Biederman <ebiederm@xmission.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Haiyang Zhang <haiyangz@microsoft.com>
+	Cc: Heiko Carstens <hca@linux.ibm.com>
+	Cc: Jason Wang <jasowang@redhat.com>
+	Cc: Juergen Gross <jgross@suse.com>
+	Cc: Julien Grall <julien@xen.org>
+	Cc: "K. Y. Srinivasan" <kys@microsoft.com>
+	Cc: Len Brown <lenb@kernel.org>
+	Cc: Leonardo Bras <leobras.c@gmail.com>
+	Cc: Libor Pechacek <lpechacek@suse.cz>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: "Michael S. Tsirkin" <mst@redhat.com>
+	Cc: Nathan Lynch <nathanl@linux.ibm.com>
+	Cc: "Oliver O'Halloran" <oohall@gmail.com>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Pingfan Liu <kernelfans@gmail.com>
+	Cc: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+	Cc: Roger Pau Monn <roger.pau@citrix.com>
+	Cc: Stefano Stabellini <sstabellini@kernel.org>
+	Cc: Stephen Hemminger <sthemmin@microsoft.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vasily Gorbik <gor@linux.ibm.com>
+	Cc: Vishal Verma <vishal.l.verma@intel.com>
+	Cc: Wei Liu <wei.liu@kernel.org>
+Link: https://lkml.kernel.org/r/20200911103459.10306-2-david@redhat.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit ec62d04e3fdc4ba3a7912cd7f6da1a4e787a0d75)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/resource.c
+diff --cc kernel/resource.c
+index d222bbe8901b,4c1c487abbfb..000000000000
+--- a/kernel/resource.c
++++ b/kernel/resource.c
+@@@ -1267,6 -1294,20 +1274,23 @@@ retry
+  			continue;
+  		}
+  
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * All memory regions added from memory-hotplug path have the
++ 		 * flag IORESOURCE_SYSTEM_RAM. If the resource does not have
++ 		 * this flag, we know that we are dealing with a resource coming
++ 		 * from HMM/devm. HMM/devm use another mechanism to add/release
++ 		 * a resource. This goes via devm_request_mem_region and
++ 		 * devm_release_mem_region.
++ 		 * HMM/devm take care to release their resources when they want,
++ 		 * so if we are dealing with them, let us just back off here.
++ 		 */
++ 		if (!(res->flags & IORESOURCE_SYSRAM)) {
++ 			break;
++ 		}
++ 
+++>>>>>>> ec62d04e3fdc (kernel/resource: make release_mem_region_adjustable() never fail)
+  		if (!(res->flags & IORESOURCE_MEM))
+  			break;
+  
+diff --git a/include/linux/ioport.h b/include/linux/ioport.h
+index 9b2403d8bd75..ea4233fc54c1 100644
+--- a/include/linux/ioport.h
++++ b/include/linux/ioport.h
+@@ -285,8 +285,8 @@ extern struct resource * __request_region(struct resource *,
+ extern void __release_region(struct resource *, resource_size_t,
+ 				resource_size_t);
+ #ifdef CONFIG_MEMORY_HOTREMOVE
+-extern int release_mem_region_adjustable(struct resource *, resource_size_t,
+-				resource_size_t);
++extern void release_mem_region_adjustable(struct resource *, resource_size_t,
++					  resource_size_t);
+ #endif
+ 
+ /* Wrappers for managed devices */
+* Unmerged path kernel/resource.c
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index 80f0508943e1..1f8db7f7a0e2 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -1714,26 +1714,6 @@ void try_offline_node(int nid)
+ }
+ EXPORT_SYMBOL(try_offline_node);
+ 
+-static void __release_memory_resource(resource_size_t start,
+-				      resource_size_t size)
+-{
+-	int ret;
+-
+-	/*
+-	 * When removing memory in the same granularity as it was added,
+-	 * this function never fails. It might only fail if resources
+-	 * have to be adjusted or split. We'll ignore the error, as
+-	 * removing of memory cannot fail.
+-	 */
+-	ret = release_mem_region_adjustable(&iomem_resource, start, size);
+-	if (ret) {
+-		resource_size_t endres = start + size - 1;
+-
+-		pr_warn("Unable to release resource <%pa-%pa> (%d)\n",
+-			&start, &endres, ret);
+-	}
+-}
+-
+ static int __ref try_remove_memory(int nid, u64 start, u64 size)
+ {
+ 	int rc = 0;
+@@ -1767,7 +1747,7 @@ static int __ref try_remove_memory(int nid, u64 start, u64 size)
+ 		memblock_remove(start, size);
+ 	}
+ 
+-	__release_memory_resource(start, size);
++	release_mem_region_adjustable(&iomem_resource, start, size);
+ 
+ 	try_offline_node(nid);
+ 
