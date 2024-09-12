@@ -1,0 +1,297 @@
+hv_netvsc: Remove second mapping of send and recv buffers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-536.el8
+commit-author Michael Kelley <mikelley@microsoft.com>
+commit 25727aaed6514b88f98a18862c6f2d65a0b0ec3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-536.el8/25727aae.failed
+
+With changes to how Hyper-V guest VMs flip memory between private
+(encrypted) and shared (decrypted), creating a second kernel virtual
+mapping for shared memory is no longer necessary.  Everything needed
+for the transition to shared is handled by set_memory_decrypted().
+
+As such, remove the code to create and manage the second
+mapping for the pre-allocated send and recv buffers.  This mapping
+is the last user of hv_map_memory()/hv_unmap_memory(), so delete
+these functions as well.  Finally, hv_map_memory() is the last
+user of vmap_pfn() in Hyper-V guest code, so remove the Kconfig
+selection of VMAP_PFN.
+
+	Signed-off-by: Michael Kelley <mikelley@microsoft.com>
+	Reviewed-by: Tianyu Lan <Tianyu.Lan@microsoft.com>
+Link: https://lore.kernel.org/r/1679838727-87310-11-git-send-email-mikelley@microsoft.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 25727aaed6514b88f98a18862c6f2d65a0b0ec3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/ivm.c
+#	drivers/hv/Kconfig
+diff --cc arch/x86/hyperv/ivm.c
+index 5648efb6c73e,127d5b7b63de..000000000000
+--- a/arch/x86/hyperv/ivm.c
++++ b/arch/x86/hyperv/ivm.c
+@@@ -323,37 -324,58 +323,89 @@@ int hv_set_mem_host_visibility(unsigne
+  
+   err_free_pfn_array:
+  	kfree(pfn_array);
+ -	return result;
+ +	return ret;
+ +}
+ +
+++<<<<<<< HEAD
+ +/*
+ + * hv_map_memory - map memory to extra space in the AMD SEV-SNP Isolation VM.
+ + */
+ +void *hv_map_memory(void *addr, unsigned long size)
+ +{
+ +	unsigned long *pfns = kcalloc(size / PAGE_SIZE,
+ +				      sizeof(unsigned long), GFP_KERNEL);
+ +	void *vaddr;
+ +	int i;
+ +
+ +	if (!pfns)
+ +		return NULL;
+ +
+ +	for (i = 0; i < size / PAGE_SIZE; i++)
+ +		pfns[i] = vmalloc_to_pfn(addr + i * PAGE_SIZE) +
+ +			(ms_hyperv.shared_gpa_boundary >> PAGE_SHIFT);
+ +
+ +	vaddr = vmap_pfn(pfns, size / PAGE_SIZE, pgprot_decrypted(PAGE_KERNEL));
+ +	kfree(pfns);
+ +
+ +	return vaddr;
+ +}
+ +
+ +void hv_unmap_memory(void *addr)
+ +{
+ +	vunmap(addr);
+  }
+  
+++=======
++ static bool hv_vtom_tlb_flush_required(bool private)
++ {
++ 	return true;
++ }
++ 
++ static bool hv_vtom_cache_flush_required(void)
++ {
++ 	return false;
++ }
++ 
++ static bool hv_is_private_mmio(u64 addr)
++ {
++ 	/*
++ 	 * Hyper-V always provides a single IO-APIC in a guest VM.
++ 	 * When a paravisor is used, it is emulated by the paravisor
++ 	 * in the guest context and must be mapped private.
++ 	 */
++ 	if (addr >= HV_IOAPIC_BASE_ADDRESS &&
++ 	    addr < (HV_IOAPIC_BASE_ADDRESS + PAGE_SIZE))
++ 		return true;
++ 
++ 	/* Same with a vTPM */
++ 	if (addr >= VTPM_BASE_ADDRESS &&
++ 	    addr < (VTPM_BASE_ADDRESS + PAGE_SIZE))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ void __init hv_vtom_init(void)
++ {
++ 	/*
++ 	 * By design, a VM using vTOM doesn't see the SEV setting,
++ 	 * so SEV initialization is bypassed and sev_status isn't set.
++ 	 * Set it here to indicate a vTOM VM.
++ 	 */
++ 	sev_status = MSR_AMD64_SNP_VTOM;
++ 	cc_set_vendor(CC_VENDOR_AMD);
++ 	cc_set_mask(ms_hyperv.shared_gpa_boundary);
++ 	physical_mask &= ms_hyperv.shared_gpa_boundary - 1;
++ 
++ 	x86_platform.hyper.is_private_mmio = hv_is_private_mmio;
++ 	x86_platform.guest.enc_cache_flush_required = hv_vtom_cache_flush_required;
++ 	x86_platform.guest.enc_tlb_flush_required = hv_vtom_tlb_flush_required;
++ 	x86_platform.guest.enc_status_change_finish = hv_vtom_set_host_visibility;
++ }
++ 
++ #endif /* CONFIG_AMD_MEM_ENCRYPT */
++ 
+++>>>>>>> 25727aaed651 (hv_netvsc: Remove second mapping of send and recv buffers)
+  enum hv_isolation_type hv_get_isolation_type(void)
+  {
+  	if (!(ms_hyperv.priv_high & HV_ISOLATION))
+diff --cc drivers/hv/Kconfig
+index dd12af20e467,94982f08b661..000000000000
+--- a/drivers/hv/Kconfig
++++ b/drivers/hv/Kconfig
+@@@ -4,11 -4,11 +4,15 @@@ menu "Microsoft Hyper-V guest support
+  
+  config HYPERV
+  	tristate "Microsoft Hyper-V client drivers"
+ -	depends on (X86 && X86_LOCAL_APIC && HYPERVISOR_GUEST) \
+ -		|| (ACPI && ARM64 && !CPU_BIG_ENDIAN)
+ +	depends on ACPI && ((X86 && X86_LOCAL_APIC && HYPERVISOR_GUEST) \
+ +		|| (ARM64 && !CPU_BIG_ENDIAN))
+  	select PARAVIRT
+  	select X86_HV_CALLBACK_VECTOR if X86
+++<<<<<<< HEAD
+ +	select VMAP_PFN
+++=======
++ 	select OF_EARLY_FLATTREE if OF
+++>>>>>>> 25727aaed651 (hv_netvsc: Remove second mapping of send and recv buffers)
+  	help
+  	  Select this option to run Linux as a Hyper-V client operating
+  	  system.
+* Unmerged path arch/x86/hyperv/ivm.c
+* Unmerged path drivers/hv/Kconfig
+diff --git a/drivers/hv/hv_common.c b/drivers/hv/hv_common.c
+index c00e1e18c2ea..88c4dd2587c7 100644
+--- a/drivers/hv/hv_common.c
++++ b/drivers/hv/hv_common.c
+@@ -310,14 +310,3 @@ u64 __weak hv_ghcb_hypercall(u64 control, void *input, void *output, u32 input_s
+ 	return HV_STATUS_INVALID_PARAMETER;
+ }
+ EXPORT_SYMBOL_GPL(hv_ghcb_hypercall);
+-
+-void __weak *hv_map_memory(void *addr, unsigned long size)
+-{
+-	return NULL;
+-}
+-EXPORT_SYMBOL_GPL(hv_map_memory);
+-
+-void __weak hv_unmap_memory(void *addr)
+-{
+-}
+-EXPORT_SYMBOL_GPL(hv_unmap_memory);
+diff --git a/drivers/net/hyperv/hyperv_net.h b/drivers/net/hyperv/hyperv_net.h
+index cbf964a1bde9..a2af4f879bab 100644
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@ -1151,7 +1151,6 @@ struct netvsc_device {
+ 
+ 	/* Receive buffer allocated by us but manages by NetVSP */
+ 	void *recv_buf;
+-	void *recv_original_buf;
+ 	u32 recv_buf_size; /* allocated bytes */
+ 	struct vmbus_gpadl recv_buf_gpadl_handle;
+ 	u32 recv_section_cnt;
+@@ -1160,7 +1159,6 @@ struct netvsc_device {
+ 
+ 	/* Send buffer allocated by us */
+ 	void *send_buf;
+-	void *send_original_buf;
+ 	u32 send_buf_size;
+ 	struct vmbus_gpadl send_buf_gpadl_handle;
+ 	u32 send_section_cnt;
+diff --git a/drivers/net/hyperv/netvsc.c b/drivers/net/hyperv/netvsc.c
+index ae6fab075d0b..8a01637b1b7a 100644
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@ -165,17 +165,8 @@ static void free_netvsc_device(struct rcu_head *head)
+ 	int i;
+ 
+ 	kfree(nvdev->extension);
+-
+-	if (nvdev->recv_original_buf)
+-		vfree(nvdev->recv_original_buf);
+-	else
+-		vfree(nvdev->recv_buf);
+-
+-	if (nvdev->send_original_buf)
+-		vfree(nvdev->send_original_buf);
+-	else
+-		vfree(nvdev->send_buf);
+-
++	vfree(nvdev->recv_buf);
++	vfree(nvdev->send_buf);
+ 	bitmap_free(nvdev->send_section_map);
+ 
+ 	for (i = 0; i < VRSS_CHANNEL_MAX; i++) {
+@@ -358,7 +349,6 @@ static int netvsc_init_buf(struct hv_device *device,
+ 	struct nvsp_message *init_packet;
+ 	unsigned int buf_size;
+ 	int i, ret = 0;
+-	void *vaddr;
+ 
+ 	/* Get receive buffer area. */
+ 	buf_size = device_info->recv_sections * device_info->recv_section_size;
+@@ -394,17 +384,6 @@ static int netvsc_init_buf(struct hv_device *device,
+ 		goto cleanup;
+ 	}
+ 
+-	if (hv_isolation_type_snp()) {
+-		vaddr = hv_map_memory(net_device->recv_buf, buf_size);
+-		if (!vaddr) {
+-			ret = -ENOMEM;
+-			goto cleanup;
+-		}
+-
+-		net_device->recv_original_buf = net_device->recv_buf;
+-		net_device->recv_buf = vaddr;
+-	}
+-
+ 	/* Notify the NetVsp of the gpadl handle */
+ 	init_packet = &net_device->channel_init_pkt;
+ 	memset(init_packet, 0, sizeof(struct nvsp_message));
+@@ -508,17 +487,6 @@ static int netvsc_init_buf(struct hv_device *device,
+ 		goto cleanup;
+ 	}
+ 
+-	if (hv_isolation_type_snp()) {
+-		vaddr = hv_map_memory(net_device->send_buf, buf_size);
+-		if (!vaddr) {
+-			ret = -ENOMEM;
+-			goto cleanup;
+-		}
+-
+-		net_device->send_original_buf = net_device->send_buf;
+-		net_device->send_buf = vaddr;
+-	}
+-
+ 	/* Notify the NetVsp of the gpadl handle */
+ 	init_packet = &net_device->channel_init_pkt;
+ 	memset(init_packet, 0, sizeof(struct nvsp_message));
+@@ -773,12 +741,6 @@ void netvsc_device_remove(struct hv_device *device)
+ 		netvsc_teardown_send_gpadl(device, net_device, ndev);
+ 	}
+ 
+-	if (net_device->recv_original_buf)
+-		hv_unmap_memory(net_device->recv_buf);
+-
+-	if (net_device->send_original_buf)
+-		hv_unmap_memory(net_device->send_buf);
+-
+ 	/* Release all resources */
+ 	free_netvsc_device_rcu(net_device);
+ }
+@@ -1855,12 +1817,6 @@ struct netvsc_device *netvsc_device_add(struct hv_device *device,
+ 	netif_napi_del(&net_device->chan_table[0].napi);
+ 
+ cleanup2:
+-	if (net_device->recv_original_buf)
+-		hv_unmap_memory(net_device->recv_buf);
+-
+-	if (net_device->send_original_buf)
+-		hv_unmap_memory(net_device->send_buf);
+-
+ 	free_netvsc_device(&net_device->rcu);
+ 
+ 	return ERR_PTR(ret);
+diff --git a/include/asm-generic/mshyperv.h b/include/asm-generic/mshyperv.h
+index 8845a2eca339..2d80684c1ab0 100644
+--- a/include/asm-generic/mshyperv.h
++++ b/include/asm-generic/mshyperv.h
+@@ -269,8 +269,6 @@ u64 hv_ghcb_hypercall(u64 control, void *input, void *output, u32 input_size);
+ void hyperv_cleanup(void);
+ bool hv_query_ext_cap(u64 cap_query);
+ void hv_setup_dma_ops(struct device *dev, bool coherent);
+-void *hv_map_memory(void *addr, unsigned long size);
+-void hv_unmap_memory(void *addr);
+ #else /* CONFIG_HYPERV */
+ static inline bool hv_is_hyperv_initialized(void) { return false; }
+ static inline bool hv_is_hibernation_supported(void) { return false; }
