@@ -1,0 +1,199 @@
+x86/mm: Randomize per-cpu entry area
+
+jira LE-1907
+cve CVE-2023-0597
+Rebuild_History Non-Buildable kernel-4.18.0-510.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 97e3d26b5e5f371b3ee223d94dd123e6c442ba80
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-510.el8/97e3d26b.failed
+
+Seth found that the CPU-entry-area; the piece of per-cpu data that is
+mapped into the userspace page-tables for kPTI is not subject to any
+randomization -- irrespective of kASLR settings.
+
+On x86_64 a whole P4D (512 GB) of virtual address space is reserved for
+this structure, which is plenty large enough to randomize things a
+little.
+
+As such, use a straight forward randomization scheme that avoids
+duplicates to spread the existing CPUs over the available space.
+
+  [ bp: Fix le build. ]
+
+	Reported-by: Seth Jenkins <sethjenkins@google.com>
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit 97e3d26b5e5f371b3ee223d94dd123e6c442ba80)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/pgtable_areas.h
+#	arch/x86/kernel/hw_breakpoint.c
+#	arch/x86/mm/cpu_entry_area.c
+diff --cc arch/x86/kernel/hw_breakpoint.c
+index d38d4648512d,bbb0f737aab1..000000000000
+--- a/arch/x86/kernel/hw_breakpoint.c
++++ b/arch/x86/kernel/hw_breakpoint.c
+@@@ -239,6 -247,79 +239,82 @@@ int arch_check_bp_in_kernelspace(struc
+  	return (va >= TASK_SIZE_MAX) || ((va + len - 1) >= TASK_SIZE_MAX);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Checks whether the range [addr, end], overlaps the area [base, base + size).
++  */
++ static inline bool within_area(unsigned long addr, unsigned long end,
++ 			       unsigned long base, unsigned long size)
++ {
++ 	return end >= base && addr < (base + size);
++ }
++ 
++ /*
++  * Checks whether the range from addr to end, inclusive, overlaps the fixed
++  * mapped CPU entry area range or other ranges used for CPU entry.
++  */
++ static inline bool within_cpu_entry(unsigned long addr, unsigned long end)
++ {
++ 	int cpu;
++ 
++ 	/* CPU entry erea is always used for CPU entry */
++ 	if (within_area(addr, end, CPU_ENTRY_AREA_BASE,
++ 			CPU_ENTRY_AREA_MAP_SIZE))
++ 		return true;
++ 
++ 	/*
++ 	 * When FSGSBASE is enabled, paranoid_entry() fetches the per-CPU
++ 	 * GSBASE value via __per_cpu_offset or pcpu_unit_offsets.
++ 	 */
++ #ifdef CONFIG_SMP
++ 	if (within_area(addr, end, (unsigned long)__per_cpu_offset,
++ 			sizeof(unsigned long) * nr_cpu_ids))
++ 		return true;
++ #else
++ 	if (within_area(addr, end, (unsigned long)&pcpu_unit_offsets,
++ 			sizeof(pcpu_unit_offsets)))
++ 		return true;
++ #endif
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		/* The original rw GDT is being used after load_direct_gdt() */
++ 		if (within_area(addr, end, (unsigned long)get_cpu_gdt_rw(cpu),
++ 				GDT_SIZE))
++ 			return true;
++ 
++ 		/*
++ 		 * cpu_tss_rw is not directly referenced by hardware, but
++ 		 * cpu_tss_rw is also used in CPU entry code,
++ 		 */
++ 		if (within_area(addr, end,
++ 				(unsigned long)&per_cpu(cpu_tss_rw, cpu),
++ 				sizeof(struct tss_struct)))
++ 			return true;
++ 
++ 		/*
++ 		 * cpu_tlbstate.user_pcid_flush_mask is used for CPU entry.
++ 		 * If a data breakpoint on it, it will cause an unwanted #DB.
++ 		 * Protect the full cpu_tlbstate structure to be sure.
++ 		 */
++ 		if (within_area(addr, end,
++ 				(unsigned long)&per_cpu(cpu_tlbstate, cpu),
++ 				sizeof(struct tlb_state)))
++ 			return true;
++ 
++ 		/*
++ 		 * When in guest (X86_FEATURE_HYPERVISOR), local_db_save()
++ 		 * will read per-cpu cpu_dr7 before clear dr7 register.
++ 		 */
++ 		if (within_area(addr, end, (unsigned long)&per_cpu(cpu_dr7, cpu),
++ 				sizeof(cpu_dr7)))
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 97e3d26b5e5f (x86/mm: Randomize per-cpu entry area)
+  static int arch_build_bp_info(struct perf_event *bp,
+  			      const struct perf_event_attr *attr,
+  			      struct arch_hw_breakpoint *hw)
+diff --cc arch/x86/mm/cpu_entry_area.c
+index 463c6ea6086b,dff9001e5e12..000000000000
+--- a/arch/x86/mm/cpu_entry_area.c
++++ b/arch/x86/mm/cpu_entry_area.c
+@@@ -16,8 -16,49 +16,52 @@@ static DEFINE_PER_CPU_PAGE_ALIGNED(stru
+  #ifdef CONFIG_X86_64
+  static DEFINE_PER_CPU_PAGE_ALIGNED(struct exception_stacks, exception_stacks);
+  DEFINE_PER_CPU(struct cea_exception_stacks*, cea_exception_stacks);
++ 
+++<<<<<<< HEAD
+++=======
++ static DEFINE_PER_CPU_READ_MOSTLY(unsigned long, _cea_offset);
++ 
++ static __always_inline unsigned int cea_offset(unsigned int cpu)
++ {
++ 	return per_cpu(_cea_offset, cpu);
++ }
++ 
++ static __init void init_cea_offsets(void)
++ {
++ 	unsigned int max_cea;
++ 	unsigned int i, j;
++ 
++ 	max_cea = (CPU_ENTRY_AREA_MAP_SIZE - PAGE_SIZE) / CPU_ENTRY_AREA_SIZE;
++ 
++ 	/* O(sodding terrible) */
++ 	for_each_possible_cpu(i) {
++ 		unsigned int cea;
++ 
++ again:
++ 		cea = prandom_u32_max(max_cea);
++ 
++ 		for_each_possible_cpu(j) {
++ 			if (cea_offset(j) == cea)
++ 				goto again;
++ 
++ 			if (i == j)
++ 				break;
++ 		}
++ 
++ 		per_cpu(_cea_offset, i) = cea;
++ 	}
++ }
++ #else /* !X86_64 */
++ DECLARE_PER_CPU_PAGE_ALIGNED(struct doublefault_stack, doublefault_stack);
++ 
++ static __always_inline unsigned int cea_offset(unsigned int cpu)
++ {
++ 	return cpu;
++ }
++ static inline void init_cea_offsets(void) { }
+  #endif
+  
+++>>>>>>> 97e3d26b5e5f (x86/mm: Randomize per-cpu entry area)
+  /* Is called from entry code, so must be noinstr */
+  noinstr struct cpu_entry_area *get_cpu_entry_area(int cpu)
+  {
+* Unmerged path arch/x86/include/asm/pgtable_areas.h
+diff --git a/arch/x86/include/asm/cpu_entry_area.h b/arch/x86/include/asm/cpu_entry_area.h
+index e01f365692a7..c76cc61e818e 100644
+--- a/arch/x86/include/asm/cpu_entry_area.h
++++ b/arch/x86/include/asm/cpu_entry_area.h
+@@ -113,10 +113,6 @@ struct cpu_entry_area {
+ };
+ 
+ #define CPU_ENTRY_AREA_SIZE		(sizeof(struct cpu_entry_area))
+-#define CPU_ENTRY_AREA_ARRAY_SIZE	(CPU_ENTRY_AREA_SIZE * NR_CPUS)
+-
+-/* Total size includes the readonly IDT mapping page as well: */
+-#define CPU_ENTRY_AREA_TOTAL_SIZE	(CPU_ENTRY_AREA_ARRAY_SIZE + PAGE_SIZE)
+ 
+ DECLARE_PER_CPU(struct cpu_entry_area *, cpu_entry_area);
+ DECLARE_PER_CPU(struct cea_exception_stacks *, cea_exception_stacks);
+* Unmerged path arch/x86/include/asm/pgtable_areas.h
+* Unmerged path arch/x86/kernel/hw_breakpoint.c
+* Unmerged path arch/x86/mm/cpu_entry_area.c
