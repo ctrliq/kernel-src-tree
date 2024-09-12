@@ -1,0 +1,185 @@
+proc/vmcore: convert oldmem_pfn_is_ram callback to more generic vmcore callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-511.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit cc5f2704c93456e6f1c671c5cf7b582a55df5484
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-511.el8/cc5f2704.failed
+
+Let's support multiple registered callbacks, making sure that
+registering vmcore callbacks cannot fail.  Make the callback return a
+bool instead of an int, handling how to deal with errors internally.
+Drop unused HAVE_OLDMEM_PFN_IS_RAM.
+
+We soon want to make use of this infrastructure from other drivers:
+virtio-mem, registering one callback for each virtio-mem device, to
+prevent reading unplugged virtio-mem memory.
+
+Handle it via a generic vmcore_cb structure, prepared for future
+extensions: for example, once we support virtio-mem on s390x where the
+vmcore is completely constructed in the second kernel, we want to detect
+and add plugged virtio-mem memory ranges to the vmcore in order for them
+to get dumped properly.
+
+Handle corner cases that are unexpected and shouldn't happen in sane
+setups: registering a callback after the vmcore has already been opened
+(warn only) and unregistering a callback after the vmcore has already been
+opened (warn and essentially read only zeroes from that point on).
+
+Link: https://lkml.kernel.org/r/20211005121430.30136-6-david@redhat.com
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Cc: Baoquan He <bhe@redhat.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jason Wang <jasowang@redhat.com>
+	Cc: Juergen Gross <jgross@suse.com>
+	Cc: "Michael S. Tsirkin" <mst@redhat.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Mike Rapoport <rppt@kernel.org>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: "Rafael J. Wysocki" <rafael.j.wysocki@intel.com>
+	Cc: Stefano Stabellini <sstabellini@kernel.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vivek Goyal <vgoyal@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit cc5f2704c93456e6f1c671c5cf7b582a55df5484)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/vmcore.c
+diff --cc fs/proc/vmcore.c
+index e57145de158d,7a04b2eca287..000000000000
+--- a/fs/proc/vmcore.c
++++ b/fs/proc/vmcore.c
+@@@ -665,10 -705,11 +703,18 @@@ static int mmap_vmcore(struct file *fil
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +static const struct file_operations proc_vmcore_operations = {
+ +	.read		= read_vmcore,
+ +	.llseek		= default_llseek,
+ +	.mmap		= mmap_vmcore,
+++=======
++ static const struct proc_ops vmcore_proc_ops = {
++ 	.proc_open	= open_vmcore,
++ 	.proc_read	= read_vmcore,
++ 	.proc_lseek	= default_llseek,
++ 	.proc_mmap	= mmap_vmcore,
+++>>>>>>> cc5f2704c934 (proc/vmcore: convert oldmem_pfn_is_ram callback to more generic vmcore callbacks)
+  };
+  
+  static struct vmcore* __init get_new_element(void)
+diff --git a/arch/x86/kernel/aperture_64.c b/arch/x86/kernel/aperture_64.c
+index 294ed4392a0e..9317a611e7ee 100644
+--- a/arch/x86/kernel/aperture_64.c
++++ b/arch/x86/kernel/aperture_64.c
+@@ -73,12 +73,23 @@ static int gart_mem_pfn_is_ram(unsigned long pfn)
+ 		      (pfn >= aperture_pfn_start + aperture_page_count));
+ }
+ 
++#ifdef CONFIG_PROC_VMCORE
++static bool gart_oldmem_pfn_is_ram(struct vmcore_cb *cb, unsigned long pfn)
++{
++	return !!gart_mem_pfn_is_ram(pfn);
++}
++
++static struct vmcore_cb gart_vmcore_cb = {
++	.pfn_is_ram = gart_oldmem_pfn_is_ram,
++};
++#endif
++
+ static void __init exclude_from_core(u64 aper_base, u32 aper_order)
+ {
+ 	aperture_pfn_start = aper_base >> PAGE_SHIFT;
+ 	aperture_page_count = (32 * 1024 * 1024) << aper_order >> PAGE_SHIFT;
+ #ifdef CONFIG_PROC_VMCORE
+-	WARN_ON(register_oldmem_pfn_is_ram(&gart_mem_pfn_is_ram));
++	register_vmcore_cb(&gart_vmcore_cb);
+ #endif
+ #ifdef CONFIG_PROC_KCORE
+ 	WARN_ON(register_mem_pfn_is_ram(&gart_mem_pfn_is_ram));
+diff --git a/arch/x86/xen/mmu_hvm.c b/arch/x86/xen/mmu_hvm.c
+index 080230b59bcb..75bd94c4f051 100644
+--- a/arch/x86/xen/mmu_hvm.c
++++ b/arch/x86/xen/mmu_hvm.c
+@@ -12,10 +12,10 @@
+  * The kdump kernel has to check whether a pfn of the crashed kernel
+  * was a ballooned page. vmcore is using this function to decide
+  * whether to access a pfn of the crashed kernel.
+- * Returns 0 if the pfn is not backed by a RAM page, the caller may
++ * Returns "false" if the pfn is not backed by a RAM page, the caller may
+  * handle the pfn special in this case.
+  */
+-static int xen_oldmem_pfn_is_ram(unsigned long pfn)
++static bool xen_vmcore_pfn_is_ram(struct vmcore_cb *cb, unsigned long pfn)
+ {
+ 	struct xen_hvm_get_mem_type a = {
+ 		.domid = DOMID_SELF,
+@@ -24,10 +24,13 @@ static int xen_oldmem_pfn_is_ram(unsigned long pfn)
+ 
+ 	if (HYPERVISOR_hvm_op(HVMOP_get_mem_type, &a)) {
+ 		pr_warn_once("Unexpected HVMOP_get_mem_type failure\n");
+-		return -ENXIO;
++		return true;
+ 	}
+ 	return a.mem_type != HVMMEM_mmio_dm;
+ }
++static struct vmcore_cb xen_vmcore_cb = {
++	.pfn_is_ram = xen_vmcore_pfn_is_ram,
++};
+ #endif
+ 
+ static void xen_hvm_exit_mmap(struct mm_struct *mm)
+@@ -61,6 +64,6 @@ void __init xen_hvm_init_mmu_ops(void)
+ 	if (is_pagetable_dying_supported())
+ 		pv_mmu_ops.exit_mmap = xen_hvm_exit_mmap;
+ #ifdef CONFIG_PROC_VMCORE
+-	WARN_ON(register_oldmem_pfn_is_ram(&xen_oldmem_pfn_is_ram));
++	register_vmcore_cb(&xen_vmcore_cb);
+ #endif
+ }
+* Unmerged path fs/proc/vmcore.c
+diff --git a/include/linux/crash_dump.h b/include/linux/crash_dump.h
+index 4664fc1871de..990a61a7e977 100644
+--- a/include/linux/crash_dump.h
++++ b/include/linux/crash_dump.h
+@@ -89,9 +89,29 @@ static inline void vmcore_unusable(void)
+ 		elfcorehdr_addr = ELFCORE_ADDR_ERR;
+ }
+ 
+-#define HAVE_OLDMEM_PFN_IS_RAM 1
+-extern int register_oldmem_pfn_is_ram(int (*fn)(unsigned long pfn));
+-extern void unregister_oldmem_pfn_is_ram(void);
++/**
++ * struct vmcore_cb - driver callbacks for /proc/vmcore handling
++ * @pfn_is_ram: check whether a PFN really is RAM and should be accessed when
++ *              reading the vmcore. Will return "true" if it is RAM or if the
++ *              callback cannot tell. If any callback returns "false", it's not
++ *              RAM and the page must not be accessed; zeroes should be
++ *              indicated in the vmcore instead. For example, a ballooned page
++ *              contains no data and reading from such a page will cause high
++ *              load in the hypervisor.
++ * @next: List head to manage registered callbacks internally; initialized by
++ *        register_vmcore_cb().
++ *
++ * vmcore callbacks allow drivers managing physical memory ranges to
++ * coordinate with vmcore handling code, for example, to prevent accessing
++ * physical memory ranges that should not be accessed when reading the vmcore,
++ * although included in the vmcore header as memory ranges to dump.
++ */
++struct vmcore_cb {
++	bool (*pfn_is_ram)(struct vmcore_cb *cb, unsigned long pfn);
++	struct list_head next;
++};
++extern void register_vmcore_cb(struct vmcore_cb *cb);
++extern void unregister_vmcore_cb(struct vmcore_cb *cb);
+ 
+ #else /* !CONFIG_CRASH_DUMP */
+ static inline bool is_kdump_kernel(void) { return 0; }
