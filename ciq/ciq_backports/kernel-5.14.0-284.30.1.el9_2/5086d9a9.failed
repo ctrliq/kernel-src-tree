@@ -1,0 +1,162 @@
+rxrpc: Move the cwnd degradation after transmitting packets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 5086d9a9dfec4866806da303115489b0606decb7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/5086d9a9.failed
+
+When we've gone for >1RTT without transmitting a packet, we should reduce
+the ssthresh and cut the cwnd by half (as suggested in RFC2861 sec 3.1).
+
+However, we may receive ACK packets in a batch and the first of these may
+cut the cwnd, preventing further transmission, and each subsequent one cuts
+the cwnd yet further, reducing it to the floor and killing performance.
+
+Fix this by moving the cwnd reset to after doing the transmission and
+resetting the base time such that we don't cut the cwnd by half again for
+at least another RTT.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit 5086d9a9dfec4866806da303115489b0606decb7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/call_event.c
+#	net/rxrpc/input.c
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,785cd0dd1eea..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -942,7 -954,20 +943,24 @@@ void rxrpc_unpublish_service_conn(struc
+  /*
+   * input.c
+   */
+++<<<<<<< HEAD
+ +int rxrpc_input_packet(struct sock *, struct sk_buff *);
+++=======
++ void rxrpc_congestion_degrade(struct rxrpc_call *);
++ void rxrpc_input_call_packet(struct rxrpc_call *, struct sk_buff *);
++ void rxrpc_implicit_end_call(struct rxrpc_call *, struct sk_buff *);
++ 
++ /*
++  * io_thread.c
++  */
++ int rxrpc_encap_rcv(struct sock *, struct sk_buff *);
++ void rxrpc_error_report(struct sock *);
++ int rxrpc_io_thread(void *data);
++ static inline void rxrpc_wake_up_io_thread(struct rxrpc_local *local)
++ {
++ 	wake_up_process(local->io_thread);
++ }
+++>>>>>>> 5086d9a9dfec (rxrpc: Move the cwnd degradation after transmitting packets)
+  
+  /*
+   * insecure.c
+diff --cc net/rxrpc/call_event.c
+index a95f4604cb29,fd122e3726bd..000000000000
+--- a/net/rxrpc/call_event.c
++++ b/net/rxrpc/call_event.c
+@@@ -384,11 -419,26 +384,29 @@@ recheck_state
+  	if (time_after_eq(now, t)) {
+  		trace_rxrpc_timer(call, rxrpc_timer_exp_resend, now);
+  		cmpxchg(&call->resend_at, t, now + MAX_JIFFY_OFFSET);
+ -		resend = true;
+ +		set_bit(RXRPC_CALL_EV_RESEND, &call->events);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (skb)
++ 		rxrpc_input_call_packet(call, skb);
++ 
++ 	rxrpc_transmit_some_data(call);
++ 
++ 	if (skb) {
++ 		struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
++ 
++ 		if (sp->hdr.type == RXRPC_PACKET_TYPE_ACK)
++ 			rxrpc_congestion_degrade(call);
++ 	}
++ 
++ 	if (test_and_clear_bit(RXRPC_CALL_EV_INITIAL_PING, &call->events))
++ 		rxrpc_send_initial_ping(call);
++ 
+++>>>>>>> 5086d9a9dfec (rxrpc: Move the cwnd degradation after transmitting packets)
+  	/* Process events */
+ -	if (expired) {
+ +	if (test_and_clear_bit(RXRPC_CALL_EV_EXPIRED, &call->events)) {
+  		if (test_bit(RXRPC_CALL_RX_HEARD, &call->flags) &&
+  		    (int)call->conn->hi_serial - (int)call->rx_serial > 0) {
+  			trace_rxrpc_call_reset(call);
+diff --cc net/rxrpc/input.c
+index b5326e160685,d0e20e946e48..000000000000
+--- a/net/rxrpc/input.c
++++ b/net/rxrpc/input.c
+@@@ -58,25 -56,6 +58,28 @@@ static void rxrpc_congestion_management
+  	summary->cumulative_acks = cumulative_acks;
+  	summary->dup_acks = call->cong_dup_acks;
+  
+++<<<<<<< HEAD
+ +	/* If we haven't transmitted anything for >1RTT, we should reset the
+ +	 * congestion management state.
+ +	 */
+ +	if ((call->cong_mode == RXRPC_CALL_SLOW_START ||
+ +	     call->cong_mode == RXRPC_CALL_CONGEST_AVOIDANCE) &&
+ +	    ktime_before(ktime_add_us(call->tx_last_sent,
+ +				      call->peer->srtt_us >> 3),
+ +			 ktime_get_real())
+ +	    ) {
+ +		change = rxrpc_cong_idle_reset;
+ +		summary->mode = RXRPC_CALL_SLOW_START;
+ +		if (RXRPC_TX_SMSS > 2190)
+ +			summary->cwnd = 2;
+ +		else if (RXRPC_TX_SMSS > 1095)
+ +			summary->cwnd = 3;
+ +		else
+ +			summary->cwnd = 4;
+ +	}
+ +
+++=======
+++>>>>>>> 5086d9a9dfec (rxrpc: Move the cwnd degradation after transmitting packets)
+  	switch (call->cong_mode) {
+  	case RXRPC_CALL_SLOW_START:
+  		if (summary->saw_nacks)
+* Unmerged path net/rxrpc/ar-internal.h
+* Unmerged path net/rxrpc/call_event.c
+* Unmerged path net/rxrpc/input.c
+diff --git a/net/rxrpc/proc.c b/net/rxrpc/proc.c
+index fae22a8b38d6..ad801df6f1d7 100644
+--- a/net/rxrpc/proc.c
++++ b/net/rxrpc/proc.c
+@@ -63,7 +63,7 @@ static int rxrpc_call_seq_show(struct seq_file *seq, void *v)
+ 			 "Proto Local                                          "
+ 			 " Remote                                         "
+ 			 " SvID ConnID   CallID   End Use State    Abort   "
+-			 " DebugId  TxSeq    TW RxSeq    RW RxSerial RxTimo\n");
++			 " DebugId  TxSeq    TW RxSeq    RW RxSerial CW RxTimo\n");
+ 		return 0;
+ 	}
+ 
+@@ -95,7 +95,7 @@ static int rxrpc_call_seq_show(struct seq_file *seq, void *v)
+ 	wtmp   = atomic64_read_acquire(&call->ackr_window);
+ 	seq_printf(seq,
+ 		   "UDP   %-47.47s %-47.47s %4x %08x %08x %s %3u"
+-		   " %-8.8s %08x %08x %08x %02x %08x %02x %08x %06lx\n",
++		   " %-8.8s %08x %08x %08x %02x %08x %02x %08x %02x %06lx\n",
+ 		   lbuff,
+ 		   rbuff,
+ 		   call->service_id,
+@@ -109,6 +109,7 @@ static int rxrpc_call_seq_show(struct seq_file *seq, void *v)
+ 		   acks_hard_ack, READ_ONCE(call->tx_top) - acks_hard_ack,
+ 		   lower_32_bits(wtmp), upper_32_bits(wtmp) - lower_32_bits(wtmp),
+ 		   call->rx_serial,
++		   call->cong_cwnd,
+ 		   timeout);
+ 
+ 	return 0;
