@@ -4422,6 +4422,8 @@ static int snd_scarlett_gen2_controls_create(
 
 	/* Add firmware version control */
 	err = scarlett2_add_firmware_version_ctl(mixer);
+	if (err < 0)
+		return err;
 
 	/* Read volume levels and controls from the interface */
 	err = scarlett2_read_configs(mixer);
