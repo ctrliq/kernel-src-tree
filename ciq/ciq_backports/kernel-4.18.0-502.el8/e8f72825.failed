@@ -1,0 +1,437 @@
+x86/resctrl: Group staged configuration into a separate struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author James Morse <james.morse@arm.com>
+commit e8f7282552b902af3bd1f07a87d657b7f5f12ab8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/e8f72825.failed
+
+When configuration changes are made, the new value is written to struct
+rdt_domain's new_ctrl field and the have_new_ctrl flag is set. Later
+new_ctrl is copied to hardware by a call to update_domains().
+
+Once the CDP resources are merged, there will be one new_ctrl field in
+use by two struct resctrl_schema requiring a per-schema IPI to copy the
+value to hardware.
+
+Move new_ctrl and have_new_ctrl into a new struct resctrl_staged_config.
+Before the CDP resources can be merged, struct rdt_domain will need an
+array of these, one per type of configuration. Using the type as an
+index to the array will ensure that a schema configuration string can't
+specify the same domain twice.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Jamie Iles <jamie@nuviainc.com>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Tested-by: Babu Moger <babu.moger@amd.com>
+Link: https://lkml.kernel.org/r/20210728170637.25610-14-james.morse@arm.com
+(cherry picked from commit e8f7282552b902af3bd1f07a87d657b7f5f12ab8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+#	include/linux/resctrl.h
+diff --cc arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+index 9a768d89de37,9ddfa7607234..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/ctrlmondata.c
++++ b/arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+@@@ -65,12 -57,14 +65,13 @@@ static bool bw_validate(char *buf, unsi
+  	return true;
+  }
+  
+ -int parse_bw(struct rdt_parse_data *data, struct resctrl_schema *s,
+ +int parse_bw(struct rdt_parse_data *data, struct rdt_resource *r,
+  	     struct rdt_domain *d)
+  {
+ -	struct rdt_resource *r = s->res;
+  	unsigned long bw_val;
++ 	struct resctrl_staged_config *cfg = &d->staged_config;
+  
+- 	if (d->have_new_ctrl) {
++ 	if (cfg->have_new_ctrl) {
+  		rdt_last_cmd_printf("Duplicate domain %d\n", d->id);
+  		return -EINVAL;
+  	}
+@@@ -133,13 -127,15 +134,14 @@@ static bool cbm_validate(char *buf, u3
+   * Read one cache bit mask (hex). Check that it is valid for the current
+   * resource type.
+   */
+ -int parse_cbm(struct rdt_parse_data *data, struct resctrl_schema *s,
+ +int parse_cbm(struct rdt_parse_data *data, struct rdt_resource *r,
+  	      struct rdt_domain *d)
+  {
++ 	struct resctrl_staged_config *cfg = &d->staged_config;
+  	struct rdtgroup *rdtgrp = data->rdtgrp;
+ -	struct rdt_resource *r = s->res;
+  	u32 cbm_val;
+  
+- 	if (d->have_new_ctrl) {
++ 	if (cfg->have_new_ctrl) {
+  		rdt_last_cmd_printf("Duplicate domain %d\n", d->id);
+  		return -EINVAL;
+  	}
+@@@ -193,9 -189,11 +195,14 @@@
+   * separated by ";". The "id" is in decimal, and must match one of
+   * the "id"s for this resource.
+   */
+ -static int parse_line(char *line, struct resctrl_schema *s,
+ +static int parse_line(char *line, struct rdt_resource *r,
+  		      struct rdtgroup *rdtgrp)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct resctrl_staged_config *cfg;
++ 	struct rdt_resource *r = s->res;
+++>>>>>>> e8f7282552b9 (x86/resctrl: Group staged configuration into a separate struct)
+  	struct rdt_parse_data data;
+  	char *dom = NULL, *id;
+  	struct rdt_domain *d;
+@@@ -221,9 -219,10 +228,10 @@@ next
+  		if (d->id == dom_id) {
+  			data.buf = dom;
+  			data.rdtgrp = rdtgrp;
+ -			if (r->parse_ctrlval(&data, s, d))
+ +			if (r->parse_ctrlval(&data, r, d))
+  				return -EINVAL;
+  			if (rdtgrp->mode ==  RDT_MODE_PSEUDO_LOCKSETUP) {
++ 				cfg = &d->staged_config;
+  				/*
+  				 * In pseudo-locking setup mode and just
+  				 * parsed a valid CBM that should be
+@@@ -244,8 -243,23 +252,26 @@@
+  	return -EINVAL;
+  }
+  
++ static void apply_config(struct rdt_hw_domain *hw_dom,
++ 			 struct resctrl_staged_config *cfg, int closid,
++ 			 cpumask_var_t cpu_mask, bool mba_sc)
++ {
++ 	struct rdt_domain *dom = &hw_dom->d_resctrl;
++ 	u32 *dc = !mba_sc ? hw_dom->ctrl_val : hw_dom->mbps_val;
++ 
++ 	if (cfg->new_ctrl != dc[closid]) {
++ 		cpumask_set_cpu(cpumask_any(&dom->cpu_mask), cpu_mask);
++ 		dc[closid] = cfg->new_ctrl;
++ 	}
++ }
++ 
+  int update_domains(struct rdt_resource *r, int closid)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct resctrl_staged_config *cfg;
++ 	struct rdt_hw_domain *hw_dom;
+++>>>>>>> e8f7282552b9 (x86/resctrl: Group staged configuration into a separate struct)
+  	struct msr_param msr_param;
+  	cpumask_var_t cpu_mask;
+  	struct rdt_domain *d;
+@@@ -262,11 -275,10 +287,18 @@@
+  
+  	mba_sc = is_mba_sc(r);
+  	list_for_each_entry(d, &r->domains, list) {
+++<<<<<<< HEAD
+ +		dc = !mba_sc ? d->ctrl_val : d->mbps_val;
+ +		if (d->have_new_ctrl && d->new_ctrl != dc[closid]) {
+ +			cpumask_set_cpu(cpumask_any(&d->cpu_mask), cpu_mask);
+ +			dc[closid] = d->new_ctrl;
+ +		}
+++=======
++ 		hw_dom = resctrl_to_arch_dom(d);
++ 		cfg = &hw_dom->d_resctrl.staged_config;
++ 		if (cfg->have_new_ctrl)
++ 			apply_config(hw_dom, cfg, closid, cpu_mask, mba_sc);
+++>>>>>>> e8f7282552b9 (x86/resctrl: Group staged configuration into a separate struct)
+  	}
+  
+  	/*
+@@@ -335,9 -348,9 +367,15 @@@ ssize_t rdtgroup_schemata_write(struct 
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	for_each_alloc_enabled_rdt_resource(r) {
+ +		list_for_each_entry(dom, &r->domains, list)
+ +			dom->have_new_ctrl = false;
+++=======
++ 	list_for_each_entry(s, &resctrl_schema_all, list) {
++ 		list_for_each_entry(dom, &s->res->domains, list)
++ 			memset(&dom->staged_config, 0, sizeof(dom->staged_config));
+++>>>>>>> e8f7282552b9 (x86/resctrl: Group staged configuration into a separate struct)
+  	}
+  
+  	while ((tok = strsep(&buf, "\n")) != NULL) {
+diff --cc include/linux/resctrl.h
+index 9b05af9b3e28,ff7f7d7e1348..000000000000
+--- a/include/linux/resctrl.h
++++ b/include/linux/resctrl.h
+@@@ -13,4 -15,187 +13,190 @@@ int proc_resctrl_show(struct seq_file *
+  
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * enum resctrl_conf_type - The type of configuration.
++  * @CDP_NONE:	No prioritisation, both code and data are controlled or monitored.
++  * @CDP_CODE:	Configuration applies to instruction fetches.
++  * @CDP_DATA:	Configuration applies to reads and writes.
++  */
++ enum resctrl_conf_type {
++ 	CDP_NONE,
++ 	CDP_CODE,
++ 	CDP_DATA,
++ };
++ 
++ /**
++  * struct resctrl_staged_config - parsed configuration to be applied
++  * @new_ctrl:		new ctrl value to be loaded
++  * @have_new_ctrl:	whether the user provided new_ctrl is valid
++  */
++ struct resctrl_staged_config {
++ 	u32			new_ctrl;
++ 	bool			have_new_ctrl;
++ };
++ 
++ /**
++  * struct rdt_domain - group of CPUs sharing a resctrl resource
++  * @list:		all instances of this resource
++  * @id:			unique id for this instance
++  * @cpu_mask:		which CPUs share this resource
++  * @rmid_busy_llc:	bitmap of which limbo RMIDs are above threshold
++  * @mbm_total:		saved state for MBM total bandwidth
++  * @mbm_local:		saved state for MBM local bandwidth
++  * @mbm_over:		worker to periodically read MBM h/w counters
++  * @cqm_limbo:		worker to periodically read CQM h/w counters
++  * @mbm_work_cpu:	worker CPU for MBM h/w counters
++  * @cqm_work_cpu:	worker CPU for CQM h/w counters
++  * @plr:		pseudo-locked region (if any) associated with domain
++  * @staged_config:	parsed configuration to be applied
++  */
++ struct rdt_domain {
++ 	struct list_head		list;
++ 	int				id;
++ 	struct cpumask			cpu_mask;
++ 	unsigned long			*rmid_busy_llc;
++ 	struct mbm_state		*mbm_total;
++ 	struct mbm_state		*mbm_local;
++ 	struct delayed_work		mbm_over;
++ 	struct delayed_work		cqm_limbo;
++ 	int				mbm_work_cpu;
++ 	int				cqm_work_cpu;
++ 	struct pseudo_lock_region	*plr;
++ 	struct resctrl_staged_config	staged_config;
++ };
++ 
++ /**
++  * struct resctrl_cache - Cache allocation related data
++  * @cbm_len:		Length of the cache bit mask
++  * @min_cbm_bits:	Minimum number of consecutive bits to be set
++  * @cbm_idx_mult:	Multiplier of CBM index
++  * @cbm_idx_offset:	Offset of CBM index. CBM index is computed by:
++  *			closid * cbm_idx_multi + cbm_idx_offset
++  *			in a cache bit mask
++  * @shareable_bits:	Bitmask of shareable resource with other
++  *			executing entities
++  * @arch_has_sparse_bitmaps:	True if a bitmap like f00f is valid.
++  * @arch_has_empty_bitmaps:	True if the '0' bitmap is valid.
++  * @arch_has_per_cpu_cfg:	True if QOS_CFG register for this cache
++  *				level has CPU scope.
++  */
++ struct resctrl_cache {
++ 	unsigned int	cbm_len;
++ 	unsigned int	min_cbm_bits;
++ 	unsigned int	cbm_idx_mult;	// TODO remove this
++ 	unsigned int	cbm_idx_offset; // TODO remove this
++ 	unsigned int	shareable_bits;
++ 	bool		arch_has_sparse_bitmaps;
++ 	bool		arch_has_empty_bitmaps;
++ 	bool		arch_has_per_cpu_cfg;
++ };
++ 
++ /**
++  * enum membw_throttle_mode - System's memory bandwidth throttling mode
++  * @THREAD_THROTTLE_UNDEFINED:	Not relevant to the system
++  * @THREAD_THROTTLE_MAX:	Memory bandwidth is throttled at the core
++  *				always using smallest bandwidth percentage
++  *				assigned to threads, aka "max throttling"
++  * @THREAD_THROTTLE_PER_THREAD:	Memory bandwidth is throttled at the thread
++  */
++ enum membw_throttle_mode {
++ 	THREAD_THROTTLE_UNDEFINED = 0,
++ 	THREAD_THROTTLE_MAX,
++ 	THREAD_THROTTLE_PER_THREAD,
++ };
++ 
++ /**
++  * struct resctrl_membw - Memory bandwidth allocation related data
++  * @min_bw:		Minimum memory bandwidth percentage user can request
++  * @bw_gran:		Granularity at which the memory bandwidth is allocated
++  * @delay_linear:	True if memory B/W delay is in linear scale
++  * @arch_needs_linear:	True if we can't configure non-linear resources
++  * @throttle_mode:	Bandwidth throttling mode when threads request
++  *			different memory bandwidths
++  * @mba_sc:		True if MBA software controller(mba_sc) is enabled
++  * @mb_map:		Mapping of memory B/W percentage to memory B/W delay
++  */
++ struct resctrl_membw {
++ 	u32				min_bw;
++ 	u32				bw_gran;
++ 	u32				delay_linear;
++ 	bool				arch_needs_linear;
++ 	enum membw_throttle_mode	throttle_mode;
++ 	bool				mba_sc;
++ 	u32				*mb_map;
++ };
++ 
++ struct rdt_parse_data;
++ struct resctrl_schema;
++ 
++ /**
++  * struct rdt_resource - attributes of a resctrl resource
++  * @rid:		The index of the resource
++  * @alloc_enabled:	Is allocation enabled on this machine
++  * @mon_enabled:	Is monitoring enabled for this feature
++  * @alloc_capable:	Is allocation available on this machine
++  * @mon_capable:	Is monitor feature available on this machine
++  * @num_rmid:		Number of RMIDs available
++  * @cache_level:	Which cache level defines scope of this resource
++  * @cache:		Cache allocation related data
++  * @membw:		If the component has bandwidth controls, their properties.
++  * @domains:		All domains for this resource
++  * @name:		Name to use in "schemata" file.
++  * @data_width:		Character width of data when displaying
++  * @default_ctrl:	Specifies default cache cbm or memory B/W percent.
++  * @format_str:		Per resource format string to show domain value
++  * @parse_ctrlval:	Per resource function pointer to parse control values
++  * @evt_list:		List of monitoring events
++  * @fflags:		flags to choose base and info files
++  * @cdp_capable:	Is the CDP feature available on this resource
++  */
++ struct rdt_resource {
++ 	int			rid;
++ 	bool			alloc_enabled;
++ 	bool			mon_enabled;
++ 	bool			alloc_capable;
++ 	bool			mon_capable;
++ 	int			num_rmid;
++ 	int			cache_level;
++ 	struct resctrl_cache	cache;
++ 	struct resctrl_membw	membw;
++ 	struct list_head	domains;
++ 	char			*name;
++ 	int			data_width;
++ 	u32			default_ctrl;
++ 	const char		*format_str;
++ 	int			(*parse_ctrlval)(struct rdt_parse_data *data,
++ 						 struct resctrl_schema *s,
++ 						 struct rdt_domain *d);
++ 	struct list_head	evt_list;
++ 	unsigned long		fflags;
++ 	bool			cdp_capable;
++ };
++ 
++ /**
++  * struct resctrl_schema - configuration abilities of a resource presented to
++  *			   user-space
++  * @list:	Member of resctrl_schema_all.
++  * @name:	The name to use in the "schemata" file.
++  * @conf_type:	Whether this schema is specific to code/data.
++  * @res:	The resource structure exported by the architecture to describe
++  *		the hardware that is configured by this schema.
++  * @num_closid:	The number of closid that can be used with this schema. When
++  *		features like CDP are enabled, this will be lower than the
++  *		hardware supports for the resource.
++  */
++ struct resctrl_schema {
++ 	struct list_head		list;
++ 	char				name[8];
++ 	enum resctrl_conf_type		conf_type;
++ 	struct rdt_resource		*res;
++ 	u32				num_closid;
++ };
++ 
++ /* The number of closid supported by this resource regardless of CDP */
++ u32 resctrl_arch_get_num_closid(struct rdt_resource *r);
++ 
+++>>>>>>> e8f7282552b9 (x86/resctrl: Group staged configuration into a separate struct)
+  #endif /* _RESCTRL_H */
+* Unmerged path arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+diff --git a/arch/x86/kernel/cpu/resctrl/rdtgroup.c b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index a8731279ffbf..692091ea7766 100644
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@ -2673,6 +2673,7 @@ static int __init_one_rdt_domain(struct rdt_domain *d, struct rdt_resource *r,
+ 				 u32 closid)
+ {
+ 	struct rdt_resource *r_cdp = NULL;
++	struct resctrl_staged_config *cfg;
+ 	struct rdt_domain *d_cdp = NULL;
+ 	u32 used_b = 0, unused_b = 0;
+ 	unsigned long tmp_cbm;
+@@ -2681,8 +2682,9 @@ static int __init_one_rdt_domain(struct rdt_domain *d, struct rdt_resource *r,
+ 	int i;
+ 
+ 	rdt_cdp_peer_get(r, d, &r_cdp, &d_cdp);
+-	d->have_new_ctrl = false;
+-	d->new_ctrl = r->cache.shareable_bits;
++	cfg = &d->staged_config;
++	cfg->have_new_ctrl = false;
++	cfg->new_ctrl = r->cache.shareable_bits;
+ 	used_b = r->cache.shareable_bits;
+ 	ctrl = d->ctrl_val;
+ 	for (i = 0; i < closids_supported(); i++, ctrl++) {
+@@ -2706,29 +2708,29 @@ static int __init_one_rdt_domain(struct rdt_domain *d, struct rdt_resource *r,
+ 				peer_ctl = 0;
+ 			used_b |= *ctrl | peer_ctl;
+ 			if (mode == RDT_MODE_SHAREABLE)
+-				d->new_ctrl |= *ctrl | peer_ctl;
++				cfg->new_ctrl |= *ctrl | peer_ctl;
+ 		}
+ 	}
+ 	if (d->plr && d->plr->cbm > 0)
+ 		used_b |= d->plr->cbm;
+ 	unused_b = used_b ^ (BIT_MASK(r->cache.cbm_len) - 1);
+ 	unused_b &= BIT_MASK(r->cache.cbm_len) - 1;
+-	d->new_ctrl |= unused_b;
++	cfg->new_ctrl |= unused_b;
+ 	/*
+ 	 * Force the initial CBM to be valid, user can
+ 	 * modify the CBM based on system availability.
+ 	 */
+-	d->new_ctrl = cbm_ensure_valid(d->new_ctrl, r);
++	cfg->new_ctrl = cbm_ensure_valid(cfg->new_ctrl, r);
+ 	/*
+ 	 * Assign the u32 CBM to an unsigned long to ensure that
+ 	 * bitmap_weight() does not access out-of-bound memory.
+ 	 */
+-	tmp_cbm = d->new_ctrl;
++	tmp_cbm = cfg->new_ctrl;
+ 	if (bitmap_weight(&tmp_cbm, r->cache.cbm_len) < r->cache.min_cbm_bits) {
+ 		rdt_last_cmd_printf("No space on %s:%d\n", r->name, d->id);
+ 		return -ENOSPC;
+ 	}
+-	d->have_new_ctrl = true;
++	cfg->have_new_ctrl = true;
+ 
+ 	return 0;
+ }
+@@ -2760,11 +2762,13 @@ static int rdtgroup_init_cat(struct rdt_resource *r, u32 closid)
+ /* Initialize MBA resource with default values. */
+ static void rdtgroup_init_mba(struct rdt_resource *r)
+ {
++	struct resctrl_staged_config *cfg;
+ 	struct rdt_domain *d;
+ 
+ 	list_for_each_entry(d, &r->domains, list) {
+-		d->new_ctrl = is_mba_sc(r) ? MBA_MAX_MBPS : r->default_ctrl;
+-		d->have_new_ctrl = true;
++		cfg = &d->staged_config;
++		cfg->new_ctrl = is_mba_sc(r) ? MBA_MAX_MBPS : r->default_ctrl;
++		cfg->have_new_ctrl = true;
+ 	}
+ }
+ 
+* Unmerged path include/linux/resctrl.h
