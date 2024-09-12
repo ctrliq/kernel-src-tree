@@ -1,0 +1,210 @@
+x86/microcode/intel: Reuse find_matching_signature()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Jithu Joseph <jithu.joseph@intel.com>
+commit 716f380275866350ee44447b3c7c999f39c3178d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/716f3802.failed
+
+IFS uses test images provided by Intel that can be regarded as firmware.
+An IFS test image carries microcode header with an extended signature
+table.
+
+Reuse find_matching_signature() for verifying if the test image header
+or the extended signature table indicate whether that image is fit to
+run on a system.
+
+No functional changes.
+
+	Signed-off-by: Jithu Joseph <jithu.joseph@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Tony Luck <tony.luck@intel.com>
+	Reviewed-by: Ashok Raj <ashok.raj@intel.com>
+	Reviewed-by: Sohil Mehta <sohil.mehta@intel.com>
+Link: https://lore.kernel.org/r/20221117035935.4136738-6-jithu.joseph@intel.com
+(cherry picked from commit 716f380275866350ee44447b3c7c999f39c3178d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpu.h
+#	arch/x86/kernel/cpu/intel.c
+#	arch/x86/kernel/cpu/microcode/intel.c
+diff --cc arch/x86/include/asm/cpu.h
+index 21924730afae,e853440b5c65..000000000000
+--- a/arch/x86/include/asm/cpu.h
++++ b/arch/x86/include/asm/cpu.h
+@@@ -73,4 -68,33 +73,36 @@@ static inline u8 get_this_hybrid_cpu_ty
+  	return 0;
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_IA32_FEAT_CTL
++ void init_ia32_feat_ctl(struct cpuinfo_x86 *c);
++ #else
++ static inline void init_ia32_feat_ctl(struct cpuinfo_x86 *c) {}
++ #endif
++ 
++ extern __noendbr void cet_disable(void);
++ 
++ struct ucode_cpu_info;
++ 
++ int intel_cpu_collect_info(struct ucode_cpu_info *uci);
++ 
++ static inline bool intel_cpu_signatures_match(unsigned int s1, unsigned int p1,
++ 					      unsigned int s2, unsigned int p2)
++ {
++ 	if (s1 != s2)
++ 		return false;
++ 
++ 	/* Processor flags are either both 0 ... */
++ 	if (!p1 && !p2)
++ 		return true;
++ 
++ 	/* ... or they intersect. */
++ 	return p1 & p2;
++ }
++ 
++ extern u64 x86_read_arch_cap_msr(void);
++ int intel_find_matching_signature(void *mc, unsigned int csig, int cpf);
++ 
+++>>>>>>> 716f38027586 (x86/microcode/intel: Reuse find_matching_signature())
+  #endif /* _ASM_X86_CPU_H */
+diff --cc arch/x86/kernel/cpu/intel.c
+index 9f6c1ec168fa,c7331eced21f..000000000000
+--- a/arch/x86/kernel/cpu/intel.c
++++ b/arch/x86/kernel/cpu/intel.c
+@@@ -217,6 -184,66 +217,69 @@@ static bool bad_spectre_microcode(struc
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int intel_cpu_collect_info(struct ucode_cpu_info *uci)
++ {
++ 	unsigned int val[2];
++ 	unsigned int family, model;
++ 	struct cpu_signature csig = { 0 };
++ 	unsigned int eax, ebx, ecx, edx;
++ 
++ 	memset(uci, 0, sizeof(*uci));
++ 
++ 	eax = 0x00000001;
++ 	ecx = 0;
++ 	native_cpuid(&eax, &ebx, &ecx, &edx);
++ 	csig.sig = eax;
++ 
++ 	family = x86_family(eax);
++ 	model  = x86_model(eax);
++ 
++ 	if (model >= 5 || family > 6) {
++ 		/* get processor flags from MSR 0x17 */
++ 		native_rdmsr(MSR_IA32_PLATFORM_ID, val[0], val[1]);
++ 		csig.pf = 1 << ((val[1] >> 18) & 7);
++ 	}
++ 
++ 	csig.rev = intel_get_microcode_revision();
++ 
++ 	uci->cpu_sig = csig;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(intel_cpu_collect_info);
++ 
++ /*
++  * Returns 1 if update has been found, 0 otherwise.
++  */
++ int intel_find_matching_signature(void *mc, unsigned int csig, int cpf)
++ {
++ 	struct microcode_header_intel *mc_hdr = mc;
++ 	struct extended_sigtable *ext_hdr;
++ 	struct extended_signature *ext_sig;
++ 	int i;
++ 
++ 	if (intel_cpu_signatures_match(csig, cpf, mc_hdr->sig, mc_hdr->pf))
++ 		return 1;
++ 
++ 	/* Look for ext. headers: */
++ 	if (get_totalsize(mc_hdr) <= get_datasize(mc_hdr) + MC_HEADER_SIZE)
++ 		return 0;
++ 
++ 	ext_hdr = mc + get_datasize(mc_hdr) + MC_HEADER_SIZE;
++ 	ext_sig = (void *)ext_hdr + EXT_HEADER_SIZE;
++ 
++ 	for (i = 0; i < ext_hdr->count; i++) {
++ 		if (intel_cpu_signatures_match(csig, cpf, ext_sig->sig, ext_sig->pf))
++ 			return 1;
++ 		ext_sig++;
++ 	}
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(intel_find_matching_signature);
++ 
+++>>>>>>> 716f38027586 (x86/microcode/intel: Reuse find_matching_signature())
+  static void early_init_intel(struct cpuinfo_x86 *c)
+  {
+  	u64 misc_enable;
+diff --cc arch/x86/kernel/cpu/microcode/intel.c
+index f8e43af6ddb5,c77ec1ba6844..000000000000
+--- a/arch/x86/kernel/cpu/microcode/intel.c
++++ b/arch/x86/kernel/cpu/microcode/intel.c
+@@@ -45,51 -45,9 +45,54 @@@ static struct microcode_intel *intel_uc
+  /* last level cache size per core */
+  static int llc_size_per_core;
+  
+ +static inline bool cpu_signatures_match(unsigned int s1, unsigned int p1,
+ +					unsigned int s2, unsigned int p2)
+ +{
+ +	if (s1 != s2)
+ +		return false;
+ +
+ +	/* Processor flags are either both 0 ... */
+ +	if (!p1 && !p2)
+ +		return true;
+ +
+ +	/* ... or they intersect. */
+ +	return p1 & p2;
+ +}
+ +
+ +/*
+ + * Returns 1 if update has been found, 0 otherwise.
+ + */
+++<<<<<<< HEAD
+ +static int find_matching_signature(void *mc, unsigned int csig, int cpf)
+ +{
+ +	struct microcode_header_intel *mc_hdr = mc;
+ +	struct extended_sigtable *ext_hdr;
+ +	struct extended_signature *ext_sig;
+ +	int i;
+ +
+ +	if (cpu_signatures_match(csig, cpf, mc_hdr->sig, mc_hdr->pf))
+ +		return 1;
+ +
+ +	/* Look for ext. headers: */
+ +	if (get_totalsize(mc_hdr) <= get_datasize(mc_hdr) + MC_HEADER_SIZE)
+ +		return 0;
+ +
+ +	ext_hdr = mc + get_datasize(mc_hdr) + MC_HEADER_SIZE;
+ +	ext_sig = (void *)ext_hdr + EXT_HEADER_SIZE;
+ +
+ +	for (i = 0; i < ext_hdr->count; i++) {
+ +		if (cpu_signatures_match(csig, cpf, ext_sig->sig, ext_sig->pf))
+ +			return 1;
+ +		ext_sig++;
+ +	}
+ +	return 0;
+ +}
+ +
+  /*
+   * Returns 1 if update has been found, 0 otherwise.
+   */
+++=======
+++>>>>>>> 716f38027586 (x86/microcode/intel: Reuse find_matching_signature())
+  static int has_newer_microcode(void *mc, unsigned int csig, int cpf, int new_rev)
+  {
+  	struct microcode_header_intel *mc_hdr = mc;
+* Unmerged path arch/x86/include/asm/cpu.h
+* Unmerged path arch/x86/kernel/cpu/intel.c
+* Unmerged path arch/x86/kernel/cpu/microcode/intel.c
