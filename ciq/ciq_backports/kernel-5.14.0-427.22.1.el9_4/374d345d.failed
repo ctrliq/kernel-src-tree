@@ -1,0 +1,259 @@
+netlink: add variable-length / auto integers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-427.22.1.el9_4
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit 374d345d9b5e13380c66d7042f9533a6ac6d1195
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.22.1.el9_4/374d345d.failed
+
+We currently push everyone to use padding to align 64b values
+in netlink. Un-padded nla_put_u64() doesn't even exist any more.
+
+The story behind this possibly start with this thread:
+https://lore.kernel.org/netdev/20121204.130914.1457976839967676240.davem@davemloft.net/
+where DaveM was concerned about the alignment of a structure
+containing 64b stats. If user space tries to access such struct
+directly:
+
+	struct some_stats *stats = nla_data(attr);
+	printf("A: %llu", stats->a);
+
+lack of alignment may become problematic for some architectures.
+These days we most often put every single member in a separate
+attribute, meaning that the code above would use a helper like
+nla_get_u64(), which can deal with alignment internally.
+Even for arches which don't have good unaligned access - access
+aligned to 4B should be pretty efficient.
+Kernel and well known libraries deal with unaligned input already.
+
+Padded 64b is quite space-inefficient (64b + pad means at worst 16B
+per attr vs 32b which takes 8B). It is also more typing:
+
+    if (nla_put_u64_pad(rsp, NETDEV_A_SOMETHING_SOMETHING,
+                        value, NETDEV_A_SOMETHING_PAD))
+
+Create a new attribute type which will use 32 bits at netlink
+level if value is small enough (probably most of the time?),
+and (4B-aligned) 64 bits otherwise. Kernel API is just:
+
+    if (nla_put_uint(rsp, NETDEV_A_SOMETHING_SOMETHING, value))
+
+Calling this new type "just" sint / uint with no specific size
+will hopefully also make people more comfortable with using it.
+Currently telling people "don't use u8, you may need the bits,
+and netlink will round up to 4B, anyway" is the #1 comment
+we give to newcomers.
+
+In terms of netlink layout it looks like this:
+
+         0       4       8       12      16
+32b:     [nlattr][ u32  ]
+64b:     [  pad ][nlattr][     u64      ]
+uint(32) [nlattr][ u32  ]
+uint(64) [nlattr][     u64      ]
+
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Acked-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 374d345d9b5e13380c66d7042f9533a6ac6d1195)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/userspace-api/netlink/specs.rst
+#	include/net/netlink.h
+diff --cc include/net/netlink.h
+index 48c3c43f9c02,aba2b162a226..000000000000
+--- a/include/net/netlink.h
++++ b/include/net/netlink.h
+@@@ -183,6 -183,10 +185,13 @@@ enum 
+  	NLA_S64,
+  	NLA_BITFIELD32,
+  	NLA_REJECT,
+++<<<<<<< HEAD
+++=======
++ 	NLA_BE16,
++ 	NLA_BE32,
++ 	NLA_SINT,
++ 	NLA_UINT,
+++>>>>>>> 374d345d9b5e (netlink: add variable-length / auto integers)
+  	__NLA_TYPE_MAX,
+  };
+  
+@@@ -263,6 -270,9 +274,12 @@@ enum nla_policy_validation 
+   *    NLA_U16,
+   *    NLA_U32,
+   *    NLA_U64,
+++<<<<<<< HEAD
+++=======
++  *    NLA_BE16,
++  *    NLA_BE32,
++  *    NLA_SINT,
+++>>>>>>> 374d345d9b5e (netlink: add variable-length / auto integers)
+   *    NLA_S8,
+   *    NLA_S16,
+   *    NLA_S32,
+* Unmerged path Documentation/userspace-api/netlink/specs.rst
+* Unmerged path Documentation/userspace-api/netlink/specs.rst
+* Unmerged path include/net/netlink.h
+diff --git a/include/uapi/linux/netlink.h b/include/uapi/linux/netlink.h
+index b4ac9a860485..19c4b11e05ad 100644
+--- a/include/uapi/linux/netlink.h
++++ b/include/uapi/linux/netlink.h
+@@ -290,6 +290,8 @@ struct nla_bitfield32 {
+  *	entry has attributes again, the policy for those inner ones
+  *	and the corresponding maxtype may be specified.
+  * @NL_ATTR_TYPE_BITFIELD32: &struct nla_bitfield32 attribute
++ * @NL_ATTR_TYPE_SINT: 32-bit or 64-bit signed attribute, aligned to 4B
++ * @NL_ATTR_TYPE_UINT: 32-bit or 64-bit unsigned attribute, aligned to 4B
+  */
+ enum netlink_attribute_type {
+ 	NL_ATTR_TYPE_INVALID,
+@@ -314,6 +316,9 @@ enum netlink_attribute_type {
+ 	NL_ATTR_TYPE_NESTED_ARRAY,
+ 
+ 	NL_ATTR_TYPE_BITFIELD32,
++
++	NL_ATTR_TYPE_SINT,
++	NL_ATTR_TYPE_UINT,
+ };
+ 
+ /**
+diff --git a/lib/nlattr.c b/lib/nlattr.c
+index 46d003dc40e2..a9b4e3845427 100644
+--- a/lib/nlattr.c
++++ b/lib/nlattr.c
+@@ -135,6 +135,7 @@ void nla_get_range_unsigned(const struct nla_policy *pt,
+ 		range->max = U32_MAX;
+ 		break;
+ 	case NLA_U64:
++	case NLA_UINT:
+ 	case NLA_MSECS:
+ 		range->max = U64_MAX;
+ 		break;
+@@ -205,6 +206,9 @@ static int nla_validate_range_unsigned(const struct nla_policy *pt,
+ 	case NLA_U64:
+ 		value = nla_get_attr_bo(pt, nla);
+ 		break;
++	case NLA_UINT:
++		value = nla_get_uint(nla);
++		break;
+ 	case NLA_MSECS:
+ 		value = nla_get_u64(nla);
+ 		break;
+@@ -264,6 +268,7 @@ void nla_get_range_signed(const struct nla_policy *pt,
+ 		range->max = S32_MAX;
+ 		break;
+ 	case NLA_S64:
++	case NLA_SINT:
+ 		range->min = S64_MIN;
+ 		range->max = S64_MAX;
+ 		break;
+@@ -311,6 +316,9 @@ static int nla_validate_int_range_signed(const struct nla_policy *pt,
+ 	case NLA_S64:
+ 		value = nla_get_s64(nla);
+ 		break;
++	case NLA_SINT:
++		value = nla_get_sint(nla);
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -336,6 +344,7 @@ static int nla_validate_int_range(const struct nla_policy *pt,
+ 	case NLA_U16:
+ 	case NLA_U32:
+ 	case NLA_U64:
++	case NLA_UINT:
+ 	case NLA_MSECS:
+ 	case NLA_BINARY:
+ 		return nla_validate_range_unsigned(pt, nla, extack, validate);
+@@ -343,6 +352,7 @@ static int nla_validate_int_range(const struct nla_policy *pt,
+ 	case NLA_S16:
+ 	case NLA_S32:
+ 	case NLA_S64:
++	case NLA_SINT:
+ 		return nla_validate_int_range_signed(pt, nla, extack);
+ 	default:
+ 		WARN_ON(1);
+@@ -369,6 +379,9 @@ static int nla_validate_mask(const struct nla_policy *pt,
+ 	case NLA_U64:
+ 		value = nla_get_u64(nla);
+ 		break;
++	case NLA_UINT:
++		value = nla_get_uint(nla);
++		break;
+ 	case NLA_BE16:
+ 		value = ntohs(nla_get_be16(nla));
+ 		break;
+@@ -446,6 +459,15 @@ static int validate_nla(const struct nlattr *nla, int maxtype,
+ 			goto out_err;
+ 		break;
+ 
++	case NLA_SINT:
++	case NLA_UINT:
++		if (attrlen != sizeof(u32) && attrlen != sizeof(u64)) {
++			NL_SET_ERR_MSG_ATTR_POL(extack, nla, pt,
++						"invalid attribute length");
++			return -EINVAL;
++		}
++		break;
++
+ 	case NLA_BITFIELD32:
+ 		if (attrlen != sizeof(struct nla_bitfield32))
+ 			goto out_err;
+diff --git a/net/netlink/policy.c b/net/netlink/policy.c
+index 87e3de0fde89..ef542a142b98 100644
+--- a/net/netlink/policy.c
++++ b/net/netlink/policy.c
+@@ -229,6 +229,8 @@ int netlink_policy_dump_attr_size_estimate(const struct nla_policy *pt)
+ 	case NLA_S16:
+ 	case NLA_S32:
+ 	case NLA_S64:
++	case NLA_SINT:
++	case NLA_UINT:
+ 		/* maximum is common, u64 min/max with padding */
+ 		return common +
+ 		       2 * (nla_attr_size(0) + nla_attr_size(sizeof(u64)));
+@@ -287,6 +289,7 @@ __netlink_policy_dump_write_attr(struct netlink_policy_dump_state *state,
+ 	case NLA_U16:
+ 	case NLA_U32:
+ 	case NLA_U64:
++	case NLA_UINT:
+ 	case NLA_MSECS: {
+ 		struct netlink_range_validation range;
+ 
+@@ -296,8 +299,10 @@ __netlink_policy_dump_write_attr(struct netlink_policy_dump_state *state,
+ 			type = NL_ATTR_TYPE_U16;
+ 		else if (pt->type == NLA_U32)
+ 			type = NL_ATTR_TYPE_U32;
+-		else
++		else if (pt->type == NLA_U64)
+ 			type = NL_ATTR_TYPE_U64;
++		else
++			type = NL_ATTR_TYPE_UINT;
+ 
+ 		if (pt->validation_type == NLA_VALIDATE_MASK) {
+ 			if (nla_put_u64_64bit(skb, NL_POLICY_TYPE_ATTR_MASK,
+@@ -319,7 +324,8 @@ __netlink_policy_dump_write_attr(struct netlink_policy_dump_state *state,
+ 	case NLA_S8:
+ 	case NLA_S16:
+ 	case NLA_S32:
+-	case NLA_S64: {
++	case NLA_S64:
++	case NLA_SINT: {
+ 		struct netlink_range_validation_signed range;
+ 
+ 		if (pt->type == NLA_S8)
+@@ -328,8 +334,10 @@ __netlink_policy_dump_write_attr(struct netlink_policy_dump_state *state,
+ 			type = NL_ATTR_TYPE_S16;
+ 		else if (pt->type == NLA_S32)
+ 			type = NL_ATTR_TYPE_S32;
+-		else
++		else if (pt->type == NLA_S64)
+ 			type = NL_ATTR_TYPE_S64;
++		else
++			type = NL_ATTR_TYPE_SINT;
+ 
+ 		nla_get_range_signed(pt, &range);
+ 
