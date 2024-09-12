@@ -1,0 +1,196 @@
+ASOC: SOF: Intel: hda-dai: add hda_dai_hw_free_ipc() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+commit 81622503229943363858cd7ae1330f49b131dfbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/81622503.failed
+
+We do the same thing from different places, let's use a helper.
+
+	Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Reviewed-by: Rander Wang <rander.wang@intel.com>
+	Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+	Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+	Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+Link: https://lore.kernel.org/r/20220421203201.1550328-10-pierre-louis.bossart@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 81622503229943363858cd7ae1330f49b131dfbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/intel/hda-dai.c
+diff --cc sound/soc/sof/intel/hda-dai.c
+index 97bf291cb5b8,0521cb755a8a..000000000000
+--- a/sound/soc/sof/intel/hda-dai.c
++++ b/sound/soc/sof/intel/hda-dai.c
+@@@ -457,11 -294,158 +457,166 @@@ static int hda_link_hw_free(struct snd_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static const struct snd_soc_dai_ops hda_link_dai_ops = {
+ +	.hw_params = hda_link_hw_params,
+ +	.hw_free = hda_link_hw_free,
+ +	.trigger = hda_link_pcm_trigger,
+ +	.prepare = hda_link_pcm_prepare,
+++=======
++ static int hda_dai_widget_update(struct snd_soc_dapm_widget *w,
++ 				 int channel, bool widget_setup)
++ {
++ 	struct snd_sof_dai_config_data data;
++ 
++ 	data.dai_data = channel;
++ 
++ 	/* set up/free DAI widget and send DAI_CONFIG IPC */
++ 	if (widget_setup)
++ 		return hda_ctrl_dai_widget_setup(w, SOF_DAI_CONFIG_FLAGS_2_STEP_STOP, &data);
++ 
++ 	return hda_ctrl_dai_widget_free(w, SOF_DAI_CONFIG_FLAGS_NONE, &data);
++ }
++ 
++ static int hda_dai_hw_params_update(struct snd_pcm_substream *substream,
++ 				    struct snd_pcm_hw_params *params,
++ 				    struct snd_soc_dai *dai)
++ {
++ 	struct hdac_ext_stream *hext_stream;
++ 	struct snd_soc_dapm_widget *w;
++ 	int stream_tag;
++ 
++ 	hext_stream = snd_soc_dai_get_dma_data(dai, substream);
++ 	if (!hext_stream)
++ 		return -EINVAL;
++ 
++ 	stream_tag = hdac_stream(hext_stream)->stream_tag;
++ 
++ 	w = snd_soc_dai_get_widget(dai, substream->stream);
++ 
++ 	/* set up the DAI widget and send the DAI_CONFIG with the new tag */
++ 	return hda_dai_widget_update(w, stream_tag - 1, true);
++ }
++ 
++ static int hda_dai_hw_params(struct snd_pcm_substream *substream,
++ 			     struct snd_pcm_hw_params *params,
++ 			     struct snd_soc_dai *dai)
++ {
++ 	int ret;
++ 
++ 	ret = hda_link_dma_hw_params(substream, params);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	return hda_dai_hw_params_update(substream, params, dai);
++ }
++ 
++ 
++ static int hda_dai_config_pause_push_ipc(struct snd_soc_dapm_widget *w)
++ {
++ 	struct snd_sof_widget *swidget = w->dobj.private;
++ 	struct snd_soc_component *component = swidget->scomp;
++ 	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(component);
++ 	const struct sof_ipc_tplg_ops *tplg_ops = sdev->ipc->ops->tplg;
++ 	int ret = 0;
++ 
++ 	if (tplg_ops->dai_config) {
++ 		ret = tplg_ops->dai_config(sdev, swidget, SOF_DAI_CONFIG_FLAGS_PAUSE, NULL);
++ 		if (ret < 0)
++ 			dev_err(sdev->dev, "%s: DAI config failed for widget %s\n", __func__,
++ 				w->name);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int ipc3_hda_dai_prepare(struct snd_pcm_substream *substream,
++ 				struct snd_soc_dai *dai)
++ {
++ 	struct hdac_ext_stream *hext_stream =
++ 				snd_soc_dai_get_dma_data(dai, substream);
++ 	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(dai->component);
++ 	struct snd_soc_pcm_runtime *rtd = asoc_substream_to_rtd(substream);
++ 	int stream = substream->stream;
++ 	int ret;
++ 
++ 	if (hext_stream->link_prepared)
++ 		return 0;
++ 
++ 	dev_dbg(sdev->dev, "%s: prepare stream dir %d\n", __func__, substream->stream);
++ 
++ 	ret = hda_link_dma_prepare(substream);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	return hda_dai_hw_params_update(substream, &rtd->dpcm[stream].hw_params, dai);
++ }
++ 
++ static int hda_dai_hw_free_ipc(int stream, /* direction */
++ 			       struct snd_soc_dai *dai)
++ {
++ 	struct snd_soc_dapm_widget *w;
++ 
++ 	w = snd_soc_dai_get_widget(dai, stream);
++ 
++ 	/* free the link DMA channel in the FW and the DAI widget */
++ 	return hda_dai_widget_update(w, DMA_CHAN_INVALID, false);
++ }
++ 
++ static int ipc3_hda_dai_trigger(struct snd_pcm_substream *substream,
++ 				int cmd, struct snd_soc_dai *dai)
++ {
++ 	struct snd_soc_dapm_widget *w;
++ 	int ret;
++ 
++ 	ret = hda_link_dma_trigger(substream, cmd);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	w = snd_soc_dai_get_widget(dai, substream->stream);
++ 
++ 	dev_dbg(dai->dev, "%s: cmd=%d\n", __func__, cmd);
++ 	switch (cmd) {
++ 	case SNDRV_PCM_TRIGGER_SUSPEND:
++ 	case SNDRV_PCM_TRIGGER_STOP:
++ 		/*
++ 		 * free DAI widget during stop/suspend to keep widget use_count's balanced.
++ 		 */
++ 		ret = hda_dai_hw_free_ipc(substream->stream, dai);
++ 		if (ret < 0)
++ 			return ret;
++ 
++ 		break;
++ 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++ 		ret = hda_dai_config_pause_push_ipc(w);
++ 		if (ret < 0)
++ 			return ret;
++ 		break;
++ 
++ 	default:
++ 		break;
++ 	}
++ 	return 0;
++ }
++ 
++ static int hda_dai_hw_free(struct snd_pcm_substream *substream,
++ 			   struct snd_soc_dai *dai)
++ {
++ 	int ret;
++ 
++ 	ret = hda_link_dma_hw_free(substream);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	return hda_dai_hw_free_ipc(substream->stream, dai);
++ }
++ 
++ static const struct snd_soc_dai_ops ipc3_hda_dai_ops = {
++ 	.hw_params = hda_dai_hw_params,
++ 	.hw_free = hda_dai_hw_free,
++ 	.trigger = ipc3_hda_dai_trigger,
++ 	.prepare = ipc3_hda_dai_prepare,
+++>>>>>>> 816225032299 (ASOC: SOF: Intel: hda-dai: add hda_dai_hw_free_ipc() helper)
+  };
+  
+  #endif
+* Unmerged path sound/soc/sof/intel/hda-dai.c
