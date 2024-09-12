@@ -757,14 +757,12 @@ static const struct pci_device_id mlx5_core_hw_unsupp_pci_table[] = {
 static int mlx5_pci_init(struct mlx5_core_dev *dev, struct pci_dev *pdev,
 			 const struct pci_device_id *id)
 {
-	struct mlx5_priv *priv = &dev->priv;
 	int err = 0;
 
 	mutex_init(&dev->pci_status_mutex);
 	pci_set_drvdata(dev->pdev, dev);
 
 	dev->bar_addr = pci_resource_start(pdev, 0);
-	priv->numa_node = dev_to_node(mlx5_core_dma_dev(dev));
 
 	err = mlx5_pci_enable_device(dev);
 	if (err) {
@@ -1458,6 +1456,7 @@ int mlx5_mdev_init(struct mlx5_core_dev *dev, int profile_idx)
 	mutex_init(&priv->pgdir_mutex);
 	INIT_LIST_HEAD(&priv->pgdir_list);
 
+	priv->numa_node = dev_to_node(mlx5_core_dma_dev(dev));
 	priv->dbg_root = debugfs_create_dir(dev_name(dev->device),
 					    mlx5_debugfs_root);
 	INIT_LIST_HEAD(&priv->traps);
