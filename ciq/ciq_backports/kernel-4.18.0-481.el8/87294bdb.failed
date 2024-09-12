@@ -1,0 +1,149 @@
+x86/compressed: Register GHCB memory when SEV-SNP is active
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Brijesh Singh <brijesh.singh@amd.com>
+commit 87294bdb7b4b73555b0fba45da1cdecdc6a0d5a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/87294bdb.failed
+
+The SEV-SNP guest is required by the GHCB spec to register the GHCB's
+Guest Physical Address (GPA). This is because the hypervisor may prefer
+that a guest use a consistent and/or specific GPA for the GHCB associated
+with a vCPU. For more information, see the GHCB specification section
+"GHCB GPA Registration".
+
+If hypervisor can not work with the guest provided GPA then terminate the
+guest boot.
+
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Venu Busireddy <venu.busireddy@oracle.com>
+Link: https://lore.kernel.org/r/20220307213356.2797205-17-brijesh.singh@amd.com
+(cherry picked from commit 87294bdb7b4b73555b0fba45da1cdecdc6a0d5a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/sev-common.h
+#	arch/x86/kernel/sev-shared.c
+diff --cc arch/x86/include/asm/sev-common.h
+index 94f0ea574049,f077a6c95e67..000000000000
+--- a/arch/x86/include/asm/sev-common.h
++++ b/arch/x86/include/asm/sev-common.h
+@@@ -57,6 -57,45 +57,48 @@@
+  #define GHCB_MSR_AP_RESET_HOLD_REQ	0x006
+  #define GHCB_MSR_AP_RESET_HOLD_RESP	0x007
+  
+++<<<<<<< HEAD
+++=======
++ /* GHCB GPA Register */
++ #define GHCB_MSR_REG_GPA_REQ		0x012
++ #define GHCB_MSR_REG_GPA_REQ_VAL(v)			\
++ 	/* GHCBData[63:12] */				\
++ 	(((u64)((v) & GENMASK_ULL(51, 0)) << 12) |	\
++ 	/* GHCBData[11:0] */				\
++ 	GHCB_MSR_REG_GPA_REQ)
++ 
++ #define GHCB_MSR_REG_GPA_RESP		0x013
++ #define GHCB_MSR_REG_GPA_RESP_VAL(v)			\
++ 	/* GHCBData[63:12] */				\
++ 	(((u64)(v) & GENMASK_ULL(63, 12)) >> 12)
++ 
++ /*
++  * SNP Page State Change Operation
++  *
++  * GHCBData[55:52] - Page operation:
++  *   0x0001	Page assignment, Private
++  *   0x0002	Page assignment, Shared
++  */
++ enum psc_op {
++ 	SNP_PAGE_STATE_PRIVATE = 1,
++ 	SNP_PAGE_STATE_SHARED,
++ };
++ 
++ #define GHCB_MSR_PSC_REQ		0x014
++ #define GHCB_MSR_PSC_REQ_GFN(gfn, op)			\
++ 	/* GHCBData[55:52] */				\
++ 	(((u64)((op) & 0xf) << 52) |			\
++ 	/* GHCBData[51:12] */				\
++ 	((u64)((gfn) & GENMASK_ULL(39, 0)) << 12) |	\
++ 	/* GHCBData[11:0] */				\
++ 	GHCB_MSR_PSC_REQ)
++ 
++ #define GHCB_MSR_PSC_RESP		0x015
++ #define GHCB_MSR_PSC_RESP_VAL(val)			\
++ 	/* GHCBData[63:32] */				\
++ 	(((u64)(val) & GENMASK_ULL(63, 32)) >> 32)
++ 
+++>>>>>>> 87294bdb7b4b (x86/compressed: Register GHCB memory when SEV-SNP is active)
+  /* GHCB Hypervisor Feature Request/Response */
+  #define GHCB_MSR_HV_FT_REQ		0x080
+  #define GHCB_MSR_HV_FT_RESP		0x081
+diff --cc arch/x86/kernel/sev-shared.c
+index 91ece8db542a,e9ff13cd90b0..000000000000
+--- a/arch/x86/kernel/sev-shared.c
++++ b/arch/x86/kernel/sev-shared.c
+@@@ -48,6 -48,42 +48,45 @@@ static void __noreturn sev_es_terminate
+  		asm volatile("hlt\n" : : : "memory");
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The hypervisor features are available from GHCB version 2 onward.
++  */
++ static u64 get_hv_features(void)
++ {
++ 	u64 val;
++ 
++ 	if (ghcb_version < 2)
++ 		return 0;
++ 
++ 	sev_es_wr_ghcb_msr(GHCB_MSR_HV_FT_REQ);
++ 	VMGEXIT();
++ 
++ 	val = sev_es_rd_ghcb_msr();
++ 	if (GHCB_RESP_CODE(val) != GHCB_MSR_HV_FT_RESP)
++ 		return 0;
++ 
++ 	return GHCB_MSR_HV_FT_RESP_VAL(val);
++ }
++ 
++ static void __maybe_unused snp_register_ghcb_early(unsigned long paddr)
++ {
++ 	unsigned long pfn = paddr >> PAGE_SHIFT;
++ 	u64 val;
++ 
++ 	sev_es_wr_ghcb_msr(GHCB_MSR_REG_GPA_REQ_VAL(pfn));
++ 	VMGEXIT();
++ 
++ 	val = sev_es_rd_ghcb_msr();
++ 
++ 	/* If the response GPA is not ours then abort the guest */
++ 	if ((GHCB_RESP_CODE(val) != GHCB_MSR_REG_GPA_RESP) ||
++ 	    (GHCB_MSR_REG_GPA_RESP_VAL(val) != pfn))
++ 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_REGISTER);
++ }
++ 
+++>>>>>>> 87294bdb7b4b (x86/compressed: Register GHCB memory when SEV-SNP is active)
+  static bool sev_es_negotiate_protocol(void)
+  {
+  	u64 val;
+diff --git a/arch/x86/boot/compressed/sev.c b/arch/x86/boot/compressed/sev.c
+index 213b126ba7e3..a1ffbf21a542 100644
+--- a/arch/x86/boot/compressed/sev.c
++++ b/arch/x86/boot/compressed/sev.c
+@@ -133,6 +133,10 @@ static bool early_setup_sev_es(void)
+ 	/* Initialize lookup tables for the instruction decoder */
+ 	inat_init_tables();
+ 
++	/* SNP guest requires the GHCB GPA must be registered */
++	if (sev_snp_enabled())
++		snp_register_ghcb_early(__pa(&boot_ghcb_page));
++
+ 	return true;
+ }
+ 
+* Unmerged path arch/x86/include/asm/sev-common.h
+* Unmerged path arch/x86/kernel/sev-shared.c
