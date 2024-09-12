@@ -1,0 +1,138 @@
+dm-crypt: recheck the integrity tag after a failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-546.el8
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 42e15d12070b4ff9af2b980f1b65774c2dab0507
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-546.el8/42e15d12.failed
+
+If a userspace process reads (with O_DIRECT) multiple blocks into the same
+buffer, dm-crypt reports an authentication error [1]. The error is
+reported in a log and it may cause RAID leg being kicked out of the
+array.
+
+This commit fixes dm-crypt, so that if integrity verification fails, the
+data is read again into a kernel buffer (where userspace can't modify it)
+and the integrity tag is rechecked. If the recheck succeeds, the content
+of the kernel buffer is copied into the user buffer; if the recheck fails,
+an integrity error is reported.
+
+[1] https://people.redhat.com/~mpatocka/testcases/blk-auth-modify/read2.c
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 42e15d12070b4ff9af2b980f1b65774c2dab0507)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-crypt.c
+diff --cc drivers/md/dm-crypt.c
+index 09cf8ce3cafe,6044614bab76..000000000000
+--- a/drivers/md/dm-crypt.c
++++ b/drivers/md/dm-crypt.c
+@@@ -1360,9 -1372,15 +1364,21 @@@ static int crypt_convert_block_aead(str
+  	}
+  
+  	if (r == -EBADMSG) {
+++<<<<<<< HEAD
+ +		char b[BDEVNAME_SIZE];
+ +		DMERR_LIMIT("%s: INTEGRITY AEAD ERROR, sector %llu", bio_devname(ctx->bio_in, b),
+ +			    (unsigned long long)le64_to_cpu(*sector));
+++=======
++ 		sector_t s = le64_to_cpu(*sector);
++ 
++ 		ctx->aead_failed = true;
++ 		if (ctx->aead_recheck) {
++ 			DMERR_LIMIT("%pg: INTEGRITY AEAD ERROR, sector %llu",
++ 				    ctx->bio_in->bi_bdev, s);
++ 			dm_audit_log_bio(DM_MSG_PREFIX, "integrity-aead",
++ 					 ctx->bio_in, s, 0);
++ 		}
+++>>>>>>> 42e15d12070b (dm-crypt: recheck the integrity tag after a failure)
+  	}
+  
+  	if (!r && cc->iv_gen_ops && cc->iv_gen_ops->post)
+@@@ -1777,8 -1835,13 +1806,18 @@@ static void crypt_endio(struct bio *clo
+  {
+  	struct dm_crypt_io *io = clone->bi_private;
+  	struct crypt_config *cc = io->cc;
+++<<<<<<< HEAD
+ +	unsigned rw = bio_data_dir(clone);
+ +	blk_status_t error;
+++=======
++ 	unsigned int rw = bio_data_dir(clone);
++ 	blk_status_t error = clone->bi_status;
++ 
++ 	if (io->ctx.aead_recheck && !error) {
++ 		kcryptd_queue_crypt(io);
++ 		return;
++ 	}
+++>>>>>>> 42e15d12070b (dm-crypt: recheck the integrity tag after a failure)
+  
+  	/*
+  	 * free the processed pages
+@@@ -1817,15 -1869,33 +1855,31 @@@ static int kcryptd_io_read(struct dm_cr
+  	struct crypt_config *cc = io->cc;
+  	struct bio *clone;
+  
++ 	if (io->ctx.aead_recheck) {
++ 		if (!(gfp & __GFP_DIRECT_RECLAIM))
++ 			return 1;
++ 		crypt_inc_pending(io);
++ 		clone = crypt_alloc_buffer(io, io->base_bio->bi_iter.bi_size);
++ 		if (unlikely(!clone)) {
++ 			crypt_dec_pending(io);
++ 			return 1;
++ 		}
++ 		clone->bi_iter.bi_sector = cc->start + io->sector;
++ 		crypt_convert_init(cc, &io->ctx, clone, clone, io->sector);
++ 		io->saved_bi_iter = clone->bi_iter;
++ 		dm_submit_bio_remap(io->base_bio, clone);
++ 		return 0;
++ 	}
++ 
+  	/*
+ -	 * We need the original biovec array in order to decrypt the whole bio
+ -	 * data *afterwards* -- thanks to immutable biovecs we don't need to
+ -	 * worry about the block layer modifying the biovec array; so leverage
+ -	 * bio_alloc_clone().
+ +	 * We need the original biovec array in order to decrypt
+ +	 * the whole bio data *afterwards* -- thanks to immutable
+ +	 * biovecs we don't need to worry about the block layer
+ +	 * modifying the biovec array; so leverage bio_clone_fast().
+  	 */
+ -	clone = bio_alloc_clone(cc->dev->bdev, io->base_bio, gfp, &cc->bs);
+ +	clone = bio_clone_fast(io->base_bio, gfp, &cc->bs);
+  	if (!clone)
+  		return 1;
+ -	clone->bi_private = io;
+ -	clone->bi_end_io = crypt_endio;
+  
+  	crypt_inc_pending(io);
+  
+@@@ -2126,9 -2240,15 +2194,21 @@@ static void kcryptd_async_done(struct c
+  		error = cc->iv_gen_ops->post(cc, org_iv_of_dmreq(cc, dmreq), dmreq);
+  
+  	if (error == -EBADMSG) {
+++<<<<<<< HEAD
+ +		char b[BDEVNAME_SIZE];
+ +		DMERR_LIMIT("%s: INTEGRITY AEAD ERROR, sector %llu", bio_devname(ctx->bio_in, b),
+ +			    (unsigned long long)le64_to_cpu(*org_sector_of_dmreq(cc, dmreq)));
+++=======
++ 		sector_t s = le64_to_cpu(*org_sector_of_dmreq(cc, dmreq));
++ 
++ 		ctx->aead_failed = true;
++ 		if (ctx->aead_recheck) {
++ 			DMERR_LIMIT("%pg: INTEGRITY AEAD ERROR, sector %llu",
++ 				    ctx->bio_in->bi_bdev, s);
++ 			dm_audit_log_bio(DM_MSG_PREFIX, "integrity-aead",
++ 					 ctx->bio_in, s, 0);
++ 		}
+++>>>>>>> 42e15d12070b (dm-crypt: recheck the integrity tag after a failure)
+  		io->error = BLK_STS_PROTECTION;
+  	} else if (error < 0)
+  		io->error = BLK_STS_IOERR;
+* Unmerged path drivers/md/dm-crypt.c
