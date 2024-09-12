@@ -1,0 +1,205 @@
+NFS: pass cred explicitly for access tests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author NeilBrown <neilb@suse.de>
+commit 73fbb3fa647bdb5b60469af8101c741ece03a825
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/73fbb3fa.failed
+
+Storing the 'struct cred *' in nfs_access_entry is problematic.
+An active 'cred' can keep a 'struct key *' active, and a quota is
+imposed on the number of such keys that a user can maintain.
+Cached 'nfs_access_entry' structs have indefinite lifetime, and having
+these keep 'struct key's alive imposes on that quota.
+
+So a future patch will remove the ->cred ref from nfs_access_entry.
+
+To prepare, change various functions to not assume there is a 'cred' in
+the nfs_access_entry, but to pass the cred around explicitly.
+
+	Signed-off-by: NeilBrown <neilb@suse.de>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 73fbb3fa647bdb5b60469af8101c741ece03a825)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/nfs_fs.h
+diff --cc include/linux/nfs_fs.h
+index 94a6b834caf8,c33b1b792bc9..000000000000
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@@ -396,10 -394,11 +396,16 @@@ extern int nfs_refresh_inode(struct ino
+  extern int nfs_post_op_update_inode(struct inode *inode, struct nfs_fattr *fattr);
+  extern int nfs_post_op_update_inode_force_wcc(struct inode *inode, struct nfs_fattr *fattr);
+  extern int nfs_post_op_update_inode_force_wcc_locked(struct inode *inode, struct nfs_fattr *fattr);
+++<<<<<<< HEAD
+ +extern int nfs_getattr(const struct path *, struct kstat *, u32, unsigned int);
+ +extern void nfs_access_add_cache(struct inode *, struct nfs_access_entry *);
+++=======
++ extern int nfs_getattr(struct user_namespace *, const struct path *,
++ 		       struct kstat *, u32, unsigned int);
++ extern void nfs_access_add_cache(struct inode *, struct nfs_access_entry *, const struct cred *);
+++>>>>>>> 73fbb3fa647b (NFS: pass cred explicitly for access tests)
+  extern void nfs_access_set_mask(struct nfs_access_entry *, u32);
+ -extern int nfs_permission(struct user_namespace *, struct inode *, int);
+ +extern int nfs_permission(struct inode *, int);
+  extern int nfs_open(struct inode *, struct file *);
+  extern int nfs_attribute_cache_expired(struct inode *inode);
+  extern int nfs_revalidate_inode(struct inode *inode, unsigned long flags);
+diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
+index 0ab405849d16..b77a37bc90ba 100644
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -2913,7 +2913,9 @@ int nfs_access_get_cached(struct inode *inode, const struct cred *cred,
+ }
+ EXPORT_SYMBOL_GPL(nfs_access_get_cached);
+ 
+-static void nfs_access_add_rbtree(struct inode *inode, struct nfs_access_entry *set)
++static void nfs_access_add_rbtree(struct inode *inode,
++				  struct nfs_access_entry *set,
++				  const struct cred *cred)
+ {
+ 	struct nfs_inode *nfsi = NFS_I(inode);
+ 	struct rb_root *root_node = &nfsi->access_cache;
+@@ -2926,7 +2928,7 @@ static void nfs_access_add_rbtree(struct inode *inode, struct nfs_access_entry *
+ 	while (*p != NULL) {
+ 		parent = *p;
+ 		entry = rb_entry(parent, struct nfs_access_entry, rb_node);
+-		cmp = cred_fscmp(set->cred, entry->cred);
++		cmp = cred_fscmp(cred, entry->cred);
+ 
+ 		if (cmp < 0)
+ 			p = &parent->rb_left;
+@@ -2948,13 +2950,14 @@ static void nfs_access_add_rbtree(struct inode *inode, struct nfs_access_entry *
+ 	nfs_access_free_entry(entry);
+ }
+ 
+-void nfs_access_add_cache(struct inode *inode, struct nfs_access_entry *set)
++void nfs_access_add_cache(struct inode *inode, struct nfs_access_entry *set,
++			  const struct cred *cred)
+ {
+ 	struct nfs_access_entry *cache = kmalloc(sizeof(*cache), GFP_KERNEL);
+ 	if (cache == NULL)
+ 		return;
+ 	RB_CLEAR_NODE(&cache->rb_node);
+-	cache->cred = get_cred(set->cred);
++	cache->cred = get_cred(cred);
+ 	cache->mask = set->mask;
+ 
+ 	/* The above field assignments must be visible
+@@ -2962,7 +2965,7 @@ void nfs_access_add_cache(struct inode *inode, struct nfs_access_entry *set)
+ 	 * use rcu_assign_pointer, so just force the memory barrier.
+ 	 */
+ 	smp_wmb();
+-	nfs_access_add_rbtree(inode, cache);
++	nfs_access_add_rbtree(inode, cache, cred);
+ 
+ 	/* Update accounting */
+ 	smp_mb__before_atomic();
+@@ -3048,7 +3051,7 @@ static int nfs_do_access(struct inode *inode, const struct cred *cred, int mask)
+ 	else
+ 		cache.mask |= NFS_ACCESS_EXECUTE;
+ 	cache.cred = cred;
+-	status = NFS_PROTO(inode)->access(inode, &cache);
++	status = NFS_PROTO(inode)->access(inode, &cache, cred);
+ 	if (status != 0) {
+ 		if (status == -ESTALE) {
+ 			if (!S_ISDIR(inode->i_mode))
+@@ -3058,7 +3061,7 @@ static int nfs_do_access(struct inode *inode, const struct cred *cred, int mask)
+ 		}
+ 		goto out;
+ 	}
+-	nfs_access_add_cache(inode, &cache);
++	nfs_access_add_cache(inode, &cache, cred);
+ out_cached:
+ 	cache_mask = nfs_access_calc_mask(cache.mask, inode->i_mode);
+ 	if ((mask & ~cache_mask & (MAY_READ | MAY_WRITE | MAY_EXEC)) != 0)
+diff --git a/fs/nfs/nfs3proc.c b/fs/nfs/nfs3proc.c
+index 7100514d306b..1597eef40d54 100644
+--- a/fs/nfs/nfs3proc.c
++++ b/fs/nfs/nfs3proc.c
+@@ -220,7 +220,8 @@ static int nfs3_proc_lookupp(struct inode *inode, struct nfs_fh *fhandle,
+ 				  task_flags);
+ }
+ 
+-static int nfs3_proc_access(struct inode *inode, struct nfs_access_entry *entry)
++static int nfs3_proc_access(struct inode *inode, struct nfs_access_entry *entry,
++			    const struct cred *cred)
+ {
+ 	struct nfs3_accessargs	arg = {
+ 		.fh		= NFS_FH(inode),
+@@ -231,7 +232,7 @@ static int nfs3_proc_access(struct inode *inode, struct nfs_access_entry *entry)
+ 		.rpc_proc	= &nfs3_procedures[NFS3PROC_ACCESS],
+ 		.rpc_argp	= &arg,
+ 		.rpc_resp	= &res,
+-		.rpc_cred	= entry->cred,
++		.rpc_cred	= cred,
+ 	};
+ 	int status = -ENOMEM;
+ 
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 82b7b1868222..71975c36a37b 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -2651,7 +2651,7 @@ static int nfs4_opendata_access(const struct cred *cred,
+ 
+ 	cache.cred = cred;
+ 	nfs_access_set_mask(&cache, opendata->o_res.access_result);
+-	nfs_access_add_cache(state->inode, &cache);
++	nfs_access_add_cache(state->inode, &cache, cred);
+ 
+ 	flags = NFS4_ACCESS_READ | NFS4_ACCESS_EXECUTE | NFS4_ACCESS_LOOKUP;
+ 	if ((mask & ~cache.mask & flags) == 0)
+@@ -4555,7 +4555,8 @@ static int nfs4_proc_lookupp(struct inode *inode, struct nfs_fh *fhandle,
+ 	return err;
+ }
+ 
+-static int _nfs4_proc_access(struct inode *inode, struct nfs_access_entry *entry)
++static int _nfs4_proc_access(struct inode *inode, struct nfs_access_entry *entry,
++			     const struct cred *cred)
+ {
+ 	struct nfs_server *server = NFS_SERVER(inode);
+ 	struct nfs4_accessargs args = {
+@@ -4569,7 +4570,7 @@ static int _nfs4_proc_access(struct inode *inode, struct nfs_access_entry *entry
+ 		.rpc_proc = &nfs4_procedures[NFSPROC4_CLNT_ACCESS],
+ 		.rpc_argp = &args,
+ 		.rpc_resp = &res,
+-		.rpc_cred = entry->cred,
++		.rpc_cred = cred,
+ 	};
+ 	int status = 0;
+ 
+@@ -4589,14 +4590,15 @@ static int _nfs4_proc_access(struct inode *inode, struct nfs_access_entry *entry
+ 	return status;
+ }
+ 
+-static int nfs4_proc_access(struct inode *inode, struct nfs_access_entry *entry)
++static int nfs4_proc_access(struct inode *inode, struct nfs_access_entry *entry,
++			    const struct cred *cred)
+ {
+ 	struct nfs4_exception exception = {
+ 		.interruptible = true,
+ 	};
+ 	int err;
+ 	do {
+-		err = _nfs4_proc_access(inode, entry);
++		err = _nfs4_proc_access(inode, entry, cred);
+ 		trace_nfs4_access(inode, err);
+ 		err = nfs4_handle_exception(NFS_SERVER(inode), err,
+ 				&exception);
+* Unmerged path include/linux/nfs_fs.h
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index ca453ef4777c..5db555ff4180 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -1719,7 +1719,7 @@ struct nfs_rpc_ops {
+ 			    struct nfs_fh *, struct nfs_fattr *);
+ 	int	(*lookupp) (struct inode *, struct nfs_fh *,
+ 			    struct nfs_fattr *);
+-	int	(*access)  (struct inode *, struct nfs_access_entry *);
++	int	(*access)  (struct inode *, struct nfs_access_entry *, const struct cred *);
+ 	int	(*readlink)(struct inode *, struct page *, unsigned int,
+ 			    unsigned int);
+ 	int	(*create)  (struct inode *, struct dentry *,
