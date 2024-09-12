@@ -1,5 +1,5 @@
 /*
- * cppc_msr.c:  MSR Interface for CPPC
+ * cppc.c: CPPC Interface for x86
  * Copyright (c) 2016, Intel Corporation.
  *
  * This program is free software; you can redistribute it and/or modify it
