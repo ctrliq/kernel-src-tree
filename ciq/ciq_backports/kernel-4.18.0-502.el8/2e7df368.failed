@@ -1,0 +1,214 @@
+x86/resctrl: Apply offset correction when config is staged
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author James Morse <james.morse@arm.com>
+commit 2e7df368fc9260ac2229335755de2f403ec8f08f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/2e7df368.failed
+
+When resctrl comes to copy the CAT MSR values from the ctrl_val[] array
+into hardware, it applies an offset adjustment based on the type of
+the resource. CODE and DATA resources have their closid mapped into an
+odd/even range. This mapping is based on a property of the resource.
+
+This happens once the new control value has been written to the ctrl_val[]
+array. Once the CDP resources are merged, there will only be a single
+property that needs to cover both odd/even mappings to the single
+ctrl_val[] array. The offset adjustment must be applied before the new
+value is written to the array.
+
+Move the logic from cat_wrmsr() to resctrl_arch_update_domains(). The
+value provided to apply_config() is now an index in the array, not the
+closid. The parameters provided via struct msr_param are now indexes
+too. As resctrl's use of closid is a u32, struct msr_param's type is
+changed to match.
+
+With this, the CODE and DATA resources only use the odd or even
+indexes in the array. This allows the temporary num_closid/2 fixes in
+domain_setup_ctrlval() and reset_all_ctrls() to be removed.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Jamie Iles <jamie@nuviainc.com>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Tested-by: Babu Moger <babu.moger@amd.com>
+Link: https://lkml.kernel.org/r/20210728170637.25610-20-james.morse@arm.com
+(cherry picked from commit 2e7df368fc9260ac2229335755de2f403ec8f08f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/core.c
+#	arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+#	arch/x86/kernel/cpu/resctrl/rdtgroup.c
+diff --cc arch/x86/kernel/cpu/resctrl/core.c
+index 916eb976301b,990e41661b4a..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/core.c
++++ b/arch/x86/kernel/cpu/resctrl/core.c
+@@@ -407,9 -429,11 +402,13 @@@ static voi
+  cat_wrmsr(struct rdt_domain *d, struct msr_param *m, struct rdt_resource *r)
+  {
+  	unsigned int i;
+ -	struct rdt_hw_domain *hw_dom = resctrl_to_arch_dom(d);
+ -	struct rdt_hw_resource *hw_res = resctrl_to_arch_res(r);
+  
+  	for (i = m->low; i < m->high; i++)
+++<<<<<<< HEAD
+ +		wrmsrl(r->msr_base + cbm_idx(r, i), d->ctrl_val[i]);
+++=======
++ 		wrmsrl(hw_res->msr_base + i, hw_dom->ctrl_val[i]);
+++>>>>>>> 2e7df368fc92 (x86/resctrl: Apply offset correction when config is staged)
+  }
+  
+  struct rdt_domain *get_domain_from_cpu(int cpu, struct rdt_resource *r)
+@@@ -510,8 -543,8 +509,13 @@@ static int domain_setup_ctrlval(struct 
+  	setup_default_ctrlval(r, dc, dm);
+  
+  	m.low = 0;
+++<<<<<<< HEAD
+ +	m.high = r->num_closid;
+ +	r->msr_update(d, &m, r);
+++=======
++ 	m.high = hw_res->num_closid;
++ 	hw_res->msr_update(d, &m, r);
+++>>>>>>> 2e7df368fc92 (x86/resctrl: Apply offset correction when config is staged)
+  	return 0;
+  }
+  
+diff --cc arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+index 9a768d89de37,fdb0e11a78dc..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/ctrlmondata.c
++++ b/arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+@@@ -244,14 -246,42 +244,47 @@@ next
+  	return -EINVAL;
+  }
+  
+++<<<<<<< HEAD
+ +int update_domains(struct rdt_resource *r, int closid)
+ +{
+++=======
++ static u32 cbm_idx(struct rdt_resource *r, unsigned int closid)
++ {
++ 	if (r->rid == RDT_RESOURCE_MBA)
++ 		return closid;
++ 
++ 	return closid * r->cache.cbm_idx_mult + r->cache.cbm_idx_offset;
++ }
++ 
++ static bool apply_config(struct rdt_hw_domain *hw_dom,
++ 			 struct resctrl_staged_config *cfg, u32 idx,
++ 			 cpumask_var_t cpu_mask, bool mba_sc)
++ {
++ 	struct rdt_domain *dom = &hw_dom->d_resctrl;
++ 	u32 *dc = !mba_sc ? hw_dom->ctrl_val : hw_dom->mbps_val;
++ 
++ 	if (cfg->new_ctrl != dc[idx]) {
++ 		cpumask_set_cpu(cpumask_any(&dom->cpu_mask), cpu_mask);
++ 		dc[idx] = cfg->new_ctrl;
++ 
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ int resctrl_arch_update_domains(struct rdt_resource *r, u32 closid)
++ {
++ 	struct resctrl_staged_config *cfg;
++ 	struct rdt_hw_domain *hw_dom;
+++>>>>>>> 2e7df368fc92 (x86/resctrl: Apply offset correction when config is staged)
+  	struct msr_param msr_param;
+ -	enum resctrl_conf_type t;
+  	cpumask_var_t cpu_mask;
+  	struct rdt_domain *d;
+  	bool mba_sc;
+ +	u32 *dc;
+  	int cpu;
++ 	u32 idx;
+  
+  	if (!zalloc_cpumask_var(&cpu_mask, GFP_KERNEL))
+  		return -ENOMEM;
+@@@ -262,10 -292,15 +295,22 @@@
+  
+  	mba_sc = is_mba_sc(r);
+  	list_for_each_entry(d, &r->domains, list) {
+++<<<<<<< HEAD
+ +		dc = !mba_sc ? d->ctrl_val : d->mbps_val;
+ +		if (d->have_new_ctrl && d->new_ctrl != dc[closid]) {
+ +			cpumask_set_cpu(cpumask_any(&d->cpu_mask), cpu_mask);
+ +			dc[closid] = d->new_ctrl;
+++=======
++ 		hw_dom = resctrl_to_arch_dom(d);
++ 		for (t = 0; t < CDP_NUM_TYPES; t++) {
++ 			cfg = &hw_dom->d_resctrl.staged_config[t];
++ 			if (!cfg->have_new_ctrl)
++ 				continue;
++ 
++ 			idx = cbm_idx(r, closid);
++ 			if (!apply_config(hw_dom, cfg, idx, cpu_mask, mba_sc))
++ 				continue;
+++>>>>>>> 2e7df368fc92 (x86/resctrl: Apply offset correction when config is staged)
+  		}
+  	}
+  
+@@@ -379,8 -416,21 +424,23 @@@ out
+  	return ret ?: nbytes;
+  }
+  
+ -void resctrl_arch_get_config(struct rdt_resource *r, struct rdt_domain *d,
+ -			     u32 closid, enum resctrl_conf_type type, u32 *value)
+ +static void show_doms(struct seq_file *s, struct rdt_resource *r, int closid)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct rdt_hw_domain *hw_dom = resctrl_to_arch_dom(d);
++ 	u32 idx = cbm_idx(r, closid);
++ 
++ 	if (!is_mba_sc(r))
++ 		*value = hw_dom->ctrl_val[idx];
++ 	else
++ 		*value = hw_dom->mbps_val[idx];
++ }
++ 
++ static void show_doms(struct seq_file *s, struct resctrl_schema *schema, int closid)
++ {
++ 	struct rdt_resource *r = schema->res;
+++>>>>>>> 2e7df368fc92 (x86/resctrl: Apply offset correction when config is staged)
+  	struct rdt_domain *dom;
+  	bool sep = false;
+  	u32 ctrl_val;
+diff --cc arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index a8731279ffbf,1f72517057e8..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@@ -2294,7 -2376,7 +2294,11 @@@ static int reset_all_ctrls(struct rdt_r
+  
+  	msr_param.res = r;
+  	msr_param.low = 0;
+++<<<<<<< HEAD
+ +	msr_param.high = r->num_closid;
+++=======
++ 	msr_param.high = hw_res->num_closid;
+++>>>>>>> 2e7df368fc92 (x86/resctrl: Apply offset correction when config is staged)
+  
+  	/*
+  	 * Disable resource control for this resource by setting all
+* Unmerged path arch/x86/kernel/cpu/resctrl/core.c
+* Unmerged path arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+diff --git a/arch/x86/kernel/cpu/resctrl/internal.h b/arch/x86/kernel/cpu/resctrl/internal.h
+index 9780c2d2c637..6593adc7da2c 100644
+--- a/arch/x86/kernel/cpu/resctrl/internal.h
++++ b/arch/x86/kernel/cpu/resctrl/internal.h
+@@ -349,8 +349,8 @@ struct rdt_domain {
+  */
+ struct msr_param {
+ 	struct rdt_resource	*res;
+-	int			low;
+-	int			high;
++	u32			low;
++	u32			high;
+ };
+ 
+ /**
+* Unmerged path arch/x86/kernel/cpu/resctrl/rdtgroup.c
