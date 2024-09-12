@@ -1,0 +1,245 @@
+mxser: don't throttle manually
+
+jira LE-1907
+cve CVE-2023-6546
+Rebuild_History Non-Buildable kernel-4.18.0-541.el8
+commit-author Jiri Slaby <jslaby@suse.cz>
+commit c6693e6e07805f1b7822b13a5b482bf2b6a1f312
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-541.el8/c6693e6e.failed
+
+First, checking tty->receive_room to signalize whether there is enough space
+in the tty buffers does not make much sense. Provided the tty buffers
+are in tty_port and those are not checked at all.
+
+Second, if the rx path is throttled, with CRTSCTS, RTS is deasserted,
+but is never asserted again. This leads to port "lockup", not accepting
+any more input.
+
+So:
+1) stty -F /dev/ttyMI0 crtscts # the mxser port
+2) stty -F /dev/ttyS6 crtscts # the connected port
+3) cat /dev/ttyMI0
+4) "write in a loop" to /dev/ttyS6
+5) cat from 3) produces the bytes from 4)
+6) killall -STOP cat (the 3)'s one)
+7) wait for RTS to drop on /dev/ttyMI0
+8) killall -CONT cat (again the 3)'s one)
+
+cat erroneously produces no more output now (i.e. no data sent from
+ttyS6 to ttyMI can be seen).
+
+Note that the step 7) is performed twice: once from n_tty by
+tty_throttle_safe(), once by mxser_stoprx() from the receive path. Then
+after step 7), n_tty correctly unthrottles the input, but mxser calls
+mxser_stoprx() again as there is still only a little space in n_tty
+buffers (tty->receive_room mentioned at the beginning), but the device's
+FIFO is/can be already filled.
+
+After this patch, the output is correctly resumed, i.e. n_tty both
+throttles and unthrottles without interfering with mxser's attempts.
+
+This allows us to get rid of the non-standard ldisc_stop_rx flag from
+struct mxser_port.
+
+	Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+Link: https://lore.kernel.org/r/20211118073125.12283-15-jslaby@suse.cz
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit c6693e6e07805f1b7822b13a5b482bf2b6a1f312)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/mxser.c
+diff --cc drivers/tty/mxser.c
+index edf10c6c8cf9,2359b4aa68af..000000000000
+--- a/drivers/tty/mxser.c
++++ b/drivers/tty/mxser.c
+@@@ -348,18 -244,13 +348,21 @@@ struct mxser_port 
+  
+  	u8 rx_high_water;
+  	u8 rx_low_water;
+ +	int baud_base;		/* max. speed */
+  	int type;		/* UART type */
+  
+ -	unsigned char x_char;	/* xon/xoff character */
+ -	u8 IER;			/* Interrupt Enable Register */
+ -	u8 MCR;			/* Modem control register */
+ -	u8 FCR;			/* FIFO control register */
+ +	int x_char;		/* xon/xoff character */
+ +	int IER;		/* Interrupt Enable Register */
+ +	int MCR;		/* Modem control register */
+  
+++<<<<<<< HEAD
+ +	bool ldisc_stop_rx;
+ +
+ +	int custom_divisor;
+ +	unsigned char err_shadow;
+ +
+++=======
+++>>>>>>> c6693e6e0780 (mxser: don't throttle manually)
+  	struct async_icount icount; /* kernel counters for 4 input interrupts */
+  	unsigned int timeout;
+  
+@@@ -1954,9 -1292,8 +1961,8 @@@ static void mxser_throttle(struct tty_s
+  {
+  	struct mxser_port *info = tty->driver_data;
+  
+- 	info->ldisc_stop_rx = true;
+  	if (I_IXOFF(tty)) {
+ -		if (info->board->must_hwid) {
+ +		if (info->board->chip_flag) {
+  			info->IER &= ~MOXA_MUST_RECV_ISR;
+  			outb(info->IER, info->ioaddr + UART_IER);
+  		} else {
+@@@ -2159,44 -1490,37 +2155,74 @@@ static int mxser_rs_break(struct tty_st
+  	return 0;
+  }
+  
+ -static bool mxser_receive_chars_new(struct tty_struct *tty,
+ -		struct mxser_port *port, u8 status)
+ +static void mxser_receive_chars(struct tty_struct *tty,
+ +				struct mxser_port *port, int *status)
+  {
+++<<<<<<< HEAD
+ +	unsigned char ch, gdl;
+ +	int ignored = 0;
+ +	int cnt = 0;
+ +	int recv_room;
+ +	int max = 256;
+ +
+ +	recv_room = tty->receive_room;
+ +	if (recv_room == 0 && !port->ldisc_stop_rx)
+ +		mxser_stoprx(tty);
+ +	if (port->board->chip_flag != MOXA_OTHER_UART) {
+ +
+ +		if (*status & UART_LSR_SPECIAL)
+ +			goto intr_old;
+ +		if (port->board->chip_flag == MOXA_MUST_MU860_HWID &&
+ +				(*status & MOXA_MUST_LSR_RERR))
+ +			goto intr_old;
+ +		if (*status & MOXA_MUST_LSR_RERR)
+ +			goto intr_old;
+ +
+ +		gdl = inb(port->ioaddr + MOXA_MUST_GDL_REGISTER);
+ +
+ +		if (port->board->chip_flag == MOXA_MUST_MU150_HWID)
+ +			gdl &= MOXA_MUST_GDL_MASK;
+ +		if (gdl >= recv_room) {
+ +			if (!port->ldisc_stop_rx)
+ +				mxser_stoprx(tty);
+ +		}
+ +		while (gdl--) {
+ +			ch = inb(port->ioaddr + UART_RX);
+ +			tty_insert_flip_char(&port->port, ch, 0);
+ +			cnt++;
+ +		}
+ +		goto end_intr;
+ +	}
+ +intr_old:
+++=======
++ 	enum mxser_must_hwid hwid = port->board->must_hwid;
++ 	u8 gdl;
++ 
++ 	if (hwid == MOXA_OTHER_UART)
++ 		return false;
++ 	if (status & (UART_LSR_BRK_ERROR_BITS | MOXA_MUST_LSR_RERR))
++ 		return false;
++ 
++ 	gdl = inb(port->ioaddr + MOXA_MUST_GDL_REGISTER);
++ 	if (hwid == MOXA_MUST_MU150_HWID)
++ 		gdl &= MOXA_MUST_GDL_MASK;
++ 
++ 	while (gdl--) {
++ 		u8 ch = inb(port->ioaddr + UART_RX);
++ 		tty_insert_flip_char(&port->port, ch, 0);
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static u8 mxser_receive_chars_old(struct tty_struct *tty,
++ 		                struct mxser_port *port, u8 status)
++ {
++ 	enum mxser_must_hwid hwid = port->board->must_hwid;
++ 	int ignored = 0;
++ 	int max = 256;
++ 	u8 ch;
+++>>>>>>> c6693e6e0780 (mxser: don't throttle manually)
+  
+  	do {
+  		if (max-- < 0)
+@@@ -2229,28 -1554,28 +2255,33 @@@
+  					port->icount.overrun++;
+  				}
+  			}
+- 			tty_insert_flip_char(&port->port, ch, flag);
+- 			cnt++;
+- 			if (cnt >= recv_room) {
+- 				if (!port->ldisc_stop_rx)
+- 					mxser_stoprx(tty);
++ 			if (!tty_insert_flip_char(&port->port, ch, flag))
+  				break;
+- 			}
+- 
+  		}
+  
+ -		if (hwid)
+ +		if (port->board->chip_flag)
+  			break;
+  
+ -		status = inb(port->ioaddr + UART_LSR);
+ -	} while (status & UART_LSR_DR);
+ +		*status = inb(port->ioaddr + UART_LSR);
+ +	} while (*status & UART_LSR_DR);
+  
+++<<<<<<< HEAD
+ +end_intr:
+ +	mxvar_log.rxcnt[tty->index] += cnt;
+ +	port->mon_data.rxcnt += cnt;
+ +	port->mon_data.up_rxcnt += cnt;
+++=======
++ 	return status;
++ }
++ 
++ static u8 mxser_receive_chars(struct tty_struct *tty,
++ 		struct mxser_port *port, u8 status)
++ {
++ 	if (!mxser_receive_chars_new(tty, port, status))
++ 		status = mxser_receive_chars_old(tty, port, status);
+++>>>>>>> c6693e6e0780 (mxser: don't throttle manually)
+  
+  	tty_flip_buffer_push(&port->port);
+ -
+ -	return status;
+  }
+  
+  static void mxser_transmit_chars(struct tty_struct *tty, struct mxser_port *port)
+@@@ -2475,22 -1769,23 +2506,21 @@@ static int mxser_initbrd(struct mxser_b
+  		tty_port_init(&info->port);
+  		info->port.ops = &mxser_port_ops;
+  		info->board = brd;
+- 		info->ldisc_stop_rx = false;
+  
+  		/* Enhance mode enabled here */
+ -		if (brd->must_hwid != MOXA_OTHER_UART)
+ -			mxser_must_set_enhance_mode(info->ioaddr, true);
+ +		if (brd->chip_flag != MOXA_OTHER_UART)
+ +			mxser_enable_must_enchance_mode(info->ioaddr);
+  
+ -		info->type = PORT_16550A;
+ +		info->type = brd->uart_type;
+  
+ -		mxser_process_txrx_fifo(info);
+ +		process_txrx_fifo(info);
+  
+ +		info->custom_divisor = info->baud_base * 16;
+  		info->port.close_delay = 5 * HZ / 10;
+  		info->port.closing_wait = 30 * HZ;
+ +		info->normal_termios = mxvar_sdriver->init_termios;
+ +		memset(&info->mon_data, 0, sizeof(struct mxser_mon));
+ +		info->err_shadow = 0;
+  		spin_lock_init(&info->slock);
+  
+  		/* before set INT ISR, disable all int */
+* Unmerged path drivers/tty/mxser.c
