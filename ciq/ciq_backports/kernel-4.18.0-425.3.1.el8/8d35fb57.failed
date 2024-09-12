@@ -1,0 +1,141 @@
+net/mlx5e: Build SKB in place over the first fragment in non-linear legacy RQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Maxim Mikityanskiy <maximmi@nvidia.com>
+commit 8d35fb57fd907251992f85e97fa25e8db20d4bca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/8d35fb57.failed
+
+As a performance optimization and preparation to enabling XDP multi
+buffer on non-linear legacy RQ, build the linear part of the SKB over
+the first fragment, instead of allocating a new buffer and copying the
+first 256 bytes there.
+
+To achieve this, add headroom and tailroom to the first fragment.
+
+	Signed-off-by: Maxim Mikityanskiy <maximmi@nvidia.com>
+	Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 8d35fb57fd907251992f85e97fa25e8db20d4bca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/params.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/params.c
+index 7902ffe6e9ec,5c4711be6fae..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/params.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/params.c
+@@@ -160,23 -188,18 +160,34 @@@ u16 mlx5e_get_rq_headroom(struct mlx5_c
+  			  struct mlx5e_params *params,
+  			  struct mlx5e_xsk_param *xsk)
+  {
+- 	bool is_linear_skb = (params->rq_wq_type == MLX5_WQ_TYPE_CYCLIC) ?
+- 		mlx5e_rx_is_linear_skb(params, xsk) :
+- 		mlx5e_rx_mpwqe_is_linear_skb(mdev, params, xsk);
++ 	u16 linear_headroom = mlx5e_get_linear_rq_headroom(params, xsk);
+  
+++<<<<<<< HEAD
+ +	return is_linear_skb ? mlx5e_get_linear_rq_headroom(params, xsk) : 0;
+ +}
+ +
+ +struct mlx5e_lro_param mlx5e_get_lro_param(struct mlx5e_params *params)
+ +{
+ +	struct mlx5e_lro_param lro_param;
+ +
+ +	lro_param = (struct mlx5e_lro_param) {
+ +		.enabled = params->lro_en,
+ +		.timeout = params->packet_merge_timeout,
+ +	};
+ +
+ +	return lro_param;
+++=======
++ 	if (params->rq_wq_type == MLX5_WQ_TYPE_CYCLIC)
++ 		return linear_headroom;
++ 
++ 	if (mlx5e_rx_mpwqe_is_linear_skb(mdev, params, xsk))
++ 		return linear_headroom;
++ 
++ 	if (params->packet_merge.type == MLX5E_PACKET_MERGE_SHAMPO)
++ 		return linear_headroom;
++ 
++ 	return 0;
+++>>>>>>> 8d35fb57fd90 (net/mlx5e: Build SKB in place over the first fragment in non-linear legacy RQ)
+  }
+  
+  u16 mlx5e_calc_sq_stop_room(struct mlx5_core_dev *mdev, struct mlx5e_params *params)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/params.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index b3f823cc73ba..9c2b7da190b3 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -1182,43 +1182,45 @@ mlx5e_skb_from_cqe_nonlinear(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
+ 			     struct mlx5e_wqe_frag_info *wi, u32 cqe_bcnt)
+ {
+ 	struct mlx5e_rq_frag_info *frag_info = &rq->wqe.info.arr[0];
+-	struct mlx5e_wqe_frag_info *head_wi = wi;
+-	u16 headlen      = min_t(u32, MLX5E_RX_MAX_HEAD, cqe_bcnt);
+-	u16 frag_headlen = headlen;
+-	u16 byte_cnt     = cqe_bcnt - headlen;
++	u16 rx_headroom = rq->buff.headroom;
++	struct mlx5e_dma_info *di = wi->di;
++	u32 frag_consumed_bytes;
++	u32 first_frag_size;
+ 	struct sk_buff *skb;
++	void *va;
++
++	va = page_address(di->page) + wi->offset;
++	frag_consumed_bytes = min_t(u32, frag_info->frag_size, cqe_bcnt);
++	first_frag_size = MLX5_SKB_FRAG_SZ(rx_headroom + frag_consumed_bytes);
++
++	dma_sync_single_range_for_cpu(rq->pdev, di->addr, wi->offset,
++				      first_frag_size, DMA_FROM_DEVICE);
++	net_prefetch(va + rx_headroom);
+ 
+ 	/* XDP is not supported in this configuration, as incoming packets
+ 	 * might spread among multiple pages.
+ 	 */
+-	skb = napi_alloc_skb(rq->cq.napi,
+-			     ALIGN(MLX5E_RX_MAX_HEAD, sizeof(long)));
+-	if (unlikely(!skb)) {
+-		rq->stats->buff_alloc_err++;
++	skb = mlx5e_build_linear_skb(rq, va, first_frag_size, rx_headroom,
++				     frag_consumed_bytes, 0);
++	if (unlikely(!skb))
+ 		return NULL;
+-	}
+ 
+-	net_prefetchw(skb->data);
++	page_ref_inc(di->page);
+ 
+-	while (byte_cnt) {
+-		u16 frag_consumed_bytes =
+-			min_t(u16, frag_info->frag_size - frag_headlen, byte_cnt);
++	cqe_bcnt -= frag_consumed_bytes;
++	frag_info++;
++	wi++;
+ 
+-		mlx5e_add_skb_frag(rq, skb, wi->di, wi->offset + frag_headlen,
++	while (cqe_bcnt) {
++		frag_consumed_bytes = min_t(u32, frag_info->frag_size, cqe_bcnt);
++
++		mlx5e_add_skb_frag(rq, skb, wi->di, wi->offset,
+ 				   frag_consumed_bytes, frag_info->frag_stride);
+-		byte_cnt -= frag_consumed_bytes;
+-		frag_headlen = 0;
++		cqe_bcnt -= frag_consumed_bytes;
+ 		frag_info++;
+ 		wi++;
+ 	}
+ 
+-	/* copy header */
+-	mlx5e_copy_skb_header(rq->pdev, skb, head_wi->di, head_wi->offset, head_wi->offset,
+-			      headlen);
+-	/* skb linear part was allocated with headlen and aligned to long */
+-	skb->tail += headlen;
+-	skb->len  += headlen;
+-
+ 	return skb;
+ }
+ 
