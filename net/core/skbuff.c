@@ -883,6 +883,33 @@ kfree_skb_reason(struct sk_buff *skb, enum skb_drop_reason reason)
 }
 EXPORT_SYMBOL(kfree_skb_reason);
 
+#define KFREE_SKB_BULK_SIZE	16
+
+struct skb_free_array {
+	unsigned int skb_count;
+	void *skb_array[KFREE_SKB_BULK_SIZE];
+};
+
+static void kfree_skb_add_bulk(struct sk_buff *skb,
+			       struct skb_free_array *sa,
+			       enum skb_drop_reason reason)
+{
+	/* if SKB is a clone, don't handle this case */
+	if (unlikely(skb->fclone != SKB_FCLONE_UNAVAILABLE)) {
+		__kfree_skb(skb);
+		return;
+	}
+
+	skb_release_all(skb, reason);
+	sa->skb_array[sa->skb_count++] = skb;
+
+	if (unlikely(sa->skb_count == KFREE_SKB_BULK_SIZE)) {
+		kmem_cache_free_bulk(skbuff_head_cache, KFREE_SKB_BULK_SIZE,
+				     sa->skb_array);
+		sa->skb_count = 0;
+	}
+}
+
 void kfree_skb_list(struct sk_buff *segs)
 {
 	kfree_skb_list_reason(segs, SKB_DROP_REASON_NOT_SPECIFIED);
@@ -892,13 +919,22 @@ EXPORT_SYMBOL(kfree_skb_list);
 void __fix_address
 kfree_skb_list_reason(struct sk_buff *segs, enum skb_drop_reason reason)
 {
+	struct skb_free_array sa;
+
+	sa.skb_count = 0;
+
 	while (segs) {
 		struct sk_buff *next = segs->next;
 
 		if (__kfree_skb_reason(segs, reason))
-			__kfree_skb(segs);
+			kfree_skb_add_bulk(segs, &sa, reason);
+
 		segs = next;
 	}
+
+	if (sa.skb_count)
+		kmem_cache_free_bulk(skbuff_head_cache, sa.skb_count,
+				     sa.skb_array);
 }
 EXPORT_SYMBOL(kfree_skb_list_reason);
 
@@ -3234,6 +3270,34 @@ struct sk_buff *skb_dequeue_tail(struct sk_buff_head *list)
 EXPORT_SYMBOL(skb_dequeue_tail);
 
 /**
+ *	skb_queue_purge_reason - empty a list
+ *	@list: list to empty
+ *	@reason: drop reason
+ *
+ *	Delete all buffers on an &sk_buff list. Each buffer is removed from
+ *	the list and one reference dropped. This function takes the list
+ *	lock and is atomic with respect to other list locking functions.
+ */
+void skb_queue_purge_reason(struct sk_buff_head *list,
+			    enum skb_drop_reason reason)
+{
+	struct sk_buff_head tmp;
+	unsigned long flags;
+
+	if (skb_queue_empty_lockless(list))
+		return;
+
+	__skb_queue_head_init(&tmp);
+
+	spin_lock_irqsave(&list->lock, flags);
+	skb_queue_splice_init(list, &tmp);
+	spin_unlock_irqrestore(&list->lock, flags);
+
+	__skb_queue_purge_reason(&tmp, reason);
+}
+EXPORT_SYMBOL(skb_queue_purge_reason);
+
+/**
  *	skb_queue_purge - empty a list
  *	@list: list to empty
  *
@@ -3243,9 +3307,7 @@ EXPORT_SYMBOL(skb_dequeue_tail);
  */
 void skb_queue_purge(struct sk_buff_head *list)
 {
-	struct sk_buff *skb;
-	while ((skb = skb_dequeue(list)) != NULL)
-		kfree_skb(skb);
+	skb_queue_purge_reason(list, SKB_DROP_REASON_QUEUE_PURGE);
 }
 EXPORT_SYMBOL(skb_queue_purge);
 
