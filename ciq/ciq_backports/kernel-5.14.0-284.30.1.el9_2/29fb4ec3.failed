@@ -1,0 +1,140 @@
+rxrpc: Remove RCU from peer->error_targets list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 29fb4ec385f18db98d9188c2173a0b07d2de6917
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/29fb4ec3.failed
+
+Remove the RCU requirements from the peer's list of error targets so that
+the error distributor can call sleeping functions.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit 29fb4ec385f18db98d9188c2173a0b07d2de6917)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/call_object.c
+diff --cc net/rxrpc/call_object.c
+index ad495d0d21a8,7570b4e67bc5..000000000000
+--- a/net/rxrpc/call_object.c
++++ b/net/rxrpc/call_object.c
+@@@ -416,11 -441,9 +416,17 @@@ void rxrpc_incoming_call(struct rxrpc_s
+  	conn->channels[chan].call_id = call->call_id;
+  	rcu_assign_pointer(conn->channels[chan].call, call);
+  
+++<<<<<<< HEAD
+ +	spin_lock(&conn->params.peer->lock);
+ +	hlist_add_head_rcu(&call->error_link, &conn->params.peer->error_targets);
+ +	spin_unlock(&conn->params.peer->lock);
+ +
+ +	_net("CALL incoming %d on CONN %d", call->debug_id, call->conn->debug_id);
+++=======
++ 	spin_lock(&conn->peer->lock);
++ 	hlist_add_head(&call->error_link, &conn->peer->error_targets);
++ 	spin_unlock(&conn->peer->lock);
+++>>>>>>> 29fb4ec385f1 (rxrpc: Remove RCU from peer->error_targets list)
+  
+  	rxrpc_start_call_timer(call);
+  	_leave("");
+diff --git a/net/rxrpc/call_accept.c b/net/rxrpc/call_accept.c
+index afe1f587aaf0..d6a056336dde 100644
+--- a/net/rxrpc/call_accept.c
++++ b/net/rxrpc/call_accept.c
+@@ -431,6 +431,12 @@ struct rxrpc_call *rxrpc_new_incoming_call(struct rxrpc_local *local,
+ 	 */
+ 	rxrpc_put_call(call, rxrpc_call_put_discard_prealloc);
+ 
++	if (hlist_unhashed(&call->error_link)) {
++		spin_lock(&call->peer->lock);
++		hlist_add_head(&call->error_link, &call->peer->error_targets);
++		spin_unlock(&call->peer->lock);
++	}
++
+ 	_leave(" = %p{%d}", call, call->debug_id);
+ 	return call;
+ 
+* Unmerged path net/rxrpc/call_object.c
+diff --git a/net/rxrpc/conn_client.c b/net/rxrpc/conn_client.c
+index 827c1308297c..7346d598492c 100644
+--- a/net/rxrpc/conn_client.c
++++ b/net/rxrpc/conn_client.c
+@@ -773,6 +773,10 @@ void rxrpc_expose_client_call(struct rxrpc_call *call)
+ 		if (chan->call_counter >= INT_MAX)
+ 			set_bit(RXRPC_CONN_DONT_REUSE, &conn->flags);
+ 		trace_rxrpc_client(conn, channel, rxrpc_client_exposed);
++
++		spin_lock(&call->peer->lock);
++		hlist_add_head(&call->error_link, &call->peer->error_targets);
++		spin_unlock(&call->peer->lock);
+ 	}
+ }
+ 
+diff --git a/net/rxrpc/conn_object.c b/net/rxrpc/conn_object.c
+index 156bd26daf74..63610a2dc2de 100644
+--- a/net/rxrpc/conn_object.c
++++ b/net/rxrpc/conn_object.c
+@@ -210,9 +210,9 @@ void rxrpc_disconnect_call(struct rxrpc_call *call)
+ 	call->peer->cong_ssthresh = call->cong_ssthresh;
+ 
+ 	if (!hlist_unhashed(&call->error_link)) {
+-		spin_lock_bh(&call->peer->lock);
+-		hlist_del_rcu(&call->error_link);
+-		spin_unlock_bh(&call->peer->lock);
++		spin_lock(&call->peer->lock);
++		hlist_del_init(&call->error_link);
++		spin_unlock(&call->peer->lock);
+ 	}
+ 
+ 	if (rxrpc_is_client_call(call))
+diff --git a/net/rxrpc/output.c b/net/rxrpc/output.c
+index 71b6fea4598b..1e2cc98891fe 100644
+--- a/net/rxrpc/output.c
++++ b/net/rxrpc/output.c
+@@ -395,12 +395,6 @@ int rxrpc_send_data_packet(struct rxrpc_call *call, struct rxrpc_txbuf *txb)
+ 
+ 	_enter("%x,{%d}", txb->seq, txb->len);
+ 
+-	if (hlist_unhashed(&call->error_link)) {
+-		spin_lock_bh(&call->peer->lock);
+-		hlist_add_head_rcu(&call->error_link, &call->peer->error_targets);
+-		spin_unlock_bh(&call->peer->lock);
+-	}
+-
+ 	/* Each transmission of a Tx packet needs a new serial number */
+ 	serial = atomic_inc_return(&conn->serial);
+ 	txb->wire.serial = htonl(serial);
+diff --git a/net/rxrpc/peer_event.c b/net/rxrpc/peer_event.c
+index b5160a878fe1..eef600f9d0ac 100644
+--- a/net/rxrpc/peer_event.c
++++ b/net/rxrpc/peer_event.c
+@@ -285,11 +285,24 @@ static void rxrpc_distribute_error(struct rxrpc_peer *peer, int error,
+ 				   enum rxrpc_call_completion compl)
+ {
+ 	struct rxrpc_call *call;
++	HLIST_HEAD(error_targets);
++
++	spin_lock(&peer->lock);
++	hlist_move_list(&peer->error_targets, &error_targets);
++
++	while (!hlist_empty(&error_targets)) {
++		call = hlist_entry(error_targets.first,
++				   struct rxrpc_call, error_link);
++		hlist_del_init(&call->error_link);
++		spin_unlock(&peer->lock);
+ 
+-	hlist_for_each_entry_rcu(call, &peer->error_targets, error_link) {
+ 		rxrpc_see_call(call, rxrpc_call_see_distribute_error);
+ 		rxrpc_set_call_completion(call, compl, 0, -error);
++
++		spin_lock(&peer->lock);
+ 	}
++
++	spin_unlock(&peer->lock);
+ }
+ 
+ /*
