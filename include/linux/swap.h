@@ -358,6 +358,7 @@ extern unsigned long mem_cgroup_shrink_node(struct mem_cgroup *mem,
 						unsigned long *nr_scanned);
 extern unsigned long shrink_all_memory(unsigned long nr_pages);
 extern int vm_swappiness;
+extern int force_cgroup_v2_swappiness __read_mostly;
 extern int remove_mapping(struct address_space *mapping, struct page *page);
 extern unsigned long vm_total_pages;
 
@@ -649,6 +650,10 @@ static inline int split_swap_cluster(swp_entry_t entry)
 #ifdef CONFIG_MEMCG
 static inline int mem_cgroup_swappiness(struct mem_cgroup *memcg)
 {
+	/* RHEL-Only deprecate per-cg swappiness for v1 */
+	if (force_cgroup_v2_swappiness)
+		return vm_swappiness;
+
 	/* Cgroup2 doesn't have per-cgroup swappiness */
 	if (cgroup_subsys_on_dfl(memory_cgrp_subsys))
 		return vm_swappiness;

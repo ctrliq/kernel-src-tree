@@ -41,7 +41,7 @@ SYNOPSIS
 
 	*BTF-COMMANDS* := { **show** | **list** | **dump** | **help** }
 
-	*GEN-COMMANDS* := { **object** | **skeleton** | **min_core_btf** | **help** }
+	*GEN-COMMANDS* := { **object** | **skeleton** | **help** }
 
 	*STRUCT-OPS-COMMANDS* := { **show** | **list** | **dump** | **register** | **unregister** | **help** }
 

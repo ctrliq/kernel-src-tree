@@ -451,14 +451,6 @@ enum {
 	MLX5_ESW_DEST_CHAIN_WITH_SRC_PORT_CHANGE  = BIT(2),
 };
 
-enum {
-	MLX5_ESW_ATTR_FLAG_VLAN_HANDLED  = BIT(0),
-	MLX5_ESW_ATTR_FLAG_SLOW_PATH     = BIT(1),
-	MLX5_ESW_ATTR_FLAG_NO_IN_PORT    = BIT(2),
-	MLX5_ESW_ATTR_FLAG_SRC_REWRITE   = BIT(3),
-	MLX5_ESW_ATTR_FLAG_SAMPLE        = BIT(4),
-};
-
 struct mlx5_esw_flow_attr {
 	struct mlx5_eswitch_rep *in_rep;
 	struct mlx5_core_dev	*in_mdev;
@@ -482,6 +474,7 @@ struct mlx5_esw_flow_attr {
 		int src_port_rewrite_act_id;
 	} dests[MLX5_MAX_FLOW_FWD_VPORTS];
 	struct mlx5_rx_tun_attr *rx_tun_attr;
+	struct ethhdr eth;
 	struct mlx5_pkt_reformat *decap_pkt_reformat;
 };
 

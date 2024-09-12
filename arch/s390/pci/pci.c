@@ -838,9 +838,6 @@ void zpci_release_device(struct kref *kref)
 		break;
 	}
 
-	spin_lock(&zpci_list_lock);
-	list_del(&zdev->entry);
-	spin_unlock(&zpci_list_lock);
 	zpci_dbg(3, "rem fid:%x\n", zdev->fid);
 	kfree(zdev);
 }

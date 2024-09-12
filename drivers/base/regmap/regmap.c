@@ -605,6 +605,7 @@ int regmap_attach_dev(struct device *dev, struct regmap *map,
 
 	map->dev = dev;
 
+	regmap_debugfs_exit(map);
 	regmap_debugfs_init(map, config->name);
 
 	/* Add a devres resource for dev_get_regmap() */

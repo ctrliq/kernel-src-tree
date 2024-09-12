@@ -34,6 +34,7 @@
 #include <linux/kernel_stat.h>
 #include <linux/clockchips.h>
 #include <linux/cpu.h>
+#include <linux/sched/isolation.h>
 #include <linux/sched/task_stack.h>
 
 #include <linux/delay.h>
@@ -1805,6 +1806,9 @@ static ssize_t target_cpu_store(struct vmbus_channel *channel,
 	if (target_cpu >= nr_cpumask_bits)
 		return -EINVAL;
 
+	if (!cpumask_test_cpu(target_cpu, housekeeping_cpumask(HK_FLAG_MANAGED_IRQ)))
+		return -EINVAL;
+
 	/* No CPUs should come up or down during this. */
 	cpus_read_lock();
 
@@ -1875,7 +1879,7 @@ static ssize_t target_cpu_store(struct vmbus_channel *channel,
 
 	/* See init_vp_index(). */
 	if (hv_is_perf_channel(channel))
-		hv_update_alloced_cpus(origin_cpu, target_cpu);
+		hv_update_allocated_cpus(origin_cpu, target_cpu);
 
 	/* Currently set only for storvsc channels. */
 	if (channel->change_target_cpu_callback) {

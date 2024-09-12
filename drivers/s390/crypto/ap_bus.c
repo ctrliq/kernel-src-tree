@@ -673,7 +673,7 @@ static void ap_send_bindings_complete_uevent(void)
 	char buf[32];
 	char *envp[] = { "BINDINGS=complete", buf, NULL };
 
-	snprintf(buf, sizeof(buf), "COMPLETECOUNT=%llu",
+	snprintf(buf, sizeof(buf), "COMPLETECOUNT=%lu",
 		 atomic64_inc_return(&ap_bindings_complete_count));
 	kobject_uevent_env(&ap_root_device->kobj, KOBJ_CHANGE, envp);
 }

@@ -286,5 +286,6 @@ struct nfs_server {
 #define NFS_CAP_LAYOUTERROR	(1U << 26)
 #define NFS_CAP_XATTR		(1U << 28)
 #define NFS_CAP_FS_LOCATIONS	(1U << 30)
+#define NFS_CAP_MOVEABLE	(1U << 31)
 
 #endif

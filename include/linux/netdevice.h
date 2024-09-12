@@ -863,6 +863,7 @@ enum tc_setup_type {
 	TC_SETUP_QDISC_TBF,
 	TC_SETUP_QDISC_FIFO,
 	TC_SETUP_QDISC_HTB,
+	TC_SETUP_ACT,
 };
 
 /* These structures hold the attributes of bpf state that are being passed
@@ -2146,7 +2147,7 @@ struct net_device {
 	struct netdev_queue	*_tx ____cacheline_aligned_in_smp;
 	unsigned int		num_tx_queues;
 	unsigned int		real_num_tx_queues;
-	RH_KABI_EXCLUDE(struct Qdisc		*qdisc)
+	RH_KABI_EXCLUDE(struct Qdisc __rcu *qdisc)
 #ifdef CONFIG_NET_SCHED
 	DECLARE_HASHTABLE	(qdisc_hash, 4);
 #endif
@@ -2238,6 +2239,7 @@ struct net_device {
 	struct phy_device	*phydev;
 	struct sfp_bus		*sfp_bus;
 	struct lock_class_key	*qdisc_tx_busylock;
+	RH_KABI_DEPRECATE(struct lock_class_key *, qdisc_running_key)
 	bool			proto_down;
 	RH_KABI_FILL_HOLE(unsigned	wol_enabled:1)
 	RH_KABI_FILL_HOLE(unsigned	threaded:1)

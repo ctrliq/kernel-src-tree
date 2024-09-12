@@ -1571,9 +1571,9 @@ static void analogix_dp_bridge_mode_set(struct drm_bridge *bridge,
 		video->color_depth = COLOR_8;
 		break;
 	}
-	if (display_info->color_formats & DRM_COLOR_FORMAT_YCRCB444)
+	if (display_info->color_formats & DRM_COLOR_FORMAT_YCBCR444)
 		video->color_space = COLOR_YCBCR444;
-	else if (display_info->color_formats & DRM_COLOR_FORMAT_YCRCB422)
+	else if (display_info->color_formats & DRM_COLOR_FORMAT_YCBCR422)
 		video->color_space = COLOR_YCBCR422;
 	else
 		video->color_space = COLOR_RGB;
@@ -1617,7 +1617,6 @@ static int analogix_dp_create_bridge(struct drm_device *drm_dev,
 				     struct analogix_dp_device *dp)
 {
 	struct drm_bridge *bridge;
-	int ret;
 
 	bridge = devm_kzalloc(drm_dev->dev, sizeof(*bridge), GFP_KERNEL);
 	if (!bridge) {
@@ -1630,13 +1629,7 @@ static int analogix_dp_create_bridge(struct drm_device *drm_dev,
 	bridge->driver_private = dp;
 	bridge->funcs = &analogix_dp_bridge_funcs;
 
-	ret = drm_bridge_attach(dp->encoder, bridge, NULL, 0);
-	if (ret) {
-		DRM_ERROR("failed to attach drm bridge\n");
-		return -EINVAL;
-	}
-
-	return 0;
+	return drm_bridge_attach(dp->encoder, bridge, NULL, 0);
 }
 
 static int analogix_dp_dt_parse_pdata(struct analogix_dp_device *dp)

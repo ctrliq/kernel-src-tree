@@ -343,7 +343,6 @@ void dev_pm_disable_wake_irq_check(struct device *dev, bool cond_disable)
 
 	if (!wirq || !((wirq->status & WAKE_IRQ_DEDICATED_MASK)))
 		return;
-
 	if (cond_disable && (wirq->status & WAKE_IRQ_DEDICATED_REVERSE))
 		return;
 

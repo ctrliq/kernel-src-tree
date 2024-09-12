@@ -1272,6 +1272,12 @@ nfsd4_copy(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	__be32 status;
 	struct nfsd4_copy *async_copy = NULL;
 
+	/* RHEL8 only: deferring inter-copy support to RHEL9 */
+	if (!copy->cp_intra) {
+		status = nfserr_notsupp;
+		goto out;
+	}
+
 	status = nfsd4_verify_copy(rqstp, cstate, &copy->cp_src_stateid,
 				   &copy->file_src, &copy->cp_dst_stateid,
 				   &copy->file_dst);

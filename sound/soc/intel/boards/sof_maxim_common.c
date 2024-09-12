@@ -199,7 +199,7 @@ struct snd_soc_dai_link_component max_98390_components[] = {
 		.dai_name = MAX_98390_CODEC_DAI,
 	},
 };
-EXPORT_SYMBOL_NS(max_98390_components, SND_SOC_INTEL_SOF_MAXIM_COMMON);
+EXPORT_SYMBOL(max_98390_components);
 
 struct snd_soc_dai_link_component max_98390_4spk_components[] = {
 	{
@@ -219,7 +219,7 @@ struct snd_soc_dai_link_component max_98390_4spk_components[] = {
 		.dai_name = MAX_98390_CODEC_DAI,
 	},
 };
-EXPORT_SYMBOL_NS(max_98390_4spk_components, SND_SOC_INTEL_SOF_MAXIM_COMMON);
+EXPORT_SYMBOL(max_98390_4spk_components);
 
 static int max_98390_hw_params(struct snd_pcm_substream *substream,
 			       struct snd_pcm_hw_params *params)
@@ -294,12 +294,12 @@ int max_98390_spk_codec_init(struct snd_soc_pcm_runtime *rtd)
 	}
 	return ret;
 }
-EXPORT_SYMBOL_NS(max_98390_spk_codec_init, SND_SOC_INTEL_SOF_MAXIM_COMMON);
+EXPORT_SYMBOL(max_98390_spk_codec_init);
 
 const struct snd_soc_ops max_98390_ops = {
 	.hw_params = max_98390_hw_params,
 };
-EXPORT_SYMBOL_NS(max_98390_ops, SND_SOC_INTEL_SOF_MAXIM_COMMON);
+EXPORT_SYMBOL(max_98390_ops);
 
 void max_98390_set_codec_conf(struct snd_soc_card *card, int ch)
 {
@@ -311,7 +311,7 @@ void max_98390_set_codec_conf(struct snd_soc_card *card, int ch)
 		card->num_configs = ARRAY_SIZE(max_98390_codec_conf);
 	}
 }
-EXPORT_SYMBOL_NS(max_98390_set_codec_conf, SND_SOC_INTEL_SOF_MAXIM_COMMON);
+EXPORT_SYMBOL(max_98390_set_codec_conf);
 
 /*
  * Maxim MAX98357A/MAX98360A

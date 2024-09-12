@@ -584,8 +584,8 @@ static void xfrm_get_inner_ipproto(struct sk_buff *skb, struct xfrm_state *x)
 	if (!xo)
 		return;
 
-	if (x->outer_mode.encap == XFRM_MODE_TUNNEL) {
-		switch (x->outer_mode.family) {
+	if (x->outer_mode->encap == XFRM_MODE_TUNNEL) {
+		switch (x->outer_mode->family) {
 		case AF_INET:
 			xo->inner_ipproto = ip_hdr(skb)->protocol;
 			break;

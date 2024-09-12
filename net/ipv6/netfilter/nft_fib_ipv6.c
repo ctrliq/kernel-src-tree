@@ -178,8 +178,7 @@ void nft_fib6_eval(const struct nft_expr *expr, struct nft_regs *regs,
 
 	lookup_flags = nft_fib6_flowi_init(&fl6, priv, pkt, oif, iph);
 
-	if (nft_hook(pkt) == NF_INET_PRE_ROUTING ||
-	    nft_hook(pkt) == NF_INET_INGRESS) {
+	if (nft_hook(pkt) == NF_INET_PRE_ROUTING) {
 		if (nft_fib_is_loopback(pkt->skb, nft_in(pkt)) ||
 		    nft_fib_v6_skip_icmpv6(pkt->skb, pkt->tprot, iph)) {
 			nft_fib_store_result(dest, priv, nft_in(pkt));

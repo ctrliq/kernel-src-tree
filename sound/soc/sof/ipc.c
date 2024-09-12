@@ -17,6 +17,7 @@
 #include "sof-priv.h"
 #include "sof-audio.h"
 #include "ops.h"
+#include "ipc3-ops.h"
 
 typedef void (*ipc_rx_callback)(struct snd_sof_dev *sdev, void *msg_buf);
 
@@ -469,6 +470,7 @@ EXPORT_SYMBOL(snd_sof_ipc_reply);
 
 static void ipc_comp_notification(struct snd_sof_dev *sdev, void *msg_buf)
 {
+	const struct sof_ipc_tplg_ops *tplg_ops = sdev->ipc->ops->tplg;
 	struct sof_ipc_cmd_hdr *hdr = msg_buf;
 	u32 msg_type = hdr->cmd & SOF_CMD_TYPE_MASK;
 
@@ -481,7 +483,8 @@ static void ipc_comp_notification(struct snd_sof_dev *sdev, void *msg_buf)
 		return;
 	}
 
-	snd_sof_control_notify(sdev, msg_buf);
+	if (tplg_ops->control->update)
+		tplg_ops->control->update(sdev, msg_buf);
 }
 
 /* DSP firmware has sent host a message  */
@@ -545,21 +548,24 @@ void snd_sof_ipc_msgs_rx(struct snd_sof_dev *sdev)
 		break;
 	}
 
-	if (rx_callback) {
-		/* read the full message as we have rx handler for it */
-		msg_buf = kmalloc(hdr.size, GFP_KERNEL);
-		if (!msg_buf)
-			return;
+	/* read the full message */
+	msg_buf = kmalloc(hdr.size, GFP_KERNEL);
+	if (!msg_buf)
+		return;
 
-		err = snd_sof_ipc_msg_data(sdev, NULL, msg_buf, hdr.size);
-		if (err < 0)
-			dev_err(sdev->dev, "%s: Failed to read message: %d\n",
-				__func__, err);
-		else
+	err = snd_sof_ipc_msg_data(sdev, NULL, msg_buf, hdr.size);
+	if (err < 0) {
+		dev_err(sdev->dev, "%s: Failed to read message: %d\n", __func__, err);
+	} else {
+		/* Call local handler for the message */
+		if (rx_callback)
 			rx_callback(sdev, msg_buf);
 
-		kfree(msg_buf);
+		/* Notify registered clients */
+		sof_client_ipc_rx_dispatcher(sdev, msg_buf);
 	}
+
+	kfree(msg_buf);
 
 	ipc_log_header(sdev->dev, "ipc rx done", hdr.cmd);
 }
@@ -809,7 +815,7 @@ static int sof_set_get_large_ctrl_data(struct snd_sof_dev *sdev,
 int snd_sof_ipc_set_get_comp_data(struct snd_sof_control *scontrol, bool set)
 {
 	struct snd_soc_component *scomp = scontrol->scomp;
-	struct sof_ipc_ctrl_data *cdata = scontrol->control_data;
+	struct sof_ipc_ctrl_data *cdata = scontrol->ipc_control_data;
 	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(scomp);
 	struct sof_ipc_fw_ready *ready = &sdev->fw_ready;
 	struct sof_ipc_fw_version *v = &ready->version;
@@ -1019,6 +1025,19 @@ struct snd_sof_ipc *snd_sof_ipc_init(struct snd_sof_dev *sdev)
 	msg->ipc_complete = true;
 
 	init_waitqueue_head(&msg->waitq);
+
+	/*
+	 * Use IPC3 ops as it is the only available version now. With the addition of new IPC
+	 * versions, this will need to be modified to use the selected version at runtime.
+	 */
+	ipc->ops = &ipc3_ops;
+
+	/* check for mandatory ops */
+	if (!ipc->ops->pcm || !ipc->ops->tplg || !ipc->ops->tplg->widget ||
+	    !ipc->ops->tplg->control) {
+		dev_err(sdev->dev, "Invalid IPC ops\n");
+		return NULL;
+	}
 
 	return ipc;
 }

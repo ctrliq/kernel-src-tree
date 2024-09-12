@@ -47,11 +47,13 @@
 #include <linux/tick.h>
 #include <trace/events/power.h>
 #include <linux/sched.h>
+#include <linux/sched/smt.h>
 #include <linux/notifier.h>
 #include <linux/cpu.h>
 #include <linux/moduleparam.h>
 #include <asm/cpu_device_id.h>
 #include <asm/intel-family.h>
+#include <asm/nospec-branch.h>
 #include <asm/mwait.h>
 #include <asm/msr.h>
 
@@ -69,7 +71,12 @@ static unsigned int preferred_states_mask;
 static struct cpuidle_device __percpu *intel_idle_cpuidle_devices;
 
 static unsigned long auto_demotion_disable_flags;
-static bool disable_promotion_to_c1e;
+
+static enum {
+	C1E_PROMOTION_PRESERVE,
+	C1E_PROMOTION_ENABLE,
+	C1E_PROMOTION_DISABLE
+} c1e_promotion = C1E_PROMOTION_PRESERVE;
 
 struct idle_cpu {
 	struct cpuidle_state *state_table;
@@ -99,6 +106,12 @@ static unsigned int mwait_substates __initdata;
  * Enable this state by default even if the ACPI _CST does not list it.
  */
 #define CPUIDLE_FLAG_ALWAYS_ENABLE	BIT(15)
+
+/*
+ * Disable IBRS across idle (when KERNEL_IBRS), is exclusive vs IRQ_ENABLE
+ * above.
+ */
+#define CPUIDLE_FLAG_IBRS		BIT(16)
 
 /*
  * MWAIT takes an 8-bit "hint" in EAX "suggesting"
@@ -156,6 +169,24 @@ static __cpuidle int intel_idle_irq(struct cpuidle_device *dev,
 	 * to keep the hardirqs state correct.
 	 */
 	local_irq_disable();
+
+	return ret;
+}
+
+static __cpuidle int intel_idle_ibrs(struct cpuidle_device *dev,
+				     struct cpuidle_driver *drv, int index)
+{
+	bool smt_active = sched_smt_active();
+	u64 spec_ctrl = spec_ctrl_current();
+	int ret;
+
+	if (smt_active)
+		wrmsrl(MSR_IA32_SPEC_CTRL, 0);
+
+	ret = __intel_idle(dev, drv, index);
+
+	if (smt_active)
+		wrmsrl(MSR_IA32_SPEC_CTRL, spec_ctrl);
 
 	return ret;
 }
@@ -681,7 +712,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
 	{
 		.name = "C6",
 		.desc = "MWAIT 0x20",
-		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
 		.exit_latency = 85,
 		.target_residency = 200,
 		.enter = &intel_idle,
@@ -689,7 +720,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
 	{
 		.name = "C7s",
 		.desc = "MWAIT 0x33",
-		.flags = MWAIT2flg(0x33) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.flags = MWAIT2flg(0x33) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
 		.exit_latency = 124,
 		.target_residency = 800,
 		.enter = &intel_idle,
@@ -697,7 +728,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
 	{
 		.name = "C8",
 		.desc = "MWAIT 0x40",
-		.flags = MWAIT2flg(0x40) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.flags = MWAIT2flg(0x40) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
 		.exit_latency = 200,
 		.target_residency = 800,
 		.enter = &intel_idle,
@@ -705,7 +736,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
 	{
 		.name = "C9",
 		.desc = "MWAIT 0x50",
-		.flags = MWAIT2flg(0x50) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.flags = MWAIT2flg(0x50) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
 		.exit_latency = 480,
 		.target_residency = 5000,
 		.enter = &intel_idle,
@@ -713,7 +744,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
 	{
 		.name = "C10",
 		.desc = "MWAIT 0x60",
-		.flags = MWAIT2flg(0x60) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.flags = MWAIT2flg(0x60) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
 		.exit_latency = 890,
 		.target_residency = 5000,
 		.enter = &intel_idle,
@@ -742,7 +773,7 @@ static struct cpuidle_state skx_cstates[] __initdata = {
 	{
 		.name = "C6",
 		.desc = "MWAIT 0x20",
-		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED,
+		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
 		.exit_latency = 133,
 		.target_residency = 600,
 		.enter = &intel_idle,
@@ -1529,8 +1560,6 @@ static inline void intel_idle_init_cstates_acpi(struct cpuidle_driver *drv) { }
 static inline bool intel_idle_off_by_default(u32 mwait_hint) { return false; }
 #endif /* !CONFIG_ACPI_PROCESSOR_CSTATE */
 
-static void c1e_promotion_enable(void);
-
 /**
  * ivt_idle_state_table_update - Tune the idle states table for Ivy Town.
  *
@@ -1735,8 +1764,7 @@ static void __init spr_idle_state_table_update(void)
 		spr_cstates[1].flags &= ~CPUIDLE_FLAG_UNUSABLE;
 
 		/* Enable C1E using the "C1E promotion" bit. */
-		c1e_promotion_enable();
-		disable_promotion_to_c1e = false;
+		c1e_promotion = C1E_PROMOTION_ENABLE;
 	}
 
 	/*
@@ -1822,6 +1850,12 @@ static void __init intel_idle_init_cstates_icpu(struct cpuidle_driver *drv)
 
 		if (cpuidle_state_table[cstate].flags & CPUIDLE_FLAG_IRQ_ENABLE)
 			drv->states[drv->state_count].enter = intel_idle_irq;
+
+		if (cpu_feature_enabled(X86_FEATURE_KERNEL_IBRS) &&
+		    cpuidle_state_table[cstate].flags & CPUIDLE_FLAG_IBRS) {
+			WARN_ON_ONCE(cpuidle_state_table[cstate].flags & CPUIDLE_FLAG_IRQ_ENABLE);
+			drv->states[drv->state_count].enter = intel_idle_ibrs;
+		}
 
 		if ((disabled_states_mask & BIT(drv->state_count)) ||
 		    ((icpu->use_acpi && force_use_acpi) &&
@@ -1909,7 +1943,9 @@ static int intel_idle_cpu_init(unsigned int cpu)
 	if (auto_demotion_disable_flags)
 		auto_demotion_disable();
 
-	if (disable_promotion_to_c1e)
+	if (c1e_promotion == C1E_PROMOTION_ENABLE)
+		c1e_promotion_enable();
+	else if (c1e_promotion == C1E_PROMOTION_DISABLE)
 		c1e_promotion_disable();
 
 	return 0;
@@ -1988,7 +2024,8 @@ static int __init intel_idle_init(void)
 	if (icpu) {
 		cpuidle_state_table = icpu->state_table;
 		auto_demotion_disable_flags = icpu->auto_demotion_disable_flags;
-		disable_promotion_to_c1e = icpu->disable_promotion_to_c1e;
+		if (icpu->disable_promotion_to_c1e)
+			c1e_promotion = C1E_PROMOTION_DISABLE;
 		if (icpu->use_acpi && force_use_acpi)
 			intel_idle_acpi_cst_extract();
 	} else if (!intel_idle_acpi_cst_extract()) {

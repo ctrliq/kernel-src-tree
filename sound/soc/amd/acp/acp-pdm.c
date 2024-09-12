@@ -187,7 +187,7 @@ const struct snd_soc_dai_ops acp_dmic_dai_ops = {
 	.startup	= acp_dmic_dai_startup,
 	.shutdown	= acp_dmic_dai_shutdown,
 };
-EXPORT_SYMBOL_NS_GPL(acp_dmic_dai_ops, SND_SOC_ACP_COMMON);
+EXPORT_SYMBOL_GPL(acp_dmic_dai_ops);
 
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_ALIAS(DRV_NAME);

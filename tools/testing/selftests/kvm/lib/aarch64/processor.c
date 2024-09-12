@@ -249,10 +249,18 @@ void aarch64_vcpu_setup(struct kvm_vm *vm, uint32_t vcpuid, struct kvm_vcpu_init
 	case VM_MODE_P52V48_64K:
 	case VM_MODE_P48V48_64K:
 	case VM_MODE_P40V48_64K:
+	case VM_MODE_P36V48_64K:
 		tcr_el1 |= 1ul << 14; /* TG0 = 64KB */
+		break;
+	case VM_MODE_P48V48_16K:
+	case VM_MODE_P40V48_16K:
+	case VM_MODE_P36V48_16K:
+	case VM_MODE_P36V47_16K:
+		tcr_el1 |= 2ul << 14; /* TG0 = 16KB */
 		break;
 	case VM_MODE_P48V48_4K:
 	case VM_MODE_P40V48_4K:
+	case VM_MODE_P36V48_4K:
 		tcr_el1 |= 0ul << 14; /* TG0 = 4KB */
 		break;
 	default:
@@ -265,12 +273,20 @@ void aarch64_vcpu_setup(struct kvm_vm *vm, uint32_t vcpuid, struct kvm_vcpu_init
 		tcr_el1 |= 6ul << 32; /* IPS = 52 bits */
 		break;
 	case VM_MODE_P48V48_4K:
+	case VM_MODE_P48V48_16K:
 	case VM_MODE_P48V48_64K:
 		tcr_el1 |= 5ul << 32; /* IPS = 48 bits */
 		break;
 	case VM_MODE_P40V48_4K:
+	case VM_MODE_P40V48_16K:
 	case VM_MODE_P40V48_64K:
 		tcr_el1 |= 2ul << 32; /* IPS = 40 bits */
+		break;
+	case VM_MODE_P36V48_4K:
+	case VM_MODE_P36V48_16K:
+	case VM_MODE_P36V48_64K:
+	case VM_MODE_P36V47_16K:
+		tcr_el1 |= 1ul << 32; /* IPS = 36 bits */
 		break;
 	default:
 		TEST_FAIL("Unknown guest mode, mode: 0x%x", vm->mode);

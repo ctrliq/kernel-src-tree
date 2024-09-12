@@ -676,7 +676,7 @@ EXPORT_SYMBOL_GPL(devres_release_group);
 
 /*
  * Custom devres actions allow inserting a simple function call
- * into the teadown sequence.
+ * into the teardown sequence.
  */
 
 struct action_devres {

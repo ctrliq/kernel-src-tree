@@ -16,8 +16,8 @@
 #include <linux/dmi.h>
 #include <linux/dma-map-ops.h>
 #include <linux/platform_data/x86/apple.h>
-
 #include <asm/pgtable.h>
+#include <linux/crc32.h>
 
 #include "internal.h"
 
@@ -655,6 +655,19 @@ static int acpi_tie_acpi_dev(struct acpi_device *adev)
 	return 0;
 }
 
+static void acpi_store_pld_crc(struct acpi_device *adev)
+{
+	struct acpi_pld_info *pld;
+	acpi_status status;
+
+	status = acpi_get_physical_device_location(adev->handle, &pld);
+	if (ACPI_FAILURE(status))
+		return;
+
+	adev->pld_crc = crc32(~0, pld, sizeof(*pld));
+	ACPI_FREE(pld);
+}
+
 static int __acpi_device_add(struct acpi_device *device,
 			     void (*release)(struct device *))
 {
@@ -702,6 +715,8 @@ static int __acpi_device_add(struct acpi_device *device,
 
 	if (device->wakeup.flags.valid)
 		list_add_tail(&device->wakeup_list, &acpi_wakeup_device_list);
+
+	acpi_store_pld_crc(device);
 
 	mutex_unlock(&acpi_device_lock);
 
@@ -1637,17 +1652,22 @@ static bool acpi_device_enumeration_by_parent(struct acpi_device *device)
 	bool is_serial_bus_slave = false;
 	static const struct acpi_device_id ignore_serial_bus_ids[] = {
 	/*
-	 * These devices have multiple I2cSerialBus resources and an i2c-client
-	 * must be instantiated for each, each with its own i2c_device_id.
-	 * Normally we only instantiate an i2c-client for the first resource,
-	 * using the ACPI HID as id. These special cases are handled by the
-	 * drivers/platform/x86/i2c-multi-instantiate.c driver, which knows
-	 * which i2c_device_id to use for each resource.
+	 * These devices have multiple SerialBus resources and a client
+	 * device must be instantiated for each of them, each with
+	 * its own device id.
+	 * Normally we only instantiate one client device for the first
+	 * resource, using the ACPI HID as id. These special cases are handled
+	 * by the drivers/platform/x86/serial-multi-instantiate.c driver, which
+	 * knows which client device id to use for each resource.
 	 */
 		{"BSG1160", },
 		{"BSG2150", },
+		{"CSC3551", },
 		{"INT33FE", },
 		{"INT3515", },
+		/* Non-conforming _HID for Cirrus Logic already released */
+		{"CLSA0100", },
+		{"CLSA0101", },
 	/*
 	 * HIDs of device with an UartSerialBusV2 resource for which userspace
 	 * expects a regular tty cdev to be created (instead of the in kernel

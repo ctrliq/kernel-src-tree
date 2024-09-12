@@ -94,7 +94,7 @@ int event_spkr_handler(struct snd_soc_dapm_widget *w,
 	}
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(event_spkr_handler, SND_SOC_AMD_MACH);
+EXPORT_SYMBOL_GPL(event_spkr_handler);
 
 /* Define card ops for RT5682 CODEC */
 static int acp_card_rt5682_init(struct snd_soc_pcm_runtime *rtd)

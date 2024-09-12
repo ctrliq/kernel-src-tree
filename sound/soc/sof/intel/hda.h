@@ -16,6 +16,8 @@
 #include <sound/compress_driver.h>
 #include <sound/hda_codec.h>
 #include <sound/hdaudio_ext.h>
+#include "../sof-client-probes.h"
+#include "../sof-audio.h"
 #include "shim.h"
 
 /* PCI registers */
@@ -351,13 +353,7 @@
 
 /* Number of DAIs */
 #if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
-
-#if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA_PROBES)
-#define SOF_SKL_NUM_DAIS		16
-#else
 #define SOF_SKL_NUM_DAIS		15
-#endif
-
 #else
 #define SOF_SKL_NUM_DAIS		8
 #endif
@@ -579,29 +575,6 @@ int hda_set_stream_data_offset(struct snd_sof_dev *sdev,
 			       struct snd_pcm_substream *substream,
 			       size_t posn_offset);
 
-#if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA_PROBES)
-/*
- * Probe Compress Operations.
- */
-int hda_probe_compr_assign(struct snd_sof_dev *sdev,
-			   struct snd_compr_stream *cstream,
-			   struct snd_soc_dai *dai);
-int hda_probe_compr_free(struct snd_sof_dev *sdev,
-			 struct snd_compr_stream *cstream,
-			 struct snd_soc_dai *dai);
-int hda_probe_compr_set_params(struct snd_sof_dev *sdev,
-			       struct snd_compr_stream *cstream,
-			       struct snd_compr_params *params,
-			       struct snd_soc_dai *dai);
-int hda_probe_compr_trigger(struct snd_sof_dev *sdev,
-			    struct snd_compr_stream *cstream, int cmd,
-			    struct snd_soc_dai *dai);
-int hda_probe_compr_pointer(struct snd_sof_dev *sdev,
-			    struct snd_compr_stream *cstream,
-			    struct snd_compr_tstamp *tstamp,
-			    struct snd_soc_dai *dai);
-#endif
-
 /*
  * DSP IPC Operations.
  */
@@ -733,6 +706,25 @@ extern const struct sof_intel_dsp_desc ehl_chip_info;
 extern const struct sof_intel_dsp_desc jsl_chip_info;
 extern const struct sof_intel_dsp_desc adls_chip_info;
 
+/* Probes support */
+#if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA_PROBES)
+int hda_probes_register(struct snd_sof_dev *sdev);
+void hda_probes_unregister(struct snd_sof_dev *sdev);
+#else
+static inline int hda_probes_register(struct snd_sof_dev *sdev)
+{
+	return 0;
+}
+
+static inline void hda_probes_unregister(struct snd_sof_dev *sdev)
+{
+}
+#endif /* CONFIG_SND_SOC_SOF_HDA_PROBES */
+
+/* SOF client registration for HDA platforms */
+int hda_register_clients(struct snd_sof_dev *sdev);
+void hda_unregister_clients(struct snd_sof_dev *sdev);
+
 /* machine driver select */
 struct snd_soc_acpi_mach *hda_machine_select(struct snd_sof_dev *sdev);
 void hda_set_mach_params(struct snd_soc_acpi_mach *mach,
@@ -743,8 +735,10 @@ int hda_pci_intel_probe(struct pci_dev *pci, const struct pci_device_id *pci_id)
 
 struct snd_sof_dai;
 struct sof_ipc_dai_config;
-int hda_ctrl_dai_widget_setup(struct snd_soc_dapm_widget *w);
-int hda_ctrl_dai_widget_free(struct snd_soc_dapm_widget *w);
+int hda_ctrl_dai_widget_setup(struct snd_soc_dapm_widget *w, unsigned int quirk_flags,
+			      struct snd_sof_dai_config_data *data);
+int hda_ctrl_dai_widget_free(struct snd_soc_dapm_widget *w, unsigned int quirk_flags,
+			     struct snd_sof_dai_config_data *data);
 
 #define SOF_HDA_POSITION_QUIRK_USE_SKYLAKE_LEGACY	(0) /* previous implementation */
 #define SOF_HDA_POSITION_QUIRK_USE_DPIB_REGISTERS	(1) /* recommended if VC0 only */

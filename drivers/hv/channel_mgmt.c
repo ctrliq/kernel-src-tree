@@ -33,6 +33,7 @@
 #include <linux/cpu.h>
 #include <linux/hyperv.h>
 #include <asm/mshyperv.h>
+#include <linux/sched/isolation.h>
 
 #include "hyperv_vmbus.h"
 
@@ -472,7 +473,7 @@ void hv_process_channel_removal(struct vmbus_channel *channel)
 	 * init_vp_index() can (re-)use the CPU.
 	 */
 	if (hv_is_perf_channel(channel))
-		hv_clear_alloced_cpu(channel->target_cpu);
+		hv_clear_allocated_cpu(channel->target_cpu);
 
 	/*
 	 * Upon suspend, an in-use hv_sock channel is marked as "rescinded" and
@@ -740,21 +741,25 @@ static void init_vp_index(struct vmbus_channel *channel)
 	bool perf_chn = hv_is_perf_channel(channel);
 	u32 i, ncpu = num_online_cpus();
 	cpumask_var_t available_mask;
-	struct cpumask *alloced_mask;
+	struct cpumask *allocated_mask;
+	const struct cpumask *hk_mask = housekeeping_cpumask(HK_FLAG_MANAGED_IRQ);
 	u32 target_cpu = 0;
 	int numa_node;
 
 	if (!perf_chn ||
-	    !alloc_cpumask_var(&available_mask, GFP_KERNEL)) {
+	    !alloc_cpumask_var(&available_mask, GFP_KERNEL) ||
+	    cpumask_empty(hk_mask)) {
 		/*
 		 * If the channel is not a performance critical
 		 * channel, bind it to VMBUS_CONNECT_CPU.
 		 * In case alloc_cpumask_var() fails, bind it to
 		 * VMBUS_CONNECT_CPU.
+		 * If all the cpus are isolated, bind it to
+		 * VMBUS_CONNECT_CPU.
 		 */
 		channel->target_cpu = VMBUS_CONNECT_CPU;
 		if (perf_chn)
-			hv_set_alloced_cpu(VMBUS_CONNECT_CPU);
+			hv_set_allocated_cpu(VMBUS_CONNECT_CPU);
 		return;
 	}
 
@@ -769,22 +774,23 @@ static void init_vp_index(struct vmbus_channel *channel)
 				continue;
 			break;
 		}
-		alloced_mask = &hv_context.hv_numa_map[numa_node];
+		allocated_mask = &hv_context.hv_numa_map[numa_node];
 
-		if (cpumask_weight(alloced_mask) ==
-		    cpumask_weight(cpumask_of_node(numa_node))) {
+retry:
+		cpumask_xor(available_mask, allocated_mask, cpumask_of_node(numa_node));
+		cpumask_and(available_mask, available_mask, hk_mask);
+
+		if (cpumask_empty(available_mask)) {
 			/*
 			 * We have cycled through all the CPUs in the node;
-			 * reset the alloced map.
+			 * reset the allocated map.
 			 */
-			cpumask_clear(alloced_mask);
+			cpumask_clear(allocated_mask);
+			goto retry;
 		}
 
-		cpumask_xor(available_mask, alloced_mask,
-			    cpumask_of_node(numa_node));
-
 		target_cpu = cpumask_first(available_mask);
-		cpumask_set_cpu(target_cpu, alloced_mask);
+		cpumask_set_cpu(target_cpu, allocated_mask);
 
 		if (channel->offermsg.offer.sub_channel_index >= ncpu ||
 		    i > ncpu || !hv_cpuself_used(target_cpu, channel))

@@ -43,7 +43,7 @@ struct flowi_common {
 	struct flowi_tunnel flowic_tun_key;
 	kuid_t  flowic_uid;
 
-	RH_KABI_RESERVE(1)
+	RH_KABI_USE(1, __u32	flowic_multipath_hash)
 	RH_KABI_RESERVE(2)
 };
 
@@ -83,6 +83,7 @@ struct flowi4 {
 #define flowi4_secid		__fl_common.flowic_secid
 #define flowi4_tun_key		__fl_common.flowic_tun_key
 #define flowi4_uid		__fl_common.flowic_uid
+#define flowi4_multipath_hash	__fl_common.flowic_multipath_hash
 
 	/* (saddr,daddr) must be grouped, same order as in IP header */
 	__be32			saddr;

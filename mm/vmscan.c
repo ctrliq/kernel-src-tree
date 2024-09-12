@@ -173,6 +173,16 @@ struct scan_control {
  * From 0 .. 200.  Higher means more swappy.
  */
 int vm_swappiness = 60;
+
+/*
+ * RHEL-Only: systemd runs everything in cgroups, so the per-cgroup swappiness
+ * creates inconsistant swap behavior across the system... additionally a race
+ * between systemd-sysctl.service and the creation of these cgroups causes all
+ * these cgroups to have a default of 60, despite the sysctl value at boot.
+ *
+ * Adding the force_cgroup_v2_swappiness tuneable turns off per-cgroup swappiness
+ */
+int force_cgroup_v2_swappiness __read_mostly = 0; 
 /*
  * The total number of pages which are beyond the high watermark within all
  * zones.

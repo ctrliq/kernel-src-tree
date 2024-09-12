@@ -425,9 +425,7 @@ int dev_ioctl(struct net *net, unsigned int cmd, struct ifreq *ifr, bool *need_c
 
 	case SIOCETHTOOL:
 		dev_load(net, ifr->ifr_name);
-		rtnl_lock();
 		ret = dev_ethtool(net, ifr);
-		rtnl_unlock();
 		if (colon)
 			*colon = ':';
 		return ret;

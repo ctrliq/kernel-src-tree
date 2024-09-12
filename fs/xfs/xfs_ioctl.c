@@ -650,8 +650,6 @@ xfs_ioc_space(
 	if (xfs_is_always_cow_inode(ip))
 		return -EOPNOTSUPP;
 
-	if (filp->f_flags & O_DSYNC)
-		flags |= XFS_PREALLOC_SYNC;
 	if (filp->f_mode & FMODE_NOCMTIME)
 		flags |= XFS_PREALLOC_INVISIBLE;
 
@@ -699,6 +697,11 @@ xfs_ioc_space(
 		goto out_unlock;
 
 	error = xfs_update_prealloc_flags(ip, flags);
+	if (error)
+		goto out_unlock;
+
+	if (filp->f_flags & O_DSYNC)
+		error = xfs_log_force_inode(ip);
 
 out_unlock:
 	xfs_iunlock(ip, iolock);

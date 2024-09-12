@@ -200,6 +200,7 @@ static int imx8_probe(struct snd_sof_dev *sdev)
 	if (!priv->clks)
 		return -ENOMEM;
 
+	sdev->num_cores = 1;
 	sdev->pdata->hw_pdata = priv;
 	priv->dev = sdev->dev;
 	priv->sdev = sdev;

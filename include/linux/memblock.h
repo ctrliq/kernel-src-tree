@@ -361,6 +361,10 @@ phys_addr_t memblock_phys_alloc_nid(phys_addr_t size, phys_addr_t align, int nid
 phys_addr_t memblock_phys_alloc_try_nid(phys_addr_t size, phys_addr_t align, int nid);
 
 phys_addr_t memblock_phys_alloc(phys_addr_t size, phys_addr_t align);
+phys_addr_t memblock_alloc_range_nid(phys_addr_t size,
+				      phys_addr_t align, phys_addr_t start,
+				      phys_addr_t end, int nid,
+				      enum memblock_flags flags);
 
 void *memblock_alloc_try_nid_raw(phys_addr_t size, phys_addr_t align,
 				 phys_addr_t min_addr, phys_addr_t max_addr,

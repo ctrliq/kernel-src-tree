@@ -365,22 +365,6 @@ struct mlx5_core_sig_ctx {
 	u32			sigerr_count;
 };
 
-enum {
-	MLX5_MKEY_MR = 1,
-	MLX5_MKEY_MW,
-	MLX5_MKEY_INDIRECT_DEVX,
-};
-
-struct mlx5_core_mkey {
-	u64			iova;
-	u64			size;
-	u32			key;
-	u32			pd;
-	u32			type;
-	struct wait_queue_head wait;
-	refcount_t usecount;
-};
-
 #define MLX5_24BIT_MASK		((1 << 24) - 1)
 
 enum mlx5_res_type {
@@ -567,6 +551,15 @@ struct mlx5_adev {
 	int idx;
 };
 
+struct mlx5_debugfs_entries {
+	struct dentry *dbg_root;
+	struct dentry *qp_debugfs;
+	struct dentry *eq_debugfs;
+	struct dentry *cq_debugfs;
+	struct dentry *cmdif_debugfs;
+	struct dentry *pages_debugfs;
+};
+
 struct mlx5_ft_pool;
 struct mlx5_priv {
 	/* IRQ table valid only for real pci devices PF or VF */
@@ -577,21 +570,19 @@ struct mlx5_priv {
 	struct mlx5_nb          pg_nb;
 	struct workqueue_struct *pg_wq;
 	struct xarray           page_root_xa;
-	int			fw_pages;
+	u32			fw_pages;
 	atomic_t		reg_pages;
 	struct list_head	free_list;
-	int			vfs_pages;
-	int			host_pf_pages;
+	u32			vfs_pages;
+	u32			host_pf_pages;
+	u32			fw_pages_alloc_failed;
+	u32			give_pages_dropped;
+	u32			reclaim_pages_discard;
 
 	struct mlx5_core_health health;
 	struct list_head	traps;
 
-	/* start: qp staff */
-	struct dentry	       *qp_debugfs;
-	struct dentry	       *eq_debugfs;
-	struct dentry	       *cq_debugfs;
-	struct dentry	       *cmdif_debugfs;
-	/* end: qp staff */
+	struct mlx5_debugfs_entries dbg;
 
 	/* start: alloc staff */
 	/* protect buffer allocation according to numa node */
@@ -601,7 +592,6 @@ struct mlx5_priv {
 	struct mutex            pgdir_mutex;
 	struct list_head        pgdir_list;
 	/* end: alloc staff */
-	struct dentry	       *dbg_root;
 
 	struct list_head        ctx_list;
 	spinlock_t              ctx_lock;
@@ -666,11 +656,11 @@ struct mlx5e_resources {
 	struct mlx5e_hw_objs {
 		u32                        pdn;
 		struct mlx5_td             td;
-		struct mlx5_core_mkey      mkey;
+		u32			   mkey;
 		struct mlx5_sq_bfreg       bfreg;
 	} hw_objs;
-	struct net_device *uplink_netdev;
 	struct devlink_port dl_port;
+	struct net_device *uplink_netdev;
 };
 
 enum mlx5_sw_icm_type {
@@ -807,6 +797,10 @@ struct mlx5_db {
 	}			u;
 	dma_addr_t		dma;
 	int			index;
+};
+
+enum {
+	MLX5_COMP_EQ_SIZE = 1024,
 };
 
 enum {
@@ -1022,19 +1016,19 @@ struct mlx5_cmd_mailbox *mlx5_alloc_cmd_mailbox_chain(struct mlx5_core_dev *dev,
 						      gfp_t flags, int npages);
 void mlx5_free_cmd_mailbox_chain(struct mlx5_core_dev *dev,
 				 struct mlx5_cmd_mailbox *head);
-int mlx5_core_create_mkey(struct mlx5_core_dev *dev,
-			  struct mlx5_core_mkey *mkey,
-			  u32 *in, int inlen);
-int mlx5_core_destroy_mkey(struct mlx5_core_dev *dev,
-			   struct mlx5_core_mkey *mkey);
-int mlx5_core_query_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mkey *mkey,
-			 u32 *out, int outlen);
+int mlx5_core_create_mkey(struct mlx5_core_dev *dev, u32 *mkey, u32 *in,
+			  int inlen);
+int mlx5_core_destroy_mkey(struct mlx5_core_dev *dev, u32 mkey);
+int mlx5_core_query_mkey(struct mlx5_core_dev *dev, u32 mkey, u32 *out,
+			 int outlen);
 int mlx5_core_alloc_pd(struct mlx5_core_dev *dev, u32 *pdn);
 int mlx5_core_dealloc_pd(struct mlx5_core_dev *dev, u32 pdn);
 int mlx5_pagealloc_init(struct mlx5_core_dev *dev);
 void mlx5_pagealloc_cleanup(struct mlx5_core_dev *dev);
 void mlx5_pagealloc_start(struct mlx5_core_dev *dev);
 void mlx5_pagealloc_stop(struct mlx5_core_dev *dev);
+void mlx5_pages_debugfs_init(struct mlx5_core_dev *dev);
+void mlx5_pages_debugfs_cleanup(struct mlx5_core_dev *dev);
 void mlx5_core_req_pages_handler(struct mlx5_core_dev *dev, u16 func_id,
 				 s32 npages, bool ec_function);
 int mlx5_satisfy_startup_pages(struct mlx5_core_dev *dev, int boot);
@@ -1048,6 +1042,7 @@ int mlx5_vector2eqn(struct mlx5_core_dev *dev, int vector, int *eqn);
 int mlx5_core_attach_mcg(struct mlx5_core_dev *dev, union ib_gid *mgid, u32 qpn);
 int mlx5_core_detach_mcg(struct mlx5_core_dev *dev, union ib_gid *mgid, u32 qpn);
 
+struct dentry *mlx5_debugfs_get_dev_root(struct mlx5_core_dev *dev);
 void mlx5_qp_debugfs_init(struct mlx5_core_dev *dev);
 void mlx5_qp_debugfs_cleanup(struct mlx5_core_dev *dev);
 int mlx5_access_reg(struct mlx5_core_dev *dev, void *data_in, int size_in,

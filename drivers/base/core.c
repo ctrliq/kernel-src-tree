@@ -4753,6 +4753,12 @@ int device_match_acpi_dev(struct device *dev, const void *adev)
 }
 EXPORT_SYMBOL(device_match_acpi_dev);
 
+int device_match_acpi_handle(struct device *dev, const void *handle)
+{
+	return ACPI_HANDLE(dev) == handle;
+}
+EXPORT_SYMBOL(device_match_acpi_handle);
+
 void device_set_node(struct device *dev, struct fwnode_handle *fwnode)
 {
 	dev->fwnode = fwnode;

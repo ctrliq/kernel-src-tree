@@ -80,6 +80,11 @@ struct page_pool;
 				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
 
 #define MLX5E_RX_MAX_HEAD (256)
+#define MLX5E_SHAMPO_LOG_MAX_HEADER_ENTRY_SIZE (9)
+#define MLX5E_SHAMPO_WQ_HEADER_PER_PAGE (PAGE_SIZE >> MLX5E_SHAMPO_LOG_MAX_HEADER_ENTRY_SIZE)
+#define MLX5E_SHAMPO_WQ_BASE_HEAD_ENTRY_SIZE (64)
+#define MLX5E_SHAMPO_WQ_RESRV_SIZE (64 * 1024)
+#define MLX5E_SHAMPO_WQ_BASE_RESRV_SIZE (4096)
 
 #define MLX5_MPWRQ_MIN_LOG_STRIDE_SZ(mdev) \
 	(6 + MLX5_CAP_GEN(mdev, cache_line_128byte)) /* HW restriction */
@@ -169,7 +174,8 @@ struct page_pool;
 	ALIGN_DOWN(MLX5E_KLM_MAX_ENTRIES_PER_WQE(wqe_size), MLX5_UMR_KLM_ALIGNMENT)
 
 #define MLX5E_MAX_KLM_PER_WQE(mdev) \
-	MLX5E_KLM_ENTRIES_PER_WQE(MLX5E_TX_MPW_MAX_NUM_DS << MLX5_MKEY_BSF_OCTO_SIZE)
+	MLX5E_KLM_ENTRIES_PER_WQE(mlx5e_get_sw_max_sq_mpw_wqebbs(mlx5e_get_max_sq_wqebbs(mdev)) \
+				   << MLX5_MKEY_BSF_OCTO_SIZE)
 
 #define MLX5E_MSG_LEVEL			NETIF_MSG_LINK
 
@@ -227,6 +233,22 @@ static inline u16 mlx5e_get_max_sq_wqebbs(struct mlx5_core_dev *mdev)
 		     MLX5_CAP_GEN(mdev, max_wqe_sz_sq) / MLX5_SEND_WQE_BB);
 }
 
+static inline u16 mlx5e_get_sw_max_sq_mpw_wqebbs(u16 max_sq_wqebbs)
+{
+/* The return value will be multiplied by MLX5_SEND_WQEBB_NUM_DS.
+ * Since max_sq_wqebbs may be up to MLX5_SEND_WQE_MAX_WQEBBS == 16,
+ * see mlx5e_get_max_sq_wqebbs(), the multiplication (16 * 4 == 64)
+ * overflows the 6-bit DS field of Ctrl Segment. Use a bound lower
+ * than MLX5_SEND_WQE_MAX_WQEBBS to let a full-session WQE be
+ * cache-aligned.
+ */
+#if L1_CACHE_BYTES < 128
+	return min_t(u16, max_sq_wqebbs, MLX5_SEND_WQE_MAX_WQEBBS - 1);
+#else
+	return min_t(u16, max_sq_wqebbs, MLX5_SEND_WQE_MAX_WQEBBS - 2);
+#endif
+}
+
 struct mlx5e_tx_wqe {
 	struct mlx5_wqe_ctrl_seg ctrl;
 	struct mlx5_wqe_eth_seg  eth;
@@ -274,6 +296,21 @@ enum mlx5e_priv_flag {
 
 #define MLX5E_GET_PFLAG(params, pflag) (!!((params)->pflags & (BIT(pflag))))
 
+enum packet_merge {
+	MLX5E_PACKET_MERGE_NONE,
+	MLX5E_PACKET_MERGE_LRO,
+	MLX5E_PACKET_MERGE_SHAMPO,
+};
+
+struct mlx5e_packet_merge_param {
+	enum packet_merge type;
+	u32 timeout;
+	struct {
+		u8 match_criteria_type;
+		u8 alignment_granularity;
+	} shampo;
+};
+
 struct mlx5e_params {
 	u8  log_sq_size;
 	u8  rq_wq_type;
@@ -288,16 +325,15 @@ struct mlx5e_params {
 		} channel;
 	} mqprio;
 	bool rx_cqe_compress_def;
+	bool tunneled_offload_en;
 	struct dim_cq_moder rx_cq_moderation;
 	struct dim_cq_moder tx_cq_moderation;
-	bool tunneled_offload_en;
-	bool lro_en;
+	struct mlx5e_packet_merge_param packet_merge;
 	u8  tx_min_inline_mode;
 	bool vlan_strip_disable;
 	bool scatter_fcs_en;
 	bool rx_dim_enabled;
 	bool tx_dim_enabled;
-	u32 packet_merge_timeout;
 	u32 pflags;
 	struct bpf_prog *xdp_prog;
 	struct mlx5e_xsk *xsk;
@@ -319,7 +355,8 @@ enum {
 	MLX5E_RQ_STATE_NO_CSUM_COMPLETE,
 	MLX5E_RQ_STATE_CSUM_FULL, /* cqe_csum_full hw bit is set */
 	MLX5E_RQ_STATE_FPGA_TLS, /* FPGA TLS enabled */
-	MLX5E_RQ_STATE_MINI_CQE_HW_STRIDX /* set when mini_cqe_resp_stride_index cap is used */
+	MLX5E_RQ_STATE_MINI_CQE_HW_STRIDX, /* set when mini_cqe_resp_stride_index cap is used */
+	MLX5E_RQ_STATE_SHAMPO, /* set when SHAMPO cap is used */
 };
 
 struct mlx5e_cq {
@@ -418,6 +455,7 @@ struct mlx5e_txqsq {
 	struct netdev_queue       *txq;
 	u32                        sqn;
 	u16                        stop_room;
+	u16                        max_sq_mpw_wqebbs;
 	u8                         min_inline_mode;
 	struct device             *pdev;
 	__be32                     mkey_be;
@@ -532,6 +570,7 @@ struct mlx5e_xdpsq {
 	struct device             *pdev;
 	__be32                     mkey_be;
 	u16                        stop_room;
+	u16                        max_sq_mpw_wqebbs;
 	u8                         min_inline_mode;
 	unsigned long              state;
 	unsigned int               hw_mtu;
@@ -613,6 +652,7 @@ typedef struct sk_buff *
 			 struct mlx5e_wqe_frag_info *wi, u32 cqe_bcnt);
 typedef bool (*mlx5e_fp_post_rx_wqes)(struct mlx5e_rq *rq);
 typedef void (*mlx5e_fp_dealloc_wqe)(struct mlx5e_rq*, u16);
+typedef void (*mlx5e_fp_shampo_dealloc_hd)(struct mlx5e_rq*, u16, u16, bool);
 
 int mlx5e_rq_set_handlers(struct mlx5e_rq *rq, struct mlx5e_params *params, bool xsk);
 void mlx5e_rq_set_trap_handlers(struct mlx5e_rq *rq, struct mlx5e_params *params);
@@ -632,6 +672,25 @@ struct mlx5e_rq_frags_info {
 	u8 num_frags;
 	u8 log_num_frags;
 	u8 wqe_bulk;
+};
+
+struct mlx5e_shampo_hd {
+	u32 mkey;
+	struct mlx5e_dma_info *info;
+	struct page *last_page;
+	u16 hd_per_wq;
+	u16 hd_per_wqe;
+	unsigned long *bitmap;
+	u16 pi;
+	u16 ci;
+	__be32 key;
+	u64 last_addr;
+};
+
+struct mlx5e_hw_gro_data {
+	struct sk_buff *skb;
+	struct flow_keys fk;
+	int second_ip_id;
 };
 
 struct mlx5e_rq {
@@ -655,6 +714,8 @@ struct mlx5e_rq {
 			u8                     umr_in_progress;
 			u8                     umr_last_bulk;
 			u8                     umr_completed;
+			u8                     min_wqe_bulk;
+			struct mlx5e_shampo_hd *shampo;
 		} mpwqe;
 	};
 	struct {
@@ -673,6 +734,8 @@ struct mlx5e_rq {
 	struct mlx5_clock      *clock;
 	struct mlx5e_icosq    *icosq;
 	struct mlx5e_priv     *priv;
+
+	struct mlx5e_hw_gro_data *hw_gro_data;
 
 	mlx5e_fp_handle_rx_cqe handle_rx_cqe;
 	mlx5e_fp_post_rx_wqes  post_wqes;
@@ -701,7 +764,8 @@ struct mlx5e_rq {
 	u8                     wq_type;
 	u32                    rqn;
 	struct mlx5_core_dev  *mdev;
-	struct mlx5_core_mkey  umr_mkey;
+	struct mlx5e_channel  *channel;
+	u32  umr_mkey;
 	struct mlx5e_dma_info  wqe_overflow;
 
 	/* XDP read-mostly */
@@ -849,8 +913,6 @@ struct mlx5e_priv {
 	/* priv data path fields - start */
 	struct mlx5e_selq selq;
 	struct mlx5e_txqsq **txq2sq;
-	int **channel_tc2realtxq;
-	int port_ptp_tc2realtxq[MLX5E_MAX_NUM_TC];
 #ifdef CONFIG_MLX5_CORE_EN_DCB
 	struct mlx5e_dcbx_dp       dcbx_dp;
 #endif
@@ -893,7 +955,6 @@ struct mlx5e_priv {
 	u16                        drop_rq_q_counter;
 	struct notifier_block      events_nb;
 	struct notifier_block      blocking_events_nb;
-	int                        num_tc_x_num_ch;
 
 	struct udp_tunnel_nic_info nic_info;
 #ifdef CONFIG_MLX5_CORE_EN_DCB
@@ -962,6 +1023,7 @@ void mlx5e_build_ptys2ethtool_map(void);
 
 bool mlx5e_check_fragmented_striding_rq_cap(struct mlx5_core_dev *mdev);
 
+void mlx5e_shampo_dealloc_hd(struct mlx5e_rq *rq, u16 len, u16 start, bool close);
 void mlx5e_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats);
 void mlx5e_fold_sw_stats64(struct mlx5e_priv *priv, struct rtnl_link_stats64 *s);
 
@@ -1014,6 +1076,9 @@ void mlx5e_close_cq(struct mlx5e_cq *cq);
 
 int mlx5e_open_locked(struct net_device *netdev);
 int mlx5e_close_locked(struct net_device *netdev);
+
+void mlx5e_trigger_napi_icosq(struct mlx5e_channel *c);
+void mlx5e_trigger_napi_sched(struct napi_struct *napi);
 
 int mlx5e_open_channels(struct mlx5e_priv *priv,
 			struct mlx5e_channels *chs);

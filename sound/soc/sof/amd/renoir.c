@@ -180,6 +180,5 @@ const struct snd_sof_dsp_ops sof_renoir_ops = {
 };
 EXPORT_SYMBOL(sof_renoir_ops);
 
-MODULE_IMPORT_NS(SND_SOC_SOF_AMD_COMMON);
 MODULE_DESCRIPTION("RENOIR SOF Driver");
 MODULE_LICENSE("Dual BSD/GPL");

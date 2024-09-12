@@ -472,6 +472,12 @@ struct snd_soc_acpi_mach snd_soc_acpi_intel_adl_machines[] = {
 		.drv_name = "adl_rt5682",
 		.sof_tplg_filename = "sof-adl-rt5682.tplg",
 	},
+	/* place amp-only boards in the end of table */
+	{
+		.id = "CSC3541",
+		.drv_name = "adl_cs35l41",
+		.sof_tplg_filename = "sof-adl-cs35l41.tplg",
+	},
 	{},
 };
 EXPORT_SYMBOL_GPL(snd_soc_acpi_intel_adl_machines);
@@ -506,7 +512,6 @@ struct snd_soc_acpi_mach snd_soc_acpi_intel_adl_sdw_machines[] = {
 		.link_mask = 0x7, /* rt1316 on link0 and link1 & rt711 on link2*/
 		.links = adl_sdw_rt711_link2_rt1316_link01,
 		.drv_name = "sof_sdw",
-		.sof_fw_filename = "sof-adl.ri",
 		.sof_tplg_filename = "sof-adl-rt711-l2-rt1316-l01.tplg",
 	},
 	{

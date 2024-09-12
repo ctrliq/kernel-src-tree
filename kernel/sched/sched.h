@@ -80,8 +80,24 @@
 
 #include <trace/events/sched.h>
 
+#define WARN_ONCE_SAFE(condition, format...)	({		\
+	static bool __section(.data.once) __warned;		\
+	int __ret_warn_once = !!(condition);			\
+								\
+	if (unlikely(__ret_warn_once && !__warned)) {		\
+		bool __warn_deferred = irqs_disabled();         \
+		__warned = true;				\
+		if(__warn_deferred)                         	\
+			printk_deferred_enter();		\
+		WARN(1, format);				\
+		if (__warn_deferred)				\
+			printk_deferred_exit();			\
+	}							\
+	unlikely(__ret_warn_once);				\
+})
+
 #ifdef CONFIG_SCHED_DEBUG
-# define SCHED_WARN_ON(x)	WARN_ONCE(x, #x)
+# define SCHED_WARN_ON(x)	WARN_ONCE_SAFE(x, #x)
 #else
 # define SCHED_WARN_ON(x)	({ (void)(x), 0; })
 #endif

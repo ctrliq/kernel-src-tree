@@ -488,6 +488,7 @@ struct pci_dev {
 	RH_KABI_FILL_HOLE(unsigned int	dpc_rp_extensions:1)
 #endif
         RH_KABI_FILL_HOLE(unsigned int  no_command_memory:1)    /* No PCI_COMMAND_MEMORY */
+	RH_KABI_FILL_HOLE(unsigned int	rom_bar_overlap:1)	/* ROM BAR disable broken */
 	pci_dev_flags_t dev_flags;
 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
 
