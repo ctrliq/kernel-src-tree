@@ -1,0 +1,784 @@
+rxrpc: Clean up connection abort
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit a00ce28b1778fa3576575b43bdb17f60ded38b66
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/a00ce28b.failed
+
+Clean up connection abort, using the connection state_lock to gate access
+to change that state, and use an rxrpc_call_completion value to indicate
+the difference between local and remote aborts as these can be pasted
+directly into the call state.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit a00ce28b1778fa3576575b43bdb17f60ded38b66)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/trace/events/rxrpc.h
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/call_object.c
+#	net/rxrpc/conn_event.c
+#	net/rxrpc/output.c
+#	net/rxrpc/proc.c
+diff --cc include/trace/events/rxrpc.h
+index 2a52121d73a0,222d0498d23f..000000000000
+--- a/include/trace/events/rxrpc.h
++++ b/include/trace/events/rxrpc.h
+@@@ -16,44 -16,124 +16,75 @@@
+  /*
+   * Declare tracing information enums and their string mappings for display.
+   */
+ -#define rxrpc_call_poke_traces \
+ -	EM(rxrpc_call_poke_abort,		"Abort")	\
+ -	EM(rxrpc_call_poke_complete,		"Compl")	\
+ -	EM(rxrpc_call_poke_error,		"Error")	\
+ -	EM(rxrpc_call_poke_idle,		"Idle")		\
+ -	EM(rxrpc_call_poke_start,		"Start")	\
+ -	EM(rxrpc_call_poke_timer,		"Timer")	\
+ -	E_(rxrpc_call_poke_timer_now,		"Timer-now")
+ -
+  #define rxrpc_skb_traces \
+ -	EM(rxrpc_skb_eaten_by_unshare,		"ETN unshare  ") \
+ -	EM(rxrpc_skb_eaten_by_unshare_nomem,	"ETN unshar-nm") \
+ -	EM(rxrpc_skb_get_conn_work,		"GET conn-work") \
+ -	EM(rxrpc_skb_get_local_work,		"GET locl-work") \
+ -	EM(rxrpc_skb_get_reject_work,		"GET rej-work ") \
+ -	EM(rxrpc_skb_get_to_recvmsg,		"GET to-recv  ") \
+ -	EM(rxrpc_skb_get_to_recvmsg_oos,	"GET to-recv-o") \
+ -	EM(rxrpc_skb_new_encap_rcv,		"NEW encap-rcv") \
+ -	EM(rxrpc_skb_new_error_report,		"NEW error-rpt") \
+ -	EM(rxrpc_skb_new_jumbo_subpacket,	"NEW jumbo-sub") \
+ -	EM(rxrpc_skb_new_unshared,		"NEW unshared ") \
+ -	EM(rxrpc_skb_put_conn_work,		"PUT conn-work") \
+ -	EM(rxrpc_skb_put_error_report,		"PUT error-rep") \
+ -	EM(rxrpc_skb_put_input,			"PUT input    ") \
+ -	EM(rxrpc_skb_put_jumbo_subpacket,	"PUT jumbo-sub") \
+ -	EM(rxrpc_skb_put_purge,			"PUT purge    ") \
+ -	EM(rxrpc_skb_put_rotate,		"PUT rotate   ") \
+ -	EM(rxrpc_skb_put_unknown,		"PUT unknown  ") \
+ -	EM(rxrpc_skb_see_conn_work,		"SEE conn-work") \
+ -	EM(rxrpc_skb_see_recvmsg,		"SEE recvmsg  ") \
+ -	EM(rxrpc_skb_see_reject,		"SEE reject   ") \
+ -	EM(rxrpc_skb_see_rotate,		"SEE rotate   ") \
+ -	E_(rxrpc_skb_see_version,		"SEE version  ")
+ +	EM(rxrpc_skb_ack,			"ACK") \
+ +	EM(rxrpc_skb_cleaned,			"CLN") \
+ +	EM(rxrpc_skb_cloned_jumbo,		"CLJ") \
+ +	EM(rxrpc_skb_freed,			"FRE") \
+ +	EM(rxrpc_skb_got,			"GOT") \
+ +	EM(rxrpc_skb_lost,			"*L*") \
+ +	EM(rxrpc_skb_new,			"NEW") \
+ +	EM(rxrpc_skb_purged,			"PUR") \
+ +	EM(rxrpc_skb_received,			"RCV") \
+ +	EM(rxrpc_skb_rotated,			"ROT") \
+ +	EM(rxrpc_skb_seen,			"SEE") \
+ +	EM(rxrpc_skb_unshared,			"UNS") \
+ +	E_(rxrpc_skb_unshared_nomem,		"US0")
+  
+  #define rxrpc_local_traces \
+ -	EM(rxrpc_local_free,			"FREE        ") \
+ -	EM(rxrpc_local_get_call,		"GET call    ") \
+ -	EM(rxrpc_local_get_client_conn,		"GET conn-cln") \
+ -	EM(rxrpc_local_get_for_use,		"GET for-use ") \
+ -	EM(rxrpc_local_get_peer,		"GET peer    ") \
+ -	EM(rxrpc_local_get_prealloc_conn,	"GET conn-pre") \
+ -	EM(rxrpc_local_new,			"NEW         ") \
+ -	EM(rxrpc_local_put_bind,		"PUT bind    ") \
+ -	EM(rxrpc_local_put_call,		"PUT call    ") \
+ -	EM(rxrpc_local_put_for_use,		"PUT for-use ") \
+ -	EM(rxrpc_local_put_kill_conn,		"PUT conn-kil") \
+ -	EM(rxrpc_local_put_peer,		"PUT peer    ") \
+ -	EM(rxrpc_local_put_prealloc_conn,	"PUT conn-pre") \
+ -	EM(rxrpc_local_put_release_sock,	"PUT rel-sock") \
+ -	EM(rxrpc_local_stop,			"STOP        ") \
+ -	EM(rxrpc_local_stopped,			"STOPPED     ") \
+ -	EM(rxrpc_local_unuse_bind,		"UNU bind    ") \
+ -	EM(rxrpc_local_unuse_conn_work,		"UNU conn-wrk") \
+ -	EM(rxrpc_local_unuse_peer_keepalive,	"UNU peer-kpa") \
+ -	EM(rxrpc_local_unuse_release_sock,	"UNU rel-sock") \
+ -	EM(rxrpc_local_use_conn_work,		"USE conn-wrk") \
+ -	EM(rxrpc_local_use_lookup,		"USE lookup  ") \
+ -	E_(rxrpc_local_use_peer_keepalive,	"USE peer-kpa")
+ +	EM(rxrpc_local_got,			"GOT") \
+ +	EM(rxrpc_local_new,			"NEW") \
+ +	EM(rxrpc_local_processing,		"PRO") \
+ +	EM(rxrpc_local_put,			"PUT") \
+ +	EM(rxrpc_local_queued,			"QUE") \
+ +	E_(rxrpc_local_tx_ack,			"TAK")
+  
+  #define rxrpc_peer_traces \
+ -	EM(rxrpc_peer_free,			"FREE        ") \
+ -	EM(rxrpc_peer_get_accept,		"GET accept  ") \
+ -	EM(rxrpc_peer_get_activate_call,	"GET act-call") \
+ -	EM(rxrpc_peer_get_bundle,		"GET bundle  ") \
+ -	EM(rxrpc_peer_get_client_conn,		"GET cln-conn") \
+ -	EM(rxrpc_peer_get_input,		"GET input   ") \
+ -	EM(rxrpc_peer_get_input_error,		"GET inpt-err") \
+ -	EM(rxrpc_peer_get_keepalive,		"GET keepaliv") \
+ -	EM(rxrpc_peer_get_lookup_client,	"GET look-cln") \
+ -	EM(rxrpc_peer_get_service_conn,		"GET srv-conn") \
+ -	EM(rxrpc_peer_new_client,		"NEW client  ") \
+ -	EM(rxrpc_peer_new_prealloc,		"NEW prealloc") \
+ -	EM(rxrpc_peer_put_bundle,		"PUT bundle  ") \
+ -	EM(rxrpc_peer_put_call,			"PUT call    ") \
+ -	EM(rxrpc_peer_put_conn,			"PUT conn    ") \
+ -	EM(rxrpc_peer_put_discard_tmp,		"PUT disc-tmp") \
+ -	EM(rxrpc_peer_put_input,		"PUT input   ") \
+ -	EM(rxrpc_peer_put_input_error,		"PUT inpt-err") \
+ -	E_(rxrpc_peer_put_keepalive,		"PUT keepaliv")
+ -
+ -#define rxrpc_bundle_traces \
+ -	EM(rxrpc_bundle_free,			"FREE        ") \
+ -	EM(rxrpc_bundle_get_client_call,	"GET clt-call") \
+ -	EM(rxrpc_bundle_get_client_conn,	"GET clt-conn") \
+ -	EM(rxrpc_bundle_get_service_conn,	"GET svc-conn") \
+ -	EM(rxrpc_bundle_put_conn,		"PUT conn    ") \
+ -	EM(rxrpc_bundle_put_discard,		"PUT discard ") \
+ -	E_(rxrpc_bundle_new,			"NEW         ")
+ +	EM(rxrpc_peer_got,			"GOT") \
+ +	EM(rxrpc_peer_new,			"NEW") \
+ +	EM(rxrpc_peer_processing,		"PRO") \
+ +	E_(rxrpc_peer_put,			"PUT")
+  
+  #define rxrpc_conn_traces \
+++<<<<<<< HEAD
+ +	EM(rxrpc_conn_got,			"GOT") \
+ +	EM(rxrpc_conn_new_client,		"NWc") \
+ +	EM(rxrpc_conn_new_service,		"NWs") \
+ +	EM(rxrpc_conn_put_client,		"PTc") \
+ +	EM(rxrpc_conn_put_service,		"PTs") \
+ +	EM(rxrpc_conn_queued,			"QUE") \
+ +	EM(rxrpc_conn_reap_service,		"RPs") \
+ +	E_(rxrpc_conn_seen,			"SEE")
+++=======
++ 	EM(rxrpc_conn_free,			"FREE        ") \
++ 	EM(rxrpc_conn_get_activate_call,	"GET act-call") \
++ 	EM(rxrpc_conn_get_call_input,		"GET inp-call") \
++ 	EM(rxrpc_conn_get_conn_input,		"GET inp-conn") \
++ 	EM(rxrpc_conn_get_idle,			"GET idle    ") \
++ 	EM(rxrpc_conn_get_poke_abort,		"GET pk-abort") \
++ 	EM(rxrpc_conn_get_poke_timer,		"GET poke    ") \
++ 	EM(rxrpc_conn_get_service_conn,		"GET svc-conn") \
++ 	EM(rxrpc_conn_new_client,		"NEW client  ") \
++ 	EM(rxrpc_conn_new_service,		"NEW service ") \
++ 	EM(rxrpc_conn_put_call,			"PUT call    ") \
++ 	EM(rxrpc_conn_put_call_input,		"PUT inp-call") \
++ 	EM(rxrpc_conn_put_conn_input,		"PUT inp-conn") \
++ 	EM(rxrpc_conn_put_discard,		"PUT discard ") \
++ 	EM(rxrpc_conn_put_discard_idle,		"PUT disc-idl") \
++ 	EM(rxrpc_conn_put_local_dead,		"PUT loc-dead") \
++ 	EM(rxrpc_conn_put_noreuse,		"PUT noreuse ") \
++ 	EM(rxrpc_conn_put_poke,			"PUT poke    ") \
++ 	EM(rxrpc_conn_put_service_reaped,	"PUT svc-reap") \
++ 	EM(rxrpc_conn_put_unbundle,		"PUT unbundle") \
++ 	EM(rxrpc_conn_put_unidle,		"PUT unidle  ") \
++ 	EM(rxrpc_conn_put_work,			"PUT work    ") \
++ 	EM(rxrpc_conn_queue_challenge,		"QUE chall   ") \
++ 	EM(rxrpc_conn_queue_retry_work,		"QUE retry-wk") \
++ 	EM(rxrpc_conn_queue_rx_work,		"QUE rx-work ") \
++ 	EM(rxrpc_conn_see_new_service_conn,	"SEE new-svc ") \
++ 	EM(rxrpc_conn_see_reap_service,		"SEE reap-svc") \
++ 	E_(rxrpc_conn_see_work,			"SEE work    ")
+++>>>>>>> a00ce28b1778 (rxrpc: Clean up connection abort)
+  
+  #define rxrpc_client_traces \
+  	EM(rxrpc_client_activate_chans,		"Activa") \
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,78bd6fb0bc15..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -878,9 -902,21 +877,22 @@@ void rxrpc_clean_up_local_conns(struct 
+  /*
+   * conn_event.c
+   */
+++<<<<<<< HEAD
+++=======
++ void rxrpc_conn_retransmit_call(struct rxrpc_connection *conn, struct sk_buff *skb,
++ 				unsigned int channel);
++ int rxrpc_abort_conn(struct rxrpc_connection *conn, struct sk_buff *skb,
++ 		     s32 abort_code, int err, const char *why);
+++>>>>>>> a00ce28b1778 (rxrpc: Clean up connection abort)
+  void rxrpc_process_connection(struct work_struct *);
+  void rxrpc_process_delayed_final_acks(struct rxrpc_connection *, bool);
+ -int rxrpc_input_conn_packet(struct rxrpc_connection *conn, struct sk_buff *skb);
+ -void rxrpc_input_conn_event(struct rxrpc_connection *conn, struct sk_buff *skb);
+  
++ static inline bool rxrpc_is_conn_aborted(const struct rxrpc_connection *conn)
++ {
++ 	/* Order reading the abort info after the state check. */
++ 	return smp_load_acquire(&conn->state) == RXRPC_CONN_ABORTED;
++ }
++ 
+  /*
+   * conn_object.c
+   */
+@@@ -1009,11 -1063,13 +1021,16 @@@ static inline struct rxrpc_net *rxrpc_n
+  /*
+   * output.c
+   */
+ -int rxrpc_send_ack_packet(struct rxrpc_call *call, struct rxrpc_txbuf *txb);
+ +void rxrpc_transmit_ack_packets(struct rxrpc_local *);
+  int rxrpc_send_abort_packet(struct rxrpc_call *);
+  int rxrpc_send_data_packet(struct rxrpc_call *, struct rxrpc_txbuf *);
+++<<<<<<< HEAD
+ +void rxrpc_reject_packets(struct rxrpc_local *);
+++=======
++ void rxrpc_send_conn_abort(struct rxrpc_connection *conn);
++ void rxrpc_reject_packet(struct rxrpc_local *local, struct sk_buff *skb);
+++>>>>>>> a00ce28b1778 (rxrpc: Clean up connection abort)
+  void rxrpc_send_keepalive(struct rxrpc_peer *);
+ -void rxrpc_transmit_one(struct rxrpc_call *call, struct rxrpc_txbuf *txb);
+  
+  /*
+   * peer_event.c
+diff --cc net/rxrpc/call_object.c
+index ad495d0d21a8,666430182dfd..000000000000
+--- a/net/rxrpc/call_object.c
++++ b/net/rxrpc/call_object.c
+@@@ -405,6 -430,29 +405,32 @@@ void rxrpc_incoming_call(struct rxrpc_s
+  	call->state		= RXRPC_CALL_SERVER_SECURING;
+  	call->cong_tstamp	= skb->tstamp;
+  
+++<<<<<<< HEAD
+++=======
++ 	__set_bit(RXRPC_CALL_EXPOSED, &call->flags);
++ 
++ 	spin_lock(&conn->state_lock);
++ 
++ 	switch (conn->state) {
++ 	case RXRPC_CONN_SERVICE_UNSECURED:
++ 	case RXRPC_CONN_SERVICE_CHALLENGING:
++ 		call->state = RXRPC_CALL_SERVER_SECURING;
++ 		break;
++ 	case RXRPC_CONN_SERVICE:
++ 		call->state = RXRPC_CALL_SERVER_RECV_REQUEST;
++ 		break;
++ 
++ 	case RXRPC_CONN_ABORTED:
++ 		__rxrpc_set_call_completion(call, conn->completion,
++ 					    conn->abort_code, conn->error);
++ 		break;
++ 	default:
++ 		BUG();
++ 	}
++ 
++ 	rxrpc_get_call(call, rxrpc_call_get_io_thread);
++ 
+++>>>>>>> a00ce28b1778 (rxrpc: Clean up connection abort)
+  	/* Set the channel for this call.  We don't get channel_lock as we're
+  	 * only defending against the data_ready handler (which we're called
+  	 * from) and the RESPONSE packet parser (which is only really
+diff --cc net/rxrpc/conn_event.c
+index abf03a5b1d31,753d91a9646f..000000000000
+--- a/net/rxrpc/conn_event.c
++++ b/net/rxrpc/conn_event.c
+@@@ -182,82 -225,6 +225,85 @@@ static void rxrpc_abort_calls(struct rx
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * generate a connection-level abort
+ + */
+ +static int rxrpc_abort_connection(struct rxrpc_connection *conn,
+ +				  int error, u32 abort_code)
+ +{
+ +	struct rxrpc_wire_header whdr;
+ +	struct msghdr msg;
+ +	struct kvec iov[2];
+ +	__be32 word;
+ +	size_t len;
+ +	u32 serial;
+ +	int ret;
+ +
+ +	_enter("%d,,%u,%u", conn->debug_id, error, abort_code);
+ +
+ +	/* generate a connection-level abort */
+ +	spin_lock_bh(&conn->state_lock);
+ +	if (conn->state >= RXRPC_CONN_REMOTELY_ABORTED) {
+ +		spin_unlock_bh(&conn->state_lock);
+ +		_leave(" = 0 [already dead]");
+ +		return 0;
+ +	}
+ +
+ +	conn->error = error;
+ +	conn->abort_code = abort_code;
+ +	conn->state = RXRPC_CONN_LOCALLY_ABORTED;
+ +	set_bit(RXRPC_CONN_DONT_REUSE, &conn->flags);
+ +	spin_unlock_bh(&conn->state_lock);
+ +
+ +	msg.msg_name	= &conn->params.peer->srx.transport;
+ +	msg.msg_namelen	= conn->params.peer->srx.transport_len;
+ +	msg.msg_control	= NULL;
+ +	msg.msg_controllen = 0;
+ +	msg.msg_flags	= 0;
+ +
+ +	whdr.epoch	= htonl(conn->proto.epoch);
+ +	whdr.cid	= htonl(conn->proto.cid);
+ +	whdr.callNumber	= 0;
+ +	whdr.seq	= 0;
+ +	whdr.type	= RXRPC_PACKET_TYPE_ABORT;
+ +	whdr.flags	= conn->out_clientflag;
+ +	whdr.userStatus	= 0;
+ +	whdr.securityIndex = conn->security_ix;
+ +	whdr._rsvd	= 0;
+ +	whdr.serviceId	= htons(conn->service_id);
+ +
+ +	word		= htonl(conn->abort_code);
+ +
+ +	iov[0].iov_base	= &whdr;
+ +	iov[0].iov_len	= sizeof(whdr);
+ +	iov[1].iov_base	= &word;
+ +	iov[1].iov_len	= sizeof(word);
+ +
+ +	len = iov[0].iov_len + iov[1].iov_len;
+ +
+ +	serial = atomic_inc_return(&conn->serial);
+ +	rxrpc_abort_calls(conn, RXRPC_CALL_LOCALLY_ABORTED, serial);
+ +	whdr.serial = htonl(serial);
+ +
+ +	ret = kernel_sendmsg(conn->params.local->socket, &msg, iov, 2, len);
+ +	if (ret < 0) {
+ +		trace_rxrpc_tx_fail(conn->debug_id, serial, ret,
+ +				    rxrpc_tx_point_conn_abort);
+ +		_debug("sendmsg failed: %d", ret);
+ +		return -EAGAIN;
+ +	}
+ +
+ +	trace_rxrpc_tx_packet(conn->debug_id, &whdr, rxrpc_tx_point_conn_abort);
+ +
+ +	conn->params.peer->last_tx_at = ktime_get_seconds();
+ +
+ +	_leave(" = 0");
+ +	return 0;
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> a00ce28b1778 (rxrpc: Clean up connection abort)
+   * mark a call as being on a now-secured channel
+   * - must be called with BH's disabled.
+   */
+@@@ -292,30 -256,11 +335,29 @@@ static int rxrpc_process_event(struct r
+  	_enter("{%d},{%u,%%%u},", conn->debug_id, sp->hdr.type, sp->hdr.serial);
+  
+  	switch (sp->hdr.type) {
+ +	case RXRPC_PACKET_TYPE_DATA:
+ +	case RXRPC_PACKET_TYPE_ACK:
+ +		rxrpc_conn_retransmit_call(conn, skb,
+ +					   sp->hdr.cid & RXRPC_CHANNELMASK);
+ +		return 0;
+ +
+ +	case RXRPC_PACKET_TYPE_BUSY:
+ +		/* Just ignore BUSY packets for now. */
+ +		return 0;
+ +
+ +	case RXRPC_PACKET_TYPE_ABORT:
+ +		conn->error = -ECONNABORTED;
+ +		conn->abort_code = skb->priority;
+ +		conn->state = RXRPC_CONN_REMOTELY_ABORTED;
+ +		set_bit(RXRPC_CONN_DONT_REUSE, &conn->flags);
+ +		rxrpc_abort_calls(conn, RXRPC_CALL_REMOTELY_ABORTED, sp->hdr.serial);
+ +		return -ECONNABORTED;
+ +
+  	case RXRPC_PACKET_TYPE_CHALLENGE:
+- 		return conn->security->respond_to_challenge(conn, skb,
+- 							    _abort_code);
++ 		return conn->security->respond_to_challenge(conn, skb);
+  
+  	case RXRPC_PACKET_TYPE_RESPONSE:
+- 		ret = conn->security->verify_response(conn, skb, _abort_code);
++ 		ret = conn->security->verify_response(conn, skb);
+  		if (ret < 0)
+  			return ret;
+  
+@@@ -437,34 -359,19 +460,39 @@@ static void rxrpc_do_process_connection
+  	/* go through the conn-level event packets, releasing the ref on this
+  	 * connection that each one has when we've finished with it */
+  	while ((skb = skb_dequeue(&conn->rx_queue))) {
+++<<<<<<< HEAD
+ +		rxrpc_see_skb(skb, rxrpc_skb_seen);
+ +		ret = rxrpc_process_event(conn, skb, &abort_code);
+++=======
++ 		rxrpc_see_skb(skb, rxrpc_skb_see_conn_work);
++ 		ret = rxrpc_process_event(conn, skb);
+++>>>>>>> a00ce28b1778 (rxrpc: Clean up connection abort)
+  		switch (ret) {
+- 		case -EPROTO:
+- 		case -EKEYEXPIRED:
+- 		case -EKEYREJECTED:
+- 			goto protocol_error;
+  		case -ENOMEM:
+  		case -EAGAIN:
+- 			goto requeue_and_leave;
+- 		case -ECONNABORTED:
++ 			skb_queue_head(&conn->rx_queue, skb);
++ 			rxrpc_queue_conn(conn, rxrpc_conn_queue_retry_work);
++ 			break;
+  		default:
+ -			rxrpc_free_skb(skb, rxrpc_skb_put_conn_work);
+ +			rxrpc_free_skb(skb, rxrpc_skb_freed);
+  			break;
+  		}
+  	}
+++<<<<<<< HEAD
+ +
+ +	return;
+ +
+ +requeue_and_leave:
+ +	skb_queue_head(&conn->rx_queue, skb);
+ +	return;
+ +
+ +protocol_error:
+ +	if (rxrpc_abort_connection(conn, ret, abort_code) < 0)
+ +		goto requeue_and_leave;
+ +	rxrpc_free_skb(skb, rxrpc_skb_freed);
+ +	return;
+++=======
+++>>>>>>> a00ce28b1778 (rxrpc: Clean up connection abort)
+  }
+  
+  void rxrpc_process_connection(struct work_struct *work)
+@@@ -472,14 -379,74 +500,83 @@@
+  	struct rxrpc_connection *conn =
+  		container_of(work, struct rxrpc_connection, processor);
+  
+ -	rxrpc_see_connection(conn, rxrpc_conn_see_work);
+ +	rxrpc_see_connection(conn);
+  
+ -	if (__rxrpc_use_local(conn->local, rxrpc_local_use_conn_work)) {
+ +	if (__rxrpc_use_local(conn->params.local)) {
+  		rxrpc_do_process_connection(conn);
+++<<<<<<< HEAD
+ +		rxrpc_unuse_local(conn->params.local);
+ +	}
+ +
+ +	rxrpc_put_connection(conn);
+ +	_leave("");
+ +	return;
+++=======
++ 		rxrpc_unuse_local(conn->local, rxrpc_local_unuse_conn_work);
++ 	}
++ }
++ 
++ /*
++  * post connection-level events to the connection
++  * - this includes challenges, responses, some aborts and call terminal packet
++  *   retransmission.
++  */
++ static void rxrpc_post_packet_to_conn(struct rxrpc_connection *conn,
++ 				      struct sk_buff *skb)
++ {
++ 	_enter("%p,%p", conn, skb);
++ 
++ 	rxrpc_get_skb(skb, rxrpc_skb_get_conn_work);
++ 	skb_queue_tail(&conn->rx_queue, skb);
++ 	rxrpc_queue_conn(conn, rxrpc_conn_queue_rx_work);
++ }
++ 
++ /*
++  * Input a connection-level packet.
++  */
++ int rxrpc_input_conn_packet(struct rxrpc_connection *conn, struct sk_buff *skb)
++ {
++ 	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
++ 
++ 	switch (sp->hdr.type) {
++ 	case RXRPC_PACKET_TYPE_BUSY:
++ 		/* Just ignore BUSY packets for now. */
++ 		return 0;
++ 
++ 	case RXRPC_PACKET_TYPE_ABORT:
++ 		if (rxrpc_is_conn_aborted(conn))
++ 			return true;
++ 		rxrpc_input_conn_abort(conn, skb);
++ 		rxrpc_abort_calls(conn);
++ 		return true;
++ 
++ 	case RXRPC_PACKET_TYPE_CHALLENGE:
++ 	case RXRPC_PACKET_TYPE_RESPONSE:
++ 		if (rxrpc_is_conn_aborted(conn)) {
++ 			if (conn->completion == RXRPC_CALL_LOCALLY_ABORTED)
++ 				rxrpc_send_conn_abort(conn);
++ 			return true;
++ 		}
++ 		rxrpc_post_packet_to_conn(conn, skb);
++ 		return 0;
++ 
++ 	default:
++ 		trace_rxrpc_rx_eproto(NULL, sp->hdr.serial,
++ 				      tracepoint_string("bad_conn_pkt"));
++ 		return -EPROTO;
++ 	}
++ }
++ 
++ /*
++  * Input a connection event.
++  */
++ void rxrpc_input_conn_event(struct rxrpc_connection *conn, struct sk_buff *skb)
++ {
++ 	if (test_and_clear_bit(RXRPC_CONN_EV_ABORT_CALLS, &conn->events))
++ 		rxrpc_abort_calls(conn);
++ 
++ 	/* Process delayed ACKs whose time has come. */
++ 	if (conn->flags & RXRPC_CONN_FINAL_ACK_MASK)
++ 		rxrpc_process_delayed_final_acks(conn, false);
+++>>>>>>> a00ce28b1778 (rxrpc: Clean up connection abort)
+  }
+diff --cc net/rxrpc/output.c
+index 71b6fea4598b,8a5ff2c9e061..000000000000
+--- a/net/rxrpc/output.c
++++ b/net/rxrpc/output.c
+@@@ -587,14 -545,69 +587,74 @@@ send_fragmentable
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * reject packets through the local endpoint
+++=======
++  * Transmit a connection-level abort.
++  */
++ void rxrpc_send_conn_abort(struct rxrpc_connection *conn)
++ {
++ 	struct rxrpc_wire_header whdr;
++ 	struct msghdr msg;
++ 	struct kvec iov[2];
++ 	__be32 word;
++ 	size_t len;
++ 	u32 serial;
++ 	int ret;
++ 
++ 	msg.msg_name	= &conn->peer->srx.transport;
++ 	msg.msg_namelen	= conn->peer->srx.transport_len;
++ 	msg.msg_control	= NULL;
++ 	msg.msg_controllen = 0;
++ 	msg.msg_flags	= 0;
++ 
++ 	whdr.epoch	= htonl(conn->proto.epoch);
++ 	whdr.cid	= htonl(conn->proto.cid);
++ 	whdr.callNumber	= 0;
++ 	whdr.seq	= 0;
++ 	whdr.type	= RXRPC_PACKET_TYPE_ABORT;
++ 	whdr.flags	= conn->out_clientflag;
++ 	whdr.userStatus	= 0;
++ 	whdr.securityIndex = conn->security_ix;
++ 	whdr._rsvd	= 0;
++ 	whdr.serviceId	= htons(conn->service_id);
++ 
++ 	word		= htonl(conn->abort_code);
++ 
++ 	iov[0].iov_base	= &whdr;
++ 	iov[0].iov_len	= sizeof(whdr);
++ 	iov[1].iov_base	= &word;
++ 	iov[1].iov_len	= sizeof(word);
++ 
++ 	len = iov[0].iov_len + iov[1].iov_len;
++ 
++ 	serial = atomic_inc_return(&conn->serial);
++ 	whdr.serial = htonl(serial);
++ 
++ 	iov_iter_kvec(&msg.msg_iter, WRITE, iov, 2, len);
++ 	ret = do_udp_sendmsg(conn->local->socket, &msg, len);
++ 	if (ret < 0) {
++ 		trace_rxrpc_tx_fail(conn->debug_id, serial, ret,
++ 				    rxrpc_tx_point_conn_abort);
++ 		_debug("sendmsg failed: %d", ret);
++ 		return;
++ 	}
++ 
++ 	trace_rxrpc_tx_packet(conn->debug_id, &whdr, rxrpc_tx_point_conn_abort);
++ 
++ 	conn->peer->last_tx_at = ktime_get_seconds();
++ }
++ 
++ /*
++  * Reject a packet through the local endpoint.
+++>>>>>>> a00ce28b1778 (rxrpc: Clean up connection abort)
+   */
+ -void rxrpc_reject_packet(struct rxrpc_local *local, struct sk_buff *skb)
+ +void rxrpc_reject_packets(struct rxrpc_local *local)
+  {
+ -	struct rxrpc_wire_header whdr;
+  	struct sockaddr_rxrpc srx;
+ -	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
+ +	struct rxrpc_skb_priv *sp;
+ +	struct rxrpc_wire_header whdr;
+ +	struct sk_buff *skb;
+  	struct msghdr msg;
+  	struct kvec iov[2];
+  	size_t size;
+diff --cc net/rxrpc/proc.c
+index fae22a8b38d6,63947cce4048..000000000000
+--- a/net/rxrpc/proc.c
++++ b/net/rxrpc/proc.c
+@@@ -172,12 -162,14 +172,20 @@@ static int rxrpc_connection_seq_show(st
+  		goto print;
+  	}
+  
+++<<<<<<< HEAD
+ +	sprintf(lbuff, "%pISpc", &conn->params.local->srx.transport);
+ +
+ +	sprintf(rbuff, "%pISpc", &conn->params.peer->srx.transport);
+++=======
++ 	sprintf(lbuff, "%pISpc", &conn->local->srx.transport);
++ 	sprintf(rbuff, "%pISpc", &conn->peer->srx.transport);
+++>>>>>>> a00ce28b1778 (rxrpc: Clean up connection abort)
+  print:
++ 	state = rxrpc_is_conn_aborted(conn) ?
++ 		rxrpc_call_completions[conn->completion] :
++ 		rxrpc_conn_states[conn->state];
+  	seq_printf(seq,
+ -		   "UDP   %-47.47s %-47.47s %4x %08x %s %3u %3d"
+ +		   "UDP   %-47.47s %-47.47s %4x %08x %s %3u"
+  		   " %s %08x %08x %08x %08x %08x %08x %08x\n",
+  		   lbuff,
+  		   rbuff,
+@@@ -185,8 -177,9 +193,14 @@@
+  		   conn->proto.cid,
+  		   rxrpc_conn_is_service(conn) ? "Svc" : "Clt",
+  		   refcount_read(&conn->ref),
+++<<<<<<< HEAD
+ +		   rxrpc_conn_states[conn->state],
+ +		   key_serial(conn->params.key),
+++=======
++ 		   atomic_read(&conn->active),
++ 		   state,
++ 		   key_serial(conn->key),
+++>>>>>>> a00ce28b1778 (rxrpc: Clean up connection abort)
+  		   atomic_read(&conn->serial),
+  		   conn->hi_serial,
+  		   conn->channels[0].call_id,
+* Unmerged path include/trace/events/rxrpc.h
+* Unmerged path net/rxrpc/ar-internal.h
+* Unmerged path net/rxrpc/call_object.c
+* Unmerged path net/rxrpc/conn_event.c
+diff --git a/net/rxrpc/insecure.c b/net/rxrpc/insecure.c
+index 0eb8471bfc53..29dcc7d3f51a 100644
+--- a/net/rxrpc/insecure.c
++++ b/net/rxrpc/insecure.c
+@@ -43,25 +43,15 @@ static void none_free_call_crypto(struct rxrpc_call *call)
+ }
+ 
+ static int none_respond_to_challenge(struct rxrpc_connection *conn,
+-				     struct sk_buff *skb,
+-				     u32 *_abort_code)
++				     struct sk_buff *skb)
+ {
+-	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
+-
+-	trace_rxrpc_rx_eproto(NULL, sp->hdr.serial,
+-			      tracepoint_string("chall_none"));
+-	return -EPROTO;
++	return rxrpc_abort_conn(conn, skb, RX_PROTOCOL_ERROR, -EPROTO, "RXN");
+ }
+ 
+ static int none_verify_response(struct rxrpc_connection *conn,
+-				struct sk_buff *skb,
+-				u32 *_abort_code)
++				struct sk_buff *skb)
+ {
+-	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
+-
+-	trace_rxrpc_rx_eproto(NULL, sp->hdr.serial,
+-			      tracepoint_string("resp_none"));
+-	return -EPROTO;
++	return rxrpc_abort_conn(conn, skb, RX_PROTOCOL_ERROR, -EPROTO, "RXN");
+ }
+ 
+ static void none_clear(struct rxrpc_connection *conn)
+* Unmerged path net/rxrpc/output.c
+* Unmerged path net/rxrpc/proc.c
+diff --git a/net/rxrpc/rxkad.c b/net/rxrpc/rxkad.c
+index 36cf40442a7e..823dfb898a86 100644
+--- a/net/rxrpc/rxkad.c
++++ b/net/rxrpc/rxkad.c
+@@ -821,8 +821,7 @@ static int rxkad_encrypt_response(struct rxrpc_connection *conn,
+  * respond to a challenge packet
+  */
+ static int rxkad_respond_to_challenge(struct rxrpc_connection *conn,
+-				      struct sk_buff *skb,
+-				      u32 *_abort_code)
++				      struct sk_buff *skb)
+ {
+ 	const struct rxrpc_key_token *token;
+ 	struct rxkad_challenge challenge;
+@@ -898,7 +897,7 @@ static int rxkad_respond_to_challenge(struct rxrpc_connection *conn,
+ 	trace_rxrpc_rx_eproto(NULL, sp->hdr.serial, eproto);
+ 	ret = -EPROTO;
+ other_error:
+-	*_abort_code = abort_code;
++	rxrpc_abort_conn(conn, skb, abort_code, ret, "RXK");
+ 	return ret;
+ }
+ 
+@@ -910,8 +909,7 @@ static int rxkad_decrypt_ticket(struct rxrpc_connection *conn,
+ 				struct sk_buff *skb,
+ 				void *ticket, size_t ticket_len,
+ 				struct rxrpc_crypt *_session_key,
+-				time64_t *_expiry,
+-				u32 *_abort_code)
++				time64_t *_expiry)
+ {
+ 	struct skcipher_request *req;
+ 	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
+@@ -1042,8 +1040,7 @@ static int rxkad_decrypt_ticket(struct rxrpc_connection *conn,
+ 	abort_code = RXKADBADTICKET;
+ 	ret = -EPROTO;
+ other_error:
+-	*_abort_code = abort_code;
+-	return ret;
++	return rxrpc_abort_conn(conn, skb, abort_code, ret, "RXK");
+ temporary_error:
+ 	return ret;
+ }
+@@ -1086,8 +1083,7 @@ static void rxkad_decrypt_response(struct rxrpc_connection *conn,
+  * verify a response
+  */
+ static int rxkad_verify_response(struct rxrpc_connection *conn,
+-				 struct sk_buff *skb,
+-				 u32 *_abort_code)
++				 struct sk_buff *skb)
+ {
+ 	struct rxkad_response *response;
+ 	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
+@@ -1115,11 +1111,8 @@ static int rxkad_verify_response(struct rxrpc_connection *conn,
+ 			abort_code = RXKADNOAUTH;
+ 			break;
+ 		}
+-		trace_rxrpc_abort(0, "SVK",
+-				  sp->hdr.cid, sp->hdr.callNumber, sp->hdr.seq,
+-				  abort_code, PTR_ERR(server_key));
+-		*_abort_code = abort_code;
+-		return -EPROTO;
++		return rxrpc_abort_conn(conn, skb, abort_code,
++					PTR_ERR(server_key), "RXK");
+ 	}
+ 
+ 	ret = -ENOMEM;
+@@ -1168,7 +1161,7 @@ static int rxkad_verify_response(struct rxrpc_connection *conn,
+ 		goto temporary_error_free_ticket;
+ 
+ 	ret = rxkad_decrypt_ticket(conn, server_key, skb, ticket, ticket_len,
+-				   &session_key, &expiry, _abort_code);
++				   &session_key, &expiry);
+ 	if (ret < 0)
+ 		goto temporary_error_free_ticket;
+ 
+@@ -1246,10 +1239,9 @@ static int rxkad_verify_response(struct rxrpc_connection *conn,
+ 	kfree(ticket);
+ protocol_error:
+ 	kfree(response);
+-	trace_rxrpc_rx_eproto(NULL, sp->hdr.serial, eproto);
+ 	key_put(server_key);
+-	*_abort_code = abort_code;
+-	return -EPROTO;
++	trace_rxrpc_rx_eproto(NULL, sp->hdr.serial, eproto);
++	return rxrpc_abort_conn(conn, skb, abort_code, -EPROTO, "RXK");
+ 
+ temporary_error_free_ticket:
+ 	kfree(ticket);
