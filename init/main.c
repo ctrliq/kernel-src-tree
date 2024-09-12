@@ -575,7 +575,7 @@ asmlinkage __visible void __init start_kernel(void)
 	page_alloc_init();
 
 	pr_notice("Kernel command line: %s\n", boot_command_line);
-	pr_notice("Specific versions of hardware are certified with Red Hat Enterprise Linux 8. Please see the list of hardware certified with Red Hat Enterprise Linux 8 at https://catalog.redhat.com.\n");
+	pr_notice("Specific versions of hardware are certified with Enterprise Linux 8. Please see the list of hardware certified with Enterprise Linux 8 at the Red Hat catalog: https://catalog.redhat.com.\n");
 	/* parameters may set static keys */
 	jump_label_init();
 	parse_early_param();
