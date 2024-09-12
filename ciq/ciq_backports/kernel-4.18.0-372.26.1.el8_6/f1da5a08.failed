@@ -1,0 +1,115 @@
+ice: Add ability for PF admin to enable VF VLAN pruning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.26.1.el8_6
+commit-author Brett Creeley <brett.creeley@intel.com>
+commit f1da5a0866bcbe14164f4b1d399a25feec56fe49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.26.1.el8_6/f1da5a08.failed
+
+VFs by default are able to see all tagged traffic regardless of trust
+and VLAN filters. Based on legacy devices (i.e. ixgbe, i40e), customers
+expect VFs to receive all VLAN tagged traffic with a matching
+destination MAC.
+
+Add an ethtool private flag 'vf-vlan-pruning' and set the default to
+off so VFs will receive all VLAN traffic directed towards them. When
+the flag is turned on, VF will only be able to receive untagged
+traffic or traffic with VLAN tags it has created interfaces for.
+
+Also, the flag cannot be changed while any VFs are allocated. This was
+done to simplify the implementation. So, if this flag is needed, then
+the PF admin must enable it. If the user tries to enable the flag while
+VFs are active, then print an unsupported message with the
+vf-vlan-pruning flag included. In case multiple flags were specified, this
+makes it clear to the user which flag failed.
+
+	Signed-off-by: Brett Creeley <brett.creeley@intel.com>
+	Tested-by: Gurucharan G <gurucharanx.g@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit f1da5a0866bcbe14164f4b1d399a25feec56fe49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_vf_vsi_vlan_ops.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_vf_vsi_vlan_ops.c
+diff --git a/drivers/net/ethernet/intel/ice/ice.h b/drivers/net/ethernet/intel/ice/ice.h
+index 5ef4f7fcb12c..f656aade888f 100644
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -481,6 +481,7 @@ enum ice_pf_flags {
+ 	ICE_FLAG_LEGACY_RX,
+ 	ICE_FLAG_VF_TRUE_PROMISC_ENA,
+ 	ICE_FLAG_MDD_AUTO_RESET_VF,
++	ICE_FLAG_VF_VLAN_PRUNING,
+ 	ICE_FLAG_LINK_LENIENT_MODE_ENA,
+ 	ICE_FLAG_PLUG_AUX_DEV,
+ 	ICE_FLAG_MTU_CHANGED,
+diff --git a/drivers/net/ethernet/intel/ice/ice_ethtool.c b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+index 3e0089fcaa98..cc545284137f 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@ -164,6 +164,7 @@ static const struct ice_priv_flag ice_gstrings_priv_flags[] = {
+ 	ICE_PRIV_FLAG("vf-true-promisc-support",
+ 		      ICE_FLAG_VF_TRUE_PROMISC_ENA),
+ 	ICE_PRIV_FLAG("mdd-auto-reset-vf", ICE_FLAG_MDD_AUTO_RESET_VF),
++	ICE_PRIV_FLAG("vf-vlan-pruning", ICE_FLAG_VF_VLAN_PRUNING),
+ 	ICE_PRIV_FLAG("legacy-rx", ICE_FLAG_LEGACY_RX),
+ };
+ 
+@@ -1295,6 +1296,14 @@ static int ice_set_priv_flags(struct net_device *netdev, u32 flags)
+ 		change_bit(ICE_FLAG_VF_TRUE_PROMISC_ENA, pf->flags);
+ 		ret = -EAGAIN;
+ 	}
++
++	if (test_bit(ICE_FLAG_VF_VLAN_PRUNING, change_flags) &&
++	    pf->num_alloc_vfs) {
++		dev_err(dev, "vf-vlan-pruning: VLAN pruning cannot be changed while VFs are active.\n");
++		/* toggle bit back to previous state */
++		change_bit(ICE_FLAG_VF_VLAN_PRUNING, pf->flags);
++		ret = -EOPNOTSUPP;
++	}
+ ethtool_exit:
+ 	clear_bit(ICE_FLAG_ETHTOOL_CTXT, pf->flags);
+ 	return ret;
+* Unmerged path drivers/net/ethernet/intel/ice/ice_vf_vsi_vlan_ops.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+index e5875fdaaf40..ebe1bd14f407 100644
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+@@ -835,6 +835,11 @@ static int ice_vf_rebuild_host_vlan_cfg(struct ice_vf *vf)
+ 		return err;
+ 	}
+ 
++	err = vlan_ops->ena_rx_filtering(vsi);
++	if (err)
++		dev_warn(dev, "failed to enable Rx VLAN filtering for VF %d VSI %d during VF rebuild, error %d\n",
++			 vf->vf_id, vsi->idx, err);
++
+ 	return 0;
+ }
+ 
+@@ -1739,6 +1744,7 @@ static void ice_vc_notify_vf_reset(struct ice_vf *vf)
+  */
+ static int ice_init_vf_vsi_res(struct ice_vf *vf)
+ {
++	struct ice_vsi_vlan_ops *vlan_ops;
+ 	struct ice_pf *pf = vf->pf;
+ 	u8 broadcast[ETH_ALEN];
+ 	struct ice_vsi *vsi;
+@@ -1759,6 +1765,14 @@ static int ice_init_vf_vsi_res(struct ice_vf *vf)
+ 		goto release_vsi;
+ 	}
+ 
++	vlan_ops = ice_get_compat_vsi_vlan_ops(vsi);
++	err = vlan_ops->ena_rx_filtering(vsi);
++	if (err) {
++		dev_warn(dev, "Failed to enable Rx VLAN filtering for VF %d\n",
++			 vf->vf_id);
++		goto release_vsi;
++	}
++
+ 	eth_broadcast_addr(broadcast);
+ 	err = ice_fltr_add_mac(vsi, broadcast, ICE_FWD_TO_VSI);
+ 	if (err) {
