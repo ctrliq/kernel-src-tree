@@ -1,0 +1,542 @@
+ASoC: SOF: Add a prepare op to IPC topology widget ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+commit 66344c6d92113e605d8212e79b1219406893ee05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/66344c6d.failed
+
+In order to set up a pipeline with IPC4, the total memory usage for the
+pipeline needs to be calculated based on the list of connected widgets.
+Add a new ipc_prepare() op to struct sof_ipc_tplg_widget_ops that will be
+used to calculate the memory usage for each widget in the pipelines
+associated with a PCM and prepare the widget for getting set up in the
+DSP. The prepare step will be used to allocate memory for the IPC
+payload, assign instance ID and update the config data for the widget
+based on the runtime PCM params. Once prepared, the setup step is used
+to send the IPC to create the widget in the DSP.
+
+Add an ipc_unprepare() op to unprepare the widget i.e free the memory
+allocated during prepare, free the instance ID etc. This should be
+invoked after the widget is freed.
+
+A new flag "prepared" is added to struct snd_sof_widget to track the
+prepared status of widgets.
+
+Also, IPC4 requires the platform_params and the runtime PCM params in
+order to prepare a widget for set up. So modify the signature of
+sof_pcm_setup_connected_widgets() and sof_widget_list_setup() to accept
+these as arguments.
+
+	Signed-off-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+	Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+	Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+Link: https://lore.kernel.org/r/20220426171743.171061-12-ranjani.sridharan@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 66344c6d92113e605d8212e79b1219406893ee05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/pcm.c
+#	sound/soc/sof/sof-audio.c
+#	sound/soc/sof/sof-audio.h
+diff --cc sound/soc/sof/pcm.c
+index 0575011ac242,a76d0b5b2ad9..000000000000
+--- a/sound/soc/sof/pcm.c
++++ b/sound/soc/sof/pcm.c
+@@@ -85,31 -82,10 +85,38 @@@ void snd_sof_pcm_period_elapsed(struct 
+  }
+  EXPORT_SYMBOL(snd_sof_pcm_period_elapsed);
+  
+++<<<<<<< HEAD
+ +int sof_pcm_dsp_pcm_free(struct snd_pcm_substream *substream, struct snd_sof_dev *sdev,
+ +			 struct snd_sof_pcm *spcm)
+ +{
+ +	struct sof_ipc_stream stream;
+ +	struct sof_ipc_reply reply;
+ +	int ret;
+ +
+ +	if (!spcm->prepared[substream->stream])
+ +		return 0;
+ +
+ +	stream.hdr.size = sizeof(stream);
+ +	stream.hdr.cmd = SOF_IPC_GLB_STREAM_MSG | SOF_IPC_STREAM_PCM_FREE;
+ +	stream.comp_id = spcm->stream[substream->stream].comp_id;
+ +
+ +	/* send IPC to the DSP */
+ +	ret = sof_ipc_tx_message(sdev->ipc, stream.hdr.cmd, &stream,
+ +				 sizeof(stream), &reply, sizeof(reply));
+ +	if (!ret)
+ +		spcm->prepared[substream->stream] = false;
+ +
+ +	return ret;
+ +}
+ +
+ +int sof_pcm_setup_connected_widgets(struct snd_sof_dev *sdev, struct snd_soc_pcm_runtime *rtd,
+ +				    struct snd_sof_pcm *spcm, int dir)
+++=======
++ static int
++ sof_pcm_setup_connected_widgets(struct snd_sof_dev *sdev, struct snd_soc_pcm_runtime *rtd,
++ 				struct snd_sof_pcm *spcm, struct snd_pcm_hw_params *params,
++ 				struct snd_sof_platform_stream_params *platform_params, int dir)
+++>>>>>>> 66344c6d9211 (ASoC: SOF: Add a prepare op to IPC topology widget ops)
+  {
+  	struct snd_soc_dai *dai;
+  	int ret, j;
+@@@ -236,28 -158,10 +243,29 @@@ static int sof_pcm_hw_params(struct snd
+  		return ret;
+  	}
+  
+ +	/* Update the IPC message with information from the platform */
+ +	pcm.params.stream_tag = platform_params.stream_tag;
+ +
+ +	if (platform_params.use_phy_address)
+ +		pcm.params.buffer.phy_addr = platform_params.phy_addr;
+ +
+ +	if (platform_params.no_ipc_position) {
+ +		/* For older ABIs set host_period_bytes to zero to inform
+ +		 * FW we don't want position updates. Newer versions use
+ +		 * no_stream_position for this purpose.
+ +		 */
+ +		if (v->abi_version < SOF_ABI_VER(3, 10, 0))
+ +			pcm.params.host_period_bytes = 0;
+ +		else
+ +			pcm.params.no_stream_position = 1;
+ +	}
+ +
+ +	dev_dbg(component->dev, "stream_tag %d", pcm.params.stream_tag);
+ +
+  	/* if this is a repeated hw_params without hw_free, skip setting up widgets */
+  	if (!spcm->stream[substream->stream].list) {
+- 		ret = sof_pcm_setup_connected_widgets(sdev, rtd, spcm, substream->stream);
++ 		ret = sof_pcm_setup_connected_widgets(sdev, rtd, spcm, params, &platform_params,
++ 						      substream->stream);
+  		if (ret < 0)
+  			return ret;
+  	}
+diff --cc sound/soc/sof/sof-audio.c
+index 7c3fc31d8912,8d740635a4bb..000000000000
+--- a/sound/soc/sof/sof-audio.c
++++ b/sound/soc/sof/sof-audio.c
+@@@ -419,28 -257,250 +419,268 @@@ static int sof_setup_pipeline_connectio
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int sof_widget_list_setup(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm, int dir)
+++=======
++ static void
++ sof_unprepare_widgets_in_path(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget *widget)
++ {
++ 	const struct sof_ipc_tplg_ops *ipc_tplg_ops = sdev->ipc->ops->tplg;
++ 	const struct sof_ipc_tplg_widget_ops *widget_ops = ipc_tplg_ops->widget;
++ 	struct snd_sof_widget *swidget = widget->dobj.private;
++ 	struct snd_soc_dapm_path *p;
++ 
++ 	if (!widget_ops[widget->id].ipc_unprepare || !swidget->prepared)
++ 		goto sink_unprepare;
++ 
++ 	/* unprepare the source widget */
++ 	widget_ops[widget->id].ipc_unprepare(swidget);
++ 	swidget->prepared = false;
++ 
++ sink_unprepare:
++ 	/* unprepare all widgets in the sink paths */
++ 	snd_soc_dapm_widget_for_each_sink_path(widget, p) {
++ 		if (!p->walking && p->sink->dobj.private) {
++ 			p->walking = true;
++ 			sof_unprepare_widgets_in_path(sdev, p->sink);
++ 			p->walking = false;
++ 		}
++ 	}
++ }
++ 
++ static int
++ sof_prepare_widgets_in_path(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget *widget,
++ 			    struct snd_pcm_hw_params *fe_params,
++ 			    struct snd_sof_platform_stream_params *platform_params,
++ 			    struct snd_pcm_hw_params *pipeline_params, int dir)
++ {
++ 	const struct sof_ipc_tplg_ops *ipc_tplg_ops = sdev->ipc->ops->tplg;
++ 	const struct sof_ipc_tplg_widget_ops *widget_ops = ipc_tplg_ops->widget;
++ 	struct snd_sof_widget *swidget = widget->dobj.private;
++ 	struct snd_soc_dapm_path *p;
++ 	int ret;
++ 
++ 	if (!widget_ops[widget->id].ipc_prepare || swidget->prepared)
++ 		goto sink_prepare;
++ 
++ 	/* prepare the source widget */
++ 	ret = widget_ops[widget->id].ipc_prepare(swidget, fe_params, platform_params,
++ 					     pipeline_params, dir);
++ 	if (ret < 0) {
++ 		dev_err(sdev->dev, "failed to prepare widget %s\n", widget->name);
++ 		return ret;
++ 	}
++ 
++ 	swidget->prepared = true;
++ 
++ sink_prepare:
++ 	/* prepare all widgets in the sink paths */
++ 	snd_soc_dapm_widget_for_each_sink_path(widget, p) {
++ 		if (!p->walking && p->sink->dobj.private) {
++ 			p->walking = true;
++ 			ret = sof_prepare_widgets_in_path(sdev, p->sink,  fe_params,
++ 							  platform_params, pipeline_params, dir);
++ 			p->walking = false;
++ 			if (ret < 0) {
++ 				/* unprepare the source widget */
++ 				if (!widget_ops[widget->id].ipc_unprepare && swidget->prepared) {
++ 					widget_ops[widget->id].ipc_unprepare(swidget);
++ 					swidget->prepared = false;
++ 				}
++ 				return ret;
++ 			}
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * free all widgets in the sink path starting from the source widget
++  * (DAI type for capture, AIF type for playback)
++  */
++ static int sof_free_widgets_in_path(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget *widget,
++ 				    int dir)
++ {
++ 	struct snd_soc_dapm_path *p;
++ 	int err;
++ 	int ret = 0;
++ 
++ 	/* free all widgets even in case of error to keep use counts balanced */
++ 	snd_soc_dapm_widget_for_each_sink_path(widget, p) {
++ 		if (!p->walking && p->sink->dobj.private && widget->dobj.private) {
++ 			p->walking = true;
++ 			if (WIDGET_IS_AIF_OR_DAI(widget->id)) {
++ 				err = sof_widget_free(sdev, widget->dobj.private);
++ 				if (err < 0)
++ 					ret = err;
++ 			}
++ 
++ 			err = sof_widget_free(sdev, p->sink->dobj.private);
++ 			if (err < 0)
++ 				ret = err;
++ 
++ 			err = sof_free_widgets_in_path(sdev, p->sink, dir);
++ 			if (err < 0)
++ 				ret = err;
++ 			p->walking = false;
++ 		}
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * set up all widgets in the sink path starting from the source widget
++  * (DAI type for capture, AIF type for playback).
++  * The error path in this function ensures that all successfully set up widgets getting freed.
++  */
++ static int sof_set_up_widgets_in_path(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget *widget,
++ 				      int dir)
++ {
++ 	struct snd_soc_dapm_path *p;
++ 	int ret;
++ 
++ 	snd_soc_dapm_widget_for_each_sink_path(widget, p) {
++ 		if (!p->walking && p->sink->dobj.private && widget->dobj.private) {
++ 			p->walking = true;
++ 			if (WIDGET_IS_AIF_OR_DAI(widget->id)) {
++ 				ret = sof_widget_setup(sdev, widget->dobj.private);
++ 				if (ret < 0)
++ 					goto out;
++ 			}
++ 
++ 			ret = sof_widget_setup(sdev, p->sink->dobj.private);
++ 			if (ret < 0) {
++ 				if (WIDGET_IS_AIF_OR_DAI(widget->id))
++ 					sof_widget_free(sdev, widget->dobj.private);
++ 				goto out;
++ 			}
++ 
++ 			ret = sof_set_up_widgets_in_path(sdev, p->sink, dir);
++ 			if (ret < 0) {
++ 				if (WIDGET_IS_AIF_OR_DAI(widget->id))
++ 					sof_widget_free(sdev, widget->dobj.private);
++ 				sof_widget_free(sdev, p->sink->dobj.private);
++ 			}
++ out:
++ 			p->walking = false;
++ 			if (ret < 0)
++ 				return ret;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int
++ sof_walk_widgets_in_order(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget_list *list,
++ 			  struct snd_pcm_hw_params *fe_params,
++ 			  struct snd_sof_platform_stream_params *platform_params, int dir,
++ 			  enum sof_widget_op op)
++ {
++ 	struct snd_soc_dapm_widget *widget;
++ 	char *str;
++ 	int ret = 0;
++ 	int i;
++ 
++ 	for_each_dapm_widgets(list, i, widget) {
++ 		/* starting widget for playback is AIF type */
++ 		if (dir == SNDRV_PCM_STREAM_PLAYBACK && !WIDGET_IS_AIF(widget->id))
++ 			continue;
++ 
++ 		/* starting widget for capture is DAI type */
++ 		if (dir == SNDRV_PCM_STREAM_CAPTURE && !WIDGET_IS_DAI(widget->id))
++ 			continue;
++ 
++ 		switch (op) {
++ 		case SOF_WIDGET_SETUP:
++ 			ret = sof_set_up_widgets_in_path(sdev, widget, dir);
++ 			str = "set up";
++ 			break;
++ 		case SOF_WIDGET_FREE:
++ 			ret = sof_free_widgets_in_path(sdev, widget, dir);
++ 			str = "free";
++ 			break;
++ 		case SOF_WIDGET_PREPARE:
++ 		{
++ 			struct snd_pcm_hw_params pipeline_params;
++ 
++ 			str = "prepare";
++ 			/*
++ 			 * When walking the list of connected widgets, the pipeline_params for each
++ 			 * widget is modified by the source widget in the path. Use a local
++ 			 * copy of the runtime params as the pipeline_params so that the runtime
++ 			 * params does not get overwritten.
++ 			 */
++ 			memcpy(&pipeline_params, fe_params, sizeof(*fe_params));
++ 
++ 			ret = sof_prepare_widgets_in_path(sdev, widget, fe_params,
++ 							  platform_params, &pipeline_params, dir);
++ 			break;
++ 		}
++ 		case SOF_WIDGET_UNPREPARE:
++ 			sof_unprepare_widgets_in_path(sdev, widget);
++ 			break;
++ 		default:
++ 			dev_err(sdev->dev, "Invalid widget op %d\n", op);
++ 			return -EINVAL;
++ 		}
++ 		if (ret < 0) {
++ 			dev_err(sdev->dev, "Failed to %s connected widgets\n", str);
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int sof_widget_list_setup(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm,
++ 			  struct snd_pcm_hw_params *fe_params,
++ 			  struct snd_sof_platform_stream_params *platform_params,
++ 			  int dir)
+++>>>>>>> 66344c6d9211 (ASoC: SOF: Add a prepare op to IPC topology widget ops)
+  {
+ -	const struct sof_ipc_tplg_ops *ipc_tplg_ops = sdev->ipc->ops->tplg;
+  	struct snd_soc_dapm_widget_list *list = spcm->stream[dir].list;
+  	struct snd_soc_dapm_widget *widget;
+ -	int i, ret;
+ +	int i, ret, num_widgets;
+  
+  	/* nothing to set up */
+  	if (!list)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	/* set up widgets in the list */
+ +	for_each_dapm_widgets(list, num_widgets, widget) {
+ +		struct snd_sof_widget *swidget = widget->dobj.private;
+ +
+ +		if (!swidget)
+ +			continue;
+ +
+ +		/* set up the widget */
+ +		ret = sof_widget_setup(sdev, swidget);
+ +		if (ret < 0)
+ +			goto widget_free;
+ +	}
+++=======
++ 	/*
++ 	 * Prepare widgets for set up. The prepare step is used to allocate memory, assign
++ 	 * instance ID and pick the widget configuration based on the runtime PCM params.
++ 	 */
++ 	ret = sof_walk_widgets_in_order(sdev, list, fe_params, platform_params,
++ 					dir, SOF_WIDGET_PREPARE);
++ 	if (ret < 0)
++ 		return ret;
+++>>>>>>> 66344c6d9211 (ASoC: SOF: Add a prepare op to IPC topology widget ops)
++ 
++ 	/* Set up is used to send the IPC to the DSP to create the widget */
++ 	ret = sof_walk_widgets_in_order(sdev, list, fe_params, platform_params,
++ 					dir, SOF_WIDGET_SETUP);
++ 	if (ret < 0) {
++ 		ret = sof_walk_widgets_in_order(sdev, list, fe_params, platform_params,
++ 						dir, SOF_WIDGET_UNPREPARE);
++ 		return ret;
++ 	}
+  
+  	/*
+  	 * error in setting pipeline connections will result in route status being reset for
+@@@ -479,18 -541,9 +719,24 @@@
+  	return 0;
+  
+  widget_free:
+++<<<<<<< HEAD
+ +	/* free all widgets that have been set up successfully */
+ +	for_each_dapm_widgets(list, i, widget) {
+ +		struct snd_sof_widget *swidget = widget->dobj.private;
+ +
+ +		if (!swidget)
+ +			continue;
+ +
+ +		if (!num_widgets--)
+ +			break;
+ +
+ +		sof_widget_free(sdev, swidget);
+ +	}
+++=======
++ 	sof_walk_widgets_in_order(sdev, list, fe_params, platform_params, dir,
++ 				  SOF_WIDGET_FREE);
++ 	sof_walk_widgets_in_order(sdev, list, NULL, NULL, dir, SOF_WIDGET_UNPREPARE);
+++>>>>>>> 66344c6d9211 (ASoC: SOF: Add a prepare op to IPC topology widget ops)
+  
+  	return ret;
+  }
+@@@ -506,24 -557,11 +752,32 @@@ int sof_widget_list_free(struct snd_sof
+  	if (!list)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Free widgets in the list. This can fail but continue freeing other widgets to keep
+ +	 * use_counts balanced.
+ +	 */
+ +	for_each_dapm_widgets(list, i, widget) {
+ +		struct snd_sof_widget *swidget = widget->dobj.private;
+ +
+ +		if (!swidget)
+ +			continue;
+ +
+ +		/*
+ +		 * free widget and its pipe_widget. Either of these can fail, but free as many as
+ +		 * possible before freeing the list and returning the error.
+ +		 */
+ +		ret = sof_widget_free(sdev, swidget);
+ +		if (ret < 0)
+ +			ret1 = ret;
+ +	}
+++=======
++ 	/* send IPC to free widget in the DSP */
++ 	ret = sof_walk_widgets_in_order(sdev, list, NULL, NULL, dir, SOF_WIDGET_FREE);
++ 
++ 	/* unprepare the widget */
++ 	sof_walk_widgets_in_order(sdev, list, NULL, NULL, dir, SOF_WIDGET_UNPREPARE);
+++>>>>>>> 66344c6d9211 (ASoC: SOF: Add a prepare op to IPC topology widget ops)
+  
+  	snd_soc_dapm_dai_free_widgets(&list);
+  	spcm->stream[dir].list = NULL;
+diff --cc sound/soc/sof/sof-audio.h
+index 12d531df1752,27cc5fb642e5..000000000000
+--- a/sound/soc/sof/sof-audio.h
++++ b/sound/soc/sof/sof-audio.h
+@@@ -29,6 -29,46 +29,49 @@@
+  #define DMA_CHAN_INVALID	0xFFFFFFFF
+  
+  #define WIDGET_IS_DAI(id) ((id) == snd_soc_dapm_dai_in || (id) == snd_soc_dapm_dai_out)
+++<<<<<<< HEAD
+++=======
++ #define WIDGET_IS_AIF(id) ((id) == snd_soc_dapm_aif_in || (id) == snd_soc_dapm_aif_out)
++ #define WIDGET_IS_AIF_OR_DAI(id) (WIDGET_IS_DAI(id) || WIDGET_IS_AIF(id))
++ 
++ #define SOF_DAI_CLK_INTEL_SSP_MCLK	0
++ #define SOF_DAI_CLK_INTEL_SSP_BCLK	1
++ 
++ enum sof_widget_op {
++ 	SOF_WIDGET_PREPARE,
++ 	SOF_WIDGET_SETUP,
++ 	SOF_WIDGET_FREE,
++ 	SOF_WIDGET_UNPREPARE,
++ };
++ 
++ /*
++  * Volume fractional word length define to 16 sets
++  * the volume linear gain value to use Qx.16 format
++  */
++ #define VOLUME_FWL	16
++ 
++ #define SOF_TLV_ITEMS 3
++ 
++ static inline u32 mixer_to_ipc(unsigned int value, u32 *volume_map, int size)
++ {
++ 	if (value >= size)
++ 		return volume_map[size - 1];
++ 
++ 	return volume_map[value];
++ }
++ 
++ static inline u32 ipc_to_mixer(u32 value, u32 *volume_map, int size)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < size; i++) {
++ 		if (volume_map[i] >= value)
++ 			return i;
++ 	}
++ 
++ 	return i - 1;
++ }
+++>>>>>>> 66344c6d9211 (ASoC: SOF: Add a prepare op to IPC topology widget ops)
+  
+  struct snd_sof_widget;
+  struct snd_sof_route;
+@@@ -235,7 -336,16 +285,12 @@@ struct snd_sof_widget 
+  	struct snd_soc_component *scomp;
+  	int comp_id;
+  	int pipeline_id;
+ -	/*
+ -	 * complete flag is used to indicate that pipeline set up is complete for scheduler type
+ -	 * widgets. It is unused for all other widget types.
+ -	 */
+  	int complete;
++ 	/*
++ 	 * the prepared flag is used to indicate that a widget has been prepared for getting set
++ 	 * up in the DSP.
++ 	 */
++ 	bool prepared;
+  	int use_count; /* use_count will be protected by the PCM mutex held by the core */
+  	int core;
+  	int id; /* id is the DAPM widget type */
+@@@ -402,9 -501,14 +457,12 @@@ void sof_machine_unregister(struct snd_
+  
+  int sof_widget_setup(struct snd_sof_dev *sdev, struct snd_sof_widget *swidget);
+  int sof_widget_free(struct snd_sof_dev *sdev, struct snd_sof_widget *swidget);
+ -int sof_route_setup(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget *wsource,
+ -		    struct snd_soc_dapm_widget *wsink);
+  
+  /* PCM */
+- int sof_widget_list_setup(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm, int dir);
++ int sof_widget_list_setup(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm,
++ 			  struct snd_pcm_hw_params *fe_params,
++ 			  struct snd_sof_platform_stream_params *platform_params,
++ 			  int dir);
+  int sof_widget_list_free(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm, int dir);
+  int sof_pcm_dsp_pcm_free(struct snd_pcm_substream *substream, struct snd_sof_dev *sdev,
+  			 struct snd_sof_pcm *spcm);
+* Unmerged path sound/soc/sof/pcm.c
+* Unmerged path sound/soc/sof/sof-audio.c
+* Unmerged path sound/soc/sof/sof-audio.h
