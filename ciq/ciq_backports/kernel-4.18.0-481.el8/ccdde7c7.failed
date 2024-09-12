@@ -1,0 +1,788 @@
+wifi: mac80211: properly implement MLO key handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit ccdde7c74ffd7e8bdd3cf685bbfa41231c8e3131
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/ccdde7c7.failed
+
+Implement key installation and lookup (on TX and RX)
+for MLO, so we can use multiple GTKs/IGTKs/BIGTKs.
+
+Co-authored-by: Ilan Peer <ilan.peer@intel.com>
+	Signed-off-by: Ilan Peer <ilan.peer@intel.com>
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit ccdde7c74ffd7e8bdd3cf685bbfa41231c8e3131)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/cfg.c
+diff --cc net/mac80211/cfg.c
+index a5108c4d24c4,854becd00468..000000000000
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@@ -452,10 -458,12 +458,12 @@@ static int ieee80211_set_tx(struct ieee
+  }
+  
+  static int ieee80211_add_key(struct wiphy *wiphy, struct net_device *dev,
+ -			     int link_id, u8 key_idx, bool pairwise,
+ -			     const u8 *mac_addr, struct key_params *params)
+ +			     u8 key_idx, bool pairwise, const u8 *mac_addr,
+ +			     struct key_params *params)
+  {
+  	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++ 	struct ieee80211_link_data *link =
++ 		ieee80211_link_or_deflink(sdata, link_id, false);
+  	struct ieee80211_local *local = sdata->local;
+  	struct sta_info *sta = NULL;
+  	struct ieee80211_key *key;
+@@@ -554,14 -569,24 +569,28 @@@
+  }
+  
+  static struct ieee80211_key *
+- ieee80211_lookup_key(struct ieee80211_sub_if_data *sdata,
++ ieee80211_lookup_key(struct ieee80211_sub_if_data *sdata, int link_id,
+  		     u8 key_idx, bool pairwise, const u8 *mac_addr)
+  {
+++<<<<<<< HEAD
+ +	struct ieee80211_local *local __maybe_unused = sdata->local;
+++=======
++ 	struct ieee80211_local *local = sdata->local;
++ 	struct ieee80211_link_data *link = &sdata->deflink;
+++>>>>>>> ccdde7c74ffd (wifi: mac80211: properly implement MLO key handling)
+  	struct ieee80211_key *key;
+- 	struct sta_info *sta;
++ 
++ 	if (link_id >= 0) {
++ 		link = rcu_dereference_check(sdata->link[link_id],
++ 					     lockdep_is_held(&sdata->wdev.mtx));
++ 		if (!link)
++ 			return NULL;
++ 	}
+  
+  	if (mac_addr) {
++ 		struct sta_info *sta;
++ 		struct link_sta_info *link_sta;
++ 
+  		sta = sta_info_get_bss(sdata, mac_addr);
+  		if (!sta)
+  			return NULL;
+@@@ -741,22 -781,32 +784,32 @@@ static int ieee80211_config_default_key
+  
+  static int ieee80211_config_default_mgmt_key(struct wiphy *wiphy,
+  					     struct net_device *dev,
+ -					     int link_id, u8 key_idx)
+ +					     u8 key_idx)
+  {
+  	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++ 	struct ieee80211_link_data *link =
++ 		ieee80211_link_or_deflink(sdata, link_id, true);
+  
+- 	ieee80211_set_default_mgmt_key(sdata, key_idx);
++ 	if (IS_ERR(link))
++ 		return PTR_ERR(link);
++ 
++ 	ieee80211_set_default_mgmt_key(link, key_idx);
+  
+  	return 0;
+  }
+  
+  static int ieee80211_config_default_beacon_key(struct wiphy *wiphy,
+  					       struct net_device *dev,
+ -					       int link_id, u8 key_idx)
+ +					       u8 key_idx)
+  {
+  	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++ 	struct ieee80211_link_data *link =
++ 		ieee80211_link_or_deflink(sdata, link_id, true);
++ 
++ 	if (IS_ERR(link))
++ 		return PTR_ERR(link);
+  
+- 	ieee80211_set_default_beacon_key(sdata, key_idx);
++ 	ieee80211_set_default_beacon_key(link, key_idx);
+  
+  	return 0;
+  }
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index 353244f78573..230bed9f25cc 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -1975,6 +1975,7 @@ enum ieee80211_key_flags {
+  * 	- Temporal Authenticator Rx MIC Key (64 bits)
+  * @icv_len: The ICV length for this key type
+  * @iv_len: The IV length for this key type
++ * @link_id: the link ID for MLO, or -1 for non-MLO or pairwise keys
+  */
+ struct ieee80211_key_conf {
+ 	atomic64_t tx_pn;
+@@ -1984,6 +1985,7 @@ struct ieee80211_key_conf {
+ 	u8 hw_key_idx;
+ 	s8 keyidx;
+ 	u16 flags;
++	s8 link_id;
+ 	u8 keylen;
+ 	u8 key[];
+ };
+* Unmerged path net/mac80211/cfg.c
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 9815568d88ca..8b8ca0b6f3c8 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -213,6 +213,7 @@ struct ieee80211_rx_data {
+ 	struct ieee80211_sub_if_data *sdata;
+ 	struct ieee80211_link_data *link;
+ 	struct sta_info *sta;
++	struct link_sta_info *link_sta;
+ 	struct ieee80211_key *key;
+ 
+ 	unsigned int flags;
+diff --git a/net/mac80211/iface.c b/net/mac80211/iface.c
+index 659f868250d8..d4dd8581d08c 100644
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -434,10 +434,19 @@ struct link_container {
+ static void ieee80211_free_links(struct ieee80211_sub_if_data *sdata,
+ 				 struct link_container **links)
+ {
++	LIST_HEAD(keys);
+ 	unsigned int link_id;
+ 
++	for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++) {
++		if (!links[link_id])
++			continue;
++		ieee80211_remove_link_keys(&links[link_id]->data, &keys);
++	}
++
+ 	synchronize_rcu();
+ 
++	ieee80211_free_key_list(sdata->local, &keys);
++
+ 	for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++) {
+ 		if (!links[link_id])
+ 			continue;
+diff --git a/net/mac80211/key.c b/net/mac80211/key.c
+index 6befb578ed9e..86aac87e0211 100644
+--- a/net/mac80211/key.c
++++ b/net/mac80211/key.c
+@@ -344,9 +344,10 @@ static void ieee80211_pairwise_rekey(struct ieee80211_key *old,
+ 	}
+ }
+ 
+-static void __ieee80211_set_default_key(struct ieee80211_sub_if_data *sdata,
++static void __ieee80211_set_default_key(struct ieee80211_link_data *link,
+ 					int idx, bool uni, bool multi)
+ {
++	struct ieee80211_sub_if_data *sdata = link->sdata;
+ 	struct ieee80211_key *key = NULL;
+ 
+ 	assert_key_lock(sdata->local);
+@@ -354,7 +355,7 @@ static void __ieee80211_set_default_key(struct ieee80211_sub_if_data *sdata,
+ 	if (idx >= 0 && idx < NUM_DEFAULT_KEYS) {
+ 		key = key_mtx_dereference(sdata->local, sdata->keys[idx]);
+ 		if (!key)
+-			key = key_mtx_dereference(sdata->local, sdata->deflink.gtk[idx]);
++			key = key_mtx_dereference(sdata->local, link->gtk[idx]);
+ 	}
+ 
+ 	if (uni) {
+@@ -365,47 +366,48 @@ static void __ieee80211_set_default_key(struct ieee80211_sub_if_data *sdata,
+ 	}
+ 
+ 	if (multi)
+-		rcu_assign_pointer(sdata->deflink.default_multicast_key, key);
++		rcu_assign_pointer(link->default_multicast_key, key);
+ 
+ 	ieee80211_debugfs_key_update_default(sdata);
+ }
+ 
+-void ieee80211_set_default_key(struct ieee80211_sub_if_data *sdata, int idx,
++void ieee80211_set_default_key(struct ieee80211_link_data *link, int idx,
+ 			       bool uni, bool multi)
+ {
+-	mutex_lock(&sdata->local->key_mtx);
+-	__ieee80211_set_default_key(sdata, idx, uni, multi);
+-	mutex_unlock(&sdata->local->key_mtx);
++	mutex_lock(&link->sdata->local->key_mtx);
++	__ieee80211_set_default_key(link, idx, uni, multi);
++	mutex_unlock(&link->sdata->local->key_mtx);
+ }
+ 
+ static void
+-__ieee80211_set_default_mgmt_key(struct ieee80211_sub_if_data *sdata, int idx)
++__ieee80211_set_default_mgmt_key(struct ieee80211_link_data *link, int idx)
+ {
++	struct ieee80211_sub_if_data *sdata = link->sdata;
+ 	struct ieee80211_key *key = NULL;
+ 
+ 	assert_key_lock(sdata->local);
+ 
+ 	if (idx >= NUM_DEFAULT_KEYS &&
+ 	    idx < NUM_DEFAULT_KEYS + NUM_DEFAULT_MGMT_KEYS)
+-		key = key_mtx_dereference(sdata->local,
+-					  sdata->deflink.gtk[idx]);
++		key = key_mtx_dereference(sdata->local, link->gtk[idx]);
+ 
+-	rcu_assign_pointer(sdata->deflink.default_mgmt_key, key);
++	rcu_assign_pointer(link->default_mgmt_key, key);
+ 
+ 	ieee80211_debugfs_key_update_default(sdata);
+ }
+ 
+-void ieee80211_set_default_mgmt_key(struct ieee80211_sub_if_data *sdata,
++void ieee80211_set_default_mgmt_key(struct ieee80211_link_data *link,
+ 				    int idx)
+ {
+-	mutex_lock(&sdata->local->key_mtx);
+-	__ieee80211_set_default_mgmt_key(sdata, idx);
+-	mutex_unlock(&sdata->local->key_mtx);
++	mutex_lock(&link->sdata->local->key_mtx);
++	__ieee80211_set_default_mgmt_key(link, idx);
++	mutex_unlock(&link->sdata->local->key_mtx);
+ }
+ 
+ static void
+-__ieee80211_set_default_beacon_key(struct ieee80211_sub_if_data *sdata, int idx)
++__ieee80211_set_default_beacon_key(struct ieee80211_link_data *link, int idx)
+ {
++	struct ieee80211_sub_if_data *sdata = link->sdata;
+ 	struct ieee80211_key *key = NULL;
+ 
+ 	assert_key_lock(sdata->local);
+@@ -413,28 +415,30 @@ __ieee80211_set_default_beacon_key(struct ieee80211_sub_if_data *sdata, int idx)
+ 	if (idx >= NUM_DEFAULT_KEYS + NUM_DEFAULT_MGMT_KEYS &&
+ 	    idx < NUM_DEFAULT_KEYS + NUM_DEFAULT_MGMT_KEYS +
+ 	    NUM_DEFAULT_BEACON_KEYS)
+-		key = key_mtx_dereference(sdata->local,
+-					  sdata->deflink.gtk[idx]);
++		key = key_mtx_dereference(sdata->local, link->gtk[idx]);
+ 
+-	rcu_assign_pointer(sdata->deflink.default_beacon_key, key);
++	rcu_assign_pointer(link->default_beacon_key, key);
+ 
+ 	ieee80211_debugfs_key_update_default(sdata);
+ }
+ 
+-void ieee80211_set_default_beacon_key(struct ieee80211_sub_if_data *sdata,
++void ieee80211_set_default_beacon_key(struct ieee80211_link_data *link,
+ 				      int idx)
+ {
+-	mutex_lock(&sdata->local->key_mtx);
+-	__ieee80211_set_default_beacon_key(sdata, idx);
+-	mutex_unlock(&sdata->local->key_mtx);
++	mutex_lock(&link->sdata->local->key_mtx);
++	__ieee80211_set_default_beacon_key(link, idx);
++	mutex_unlock(&link->sdata->local->key_mtx);
+ }
+ 
+ static int ieee80211_key_replace(struct ieee80211_sub_if_data *sdata,
+-				  struct sta_info *sta,
+-				  bool pairwise,
+-				  struct ieee80211_key *old,
+-				  struct ieee80211_key *new)
++				 struct ieee80211_link_data *link,
++				 struct sta_info *sta,
++				 bool pairwise,
++				 struct ieee80211_key *old,
++				 struct ieee80211_key *new)
+ {
++	struct link_sta_info *link_sta = sta ? &sta->deflink : NULL;
++	int link_id;
+ 	int idx;
+ 	int ret = 0;
+ 	bool defunikey, defmultikey, defmgmtkey, defbeaconkey;
+@@ -446,13 +450,36 @@ static int ieee80211_key_replace(struct ieee80211_sub_if_data *sdata,
+ 
+ 	if (new) {
+ 		idx = new->conf.keyidx;
+-		list_add_tail_rcu(&new->list, &sdata->key_list);
+ 		is_wep = new->conf.cipher == WLAN_CIPHER_SUITE_WEP40 ||
+ 			 new->conf.cipher == WLAN_CIPHER_SUITE_WEP104;
++		link_id = new->conf.link_id;
+ 	} else {
+ 		idx = old->conf.keyidx;
+ 		is_wep = old->conf.cipher == WLAN_CIPHER_SUITE_WEP40 ||
+ 			 old->conf.cipher == WLAN_CIPHER_SUITE_WEP104;
++		link_id = old->conf.link_id;
++	}
++
++	if (WARN(old && old->conf.link_id != link_id,
++		 "old link ID %d doesn't match new link ID %d\n",
++		 old->conf.link_id, link_id))
++		return -EINVAL;
++
++	if (link_id >= 0) {
++		if (!link) {
++			link = sdata_dereference(sdata->link[link_id], sdata);
++			if (!link)
++				return -ENOLINK;
++		}
++
++		if (sta) {
++			link_sta = rcu_dereference_protected(sta->link[link_id],
++							     lockdep_is_held(&sta->local->sta_mtx));
++			if (!link_sta)
++				return -ENOLINK;
++		}
++	} else {
++		link = &sdata->deflink;
+ 	}
+ 
+ 	if ((is_wep || pairwise) && idx >= NUM_DEFAULT_KEYS)
+@@ -482,6 +509,9 @@ static int ieee80211_key_replace(struct ieee80211_sub_if_data *sdata,
+ 	if (ret)
+ 		return ret;
+ 
++	if (new)
++		list_add_tail_rcu(&new->list, &sdata->key_list);
++
+ 	if (sta) {
+ 		if (pairwise) {
+ 			rcu_assign_pointer(sta->ptk[idx], new);
+@@ -489,7 +519,7 @@ static int ieee80211_key_replace(struct ieee80211_sub_if_data *sdata,
+ 			    !(new->conf.flags & IEEE80211_KEY_FLAG_NO_AUTO_TX))
+ 				_ieee80211_set_tx_key(new, true);
+ 		} else {
+-			rcu_assign_pointer(sta->deflink.gtk[idx], new);
++			rcu_assign_pointer(link_sta->gtk[idx], new);
+ 		}
+ 		/* Only needed for transition from no key -> key.
+ 		 * Still triggers unnecessary when using Extended Key ID
+@@ -503,39 +533,39 @@ static int ieee80211_key_replace(struct ieee80211_sub_if_data *sdata,
+ 						sdata->default_unicast_key);
+ 		defmultikey = old &&
+ 			old == key_mtx_dereference(sdata->local,
+-						sdata->deflink.default_multicast_key);
++						   link->default_multicast_key);
+ 		defmgmtkey = old &&
+ 			old == key_mtx_dereference(sdata->local,
+-						sdata->deflink.default_mgmt_key);
++						   link->default_mgmt_key);
+ 		defbeaconkey = old &&
+ 			old == key_mtx_dereference(sdata->local,
+-						   sdata->deflink.default_beacon_key);
++						   link->default_beacon_key);
+ 
+ 		if (defunikey && !new)
+-			__ieee80211_set_default_key(sdata, -1, true, false);
++			__ieee80211_set_default_key(link, -1, true, false);
+ 		if (defmultikey && !new)
+-			__ieee80211_set_default_key(sdata, -1, false, true);
++			__ieee80211_set_default_key(link, -1, false, true);
+ 		if (defmgmtkey && !new)
+-			__ieee80211_set_default_mgmt_key(sdata, -1);
++			__ieee80211_set_default_mgmt_key(link, -1);
+ 		if (defbeaconkey && !new)
+-			__ieee80211_set_default_beacon_key(sdata, -1);
++			__ieee80211_set_default_beacon_key(link, -1);
+ 
+ 		if (is_wep || pairwise)
+ 			rcu_assign_pointer(sdata->keys[idx], new);
+ 		else
+-			rcu_assign_pointer(sdata->deflink.gtk[idx], new);
++			rcu_assign_pointer(link->gtk[idx], new);
+ 
+ 		if (defunikey && new)
+-			__ieee80211_set_default_key(sdata, new->conf.keyidx,
++			__ieee80211_set_default_key(link, new->conf.keyidx,
+ 						    true, false);
+ 		if (defmultikey && new)
+-			__ieee80211_set_default_key(sdata, new->conf.keyidx,
++			__ieee80211_set_default_key(link, new->conf.keyidx,
+ 						    false, true);
+ 		if (defmgmtkey && new)
+-			__ieee80211_set_default_mgmt_key(sdata,
++			__ieee80211_set_default_mgmt_key(link,
+ 							 new->conf.keyidx);
+ 		if (defbeaconkey && new)
+-			__ieee80211_set_default_beacon_key(sdata,
++			__ieee80211_set_default_beacon_key(link,
+ 							   new->conf.keyidx);
+ 	}
+ 
+@@ -569,6 +599,7 @@ ieee80211_key_alloc(u32 cipher, int idx, size_t key_len,
+ 	key->conf.flags = 0;
+ 	key->flags = 0;
+ 
++	key->conf.link_id = -1;
+ 	key->conf.cipher = cipher;
+ 	key->conf.keyidx = idx;
+ 	key->conf.keylen = key_len;
+@@ -797,9 +828,10 @@ static bool ieee80211_key_identical(struct ieee80211_sub_if_data *sdata,
+ }
+ 
+ int ieee80211_key_link(struct ieee80211_key *key,
+-		       struct ieee80211_sub_if_data *sdata,
++		       struct ieee80211_link_data *link,
+ 		       struct sta_info *sta)
+ {
++	struct ieee80211_sub_if_data *sdata = link->sdata;
+ 	static atomic_t key_color = ATOMIC_INIT(0);
+ 	struct ieee80211_key *old_key = NULL;
+ 	int idx = key->conf.keyidx;
+@@ -827,15 +859,24 @@ int ieee80211_key_link(struct ieee80211_key *key,
+ 		    (old_key && old_key->conf.cipher != key->conf.cipher))
+ 			goto out;
+ 	} else if (sta) {
+-		old_key = key_mtx_dereference(sdata->local,
+-					      sta->deflink.gtk[idx]);
++		struct link_sta_info *link_sta = &sta->deflink;
++		int link_id = key->conf.link_id;
++
++		if (link_id >= 0) {
++			link_sta = rcu_dereference_protected(sta->link[link_id],
++							     lockdep_is_held(&sta->local->sta_mtx));
++			if (!link_sta)
++				return -ENOLINK;
++		}
++
++		old_key = key_mtx_dereference(sdata->local, link_sta->gtk[idx]);
+ 	} else {
+ 		if (idx < NUM_DEFAULT_KEYS)
+ 			old_key = key_mtx_dereference(sdata->local,
+ 						      sdata->keys[idx]);
+ 		if (!old_key)
+ 			old_key = key_mtx_dereference(sdata->local,
+-						      sdata->deflink.gtk[idx]);
++						      link->gtk[idx]);
+ 	}
+ 
+ 	/* Non-pairwise keys must also not switch the cipher on rekey */
+@@ -866,7 +907,7 @@ int ieee80211_key_link(struct ieee80211_key *key,
+ 
+ 	increment_tailroom_need_count(sdata);
+ 
+-	ret = ieee80211_key_replace(sdata, sta, pairwise, old_key, key);
++	ret = ieee80211_key_replace(sdata, link, sta, pairwise, old_key, key);
+ 
+ 	if (!ret) {
+ 		ieee80211_debugfs_key_add(key);
+@@ -890,9 +931,9 @@ void ieee80211_key_free(struct ieee80211_key *key, bool delay_tailroom)
+ 	 * Replace key with nothingness if it was ever used.
+ 	 */
+ 	if (key->sdata)
+-		ieee80211_key_replace(key->sdata, key->sta,
+-				key->conf.flags & IEEE80211_KEY_FLAG_PAIRWISE,
+-				key, NULL);
++		ieee80211_key_replace(key->sdata, NULL, key->sta,
++				      key->conf.flags & IEEE80211_KEY_FLAG_PAIRWISE,
++				      key, NULL);
+ 	ieee80211_key_destroy(key, delay_tailroom);
+ }
+ 
+@@ -1019,15 +1060,45 @@ static void ieee80211_free_keys_iface(struct ieee80211_sub_if_data *sdata,
+ 	ieee80211_debugfs_key_remove_beacon_default(sdata);
+ 
+ 	list_for_each_entry_safe(key, tmp, &sdata->key_list, list) {
+-		ieee80211_key_replace(key->sdata, key->sta,
+-				key->conf.flags & IEEE80211_KEY_FLAG_PAIRWISE,
+-				key, NULL);
++		ieee80211_key_replace(key->sdata, NULL, key->sta,
++				      key->conf.flags & IEEE80211_KEY_FLAG_PAIRWISE,
++				      key, NULL);
+ 		list_add_tail(&key->list, keys);
+ 	}
+ 
+ 	ieee80211_debugfs_key_update_default(sdata);
+ }
+ 
++void ieee80211_remove_link_keys(struct ieee80211_link_data *link,
++				struct list_head *keys)
++{
++	struct ieee80211_sub_if_data *sdata = link->sdata;
++	struct ieee80211_local *local = sdata->local;
++	struct ieee80211_key *key, *tmp;
++
++	mutex_lock(&local->key_mtx);
++	list_for_each_entry_safe(key, tmp, &sdata->key_list, list) {
++		if (key->conf.link_id != link->link_id)
++			continue;
++		ieee80211_key_replace(key->sdata, link, key->sta,
++				      key->conf.flags & IEEE80211_KEY_FLAG_PAIRWISE,
++				      key, NULL);
++		list_add_tail(&key->list, keys);
++	}
++	mutex_unlock(&local->key_mtx);
++}
++
++void ieee80211_free_key_list(struct ieee80211_local *local,
++			     struct list_head *keys)
++{
++	struct ieee80211_key *key, *tmp;
++
++	mutex_lock(&local->key_mtx);
++	list_for_each_entry_safe(key, tmp, keys, list)
++		__ieee80211_key_destroy(key, false);
++	mutex_unlock(&local->key_mtx);
++}
++
+ void ieee80211_free_keys(struct ieee80211_sub_if_data *sdata,
+ 			 bool force_synchronize)
+ {
+@@ -1087,9 +1158,9 @@ void ieee80211_free_sta_keys(struct ieee80211_local *local,
+ 		key = key_mtx_dereference(local, sta->deflink.gtk[i]);
+ 		if (!key)
+ 			continue;
+-		ieee80211_key_replace(key->sdata, key->sta,
+-				key->conf.flags & IEEE80211_KEY_FLAG_PAIRWISE,
+-				key, NULL);
++		ieee80211_key_replace(key->sdata, NULL, key->sta,
++				      key->conf.flags & IEEE80211_KEY_FLAG_PAIRWISE,
++				      key, NULL);
+ 		__ieee80211_key_destroy(key, key->sdata->vif.type ==
+ 					NL80211_IFTYPE_STATION);
+ 	}
+@@ -1098,9 +1169,9 @@ void ieee80211_free_sta_keys(struct ieee80211_local *local,
+ 		key = key_mtx_dereference(local, sta->ptk[i]);
+ 		if (!key)
+ 			continue;
+-		ieee80211_key_replace(key->sdata, key->sta,
+-				key->conf.flags & IEEE80211_KEY_FLAG_PAIRWISE,
+-				key, NULL);
++		ieee80211_key_replace(key->sdata, NULL, key->sta,
++				      key->conf.flags & IEEE80211_KEY_FLAG_PAIRWISE,
++				      key, NULL);
+ 		__ieee80211_key_destroy(key, key->sdata->vif.type ==
+ 					NL80211_IFTYPE_STATION);
+ 	}
+@@ -1307,7 +1378,8 @@ ieee80211_gtk_rekey_add(struct ieee80211_vif *vif,
+ 	if (sdata->u.mgd.mfp != IEEE80211_MFP_DISABLED)
+ 		key->conf.flags |= IEEE80211_KEY_FLAG_RX_MGMT;
+ 
+-	err = ieee80211_key_link(key, sdata, NULL);
++	/* FIXME: this function needs to get a link ID */
++	err = ieee80211_key_link(key, &sdata->deflink, NULL);
+ 	if (err)
+ 		return ERR_PTR(err);
+ 
+diff --git a/net/mac80211/key.h b/net/mac80211/key.h
+index e994dcea1ce3..518af24aab56 100644
+--- a/net/mac80211/key.h
++++ b/net/mac80211/key.h
+@@ -22,6 +22,7 @@
+ 
+ struct ieee80211_local;
+ struct ieee80211_sub_if_data;
++struct ieee80211_link_data;
+ struct sta_info;
+ 
+ /**
+@@ -144,17 +145,21 @@ ieee80211_key_alloc(u32 cipher, int idx, size_t key_len,
+  * to make it used, free old key. On failure, also free the new key.
+  */
+ int ieee80211_key_link(struct ieee80211_key *key,
+-		       struct ieee80211_sub_if_data *sdata,
++		       struct ieee80211_link_data *link,
+ 		       struct sta_info *sta);
+ int ieee80211_set_tx_key(struct ieee80211_key *key);
+ void ieee80211_key_free(struct ieee80211_key *key, bool delay_tailroom);
+ void ieee80211_key_free_unused(struct ieee80211_key *key);
+-void ieee80211_set_default_key(struct ieee80211_sub_if_data *sdata, int idx,
++void ieee80211_set_default_key(struct ieee80211_link_data *link, int idx,
+ 			       bool uni, bool multi);
+-void ieee80211_set_default_mgmt_key(struct ieee80211_sub_if_data *sdata,
++void ieee80211_set_default_mgmt_key(struct ieee80211_link_data *link,
+ 				    int idx);
+-void ieee80211_set_default_beacon_key(struct ieee80211_sub_if_data *sdata,
++void ieee80211_set_default_beacon_key(struct ieee80211_link_data *link,
+ 				      int idx);
++void ieee80211_remove_link_keys(struct ieee80211_link_data *link,
++				struct list_head *keys);
++void ieee80211_free_key_list(struct ieee80211_local *local,
++			     struct list_head *keys);
+ void ieee80211_free_keys(struct ieee80211_sub_if_data *sdata,
+ 			 bool force_synchronize);
+ void ieee80211_free_sta_keys(struct ieee80211_local *local,
+diff --git a/net/mac80211/rx.c b/net/mac80211/rx.c
+index 6081352f4f6d..cd5e4ebc1675 100644
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -1854,7 +1854,6 @@ static struct ieee80211_key *
+ ieee80211_rx_get_bigtk(struct ieee80211_rx_data *rx, int idx)
+ {
+ 	struct ieee80211_key *key = NULL;
+-	struct ieee80211_sub_if_data *sdata = rx->sdata;
+ 	int idx2;
+ 
+ 	/* Make sure key gets set if either BIGTK key index is set so that
+@@ -1873,14 +1872,14 @@ ieee80211_rx_get_bigtk(struct ieee80211_rx_data *rx, int idx)
+ 			idx2 = idx - 1;
+ 	}
+ 
+-	if (rx->sta)
+-		key = rcu_dereference(rx->sta->deflink.gtk[idx]);
++	if (rx->link_sta)
++		key = rcu_dereference(rx->link_sta->gtk[idx]);
+ 	if (!key)
+-		key = rcu_dereference(sdata->deflink.gtk[idx]);
+-	if (!key && rx->sta)
+-		key = rcu_dereference(rx->sta->deflink.gtk[idx2]);
++		key = rcu_dereference(rx->link->gtk[idx]);
++	if (!key && rx->link_sta)
++		key = rcu_dereference(rx->link_sta->gtk[idx2]);
+ 	if (!key)
+-		key = rcu_dereference(sdata->deflink.gtk[idx2]);
++		key = rcu_dereference(rx->link->gtk[idx2]);
+ 
+ 	return key;
+ }
+@@ -1986,15 +1985,15 @@ ieee80211_rx_h_decrypt(struct ieee80211_rx_data *rx)
+ 		if (mmie_keyidx < NUM_DEFAULT_KEYS ||
+ 		    mmie_keyidx >= NUM_DEFAULT_KEYS + NUM_DEFAULT_MGMT_KEYS)
+ 			return RX_DROP_MONITOR; /* unexpected BIP keyidx */
+-		if (rx->sta) {
++		if (rx->link_sta) {
+ 			if (ieee80211_is_group_privacy_action(skb) &&
+ 			    test_sta_flag(rx->sta, WLAN_STA_MFP))
+ 				return RX_DROP_MONITOR;
+ 
+-			rx->key = rcu_dereference(rx->sta->deflink.gtk[mmie_keyidx]);
++			rx->key = rcu_dereference(rx->link_sta->gtk[mmie_keyidx]);
+ 		}
+ 		if (!rx->key)
+-			rx->key = rcu_dereference(rx->sdata->deflink.gtk[mmie_keyidx]);
++			rx->key = rcu_dereference(rx->link->gtk[mmie_keyidx]);
+ 	} else if (!ieee80211_has_protected(fc)) {
+ 		/*
+ 		 * The frame was not protected, so skip decryption. However, we
+@@ -2003,25 +2002,24 @@ ieee80211_rx_h_decrypt(struct ieee80211_rx_data *rx)
+ 		 * have been expected.
+ 		 */
+ 		struct ieee80211_key *key = NULL;
+-		struct ieee80211_sub_if_data *sdata = rx->sdata;
+ 		int i;
+ 
+ 		if (ieee80211_is_beacon(fc)) {
+ 			key = ieee80211_rx_get_bigtk(rx, -1);
+ 		} else if (ieee80211_is_mgmt(fc) &&
+ 			   is_multicast_ether_addr(hdr->addr1)) {
+-			key = rcu_dereference(rx->sdata->deflink.default_mgmt_key);
++			key = rcu_dereference(rx->link->default_mgmt_key);
+ 		} else {
+-			if (rx->sta) {
++			if (rx->link_sta) {
+ 				for (i = 0; i < NUM_DEFAULT_KEYS; i++) {
+-					key = rcu_dereference(rx->sta->deflink.gtk[i]);
++					key = rcu_dereference(rx->link_sta->gtk[i]);
+ 					if (key)
+ 						break;
+ 				}
+ 			}
+ 			if (!key) {
+ 				for (i = 0; i < NUM_DEFAULT_KEYS; i++) {
+-					key = rcu_dereference(sdata->deflink.gtk[i]);
++					key = rcu_dereference(rx->link->gtk[i]);
+ 					if (key)
+ 						break;
+ 				}
+@@ -2050,13 +2048,13 @@ ieee80211_rx_h_decrypt(struct ieee80211_rx_data *rx)
+ 			return RX_DROP_UNUSABLE;
+ 
+ 		/* check per-station GTK first, if multicast packet */
+-		if (is_multicast_ether_addr(hdr->addr1) && rx->sta)
+-			rx->key = rcu_dereference(rx->sta->deflink.gtk[keyidx]);
++		if (is_multicast_ether_addr(hdr->addr1) && rx->link_sta)
++			rx->key = rcu_dereference(rx->link_sta->gtk[keyidx]);
+ 
+ 		/* if not found, try default key */
+ 		if (!rx->key) {
+ 			if (is_multicast_ether_addr(hdr->addr1))
+-				rx->key = rcu_dereference(rx->sdata->deflink.gtk[keyidx]);
++				rx->key = rcu_dereference(rx->link->gtk[keyidx]);
+ 			if (!rx->key)
+ 				rx->key = rcu_dereference(rx->sdata->keys[keyidx]);
+ 
+@@ -4773,7 +4771,17 @@ static bool ieee80211_prepare_and_rx_handle(struct ieee80211_rx_data *rx,
+ 		if (!link)
+ 			return true;
+ 		rx->link = link;
++
++		if (rx->sta) {
++			rx->link_sta =
++				rcu_dereference(rx->sta->link[rx->link_id]);
++			if (!rx->link_sta)
++				return true;
++		}
+ 	} else {
++		if (rx->sta)
++			rx->link_sta = &rx->sta->deflink;
++
+ 		rx->link = &sdata->deflink;
+ 	}
+ 
+diff --git a/net/mac80211/tx.c b/net/mac80211/tx.c
+index aa9b8ea58cc0..8e61c2127e8e 100644
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -576,6 +576,51 @@ ieee80211_tx_h_check_control_port_protocol(struct ieee80211_tx_data *tx)
+ 	return TX_CONTINUE;
+ }
+ 
++static struct ieee80211_key *
++ieee80211_select_link_key(struct ieee80211_tx_data *tx)
++{
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)tx->skb->data;
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(tx->skb);
++	enum {
++		USE_NONE,
++		USE_MGMT_KEY,
++		USE_MCAST_KEY,
++	} which_key = USE_NONE;
++	struct ieee80211_link_data *link;
++	unsigned int link_id;
++
++	if (ieee80211_is_group_privacy_action(tx->skb))
++		which_key = USE_MCAST_KEY;
++	else if (ieee80211_is_mgmt(hdr->frame_control) &&
++		 is_multicast_ether_addr(hdr->addr1) &&
++		 ieee80211_is_robust_mgmt_frame(tx->skb))
++		which_key = USE_MGMT_KEY;
++	else if (is_multicast_ether_addr(hdr->addr1))
++		which_key = USE_MCAST_KEY;
++	else
++		return NULL;
++
++	link_id = u32_get_bits(info->control.flags, IEEE80211_TX_CTRL_MLO_LINK);
++	if (link_id == IEEE80211_LINK_UNSPECIFIED) {
++		link = &tx->sdata->deflink;
++	} else {
++		link = rcu_dereference(tx->sdata->link[link_id]);
++		if (!link)
++			return NULL;
++	}
++
++	switch (which_key) {
++	case USE_NONE:
++		break;
++	case USE_MGMT_KEY:
++		return rcu_dereference(link->default_mgmt_key);
++	case USE_MCAST_KEY:
++		return rcu_dereference(link->default_multicast_key);
++	}
++
++	return NULL;
++}
++
+ static ieee80211_tx_result debug_noinline
+ ieee80211_tx_h_select_key(struct ieee80211_tx_data *tx)
+ {
+@@ -591,16 +636,7 @@ ieee80211_tx_h_select_key(struct ieee80211_tx_data *tx)
+ 	if (tx->sta &&
+ 	    (key = rcu_dereference(tx->sta->ptk[tx->sta->ptk_idx])))
+ 		tx->key = key;
+-	else if (ieee80211_is_group_privacy_action(tx->skb) &&
+-		(key = rcu_dereference(tx->sdata->deflink.default_multicast_key)))
+-		tx->key = key;
+-	else if (ieee80211_is_mgmt(hdr->frame_control) &&
+-		 is_multicast_ether_addr(hdr->addr1) &&
+-		 ieee80211_is_robust_mgmt_frame(tx->skb) &&
+-		 (key = rcu_dereference(tx->sdata->deflink.default_mgmt_key)))
+-		tx->key = key;
+-	else if (is_multicast_ether_addr(hdr->addr1) &&
+-		 (key = rcu_dereference(tx->sdata->deflink.default_multicast_key)))
++	else if ((key = ieee80211_select_link_key(tx)))
+ 		tx->key = key;
+ 	else if (!is_multicast_ether_addr(hdr->addr1) &&
+ 		 (key = rcu_dereference(tx->sdata->default_unicast_key)))
