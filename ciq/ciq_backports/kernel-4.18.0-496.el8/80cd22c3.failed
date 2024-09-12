@@ -1,0 +1,226 @@
+net/sched: cls_api: Support hardware miss to tc action
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Paul Blakey <paulb@nvidia.com>
+commit 80cd22c35c9001fe72bf614d29439de41933deca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/80cd22c3.failed
+
+For drivers to support partial offload of a filter's action list,
+add support for action miss to specify an action instance to
+continue from in sw.
+
+CT action in particular can't be fully offloaded, as new connections
+need to be handled in software. This imposes other limitations on
+the actions that can be offloaded together with the CT action, such
+as packet modifications.
+
+Assign each action on a filter's action list a unique miss_cookie
+which drivers can then use to fill action_miss part of the tc skb
+extension. On getting back this miss_cookie, find the action
+instance with relevant cookie and continue classifying from there.
+
+	Signed-off-by: Paul Blakey <paulb@nvidia.com>
+	Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+	Reviewed-by: Simon Horman <simon.horman@corigine.com>
+	Reviewed-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 80cd22c35c9001fe72bf614d29439de41933deca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/flow_offload.h
+#	include/net/pkt_cls.h
+#	net/sched/cls_api.c
+diff --cc include/net/flow_offload.h
+index e5540ac44e25,118082eae48c..000000000000
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@@ -228,7 -228,8 +228,12 @@@ void flow_action_cookie_destroy(struct 
+  struct flow_action_entry {
+  	enum flow_action_id		id;
+  	u32				hw_index;
+++<<<<<<< HEAD
+ +	unsigned long			act_cookie;
+++=======
++ 	unsigned long			cookie;
++ 	u64				miss_cookie;
+++>>>>>>> 80cd22c35c90 (net/sched: cls_api: Support hardware miss to tc action)
+  	enum flow_action_hw_stats	hw_stats;
+  	action_destr			destructor;
+  	void				*destructor_priv;
+diff --cc include/net/pkt_cls.h
+index 3a8d0d311e79,b3b5b0b62f16..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -227,7 -229,9 +229,13 @@@ struct tcf_exts 
+  	__u32	type; /* for backward compat(TCA_OLD_COMPAT) */
+  	int nr_actions;
+  	struct tc_action **actions;
+++<<<<<<< HEAD
+ +	struct net *net;
+++=======
++ 	struct net	*net;
++ 	netns_tracker	ns_tracker;
++ 	struct tcf_exts_miss_cookie_node *miss_cookie_node;
+++>>>>>>> 80cd22c35c90 (net/sched: cls_api: Support hardware miss to tc action)
+  #endif
+  	/* Map to export classifier specific extension TLV types to the
+  	 * generic extensions API. Unsupported extensions must be set to 0.
+@@@ -239,18 -243,11 +247,22 @@@
+  static inline int tcf_exts_init(struct tcf_exts *exts, struct net *net,
+  				int action, int police)
+  {
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NET_CLS_ACT
+ +	exts->type = 0;
+ +	exts->nr_actions = 0;
+ +	exts->net = net;
+ +	exts->actions = kcalloc(TCA_ACT_MAX_PRIO, sizeof(struct tc_action *),
+ +				GFP_KERNEL);
+ +	if (!exts->actions)
+ +		return -ENOMEM;
+++=======
++ #ifdef CONFIG_NET_CLS
++ 	return tcf_exts_init_ex(exts, net, action, police, NULL, 0, false);
++ #else
++ 	return -EOPNOTSUPP;
+++>>>>>>> 80cd22c35c90 (net/sched: cls_api: Support hardware miss to tc action)
+  #endif
+- 	exts->action = action;
+- 	exts->police = police;
+- 	return 0;
+  }
+  
+  /* Return false if the netns is being destroyed in cleanup_net(). Callers
+diff --cc net/sched/cls_api.c
+index cbeb5ab635f8,3569e2c3660c..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -1564,13 -1666,36 +1670,40 @@@ reclassify
+  #endif
+  	for (; tp; tp = rcu_dereference_bh(tp->next)) {
+  		__be16 protocol = skb_protocol(skb, false);
+- 		int err;
++ 		int err = 0;
+  
+- 		if (tp->protocol != protocol &&
+- 		    tp->protocol != htons(ETH_P_ALL))
+- 			continue;
++ 		if (n) {
++ 			struct tcf_exts *exts;
+  
+++<<<<<<< HEAD
+ +		err = tp->classify(skb, tp, res);
+++=======
++ 			if (n->tp_prio != tp->prio)
++ 				continue;
++ 
++ 			/* We re-lookup the tp and chain based on index instead
++ 			 * of having hard refs and locks to them, so do a sanity
++ 			 * check if any of tp,chain,exts was replaced by the
++ 			 * time we got here with a cookie from hardware.
++ 			 */
++ 			if (unlikely(n->tp != tp || n->tp->chain != n->chain ||
++ 				     !tp->ops->get_exts))
++ 				return TC_ACT_SHOT;
++ 
++ 			exts = tp->ops->get_exts(tp, n->handle);
++ 			if (unlikely(!exts || n->exts != exts))
++ 				return TC_ACT_SHOT;
++ 
++ 			n = NULL;
++ 			err = tcf_exts_exec_ex(skb, exts, act_index, res);
++ 		} else {
++ 			if (tp->protocol != protocol &&
++ 			    tp->protocol != htons(ETH_P_ALL))
++ 				continue;
++ 
++ 			err = tc_classify(skb, tp, res);
++ 		}
+++>>>>>>> 80cd22c35c90 (net/sched: cls_api: Support hardware miss to tc action)
+  #ifdef CONFIG_NET_CLS_ACT
+  		if (unlikely(err == TC_ACT_RECLASSIFY && !compat_mode)) {
+  			first_tp = orig_tp;
+@@@ -3582,7 -3763,9 +3772,13 @@@ int tc_setup_action(struct flow_action 
+  		for (k = 0; k < index ; k++) {
+  			entry[k].hw_stats = tc_act_hw_stats(act->hw_stats);
+  			entry[k].hw_index = act->tcfa_index;
+++<<<<<<< HEAD
+ +			entry[k].act_cookie = (unsigned long)act;
+++=======
++ 			entry[k].cookie = (unsigned long)act;
++ 			entry[k].miss_cookie =
++ 				tcf_exts_miss_cookie_get(miss_cookie_base, i);
+++>>>>>>> 80cd22c35c90 (net/sched: cls_api: Support hardware miss to tc action)
+  		}
+  
+  		j += index;
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 024730cd92d0..16143289a49f 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -292,12 +292,16 @@ struct nf_bridge_info {
+  * and read by ovs to recirc_id.
+  */
+ struct tc_skb_ext {
+-	__u32 chain;
++	union {
++		u64 act_miss_cookie;
++		__u32 chain;
++	};
+ 	__u16 mru;
+ 	__u16 zone;
+ 	u8 post_ct:1;
+ 	u8 post_ct_snat:1;
+ 	u8 post_ct_dnat:1;
++	u8 act_miss:1; /* Set if act_miss_cookie is used */
+ };
+ #endif
+ 
+* Unmerged path include/net/flow_offload.h
+* Unmerged path include/net/pkt_cls.h
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index e26bdacc9761..5f012114bf1a 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -369,6 +369,8 @@ struct tcf_proto_ops {
+ 						struct nlattr **tca,
+ 						struct netlink_ext_ack *extack);
+ 	void			(*tmplt_destroy)(void *tmplt_priv);
++	struct tcf_exts *	(*get_exts)(const struct tcf_proto *tp,
++					    u32 handle);
+ 
+ 	/* rtnetlink specific */
+ 	int			(*dump)(struct net*, struct tcf_proto*, void *,
+diff --git a/net/openvswitch/flow.c b/net/openvswitch/flow.c
+index 74831bed39f3..d47a01287841 100644
+--- a/net/openvswitch/flow.c
++++ b/net/openvswitch/flow.c
+@@ -911,7 +911,8 @@ int ovs_flow_key_extract(const struct ip_tunnel_info *tun_info,
+ #if IS_ENABLED(CONFIG_NET_TC_SKB_EXT)
+ 	if (tc_skb_ext_tc_enabled()) {
+ 		tc_ext = skb_ext_find(skb, TC_SKB_EXT);
+-		key->recirc_id = tc_ext ? tc_ext->chain : 0;
++		key->recirc_id = tc_ext && !tc_ext->act_miss ?
++				 tc_ext->chain : 0;
+ 		OVS_CB(skb)->mru = tc_ext ? tc_ext->mru : 0;
+ 		post_ct = tc_ext ? tc_ext->post_ct : false;
+ 		post_ct_snat = post_ct ? tc_ext->post_ct_snat : false;
+diff --git a/net/sched/act_api.c b/net/sched/act_api.c
+index efa3e65ddce5..765cb1dbfd33 100644
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@ -273,7 +273,7 @@ static int tcf_action_offload_add_ex(struct tc_action *action,
+ 	if (err)
+ 		goto fl_err;
+ 
+-	err = tc_setup_action(&fl_action->action, actions, extack);
++	err = tc_setup_action(&fl_action->action, actions, 0, extack);
+ 	if (err) {
+ 		NL_SET_ERR_MSG_MOD(extack,
+ 				   "Failed to setup tc actions for offload");
+* Unmerged path net/sched/cls_api.c
