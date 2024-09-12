@@ -1,0 +1,280 @@
+scsi: target: Add iscsi/cpus_allowed_list in configfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-494.el8
+commit-author Mingzhe Zou <mingzhe.zou@easystack.cn>
+commit d72d827f2f2636d8d72f0f3ebe5b661c9a24d343
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-494.el8/d72d827f.failed
+
+The RX/TX threads for iSCSI connection can be scheduled to any online CPUs,
+and will not be rescheduled.
+
+When binding other heavy load threads along with iSCSI connection RX/TX
+thread to the same CPU, the iSCSI performance will be worse.
+
+Add iscsi/cpus_allowed_list in configfs. The available CPU set of iSCSI
+connection RX/TX threads is allowed_cpus & online_cpus. If it is modified,
+all RX/TX threads will be rescheduled.
+
+Link: https://lore.kernel.org/r/20220301075500.14266-1-mingzhe.zou@easystack.cn
+	Reviewed-by: Mike Christie <michael.christie@oracle.com>
+	Signed-off-by: Mingzhe Zou <mingzhe.zou@easystack.cn>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit d72d827f2f2636d8d72f0f3ebe5b661c9a24d343)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/target/iscsi/iscsi_target_core.h
+diff --cc include/target/iscsi/iscsi_target_core.h
+index 4e33298a35f2,adc87de0362b..000000000000
+--- a/include/target/iscsi/iscsi_target_core.h
++++ b/include/target/iscsi/iscsi_target_core.h
+@@@ -902,36 -900,8 +904,43 @@@ static inline u32 session_get_next_ttt(
+  
+  extern struct iscsi_cmd *iscsit_find_cmd_from_itt(struct iscsi_conn *, itt_t);
+  
+++<<<<<<< HEAD
+ +static inline void iscsit_thread_check_cpumask(
+ +	struct iscsi_conn *conn,
+ +	struct task_struct *p,
+ +	int mode)
+ +{
+ +	/*
+ +	 * mode == 1 signals iscsi_target_tx_thread() usage.
+ +	 * mode == 0 signals iscsi_target_rx_thread() usage.
+ +	 */
+ +	if (mode == 1) {
+ +		if (!conn->conn_tx_reset_cpumask)
+ +			return;
+ +		conn->conn_tx_reset_cpumask = 0;
+ +	} else {
+ +		if (!conn->conn_rx_reset_cpumask)
+ +			return;
+ +		conn->conn_rx_reset_cpumask = 0;
+ +	}
+ +	/*
+ +	 * Update the CPU mask for this single kthread so that
+ +	 * both TX and RX kthreads are scheduled to run on the
+ +	 * same CPU.
+ +	 */
+ +	set_cpus_allowed_ptr(p, conn->conn_cpumask);
+ +}
+ +
+ +#define iscsit_set_max_cmdsn(hdr, conn) \
+ +{ \
+ +	u32 max_cmdsn = (u32) atomic_read(&conn->sess->max_cmd_sn); \
+ +	hdr->max_cmdsn = cpu_to_be32(max_cmdsn); \
+ +	conn->sess->last_max_cmd_sn = max_cmdsn; \
+ +}
+++=======
++ extern void iscsit_thread_check_cpumask(struct iscsi_conn *conn,
++ 					struct task_struct *p,
++ 					int mode);
++ 
+++>>>>>>> d72d827f2f26 (scsi: target: Add iscsi/cpus_allowed_list in configfs)
+  #endif /* ISCSI_TARGET_CORE_H */
+diff --git a/drivers/target/iscsi/iscsi_target.c b/drivers/target/iscsi/iscsi_target.c
+index e18864143503..09bfe9876323 100644
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@ -711,13 +711,19 @@ static int __init iscsi_target_init_module(void)
+ 	if (!iscsit_global->ts_bitmap)
+ 		goto configfs_out;
+ 
++	if (!zalloc_cpumask_var(&iscsit_global->allowed_cpumask, GFP_KERNEL)) {
++		pr_err("Unable to allocate iscsit_global->allowed_cpumask\n");
++		goto bitmap_out;
++	}
++	cpumask_setall(iscsit_global->allowed_cpumask);
++
+ 	lio_qr_cache = kmem_cache_create("lio_qr_cache",
+ 			sizeof(struct iscsi_queue_req),
+ 			__alignof__(struct iscsi_queue_req), 0, NULL);
+ 	if (!lio_qr_cache) {
+ 		pr_err("Unable to kmem_cache_create() for"
+ 				" lio_qr_cache\n");
+-		goto bitmap_out;
++		goto cpumask_out;
+ 	}
+ 
+ 	lio_dr_cache = kmem_cache_create("lio_dr_cache",
+@@ -762,6 +768,8 @@ static int __init iscsi_target_init_module(void)
+ 	kmem_cache_destroy(lio_dr_cache);
+ qr_out:
+ 	kmem_cache_destroy(lio_qr_cache);
++cpumask_out:
++	free_cpumask_var(iscsit_global->allowed_cpumask);
+ bitmap_out:
+ 	vfree(iscsit_global->ts_bitmap);
+ configfs_out:
+@@ -791,6 +799,7 @@ static void __exit iscsi_target_cleanup_module(void)
+ 
+ 	target_unregister_template(&iscsi_ops);
+ 
++	free_cpumask_var(iscsit_global->allowed_cpumask);
+ 	vfree(iscsit_global->ts_bitmap);
+ 	kfree(iscsit_global);
+ }
+@@ -3595,6 +3604,11 @@ static int iscsit_send_reject(
+ void iscsit_thread_get_cpumask(struct iscsi_conn *conn)
+ {
+ 	int ord, cpu;
++	cpumask_t conn_allowed_cpumask;
++
++	cpumask_and(&conn_allowed_cpumask, iscsit_global->allowed_cpumask,
++		    cpu_online_mask);
++
+ 	/*
+ 	 * bitmap_id is assigned from iscsit_global->ts_bitmap from
+ 	 * within iscsit_start_kthreads()
+@@ -3603,8 +3617,9 @@ void iscsit_thread_get_cpumask(struct iscsi_conn *conn)
+ 	 * iSCSI connection's RX/TX threads will be scheduled to
+ 	 * execute upon.
+ 	 */
+-	ord = conn->bitmap_id % cpumask_weight(cpu_online_mask);
+-	for_each_online_cpu(cpu) {
++	cpumask_clear(conn->conn_cpumask);
++	ord = conn->bitmap_id % cpumask_weight(&conn_allowed_cpumask);
++	for_each_cpu(cpu, &conn_allowed_cpumask) {
+ 		if (ord-- == 0) {
+ 			cpumask_set_cpu(cpu, conn->conn_cpumask);
+ 			return;
+@@ -3617,6 +3632,62 @@ void iscsit_thread_get_cpumask(struct iscsi_conn *conn)
+ 	cpumask_setall(conn->conn_cpumask);
+ }
+ 
++static void iscsit_thread_reschedule(struct iscsi_conn *conn)
++{
++	/*
++	 * If iscsit_global->allowed_cpumask modified, reschedule iSCSI
++	 * connection's RX/TX threads update conn->allowed_cpumask.
++	 */
++	if (!cpumask_equal(iscsit_global->allowed_cpumask,
++			   conn->allowed_cpumask)) {
++		iscsit_thread_get_cpumask(conn);
++		conn->conn_tx_reset_cpumask = 1;
++		conn->conn_rx_reset_cpumask = 1;
++		cpumask_copy(conn->allowed_cpumask,
++			     iscsit_global->allowed_cpumask);
++	}
++}
++
++void iscsit_thread_check_cpumask(
++	struct iscsi_conn *conn,
++	struct task_struct *p,
++	int mode)
++{
++	/*
++	 * The TX and RX threads maybe call iscsit_thread_check_cpumask()
++	 * at the same time. The RX thread might be faster and return from
++	 * iscsit_thread_reschedule() with conn_rx_reset_cpumask set to 0.
++	 * Then the TX thread sets it back to 1.
++	 * The next time the RX thread loops, it sees conn_rx_reset_cpumask
++	 * set to 1 and calls set_cpus_allowed_ptr() again and set it to 0.
++	 */
++	iscsit_thread_reschedule(conn);
++
++	/*
++	 * mode == 1 signals iscsi_target_tx_thread() usage.
++	 * mode == 0 signals iscsi_target_rx_thread() usage.
++	 */
++	if (mode == 1) {
++		if (!conn->conn_tx_reset_cpumask)
++			return;
++	} else {
++		if (!conn->conn_rx_reset_cpumask)
++			return;
++	}
++
++	/*
++	 * Update the CPU mask for this single kthread so that
++	 * both TX and RX kthreads are scheduled to run on the
++	 * same CPU.
++	 */
++	set_cpus_allowed_ptr(p, conn->conn_cpumask);
++	if (mode == 1)
++		conn->conn_tx_reset_cpumask = 0;
++	else
++		conn->conn_rx_reset_cpumask = 0;
++}
++EXPORT_SYMBOL(iscsit_thread_check_cpumask);
++
+ int
+ iscsit_immediate_queue(struct iscsi_conn *conn, struct iscsi_cmd *cmd, int state)
+ {
+diff --git a/drivers/target/iscsi/iscsi_target_configfs.c b/drivers/target/iscsi/iscsi_target_configfs.c
+index 5591019ea505..4aa3397fc934 100644
+--- a/drivers/target/iscsi/iscsi_target_configfs.c
++++ b/drivers/target/iscsi/iscsi_target_configfs.c
+@@ -1135,8 +1135,40 @@ static ssize_t lio_target_wwn_lio_version_show(struct config_item *item,
+ 
+ CONFIGFS_ATTR_RO(lio_target_wwn_, lio_version);
+ 
++static ssize_t lio_target_wwn_cpus_allowed_list_show(
++		struct config_item *item, char *page)
++{
++	return sprintf(page, "%*pbl\n",
++		       cpumask_pr_args(iscsit_global->allowed_cpumask));
++}
++
++static ssize_t lio_target_wwn_cpus_allowed_list_store(
++		struct config_item *item, const char *page, size_t count)
++{
++	int ret;
++	char *orig;
++	cpumask_t new_allowed_cpumask;
++
++	orig = kstrdup(page, GFP_KERNEL);
++	if (!orig)
++		return -ENOMEM;
++
++	cpumask_clear(&new_allowed_cpumask);
++	ret = cpulist_parse(orig, &new_allowed_cpumask);
++
++	kfree(orig);
++	if (ret != 0)
++		return ret;
++
++	cpumask_copy(iscsit_global->allowed_cpumask, &new_allowed_cpumask);
++	return count;
++}
++
++CONFIGFS_ATTR(lio_target_wwn_, cpus_allowed_list);
++
+ static struct configfs_attribute *lio_target_wwn_attrs[] = {
+ 	&lio_target_wwn_attr_lio_version,
++	&lio_target_wwn_attr_cpus_allowed_list,
+ 	NULL,
+ };
+ 
+diff --git a/drivers/target/iscsi/iscsi_target_login.c b/drivers/target/iscsi/iscsi_target_login.c
+index 712aa79e4a15..1c8f7cd978b6 100644
+--- a/drivers/target/iscsi/iscsi_target_login.c
++++ b/drivers/target/iscsi/iscsi_target_login.c
+@@ -1152,8 +1152,15 @@ static struct iscsi_conn *iscsit_alloc_conn(struct iscsi_np *np)
+ 		goto free_conn_ops;
+ 	}
+ 
++	if (!zalloc_cpumask_var(&conn->allowed_cpumask, GFP_KERNEL)) {
++		pr_err("Unable to allocate conn->allowed_cpumask\n");
++		goto free_conn_cpumask;
++	}
++
+ 	return conn;
+ 
++free_conn_cpumask:
++	free_cpumask_var(conn->conn_cpumask);
+ free_conn_ops:
+ 	kfree(conn->conn_ops);
+ put_transport:
+@@ -1165,6 +1172,7 @@ static struct iscsi_conn *iscsit_alloc_conn(struct iscsi_np *np)
+ 
+ void iscsit_free_conn(struct iscsi_conn *conn)
+ {
++	free_cpumask_var(conn->allowed_cpumask);
+ 	free_cpumask_var(conn->conn_cpumask);
+ 	kfree(conn->conn_ops);
+ 	iscsit_put_transport(conn->conn_transport);
+* Unmerged path include/target/iscsi/iscsi_target_core.h
