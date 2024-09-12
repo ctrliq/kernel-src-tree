@@ -1,0 +1,290 @@
+KVM: Add GDS_NO support to KVM
+
+jira LE-1907
+cve CVE-2022-40982
+Rebuild_History Non-Buildable kernel-4.18.0-511.el8
+commit-author Daniel Sneddon <daniel.sneddon@linux.intel.com>
+commit 81ac7e5d741742d650b4ed6186c4826c1a0631a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-511.el8/81ac7e5d.failed
+
+Gather Data Sampling (GDS) is a transient execution attack using
+gather instructions from the AVX2 and AVX512 extensions. This attack
+allows malicious code to infer data that was previously stored in
+vector registers. Systems that are not vulnerable to GDS will set the
+GDS_NO bit of the IA32_ARCH_CAPABILITIES MSR. This is useful for VM
+guests that may think they are on vulnerable systems that are, in
+fact, not affected. Guests that are running on affected hosts where
+the mitigation is enabled are protected as if they were running
+on an unaffected system.
+
+On all hosts that are not affected or that are mitigated, set the
+GDS_NO bit.
+
+	Signed-off-by: Daniel Sneddon <daniel.sneddon@linux.intel.com>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Acked-by: Josh Poimboeuf <jpoimboe@kernel.org>
+(cherry picked from commit 81ac7e5d741742d650b4ed6186c4826c1a0631a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/bugs.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kernel/cpu/bugs.c
+index aee8d5227bc4,7985c658d129..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -658,6 -620,177 +658,180 @@@ static int __init srbds_parse_cmdline(c
+  early_param("srbds", srbds_parse_cmdline);
+  
+  #undef pr_fmt
+++<<<<<<< HEAD
+++=======
++ #define pr_fmt(fmt)     "L1D Flush : " fmt
++ 
++ enum l1d_flush_mitigations {
++ 	L1D_FLUSH_OFF = 0,
++ 	L1D_FLUSH_ON,
++ };
++ 
++ static enum l1d_flush_mitigations l1d_flush_mitigation __initdata = L1D_FLUSH_OFF;
++ 
++ static void __init l1d_flush_select_mitigation(void)
++ {
++ 	if (!l1d_flush_mitigation || !boot_cpu_has(X86_FEATURE_FLUSH_L1D))
++ 		return;
++ 
++ 	static_branch_enable(&switch_mm_cond_l1d_flush);
++ 	pr_info("Conditional flush on switch_mm() enabled\n");
++ }
++ 
++ static int __init l1d_flush_parse_cmdline(char *str)
++ {
++ 	if (!strcmp(str, "on"))
++ 		l1d_flush_mitigation = L1D_FLUSH_ON;
++ 
++ 	return 0;
++ }
++ early_param("l1d_flush", l1d_flush_parse_cmdline);
++ 
++ #undef pr_fmt
++ #define pr_fmt(fmt)	"GDS: " fmt
++ 
++ enum gds_mitigations {
++ 	GDS_MITIGATION_OFF,
++ 	GDS_MITIGATION_UCODE_NEEDED,
++ 	GDS_MITIGATION_FORCE,
++ 	GDS_MITIGATION_FULL,
++ 	GDS_MITIGATION_FULL_LOCKED,
++ 	GDS_MITIGATION_HYPERVISOR,
++ };
++ 
++ #if IS_ENABLED(CONFIG_GDS_FORCE_MITIGATION)
++ static enum gds_mitigations gds_mitigation __ro_after_init = GDS_MITIGATION_FORCE;
++ #else
++ static enum gds_mitigations gds_mitigation __ro_after_init = GDS_MITIGATION_FULL;
++ #endif
++ 
++ static const char * const gds_strings[] = {
++ 	[GDS_MITIGATION_OFF]		= "Vulnerable",
++ 	[GDS_MITIGATION_UCODE_NEEDED]	= "Vulnerable: No microcode",
++ 	[GDS_MITIGATION_FORCE]		= "Mitigation: AVX disabled, no microcode",
++ 	[GDS_MITIGATION_FULL]		= "Mitigation: Microcode",
++ 	[GDS_MITIGATION_FULL_LOCKED]	= "Mitigation: Microcode (locked)",
++ 	[GDS_MITIGATION_HYPERVISOR]	= "Unknown: Dependent on hypervisor status",
++ };
++ 
++ bool gds_ucode_mitigated(void)
++ {
++ 	return (gds_mitigation == GDS_MITIGATION_FULL ||
++ 		gds_mitigation == GDS_MITIGATION_FULL_LOCKED);
++ }
++ EXPORT_SYMBOL_GPL(gds_ucode_mitigated);
++ 
++ void update_gds_msr(void)
++ {
++ 	u64 mcu_ctrl_after;
++ 	u64 mcu_ctrl;
++ 
++ 	switch (gds_mitigation) {
++ 	case GDS_MITIGATION_OFF:
++ 		rdmsrl(MSR_IA32_MCU_OPT_CTRL, mcu_ctrl);
++ 		mcu_ctrl |= GDS_MITG_DIS;
++ 		break;
++ 	case GDS_MITIGATION_FULL_LOCKED:
++ 		/*
++ 		 * The LOCKED state comes from the boot CPU. APs might not have
++ 		 * the same state. Make sure the mitigation is enabled on all
++ 		 * CPUs.
++ 		 */
++ 	case GDS_MITIGATION_FULL:
++ 		rdmsrl(MSR_IA32_MCU_OPT_CTRL, mcu_ctrl);
++ 		mcu_ctrl &= ~GDS_MITG_DIS;
++ 		break;
++ 	case GDS_MITIGATION_FORCE:
++ 	case GDS_MITIGATION_UCODE_NEEDED:
++ 	case GDS_MITIGATION_HYPERVISOR:
++ 		return;
++ 	};
++ 
++ 	wrmsrl(MSR_IA32_MCU_OPT_CTRL, mcu_ctrl);
++ 
++ 	/*
++ 	 * Check to make sure that the WRMSR value was not ignored. Writes to
++ 	 * GDS_MITG_DIS will be ignored if this processor is locked but the boot
++ 	 * processor was not.
++ 	 */
++ 	rdmsrl(MSR_IA32_MCU_OPT_CTRL, mcu_ctrl_after);
++ 	WARN_ON_ONCE(mcu_ctrl != mcu_ctrl_after);
++ }
++ 
++ static void __init gds_select_mitigation(void)
++ {
++ 	u64 mcu_ctrl;
++ 
++ 	if (!boot_cpu_has_bug(X86_BUG_GDS))
++ 		return;
++ 
++ 	if (boot_cpu_has(X86_FEATURE_HYPERVISOR)) {
++ 		gds_mitigation = GDS_MITIGATION_HYPERVISOR;
++ 		goto out;
++ 	}
++ 
++ 	if (cpu_mitigations_off())
++ 		gds_mitigation = GDS_MITIGATION_OFF;
++ 	/* Will verify below that mitigation _can_ be disabled */
++ 
++ 	/* No microcode */
++ 	if (!(x86_read_arch_cap_msr() & ARCH_CAP_GDS_CTRL)) {
++ 		if (gds_mitigation == GDS_MITIGATION_FORCE) {
++ 			/*
++ 			 * This only needs to be done on the boot CPU so do it
++ 			 * here rather than in update_gds_msr()
++ 			 */
++ 			setup_clear_cpu_cap(X86_FEATURE_AVX);
++ 			pr_warn("Microcode update needed! Disabling AVX as mitigation.\n");
++ 		} else {
++ 			gds_mitigation = GDS_MITIGATION_UCODE_NEEDED;
++ 		}
++ 		goto out;
++ 	}
++ 
++ 	/* Microcode has mitigation, use it */
++ 	if (gds_mitigation == GDS_MITIGATION_FORCE)
++ 		gds_mitigation = GDS_MITIGATION_FULL;
++ 
++ 	rdmsrl(MSR_IA32_MCU_OPT_CTRL, mcu_ctrl);
++ 	if (mcu_ctrl & GDS_MITG_LOCKED) {
++ 		if (gds_mitigation == GDS_MITIGATION_OFF)
++ 			pr_warn("Mitigation locked. Disable failed.\n");
++ 
++ 		/*
++ 		 * The mitigation is selected from the boot CPU. All other CPUs
++ 		 * _should_ have the same state. If the boot CPU isn't locked
++ 		 * but others are then update_gds_msr() will WARN() of the state
++ 		 * mismatch. If the boot CPU is locked update_gds_msr() will
++ 		 * ensure the other CPUs have the mitigation enabled.
++ 		 */
++ 		gds_mitigation = GDS_MITIGATION_FULL_LOCKED;
++ 	}
++ 
++ 	update_gds_msr();
++ out:
++ 	pr_info("%s\n", gds_strings[gds_mitigation]);
++ }
++ 
++ static int __init gds_parse_cmdline(char *str)
++ {
++ 	if (!str)
++ 		return -EINVAL;
++ 
++ 	if (!boot_cpu_has_bug(X86_BUG_GDS))
++ 		return 0;
++ 
++ 	if (!strcmp(str, "off"))
++ 		gds_mitigation = GDS_MITIGATION_OFF;
++ 	else if (!strcmp(str, "force"))
++ 		gds_mitigation = GDS_MITIGATION_FORCE;
++ 
++ 	return 0;
++ }
++ early_param("gather_data_sampling", gds_parse_cmdline);
++ 
++ #undef pr_fmt
+++>>>>>>> 81ac7e5d7417 (KVM: Add GDS_NO support to KVM)
+  #define pr_fmt(fmt)     "Spectre V1 : " fmt
+  
+  enum spectre_v1_mitigation {
+diff --cc arch/x86/kvm/x86.c
+index a4a328852a33,ad09c8540189..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1529,9 -1570,47 +1531,49 @@@ static const u32 msr_based_features_all
+  	MSR_IA32_PERF_CAPABILITIES,
+  };
+  
+ -static u32 msr_based_features[ARRAY_SIZE(msr_based_features_all_except_vmx) +
+ -			      (KVM_LAST_EMULATED_VMX_MSR - KVM_FIRST_EMULATED_VMX_MSR + 1)];
+ +static u32 msr_based_features[ARRAY_SIZE(msr_based_features_all)];
+  static unsigned int num_msr_based_features;
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * All feature MSRs except uCode revID, which tracks the currently loaded uCode
++  * patch, are immutable once the vCPU model is defined.
++  */
++ static bool kvm_is_immutable_feature_msr(u32 msr)
++ {
++ 	int i;
++ 
++ 	if (msr >= KVM_FIRST_EMULATED_VMX_MSR && msr <= KVM_LAST_EMULATED_VMX_MSR)
++ 		return true;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(msr_based_features_all_except_vmx); i++) {
++ 		if (msr == msr_based_features_all_except_vmx[i])
++ 			return msr != MSR_IA32_UCODE_REV;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ /*
++  * Some IA32_ARCH_CAPABILITIES bits have dependencies on MSRs that KVM
++  * does not yet virtualize. These include:
++  *   10 - MISC_PACKAGE_CTRLS
++  *   11 - ENERGY_FILTERING_CTL
++  *   12 - DOITM
++  *   18 - FB_CLEAR_CTRL
++  *   21 - XAPIC_DISABLE_STATUS
++  *   23 - OVERCLOCKING_STATUS
++  */
++ 
++ #define KVM_SUPPORTED_ARCH_CAP \
++ 	(ARCH_CAP_RDCL_NO | ARCH_CAP_IBRS_ALL | ARCH_CAP_RSBA | \
++ 	 ARCH_CAP_SKIP_VMENTRY_L1DFLUSH | ARCH_CAP_SSB_NO | ARCH_CAP_MDS_NO | \
++ 	 ARCH_CAP_PSCHANGE_MC_NO | ARCH_CAP_TSX_CTRL_MSR | ARCH_CAP_TAA_NO | \
++ 	 ARCH_CAP_SBDR_SSDP_NO | ARCH_CAP_FBSDP_NO | ARCH_CAP_PSDP_NO | \
++ 	 ARCH_CAP_FB_CLEAR | ARCH_CAP_RRSBA | ARCH_CAP_PBRSB_NO | ARCH_CAP_GDS_NO)
++ 
+++>>>>>>> 81ac7e5d7417 (KVM: Add GDS_NO support to KVM)
+  static u64 kvm_get_arch_capabilities(void)
+  {
+  	u64 data = 0;
+@@@ -1585,8 -1666,8 +1627,13 @@@
+  		 */
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Guests don't need to know "Fill buffer clear control" exists */
+ +	data &= ~ARCH_CAP_FB_CLEAR_CTRL;
+++=======
++ 	if (!boot_cpu_has_bug(X86_BUG_GDS) || gds_ucode_mitigated())
++ 		data |= ARCH_CAP_GDS_NO;
+++>>>>>>> 81ac7e5d7417 (KVM: Add GDS_NO support to KVM)
+  
+  	return data;
+  }
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+* Unmerged path arch/x86/kvm/x86.c
