@@ -1,0 +1,125 @@
+Drivers: hv: vmbus: Bring the post_msg_page back for TDX VMs with the paravisor
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-536.el8
+commit-author Dexuan Cui <decui@microsoft.com>
+commit 23378295042a4bcaeec350733a4771678e7a1f3a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-536.el8/23378295.failed
+
+The post_msg_page was removed in
+commit 9a6b1a170ca8 ("Drivers: hv: vmbus: Remove the per-CPU post_msg_page")
+
+However, it turns out that we need to bring it back, but only for a TDX VM
+with the paravisor: in such a VM, the hyperv_pcpu_input_arg is not decrypted,
+but the HVCALL_POST_MESSAGE in such a VM needs a decrypted page as the
+hypercall input page: see the comments in hyperv_init() for a detailed
+explanation.
+
+Except for HVCALL_POST_MESSAGE and HVCALL_SIGNAL_EVENT, the other hypercalls
+in a TDX VM with the paravisor still use hv_hypercall_pg and must use the
+hyperv_pcpu_input_arg (which is encrypted in such a VM), when a hypercall
+input page is used.
+
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Reviewed-by: Tianyu Lan <tiala@microsoft.com>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+Link: https://lore.kernel.org/r/20230824080712.30327-8-decui@microsoft.com
+(cherry picked from commit 23378295042a4bcaeec350733a4771678e7a1f3a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/hv_init.c
+#	drivers/hv/hv.c
+diff --cc arch/x86/hyperv/hv_init.c
+index 1d0a26104d0f,3729eee21e47..000000000000
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@@ -446,6 -503,10 +462,13 @@@ void __init hyperv_init(void
+  	/* Hyper-V requires to write guest os id via ghcb in SNP IVM. */
+  	hv_ghcb_msr_write(HV_X64_MSR_GUEST_OS_ID, guest_id);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* A TDX VM with no paravisor only uses TDX GHCI rather than hv_hypercall_pg */
++ 	if (hv_isolation_type_tdx() && !ms_hyperv.paravisor_present)
++ 		goto skip_hypercall_pg_init;
++ 
+++>>>>>>> 23378295042a (Drivers: hv: vmbus: Bring the post_msg_page back for TDX VMs with the paravisor)
+  	hv_hypercall_pg = __vmalloc_node_range(PAGE_SIZE, 1, VMALLOC_START,
+  			VMALLOC_END, GFP_KERNEL, PAGE_KERNEL_ROX,
+  			VM_FLUSH_RESET_PERMS, NUMA_NO_NODE,
+diff --cc drivers/hv/hv.c
+index 54db91ae3c0d,523c5d99f375..000000000000
+--- a/drivers/hv/hv.c
++++ b/drivers/hv/hv.c
+@@@ -192,6 -212,40 +227,43 @@@ void hv_synic_free(void
+  		struct hv_per_cpu_context *hv_cpu
+  			= per_cpu_ptr(hv_context.cpu_context, cpu);
+  
+++<<<<<<< HEAD
+++=======
++ 		/* It's better to leak the page if the encryption fails. */
++ 		if (ms_hyperv.paravisor_present && hv_isolation_type_tdx()) {
++ 			if (hv_cpu->post_msg_page) {
++ 				ret = set_memory_encrypted((unsigned long)
++ 					hv_cpu->post_msg_page, 1);
++ 				if (ret) {
++ 					pr_err("Failed to encrypt post msg page: %d\n", ret);
++ 					hv_cpu->post_msg_page = NULL;
++ 				}
++ 			}
++ 		}
++ 
++ 		if (!ms_hyperv.paravisor_present &&
++ 		    (hv_isolation_type_en_snp() || hv_isolation_type_tdx())) {
++ 			if (hv_cpu->synic_message_page) {
++ 				ret = set_memory_encrypted((unsigned long)
++ 					hv_cpu->synic_message_page, 1);
++ 				if (ret) {
++ 					pr_err("Failed to encrypt SYNIC msg page: %d\n", ret);
++ 					hv_cpu->synic_message_page = NULL;
++ 				}
++ 			}
++ 
++ 			if (hv_cpu->synic_event_page) {
++ 				ret = set_memory_encrypted((unsigned long)
++ 					hv_cpu->synic_event_page, 1);
++ 				if (ret) {
++ 					pr_err("Failed to encrypt SYNIC event page: %d\n", ret);
++ 					hv_cpu->synic_event_page = NULL;
++ 				}
++ 			}
++ 		}
++ 
++ 		free_page((unsigned long)hv_cpu->post_msg_page);
+++>>>>>>> 23378295042a (Drivers: hv: vmbus: Bring the post_msg_page back for TDX VMs with the paravisor)
+  		free_page((unsigned long)hv_cpu->synic_event_page);
+  		free_page((unsigned long)hv_cpu->synic_message_page);
+  	}
+* Unmerged path arch/x86/hyperv/hv_init.c
+* Unmerged path drivers/hv/hv.c
+diff --git a/drivers/hv/hyperv_vmbus.h b/drivers/hv/hyperv_vmbus.h
+index 316f20cdefb7..e30eb7742981 100644
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@ -136,6 +136,17 @@ struct hv_per_cpu_context {
+ 	void *synic_message_page;
+ 	void *synic_event_page;
+ 
++	/*
++	 * The page is only used in hv_post_message() for a TDX VM (with the
++	 * paravisor) to post a messages to Hyper-V: when such a VM calls
++	 * HVCALL_POST_MESSAGE, it can't use the hyperv_pcpu_input_arg (which
++	 * is encrypted in such a VM) as the hypercall input page, because
++	 * the input page for HVCALL_POST_MESSAGE must be decrypted in such a
++	 * VM, so post_msg_page (which is decrypted in hv_synic_alloc()) is
++	 * introduced for this purpose. See hyperv_init() for more comments.
++	 */
++	void *post_msg_page;
++
+ 	/*
+ 	 * Starting with win8, we can take channel interrupts on any CPU;
+ 	 * we will manage the tasklet that handles events messages on a per CPU
