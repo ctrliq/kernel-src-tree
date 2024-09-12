@@ -1,0 +1,337 @@
+vfio: Follow a strict lifetime for struct iommu_group
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit ca5f21b2574903a7430fcb3590e534d92b2fa816
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/ca5f21b2.failed
+
+The iommu_group comes from the struct device that a driver has been bound
+to and then created a struct vfio_device against. To keep the iommu layer
+sane we want to have a simple rule that only an attached driver should be
+using the iommu API. Particularly only an attached driver should hold
+ownership.
+
+In VFIO's case since it uses the group APIs and it shares between
+different drivers it is a bit more complicated, but the principle still
+holds.
+
+Solve this by waiting for all users of the vfio_group to stop before
+allowing vfio_unregister_group_dev() to complete. This is done with a new
+completion to know when the users go away and an additional refcount to
+keep track of how many device drivers are sharing the vfio group. The last
+driver to be unregistered will clean up the group.
+
+This solves crashes in the S390 iommu driver that come because VFIO ends
+up racing releasing ownership (which attaches the default iommu_domain to
+the device) with the removal of that same device from the iommu
+driver. This is a side case that iommu drivers should not have to cope
+with.
+
+   iommu driver failed to attach the default/blocking domain
+   WARNING: CPU: 0 PID: 5082 at drivers/iommu/iommu.c:1961 iommu_detach_group+0x6c/0x80
+   Modules linked in: macvtap macvlan tap vfio_pci vfio_pci_core irqbypass vfio_virqfd kvm nft_fib_inet nft_fib_ipv4 nft_fib_ipv6 nft_fib nft_reject_inet nf_reject_ipv4 nf_reject_ipv6 nft_reject nft_ct nft_chain_nat nf_nat nf_conntrack nf_defrag_ipv6 nf_defrag_ipv4 ip_set nf_tables nfnetlink mlx5_ib sunrpc ib_uverbs ism smc uvdevice ib_core s390_trng eadm_sch tape_3590 tape tape_class vfio_ccw mdev vfio_iommu_type1 vfio zcrypt_cex4 sch_fq_codel configfs ghash_s390 prng chacha_s390 libchacha aes_s390 mlx5_core des_s390 libdes sha3_512_s390 nvme sha3_256_s390 sha512_s390 sha256_s390 sha1_s390 sha_common nvme_core zfcp scsi_transport_fc pkey zcrypt rng_core autofs4
+   CPU: 0 PID: 5082 Comm: qemu-system-s39 Tainted: G        W          6.0.0-rc3 #5
+   Hardware name: IBM 3931 A01 782 (LPAR)
+   Krnl PSW : 0704c00180000000 000000095bb10d28 (iommu_detach_group+0x70/0x80)
+              R:0 T:1 IO:1 EX:1 Key:0 M:1 W:0 P:0 AS:3 CC:0 PM:0 RI:0 EA:3
+   Krnl GPRS: 0000000000000001 0000000900000027 0000000000000039 000000095c97ffe0
+              00000000fffeffff 00000009fc290000 00000000af1fda50 00000000af590b58
+              00000000af1fdaf0 0000000135c7a320 0000000135e52258 0000000135e52200
+              00000000a29e8000 00000000af590b40 000000095bb10d24 0000038004b13c98
+   Krnl Code: 000000095bb10d18: c020003d56fc        larl    %r2,000000095c2bbb10
+                          000000095bb10d1e: c0e50019d901        brasl   %r14,000000095be4bf20
+                         #000000095bb10d24: af000000            mc      0,0
+                         >000000095bb10d28: b904002a            lgr     %r2,%r10
+                          000000095bb10d2c: ebaff0a00004        lmg     %r10,%r15,160(%r15)
+                          000000095bb10d32: c0f4001aa867        brcl    15,000000095be65e00
+                          000000095bb10d38: c004002168e0        brcl    0,000000095bf3def8
+                          000000095bb10d3e: eb6ff0480024        stmg    %r6,%r15,72(%r15)
+   Call Trace:
+    [<000000095bb10d28>] iommu_detach_group+0x70/0x80
+   ([<000000095bb10d24>] iommu_detach_group+0x6c/0x80)
+    [<000003ff80243b0e>] vfio_iommu_type1_detach_group+0x136/0x6c8 [vfio_iommu_type1]
+    [<000003ff80137780>] __vfio_group_unset_container+0x58/0x158 [vfio]
+    [<000003ff80138a16>] vfio_group_fops_unl_ioctl+0x1b6/0x210 [vfio]
+   pci 0004:00:00.0: Removing from iommu group 4
+    [<000000095b5b62e8>] __s390x_sys_ioctl+0xc0/0x100
+    [<000000095be5d3b4>] __do_syscall+0x1d4/0x200
+    [<000000095be6c072>] system_call+0x82/0xb0
+   Last Breaking-Event-Address:
+    [<000000095be4bf80>] __warn_printk+0x60/0x68
+
+It indicates that domain->ops->attach_dev() failed because the driver has
+already passed the point of destructing the device.
+
+Fixes: 9ac8545199a1 ("iommu: Fix use-after-free in iommu_release_device")
+	Reported-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Tested-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Reviewed-by: Yi Liu <yi.l.liu@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Link: https://lore.kernel.org/r/0-v2-a3c5f4429e2a+55-iommu_group_lifetime_jgg@nvidia.com
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit ca5f21b2574903a7430fcb3590e534d92b2fa816)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/vfio.h
+#	drivers/vfio/vfio_main.c
+diff --cc drivers/vfio/vfio.h
+index 503bea6c843d,039e3208d286..000000000000
+--- a/drivers/vfio/vfio.h
++++ b/drivers/vfio/vfio.h
+@@@ -28,6 -38,32 +28,35 @@@ enum vfio_group_type 
+  	VFIO_NO_IOMMU,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct vfio_group {
++ 	struct device 			dev;
++ 	struct cdev			cdev;
++ 	/*
++ 	 * When drivers is non-zero a driver is attached to the struct device
++ 	 * that provided the iommu_group and thus the iommu_group is a valid
++ 	 * pointer. When drivers is 0 the driver is being detached. Once users
++ 	 * reaches 0 then the iommu_group is invalid.
++ 	 */
++ 	refcount_t			drivers;
++ 	refcount_t			users;
++ 	struct completion		users_comp;
++ 	unsigned int			container_users;
++ 	struct iommu_group		*iommu_group;
++ 	struct vfio_container		*container;
++ 	struct list_head		device_list;
++ 	struct mutex			device_lock;
++ 	struct list_head		vfio_next;
++ 	struct list_head		container_next;
++ 	enum vfio_group_type		type;
++ 	struct rw_semaphore		group_rwsem;
++ 	struct kvm			*kvm;
++ 	struct file			*opened_file;
++ 	struct blocking_notifier_head	notifier;
++ };
++ 
+++>>>>>>> ca5f21b25749 (vfio: Follow a strict lifetime for struct iommu_group)
+  /* events for the backend driver notify callback */
+  enum vfio_iommu_notify_type {
+  	VFIO_IOMMU_CONTAINER_CLOSE = 0,
+diff --cc drivers/vfio/vfio_main.c
+index eb849d5b81b0,f19171cad9a2..000000000000
+--- a/drivers/vfio/vfio_main.c
++++ b/drivers/vfio/vfio_main.c
+@@@ -164,159 -125,6 +164,162 @@@ static void vfio_release_device_set(str
+  	xa_unlock(&vfio_device_set_xa);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_VFIO_NOIOMMU
+ +static void *vfio_noiommu_open(unsigned long arg)
+ +{
+ +	if (arg != VFIO_NOIOMMU_IOMMU)
+ +		return ERR_PTR(-EINVAL);
+ +	if (!capable(CAP_SYS_RAWIO))
+ +		return ERR_PTR(-EPERM);
+ +
+ +	return NULL;
+ +}
+ +
+ +static void vfio_noiommu_release(void *iommu_data)
+ +{
+ +}
+ +
+ +static long vfio_noiommu_ioctl(void *iommu_data,
+ +			       unsigned int cmd, unsigned long arg)
+ +{
+ +	if (cmd == VFIO_CHECK_EXTENSION)
+ +		return noiommu && (arg == VFIO_NOIOMMU_IOMMU) ? 1 : 0;
+ +
+ +	return -ENOTTY;
+ +}
+ +
+ +static int vfio_noiommu_attach_group(void *iommu_data,
+ +		struct iommu_group *iommu_group, enum vfio_group_type type)
+ +{
+ +	return 0;
+ +}
+ +
+ +static void vfio_noiommu_detach_group(void *iommu_data,
+ +				      struct iommu_group *iommu_group)
+ +{
+ +}
+ +
+ +static const struct vfio_iommu_driver_ops vfio_noiommu_ops = {
+ +	.name = "vfio-noiommu",
+ +	.owner = THIS_MODULE,
+ +	.open = vfio_noiommu_open,
+ +	.release = vfio_noiommu_release,
+ +	.ioctl = vfio_noiommu_ioctl,
+ +	.attach_group = vfio_noiommu_attach_group,
+ +	.detach_group = vfio_noiommu_detach_group,
+ +};
+ +
+ +/*
+ + * Only noiommu containers can use vfio-noiommu and noiommu containers can only
+ + * use vfio-noiommu.
+ + */
+ +static inline bool vfio_iommu_driver_allowed(struct vfio_container *container,
+ +		const struct vfio_iommu_driver *driver)
+ +{
+ +	return container->noiommu == (driver->ops == &vfio_noiommu_ops);
+ +}
+ +#else
+ +static inline bool vfio_iommu_driver_allowed(struct vfio_container *container,
+ +		const struct vfio_iommu_driver *driver)
+ +{
+ +	return true;
+ +}
+ +#endif /* CONFIG_VFIO_NOIOMMU */
+ +
+ +/*
+ + * IOMMU driver registration
+ + */
+ +int vfio_register_iommu_driver(const struct vfio_iommu_driver_ops *ops)
+ +{
+ +	struct vfio_iommu_driver *driver, *tmp;
+ +
+ +	if (WARN_ON(!ops->register_device != !ops->unregister_device))
+ +		return -EINVAL;
+ +
+ +	driver = kzalloc(sizeof(*driver), GFP_KERNEL);
+ +	if (!driver)
+ +		return -ENOMEM;
+ +
+ +	driver->ops = ops;
+ +
+ +	mutex_lock(&vfio.iommu_drivers_lock);
+ +
+ +	/* Check for duplicates */
+ +	list_for_each_entry(tmp, &vfio.iommu_drivers_list, vfio_next) {
+ +		if (tmp->ops == ops) {
+ +			mutex_unlock(&vfio.iommu_drivers_lock);
+ +			kfree(driver);
+ +			return -EINVAL;
+ +		}
+ +	}
+ +
+ +	list_add(&driver->vfio_next, &vfio.iommu_drivers_list);
+ +
+ +	mutex_unlock(&vfio.iommu_drivers_lock);
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL_GPL(vfio_register_iommu_driver);
+ +
+ +void vfio_unregister_iommu_driver(const struct vfio_iommu_driver_ops *ops)
+ +{
+ +	struct vfio_iommu_driver *driver;
+ +
+ +	mutex_lock(&vfio.iommu_drivers_lock);
+ +	list_for_each_entry(driver, &vfio.iommu_drivers_list, vfio_next) {
+ +		if (driver->ops == ops) {
+ +			list_del(&driver->vfio_next);
+ +			mutex_unlock(&vfio.iommu_drivers_lock);
+ +			kfree(driver);
+ +			return;
+ +		}
+ +	}
+ +	mutex_unlock(&vfio.iommu_drivers_lock);
+ +}
+ +EXPORT_SYMBOL_GPL(vfio_unregister_iommu_driver);
+ +
+ +static void vfio_group_get(struct vfio_group *group);
+ +
+++=======
+++>>>>>>> ca5f21b25749 (vfio: Follow a strict lifetime for struct iommu_group)
+ +/*
+ + * Container objects - containers are created when /dev/vfio/vfio is
+ + * opened, but their lifecycle extends until the last user is done, so
+ + * it's freed via kref.  Must support container/group/device being
+ + * closed in any order.
+ + */
+ +static void vfio_container_get(struct vfio_container *container)
+ +{
+ +	kref_get(&container->kref);
+ +}
+ +
+ +static void vfio_container_release(struct kref *kref)
+ +{
+ +	struct vfio_container *container;
+ +	container = container_of(kref, struct vfio_container, kref);
+ +
+ +	kfree(container);
+ +}
+ +
+ +static void vfio_container_put(struct vfio_container *container)
+ +{
+ +	kref_put(&container->kref, vfio_container_release);
+ +}
+ +
+ +unsigned int vfio_device_set_open_count(struct vfio_device_set *dev_set)
+ +{
+ +	struct vfio_device *cur;
+ +	unsigned int open_count = 0;
+ +
+ +	lockdep_assert_held(&dev_set->lock);
+ +
+ +	list_for_each_entry(cur, &dev_set->device_list, dev_set_list)
+ +		open_count += cur->open_count;
+ +	return open_count;
+ +}
+ +EXPORT_SYMBOL_GPL(vfio_device_set_open_count);
+ +
+  /*
+   * Group objects - create, release, get, put, search
+   */
+@@@ -592,7 -517,12 +622,11 @@@ static int __vfio_register_dev(struct v
+  		struct vfio_group *group)
+  {
+  	struct vfio_device *existing_device;
+ -	int ret;
+  
++ 	/*
++ 	 * In all cases group is the output of one of the group allocation
++ 	 * functions and we have group->drivers incremented for us.
++ 	 */
+  	if (IS_ERR(group))
+  		return PTR_ERR(group);
+  
+@@@ -627,6 -561,9 +661,12 @@@
+  	mutex_unlock(&group->device_lock);
+  
+  	return 0;
+++<<<<<<< HEAD
+++=======
++ err_out:
++ 	vfio_device_remove_group(device);
++ 	return ret;
+++>>>>>>> ca5f21b25749 (vfio: Follow a strict lifetime for struct iommu_group)
+  }
+  
+  int vfio_register_group_dev(struct vfio_device *device)
+@@@ -711,14 -648,12 +751,21 @@@ void vfio_unregister_group_dev(struct v
+  
+  	mutex_lock(&group->device_lock);
+  	list_del(&device->group_next);
+ +	group->dev_counter--;
+  	mutex_unlock(&group->device_lock);
+  
+++<<<<<<< HEAD
+ +	if (group->type == VFIO_NO_IOMMU || group->type == VFIO_EMULATED_IOMMU)
+ +		iommu_group_remove_device(device->dev);
+ +
+ +	/* Matches the get in vfio_register_group_dev() */
+ +	vfio_group_put(group);
+++=======
++ 	/* Balances device_add in register path */
++ 	device_del(&device->device);
++ 
++ 	vfio_device_remove_group(device);
+++>>>>>>> ca5f21b25749 (vfio: Follow a strict lifetime for struct iommu_group)
+  }
+  EXPORT_SYMBOL_GPL(vfio_unregister_group_dev);
+  
+* Unmerged path drivers/vfio/vfio.h
+* Unmerged path drivers/vfio/vfio_main.c
