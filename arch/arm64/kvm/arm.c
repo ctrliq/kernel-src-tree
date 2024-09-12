@@ -1506,9 +1506,7 @@ static void teardown_hyp_mode(void)
 		free_page(per_cpu(kvm_arm_hyp_stack_page, cpu));
 }
 
-/**
- * Inits Hyp-mode on all online CPUs
- */
+/* Inits Hyp-mode on all online CPUs */
 static int init_hyp_mode(void)
 {
 	int cpu;
@@ -1662,9 +1660,7 @@ void kvm_arch_irq_bypass_start(struct irq_bypass_consumer *cons)
 	kvm_arm_resume_guest(irqfd->kvm);
 }
 
-/**
- * Initialize Hyp-mode and memory mappings on all CPUs.
- */
+/* Initialize Hyp-mode and memory mappings on all CPUs */
 int kvm_arch_init(void *opaque)
 {
 	int err;
