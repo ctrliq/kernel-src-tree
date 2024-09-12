@@ -1,0 +1,1095 @@
+usb: typec: maxim_contaminant: Implement check_contaminant callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-504.el8
+commit-author Badhri Jagan Sridharan <badhri@google.com>
+commit 02b332a06397ef213790f9561c9c022ce1af1a97
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-504.el8/02b332a0.failed
+
+Maxim TCPC has additional ADCs and low current(1ua) current source
+to measure the impedance of CC and SBU pins. When tcpm invokes
+the check_contaminant callback, Maxim TCPC measures the impedance
+of the CC & SBU pins and when the impedance measured is less than
+1MOhm, it is assumed that USB-C port is contaminated. CC comparators
+are also checked to differentiate between presence of sink and
+contaminant. Once USB-C is deemed to be contaminated, MAXIM TCPC
+has additional hardware to disable normal DRP toggling cycle and
+enable 1ua on CC pins once every 2.4secs/4.8secs. Maxim TCPC
+interrupts AP once the impedance on the CC pin is above the
+1MOhm threshold. The Maxim tcpc driver then signals TCPM_PORT_CLEAN
+to restart toggling.
+
+Renaming tcpci_maxim.c to tcpci_maxim_core.c and moving reg read/write
+helper functions to the tcpci_maxim.h header file.
+
+	Signed-off-by: Badhri Jagan Sridharan <badhri@google.com>
+	Reviewed-by: Guenter Roeck <linux@roeck-us.net>
+Link: https://lore.kernel.org/r/20230114093246.1933321-3-badhri@google.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 02b332a06397ef213790f9561c9c022ce1af1a97)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/typec/tcpm/tcpci_maxim_core.c
+diff --cc drivers/usb/typec/tcpm/tcpci_maxim_core.c
+index 4b6705f3d7b7,f32cda2a5e3a..000000000000
+--- a/drivers/usb/typec/tcpm/tcpci_maxim_core.c
++++ b/drivers/usb/typec/tcpm/tcpci_maxim_core.c
+@@@ -438,7 -418,15 +418,19 @@@ static int tcpci_init(struct tcpci *tcp
+  	return -1;
+  }
+  
+++<<<<<<< HEAD:drivers/usb/typec/tcpm/tcpci_maxim.c
+ +static int max_tcpci_probe(struct i2c_client *client, const struct i2c_device_id *i2c_id)
+++=======
++ static void max_tcpci_check_contaminant(struct tcpci *tcpci, struct tcpci_data *tdata)
++ {
++ 	struct max_tcpci_chip *chip = tdata_to_max_tcpci(tdata);
++ 
++ 	if (!max_contaminant_is_contaminant(chip, true))
++ 		tcpm_port_clean(chip->port);
++ }
++ 
++ static int max_tcpci_probe(struct i2c_client *client)
+++>>>>>>> 02b332a06397 (usb: typec: maxim_contaminant: Implement check_contaminant callback):drivers/usb/typec/tcpm/tcpci_maxim_core.c
+  {
+  	int ret;
+  	struct max_tcpci_chip *chip;
+diff --git a/drivers/usb/typec/tcpm/Makefile b/drivers/usb/typec/tcpm/Makefile
+index 7d499f3569fd..d0f6e44d928f 100644
+--- a/drivers/usb/typec/tcpm/Makefile
++++ b/drivers/usb/typec/tcpm/Makefile
+@@ -7,3 +7,4 @@ obj-$(CONFIG_TYPEC_TCPCI)		+= tcpci.o
+ obj-$(CONFIG_TYPEC_RT1711H)		+= tcpci_rt1711h.o
+ obj-$(CONFIG_TYPEC_MT6360)		+= tcpci_mt6360.o
+ obj-$(CONFIG_TYPEC_TCPCI_MAXIM)		+= tcpci_maxim.o
++tcpci_maxim-y				+= tcpci_maxim_core.o maxim_contaminant.o
+diff --git a/drivers/usb/typec/tcpm/maxim_contaminant.c b/drivers/usb/typec/tcpm/maxim_contaminant.c
+new file mode 100644
+index 000000000000..f8504a90da26
+--- /dev/null
++++ b/drivers/usb/typec/tcpm/maxim_contaminant.c
+@@ -0,0 +1,387 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2022 Google, Inc
++ *
++ * USB-C module to reduce wakeups due to contaminants.
++ */
++
++#include <linux/device.h>
++#include <linux/irqreturn.h>
++#include <linux/module.h>
++#include <linux/regmap.h>
++#include <linux/usb/tcpci.h>
++#include <linux/usb/tcpm.h>
++#include <linux/usb/typec.h>
++
++#include "tcpci_maxim.h"
++
++enum fladc_select {
++	CC1_SCALE1 = 1,
++	CC1_SCALE2,
++	CC2_SCALE1,
++	CC2_SCALE2,
++	SBU1,
++	SBU2,
++};
++
++#define FLADC_1uA_LSB_MV		25
++/* High range CC */
++#define FLADC_CC_HIGH_RANGE_LSB_MV	208
++/* Low range CC */
++#define FLADC_CC_LOW_RANGE_LSB_MV      126
++
++/* 1uA current source */
++#define FLADC_CC_SCALE1			1
++/* 5 uA current source */
++#define FLADC_CC_SCALE2			5
++
++#define FLADC_1uA_CC_OFFSET_MV		300
++#define FLADC_CC_HIGH_RANGE_OFFSET_MV	624
++#define FLADC_CC_LOW_RANGE_OFFSET_MV	378
++
++#define CONTAMINANT_THRESHOLD_SBU_K	1000
++#define	CONTAMINANT_THRESHOLD_CC_K	1000
++
++#define READ1_SLEEP_MS			10
++#define READ2_SLEEP_MS			5
++
++#define STATUS_CHECK(reg, mask, val)	(((reg) & (mask)) == (val))
++
++#define IS_CC_OPEN(cc_status) \
++	(STATUS_CHECK((cc_status), TCPC_CC_STATUS_CC1_MASK << TCPC_CC_STATUS_CC1_SHIFT,  \
++		      TCPC_CC_STATE_SRC_OPEN) && STATUS_CHECK((cc_status),               \
++							      TCPC_CC_STATUS_CC2_MASK << \
++							      TCPC_CC_STATUS_CC2_SHIFT,  \
++							      TCPC_CC_STATE_SRC_OPEN))
++
++static int max_contaminant_adc_to_mv(struct max_tcpci_chip *chip, enum fladc_select channel,
++				     bool ua_src, u8 fladc)
++{
++	/* SBU channels only have 1 scale with 1uA. */
++	if ((ua_src && (channel == CC1_SCALE2 || channel == CC2_SCALE2 || channel == SBU1 ||
++			channel == SBU2)))
++		/* Mean of range */
++		return FLADC_1uA_CC_OFFSET_MV + (fladc * FLADC_1uA_LSB_MV);
++	else if (!ua_src && (channel == CC1_SCALE1 || channel == CC2_SCALE1))
++		return FLADC_CC_HIGH_RANGE_OFFSET_MV + (fladc * FLADC_CC_HIGH_RANGE_LSB_MV);
++	else if (!ua_src && (channel == CC1_SCALE2 || channel == CC2_SCALE2))
++		return FLADC_CC_LOW_RANGE_OFFSET_MV + (fladc * FLADC_CC_LOW_RANGE_LSB_MV);
++
++	dev_err_once(chip->dev, "ADC ERROR: SCALE UNKNOWN");
++
++	return -EINVAL;
++}
++
++static int max_contaminant_read_adc_mv(struct max_tcpci_chip *chip, enum fladc_select channel,
++				       int sleep_msec, bool raw, bool ua_src)
++{
++	struct regmap *regmap = chip->data.regmap;
++	u8 fladc;
++	int ret;
++
++	/* Channel & scale select */
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_ADC_CTRL1, ADCINSEL_MASK,
++				 channel << ADC_CHANNEL_OFFSET);
++	if (ret < 0)
++		return ret;
++
++	/* Enable ADC */
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_ADC_CTRL1, ADCEN, ADCEN);
++	if (ret < 0)
++		return ret;
++
++	usleep_range(sleep_msec * 1000, (sleep_msec + 1) * 1000);
++	ret = max_tcpci_read8(chip, TCPC_VENDOR_FLADC_STATUS, &fladc);
++	if (ret < 0)
++		return ret;
++
++	/* Disable ADC */
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_ADC_CTRL1, ADCEN, 0);
++	if (ret < 0)
++		return ret;
++
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_ADC_CTRL1, ADCINSEL_MASK, 0);
++	if (ret < 0)
++		return ret;
++
++	if (!raw)
++		return max_contaminant_adc_to_mv(chip, channel, ua_src, fladc);
++	else
++		return fladc;
++}
++
++static int max_contaminant_read_resistance_kohm(struct max_tcpci_chip *chip,
++						enum fladc_select channel, int sleep_msec, bool raw)
++{
++	struct regmap *regmap = chip->data.regmap;
++	int mv;
++	int ret;
++
++	if (channel == CC1_SCALE1 || channel == CC2_SCALE1 || channel == CC1_SCALE2 ||
++	    channel == CC2_SCALE2) {
++		/* Enable 1uA current source */
++		ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL2, CCLPMODESEL_MASK,
++					 ULTRA_LOW_POWER_MODE);
++		if (ret < 0)
++			return ret;
++
++		/* Enable 1uA current source */
++		ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL2, CCRPCTRL_MASK, UA_1_SRC);
++		if (ret < 0)
++			return ret;
++
++		/* OVP disable */
++		ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL2, CCOVPDIS, CCOVPDIS);
++		if (ret < 0)
++			return ret;
++
++		mv = max_contaminant_read_adc_mv(chip, channel, sleep_msec, raw, true);
++		if (mv < 0)
++			return ret;
++
++		/* OVP enable */
++		ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL2, CCOVPDIS, 0);
++		if (ret < 0)
++			return ret;
++		/* returns KOhm as 1uA source is used. */
++		return mv;
++	}
++
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL2, SBUOVPDIS, SBUOVPDIS);
++	if (ret < 0)
++		return ret;
++
++	/* SBU switches auto configure when channel is selected. */
++	/* Enable 1ua current source */
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL2, SBURPCTRL, SBURPCTRL);
++	if (ret < 0)
++		return ret;
++
++	mv = max_contaminant_read_adc_mv(chip, channel, sleep_msec, raw, true);
++	if (mv < 0)
++		return ret;
++	/* Disable current source */
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL2, SBURPCTRL, 0);
++	if (ret < 0)
++		return ret;
++
++	/* OVP disable */
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL2, SBUOVPDIS, 0);
++	if (ret < 0)
++		return ret;
++
++	return mv;
++}
++
++static int max_contaminant_read_comparators(struct max_tcpci_chip *chip, u8 *vendor_cc_status2_cc1,
++					    u8 *vendor_cc_status2_cc2)
++{
++	struct regmap *regmap = chip->data.regmap;
++	int ret;
++
++	/* Enable 80uA source */
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL2, CCRPCTRL_MASK, UA_80_SRC);
++	if (ret < 0)
++		return ret;
++
++	/* Enable comparators */
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL1, CCCOMPEN, CCCOMPEN);
++	if (ret < 0)
++		return ret;
++
++	/* Sleep to allow comparators settle */
++	usleep_range(5000, 6000);
++	ret = regmap_update_bits(regmap, TCPC_TCPC_CTRL, TCPC_TCPC_CTRL_ORIENTATION, PLUG_ORNT_CC1);
++	if (ret < 0)
++		return ret;
++
++	usleep_range(5000, 6000);
++	ret = max_tcpci_read8(chip, VENDOR_CC_STATUS2, vendor_cc_status2_cc1);
++	if (ret < 0)
++		return ret;
++
++	ret = regmap_update_bits(regmap, TCPC_TCPC_CTRL, TCPC_TCPC_CTRL_ORIENTATION, PLUG_ORNT_CC2);
++	if (ret < 0)
++		return ret;
++
++	usleep_range(5000, 6000);
++	ret = max_tcpci_read8(chip, VENDOR_CC_STATUS2, vendor_cc_status2_cc2);
++	if (ret < 0)
++		return ret;
++
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL1, CCCOMPEN, 0);
++	if (ret < 0)
++		return ret;
++
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL2, CCRPCTRL_MASK, 0);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
++static int max_contaminant_detect_contaminant(struct max_tcpci_chip *chip)
++{
++	int cc1_k, cc2_k, sbu1_k, sbu2_k, ret;
++	u8 vendor_cc_status2_cc1 = 0xff, vendor_cc_status2_cc2 = 0xff;
++	u8 role_ctrl = 0, role_ctrl_backup = 0;
++	int inferred_state = NOT_DETECTED;
++
++	ret = max_tcpci_read8(chip, TCPC_ROLE_CTRL, &role_ctrl);
++	if (ret < 0)
++		return NOT_DETECTED;
++
++	role_ctrl_backup = role_ctrl;
++	role_ctrl = 0x0F;
++	ret = max_tcpci_write8(chip, TCPC_ROLE_CTRL, role_ctrl);
++	if (ret < 0)
++		return NOT_DETECTED;
++
++	cc1_k = max_contaminant_read_resistance_kohm(chip, CC1_SCALE2, READ1_SLEEP_MS, false);
++	if (cc1_k < 0)
++		goto exit;
++
++	cc2_k = max_contaminant_read_resistance_kohm(chip, CC2_SCALE2, READ2_SLEEP_MS, false);
++	if (cc2_k < 0)
++		goto exit;
++
++	sbu1_k = max_contaminant_read_resistance_kohm(chip, SBU1, READ1_SLEEP_MS, false);
++	if (sbu1_k < 0)
++		goto exit;
++
++	sbu2_k = max_contaminant_read_resistance_kohm(chip, SBU2, READ2_SLEEP_MS, false);
++	if (sbu2_k < 0)
++		goto exit;
++
++	ret = max_contaminant_read_comparators(chip, &vendor_cc_status2_cc1,
++					       &vendor_cc_status2_cc2);
++
++	if (ret < 0)
++		goto exit;
++
++	if ((!(CC1_VUFP_RD0P5 & vendor_cc_status2_cc1) ||
++	     !(CC2_VUFP_RD0P5 & vendor_cc_status2_cc2)) &&
++	    !(CC1_VUFP_RD0P5 & vendor_cc_status2_cc1 && CC2_VUFP_RD0P5 & vendor_cc_status2_cc2))
++		inferred_state = SINK;
++	else if ((cc1_k < CONTAMINANT_THRESHOLD_CC_K || cc2_k < CONTAMINANT_THRESHOLD_CC_K) &&
++		 (sbu1_k < CONTAMINANT_THRESHOLD_SBU_K || sbu2_k < CONTAMINANT_THRESHOLD_SBU_K))
++		inferred_state = DETECTED;
++
++	if (inferred_state == NOT_DETECTED)
++		max_tcpci_write8(chip, TCPC_ROLE_CTRL, role_ctrl_backup);
++	else
++		max_tcpci_write8(chip, TCPC_ROLE_CTRL, (TCPC_ROLE_CTRL_DRP | 0xA));
++
++	return inferred_state;
++exit:
++	max_tcpci_write8(chip, TCPC_ROLE_CTRL, role_ctrl_backup);
++	return NOT_DETECTED;
++}
++
++static int max_contaminant_enable_dry_detection(struct max_tcpci_chip *chip)
++{
++	struct regmap *regmap = chip->data.regmap;
++	u8 temp;
++	int ret;
++
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL3, CCWTRDEB_MASK | CCWTRSEL_MASK
++				    | WTRCYCLE_MASK, CCWTRDEB_1MS << CCWTRDEB_SHIFT |
++				    CCWTRSEL_1V << CCWTRSEL_SHIFT | WTRCYCLE_4_8_S <<
++				    WTRCYCLE_SHIFT);
++	if (ret < 0)
++		return ret;
++
++	ret = regmap_update_bits(regmap, TCPC_ROLE_CTRL, TCPC_ROLE_CTRL_DRP, TCPC_ROLE_CTRL_DRP);
++	if (ret < 0)
++		return ret;
++
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL1, CCCONNDRY, CCCONNDRY);
++	if (ret < 0)
++		return ret;
++	ret = max_tcpci_read8(chip, TCPC_VENDOR_CC_CTRL1, &temp);
++	if (ret < 0)
++		return ret;
++
++	ret = regmap_update_bits(regmap, TCPC_VENDOR_CC_CTRL2, CCLPMODESEL_MASK,
++				 ULTRA_LOW_POWER_MODE);
++	if (ret < 0)
++		return ret;
++	ret = max_tcpci_read8(chip, TCPC_VENDOR_CC_CTRL2, &temp);
++	if (ret < 0)
++		return ret;
++
++	/* Enable Look4Connection before sending the command */
++	ret = regmap_update_bits(regmap, TCPC_TCPC_CTRL, TCPC_TCPC_CTRL_EN_LK4CONN_ALRT,
++				 TCPC_TCPC_CTRL_EN_LK4CONN_ALRT);
++	if (ret < 0)
++		return ret;
++
++	ret = max_tcpci_write8(chip, TCPC_COMMAND, TCPC_CMD_LOOK4CONNECTION);
++	if (ret < 0)
++		return ret;
++	return 0;
++}
++
++bool max_contaminant_is_contaminant(struct max_tcpci_chip *chip, bool disconnect_while_debounce)
++{
++	u8 cc_status, pwr_cntl;
++	int ret;
++
++	ret = max_tcpci_read8(chip, TCPC_CC_STATUS, &cc_status);
++	if (ret < 0)
++		return false;
++
++	ret = max_tcpci_read8(chip, TCPC_POWER_CTRL, &pwr_cntl);
++	if (ret < 0)
++		return false;
++
++	if (chip->contaminant_state == NOT_DETECTED || chip->contaminant_state == SINK) {
++		if (!disconnect_while_debounce)
++			msleep(100);
++
++		ret = max_tcpci_read8(chip, TCPC_CC_STATUS, &cc_status);
++		if (ret < 0)
++			return false;
++
++		if (IS_CC_OPEN(cc_status)) {
++			u8 role_ctrl, role_ctrl_backup;
++
++			ret = max_tcpci_read8(chip, TCPC_ROLE_CTRL, &role_ctrl);
++			if (ret < 0)
++				return false;
++
++			role_ctrl_backup = role_ctrl;
++			role_ctrl |= 0x0F;
++			role_ctrl &= ~(TCPC_ROLE_CTRL_DRP);
++			ret = max_tcpci_write8(chip, TCPC_ROLE_CTRL, role_ctrl);
++			if (ret < 0)
++				return false;
++
++			chip->contaminant_state = max_contaminant_detect_contaminant(chip);
++
++			ret = max_tcpci_write8(chip, TCPC_ROLE_CTRL, role_ctrl_backup);
++			if (ret < 0)
++				return false;
++
++			if (chip->contaminant_state == DETECTED) {
++				max_contaminant_enable_dry_detection(chip);
++				return true;
++			}
++		}
++		return false;
++	} else if (chip->contaminant_state == DETECTED) {
++		if (STATUS_CHECK(cc_status, TCPC_CC_STATUS_TOGGLING, 0)) {
++			chip->contaminant_state = max_contaminant_detect_contaminant(chip);
++			if (chip->contaminant_state == DETECTED) {
++				max_contaminant_enable_dry_detection(chip);
++				return true;
++			}
++		}
++	}
++
++	return false;
++}
++
++MODULE_DESCRIPTION("MAXIM TCPC CONTAMINANT Module");
++MODULE_AUTHOR("Badhri Jagan Sridharan <badhri@google.com>");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/usb/typec/tcpm/tcpci_maxim.c b/drivers/usb/typec/tcpm/tcpci_maxim.c
+deleted file mode 100644
+index 4b6705f3d7b7..000000000000
+--- a/drivers/usb/typec/tcpm/tcpci_maxim.c
++++ /dev/null
+@@ -1,532 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-/*
+- * Copyright (C) 2020, Google LLC
+- *
+- * MAXIM TCPCI based TCPC driver
+- */
+-
+-#include <linux/interrupt.h>
+-#include <linux/i2c.h>
+-#include <linux/kernel.h>
+-#include <linux/module.h>
+-#include <linux/regmap.h>
+-#include <linux/usb/pd.h>
+-#include <linux/usb/tcpci.h>
+-#include <linux/usb/tcpm.h>
+-#include <linux/usb/typec.h>
+-
+-#define PD_ACTIVITY_TIMEOUT_MS				10000
+-
+-#define TCPC_VENDOR_ALERT				0x80
+-#define TCPC_VENDOR_USBSW_CTRL				0x93
+-#define TCPC_VENDOR_USBSW_CTRL_ENABLE_USB_DATA		0x9
+-#define TCPC_VENDOR_USBSW_CTRL_DISABLE_USB_DATA		0
+-
+-#define TCPC_RECEIVE_BUFFER_COUNT_OFFSET		0
+-#define TCPC_RECEIVE_BUFFER_FRAME_TYPE_OFFSET		1
+-#define TCPC_RECEIVE_BUFFER_RX_BYTE_BUF_OFFSET		2
+-
+-/*
+- * LongMessage not supported, hence 32 bytes for buf to be read from RECEIVE_BUFFER.
+- * DEVICE_CAPABILITIES_2.LongMessage = 0, the value in READABLE_BYTE_COUNT reg shall be
+- * less than or equal to 31. Since, RECEIVE_BUFFER len = 31 + 1(READABLE_BYTE_COUNT).
+- */
+-#define TCPC_RECEIVE_BUFFER_LEN				32
+-
+-#define MAX_BUCK_BOOST_SID				0x69
+-#define MAX_BUCK_BOOST_OP				0xb9
+-#define MAX_BUCK_BOOST_OFF				0
+-#define MAX_BUCK_BOOST_SOURCE				0xa
+-#define MAX_BUCK_BOOST_SINK				0x5
+-
+-struct max_tcpci_chip {
+-	struct tcpci_data data;
+-	struct tcpci *tcpci;
+-	struct device *dev;
+-	struct i2c_client *client;
+-	struct tcpm_port *port;
+-};
+-
+-static const struct regmap_range max_tcpci_tcpci_range[] = {
+-	regmap_reg_range(0x00, 0x95)
+-};
+-
+-static const struct regmap_access_table max_tcpci_tcpci_write_table = {
+-	.yes_ranges = max_tcpci_tcpci_range,
+-	.n_yes_ranges = ARRAY_SIZE(max_tcpci_tcpci_range),
+-};
+-
+-static const struct regmap_config max_tcpci_regmap_config = {
+-	.reg_bits = 8,
+-	.val_bits = 8,
+-	.max_register = 0x95,
+-	.wr_table = &max_tcpci_tcpci_write_table,
+-};
+-
+-static struct max_tcpci_chip *tdata_to_max_tcpci(struct tcpci_data *tdata)
+-{
+-	return container_of(tdata, struct max_tcpci_chip, data);
+-}
+-
+-static int max_tcpci_read16(struct max_tcpci_chip *chip, unsigned int reg, u16 *val)
+-{
+-	return regmap_raw_read(chip->data.regmap, reg, val, sizeof(u16));
+-}
+-
+-static int max_tcpci_write16(struct max_tcpci_chip *chip, unsigned int reg, u16 val)
+-{
+-	return regmap_raw_write(chip->data.regmap, reg, &val, sizeof(u16));
+-}
+-
+-static int max_tcpci_read8(struct max_tcpci_chip *chip, unsigned int reg, u8 *val)
+-{
+-	return regmap_raw_read(chip->data.regmap, reg, val, sizeof(u8));
+-}
+-
+-static int max_tcpci_write8(struct max_tcpci_chip *chip, unsigned int reg, u8 val)
+-{
+-	return regmap_raw_write(chip->data.regmap, reg, &val, sizeof(u8));
+-}
+-
+-static void max_tcpci_init_regs(struct max_tcpci_chip *chip)
+-{
+-	u16 alert_mask = 0;
+-	int ret;
+-
+-	ret = max_tcpci_write16(chip, TCPC_ALERT, 0xffff);
+-	if (ret < 0) {
+-		dev_err(chip->dev, "Error writing to TCPC_ALERT ret:%d\n", ret);
+-		return;
+-	}
+-
+-	ret = max_tcpci_write16(chip, TCPC_VENDOR_ALERT, 0xffff);
+-	if (ret < 0) {
+-		dev_err(chip->dev, "Error writing to TCPC_VENDOR_ALERT ret:%d\n", ret);
+-		return;
+-	}
+-
+-	ret = max_tcpci_write8(chip, TCPC_ALERT_EXTENDED, 0xff);
+-	if (ret < 0) {
+-		dev_err(chip->dev, "Unable to clear TCPC_ALERT_EXTENDED ret:%d\n", ret);
+-		return;
+-	}
+-
+-	/* Enable VSAFE0V detection */
+-	ret = max_tcpci_write8(chip, TCPC_EXTENDED_STATUS_MASK, TCPC_EXTENDED_STATUS_VSAFE0V);
+-	if (ret < 0) {
+-		dev_err(chip->dev, "Unable to unmask TCPC_EXTENDED_STATUS_VSAFE0V ret:%d\n", ret);
+-		return;
+-	}
+-
+-	alert_mask = TCPC_ALERT_TX_SUCCESS | TCPC_ALERT_TX_DISCARDED | TCPC_ALERT_TX_FAILED |
+-		TCPC_ALERT_RX_HARD_RST | TCPC_ALERT_RX_STATUS | TCPC_ALERT_CC_STATUS |
+-		TCPC_ALERT_VBUS_DISCNCT | TCPC_ALERT_RX_BUF_OVF | TCPC_ALERT_POWER_STATUS |
+-		/* Enable Extended alert for detecting Fast Role Swap Signal */
+-		TCPC_ALERT_EXTND | TCPC_ALERT_EXTENDED_STATUS;
+-
+-	ret = max_tcpci_write16(chip, TCPC_ALERT_MASK, alert_mask);
+-	if (ret < 0) {
+-		dev_err(chip->dev,
+-			"Error enabling TCPC_ALERT: TCPC_ALERT_MASK write failed ret:%d\n", ret);
+-		return;
+-	}
+-
+-	/* Enable vbus voltage monitoring and voltage alerts */
+-	ret = max_tcpci_write8(chip, TCPC_POWER_CTRL, 0);
+-	if (ret < 0) {
+-		dev_err(chip->dev, "Error writing to TCPC_POWER_CTRL ret:%d\n", ret);
+-		return;
+-	}
+-
+-	ret = max_tcpci_write8(chip, TCPC_ALERT_EXTENDED_MASK, TCPC_SINK_FAST_ROLE_SWAP);
+-	if (ret < 0)
+-		return;
+-}
+-
+-static void process_rx(struct max_tcpci_chip *chip, u16 status)
+-{
+-	struct pd_message msg;
+-	u8 count, frame_type, rx_buf[TCPC_RECEIVE_BUFFER_LEN];
+-	int ret, payload_index;
+-	u8 *rx_buf_ptr;
+-
+-	/*
+-	 * READABLE_BYTE_COUNT: Indicates the number of bytes in the RX_BUF_BYTE_x registers
+-	 * plus one (for the RX_BUF_FRAME_TYPE) Table 4-36.
+-	 * Read the count and frame type.
+-	 */
+-	ret = regmap_raw_read(chip->data.regmap, TCPC_RX_BYTE_CNT, rx_buf, 2);
+-	if (ret < 0) {
+-		dev_err(chip->dev, "TCPC_RX_BYTE_CNT read failed ret:%d\n", ret);
+-		return;
+-	}
+-
+-	count = rx_buf[TCPC_RECEIVE_BUFFER_COUNT_OFFSET];
+-	frame_type = rx_buf[TCPC_RECEIVE_BUFFER_FRAME_TYPE_OFFSET];
+-
+-	if (count == 0 || frame_type != TCPC_RX_BUF_FRAME_TYPE_SOP) {
+-		max_tcpci_write16(chip, TCPC_ALERT, TCPC_ALERT_RX_STATUS);
+-		dev_err(chip->dev, "%s\n", count ==  0 ? "error: count is 0" :
+-			"error frame_type is not SOP");
+-		return;
+-	}
+-
+-	if (count > sizeof(struct pd_message) || count + 1 > TCPC_RECEIVE_BUFFER_LEN) {
+-		dev_err(chip->dev, "Invalid TCPC_RX_BYTE_CNT %d\n", count);
+-		return;
+-	}
+-
+-	/*
+-	 * Read count + 1 as RX_BUF_BYTE_x is hidden and can only be read through
+-	 * TCPC_RX_BYTE_CNT
+-	 */
+-	count += 1;
+-	ret = regmap_raw_read(chip->data.regmap, TCPC_RX_BYTE_CNT, rx_buf, count);
+-	if (ret < 0) {
+-		dev_err(chip->dev, "Error: TCPC_RX_BYTE_CNT read failed: %d\n", ret);
+-		return;
+-	}
+-
+-	rx_buf_ptr = rx_buf + TCPC_RECEIVE_BUFFER_RX_BYTE_BUF_OFFSET;
+-	msg.header = cpu_to_le16(*(u16 *)rx_buf_ptr);
+-	rx_buf_ptr = rx_buf_ptr + sizeof(msg.header);
+-	for (payload_index = 0; payload_index < pd_header_cnt_le(msg.header); payload_index++,
+-	     rx_buf_ptr += sizeof(msg.payload[0]))
+-		msg.payload[payload_index] = cpu_to_le32(*(u32 *)rx_buf_ptr);
+-
+-	/*
+-	 * Read complete, clear RX status alert bit.
+-	 * Clear overflow as well if set.
+-	 */
+-	ret = max_tcpci_write16(chip, TCPC_ALERT, status & TCPC_ALERT_RX_BUF_OVF ?
+-				TCPC_ALERT_RX_STATUS | TCPC_ALERT_RX_BUF_OVF :
+-				TCPC_ALERT_RX_STATUS);
+-	if (ret < 0)
+-		return;
+-
+-	tcpm_pd_receive(chip->port, &msg);
+-}
+-
+-static int max_tcpci_set_vbus(struct tcpci *tcpci, struct tcpci_data *tdata, bool source, bool sink)
+-{
+-	struct max_tcpci_chip *chip = tdata_to_max_tcpci(tdata);
+-	u8 buffer_source[2] = {MAX_BUCK_BOOST_OP, MAX_BUCK_BOOST_SOURCE};
+-	u8 buffer_sink[2] = {MAX_BUCK_BOOST_OP, MAX_BUCK_BOOST_SINK};
+-	u8 buffer_none[2] = {MAX_BUCK_BOOST_OP, MAX_BUCK_BOOST_OFF};
+-	struct i2c_client *i2c = chip->client;
+-	int ret;
+-
+-	struct i2c_msg msgs[] = {
+-		{
+-			.addr = MAX_BUCK_BOOST_SID,
+-			.flags = i2c->flags & I2C_M_TEN,
+-			.len = 2,
+-			.buf = source ? buffer_source : sink ? buffer_sink : buffer_none,
+-		},
+-	};
+-
+-	if (source && sink) {
+-		dev_err(chip->dev, "Both source and sink set\n");
+-		return -EINVAL;
+-	}
+-
+-	ret = i2c_transfer(i2c->adapter, msgs, 1);
+-
+-	return  ret < 0 ? ret : 1;
+-}
+-
+-static void process_power_status(struct max_tcpci_chip *chip)
+-{
+-	u8 pwr_status;
+-	int ret;
+-
+-	ret = max_tcpci_read8(chip, TCPC_POWER_STATUS, &pwr_status);
+-	if (ret < 0)
+-		return;
+-
+-	if (pwr_status == 0xff)
+-		max_tcpci_init_regs(chip);
+-	else if (pwr_status & TCPC_POWER_STATUS_SOURCING_VBUS)
+-		tcpm_sourcing_vbus(chip->port);
+-	else
+-		tcpm_vbus_change(chip->port);
+-}
+-
+-static void max_tcpci_frs_sourcing_vbus(struct tcpci *tcpci, struct tcpci_data *tdata)
+-{
+-	/*
+-	 * For Fast Role Swap case, Boost turns on autonomously without
+-	 * AP intervention, but, needs AP to enable source mode explicitly
+-	 * for AP to regain control.
+-	 */
+-	max_tcpci_set_vbus(tcpci, tdata, true, false);
+-}
+-
+-static void process_tx(struct max_tcpci_chip *chip, u16 status)
+-{
+-	if (status & TCPC_ALERT_TX_SUCCESS)
+-		tcpm_pd_transmit_complete(chip->port, TCPC_TX_SUCCESS);
+-	else if (status & TCPC_ALERT_TX_DISCARDED)
+-		tcpm_pd_transmit_complete(chip->port, TCPC_TX_DISCARDED);
+-	else if (status & TCPC_ALERT_TX_FAILED)
+-		tcpm_pd_transmit_complete(chip->port, TCPC_TX_FAILED);
+-
+-	/* Reinit regs as Hard reset sets them to default value */
+-	if ((status & TCPC_ALERT_TX_SUCCESS) && (status & TCPC_ALERT_TX_FAILED))
+-		max_tcpci_init_regs(chip);
+-}
+-
+-/* Enable USB switches when partner is USB communications capable */
+-static void max_tcpci_set_partner_usb_comm_capable(struct tcpci *tcpci, struct tcpci_data *data,
+-						   bool capable)
+-{
+-	struct max_tcpci_chip *chip = tdata_to_max_tcpci(data);
+-	int ret;
+-
+-	ret = max_tcpci_write8(chip, TCPC_VENDOR_USBSW_CTRL, capable ?
+-			       TCPC_VENDOR_USBSW_CTRL_ENABLE_USB_DATA :
+-			       TCPC_VENDOR_USBSW_CTRL_DISABLE_USB_DATA);
+-
+-	if (ret < 0)
+-		dev_err(chip->dev, "Failed to enable USB switches");
+-}
+-
+-static irqreturn_t _max_tcpci_irq(struct max_tcpci_chip *chip, u16 status)
+-{
+-	u16 mask;
+-	int ret;
+-	u8 reg_status;
+-
+-	/*
+-	 * Clear alert status for everything except RX_STATUS, which shouldn't
+-	 * be cleared until we have successfully retrieved message.
+-	 */
+-	if (status & ~TCPC_ALERT_RX_STATUS) {
+-		mask = status & TCPC_ALERT_RX_BUF_OVF ?
+-			status & ~(TCPC_ALERT_RX_STATUS | TCPC_ALERT_RX_BUF_OVF) :
+-			status & ~TCPC_ALERT_RX_STATUS;
+-		ret = max_tcpci_write16(chip, TCPC_ALERT, mask);
+-		if (ret < 0) {
+-			dev_err(chip->dev, "ALERT clear failed\n");
+-			return ret;
+-		}
+-	}
+-
+-	if (status & TCPC_ALERT_RX_BUF_OVF && !(status & TCPC_ALERT_RX_STATUS)) {
+-		ret = max_tcpci_write16(chip, TCPC_ALERT, (TCPC_ALERT_RX_STATUS |
+-							  TCPC_ALERT_RX_BUF_OVF));
+-		if (ret < 0) {
+-			dev_err(chip->dev, "ALERT clear failed\n");
+-			return ret;
+-		}
+-	}
+-
+-	if (status & TCPC_ALERT_EXTND) {
+-		ret = max_tcpci_read8(chip, TCPC_ALERT_EXTENDED, &reg_status);
+-		if (ret < 0)
+-			return ret;
+-
+-		ret = max_tcpci_write8(chip, TCPC_ALERT_EXTENDED, reg_status);
+-		if (ret < 0)
+-			return ret;
+-
+-		if (reg_status & TCPC_SINK_FAST_ROLE_SWAP) {
+-			dev_info(chip->dev, "FRS Signal\n");
+-			tcpm_sink_frs(chip->port);
+-		}
+-	}
+-
+-	if (status & TCPC_ALERT_EXTENDED_STATUS) {
+-		ret = max_tcpci_read8(chip, TCPC_EXTENDED_STATUS, (u8 *)&reg_status);
+-		if (ret >= 0 && (reg_status & TCPC_EXTENDED_STATUS_VSAFE0V))
+-			tcpm_vbus_change(chip->port);
+-	}
+-
+-	if (status & TCPC_ALERT_RX_STATUS)
+-		process_rx(chip, status);
+-
+-	if (status & TCPC_ALERT_VBUS_DISCNCT)
+-		tcpm_vbus_change(chip->port);
+-
+-	if (status & TCPC_ALERT_CC_STATUS)
+-		tcpm_cc_change(chip->port);
+-
+-	if (status & TCPC_ALERT_POWER_STATUS)
+-		process_power_status(chip);
+-
+-	if (status & TCPC_ALERT_RX_HARD_RST) {
+-		tcpm_pd_hard_reset(chip->port);
+-		max_tcpci_init_regs(chip);
+-	}
+-
+-	if (status & TCPC_ALERT_TX_SUCCESS || status & TCPC_ALERT_TX_DISCARDED || status &
+-	    TCPC_ALERT_TX_FAILED)
+-		process_tx(chip, status);
+-
+-	return IRQ_HANDLED;
+-}
+-
+-static irqreturn_t max_tcpci_irq(int irq, void *dev_id)
+-{
+-	struct max_tcpci_chip *chip = dev_id;
+-	u16 status;
+-	irqreturn_t irq_return = IRQ_HANDLED;
+-	int ret;
+-
+-	if (!chip->port)
+-		return IRQ_HANDLED;
+-
+-	ret = max_tcpci_read16(chip, TCPC_ALERT, &status);
+-	if (ret < 0) {
+-		dev_err(chip->dev, "ALERT read failed\n");
+-		return ret;
+-	}
+-	while (status) {
+-		irq_return = _max_tcpci_irq(chip, status);
+-		/* Do not return if the ALERT is already set. */
+-		ret = max_tcpci_read16(chip, TCPC_ALERT, &status);
+-		if (ret < 0)
+-			break;
+-	}
+-
+-	return irq_return;
+-}
+-
+-static irqreturn_t max_tcpci_isr(int irq, void *dev_id)
+-{
+-	struct max_tcpci_chip *chip = dev_id;
+-
+-	pm_wakeup_event(chip->dev, PD_ACTIVITY_TIMEOUT_MS);
+-
+-	if (!chip->port)
+-		return IRQ_HANDLED;
+-
+-	return IRQ_WAKE_THREAD;
+-}
+-
+-static int max_tcpci_init_alert(struct max_tcpci_chip *chip, struct i2c_client *client)
+-{
+-	int ret;
+-
+-	ret = devm_request_threaded_irq(chip->dev, client->irq, max_tcpci_isr, max_tcpci_irq,
+-					(IRQF_TRIGGER_LOW | IRQF_ONESHOT), dev_name(chip->dev),
+-					chip);
+-
+-	if (ret < 0)
+-		return ret;
+-
+-	enable_irq_wake(client->irq);
+-	return 0;
+-}
+-
+-static int max_tcpci_start_toggling(struct tcpci *tcpci, struct tcpci_data *tdata,
+-				    enum typec_cc_status cc)
+-{
+-	struct max_tcpci_chip *chip = tdata_to_max_tcpci(tdata);
+-
+-	max_tcpci_init_regs(chip);
+-
+-	return 0;
+-}
+-
+-static int tcpci_init(struct tcpci *tcpci, struct tcpci_data *data)
+-{
+-	/*
+-	 * Generic TCPCI overwrites the regs once this driver initializes
+-	 * them. Prevent this by returning -1.
+-	 */
+-	return -1;
+-}
+-
+-static int max_tcpci_probe(struct i2c_client *client, const struct i2c_device_id *i2c_id)
+-{
+-	int ret;
+-	struct max_tcpci_chip *chip;
+-	u8 power_status;
+-
+-	chip = devm_kzalloc(&client->dev, sizeof(*chip), GFP_KERNEL);
+-	if (!chip)
+-		return -ENOMEM;
+-
+-	chip->client = client;
+-	chip->data.regmap = devm_regmap_init_i2c(client, &max_tcpci_regmap_config);
+-	if (IS_ERR(chip->data.regmap)) {
+-		dev_err(&client->dev, "Regmap init failed\n");
+-		return PTR_ERR(chip->data.regmap);
+-	}
+-
+-	chip->dev = &client->dev;
+-	i2c_set_clientdata(client, chip);
+-
+-	ret = max_tcpci_read8(chip, TCPC_POWER_STATUS, &power_status);
+-	if (ret < 0)
+-		return ret;
+-
+-	/* Chip level tcpci callbacks */
+-	chip->data.set_vbus = max_tcpci_set_vbus;
+-	chip->data.start_drp_toggling = max_tcpci_start_toggling;
+-	chip->data.TX_BUF_BYTE_x_hidden = true;
+-	chip->data.init = tcpci_init;
+-	chip->data.frs_sourcing_vbus = max_tcpci_frs_sourcing_vbus;
+-	chip->data.auto_discharge_disconnect = true;
+-	chip->data.vbus_vsafe0v = true;
+-	chip->data.set_partner_usb_comm_capable = max_tcpci_set_partner_usb_comm_capable;
+-
+-	max_tcpci_init_regs(chip);
+-	chip->tcpci = tcpci_register_port(chip->dev, &chip->data);
+-	if (IS_ERR(chip->tcpci)) {
+-		dev_err(&client->dev, "TCPCI port registration failed\n");
+-		return PTR_ERR(chip->tcpci);
+-	}
+-	chip->port = tcpci_get_tcpm_port(chip->tcpci);
+-	ret = max_tcpci_init_alert(chip, client);
+-	if (ret < 0)
+-		goto unreg_port;
+-
+-	device_init_wakeup(chip->dev, true);
+-	return 0;
+-
+-unreg_port:
+-	tcpci_unregister_port(chip->tcpci);
+-
+-	return ret;
+-}
+-
+-static int max_tcpci_remove(struct i2c_client *client)
+-{
+-	struct max_tcpci_chip *chip = i2c_get_clientdata(client);
+-
+-	if (!IS_ERR_OR_NULL(chip->tcpci))
+-		tcpci_unregister_port(chip->tcpci);
+-
+-	return 0;
+-}
+-
+-static const struct i2c_device_id max_tcpci_id[] = {
+-	{ "maxtcpc", 0 },
+-	{ }
+-};
+-MODULE_DEVICE_TABLE(i2c, max_tcpci_id);
+-
+-#ifdef CONFIG_OF
+-static const struct of_device_id max_tcpci_of_match[] = {
+-	{ .compatible = "maxim,max33359", },
+-	{},
+-};
+-MODULE_DEVICE_TABLE(of, max_tcpci_of_match);
+-#endif
+-
+-static struct i2c_driver max_tcpci_i2c_driver = {
+-	.driver = {
+-		.name = "maxtcpc",
+-		.of_match_table = of_match_ptr(max_tcpci_of_match),
+-	},
+-	.probe = max_tcpci_probe,
+-	.remove = max_tcpci_remove,
+-	.id_table = max_tcpci_id,
+-};
+-module_i2c_driver(max_tcpci_i2c_driver);
+-
+-MODULE_AUTHOR("Badhri Jagan Sridharan <badhri@google.com>");
+-MODULE_DESCRIPTION("Maxim TCPCI based USB Type-C Port Controller Interface Driver");
+-MODULE_LICENSE("GPL v2");
+diff --git a/drivers/usb/typec/tcpm/tcpci_maxim.h b/drivers/usb/typec/tcpm/tcpci_maxim.h
+new file mode 100644
+index 000000000000..2c1c4d161b0d
+--- /dev/null
++++ b/drivers/usb/typec/tcpm/tcpci_maxim.h
+@@ -0,0 +1,89 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2022 Google, Inc
++ *
++ * MAXIM TCPC header file.
++ */
++#ifndef TCPCI_MAXIM_H_
++#define TCPCI_MAXIM_H_
++
++#define VENDOR_CC_STATUS2                       0x85
++#define CC1_VUFP_RD0P5                          BIT(1)
++#define CC2_VUFP_RD0P5                          BIT(5)
++#define TCPC_VENDOR_FLADC_STATUS                0x89
++
++#define TCPC_VENDOR_CC_CTRL1                    0x8c
++#define CCCONNDRY                               BIT(7)
++#define CCCOMPEN                                BIT(5)
++
++#define TCPC_VENDOR_CC_CTRL2                    0x8d
++#define SBUOVPDIS                               BIT(7)
++#define CCOVPDIS                                BIT(6)
++#define SBURPCTRL                               BIT(5)
++#define CCLPMODESEL_MASK                        GENMASK(4, 3)
++#define ULTRA_LOW_POWER_MODE                    BIT(3)
++#define CCRPCTRL_MASK                           GENMASK(2, 0)
++#define UA_1_SRC                                1
++#define UA_80_SRC                               3
++
++#define TCPC_VENDOR_CC_CTRL3                    0x8e
++#define CCWTRDEB_MASK                           GENMASK(7, 6)
++#define CCWTRDEB_SHIFT                          6
++#define CCWTRDEB_1MS                            1
++#define CCWTRSEL_MASK                           GENMASK(5, 3)
++#define CCWTRSEL_SHIFT                          3
++#define CCWTRSEL_1V                             0x4
++#define CCLADDERDIS                             BIT(2)
++#define WTRCYCLE_MASK                           BIT(0)
++#define WTRCYCLE_SHIFT                          0
++#define WTRCYCLE_2_4_S                          0
++#define WTRCYCLE_4_8_S                          1
++
++#define TCPC_VENDOR_ADC_CTRL1                   0x91
++#define ADCINSEL_MASK                           GENMASK(7, 5)
++#define ADC_CHANNEL_OFFSET                      5
++#define ADCEN                                   BIT(0)
++
++enum contamiant_state {
++	NOT_DETECTED,
++	DETECTED,
++	SINK,
++};
++
++/*
++ * @potential_contaminant:
++ *		Last returned result to tcpm indicating whether the TCPM port
++ *		has potential contaminant.
++ */
++struct max_tcpci_chip {
++	struct tcpci_data data;
++	struct tcpci *tcpci;
++	struct device *dev;
++	struct i2c_client *client;
++	struct tcpm_port *port;
++	enum contamiant_state contaminant_state;
++};
++
++static inline int max_tcpci_read16(struct max_tcpci_chip *chip, unsigned int reg, u16 *val)
++{
++	return regmap_raw_read(chip->data.regmap, reg, val, sizeof(u16));
++}
++
++static inline int max_tcpci_write16(struct max_tcpci_chip *chip, unsigned int reg, u16 val)
++{
++	return regmap_raw_write(chip->data.regmap, reg, &val, sizeof(u16));
++}
++
++static inline int max_tcpci_read8(struct max_tcpci_chip *chip, unsigned int reg, u8 *val)
++{
++	return regmap_raw_read(chip->data.regmap, reg, val, sizeof(u8));
++}
++
++static inline int max_tcpci_write8(struct max_tcpci_chip *chip, unsigned int reg, u8 val)
++{
++	return regmap_raw_write(chip->data.regmap, reg, &val, sizeof(u8));
++}
++
++bool max_contaminant_is_contaminant(struct max_tcpci_chip *chip, bool disconnect_while_debounce);
++
++#endif  // TCPCI_MAXIM_H_
+* Unmerged path drivers/usb/typec/tcpm/tcpci_maxim_core.c
