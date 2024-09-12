@@ -1,0 +1,115 @@
+scsi: core: Allow the ALUA transitioning state enough time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.10.1.el8_7
+commit-author Brian Bunker <brian@purestorage.com>
+commit 54249306e2776774ccb827969e62d34570f991db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.10.1.el8_7/54249306.failed
+
+The error path for the SCSI check condition of not ready, target in ALUA
+state transition, will result in the failure of that path after the retries
+are exhausted. In most cases that is well ahead of the transition timeout
+established in the SCSI ALUA device handler.
+
+Instead, reprep the command and re-add it to the queue after a 1 second
+delay. This will allow the handler to take care of the timeout and only
+fail the path if the target has exceeded the transition expiry timeout
+(default 60 seconds). If the expiry timeout is exceeded, the handler will
+change the path state from transitioning to standby leading to a path
+failure eliminating the potential of this re-prep to continue endlessly. In
+most cases the target will exit the transitioning state well before the
+expiry timeout but after the retries are exhausted as mentioned.
+
+Additionally remove the scsi_io_completion_reprep() function which provides
+little value.
+
+Link: https://lore.kernel.org/r/20220729214110.58576-1-brian@purestorage.com
+	Reviewed-by: Martin Wilck <mwilck@suse.com>
+	Acked-by: Krishna Kant <krishna.kant@purestorage.com>
+	Acked-by: Seamus Connor <sconnor@purestorage.com>
+	Signed-off-by: Brian Bunker <brian@purestorage.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 54249306e2776774ccb827969e62d34570f991db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_lib.c
+diff --cc drivers/scsi/scsi_lib.c
+index 9389762189f3,784661035590..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -652,12 -616,44 +657,53 @@@ static blk_status_t scsi_result_to_blk_
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +/* Helper for scsi_io_completion() when "reprep" action required. */
+ +static void scsi_io_completion_reprep(struct scsi_cmnd *cmd,
+ +				      struct request_queue *q)
+ +{
+ +	/* A new command will be prepared and issued. */
+ +	scsi_mq_requeue_cmd(cmd);
+++=======
++ /**
++  * scsi_rq_err_bytes - determine number of bytes till the next failure boundary
++  * @rq: request to examine
++  *
++  * Description:
++  *     A request could be merge of IOs which require different failure
++  *     handling.  This function determines the number of bytes which
++  *     can be failed from the beginning of the request without
++  *     crossing into area which need to be retried further.
++  *
++  * Return:
++  *     The number of bytes to fail.
++  */
++ static unsigned int scsi_rq_err_bytes(const struct request *rq)
++ {
++ 	unsigned int ff = rq->cmd_flags & REQ_FAILFAST_MASK;
++ 	unsigned int bytes = 0;
++ 	struct bio *bio;
++ 
++ 	if (!(rq->rq_flags & RQF_MIXED_MERGE))
++ 		return blk_rq_bytes(rq);
++ 
++ 	/*
++ 	 * Currently the only 'mixing' which can happen is between
++ 	 * different fastfail types.  We can safely fail portions
++ 	 * which have all the failfast bits that the first one has -
++ 	 * the ones which are at least as eager to fail as the first
++ 	 * one.
++ 	 */
++ 	for (bio = rq->bio; bio; bio = bio->bi_next) {
++ 		if ((bio->bi_opf & ff) != ff)
++ 			break;
++ 		bytes += bio->bi_iter.bi_size;
++ 	}
++ 
++ 	/* this could lead to infinite loop */
++ 	BUG_ON(blk_rq_bytes(rq) && !bytes);
++ 	return bytes;
+++>>>>>>> 54249306e277 (scsi: core: Allow the ALUA transitioning state enough time)
+  }
+  
+  static bool scsi_cmd_runtime_exceeced(struct scsi_cmnd *cmd)
+@@@ -829,11 -832,14 +882,14 @@@ static void scsi_io_completion_action(s
+  				scsi_print_command(cmd);
+  			}
+  		}
+ -		if (!scsi_end_request(req, blk_stat, scsi_rq_err_bytes(req)))
+ +		if (!scsi_end_request(req, blk_stat, blk_rq_err_bytes(req)))
+  			return;
+ -		fallthrough;
+ +		/*FALLTHRU*/
+  	case ACTION_REPREP:
+- 		scsi_io_completion_reprep(cmd, q);
++ 		scsi_mq_requeue_cmd(cmd, 0);
++ 		break;
++ 	case ACTION_DELAYED_REPREP:
++ 		scsi_mq_requeue_cmd(cmd, ALUA_TRANSITION_REPREP_DELAY);
+  		break;
+  	case ACTION_RETRY:
+  		/* Retry the same command immediately */
+* Unmerged path drivers/scsi/scsi_lib.c
