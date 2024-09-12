@@ -1,0 +1,119 @@
+fortify: Provide a memcpy trap door for sharp corners
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-487.el8
+commit-author Kees Cook <keescook@chromium.org>
+commit 43213daed6d6cb60e8cf69058a6db8648a556d9d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-487.el8/43213dae.failed
+
+As we continue to narrow the scope of what the FORTIFY memcpy() will
+accept and build alternative APIs that give the compiler appropriate
+visibility into more complex memcpy scenarios, there is a need for
+"unfortified" memcpy use in rare cases where combinations of compiler
+behaviors, source code layout, etc, result in cases where the stricter
+memcpy checks need to be bypassed until appropriate solutions can be
+developed (i.e. fix compiler bugs, code refactoring, new API, etc). The
+intention is for this to be used only if there's no other reasonable
+solution, for its use to include a justification that can be used
+to assess future solutions, and for it to be temporary.
+
+Example usage included, based on analysis and discussion from:
+https://lore.kernel.org/netdev/CANn89iLS_2cshtuXPyNUGDPaic=sJiYfvTb_wNLgWrZRyBxZ_g@mail.gmail.com
+
+	Cc: Jakub Kicinski <kuba@kernel.org>
+	Cc: Eric Dumazet <edumazet@google.com>
+	Cc: "David S. Miller" <davem@davemloft.net>
+	Cc: Paolo Abeni <pabeni@redhat.com>
+	Cc: Coco Li <lixiaoyan@google.com>
+	Cc: Tariq Toukan <tariqt@nvidia.com>
+	Cc: Saeed Mahameed <saeedm@nvidia.com>
+	Cc: Leon Romanovsky <leon@kernel.org>
+	Cc: netdev@vger.kernel.org
+	Cc: linux-hardening@vger.kernel.org
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+Link: https://lore.kernel.org/r/20220511025301.3636666-1-keescook@chromium.org
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit 43213daed6d6cb60e8cf69058a6db8648a556d9d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/fortify-string.h
+diff --cc include/linux/fortify-string.h
+index 4d86485f5be8,3b401fa0f374..000000000000
+--- a/include/linux/fortify-string.h
++++ b/include/linux/fortify-string.h
+@@@ -41,7 -52,33 +41,37 @@@ extern char *__underlying_strncpy(char 
+  #define __underlying_strncpy	__builtin_strncpy
+  #endif
+  
+++<<<<<<< HEAD
+ +__FORTIFY_INLINE char *strncpy(char *p, const char *q, __kernel_size_t size)
+++=======
++ /**
++  * unsafe_memcpy - memcpy implementation with no FORTIFY bounds checking
++  *
++  * @dst: Destination memory address to write to
++  * @src: Source memory address to read from
++  * @bytes: How many bytes to write to @dst from @src
++  * @justification: Free-form text or comment describing why the use is needed
++  *
++  * This should be used for corner cases where the compiler cannot do the
++  * right thing, or during transitions between APIs, etc. It should be used
++  * very rarely, and includes a place for justification detailing where bounds
++  * checking has happened, and why existing solutions cannot be employed.
++  */
++ #define unsafe_memcpy(dst, src, bytes, justification)		\
++ 	__underlying_memcpy(dst, src, bytes)
++ 
++ /*
++  * Clang's use of __builtin_object_size() within inlines needs hinting via
++  * __pass_object_size(). The preference is to only ever use type 1 (member
++  * size, rather than struct size), but there remain some stragglers using
++  * type 0 that will be converted in the future.
++  */
++ #define POS	__pass_object_size(1)
++ #define POS0	__pass_object_size(0)
++ 
++ __FORTIFY_INLINE __diagnose_as(__builtin_strncpy, 1, 2, 3)
++ char *strncpy(char * const POS p, const char *q, __kernel_size_t size)
+++>>>>>>> 43213daed6d6 (fortify: Provide a memcpy trap door for sharp corners)
+  {
+  	size_t p_size = __builtin_object_size(p, 1);
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index ca64d733a31c..314c4e170fd0 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@ -416,7 +416,13 @@ mlx5e_sq_xmit_wqe(struct mlx5e_txqsq *sq, struct sk_buff *skb,
+ 			stats->added_vlan_packets++;
+ 		} else {
+ 			eseg->inline_hdr.sz |= cpu_to_be16(attr->ihs);
+-			memcpy(eseg->inline_hdr.start, skb->data, attr->ihs);
++			unsafe_memcpy(eseg->inline_hdr.start, skb->data, attr->ihs,
++				/* This copy has been bounds-checked earlier in
++				 * mlx5i_sq_calc_wqe_attr() and intentionally
++				 * crosses a flex array boundary. Since it is
++				 * performance sensitive, splitting the copy is
++				 * undesirable.
++				 */);
+ 		}
+ 		dseg += wqe_attr->ds_cnt_inl;
+ 	} else if (skb_vlan_tag_present(skb)) {
+* Unmerged path include/linux/fortify-string.h
+diff --git a/include/linux/string.h b/include/linux/string.h
+index 9d0d89afb113..ae756b4d56e4 100644
+--- a/include/linux/string.h
++++ b/include/linux/string.h
+@@ -269,6 +269,10 @@ void __write_overflow(void) __compiletime_error("detected write beyond size of o
+ #if !defined(__NO_FORTIFY) && defined(__OPTIMIZE__) && defined(CONFIG_FORTIFY_SOURCE)
+ #include <linux/fortify-string.h>
+ #endif
++#ifndef unsafe_memcpy
++#define unsafe_memcpy(dst, src, bytes, justification)		\
++	memcpy(dst, src, bytes)
++#endif
+ 
+ /**
+  * memcpy_and_pad - Copy one buffer to another with padding
