@@ -1,0 +1,747 @@
+net: devlink: move net check into devlinks_xa_for_each_registered_get()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Jiri Pirko <jiri@nvidia.com>
+commit 294c4f57cfe3303ee2f050d1728c76a401e573a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/294c4f57.failed
+
+Benefit from having devlinks iterator helper
+devlinks_xa_for_each_registered_get() and move the net pointer
+check inside.
+
+	Suggested-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: Jiri Pirko <jiri@nvidia.com>
+	Reviewed-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 294c4f57cfe3303ee2f050d1728c76a401e573a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/devlink.c
+diff --cc net/core/devlink.c
+index 571e4c3d21fd,865232a1455f..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -256,6 -288,57 +256,60 @@@ void devl_unlock(struct devlink *devlin
+  }
+  EXPORT_SYMBOL_GPL(devl_unlock);
+  
+++<<<<<<< HEAD
+++=======
++ static struct devlink *
++ devlinks_xa_find_get(struct net *net, unsigned long *indexp, xa_mark_t filter,
++ 		     void * (*xa_find_fn)(struct xarray *, unsigned long *,
++ 					  unsigned long, xa_mark_t))
++ {
++ 	struct devlink *devlink;
++ 
++ 	rcu_read_lock();
++ retry:
++ 	devlink = xa_find_fn(&devlinks, indexp, ULONG_MAX, DEVLINK_REGISTERED);
++ 	if (!devlink)
++ 		goto unlock;
++ 	/* For a possible retry, the xa_find_after() should be always used */
++ 	xa_find_fn = xa_find_after;
++ 	if (!devlink_try_get(devlink))
++ 		goto retry;
++ 	if (!net_eq(devlink_net(devlink), net)) {
++ 		devlink_put(devlink);
++ 		goto retry;
++ 	}
++ unlock:
++ 	rcu_read_unlock();
++ 	return devlink;
++ }
++ 
++ static struct devlink *devlinks_xa_find_get_first(struct net *net,
++ 						  unsigned long *indexp,
++ 						  xa_mark_t filter)
++ {
++ 	return devlinks_xa_find_get(net, indexp, filter, xa_find);
++ }
++ 
++ static struct devlink *devlinks_xa_find_get_next(struct net *net,
++ 						 unsigned long *indexp,
++ 						 xa_mark_t filter)
++ {
++ 	return devlinks_xa_find_get(net, indexp, filter, xa_find_after);
++ }
++ 
++ /* Iterate over devlink pointers which were possible to get reference to.
++  * devlink_put() needs to be called for each iterated devlink pointer
++  * in loop body in order to release the reference.
++  */
++ #define devlinks_xa_for_each_get(net, index, devlink, filter)			\
++ 	for (index = 0,								\
++ 	     devlink = devlinks_xa_find_get_first(net, &index, filter);		\
++ 	     devlink; devlink = devlinks_xa_find_get_next(net, &index, filter))
++ 
++ #define devlinks_xa_for_each_registered_get(net, index, devlink)		\
++ 	devlinks_xa_for_each_get(net, index, devlink, DEVLINK_REGISTERED)
++ 
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  static struct devlink *devlink_get_from_attrs(struct net *net,
+  					      struct nlattr **attrs)
+  {
+@@@ -271,21 -353,14 +325,29 @@@
+  	busname = nla_data(attrs[DEVLINK_ATTR_BUS_NAME]);
+  	devname = nla_data(attrs[DEVLINK_ATTR_DEV_NAME]);
+  
+++<<<<<<< HEAD
+ +	lockdep_assert_held(&devlink_mutex);
+ +
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (strcmp(devlink->dev->bus->name, busname) == 0 &&
+ +		    strcmp(dev_name(devlink->dev), devname) == 0 &&
+ +		    net_eq(devlink_net(devlink), net)) {
+ +			found = true;
+ +			break;
+ +		}
+++=======
++ 	devlinks_xa_for_each_registered_get(net, index, devlink) {
++ 		if (strcmp(devlink->dev->bus->name, busname) == 0 &&
++ 		    strcmp(dev_name(devlink->dev), devname) == 0)
++ 			return devlink;
++ 		devlink_put(devlink);
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  	}
+  
+ -	return ERR_PTR(-ENODEV);
+ +	if (!found || !devlink_try_get(devlink))
+ +		devlink = ERR_PTR(-ENODEV);
+ +
+ +	return devlink;
+  }
+  
+  static struct devlink_port *devlink_port_get_by_index(struct devlink *devlink,
+@@@ -1237,13 -1382,7 +1299,17 @@@ static int devlink_nl_cmd_rate_get_dump
+  	int err = 0;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
+ +			goto retry;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		devl_lock(devlink);
+  		list_for_each_entry(devlink_rate, &devlink->rate_list, list) {
+  			enum devlink_command cmd = DEVLINK_CMD_RATE_NEW;
+@@@ -1340,15 -1478,7 +1405,19 @@@ static int devlink_nl_cmd_get_dumpit(st
+  	int err;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk))) {
+ +			devlink_put(devlink);
+ +			continue;
+ +		}
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		if (idx < start) {
+  			idx++;
+  			devlink_put(devlink);
+@@@ -1403,13 -1533,7 +1472,17 @@@ static int devlink_nl_cmd_port_get_dump
+  	int err;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
+ +			goto retry;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		devl_lock(devlink);
+  		list_for_each_entry(devlink_port, &devlink->port_list, list) {
+  			if (idx < start) {
+@@@ -1968,6 -2088,315 +2040,318 @@@ static int devlink_nl_cmd_rate_del_doit
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct devlink_linecard_type {
++ 	const char *type;
++ 	const void *priv;
++ };
++ 
++ static int devlink_nl_linecard_fill(struct sk_buff *msg,
++ 				    struct devlink *devlink,
++ 				    struct devlink_linecard *linecard,
++ 				    enum devlink_command cmd, u32 portid,
++ 				    u32 seq, int flags,
++ 				    struct netlink_ext_ack *extack)
++ {
++ 	struct devlink_linecard_type *linecard_type;
++ 	struct nlattr *attr;
++ 	void *hdr;
++ 	int i;
++ 
++ 	hdr = genlmsg_put(msg, portid, seq, &devlink_nl_family, flags, cmd);
++ 	if (!hdr)
++ 		return -EMSGSIZE;
++ 
++ 	if (devlink_nl_put_handle(msg, devlink))
++ 		goto nla_put_failure;
++ 	if (nla_put_u32(msg, DEVLINK_ATTR_LINECARD_INDEX, linecard->index))
++ 		goto nla_put_failure;
++ 	if (nla_put_u8(msg, DEVLINK_ATTR_LINECARD_STATE, linecard->state))
++ 		goto nla_put_failure;
++ 	if (linecard->type &&
++ 	    nla_put_string(msg, DEVLINK_ATTR_LINECARD_TYPE, linecard->type))
++ 		goto nla_put_failure;
++ 
++ 	if (linecard->types_count) {
++ 		attr = nla_nest_start(msg,
++ 				      DEVLINK_ATTR_LINECARD_SUPPORTED_TYPES);
++ 		if (!attr)
++ 			goto nla_put_failure;
++ 		for (i = 0; i < linecard->types_count; i++) {
++ 			linecard_type = &linecard->types[i];
++ 			if (nla_put_string(msg, DEVLINK_ATTR_LINECARD_TYPE,
++ 					   linecard_type->type)) {
++ 				nla_nest_cancel(msg, attr);
++ 				goto nla_put_failure;
++ 			}
++ 		}
++ 		nla_nest_end(msg, attr);
++ 	}
++ 
++ 	genlmsg_end(msg, hdr);
++ 	return 0;
++ 
++ nla_put_failure:
++ 	genlmsg_cancel(msg, hdr);
++ 	return -EMSGSIZE;
++ }
++ 
++ static void devlink_linecard_notify(struct devlink_linecard *linecard,
++ 				    enum devlink_command cmd)
++ {
++ 	struct devlink *devlink = linecard->devlink;
++ 	struct sk_buff *msg;
++ 	int err;
++ 
++ 	WARN_ON(cmd != DEVLINK_CMD_LINECARD_NEW &&
++ 		cmd != DEVLINK_CMD_LINECARD_DEL);
++ 
++ 	if (!xa_get_mark(&devlinks, devlink->index, DEVLINK_REGISTERED))
++ 		return;
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg)
++ 		return;
++ 
++ 	err = devlink_nl_linecard_fill(msg, devlink, linecard, cmd, 0, 0, 0,
++ 				       NULL);
++ 	if (err) {
++ 		nlmsg_free(msg);
++ 		return;
++ 	}
++ 
++ 	genlmsg_multicast_netns(&devlink_nl_family, devlink_net(devlink),
++ 				msg, 0, DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
++ }
++ 
++ static int devlink_nl_cmd_linecard_get_doit(struct sk_buff *skb,
++ 					    struct genl_info *info)
++ {
++ 	struct devlink_linecard *linecard = info->user_ptr[1];
++ 	struct devlink *devlink = linecard->devlink;
++ 	struct sk_buff *msg;
++ 	int err;
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg)
++ 		return -ENOMEM;
++ 
++ 	mutex_lock(&linecard->state_lock);
++ 	err = devlink_nl_linecard_fill(msg, devlink, linecard,
++ 				       DEVLINK_CMD_LINECARD_NEW,
++ 				       info->snd_portid, info->snd_seq, 0,
++ 				       info->extack);
++ 	mutex_unlock(&linecard->state_lock);
++ 	if (err) {
++ 		nlmsg_free(msg);
++ 		return err;
++ 	}
++ 
++ 	return genlmsg_reply(msg, info);
++ }
++ 
++ static int devlink_nl_cmd_linecard_get_dumpit(struct sk_buff *msg,
++ 					      struct netlink_callback *cb)
++ {
++ 	struct devlink_linecard *linecard;
++ 	struct devlink *devlink;
++ 	int start = cb->args[0];
++ 	unsigned long index;
++ 	int idx = 0;
++ 	int err;
++ 
++ 	mutex_lock(&devlink_mutex);
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
++ 		mutex_lock(&devlink->linecards_lock);
++ 		list_for_each_entry(linecard, &devlink->linecard_list, list) {
++ 			if (idx < start) {
++ 				idx++;
++ 				continue;
++ 			}
++ 			mutex_lock(&linecard->state_lock);
++ 			err = devlink_nl_linecard_fill(msg, devlink, linecard,
++ 						       DEVLINK_CMD_LINECARD_NEW,
++ 						       NETLINK_CB(cb->skb).portid,
++ 						       cb->nlh->nlmsg_seq,
++ 						       NLM_F_MULTI,
++ 						       cb->extack);
++ 			mutex_unlock(&linecard->state_lock);
++ 			if (err) {
++ 				mutex_unlock(&devlink->linecards_lock);
++ 				devlink_put(devlink);
++ 				goto out;
++ 			}
++ 			idx++;
++ 		}
++ 		mutex_unlock(&devlink->linecards_lock);
++ 		devlink_put(devlink);
++ 	}
++ out:
++ 	mutex_unlock(&devlink_mutex);
++ 
++ 	cb->args[0] = idx;
++ 	return msg->len;
++ }
++ 
++ static struct devlink_linecard_type *
++ devlink_linecard_type_lookup(struct devlink_linecard *linecard,
++ 			     const char *type)
++ {
++ 	struct devlink_linecard_type *linecard_type;
++ 	int i;
++ 
++ 	for (i = 0; i < linecard->types_count; i++) {
++ 		linecard_type = &linecard->types[i];
++ 		if (!strcmp(type, linecard_type->type))
++ 			return linecard_type;
++ 	}
++ 	return NULL;
++ }
++ 
++ static int devlink_linecard_type_set(struct devlink_linecard *linecard,
++ 				     const char *type,
++ 				     struct netlink_ext_ack *extack)
++ {
++ 	const struct devlink_linecard_ops *ops = linecard->ops;
++ 	struct devlink_linecard_type *linecard_type;
++ 	int err;
++ 
++ 	mutex_lock(&linecard->state_lock);
++ 	if (linecard->state == DEVLINK_LINECARD_STATE_PROVISIONING) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Line card is currently being provisioned");
++ 		err = -EBUSY;
++ 		goto out;
++ 	}
++ 	if (linecard->state == DEVLINK_LINECARD_STATE_UNPROVISIONING) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Line card is currently being unprovisioned");
++ 		err = -EBUSY;
++ 		goto out;
++ 	}
++ 
++ 	linecard_type = devlink_linecard_type_lookup(linecard, type);
++ 	if (!linecard_type) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Unsupported line card type provided");
++ 		err = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (linecard->state != DEVLINK_LINECARD_STATE_UNPROVISIONED &&
++ 	    linecard->state != DEVLINK_LINECARD_STATE_PROVISIONING_FAILED) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Line card already provisioned");
++ 		err = -EBUSY;
++ 		/* Check if the line card is provisioned in the same
++ 		 * way the user asks. In case it is, make the operation
++ 		 * to return success.
++ 		 */
++ 		if (ops->same_provision &&
++ 		    ops->same_provision(linecard, linecard->priv,
++ 					linecard_type->type,
++ 					linecard_type->priv))
++ 			err = 0;
++ 		goto out;
++ 	}
++ 
++ 	linecard->state = DEVLINK_LINECARD_STATE_PROVISIONING;
++ 	linecard->type = linecard_type->type;
++ 	devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 	mutex_unlock(&linecard->state_lock);
++ 	err = ops->provision(linecard, linecard->priv, linecard_type->type,
++ 			     linecard_type->priv, extack);
++ 	if (err) {
++ 		/* Provisioning failed. Assume the linecard is unprovisioned
++ 		 * for future operations.
++ 		 */
++ 		mutex_lock(&linecard->state_lock);
++ 		linecard->state = DEVLINK_LINECARD_STATE_UNPROVISIONED;
++ 		linecard->type = NULL;
++ 		devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 		mutex_unlock(&linecard->state_lock);
++ 	}
++ 	return err;
++ 
++ out:
++ 	mutex_unlock(&linecard->state_lock);
++ 	return err;
++ }
++ 
++ static int devlink_linecard_type_unset(struct devlink_linecard *linecard,
++ 				       struct netlink_ext_ack *extack)
++ {
++ 	int err;
++ 
++ 	mutex_lock(&linecard->state_lock);
++ 	if (linecard->state == DEVLINK_LINECARD_STATE_PROVISIONING) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Line card is currently being provisioned");
++ 		err = -EBUSY;
++ 		goto out;
++ 	}
++ 	if (linecard->state == DEVLINK_LINECARD_STATE_UNPROVISIONING) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Line card is currently being unprovisioned");
++ 		err = -EBUSY;
++ 		goto out;
++ 	}
++ 	if (linecard->state == DEVLINK_LINECARD_STATE_PROVISIONING_FAILED) {
++ 		linecard->state = DEVLINK_LINECARD_STATE_UNPROVISIONED;
++ 		linecard->type = NULL;
++ 		devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 		err = 0;
++ 		goto out;
++ 	}
++ 
++ 	if (linecard->state == DEVLINK_LINECARD_STATE_UNPROVISIONED) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Line card is not provisioned");
++ 		err = 0;
++ 		goto out;
++ 	}
++ 	linecard->state = DEVLINK_LINECARD_STATE_UNPROVISIONING;
++ 	devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 	mutex_unlock(&linecard->state_lock);
++ 	err = linecard->ops->unprovision(linecard, linecard->priv,
++ 					 extack);
++ 	if (err) {
++ 		/* Unprovisioning failed. Assume the linecard is unprovisioned
++ 		 * for future operations.
++ 		 */
++ 		mutex_lock(&linecard->state_lock);
++ 		linecard->state = DEVLINK_LINECARD_STATE_UNPROVISIONED;
++ 		linecard->type = NULL;
++ 		devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 		mutex_unlock(&linecard->state_lock);
++ 	}
++ 	return err;
++ 
++ out:
++ 	mutex_unlock(&linecard->state_lock);
++ 	return err;
++ }
++ 
++ static int devlink_nl_cmd_linecard_set_doit(struct sk_buff *skb,
++ 					    struct genl_info *info)
++ {
++ 	struct devlink_linecard *linecard = info->user_ptr[1];
++ 	struct netlink_ext_ack *extack = info->extack;
++ 	int err;
++ 
++ 	if (info->attrs[DEVLINK_ATTR_LINECARD_TYPE]) {
++ 		const char *type;
++ 
++ 		type = nla_data(info->attrs[DEVLINK_ATTR_LINECARD_TYPE]);
++ 		if (strcmp(type, "")) {
++ 			err = devlink_linecard_type_set(linecard, type, extack);
++ 			if (err)
++ 				return err;
++ 		} else {
++ 			err = devlink_linecard_type_unset(linecard, extack);
++ 			if (err)
++ 				return err;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  static int devlink_nl_sb_fill(struct sk_buff *msg, struct devlink *devlink,
+  			      struct devlink_sb *devlink_sb,
+  			      enum devlink_command cmd, u32 portid,
+@@@ -2044,13 -2473,7 +2428,17 @@@ static int devlink_nl_cmd_sb_get_dumpit
+  	int err;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
+ +			goto retry;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		devl_lock(devlink);
+  		list_for_each_entry(devlink_sb, &devlink->sb_list, list) {
+  			if (idx < start) {
+@@@ -2196,10 -2618,7 +2583,14 @@@ static int devlink_nl_cmd_sb_pool_get_d
+  	int err = 0;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)) ||
+  		    !devlink->ops->sb_pool_get)
+  			goto retry;
+@@@ -2417,12 -2836,8 +2808,17 @@@ static int devlink_nl_cmd_sb_port_pool_
+  	int err = 0;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)) ||
+ +		    !devlink->ops->sb_port_pool_get)
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
++ 		if (!devlink->ops->sb_port_pool_get)
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  			goto retry;
+  
+  		devl_lock(devlink);
+@@@ -2666,12 -3081,8 +3062,17 @@@ devlink_nl_cmd_sb_tc_pool_bind_get_dump
+  	int err = 0;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)) ||
+ +		    !devlink->ops->sb_tc_pool_bind_get)
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
++ 		if (!devlink->ops->sb_tc_pool_bind_get)
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  			goto retry;
+  
+  		devl_lock(devlink);
+@@@ -4753,13 -5164,7 +5154,17 @@@ static int devlink_nl_cmd_param_get_dum
+  	int err = 0;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
+ +			goto retry;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		devl_lock(devlink);
+  		list_for_each_entry(param_item, &devlink->param_list, list) {
+  			if (idx < start) {
+@@@ -4988,13 -5392,7 +5392,17 @@@ static int devlink_nl_cmd_port_param_ge
+  	int err = 0;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
+ +			goto retry;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		devl_lock(devlink);
+  		list_for_each_entry(devlink_port, &devlink->port_list, list) {
+  			list_for_each_entry(param_item,
+@@@ -5572,16 -5969,9 +5979,19 @@@ static int devlink_nl_cmd_region_get_du
+  	int err = 0;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
+ +			goto retry;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		err = devlink_nl_cmd_region_get_devlink_dumpit(msg, cb, devlink,
+  							       &idx, start);
+- retry:
+  		devlink_put(devlink);
+  		if (err)
+  			goto out;
+@@@ -6106,13 -6496,7 +6516,17 @@@ static int devlink_nl_cmd_info_get_dump
+  	int err = 0;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
+ +			goto retry;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		if (idx < start || !devlink->ops->info_get)
+  			goto inc;
+  
+@@@ -7286,13 -7669,7 +7699,17 @@@ devlink_nl_cmd_health_reporter_get_dump
+  	int err;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
+ +			goto retry_rep;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		mutex_lock(&devlink->reporters_lock);
+  		list_for_each_entry(reporter, &devlink->reporter_list,
+  				    list) {
+@@@ -7315,14 -7692,7 +7732,17 @@@
+  		devlink_put(devlink);
+  	}
+  
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
+ +			goto retry_port;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		devl_lock(devlink);
+  		list_for_each_entry(port, &devlink->port_list, list) {
+  			mutex_lock(&port->reporters_lock);
+@@@ -7882,13 -8255,7 +8301,17 @@@ static int devlink_nl_cmd_trap_get_dump
+  	int err;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
+ +			goto retry;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		devl_lock(devlink);
+  		list_for_each_entry(trap_item, &devlink->trap_list, list) {
+  			if (idx < start) {
+@@@ -8109,13 -8475,7 +8531,17 @@@ static int devlink_nl_cmd_trap_group_ge
+  	int err;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
+ +			goto retry;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		devl_lock(devlink);
+  		list_for_each_entry(group_item, &devlink->trap_group_list,
+  				    list) {
+@@@ -8423,13 -8782,7 +8848,17 @@@ static int devlink_nl_cmd_trap_policer_
+  	int err;
+  
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
+ +			goto retry;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(sock_net(msg->sk), index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		devl_lock(devlink);
+  		list_for_each_entry(policer_item, &devlink->trap_policer_list,
+  				    list) {
+@@@ -11831,13 -12220,7 +12259,17 @@@ static void __net_exit devlink_pernet_p
+  	 * all devlink instances from this namespace into init_net.
+  	 */
+  	mutex_lock(&devlink_mutex);
+++<<<<<<< HEAD
+ +	xa_for_each_marked(&devlinks, index, devlink, DEVLINK_REGISTERED) {
+ +		if (!devlink_try_get(devlink))
+ +			continue;
+ +
+ +		if (!net_eq(devlink_net(devlink), net))
+ +			goto retry;
+ +
+++=======
++ 	devlinks_xa_for_each_registered_get(net, index, devlink) {
+++>>>>>>> 294c4f57cfe3 (net: devlink: move net check into devlinks_xa_for_each_registered_get())
+  		WARN_ON(!(devlink->features & DEVLINK_F_RELOAD));
+  		err = devlink_reload(devlink, &init_net,
+  				     DEVLINK_RELOAD_ACTION_DRIVER_REINIT,
+* Unmerged path net/core/devlink.c
