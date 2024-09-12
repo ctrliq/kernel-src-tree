@@ -1,0 +1,134 @@
+powerpc64/bpf: Optimize instruction sequence used for function calls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+commit feb6307289d85262c5aed04d6f192d38abba7c45
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/feb63072.failed
+
+When calling BPF helpers, we load the function address to call into a
+register. This can result in upto 5 instructions. Optimize this by
+instead using the kernel toc in r2 and adjusting offset to the BPF
+helper. This works since all BPF helpers are part of kernel text, and
+all BPF programs/functions utilize the kernel TOC.
+
+Further more:
+- load the actual function entry address in elf v1, rather than loading
+  it through the function descriptor address.
+- load the Local Entry Point (LEP) in elf v2 skipping TOC setup.
+- consolidate code across elf abi v1 and v2 by using r12 on both.
+
+	Reported-by: Anton Blanchard <anton@ozlabs.org>
+	Signed-off-by: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/1233c7544e60dcb021c52b1f840b0f21a87b33ed.1644834730.git.naveen.n.rao@linux.vnet.ibm.com
+
+(cherry picked from commit feb6307289d85262c5aed04d6f192d38abba7c45)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/net/bpf_jit_comp64.c
+diff --cc arch/powerpc/net/bpf_jit_comp64.c
+index 3361fea2cdf5,bff200723e72..000000000000
+--- a/arch/powerpc/net/bpf_jit_comp64.c
++++ b/arch/powerpc/net/bpf_jit_comp64.c
+@@@ -150,35 -147,38 +150,62 @@@ void bpf_jit_build_epilogue(u32 *image
+  	EMIT(PPC_RAW_BLR());
+  }
+  
+ -static int bpf_jit_emit_func_call_hlp(u32 *image, struct codegen_context *ctx, u64 func)
+ +static void bpf_jit_emit_func_call_hlp(u32 *image, struct codegen_context *ctx,
+ +				       u64 func)
+  {
+++<<<<<<< HEAD
+ +#ifdef PPC64_ELF_ABI_v1
+ +	/* func points to the function descriptor */
+ +	PPC_LI64(b2p[TMP_REG_2], func);
+ +	/* Load actual entry point from function descriptor */
+ +	PPC_BPF_LL(b2p[TMP_REG_1], b2p[TMP_REG_2], 0);
+ +	/* ... and move it to CTR */
+ +	EMIT(PPC_RAW_MTCTR(b2p[TMP_REG_1]));
+ +	/*
+ +	 * Load TOC from function descriptor at offset 8.
+ +	 * We can clobber r2 since we get called through a
+ +	 * function pointer (so caller will save/restore r2)
+ +	 * and since we don't use a TOC ourself.
+ +	 */
+ +	PPC_BPF_LL(2, b2p[TMP_REG_2], 8);
+ +#else
+ +	/* We can clobber r12 */
+ +	PPC_FUNC_ADDR(12, func);
+ +	EMIT(PPC_RAW_MTCTR(12));
+ +#endif
+++=======
++ 	unsigned long func_addr = func ? ppc_function_entry((void *)func) : 0;
++ 	long reladdr;
++ 
++ 	if (WARN_ON_ONCE(!core_kernel_text(func_addr)))
++ 		return -EINVAL;
++ 
++ 	reladdr = func_addr - kernel_toc_addr();
++ 	if (reladdr > 0x7FFFFFFF || reladdr < -(0x80000000L)) {
++ 		pr_err("eBPF: address of %ps out of range of kernel_toc.\n", (void *)func);
++ 		return -ERANGE;
++ 	}
++ 
++ 	EMIT(PPC_RAW_ADDIS(_R12, _R2, PPC_HA(reladdr)));
++ 	EMIT(PPC_RAW_ADDI(_R12, _R12, PPC_LO(reladdr)));
++ 	EMIT(PPC_RAW_MTCTR(_R12));
+++>>>>>>> feb6307289d8 (powerpc64/bpf: Optimize instruction sequence used for function calls)
+  	EMIT(PPC_RAW_BCTRL());
+ -
+ -	return 0;
+  }
+  
+ -int bpf_jit_emit_func_call_rel(u32 *image, struct codegen_context *ctx, u64 func)
+ +void bpf_jit_emit_func_call_rel(u32 *image, struct codegen_context *ctx, u64 func)
+  {
+  	unsigned int i, ctx_idx = ctx->idx;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (WARN_ON_ONCE(func && is_module_text_address(func)))
++ 		return -EINVAL;
++ 
++ 	/* skip past descriptor if elf v1 */
++ 	func += FUNCTION_DESCR_SIZE;
++ 
+++>>>>>>> feb6307289d8 (powerpc64/bpf: Optimize instruction sequence used for function calls)
+  	/* Load function address into r12 */
+  	PPC_LI64(12, func);
+  
+@@@ -195,23 -195,13 +222,26 @@@
+  	for (i = ctx->idx - ctx_idx; i < 5; i++)
+  		EMIT(PPC_RAW_NOP());
+  
+++<<<<<<< HEAD
+ +#ifdef PPC64_ELF_ABI_v1
+ +	/*
+ +	 * Load TOC from function descriptor at offset 8.
+ +	 * We can clobber r2 since we get called through a
+ +	 * function pointer (so caller will save/restore r2)
+ +	 * and since we don't use a TOC ourself.
+ +	 */
+ +	PPC_BPF_LL(2, 12, 8);
+ +	/* Load actual entry point from function descriptor */
+ +	PPC_BPF_LL(12, 12, 0);
+ +#endif
+ +
+++=======
+++>>>>>>> feb6307289d8 (powerpc64/bpf: Optimize instruction sequence used for function calls)
+  	EMIT(PPC_RAW_MTCTR(12));
+  	EMIT(PPC_RAW_BCTRL());
+ -
+ -	return 0;
+  }
+  
+ -static int bpf_jit_emit_tail_call(u32 *image, struct codegen_context *ctx, u32 out)
+ +static void bpf_jit_emit_tail_call(u32 *image, struct codegen_context *ctx, u32 out)
+  {
+  	/*
+  	 * By now, the eBPF program has already setup parameters in r3, r4 and r5
+* Unmerged path arch/powerpc/net/bpf_jit_comp64.c
