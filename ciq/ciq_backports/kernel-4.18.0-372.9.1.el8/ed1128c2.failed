@@ -1,0 +1,219 @@
+xfs: reduce exclusive locking on unaligned dio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Dave Chinner <dchinner@redhat.com>
+commit ed1128c2d0c87e5ff49c40f5529f06bc35f4251b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/ed1128c2.failed
+
+Attempt shared locking for unaligned DIO, but only if the the
+underlying extent is already allocated and in written state. On
+failure, retry with the existing exclusive locking.
+
+Test case is fio randrw of 512 byte IOs using AIO and an iodepth of
+32 IOs.
+
+Vanilla:
+
+  READ: bw=4560KiB/s (4670kB/s), 4560KiB/s-4560KiB/s (4670kB/s-4670kB/s), io=134MiB (140MB), run=30001-30001msec
+  WRITE: bw=4567KiB/s (4676kB/s), 4567KiB/s-4567KiB/s (4676kB/s-4676kB/s), io=134MiB (140MB), run=30001-30001msec
+
+Patched:
+   READ: bw=37.6MiB/s (39.4MB/s), 37.6MiB/s-37.6MiB/s (39.4MB/s-39.4MB/s), io=1127MiB (1182MB), run=30002-30002msec
+  WRITE: bw=37.6MiB/s (39.4MB/s), 37.6MiB/s-37.6MiB/s (39.4MB/s-39.4MB/s), io=1128MiB (1183MB), run=30002-30002msec
+
+That's an improvement from ~18k IOPS to a ~150k IOPS, which is
+about the IOPS limit of the VM block device setup I'm testing on.
+
+4kB block IO comparison:
+
+   READ: bw=296MiB/s (310MB/s), 296MiB/s-296MiB/s (310MB/s-310MB/s), io=8868MiB (9299MB), run=30002-30002msec
+  WRITE: bw=296MiB/s (310MB/s), 296MiB/s-296MiB/s (310MB/s-310MB/s), io=8878MiB (9309MB), run=30002-30002msec
+
+Which is ~150k IOPS, same as what the test gets for sub-block
+AIO+DIO writes with this patch.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+[hch: rebased, split unaligned from nowait]
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit ed1128c2d0c87e5ff49c40f5529f06bc35f4251b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index 09c8147f8a2e,39695b59dfcc..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -624,6 -535,113 +624,116 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Handle block unaligned direct I/O writes
++  *
++  * In most cases direct I/O writes will be done holding IOLOCK_SHARED, allowing
++  * them to be done in parallel with reads and other direct I/O writes.  However,
++  * if the I/O is not aligned to filesystem blocks, the direct I/O layer may need
++  * to do sub-block zeroing and that requires serialisation against other direct
++  * I/O to the same block.  In this case we need to serialise the submission of
++  * the unaligned I/O so that we don't get racing block zeroing in the dio layer.
++  * In the case where sub-block zeroing is not required, we can do concurrent
++  * sub-block dios to the same block successfully.
++  *
++  * Optimistically submit the I/O using the shared lock first, but use the
++  * IOMAP_DIO_OVERWRITE_ONLY flag to tell the lower layers to return -EAGAIN
++  * if block allocation or partial block zeroing would be required.  In that case
++  * we try again with the exclusive lock.
++  */
++ static noinline ssize_t
++ xfs_file_dio_write_unaligned(
++ 	struct xfs_inode	*ip,
++ 	struct kiocb		*iocb,
++ 	struct iov_iter		*from)
++ {
++ 	size_t			isize = i_size_read(VFS_I(ip));
++ 	size_t			count = iov_iter_count(from);
++ 	int			iolock = XFS_IOLOCK_SHARED;
++ 	unsigned int		flags = IOMAP_DIO_OVERWRITE_ONLY;
++ 	ssize_t			ret;
++ 
++ 	/*
++ 	 * Extending writes need exclusivity because of the sub-block zeroing
++ 	 * that the DIO code always does for partial tail blocks beyond EOF, so
++ 	 * don't even bother trying the fast path in this case.
++ 	 */
++ 	if (iocb->ki_pos > isize || iocb->ki_pos + count >= isize) {
++ retry_exclusive:
++ 		if (iocb->ki_flags & IOCB_NOWAIT)
++ 			return -EAGAIN;
++ 		iolock = XFS_IOLOCK_EXCL;
++ 		flags = IOMAP_DIO_FORCE_WAIT;
++ 	}
++ 
++ 	ret = xfs_ilock_iocb(iocb, iolock);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/*
++ 	 * We can't properly handle unaligned direct I/O to reflink files yet,
++ 	 * as we can't unshare a partial block.
++ 	 */
++ 	if (xfs_is_cow_inode(ip)) {
++ 		trace_xfs_reflink_bounce_dio_write(iocb, from);
++ 		ret = -ENOTBLK;
++ 		goto out_unlock;
++ 	}
++ 
++ 	ret = xfs_file_write_checks(iocb, from, &iolock);
++ 	if (ret)
++ 		goto out_unlock;
++ 
++ 	/*
++ 	 * If we are doing exclusive unaligned I/O, this must be the only I/O
++ 	 * in-flight.  Otherwise we risk data corruption due to unwritten extent
++ 	 * conversions from the AIO end_io handler.  Wait for all other I/O to
++ 	 * drain first.
++ 	 */
++ 	if (flags & IOMAP_DIO_FORCE_WAIT)
++ 		inode_dio_wait(VFS_I(ip));
++ 
++ 	trace_xfs_file_direct_write(iocb, from);
++ 	ret = iomap_dio_rw(iocb, from, &xfs_direct_write_iomap_ops,
++ 			   &xfs_dio_write_ops, flags);
++ 
++ 	/*
++ 	 * Retry unaligned I/O with exclusive blocking semantics if the DIO
++ 	 * layer rejected it for mapping or locking reasons. If we are doing
++ 	 * nonblocking user I/O, propagate the error.
++ 	 */
++ 	if (ret == -EAGAIN && !(iocb->ki_flags & IOCB_NOWAIT)) {
++ 		ASSERT(flags & IOMAP_DIO_OVERWRITE_ONLY);
++ 		xfs_iunlock(ip, iolock);
++ 		goto retry_exclusive;
++ 	}
++ 
++ out_unlock:
++ 	if (iolock)
++ 		xfs_iunlock(ip, iolock);
++ 	return ret;
++ }
++ 
++ static ssize_t
++ xfs_file_dio_write(
++ 	struct kiocb		*iocb,
++ 	struct iov_iter		*from)
++ {
++ 	struct xfs_inode	*ip = XFS_I(file_inode(iocb->ki_filp));
++ 	struct xfs_buftarg      *target = xfs_inode_buftarg(ip);
++ 	size_t			count = iov_iter_count(from);
++ 
++ 	/* direct I/O must be aligned to device logical sector size */
++ 	if ((iocb->ki_pos | count) & target->bt_logical_sectormask)
++ 		return -EINVAL;
++ 	if ((iocb->ki_pos | count) & ip->i_mount->m_blockmask)
++ 		return xfs_file_dio_write_unaligned(ip, iocb, from);
++ 	return xfs_file_dio_write_aligned(ip, iocb, from);
++ }
++ 
+++>>>>>>> ed1128c2d0c8 (xfs: reduce exclusive locking on unaligned dio)
+  static noinline ssize_t
+  xfs_file_dax_write(
+  	struct kiocb		*iocb,
+* Unmerged path fs/xfs/xfs_file.c
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index cb848cd52bd0..b51da1cf5d7d 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -794,15 +794,28 @@ xfs_direct_write_iomap_begin(
+ 		goto allocate_blocks;
+ 
+ 	/*
+-	 * NOWAIT IO needs to span the entire requested IO with a single map so
+-	 * that we avoid partial IO failures due to the rest of the IO range not
+-	 * covered by this map triggering an EAGAIN condition when it is
+-	 * subsequently mapped and aborting the IO.
++	 * NOWAIT and OVERWRITE I/O needs to span the entire requested I/O with
++	 * a single map so that we avoid partial IO failures due to the rest of
++	 * the I/O range not covered by this map triggering an EAGAIN condition
++	 * when it is subsequently mapped and aborting the I/O.
+ 	 */
+-	if ((flags & IOMAP_NOWAIT) &&
+-	    !imap_spans_range(&imap, offset_fsb, end_fsb)) {
++	if (flags & (IOMAP_NOWAIT | IOMAP_OVERWRITE_ONLY)) {
+ 		error = -EAGAIN;
+-		goto out_unlock;
++		if (!imap_spans_range(&imap, offset_fsb, end_fsb))
++			goto out_unlock;
++	}
++
++	/*
++	 * For overwrite only I/O, we cannot convert unwritten extents without
++	 * requiring sub-block zeroing.  This can only be done under an
++	 * exclusive IOLOCK, hence return -EAGAIN if this is not a written
++	 * extent to tell the caller to try again.
++	 */
++	if (flags & IOMAP_OVERWRITE_ONLY) {
++		error = -EAGAIN;
++		if (imap.br_state != XFS_EXT_NORM &&
++	            ((offset | length) & mp->m_blockmask))
++			goto out_unlock;
+ 	}
+ 
+ 	xfs_iunlock(ip, lockmode);
+@@ -811,7 +824,7 @@ xfs_direct_write_iomap_begin(
+ 
+ allocate_blocks:
+ 	error = -EAGAIN;
+-	if (flags & IOMAP_NOWAIT)
++	if (flags & (IOMAP_NOWAIT | IOMAP_OVERWRITE_ONLY))
+ 		goto out_unlock;
+ 
+ 	/*
