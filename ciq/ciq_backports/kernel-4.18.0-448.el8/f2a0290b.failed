@@ -1,0 +1,217 @@
+wifi: cfg80211: add optional link add/remove callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit f2a0290b2df2b0e65ab78b71c4a15e732afd4458
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/f2a0290b.failed
+
+Add some optional callbacks for link add/remove so that
+drivers can react here. Initially, I thought it would be
+sufficient to just create the link in start_ap etc., but
+it turns out that's not so simple, since there are quite
+a few callbacks that can be called: if they're erroneously
+without start_ap, things might crash.
+
+Thus it might be easier for drivers to allocate all the
+necessary data structures immediately, to not have to
+worry about it in each callback, since cfg80211 checks
+that the link ID is valid (has been added.)
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit f2a0290b2df2b0e65ab78b71c4a15e732afd4458)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/wireless/nl80211.c
+#	net/wireless/trace.h
+diff --cc net/wireless/nl80211.c
+index 61943281a64c,0a69a5a6b74d..000000000000
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@@ -15321,6 -15554,74 +15321,77 @@@ static int nl80211_set_fils_aad(struct 
+  	return rdev_set_fils_aad(rdev, dev, &fils_aad);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nl80211_add_link(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct cfg80211_registered_device *rdev = info->user_ptr[0];
++ 	unsigned int link_id = nl80211_link_id(info->attrs);
++ 	struct net_device *dev = info->user_ptr[1];
++ 	struct wireless_dev *wdev = dev->ieee80211_ptr;
++ 	int ret;
++ 
++ 	if (!(wdev->wiphy->flags & WIPHY_FLAG_SUPPORTS_MLO))
++ 		return -EINVAL;
++ 
++ 	switch (wdev->iftype) {
++ 	case NL80211_IFTYPE_AP:
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!info->attrs[NL80211_ATTR_MAC] ||
++ 	    !is_valid_ether_addr(nla_data(info->attrs[NL80211_ATTR_MAC])))
++ 		return -EINVAL;
++ 
++ 	wdev_lock(wdev);
++ 	wdev->valid_links |= BIT(link_id);
++ 	ether_addr_copy(wdev->links[link_id].addr,
++ 			nla_data(info->attrs[NL80211_ATTR_MAC]));
++ 
++ 	ret = rdev_add_intf_link(rdev, wdev, link_id);
++ 	if (ret) {
++ 		wdev->valid_links &= ~BIT(link_id);
++ 		eth_zero_addr(wdev->links[link_id].addr);
++ 	}
++ 	wdev_unlock(wdev);
++ 
++ 	return ret;
++ }
++ 
++ static int nl80211_remove_link(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct cfg80211_registered_device *rdev = info->user_ptr[0];
++ 	unsigned int link_id = nl80211_link_id(info->attrs);
++ 	struct net_device *dev = info->user_ptr[1];
++ 	struct wireless_dev *wdev = dev->ieee80211_ptr;
++ 
++ 	/* cannot remove if there's no link */
++ 	if (!info->attrs[NL80211_ATTR_MLO_LINK_ID])
++ 		return -EINVAL;
++ 
++ 	switch (wdev->iftype) {
++ 	case NL80211_IFTYPE_AP:
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* FIXME: stop the link operations first */
++ 
++ 	wdev_lock(wdev);
++ 	wdev->valid_links &= ~BIT(link_id);
++ 
++ 	rdev_del_intf_link(rdev, wdev, link_id);
++ 
++ 	eth_zero_addr(wdev->links[link_id].addr);
++ 	wdev_unlock(wdev);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> f2a0290b2df2 (wifi: cfg80211: add optional link add/remove callbacks)
+  #define NL80211_FLAG_NEED_WIPHY		0x01
+  #define NL80211_FLAG_NEED_NETDEV	0x02
+  #define NL80211_FLAG_NEED_RTNL		0x04
+diff --cc net/wireless/trace.h
+index 02987ad8e876,65f8b814ecd0..000000000000
+--- a/net/wireless/trace.h
++++ b/net/wireless/trace.h
+@@@ -2040,9 -2064,28 +2040,34 @@@ TRACE_EVENT(rdev_set_noack_map
+  		  WIPHY_PR_ARG, NETDEV_PR_ARG, __entry->noack_map)
+  );
+  
+++<<<<<<< HEAD
+ +DEFINE_EVENT(wiphy_wdev_evt, rdev_get_channel,
+ +	TP_PROTO(struct wiphy *wiphy, struct wireless_dev *wdev),
+ +	TP_ARGS(wiphy, wdev)
+++=======
++ DECLARE_EVENT_CLASS(wiphy_wdev_link_evt,
++ 	TP_PROTO(struct wiphy *wiphy, struct wireless_dev *wdev,
++ 		 unsigned int link_id),
++ 	TP_ARGS(wiphy, wdev, link_id),
++ 	TP_STRUCT__entry(
++ 		WIPHY_ENTRY
++ 		WDEV_ENTRY
++ 		__field(unsigned int, link_id)
++ 	),
++ 	TP_fast_assign(
++ 		WIPHY_ASSIGN;
++ 		WDEV_ASSIGN;
++ 		__entry->link_id = link_id;
++ 	),
++ 	TP_printk(WIPHY_PR_FMT ", " WDEV_PR_FMT ", link_id: %u",
++ 		  WIPHY_PR_ARG, WDEV_PR_ARG, __entry->link_id)
+++>>>>>>> f2a0290b2df2 (wifi: cfg80211: add optional link add/remove callbacks)
++ );
++ 
++ DEFINE_EVENT(wiphy_wdev_link_evt, rdev_get_channel,
++ 	TP_PROTO(struct wiphy *wiphy, struct wireless_dev *wdev,
++ 		 unsigned int link_id),
++ 	TP_ARGS(wiphy, wdev, link_id)
+  );
+  
+  TRACE_EVENT(rdev_return_chandef,
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index 3eeec9c7c79b..3256ebadbf27 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -3823,6 +3823,11 @@ struct mgmt_frame_regs {
+  *	keep the struct wireless_dev's iftype updated.
+  *	This additionally holds the RTNL to be able to do netdev changes.
+  *
++ * @add_intf_link: Add a new MLO link to the given interface. Note that
++ *	the wdev->link[] data structure has been updated, so the new link
++ *	address is available.
++ * @del_intf_link: Remove an MLO link from the given interface.
++ *
+  * @add_key: add a key with the given parameters. @mac_addr will be %NULL
+  *	when adding a group key.
+  *
+@@ -4177,6 +4182,13 @@ struct cfg80211_ops {
+ 				       enum nl80211_iftype type,
+ 				       struct vif_params *params);
+ 
++	int	(*add_intf_link)(struct wiphy *wiphy,
++				 struct wireless_dev *wdev,
++				 unsigned int link_id);
++	void	(*del_intf_link)(struct wiphy *wiphy,
++				 struct wireless_dev *wdev,
++				 unsigned int link_id);
++
+ 	int	(*add_key)(struct wiphy *wiphy, struct net_device *netdev,
+ 			   u8 key_index, bool pairwise, const u8 *mac_addr,
+ 			   struct key_params *params);
+* Unmerged path net/wireless/nl80211.c
+diff --git a/net/wireless/rdev-ops.h b/net/wireless/rdev-ops.h
+index 439bcf52369c..4197b2a119c5 100644
+--- a/net/wireless/rdev-ops.h
++++ b/net/wireless/rdev-ops.h
+@@ -1412,4 +1412,30 @@ rdev_set_radar_background(struct cfg80211_registered_device *rdev,
+ 	return ret;
+ }
+ 
++static inline int
++rdev_add_intf_link(struct cfg80211_registered_device *rdev,
++		   struct wireless_dev *wdev,
++		   unsigned int link_id)
++{
++	int ret = 0;
++
++	trace_rdev_add_intf_link(&rdev->wiphy, wdev, link_id);
++	if (rdev->ops->add_intf_link)
++		ret = rdev->ops->add_intf_link(&rdev->wiphy, wdev, link_id);
++	trace_rdev_return_int(&rdev->wiphy, ret);
++
++	return ret;
++}
++
++static inline void
++rdev_del_intf_link(struct cfg80211_registered_device *rdev,
++		   struct wireless_dev *wdev,
++		   unsigned int link_id)
++{
++	trace_rdev_del_intf_link(&rdev->wiphy, wdev, link_id);
++	if (rdev->ops->add_intf_link)
++		rdev->ops->add_intf_link(&rdev->wiphy, wdev, link_id);
++	trace_rdev_return_void(&rdev->wiphy);
++}
++
+ #endif /* __CFG80211_RDEV_OPS */
+* Unmerged path net/wireless/trace.h
