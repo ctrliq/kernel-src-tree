@@ -1,0 +1,199 @@
+gfs2: Pull return value test out of should_fault_in_pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.16.1.el8_6
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 72382264502d9348ead372f82ecc3044de5c82d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.16.1.el8_6/72382264.failed
+
+Pull the return value test of the previous read or write operation out
+of should_fault_in_pages().  In a following patch, we'll fault in pages
+before the I/O and there will be no return value to check.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 72382264502d9348ead372f82ecc3044de5c82d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/file.c
+diff --cc fs/gfs2/file.c
+index 37f4489b53a0,ea87bef7314d..000000000000
+--- a/fs/gfs2/file.c
++++ b/fs/gfs2/file.c
+@@@ -810,12 -832,37 +808,40 @@@ static ssize_t gfs2_file_direct_read(st
+  	ret = gfs2_glock_nq(gh);
+  	if (ret)
+  		goto out_uninit;
+++<<<<<<< HEAD
+ +
+ +	ret = iomap_dio_rw(iocb, to, &gfs2_iomap_ops, NULL, 0);
+ +	gfs2_glock_dq(gh);
+++=======
++ retry_under_glock:
++ 	pagefault_disable();
++ 	to->nofault = true;
++ 	ret = iomap_dio_rw(iocb, to, &gfs2_iomap_ops, NULL,
++ 			   IOMAP_DIO_PARTIAL, read);
++ 	to->nofault = false;
++ 	pagefault_enable();
++ 	if (ret <= 0 && ret != -EFAULT)
++ 		goto out_unlock;
++ 	if (ret > 0)
++ 		read = ret;
++ 
++ 	if (should_fault_in_pages(to, &prev_count, &window_size)) {
++ 		gfs2_holder_allow_demote(gh);
++ 		window_size -= fault_in_iov_iter_writeable(to, window_size);
++ 		gfs2_holder_disallow_demote(gh);
++ 		if (window_size) {
++ 			if (gfs2_holder_queued(gh))
++ 				goto retry_under_glock;
++ 			goto retry;
++ 		}
++ 	}
++ out_unlock:
++ 	if (gfs2_holder_queued(gh))
++ 		gfs2_glock_dq(gh);
+++>>>>>>> 72382264502d (gfs2: Pull return value test out of should_fault_in_pages)
+  out_uninit:
+  	gfs2_holder_uninit(gh);
+ -	if (ret < 0)
+ -		return ret;
+ -	return read;
+ +	return ret;
+  }
+  
+  static ssize_t gfs2_file_direct_write(struct kiocb *iocb, struct iov_iter *from,
+@@@ -840,19 -897,43 +866,52 @@@
+  	ret = gfs2_glock_nq(gh);
+  	if (ret)
+  		goto out_uninit;
+ +
+  	/* Silently fall back to buffered I/O when writing beyond EOF */
+++<<<<<<< HEAD
+ +	if (offset + len > i_size_read(&ip->i_inode))
+ +		goto out;
+ +
+ +	ret = iomap_dio_rw(iocb, from, &gfs2_iomap_ops, NULL, 0);
+ +	if (ret == -ENOTBLK)
+ +		ret = 0;
+ +out:
+ +	gfs2_glock_dq(gh);
+++=======
++ 	if (iocb->ki_pos + iov_iter_count(from) > i_size_read(&ip->i_inode))
++ 		goto out_unlock;
++ retry_under_glock:
++ 
++ 	from->nofault = true;
++ 	ret = iomap_dio_rw(iocb, from, &gfs2_iomap_ops, NULL,
++ 			   IOMAP_DIO_PARTIAL, written);
++ 	from->nofault = false;
++ 	if (ret <= 0) {
++ 		if (ret == -ENOTBLK)
++ 			ret = 0;
++ 		if (ret != -EFAULT)
++ 			goto out_unlock;
++ 	}
++ 	if (ret > 0)
++ 		written = ret;
++ 
++ 	if (should_fault_in_pages(from, &prev_count, &window_size)) {
++ 		gfs2_holder_allow_demote(gh);
++ 		window_size -= fault_in_iov_iter_readable(from, window_size);
++ 		gfs2_holder_disallow_demote(gh);
++ 		if (window_size) {
++ 			if (gfs2_holder_queued(gh))
++ 				goto retry_under_glock;
++ 			goto retry;
++ 		}
++ 	}
++ out_unlock:
++ 	if (gfs2_holder_queued(gh))
++ 		gfs2_glock_dq(gh);
+++>>>>>>> 72382264502d (gfs2: Pull return value test out of should_fault_in_pages)
+  out_uninit:
+  	gfs2_holder_uninit(gh);
+ -	if (ret < 0)
+ -		return ret;
+ -	return written;
+ +	return ret;
+  }
+  
+  static ssize_t gfs2_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+@@@ -898,24 -979,22 +957,31 @@@ retry_under_glock
+  	pagefault_disable();
+  	ret = generic_file_read_iter(iocb, to);
+  	pagefault_enable();
++ 	if (ret <= 0 && ret != -EFAULT)
++ 		goto out_unlock;
+  	if (ret > 0)
+ -		read += ret;
+ +		written += ret;
+  
+++<<<<<<< HEAD
+ +	if (should_fault_in_pages(ret, to, &prev_count, &window_size)) {
+ +		size_t leftover;
+ +
+++=======
++ 	if (should_fault_in_pages(to, &prev_count, &window_size)) {
+++>>>>>>> 72382264502d (gfs2: Pull return value test out of should_fault_in_pages)
+  		gfs2_holder_allow_demote(&gh);
+ -		window_size -= fault_in_iov_iter_writeable(to, window_size);
+ +		leftover = fault_in_iov_iter_writeable(to, window_size);
+  		gfs2_holder_disallow_demote(&gh);
+ -		if (window_size) {
+ -			if (gfs2_holder_queued(&gh))
+ -				goto retry_under_glock;
+ -			goto retry;
+ +		if (leftover != window_size) {
+ +			if (!gfs2_holder_queued(&gh)) {
+ +				if (written)
+ +					goto out_uninit;
+ +				goto retry;
+ +			}
+ +			goto retry_under_glock;
+  		}
+  	}
++ out_unlock:
+  	if (gfs2_holder_queued(&gh))
+  		gfs2_glock_dq(&gh);
+  out_uninit:
+@@@ -978,21 -1057,19 +1044,29 @@@ retry_under_glock
+  	if (inode == sdp->sd_rindex)
+  		gfs2_glock_dq_uninit(statfs_gh);
+  
+++<<<<<<< HEAD
+ +	from->count = orig_count - read;
+ +	if (should_fault_in_pages(ret, from, &prev_count, &window_size)) {
+ +		size_t leftover;
+ +
+++=======
++ 	if (ret <= 0 && ret != -EFAULT)
++ 		goto out_unlock;
++ 
++ 	from->count = orig_count - written;
++ 	if (should_fault_in_pages(from, &prev_count, &window_size)) {
+++>>>>>>> 72382264502d (gfs2: Pull return value test out of should_fault_in_pages)
+  		gfs2_holder_allow_demote(gh);
+ -		window_size -= fault_in_iov_iter_readable(from, window_size);
+ +		leftover = fault_in_iov_iter_readable(from, window_size);
+  		gfs2_holder_disallow_demote(gh);
+ -		if (window_size) {
+ -			from->count = min(from->count, window_size);
+ -			if (gfs2_holder_queued(gh))
+ -				goto retry_under_glock;
+ -			goto retry;
+ +		if (leftover != window_size) {
+ +			from->count = min(from->count, window_size - leftover);
+ +			if (!gfs2_holder_queued(gh)) {
+ +				if (read)
+ +					goto out_uninit;
+ +				goto retry;
+ +			}
+ +			goto retry_under_glock;
+  		}
+  	}
+  out_unlock:
+* Unmerged path fs/gfs2/file.c
