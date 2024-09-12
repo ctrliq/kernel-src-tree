@@ -1,0 +1,129 @@
+gfs2: gl_object races fix
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-483.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 9ffa18884cceb2e5731e422140fad06292de0577
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-483.el8/9ffa1888.failed
+
+Function glock_clear_object() checks if the specified glock is still
+pointing at the right object and clears the gl_object pointer.  To
+handle the case of incompletely constructed inodes, glock_clear_object()
+also allows gl_object to be NULL.
+
+However, in the teardown case, when iget_failed() is called and the
+inode is removed from the inode hash, by the time we get to the
+glock_clear_object() calls in gfs2_put_super() and its helpers, we don't
+have exclusion against concurrent gfs2_inode_lookup() and
+gfs2_create_inode() calls, and the inode and iopen glocks may already be
+pointing at another inode, so the checks in glock_clear_object() are
+incorrect.
+
+To better handle this case, always completely disassociate an inode from
+its glocks before tearing it down.  In addition, get rid of a duplicate
+glock_clear_object() call in gfs2_evict_inode().  That way,
+glock_clear_object() will only ever be called when the glock points at
+the current inode, and the NULL check in glock_clear_object() can be
+removed.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 9ffa18884cceb2e5731e422140fad06292de0577)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+#	fs/gfs2/inode.c
+diff --cc fs/gfs2/glock.c
+index e05d4ce9aac6,2868e979810a..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -897,6 -859,48 +897,51 @@@ out_unlock
+  	return;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * glock_set_object - set the gl_object field of a glock
++  * @gl: the glock
++  * @object: the object
++  */
++ void glock_set_object(struct gfs2_glock *gl, void *object)
++ {
++ 	void *prev_object;
++ 
++ 	spin_lock(&gl->gl_lockref.lock);
++ 	prev_object = gl->gl_object;
++ 	gl->gl_object = object;
++ 	spin_unlock(&gl->gl_lockref.lock);
++ 	if (gfs2_assert_warn(gl->gl_name.ln_sbd, prev_object == NULL)) {
++ 		pr_warn("glock=%u/%llx\n",
++ 			gl->gl_name.ln_type,
++ 			(unsigned long long)gl->gl_name.ln_number);
++ 		gfs2_dump_glock(NULL, gl, true);
++ 	}
++ }
++ 
++ /**
++  * glock_clear_object - clear the gl_object field of a glock
++  * @gl: the glock
++  * @object: object the glock currently points at
++  */
++ void glock_clear_object(struct gfs2_glock *gl, void *object)
++ {
++ 	void *prev_object;
++ 
++ 	spin_lock(&gl->gl_lockref.lock);
++ 	prev_object = gl->gl_object;
++ 	gl->gl_object = NULL;
++ 	spin_unlock(&gl->gl_lockref.lock);
++ 	if (gfs2_assert_warn(gl->gl_name.ln_sbd, prev_object == object)) {
++ 		pr_warn("glock=%u/%llx\n",
++ 			gl->gl_name.ln_type,
++ 			(unsigned long long)gl->gl_name.ln_number);
++ 		gfs2_dump_glock(NULL, gl, true);
++ 	}
++ }
++ 
+++>>>>>>> 9ffa18884cce (gfs2: gl_object races fix)
+  void gfs2_inode_remember_delete(struct gfs2_glock *gl, u64 generation)
+  {
+  	struct gfs2_inode_lvb *ri = (void *)gl->gl_lksb.sb_lvbptr;
+diff --cc fs/gfs2/inode.c
+index d49f4a9f387c,c76fdb8f951f..000000000000
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@@ -812,8 -821,8 +816,13 @@@ fail_gunlock2
+  	gfs2_glock_put(io_gl);
+  fail_free_inode:
+  	if (ip->i_gl) {
+++<<<<<<< HEAD
+ +		if (free_vfs_inode) /* else evict will do the put for us */
+ +			gfs2_glock_put(ip->i_gl);
+++=======
++ 		gfs2_glock_put(ip->i_gl);
++ 		ip->i_gl = NULL;
+++>>>>>>> 9ffa18884cce (gfs2: gl_object races fix)
+  	}
+  	gfs2_rs_deltree(&ip->i_res);
+  	gfs2_qa_put(ip);
+* Unmerged path fs/gfs2/glock.c
+* Unmerged path fs/gfs2/inode.c
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index a8c1dec0119f..39554121cb5d 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -1461,10 +1461,8 @@ static void gfs2_evict_inode(struct inode *inode)
+ 	if (gfs2_rs_active(&ip->i_res))
+ 		gfs2_rs_deltree(&ip->i_res);
+ 
+-	if (gfs2_holder_initialized(&gh)) {
+-		glock_clear_object(ip->i_gl, ip);
++	if (gfs2_holder_initialized(&gh))
+ 		gfs2_glock_dq_uninit(&gh);
+-	}
+ 	if (ret && ret != GLR_TRYFAILED && ret != -EROFS)
+ 		fs_warn(sdp, "gfs2_evict_inode: %d\n", ret);
+ out:
