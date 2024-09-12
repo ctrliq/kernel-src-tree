@@ -1,0 +1,653 @@
+wifi: ath11k: Fix register write failure on QCN9074
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Manikanta Pubbisetty <quic_mpubbise@quicinc.com>
+commit 867f4eeee862d6568a0f142d6a38f8bb724ff80e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/867f4eee.failed
+
+Commit 56c8ccf331bd ("ath11k: Add register access logic for WCN6750")
+regressed QCN9074. With the above mentioned commit, writes are failing
+for some registers on QCN9074 although the device seems to work
+normally.
+
+ath11k_pci 0000:03:00.0: failed to set pcie link register0x01e0e0a8: 0xffffffff != 0x00000010
+ath11k_pci 0000:03:00.0: failed to set sysclk: -110
+
+PCIe devices in ath11k (QCA6390, WCN6855, QCN9074, WCN6750) use window
+concept for register accesses. There are two schemes, dynamic & static
+window.
+
+In dynamic window scheme, a single window(region in the BAR) is mapped
+either to CE or DP register windows at any give time. QCA6390 & WCN6855
+follow this scheme for register accesses.
+
+In static window scheme, CE & DP register windows are statically mapped
+to separate regions with in the BAR so that there is no switching of
+register windows between CE & DP register accesses. QCN9074 & WCN6750
+follow this scheme although the window start offsets are different for
+QCN9074 & WCN6750.
+
+QCN9074 uses 3rd & 2nd window for DP & CE register accesses respectively
+whereas WCN6750 uses 1st & 2nd window for DP & CE. In QCN9074, along with
+2nd & 3rd windows, 1st window is also used for certain configurations
+which commit 56c8ccf331bd ("ath11k: Add register access logic for WCN6750")
+did not account for and hence the regression.
+
+Fix this by going back to the original way of accessing the registers on
+QCN9074. Since this diverges from WCN6750 way of accessing registers, it
+is required to register window_read32/window_write32() pci_ops for WCN6750.
+We can also get rid of dp_window_idx & ce_window_idx members in hw_params,
+so remove them.
+
+Also add a new API ath11k_pcic_register_pci_ops() for registering pci_ops
+to the ath11k core. This API checks for mandatory pci_ops() and reports
+error if those are missing. Also initialize unused pci_ops to NULL.
+
+Tested-on: WCN6750 hw1.0 AHB WLAN.MSL.1.0.1-00887-QCAMSLSWPLZ-1
+Tested-on: QCN9074 hw1.0 PCI WLAN.HK.2.6.0.1-00861-QCAHKSWPL_SILICONZ-1
+
+Fixes: 56c8ccf331bd ("ath11k: Add register access logic for WCN6750")
+	Reported-by: Maxime Bizon <mbizon@freebox.fr>
+	Tested-by: Maxime Bizon <mbizon@freebox.fr>
+	Signed-off-by: Manikanta Pubbisetty <quic_mpubbise@quicinc.com>
+	Signed-off-by: Kalle Valo <quic_kvalo@quicinc.com>
+Link: https://lore.kernel.org/r/20220608062954.27792-1-quic_mpubbise@quicinc.com
+(cherry picked from commit 867f4eeee862d6568a0f142d6a38f8bb724ff80e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/ath/ath11k/ahb.c
+#	drivers/net/wireless/ath/ath11k/core.c
+#	drivers/net/wireless/ath/ath11k/hw.h
+#	drivers/net/wireless/ath/ath11k/pci.c
+#	drivers/net/wireless/ath/ath11k/pcic.c
+#	drivers/net/wireless/ath/ath11k/pcic.h
+diff --cc drivers/net/wireless/ath/ath11k/ahb.c
+index c7ff98b317b6,c47414710138..000000000000
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@@ -134,6 -134,61 +134,64 @@@ enum ext_irq_num 
+  	tcl2host_status_ring,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ ath11k_ahb_get_msi_irq_wcn6750(struct ath11k_base *ab, unsigned int vector)
++ {
++ 	return ab->pci.msi.irqs[vector];
++ }
++ 
++ static inline u32
++ ath11k_ahb_get_window_start_wcn6750(struct ath11k_base *ab, u32 offset)
++ {
++ 	u32 window_start = 0;
++ 
++ 	/* If offset lies within DP register range, use 1st window */
++ 	if ((offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < ATH11K_PCI_WINDOW_RANGE_MASK)
++ 		window_start = ATH11K_PCI_WINDOW_START;
++ 	/* If offset lies within CE register range, use 2nd window */
++ 	else if ((offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) <
++ 		 ATH11K_PCI_WINDOW_RANGE_MASK)
++ 		window_start = 2 * ATH11K_PCI_WINDOW_START;
++ 
++ 	return window_start;
++ }
++ 
++ static void
++ ath11k_ahb_window_write32_wcn6750(struct ath11k_base *ab, u32 offset, u32 value)
++ {
++ 	u32 window_start;
++ 
++ 	/* WCN6750 uses static window based register access*/
++ 	window_start = ath11k_ahb_get_window_start_wcn6750(ab, offset);
++ 
++ 	iowrite32(value, ab->mem + window_start +
++ 		  (offset & ATH11K_PCI_WINDOW_RANGE_MASK));
++ }
++ 
++ static u32 ath11k_ahb_window_read32_wcn6750(struct ath11k_base *ab, u32 offset)
++ {
++ 	u32 window_start;
++ 	u32 val;
++ 
++ 	/* WCN6750 uses static window based register access */
++ 	window_start = ath11k_ahb_get_window_start_wcn6750(ab, offset);
++ 
++ 	val = ioread32(ab->mem + window_start +
++ 		       (offset & ATH11K_PCI_WINDOW_RANGE_MASK));
++ 	return val;
++ }
++ 
++ static const struct ath11k_pci_ops ath11k_ahb_pci_ops_wcn6750 = {
++ 	.wakeup = NULL,
++ 	.release = NULL,
++ 	.get_msi_irq = ath11k_ahb_get_msi_irq_wcn6750,
++ 	.window_write32 = ath11k_ahb_window_write32_wcn6750,
++ 	.window_read32 = ath11k_ahb_window_read32_wcn6750,
++ };
++ 
+++>>>>>>> 867f4eeee862 (wifi: ath11k: Fix register write failure on QCN9074)
+  static inline u32 ath11k_ahb_read32(struct ath11k_base *ab, u32 offset)
+  {
+  	return ioread32(ab->mem + offset);
+@@@ -693,13 -1015,17 +751,23 @@@ static int ath11k_ahb_probe(struct plat
+  		return -ENOMEM;
+  	}
+  
+++<<<<<<< HEAD
+ +	ab->hif.ops = &ath11k_ahb_hif_ops;
+++=======
++ 	ab->hif.ops = hif_ops;
+++>>>>>>> 867f4eeee862 (wifi: ath11k: Fix register write failure on QCN9074)
+  	ab->pdev = pdev;
+ -	ab->hw_rev = hw_rev;
+ +	ab->hw_rev = (enum ath11k_hw_rev)of_id->data;
+ +	ab->mem = mem;
+ +	ab->mem_len = resource_size(mem_res);
+  	platform_set_drvdata(pdev, ab);
+  
++ 	ret = ath11k_pcic_register_pci_ops(ab, pci_ops);
++ 	if (ret) {
++ 		ath11k_err(ab, "failed to register PCI ops: %d\n", ret);
++ 		goto err_core_free;
++ 	}
++ 
+  	ret = ath11k_core_pre_init(ab);
+  	if (ret)
+  		goto err_core_free;
+diff --cc drivers/net/wireless/ath/ath11k/core.c
+index 175aa47e5d71,6ddc698f4a2d..000000000000
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@@ -102,6 -102,13 +102,16 @@@ static const struct ath11k_hw_params at
+  		.dbr_debug_support = true,
+  		.global_reset = false,
+  		.bios_sar_capa = NULL,
+++<<<<<<< HEAD
+++=======
++ 		.m3_fw_support = false,
++ 		.fixed_bdf_addr = true,
++ 		.fixed_mem_region = true,
++ 		.static_window_map = false,
++ 		.hybrid_bus_type = false,
++ 		.fixed_fw_mem = false,
++ 		.support_off_channel_tx = false,
+++>>>>>>> 867f4eeee862 (wifi: ath11k: Fix register write failure on QCN9074)
+  	},
+  	{
+  		.hw_rev = ATH11K_HW_IPQ6018_HW10,
+@@@ -170,6 -176,13 +180,16 @@@
+  		.dbr_debug_support = true,
+  		.global_reset = false,
+  		.bios_sar_capa = NULL,
+++<<<<<<< HEAD
+++=======
++ 		.m3_fw_support = false,
++ 		.fixed_bdf_addr = true,
++ 		.fixed_mem_region = true,
++ 		.static_window_map = false,
++ 		.hybrid_bus_type = false,
++ 		.fixed_fw_mem = false,
++ 		.support_off_channel_tx = false,
+++>>>>>>> 867f4eeee862 (wifi: ath11k: Fix register write failure on QCN9074)
+  	},
+  	{
+  		.name = "qca6390 hw2.0",
+@@@ -237,6 -249,13 +257,16 @@@
+  		.dbr_debug_support = false,
+  		.global_reset = true,
+  		.bios_sar_capa = NULL,
+++<<<<<<< HEAD
+++=======
++ 		.m3_fw_support = true,
++ 		.fixed_bdf_addr = false,
++ 		.fixed_mem_region = false,
++ 		.static_window_map = false,
++ 		.hybrid_bus_type = false,
++ 		.fixed_fw_mem = false,
++ 		.support_off_channel_tx = true,
+++>>>>>>> 867f4eeee862 (wifi: ath11k: Fix register write failure on QCN9074)
+  	},
+  	{
+  		.name = "qcn9074 hw1.0",
+@@@ -304,6 -322,13 +334,16 @@@
+  		.dbr_debug_support = true,
+  		.global_reset = false,
+  		.bios_sar_capa = NULL,
+++<<<<<<< HEAD
+++=======
++ 		.m3_fw_support = true,
++ 		.fixed_bdf_addr = false,
++ 		.fixed_mem_region = false,
++ 		.static_window_map = true,
++ 		.hybrid_bus_type = false,
++ 		.fixed_fw_mem = false,
++ 		.support_off_channel_tx = false,
+++>>>>>>> 867f4eeee862 (wifi: ath11k: Fix register write failure on QCN9074)
+  	},
+  	{
+  		.name = "wcn6855 hw2.0",
+@@@ -371,6 -395,13 +411,16 @@@
+  		.dbr_debug_support = false,
+  		.global_reset = true,
+  		.bios_sar_capa = &ath11k_hw_sar_capa_wcn6855,
+++<<<<<<< HEAD
+++=======
++ 		.m3_fw_support = true,
++ 		.fixed_bdf_addr = false,
++ 		.fixed_mem_region = false,
++ 		.static_window_map = false,
++ 		.hybrid_bus_type = false,
++ 		.fixed_fw_mem = false,
++ 		.support_off_channel_tx = true,
+++>>>>>>> 867f4eeee862 (wifi: ath11k: Fix register write failure on QCN9074)
+  	},
+  	{
+  		.name = "wcn6855 hw2.1",
+@@@ -437,6 -467,85 +487,88 @@@
+  		.dbr_debug_support = false,
+  		.global_reset = true,
+  		.bios_sar_capa = &ath11k_hw_sar_capa_wcn6855,
+++<<<<<<< HEAD
+++=======
++ 		.m3_fw_support = true,
++ 		.fixed_bdf_addr = false,
++ 		.fixed_mem_region = false,
++ 		.static_window_map = false,
++ 		.hybrid_bus_type = false,
++ 		.fixed_fw_mem = false,
++ 		.support_off_channel_tx = true,
++ 	},
++ 	{
++ 		.name = "wcn6750 hw1.0",
++ 		.hw_rev = ATH11K_HW_WCN6750_HW10,
++ 		.fw = {
++ 			.dir = "WCN6750/hw1.0",
++ 			.board_size = 256 * 1024,
++ 			.cal_offset = 128 * 1024,
++ 		},
++ 		.max_radios = 1,
++ 		.bdf_addr = 0x4B0C0000,
++ 		.hw_ops = &wcn6750_ops,
++ 		.ring_mask = &ath11k_hw_ring_mask_qca6390,
++ 		.internal_sleep_clock = false,
++ 		.regs = &wcn6750_regs,
++ 		.qmi_service_ins_id = ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_WCN6750,
++ 		.host_ce_config = ath11k_host_ce_config_qca6390,
++ 		.ce_count = 9,
++ 		.target_ce_config = ath11k_target_ce_config_wlan_qca6390,
++ 		.target_ce_count = 9,
++ 		.svc_to_ce_map = ath11k_target_service_to_ce_map_wlan_qca6390,
++ 		.svc_to_ce_map_len = 14,
++ 		.rfkill_pin = 0,
++ 		.rfkill_cfg = 0,
++ 		.rfkill_on_level = 0,
++ 		.single_pdev_only = true,
++ 		.rxdma1_enable = false,
++ 		.num_rxmda_per_pdev = 1,
++ 		.rx_mac_buf_ring = true,
++ 		.vdev_start_delay = true,
++ 		.htt_peer_map_v2 = false,
++ 
++ 		.spectral = {
++ 			.fft_sz = 0,
++ 			.fft_pad_sz = 0,
++ 			.summary_pad_sz = 0,
++ 			.fft_hdr_len = 0,
++ 			.max_fft_bins = 0,
++ 		},
++ 
++ 		.interface_modes = BIT(NL80211_IFTYPE_STATION) |
++ 					BIT(NL80211_IFTYPE_AP),
++ 		.supports_monitor = false,
++ 		.supports_shadow_regs = true,
++ 		.idle_ps = true,
++ 		.supports_sta_ps = true,
++ 		.cold_boot_calib = false,
++ 		.fw_mem_mode = 0,
++ 		.num_vdevs = 16 + 1,
++ 		.num_peers = 512,
++ 		.supports_suspend = false,
++ 		.hal_desc_sz = sizeof(struct hal_rx_desc_qcn9074),
++ 		.supports_regdb = true,
++ 		.fix_l1ss = false,
++ 		.credit_flow = true,
++ 		.max_tx_ring = DP_TCL_NUM_RING_MAX_QCA6390,
++ 		.hal_params = &ath11k_hw_hal_params_qca6390,
++ 		.supports_dynamic_smps_6ghz = false,
++ 		.alloc_cacheable_memory = false,
++ 		.supports_rssi_stats = true,
++ 		.fw_wmi_diag_event = false,
++ 		.current_cc_support = true,
++ 		.dbr_debug_support = false,
++ 		.global_reset = false,
++ 		.bios_sar_capa = NULL,
++ 		.m3_fw_support = false,
++ 		.fixed_bdf_addr = false,
++ 		.fixed_mem_region = false,
++ 		.static_window_map = true,
++ 		.hybrid_bus_type = true,
++ 		.fixed_fw_mem = true,
++ 		.support_off_channel_tx = false,
+++>>>>>>> 867f4eeee862 (wifi: ath11k: Fix register write failure on QCN9074)
+  	},
+  };
+  
+diff --cc drivers/net/wireless/ath/ath11k/hw.h
+index 29546d8de738,84c284fab5db..000000000000
+--- a/drivers/net/wireless/ath/ath11k/hw.h
++++ b/drivers/net/wireless/ath/ath11k/hw.h
+@@@ -196,6 -196,13 +196,16 @@@ struct ath11k_hw_params 
+  	bool dbr_debug_support;
+  	bool global_reset;
+  	const struct cfg80211_sar_capa *bios_sar_capa;
+++<<<<<<< HEAD
+++=======
++ 	bool m3_fw_support;
++ 	bool fixed_bdf_addr;
++ 	bool fixed_mem_region;
++ 	bool static_window_map;
++ 	bool hybrid_bus_type;
++ 	bool fixed_fw_mem;
++ 	bool support_off_channel_tx;
+++>>>>>>> 867f4eeee862 (wifi: ath11k: Fix register write failure on QCN9074)
+  };
+  
+  struct ath11k_hw_ops {
+diff --cc drivers/net/wireless/ath/ath11k/pci.c
+index ae4b3aa98fc3,5bd34a6273d9..000000000000
+--- a/drivers/net/wireless/ath/ath11k/pci.c
++++ b/drivers/net/wireless/ath/ath11k/pci.c
+@@@ -35,100 -36,36 +35,116 @@@ static const struct pci_device_id ath11
+  
+  MODULE_DEVICE_TABLE(pci, ath11k_pci_id_table);
+  
+ -static int ath11k_pci_bus_wake_up(struct ath11k_base *ab)
+ -{
+ -	struct ath11k_pci *ab_pci = ath11k_pci_priv(ab);
+ +static const struct ath11k_bus_params ath11k_pci_bus_params = {
+ +	.mhi_support = true,
+ +	.m3_fw_support = true,
+ +	.fixed_bdf_addr = false,
+ +	.fixed_mem_region = false,
+ +};
+  
+ -	return mhi_device_get_sync(ab_pci->mhi_ctrl->mhi_dev);
+ -}
+ +static const struct ath11k_msi_config ath11k_msi_config[] = {
+ +	{
+ +		.total_vectors = 32,
+ +		.total_users = 4,
+ +		.users = (struct ath11k_msi_user[]) {
+ +			{ .name = "MHI", .num_vectors = 3, .base_vector = 0 },
+ +			{ .name = "CE", .num_vectors = 10, .base_vector = 3 },
+ +			{ .name = "WAKE", .num_vectors = 1, .base_vector = 13 },
+ +			{ .name = "DP", .num_vectors = 18, .base_vector = 14 },
+ +		},
+ +	},
+ +	{
+ +		.total_vectors = 16,
+ +		.total_users = 3,
+ +		.users = (struct ath11k_msi_user[]) {
+ +			{ .name = "MHI", .num_vectors = 3, .base_vector = 0 },
+ +			{ .name = "CE", .num_vectors = 5, .base_vector = 3 },
+ +			{ .name = "DP", .num_vectors = 8, .base_vector = 8 },
+ +		},
+ +	},
+ +};
+  
+ -static void ath11k_pci_bus_release(struct ath11k_base *ab)
+ -{
+ -	struct ath11k_pci *ab_pci = ath11k_pci_priv(ab);
+ +static const struct ath11k_msi_config msi_config_one_msi = {
+ +	.total_vectors = 1,
+ +	.total_users = 4,
+ +	.users = (struct ath11k_msi_user[]) {
+ +		{ .name = "MHI", .num_vectors = 3, .base_vector = 0 },
+ +		{ .name = "CE", .num_vectors = 1, .base_vector = 0 },
+ +		{ .name = "WAKE", .num_vectors = 1, .base_vector = 0 },
+ +		{ .name = "DP", .num_vectors = 1, .base_vector = 0 },
+ +	},
+ +};
+  
+ -	mhi_device_put(ab_pci->mhi_ctrl->mhi_dev);
+ -}
+ +static const char *irq_name[ATH11K_IRQ_NUM_MAX] = {
+ +	"bhi",
+ +	"mhi-er0",
+ +	"mhi-er1",
+ +	"ce0",
+ +	"ce1",
+ +	"ce2",
+ +	"ce3",
+ +	"ce4",
+ +	"ce5",
+ +	"ce6",
+ +	"ce7",
+ +	"ce8",
+ +	"ce9",
+ +	"ce10",
+ +	"ce11",
+ +	"host2wbm-desc-feed",
+ +	"host2reo-re-injection",
+ +	"host2reo-command",
+ +	"host2rxdma-monitor-ring3",
+ +	"host2rxdma-monitor-ring2",
+ +	"host2rxdma-monitor-ring1",
+ +	"reo2ost-exception",
+ +	"wbm2host-rx-release",
+ +	"reo2host-status",
+ +	"reo2host-destination-ring4",
+ +	"reo2host-destination-ring3",
+ +	"reo2host-destination-ring2",
+ +	"reo2host-destination-ring1",
+ +	"rxdma2host-monitor-destination-mac3",
+ +	"rxdma2host-monitor-destination-mac2",
+ +	"rxdma2host-monitor-destination-mac1",
+ +	"ppdu-end-interrupts-mac3",
+ +	"ppdu-end-interrupts-mac2",
+ +	"ppdu-end-interrupts-mac1",
+ +	"rxdma2host-monitor-status-ring-mac3",
+ +	"rxdma2host-monitor-status-ring-mac2",
+ +	"rxdma2host-monitor-status-ring-mac1",
+ +	"host2rxdma-host-buf-ring-mac3",
+ +	"host2rxdma-host-buf-ring-mac2",
+ +	"host2rxdma-host-buf-ring-mac1",
+ +	"rxdma2host-destination-ring-mac3",
+ +	"rxdma2host-destination-ring-mac2",
+ +	"rxdma2host-destination-ring-mac1",
+ +	"host2tcl-input-ring4",
+ +	"host2tcl-input-ring3",
+ +	"host2tcl-input-ring2",
+ +	"host2tcl-input-ring1",
+ +	"wbm2host-tx-completions-ring3",
+ +	"wbm2host-tx-completions-ring2",
+ +	"wbm2host-tx-completions-ring1",
+ +	"tcl2host-status-ring",
+ +};
+  
++ static u32 ath11k_pci_get_window_start(struct ath11k_base *ab, u32 offset)
++ {
++ 	if (!ab->hw_params.static_window_map)
++ 		return ATH11K_PCI_WINDOW_START;
++ 
++ 	if ((offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < ATH11K_PCI_WINDOW_RANGE_MASK)
++ 		/* if offset lies within DP register range, use 3rd window */
++ 		return 3 * ATH11K_PCI_WINDOW_START;
++ 	else if ((offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) <
++ 		 ATH11K_PCI_WINDOW_RANGE_MASK)
++ 		 /* if offset lies within CE register range, use 2nd window */
++ 		return 2 * ATH11K_PCI_WINDOW_START;
++ 	else
++ 		return ATH11K_PCI_WINDOW_START;
++ }
++ 
+  static inline void ath11k_pci_select_window(struct ath11k_pci *ab_pci, u32 offset)
+  {
+  	struct ath11k_base *ab = ab_pci->ab;
+@@@ -145,6 -82,81 +161,84 @@@
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ ath11k_pci_window_write32(struct ath11k_base *ab, u32 offset, u32 value)
++ {
++ 	struct ath11k_pci *ab_pci = ath11k_pci_priv(ab);
++ 	u32 window_start;
++ 
++ 	window_start = ath11k_pci_get_window_start(ab, offset);
++ 
++ 	if (window_start == ATH11K_PCI_WINDOW_START) {
++ 		spin_lock_bh(&ab_pci->window_lock);
++ 		ath11k_pci_select_window(ab_pci, offset);
++ 		iowrite32(value, ab->mem + window_start +
++ 			  (offset & ATH11K_PCI_WINDOW_RANGE_MASK));
++ 		spin_unlock_bh(&ab_pci->window_lock);
++ 	} else {
++ 		iowrite32(value, ab->mem + window_start +
++ 			  (offset & ATH11K_PCI_WINDOW_RANGE_MASK));
++ 	}
++ }
++ 
++ static u32 ath11k_pci_window_read32(struct ath11k_base *ab, u32 offset)
++ {
++ 	struct ath11k_pci *ab_pci = ath11k_pci_priv(ab);
++ 	u32 window_start, val;
++ 
++ 	window_start = ath11k_pci_get_window_start(ab, offset);
++ 
++ 	if (window_start == ATH11K_PCI_WINDOW_START) {
++ 		spin_lock_bh(&ab_pci->window_lock);
++ 		ath11k_pci_select_window(ab_pci, offset);
++ 		val = ioread32(ab->mem + window_start +
++ 			       (offset & ATH11K_PCI_WINDOW_RANGE_MASK));
++ 		spin_unlock_bh(&ab_pci->window_lock);
++ 	} else {
++ 		val = ioread32(ab->mem + window_start +
++ 			       (offset & ATH11K_PCI_WINDOW_RANGE_MASK));
++ 	}
++ 
++ 	return val;
++ }
++ 
++ int ath11k_pci_get_msi_irq(struct ath11k_base *ab, unsigned int vector)
++ {
++ 	struct pci_dev *pci_dev = to_pci_dev(ab->dev);
++ 
++ 	return pci_irq_vector(pci_dev, vector);
++ }
++ 
++ static const struct ath11k_pci_ops ath11k_pci_ops_qca6390 = {
++ 	.wakeup = ath11k_pci_bus_wake_up,
++ 	.release = ath11k_pci_bus_release,
++ 	.get_msi_irq = ath11k_pci_get_msi_irq,
++ 	.window_write32 = ath11k_pci_window_write32,
++ 	.window_read32 = ath11k_pci_window_read32,
++ };
++ 
++ static const struct ath11k_pci_ops ath11k_pci_ops_qcn9074 = {
++ 	.wakeup = NULL,
++ 	.release = NULL,
++ 	.get_msi_irq = ath11k_pci_get_msi_irq,
++ 	.window_write32 = ath11k_pci_window_write32,
++ 	.window_read32 = ath11k_pci_window_read32,
++ };
++ 
++ static const struct ath11k_msi_config msi_config_one_msi = {
++ 	.total_vectors = 1,
++ 	.total_users = 4,
++ 	.users = (struct ath11k_msi_user[]) {
++ 		{ .name = "MHI", .num_vectors = 3, .base_vector = 0 },
++ 		{ .name = "CE", .num_vectors = 1, .base_vector = 0 },
++ 		{ .name = "WAKE", .num_vectors = 1, .base_vector = 0 },
++ 		{ .name = "DP", .num_vectors = 1, .base_vector = 0 },
++ 	},
++ };
++ 
+++>>>>>>> 867f4eeee862 (wifi: ath11k: Fix register write failure on QCN9074)
+  static inline void ath11k_pci_select_static_window(struct ath11k_pci *ab_pci)
+  {
+  	u32 umac_window;
+@@@ -1348,10 -728,11 +1442,11 @@@ static int ath11k_pci_probe(struct pci_
+  	struct ath11k_base *ab;
+  	struct ath11k_pci *ab_pci;
+  	u32 soc_hw_version_major, soc_hw_version_minor, addr;
++ 	const struct ath11k_pci_ops *pci_ops;
+  	int ret;
+  
+ -	ab = ath11k_core_alloc(&pdev->dev, sizeof(*ab_pci), ATH11K_BUS_PCI);
+ -
+ +	ab = ath11k_core_alloc(&pdev->dev, sizeof(*ab_pci), ATH11K_BUS_PCI,
+ +			       &ath11k_pci_bus_params);
+  	if (!ab) {
+  		dev_err(&pdev->dev, "failed to allocate ath11k base\n");
+  		return -ENOMEM;
+@@@ -1404,11 -785,11 +1499,19 @@@
+  			ret = -EOPNOTSUPP;
+  			goto err_pci_free_region;
+  		}
+++<<<<<<< HEAD
+ +		ab_pci->msi_config = &ath11k_msi_config[0];
+ +		break;
+ +	case QCN9074_DEVICE_ID:
+ +		ab_pci->msi_config = &ath11k_msi_config[1];
+ +		ab->bus_params.static_window_map = true;
+++=======
++ 
++ 		pci_ops = &ath11k_pci_ops_qca6390;
++ 		break;
++ 	case QCN9074_DEVICE_ID:
++ 		pci_ops = &ath11k_pci_ops_qcn9074;
+++>>>>>>> 867f4eeee862 (wifi: ath11k: Fix register write failure on QCN9074)
+  		ab->hw_rev = ATH11K_HW_QCN9074_HW10;
+  		break;
+  	case WCN6855_DEVICE_ID:
+@@@ -1437,7 -818,8 +1540,12 @@@ unsupported_wcn6855_soc
+  			ret = -EOPNOTSUPP;
+  			goto err_pci_free_region;
+  		}
+++<<<<<<< HEAD
+ +		ab_pci->msi_config = &ath11k_msi_config[0];
+++=======
++ 
++ 		pci_ops = &ath11k_pci_ops_qca6390;
+++>>>>>>> 867f4eeee862 (wifi: ath11k: Fix register write failure on QCN9074)
+  		break;
+  	default:
+  		dev_err(&pdev->dev, "Unknown PCI device found: 0x%x\n",
+@@@ -1446,6 -828,18 +1554,21 @@@
+  		goto err_pci_free_region;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = ath11k_pcic_register_pci_ops(ab, pci_ops);
++ 	if (ret) {
++ 		ath11k_err(ab, "failed to register PCI ops: %d\n", ret);
++ 		goto err_pci_free_region;
++ 	}
++ 
++ 	ret = ath11k_pcic_init_msi_config(ab);
++ 	if (ret) {
++ 		ath11k_err(ab, "failed to init msi config: %d\n", ret);
++ 		goto err_pci_free_region;
++ 	}
++ 
+++>>>>>>> 867f4eeee862 (wifi: ath11k: Fix register write failure on QCN9074)
+  	ret = ath11k_pci_alloc_msi(ab_pci);
+  	if (ret) {
+  		ath11k_err(ab, "failed to enable msi: %d\n", ret);
+* Unmerged path drivers/net/wireless/ath/ath11k/pcic.c
+* Unmerged path drivers/net/wireless/ath/ath11k/pcic.h
+* Unmerged path drivers/net/wireless/ath/ath11k/ahb.c
+* Unmerged path drivers/net/wireless/ath/ath11k/core.c
+* Unmerged path drivers/net/wireless/ath/ath11k/hw.h
+* Unmerged path drivers/net/wireless/ath/ath11k/pci.c
+* Unmerged path drivers/net/wireless/ath/ath11k/pcic.c
+* Unmerged path drivers/net/wireless/ath/ath11k/pcic.h
