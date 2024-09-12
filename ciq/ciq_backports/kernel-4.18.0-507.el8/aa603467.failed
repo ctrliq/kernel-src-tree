@@ -1,0 +1,149 @@
+bonding: use rcu_dereference_rtnl when get bonding active slave
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-507.el8
+commit-author Hangbin Liu <liuhangbin@gmail.com>
+commit aa6034678e873db8bd5c5a4b73f8b88c469374d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-507.el8/aa603467.failed
+
+bond_option_active_slave_get_rcu() should not be used in rtnl_mutex as it
+use rcu_dereference(). Replace to rcu_dereference_rtnl() so we also can use
+this function in rtnl protected context.
+
+With this update, we can rmeove the rcu_read_lock/unlock in
+bonding .ndo_eth_ioctl and .get_ts_info.
+
+	Reported-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Fixes: 94dd016ae538 ("bond: pass get_ts_info and SIOC[SG]HWTSTAMP ioctl to active device")
+	Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit aa6034678e873db8bd5c5a4b73f8b88c469374d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index f99aa29504af,238b56d77c36..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -4045,8 -4123,62 +4045,67 @@@ static int bond_do_ioctl(struct net_dev
+  				mii->val_out = BMSR_LSTATUS;
+  		}
+  
+++<<<<<<< HEAD
+ +		return 0;
+ +	case BOND_INFO_QUERY_OLD:
+++=======
++ 		break;
++ 	case SIOCSHWTSTAMP:
++ 		if (copy_from_user(&cfg, ifr->ifr_data, sizeof(cfg)))
++ 			return -EFAULT;
++ 
++ 		if (!(cfg.flags & HWTSTAMP_FLAG_BONDED_PHC_INDEX))
++ 			return -EOPNOTSUPP;
++ 
++ 		fallthrough;
++ 	case SIOCGHWTSTAMP:
++ 		real_dev = bond_option_active_slave_get_rcu(bond);
++ 		if (!real_dev)
++ 			return -EOPNOTSUPP;
++ 
++ 		strscpy_pad(ifrr.ifr_name, real_dev->name, IFNAMSIZ);
++ 		ifrr.ifr_ifru = ifr->ifr_ifru;
++ 
++ 		ops = real_dev->netdev_ops;
++ 		if (netif_device_present(real_dev) && ops->ndo_eth_ioctl) {
++ 			res = ops->ndo_eth_ioctl(real_dev, &ifrr, cmd);
++ 			if (res)
++ 				return res;
++ 
++ 			ifr->ifr_ifru = ifrr.ifr_ifru;
++ 			if (copy_from_user(&cfg, ifr->ifr_data, sizeof(cfg)))
++ 				return -EFAULT;
++ 
++ 			/* Set the BOND_PHC_INDEX flag to notify user space */
++ 			cfg.flags |= HWTSTAMP_FLAG_BONDED_PHC_INDEX;
++ 
++ 			return copy_to_user(ifr->ifr_data, &cfg, sizeof(cfg)) ?
++ 				-EFAULT : 0;
++ 		}
++ 		fallthrough;
++ 	default:
++ 		res = -EOPNOTSUPP;
++ 	}
++ 
++ 	return res;
++ }
++ 
++ static int bond_do_ioctl(struct net_device *bond_dev, struct ifreq *ifr, int cmd)
++ {
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	struct net_device *slave_dev = NULL;
++ 	struct ifbond k_binfo;
++ 	struct ifbond __user *u_binfo = NULL;
++ 	struct ifslave k_sinfo;
++ 	struct ifslave __user *u_sinfo = NULL;
++ 	struct bond_opt_value newval;
++ 	struct net *net;
++ 	int res = 0;
++ 
++ 	netdev_dbg(bond_dev, "bond_ioctl: cmd=%d\n", cmd);
++ 
++ 	switch (cmd) {
+++>>>>>>> aa6034678e87 (bonding: use rcu_dereference_rtnl when get bonding active slave)
+  	case SIOCBONDINFOQUERY:
+  		u_binfo = (struct ifbond __user *)ifr->ifr_data;
+  
+@@@ -5003,6 -5372,33 +5062,36 @@@ static void bond_ethtool_get_drvinfo(st
+  		 BOND_ABI_VERSION);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bond_ethtool_get_ts_info(struct net_device *bond_dev,
++ 				    struct ethtool_ts_info *info)
++ {
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	const struct ethtool_ops *ops;
++ 	struct net_device *real_dev;
++ 	struct phy_device *phydev;
++ 
++ 	real_dev = bond_option_active_slave_get_rcu(bond);
++ 	if (real_dev) {
++ 		ops = real_dev->ethtool_ops;
++ 		phydev = real_dev->phydev;
++ 
++ 		if (phy_has_tsinfo(phydev)) {
++ 			return phy_ts_info(phydev, info);
++ 		} else if (ops->get_ts_info) {
++ 			return ops->get_ts_info(real_dev, info);
++ 		}
++ 	}
++ 
++ 	info->so_timestamping = SOF_TIMESTAMPING_RX_SOFTWARE |
++ 				SOF_TIMESTAMPING_SOFTWARE;
++ 	info->phc_index = -1;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> aa6034678e87 (bonding: use rcu_dereference_rtnl when get bonding active slave)
+  static const struct ethtool_ops bond_ethtool_ops = {
+  	.get_drvinfo		= bond_ethtool_get_drvinfo,
+  	.get_link		= ethtool_op_get_link,
+* Unmerged path drivers/net/bonding/bond_main.c
+diff --git a/include/net/bonding.h b/include/net/bonding.h
+index 53a8fa5b023a..8ba97e7024a3 100644
+--- a/include/net/bonding.h
++++ b/include/net/bonding.h
+@@ -344,7 +344,7 @@ static inline bool bond_uses_primary(struct bonding *bond)
+ 
+ static inline struct net_device *bond_option_active_slave_get_rcu(struct bonding *bond)
+ {
+-	struct slave *slave = rcu_dereference(bond->curr_active_slave);
++	struct slave *slave = rcu_dereference_rtnl(bond->curr_active_slave);
+ 
+ 	return bond_uses_primary(bond) && slave ? slave->dev : NULL;
+ }
