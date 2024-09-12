@@ -893,5 +893,6 @@ forward:
 	return;
 
 free_skb:
+	dev_put(tc_priv.fwd_dev);
 	dev_kfree_skb_any(skb);
 }
