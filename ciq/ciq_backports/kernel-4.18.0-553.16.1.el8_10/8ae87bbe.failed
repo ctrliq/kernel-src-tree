@@ -1,0 +1,305 @@
+cifs: introduce cifs_ses_mark_for_reconnect() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Paulo Alcantara <pc@cjr.nz>
+commit 8ae87bbeb5d1bfd4ddf2f73f72be51d02d6be2eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/8ae87bbe.failed
+
+Use new cifs_ses_mark_for_reconnect() helper to mark all session
+channels for reconnect instead of duplicating it in different places.
+
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@cjr.nz>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 8ae87bbeb5d1bfd4ddf2f73f72be51d02d6be2eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+diff --cc fs/cifs/connect.c
+index 81cb3cdf4f3a,67e4c5548e9d..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -4231,6 -4113,189 +4231,192 @@@ cifs_prune_tlinks(struct work_struct *w
+  }
+  
+  #ifdef CONFIG_CIFS_DFS_UPCALL
+++<<<<<<< HEAD
+++=======
++ /* Update dfs referral path of superblock */
++ static int update_server_fullpath(struct TCP_Server_Info *server, struct cifs_sb_info *cifs_sb,
++ 				  const char *target)
++ {
++ 	int rc = 0;
++ 	size_t len = strlen(target);
++ 	char *refpath, *npath;
++ 
++ 	if (unlikely(len < 2 || *target != '\\'))
++ 		return -EINVAL;
++ 
++ 	if (target[1] == '\\') {
++ 		len += 1;
++ 		refpath = kmalloc(len, GFP_KERNEL);
++ 		if (!refpath)
++ 			return -ENOMEM;
++ 
++ 		scnprintf(refpath, len, "%s", target);
++ 	} else {
++ 		len += sizeof("\\");
++ 		refpath = kmalloc(len, GFP_KERNEL);
++ 		if (!refpath)
++ 			return -ENOMEM;
++ 
++ 		scnprintf(refpath, len, "\\%s", target);
++ 	}
++ 
++ 	npath = dfs_cache_canonical_path(refpath, cifs_sb->local_nls, cifs_remap(cifs_sb));
++ 	kfree(refpath);
++ 
++ 	if (IS_ERR(npath)) {
++ 		rc = PTR_ERR(npath);
++ 	} else {
++ 		mutex_lock(&server->refpath_lock);
++ 		kfree(server->leaf_fullpath);
++ 		server->leaf_fullpath = npath;
++ 		mutex_unlock(&server->refpath_lock);
++ 		server->current_fullpath = server->leaf_fullpath;
++ 	}
++ 	return rc;
++ }
++ 
++ static int target_share_matches_server(struct TCP_Server_Info *server, const char *tcp_host,
++ 				       size_t tcp_host_len, char *share, bool *target_match)
++ {
++ 	int rc = 0;
++ 	const char *dfs_host;
++ 	size_t dfs_host_len;
++ 
++ 	*target_match = true;
++ 	extract_unc_hostname(share, &dfs_host, &dfs_host_len);
++ 
++ 	/* Check if hostnames or addresses match */
++ 	if (dfs_host_len != tcp_host_len || strncasecmp(dfs_host, tcp_host, dfs_host_len) != 0) {
++ 		cifs_dbg(FYI, "%s: %.*s doesn't match %.*s\n", __func__, (int)dfs_host_len,
++ 			 dfs_host, (int)tcp_host_len, tcp_host);
++ 		rc = match_target_ip(server, dfs_host, dfs_host_len, target_match);
++ 		if (rc)
++ 			cifs_dbg(VFS, "%s: failed to match target ip: %d\n", __func__, rc);
++ 	}
++ 	return rc;
++ }
++ 
++ static int __tree_connect_dfs_target(const unsigned int xid, struct cifs_tcon *tcon,
++ 				     struct cifs_sb_info *cifs_sb, char *tree, bool islink,
++ 				     struct dfs_cache_tgt_list *tl)
++ {
++ 	int rc;
++ 	struct TCP_Server_Info *server = tcon->ses->server;
++ 	const struct smb_version_operations *ops = server->ops;
++ 	struct cifs_tcon *ipc = tcon->ses->tcon_ipc;
++ 	char *share = NULL, *prefix = NULL;
++ 	const char *tcp_host;
++ 	size_t tcp_host_len;
++ 	struct dfs_cache_tgt_iterator *tit;
++ 	bool target_match;
++ 
++ 	extract_unc_hostname(server->hostname, &tcp_host, &tcp_host_len);
++ 
++ 	tit = dfs_cache_get_tgt_iterator(tl);
++ 	if (!tit) {
++ 		rc = -ENOENT;
++ 		goto out;
++ 	}
++ 
++ 	/* Try to tree connect to all dfs targets */
++ 	for (; tit; tit = dfs_cache_get_next_tgt(tl, tit)) {
++ 		const char *target = dfs_cache_get_tgt_name(tit);
++ 		struct dfs_cache_tgt_list ntl = DFS_CACHE_TGT_LIST_INIT(ntl);
++ 
++ 		kfree(share);
++ 		kfree(prefix);
++ 		share = prefix = NULL;
++ 
++ 		/* Check if share matches with tcp ses */
++ 		rc = dfs_cache_get_tgt_share(server->current_fullpath + 1, tit, &share, &prefix);
++ 		if (rc) {
++ 			cifs_dbg(VFS, "%s: failed to parse target share: %d\n", __func__, rc);
++ 			break;
++ 		}
++ 
++ 		rc = target_share_matches_server(server, tcp_host, tcp_host_len, share,
++ 						 &target_match);
++ 		if (rc)
++ 			break;
++ 		if (!target_match) {
++ 			rc = -EHOSTUNREACH;
++ 			continue;
++ 		}
++ 
++ 		if (ipc->need_reconnect) {
++ 			scnprintf(tree, MAX_TREE_SIZE, "\\\\%s\\IPC$", server->hostname);
++ 			rc = ops->tree_connect(xid, ipc->ses, tree, ipc, cifs_sb->local_nls);
++ 			if (rc)
++ 				break;
++ 		}
++ 
++ 		scnprintf(tree, MAX_TREE_SIZE, "\\%s", share);
++ 		if (!islink) {
++ 			rc = ops->tree_connect(xid, tcon->ses, tree, tcon, cifs_sb->local_nls);
++ 			break;
++ 		}
++ 		/*
++ 		 * If no dfs referrals were returned from link target, then just do a TREE_CONNECT
++ 		 * to it.  Otherwise, cache the dfs referral and then mark current tcp ses for
++ 		 * reconnect so either the demultiplex thread or the echo worker will reconnect to
++ 		 * newly resolved target.
++ 		 */
++ 		if (dfs_cache_find(xid, tcon->ses, cifs_sb->local_nls, cifs_remap(cifs_sb), target,
++ 				   NULL, &ntl)) {
++ 			rc = ops->tree_connect(xid, tcon->ses, tree, tcon, cifs_sb->local_nls);
++ 			if (rc)
++ 				continue;
++ 			rc = dfs_cache_noreq_update_tgthint(server->current_fullpath + 1, tit);
++ 			if (!rc)
++ 				rc = cifs_update_super_prepath(cifs_sb, prefix);
++ 		} else {
++ 			/* Target is another dfs share */
++ 			rc = update_server_fullpath(server, cifs_sb, target);
++ 			dfs_cache_free_tgts(tl);
++ 
++ 			if (!rc) {
++ 				rc = -EREMOTE;
++ 				list_replace_init(&ntl.tl_list, &tl->tl_list);
++ 			} else
++ 				dfs_cache_free_tgts(&ntl);
++ 		}
++ 		break;
++ 	}
++ 
++ out:
++ 	kfree(share);
++ 	kfree(prefix);
++ 
++ 	return rc;
++ }
++ 
++ static int tree_connect_dfs_target(const unsigned int xid, struct cifs_tcon *tcon,
++ 				   struct cifs_sb_info *cifs_sb, char *tree, bool islink,
++ 				   struct dfs_cache_tgt_list *tl)
++ {
++ 	int rc;
++ 	int num_links = 0;
++ 	struct TCP_Server_Info *server = tcon->ses->server;
++ 
++ 	do {
++ 		rc = __tree_connect_dfs_target(xid, tcon, cifs_sb, tree, islink, tl);
++ 		if (!rc || rc != -EREMOTE)
++ 			break;
++ 	} while (rc = -ELOOP, ++num_links < MAX_NESTED_LINKS);
++ 	/*
++ 	 * If we couldn't tree connect to any targets from last referral path, then retry from
++ 	 * original referral path.
++ 	 */
++ 	if (rc && server->current_fullpath != server->origin_fullpath) {
++ 		server->current_fullpath = server->origin_fullpath;
++ 		cifs_ses_mark_for_reconnect(tcon->ses);
++ 	}
++ 
++ 	dfs_cache_free_tgts(tl);
++ 	return rc;
++ }
++ 
+++>>>>>>> 8ae87bbeb5d1 (cifs: introduce cifs_ses_mark_for_reconnect() helper)
+  int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const struct nls_table *nlsc)
+  {
+  	int rc;
+diff --git a/fs/cifs/cifs_swn.c b/fs/cifs/cifs_swn.c
+index 1646ad657e99..bcbaf4e25f94 100644
+--- a/fs/cifs/cifs_swn.c
++++ b/fs/cifs/cifs_swn.c
+@@ -395,26 +395,14 @@ static void cifs_put_swn_reg(struct cifs_swn_reg *swnreg)
+ 
+ static int cifs_swn_resource_state_changed(struct cifs_swn_reg *swnreg, const char *name, int state)
+ {
+-	int i;
+-
+ 	switch (state) {
+ 	case CIFS_SWN_RESOURCE_STATE_UNAVAILABLE:
+ 		cifs_dbg(FYI, "%s: resource name '%s' become unavailable\n", __func__, name);
+-		for (i = 0; i < swnreg->tcon->ses->chan_count; i++) {
+-			spin_lock(&GlobalMid_Lock);
+-			if (swnreg->tcon->ses->chans[i].server->tcpStatus != CifsExiting)
+-				swnreg->tcon->ses->chans[i].server->tcpStatus = CifsNeedReconnect;
+-			spin_unlock(&GlobalMid_Lock);
+-		}
++		cifs_ses_mark_for_reconnect(swnreg->tcon->ses);
+ 		break;
+ 	case CIFS_SWN_RESOURCE_STATE_AVAILABLE:
+ 		cifs_dbg(FYI, "%s: resource name '%s' become available\n", __func__, name);
+-		for (i = 0; i < swnreg->tcon->ses->chan_count; i++) {
+-			spin_lock(&GlobalMid_Lock);
+-			if (swnreg->tcon->ses->chans[i].server->tcpStatus != CifsExiting)
+-				swnreg->tcon->ses->chans[i].server->tcpStatus = CifsNeedReconnect;
+-			spin_unlock(&GlobalMid_Lock);
+-		}
++		cifs_ses_mark_for_reconnect(swnreg->tcon->ses);
+ 		break;
+ 	case CIFS_SWN_RESOURCE_STATE_UNKNOWN:
+ 		cifs_dbg(FYI, "%s: resource name '%s' changed to unknown state\n", __func__, name);
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index 8c76792c0d0f..a4123a4e9e24 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -593,6 +593,7 @@ int cifs_try_adding_channels(struct cifs_sb_info *cifs_sb, struct cifs_ses *ses)
+ bool is_server_using_iface(struct TCP_Server_Info *server,
+ 			   struct cifs_server_iface *iface);
+ bool is_ses_using_iface(struct cifs_ses *ses, struct cifs_server_iface *iface);
++void cifs_ses_mark_for_reconnect(struct cifs_ses *ses);
+ 
+ void extract_unc_hostname(const char *unc, const char **h, size_t *len);
+ int copy_path_name(char *dst, const char *src);
+* Unmerged path fs/cifs/connect.c
+diff --git a/fs/cifs/dfs_cache.c b/fs/cifs/dfs_cache.c
+index 172fc0b3e8f8..c809535618e3 100644
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@ -1354,12 +1354,7 @@ static void mark_for_reconnect_if_needed(struct cifs_tcon *tcon, struct dfs_cach
+ 	}
+ 
+ 	cifs_dbg(FYI, "%s: no cached or matched targets. mark dfs share for reconnect.\n", __func__);
+-	for (i = 0; i < tcon->ses->chan_count; i++) {
+-		spin_lock(&GlobalMid_Lock);
+-		if (tcon->ses->chans[i].server->tcpStatus != CifsExiting)
+-			tcon->ses->chans[i].server->tcpStatus = CifsNeedReconnect;
+-		spin_unlock(&GlobalMid_Lock);
+-	}
++	cifs_ses_mark_for_reconnect(tcon->ses);
+ }
+ 
+ /* Refresh dfs referral of tcon and mark it for reconnect if needed */
+diff --git a/fs/cifs/sess.c b/fs/cifs/sess.c
+index 6ad3594f10a5..7501895ea3f4 100644
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@ -334,6 +334,19 @@ cifs_ses_add_channel(struct cifs_sb_info *cifs_sb, struct cifs_ses *ses,
+ 	return rc;
+ }
+ 
++/* Mark all session channels for reconnect */
++void cifs_ses_mark_for_reconnect(struct cifs_ses *ses)
++{
++	int i;
++
++	for (i = 0; i < ses->chan_count; i++) {
++		spin_lock(&GlobalMid_Lock);
++		if (ses->chans[i].server->tcpStatus != CifsExiting)
++			ses->chans[i].server->tcpStatus = CifsNeedReconnect;
++		spin_unlock(&GlobalMid_Lock);
++	}
++}
++
+ static __u32 cifs_ssetup_hdr(struct cifs_ses *ses, SESSION_SETUP_ANDX *pSMB)
+ {
+ 	__u32 capabilities = 0;
