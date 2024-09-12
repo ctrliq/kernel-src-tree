@@ -1,0 +1,124 @@
+x86/hyperv: Restore VP assist page after cpu offlining/onlining
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit ee6815416380bc069b7dcbdff0682d4c53617527
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/ee681541.failed
+
+Commit e5d9b714fe40 ("x86/hyperv: fix root partition faults when writing
+to VP assist page MSR") moved 'wrmsrl(HV_X64_MSR_VP_ASSIST_PAGE)' under
+'if (*hvp)' condition. This works for root partition as hv_cpu_die()
+does memunmap() and sets 'hv_vp_assist_page[cpu]' to NULL but breaks
+non-root partitions as hv_cpu_die() doesn't free 'hv_vp_assist_page[cpu]'
+for them. This causes VP assist page to remain unset after CPU
+offline/online cycle:
+
+$ rdmsr -p 24 0x40000073
+  10212f001
+$ echo 0 > /sys/devices/system/cpu/cpu24/online
+$ echo 1 > /sys/devices/system/cpu/cpu24/online
+$ rdmsr -p 24 0x40000073
+  0
+
+Fix the issue by always writing to HV_X64_MSR_VP_ASSIST_PAGE in
+hv_cpu_init(). Note, checking 'if (!*hvp)', for root partition is
+pointless as hv_cpu_die() always sets 'hv_vp_assist_page[cpu]' to
+NULL (and it's also NULL initially).
+
+Note: the fact that 'hv_vp_assist_page[cpu]' is reset to NULL may
+present a (potential) issue for KVM. While Hyper-V uses
+CPUHP_AP_ONLINE_DYN stage in CPU hotplug, KVM uses CPUHP_AP_KVM_STARTING
+which comes earlier in CPU teardown sequence. It is theoretically
+possible that Enlightened VMCS is still in use. It is unclear if the
+issue is real and if using KVM with Hyper-V root partition is even
+possible.
+
+While on it, drop the unneeded smp_processor_id() call from hv_cpu_init().
+
+Fixes: e5d9b714fe40 ("x86/hyperv: fix root partition faults when writing to VP assist page MSR")
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+Link: https://lore.kernel.org/r/20221103190601.399343-1-vkuznets@redhat.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit ee6815416380bc069b7dcbdff0682d4c53617527)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/hv_init.c
+diff --cc arch/x86/hyperv/hv_init.c
+index 25613e922aaf,a269049a43ce..000000000000
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@@ -85,7 -76,8 +85,12 @@@ static int hyperv_init_ghcb(void
+  
+  static int hv_cpu_init(unsigned int cpu)
+  {
+++<<<<<<< HEAD
+ +	struct hv_vp_assist_page **hvp = &hv_vp_assist_page[smp_processor_id()];
+++=======
++ 	union hv_vp_assist_msr_contents msr = { 0 };
++ 	struct hv_vp_assist_page **hvp = &hv_vp_assist_page[cpu];
+++>>>>>>> ee6815416380 (x86/hyperv: Restore VP assist page after cpu offlining/onlining)
+  	int ret;
+  
+  	ret = hv_common_cpu_init(cpu);
+@@@ -95,26 -87,32 +100,55 @@@
+  	if (!hv_vp_assist_page)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * The VP ASSIST PAGE is an "overlay" page (see Hyper-V TLFS's Section
+ +	 * 5.2.1 "GPA Overlay Pages"). Here it must be zeroed out to make sure
+ +	 * we always write the EOI MSR in hv_apic_eoi_write() *after* the
+ +	 * EOI optimization is disabled in hv_cpu_die(), otherwise a CPU may
+ +	 * not be stopped in the case of CPU offlining and the VM will hang.
+ +	 */
+ +	if (!*hvp) {
+ +		*hvp = __vmalloc(PAGE_SIZE, GFP_KERNEL | __GFP_ZERO,
+ +				 PAGE_KERNEL);
+ +	}
+ +
+ +	if (*hvp) {
+ +		u64 val;
+ +
+ +		val = vmalloc_to_pfn(*hvp);
+ +		val = (val << HV_X64_MSR_VP_ASSIST_PAGE_ADDRESS_SHIFT) |
+ +			HV_X64_MSR_VP_ASSIST_PAGE_ENABLE;
+ +
+ +		wrmsrl(HV_X64_MSR_VP_ASSIST_PAGE, val);
+++=======
++ 	if (hv_root_partition) {
++ 		/*
++ 		 * For root partition we get the hypervisor provided VP assist
++ 		 * page, instead of allocating a new page.
++ 		 */
++ 		rdmsrl(HV_X64_MSR_VP_ASSIST_PAGE, msr.as_uint64);
++ 		*hvp = memremap(msr.pfn << HV_X64_MSR_VP_ASSIST_PAGE_ADDRESS_SHIFT,
++ 				PAGE_SIZE, MEMREMAP_WB);
++ 	} else {
++ 		/*
++ 		 * The VP assist page is an "overlay" page (see Hyper-V TLFS's
++ 		 * Section 5.2.1 "GPA Overlay Pages"). Here it must be zeroed
++ 		 * out to make sure we always write the EOI MSR in
++ 		 * hv_apic_eoi_write() *after* the EOI optimization is disabled
++ 		 * in hv_cpu_die(), otherwise a CPU may not be stopped in the
++ 		 * case of CPU offlining and the VM will hang.
++ 		 */
++ 		if (!*hvp)
++ 			*hvp = __vmalloc(PAGE_SIZE, GFP_KERNEL | __GFP_ZERO);
++ 		if (*hvp)
++ 			msr.pfn = vmalloc_to_pfn(*hvp);
++ 
++ 	}
++ 	if (!WARN_ON(!(*hvp))) {
++ 		msr.enable = 1;
++ 		wrmsrl(HV_X64_MSR_VP_ASSIST_PAGE, msr.as_uint64);
+++>>>>>>> ee6815416380 (x86/hyperv: Restore VP assist page after cpu offlining/onlining)
+  	}
+  
+  	return hyperv_init_ghcb();
+* Unmerged path arch/x86/hyperv/hv_init.c
