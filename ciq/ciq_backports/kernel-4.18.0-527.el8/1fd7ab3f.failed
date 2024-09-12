@@ -1,0 +1,82 @@
+driver/base/cpu: Retry online operation if -EBUSY
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-527.el8
+commit-author Waiman Long <longman@redhat.com>
+commit 1fd7ab3facfc793c3f99d86752f8eb82db18e03d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-527.el8/1fd7ab3f.failed
+
+Booting the kernel with "maxcpus=1" is a common technique for CPU
+partitioning and isolation. It delays the CPU bringup process until
+when the bootup scripts are ready to bring CPUs online by writing 1 to
+/sys/device/system/cpu/cpu<X>/online. However, it was found that not
+all the CPUs were online after bootup. The collection of offline CPUs
+are different after every reboot.
+
+Further investigation reveals that some "online" write operations
+fail with an -EBUSY error. This error is returned when CPU hotplug is
+temporiarly disabled when cpu_hotplug_disable() is called.
+
+During bootup, the main caller of cpu_hotplug_disable() is
+pci_call_probe() for PCI device initialization. By measuring the times
+spent with cpu_hotplug_disabled set in a typical 2-socket server, most
+of them last less than 10ms.  However, there are a few that can last
+hundreds of ms. Note that the cpu_hotplug_disabled period of different
+devices can overlap leading to longer cpu_hotplug_disabled hold time.
+
+Since the CPU hotplug disable condition is transient and it is not
+that easy to modify all the existing bootup scripts to handle this
+condition, the kernel can help by retrying the online operation when
+an -EBUSY error is returned. This patch retries the online operation
+in cpu_subsys_online() when an -EBUSY error is returned for up to 5
+times after an exponentially increasing delay that can last a total of
+at least 620ms of waiting time by calling msleep().
+
+With this patch in place, booting up the patched kernel with "maxcpus=1"
+does not leave any CPU in an offline state in 10 reboot attempts.
+
+	Reported-by: Vishal Agrawal <vagrawal@redhat.com>
+	Signed-off-by: Waiman Long <longman@redhat.com>
+Link: https://lore.kernel.org/r/20230724143826.3996163-1-longman@redhat.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 1fd7ab3facfc793c3f99d86752f8eb82db18e03d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/cpu.c
+diff --cc drivers/base/cpu.c
+index 03ac83330f5f,4b828f54f9f4..000000000000
+--- a/drivers/base/cpu.c
++++ b/drivers/base/cpu.c
+@@@ -55,7 -57,24 +57,28 @@@ static int cpu_subsys_online(struct dev
+  	if (from_nid == NUMA_NO_NODE)
+  		return -ENODEV;
+  
+++<<<<<<< HEAD
+ +	ret = cpu_up(cpuid);
+++=======
++ retry:
++ 	ret = cpu_device_up(dev);
++ 
++ 	/*
++ 	 * If -EBUSY is returned, it is likely that hotplug is temporarily
++ 	 * disabled when cpu_hotplug_disable() was called. This condition is
++ 	 * transient. So we retry after waiting for an exponentially
++ 	 * increasing delay up to a total of at least 620ms as some PCI
++ 	 * device initialization can take quite a while.
++ 	 */
++ 	if (ret == -EBUSY) {
++ 		retries++;
++ 		if (retries > 5)
++ 			return ret;
++ 		msleep(10 * (1 << retries));
++ 		goto retry;
++ 	}
++ 
+++>>>>>>> 1fd7ab3facfc (driver/base/cpu: Retry online operation if -EBUSY)
+  	/*
+  	 * When hot adding memory to memoryless node and enabling a cpu
+  	 * on the node, node number of the cpu may internally change.
+* Unmerged path drivers/base/cpu.c
