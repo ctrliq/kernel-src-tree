@@ -1,0 +1,165 @@
+net/sched: act_ct: Fix promotion of offloaded unreplied tuple
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-526.el8
+commit-author Paul Blakey <paulb@nvidia.com>
+commit 41f2c7c342d3adb1c4dd5f2e3dd831adff16a669
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-526.el8/41f2c7c3.failed
+
+Currently UNREPLIED and UNASSURED connections are added to the nf flow
+table. This causes the following connection packets to be processed
+by the flow table which then skips conntrack_in(), and thus such the
+connections will remain UNREPLIED and UNASSURED even if reply traffic
+is then seen. Even still, the unoffloaded reply packets are the ones
+triggering hardware update from new to established state, and if
+there aren't any to triger an update and/or previous update was
+missed, hardware can get out of sync with sw and still mark
+packets as new.
+
+Fix the above by:
+1) Not skipping conntrack_in() for UNASSURED packets, but still
+   refresh for hardware, as before the cited patch.
+2) Try and force a refresh by reply-direction packets that update
+   the hardware rules from new to established state.
+3) Remove any bidirectional flows that didn't failed to update in
+   hardware for re-insertion as bidrectional once any new packet
+   arrives.
+
+Fixes: 6a9bad0069cf ("net/sched: act_ct: offload UDP NEW connections")
+Co-developed-by: Vlad Buslov <vladbu@nvidia.com>
+	Signed-off-by: Vlad Buslov <vladbu@nvidia.com>
+	Signed-off-by: Paul Blakey <paulb@nvidia.com>
+	Reviewed-by: Florian Westphal <fw@strlen.de>
+Link: https://lore.kernel.org/r/1686313379-117663-1-git-send-email-paulb@nvidia.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit 41f2c7c342d3adb1c4dd5f2e3dd831adff16a669)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_flow_table_core.c
+#	net/netfilter/nf_flow_table_ip.c
+diff --cc net/netfilter/nf_flow_table_core.c
+index 30240bbee53e,b0ef48b21dcb..000000000000
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@@ -379,8 -428,9 +385,14 @@@ nf_flow_table_iterate(struct nf_flowtab
+  static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+  				    struct flow_offload *flow, void *data)
+  {
+++<<<<<<< HEAD
+ +
+ +	if (nf_flow_has_expired(flow) || nf_ct_is_dying(flow->ct))
+++=======
++ 	if (nf_flow_has_expired(flow) ||
++ 	    nf_ct_is_dying(flow->ct) ||
++ 	    nf_flow_is_outdated(flow))
+++>>>>>>> 41f2c7c342d3 (net/sched: act_ct: Fix promotion of offloaded unreplied tuple)
+  		flow_offload_teardown(flow);
+  
+  	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags)) {
+diff --cc net/netfilter/nf_flow_table_ip.c
+index f694fef056a0,3bbaf9c7ea46..000000000000
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@@ -282,12 -381,19 +282,20 @@@ nf_flow_offload_ip_hook(void *priv, str
+  		return NF_ACCEPT;
+  	}
+  
+ -	if (skb_try_make_writable(skb, thoff + hdrsize))
+ +	if (nf_flow_nat_ip(flow, skb, thoff, dir) < 0)
+  		return NF_DROP;
+  
+++<<<<<<< HEAD
+++=======
++ 	flow_offload_refresh(flow_table, flow, false);
++ 
++ 	nf_flow_encap_pop(skb, tuplehash);
++ 	thoff -= offset;
++ 
+++>>>>>>> 41f2c7c342d3 (net/sched: act_ct: Fix promotion of offloaded unreplied tuple)
+  	iph = ip_hdr(skb);
+ -	nf_flow_nat_ip(flow, skb, thoff, dir, iph);
+ -
+  	ip_decrease_ttl(iph);
+ -	skb_clear_tstamp(skb);
+ +	skb->tstamp = 0;
+  
+  	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
+  		nf_ct_acct_update(flow->ct, tuplehash->tuple.dir, skb->len);
+@@@ -515,15 -647,18 +523,21 @@@ nf_flow_offload_ipv6_hook(void *priv, s
+  		return NF_ACCEPT;
+  	}
+  
+ -	if (skb_try_make_writable(skb, thoff + hdrsize))
+ +	if (skb_try_make_writable(skb, sizeof(*ip6h)))
+  		return NF_DROP;
+  
+++<<<<<<< HEAD
+ +	if (nf_flow_nat_ipv6(flow, skb, dir) < 0)
+ +		return NF_DROP;
+++=======
++ 	flow_offload_refresh(flow_table, flow, false);
++ 
++ 	nf_flow_encap_pop(skb, tuplehash);
+++>>>>>>> 41f2c7c342d3 (net/sched: act_ct: Fix promotion of offloaded unreplied tuple)
+  
+  	ip6h = ipv6_hdr(skb);
+ -	nf_flow_nat_ipv6(flow, skb, dir, ip6h);
+ -
+  	ip6h->hop_limit--;
+ -	skb_clear_tstamp(skb);
+ +	skb->tstamp = 0;
+  
+  	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
+  		nf_ct_acct_update(flow->ct, tuplehash->tuple.dir, skb->len);
+diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
+index 5cb275c17a88..007e2da5ff2d 100644
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -214,7 +214,7 @@ int flow_offload_route_init(struct flow_offload *flow,
+ 
+ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow);
+ void flow_offload_refresh(struct nf_flowtable *flow_table,
+-			  struct flow_offload *flow);
++			  struct flow_offload *flow, bool force);
+ 
+ struct flow_offload_tuple_rhash *flow_offload_lookup(struct nf_flowtable *flow_table,
+ 						     struct flow_offload_tuple *tuple);
+* Unmerged path net/netfilter/nf_flow_table_core.c
+* Unmerged path net/netfilter/nf_flow_table_ip.c
+diff --git a/net/sched/act_ct.c b/net/sched/act_ct.c
+index adb56fcdd4bd..c6e4205b50fe 100644
+--- a/net/sched/act_ct.c
++++ b/net/sched/act_ct.c
+@@ -526,6 +526,7 @@ static bool tcf_ct_flow_table_lookup(struct tcf_ct_params *p,
+ 	struct flow_offload_tuple tuple = {};
+ 	enum ip_conntrack_info ctinfo;
+ 	struct tcphdr *tcph = NULL;
++	bool force_refresh = false;
+ 	struct flow_offload *flow;
+ 	struct nf_conn *ct;
+ 	u8 dir;
+@@ -563,6 +564,7 @@ static bool tcf_ct_flow_table_lookup(struct tcf_ct_params *p,
+ 			 * established state, then don't refresh.
+ 			 */
+ 			return false;
++		force_refresh = true;
+ 	}
+ 
+ 	if (tcph && (unlikely(tcph->fin || tcph->rst))) {
+@@ -576,7 +578,12 @@ static bool tcf_ct_flow_table_lookup(struct tcf_ct_params *p,
+ 	else
+ 		ctinfo = IP_CT_ESTABLISHED_REPLY;
+ 
+-	flow_offload_refresh(nf_ft, flow);
++	flow_offload_refresh(nf_ft, flow, force_refresh);
++	if (!test_bit(IPS_ASSURED_BIT, &ct->status)) {
++		/* Process this flow in SW to allow promoting to ASSURED */
++		return false;
++	}
++
+ 	nf_conntrack_get(&ct->ct_general);
+ 	nf_ct_set(skb, ct, ctinfo);
+ 	if (nf_ft->flags & NF_FLOWTABLE_COUNTER)
