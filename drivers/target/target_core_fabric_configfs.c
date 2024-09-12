@@ -528,7 +528,7 @@ static ssize_t target_fabric_port_alua_tg_pt_gp_show(struct config_item *item,
 {
 	struct se_lun *lun = item_to_lun(item);
 
-	if (!lun || !lun->lun_se_dev)
+	if (!lun->lun_se_dev)
 		return -ENODEV;
 
 	return core_alua_show_tg_pt_gp_info(lun, page);
@@ -539,7 +539,7 @@ static ssize_t target_fabric_port_alua_tg_pt_gp_store(struct config_item *item,
 {
 	struct se_lun *lun = item_to_lun(item);
 
-	if (!lun || !lun->lun_se_dev)
+	if (!lun->lun_se_dev)
 		return -ENODEV;
 
 	return core_alua_store_tg_pt_gp_info(lun, page, count);
@@ -550,7 +550,7 @@ static ssize_t target_fabric_port_alua_tg_pt_offline_show(
 {
 	struct se_lun *lun = item_to_lun(item);
 
-	if (!lun || !lun->lun_se_dev)
+	if (!lun->lun_se_dev)
 		return -ENODEV;
 
 	return core_alua_show_offline_bit(lun, page);
@@ -561,7 +561,7 @@ static ssize_t target_fabric_port_alua_tg_pt_offline_store(
 {
 	struct se_lun *lun = item_to_lun(item);
 
-	if (!lun || !lun->lun_se_dev)
+	if (!lun->lun_se_dev)
 		return -ENODEV;
 
 	return core_alua_store_offline_bit(lun, page, count);
@@ -572,7 +572,7 @@ static ssize_t target_fabric_port_alua_tg_pt_status_show(
 {
 	struct se_lun *lun = item_to_lun(item);
 
-	if (!lun || !lun->lun_se_dev)
+	if (!lun->lun_se_dev)
 		return -ENODEV;
 
 	return core_alua_show_secondary_status(lun, page);
@@ -583,7 +583,7 @@ static ssize_t target_fabric_port_alua_tg_pt_status_store(
 {
 	struct se_lun *lun = item_to_lun(item);
 
-	if (!lun || !lun->lun_se_dev)
+	if (!lun->lun_se_dev)
 		return -ENODEV;
 
 	return core_alua_store_secondary_status(lun, page, count);
@@ -594,7 +594,7 @@ static ssize_t target_fabric_port_alua_tg_pt_write_md_show(
 {
 	struct se_lun *lun = item_to_lun(item);
 
-	if (!lun || !lun->lun_se_dev)
+	if (!lun->lun_se_dev)
 		return -ENODEV;
 
 	return core_alua_show_secondary_write_metadata(lun, page);
@@ -605,7 +605,7 @@ static ssize_t target_fabric_port_alua_tg_pt_write_md_store(
 {
 	struct se_lun *lun = item_to_lun(item);
 
-	if (!lun || !lun->lun_se_dev)
+	if (!lun->lun_se_dev)
 		return -ENODEV;
 
 	return core_alua_store_secondary_write_metadata(lun, page, count);
