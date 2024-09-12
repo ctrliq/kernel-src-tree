@@ -1,0 +1,267 @@
+netfilter: conntrack: ignore overly delayed tcp packets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 6e250dcbff1d3ce347b8294e4ec6da96a2cecdb5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/6e250dcb.failed
+
+If 'nf_conntrack_tcp_loose' is off (the default), tcp packets that are
+outside of the current window are marked as INVALID.
+
+nf/iptables rulesets often drop such packets via 'ct state invalid' or
+similar checks.
+
+For overly delayed acks, this can be a nuisance if such 'invalid' packets
+are also logged.
+
+Since they are not invalid in a strict sense, just ignore them, i.e.
+conntrack won't extend timeout or change state so that they do not match
+invalid state rules anymore.
+
+This also avoids unwantend connection stalls in case conntrack considers
+retransmission (of data that did not reach the peer) as too old.
+
+The else branch of the conditional becomes obsolete.
+Next patch will reformant the now always-true if condition.
+
+The existing workaround for data that exceeds the calculated receive
+window is adjusted to use the 'ignore' state so that these packets do
+not refresh the timeout or change state other than updating ->td_end.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 6e250dcbff1d3ce347b8294e4ec6da96a2cecdb5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_proto_tcp.c
+diff --cc net/netfilter/nf_conntrack_proto_tcp.c
+index f9bb6bbd54e2,2d6925ef269f..000000000000
+--- a/net/netfilter/nf_conntrack_proto_tcp.c
++++ b/net/netfilter/nf_conntrack_proto_tcp.c
+@@@ -64,6 -47,12 +64,15 @@@ static const char *const tcp_conntrack_
+  	"SYN_SENT2",
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum nf_ct_tcp_action {
++ 	NFCT_TCP_IGNORE,
++ 	NFCT_TCP_INVALID,
++ 	NFCT_TCP_ACCEPT,
++ };
++ 
+++>>>>>>> 6e250dcbff1d (netfilter: conntrack: ignore overly delayed tcp packets)
+  #define SECS * HZ
+  #define MINS * 60 SECS
+  #define HOURS * 60 MINS
+@@@ -489,23 -478,45 +498,51 @@@ static void tcp_init_sender(struct ip_c
+  	}
+  }
+  
+ -__printf(6, 7)
+ -static enum nf_ct_tcp_action nf_tcp_log_invalid(const struct sk_buff *skb,
+ -						const struct nf_conn *ct,
+ -						const struct nf_hook_state *state,
+ -						const struct ip_ct_tcp_state *sender,
+ -						enum nf_ct_tcp_action ret,
+ -						const char *fmt, ...)
+ +static bool tcp_in_window(const struct nf_conn *ct,
+ +			  struct ip_ct_tcp *state,
+ +			  enum ip_conntrack_dir dir,
+ +			  unsigned int index,
+ +			  const struct sk_buff *skb,
+ +			  unsigned int dataoff,
+ +			  const struct tcphdr *tcph)
+  {
+++<<<<<<< HEAD
+ +	struct net *net = nf_ct_net(ct);
+ +	struct nf_tcp_net *tn = nf_tcp_pernet(net);
+++=======
++ 	const struct nf_tcp_net *tn = nf_tcp_pernet(nf_ct_net(ct));
++ 	struct va_format vaf;
++ 	va_list args;
++ 	bool be_liberal;
++ 
++ 	be_liberal = sender->flags & IP_CT_TCP_FLAG_BE_LIBERAL || tn->tcp_be_liberal;
++ 	if (be_liberal)
++ 		return NFCT_TCP_ACCEPT;
++ 
++ 	va_start(args, fmt);
++ 	vaf.fmt = fmt;
++ 	vaf.va = &args;
++ 	nf_ct_l4proto_log_invalid(skb, ct, state, "%pV", &vaf);
++ 	va_end(args);
++ 
++ 	return ret;
++ }
++ 
++ static enum nf_ct_tcp_action
++ tcp_in_window(struct nf_conn *ct, enum ip_conntrack_dir dir,
++ 	      unsigned int index, const struct sk_buff *skb,
++ 	      unsigned int dataoff, const struct tcphdr *tcph,
++ 	      const struct nf_hook_state *hook_state)
++ {
++ 	struct ip_ct_tcp *state = &ct->proto.tcp;
+++>>>>>>> 6e250dcbff1d (netfilter: conntrack: ignore overly delayed tcp packets)
+  	struct ip_ct_tcp_state *sender = &state->seen[dir];
+  	struct ip_ct_tcp_state *receiver = &state->seen[!dir];
+ +	const struct nf_conntrack_tuple *tuple = &ct->tuplehash[dir].tuple;
+  	__u32 seq, ack, sack, end, win, swin;
+ -	bool in_recv_win, seq_ok;
+ -	s32 receiver_offset;
+  	u16 win_raw;
+ +	s32 receiver_offset;
+ +	bool res, in_recv_win;
+  
+  	/*
+  	 * Get the required data from the packet.
+@@@ -613,31 -612,58 +650,85 @@@
+  		 */
+  		seq = end = sender->td_end;
+  
+++<<<<<<< HEAD
+ +	pr_debug("tcp_in_window: ");
+ +	nf_ct_dump_tuple(tuple);
+ +	pr_debug("seq=%u ack=%u+(%d) sack=%u+(%d) win=%u end=%u\n",
+ +		 seq, ack, receiver_offset, sack, receiver_offset, win, end);
+ +	pr_debug("tcp_in_window: sender end=%u maxend=%u maxwin=%u scale=%i "
+ +		 "receiver end=%u maxend=%u maxwin=%u scale=%i\n",
+ +		 sender->td_end, sender->td_maxend, sender->td_maxwin,
+ +		 sender->td_scale,
+ +		 receiver->td_end, receiver->td_maxend, receiver->td_maxwin,
+ +		 receiver->td_scale);
+++=======
++ 	seq_ok = before(seq, sender->td_maxend + 1);
++ 	if (!seq_ok) {
++ 		u32 overshot = end - sender->td_maxend + 1;
++ 		bool ack_ok;
++ 
++ 		ack_ok = after(sack, receiver->td_end - MAXACKWINDOW(sender) - 1);
++ 		in_recv_win = receiver->td_maxwin &&
++ 			      after(end, sender->td_end - receiver->td_maxwin - 1);
++ 
++ 		if (in_recv_win &&
++ 		    ack_ok &&
++ 		    overshot <= receiver->td_maxwin &&
++ 		    before(sack, receiver->td_end + 1)) {
++ 			/* Work around TCPs that send more bytes than allowed by
++ 			 * the receive window.
++ 			 *
++ 			 * If the (marked as invalid) packet is allowed to pass by
++ 			 * the ruleset and the peer acks this data, then its possible
++ 			 * all future packets will trigger 'ACK is over upper bound' check.
++ 			 *
++ 			 * Thus if only the sequence check fails then do update td_end so
++ 			 * possible ACK for this data can update internal state.
++ 			 */
++ 			sender->td_end = end;
++ 			sender->flags |= IP_CT_TCP_FLAG_DATA_UNACKNOWLEDGED;
++ 
++ 			return nf_tcp_log_invalid(skb, ct, hook_state, sender, NFCT_TCP_IGNORE,
++ 						  "%u bytes more than expected", overshot);
++ 		}
++ 
++ 		return nf_tcp_log_invalid(skb, ct, hook_state, sender, NFCT_TCP_INVALID,
++ 					  "SEQ is over upper bound %u (over the window of the receiver)",
++ 					  sender->td_maxend + 1);
++ 	}
++ 
++ 	if (!before(sack, receiver->td_end + 1))
++ 		return nf_tcp_log_invalid(skb, ct, hook_state, sender, NFCT_TCP_INVALID,
++ 					  "ACK is over upper bound %u (ACKed data not seen yet)",
++ 					  receiver->td_end + 1);
+++>>>>>>> 6e250dcbff1d (netfilter: conntrack: ignore overly delayed tcp packets)
+  
+  	/* Is the ending sequence in the receive window (if available)? */
+  	in_recv_win = !receiver->td_maxwin ||
+  		      after(end, sender->td_end - receiver->td_maxwin - 1);
+++<<<<<<< HEAD
+ +
+ +	pr_debug("tcp_in_window: I=%i II=%i III=%i IV=%i\n",
+ +		 before(seq, sender->td_maxend + 1),
+ +		 (in_recv_win ? 1 : 0),
+ +		 before(sack, receiver->td_end + 1),
+ +		 after(sack, receiver->td_end - MAXACKWINDOW(sender) - 1));
+ +
+ +	if (before(seq, sender->td_maxend + 1) &&
+ +	    in_recv_win &&
+ +	    before(sack, receiver->td_end + 1) &&
+ +	    after(sack, receiver->td_end - MAXACKWINDOW(sender) - 1)) {
+++=======
++ 	if (!in_recv_win)
++ 		return nf_tcp_log_invalid(skb, ct, hook_state, sender, NFCT_TCP_IGNORE,
++ 					  "SEQ is under lower bound %u (already ACKed data retransmitted)",
++ 					  sender->td_end - receiver->td_maxwin - 1);
++ 	if (!after(sack, receiver->td_end - MAXACKWINDOW(sender) - 1))
++ 		return nf_tcp_log_invalid(skb, ct, hook_state, sender, NFCT_TCP_IGNORE,
++ 					  "ignored ACK under lower bound %u (possible overly delayed)",
++ 					  receiver->td_end - MAXACKWINDOW(sender) - 1);
++ 	if (1) {
+++>>>>>>> 6e250dcbff1d (netfilter: conntrack: ignore overly delayed tcp packets)
+  		/*
+  		 * Take into account window scaling (RFC 1323).
+  		 */
+@@@ -694,32 -720,9 +785,35 @@@
+  				state->retrans = 0;
+  			}
+  		}
+++<<<<<<< HEAD
+ +		res = true;
+ +	} else {
+ +		res = false;
+ +		if (sender->flags & IP_CT_TCP_FLAG_BE_LIBERAL ||
+ +		    tn->tcp_be_liberal)
+ +			res = true;
+ +		if (!res) {
+ +			nf_ct_l4proto_log_invalid(skb, ct,
+ +			"%s",
+ +			before(seq, sender->td_maxend + 1) ?
+ +			in_recv_win ?
+ +			before(sack, receiver->td_end + 1) ?
+ +			after(sack, receiver->td_end - MAXACKWINDOW(sender) - 1) ? "BUG"
+ +			: "ACK is under the lower bound (possible overly delayed ACK)"
+ +			: "ACK is over the upper bound (ACKed data not seen yet)"
+ +			: "SEQ is under the lower bound (already ACKed data retransmitted)"
+ +			: "SEQ is over the upper bound (over the window of the receiver)");
+ +		}
+++=======
+++>>>>>>> 6e250dcbff1d (netfilter: conntrack: ignore overly delayed tcp packets)
+  	}
+  
+ -	return NFCT_TCP_ACCEPT;
+ +	pr_debug("tcp_in_window: res=%u sender end=%u maxend=%u maxwin=%u "
+ +		 "receiver end=%u maxend=%u maxwin=%u\n",
+ +		 res, sender->td_end, sender->td_maxend, sender->td_maxwin,
+ +		 receiver->td_end, receiver->td_maxend, receiver->td_maxwin);
+ +
+ +	return res;
+  }
+  
+  /* table of valid flag combinations - PUSH, ECE and CWR are always valid */
+@@@ -1119,10 -1150,17 +1214,22 @@@ int nf_conntrack_tcp_packet(struct nf_c
+  		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!tcp_in_window(ct, &ct->proto.tcp, dir, index,
+ +			   skb, dataoff, th)) {
+++=======
++ 	res = tcp_in_window(ct, dir, index,
++ 			    skb, dataoff, th, state);
++ 	switch (res) {
++ 	case NFCT_TCP_IGNORE:
++ 		spin_unlock_bh(&ct->lock);
++ 		return NF_ACCEPT;
++ 	case NFCT_TCP_INVALID:
+++>>>>>>> 6e250dcbff1d (netfilter: conntrack: ignore overly delayed tcp packets)
+  		spin_unlock_bh(&ct->lock);
+  		return -NF_ACCEPT;
++ 	case NFCT_TCP_ACCEPT:
++ 		break;
+  	}
+       in_window:
+  	/* From now on we have got in-window packets */
+* Unmerged path net/netfilter/nf_conntrack_proto_tcp.c
