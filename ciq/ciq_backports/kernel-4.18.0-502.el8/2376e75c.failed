@@ -1,0 +1,138 @@
+arm64: sdei: explicitly simulate PAN/UAO entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit 2376e75cc77eeb80bf30447f35e9ceb0997508a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/2376e75c.failed
+
+In preparation for removing addr_limit and set_fs() we must decouple the
+SDEI PAN/UAO manipulation from the uaccess code, and explicitly
+reinitialize these as required.
+
+SDEI enters the kernel with a non-architectural exception, and prior to
+the most recent revision of the specification (ARM DEN 0054B), PSTATE
+bits (e.g. PAN, UAO) are not manipulated in the same way as for
+architectural exceptions. Notably, older versions of the spec can be
+read ambiguously as to whether PSTATE bits are inherited unchanged from
+the interrupted context or whether they are generated from scratch, with
+TF-A doing the latter.
+
+We have three cases to consider:
+
+1) The existing TF-A implementation of SDEI will clear PAN and clear UAO
+   (along with other bits in PSTATE) when delivering an SDEI exception.
+
+2) In theory, implementations of SDEI prior to revision B could inherit
+   PAN and UAO (along with other bits in PSTATE) unchanged from the
+   interrupted context. However, in practice such implementations do not
+   exist.
+
+3) Going forward, new implementations of SDEI must clear UAO, and
+   depending on SCTLR_ELx.SPAN must either inherit or set PAN.
+
+As we can ignore (2) we can assume that upon SDEI entry, UAO is always
+clear, though PAN may be clear, inherited, or set per SCTLR_ELx.SPAN.
+Therefore, we must explicitly initialize PAN, but do not need to do
+anything for UAO.
+
+Considering what we need to do:
+
+* When set_fs() is removed, force_uaccess_begin() will have no HW
+  side-effects. As this only clears UAO, which we can assume has already
+  been cleared upon entry, this is not a problem. We do not need to add
+  code to manipulate UAO explicitly.
+
+* PAN may be cleared upon entry (in case 1 above), so where a kernel is
+  built to use PAN and this is supported by all CPUs, the kernel must
+  set PAN upon entry to ensure expected behaviour.
+
+* PAN may be inherited from the interrupted context (in case 3 above),
+  and so where a kernel is not built to use PAN or where PAN support is
+  not uniform across CPUs, the kernel must clear PAN to ensure expected
+  behaviour.
+
+This patch reworks the SDEI code accordingly, explicitly setting PAN to
+the expected state in all cases. To cater for the cases where the kernel
+does not use PAN or this is not uniformly supported by hardware we add a
+new cpu_has_pan() helper which can be used regardless of whether the
+kernel is built to use PAN.
+
+The existing system_uses_ttbr0_pan() is redefined in terms of
+system_uses_hw_pan() both for clarity and as a minor optimization when
+HW PAN is not selected.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Reviewed-by: James Morse <james.morse@arm.com>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20201202131558.39270-3-mark.rutland@arm.com
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit 2376e75cc77eeb80bf30447f35e9ceb0997508a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/sdei.c
+diff --cc arch/arm64/kernel/sdei.c
+index e396e69e33a1,c9640e50967a..000000000000
+--- a/arch/arm64/kernel/sdei.c
++++ b/arch/arm64/kernel/sdei.c
+@@@ -251,6 -242,15 +272,18 @@@ asmlinkage __kprobes notrace unsigned l
+  __sdei_handler(struct pt_regs *regs, struct sdei_registered_event *arg)
+  {
+  	unsigned long ret;
+++<<<<<<< HEAD
+++=======
++ 	mm_segment_t orig_addr_limit;
++ 
++ 	/*
++ 	 * We didn't take an exception to get here, so the HW hasn't
++ 	 * set/cleared bits in PSTATE that we may rely on. Initialize PAN, then
++ 	 * use force_uaccess_begin() to reset addr_limit.
++ 	 */
++ 	__sdei_pstate_entry();
++ 	orig_addr_limit = force_uaccess_begin();
+++>>>>>>> 2376e75cc77e (arm64: sdei: explicitly simulate PAN/UAO entry)
+  
+  	nmi_enter();
+  
+diff --git a/arch/arm64/include/asm/cpufeature.h b/arch/arm64/include/asm/cpufeature.h
+index 7ce568ab9b0b..1ae84cc86580 100644
+--- a/arch/arm64/include/asm/cpufeature.h
++++ b/arch/arm64/include/asm/cpufeature.h
+@@ -700,10 +700,16 @@ static __always_inline bool system_supports_fpsimd(void)
+ 	return !cpus_have_const_cap(ARM64_HAS_NO_FPSIMD);
+ }
+ 
++static inline bool system_uses_hw_pan(void)
++{
++	return IS_ENABLED(CONFIG_ARM64_PAN) &&
++		cpus_have_const_cap(ARM64_HAS_PAN);
++}
++
+ static inline bool system_uses_ttbr0_pan(void)
+ {
+ 	return IS_ENABLED(CONFIG_ARM64_SW_TTBR0_PAN) &&
+-		!cpus_have_const_cap(ARM64_HAS_PAN);
++		!system_uses_hw_pan();
+ }
+ 
+ static __always_inline bool system_supports_sve(void)
+@@ -816,6 +822,13 @@ static inline bool cpu_has_hw_af(void)
+ 						ID_AA64MMFR1_HADBS_SHIFT);
+ }
+ 
++static inline bool cpu_has_pan(void)
++{
++	u64 mmfr1 = read_cpuid(ID_AA64MMFR1_EL1);
++	return cpuid_feature_extract_unsigned_field(mmfr1,
++						    ID_AA64MMFR1_PAN_SHIFT);
++}
++
+ #ifdef CONFIG_ARM64_AMU_EXTN
+ /* Check whether the cpu supports the Activity Monitors Unit (AMU) */
+ extern bool cpu_has_amu_feat(int cpu);
+* Unmerged path arch/arm64/kernel/sdei.c
