@@ -24,6 +24,19 @@ struct psample_metadata {
 	u8 out_tc_valid:1,
 	   out_tc_occ_valid:1,
 	   latency_valid:1,
+	   unused:5;
+};
+
+struct rh_psample_metadata {
+	u32 trunc_size;
+	int in_ifindex;
+	int out_ifindex;
+	u16 out_tc;
+	u64 out_tc_occ;	/* bytes */
+	u64 latency;	/* nanoseconds */
+	u8 out_tc_valid:1,
+	   out_tc_occ_valid:1,
+	   latency_valid:1,
 	   rate_as_probability:1,
 	   unused:4;
 	const u8 *user_cookie;
@@ -38,16 +51,25 @@ struct sk_buff;
 
 #if IS_ENABLED(CONFIG_PSAMPLE)
 
-void psample_sample_packet(struct psample_group *group,
-			   const struct sk_buff *skb, u32 sample_rate,
-			   const struct psample_metadata *md);
+void psample_sample_packet(struct psample_group *group, struct sk_buff *skb,
+			   u32 sample_rate, const struct psample_metadata *md);
+
+void rh_psample_sample_packet(struct psample_group *group,
+			      const struct sk_buff *skb, u32 sample_rate,
+			      const struct rh_psample_metadata *md);
 
 #else
 
 static inline void psample_sample_packet(struct psample_group *group,
-					 const struct sk_buff *skb,
-					 u32 sample_rate,
+					 struct sk_buff *skb, u32 sample_rate,
 					 const struct psample_metadata *md)
+{
+}
+
+static inline void
+rh_psample_sample_packet(struct psample_group *group,
+			 const struct sk_buff *skb, u32 sample_rate,
+			 const struct rh_psample_metadata *md)
 {
 }
 
