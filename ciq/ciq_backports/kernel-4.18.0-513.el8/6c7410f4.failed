@@ -1,0 +1,200 @@
+gfs2: gfs2_freeze_lock_shared cleanup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-513.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 6c7410f44961cf72d49a18e455ad4ae833f6fb7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-513.el8/6c7410f4.failed
+
+All the remaining users of gfs2_freeze_lock_shared() set freeze_gh to
+&sdp->sd_freeze_gh and flags to 0, so remove those two parameters.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 6c7410f44961cf72d49a18e455ad4ae833f6fb7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/ops_fstype.c
+#	fs/gfs2/super.c
+diff --cc fs/gfs2/ops_fstype.c
+index 698fc2257f73,9375409fd0c5..000000000000
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@@ -1244,7 -1267,7 +1244,11 @@@ static int gfs2_fill_super(struct super
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	error = gfs2_freeze_lock_shared(sdp, &freeze_gh, 0);
+++=======
++ 	error = gfs2_freeze_lock_shared(sdp);
+++>>>>>>> 6c7410f44961 (gfs2: gfs2_freeze_lock_shared cleanup)
+  	if (error)
+  		goto fail_per_node;
+  
+diff --cc fs/gfs2/super.c
+index 62f48d6e172b,9f4d5d6549ee..000000000000
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@@ -389,8 -375,14 +389,19 @@@ static int gfs2_lock_fs_check_clean(str
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (error)
+ +		gfs2_freeze_unlock(&sdp->sd_freeze_gh);
+++=======
++ 	if (!error)
++ 		goto out;  /* success */
++ 
++ 	gfs2_freeze_unlock(&sdp->sd_freeze_gh);
++ 
++ relock_shared:
++ 	error2 = gfs2_freeze_lock_shared(sdp);
++ 	gfs2_assert_withdraw(sdp, !error2);
+++>>>>>>> 6c7410f44961 (gfs2: gfs2_freeze_lock_shared cleanup)
+  
+  out:
+  	while (!list_empty(&list)) {
+@@@ -679,31 -684,75 +690,72 @@@ static int gfs2_sync_fs(struct super_bl
+  	return sdp->sd_log_error;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int gfs2_freeze_locally(struct gfs2_sbd *sdp)
++ {
++ 	struct super_block *sb = sdp->sd_vfs;
++ 	int error;
++ 
++ 	error = freeze_super(sb);
++ 	if (error)
++ 		return error;
++ 
++ 	if (test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags)) {
++ 		gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_FREEZE |
++ 			       GFS2_LFC_FREEZE_GO_SYNC);
++ 		if (gfs2_withdrawn(sdp)) {
++ 			thaw_super(sb);
++ 			return -EIO;
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ static int gfs2_do_thaw(struct gfs2_sbd *sdp)
++ {
++ 	struct super_block *sb = sdp->sd_vfs;
++ 	int error;
++ 
++ 	error = gfs2_freeze_lock_shared(sdp);
++ 	if (error)
++ 		goto fail;
++ 	error = thaw_super(sb);
++ 	if (!error)
++ 		return 0;
++ 
++ fail:
++ 	fs_info(sdp, "GFS2: couldn't thaw filesystem: %d\n", error);
++ 	gfs2_assert_withdraw(sdp, 0);
++ 	return error;
++ }
++ 
+++>>>>>>> 6c7410f44961 (gfs2: gfs2_freeze_lock_shared cleanup)
+  void gfs2_freeze_func(struct work_struct *work)
+  {
+ +	int error;
+ +	struct gfs2_holder freeze_gh;
+  	struct gfs2_sbd *sdp = container_of(work, struct gfs2_sbd, sd_freeze_work);
+  	struct super_block *sb = sdp->sd_vfs;
+ -	int error;
+ -
+ -	mutex_lock(&sdp->sd_freeze_mutex);
+ -	error = -EBUSY;
+ -	if (test_bit(SDF_FROZEN, &sdp->sd_flags))
+ -		goto freeze_failed;
+  
+ -	error = gfs2_freeze_locally(sdp);
+ -	if (error)
+ -		goto freeze_failed;
+ -
+ -	gfs2_freeze_unlock(&sdp->sd_freeze_gh);
+ -	set_bit(SDF_FROZEN, &sdp->sd_flags);
+ -
+ -	error = gfs2_do_thaw(sdp);
+ -	if (error)
+ -		goto out;
+ -
+ -	clear_bit(SDF_FROZEN, &sdp->sd_flags);
+ -	goto out;
+ -
+ -freeze_failed:
+ -	fs_info(sdp, "GFS2: couldn't freeze filesystem: %d\n", error);
+ -
+ -out:
+ -	mutex_unlock(&sdp->sd_freeze_mutex);
+ +	atomic_inc(&sb->s_active);
+ +	error = gfs2_freeze_lock_shared(sdp, &freeze_gh, 0);
+ +	if (error) {
+ +		gfs2_assert_withdraw(sdp, 0);
+ +	} else {
+ +		atomic_set(&sdp->sd_freeze_state, SFS_UNFROZEN);
+ +		error = thaw_super(sb);
+ +		if (error) {
+ +			fs_info(sdp, "GFS2: couldn't thaw filesystem: %d\n",
+ +				error);
+ +			gfs2_assert_withdraw(sdp, 0);
+ +		}
+ +		gfs2_freeze_unlock(&freeze_gh);
+ +	}
+  	deactivate_super(sb);
+ +	clear_bit(SDF_FS_FROZEN, &sdp->sd_flags);
+ +	wake_up_bit(&sdp->sd_flags, SDF_FS_FROZEN);
+ +	return;
+  }
+  
+  /**
+* Unmerged path fs/gfs2/ops_fstype.c
+* Unmerged path fs/gfs2/super.c
+diff --git a/fs/gfs2/util.c b/fs/gfs2/util.c
+index 8db57f0f2c81..e968aa77eb5f 100644
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@ -97,17 +97,14 @@ int check_journal_clean(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
+ /**
+  * gfs2_freeze_lock_shared - hold the freeze glock
+  * @sdp: the superblock
+- * @freeze_gh: pointer to the requested holder
+- * @caller_flags: any additional flags needed by the caller
+  */
+-int gfs2_freeze_lock_shared(struct gfs2_sbd *sdp, struct gfs2_holder *freeze_gh,
+-			    int caller_flags)
++int gfs2_freeze_lock_shared(struct gfs2_sbd *sdp)
+ {
+-	int flags = LM_FLAG_NOEXP | GL_EXACT | caller_flags;
++	int flags = LM_FLAG_NOEXP | GL_EXACT;
+ 	int error;
+ 
+ 	error = gfs2_glock_nq_init(sdp->sd_freeze_gl, LM_ST_SHARED, flags,
+-				   freeze_gh);
++				   &sdp->sd_freeze_gh);
+ 	if (error && error != GLR_TRYFAILED)
+ 		fs_err(sdp, "can't lock the freeze glock: %d\n", error);
+ 	return error;
+diff --git a/fs/gfs2/util.h b/fs/gfs2/util.h
+index a7e3e7b15f24..4d64fe579248 100644
+--- a/fs/gfs2/util.h
++++ b/fs/gfs2/util.h
+@@ -152,9 +152,7 @@ int gfs2_io_error_i(struct gfs2_sbd *sdp, const char *function,
+ 
+ extern int check_journal_clean(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
+ 			       bool verbose);
+-extern int gfs2_freeze_lock_shared(struct gfs2_sbd *sdp,
+-				   struct gfs2_holder *freeze_gh,
+-				   int caller_flags);
++extern int gfs2_freeze_lock_shared(struct gfs2_sbd *sdp);
+ extern void gfs2_freeze_unlock(struct gfs2_holder *freeze_gh);
+ 
+ #define gfs2_io_error(sdp) \
