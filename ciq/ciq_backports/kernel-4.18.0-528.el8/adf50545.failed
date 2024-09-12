@@ -1,0 +1,84 @@
+kunit: fix UAF when run kfence test case test_gfpzero
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-528.el8
+commit-author Peng Liu <liupeng256@huawei.com>
+commit adf505457032c11b79b5a7c277c62ff5d61b17c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-528.el8/adf50545.failed
+
+Patch series "kunit: fix a UAF bug and do some optimization", v2.
+
+This series is to fix UAF (use after free) when running kfence test case
+test_gfpzero, which is time costly.  This UAF bug can be easily triggered
+by setting CONFIG_KFENCE_NUM_OBJECTS = 65535.  Furthermore, some
+optimization for kunit tests has been done.
+
+This patch (of 3):
+
+Kunit will create a new thread to run an actual test case, and the main
+process will wait for the completion of the actual test thread until
+overtime.  The variable "struct kunit test" has local property in function
+kunit_try_catch_run, and will be used in the test case thread.  Task
+kunit_try_catch_run will free "struct kunit test" when kunit runs
+overtime, but the actual test case is still run and an UAF bug will be
+triggered.
+
+The above problem has been both observed in a physical machine and qemu
+platform when running kfence kunit tests.  The problem can be triggered
+when setting CONFIG_KFENCE_NUM_OBJECTS = 65535.  Under this setting, the
+test case test_gfpzero will cost hours and kunit will run to overtime.
+The follows show the panic log.
+
+  BUG: unable to handle page fault for address: ffffffff82d882e9
+
+  Call Trace:
+   kunit_log_append+0x58/0xd0
+   ...
+   test_alloc.constprop.0.cold+0x6b/0x8a [kfence_test]
+   test_gfpzero.cold+0x61/0x8ab [kfence_test]
+   kunit_try_run_case+0x4c/0x70
+   kunit_generic_run_threadfn_adapter+0x11/0x20
+   kthread+0x166/0x190
+   ret_from_fork+0x22/0x30
+  Kernel panic - not syncing: Fatal exception
+  Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS
+  Ubuntu-1.8.2-1ubuntu1 04/01/2014
+
+To solve this problem, the test case thread should be stopped when the
+kunit frame runs overtime.  The stop signal will send in function
+kunit_try_catch_run, and test_gfpzero will handle it.
+
+Link: https://lkml.kernel.org/r/20220309083753.1561921-1-liupeng256@huawei.com
+Link: https://lkml.kernel.org/r/20220309083753.1561921-2-liupeng256@huawei.com
+	Signed-off-by: Peng Liu <liupeng256@huawei.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Reviewed-by: Brendan Higgins <brendanhiggins@google.com>
+	Tested-by: Brendan Higgins <brendanhiggins@google.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Wang Kefeng <wangkefeng.wang@huawei.com>
+	Cc: Daniel Latypov <dlatypov@google.com>
+	Cc: David Gow <davidgow@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit adf505457032c11b79b5a7c277c62ff5d61b17c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kfence/kfence_test.c
+* Unmerged path mm/kfence/kfence_test.c
+diff --git a/lib/kunit/try-catch.c b/lib/kunit/try-catch.c
+index 71e5c5853099..d7b3fe4d5f24 100644
+--- a/lib/kunit/try-catch.c
++++ b/lib/kunit/try-catch.c
+@@ -78,6 +78,7 @@ void kunit_try_catch_run(struct kunit_try_catch *try_catch, void *context)
+ 	if (time_remaining == 0) {
+ 		kunit_err(test, "try timed out\n");
+ 		try_catch->try_result = -ETIMEDOUT;
++		kthread_stop(task_struct);
+ 	}
+ 
+ 	exit_code = try_catch->try_result;
+* Unmerged path mm/kfence/kfence_test.c
