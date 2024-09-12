@@ -74,6 +74,8 @@ SECTIONS
 #endif
 	. = ALIGN(PAGE_SIZE);	/* keep ZO size page aligned */
 	_end = .;
+
+	DISCARDS
 }
 
 ASSERT(SIZEOF(.got) == 0, "Unexpected GOT entries detected!")
