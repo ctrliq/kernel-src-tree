@@ -1,0 +1,564 @@
+mm/slub: restrict sysfs validation to debug caches and make it safe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-524.el8
+commit-author Vlastimil Babka <vbabka@suse.cz>
+commit c7323a5ad0786371f61dca49fc26f7ab3a68e0da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-524.el8/c7323a5a.failed
+
+Rongwei Wang reports [1] that cache validation triggered by writing to
+/sys/kernel/slab/<cache>/validate is racy against normal cache
+operations (e.g. freeing) in a way that can cause false positive
+inconsistency reports for caches with debugging enabled. The problem is
+that debugging actions that mark object free or active and actual
+freelist operations are not atomic, and the validation can see an
+inconsistent state.
+
+For caches that do or don't have debugging enabled, additional races
+involving n->nr_slabs are possible that result in false reports of wrong
+slab counts.
+
+This patch attempts to solve these issues while not adding overhead to
+normal (especially fastpath) operations for caches that do not have
+debugging enabled. Such overhead would not be justified to make possible
+userspace-triggered validation safe. Instead, disable the validation for
+caches that don't have debugging enabled and make their sysfs validate
+handler return -EINVAL.
+
+For caches that do have debugging enabled, we can instead extend the
+existing approach of not using percpu freelists to force all alloc/free
+operations to the slow paths where debugging flags is checked and acted
+upon. There can adjust the debug-specific paths to increase n->list_lock
+coverage against concurrent validation as necessary.
+
+The processing on free in free_debug_processing() already happens under
+n->list_lock so we can extend it to actually do the freeing as well and
+thus make it atomic against concurrent validation. As observed by
+Hyeonggon Yoo, we do not really need to take slab_lock() anymore here
+because all paths we could race with are protected by n->list_lock under
+the new scheme, so drop its usage here.
+
+The processing on alloc in alloc_debug_processing() currently doesn't
+take any locks, but we have to first allocate the object from a slab on
+the partial list (as debugging caches have no percpu slabs) and thus
+take the n->list_lock anyway. Add a function alloc_single_from_partial()
+that grabs just the allocated object instead of the whole freelist, and
+does the debug processing. The n->list_lock coverage again makes it
+atomic against validation and it is also ultimately more efficient than
+the current grabbing of freelist immediately followed by slab
+deactivation.
+
+To prevent races on n->nr_slabs updates, make sure that for caches with
+debugging enabled, inc_slabs_node() or dec_slabs_node() is called under
+n->list_lock. When allocating a new slab for a debug cache, handle the
+allocation by a new function alloc_single_from_new_slab() instead of the
+current forced deactivation path.
+
+Neither of these changes affect the fast paths at all. The changes in
+slow paths are negligible for non-debug caches.
+
+[1] https://lore.kernel.org/all/20220529081535.69275-1-rongwei.wang@linux.alibaba.com/
+
+	Reported-by: Rongwei Wang <rongwei.wang@linux.alibaba.com>
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+	Reviewed-by: Hyeonggon Yoo <42.hyeyoo@gmail.com>
+(cherry picked from commit c7323a5ad0786371f61dca49fc26f7ab3a68e0da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slub.c
+diff --cc mm/slub.c
+index 4ece4a8929e7,a18a81a52307..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -1274,18 -1324,15 +1274,27 @@@ static inline int alloc_consistency_che
+  }
+  
+  static noinline int alloc_debug_processing(struct kmem_cache *s,
+++<<<<<<< HEAD
+ +					struct page *page,
+ +					void *object, unsigned long addr)
+++=======
++ 					struct slab *slab, void *object)
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
+  {
+  	if (s->flags & SLAB_CONSISTENCY_CHECKS) {
+ -		if (!alloc_consistency_checks(s, slab, object))
+ +		if (!alloc_consistency_checks(s, page, object))
+  			goto bad;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Success perform special debug activities for allocs */
+ +	if (s->flags & SLAB_STORE_USER)
+ +		set_track(s, object, TRACK_ALLOC, addr);
+ +	trace(s, page, object, 1);
+++=======
++ 	/* Success. Perform special debug activities for allocs */
++ 	trace(s, slab, object, 1);
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
+  	init_object(s, object, SLUB_RED_ACTIVE);
+  	return 1;
+  
+@@@ -1595,27 -1596,27 +1604,36 @@@ slab_flags_t kmem_cache_flags(unsigned 
+  	return flags | slub_debug_local;
+  }
+  #else /* !CONFIG_SLUB_DEBUG */
+ -static inline void setup_object_debug(struct kmem_cache *s, void *object) {}
+ +static inline void setup_object_debug(struct kmem_cache *s,
+ +			struct page *page, void *object) {}
+  static inline
+ -void setup_slab_debug(struct kmem_cache *s, struct slab *slab, void *addr) {}
+ +void setup_page_debug(struct kmem_cache *s, struct page *page, void *addr) {}
+  
+  static inline int alloc_debug_processing(struct kmem_cache *s,
+++<<<<<<< HEAD
+ +	struct page *page, void *object, unsigned long addr) { return 0; }
+ +
+ +static inline int free_debug_processing(
+ +	struct kmem_cache *s, struct page *page,
+++=======
++ 	struct slab *slab, void *object) { return 0; }
++ 
++ static inline void free_debug_processing(
++ 	struct kmem_cache *s, struct slab *slab,
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
+  	void *head, void *tail, int bulk_cnt,
+- 	unsigned long addr) { return 0; }
++ 	unsigned long addr) {}
+  
+ -static inline void slab_pad_check(struct kmem_cache *s, struct slab *slab) {}
+ -static inline int check_object(struct kmem_cache *s, struct slab *slab,
+ +static inline int slab_pad_check(struct kmem_cache *s, struct page *page)
+ +			{ return 1; }
+ +static inline int check_object(struct kmem_cache *s, struct page *page,
+  			void *object, u8 val) { return 1; }
++ static inline void set_track(struct kmem_cache *s, void *object,
++ 			     enum track_item alloc, unsigned long addr) {}
+  static inline void add_full(struct kmem_cache *s, struct kmem_cache_node *n,
+ -					struct slab *slab) {}
+ +					struct page *page) {}
+  static inline void remove_full(struct kmem_cache *s, struct kmem_cache_node *n,
+ -					struct slab *slab) {}
+ +					struct page *page) {}
+  slab_flags_t kmem_cache_flags(unsigned int object_size,
+  	slab_flags_t flags, const char *name)
+  {
+@@@ -1892,28 -1916,27 +1910,40 @@@ static struct page *allocate_slab(struc
+  		 * Allocation may have failed due to fragmentation.
+  		 * Try a lower order alloc if possible
+  		 */
+++<<<<<<< HEAD
+ +		page = alloc_slab_page(s, alloc_gfp, node, oo);
+ +		if (unlikely(!page))
+ +			goto out;
+ +		stat(s, ORDER_FALLBACK);
+ +	}
+ +
+ +	page->objects = oo_objects(oo);
+++=======
++ 		slab = alloc_slab_page(alloc_gfp, node, oo);
++ 		if (unlikely(!slab))
++ 			return NULL;
++ 		stat(s, ORDER_FALLBACK);
++ 	}
++ 
++ 	slab->objects = oo_objects(oo);
++ 	slab->inuse = 0;
++ 	slab->frozen = 0;
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
+  
+ -	account_slab(slab, oo_order(oo), s, flags);
+ +	account_slab_page(page, oo_order(oo), s, flags);
+  
+ -	slab->slab_cache = s;
+ +	page->slab_cache = s;
+ +	__SetPageSlab(page);
+ +	if (page_is_pfmemalloc(page))
+ +		SetPageSlabPfmemalloc(page);
+  
+ -	kasan_poison_slab(slab);
+ +	kasan_poison_slab(page);
+  
+ -	start = slab_address(slab);
+ +	start = page_address(page);
+  
+ -	setup_slab_debug(s, slab, start);
+ +	setup_page_debug(s, page, start);
+  
+ -	shuffle = shuffle_freelist(s, slab);
+ +	shuffle = shuffle_freelist(s, page);
+  
+  	if (!shuffle) {
+  		start = fixup_red_left(s, start);
+@@@ -1928,19 -1951,10 +1958,23 @@@
+  		set_freepointer(s, p, NULL);
+  	}
+  
+++<<<<<<< HEAD
+ +	page->inuse = page->objects;
+ +	page->frozen = 1;
+ +
+ +out:
+ +	if (!page)
+ +		return NULL;
+ +
+ +	inc_slabs_node(s, page_to_nid(page), page->objects);
+ +
+ +	return page;
+++=======
++ 	return slab;
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
+  }
+  
+ -static struct slab *new_slab(struct kmem_cache *s, gfp_t flags, int node)
+ +static struct page *new_slab(struct kmem_cache *s, gfp_t flags, int node)
+  {
+  	if (unlikely(flags & GFP_SLAB_BUG_MASK))
+  		flags = kmalloc_fix_flags(flags);
+@@@ -2100,13 -2180,20 +2203,24 @@@ static void *get_partial_node(struct km
+  		return NULL;
+  
+  	spin_lock_irqsave(&n->list_lock, flags);
+ -	list_for_each_entry_safe(slab, slab2, &n->partial, slab_list) {
+ +	list_for_each_entry_safe(page, page2, &n->partial, slab_list) {
+  		void *t;
+  
+ -		if (!pfmemalloc_match(slab, gfpflags))
+ +		if (!pfmemalloc_match(page, gfpflags))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		t = acquire_slab(s, n, page, object == NULL, &objects);
+++=======
++ 		if (kmem_cache_debug(s)) {
++ 			object = alloc_single_from_partial(s, n, slab);
++ 			if (object)
++ 				break;
++ 			continue;
++ 		}
++ 
++ 		t = acquire_slab(s, n, slab, object == NULL);
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
+  		if (!t)
+  			break;
+  
+@@@ -2724,6 -2799,110 +2838,113 @@@ static inline unsigned long node_nr_obj
+  {
+  	return atomic_long_read(&n->total_objects);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /* Supports checking bulk free of a constructed freelist */
++ static noinline void free_debug_processing(
++ 	struct kmem_cache *s, struct slab *slab,
++ 	void *head, void *tail, int bulk_cnt,
++ 	unsigned long addr)
++ {
++ 	struct kmem_cache_node *n = get_node(s, slab_nid(slab));
++ 	struct slab *slab_free = NULL;
++ 	void *object = head;
++ 	int cnt = 0;
++ 	unsigned long flags;
++ 	bool checks_ok = false;
++ 	depot_stack_handle_t handle = 0;
++ 
++ 	if (s->flags & SLAB_STORE_USER)
++ 		handle = set_track_prepare();
++ 
++ 	spin_lock_irqsave(&n->list_lock, flags);
++ 
++ 	if (s->flags & SLAB_CONSISTENCY_CHECKS) {
++ 		if (!check_slab(s, slab))
++ 			goto out;
++ 	}
++ 
++ 	if (slab->inuse < bulk_cnt) {
++ 		slab_err(s, slab, "Slab has %d allocated objects but %d are to be freed\n",
++ 			 slab->inuse, bulk_cnt);
++ 		goto out;
++ 	}
++ 
++ next_object:
++ 
++ 	if (++cnt > bulk_cnt)
++ 		goto out_cnt;
++ 
++ 	if (s->flags & SLAB_CONSISTENCY_CHECKS) {
++ 		if (!free_consistency_checks(s, slab, object, addr))
++ 			goto out;
++ 	}
++ 
++ 	if (s->flags & SLAB_STORE_USER)
++ 		set_track_update(s, object, TRACK_FREE, addr, handle);
++ 	trace(s, slab, object, 0);
++ 	/* Freepointer not overwritten by init_object(), SLAB_POISON moved it */
++ 	init_object(s, object, SLUB_RED_INACTIVE);
++ 
++ 	/* Reached end of constructed freelist yet? */
++ 	if (object != tail) {
++ 		object = get_freepointer(s, object);
++ 		goto next_object;
++ 	}
++ 	checks_ok = true;
++ 
++ out_cnt:
++ 	if (cnt != bulk_cnt)
++ 		slab_err(s, slab, "Bulk free expected %d objects but found %d\n",
++ 			 bulk_cnt, cnt);
++ 
++ out:
++ 	if (checks_ok) {
++ 		void *prior = slab->freelist;
++ 
++ 		/* Perform the actual freeing while we still hold the locks */
++ 		slab->inuse -= cnt;
++ 		set_freepointer(s, tail, prior);
++ 		slab->freelist = head;
++ 
++ 		/* Do we need to remove the slab from full or partial list? */
++ 		if (!prior) {
++ 			remove_full(s, n, slab);
++ 		} else if (slab->inuse == 0 &&
++ 			   n->nr_partial >= s->min_partial) {
++ 			remove_partial(n, slab);
++ 			stat(s, FREE_REMOVE_PARTIAL);
++ 		}
++ 
++ 		/* Do we need to discard the slab or add to partial list? */
++ 		if (slab->inuse == 0 && n->nr_partial >= s->min_partial) {
++ 			slab_free = slab;
++ 		} else if (!prior) {
++ 			add_partial(n, slab, DEACTIVATE_TO_TAIL);
++ 			stat(s, FREE_ADD_PARTIAL);
++ 		}
++ 	}
++ 
++ 	if (slab_free) {
++ 		/*
++ 		 * Update the counters while still holding n->list_lock to
++ 		 * prevent spurious validation warnings
++ 		 */
++ 		dec_slabs_node(s, slab_nid(slab_free), slab_free->objects);
++ 	}
++ 
++ 	spin_unlock_irqrestore(&n->list_lock, flags);
++ 
++ 	if (!checks_ok)
++ 		slab_fix(s, "Object at 0x%p not freed", object);
++ 
++ 	if (slab_free) {
++ 		stat(s, FREE_SLAB);
++ 		free_slab(s, slab_free);
++ 	}
++ }
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
+  #endif /* CONFIG_SLUB_DEBUG */
+  
+  #if defined(CONFIG_SLUB_DEBUG) || defined(CONFIG_SYSFS)
+@@@ -2984,45 -3151,61 +3205,82 @@@ new_objects
+  		return NULL;
+  	}
+  
++ 	stat(s, ALLOC_SLAB);
++ 
++ 	if (kmem_cache_debug(s)) {
++ 		freelist = alloc_single_from_new_slab(s, slab);
++ 
++ 		if (unlikely(!freelist))
++ 			goto new_objects;
++ 
++ 		if (s->flags & SLAB_STORE_USER)
++ 			set_track(s, freelist, TRACK_ALLOC, addr);
++ 
++ 		return freelist;
++ 	}
++ 
+  	/*
+ -	 * No other reference to the slab yet so we can
+ +	 * No other reference to the page yet so we can
+  	 * muck around with it freely without cmpxchg
+  	 */
+++<<<<<<< HEAD
+ +	freelist = page->freelist;
+ +	page->freelist = NULL;
+++=======
++ 	freelist = slab->freelist;
++ 	slab->freelist = NULL;
++ 	slab->inuse = slab->objects;
++ 	slab->frozen = 1;
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
+  
+- 	stat(s, ALLOC_SLAB);
++ 	inc_slabs_node(s, slab_nid(slab), slab->objects);
+  
+ -check_new_slab:
+ +check_new_page:
+  
+  	if (kmem_cache_debug(s)) {
+++<<<<<<< HEAD
+ +		if (!alloc_debug_processing(s, page, freelist, addr)) {
+ +			/* Slab failed checks. Next slab needed */
+ +			goto new_slab;
+ +		} else {
+ +			/*
+ +			 * For debug case, we don't load freelist so that all
+ +			 * allocations go through alloc_debug_processing()
+ +			 */
+ +			goto return_single;
+ +		}
+ +	}
+ +
+ +	if (unlikely(!pfmemalloc_match(page, gfpflags)))
+++=======
++ 		/*
++ 		 * For debug caches here we had to go through
++ 		 * alloc_single_from_partial() so just store the tracking info
++ 		 * and return the object
++ 		 */
++ 		if (s->flags & SLAB_STORE_USER)
++ 			set_track(s, freelist, TRACK_ALLOC, addr);
++ 		return freelist;
++ 	}
++ 
++ 	if (unlikely(!pfmemalloc_match(slab, gfpflags))) {
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
+  		/*
+  		 * For !pfmemalloc_match() case we don't load freelist so that
+  		 * we don't make further mismatched allocations easier.
+  		 */
+- 		goto return_single;
++ 		deactivate_slab(s, slab, get_freepointer(s, freelist));
++ 		return freelist;
++ 	}
+  
+ -retry_load_slab:
+ +retry_load_page:
+  
+  	local_lock_irqsave(&s->cpu_slab->lock, flags);
+ -	if (unlikely(c->slab)) {
+ +	if (unlikely(c->page)) {
+  		void *flush_freelist = c->freelist;
+ -		struct slab *flush_slab = c->slab;
+ +		struct page *flush_page = c->page;
+  
+ -		c->slab = NULL;
+ +		c->page = NULL;
+  		c->freelist = NULL;
+  		c->tid = next_tid(c->tid);
+  
+@@@ -3032,16 -3215,11 +3290,19 @@@
+  
+  		stat(s, CPUSLAB_FLUSH);
+  
+ -		goto retry_load_slab;
+ +		goto retry_load_page;
+  	}
+ -	c->slab = slab;
+ +	c->page = page;
+  
+  	goto load_freelist;
+++<<<<<<< HEAD
+ +
+ +return_single:
+ +
+ +	deactivate_slab(s, page, get_freepointer(s, freelist));
+ +	return freelist;
+++=======
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
+  }
+  
+  /*
+@@@ -3267,10 -3464,14 +3528,19 @@@ static void __slab_free(struct kmem_cac
+  
+  	stat(s, FREE_SLOWPATH);
+  
+++<<<<<<< HEAD
+ +	if (kmem_cache_debug(s) &&
+ +	    !free_debug_processing(s, page, head, tail, cnt, addr))
+++=======
++ 	if (kfence_free(head))
+  		return;
+  
++ 	if (kmem_cache_debug(s)) {
++ 		free_debug_processing(s, slab, head, tail, cnt, addr);
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
++ 		return;
++ 	}
++ 
+  	do {
+  		if (unlikely(n)) {
+  			spin_unlock_irqrestore(&n->list_lock, flags);
+@@@ -3868,10 -4060,11 +4138,16 @@@ static void early_kmem_cache_node_alloc
+  
+  	BUG_ON(kmem_cache_node->size < sizeof(struct kmem_cache_node));
+  
+ -	slab = new_slab(kmem_cache_node, GFP_NOWAIT, node);
+ +	page = new_slab(kmem_cache_node, GFP_NOWAIT, node);
+  
+++<<<<<<< HEAD
+ +	BUG_ON(!page);
+ +	if (page_to_nid(page) != node) {
+++=======
++ 	BUG_ON(!slab);
++ 	inc_slabs_node(kmem_cache_node, slab_nid(slab), slab->objects);
++ 	if (slab_nid(slab) != node) {
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
+  		pr_err("SLUB: Unable to allocate memory from node %d\n", node);
+  		pr_err("SLUB: Allocating a useless per node structure in order to be able to continue\n");
+  	}
+@@@ -3882,13 -4075,12 +4158,19 @@@
+  	init_object(kmem_cache_node, n, SLUB_RED_ACTIVE);
+  	init_tracking(kmem_cache_node, n);
+  #endif
+++<<<<<<< HEAD
+ +	n = kasan_slab_alloc(kmem_cache_node, n, GFP_KERNEL);
+ +	page->freelist = get_freepointer(kmem_cache_node, n);
+ +	page->inuse = 1;
+ +	page->frozen = 0;
+++=======
++ 	n = kasan_slab_alloc(kmem_cache_node, n, GFP_KERNEL, false);
++ 	slab->freelist = get_freepointer(kmem_cache_node, n);
++ 	slab->inuse = 1;
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
+  	kmem_cache_node->node[node] = n;
+  	init_kmem_cache_node(n);
+ -	inc_slabs_node(kmem_cache_node, node, slab->objects);
+ +	inc_slabs_node(kmem_cache_node, node, page->objects);
+  
+  	/*
+  	 * No locks need to be taken here as it has just been
+@@@ -4551,11 -4735,12 +4833,12 @@@ static int __kmem_cache_do_shrink(struc
+  			/* We do not keep full slabs on the list */
+  			BUG_ON(free <= 0);
+  
+ -			if (free == slab->objects) {
+ -				list_move(&slab->slab_list, &discard);
+ +			if (free == page->objects) {
+ +				list_move(&page->slab_list, &discard);
+  				n->nr_partial--;
++ 				dec_slabs_node(s, node, slab->objects);
+  			} else if (free <= SHRINK_PROMOTE_MAX)
+ -				list_move(&slab->slab_list, promote + free - 1);
+ +				list_move(&page->slab_list, promote + free - 1);
+  		}
+  
+  		/*
+@@@ -4568,8 -4753,8 +4851,13 @@@
+  		spin_unlock_irqrestore(&n->list_lock, flags);
+  
+  		/* Release empty slabs */
+++<<<<<<< HEAD
+ +		list_for_each_entry_safe(page, t, &discard, slab_list)
+ +			discard_slab(s, page);
+++=======
++ 		list_for_each_entry_safe(slab, t, &discard, slab_list)
++ 			free_slab(s, slab);
+++>>>>>>> c7323a5ad078 (mm/slub: restrict sysfs validation to debug caches and make it safe)
+  
+  		if (slabs_node(s, node))
+  			ret = 1;
+* Unmerged path mm/slub.c
