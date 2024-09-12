@@ -1,0 +1,182 @@
+wifi: mac80211: implement support for yet another mesh A-MSDU format
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-512.el8
+commit-author Felix Fietkau <nbd@nbd.name>
+commit fe4a6d2db3bad41e9f22c860596f355af8493ebb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-512.el8/fe4a6d2d.failed
+
+MT7996 hardware supports mesh A-MSDU subframes in hardware, but uses a
+big-endian length field
+
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+	Signed-off-by: Ryder Lee <ryder.lee@mediatek.com>
+Link: https://lore.kernel.org/r/20230314095956.62085-7-nbd@nbd.name
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit fe4a6d2db3bad41e9f22c860596f355af8493ebb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/rx.c
+diff --cc net/mac80211/rx.c
+index 50735f2db770,1c957194554b..000000000000
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@@ -2985,14 -2982,24 +2985,30 @@@ __ieee80211_rx_h_amsdu(struct ieee80211
+  					  data_offset, true))
+  		return RX_DROP_UNUSABLE;
+  
+++<<<<<<< HEAD
+ +	if (rx->sta->amsdu_mesh_control < 0) {
+ +		bool valid_std = ieee80211_is_valid_amsdu(skb, true);
+ +		bool valid_nonstd = ieee80211_is_valid_amsdu(skb, false);
+++=======
++ 	if (rx->sta && rx->sta->amsdu_mesh_control < 0) {
++ 		s8 valid = -1;
++ 		int i;
+++>>>>>>> fe4a6d2db3ba (wifi: mac80211: implement support for yet another mesh A-MSDU format)
++ 
++ 		for (i = 0; i <= 2; i++) {
++ 			if (!ieee80211_is_valid_amsdu(skb, i))
++ 				continue;
++ 
++ 			if (valid >= 0) {
++ 				/* ambiguous */
++ 				valid = -1;
++ 				break;
++ 			}
++ 
++ 			valid = i;
++ 		}
+  
+- 		if (valid_std && !valid_nonstd)
+- 			rx->sta->amsdu_mesh_control = 1;
+- 		else if (valid_nonstd && !valid_std)
+- 			rx->sta->amsdu_mesh_control = 0;
++ 		rx->sta->amsdu_mesh_control = valid;
+  	}
+  
+  	ieee80211_amsdu_to_8023s(skb, &frame_list, dev->dev_addr,
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index 21e4d082fc7d..55c7b49cece2 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -6246,10 +6246,13 @@ static inline int ieee80211_data_to_8023(struct sk_buff *skb, const u8 *addr,
+  * mesh control field.
+  *
+  * @skb: The input A-MSDU frame without any headers.
+- * @mesh_hdr: use standard compliant mesh A-MSDU subframe header
++ * @mesh_hdr: the type of mesh header to test
++ *	0: non-mesh A-MSDU length field
++ *	1: big-endian mesh A-MSDU length field
++ *	2: little-endian mesh A-MSDU length field
+  * Returns: true if subframe header lengths are valid for the @mesh_hdr mode
+  */
+-bool ieee80211_is_valid_amsdu(struct sk_buff *skb, bool mesh_hdr);
++bool ieee80211_is_valid_amsdu(struct sk_buff *skb, u8 mesh_hdr);
+ 
+ /**
+  * ieee80211_amsdu_to_8023s - decode an IEEE 802.11n A-MSDU frame
+@@ -6266,13 +6269,13 @@ bool ieee80211_is_valid_amsdu(struct sk_buff *skb, bool mesh_hdr);
+  * @extra_headroom: The hardware extra headroom for SKBs in the @list.
+  * @check_da: DA to check in the inner ethernet header, or NULL
+  * @check_sa: SA to check in the inner ethernet header, or NULL
+- * @mesh_control: A-MSDU subframe header includes the mesh control field
++ * @mesh_control: see mesh_hdr in ieee80211_is_valid_amsdu
+  */
+ void ieee80211_amsdu_to_8023s(struct sk_buff *skb, struct sk_buff_head *list,
+ 			      const u8 *addr, enum nl80211_iftype iftype,
+ 			      const unsigned int extra_headroom,
+ 			      const u8 *check_da, const u8 *check_sa,
+-			      bool mesh_control);
++			      u8 mesh_control);
+ 
+ /**
+  * ieee80211_get_8023_tunnel_proto - get RFC1042 or bridge tunnel encap protocol
+* Unmerged path net/mac80211/rx.c
+diff --git a/net/mac80211/sta_info.h b/net/mac80211/sta_info.h
+index e8e482a82d77..f354d470e174 100644
+--- a/net/mac80211/sta_info.h
++++ b/net/mac80211/sta_info.h
+@@ -623,7 +623,10 @@ struct link_sta_info {
+  * @cparams: CoDel parameters for this station.
+  * @reserved_tid: reserved TID (if any, otherwise IEEE80211_TID_UNRESERVED)
+  * @amsdu_mesh_control: track the mesh A-MSDU format used by the peer
+- *	(-1: not yet known, 0: non-standard [without mesh header], 1: standard)
++ *	(-1: not yet known,
++ *	  0: non-mesh A-MSDU length field
++ *	  1: big-endian mesh A-MSDU length field
++ *	  2: little-endian mesh A-MSDU length field)
+  * @fast_tx: TX fastpath information
+  * @fast_rx: RX fastpath information
+  * @tdls_chandef: a TDLS peer can have a wider chandef that is compatible to
+diff --git a/net/wireless/util.c b/net/wireless/util.c
+index 83eefe07f130..9730ec9cce49 100644
+--- a/net/wireless/util.c
++++ b/net/wireless/util.c
+@@ -776,7 +776,24 @@ __ieee80211_amsdu_copy(struct sk_buff *skb, unsigned int hlen,
+ 	return frame;
+ }
+ 
+-bool ieee80211_is_valid_amsdu(struct sk_buff *skb, bool mesh_hdr)
++static u16
++ieee80211_amsdu_subframe_length(void *field, u8 mesh_flags, u8 hdr_type)
++{
++	__le16 *field_le = field;
++	__be16 *field_be = field;
++	u16 len;
++
++	if (hdr_type >= 2)
++		len = le16_to_cpu(*field_le);
++	else
++		len = be16_to_cpu(*field_be);
++	if (hdr_type)
++		len += __ieee80211_get_mesh_hdrlen(mesh_flags);
++
++	return len;
++}
++
++bool ieee80211_is_valid_amsdu(struct sk_buff *skb, u8 mesh_hdr)
+ {
+ 	int offset = 0, remaining, subframe_len, padding;
+ 
+@@ -790,12 +807,8 @@ bool ieee80211_is_valid_amsdu(struct sk_buff *skb, bool mesh_hdr)
+ 		if (skb_copy_bits(skb, offset + 2 * ETH_ALEN, &hdr, sizeof(hdr)) < 0)
+ 			return false;
+ 
+-		if (mesh_hdr)
+-			len = le16_to_cpu(*(__le16 *)&hdr.len) +
+-			      __ieee80211_get_mesh_hdrlen(hdr.mesh_flags);
+-		else
+-			len = ntohs(hdr.len);
+-
++		len = ieee80211_amsdu_subframe_length(&hdr.len, hdr.mesh_flags,
++						      mesh_hdr);
+ 		subframe_len = sizeof(struct ethhdr) + len;
+ 		padding = (4 - subframe_len) & 0x3;
+ 		remaining = skb->len - offset;
+@@ -812,7 +825,7 @@ void ieee80211_amsdu_to_8023s(struct sk_buff *skb, struct sk_buff_head *list,
+ 			      const u8 *addr, enum nl80211_iftype iftype,
+ 			      const unsigned int extra_headroom,
+ 			      const u8 *check_da, const u8 *check_sa,
+-			      bool mesh_control)
++			      u8 mesh_control)
+ {
+ 	unsigned int hlen = ALIGN(extra_headroom, 4);
+ 	struct sk_buff *frame = NULL;
+@@ -837,11 +850,8 @@ void ieee80211_amsdu_to_8023s(struct sk_buff *skb, struct sk_buff_head *list,
+ 		skb_copy_bits(skb, offset, &hdr, copy_len);
+ 		if (iftype == NL80211_IFTYPE_MESH_POINT)
+ 			mesh_len = __ieee80211_get_mesh_hdrlen(hdr.flags);
+-		if (mesh_control)
+-			len = le16_to_cpu(*(__le16 *)&hdr.eth.h_proto) + mesh_len;
+-		else
+-			len = ntohs(hdr.eth.h_proto);
+-
++		len = ieee80211_amsdu_subframe_length(&hdr.eth.h_proto, hdr.flags,
++						      mesh_control);
+ 		subframe_len = sizeof(struct ethhdr) + len;
+ 		padding = (4 - subframe_len) & 0x3;
+ 
