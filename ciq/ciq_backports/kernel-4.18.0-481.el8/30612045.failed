@@ -1,0 +1,418 @@
+x86/sev: Use firmware-validated CPUID for SEV-SNP guests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Michael Roth <michael.roth@amd.com>
+commit 30612045e69d088f1effd748048ebb0e282984ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/30612045.failed
+
+SEV-SNP guests will be provided the location of special 'secrets' and
+'CPUID' pages via the Confidential Computing blob. This blob is
+provided to the run-time kernel either through a boot_params field that
+was initialized by the boot/compressed kernel, or via a setup_data
+structure as defined by the Linux Boot Protocol.
+
+Locate the Confidential Computing blob from these sources and, if found,
+use the provided CPUID page/table address to create a copy that the
+run-time kernel will use when servicing CPUID instructions via a #VC
+handler.
+
+	Signed-off-by: Michael Roth <michael.roth@amd.com>
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20220307213356.2797205-40-brijesh.singh@amd.com
+(cherry picked from commit 30612045e69d088f1effd748048ebb0e282984ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/sev.c
+#	arch/x86/kernel/sev-shared.c
+#	arch/x86/kernel/sev.c
+diff --cc arch/x86/boot/compressed/sev.c
+index 213b126ba7e3,52f989f6acc2..000000000000
+--- a/arch/x86/boot/compressed/sev.c
++++ b/arch/x86/boot/compressed/sev.c
+@@@ -202,3 -249,189 +202,192 @@@ finish
+  	else if (result != ES_RETRY)
+  		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_GEN_REQ);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void enforce_vmpl0(void)
++ {
++ 	u64 attrs;
++ 	int err;
++ 
++ 	/*
++ 	 * RMPADJUST modifies RMP permissions of a lesser-privileged (numerically
++ 	 * higher) privilege level. Here, clear the VMPL1 permission mask of the
++ 	 * GHCB page. If the guest is not running at VMPL0, this will fail.
++ 	 *
++ 	 * If the guest is running at VMPL0, it will succeed. Even if that operation
++ 	 * modifies permission bits, it is still ok to do so currently because Linux
++ 	 * SNP guests are supported only on VMPL0 so VMPL1 or higher permission masks
++ 	 * changing is a don't-care.
++ 	 */
++ 	attrs = 1;
++ 	if (rmpadjust((unsigned long)&boot_ghcb_page, RMP_PG_SIZE_4K, attrs))
++ 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_NOT_VMPL0);
++ }
++ 
++ void sev_enable(struct boot_params *bp)
++ {
++ 	unsigned int eax, ebx, ecx, edx;
++ 	struct msr m;
++ 	bool snp;
++ 
++ 	/*
++ 	 * Setup/preliminary detection of SNP. This will be sanity-checked
++ 	 * against CPUID/MSR values later.
++ 	 */
++ 	snp = snp_init(bp);
++ 
++ 	/* Check for the SME/SEV support leaf */
++ 	eax = 0x80000000;
++ 	ecx = 0;
++ 	native_cpuid(&eax, &ebx, &ecx, &edx);
++ 	if (eax < 0x8000001f)
++ 		return;
++ 
++ 	/*
++ 	 * Check for the SME/SEV feature:
++ 	 *   CPUID Fn8000_001F[EAX]
++ 	 *   - Bit 0 - Secure Memory Encryption support
++ 	 *   - Bit 1 - Secure Encrypted Virtualization support
++ 	 *   CPUID Fn8000_001F[EBX]
++ 	 *   - Bits 5:0 - Pagetable bit position used to indicate encryption
++ 	 */
++ 	eax = 0x8000001f;
++ 	ecx = 0;
++ 	native_cpuid(&eax, &ebx, &ecx, &edx);
++ 	/* Check whether SEV is supported */
++ 	if (!(eax & BIT(1))) {
++ 		if (snp)
++ 			error("SEV-SNP support indicated by CC blob, but not CPUID.");
++ 		return;
++ 	}
++ 
++ 	/* Set the SME mask if this is an SEV guest. */
++ 	boot_rdmsr(MSR_AMD64_SEV, &m);
++ 	sev_status = m.q;
++ 	if (!(sev_status & MSR_AMD64_SEV_ENABLED))
++ 		return;
++ 
++ 	/* Negotiate the GHCB protocol version. */
++ 	if (sev_status & MSR_AMD64_SEV_ES_ENABLED) {
++ 		if (!sev_es_negotiate_protocol())
++ 			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_PROT_UNSUPPORTED);
++ 	}
++ 
++ 	/*
++ 	 * SNP is supported in v2 of the GHCB spec which mandates support for HV
++ 	 * features.
++ 	 */
++ 	if (sev_status & MSR_AMD64_SEV_SNP_ENABLED) {
++ 		if (!(get_hv_features() & GHCB_HV_FT_SNP))
++ 			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
++ 
++ 		enforce_vmpl0();
++ 	}
++ 
++ 	if (snp && !(sev_status & MSR_AMD64_SEV_SNP_ENABLED))
++ 		error("SEV-SNP supported indicated by CC blob, but not SEV status MSR.");
++ 
++ 	sme_me_mask = BIT_ULL(ebx & 0x3f);
++ }
++ 
++ /* Search for Confidential Computing blob in the EFI config table. */
++ static struct cc_blob_sev_info *find_cc_blob_efi(struct boot_params *bp)
++ {
++ 	unsigned long cfg_table_pa;
++ 	unsigned int cfg_table_len;
++ 	int ret;
++ 
++ 	ret = efi_get_conf_table(bp, &cfg_table_pa, &cfg_table_len);
++ 	if (ret)
++ 		return NULL;
++ 
++ 	return (struct cc_blob_sev_info *)efi_find_vendor_table(bp, cfg_table_pa,
++ 								cfg_table_len,
++ 								EFI_CC_BLOB_GUID);
++ }
++ 
++ /*
++  * Initial set up of SNP relies on information provided by the
++  * Confidential Computing blob, which can be passed to the boot kernel
++  * by firmware/bootloader in the following ways:
++  *
++  * - via an entry in the EFI config table
++  * - via a setup_data structure, as defined by the Linux Boot Protocol
++  *
++  * Scan for the blob in that order.
++  */
++ static struct cc_blob_sev_info *find_cc_blob(struct boot_params *bp)
++ {
++ 	struct cc_blob_sev_info *cc_info;
++ 
++ 	cc_info = find_cc_blob_efi(bp);
++ 	if (cc_info)
++ 		goto found_cc_info;
++ 
++ 	cc_info = find_cc_blob_setup_data(bp);
++ 	if (!cc_info)
++ 		return NULL;
++ 
++ found_cc_info:
++ 	if (cc_info->magic != CC_BLOB_SEV_HDR_MAGIC)
++ 		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
++ 
++ 	return cc_info;
++ }
++ 
++ /*
++  * Indicate SNP based on presence of SNP-specific CC blob. Subsequent checks
++  * will verify the SNP CPUID/MSR bits.
++  */
++ bool snp_init(struct boot_params *bp)
++ {
++ 	struct cc_blob_sev_info *cc_info;
++ 
++ 	if (!bp)
++ 		return false;
++ 
++ 	cc_info = find_cc_blob(bp);
++ 	if (!cc_info)
++ 		return false;
++ 
++ 	/*
++ 	 * If a SNP-specific Confidential Computing blob is present, then
++ 	 * firmware/bootloader have indicated SNP support. Verifying this
++ 	 * involves CPUID checks which will be more reliable if the SNP
++ 	 * CPUID table is used. See comments over snp_setup_cpuid_table() for
++ 	 * more details.
++ 	 */
++ 	setup_cpuid_table(cc_info);
++ 
++ 	/*
++ 	 * Pass run-time kernel a pointer to CC info via boot_params so EFI
++ 	 * config table doesn't need to be searched again during early startup
++ 	 * phase.
++ 	 */
++ 	bp->cc_blob_address = (u32)(unsigned long)cc_info;
++ 
++ 	return true;
++ }
++ 
++ void sev_prep_identity_maps(unsigned long top_level_pgt)
++ {
++ 	/*
++ 	 * The Confidential Computing blob is used very early in uncompressed
++ 	 * kernel to find the in-memory CPUID table to handle CPUID
++ 	 * instructions. Make sure an identity-mapping exists so it can be
++ 	 * accessed after switchover.
++ 	 */
++ 	if (sev_snp_enabled()) {
++ 		unsigned long cc_info_pa = boot_params->cc_blob_address;
++ 		struct cc_blob_sev_info *cc_info;
++ 
++ 		kernel_add_identity_map(cc_info_pa, cc_info_pa + sizeof(*cc_info));
++ 
++ 		cc_info = (struct cc_blob_sev_info *)cc_info_pa;
++ 		kernel_add_identity_map(cc_info->cpuid_phys, cc_info->cpuid_phys + cc_info->cpuid_len);
++ 	}
++ 
++ 	sev_verify_cbit(top_level_pgt);
++ }
+++>>>>>>> 30612045e69d (x86/sev: Use firmware-validated CPUID for SEV-SNP guests)
+diff --cc arch/x86/kernel/sev-shared.c
+index 91ece8db542a,2b4270d5559e..000000000000
+--- a/arch/x86/kernel/sev-shared.c
++++ b/arch/x86/kernel/sev-shared.c
+@@@ -546,3 -937,67 +546,70 @@@ static enum es_result vc_handle_rdtsc(s
+  
+  	return ES_OK;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ struct cc_setup_data {
++ 	struct setup_data header;
++ 	u32 cc_blob_address;
++ };
++ 
++ /*
++  * Search for a Confidential Computing blob passed in as a setup_data entry
++  * via the Linux Boot Protocol.
++  */
++ static struct cc_blob_sev_info *find_cc_blob_setup_data(struct boot_params *bp)
++ {
++ 	struct cc_setup_data *sd = NULL;
++ 	struct setup_data *hdr;
++ 
++ 	hdr = (struct setup_data *)bp->hdr.setup_data;
++ 
++ 	while (hdr) {
++ 		if (hdr->type == SETUP_CC_BLOB) {
++ 			sd = (struct cc_setup_data *)hdr;
++ 			return (struct cc_blob_sev_info *)(unsigned long)sd->cc_blob_address;
++ 		}
++ 		hdr = (struct setup_data *)hdr->next;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ /*
++  * Initialize the kernel's copy of the SNP CPUID table, and set up the
++  * pointer that will be used to access it.
++  *
++  * Maintaining a direct mapping of the SNP CPUID table used by firmware would
++  * be possible as an alternative, but the approach is brittle since the
++  * mapping needs to be updated in sync with all the changes to virtual memory
++  * layout and related mapping facilities throughout the boot process.
++  */
++ static void __init setup_cpuid_table(const struct cc_blob_sev_info *cc_info)
++ {
++ 	const struct snp_cpuid_table *cpuid_table_fw, *cpuid_table;
++ 	int i;
++ 
++ 	if (!cc_info || !cc_info->cpuid_phys || cc_info->cpuid_len < PAGE_SIZE)
++ 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_CPUID);
++ 
++ 	cpuid_table_fw = (const struct snp_cpuid_table *)cc_info->cpuid_phys;
++ 	if (!cpuid_table_fw->count || cpuid_table_fw->count > SNP_CPUID_COUNT_MAX)
++ 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_CPUID);
++ 
++ 	cpuid_table = snp_cpuid_get_table();
++ 	memcpy((void *)cpuid_table, cpuid_table_fw, sizeof(*cpuid_table));
++ 
++ 	/* Initialize CPUID ranges for range-checking. */
++ 	for (i = 0; i < cpuid_table->count; i++) {
++ 		const struct snp_cpuid_fn *fn = &cpuid_table->fn[i];
++ 
++ 		if (fn->eax_in == 0x0)
++ 			cpuid_std_range_max = fn->eax;
++ 		else if (fn->eax_in == 0x40000000)
++ 			cpuid_hyp_range_max = fn->eax;
++ 		else if (fn->eax_in == 0x80000000)
++ 			cpuid_ext_range_max = fn->eax;
++ 	}
++ }
+++>>>>>>> 30612045e69d (x86/sev: Use firmware-validated CPUID for SEV-SNP guests)
+diff --cc arch/x86/kernel/sev.c
+index 9f3a4a57b1e6,c8733725d8bf..000000000000
+--- a/arch/x86/kernel/sev.c
++++ b/arch/x86/kernel/sev.c
+@@@ -32,6 -32,9 +32,12 @@@
+  #include <asm/svm.h>
+  #include <asm/smp.h>
+  #include <asm/cpu.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/apic.h>
++ #include <asm/cpuid.h>
++ #include <asm/cmdline.h>
+++>>>>>>> 30612045e69d (x86/sev: Use firmware-validated CPUID for SEV-SNP guests)
+  
+  #define DR7_RESET_VALUE        0x400
+  
+@@@ -1492,3 -1975,90 +1498,93 @@@ fail
+  	while (true)
+  		halt();
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Initial set up of SNP relies on information provided by the
++  * Confidential Computing blob, which can be passed to the kernel
++  * in the following ways, depending on how it is booted:
++  *
++  * - when booted via the boot/decompress kernel:
++  *   - via boot_params
++  *
++  * - when booted directly by firmware/bootloader (e.g. CONFIG_PVH):
++  *   - via a setup_data entry, as defined by the Linux Boot Protocol
++  *
++  * Scan for the blob in that order.
++  */
++ static __init struct cc_blob_sev_info *find_cc_blob(struct boot_params *bp)
++ {
++ 	struct cc_blob_sev_info *cc_info;
++ 
++ 	/* Boot kernel would have passed the CC blob via boot_params. */
++ 	if (bp->cc_blob_address) {
++ 		cc_info = (struct cc_blob_sev_info *)(unsigned long)bp->cc_blob_address;
++ 		goto found_cc_info;
++ 	}
++ 
++ 	/*
++ 	 * If kernel was booted directly, without the use of the
++ 	 * boot/decompression kernel, the CC blob may have been passed via
++ 	 * setup_data instead.
++ 	 */
++ 	cc_info = find_cc_blob_setup_data(bp);
++ 	if (!cc_info)
++ 		return NULL;
++ 
++ found_cc_info:
++ 	if (cc_info->magic != CC_BLOB_SEV_HDR_MAGIC)
++ 		snp_abort();
++ 
++ 	return cc_info;
++ }
++ 
++ bool __init snp_init(struct boot_params *bp)
++ {
++ 	struct cc_blob_sev_info *cc_info;
++ 
++ 	if (!bp)
++ 		return false;
++ 
++ 	cc_info = find_cc_blob(bp);
++ 	if (!cc_info)
++ 		return false;
++ 
++ 	setup_cpuid_table(cc_info);
++ 
++ 	/*
++ 	 * The CC blob will be used later to access the secrets page. Cache
++ 	 * it here like the boot kernel does.
++ 	 */
++ 	bp->cc_blob_address = (u32)(unsigned long)cc_info;
++ 
++ 	return true;
++ }
++ 
++ void __init snp_abort(void)
++ {
++ 	sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
++ }
++ 
++ /*
++  * It is useful from an auditing/testing perspective to provide an easy way
++  * for the guest owner to know that the CPUID table has been initialized as
++  * expected, but that initialization happens too early in boot to print any
++  * sort of indicator, and there's not really any other good place to do it,
++  * so do it here.
++  */
++ static int __init report_cpuid_table(void)
++ {
++ 	const struct snp_cpuid_table *cpuid_table = snp_cpuid_get_table();
++ 
++ 	if (!cpuid_table->count)
++ 		return 0;
++ 
++ 	pr_info("Using SNP CPUID table, %d entries present.\n",
++ 		cpuid_table->count);
++ 
++ 	return 0;
++ }
++ arch_initcall(report_cpuid_table);
+++>>>>>>> 30612045e69d (x86/sev: Use firmware-validated CPUID for SEV-SNP guests)
+* Unmerged path arch/x86/boot/compressed/sev.c
+* Unmerged path arch/x86/kernel/sev-shared.c
+* Unmerged path arch/x86/kernel/sev.c
