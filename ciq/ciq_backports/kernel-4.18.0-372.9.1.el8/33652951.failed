@@ -1,0 +1,182 @@
+RDMA/mlx5: Support real-time timestamp directly from the device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Aharon Landau <aharonl@nvidia.com>
+commit 336529518e9724d4cecabc622e57bcdce02e7c61
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/33652951.failed
+
+Currently, if the user asks for a real-time timestamp, the device will
+return a free-running one, and the timestamp will be translated to
+real-time in the user-space.
+
+When the device supports only real-time timestamp and not free-running,
+the creation of the QP will fail even though the user needs supported the
+real-time one. To prevent this, we will return the real-time timestamp
+directly from the device.
+
+Link: https://lore.kernel.org/r/c6cfc8e6f038575c5c2de6505830f7e74e4de80d.1623829775.git.leonro@nvidia.com
+	Signed-off-by: Aharon Landau <aharonl@nvidia.com>
+	Reviewed-by: Maor Gottlieb <maorg@nvidia.com>
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 336529518e9724d4cecabc622e57bcdce02e7c61)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/rdma/mlx5-abi.h
+diff --cc include/uapi/rdma/mlx5-abi.h
+index 995faf8f44bd,82e3bc1eb57d..000000000000
+--- a/include/uapi/rdma/mlx5-abi.h
++++ b/include/uapi/rdma/mlx5-abi.h
+@@@ -101,7 -101,7 +101,11 @@@ enum mlx5_ib_alloc_ucontext_resp_mask 
+  	MLX5_IB_ALLOC_UCONTEXT_RESP_MASK_CORE_CLOCK_OFFSET = 1UL << 0,
+  	MLX5_IB_ALLOC_UCONTEXT_RESP_MASK_DUMP_FILL_MKEY    = 1UL << 1,
+  	MLX5_IB_ALLOC_UCONTEXT_RESP_MASK_ECE               = 1UL << 2,
+++<<<<<<< HEAD
+ +	MLX5_IB_ALLOC_UCONTEXT_RESP_MASK_SQD2RTS           = 1UL << 3,
+++=======
++ 	MLX5_IB_ALLOC_UCONTEXT_RESP_MASK_REAL_TIME_TS	   = 1UL << 4,
+++>>>>>>> 336529518e97 (RDMA/mlx5: Support real-time timestamp directly from the device)
+  };
+  
+  enum mlx5_user_cmds_supp_uhw {
+diff --git a/drivers/infiniband/hw/mlx5/cq.c b/drivers/infiniband/hw/mlx5/cq.c
+index 2c5c37170b7a..18804f2eec04 100644
+--- a/drivers/infiniband/hw/mlx5/cq.c
++++ b/drivers/infiniband/hw/mlx5/cq.c
+@@ -725,7 +725,8 @@ static int create_cq_user(struct mlx5_ib_dev *dev, struct ib_udata *udata,
+ 		return -EFAULT;
+ 
+ 	if ((ucmd.flags & ~(MLX5_IB_CREATE_CQ_FLAGS_CQE_128B_PAD |
+-			    MLX5_IB_CREATE_CQ_FLAGS_UAR_PAGE_INDEX)))
++			    MLX5_IB_CREATE_CQ_FLAGS_UAR_PAGE_INDEX |
++			    MLX5_IB_CREATE_CQ_FLAGS_REAL_TIME_TS)))
+ 		return -EINVAL;
+ 
+ 	if ((ucmd.cqe_size != 64 && ucmd.cqe_size != 128) ||
+@@ -826,6 +827,9 @@ static int create_cq_user(struct mlx5_ib_dev *dev, struct ib_udata *udata,
+ 		cq->private_flags |= MLX5_IB_CQ_PR_FLAGS_CQE_128_PAD;
+ 	}
+ 
++	if (ucmd.flags & MLX5_IB_CREATE_CQ_FLAGS_REAL_TIME_TS)
++		cq->private_flags |= MLX5_IB_CQ_PR_FLAGS_REAL_TIME_TS;
++
+ 	MLX5_SET(create_cq_in, *cqb, uid, context->devx_uid);
+ 	return 0;
+ 
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 925beae460c3..d5fd18b06218 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -1815,6 +1815,12 @@ static int set_ucontext_resp(struct ib_ucontext *uctx,
+ 	if (MLX5_CAP_GEN(dev->mdev, ece_support))
+ 		resp->comp_mask |= MLX5_IB_ALLOC_UCONTEXT_RESP_MASK_ECE;
+ 
++	if (rt_supported(MLX5_CAP_GEN(dev->mdev, sq_ts_format)) &&
++	    rt_supported(MLX5_CAP_GEN(dev->mdev, rq_ts_format)) &&
++	    rt_supported(MLX5_CAP_ROCE(dev->mdev, qp_ts_format)))
++		resp->comp_mask |=
++			MLX5_IB_ALLOC_UCONTEXT_RESP_MASK_REAL_TIME_TS;
++
+ 	resp->num_dyn_bfregs = bfregi->num_dyn_bfregs;
+ 
+ 	if (MLX5_CAP_GEN(dev->mdev, drain_sigerr))
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 74c719ef65e1..338e1e9f4724 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -548,6 +548,7 @@ static inline const struct mlx5_umr_wr *umr_wr(const struct ib_send_wr *wr)
+ 
+ enum mlx5_ib_cq_pr_flags {
+ 	MLX5_IB_CQ_PR_FLAGS_CQE_128_PAD	= 1 << 0,
++	MLX5_IB_CQ_PR_FLAGS_REAL_TIME_TS = 1 << 1,
+ };
+ 
+ struct mlx5_ib_cq {
+@@ -1595,4 +1596,10 @@ static inline bool mlx5_ib_lag_should_assign_affinity(struct mlx5_ib_dev *dev)
+ 		(MLX5_CAP_GEN(dev->mdev, num_lag_ports) > 1 &&
+ 		 MLX5_CAP_GEN(dev->mdev, lag_tx_port_affinity));
+ }
++
++static inline bool rt_supported(int ts_cap)
++{
++	return ts_cap == MLX5_TIMESTAMP_FORMAT_CAP_REAL_TIME ||
++	       ts_cap == MLX5_TIMESTAMP_FORMAT_CAP_FREE_RUNNING_AND_REAL_TIME;
++}
+ #endif /* MLX5_IB_H */
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index 91742406ab1b..5e7ca6cc437f 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -1180,8 +1180,16 @@ static bool fr_supported(int ts_cap)
+ }
+ 
+ static int get_ts_format(struct mlx5_ib_dev *dev, struct mlx5_ib_cq *cq,
+-			 bool fr_sup)
++			 bool fr_sup, bool rt_sup)
+ {
++	if (cq->private_flags & MLX5_IB_CQ_PR_FLAGS_REAL_TIME_TS) {
++		if (!rt_sup) {
++			mlx5_ib_dbg(dev,
++				    "Real time TS format is not supported\n");
++			return -EOPNOTSUPP;
++		}
++		return MLX5_TIMESTAMP_FORMAT_REAL_TIME;
++	}
+ 	if (cq->create_flags & IB_UVERBS_CQ_FLAGS_TIMESTAMP_COMPLETION) {
+ 		if (!fr_sup) {
+ 			mlx5_ib_dbg(dev,
+@@ -1198,14 +1206,16 @@ static int get_rq_ts_format(struct mlx5_ib_dev *dev, struct mlx5_ib_cq *recv_cq)
+ {
+ 	u8 ts_cap = MLX5_CAP_GEN(dev->mdev, rq_ts_format);
+ 
+-	return get_ts_format(dev, recv_cq, fr_supported(ts_cap));
++	return get_ts_format(dev, recv_cq, fr_supported(ts_cap),
++			     rt_supported(ts_cap));
+ }
+ 
+ static int get_sq_ts_format(struct mlx5_ib_dev *dev, struct mlx5_ib_cq *send_cq)
+ {
+ 	u8 ts_cap = MLX5_CAP_GEN(dev->mdev, sq_ts_format);
+ 
+-	return get_ts_format(dev, send_cq, fr_supported(ts_cap));
++	return get_ts_format(dev, send_cq, fr_supported(ts_cap),
++			     rt_supported(ts_cap));
+ }
+ 
+ static int get_qp_ts_format(struct mlx5_ib_dev *dev, struct mlx5_ib_cq *send_cq,
+@@ -1213,18 +1223,28 @@ static int get_qp_ts_format(struct mlx5_ib_dev *dev, struct mlx5_ib_cq *send_cq,
+ {
+ 	u8 ts_cap = MLX5_CAP_ROCE(dev->mdev, qp_ts_format);
+ 	bool fr_sup = fr_supported(ts_cap);
++	bool rt_sup = rt_supported(ts_cap);
+ 	u8 default_ts = fr_sup ? MLX5_TIMESTAMP_FORMAT_FREE_RUNNING :
+ 				 MLX5_TIMESTAMP_FORMAT_DEFAULT;
+ 	int send_ts_format =
+-		send_cq ? get_ts_format(dev, send_cq, fr_sup) :
++		send_cq ? get_ts_format(dev, send_cq, fr_sup, rt_sup) :
+ 			  default_ts;
+ 	int recv_ts_format =
+-		recv_cq ? get_ts_format(dev, recv_cq, fr_sup) :
++		recv_cq ? get_ts_format(dev, recv_cq, fr_sup, rt_sup) :
+ 			  default_ts;
+ 
+ 	if (send_ts_format < 0 || recv_ts_format < 0)
+ 		return -EOPNOTSUPP;
+ 
++	if (send_ts_format != MLX5_TIMESTAMP_FORMAT_DEFAULT &&
++	    recv_ts_format != MLX5_TIMESTAMP_FORMAT_DEFAULT &&
++	    send_ts_format != recv_ts_format) {
++		mlx5_ib_dbg(
++			dev,
++			"The send ts_format does not match the receive ts_format\n");
++		return -EOPNOTSUPP;
++	}
++
+ 	return send_ts_format == default_ts ? recv_ts_format : send_ts_format;
+ }
+ 
+* Unmerged path include/uapi/rdma/mlx5-abi.h
