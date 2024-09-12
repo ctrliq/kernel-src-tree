@@ -1,0 +1,196 @@
+KVM: VMX: Convert launched argument to flags
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Josh Poimboeuf <jpoimboe@kernel.org>
+commit bb06650634d3552c0f8557e9d16aa1a408040e28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/bb066506.failed
+
+Convert __vmx_vcpu_run()'s 'launched' argument to 'flags', in
+preparation for doing SPEC_CTRL handling immediately after vmexit, which
+will need another flag.
+
+This is much easier than adding a fourth argument, because this code
+supports both 32-bit and 64-bit, and the fourth argument on 32-bit would
+have to be pushed on the stack.
+
+Note that __vmx_vcpu_run_flags() is called outside of the noinstr
+critical section because it will soon start calling potentially
+traceable functions.
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@kernel.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit bb06650634d3552c0f8557e9d16aa1a408040e28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmenter.S
+diff --cc arch/x86/kvm/vmx/vmenter.S
+index fd0a4aadb374,ddc3bf85db33..000000000000
+--- a/arch/x86/kvm/vmx/vmenter.S
++++ b/arch/x86/kvm/vmx/vmenter.S
+@@@ -121,11 -60,10 +122,11 @@@ SYM_FUNC_START(__vmx_vcpu_run
+  	 */
+  	push %_ASM_ARG2
+  
+- 	/* Copy @launched to BL, _ASM_ARG3 is volatile. */
++ 	/* Copy @flags to BL, _ASM_ARG3 is volatile. */
+  	mov %_ASM_ARG3B, %bl
+  
+ -	lea (%_ASM_SP), %_ASM_ARG2
+ +	/* Adjust RSP to account for the CALL to vmx_vmenter(). */
+ +	lea -WORD_SIZE(%_ASM_SP), %_ASM_ARG2
+  	call vmx_update_host_rsp
+  
+  	/* Load @regs to RAX. */
+@@@ -154,11 -92,37 +155,16 @@@
+  	/* Load guest RAX.  This kills the @regs pointer! */
+  	mov VCPU_RAX(%_ASM_AX), %_ASM_AX
+  
+++<<<<<<< HEAD
+ +	/* Enter guest mode */
+ +	call vmx_vmenter
+++=======
++ 	/* Check EFLAGS.ZF from 'testb' above */
++ 	jz .Lvmlaunch
+++>>>>>>> bb06650634d3 (KVM: VMX: Convert launched argument to flags)
+  
+ -	/*
+ -	 * After a successful VMRESUME/VMLAUNCH, control flow "magically"
+ -	 * resumes below at 'vmx_vmexit' due to the VMCS HOST_RIP setting.
+ -	 * So this isn't a typical function and objtool needs to be told to
+ -	 * save the unwind state here and restore it below.
+ -	 */
+ -	UNWIND_HINT_SAVE
+ -
+ -/*
+ - * If VMRESUME/VMLAUNCH and corresponding vmexit succeed, execution resumes at
+ - * the 'vmx_vmexit' label below.
+ - */
+ -.Lvmresume:
+ -	vmresume
+ -	jmp .Lvmfail
+ -
+ -.Lvmlaunch:
+ -	vmlaunch
+ -	jmp .Lvmfail
+ -
+ -	_ASM_EXTABLE(.Lvmresume, .Lfixup)
+ -	_ASM_EXTABLE(.Lvmlaunch, .Lfixup)
+ -
+ -SYM_INNER_LABEL(vmx_vmexit, SYM_L_GLOBAL)
+ -
+ -	/* Restore unwind state from before the VMRESUME/VMLAUNCH. */
+ -	UNWIND_HINT_RESTORE
+ -	ENDBR
+ +	/* Jump on VM-Fail. */
+ +	jbe 2f
+  
+  	/* Temporarily save guest's RAX. */
+  	push %_ASM_AX
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index 40abacde21fa..9de57acd72ef 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -3081,7 +3081,7 @@ static int nested_vmx_check_vmentry_hw(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	vm_fail = __vmx_vcpu_run(vmx, (unsigned long *)&vcpu->arch.regs,
+-				 vmx->loaded_vmcs->launched);
++				 __vmx_vcpu_run_flags(vmx));
+ 
+ 	if (vmx->msr_autoload.host.nr)
+ 		vmcs_write32(VM_EXIT_MSR_LOAD_COUNT, vmx->msr_autoload.host.nr);
+diff --git a/arch/x86/kvm/vmx/run_flags.h b/arch/x86/kvm/vmx/run_flags.h
+new file mode 100644
+index 000000000000..57f4c664ea9c
+--- /dev/null
++++ b/arch/x86/kvm/vmx/run_flags.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __KVM_X86_VMX_RUN_FLAGS_H
++#define __KVM_X86_VMX_RUN_FLAGS_H
++
++#define VMX_RUN_VMRESUME	(1 << 0)
++
++#endif /* __KVM_X86_VMX_RUN_FLAGS_H */
+* Unmerged path arch/x86/kvm/vmx/vmenter.S
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index e42640520968..da7c92dc8b0d 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -856,6 +856,16 @@ static bool msr_write_intercepted(struct vcpu_vmx *vmx, u32 msr)
+ 	return true;
+ }
+ 
++unsigned int __vmx_vcpu_run_flags(struct vcpu_vmx *vmx)
++{
++	unsigned int flags = 0;
++
++	if (vmx->loaded_vmcs->launched)
++		flags |= VMX_RUN_VMRESUME;
++
++	return flags;
++}
++
+ static void clear_atomic_switch_msr_special(struct vcpu_vmx *vmx,
+ 		unsigned long entry, unsigned long exit)
+ {
+@@ -6717,7 +6727,8 @@ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu)
+ }
+ 
+ static noinstr void vmx_vcpu_enter_exit(struct kvm_vcpu *vcpu,
+-					struct vcpu_vmx *vmx)
++					struct vcpu_vmx *vmx,
++					unsigned long flags)
+ {
+ 	kvm_guest_enter_irqoff();
+ 
+@@ -6736,7 +6747,7 @@ static noinstr void vmx_vcpu_enter_exit(struct kvm_vcpu *vcpu,
+ 		native_write_cr2(vcpu->arch.cr2);
+ 
+ 	vmx->fail = __vmx_vcpu_run(vmx, (unsigned long *)&vcpu->arch.regs,
+-				   vmx->loaded_vmcs->launched);
++				   flags);
+ 
+ 	vcpu->arch.cr2 = native_read_cr2();
+ 
+@@ -6838,7 +6849,7 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ 	x86_spec_ctrl_set_guest(vmx->spec_ctrl, 0);
+ 
+ 	/* The actual VMENTER/EXIT is in the .noinstr.text section. */
+-	vmx_vcpu_enter_exit(vcpu, vmx);
++	vmx_vcpu_enter_exit(vcpu, vmx, __vmx_vcpu_run_flags(vmx));
+ 
+ 	/*
+ 	 * We do not use IBRS in the kernel. If this vCPU has used the
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index f120ccd14f3d..6bc23b5cfdc1 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -13,6 +13,7 @@
+ #include "vmcs.h"
+ #include "vmx_ops.h"
+ #include "cpuid.h"
++#include "run_flags.h"
+ 
+ #define MSR_TYPE_R	1
+ #define MSR_TYPE_W	2
+@@ -381,7 +382,9 @@ void vmx_set_virtual_apic_mode(struct kvm_vcpu *vcpu);
+ struct vmx_uret_msr *vmx_find_uret_msr(struct vcpu_vmx *vmx, u32 msr);
+ void pt_update_intercept_for_msr(struct kvm_vcpu *vcpu);
+ void vmx_update_host_rsp(struct vcpu_vmx *vmx, unsigned long host_rsp);
+-bool __vmx_vcpu_run(struct vcpu_vmx *vmx, unsigned long *regs, bool launched);
++unsigned int __vmx_vcpu_run_flags(struct vcpu_vmx *vmx);
++bool __vmx_vcpu_run(struct vcpu_vmx *vmx, unsigned long *regs,
++		    unsigned int flags);
+ int vmx_find_loadstore_msr_slot(struct vmx_msrs *m, u32 msr);
+ void vmx_ept_load_pdptrs(struct kvm_vcpu *vcpu);
+ 
