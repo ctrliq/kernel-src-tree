@@ -1,0 +1,96 @@
+powerpc/watchdog: introduce a NMI watchdog's factor
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-488.el8
+commit-author Laurent Dufour <ldufour@linux.ibm.com>
+commit f5e74e836097d1004077390717d4bd95d4a2c27a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-488.el8/f5e74e83.failed
+
+Introduce a factor which would apply to the NMI watchdog timeout.
+
+This factor is a percentage added to the watchdog_tresh value. The value is
+set under the watchdog_mutex protection and lockup_detector_reconfigure()
+is called to recompute wd_panic_timeout_tb.
+
+Once the factor is set, it remains until it is set back to 0, which means
+no impact.
+
+	Signed-off-by: Laurent Dufour <ldufour@linux.ibm.com>
+	Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20220713154729.80789-4-ldufour@linux.ibm.com
+
+(cherry picked from commit f5e74e836097d1004077390717d4bd95d4a2c27a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/nmi.h
+diff --cc arch/powerpc/include/asm/nmi.h
+index 84b4cfe73edd,c3c7adef74de..000000000000
+--- a/arch/powerpc/include/asm/nmi.h
++++ b/arch/powerpc/include/asm/nmi.h
+@@@ -4,11 -4,14 +4,17 @@@
+  
+  #ifdef CONFIG_PPC_WATCHDOG
+  extern void arch_touch_nmi_watchdog(void);
+++<<<<<<< HEAD
+++=======
++ long soft_nmi_interrupt(struct pt_regs *regs);
++ void watchdog_nmi_set_timeout_pct(u64 pct);
+++>>>>>>> f5e74e836097 (powerpc/watchdog: introduce a NMI watchdog's factor)
+  #else
+  static inline void arch_touch_nmi_watchdog(void) {}
++ static inline void watchdog_nmi_set_timeout_pct(u64 pct) {}
+  #endif
+  
+ -#ifdef CONFIG_NMI_IPI
+ +#if defined(CONFIG_NMI_IPI) && defined(CONFIG_STACKTRACE)
+  extern void arch_trigger_cpumask_backtrace(const cpumask_t *mask,
+  					   bool exclude_self);
+  #define arch_trigger_cpumask_backtrace arch_trigger_cpumask_backtrace
+* Unmerged path arch/powerpc/include/asm/nmi.h
+diff --git a/arch/powerpc/kernel/watchdog.c b/arch/powerpc/kernel/watchdog.c
+index 0a6d3a227ed8..d1a525fb4de9 100644
+--- a/arch/powerpc/kernel/watchdog.c
++++ b/arch/powerpc/kernel/watchdog.c
+@@ -88,6 +88,10 @@ static cpumask_t wd_smp_cpus_pending;
+ static cpumask_t wd_smp_cpus_stuck;
+ static u64 wd_smp_last_reset_tb;
+ 
++#ifdef CONFIG_PPC_PSERIES
++static u64 wd_timeout_pct;
++#endif
++
+ /*
+  * Try to take the exclusive watchdog action / NMI IPI / printing lock.
+  * wd_smp_lock must be held. If this fails, we should return and wait
+@@ -526,7 +530,13 @@ static int stop_watchdog_on_cpu(unsigned int cpu)
+ 
+ static void watchdog_calc_timeouts(void)
+ {
+-	wd_panic_timeout_tb = watchdog_thresh * ppc_tb_freq;
++	u64 threshold = watchdog_thresh;
++
++#ifdef CONFIG_PPC_PSERIES
++	threshold += (READ_ONCE(wd_timeout_pct) * threshold) / 100;
++#endif
++
++	wd_panic_timeout_tb = threshold * ppc_tb_freq;
+ 
+ 	/* Have the SMP detector trigger a bit later */
+ 	wd_smp_panic_timeout_tb = wd_panic_timeout_tb * 3 / 2;
+@@ -569,3 +579,12 @@ int __init watchdog_nmi_probe(void)
+ 	}
+ 	return 0;
+ }
++
++#ifdef CONFIG_PPC_PSERIES
++void watchdog_nmi_set_timeout_pct(u64 pct)
++{
++	pr_info("Set the NMI watchdog timeout factor to %llu%%\n", pct);
++	WRITE_ONCE(wd_timeout_pct, pct);
++	lockup_detector_reconfigure();
++}
++#endif
