@@ -1,0 +1,532 @@
+ASoC: SOF: ipc: Move the ipc_set_get_comp_data() local to ipc3-control
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+commit e760f102c92c16307abebffd24a31bdb3ccd78ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/e760f102.failed
+
+The snd_sof_ipc_set_get_comp_data() only used for kcontrol data update
+and it is an IPC3 message parsing function.
+
+Move it out from the generic ipc.c to ipc3-control.c and rename it to
+better describe it's function.
+
+	Signed-off-by: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+	Reviewed-by: Daniel Baluta <daniel.baluta@nxp.com>
+	Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Signed-off-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Link: https://lore.kernel.org/r/20220405172708.122168-16-ranjani.sridharan@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit e760f102c92c16307abebffd24a31bdb3ccd78ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/ipc.c
+#	sound/soc/sof/ipc3-control.c
+diff --cc sound/soc/sof/ipc.c
+index 8fa056049072,6f8ac3fb195f..000000000000
+--- a/sound/soc/sof/ipc.c
++++ b/sound/soc/sof/ipc.c
+@@@ -476,477 -137,6 +476,480 @@@ void snd_sof_ipc_reply(struct snd_sof_d
+  }
+  EXPORT_SYMBOL(snd_sof_ipc_reply);
+  
+++<<<<<<< HEAD
+ +static void ipc_comp_notification(struct snd_sof_dev *sdev, void *msg_buf)
+ +{
+ +	struct sof_ipc_cmd_hdr *hdr = msg_buf;
+ +	u32 msg_type = hdr->cmd & SOF_CMD_TYPE_MASK;
+ +
+ +	switch (msg_type) {
+ +	case SOF_IPC_COMP_GET_VALUE:
+ +	case SOF_IPC_COMP_GET_DATA:
+ +		break;
+ +	default:
+ +		dev_err(sdev->dev, "error: unhandled component message %#x\n", msg_type);
+ +		return;
+ +	}
+ +
+ +	snd_sof_control_notify(sdev, msg_buf);
+ +}
+ +
+ +/* DSP firmware has sent host a message  */
+ +void snd_sof_ipc_msgs_rx(struct snd_sof_dev *sdev)
+ +{
+ +	ipc_rx_callback rx_callback = NULL;
+ +	struct sof_ipc_cmd_hdr hdr;
+ +	void *msg_buf;
+ +	u32 cmd;
+ +	int err;
+ +
+ +	/* read back header */
+ +	err = snd_sof_ipc_msg_data(sdev, NULL, &hdr, sizeof(hdr));
+ +	if (err < 0) {
+ +		dev_warn(sdev->dev, "failed to read IPC header: %d\n", err);
+ +		return;
+ +	}
+ +
+ +	if (hdr.size < sizeof(hdr)) {
+ +		dev_err(sdev->dev, "The received message size is invalid\n");
+ +		return;
+ +	}
+ +
+ +	ipc_log_header(sdev->dev, "ipc rx", hdr.cmd);
+ +
+ +	cmd = hdr.cmd & SOF_GLB_TYPE_MASK;
+ +
+ +	/* check message type */
+ +	switch (cmd) {
+ +	case SOF_IPC_GLB_REPLY:
+ +		dev_err(sdev->dev, "error: ipc reply unknown\n");
+ +		break;
+ +	case SOF_IPC_FW_READY:
+ +		/* check for FW boot completion */
+ +		if (sdev->fw_state == SOF_FW_BOOT_IN_PROGRESS) {
+ +			err = sof_ops(sdev)->fw_ready(sdev, cmd);
+ +			if (err < 0)
+ +				sof_set_fw_state(sdev, SOF_FW_BOOT_READY_FAILED);
+ +			else
+ +				sof_set_fw_state(sdev, SOF_FW_BOOT_READY_OK);
+ +
+ +			/* wake up firmware loader */
+ +			wake_up(&sdev->boot_wait);
+ +		}
+ +		break;
+ +	case SOF_IPC_GLB_COMPOUND:
+ +	case SOF_IPC_GLB_TPLG_MSG:
+ +	case SOF_IPC_GLB_PM_MSG:
+ +		break;
+ +	case SOF_IPC_GLB_COMP_MSG:
+ +		rx_callback = ipc_comp_notification;
+ +		break;
+ +	case SOF_IPC_GLB_STREAM_MSG:
+ +		rx_callback = ipc_stream_message;
+ +		break;
+ +	case SOF_IPC_GLB_TRACE_MSG:
+ +		rx_callback = ipc_trace_message;
+ +		break;
+ +	default:
+ +		dev_err(sdev->dev, "%s: Unknown DSP message: 0x%x\n", __func__, cmd);
+ +		break;
+ +	}
+ +
+ +	if (rx_callback) {
+ +		/* read the full message as we have rx handler for it */
+ +		msg_buf = kmalloc(hdr.size, GFP_KERNEL);
+ +		if (!msg_buf)
+ +			return;
+ +
+ +		err = snd_sof_ipc_msg_data(sdev, NULL, msg_buf, hdr.size);
+ +		if (err < 0)
+ +			dev_err(sdev->dev, "%s: Failed to read message: %d\n",
+ +				__func__, err);
+ +		else
+ +			rx_callback(sdev, msg_buf);
+ +
+ +		kfree(msg_buf);
+ +	}
+ +
+ +	ipc_log_header(sdev->dev, "ipc rx done", hdr.cmd);
+ +}
+ +EXPORT_SYMBOL(snd_sof_ipc_msgs_rx);
+ +
+ +/*
+ + * IPC trace mechanism.
+ + */
+ +
+ +static void ipc_trace_message(struct snd_sof_dev *sdev, void *msg_buf)
+ +{
+ +	struct sof_ipc_cmd_hdr *hdr = msg_buf;
+ +	u32 msg_type = hdr->cmd & SOF_CMD_TYPE_MASK;
+ +
+ +	switch (msg_type) {
+ +	case SOF_IPC_TRACE_DMA_POSITION:
+ +		snd_sof_trace_update_pos(sdev, msg_buf);
+ +		break;
+ +	default:
+ +		dev_err(sdev->dev, "error: unhandled trace message %#x\n", msg_type);
+ +		break;
+ +	}
+ +}
+ +
+ +/*
+ + * IPC stream position.
+ + */
+ +
+ +static void ipc_period_elapsed(struct snd_sof_dev *sdev, u32 msg_id)
+ +{
+ +	struct snd_soc_component *scomp = sdev->component;
+ +	struct snd_sof_pcm_stream *stream;
+ +	struct sof_ipc_stream_posn posn;
+ +	struct snd_sof_pcm *spcm;
+ +	int direction, ret;
+ +
+ +	spcm = snd_sof_find_spcm_comp(scomp, msg_id, &direction);
+ +	if (!spcm) {
+ +		dev_err(sdev->dev,
+ +			"error: period elapsed for unknown stream, msg_id %d\n",
+ +			msg_id);
+ +		return;
+ +	}
+ +
+ +	stream = &spcm->stream[direction];
+ +	ret = snd_sof_ipc_msg_data(sdev, stream->substream, &posn, sizeof(posn));
+ +	if (ret < 0) {
+ +		dev_warn(sdev->dev, "failed to read stream position: %d\n", ret);
+ +		return;
+ +	}
+ +
+ +	dev_vdbg(sdev->dev, "posn : host 0x%llx dai 0x%llx wall 0x%llx\n",
+ +		 posn.host_posn, posn.dai_posn, posn.wallclock);
+ +
+ +	memcpy(&stream->posn, &posn, sizeof(posn));
+ +
+ +	if (spcm->pcm.compress)
+ +		snd_sof_compr_fragment_elapsed(stream->cstream);
+ +	else if (stream->substream->runtime &&
+ +		 !stream->substream->runtime->no_period_wakeup)
+ +		/* only inform ALSA for period_wakeup mode */
+ +		snd_sof_pcm_period_elapsed(stream->substream);
+ +}
+ +
+ +/* DSP notifies host of an XRUN within FW */
+ +static void ipc_xrun(struct snd_sof_dev *sdev, u32 msg_id)
+ +{
+ +	struct snd_soc_component *scomp = sdev->component;
+ +	struct snd_sof_pcm_stream *stream;
+ +	struct sof_ipc_stream_posn posn;
+ +	struct snd_sof_pcm *spcm;
+ +	int direction, ret;
+ +
+ +	spcm = snd_sof_find_spcm_comp(scomp, msg_id, &direction);
+ +	if (!spcm) {
+ +		dev_err(sdev->dev, "error: XRUN for unknown stream, msg_id %d\n",
+ +			msg_id);
+ +		return;
+ +	}
+ +
+ +	stream = &spcm->stream[direction];
+ +	ret = snd_sof_ipc_msg_data(sdev, stream->substream, &posn, sizeof(posn));
+ +	if (ret < 0) {
+ +		dev_warn(sdev->dev, "failed to read overrun position: %d\n", ret);
+ +		return;
+ +	}
+ +
+ +	dev_dbg(sdev->dev,  "posn XRUN: host %llx comp %d size %d\n",
+ +		posn.host_posn, posn.xrun_comp_id, posn.xrun_size);
+ +
+ +#if defined(CONFIG_SND_SOC_SOF_DEBUG_XRUN_STOP)
+ +	/* stop PCM on XRUN - used for pipeline debug */
+ +	memcpy(&stream->posn, &posn, sizeof(posn));
+ +	snd_pcm_stop_xrun(stream->substream);
+ +#endif
+ +}
+ +
+ +/* stream notifications from DSP FW */
+ +static void ipc_stream_message(struct snd_sof_dev *sdev, void *msg_buf)
+ +{
+ +	struct sof_ipc_cmd_hdr *hdr = msg_buf;
+ +	u32 msg_type = hdr->cmd & SOF_CMD_TYPE_MASK;
+ +	u32 msg_id = SOF_IPC_MESSAGE_ID(hdr->cmd);
+ +
+ +	switch (msg_type) {
+ +	case SOF_IPC_STREAM_POSITION:
+ +		ipc_period_elapsed(sdev, msg_id);
+ +		break;
+ +	case SOF_IPC_STREAM_TRIG_XRUN:
+ +		ipc_xrun(sdev, msg_id);
+ +		break;
+ +	default:
+ +		dev_err(sdev->dev, "error: unhandled stream message %#x\n",
+ +			msg_id);
+ +		break;
+ +	}
+ +}
+ +
+ +/* get stream position IPC - use faster MMIO method if available on platform */
+ +int snd_sof_ipc_stream_posn(struct snd_soc_component *scomp,
+ +			    struct snd_sof_pcm *spcm, int direction,
+ +			    struct sof_ipc_stream_posn *posn)
+ +{
+ +	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(scomp);
+ +	struct sof_ipc_stream stream;
+ +	int err;
+ +
+ +	/* read position via slower IPC */
+ +	stream.hdr.size = sizeof(stream);
+ +	stream.hdr.cmd = SOF_IPC_GLB_STREAM_MSG | SOF_IPC_STREAM_POSITION;
+ +	stream.comp_id = spcm->stream[direction].comp_id;
+ +
+ +	/* send IPC to the DSP */
+ +	err = sof_ipc_tx_message(sdev->ipc,
+ +				 stream.hdr.cmd, &stream, sizeof(stream), posn,
+ +				 sizeof(*posn));
+ +	if (err < 0) {
+ +		dev_err(sdev->dev, "error: failed to get stream %d position\n",
+ +			stream.comp_id);
+ +		return err;
+ +	}
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(snd_sof_ipc_stream_posn);
+ +
+ +static int sof_get_ctrl_copy_params(enum sof_ipc_ctrl_type ctrl_type,
+ +				    struct sof_ipc_ctrl_data *src,
+ +				    struct sof_ipc_ctrl_data *dst,
+ +				    struct sof_ipc_ctrl_data_params *sparams)
+ +{
+ +	switch (ctrl_type) {
+ +	case SOF_CTRL_TYPE_VALUE_CHAN_GET:
+ +	case SOF_CTRL_TYPE_VALUE_CHAN_SET:
+ +		sparams->src = (u8 *)src->chanv;
+ +		sparams->dst = (u8 *)dst->chanv;
+ +		break;
+ +	case SOF_CTRL_TYPE_DATA_GET:
+ +	case SOF_CTRL_TYPE_DATA_SET:
+ +		sparams->src = (u8 *)src->data->data;
+ +		sparams->dst = (u8 *)dst->data->data;
+ +		break;
+ +	default:
+ +		return -EINVAL;
+ +	}
+ +
+ +	/* calculate payload size and number of messages */
+ +	sparams->pl_size = SOF_IPC_MSG_MAX_SIZE - sparams->hdr_bytes;
+ +	sparams->num_msg = DIV_ROUND_UP(sparams->msg_bytes, sparams->pl_size);
+ +
+ +	return 0;
+ +}
+ +
+ +static int sof_set_get_large_ctrl_data(struct snd_sof_dev *sdev,
+ +				       struct sof_ipc_ctrl_data *cdata,
+ +				       struct sof_ipc_ctrl_data_params *sparams,
+ +				       bool set)
+ +{
+ +	struct sof_ipc_ctrl_data *partdata;
+ +	size_t send_bytes;
+ +	size_t offset = 0;
+ +	size_t msg_bytes;
+ +	size_t pl_size;
+ +	int err;
+ +	int i;
+ +
+ +	/* allocate max ipc size because we have at least one */
+ +	partdata = kzalloc(SOF_IPC_MSG_MAX_SIZE, GFP_KERNEL);
+ +	if (!partdata)
+ +		return -ENOMEM;
+ +
+ +	if (set)
+ +		err = sof_get_ctrl_copy_params(cdata->type, cdata, partdata,
+ +					       sparams);
+ +	else
+ +		err = sof_get_ctrl_copy_params(cdata->type, partdata, cdata,
+ +					       sparams);
+ +	if (err < 0) {
+ +		kfree(partdata);
+ +		return err;
+ +	}
+ +
+ +	msg_bytes = sparams->msg_bytes;
+ +	pl_size = sparams->pl_size;
+ +
+ +	/* copy the header data */
+ +	memcpy(partdata, cdata, sparams->hdr_bytes);
+ +
+ +	/* Serialise IPC TX */
+ +	mutex_lock(&sdev->ipc->tx_mutex);
+ +
+ +	/* copy the payload data in a loop */
+ +	for (i = 0; i < sparams->num_msg; i++) {
+ +		send_bytes = min(msg_bytes, pl_size);
+ +		partdata->num_elems = send_bytes;
+ +		partdata->rhdr.hdr.size = sparams->hdr_bytes + send_bytes;
+ +		partdata->msg_index = i;
+ +		msg_bytes -= send_bytes;
+ +		partdata->elems_remaining = msg_bytes;
+ +
+ +		if (set)
+ +			memcpy(sparams->dst, sparams->src + offset, send_bytes);
+ +
+ +		err = sof_ipc_tx_message_unlocked(sdev->ipc,
+ +						  partdata,
+ +						  partdata->rhdr.hdr.size,
+ +						  partdata,
+ +						  partdata->rhdr.hdr.size);
+ +		if (err < 0)
+ +			break;
+ +
+ +		if (!set)
+ +			memcpy(sparams->dst + offset, sparams->src, send_bytes);
+ +
+ +		offset += pl_size;
+ +	}
+ +
+ +	mutex_unlock(&sdev->ipc->tx_mutex);
+ +
+ +	kfree(partdata);
+ +	return err;
+ +}
+ +
+ +/*
+ + * IPC get()/set() for kcontrols.
+ + */
+ +int snd_sof_ipc_set_get_comp_data(struct snd_sof_control *scontrol, bool set)
+ +{
+ +	struct snd_soc_component *scomp = scontrol->scomp;
+ +	struct sof_ipc_ctrl_data *cdata = scontrol->control_data;
+ +	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(scomp);
+ +	struct sof_ipc_fw_ready *ready = &sdev->fw_ready;
+ +	struct sof_ipc_fw_version *v = &ready->version;
+ +	struct sof_ipc_ctrl_data_params sparams;
+ +	enum sof_ipc_ctrl_type ctrl_type;
+ +	struct snd_sof_widget *swidget;
+ +	bool widget_found = false;
+ +	size_t send_bytes;
+ +	u32 ipc_cmd;
+ +	int err;
+ +
+ +	list_for_each_entry(swidget, &sdev->widget_list, list) {
+ +		if (swidget->comp_id == scontrol->comp_id) {
+ +			widget_found = true;
+ +			break;
+ +		}
+ +	}
+ +
+ +	if (!widget_found) {
+ +		dev_err(sdev->dev, "error: can't find widget with id %d\n", scontrol->comp_id);
+ +		return -EINVAL;
+ +	}
+ +
+ +	/*
+ +	 * Volatile controls should always be part of static pipelines and the widget use_count
+ +	 * would always be > 0 in this case. For the others, just return the cached value if the
+ +	 * widget is not set up.
+ +	 */
+ +	if (!swidget->use_count)
+ +		return 0;
+ +
+ +	/* read or write firmware volume */
+ +	if (scontrol->readback_offset != 0) {
+ +		/* write/read value header via mmaped region */
+ +		send_bytes = sizeof(struct sof_ipc_ctrl_value_chan) *
+ +		cdata->num_elems;
+ +		if (set)
+ +			err = snd_sof_dsp_block_write(sdev, SOF_FW_BLK_TYPE_IRAM,
+ +						      scontrol->readback_offset,
+ +						      cdata->chanv, send_bytes);
+ +
+ +		else
+ +			err = snd_sof_dsp_block_read(sdev, SOF_FW_BLK_TYPE_IRAM,
+ +						     scontrol->readback_offset,
+ +						     cdata->chanv, send_bytes);
+ +
+ +		if (err)
+ +			dev_err_once(sdev->dev, "error: %s TYPE_IRAM failed\n",
+ +				     set ? "write to" :  "read from");
+ +		return err;
+ +	}
+ +
+ +	/*
+ +	 * Select the IPC cmd and the ctrl_type based on the ctrl_cmd and the
+ +	 * direction
+ +	 * Note: SOF_CTRL_TYPE_VALUE_COMP_* is not used and supported currently
+ +	 *	 for ctrl_type
+ +	 */
+ +	if (cdata->cmd == SOF_CTRL_CMD_BINARY) {
+ +		ipc_cmd = set ? SOF_IPC_COMP_SET_DATA : SOF_IPC_COMP_GET_DATA;
+ +		ctrl_type = set ? SOF_CTRL_TYPE_DATA_SET : SOF_CTRL_TYPE_DATA_GET;
+ +	} else {
+ +		ipc_cmd = set ? SOF_IPC_COMP_SET_VALUE : SOF_IPC_COMP_GET_VALUE;
+ +		ctrl_type = set ? SOF_CTRL_TYPE_VALUE_CHAN_SET : SOF_CTRL_TYPE_VALUE_CHAN_GET;
+ +	}
+ +
+ +	cdata->rhdr.hdr.cmd = SOF_IPC_GLB_COMP_MSG | ipc_cmd;
+ +	cdata->type = ctrl_type;
+ +	cdata->comp_id = scontrol->comp_id;
+ +	cdata->msg_index = 0;
+ +
+ +	/* calculate header and data size */
+ +	switch (cdata->type) {
+ +	case SOF_CTRL_TYPE_VALUE_CHAN_GET:
+ +	case SOF_CTRL_TYPE_VALUE_CHAN_SET:
+ +		sparams.msg_bytes = scontrol->num_channels *
+ +			sizeof(struct sof_ipc_ctrl_value_chan);
+ +		sparams.hdr_bytes = sizeof(struct sof_ipc_ctrl_data);
+ +		sparams.elems = scontrol->num_channels;
+ +		break;
+ +	case SOF_CTRL_TYPE_DATA_GET:
+ +	case SOF_CTRL_TYPE_DATA_SET:
+ +		sparams.msg_bytes = cdata->data->size;
+ +		sparams.hdr_bytes = sizeof(struct sof_ipc_ctrl_data) +
+ +			sizeof(struct sof_abi_hdr);
+ +		sparams.elems = cdata->data->size;
+ +		break;
+ +	default:
+ +		return -EINVAL;
+ +	}
+ +
+ +	cdata->rhdr.hdr.size = sparams.msg_bytes + sparams.hdr_bytes;
+ +	cdata->num_elems = sparams.elems;
+ +	cdata->elems_remaining = 0;
+ +
+ +	/* send normal size ipc in one part */
+ +	if (cdata->rhdr.hdr.size <= SOF_IPC_MSG_MAX_SIZE) {
+ +		err = sof_ipc_tx_message(sdev->ipc, cdata->rhdr.hdr.cmd, cdata,
+ +					 cdata->rhdr.hdr.size, cdata,
+ +					 cdata->rhdr.hdr.size);
+ +
+ +		if (err < 0)
+ +			dev_err(sdev->dev, "error: set/get ctrl ipc comp %d\n",
+ +				cdata->comp_id);
+ +
+ +		return err;
+ +	}
+ +
+ +	/* data is bigger than max ipc size, chop into smaller pieces */
+ +	dev_dbg(sdev->dev, "large ipc size %u, control size %u\n",
+ +		cdata->rhdr.hdr.size, scontrol->size);
+ +
+ +	/* large messages is only supported from ABI 3.3.0 onwards */
+ +	if (v->abi_version < SOF_ABI_VER(3, 3, 0)) {
+ +		dev_err(sdev->dev, "error: incompatible FW ABI version\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	err = sof_set_get_large_ctrl_data(sdev, cdata, &sparams, set);
+ +
+ +	if (err < 0)
+ +		dev_err(sdev->dev, "error: set/get large ctrl ipc comp %d\n",
+ +			cdata->comp_id);
+ +
+ +	return err;
+ +}
+ +EXPORT_SYMBOL(snd_sof_ipc_set_get_comp_data);
+ +
+++=======
+++>>>>>>> e760f102c92c (ASoC: SOF: ipc: Move the ipc_set_get_comp_data() local to ipc3-control)
+  int snd_sof_ipc_valid(struct snd_sof_dev *sdev)
+  {
+  	struct sof_ipc_fw_ready *ready = &sdev->fw_ready;
+* Unmerged path sound/soc/sof/ipc3-control.c
+* Unmerged path sound/soc/sof/ipc.c
+* Unmerged path sound/soc/sof/ipc3-control.c
+diff --git a/sound/soc/sof/sof-audio.h b/sound/soc/sof/sof-audio.h
+index d620c73a2a23..5bd37b9d5994 100644
+--- a/sound/soc/sof/sof-audio.h
++++ b/sound/soc/sof/sof-audio.h
+@@ -374,11 +374,6 @@ static inline void snd_sof_compr_fragment_elapsed(struct snd_compr_stream *cstre
+ static inline void snd_sof_compr_init_elapsed_work(struct work_struct *work) { }
+ #endif
+ 
+-/*
+- * Mixer IPC
+- */
+-int snd_sof_ipc_set_get_comp_data(struct snd_sof_control *scontrol, bool set);
+-
+ /* DAI link fixup */
+ int sof_pcm_dai_link_fixup(struct snd_soc_pcm_runtime *rtd, struct snd_pcm_hw_params *params);
+ 
