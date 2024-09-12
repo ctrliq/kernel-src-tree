@@ -1,0 +1,167 @@
+swiotlb: Fix alignment checks when both allocation and DMA masks are present
+
+jira LE-1907
+cve CVE-2024-35814
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Will Deacon <will@kernel.org>
+commit 51b30ecb73b481d5fac6ccf2ecb4a309c9ee3310
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/51b30ecb.failed
+
+Nicolin reports that swiotlb buffer allocations fail for an NVME device
+behind an IOMMU using 64KiB pages. This is because we end up with a
+minimum allocation alignment of 64KiB (for the IOMMU to map the buffer
+safely) but a minimum DMA alignment mask corresponding to a 4KiB NVME
+page (i.e. preserving the 4KiB page offset from the original allocation).
+If the original address is not 4KiB-aligned, the allocation will fail
+because swiotlb_search_pool_area() erroneously compares these unmasked
+bits with the 64KiB-aligned candidate allocation.
+
+Tweak swiotlb_search_pool_area() so that the DMA alignment mask is
+reduced based on the required alignment of the allocation.
+
+Fixes: 82612d66d51d ("iommu: Allow the dma-iommu api to use bounce buffers")
+Link: https://lore.kernel.org/r/cover.1707851466.git.nicolinc@nvidia.com
+	Reported-by: Nicolin Chen <nicolinc@nvidia.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+	Reviewed-by: Michael Kelley <mhklinux@outlook.com>
+	Tested-by: Nicolin Chen <nicolinc@nvidia.com>
+	Tested-by: Michael Kelley <mhklinux@outlook.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 51b30ecb73b481d5fac6ccf2ecb4a309c9ee3310)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/dma/swiotlb.c
+diff --cc kernel/dma/swiotlb.c
+index c0e227dcb45e,f212943e51ca..000000000000
+--- a/kernel/dma/swiotlb.c
++++ b/kernel/dma/swiotlb.c
+@@@ -588,21 -923,87 +588,25 @@@ static unsigned int wrap_area_index(str
+  }
+  
+  /*
+ - * Track the total used slots with a global atomic value in order to have
+ - * correct information to determine the high water mark. The mem_used()
+ - * function gives imprecise results because there's no locking across
+ - * multiple areas.
+ + * Find a suitable number of IO TLB entries size that will fit this request and
+ + * allocate a buffer from that IO TLB pool.
+   */
+ -#ifdef CONFIG_DEBUG_FS
+ -static void inc_used_and_hiwater(struct io_tlb_mem *mem, unsigned int nslots)
+ -{
+ -	unsigned long old_hiwater, new_used;
+ -
+ -	new_used = atomic_long_add_return(nslots, &mem->total_used);
+ -	old_hiwater = atomic_long_read(&mem->used_hiwater);
+ -	do {
+ -		if (new_used <= old_hiwater)
+ -			break;
+ -	} while (!atomic_long_try_cmpxchg(&mem->used_hiwater,
+ -					  &old_hiwater, new_used));
+ -}
+ -
+ -static void dec_used(struct io_tlb_mem *mem, unsigned int nslots)
+ -{
+ -	atomic_long_sub(nslots, &mem->total_used);
+ -}
+ -
+ -#else /* !CONFIG_DEBUG_FS */
+ -static void inc_used_and_hiwater(struct io_tlb_mem *mem, unsigned int nslots)
+ -{
+ -}
+ -static void dec_used(struct io_tlb_mem *mem, unsigned int nslots)
+ -{
+ -}
+ -#endif /* CONFIG_DEBUG_FS */
+ -
+ -#ifdef CONFIG_SWIOTLB_DYNAMIC
+ -#ifdef CONFIG_DEBUG_FS
+ -static void inc_transient_used(struct io_tlb_mem *mem, unsigned int nslots)
+ -{
+ -	atomic_long_add(nslots, &mem->transient_nslabs);
+ -}
+ -
+ -static void dec_transient_used(struct io_tlb_mem *mem, unsigned int nslots)
+ -{
+ -	atomic_long_sub(nslots, &mem->transient_nslabs);
+ -}
+ -
+ -#else /* !CONFIG_DEBUG_FS */
+ -static void inc_transient_used(struct io_tlb_mem *mem, unsigned int nslots)
+ -{
+ -}
+ -static void dec_transient_used(struct io_tlb_mem *mem, unsigned int nslots)
+ -{
+ -}
+ -#endif /* CONFIG_DEBUG_FS */
+ -#endif /* CONFIG_SWIOTLB_DYNAMIC */
+ -
+ -/**
+ - * swiotlb_search_pool_area() - search one memory area in one pool
+ - * @dev:	Device which maps the buffer.
+ - * @pool:	Memory pool to be searched.
+ - * @area_index:	Index of the IO TLB memory area to be searched.
+ - * @orig_addr:	Original (non-bounced) IO buffer address.
+ - * @alloc_size: Total requested size of the bounce buffer,
+ - *		including initial alignment padding.
+ - * @alloc_align_mask:	Required alignment of the allocated buffer.
+ - *
+ - * Find a suitable sequence of IO TLB entries for the request and allocate
+ - * a buffer from the given IO TLB memory area.
+ - * This function takes care of locking.
+ - *
+ - * Return: Index of the first allocated slot, or -1 on error.
+ - */
+ -static int swiotlb_search_pool_area(struct device *dev, struct io_tlb_pool *pool,
+ -		int area_index, phys_addr_t orig_addr, size_t alloc_size,
+ +static int swiotlb_do_find_slots(struct device *dev, int area_index,
+ +		phys_addr_t orig_addr, size_t alloc_size,
+  		unsigned int alloc_align_mask)
+  {
+ -	struct io_tlb_area *area = pool->areas + area_index;
+ +	struct io_tlb_mem *mem = dev->dma_io_tlb_mem;
+ +	struct io_tlb_area *area = mem->areas + area_index;
+  	unsigned long boundary_mask = dma_get_seg_boundary(dev);
+  	dma_addr_t tbl_dma_addr =
+ -		phys_to_dma_unencrypted(dev, pool->start) & boundary_mask;
+ +		phys_to_dma_unencrypted(dev, mem->start) & boundary_mask;
+  	unsigned long max_slots = get_max_slots(boundary_mask);
+++<<<<<<< HEAD
+ +	unsigned int iotlb_align_mask =
+ +		dma_get_min_align_mask(dev) | alloc_align_mask;
+++=======
++ 	unsigned int iotlb_align_mask = dma_get_min_align_mask(dev);
+++>>>>>>> 51b30ecb73b4 (swiotlb: Fix alignment checks when both allocation and DMA masks are present)
+  	unsigned int nslots = nr_slots(alloc_size), stride;
+  	unsigned int offset = swiotlb_align_offset(dev, orig_addr);
+  	unsigned int index, slots_checked, count = 0, i;
+@@@ -611,7 -1012,21 +615,25 @@@
+  	unsigned int slot_index;
+  
+  	BUG_ON(!nslots);
+++<<<<<<< HEAD
+ +	BUG_ON(area_index >= mem->nareas);
+++=======
++ 	BUG_ON(area_index >= pool->nareas);
++ 
++ 	/*
++ 	 * Ensure that the allocation is at least slot-aligned and update
++ 	 * 'iotlb_align_mask' to ignore bits that will be preserved when
++ 	 * offsetting into the allocation.
++ 	 */
++ 	alloc_align_mask |= (IO_TLB_SIZE - 1);
++ 	iotlb_align_mask &= ~alloc_align_mask;
++ 
++ 	/*
++ 	 * For mappings with an alignment requirement don't bother looping to
++ 	 * unaligned slots once we found an aligned one.
++ 	 */
++ 	stride = get_max_slots(max(alloc_align_mask, iotlb_align_mask));
+++>>>>>>> 51b30ecb73b4 (swiotlb: Fix alignment checks when both allocation and DMA masks are present)
+  
+  	/*
+  	 * For allocations of PAGE_SIZE or larger only look for page aligned
+* Unmerged path kernel/dma/swiotlb.c
