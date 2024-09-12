@@ -1,0 +1,163 @@
+ASoC: soc-pcm: improve BE transition for PAUSE_RELEASE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+commit 9995c1d096c8ab1b5f1edc4141257719f6a53524
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/9995c1d0.failed
+
+Commit 3aa1e96a2b95 ("ASoC: soc-pcm: fix BE handling of PAUSE_RELEASE")
+did not modify the existing logic and kept the same logic for the following
+transition
+
+    play FE1    -> BE state is START
+    pause FE1   -> BE state is PAUSED
+    play FE2    -> BE state is START
+    stop FE2    -> BE state is STOP <<< !!
+    release FE1 -> BE state is START
+    stop FE1    -> BE state is STOP
+
+At the time it was identified by reviewers that a better solution
+might consist in
+
+    play FE1    -> BE state is START
+    pause FE1   -> BE state is PAUSED
+    play FE2    -> BE state is START
+    stop FE2    -> BE state is PAUSE <<< !!
+    release FE1 -> BE state is START
+    stop FE1    -> BE state is STOP
+
+This patch suggest a transition to PAUSE when all the 'active' streams
+are paused. This would allow for a more consistent resource management
+for platforms where PAUSE and STOP are handled differently.
+
+To track the special case of an FE going from PAUSE_PUSH to STOP, we
+add a state variable for each FE context. This 'fe_pause' boolean is
+set on PAUSE_PUSH and cleared on either PAUSE_RELEASE and STOP
+triggers.
+
+	Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Reviewed-by: Rander Wang <rander.wang@intel.com>
+	Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+	Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+	Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+Link: https://lore.kernel.org/r/20220406190056.233481-2-pierre-louis.bossart@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 9995c1d096c8ab1b5f1edc4141257719f6a53524)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/sound/soc-dpcm.h
+#	sound/soc/soc-pcm.c
+diff --cc include/sound/soc-dpcm.h
+index bc7af90099a8,5b689c663290..000000000000
+--- a/include/sound/soc-dpcm.h
++++ b/include/sound/soc-dpcm.h
+@@@ -101,6 -101,10 +101,13 @@@ struct snd_soc_dpcm_runtime 
+  	enum snd_soc_dpcm_state state;
+  
+  	int trigger_pending; /* trigger cmd + 1 if pending, 0 if not */
+++<<<<<<< HEAD
+++=======
++ 
++ 	int be_start; /* refcount protected by BE stream pcm lock */
++ 	int be_pause; /* refcount protected by BE stream pcm lock */
++ 	bool fe_pause; /* used to track STOP after PAUSE */
+++>>>>>>> 9995c1d096c8 (ASoC: soc-pcm: improve BE transition for PAUSE_RELEASE)
+  };
+  
+  #define for_each_dpcm_fe(be, stream, _dpcm)				\
+diff --cc sound/soc/soc-pcm.c
+index 29ca74b04e82,e8700dd1839f..000000000000
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@@ -2146,10 -2152,18 +2147,19 @@@ int dpcm_be_dai_trigger(struct snd_soc_
+  			    (be->dpcm[stream].state != SND_SOC_DPCM_STATE_PAUSED))
+  				goto next;
+  
+++<<<<<<< HEAD
+++=======
++ 			fe->dpcm[stream].fe_pause = false;
++ 			be->dpcm[stream].be_pause--;
++ 
++ 			be->dpcm[stream].be_start++;
++ 			if (be->dpcm[stream].be_start != 1)
++ 				goto next;
++ 
+++>>>>>>> 9995c1d096c8 (ASoC: soc-pcm: improve BE transition for PAUSE_RELEASE)
+  			ret = soc_pcm_trigger(be_substream, cmd);
+ -			if (ret) {
+ -				be->dpcm[stream].be_start--;
+ +			if (ret)
+  				goto next;
+ -			}
+  
+  			be->dpcm[stream].state = SND_SOC_DPCM_STATE_START;
+  			break;
+@@@ -2158,14 -2172,39 +2168,40 @@@
+  			    (be->dpcm[stream].state != SND_SOC_DPCM_STATE_PAUSED))
+  				goto next;
+  
+ -			if (be->dpcm[stream].state == SND_SOC_DPCM_STATE_START)
+ -				be->dpcm[stream].be_start--;
+ -
+ -			if (be->dpcm[stream].be_start != 0)
+ +			if (!snd_soc_dpcm_can_be_free_stop(fe, be, stream))
+  				goto next;
+  
+++<<<<<<< HEAD
+ +			ret = soc_pcm_trigger(be_substream, cmd);
+ +			if (ret)
+++=======
++ 			pause_stop_transition = false;
++ 			if (fe->dpcm[stream].fe_pause) {
++ 				pause_stop_transition = true;
++ 				fe->dpcm[stream].fe_pause = false;
++ 				be->dpcm[stream].be_pause--;
++ 			}
++ 
++ 			if (be->dpcm[stream].be_pause != 0)
++ 				ret = soc_pcm_trigger(be_substream, SNDRV_PCM_TRIGGER_PAUSE_PUSH);
++ 			else
++ 				ret = soc_pcm_trigger(be_substream, SNDRV_PCM_TRIGGER_STOP);
++ 
++ 			if (ret) {
++ 				if (be->dpcm[stream].state == SND_SOC_DPCM_STATE_START)
++ 					be->dpcm[stream].be_start++;
++ 				if (pause_stop_transition) {
++ 					fe->dpcm[stream].fe_pause = true;
++ 					be->dpcm[stream].be_pause++;
++ 				}
+++>>>>>>> 9995c1d096c8 (ASoC: soc-pcm: improve BE transition for PAUSE_RELEASE)
+  				goto next;
+ -			}
+  
+- 			be->dpcm[stream].state = SND_SOC_DPCM_STATE_STOP;
++ 			if (be->dpcm[stream].be_pause != 0)
++ 				be->dpcm[stream].state = SND_SOC_DPCM_STATE_PAUSED;
++ 			else
++ 				be->dpcm[stream].state = SND_SOC_DPCM_STATE_STOP;
++ 
+  			break;
+  		case SNDRV_PCM_TRIGGER_SUSPEND:
+  			if (be->dpcm[stream].state != SND_SOC_DPCM_STATE_START)
+@@@ -2184,7 -2226,11 +2220,15 @@@
+  			if (be->dpcm[stream].state != SND_SOC_DPCM_STATE_START)
+  				goto next;
+  
+++<<<<<<< HEAD
+ +			if (!snd_soc_dpcm_can_be_free_stop(fe, be, stream))
+++=======
++ 			fe->dpcm[stream].fe_pause = true;
++ 			be->dpcm[stream].be_pause++;
++ 
++ 			be->dpcm[stream].be_start--;
++ 			if (be->dpcm[stream].be_start != 0)
+++>>>>>>> 9995c1d096c8 (ASoC: soc-pcm: improve BE transition for PAUSE_RELEASE)
+  				goto next;
+  
+  			ret = soc_pcm_trigger(be_substream, cmd);
+* Unmerged path include/sound/soc-dpcm.h
+* Unmerged path sound/soc/soc-pcm.c
