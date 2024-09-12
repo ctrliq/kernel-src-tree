@@ -1116,7 +1116,7 @@ reset_info_exit:
 			}
 
 			/* Ensure the FD is a vfio group FD.*/
-			if (!vfio_file_iommu_group(file)) {
+			if (!vfio_file_is_group(file)) {
 				fput(file);
 				ret = -EINVAL;
 				break;
