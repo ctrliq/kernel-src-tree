@@ -604,6 +604,7 @@ static int asoc_simple_probe(struct platform_device *pdev)
 	card->owner		= THIS_MODULE;
 	card->dev		= dev;
 	card->probe		= simple_soc_probe;
+	card->driver_name       = "simple-card";
 
 	memset(&li, 0, sizeof(li));
 	simple_get_dais_count(priv, &li);
