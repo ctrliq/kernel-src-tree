@@ -1,0 +1,197 @@
+cgroup: Use open-time cgroup namespace for process migration perm checks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Tejun Heo <tj@kernel.org>
+commit e57457641613fef0d147ede8bd6a3047df588b95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/e5745764.failed
+
+cgroup process migration permission checks are performed at write time as
+whether a given operation is allowed or not is dependent on the content of
+the write - the PID. This currently uses current's cgroup namespace which is
+a potential security weakness as it may allow scenarios where a less
+privileged process tricks a more privileged one into writing into a fd that
+it created.
+
+This patch makes cgroup remember the cgroup namespace at the time of open
+and uses it for migration permission checks instad of current's. Note that
+this only applies to cgroup2 as cgroup1 doesn't have namespace support.
+
+This also fixes a use-after-free bug on cgroupns reported in
+
+ https://lore.kernel.org/r/00000000000048c15c05d0083397@google.com
+
+Note that backporting this fix also requires the preceding patch.
+
+	Reported-by: "Eric W. Biederman" <ebiederm@xmission.com>
+	Suggested-by: Linus Torvalds <torvalds@linuxfoundation.org>
+	Cc: Michal Koutný <mkoutny@suse.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Reviewed-by: Michal Koutný <mkoutny@suse.com>
+	Reported-by: syzbot+50f5cf33a284ce738b62@syzkaller.appspotmail.com
+Link: https://lore.kernel.org/r/00000000000048c15c05d0083397@google.com
+Fixes: 5136f6365ce3 ("cgroup: implement "nsdelegate" mount option")
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit e57457641613fef0d147ede8bd6a3047df588b95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cgroup/cgroup.c
+diff --cc kernel/cgroup/cgroup.c
+index 6f88796a8b5c,cafb8c114a21..000000000000
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@@ -5971,6 -6093,134 +5980,137 @@@ static struct cgroup *cgroup_get_from_f
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * cgroup_css_set_fork - find or create a css_set for a child process
++  * @kargs: the arguments passed to create the child process
++  *
++  * This functions finds or creates a new css_set which the child
++  * process will be attached to in cgroup_post_fork(). By default,
++  * the child process will be given the same css_set as its parent.
++  *
++  * If CLONE_INTO_CGROUP is specified this function will try to find an
++  * existing css_set which includes the requested cgroup and if not create
++  * a new css_set that the child will be attached to later. If this function
++  * succeeds it will hold cgroup_threadgroup_rwsem on return. If
++  * CLONE_INTO_CGROUP is requested this function will grab cgroup mutex
++  * before grabbing cgroup_threadgroup_rwsem and will hold a reference
++  * to the target cgroup.
++  */
++ static int cgroup_css_set_fork(struct kernel_clone_args *kargs)
++ 	__acquires(&cgroup_mutex) __acquires(&cgroup_threadgroup_rwsem)
++ {
++ 	int ret;
++ 	struct cgroup *dst_cgrp = NULL;
++ 	struct css_set *cset;
++ 	struct super_block *sb;
++ 	struct file *f;
++ 
++ 	if (kargs->flags & CLONE_INTO_CGROUP)
++ 		mutex_lock(&cgroup_mutex);
++ 
++ 	cgroup_threadgroup_change_begin(current);
++ 
++ 	spin_lock_irq(&css_set_lock);
++ 	cset = task_css_set(current);
++ 	get_css_set(cset);
++ 	spin_unlock_irq(&css_set_lock);
++ 
++ 	if (!(kargs->flags & CLONE_INTO_CGROUP)) {
++ 		kargs->cset = cset;
++ 		return 0;
++ 	}
++ 
++ 	f = fget_raw(kargs->cgroup);
++ 	if (!f) {
++ 		ret = -EBADF;
++ 		goto err;
++ 	}
++ 	sb = f->f_path.dentry->d_sb;
++ 
++ 	dst_cgrp = cgroup_get_from_file(f);
++ 	if (IS_ERR(dst_cgrp)) {
++ 		ret = PTR_ERR(dst_cgrp);
++ 		dst_cgrp = NULL;
++ 		goto err;
++ 	}
++ 
++ 	if (cgroup_is_dead(dst_cgrp)) {
++ 		ret = -ENODEV;
++ 		goto err;
++ 	}
++ 
++ 	/*
++ 	 * Verify that we the target cgroup is writable for us. This is
++ 	 * usually done by the vfs layer but since we're not going through
++ 	 * the vfs layer here we need to do it "manually".
++ 	 */
++ 	ret = cgroup_may_write(dst_cgrp, sb);
++ 	if (ret)
++ 		goto err;
++ 
++ 	ret = cgroup_attach_permissions(cset->dfl_cgrp, dst_cgrp, sb,
++ 					!(kargs->flags & CLONE_THREAD),
++ 					current->nsproxy->cgroup_ns);
++ 	if (ret)
++ 		goto err;
++ 
++ 	kargs->cset = find_css_set(cset, dst_cgrp);
++ 	if (!kargs->cset) {
++ 		ret = -ENOMEM;
++ 		goto err;
++ 	}
++ 
++ 	put_css_set(cset);
++ 	fput(f);
++ 	kargs->cgrp = dst_cgrp;
++ 	return ret;
++ 
++ err:
++ 	cgroup_threadgroup_change_end(current);
++ 	mutex_unlock(&cgroup_mutex);
++ 	if (f)
++ 		fput(f);
++ 	if (dst_cgrp)
++ 		cgroup_put(dst_cgrp);
++ 	put_css_set(cset);
++ 	if (kargs->cset)
++ 		put_css_set(kargs->cset);
++ 	return ret;
++ }
++ 
++ /**
++  * cgroup_css_set_put_fork - drop references we took during fork
++  * @kargs: the arguments passed to create the child process
++  *
++  * Drop references to the prepared css_set and target cgroup if
++  * CLONE_INTO_CGROUP was requested.
++  */
++ static void cgroup_css_set_put_fork(struct kernel_clone_args *kargs)
++ 	__releases(&cgroup_threadgroup_rwsem) __releases(&cgroup_mutex)
++ {
++ 	cgroup_threadgroup_change_end(current);
++ 
++ 	if (kargs->flags & CLONE_INTO_CGROUP) {
++ 		struct cgroup *cgrp = kargs->cgrp;
++ 		struct css_set *cset = kargs->cset;
++ 
++ 		mutex_unlock(&cgroup_mutex);
++ 
++ 		if (cset) {
++ 			put_css_set(cset);
++ 			kargs->cset = NULL;
++ 		}
++ 
++ 		if (cgrp) {
++ 			cgroup_put(cgrp);
++ 			kargs->cgrp = NULL;
++ 		}
++ 	}
++ }
++ 
++ /**
+++>>>>>>> e57457641613 (cgroup: Use open-time cgroup namespace for process migration perm checks)
+   * cgroup_can_fork - called on a new task before the process is exposed
+   * @child: the child process
+   *
+diff --git a/kernel/cgroup/cgroup-internal.h b/kernel/cgroup/cgroup-internal.h
+index cf637bc4ab45..6e36e854b512 100644
+--- a/kernel/cgroup/cgroup-internal.h
++++ b/kernel/cgroup/cgroup-internal.h
+@@ -68,6 +68,8 @@ static inline struct cgroup_fs_context *cgroup_fc2context(struct fs_context *fc)
+ struct cgroup_pidlist;
+ 
+ struct cgroup_file_ctx {
++	struct cgroup_namespace	*ns;
++
+ 	struct {
+ 		void			*trigger;
+ 	} psi;
+* Unmerged path kernel/cgroup/cgroup.c
