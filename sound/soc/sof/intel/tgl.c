@@ -186,6 +186,7 @@ const struct sof_intel_dsp_desc tgl_chip_info = {
 	.sdw_shim_base = SDW_SHIM_BASE,
 	.sdw_alh_base = SDW_ALH_BASE,
 	.check_sdw_irq	= hda_common_check_sdw_irq,
+	.check_ipc_irq	= hda_dsp_check_ipc_irq,
 };
 EXPORT_SYMBOL(tgl_chip_info);
 
@@ -205,6 +206,7 @@ const struct sof_intel_dsp_desc tglh_chip_info = {
 	.sdw_shim_base = SDW_SHIM_BASE,
 	.sdw_alh_base = SDW_ALH_BASE,
 	.check_sdw_irq	= hda_common_check_sdw_irq,
+	.check_ipc_irq	= hda_dsp_check_ipc_irq,
 };
 EXPORT_SYMBOL(tglh_chip_info);
 
@@ -224,6 +226,7 @@ const struct sof_intel_dsp_desc ehl_chip_info = {
 	.sdw_shim_base = SDW_SHIM_BASE,
 	.sdw_alh_base = SDW_ALH_BASE,
 	.check_sdw_irq	= hda_common_check_sdw_irq,
+	.check_ipc_irq	= hda_dsp_check_ipc_irq,
 };
 EXPORT_SYMBOL(ehl_chip_info);
 
@@ -243,5 +246,6 @@ const struct sof_intel_dsp_desc adls_chip_info = {
 	.sdw_shim_base = SDW_SHIM_BASE,
 	.sdw_alh_base = SDW_ALH_BASE,
 	.check_sdw_irq	= hda_common_check_sdw_irq,
+	.check_ipc_irq	= hda_dsp_check_ipc_irq,
 };
 EXPORT_SYMBOL(adls_chip_info);
