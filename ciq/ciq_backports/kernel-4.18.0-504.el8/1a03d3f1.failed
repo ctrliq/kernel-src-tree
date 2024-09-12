@@ -1,0 +1,224 @@
+fork: Move task stack accounting to do_exit()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-504.el8
+commit-author Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+commit 1a03d3f13ffe5dd24142d6db629e72c11b704d99
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-504.el8/1a03d3f1.failed
+
+There is no need to perform the stack accounting of the outgoing task in
+its final schedule() invocation which happens with preemption disabled.
+The task is leaving, the resources will be freed and the accounting can
+happen in do_exit() before the actual schedule invocation which
+frees the stack memory.
+
+Move the accounting of the stack memory from release_task_stack() to
+exit_task_stack_account() which then can be invoked from do_exit().
+
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Andy Lutomirski <luto@kernel.org>
+Link: https://lore.kernel.org/r/20220217102406.3697941-7-bigeasy@linutronix.de
+
+(cherry picked from commit 1a03d3f13ffe5dd24142d6db629e72c11b704d99)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/fork.c
+diff --cc kernel/fork.c
+index 2fc87f72c8b1,25828127db8d..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -206,8 -211,34 +206,38 @@@ static int free_vm_stack_cache(unsigne
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static unsigned long *alloc_thread_stack_node(struct task_struct *tsk, int node)
+++=======
++ static int memcg_charge_kernel_stack(struct vm_struct *vm)
+  {
++ 	int i;
++ 	int ret;
++ 
++ 	BUILD_BUG_ON(IS_ENABLED(CONFIG_VMAP_STACK) && PAGE_SIZE % 1024 != 0);
++ 	BUG_ON(vm->nr_pages != THREAD_SIZE / PAGE_SIZE);
++ 
++ 	for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
++ 		ret = memcg_kmem_charge_page(vm->pages[i], GFP_KERNEL, 0);
++ 		if (ret)
++ 			goto err;
++ 	}
++ 	return 0;
++ err:
++ 	/*
++ 	 * If memcg_kmem_charge_page() fails, page's memory cgroup pointer is
++ 	 * NULL, and memcg_kmem_uncharge_page() in free_thread_stack() will
++ 	 * ignore this page.
++ 	 */
++ 	for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++)
++ 		memcg_kmem_uncharge_page(vm->pages[i], 0);
++ 	return ret;
++ }
++ 
++ static int alloc_thread_stack_node(struct task_struct *tsk, int node)
+++>>>>>>> 1a03d3f13ffe (fork: Move task stack accounting to do_exit())
++ {
++ 	struct vm_struct *vm;
+  	void *stack;
+  	int i;
+  
+@@@ -225,9 -256,14 +255,17 @@@
+  		/* Clear stale pointers from reused stack. */
+  		memset(s->addr, 0, THREAD_SIZE);
+  
+++<<<<<<< HEAD
+++=======
++ 		if (memcg_charge_kernel_stack(s)) {
++ 			vfree(s->addr);
++ 			return -ENOMEM;
++ 		}
++ 
+++>>>>>>> 1a03d3f13ffe (fork: Move task stack accounting to do_exit())
+  		tsk->stack_vm_area = s;
+  		tsk->stack = s->addr;
+ -		return 0;
+ +		return s->addr;
+  	}
+  
+  	/*
+@@@ -240,17 -276,22 +278,31 @@@
+  				     THREADINFO_GFP & ~__GFP_ACCOUNT,
+  				     PAGE_KERNEL,
+  				     0, node, __builtin_return_address(0));
+ -	if (!stack)
+ -		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	vm = find_vm_area(stack);
++ 	if (memcg_charge_kernel_stack(vm)) {
++ 		vfree(stack);
++ 		return -ENOMEM;
++ 	}
+++>>>>>>> 1a03d3f13ffe (fork: Move task stack accounting to do_exit())
+  	/*
+  	 * We can't call find_vm_area() in interrupt context, and
+  	 * free_thread_stack() can be called in interrupt context,
+  	 * so cache the vm_struct.
+  	 */
+++<<<<<<< HEAD
+ +	if (stack) {
+ +		tsk->stack_vm_area = find_vm_area(stack);
+ +		tsk->stack = stack;
+ +	}
+ +	return stack;
+++=======
++ 	tsk->stack_vm_area = vm;
++ 	tsk->stack = stack;
++ 	return 0;
+++>>>>>>> 1a03d3f13ffe (fork: Move task stack accounting to do_exit())
+  }
+  
+  static void free_thread_stack(struct task_struct *tsk)
+@@@ -406,34 -451,18 +454,49 @@@ static void account_kernel_stack(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static int memcg_charge_kernel_stack(struct task_struct *tsk)
+ +{
+ +#ifdef CONFIG_VMAP_STACK
+ +	struct vm_struct *vm = task_stack_vm_area(tsk);
+ +	int ret;
+ +
+ +	BUILD_BUG_ON(IS_ENABLED(CONFIG_VMAP_STACK) && PAGE_SIZE % 1024 != 0);
+ +
+ +	if (vm) {
+ +		int i;
+ +
+ +		BUG_ON(vm->nr_pages != THREAD_SIZE / PAGE_SIZE);
+ +
+ +		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
+ +			/*
+ +			 * If memcg_kmem_charge_page() fails, page's
+ +			 * memory cgroup pointer is NULL, and
+ +			 * memcg_kmem_uncharge_page() in free_thread_stack()
+ +			 * will ignore this page.
+ +			 */
+ +			ret = memcg_kmem_charge_page(vm->pages[i], GFP_KERNEL,
+ +						     0);
+ +			if (ret)
+ +				return ret;
+ +		}
+ +	}
+ +#endif
+ +	return 0;
+++=======
++ void exit_task_stack_account(struct task_struct *tsk)
++ {
++ 	account_kernel_stack(tsk, -1);
++ 
++ 	if (IS_ENABLED(CONFIG_VMAP_STACK)) {
++ 		struct vm_struct *vm;
++ 		int i;
++ 
++ 		vm = task_stack_vm_area(tsk);
++ 		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++)
++ 			memcg_kmem_uncharge_page(vm->pages[i], 0);
++ 	}
+++>>>>>>> 1a03d3f13ffe (fork: Move task stack accounting to do_exit())
+  }
+  
+  static void release_task_stack(struct task_struct *tsk)
+@@@ -921,10 -928,8 +983,11 @@@ static struct task_struct *dup_task_str
+  #ifdef CONFIG_THREAD_INFO_IN_TASK
+  	refcount_set(&tsk->stack_refcount, 1);
+  #endif
++ 	account_kernel_stack(tsk, 1);
+  
+ +	if (err || !dup_rh_task_struct(tsk, orig, node))
+ +		goto free_stack;
+ +
+  	err = scs_prepare(tsk, node);
+  	if (err)
+  		goto free_stack;
+@@@ -963,9 -970,8 +1026,7 @@@
+  	tsk->splice_pipe = NULL;
+  	tsk->task_frag.page = NULL;
+  	tsk->wake_q.next = NULL;
+ -	tsk->worker_private = NULL;
+  
+- 	account_kernel_stack(tsk, 1);
+- 
+  	kcov_task_init(tsk);
+  	kmap_local_fork(tsk);
+  
+diff --git a/include/linux/sched/task_stack.h b/include/linux/sched/task_stack.h
+index 2413427e439c..4d28e34e8171 100644
+--- a/include/linux/sched/task_stack.h
++++ b/include/linux/sched/task_stack.h
+@@ -75,6 +75,8 @@ static inline void *try_get_task_stack(struct task_struct *tsk)
+ static inline void put_task_stack(struct task_struct *tsk) {}
+ #endif
+ 
++void exit_task_stack_account(struct task_struct *tsk);
++
+ #define task_stack_end_corrupted(task) \
+ 		(*(end_of_stack(task)) != STACK_END_MAGIC)
+ 
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 7279ef6dbeb2..aa693f2f0215 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -843,6 +843,7 @@ void __noreturn do_exit(long code)
+ 		put_page(tsk->task_frag.page);
+ 
+ 	validate_creds_for_do_exit(tsk);
++	exit_task_stack_account(tsk);
+ 
+ 	check_stack_usage();
+ 	preempt_disable();
+* Unmerged path kernel/fork.c
