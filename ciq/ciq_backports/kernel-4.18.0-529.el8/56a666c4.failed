@@ -1,0 +1,83 @@
+mptcp: fix possible list corruption on passive MPJ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-529.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 56a666c48b038e91b76471289e2cf60c79d326b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-529.el8/56a666c4.failed
+
+At passive MPJ time, if the msk socket lock is held by the user,
+the new subflow is appended to the msk->join_list under the msk
+data lock.
+
+In mptcp_release_cb()/__mptcp_flush_join_list(), the subflows in
+that list are moved from the join_list into the conn_list under the
+msk socket lock.
+
+Append and removal could race, possibly corrupting such list.
+Address the issue splicing the join list into a temporary one while
+still under the msk data lock.
+
+Found by code inspection, the race itself should be almost impossible
+to trigger in practice.
+
+Fixes: 3e5014909b56 ("mptcp: cleanup MPJ subflow list handling")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+	Signed-off-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 56a666c48b038e91b76471289e2cf60c79d326b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index 235f6c6f03b1,9a40dae31cec..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -2979,16 -3335,15 +2979,23 @@@ void __mptcp_check_push(struct sock *sk
+  
+  /* processes deferred events and flush wmem */
+  static void mptcp_release_cb(struct sock *sk)
+ -	__must_hold(&sk->sk_lock.slock)
+  {
+ -	struct mptcp_sock *msk = mptcp_sk(sk);
+ -
+  	for (;;) {
+++<<<<<<< HEAD
+ +		unsigned long flags = 0;
+ +
+ +		if (test_and_clear_bit(MPTCP_PUSH_PENDING, &mptcp_sk(sk)->flags))
+ +			flags |= BIT(MPTCP_PUSH_PENDING);
+ +		if (test_and_clear_bit(MPTCP_RETRANSMIT, &mptcp_sk(sk)->flags))
+ +			flags |= BIT(MPTCP_RETRANSMIT);
+ +		if (test_and_clear_bit(MPTCP_FLUSH_JOIN_LIST, &mptcp_sk(sk)->flags))
+ +			flags |= BIT(MPTCP_FLUSH_JOIN_LIST);
+++=======
++ 		unsigned long flags = (msk->cb_flags & MPTCP_FLAGS_PROCESS_CTX_NEED) |
++ 				      msk->push_pending;
++ 		struct list_head join_list;
++ 
+++>>>>>>> 56a666c48b03 (mptcp: fix possible list corruption on passive MPJ)
+  		if (!flags)
+  			break;
+  
+@@@ -2999,10 -3357,12 +3009,11 @@@
+  		 *    datapath acquires the msk socket spinlock while helding
+  		 *    the subflow socket lock
+  		 */
+ -		msk->push_pending = 0;
+ -		msk->cb_flags &= ~flags;
+ +
+  		spin_unlock_bh(&sk->sk_lock.slock);
++ 
+  		if (flags & BIT(MPTCP_FLUSH_JOIN_LIST))
+- 			__mptcp_flush_join_list(sk);
++ 			__mptcp_flush_join_list(sk, &join_list);
+  		if (flags & BIT(MPTCP_PUSH_PENDING))
+  			__mptcp_push_pending(sk, 0);
+  		if (flags & BIT(MPTCP_RETRANSMIT))
+* Unmerged path net/mptcp/protocol.c
