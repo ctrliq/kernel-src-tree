@@ -803,12 +803,15 @@ struct sk_buff {
 	/* RHEL: We have 1 byte hole here */
 	RH_KABI_FILL_HOLE(__u8	active_extensions)
 #endif
-	/* fields enclosed in headers_start/headers_end are copied
+
+	/* Fields enclosed in headers group are copied
 	 * using a single memcpy() in __copy_skb_header()
 	 */
-	/* private: */
-	__u32			headers_start[0];
-	/* public: */
+#ifdef __GENKSYMS__
+	__u32                   headers_start[0];
+#else
+	struct_group(headers,
+#endif
 
 /* if you move pkt_type around you also must adapt those constants */
 #ifdef __BIG_ENDIAN_BITFIELD
@@ -930,9 +933,11 @@ struct sk_buff {
 	char rh_reserved_start[0];
 #endif
 
-	/* private: */
-	__u32			headers_end[0];
-	/* public: */
+#ifdef __GENKSYMS__
+	__u32                   headers_end[0];
+#else
+	); /* end headers group */
+#endif
 
 #ifdef __GENKSYMS__
 	char rh_reserved[RH_KABI_SKBUFF_RESERVED];
