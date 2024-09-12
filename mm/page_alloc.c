@@ -3508,7 +3508,8 @@ struct page *rmqueue(struct zone *preferred_zone,
 
 out:
 	/* Separate test+clear to avoid unnecessary atomics */
-	if (test_bit(ZONE_BOOSTED_WATERMARK, &zone->flags)) {
+	if ((alloc_flags & ALLOC_KSWAPD) &&
+	    unlikely(test_bit(ZONE_BOOSTED_WATERMARK, &zone->flags))) {
 		clear_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
 		wakeup_kswapd(zone, 0, 0, zone_idx(zone));
 	}
@@ -6034,7 +6035,9 @@ static void __build_all_zonelists(void *data)
 	 * tty_insert_flip_string_and_push_buffer() on other CPU might be
 	 * calling kmalloc(GFP_ATOMIC | __GFP_NOWARN) with port->lock held.
 	 */
+#ifndef CONFIG_PREEMPT_RT
 	printk_deferred_enter();
+#endif
 
 #ifdef CONFIG_NUMA
 	memset(node_load, 0, sizeof(node_load));
@@ -6071,7 +6074,9 @@ static void __build_all_zonelists(void *data)
 #endif
 	}
 
+#ifndef CONFIG_PREEMPT_RT
 	printk_deferred_exit();
+#endif
 	write_sequnlock_irqrestore(&zonelist_update_seq, flags);
 }
 
