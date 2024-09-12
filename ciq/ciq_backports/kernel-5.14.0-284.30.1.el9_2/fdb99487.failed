@@ -1,0 +1,150 @@
+rxrpc: Fix security setting propagation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit fdb99487b0189f0ef883e353ad7484c78a8bd425
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/fdb99487.failed
+
+Fix the propagation of the security settings from sendmsg to the rxrpc_call
+struct.
+
+Fixes: f3441d4125fc ("rxrpc: Copy client call parameters into rxrpc_call earlier")
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fdb99487b0189f0ef883e353ad7484c78a8bd425)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/call_object.c
+#	net/rxrpc/conn_client.c
+#	net/rxrpc/security.c
+diff --cc net/rxrpc/call_object.c
+index ad495d0d21a8,89dcf60b1158..000000000000
+--- a/net/rxrpc/call_object.c
++++ b/net/rxrpc/call_object.c
+@@@ -196,11 -208,32 +196,39 @@@ static struct rxrpc_call *rxrpc_alloc_c
+  	call = rxrpc_alloc_call(rx, gfp, debug_id);
+  	if (!call)
+  		return ERR_PTR(-ENOMEM);
+ +	call->state = RXRPC_CALL_CLIENT_AWAIT_CONN;
+ +	call->service_id = srx->srx_service;
+  	now = ktime_get_real();
+++<<<<<<< HEAD
+ +	call->acks_latest_ts = now;
+ +	call->cong_tstamp = now;
+++=======
++ 	call->acks_latest_ts	= now;
++ 	call->cong_tstamp	= now;
++ 	call->state		= RXRPC_CALL_CLIENT_AWAIT_CONN;
++ 	call->dest_srx		= *srx;
++ 	call->interruptibility	= p->interruptibility;
++ 	call->tx_total_len	= p->tx_total_len;
++ 	call->key		= key_get(cp->key);
++ 	call->local		= rxrpc_get_local(cp->local, rxrpc_local_get_call);
++ 	call->security_level	= cp->security_level;
++ 	if (p->kernel)
++ 		__set_bit(RXRPC_CALL_KERNEL, &call->flags);
++ 	if (cp->upgrade)
++ 		__set_bit(RXRPC_CALL_UPGRADE, &call->flags);
++ 	if (cp->exclusive)
++ 		__set_bit(RXRPC_CALL_EXCLUSIVE, &call->flags);
++ 
++ 	ret = rxrpc_init_client_call_security(call);
++ 	if (ret < 0) {
++ 		__rxrpc_set_call_completion(call, RXRPC_CALL_LOCAL_ERROR, 0, ret);
++ 		rxrpc_put_call(call, rxrpc_call_put_discard_error);
++ 		return ERR_PTR(ret);
++ 	}
++ 
++ 	trace_rxrpc_call(call->debug_id, refcount_read(&call->ref),
++ 			 p->user_call_ID, rxrpc_call_new_client);
+++>>>>>>> fdb99487b018 (rxrpc: Fix security setting propagation)
+  
+  	_leave(" = %p", call);
+  	return call;
+diff --cc net/rxrpc/conn_client.c
+index 827c1308297c,87efa0373aed..000000000000
+--- a/net/rxrpc/conn_client.c
++++ b/net/rxrpc/conn_client.c
+@@@ -532,21 -547,17 +532,25 @@@ static void rxrpc_activate_one_channel(
+  
+  	rxrpc_see_call(call, rxrpc_call_see_activate_client);
+  	list_del_init(&call->chan_wait_link);
+ -	call->peer	= rxrpc_get_peer(conn->peer, rxrpc_peer_get_activate_call);
+ -	call->conn	= rxrpc_get_connection(conn, rxrpc_conn_get_activate_call);
+ +	call->peer	= rxrpc_get_peer(conn->params.peer);
+ +	call->conn	= rxrpc_get_connection(conn);
+  	call->cid	= conn->proto.cid | channel;
+  	call->call_id	= call_id;
+++<<<<<<< HEAD
+ +	call->security	= conn->security;
+ +	call->security_ix = conn->security_ix;
+ +	call->service_id = conn->service_id;
+++=======
++ 	call->dest_srx.srx_service = conn->service_id;
+++>>>>>>> fdb99487b018 (rxrpc: Fix security setting propagation)
+  
+  	trace_rxrpc_connect_call(call);
+ +	_net("CONNECT call %08x:%08x as call %d on conn %d",
+ +	     call->cid, call->call_id, call->debug_id, conn->debug_id);
+  
+ -	write_lock(&call->state_lock);
+ +	write_lock_bh(&call->state_lock);
+  	call->state = RXRPC_CALL_CLIENT_SEND_REQUEST;
+ -	write_unlock(&call->state_lock);
+ +	write_unlock_bh(&call->state_lock);
+  
+  	/* Paired with the read barrier in rxrpc_connect_call().  This orders
+  	 * cid and epoch in the connection wrt to call_id without the need to
+diff --cc net/rxrpc/security.c
+index 50cb5f1ee0c0,ab968f65a490..000000000000
+--- a/net/rxrpc/security.c
++++ b/net/rxrpc/security.c
+@@@ -63,6 -63,36 +63,39 @@@ const struct rxrpc_security *rxrpc_secu
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Initialise the security on a client call.
++  */
++ int rxrpc_init_client_call_security(struct rxrpc_call *call)
++ {
++ 	const struct rxrpc_security *sec = &rxrpc_no_security;
++ 	struct rxrpc_key_token *token;
++ 	struct key *key = call->key;
++ 	int ret;
++ 
++ 	if (!key)
++ 		goto found;
++ 
++ 	ret = key_validate(key);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	for (token = key->payload.data[0]; token; token = token->next) {
++ 		sec = rxrpc_security_lookup(token->security_index);
++ 		if (sec)
++ 			goto found;
++ 	}
++ 	return -EKEYREJECTED;
++ 
++ found:
++ 	call->security = sec;
++ 	call->security_ix = sec->security_index;
++ 	return 0;
++ }
++ 
++ /*
+++>>>>>>> fdb99487b018 (rxrpc: Fix security setting propagation)
+   * initialise the security on a client connection
+   */
+  int rxrpc_init_client_conn_security(struct rxrpc_connection *conn)
+* Unmerged path net/rxrpc/call_object.c
+* Unmerged path net/rxrpc/conn_client.c
+* Unmerged path net/rxrpc/security.c
