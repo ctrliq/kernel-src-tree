@@ -1,0 +1,191 @@
+PCI: vmd: Prevent recursive locking on interrupt allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit ba1366f3d039e7c3ca1fc29ed00ce3ed2b8fd32f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/ba1366f3.failed
+
+Tejas reported the following recursive locking issue:
+
+ swapper/0/1 is trying to acquire lock:
+ ffff8881074fd0a0 (&md->mutex){+.+.}-{3:3}, at: msi_get_virq+0x30/0xc0
+ 
+ but task is already holding lock:
+ ffff8881017cd6a0 (&md->mutex){+.+.}-{3:3}, at: __pci_enable_msi_range+0xf2/0x290
+ 
+ stack backtrace:
+  __mutex_lock+0x9d/0x920
+  msi_get_virq+0x30/0xc0
+  pci_irq_vector+0x26/0x30
+  vmd_msi_init+0xcc/0x210
+  msi_domain_alloc+0xbf/0x150
+  msi_domain_alloc_irqs_descs_locked+0x3e/0xb0
+  __pci_enable_msi_range+0x155/0x290
+  pci_alloc_irq_vectors_affinity+0xba/0x100
+  pcie_port_device_register+0x307/0x550
+  pcie_portdrv_probe+0x3c/0xd0
+  pci_device_probe+0x95/0x110
+
+This is caused by the VMD MSI code which does a lookup of the Linux
+interrupt number for an VMD managed MSI[X] vector. The lookup function
+tries to acquire the already held mutex.
+
+Avoid that by caching the Linux interrupt number at initialization time
+instead of looking it up over and over.
+
+Fixes: 82ff8e6b78fc ("PCI/MSI: Use msi_get_virq() in pci_get_vector()")
+	Reported-by: "Surendrakumar Upadhyay, TejaskumarX" <tejaskumarx.surendrakumar.upadhyay@intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: "Surendrakumar Upadhyay, TejaskumarX" <tejaskumarx.surendrakumar.upadhyay@intel.com>
+	Cc: linux-pci@vger.kernel.org
+Link: https://lore.kernel.org/r/87a6euub2a.ffs@tglx
+
+(cherry picked from commit ba1366f3d039e7c3ca1fc29ed00ce3ed2b8fd32f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/controller/vmd.c
+diff --cc drivers/pci/controller/vmd.c
+index 6e122dfa3c2f,eb05cceab964..000000000000
+--- a/drivers/pci/controller/vmd.c
++++ b/drivers/pci/controller/vmd.c
+@@@ -90,7 -105,7 +91,11 @@@ struct vmd_irq_list 
+  	struct list_head	irq_list;
+  	struct srcu_struct	srcu;
+  	unsigned int		count;
+++<<<<<<< HEAD
+ +	unsigned int		index;
+++=======
++ 	unsigned int		virq;
+++>>>>>>> ba1366f3d039 (PCI: vmd: Prevent recursive locking on interrupt allocation)
+  };
+  
+  struct vmd_dev {
+@@@ -229,7 -255,6 +234,10 @@@ static int vmd_msi_init(struct irq_doma
+  	struct msi_desc *desc = arg->desc;
+  	struct vmd_dev *vmd = vmd_from_bus(msi_desc_to_pci_dev(desc)->bus);
+  	struct vmd_irq *vmdirq = kzalloc(sizeof(*vmdirq), GFP_KERNEL);
+++<<<<<<< HEAD
+ +	unsigned int vector;
+++=======
+++>>>>>>> ba1366f3d039 (PCI: vmd: Prevent recursive locking on interrupt allocation)
+  
+  	if (!vmdirq)
+  		return -ENOMEM;
+@@@ -237,9 -262,8 +245,12 @@@
+  	INIT_LIST_HEAD(&vmdirq->node);
+  	vmdirq->irq = vmd_next_irq(vmd, desc);
+  	vmdirq->virq = virq;
+++<<<<<<< HEAD
+ +	vector = pci_irq_vector(vmd->dev, vmdirq->irq->index);
+++=======
+++>>>>>>> ba1366f3d039 (PCI: vmd: Prevent recursive locking on interrupt allocation)
+  
+- 	irq_domain_set_info(domain, virq, vector, info->chip, vmdirq,
++ 	irq_domain_set_info(domain, virq, vmdirq->irq->virq, info->chip, vmdirq,
+  			    handle_untracked_irq, vmd, NULL);
+  	return 0;
+  }
+@@@ -577,6 -645,71 +588,74 @@@ static int vmd_get_bus_number_start(str
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static irqreturn_t vmd_irq(int irq, void *data)
++ {
++ 	struct vmd_irq_list *irqs = data;
++ 	struct vmd_irq *vmdirq;
++ 	int idx;
++ 
++ 	idx = srcu_read_lock(&irqs->srcu);
++ 	list_for_each_entry_rcu(vmdirq, &irqs->irq_list, node)
++ 		generic_handle_irq(vmdirq->virq);
++ 	srcu_read_unlock(&irqs->srcu, idx);
++ 
++ 	return IRQ_HANDLED;
++ }
++ 
++ static int vmd_alloc_irqs(struct vmd_dev *vmd)
++ {
++ 	struct pci_dev *dev = vmd->dev;
++ 	int i, err;
++ 
++ 	vmd->msix_count = pci_msix_vec_count(dev);
++ 	if (vmd->msix_count < 0)
++ 		return -ENODEV;
++ 
++ 	vmd->msix_count = pci_alloc_irq_vectors(dev, vmd->first_vec + 1,
++ 						vmd->msix_count, PCI_IRQ_MSIX);
++ 	if (vmd->msix_count < 0)
++ 		return vmd->msix_count;
++ 
++ 	vmd->irqs = devm_kcalloc(&dev->dev, vmd->msix_count, sizeof(*vmd->irqs),
++ 				 GFP_KERNEL);
++ 	if (!vmd->irqs)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < vmd->msix_count; i++) {
++ 		err = init_srcu_struct(&vmd->irqs[i].srcu);
++ 		if (err)
++ 			return err;
++ 
++ 		INIT_LIST_HEAD(&vmd->irqs[i].irq_list);
++ 		vmd->irqs[i].virq = pci_irq_vector(dev, i);
++ 		err = devm_request_irq(&dev->dev, vmd->irqs[i].virq,
++ 				       vmd_irq, IRQF_NO_THREAD,
++ 				       vmd->name, &vmd->irqs[i]);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Since VMD is an aperture to regular PCIe root ports, only allow it to
++  * control features that the OS is allowed to control on the physical PCI bus.
++  */
++ static void vmd_copy_host_bridge_flags(struct pci_host_bridge *root_bridge,
++ 				       struct pci_host_bridge *vmd_bridge)
++ {
++ 	vmd_bridge->native_pcie_hotplug = root_bridge->native_pcie_hotplug;
++ 	vmd_bridge->native_shpc_hotplug = root_bridge->native_shpc_hotplug;
++ 	vmd_bridge->native_aer = root_bridge->native_aer;
++ 	vmd_bridge->native_pme = root_bridge->native_pme;
++ 	vmd_bridge->native_ltr = root_bridge->native_ltr;
++ 	vmd_bridge->native_dpc = root_bridge->native_dpc;
++ }
++ 
+++>>>>>>> ba1366f3d039 (PCI: vmd: Prevent recursive locking on interrupt allocation)
+  static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
+  {
+  	struct pci_sysdata *sd = &vmd->sysdata;
+@@@ -850,7 -969,7 +929,11 @@@ static int vmd_suspend(struct device *d
+  	int i;
+  
+  	for (i = 0; i < vmd->msix_count; i++)
+++<<<<<<< HEAD
+ +                devm_free_irq(dev, pci_irq_vector(pdev, i), vmd->irqs[i]);
+++=======
++ 		devm_free_irq(dev, vmd->irqs[i].virq, &vmd->irqs[i]);
+++>>>>>>> ba1366f3d039 (PCI: vmd: Prevent recursive locking on interrupt allocation)
+  
+  	return 0;
+  }
+@@@ -862,9 -981,9 +945,9 @@@ static int vmd_resume(struct device *de
+  	int err, i;
+  
+  	for (i = 0; i < vmd->msix_count; i++) {
+- 		err = devm_request_irq(dev, pci_irq_vector(pdev, i),
++ 		err = devm_request_irq(dev, vmd->irqs[i].virq,
+  				       vmd_irq, IRQF_NO_THREAD,
+ -				       vmd->name, &vmd->irqs[i]);
+ +				       "vmd", vmd->irqs[i]);
+  		if (err)
+  			return err;
+  	}
+* Unmerged path drivers/pci/controller/vmd.c
