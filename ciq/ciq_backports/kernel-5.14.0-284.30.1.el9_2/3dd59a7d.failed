@@ -1,0 +1,376 @@
+vfio: Make the group FD disassociate from the iommu_group
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 3dd59a7dcb97e6e40d6385a1a3faa9392b6d184a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/3dd59a7d.failed
+
+Allow the vfio_group struct to exist with a NULL iommu_group pointer. When
+the pointer is NULL the vfio_group users promise not to touch the
+iommu_group. This allows a driver to be hot unplugged while userspace is
+keeping the group FD open.
+
+Remove all the code waiting for the group FD to close.
+
+This fixes a userspace regression where we learned that virtnodedevd
+leaves a group FD open even though the /dev/ node for it has been deleted
+and all the drivers for it unplugged.
+
+Fixes: ca5f21b25749 ("vfio: Follow a strict lifetime for struct iommu_group")
+	Reported-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+	Tested-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Tested-by: Christian Borntraeger <borntraeger@de.ibm.com>
+	Tested-by: Eric Farman <farman@linux.ibm.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Link: https://lore.kernel.org/r/3-v2-15417f29324e+1c-vfio_group_disassociate_jgg@nvidia.com
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 3dd59a7dcb97e6e40d6385a1a3faa9392b6d184a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/vfio.h
+#	drivers/vfio/vfio_main.c
+diff --cc drivers/vfio/vfio.h
+index 503bea6c843d,bcad54bbab08..000000000000
+--- a/drivers/vfio/vfio.h
++++ b/drivers/vfio/vfio.h
+@@@ -28,6 -38,30 +28,33 @@@ enum vfio_group_type 
+  	VFIO_NO_IOMMU,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct vfio_group {
++ 	struct device 			dev;
++ 	struct cdev			cdev;
++ 	/*
++ 	 * When drivers is non-zero a driver is attached to the struct device
++ 	 * that provided the iommu_group and thus the iommu_group is a valid
++ 	 * pointer. When drivers is 0 the driver is being detached. Once users
++ 	 * reaches 0 then the iommu_group is invalid.
++ 	 */
++ 	refcount_t			drivers;
++ 	unsigned int			container_users;
++ 	struct iommu_group		*iommu_group;
++ 	struct vfio_container		*container;
++ 	struct list_head		device_list;
++ 	struct mutex			device_lock;
++ 	struct list_head		vfio_next;
++ 	struct list_head		container_next;
++ 	enum vfio_group_type		type;
++ 	struct mutex			group_lock;
++ 	struct kvm			*kvm;
++ 	struct file			*opened_file;
++ 	struct blocking_notifier_head	notifier;
++ };
++ 
+++>>>>>>> 3dd59a7dcb97 (vfio: Make the group FD disassociate from the iommu_group)
+  /* events for the backend driver notify callback */
+  enum vfio_iommu_notify_type {
+  	VFIO_IOMMU_CONTAINER_CLOSE = 0,
+diff --cc drivers/vfio/vfio_main.c
+index eb849d5b81b0,04099a839a52..000000000000
+--- a/drivers/vfio/vfio_main.c
++++ b/drivers/vfio/vfio_main.c
+@@@ -325,9 -133,13 +325,13 @@@ __vfio_group_get_from_iommu(struct iomm
+  {
+  	struct vfio_group *group;
+  
++ 	/*
++ 	 * group->iommu_group from the vfio.group_list cannot be NULL
++ 	 * under the vfio.group_lock.
++ 	 */
+  	list_for_each_entry(group, &vfio.group_list, vfio_next) {
+  		if (group->iommu_group == iommu_group) {
+ -			refcount_inc(&group->drivers);
+ +			vfio_group_get(group);
+  			return group;
+  		}
+  	}
+@@@ -350,7 -162,8 +354,12 @@@ static void vfio_group_release(struct d
+  	struct vfio_group *group = container_of(dev, struct vfio_group, dev);
+  
+  	mutex_destroy(&group->device_lock);
+++<<<<<<< HEAD
+ +	iommu_group_put(group->iommu_group);
+++=======
++ 	mutex_destroy(&group->group_lock);
++ 	WARN_ON(group->iommu_group);
+++>>>>>>> 3dd59a7dcb97 (vfio: Make the group FD disassociate from the iommu_group)
+  	ida_free(&vfio.group_ida, MINOR(group->dev.devt));
+  	kfree(group);
+  }
+@@@ -378,8 -191,8 +387,13 @@@ static struct vfio_group *vfio_group_al
+  	cdev_init(&group->cdev, &vfio_group_fops);
+  	group->cdev.owner = THIS_MODULE;
+  
+++<<<<<<< HEAD
+ +	refcount_set(&group->users, 1);
+ +	init_rwsem(&group->group_rwsem);
+++=======
++ 	refcount_set(&group->drivers, 1);
++ 	mutex_init(&group->group_lock);
+++>>>>>>> 3dd59a7dcb97 (vfio: Make the group FD disassociate from the iommu_group)
+  	INIT_LIST_HEAD(&group->device_list);
+  	mutex_init(&group->device_lock);
+  	group->iommu_group = iommu_group;
+@@@ -435,25 -248,50 +449,63 @@@ err_put
+  	return ret;
+  }
+  
+ -static void vfio_device_remove_group(struct vfio_device *device)
+ +static void vfio_group_put(struct vfio_group *group)
+  {
+++<<<<<<< HEAD
+ +	if (!refcount_dec_and_mutex_lock(&group->users, &vfio.group_lock))
+ +		return;
+ +
+++=======
++ 	struct vfio_group *group = device->group;
++ 	struct iommu_group *iommu_group;
++ 
++ 	if (group->type == VFIO_NO_IOMMU || group->type == VFIO_EMULATED_IOMMU)
++ 		iommu_group_remove_device(device->dev);
++ 
++ 	/* Pairs with vfio_create_group() / vfio_group_get_from_iommu() */
++ 	if (!refcount_dec_and_mutex_lock(&group->drivers, &vfio.group_lock))
++ 		return;
++ 	list_del(&group->vfio_next);
++ 
++ 	/*
++ 	 * We could concurrently probe another driver in the group that might
++ 	 * race vfio_device_remove_group() with vfio_get_group(), so we have to
++ 	 * ensure that the sysfs is all cleaned up under lock otherwise the
++ 	 * cdev_device_add() will fail due to the name aready existing.
++ 	 */
++ 	cdev_device_del(&group->cdev, &group->dev);
++ 
++ 	mutex_lock(&group->group_lock);
+++>>>>>>> 3dd59a7dcb97 (vfio: Make the group FD disassociate from the iommu_group)
+  	/*
+  	 * These data structures all have paired operations that can only be
+- 	 * undone when the caller holds a live reference on the group. Since all
+- 	 * pairs must be undone these WARN_ON's indicate some caller did not
++ 	 * undone when the caller holds a live reference on the device. Since
++ 	 * all pairs must be undone these WARN_ON's indicate some caller did not
+  	 * properly hold the group reference.
+  	 */
+  	WARN_ON(!list_empty(&group->device_list));
+- 	WARN_ON(group->container || group->container_users);
+  	WARN_ON(group->notifier.head);
+++<<<<<<< HEAD
+ +
+ +	list_del(&group->vfio_next);
+ +	cdev_device_del(&group->cdev, &group->dev);
+ +	mutex_unlock(&vfio.group_lock);
+++=======
+++>>>>>>> 3dd59a7dcb97 (vfio: Make the group FD disassociate from the iommu_group)
+  
++ 	/*
++ 	 * Revoke all users of group->iommu_group. At this point we know there
++ 	 * are no devices active because we are unplugging the last one. Setting
++ 	 * iommu_group to NULL blocks all new users.
++ 	 */
++ 	if (group->container)
++ 		vfio_group_detach_container(group);
++ 	iommu_group = group->iommu_group;
++ 	group->iommu_group = NULL;
++ 	mutex_unlock(&group->group_lock);
++ 	mutex_unlock(&vfio.group_lock);
++ 
++ 	iommu_group_put(iommu_group);
+  	put_device(&group->dev);
+  }
+  
+@@@ -605,14 -533,15 +657,18 @@@ static int __vfio_register_dev(struct v
+  
+  	existing_device = vfio_group_get_device(group, device->dev);
+  	if (existing_device) {
++ 		/*
++ 		 * group->iommu_group is non-NULL because we hold the drivers
++ 		 * refcount.
++ 		 */
+  		dev_WARN(device->dev, "Device already exists on group %d\n",
+  			 iommu_group_id(group->iommu_group));
+ -		vfio_device_put_registration(existing_device);
+ -		ret = -EBUSY;
+ -		goto err_out;
+ +		vfio_device_put(existing_device);
+ +		if (group->type == VFIO_NO_IOMMU ||
+ +		    group->type == VFIO_EMULATED_IOMMU)
+ +			iommu_group_remove_device(device->dev);
+ +		vfio_group_put(group);
+ +		return -EBUSY;
+  	}
+  
+  	/* Our reference on group is moved to the device */
+@@@ -1014,53 -703,25 +1070,71 @@@ static int vfio_group_set_container(str
+  	if (!f.file)
+  		return -EBADF;
+  
+++<<<<<<< HEAD
+ +	/* Sanity check, is this really our fd? */
+ +	if (f.file->f_op != &vfio_fops) {
+ +		fdput(f);
+ +		return -EINVAL;
+++=======
++ 	mutex_lock(&group->group_lock);
++ 	if (group->container || WARN_ON(group->container_users)) {
++ 		ret = -EINVAL;
++ 		goto out_unlock;
++ 	}
++ 	if (!group->iommu_group) {
++ 		ret = -ENODEV;
++ 		goto out_unlock;
++ 	}
++ 
++ 	container = vfio_container_from_file(f.file);
++ 	ret = -EINVAL;
++ 	if (container) {
++ 		ret = vfio_container_attach_group(container, group);
++ 		goto out_unlock;
+++>>>>>>> 3dd59a7dcb97 (vfio: Make the group FD disassociate from the iommu_group)
+  	}
+  
+ -out_unlock:
+ -	mutex_unlock(&group->group_lock);
+ +	container = f.file->private_data;
+ +	WARN_ON(!container); /* fget ensures we don't race vfio_release */
+ +
+ +	down_write(&container->group_lock);
+ +
+ +	/* Real groups and fake groups cannot mix */
+ +	if (!list_empty(&container->group_list) &&
+ +	    container->noiommu != (group->type == VFIO_NO_IOMMU)) {
+ +		ret = -EPERM;
+ +		goto unlock_out;
+ +	}
+ +
+ +	if (group->type == VFIO_IOMMU) {
+ +		ret = iommu_group_claim_dma_owner(group->iommu_group, f.file);
+ +		if (ret)
+ +			goto unlock_out;
+ +	}
+ +
+ +	driver = container->iommu_driver;
+ +	if (driver) {
+ +		ret = driver->ops->attach_group(container->iommu_data,
+ +						group->iommu_group,
+ +						group->type);
+ +		if (ret) {
+ +			if (group->type == VFIO_IOMMU)
+ +				iommu_group_release_dma_owner(
+ +					group->iommu_group);
+ +			goto unlock_out;
+ +		}
+ +	}
+ +
+ +	group->container = container;
+ +	group->container_users = 1;
+ +	container->noiommu = (group->type == VFIO_NO_IOMMU);
+ +	list_add(&group->container_next, &container->group_list);
+ +
+ +	/* Get a reference on the container and mark a user within the group */
+ +	vfio_container_get(container);
+ +
+ +unlock_out:
+ +	up_write(&container->group_lock);
+  	fdput(f);
+  	return ret;
+  }
+@@@ -1238,6 -858,38 +1312,41 @@@ err_put_device
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vfio_group_ioctl_get_status(struct vfio_group *group,
++ 				       struct vfio_group_status __user *arg)
++ {
++ 	unsigned long minsz = offsetofend(struct vfio_group_status, flags);
++ 	struct vfio_group_status status;
++ 
++ 	if (copy_from_user(&status, arg, minsz))
++ 		return -EFAULT;
++ 
++ 	if (status.argsz < minsz)
++ 		return -EINVAL;
++ 
++ 	status.flags = 0;
++ 
++ 	mutex_lock(&group->group_lock);
++ 	if (!group->iommu_group) {
++ 		mutex_unlock(&group->group_lock);
++ 		return -ENODEV;
++ 	}
++ 
++ 	if (group->container)
++ 		status.flags |= VFIO_GROUP_FLAGS_CONTAINER_SET |
++ 				VFIO_GROUP_FLAGS_VIABLE;
++ 	else if (!iommu_group_dma_owner_claimed(group->iommu_group))
++ 		status.flags |= VFIO_GROUP_FLAGS_VIABLE;
++ 	mutex_unlock(&group->group_lock);
++ 
++ 	if (copy_to_user(arg, &status, minsz))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ 
+++>>>>>>> 3dd59a7dcb97 (vfio: Make the group FD disassociate from the iommu_group)
+  static long vfio_group_fops_unl_ioctl(struct file *filep,
+  				      unsigned int cmd, unsigned long arg)
+  {
+@@@ -1361,15 -959,10 +1470,19 @@@ static int vfio_group_fops_release(stru
+  	 * is only called when there are no open devices.
+  	 */
+  	WARN_ON(group->notifier.head);
+ -	if (group->container)
+ -		vfio_group_detach_container(group);
+ +	if (group->container) {
+ +		WARN_ON(group->container_users != 1);
+ +		__vfio_group_unset_container(group);
+ +	}
+  	group->opened_file = NULL;
+++<<<<<<< HEAD
+ +	up_write(&group->group_rwsem);
+ +
+ +	vfio_group_put(group);
+ +
+++=======
++ 	mutex_unlock(&group->group_lock);
+++>>>>>>> 3dd59a7dcb97 (vfio: Make the group FD disassociate from the iommu_group)
+  	return 0;
+  }
+  
+@@@ -2037,10 -1573,21 +2150,25 @@@ static const struct file_operations vfi
+  struct iommu_group *vfio_file_iommu_group(struct file *file)
+  {
+  	struct vfio_group *group = file->private_data;
++ 	struct iommu_group *iommu_group = NULL;
+  
+ -	if (!IS_ENABLED(CONFIG_SPAPR_TCE_IOMMU))
+ +	if (file->f_op != &vfio_group_fops)
+  		return NULL;
+++<<<<<<< HEAD
+ +	return group->iommu_group;
+++=======
++ 
++ 	if (!vfio_file_is_group(file))
++ 		return NULL;
++ 
++ 	mutex_lock(&group->group_lock);
++ 	if (group->iommu_group) {
++ 		iommu_group = group->iommu_group;
++ 		iommu_group_ref_get(iommu_group);
++ 	}
++ 	mutex_unlock(&group->group_lock);
++ 	return iommu_group;
+++>>>>>>> 3dd59a7dcb97 (vfio: Make the group FD disassociate from the iommu_group)
+  }
+  EXPORT_SYMBOL_GPL(vfio_file_iommu_group);
+  
+* Unmerged path drivers/vfio/vfio.h
+* Unmerged path drivers/vfio/vfio_main.c
