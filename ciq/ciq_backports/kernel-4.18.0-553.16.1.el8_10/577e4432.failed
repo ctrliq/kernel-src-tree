@@ -1,0 +1,409 @@
+tcp: add sanity checks to rx zerocopy
+
+jira LE-1907
+cve CVE-2024-26640
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Eric Dumazet <edumazet@google.com>
+commit 577e4432f3ac810049cb7e6b71f4d96ec7c6e894
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/577e4432.failed
+
+TCP rx zerocopy intent is to map pages initially allocated
+from NIC drivers, not pages owned by a fs.
+
+This patch adds to can_map_frag() these additional checks:
+
+- Page must not be a compound one.
+- page->mapping must be NULL.
+
+This fixes the panic reported by ZhangPeng.
+
+syzbot was able to loopback packets built with sendfile(),
+mapping pages owned by an ext4 file to TCP rx zerocopy.
+
+r3 = socket$inet_tcp(0x2, 0x1, 0x0)
+mmap(&(0x7f0000ff9000/0x4000)=nil, 0x4000, 0x0, 0x12, r3, 0x0)
+r4 = socket$inet_tcp(0x2, 0x1, 0x0)
+bind$inet(r4, &(0x7f0000000000)={0x2, 0x4e24, @multicast1}, 0x10)
+connect$inet(r4, &(0x7f00000006c0)={0x2, 0x4e24, @empty}, 0x10)
+r5 = openat$dir(0xffffffffffffff9c, &(0x7f00000000c0)='./file0\x00',
+    0x181e42, 0x0)
+fallocate(r5, 0x0, 0x0, 0x85b8)
+sendfile(r4, r5, 0x0, 0x8ba0)
+getsockopt$inet_tcp_TCP_ZEROCOPY_RECEIVE(r4, 0x6, 0x23,
+    &(0x7f00000001c0)={&(0x7f0000ffb000/0x3000)=nil, 0x3000, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x0}, &(0x7f0000000440)=0x40)
+r6 = openat$dir(0xffffffffffffff9c, &(0x7f00000000c0)='./file0\x00',
+    0x181e42, 0x0)
+
+Fixes: 93ab6cc69162 ("tcp: implement mmap() for zero copy receive")
+Link: https://lore.kernel.org/netdev/5106a58e-04da-372a-b836-9d3d0bd2507b@huawei.com/T/
+Reported-and-bisected-by: ZhangPeng <zhangpeng362@huawei.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Arjun Roy <arjunroy@google.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: linux-mm@vger.kernel.org
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: linux-fsdevel@vger.kernel.org
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 577e4432f3ac810049cb7e6b71f4d96ec7c6e894)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp.c
+diff --cc net/ipv4/tcp.c
+index ec67c590bbbd,7e2481b9eae1..000000000000
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@@ -1780,18 -1759,343 +1780,336 @@@ int tcp_mmap(struct file *file, struct 
+  }
+  EXPORT_SYMBOL(tcp_mmap);
+  
+++<<<<<<< HEAD
+++=======
++ static skb_frag_t *skb_advance_to_frag(struct sk_buff *skb, u32 offset_skb,
++ 				       u32 *offset_frag)
++ {
++ 	skb_frag_t *frag;
++ 
++ 	if (unlikely(offset_skb >= skb->len))
++ 		return NULL;
++ 
++ 	offset_skb -= skb_headlen(skb);
++ 	if ((int)offset_skb < 0 || skb_has_frag_list(skb))
++ 		return NULL;
++ 
++ 	frag = skb_shinfo(skb)->frags;
++ 	while (offset_skb) {
++ 		if (skb_frag_size(frag) > offset_skb) {
++ 			*offset_frag = offset_skb;
++ 			return frag;
++ 		}
++ 		offset_skb -= skb_frag_size(frag);
++ 		++frag;
++ 	}
++ 	*offset_frag = 0;
++ 	return frag;
++ }
++ 
++ static bool can_map_frag(const skb_frag_t *frag)
++ {
++ 	struct page *page;
++ 
++ 	if (skb_frag_size(frag) != PAGE_SIZE || skb_frag_off(frag))
++ 		return false;
++ 
++ 	page = skb_frag_page(frag);
++ 
++ 	if (PageCompound(page) || page->mapping)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static int find_next_mappable_frag(const skb_frag_t *frag,
++ 				   int remaining_in_skb)
++ {
++ 	int offset = 0;
++ 
++ 	if (likely(can_map_frag(frag)))
++ 		return 0;
++ 
++ 	while (offset < remaining_in_skb && !can_map_frag(frag)) {
++ 		offset += skb_frag_size(frag);
++ 		++frag;
++ 	}
++ 	return offset;
++ }
++ 
++ static void tcp_zerocopy_set_hint_for_skb(struct sock *sk,
++ 					  struct tcp_zerocopy_receive *zc,
++ 					  struct sk_buff *skb, u32 offset)
++ {
++ 	u32 frag_offset, partial_frag_remainder = 0;
++ 	int mappable_offset;
++ 	skb_frag_t *frag;
++ 
++ 	/* worst case: skip to next skb. try to improve on this case below */
++ 	zc->recv_skip_hint = skb->len - offset;
++ 
++ 	/* Find the frag containing this offset (and how far into that frag) */
++ 	frag = skb_advance_to_frag(skb, offset, &frag_offset);
++ 	if (!frag)
++ 		return;
++ 
++ 	if (frag_offset) {
++ 		struct skb_shared_info *info = skb_shinfo(skb);
++ 
++ 		/* We read part of the last frag, must recvmsg() rest of skb. */
++ 		if (frag == &info->frags[info->nr_frags - 1])
++ 			return;
++ 
++ 		/* Else, we must at least read the remainder in this frag. */
++ 		partial_frag_remainder = skb_frag_size(frag) - frag_offset;
++ 		zc->recv_skip_hint -= partial_frag_remainder;
++ 		++frag;
++ 	}
++ 
++ 	/* partial_frag_remainder: If part way through a frag, must read rest.
++ 	 * mappable_offset: Bytes till next mappable frag, *not* counting bytes
++ 	 * in partial_frag_remainder.
++ 	 */
++ 	mappable_offset = find_next_mappable_frag(frag, zc->recv_skip_hint);
++ 	zc->recv_skip_hint = mappable_offset + partial_frag_remainder;
++ }
++ 
++ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
++ 			      int flags, struct scm_timestamping_internal *tss,
++ 			      int *cmsg_flags);
++ static int receive_fallback_to_copy(struct sock *sk,
++ 				    struct tcp_zerocopy_receive *zc, int inq,
++ 				    struct scm_timestamping_internal *tss)
++ {
++ 	unsigned long copy_address = (unsigned long)zc->copybuf_address;
++ 	struct msghdr msg = {};
++ 	int err;
++ 
++ 	zc->length = 0;
++ 	zc->recv_skip_hint = 0;
++ 
++ 	if (copy_address != zc->copybuf_address)
++ 		return -EINVAL;
++ 
++ 	err = import_ubuf(ITER_DEST, (void __user *)copy_address, inq,
++ 			  &msg.msg_iter);
++ 	if (err)
++ 		return err;
++ 
++ 	err = tcp_recvmsg_locked(sk, &msg, inq, MSG_DONTWAIT,
++ 				 tss, &zc->msg_flags);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	zc->copybuf_len = err;
++ 	if (likely(zc->copybuf_len)) {
++ 		struct sk_buff *skb;
++ 		u32 offset;
++ 
++ 		skb = tcp_recv_skb(sk, tcp_sk(sk)->copied_seq, &offset);
++ 		if (skb)
++ 			tcp_zerocopy_set_hint_for_skb(sk, zc, skb, offset);
++ 	}
++ 	return 0;
++ }
++ 
++ static int tcp_copy_straggler_data(struct tcp_zerocopy_receive *zc,
++ 				   struct sk_buff *skb, u32 copylen,
++ 				   u32 *offset, u32 *seq)
++ {
++ 	unsigned long copy_address = (unsigned long)zc->copybuf_address;
++ 	struct msghdr msg = {};
++ 	int err;
++ 
++ 	if (copy_address != zc->copybuf_address)
++ 		return -EINVAL;
++ 
++ 	err = import_ubuf(ITER_DEST, (void __user *)copy_address, copylen,
++ 			  &msg.msg_iter);
++ 	if (err)
++ 		return err;
++ 	err = skb_copy_datagram_msg(skb, *offset, &msg, copylen);
++ 	if (err)
++ 		return err;
++ 	zc->recv_skip_hint -= copylen;
++ 	*offset += copylen;
++ 	*seq += copylen;
++ 	return (__s32)copylen;
++ }
++ 
++ static int tcp_zc_handle_leftover(struct tcp_zerocopy_receive *zc,
++ 				  struct sock *sk,
++ 				  struct sk_buff *skb,
++ 				  u32 *seq,
++ 				  s32 copybuf_len,
++ 				  struct scm_timestamping_internal *tss)
++ {
++ 	u32 offset, copylen = min_t(u32, copybuf_len, zc->recv_skip_hint);
++ 
++ 	if (!copylen)
++ 		return 0;
++ 	/* skb is null if inq < PAGE_SIZE. */
++ 	if (skb) {
++ 		offset = *seq - TCP_SKB_CB(skb)->seq;
++ 	} else {
++ 		skb = tcp_recv_skb(sk, *seq, &offset);
++ 		if (TCP_SKB_CB(skb)->has_rxtstamp) {
++ 			tcp_update_recv_tstamps(skb, tss);
++ 			zc->msg_flags |= TCP_CMSG_TS;
++ 		}
++ 	}
++ 
++ 	zc->copybuf_len = tcp_copy_straggler_data(zc, skb, copylen, &offset,
++ 						  seq);
++ 	return zc->copybuf_len < 0 ? 0 : copylen;
++ }
++ 
++ static int tcp_zerocopy_vm_insert_batch_error(struct vm_area_struct *vma,
++ 					      struct page **pending_pages,
++ 					      unsigned long pages_remaining,
++ 					      unsigned long *address,
++ 					      u32 *length,
++ 					      u32 *seq,
++ 					      struct tcp_zerocopy_receive *zc,
++ 					      u32 total_bytes_to_map,
++ 					      int err)
++ {
++ 	/* At least one page did not map. Try zapping if we skipped earlier. */
++ 	if (err == -EBUSY &&
++ 	    zc->flags & TCP_RECEIVE_ZEROCOPY_FLAG_TLB_CLEAN_HINT) {
++ 		u32 maybe_zap_len;
++ 
++ 		maybe_zap_len = total_bytes_to_map -  /* All bytes to map */
++ 				*length + /* Mapped or pending */
++ 				(pages_remaining * PAGE_SIZE); /* Failed map. */
++ 		zap_page_range_single(vma, *address, maybe_zap_len, NULL);
++ 		err = 0;
++ 	}
++ 
++ 	if (!err) {
++ 		unsigned long leftover_pages = pages_remaining;
++ 		int bytes_mapped;
++ 
++ 		/* We called zap_page_range_single, try to reinsert. */
++ 		err = vm_insert_pages(vma, *address,
++ 				      pending_pages,
++ 				      &pages_remaining);
++ 		bytes_mapped = PAGE_SIZE * (leftover_pages - pages_remaining);
++ 		*seq += bytes_mapped;
++ 		*address += bytes_mapped;
++ 	}
++ 	if (err) {
++ 		/* Either we were unable to zap, OR we zapped, retried an
++ 		 * insert, and still had an issue. Either ways, pages_remaining
++ 		 * is the number of pages we were unable to map, and we unroll
++ 		 * some state we speculatively touched before.
++ 		 */
++ 		const int bytes_not_mapped = PAGE_SIZE * pages_remaining;
++ 
++ 		*length -= bytes_not_mapped;
++ 		zc->recv_skip_hint += bytes_not_mapped;
++ 	}
++ 	return err;
++ }
++ 
++ static int tcp_zerocopy_vm_insert_batch(struct vm_area_struct *vma,
++ 					struct page **pages,
++ 					unsigned int pages_to_map,
++ 					unsigned long *address,
++ 					u32 *length,
++ 					u32 *seq,
++ 					struct tcp_zerocopy_receive *zc,
++ 					u32 total_bytes_to_map)
++ {
++ 	unsigned long pages_remaining = pages_to_map;
++ 	unsigned int pages_mapped;
++ 	unsigned int bytes_mapped;
++ 	int err;
++ 
++ 	err = vm_insert_pages(vma, *address, pages, &pages_remaining);
++ 	pages_mapped = pages_to_map - (unsigned int)pages_remaining;
++ 	bytes_mapped = PAGE_SIZE * pages_mapped;
++ 	/* Even if vm_insert_pages fails, it may have partially succeeded in
++ 	 * mapping (some but not all of the pages).
++ 	 */
++ 	*seq += bytes_mapped;
++ 	*address += bytes_mapped;
++ 
++ 	if (likely(!err))
++ 		return 0;
++ 
++ 	/* Error: maybe zap and retry + rollback state for failed inserts. */
++ 	return tcp_zerocopy_vm_insert_batch_error(vma, pages + pages_mapped,
++ 		pages_remaining, address, length, seq, zc, total_bytes_to_map,
++ 		err);
++ }
++ 
++ #define TCP_VALID_ZC_MSG_FLAGS   (TCP_CMSG_TS)
++ static void tcp_zc_finalize_rx_tstamp(struct sock *sk,
++ 				      struct tcp_zerocopy_receive *zc,
++ 				      struct scm_timestamping_internal *tss)
++ {
++ 	unsigned long msg_control_addr;
++ 	struct msghdr cmsg_dummy;
++ 
++ 	msg_control_addr = (unsigned long)zc->msg_control;
++ 	cmsg_dummy.msg_control_user = (void __user *)msg_control_addr;
++ 	cmsg_dummy.msg_controllen =
++ 		(__kernel_size_t)zc->msg_controllen;
++ 	cmsg_dummy.msg_flags = in_compat_syscall()
++ 		? MSG_CMSG_COMPAT : 0;
++ 	cmsg_dummy.msg_control_is_user = true;
++ 	zc->msg_flags = 0;
++ 	if (zc->msg_control == msg_control_addr &&
++ 	    zc->msg_controllen == cmsg_dummy.msg_controllen) {
++ 		tcp_recv_timestamp(&cmsg_dummy, sk, tss);
++ 		zc->msg_control = (__u64)
++ 			((uintptr_t)cmsg_dummy.msg_control_user);
++ 		zc->msg_controllen =
++ 			(__u64)cmsg_dummy.msg_controllen;
++ 		zc->msg_flags = (__u32)cmsg_dummy.msg_flags;
++ 	}
++ }
++ 
++ static struct vm_area_struct *find_tcp_vma(struct mm_struct *mm,
++ 					   unsigned long address,
++ 					   bool *mmap_locked)
++ {
++ 	struct vm_area_struct *vma = lock_vma_under_rcu(mm, address);
++ 
++ 	if (vma) {
++ 		if (vma->vm_ops != &tcp_vm_ops) {
++ 			vma_end_read(vma);
++ 			return NULL;
++ 		}
++ 		*mmap_locked = false;
++ 		return vma;
++ 	}
++ 
++ 	mmap_read_lock(mm);
++ 	vma = vma_lookup(mm, address);
++ 	if (!vma || vma->vm_ops != &tcp_vm_ops) {
++ 		mmap_read_unlock(mm);
++ 		return NULL;
++ 	}
++ 	*mmap_locked = true;
++ 	return vma;
++ }
++ 
++ #define TCP_ZEROCOPY_PAGE_BATCH_SIZE 32
+++>>>>>>> 577e4432f3ac (tcp: add sanity checks to rx zerocopy)
+  static int tcp_zerocopy_receive(struct sock *sk,
+ -				struct tcp_zerocopy_receive *zc,
+ -				struct scm_timestamping_internal *tss)
+ +				struct tcp_zerocopy_receive *zc)
+  {
+ -	u32 length = 0, offset, vma_len, avail_len, copylen = 0;
+  	unsigned long address = (unsigned long)zc->address;
+ -	struct page *pages[TCP_ZEROCOPY_PAGE_BATCH_SIZE];
+ -	s32 copybuf_len = zc->copybuf_len;
+ -	struct tcp_sock *tp = tcp_sk(sk);
+  	const skb_frag_t *frags = NULL;
+ -	unsigned int pages_to_map = 0;
+ +	u32 length = 0, seq, offset;
+  	struct vm_area_struct *vma;
+  	struct sk_buff *skb = NULL;
+ -	u32 seq = tp->copied_seq;
+ -	u32 total_bytes_to_map;
+ +	struct tcp_sock *tp;
+  	int inq = tcp_inq(sk);
+ -	bool mmap_locked;
+  	int ret;
+  
+ -	zc->copybuf_len = 0;
+ -	zc->msg_flags = 0;
+ -
+  	if (address & (PAGE_SIZE - 1) || address != zc->address)
+  		return -EINVAL;
+  
+* Unmerged path net/ipv4/tcp.c
