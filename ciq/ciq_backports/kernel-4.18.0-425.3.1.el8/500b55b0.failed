@@ -1,0 +1,204 @@
+PCI: Work around Intel I210 ROM BAR overlap defect
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Bjorn Helgaas <bhelgaas@google.com>
+commit 500b55b05d0a21c4adddf4c3b29ee6f32b502046
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/500b55b0.failed
+
+Per PCIe r5, sec 7.5.1.2.4, a device must not claim accesses to its
+Expansion ROM unless both the Memory Space Enable and the Expansion ROM
+Enable bit are set.  But apparently some Intel I210 NICs don't work
+correctly if the ROM BAR overlaps another BAR, even if the Expansion ROM is
+disabled.
+
+Michael reported that on a Kontron SMARC-sAL28 ARM64 system with U-Boot
+v2021.01-rc3, the ROM BAR overlaps BAR 3, and networking doesn't work at
+all:
+
+  BAR 0: 0x40000000 (32-bit, non-prefetchable) [size=1M]
+  BAR 3: 0x40200000 (32-bit, non-prefetchable) [size=16K]
+  ROM:   0x40200000 (disabled) [size=1M]
+
+  NETDEV WATCHDOG: enP2p1s0 (igb): transmit queue 0 timed out
+  Hardware name: Kontron SMARC-sAL28 (Single PHY) on SMARC Eval 2.0 carrier (DT)
+  igb 0002:01:00.0 enP2p1s0: Reset adapter
+
+Previously, pci_std_update_resource() wrote the assigned ROM address to the
+BAR only when the ROM was enabled.  This meant that the I210 ROM BAR could
+be left with an address assigned by firmware, which might overlap with
+other BARs.
+
+Quirk these I210 devices so pci_std_update_resource() always writes the
+assigned address to the ROM BAR, whether or not the ROM is enabled.
+
+Link: https://lore.kernel.org/r/20211223163754.GA1267351@bhelgaas
+Link: https://lore.kernel.org/r/20201230185317.30915-1-michael@walle.cc
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=211105
+	Reported-by: Michael Walle <michael@walle.cc>
+	Tested-by: Michael Walle <michael@walle.cc>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit 500b55b05d0a21c4adddf4c3b29ee6f32b502046)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/quirks.c
+#	include/linux/pci.h
+diff --cc drivers/pci/quirks.c
+index b73acdd97ae8,46ff04091fa3..000000000000
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@@ -5619,3 -5789,81 +5619,84 @@@ static void pci_fixup_no_msi_no_pme(str
+  }
+  DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_PERICOM, 0x400e, pci_fixup_no_msi_no_pme);
+  DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_PERICOM, 0x400f, pci_fixup_no_msi_no_pme);
+++<<<<<<< HEAD
+++=======
++ 
++ static void apex_pci_fixup_class(struct pci_dev *pdev)
++ {
++ 	pdev->class = (PCI_CLASS_SYSTEM_OTHER << 8) | pdev->class;
++ }
++ DECLARE_PCI_FIXUP_CLASS_HEADER(0x1ac1, 0x089a,
++ 			       PCI_CLASS_NOT_DEFINED, 8, apex_pci_fixup_class);
++ 
++ /*
++  * Pericom PI7C9X2G404/PI7C9X2G304/PI7C9X2G303 switch erratum E5 -
++  * ACS P2P Request Redirect is not functional
++  *
++  * When ACS P2P Request Redirect is enabled and bandwidth is not balanced
++  * between upstream and downstream ports, packets are queued in an internal
++  * buffer until CPLD packet. The workaround is to use the switch in store and
++  * forward mode.
++  */
++ #define PI7C9X2Gxxx_MODE_REG		0x74
++ #define PI7C9X2Gxxx_STORE_FORWARD_MODE	BIT(0)
++ static void pci_fixup_pericom_acs_store_forward(struct pci_dev *pdev)
++ {
++ 	struct pci_dev *upstream;
++ 	u16 val;
++ 
++ 	/* Downstream ports only */
++ 	if (pci_pcie_type(pdev) != PCI_EXP_TYPE_DOWNSTREAM)
++ 		return;
++ 
++ 	/* Check for ACS P2P Request Redirect use */
++ 	if (!pdev->acs_cap)
++ 		return;
++ 	pci_read_config_word(pdev, pdev->acs_cap + PCI_ACS_CTRL, &val);
++ 	if (!(val & PCI_ACS_RR))
++ 		return;
++ 
++ 	upstream = pci_upstream_bridge(pdev);
++ 	if (!upstream)
++ 		return;
++ 
++ 	pci_read_config_word(upstream, PI7C9X2Gxxx_MODE_REG, &val);
++ 	if (!(val & PI7C9X2Gxxx_STORE_FORWARD_MODE)) {
++ 		pci_info(upstream, "Setting PI7C9X2Gxxx store-forward mode to avoid ACS erratum\n");
++ 		pci_write_config_word(upstream, PI7C9X2Gxxx_MODE_REG, val |
++ 				      PI7C9X2Gxxx_STORE_FORWARD_MODE);
++ 	}
++ }
++ /*
++  * Apply fixup on enable and on resume, in order to apply the fix up whenever
++  * ACS configuration changes or switch mode is reset
++  */
++ DECLARE_PCI_FIXUP_ENABLE(PCI_VENDOR_ID_PERICOM, 0x2404,
++ 			 pci_fixup_pericom_acs_store_forward);
++ DECLARE_PCI_FIXUP_RESUME(PCI_VENDOR_ID_PERICOM, 0x2404,
++ 			 pci_fixup_pericom_acs_store_forward);
++ DECLARE_PCI_FIXUP_ENABLE(PCI_VENDOR_ID_PERICOM, 0x2304,
++ 			 pci_fixup_pericom_acs_store_forward);
++ DECLARE_PCI_FIXUP_RESUME(PCI_VENDOR_ID_PERICOM, 0x2304,
++ 			 pci_fixup_pericom_acs_store_forward);
++ DECLARE_PCI_FIXUP_ENABLE(PCI_VENDOR_ID_PERICOM, 0x2303,
++ 			 pci_fixup_pericom_acs_store_forward);
++ DECLARE_PCI_FIXUP_RESUME(PCI_VENDOR_ID_PERICOM, 0x2303,
++ 			 pci_fixup_pericom_acs_store_forward);
++ 
++ static void nvidia_ion_ahci_fixup(struct pci_dev *pdev)
++ {
++ 	pdev->dev_flags |= PCI_DEV_FLAGS_HAS_MSI_MASKING;
++ }
++ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_NVIDIA, 0x0ab8, nvidia_ion_ahci_fixup);
++ 
++ static void rom_bar_overlap_defect(struct pci_dev *dev)
++ {
++ 	pci_info(dev, "working around ROM BAR overlap defect\n");
++ 	dev->rom_bar_overlap = 1;
++ }
++ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x1533, rom_bar_overlap_defect);
++ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x1536, rom_bar_overlap_defect);
++ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x1537, rom_bar_overlap_defect);
++ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x1538, rom_bar_overlap_defect);
+++>>>>>>> 500b55b05d0a (PCI: Work around Intel I210 ROM BAR overlap defect)
+diff --cc include/linux/pci.h
+index e3981947b059,51c4a063f489..000000000000
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@@ -476,18 -440,22 +476,37 @@@ struct pci_dev 
+  	 * that. When an IOMMU is enabled they should be getting full
+  	 * mappings to make sure they cannot access arbitrary memory.
+  	 */
+++<<<<<<< HEAD
+ +	RH_KABI_FILL_HOLE(unsigned int	untrusted:1)
+ +	RH_KABI_FILL_HOLE(unsigned int	no_vf_scan:1)  /* Don't scan for VFs after IOV enablement */
+ +	RH_KABI_FILL_HOLE(unsigned int	io_window:1)	/* Bridge has I/O window */
+ +	RH_KABI_FILL_HOLE(unsigned int	pref_window:1)	/* Bridge has pref mem window */
+ +	RH_KABI_FILL_HOLE(unsigned int	pref_64_window:1)/* Pref mem window is 64-bit */
+ +#ifdef CONFIG_PCI_PRI
+ +	RH_KABI_FILL_HOLE(unsigned int  pasid_required:1) /* PRG Response PASID Required */
+ +#endif
+ +#ifdef CONFIG_PCIE_DPC
+ +	RH_KABI_FILL_HOLE(unsigned int	dpc_rp_extensions:1)
+ +#endif
+ +        RH_KABI_FILL_HOLE(unsigned int  no_command_memory:1)    /* No PCI_COMMAND_MEMORY */
+++=======
++ 	unsigned int	untrusted:1;
++ 	/*
++ 	 * Info from the platform, e.g., ACPI or device tree, may mark a
++ 	 * device as "external-facing".  An external-facing device is
++ 	 * itself internal but devices downstream from it are external.
++ 	 */
++ 	unsigned int	external_facing:1;
++ 	unsigned int	broken_intx_masking:1;	/* INTx masking can't be used */
++ 	unsigned int	io_window_1k:1;		/* Intel bridge 1K I/O windows */
++ 	unsigned int	irq_managed:1;
++ 	unsigned int	non_compliant_bars:1;	/* Broken BARs; ignore them */
++ 	unsigned int	is_probed:1;		/* Device probing in progress */
++ 	unsigned int	link_active_reporting:1;/* Device capable of reporting link active */
++ 	unsigned int	no_vf_scan:1;		/* Don't scan for VFs after IOV enablement */
++ 	unsigned int	no_command_memory:1;	/* No PCI_COMMAND_MEMORY */
++ 	unsigned int	rom_bar_overlap:1;	/* ROM BAR disable broken */
+++>>>>>>> 500b55b05d0a (PCI: Work around Intel I210 ROM BAR overlap defect)
+  	pci_dev_flags_t dev_flags;
+  	atomic_t	enable_cnt;	/* pci_enable_device has been called */
+  
+* Unmerged path drivers/pci/quirks.c
+diff --git a/drivers/pci/setup-res.c b/drivers/pci/setup-res.c
+index 7f1acb3918d0..439ac5f5907a 100644
+--- a/drivers/pci/setup-res.c
++++ b/drivers/pci/setup-res.c
+@@ -75,12 +75,16 @@ static void pci_std_update_resource(struct pci_dev *dev, int resno)
+ 		 * as zero when disabled, so don't update ROM BARs unless
+ 		 * they're enabled.  See
+ 		 * https://lore.kernel.org/r/43147B3D.1030309@vc.cvut.cz/
++		 * But we must update ROM BAR for buggy devices where even a
++		 * disabled ROM can conflict with other BARs.
+ 		 */
+-		if (!(res->flags & IORESOURCE_ROM_ENABLE))
++		if (!(res->flags & IORESOURCE_ROM_ENABLE) &&
++		    !dev->rom_bar_overlap)
+ 			return;
+ 
+ 		reg = dev->rom_base_reg;
+-		new |= PCI_ROM_ADDRESS_ENABLE;
++		if (res->flags & IORESOURCE_ROM_ENABLE)
++			new |= PCI_ROM_ADDRESS_ENABLE;
+ 	} else
+ 		return;
+ 
+* Unmerged path include/linux/pci.h
