@@ -1,0 +1,180 @@
+net/smc: llc_conf_mutex refactor, replace it with rw_semaphore
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author D. Wythe <alibuda@linux.alibaba.com>
+commit b5dd4d6981717f7e2682c0419fe832328c7441cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/b5dd4d69.failed
+
+llc_conf_mutex was used to protect links and link related configurations
+in the same link group, for example, add or delete links. However,
+in most cases, the protected critical area has only read semantics and
+with no write semantics at all, such as obtaining a usable link or an
+available rmb_desc.
+
+This patch do simply code refactoring, replace mutex with rw_semaphore,
+replace mutex_lock with down_write and replace mutex_unlock with
+up_write.
+
+Theoretically, this replacement is equivalent, but after this patch,
+we can distinguish lock granularity according to different semantics
+of critical areas.
+
+	Signed-off-by: D. Wythe <alibuda@linux.alibaba.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b5dd4d6981717f7e2682c0419fe832328c7441cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/smc_llc.c
+diff --cc net/smc/smc_llc.c
+index 99b8c88e0d63,c0e73e436e98..000000000000
+--- a/net/smc/smc_llc.c
++++ b/net/smc/smc_llc.c
+@@@ -2126,8 -2126,8 +2126,13 @@@ void smc_llc_lgr_init(struct smc_link_g
+  	spin_lock_init(&lgr->llc_flow_lock);
+  	init_waitqueue_head(&lgr->llc_flow_waiter);
+  	init_waitqueue_head(&lgr->llc_msg_waiter);
+++<<<<<<< HEAD
+ +	mutex_init(&lgr->llc_conf_mutex);
+ +	lgr->llc_testlink_time = READ_ONCE(net->ipv4.sysctl_tcp_keepalive_time);
+++=======
++ 	init_rwsem(&lgr->llc_conf_mutex);
++ 	lgr->llc_testlink_time = READ_ONCE(net->smc.sysctl_smcr_testlink_time);
+++>>>>>>> b5dd4d698171 (net/smc: llc_conf_mutex refactor, replace it with rw_semaphore)
+  }
+  
+  /* called after lgr was removed from lgr_list */
+diff --git a/net/smc/af_smc.c b/net/smc/af_smc.c
+index ae9dc2293a5e..0cb3408a81d2 100644
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@ -497,7 +497,7 @@ static int smcr_lgr_reg_sndbufs(struct smc_link *link,
+ 		return -EINVAL;
+ 
+ 	/* protect against parallel smcr_link_reg_buf() */
+-	mutex_lock(&lgr->llc_conf_mutex);
++	down_write(&lgr->llc_conf_mutex);
+ 	for (i = 0; i < SMC_LINKS_PER_LGR_MAX; i++) {
+ 		if (!smc_link_active(&lgr->lnk[i]))
+ 			continue;
+@@ -505,7 +505,7 @@ static int smcr_lgr_reg_sndbufs(struct smc_link *link,
+ 		if (rc)
+ 			break;
+ 	}
+-	mutex_unlock(&lgr->llc_conf_mutex);
++	up_write(&lgr->llc_conf_mutex);
+ 	return rc;
+ }
+ 
+@@ -522,7 +522,7 @@ static int smcr_lgr_reg_rmbs(struct smc_link *link,
+ 	/* protect against parallel smc_llc_cli_rkey_exchange() and
+ 	 * parallel smcr_link_reg_buf()
+ 	 */
+-	mutex_lock(&lgr->llc_conf_mutex);
++	down_write(&lgr->llc_conf_mutex);
+ 	for (i = 0; i < SMC_LINKS_PER_LGR_MAX; i++) {
+ 		if (!smc_link_active(&lgr->lnk[i]))
+ 			continue;
+@@ -539,7 +539,7 @@ static int smcr_lgr_reg_rmbs(struct smc_link *link,
+ 	}
+ 	rmb_desc->is_conf_rkey = true;
+ out:
+-	mutex_unlock(&lgr->llc_conf_mutex);
++	up_write(&lgr->llc_conf_mutex);
+ 	smc_llc_flow_stop(lgr, &lgr->llc_flow_lcl);
+ 	return rc;
+ }
+diff --git a/net/smc/smc_core.c b/net/smc/smc_core.c
+index b8b18a172193..decd071415e7 100644
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@ -1101,10 +1101,10 @@ static void smcr_buf_unuse(struct smc_buf_desc *buf_desc, bool is_rmb,
+ 		rc = smc_llc_flow_initiate(lgr, SMC_LLC_FLOW_RKEY);
+ 		if (!rc) {
+ 			/* protect against smc_llc_cli_rkey_exchange() */
+-			mutex_lock(&lgr->llc_conf_mutex);
++			down_write(&lgr->llc_conf_mutex);
+ 			smc_llc_do_delete_rkey(lgr, buf_desc);
+ 			buf_desc->is_conf_rkey = false;
+-			mutex_unlock(&lgr->llc_conf_mutex);
++			up_write(&lgr->llc_conf_mutex);
+ 			smc_llc_flow_stop(lgr, &lgr->llc_flow_lcl);
+ 		}
+ 	}
+@@ -1372,12 +1372,12 @@ static void smc_lgr_free(struct smc_link_group *lgr)
+ 	int i;
+ 
+ 	if (!lgr->is_smcd) {
+-		mutex_lock(&lgr->llc_conf_mutex);
++		down_write(&lgr->llc_conf_mutex);
+ 		for (i = 0; i < SMC_LINKS_PER_LGR_MAX; i++) {
+ 			if (lgr->lnk[i].state != SMC_LNK_UNUSED)
+ 				smcr_link_clear(&lgr->lnk[i], false);
+ 		}
+-		mutex_unlock(&lgr->llc_conf_mutex);
++		up_write(&lgr->llc_conf_mutex);
+ 		smc_llc_lgr_clear(lgr);
+ 	}
+ 
+@@ -1691,12 +1691,12 @@ static void smcr_link_down(struct smc_link *lnk)
+ 	} else {
+ 		if (lgr->llc_flow_lcl.type != SMC_LLC_FLOW_NONE) {
+ 			/* another llc task is ongoing */
+-			mutex_unlock(&lgr->llc_conf_mutex);
++			up_write(&lgr->llc_conf_mutex);
+ 			wait_event_timeout(lgr->llc_flow_waiter,
+ 				(list_empty(&lgr->list) ||
+ 				 lgr->llc_flow_lcl.type == SMC_LLC_FLOW_NONE),
+ 				SMC_LLC_WAIT_TIME);
+-			mutex_lock(&lgr->llc_conf_mutex);
++			down_write(&lgr->llc_conf_mutex);
+ 		}
+ 		if (!list_empty(&lgr->list)) {
+ 			smc_llc_send_delete_link(to_lnk, del_link_id,
+@@ -1756,9 +1756,9 @@ static void smc_link_down_work(struct work_struct *work)
+ 	if (list_empty(&lgr->list))
+ 		return;
+ 	wake_up_all(&lgr->llc_msg_waiter);
+-	mutex_lock(&lgr->llc_conf_mutex);
++	down_write(&lgr->llc_conf_mutex);
+ 	smcr_link_down(link);
+-	mutex_unlock(&lgr->llc_conf_mutex);
++	up_write(&lgr->llc_conf_mutex);
+ }
+ 
+ static int smc_vlan_by_tcpsk_walk(struct net_device *lower_dev,
+@@ -2242,7 +2242,7 @@ static int smcr_buf_map_usable_links(struct smc_link_group *lgr,
+ 	int i, rc = 0, cnt = 0;
+ 
+ 	/* protect against parallel link reconfiguration */
+-	mutex_lock(&lgr->llc_conf_mutex);
++	down_write(&lgr->llc_conf_mutex);
+ 	for (i = 0; i < SMC_LINKS_PER_LGR_MAX; i++) {
+ 		struct smc_link *lnk = &lgr->lnk[i];
+ 
+@@ -2255,7 +2255,7 @@ static int smcr_buf_map_usable_links(struct smc_link_group *lgr,
+ 		cnt++;
+ 	}
+ out:
+-	mutex_unlock(&lgr->llc_conf_mutex);
++	up_write(&lgr->llc_conf_mutex);
+ 	if (!rc && !cnt)
+ 		rc = -EINVAL;
+ 	return rc;
+diff --git a/net/smc/smc_core.h b/net/smc/smc_core.h
+index f9e2631bd6c0..affab4956c55 100644
+--- a/net/smc/smc_core.h
++++ b/net/smc/smc_core.h
+@@ -292,7 +292,7 @@ struct smc_link_group {
+ 						/* queue for llc events */
+ 			spinlock_t		llc_event_q_lock;
+ 						/* protects llc_event_q */
+-			struct mutex		llc_conf_mutex;
++			struct rw_semaphore	llc_conf_mutex;
+ 						/* protects lgr reconfig. */
+ 			struct work_struct	llc_add_link_work;
+ 			struct work_struct	llc_del_link_work;
+* Unmerged path net/smc/smc_llc.c
