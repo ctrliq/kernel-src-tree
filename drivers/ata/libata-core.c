@@ -1993,6 +1993,11 @@ void ata_dev_power_set_standby(struct ata_device *dev)
 	struct ata_taskfile tf;
 	unsigned int err_mask;
 
+
+	/* If the device is already sleeping, do nothing. */
+	if (dev->flags & ATA_DFLAG_SLEEPING)
+		return;
+
 	/* Issue STANDBY IMMEDIATE command only if supported by the device */
 	if (dev->class != ATA_DEV_ATA && dev->class != ATA_DEV_ZAC)
 		return;
