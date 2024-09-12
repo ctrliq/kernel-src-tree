@@ -624,7 +624,7 @@ static void ieee80211_add_vht_ie(struct ieee80211_sub_if_data *sdata,
 		struct ieee80211_sub_if_data *other;
 
 		list_for_each_entry_rcu(other, &local->interfaces, list) {
-			if (other->vif.mu_mimo_owner) {
+			if (other->vif.bss_conf.mu_mimo_owner) {
 				disable_mu_mimo = true;
 				break;
 			}
@@ -632,7 +632,7 @@ static void ieee80211_add_vht_ie(struct ieee80211_sub_if_data *sdata,
 		if (disable_mu_mimo)
 			cap &= ~IEEE80211_VHT_CAP_MU_BEAMFORMEE_CAPABLE;
 		else
-			sdata->vif.mu_mimo_owner = true;
+			sdata->vif.bss_conf.mu_mimo_owner = true;
 	}
 
 	mask = IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK;
@@ -664,7 +664,7 @@ static void ieee80211_add_he_ie(struct ieee80211_sub_if_data *sdata,
 	bool reg_cap = false;
 
 	rcu_read_lock();
-	chanctx_conf = rcu_dereference(sdata->vif.chanctx_conf);
+	chanctx_conf = rcu_dereference(sdata->vif.bss_conf.chanctx_conf);
 	if (!WARN_ON_ONCE(!chanctx_conf))
 		reg_cap = cfg80211_chandef_usable(sdata->wdev.wiphy,
 						  &chanctx_conf->def,
@@ -705,7 +705,7 @@ static void ieee80211_add_eht_ie(struct ieee80211_sub_if_data *sdata,
 	bool reg_cap = false;
 
 	rcu_read_lock();
-	chanctx_conf = rcu_dereference(sdata->vif.chanctx_conf);
+	chanctx_conf = rcu_dereference(sdata->vif.bss_conf.chanctx_conf);
 	if (!WARN_ON_ONCE(!chanctx_conf))
 		reg_cap = cfg80211_chandef_usable(sdata->wdev.wiphy,
 						  &chanctx_conf->def,
@@ -766,7 +766,7 @@ static int ieee80211_send_assoc(struct ieee80211_sub_if_data *sdata)
 	sdata_assert_lock(sdata);
 
 	rcu_read_lock();
-	chanctx_conf = rcu_dereference(sdata->vif.chanctx_conf);
+	chanctx_conf = rcu_dereference(sdata->vif.bss_conf.chanctx_conf);
 	if (WARN_ON(!chanctx_conf)) {
 		rcu_read_unlock();
 		return -EINVAL;
@@ -1232,7 +1232,7 @@ static void ieee80211_chswitch_work(struct work_struct *work)
 	if (!ifmgd->associated)
 		goto out;
 
-	if (!sdata->vif.csa_active)
+	if (!sdata->vif.bss_conf.csa_active)
 		goto out;
 
 	/*
@@ -1292,7 +1292,7 @@ static void ieee80211_chswitch_post_beacon(struct ieee80211_sub_if_data *sdata)
 
 	sdata_assert_lock(sdata);
 
-	WARN_ON(!sdata->vif.csa_active);
+	WARN_ON(!sdata->vif.bss_conf.csa_active);
 
 	if (sdata->csa_block_tx) {
 		ieee80211_wake_vif_queues(local, sdata,
@@ -1300,7 +1300,7 @@ static void ieee80211_chswitch_post_beacon(struct ieee80211_sub_if_data *sdata)
 		sdata->csa_block_tx = false;
 	}
 
-	sdata->vif.csa_active = false;
+	sdata->vif.bss_conf.csa_active = false;
 	ifmgd->csa_waiting_bcn = false;
 	/*
 	 * If the CSA IE is still present on the beacon after the switch,
@@ -1364,7 +1364,7 @@ ieee80211_sta_abort_chanswitch(struct ieee80211_sub_if_data *sdata)
 					  IEEE80211_QUEUE_STOP_REASON_CSA);
 
 	sdata->csa_block_tx = false;
-	sdata->vif.csa_active = false;
+	sdata->vif.bss_conf.csa_active = false;
 
 	mutex_unlock(&local->mtx);
 
@@ -1415,13 +1415,13 @@ ieee80211_sta_process_chanswitch(struct ieee80211_sub_if_data *sdata,
 	if (res < 0)
 		goto lock_and_drop_connection;
 
-	if (beacon && sdata->vif.csa_active && !ifmgd->csa_waiting_bcn) {
+	if (beacon && sdata->vif.bss_conf.csa_active && !ifmgd->csa_waiting_bcn) {
 		if (res)
 			ieee80211_sta_abort_chanswitch(sdata);
 		else
 			drv_channel_switch_rx_beacon(sdata, &ch_switch);
 		return;
-	} else if (sdata->vif.csa_active || res) {
+	} else if (sdata->vif.bss_conf.csa_active || res) {
 		/* disregard subsequent announcements if already processing */
 		return;
 	}
@@ -1474,7 +1474,7 @@ ieee80211_sta_process_chanswitch(struct ieee80211_sub_if_data *sdata,
 
 	mutex_lock(&local->mtx);
 	mutex_lock(&local->chanctx_mtx);
-	conf = rcu_dereference_protected(sdata->vif.chanctx_conf,
+	conf = rcu_dereference_protected(sdata->vif.bss_conf.chanctx_conf,
 					 lockdep_is_held(&local->chanctx_mtx));
 	if (!conf) {
 		sdata_info(sdata,
@@ -1507,7 +1507,7 @@ ieee80211_sta_process_chanswitch(struct ieee80211_sub_if_data *sdata,
 	}
 	mutex_unlock(&local->chanctx_mtx);
 
-	sdata->vif.csa_active = true;
+	sdata->vif.bss_conf.csa_active = true;
 	sdata->csa_chandef = csa_ie.chandef;
 	sdata->csa_block_tx = csa_ie.mode;
 	ifmgd->csa_ignored_same_chan = false;
@@ -1546,7 +1546,7 @@ ieee80211_sta_process_chanswitch(struct ieee80211_sub_if_data *sdata,
 	 * send a deauthentication frame. Those two fields will be
 	 * reset when the disconnection worker runs.
 	 */
-	sdata->vif.csa_active = true;
+	sdata->vif.bss_conf.csa_active = true;
 	sdata->csa_block_tx = csa_ie.mode;
 
 	ieee80211_queue_work(&local->hw, &ifmgd->csa_connection_drop_work);
@@ -2450,7 +2450,7 @@ static void ieee80211_set_disassoc(struct ieee80211_sub_if_data *sdata,
 	memset(sdata->vif.bss_conf.mu_group.position, 0,
 	       sizeof(sdata->vif.bss_conf.mu_group.position));
 	changed |= BSS_CHANGED_MU_GROUPS;
-	sdata->vif.mu_mimo_owner = false;
+	sdata->vif.bss_conf.mu_mimo_owner = false;
 
 	sdata->ap_power_level = IEEE80211_UNSET_POWER_LEVEL;
 
@@ -2485,7 +2485,7 @@ static void ieee80211_set_disassoc(struct ieee80211_sub_if_data *sdata,
 	mutex_lock(&local->mtx);
 	ieee80211_vif_release_channel(sdata);
 
-	sdata->vif.csa_active = false;
+	sdata->vif.bss_conf.csa_active = false;
 	ifmgd->csa_waiting_bcn = false;
 	ifmgd->csa_ignored_same_chan = false;
 	if (sdata->csa_block_tx) {
@@ -2811,7 +2811,7 @@ static void __ieee80211_disconnect(struct ieee80211_sub_if_data *sdata)
 					WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY,
 			       tx, frame_buf);
 	mutex_lock(&local->mtx);
-	sdata->vif.csa_active = false;
+	sdata->vif.bss_conf.csa_active = false;
 	ifmgd->csa_waiting_bcn = false;
 	if (sdata->csa_block_tx) {
 		ieee80211_wake_vif_queues(local, sdata,
@@ -2951,7 +2951,7 @@ static void ieee80211_destroy_assoc_data(struct ieee80211_sub_if_data *sdata,
 		eth_zero_addr(sdata->u.mgd.bssid);
 		ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_BSSID);
 		sdata->u.mgd.flags = 0;
-		sdata->vif.mu_mimo_owner = false;
+		sdata->vif.bss_conf.mu_mimo_owner = false;
 
 		mutex_lock(&sdata->local->mtx);
 		ieee80211_vif_release_channel(sdata);
@@ -4137,7 +4137,7 @@ static void ieee80211_rx_mgmt_beacon(struct ieee80211_sub_if_data *sdata,
 		return;
 
 	rcu_read_lock();
-	chanctx_conf = rcu_dereference(sdata->vif.chanctx_conf);
+	chanctx_conf = rcu_dereference(sdata->vif.bss_conf.chanctx_conf);
 	if (!chanctx_conf) {
 		rcu_read_unlock();
 		return;
@@ -4806,7 +4806,7 @@ static void ieee80211_sta_bcn_mon_timer(struct timer_list *t)
 		from_timer(sdata, t, u.mgd.bcn_mon_timer);
 	struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
 
-	if (sdata->vif.csa_active && !ifmgd->csa_waiting_bcn)
+	if (sdata->vif.bss_conf.csa_active && !ifmgd->csa_waiting_bcn)
 		return;
 
 	if (sdata->vif.driver_flags & IEEE80211_VIF_BEACON_FILTER)
@@ -4826,7 +4826,7 @@ static void ieee80211_sta_conn_mon_timer(struct timer_list *t)
 	struct sta_info *sta;
 	unsigned long timeout;
 
-	if (sdata->vif.csa_active && !ifmgd->csa_waiting_bcn)
+	if (sdata->vif.bss_conf.csa_active && !ifmgd->csa_waiting_bcn)
 		return;
 
 	sta = sta_info_get(sdata, ifmgd->bssid);
