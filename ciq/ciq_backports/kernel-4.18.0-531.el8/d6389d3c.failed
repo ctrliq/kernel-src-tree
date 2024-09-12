@@ -1,0 +1,134 @@
+perf/x86/amd/uncore: Refactor uncore management
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-531.el8
+commit-author Sandipan Das <sandipan.das@amd.com>
+commit d6389d3ccc136a4229a8d497899c64f80fd3c5b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-531.el8/d6389d3c.failed
+
+Since struct amd_uncore is used to manage per-cpu contexts, rename it to
+amd_uncore_ctx in order to better reflect its purpose. Add a new struct
+amd_uncore_pmu to encapsulate all attributes which are shared by per-cpu
+contexts for a corresponding PMU. These include the number of counters,
+active mask, MSR and RDPMC base addresses, etc. Since the struct pmu is
+now embedded, the corresponding amd_uncore_pmu for a given event can be
+found by simply using container_of().
+
+Finally, move all PMU-specific code to separate functions. While the
+original event management functions continue to provide the base
+functionality, all PMU-specific quirks and customizations are applied in
+separate functions.
+
+The motivation is to simplify the management of uncore PMUs.
+
+	Signed-off-by: Sandipan Das <sandipan.das@amd.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/24b38c49a5dae65d8c96e5d75a2b96ae97aaa651.1696425185.git.sandipan.das@amd.com
+(cherry picked from commit d6389d3ccc136a4229a8d497899c64f80fd3c5b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/amd/uncore.c
+diff --cc arch/x86/events/amd/uncore.c
+index 63fc97aecaf4,ffcecda13d65..000000000000
+--- a/arch/x86/events/amd/uncore.c
++++ b/arch/x86/events/amd/uncore.c
+@@@ -648,12 -746,10 +749,9 @@@ static void uncore_free(void
+  
+  static int __init amd_uncore_init(void)
+  {
+- 	struct attribute **df_attr = amd_uncore_df_format_attr;
+- 	struct attribute **l3_attr = amd_uncore_l3_format_attr;
+- 	union cpuid_0x80000022_ebx ebx;
+- 	int ret = -ENODEV;
++ 	int ret;
+  
+ -	if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD &&
+ -	    boot_cpu_data.x86_vendor != X86_VENDOR_HYGON)
+ +	if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD)
+  		return -ENODEV;
+  
+  	if (!boot_cpu_has(X86_FEATURE_TOPOEXT))
+@@@ -662,69 -758,13 +760,79 @@@
+  	if (boot_cpu_has(X86_FEATURE_PERFMON_V2))
+  		pmu_version = 2;
+  
+++<<<<<<< HEAD
+ +	num_counters_nb	= NUM_COUNTERS_NB;
+ +	num_counters_llc = NUM_COUNTERS_L2;
+ +	if (boot_cpu_data.x86 >= 0x17) {
+ +		/*
+ +		 * For F17h and above, the Northbridge counters are repurposed as Data
+ +		 * Fabric counters. Also, L3 counters are supported too. The PMUs
+ +		 * are exported based on  family as either L2 or L3 and NB or DF.
+ +		 */
+ +		num_counters_llc	  = NUM_COUNTERS_L3;
+ +		amd_nb_pmu.name		  = "amd_df";
+ +		amd_llc_pmu.name	  = "amd_l3";
+ +		l3_mask			  = true;
+ +	}
+ +
+ +	if (boot_cpu_has(X86_FEATURE_PERFCTR_NB)) {
+ +		if (pmu_version >= 2) {
+ +			*df_attr++ = &format_attr_event14v2.attr;
+ +			*df_attr++ = &format_attr_umask12.attr;
+ +		} else if (boot_cpu_data.x86 >= 0x17) {
+ +			*df_attr = &format_attr_event14.attr;
+ +		}
+ +
+ +		amd_uncore_nb = alloc_percpu(struct amd_uncore *);
+ +		if (!amd_uncore_nb) {
+ +			ret = -ENOMEM;
+ +			goto fail_nb;
+ +		}
+ +		ret = perf_pmu_register(&amd_nb_pmu, amd_nb_pmu.name, -1);
+ +		if (ret)
+ +			goto fail_nb;
+ +
+ +		if (pmu_version >= 2) {
+ +			ebx.full = cpuid_ebx(EXT_PERFMON_DEBUG_FEATURES);
+ +			num_counters_nb = ebx.split.num_df_pmc;
+ +		}
+ +
+ +		pr_info("%d %s counters detected\n", num_counters_nb, amd_nb_pmu.name);
+ +		ret = 0;
+ +	}
+ +
+ +	if (boot_cpu_has(X86_FEATURE_PERFCTR_LLC)) {
+ +		if (boot_cpu_data.x86 >= 0x19) {
+ +			*l3_attr++ = &format_attr_event8.attr;
+ +			*l3_attr++ = &format_attr_umask8.attr;
+ +			*l3_attr++ = &format_attr_threadmask2.attr;
+ +		} else if (boot_cpu_data.x86 >= 0x17) {
+ +			*l3_attr++ = &format_attr_event8.attr;
+ +			*l3_attr++ = &format_attr_umask8.attr;
+ +			*l3_attr++ = &format_attr_threadmask8.attr;
+ +		}
+ +
+ +		amd_uncore_llc = alloc_percpu(struct amd_uncore *);
+ +		if (!amd_uncore_llc) {
+ +			ret = -ENOMEM;
+ +			goto fail_llc;
+ +		}
+ +		ret = perf_pmu_register(&amd_llc_pmu, amd_llc_pmu.name, -1);
+ +		if (ret)
+ +			goto fail_llc;
+ +
+ +		pr_info("%d %s counters detected\n", num_counters_llc, amd_llc_pmu.name);
+ +		ret = 0;
+ +	}
+++=======
++ 	ret = amd_uncore_df_init();
++ 	if (ret)
++ 		goto fail;
++ 
++ 	ret = amd_uncore_l3_init();
++ 	if (ret)
++ 		goto fail;
+++>>>>>>> d6389d3ccc13 (perf/x86/amd/uncore: Refactor uncore management)
+  
+  	/*
+  	 * Install callbacks. Core will call them for each online cpu.
+* Unmerged path arch/x86/events/amd/uncore.c
