@@ -1745,10 +1745,6 @@ retry:
 		set_bit(HCI_QUIRK_USE_BDADDR_PROPERTY, &hdev->quirks);
 		hci_set_aosp_capable(hdev);
 
-		ret = qca_wcn3990_init(hu);
-		if (ret)
-			return ret;
-
 		ret = qca_read_soc_version(hdev, &ver, soc_type);
 		if (ret)
 			goto out;
