@@ -1,0 +1,161 @@
+dm bufio: remove unused dm_bufio_release_move interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-494.el8
+commit-author Joe Thornber <ejt@redhat.com>
+commit 96a2ff2a6373259cd3bbc5dcaa79865ce271fa4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-494.el8/96a2ff2a.failed
+
+Was used by multi-snapshot DM target that never went upstream.
+
+	Signed-off-by: Joe Thornber <ejt@redhat.com>
+	Acked-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 96a2ff2a6373259cd3bbc5dcaa79865ce271fa4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-bufio.c
+#	include/linux/dm-bufio.h
+diff --cc drivers/md/dm-bufio.c
+index a7759a71b8fa,79434b38f368..000000000000
+--- a/drivers/md/dm-bufio.c
++++ b/drivers/md/dm-bufio.c
+@@@ -1350,80 -1393,35 +1350,112 @@@ int dm_bufio_issue_flush(struct dm_bufi
+  EXPORT_SYMBOL_GPL(dm_bufio_issue_flush);
+  
+  /*
+++<<<<<<< HEAD
+ + * We first delete any other buffer that may be at that new location.
+ + *
+ + * Then, we write the buffer to the original location if it was dirty.
+ + *
+ + * Then, if we are the only one who is holding the buffer, relink the buffer
+ + * in the buffer tree for the new location.
+ + *
+ + * If there was someone else holding the buffer, we write it to the new
+ + * location but not relink it, because that other user needs to have the buffer
+ + * at the same place.
+ + */
+ +void dm_bufio_release_move(struct dm_buffer *b, sector_t new_block)
+ +{
+ +	struct dm_bufio_client *c = b->c;
+ +	struct dm_buffer *new;
+ +
+ +	BUG_ON(dm_bufio_in_request());
+ +
+ +	dm_bufio_lock(c);
+ +
+ +retry:
+ +	new = __find(c, new_block);
+ +	if (new) {
+ +		if (new->hold_count) {
+ +			__wait_for_free_buffer(c);
+ +			goto retry;
+ +		}
+ +
+ +		/*
+ +		 * FIXME: Is there any point waiting for a write that's going
+ +		 * to be overwritten in a bit?
+ +		 */
+ +		__make_buffer_clean(new);
+ +		__unlink_buffer(new);
+ +		__free_buffer_wake(new);
+ +	}
+ +
+ +	BUG_ON(!b->hold_count);
+ +	BUG_ON(test_bit(B_READING, &b->state));
+ +
+ +	__write_dirty_buffer(b, NULL);
+ +	if (b->hold_count == 1) {
+ +		wait_on_bit_io(&b->state, B_WRITING,
+ +			       TASK_UNINTERRUPTIBLE);
+ +		set_bit(B_DIRTY, &b->state);
+ +		b->dirty_start = 0;
+ +		b->dirty_end = c->block_size;
+ +		__unlink_buffer(b);
+ +		__link_buffer(b, new_block, LIST_DIRTY);
+ +	} else {
+ +		sector_t old_block;
+ +		wait_on_bit_lock_io(&b->state, B_WRITING,
+ +				    TASK_UNINTERRUPTIBLE);
+ +		/*
+ +		 * Relink buffer to "new_block" so that write_callback
+ +		 * sees "new_block" as a block number.
+ +		 * After the write, link the buffer back to old_block.
+ +		 * All this must be done in bufio lock, so that block number
+ +		 * change isn't visible to other threads.
+ +		 */
+ +		old_block = b->block;
+ +		__unlink_buffer(b);
+ +		__link_buffer(b, new_block, b->list_mode);
+ +		submit_io(b, REQ_OP_WRITE, write_endio);
+ +		wait_on_bit_io(&b->state, B_WRITING,
+ +			       TASK_UNINTERRUPTIBLE);
+ +		__unlink_buffer(b);
+ +		__link_buffer(b, old_block, b->list_mode);
+ +	}
+ +
+ +	dm_bufio_unlock(c);
+ +	dm_bufio_release(b);
+ +}
+ +EXPORT_SYMBOL_GPL(dm_bufio_release_move);
+++=======
++  * Use dm-io to send a discard request to flush the device.
++  */
++ int dm_bufio_issue_discard(struct dm_bufio_client *c, sector_t block, sector_t count)
++ {
++ 	struct dm_io_request io_req = {
++ 		.bi_opf = REQ_OP_DISCARD | REQ_SYNC,
++ 		.mem.type = DM_IO_KMEM,
++ 		.mem.ptr.addr = NULL,
++ 		.client = c->dm_io,
++ 	};
++ 	struct dm_io_region io_reg = {
++ 		.bdev = c->bdev,
++ 		.sector = block_to_sector(c, block),
++ 		.count = block_to_sector(c, count),
++ 	};
++ 
++ 	BUG_ON(dm_bufio_in_request());
++ 
++ 	return dm_io(&io_req, 1, &io_reg, NULL);
++ }
++ EXPORT_SYMBOL_GPL(dm_bufio_issue_discard);
++ 
++ static void forget_buffer_locked(struct dm_buffer *b)
++ {
++ 	if (likely(!b->hold_count) && likely(!smp_load_acquire(&b->state))) {
++ 		__unlink_buffer(b);
++ 		__free_buffer_wake(b);
++ 	}
++ }
+++>>>>>>> 96a2ff2a6373 (dm bufio: remove unused dm_bufio_release_move interface)
+  
+  /*
+   * Free the given buffer.
+diff --cc include/linux/dm-bufio.h
+index 3fa32d0b25a8,681656a1c03d..000000000000
+--- a/include/linux/dm-bufio.h
++++ b/include/linux/dm-bufio.h
+@@@ -125,10 -126,9 +125,16 @@@ int dm_bufio_write_dirty_buffers(struc
+  int dm_bufio_issue_flush(struct dm_bufio_client *c);
+  
+  /*
+++<<<<<<< HEAD
+ + * Like dm_bufio_release but also move the buffer to the new
+ + * block. dm_bufio_write_dirty_buffers is needed to commit the new block.
+ + */
+ +void dm_bufio_release_move(struct dm_buffer *b, sector_t new_block);
+++=======
++  * Send a discard request to the underlying device.
++  */
++ int dm_bufio_issue_discard(struct dm_bufio_client *c, sector_t block, sector_t count);
+++>>>>>>> 96a2ff2a6373 (dm bufio: remove unused dm_bufio_release_move interface)
+  
+  /*
+   * Free the given buffer.
+* Unmerged path drivers/md/dm-bufio.c
+* Unmerged path include/linux/dm-bufio.h
