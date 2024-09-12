@@ -1,0 +1,157 @@
+usb: typec: tipd: Only update power status on IRQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-500.el8
+commit-author Guido Günther <agx@sigxcpu.org>
+commit 92440202a88009ef66a236001981513e03a300fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-500.el8/92440202.failed
+
+Instead of refetching power status cache it and only update it when a
+change is signalled via irq. This simplifies tracing and adding more
+supply properties in follow up patches.
+
+	Signed-off-by: Guido Günther <agx@sigxcpu.org>
+	Signed-off-by: Sebastian Krzyszkowiak <sebastian.krzyszkowiak@puri.sm>
+	Reviewed-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+Link: https://lore.kernel.org/r/20220317154518.4082046-2-sebastian.krzyszkowiak@puri.sm
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 92440202a88009ef66a236001981513e03a300fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/typec/tipd/core.c
+diff --cc drivers/usb/typec/tipd/core.c
+index 1493ef9d4090,dfbba5ae9487..000000000000
+--- a/drivers/usb/typec/tipd/core.c
++++ b/drivers/usb/typec/tipd/core.c
+@@@ -409,6 -413,109 +406,112 @@@ static const struct typec_operations tp
+  	.pr_set = tps6598x_pr_set,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static bool tps6598x_read_status(struct tps6598x *tps, u32 *status)
++ {
++ 	int ret;
++ 
++ 	ret = tps6598x_read32(tps, TPS_REG_STATUS, status);
++ 	if (ret) {
++ 		dev_err(tps->dev, "%s: failed to read status\n", __func__);
++ 		return false;
++ 	}
++ 	trace_tps6598x_status(*status);
++ 
++ 	return true;
++ }
++ 
++ static bool tps6598x_read_data_status(struct tps6598x *tps)
++ {
++ 	u32 data_status;
++ 	int ret;
++ 
++ 	ret = tps6598x_read32(tps, TPS_REG_DATA_STATUS, &data_status);
++ 	if (ret < 0) {
++ 		dev_err(tps->dev, "failed to read data status: %d\n", ret);
++ 		return false;
++ 	}
++ 	trace_tps6598x_data_status(data_status);
++ 
++ 	return true;
++ }
++ 
++ static bool tps6598x_read_power_status(struct tps6598x *tps)
++ {
++ 	u16 pwr_status;
++ 	int ret;
++ 
++ 	ret = tps6598x_read16(tps, TPS_REG_POWER_STATUS, &pwr_status);
++ 	if (ret < 0) {
++ 		dev_err(tps->dev, "failed to read power status: %d\n", ret);
++ 		return false;
++ 	}
++ 	tps->pwr_status = pwr_status;
++ 	trace_tps6598x_power_status(pwr_status);
++ 
++ 	return true;
++ }
++ 
++ static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
++ {
++ 	int ret;
++ 
++ 	if (status & TPS_STATUS_PLUG_PRESENT) {
++ 		ret = tps6598x_connect(tps, status);
++ 		if (ret)
++ 			dev_err(tps->dev, "failed to register partner\n");
++ 	} else {
++ 		tps6598x_disconnect(tps, status);
++ 	}
++ }
++ 
++ static irqreturn_t cd321x_interrupt(int irq, void *data)
++ {
++ 	struct tps6598x *tps = data;
++ 	u64 event;
++ 	u32 status;
++ 	int ret;
++ 
++ 	mutex_lock(&tps->lock);
++ 
++ 	ret = tps6598x_read64(tps, TPS_REG_INT_EVENT1, &event);
++ 	if (ret) {
++ 		dev_err(tps->dev, "%s: failed to read events\n", __func__);
++ 		goto err_unlock;
++ 	}
++ 	trace_cd321x_irq(event);
++ 
++ 	if (!event)
++ 		goto err_unlock;
++ 
++ 	if (!tps6598x_read_status(tps, &status))
++ 		goto err_clear_ints;
++ 
++ 	if (event & APPLE_CD_REG_INT_POWER_STATUS_UPDATE)
++ 		if (!tps6598x_read_power_status(tps))
++ 			goto err_clear_ints;
++ 
++ 	if (event & APPLE_CD_REG_INT_DATA_STATUS_UPDATE)
++ 		if (!tps6598x_read_data_status(tps))
++ 			goto err_clear_ints;
++ 
++ 	/* Handle plug insert or removal */
++ 	if (event & APPLE_CD_REG_INT_PLUG_EVENT)
++ 		tps6598x_handle_plug_event(tps, status);
++ 
++ err_clear_ints:
++ 	tps6598x_write64(tps, TPS_REG_INT_CLEAR1, event);
++ 
++ err_unlock:
++ 	mutex_unlock(&tps->lock);
++ 
++ 	if (event)
++ 		return IRQ_HANDLED;
++ 	return IRQ_NONE;
++ }
++ 
+++>>>>>>> 92440202a880 (usb: typec: tipd: Only update power status on IRQ)
+  static irqreturn_t tps6598x_interrupt(int irq, void *data)
+  {
+  	struct tps6598x *tps = data;
+@@@ -691,8 -821,14 +783,13 @@@ static int tps6598x_probe(struct i2c_cl
+  		ret = PTR_ERR(tps->port);
+  		goto err_role_put;
+  	}
+ -	fwnode_handle_put(fwnode);
+  
+  	if (status & TPS_STATUS_PLUG_PRESENT) {
++ 		ret = tps6598x_read16(tps, TPS_REG_POWER_STATUS, &tps->pwr_status);
++ 		if (ret < 0) {
++ 			dev_err(tps->dev, "failed to read power status: %d\n", ret);
++ 			goto err_role_put;
++ 		}
+  		ret = tps6598x_connect(tps, status);
+  		if (ret)
+  			dev_err(&client->dev, "failed to register partner\n");
+* Unmerged path drivers/usb/typec/tipd/core.c
