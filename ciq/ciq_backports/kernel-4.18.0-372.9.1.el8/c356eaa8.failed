@@ -1,0 +1,150 @@
+ice: move and rename ice_check_for_pending_update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit c356eaa82401f159f48f29aea8440a058cc5da8d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/c356eaa8.failed
+
+The ice_devlink_flash_update function performs a few checks and then
+calls ice_flash_pldm_image. One of these checks is to call
+ice_check_for_pending_update. This function checks if the device has
+a pending update, and cancels it if so. This is necessary to allow
+a new flash update to proceed.
+
+We want to refactor the ice code to eliminate ice_devlink_flash_update,
+moving its checks into ice_flash_pldm_image.
+
+To do this, ice_check_for_pending_update will become static, and only
+called by ice_flash_pldm_image. To make this change easier to review,
+first just move the function up within the ice_fw_update.c file.
+
+While at it, note that the function has a misleading name. Its primary
+action is to cancel a pending update. Using the verb "check" does not
+imply this. Rename it to ice_cancel_pending_update.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Gurucharan G <gurucharanx.g@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit c356eaa82401f159f48f29aea8440a058cc5da8d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_fw_update.c
+diff --cc drivers/net/ethernet/intel/ice/ice_fw_update.c
+index ff801f4064a0,489766e6ca6b..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_fw_update.c
++++ b/drivers/net/ethernet/intel/ice/ice_fw_update.c
+@@@ -648,78 -642,7 +648,82 @@@ static const struct pldmfw_ops ice_fwu_
+  };
+  
+  /**
+++<<<<<<< HEAD
+ + * ice_flash_pldm_image - Write a PLDM-formatted firmware image to the device
+ + * @pf: private device driver structure
+ + * @fw: firmware object pointing to the relevant firmware file
+ + * @preservation: preservation level to request from firmware
+ + * @extack: netlink extended ACK structure
+ + *
+ + * Parse the data for a given firmware file, verifying that it is a valid PLDM
+ + * formatted image that matches this device.
+ + *
+ + * Extract the device record Package Data and Component Tables and send them
+ + * to the firmware. Extract and write the flash data for each of the three
+ + * main flash components, "fw.mgmt", "fw.undi", and "fw.netlist". Notify
+ + * firmware once the data is written to the inactive banks.
+ + *
+ + * Returns: zero on success or a negative error code on failure.
+ + */
+ +int ice_flash_pldm_image(struct ice_pf *pf, const struct firmware *fw,
+ +			 u8 preservation, struct netlink_ext_ack *extack)
+ +{
+ +	struct device *dev = ice_pf_to_dev(pf);
+ +	struct ice_hw *hw = &pf->hw;
+ +	struct ice_fwu_priv priv;
+ +	enum ice_status status;
+ +	int err;
+ +
+ +	switch (preservation) {
+ +	case ICE_AQC_NVM_PRESERVE_ALL:
+ +	case ICE_AQC_NVM_PRESERVE_SELECTED:
+ +	case ICE_AQC_NVM_NO_PRESERVATION:
+ +	case ICE_AQC_NVM_FACTORY_DEFAULT:
+ +		break;
+ +	default:
+ +		WARN(1, "Unexpected preservation level request %u", preservation);
+ +		return -EINVAL;
+ +	}
+ +
+ +	memset(&priv, 0, sizeof(priv));
+ +
+ +	priv.context.ops = &ice_fwu_ops;
+ +	priv.context.dev = dev;
+ +	priv.extack = extack;
+ +	priv.pf = pf;
+ +	priv.activate_flags = preservation;
+ +
+ +	status = ice_acquire_nvm(hw, ICE_RES_WRITE);
+ +	if (status) {
+ +		dev_err(dev, "Failed to acquire device flash lock, err %d aq_err %s\n",
+ +			status,
+ +			ice_aq_str(hw->adminq.sq_last_status));
+ +		NL_SET_ERR_MSG_MOD(extack, "Failed to acquire device flash lock");
+ +		return -EIO;
+ +	}
+ +
+ +	err = pldmfw_flash_image(&priv.context, fw);
+ +	if (err == -ENOENT) {
+ +		dev_err(dev, "Firmware image has no record matching this device\n");
+ +		NL_SET_ERR_MSG_MOD(extack, "Firmware image has no record matching this device");
+ +	} else if (err) {
+ +		/* Do not set a generic extended ACK message here. A more
+ +		 * specific message may already have been set by one of our
+ +		 * ops.
+ +		 */
+ +		dev_err(dev, "Failed to flash PLDM image, err %d", err);
+ +	}
+ +
+ +	ice_release_nvm(hw);
+ +
+ +	return err;
+ +}
+ +
+ +/**
+ + * ice_check_for_pending_update - Check for a pending flash update
+++=======
++  * ice_cancel_pending_update - Cancel any pending update for a component
+++>>>>>>> c356eaa82401 (ice: move and rename ice_check_for_pending_update)
+   * @pf: the PF driver structure
+   * @component: if not NULL, the name of the component being updated
+   * @extack: Netlink extended ACK structure
+diff --git a/drivers/net/ethernet/intel/ice/ice_devlink.c b/drivers/net/ethernet/intel/ice/ice_devlink.c
+index 021c315fa8d4..46c952641849 100644
+--- a/drivers/net/ethernet/intel/ice/ice_devlink.c
++++ b/drivers/net/ethernet/intel/ice/ice_devlink.c
+@@ -413,7 +413,7 @@ ice_devlink_flash_update(struct devlink *devlink,
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	err = ice_check_for_pending_update(pf, NULL, extack);
++	err = ice_cancel_pending_update(pf, NULL, extack);
+ 	if (err)
+ 		return err;
+ 
+* Unmerged path drivers/net/ethernet/intel/ice/ice_fw_update.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_fw_update.h b/drivers/net/ethernet/intel/ice/ice_fw_update.h
+index c6390f6851ff..1f84ef18bfd1 100644
+--- a/drivers/net/ethernet/intel/ice/ice_fw_update.h
++++ b/drivers/net/ethernet/intel/ice/ice_fw_update.h
+@@ -6,7 +6,7 @@
+ 
+ int ice_flash_pldm_image(struct ice_pf *pf, const struct firmware *fw,
+ 			 u8 preservation, struct netlink_ext_ack *extack);
+-int ice_check_for_pending_update(struct ice_pf *pf, const char *component,
+-				 struct netlink_ext_ack *extack);
++int ice_cancel_pending_update(struct ice_pf *pf, const char *component,
++			      struct netlink_ext_ack *extack);
+ 
+ #endif
