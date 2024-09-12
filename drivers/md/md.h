@@ -536,6 +536,11 @@ struct mddev {
 	unsigned int			good_device_nr;	/* good device num within cluster raid */
 	unsigned int			noio_flag; /* for memalloc scope API */
 
+	/* Used to synchronize idle and frozen for action_store() */
+	struct mutex			sync_mutex;
+	/* The sequence number for sync thread */
+	atomic_t sync_seq;
+
 	bool	has_superblocks:1;
 	bool	fail_last_dev:1;
 	bool	serialize_policy:1;
@@ -559,6 +564,23 @@ enum recovery_flags {
 	MD_RECOVERY_WAIT,	/* waiting for pers->start() to finish */
 	MD_RESYNCING_REMOTE,	/* remote node is running resync thread */
 };
+
+enum md_ro_state {
+	MD_RDWR,
+	MD_RDONLY,
+	MD_AUTO_READ,
+	MD_MAX_STATE
+};
+
+static inline bool md_is_rdwr(struct mddev *mddev)
+{
+	return (mddev->ro == MD_RDWR);
+}
+
+static inline bool is_md_suspended(struct mddev *mddev)
+{
+	return percpu_ref_is_dying(&mddev->active_io);
+}
 
 static inline int __must_check mddev_lock(struct mddev *mddev)
 {
