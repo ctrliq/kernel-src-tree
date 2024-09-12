@@ -1,0 +1,2179 @@
+rxrpc: Move client call connection to the I/O thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 9d35d880e0e4a3ab32d8c12f9e4d76198aadd42d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/9d35d880.failed
+
+Move the connection setup of client calls to the I/O thread so that a whole
+load of locking and barrierage can be eliminated.  This necessitates the
+app thread waiting for connection to complete before it can begin
+encrypting data.
+
+This also completes the fix for a race that exists between call connection
+and call disconnection whereby the data transmission code adds the call to
+the peer error distribution list after the call has been disconnected (say
+by the rxrpc socket getting closed).
+
+The fix is to complete the process of moving call connection, data
+transmission and call disconnection into the I/O thread and thus forcibly
+serialising them.
+
+Note that the issue may predate the overhaul to an I/O thread model that
+were included in the merge window for v6.2, but the timing is very much
+changed by the change given below.
+
+Fixes: cf37b5987508 ("rxrpc: Move DATA transmission into call processor work item")
+	Reported-by: syzbot+c22650d2844392afdcfd@syzkaller.appspotmail.com
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit 9d35d880e0e4a3ab32d8c12f9e4d76198aadd42d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/trace/events/rxrpc.h
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/call_object.c
+#	net/rxrpc/call_state.c
+#	net/rxrpc/conn_client.c
+#	net/rxrpc/conn_event.c
+#	net/rxrpc/conn_object.c
+#	net/rxrpc/io_thread.c
+#	net/rxrpc/local_object.c
+#	net/rxrpc/rxkad.c
+#	net/rxrpc/security.c
+#	net/rxrpc/sendmsg.c
+diff --cc include/trace/events/rxrpc.h
+index 2a52121d73a0,283db0ea3db4..000000000000
+--- a/include/trace/events/rxrpc.h
++++ b/include/trace/events/rxrpc.h
+@@@ -16,44 -16,222 +16,74 @@@
+  /*
+   * Declare tracing information enums and their string mappings for display.
+   */
+ -#define rxrpc_abort_reasons \
+ -	/* AFS errors */						\
+ -	EM(afs_abort_general_error,		"afs-error")		\
+ -	EM(afs_abort_interrupted,		"afs-intr")		\
+ -	EM(afs_abort_oom,			"afs-oom")		\
+ -	EM(afs_abort_op_not_supported,		"afs-op-notsupp")	\
+ -	EM(afs_abort_probeuuid_negative,	"afs-probeuuid-neg")	\
+ -	EM(afs_abort_send_data_error,		"afs-send-data")	\
+ -	EM(afs_abort_unmarshal_error,		"afs-unmarshal")	\
+ -	/* rxperf errors */						\
+ -	EM(rxperf_abort_general_error,		"rxperf-error")		\
+ -	EM(rxperf_abort_oom,			"rxperf-oom")		\
+ -	EM(rxperf_abort_op_not_supported,	"rxperf-op-notsupp")	\
+ -	EM(rxperf_abort_unmarshal_error,	"rxperf-unmarshal")	\
+ -	/* RxKAD security errors */					\
+ -	EM(rxkad_abort_1_short_check,		"rxkad1-short-check")	\
+ -	EM(rxkad_abort_1_short_data,		"rxkad1-short-data")	\
+ -	EM(rxkad_abort_1_short_encdata,		"rxkad1-short-encdata")	\
+ -	EM(rxkad_abort_1_short_header,		"rxkad1-short-hdr")	\
+ -	EM(rxkad_abort_2_short_check,		"rxkad2-short-check")	\
+ -	EM(rxkad_abort_2_short_data,		"rxkad2-short-data")	\
+ -	EM(rxkad_abort_2_short_header,		"rxkad2-short-hdr")	\
+ -	EM(rxkad_abort_2_short_len,		"rxkad2-short-len")	\
+ -	EM(rxkad_abort_bad_checksum,		"rxkad2-bad-cksum")	\
+ -	EM(rxkad_abort_chall_key_expired,	"rxkad-chall-key-exp")	\
+ -	EM(rxkad_abort_chall_level,		"rxkad-chall-level")	\
+ -	EM(rxkad_abort_chall_no_key,		"rxkad-chall-nokey")	\
+ -	EM(rxkad_abort_chall_short,		"rxkad-chall-short")	\
+ -	EM(rxkad_abort_chall_version,		"rxkad-chall-version")	\
+ -	EM(rxkad_abort_resp_bad_callid,		"rxkad-resp-bad-callid") \
+ -	EM(rxkad_abort_resp_bad_checksum,	"rxkad-resp-bad-cksum")	\
+ -	EM(rxkad_abort_resp_bad_param,		"rxkad-resp-bad-param")	\
+ -	EM(rxkad_abort_resp_call_ctr,		"rxkad-resp-call-ctr") \
+ -	EM(rxkad_abort_resp_call_state,		"rxkad-resp-call-state") \
+ -	EM(rxkad_abort_resp_key_expired,	"rxkad-resp-key-exp")	\
+ -	EM(rxkad_abort_resp_key_rejected,	"rxkad-resp-key-rej")	\
+ -	EM(rxkad_abort_resp_level,		"rxkad-resp-level")	\
+ -	EM(rxkad_abort_resp_nokey,		"rxkad-resp-nokey")	\
+ -	EM(rxkad_abort_resp_ooseq,		"rxkad-resp-ooseq")	\
+ -	EM(rxkad_abort_resp_short,		"rxkad-resp-short")	\
+ -	EM(rxkad_abort_resp_short_tkt,		"rxkad-resp-short-tkt")	\
+ -	EM(rxkad_abort_resp_tkt_aname,		"rxkad-resp-tk-aname")	\
+ -	EM(rxkad_abort_resp_tkt_expired,	"rxkad-resp-tk-exp")	\
+ -	EM(rxkad_abort_resp_tkt_future,		"rxkad-resp-tk-future")	\
+ -	EM(rxkad_abort_resp_tkt_inst,		"rxkad-resp-tk-inst")	\
+ -	EM(rxkad_abort_resp_tkt_len,		"rxkad-resp-tk-len")	\
+ -	EM(rxkad_abort_resp_tkt_realm,		"rxkad-resp-tk-realm")	\
+ -	EM(rxkad_abort_resp_tkt_short,		"rxkad-resp-tk-short")	\
+ -	EM(rxkad_abort_resp_tkt_sinst,		"rxkad-resp-tk-sinst")	\
+ -	EM(rxkad_abort_resp_tkt_sname,		"rxkad-resp-tk-sname")	\
+ -	EM(rxkad_abort_resp_unknown_tkt,	"rxkad-resp-unknown-tkt") \
+ -	EM(rxkad_abort_resp_version,		"rxkad-resp-version")	\
+ -	/* rxrpc errors */						\
+ -	EM(rxrpc_abort_call_improper_term,	"call-improper-term")	\
+ -	EM(rxrpc_abort_call_reset,		"call-reset")		\
+ -	EM(rxrpc_abort_call_sendmsg,		"call-sendmsg")		\
+ -	EM(rxrpc_abort_call_sock_release,	"call-sock-rel")	\
+ -	EM(rxrpc_abort_call_sock_release_tba,	"call-sock-rel-tba")	\
+ -	EM(rxrpc_abort_call_timeout,		"call-timeout")		\
+ -	EM(rxrpc_abort_no_service_key,		"no-serv-key")		\
+ -	EM(rxrpc_abort_nomem,			"nomem")		\
+ -	EM(rxrpc_abort_service_not_offered,	"serv-not-offered")	\
+ -	EM(rxrpc_abort_shut_down,		"shut-down")		\
+ -	EM(rxrpc_abort_unsupported_security,	"unsup-sec")		\
+ -	EM(rxrpc_badmsg_bad_abort,		"bad-abort")		\
+ -	EM(rxrpc_badmsg_bad_jumbo,		"bad-jumbo")		\
+ -	EM(rxrpc_badmsg_short_ack,		"short-ack")		\
+ -	EM(rxrpc_badmsg_short_ack_info,		"short-ack-info")	\
+ -	EM(rxrpc_badmsg_short_hdr,		"short-hdr")		\
+ -	EM(rxrpc_badmsg_unsupported_packet,	"unsup-pkt")		\
+ -	EM(rxrpc_badmsg_zero_call,		"zero-call")		\
+ -	EM(rxrpc_badmsg_zero_seq,		"zero-seq")		\
+ -	EM(rxrpc_badmsg_zero_service,		"zero-service")		\
+ -	EM(rxrpc_eproto_ackr_outside_window,	"ackr-out-win")		\
+ -	EM(rxrpc_eproto_ackr_sack_overflow,	"ackr-sack-over")	\
+ -	EM(rxrpc_eproto_ackr_short_sack,	"ackr-short-sack")	\
+ -	EM(rxrpc_eproto_ackr_zero,		"ackr-zero")		\
+ -	EM(rxrpc_eproto_bad_upgrade,		"bad-upgrade")		\
+ -	EM(rxrpc_eproto_data_after_last,	"data-after-last")	\
+ -	EM(rxrpc_eproto_different_last,		"diff-last")		\
+ -	EM(rxrpc_eproto_early_reply,		"early-reply")		\
+ -	EM(rxrpc_eproto_improper_term,		"improper-term")	\
+ -	EM(rxrpc_eproto_no_client_call,		"no-cl-call")		\
+ -	EM(rxrpc_eproto_no_client_conn,		"no-cl-conn")		\
+ -	EM(rxrpc_eproto_no_service_call,	"no-sv-call")		\
+ -	EM(rxrpc_eproto_reupgrade,		"re-upgrade")		\
+ -	EM(rxrpc_eproto_rxnull_challenge,	"rxnull-chall")		\
+ -	EM(rxrpc_eproto_rxnull_response,	"rxnull-resp")		\
+ -	EM(rxrpc_eproto_tx_rot_last,		"tx-rot-last")		\
+ -	EM(rxrpc_eproto_unexpected_ack,		"unex-ack")		\
+ -	EM(rxrpc_eproto_unexpected_ackall,	"unex-ackall")		\
+ -	EM(rxrpc_eproto_unexpected_implicit_end, "unex-impl-end")	\
+ -	EM(rxrpc_eproto_unexpected_reply,	"unex-reply")		\
+ -	EM(rxrpc_eproto_wrong_security,		"wrong-sec")		\
+ -	EM(rxrpc_recvmsg_excess_data,		"recvmsg-excess")	\
+ -	EM(rxrpc_recvmsg_short_data,		"recvmsg-short")	\
+ -	E_(rxrpc_sendmsg_late_send,		"sendmsg-late")
+ -
+ -#define rxrpc_call_poke_traces \
+ -	EM(rxrpc_call_poke_abort,		"Abort")	\
+ -	EM(rxrpc_call_poke_complete,		"Compl")	\
+ -	EM(rxrpc_call_poke_error,		"Error")	\
+ -	EM(rxrpc_call_poke_idle,		"Idle")		\
+ -	EM(rxrpc_call_poke_start,		"Start")	\
+ -	EM(rxrpc_call_poke_timer,		"Timer")	\
+ -	E_(rxrpc_call_poke_timer_now,		"Timer-now")
+ -
+  #define rxrpc_skb_traces \
+ -	EM(rxrpc_skb_eaten_by_unshare,		"ETN unshare  ") \
+ -	EM(rxrpc_skb_eaten_by_unshare_nomem,	"ETN unshar-nm") \
+ -	EM(rxrpc_skb_get_conn_secured,		"GET conn-secd") \
+ -	EM(rxrpc_skb_get_conn_work,		"GET conn-work") \
+ -	EM(rxrpc_skb_get_local_work,		"GET locl-work") \
+ -	EM(rxrpc_skb_get_reject_work,		"GET rej-work ") \
+ -	EM(rxrpc_skb_get_to_recvmsg,		"GET to-recv  ") \
+ -	EM(rxrpc_skb_get_to_recvmsg_oos,	"GET to-recv-o") \
+ -	EM(rxrpc_skb_new_encap_rcv,		"NEW encap-rcv") \
+ -	EM(rxrpc_skb_new_error_report,		"NEW error-rpt") \
+ -	EM(rxrpc_skb_new_jumbo_subpacket,	"NEW jumbo-sub") \
+ -	EM(rxrpc_skb_new_unshared,		"NEW unshared ") \
+ -	EM(rxrpc_skb_put_conn_secured,		"PUT conn-secd") \
+ -	EM(rxrpc_skb_put_conn_work,		"PUT conn-work") \
+ -	EM(rxrpc_skb_put_error_report,		"PUT error-rep") \
+ -	EM(rxrpc_skb_put_input,			"PUT input    ") \
+ -	EM(rxrpc_skb_put_jumbo_subpacket,	"PUT jumbo-sub") \
+ -	EM(rxrpc_skb_put_purge,			"PUT purge    ") \
+ -	EM(rxrpc_skb_put_rotate,		"PUT rotate   ") \
+ -	EM(rxrpc_skb_put_unknown,		"PUT unknown  ") \
+ -	EM(rxrpc_skb_see_conn_work,		"SEE conn-work") \
+ -	EM(rxrpc_skb_see_recvmsg,		"SEE recvmsg  ") \
+ -	EM(rxrpc_skb_see_reject,		"SEE reject   ") \
+ -	EM(rxrpc_skb_see_rotate,		"SEE rotate   ") \
+ -	E_(rxrpc_skb_see_version,		"SEE version  ")
+ +	EM(rxrpc_skb_ack,			"ACK") \
+ +	EM(rxrpc_skb_cleaned,			"CLN") \
+ +	EM(rxrpc_skb_cloned_jumbo,		"CLJ") \
+ +	EM(rxrpc_skb_freed,			"FRE") \
+ +	EM(rxrpc_skb_got,			"GOT") \
+ +	EM(rxrpc_skb_lost,			"*L*") \
+ +	EM(rxrpc_skb_new,			"NEW") \
+ +	EM(rxrpc_skb_purged,			"PUR") \
+ +	EM(rxrpc_skb_received,			"RCV") \
+ +	EM(rxrpc_skb_rotated,			"ROT") \
+ +	EM(rxrpc_skb_seen,			"SEE") \
+ +	EM(rxrpc_skb_unshared,			"UNS") \
+ +	E_(rxrpc_skb_unshared_nomem,		"US0")
+  
+  #define rxrpc_local_traces \
+ -	EM(rxrpc_local_free,			"FREE        ") \
+ -	EM(rxrpc_local_get_call,		"GET call    ") \
+ -	EM(rxrpc_local_get_client_conn,		"GET conn-cln") \
+ -	EM(rxrpc_local_get_for_use,		"GET for-use ") \
+ -	EM(rxrpc_local_get_peer,		"GET peer    ") \
+ -	EM(rxrpc_local_get_prealloc_conn,	"GET conn-pre") \
+ -	EM(rxrpc_local_new,			"NEW         ") \
+ -	EM(rxrpc_local_put_bind,		"PUT bind    ") \
+ -	EM(rxrpc_local_put_call,		"PUT call    ") \
+ -	EM(rxrpc_local_put_for_use,		"PUT for-use ") \
+ -	EM(rxrpc_local_put_kill_conn,		"PUT conn-kil") \
+ -	EM(rxrpc_local_put_peer,		"PUT peer    ") \
+ -	EM(rxrpc_local_put_prealloc_conn,	"PUT conn-pre") \
+ -	EM(rxrpc_local_put_release_sock,	"PUT rel-sock") \
+ -	EM(rxrpc_local_stop,			"STOP        ") \
+ -	EM(rxrpc_local_stopped,			"STOPPED     ") \
+ -	EM(rxrpc_local_unuse_bind,		"UNU bind    ") \
+ -	EM(rxrpc_local_unuse_conn_work,		"UNU conn-wrk") \
+ -	EM(rxrpc_local_unuse_peer_keepalive,	"UNU peer-kpa") \
+ -	EM(rxrpc_local_unuse_release_sock,	"UNU rel-sock") \
+ -	EM(rxrpc_local_use_conn_work,		"USE conn-wrk") \
+ -	EM(rxrpc_local_use_lookup,		"USE lookup  ") \
+ -	E_(rxrpc_local_use_peer_keepalive,	"USE peer-kpa")
+ +	EM(rxrpc_local_got,			"GOT") \
+ +	EM(rxrpc_local_new,			"NEW") \
+ +	EM(rxrpc_local_processing,		"PRO") \
+ +	EM(rxrpc_local_put,			"PUT") \
+ +	EM(rxrpc_local_queued,			"QUE") \
+ +	E_(rxrpc_local_tx_ack,			"TAK")
+  
+  #define rxrpc_peer_traces \
+ -	EM(rxrpc_peer_free,			"FREE        ") \
+ -	EM(rxrpc_peer_get_accept,		"GET accept  ") \
+ -	EM(rxrpc_peer_get_bundle,		"GET bundle  ") \
+ -	EM(rxrpc_peer_get_client_conn,		"GET cln-conn") \
+ -	EM(rxrpc_peer_get_input,		"GET input   ") \
+ -	EM(rxrpc_peer_get_input_error,		"GET inpt-err") \
+ -	EM(rxrpc_peer_get_keepalive,		"GET keepaliv") \
+ -	EM(rxrpc_peer_get_lookup_client,	"GET look-cln") \
+ -	EM(rxrpc_peer_get_service_conn,		"GET srv-conn") \
+ -	EM(rxrpc_peer_new_client,		"NEW client  ") \
+ -	EM(rxrpc_peer_new_prealloc,		"NEW prealloc") \
+ -	EM(rxrpc_peer_put_bundle,		"PUT bundle  ") \
+ -	EM(rxrpc_peer_put_call,			"PUT call    ") \
+ -	EM(rxrpc_peer_put_conn,			"PUT conn    ") \
+ -	EM(rxrpc_peer_put_input,		"PUT input   ") \
+ -	EM(rxrpc_peer_put_input_error,		"PUT inpt-err") \
+ -	E_(rxrpc_peer_put_keepalive,		"PUT keepaliv")
+ -
+ -#define rxrpc_bundle_traces \
+ -	EM(rxrpc_bundle_free,			"FREE        ") \
+ -	EM(rxrpc_bundle_get_client_call,	"GET clt-call") \
+ -	EM(rxrpc_bundle_get_client_conn,	"GET clt-conn") \
+ -	EM(rxrpc_bundle_get_service_conn,	"GET svc-conn") \
+ -	EM(rxrpc_bundle_put_call,		"PUT call    ") \
+ -	EM(rxrpc_bundle_put_conn,		"PUT conn    ") \
+ -	EM(rxrpc_bundle_put_discard,		"PUT discard ") \
+ -	E_(rxrpc_bundle_new,			"NEW         ")
+ +	EM(rxrpc_peer_got,			"GOT") \
+ +	EM(rxrpc_peer_new,			"NEW") \
+ +	EM(rxrpc_peer_processing,		"PRO") \
+ +	E_(rxrpc_peer_put,			"PUT")
+  
+  #define rxrpc_conn_traces \
+++<<<<<<< HEAD
+ +	EM(rxrpc_conn_got,			"GOT") \
+ +	EM(rxrpc_conn_new_client,		"NWc") \
+ +	EM(rxrpc_conn_new_service,		"NWs") \
+ +	EM(rxrpc_conn_put_client,		"PTc") \
+ +	EM(rxrpc_conn_put_service,		"PTs") \
+ +	EM(rxrpc_conn_queued,			"QUE") \
+ +	EM(rxrpc_conn_reap_service,		"RPs") \
+ +	E_(rxrpc_conn_seen,			"SEE")
+++=======
++ 	EM(rxrpc_conn_free,			"FREE        ") \
++ 	EM(rxrpc_conn_get_activate_call,	"GET act-call") \
++ 	EM(rxrpc_conn_get_call_input,		"GET inp-call") \
++ 	EM(rxrpc_conn_get_conn_input,		"GET inp-conn") \
++ 	EM(rxrpc_conn_get_idle,			"GET idle    ") \
++ 	EM(rxrpc_conn_get_poke_abort,		"GET pk-abort") \
++ 	EM(rxrpc_conn_get_poke_timer,		"GET poke    ") \
++ 	EM(rxrpc_conn_get_service_conn,		"GET svc-conn") \
++ 	EM(rxrpc_conn_new_client,		"NEW client  ") \
++ 	EM(rxrpc_conn_new_service,		"NEW service ") \
++ 	EM(rxrpc_conn_put_call,			"PUT call    ") \
++ 	EM(rxrpc_conn_put_call_input,		"PUT inp-call") \
++ 	EM(rxrpc_conn_put_conn_input,		"PUT inp-conn") \
++ 	EM(rxrpc_conn_put_discard_idle,		"PUT disc-idl") \
++ 	EM(rxrpc_conn_put_local_dead,		"PUT loc-dead") \
++ 	EM(rxrpc_conn_put_noreuse,		"PUT noreuse ") \
++ 	EM(rxrpc_conn_put_poke,			"PUT poke    ") \
++ 	EM(rxrpc_conn_put_service_reaped,	"PUT svc-reap") \
++ 	EM(rxrpc_conn_put_unbundle,		"PUT unbundle") \
++ 	EM(rxrpc_conn_put_unidle,		"PUT unidle  ") \
++ 	EM(rxrpc_conn_put_work,			"PUT work    ") \
++ 	EM(rxrpc_conn_queue_challenge,		"QUE chall   ") \
++ 	EM(rxrpc_conn_queue_retry_work,		"QUE retry-wk") \
++ 	EM(rxrpc_conn_queue_rx_work,		"QUE rx-work ") \
++ 	EM(rxrpc_conn_see_new_service_conn,	"SEE new-svc ") \
++ 	EM(rxrpc_conn_see_reap_service,		"SEE reap-svc") \
++ 	E_(rxrpc_conn_see_work,			"SEE work    ")
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  
+  #define rxrpc_client_traces \
+  	EM(rxrpc_client_activate_chans,		"Activa") \
+@@@ -89,17 -267,11 +118,21 @@@
+  	EM(rxrpc_call_put_recvmsg,		"PUT recvmsg ") \
+  	EM(rxrpc_call_put_release_sock,		"PUT rls-sock") \
+  	EM(rxrpc_call_put_release_sock_tba,	"PUT rls-sk-a") \
+ +	EM(rxrpc_call_put_send_ack,		"PUT send-ack") \
+  	EM(rxrpc_call_put_sendmsg,		"PUT sendmsg ") \
+ +	EM(rxrpc_call_put_timer,		"PUT timer   ") \
+ +	EM(rxrpc_call_put_timer_already,	"PUT timer-al") \
+  	EM(rxrpc_call_put_unnotify,		"PUT unnotify") \
+  	EM(rxrpc_call_put_userid_exists,	"PUT u-exists") \
+++<<<<<<< HEAD
+ +	EM(rxrpc_call_put_work,			"PUT work    ") \
+ +	EM(rxrpc_call_queue_abort,		"QUE abort   ") \
+ +	EM(rxrpc_call_queue_requeue,		"QUE requeue ") \
+ +	EM(rxrpc_call_queue_resend,		"QUE resend  ") \
+ +	EM(rxrpc_call_queue_timer,		"QUE timer   ") \
+++=======
++ 	EM(rxrpc_call_put_userid,		"PUT user-id ") \
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	EM(rxrpc_call_see_accept,		"SEE accept  ") \
+  	EM(rxrpc_call_see_activate_client,	"SEE act-clnt") \
+  	EM(rxrpc_call_see_connect_failed,	"SEE con-fail") \
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,007258538bee..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -276,23 -277,34 +276,38 @@@ struct rxrpc_local 
+  	struct rcu_head		rcu;
+  	atomic_t		active_users;	/* Number of users of the local endpoint */
+  	refcount_t		ref;		/* Number of references to the structure */
+ -	struct net		*net;		/* The network namespace */
+ -	struct rxrpc_net	*rxnet;		/* Our bits in the network namespace */
+ +	struct rxrpc_net	*rxnet;		/* The network ns in which this resides */
+  	struct hlist_node	link;
+  	struct socket		*socket;	/* my UDP socket */
+ -	struct task_struct	*io_thread;
+ -	struct completion	io_thread_ready; /* Indication that the I/O thread started */
+ +	struct work_struct	processor;
+ +	struct list_head	ack_tx_queue;	/* List of ACKs that need sending */
+ +	spinlock_t		ack_tx_lock;	/* ACK list lock */
+  	struct rxrpc_sock __rcu	*service;	/* Service(s) listening on this endpoint */
+  	struct rw_semaphore	defrag_sem;	/* control re-enablement of IP DF bit */
+ -	struct sk_buff_head	rx_queue;	/* Received packets */
+ -	struct list_head	conn_attend_q;	/* Conns requiring immediate attention */
+ -	struct list_head	call_attend_q;	/* Calls requiring immediate attention */
+ -
+ +	struct sk_buff_head	reject_queue;	/* packets awaiting rejection */
+ +	struct sk_buff_head	event_queue;	/* endpoint event packets awaiting processing */
+  	struct rb_root		client_bundles;	/* Client connection bundles by socket params */
+  	spinlock_t		client_bundles_lock; /* Lock for client_bundles */
+++<<<<<<< HEAD
+++=======
++ 	bool			kill_all_client_conns;
++ 	struct list_head	idle_client_conns;
++ 	struct timer_list	client_conn_reap_timer;
++ 	unsigned long		client_conn_flags;
++ #define RXRPC_CLIENT_CONN_REAP_TIMER	0	/* The client conn reap timer expired */
++ 
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	spinlock_t		lock;		/* access lock */
+  	rwlock_t		services_lock;	/* lock for services list */
+  	int			debug_id;	/* debug ID for printks */
+  	bool			dead;
+  	bool			service_closed;	/* Service socket closed */
+++<<<<<<< HEAD
+++=======
++ 	struct idr		conn_ids;	/* List of connection IDs */
++ 	struct list_head	new_client_calls; /* Newly created client calls need connection */
++ 	spinlock_t		client_call_lock; /* Lock for ->new_client_calls */
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	struct sockaddr_rxrpc	srx;		/* local address */
+  };
+  
+@@@ -407,10 -433,12 +422,16 @@@ struct rxrpc_bundle 
+  	refcount_t		ref;
+  	atomic_t		active;		/* Number of active users */
+  	unsigned int		debug_id;
+ -	u32			security_level;	/* Security level selected */
+ -	u16			service_id;	/* Service ID for this connection */
+  	bool			try_upgrade;	/* True if the bundle is attempting upgrade */
+++<<<<<<< HEAD
+ +	bool			alloc_conn;	/* True if someone's getting a conn */
+ +	short			alloc_error;	/* Error from last conn allocation */
+ +	spinlock_t		channel_lock;
+++=======
++ 	bool			exclusive;	/* T if conn is exclusive */
++ 	bool			upgrade;	/* T if service ID can be upgraded */
++ 	unsigned short		alloc_error;	/* Error from last conn allocation */
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	struct rb_node		local_node;	/* Node in local->client_conns */
+  	struct list_head	waiting_calls;	/* Calls waiting for channels */
+  	unsigned long		avail_chans;	/* Mask of available channels */
+@@@ -585,10 -615,10 +607,10 @@@ struct rxrpc_call 
+  	u32			next_rx_timo;	/* Timeout for next Rx packet (jif) */
+  	u32			next_req_timo;	/* Timeout for next Rx request packet (jif) */
+  	struct timer_list	timer;		/* Combined event timer */
+ -	struct work_struct	destroyer;	/* In-process-context destroyer */
+ +	struct work_struct	processor;	/* Event processor */
+  	rxrpc_notify_rx_t	notify_rx;	/* kernel service Rx notification function */
+  	struct list_head	link;		/* link in master call list */
+- 	struct list_head	chan_wait_link;	/* Link in conn->bundle->waiting_calls */
++ 	struct list_head	wait_link;	/* Link in local->new_client_calls */
+  	struct hlist_node	error_link;	/* link in error distribution list */
+  	struct list_head	accept_link;	/* Link in rx->acceptq */
+  	struct list_head	recvmsg_link;	/* Link in rx->recvmsg_q */
+@@@ -855,24 -888,69 +878,82 @@@ static inline bool rxrpc_is_client_call
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * call_state.c
++  */
++ bool rxrpc_set_call_completion(struct rxrpc_call *call,
++ 			       enum rxrpc_call_completion compl,
++ 			       u32 abort_code,
++ 			       int error);
++ bool rxrpc_call_completed(struct rxrpc_call *call);
++ bool rxrpc_abort_call(struct rxrpc_call *call, rxrpc_seq_t seq,
++ 		      u32 abort_code, int error, enum rxrpc_abort_reason why);
++ void rxrpc_prefail_call(struct rxrpc_call *call, enum rxrpc_call_completion compl,
++ 			int error);
++ 
++ static inline void rxrpc_set_call_state(struct rxrpc_call *call,
++ 					enum rxrpc_call_state state)
++ {
++ 	/* Order write of completion info before write of ->state. */
++ 	smp_store_release(&call->_state, state);
++ 	wake_up(&call->waitq);
++ }
++ 
++ static inline enum rxrpc_call_state __rxrpc_call_state(const struct rxrpc_call *call)
++ {
++ 	return call->_state; /* Only inside I/O thread */
++ }
++ 
++ static inline bool __rxrpc_call_is_complete(const struct rxrpc_call *call)
++ {
++ 	return __rxrpc_call_state(call) == RXRPC_CALL_COMPLETE;
++ }
++ 
++ static inline enum rxrpc_call_state rxrpc_call_state(const struct rxrpc_call *call)
++ {
++ 	/* Order read ->state before read of completion info. */
++ 	return smp_load_acquire(&call->_state);
++ }
++ 
++ static inline bool rxrpc_call_is_complete(const struct rxrpc_call *call)
++ {
++ 	return rxrpc_call_state(call) == RXRPC_CALL_COMPLETE;
++ }
++ 
++ static inline bool rxrpc_call_has_failed(const struct rxrpc_call *call)
++ {
++ 	return rxrpc_call_is_complete(call) && call->completion != RXRPC_CALL_SUCCEEDED;
++ }
++ 
++ /*
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+   * conn_client.c
+   */
+  extern unsigned int rxrpc_reap_client_connections;
+  extern unsigned long rxrpc_conn_idle_client_expiry;
+  extern unsigned long rxrpc_conn_idle_client_fast_expiry;
+ -
+ +extern struct idr rxrpc_client_conn_ids;
+ +
+++<<<<<<< HEAD
+ +void rxrpc_destroy_client_conn_ids(void);
+ +struct rxrpc_bundle *rxrpc_get_bundle(struct rxrpc_bundle *);
+ +void rxrpc_put_bundle(struct rxrpc_bundle *);
+ +int rxrpc_connect_call(struct rxrpc_sock *, struct rxrpc_call *,
+ +		       struct rxrpc_conn_parameters *, struct sockaddr_rxrpc *,
+ +		       gfp_t);
+++=======
++ void rxrpc_purge_client_connections(struct rxrpc_local *local);
++ struct rxrpc_bundle *rxrpc_get_bundle(struct rxrpc_bundle *, enum rxrpc_bundle_trace);
++ void rxrpc_put_bundle(struct rxrpc_bundle *, enum rxrpc_bundle_trace);
++ int rxrpc_look_up_bundle(struct rxrpc_call *call, gfp_t gfp);
++ void rxrpc_connect_client_calls(struct rxrpc_local *local);
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  void rxrpc_expose_client_call(struct rxrpc_call *);
+  void rxrpc_disconnect_client_call(struct rxrpc_bundle *, struct rxrpc_call *);
+ -void rxrpc_deactivate_bundle(struct rxrpc_bundle *bundle);
+ -void rxrpc_put_client_conn(struct rxrpc_connection *, enum rxrpc_conn_trace);
+ -void rxrpc_discard_expired_client_conns(struct rxrpc_local *local);
+ +void rxrpc_put_client_conn(struct rxrpc_connection *);
+ +void rxrpc_discard_expired_client_conns(struct work_struct *);
+ +void rxrpc_destroy_all_client_connections(struct rxrpc_net *);
+  void rxrpc_clean_up_local_conns(struct rxrpc_local *);
+  
+  /*
+diff --cc net/rxrpc/call_object.c
+index ad495d0d21a8,3ded5a24627c..000000000000
+--- a/net/rxrpc/call_object.c
++++ b/net/rxrpc/call_object.c
+@@@ -139,9 -148,9 +139,9 @@@ struct rxrpc_call *rxrpc_alloc_call(str
+  				  &rxrpc_call_user_mutex_lock_class_key);
+  
+  	timer_setup(&call->timer, rxrpc_call_timer_expired, 0);
+ -	INIT_WORK(&call->destroyer, rxrpc_destroy_call);
+ +	INIT_WORK(&call->processor, &rxrpc_process_call);
+  	INIT_LIST_HEAD(&call->link);
+- 	INIT_LIST_HEAD(&call->chan_wait_link);
++ 	INIT_LIST_HEAD(&call->wait_link);
+  	INIT_LIST_HEAD(&call->accept_link);
+  	INIT_LIST_HEAD(&call->recvmsg_link);
+  	INIT_LIST_HEAD(&call->sock_link);
+@@@ -342,12 -402,6 +375,15 @@@ struct rxrpc_call *rxrpc_new_client_cal
+  	if (ret < 0)
+  		goto error_attached_to_socket;
+  
+++<<<<<<< HEAD
+ +	rxrpc_see_call(call, rxrpc_call_see_connected);
+ +
+ +	rxrpc_start_call_timer(call);
+ +
+ +	_net("CALL new %d on CONN %d", call->debug_id, call->conn->debug_id);
+ +
+++=======
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	_leave(" = %p [new]", call);
+  	return call;
+  
+@@@ -359,11 -413,9 +395,10 @@@
+  error_dup_user_ID:
+  	write_unlock(&rx->call_lock);
+  	release_sock(&rx->sk);
+ -	rxrpc_prefail_call(call, RXRPC_CALL_LOCAL_ERROR, -EEXIST);
+ +	__rxrpc_set_call_completion(call, RXRPC_CALL_LOCAL_ERROR,
+ +				    RX_CALL_DEAD, -EEXIST);
+  	trace_rxrpc_call(call->debug_id, refcount_read(&call->ref), 0,
+  			 rxrpc_call_see_userid_exists);
+- 	rxrpc_release_call(rx, call);
+  	mutex_unlock(&call->user_mutex);
+  	rxrpc_put_call(call, rxrpc_call_put_userid_exists);
+  	_leave(" = -EEXIST");
+@@@ -377,9 -429,7 +412,13 @@@
+  error_attached_to_socket:
+  	trace_rxrpc_call(call->debug_id, refcount_read(&call->ref), ret,
+  			 rxrpc_call_see_connect_failed);
+++<<<<<<< HEAD
+ +	set_bit(RXRPC_CALL_DISCONNECTED, &call->flags);
+ +	__rxrpc_set_call_completion(call, RXRPC_CALL_LOCAL_ERROR,
+ +				    RX_CALL_DEAD, ret);
+++=======
++ 	rxrpc_set_call_completion(call, RXRPC_CALL_LOCAL_ERROR, 0, ret);
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	_leave(" = c=%08x [err]", call->debug_id);
+  	return call;
+  }
+@@@ -414,13 -487,12 +453,18 @@@ void rxrpc_incoming_call(struct rxrpc_s
+  	chan = sp->hdr.cid & RXRPC_CHANNELMASK;
+  	conn->channels[chan].call_counter = call->call_id;
+  	conn->channels[chan].call_id = call->call_id;
+++<<<<<<< HEAD
+ +	rcu_assign_pointer(conn->channels[chan].call, call);
+++=======
++ 	conn->channels[chan].call = call;
++ 	spin_unlock(&conn->state_lock);
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+ +
+ +	spin_lock(&conn->params.peer->lock);
+ +	hlist_add_head_rcu(&call->error_link, &conn->params.peer->error_targets);
+ +	spin_unlock(&conn->params.peer->lock);
+  
+ -	spin_lock(&conn->peer->lock);
+ -	hlist_add_head(&call->error_link, &conn->peer->error_targets);
+ -	spin_unlock(&conn->peer->lock);
+ +	_net("CALL incoming %d on CONN %d", call->debug_id, call->conn->debug_id);
+  
+  	rxrpc_start_call_timer(call);
+  	_leave("");
+@@@ -551,10 -590,9 +595,16 @@@ void rxrpc_release_call(struct rxrpc_so
+  
+  	_debug("RELEASE CALL %p (%d CONN %p)", call, call->debug_id, conn);
+  
+++<<<<<<< HEAD
+ +	if (conn && !test_bit(RXRPC_CALL_DISCONNECTED, &call->flags))
+ +		rxrpc_disconnect_call(call);
+ +	if (call->security)
+ +		call->security->free_call_crypto(call);
+++=======
++ 	if (putu)
++ 		rxrpc_put_call(call, rxrpc_call_put_userid);
++ 
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	_leave("");
+  }
+  
+diff --cc net/rxrpc/conn_client.c
+index 827c1308297c,981ca5b98bcb..000000000000
+--- a/net/rxrpc/conn_client.c
++++ b/net/rxrpc/conn_client.c
+@@@ -34,69 -34,24 +34,81 @@@ __read_mostly unsigned int rxrpc_reap_c
+  __read_mostly unsigned long rxrpc_conn_idle_client_expiry = 2 * 60 * HZ;
+  __read_mostly unsigned long rxrpc_conn_idle_client_fast_expiry = 2 * HZ;
+  
+ -static void rxrpc_activate_bundle(struct rxrpc_bundle *bundle)
+ +/*
+ + * We use machine-unique IDs for our client connections.
+ + */
+ +DEFINE_IDR(rxrpc_client_conn_ids);
+ +static DEFINE_SPINLOCK(rxrpc_conn_id_lock);
+ +
+ +static void rxrpc_deactivate_bundle(struct rxrpc_bundle *bundle);
+ +
+ +/*
+++<<<<<<< HEAD
+ + * Get a connection ID and epoch for a client connection from the global pool.
+ + * The connection struct pointer is then recorded in the idr radix tree.  The
+ + * epoch doesn't change until the client is rebooted (or, at least, unless the
+ + * module is unloaded).
+ + */
+ +static int rxrpc_get_client_connection_id(struct rxrpc_connection *conn,
+ +					  gfp_t gfp)
+  {
+ -	atomic_inc(&bundle->active);
+ +	struct rxrpc_net *rxnet = conn->params.local->rxnet;
+ +	int id;
+ +
+ +	_enter("");
+ +
+ +	idr_preload(gfp);
+ +	spin_lock(&rxrpc_conn_id_lock);
+ +
+ +	id = idr_alloc_cyclic(&rxrpc_client_conn_ids, conn,
+ +			      1, 0x40000000, GFP_NOWAIT);
+ +	if (id < 0)
+ +		goto error;
+ +
+ +	spin_unlock(&rxrpc_conn_id_lock);
+ +	idr_preload_end();
+ +
+ +	conn->proto.epoch = rxnet->epoch;
+ +	conn->proto.cid = id << RXRPC_CIDSHIFT;
+ +	set_bit(RXRPC_CONN_HAS_IDR, &conn->flags);
+ +	_leave(" [CID %x]", conn->proto.cid);
+ +	return 0;
+ +
+ +error:
+ +	spin_unlock(&rxrpc_conn_id_lock);
+ +	idr_preload_end();
+ +	_leave(" = %d", id);
+ +	return id;
+  }
+  
+  /*
+ + * Release a connection ID for a client connection from the global pool.
+++=======
++  * Release a connection ID for a client connection.
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+   */
+ -static void rxrpc_put_client_connection_id(struct rxrpc_local *local,
+ -					   struct rxrpc_connection *conn)
+ +static void rxrpc_put_client_connection_id(struct rxrpc_connection *conn)
+  {
+++<<<<<<< HEAD
+ +	if (test_bit(RXRPC_CONN_HAS_IDR, &conn->flags)) {
+ +		spin_lock(&rxrpc_conn_id_lock);
+ +		idr_remove(&rxrpc_client_conn_ids,
+ +			   conn->proto.cid >> RXRPC_CIDSHIFT);
+ +		spin_unlock(&rxrpc_conn_id_lock);
+ +	}
+++=======
++ 	idr_remove(&local->conn_ids, conn->proto.cid >> RXRPC_CIDSHIFT);
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  }
+  
+  /*
+   * Destroy the client connection ID tree.
+   */
+++<<<<<<< HEAD
+ +void rxrpc_destroy_client_conn_ids(void)
+++=======
++ static void rxrpc_destroy_client_conn_ids(struct rxrpc_local *local)
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  {
+  	struct rxrpc_connection *conn;
+  	int id;
+@@@ -122,12 -77,18 +134,11 @@@ static struct rxrpc_bundle *rxrpc_alloc
+  
+  	bundle = kzalloc(sizeof(*bundle), gfp);
+  	if (bundle) {
+ -		bundle->local		= call->local;
+ -		bundle->peer		= rxrpc_get_peer(call->peer, rxrpc_peer_get_bundle);
+ -		bundle->key		= key_get(call->key);
+ -		bundle->security	= call->security;
+ -		bundle->exclusive	= test_bit(RXRPC_CALL_EXCLUSIVE, &call->flags);
+ -		bundle->upgrade		= test_bit(RXRPC_CALL_UPGRADE, &call->flags);
+ -		bundle->service_id	= call->dest_srx.srx_service;
+ -		bundle->security_level	= call->security_level;
+ +		bundle->params = *cp;
+ +		rxrpc_get_peer(bundle->params.peer);
+  		refcount_set(&bundle->ref, 1);
+  		atomic_set(&bundle->active, 1);
+- 		spin_lock_init(&bundle->channel_lock);
+  		INIT_LIST_HEAD(&bundle->waiting_calls);
+ -		trace_rxrpc_bundle(bundle->debug_id, 1, rxrpc_bundle_new);
+  	}
+  	return bundle;
+  }
+@@@ -150,71 -117,77 +161,115 @@@ void rxrpc_put_bundle(struct rxrpc_bund
+  	bool dead;
+  	int r;
+  
+ -	if (bundle) {
+ -		id = bundle->debug_id;
+ -		dead = __refcount_dec_and_test(&bundle->ref, &r);
+ -		trace_rxrpc_bundle(id, r - 1, why);
+ -		if (dead)
+ -			rxrpc_free_bundle(bundle);
+ -	}
+ +	dead = __refcount_dec_and_test(&bundle->ref, &r);
+ +
+ +	_debug("PUT B=%x %d", d, r - 1);
+ +	if (dead)
+ +		rxrpc_free_bundle(bundle);
+  }
+  
++ /*
++  * Get rid of outstanding client connection preallocations when a local
++  * endpoint is destroyed.
++  */
++ void rxrpc_purge_client_connections(struct rxrpc_local *local)
++ {
++ 	rxrpc_destroy_client_conn_ids(local);
++ }
++ 
+  /*
+   * Allocate a client connection.
+   */
+  static struct rxrpc_connection *
+- rxrpc_alloc_client_connection(struct rxrpc_bundle *bundle, gfp_t gfp)
++ rxrpc_alloc_client_connection(struct rxrpc_bundle *bundle)
+  {
+  	struct rxrpc_connection *conn;
+++<<<<<<< HEAD
+ +	struct rxrpc_net *rxnet = bundle->params.local->rxnet;
+ +	int ret;
+ +
+ +	_enter("");
+ +
+ +	conn = rxrpc_alloc_connection(gfp);
+ +	if (!conn) {
+ +		_leave(" = -ENOMEM");
+++=======
++ 	struct rxrpc_local *local = bundle->local;
++ 	struct rxrpc_net *rxnet = local->rxnet;
++ 	int id;
++ 
++ 	_enter("");
++ 
++ 	conn = rxrpc_alloc_connection(rxnet, GFP_ATOMIC | __GFP_NOWARN);
++ 	if (!conn)
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  		return ERR_PTR(-ENOMEM);
++ 
++ 	id = idr_alloc_cyclic(&local->conn_ids, conn, 1, 0x40000000,
++ 			      GFP_ATOMIC | __GFP_NOWARN);
++ 	if (id < 0) {
++ 		kfree(conn);
++ 		return ERR_PTR(id);
+  	}
+  
+  	refcount_set(&conn->ref, 1);
+++<<<<<<< HEAD
+ +	conn->bundle		= bundle;
+ +	conn->params		= bundle->params;
+ +	conn->out_clientflag	= RXRPC_CLIENT_INITIATED;
+ +	conn->state		= RXRPC_CONN_CLIENT;
+ +	conn->service_id	= conn->params.service_id;
+- 
+- 	ret = rxrpc_get_client_connection_id(conn, gfp);
+- 	if (ret < 0)
+- 		goto error_0;
+- 
+- 	ret = rxrpc_init_client_conn_security(conn);
+- 	if (ret < 0)
+- 		goto error_1;
+++=======
++ 	conn->proto.cid		= id << RXRPC_CIDSHIFT;
++ 	conn->proto.epoch	= local->rxnet->epoch;
++ 	conn->out_clientflag	= RXRPC_CLIENT_INITIATED;
++ 	conn->bundle		= rxrpc_get_bundle(bundle, rxrpc_bundle_get_client_conn);
++ 	conn->local		= rxrpc_get_local(bundle->local, rxrpc_local_get_client_conn);
++ 	conn->peer		= rxrpc_get_peer(bundle->peer, rxrpc_peer_get_client_conn);
++ 	conn->key		= key_get(bundle->key);
++ 	conn->security		= bundle->security;
++ 	conn->exclusive		= bundle->exclusive;
++ 	conn->upgrade		= bundle->upgrade;
++ 	conn->orig_service_id	= bundle->service_id;
++ 	conn->security_level	= bundle->security_level;
++ 	conn->state		= RXRPC_CONN_CLIENT_UNSECURED;
++ 	conn->service_id	= conn->orig_service_id;
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
++ 
++ 	if (conn->security == &rxrpc_no_security)
++ 		conn->state	= RXRPC_CONN_CLIENT;
+  
+  	atomic_inc(&rxnet->nr_conns);
+  	write_lock(&rxnet->conn_lock);
+  	list_add_tail(&conn->proc_link, &rxnet->conn_proc_list);
+  	write_unlock(&rxnet->conn_lock);
+  
+++<<<<<<< HEAD
+ +	rxrpc_get_bundle(bundle);
+ +	rxrpc_get_peer(conn->params.peer);
+ +	rxrpc_get_local(conn->params.local);
+ +	key_get(conn->params.key);
+ +
+ +	trace_rxrpc_conn(conn->debug_id, rxrpc_conn_new_client,
+ +			 refcount_read(&conn->ref),
+ +			 __builtin_return_address(0));
+++=======
++ 	rxrpc_see_connection(conn, rxrpc_conn_new_client);
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  
+  	atomic_inc(&rxnet->nr_client_conns);
+  	trace_rxrpc_client(conn, -1, rxrpc_client_alloc);
+- 	_leave(" = %p", conn);
+  	return conn;
+++<<<<<<< HEAD
+ +
+ +error_1:
+ +	rxrpc_put_client_connection_id(conn);
+ +error_0:
+ +	kfree(conn);
+ +	_leave(" = %d", ret);
+ +	return ERR_PTR(ret);
+++=======
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  }
+  
+  /*
+@@@ -263,20 -237,23 +319,31 @@@ dont_reuse
+   * Look up the conn bundle that matches the connection parameters, adding it if
+   * it doesn't yet exist.
+   */
+++<<<<<<< HEAD
+ +static struct rxrpc_bundle *rxrpc_look_up_bundle(struct rxrpc_conn_parameters *cp,
+ +						 gfp_t gfp)
+++=======
++ int rxrpc_look_up_bundle(struct rxrpc_call *call, gfp_t gfp)
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  {
+  	static atomic_t rxrpc_bundle_id;
+  	struct rxrpc_bundle *bundle, *candidate;
+ -	struct rxrpc_local *local = call->local;
+ +	struct rxrpc_local *local = cp->local;
+  	struct rb_node *p, **pp, *parent;
+  	long diff;
+ -	bool upgrade = test_bit(RXRPC_CALL_UPGRADE, &call->flags);
+  
+  	_enter("{%px,%x,%u,%u}",
+ -	       call->peer, key_serial(call->key), call->security_level,
+ -	       upgrade);
+ +	       cp->peer, key_serial(cp->key), cp->security_level, cp->upgrade);
+  
+++<<<<<<< HEAD
+ +	if (cp->exclusive)
+ +		return rxrpc_alloc_bundle(cp, gfp);
+++=======
++ 	if (test_bit(RXRPC_CALL_EXCLUSIVE, &call->flags)) {
++ 		call->bundle = rxrpc_alloc_bundle(call, gfp);
++ 		return call->bundle ? 0 : -ENOMEM;
++ 	}
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  
+  	/* First, see if the bundle is already there. */
+  	_debug("search 1");
+@@@ -302,9 -279,9 +369,13 @@@
+  	_debug("not found");
+  
+  	/* It wasn't.  We need to add one. */
+ -	candidate = rxrpc_alloc_bundle(call, gfp);
+ +	candidate = rxrpc_alloc_bundle(cp, gfp);
+  	if (!candidate)
+++<<<<<<< HEAD
+ +		return NULL;
+++=======
++ 		return -ENOMEM;
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  
+  	_debug("search 2");
+  	spin_lock(&local->client_bundles_lock);
+@@@ -332,135 -309,50 +403,144 @@@
+  	candidate->debug_id = atomic_inc_return(&rxrpc_bundle_id);
+  	rb_link_node(&candidate->local_node, parent, pp);
+  	rb_insert_color(&candidate->local_node, &local->client_bundles);
+ -	call->bundle = rxrpc_get_bundle(candidate, rxrpc_bundle_get_client_call);
+ +	rxrpc_get_bundle(candidate);
+  	spin_unlock(&local->client_bundles_lock);
+++<<<<<<< HEAD
+ +	_leave(" = %u [new]", candidate->debug_id);
+ +	return candidate;
+++=======
++ 	_leave(" = B=%u [new]", call->bundle->debug_id);
++ 	return 0;
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  
+  found_bundle_free:
+  	rxrpc_free_bundle(candidate);
+  found_bundle:
+ -	call->bundle = rxrpc_get_bundle(bundle, rxrpc_bundle_get_client_call);
+ -	rxrpc_activate_bundle(bundle);
+ +	rxrpc_get_bundle(bundle);
+ +	atomic_inc(&bundle->active);
+  	spin_unlock(&local->client_bundles_lock);
+++<<<<<<< HEAD
+ +	_leave(" = %u [found]", bundle->debug_id);
+ +	return bundle;
+ +}
+ +
+ +/*
+ + * Create or find a client bundle to use for a call.
+ + *
+ + * If we return with a connection, the call will be on its waiting list.  It's
+ + * left to the caller to assign a channel and wake up the call.
+ + */
+ +static struct rxrpc_bundle *rxrpc_prep_call(struct rxrpc_sock *rx,
+ +					    struct rxrpc_call *call,
+ +					    struct rxrpc_conn_parameters *cp,
+ +					    struct sockaddr_rxrpc *srx,
+ +					    gfp_t gfp)
+ +{
+ +	struct rxrpc_bundle *bundle;
+ +
+ +	_enter("{%d,%lx},", call->debug_id, call->user_call_ID);
+ +
+ +	cp->peer = rxrpc_lookup_peer(rx, cp->local, srx, gfp);
+ +	if (!cp->peer)
+ +		goto error;
+ +
+ +	call->tx_last_sent = ktime_get_real();
+ +	call->cong_ssthresh = cp->peer->cong_ssthresh;
+ +	if (call->cong_cwnd >= call->cong_ssthresh)
+ +		call->cong_mode = RXRPC_CALL_CONGEST_AVOIDANCE;
+ +	else
+ +		call->cong_mode = RXRPC_CALL_SLOW_START;
+ +	if (cp->upgrade)
+ +		__set_bit(RXRPC_CALL_UPGRADE, &call->flags);
+ +
+ +	/* Find the client connection bundle. */
+ +	bundle = rxrpc_look_up_bundle(cp, gfp);
+ +	if (!bundle)
+ +		goto error;
+ +
+ +	/* Get this call queued.  Someone else may activate it whilst we're
+ +	 * lining up a new connection, but that's fine.
+ +	 */
+ +	spin_lock(&bundle->channel_lock);
+ +	list_add_tail(&call->chan_wait_link, &bundle->waiting_calls);
+ +	spin_unlock(&bundle->channel_lock);
+ +
+ +	_leave(" = [B=%x]", bundle->debug_id);
+ +	return bundle;
+ +
+ +error:
+ +	_leave(" = -ENOMEM");
+ +	return ERR_PTR(-ENOMEM);
+++=======
++ 	_leave(" = B=%u [found]", call->bundle->debug_id);
++ 	return 0;
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  }
+  
+  /*
+   * Allocate a new connection and add it into a bundle.
+   */
+- static void rxrpc_add_conn_to_bundle(struct rxrpc_bundle *bundle, gfp_t gfp)
+- 	__releases(bundle->channel_lock)
++ static bool rxrpc_add_conn_to_bundle(struct rxrpc_bundle *bundle,
++ 				     unsigned int slot)
+  {
+- 	struct rxrpc_connection *candidate = NULL, *old = NULL;
+- 	bool conflict;
+- 	int i;
+- 
+- 	_enter("");
+- 
+- 	conflict = bundle->alloc_conn;
+- 	if (!conflict)
+- 		bundle->alloc_conn = true;
+- 	spin_unlock(&bundle->channel_lock);
+- 	if (conflict) {
+- 		_leave(" [conf]");
+- 		return;
++ 	struct rxrpc_connection *conn, *old;
++ 	unsigned int shift = slot * RXRPC_MAXCALLS;
++ 	unsigned int i;
++ 
++ 	old = bundle->conns[slot];
++ 	if (old) {
++ 		bundle->conns[slot] = NULL;
++ 		trace_rxrpc_client(old, -1, rxrpc_client_replace);
++ 		rxrpc_put_connection(old, rxrpc_conn_put_noreuse);
+  	}
+  
+- 	candidate = rxrpc_alloc_client_connection(bundle, gfp);
+- 
+- 	spin_lock(&bundle->channel_lock);
+- 	bundle->alloc_conn = false;
+- 
+- 	if (IS_ERR(candidate)) {
+- 		bundle->alloc_error = PTR_ERR(candidate);
+- 		spin_unlock(&bundle->channel_lock);
+- 		_leave(" [err %ld]", PTR_ERR(candidate));
+- 		return;
++ 	conn = rxrpc_alloc_client_connection(bundle);
++ 	if (IS_ERR(conn)) {
++ 		bundle->alloc_error = PTR_ERR(conn);
++ 		return false;
+  	}
+  
+++<<<<<<< HEAD
+ +	bundle->alloc_error = 0;
+ +
+ +	for (i = 0; i < ARRAY_SIZE(bundle->conns); i++) {
+ +		unsigned int shift = i * RXRPC_MAXCALLS;
+ +		int j;
+ +
+ +		old = bundle->conns[i];
+ +		if (!rxrpc_may_reuse_conn(old)) {
+ +			if (old)
+ +				trace_rxrpc_client(old, -1, rxrpc_client_replace);
+ +			candidate->bundle_shift = shift;
+ +			atomic_inc(&bundle->active);
+ +			bundle->conns[i] = candidate;
+ +			for (j = 0; j < RXRPC_MAXCALLS; j++)
+ +				set_bit(shift + j, &bundle->avail_chans);
+ +			candidate = NULL;
+ +			break;
+ +		}
+ +
+ +		old = NULL;
+ +	}
+ +
+ +	spin_unlock(&bundle->channel_lock);
+ +
+ +	if (candidate) {
+ +		_debug("discard C=%x", candidate->debug_id);
+ +		trace_rxrpc_client(candidate, -1, rxrpc_client_duplicate);
+ +		rxrpc_put_connection(candidate);
+ +	}
+ +
+ +	rxrpc_put_connection(old);
+ +	_leave("");
+++=======
++ 	rxrpc_activate_bundle(bundle);
++ 	conn->bundle_shift = shift;
++ 	bundle->conns[slot] = conn;
++ 	for (i = 0; i < RXRPC_MAXCALLS; i++)
++ 		set_bit(shift + i, &bundle->avail_chans);
++ 	return true;
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  }
+  
+  /*
+@@@ -531,34 -421,15 +609,46 @@@ static void rxrpc_activate_one_channel(
+  	clear_bit(conn->bundle_shift + channel, &bundle->avail_chans);
+  
+  	rxrpc_see_call(call, rxrpc_call_see_activate_client);
+++<<<<<<< HEAD
+ +	list_del_init(&call->chan_wait_link);
+ +	call->peer	= rxrpc_get_peer(conn->params.peer);
+ +	call->conn	= rxrpc_get_connection(conn);
+ +	call->cid	= conn->proto.cid | channel;
+ +	call->call_id	= call_id;
+ +	call->security	= conn->security;
+ +	call->security_ix = conn->security_ix;
+ +	call->service_id = conn->service_id;
+ +
+ +	trace_rxrpc_connect_call(call);
+ +	_net("CONNECT call %08x:%08x as call %d on conn %d",
+ +	     call->cid, call->call_id, call->debug_id, conn->debug_id);
+ +
+ +	write_lock_bh(&call->state_lock);
+ +	call->state = RXRPC_CALL_CLIENT_SEND_REQUEST;
+ +	write_unlock_bh(&call->state_lock);
+ +
+ +	/* Paired with the read barrier in rxrpc_connect_call().  This orders
+ +	 * cid and epoch in the connection wrt to call_id without the need to
+ +	 * take the channel_lock.
+ +	 *
+ +	 * We provisionally assign a callNumber at this point, but we don't
+ +	 * confirm it until the call is about to be exposed.
+ +	 *
+ +	 * TODO: Pair with a barrier in the data_ready handler when that looks
+ +	 * at the call ID through a connection channel.
+ +	 */
+ +	smp_wmb();
+++=======
++ 	call->conn	= rxrpc_get_connection(conn, rxrpc_conn_get_activate_call);
++ 	call->cid	= conn->proto.cid | channel;
++ 	call->call_id	= call_id;
++ 	call->dest_srx.srx_service = conn->service_id;
++ 	call->cong_ssthresh = call->peer->cong_ssthresh;
++ 	if (call->cong_cwnd >= call->cong_ssthresh)
++ 		call->cong_mode = RXRPC_CALL_CONGEST_AVOIDANCE;
++ 	else
++ 		call->cong_mode = RXRPC_CALL_SLOW_START;
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  
+  	chan->call_id		= call_id;
+  	chan->call_debug_id	= call->debug_id;
+@@@ -569,21 -446,11 +665,27 @@@
+  /*
+   * Remove a connection from the idle list if it's on it.
+   */
+- static void rxrpc_unidle_conn(struct rxrpc_bundle *bundle, struct rxrpc_connection *conn)
++ static void rxrpc_unidle_conn(struct rxrpc_connection *conn)
+  {
+++<<<<<<< HEAD
+ +	struct rxrpc_net *rxnet = bundle->params.local->rxnet;
+ +	bool drop_ref;
+ +
+ +	if (!list_empty(&conn->cache_link)) {
+ +		drop_ref = false;
+ +		spin_lock(&rxnet->client_conn_cache_lock);
+ +		if (!list_empty(&conn->cache_link)) {
+ +			list_del_init(&conn->cache_link);
+ +			drop_ref = true;
+ +		}
+ +		spin_unlock(&rxnet->client_conn_cache_lock);
+ +		if (drop_ref)
+ +			rxrpc_put_connection(conn);
+++=======
++ 	if (!list_empty(&conn->cache_link)) {
++ 		list_del_init(&conn->cache_link);
++ 		rxrpc_put_connection(conn, rxrpc_conn_put_unidle);
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	}
+  }
+  
+@@@ -625,132 -493,24 +728,119 @@@ static void rxrpc_activate_channels(str
+  }
+  
+  /*
+-  * Assign channels and callNumbers to waiting calls.
++  * Connect waiting channels (called from the I/O thread).
+   */
+- static void rxrpc_activate_channels(struct rxrpc_bundle *bundle)
++ void rxrpc_connect_client_calls(struct rxrpc_local *local)
+  {
+- 	_enter("B=%x", bundle->debug_id);
+- 
+- 	trace_rxrpc_client(NULL, -1, rxrpc_client_activate_chans);
+- 
+- 	if (!bundle->avail_chans)
+- 		return;
+- 
+- 	spin_lock(&bundle->channel_lock);
+- 	rxrpc_activate_channels_locked(bundle);
+- 	spin_unlock(&bundle->channel_lock);
+- 	_leave("");
+- }
++ 	struct rxrpc_call *call;
+  
+- /*
+-  * Wait for a callNumber and a channel to be granted to a call.
+-  */
+- static int rxrpc_wait_for_channel(struct rxrpc_bundle *bundle,
+- 				  struct rxrpc_call *call, gfp_t gfp)
+- {
+- 	DECLARE_WAITQUEUE(myself, current);
+- 	int ret = 0;
++ 	while ((call = list_first_entry_or_null(&local->new_client_calls,
++ 						struct rxrpc_call, wait_link))
++ 	       ) {
++ 		struct rxrpc_bundle *bundle = call->bundle;
+  
+- 	_enter("%d", call->debug_id);
++ 		spin_lock(&local->client_call_lock);
++ 		list_move_tail(&call->wait_link, &bundle->waiting_calls);
++ 		spin_unlock(&local->client_call_lock);
+  
+- 	if (!gfpflags_allow_blocking(gfp)) {
+- 		rxrpc_maybe_add_conn(bundle, gfp);
+- 		rxrpc_activate_channels(bundle);
+- 		ret = bundle->alloc_error ?: -EAGAIN;
+- 		goto out;
++ 		if (rxrpc_bundle_has_space(bundle))
++ 			rxrpc_activate_channels(bundle);
+  	}
+++<<<<<<< HEAD
+ +
+ +	add_wait_queue_exclusive(&call->waitq, &myself);
+ +	for (;;) {
+ +		rxrpc_maybe_add_conn(bundle, gfp);
+ +		rxrpc_activate_channels(bundle);
+ +		ret = bundle->alloc_error;
+ +		if (ret < 0)
+ +			break;
+ +
+ +		switch (call->interruptibility) {
+ +		case RXRPC_INTERRUPTIBLE:
+ +		case RXRPC_PREINTERRUPTIBLE:
+ +			set_current_state(TASK_INTERRUPTIBLE);
+ +			break;
+ +		case RXRPC_UNINTERRUPTIBLE:
+ +		default:
+ +			set_current_state(TASK_UNINTERRUPTIBLE);
+ +			break;
+ +		}
+ +		if (READ_ONCE(call->state) != RXRPC_CALL_CLIENT_AWAIT_CONN)
+ +			break;
+ +		if ((call->interruptibility == RXRPC_INTERRUPTIBLE ||
+ +		     call->interruptibility == RXRPC_PREINTERRUPTIBLE) &&
+ +		    signal_pending(current)) {
+ +			ret = -ERESTARTSYS;
+ +			break;
+ +		}
+ +		schedule();
+ +	}
+ +	remove_wait_queue(&call->waitq, &myself);
+ +	__set_current_state(TASK_RUNNING);
+ +
+ +out:
+ +	_leave(" = %d", ret);
+ +	return ret;
+ +}
+ +
+ +/*
+ + * find a connection for a call
+ + * - called in process context with IRQs enabled
+ + */
+ +int rxrpc_connect_call(struct rxrpc_sock *rx,
+ +		       struct rxrpc_call *call,
+ +		       struct rxrpc_conn_parameters *cp,
+ +		       struct sockaddr_rxrpc *srx,
+ +		       gfp_t gfp)
+ +{
+ +	struct rxrpc_bundle *bundle;
+ +	struct rxrpc_net *rxnet = cp->local->rxnet;
+ +	int ret = 0;
+ +
+ +	_enter("{%d,%lx},", call->debug_id, call->user_call_ID);
+ +
+ +	rxrpc_discard_expired_client_conns(&rxnet->client_conn_reaper);
+ +
+ +	bundle = rxrpc_prep_call(rx, call, cp, srx, gfp);
+ +	if (IS_ERR(bundle)) {
+ +		ret = PTR_ERR(bundle);
+ +		goto out;
+ +	}
+ +
+ +	if (call->state == RXRPC_CALL_CLIENT_AWAIT_CONN) {
+ +		ret = rxrpc_wait_for_channel(bundle, call, gfp);
+ +		if (ret < 0)
+ +			goto wait_failed;
+ +	}
+ +
+ +granted_channel:
+ +	/* Paired with the write barrier in rxrpc_activate_one_channel(). */
+ +	smp_rmb();
+ +
+ +out_put_bundle:
+ +	rxrpc_deactivate_bundle(bundle);
+ +	rxrpc_put_bundle(bundle);
+ +out:
+ +	_leave(" = %d", ret);
+ +	return ret;
+ +
+ +wait_failed:
+ +	spin_lock(&bundle->channel_lock);
+ +	list_del_init(&call->chan_wait_link);
+ +	spin_unlock(&bundle->channel_lock);
+ +
+ +	if (call->state != RXRPC_CALL_CLIENT_AWAIT_CONN) {
+ +		ret = 0;
+ +		goto granted_channel;
+ +	}
+ +
+ +	trace_rxrpc_client(call->conn, ret, rxrpc_client_chan_wait_failed);
+ +	rxrpc_set_call_completion(call, RXRPC_CALL_LOCAL_ERROR, 0, ret);
+ +	rxrpc_disconnect_client_call(bundle, call);
+ +	goto out_put_bundle;
+++=======
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  }
+  
+  /*
+@@@ -804,9 -568,6 +894,12 @@@ void rxrpc_disconnect_client_call(struc
+  
+  	_enter("c=%x", call->debug_id);
+  
+++<<<<<<< HEAD
+ +	spin_lock(&bundle->channel_lock);
+ +	set_bit(RXRPC_CALL_DISCONNECTED, &call->flags);
+ +
+++=======
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	/* Calls that have never actually been assigned a channel can simply be
+  	 * discarded.
+  	 */
+@@@ -887,18 -645,11 +977,26 @@@
+  		trace_rxrpc_client(conn, channel, rxrpc_client_to_idle);
+  		conn->idle_timestamp = jiffies;
+  
+++<<<<<<< HEAD
+ +		rxrpc_get_connection(conn);
+ +		spin_lock(&rxnet->client_conn_cache_lock);
+ +		list_move_tail(&conn->cache_link, &rxnet->idle_client_conns);
+ +		spin_unlock(&rxnet->client_conn_cache_lock);
+++=======
++ 		rxrpc_get_connection(conn, rxrpc_conn_get_idle);
++ 		list_move_tail(&conn->cache_link, &local->idle_client_conns);
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  
+ -		rxrpc_set_client_reap_timer(local);
+ +		rxrpc_set_client_reap_timer(rxnet);
+  	}
+++<<<<<<< HEAD
+ +
+ +out:
+ +	spin_unlock(&bundle->channel_lock);
+ +	_leave("");
+ +	return;
+++=======
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  }
+  
+  /*
+@@@ -923,13 -672,9 +1019,9 @@@ static void rxrpc_unbundle_conn(struct 
+  		bundle->conns[bindex] = NULL;
+  		for (i = 0; i < RXRPC_MAXCALLS; i++)
+  			clear_bit(conn->bundle_shift + i, &bundle->avail_chans);
+- 		need_drop = true;
+- 	}
+- 	spin_unlock(&bundle->channel_lock);
+- 
+- 	if (need_drop) {
++ 		rxrpc_put_client_connection_id(bundle->local, conn);
+  		rxrpc_deactivate_bundle(bundle);
+ -		rxrpc_put_connection(conn, rxrpc_conn_put_unbundle);
+ +		rxrpc_put_connection(conn);
+  	}
+  }
+  
+@@@ -1004,32 -734,18 +1096,42 @@@ void rxrpc_discard_expired_client_conns
+  
+  	_enter("");
+  
+++<<<<<<< HEAD
+ +	if (list_empty(&rxnet->idle_client_conns)) {
+ +		_leave(" [empty]");
+ +		return;
+ +	}
+ +
+ +	/* Don't double up on the discarding */
+ +	if (!spin_trylock(&rxnet->client_conn_discard_lock)) {
+ +		_leave(" [already]");
+ +		return;
+ +	}
+ +
+++=======
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	/* We keep an estimate of what the number of conns ought to be after
+  	 * we've discarded some so that we don't overdo the discarding.
+  	 */
+ -	nr_conns = atomic_read(&local->rxnet->nr_client_conns);
+ +	nr_conns = atomic_read(&rxnet->nr_client_conns);
+  
+  next:
+++<<<<<<< HEAD
+ +	spin_lock(&rxnet->client_conn_cache_lock);
+ +
+ +	if (list_empty(&rxnet->idle_client_conns))
+ +		goto out;
+ +
+ +	conn = list_entry(rxnet->idle_client_conns.next,
+ +			  struct rxrpc_connection, cache_link);
+++=======
++ 	conn = list_first_entry_or_null(&local->idle_client_conns,
++ 					struct rxrpc_connection, cache_link);
++ 	if (!conn)
++ 		return;
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  
+ -	if (!local->kill_all_client_conns) {
+ +	if (!rxnet->kill_all_client_conns) {
+  		/* If the number of connections is over the reap limit, we
+  		 * expedite discard by reducing the expiry timeout.  We must,
+  		 * however, have at least a short grace period to be able to do
+@@@ -1051,10 -767,10 +1153,13 @@@
+  	trace_rxrpc_client(conn, -1, rxrpc_client_discard);
+  	list_del_init(&conn->cache_link);
+  
+++<<<<<<< HEAD
+ +	spin_unlock(&rxnet->client_conn_cache_lock);
+ +
+++=======
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	rxrpc_unbundle_conn(conn);
+ -	/* Drop the ->cache_link ref */
+ -	rxrpc_put_connection(conn, rxrpc_conn_put_discard_idle);
+ +	rxrpc_put_connection(conn); /* Drop the ->cache_link ref */
+  
+  	nr_conns--;
+  	goto next;
+@@@ -1068,32 -784,9 +1173,35 @@@ not_yet_expired
+  	 * then things get messier.
+  	 */
+  	_debug("not yet");
+ -	if (!local->kill_all_client_conns)
+ -		timer_reduce(&local->client_conn_reap_timer, conn_expires_at);
+ +	if (!rxnet->kill_all_client_conns)
+ +		timer_reduce(&rxnet->client_conn_reap_timer, conn_expires_at);
+ +
+++<<<<<<< HEAD
+ +out:
+ +	spin_unlock(&rxnet->client_conn_cache_lock);
+ +	spin_unlock(&rxnet->client_conn_discard_lock);
+ +	_leave("");
+ +}
+ +
+ +/*
+ + * Preemptively destroy all the client connection records rather than waiting
+ + * for them to time out
+ + */
+ +void rxrpc_destroy_all_client_connections(struct rxrpc_net *rxnet)
+ +{
+ +	_enter("");
+ +
+ +	spin_lock(&rxnet->client_conn_cache_lock);
+ +	rxnet->kill_all_client_conns = true;
+ +	spin_unlock(&rxnet->client_conn_cache_lock);
+ +
+ +	del_timer_sync(&rxnet->client_conn_reap_timer);
+ +
+ +	if (!rxrpc_queue_work(&rxnet->client_conn_reaper))
+ +		_debug("destroy: queue failed");
+  
+++=======
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	_leave("");
+  }
+  
+@@@ -1102,30 -795,21 +1210,45 @@@
+   */
+  void rxrpc_clean_up_local_conns(struct rxrpc_local *local)
+  {
+++<<<<<<< HEAD
+ +	struct rxrpc_connection *conn, *tmp;
+ +	struct rxrpc_net *rxnet = local->rxnet;
+ +	LIST_HEAD(graveyard);
+ +
+ +	_enter("");
+ +
+ +	spin_lock(&rxnet->client_conn_cache_lock);
+ +
+ +	list_for_each_entry_safe(conn, tmp, &rxnet->idle_client_conns,
+ +				 cache_link) {
+ +		if (conn->params.local == local) {
+ +			trace_rxrpc_client(conn, -1, rxrpc_client_discard);
+ +			list_move(&conn->cache_link, &graveyard);
+ +		}
+ +	}
+ +
+ +	spin_unlock(&rxnet->client_conn_cache_lock);
+ +
+ +	while (!list_empty(&graveyard)) {
+ +		conn = list_entry(graveyard.next,
+ +				  struct rxrpc_connection, cache_link);
+++=======
++ 	struct rxrpc_connection *conn;
++ 
++ 	_enter("");
++ 
++ 	local->kill_all_client_conns = true;
++ 
++ 	del_timer_sync(&local->client_conn_reap_timer);
++ 
++ 	while ((conn = list_first_entry_or_null(&local->idle_client_conns,
++ 						struct rxrpc_connection, cache_link))) {
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  		list_del_init(&conn->cache_link);
++ 		atomic_dec(&conn->active);
++ 		trace_rxrpc_client(conn, -1, rxrpc_client_discard);
+  		rxrpc_unbundle_conn(conn);
+ -		rxrpc_put_connection(conn, rxrpc_conn_put_local_dead);
+ +		rxrpc_put_connection(conn);
+  	}
+  
+  	_leave(" [culled]");
+diff --cc net/rxrpc/conn_event.c
+index abf03a5b1d31,44414e724415..000000000000
+--- a/net/rxrpc/conn_event.c
++++ b/net/rxrpc/conn_event.c
+@@@ -129,10 -165,13 +111,13 @@@ static void rxrpc_conn_retransmit_call(
+  				   ntohl(pkt.ack.serial),
+  				   pkt.ack.reason, 0);
+  		break;
++ 
++ 	default:
++ 		return;
+  	}
+  
+ -	ret = kernel_sendmsg(conn->local->socket, &msg, iov, ioc, len);
+ -	conn->peer->last_tx_at = ktime_get_seconds();
+ +	ret = kernel_sendmsg(conn->params.local->socket, &msg, iov, ioc, len);
+ +	conn->params.peer->last_tx_at = ktime_get_seconds();
+  	if (ret < 0)
+  		trace_rxrpc_tx_fail(chan->call_debug_id, serial, ret,
+  				    rxrpc_tx_point_call_final_resend);
+@@@ -155,29 -192,15 +140,33 @@@ static void rxrpc_abort_calls(struct rx
+  
+  	_enter("{%d},%x", conn->debug_id, conn->abort_code);
+  
+- 	spin_lock(&conn->bundle->channel_lock);
+- 
+  	for (i = 0; i < RXRPC_MAXCALLS; i++) {
+++<<<<<<< HEAD
+ +		call = rcu_dereference_protected(
+ +			conn->channels[i].call,
+ +			lockdep_is_held(&conn->bundle->channel_lock));
+ +		if (call) {
+ +			if (compl == RXRPC_CALL_LOCALLY_ABORTED)
+ +				trace_rxrpc_abort(call->debug_id,
+ +						  "CON", call->cid,
+ +						  call->call_id, 0,
+++=======
++ 		call = conn->channels[i].call;
++ 		if (call)
++ 			rxrpc_set_call_completion(call,
++ 						  conn->completion,
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+ +						  conn->abort_code,
+ +						  conn->error);
+ +			else
+ +				trace_rxrpc_rx_abort(call, serial,
+ +						     conn->abort_code);
+ +			rxrpc_set_call_completion(call, compl,
+  						  conn->abort_code,
+  						  conn->error);
+ +		}
+  	}
+  
+- 	spin_unlock(&conn->bundle->channel_lock);
+  	_leave("");
+  }
+  
+@@@ -472,14 -351,85 +459,89 @@@ void rxrpc_process_connection(struct wo
+  	struct rxrpc_connection *conn =
+  		container_of(work, struct rxrpc_connection, processor);
+  
+ -	rxrpc_see_connection(conn, rxrpc_conn_see_work);
+ +	rxrpc_see_connection(conn);
+  
+ -	if (__rxrpc_use_local(conn->local, rxrpc_local_use_conn_work)) {
+ +	if (__rxrpc_use_local(conn->params.local)) {
+  		rxrpc_do_process_connection(conn);
+++<<<<<<< HEAD
+ +		rxrpc_unuse_local(conn->params.local);
+++=======
++ 		rxrpc_unuse_local(conn->local, rxrpc_local_unuse_conn_work);
++ 	}
++ }
++ 
++ /*
++  * post connection-level events to the connection
++  * - this includes challenges, responses, some aborts and call terminal packet
++  *   retransmission.
++  */
++ static void rxrpc_post_packet_to_conn(struct rxrpc_connection *conn,
++ 				      struct sk_buff *skb)
++ {
++ 	_enter("%p,%p", conn, skb);
++ 
++ 	rxrpc_get_skb(skb, rxrpc_skb_get_conn_work);
++ 	skb_queue_tail(&conn->rx_queue, skb);
++ 	rxrpc_queue_conn(conn, rxrpc_conn_queue_rx_work);
++ }
++ 
++ /*
++  * Input a connection-level packet.
++  */
++ bool rxrpc_input_conn_packet(struct rxrpc_connection *conn, struct sk_buff *skb)
++ {
++ 	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
++ 
++ 	switch (sp->hdr.type) {
++ 	case RXRPC_PACKET_TYPE_BUSY:
++ 		/* Just ignore BUSY packets for now. */
++ 		return true;
++ 
++ 	case RXRPC_PACKET_TYPE_ABORT:
++ 		if (rxrpc_is_conn_aborted(conn))
++ 			return true;
++ 		rxrpc_input_conn_abort(conn, skb);
++ 		rxrpc_abort_calls(conn);
++ 		return true;
++ 
++ 	case RXRPC_PACKET_TYPE_CHALLENGE:
++ 	case RXRPC_PACKET_TYPE_RESPONSE:
++ 		if (rxrpc_is_conn_aborted(conn)) {
++ 			if (conn->completion == RXRPC_CALL_LOCALLY_ABORTED)
++ 				rxrpc_send_conn_abort(conn);
++ 			return true;
++ 		}
++ 		rxrpc_post_packet_to_conn(conn, skb);
++ 		return true;
++ 
++ 	default:
++ 		WARN_ON_ONCE(1);
++ 		return true;
++ 	}
++ }
++ 
++ /*
++  * Input a connection event.
++  */
++ void rxrpc_input_conn_event(struct rxrpc_connection *conn, struct sk_buff *skb)
++ {
++ 	unsigned int loop;
++ 
++ 	if (test_and_clear_bit(RXRPC_CONN_EV_ABORT_CALLS, &conn->events))
++ 		rxrpc_abort_calls(conn);
++ 
++ 	switch (skb->mark) {
++ 	case RXRPC_SKB_MARK_SERVICE_CONN_SECURED:
++ 		if (conn->state != RXRPC_CONN_SERVICE)
++ 			break;
++ 
++ 		for (loop = 0; loop < RXRPC_MAXCALLS; loop++)
++ 			rxrpc_call_is_secure(conn->channels[loop].call);
++ 		break;
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	}
+  
+ -	/* Process delayed ACKs whose time has come. */
+ -	if (conn->flags & RXRPC_CONN_FINAL_ACK_MASK)
+ -		rxrpc_process_delayed_final_acks(conn, false);
+ +	rxrpc_put_connection(conn);
+ +	_leave("");
+ +	return;
+  }
+diff --cc net/rxrpc/conn_object.c
+index 156bd26daf74,ac85d4644a3c..000000000000
+--- a/net/rxrpc/conn_object.c
++++ b/net/rxrpc/conn_object.c
+@@@ -42,10 -63,13 +42,11 @@@ struct rxrpc_connection *rxrpc_alloc_co
+  	if (conn) {
+  		INIT_LIST_HEAD(&conn->cache_link);
+  		timer_setup(&conn->timer, &rxrpc_connection_timer, 0);
+ -		INIT_WORK(&conn->processor, rxrpc_process_connection);
+ -		INIT_WORK(&conn->destructor, rxrpc_clean_up_connection);
+ +		INIT_WORK(&conn->processor, &rxrpc_process_connection);
+  		INIT_LIST_HEAD(&conn->proc_link);
+  		INIT_LIST_HEAD(&conn->link);
++ 		mutex_init(&conn->security_lock);
+  		skb_queue_head_init(&conn->rx_queue);
+ -		conn->rxnet = rxnet;
+  		conn->security = &rxrpc_no_security;
+  		spin_lock_init(&conn->state_lock);
+  		conn->debug_id = atomic_inc_return(&rxrpc_debug_id);
+@@@ -210,50 -197,25 +208,62 @@@ void rxrpc_disconnect_call(struct rxrpc
+  	call->peer->cong_ssthresh = call->cong_ssthresh;
+  
+  	if (!hlist_unhashed(&call->error_link)) {
+ -		spin_lock(&call->peer->lock);
+ -		hlist_del_init(&call->error_link);
+ -		spin_unlock(&call->peer->lock);
+ +		spin_lock_bh(&call->peer->lock);
+ +		hlist_del_rcu(&call->error_link);
+ +		spin_unlock_bh(&call->peer->lock);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (rxrpc_is_client_call(call))
+ +		return rxrpc_disconnect_client_call(conn->bundle, call);
+ +
+ +	spin_lock(&conn->bundle->channel_lock);
+ +	__rxrpc_disconnect_call(conn, call);
+ +	spin_unlock(&conn->bundle->channel_lock);
+++=======
++ 	if (rxrpc_is_client_call(call)) {
++ 		rxrpc_disconnect_client_call(call->bundle, call);
++ 	} else {
++ 		__rxrpc_disconnect_call(conn, call);
++ 		conn->idle_timestamp = jiffies;
++ 		if (atomic_dec_and_test(&conn->active))
++ 			rxrpc_set_service_reap_timer(conn->rxnet,
++ 						     jiffies + rxrpc_connection_expiry);
++ 	}
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+ +
+ +	set_bit(RXRPC_CALL_DISCONNECTED, &call->flags);
+ +	conn->idle_timestamp = jiffies;
+ +}
+ +
+ +/*
+ + * Kill off a connection.
+ + */
+ +void rxrpc_kill_connection(struct rxrpc_connection *conn)
+ +{
+ +	struct rxrpc_net *rxnet = conn->params.local->rxnet;
+ +
+ +	ASSERT(!rcu_access_pointer(conn->channels[0].call) &&
+ +	       !rcu_access_pointer(conn->channels[1].call) &&
+ +	       !rcu_access_pointer(conn->channels[2].call) &&
+ +	       !rcu_access_pointer(conn->channels[3].call));
+ +	ASSERT(list_empty(&conn->cache_link));
+ +
+ +	write_lock(&rxnet->conn_lock);
+ +	list_del_init(&conn->proc_link);
+ +	write_unlock(&rxnet->conn_lock);
+  
+ -	rxrpc_put_call(call, rxrpc_call_put_io_thread);
+ +	/* Drain the Rx queue.  Note that even though we've unpublished, an
+ +	 * incoming packet could still be being added to our Rx queue, so we
+ +	 * will need to drain it again in the RCU cleanup handler.
+ +	 */
+ +	rxrpc_purge_queue(&conn->rx_queue);
+ +
+ +	/* Leave final destruction to RCU.  The connection processor work item
+ +	 * must carry a ref on the connection to prevent us getting here whilst
+ +	 * it is queued or running.
+ +	 */
+ +	call_rcu(&conn->rcu, rxrpc_destroy_connection);
+  }
+  
+  /*
+@@@ -354,24 -293,86 +364,45 @@@ static void rxrpc_destroy_connection(st
+  
+  	_enter("{%d,u=%d}", conn->debug_id, refcount_read(&conn->ref));
+  
+ -	trace_rxrpc_conn(conn->debug_id, refcount_read(&conn->ref),
+ -			 rxrpc_conn_free);
+ -	kfree(conn);
+ +	ASSERTCMP(refcount_read(&conn->ref), ==, 0);
+  
+++<<<<<<< HEAD
+ +	_net("DESTROY CONN %d", conn->debug_id);
+++=======
++ 	if (atomic_dec_and_test(&rxnet->nr_conns))
++ 		wake_up_var(&rxnet->nr_conns);
++ }
++ 
++ /*
++  * Clean up a dead connection.
++  */
++ static void rxrpc_clean_up_connection(struct work_struct *work)
++ {
++ 	struct rxrpc_connection *conn =
++ 		container_of(work, struct rxrpc_connection, destructor);
++ 	struct rxrpc_net *rxnet = conn->rxnet;
++ 
++ 	ASSERT(!conn->channels[0].call &&
++ 	       !conn->channels[1].call &&
++ 	       !conn->channels[2].call &&
++ 	       !conn->channels[3].call);
++ 	ASSERT(list_empty(&conn->cache_link));
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  
+  	del_timer_sync(&conn->timer);
+ -	cancel_work_sync(&conn->processor); /* Processing may restart the timer */
+ -	del_timer_sync(&conn->timer);
+ -
+ -	write_lock(&rxnet->conn_lock);
+ -	list_del_init(&conn->proc_link);
+ -	write_unlock(&rxnet->conn_lock);
+ -
+  	rxrpc_purge_queue(&conn->rx_queue);
+  
+ -	rxrpc_kill_client_conn(conn);
+ -
+  	conn->security->clear(conn);
+ -	key_put(conn->key);
+ -	rxrpc_put_bundle(conn->bundle, rxrpc_bundle_put_conn);
+ -	rxrpc_put_peer(conn->peer, rxrpc_peer_put_conn);
+ -	rxrpc_put_local(conn->local, rxrpc_local_put_kill_conn);
+ +	key_put(conn->params.key);
+ +	rxrpc_put_bundle(conn->bundle);
+ +	rxrpc_put_peer(conn->params.peer);
+  
+ -	/* Drain the Rx queue.  Note that even though we've unpublished, an
+ -	 * incoming packet could still be being added to our Rx queue, so we
+ -	 * will need to drain it again in the RCU cleanup handler.
+ -	 */
+ -	rxrpc_purge_queue(&conn->rx_queue);
+ +	if (atomic_dec_and_test(&conn->params.local->rxnet->nr_conns))
+ +		wake_up_var(&conn->params.local->rxnet->nr_conns);
+ +	rxrpc_put_local(conn->params.local);
+  
+ -	call_rcu(&conn->rcu, rxrpc_rcu_free_connection);
+ -}
+ -
+ -/*
+ - * Drop a ref on a connection.
+ - */
+ -void rxrpc_put_connection(struct rxrpc_connection *conn,
+ -			  enum rxrpc_conn_trace why)
+ -{
+ -	unsigned int debug_id;
+ -	bool dead;
+ -	int r;
+ -
+ -	if (!conn)
+ -		return;
+ -
+ -	debug_id = conn->debug_id;
+ -	dead = __refcount_dec_and_test(&conn->ref, &r);
+ -	trace_rxrpc_conn(debug_id, r - 1, why);
+ -	if (dead) {
+ -		del_timer(&conn->timer);
+ -		cancel_work(&conn->processor);
+ -
+ -		if (in_softirq() || work_busy(&conn->processor) ||
+ -		    timer_pending(&conn->timer))
+ -			/* Can't use the rxrpc workqueue as we need to cancel/flush
+ -			 * something that may be running/waiting there.
+ -			 */
+ -			schedule_work(&conn->destructor);
+ -		else
+ -			rxrpc_clean_up_connection(&conn->destructor);
+ -	}
+ +	kfree(conn);
+ +	_leave("");
+  }
+  
+  /*
+diff --cc net/rxrpc/local_object.c
+index 846558613c7f,b8eaca5d9f22..000000000000
+--- a/net/rxrpc/local_object.c
++++ b/net/rxrpc/local_object.c
+@@@ -81,22 -105,37 +81,43 @@@ static struct rxrpc_local *rxrpc_alloc_
+  	if (local) {
+  		refcount_set(&local->ref, 1);
+  		atomic_set(&local->active_users, 1);
+ -		local->net = net;
+ -		local->rxnet = rxrpc_net(net);
+ +		local->rxnet = rxnet;
+  		INIT_HLIST_NODE(&local->link);
+ +		INIT_WORK(&local->processor, rxrpc_local_processor);
+ +		INIT_LIST_HEAD(&local->ack_tx_queue);
+ +		spin_lock_init(&local->ack_tx_lock);
+  		init_rwsem(&local->defrag_sem);
+ -		init_completion(&local->io_thread_ready);
+ -		skb_queue_head_init(&local->rx_queue);
+ -		INIT_LIST_HEAD(&local->conn_attend_q);
+ -		INIT_LIST_HEAD(&local->call_attend_q);
+ -
+ +		skb_queue_head_init(&local->reject_queue);
+ +		skb_queue_head_init(&local->event_queue);
+  		local->client_bundles = RB_ROOT;
+  		spin_lock_init(&local->client_bundles_lock);
+++<<<<<<< HEAD
+++=======
++ 		local->kill_all_client_conns = false;
++ 		INIT_LIST_HEAD(&local->idle_client_conns);
++ 		timer_setup(&local->client_conn_reap_timer,
++ 			    rxrpc_client_conn_reap_timeout, 0);
++ 
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  		spin_lock_init(&local->lock);
+  		rwlock_init(&local->services_lock);
+  		local->debug_id = atomic_inc_return(&rxrpc_debug_id);
+  		memcpy(&local->srx, srx, sizeof(*srx));
+  		local->srx.srx_service = 0;
+++<<<<<<< HEAD
+ +		trace_rxrpc_local(local->debug_id, rxrpc_local_new, 1, NULL);
+++=======
++ 		idr_init(&local->conn_ids);
++ 		get_random_bytes(&tmp, sizeof(tmp));
++ 		tmp &= 0x3fffffff;
++ 		if (tmp == 0)
++ 			tmp = 1;
++ 		idr_set_cursor(&local->conn_ids, tmp);
++ 		INIT_LIST_HEAD(&local->new_client_calls);
++ 		spin_lock_init(&local->client_call_lock);
++ 
++ 		trace_rxrpc_local(local->debug_id, rxrpc_local_new, 1, 1);
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  	}
+  
+  	_leave(" = %p", local);
+@@@ -393,52 -434,8 +414,57 @@@ static void rxrpc_local_destroyer(struc
+  	/* At this point, there should be no more packets coming in to the
+  	 * local endpoint.
+  	 */
+++<<<<<<< HEAD
+ +	rxrpc_purge_queue(&local->reject_queue);
+ +	rxrpc_purge_queue(&local->event_queue);
+ +}
+ +
+ +/*
+ + * Process events on an endpoint.  The work item carries a ref which
+ + * we must release.
+ + */
+ +static void rxrpc_local_processor(struct work_struct *work)
+ +{
+ +	struct rxrpc_local *local =
+ +		container_of(work, struct rxrpc_local, processor);
+ +	bool again;
+ +
+ +	if (local->dead)
+ +		return;
+ +
+ +	trace_rxrpc_local(local->debug_id, rxrpc_local_processing,
+ +			  refcount_read(&local->ref), NULL);
+ +
+ +	do {
+ +		again = false;
+ +		if (!__rxrpc_use_local(local)) {
+ +			rxrpc_local_destroyer(local);
+ +			break;
+ +		}
+ +
+ +		if (!list_empty(&local->ack_tx_queue)) {
+ +			rxrpc_transmit_ack_packets(local);
+ +			again = true;
+ +		}
+ +
+ +		if (!skb_queue_empty(&local->reject_queue)) {
+ +			rxrpc_reject_packets(local);
+ +			again = true;
+ +		}
+ +
+ +		if (!skb_queue_empty(&local->event_queue)) {
+ +			rxrpc_process_local_events(local);
+ +			again = true;
+ +		}
+ +
+ +		__rxrpc_unuse_local(local);
+ +	} while (again);
+ +
+ +	rxrpc_put_local(local);
+++=======
++ 	rxrpc_purge_queue(&local->rx_queue);
++ 	rxrpc_purge_client_connections(local);
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  }
+  
+  /*
+diff --cc net/rxrpc/rxkad.c
+index 36cf40442a7e,1bf571a66e02..000000000000
+--- a/net/rxrpc/rxkad.c
++++ b/net/rxrpc/rxkad.c
+@@@ -1187,46 -1114,53 +1187,65 @@@ static int rxkad_verify_response(struc
+  	csum = response->encrypted.checksum;
+  	response->encrypted.checksum = 0;
+  	rxkad_calc_response_checksum(response);
+ -	if (response->encrypted.checksum != csum) {
+ -		rxrpc_abort_conn(conn, skb, RXKADSEALEDINCON, -EPROTO,
+ -				 rxkad_abort_resp_bad_checksum);
+ +	eproto = tracepoint_string("rxkad_rsp_csum");
+ +	if (response->encrypted.checksum != csum)
+  		goto protocol_error_free;
+ -	}
+  
+- 	spin_lock(&conn->bundle->channel_lock);
+  	for (i = 0; i < RXRPC_MAXCALLS; i++) {
+- 		struct rxrpc_call *call;
+  		u32 call_id = ntohl(response->encrypted.call_id[i]);
++ 		u32 counter = READ_ONCE(conn->channels[i].call_counter);
+  
+++<<<<<<< HEAD
+ +		eproto = tracepoint_string("rxkad_rsp_callid");
+ +		if (call_id > INT_MAX)
+ +			goto protocol_error_unlock;
+ +
+ +		eproto = tracepoint_string("rxkad_rsp_callctr");
+ +		if (call_id < conn->channels[i].call_counter)
+ +			goto protocol_error_unlock;
+ +
+ +		eproto = tracepoint_string("rxkad_rsp_callst");
+ +		if (call_id > conn->channels[i].call_counter) {
+ +			call = rcu_dereference_protected(
+ +				conn->channels[i].call,
+ +				lockdep_is_held(&conn->bundle->channel_lock));
+ +			if (call && call->state < RXRPC_CALL_COMPLETE)
+ +				goto protocol_error_unlock;
+++=======
++ 		if (call_id > INT_MAX) {
++ 			rxrpc_abort_conn(conn, skb, RXKADSEALEDINCON, -EPROTO,
++ 					 rxkad_abort_resp_bad_callid);
++ 			goto protocol_error_free;
++ 		}
++ 
++ 		if (call_id < counter) {
++ 			rxrpc_abort_conn(conn, skb, RXKADSEALEDINCON, -EPROTO,
++ 					 rxkad_abort_resp_call_ctr);
++ 			goto protocol_error_free;
++ 		}
++ 
++ 		if (call_id > counter) {
++ 			if (conn->channels[i].call) {
++ 				rxrpc_abort_conn(conn, skb, RXKADSEALEDINCON, -EPROTO,
++ 						 rxkad_abort_resp_call_state);
++ 				goto protocol_error_free;
++ 			}
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  			conn->channels[i].call_counter = call_id;
+  		}
+  	}
+- 	spin_unlock(&conn->bundle->channel_lock);
+  
+ -	if (ntohl(response->encrypted.inc_nonce) != conn->rxkad.nonce + 1) {
+ -		rxrpc_abort_conn(conn, skb, RXKADOUTOFSEQUENCE, -EPROTO,
+ -				 rxkad_abort_resp_ooseq);
+ +	eproto = tracepoint_string("rxkad_rsp_seq");
+ +	abort_code = RXKADOUTOFSEQUENCE;
+ +	if (ntohl(response->encrypted.inc_nonce) != conn->rxkad.nonce + 1)
+  		goto protocol_error_free;
+ -	}
+  
+ +	eproto = tracepoint_string("rxkad_rsp_level");
+ +	abort_code = RXKADLEVELFAIL;
+  	level = ntohl(response->encrypted.level);
+ -	if (level > RXRPC_SECURITY_ENCRYPT) {
+ -		rxrpc_abort_conn(conn, skb, RXKADLEVELFAIL, -EPROTO,
+ -				 rxkad_abort_resp_level);
+ +	if (level > RXRPC_SECURITY_ENCRYPT)
+  		goto protocol_error_free;
+ -	}
+ -	conn->security_level = level;
+ +	conn->params.security_level = level;
+  
+  	/* create a key to hold the security data and expiration time - after
+  	 * this the connection security can be handled in exactly the same way
+diff --cc net/rxrpc/security.c
+index 50cb5f1ee0c0,cd66634dffe6..000000000000
+--- a/net/rxrpc/security.c
++++ b/net/rxrpc/security.c
+@@@ -67,10 -97,9 +67,14 @@@ const struct rxrpc_security *rxrpc_secu
+   */
+  int rxrpc_init_client_conn_security(struct rxrpc_connection *conn)
+  {
+- 	const struct rxrpc_security *sec;
+  	struct rxrpc_key_token *token;
+++<<<<<<< HEAD
+ +	struct key *key = conn->params.key;
+ +	int ret;
+++=======
++ 	struct key *key = conn->key;
++ 	int ret = 0;
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+  
+  	_enter("{%d},{%x}", conn->debug_id, key_serial(key));
+  
+diff --cc net/rxrpc/sendmsg.c
+index 45c09f0de6fe,da49fcf1c456..000000000000
+--- a/net/rxrpc/sendmsg.c
++++ b/net/rxrpc/sendmsg.c
+@@@ -18,6 -18,81 +18,84 @@@
+  #include "ar-internal.h"
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Propose an abort to be made in the I/O thread.
++  */
++ bool rxrpc_propose_abort(struct rxrpc_call *call, s32 abort_code, int error,
++ 			 enum rxrpc_abort_reason why)
++ {
++ 	_enter("{%d},%d,%d,%u", call->debug_id, abort_code, error, why);
++ 
++ 	if (!call->send_abort && !rxrpc_call_is_complete(call)) {
++ 		call->send_abort_why = why;
++ 		call->send_abort_err = error;
++ 		call->send_abort_seq = 0;
++ 		/* Request abort locklessly vs rxrpc_input_call_event(). */
++ 		smp_store_release(&call->send_abort, abort_code);
++ 		rxrpc_poke_call(call, rxrpc_call_poke_abort);
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ /*
++  * Wait for a call to become connected.  Interruption here doesn't cause the
++  * call to be aborted.
++  */
++ static int rxrpc_wait_to_be_connected(struct rxrpc_call *call, long *timeo)
++ {
++ 	DECLARE_WAITQUEUE(myself, current);
++ 	int ret = 0;
++ 
++ 	_enter("%d", call->debug_id);
++ 
++ 	if (rxrpc_call_state(call) != RXRPC_CALL_CLIENT_AWAIT_CONN)
++ 		return call->error;
++ 
++ 	add_wait_queue_exclusive(&call->waitq, &myself);
++ 
++ 	for (;;) {
++ 		ret = call->error;
++ 		if (ret < 0)
++ 			break;
++ 
++ 		switch (call->interruptibility) {
++ 		case RXRPC_INTERRUPTIBLE:
++ 		case RXRPC_PREINTERRUPTIBLE:
++ 			set_current_state(TASK_INTERRUPTIBLE);
++ 			break;
++ 		case RXRPC_UNINTERRUPTIBLE:
++ 		default:
++ 			set_current_state(TASK_UNINTERRUPTIBLE);
++ 			break;
++ 		}
++ 		if (rxrpc_call_state(call) != RXRPC_CALL_CLIENT_AWAIT_CONN) {
++ 			ret = call->error;
++ 			break;
++ 		}
++ 		if ((call->interruptibility == RXRPC_INTERRUPTIBLE ||
++ 		     call->interruptibility == RXRPC_PREINTERRUPTIBLE) &&
++ 		    signal_pending(current)) {
++ 			ret = sock_intr_errno(*timeo);
++ 			break;
++ 		}
++ 		*timeo = schedule_timeout(*timeo);
++ 	}
++ 
++ 	remove_wait_queue(&call->waitq, &myself);
++ 	__set_current_state(TASK_RUNNING);
++ 
++ 	if (ret == 0 && rxrpc_call_is_complete(call))
++ 		ret = call->error;
++ 
++ 	_leave(" = %d", ret);
++ 	return ret;
++ }
++ 
++ /*
+++>>>>>>> 9d35d880e0e4 (rxrpc: Move client call connection to the I/O thread)
+   * Return true if there's sufficient Tx queue space.
+   */
+  static bool rxrpc_check_tx_space(struct rxrpc_call *call, rxrpc_seq_t *_tx_win)
+* Unmerged path net/rxrpc/call_state.c
+* Unmerged path net/rxrpc/io_thread.c
+* Unmerged path include/trace/events/rxrpc.h
+* Unmerged path net/rxrpc/ar-internal.h
+* Unmerged path net/rxrpc/call_object.c
+* Unmerged path net/rxrpc/call_state.c
+* Unmerged path net/rxrpc/conn_client.c
+* Unmerged path net/rxrpc/conn_event.c
+* Unmerged path net/rxrpc/conn_object.c
+diff --git a/net/rxrpc/conn_service.c b/net/rxrpc/conn_service.c
+index 6e6aa02c6f9e..ceb904e5e1cc 100644
+--- a/net/rxrpc/conn_service.c
++++ b/net/rxrpc/conn_service.c
+@@ -11,7 +11,6 @@
+ static struct rxrpc_bundle rxrpc_service_dummy_bundle = {
+ 	.ref		= REFCOUNT_INIT(1),
+ 	.debug_id	= UINT_MAX,
+-	.channel_lock	= __SPIN_LOCK_UNLOCKED(&rxrpc_service_dummy_bundle.channel_lock),
+ };
+ 
+ /*
+* Unmerged path net/rxrpc/io_thread.c
+* Unmerged path net/rxrpc/local_object.c
+diff --git a/net/rxrpc/proc.c b/net/rxrpc/proc.c
+index fae22a8b38d6..562e39fb630f 100644
+--- a/net/rxrpc/proc.c
++++ b/net/rxrpc/proc.c
+@@ -12,6 +12,7 @@
+ 
+ static const char *const rxrpc_conn_states[RXRPC_CONN__NR_STATES] = {
+ 	[RXRPC_CONN_UNUSED]			= "Unused  ",
++	[RXRPC_CONN_CLIENT_UNSECURED]		= "ClUnsec ",
+ 	[RXRPC_CONN_CLIENT]			= "Client  ",
+ 	[RXRPC_CONN_SERVICE_PREALLOC]		= "SvPrealc",
+ 	[RXRPC_CONN_SERVICE_UNSECURED]		= "SvUnsec ",
+* Unmerged path net/rxrpc/rxkad.c
+* Unmerged path net/rxrpc/security.c
+* Unmerged path net/rxrpc/sendmsg.c
