@@ -1,0 +1,101 @@
+locking/rwsem: Make handoff bit handling more consistent
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Waiman Long <longman@redhat.com>
+commit d257cc8cb8d5355ffc43a96bab94db7b5a324803
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/d257cc8c.failed
+
+There are some inconsistency in the way that the handoff bit is being
+handled in readers and writers that lead to a race condition.
+
+Firstly, when a queue head writer set the handoff bit, it will clear
+it when the writer is being killed or interrupted on its way out
+without acquiring the lock. That is not the case for a queue head
+reader. The handoff bit will simply be inherited by the next waiter.
+
+Secondly, in the out_nolock path of rwsem_down_read_slowpath(), both
+the waiter and handoff bits are cleared if the wait queue becomes
+empty.  For rwsem_down_write_slowpath(), however, the handoff bit is
+not checked and cleared if the wait queue is empty. This can
+potentially make the handoff bit set with empty wait queue.
+
+Worse, the situation in rwsem_down_write_slowpath() relies on wstate,
+a variable set outside of the critical section containing the ->count
+manipulation, this leads to race condition where RWSEM_FLAG_HANDOFF
+can be double subtracted, corrupting ->count.
+
+To make the handoff bit handling more consistent and robust, extract
+out handoff bit clearing code into the new rwsem_del_waiter() helper
+function. Also, completely eradicate wstate; always evaluate
+everything inside the same critical section.
+
+The common function will only use atomic_long_andnot() to clear bits
+when the wait queue is empty to avoid possible race condition.  If the
+first waiter with handoff bit set is killed or interrupted to exit the
+slowpath without acquiring the lock, the next waiter will inherit the
+handoff bit.
+
+While at it, simplify the trylock for loop in
+rwsem_down_write_slowpath() to make it easier to read.
+
+Fixes: 4f23dbc1e657 ("locking/rwsem: Implement lock handoff to prevent lock starvation")
+	Reported-by: Zhenhua Ma <mazhenhua@xiaomi.com>
+	Suggested-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20211116012912.723980-1-longman@redhat.com
+(cherry picked from commit d257cc8cb8d5355ffc43a96bab94db7b5a324803)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/rwsem.c
+diff --cc kernel/locking/rwsem.c
+index 9d497b9ebfe0,e039cf1605af..000000000000
+--- a/kernel/locking/rwsem.c
++++ b/kernel/locking/rwsem.c
+@@@ -1061,18 -1077,30 +1100,36 @@@ rwsem_down_write_slowpath(struct rw_sem
+  	waiter.task = current;
+  	waiter.type = RWSEM_WAITING_FOR_WRITE;
+  	waiter.timeout = jiffies + RWSEM_WAIT_TIMEOUT;
++ 	waiter.handoff_set = false;
+  
+  	raw_spin_lock_irq(&sem->wait_lock);
+- 
+- 	/* account for this before adding a new element to the list */
+- 	wstate = list_empty(&sem->wait_list) ? WRITER_FIRST : WRITER_NOT_FIRST;
+- 
+- 	list_add_tail(&waiter.list, &sem->wait_list);
++ 	rwsem_add_waiter(sem, &waiter);
+  
+  	/* we're now waiting on the lock */
+++<<<<<<< HEAD
+ +	if (wstate == WRITER_NOT_FIRST) {
+ +		rwsem_cond_wake_waiter(sem, atomic_long_read(&sem->count),
+ +				       &wake_q);
+++=======
++ 	if (rwsem_first_waiter(sem) != &waiter) {
++ 		count = atomic_long_read(&sem->count);
++ 
++ 		/*
++ 		 * If there were already threads queued before us and:
++ 		 *  1) there are no active locks, wake the front
++ 		 *     queued process(es) as the handoff bit might be set.
++ 		 *  2) there are no active writers and some readers, the lock
++ 		 *     must be read owned; so we try to wake any read lock
++ 		 *     waiters that were queued ahead of us.
++ 		 */
++ 		if (count & RWSEM_WRITER_MASK)
++ 			goto wait;
++ 
++ 		rwsem_mark_wake(sem, (count & RWSEM_READER_MASK)
++ 					? RWSEM_WAKE_READERS
++ 					: RWSEM_WAKE_ANY, &wake_q);
++ 
+++>>>>>>> d257cc8cb8d5 (locking/rwsem: Make handoff bit handling more consistent)
+  		if (!wake_q_empty(&wake_q)) {
+  			/*
+  			 * We want to minimize wait_lock hold time especially
+* Unmerged path kernel/locking/rwsem.c
