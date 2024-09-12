@@ -1196,7 +1196,7 @@ again:
 	return 0;
 }
 
-void qla_trim_buf(struct qla_qpair *qp, u16 trim)
+static void qla_trim_buf(struct qla_qpair *qp, u16 trim)
 {
 	int i, j;
 	struct qla_hw_data *ha = qp->vha->hw;
@@ -1228,7 +1228,7 @@ void qla_trim_buf(struct qla_qpair *qp, u16 trim)
 	       qp->id, trim, qp->buf_pool.num_alloc);
 }
 
-void __qla_adjust_buf(struct qla_qpair *qp)
+static void __qla_adjust_buf(struct qla_qpair *qp)
 {
 	u32 trim;
 
