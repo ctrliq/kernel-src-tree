@@ -1,0 +1,277 @@
+perf/x86/amd/core: Add PerfMonV2 overflow handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Sandipan Das <sandipan.das@amd.com>
+commit 7685665c390dc68c2d9a74e8445f41494cc8f6cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/7685665c.failed
+
+If AMD Performance Monitoring Version 2 (PerfMonV2) is
+supported, use a new scheme to process Core PMC overflows
+in the NMI handler using the new global control and status
+registers. This will be bypassed on unsupported hardware
+(x86_pmu.version < 2).
+
+In x86_pmu_handle_irq(), overflows are detected by testing
+the contents of the PERF_CTR register for each active PMC in
+a loop. The new scheme instead inspects the overflow bits of
+the global status register.
+
+The Performance Counter Global Status (PerfCntrGlobalStatus)
+register has overflow (PerfCntrOvfl) bits for each PMC. This
+is, however, a read-only MSR. To acknowledge that overflows
+have been processed, the NMI handler must clear the bits by
+writing to the PerfCntrGlobalStatusClr register.
+
+In x86_pmu_handle_irq(), PMCs counting the same event that
+are started and stopped at the same time record slightly
+different counts due to delays in between reads from the
+PERF_CTR registers. This is fixed by stopping and starting
+the PMCs at the same before and with a single write to the
+Performance Counter Global Control (PerfCntrGlobalCtl) upon
+entering and before exiting the NMI handler.
+
+	Signed-off-by: Sandipan Das <sandipan.das@amd.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/f20b7e4da0b0a83bdbe05857f354146623bc63ab.1650515382.git.sandipan.das@amd.com
+(cherry picked from commit 7685665c390dc68c2d9a74e8445f41494cc8f6cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/amd/core.c
+diff --cc arch/x86/events/amd/core.c
+index fc84e3f05348,262e39a85031..000000000000
+--- a/arch/x86/events/amd/core.c
++++ b/arch/x86/events/amd/core.c
+@@@ -573,8 -661,54 +574,47 @@@ static void amd_pmu_cpu_dead(int cpu
+  
+  		cpuhw->amd_nb = NULL;
+  	}
+ -
+ -	amd_pmu_cpu_reset(cpu);
+ -}
+ -
+ -static inline void amd_pmu_set_global_ctl(u64 ctl)
+ -{
+ -	wrmsrl(MSR_AMD64_PERF_CNTR_GLOBAL_CTL, ctl);
+  }
+  
++ static inline u64 amd_pmu_get_global_status(void)
++ {
++ 	u64 status;
++ 
++ 	/* PerfCntrGlobalStatus is read-only */
++ 	rdmsrl(MSR_AMD64_PERF_CNTR_GLOBAL_STATUS, status);
++ 
++ 	return status & amd_pmu_global_cntr_mask;
++ }
++ 
++ static inline void amd_pmu_ack_global_status(u64 status)
++ {
++ 	/*
++ 	 * PerfCntrGlobalStatus is read-only but an overflow acknowledgment
++ 	 * mechanism exists; writing 1 to a bit in PerfCntrGlobalStatusClr
++ 	 * clears the same bit in PerfCntrGlobalStatus
++ 	 */
++ 
++ 	/* Only allow modifications to PerfCntrGlobalStatus.PerfCntrOvfl */
++ 	status &= amd_pmu_global_cntr_mask;
++ 	wrmsrl(MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_CLR, status);
++ }
++ 
++ static bool amd_pmu_test_overflow_topbit(int idx)
++ {
++ 	u64 counter;
++ 
++ 	rdmsrl(x86_pmu_event_addr(idx), counter);
++ 
++ 	return !(counter & BIT_ULL(x86_pmu.cntval_bits - 1));
++ }
++ 
++ static bool amd_pmu_test_overflow_status(int idx)
++ {
++ 	return amd_pmu_get_global_status() & BIT_ULL(idx);
++ }
++ 
++ DEFINE_STATIC_CALL(amd_pmu_test_overflow, amd_pmu_test_overflow_topbit);
++ 
+  /*
+   * When a PMC counter overflows, an NMI is used to process the event and
+   * reset the counter. NMI latency can result in the counter being updated
+@@@ -668,27 -868,129 +706,122 @@@ static void amd_pmu_disable_event(struc
+   * handled a counter. When an un-handled NMI is received, it will be claimed
+   * only if arriving within that window.
+   */
++ static inline int amd_pmu_adjust_nmi_window(int handled)
++ {
++ 	/*
++ 	 * If a counter was handled, record a timestamp such that un-handled
++ 	 * NMIs will be claimed if arriving within that window.
++ 	 */
++ 	if (handled) {
++ 		this_cpu_write(perf_nmi_tstamp, jiffies + perf_nmi_window);
++ 
++ 		return handled;
++ 	}
++ 
++ 	if (time_after(jiffies, this_cpu_read(perf_nmi_tstamp)))
++ 		return NMI_DONE;
++ 
++ 	return NMI_HANDLED;
++ }
++ 
+  static int amd_pmu_handle_irq(struct pt_regs *regs)
+  {
+ -	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+  	int handled;
+ -	int pmu_enabled;
+ -
+ -	/*
+ -	 * Save the PMU state.
+ -	 * It needs to be restored when leaving the handler.
+ -	 */
+ -	pmu_enabled = cpuc->enabled;
+ -	cpuc->enabled = 0;
+ -
+ -	/* stop everything (includes BRS) */
+ -	amd_pmu_disable_all();
+ -
+ -	/* Drain BRS is in use (could be inactive) */
+ -	if (cpuc->lbr_users)
+ -		amd_brs_drain();
+  
+  	/* Process any counter overflows */
+  	handled = x86_pmu_handle_irq(regs);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If a counter was handled, record a timestamp such that un-handled
+ +	 * NMIs will be claimed if arriving within that window.
+ +	 */
+ +	if (handled) {
+ +		this_cpu_write(perf_nmi_tstamp, jiffies + perf_nmi_window);
+++=======
++ 	cpuc->enabled = pmu_enabled;
++ 	if (pmu_enabled)
++ 		amd_pmu_enable_all(0);
+  
+- 		return handled;
++ 	return amd_pmu_adjust_nmi_window(handled);
++ }
+++>>>>>>> 7685665c390d (perf/x86/amd/core: Add PerfMonV2 overflow handling)
++ 
++ static int amd_pmu_v2_handle_irq(struct pt_regs *regs)
++ {
++ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++ 	struct perf_sample_data data;
++ 	struct hw_perf_event *hwc;
++ 	struct perf_event *event;
++ 	int handled = 0, idx;
++ 	u64 status, mask;
++ 	bool pmu_enabled;
++ 
++ 	/*
++ 	 * Save the PMU state as it needs to be restored when leaving the
++ 	 * handler
++ 	 */
++ 	pmu_enabled = cpuc->enabled;
++ 	cpuc->enabled = 0;
++ 
++ 	/* Stop counting */
++ 	amd_pmu_v2_disable_all();
++ 
++ 	status = amd_pmu_get_global_status();
++ 
++ 	/* Check if any overflows are pending */
++ 	if (!status)
++ 		goto done;
++ 
++ 	for (idx = 0; idx < x86_pmu.num_counters; idx++) {
++ 		if (!test_bit(idx, cpuc->active_mask))
++ 			continue;
++ 
++ 		event = cpuc->events[idx];
++ 		hwc = &event->hw;
++ 		x86_perf_event_update(event);
++ 		mask = BIT_ULL(idx);
++ 
++ 		if (!(status & mask))
++ 			continue;
++ 
++ 		/* Event overflow */
++ 		handled++;
++ 		perf_sample_data_init(&data, 0, hwc->last_period);
++ 
++ 		if (!x86_perf_event_set_period(event))
++ 			continue;
++ 
++ 		if (perf_event_overflow(event, &data, regs))
++ 			x86_pmu_stop(event, 0);
++ 
++ 		status &= ~mask;
+  	}
+  
+- 	if (time_after(jiffies, this_cpu_read(perf_nmi_tstamp)))
+- 		return NMI_DONE;
++ 	/*
++ 	 * It should never be the case that some overflows are not handled as
++ 	 * the corresponding PMCs are expected to be inactive according to the
++ 	 * active_mask
++ 	 */
++ 	WARN_ON(status > 0);
+  
+- 	return NMI_HANDLED;
++ 	/* Clear overflow bits */
++ 	amd_pmu_ack_global_status(~status);
++ 
++ 	/*
++ 	 * Unmasking the LVTPC is not required as the Mask (M) bit of the LVT
++ 	 * PMI entry is not set by the local APIC when a PMC overflow occurs
++ 	 */
++ 	inc_irq_stat(apic_perf_irqs);
++ 
++ done:
++ 	cpuc->enabled = pmu_enabled;
++ 
++ 	/* Resume counting only if PMU is active */
++ 	if (pmu_enabled)
++ 		amd_pmu_v2_enable_all(0);
++ 
++ 	return amd_pmu_adjust_nmi_window(handled);
+  }
+  
+  static struct event_constraint *
+@@@ -956,6 -1359,27 +1089,30 @@@ static int __init amd_core_pmu_init(voi
+  	x86_pmu.eventsel	= MSR_F15H_PERF_CTL;
+  	x86_pmu.perfctr		= MSR_F15H_PERF_CTR;
+  	x86_pmu.num_counters	= AMD64_NUM_COUNTERS_CORE;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Check for Performance Monitoring v2 support */
++ 	if (boot_cpu_has(X86_FEATURE_PERFMON_V2)) {
++ 		ebx.full = cpuid_ebx(EXT_PERFMON_DEBUG_FEATURES);
++ 
++ 		/* Update PMU version for later usage */
++ 		x86_pmu.version = 2;
++ 
++ 		/* Find the number of available Core PMCs */
++ 		x86_pmu.num_counters = ebx.split.num_core_pmc;
++ 
++ 		amd_pmu_global_cntr_mask = (1ULL << x86_pmu.num_counters) - 1;
++ 
++ 		/* Update PMC handling functions */
++ 		x86_pmu.enable_all = amd_pmu_v2_enable_all;
++ 		x86_pmu.disable_all = amd_pmu_v2_disable_all;
++ 		x86_pmu.enable = amd_pmu_v2_enable_event;
++ 		x86_pmu.handle_irq = amd_pmu_v2_handle_irq;
++ 		static_call_update(amd_pmu_test_overflow, amd_pmu_test_overflow_status);
++ 	}
++ 
+++>>>>>>> 7685665c390d (perf/x86/amd/core: Add PerfMonV2 overflow handling)
+  	/*
+  	 * AMD Core perfctr has separate MSRs for the NB events, see
+  	 * the amd/uncore.c driver.
+* Unmerged path arch/x86/events/amd/core.c
