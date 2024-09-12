@@ -1,0 +1,202 @@
+x86/decompressor: Pass pgtable address to trampoline directly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit cb83cece57e1889109dd73ea08ee338668c9d1b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/cb83cece.failed
+
+The only remaining use of the trampoline address by the trampoline
+itself is deriving the page table address from it, and this involves
+adding an offset of 0x0. So simplify this, and pass the new CR3 value
+directly.
+
+This makes the fact that the page table happens to be at the start of
+the trampoline allocation an implementation detail of the caller.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Link: https://lore.kernel.org/r/20230807162720.545787-15-ardb@kernel.org
+(cherry picked from commit cb83cece57e1889109dd73ea08ee338668c9d1b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/head_64.S
+#	arch/x86/boot/compressed/pgtable_64.c
+diff --cc arch/x86/boot/compressed/head_64.S
+index c4f3be19a58f,afdaf8cb8bb9..000000000000
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@@ -561,52 -511,74 +561,114 @@@ SYM_FUNC_END(efi64_stub_entry
+  /*
+   * Jump to the decompressed kernel.
+   */
+ -	movq	%r15, %rsi
+  	jmp	*%rax
+++<<<<<<< HEAD
+++=======
++ SYM_FUNC_END(.Lrelocated)
++ 
++ /*
++  * This is the 32-bit trampoline that will be copied over to low memory. It
++  * will be called using the ordinary 64-bit calling convention from code
++  * running in 64-bit mode.
++  *
++  * Return address is at the top of the stack (might be above 4G).
++  * The first argument (EDI) contains the address of the temporary PGD level
++  * page table in 32-bit addressable memory which will be programmed into
++  * register CR3.
++  */
++ 	.section ".rodata", "a", @progbits
++ SYM_CODE_START(trampoline_32bit_src)
++ 	/*
++ 	 * Preserve callee save 64-bit registers on the stack: this is
++ 	 * necessary because the architecture does not guarantee that GPRs will
++ 	 * retain their full 64-bit values across a 32-bit mode switch.
++ 	 */
++ 	pushq	%r15
++ 	pushq	%r14
++ 	pushq	%r13
++ 	pushq	%r12
++ 	pushq	%rbp
++ 	pushq	%rbx
++ 
++ 	/* Preserve top half of RSP in a legacy mode GPR to avoid truncation */
++ 	movq	%rsp, %rbx
++ 	shrq	$32, %rbx
++ 
++ 	/* Switch to compatibility mode (CS.L = 0 CS.D = 1) via far return */
++ 	pushq	$__KERNEL32_CS
++ 	leaq	0f(%rip), %rax
++ 	pushq	%rax
++ 	lretq
++ 
++ 	/*
++ 	 * The 32-bit code below will do a far jump back to long mode and end
++ 	 * up here after reconfiguring the number of paging levels. First, the
++ 	 * stack pointer needs to be restored to its full 64-bit value before
++ 	 * the callee save register contents can be popped from the stack.
++ 	 */
++ .Lret:
++ 	shlq	$32, %rbx
++ 	orq	%rbx, %rsp
++ 
++ 	/* Restore the preserved 64-bit registers */
++ 	popq	%rbx
++ 	popq	%rbp
++ 	popq	%r12
++ 	popq	%r13
++ 	popq	%r14
++ 	popq	%r15
++ 	retq
+++>>>>>>> cb83cece57e1 (x86/decompressor: Pass pgtable address to trampoline directly)
+  
+  	.code32
+ -0:
+ +/*
+ + * This is the 32-bit trampoline that will be copied over to low memory.
+ + *
+ + * RDI contains the return address (might be above 4G).
+ + * ECX contains the base address of the trampoline memory.
+ + * Non zero RDX means trampoline needs to enable 5-level paging.
+ + */
+ +SYM_CODE_START(trampoline_32bit_src)
+ +	/* Set up data and stack segments */
+ +	movl	$__KERNEL_DS, %eax
+ +	movl	%eax, %ds
+ +	movl	%eax, %ss
+ +
+ +	/* Set up new stack */
+ +	leal	TRAMPOLINE_32BIT_STACK_END(%ecx), %esp
+ +
+  	/* Disable paging */
+  	movl	%cr0, %eax
+  	btrl	$X86_CR0_PG_BIT, %eax
+  	movl	%eax, %cr0
+  
+++<<<<<<< HEAD
+ +	/* Check what paging mode we want to be in after the trampoline */
+ +	testl	%edx, %edx
+ +	jz	1f
+++=======
++ 	/* Point CR3 to the trampoline's new top level page table */
++ 	movl	%edi, %cr3
+++>>>>>>> cb83cece57e1 (x86/decompressor: Pass pgtable address to trampoline directly)
+  
+ +	/* We want 5-level paging: don't touch CR3 if it already points to 5-level page tables */
+ +	movl	%cr4, %eax
+ +	testl	$X86_CR4_LA57, %eax
+ +	jnz	3f
+ +	jmp	2f
+ +1:
+ +	/* We want 4-level paging: don't touch CR3 if it already points to 4-level page tables */
+ +	movl	%cr4, %eax
+ +	testl	$X86_CR4_LA57, %eax
+ +	jz	3f
+ +2:
+ +	/* Point CR3 to the trampoline's new top level page table */
+ +	leal	TRAMPOLINE_32BIT_PGTABLE_OFFSET(%ecx), %eax
+ +	movl	%eax, %cr3
+ +3:
+  	/* Set EFER.LME=1 as a precaution in case hypervsior pulls the rug */
+ +	pushl	%ecx
+ +	pushl	%edx
+  	movl	$MSR_EFER, %ecx
+  	rdmsr
+  	btsl	$_EFER_LME, %eax
+diff --cc arch/x86/boot/compressed/pgtable_64.c
+index af8b429eafb0,eab4e6b568ae..000000000000
+--- a/arch/x86/boot/compressed/pgtable_64.c
++++ b/arch/x86/boot/compressed/pgtable_64.c
+@@@ -105,12 -101,13 +105,17 @@@ static unsigned long find_trampoline_pl
+  	return bios_start - TRAMPOLINE_32BIT_SIZE;
+  }
+  
+ -asmlinkage void configure_5level_paging(struct boot_params *bp)
+ +struct paging_config paging_prepare(void *rmode)
+  {
+++<<<<<<< HEAD
+ +	struct paging_config paging_config = {};
+++=======
++ 	void (*toggle_la57)(void *cr3);
++ 	bool l5_required = false;
+++>>>>>>> cb83cece57e1 (x86/decompressor: Pass pgtable address to trampoline directly)
+  
+  	/* Initialize boot_params. Required for cmdline_find_option_bool(). */
+ -	boot_params = bp;
+ +	boot_params = rmode;
+  
+  	/*
+  	 * Check if LA57 is desired and supported.
+@@@ -185,12 -187,10 +190,11 @@@
+  		 * may be above 4G.
+  		 */
+  		src = *(unsigned long *)__native_read_cr3() & PAGE_MASK;
+- 		memcpy(trampoline_32bit + TRAMPOLINE_32BIT_PGTABLE_OFFSET / sizeof(unsigned long),
+- 		       (void *)src, PAGE_SIZE);
++ 		memcpy(trampoline_32bit, (void *)src, PAGE_SIZE);
+  	}
+  
+ -	toggle_la57(trampoline_32bit);
+ +out:
+ +	return paging_config;
+  }
+  
+  void cleanup_trampoline(void *pgtable)
+* Unmerged path arch/x86/boot/compressed/head_64.S
+diff --git a/arch/x86/boot/compressed/pgtable.h b/arch/x86/boot/compressed/pgtable.h
+index cc9b2529a086..6e9352c80d27 100644
+--- a/arch/x86/boot/compressed/pgtable.h
++++ b/arch/x86/boot/compressed/pgtable.h
+@@ -3,8 +3,6 @@
+ 
+ #define TRAMPOLINE_32BIT_SIZE		(2 * PAGE_SIZE)
+ 
+-#define TRAMPOLINE_32BIT_PGTABLE_OFFSET	0
+-
+ #define TRAMPOLINE_32BIT_CODE_OFFSET	PAGE_SIZE
+ #define TRAMPOLINE_32BIT_CODE_SIZE	0x80
+ 
+* Unmerged path arch/x86/boot/compressed/pgtable_64.c
