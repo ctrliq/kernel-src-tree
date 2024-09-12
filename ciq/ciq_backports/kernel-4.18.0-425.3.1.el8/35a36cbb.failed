@@ -1,0 +1,255 @@
+platform/x86: serial-multi-instantiate: Reorganize I2C functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Lucas Tanure <tanureal@opensource.cirrus.com>
+commit 35a36cbb7b1ce7596fc03962f7ce261b2e908d1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/35a36cbb.failed
+
+Reorganize I2C functions to accommodate SPI support
+Split the probe and factor out parts of the code
+that will be used in the SPI support
+Also switched from strlcpy() to strscpy()
+
+	Signed-off-by: Lucas Tanure <tanureal@opensource.cirrus.com>
+	Signed-off-by: Stefan Binding <sbinding@opensource.cirrus.com>
+Link: https://lore.kernel.org/r/20220121172431.6876-7-sbinding@opensource.cirrus.com
+	Reviewed-by: Hans de Goede <hdegoede@redhat.com>
+	Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+(cherry picked from commit 35a36cbb7b1ce7596fc03962f7ce261b2e908d1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/platform/x86/i2c-multi-instantiate.c
+diff --cc drivers/platform/x86/i2c-multi-instantiate.c
+index 4956a1df5b90,1eb29bec405f..000000000000
+--- a/drivers/platform/x86/i2c-multi-instantiate.c
++++ b/drivers/platform/x86/i2c-multi-instantiate.c
+@@@ -27,99 -27,134 +27,222 @@@ struct i2c_inst_data 
+  	int irq_idx;
+  };
+  
+++<<<<<<< HEAD:drivers/platform/x86/i2c-multi-instantiate.c
+ +struct i2c_multi_inst_data {
+ +	int num_clients;
+ +	struct i2c_client *clients[];
+ +};
+ +
+ +static int i2c_multi_inst_probe(struct platform_device *pdev)
+ +{
+ +	struct i2c_multi_inst_data *multi;
+ +	const struct i2c_inst_data *inst_data;
+ +	struct i2c_board_info board_info = {};
+ +	struct device *dev = &pdev->dev;
+ +	struct acpi_device *adev;
+ +	char name[32];
+ +	int i, ret;
+ +
+ +	inst_data = device_get_match_data(dev);
+ +	if (!inst_data) {
+ +		dev_err(dev, "Error ACPI match data is missing\n");
+ +		return -ENODEV;
+++=======
++ struct smi {
++ 	int i2c_num;
++ 	struct i2c_client **i2c_devs;
++ };
++ 
++ static int smi_get_irq(struct platform_device *pdev, struct acpi_device *adev,
++ 		       const struct smi_instance *inst)
++ {
++ 	int ret;
++ 
++ 	switch (inst->flags & IRQ_RESOURCE_TYPE) {
++ 	case IRQ_RESOURCE_GPIO:
++ 		ret = acpi_dev_gpio_irq_get(adev, inst->irq_idx);
++ 		break;
++ 	case IRQ_RESOURCE_APIC:
++ 		ret = platform_get_irq(pdev, inst->irq_idx);
++ 		break;
++ 	default:
++ 		return 0;
+++>>>>>>> 35a36cbb7b1c (platform/x86: serial-multi-instantiate: Reorganize I2C functions):drivers/platform/x86/serial-multi-instantiate.c
+  	}
+  
+- 	adev = ACPI_COMPANION(dev);
++ 	if (ret < 0)
++ 		dev_err_probe(&pdev->dev, ret, "Error requesting irq at index %d: %d\n",
++ 			      inst->irq_idx, ret);
++ 
++ 	return ret;
++ }
++ 
++ static void smi_devs_unregister(struct smi *smi)
++ {
++ 	while (smi->i2c_num > 0)
++ 		i2c_unregister_device(smi->i2c_devs[--smi->i2c_num]);
++ }
++ 
++ /**
++  * smi_i2c_probe - Instantiate multiple I2C devices from inst array
++  * @pdev:	Platform device
++  * @adev:	ACPI device
++  * @smi:	Internal struct for Serial multi instantiate driver
++  * @inst_array:	Array of instances to probe
++  *
++  * Returns the number of I2C devices instantiate, Zero if none is found or a negative error code.
++  */
++ static int smi_i2c_probe(struct platform_device *pdev, struct acpi_device *adev, struct smi *smi,
++ 			 const struct smi_instance *inst_array)
++ {
++ 	struct i2c_board_info board_info = {};
++ 	struct device *dev = &pdev->dev;
++ 	char name[32];
++ 	int i, ret, count;
+  
+- 	/* Count number of clients to instantiate */
+  	ret = i2c_acpi_client_count(adev);
+  	if (ret < 0)
+  		return ret;
++ 	else if (!ret)
++ 		return -ENODEV;
+  
+++<<<<<<< HEAD:drivers/platform/x86/i2c-multi-instantiate.c
+ +	multi = devm_kmalloc(dev, struct_size(multi, clients, ret), GFP_KERNEL);
+ +	if (!multi)
+ +		return -ENOMEM;
+ +
+ +	multi->num_clients = ret;
+ +
+ +	for (i = 0; i < multi->num_clients && inst_data[i].type; i++) {
+ +		memset(&board_info, 0, sizeof(board_info));
+ +		strlcpy(board_info.type, inst_data[i].type, I2C_NAME_SIZE);
+ +		snprintf(name, sizeof(name), "%s-%s.%d", dev_name(dev),
+ +			 inst_data[i].type, i);
+ +		board_info.dev_name = name;
+ +		switch (inst_data[i].flags & IRQ_RESOURCE_TYPE) {
+ +		case IRQ_RESOURCE_GPIO:
+ +			ret = acpi_dev_gpio_irq_get(adev, inst_data[i].irq_idx);
+ +			if (ret < 0) {
+ +				dev_err(dev, "Error requesting irq at index %d: %d\n",
+ +					inst_data[i].irq_idx, ret);
+ +				goto error;
+ +			}
+ +			board_info.irq = ret;
+ +			break;
+ +		case IRQ_RESOURCE_APIC:
+ +			ret = platform_get_irq(pdev, inst_data[i].irq_idx);
+ +			if (ret < 0) {
+ +				dev_dbg(dev, "Error requesting irq at index %d: %d\n",
+ +					inst_data[i].irq_idx, ret);
+ +				goto error;
+ +			}
+ +			board_info.irq = ret;
+ +			break;
+ +		default:
+ +			board_info.irq = 0;
+ +			break;
+ +		}
+ +		multi->clients[i] = i2c_acpi_new_device(dev, i, &board_info);
+ +		if (IS_ERR(multi->clients[i])) {
+ +			ret = dev_err_probe(dev, PTR_ERR(multi->clients[i]),
+++=======
++ 	count = ret;
++ 
++ 	smi->i2c_devs = devm_kcalloc(dev, count, sizeof(*smi->i2c_devs), GFP_KERNEL);
++ 	if (!smi->i2c_devs)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < count && inst_array[i].type; i++) {
++ 		memset(&board_info, 0, sizeof(board_info));
++ 		strscpy(board_info.type, inst_array[i].type, I2C_NAME_SIZE);
++ 		snprintf(name, sizeof(name), "%s-%s.%d", dev_name(dev), inst_array[i].type, i);
++ 		board_info.dev_name = name;
++ 
++ 		ret = smi_get_irq(pdev, adev, &inst_array[i]);
++ 		if (ret < 0)
++ 			goto error;
++ 		board_info.irq = ret;
++ 
++ 		smi->i2c_devs[i] = i2c_acpi_new_device(dev, i, &board_info);
++ 		if (IS_ERR(smi->i2c_devs[i])) {
++ 			ret = dev_err_probe(dev, PTR_ERR(smi->i2c_devs[i]),
+++>>>>>>> 35a36cbb7b1c (platform/x86: serial-multi-instantiate: Reorganize I2C functions):drivers/platform/x86/serial-multi-instantiate.c
+  					    "Error creating i2c-client, idx %d\n", i);
+  			goto error;
+  		}
++ 		smi->i2c_num++;
+  	}
+++<<<<<<< HEAD:drivers/platform/x86/i2c-multi-instantiate.c
+ +	if (i < multi->num_clients) {
+ +		dev_err(dev, "Error finding driver, idx %d\n", i);
+++=======
++ 	if (smi->i2c_num < count) {
++ 		dev_dbg(dev, "Error finding driver, idx %d\n", i);
+++>>>>>>> 35a36cbb7b1c (platform/x86: serial-multi-instantiate: Reorganize I2C functions):drivers/platform/x86/serial-multi-instantiate.c
+  		ret = -ENODEV;
+  		goto error;
+  	}
+  
+++<<<<<<< HEAD:drivers/platform/x86/i2c-multi-instantiate.c
+ +	platform_set_drvdata(pdev, multi);
+ +	return 0;
+++=======
++ 	dev_info(dev, "Instantiated %d I2C devices.\n", smi->i2c_num);
+++>>>>>>> 35a36cbb7b1c (platform/x86: serial-multi-instantiate: Reorganize I2C functions):drivers/platform/x86/serial-multi-instantiate.c
+  
++ 	return 0;
+  error:
+++<<<<<<< HEAD:drivers/platform/x86/i2c-multi-instantiate.c
+ +	while (--i >= 0)
+ +		i2c_unregister_device(multi->clients[i]);
+++=======
++ 	smi_devs_unregister(smi);
+++>>>>>>> 35a36cbb7b1c (platform/x86: serial-multi-instantiate: Reorganize I2C functions):drivers/platform/x86/serial-multi-instantiate.c
+  
+  	return ret;
+  }
+  
+++<<<<<<< HEAD:drivers/platform/x86/i2c-multi-instantiate.c
+ +static int i2c_multi_inst_remove(struct platform_device *pdev)
+ +{
+ +	struct i2c_multi_inst_data *multi = platform_get_drvdata(pdev);
+ +	int i;
+ +
+ +	for (i = 0; i < multi->num_clients; i++)
+ +		i2c_unregister_device(multi->clients[i]);
+++=======
++ static int smi_probe(struct platform_device *pdev)
++ {
++ 	const struct smi_instance *inst_array;
++ 	struct device *dev = &pdev->dev;
++ 	struct acpi_device *adev;
++ 	struct smi *smi;
++ 
++ 	adev = ACPI_COMPANION(dev);
++ 	if (!adev)
++ 		return -ENODEV;
++ 
++ 	inst_array = device_get_match_data(dev);
++ 	if (!inst_array) {
++ 		dev_dbg(dev, "Error ACPI match data is missing\n");
++ 		return -ENODEV;
++ 	}
++ 
++ 	smi = devm_kzalloc(dev, sizeof(*smi), GFP_KERNEL);
++ 	if (!smi)
++ 		return -ENOMEM;
++ 
++ 	platform_set_drvdata(pdev, smi);
++ 
++ 	return smi_i2c_probe(pdev, adev, smi, inst_array);
++ }
++ 
++ static int smi_remove(struct platform_device *pdev)
++ {
++ 	struct smi *smi = platform_get_drvdata(pdev);
++ 
++ 	smi_devs_unregister(smi);
+++>>>>>>> 35a36cbb7b1c (platform/x86: serial-multi-instantiate: Reorganize I2C functions):drivers/platform/x86/serial-multi-instantiate.c
+  
+  	return 0;
+  }
+* Unmerged path drivers/platform/x86/i2c-multi-instantiate.c
