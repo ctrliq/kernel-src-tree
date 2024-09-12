@@ -1,0 +1,110 @@
+x86/resctrl: Calculate bandwidth from the previous __mon_event_count() chunks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author James Morse <james.morse@arm.com>
+commit 30442571ec81fb33f7bd8cea5a14afb10b8f442a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/30442571.failed
+
+mbm_bw_count() is only called by the mbm_handle_overflow() worker once a
+second. It reads the hardware register, calculates the bandwidth and
+updates m->prev_bw_msr which is used to hold the previous hardware register
+value.
+
+Operating directly on hardware register values makes it difficult to make
+this code architecture independent, so that it can be moved to /fs/,
+making the mba_sc feature something resctrl supports with no additional
+support from the architecture.
+Prior to calling mbm_bw_count(), mbm_update() reads from the same hardware
+register using __mon_event_count().
+
+Change mbm_bw_count() to use the current chunks value most recently saved
+by __mon_event_count(). This removes an extra call to __rmid_read().
+Instead of using m->prev_msr to calculate the number of chunks seen,
+use the rr->val that was updated by __mon_event_count(). This removes an
+extra call to mbm_overflow_count() and get_corrected_mbm_count().
+Calculating bandwidth like this means mbm_bw_count() no longer operates
+on hardware register values directly.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Jamie Iles <quic_jiles@quicinc.com>
+	Reviewed-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Tested-by: Xin Hao <xhao@linux.alibaba.com>
+	Tested-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Tested-by: Cristian Marussi <cristian.marussi@arm.com>
+Link: https://lore.kernel.org/r/20220902154829.30399-13-james.morse@arm.com
+(cherry picked from commit 30442571ec81fb33f7bd8cea5a14afb10b8f442a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/monitor.c
+diff --cc arch/x86/kernel/cpu/resctrl/monitor.c
+index 810114991b5b,2d81b6cd9632..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/monitor.c
++++ b/arch/x86/kernel/cpu/resctrl/monitor.c
+@@@ -341,17 -341,15 +348,21 @@@ static u64 __mon_event_count(u32 rmid, 
+   */
+  static void mbm_bw_count(u32 rmid, struct rmid_read *rr)
+  {
+ -	struct rdt_hw_resource *hw_res = resctrl_to_arch_res(rr->r);
+ +	struct rdt_resource *r = &rdt_resources_all[RDT_RESOURCE_L3];
+  	struct mbm_state *m = &rr->d->mbm_local[rmid];
+- 	u64 tval, cur_bw, chunks;
++ 	u64 cur_bw, chunks, cur_chunks;
+  
+- 	tval = __rmid_read(rmid, rr->evtid);
+- 	if (tval & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL))
+- 		return;
++ 	cur_chunks = rr->val;
++ 	chunks = cur_chunks - m->prev_bw_chunks;
++ 	m->prev_bw_chunks = cur_chunks;
+  
+++<<<<<<< HEAD
+ +	chunks = mbm_overflow_count(m->prev_bw_msr, tval, rr->r->mbm_width);
+ +	m->chunks += chunks;
+ +	cur_bw = (get_corrected_mbm_count(rmid, chunks) * r->mon_scale) >> 20;
+++=======
++ 	cur_bw = (chunks * hw_res->mon_scale) >> 20;
+++>>>>>>> 30442571ec81 (x86/resctrl: Calculate bandwidth from the previous __mon_event_count() chunks)
+  
+  	if (m->delta_comp)
+  		m->delta_bw = abs(cur_bw - m->prev_bw);
+@@@ -527,6 -526,8 +538,11 @@@ static void mbm_update(struct rdt_resou
+  	}
+  	if (is_mbm_local_enabled()) {
+  		rr.evtid = QOS_L3_MBM_LOCAL_EVENT_ID;
+++<<<<<<< HEAD
+++=======
++ 		rr.val = 0;
++ 		__mon_event_count(rmid, &rr);
+++>>>>>>> 30442571ec81 (x86/resctrl: Calculate bandwidth from the previous __mon_event_count() chunks)
+  
+  		/*
+  		 * Call the MBA software controller only for the
+diff --git a/arch/x86/kernel/cpu/resctrl/internal.h b/arch/x86/kernel/cpu/resctrl/internal.h
+index 9780c2d2c637..3efe058f6acb 100644
+--- a/arch/x86/kernel/cpu/resctrl/internal.h
++++ b/arch/x86/kernel/cpu/resctrl/internal.h
+@@ -288,7 +288,7 @@ struct rftype {
+  * struct mbm_state - status for each MBM counter in each domain
+  * @chunks:	Total data moved (multiply by rdt_group.mon_scale to get bytes)
+  * @prev_msr:	Value of IA32_QM_CTR for this RMID last time we read it
+- * @prev_bw_msr:Value of previous IA32_QM_CTR for bandwidth counting
++ * @prev_bw_chunks: Previous chunks value read for bandwidth calculation
+  * @prev_bw:	The most recent bandwidth in MBps
+  * @delta_bw:	Difference between the current and previous bandwidth
+  * @delta_comp:	Indicates whether to compute the delta_bw
+@@ -296,7 +296,7 @@ struct rftype {
+ struct mbm_state {
+ 	u64	chunks;
+ 	u64	prev_msr;
+-	u64	prev_bw_msr;
++	u64	prev_bw_chunks;
+ 	u32	prev_bw;
+ 	u32	delta_bw;
+ 	bool	delta_comp;
+* Unmerged path arch/x86/kernel/cpu/resctrl/monitor.c
