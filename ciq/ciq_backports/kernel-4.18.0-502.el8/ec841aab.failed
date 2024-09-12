@@ -1,0 +1,710 @@
+arm64: entry: handle all vectors with C
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit ec841aab8d3cdd23decdcf0c47292e14627446c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/ec841aab.failed
+
+We have 16 architectural exception vectors, and depending on kernel
+configuration we handle 8 or 12 of these with C code, with the remaining
+8 or 4 of these handled as special cases in the entry assembly.
+
+It would be nicer if the entry assembly were uniform for all exceptions,
+and we deferred any specific handling of the exceptions to C code. This
+way the entry assembly can be more easily templated without ifdeffery or
+special cases, and it's easier to modify the handling of these cases in
+future (e.g. to dump additional registers other context).
+
+This patch reworks the entry code so that we always have a C handler for
+every architectural exception vector, with the entry assembly being
+completely uniform. We now have to handle exceptions from EL1t and EL1h,
+and also have to handle exceptions from AArch32 even when the kernel is
+built without CONFIG_COMPAT. To make this clear and to simplify
+templating, we rename the top-level exception handlers with a consistent
+naming scheme:
+
+  asm: <el+sp>_<regsize>_<type>
+  c:   <el+sp>_<regsize>_<type>_handler
+
+.. where:
+
+  <el+sp> is `el1t`, `el1h`, or `el0t`
+  <regsize> is `64` or `32`
+  <type> is `sync`, `irq`, `fiq`, or `error`
+
+... e.g.
+
+  asm: el1h_64_sync
+  c:   el1h_64_sync_handler
+
+... with lower-level handlers simply using "el1" and "compat" as today.
+
+For unexpected exceptions, this information is passed to
+__panic_unhandled(), so it can report the specific vector an unexpected
+exception was taken from, e.g.
+
+| Unhandled 64-bit el1t sync exception
+
+For vectors we never expect to enter legitimately, the C code is
+generated using a macro to avoid code duplication. The exceptions are
+handled via __panic_unhandled(), replacing bad_mode() (which is
+removed).
+
+The `kernel_ventry` and `entry_handler` assembly macros are updated to
+handle the new naming scheme. In theory it should be possible to
+generate the entry functions at the same time as the vectors using a
+single table, but this will require reworking the linker script to split
+the two into separate sections, so for now we have separate tables.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+	Acked-by: Marc Zyngier <maz@kernel.org>
+	Reviewed-by: Joey Gouly <joey.gouly@arm.com>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20210607094624.34689-15-mark.rutland@arm.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit ec841aab8d3cdd23decdcf0c47292e14627446c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/exception.h
+#	arch/arm64/kernel/entry-common.c
+#	arch/arm64/kernel/entry.S
+diff --cc arch/arm64/include/asm/exception.h
+index acd3d9be4846,ad30a5a1d2bf..000000000000
+--- a/arch/arm64/include/asm/exception.h
++++ b/arch/arm64/include/asm/exception.h
+@@@ -42,19 -31,35 +42,40 @@@ static inline u32 disr_to_esr(u64 disr
+  	return esr;
+  }
+  
+++<<<<<<< HEAD
+ +asmlinkage void el1_sync_handler(struct pt_regs *regs);
+ +asmlinkage void el0_sync_handler(struct pt_regs *regs);
+ +asmlinkage void el0_sync_compat_handler(struct pt_regs *regs);
+++=======
++ asmlinkage void el1t_64_sync_handler(struct pt_regs *regs);
++ asmlinkage void el1t_64_irq_handler(struct pt_regs *regs);
++ asmlinkage void el1t_64_fiq_handler(struct pt_regs *regs);
++ asmlinkage void el1t_64_error_handler(struct pt_regs *regs);
++ 
++ asmlinkage void el1h_64_sync_handler(struct pt_regs *regs);
++ asmlinkage void el1h_64_irq_handler(struct pt_regs *regs);
++ asmlinkage void el1h_64_fiq_handler(struct pt_regs *regs);
++ asmlinkage void el1h_64_error_handler(struct pt_regs *regs);
++ 
++ asmlinkage void el0t_64_sync_handler(struct pt_regs *regs);
++ asmlinkage void el0t_64_irq_handler(struct pt_regs *regs);
++ asmlinkage void el0t_64_fiq_handler(struct pt_regs *regs);
++ asmlinkage void el0t_64_error_handler(struct pt_regs *regs);
++ 
++ asmlinkage void el0t_32_sync_handler(struct pt_regs *regs);
++ asmlinkage void el0t_32_irq_handler(struct pt_regs *regs);
++ asmlinkage void el0t_32_fiq_handler(struct pt_regs *regs);
++ asmlinkage void el0t_32_error_handler(struct pt_regs *regs);
+++>>>>>>> ec841aab8d3c (arm64: entry: handle all vectors with C)
+  
+ +asmlinkage void noinstr enter_el1_irq_or_nmi(struct pt_regs *regs);
+ +asmlinkage void noinstr exit_el1_irq_or_nmi(struct pt_regs *regs);
+  asmlinkage void call_on_irq_stack(struct pt_regs *regs,
+  				  void (*func)(struct pt_regs *));
+  asmlinkage void enter_from_user_mode(void);
+ -asmlinkage void exit_to_user_mode(void);
+ -void arm64_enter_nmi(struct pt_regs *regs);
+ -void arm64_exit_nmi(struct pt_regs *regs);
+ -void do_mem_abort(unsigned long far, unsigned int esr, struct pt_regs *regs);
+ +void do_mem_abort(unsigned long addr, unsigned int esr, struct pt_regs *regs);
+  void do_undefinstr(struct pt_regs *regs);
+  void do_bti(struct pt_regs *regs);
+- asmlinkage void bad_mode(struct pt_regs *regs, int reason, unsigned int esr);
+  void do_debug_exception(unsigned long addr_if_watchpoint, unsigned int esr,
+  			struct pt_regs *regs);
+  void do_fpsimd_acc(unsigned int esr, struct pt_regs *regs);
+diff --cc arch/arm64/kernel/entry-common.c
+index c764ba2d11d7,dd6403b748f2..000000000000
+--- a/arch/arm64/kernel/entry-common.c
++++ b/arch/arm64/kernel/entry-common.c
+@@@ -79,6 -120,119 +79,122 @@@ asmlinkage void noinstr exit_el1_irq_or
+  		exit_to_kernel_mode(regs);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __sched arm64_preempt_schedule_irq(void)
++ {
++ 	lockdep_assert_irqs_disabled();
++ 
++ 	/*
++ 	 * DAIF.DA are cleared at the start of IRQ/FIQ handling, and when GIC
++ 	 * priority masking is used the GIC irqchip driver will clear DAIF.IF
++ 	 * using gic_arch_enable_irqs() for normal IRQs. If anything is set in
++ 	 * DAIF we must have handled an NMI, so skip preemption.
++ 	 */
++ 	if (system_uses_irq_prio_masking() && read_sysreg(daif))
++ 		return;
++ 
++ 	/*
++ 	 * Preempting a task from an IRQ means we leave copies of PSTATE
++ 	 * on the stack. cpufeature's enable calls may modify PSTATE, but
++ 	 * resuming one of these preempted tasks would undo those changes.
++ 	 *
++ 	 * Only allow a task to be preempted once cpufeatures have been
++ 	 * enabled.
++ 	 */
++ 	if (system_capabilities_finalized())
++ 		preempt_schedule_irq();
++ }
++ 
++ static void do_interrupt_handler(struct pt_regs *regs,
++ 				 void (*handler)(struct pt_regs *))
++ {
++ 	if (on_thread_stack())
++ 		call_on_irq_stack(regs, handler);
++ 	else
++ 		handler(regs);
++ }
++ 
++ extern void (*handle_arch_irq)(struct pt_regs *);
++ extern void (*handle_arch_fiq)(struct pt_regs *);
++ 
++ static void noinstr __panic_unhandled(struct pt_regs *regs, const char *vector,
++ 				      unsigned int esr)
++ {
++ 	arm64_enter_nmi(regs);
++ 
++ 	console_verbose();
++ 
++ 	pr_crit("Unhandled %s exception on CPU%d, ESR 0x%08x -- %s\n",
++ 		vector, smp_processor_id(), esr,
++ 		esr_get_class_string(esr));
++ 
++ 	__show_regs(regs);
++ 	panic("Unhandled exception");
++ }
++ 
++ #define UNHANDLED(el, regsize, vector)							\
++ asmlinkage void noinstr el##_##regsize##_##vector##_handler(struct pt_regs *regs)	\
++ {											\
++ 	const char *desc = #regsize "-bit " #el " " #vector;				\
++ 	__panic_unhandled(regs, desc, read_sysreg(esr_el1));				\
++ }
++ 
++ #ifdef CONFIG_ARM64_ERRATUM_1463225
++ static DEFINE_PER_CPU(int, __in_cortex_a76_erratum_1463225_wa);
++ 
++ static void cortex_a76_erratum_1463225_svc_handler(void)
++ {
++ 	u32 reg, val;
++ 
++ 	if (!unlikely(test_thread_flag(TIF_SINGLESTEP)))
++ 		return;
++ 
++ 	if (!unlikely(this_cpu_has_cap(ARM64_WORKAROUND_1463225)))
++ 		return;
++ 
++ 	__this_cpu_write(__in_cortex_a76_erratum_1463225_wa, 1);
++ 	reg = read_sysreg(mdscr_el1);
++ 	val = reg | DBG_MDSCR_SS | DBG_MDSCR_KDE;
++ 	write_sysreg(val, mdscr_el1);
++ 	asm volatile("msr daifclr, #8");
++ 	isb();
++ 
++ 	/* We will have taken a single-step exception by this point */
++ 
++ 	write_sysreg(reg, mdscr_el1);
++ 	__this_cpu_write(__in_cortex_a76_erratum_1463225_wa, 0);
++ }
++ 
++ static bool cortex_a76_erratum_1463225_debug_handler(struct pt_regs *regs)
++ {
++ 	if (!__this_cpu_read(__in_cortex_a76_erratum_1463225_wa))
++ 		return false;
++ 
++ 	/*
++ 	 * We've taken a dummy step exception from the kernel to ensure
++ 	 * that interrupts are re-enabled on the syscall path. Return back
++ 	 * to cortex_a76_erratum_1463225_svc_handler() with debug exceptions
++ 	 * masked so that we can safely restore the mdscr and get on with
++ 	 * handling the syscall.
++ 	 */
++ 	regs->pstate |= PSR_D_BIT;
++ 	return true;
++ }
++ #else /* CONFIG_ARM64_ERRATUM_1463225 */
++ static void cortex_a76_erratum_1463225_svc_handler(void) { }
++ static bool cortex_a76_erratum_1463225_debug_handler(struct pt_regs *regs)
++ {
++ 	return false;
++ }
++ #endif /* CONFIG_ARM64_ERRATUM_1463225 */
++ 
++ UNHANDLED(el1t, 64, sync)
++ UNHANDLED(el1t, 64, irq)
++ UNHANDLED(el1t, 64, fiq)
++ UNHANDLED(el1t, 64, error)
++ 
+++>>>>>>> ec841aab8d3c (arm64: entry: handle all vectors with C)
+  static void noinstr el1_abort(struct pt_regs *regs, unsigned long esr)
+  {
+  	unsigned long far = read_sysreg(far_el1);
+@@@ -178,6 -350,64 +294,67 @@@ asmlinkage void noinstr el1h_64_sync_ha
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void noinstr el1_interrupt(struct pt_regs *regs,
++ 				  void (*handler)(struct pt_regs *))
++ {
++ 	write_sysreg(DAIF_PROCCTX_NOIRQ, daif);
++ 
++ 	enter_el1_irq_or_nmi(regs);
++ 	do_interrupt_handler(regs, handler);
++ 
++ 	/*
++ 	 * Note: thread_info::preempt_count includes both thread_info::count
++ 	 * and thread_info::need_resched, and is not equivalent to
++ 	 * preempt_count().
++ 	 */
++ 	if (IS_ENABLED(CONFIG_PREEMPTION) &&
++ 	    READ_ONCE(current_thread_info()->preempt_count) == 0)
++ 		arm64_preempt_schedule_irq();
++ 
++ 	exit_el1_irq_or_nmi(regs);
++ }
++ 
++ asmlinkage void noinstr el1h_64_irq_handler(struct pt_regs *regs)
++ {
++ 	el1_interrupt(regs, handle_arch_irq);
++ }
++ 
++ asmlinkage void noinstr el1h_64_fiq_handler(struct pt_regs *regs)
++ {
++ 	el1_interrupt(regs, handle_arch_fiq);
++ }
++ 
++ asmlinkage void noinstr el1h_64_error_handler(struct pt_regs *regs)
++ {
++ 	unsigned long esr = read_sysreg(esr_el1);
++ 
++ 	local_daif_restore(DAIF_ERRCTX);
++ 	arm64_enter_nmi(regs);
++ 	do_serror(regs, esr);
++ 	arm64_exit_nmi(regs);
++ }
++ 
++ asmlinkage void noinstr enter_from_user_mode(void)
++ {
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	CT_WARN_ON(ct_state() != CONTEXT_USER);
++ 	user_exit_irqoff();
++ 	trace_hardirqs_off_finish();
++ }
++ 
++ asmlinkage void noinstr exit_to_user_mode(void)
++ {
++ 	mte_check_tfsr_exit();
++ 
++ 	trace_hardirqs_on_prepare();
++ 	lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++ 	user_enter_irqoff();
++ 	lockdep_hardirqs_on(CALLER_ADDR0);
++ }
++ 
+++>>>>>>> ec841aab8d3c (arm64: entry: handle all vectors with C)
+  static void noinstr el0_da(struct pt_regs *regs, unsigned long esr)
+  {
+  	unsigned long far = read_sysreg(far_el1);
+@@@ -354,6 -579,56 +531,59 @@@ asmlinkage void noinstr el0t_64_sync_ha
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void noinstr el0_interrupt(struct pt_regs *regs,
++ 				  void (*handler)(struct pt_regs *))
++ {
++ 	enter_from_user_mode();
++ 
++ 	write_sysreg(DAIF_PROCCTX_NOIRQ, daif);
++ 
++ 	if (regs->pc & BIT(55))
++ 		arm64_apply_bp_hardening();
++ 
++ 	do_interrupt_handler(regs, handler);
++ }
++ 
++ static void noinstr __el0_irq_handler_common(struct pt_regs *regs)
++ {
++ 	el0_interrupt(regs, handle_arch_irq);
++ }
++ 
++ asmlinkage void noinstr el0t_64_irq_handler(struct pt_regs *regs)
++ {
++ 	__el0_irq_handler_common(regs);
++ }
++ 
++ static void noinstr __el0_fiq_handler_common(struct pt_regs *regs)
++ {
++ 	el0_interrupt(regs, handle_arch_fiq);
++ }
++ 
++ asmlinkage void noinstr el0t_64_fiq_handler(struct pt_regs *regs)
++ {
++ 	__el0_fiq_handler_common(regs);
++ }
++ 
++ static void __el0_error_handler_common(struct pt_regs *regs)
++ {
++ 	unsigned long esr = read_sysreg(esr_el1);
++ 
++ 	enter_from_user_mode();
++ 	local_daif_restore(DAIF_ERRCTX);
++ 	arm64_enter_nmi(regs);
++ 	do_serror(regs, esr);
++ 	arm64_exit_nmi(regs);
++ 	local_daif_restore(DAIF_PROCCTX);
++ }
++ 
++ asmlinkage void noinstr el0t_64_error_handler(struct pt_regs *regs)
++ {
++ 	__el0_error_handler_common(regs);
++ }
++ 
+++>>>>>>> ec841aab8d3c (arm64: entry: handle all vectors with C)
+  #ifdef CONFIG_COMPAT
+  static void noinstr el0_cp15(struct pt_regs *regs, unsigned long esr)
+  {
+@@@ -413,4 -687,24 +643,27 @@@ asmlinkage void noinstr el0t_32_sync_ha
+  		el0_inv(regs, esr);
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ asmlinkage void noinstr el0t_32_irq_handler(struct pt_regs *regs)
++ {
++ 	__el0_irq_handler_common(regs);
++ }
++ 
++ asmlinkage void noinstr el0t_32_fiq_handler(struct pt_regs *regs)
++ {
++ 	__el0_fiq_handler_common(regs);
++ }
++ 
++ asmlinkage void noinstr el0t_32_error_handler(struct pt_regs *regs)
++ {
++ 	__el0_error_handler_common(regs);
++ }
++ #else /* CONFIG_COMPAT */
++ UNHANDLED(el0t, 32, sync)
++ UNHANDLED(el0t, 32, irq)
++ UNHANDLED(el0t, 32, fiq)
++ UNHANDLED(el0t, 32, error)
+++>>>>>>> ec841aab8d3c (arm64: entry: handle all vectors with C)
+  #endif /* CONFIG_COMPAT */
+diff --cc arch/arm64/kernel/entry.S
+index 3f9d46ff532e,d43a12dfd189..000000000000
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@@ -60,24 -45,11 +60,15 @@@
+  	.endr
+  	.endm
+  
+- /*
+-  * Bad Abort numbers
+-  *-----------------
+-  */
+- #define BAD_SYNC	0
+- #define BAD_IRQ		1
+- #define BAD_FIQ		2
+- #define BAD_ERROR	3
+- 
+- 	.macro kernel_ventry, el:req, regsize:req, label:req
++ 	.macro kernel_ventry, el:req, ht:req, regsize:req, label:req
+  	.align 7
+ -#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+ +.Lventry_start\@:
+  	.if	\el == 0
+ -alternative_if ARM64_UNMAP_KERNEL_AT_EL0
+ +	/*
+ +	 * This must be the first instruction of the EL0 vector entries. It is
+ +	 * skipped by the trampoline vectors, to trigger the cleanup.
+ +	 */
+ +	b	.Lskip_tramp_vectors_cleanup\@
+  	.if	\regsize == 64
+  	mrs	x30, tpidrro_el0
+  	msr	tpidrro_el0, xzr
+@@@ -131,16 -104,12 +122,20 @@@
+  	sub	sp, sp, x0
+  	mrs	x0, tpidrro_el0
+  #endif
+++<<<<<<< HEAD
+ +	b	el\()\el\()_\label
+ +.org .Lventry_start\@ + 128	// Did we overflow the ventry slot?
+++=======
++ 	b	el\el\ht\()_\regsize\()_\label
+++>>>>>>> ec841aab8d3c (arm64: entry: handle all vectors with C)
+  	.endm
+  
+ -	.macro tramp_alias, dst, sym
+ +	.macro tramp_alias, dst, sym, tmp
+  	mov_q	\dst, TRAMP_VALIAS
+ -	add	\dst, \dst, #(\sym - .entry.tramp.text)
+ +	adr_l	\tmp, \sym
+ +	add	\dst, \dst, \tmp
+ +	adr_l	\tmp, .entry.tramp.text
+ +	sub	\dst, \dst, \tmp
+  	.endm
+  
+  	/*
+@@@ -525,189 -544,46 +513,222 @@@ __bad_stack
+  	ASM_BUG()
+  #endif /* CONFIG_VMAP_STACK */
+  
+- /*
+-  * Invalid mode handlers
+-  */
+- 	.macro	inv_entry, el, reason, regsize = 64
++ 
++ 	.macro entry_handler el:req, ht:req, regsize:req, label:req
++ SYM_CODE_START_LOCAL(el\el\ht\()_\regsize\()_\label)
+  	kernel_entry \el, \regsize
+  	mov	x0, sp
+++<<<<<<< HEAD
+ +	mov	x1, #\reason
+ +	mrs	x2, esr_el1
+ +	bl	bad_mode
+ +	ASM_BUG()
+ +	.endm
+ +
+ +SYM_CODE_START_LOCAL(el0_sync_invalid)
+ +	inv_entry 0, BAD_SYNC
+ +SYM_CODE_END(el0_sync_invalid)
+ +
+ +SYM_CODE_START_LOCAL(el0_irq_invalid)
+ +	inv_entry 0, BAD_IRQ
+ +SYM_CODE_END(el0_irq_invalid)
+ +
+ +SYM_CODE_START_LOCAL(el0_fiq_invalid)
+ +	inv_entry 0, BAD_FIQ
+ +SYM_CODE_END(el0_fiq_invalid)
+ +
+ +SYM_CODE_START_LOCAL(el0_error_invalid)
+ +	inv_entry 0, BAD_ERROR
+ +SYM_CODE_END(el0_error_invalid)
+ +
+ +SYM_CODE_START_LOCAL(el1_sync_invalid)
+ +	inv_entry 1, BAD_SYNC
+ +SYM_CODE_END(el1_sync_invalid)
+ +
+ +SYM_CODE_START_LOCAL(el1_irq_invalid)
+ +	inv_entry 1, BAD_IRQ
+ +SYM_CODE_END(el1_irq_invalid)
+ +
+ +SYM_CODE_START_LOCAL(el1_fiq_invalid)
+ +	inv_entry 1, BAD_FIQ
+ +SYM_CODE_END(el1_fiq_invalid)
+ +
+ +SYM_CODE_START_LOCAL(el1_error_invalid)
+ +	inv_entry 1, BAD_ERROR
+ +SYM_CODE_END(el1_error_invalid)
+ +
+++=======
++ 	bl	el\el\ht\()_\regsize\()_\label\()_handler
++ 	.if \el == 0
++ 	b	ret_to_user
++ 	.else
++ 	b	ret_to_kernel
++ 	.endif
++ SYM_CODE_END(el\el\ht\()_\regsize\()_\label)
++ 	.endm
++ 
+++>>>>>>> ec841aab8d3c (arm64: entry: handle all vectors with C)
+  /*
+ - * Early exception handlers
+ + * EL1 mode handlers.
+   */
+++<<<<<<< HEAD
+ +	.align	6
+ +SYM_CODE_START_LOCAL_NOALIGN(el1_sync)
+ +	kernel_entry 1
+ +	mov	x0, sp
+ +	bl	el1_sync_handler
+ +	kernel_exit 1
+ +SYM_CODE_END(el1_sync)
+ +
+ +	.align	6
+ +SYM_CODE_START_LOCAL_NOALIGN(el1_irq)
+ +	kernel_entry 1
+ +	gic_prio_irq_setup pmr=x20, tmp=x1
+ +	enable_da_f
+ +
+ +	mov	x0, sp
+ +	bl	enter_el1_irq_or_nmi
+ +
+ +	irq_handler
+ +
+ +#ifdef CONFIG_PREEMPT
+ +	ldr	x24, [tsk, #TSK_TI_PREEMPT]	// get preempt count
+ +alternative_if ARM64_HAS_IRQ_PRIO_MASKING
+ +	/*
+ +	 * DA_F were cleared at start of handling. If anything is set in DAIF,
+ +	 * we come back from an NMI, so skip preemption
+ +	 */
+ +	mrs	x0, daif
+ +	orr	x24, x24, x0
+ +alternative_else_nop_endif
+ +	cbnz	x24, 1f				// preempt count != 0 || NMI return path
+ +	bl	arm64_preempt_schedule_irq	// irq en/disable is done inside
+ +1:
+ +#endif
+++=======
++ 	entry_handler	1, t, 64, sync
++ 	entry_handler	1, t, 64, irq
++ 	entry_handler	1, t, 64, fiq
++ 	entry_handler	1, t, 64, error
++ 
++ 	entry_handler	1, h, 64, sync
++ 	entry_handler	1, h, 64, irq
++ 	entry_handler	1, h, 64, fiq
++ 	entry_handler	1, h, 64, error
++ 
++ 	entry_handler	0, t, 64, sync
++ 	entry_handler	0, t, 64, irq
++ 	entry_handler	0, t, 64, fiq
++ 	entry_handler	0, t, 64, error
++ 
++ 	entry_handler	0, t, 32, sync
++ 	entry_handler	0, t, 32, irq
++ 	entry_handler	0, t, 32, fiq
++ 	entry_handler	0, t, 32, error
+++>>>>>>> ec841aab8d3c (arm64: entry: handle all vectors with C)
+ +
+ +	mov	x0, sp
+ +	bl	exit_el1_irq_or_nmi
+ +
+ +	kernel_exit 1
+ +SYM_CODE_END(el1_irq)
+ +
+ +SYM_CODE_START_LOCAL_NOALIGN(el1_fiq)
+ +	kernel_entry 1
+ +	el1_interrupt_handler handle_arch_fiq
+ +	kernel_exit 1
+ +SYM_CODE_END(el1_fiq)
+ +
+ +/*
+ + * EL0 mode handlers.
+ + */
+ +	.align	6
+ +SYM_CODE_START_LOCAL_NOALIGN(el0_sync)
+ +	kernel_entry 0
+ +	mov	x0, sp
+ +	bl	el0_sync_handler
+ +	b	ret_to_user
+ +SYM_CODE_END(el0_sync)
+ +
+ +#ifdef CONFIG_COMPAT
+ +	.align	6
+ +SYM_CODE_START_LOCAL_NOALIGN(el0_sync_compat)
+ +	kernel_entry 0, 32
+ +	mov	x0, sp
+ +	bl	el0_sync_compat_handler
+ +	b	ret_to_user
+ +SYM_CODE_END(el0_sync_compat)
+ +
+ +	.align	6
+ +SYM_CODE_START_LOCAL_NOALIGN(el0_irq_compat)
+ +	kernel_entry 0, 32
+ +	b	el0_irq_naked
+ +SYM_CODE_END(el0_irq_compat)
+ +
+ +SYM_CODE_START_LOCAL_NOALIGN(el0_fiq_compat)
+ +	kernel_entry 0, 32
+ +	b	el0_fiq_naked
+ +SYM_CODE_END(el0_fiq_compat)
+ +
+ +SYM_CODE_START_LOCAL_NOALIGN(el0_error_compat)
+ +	kernel_entry 0, 32
+ +	b	el0_error_naked
+ +SYM_CODE_END(el0_error_compat)
+ +#endif
+ +
+ +	.align	6
+ +SYM_CODE_START_LOCAL_NOALIGN(el0_irq)
+ +	kernel_entry 0
+ +el0_irq_naked:
+ +	gic_prio_irq_setup pmr=x20, tmp=x0
+ +	ct_user_exit_irqoff
+ +	enable_da_f
+ +
+ +#ifdef CONFIG_TRACE_IRQFLAGS
+ +	bl	trace_hardirqs_off
+ +#endif
+ +
+ +	tbz	x22, #55, 1f
+ +	bl	do_el0_irq_bp_hardening
+ +1:
+ +	irq_handler
+ +
+ +#ifdef CONFIG_TRACE_IRQFLAGS
+ +	bl	trace_hardirqs_on
+ +#endif
+ +	b	ret_to_user
+ +SYM_CODE_END(el0_irq)
+ +
+ +SYM_CODE_START_LOCAL_NOALIGN(el0_fiq)
+ +	kernel_entry 0
+ +el0_fiq_naked:
+ +	el0_interrupt_handler handle_arch_fiq
+ +	b	ret_to_user
+ +SYM_CODE_END(el0_fiq)
+  
+ -SYM_CODE_START_LOCAL(ret_to_kernel)
+ +SYM_CODE_START_LOCAL(el1_error)
+ +	kernel_entry 1
+ +	mrs	x1, esr_el1
+ +	gic_prio_kentry_setup tmp=x2
+ +	enable_dbg
+ +	mov	x0, sp
+ +	bl	do_serror
+  	kernel_exit 1
+ -SYM_CODE_END(ret_to_kernel)
+ +SYM_CODE_END(el1_error)
+ +
+ +SYM_CODE_START_LOCAL(el0_error)
+ +	kernel_entry 0
+ +el0_error_naked:
+ +	mrs	x25, esr_el1
+ +	gic_prio_kentry_setup tmp=x2
+ +	ct_user_exit_irqoff
+ +	enable_dbg
+ +	mov	x0, sp
+ +	mov	x1, x25
+ +	bl	do_serror
+ +	enable_da_f
+ +	b	ret_to_user
+ +SYM_CODE_END(el0_error)
+  
+  /*
+   * "slow" syscall return path.
+* Unmerged path arch/arm64/include/asm/exception.h
+* Unmerged path arch/arm64/kernel/entry-common.c
+* Unmerged path arch/arm64/kernel/entry.S
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index af27331eeca1..e0bc2a898411 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -839,7 +839,7 @@ asmlinkage void bad_mode(struct pt_regs *regs, int reason, unsigned int esr)
+ 
+ /*
+  * bad_el0_sync handles unexpected, but potentially recoverable synchronous
+- * exceptions taken from EL0. Unlike bad_mode, this returns.
++ * exceptions taken from EL0.
+  */
+ void bad_el0_sync(struct pt_regs *regs, int reason, unsigned int esr)
+ {
