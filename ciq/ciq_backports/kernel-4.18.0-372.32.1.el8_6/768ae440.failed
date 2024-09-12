@@ -1,0 +1,173 @@
+x86/ftrace: Use text_poke()
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 768ae4406a5cab7e8702550f2446dbeb377b798d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/768ae440.failed
+
+Move ftrace over to using the generic x86 text_poke functions; this
+avoids having a second/different copy of that code around.
+
+This also avoids ftrace violating the (new) W^X rule and avoids
+fragmenting the kernel text page-tables, due to no longer having to
+toggle them RW.
+
+	Tested-by: Alexei Starovoitov <ast@kernel.org>
+	Tested-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Daniel Bristot de Oliveira <bristot@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/20191111132457.761255803@infradead.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 768ae4406a5cab7e8702550f2446dbeb377b798d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/ftrace.c
+diff --cc arch/x86/kernel/ftrace.c
+index 65f676625c82,3d8adeba2651..000000000000
+--- a/arch/x86/kernel/ftrace.c
++++ b/arch/x86/kernel/ftrace.c
+@@@ -38,9 -39,13 +40,8 @@@ static int ftrace_poke_late = 0
+  int ftrace_arch_code_modify_prepare(void)
+      __acquires(&text_mutex)
+  {
+ -	/*
+ -	 * Need to grab text_mutex to prevent a race from module loading
+ -	 * and live kernel patching from changing the text permissions while
+ -	 * ftrace has it set to "read/write".
+ -	 */
+  	mutex_lock(&text_mutex);
+- 	set_kernel_text_rw();
+- 	set_all_modules_text_rw();
++ 	ftrace_poke_late = 1;
+  	return 0;
+  }
+  
+@@@ -826,13 -417,14 +417,19 @@@ create_trampoline(struct ftrace_ops *op
+  	/* ALLOC_TRAMP flags lets us know we created it */
+  	ops->flags |= FTRACE_OPS_FL_ALLOC_TRAMP;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Module allocation needs to be completed by making the page
+ +	 * executable. The page is still writable, which is a security hazard,
+ +	 * but anyhow ftrace breaks W^X completely.
+ +	 */
+++=======
++ 	set_vm_flush_reset_perms(trampoline);
++ 
++ 	set_memory_ro((unsigned long)trampoline, npages);
+++>>>>>>> 768ae4406a5c (x86/ftrace: Use text_poke())
+  	set_memory_x((unsigned long)trampoline, npages);
+  	return (unsigned long)trampoline;
+ -fail:
+ -	tramp_free(trampoline);
+ -	return 0;
+  }
+  
+  static unsigned long calc_trampoline_call_offset(bool save_regs)
+diff --git a/arch/x86/include/asm/ftrace.h b/arch/x86/include/asm/ftrace.h
+index 8d662b45fe37..5bf6206a4079 100644
+--- a/arch/x86/include/asm/ftrace.h
++++ b/arch/x86/include/asm/ftrace.h
+@@ -47,8 +47,6 @@ struct dyn_arch_ftrace {
+ 	/* No extra data needed for x86 */
+ };
+ 
+-int ftrace_int3_handler(struct pt_regs *regs);
+-
+ #define FTRACE_GRAPH_TRAMP_ADDR FTRACE_GRAPH_ADDR
+ 
+ #endif /*  CONFIG_DYNAMIC_FTRACE */
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 57fff6ac78c6..1dd293b632e4 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -790,7 +790,7 @@ static struct bp_patching_desc {
+ 	int nr_entries;
+ } bp_patching;
+ 
+-static int patch_cmp(const void *key, const void *elt)
++static int notrace patch_cmp(const void *key, const void *elt)
+ {
+ 	struct text_poke_loc *tp = (struct text_poke_loc *) elt;
+ 
+@@ -802,7 +802,7 @@ static int patch_cmp(const void *key, const void *elt)
+ }
+ NOKPROBE_SYMBOL(patch_cmp);
+ 
+-int poke_int3_handler(struct pt_regs *regs)
++int notrace poke_int3_handler(struct pt_regs *regs)
+ {
+ 	struct text_poke_loc *tp;
+ 	void *ip;
+@@ -1056,10 +1056,15 @@ void text_poke_finish(void)
+ 	text_poke_flush(NULL);
+ }
+ 
+-void text_poke_queue(void *addr, const void *opcode, size_t len, const void *emulate)
++void __ref text_poke_queue(void *addr, const void *opcode, size_t len, const void *emulate)
+ {
+ 	struct text_poke_loc *tp;
+ 
++	if (unlikely(system_state == SYSTEM_BOOTING)) {
++		text_poke_early(addr, opcode, len);
++		return;
++	}
++
+ 	text_poke_flush(addr);
+ 
+ 	tp = &tp_vec[tp_vec_nr++];
+@@ -1077,10 +1082,15 @@ void text_poke_queue(void *addr, const void *opcode, size_t len, const void *emu
+  * dynamically allocated memory. This function should be used when it is
+  * not possible to allocate memory.
+  */
+-void text_poke_bp(void *addr, const void *opcode, size_t len, const void *emulate)
++void __ref text_poke_bp(void *addr, const void *opcode, size_t len, const void *emulate)
+ {
+ 	struct text_poke_loc tp;
+ 
++	if (unlikely(system_state == SYSTEM_BOOTING)) {
++		text_poke_early(addr, opcode, len);
++		return;
++	}
++
+ 	text_poke_loc_init(&tp, addr, opcode, len, emulate);
+ 	text_poke_bp_batch(&tp, 1);
+ }
+* Unmerged path arch/x86/kernel/ftrace.c
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index ae070300154c..b7c433d1e39d 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -521,15 +521,6 @@ NOKPROBE_SYMBOL(do_general_protection);
+ 
+ dotraplinkage void notrace do_int3(struct pt_regs *regs, long error_code)
+ {
+-#ifdef CONFIG_DYNAMIC_FTRACE
+-	/*
+-	 * ftrace must be first, everything else may cause a recursive crash.
+-	 * See note by declaration of modifying_ftrace_code in ftrace.c
+-	 */
+-	if (unlikely(atomic_read(&modifying_ftrace_code)) &&
+-	    ftrace_int3_handler(regs))
+-		return;
+-#endif
+ 	if (poke_int3_handler(regs))
+ 		return;
+ 
