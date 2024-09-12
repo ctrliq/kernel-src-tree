@@ -1,0 +1,118 @@
+vfio: Hold a reference to the iommu_group in kvm for SPAPR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 819da99a7360f7e197038d12f0eba626bde11856
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/819da99a.failed
+
+SPAPR exists completely outside the normal iommu driver framework, the
+groups it creates are fake and are only created to enable VFIO's uAPI.
+
+Thus, it does not need to follow the iommu core rule that the iommu_group
+will only be touched while a driver is attached.
+
+Carry a group reference into KVM and have KVM directly manage the lifetime
+of this object independently of VFIO. This means KVM no longer relies on
+the vfio group file being valid to maintain the group reference.
+
+	Tested-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Link: https://lore.kernel.org/r/2-v2-15417f29324e+1c-vfio_group_disassociate_jgg@nvidia.com
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 819da99a7360f7e197038d12f0eba626bde11856)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/vfio_main.c
+diff --cc drivers/vfio/vfio_main.c
+index eb849d5b81b0,911ee1abdff0..000000000000
+--- a/drivers/vfio/vfio_main.c
++++ b/drivers/vfio/vfio_main.c
+@@@ -2032,14 -1552,20 +2032,21 @@@ static const struct file_operations vfi
+   * vfio_file_iommu_group - Return the struct iommu_group for the vfio group file
+   * @file: VFIO group file
+   *
+++<<<<<<< HEAD
+ + * The returned iommu_group is valid as long as a ref is held on the file.
+++=======
++  * The returned iommu_group is valid as long as a ref is held on the file. This
++  * returns a reference on the group. This function is deprecated, only the SPAPR
++  * path in kvm should call it.
+++>>>>>>> 819da99a7360 (vfio: Hold a reference to the iommu_group in kvm for SPAPR)
+   */
+  struct iommu_group *vfio_file_iommu_group(struct file *file)
+  {
+  	struct vfio_group *group = file->private_data;
+  
+ -	if (!IS_ENABLED(CONFIG_SPAPR_TCE_IOMMU))
+ -		return NULL;
+ -
+ -	if (!vfio_file_is_group(file))
+ +	if (file->f_op != &vfio_group_fops)
+  		return NULL;
++ 	iommu_group_ref_get(group->iommu_group);
+  	return group->iommu_group;
+  }
+  EXPORT_SYMBOL_GPL(vfio_file_iommu_group);
+* Unmerged path drivers/vfio/vfio_main.c
+diff --git a/virt/kvm/vfio.c b/virt/kvm/vfio.c
+index ce1b01d02c51..842c0093dc5a 100644
+--- a/virt/kvm/vfio.c
++++ b/virt/kvm/vfio.c
+@@ -24,6 +24,9 @@
+ struct kvm_vfio_group {
+ 	struct list_head node;
+ 	struct file *file;
++#ifdef CONFIG_SPAPR_TCE_IOMMU
++	struct iommu_group *iommu_group;
++#endif
+ };
+ 
+ struct kvm_vfio {
+@@ -81,12 +84,12 @@ static struct iommu_group *kvm_vfio_file_iommu_group(struct file *file)
+ static void kvm_spapr_tce_release_vfio_group(struct kvm *kvm,
+ 					     struct kvm_vfio_group *kvg)
+ {
+-	struct iommu_group *grp = kvm_vfio_file_iommu_group(kvg->file);
+-
+-	if (WARN_ON_ONCE(!grp))
++	if (WARN_ON_ONCE(!kvg->iommu_group))
+ 		return;
+ 
+-	kvm_spapr_tce_release_iommu_group(kvm, grp);
++	kvm_spapr_tce_release_iommu_group(kvm, kvg->iommu_group);
++	iommu_group_put(kvg->iommu_group);
++	kvg->iommu_group = NULL;
+ }
+ #endif
+ 
+@@ -236,19 +239,19 @@ static int kvm_vfio_group_set_spapr_tce(struct kvm_device *dev,
+ 	mutex_lock(&kv->lock);
+ 
+ 	list_for_each_entry(kvg, &kv->group_list, node) {
+-		struct iommu_group *grp;
+-
+ 		if (kvg->file != f.file)
+ 			continue;
+ 
+-		grp = kvm_vfio_file_iommu_group(kvg->file);
+-		if (WARN_ON_ONCE(!grp)) {
+-			ret = -EIO;
+-			goto err_fdput;
++		if (!kvg->iommu_group) {
++			kvg->iommu_group = kvm_vfio_file_iommu_group(kvg->file);
++			if (WARN_ON_ONCE(!kvg->iommu_group)) {
++				ret = -EIO;
++				goto err_fdput;
++			}
+ 		}
+ 
+ 		ret = kvm_spapr_tce_attach_iommu_group(dev->kvm, param.tablefd,
+-						       grp);
++						       kvg->iommu_group);
+ 		break;
+ 	}
+ 
