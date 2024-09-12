@@ -1,0 +1,513 @@
+KVM: arm64: PMU: Don't overwrite PMUSERENR with vcpu loaded
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-512.el8
+commit-author Reiji Watanabe <reijiw@google.com>
+commit 0c2f9acf6ae74118385f7a7d48f4b2d93637b628
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-512.el8/0c2f9acf.failed
+
+Currently, with VHE, KVM sets ER, CR, SW and EN bits of
+PMUSERENR_EL0 to 1 on vcpu_load(), and saves and restores
+the register value for the host on vcpu_load() and vcpu_put().
+If the value of those bits are cleared on a pCPU with a vCPU
+loaded (armv8pmu_start() would do that when PMU counters are
+programmed for the guest), PMU access from the guest EL0 might
+be trapped to the guest EL1 directly regardless of the current
+PMUSERENR_EL0 value of the vCPU.
+
+Fix this by not letting armv8pmu_start() overwrite PMUSERENR_EL0
+on the pCPU where PMUSERENR_EL0 for the guest is loaded, and
+instead updating the saved shadow register value for the host
+so that the value can be restored on vcpu_put() later.
+While vcpu_{put,load}() are manipulating PMUSERENR_EL0, disable
+IRQs to prevent a race condition between these processes and IPIs
+that attempt to update PMUSERENR_EL0 for the host EL0.
+
+	Suggested-by: Mark Rutland <mark.rutland@arm.com>
+	Suggested-by: Marc Zyngier <maz@kernel.org>
+Fixes: 83a7a4d643d3 ("arm64: perf: Enable PMU counter userspace access for perf event")
+	Signed-off-by: Reiji Watanabe <reijiw@google.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/20230603025035.3781797-3-reijiw@google.com
+(cherry picked from commit 0c2f9acf6ae74118385f7a7d48f4b2d93637b628)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/include/asm/arm_pmuv3.h
+#	arch/arm64/include/asm/kvm_host.h
+#	arch/arm64/kernel/perf_event.c
+#	arch/arm64/kvm/hyp/include/hyp/switch.h
+#	arch/arm64/kvm/hyp/vhe/switch.c
+diff --cc arch/arm64/include/asm/kvm_host.h
+index 7f58bd229b69,9787503ff43f..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -377,11 -556,158 +377,156 @@@ struct kvm_vcpu_arch 
+  		u64 last_steal;
+  		gpa_t base;
+  	} steal;
+ -
+ -	/* Per-vcpu CCSIDR override or NULL */
+ -	u32 *ccsidr;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Each 'flag' is composed of a comma-separated triplet:
++  *
++  * - the flag-set it belongs to in the vcpu->arch structure
++  * - the value for that flag
++  * - the mask for that flag
++  *
++  *  __vcpu_single_flag() builds such a triplet for a single-bit flag.
++  * unpack_vcpu_flag() extract the flag value from the triplet for
++  * direct use outside of the flag accessors.
++  */
++ #define __vcpu_single_flag(_set, _f)	_set, (_f), (_f)
++ 
++ #define __unpack_flag(_set, _f, _m)	_f
++ #define unpack_vcpu_flag(...)		__unpack_flag(__VA_ARGS__)
++ 
++ #define __build_check_flag(v, flagset, f, m)			\
++ 	do {							\
++ 		typeof(v->arch.flagset) *_fset;			\
++ 								\
++ 		/* Check that the flags fit in the mask */	\
++ 		BUILD_BUG_ON(HWEIGHT(m) != HWEIGHT((f) | (m)));	\
++ 		/* Check that the flags fit in the type */	\
++ 		BUILD_BUG_ON((sizeof(*_fset) * 8) <= __fls(m));	\
++ 	} while (0)
++ 
++ #define __vcpu_get_flag(v, flagset, f, m)			\
++ 	({							\
++ 		__build_check_flag(v, flagset, f, m);		\
++ 								\
++ 		READ_ONCE(v->arch.flagset) & (m);		\
++ 	})
++ 
++ /*
++  * Note that the set/clear accessors must be preempt-safe in order to
++  * avoid nesting them with load/put which also manipulate flags...
++  */
++ #ifdef __KVM_NVHE_HYPERVISOR__
++ /* the nVHE hypervisor is always non-preemptible */
++ #define __vcpu_flags_preempt_disable()
++ #define __vcpu_flags_preempt_enable()
++ #else
++ #define __vcpu_flags_preempt_disable()	preempt_disable()
++ #define __vcpu_flags_preempt_enable()	preempt_enable()
++ #endif
++ 
++ #define __vcpu_set_flag(v, flagset, f, m)			\
++ 	do {							\
++ 		typeof(v->arch.flagset) *fset;			\
++ 								\
++ 		__build_check_flag(v, flagset, f, m);		\
++ 								\
++ 		fset = &v->arch.flagset;			\
++ 		__vcpu_flags_preempt_disable();			\
++ 		if (HWEIGHT(m) > 1)				\
++ 			*fset &= ~(m);				\
++ 		*fset |= (f);					\
++ 		__vcpu_flags_preempt_enable();			\
++ 	} while (0)
++ 
++ #define __vcpu_clear_flag(v, flagset, f, m)			\
++ 	do {							\
++ 		typeof(v->arch.flagset) *fset;			\
++ 								\
++ 		__build_check_flag(v, flagset, f, m);		\
++ 								\
++ 		fset = &v->arch.flagset;			\
++ 		__vcpu_flags_preempt_disable();			\
++ 		*fset &= ~(m);					\
++ 		__vcpu_flags_preempt_enable();			\
++ 	} while (0)
++ 
++ #define vcpu_get_flag(v, ...)	__vcpu_get_flag((v), __VA_ARGS__)
++ #define vcpu_set_flag(v, ...)	__vcpu_set_flag((v), __VA_ARGS__)
++ #define vcpu_clear_flag(v, ...)	__vcpu_clear_flag((v), __VA_ARGS__)
++ 
++ /* SVE exposed to guest */
++ #define GUEST_HAS_SVE		__vcpu_single_flag(cflags, BIT(0))
++ /* SVE config completed */
++ #define VCPU_SVE_FINALIZED	__vcpu_single_flag(cflags, BIT(1))
++ /* PTRAUTH exposed to guest */
++ #define GUEST_HAS_PTRAUTH	__vcpu_single_flag(cflags, BIT(2))
++ 
++ /* Exception pending */
++ #define PENDING_EXCEPTION	__vcpu_single_flag(iflags, BIT(0))
++ /*
++  * PC increment. Overlaps with EXCEPT_MASK on purpose so that it can't
++  * be set together with an exception...
++  */
++ #define INCREMENT_PC		__vcpu_single_flag(iflags, BIT(1))
++ /* Target EL/MODE (not a single flag, but let's abuse the macro) */
++ #define EXCEPT_MASK		__vcpu_single_flag(iflags, GENMASK(3, 1))
++ 
++ /* Helpers to encode exceptions with minimum fuss */
++ #define __EXCEPT_MASK_VAL	unpack_vcpu_flag(EXCEPT_MASK)
++ #define __EXCEPT_SHIFT		__builtin_ctzl(__EXCEPT_MASK_VAL)
++ #define __vcpu_except_flags(_f)	iflags, (_f << __EXCEPT_SHIFT), __EXCEPT_MASK_VAL
++ 
++ /*
++  * When PENDING_EXCEPTION is set, EXCEPT_MASK can take the following
++  * values:
++  *
++  * For AArch32 EL1:
++  */
++ #define EXCEPT_AA32_UND		__vcpu_except_flags(0)
++ #define EXCEPT_AA32_IABT	__vcpu_except_flags(1)
++ #define EXCEPT_AA32_DABT	__vcpu_except_flags(2)
++ /* For AArch64: */
++ #define EXCEPT_AA64_EL1_SYNC	__vcpu_except_flags(0)
++ #define EXCEPT_AA64_EL1_IRQ	__vcpu_except_flags(1)
++ #define EXCEPT_AA64_EL1_FIQ	__vcpu_except_flags(2)
++ #define EXCEPT_AA64_EL1_SERR	__vcpu_except_flags(3)
++ /* For AArch64 with NV: */
++ #define EXCEPT_AA64_EL2_SYNC	__vcpu_except_flags(4)
++ #define EXCEPT_AA64_EL2_IRQ	__vcpu_except_flags(5)
++ #define EXCEPT_AA64_EL2_FIQ	__vcpu_except_flags(6)
++ #define EXCEPT_AA64_EL2_SERR	__vcpu_except_flags(7)
++ /* Guest debug is live */
++ #define DEBUG_DIRTY		__vcpu_single_flag(iflags, BIT(4))
++ /* Save SPE context if active  */
++ #define DEBUG_STATE_SAVE_SPE	__vcpu_single_flag(iflags, BIT(5))
++ /* Save TRBE context if active  */
++ #define DEBUG_STATE_SAVE_TRBE	__vcpu_single_flag(iflags, BIT(6))
++ /* vcpu running in HYP context */
++ #define VCPU_HYP_CONTEXT	__vcpu_single_flag(iflags, BIT(7))
++ 
++ /* SVE enabled for host EL0 */
++ #define HOST_SVE_ENABLED	__vcpu_single_flag(sflags, BIT(0))
++ /* SME enabled for EL0 */
++ #define HOST_SME_ENABLED	__vcpu_single_flag(sflags, BIT(1))
++ /* Physical CPU not in supported_cpus */
++ #define ON_UNSUPPORTED_CPU	__vcpu_single_flag(sflags, BIT(2))
++ /* WFIT instruction trapped */
++ #define IN_WFIT			__vcpu_single_flag(sflags, BIT(3))
++ /* vcpu system registers loaded on physical CPU */
++ #define SYSREGS_ON_CPU		__vcpu_single_flag(sflags, BIT(4))
++ /* Software step state is Active-pending */
++ #define DBG_SS_ACTIVE_PENDING	__vcpu_single_flag(sflags, BIT(5))
++ /* PMUSERENR for the guest EL0 is on physical CPU */
++ #define PMUSERENR_ON_CPU	__vcpu_single_flag(sflags, BIT(6))
++ 
++ 
+++>>>>>>> 0c2f9acf6ae7 (KVM: arm64: PMU: Don't overwrite PMUSERENR with vcpu loaded)
+  /* Pointer to the vcpu's SVE FFR for sve_{save,load}_state() */
+ -#define vcpu_sve_pffr(vcpu) (kern_hyp_va((vcpu)->arch.sve_state) +	\
+ -			     sve_ffr_offset((vcpu)->arch.sve_max_vl))
+ -
+ -#define vcpu_sve_max_vq(vcpu)	sve_vq_from_vl((vcpu)->arch.sve_max_vl)
+ +#define vcpu_sve_pffr(vcpu) ((void *)((char *)((vcpu)->arch.sve_state) + \
+ +				      sve_ffr_offset((vcpu)->arch.sve_max_vl)))
+  
+  #define vcpu_sve_state_size(vcpu) ({					\
+  	size_t __size_ret;						\
+@@@ -629,54 -1063,20 +774,62 @@@ static inline bool kvm_pmu_counter_defe
+  #ifdef CONFIG_KVM
+  void kvm_set_pmu_events(u32 set, struct perf_event_attr *attr);
+  void kvm_clr_pmu_events(u32 clr);
+++<<<<<<< HEAD
+ +
+ +void kvm_vcpu_pmu_restore_guest(struct kvm_vcpu *vcpu);
+ +void kvm_vcpu_pmu_restore_host(struct kvm_vcpu *vcpu);
+++=======
++ bool kvm_set_pmuserenr(u64 val);
+++>>>>>>> 0c2f9acf6ae7 (KVM: arm64: PMU: Don't overwrite PMUSERENR with vcpu loaded)
+  #else
+  static inline void kvm_set_pmu_events(u32 set, struct perf_event_attr *attr) {}
+  static inline void kvm_clr_pmu_events(u32 clr) {}
++ static inline bool kvm_set_pmuserenr(u64 val)
++ {
++ 	return false;
++ }
+  #endif
+  
+ +#define KVM_BP_HARDEN_UNKNOWN		-1
+ +#define KVM_BP_HARDEN_WA_NEEDED		0
+ +#define KVM_BP_HARDEN_NOT_REQUIRED	1
+ +
+ +static inline int kvm_arm_harden_branch_predictor(void)
+ +{
+ +	switch (get_spectre_v2_workaround_state()) {
+ +	case ARM64_BP_HARDEN_WA_NEEDED:
+ +		return KVM_BP_HARDEN_WA_NEEDED;
+ +	case ARM64_BP_HARDEN_NOT_REQUIRED:
+ +		return KVM_BP_HARDEN_NOT_REQUIRED;
+ +	case ARM64_BP_HARDEN_UNKNOWN:
+ +	default:
+ +		return KVM_BP_HARDEN_UNKNOWN;
+ +	}
+ +}
+ +
+ +#define KVM_SSBD_UNKNOWN		-1
+ +#define KVM_SSBD_FORCE_DISABLE		0
+ +#define KVM_SSBD_KERNEL		1
+ +#define KVM_SSBD_FORCE_ENABLE		2
+ +#define KVM_SSBD_MITIGATED		3
+ +
+ +static inline int kvm_arm_have_ssbd(void)
+ +{
+ +	switch (arm64_get_ssbd_state()) {
+ +	case ARM64_SSBD_FORCE_DISABLE:
+ +		return KVM_SSBD_FORCE_DISABLE;
+ +	case ARM64_SSBD_KERNEL:
+ +		return KVM_SSBD_KERNEL;
+ +	case ARM64_SSBD_FORCE_ENABLE:
+ +		return KVM_SSBD_FORCE_ENABLE;
+ +	case ARM64_SSBD_MITIGATED:
+ +		return KVM_SSBD_MITIGATED;
+ +	case ARM64_SSBD_UNKNOWN:
+ +	default:
+ +		return KVM_SSBD_UNKNOWN;
+ +	}
+ +}
+ +
+  void kvm_vcpu_load_sysregs_vhe(struct kvm_vcpu *vcpu);
+  void kvm_vcpu_put_sysregs_vhe(struct kvm_vcpu *vcpu);
+  
+diff --cc arch/arm64/kernel/perf_event.c
+index a2f6186904fd,93b7edb5f1e7..000000000000
+--- a/arch/arm64/kernel/perf_event.c
++++ b/arch/arm64/kernel/perf_event.c
+@@@ -680,9 -677,25 +680,29 @@@ static inline u32 armv8pmu_getreset_fla
+  	return value;
+  }
+  
++ static void update_pmuserenr(u64 val)
++ {
++ 	lockdep_assert_irqs_disabled();
++ 
++ 	/*
++ 	 * The current PMUSERENR_EL0 value might be the value for the guest.
++ 	 * If that's the case, have KVM keep tracking of the register value
++ 	 * for the host EL0 so that KVM can restore it before returning to
++ 	 * the host EL0. Otherwise, update the register now.
++ 	 */
++ 	if (kvm_set_pmuserenr(val))
++ 		return;
++ 
++ 	write_pmuserenr(val);
++ }
++ 
+  static void armv8pmu_disable_user_access(void)
+  {
+++<<<<<<< HEAD:arch/arm64/kernel/perf_event.c
+ +	write_sysreg(0, pmuserenr_el0);
+++=======
++ 	update_pmuserenr(0);
+++>>>>>>> 0c2f9acf6ae7 (KVM: arm64: PMU: Don't overwrite PMUSERENR with vcpu loaded):drivers/perf/arm_pmuv3.c
+  }
+  
+  static void armv8pmu_enable_user_access(struct arm_pmu *cpu_pmu)
+@@@ -698,8 -711,7 +718,12 @@@
+  			armv8pmu_write_evcntr(i, 0);
+  	}
+  
+++<<<<<<< HEAD:arch/arm64/kernel/perf_event.c
+ +	write_sysreg(0, pmuserenr_el0);
+ +	write_sysreg(ARMV8_PMU_USERENR_ER | ARMV8_PMU_USERENR_CR, pmuserenr_el0);
+++=======
++ 	update_pmuserenr(ARMV8_PMU_USERENR_ER | ARMV8_PMU_USERENR_CR);
+++>>>>>>> 0c2f9acf6ae7 (KVM: arm64: PMU: Don't overwrite PMUSERENR with vcpu loaded):drivers/perf/arm_pmuv3.c
+  }
+  
+  static void armv8pmu_enable_event(struct perf_event *event)
+diff --cc arch/arm64/kvm/hyp/include/hyp/switch.h
+index 238c109f9a01,4fe217efa218..000000000000
+--- a/arch/arm64/kvm/hyp/include/hyp/switch.h
++++ b/arch/arm64/kvm/hyp/include/hyp/switch.h
+@@@ -92,15 -81,53 +92,49 @@@ static inline void __activate_traps_com
+  	 * counter, which could make a PMXEVCNTR_EL0 access UNDEF at
+  	 * EL1 instead of being trapped to EL2.
+  	 */
+++<<<<<<< HEAD
+ +	write_sysreg(0, pmselr_el0);
+ +	write_sysreg(ARMV8_PMU_USERENR_MASK, pmuserenr_el0);
+++=======
++ 	if (kvm_arm_support_pmu_v3()) {
++ 		struct kvm_cpu_context *hctxt;
++ 
++ 		write_sysreg(0, pmselr_el0);
++ 
++ 		hctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
++ 		ctxt_sys_reg(hctxt, PMUSERENR_EL0) = read_sysreg(pmuserenr_el0);
++ 		write_sysreg(ARMV8_PMU_USERENR_MASK, pmuserenr_el0);
++ 		vcpu_set_flag(vcpu, PMUSERENR_ON_CPU);
++ 	}
++ 
++ 	vcpu->arch.mdcr_el2_host = read_sysreg(mdcr_el2);
+++>>>>>>> 0c2f9acf6ae7 (KVM: arm64: PMU: Don't overwrite PMUSERENR with vcpu loaded)
+  	write_sysreg(vcpu->arch.mdcr_el2, mdcr_el2);
+ -
+ -	if (cpus_have_final_cap(ARM64_SME)) {
+ -		sysreg_clear_set_s(SYS_HFGRTR_EL2,
+ -				   HFGxTR_EL2_nSMPRI_EL1_MASK |
+ -				   HFGxTR_EL2_nTPIDR2_EL0_MASK,
+ -				   0);
+ -		sysreg_clear_set_s(SYS_HFGWTR_EL2,
+ -				   HFGxTR_EL2_nSMPRI_EL1_MASK |
+ -				   HFGxTR_EL2_nTPIDR2_EL0_MASK,
+ -				   0);
+ -	}
+  }
+  
+ -static inline void __deactivate_traps_common(struct kvm_vcpu *vcpu)
+ +static inline void __deactivate_traps_common(void)
+  {
+ -	write_sysreg(vcpu->arch.mdcr_el2_host, mdcr_el2);
+ -
+  	write_sysreg(0, hstr_el2);
+++<<<<<<< HEAD
+ +	write_sysreg(0, pmuserenr_el0);
+++=======
++ 	if (kvm_arm_support_pmu_v3()) {
++ 		struct kvm_cpu_context *hctxt;
++ 
++ 		hctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
++ 		write_sysreg(ctxt_sys_reg(hctxt, PMUSERENR_EL0), pmuserenr_el0);
++ 		vcpu_clear_flag(vcpu, PMUSERENR_ON_CPU);
++ 	}
++ 
++ 	if (cpus_have_final_cap(ARM64_SME)) {
++ 		sysreg_clear_set_s(SYS_HFGRTR_EL2, 0,
++ 				   HFGxTR_EL2_nSMPRI_EL1_MASK |
++ 				   HFGxTR_EL2_nTPIDR2_EL0_MASK);
++ 		sysreg_clear_set_s(SYS_HFGWTR_EL2, 0,
++ 				   HFGxTR_EL2_nSMPRI_EL1_MASK |
++ 				   HFGxTR_EL2_nTPIDR2_EL0_MASK);
++ 	}
+++>>>>>>> 0c2f9acf6ae7 (KVM: arm64: PMU: Don't overwrite PMUSERENR with vcpu loaded)
+  }
+  
+  static inline void ___activate_traps(struct kvm_vcpu *vcpu)
+diff --cc arch/arm64/kvm/hyp/vhe/switch.c
+index 8c97c98b2b31,b37e7c96efea..000000000000
+--- a/arch/arm64/kvm/hyp/vhe/switch.c
++++ b/arch/arm64/kvm/hyp/vhe/switch.c
+@@@ -86,22 -92,68 +86,41 @@@ static void __deactivate_traps(struct k
+  }
+  NOKPROBE_SYMBOL(__deactivate_traps);
+  
++ /*
++  * Disable IRQs in {activate,deactivate}_traps_vhe_{load,put}() to
++  * prevent a race condition between context switching of PMUSERENR_EL0
++  * in __{activate,deactivate}_traps_common() and IPIs that attempts to
++  * update PMUSERENR_EL0. See also kvm_set_pmuserenr().
++  */
+  void activate_traps_vhe_load(struct kvm_vcpu *vcpu)
+  {
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
+  	__activate_traps_common(vcpu);
++ 	local_irq_restore(flags);
+  }
+  
+ -void deactivate_traps_vhe_put(struct kvm_vcpu *vcpu)
+ +void deactivate_traps_vhe_put(void)
+  {
+++<<<<<<< HEAD
+ +	u64 mdcr_el2 = read_sysreg(mdcr_el2);
+++=======
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 	__deactivate_traps_common(vcpu);
++ 	local_irq_restore(flags);
++ }
+++>>>>>>> 0c2f9acf6ae7 (KVM: arm64: PMU: Don't overwrite PMUSERENR with vcpu loaded)
+  
+ -static const exit_handler_fn hyp_exit_handlers[] = {
+ -	[0 ... ESR_ELx_EC_MAX]		= NULL,
+ -	[ESR_ELx_EC_CP15_32]		= kvm_hyp_handle_cp15_32,
+ -	[ESR_ELx_EC_SYS64]		= kvm_hyp_handle_sysreg,
+ -	[ESR_ELx_EC_SVE]		= kvm_hyp_handle_fpsimd,
+ -	[ESR_ELx_EC_FP_ASIMD]		= kvm_hyp_handle_fpsimd,
+ -	[ESR_ELx_EC_IABT_LOW]		= kvm_hyp_handle_iabt_low,
+ -	[ESR_ELx_EC_DABT_LOW]		= kvm_hyp_handle_dabt_low,
+ -	[ESR_ELx_EC_WATCHPT_LOW]	= kvm_hyp_handle_watchpt_low,
+ -	[ESR_ELx_EC_PAC]		= kvm_hyp_handle_ptrauth,
+ -};
+ -
+ -static const exit_handler_fn *kvm_get_exit_handler_array(struct kvm_vcpu *vcpu)
+ -{
+ -	return hyp_exit_handlers;
+ -}
+ +	mdcr_el2 &= MDCR_EL2_HPMN_MASK |
+ +		    MDCR_EL2_E2PB_MASK << MDCR_EL2_E2PB_SHIFT |
+ +		    MDCR_EL2_TPMS;
+  
+ -static void early_exit_filter(struct kvm_vcpu *vcpu, u64 *exit_code)
+ -{
+ -	/*
+ -	 * If we were in HYP context on entry, adjust the PSTATE view
+ -	 * so that the usual helpers work correctly.
+ -	 */
+ -	if (unlikely(vcpu_get_flag(vcpu, VCPU_HYP_CONTEXT))) {
+ -		u64 mode = *vcpu_cpsr(vcpu) & (PSR_MODE_MASK | PSR_MODE32_BIT);
+ -
+ -		switch (mode) {
+ -		case PSR_MODE_EL1t:
+ -			mode = PSR_MODE_EL2t;
+ -			break;
+ -		case PSR_MODE_EL1h:
+ -			mode = PSR_MODE_EL2h;
+ -			break;
+ -		}
+ -
+ -		*vcpu_cpsr(vcpu) &= ~(PSR_MODE_MASK | PSR_MODE32_BIT);
+ -		*vcpu_cpsr(vcpu) |= mode;
+ -	}
+ +	write_sysreg(mdcr_el2, mdcr_el2);
+ +
+ +	__deactivate_traps_common();
+  }
+  
+  /* Switch to the guest for VHE systems running in EL2 */
+* Unmerged path arch/arm/include/asm/arm_pmuv3.h
+* Unmerged path arch/arm/include/asm/arm_pmuv3.h
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+* Unmerged path arch/arm64/kernel/perf_event.c
+* Unmerged path arch/arm64/kvm/hyp/include/hyp/switch.h
+* Unmerged path arch/arm64/kvm/hyp/vhe/switch.c
+diff --git a/arch/arm64/kvm/pmu.c b/arch/arm64/kvm/pmu.c
+index 3c224162b3dd..52ed99e2bdc8 100644
+--- a/arch/arm64/kvm/pmu.c
++++ b/arch/arm64/kvm/pmu.c
+@@ -200,3 +200,30 @@ void kvm_vcpu_pmu_restore_host(struct kvm_vcpu *vcpu)
+ 	kvm_vcpu_pmu_enable_el0(events_host);
+ 	kvm_vcpu_pmu_disable_el0(events_guest);
+ }
++
++/*
++ * With VHE, keep track of the PMUSERENR_EL0 value for the host EL0 on the pCPU
++ * where PMUSERENR_EL0 for the guest is loaded, since PMUSERENR_EL0 is switched
++ * to the value for the guest on vcpu_load().  The value for the host EL0
++ * will be restored on vcpu_put(), before returning to userspace.
++ * This isn't necessary for nVHE, as the register is context switched for
++ * every guest enter/exit.
++ *
++ * Return true if KVM takes care of the register. Otherwise return false.
++ */
++bool kvm_set_pmuserenr(u64 val)
++{
++	struct kvm_cpu_context *hctxt;
++	struct kvm_vcpu *vcpu;
++
++	if (!kvm_arm_support_pmu_v3() || !has_vhe())
++		return false;
++
++	vcpu = kvm_get_running_vcpu();
++	if (!vcpu || !vcpu_get_flag(vcpu, PMUSERENR_ON_CPU))
++		return false;
++
++	hctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
++	ctxt_sys_reg(hctxt, PMUSERENR_EL0) = val;
++	return true;
++}
