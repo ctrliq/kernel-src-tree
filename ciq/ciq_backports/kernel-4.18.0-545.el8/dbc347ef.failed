@@ -1,0 +1,170 @@
+ceph: add ceph_cap_unlink_work to fire check_caps() immediately
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-545.el8
+commit-author Xiubo Li <xiubli@redhat.com>
+commit dbc347ef7f0c53aa4a5383238a804d7ebbb0b5ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-545.el8/dbc347ef.failed
+
+When unlinking a file the check caps could be delayed for more than
+5 seconds, but in MDS side it maybe waiting for the clients to
+release caps.
+
+This will use the cap_wq work queue and a dedicated list to help
+fire the check_caps() and dirty buffer flushing immediately.
+
+Link: https://tracker.ceph.com/issues/50223
+	Signed-off-by: Xiubo Li <xiubli@redhat.com>
+	Reviewed-by: Milind Changire <mchangir@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit dbc347ef7f0c53aa4a5383238a804d7ebbb0b5ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/caps.c
+diff --cc fs/ceph/caps.c
+index b45313271f21,7fb4aae97412..000000000000
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@@ -4502,8 -4771,23 +4502,28 @@@ int ceph_drop_caps_for_unlink(struct in
+  
+  		if (__ceph_caps_dirty(ci)) {
+  			struct ceph_mds_client *mdsc =
+++<<<<<<< HEAD
+ +				ceph_inode_to_client(inode)->mdsc;
+ +			__cap_delay_requeue_front(mdsc, ci);
+++=======
++ 				ceph_inode_to_fs_client(inode)->mdsc;
++ 
++ 			doutc(mdsc->fsc->client, "%p %llx.%llx\n", inode,
++ 			      ceph_vinop(inode));
++ 			spin_lock(&mdsc->cap_unlink_delay_lock);
++ 			ci->i_ceph_flags |= CEPH_I_FLUSH;
++ 			if (!list_empty(&ci->i_cap_delay_list))
++ 				list_del_init(&ci->i_cap_delay_list);
++ 			list_add_tail(&ci->i_cap_delay_list,
++ 				      &mdsc->cap_unlink_delay_list);
++ 			spin_unlock(&mdsc->cap_unlink_delay_lock);
++ 
++ 			/*
++ 			 * Fire the work immediately, because the MDS maybe
++ 			 * waiting for caps release.
++ 			 */
++ 			ceph_queue_cap_unlink_work(mdsc);
+++>>>>>>> dbc347ef7f0c (ceph: add ceph_cap_unlink_work to fire check_caps() immediately)
+  		}
+  	}
+  	spin_unlock(&ci->i_ceph_lock);
+* Unmerged path fs/ceph/caps.c
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index 99b68cd627d3..5ac9a1610c0c 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -2252,6 +2252,50 @@ void ceph_reclaim_caps_nr(struct ceph_mds_client *mdsc, int nr)
+ 	}
+ }
+ 
++void ceph_queue_cap_unlink_work(struct ceph_mds_client *mdsc)
++{
++	struct ceph_client *cl = mdsc->fsc->client;
++	if (mdsc->stopping)
++		return;
++
++        if (queue_work(mdsc->fsc->cap_wq, &mdsc->cap_unlink_work)) {
++                doutc(cl, "caps unlink work queued\n");
++        } else {
++                doutc(cl, "failed to queue caps unlink work\n");
++        }
++}
++
++static void ceph_cap_unlink_work(struct work_struct *work)
++{
++	struct ceph_mds_client *mdsc =
++		container_of(work, struct ceph_mds_client, cap_unlink_work);
++	struct ceph_client *cl = mdsc->fsc->client;
++
++	doutc(cl, "begin\n");
++	spin_lock(&mdsc->cap_unlink_delay_lock);
++	while (!list_empty(&mdsc->cap_unlink_delay_list)) {
++		struct ceph_inode_info *ci;
++		struct inode *inode;
++
++		ci = list_first_entry(&mdsc->cap_unlink_delay_list,
++				      struct ceph_inode_info,
++				      i_cap_delay_list);
++		list_del_init(&ci->i_cap_delay_list);
++
++		inode = igrab(&ci->netfs.inode);
++		if (inode) {
++			spin_unlock(&mdsc->cap_unlink_delay_lock);
++			doutc(cl, "on %p %llx.%llx\n", inode,
++			      ceph_vinop(inode));
++			ceph_check_caps(ci, CHECK_CAPS_FLUSH);
++			iput(inode);
++			spin_lock(&mdsc->cap_unlink_delay_lock);
++		}
++	}
++	spin_unlock(&mdsc->cap_unlink_delay_lock);
++	doutc(cl, "done\n");
++}
++
+ /*
+  * requests
+  */
+@@ -4790,6 +4834,8 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
+ 	INIT_LIST_HEAD(&mdsc->cap_delay_list);
+ 	INIT_LIST_HEAD(&mdsc->cap_wait_list);
+ 	spin_lock_init(&mdsc->cap_delay_lock);
++	INIT_LIST_HEAD(&mdsc->cap_unlink_delay_list);
++	spin_lock_init(&mdsc->cap_unlink_delay_lock);
+ 	INIT_LIST_HEAD(&mdsc->snap_flush_list);
+ 	spin_lock_init(&mdsc->snap_flush_lock);
+ 	mdsc->last_cap_flush_tid = 1;
+@@ -4798,6 +4844,7 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
+ 	spin_lock_init(&mdsc->cap_dirty_lock);
+ 	init_waitqueue_head(&mdsc->cap_flushing_wq);
+ 	INIT_WORK(&mdsc->cap_reclaim_work, ceph_cap_reclaim_work);
++	INIT_WORK(&mdsc->cap_unlink_work, ceph_cap_unlink_work);
+ 	err = ceph_metric_init(&mdsc->metric);
+ 	if (err)
+ 		goto err_mdsmap;
+@@ -5046,6 +5093,7 @@ void ceph_mdsc_close_sessions(struct ceph_mds_client *mdsc)
+ 	ceph_cleanup_empty_realms(mdsc);
+ 
+ 	cancel_work_sync(&mdsc->cap_reclaim_work);
++	cancel_work_sync(&mdsc->cap_unlink_work);
+ 	cancel_delayed_work_sync(&mdsc->delayed_work); /* cancel timer */
+ 
+ 	dout("stopped\n");
+diff --git a/fs/ceph/mds_client.h b/fs/ceph/mds_client.h
+index e4ae1dd12a63..5b8a80a253da 100644
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@ -421,6 +421,8 @@ struct ceph_mds_client {
+ 	unsigned long    last_renew_caps;  /* last time we renewed our caps */
+ 	struct list_head cap_delay_list;   /* caps with delayed release */
+ 	spinlock_t       cap_delay_lock;   /* protects cap_delay_list */
++	struct list_head cap_unlink_delay_list;  /* caps with delayed release for unlink */
++	spinlock_t       cap_unlink_delay_lock;  /* protects cap_unlink_delay_list */
+ 	struct list_head snap_flush_list;  /* cap_snaps ready to flush */
+ 	spinlock_t       snap_flush_lock;
+ 
+@@ -434,6 +436,8 @@ struct ceph_mds_client {
+ 	struct work_struct cap_reclaim_work;
+ 	atomic_t	   cap_reclaim_pending;
+ 
++	struct work_struct cap_unlink_work;
++
+ 	/*
+ 	 * Cap reservations
+ 	 *
+@@ -530,6 +534,7 @@ extern void ceph_flush_cap_releases(struct ceph_mds_client *mdsc,
+ 				    struct ceph_mds_session *session);
+ extern void ceph_queue_cap_reclaim_work(struct ceph_mds_client *mdsc);
+ extern void ceph_reclaim_caps_nr(struct ceph_mds_client *mdsc, int nr);
++extern void ceph_queue_cap_unlink_work(struct ceph_mds_client *mdsc);
+ extern int ceph_iterate_session_caps(struct ceph_mds_session *session,
+ 				     int (*cb)(struct inode *, int mds, void *),
+ 				     void *arg);
