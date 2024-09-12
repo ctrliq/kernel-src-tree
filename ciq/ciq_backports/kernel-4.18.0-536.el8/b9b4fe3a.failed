@@ -1,0 +1,251 @@
+x86/hyperv: Use TDX GHCI to access some MSRs in a TDX VM with the paravisor
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-536.el8
+commit-author Dexuan Cui <decui@microsoft.com>
+commit b9b4fe3a72b60c8d74a9ffb61aa778f04eaddd87
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-536.el8/b9b4fe3a.failed
+
+When the paravisor is present, a SNP VM must use GHCB to access some
+special MSRs, including HV_X64_MSR_GUEST_OS_ID and some SynIC MSRs.
+
+Similarly, when the paravisor is present, a TDX VM must use TDX GHCI
+to access the same MSRs.
+
+Implement hv_tdx_msr_write() and hv_tdx_msr_read(), and use the helper
+functions hv_ivm_msr_read() and hv_ivm_msr_write() to access the MSRs
+in a unified way for SNP/TDX VMs with the paravisor.
+
+Do not export hv_tdx_msr_write() and hv_tdx_msr_read(), because we never
+really used hv_ghcb_msr_write() and hv_ghcb_msr_read() in any module.
+
+Update arch/x86/include/asm/mshyperv.h so that the kernel can still build
+if CONFIG_AMD_MEM_ENCRYPT or CONFIG_INTEL_TDX_GUEST is not set, or
+neither is set.
+
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Reviewed-by: Tianyu Lan <tiala@microsoft.com>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+Link: https://lore.kernel.org/r/20230824080712.30327-9-decui@microsoft.com
+(cherry picked from commit b9b4fe3a72b60c8d74a9ffb61aa778f04eaddd87)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/ivm.c
+#	arch/x86/include/asm/mshyperv.h
+diff --cc arch/x86/hyperv/ivm.c
+index 5648efb6c73e,fbc07493fcb4..000000000000
+--- a/arch/x86/hyperv/ivm.c
++++ b/arch/x86/hyperv/ivm.c
+@@@ -13,8 -13,18 +13,19 @@@
+  #include <asm/svm.h>
+  #include <asm/sev.h>
+  #include <asm/io.h>
+ -#include <asm/coco.h>
+ -#include <asm/mem_encrypt.h>
+  #include <asm/mshyperv.h>
+  #include <asm/hypervisor.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/mtrr.h>
++ #include <asm/coco.h>
++ #include <asm/io_apic.h>
++ #include <asm/sev.h>
++ #include <asm/realmode.h>
++ #include <asm/e820/api.h>
++ #include <asm/desc.h>
++ #include <uapi/asm/vmx.h>
+++>>>>>>> b9b4fe3a72b6 (x86/hyperv: Use TDX GHCI to access some MSRs in a TDX VM with the paravisor)
+  
+  #ifdef CONFIG_AMD_MEM_ENCRYPT
+  
+@@@ -232,9 -246,72 +242,78 @@@ static void hv_ghcb_msr_read(u64 msr, u
+  			| ((u64)lower_32_bits(hv_ghcb->ghcb.save.rdx) << 32);
+  	local_irq_restore(flags);
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(hv_ghcb_msr_read);
+ +#endif
+ +
+++=======
++ 
++ #else
++ static inline void hv_ghcb_msr_write(u64 msr, u64 value) {}
++ static inline void hv_ghcb_msr_read(u64 msr, u64 *value) {}
++ #endif /* CONFIG_AMD_MEM_ENCRYPT */
++ 
++ #ifdef CONFIG_INTEL_TDX_GUEST
++ static void hv_tdx_msr_write(u64 msr, u64 val)
++ {
++ 	struct tdx_hypercall_args args = {
++ 		.r10 = TDX_HYPERCALL_STANDARD,
++ 		.r11 = EXIT_REASON_MSR_WRITE,
++ 		.r12 = msr,
++ 		.r13 = val,
++ 	};
++ 
++ 	u64 ret = __tdx_hypercall(&args);
++ 
++ 	WARN_ONCE(ret, "Failed to emulate MSR write: %lld\n", ret);
++ }
++ 
++ static void hv_tdx_msr_read(u64 msr, u64 *val)
++ {
++ 	struct tdx_hypercall_args args = {
++ 		.r10 = TDX_HYPERCALL_STANDARD,
++ 		.r11 = EXIT_REASON_MSR_READ,
++ 		.r12 = msr,
++ 	};
++ 
++ 	u64 ret = __tdx_hypercall_ret(&args);
++ 
++ 	if (WARN_ONCE(ret, "Failed to emulate MSR read: %lld\n", ret))
++ 		*val = 0;
++ 	else
++ 		*val = args.r11;
++ }
++ #else
++ static inline void hv_tdx_msr_write(u64 msr, u64 value) {}
++ static inline void hv_tdx_msr_read(u64 msr, u64 *value) {}
++ #endif /* CONFIG_INTEL_TDX_GUEST */
++ 
++ #if defined(CONFIG_AMD_MEM_ENCRYPT) || defined(CONFIG_INTEL_TDX_GUEST)
++ void hv_ivm_msr_write(u64 msr, u64 value)
++ {
++ 	if (!ms_hyperv.paravisor_present)
++ 		return;
++ 
++ 	if (hv_isolation_type_tdx())
++ 		hv_tdx_msr_write(msr, value);
++ 	else if (hv_isolation_type_snp())
++ 		hv_ghcb_msr_write(msr, value);
++ }
++ 
++ void hv_ivm_msr_read(u64 msr, u64 *value)
++ {
++ 	if (!ms_hyperv.paravisor_present)
++ 		return;
++ 
++ 	if (hv_isolation_type_tdx())
++ 		hv_tdx_msr_read(msr, value);
++ 	else if (hv_isolation_type_snp())
++ 		hv_ghcb_msr_read(msr, value);
++ }
++ #endif
++ 
++ #if defined(CONFIG_AMD_MEM_ENCRYPT) || defined(CONFIG_INTEL_TDX_GUEST)
+++>>>>>>> b9b4fe3a72b6 (x86/hyperv: Use TDX GHCI to access some MSRs in a TDX VM with the paravisor)
+  /*
+   * hv_mark_gpa_visibility - Set pages visible to host via hvcall.
+   *
+diff --cc arch/x86/include/asm/mshyperv.h
+index a56488c7d1a0,101f71b85cfd..000000000000
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@@ -242,22 -269,33 +242,31 @@@ static inline void hv_apic_init(void) {
+  #endif
+  
+  struct irq_domain *hv_create_pci_msi_domain(void);
+ -
+ -int hv_map_ioapic_interrupt(int ioapic_id, bool level, int vcpu, int vector,
+ -		struct hv_interrupt_entry *entry);
+ -int hv_unmap_ioapic_interrupt(int ioapic_id, struct hv_interrupt_entry *entry);
+ +int hv_set_mem_host_visibility(unsigned long addr, int numpages, bool visible);
+  
+  #ifdef CONFIG_AMD_MEM_ENCRYPT
+- void hv_ghcb_msr_write(u64 msr, u64 value);
+- void hv_ghcb_msr_read(u64 msr, u64 *value);
+  bool hv_ghcb_negotiate_protocol(void);
+ -void __noreturn hv_ghcb_terminate(unsigned int set, unsigned int reason);
+ -int hv_snp_boot_ap(int cpu, unsigned long start_ip);
+ +void hv_ghcb_terminate(unsigned int set, unsigned int reason);
+  #else
+- static inline void hv_ghcb_msr_write(u64 msr, u64 value) {}
+- static inline void hv_ghcb_msr_read(u64 msr, u64 *value) {}
+  static inline bool hv_ghcb_negotiate_protocol(void) { return false; }
+  static inline void hv_ghcb_terminate(unsigned int set, unsigned int reason) {}
+ -static inline int hv_snp_boot_ap(int cpu, unsigned long start_ip) { return 0; }
+  #endif
+  
+  extern bool hv_isolation_type_snp(void);
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_AMD_MEM_ENCRYPT) || defined(CONFIG_INTEL_TDX_GUEST)
++ void hv_vtom_init(void);
++ void hv_ivm_msr_write(u64 msr, u64 value);
++ void hv_ivm_msr_read(u64 msr, u64 *value);
++ #else
++ static inline void hv_vtom_init(void) {}
++ static inline void hv_ivm_msr_write(u64 msr, u64 value) {}
++ static inline void hv_ivm_msr_read(u64 msr, u64 *value) {}
++ #endif
++ 
+++>>>>>>> b9b4fe3a72b6 (x86/hyperv: Use TDX GHCI to access some MSRs in a TDX VM with the paravisor)
+  static inline bool hv_is_synic_reg(unsigned int reg)
+  {
+  	return (reg >= HV_REGISTER_SCONTROL) &&
+diff --git a/arch/x86/hyperv/hv_init.c b/arch/x86/hyperv/hv_init.c
+index 1d0a26104d0f..a494fa6d5798 100644
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@ -443,8 +443,8 @@ void __init hyperv_init(void)
+ 	guest_id = hv_generate_guest_id(LINUX_VERSION_CODE);
+ 	wrmsrl(HV_X64_MSR_GUEST_OS_ID, guest_id);
+ 
+-	/* Hyper-V requires to write guest os id via ghcb in SNP IVM. */
+-	hv_ghcb_msr_write(HV_X64_MSR_GUEST_OS_ID, guest_id);
++	/* With the paravisor, the VM must also write the ID via GHCB/GHCI */
++	hv_ivm_msr_write(HV_X64_MSR_GUEST_OS_ID, guest_id);
+ 
+ 	hv_hypercall_pg = __vmalloc_node_range(PAGE_SIZE, 1, VMALLOC_START,
+ 			VMALLOC_END, GFP_KERNEL, PAGE_KERNEL_ROX,
+@@ -534,7 +534,7 @@ void __init hyperv_init(void)
+ 
+ clean_guest_os_id:
+ 	wrmsrl(HV_X64_MSR_GUEST_OS_ID, 0);
+-	hv_ghcb_msr_write(HV_X64_MSR_GUEST_OS_ID, 0);
++	hv_ivm_msr_write(HV_X64_MSR_GUEST_OS_ID, 0);
+ 	cpuhp_remove_state(cpuhp);
+ free_ghcb_page:
+ 	free_percpu(hv_ghcb_pg);
+@@ -555,7 +555,7 @@ void hyperv_cleanup(void)
+ 
+ 	/* Reset our OS id */
+ 	wrmsrl(HV_X64_MSR_GUEST_OS_ID, 0);
+-	hv_ghcb_msr_write(HV_X64_MSR_GUEST_OS_ID, 0);
++	hv_ivm_msr_write(HV_X64_MSR_GUEST_OS_ID, 0);
+ 
+ 	/*
+ 	 * Reset hypercall page reference before reset the page,
+* Unmerged path arch/x86/hyperv/ivm.c
+* Unmerged path arch/x86/include/asm/mshyperv.h
+diff --git a/arch/x86/kernel/cpu/mshyperv.c b/arch/x86/kernel/cpu/mshyperv.c
+index 1189865ffc68..7e30dc456b6f 100644
+--- a/arch/x86/kernel/cpu/mshyperv.c
++++ b/arch/x86/kernel/cpu/mshyperv.c
+@@ -70,8 +70,8 @@ u64 hv_get_non_nested_register(unsigned int reg)
+ {
+ 	u64 value;
+ 
+-	if (hv_is_synic_reg(reg) && hv_isolation_type_snp())
+-		hv_ghcb_msr_read(reg, &value);
++	if (hv_is_synic_reg(reg) && ms_hyperv.paravisor_present)
++		hv_ivm_msr_read(reg, &value);
+ 	else
+ 		rdmsrl(reg, value);
+ 	return value;
+@@ -80,8 +80,8 @@ EXPORT_SYMBOL_GPL(hv_get_non_nested_register);
+ 
+ void hv_set_non_nested_register(unsigned int reg, u64 value)
+ {
+-	if (hv_is_synic_reg(reg) && hv_isolation_type_snp()) {
+-		hv_ghcb_msr_write(reg, value);
++	if (hv_is_synic_reg(reg) && ms_hyperv.paravisor_present) {
++		hv_ivm_msr_write(reg, value);
+ 
+ 		/* Write proxy bit via wrmsl instruction */
+ 		if (hv_is_sint_reg(reg))
