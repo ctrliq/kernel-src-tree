@@ -1,0 +1,176 @@
+vdpa: Allow to configure max data virtqueues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Eli Cohen <elic@nvidia.com>
+commit aba21aff772b8622e08f07219069be793429a48f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/aba21aff.failed
+
+Add netlink support to configure the max virtqueue pairs for a device.
+At least one pair is required. The maximum is dictated by the device.
+
+Example:
+$ vdpa dev add name vdpa-a mgmtdev auxiliary/mlx5_core.sf.1 max_vqp 4
+
+	Signed-off-by: Eli Cohen <elic@nvidia.com>
+Link: https://lore.kernel.org/r/20220105114646.577224-6-elic@nvidia.com
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+(cherry picked from commit aba21aff772b8622e08f07219069be793429a48f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vdpa/vdpa.c
+#	include/linux/vdpa.h
+diff --cc drivers/vdpa/vdpa.c
+index 2703bbc9306a,96d31b80fdce..000000000000
+--- a/drivers/vdpa/vdpa.c
++++ b/drivers/vdpa/vdpa.c
+@@@ -582,9 -580,16 +582,16 @@@ out
+  	return msg->len;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define VDPA_DEV_NET_ATTRS_MASK ((1 << VDPA_ATTR_DEV_NET_CFG_MACADDR) | \
++ 				 (1 << VDPA_ATTR_DEV_NET_CFG_MTU) | \
++ 				 (1 << VDPA_ATTR_DEV_NET_CFG_MAX_VQP))
++ 
+++>>>>>>> aba21aff772b (vdpa: Allow to configure max data virtqueues)
+  static int vdpa_nl_cmd_dev_add_set_doit(struct sk_buff *skb, struct genl_info *info)
+  {
+ -	struct vdpa_dev_set_config config = {};
+ -	struct nlattr **nl_attrs = info->attrs;
+  	struct vdpa_mgmt_dev *mdev;
+ -	const u8 *macaddr;
+  	const char *name;
+  	int err = 0;
+  
+@@@ -593,6 -598,36 +600,39 @@@
+  
+  	name = nla_data(info->attrs[VDPA_ATTR_DEV_NAME]);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (nl_attrs[VDPA_ATTR_DEV_NET_CFG_MACADDR]) {
++ 		macaddr = nla_data(nl_attrs[VDPA_ATTR_DEV_NET_CFG_MACADDR]);
++ 		memcpy(config.net.mac, macaddr, sizeof(config.net.mac));
++ 		config.mask |= (1 << VDPA_ATTR_DEV_NET_CFG_MACADDR);
++ 	}
++ 	if (nl_attrs[VDPA_ATTR_DEV_NET_CFG_MTU]) {
++ 		config.net.mtu =
++ 			nla_get_u16(nl_attrs[VDPA_ATTR_DEV_NET_CFG_MTU]);
++ 		config.mask |= (1 << VDPA_ATTR_DEV_NET_CFG_MTU);
++ 	}
++ 	if (nl_attrs[VDPA_ATTR_DEV_NET_CFG_MAX_VQP]) {
++ 		config.net.max_vq_pairs =
++ 			nla_get_u16(nl_attrs[VDPA_ATTR_DEV_NET_CFG_MAX_VQP]);
++ 		if (!config.net.max_vq_pairs) {
++ 			NL_SET_ERR_MSG_MOD(info->extack,
++ 					   "At least one pair of VQs is required");
++ 			return -EINVAL;
++ 		}
++ 		config.mask |= BIT_ULL(VDPA_ATTR_DEV_NET_CFG_MAX_VQP);
++ 	}
++ 
++ 	/* Skip checking capability if user didn't prefer to configure any
++ 	 * device networking attributes. It is likely that user might have used
++ 	 * a device specific method to configure such attributes or using device
++ 	 * default attributes.
++ 	 */
++ 	if ((config.mask & VDPA_DEV_NET_ATTRS_MASK) &&
++ 	    !netlink_capable(skb, CAP_NET_ADMIN))
++ 		return -EPERM;
++ 
+++>>>>>>> aba21aff772b (vdpa: Allow to configure max data virtqueues)
+  	mutex_lock(&vdpa_dev_mutex);
+  	mdev = vdpa_mgmtdev_get_from_attr(info->attrs);
+  	if (IS_ERR(mdev)) {
+diff --cc include/linux/vdpa.h
+index a32e0e9b012d,6d4d7e4fe208..000000000000
+--- a/include/linux/vdpa.h
++++ b/include/linux/vdpa.h
+@@@ -95,6 -97,15 +95,18 @@@ struct vdpa_iova_range 
+  	u64 last;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct vdpa_dev_set_config {
++ 	struct {
++ 		u8 mac[ETH_ALEN];
++ 		u16 mtu;
++ 		u16 max_vq_pairs;
++ 	} net;
++ 	u64 mask;
++ };
++ 
+++>>>>>>> aba21aff772b (vdpa: Allow to configure max data virtqueues)
+  /**
+   * Corresponding file area for device memory mapping
+   * @file: vma->vm_file for the mapping
+@@@ -377,17 -392,29 +389,33 @@@ static inline struct device *vdpa_get_d
+  static inline int vdpa_reset(struct vdpa_device *vdev)
+  {
+  	const struct vdpa_config_ops *ops = vdev->config;
++ 	int ret;
+  
++ 	mutex_lock(&vdev->cf_mutex);
+  	vdev->features_valid = false;
+- 	return ops->reset(vdev);
++ 	ret = ops->reset(vdev);
++ 	mutex_unlock(&vdev->cf_mutex);
++ 	return ret;
+  }
+  
+- static inline int vdpa_set_features(struct vdpa_device *vdev, u64 features)
++ static inline int vdpa_set_features(struct vdpa_device *vdev, u64 features, bool locked)
+  {
+  	const struct vdpa_config_ops *ops = vdev->config;
++ 	int ret;
++ 
++ 	if (!locked)
++ 		mutex_lock(&vdev->cf_mutex);
+  
+  	vdev->features_valid = true;
+++<<<<<<< HEAD
+ +	return ops->set_features(vdev, features);
+++=======
++ 	ret = ops->set_driver_features(vdev, features);
++ 	if (!locked)
++ 		mutex_unlock(&vdev->cf_mutex);
++ 
++ 	return ret;
+++>>>>>>> aba21aff772b (vdpa: Allow to configure max data virtqueues)
+  }
+  
+  void vdpa_get_config(struct vdpa_device *vdev, unsigned int offset,
+* Unmerged path drivers/vdpa/vdpa.c
+diff --git a/drivers/vhost/vdpa.c b/drivers/vhost/vdpa.c
+index ec59c7e32081..b0394c54e037 100644
+--- a/drivers/vhost/vdpa.c
++++ b/drivers/vhost/vdpa.c
+@@ -285,7 +285,7 @@ static long vhost_vdpa_set_features(struct vhost_vdpa *v, u64 __user *featurep)
+ 	if (copy_from_user(&features, featurep, sizeof(features)))
+ 		return -EFAULT;
+ 
+-	if (vdpa_set_features(vdpa, features))
++	if (vdpa_set_features(vdpa, features, false))
+ 		return -EINVAL;
+ 
+ 	return 0;
+diff --git a/drivers/virtio/virtio_vdpa.c b/drivers/virtio/virtio_vdpa.c
+index d389b91f5851..3fadb2032cc4 100644
+--- a/drivers/virtio/virtio_vdpa.c
++++ b/drivers/virtio/virtio_vdpa.c
+@@ -317,7 +317,7 @@ static int virtio_vdpa_finalize_features(struct virtio_device *vdev)
+ 	/* Give virtio_ring a chance to accept features. */
+ 	vring_transport_features(vdev);
+ 
+-	return vdpa_set_features(vdpa, vdev->features);
++	return vdpa_set_features(vdpa, vdev->features, false);
+ }
+ 
+ static const char *virtio_vdpa_bus_name(struct virtio_device *vdev)
+* Unmerged path include/linux/vdpa.h
