@@ -35,6 +35,7 @@
 #include <net/vxlan.h>
 #include <net/geneve.h>
 #include <linux/bpf.h>
+#include <linux/debugfs.h>
 #include <linux/if_bridge.h>
 #include <linux/filter.h>
 #include <net/page_pool.h>
@@ -482,7 +483,8 @@ static int mlx5e_init_rxq_rq(struct mlx5e_channel *c, struct mlx5e_params *param
 	rq->ix           = c->ix;
 	rq->channel      = c;
 	rq->mdev         = mdev;
-	rq->hw_mtu       = MLX5E_SW2HW_MTU(params, params->sw_mtu);
+	rq->hw_mtu =
+		MLX5E_SW2HW_MTU(params, params->sw_mtu) - ETH_FCS_LEN * !params->scatter_fcs_en;
 	rq->xdpsq        = &c->rq_xdpsq;
 	rq->stats        = &c->priv->channel_stats[c->ix]->rq;
 	rq->ptp_cyc2time = mlx5_rq_ts_translator(mdev);
@@ -861,35 +863,6 @@ int mlx5e_modify_rq_state(struct mlx5e_rq *rq, int curr_state, int next_state)
 
 	MLX5_SET(modify_rq_in, in, rq_state, curr_state);
 	MLX5_SET(rqc, rqc, state, next_state);
-
-	err = mlx5_core_modify_rq(mdev, rq->rqn, in);
-
-	kvfree(in);
-
-	return err;
-}
-
-static int mlx5e_modify_rq_scatter_fcs(struct mlx5e_rq *rq, bool enable)
-{
-	struct mlx5_core_dev *mdev = rq->mdev;
-
-	void *in;
-	void *rqc;
-	int inlen;
-	int err;
-
-	inlen = MLX5_ST_SZ_BYTES(modify_rq_in);
-	in = kvzalloc(inlen, GFP_KERNEL);
-	if (!in)
-		return -ENOMEM;
-
-	rqc = MLX5_ADDR_OF(modify_rq_in, in, ctx);
-
-	MLX5_SET(modify_rq_in, in, rq_state, MLX5_RQC_STATE_RDY);
-	MLX5_SET64(modify_rq_in, in, modify_bitmask,
-		   MLX5_MODIFY_RQ_IN_MODIFY_BITMASK_SCATTER_FCS);
-	MLX5_SET(rqc, rqc, scatter_fcs, enable);
-	MLX5_SET(rqc, rqc, state, MLX5_RQC_STATE_RDY);
 
 	err = mlx5_core_modify_rq(mdev, rq->rqn, in);
 
@@ -1325,6 +1298,7 @@ static int mlx5e_alloc_txqsq(struct mlx5e_channel *c,
 	sq->mkey_be   = c->mkey_be;
 	sq->netdev    = c->netdev;
 	sq->mdev      = c->mdev;
+	sq->channel   = c;
 	sq->priv      = c->priv;
 	sq->ch_ix     = c->ix;
 	sq->txq_ix    = txq_ix;
@@ -2329,8 +2303,6 @@ static void mlx5e_activate_channel(struct mlx5e_channel *c)
 
 	if (test_bit(MLX5E_CHANNEL_STATE_XSK, c->state))
 		mlx5e_activate_xsk(c);
-
-	mlx5e_trigger_napi_icosq(c);
 }
 
 static void mlx5e_deactivate_channel(struct mlx5e_channel *c)
@@ -2421,12 +2393,18 @@ err_free:
 	return err;
 }
 
-static void mlx5e_activate_channels(struct mlx5e_channels *chs)
+static void mlx5e_activate_channels(struct mlx5e_priv *priv, struct mlx5e_channels *chs)
 {
 	int i;
 
 	for (i = 0; i < chs->num; i++)
 		mlx5e_activate_channel(chs->c[i]);
+
+	if (priv->htb)
+		mlx5e_qos_activate_queues(priv);
+
+	for (i = 0; i < chs->num; i++)
+		mlx5e_trigger_napi_icosq(chs->c[i]);
 
 	if (chs->ptp)
 		mlx5e_ptp_activate_channel(chs->ptp);
@@ -2733,9 +2711,7 @@ out:
 void mlx5e_activate_priv_channels(struct mlx5e_priv *priv)
 {
 	mlx5e_build_txq_maps(priv);
-	mlx5e_activate_channels(&priv->channels);
-	if (priv->htb)
-		mlx5e_qos_activate_queues(priv);
+	mlx5e_activate_channels(priv, &priv->channels);
 	mlx5e_xdp_tx_enable(priv);
 
 	/* dev_watchdog() wants all TX queues to be started when the carrier is
@@ -3163,20 +3139,6 @@ static void mlx5e_cleanup_nic_tx(struct mlx5e_priv *priv)
 	}
 	mlx5e_accel_cleanup_tx(priv);
 	mlx5e_destroy_tises(priv);
-}
-
-static int mlx5e_modify_channels_scatter_fcs(struct mlx5e_channels *chs, bool enable)
-{
-	int err = 0;
-	int i;
-
-	for (i = 0; i < chs->num; i++) {
-		err = mlx5e_modify_rq_scatter_fcs(&chs->c[i]->rq, enable);
-		if (err)
-			return err;
-	}
-
-	return 0;
 }
 
 static int mlx5e_modify_channels_vsd(struct mlx5e_channels *chs, bool vsd)
@@ -3687,9 +3649,11 @@ static int set_feature_cvlan_filter(struct net_device *netdev, bool enable)
 	struct mlx5e_priv *priv = netdev_priv(netdev);
 
 	if (enable)
-		mlx5e_enable_cvlan_filter(priv);
+		mlx5e_enable_cvlan_filter(priv->fs,
+					  !!(priv->netdev->flags & IFF_PROMISC));
 	else
-		mlx5e_disable_cvlan_filter(priv);
+		mlx5e_disable_cvlan_filter(priv->fs,
+					   !!(priv->netdev->flags & IFF_PROMISC));
 
 	return 0;
 }
@@ -3752,41 +3716,27 @@ static int mlx5e_set_rx_port_ts(struct mlx5_core_dev *mdev, bool enable)
 	return mlx5_set_ports_check(mdev, in, sizeof(in));
 }
 
+static int mlx5e_set_rx_port_ts_wrap(struct mlx5e_priv *priv, void *ctx)
+{
+	struct mlx5_core_dev *mdev = priv->mdev;
+	bool enable = *(bool *)ctx;
+
+	return mlx5e_set_rx_port_ts(mdev, enable);
+}
+
 static int set_feature_rx_fcs(struct net_device *netdev, bool enable)
 {
 	struct mlx5e_priv *priv = netdev_priv(netdev);
 	struct mlx5e_channels *chs = &priv->channels;
-	struct mlx5_core_dev *mdev = priv->mdev;
+	struct mlx5e_params new_params;
 	int err;
 
 	mutex_lock(&priv->state_lock);
 
-	if (enable) {
-		err = mlx5e_set_rx_port_ts(mdev, false);
-		if (err)
-			goto out;
-
-		chs->params.scatter_fcs_en = true;
-		err = mlx5e_modify_channels_scatter_fcs(chs, true);
-		if (err) {
-			chs->params.scatter_fcs_en = false;
-			mlx5e_set_rx_port_ts(mdev, true);
-		}
-	} else {
-		chs->params.scatter_fcs_en = false;
-		err = mlx5e_modify_channels_scatter_fcs(chs, false);
-		if (err) {
-			chs->params.scatter_fcs_en = true;
-			goto out;
-		}
-		err = mlx5e_set_rx_port_ts(mdev, true);
-		if (err) {
-			mlx5_core_warn(mdev, "Failed to set RX port timestamp %d\n", err);
-			err = 0;
-		}
-	}
-
-out:
+	new_params = chs->params;
+	new_params.scatter_fcs_en = enable;
+	err = mlx5e_safe_switch_params(priv, &new_params, mlx5e_set_rx_port_ts_wrap,
+				       &new_params.scatter_fcs_en, true);
 	mutex_unlock(&priv->state_lock);
 	return err;
 }
@@ -3798,7 +3748,7 @@ static int set_feature_rx_vlan(struct net_device *netdev, bool enable)
 
 	mutex_lock(&priv->state_lock);
 
-	priv->fs->vlan_strip_disable = !enable;
+	mlx5e_fs_set_vlan_strip_disable(priv->fs, !enable);
 	priv->channels.params.vlan_strip_disable = !enable;
 
 	if (!test_bit(MLX5E_STATE_OPENED, &priv->state))
@@ -3806,7 +3756,7 @@ static int set_feature_rx_vlan(struct net_device *netdev, bool enable)
 
 	err = mlx5e_modify_channels_vsd(&priv->channels, !enable);
 	if (err) {
-		priv->fs->vlan_strip_disable = enable;
+		mlx5e_fs_set_vlan_strip_disable(priv->fs, enable);
 		priv->channels.params.vlan_strip_disable = enable;
 	}
 unlock:
@@ -3844,9 +3794,9 @@ static int set_feature_arfs(struct net_device *netdev, bool enable)
 	int err;
 
 	if (enable)
-		err = mlx5e_arfs_enable(priv);
+		err = mlx5e_arfs_enable(priv->fs);
 	else
-		err = mlx5e_arfs_disable(priv);
+		err = mlx5e_arfs_disable(priv->fs);
 
 	return err;
 }
@@ -3923,6 +3873,10 @@ static netdev_features_t mlx5e_fix_uplink_rep_features(struct net_device *netdev
 	if (netdev->features & NETIF_F_GRO_HW)
 		netdev_warn(netdev, "Disabling HW_GRO, not supported in switchdev mode\n");
 
+	features &= ~NETIF_F_HW_VLAN_CTAG_FILTER;
+	if (netdev->features & NETIF_F_HW_VLAN_CTAG_FILTER)
+		netdev_warn(netdev, "Disabling HW_VLAN CTAG FILTERING, not supported in switchdev mode\n");
+
 	return features;
 }
 
@@ -3930,15 +3884,17 @@ static netdev_features_t mlx5e_fix_features(struct net_device *netdev,
 					    netdev_features_t features)
 {
 	struct mlx5e_priv *priv = netdev_priv(netdev);
+	struct mlx5e_vlan_table *vlan;
 	struct mlx5e_params *params;
 
 	if (!netif_device_present(netdev))
 		return features;
 
+	vlan = mlx5e_fs_get_vlan(priv->fs);
 	mutex_lock(&priv->state_lock);
 	params = &priv->channels.params;
-	if (!priv->fs->vlan ||
-	    !bitmap_empty(mlx5e_vlan_get_active_svlans(priv->fs->vlan), VLAN_N_VID)) {
+	if (!vlan ||
+	    !bitmap_empty(mlx5e_vlan_get_active_svlans(vlan), VLAN_N_VID)) {
 		/* HW strips the outer C-tag header, this is a problem
 		 * for S-tag traffic.
 		 */
@@ -4799,8 +4755,6 @@ void mlx5e_build_nic_params(struct mlx5e_priv *priv, struct mlx5e_xsk *xsk, u16 
 	/* TX inline */
 	mlx5_query_min_inline(mdev, &params->tx_min_inline_mode);
 
-	params->tunneled_offload_en = mlx5_tunnel_inner_ft_supported(mdev);
-
 	/* AF_XDP */
 	params->xsk = xsk;
 
@@ -5053,18 +5007,19 @@ static int mlx5e_nic_init(struct mlx5_core_dev *mdev,
 
 	mlx5e_timestamp_init(priv);
 
+	priv->dfs_root = debugfs_create_dir("nic",
+					    mlx5_debugfs_get_dev_root(mdev));
+
 	fs = mlx5e_fs_init(priv->profile, mdev,
-			   !test_bit(MLX5E_STATE_DESTROYING, &priv->state));
+			   !test_bit(MLX5E_STATE_DESTROYING, &priv->state),
+			   priv->dfs_root);
 	if (!fs) {
 		err = -ENOMEM;
 		mlx5_core_err(mdev, "FS initialization failed, %d\n", err);
+		debugfs_remove_recursive(priv->dfs_root);
 		return err;
 	}
 	priv->fs = fs;
-
-	err = mlx5e_ipsec_init(priv);
-	if (err)
-		mlx5_core_err(mdev, "IPSec initialization failed, %d\n", err);
 
 	err = mlx5e_ktls_init(priv);
 	if (err)
@@ -5088,8 +5043,9 @@ static void mlx5e_nic_cleanup(struct mlx5e_priv *priv)
 		mlx5e_health_destroy_reporters(priv);
 	mlx5e_devlink_port_unregister(priv);
 	mlx5e_ktls_cleanup(priv);
-	mlx5e_ipsec_cleanup(priv);
 	mlx5e_fs_cleanup(priv->fs);
+	debugfs_remove_recursive(priv->dfs_root);
+	priv->fs = NULL;
 }
 
 static int mlx5e_init_nic_rx(struct mlx5e_priv *priv)
@@ -5111,7 +5067,7 @@ static int mlx5e_init_nic_rx(struct mlx5e_priv *priv)
 	}
 
 	features = MLX5E_RX_RES_FEATURE_XSK | MLX5E_RX_RES_FEATURE_PTP;
-	if (priv->channels.params.tunneled_offload_en)
+	if (mlx5_tunnel_inner_ft_supported(mdev))
 		features |= MLX5E_RX_RES_FEATURE_INNER_FT;
 	err = mlx5e_rx_res_init(priv->rx_res, priv->mdev, features,
 				priv->max_nch, priv->drop_rq.rqn,
@@ -5120,7 +5076,8 @@ static int mlx5e_init_nic_rx(struct mlx5e_priv *priv)
 	if (err)
 		goto err_close_drop_rq;
 
-	err = mlx5e_create_flow_steering(priv);
+	err = mlx5e_create_flow_steering(priv->fs, priv->rx_res, priv->profile,
+					 priv->netdev);
 	if (err) {
 		mlx5_core_warn(mdev, "create flow steering failed, %d\n", err);
 		goto err_destroy_rx_res;
@@ -5143,7 +5100,8 @@ static int mlx5e_init_nic_rx(struct mlx5e_priv *priv)
 err_tc_nic_cleanup:
 	mlx5e_tc_nic_cleanup(priv);
 err_destroy_flow_steering:
-	mlx5e_destroy_flow_steering(priv);
+	mlx5e_destroy_flow_steering(priv->fs, !!(priv->netdev->hw_features & NETIF_F_NTUPLE),
+				    priv->profile);
 err_destroy_rx_res:
 	mlx5e_rx_res_destroy(priv->rx_res);
 err_close_drop_rq:
@@ -5159,7 +5117,8 @@ static void mlx5e_cleanup_nic_rx(struct mlx5e_priv *priv)
 {
 	mlx5e_accel_cleanup_rx(priv);
 	mlx5e_tc_nic_cleanup(priv);
-	mlx5e_destroy_flow_steering(priv);
+	mlx5e_destroy_flow_steering(priv->fs, !!(priv->netdev->hw_features & NETIF_F_NTUPLE),
+				    priv->profile);
 	mlx5e_rx_res_destroy(priv->rx_res);
 	mlx5e_close_drop_rq(&priv->drop_rq);
 	mlx5e_destroy_q_counters(priv);
@@ -5213,6 +5172,7 @@ static void mlx5e_nic_enable(struct mlx5e_priv *priv)
 	struct mlx5_core_dev *mdev = priv->mdev;
 
 	mlx5e_fs_init_l2_addr(priv->fs, netdev);
+	mlx5e_ipsec_init(priv);
 
 	/* Marking the link as currently not needed by the Driver */
 	if (!netif_running(netdev))
@@ -5271,6 +5231,7 @@ static void mlx5e_nic_disable(struct mlx5e_priv *priv)
 	mlx5e_disable_async_events(priv);
 	mlx5_lag_remove_netdev(mdev, priv->netdev);
 	mlx5_vxlan_reset_to_default(mdev->vxlan);
+	mlx5e_ipsec_cleanup(priv);
 }
 
 int mlx5e_update_nic_rx(struct mlx5e_priv *priv)
@@ -5535,7 +5496,8 @@ int mlx5e_attach_netdev(struct mlx5e_priv *priv)
 
 	clear_bit(MLX5E_STATE_DESTROYING, &priv->state);
 	if (priv->fs)
-		priv->fs->state_destroy = !test_bit(MLX5E_STATE_DESTROYING, &priv->state);
+		mlx5e_fs_set_state_destroy(priv->fs,
+					   !test_bit(MLX5E_STATE_DESTROYING, &priv->state));
 
 	/* Validate the max_wqe_size_sq capability. */
 	if (WARN_ON_ONCE(mlx5e_get_max_sq_wqebbs(priv->mdev) < MLX5E_MAX_TX_WQEBBS)) {
@@ -5603,7 +5565,8 @@ out:
 	mlx5e_reset_channels(priv->netdev);
 	set_bit(MLX5E_STATE_DESTROYING, &priv->state);
 	if (priv->fs)
-		priv->fs->state_destroy = !test_bit(MLX5E_STATE_DESTROYING, &priv->state);
+		mlx5e_fs_set_state_destroy(priv->fs,
+					   !test_bit(MLX5E_STATE_DESTROYING, &priv->state));
 	cancel_work_sync(&priv->update_stats_work);
 	return err;
 }
@@ -5614,7 +5577,8 @@ void mlx5e_detach_netdev(struct mlx5e_priv *priv)
 
 	set_bit(MLX5E_STATE_DESTROYING, &priv->state);
 	if (priv->fs)
-		priv->fs->state_destroy = !test_bit(MLX5E_STATE_DESTROYING, &priv->state);
+		mlx5e_fs_set_state_destroy(priv->fs,
+					   !test_bit(MLX5E_STATE_DESTROYING, &priv->state));
 
 	if (profile->disable)
 		profile->disable(priv);
@@ -5761,6 +5725,7 @@ static int mlx5e_probe(struct auxiliary_device *adev,
 
 	priv->profile = profile;
 	priv->ppriv = NULL;
+
 	err = profile->init(mdev, netdev);
 	if (err) {
 		mlx5_core_err(mdev, "mlx5e_nic_profile init failed, %d\n", err);
@@ -5782,7 +5747,8 @@ static int mlx5e_probe(struct auxiliary_device *adev,
 	mlx5e_devlink_port_type_eth_set(priv);
 
 	mlx5e_dcbnl_init_app(priv);
-	mlx5_uplink_netdev_set(mdev, netdev);
+	mlx5_core_uplink_netdev_set(mdev, netdev);
+	mlx5e_params_print_info(mdev, &priv->channels.params);
 	return 0;
 
 err_resume:
@@ -5799,6 +5765,7 @@ static void mlx5e_remove(struct auxiliary_device *adev)
 	struct mlx5e_priv *priv = auxiliary_get_drvdata(adev);
 	pm_message_t state = {};
 
+	mlx5_core_uplink_netdev_set(priv->mdev, NULL);
 	mlx5e_dcbnl_delete_app(priv);
 	unregister_netdev(priv->netdev);
 	mlx5e_suspend(adev, state);

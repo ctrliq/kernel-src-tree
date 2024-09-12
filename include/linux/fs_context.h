@@ -89,7 +89,7 @@ struct p_log {
  * Superblock creation fills in ->root whereas reconfiguration begins with this
  * already set.
  *
- * See Documentation/filesystems/mounting.txt
+ * See Documentation/filesystems/mount_api.txt
  */
 struct fs_context {
 	const struct fs_context_operations *ops;

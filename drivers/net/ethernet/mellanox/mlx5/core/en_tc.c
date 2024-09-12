@@ -43,6 +43,7 @@
 #include <net/ipv6_stubs.h>
 #include <net/bareudp.h>
 #include <net/bonding.h>
+#include <net/dst_metadata.h>
 #include "en.h"
 #include "en/tc/post_act.h"
 #include "en/tc/act_stats.h"
@@ -352,6 +353,7 @@ mlx5e_get_flow_meters(struct mlx5_core_dev *dev)
 static struct mlx5_tc_ct_priv *
 get_ct_priv(struct mlx5e_priv *priv)
 {
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	struct mlx5_rep_uplink_priv *uplink_priv;
 	struct mlx5e_rep_priv *uplink_rpriv;
@@ -363,7 +365,7 @@ get_ct_priv(struct mlx5e_priv *priv)
 		return uplink_priv->ct_priv;
 	}
 
-	return priv->fs->tc->ct;
+	return tc->ct;
 }
 
 static struct mlx5e_tc_psample *
@@ -386,6 +388,7 @@ get_sample_priv(struct mlx5e_priv *priv)
 static struct mlx5e_post_act *
 get_post_action(struct mlx5e_priv *priv)
 {
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	struct mlx5_rep_uplink_priv *uplink_priv;
 	struct mlx5e_rep_priv *uplink_rpriv;
@@ -397,7 +400,7 @@ get_post_action(struct mlx5e_priv *priv)
 		return uplink_priv->post_act;
 	}
 
-	return priv->fs->tc->post_act;
+	return tc->post_act;
 }
 
 struct mlx5_flow_handle *
@@ -659,11 +662,12 @@ get_flow_counter_dev(struct mlx5e_tc_flow *flow)
 static struct mod_hdr_tbl *
 get_mod_hdr_table(struct mlx5e_priv *priv, struct mlx5e_tc_flow *flow)
 {
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 
 	return mlx5e_get_flow_namespace(flow) == MLX5_FLOW_NAMESPACE_FDB ?
 		&esw->offloads.mod_hdr :
-		&priv->fs->tc->mod_hdr;
+		&tc->mod_hdr;
 }
 
 int mlx5e_tc_attach_mod_hdr(struct mlx5e_priv *priv,
@@ -862,6 +866,7 @@ static int mlx5e_hairpin_rss_init(struct mlx5e_hairpin *hp)
 {
 	struct mlx5e_priv *priv = hp->func_priv;
 	struct ttc_params ttc_params;
+	struct mlx5_ttc_table *ttc;
 	int err;
 
 	err = mlx5e_hairpin_create_indirect_rqt(hp);
@@ -879,9 +884,10 @@ static int mlx5e_hairpin_rss_init(struct mlx5e_hairpin *hp)
 		goto err_create_ttc_table;
 	}
 
+	ttc = mlx5e_fs_get_ttc(priv->fs, false);
 	netdev_dbg(priv->netdev, "add hairpin: using %d channels rss ttc table id %x\n",
 		   hp->num_channels,
-		   mlx5_get_ttc_flow_table(priv->fs->ttc)->id);
+		   mlx5_get_ttc_flow_table(ttc)->id);
 
 	return 0;
 
@@ -968,10 +974,11 @@ static inline u32 hash_hairpin_info(u16 peer_vhca_id, u8 prio)
 static struct mlx5e_hairpin_entry *mlx5e_hairpin_get(struct mlx5e_priv *priv,
 						     u16 peer_vhca_id, u8 prio)
 {
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
 	struct mlx5e_hairpin_entry *hpe;
 	u32 hash_key = hash_hairpin_info(peer_vhca_id, prio);
 
-	hash_for_each_possible(priv->fs->tc->hairpin_tbl, hpe,
+	hash_for_each_possible(tc->hairpin_tbl, hpe,
 			       hairpin_hlist, hash_key) {
 		if (hpe->peer_vhca_id == peer_vhca_id && hpe->prio == prio) {
 			refcount_inc(&hpe->refcnt);
@@ -985,11 +992,12 @@ static struct mlx5e_hairpin_entry *mlx5e_hairpin_get(struct mlx5e_priv *priv,
 static void mlx5e_hairpin_put(struct mlx5e_priv *priv,
 			      struct mlx5e_hairpin_entry *hpe)
 {
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
 	/* no more hairpin flows for us, release the hairpin pair */
-	if (!refcount_dec_and_mutex_lock(&hpe->refcnt, &priv->fs->tc->hairpin_tbl_lock))
+	if (!refcount_dec_and_mutex_lock(&hpe->refcnt, &tc->hairpin_tbl_lock))
 		return;
 	hash_del(&hpe->hairpin_hlist);
-	mutex_unlock(&priv->fs->tc->hairpin_tbl_lock);
+	mutex_unlock(&tc->hairpin_tbl_lock);
 
 	if (!IS_ERR_OR_NULL(hpe->hp)) {
 		netdev_dbg(priv->netdev, "del hairpin: peer %s\n",
@@ -1116,6 +1124,7 @@ static int mlx5e_hairpin_flow_add(struct mlx5e_priv *priv,
 				  struct mlx5e_tc_flow_parse_attr *parse_attr,
 				  struct netlink_ext_ack *extack)
 {
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
 	int peer_ifindex = parse_attr->mirred_ifindex[0];
 	struct mlx5_hairpin_params params;
 	struct mlx5_core_dev *peer_mdev;
@@ -1142,10 +1151,10 @@ static int mlx5e_hairpin_flow_add(struct mlx5e_priv *priv,
 	if (err)
 		return err;
 
-	mutex_lock(&priv->fs->tc->hairpin_tbl_lock);
+	mutex_lock(&tc->hairpin_tbl_lock);
 	hpe = mlx5e_hairpin_get(priv, peer_id, match_prio);
 	if (hpe) {
-		mutex_unlock(&priv->fs->tc->hairpin_tbl_lock);
+		mutex_unlock(&tc->hairpin_tbl_lock);
 		wait_for_completion(&hpe->res_ready);
 
 		if (IS_ERR(hpe->hp)) {
@@ -1157,7 +1166,7 @@ static int mlx5e_hairpin_flow_add(struct mlx5e_priv *priv,
 
 	hpe = kzalloc(sizeof(*hpe), GFP_KERNEL);
 	if (!hpe) {
-		mutex_unlock(&priv->fs->tc->hairpin_tbl_lock);
+		mutex_unlock(&tc->hairpin_tbl_lock);
 		return -ENOMEM;
 	}
 
@@ -1169,9 +1178,9 @@ static int mlx5e_hairpin_flow_add(struct mlx5e_priv *priv,
 	refcount_set(&hpe->refcnt, 1);
 	init_completion(&hpe->res_ready);
 
-	hash_add(priv->fs->tc->hairpin_tbl, &hpe->hairpin_hlist,
+	hash_add(tc->hairpin_tbl, &hpe->hairpin_hlist,
 		 hash_hairpin_info(peer_id, match_prio));
-	mutex_unlock(&priv->fs->tc->hairpin_tbl_lock);
+	mutex_unlock(&tc->hairpin_tbl_lock);
 
 	params.log_num_packets = ilog2(tc->hairpin_params.queue_size);
 	params.log_data_size =
@@ -1239,8 +1248,9 @@ mlx5e_add_offloaded_nic_rule(struct mlx5e_priv *priv,
 			     struct mlx5_flow_attr *attr)
 {
 	struct mlx5_flow_context *flow_context = &spec->flow_context;
+	struct mlx5e_vlan_table *vlan = mlx5e_fs_get_vlan(priv->fs);
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
 	struct mlx5_nic_flow_attr *nic_attr = attr->nic_attr;
-	struct mlx5e_tc_table *tc = priv->fs->tc;
 	struct mlx5_flow_destination dest[2] = {};
 	struct mlx5_fs_chains *nic_chains;
 	struct mlx5_flow_act flow_act = {
@@ -1276,7 +1286,7 @@ mlx5e_add_offloaded_nic_rule(struct mlx5e_priv *priv,
 			if (IS_ERR(dest[dest_ix].ft))
 				return ERR_CAST(dest[dest_ix].ft);
 		} else {
-			dest[dest_ix].ft = mlx5e_vlan_get_flowtable(priv->fs->vlan);
+			dest[dest_ix].ft = mlx5e_vlan_get_flowtable(vlan);
 		}
 		dest_ix++;
 	}
@@ -1304,7 +1314,7 @@ mlx5e_add_offloaded_nic_rule(struct mlx5e_priv *priv,
 			mutex_unlock(&tc->t_lock);
 			netdev_err(priv->netdev,
 				   "Failed to create tc offload table\n");
-			rule = ERR_CAST(priv->fs->tc->t);
+			rule = ERR_CAST(tc->t);
 			goto err_ft_get;
 		}
 	}
@@ -1405,8 +1415,10 @@ void mlx5e_del_offloaded_nic_rule(struct mlx5e_priv *priv,
 				  struct mlx5_flow_handle *rule,
 				  struct mlx5_flow_attr *attr)
 {
-	struct mlx5_fs_chains *nic_chains = mlx5e_nic_chains(priv->fs->tc);
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
+	struct mlx5_fs_chains *nic_chains;
 
+	nic_chains = mlx5e_nic_chains(tc);
 	mlx5_del_flow_rules(rule);
 
 	if (attr->chain || attr->prio)
@@ -1421,8 +1433,8 @@ void mlx5e_del_offloaded_nic_rule(struct mlx5e_priv *priv,
 static void mlx5e_tc_del_nic_flow(struct mlx5e_priv *priv,
 				  struct mlx5e_tc_flow *flow)
 {
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
 	struct mlx5_flow_attr *attr = flow->attr;
-	struct mlx5e_tc_table *tc = priv->fs->tc;
 
 	flow_flag_clear(flow, OFFLOADED);
 
@@ -1434,13 +1446,13 @@ static void mlx5e_tc_del_nic_flow(struct mlx5e_priv *priv,
 	/* Remove root table if no rules are left to avoid
 	 * extra steering hops.
 	 */
-	mutex_lock(&priv->fs->tc->t_lock);
+	mutex_lock(&tc->t_lock);
 	if (!mlx5e_tc_num_filters(priv, MLX5_TC_FLAG(NIC_OFFLOAD)) &&
 	    !IS_ERR_OR_NULL(tc->t)) {
 		mlx5_chains_put_table(mlx5e_nic_chains(tc), 0, 1, MLX5E_TC_FT_LEVEL);
-		priv->fs->tc->t = NULL;
+		tc->t = NULL;
 	}
-	mutex_unlock(&priv->fs->tc->t_lock);
+	mutex_unlock(&tc->t_lock);
 
 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR) {
 		mlx5e_mod_hdr_dealloc(&attr->parse_attr->mod_hdr_acts);
@@ -1806,12 +1818,40 @@ clean_encap_dests(struct mlx5e_priv *priv,
 }
 
 static int
+verify_attr_actions(u32 actions, struct netlink_ext_ack *extack)
+{
+	if (!(actions &
+	      (MLX5_FLOW_CONTEXT_ACTION_FWD_DEST | MLX5_FLOW_CONTEXT_ACTION_DROP))) {
+		NL_SET_ERR_MSG_MOD(extack, "Rule must have at least one forward/drop action");
+		return -EOPNOTSUPP;
+	}
+
+	if (!(~actions &
+	      (MLX5_FLOW_CONTEXT_ACTION_FWD_DEST | MLX5_FLOW_CONTEXT_ACTION_DROP))) {
+		NL_SET_ERR_MSG_MOD(extack, "Rule cannot support forward+drop action");
+		return -EOPNOTSUPP;
+	}
+
+	if (actions & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR &&
+	    actions & MLX5_FLOW_CONTEXT_ACTION_DROP) {
+		NL_SET_ERR_MSG_MOD(extack, "Drop with modify header action is not supported");
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+static int
 post_process_attr(struct mlx5e_tc_flow *flow,
 		  struct mlx5_flow_attr *attr,
 		  struct netlink_ext_ack *extack)
 {
 	bool vf_tun;
 	int err = 0;
+
+	err = verify_attr_actions(attr->action, extack);
+	if (err)
+		goto err_out;
 
 	err = set_encap_dests(flow->priv, flow, attr, extack, &vf_tun);
 	if (err)
@@ -3630,36 +3670,6 @@ actions_match_supported(struct mlx5e_priv *priv,
 	ct_clear = flow->attr->ct_attr.ct_action & TCA_CT_ACT_CLEAR;
 	ct_flow = flow_flag_test(flow, CT) && !ct_clear;
 
-	if (!(actions &
-	      (MLX5_FLOW_CONTEXT_ACTION_FWD_DEST | MLX5_FLOW_CONTEXT_ACTION_DROP))) {
-		NL_SET_ERR_MSG_MOD(extack, "Rule must have at least one forward/drop action");
-		return false;
-	}
-
-	if (!(~actions &
-	      (MLX5_FLOW_CONTEXT_ACTION_FWD_DEST | MLX5_FLOW_CONTEXT_ACTION_DROP))) {
-		NL_SET_ERR_MSG_MOD(extack, "Rule cannot support forward+drop action");
-		return false;
-	}
-
-	if (!(~actions &
-	      (MLX5_FLOW_CONTEXT_ACTION_FWD_DEST | MLX5_FLOW_CONTEXT_ACTION_DROP))) {
-		NL_SET_ERR_MSG_MOD(extack, "Rule cannot support forward+drop action");
-		return false;
-	}
-
-	if (actions & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR &&
-	    actions & MLX5_FLOW_CONTEXT_ACTION_DROP) {
-		NL_SET_ERR_MSG_MOD(extack, "Drop with modify header action is not supported");
-		return false;
-	}
-
-	if (actions & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR &&
-	    actions & MLX5_FLOW_CONTEXT_ACTION_DROP) {
-		NL_SET_ERR_MSG_MOD(extack, "Drop with modify header action is not supported");
-		return false;
-	}
-
 	if (actions & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR &&
 	    !modify_header_match_supported(priv, &parse_attr->spec, flow_action,
 					   actions, ct_flow, ct_clear, extack))
@@ -3755,6 +3765,7 @@ mlx5e_clone_flow_attr_for_post_act(struct mlx5_flow_attr *attr,
 	attr2->parse_attr = parse_attr;
 	attr2->dest_chain = 0;
 	attr2->dest_ft = NULL;
+	attr2->act_id_restore_rule = NULL;
 
 	if (ns_type == MLX5_FLOW_NAMESPACE_FDB) {
 		attr2->esw_attr->out_count = 0;
@@ -4116,7 +4127,7 @@ parse_tc_actions(struct mlx5e_tc_act_parse_state *parse_state,
 
 		parse_state->actions |= attr->action;
 		if (!tc_act->stats_action)
-			attr->tc_act_cookies[attr->tc_act_cookies_count++] = act->act_cookie;
+			attr->tc_act_cookies[attr->tc_act_cookies_count++] = act->cookie;
 
 		/* Split attr for multi table act if not the last act. */
 		if (jump_state.jump_target ||
@@ -4201,6 +4212,10 @@ parse_tc_nic_actions(struct mlx5e_priv *priv,
 		return err;
 
 	err = actions_prepare_mod_hdr_actions(priv, flow, attr, extack);
+	if (err)
+		return err;
+
+	err = verify_attr_actions(attr->action, extack);
 	if (err)
 		return err;
 
@@ -4394,13 +4409,14 @@ static const struct rhashtable_params tc_ht_params = {
 static struct rhashtable *get_tc_ht(struct mlx5e_priv *priv,
 				    unsigned long flags)
 {
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
 	struct mlx5e_rep_priv *rpriv;
 
 	if (flags & MLX5_TC_FLAG(ESW_OFFLOAD)) {
 		rpriv = priv->ppriv;
 		return &rpriv->tc_ht;
 	} else /* NIC offload */
-		return &priv->fs->tc->ht;
+		return &tc->ht;
 }
 
 static bool is_peer_flow_needed(struct mlx5e_tc_flow *flow)
@@ -5137,6 +5153,7 @@ void mlx5e_tc_stats_matchall(struct mlx5e_priv *priv,
 static void mlx5e_tc_hairpin_update_dead_peer(struct mlx5e_priv *priv,
 					      struct mlx5e_priv *peer_priv)
 {
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
 	struct mlx5_core_dev *peer_mdev = peer_priv->mdev;
 	struct mlx5e_hairpin_entry *hpe, *tmp;
 	LIST_HEAD(init_wait_list);
@@ -5148,11 +5165,11 @@ static void mlx5e_tc_hairpin_update_dead_peer(struct mlx5e_priv *priv,
 
 	peer_vhca_id = MLX5_CAP_GEN(peer_mdev, vhca_id);
 
-	mutex_lock(&priv->fs->tc->hairpin_tbl_lock);
-	hash_for_each(priv->fs->tc->hairpin_tbl, bkt, hpe, hairpin_hlist)
+	mutex_lock(&tc->hairpin_tbl_lock);
+	hash_for_each(tc->hairpin_tbl, bkt, hpe, hairpin_hlist)
 		if (refcount_inc_not_zero(&hpe->refcnt))
 			list_add(&hpe->dead_peer_wait_list, &init_wait_list);
-	mutex_unlock(&priv->fs->tc->hairpin_tbl_lock);
+	mutex_unlock(&tc->hairpin_tbl_lock);
 
 	list_for_each_entry_safe(hpe, tmp, &init_wait_list, dead_peer_wait_list) {
 		wait_for_completion(&hpe->res_ready);
@@ -5206,7 +5223,8 @@ static int mlx5e_tc_nic_get_ft_size(struct mlx5_core_dev *dev)
 
 static int mlx5e_tc_nic_create_miss_table(struct mlx5e_priv *priv)
 {
-	struct mlx5_flow_table **ft = &priv->fs->tc->miss_t;
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
+	struct mlx5_flow_table **ft = &tc->miss_t;
 	struct mlx5_flow_table_attr ft_attr = {};
 	struct mlx5_flow_namespace *ns;
 	int err = 0;
@@ -5228,12 +5246,14 @@ static int mlx5e_tc_nic_create_miss_table(struct mlx5e_priv *priv)
 
 static void mlx5e_tc_nic_destroy_miss_table(struct mlx5e_priv *priv)
 {
-	mlx5_destroy_flow_table(priv->fs->tc->miss_t);
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
+
+	mlx5_destroy_flow_table(tc->miss_t);
 }
 
 int mlx5e_tc_nic_init(struct mlx5e_priv *priv)
 {
-	struct mlx5e_tc_table *tc = priv->fs->tc;
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
 	struct mlx5_core_dev *dev = priv->mdev;
 	struct mapping_ctx *chains_mapping;
 	struct mlx5_chains_attr attr = {};
@@ -5275,7 +5295,7 @@ int mlx5e_tc_nic_init(struct mlx5e_priv *priv)
 	attr.ns = MLX5_FLOW_NAMESPACE_KERNEL;
 	attr.max_ft_sz = mlx5e_tc_nic_get_ft_size(dev);
 	attr.max_grp_num = MLX5E_TC_TABLE_NUM_GROUPS;
-	attr.default_ft = priv->fs->tc->miss_t;
+	attr.default_ft = tc->miss_t;
 	attr.mapping = chains_mapping;
 
 	tc->chains = mlx5_chains_create(dev, &attr);
@@ -5338,7 +5358,7 @@ static void _mlx5e_tc_del_flow(void *ptr, void *arg)
 
 void mlx5e_tc_nic_cleanup(struct mlx5e_priv *priv)
 {
-	struct mlx5e_tc_table *tc = priv->fs->tc;
+	struct mlx5e_tc_table *tc = mlx5e_fs_get_tc(priv->fs);
 
 	debugfs_remove_recursive(tc->dfs_root);
 
@@ -5560,46 +5580,288 @@ int mlx5e_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
 	}
 }
 
-bool mlx5e_tc_update_skb(struct mlx5_cqe64 *cqe,
-			 struct sk_buff *skb)
+static bool mlx5e_tc_restore_tunnel(struct mlx5e_priv *priv, struct sk_buff *skb,
+				    struct mlx5e_tc_update_priv *tc_priv,
+				    u32 tunnel_id)
 {
-	u32 chain = 0, chain_tag, reg_b, zone_restore_id;
-	struct mlx5e_priv *priv = netdev_priv(skb->dev);
-	struct mlx5e_tc_table *tc = priv->fs->tc;
-	struct mlx5_mapped_obj mapped_obj;
-	struct tc_skb_ext *tc_skb_ext;
+	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+	struct tunnel_match_enc_opts enc_opts = {};
+	struct mlx5_rep_uplink_priv *uplink_priv;
+	struct mlx5e_rep_priv *uplink_rpriv;
+	struct metadata_dst *tun_dst;
+	struct tunnel_match_key key;
+	u32 tun_id, enc_opts_id;
+	struct net_device *dev;
 	int err;
 
-	reg_b = be32_to_cpu(cqe->ft_metadata);
+	enc_opts_id = tunnel_id & ENC_OPTS_BITS_MASK;
+	tun_id = tunnel_id >> ENC_OPTS_BITS;
 
-	chain_tag = reg_b & MLX5E_TC_TABLE_CHAIN_TAG_MASK;
+	if (!tun_id)
+		return true;
 
-	err = mapping_find(tc->mapping, chain_tag, &mapped_obj);
+	uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
+	uplink_priv = &uplink_rpriv->uplink_priv;
+
+	err = mapping_find(uplink_priv->tunnel_mapping, tun_id, &key);
 	if (err) {
 		netdev_dbg(priv->netdev,
-			   "Couldn't find chain for chain tag: %d, err: %d\n",
-			   chain_tag, err);
+			   "Couldn't find tunnel for tun_id: %d, err: %d\n",
+			   tun_id, err);
 		return false;
 	}
 
-	if (mapped_obj.type == MLX5_MAPPED_OBJ_CHAIN) {
-		chain = mapped_obj.chain;
+	if (enc_opts_id) {
+		err = mapping_find(uplink_priv->tunnel_enc_opts_mapping,
+				   enc_opts_id, &enc_opts);
+		if (err) {
+			netdev_dbg(priv->netdev,
+				   "Couldn't find tunnel (opts) for tun_id: %d, err: %d\n",
+				   enc_opts_id, err);
+			return false;
+		}
+	}
+
+	switch (key.enc_control.addr_type) {
+	case FLOW_DISSECTOR_KEY_IPV4_ADDRS:
+		tun_dst = __ip_tun_set_dst(key.enc_ipv4.src, key.enc_ipv4.dst,
+					   key.enc_ip.tos, key.enc_ip.ttl,
+					   key.enc_tp.dst, TUNNEL_KEY,
+					   key32_to_tunnel_id(key.enc_key_id.keyid),
+					   enc_opts.key.len);
+		break;
+	case FLOW_DISSECTOR_KEY_IPV6_ADDRS:
+		tun_dst = __ipv6_tun_set_dst(&key.enc_ipv6.src, &key.enc_ipv6.dst,
+					     key.enc_ip.tos, key.enc_ip.ttl,
+					     key.enc_tp.dst, 0, TUNNEL_KEY,
+					     key32_to_tunnel_id(key.enc_key_id.keyid),
+					     enc_opts.key.len);
+		break;
+	default:
+		netdev_dbg(priv->netdev,
+			   "Couldn't restore tunnel, unsupported addr_type: %d\n",
+			   key.enc_control.addr_type);
+		return false;
+	}
+
+	if (!tun_dst) {
+		netdev_dbg(priv->netdev, "Couldn't restore tunnel, no tun_dst\n");
+		return false;
+	}
+
+	tun_dst->u.tun_info.key.tp_src = key.enc_tp.src;
+
+	if (enc_opts.key.len)
+		ip_tunnel_info_opts_set(&tun_dst->u.tun_info,
+					enc_opts.key.data,
+					enc_opts.key.len,
+					enc_opts.key.dst_opt_type);
+
+	skb_dst_set(skb, (struct dst_entry *)tun_dst);
+	dev = dev_get_by_index(&init_net, key.filter_ifindex);
+	if (!dev) {
+		netdev_dbg(priv->netdev,
+			   "Couldn't find tunnel device with ifindex: %d\n",
+			   key.filter_ifindex);
+		return false;
+	}
+
+	/* Set fwd_dev so we do dev_put() after datapath */
+	tc_priv->fwd_dev = dev;
+
+	skb->dev = dev;
+
+	return true;
+}
+
+static bool mlx5e_tc_restore_skb_tc_meta(struct sk_buff *skb, struct mlx5_tc_ct_priv *ct_priv,
+					 struct mlx5_mapped_obj *mapped_obj, u32 zone_restore_id,
+					 u32 tunnel_id,  struct mlx5e_tc_update_priv *tc_priv)
+{
+	struct mlx5e_priv *priv = netdev_priv(skb->dev);
+	struct tc_skb_ext *tc_skb_ext;
+	u64 act_miss_cookie;
+	u32 chain;
+
+	chain = mapped_obj->type == MLX5_MAPPED_OBJ_CHAIN ? mapped_obj->chain : 0;
+	act_miss_cookie = mapped_obj->type == MLX5_MAPPED_OBJ_ACT_MISS ?
+			  mapped_obj->act_miss_cookie : 0;
+	if (chain || act_miss_cookie) {
+		if (!mlx5e_tc_ct_restore_flow(ct_priv, skb, zone_restore_id))
+			return false;
+
 		tc_skb_ext = tc_skb_ext_alloc(skb);
-		if (WARN_ON(!tc_skb_ext))
+		if (!tc_skb_ext) {
+			WARN_ON(1);
 			return false;
+		}
 
-		tc_skb_ext->chain = chain;
+		if (act_miss_cookie) {
+			tc_skb_ext->act_miss_cookie = act_miss_cookie;
+			tc_skb_ext->act_miss = 1;
+		} else {
+			tc_skb_ext->chain = chain;
+		}
+	}
 
-		zone_restore_id = (reg_b >> MLX5_REG_MAPPING_MOFFSET(NIC_ZONE_RESTORE_TO_REG)) &
-			ESW_ZONE_ID_MASK;
+	if (tc_priv)
+		return mlx5e_tc_restore_tunnel(priv, skb, tc_priv, tunnel_id);
 
-		if (!mlx5e_tc_ct_restore_flow(tc->ct, skb,
-					      zone_restore_id))
-			return false;
-	} else {
+	return true;
+}
+
+static void mlx5e_tc_restore_skb_sample(struct mlx5e_priv *priv, struct sk_buff *skb,
+					struct mlx5_mapped_obj *mapped_obj,
+					struct mlx5e_tc_update_priv *tc_priv)
+{
+	if (!mlx5e_tc_restore_tunnel(priv, skb, tc_priv, mapped_obj->sample.tunnel_id)) {
+		netdev_dbg(priv->netdev,
+			   "Failed to restore tunnel info for sampled packet\n");
+		return;
+	}
+	mlx5e_tc_sample_skb(skb, mapped_obj);
+}
+
+static bool mlx5e_tc_restore_skb_int_port(struct mlx5e_priv *priv, struct sk_buff *skb,
+					  struct mlx5_mapped_obj *mapped_obj,
+					  struct mlx5e_tc_update_priv *tc_priv,
+					  u32 tunnel_id)
+{
+	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+	struct mlx5_rep_uplink_priv *uplink_priv;
+	struct mlx5e_rep_priv *uplink_rpriv;
+	bool forward_tx = false;
+
+	/* Tunnel restore takes precedence over int port restore */
+	if (tunnel_id)
+		return mlx5e_tc_restore_tunnel(priv, skb, tc_priv, tunnel_id);
+
+	uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
+	uplink_priv = &uplink_rpriv->uplink_priv;
+
+	if (mlx5e_tc_int_port_dev_fwd(uplink_priv->int_port_priv, skb,
+				      mapped_obj->int_port_metadata, &forward_tx)) {
+		/* Set fwd_dev for future dev_put */
+		tc_priv->fwd_dev = skb->dev;
+		tc_priv->forward_tx = forward_tx;
+
+		return true;
+	}
+
+	return false;
+}
+
+bool mlx5e_tc_update_skb(struct mlx5_cqe64 *cqe, struct sk_buff *skb,
+			 struct mapping_ctx *mapping_ctx, u32 mapped_obj_id,
+			 struct mlx5_tc_ct_priv *ct_priv,
+			 u32 zone_restore_id, u32 tunnel_id,
+			 struct mlx5e_tc_update_priv *tc_priv)
+{
+	struct mlx5e_priv *priv = netdev_priv(skb->dev);
+	struct mlx5_mapped_obj mapped_obj;
+	int err;
+
+	err = mapping_find(mapping_ctx, mapped_obj_id, &mapped_obj);
+	if (err) {
+		netdev_dbg(skb->dev,
+			   "Couldn't find mapped object for mapped_obj_id: %d, err: %d\n",
+			   mapped_obj_id, err);
+		return false;
+	}
+
+	switch (mapped_obj.type) {
+	case MLX5_MAPPED_OBJ_CHAIN:
+	case MLX5_MAPPED_OBJ_ACT_MISS:
+		return mlx5e_tc_restore_skb_tc_meta(skb, ct_priv, &mapped_obj, zone_restore_id,
+						    tunnel_id, tc_priv);
+	case MLX5_MAPPED_OBJ_SAMPLE:
+		mlx5e_tc_restore_skb_sample(priv, skb, &mapped_obj, tc_priv);
+		tc_priv->skb_done = true;
+		return true;
+	case MLX5_MAPPED_OBJ_INT_PORT_METADATA:
+		return mlx5e_tc_restore_skb_int_port(priv, skb, &mapped_obj, tc_priv, tunnel_id);
+	default:
 		netdev_dbg(priv->netdev, "Invalid mapped object type: %d\n", mapped_obj.type);
 		return false;
 	}
 
-	return true;
+	return false;
+}
+
+bool mlx5e_tc_update_skb_nic(struct mlx5_cqe64 *cqe, struct sk_buff *skb)
+{
+	struct mlx5e_priv *priv = netdev_priv(skb->dev);
+	u32 mapped_obj_id, reg_b, zone_restore_id;
+	struct mlx5_tc_ct_priv *ct_priv;
+	struct mapping_ctx *mapping_ctx;
+	struct mlx5e_tc_table *tc;
+
+	reg_b = be32_to_cpu(cqe->ft_metadata);
+	tc = mlx5e_fs_get_tc(priv->fs);
+	mapped_obj_id = reg_b & MLX5E_TC_TABLE_CHAIN_TAG_MASK;
+	zone_restore_id = (reg_b >> MLX5_REG_MAPPING_MOFFSET(NIC_ZONE_RESTORE_TO_REG)) &
+			  ESW_ZONE_ID_MASK;
+	ct_priv = tc->ct;
+	mapping_ctx = tc->mapping;
+
+	return mlx5e_tc_update_skb(cqe, skb, mapping_ctx, mapped_obj_id, ct_priv, zone_restore_id,
+				   0, NULL);
+}
+
+static struct mapping_ctx *
+mlx5e_get_priv_obj_mapping(struct mlx5e_priv *priv)
+{
+	struct mlx5e_tc_table *tc;
+	struct mlx5_eswitch *esw;
+	struct mapping_ctx *ctx;
+
+	if (is_mdev_switchdev_mode(priv->mdev)) {
+		esw = priv->mdev->priv.eswitch;
+		ctx = esw->offloads.reg_c0_obj_pool;
+	} else {
+		tc = mlx5e_fs_get_tc(priv->fs);
+		ctx = tc->mapping;
+	}
+
+	return ctx;
+}
+
+int mlx5e_tc_action_miss_mapping_get(struct mlx5e_priv *priv, struct mlx5_flow_attr *attr,
+				     u64 act_miss_cookie, u32 *act_miss_mapping)
+{
+	struct mlx5_mapped_obj mapped_obj = {};
+	struct mlx5_eswitch *esw;
+	struct mapping_ctx *ctx;
+	int err;
+
+	ctx = mlx5e_get_priv_obj_mapping(priv);
+	mapped_obj.type = MLX5_MAPPED_OBJ_ACT_MISS;
+	mapped_obj.act_miss_cookie = act_miss_cookie;
+	err = mapping_add(ctx, &mapped_obj, act_miss_mapping);
+	if (err)
+		return err;
+
+	if (!is_mdev_switchdev_mode(priv->mdev))
+		return 0;
+
+	esw = priv->mdev->priv.eswitch;
+	attr->act_id_restore_rule = esw_add_restore_rule(esw, *act_miss_mapping);
+	if (IS_ERR(attr->act_id_restore_rule))
+		goto err_rule;
+
+	return 0;
+
+err_rule:
+	mapping_remove(ctx, *act_miss_mapping);
+	return err;
+}
+
+void mlx5e_tc_action_miss_mapping_put(struct mlx5e_priv *priv, struct mlx5_flow_attr *attr,
+				      u32 act_miss_mapping)
+{
+	struct mapping_ctx *ctx = mlx5e_get_priv_obj_mapping(priv);
+
+	if (is_mdev_switchdev_mode(priv->mdev))
+		mlx5_del_flow_rules(attr->act_id_restore_rule);
+	mapping_remove(ctx, act_miss_mapping);
 }

@@ -4,6 +4,7 @@
 #include <linux/debugfs.h>
 #include "en.h"
 #include "lib/mlx5.h"
+#include "lib/crypto.h"
 #include "en_accel/ktls.h"
 #include "en_accel/ktls_utils.h"
 #include "en_accel/fs_tcp.h"
@@ -11,8 +12,8 @@
 struct mlx5_crypto_dek *mlx5_ktls_create_key(struct mlx5_crypto_dek_pool *dek_pool,
 					     struct tls_crypto_info *crypto_info)
 {
+	const void *key;
 	u32 sz_bytes;
-	void *key;
 
 	switch (crypto_info->cipher_type) {
 	case TLS_CIPHER_AES_GCM_128: {
@@ -117,9 +118,9 @@ int mlx5e_ktls_set_feature_rx(struct net_device *netdev, bool enable)
 
 	mutex_lock(&priv->state_lock);
 	if (enable)
-		err = mlx5e_accel_fs_tcp_create(priv);
+		err = mlx5e_accel_fs_tcp_create(priv->fs);
 	else
-		mlx5e_accel_fs_tcp_destroy(priv);
+		mlx5e_accel_fs_tcp_destroy(priv->fs);
 	mutex_unlock(&priv->state_lock);
 
 	return err;
@@ -137,7 +138,7 @@ int mlx5e_ktls_init_rx(struct mlx5e_priv *priv)
 		return -ENOMEM;
 
 	if (priv->netdev->features & NETIF_F_HW_TLS_RX) {
-		err = mlx5e_accel_fs_tcp_create(priv);
+		err = mlx5e_accel_fs_tcp_create(priv->fs);
 		if (err) {
 			destroy_workqueue(priv->tls->rx_wq);
 			return err;
@@ -153,7 +154,7 @@ void mlx5e_ktls_cleanup_rx(struct mlx5e_priv *priv)
 		return;
 
 	if (priv->netdev->features & NETIF_F_HW_TLS_RX)
-		mlx5e_accel_fs_tcp_destroy(priv);
+		mlx5e_accel_fs_tcp_destroy(priv->fs);
 
 	destroy_workqueue(priv->tls->rx_wq);
 }

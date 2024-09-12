@@ -13,10 +13,11 @@
 #ifndef _KGDB_H_
 #define _KGDB_H_
 
+#include <linux/rh_kabi.h>
 #include <linux/linkage.h>
 #include <linux/init.h>
 #include <linux/atomic.h>
-#include <linux/kprobes.h>
+#include RH_KABI_HIDE_INCLUDE(<linux/kprobes.h>)
 #ifdef CONFIG_HAVE_ARCH_KGDB
 #include <asm/kgdb.h>
 #endif

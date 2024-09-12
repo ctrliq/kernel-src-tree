@@ -14,6 +14,13 @@
 #include <net/xdp_sock_drv.h>
 #include <linux/pci.h>
 
+/* RHEL-8-only. pci_disable_ptm is defined in PCI-local header. */
+#ifdef CONFIG_PCIE_PTM
+void pci_disable_ptm(struct pci_dev *dev);
+#else
+static inline void pci_disable_ptm(struct pci_dev *dev) { }
+#endif
+
 #include <net/ipv6.h>
 
 #include "igc.h"

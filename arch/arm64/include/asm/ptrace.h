@@ -194,21 +194,19 @@ struct pt_regs {
 	};
 	u64 orig_x0;
 #ifdef __AARCH64EB__
-	u32 unused2;
+	/* Only valid for some EL1 exceptions. */
+	RH_KABI_REPLACE_SPLIT(u32 unused2, u16 lockdep_hardirqs, u16 exit_rcu)
 	s32 syscallno;
 #else
 	s32 syscallno;
-	u32 unused2;
+	/* Only valid for some EL1 exceptions. */
+	RH_KABI_REPLACE_SPLIT(u32 unused2, u16 lockdep_hardirqs, u16 exit_rcu)
 #endif
 
 	u64 orig_addr_limit;
 	/* Only valid when ARM64_HAS_IRQ_PRIO_MASKING is enabled. */
 	u64 RH_KABI_RENAME(unused, pmr_save);
 	u64 stackframe[2];
-
-	/* Only valid for some EL1 exceptions. */
-	u64 lockdep_hardirqs;
-	u64 exit_rcu;
 };
 
 static inline bool in_syscall(struct pt_regs const *regs)

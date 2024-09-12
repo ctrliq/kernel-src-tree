@@ -61,7 +61,7 @@ static u8 amd_ucode_patch[MAX_NUMNODES][PATCH_MAX_SIZE];
 
 /*
  * Microcode patch container file is prepended to the initrd in cpio
- * format. See Documentation/x86/microcode.txt
+ * format. See Documentation/x86/microcode.rst
  */
 static const char
 ucode_path[] __maybe_unused = "kernel/x86/microcode/AuthenticAMD.bin";
@@ -464,17 +464,23 @@ static bool early_apply_microcode(u32 cpuid_1_eax, void *ucode, size_t size, boo
 
 static bool get_builtin_microcode(struct cpio_data *cp, unsigned int family)
 {
-#ifdef CONFIG_X86_64
 	char fw_name[36] = "amd-ucode/microcode_amd.bin";
+	struct firmware fw;
+
+	if (IS_ENABLED(CONFIG_X86_32))
+		return false;
 
 	if (family >= 0x15)
 		snprintf(fw_name, sizeof(fw_name),
 			 "amd-ucode/microcode_amd_fam%.2xh.bin", family);
 
-	return get_builtin_firmware(cp, fw_name);
-#else
+	if (firmware_request_builtin(&fw, fw_name)) {
+		cp->size = fw.size;
+		cp->data = (void *)fw.data;
+		return true;
+	}
+
 	return false;
-#endif
 }
 
 static void find_blobs_in_containers(unsigned int cpuid_1_eax, struct cpio_data *ret)
@@ -574,7 +580,7 @@ int __init save_microcode_in_initrd_amd(unsigned int cpuid_1_eax)
 	return 0;
 }
 
-void reload_ucode_amd(void)
+void reload_ucode_amd(unsigned int cpu)
 {
 	u32 rev, dummy __always_unused;
 	struct microcode_amd *mc;

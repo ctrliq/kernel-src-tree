@@ -73,4 +73,25 @@ static inline u8 get_this_hybrid_cpu_type(void)
 	return 0;
 }
 #endif
+
+struct ucode_cpu_info;
+
+int intel_cpu_collect_info(struct ucode_cpu_info *uci);
+
+static inline bool intel_cpu_signatures_match(unsigned int s1, unsigned int p1,
+					      unsigned int s2, unsigned int p2)
+{
+	if (s1 != s2)
+		return false;
+
+	/* Processor flags are either both 0 ... */
+	if (!p1 && !p2)
+		return true;
+
+	/* ... or they intersect. */
+	return p1 & p2;
+}
+
+int intel_find_matching_signature(void *mc, unsigned int csig, int cpf);
+int intel_microcode_sanity_check(void *mc, bool print_err, int hdr_type);
 #endif /* _ASM_X86_CPU_H */

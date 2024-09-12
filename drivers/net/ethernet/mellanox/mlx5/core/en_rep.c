@@ -30,6 +30,7 @@
  * SOFTWARE.
  */
 
+#include <linux/debugfs.h>
 #include <linux/mlx5/fs.h>
 #include <net/switchdev.h>
 #include <net/pkt_cls.h>
@@ -56,6 +57,7 @@
 #include "en_accel/ipsec.h"
 #include "en/tc/int_port.h"
 #include "en/ptp.h"
+#include "en/fs_ethtool.h"
 
 #define MLX5E_REP_PARAMS_DEF_LOG_SQ_SIZE \
 	max(0x7, MLX5E_PARAMS_MINIMUM_LOG_SQ_SIZE)
@@ -69,7 +71,7 @@ static void mlx5e_rep_get_drvinfo(struct net_device *dev,
 	struct mlx5e_priv *priv = netdev_priv(dev);
 	struct mlx5_core_dev *mdev = priv->mdev;
 
-	strlcpy(drvinfo->driver, mlx5e_rep_driver_name,
+	strscpy(drvinfo->driver, mlx5e_rep_driver_name,
 		sizeof(drvinfo->driver));
 	snprintf(drvinfo->fw_version, sizeof(drvinfo->fw_version),
 		 "%d.%d.%04d (%.16s)",
@@ -761,7 +763,6 @@ static void mlx5e_build_rep_params(struct net_device *netdev)
 	mlx5e_set_rx_cq_mode_params(params, cq_period_mode);
 
 	params->mqprio.num_tc       = 1;
-	params->tunneled_offload_en = false;
 	if (rep->vport != MLX5_VPORT_UPLINK)
 		params->vlan_strip_disable = true;
 
@@ -798,8 +799,10 @@ static int mlx5e_init_rep(struct mlx5_core_dev *mdev,
 {
 	struct mlx5e_priv *priv = netdev_priv(netdev);
 
-	priv->fs = mlx5e_fs_init(priv->profile, mdev,
-				 !test_bit(MLX5E_STATE_DESTROYING, &priv->state));
+	priv->fs =
+		mlx5e_fs_init(priv->profile, mdev,
+			      !test_bit(MLX5E_STATE_DESTROYING, &priv->state),
+			      priv->dfs_root);
 	if (!priv->fs) {
 		netdev_err(priv->netdev, "FS allocation failed\n");
 		return -ENOMEM;
@@ -815,18 +818,18 @@ static int mlx5e_init_ul_rep(struct mlx5_core_dev *mdev,
 			     struct net_device *netdev)
 {
 	struct mlx5e_priv *priv = netdev_priv(netdev);
-	int err;
+
+	priv->dfs_root = debugfs_create_dir("nic",
+					    mlx5_debugfs_get_dev_root(mdev));
 
 	priv->fs = mlx5e_fs_init(priv->profile, mdev,
-				 !test_bit(MLX5E_STATE_DESTROYING, &priv->state));
+				 !test_bit(MLX5E_STATE_DESTROYING, &priv->state),
+				 priv->dfs_root);
 	if (!priv->fs) {
 		netdev_err(priv->netdev, "FS allocation failed\n");
+		debugfs_remove_recursive(priv->dfs_root);
 		return -ENOMEM;
 	}
-
-	err = mlx5e_ipsec_init(priv);
-	if (err)
-		mlx5_core_err(mdev, "Uplink rep IPsec initialization failed, %d\n", err);
 
 	mlx5e_vxlan_set_netdev_info(priv);
 	mlx5e_build_rep_params(netdev);
@@ -837,7 +840,8 @@ static int mlx5e_init_ul_rep(struct mlx5_core_dev *mdev,
 static void mlx5e_cleanup_rep(struct mlx5e_priv *priv)
 {
 	mlx5e_fs_cleanup(priv->fs);
-	mlx5e_ipsec_cleanup(priv);
+	debugfs_remove_recursive(priv->dfs_root);
+	priv->fs = NULL;
 }
 
 static int mlx5e_create_rep_ttc_table(struct mlx5e_priv *priv)
@@ -847,19 +851,20 @@ static int mlx5e_create_rep_ttc_table(struct mlx5e_priv *priv)
 	struct ttc_params ttc_params = {};
 	int err;
 
-	priv->fs->ns = mlx5_get_flow_namespace(priv->mdev,
-					       MLX5_FLOW_NAMESPACE_KERNEL);
+	mlx5e_fs_set_ns(priv->fs,
+			mlx5_get_flow_namespace(priv->mdev,
+						MLX5_FLOW_NAMESPACE_KERNEL), false);
 
 	/* The inner_ttc in the ttc params is intentionally not set */
-	mlx5e_set_ttc_params(priv, &ttc_params, false);
+	mlx5e_set_ttc_params(priv->fs, priv->rx_res, &ttc_params, false);
 
 	if (rep->vport != MLX5_VPORT_UPLINK)
 		/* To give uplik rep TTC a lower level for chaining from root ft */
 		ttc_params.ft_attr.level = MLX5E_TTC_FT_LEVEL + 1;
 
-	priv->fs->ttc = mlx5_create_ttc_table(priv->mdev, &ttc_params);
-	if (IS_ERR(priv->fs->ttc)) {
-		err = PTR_ERR(priv->fs->ttc);
+	mlx5e_fs_set_ttc(priv->fs, mlx5_create_ttc_table(priv->mdev, &ttc_params), false);
+	if (IS_ERR(mlx5e_fs_get_ttc(priv->fs, false))) {
+		err = PTR_ERR(mlx5e_fs_get_ttc(priv->fs, false));
 		netdev_err(priv->netdev, "Failed to create rep ttc table, err=%d\n",
 			   err);
 		return err;
@@ -879,7 +884,7 @@ static int mlx5e_create_rep_root_ft(struct mlx5e_priv *priv)
 		/* non uplik reps will skip any bypass tables and go directly to
 		 * their own ttc
 		 */
-		rpriv->root_ft = mlx5_get_ttc_flow_table(priv->fs->ttc);
+		rpriv->root_ft = mlx5_get_ttc_flow_table(mlx5e_fs_get_ttc(priv->fs, false));
 		return 0;
 	}
 
@@ -944,7 +949,6 @@ static void rep_vport_rx_rule_destroy(struct mlx5e_priv *priv)
 
 int mlx5e_rep_bond_update(struct mlx5e_priv *priv, bool cleanup)
 {
-	mlx5e_ethtool_cleanup_steering(priv);
 	rep_vport_rx_rule_destroy(priv);
 
 	return cleanup ? 0 : mlx5e_create_rep_vport_rx_rule(priv);
@@ -988,14 +992,14 @@ static int mlx5e_init_rep_rx(struct mlx5e_priv *priv)
 	if (err)
 		goto err_destroy_root_ft;
 
-	mlx5e_ethtool_init_steering(priv);
+	mlx5e_ethtool_init_steering(priv->fs);
 
 	return 0;
 
 err_destroy_root_ft:
 	mlx5e_destroy_rep_root_ft(priv);
 err_destroy_ttc_table:
-	mlx5_destroy_ttc_table(priv->fs->ttc);
+	mlx5_destroy_ttc_table(mlx5e_fs_get_ttc(priv->fs, false));
 err_destroy_rx_res:
 	mlx5e_rx_res_destroy(priv->rx_res);
 err_close_drop_rq:
@@ -1004,15 +1008,16 @@ err_close_drop_rq:
 	priv->rx_res = NULL;
 err_free_fs:
 	mlx5e_fs_cleanup(priv->fs);
+	priv->fs = NULL;
 	return err;
 }
 
 static void mlx5e_cleanup_rep_rx(struct mlx5e_priv *priv)
 {
-	mlx5e_ethtool_cleanup_steering(priv);
+	mlx5e_ethtool_cleanup_steering(priv->fs);
 	rep_vport_rx_rule_destroy(priv);
 	mlx5e_destroy_rep_root_ft(priv);
-	mlx5_destroy_ttc_table(priv->fs->ttc);
+	mlx5_destroy_ttc_table(mlx5e_fs_get_ttc(priv->fs, false));
 	mlx5e_rx_res_destroy(priv->rx_res);
 	mlx5e_close_drop_rq(&priv->drop_rq);
 	mlx5e_rx_res_free(priv->rx_res);
@@ -1176,6 +1181,8 @@ static void mlx5e_uplink_rep_enable(struct mlx5e_priv *priv)
 	struct mlx5_core_dev *mdev = priv->mdev;
 	u16 max_mtu;
 
+	mlx5e_ipsec_init(priv);
+
 	netdev->min_mtu = ETH_MIN_MTU;
 	mlx5_query_port_max_mtu(priv->mdev, &max_mtu, 1);
 	netdev->max_mtu = MLX5E_HW2SW_MTU(&priv->channels.params, max_mtu);
@@ -1222,6 +1229,8 @@ static void mlx5e_uplink_rep_disable(struct mlx5e_priv *priv)
 	mlx5e_rep_tc_disable(priv);
 	mlx5_lag_remove_netdev(mdev, priv->netdev);
 	mlx5_vxlan_reset_to_default(mdev->vxlan);
+
+	mlx5e_ipsec_cleanup(priv);
 }
 
 static MLX5E_DEFINE_STATS_GRP(sw_rep, 0);

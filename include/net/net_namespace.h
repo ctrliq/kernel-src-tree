@@ -215,6 +215,7 @@ struct net {
 	RH_KABI_EXTEND(struct cpumask *core_rps_default_mask)
 #endif
 	RH_KABI_EXTEND(u64 nft_table_handle)
+	RH_KABI_EXTEND(int	sysctl_txrehash)
 
 } __randomize_layout;
 

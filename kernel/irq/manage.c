@@ -1390,11 +1390,27 @@ static bool irq_supports_nmi(struct irq_desc *desc)
 
 static int irq_nmi_setup(struct irq_desc *desc)
 {
+#ifdef CONFIG_ARM64
+	struct irq_data *d = irq_desc_get_irq_data(desc);
+	struct irq_chip *c = d->chip;
+
+	extern int gic_irq_nmi_setup(struct irq_data *d);
+	return c->flags & IRQCHIP_GIC ? gic_irq_nmi_setup(d) : -EINVAL;
+#else
 	return -EINVAL;
+#endif
 }
 
 static void irq_nmi_teardown(struct irq_desc *desc)
 {
+#ifdef CONFIG_ARM64
+	struct irq_data *d = irq_desc_get_irq_data(desc);
+	struct irq_chip *c = d->chip;
+
+	extern void gic_irq_nmi_teardown(struct irq_data *d);
+	if (c->flags & IRQCHIP_GIC)
+		gic_irq_nmi_teardown(d);
+#endif
 }
 
 static int

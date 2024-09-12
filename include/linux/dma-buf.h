@@ -327,15 +327,6 @@ struct dma_buf {
 	const struct dma_buf_ops *ops;
 
 	/**
-	 * @lock:
-	 *
-	 * Used internally to serialize list manipulation, attach/detach and
-	 * vmap/unmap. Note that in many cases this is superseeded by
-	 * dma_resv_lock() on @resv.
-	 */
-	struct mutex lock;
-
-	/**
 	 * @vmapping_counter:
 	 *
 	 * Used internally to refcnt the vmaps returned by dma_buf_vmap().
@@ -365,7 +356,7 @@ struct dma_buf {
 	 */
 	const char *name;
 
-	/** @name_lock: Spinlock to protect name acces for read access. */
+	/** @name_lock: Spinlock to protect name access for read access. */
 	spinlock_t name_lock;
 
 	/**
@@ -402,7 +393,7 @@ struct dma_buf {
 	 *   anything the userspace API considers write access.
 	 *
 	 * - Drivers may just always add a write fence, since that only
-	 *   causes unecessarily synchronization, but no correctness issues.
+	 *   causes unnecessary synchronization, but no correctness issues.
 	 *
 	 * - Some drivers only expose a synchronous userspace API with no
 	 *   pipelining across drivers. These do not set any fences for their

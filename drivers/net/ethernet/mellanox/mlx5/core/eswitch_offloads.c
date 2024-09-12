@@ -71,7 +71,9 @@
 #define MLX5_ESW_VPORT_TBL_SIZE 128
 #define MLX5_ESW_VPORT_TBL_NUM_GROUPS  4
 
-static const struct esw_vport_tbl_namespace mlx5_esw_vport_tbl_mirror_ns = {
+#define MLX5_ESW_FT_OFFLOADS_DROP_RULE (1)
+
+static struct esw_vport_tbl_namespace mlx5_esw_vport_tbl_mirror_ns = {
 	.max_fte = MLX5_ESW_VPORT_TBL_SIZE,
 	.max_num_groups = MLX5_ESW_VPORT_TBL_NUM_GROUPS,
 	.flags = 0,
@@ -1785,7 +1787,7 @@ static void esw_destroy_offloads_fdb_tables(struct mlx5_eswitch *esw)
 	atomic64_set(&esw->user_count, 0);
 }
 
-static int esw_get_offloads_ft_size(struct mlx5_eswitch *esw)
+static int esw_get_nr_ft_offloads_steering_src_ports(struct mlx5_eswitch *esw)
 {
 	int nvports;
 
@@ -1810,7 +1812,8 @@ static int esw_create_offloads_table(struct mlx5_eswitch *esw)
 		return -EOPNOTSUPP;
 	}
 
-	ft_attr.max_fte = esw_get_offloads_ft_size(esw);
+	ft_attr.max_fte = esw_get_nr_ft_offloads_steering_src_ports(esw) +
+			  MLX5_ESW_FT_OFFLOADS_DROP_RULE;
 	ft_attr.prio = 1;
 
 	ft_offloads = mlx5_create_flow_table(ns, &ft_attr);
@@ -1839,7 +1842,7 @@ static int esw_create_vport_rx_group(struct mlx5_eswitch *esw)
 	int nvports;
 	int err = 0;
 
-	nvports = esw_get_offloads_ft_size(esw);
+	nvports = esw_get_nr_ft_offloads_steering_src_ports(esw);
 	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
 	if (!flow_group_in)
 		return -ENOMEM;
@@ -1867,6 +1870,52 @@ out:
 static void esw_destroy_vport_rx_group(struct mlx5_eswitch *esw)
 {
 	mlx5_destroy_flow_group(esw->offloads.vport_rx_group);
+}
+
+static int esw_create_vport_rx_drop_rule_index(struct mlx5_eswitch *esw)
+{
+	/* ft_offloads table is enlarged by MLX5_ESW_FT_OFFLOADS_DROP_RULE (1)
+	 * for the drop rule, which is placed at the end of the table.
+	 * So return the total of vport and int_port as rule index.
+	 */
+	return esw_get_nr_ft_offloads_steering_src_ports(esw);
+}
+
+static int esw_create_vport_rx_drop_group(struct mlx5_eswitch *esw)
+{
+	int inlen = MLX5_ST_SZ_BYTES(create_flow_group_in);
+	struct mlx5_flow_group *g;
+	u32 *flow_group_in;
+	int flow_index;
+	int err = 0;
+
+	flow_index = esw_create_vport_rx_drop_rule_index(esw);
+
+	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
+	if (!flow_group_in)
+		return -ENOMEM;
+
+	MLX5_SET(create_flow_group_in, flow_group_in, start_flow_index, flow_index);
+	MLX5_SET(create_flow_group_in, flow_group_in, end_flow_index, flow_index);
+
+	g = mlx5_create_flow_group(esw->offloads.ft_offloads, flow_group_in);
+
+	if (IS_ERR(g)) {
+		err = PTR_ERR(g);
+		mlx5_core_warn(esw->dev, "Failed to create vport rx drop group err %d\n", err);
+		goto out;
+	}
+
+	esw->offloads.vport_rx_drop_group = g;
+out:
+	kvfree(flow_group_in);
+	return err;
+}
+
+static void esw_destroy_vport_rx_drop_group(struct mlx5_eswitch *esw)
+{
+	if (esw->offloads.vport_rx_drop_group)
+		mlx5_destroy_flow_group(esw->offloads.vport_rx_drop_group);
 }
 
 struct mlx5_flow_handle *
@@ -1915,6 +1964,70 @@ mlx5_eswitch_create_vport_rx_rule(struct mlx5_eswitch *esw, u16 vport,
 out:
 	kvfree(spec);
 	return flow_rule;
+}
+
+static int esw_create_vport_rx_drop_rule(struct mlx5_eswitch *esw)
+{
+	struct mlx5_flow_act flow_act = {};
+	struct mlx5_flow_handle *flow_rule;
+
+	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_DROP;
+	flow_rule = mlx5_add_flow_rules(esw->offloads.ft_offloads, NULL,
+					&flow_act, NULL, 0);
+	if (IS_ERR(flow_rule)) {
+		esw_warn(esw->dev,
+			 "fs offloads: Failed to add vport rx drop rule err %ld\n",
+			 PTR_ERR(flow_rule));
+		return PTR_ERR(flow_rule);
+	}
+
+	esw->offloads.vport_rx_drop_rule = flow_rule;
+
+	return 0;
+}
+
+static void esw_destroy_vport_rx_drop_rule(struct mlx5_eswitch *esw)
+{
+	if (esw->offloads.vport_rx_drop_rule)
+		mlx5_del_flow_rules(esw->offloads.vport_rx_drop_rule);
+}
+
+static int mlx5_eswitch_inline_mode_get(struct mlx5_eswitch *esw, u8 *mode)
+{
+	u8 prev_mlx5_mode, mlx5_mode = MLX5_INLINE_MODE_L2;
+	struct mlx5_core_dev *dev = esw->dev;
+	struct mlx5_vport *vport;
+	unsigned long i;
+
+	if (!MLX5_CAP_GEN(dev, vport_group_manager))
+		return -EOPNOTSUPP;
+
+	if (!mlx5_esw_is_fdb_created(esw))
+		return -EOPNOTSUPP;
+
+	switch (MLX5_CAP_ETH(dev, wqe_inline_mode)) {
+	case MLX5_CAP_INLINE_MODE_NOT_REQUIRED:
+		mlx5_mode = MLX5_INLINE_MODE_NONE;
+		goto out;
+	case MLX5_CAP_INLINE_MODE_L2:
+		mlx5_mode = MLX5_INLINE_MODE_L2;
+		goto out;
+	case MLX5_CAP_INLINE_MODE_VPORT_CONTEXT:
+		goto query_vports;
+	}
+
+query_vports:
+	mlx5_query_nic_vport_min_inline(dev, esw->first_host_vport, &prev_mlx5_mode);
+	mlx5_esw_for_each_host_func_vport(esw, i, vport, esw->esw_funcs.num_vfs) {
+		mlx5_query_nic_vport_min_inline(dev, vport->vport, &mlx5_mode);
+		if (prev_mlx5_mode != mlx5_mode)
+			return -EINVAL;
+		prev_mlx5_mode = mlx5_mode;
+	}
+
+out:
+	*mode = mlx5_mode;
+	return 0;
 }
 
 static void esw_destroy_restore_table(struct mlx5_eswitch *esw)
@@ -2018,44 +2131,6 @@ out_free:
 	kvfree(flow_group_in);
 
 	return err;
-}
-
-static int mlx5_eswitch_inline_mode_get(struct mlx5_eswitch *esw, u8 *mode)
-{
-	u8 prev_mlx5_mode, mlx5_mode = MLX5_INLINE_MODE_L2;
-	struct mlx5_core_dev *dev = esw->dev;
-	struct mlx5_vport *vport;
-	unsigned long i;
-
-	if (!MLX5_CAP_GEN(dev, vport_group_manager))
-		return -EOPNOTSUPP;
-
-	if (!mlx5_esw_is_fdb_created(esw))
-		return -EOPNOTSUPP;
-
-	switch (MLX5_CAP_ETH(dev, wqe_inline_mode)) {
-	case MLX5_CAP_INLINE_MODE_NOT_REQUIRED:
-		mlx5_mode = MLX5_INLINE_MODE_NONE;
-		goto out;
-	case MLX5_CAP_INLINE_MODE_L2:
-		mlx5_mode = MLX5_INLINE_MODE_L2;
-		goto out;
-	case MLX5_CAP_INLINE_MODE_VPORT_CONTEXT:
-		goto query_vports;
-	}
-
-query_vports:
-	mlx5_query_nic_vport_min_inline(dev, esw->first_host_vport, &prev_mlx5_mode);
-	mlx5_esw_for_each_host_func_vport(esw, i, vport, esw->esw_funcs.num_vfs) {
-		mlx5_query_nic_vport_min_inline(dev, vport->vport, &mlx5_mode);
-		if (prev_mlx5_mode != mlx5_mode)
-			return -EINVAL;
-		prev_mlx5_mode = mlx5_mode;
-	}
-
-out:
-	*mode = mlx5_mode;
-	return 0;
 }
 
 static int esw_offloads_start(struct mlx5_eswitch *esw,
@@ -2907,8 +2982,20 @@ static int esw_offloads_steering_init(struct mlx5_eswitch *esw)
 	if (err)
 		goto create_fg_err;
 
+	err = esw_create_vport_rx_drop_group(esw);
+	if (err)
+		goto create_rx_drop_fg_err;
+
+	err = esw_create_vport_rx_drop_rule(esw);
+	if (err)
+		goto create_rx_drop_rule_err;
+
 	return 0;
 
+create_rx_drop_rule_err:
+	esw_destroy_vport_rx_drop_group(esw);
+create_rx_drop_fg_err:
+	esw_destroy_vport_rx_group(esw);
 create_fg_err:
 	esw_destroy_offloads_fdb_tables(esw);
 create_fdb_err:
@@ -2926,6 +3013,8 @@ create_indir_err:
 
 static void esw_offloads_steering_cleanup(struct mlx5_eswitch *esw)
 {
+	esw_destroy_vport_rx_drop_rule(esw);
+	esw_destroy_vport_rx_drop_group(esw);
 	esw_destroy_vport_rx_group(esw);
 	esw_destroy_offloads_fdb_tables(esw);
 	esw_destroy_restore_table(esw);

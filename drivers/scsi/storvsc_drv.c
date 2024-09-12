@@ -1575,6 +1575,8 @@ static int storvsc_device_configure(struct scsi_device *sdevice)
 	/* Ensure there are no gaps in presented sgls */
 	blk_queue_virt_boundary(sdevice->request_queue, HV_HYP_PAGE_SIZE - 1);
 
+	/* storvsc devices don't support MAINTENANCE_IN SCSI cmd */
+	sdevice->no_report_opcodes = 1;
 	sdevice->no_write_same = 1;
 
 	/*

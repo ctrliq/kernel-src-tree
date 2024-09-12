@@ -327,7 +327,6 @@ struct mlx5e_params {
 		} channel;
 	} mqprio;
 	bool rx_cqe_compress_def;
-	bool tunneled_offload_en;
 	struct dim_cq_moder rx_cq_moderation;
 	struct dim_cq_moder tx_cq_moderation;
 	struct mlx5e_packet_merge_param packet_merge;
@@ -468,6 +467,7 @@ struct mlx5e_txqsq {
 	struct mlx5_clock         *clock;
 	struct net_device         *netdev;
 	struct mlx5_core_dev      *mdev;
+	struct mlx5e_channel      *channel;
 	struct mlx5e_priv         *priv;
 
 	/* control path */
@@ -858,11 +858,6 @@ enum {
 	MLX5E_STATE_XDP_ACTIVE,
 };
 
-enum {
-	MLX5E_TC_PRIO = 0,
-	MLX5E_NIC_PRIO
-};
-
 struct mlx5e_modify_sq_param {
 	int curr_state;
 	int next_state;
@@ -976,6 +971,7 @@ struct mlx5e_priv {
 	struct mlx5e_scratchpad    scratchpad;
 	struct mlx5e_htb          *htb;
 	struct mlx5e_mqprio_rl    *mqprio_rl;
+	struct dentry             *dfs_root;
 };
 
 struct mlx5e_rx_handlers {

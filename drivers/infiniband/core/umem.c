@@ -156,7 +156,7 @@ struct ib_umem *ib_umem_get(struct ib_udata *udata, unsigned long addr,
 	struct mm_struct *mm;
 	unsigned long npages;
 	int pinned, ret;
-	unsigned int gup_flags = FOLL_LONGTERM;
+	unsigned int gup_flags = FOLL_WRITE;
 
 	if (!udata)
 		return ERR_PTR(-EIO);
@@ -218,8 +218,8 @@ struct ib_umem *ib_umem_get(struct ib_udata *udata, unsigned long addr,
 
 	cur_base = addr & PAGE_MASK;
 
-	if (umem->writable)
-		gup_flags |= FOLL_WRITE;
+	if (!umem->writable)
+		gup_flags |= FOLL_FORCE;
 
 	while (npages) {
 		cond_resched();
@@ -227,7 +227,7 @@ struct ib_umem *ib_umem_get(struct ib_udata *udata, unsigned long addr,
 					  min_t(unsigned long, npages,
 						PAGE_SIZE /
 						sizeof(struct page *)),
-					  gup_flags, page_list);
+					  gup_flags | FOLL_LONGTERM, page_list);
 		if (pinned < 0) {
 			ret = pinned;
 			goto umem_release;

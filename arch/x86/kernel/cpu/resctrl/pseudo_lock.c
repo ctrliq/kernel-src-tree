@@ -690,8 +690,8 @@ int rdtgroup_locksetup_enter(struct rdtgroup *rdtgrp)
 	 *   resource, the portion of cache used by it should be made
 	 *   unavailable to all future allocations from both resources.
 	 */
-	if (rdt_resources_all[RDT_RESOURCE_L3DATA].alloc_enabled ||
-	    rdt_resources_all[RDT_RESOURCE_L2DATA].alloc_enabled) {
+	if (resctrl_arch_get_cdp_enabled(RDT_RESOURCE_L3) ||
+	    resctrl_arch_get_cdp_enabled(RDT_RESOURCE_L2)) {
 		rdt_last_cmd_puts("CDP enabled\n");
 		return -EINVAL;
 	}
@@ -837,7 +837,7 @@ bool rdtgroup_pseudo_locked_in_hierarchy(struct rdt_domain *d)
 	 * First determine which cpus have pseudo-locked regions
 	 * associated with them.
 	 */
-	for_each_alloc_enabled_rdt_resource(r) {
+	for_each_alloc_capable_rdt_resource(r) {
 		list_for_each_entry(d_i, &r->domains, list) {
 			if (d_i->plr)
 				cpumask_or(cpu_with_psl, cpu_with_psl,
@@ -1319,7 +1319,7 @@ int rdtgroup_pseudo_lock_create(struct rdtgroup *rdtgrp)
 		 * If the thread does not get on the CPU for whatever
 		 * reason and the process which sets up the region is
 		 * interrupted then this will leave the thread in runnable
-		 * state and once it gets on the CPU it will derefence
+		 * state and once it gets on the CPU it will dereference
 		 * the cleared, but not freed, plr struct resulting in an
 		 * empty pseudo-locking loop.
 		 */
@@ -1403,7 +1403,7 @@ out:
  * group is removed from user space via a "rmdir" from userspace or the
  * unmount of the resctrl filesystem. On removal the resource group does
  * not go back to pseudo-locksetup mode before it is removed, instead it is
- * removed directly. There is thus assymmetry with the creation where the
+ * removed directly. There is thus asymmetry with the creation where the
  * &struct pseudo_lock_region is removed here while it was not created in
  * rdtgroup_pseudo_lock_create().
  *

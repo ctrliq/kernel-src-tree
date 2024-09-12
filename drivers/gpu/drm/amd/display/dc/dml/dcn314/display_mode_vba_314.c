@@ -27,7 +27,6 @@
 #define UNIT_TEST 0
 #if !UNIT_TEST
 #include "dc.h"
-#include "dc_link.h"
 #endif
 #include "../display_mode_lib.h"
 #include "display_mode_vba_314.h"
@@ -900,7 +899,9 @@ static bool CalculatePrefetchSchedule(
 	double DSTTotalPixelsAfterScaler;
 	double LineTime;
 	double dst_y_prefetch_equ;
+#ifdef __DML_VBA_DEBUG__
 	double Tsw_oto;
+#endif
 	double prefetch_bw_oto;
 	double prefetch_bw_pr;
 	double Tvm_oto;
@@ -1074,17 +1075,18 @@ static bool CalculatePrefetchSchedule(
 	else
 		bytes_pp = myPipe->BytePerPixelY + myPipe->BytePerPixelC;
 	/*rev 99*/
-	prefetch_bw_pr = dml_min(1, bytes_pp * myPipe->PixelClock / (double) myPipe->DPPPerPlane);
+	prefetch_bw_pr = bytes_pp * myPipe->PixelClock / (double) myPipe->DPPPerPlane;
+	prefetch_bw_pr = dml_min(1, myPipe->VRatio) * prefetch_bw_pr;
 	max_Tsw = dml_max(PrefetchSourceLinesY, PrefetchSourceLinesC) * LineTime;
 	prefetch_sw_bytes = PrefetchSourceLinesY * swath_width_luma_ub * myPipe->BytePerPixelY + PrefetchSourceLinesC * swath_width_chroma_ub * myPipe->BytePerPixelC;
-	prefetch_bw_oto = dml_max(bytes_pp * myPipe->PixelClock / myPipe->DPPPerPlane, prefetch_sw_bytes / (dml_max(PrefetchSourceLinesY, PrefetchSourceLinesC) * LineTime));
 	prefetch_bw_oto = dml_max(prefetch_bw_pr, prefetch_sw_bytes / max_Tsw);
 
 	min_Lsw = dml_max(1, dml_max(PrefetchSourceLinesY, PrefetchSourceLinesC) / max_vratio_pre);
 	Lsw_oto = dml_ceil(4 * dml_max(prefetch_sw_bytes / prefetch_bw_oto / LineTime, min_Lsw), 1) / 4;
+#ifdef __DML_VBA_DEBUG__
 	Tsw_oto = Lsw_oto * LineTime;
+#endif
 
-	prefetch_bw_oto = (PrefetchSourceLinesY * swath_width_luma_ub * myPipe->BytePerPixelY + PrefetchSourceLinesC * swath_width_chroma_ub * myPipe->BytePerPixelC) / Tsw_oto;
 
 #ifdef __DML_VBA_DEBUG__
 	dml_print("DML: HTotal: %d\n", myPipe->HTotal);
@@ -1306,7 +1308,7 @@ static bool CalculatePrefetchSchedule(
 		//                      - ((NumberOfCursors > 0 || GPUVMEnable || DCCEnable) ?
 				- ((GPUVMEnable || myPipe->DCCEnable) ? (*DestinationLinesToRequestVMInVBlank + 2 * *DestinationLinesToRequestRowInVBlank) : 0.0); // TODO: Did someone else add this??
 #else
-				LinesToRequestPrefetchPixelData = *DestinationLinesForPrefetch - *DestinationLinesToRequestVMInVBlank - 2 * *DestinationLinesToRequestRowInVBlank;
+		LinesToRequestPrefetchPixelData = *DestinationLinesForPrefetch - *DestinationLinesToRequestVMInVBlank - 2 * *DestinationLinesToRequestRowInVBlank;
 #endif
 
 #ifdef __DML_VBA_DEBUG__
@@ -3184,7 +3186,7 @@ static void DISPCLKDPPCLKDCFCLKDeepSleepPrefetchParametersWatermarksAndPerforman
 		} else {
 			v->MIN_DST_Y_NEXT_START[k] = v->VTotal[k] - v->VFrontPorch[k] + v->VTotal[k] - v->VActive[k] - v->VStartup[k];
 		}
-		v->MIN_DST_Y_NEXT_START[k] += dml_floor(4.0 * v->TSetup[k] / (double)v->HTotal[k] / v->PixelClock[k], 1.0) / 4.0;
+		v->MIN_DST_Y_NEXT_START[k] += dml_floor(4.0 * v->TSetup[k] / ((double)v->HTotal[k] / v->PixelClock[k]), 1.0) / 4.0;
 		if (((v->VUpdateOffsetPix[k] + v->VUpdateWidthPix[k] + v->VReadyOffsetPix[k]) / v->HTotal[k])
 				<= (isInterlaceTiming ?
 						dml_floor((v->VTotal[k] - v->VActive[k] - v->VFrontPorch[k] - v->VStartup[k]) / 2.0, 1.0) :
@@ -5180,7 +5182,7 @@ void dml314_ModeSupportAndSystemConfigurationFull(struct display_mode_lib *mode_
 							v->SwathHeightYThisState[k],
 							v->SwathHeightCThisState[k],
 							v->HTotal[k] / v->PixelClock[k],
-							v->UrgentLatency,
+							v->UrgLatency[i],
 							v->CursorBufferSize,
 							v->CursorWidth[k][0],
 							v->CursorBPP[k][0],
@@ -6825,8 +6827,6 @@ static void CalculateSwathWidth(
 		{
 		int surface_width_ub_l = dml_ceil(SurfaceWidthY[k], Read256BytesBlockWidthY[k]);
 		int surface_height_ub_l = dml_ceil(SurfaceHeightY[k], Read256BytesBlockHeightY[k]);
-		int surface_width_ub_c = dml_ceil(SurfaceWidthC[k], Read256BytesBlockWidthC[k]);
-		int surface_height_ub_c = dml_ceil(SurfaceHeightC[k], Read256BytesBlockHeightC[k]);
 
 #ifdef __DML_VBA_DEBUG__
 		dml_print("DML::%s: k=%d surface_width_ub_l=%0d\n", __func__, k, surface_width_ub_l);
@@ -6837,6 +6837,8 @@ static void CalculateSwathWidth(
 			MaximumSwathHeightC[k] = Read256BytesBlockHeightC[k];
 			swath_width_luma_ub[k] = dml_min(surface_width_ub_l, (int) dml_ceil(SwathWidthY[k] - 1, Read256BytesBlockWidthY[k]) + Read256BytesBlockWidthY[k]);
 			if (BytePerPixC[k] > 0) {
+				int surface_width_ub_c = dml_ceil(SurfaceWidthC[k], Read256BytesBlockWidthC[k]);
+
 				swath_width_chroma_ub[k] = dml_min(
 						surface_width_ub_c,
 						(int) dml_ceil(SwathWidthC[k] - 1, Read256BytesBlockWidthC[k]) + Read256BytesBlockWidthC[k]);
@@ -6848,6 +6850,8 @@ static void CalculateSwathWidth(
 			MaximumSwathHeightC[k] = Read256BytesBlockWidthC[k];
 			swath_width_luma_ub[k] = dml_min(surface_height_ub_l, (int) dml_ceil(SwathWidthY[k] - 1, Read256BytesBlockHeightY[k]) + Read256BytesBlockHeightY[k]);
 			if (BytePerPixC[k] > 0) {
+				int surface_height_ub_c = dml_ceil(SurfaceHeightC[k], Read256BytesBlockHeightC[k]);
+
 				swath_width_chroma_ub[k] = dml_min(
 						surface_height_ub_c,
 						(int) dml_ceil(SwathWidthC[k] - 1, Read256BytesBlockHeightC[k]) + Read256BytesBlockHeightC[k]);
@@ -7183,7 +7187,7 @@ static unsigned int CalculateMaxVStartup(
 	double line_time_us = HTotal / PixelClock;
 	unsigned int vblank_actual = VTotal - VActive;
 	unsigned int vblank_nom_default_in_line = dml_floor(VBlankNomDefaultUS / line_time_us, 1.0);
-	unsigned int vblank_nom_input = dml_min(VBlankNom, vblank_nom_default_in_line);
+	unsigned int vblank_nom_input = VBlankNom; //dml_min(VBlankNom, vblank_nom_default_in_line);
 	unsigned int vblank_avail = vblank_nom_input == 0 ? vblank_nom_default_in_line : vblank_nom_input;
 
 	vblank_size = (unsigned int) dml_min(vblank_actual, vblank_avail);

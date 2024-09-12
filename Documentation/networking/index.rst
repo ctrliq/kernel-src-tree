@@ -26,6 +26,7 @@ Contents:
    tls-offload
    filter
    mptcp-sysctl
+   smc-sysctl
    statistics
    switchdev
    tc-queue-filters
