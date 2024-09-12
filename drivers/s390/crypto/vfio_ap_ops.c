@@ -356,6 +356,9 @@ static int vfio_ap_validate_nib(struct kvm_vcpu *vcpu, unsigned long *nib,
 				unsigned long *g_pfn)
 {
 	*nib = vcpu->run->s.regs.gprs[2];
+	if (!*nib)
+		return -EINVAL;
+
 	*g_pfn = *nib >> PAGE_SHIFT;
 
 	if (kvm_is_error_hva(gfn_to_hva(vcpu->kvm, *g_pfn)))
