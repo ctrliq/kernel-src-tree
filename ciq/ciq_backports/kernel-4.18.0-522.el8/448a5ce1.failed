@@ -1,0 +1,66 @@
+udp6: Fix race condition in udp6_sendmsg & connect
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-522.el8
+commit-author Vladislav Efanov <VEfanov@ispras.ru>
+commit 448a5ce1120c5bdbce1f1ccdabcd31c7d029f328
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-522.el8/448a5ce1.failed
+
+Syzkaller got the following report:
+BUG: KASAN: use-after-free in sk_setup_caps+0x621/0x690 net/core/sock.c:2018
+Read of size 8 at addr ffff888027f82780 by task syz-executor276/3255
+
+The function sk_setup_caps (called by ip6_sk_dst_store_flow->
+ip6_dst_store) referenced already freed memory as this memory was
+freed by parallel task in udpv6_sendmsg->ip6_sk_dst_lookup_flow->
+sk_dst_check.
+
+          task1 (connect)              task2 (udp6_sendmsg)
+        sk_setup_caps->sk_dst_set |
+                                  |  sk_dst_check->
+                                  |      sk_dst_set
+                                  |      dst_release
+        sk_setup_caps references  |
+        to already freed dst_entry|
+
+The reason for this race condition is: sk_setup_caps() keeps using
+the dst after transferring the ownership to the dst cache.
+
+Found by Linux Verification Center (linuxtesting.org) with syzkaller.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+	Signed-off-by: Vladislav Efanov <VEfanov@ispras.ru>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 448a5ce1120c5bdbce1f1ccdabcd31c7d029f328)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/sock.c
+diff --cc net/core/sock.c
+index 84ad6223e38b,24f2761bdb1d..000000000000
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@@ -2035,11 -2381,13 +2035,17 @@@ void sk_setup_caps(struct sock *sk, str
+  {
+  	u32 max_segs = 1;
+  
+++<<<<<<< HEAD
+ +	sk_dst_set(sk, dst);
+ +	sk->sk_route_caps = dst->dev->features | sk->sk_route_forced_caps;
+++=======
++ 	sk->sk_route_caps = dst->dev->features;
++ 	if (sk_is_tcp(sk))
++ 		sk->sk_route_caps |= NETIF_F_GSO;
+++>>>>>>> 448a5ce1120c (udp6: Fix race condition in udp6_sendmsg & connect)
+  	if (sk->sk_route_caps & NETIF_F_GSO)
+  		sk->sk_route_caps |= NETIF_F_GSO_SOFTWARE;
+ -	if (unlikely(sk->sk_gso_disabled))
+ -		sk->sk_route_caps &= ~NETIF_F_GSO_MASK;
+ +	sk->sk_route_caps &= ~sk->sk_route_nocaps;
+  	if (sk_can_gso(sk)) {
+  		if (dst->header_len && !xfrm_dst_offload_ok(dst)) {
+  			sk->sk_route_caps &= ~NETIF_F_GSO_MASK;
+* Unmerged path net/core/sock.c
