@@ -1,0 +1,208 @@
+ice: merge ice_mbx_report_malvf with ice_mbx_vf_state_handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-535.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 07cc1a942216d1f211f1c641af8b6f810bb16699
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-535.el8/07cc1a94.failed
+
+The ice_mbx_report_malvf function is used to update the
+ice_mbx_vf_info.malicious member after we detect a malicious VF. This is
+done by calling ice_mbx_report_malvf after ice_mbx_vf_state_handler sets
+its "is_malvf" return parameter true.
+
+Instead of requiring two steps, directly update the malicious bit in the
+state handler, and remove the need for separately calling
+ice_mbx_report_malvf.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+	Tested-by: Marek Szlosek <marek.szlosek@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 07cc1a942216d1f211f1c641af8b6f810bb16699)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_vf_mbx.h
+diff --cc drivers/net/ethernet/intel/ice/ice_vf_mbx.h
+index a6d42f467dc5,41250519bc56..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_vf_mbx.h
++++ b/drivers/net/ethernet/intel/ice/ice_vf_mbx.h
+@@@ -25,10 -25,6 +25,13 @@@ ice_mbx_vf_state_handler(struct ice_hw 
+  void ice_mbx_clear_malvf(struct ice_mbx_vf_info *vf_info);
+  void ice_mbx_init_vf_info(struct ice_hw *hw, struct ice_mbx_vf_info *vf_info);
+  void ice_mbx_init_snapshot(struct ice_hw *hw);
+++<<<<<<< HEAD
+ +void ice_mbx_deinit_snapshot(struct ice_hw *hw);
+ +int
+ +ice_mbx_report_malvf(struct ice_hw *hw, struct ice_mbx_vf_info *vf_info,
+ +		     bool *report_malvf);
+++=======
+++>>>>>>> 07cc1a942216 (ice: merge ice_mbx_report_malvf with ice_mbx_vf_state_handler)
+  #else /* CONFIG_PCI_IOV */
+  static inline int
+  ice_aq_send_msg_to_vf(struct ice_hw __always_unused *hw,
+diff --git a/drivers/net/ethernet/intel/ice/ice_sriov.c b/drivers/net/ethernet/intel/ice/ice_sriov.c
+index 19ad94f3334c..2578dfe81c24 100644
+--- a/drivers/net/ethernet/intel/ice/ice_sriov.c
++++ b/drivers/net/ethernet/intel/ice/ice_sriov.c
+@@ -1793,7 +1793,7 @@ ice_is_malicious_vf(struct ice_pf *pf, struct ice_rq_event_info *event,
+ 	s16 vf_id = le16_to_cpu(event->desc.retval);
+ 	struct device *dev = ice_pf_to_dev(pf);
+ 	struct ice_mbx_data mbxdata;
+-	bool malvf = false;
++	bool report_malvf = false;
+ 	struct ice_vf *vf;
+ 	int status;
+ 
+@@ -1810,33 +1810,23 @@ ice_is_malicious_vf(struct ice_pf *pf, struct ice_rq_event_info *event,
+ #define ICE_MBX_OVERFLOW_WATERMARK 64
+ 	mbxdata.async_watermark_val = ICE_MBX_OVERFLOW_WATERMARK;
+ 
+-	/* check to see if we have a malicious VF */
+-	status = ice_mbx_vf_state_handler(&pf->hw, &mbxdata, &vf->mbx_info, &malvf);
++	/* check to see if we have a newly malicious VF */
++	status = ice_mbx_vf_state_handler(&pf->hw, &mbxdata, &vf->mbx_info,
++					  &report_malvf);
+ 	if (status)
+ 		goto out_put_vf;
+ 
+-	if (malvf) {
+-		bool report_vf = false;
++	if (report_malvf) {
++		struct ice_vsi *pf_vsi = ice_get_main_vsi(pf);
+ 
+-		/* if the VF is malicious and we haven't let the user
+-		 * know about it, then let them know now
+-		 */
+-		status = ice_mbx_report_malvf(&pf->hw, &vf->mbx_info,
+-					      &report_vf);
+-		if (status)
+-			dev_dbg(dev, "Error reporting malicious VF\n");
+-
+-		if (report_vf) {
+-			struct ice_vsi *pf_vsi = ice_get_main_vsi(pf);
+-
+-			if (pf_vsi)
+-				dev_warn(dev, "VF MAC %pM on PF MAC %pM is generating asynchronous messages and may be overflowing the PF message queue. Please see the Adapter User Guide for more information\n",
+-					 &vf->dev_lan_addr[0],
+-					 pf_vsi->netdev->dev_addr);
+-		}
++		if (pf_vsi)
++			dev_warn(dev, "VF MAC %pM on PF MAC %pM is generating asynchronous messages and may be overflowing the PF message queue. Please see the Adapter User Guide for more information\n",
++				 &vf->dev_lan_addr[0],
++				 pf_vsi->netdev->dev_addr);
+ 	}
+ 
+ out_put_vf:
+ 	ice_put_vf(vf);
+-	return malvf;
++
++	return vf->mbx_info.malicious;
+ }
+diff --git a/drivers/net/ethernet/intel/ice/ice_vf_mbx.c b/drivers/net/ethernet/intel/ice/ice_vf_mbx.c
+index 4bfed5fb3a88..09181d11ffae 100644
+--- a/drivers/net/ethernet/intel/ice/ice_vf_mbx.c
++++ b/drivers/net/ethernet/intel/ice/ice_vf_mbx.c
+@@ -215,7 +215,7 @@ ice_mbx_detect_malvf(struct ice_hw *hw, struct ice_mbx_vf_info *vf_info,
+  * @hw: pointer to the HW struct
+  * @mbx_data: pointer to structure containing mailbox data
+  * @vf_info: mailbox tracking structure for the VF in question
+- * @is_malvf: boolean output to indicate if VF is malicious
++ * @report_malvf: boolean output to indicate whether VF should be reported
+  *
+  * The function serves as an entry point for the malicious VF
+  * detection algorithm by handling the different states and state
+@@ -234,25 +234,24 @@ ice_mbx_detect_malvf(struct ice_hw *hw, struct ice_mbx_vf_info *vf_info,
+  * the static snapshot and look for a malicious VF.
+  */
+ int
+-ice_mbx_vf_state_handler(struct ice_hw *hw,
+-			 struct ice_mbx_data *mbx_data,
+-			 struct ice_mbx_vf_info *vf_info,
+-			 bool *is_malvf)
++ice_mbx_vf_state_handler(struct ice_hw *hw, struct ice_mbx_data *mbx_data,
++			 struct ice_mbx_vf_info *vf_info, bool *report_malvf)
+ {
+ 	struct ice_mbx_snapshot *snap = &hw->mbx_snapshot;
+ 	struct ice_mbx_snap_buffer_data *snap_buf;
+ 	struct ice_ctl_q_info *cq = &hw->mailboxq;
+ 	enum ice_mbx_snapshot_state new_state;
++	bool is_malvf = false;
+ 	int status = 0;
+ 
+-	if (!is_malvf || !mbx_data)
++	if (!report_malvf || !mbx_data || !vf_info)
+ 		return -EINVAL;
+ 
++	*report_malvf = false;
++
+ 	/* When entering the mailbox state machine assume that the VF
+ 	 * is not malicious until detected.
+ 	 */
+-	*is_malvf = false;
+-
+ 	 /* Checking if max messages allowed to be processed while servicing current
+ 	  * interrupt is not less than the defined AVF message threshold.
+ 	  */
+@@ -301,8 +300,7 @@ ice_mbx_vf_state_handler(struct ice_hw *hw,
+ 		if (snap_buf->num_pending_arq >=
+ 		    mbx_data->async_watermark_val) {
+ 			new_state = ICE_MAL_VF_DETECT_STATE_DETECT;
+-			status = ice_mbx_detect_malvf(hw, vf_info, &new_state,
+-						      is_malvf);
++			status = ice_mbx_detect_malvf(hw, vf_info, &new_state, &is_malvf);
+ 		} else {
+ 			new_state = ICE_MAL_VF_DETECT_STATE_TRAVERSE;
+ 			ice_mbx_traverse(hw, &new_state);
+@@ -316,8 +314,7 @@ ice_mbx_vf_state_handler(struct ice_hw *hw,
+ 
+ 	case ICE_MAL_VF_DETECT_STATE_DETECT:
+ 		new_state = ICE_MAL_VF_DETECT_STATE_DETECT;
+-		status = ice_mbx_detect_malvf(hw, vf_info, &new_state,
+-					      is_malvf);
++		status = ice_mbx_detect_malvf(hw, vf_info, &new_state, &is_malvf);
+ 		break;
+ 
+ 	default:
+@@ -327,31 +324,13 @@ ice_mbx_vf_state_handler(struct ice_hw *hw,
+ 
+ 	snap_buf->state = new_state;
+ 
+-	return status;
+-}
+-
+-/**
+- * ice_mbx_report_malvf - Track and note malicious VF
+- * @hw: pointer to the HW struct
+- * @vf_info: the mailbox tracking info structure for a VF
+- * @report_malvf: boolean to indicate if malicious VF must be reported
+- *
+- * This function updates the malicious indicator bit in the VF mailbox
+- * tracking structure. A malicious VF must be reported only once if discovered
+- * between VF resets or loading so the function first checks if the VF has
+- * already been detected in any previous mailbox iterations.
+- */
+-int
+-ice_mbx_report_malvf(struct ice_hw *hw, struct ice_mbx_vf_info *vf_info,
+-		     bool *report_malvf)
+-{
+-	if (!report_malvf)
+-		return -EINVAL;
+-
+-	*report_malvf = !vf_info->malicious;
+-	vf_info->malicious = 1;
++	/* Only report VFs as malicious the first time we detect it */
++	if (is_malvf && !vf_info->malicious) {
++		vf_info->malicious = 1;
++		*report_malvf = true;
++	}
+ 
+-	return 0;
++	return status;
+ }
+ 
+ /**
+* Unmerged path drivers/net/ethernet/intel/ice/ice_vf_mbx.h
