@@ -1,0 +1,202 @@
+gfs2: Stop using glock holder auto-demotion for now
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.16.1.el8_6
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit e1fa9ea85ce89207d2ac0316da35a4a7736801f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.16.1.el8_6/e1fa9ea8.failed
+
+We're having unresolved issues with the glock holder auto-demotion mechanism
+introduced in commit dc732906c245.  This mechanism was assumed to be essential
+for avoiding frequent short reads and writes until commit 296abc0d91d8
+("gfs2: No short reads or writes upon glock contention").  Since then,
+when the inode glock is lost, it is simply re-acquired and the operation
+is resumed.  This means that apart from the performance penalty, we
+might as well drop the inode glock before faulting in pages, and
+re-acquire it afterwards.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit e1fa9ea85ce89207d2ac0316da35a4a7736801f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/file.c
+diff --cc fs/gfs2/file.c
+index 37f4489b53a0,2556ae1f92ea..000000000000
+--- a/fs/gfs2/file.c
++++ b/fs/gfs2/file.c
+@@@ -810,12 -831,32 +810,35 @@@ static ssize_t gfs2_file_direct_read(st
+  	ret = gfs2_glock_nq(gh);
+  	if (ret)
+  		goto out_uninit;
+++<<<<<<< HEAD
+ +
+ +	ret = iomap_dio_rw(iocb, to, &gfs2_iomap_ops, NULL, 0);
+ +	gfs2_glock_dq(gh);
+++=======
++ 	pagefault_disable();
++ 	to->nofault = true;
++ 	ret = iomap_dio_rw(iocb, to, &gfs2_iomap_ops, NULL,
++ 			   IOMAP_DIO_PARTIAL, read);
++ 	to->nofault = false;
++ 	pagefault_enable();
++ 	if (ret <= 0 && ret != -EFAULT)
++ 		goto out_unlock;
++ 	if (ret > 0)
++ 		read = ret;
++ 
++ 	if (should_fault_in_pages(to, iocb, &prev_count, &window_size)) {
++ 		gfs2_glock_dq(gh);
++ 		window_size -= fault_in_iov_iter_writeable(to, window_size);
++ 		if (window_size)
++ 			goto retry;
++ 	}
++ out_unlock:
++ 	if (gfs2_holder_queued(gh))
++ 		gfs2_glock_dq(gh);
+++>>>>>>> e1fa9ea85ce8 (gfs2: Stop using glock holder auto-demotion for now)
+  out_uninit:
+  	gfs2_holder_uninit(gh);
+ -	if (ret < 0)
+ -		return ret;
+ -	return read;
+ +	return ret;
+  }
+  
+  static ssize_t gfs2_file_direct_write(struct kiocb *iocb, struct iov_iter *from,
+@@@ -840,19 -891,38 +863,47 @@@
+  	ret = gfs2_glock_nq(gh);
+  	if (ret)
+  		goto out_uninit;
+ +
+  	/* Silently fall back to buffered I/O when writing beyond EOF */
+++<<<<<<< HEAD
+ +	if (offset + len > i_size_read(&ip->i_inode))
+ +		goto out;
+ +
+ +	ret = iomap_dio_rw(iocb, from, &gfs2_iomap_ops, NULL, 0);
+ +	if (ret == -ENOTBLK)
+ +		ret = 0;
+ +out:
+ +	gfs2_glock_dq(gh);
+++=======
++ 	if (iocb->ki_pos + iov_iter_count(from) > i_size_read(&ip->i_inode))
++ 		goto out_unlock;
++ 
++ 	from->nofault = true;
++ 	ret = iomap_dio_rw(iocb, from, &gfs2_iomap_ops, NULL,
++ 			   IOMAP_DIO_PARTIAL, written);
++ 	from->nofault = false;
++ 	if (ret <= 0) {
++ 		if (ret == -ENOTBLK)
++ 			ret = 0;
++ 		if (ret != -EFAULT)
++ 			goto out_unlock;
++ 	}
++ 	if (ret > 0)
++ 		written = ret;
++ 
++ 	if (should_fault_in_pages(from, iocb, &prev_count, &window_size)) {
++ 		gfs2_glock_dq(gh);
++ 		window_size -= fault_in_iov_iter_readable(from, window_size);
++ 		if (window_size)
++ 			goto retry;
++ 	}
++ out_unlock:
++ 	if (gfs2_holder_queued(gh))
++ 		gfs2_glock_dq(gh);
+++>>>>>>> e1fa9ea85ce8 (gfs2: Stop using glock holder auto-demotion for now)
+  out_uninit:
+  	gfs2_holder_uninit(gh);
+ -	if (ret < 0)
+ -		return ret;
+ -	return written;
+ +	return ret;
+  }
+  
+  static ssize_t gfs2_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+@@@ -897,25 -967,18 +948,32 @@@ retry
+  	pagefault_disable();
+  	ret = generic_file_read_iter(iocb, to);
+  	pagefault_enable();
+ -	if (ret <= 0 && ret != -EFAULT)
+ -		goto out_unlock;
+  	if (ret > 0)
+ -		read += ret;
+ +		written += ret;
+  
+ +	if (should_fault_in_pages(ret, to, &prev_count, &window_size)) {
+ +		size_t leftover;
+ +
+++<<<<<<< HEAD
+ +		gfs2_holder_allow_demote(&gh);
+ +		leftover = fault_in_iov_iter_writeable(to, window_size);
+ +		gfs2_holder_disallow_demote(&gh);
+ +		if (leftover != window_size) {
+ +			if (!gfs2_holder_queued(&gh)) {
+ +				if (written)
+ +					goto out_uninit;
+ +				goto retry;
+ +			}
+ +			goto retry_under_glock;
+ +		}
+++=======
++ 	if (should_fault_in_pages(to, iocb, &prev_count, &window_size)) {
++ 		gfs2_glock_dq(&gh);
++ 		window_size -= fault_in_iov_iter_writeable(to, window_size);
++ 		if (window_size)
++ 			goto retry;
+++>>>>>>> e1fa9ea85ce8 (gfs2: Stop using glock holder auto-demotion for now)
+  	}
+ -out_unlock:
+  	if (gfs2_holder_queued(&gh))
+  		gfs2_glock_dq(&gh);
+  out_uninit:
+@@@ -955,7 -1026,7 +1021,11 @@@ retry
+  	ret = gfs2_glock_nq(gh);
+  	if (ret)
+  		goto out_uninit;
+++<<<<<<< HEAD
+ +retry_under_glock:
+++=======
++ 
+++>>>>>>> e1fa9ea85ce8 (gfs2: Stop using glock holder auto-demotion for now)
+  	if (inode == sdp->sd_rindex) {
+  		struct gfs2_inode *m_ip = GFS2_I(sdp->sd_statfs_inode);
+  
+@@@ -978,22 -1049,13 +1048,29 @@@
+  	if (inode == sdp->sd_rindex)
+  		gfs2_glock_dq_uninit(statfs_gh);
+  
+ -	if (ret <= 0 && ret != -EFAULT)
+ -		goto out_unlock;
+ -
+ +	from->count = orig_count - read;
+ +	if (should_fault_in_pages(ret, from, &prev_count, &window_size)) {
+ +		size_t leftover;
+ +
+++<<<<<<< HEAD
+ +		gfs2_holder_allow_demote(gh);
+ +		leftover = fault_in_iov_iter_readable(from, window_size);
+ +		gfs2_holder_disallow_demote(gh);
+ +		if (leftover != window_size) {
+ +			from->count = min(from->count, window_size - leftover);
+ +			if (!gfs2_holder_queued(gh)) {
+ +				if (read)
+ +					goto out_uninit;
+ +				goto retry;
+ +			}
+ +			goto retry_under_glock;
+ +		}
+++=======
++ 	from->count = orig_count - written;
++ 	if (should_fault_in_pages(from, iocb, &prev_count, &window_size)) {
++ 		gfs2_glock_dq(gh);
++ 		goto retry;
+++>>>>>>> e1fa9ea85ce8 (gfs2: Stop using glock holder auto-demotion for now)
+  	}
+  out_unlock:
+  	if (gfs2_holder_queued(gh))
+* Unmerged path fs/gfs2/file.c
