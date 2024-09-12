@@ -1,0 +1,115 @@
+dm: fix a race condition in retrieve_deps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-524.el8
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit f6007dce0cd35d634d9be91ef3515a6385dcee16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-524.el8/f6007dce.failed
+
+There's a race condition in the multipath target when retrieve_deps
+races with multipath_message calling dm_get_device and dm_put_device.
+retrieve_deps walks the list of open devices without holding any lock
+but multipath may add or remove devices to the list while it is
+running. The end result may be memory corruption or use-after-free
+memory access.
+
+See this description of a UAF with multipath_message():
+https://listman.redhat.com/archives/dm-devel/2022-October/052373.html
+
+Fix this bug by introducing a new rw semaphore "devices_lock". We grab
+devices_lock for read in retrieve_deps and we grab it for write in
+dm_get_device and dm_put_device.
+
+	Reported-by: Luo Meng <luomeng12@huawei.com>
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Cc: stable@vger.kernel.org
+	Tested-by: Li Lingfeng <lilingfeng3@huawei.com>
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit f6007dce0cd35d634d9be91ef3515a6385dcee16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-table.c
+diff --cc drivers/md/dm-table.c
+index b6c2b3f18d00,37b48f63ae6a..000000000000
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@@ -132,7 -135,7 +132,11 @@@ int dm_table_create(struct dm_table **r
+  		return -ENOMEM;
+  
+  	INIT_LIST_HEAD(&t->devices);
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&t->target_callbacks);
+++=======
++ 	init_rwsem(&t->devices_lock);
+++>>>>>>> f6007dce0cd3 (dm: fix a race condition in retrieve_deps)
+  
+  	if (!num_targets)
+  		num_targets = KEYS_PER_NODE;
+@@@ -376,12 -365,15 +382,14 @@@ int dm_get_device(struct dm_target *ti
+  	dd = find_device(&t->devices, dev);
+  	if (!dd) {
+  		dd = kmalloc(sizeof(*dd), GFP_KERNEL);
+- 		if (!dd)
+- 			return -ENOMEM;
++ 		if (!dd) {
++ 			r = -ENOMEM;
++ 			goto unlock_ret_r;
++ 		}
+  
+ -		r = dm_get_table_device(t->md, dev, mode, &dd->dm_dev);
+ -		if (r) {
+ +		if ((r = dm_get_table_device(t->md, dev, mode, &dd->dm_dev))) {
+  			kfree(dd);
+- 			return r;
++ 			goto unlock_ret_r;
+  		}
+  
+  		refcount_set(&dd->count, 1);
+diff --git a/drivers/md/dm-core.h b/drivers/md/dm-core.h
+index 571e72d030e6..7864eeee7a45 100644
+--- a/drivers/md/dm-core.h
++++ b/drivers/md/dm-core.h
+@@ -194,6 +194,7 @@ struct dm_table {
+ 
+ 	/* a list of devices used by this table */
+ 	struct list_head devices;
++	struct rw_semaphore devices_lock;
+ 
+ 	/* events get handed up using this callback */
+ 	void (*event_fn)(void *);
+diff --git a/drivers/md/dm-ioctl.c b/drivers/md/dm-ioctl.c
+index ef058e31fb39..1539c1c11458 100644
+--- a/drivers/md/dm-ioctl.c
++++ b/drivers/md/dm-ioctl.c
+@@ -1571,6 +1571,8 @@ static void retrieve_deps(struct dm_table *table,
+ 	struct dm_dev_internal *dd;
+ 	struct dm_target_deps *deps;
+ 
++	down_read(&table->devices_lock);
++
+ 	deps = get_result_buffer(param, param_size, &len);
+ 
+ 	/*
+@@ -1585,7 +1587,7 @@ static void retrieve_deps(struct dm_table *table,
+ 	needed = struct_size(deps, dev, count);
+ 	if (len < needed) {
+ 		param->flags |= DM_BUFFER_FULL_FLAG;
+-		return;
++		goto out;
+ 	}
+ 
+ 	/*
+@@ -1597,6 +1599,9 @@ static void retrieve_deps(struct dm_table *table,
+ 		deps->dev[count++] = huge_encode_dev(dd->dm_dev->bdev->bd_dev);
+ 
+ 	param->data_size = param->data_start + needed;
++
++out:
++	up_read(&table->devices_lock);
+ }
+ 
+ static int table_deps(struct file *filp, struct dm_ioctl *param, size_t param_size)
+* Unmerged path drivers/md/dm-table.c
