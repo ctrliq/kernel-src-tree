@@ -1,0 +1,130 @@
+x86/resctrl: Don't move a task to the same resource group
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Fenghua Yu <fenghua.yu@intel.com>
+commit a0195f314a25582b38993bf30db11c300f4f4611
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/a0195f31.failed
+
+Shakeel Butt reported in [1] that a user can request a task to be moved
+to a resource group even if the task is already in the group. It just
+wastes time to do the move operation which could be costly to send IPI
+to a different CPU.
+
+Add a sanity check to ensure that the move operation only happens when
+the task is not already in the resource group.
+
+[1] https://lore.kernel.org/lkml/CALvZod7E9zzHwenzf7objzGKsdBmVwTgEJ0nPgs0LUFU3SN5Pw@mail.gmail.com/
+
+Fixes: e02737d5b826 ("x86/intel_rdt: Add tasks files")
+	Reported-by: Shakeel Butt <shakeelb@google.com>
+	Signed-off-by: Fenghua Yu <fenghua.yu@intel.com>
+	Signed-off-by: Reinette Chatre <reinette.chatre@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Tony Luck <tony.luck@intel.com>
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/962ede65d8e95be793cb61102cca37f7bb018e66.1608243147.git.reinette.chatre@intel.com
+(cherry picked from commit a0195f314a25582b38993bf30db11c300f4f4611)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/rdtgroup.c
+diff --cc arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index 834cd3a63718,460f3e0df106..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@@ -573,49 -546,49 +573,67 @@@ out
+  static int __rdtgroup_move_task(struct task_struct *tsk,
+  				struct rdtgroup *rdtgrp)
+  {
+++<<<<<<< HEAD
+ +	struct task_move_callback *callback;
+ +	int ret;
+++=======
++ 	/* If the task is already in rdtgrp, no need to move the task. */
++ 	if ((rdtgrp->type == RDTCTRL_GROUP && tsk->closid == rdtgrp->closid &&
++ 	     tsk->rmid == rdtgrp->mon.rmid) ||
++ 	    (rdtgrp->type == RDTMON_GROUP && tsk->rmid == rdtgrp->mon.rmid &&
++ 	     tsk->closid == rdtgrp->mon.parent->closid))
++ 		return 0;
++ 
++ 	/*
++ 	 * Set the task's closid/rmid before the PQR_ASSOC MSR can be
++ 	 * updated by them.
++ 	 *
++ 	 * For ctrl_mon groups, move both closid and rmid.
++ 	 * For monitor groups, can move the tasks only from
++ 	 * their parent CTRL group.
++ 	 */
+++>>>>>>> a0195f314a25 (x86/resctrl: Don't move a task to the same resource group)
+  
+ -	if (rdtgrp->type == RDTCTRL_GROUP) {
+ -		tsk->closid = rdtgrp->closid;
+ -		tsk->rmid = rdtgrp->mon.rmid;
+ -	} else if (rdtgrp->type == RDTMON_GROUP) {
+ -		if (rdtgrp->mon.parent->closid == tsk->closid) {
+ -			tsk->rmid = rdtgrp->mon.rmid;
+ -		} else {
+ -			rdt_last_cmd_puts("Can't move task to different control group\n");
+ -			return -EINVAL;
+ -		}
+ -	}
+ -
+ -	/*
+ -	 * Ensure the task's closid and rmid are written before determining if
+ -	 * the task is current that will decide if it will be interrupted.
+ -	 */
+ -	barrier();
+ +	callback = kzalloc(sizeof(*callback), GFP_KERNEL);
+ +	if (!callback)
+ +		return -ENOMEM;
+ +	callback->work.func = move_myself;
+ +	callback->rdtgrp = rdtgrp;
+  
+  	/*
+ -	 * By now, the task's closid and rmid are set. If the task is current
+ -	 * on a CPU, the PQR_ASSOC MSR needs to be updated to make the resource
+ -	 * group go into effect. If the task is not current, the MSR will be
+ -	 * updated when the task is scheduled in.
+ +	 * Take a refcount, so rdtgrp cannot be freed before the
+ +	 * callback has been invoked.
+  	 */
+ -	update_task_closid_rmid(tsk);
+ -
+ -	return 0;
+ +	atomic_inc(&rdtgrp->waitcount);
+ +	ret = task_work_add(tsk, &callback->work, true);
+ +	if (ret) {
+ +		/*
+ +		 * Task is exiting. Drop the refcount and free the callback.
+ +		 * No need to check the refcount as the group cannot be
+ +		 * deleted before the write function unlocks rdtgroup_mutex.
+ +		 */
+ +		atomic_dec(&rdtgrp->waitcount);
+ +		kfree(callback);
+ +		rdt_last_cmd_puts("Task exited\n");
+ +	} else {
+ +		/*
+ +		 * For ctrl_mon groups move both closid and rmid.
+ +		 * For monitor groups, can move the tasks only from
+ +		 * their parent CTRL group.
+ +		 */
+ +		if (rdtgrp->type == RDTCTRL_GROUP) {
+ +			tsk->closid = rdtgrp->closid;
+ +			tsk->rmid = rdtgrp->mon.rmid;
+ +		} else if (rdtgrp->type == RDTMON_GROUP) {
+ +			if (rdtgrp->mon.parent->closid == tsk->closid) {
+ +				tsk->rmid = rdtgrp->mon.rmid;
+ +			} else {
+ +				rdt_last_cmd_puts("Can't move task to different control group\n");
+ +				ret = -EINVAL;
+ +			}
+ +		}
+ +	}
+ +	return ret;
+  }
+  
+  static bool is_closid_match(struct task_struct *t, struct rdtgroup *r)
+* Unmerged path arch/x86/kernel/cpu/resctrl/rdtgroup.c
