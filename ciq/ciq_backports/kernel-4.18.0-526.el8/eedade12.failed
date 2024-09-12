@@ -1,0 +1,90 @@
+net: kfree_skb_list use kmem_cache_free_bulk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-526.el8
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit eedade12f4cb7284555c4c0314485e9575c70ab7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-526.el8/eedade12.failed
+
+The kfree_skb_list function walks SKB (via skb->next) and frees them
+individually to the SLUB/SLAB allocator (kmem_cache). It is more
+efficient to bulk free them via the kmem_cache_free_bulk API.
+
+This patches create a stack local array with SKBs to bulk free while
+walking the list. Bulk array size is limited to 16 SKBs to trade off
+stack usage and efficiency. The SLUB kmem_cache "skbuff_head_cache"
+uses objsize 256 bytes usually in an order-1 page 8192 bytes that is
+32 objects per slab (can vary on archs and due to SLUB sharing). Thus,
+for SLUB the optimal bulk free case is 32 objects belonging to same
+slab, but runtime this isn't likely to occur.
+
+The expected gain from using kmem_cache bulk alloc and free API
+have been assessed via a microbencmark kernel module[1].
+
+The module 'slab_bulk_test01' results at bulk 16 element:
+ kmem-in-loop Per elem: 109 cycles(tsc) 30.532 ns (step:16)
+ kmem-bulk    Per elem: 64 cycles(tsc) 17.905 ns (step:16)
+
+More detailed description of benchmarks avail in [2].
+
+[1] https://github.com/netoptimizer/prototype-kernel/tree/master/kernel/mm
+[2] https://github.com/xdp-project/xdp-project/blob/master/areas/mem/kfree_skb_list01.org
+
+V2: rename function to kfree_skb_add_bulk.
+
+	Reviewed-by: Saeed Mahameed <saeed@kernel.org>
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit eedade12f4cb7284555c4c0314485e9575c70ab7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skbuff.c
+diff --cc net/core/skbuff.c
+index 5b0b94138c72,4e73ab3482b8..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -883,11 -962,32 +883,40 @@@ kfree_skb_reason(struct sk_buff *skb, e
+  }
+  EXPORT_SYMBOL(kfree_skb_reason);
+  
+++<<<<<<< HEAD
+ +void kfree_skb_list(struct sk_buff *segs)
+ +{
+ +	kfree_skb_list_reason(segs, SKB_DROP_REASON_NOT_SPECIFIED);
+ +}
+ +EXPORT_SYMBOL(kfree_skb_list);
+++=======
++ #define KFREE_SKB_BULK_SIZE	16
++ 
++ struct skb_free_array {
++ 	unsigned int skb_count;
++ 	void *skb_array[KFREE_SKB_BULK_SIZE];
++ };
++ 
++ static void kfree_skb_add_bulk(struct sk_buff *skb,
++ 			       struct skb_free_array *sa,
++ 			       enum skb_drop_reason reason)
++ {
++ 	/* if SKB is a clone, don't handle this case */
++ 	if (unlikely(skb->fclone != SKB_FCLONE_UNAVAILABLE)) {
++ 		__kfree_skb(skb);
++ 		return;
++ 	}
++ 
++ 	skb_release_all(skb, reason);
++ 	sa->skb_array[sa->skb_count++] = skb;
++ 
++ 	if (unlikely(sa->skb_count == KFREE_SKB_BULK_SIZE)) {
++ 		kmem_cache_free_bulk(skbuff_head_cache, KFREE_SKB_BULK_SIZE,
++ 				     sa->skb_array);
++ 		sa->skb_count = 0;
++ 	}
++ }
+++>>>>>>> eedade12f4cb (net: kfree_skb_list use kmem_cache_free_bulk)
+  
+  void __fix_address
+  kfree_skb_list_reason(struct sk_buff *segs, enum skb_drop_reason reason)
+* Unmerged path net/core/skbuff.c
