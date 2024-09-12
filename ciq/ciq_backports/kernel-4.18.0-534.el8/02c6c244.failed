@@ -1,0 +1,250 @@
+netfilter: nf_tables: GC transaction race with netns dismantle
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-534.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 02c6c24402bf1c1e986899c14ba22a10b510916b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-534.el8/02c6c244.failed
+
+Use maybe_get_net() since GC workqueue might race with netns exit path.
+
+Fixes: 5f68718b34a5 ("netfilter: nf_tables: GC transaction API to avoid race with control plane")
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 02c6c24402bf1c1e986899c14ba22a10b510916b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+diff --cc net/netfilter/nf_tables_api.c
+index 65617e020aff,3e841e45f2c0..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -7725,12 -9380,219 +7725,221 @@@ static void nft_chain_del(struct nft_ch
+  	list_del_rcu(&chain->list);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nft_trans_gc_setelem_remove(struct nft_ctx *ctx,
++ 					struct nft_trans_gc *trans)
++ {
++ 	void **priv = trans->priv;
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < trans->count; i++) {
++ 		struct nft_set_elem elem = {
++ 			.priv = priv[i],
++ 		};
++ 
++ 		nft_setelem_data_deactivate(ctx->net, trans->set, &elem);
++ 		nft_setelem_remove(ctx->net, trans->set, &elem);
++ 	}
++ }
++ 
++ void nft_trans_gc_destroy(struct nft_trans_gc *trans)
++ {
++ 	nft_set_put(trans->set);
++ 	put_net(trans->net);
++ 	kfree(trans);
++ }
++ 
++ static void nft_trans_gc_trans_free(struct rcu_head *rcu)
++ {
++ 	struct nft_set_elem elem = {};
++ 	struct nft_trans_gc *trans;
++ 	struct nft_ctx ctx = {};
++ 	unsigned int i;
++ 
++ 	trans = container_of(rcu, struct nft_trans_gc, rcu);
++ 	ctx.net	= read_pnet(&trans->set->net);
++ 
++ 	for (i = 0; i < trans->count; i++) {
++ 		elem.priv = trans->priv[i];
++ 		if (!nft_setelem_is_catchall(trans->set, &elem))
++ 			atomic_dec(&trans->set->nelems);
++ 
++ 		nf_tables_set_elem_destroy(&ctx, trans->set, elem.priv);
++ 	}
++ 
++ 	nft_trans_gc_destroy(trans);
++ }
++ 
++ static bool nft_trans_gc_work_done(struct nft_trans_gc *trans)
++ {
++ 	struct nftables_pernet *nft_net;
++ 	struct nft_ctx ctx = {};
++ 
++ 	nft_net = nft_pernet(trans->net);
++ 
++ 	mutex_lock(&nft_net->commit_mutex);
++ 
++ 	/* Check for race with transaction, otherwise this batch refers to
++ 	 * stale objects that might not be there anymore. Skip transaction if
++ 	 * set has been destroyed from control plane transaction in case gc
++ 	 * worker loses race.
++ 	 */
++ 	if (READ_ONCE(nft_net->gc_seq) != trans->seq || trans->set->dead) {
++ 		mutex_unlock(&nft_net->commit_mutex);
++ 		return false;
++ 	}
++ 
++ 	ctx.net = trans->net;
++ 	ctx.table = trans->set->table;
++ 
++ 	nft_trans_gc_setelem_remove(&ctx, trans);
++ 	mutex_unlock(&nft_net->commit_mutex);
++ 
++ 	return true;
++ }
++ 
++ static void nft_trans_gc_work(struct work_struct *work)
++ {
++ 	struct nft_trans_gc *trans, *next;
++ 	LIST_HEAD(trans_gc_list);
++ 
++ 	spin_lock(&nf_tables_destroy_list_lock);
++ 	list_splice_init(&nf_tables_gc_list, &trans_gc_list);
++ 	spin_unlock(&nf_tables_destroy_list_lock);
++ 
++ 	list_for_each_entry_safe(trans, next, &trans_gc_list, list) {
++ 		list_del(&trans->list);
++ 		if (!nft_trans_gc_work_done(trans)) {
++ 			nft_trans_gc_destroy(trans);
++ 			continue;
++ 		}
++ 		call_rcu(&trans->rcu, nft_trans_gc_trans_free);
++ 	}
++ }
++ 
++ struct nft_trans_gc *nft_trans_gc_alloc(struct nft_set *set,
++ 					unsigned int gc_seq, gfp_t gfp)
++ {
++ 	struct net *net = read_pnet(&set->net);
++ 	struct nft_trans_gc *trans;
++ 
++ 	trans = kzalloc(sizeof(*trans), gfp);
++ 	if (!trans)
++ 		return NULL;
++ 
++ 	trans->net = maybe_get_net(net);
++ 	if (!trans->net) {
++ 		kfree(trans);
++ 		return NULL;
++ 	}
++ 
++ 	refcount_inc(&set->refs);
++ 	trans->set = set;
++ 	trans->seq = gc_seq;
++ 
++ 	return trans;
++ }
++ 
++ void nft_trans_gc_elem_add(struct nft_trans_gc *trans, void *priv)
++ {
++ 	trans->priv[trans->count++] = priv;
++ }
++ 
++ static void nft_trans_gc_queue_work(struct nft_trans_gc *trans)
++ {
++ 	spin_lock(&nf_tables_gc_list_lock);
++ 	list_add_tail(&trans->list, &nf_tables_gc_list);
++ 	spin_unlock(&nf_tables_gc_list_lock);
++ 
++ 	schedule_work(&trans_gc_work);
++ }
++ 
++ static int nft_trans_gc_space(struct nft_trans_gc *trans)
++ {
++ 	return NFT_TRANS_GC_BATCHCOUNT - trans->count;
++ }
++ 
++ struct nft_trans_gc *nft_trans_gc_queue_async(struct nft_trans_gc *gc,
++ 					      unsigned int gc_seq, gfp_t gfp)
++ {
++ 	if (nft_trans_gc_space(gc))
++ 		return gc;
++ 
++ 	nft_trans_gc_queue_work(gc);
++ 
++ 	return nft_trans_gc_alloc(gc->set, gc_seq, gfp);
++ }
++ 
++ void nft_trans_gc_queue_async_done(struct nft_trans_gc *trans)
++ {
++ 	if (trans->count == 0) {
++ 		nft_trans_gc_destroy(trans);
++ 		return;
++ 	}
++ 
++ 	nft_trans_gc_queue_work(trans);
++ }
++ 
++ struct nft_trans_gc *nft_trans_gc_queue_sync(struct nft_trans_gc *gc, gfp_t gfp)
++ {
++ 	if (WARN_ON_ONCE(!lockdep_commit_lock_is_held(gc->net)))
++ 		return NULL;
++ 
++ 	if (nft_trans_gc_space(gc))
++ 		return gc;
++ 
++ 	call_rcu(&gc->rcu, nft_trans_gc_trans_free);
++ 
++ 	return nft_trans_gc_alloc(gc->set, 0, gfp);
++ }
++ 
++ void nft_trans_gc_queue_sync_done(struct nft_trans_gc *trans)
++ {
++ 	WARN_ON_ONCE(!lockdep_commit_lock_is_held(trans->net));
++ 
++ 	if (trans->count == 0) {
++ 		nft_trans_gc_destroy(trans);
++ 		return;
++ 	}
++ 
++ 	call_rcu(&trans->rcu, nft_trans_gc_trans_free);
++ }
++ 
++ struct nft_trans_gc *nft_trans_gc_catchall(struct nft_trans_gc *gc,
++ 					   unsigned int gc_seq)
++ {
++ 	struct nft_set_elem_catchall *catchall;
++ 	const struct nft_set *set = gc->set;
++ 	struct nft_set_ext *ext;
++ 
++ 	list_for_each_entry_rcu(catchall, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 
++ 		if (!nft_set_elem_expired(ext))
++ 			continue;
++ 		if (nft_set_elem_is_dead(ext))
++ 			goto dead_elem;
++ 
++ 		nft_set_elem_dead(ext);
++ dead_elem:
++ 		gc = nft_trans_gc_queue_async(gc, gc_seq, GFP_ATOMIC);
++ 		if (!gc)
++ 			return NULL;
++ 
++ 		nft_trans_gc_elem_add(gc, catchall->elem);
++ 	}
++ 
++ 	return gc;
++ }
++ 
+++>>>>>>> 02c6c24402bf (netfilter: nf_tables: GC transaction race with netns dismantle)
+  static void nf_tables_module_autoload_cleanup(struct net *net)
+  {
+ -	struct nftables_pernet *nft_net = nft_pernet(net);
+  	struct nft_module_request *req, *next;
+  
+ -	WARN_ON_ONCE(!list_empty(&nft_net->commit_list));
+ -	list_for_each_entry_safe(req, next, &nft_net->module_list, list) {
+ +	WARN_ON_ONCE(!list_empty(&net->nft.commit_list));
+ +	list_for_each_entry_safe(req, next, &net->nft_module_list, list) {
+  		WARN_ON_ONCE(!req->done);
+  		list_del(&req->list);
+  		kfree(req);
+* Unmerged path net/netfilter/nf_tables_api.c
