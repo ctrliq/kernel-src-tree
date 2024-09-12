@@ -1,0 +1,328 @@
+net: Add tests for bonding and team address list management
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Benjamin Poirier <bpoirier@nvidia.com>
+commit bbb774d921e273ca262944c94011bc2cc888ebeb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/bbb774d9.failed
+
+Test that the bonding and team drivers clean up an underlying device's
+address lists (dev->uc, dev->mc) when the aggregated device is deleted.
+
+Test addition and removal of the LACPDU multicast address on underlying
+devices by the bonding driver.
+
+v2:
+* add lag_lib.sh to TEST_FILES
+
+v3:
+* extend bond_listen_lacpdu_multicast test to init_state up and down cases
+* remove some superfluous shell syntax and 'set dev ... up' commands
+
+	Signed-off-by: Benjamin Poirier <bpoirier@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bbb774d921e273ca262944c94011bc2cc888ebeb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/Makefile
+#	tools/testing/selftests/drivers/net/bonding/Makefile
+#	tools/testing/selftests/drivers/net/bonding/config
+diff --cc tools/testing/selftests/Makefile
+index f4eb598743a1,1fc89b8ef433..000000000000
+--- a/tools/testing/selftests/Makefile
++++ b/tools/testing/selftests/Makefile
+@@@ -7,6 -8,12 +7,14 @@@ TARGETS += cgrou
+  TARGETS += core
+  TARGETS += cpufreq
+  TARGETS += cpu-hotplug
+++<<<<<<< HEAD
+++=======
++ TARGETS += damon
++ TARGETS += drivers/dma-buf
++ TARGETS += drivers/s390x/uvdevice
++ TARGETS += drivers/net/bonding
++ TARGETS += drivers/net/team
+++>>>>>>> bbb774d921e2 (net: Add tests for bonding and team address list management)
+  TARGETS += efivarfs
+  TARGETS += exec
+  TARGETS += filesystems
+* Unmerged path tools/testing/selftests/drivers/net/bonding/Makefile
+* Unmerged path tools/testing/selftests/drivers/net/bonding/config
+diff --git a/MAINTAINERS b/MAINTAINERS
+index aa8a8ffebe7a..8e612f1924df 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -14469,6 +14469,7 @@ S:	Supported
+ F:	drivers/net/team/
+ F:	include/linux/if_team.h
+ F:	include/uapi/linux/if_team.h
++F:	tools/testing/selftests/net/team/
+ 
+ TECHNOLOGIC SYSTEMS TS-5500 PLATFORM SUPPORT
+ M:	"Savoir-faire Linux Inc." <kernel@savoirfairelinux.com>
+* Unmerged path tools/testing/selftests/Makefile
+* Unmerged path tools/testing/selftests/drivers/net/bonding/Makefile
+* Unmerged path tools/testing/selftests/drivers/net/bonding/config
+diff --git a/tools/testing/selftests/drivers/net/bonding/dev_addr_lists.sh b/tools/testing/selftests/drivers/net/bonding/dev_addr_lists.sh
+new file mode 100755
+index 000000000000..e6fa24eded5b
+--- /dev/null
++++ b/tools/testing/selftests/drivers/net/bonding/dev_addr_lists.sh
+@@ -0,0 +1,109 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0
++#
++# Test bond device handling of addr lists (dev->uc, mc)
++#
++
++ALL_TESTS="
++	bond_cleanup_mode1
++	bond_cleanup_mode4
++	bond_listen_lacpdu_multicast_case_down
++	bond_listen_lacpdu_multicast_case_up
++"
++
++REQUIRE_MZ=no
++NUM_NETIFS=0
++lib_dir=$(dirname "$0")
++source "$lib_dir"/../../../net/forwarding/lib.sh
++
++source "$lib_dir"/lag_lib.sh
++
++
++destroy()
++{
++	local ifnames=(dummy1 dummy2 bond1 mv0)
++	local ifname
++
++	for ifname in "${ifnames[@]}"; do
++		ip link del "$ifname" &>/dev/null
++	done
++}
++
++cleanup()
++{
++	pre_cleanup
++
++	destroy
++}
++
++
++# bond driver control paths vary between modes that have a primary slave
++# (bond_uses_primary()) and others. Test both kinds of modes.
++
++bond_cleanup_mode1()
++{
++	RET=0
++
++	test_LAG_cleanup "bonding" "active-backup"
++}
++
++bond_cleanup_mode4() {
++	RET=0
++
++	test_LAG_cleanup "bonding" "802.3ad"
++}
++
++bond_listen_lacpdu_multicast()
++{
++	# Initial state of bond device, up | down
++	local init_state=$1
++	local lacpdu_mc="01:80:c2:00:00:02"
++
++	ip link add dummy1 type dummy
++	ip link add bond1 "$init_state" type bond mode 802.3ad
++	ip link set dev dummy1 master bond1
++	if [ "$init_state" = "down" ]; then
++		ip link set dev bond1 up
++	fi
++
++	grep_bridge_fdb "$lacpdu_mc" bridge fdb show brport dummy1 >/dev/null
++	check_err $? "LACPDU multicast address not present on slave (1)"
++
++	ip link set dev bond1 down
++
++	not grep_bridge_fdb "$lacpdu_mc" bridge fdb show brport dummy1 >/dev/null
++	check_err $? "LACPDU multicast address still present on slave"
++
++	ip link set dev bond1 up
++
++	grep_bridge_fdb "$lacpdu_mc" bridge fdb show brport dummy1 >/dev/null
++	check_err $? "LACPDU multicast address not present on slave (2)"
++
++	cleanup
++
++	log_test "bonding LACPDU multicast address to slave (from bond $init_state)"
++}
++
++# The LACPDU mc addr is added by different paths depending on the initial state
++# of the bond when enslaving a device. Test both cases.
++
++bond_listen_lacpdu_multicast_case_down()
++{
++	RET=0
++
++	bond_listen_lacpdu_multicast "down"
++}
++
++bond_listen_lacpdu_multicast_case_up()
++{
++	RET=0
++
++	bond_listen_lacpdu_multicast "up"
++}
++
++
++trap cleanup EXIT
++
++tests_run
++
++exit "$EXIT_STATUS"
+diff --git a/tools/testing/selftests/drivers/net/bonding/lag_lib.sh b/tools/testing/selftests/drivers/net/bonding/lag_lib.sh
+new file mode 100644
+index 000000000000..16c7fb858ac1
+--- /dev/null
++++ b/tools/testing/selftests/drivers/net/bonding/lag_lib.sh
+@@ -0,0 +1,61 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0
++
++# Test that a link aggregation device (bonding, team) removes the hardware
++# addresses that it adds on its underlying devices.
++test_LAG_cleanup()
++{
++	local driver=$1
++	local mode=$2
++	local ucaddr="02:00:00:12:34:56"
++	local addr6="fe80::78:9abc/64"
++	local mcaddr="33:33:ff:78:9a:bc"
++	local name
++
++	ip link add dummy1 type dummy
++	ip link add dummy2 type dummy
++	if [ "$driver" = "bonding" ]; then
++		name="bond1"
++		ip link add "$name" up type bond mode "$mode"
++		ip link set dev dummy1 master "$name"
++		ip link set dev dummy2 master "$name"
++	elif [ "$driver" = "team" ]; then
++		name="team0"
++		teamd -d -c '
++			{
++				"device": "'"$name"'",
++				"runner": {
++					"name": "'"$mode"'"
++				},
++				"ports": {
++					"dummy1":
++						{},
++					"dummy2":
++						{}
++				}
++			}
++		'
++		ip link set dev "$name" up
++	else
++		check_err 1
++		log_test test_LAG_cleanup ": unknown driver \"$driver\""
++		return
++	fi
++
++	# Used to test dev->uc handling
++	ip link add mv0 link "$name" up address "$ucaddr" type macvlan
++	# Used to test dev->mc handling
++	ip address add "$addr6" dev "$name"
++	ip link set dev "$name" down
++	ip link del "$name"
++
++	not grep_bridge_fdb "$ucaddr" bridge fdb show >/dev/null
++	check_err $? "macvlan unicast address still present on a slave"
++
++	not grep_bridge_fdb "$mcaddr" bridge fdb show >/dev/null
++	check_err $? "IPv6 solicited-node multicast mac address still present on a slave"
++
++	cleanup
++
++	log_test "$driver cleanup mode $mode"
++}
+diff --git a/tools/testing/selftests/drivers/net/team/Makefile b/tools/testing/selftests/drivers/net/team/Makefile
+new file mode 100644
+index 000000000000..642d8df1c137
+--- /dev/null
++++ b/tools/testing/selftests/drivers/net/team/Makefile
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: GPL-2.0
++# Makefile for net selftests
++
++TEST_PROGS := dev_addr_lists.sh
++
++include ../../../lib.mk
+diff --git a/tools/testing/selftests/drivers/net/team/config b/tools/testing/selftests/drivers/net/team/config
+new file mode 100644
+index 000000000000..265b6882cc21
+--- /dev/null
++++ b/tools/testing/selftests/drivers/net/team/config
+@@ -0,0 +1,3 @@
++CONFIG_NET_TEAM=y
++CONFIG_NET_TEAM_MODE_LOADBALANCE=y
++CONFIG_MACVLAN=y
+diff --git a/tools/testing/selftests/drivers/net/team/dev_addr_lists.sh b/tools/testing/selftests/drivers/net/team/dev_addr_lists.sh
+new file mode 100755
+index 000000000000..debda7262956
+--- /dev/null
++++ b/tools/testing/selftests/drivers/net/team/dev_addr_lists.sh
+@@ -0,0 +1,51 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0
++#
++# Test team device handling of addr lists (dev->uc, mc)
++#
++
++ALL_TESTS="
++	team_cleanup
++"
++
++REQUIRE_MZ=no
++NUM_NETIFS=0
++lib_dir=$(dirname "$0")
++source "$lib_dir"/../../../net/forwarding/lib.sh
++
++source "$lib_dir"/../bonding/lag_lib.sh
++
++
++destroy()
++{
++	local ifnames=(dummy0 dummy1 team0 mv0)
++	local ifname
++
++	for ifname in "${ifnames[@]}"; do
++		ip link del "$ifname" &>/dev/null
++	done
++}
++
++cleanup()
++{
++	pre_cleanup
++
++	destroy
++}
++
++
++team_cleanup()
++{
++	RET=0
++
++	test_LAG_cleanup "team" "lacp"
++}
++
++
++require_command teamd
++
++trap cleanup EXIT
++
++tests_run
++
++exit "$EXIT_STATUS"
