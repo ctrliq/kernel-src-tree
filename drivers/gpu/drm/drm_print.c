@@ -23,7 +23,7 @@
  * Rob Clark <robdclark@gmail.com>
  */
 
-#include <linux/stdarg.h>
+#include <stdarg.h>
 
 #include <linux/io.h>
 #include <linux/moduleparam.h>
