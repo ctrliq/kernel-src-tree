@@ -232,7 +232,7 @@ next:
 				 * the required initialization for single
 				 * region and return.
 				 */
-				rdtgrp->plr->r = r;
+				rdtgrp->plr->s = s;
 				rdtgrp->plr->d = d;
 				rdtgrp->plr->cbm = d->new_ctrl;
 				d->plr = rdtgrp->plr;
@@ -419,7 +419,7 @@ int rdtgroup_schemata_show(struct kernfs_open_file *of,
 				ret = -ENODEV;
 			} else {
 				seq_printf(s, "%s:%d=%x\n",
-					   rdtgrp->plr->r->name,
+					   rdtgrp->plr->s->res->name,
 					   rdtgrp->plr->d->id,
 					   rdtgrp->plr->cbm);
 			}
