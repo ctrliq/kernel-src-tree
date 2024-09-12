@@ -266,6 +266,9 @@ SYM_CODE_START(startup_64)
 	 * and command line.
 	 */
 
+	cld
+	cli
+
 	/* Setup data segments. */
 	xorl	%eax, %eax
 	movl	%eax, %ds
