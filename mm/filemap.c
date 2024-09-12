@@ -1026,12 +1026,6 @@ void __init pagecache_init(void)
 		init_waitqueue_head(&page_wait_table[i]);
 
 	page_writeback_init();
-
-	/*
-	 * tmpfs uses the ZERO_PAGE for reading holes: it is up-to-date,
-	 * and splice's page_cache_pipe_buf_confirm() needs to see that.
-	 */
-	SetPageUptodate(ZERO_PAGE(0));
 }
 
 /* This has the same layout as wait_bit_key - see fs/cachefiles/rdwr.c */
