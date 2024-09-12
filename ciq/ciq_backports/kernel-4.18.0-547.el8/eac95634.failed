@@ -1,0 +1,174 @@
+x86/boot: Set EFI handover offset directly in header asm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit eac956345f99dda3d68f4ae6cf7b494105e54780
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/eac95634.failed
+
+The offsets of the EFI handover entrypoints are available to the
+assembler when constructing the header, so there is no need to set them
+from the build tool afterwards.
+
+This change has no impact on the resulting bzImage binary.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20230915171623.655440-12-ardb@google.com
+(cherry picked from commit eac956345f99dda3d68f4ae6cf7b494105e54780)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/header.S
+#	arch/x86/boot/tools/build.c
+diff --cc arch/x86/boot/header.S
+index 941d1e9413b4,72744ba440f6..000000000000
+--- a/arch/x86/boot/header.S
++++ b/arch/x86/boot/header.S
+@@@ -538,8 -524,25 +538,29 @@@ pref_address:		.quad LOAD_PHYSICAL_ADD
+  # define INIT_SIZE VO_INIT_SIZE
+  #endif
+  
++ 	.macro		__handover_offset
++ #ifndef CONFIG_EFI_HANDOVER_PROTOCOL
++ 	.long		0
++ #elif !defined(CONFIG_X86_64)
++ 	.long		ZO_efi32_stub_entry
++ #else
++ 	/* Yes, this is really how we defined it :( */
++ 	.long		ZO_efi64_stub_entry - 0x200
++ #ifdef CONFIG_EFI_MIXED
++ 	.if		ZO_efi32_stub_entry != ZO_efi64_stub_entry - 0x200
++ 	.error		"32-bit and 64-bit EFI entry points do not match"
++ 	.endif
++ #endif
++ #endif
++ 	.endm
++ 
+  init_size:		.long INIT_SIZE		# kernel initialization size
+++<<<<<<< HEAD
+ +handover_offset:	.long 0			# Filled in by build.c
+++=======
++ handover_offset:	__handover_offset
++ kernel_info_offset:	.long ZO_kernel_info
+++>>>>>>> eac956345f99 (x86/boot: Set EFI handover offset directly in header asm)
+  
+  # End of setup header #####################################################
+  
+diff --cc arch/x86/boot/tools/build.c
+index db1a6f7dea68,069497543164..000000000000
+--- a/arch/x86/boot/tools/build.c
++++ b/arch/x86/boot/tools/build.c
+@@@ -49,12 -49,15 +49,24 @@@ u8 buf[SETUP_SECT_MAX*512]
+  
+  #define PECOFF_RELOC_RESERVE 0x20
+  
+++<<<<<<< HEAD
+ +unsigned long efi32_stub_entry;
+ +unsigned long efi64_stub_entry;
+ +unsigned long efi_pe_entry;
+ +unsigned long startup_64;
+ +unsigned long _ehead;
+ +unsigned long _end;
+++=======
++ #ifdef CONFIG_EFI_MIXED
++ #define PECOFF_COMPAT_RESERVE 0x20
++ #else
++ #define PECOFF_COMPAT_RESERVE 0x0
++ #endif
++ 
++ static unsigned long efi_pe_entry;
++ static unsigned long efi32_pe_entry;
++ static unsigned long _end;
+++>>>>>>> eac956345f99 (x86/boot: Set EFI handover offset directly in header asm)
+  
+  /*----------------------------------------------------------------------*/
+  
+@@@ -241,34 -260,15 +253,36 @@@ static void efi_stub_defaults(void
+  	efi_pe_entry = 0x10;
+  #else
+  	efi_pe_entry = 0x210;
+ +	startup_64 = 0x200;
+ +#endif
+ +}
+ +
+++<<<<<<< HEAD
+ +static void efi_stub_entry_update(void)
+ +{
+ +	unsigned long addr = efi32_stub_entry;
+ +
+ +#ifdef CONFIG_X86_64
+ +	/* Yes, this is really how we defined it :( */
+ +	addr = efi64_stub_entry - 0x200;
+ +#endif
+ +
+ +#ifdef CONFIG_EFI_MIXED
+ +	if (efi32_stub_entry != addr)
+ +		die("32-bit and 64-bit EFI entry points do not match\n");
+  #endif
+ +	put_unaligned_le32(addr, &buf[0x264]);
+  }
+  
+++=======
+++>>>>>>> eac956345f99 (x86/boot: Set EFI handover offset directly in header asm)
+  #else
+  
+  static inline void update_pecoff_setup_and_reloc(unsigned int size) {}
+  static inline void update_pecoff_text(unsigned int text_start,
+ -				      unsigned int file_sz) {}
+ +				      unsigned int file_sz,
+ +				      unsigned int init_sz) {}
+  static inline void efi_stub_defaults(void) {}
+- static inline void efi_stub_entry_update(void) {}
+  
+  static inline int reserve_pecoff_reloc_section(int c)
+  {
+@@@ -305,11 -311,8 +319,9 @@@ static void parse_zoffset(char *fname
+  	p = (char *)buf;
+  
+  	while (p && *p) {
+- 		PARSE_ZOFS(p, efi32_stub_entry);
+- 		PARSE_ZOFS(p, efi64_stub_entry);
+  		PARSE_ZOFS(p, efi_pe_entry);
+ -		PARSE_ZOFS(p, efi32_pe_entry);
+ +		PARSE_ZOFS(p, startup_64);
+ +		PARSE_ZOFS(p, _ehead);
+  		PARSE_ZOFS(p, _end);
+  
+  		p = strchr(p, '\n');
+@@@ -380,30 -391,8 +392,29 @@@ int main(int argc, char ** argv
+  	buf[0x1f1] = setup_sectors-1;
+  	put_unaligned_le32(sys_size, &buf[0x1f4]);
+  
+ -	update_pecoff_text(setup_sectors * 512, i + (sys_size * 16));
+ +	init_sz = get_unaligned_le32(&buf[0x260]);
+ +#ifdef CONFIG_EFI_STUB
+ +	/*
+ +	 * The decompression buffer will start at ImageBase. When relocating
+ +	 * the compressed kernel to its end, we must ensure that the head
+ +	 * section does not get overwritten.  The head section occupies
+ +	 * [i, i + _ehead), and the destination is [init_sz - _end, init_sz).
+ +	 *
+ +	 * At present these should never overlap, because 'i' is at most 32k
+ +	 * because of SETUP_SECT_MAX, '_ehead' is less than 1k, and the
+ +	 * calculation of INIT_SIZE in boot/header.S ensures that
+ +	 * 'init_sz - _end' is at least 64k.
+ +	 *
+ +	 * For future-proofing, increase init_sz if necessary.
+ +	 */
+ +
+ +	if (init_sz - _end < i + _ehead) {
+ +		init_sz = (i + _ehead + _end + 4095) & ~4095;
+ +		put_unaligned_le32(init_sz, &buf[0x260]);
+ +	}
+ +#endif
+ +	update_pecoff_text(setup_sectors * 512, i + (sys_size * 16), init_sz);
+  
+- 	efi_stub_entry_update();
+  
+  	crc = partial_crc32(buf, i, crc);
+  	if (fwrite(buf, 1, i, dest) != i)
+* Unmerged path arch/x86/boot/header.S
+* Unmerged path arch/x86/boot/tools/build.c
