@@ -1,0 +1,160 @@
+vfio/ccw: pass page count to page_array struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-494.el8
+commit-author Eric Farman <farman@linux.ibm.com>
+commit 62a97a56a64c97c3865e55d702babc22f3b2ea6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-494.el8/62a97a56.failed
+
+The allocation of our page_array struct calculates the number
+of 4K pages that would be needed to hold a certain number of
+bytes. But, since the number of pages that will be pinned is
+also calculated by the length of the IDAL, this logic is
+unnecessary. Let's pass that information in directly, and
+avoid the math within the allocator.
+
+Also, let's make this two allocations instead of one,
+to make it apparent what's happening within here.
+
+	Signed-off-by: Eric Farman <farman@linux.ibm.com>
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 62a97a56a64c97c3865e55d702babc22f3b2ea6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/cio/vfio_ccw_cp.c
+diff --cc drivers/s390/cio/vfio_ccw_cp.c
+index 3054373c1ee5,b1436736b7b6..000000000000
+--- a/drivers/s390/cio/vfio_ccw_cp.c
++++ b/drivers/s390/cio/vfio_ccw_cp.c
+@@@ -40,15 -40,15 +40,15 @@@ struct ccwchain 
+  };
+  
+  /*
+ - * page_array_alloc() - alloc memory for page array
+ - * @pa: page_array on which to perform the operation
+ + * pfn_array_alloc() - alloc memory for PFNs
+ + * @pa: pfn_array on which to perform the operation
+   * @iova: target guest physical address
+-  * @len: number of bytes that should be pinned from @iova
++  * @len: number of pages that should be pinned from @iova
+   *
+ - * Attempt to allocate memory for page array.
+ + * Attempt to allocate memory for PFNs.
+   *
+ - * Usage of page_array:
+ - * We expect (pa_nr == 0) and (pa_iova == NULL), any field in
+ + * Usage of pfn_array:
+ + * We expect (pa_nr == 0) and (pa_iova_pfn == NULL), any field in
+   * this structure will be filled in by this function.
+   *
+   * Returns:
+@@@ -60,30 -60,29 +60,47 @@@ static int pfn_array_alloc(struct pfn_a
+  {
+  	int i;
+  
+ -	if (pa->pa_nr || pa->pa_iova)
+ +	if (pa->pa_nr || pa->pa_iova_pfn)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	pa->pa_iova = iova;
+ +
+ +	pa->pa_nr = ((iova & ~PAGE_MASK) + len + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
+ +	if (!pa->pa_nr)
+ +		return -EINVAL;
+ +
+ +	pa->pa_iova_pfn = kcalloc(pa->pa_nr,
+ +				  sizeof(*pa->pa_iova_pfn) +
+ +				  sizeof(*pa->pa_pfn),
+ +				  GFP_KERNEL);
+ +	if (unlikely(!pa->pa_iova_pfn)) {
+ +		pa->pa_nr = 0;
+ +		return -ENOMEM;
+ +	}
+ +	pa->pa_pfn = pa->pa_iova_pfn + pa->pa_nr;
+++=======
++ 	if (len == 0)
++ 		return -EINVAL;
++ 
++ 	pa->pa_nr = len;
++ 
++ 	pa->pa_iova = kcalloc(len, sizeof(*pa->pa_iova), GFP_KERNEL);
++ 	if (!pa->pa_iova)
++ 		return -ENOMEM;
++ 
++ 	pa->pa_page = kcalloc(len, sizeof(*pa->pa_page), GFP_KERNEL);
++ 	if (!pa->pa_page) {
++ 		kfree(pa->pa_iova);
++ 		return -ENOMEM;
++ 	}
+++>>>>>>> 62a97a56a64c (vfio/ccw: pass page count to page_array struct)
+  
+ -	pa->pa_iova[0] = iova;
+ -	pa->pa_page[0] = NULL;
+ +	pa->pa_iova_pfn[0] = pa->pa_iova >> PAGE_SHIFT;
+ +	pa->pa_pfn[0] = -1ULL;
+  	for (i = 1; i < pa->pa_nr; i++) {
+ -		pa->pa_iova[i] = pa->pa_iova[i - 1] + PAGE_SIZE;
+ -		pa->pa_page[i] = NULL;
+ +		pa->pa_iova_pfn[i] = pa->pa_iova_pfn[i - 1] + 1;
+ +		pa->pa_pfn[i] = -1ULL;
+  	}
+  
+  	return 0;
+@@@ -122,23 -166,25 +139,29 @@@ err_out
+  }
+  
+  /* Unpin the pages before releasing the memory. */
+ -static void page_array_unpin_free(struct page_array *pa, struct vfio_device *vdev)
+ +static void pfn_array_unpin_free(struct pfn_array *pa, struct device *mdev)
+  {
+++<<<<<<< HEAD
+ +	/* Only unpin if any pages were pinned to begin with */
+ +	if (pa->pa_nr)
+ +		vfio_unpin_pages(mdev, pa->pa_iova_pfn, pa->pa_nr);
+ +	pa->pa_nr = 0;
+ +	kfree(pa->pa_iova_pfn);
+++=======
++ 	page_array_unpin(pa, vdev, pa->pa_nr);
++ 	kfree(pa->pa_page);
++ 	kfree(pa->pa_iova);
+++>>>>>>> 62a97a56a64c (vfio/ccw: pass page count to page_array struct)
+  }
+  
+ -static bool page_array_iova_pinned(struct page_array *pa, u64 iova, u64 length)
+ +static bool pfn_array_iova_pinned(struct pfn_array *pa, unsigned long iova)
+  {
+ -	u64 iova_pfn_start = iova >> PAGE_SHIFT;
+ -	u64 iova_pfn_end = (iova + length - 1) >> PAGE_SHIFT;
+ -	u64 pfn;
+ +	unsigned long iova_pfn = iova >> PAGE_SHIFT;
+  	int i;
+  
+ -	for (i = 0; i < pa->pa_nr; i++) {
+ -		pfn = pa->pa_iova[i] >> PAGE_SHIFT;
+ -		if (pfn >= iova_pfn_start && pfn <= iova_pfn_end)
+ +	for (i = 0; i < pa->pa_nr; i++)
+ +		if (pa->pa_iova_pfn[i] == iova_pfn)
+  			return true;
+ -	}
+  
+  	return false;
+  }
+@@@ -548,8 -548,7 +571,12 @@@ static int ccwchain_fetch_direct(struc
+  	 * required for the data transfer, since we only only support
+  	 * 4K IDAWs today.
+  	 */
+++<<<<<<< HEAD
+ +	pa = chain->ch_pa + idx;
+ +	ret = pfn_array_alloc(pa, iova, bytes);
+++=======
++ 	ret = page_array_alloc(pa, iova, idaw_nr);
+++>>>>>>> 62a97a56a64c (vfio/ccw: pass page count to page_array struct)
+  	if (ret < 0)
+  		goto out_free_idaws;
+  
+* Unmerged path drivers/s390/cio/vfio_ccw_cp.c
