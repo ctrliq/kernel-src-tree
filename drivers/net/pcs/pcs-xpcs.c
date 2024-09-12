@@ -952,8 +952,10 @@ static u32 xpcs_get_id(struct mdio_xpcs_args *xpcs)
 	if (ret < 0)
 		return 0xffffffff;
 
-	/* If Device IDs are not all zeros, we found C73 AN-type device */
-	if (id | ret)
+	/* If Device IDs are not all zeros or all ones,
+	 * we found C73 AN-type device
+	 */
+	if ((id | ret) && (id | ret) != 0xffffffff)
 		return id | ret;
 
 	/* Next, search C37 PCS using Vendor-Specific MII MMD */
