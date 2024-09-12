@@ -1,0 +1,107 @@
+perf: Fix perf_event_validate_size() lockdep splat
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-536.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit 7e2c1e4b34f07d9aa8937fab88359d4a0fce468e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-536.el8/7e2c1e4b.failed
+
+When lockdep is enabled, the for_each_sibling_event(sibling, event)
+macro checks that event->ctx->mutex is held. When creating a new group
+leader event, we call perf_event_validate_size() on a partially
+initialized event where event->ctx is NULL, and so when
+for_each_sibling_event() attempts to check event->ctx->mutex, we get a
+splat, as reported by Lucas De Marchi:
+
+  WARNING: CPU: 8 PID: 1471 at kernel/events/core.c:1950 __do_sys_perf_event_open+0xf37/0x1080
+
+This only happens for a new event which is its own group_leader, and in
+this case there cannot be any sibling events. Thus it's safe to skip the
+check for siblings, which avoids having to make invasive and ugly
+changes to for_each_sibling_event().
+
+Avoid the splat by bailing out early when the new event is its own
+group_leader.
+
+Fixes: 382c27f4ed28f803 ("perf: Fix perf_event_validate_size()")
+Closes: https://lore.kernel.org/lkml/20231214000620.3081018-1-lucas.demarchi@intel.com/
+Closes: https://lore.kernel.org/lkml/ZXpm6gQ%2Fd59jGsuW@xpf.sh.intel.com/
+	Reported-by: Lucas De Marchi <lucas.demarchi@intel.com>
+	Reported-by: Pengfei Xu <pengfei.xu@intel.com>
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20231215112450.3972309-1-mark.rutland@arm.com
+(cherry picked from commit 7e2c1e4b34f07d9aa8937fab88359d4a0fce468e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 0e236455b9e0,9efd0d7775e7..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -1953,24 -1924,45 +1953,47 @@@ static void perf_event__id_header_size(
+  	event->id_header_size = size;
+  }
+  
+ -/*
+ - * Check that adding an event to the group does not result in anybody
+ - * overflowing the 64k event limit imposed by the output buffer.
+ - *
+ - * Specifically, check that the read_size for the event does not exceed 16k,
+ - * read_size being the one term that grows with groups size. Since read_size
+ - * depends on per-event read_format, also (re)check the existing events.
+ - *
+ - * This leaves 48k for the constant size fields and things like callchains,
+ - * branch stacks and register sets.
+ - */
+  static bool perf_event_validate_size(struct perf_event *event)
+  {
+ -	struct perf_event *sibling, *group_leader = event->group_leader;
+ +	/*
+ +	 * The values computed here will be over-written when we actually
+ +	 * attach the event.
+ +	 */
+ +	__perf_event_read_size(event, event->group_leader->nr_siblings + 1);
+ +	__perf_event_header_size(event, event->attr.sample_type & ~PERF_SAMPLE_READ);
+ +	perf_event__id_header_size(event);
+  
+ -	if (__perf_event_read_size(event->attr.read_format,
+ -				   group_leader->nr_siblings + 1) > 16*1024)
+ +	/*
+ +	 * Sum the lot; should not exceed the 64k limit we have on records.
+ +	 * Conservative limit to allow for callchains and other variable fields.
+ +	 */
+ +	if (event->read_size + event->header_size +
+ +	    event->id_header_size + sizeof(struct perf_event_header) >= 16*1024)
+  		return false;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (__perf_event_read_size(group_leader->attr.read_format,
++ 				   group_leader->nr_siblings + 1) > 16*1024)
++ 		return false;
++ 
++ 	/*
++ 	 * When creating a new group leader, group_leader->ctx is initialized
++ 	 * after the size has been validated, but we cannot safely use
++ 	 * for_each_sibling_event() until group_leader->ctx is set. A new group
++ 	 * leader cannot have any siblings yet, so we can safely skip checking
++ 	 * the non-existent siblings.
++ 	 */
++ 	if (event == group_leader)
++ 		return true;
++ 
++ 	for_each_sibling_event(sibling, group_leader) {
++ 		if (__perf_event_read_size(sibling->attr.read_format,
++ 					   group_leader->nr_siblings + 1) > 16*1024)
++ 			return false;
++ 	}
++ 
+++>>>>>>> 7e2c1e4b34f0 (perf: Fix perf_event_validate_size() lockdep splat)
+  	return true;
+  }
+  
+* Unmerged path kernel/events/core.c
