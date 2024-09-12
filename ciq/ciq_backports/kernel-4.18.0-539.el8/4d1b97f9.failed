@@ -1,0 +1,258 @@
+xfs: kill the XFS_IOC_{ALLOC,FREE}SP* ioctls
+
+jira LE-1907
+cve {CVE-2021-4155
+cve [RHEL-8464]
+cve Albershteyn)
+cve (Andrey
+cve ioctls
+cve ALLOC,FREESP*
+Rebuild_History Non-Buildable kernel-4.18.0-539.el8
+commit-author Darrick J. Wong <djwong@kernel.org>
+commit 4d1b97f9ce7c0d2af2bb85b12d48e6902172a28e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-539.el8/4d1b97f9.failed
+
+According to the glibc compat header for Irix 4, these ioctls originated
+in April 1991 as a (somewhat clunky) way to preallocate space at the end
+of a file on an EFS filesystem.  XFS, which was released in Irix 5.3 in
+December 1993, picked up these ioctls to maintain compatibility and they
+were ported to Linux in the early 2000s.
+
+Recently it was pointed out to me they still lurk in the kernel, even
+though the Linux fallocate syscall supplanted the functionality a long
+time ago.  fstests doesn't seem to include any real functional or stress
+tests for these ioctls, which means that the code quality is ... very
+questionable.  Most notably, it was a stale disk block exposure vector
+for 21 years and nobody noticed or complained.  As mature programmers
+say, "If you're not testing it, it's broken."
+
+Given all that, let's withdraw these ioctls from the XFS userspace API.
+Normally we'd set a long deprecation process, but I estimate that there
+aren't any real users, so let's trigger a warning in dmesg and return
+-ENOTTY.
+
+See: CVE-2021-4155
+
+Augments: 983d8e60f508 ("xfs: map unwritten blocks in XFS_IOC_{ALLOC,FREE}SP just like fallocate")
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Eric Sandeen <sandeen@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+(cherry picked from commit 4d1b97f9ce7c0d2af2bb85b12d48e6902172a28e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_ioctl.c
+diff --cc fs/xfs/xfs_ioctl.c
+index 5b88bed92c0e,64a7ef4a7298..000000000000
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@@ -626,89 -627,6 +626,92 @@@ xfs_attrmulti_by_handle
+  	return error;
+  }
+  
+++<<<<<<< HEAD
+ +int
+ +xfs_ioc_space(
+ +	struct file		*filp,
+ +	xfs_flock64_t		*bf)
+ +{
+ +	struct inode		*inode = file_inode(filp);
+ +	struct xfs_inode	*ip = XFS_I(inode);
+ +	struct iattr		iattr;
+ +	enum xfs_prealloc_flags	flags = XFS_PREALLOC_CLEAR;
+ +	uint			iolock = XFS_IOLOCK_EXCL | XFS_MMAPLOCK_EXCL;
+ +	int			error;
+ +
+ +	if (inode->i_flags & (S_IMMUTABLE|S_APPEND))
+ +		return -EPERM;
+ +
+ +	if (!(filp->f_mode & FMODE_WRITE))
+ +		return -EBADF;
+ +
+ +	if (!S_ISREG(inode->i_mode))
+ +		return -EINVAL;
+ +
+ +	if (xfs_is_always_cow_inode(ip))
+ +		return -EOPNOTSUPP;
+ +
+ +	if (filp->f_mode & FMODE_NOCMTIME)
+ +		flags |= XFS_PREALLOC_INVISIBLE;
+ +
+ +	error = mnt_want_write_file(filp);
+ +	if (error)
+ +		return error;
+ +
+ +	xfs_ilock(ip, iolock);
+ +	error = xfs_break_layouts(inode, &iolock, BREAK_UNMAP);
+ +	if (error)
+ +		goto out_unlock;
+ +	inode_dio_wait(inode);
+ +
+ +	switch (bf->l_whence) {
+ +	case 0: /*SEEK_SET*/
+ +		break;
+ +	case 1: /*SEEK_CUR*/
+ +		bf->l_start += filp->f_pos;
+ +		break;
+ +	case 2: /*SEEK_END*/
+ +		bf->l_start += XFS_ISIZE(ip);
+ +		break;
+ +	default:
+ +		error = -EINVAL;
+ +		goto out_unlock;
+ +	}
+ +
+ +	if (bf->l_start < 0 || bf->l_start > inode->i_sb->s_maxbytes) {
+ +		error = -EINVAL;
+ +		goto out_unlock;
+ +	}
+ +
+ +	if (bf->l_start > XFS_ISIZE(ip)) {
+ +		error = xfs_alloc_file_space(ip, XFS_ISIZE(ip),
+ +				bf->l_start - XFS_ISIZE(ip),
+ +				XFS_BMAPI_PREALLOC);
+ +		if (error)
+ +			goto out_unlock;
+ +	}
+ +
+ +	iattr.ia_valid = ATTR_SIZE;
+ +	iattr.ia_size = bf->l_start;
+ +	error = xfs_vn_setattr_size(file_dentry(filp), &iattr);
+ +	if (error)
+ +		goto out_unlock;
+ +
+ +	error = xfs_update_prealloc_flags(ip, flags);
+ +	if (error)
+ +		goto out_unlock;
+ +
+ +	if (filp->f_flags & O_DSYNC)
+ +		error = xfs_log_force_inode(ip);
+ +
+ +out_unlock:
+ +	xfs_iunlock(ip, iolock);
+ +	mnt_drop_write_file(filp);
+ +	return error;
+ +}
+ +
+++=======
+++>>>>>>> 4d1b97f9ce7c (xfs: kill the XFS_IOC_{ALLOC,FREE}SP* ioctls)
+  /* Return 0 on success or positive error */
+  int
+  xfs_fsbulkstat_one_fmt(
+diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+index 6d8de8bcb14b..dade78786373 100644
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -774,8 +774,7 @@ int
+ xfs_alloc_file_space(
+ 	struct xfs_inode	*ip,
+ 	xfs_off_t		offset,
+-	xfs_off_t		len,
+-	int			alloc_type)
++	xfs_off_t		len)
+ {
+ 	xfs_mount_t		*mp = ip->i_mount;
+ 	xfs_off_t		count;
+@@ -865,8 +864,8 @@ xfs_alloc_file_space(
+ 			goto error;
+ 
+ 		error = xfs_bmapi_write(tp, ip, startoffset_fsb,
+-					allocatesize_fsb, alloc_type, 0, imapp,
+-					&nimaps);
++				allocatesize_fsb, XFS_BMAPI_PREALLOC, 0, imapp,
++				&nimaps);
+ 		if (error)
+ 			goto error;
+ 
+diff --git a/fs/xfs/xfs_bmap_util.h b/fs/xfs/xfs_bmap_util.h
+index ca9000d38b90..6888078f5c31 100644
+--- a/fs/xfs/xfs_bmap_util.h
++++ b/fs/xfs/xfs_bmap_util.h
+@@ -54,7 +54,7 @@ int	xfs_bmap_last_extent(struct xfs_trans *tp, struct xfs_inode *ip,
+ 
+ /* preallocation and hole punch interface */
+ int	xfs_alloc_file_space(struct xfs_inode *ip, xfs_off_t offset,
+-			     xfs_off_t len, int alloc_type);
++			     xfs_off_t len);
+ int	xfs_free_file_space(struct xfs_inode *ip, xfs_off_t offset,
+ 			    xfs_off_t len);
+ int	xfs_collapse_file_space(struct xfs_inode *, xfs_off_t offset,
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 137f800d7415..3cdc46c5f7ff 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -1058,8 +1058,7 @@ xfs_file_fallocate(
+ 		}
+ 
+ 		if (!xfs_is_always_cow_inode(ip)) {
+-			error = xfs_alloc_file_space(ip, offset, len,
+-						     XFS_BMAPI_PREALLOC);
++			error = xfs_alloc_file_space(ip, offset, len);
+ 			if (error)
+ 				goto out_unlock;
+ 		}
+* Unmerged path fs/xfs/xfs_ioctl.c
+diff --git a/fs/xfs/xfs_ioctl.h b/fs/xfs/xfs_ioctl.h
+index 416e20de66e7..39df35380d74 100644
+--- a/fs/xfs/xfs_ioctl.h
++++ b/fs/xfs/xfs_ioctl.h
+@@ -10,12 +10,6 @@ struct xfs_bstat;
+ struct xfs_ibulk;
+ struct xfs_inogrp;
+ 
+-
+-extern int
+-xfs_ioc_space(
+-	struct file		*filp,
+-	xfs_flock64_t		*bf);
+-
+ int
+ xfs_ioc_swapext(
+ 	xfs_swapext_t	*sxp);
+diff --git a/fs/xfs/xfs_ioctl32.c b/fs/xfs/xfs_ioctl32.c
+index fd5eb5304b1c..3f5b2758e140 100644
+--- a/fs/xfs/xfs_ioctl32.c
++++ b/fs/xfs/xfs_ioctl32.c
+@@ -27,22 +27,6 @@
+ 	  _IOC(_IOC_DIR(cmd), _IOC_TYPE(cmd), _IOC_NR(cmd), sizeof(type))
+ 
+ #ifdef BROKEN_X86_ALIGNMENT
+-STATIC int
+-xfs_compat_flock64_copyin(
+-	xfs_flock64_t		*bf,
+-	compat_xfs_flock64_t	__user *arg32)
+-{
+-	if (get_user(bf->l_type,	&arg32->l_type) ||
+-	    get_user(bf->l_whence,	&arg32->l_whence) ||
+-	    get_user(bf->l_start,	&arg32->l_start) ||
+-	    get_user(bf->l_len,		&arg32->l_len) ||
+-	    get_user(bf->l_sysid,	&arg32->l_sysid) ||
+-	    get_user(bf->l_pid,		&arg32->l_pid) ||
+-	    copy_from_user(bf->l_pad,	&arg32->l_pad,	4*sizeof(u32)))
+-		return -EFAULT;
+-	return 0;
+-}
+-
+ STATIC int
+ xfs_compat_ioc_fsgeometry_v1(
+ 	struct xfs_mount	  *mp,
+@@ -444,17 +428,6 @@ xfs_file_compat_ioctl(
+ 
+ 	switch (cmd) {
+ #if defined(BROKEN_X86_ALIGNMENT)
+-	case XFS_IOC_ALLOCSP_32:
+-	case XFS_IOC_FREESP_32:
+-	case XFS_IOC_ALLOCSP64_32:
+-	case XFS_IOC_FREESP64_32: {
+-		struct xfs_flock64	bf;
+-
+-		if (xfs_compat_flock64_copyin(&bf, arg))
+-			return -EFAULT;
+-		cmd = _NATIVE_IOC(cmd, struct xfs_flock64);
+-		return xfs_ioc_space(filp, &bf);
+-	}
+ 	case XFS_IOC_FSGEOMETRY_V1_32:
+ 		return xfs_compat_ioc_fsgeometry_v1(mp, arg);
+ 	case XFS_IOC_FSGROWFSDATA_32: {
