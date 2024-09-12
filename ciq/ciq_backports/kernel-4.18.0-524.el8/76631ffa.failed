@@ -1,0 +1,143 @@
+s390/ism: Fix and simplify add()/remove() callback handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-524.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 76631ffa2fd2d45bae5ad717eef716b94144e0e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-524.el8/76631ffa.failed
+
+Previously the clients_lock was protecting the clients array against
+concurrent addition/removal of clients but was also accessed from IRQ
+context. This meant that it had to be a spinlock and that the add() and
+remove() callbacks in which clients need to do allocation and take
+mutexes can't be called under the clients_lock. To work around this these
+callbacks were moved to workqueues. This not only introduced significant
+complexity but is also subtly broken in at least one way.
+
+In ism_dev_init() and ism_dev_exit() clients[i]->tgt_ism is used to
+communicate the added/removed ISM device to the work function. While
+write access to client[i]->tgt_ism is protected by the clients_lock and
+the code waits that there is no pending add/remove work before and after
+setting clients[i]->tgt_ism this is not enough. The problem is that the
+wait happens based on per ISM device counters. Thus a concurrent
+ism_dev_init()/ism_dev_exit() for a different ISM device may overwrite
+a clients[i]->tgt_ism between unlocking the clients_lock and the
+subsequent wait for the work to finnish.
+
+Thankfully with the clients_lock no longer held in IRQ context it can be
+turned into a mutex which can be held during the calls to add()/remove()
+completely removing the need for the workqueues and the associated
+broken housekeeping including the per ISM device counters and the
+clients[i]->tgt_ism.
+
+Fixes: 89e7d2ba61b7 ("net/ism: Add new API for client registration")
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 76631ffa2fd2d45bae5ad717eef716b94144e0e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/ism_drv.c
+#	include/linux/ism.h
+diff --cc drivers/s390/net/ism_drv.c
+index f5bfc50915ca,54091b7aea16..000000000000
+--- a/drivers/s390/net/ism_drv.c
++++ b/drivers/s390/net/ism_drv.c
+@@@ -84,16 -94,18 +84,16 @@@ int ism_unregister_client(struct ism_cl
+  	struct ism_dev *ism;
+  	unsigned long flags;
+  	int rc = 0;
+ +	int i;
+  
+  	mutex_lock(&ism_dev_list.mutex);
+- 	spin_lock_irqsave(&clients_lock, flags);
++ 	mutex_lock(&clients_lock);
+  	clients[client->id] = NULL;
+  	if (client->id + 1 == max_client)
+  		max_client--;
+- 	spin_unlock_irqrestore(&clients_lock, flags);
++ 	mutex_unlock(&clients_lock);
+  	list_for_each_entry(ism, &ism_dev_list.list, list) {
+ -		spin_lock_irqsave(&ism->lock, flags);
+ -		/* Stop forwarding IRQs and events */
+ -		ism->subs[client->id] = NULL;
+ -		for (int i = 0; i < ISM_NR_DMBS; ++i) {
+ +		for (i = 0; i < ISM_NR_DMBS; ++i) {
+  			if (ism->sba_client_arr[i] == client->id) {
+  				pr_err("%s: attempt to unregister client '%s'"
+  				       "with registered dmb(s)\n", __func__,
+@@@ -549,16 -571,6 +549,19 @@@ static u64 ism_get_local_gid(struct ism
+  	return ism->local_gid;
+  }
+  
+++<<<<<<< HEAD
+ +static void ism_dev_add_work_func(struct work_struct *work)
+ +{
+ +	struct ism_client *client = container_of(work, struct ism_client,
+ +						 add_work);
+ +
+ +	client->add(client->tgt_ism);
+ +	atomic_dec(&client->tgt_ism->add_dev_cnt);
+ +	wake_up(&client->tgt_ism->waitq);
+ +}
+ +
+++=======
+++>>>>>>> 76631ffa2fd2 (s390/ism: Fix and simplify add()/remove() callback handling)
+  static int ism_dev_init(struct ism_dev *ism)
+  {
+  	struct pci_dev *pdev = ism->pdev;
+@@@ -689,17 -690,6 +682,20 @@@ err_dev
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static void ism_dev_remove_work_func(struct work_struct *work)
+ +{
+ +	struct ism_client *client = container_of(work, struct ism_client,
+ +						 remove_work);
+ +
+ +	client->remove(client->tgt_ism);
+ +	atomic_dec(&client->tgt_ism->free_clients_cnt);
+ +	wake_up(&client->tgt_ism->waitq);
+ +}
+ +
+ +/* Callers must hold ism_dev_list.mutex */
+++=======
+++>>>>>>> 76631ffa2fd2 (s390/ism: Fix and simplify add()/remove() callback handling)
+  static void ism_dev_exit(struct ism_dev *ism)
+  {
+  	struct pci_dev *pdev = ism->pdev;
+@@@ -735,11 -725,8 +731,9 @@@ static void ism_remove(struct pci_dev *
+  {
+  	struct ism_dev *ism = dev_get_drvdata(&pdev->dev);
+  
+- 	mutex_lock(&ism_dev_list.mutex);
+  	ism_dev_exit(ism);
+- 	mutex_unlock(&ism_dev_list.mutex);
+  
+ +	pci_clear_master(pdev);
+  	pci_release_mem_regions(pdev);
+  	pci_disable_device(pdev);
+  	device_del(&ism->dev);
+diff --cc include/linux/ism.h
+index ea2bcdae7401,9a4c204df3da..000000000000
+--- a/include/linux/ism.h
++++ b/include/linux/ism.h
+@@@ -44,9 -44,7 +44,13 @@@ struct ism_dev 
+  	u64 local_gid;
+  	int ieq_idx;
+  
+++<<<<<<< HEAD
+ +	atomic_t free_clients_cnt;
+ +	atomic_t add_dev_cnt;
+ +	wait_queue_head_t waitq;
+++=======
++ 	struct ism_client *subs[MAX_CLIENTS];
+++>>>>>>> 76631ffa2fd2 (s390/ism: Fix and simplify add()/remove() callback handling)
+  };
+  
+  struct ism_event {
+* Unmerged path drivers/s390/net/ism_drv.c
+* Unmerged path include/linux/ism.h
