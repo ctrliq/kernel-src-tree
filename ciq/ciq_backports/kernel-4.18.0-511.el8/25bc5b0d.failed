@@ -1,0 +1,175 @@
+proc/vmcore: don't fake reading zeroes on surprise vmcore_cb unregistration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-511.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit 25bc5b0de91bc5e7afa65f1face0087fb9e331c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-511.el8/25bc5b0d.failed
+
+In commit cc5f2704c934 ("proc/vmcore: convert oldmem_pfn_is_ram callback
+to more generic vmcore callbacks"), we added detection of surprise
+vmcore_cb unregistration after the vmcore was already opened.  Once
+detected, we warn the user and simulate reading zeroes from that point
+on when accessing the vmcore.
+
+The basic reason was that unexpected unregistration, for example, by
+manually unbinding a driver from a device after opening the vmcore, is
+not supported and could result in reading oldmem the vmcore_cb would
+have actually prohibited while registered.  However, something like that
+can similarly be trigger by a user that's really looking for trouble
+simply by unbinding the relevant driver before opening the vmcore -- or
+by disallowing loading the driver in the first place.  So it's actually
+of limited help.
+
+Currently, unregistration can only be triggered via virtio-mem when
+manually unbinding the driver from the device inside the VM; there is no
+way to trigger it from the hypervisor, as hypervisors don't allow for
+unplugging virtio-mem devices -- ripping out system RAM from a VM
+without coordination with the guest is usually not a good idea.
+
+The important part is that unbinding the driver and unregistering the
+vmcore_cb while concurrently reading the vmcore won't crash the system,
+and that is handled by the rwsem.
+
+To make the mechanism more future proof, let's remove the "read zero"
+part, but leave the warning in place.  For example, we could have a
+future driver (like virtio-balloon) that will contact the hypervisor to
+figure out if we already populated a page for a given PFN.
+Hotunplugging such a device and consequently unregistering the vmcore_cb
+could be triggered from the hypervisor without harming the system even
+while kdump is running.  In that case, we don't want to silently end up
+with a vmcore that contains wrong data, because the user inside the VM
+might be unaware of the hypervisor action and might easily miss the
+warning in the log.
+
+Link: https://lkml.kernel.org/r/20211111192243.22002-1-david@redhat.com
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Acked-by: Baoquan He <bhe@redhat.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: Vivek Goyal <vgoyal@redhat.com>
+	Cc: Philipp Rudo <prudo@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 25bc5b0de91bc5e7afa65f1face0087fb9e331c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/vmcore.c
+diff --cc fs/proc/vmcore.c
+index e57145de158d,702754dd1daf..000000000000
+--- a/fs/proc/vmcore.c
++++ b/fs/proc/vmcore.c
+@@@ -62,42 -62,56 +62,75 @@@ core_param(novmcoredd, vmcoredd_disable
+  /* Device Dump Size */
+  static size_t vmcoredd_orig_sz;
+  
+++<<<<<<< HEAD
+ +/*
+ + * Returns > 0 for RAM pages, 0 for non-RAM pages, < 0 on error
+ + * The called function has to take care of module refcounting.
+ + */
+ +static int (*oldmem_pfn_is_ram)(unsigned long pfn);
+++=======
++ static DECLARE_RWSEM(vmcore_cb_rwsem);
++ /* List of registered vmcore callbacks. */
++ static LIST_HEAD(vmcore_cb_list);
++ /* Whether the vmcore has been opened once. */
++ static bool vmcore_opened;
+++>>>>>>> 25bc5b0de91b (proc/vmcore: don't fake reading zeroes on surprise vmcore_cb unregistration)
+  
+ -void register_vmcore_cb(struct vmcore_cb *cb)
+ +int register_oldmem_pfn_is_ram(int (*fn)(unsigned long pfn))
+  {
+ -	down_write(&vmcore_cb_rwsem);
+ -	INIT_LIST_HEAD(&cb->next);
+ -	list_add_tail(&cb->next, &vmcore_cb_list);
+ -	/*
+ -	 * Registering a vmcore callback after the vmcore was opened is
+ -	 * very unusual (e.g., manual driver loading).
+ -	 */
+ -	if (vmcore_opened)
+ -		pr_warn_once("Unexpected vmcore callback registration\n");
+ -	up_write(&vmcore_cb_rwsem);
+ +	if (oldmem_pfn_is_ram)
+ +		return -EBUSY;
+ +	oldmem_pfn_is_ram = fn;
+ +	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(register_vmcore_cb);
+ +EXPORT_SYMBOL_GPL(register_oldmem_pfn_is_ram);
+  
+ -void unregister_vmcore_cb(struct vmcore_cb *cb)
+ +void unregister_oldmem_pfn_is_ram(void)
+  {
+++<<<<<<< HEAD
+ +	oldmem_pfn_is_ram = NULL;
+ +	wmb();
+++=======
++ 	down_write(&vmcore_cb_rwsem);
++ 	list_del(&cb->next);
++ 	/*
++ 	 * Unregistering a vmcore callback after the vmcore was opened is
++ 	 * very unusual (e.g., forced driver removal), but we cannot stop
++ 	 * unregistering.
++ 	 */
++ 	if (vmcore_opened)
++ 		pr_warn_once("Unexpected vmcore callback unregistration\n");
++ 	up_write(&vmcore_cb_rwsem);
+++>>>>>>> 25bc5b0de91b (proc/vmcore: don't fake reading zeroes on surprise vmcore_cb unregistration)
+  }
+ -EXPORT_SYMBOL_GPL(unregister_vmcore_cb);
+ +EXPORT_SYMBOL_GPL(unregister_oldmem_pfn_is_ram);
+  
+  static bool pfn_is_ram(unsigned long pfn)
+  {
+ -	struct vmcore_cb *cb;
+ +	int (*fn)(unsigned long pfn);
+ +	/* pfn is ram unless fn() checks pagetype */
+  	bool ret = true;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Ask hypervisor if the pfn is really ram.
+ +	 * A ballooned page contains no data and reading from such a page
+ +	 * will cause high load in the hypervisor.
+ +	 */
+ +	fn = oldmem_pfn_is_ram;
+ +	if (fn)
+ +		ret = !!fn(pfn);
+++=======
++ 	lockdep_assert_held_read(&vmcore_cb_rwsem);
++ 
++ 	list_for_each_entry(cb, &vmcore_cb_list, next) {
++ 		if (unlikely(!cb->pfn_is_ram))
++ 			continue;
++ 		ret = cb->pfn_is_ram(cb, pfn);
++ 		if (!ret)
++ 			break;
++ 	}
+++>>>>>>> 25bc5b0de91b (proc/vmcore: don't fake reading zeroes on surprise vmcore_cb unregistration)
+  
+  	return ret;
+  }
+@@@ -539,10 -574,13 +572,16 @@@ static int vmcore_remap_oldmem_pfn(stru
+  	 * Check if oldmem_pfn_is_ram was registered to avoid
+  	 * looping over all pages without a reason.
+  	 */
+++<<<<<<< HEAD
+ +	if (oldmem_pfn_is_ram)
+ +		return remap_oldmem_pfn_checked(vma, from, pfn, size, prot);
+++=======
++ 	down_read(&vmcore_cb_rwsem);
++ 	if (!list_empty(&vmcore_cb_list))
++ 		ret = remap_oldmem_pfn_checked(vma, from, pfn, size, prot);
+++>>>>>>> 25bc5b0de91b (proc/vmcore: don't fake reading zeroes on surprise vmcore_cb unregistration)
+  	else
+ -		ret = remap_oldmem_pfn_range(vma, from, pfn, size, prot);
+ -	up_read(&vmcore_cb_rwsem);
+ -	return ret;
+ +		return remap_oldmem_pfn_range(vma, from, pfn, size, prot);
+  }
+  
+  static int mmap_vmcore(struct file *file, struct vm_area_struct *vma)
+* Unmerged path fs/proc/vmcore.c
