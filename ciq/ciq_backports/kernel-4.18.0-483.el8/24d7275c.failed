@@ -1,0 +1,286 @@
+fs/proc: task_mmu.c: don't read mapcount for migration entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-483.el8
+commit-author Yang Shi <shy828301@gmail.com>
+commit 24d7275ce2791829953ed4e72f68277ceb2571c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-483.el8/24d7275c.failed
+
+The syzbot reported the below BUG:
+
+  kernel BUG at include/linux/page-flags.h:785!
+  invalid opcode: 0000 [#1] PREEMPT SMP KASAN
+  CPU: 1 PID: 4392 Comm: syz-executor560 Not tainted 5.16.0-rc6-syzkaller #0
+  Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
+  RIP: 0010:PageDoubleMap include/linux/page-flags.h:785 [inline]
+  RIP: 0010:__page_mapcount+0x2d2/0x350 mm/util.c:744
+  Call Trace:
+    page_mapcount include/linux/mm.h:837 [inline]
+    smaps_account+0x470/0xb10 fs/proc/task_mmu.c:466
+    smaps_pte_entry fs/proc/task_mmu.c:538 [inline]
+    smaps_pte_range+0x611/0x1250 fs/proc/task_mmu.c:601
+    walk_pmd_range mm/pagewalk.c:128 [inline]
+    walk_pud_range mm/pagewalk.c:205 [inline]
+    walk_p4d_range mm/pagewalk.c:240 [inline]
+    walk_pgd_range mm/pagewalk.c:277 [inline]
+    __walk_page_range+0xe23/0x1ea0 mm/pagewalk.c:379
+    walk_page_vma+0x277/0x350 mm/pagewalk.c:530
+    smap_gather_stats.part.0+0x148/0x260 fs/proc/task_mmu.c:768
+    smap_gather_stats fs/proc/task_mmu.c:741 [inline]
+    show_smap+0xc6/0x440 fs/proc/task_mmu.c:822
+    seq_read_iter+0xbb0/0x1240 fs/seq_file.c:272
+    seq_read+0x3e0/0x5b0 fs/seq_file.c:162
+    vfs_read+0x1b5/0x600 fs/read_write.c:479
+    ksys_read+0x12d/0x250 fs/read_write.c:619
+    do_syscall_x64 arch/x86/entry/common.c:50 [inline]
+    do_syscall_64+0x35/0xb0 arch/x86/entry/common.c:80
+    entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+The reproducer was trying to read /proc/$PID/smaps when calling
+MADV_FREE at the mean time.  MADV_FREE may split THPs if it is called
+for partial THP.  It may trigger the below race:
+
+           CPU A                         CPU B
+           -----                         -----
+  smaps walk:                      MADV_FREE:
+  page_mapcount()
+    PageCompound()
+                                   split_huge_page()
+    page = compound_head(page)
+    PageDoubleMap(page)
+
+When calling PageDoubleMap() this page is not a tail page of THP anymore
+so the BUG is triggered.
+
+This could be fixed by elevated refcount of the page before calling
+mapcount, but that would prevent it from counting migration entries, and
+it seems overkilling because the race just could happen when PMD is
+split so all PTE entries of tail pages are actually migration entries,
+and smaps_account() does treat migration entries as mapcount == 1 as
+Kirill pointed out.
+
+Add a new parameter for smaps_account() to tell this entry is migration
+entry then skip calling page_mapcount().  Don't skip getting mapcount
+for device private entries since they do track references with mapcount.
+
+Pagemap also has the similar issue although it was not reported.  Fixed
+it as well.
+
+[shy828301@gmail.com: v4]
+  Link: https://lkml.kernel.org/r/20220203182641.824731-1-shy828301@gmail.com
+[nathan@kernel.org: avoid unused variable warning in pagemap_pmd_range()]
+  Link: https://lkml.kernel.org/r/20220207171049.1102239-1-nathan@kernel.org
+Link: https://lkml.kernel.org/r/20220120202805.3369-1-shy828301@gmail.com
+Fixes: e9b61f19858a ("thp: reintroduce split_huge_page()")
+	Signed-off-by: Yang Shi <shy828301@gmail.com>
+	Signed-off-by: Nathan Chancellor <nathan@kernel.org>
+	Reported-by: syzbot+1f52b3a18d5633fa7f82@syzkaller.appspotmail.com
+	Acked-by: David Hildenbrand <david@redhat.com>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Alexey Dobriyan <adobriyan@gmail.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 24d7275ce2791829953ed4e72f68277ceb2571c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/task_mmu.c
+diff --cc fs/proc/task_mmu.c
+index 782d6873bd95,6e97ed775074..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -418,13 -403,45 +418,18 @@@ struct mem_size_stats 
+  	unsigned long shared_hugetlb;
+  	unsigned long private_hugetlb;
+  	u64 pss;
+ -	u64 pss_anon;
+ -	u64 pss_file;
+ -	u64 pss_shmem;
+  	u64 pss_locked;
+  	u64 swap_pss;
+ +	bool check_shmem_swap;
+  };
+  
+ -static void smaps_page_accumulate(struct mem_size_stats *mss,
+ -		struct page *page, unsigned long size, unsigned long pss,
+ -		bool dirty, bool locked, bool private)
+ -{
+ -	mss->pss += pss;
+ -
+ -	if (PageAnon(page))
+ -		mss->pss_anon += pss;
+ -	else if (PageSwapBacked(page))
+ -		mss->pss_shmem += pss;
+ -	else
+ -		mss->pss_file += pss;
+ -
+ -	if (locked)
+ -		mss->pss_locked += pss;
+ -
+ -	if (dirty || PageDirty(page)) {
+ -		if (private)
+ -			mss->private_dirty += size;
+ -		else
+ -			mss->shared_dirty += size;
+ -	} else {
+ -		if (private)
+ -			mss->private_clean += size;
+ -		else
+ -			mss->shared_clean += size;
+ -	}
+ -}
+ -
+  static void smaps_account(struct mem_size_stats *mss, struct page *page,
+++<<<<<<< HEAD
+ +		bool compound, bool young, bool dirty)
+++=======
++ 		bool compound, bool young, bool dirty, bool locked,
++ 		bool migration)
+++>>>>>>> 24d7275ce279 (fs/proc: task_mmu.c: don't read mapcount for migration entry)
+  {
+  	int i, nr = compound ? compound_nr(page) : 1;
+  	unsigned long size = nr * PAGE_SIZE;
+@@@ -444,32 -465,29 +449,45 @@@
+  	 * page_count(page) == 1 guarantees the page is mapped exactly once.
+  	 * If any subpage of the compound page mapped with PTE it would elevate
+  	 * page_count().
++ 	 *
++ 	 * The page_mapcount() is called to get a snapshot of the mapcount.
++ 	 * Without holding the page lock this snapshot can be slightly wrong as
++ 	 * we cannot always read the mapcount atomically.  It is not safe to
++ 	 * call page_mapcount() even with PTL held if the page is not mapped,
++ 	 * especially for migration entries.  Treat regular migration entries
++ 	 * as mapcount == 1.
+  	 */
+++<<<<<<< HEAD
+ +	if (page_count(page) == 1) {
+ +		if (dirty || PageDirty(page))
+ +			mss->private_dirty += size;
+ +		else
+ +			mss->private_clean += size;
+ +		mss->pss += (u64)size << PSS_SHIFT;
+++=======
++ 	if ((page_count(page) == 1) || migration) {
++ 		smaps_page_accumulate(mss, page, size, size << PSS_SHIFT, dirty,
++ 			locked, true);
+++>>>>>>> 24d7275ce279 (fs/proc: task_mmu.c: don't read mapcount for migration entry)
+  		return;
+  	}
+ +
+  	for (i = 0; i < nr; i++, page++) {
+  		int mapcount = page_mapcount(page);
+ -		unsigned long pss = PAGE_SIZE << PSS_SHIFT;
+ -		if (mapcount >= 2)
+ -			pss /= mapcount;
+ -		smaps_page_accumulate(mss, page, PAGE_SIZE, pss, dirty, locked,
+ -				      mapcount < 2);
+ +
+ +		if (mapcount >= 2) {
+ +			if (dirty || PageDirty(page))
+ +				mss->shared_dirty += PAGE_SIZE;
+ +			else
+ +				mss->shared_clean += PAGE_SIZE;
+ +			mss->pss += (PAGE_SIZE << PSS_SHIFT) / mapcount;
+ +		} else {
+ +			if (dirty || PageDirty(page))
+ +				mss->private_dirty += PAGE_SIZE;
+ +			else
+ +				mss->private_clean += PAGE_SIZE;
+ +			mss->pss += PAGE_SIZE << PSS_SHIFT;
+ +		}
+  	}
+  }
+  
+@@@ -493,7 -523,9 +511,8 @@@ static void smaps_pte_entry(pte_t *pte
+  {
+  	struct mem_size_stats *mss = walk->private;
+  	struct vm_area_struct *vma = walk->vma;
+ -	bool locked = !!(vma->vm_flags & VM_LOCKED);
+  	struct page *page = NULL;
++ 	bool migration = false;
+  
+  	if (pte_present(*pte)) {
+  		page = vm_normal_page(vma, addr, *pte);
+@@@ -513,27 -545,21 +532,40 @@@
+  			} else {
+  				mss->swap_pss += (u64)PAGE_SIZE << PSS_SHIFT;
+  			}
+- 		} else if (is_pfn_swap_entry(swpent))
++ 		} else if (is_pfn_swap_entry(swpent)) {
++ 			if (is_migration_entry(swpent))
++ 				migration = true;
+  			page = pfn_swap_entry_to_page(swpent);
+++<<<<<<< HEAD
+ +	} else if (unlikely(IS_ENABLED(CONFIG_SHMEM) && mss->check_shmem_swap
+ +							&& pte_none(*pte))) {
+ +		page = find_get_entry(vma->vm_file->f_mapping,
+ +						linear_page_index(vma, addr));
+ +		if (!page)
+ +			return;
+ +
+ +		if (xa_is_value(page))
+ +			mss->swap += PAGE_SIZE;
+ +		else
+ +			put_page(page);
+ +
+++=======
++ 		}
++ 	} else {
++ 		smaps_pte_hole_lookup(addr, walk);
+++>>>>>>> 24d7275ce279 (fs/proc: task_mmu.c: don't read mapcount for migration entry)
+  		return;
+  	}
+  
+  	if (!page)
+  		return;
+  
+++<<<<<<< HEAD
+ +	smaps_account(mss, page, false, pte_young(*pte), pte_dirty(*pte));
+++=======
++ 	smaps_account(mss, page, false, pte_young(*pte), pte_dirty(*pte),
++ 		      locked, migration);
+++>>>>>>> 24d7275ce279 (fs/proc: task_mmu.c: don't read mapcount for migration entry)
+  }
+  
+  #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+@@@ -542,7 -568,9 +574,8 @@@ static void smaps_pmd_entry(pmd_t *pmd
+  {
+  	struct mem_size_stats *mss = walk->private;
+  	struct vm_area_struct *vma = walk->vma;
+ -	bool locked = !!(vma->vm_flags & VM_LOCKED);
+  	struct page *page = NULL;
++ 	bool migration = false;
+  
+  	if (pmd_present(*pmd)) {
+  		/* FOLL_DUMP will return -EFAULT on huge zero page */
+@@@ -563,7 -593,9 +598,13 @@@
+  		/* pass */;
+  	else
+  		mss->file_thp += HPAGE_PMD_SIZE;
+++<<<<<<< HEAD
+ +	smaps_account(mss, page, true, pmd_young(*pmd), pmd_dirty(*pmd));
+++=======
++ 
++ 	smaps_account(mss, page, true, pmd_young(*pmd), pmd_dirty(*pmd),
++ 		      locked, migration);
+++>>>>>>> 24d7275ce279 (fs/proc: task_mmu.c: don't read mapcount for migration entry)
+  }
+  #else
+  static void smaps_pmd_entry(pmd_t *pmd, unsigned long addr,
+@@@ -1350,7 -1479,10 +1394,8 @@@ static int pagemap_pmd_range(pmd_t *pmd
+  			flags |= PM_SWAP;
+  			if (pmd_swp_soft_dirty(pmd))
+  				flags |= PM_SOFT_DIRTY;
+ -			if (pmd_swp_uffd_wp(pmd))
+ -				flags |= PM_UFFD_WP;
+  			VM_BUG_ON(!is_pmd_migration_entry(pmd));
++ 			migration = is_migration_entry(entry);
+  			page = pfn_swap_entry_to_page(entry);
+  		}
+  #endif
+* Unmerged path fs/proc/task_mmu.c
