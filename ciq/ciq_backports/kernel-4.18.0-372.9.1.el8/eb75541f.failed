@@ -1,0 +1,230 @@
+arm64, numa: Change the numa init functions name to be generic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Atish Patra <atish.patra@wdc.com>
+commit eb75541f8b4535cf22e22cd2e60734866868e818
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/eb75541f.failed
+
+This is a preparatory patch for unifying numa implementation between
+ARM64 & RISC-V. As the numa implementation will be moved to generic
+code, rename the arm64 related functions to a generic one.
+
+	Signed-off-by: Atish Patra <atish.patra@wdc.com>
+	Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+	Signed-off-by: Palmer Dabbelt <palmerdabbelt@google.com>
+(cherry picked from commit eb75541f8b4535cf22e22cd2e60734866868e818)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/mm/init.c
+#	arch/arm64/mm/numa.c
+diff --cc arch/arm64/mm/init.c
+index 795a76d27053,35adf6a9e98e..000000000000
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@@ -479,87 -416,36 +479,96 @@@ void __init bootmem_init(void
+  	early_memtest(min << PAGE_SHIFT, max << PAGE_SHIFT);
+  
+  	max_pfn = max_low_pfn = max;
+ -	min_low_pfn = min;
+  
+++<<<<<<< HEAD
+ +	arm64_numa_init();
+ +	/*
+ +	 * Sparsemem tries to allocate bootmem in memory_present(), so must be
+ +	 * done after the fixed reservations.
+++=======
++ 	arch_numa_init();
++ 
++ 	/*
++ 	 * must be done after arch_numa_init() which calls numa_init() to
++ 	 * initialize node_online_map that gets used in hugetlb_cma_reserve()
++ 	 * while allocating required CMA size across online nodes.
+++>>>>>>> eb75541f8b45 (arm64, numa: Change the numa init functions name to be generic)
+  	 */
+ -#if defined(CONFIG_HUGETLB_PAGE) && defined(CONFIG_CMA)
+ -	arm64_hugetlb_cma_reserve();
+ -#endif
+ +	arm64_memory_present();
+ +
+ +	sparse_init();
+ +	zone_sizes_init(min, max);
+  
+ -	dma_pernuma_cma_reserve();
+ +	memblock_dump_all();
+ +}
+ +
+ +#ifndef CONFIG_SPARSEMEM_VMEMMAP
+ +static inline void free_memmap(unsigned long start_pfn, unsigned long end_pfn)
+ +{
+ +	struct page *start_pg, *end_pg;
+ +	unsigned long pg, pgend;
+  
+  	/*
+ -	 * sparse_init() tries to allocate memory from memblock, so must be
+ -	 * done after the fixed reservations
+ +	 * Convert start_pfn/end_pfn to a struct page pointer.
+  	 */
+ -	sparse_init();
+ -	zone_sizes_init(min, max);
+ +	start_pg = pfn_to_page(start_pfn - 1) + 1;
+ +	end_pg = pfn_to_page(end_pfn - 1) + 1;
+  
+  	/*
+ -	 * request_standard_resources() depends on crashkernel's memory being
+ -	 * reserved, so do it here.
+ +	 * Convert to physical addresses, and round start upwards and end
+ +	 * downwards.
+  	 */
+ -	reserve_crashkernel();
+ +	pg = (unsigned long)PAGE_ALIGN(__pa(start_pg));
+ +	pgend = (unsigned long)__pa(end_pg) & PAGE_MASK;
+  
+ -	memblock_dump_all();
+ +	/*
+ +	 * If there are free pages between these, free the section of the
+ +	 * memmap array.
+ +	 */
+ +	if (pg < pgend)
+ +		memblock_free(pg, pgend - pg);
+ +}
+ +
+ +/*
+ + * The mem_map array can get very big. Free the unused area of the memory map.
+ + */
+ +static void __init free_unused_memmap(void)
+ +{
+ +	unsigned long start, prev_end = 0;
+ +	struct memblock_region *reg;
+ +
+ +	for_each_memblock(memory, reg) {
+ +		start = __phys_to_pfn(reg->base);
+ +
+ +#ifdef CONFIG_SPARSEMEM
+ +		/*
+ +		 * Take care not to free memmap entries that don't exist due
+ +		 * to SPARSEMEM sections which aren't present.
+ +		 */
+ +		start = min(start, ALIGN(prev_end, PAGES_PER_SECTION));
+ +#endif
+ +		/*
+ +		 * If we had a previous bank, and there is a space between the
+ +		 * current bank and the previous, free it.
+ +		 */
+ +		if (prev_end && prev_end < start)
+ +			free_memmap(prev_end, start);
+ +
+ +		/*
+ +		 * Align up here since the VM subsystem insists that the
+ +		 * memmap entries are valid from the bank end aligned to
+ +		 * MAX_ORDER_NR_PAGES.
+ +		 */
+ +		prev_end = ALIGN(__phys_to_pfn(reg->base + reg->size),
+ +				 MAX_ORDER_NR_PAGES);
+ +	}
+ +
+ +#ifdef CONFIG_SPARSEMEM
+ +	if (!IS_ALIGNED(prev_end, PAGES_PER_SECTION))
+ +		free_memmap(prev_end, ALIGN(prev_end, PAGES_PER_SECTION));
+ +#endif
+  }
+ +#endif	/* !CONFIG_SPARSEMEM_VMEMMAP */
+  
+  /*
+   * mem_init() marks the free areas in the mem_map and tells us how much memory
+diff --cc arch/arm64/mm/numa.c
+index 818cfbe777a9,0dae54ce7d43..000000000000
+--- a/arch/arm64/mm/numa.c
++++ b/arch/arm64/mm/numa.c
+@@@ -446,16 -444,36 +445,40 @@@ static int __init dummy_numa_init(void
+  	return 0;
+  }
+  
++ #ifdef CONFIG_ACPI_NUMA
++ static int __init arch_acpi_numa_init(void)
++ {
++ 	int ret;
++ 
++ 	ret = acpi_numa_init();
++ 	if (ret) {
++ 		pr_info("Failed to initialise from firmware\n");
++ 		return ret;
++ 	}
++ 
++ 	return srat_disabled() ? -EINVAL : 0;
++ }
++ #else
++ static int __init arch_acpi_numa_init(void)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ #endif
++ 
+  /**
+++<<<<<<< HEAD
+ + * arm64_numa_init - Initialize NUMA
+++=======
++  * arch_numa_init() - Initialize NUMA
+++>>>>>>> eb75541f8b45 (arm64, numa: Change the numa init functions name to be generic)
+   *
+ - * Try each configured NUMA initialization method until one succeeds. The
+ - * last fallback is dummy single node config encompassing whole memory.
+ + * Try each configured NUMA initialization method until one succeeds.  The
+ + * last fallback is dummy single node config encomapssing whole memory.
+   */
+- void __init arm64_numa_init(void)
++ void __init arch_numa_init(void)
+  {
+  	if (!numa_off) {
+- 		if (!acpi_disabled && !numa_init(arm64_acpi_numa_init))
++ 		if (!acpi_disabled && !numa_init(arch_acpi_numa_init))
+  			return;
+  		if (acpi_disabled && !numa_init(of_numa_init))
+  			return;
+diff --git a/arch/arm64/include/asm/numa.h b/arch/arm64/include/asm/numa.h
+index 626ad01e83bf..db37c267b257 100644
+--- a/arch/arm64/include/asm/numa.h
++++ b/arch/arm64/include/asm/numa.h
+@@ -29,7 +29,7 @@ static inline const struct cpumask *cpumask_of_node(int node)
+ }
+ #endif
+ 
+-void __init arm64_numa_init(void);
++void __init arch_numa_init(void);
+ int __init numa_add_memblk(int nodeid, u64 start, u64 end);
+ void __init numa_set_distance(int from, int to, int distance);
+ void __init numa_free_distance(void);
+@@ -43,7 +43,7 @@ void numa_remove_cpu(unsigned int cpu);
+ static inline void numa_store_cpu_info(unsigned int cpu) { }
+ static inline void numa_add_cpu(unsigned int cpu) { }
+ static inline void numa_remove_cpu(unsigned int cpu) { }
+-static inline void arm64_numa_init(void) { }
++static inline void arch_numa_init(void) { }
+ static inline void early_map_cpu_to_node(unsigned int cpu, int nid) { }
+ 
+ #endif	/* CONFIG_NUMA */
+diff --git a/arch/arm64/kernel/acpi_numa.c b/arch/arm64/kernel/acpi_numa.c
+index 7ff800045434..fdfecf0991ce 100644
+--- a/arch/arm64/kernel/acpi_numa.c
++++ b/arch/arm64/kernel/acpi_numa.c
+@@ -118,15 +118,3 @@ void __init acpi_numa_gicc_affinity_init(struct acpi_srat_gicc_affinity *pa)
+ 	node_set(node, numa_nodes_parsed);
+ }
+ 
+-int __init arm64_acpi_numa_init(void)
+-{
+-	int ret;
+-
+-	ret = acpi_numa_init();
+-	if (ret) {
+-		pr_info("Failed to initialise from firmware\n");
+-		return ret;
+-	}
+-
+-	return srat_disabled() ? -EINVAL : 0;
+-}
+* Unmerged path arch/arm64/mm/init.c
+* Unmerged path arch/arm64/mm/numa.c
