@@ -1,0 +1,188 @@
+ice: propagate xdp_ring onto rx_ring
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+commit eb087cd828648d5322954c86c3e18b2fc98b5700
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/eb087cd8.failed
+
+With rings being split, it is now convenient to introduce a pointer to
+XDP ring within the Rx ring. For XDP_TX workloads this means that
+xdp_rings array access will be skipped, which was executed per each
+processed frame.
+
+Also, read the XDP prog once per NAPI and if prog is present, set up the
+local xdp_ring pointer. Reading prog a single time was discussed in [1]
+with some concern raised by Toke around dispatcher handling and having
+the need for going through the RCU grace period in the ndo_bpf driver
+callback, but ice currently is torning down NAPI instances regardless of
+the prog presence on VSI.
+
+Although the pointer to XDP ring introduced to Rx ring makes things a
+lot slimmer/simpler, I still feel that single prog read per NAPI
+lifetime is beneficial.
+
+Further patch that will introduce the fallback path will also get a
+profit from that as xdp_ring pointer will be set during the XDP rings
+setup.
+
+[1]: https://lore.kernel.org/bpf/87k0oseo6e.fsf@toke.dk/
+
+	Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Tested-by: George Kuruvinakunnel <george.kuruvinakunnel@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit eb087cd828648d5322954c86c3e18b2fc98b5700)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_txrx.c
+#	drivers/net/ethernet/intel/ice/ice_xsk.c
+diff --cc drivers/net/ethernet/intel/ice/ice_txrx.c
+index 6dd00f973be2,b4aaed34f10a..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@@ -1157,15 -1162,10 +1161,23 @@@ int ice_clean_rx_irq(struct ice_rx_rin
+  		xdp.frame_sz = ice_rx_frame_truesize(rx_ring, size);
+  #endif
+  
+++<<<<<<< HEAD
+ +		rcu_read_lock();
+ +		xdp_prog = READ_ONCE(rx_ring->xdp_prog);
+ +		if (!xdp_prog) {
+ +			rcu_read_unlock();
+++=======
++ 		if (!xdp_prog)
+++>>>>>>> eb087cd82864 (ice: propagate xdp_ring onto rx_ring)
+  			goto construct_skb;
+ +		}
+  
+++<<<<<<< HEAD
+ +		xdp_res = ice_run_xdp(rx_ring, &xdp, xdp_prog);
+ +		rcu_read_unlock();
+++=======
++ 		xdp_res = ice_run_xdp(rx_ring, &xdp, xdp_prog, xdp_ring);
+++>>>>>>> eb087cd82864 (ice: propagate xdp_ring onto rx_ring)
+  		if (!xdp_res)
+  			goto construct_skb;
+  		if (xdp_res & (ICE_XDP_TX | ICE_XDP_REDIR)) {
+diff --cc drivers/net/ethernet/intel/ice/ice_xsk.c
+index 295bfdac4d32,d9dfcfc2c6f9..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_xsk.c
++++ b/drivers/net/ethernet/intel/ice/ice_xsk.c
+@@@ -462,19 -458,12 +464,21 @@@ ice_construct_skb_zc(struct ice_rx_rin
+   * Returns any of ICE_XDP_{PASS, CONSUMED, TX, REDIR}
+   */
+  static int
+- ice_run_xdp_zc(struct ice_rx_ring *rx_ring, struct xdp_buff *xdp)
++ ice_run_xdp_zc(struct ice_rx_ring *rx_ring, struct xdp_buff *xdp,
++ 	       struct bpf_prog *xdp_prog, struct ice_tx_ring *xdp_ring)
+  {
+  	int err, result = ICE_XDP_PASS;
+- 	struct ice_tx_ring *xdp_ring;
+- 	struct bpf_prog *xdp_prog;
+  	u32 act;
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	/* ZC patch is enabled only when XDP program is set,
+ +	 * so here it can not be NULL
+ +	 */
+ +	xdp_prog = READ_ONCE(rx_ring->xdp_prog);
+ +
+++=======
+++>>>>>>> eb087cd82864 (ice: propagate xdp_ring onto rx_ring)
+  	act = bpf_prog_run_xdp(xdp_prog, xdp);
+  
+  	if (likely(act == XDP_REDIRECT)) {
+@@@ -550,11 -544,11 +561,15 @@@ int ice_clean_rx_irq_zc(struct ice_rx_r
+  		if (!size)
+  			break;
+  
+ -		xdp = &rx_ring->xdp_buf[rx_ring->next_to_clean];
+ -		xsk_buff_set_size(*xdp, size);
+ -		xsk_buff_dma_sync_for_cpu(*xdp, rx_ring->xsk_pool);
+ +		rx_buf = &rx_ring->rx_buf[rx_ring->next_to_clean];
+ +		rx_buf->xdp->data_end = rx_buf->xdp->data + size;
+ +		xsk_buff_dma_sync_for_cpu(rx_buf->xdp, rx_ring->xsk_pool);
+  
+++<<<<<<< HEAD
+ +		xdp_res = ice_run_xdp_zc(rx_ring, rx_buf->xdp);
+++=======
++ 		xdp_res = ice_run_xdp_zc(rx_ring, *xdp, xdp_prog, xdp_ring);
+++>>>>>>> eb087cd82864 (ice: propagate xdp_ring onto rx_ring)
+  		if (xdp_res) {
+  			if (xdp_res & (ICE_XDP_TX | ICE_XDP_REDIR))
+  				xdp_xmit |= xdp_res;
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index 8b6a4047a03a..cfccb20b9e95 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -2402,6 +2402,9 @@ static int ice_xdp_alloc_setup_rings(struct ice_vsi *vsi)
+ 		xdp_ring->xsk_pool = ice_tx_xsk_pool(xdp_ring);
+ 	}
+ 
++	ice_for_each_rxq(vsi, i)
++		vsi->rx_rings[i]->xdp_ring = vsi->xdp_rings[i];
++
+ 	return 0;
+ 
+ free_xdp_rings:
+* Unmerged path drivers/net/ethernet/intel/ice/ice_txrx.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.h b/drivers/net/ethernet/intel/ice/ice_txrx.h
+index 65020bffafd4..42936765fd69 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.h
+@@ -293,6 +293,7 @@ struct ice_rx_ring {
+ 	struct rcu_head rcu;		/* to avoid race on free */
+ 	/* CL4 - 3rd cacheline starts here */
+ 	struct bpf_prog *xdp_prog;
++	struct ice_tx_ring *xdp_ring;
+ 	struct xsk_buff_pool *xsk_pool;
+ 	struct sk_buff *skb;
+ 	dma_addr_t dma;			/* physical address of ring */
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx_lib.c b/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
+index 3065b5dbe3fc..294f30496322 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
+@@ -281,22 +281,18 @@ int ice_xmit_xdp_buff(struct xdp_buff *xdp, struct ice_tx_ring *xdp_ring)
+ 
+ /**
+  * ice_finalize_xdp_rx - Bump XDP Tx tail and/or flush redirect map
+- * @rx_ring: Rx ring
++ * @xdp_ring: XDP ring
+  * @xdp_res: Result of the receive batch
+  *
+  * This function bumps XDP Tx tail and/or flush redirect map, and
+  * should be called when a batch of packets has been processed in the
+  * napi loop.
+  */
+-void ice_finalize_xdp_rx(struct ice_rx_ring *rx_ring, unsigned int xdp_res)
++void ice_finalize_xdp_rx(struct ice_tx_ring *xdp_ring, unsigned int xdp_res)
+ {
+ 	if (xdp_res & ICE_XDP_REDIR)
+ 		xdp_do_flush_map();
+ 
+-	if (xdp_res & ICE_XDP_TX) {
+-		struct ice_tx_ring *xdp_ring =
+-			rx_ring->vsi->xdp_rings[smp_processor_id()];
+-
++	if (xdp_res & ICE_XDP_TX)
+ 		ice_xdp_ring_update_tail(xdp_ring);
+-	}
+ }
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx_lib.h b/drivers/net/ethernet/intel/ice/ice_txrx_lib.h
+index 4e56e8e321a8..11b6c1601986 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx_lib.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx_lib.h
+@@ -46,7 +46,7 @@ static inline void ice_xdp_ring_update_tail(struct ice_tx_ring *xdp_ring)
+ 	writel_relaxed(xdp_ring->next_to_use, xdp_ring->tail);
+ }
+ 
+-void ice_finalize_xdp_rx(struct ice_rx_ring *xdp_ring, unsigned int xdp_res);
++void ice_finalize_xdp_rx(struct ice_tx_ring *xdp_ring, unsigned int xdp_res);
+ int ice_xmit_xdp_buff(struct xdp_buff *xdp, struct ice_tx_ring *xdp_ring);
+ int ice_xmit_xdp_ring(void *data, u16 size, struct ice_tx_ring *xdp_ring);
+ void ice_release_rx_desc(struct ice_rx_ring *rx_ring, u16 val);
+* Unmerged path drivers/net/ethernet/intel/ice/ice_xsk.c
