@@ -1,0 +1,97 @@
+tee: handle lookup of shm with reference count 0
+
+jira LE-1907
+cve CVE-2021-44733
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Jens Wiklander <jens.wiklander@linaro.org>
+commit dfd0743f1d9ea76931510ed150334d571fbab49d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/dfd0743f.failed
+
+Since the tee subsystem does not keep a strong reference to its idle
+shared memory buffers, it races with other threads that try to destroy a
+shared memory through a close of its dma-buf fd or by unmapping the
+memory.
+
+In tee_shm_get_from_id() when a lookup in teedev->idr has been
+successful, it is possible that the tee_shm is in the dma-buf teardown
+path, but that path is blocked by the teedev mutex. Since we don't have
+an API to tell if the tee_shm is in the dma-buf teardown path or not we
+must find another way of detecting this condition.
+
+Fix this by doing the reference counting directly on the tee_shm using a
+new refcount_t refcount field. dma-buf is replaced by using
+anon_inode_getfd() instead, this separates the life-cycle of the
+underlying file from the tee_shm. tee_shm_put() is updated to hold the
+mutex when decreasing the refcount to 0 and then remove the tee_shm from
+teedev->idr before releasing the mutex. This means that the tee_shm can
+never be found unless it has a refcount larger than 0.
+
+Fixes: 967c9cca2cc5 ("tee: generic TEE subsystem")
+	Cc: stable@vger.kernel.org
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Reviewed-by: Lars Persson <larper@axis.com>
+	Reviewed-by: Sumit Garg <sumit.garg@linaro.org>
+	Reported-by: Patrik Lantz <patrik.lantz@axis.com>
+	Signed-off-by: Jens Wiklander <jens.wiklander@linaro.org>
+(cherry picked from commit dfd0743f1d9ea76931510ed150334d571fbab49d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tee/tee_shm.c
+diff --cc drivers/tee/tee_shm.c
+index 7d8c08bd1780,499fccba3d74..000000000000
+--- a/drivers/tee/tee_shm.c
++++ b/drivers/tee/tee_shm.c
+@@@ -1,20 -1,11 +1,24 @@@
+ -// SPDX-License-Identifier: GPL-2.0-only
+  /*
+++<<<<<<< HEAD
+ + * Copyright (c) 2015-2016, Linaro Limited
+ + *
+ + * This software is licensed under the terms of the GNU General Public
+ + * License version 2, as published by the Free Software Foundation, and
+ + * may be copied, distributed, and modified under those terms.
+ + *
+ + * This program is distributed in the hope that it will be useful,
+ + * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ + * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ + * GNU General Public License for more details.
+ + *
+++=======
++  * Copyright (c) 2015-2017, 2019-2021 Linaro Limited
+++>>>>>>> dfd0743f1d9e (tee: handle lookup of shm with reference count 0)
+   */
++ #include <linux/anon_inodes.h>
+  #include <linux/device.h>
+- #include <linux/dma-buf.h>
+- #include <linux/fdtable.h>
+  #include <linux/idr.h>
++ #include <linux/mm.h>
+  #include <linux/sched.h>
+  #include <linux/slab.h>
+  #include <linux/tee_drv.h>
+* Unmerged path drivers/tee/tee_shm.c
+diff --git a/include/linux/tee_drv.h b/include/linux/tee_drv.h
+index 2b1a5d968703..2eac56f2ed14 100644
+--- a/include/linux/tee_drv.h
++++ b/include/linux/tee_drv.h
+@@ -184,7 +184,7 @@ void tee_device_unregister(struct tee_device *teedev);
+  * @offset:	offset of buffer in user space
+  * @pages:	locked pages from userspace
+  * @num_pages:	number of locked pages
+- * @dmabuf:	dmabuf used to for exporting to user space
++ * @refcount:	reference counter
+  * @flags:	defined by TEE_SHM_* in tee_drv.h
+  * @id:		unique id of a shared memory object on this device
+  *
+@@ -199,7 +199,7 @@ struct tee_shm {
+ 	unsigned int offset;
+ 	struct page **pages;
+ 	size_t num_pages;
+-	struct dma_buf *dmabuf;
++	refcount_t refcount;
+ 	u32 flags;
+ 	int id;
+ };
