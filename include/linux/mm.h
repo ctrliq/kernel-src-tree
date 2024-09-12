@@ -43,6 +43,7 @@ struct bdi_writeback;
 struct pt_regs;
 
 extern int sysctl_page_lock_unfairness;
+extern int sysctl_legacy_willneed_readahead;
 
 void init_mm_internals(void);
 

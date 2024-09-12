@@ -988,8 +988,6 @@ static int gve_clean_rx_done(struct gve_rx_ring *rx, int budget,
 		}
 	}
 
-	/* restock desc ring slots */
-	dma_wmb();	/* Ensure descs are visible before ringing doorbell */
 	gve_rx_write_doorbell(priv, rx);
 	return cnts.total_pkt_cnt;
 }
