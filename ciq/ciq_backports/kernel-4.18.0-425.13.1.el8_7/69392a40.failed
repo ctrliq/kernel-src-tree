@@ -1,0 +1,164 @@
+mm/vmscan: throttle reclaim when no progress is being made
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.13.1.el8_7
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit 69392a403f49e6e33f9dfb1d6edb87c8006f83c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.13.1.el8_7/69392a40.failed
+
+Memcg reclaim throttles on congestion if no reclaim progress is made.
+This makes little sense, it might be due to writeback or a host of other
+factors.
+
+For !memcg reclaim, it's messy.  Direct reclaim primarily is throttled
+in the page allocator if it is failing to make progress.  Kswapd
+throttles if too many pages are under writeback and marked for immediate
+reclaim.
+
+This patch explicitly throttles if reclaim is failing to make progress.
+
+[vbabka@suse.cz: Remove redundant code]
+
+Link: https://lkml.kernel.org/r/20211022144651.19914-4-mgorman@techsingularity.net
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+	Cc: "Darrick J . Wong" <djwong@kernel.org>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: NeilBrown <neilb@suse.de>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: "Theodore Ts'o" <tytso@mit.edu>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 69392a403f49e6e33f9dfb1d6edb87c8006f83c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmzone.h
+#	include/trace/events/vmscan.h
+diff --cc include/linux/mmzone.h
+index e1c35e06ef35,58e744b78c2c..000000000000
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@@ -280,6 -273,13 +280,16 @@@ enum lru_list 
+  	NR_LRU_LISTS
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum vmscan_throttle_state {
++ 	VMSCAN_THROTTLE_WRITEBACK,
++ 	VMSCAN_THROTTLE_ISOLATED,
++ 	VMSCAN_THROTTLE_NOPROGRESS,
++ 	NR_VMSCAN_THROTTLE,
++ };
++ 
+++>>>>>>> 69392a403f49 (mm/vmscan: throttle reclaim when no progress is being made)
+  #define for_each_lru(lru) for (lru = 0; lru < NR_LRU_LISTS; lru++)
+  
+  #define for_each_evictable_lru(lru) for (lru = 0; lru <= LRU_ACTIVE_FILE; lru++)
+diff --cc include/trace/events/vmscan.h
+index f9612ac9e0e4,f25a6149d3ba..000000000000
+--- a/include/trace/events/vmscan.h
++++ b/include/trace/events/vmscan.h
+@@@ -27,6 -27,18 +27,21 @@@
+  		{RECLAIM_WB_ASYNC,	"RECLAIM_WB_ASYNC"}	\
+  		) : "RECLAIM_WB_NONE"
+  
+++<<<<<<< HEAD
+++=======
++ #define _VMSCAN_THROTTLE_WRITEBACK	(1 << VMSCAN_THROTTLE_WRITEBACK)
++ #define _VMSCAN_THROTTLE_ISOLATED	(1 << VMSCAN_THROTTLE_ISOLATED)
++ #define _VMSCAN_THROTTLE_NOPROGRESS	(1 << VMSCAN_THROTTLE_NOPROGRESS)
++ 
++ #define show_throttle_flags(flags)						\
++ 	(flags) ? __print_flags(flags, "|",					\
++ 		{_VMSCAN_THROTTLE_WRITEBACK,	"VMSCAN_THROTTLE_WRITEBACK"},	\
++ 		{_VMSCAN_THROTTLE_ISOLATED,	"VMSCAN_THROTTLE_ISOLATED"},	\
++ 		{_VMSCAN_THROTTLE_NOPROGRESS,	"VMSCAN_THROTTLE_NOPROGRESS"}	\
++ 		) : "VMSCAN_THROTTLE_NONE"
++ 
++ 
+++>>>>>>> 69392a403f49 (mm/vmscan: throttle reclaim when no progress is being made)
+  #define trace_reclaim_flags(file) ( \
+  	(file ? RECLAIM_WB_FILE : RECLAIM_WB_ANON) | \
+  	(RECLAIM_WB_ASYNC) \
+* Unmerged path include/linux/mmzone.h
+* Unmerged path include/trace/events/vmscan.h
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 2b244b1d840b..4e05e3677d8a 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -3563,19 +3563,11 @@ static int mem_cgroup_force_empty(struct mem_cgroup *memcg)
+ 
+ 	/* try to free all pages in this cgroup */
+ 	while (nr_retries && page_counter_read(&memcg->memory)) {
+-		int progress;
+-
+ 		if (signal_pending(current))
+ 			return -EINTR;
+ 
+-		progress = try_to_free_mem_cgroup_pages(memcg, 1,
+-							GFP_KERNEL, true);
+-		if (!progress) {
++		if (!try_to_free_mem_cgroup_pages(memcg, 1, GFP_KERNEL, true))
+ 			nr_retries--;
+-			/* maybe some writeback is necessary */
+-			congestion_wait(BLK_RW_ASYNC, HZ/10);
+-		}
+-
+ 	}
+ 
+ 	return 0;
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index e3ffc3c3d8d7..6aa770d17100 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3121,6 +3121,33 @@ static inline bool compaction_ready(struct zone *zone, struct scan_control *sc)
+ 	return zone_watermark_ok_safe(zone, 0, watermark, sc->reclaim_idx);
+ }
+ 
++static void consider_reclaim_throttle(pg_data_t *pgdat, struct scan_control *sc)
++{
++	/* If reclaim is making progress, wake any throttled tasks. */
++	if (sc->nr_reclaimed) {
++		wait_queue_head_t *wqh;
++
++		wqh = &pgdat->reclaim_wait[VMSCAN_THROTTLE_NOPROGRESS];
++		if (waitqueue_active(wqh))
++			wake_up(wqh);
++
++		return;
++	}
++
++	/*
++	 * Do not throttle kswapd on NOPROGRESS as it will throttle on
++	 * VMSCAN_THROTTLE_WRITEBACK if there are too many pages under
++	 * writeback and marked for immediate reclaim at the tail of
++	 * the LRU.
++	 */
++	if (current_is_kswapd())
++		return;
++
++	/* Throttle if making no progress at high prioities. */
++	if (sc->priority < DEF_PRIORITY - 2)
++		reclaim_throttle(pgdat, VMSCAN_THROTTLE_NOPROGRESS, HZ/10);
++}
++
+ /*
+  * This is the direct reclaim path, for page-allocating processes.  We only
+  * try to reclaim pages from zones which will satisfy the caller's allocation
+@@ -3205,6 +3232,7 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
+ 			continue;
+ 		last_pgdat = zone->zone_pgdat;
+ 		shrink_node(zone->zone_pgdat, sc);
++		consider_reclaim_throttle(zone->zone_pgdat, sc);
+ 	}
+ 
+ 	/*
