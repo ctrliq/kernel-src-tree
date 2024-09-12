@@ -1,0 +1,86 @@
+md: add a mutex to synchronize idle and frozen in action_store()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-516.el8
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit 6f56f0c4f1241f1694a6a9438dd4f78d4513a917
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-516.el8/6f56f0c4.failed
+
+Currently, for idle and frozen, action_store will hold 'reconfig_mutex'
+and call md_reap_sync_thread() to stop sync thread, however, this will
+cause deadlock (explained in the next patch). In order to fix the
+problem, following patch will release 'reconfig_mutex' and wait on
+'resync_wait', like md_set_readonly() and do_md_stop() does.
+
+Consider that action_store() will set/clear 'MD_RECOVERY_FROZEN'
+unconditionally, which might cause unexpected problems, for example,
+frozen just set 'MD_RECOVERY_FROZEN' and is still in progress, while
+'idle' clear 'MD_RECOVERY_FROZEN' and new sync thread is started, which
+might starve in progress frozen. A mutex is added to synchronize idle
+and frozen from action_store().
+
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+	Signed-off-by: Song Liu <song@kernel.org>
+Link: https://lore.kernel.org/r/20230529132037.2124527-4-yukuai1@huaweicloud.com
+(cherry picked from commit 6f56f0c4f1241f1694a6a9438dd4f78d4513a917)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.h
+diff --cc drivers/md/md.h
+index 8113acf96240,18c168bf5fab..000000000000
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@@ -536,6 -529,15 +536,18 @@@ struct mddev 
+  	unsigned int			good_device_nr;	/* good device num within cluster raid */
+  	unsigned int			noio_flag; /* for memalloc scope API */
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Temporarily store rdev that will be finally removed when
++ 	 * reconfig_mutex is unlocked, protected by reconfig_mutex.
++ 	 */
++ 	struct list_head		deleting;
++ 
++ 	/* Used to synchronize idle and frozen for action_store() */
++ 	struct mutex			sync_mutex;
++ 
+++>>>>>>> 6f56f0c4f124 (md: add a mutex to synchronize idle and frozen in action_store())
+  	bool	has_superblocks:1;
+  	bool	fail_last_dev:1;
+  	bool	serialize_policy:1;
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 92d0d694d21e..ae6610541461 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -709,6 +709,7 @@ void mddev_init(struct mddev *mddev)
+ 	kobject_init(&mddev->kobj, &md_ktype);
+ 	mutex_init(&mddev->open_mutex);
+ 	mutex_init(&mddev->reconfig_mutex);
++	mutex_init(&mddev->sync_mutex);
+ 	mutex_init(&mddev->bitmap_info.mutex);
+ 	INIT_LIST_HEAD(&mddev->disks);
+ 	INIT_LIST_HEAD(&mddev->all_mddevs);
+@@ -4898,14 +4899,18 @@ static void stop_sync_thread(struct mddev *mddev)
+ 
+ static void idle_sync_thread(struct mddev *mddev)
+ {
++	mutex_lock(&mddev->sync_mutex);
+ 	clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+ 	stop_sync_thread(mddev);
++	mutex_unlock(&mddev->sync_mutex);
+ }
+ 
+ static void frozen_sync_thread(struct mddev *mddev)
+ {
++	mutex_lock(&mddev->sync_mutex);
+ 	set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+ 	stop_sync_thread(mddev);
++	mutex_unlock(&mddev->sync_mutex);
+ }
+ 
+ static ssize_t
+* Unmerged path drivers/md/md.h
