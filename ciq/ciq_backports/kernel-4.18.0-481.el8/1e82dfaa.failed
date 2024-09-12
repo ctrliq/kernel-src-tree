@@ -1,0 +1,175 @@
+powerpc/bpf/64: Add instructions for atomic_[cmp]xchg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Hari Bathini <hbathini@linux.ibm.com>
+commit 1e82dfaa7819f03f0b0022be7ca15bbc83090da1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/1e82dfaa.failed
+
+This adds two atomic opcodes BPF_XCHG and BPF_CMPXCHG on ppc64, both
+of which include the BPF_FETCH flag.  The kernel's atomic_cmpxchg
+operation fundamentally has 3 operands, but we only have two register
+fields. Therefore the operand we compare against (the kernel's API
+calls it 'old') is hard-coded to be BPF_REG_R0. Also, kernel's
+atomic_cmpxchg returns the previous value at dst_reg + off. JIT the
+same for BPF too with return value put in BPF_REG_0.
+
+  BPF_REG_R0 = atomic_cmpxchg(dst_reg + off, BPF_REG_R0, src_reg);
+
+	Signed-off-by: Hari Bathini <hbathini@linux.ibm.com>
+	Tested-by: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com> (ppc64le)
+	Reviewed-by: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20220610155552.25892-4-hbathini@linux.ibm.com
+
+(cherry picked from commit 1e82dfaa7819f03f0b0022be7ca15bbc83090da1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/net/bpf_jit_comp64.c
+diff --cc arch/powerpc/net/bpf_jit_comp64.c
+index 3361fea2cdf5,29ee306d6302..000000000000
+--- a/arch/powerpc/net/bpf_jit_comp64.c
++++ b/arch/powerpc/net/bpf_jit_comp64.c
+@@@ -310,8 -355,12 +310,17 @@@ int bpf_jit_build_body(struct bpf_prog 
+  
+  	for (i = 0; i < flen; i++) {
+  		u32 code = insn[i].code;
+++<<<<<<< HEAD
+ +		u32 dst_reg = b2p[insn[i].dst_reg];
+ +		u32 src_reg = b2p[insn[i].src_reg];
+++=======
++ 		u32 dst_reg = bpf_to_ppc(insn[i].dst_reg);
++ 		u32 src_reg = bpf_to_ppc(insn[i].src_reg);
++ 		u32 size = BPF_SIZE(code);
++ 		u32 tmp1_reg = bpf_to_ppc(TMP_REG_1);
++ 		u32 tmp2_reg = bpf_to_ppc(TMP_REG_2);
++ 		u32 save_reg, ret_reg;
+++>>>>>>> 1e82dfaa7819 (powerpc/bpf/64: Add instructions for atomic_[cmp]xchg)
+  		s16 off = insn[i].off;
+  		s32 imm = insn[i].imm;
+  		bool func_addr_fixed;
+@@@ -736,42 -778,83 +745,119 @@@ emit_clear
+  		 * BPF_STX ATOMIC (atomic ops)
+  		 */
+  		case BPF_STX | BPF_ATOMIC | BPF_W:
+++<<<<<<< HEAD
+ +			if (imm != BPF_ADD) {
+++=======
++ 		case BPF_STX | BPF_ATOMIC | BPF_DW:
++ 			save_reg = tmp2_reg;
++ 			ret_reg = src_reg;
++ 
++ 			/* Get offset into TMP_REG_1 */
++ 			EMIT(PPC_RAW_LI(tmp1_reg, off));
++ 			tmp_idx = ctx->idx * 4;
++ 			/* load value from memory into TMP_REG_2 */
++ 			if (size == BPF_DW)
++ 				EMIT(PPC_RAW_LDARX(tmp2_reg, tmp1_reg, dst_reg, 0));
++ 			else
++ 				EMIT(PPC_RAW_LWARX(tmp2_reg, tmp1_reg, dst_reg, 0));
++ 
++ 			/* Save old value in _R0 */
++ 			if (imm & BPF_FETCH)
++ 				EMIT(PPC_RAW_MR(_R0, tmp2_reg));
++ 
++ 			switch (imm) {
++ 			case BPF_ADD:
++ 			case BPF_ADD | BPF_FETCH:
++ 				EMIT(PPC_RAW_ADD(tmp2_reg, tmp2_reg, src_reg));
++ 				break;
++ 			case BPF_AND:
++ 			case BPF_AND | BPF_FETCH:
++ 				EMIT(PPC_RAW_AND(tmp2_reg, tmp2_reg, src_reg));
++ 				break;
++ 			case BPF_OR:
++ 			case BPF_OR | BPF_FETCH:
++ 				EMIT(PPC_RAW_OR(tmp2_reg, tmp2_reg, src_reg));
++ 				break;
++ 			case BPF_XOR:
++ 			case BPF_XOR | BPF_FETCH:
++ 				EMIT(PPC_RAW_XOR(tmp2_reg, tmp2_reg, src_reg));
++ 				break;
++ 			case BPF_CMPXCHG:
++ 				/*
++ 				 * Return old value in BPF_REG_0 for BPF_CMPXCHG &
++ 				 * in src_reg for other cases.
++ 				 */
++ 				ret_reg = bpf_to_ppc(BPF_REG_0);
++ 
++ 				/* Compare with old value in BPF_R0 */
++ 				if (size == BPF_DW)
++ 					EMIT(PPC_RAW_CMPD(bpf_to_ppc(BPF_REG_0), tmp2_reg));
++ 				else
++ 					EMIT(PPC_RAW_CMPW(bpf_to_ppc(BPF_REG_0), tmp2_reg));
++ 				/* Don't set if different from old value */
++ 				PPC_BCC_SHORT(COND_NE, (ctx->idx + 3) * 4);
++ 				fallthrough;
++ 			case BPF_XCHG:
++ 				save_reg = src_reg;
++ 				break;
++ 			default:
+++>>>>>>> 1e82dfaa7819 (powerpc/bpf/64: Add instructions for atomic_[cmp]xchg)
+  				pr_err_ratelimited(
+  					"eBPF filter atomic op code %02x (@%d) unsupported\n",
+  					code, i);
+ -				return -EOPNOTSUPP;
+ +				return -ENOTSUPP;
+  			}
+  
+++<<<<<<< HEAD
+ +			/* *(u32 *)(dst + off) += src */
+ +
+ +			/* Get EA into TMP_REG_1 */
+ +			EMIT(PPC_RAW_ADDI(b2p[TMP_REG_1], dst_reg, off));
+ +			tmp_idx = ctx->idx * 4;
+ +			/* load value from memory into TMP_REG_2 */
+ +			EMIT(PPC_RAW_LWARX(b2p[TMP_REG_2], 0, b2p[TMP_REG_1], 0));
+ +			/* add value from src_reg into this */
+ +			EMIT(PPC_RAW_ADD(b2p[TMP_REG_2], b2p[TMP_REG_2], src_reg));
+ +			/* store result back */
+ +			EMIT(PPC_RAW_STWCX(b2p[TMP_REG_2], 0, b2p[TMP_REG_1]));
+++=======
++ 			/* store new value */
++ 			if (size == BPF_DW)
++ 				EMIT(PPC_RAW_STDCX(save_reg, tmp1_reg, dst_reg));
++ 			else
++ 				EMIT(PPC_RAW_STWCX(save_reg, tmp1_reg, dst_reg));
+++>>>>>>> 1e82dfaa7819 (powerpc/bpf/64: Add instructions for atomic_[cmp]xchg)
+  			/* we're done if this succeeded */
+  			PPC_BCC_SHORT(COND_NE, tmp_idx);
+ +			break;
+ +		case BPF_STX | BPF_ATOMIC | BPF_DW:
+ +			if (imm != BPF_ADD) {
+ +				pr_err_ratelimited(
+ +					"eBPF filter atomic op code %02x (@%d) unsupported\n",
+ +					code, i);
+ +				return -ENOTSUPP;
+ +			}
+ +			/* *(u64 *)(dst + off) += src */
+  
+++<<<<<<< HEAD
+ +			EMIT(PPC_RAW_ADDI(b2p[TMP_REG_1], dst_reg, off));
+ +			tmp_idx = ctx->idx * 4;
+ +			EMIT(PPC_RAW_LDARX(b2p[TMP_REG_2], 0, b2p[TMP_REG_1], 0));
+ +			EMIT(PPC_RAW_ADD(b2p[TMP_REG_2], b2p[TMP_REG_2], src_reg));
+ +			EMIT(PPC_RAW_STDCX(b2p[TMP_REG_2], 0, b2p[TMP_REG_1]));
+ +			PPC_BCC_SHORT(COND_NE, tmp_idx);
+++=======
++ 			if (imm & BPF_FETCH) {
++ 				EMIT(PPC_RAW_MR(ret_reg, _R0));
++ 				/*
++ 				 * Skip unnecessary zero-extension for 32-bit cmpxchg.
++ 				 * For context, see commit 39491867ace5.
++ 				 */
++ 				if (size != BPF_DW && imm == BPF_CMPXCHG &&
++ 				    insn_is_zext(&insn[i + 1]))
++ 					addrs[++i] = ctx->idx * 4;
++ 			}
+++>>>>>>> 1e82dfaa7819 (powerpc/bpf/64: Add instructions for atomic_[cmp]xchg)
+  			break;
+  
+  		/*
+* Unmerged path arch/powerpc/net/bpf_jit_comp64.c
