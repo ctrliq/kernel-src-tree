@@ -1,0 +1,182 @@
+x86/mm/cpa: Add support for TDX shared memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+commit 7dbde7631629896b478bc5b1f4c3e52e6d518d12
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/7dbde763.failed
+
+Intel TDX protects guest memory from VMM access. Any memory that is
+required for communication with the VMM must be explicitly shared.
+
+It is a two-step process: the guest sets the shared bit in the page
+table entry and notifies VMM about the change. The notification happens
+using MapGPA hypercall.
+
+Conversion back to private memory requires clearing the shared bit,
+notifying VMM with MapGPA hypercall following with accepting the memory
+with AcceptPage hypercall.
+
+Provide a TDX version of x86_platform.guest.* callbacks. It makes
+__set_memory_enc_pgtable() work right in TDX guest.
+
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/20220405232939.73860-27-kirill.shutemov@linux.intel.com
+(cherry picked from commit 7dbde7631629896b478bc5b1f4c3e52e6d518d12)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/coco/tdx/tdx.c
+#	arch/x86/kernel/cc_platform.c
+#	arch/x86/kernel/traps.c
+diff --cc arch/x86/kernel/cc_platform.c
+index fc1365dd927e,9f74125c582d..000000000000
+--- a/arch/x86/kernel/cc_platform.c
++++ b/arch/x86/kernel/cc_platform.c
+@@@ -18,7 -18,14 +18,18 @@@ static u64 cc_mask __ro_after_init
+  
+  static bool intel_cc_platform_has(enum cc_attr attr)
+  {
+++<<<<<<< HEAD:arch/x86/kernel/cc_platform.c
+ +	return false;
+++=======
++ 	switch (attr) {
++ 	case CC_ATTR_GUEST_UNROLL_STRING_IO:
++ 	case CC_ATTR_HOTPLUG_DISABLED:
++ 	case CC_ATTR_GUEST_MEM_ENCRYPT:
++ 		return true;
++ 	default:
++ 		return false;
++ 	}
+++>>>>>>> 7dbde7631629 (x86/mm/cpa: Add support for TDX shared memory):arch/x86/coco/core.c
+  }
+  
+  /*
+diff --cc arch/x86/kernel/traps.c
+index 462aa0afd7cd,a4e2efde5d1f..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -1026,22 -1345,105 +1026,110 @@@ do_device_not_available(struct pt_regs 
+  		 * to kill the task than getting stuck in a never-ending
+  		 * loop of #NM faults.
+  		 */
+ -		die("unexpected #NM exception", regs, 0);
+ +		die("unexpected #NM exception", regs, error_code);
+  	}
+  }
+++<<<<<<< HEAD
+ +NOKPROBE_SYMBOL(do_device_not_available);
+++=======
++ 
++ #ifdef CONFIG_INTEL_TDX_GUEST
++ 
++ #define VE_FAULT_STR "VE fault"
++ 
++ static void ve_raise_fault(struct pt_regs *regs, long error_code)
++ {
++ 	if (user_mode(regs)) {
++ 		gp_user_force_sig_segv(regs, X86_TRAP_VE, error_code, VE_FAULT_STR);
++ 		return;
++ 	}
++ 
++ 	if (gp_try_fixup_and_notify(regs, X86_TRAP_VE, error_code, VE_FAULT_STR))
++ 		return;
++ 
++ 	die_addr(VE_FAULT_STR, regs, error_code, 0);
++ }
++ 
++ /*
++  * Virtualization Exceptions (#VE) are delivered to TDX guests due to
++  * specific guest actions which may happen in either user space or the
++  * kernel:
++  *
++  *  * Specific instructions (WBINVD, for example)
++  *  * Specific MSR accesses
++  *  * Specific CPUID leaf accesses
++  *  * Access to specific guest physical addresses
++  *
++  * In the settings that Linux will run in, virtualization exceptions are
++  * never generated on accesses to normal, TD-private memory that has been
++  * accepted (by BIOS or with tdx_enc_status_changed()).
++  *
++  * Syscall entry code has a critical window where the kernel stack is not
++  * yet set up. Any exception in this window leads to hard to debug issues
++  * and can be exploited for privilege escalation. Exceptions in the NMI
++  * entry code also cause issues. Returning from the exception handler with
++  * IRET will re-enable NMIs and nested NMI will corrupt the NMI stack.
++  *
++  * For these reasons, the kernel avoids #VEs during the syscall gap and
++  * the NMI entry code. Entry code paths do not access TD-shared memory,
++  * MMIO regions, use #VE triggering MSRs, instructions, or CPUID leaves
++  * that might generate #VE. VMM can remove memory from TD at any point,
++  * but access to unaccepted (or missing) private memory leads to VM
++  * termination, not to #VE.
++  *
++  * Similarly to page faults and breakpoints, #VEs are allowed in NMI
++  * handlers once the kernel is ready to deal with nested NMIs.
++  *
++  * During #VE delivery, all interrupts, including NMIs, are blocked until
++  * TDGETVEINFO is called. It prevents #VE nesting until the kernel reads
++  * the VE info.
++  *
++  * If a guest kernel action which would normally cause a #VE occurs in
++  * the interrupt-disabled region before TDGETVEINFO, a #DF (fault
++  * exception) is delivered to the guest which will result in an oops.
++  *
++  * The entry code has been audited carefully for following these expectations.
++  * Changes in the entry code have to be audited for correctness vs. this
++  * aspect. Similarly to #PF, #VE in these places will expose kernel to
++  * privilege escalation or may lead to random crashes.
++  */
++ DEFINE_IDTENTRY(exc_virtualization_exception)
++ {
++ 	struct ve_info ve;
++ 
++ 	/*
++ 	 * NMIs/Machine-checks/Interrupts will be in a disabled state
++ 	 * till TDGETVEINFO TDCALL is executed. This ensures that VE
++ 	 * info cannot be overwritten by a nested #VE.
++ 	 */
++ 	tdx_get_ve_info(&ve);
++ 
++ 	cond_local_irq_enable(regs);
++ 
++ 	/*
++ 	 * If tdx_handle_virt_exception() could not process
++ 	 * it successfully, treat it as #GP(0) and handle it.
++ 	 */
++ 	if (!tdx_handle_virt_exception(regs, &ve))
++ 		ve_raise_fault(regs, 0);
++ 
++ 	cond_local_irq_disable(regs);
++ }
++ 
++ #endif
+++>>>>>>> 7dbde7631629 (x86/mm/cpa: Add support for TDX shared memory)
+  
+  #ifdef CONFIG_X86_32
+ -DEFINE_IDTENTRY_SW(iret_error)
+ +dotraplinkage void do_iret_error(struct pt_regs *regs, long error_code)
+  {
+ +	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+  	local_irq_enable();
+ -	if (notify_die(DIE_TRAP, "iret exception", regs, 0,
+ +
+ +	if (notify_die(DIE_TRAP, "iret exception", regs, error_code,
+  			X86_TRAP_IRET, SIGILL) != NOTIFY_STOP) {
+ -		do_trap(X86_TRAP_IRET, SIGILL, "iret exception", regs, 0,
+ +		do_trap(X86_TRAP_IRET, SIGILL, "iret exception", regs, error_code,
+  			ILL_BADSTK, (void __user *)NULL);
+  	}
+ -	local_irq_disable();
+  }
+  #endif
+  
+* Unmerged path arch/x86/coco/tdx/tdx.c
+* Unmerged path arch/x86/coco/tdx/tdx.c
+* Unmerged path arch/x86/kernel/cc_platform.c
+* Unmerged path arch/x86/kernel/traps.c
