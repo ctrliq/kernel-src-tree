@@ -1,0 +1,678 @@
+scsi: scsi_debug: Drop sdebug_queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-535.el8
+commit-author John Garry <john.g.garry@oracle.com>
+commit f1437cd1e535c5d5cc9f6e5bfdfc9b1cd3141bc4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-535.el8/f1437cd1.failed
+
+It's easy to get scsi_debug to error on throughput testing when we have
+multiple shosts:
+
+$ lsscsi
+[7:0:0:0]       disk    Linux   scsi_debug      0191
+[0:0:0:0]       disk    Linux   scsi_debug      0191
+
+$ fio --filename=/dev/sda --filename=/dev/sdb --direct=1 --rw=read --bs=4k
+--iodepth=256 --runtime=60 --numjobs=40 --time_based --name=jpg
+--eta-newline=1 --readonly --ioengine=io_uring --hipri --exitall_on_error
+jpg: (g=0): rw=read, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=io_uring, iodepth=256
+...
+fio-3.28
+Starting 40 processes
+[   27.521809] hrtimer: interrupt took 33067 ns
+[   27.904660] sd 7:0:0:0: [sdb] tag#171 FAILED Result: hostbyte=DID_ABORT driverbyte=DRIVER_OK cmd_age=0s
+[   27.904660] sd 0:0:0:0: [sda] tag#58 FAILED Result: hostbyte=DID_ABORT driverbyte=DRIVER_OK cmd_age=0s
+fio: io_u error [   27.904667] sd 0:0:0:0: [sda] tag#58 CDB: Read(10) 28 00 00 00 27 00 00 01 18 00
+on file /dev/sda[   27.904670] sd 0:0:0:0: [sda] tag#62 FAILED Result: hostbyte=DID_ABORT driverbyte=DRIVER_OK cmd_age=0s
+
+The issue is related to how the driver manages submit queues and tags. A
+single array of submit queues - sdebug_q_arr - with its own set of tags is
+shared among all shosts. As such, for occasions when we have more than one
+shost it is possible to overload the submit queues and run out of tags.
+
+The struct sdebug_queue is to manage tags and hold the associated
+queued command entry pointer (for that tag).
+
+Since the tagset iters are now used for functions like
+sdebug_blk_mq_poll(), there is no need to manage these queues. Indeed,
+blk-mq already provides what we need for managing tags and queues.
+
+Drop sdebug_queue and all its usage in the driver.
+
+	Signed-off-by: John Garry <john.g.garry@oracle.com>
+Link: https://lore.kernel.org/r/20230327074310.1862889-12-john.g.garry@oracle.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit f1437cd1e535c5d5cc9f6e5bfdfc9b1cd3141bc4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_debug.c
+diff --cc drivers/scsi/scsi_debug.c
+index a67473cb28e1,cac52bb43f1b..000000000000
+--- a/drivers/scsi/scsi_debug.c
++++ b/drivers/scsi/scsi_debug.c
+@@@ -339,13 -341,7 +339,16 @@@ struct sdebug_defer 
+  	struct hrtimer hrt;
+  	struct execute_work ew;
+  	ktime_t cmpl_ts;/* time since boot to complete this cmd */
+++<<<<<<< HEAD
+ +	int sqa_idx;	/* index of sdebug_queue array */
+ +	int qc_idx;	/* index of sdebug_queued_cmd array within sqa_idx */
+ +	int hc_idx;	/* hostwide tag index */
+++=======
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  	int issuing_cpu;
+ +	bool init_hrt;
+ +	bool init_wq;
+ +	bool init_poll;
+  	bool aborted;	/* true when blk_abort_request() already called */
+  	enum sdeb_defer_type defer_t;
+  };
+@@@ -354,17 -350,14 +357,20 @@@ struct sdebug_queued_cmd 
+  	/* corresponding bit set in in_use_bm[] in owning struct sdebug_queue
+  	 * instance indicates this slot is in use.
+  	 */
+ -	struct sdebug_defer sd_dp;
+ -	struct scsi_cmnd *scmd;
+ +	struct sdebug_defer *sd_dp;
+ +	struct scsi_cmnd *a_cmnd;
+  };
+  
+ -struct sdebug_scsi_cmd {
+ -	spinlock_t   lock;
+++<<<<<<< HEAD
+ +struct sdebug_queue {
+ +	struct sdebug_queued_cmd qc_arr[SDEBUG_CANQUEUE];
+ +	unsigned long in_use_bm[SDEBUG_CANQUEUE_WORDS];
+ +	spinlock_t qc_lock;
+ +	atomic_t blocked;	/* to temporarily stop more being queued */
+  };
+  
+++=======
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  static atomic_t sdebug_cmnd_count;   /* number of incoming commands */
+  static atomic_t sdebug_completions;  /* count of deferred completions */
+  static atomic_t sdebug_miss_cpus;    /* submission + completion cpus differ */
+@@@ -4918,75 -4902,41 +4909,106 @@@ static u32 get_tag(struct scsi_cmnd *cm
+  /* Queued (deferred) command completions converge here. */
+  static void sdebug_q_cmd_complete(struct sdebug_defer *sd_dp)
+  {
+++<<<<<<< HEAD
+ +	bool aborted = sd_dp->aborted;
+ +	int qc_idx;
+ +	int retiring = 0;
+ +	unsigned long iflags;
+ +	struct sdebug_queue *sqp;
+ +	struct sdebug_queued_cmd *sqcp;
+ +	struct scsi_cmnd *scp;
+ +	struct sdebug_dev_info *devip;
+ +
+ +	if (unlikely(aborted))
+ +		sd_dp->aborted = false;
+ +	qc_idx = sd_dp->qc_idx;
+ +	sqp = sdebug_q_arr + sd_dp->sqa_idx;
+++=======
++ 	struct sdebug_queued_cmd *sqcp = container_of(sd_dp, struct sdebug_queued_cmd, sd_dp);
++ 	unsigned long flags;
++ 	struct scsi_cmnd *scp = sqcp->scmd;
++ 	struct sdebug_scsi_cmd *sdsc;
++ 	bool aborted;
++ 
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  	if (sdebug_statistics) {
+  		atomic_inc(&sdebug_completions);
+  		if (raw_smp_processor_id() != sd_dp->issuing_cpu)
+  			atomic_inc(&sdebug_miss_cpus);
+  	}
+++<<<<<<< HEAD
+ +	if (unlikely((qc_idx < 0) || (qc_idx >= SDEBUG_CANQUEUE))) {
+ +		pr_err("wild qc_idx=%d\n", qc_idx);
+ +		return;
+ +	}
+ +	spin_lock_irqsave(&sqp->qc_lock, iflags);
+ +	WRITE_ONCE(sd_dp->defer_t, SDEB_DEFER_NONE);
+ +	sqcp = &sqp->qc_arr[qc_idx];
+ +	scp = sqcp->a_cmnd;
+ +	if (unlikely(scp == NULL)) {
+ +		spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +		pr_err("scp is NULL, sqa_idx=%d, qc_idx=%d, hc_idx=%d\n",
+ +		       sd_dp->sqa_idx, qc_idx, sd_dp->hc_idx);
+ +		return;
+ +	}
+ +	devip = (struct sdebug_dev_info *)scp->device->hostdata;
+ +	if (likely(devip))
+ +		atomic_dec(&devip->num_in_q);
+ +	else
+ +		pr_err("devip=NULL\n");
+ +	if (unlikely(atomic_read(&retired_max_queue) > 0))
+ +		retiring = 1;
+ +
+ +	sqcp->a_cmnd = NULL;
+ +	if (unlikely(!test_and_clear_bit(qc_idx, sqp->in_use_bm))) {
+ +		spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +		pr_err("Unexpected completion\n");
+ +		return;
+ +	}
+ +
+ +	if (unlikely(retiring)) {	/* user has reduced max_queue */
+ +		int k, retval;
+ +
+ +		retval = atomic_read(&retired_max_queue);
+ +		if (qc_idx >= retval) {
+ +			spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +			pr_err("index %d too large\n", retval);
+ +			return;
+ +		}
+ +		k = find_last_bit(sqp->in_use_bm, retval);
+ +		if ((k < sdebug_max_queue) || (k == retval))
+ +			atomic_set(&retired_max_queue, 0);
+ +		else
+ +			atomic_set(&retired_max_queue, k + 1);
+ +	}
+ +	spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +	if (unlikely(aborted)) {
+ +		if (sdebug_verbose)
+ +			pr_info("bypassing scsi_done() due to aborted cmd\n");
+ +		return;
+++=======
++ 
++ 	if (!scp) {
++ 		pr_err("scmd=NULL\n");
++ 		goto out;
++ 	}
++ 
++ 	sdsc = scsi_cmd_priv(scp);
++ 	spin_lock_irqsave(&sdsc->lock, flags);
++ 	aborted = sd_dp->aborted;
++ 	if (unlikely(aborted))
++ 		sd_dp->aborted = false;
++ 	ASSIGN_QUEUED_CMD(scp, NULL);
++ 
++ 	spin_unlock_irqrestore(&sdsc->lock, flags);
++ 
++ 	if (aborted) {
++ 		pr_info("bypassing scsi_done() due to aborted cmd, kicking-off EH\n");
++ 		blk_abort_request(scsi_cmd_to_rq(scp));
++ 		goto out;
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  	}
+ -
+ -	scsi_done(scp); /* callback to mid level */
+ -out:
+ -	sdebug_free_queued_cmd(sqcp);
+ +	scp->scsi_done(scp); /* callback to mid level */
+  }
+  
+  /* When high resolution timer goes off this function is called. */
+@@@ -5242,61 -5186,81 +5264,112 @@@ static void scsi_debug_slave_destroy(st
+  	}
+  }
+  
+ -/* Returns true if we require the queued memory to be freed by the caller. */
+ -static bool stop_qc_helper(struct sdebug_defer *sd_dp,
+ +static void stop_qc_helper(struct sdebug_defer *sd_dp,
+  			   enum sdeb_defer_type defer_t)
+  {
+ -	if (defer_t == SDEB_DEFER_HRT) {
+ -		int res = hrtimer_try_to_cancel(&sd_dp->hrt);
+ -
+ -		switch (res) {
+ -		case 0: /* Not active, it must have already run */
+ -		case -1: /* -1 It's executing the CB */
+ -			return false;
+ -		case 1: /* Was active, we've now cancelled */
+ -		default:
+ -			return true;
+ -		}
+ -	} else if (defer_t == SDEB_DEFER_WQ) {
+ -		/* Cancel if pending */
+ -		if (cancel_work_sync(&sd_dp->ew.work))
+ -			return true;
+ -		/* Was not pending, so it must have run */
+ -		return false;
+ -	} else if (defer_t == SDEB_DEFER_POLL) {
+ -		return true;
+ -	}
+ -
+ -	return false;
+ +	if (!sd_dp)
+ +		return;
+ +	if (defer_t == SDEB_DEFER_HRT)
+ +		hrtimer_cancel(&sd_dp->hrt);
+ +	else if (defer_t == SDEB_DEFER_WQ)
+ +		cancel_work_sync(&sd_dp->ew.work);
+  }
+  
+++<<<<<<< HEAD
+ +/* If @cmnd found deletes its timer or work queue and returns true; else
+ +   returns false */
+ +static bool stop_queued_cmnd(struct scsi_cmnd *cmnd)
+++=======
++ 
++ static bool scsi_debug_stop_cmnd(struct scsi_cmnd *cmnd)
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  {
+ +	unsigned long iflags;
+ +	int j, k, qmax, r_qmax;
+  	enum sdeb_defer_type l_defer_t;
+++<<<<<<< HEAD
+ +	struct sdebug_queue *sqp;
+ +	struct sdebug_queued_cmd *sqcp;
+ +	struct sdebug_dev_info *devip;
+ +	struct sdebug_defer *sd_dp;
+ +
+ +	for (j = 0, sqp = sdebug_q_arr; j < submit_queues; ++j, ++sqp) {
+ +		spin_lock_irqsave(&sqp->qc_lock, iflags);
+ +		qmax = sdebug_max_queue;
+ +		r_qmax = atomic_read(&retired_max_queue);
+ +		if (r_qmax > qmax)
+ +			qmax = r_qmax;
+ +		for (k = 0; k < qmax; ++k) {
+ +			if (test_bit(k, sqp->in_use_bm)) {
+ +				sqcp = &sqp->qc_arr[k];
+ +				if (cmnd != sqcp->a_cmnd)
+ +					continue;
+ +				/* found */
+ +				devip = (struct sdebug_dev_info *)
+ +						cmnd->device->hostdata;
+ +				if (devip)
+ +					atomic_dec(&devip->num_in_q);
+ +				sqcp->a_cmnd = NULL;
+ +				sd_dp = sqcp->sd_dp;
+ +				if (sd_dp) {
+ +					l_defer_t = READ_ONCE(sd_dp->defer_t);
+ +					WRITE_ONCE(sd_dp->defer_t, SDEB_DEFER_NONE);
+ +				} else
+ +					l_defer_t = SDEB_DEFER_NONE;
+ +				spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +				stop_qc_helper(sd_dp, l_defer_t);
+ +				clear_bit(k, sqp->in_use_bm);
+ +				return true;
+ +			}
+ +		}
+ +		spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +	}
+ +	return false;
+++=======
++ 	struct sdebug_defer *sd_dp;
++ 	struct sdebug_scsi_cmd *sdsc = scsi_cmd_priv(cmnd);
++ 	struct sdebug_queued_cmd *sqcp = TO_QUEUED_CMD(cmnd);
++ 
++ 	lockdep_assert_held(&sdsc->lock);
++ 
++ 	if (!sqcp)
++ 		return false;
++ 	sd_dp = &sqcp->sd_dp;
++ 	l_defer_t = READ_ONCE(sd_dp->defer_t);
++ 	ASSIGN_QUEUED_CMD(cmnd, NULL);
++ 
++ 	if (stop_qc_helper(sd_dp, l_defer_t))
++ 		sdebug_free_queued_cmd(sqcp);
++ 
++ 	return true;
++ }
++ 
++ /*
++  * Called from scsi_debug_abort() only, which is for timed-out cmd.
++  */
++ static bool scsi_debug_abort_cmnd(struct scsi_cmnd *cmnd)
++ {
++ 	struct sdebug_scsi_cmd *sdsc = scsi_cmd_priv(cmnd);
++ 	unsigned long flags;
++ 	bool res;
++ 
++ 	spin_lock_irqsave(&sdsc->lock, flags);
++ 	res = scsi_debug_stop_cmnd(cmnd);
++ 	spin_unlock_irqrestore(&sdsc->lock, flags);
++ 
++ 	return res;
++ }
++ 
++ /*
++  * All we can do is set the cmnd as internally aborted and wait for it to
++  * finish. We cannot call scsi_done() as normal completion path may do that.
++  */
++ static bool sdebug_stop_cmnd(struct request *rq, void *data)
++ {
++ 	scsi_debug_abort_cmnd(blk_mq_rq_to_pdu(rq));
++ 
++ 	return true;
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  }
+  
+  /* Deletes (stops) timers or work queues of all queued commands */
+@@@ -5573,6 -5484,33 +5646,36 @@@ static bool inject_on_this_cmd(void
+  
+  #define INCLUSIVE_TIMING_MAX_NS 1000000		/* 1 millisecond */
+  
+++<<<<<<< HEAD
+++=======
++ 
++ void sdebug_free_queued_cmd(struct sdebug_queued_cmd *sqcp)
++ {
++ 	if (sqcp)
++ 		kmem_cache_free(queued_cmd_cache, sqcp);
++ }
++ 
++ static struct sdebug_queued_cmd *sdebug_alloc_queued_cmd(struct scsi_cmnd *scmd)
++ {
++ 	struct sdebug_queued_cmd *sqcp;
++ 	struct sdebug_defer *sd_dp;
++ 
++ 	sqcp = kmem_cache_zalloc(queued_cmd_cache, GFP_ATOMIC);
++ 	if (!sqcp)
++ 		return NULL;
++ 
++ 	sd_dp = &sqcp->sd_dp;
++ 
++ 	hrtimer_init(&sd_dp->hrt, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
++ 	sd_dp->hrt.function = sdebug_q_cmd_hrt_complete;
++ 	INIT_WORK(&sd_dp->ew.work, sdebug_q_cmd_wq_complete);
++ 
++ 	sqcp->scmd = scmd;
++ 
++ 	return sqcp;
++ }
++ 
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  /* Complete the processing of the thread that queued a SCSI command to this
+   * driver. It either completes the command by calling cmnd_done() or
+   * schedules a hr timer or work queue then returns 0. Returns
+@@@ -5584,13 -5522,11 +5687,19 @@@ static int schedule_resp(struct scsi_cm
+  				    struct sdebug_dev_info *),
+  			 int delta_jiff, int ndelay)
+  {
+++<<<<<<< HEAD
+ +	bool new_sd_dp;
+ +	bool inject = false;
+ +	bool hipri = scsi_cmd_to_rq(cmnd)->cmd_flags & REQ_HIPRI;
+ +	int k, num_in_q, qdepth;
+ +	unsigned long iflags;
+++=======
++ 	struct request *rq = scsi_cmd_to_rq(cmnd);
++ 	bool polled = rq->cmd_flags & REQ_POLLED;
++ 	struct sdebug_scsi_cmd *sdsc = scsi_cmd_priv(cmnd);
++ 	unsigned long flags;
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  	u64 ns_from_boot = 0;
+- 	struct sdebug_queue *sqp;
+  	struct sdebug_queued_cmd *sqcp;
+  	struct scsi_device *sdp;
+  	struct sdebug_defer *sd_dp;
+@@@ -5605,61 -5541,32 +5714,74 @@@
+  	if (delta_jiff == 0)
+  		goto respond_in_thread;
+  
+++<<<<<<< HEAD
+ +	sqp = get_queue(cmnd);
+ +	spin_lock_irqsave(&sqp->qc_lock, iflags);
+ +	if (unlikely(atomic_read(&sqp->blocked))) {
+ +		spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +		return SCSI_MLQUEUE_HOST_BUSY;
+ +	}
+ +	num_in_q = atomic_read(&devip->num_in_q);
+ +	qdepth = cmnd->device->queue_depth;
+++=======
++ 
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  	if (unlikely(sdebug_every_nth && (SDEBUG_OPT_RARE_TSF & sdebug_opts) &&
+  		     (scsi_result == 0))) {
+ -		int num_in_q = scsi_device_busy(sdp);
+ -		int qdepth = cmnd->device->queue_depth;
+ -
+ -		if ((num_in_q == qdepth) &&
+ +		if ((num_in_q == (qdepth - 1)) &&
+  		    (atomic_inc_return(&sdebug_a_tsf) >=
+  		     abs(sdebug_every_nth))) {
+  			atomic_set(&sdebug_a_tsf, 0);
+ +			inject = true;
+  			scsi_result = device_qfull_result;
+ +		}
+ +	}
+  
+ -			if (unlikely(SDEBUG_OPT_Q_NOISE & sdebug_opts))
+ -				sdev_printk(KERN_INFO, sdp, "%s: num_in_q=%d +1, <inject> status: TASK SET FULL\n",
+ -					    __func__, num_in_q);
+++<<<<<<< HEAD
+ +	k = find_first_zero_bit(sqp->in_use_bm, sdebug_max_queue);
+ +	if (unlikely(k >= sdebug_max_queue)) {
+ +		spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +		if (scsi_result)
+ +			goto respond_in_thread;
+ +		scsi_result = device_qfull_result;
+ +		if (SDEBUG_OPT_Q_NOISE & sdebug_opts)
+ +			sdev_printk(KERN_INFO, sdp, "%s: max_queue=%d exceeded: TASK SET FULL\n",
+ +				    __func__, sdebug_max_queue);
+ +		goto respond_in_thread;
+ +	}
+ +	set_bit(k, sqp->in_use_bm);
+ +	atomic_inc(&devip->num_in_q);
+ +	sqcp = &sqp->qc_arr[k];
+ +	sqcp->a_cmnd = cmnd;
+ +	cmnd->host_scribble = (unsigned char *)sqcp;
+ +	sd_dp = sqcp->sd_dp;
+ +	spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +
+ +	if (!sd_dp) {
+ +		sd_dp = kzalloc(sizeof(*sd_dp), GFP_ATOMIC);
+ +		if (!sd_dp) {
+ +			atomic_dec(&devip->num_in_q);
+ +			clear_bit(k, sqp->in_use_bm);
+ +			return SCSI_MLQUEUE_HOST_BUSY;
+  		}
+ +		new_sd_dp = true;
+ +	} else {
+ +		new_sd_dp = false;
+  	}
+  
+ +	/* Set the hostwide tag */
+ +	if (sdebug_host_max_queue)
+ +		sd_dp->hc_idx = get_tag(cmnd);
+++=======
++ 	sqcp = sdebug_alloc_queued_cmd(cmnd);
++ 	if (!sqcp) {
++ 		pr_err("%s no alloc\n", __func__);
++ 		return SCSI_MLQUEUE_HOST_BUSY;
++ 	}
++ 	sd_dp = &sqcp->sd_dp;
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  
+ -	if (polled)
+ +	if (hipri)
+  		ns_from_boot = ktime_get_boottime_ns();
+  
+  	/* one of the resp_*() response functions is called here */
+@@@ -5704,15 -5611,9 +5826,18 @@@
+  				u64 d = ktime_get_boottime_ns() - ns_from_boot;
+  
+  				if (kt <= d) {	/* elapsed duration >= kt */
+++<<<<<<< HEAD
+ +					spin_lock_irqsave(&sqp->qc_lock, iflags);
+ +					sqcp->a_cmnd = NULL;
+ +					atomic_dec(&devip->num_in_q);
+ +					clear_bit(k, sqp->in_use_bm);
+ +					spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +					if (new_sd_dp)
+ +						kfree(sd_dp);
+++=======
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  					/* call scsi_done() from this thread */
+ -					sdebug_free_queued_cmd(sqcp);
+ -					scsi_done(cmnd);
+ +					cmnd->scsi_done(cmnd);
+  					return 0;
+  				}
+  				/* otherwise reduce kt by elapsed time */
+@@@ -7498,89 -7396,85 +7638,161 @@@ static int sdebug_map_queues(struct Scs
+  
+  		qoff += map->nr_queues;
+  	}
+ -}
+  
+ -struct sdebug_blk_mq_poll_data {
+ -	unsigned int queue_num;
+ -	int *num_entries;
+ -};
+ +	return 0;
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * We don't handle aborted commands here, but it does not seem possible to have
++  * aborted polled commands from schedule_resp()
++  */
++ static bool sdebug_blk_mq_poll_iter(struct request *rq, void *opaque)
++ {
++ 	struct sdebug_blk_mq_poll_data *data = opaque;
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
++ 	struct sdebug_scsi_cmd *sdsc = scsi_cmd_priv(cmd);
++ 	struct sdebug_defer *sd_dp;
++ 	u32 unique_tag = blk_mq_unique_tag(rq);
++ 	u16 hwq = blk_mq_unique_tag_to_hwq(unique_tag);
++ 	struct sdebug_queued_cmd *sqcp;
++ 	unsigned long flags;
++ 	int queue_num = data->queue_num;
++ 	ktime_t time;
++ 
++ 	/* We're only interested in one queue for this iteration */
++ 	if (hwq != queue_num)
++ 		return true;
++ 
++ 	/* Subsequent checks would fail if this failed, but check anyway */
++ 	if (!test_bit(SCMD_STATE_INFLIGHT, &cmd->state))
++ 		return true;
++ 
++ 	time = ktime_get_boottime();
++ 
++ 	spin_lock_irqsave(&sdsc->lock, flags);
++ 	sqcp = TO_QUEUED_CMD(cmd);
++ 	if (!sqcp) {
++ 		spin_unlock_irqrestore(&sdsc->lock, flags);
++ 		return true;
++ 	}
++ 
++ 	sd_dp = &sqcp->sd_dp;
++ 	if (READ_ONCE(sd_dp->defer_t) != SDEB_DEFER_POLL) {
++ 		spin_unlock_irqrestore(&sdsc->lock, flags);
++ 		return true;
++ 	}
++ 
++ 	if (time < sd_dp->cmpl_ts) {
++ 		spin_unlock_irqrestore(&sdsc->lock, flags);
++ 		return true;
++ 	}
++ 
++ 	ASSIGN_QUEUED_CMD(cmd, NULL);
++ 	spin_unlock_irqrestore(&sdsc->lock, flags);
++ 
++ 	if (sdebug_statistics) {
++ 		atomic_inc(&sdebug_completions);
++ 		if (raw_smp_processor_id() != sd_dp->issuing_cpu)
++ 			atomic_inc(&sdebug_miss_cpus);
++ 	}
++ 
++ 	sdebug_free_queued_cmd(sqcp);
++ 
++ 	scsi_done(cmd); /* callback to mid level */
++ 	(*data->num_entries)++;
++ 	return true;
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  }
+  
+  static int sdebug_blk_mq_poll(struct Scsi_Host *shost, unsigned int queue_num)
+  {
+ +	bool first;
+ +	bool retiring = false;
+  	int num_entries = 0;
+++<<<<<<< HEAD
+ +	unsigned int qc_idx = 0;
+ +	unsigned long iflags;
+ +	ktime_t kt_from_boot = ktime_get_boottime();
+ +	struct sdebug_queue *sqp;
+ +	struct sdebug_queued_cmd *sqcp;
+ +	struct scsi_cmnd *scp;
+ +	struct sdebug_dev_info *devip;
+ +	struct sdebug_defer *sd_dp;
+ +
+ +	sqp = sdebug_q_arr + queue_num;
+ +	spin_lock_irqsave(&sqp->qc_lock, iflags);
+++=======
++ 	struct sdebug_blk_mq_poll_data data = {
++ 		.queue_num = queue_num,
++ 		.num_entries = &num_entries,
++ 	};
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  
+ -	blk_mq_tagset_busy_iter(&shost->tag_set, sdebug_blk_mq_poll_iter,
+ -				&data);
+ +	for (first = true; first || qc_idx + 1 < sdebug_max_queue; )   {
+ +		if (first) {
+ +			qc_idx = find_first_bit(sqp->in_use_bm, sdebug_max_queue);
+ +			first = false;
+ +		} else {
+ +			qc_idx = find_next_bit(sqp->in_use_bm, sdebug_max_queue, qc_idx + 1);
+ +		}
+ +		if (unlikely(qc_idx >= sdebug_max_queue))
+ +			break;
+  
+++<<<<<<< HEAD
+ +		sqcp = &sqp->qc_arr[qc_idx];
+ +		sd_dp = sqcp->sd_dp;
+ +		if (unlikely(!sd_dp))
+ +			continue;
+ +		scp = sqcp->a_cmnd;
+ +		if (unlikely(scp == NULL)) {
+ +			pr_err("scp is NULL, queue_num=%d, qc_idx=%u from %s\n",
+ +			       queue_num, qc_idx, __func__);
+ +			break;
+ +		}
+ +		if (READ_ONCE(sd_dp->defer_t) == SDEB_DEFER_POLL) {
+ +			if (kt_from_boot < sd_dp->cmpl_ts)
+ +				continue;
+ +
+ +		} else		/* ignoring non REQ_HIPRI requests */
+ +			continue;
+ +		devip = (struct sdebug_dev_info *)scp->device->hostdata;
+ +		if (likely(devip))
+ +			atomic_dec(&devip->num_in_q);
+ +		else
+ +			pr_err("devip=NULL from %s\n", __func__);
+ +		if (unlikely(atomic_read(&retired_max_queue) > 0))
+ +			retiring = true;
+ +
+ +		sqcp->a_cmnd = NULL;
+ +		if (unlikely(!test_and_clear_bit(qc_idx, sqp->in_use_bm))) {
+ +			pr_err("Unexpected completion sqp %p queue_num=%d qc_idx=%u from %s\n",
+ +				sqp, queue_num, qc_idx, __func__);
+ +			break;
+ +		}
+ +		if (unlikely(retiring)) {	/* user has reduced max_queue */
+ +			int k, retval;
+ +
+ +			retval = atomic_read(&retired_max_queue);
+ +			if (qc_idx >= retval) {
+ +				pr_err("index %d too large\n", retval);
+ +				break;
+ +			}
+ +			k = find_last_bit(sqp->in_use_bm, retval);
+ +			if ((k < sdebug_max_queue) || (k == retval))
+ +				atomic_set(&retired_max_queue, 0);
+ +			else
+ +				atomic_set(&retired_max_queue, k + 1);
+ +		}
+ +		WRITE_ONCE(sd_dp->defer_t, SDEB_DEFER_NONE);
+ +		spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +		scp->scsi_done(scp); /* callback to mid level */
+ +		spin_lock_irqsave(&sqp->qc_lock, iflags);
+ +		num_entries++;
+ +	}
+ +	spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+++=======
+++>>>>>>> f1437cd1e535 (scsi: scsi_debug: Drop sdebug_queue)
+  	if (num_entries > 0)
+  		atomic_add(num_entries, &sdeb_mq_poll_count);
+  	return num_entries;
+* Unmerged path drivers/scsi/scsi_debug.c
