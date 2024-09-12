@@ -1506,6 +1506,9 @@ static void kmemleak_scan(void)
 		for (pfn = start_pfn; pfn < end_pfn; pfn++) {
 			struct page *page = pfn_to_online_page(pfn);
 
+			if (!(pfn & 63))
+				cond_resched();
+
 			if (!page)
 				continue;
 
@@ -1516,8 +1519,6 @@ static void kmemleak_scan(void)
 			if (page_count(page) == 0)
 				continue;
 			scan_block(page, page + 1, NULL);
-			if (!(pfn & 63))
-				cond_resched();
 		}
 	}
 	put_online_mems();
