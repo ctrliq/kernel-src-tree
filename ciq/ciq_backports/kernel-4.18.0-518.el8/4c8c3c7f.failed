@@ -1,0 +1,630 @@
+treewide: Trace IPIs sent via smp_send_reschedule()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-518.el8
+commit-author Valentin Schneider <vschneid@redhat.com>
+commit 4c8c3c7f70a6779d30f5492acbc9978f4636fe7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-518.el8/4c8c3c7f.failed
+
+To be able to trace invocations of smp_send_reschedule(), rename the
+arch-specific definitions of it to arch_smp_send_reschedule() and wrap it
+into an smp_send_reschedule() that contains a tracepoint.
+
+Changes to include the declaration of the tracepoint were driven by the
+following coccinelle script:
+
+  @func_use@
+  @@
+  smp_send_reschedule(...);
+
+  @include@
+  @@
+  #include <trace/events/ipi.h>
+
+  @no_include depends on func_use && !include@
+  @@
+    #include <...>
+  +
+  + #include <trace/events/ipi.h>
+
+[csky bits]
+[riscv bits]
+	Signed-off-by: Valentin Schneider <vschneid@redhat.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Guo Ren <guoren@kernel.org>
+	Acked-by: Palmer Dabbelt <palmer@rivosinc.com>
+Link: https://lore.kernel.org/r/20230307143558.294354-6-vschneid@redhat.com
+(cherry picked from commit 4c8c3c7f70a6779d30f5492acbc9978f4636fe7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/kernel/smp.c
+#	arch/csky/kernel/smp.c
+#	arch/loongarch/kernel/smp.c
+#	arch/powerpc/kvm/book3s_hv.c
+#	arch/riscv/kernel/smp.c
+diff --cc arch/arm/kernel/smp.c
+index 3ee72472caf2,b350bfc9d1f8..000000000000
+--- a/arch/arm/kernel/smp.c
++++ b/arch/arm/kernel/smp.c
+@@@ -673,7 -699,54 +673,58 @@@ void handle_IPI(int ipinr, struct pt_re
+  	set_irq_regs(old_regs);
+  }
+  
+++<<<<<<< HEAD
+ +void smp_send_reschedule(int cpu)
+++=======
++ static irqreturn_t ipi_handler(int irq, void *data)
++ {
++ 	do_handle_IPI(irq - ipi_irq_base);
++ 	return IRQ_HANDLED;
++ }
++ 
++ static void smp_cross_call(const struct cpumask *target, unsigned int ipinr)
++ {
++ 	trace_ipi_raise(target, ipi_types[ipinr]);
++ 	__ipi_send_mask(ipi_desc[ipinr], target);
++ }
++ 
++ static void ipi_setup(int cpu)
++ {
++ 	int i;
++ 
++ 	if (WARN_ON_ONCE(!ipi_irq_base))
++ 		return;
++ 
++ 	for (i = 0; i < nr_ipi; i++)
++ 		enable_percpu_irq(ipi_irq_base + i, 0);
++ }
++ 
++ void __init set_smp_ipi_range(int ipi_base, int n)
++ {
++ 	int i;
++ 
++ 	WARN_ON(n < MAX_IPI);
++ 	nr_ipi = min(n, MAX_IPI);
++ 
++ 	for (i = 0; i < nr_ipi; i++) {
++ 		int err;
++ 
++ 		err = request_percpu_irq(ipi_base + i, ipi_handler,
++ 					 "IPI", &irq_stat);
++ 		WARN_ON(err);
++ 
++ 		ipi_desc[i] = irq_to_desc(ipi_base + i);
++ 		irq_set_status_flags(ipi_base + i, IRQ_HIDDEN);
++ 	}
++ 
++ 	ipi_irq_base = ipi_base;
++ 
++ 	/* Setup the boot CPU immediately */
++ 	ipi_setup(smp_processor_id());
++ }
++ 
++ void arch_smp_send_reschedule(int cpu)
+++>>>>>>> 4c8c3c7f70a6 (treewide: Trace IPIs sent via smp_send_reschedule())
+  {
+  	smp_cross_call(cpumask_of(cpu), IPI_RESCHEDULE);
+  }
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index fbf13dd287eb,3b70b5f80bd5..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -45,6 -42,8 +45,11 @@@
+  #include <linux/module.h>
+  #include <linux/compiler.h>
+  #include <linux/of.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/irqdomain.h>
++ #include <linux/smp.h>
+++>>>>>>> 4c8c3c7f70a6 (treewide: Trace IPIs sent via smp_send_reschedule())
+  
+  #include <asm/ftrace.h>
+  #include <asm/reg.h>
+@@@ -80,8 -79,12 +85,10 @@@
+  #include <asm/kvm_book3s_uvmem.h>
+  #include <asm/ultravisor.h>
+  #include <asm/dtl.h>
+ -#include <asm/plpar_wrappers.h>
+  
++ #include <trace/events/ipi.h>
++ 
+  #include "book3s.h"
+ -#include "book3s_hv.h"
+  
+  #define CREATE_TRACE_POINTS
+  #include "trace_hv.h"
+diff --cc arch/riscv/kernel/smp.c
+index 6d3962435720,42e9656a1db2..000000000000
+--- a/arch/riscv/kernel/smp.c
++++ b/arch/riscv/kernel/smp.c
+@@@ -108,58 -246,90 +108,124 @@@ static void ipi_stop(void *unused
+  
+  void smp_send_stop(void)
+  {
+ -	unsigned long timeout;
+ -
+ -	if (num_online_cpus() > 1) {
+ -		cpumask_t mask;
+ -
+ -		cpumask_copy(&mask, cpu_online_mask);
+ -		cpumask_clear_cpu(smp_processor_id(), &mask);
+ -
+ -		if (system_state <= SYSTEM_RUNNING)
+ -			pr_crit("SMP: stopping secondary CPUs\n");
+ -		send_ipi_mask(&mask, IPI_CPU_STOP);
+ -	}
+ -
+ -	/* Wait up to one second for other CPUs to stop */
+ -	timeout = USEC_PER_SEC;
+ -	while (num_online_cpus() > 1 && timeout--)
+ -		udelay(1);
+ -
+ -	if (num_online_cpus() > 1)
+ -		pr_warn("SMP: failed to stop secondary CPUs %*pbl\n",
+ -			   cpumask_pr_args(cpu_online_mask));
+ +	on_each_cpu(ipi_stop, NULL, 1);
+  }
+  
+++<<<<<<< HEAD
+ +void smp_send_reschedule(int cpu)
+++=======
++ #ifdef CONFIG_KEXEC_CORE
++ /*
++  * The number of CPUs online, not counting this CPU (which may not be
++  * fully online and so not counted in num_online_cpus()).
++  */
++ static inline unsigned int num_other_online_cpus(void)
++ {
++ 	unsigned int this_cpu_online = cpu_online(smp_processor_id());
++ 
++ 	return num_online_cpus() - this_cpu_online;
++ }
++ 
++ void crash_smp_send_stop(void)
++ {
++ 	static int cpus_stopped;
++ 	cpumask_t mask;
++ 	unsigned long timeout;
++ 
++ 	/*
++ 	 * This function can be called twice in panic path, but obviously
++ 	 * we execute this only once.
++ 	 */
++ 	if (cpus_stopped)
++ 		return;
++ 
++ 	cpus_stopped = 1;
++ 
++ 	/*
++ 	 * If this cpu is the only one alive at this point in time, online or
++ 	 * not, there are no stop messages to be sent around, so just back out.
++ 	 */
++ 	if (num_other_online_cpus() == 0)
++ 		return;
++ 
++ 	cpumask_copy(&mask, cpu_online_mask);
++ 	cpumask_clear_cpu(smp_processor_id(), &mask);
++ 
++ 	atomic_set(&waiting_for_crash_ipi, num_other_online_cpus());
++ 
++ 	pr_crit("SMP: stopping secondary CPUs\n");
++ 	send_ipi_mask(&mask, IPI_CPU_CRASH_STOP);
++ 
++ 	/* Wait up to one second for other CPUs to stop */
++ 	timeout = USEC_PER_SEC;
++ 	while ((atomic_read(&waiting_for_crash_ipi) > 0) && timeout--)
++ 		udelay(1);
++ 
++ 	if (atomic_read(&waiting_for_crash_ipi) > 0)
++ 		pr_warn("SMP: failed to stop secondary CPUs %*pbl\n",
++ 			cpumask_pr_args(&mask));
++ }
++ 
++ bool smp_crash_stop_failed(void)
++ {
++ 	return (atomic_read(&waiting_for_crash_ipi) > 0);
++ }
++ #endif
++ 
++ void arch_smp_send_reschedule(int cpu)
+++>>>>>>> 4c8c3c7f70a6 (treewide: Trace IPIs sent via smp_send_reschedule())
+  {
+ -	send_ipi_single(cpu, IPI_RESCHEDULE);
+ +	send_ipi_message(cpumask_of(cpu), IPI_RESCHEDULE);
+ +}
+ +
+ +/*
+ + * Performs an icache flush for the given MM context.  RISC-V has no direct
+ + * mechanism for instruction cache shoot downs, so instead we send an IPI that
+ + * informs the remote harts they need to flush their local instruction caches.
+ + * To avoid pathologically slow behavior in a common case (a bunch of
+ + * single-hart processes on a many-hart machine, ie 'make -j') we avoid the
+ + * IPIs for harts that are not currently executing a MM context and instead
+ + * schedule a deferred local instruction cache flush to be performed before
+ + * execution resumes on each hart.
+ + */
+ +void flush_icache_mm(struct mm_struct *mm, bool local)
+ +{
+ +	unsigned int cpu;
+ +	cpumask_t others, *mask;
+ +
+ +	preempt_disable();
+ +
+ +	/* Mark every hart's icache as needing a flush for this MM. */
+ +	mask = &mm->context.icache_stale_mask;
+ +	cpumask_setall(mask);
+ +	/* Flush this hart's I$ now, and mark it as flushed. */
+ +	cpu = smp_processor_id();
+ +	cpumask_clear_cpu(cpu, mask);
+ +	local_flush_icache_all();
+ +
+ +	/*
+ +	 * Flush the I$ of other harts concurrently executing, and mark them as
+ +	 * flushed.
+ +	 */
+ +	cpumask_andnot(&others, mm_cpumask(mm), cpumask_of(cpu));
+ +	local |= cpumask_empty(&others);
+ +	if (mm != current->active_mm || !local)
+ +		sbi_remote_fence_i(others.bits);
+ +	else {
+ +		/*
+ +		 * It's assumed that at least one strongly ordered operation is
+ +		 * performed on this hart between setting a hart's cpumask bit
+ +		 * and scheduling this MM context on that hart.  Sending an SBI
+ +		 * remote message will do this, but in the case where no
+ +		 * messages are sent we still need to order this hart's writes
+ +		 * with flush_icache_deferred().
+ +		 */
+ +		smp_mb();
+ +	}
+ +
+ +	preempt_enable();
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL_GPL(arch_smp_send_reschedule);
+++>>>>>>> 4c8c3c7f70a6 (treewide: Trace IPIs sent via smp_send_reschedule())
+* Unmerged path arch/csky/kernel/smp.c
+* Unmerged path arch/loongarch/kernel/smp.c
+diff --git a/arch/alpha/kernel/smp.c b/arch/alpha/kernel/smp.c
+index d0dccae53ba9..82b0cb1dfe9d 100644
+--- a/arch/alpha/kernel/smp.c
++++ b/arch/alpha/kernel/smp.c
+@@ -571,7 +571,7 @@ handle_ipi(struct pt_regs *regs)
+ }
+ 
+ void
+-smp_send_reschedule(int cpu)
++arch_smp_send_reschedule(int cpu)
+ {
+ #ifdef DEBUG_IPI_MSG
+ 	if (cpu == hard_smp_processor_id())
+diff --git a/arch/arc/kernel/smp.c b/arch/arc/kernel/smp.c
+index 21d86c36692b..d2dba557877e 100644
+--- a/arch/arc/kernel/smp.c
++++ b/arch/arc/kernel/smp.c
+@@ -306,7 +306,7 @@ static void ipi_send_msg(const struct cpumask *callmap, enum ipi_msg_type msg)
+ 		ipi_send_msg_one(cpu, msg);
+ }
+ 
+-void smp_send_reschedule(int cpu)
++void arch_smp_send_reschedule(int cpu)
+ {
+ 	ipi_send_msg_one(cpu, IPI_RESCHEDULE);
+ }
+* Unmerged path arch/arm/kernel/smp.c
+diff --git a/arch/arm/mach-actions/platsmp.c b/arch/arm/mach-actions/platsmp.c
+index 3efaa10efc43..6e93785a4a17 100644
+--- a/arch/arm/mach-actions/platsmp.c
++++ b/arch/arm/mach-actions/platsmp.c
+@@ -24,6 +24,8 @@
+ #include <asm/smp_plat.h>
+ #include <asm/smp_scu.h>
+ 
++#include <trace/events/ipi.h>
++
+ #define OWL_CPU1_ADDR	0x50
+ #define OWL_CPU1_FLAG	0x5c
+ 
+diff --git a/arch/arm64/kernel/smp.c b/arch/arm64/kernel/smp.c
+index 42d733d78987..b842b618607d 100644
+--- a/arch/arm64/kernel/smp.c
++++ b/arch/arm64/kernel/smp.c
+@@ -1046,7 +1046,7 @@ void __init set_smp_ipi_range(int ipi_base, int n)
+ 	ipi_setup(smp_processor_id());
+ }
+ 
+-void smp_send_reschedule(int cpu)
++void arch_smp_send_reschedule(int cpu)
+ {
+ 	smp_cross_call(cpumask_of(cpu), IPI_RESCHEDULE);
+ }
+* Unmerged path arch/csky/kernel/smp.c
+diff --git a/arch/hexagon/kernel/smp.c b/arch/hexagon/kernel/smp.c
+index 5dbc15549e01..c833f0f8d3d8 100644
+--- a/arch/hexagon/kernel/smp.c
++++ b/arch/hexagon/kernel/smp.c
+@@ -230,7 +230,7 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
+ 		setup_irq(BASE_IPI_IRQ, &ipi_intdesc);
+ }
+ 
+-void smp_send_reschedule(int cpu)
++void arch_smp_send_reschedule(int cpu)
+ {
+ 	send_ipi(cpumask_of(cpu), IPI_RESCHEDULE);
+ }
+diff --git a/arch/ia64/kernel/smp.c b/arch/ia64/kernel/smp.c
+index 7f706d4f84f7..af8aacc1a4a7 100644
+--- a/arch/ia64/kernel/smp.c
++++ b/arch/ia64/kernel/smp.c
+@@ -221,11 +221,11 @@ kdump_smp_send_init(void)
+  * Called with preemption disabled.
+  */
+ void
+-smp_send_reschedule (int cpu)
++arch_smp_send_reschedule (int cpu)
+ {
+ 	platform_send_ipi(cpu, IA64_IPI_RESCHEDULE, IA64_IPI_DM_INT, 0);
+ }
+-EXPORT_SYMBOL_GPL(smp_send_reschedule);
++EXPORT_SYMBOL_GPL(arch_smp_send_reschedule);
+ 
+ /*
+  * Called with preemption disabled.
+* Unmerged path arch/loongarch/kernel/smp.c
+diff --git a/arch/mips/include/asm/smp.h b/arch/mips/include/asm/smp.h
+index 88ebd83b3bf9..512440c3e769 100644
+--- a/arch/mips/include/asm/smp.h
++++ b/arch/mips/include/asm/smp.h
+@@ -56,7 +56,7 @@ extern void calculate_cpu_foreign_map(void);
+  * it goes straight through and wastes no time serializing
+  * anything. Worst case is that we lose a reschedule ...
+  */
+-static inline void smp_send_reschedule(int cpu)
++static inline void arch_smp_send_reschedule(int cpu)
+ {
+ 	extern const struct plat_smp_ops *mp_ops;	/* private */
+ 
+diff --git a/arch/mips/kernel/rtlx-cmp.c b/arch/mips/kernel/rtlx-cmp.c
+index d26dcc4b46e7..e991cc936c1c 100644
+--- a/arch/mips/kernel/rtlx-cmp.c
++++ b/arch/mips/kernel/rtlx-cmp.c
+@@ -17,6 +17,8 @@
+ #include <asm/vpe.h>
+ #include <asm/rtlx.h>
+ 
++#include <trace/events/ipi.h>
++
+ static int major;
+ 
+ static void rtlx_interrupt(void)
+diff --git a/arch/openrisc/kernel/smp.c b/arch/openrisc/kernel/smp.c
+index 7d518ee8bddc..4b0b68fadee7 100644
+--- a/arch/openrisc/kernel/smp.c
++++ b/arch/openrisc/kernel/smp.c
+@@ -167,7 +167,7 @@ void handle_IPI(unsigned int ipi_msg)
+ 	}
+ }
+ 
+-void smp_send_reschedule(int cpu)
++void arch_smp_send_reschedule(int cpu)
+ {
+ 	smp_cross_call(cpumask_of(cpu), IPI_RESCHEDULE);
+ }
+diff --git a/arch/parisc/kernel/smp.c b/arch/parisc/kernel/smp.c
+index 5e26dbede5fc..373723c5a6dd 100644
+--- a/arch/parisc/kernel/smp.c
++++ b/arch/parisc/kernel/smp.c
+@@ -230,8 +230,8 @@ send_IPI_allbutself(enum ipi_message_type op)
+ inline void 
+ smp_send_stop(void)	{ send_IPI_allbutself(IPI_CPU_STOP); }
+ 
+-void 
+-smp_send_reschedule(int cpu) { send_IPI_single(cpu, IPI_RESCHEDULE); }
++void
++arch_smp_send_reschedule(int cpu) { send_IPI_single(cpu, IPI_RESCHEDULE); }
+ 
+ void
+ smp_send_all_nop(void)
+diff --git a/arch/powerpc/kernel/smp.c b/arch/powerpc/kernel/smp.c
+index b909814796dc..6f52bd725c39 100644
+--- a/arch/powerpc/kernel/smp.c
++++ b/arch/powerpc/kernel/smp.c
+@@ -63,6 +63,8 @@
+ #include <asm/cpu_has_feature.h>
+ #include <asm/ftrace.h>
+ 
++#include <trace/events/ipi.h>
++
+ #ifdef DEBUG
+ #include <asm/udbg.h>
+ #define DBG(fmt...) udbg_printf(fmt)
+@@ -366,12 +368,12 @@ static inline void do_message_pass(int cpu, int msg)
+ #endif
+ }
+ 
+-void smp_send_reschedule(int cpu)
++void arch_smp_send_reschedule(int cpu)
+ {
+ 	if (likely(smp_ops))
+ 		do_message_pass(cpu, PPC_MSG_RESCHEDULE);
+ }
+-EXPORT_SYMBOL_GPL(smp_send_reschedule);
++EXPORT_SYMBOL_GPL(arch_smp_send_reschedule);
+ 
+ void arch_send_call_function_single_ipi(int cpu)
+ {
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+diff --git a/arch/powerpc/platforms/powernv/subcore.c b/arch/powerpc/platforms/powernv/subcore.c
+index 1d7a9fd30dd1..7436842e171f 100644
+--- a/arch/powerpc/platforms/powernv/subcore.c
++++ b/arch/powerpc/platforms/powernv/subcore.c
+@@ -24,6 +24,8 @@
+ #include <asm/opal.h>
+ #include <asm/smp.h>
+ 
++#include <trace/events/ipi.h>
++
+ #include "subcore.h"
+ #include "powernv.h"
+ 
+* Unmerged path arch/riscv/kernel/smp.c
+diff --git a/arch/s390/kernel/smp.c b/arch/s390/kernel/smp.c
+index 5f4d4c5e2422..d261681ade46 100644
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@ -521,7 +521,7 @@ void arch_send_call_function_single_ipi(int cpu)
+  * it goes straight through and wastes no time serializing
+  * anything. Worst case is that we lose a reschedule ...
+  */
+-void smp_send_reschedule(int cpu)
++void arch_smp_send_reschedule(int cpu)
+ {
+ 	pcpu_ec_call(pcpu_devices + cpu, ec_schedule);
+ }
+diff --git a/arch/sh/kernel/smp.c b/arch/sh/kernel/smp.c
+index c483422ea4d0..dcf4af291d20 100644
+--- a/arch/sh/kernel/smp.c
++++ b/arch/sh/kernel/smp.c
+@@ -261,7 +261,7 @@ void __init smp_cpus_done(unsigned int max_cpus)
+ 	       (bogosum / (5000/HZ)) % 100);
+ }
+ 
+-void smp_send_reschedule(int cpu)
++void arch_smp_send_reschedule(int cpu)
+ {
+ 	mp_ops->send_ipi(cpu, SMP_MSG_RESCHEDULE);
+ }
+diff --git a/arch/sparc/kernel/smp_32.c b/arch/sparc/kernel/smp_32.c
+index e078680a1768..23e76fade111 100644
+--- a/arch/sparc/kernel/smp_32.c
++++ b/arch/sparc/kernel/smp_32.c
+@@ -122,7 +122,7 @@ void cpu_panic(void)
+ 
+ struct linux_prom_registers smp_penguin_ctable = { 0 };
+ 
+-void smp_send_reschedule(int cpu)
++void arch_smp_send_reschedule(int cpu)
+ {
+ 	/*
+ 	 * CPU model dependent way of implementing IPI generation targeting
+diff --git a/arch/sparc/kernel/smp_64.c b/arch/sparc/kernel/smp_64.c
+index 4792e08ad36b..e29e61299288 100644
+--- a/arch/sparc/kernel/smp_64.c
++++ b/arch/sparc/kernel/smp_64.c
+@@ -1476,7 +1476,7 @@ static unsigned long send_cpu_poke(int cpu)
+ 	return hv_err;
+ }
+ 
+-void smp_send_reschedule(int cpu)
++void arch_smp_send_reschedule(int cpu)
+ {
+ 	if (cpu == smp_processor_id()) {
+ 		WARN_ON_ONCE(preemptible());
+diff --git a/arch/x86/include/asm/smp.h b/arch/x86/include/asm/smp.h
+index 5957c3d57986..6328e7c149a8 100644
+--- a/arch/x86/include/asm/smp.h
++++ b/arch/x86/include/asm/smp.h
+@@ -119,7 +119,7 @@ static inline void play_dead(void)
+ 	smp_ops.play_dead();
+ }
+ 
+-static inline void smp_send_reschedule(int cpu)
++static inline void arch_smp_send_reschedule(int cpu)
+ {
+ 	smp_ops.smp_send_reschedule(cpu);
+ }
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 449b86d5a161..2ba5390bb9ee 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -27,6 +27,7 @@
+ #include <linux/swap.h>
+ #include <linux/rwsem.h>
+ #include <linux/cc_platform.h>
++#include <linux/smp.h>
+ 
+ #include <asm/apic.h>
+ #include <asm/perf_event.h>
+@@ -41,6 +42,9 @@
+ #include <asm/fpu/api.h>
+ 
+ #include <asm/virtext.h>
++
++#include <trace/events/ipi.h>
++
+ #include "trace.h"
+ 
+ #include "svm.h"
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index ed39aab82d45..8c7377207873 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -59,7 +59,9 @@
+ #include <linux/sched/isolation.h>
+ #include <linux/mem_encrypt.h>
+ #include <linux/suspend.h>
++#include <linux/smp.h>
+ 
++#include <trace/events/ipi.h>
+ #include <trace/events/kvm.h>
+ 
+ #include <asm/debugreg.h>
+diff --git a/arch/xtensa/kernel/smp.c b/arch/xtensa/kernel/smp.c
+index 932d64689bac..4b0298c6c1e3 100644
+--- a/arch/xtensa/kernel/smp.c
++++ b/arch/xtensa/kernel/smp.c
+@@ -375,7 +375,7 @@ void arch_send_call_function_single_ipi(int cpu)
+ 	send_ipi_message(cpumask_of(cpu), IPI_CALL_FUNC);
+ }
+ 
+-void smp_send_reschedule(int cpu)
++void arch_smp_send_reschedule(int cpu)
+ {
+ 	send_ipi_message(cpumask_of(cpu), IPI_RESCHEDULE);
+ }
+diff --git a/include/linux/smp.h b/include/linux/smp.h
+index 48baee17d62e..489ee07c5833 100644
+--- a/include/linux/smp.h
++++ b/include/linux/smp.h
+@@ -103,8 +103,15 @@ extern void smp_send_stop(void);
+ /*
+  * sends a 'reschedule' event to another CPU:
+  */
+-extern void smp_send_reschedule(int cpu);
+-
++extern void arch_smp_send_reschedule(int cpu);
++/*
++ * scheduler_ipi() is inline so can't be passed as callback reason, but the
++ * callsite IP should be sufficient for root-causing IPIs sent from here.
++ */
++#define smp_send_reschedule(cpu) ({				  \
++	trace_ipi_send_cpumask(cpumask_of(cpu), _RET_IP_, NULL);  \
++	arch_smp_send_reschedule(cpu);				  \
++})
+ 
+ /*
+  * Prepare machine for booting other CPUs.
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index f54edb445e67..d035f02be91e 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -69,11 +69,14 @@
+ #include "kvm_mm.h"
+ #include "vfio.h"
+ 
++#include <trace/events/ipi.h>
++
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/kvm.h>
+ 
+ #include <linux/kvm_dirty_ring.h>
+ 
++
+ /* Worst case buffer size needed for holding an integer. */
+ #define ITOA_MAX_LEN 12
+ 
