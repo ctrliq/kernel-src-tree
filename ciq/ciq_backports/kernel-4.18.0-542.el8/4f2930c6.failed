@@ -1,0 +1,160 @@
+selftests/vm: only run 128TBswitch with 5-level paging
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-542.el8
+commit-author Adam Sindelar <adam@wowsignal.io>
+commit 4f2930c6718afbb6c5904cda6f6781a70c52a042
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-542.el8/4f2930c6.failed
+
+The test va_128TBswitch.c expects to be able to pass mmap an address hint
+and length that cross the address 1<<47.  On x86_64, this is not possible
+without 5-level page tables, so the test fails.
+
+The test is already only run on 64-bit powerpc and x86_64 archs, but this
+patch adds an additional check on x86_64 that skips the test if
+PG_TABLE_LEVELS < 5.  There is precedent for checking /proc/config.gz in
+selftests, e.g.  in selftests/firmware.
+
+Running the tests produces the desired output:
+
+sudo make -C tools/testing/selftests TARGETS=vm run_tests
+---------------------------
+running ./va_128TBswitch.sh
+---------------------------
+./va_128TBswitch.sh: PG_TABLE_LEVELS=4, must be >= 5 to run this test
+[SKIP]
+-------------------------------
+
+[adam@wowsignal.io: restrict the check to x86_64]
+  Link: https://lkml.kernel.org/r/20220628163654.337600-1-adam@wowsignal.io
+[adam@wowsignal.io: fix formatting issues, rename "die" to "fail"]
+  Link: https://lkml.kernel.org/r/20220701163030.415735-1-adam@wowsignal.io
+Link: https://lkml.kernel.org/r/20220627163912.5581-1-adam@wowsignal.io
+	Signed-off-by: Adam Sindelar <adam@wowsignal.io>
+	Cc: Adam Sindelar <ats@fb.com>
+	Cc: David Vernet <void@manifault.com>
+	Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 4f2930c6718afbb6c5904cda6f6781a70c52a042)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/vm/run_vmtests.sh
+diff --cc tools/testing/selftests/vm/run_vmtests.sh
+index f73d9621b5a2,27c01c35c7a9..000000000000
+--- a/tools/testing/selftests/vm/run_vmtests.sh
++++ b/tools/testing/selftests/vm/run_vmtests.sh
+@@@ -189,23 -131,27 +189,27 @@@ umount "$mnt
+  rm -rf "$mnt"
+  echo "$nr_hugepgs" > /proc/sys/vm/nr_hugepages
+  
+ -run_test ./compaction_test
+ -
+ -run_test sudo -u nobody ./on-fault-limit
+ -
+ -run_test ./map_populate
+ +CATEGORY="compaction" run_test ./compaction_test
+  
+ -run_test ./mlock-random-test
+ +CATEGORY="mlock" run_test sudo -u nobody ./on-fault-limit
+  
+ -run_test ./mlock2-tests
+ +CATEGORY="mmap" run_test ./map_populate
+  
+ -run_test ./mrelease_test
+ +CATEGORY="mlock" run_test ./mlock-random-test
+  
+ -run_test ./mremap_test
+ +CATEGORY="mlock" run_test ./mlock2-tests
+  
+ -run_test ./thuge-gen
+ +CATEGORY="hugetlb" run_test ./thuge-gen
+  
+  if [ $VADDR64 -ne 0 ]; then
+ -	run_test ./virtual_address_range
+ +	CATEGORY="hugevm" run_test ./virtual_address_range
+  
+  	# virtual address 128TB switch test
+++<<<<<<< HEAD
+ +	CATEGORY="hugevm" run_test ./va_128TBswitch
+++=======
++ 	run_test ./va_128TBswitch.sh
+++>>>>>>> 4f2930c6718a (selftests/vm: only run 128TBswitch with 5-level paging)
+  fi # VADDR64
+  
+  # vmalloc stability smoke test
+diff --git a/tools/testing/selftests/vm/Makefile b/tools/testing/selftests/vm/Makefile
+index 7799278a1068..270f60a0a9fd 100644
+--- a/tools/testing/selftests/vm/Makefile
++++ b/tools/testing/selftests/vm/Makefile
+@@ -81,6 +81,7 @@ TEST_PROGS := run_vmtests.sh
+ 
+ TEST_FILES := test_vmalloc.sh
+ TEST_FILES += test_hmm.sh
++TEST_FILES += va_128TBswitch.sh
+ 
+ KSFT_KHDR_INSTALL := 1
+ include ../lib.mk
+* Unmerged path tools/testing/selftests/vm/run_vmtests.sh
+diff --git a/tools/testing/selftests/vm/va_128TBswitch.sh b/tools/testing/selftests/vm/va_128TBswitch.sh
+new file mode 100644
+index 000000000000..41580751dc51
+--- /dev/null
++++ b/tools/testing/selftests/vm/va_128TBswitch.sh
+@@ -0,0 +1,54 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0
++#
++# Copyright (C) 2022 Adam Sindelar (Meta) <adam@wowsignal.io>
++#
++# This is a test for mmap behavior with 5-level paging. This script wraps the
++# real test to check that the kernel is configured to support at least 5
++# pagetable levels.
++
++# 1 means the test failed
++exitcode=1
++
++# Kselftest framework requirement - SKIP code is 4.
++ksft_skip=4
++
++fail()
++{
++	echo "$1"
++	exit $exitcode
++}
++
++check_supported_x86_64()
++{
++	local config="/proc/config.gz"
++	[[ -f "${config}" ]] || config="/boot/config-$(uname -r)"
++	[[ -f "${config}" ]] || fail "Cannot find kernel config in /proc or /boot"
++
++	# gzip -dcfq automatically handles both compressed and plaintext input.
++	# See man 1 gzip under '-f'.
++	local pg_table_levels=$(gzip -dcfq "${config}" | grep PGTABLE_LEVELS | cut -d'=' -f 2)
++
++	if [[ "${pg_table_levels}" -lt 5 ]]; then
++		echo "$0: PGTABLE_LEVELS=${pg_table_levels}, must be >= 5 to run this test"
++		exit $ksft_skip
++	fi
++}
++
++check_test_requirements()
++{
++	# The test supports x86_64 and powerpc64. We currently have no useful
++	# eligibility check for powerpc64, and the test itself will reject other
++	# architectures.
++	case `uname -m` in
++		"x86_64")
++			check_supported_x86_64
++		;;
++		*)
++			return 0
++		;;
++	esac
++}
++
++check_test_requirements
++./va_128TBswitch
