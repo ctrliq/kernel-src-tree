@@ -1,0 +1,142 @@
+dm-crypt, dm-verity: disable tasklets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-543.el8
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 0a9bab391e336489169b95cb0d4553d921302189
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-543.el8/0a9bab39.failed
+
+Tasklets have an inherent problem with memory corruption. The function
+tasklet_action_common calls tasklet_trylock, then it calls the tasklet
+callback and then it calls tasklet_unlock. If the tasklet callback frees
+the structure that contains the tasklet or if it calls some code that may
+free it, tasklet_unlock will write into free memory.
+
+The commits 8e14f610159d and d9a02e016aaf try to fix it for dm-crypt, but
+it is not a sufficient fix and the data corruption can still happen [1].
+There is no fix for dm-verity and dm-verity will write into free memory
+with every tasklet-processed bio.
+
+There will be atomic workqueues implemented in the kernel 6.9 [2]. They
+will have better interface and they will not suffer from the memory
+corruption problem.
+
+But we need something that stops the memory corruption now and that can be
+backported to the stable kernels. So, I'm proposing this commit that
+disables tasklets in both dm-crypt and dm-verity. This commit doesn't
+remove the tasklet support, because the tasklet code will be reused when
+atomic workqueues will be implemented.
+
+[1] https://lore.kernel.org/all/d390d7ee-f142-44d3-822a-87949e14608b@suse.de/T/
+[2] https://lore.kernel.org/lkml/20240130091300.2968534-1-tj@kernel.org/
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Cc: stable@vger.kernel.org
+Fixes: 39d42fa96ba1b ("dm crypt: add flags to optionally bypass kcryptd workqueues")
+Fixes: 5721d4e5a9cdb ("dm verity: Add optional "try_verify_in_tasklet" feature")
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 0a9bab391e336489169b95cb0d4553d921302189)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-crypt.c
+diff --cc drivers/md/dm-crypt.c
+index 65047d3a04fc,f745f8508243..000000000000
+--- a/drivers/md/dm-crypt.c
++++ b/drivers/md/dm-crypt.c
+@@@ -1733,12 -1768,6 +1730,15 @@@ static void crypt_inc_pending(struct dm
+  	atomic_inc(&io->io_pending);
+  }
+  
+++<<<<<<< HEAD
+ +static void kcryptd_io_bio_endio(struct work_struct *work)
+ +{
+ +	struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
+ +	bio_endio(io->base_bio);
+ +}
+ +
+++=======
+++>>>>>>> 0a9bab391e33 (dm-crypt, dm-verity: disable tasklets)
+  /*
+   * One of the bios was finished. Check for completion of
+   * the whole request and correctly clean up the buffer.
+@@@ -2187,15 -2233,10 +2168,17 @@@ static void kcryptd_queue_crypt(struct 
+  		 * irqs_disabled(): the kernel may run some IO completion from the idle thread, but
+  		 * it is being executed with irqs disabled.
+  		 */
+++<<<<<<< HEAD
+ +		if (in_irq() || irqs_disabled()) {
+ +			io->in_tasklet = true;
+ +			tasklet_init(&io->tasklet, kcryptd_crypt_tasklet, (unsigned long)&io->work);
+ +			tasklet_schedule(&io->tasklet);
+++=======
++ 		if (!(in_hardirq() || irqs_disabled())) {
++ 			kcryptd_crypt(&io->work);
+++>>>>>>> 0a9bab391e33 (dm-crypt, dm-verity: disable tasklets)
+  			return;
+  		}
+- 
+- 		kcryptd_crypt(&io->work);
+- 		return;
+  	}
+  
+  	INIT_WORK(&io->work, kcryptd_crypt);
+* Unmerged path drivers/md/dm-crypt.c
+diff --git a/drivers/md/dm-verity-target.c b/drivers/md/dm-verity-target.c
+index 14db69c371ce..5b675bbd3f8e 100644
+--- a/drivers/md/dm-verity-target.c
++++ b/drivers/md/dm-verity-target.c
+@@ -633,23 +633,6 @@ static void verity_work(struct work_struct *w)
+ 	verity_finish_io(io, errno_to_blk_status(verity_verify_io(io)));
+ }
+ 
+-static void verity_tasklet(unsigned long data)
+-{
+-	struct dm_verity_io *io = (struct dm_verity_io *)data;
+-	int err;
+-
+-	io->in_tasklet = true;
+-	err = verity_verify_io(io);
+-	if (err == -EAGAIN || err == -ENOMEM) {
+-		/* fallback to retrying with work-queue */
+-		INIT_WORK(&io->work, verity_work);
+-		queue_work(io->v->verify_wq, &io->work);
+-		return;
+-	}
+-
+-	verity_finish_io(io, errno_to_blk_status(err));
+-}
+-
+ static void verity_end_io(struct bio *bio)
+ {
+ 	struct dm_verity_io *io = bio->bi_private;
+@@ -660,13 +643,8 @@ static void verity_end_io(struct bio *bio)
+ 		return;
+ 	}
+ 
+-	if (static_branch_unlikely(&use_tasklet_enabled) && io->v->use_tasklet) {
+-		tasklet_init(&io->tasklet, verity_tasklet, (unsigned long)io);
+-		tasklet_schedule(&io->tasklet);
+-	} else {
+-		INIT_WORK(&io->work, verity_work);
+-		queue_work(io->v->verify_wq, &io->work);
+-	}
++	INIT_WORK(&io->work, verity_work);
++	queue_work(io->v->verify_wq, &io->work);
+ }
+ 
+ /*
+diff --git a/drivers/md/dm-verity.h b/drivers/md/dm-verity.h
+index 3f06e6010aba..c9b2c80172b8 100644
+--- a/drivers/md/dm-verity.h
++++ b/drivers/md/dm-verity.h
+@@ -84,7 +84,6 @@ struct dm_verity_io {
+ 	struct bvec_iter iter;
+ 
+ 	struct work_struct work;
+-	struct tasklet_struct tasklet;
+ 
+ 	/*
+ 	 * Three variably-size fields follow this struct:
