@@ -248,6 +248,8 @@ typedef void (*regmap_unlock)(void *);
  *              used.
  * @reg_downshift: The number of bits to downshift the register before
  *		   performing any operations.
+ * @reg_base: Value to be added to every register address before performing any
+ *	      operation.
  * @pad_bits: Number of bits of padding between register and value.
  * @val_bits: Number of bits in a register value, mandatory.
  *
@@ -355,6 +357,7 @@ struct regmap_config {
 	int reg_bits;
 	int reg_stride;
 	int reg_downshift;
+	unsigned int reg_base;
 	int pad_bits;
 	int val_bits;
 
