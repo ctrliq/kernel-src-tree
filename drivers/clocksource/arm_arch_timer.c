@@ -73,7 +73,6 @@ static struct arch_timer *arch_timer_mem __ro_after_init;
 #define to_arch_timer(e) container_of(e, struct arch_timer, evt)
 
 static u32 arch_timer_rate __ro_after_init;
-u32 arch_timer_rate1 __ro_after_init;
 static int arch_timer_ppi[ARCH_TIMER_MAX_TIMER_PPI] __ro_after_init;
 
 static struct clock_event_device __percpu *arch_timer_evt;
