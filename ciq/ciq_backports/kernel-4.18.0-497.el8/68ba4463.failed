@@ -1,0 +1,96 @@
+sctp: add a refcnt in sctp_stream_priorities to avoid a nested loop
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-497.el8
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 68ba44639537de6f91fe32783766322d41848127
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-497.el8/68ba4463.failed
+
+With this refcnt added in sctp_stream_priorities, we don't need to
+traverse all streams to check if the prio is used by other streams
+when freeing one stream's prio in sctp_sched_prio_free_sid(). This
+can avoid a nested loop (up to 65535 * 65535), which may cause a
+stuck as Ying reported:
+
+    watchdog: BUG: soft lockup - CPU#23 stuck for 26s! [ksoftirqd/23:136]
+    Call Trace:
+     <TASK>
+     sctp_sched_prio_free_sid+0xab/0x100 [sctp]
+     sctp_stream_free_ext+0x64/0xa0 [sctp]
+     sctp_stream_free+0x31/0x50 [sctp]
+     sctp_association_free+0xa5/0x200 [sctp]
+
+Note that it doesn't need to use refcount_t type for this counter,
+as its accessing is always protected under the sock lock.
+
+v1->v2:
+ - add a check in sctp_sched_prio_set to avoid the possible prio_head
+   refcnt overflow.
+
+Fixes: 9ed7bfc79542 ("sctp: fix memory leak in sctp_stream_outq_migrate()")
+	Reported-by: Ying Xu <yinxu@redhat.com>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+Link: https://lore.kernel.org/r/825eb0c905cb864991eba335f4a2b780e543f06b.1677085641.git.lucien.xin@gmail.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 68ba44639537de6f91fe32783766322d41848127)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/stream_sched_prio.c
+diff --cc net/sctp/stream_sched_prio.c
+index 2245083a98f2,4d4d9da331f4..000000000000
+--- a/net/sctp/stream_sched_prio.c
++++ b/net/sctp/stream_sched_prio.c
+@@@ -219,30 -206,10 +221,35 @@@ static int sctp_sched_prio_init_sid(str
+  	return sctp_sched_prio_set(stream, sid, 0, gfp);
+  }
+  
+ -static void sctp_sched_prio_free_sid(struct sctp_stream *stream, __u16 sid)
+ +static void sctp_sched_prio_free(struct sctp_stream *stream)
+  {
+++<<<<<<< HEAD
+ +	struct sctp_stream_priorities *prio, *n;
+ +	LIST_HEAD(list);
+ +	int i;
+ +
+ +	/* As we don't keep a list of priorities, to avoid multiple
+ +	 * frees we have to do it in 3 steps:
+ +	 *   1. unsched everyone, so the lists are free to use in 2.
+ +	 *   2. build the list of the priorities
+ +	 *   3. free the list
+ +	 */
+ +	sctp_sched_prio_unsched_all(stream);
+ +	for (i = 0; i < stream->outcnt; i++) {
+ +		if (!SCTP_SO(stream, i)->ext)
+ +			continue;
+ +		prio = SCTP_SO(stream, i)->ext->prio_head;
+ +		if (prio && list_empty(&prio->prio_sched))
+ +			list_add(&prio->prio_sched, &list);
+ +	}
+ +	list_for_each_entry_safe(prio, n, &list, prio_sched) {
+ +		list_del_init(&prio->prio_sched);
+ +		kfree(prio);
+ +	}
+++=======
++ 	sctp_sched_prio_head_put(SCTP_SO(stream, sid)->ext->prio_head);
++ 	SCTP_SO(stream, sid)->ext->prio_head = NULL;
+++>>>>>>> 68ba44639537 (sctp: add a refcnt in sctp_stream_priorities to avoid a nested loop)
+  }
+  
+  static void sctp_sched_prio_enqueue(struct sctp_outq *q,
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index f501ae96c626..b105b6611cbd 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -1433,6 +1433,7 @@ struct sctp_stream_priorities {
+ 	/* The next stream stream in line */
+ 	struct sctp_stream_out_ext *next;
+ 	__u16 prio;
++	__u16 users;
+ };
+ 
+ struct sctp_stream_out_ext {
+* Unmerged path net/sctp/stream_sched_prio.c
