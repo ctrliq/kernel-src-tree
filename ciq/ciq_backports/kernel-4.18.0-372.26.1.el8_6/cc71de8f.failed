@@ -1,0 +1,390 @@
+ice: Add support for VIRTCHNL_VF_OFFLOAD_VLAN_V2
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.26.1.el8_6
+commit-author Brett Creeley <brett.creeley@intel.com>
+commit cc71de8fa13395d106ad8c542eadabe13315d081
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.26.1.el8_6/cc71de8f.failed
+
+Add support for the VF driver to be able to request
+VIRTCHNL_VF_OFFLOAD_VLAN_V2, negotiate its VLAN capabilities via
+VIRTCHNL_OP_GET_OFFLOAD_VLAN_V2_CAPS, add/delete VLAN filters, and
+enable/disable VLAN offloads.
+
+VFs supporting VIRTCHNL_OFFLOAD_VLAN_V2 will be able to use the
+following virtchnl opcodes:
+
+VIRTCHNL_OP_GET_OFFLOAD_VLAN_V2_CAPS
+VIRTCHNL_OP_ADD_VLAN_V2
+VIRTCHNL_OP_DEL_VLAN_V2
+VIRTCHNL_OP_ENABLE_VLAN_STRIPPING_V2
+VIRTCHNL_OP_DISABLE_VLAN_STRIPPING_V2
+VIRTCHNL_OP_ENABLE_VLAN_INSERTION_V2
+VIRTCHNL_OP_DISABLE_VLAN_INSERTION_V2
+
+Legacy VF drivers may expect the initial VLAN stripping settings to be
+configured by the PF, so the PF initializes VLAN stripping based on the
+VIRTCHNL_OP_GET_VF_RESOURCES opcode. However, with VLAN support via
+VIRTCHNL_VF_OFFLOAD_VLAN_V2, this function is only expected to be used
+for VFs that only support VIRTCHNL_VF_OFFLOAD_VLAN, which will only
+be supported when a port VLAN is configured. Update the function
+based on the new expectations. Also, change the message when the PF
+can't enable/disable VLAN stripping to a dev_dbg() as this isn't fatal.
+
+When a VF isn't in a port VLAN and it only supports
+VIRTCHNL_VF_OFFLOAD_VLAN when Double VLAN Mode (DVM) is enabled, then
+the PF needs to reject the VIRTCHNL_VF_OFFLOAD_VLAN capability and
+configure the VF in software only VLAN mode. To do this add the new
+function ice_vf_vsi_cfg_legacy_vlan_mode(), which updates the VF's
+inner and outer ice_vsi_vlan_ops functions and sets up software only
+VLAN mode.
+
+	Signed-off-by: Brett Creeley <brett.creeley@intel.com>
+	Tested-by: Konrad Jankowski <konrad0.jankowski@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit cc71de8fa13395d106ad8c542eadabe13315d081)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_vf_vsi_vlan_ops.c
+#	drivers/net/ethernet/intel/ice/ice_vf_vsi_vlan_ops.h
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+index e5875fdaaf40,68a515a87be7..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+@@@ -10,6 -10,8 +10,11 @@@
+  #include "ice_eswitch.h"
+  #include "ice_virtchnl_allowlist.h"
+  #include "ice_flex_pipe.h"
+++<<<<<<< HEAD
+++=======
++ #include "ice_vf_vsi_vlan_ops.h"
++ #include "ice_vlan.h"
+++>>>>>>> cc71de8fa133 (ice: Add support for VIRTCHNL_VF_OFFLOAD_VLAN_V2)
+  
+  #define FIELD_SELECTOR(proto_hdr_field) \
+  		BIT((proto_hdr_field) & PROTO_HDR_FIELD_MASK)
+@@@ -2282,8 -2351,33 +2288,38 @@@ static int ice_vc_get_vf_res_msg(struc
+  		goto err;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!vsi->info.pvid)
+ +		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_VLAN;
+++=======
++ 	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_VLAN_V2) {
++ 		/* VLAN offloads based on current device configuration */
++ 		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_VLAN_V2;
++ 	} else if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_VLAN) {
++ 		/* allow VF to negotiate VIRTCHNL_VF_OFFLOAD explicitly for
++ 		 * these two conditions, which amounts to guest VLAN filtering
++ 		 * and offloads being based on the inner VLAN or the
++ 		 * inner/single VLAN respectively and don't allow VF to
++ 		 * negotiate VIRTCHNL_VF_OFFLOAD in any other cases
++ 		 */
++ 		if (ice_is_dvm_ena(&pf->hw) && ice_vf_is_port_vlan_ena(vf)) {
++ 			vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_VLAN;
++ 		} else if (!ice_is_dvm_ena(&pf->hw) &&
++ 			   !ice_vf_is_port_vlan_ena(vf)) {
++ 			vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_VLAN;
++ 			/* configure backward compatible support for VFs that
++ 			 * only support VIRTCHNL_VF_OFFLOAD_VLAN, the PF is
++ 			 * configured in SVM, and no port VLAN is configured
++ 			 */
++ 			ice_vf_vsi_cfg_svm_legacy_vlan_mode(vsi);
++ 		} else if (ice_is_dvm_ena(&pf->hw)) {
++ 			/* configure software offloaded VLAN support when DVM
++ 			 * is enabled, but no port VLAN is enabled
++ 			 */
++ 			ice_vf_vsi_cfg_dvm_legacy_vlan_mode(vsi);
++ 		}
++ 	}
+++>>>>>>> cc71de8fa133 (ice: Add support for VIRTCHNL_VF_OFFLOAD_VLAN_V2)
+  
+  	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_RSS_PF) {
+  		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_RSS_PF;
+@@@ -4162,6 -4204,83 +4198,86 @@@ static bool ice_vf_vlan_offload_ena(u3
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_is_vlan_promisc_allowed - check if VLAN promiscuous config is allowed
++  * @vf: VF used to determine if VLAN promiscuous config is allowed
++  */
++ static bool ice_is_vlan_promisc_allowed(struct ice_vf *vf)
++ {
++ 	if ((test_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states) ||
++ 	     test_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states)) &&
++ 	    test_bit(ICE_FLAG_VF_TRUE_PROMISC_ENA, vf->pf->flags))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /**
++  * ice_vf_ena_vlan_promisc - Enable Tx/Rx VLAN promiscuous for the VLAN
++  * @vsi: VF's VSI used to enable VLAN promiscuous mode
++  * @vlan: VLAN used to enable VLAN promiscuous
++  *
++  * This function should only be called if VLAN promiscuous mode is allowed,
++  * which can be determined via ice_is_vlan_promisc_allowed().
++  */
++ static int ice_vf_ena_vlan_promisc(struct ice_vsi *vsi, struct ice_vlan *vlan)
++ {
++ 	u8 promisc_m = ICE_PROMISC_VLAN_TX | ICE_PROMISC_VLAN_RX;
++ 	int status;
++ 
++ 	status = ice_fltr_set_vsi_promisc(&vsi->back->hw, vsi->idx, promisc_m,
++ 					  vlan->vid);
++ 	if (status && status != -EEXIST)
++ 		return status;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * ice_vf_dis_vlan_promisc - Disable Tx/Rx VLAN promiscuous for the VLAN
++  * @vsi: VF's VSI used to disable VLAN promiscuous mode for
++  * @vlan: VLAN used to disable VLAN promiscuous
++  *
++  * This function should only be called if VLAN promiscuous mode is allowed,
++  * which can be determined via ice_is_vlan_promisc_allowed().
++  */
++ static int ice_vf_dis_vlan_promisc(struct ice_vsi *vsi, struct ice_vlan *vlan)
++ {
++ 	u8 promisc_m = ICE_PROMISC_VLAN_TX | ICE_PROMISC_VLAN_RX;
++ 	int status;
++ 
++ 	status = ice_fltr_clear_vsi_promisc(&vsi->back->hw, vsi->idx, promisc_m,
++ 					    vlan->vid);
++ 	if (status && status != -ENOENT)
++ 		return status;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * ice_vf_has_max_vlans - check if VF already has the max allowed VLAN filters
++  * @vf: VF to check against
++  * @vsi: VF's VSI
++  *
++  * If the VF is trusted then the VF is allowed to add as many VLANs as it
++  * wants to, so return false.
++  *
++  * When the VF is untrusted compare the number of non-zero VLANs + 1 to the max
++  * allowed VLANs for an untrusted VF. Return the result of this comparison.
++  */
++ static bool ice_vf_has_max_vlans(struct ice_vf *vf, struct ice_vsi *vsi)
++ {
++ 	if (ice_is_vf_trusted(vf))
++ 		return false;
++ 
++ #define ICE_VF_ADDED_VLAN_ZERO_FLTRS	1
++ 	return ((ice_vsi_num_non_zero_vlans(vsi) +
++ 		ICE_VF_ADDED_VLAN_ZERO_FLTRS) >= ICE_MAX_VLAN_PER_VF);
++ }
++ 
++ /**
+++>>>>>>> cc71de8fa133 (ice: Add support for VIRTCHNL_VF_OFFLOAD_VLAN_V2)
+   * ice_vc_process_vlan_msg
+   * @vf: pointer to the VF info
+   * @msg: pointer to the msg buffer
+@@@ -4225,7 -4340,10 +4338,14 @@@ static int ice_vc_process_vlan_msg(stru
+  		goto error_param;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (vsi->info.pvid) {
+++=======
++ 	/* in DVM a VF can add/delete inner VLAN filters when
++ 	 * VIRTCHNL_VF_OFFLOAD_VLAN is negotiated, so only reject in SVM
++ 	 */
++ 	if (ice_vf_is_port_vlan_ena(vf) && !ice_is_dvm_ena(&pf->hw)) {
+++>>>>>>> cc71de8fa133 (ice: Add support for VIRTCHNL_VF_OFFLOAD_VLAN_V2)
+  		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+  		goto error_param;
+  	}
+@@@ -4263,11 -4385,9 +4386,17 @@@
+  				goto error_param;
+  			}
+  
+++<<<<<<< HEAD
+ +			/* Enable VLAN pruning when non-zero VLAN is added */
+ +			if (!vlan_promisc && vid &&
+ +			    !ice_vsi_is_vlan_pruning_ena(vsi)) {
+ +				status = ice_cfg_vlan_pruning(vsi, true);
+ +				if (status) {
+++=======
++ 			/* Enable VLAN filtering on first non-zero VLAN */
++ 			if (!vlan_promisc && vid && !ice_is_dvm_ena(&pf->hw)) {
++ 				if (vsi->inner_vlan_ops.ena_rx_filtering(vsi)) {
+++>>>>>>> cc71de8fa133 (ice: Add support for VIRTCHNL_VF_OFFLOAD_VLAN_V2)
+  					v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+  					dev_err(dev, "Enable VLAN pruning on VLAN ID: %d failed error-%d\n",
+  						vid, status);
+@@@ -4317,19 -4431,12 +4441,19 @@@
+  				goto error_param;
+  			}
+  
+++<<<<<<< HEAD
+ +			/* Disable VLAN pruning when only VLAN 0 is left */
+ +			if (vsi->num_vlan == 1 &&
+ +			    ice_vsi_is_vlan_pruning_ena(vsi))
+ +				ice_cfg_vlan_pruning(vsi, false);
+- 
+- 			/* Disable Unicast/Multicast VLAN promiscuous mode */
+- 			if (vlan_promisc) {
+- 				promisc_m = ICE_PROMISC_VLAN_TX |
+- 					    ICE_PROMISC_VLAN_RX;
+- 
+- 				ice_clear_vsi_promisc(hw, vsi->idx,
+- 						      promisc_m, vid);
+- 			}
+++=======
++ 			/* Disable VLAN filtering when only VLAN 0 is left */
++ 			if (!ice_vsi_has_non_zero_vlans(vsi))
++ 				vsi->inner_vlan_ops.dis_rx_filtering(vsi);
+++>>>>>>> cc71de8fa133 (ice: Add support for VIRTCHNL_VF_OFFLOAD_VLAN_V2)
++ 
++ 			if (vlan_promisc)
++ 				ice_vf_dis_vlan_promisc(vsi, &vlan);
+  		}
+  	}
+  
+@@@ -4449,43 -4553,36 +4570,41 @@@ static int ice_vf_init_vlan_stripping(s
+  	if (!vsi)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	/* don't modify stripping if port VLAN is configured */
+ +	if (vsi->info.pvid)
+++=======
++ 	/* don't modify stripping if port VLAN is configured in SVM since the
++ 	 * port VLAN is based on the inner/single VLAN in SVM
++ 	 */
++ 	if (ice_vf_is_port_vlan_ena(vf) && !ice_is_dvm_ena(&vsi->back->hw))
+++>>>>>>> cc71de8fa133 (ice: Add support for VIRTCHNL_VF_OFFLOAD_VLAN_V2)
+  		return 0;
+  
+  	if (ice_vf_vlan_offload_ena(vf->driver_caps))
+ -		return vsi->inner_vlan_ops.ena_stripping(vsi, ETH_P_8021Q);
+ +		return ice_vsi_manage_vlan_stripping(vsi, true);
+  	else
+ -		return vsi->inner_vlan_ops.dis_stripping(vsi);
+ +		return ice_vsi_manage_vlan_stripping(vsi, false);
+  }
+  
+- static struct ice_vc_vf_ops ice_vc_vf_dflt_ops = {
+- 	.get_ver_msg = ice_vc_get_ver_msg,
+- 	.get_vf_res_msg = ice_vc_get_vf_res_msg,
+- 	.reset_vf = ice_vc_reset_vf_msg,
+- 	.add_mac_addr_msg = ice_vc_add_mac_addr_msg,
+- 	.del_mac_addr_msg = ice_vc_del_mac_addr_msg,
+- 	.cfg_qs_msg = ice_vc_cfg_qs_msg,
+- 	.ena_qs_msg = ice_vc_ena_qs_msg,
+- 	.dis_qs_msg = ice_vc_dis_qs_msg,
+- 	.request_qs_msg = ice_vc_request_qs_msg,
+- 	.cfg_irq_map_msg = ice_vc_cfg_irq_map_msg,
+- 	.config_rss_key = ice_vc_config_rss_key,
+- 	.config_rss_lut = ice_vc_config_rss_lut,
+- 	.get_stats_msg = ice_vc_get_stats_msg,
+- 	.cfg_promiscuous_mode_msg = ice_vc_cfg_promiscuous_mode_msg,
+- 	.add_vlan_msg = ice_vc_add_vlan_msg,
+- 	.remove_vlan_msg = ice_vc_remove_vlan_msg,
+- 	.ena_vlan_stripping = ice_vc_ena_vlan_stripping,
+- 	.dis_vlan_stripping = ice_vc_dis_vlan_stripping,
+- 	.handle_rss_cfg_msg = ice_vc_handle_rss_cfg,
+- 	.add_fdir_fltr_msg = ice_vc_add_fdir_fltr,
+- 	.del_fdir_fltr_msg = ice_vc_del_fdir_fltr,
+- };
++ static u16 ice_vc_get_max_vlan_fltrs(struct ice_vf *vf)
++ {
++ 	if (vf->trusted)
++ 		return VLAN_N_VID;
++ 	else
++ 		return ICE_MAX_VLAN_PER_VF;
++ }
+  
+- void ice_vc_set_dflt_vf_ops(struct ice_vc_vf_ops *ops)
++ /**
++  * ice_vf_outer_vlan_not_allowed - check outer VLAN can be used when the device is in DVM
++  * @vf: VF that being checked for
++  */
++ static bool ice_vf_outer_vlan_not_allowed(struct ice_vf *vf)
+  {
+- 	*ops = ice_vc_vf_dflt_ops;
++ 	if (ice_vf_is_port_vlan_ena(vf))
++ 		return true;
++ 
++ 	return false;
+  }
+  
+  /**
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+index 8f27255cc0cc,4f4961043638..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+@@@ -118,7 -127,8 +125,12 @@@ struct ice_vf 
+  	struct ice_time_mac legacy_last_added_umac;
+  	DECLARE_BITMAP(txq_ena, ICE_MAX_RSS_QS_PER_VF);
+  	DECLARE_BITMAP(rxq_ena, ICE_MAX_RSS_QS_PER_VF);
+++<<<<<<< HEAD
+ +	u16 port_vlan_info;		/* Port VLAN ID and QoS */
+++=======
++ 	struct ice_vlan port_vlan_info;	/* Port VLAN ID, QoS, and TPID */
++ 	struct virtchnl_vlan_caps vlan_v2_caps;
+++>>>>>>> cc71de8fa133 (ice: Add support for VIRTCHNL_VF_OFFLOAD_VLAN_V2)
+  	u8 pf_set_mac:1;		/* VF MAC address set by VMM admin */
+  	u8 trusted:1;
+  	u8 spoofchk:1;
+* Unmerged path drivers/net/ethernet/intel/ice/ice_vf_vsi_vlan_ops.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_vf_vsi_vlan_ops.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_base.c b/drivers/net/ethernet/intel/ice/ice_base.c
+index 1a5ece3bce79..87de9a8ae288 100644
+--- a/drivers/net/ethernet/intel/ice/ice_base.c
++++ b/drivers/net/ethernet/intel/ice/ice_base.c
+@@ -5,6 +5,7 @@
+ #include "ice_base.h"
+ #include "ice_lib.h"
+ #include "ice_dcb_lib.h"
++#include "ice_virtchnl_pf.h"
+ 
+ static bool ice_alloc_rx_buf_zc(struct ice_rx_ring *rx_ring)
+ {
+* Unmerged path drivers/net/ethernet/intel/ice/ice_vf_vsi_vlan_ops.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_vf_vsi_vlan_ops.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_virtchnl_allowlist.c b/drivers/net/ethernet/intel/ice/ice_virtchnl_allowlist.c
+index 9feebe5f556c..5a82216e7d03 100644
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_allowlist.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_allowlist.c
+@@ -55,6 +55,15 @@ static const u32 vlan_allowlist_opcodes[] = {
+ 	VIRTCHNL_OP_ENABLE_VLAN_STRIPPING, VIRTCHNL_OP_DISABLE_VLAN_STRIPPING,
+ };
+ 
++/* VIRTCHNL_VF_OFFLOAD_VLAN_V2 */
++static const u32 vlan_v2_allowlist_opcodes[] = {
++	VIRTCHNL_OP_GET_OFFLOAD_VLAN_V2_CAPS, VIRTCHNL_OP_ADD_VLAN_V2,
++	VIRTCHNL_OP_DEL_VLAN_V2, VIRTCHNL_OP_ENABLE_VLAN_STRIPPING_V2,
++	VIRTCHNL_OP_DISABLE_VLAN_STRIPPING_V2,
++	VIRTCHNL_OP_ENABLE_VLAN_INSERTION_V2,
++	VIRTCHNL_OP_DISABLE_VLAN_INSERTION_V2,
++};
++
+ /* VIRTCHNL_VF_OFFLOAD_RSS_PF */
+ static const u32 rss_pf_allowlist_opcodes[] = {
+ 	VIRTCHNL_OP_CONFIG_RSS_KEY, VIRTCHNL_OP_CONFIG_RSS_LUT,
+@@ -89,6 +98,7 @@ static const struct allowlist_opcode_info allowlist_opcodes[] = {
+ 	ALLOW_ITEM(VIRTCHNL_VF_OFFLOAD_RSS_PF, rss_pf_allowlist_opcodes),
+ 	ALLOW_ITEM(VIRTCHNL_VF_OFFLOAD_ADV_RSS_PF, adv_rss_pf_allowlist_opcodes),
+ 	ALLOW_ITEM(VIRTCHNL_VF_OFFLOAD_FDIR_PF, fdir_pf_allowlist_opcodes),
++	ALLOW_ITEM(VIRTCHNL_VF_OFFLOAD_VLAN_V2, vlan_v2_allowlist_opcodes),
+ };
+ 
+ /**
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
