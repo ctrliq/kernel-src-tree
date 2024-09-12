@@ -1,0 +1,204 @@
+ice: ndo_setup_tc implementation for PR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Michal Swiatkowski <michal.swiatkowski@intel.com>
+commit 7fde6d8b445f3af9caa5f3c2be384c2f797e21c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/7fde6d8b.failed
+
+Add tc-flower support for VF port representor devices.
+
+Implement ndo_setup_tc callback for TC HW offload on VF port representors
+devices. Implemented both methods: add and delete tc-flower flows.
+
+Mark NETIF_F_HW_TC bit in net device's feature set to enable offload TC
+infrastructure for port representor.
+
+Implement TC filters replay function required to restore filters settings
+while switchdev configuration is rebuilt.
+
+	Signed-off-by: Michal Swiatkowski <michal.swiatkowski@intel.com>
+	Signed-off-by: Wojciech Drewek <wojciech.drewek@intel.com>
+	Tested-by: Sandeep Penigalapati <sandeep.penigalapati@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 7fde6d8b445f3af9caa5f3c2be384c2f797e21c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_eswitch.c
+#	drivers/net/ethernet/intel/ice/ice_tc_lib.c
+#	drivers/net/ethernet/intel/ice/ice_tc_lib.h
+diff --cc drivers/net/ethernet/intel/ice/ice_eswitch.c
+index ccbb604f3a03,d91a7834f91f..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_eswitch.c
++++ b/drivers/net/ethernet/intel/ice/ice_eswitch.c
+@@@ -492,3 -585,76 +493,79 @@@ int ice_eswitch_configure(struct ice_p
+  	pf->switchdev.is_running = true;
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * ice_eswitch_start_all_tx_queues - start Tx queues of all port representors
++  * @pf: pointer to PF structure
++  */
++ static void ice_eswitch_start_all_tx_queues(struct ice_pf *pf)
++ {
++ 	struct ice_repr *repr;
++ 	int i;
++ 
++ 	if (test_bit(ICE_DOWN, pf->state))
++ 		return;
++ 
++ 	ice_for_each_vf(pf, i) {
++ 		repr = pf->vf[i].repr;
++ 		if (repr)
++ 			ice_repr_start_tx_queues(repr);
++ 	}
++ }
++ 
++ /**
++  * ice_eswitch_stop_all_tx_queues - stop Tx queues of all port representors
++  * @pf: pointer to PF structure
++  */
++ void ice_eswitch_stop_all_tx_queues(struct ice_pf *pf)
++ {
++ 	struct ice_repr *repr;
++ 	int i;
++ 
++ 	if (test_bit(ICE_DOWN, pf->state))
++ 		return;
++ 
++ 	ice_for_each_vf(pf, i) {
++ 		repr = pf->vf[i].repr;
++ 		if (repr)
++ 			ice_repr_stop_tx_queues(repr);
++ 	}
++ }
++ 
++ /**
++  * ice_eswitch_rebuild - rebuild eswitch
++  * @pf: pointer to PF structure
++  */
++ int ice_eswitch_rebuild(struct ice_pf *pf)
++ {
++ 	struct ice_vsi *ctrl_vsi = pf->switchdev.control_vsi;
++ 	int status;
++ 
++ 	ice_eswitch_napi_disable(pf);
++ 	ice_eswitch_napi_del(pf);
++ 
++ 	status = ice_eswitch_setup_env(pf);
++ 	if (status)
++ 		return status;
++ 
++ 	status = ice_eswitch_setup_reprs(pf);
++ 	if (status)
++ 		return status;
++ 
++ 	ice_eswitch_remap_rings_to_vectors(pf);
++ 
++ 	ice_replay_tc_fltrs(pf);
++ 
++ 	status = ice_vsi_open(ctrl_vsi);
++ 	if (status)
++ 		return status;
++ 
++ 	ice_eswitch_napi_enable(pf);
++ 	ice_eswitch_set_rxdid(ctrl_vsi, ICE_RXDID_FLEX_NIC_2);
++ 	ice_eswitch_start_all_tx_queues(pf);
++ 
++ 	return 0;
++ }
+++>>>>>>> 7fde6d8b445f (ice: ndo_setup_tc implementation for PR)
+* Unmerged path drivers/net/ethernet/intel/ice/ice_tc_lib.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_tc_lib.h
+* Unmerged path drivers/net/ethernet/intel/ice/ice_eswitch.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_repr.c b/drivers/net/ethernet/intel/ice/ice_repr.c
+index afdceea6d22a..9682459db041 100644
+--- a/drivers/net/ethernet/intel/ice/ice_repr.c
++++ b/drivers/net/ethernet/intel/ice/ice_repr.c
+@@ -5,6 +5,7 @@
+ #include "ice_eswitch.h"
+ #include "ice_devlink.h"
+ #include "ice_virtchnl_pf.h"
++#include "ice_tc_lib.h"
+ 
+ /**
+  * ice_repr_get_sw_port_id - get port ID associated with representor
+@@ -110,11 +111,61 @@ ice_repr_get_devlink_port(struct net_device *netdev)
+ 	return &repr->vf->devlink_port;
+ }
+ 
++static int
++ice_repr_setup_tc_cls_flower(struct ice_repr *repr,
++			     struct flow_cls_offload *flower)
++{
++	switch (flower->command) {
++	case FLOW_CLS_REPLACE:
++		return ice_add_cls_flower(repr->netdev, repr->src_vsi, flower);
++	case FLOW_CLS_DESTROY:
++		return ice_del_cls_flower(repr->src_vsi, flower);
++	default:
++		return -EINVAL;
++	}
++}
++
++static int
++ice_repr_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
++			   void *cb_priv)
++{
++	struct flow_cls_offload *flower = (struct flow_cls_offload *)type_data;
++	struct ice_netdev_priv *np = (struct ice_netdev_priv *)cb_priv;
++
++	switch (type) {
++	case TC_SETUP_CLSFLOWER:
++		return ice_repr_setup_tc_cls_flower(np->repr, flower);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static LIST_HEAD(ice_repr_block_cb_list);
++
++static int
++ice_repr_setup_tc(struct net_device *netdev, enum tc_setup_type type,
++		  void *type_data)
++{
++	struct ice_netdev_priv *np = netdev_priv(netdev);
++
++	switch (type) {
++	case TC_SETUP_BLOCK:
++		return flow_block_cb_setup_simple((struct flow_block_offload *)
++						  type_data,
++						  &ice_repr_block_cb_list,
++						  ice_repr_setup_tc_block_cb,
++						  np, np, true);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ static const struct net_device_ops ice_repr_netdev_ops = {
+ 	.ndo_get_phys_port_name = ice_repr_get_phys_port_name,
+ 	.ndo_open = ice_repr_open,
+ 	.ndo_stop = ice_repr_stop,
+ 	.ndo_get_devlink_port = ice_repr_get_devlink_port,
++	.ndo_setup_tc = ice_repr_setup_tc,
+ };
+ 
+ /**
+@@ -136,6 +187,8 @@ ice_repr_reg_netdev(struct net_device *netdev)
+ 	eth_hw_addr_random(netdev);
+ 	netdev->netdev_ops = &ice_repr_netdev_ops;
+ 
++	netdev->hw_features |= NETIF_F_HW_TC;
++
+ 	netif_carrier_off(netdev);
+ 	netif_tx_stop_all_queues(netdev);
+ 
+* Unmerged path drivers/net/ethernet/intel/ice/ice_tc_lib.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_tc_lib.h
