@@ -259,9 +259,6 @@ static struct snd_sof_dsp_ops sof_byt_ops = {
 	.pcm_open	= sof_stream_pcm_open,
 	.pcm_close	= sof_stream_pcm_close,
 
-	/* module loading */
-	.load_module	= snd_sof_parse_module_memcpy,
-
 	/*Firmware loading */
 	.load_firmware	= snd_sof_load_firmware_memcpy,
 
@@ -341,9 +338,6 @@ static struct snd_sof_dsp_ops sof_cht_ops = {
 	/* stream callbacks */
 	.pcm_open	= sof_stream_pcm_open,
 	.pcm_close	= sof_stream_pcm_close,
-
-	/* module loading */
-	.load_module	= snd_sof_parse_module_memcpy,
 
 	/*Firmware loading */
 	.load_firmware	= snd_sof_load_firmware_memcpy,
