@@ -1,0 +1,180 @@
+drm/i915/guc: Actually return an error if GuC version range check fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author John Harrison <John.C.Harrison@Intel.com>
+commit 80ab31799002166ac7c660bacfbff4f85bc29107
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/80ab3179.failed
+
+Dan Carpenter pointed out that 'err' was not being set in the case
+where the GuC firmware version range check fails. Fix that.
+
+Note that while this is a bug fix for a previous patch (see Fixes tag
+below). It is an exceedingly low risk bug. The range check is
+asserting that the GuC firmware version is within spec. So it should
+not be possible to ever have a firmware file that fails this check. If
+larger version numbers are required in the future, that would be a
+backwards breaking spec change and thus require a major version bump,
+in which case an old i915 driver would not load that new version anyway.
+
+Fixes: 9bbba0667f37 ("drm/i915/guc: Use GuC submission API version number")
+	Reported-by: Dan Carpenter <error27@gmail.com>
+	Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+	Cc: John Harrison <John.C.Harrison@Intel.com>
+	Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+	Cc: Alan Previn <alan.previn.teres.alexis@intel.com>
+	Cc: Umesh Nerlige Ramappa <umesh.nerlige.ramappa@intel.com>
+	Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+	Cc: Matthew Brost <matthew.brost@intel.com>
+	Cc: Andi Shyti <andi.shyti@linux.intel.com>
+	Cc: Matthew Auld <matthew.auld@intel.com>
+	Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+	Cc: Lucas De Marchi <lucas.demarchi@intel.com>
+	Cc: Jani Nikula <jani.nikula@intel.com>
+	Reviewed-by: Andi Shyti <andi.shyti@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230421224742.2357198-1-John.C.Harrison@Intel.com
+(cherry picked from commit 80ab31799002166ac7c660bacfbff4f85bc29107)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c
+diff --cc drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c
+index fb309ae43001,c36e68e23a14..000000000000
+--- a/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c
+@@@ -513,16 -622,92 +513,102 @@@ static int check_ccs_header(struct drm_
+  		return -E2BIG;
+  	}
+  
+ -	uc_unpack_css_version(&uc_fw->file_selected.ver, css->sw_version);
+ +	/* Get version numbers from the CSS header */
+ +	uc_fw->file_selected.major_ver = FIELD_GET(CSS_SW_VERSION_UC_MAJOR,
+ +						   css->sw_version);
+ +	uc_fw->file_selected.minor_ver = FIELD_GET(CSS_SW_VERSION_UC_MINOR,
+ +						   css->sw_version);
+ +	uc_fw->file_selected.patch_ver = FIELD_GET(CSS_SW_VERSION_UC_PATCH,
+ +						   css->sw_version);
+  
+  	if (uc_fw->type == INTEL_UC_FW_TYPE_GUC)
+++<<<<<<< HEAD
+ +		uc_fw->private_data_size = css->private_data_size;
+++=======
++ 		guc_read_css_info(uc_fw, css);
++ 
++ 	return 0;
++ }
++ 
++ static bool is_ver_8bit(struct intel_uc_fw_ver *ver)
++ {
++ 	return ver->major < 0xFF && ver->minor < 0xFF && ver->patch < 0xFF;
++ }
++ 
++ static int guc_check_version_range(struct intel_uc_fw *uc_fw)
++ {
++ 	struct intel_guc *guc = container_of(uc_fw, struct intel_guc, fw);
++ 	struct intel_gt *gt = __uc_fw_to_gt(uc_fw);
++ 
++ 	/*
++ 	 * GuC version number components are defined as being 8-bits.
++ 	 * The submission code relies on this to optimise version comparison
++ 	 * tests. So enforce the restriction here.
++ 	 */
++ 
++ 	if (!is_ver_8bit(&uc_fw->file_selected.ver)) {
++ 		gt_warn(gt, "%s firmware: invalid file version: 0x%02X:%02X:%02X\n",
++ 			intel_uc_fw_type_repr(uc_fw->type),
++ 			uc_fw->file_selected.ver.major,
++ 			uc_fw->file_selected.ver.minor,
++ 			uc_fw->file_selected.ver.patch);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!is_ver_8bit(&guc->submission_version)) {
++ 		gt_warn(gt, "%s firmware: invalid submit version: 0x%02X:%02X:%02X\n",
++ 			intel_uc_fw_type_repr(uc_fw->type),
++ 			guc->submission_version.major,
++ 			guc->submission_version.minor,
++ 			guc->submission_version.patch);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return i915_inject_probe_error(gt->i915, -EINVAL);
++ }
++ 
++ static int check_fw_header(struct intel_gt *gt,
++ 			   const struct firmware *fw,
++ 			   struct intel_uc_fw *uc_fw)
++ {
++ 	int err = 0;
++ 
++ 	/* GSC FW version is queried after the FW is loaded */
++ 	if (uc_fw->type == INTEL_UC_FW_TYPE_GSC)
++ 		return 0;
++ 
++ 	if (uc_fw->loaded_via_gsc)
++ 		err = check_gsc_manifest(gt, fw, uc_fw);
++ 	else
++ 		err = check_ccs_header(gt, fw, uc_fw);
++ 	if (err)
++ 		return err;
++ 
++ 	return 0;
++ }
++ 
++ static int try_firmware_load(struct intel_uc_fw *uc_fw, const struct firmware **fw)
++ {
++ 	struct intel_gt *gt = __uc_fw_to_gt(uc_fw);
++ 	struct device *dev = gt->i915->drm.dev;
++ 	int err;
++ 
++ 	err = firmware_request_nowarn(fw, uc_fw->file_selected.path, dev);
++ 
++ 	if (err)
++ 		return err;
++ 
++ 	if ((*fw)->size > INTEL_UC_RSVD_GGTT_PER_FW) {
++ 		gt_err(gt, "%s firmware %s: size (%zuKB) exceeds max supported size (%uKB)\n",
++ 		       intel_uc_fw_type_repr(uc_fw->type), uc_fw->file_selected.path,
++ 		       (*fw)->size / SZ_1K, INTEL_UC_RSVD_GGTT_PER_FW / SZ_1K);
++ 
++ 		/* try to find another blob to load */
++ 		release_firmware(*fw);
++ 		*fw = NULL;
++ 		return -ENOENT;
++ 	}
+++>>>>>>> 80ab31799002 (drm/i915/guc: Actually return an error if GuC version range check fails)
+  
+  	return 0;
+  }
+@@@ -589,13 -773,19 +675,23 @@@ done
+  	if (err)
+  		goto fail;
+  
+++<<<<<<< HEAD
+ +	if (uc_fw->file_wanted.major_ver) {
+++=======
++ 	if (uc_fw->type == INTEL_UC_FW_TYPE_GUC) {
++ 		err = guc_check_version_range(uc_fw);
++ 		if (err)
++ 			goto fail;
++ 	}
++ 
++ 	if (uc_fw->file_wanted.ver.major && uc_fw->file_selected.ver.major) {
+++>>>>>>> 80ab31799002 (drm/i915/guc: Actually return an error if GuC version range check fails)
+  		/* Check the file's major version was as it claimed */
+ -		if (uc_fw->file_selected.ver.major != uc_fw->file_wanted.ver.major) {
+ -			gt_notice(gt, "%s firmware %s: unexpected version: %u.%u != %u.%u\n",
+ -				  intel_uc_fw_type_repr(uc_fw->type), uc_fw->file_selected.path,
+ -				  uc_fw->file_selected.ver.major, uc_fw->file_selected.ver.minor,
+ -				  uc_fw->file_wanted.ver.major, uc_fw->file_wanted.ver.minor);
+ +		if (uc_fw->file_selected.major_ver != uc_fw->file_wanted.major_ver) {
+ +			drm_notice(&i915->drm, "%s firmware %s: unexpected version: %u.%u != %u.%u\n",
+ +				   intel_uc_fw_type_repr(uc_fw->type), uc_fw->file_selected.path,
+ +				   uc_fw->file_selected.major_ver, uc_fw->file_selected.minor_ver,
+ +				   uc_fw->file_wanted.major_ver, uc_fw->file_wanted.minor_ver);
+  			if (!intel_uc_fw_is_overridden(uc_fw)) {
+  				err = -ENOEXEC;
+  				goto fail;
+* Unmerged path drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c
