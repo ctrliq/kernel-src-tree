@@ -1,0 +1,595 @@
+drm/ast: Create the driver for ASPEED proprietory Display-Port
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author KuoHsiang Chou <kuohsiang_chou@aspeedtech.com>
+commit 594e9c04b5864b4b8b151ef4ba9521c59e0f5c54
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/594e9c04.failed
+
+V1:
+1. The MCU FW controling ASPEED DP is loaded by BMC boot loader.
+2. Driver starts after CR[3:1] == 111b that indicates Tx is ASTDP,
+   and CRD1[5] has been asserted by BMVC boot loader.
+3. EDID is prioritized by DP monitor.
+4. DP's EDID has high priority to decide resolution supporting.
+
+V2:
+Modules description:
+1. ASTDP (ASPEED DisplayPort) is controlled by dedicated
+   AST-MCU (ASPEED propriatary MCU).
+2. MCU is looping in charged of HPD, Read EDID, Link Training with
+   DP sink.
+3. ASTDP and AST-MUC reside in BMC (Baseboard Management controller)
+   addressing-space.
+4. ASPEED DRM driver requests MCU to get HPD and EDID by CR-scratched
+   register.
+
+Booting sequence:
+1. Check if TX is ASTDP					// ast_dp_launch()
+2. Check if DP-MCU FW has loaded					// ast_dp_launch()
+3. Read EDID					// ast_dp_read_edid()
+4. Resolution switch					// ast_dp_SetOutput()
+
+V3:
+1. Remove unneeded semicolon.
+2. Apply to git://anongit.freedesktop.org/drm/drm, instead of
+   git://anongit.freedesktop.org/drm/drm-misc
+3. Resolve auto build test WARNINGs on V1 patch.
+
+V4:
+1. Sync code-base with kernel 5.17_rc6
+2. Remove the define of DPControlPower, because DP chips need to be
+   powered on to be used.
+3. Remove the switches of PHY and Display from EDID procedure.
+4. Revise increaing delay to fixed delay, because this version kernel
+   doesn't detect minitor consistenntly.
+5. Create clean-up code used for reset of power state on errors with
+   -EIO manner.
+6. Revise the DP detection by TX type and its DP-FW status during
+   booting and resume.
+7. Correct the CamelCase Style.
+8. Use register reading while needing, and remove to hold full
+   register.
+9. Instead of 'u8', revise to 'bool' on swwitch of PHY and video.
+10.Correct typo
+11.Remove the duplicated copy of TX definition.
+12.Use EDID_LENGTH as the constant of 128.
+
+	Signed-off-by: KuoHsiang Chou <kuohsiang_chou@aspeedtech.com>
+	Reviewed-by: Thomas Zimmermann <tzimmermann@suse.de>
+	Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220428075603.20904-1-kuohsiang_chou@aspeedtech.com
+(cherry picked from commit 594e9c04b5864b4b8b151ef4ba9521c59e0f5c54)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/ast/Makefile
+#	drivers/gpu/drm/ast/ast_drv.h
+#	drivers/gpu/drm/ast/ast_mode.c
+diff --cc drivers/gpu/drm/ast/Makefile
+index 438a2d05b115,5a53ce51fb24..000000000000
+--- a/drivers/gpu/drm/ast/Makefile
++++ b/drivers/gpu/drm/ast/Makefile
+@@@ -3,6 -3,6 +3,10 @@@
+  # Makefile for the drm device driver.  This driver provides support for the
+  # Direct Rendering Infrastructure (DRI) in XFree86 4.1.0 and higher.
+  
+++<<<<<<< HEAD
+ +ast-y := ast_drv.o ast_main.o ast_mm.o ast_mode.o ast_post.o ast_dp501.o
+++=======
++ ast-y := ast_drv.o ast_i2c.o ast_main.o ast_mm.o ast_mode.o ast_post.o ast_dp501.o ast_dp.o
+++>>>>>>> 594e9c04b586 (drm/ast: Create the driver for ASPEED proprietory Display-Port)
+  
+  obj-$(CONFIG_DRM_AST) := ast.o
+diff --cc drivers/gpu/drm/ast/ast_drv.h
+index 39ca338eb80b,ff1ae314bd0d..000000000000
+--- a/drivers/gpu/drm/ast/ast_drv.h
++++ b/drivers/gpu/drm/ast/ast_drv.h
+@@@ -69,8 -69,8 +69,9 @@@ enum ast_chip 
+  enum ast_tx_chip {
+  	AST_TX_NONE,
+  	AST_TX_SIL164,
+ +	AST_TX_ITE66121,
+  	AST_TX_DP501,
++ 	AST_TX_ASTDP,
+  };
+  
+  #define AST_DRAM_512Mx16 0
+@@@ -163,8 -172,24 +164,29 @@@ struct ast_private 
+  	struct drm_plane primary_plane;
+  	struct ast_cursor_plane cursor_plane;
+  	struct drm_crtc crtc;
+++<<<<<<< HEAD
+ +	struct drm_encoder encoder;
+ +	struct ast_connector connector;
+++=======
++ 	union {
++ 		struct {
++ 			struct drm_encoder encoder;
++ 			struct ast_vga_connector vga_connector;
++ 		} vga;
++ 		struct {
++ 			struct drm_encoder encoder;
++ 			struct ast_sil164_connector sil164_connector;
++ 		} sil164;
++ 		struct {
++ 			struct drm_encoder encoder;
++ 			struct drm_connector connector;
++ 		} dp501;
++ 		struct {
++ 			struct drm_encoder encoder;
++ 			struct drm_connector connector;
++ 		} astdp;
++ 	} output;
+++>>>>>>> 594e9c04b586 (drm/ast: Create the driver for ASPEED proprietory Display-Port)
+  
+  	bool support_wide_screen;
+  	enum {
+@@@ -359,4 -486,14 +484,17 @@@ bool ast_dp501_read_edid(struct drm_dev
+  u8 ast_get_dp501_max_clk(struct drm_device *dev);
+  void ast_init_3rdtx(struct drm_device *dev);
+  
+++<<<<<<< HEAD
+++=======
++ /* ast_i2c.c */
++ struct ast_i2c_chan *ast_i2c_create(struct drm_device *dev);
++ 
++ /* aspeed DP */
++ int ast_astdp_read_edid(struct drm_device *dev, u8 *ediddata);
++ void ast_dp_launch(struct drm_device *dev, u8 bPower);
++ void ast_dp_power_on_off(struct drm_device *dev, bool no);
++ void ast_dp_set_on_off(struct drm_device *dev, bool no);
++ void ast_dp_set_mode(struct drm_crtc *crtc, struct ast_vbios_mode_info *vbios_mode);
++ 
+++>>>>>>> 594e9c04b586 (drm/ast: Create the driver for ASPEED proprietory Display-Port)
+  #endif
+diff --cc drivers/gpu/drm/ast/ast_mode.c
+index 67c0e273b104,4728825b7b67..000000000000
+--- a/drivers/gpu/drm/ast/ast_mode.c
++++ b/drivers/gpu/drm/ast/ast_mode.c
+@@@ -1004,9 -1015,82 +1016,85 @@@ static void ast_crtc_dpms(struct drm_cr
+  		if (ast->tx_chip_type == AST_TX_DP501)
+  			ast_set_dp501_video_output(crtc->dev, 0);
+  		break;
++ 
++ 		if (ast->tx_chip_type == AST_TX_ASTDP) {
++ 			ast_dp_set_on_off(crtc->dev, 0);
++ 			ast_dp_power_on_off(crtc->dev, AST_DP_POWER_OFF);
++ 		}
++ 
++ 		ast_set_index_reg_mask(ast, AST_IO_SEQ_PORT,  0x01, 0xdf, 0x20);
++ 		ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xb6, 0xfc, ch);
++ 	}
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ static enum drm_mode_status
++ ast_crtc_helper_mode_valid(struct drm_crtc *crtc, const struct drm_display_mode *mode)
++ {
++ 	struct ast_private *ast = to_ast_private(crtc->dev);
++ 	enum drm_mode_status status;
++ 	uint32_t jtemp;
++ 
++ 	if (ast->support_wide_screen) {
++ 		if ((mode->hdisplay == 1680) && (mode->vdisplay == 1050))
++ 			return MODE_OK;
++ 		if ((mode->hdisplay == 1280) && (mode->vdisplay == 800))
++ 			return MODE_OK;
++ 		if ((mode->hdisplay == 1440) && (mode->vdisplay == 900))
++ 			return MODE_OK;
++ 		if ((mode->hdisplay == 1360) && (mode->vdisplay == 768))
++ 			return MODE_OK;
++ 		if ((mode->hdisplay == 1600) && (mode->vdisplay == 900))
++ 			return MODE_OK;
++ 
++ 		if ((ast->chip == AST2100) || (ast->chip == AST2200) ||
++ 		    (ast->chip == AST2300) || (ast->chip == AST2400) ||
++ 		    (ast->chip == AST2500) || (ast->chip == AST2600)) {
++ 			if ((mode->hdisplay == 1920) && (mode->vdisplay == 1080))
++ 				return MODE_OK;
++ 
++ 			if ((mode->hdisplay == 1920) && (mode->vdisplay == 1200)) {
++ 				jtemp = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xd1, 0xff);
++ 				if (jtemp & 0x01)
++ 					return MODE_NOMODE;
++ 				else
++ 					return MODE_OK;
++ 			}
++ 		}
++ 	}
++ 
++ 	status = MODE_NOMODE;
++ 
++ 	switch (mode->hdisplay) {
++ 	case 640:
++ 		if (mode->vdisplay == 480)
++ 			status = MODE_OK;
++ 		break;
++ 	case 800:
++ 		if (mode->vdisplay == 600)
++ 			status = MODE_OK;
++ 		break;
++ 	case 1024:
++ 		if (mode->vdisplay == 768)
++ 			status = MODE_OK;
++ 		break;
++ 	case 1280:
++ 		if (mode->vdisplay == 1024)
++ 			status = MODE_OK;
++ 		break;
++ 	case 1600:
++ 		if (mode->vdisplay == 1200)
++ 			status = MODE_OK;
++ 		break;
++ 	default:
++ 		break;
+  	}
++ 
++ 	return status;
+  }
+  
+++>>>>>>> 594e9c04b586 (drm/ast: Create the driver for ASPEED proprietory Display-Port)
+  static int ast_crtc_helper_atomic_check(struct drm_crtc *crtc,
+  					struct drm_atomic_state *state)
+  {
+@@@ -1404,8 -1696,23 +1585,28 @@@ int ast_mode_config_init(struct ast_pri
+  		return ret;
+  
+  	ast_crtc_init(dev);
+++<<<<<<< HEAD
+ +	ast_encoder_init(dev);
+ +	ast_connector_init(dev);
+++=======
++ 
++ 	switch (ast->tx_chip_type) {
++ 	case AST_TX_NONE:
++ 		ret = ast_vga_output_init(ast);
++ 		break;
++ 	case AST_TX_SIL164:
++ 		ret = ast_sil164_output_init(ast);
++ 		break;
++ 	case AST_TX_DP501:
++ 		ret = ast_dp501_output_init(ast);
++ 		break;
++ 	case AST_TX_ASTDP:
++ 		ret = ast_astdp_output_init(ast);
++ 		break;
++ 	}
++ 	if (ret)
++ 		return ret;
+++>>>>>>> 594e9c04b586 (drm/ast: Create the driver for ASPEED proprietory Display-Port)
+  
+  	drm_mode_config_reset(dev);
+  
+* Unmerged path drivers/gpu/drm/ast/Makefile
+diff --git a/drivers/gpu/drm/ast/ast_dp.c b/drivers/gpu/drm/ast/ast_dp.c
+new file mode 100644
+index 000000000000..4551bc8a3ecf
+--- /dev/null
++++ b/drivers/gpu/drm/ast/ast_dp.c
+@@ -0,0 +1,282 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (c) 2021, ASPEED Technology Inc.
++// Authors: KuoHsiang Chou <kuohsiang_chou@aspeedtech.com>
++
++#include <linux/firmware.h>
++#include <linux/delay.h>
++#include <drm/drm_print.h>
++#include "ast_drv.h"
++
++int ast_astdp_read_edid(struct drm_device *dev, u8 *ediddata)
++{
++	struct ast_private *ast = to_ast_private(dev);
++	u8 i = 0, j = 0;
++
++	/*
++	 * CRD1[b5]: DP MCU FW is executing
++	 * CRDC[b0]: DP link success
++	 * CRDF[b0]: DP HPD
++	 * CRE5[b0]: Host reading EDID process is done
++	 */
++	if (!(ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xD1, ASTDP_MCU_FW_EXECUTING) &&
++		ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xDC, ASTDP_LINK_SUCCESS) &&
++		ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xDF, ASTDP_HPD) &&
++		ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xE5,
++								ASTDP_HOST_EDID_READ_DONE_MASK))) {
++		goto err_astdp_edid_not_ready;
++	}
++
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xE5, (u8) ~ASTDP_HOST_EDID_READ_DONE_MASK,
++							0x00);
++
++	for (i = 0; i < 32; i++) {
++		/*
++		 * CRE4[7:0]: Read-Pointer for EDID (Unit: 4bytes); valid range: 0~64
++		 */
++		ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xE4,
++					(u8) ~ASTDP_EDID_READ_POINTER_MASK, (u8) i);
++		j = 0;
++
++		/*
++		 * CRD7[b0]: valid flag for EDID
++		 * CRD6[b0]: mirror read pointer for EDID
++		 */
++		while ((ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xD7,
++				ASTDP_EDID_VALID_FLAG_MASK) != 0x01) ||
++			(ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xD6,
++						ASTDP_EDID_READ_POINTER_MASK) != i)) {
++			/*
++			 * Delay are getting longer with each retry.
++			 * 1. The Delays are often 2 loops when users request "Display Settings"
++			 *	  of right-click of mouse.
++			 * 2. The Delays are often longer a lot when system resume from S3/S4.
++			 */
++			mdelay(j+1);
++
++			if (!(ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xD1,
++							ASTDP_MCU_FW_EXECUTING) &&
++				ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xDC,
++							ASTDP_LINK_SUCCESS) &&
++				ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xDF, ASTDP_HPD))) {
++				goto err_astdp_jump_out_loop_of_edid;
++			}
++
++			j++;
++			if (j > 200)
++				goto err_astdp_jump_out_loop_of_edid;
++		}
++
++		*(ediddata) = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT,
++							0xD8, ASTDP_EDID_READ_DATA_MASK);
++		*(ediddata + 1) = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xD9,
++								ASTDP_EDID_READ_DATA_MASK);
++		*(ediddata + 2) = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xDA,
++								ASTDP_EDID_READ_DATA_MASK);
++		*(ediddata + 3) = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xDB,
++								ASTDP_EDID_READ_DATA_MASK);
++
++		if (i == 31) {
++			/*
++			 * For 128-bytes EDID_1.3,
++			 * 1. Add the value of Bytes-126 to Bytes-127.
++			 *		The Bytes-127 is Checksum. Sum of all 128bytes should
++			 *		equal 0	(mod 256).
++			 * 2. Modify Bytes-126 to be 0.
++			 *		The Bytes-126 indicates the Number of extensions to
++			 *		follow. 0 represents noextensions.
++			 */
++			*(ediddata + 3) = *(ediddata + 3) + *(ediddata + 2);
++			*(ediddata + 2) = 0;
++		}
++
++		ediddata += 4;
++	}
++
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xE5, (u8) ~ASTDP_HOST_EDID_READ_DONE_MASK,
++							ASTDP_HOST_EDID_READ_DONE);
++
++	return 0;
++
++err_astdp_jump_out_loop_of_edid:
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xE5,
++							(u8) ~ASTDP_HOST_EDID_READ_DONE_MASK,
++							ASTDP_HOST_EDID_READ_DONE);
++	return (~(j+256) + 1);
++
++err_astdp_edid_not_ready:
++	if (!(ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xD1, ASTDP_MCU_FW_EXECUTING)))
++		return (~0xD1 + 1);
++	if (!(ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xDC, ASTDP_LINK_SUCCESS)))
++		return (~0xDC + 1);
++	if (!(ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xDF, ASTDP_HPD)))
++		return (~0xDF + 1);
++	if (!(ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xE5, ASTDP_HOST_EDID_READ_DONE_MASK)))
++		return (~0xE5 + 1);
++
++	return	0;
++}
++
++/*
++ * Launch Aspeed DP
++ */
++void ast_dp_launch(struct drm_device *dev, u8 bPower)
++{
++	u32 i = 0, j = 0, WaitCount = 1;
++	u8 bDPTX = 0;
++	u8 bDPExecute = 1;
++
++	struct ast_private *ast = to_ast_private(dev);
++	// S3 come back, need more time to wait BMC ready.
++	if (bPower)
++		WaitCount = 300;
++
++
++	// Wait total count by different condition.
++	for (j = 0; j < WaitCount; j++) {
++		bDPTX = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xD1, TX_TYPE_MASK);
++
++		if (bDPTX)
++			break;
++
++		msleep(100);
++	}
++
++	// 0xE : ASTDP with DPMCU FW handling
++	if (bDPTX == ASTDP_DPMCU_TX) {
++		// Wait one second then timeout.
++		i = 0;
++
++		while (ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xD1, COPROCESSOR_LAUNCH) !=
++			COPROCESSOR_LAUNCH) {
++			i++;
++			// wait 100 ms
++			msleep(100);
++
++			if (i >= 10) {
++				// DP would not be ready.
++				bDPExecute = 0;
++				break;
++			}
++		}
++
++		if (bDPExecute)
++			ast->tx_chip_type = AST_TX_ASTDP;
++
++		ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xE5,
++							(u8) ~ASTDP_HOST_EDID_READ_DONE_MASK,
++							ASTDP_HOST_EDID_READ_DONE);
++	} else
++		ast->tx_chip_type = AST_TX_NONE;
++}
++
++
++
++void ast_dp_power_on_off(struct drm_device *dev, bool on)
++{
++	struct ast_private *ast = to_ast_private(dev);
++	// Read and Turn off DP PHY sleep
++	u8 bE3 = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xE3, AST_DP_VIDEO_ENABLE);
++
++	// Turn on DP PHY sleep
++	if (!on)
++		bE3 |= AST_DP_PHY_SLEEP;
++
++	// DP Power on/off
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xE3, (u8) ~AST_DP_PHY_SLEEP, bE3);
++}
++
++
++
++void ast_dp_set_on_off(struct drm_device *dev, bool on)
++{
++	struct ast_private *ast = to_ast_private(dev);
++	u8 video_on_off = on;
++
++	// Video On/Off
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xE3, (u8) ~AST_DP_VIDEO_ENABLE, on);
++
++	// If DP plug in and link successful then check video on / off status
++	if (ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xDC, ASTDP_LINK_SUCCESS) &&
++		ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xDF, ASTDP_HPD)) {
++		video_on_off <<= 4;
++		while (ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xDF,
++						ASTDP_MIRROR_VIDEO_ENABLE) != video_on_off) {
++			// wait 1 ms
++			mdelay(1);
++		}
++	}
++}
++
++void ast_dp_set_mode(struct drm_crtc *crtc, struct ast_vbios_mode_info *vbios_mode)
++{
++	struct ast_private *ast = to_ast_private(crtc->dev);
++
++	u32 ulRefreshRateIndex;
++	u8 ModeIdx;
++
++	ulRefreshRateIndex = vbios_mode->enh_table->refresh_rate_index - 1;
++
++	switch (crtc->mode.crtc_hdisplay) {
++	case 320:
++		ModeIdx = ASTDP_320x240_60;
++		break;
++	case 400:
++		ModeIdx = ASTDP_400x300_60;
++		break;
++	case 512:
++		ModeIdx = ASTDP_512x384_60;
++		break;
++	case 640:
++		ModeIdx = (ASTDP_640x480_60 + (u8) ulRefreshRateIndex);
++		break;
++	case 800:
++		ModeIdx = (ASTDP_800x600_56 + (u8) ulRefreshRateIndex);
++		break;
++	case 1024:
++		ModeIdx = (ASTDP_1024x768_60 + (u8) ulRefreshRateIndex);
++		break;
++	case 1152:
++		ModeIdx = ASTDP_1152x864_75;
++		break;
++	case 1280:
++		if (crtc->mode.crtc_vdisplay == 800)
++			ModeIdx = (ASTDP_1280x800_60_RB - (u8) ulRefreshRateIndex);
++		else		// 1024
++			ModeIdx = (ASTDP_1280x1024_60 + (u8) ulRefreshRateIndex);
++		break;
++	case 1360:
++	case 1366:
++		ModeIdx = ASTDP_1366x768_60;
++		break;
++	case 1440:
++		ModeIdx = (ASTDP_1440x900_60_RB - (u8) ulRefreshRateIndex);
++		break;
++	case 1600:
++		if (crtc->mode.crtc_vdisplay == 900)
++			ModeIdx = (ASTDP_1600x900_60_RB - (u8) ulRefreshRateIndex);
++		else		//1200
++			ModeIdx = ASTDP_1600x1200_60;
++		break;
++	case 1680:
++		ModeIdx = (ASTDP_1680x1050_60_RB - (u8) ulRefreshRateIndex);
++		break;
++	case 1920:
++		if (crtc->mode.crtc_vdisplay == 1080)
++			ModeIdx = ASTDP_1920x1080_60;
++		else		//1200
++			ModeIdx = ASTDP_1920x1200_60;
++		break;
++	default:
++		return;
++	}
++
++	/*
++	 * CRE0[7:0]: MISC0 ((0x00: 18-bpp) or (0x20: 24-bpp)
++	 * CRE1[7:0]: MISC1 (default: 0x00)
++	 * CRE2[7:0]: video format index (0x00 ~ 0x20 or 0x40 ~ 0x50)
++	 */
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xE0, (u8) ~ASTDP_CLEAR_MASK,
++				ASTDP_MISC0_24bpp);
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xE1, (u8) ~ASTDP_CLEAR_MASK, ASTDP_MISC1);
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xE2, (u8) ~ASTDP_CLEAR_MASK, ModeIdx);
++}
+* Unmerged path drivers/gpu/drm/ast/ast_drv.h
+diff --git a/drivers/gpu/drm/ast/ast_main.c b/drivers/gpu/drm/ast/ast_main.c
+index 79a361867955..9f25fa2c84c7 100644
+--- a/drivers/gpu/drm/ast/ast_main.c
++++ b/drivers/gpu/drm/ast/ast_main.c
+@@ -230,7 +230,7 @@ static int ast_detect_chip(struct drm_device *dev, bool *need_post)
+ 			ast->tx_chip_type = AST_TX_SIL164;
+ 	}
+ 
+-	if ((ast->chip == AST2300) || (ast->chip == AST2400)) {
++	if ((ast->chip == AST2300) || (ast->chip == AST2400) || (ast->chip == AST2500)) {
+ 		/*
+ 		 * On AST2300 and 2400, look the configuration set by the SoC in
+ 		 * the SOC scratch register #1 bits 11:8 (interestingly marked
+@@ -254,7 +254,8 @@ static int ast_detect_chip(struct drm_device *dev, bool *need_post)
+ 		case 0x0c:
+ 			ast->tx_chip_type = AST_TX_DP501;
+ 		}
+-	}
++	} else if (ast->chip == AST2600)
++		ast_dp_launch(&ast->base, 0);
+ 
+ 	/* Print stuff for diagnostic purposes */
+ 	switch(ast->tx_chip_type) {
+* Unmerged path drivers/gpu/drm/ast/ast_mode.c
+diff --git a/drivers/gpu/drm/ast/ast_post.c b/drivers/gpu/drm/ast/ast_post.c
+index b5d92f652fd8..0aa9cf0fb5c3 100644
+--- a/drivers/gpu/drm/ast/ast_post.c
++++ b/drivers/gpu/drm/ast/ast_post.c
+@@ -379,7 +379,9 @@ void ast_post_gpu(struct drm_device *dev)
+ 	ast_enable_mmio(dev);
+ 	ast_set_def_ext_reg(dev);
+ 
+-	if (ast->config_mode == ast_use_p2a) {
++	if (ast->chip == AST2600) {
++		ast_dp_launch(dev, 1);
++	} else if (ast->config_mode == ast_use_p2a) {
+ 		if (ast->chip == AST2500)
+ 			ast_post_chip_2500(dev);
+ 		else if (ast->chip == AST2300 || ast->chip == AST2400)
