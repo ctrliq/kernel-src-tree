@@ -79,6 +79,7 @@
 #define MMIO_INTCAPXT_EVT_OFFSET	0x0170
 #define MMIO_INTCAPXT_PPR_OFFSET	0x0178
 #define MMIO_INTCAPXT_GALOG_OFFSET	0x0180
+#define MMIO_EXT_FEATURES2	0x01A0
 #define MMIO_CMD_HEAD_OFFSET	0x2000
 #define MMIO_CMD_TAIL_OFFSET	0x2008
 #define MMIO_EVT_HEAD_OFFSET	0x2010
@@ -654,6 +655,9 @@ struct amd_iommu {
 
 	/* Extended features */
 	u64 features;
+
+	/* Extended features 2 */
+	u64 features2;
 
 	/* IOMMUv2 */
 	bool is_iommu_v2;
