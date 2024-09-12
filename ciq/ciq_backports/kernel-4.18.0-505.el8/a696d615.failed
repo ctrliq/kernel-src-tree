@@ -1,0 +1,157 @@
+ice: stop hard coding the ICE_VSI_CTRL location
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-505.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit a696d61528f08d2fac221dcb618495f43cccdcb3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-505.el8/a696d615.failed
+
+When allocating the ICE_VSI_CTRL, the allocated struct ice_vsi pointer is
+stored into the PF's pf->vsi array at a fixed location. This was
+historically done on the basis that it could provide an O(1) lookup for the
+special control VSI.
+
+Since we store the ctrl_vsi_idx, we already have O(1) lookup regardless of
+where in the array we store this VSI.
+
+Simplify the logic in ice_vsi_alloc by using the same method of storing the
+control VSI as other types of VSIs.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Signed-off-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+	Tested-by: Gurucharan G <gurucharanx.g@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit a696d61528f08d2fac221dcb618495f43cccdcb3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_lib.c
+diff --cc drivers/net/ethernet/intel/ice/ice_lib.c
+index 5a7867ad1ffd,528783de0df0..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@@ -379,11 -479,9 +379,8 @@@ int ice_vsi_clear(struct ice_vsi *vsi
+  	/* updates the PF for this cleared VSI */
+  
+  	pf->vsi[vsi->idx] = NULL;
+- 	if (vsi->idx < pf->next_vsi && vsi->type != ICE_VSI_CTRL)
+- 		pf->next_vsi = vsi->idx;
+- 	if (vsi->idx < pf->next_vsi && vsi->type == ICE_VSI_CTRL && vsi->vf)
+- 		pf->next_vsi = vsi->idx;
++ 	pf->next_vsi = vsi->idx;
+  
+ -	ice_vsi_free_stats(vsi);
+  	ice_vsi_free_arrays(vsi);
+  	mutex_unlock(&pf->sw_mutex);
+  	devm_kfree(dev, vsi);
+@@@ -488,83 -682,28 +485,100 @@@ ice_vsi_alloc(struct ice_pf *pf, enum i
+  
+  	vsi->type = vsi_type;
+  	vsi->back = pf;
+ -	vsi->port_info = pi;
+ -	/* For VSIs which don't have a connected VF, this will be NULL */
+ -	vsi->vf = vf;
+  	set_bit(ICE_VSI_DOWN, vsi->state);
+  
+++<<<<<<< HEAD
+ +	if (vsi_type == ICE_VSI_VF)
+ +		ice_vsi_set_num_qs(vsi, vf);
+ +	else if (vsi_type != ICE_VSI_CHNL)
+ +		ice_vsi_set_num_qs(vsi, NULL);
+ +
+ +	switch (vsi->type) {
+ +	case ICE_VSI_SWITCHDEV_CTRL:
+ +		if (ice_vsi_alloc_arrays(vsi))
+ +			goto err_rings;
+ +
+ +		/* Setup eswitch MSIX irq handler for VSI */
+ +		vsi->irq_handler = ice_eswitch_msix_clean_rings;
+ +		break;
+ +	case ICE_VSI_PF:
+ +		if (ice_vsi_alloc_arrays(vsi))
+ +			goto err_rings;
+ +
+ +		/* Setup default MSIX irq handler for VSI */
+ +		vsi->irq_handler = ice_msix_clean_rings;
+ +		break;
+ +	case ICE_VSI_CTRL:
+ +		if (ice_vsi_alloc_arrays(vsi))
+ +			goto err_rings;
+ +
+ +		/* Setup ctrl VSI MSIX irq handler */
+ +		vsi->irq_handler = ice_msix_clean_ctrl_vsi;
+ +
+ +		/* For the PF control VSI this is NULL, for the VF control VSI
+ +		 * this will be the first VF to allocate it.
+ +		 */
+ +		vsi->vf = vf;
+ +		break;
+ +	case ICE_VSI_VF:
+ +		if (ice_vsi_alloc_arrays(vsi))
+ +			goto err_rings;
+ +		vsi->vf = vf;
+ +		break;
+ +	case ICE_VSI_CHNL:
+ +		if (!ch)
+ +			goto err_rings;
+ +		vsi->num_rxq = ch->num_rxq;
+ +		vsi->num_txq = ch->num_txq;
+ +		vsi->next_base_q = ch->base_q;
+ +		break;
+ +	case ICE_VSI_LB:
+ +		if (ice_vsi_alloc_arrays(vsi))
+ +			goto err_rings;
+ +		break;
+ +	default:
+ +		dev_warn(dev, "Unknown VSI type %d\n", vsi->type);
+ +		goto unlock_pf;
+ +	}
+ +
+ +	if (vsi->type == ICE_VSI_CTRL && !vf) {
+ +		/* Use the last VSI slot as the index for PF control VSI */
+ +		vsi->idx = pf->num_alloc_vsi - 1;
+ +		pf->ctrl_vsi_idx = vsi->idx;
+ +		pf->vsi[vsi->idx] = vsi;
+ +	} else {
+ +		/* fill slot and make note of the index */
+ +		vsi->idx = pf->next_vsi;
+ +		pf->vsi[pf->next_vsi] = vsi;
+- 
+- 		/* prepare pf->next_vsi for next use */
+- 		pf->next_vsi = ice_get_free_slot(pf->vsi, pf->num_alloc_vsi,
+- 						 pf->next_vsi);
+++=======
++ 	/* fill slot and make note of the index */
++ 	vsi->idx = pf->next_vsi;
++ 	pf->vsi[pf->next_vsi] = vsi;
+++>>>>>>> a696d61528f0 (ice: stop hard coding the ICE_VSI_CTRL location)
++ 
++ 	/* prepare pf->next_vsi for next use */
++ 	pf->next_vsi = ice_get_free_slot(pf->vsi, pf->num_alloc_vsi,
++ 					 pf->next_vsi);
++ 
++ 	if (vsi->type == ICE_VSI_CTRL) {
++ 		if (vf) {
++ 			vf->ctrl_vsi_idx = vsi->idx;
++ 		} else {
++ 			WARN_ON(pf->ctrl_vsi_idx != ICE_NO_VSI);
++ 			pf->ctrl_vsi_idx = vsi->idx;
++ 		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (vsi->type == ICE_VSI_CTRL && vf)
+ +		vf->ctrl_vsi_idx = vsi->idx;
+ +	goto unlock_pf;
+ +
+ +err_rings:
+ +	devm_kfree(dev, vsi);
+ +	vsi = NULL;
+++=======
+++>>>>>>> a696d61528f0 (ice: stop hard coding the ICE_VSI_CTRL location)
+  unlock_pf:
+  	mutex_unlock(&pf->sw_mutex);
+  	return vsi;
+* Unmerged path drivers/net/ethernet/intel/ice/ice_lib.c
