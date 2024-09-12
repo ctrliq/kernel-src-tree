@@ -1,0 +1,206 @@
+md/raid1-10: limit the number of plugged bio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-536.el8
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit 460af1f9d9e62acce4a21f9bd00b5bcd5963bcd4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-536.el8/460af1f9.failed
+
+bio can be added to plug infinitely, and following writeback test can
+trigger huge amount of plugged bio:
+
+Test script:
+modprobe brd rd_nr=4 rd_size=10485760
+mdadm -CR /dev/md0 -l10 -n4 /dev/ram[0123] --assume-clean --bitmap=internal
+echo 0 > /proc/sys/vm/dirty_background_ratio
+fio -filename=/dev/md0 -ioengine=libaio -rw=write -bs=4k -numjobs=1 -iodepth=128 -name=test
+
+Test result:
+Monitor /sys/block/md0/inflight will found that inflight keep increasing
+until fio finish writing, after running for about 2 minutes:
+
+[root@fedora ~]# cat /sys/block/md0/inflight
+       0  4474191
+
+Fix the problem by limiting the number of plugged bio based on the number
+of copies for original bio.
+
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+	Signed-off-by: Song Liu <song@kernel.org>
+Link: https://lore.kernel.org/r/20230529131106.2123367-8-yukuai1@huaweicloud.com
+(cherry picked from commit 460af1f9d9e62acce4a21f9bd00b5bcd5963bcd4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1-10.c
+#	drivers/md/raid1.c
+#	drivers/md/raid10.c
+diff --cc drivers/md/raid1-10.c
+index b2d6a269dec4,169ebe296f2d..000000000000
+--- a/drivers/md/raid1-10.c
++++ b/drivers/md/raid1-10.c
+@@@ -21,19 -21,20 +21,29 @@@
+  #define IO_MADE_GOOD ((struct bio *)2)
+  
+  #define BIO_SPECIAL(bio) ((unsigned long)bio <= 2)
++ #define MAX_PLUG_BIO 32
+  
+ +/* When there are this many requests queue to be written by
+ + * the raid thread, we become 'congested' to provide back-pressure
+ + * for writeback.
+ + */
+ +static int max_queued_requests = 1024;
+ +
+  /* for managing resync I/O pages */
+  struct resync_pages {
+  	void		*raid_bio;
+  	struct page	*pages[RESYNC_PAGES];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct raid1_plug_cb {
++ 	struct blk_plug_cb	cb;
++ 	struct bio_list		pending;
++ 	unsigned int		count;
++ };
++ 
+++>>>>>>> 460af1f9d9e6 (md/raid1-10: limit the number of plugged bio)
+  static void rbio_pool_free(void *rbio, void *data)
+  {
+  	kfree(rbio);
+@@@ -111,3 -112,64 +121,67 @@@ static void md_bio_reset_resync_pages(s
+  		size -= len;
+  	} while (idx++ < RESYNC_PAGES && size > 0);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ 
++ static inline void raid1_submit_write(struct bio *bio)
++ {
++ 	struct md_rdev *rdev = (struct md_rdev *)bio->bi_bdev;
++ 
++ 	bio->bi_next = NULL;
++ 	bio_set_dev(bio, rdev->bdev);
++ 	if (test_bit(Faulty, &rdev->flags))
++ 		bio_io_error(bio);
++ 	else if (unlikely(bio_op(bio) ==  REQ_OP_DISCARD &&
++ 			  !bdev_max_discard_sectors(bio->bi_bdev)))
++ 		/* Just ignore it */
++ 		bio_endio(bio);
++ 	else
++ 		submit_bio_noacct(bio);
++ }
++ 
++ static inline bool raid1_add_bio_to_plug(struct mddev *mddev, struct bio *bio,
++ 				      blk_plug_cb_fn unplug, int copies)
++ {
++ 	struct raid1_plug_cb *plug = NULL;
++ 	struct blk_plug_cb *cb;
++ 
++ 	/*
++ 	 * If bitmap is not enabled, it's safe to submit the io directly, and
++ 	 * this can get optimal performance.
++ 	 */
++ 	if (!md_bitmap_enabled(mddev->bitmap)) {
++ 		raid1_submit_write(bio);
++ 		return true;
++ 	}
++ 
++ 	cb = blk_check_plugged(unplug, mddev, sizeof(*plug));
++ 	if (!cb)
++ 		return false;
++ 
++ 	plug = container_of(cb, struct raid1_plug_cb, cb);
++ 	bio_list_add(&plug->pending, bio);
++ 	if (++plug->count / MAX_PLUG_BIO >= copies) {
++ 		list_del(&cb->list);
++ 		cb->callback(cb, false);
++ 	}
++ 
++ 
++ 	return true;
++ }
++ 
++ /*
++  * current->bio_list will be set under submit_bio() context, in this case bitmap
++  * io will be added to the list and wait for current io submission to finish,
++  * while current io submission must wait for bitmap io to be done. In order to
++  * avoid such deadlock, submit bitmap io asynchronously.
++  */
++ static inline void raid1_prepare_flush_writes(struct bitmap *bitmap)
++ {
++ 	if (current->bio_list)
++ 		md_bitmap_unplug_async(bitmap);
++ 	else
++ 		md_bitmap_unplug(bitmap);
++ }
+++>>>>>>> 460af1f9d9e6 (md/raid1-10: limit the number of plugged bio)
+diff --cc drivers/md/raid1.c
+index f1e614f61aa9,dd25832eb045..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -1621,24 -1561,13 +1621,29 @@@ static void raid1_write_request(struct 
+  		atomic_inc(&r1_bio->remaining);
+  
+  		if (mddev->gendisk)
+ -			trace_block_bio_remap(mbio, disk_devt(mddev->gendisk),
+ +			trace_block_bio_remap(mbio->bi_disk->queue,
+ +					      mbio, disk_devt(mddev->gendisk),
+  					      r1_bio->sector);
+  		/* flush_pending_writes() needs access to the rdev so...*/
+++<<<<<<< HEAD
+ +		mbio->bi_disk = (void *)rdev;
+ +
+ +		cb = blk_check_plugged(raid1_unplug, mddev, sizeof(*plug));
+ +		if (cb)
+ +			plug = container_of(cb, struct raid1_plug_cb, cb);
+ +		else
+ +			plug = NULL;
+ +		if (plug) {
+ +			bio_list_add(&plug->pending, mbio);
+ +			plug->pending_cnt++;
+ +		} else {
+++=======
++ 		mbio->bi_bdev = (void *)rdev;
++ 		if (!raid1_add_bio_to_plug(mddev, mbio, raid1_unplug, disks)) {
+++>>>>>>> 460af1f9d9e6 (md/raid1-10: limit the number of plugged bio)
+  			spin_lock_irqsave(&conf->device_lock, flags);
+  			bio_list_add(&conf->pending_bio_list, mbio);
+ +			conf->pending_count++;
+  			spin_unlock_irqrestore(&conf->device_lock, flags);
+  			md_wakeup_thread(mddev->thread);
+  		}
+diff --cc drivers/md/raid10.c
+index adefeb0e43ad,d0de8c9fb3cf..000000000000
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@@ -1373,18 -1314,9 +1373,22 @@@ static void raid10_write_one_disk(struc
+  
+  	atomic_inc(&r10_bio->remaining);
+  
+++<<<<<<< HEAD
+ +	cb = blk_check_plugged(raid10_unplug, mddev, sizeof(*plug));
+ +	if (cb)
+ +		plug = container_of(cb, struct raid10_plug_cb, cb);
+ +	else
+ +		plug = NULL;
+ +	if (plug) {
+ +		bio_list_add(&plug->pending, mbio);
+ +		plug->pending_cnt++;
+ +	} else {
+++=======
++ 	if (!raid1_add_bio_to_plug(mddev, mbio, raid10_unplug, conf->copies)) {
+++>>>>>>> 460af1f9d9e6 (md/raid1-10: limit the number of plugged bio)
+  		spin_lock_irqsave(&conf->device_lock, flags);
+  		bio_list_add(&conf->pending_bio_list, mbio);
+ +		conf->pending_count++;
+  		spin_unlock_irqrestore(&conf->device_lock, flags);
+  		md_wakeup_thread(mddev->thread);
+  	}
+* Unmerged path drivers/md/raid1-10.c
+* Unmerged path drivers/md/raid1.c
+* Unmerged path drivers/md/raid10.c
