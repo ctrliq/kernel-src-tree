@@ -1,0 +1,95 @@
+selinux: make labeled NFS work when mounted before policy load
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-508.el8
+commit-author Ondrej Mosnacek <omosnace@redhat.com>
+commit cec5fe700799b3f863d25cf883f02e5735598ab5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-508.el8/cec5fe70.failed
+
+Currently, when an NFS filesystem that supports passing LSM/SELinux
+labels is mounted during early boot (before the SELinux policy is
+loaded), it ends up mounted without the labeling support (i.e. with
+Fedora policy all files get the generic NFS label
+system_u:object_r:nfs_t:s0).
+
+This is because the information that the NFS mount supports passing
+labels (communicated to the LSM layer via the kern_flags argument of
+security_set_mnt_opts()) gets lost and when the policy is loaded the
+mount is initialized as if the passing is not supported.
+
+Fix this by noting the "native labeling" in newsbsec->flags (using a new
+SE_SBNATIVE flag) on the pre-policy-loaded call of
+selinux_set_mnt_opts() and then making sure it is respected on the
+second call from delayed_superblock_init().
+
+Additionally, make inode_doinit_with_dentry() initialize the inode's
+label from its extended attributes whenever it doesn't find it already
+intitialized by the filesystem. This is needed to properly initialize
+pre-existing inodes when delayed_superblock_init() is called. It should
+not trigger in any other cases (and if it does, it's still better to
+initialize the correct label instead of leaving the inode unlabeled).
+
+Fixes: eb9ae686507b ("SELinux: Add new labeling type native labels")
+	Tested-by: Scott Mayhew <smayhew@redhat.com>
+	Signed-off-by: Ondrej Mosnacek <omosnace@redhat.com>
+[PM: fixed 'Fixes' tag format]
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit cec5fe700799b3f863d25cf883f02e5735598ab5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/hooks.c
+diff --cc security/selinux/hooks.c
+index cd2d2c96a405,d06e350fedee..000000000000
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@@ -616,9 -605,16 +616,16 @@@ static int selinux_set_mnt_opts(struct 
+  	u32 defcontext_sid = 0;
+  	int rc = 0;
+  
++ 	/*
++ 	 * Specifying internal flags without providing a place to
++ 	 * place the results is not allowed
++ 	 */
++ 	if (kern_flags && !set_kern_flags)
++ 		return -EINVAL;
++ 
+  	mutex_lock(&sbsec->lock);
+  
+ -	if (!selinux_initialized()) {
+ +	if (!selinux_initialized(&selinux_state)) {
+  		if (!opts) {
+  			/* Defer initialization until selinux_complete_init,
+  			   after the initial policy is loaded and the security
+@@@ -883,13 -884,6 +898,16 @@@ static int selinux_sb_clone_mnt_opts(co
+  	int set_rootcontext =	(oldsbsec->flags & ROOTCONTEXT_MNT);
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * if the parent was able to be mounted it clearly had no special lsm
+ +	 * mount options.  thus we can safely deal with this superblock later
+ +	 */
+ +	if (!selinux_initialized(&selinux_state))
+ +		return 0;
+ +
+ +	/*
+++=======
+++>>>>>>> cec5fe700799 (selinux: make labeled NFS work when mounted before policy load)
+  	 * Specifying internal flags without providing a place to
+  	 * place the results is not allowed.
+  	 */
+* Unmerged path security/selinux/hooks.c
+diff --git a/security/selinux/include/security.h b/security/selinux/include/security.h
+index 9cecef21a01c..2b571159543a 100644
+--- a/security/selinux/include/security.h
++++ b/security/selinux/include/security.h
+@@ -62,6 +62,7 @@
+ #define SE_SBPROC		0x0200
+ #define SE_SBGENFS		0x0400
+ #define SE_SBGENFS_XATTR	0x0800
++#define SE_SBNATIVE		0x1000
+ 
+ /* RHEL8-only */
+ #define SE_SBGENFS_SYMLINKS	0x8000
