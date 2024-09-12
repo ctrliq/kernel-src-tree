@@ -1,0 +1,275 @@
+drm/vmwgfx: Simplify fb pinning
+
+jira LE-1907
+cve CVE-2023-5633
+Rebuild_History Non-Buildable kernel-4.18.0-529.el8
+commit-author Zack Rusin <zackr@vmware.com>
+commit 6703e28f976d9240311ad260a73504bdc6f6a74b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-529.el8/6703e28f.failed
+
+Only the legacy display unit requires pinning of the fb memory in vram.
+Both the screen objects and screen targets can present from any buffer.
+That makes the pinning abstraction pointless. Simplify all of the code
+and move it to the legacy display unit, the only place that needs it.
+
+	Signed-off-by: Zack Rusin <zackr@vmware.com>
+	Reviewed-by: Martin Krastev <krastevm@vmware.com>
+	Reviewed-by: Maaz Mombasawala <mombasawalam@vmware.com>
+	Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230131033542.953249-5-zack@kde.org
+(cherry picked from commit 6703e28f976d9240311ad260a73504bdc6f6a74b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+#	drivers/gpu/drm/vmwgfx/vmwgfx_bo.h
+#	drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+diff --cc drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+index 5c5d3efb662a,4beaaf4326d4..000000000000
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+@@@ -72,10 -73,10 +72,17 @@@ static bool bo_is_vmw(struct ttm_buffer
+   * Return: Zero on success, Negative error code on failure. In particular
+   * -ERESTARTSYS if interrupted by a signal
+   */
+++<<<<<<< HEAD
+ +int vmw_bo_pin_in_placement(struct vmw_private *dev_priv,
+ +			    struct vmw_buffer_object *buf,
+ +			    struct ttm_placement *placement,
+ +			    bool interruptible)
+++=======
++ static int vmw_bo_pin_in_placement(struct vmw_private *dev_priv,
++ 				   struct vmw_bo *buf,
++ 				   struct ttm_placement *placement,
++ 				   bool interruptible)
+++>>>>>>> 6703e28f976d (drm/vmwgfx: Simplify fb pinning)
+  {
+  	struct ttm_operation_ctx ctx = {interruptible, false };
+  	struct ttm_buffer_object *bo = &buf->base;
+diff --cc drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+index 9fec194cdbf1,6780391c57ea..000000000000
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@@ -1420,28 -1421,30 +1420,29 @@@ static void vmw_framebuffer_bo_destroy(
+  	kfree(vfbd);
+  }
+  
+ -static int vmw_framebuffer_bo_dirty(struct drm_framebuffer *framebuffer,
+ -				    struct drm_file *file_priv,
+ -				    unsigned int flags, unsigned int color,
+ -				    struct drm_clip_rect *clips,
+ -				    unsigned int num_clips)
+ +static const struct drm_framebuffer_funcs vmw_framebuffer_bo_funcs = {
+ +	.create_handle = vmw_framebuffer_bo_create_handle,
+ +	.destroy = vmw_framebuffer_bo_destroy,
+ +	.dirty = drm_atomic_helper_dirtyfb,
+ +};
+ +
+++<<<<<<< HEAD
+ +/*
+ + * Pin the bofer in a location suitable for access by the
+ + * display system.
+ + */
+ +static int vmw_framebuffer_pin(struct vmw_framebuffer *vfb)
+  {
+ -	struct vmw_private *dev_priv = vmw_priv(framebuffer->dev);
+ -	struct vmw_framebuffer_bo *vfbd =
+ -		vmw_framebuffer_to_vfbd(framebuffer);
+ -	struct drm_clip_rect norect;
+ -	int ret, increment = 1;
+ -
+ -	drm_modeset_lock_all(&dev_priv->drm);
+ -
+ -	if (!num_clips) {
+ -		num_clips = 1;
+ -		clips = &norect;
+ -		norect.x1 = norect.y1 = 0;
+ -		norect.x2 = framebuffer->width;
+ -		norect.y2 = framebuffer->height;
+ -	} else if (flags & DRM_MODE_FB_DIRTY_ANNOTATE_COPY) {
+ -		num_clips /= 2;
+ -		increment = 2;
+ -	}
+ +	struct vmw_private *dev_priv = vmw_priv(vfb->base.dev);
+ +	struct vmw_buffer_object *buf;
+ +	struct ttm_placement *placement;
+ +	int ret;
+ +
+ +	buf = vfb->bo ?  vmw_framebuffer_to_vfbd(&vfb->base)->buffer :
+ +		vmw_framebuffer_to_vfbs(&vfb->base)->surface->res.backup;
+ +
+ +	if (!buf)
+ +		return 0;
+  
+  	switch (dev_priv->active_display_unit) {
+  	case vmw_du_legacy:
+@@@ -1475,20 -1460,33 +1476,22 @@@
+  	return ret;
+  }
+  
+ -static int vmw_framebuffer_bo_dirty_ext(struct drm_framebuffer *framebuffer,
+ -					struct drm_file *file_priv,
+ -					unsigned int flags, unsigned int color,
+ -					struct drm_clip_rect *clips,
+ -					unsigned int num_clips)
+ +static int vmw_framebuffer_unpin(struct vmw_framebuffer *vfb)
+  {
+ -	struct vmw_private *dev_priv = vmw_priv(framebuffer->dev);
+ +	struct vmw_private *dev_priv = vmw_priv(vfb->base.dev);
+ +	struct vmw_buffer_object *buf;
+  
+ -	if (dev_priv->active_display_unit == vmw_du_legacy &&
+ -	    vmw_cmd_supported(dev_priv))
+ -		return vmw_framebuffer_bo_dirty(framebuffer, file_priv, flags,
+ -						color, clips, num_clips);
+ +	buf = vfb->bo ?  vmw_framebuffer_to_vfbd(&vfb->base)->buffer :
+ +		vmw_framebuffer_to_vfbs(&vfb->base)->surface->res.backup;
+  
+ -	return drm_atomic_helper_dirtyfb(framebuffer, file_priv, flags, color,
+ -					 clips, num_clips);
+ -}
+ +	if (WARN_ON(!buf))
+ +		return 0;
+  
+ -static const struct drm_framebuffer_funcs vmw_framebuffer_bo_funcs = {
+ -	.create_handle = vmw_framebuffer_bo_create_handle,
+ -	.destroy = vmw_framebuffer_bo_destroy,
+ -	.dirty = vmw_framebuffer_bo_dirty_ext,
+ -};
+ +	return vmw_bo_unpin(dev_priv, buf, false);
+ +}
+  
+++=======
+++>>>>>>> 6703e28f976d (drm/vmwgfx: Simplify fb pinning)
+  /**
+   * vmw_create_bo_proxy - create a proxy surface for the buffer object
+   *
+* Unmerged path drivers/gpu/drm/vmwgfx/vmwgfx_bo.h
+* Unmerged path drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+* Unmerged path drivers/gpu/drm/vmwgfx/vmwgfx_bo.h
+* Unmerged path drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h
+index 83595325cc18..75f6e62e5e2c 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h
+@@ -1,7 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0 OR MIT */
+ /**************************************************************************
+  *
+- * Copyright 2009-2022 VMware, Inc., Palo Alto, CA., USA
++ * Copyright 2009-2023 VMware, Inc., Palo Alto, CA., USA
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+  * copy of this software and associated documentation files (the
+@@ -217,8 +217,6 @@ struct vmw_kms_dirty {
+  */
+ struct vmw_framebuffer {
+ 	struct drm_framebuffer base;
+-	int (*pin)(struct vmw_framebuffer *fb);
+-	int (*unpin)(struct vmw_framebuffer *fb);
+ 	bool bo;
+ 	uint32_t user_handle;
+ };
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c b/drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c
+index ac72c20715f3..47f66c8b3305 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0 OR MIT
+ /**************************************************************************
+  *
+- * Copyright 2009-2022 VMware, Inc., Palo Alto, CA., USA
++ * Copyright 2009-2023 VMware, Inc., Palo Alto, CA., USA
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+  * copy of this software and associated documentation files (the
+@@ -25,11 +25,13 @@
+  *
+  **************************************************************************/
+ 
++#include "vmwgfx_bo.h"
++#include "vmwgfx_kms.h"
++
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_fourcc.h>
+ 
+-#include "vmwgfx_kms.h"
+ 
+ #define vmw_crtc_to_ldu(x) \
+ 	container_of(x, struct vmw_legacy_display_unit, base.crtc)
+@@ -134,6 +136,47 @@ static int vmw_ldu_commit_list(struct vmw_private *dev_priv)
+ 	return 0;
+ }
+ 
++/*
++ * Pin the buffer in a location suitable for access by the
++ * display system.
++ */
++static int vmw_ldu_fb_pin(struct vmw_framebuffer *vfb)
++{
++	struct vmw_private *dev_priv = vmw_priv(vfb->base.dev);
++	struct vmw_bo *buf;
++	int ret;
++
++	buf = vfb->bo ?  vmw_framebuffer_to_vfbd(&vfb->base)->buffer :
++		vmw_framebuffer_to_vfbs(&vfb->base)->surface->res.backup;
++
++	if (!buf)
++		return 0;
++	WARN_ON(dev_priv->active_display_unit != vmw_du_legacy);
++
++	if (dev_priv->active_display_unit == vmw_du_legacy) {
++		vmw_overlay_pause_all(dev_priv);
++		ret = vmw_bo_pin_in_start_of_vram(dev_priv, buf, false);
++		vmw_overlay_resume_all(dev_priv);
++	} else
++		ret = -EINVAL;
++
++	return ret;
++}
++
++static int vmw_ldu_fb_unpin(struct vmw_framebuffer *vfb)
++{
++	struct vmw_private *dev_priv = vmw_priv(vfb->base.dev);
++	struct vmw_bo *buf;
++
++	buf = vfb->bo ?  vmw_framebuffer_to_vfbd(&vfb->base)->buffer :
++		vmw_framebuffer_to_vfbs(&vfb->base)->surface->res.backup;
++
++	if (WARN_ON(!buf))
++		return 0;
++
++	return vmw_bo_unpin(dev_priv, buf, false);
++}
++
+ static int vmw_ldu_del_active(struct vmw_private *vmw_priv,
+ 			      struct vmw_legacy_display_unit *ldu)
+ {
+@@ -145,8 +188,7 @@ static int vmw_ldu_del_active(struct vmw_private *vmw_priv,
+ 	list_del_init(&ldu->active);
+ 	if (--(ld->num_active) == 0) {
+ 		BUG_ON(!ld->fb);
+-		if (ld->fb->unpin)
+-			ld->fb->unpin(ld->fb);
++		WARN_ON(vmw_ldu_fb_unpin(ld->fb));
+ 		ld->fb = NULL;
+ 	}
+ 
+@@ -163,11 +205,10 @@ static int vmw_ldu_add_active(struct vmw_private *vmw_priv,
+ 
+ 	BUG_ON(!ld->num_active && ld->fb);
+ 	if (vfb != ld->fb) {
+-		if (ld->fb && ld->fb->unpin)
+-			ld->fb->unpin(ld->fb);
++		if (ld->fb)
++			WARN_ON(vmw_ldu_fb_unpin(ld->fb));
+ 		vmw_svga_enable(vmw_priv);
+-		if (vfb->pin)
+-			vfb->pin(vfb);
++		WARN_ON(vmw_ldu_fb_pin(vfb));
+ 		ld->fb = vfb;
+ 	}
+ 
