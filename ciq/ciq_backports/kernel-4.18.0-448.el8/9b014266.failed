@@ -1,0 +1,211 @@
+ASoC: SOF: topology: use new sound control LED layer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Jaroslav Kysela <perex@perex.cz>
+commit 9b014266ef8ad0159b39920a752f191bcd6f356c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/9b014266.failed
+
+Use the new sound control LED layer instead the direct ledtrig_audio_set()
+call - see 22d8de62f11b ("ALSA: control - add generic LED trigger module
+as the new control layer").
+
+	Signed-off-by: Jaroslav Kysela <perex@perex.cz>
+	Cc: Bard Liao <yung-chuan.liao@linux.intel.com>
+	Cc: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Reviewed-by: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+	Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Link: https://lore.kernel.org/r/20220329120039.2394138-1-perex@perex.cz
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 9b014266ef8ad0159b39920a752f191bcd6f356c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/control.c
+#	sound/soc/sof/topology.c
+diff --cc sound/soc/sof/control.c
+index ef61936dad59,3b5718a3516d..000000000000
+--- a/sound/soc/sof/control.c
++++ b/sound/soc/sof/control.c
+@@@ -15,82 -15,6 +15,85 @@@
+  #include "sof-priv.h"
+  #include "sof-audio.h"
+  
+++<<<<<<< HEAD
+ +static void update_mute_led(struct snd_sof_control *scontrol,
+ +			    struct snd_kcontrol *kcontrol,
+ +			    struct snd_ctl_elem_value *ucontrol)
+ +{
+ +	int temp = 0;
+ +	int mask;
+ +	int i;
+ +
+ +	mask = 1U << snd_ctl_get_ioffidx(kcontrol, &ucontrol->id);
+ +
+ +	for (i = 0; i < scontrol->num_channels; i++) {
+ +		if (ucontrol->value.integer.value[i]) {
+ +			temp |= mask;
+ +			break;
+ +		}
+ +	}
+ +
+ +	if (temp == scontrol->led_ctl.led_value)
+ +		return;
+ +
+ +	scontrol->led_ctl.led_value = temp;
+ +
+ +#if IS_REACHABLE(CONFIG_LEDS_TRIGGER_AUDIO)
+ +	if (!scontrol->led_ctl.direction)
+ +		ledtrig_audio_set(LED_AUDIO_MUTE, temp ? LED_OFF : LED_ON);
+ +	else
+ +		ledtrig_audio_set(LED_AUDIO_MICMUTE, temp ? LED_OFF : LED_ON);
+ +#endif
+ +}
+ +
+ +static inline u32 mixer_to_ipc(unsigned int value, u32 *volume_map, int size)
+ +{
+ +	if (value >= size)
+ +		return volume_map[size - 1];
+ +
+ +	return volume_map[value];
+ +}
+ +
+ +static inline u32 ipc_to_mixer(u32 value, u32 *volume_map, int size)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; i < size; i++) {
+ +		if (volume_map[i] >= value)
+ +			return i;
+ +	}
+ +
+ +	return i - 1;
+ +}
+ +
+ +static void snd_sof_refresh_control(struct snd_sof_control *scontrol)
+ +{
+ +	struct sof_ipc_ctrl_data *cdata = scontrol->control_data;
+ +	struct snd_soc_component *scomp = scontrol->scomp;
+ +	int ret;
+ +
+ +	if (!scontrol->comp_data_dirty)
+ +		return;
+ +
+ +	if (!pm_runtime_active(scomp->dev))
+ +		return;
+ +
+ +	/* set the ABI header values */
+ +	cdata->data->magic = SOF_ABI_MAGIC;
+ +	cdata->data->abi = SOF_ABI_VERSION;
+ +
+ +	/* refresh the component data from DSP */
+ +	scontrol->comp_data_dirty = false;
+ +	ret = snd_sof_ipc_set_get_comp_data(scontrol, false);
+ +	if (ret < 0) {
+ +		dev_err(scomp->dev, "error: failed to get control data: %d\n", ret);
+ +		/* Set the flag to re-try next time to get the data */
+ +		scontrol->comp_data_dirty = true;
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 9b014266ef8a (ASoC: SOF: topology: use new sound control LED layer)
+  int snd_sof_volume_get(struct snd_kcontrol *kcontrol,
+  		       struct snd_ctl_elem_value *ucontrol)
+  {
+@@@ -181,31 -85,16 +184,36 @@@ int snd_sof_switch_get(struct snd_kcont
+  int snd_sof_switch_put(struct snd_kcontrol *kcontrol,
+  		       struct snd_ctl_elem_value *ucontrol)
+  {
+ -	struct soc_mixer_control *sm = (struct soc_mixer_control *)kcontrol->private_value;
+ +	struct soc_mixer_control *sm =
+ +		(struct soc_mixer_control *)kcontrol->private_value;
+  	struct snd_sof_control *scontrol = sm->dobj.private;
+  	struct snd_soc_component *scomp = scontrol->scomp;
+ -	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(scomp);
+ -	const struct sof_ipc_tplg_ops *tplg_ops = sdev->ipc->ops->tplg;
+ +	struct sof_ipc_ctrl_data *cdata = scontrol->control_data;
+ +	unsigned int i, channels = scontrol->num_channels;
+ +	bool change = false;
+ +	u32 value;
+ +
+ +	/* update each channel */
+ +	for (i = 0; i < channels; i++) {
+ +		value = ucontrol->value.integer.value[i];
+ +		change = change || (value != cdata->chanv[i].value);
+ +		cdata->chanv[i].channel = i;
+ +		cdata->chanv[i].value = value;
+ +	}
+  
+++<<<<<<< HEAD
+ +	if (scontrol->led_ctl.use_led)
+ +		update_mute_led(scontrol, kcontrol, ucontrol);
+ +
+ +	/* notify DSP of mixer updates */
+ +	if (pm_runtime_active(scomp->dev))
+ +		snd_sof_ipc_set_get_comp_data(scontrol, true);
+++=======
++ 	if (tplg_ops->control->switch_put)
++ 		return tplg_ops->control->switch_put(scontrol, ucontrol);
+++>>>>>>> 9b014266ef8a (ASoC: SOF: topology: use new sound control LED layer)
+  
+ -	return false;
+ +	return change;
+  }
+  
+  int snd_sof_enum_get(struct snd_kcontrol *kcontrol,
+diff --cc sound/soc/sof/topology.c
+index 98443c24c00a,e47a64934c04..000000000000
+--- a/sound/soc/sof/topology.c
++++ b/sound/soc/sof/topology.c
+@@@ -1154,9 -772,8 +1154,13 @@@ static int sof_control_load_volume(stru
+  	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(scomp);
+  	struct snd_soc_tplg_mixer_control *mc =
+  		container_of(hdr, struct snd_soc_tplg_mixer_control, hdr);
+ +	struct sof_ipc_ctrl_data *cdata;
+  	int tlv[TLV_ITEMS];
+++<<<<<<< HEAD
+ +	unsigned int i;
+++=======
++ 	unsigned int mask;
+++>>>>>>> 9b014266ef8a (ASoC: SOF: topology: use new sound control LED layer)
+  	int ret;
+  
+  	/* validate topology data */
+@@@ -1226,9 -819,19 +1230,19 @@@ skip
+  	if (ret != 0) {
+  		dev_err(scomp->dev, "error: parse led tokens failed %d\n",
+  			le32_to_cpu(mc->priv.size));
+ -		goto err;
+ +		goto out_free_table;
+  	}
+  
++ 	if (scontrol->led_ctl.use_led) {
++ 		mask = scontrol->led_ctl.direction ? SNDRV_CTL_ELEM_ACCESS_MIC_LED :
++ 							SNDRV_CTL_ELEM_ACCESS_SPK_LED;
++ 		scontrol->access &= ~SNDRV_CTL_ELEM_ACCESS_LED_MASK;
++ 		scontrol->access |= mask;
++ 		kc->access &= ~SNDRV_CTL_ELEM_ACCESS_LED_MASK;
++ 		kc->access |= mask;
++ 		sdev->led_present = true;
++ 	}
++ 
+  	dev_dbg(scomp->dev, "tplg: load kcontrol index %d chans %d\n",
+  		scontrol->comp_id, scontrol->num_channels);
+  
+* Unmerged path sound/soc/sof/control.c
+diff --git a/sound/soc/sof/sof-priv.h b/sound/soc/sof/sof-priv.h
+index b926180867af..c4f70ab856f3 100644
+--- a/sound/soc/sof/sof-priv.h
++++ b/sound/soc/sof/sof-priv.h
+@@ -495,6 +495,7 @@ struct snd_sof_dev {
+ 	struct list_head route_list;
+ 	struct snd_soc_component *component;
+ 	u32 enabled_cores_mask; /* keep track of enabled cores */
++	bool led_present;
+ 
+ 	/* FW configuration */
+ 	struct sof_ipc_window *info_window;
+* Unmerged path sound/soc/sof/topology.c
