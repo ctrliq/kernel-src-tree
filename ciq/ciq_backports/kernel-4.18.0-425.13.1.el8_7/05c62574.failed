@@ -1,0 +1,220 @@
+panic, kexec: make __crash_kexec() NMI safe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.13.1.el8_7
+commit-author Valentin Schneider <vschneid@redhat.com>
+commit 05c6257433b7212f07a7e53479a8ab038fc1666a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.13.1.el8_7/05c62574.failed
+
+Attempting to get a crash dump out of a debug PREEMPT_RT kernel via an NMI
+panic() doesn't work.  The cause of that lies in the PREEMPT_RT definition
+of mutex_trylock():
+
+	if (IS_ENABLED(CONFIG_DEBUG_RT_MUTEXES) && WARN_ON_ONCE(!in_task()))
+		return 0;
+
+This prevents an nmi_panic() from executing the main body of
+__crash_kexec() which does the actual kexec into the kdump kernel.  The
+warning and return are explained by:
+
+  6ce47fd961fa ("rtmutex: Warn if trylock is called from hard/softirq context")
+  [...]
+  The reasons for this are:
+
+      1) There is a potential deadlock in the slowpath
+
+      2) Another cpu which blocks on the rtmutex will boost the task
+	 which allegedly locked the rtmutex, but that cannot work
+	 because the hard/softirq context borrows the task context.
+
+Furthermore, grabbing the lock isn't NMI safe, so do away with kexec_mutex
+and replace it with an atomic variable.  This is somewhat overzealous as
+*some* callsites could keep using a mutex (e.g.  the sysfs-facing ones
+like crash_shrink_memory()), but this has the benefit of involving a
+single unified lock and preventing any future NMI-related surprises.
+
+Tested by triggering NMI panics via:
+
+  $ echo 1 > /proc/sys/kernel/panic_on_unrecovered_nmi
+  $ echo 1 > /proc/sys/kernel/unknown_nmi_panic
+  $ echo 1 > /proc/sys/kernel/panic
+
+  $ ipmitool power diag
+
+Link: https://lkml.kernel.org/r/20220630223258.4144112-3-vschneid@redhat.com
+Fixes: 6ce47fd961fa ("rtmutex: Warn if trylock is called from hard/softirq context")
+	Signed-off-by: Valentin Schneider <vschneid@redhat.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Baoquan He <bhe@redhat.com>
+	Cc: "Eric W . Biederman" <ebiederm@xmission.com>
+	Cc: Juri Lelli <jlelli@redhat.com>
+	Cc: Luis Claudio R. Goncalves <lgoncalv@redhat.com>
+	Cc: Miaohe Lin <linmiaohe@huawei.com>
+	Cc: Petr Mladek <pmladek@suse.com>
+	Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 05c6257433b7212f07a7e53479a8ab038fc1666a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/kexec_core.c
+diff --cc kernel/kexec_core.c
+index af6f1873ab4b,5ca4d40c9ec1..000000000000
+--- a/kernel/kexec_core.c
++++ b/kernel/kexec_core.c
+@@@ -44,10 -44,9 +44,10 @@@
+  #include <asm/sections.h>
+  
+  #include <crypto/hash.h>
+ +#include <crypto/sha.h>
+  #include "kexec_internal.h"
+  
+- DEFINE_MUTEX(kexec_mutex);
++ atomic_t __kexec_lock = ATOMIC_INIT(0);
+  
+  /* Per cpu memory for storing cpu states in case of system crash. */
+  note_buf_t __percpu *crash_notes;
+@@@ -983,14 -1004,17 +983,26 @@@ void crash_kexec(struct pt_regs *regs
+  	}
+  }
+  
+ -ssize_t crash_get_memory_size(void)
+ +size_t crash_get_memory_size(void)
+  {
+++<<<<<<< HEAD
+ +	size_t size = 0;
+++=======
++ 	ssize_t size = 0;
++ 
++ 	if (!kexec_trylock())
++ 		return -EBUSY;
+++>>>>>>> 05c6257433b7 (panic, kexec: make __crash_kexec() NMI safe)
+  
+ +	mutex_lock(&kexec_mutex);
+  	if (crashk_res.end != crashk_res.start)
+  		size = resource_size(&crashk_res);
+++<<<<<<< HEAD
+ +	mutex_unlock(&kexec_mutex);
+++=======
++ 
++ 	kexec_unlock();
+++>>>>>>> 05c6257433b7 (panic, kexec: make __crash_kexec() NMI safe)
+  	return size;
+  }
+  
+@@@ -1010,7 -1025,8 +1022,12 @@@ int crash_shrink_memory(unsigned long n
+  	unsigned long old_size;
+  	struct resource *ram_res;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&kexec_mutex);
+++=======
++ 	if (!kexec_trylock())
++ 		return -EBUSY;
+++>>>>>>> 05c6257433b7 (panic, kexec: make __crash_kexec() NMI safe)
+  
+  	if (kexec_crash_image) {
+  		ret = -ENOENT;
+@@@ -1197,19 -1212,6 +1214,19 @@@ int kernel_kexec(void
+  #endif
+  
+   Unlock:
+- 	mutex_unlock(&kexec_mutex);
++ 	kexec_unlock();
+  	return error;
+  }
+ +
+ +/*
+ + * Protection mechanism for crashkernel reserved memory after
+ + * the kdump kernel is loaded.
+ + *
+ + * Provide an empty default implementation here -- architecture
+ + * code may override this
+ + */
+ +void __weak arch_kexec_protect_crashkres(void)
+ +{}
+ +
+ +void __weak arch_kexec_unprotect_crashkres(void)
+ +{}
+diff --git a/kernel/kexec.c b/kernel/kexec.c
+index e75c6575cb26..9ebe82f0f59d 100644
+--- a/kernel/kexec.c
++++ b/kernel/kexec.c
+@@ -114,13 +114,10 @@ static int do_kexec_load(unsigned long entry, unsigned long nr_segments,
+ 
+ 	/*
+ 	 * Because we write directly to the reserved memory region when loading
+-	 * crash kernels we need a mutex here to prevent multiple crash kernels
+-	 * from attempting to load simultaneously, and to prevent a crash kernel
+-	 * from loading over the top of a in use crash kernel.
+-	 *
+-	 * KISS: always take the mutex.
++	 * crash kernels we need a serialization here to prevent multiple crash
++	 * kernels from attempting to load simultaneously.
+ 	 */
+-	if (!mutex_trylock(&kexec_mutex))
++	if (!kexec_trylock())
+ 		return -EBUSY;
+ 
+ 	if (flags & KEXEC_ON_CRASH) {
+@@ -182,7 +179,7 @@ static int do_kexec_load(unsigned long entry, unsigned long nr_segments,
+ 
+ 	kimage_free(image);
+ out_unlock:
+-	mutex_unlock(&kexec_mutex);
++	kexec_unlock();
+ 	return ret;
+ }
+ 
+* Unmerged path kernel/kexec_core.c
+diff --git a/kernel/kexec_file.c b/kernel/kexec_file.c
+index b25e1fc82f72..40c064a6d891 100644
+--- a/kernel/kexec_file.c
++++ b/kernel/kexec_file.c
+@@ -368,7 +368,7 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
+ 
+ 	image = NULL;
+ 
+-	if (!mutex_trylock(&kexec_mutex))
++	if (!kexec_trylock())
+ 		return -EBUSY;
+ 
+ 	dest_image = &kexec_image;
+@@ -436,7 +436,7 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
+ 	if ((flags & KEXEC_FILE_ON_CRASH) && kexec_crash_image)
+ 		arch_kexec_protect_crashkres();
+ 
+-	mutex_unlock(&kexec_mutex);
++	kexec_unlock();
+ 	kimage_free(image);
+ 	return ret;
+ }
+diff --git a/kernel/kexec_internal.h b/kernel/kexec_internal.h
+index 48aaf2ac0d0d..74da1409cd14 100644
+--- a/kernel/kexec_internal.h
++++ b/kernel/kexec_internal.h
+@@ -13,7 +13,20 @@ void kimage_terminate(struct kimage *image);
+ int kimage_is_destination_range(struct kimage *image,
+ 				unsigned long start, unsigned long end);
+ 
+-extern struct mutex kexec_mutex;
++/*
++ * Whatever is used to serialize accesses to the kexec_crash_image needs to be
++ * NMI safe, as __crash_kexec() can happen during nmi_panic(), so here we use a
++ * "simple" atomic variable that is acquired with a cmpxchg().
++ */
++extern atomic_t __kexec_lock;
++static inline bool kexec_trylock(void)
++{
++	return atomic_cmpxchg_acquire(&__kexec_lock, 0, 1) == 0;
++}
++static inline void kexec_unlock(void)
++{
++	atomic_set_release(&__kexec_lock, 0);
++}
+ 
+ #ifdef CONFIG_KEXEC_FILE
+ #include <linux/purgatory.h>
