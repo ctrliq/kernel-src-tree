@@ -1,0 +1,445 @@
+drm/i915/gvt: simplify vgpu configuration management
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+Rebuild_CHGLOG: - Revert "drm/i915/gvt: simplify vgpu configuration management" (Jocelyn Falempe) [2160452]
+Rebuild_FUZZ: 92.04%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 1aa3834f510c9d9206ce4d40aff4903b0c016761
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/1aa3834f.failed
+
+Instead of copying the information from the vgpu_types arrays into each
+intel_vgpu_type structure, just reference this constant information
+with a pointer to the already existing data structure, and pass it into
+the low-level VGPU creation helpers intead of copying the data into yet
+anothe params data structure.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+	Reviewed-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+Link: https://lore.kernel.org/r/20220923092652.100656-3-hch@lst.de
+[aw: Fold fix from 20220928121110.GA30738@lst.de]
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 1aa3834f510c9d9206ce4d40aff4903b0c016761)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gvt/gvt.h
+#	drivers/gpu/drm/i915/gvt/kvmgt.c
+#	drivers/gpu/drm/i915/gvt/vgpu.c
+diff --cc drivers/gpu/drm/i915/gvt/gvt.h
+index 8565189e0c0d,563ffc2fdfb7..000000000000
+--- a/drivers/gpu/drm/i915/gvt/gvt.h
++++ b/drivers/gpu/drm/i915/gvt/gvt.h
+@@@ -499,8 -494,8 +499,13 @@@ void intel_gvt_clean_vgpu_types(struct 
+  
+  struct intel_vgpu *intel_gvt_create_idle_vgpu(struct intel_gvt *gvt);
+  void intel_gvt_destroy_idle_vgpu(struct intel_vgpu *vgpu);
+++<<<<<<< HEAD
+ +struct intel_vgpu *intel_gvt_create_vgpu(struct intel_gvt *gvt,
+ +					 struct intel_vgpu_type *type);
+++=======
++ int intel_gvt_create_vgpu(struct intel_vgpu *vgpu,
++ 			  const struct intel_vgpu_config *conf);
+++>>>>>>> 1aa3834f510c (drm/i915/gvt: simplify vgpu configuration management)
+  void intel_gvt_destroy_vgpu(struct intel_vgpu *vgpu);
+  void intel_gvt_release_vgpu(struct intel_vgpu *vgpu);
+  void intel_gvt_reset_vgpu_locked(struct intel_vgpu *vgpu, bool dmlr,
+diff --cc drivers/gpu/drm/i915/gvt/kvmgt.c
+index e573a15817c1,7f3596394645..000000000000
+--- a/drivers/gpu/drm/i915/gvt/kvmgt.c
++++ b/drivers/gpu/drm/i915/gvt/kvmgt.c
+@@@ -155,24 -151,19 +155,24 @@@ static ssize_t description_show(struct 
+  	return sprintf(buf, "low_gm_size: %dMB\nhigh_gm_size: %dMB\n"
+  		       "fence: %d\nresolution: %s\n"
+  		       "weight: %d\n",
+- 		       BYTES_TO_MB(type->low_gm_size),
+- 		       BYTES_TO_MB(type->high_gm_size),
+- 		       type->fence, vgpu_edid_str(type->resolution),
+- 		       type->weight);
++ 		       BYTES_TO_MB(type->conf->low_mm),
++ 		       BYTES_TO_MB(type->conf->high_mm),
++ 		       type->conf->fence, vgpu_edid_str(type->conf->edid),
++ 		       type->conf->weight);
+  }
+  
+ -static ssize_t name_show(struct mdev_type *mtype,
+ -			 struct mdev_type_attribute *attr, char *buf)
+ +static ssize_t name_show(struct kobject *kobj,
+ +			 struct device *dev,
+ +			 char *buf)
+  {
+  	struct intel_vgpu_type *type;
+ -	struct intel_gvt *gvt = kdev_to_i915(mtype_get_parent_dev(mtype))->gvt;
+ +	struct intel_gvt *gvt = kdev_to_i915(dev)->gvt;
+ +	int id = mdev_type_kobj_to_group_id(kobj);
+ +
+ +	if (id < 0 || id >= NR_MAX_INTEL_VGPU_TYPES)
+ +		return 0;
+  
+ -	type = &gvt->types[mtype_get_type_group_id(mtype)];
+ +	type = &gvt->types[id];
+  	if (!type)
+  		return 0;
+  
+@@@ -1731,19 -1546,88 +1731,103 @@@ static const struct attribute_group *in
+  	NULL,
+  };
+  
+++<<<<<<< HEAD
+ +const struct mdev_parent_ops intel_vgpu_mdev_ops = {
+ +	.mdev_attr_groups       = intel_vgpu_groups,
+++=======
++ static int intel_vgpu_init_dev(struct vfio_device *vfio_dev)
++ {
++ 	struct mdev_device *mdev = to_mdev_device(vfio_dev->dev);
++ 	struct device *pdev = mdev_parent_dev(mdev);
++ 	struct intel_gvt *gvt = kdev_to_i915(pdev)->gvt;
++ 	struct intel_vgpu_type *type;
++ 	struct intel_vgpu *vgpu = vfio_dev_to_vgpu(vfio_dev);
++ 
++ 	type = &gvt->types[mdev_get_type_group_id(mdev)];
++ 	if (!type)
++ 		return -EINVAL;
++ 
++ 	vgpu->gvt = gvt;
++ 	return intel_gvt_create_vgpu(vgpu, type->conf);
++ }
++ 
++ static void intel_vgpu_release_dev(struct vfio_device *vfio_dev)
++ {
++ 	struct intel_vgpu *vgpu = vfio_dev_to_vgpu(vfio_dev);
++ 
++ 	intel_gvt_destroy_vgpu(vgpu);
++ 	vfio_free_device(vfio_dev);
++ }
++ 
++ static const struct vfio_device_ops intel_vgpu_dev_ops = {
++ 	.init		= intel_vgpu_init_dev,
++ 	.release	= intel_vgpu_release_dev,
++ 	.open_device	= intel_vgpu_open_device,
++ 	.close_device	= intel_vgpu_close_device,
++ 	.read		= intel_vgpu_read,
++ 	.write		= intel_vgpu_write,
++ 	.mmap		= intel_vgpu_mmap,
++ 	.ioctl		= intel_vgpu_ioctl,
++ 	.dma_unmap	= intel_vgpu_dma_unmap,
++ };
++ 
++ static int intel_vgpu_probe(struct mdev_device *mdev)
++ {
++ 	struct intel_vgpu *vgpu;
++ 	int ret;
++ 
++ 	vgpu = vfio_alloc_device(intel_vgpu, vfio_device, &mdev->dev,
++ 				 &intel_vgpu_dev_ops);
++ 	if (IS_ERR(vgpu)) {
++ 		gvt_err("failed to create intel vgpu: %ld\n", PTR_ERR(vgpu));
++ 		return PTR_ERR(vgpu);
++ 	}
++ 
++ 	dev_set_drvdata(&mdev->dev, vgpu);
++ 	ret = vfio_register_emulated_iommu_dev(&vgpu->vfio_device);
++ 	if (ret)
++ 		goto out_put_vdev;
++ 
++ 	gvt_dbg_core("intel_vgpu_create succeeded for mdev: %s\n",
++ 		     dev_name(mdev_dev(mdev)));
++ 	return 0;
++ 
++ out_put_vdev:
++ 	vfio_put_device(&vgpu->vfio_device);
++ 	return ret;
++ }
++ 
++ static void intel_vgpu_remove(struct mdev_device *mdev)
++ {
++ 	struct intel_vgpu *vgpu = dev_get_drvdata(&mdev->dev);
++ 
++ 	if (WARN_ON_ONCE(vgpu->attached))
++ 		return;
++ 
++ 	vfio_unregister_group_dev(&vgpu->vfio_device);
++ 	vfio_put_device(&vgpu->vfio_device);
++ }
++ 
++ static struct mdev_driver intel_vgpu_mdev_driver = {
++ 	.driver = {
++ 		.name		= "intel_vgpu_mdev",
++ 		.owner		= THIS_MODULE,
++ 		.dev_groups	= intel_vgpu_groups,
++ 	},
++ 	.probe		= intel_vgpu_probe,
++ 	.remove		= intel_vgpu_remove,
+++>>>>>>> 1aa3834f510c (drm/i915/gvt: simplify vgpu configuration management)
+  	.supported_type_groups	= gvt_vgpu_type_groups,
+ +	.create			= intel_vgpu_create,
+ +	.remove			= intel_vgpu_remove,
+ +
+ +	.open			= intel_vgpu_open,
+ +	.release		= intel_vgpu_release,
+ +
+ +	.read			= intel_vgpu_read,
+ +	.write			= intel_vgpu_write,
+ +	.mmap			= intel_vgpu_mmap,
+ +	.ioctl			= intel_vgpu_ioctl,
+  };
+  
+  int intel_gvt_page_track_add(struct intel_vgpu *info, u64 gfn)
+diff --cc drivers/gpu/drm/i915/gvt/vgpu.c
+index 46da19b3225d,b0d5dafd013f..000000000000
+--- a/drivers/gpu/drm/i915/gvt/vgpu.c
++++ b/drivers/gpu/drm/i915/gvt/vgpu.c
+@@@ -131,38 -113,24 +113,35 @@@ int intel_gvt_init_vgpu_types(struct in
+  	if (!gvt->types)
+  		return -ENOMEM;
+  
+- 	min_low = MB_TO_BYTES(32);
+  	for (i = 0; i < num_types; ++i) {
+- 		if (low_avail / vgpu_types[i].low_mm == 0)
++ 		const struct intel_vgpu_config *conf = &intel_vgpu_configs[i];
++ 
++ 		if (low_avail / conf->low_mm == 0)
+  			break;
+++<<<<<<< HEAD
+ +
+ +		gvt->types[i].low_gm_size = vgpu_types[i].low_mm;
+ +		gvt->types[i].high_gm_size = vgpu_types[i].high_mm;
+ +		gvt->types[i].fence = vgpu_types[i].fence;
+ +
+ +		if (vgpu_types[i].weight < 1 ||
+ +					vgpu_types[i].weight > VGPU_MAX_WEIGHT)
+ +			return -EINVAL;
+++=======
++ 		if (conf->weight < 1 || conf->weight > VGPU_MAX_WEIGHT)
++ 			goto out_free_types;
+++>>>>>>> 1aa3834f510c (drm/i915/gvt: simplify vgpu configuration management)
+  
+- 		gvt->types[i].weight = vgpu_types[i].weight;
+- 		gvt->types[i].resolution = vgpu_types[i].edid;
+- 		gvt->types[i].avail_instance = min(low_avail / vgpu_types[i].low_mm,
+- 						   high_avail / vgpu_types[i].high_mm);
+- 
+- 		if (GRAPHICS_VER(gvt->gt->i915) == 8)
+- 			sprintf(gvt->types[i].name, "GVTg_V4_%s",
+- 				vgpu_types[i].name);
+- 		else if (GRAPHICS_VER(gvt->gt->i915) == 9)
+- 			sprintf(gvt->types[i].name, "GVTg_V5_%s",
+- 				vgpu_types[i].name);
++ 		sprintf(gvt->types[i].name, "GVTg_V%u_%s",
++ 			GRAPHICS_VER(gvt->gt->i915) == 8 ? 4 : 5, conf->name);
++ 		gvt->types[i].conf = conf;
++ 		gvt->types[i].avail_instance = min(low_avail / conf->low_mm,
++ 						   high_avail / conf->high_mm);
+  
+  		gvt_dbg_core("type[%d]: %s avail %u low %u high %u fence %u weight %u res %s\n",
+- 			     i, gvt->types[i].name,
+- 			     gvt->types[i].avail_instance,
+- 			     gvt->types[i].low_gm_size,
+- 			     gvt->types[i].high_gm_size, gvt->types[i].fence,
+- 			     gvt->types[i].weight,
+- 			     vgpu_edid_str(gvt->types[i].resolution));
++ 			     i, gvt->types[i].name, gvt->types[i].avail_instance,
++ 			     conf->low_mm, conf->high_mm, conf->fence,
++ 			     conf->weight, vgpu_edid_str(conf->edid));
+  	}
+  
+  	gvt->num_types = i;
+@@@ -363,29 -333,25 +342,45 @@@ void intel_gvt_destroy_idle_vgpu(struc
+  	vfree(vgpu);
+  }
+  
+++<<<<<<< HEAD
+ +static struct intel_vgpu *__intel_gvt_create_vgpu(struct intel_gvt *gvt,
+ +		struct intel_vgpu_creation_params *param)
+++=======
++ int intel_gvt_create_vgpu(struct intel_vgpu *vgpu,
++ 		const struct intel_vgpu_config *conf)
+++>>>>>>> 1aa3834f510c (drm/i915/gvt: simplify vgpu configuration management)
+  {
+ -	struct intel_gvt *gvt = vgpu->gvt;
+  	struct drm_i915_private *dev_priv = gvt->gt->i915;
+ +	struct intel_vgpu *vgpu;
+  	int ret;
+  
+- 	gvt_dbg_core("low %llu MB high %llu MB fence %llu\n",
+- 			param->low_gm_sz, param->high_gm_sz,
+- 			param->fence_sz);
++ 	gvt_dbg_core("low %u MB high %u MB fence %u\n",
++ 			BYTES_TO_MB(conf->low_mm), BYTES_TO_MB(conf->high_mm),
++ 			conf->fence);
+  
+++<<<<<<< HEAD
+ +	vgpu = vzalloc(sizeof(*vgpu));
+ +	if (!vgpu)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	ret = idr_alloc(&gvt->vgpu_idr, vgpu, IDLE_VGPU_IDR + 1, GVT_MAX_VGPU,
+ +		GFP_KERNEL);
+ +	if (ret < 0)
+ +		goto out_free_vgpu;
+ +
+ +	vgpu->id = ret;
+ +	vgpu->gvt = gvt;
+ +	vgpu->sched_ctl.weight = param->weight;
+++=======
++ 	mutex_lock(&gvt->lock);
++ 	ret = idr_alloc(&gvt->vgpu_idr, vgpu, IDLE_VGPU_IDR + 1, GVT_MAX_VGPU,
++ 		GFP_KERNEL);
++ 	if (ret < 0)
++ 		goto out_unlock;;
++ 
++ 	vgpu->id = ret;
++ 	vgpu->sched_ctl.weight = conf->weight;
+++>>>>>>> 1aa3834f510c (drm/i915/gvt: simplify vgpu configuration management)
+  	mutex_init(&vgpu->vgpu_lock);
+  	mutex_init(&vgpu->dmabuf_lock);
+  	INIT_LIST_HEAD(&vgpu->dmabuf_obj_list_head);
+@@@ -437,7 -403,10 +432,14 @@@
+  	if (ret)
+  		goto out_clean_sched_policy;
+  
+++<<<<<<< HEAD
+ +	return vgpu;
+++=======
++ 	intel_gvt_update_vgpu_types(gvt);
++ 	intel_gvt_update_reg_whitelist(vgpu);
++ 	mutex_unlock(&gvt->lock);
++ 	return 0;
+++>>>>>>> 1aa3834f510c (drm/i915/gvt: simplify vgpu configuration management)
+  
+  out_clean_sched_policy:
+  	intel_vgpu_clean_sched_policy(vgpu);
+@@@ -455,48 -424,9 +457,54 @@@ out_clean_vgpu_mmio
+  	intel_vgpu_clean_mmio(vgpu);
+  out_clean_idr:
+  	idr_remove(&gvt->vgpu_idr, vgpu->id);
+++<<<<<<< HEAD
+ +out_free_vgpu:
+ +	vfree(vgpu);
+ +	return ERR_PTR(ret);
+ +}
+ +
+ +/**
+ + * intel_gvt_create_vgpu - create a virtual GPU
+ + * @gvt: GVT device
+ + * @type: type of the vGPU to create
+ + *
+ + * This function is called when user wants to create a virtual GPU.
+ + *
+ + * Returns:
+ + * pointer to intel_vgpu, error pointer if failed.
+ + */
+ +struct intel_vgpu *intel_gvt_create_vgpu(struct intel_gvt *gvt,
+ +				struct intel_vgpu_type *type)
+ +{
+ +	struct intel_vgpu_creation_params param;
+ +	struct intel_vgpu *vgpu;
+ +
+ +	param.primary = 1;
+ +	param.low_gm_sz = type->low_gm_size;
+ +	param.high_gm_sz = type->high_gm_size;
+ +	param.fence_sz = type->fence;
+ +	param.weight = type->weight;
+ +	param.resolution = type->resolution;
+ +
+ +	/* XXX current param based on MB */
+ +	param.low_gm_sz = BYTES_TO_MB(param.low_gm_sz);
+ +	param.high_gm_sz = BYTES_TO_MB(param.high_gm_sz);
+ +
+ +	mutex_lock(&gvt->lock);
+ +	vgpu = __intel_gvt_create_vgpu(gvt, &param);
+ +	if (!IS_ERR(vgpu)) {
+ +		/* calculate left instance change for types */
+ +		intel_gvt_update_vgpu_types(gvt);
+ +		intel_gvt_update_reg_whitelist(vgpu);
+ +	}
+ +	mutex_unlock(&gvt->lock);
+ +
+ +	return vgpu;
+++=======
++ out_unlock:
++ 	mutex_unlock(&gvt->lock);
++ 	return ret;
+++>>>>>>> 1aa3834f510c (drm/i915/gvt: simplify vgpu configuration management)
+  }
+  
+  /**
+diff --git a/drivers/gpu/drm/i915/gvt/aperture_gm.c b/drivers/gpu/drm/i915/gvt/aperture_gm.c
+index 3b81a6d35a7b..076c779f776a 100644
+--- a/drivers/gpu/drm/i915/gvt/aperture_gm.c
++++ b/drivers/gpu/drm/i915/gvt/aperture_gm.c
+@@ -240,13 +240,13 @@ static void free_resource(struct intel_vgpu *vgpu)
+ }
+ 
+ static int alloc_resource(struct intel_vgpu *vgpu,
+-		struct intel_vgpu_creation_params *param)
++		const struct intel_vgpu_config *conf)
+ {
+ 	struct intel_gvt *gvt = vgpu->gvt;
+ 	unsigned long request, avail, max, taken;
+ 	const char *item;
+ 
+-	if (!param->low_gm_sz || !param->high_gm_sz || !param->fence_sz) {
++	if (!conf->low_mm || !conf->high_mm || !conf->fence) {
+ 		gvt_vgpu_err("Invalid vGPU creation params\n");
+ 		return -EINVAL;
+ 	}
+@@ -255,7 +255,7 @@ static int alloc_resource(struct intel_vgpu *vgpu,
+ 	max = gvt_aperture_sz(gvt) - HOST_LOW_GM_SIZE;
+ 	taken = gvt->gm.vgpu_allocated_low_gm_size;
+ 	avail = max - taken;
+-	request = MB_TO_BYTES(param->low_gm_sz);
++	request = conf->low_mm;
+ 
+ 	if (request > avail)
+ 		goto no_enough_resource;
+@@ -266,7 +266,7 @@ static int alloc_resource(struct intel_vgpu *vgpu,
+ 	max = gvt_hidden_sz(gvt) - HOST_HIGH_GM_SIZE;
+ 	taken = gvt->gm.vgpu_allocated_high_gm_size;
+ 	avail = max - taken;
+-	request = MB_TO_BYTES(param->high_gm_sz);
++	request = conf->high_mm;
+ 
+ 	if (request > avail)
+ 		goto no_enough_resource;
+@@ -277,16 +277,16 @@ static int alloc_resource(struct intel_vgpu *vgpu,
+ 	max = gvt_fence_sz(gvt) - HOST_FENCE;
+ 	taken = gvt->fence.vgpu_allocated_fence_num;
+ 	avail = max - taken;
+-	request = param->fence_sz;
++	request = conf->fence;
+ 
+ 	if (request > avail)
+ 		goto no_enough_resource;
+ 
+ 	vgpu_fence_sz(vgpu) = request;
+ 
+-	gvt->gm.vgpu_allocated_low_gm_size += MB_TO_BYTES(param->low_gm_sz);
+-	gvt->gm.vgpu_allocated_high_gm_size += MB_TO_BYTES(param->high_gm_sz);
+-	gvt->fence.vgpu_allocated_fence_num += param->fence_sz;
++	gvt->gm.vgpu_allocated_low_gm_size += conf->low_mm;
++	gvt->gm.vgpu_allocated_high_gm_size += conf->high_mm;
++	gvt->fence.vgpu_allocated_fence_num += conf->fence;
+ 	return 0;
+ 
+ no_enough_resource:
+@@ -340,11 +340,11 @@ void intel_vgpu_reset_resource(struct intel_vgpu *vgpu)
+  *
+  */
+ int intel_vgpu_alloc_resource(struct intel_vgpu *vgpu,
+-		struct intel_vgpu_creation_params *param)
++		const struct intel_vgpu_config *conf)
+ {
+ 	int ret;
+ 
+-	ret = alloc_resource(vgpu, param);
++	ret = alloc_resource(vgpu, conf);
+ 	if (ret)
+ 		return ret;
+ 
+* Unmerged path drivers/gpu/drm/i915/gvt/gvt.h
+* Unmerged path drivers/gpu/drm/i915/gvt/kvmgt.c
+* Unmerged path drivers/gpu/drm/i915/gvt/vgpu.c
