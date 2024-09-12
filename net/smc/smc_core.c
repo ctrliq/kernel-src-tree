@@ -2289,14 +2289,6 @@ static int __smc_buf_create(struct smc_sock *smc, bool is_smcd, bool is_rmb)
 	return 0;
 }
 
-void smc_sndbuf_sync_sg_for_cpu(struct smc_connection *conn)
-{
-	if (!smc_conn_lgr_valid(conn) || conn->lgr->is_smcd ||
-	    !smc_link_active(conn->lnk))
-		return;
-	smc_ib_sync_sg_for_cpu(conn->lnk, conn->sndbuf_desc, DMA_TO_DEVICE);
-}
-
 void smc_sndbuf_sync_sg_for_device(struct smc_connection *conn)
 {
 	if (!smc_conn_lgr_valid(conn) || conn->lgr->is_smcd ||
@@ -2316,20 +2308,6 @@ void smc_rmb_sync_sg_for_cpu(struct smc_connection *conn)
 			continue;
 		smc_ib_sync_sg_for_cpu(&conn->lgr->lnk[i], conn->rmb_desc,
 				       DMA_FROM_DEVICE);
-	}
-}
-
-void smc_rmb_sync_sg_for_device(struct smc_connection *conn)
-{
-	int i;
-
-	if (!smc_conn_lgr_valid(conn) || conn->lgr->is_smcd)
-		return;
-	for (i = 0; i < SMC_LINKS_PER_LGR_MAX; i++) {
-		if (!smc_link_active(&conn->lgr->lnk[i]))
-			continue;
-		smc_ib_sync_sg_for_device(&conn->lgr->lnk[i], conn->rmb_desc,
-					  DMA_FROM_DEVICE);
 	}
 }
 
