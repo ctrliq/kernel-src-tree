@@ -1,0 +1,173 @@
+kunit: move check if assertion passed into the macros
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-494.el8
+commit-author Daniel Latypov <dlatypov@google.com>
+commit 4fdacef8ac5a5382eeb1bc6fc2632d71a09d52cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-494.el8/4fdacef8.failed
+
+Currently the code always calls kunit_do_assertion() even though it does
+nothing when `pass` is true.
+
+This change moves the `if(!(pass))` check into the macro instead
+and renames the function to kunit_do_failed_assertion().
+I feel this a bit easier to read and understand.
+
+This has the potential upside of avoiding a function call that does
+nothing most of the time (assuming your tests are passing) but comes
+with the downside of generating a bit more code and branches. We try to
+mitigate the branches by tagging them with `unlikely()`.
+
+This also means we don't have to initialize structs that we don't need,
+which will become a tiny bit more expensive if we switch over to using
+static variables to try and reduce stack usage. (There's runtime code
+to check if the variable has been initialized yet or not).
+
+	Signed-off-by: Daniel Latypov <dlatypov@google.com>
+	Reviewed-by: Brendan Higgins <brendanhiggins@google.com>
+	Reviewed-by: David Gow <davidgow@google.com>
+	Signed-off-by: Shuah Khan <skhan@linuxfoundation.org>
+(cherry picked from commit 4fdacef8ac5a5382eeb1bc6fc2632d71a09d52cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/kunit/test.h
+diff --cc include/kunit/test.h
+index d16461268705,12cabd15449a..000000000000
+--- a/include/kunit/test.h
++++ b/include/kunit/test.h
+@@@ -11,11 -11,93 +11,22 @@@
+  
+  #include <kunit/assert.h>
+  #include <kunit/try-catch.h>
+++<<<<<<< HEAD
+ +#include <linux/kernel.h>
+++=======
++ 
++ #include <linux/compiler.h>
++ #include <linux/container_of.h>
++ #include <linux/err.h>
++ #include <linux/init.h>
++ #include <linux/kconfig.h>
++ #include <linux/kref.h>
++ #include <linux/list.h>
+++>>>>>>> 4fdacef8ac5a (kunit: move check if assertion passed into the macros)
+  #include <linux/module.h>
+  #include <linux/slab.h>
+ -#include <linux/spinlock.h>
+ -#include <linux/string.h>
+  #include <linux/types.h>
+ -
+ -#include <asm/rwonce.h>
+ -
+ -struct kunit_resource;
+ -
+ -typedef int (*kunit_resource_init_t)(struct kunit_resource *, void *);
+ -typedef void (*kunit_resource_free_t)(struct kunit_resource *);
+ -
+ -/**
+ - * struct kunit_resource - represents a *test managed resource*
+ - * @data: for the user to store arbitrary data.
+ - * @name: optional name
+ - * @free: a user supplied function to free the resource. Populated by
+ - * kunit_resource_alloc().
+ - *
+ - * Represents a *test managed resource*, a resource which will automatically be
+ - * cleaned up at the end of a test case.
+ - *
+ - * Resources are reference counted so if a resource is retrieved via
+ - * kunit_alloc_and_get_resource() or kunit_find_resource(), we need
+ - * to call kunit_put_resource() to reduce the resource reference count
+ - * when finished with it.  Note that kunit_alloc_resource() does not require a
+ - * kunit_resource_put() because it does not retrieve the resource itself.
+ - *
+ - * Example:
+ - *
+ - * .. code-block:: c
+ - *
+ - *	struct kunit_kmalloc_params {
+ - *		size_t size;
+ - *		gfp_t gfp;
+ - *	};
+ - *
+ - *	static int kunit_kmalloc_init(struct kunit_resource *res, void *context)
+ - *	{
+ - *		struct kunit_kmalloc_params *params = context;
+ - *		res->data = kmalloc(params->size, params->gfp);
+ - *
+ - *		if (!res->data)
+ - *			return -ENOMEM;
+ - *
+ - *		return 0;
+ - *	}
+ - *
+ - *	static void kunit_kmalloc_free(struct kunit_resource *res)
+ - *	{
+ - *		kfree(res->data);
+ - *	}
+ - *
+ - *	void *kunit_kmalloc(struct kunit *test, size_t size, gfp_t gfp)
+ - *	{
+ - *		struct kunit_kmalloc_params params;
+ - *
+ - *		params.size = size;
+ - *		params.gfp = gfp;
+ - *
+ - *		return kunit_alloc_resource(test, kunit_kmalloc_init,
+ - *			kunit_kmalloc_free, &params);
+ - *	}
+ - *
+ - * Resources can also be named, with lookup/removal done on a name
+ - * basis also.  kunit_add_named_resource(), kunit_find_named_resource()
+ - * and kunit_destroy_named_resource().  Resource names must be
+ - * unique within the test instance.
+ - */
+ -struct kunit_resource {
+ -	void *data;
+ -	const char *name;
+ -	kunit_resource_free_t free;
+ -
+ -	/* private: internal use only. */
+ -	struct kref refcount;
+ -	struct list_head node;
+ -};
+ +#include <linux/kref.h>
+  
+  struct kunit;
+  
+* Unmerged path include/kunit/test.h
+diff --git a/lib/kunit/test.c b/lib/kunit/test.c
+index 0929e834e2d9..b27ad433e6b2 100644
+--- a/lib/kunit/test.c
++++ b/lib/kunit/test.c
+@@ -275,16 +275,11 @@ static void __noreturn kunit_abort(struct kunit *test)
+ 	WARN_ONCE(true, "Throw could not abort from test!\n");
+ }
+ 
+-void kunit_do_assertion(struct kunit *test,
+-			struct kunit_assert *assert,
+-			bool pass,
+-			const char *fmt, ...)
++void kunit_do_failed_assertion(struct kunit *test,
++			       struct kunit_assert *assert,
++			       const char *fmt, ...)
+ {
+ 	va_list args;
+-
+-	if (pass)
+-		return;
+-
+ 	va_start(args, fmt);
+ 
+ 	assert->message.fmt = fmt;
+@@ -297,7 +292,7 @@ void kunit_do_assertion(struct kunit *test,
+ 	if (assert->type == KUNIT_ASSERTION)
+ 		kunit_abort(test);
+ }
+-EXPORT_SYMBOL_GPL(kunit_do_assertion);
++EXPORT_SYMBOL_GPL(kunit_do_failed_assertion);
+ 
+ void kunit_init_test(struct kunit *test, const char *name, char *log)
+ {
