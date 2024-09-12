@@ -1,0 +1,104 @@
+iommu/dma: fix zeroing of bounce buffer padding used by untrusted devices
+
+jira LE-1907
+cve CVE-2024-35814
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Michael Kelley <mhklinux@outlook.com>
+commit 2650073f1b5858008c32712f3d9e1e808ce7e967
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/2650073f.failed
+
+iommu_dma_map_page() allocates swiotlb memory as a bounce buffer when an
+untrusted device wants to map only part of the memory in an granule.  The
+goal is to disallow the untrusted device having DMA access to unrelated
+kernel data that may be sharing the granule.  To meet this goal, the
+bounce buffer itself is zeroed, and any additional swiotlb memory up to
+alloc_size after the bounce buffer end (i.e., "post-padding") is also
+zeroed.
+
+However, as of commit 901c7280ca0d ("Reinstate some of "swiotlb: rework
+"fix info leak with DMA_FROM_DEVICE"""), swiotlb_tbl_map_single() always
+initializes the contents of the bounce buffer to the original memory.
+Zeroing the bounce buffer is redundant and probably wrong per the
+discussion in that commit. Only the post-padding needs to be zeroed.
+
+Also, when the DMA min_align_mask is non-zero, the allocated bounce
+buffer space may not start on a granule boundary.  The swiotlb memory
+from the granule boundary to the start of the allocated bounce buffer
+might belong to some unrelated bounce buffer. So as described in the
+"second issue" in [1], it can't be zeroed to protect against untrusted
+devices. But as of commit af133562d5af ("swiotlb: extend buffer
+pre-padding to alloc_align_mask if necessary"), swiotlb_tbl_map_single()
+allocates pre-padding slots when necessary to meet min_align_mask
+requirements, making it possible to zero the pre-padding area as well.
+
+Finally, iommu_dma_map_page() uses the swiotlb for untrusted devices
+and also for certain kmalloc() memory. Current code does the zeroing
+for both cases, but it is needed only for the untrusted device case.
+
+Fix all of this by updating iommu_dma_map_page() to zero both the
+pre-padding and post-padding areas, but not the actual bounce buffer.
+Do this only in the case where the bounce buffer is used because
+of an untrusted device.
+
+[1] https://lore.kernel.org/all/20210929023300.335969-1-stevensd@google.com/
+
+	Signed-off-by: Michael Kelley <mhklinux@outlook.com>
+	Reviewed-by: Petr Tesarik <petr@tesarici.cz>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 2650073f1b5858008c32712f3d9e1e808ce7e967)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dma-iommu.c
+diff --cc drivers/iommu/dma-iommu.c
+index e531d2c4ba52,c745196bc150..000000000000
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@@ -1015,17 -1152,16 +1015,28 @@@ static dma_addr_t iommu_dma_map_page(st
+  	 * If both the physical buffer start address and size are
+  	 * page aligned, we don't need to use a bounce page.
+  	 */
+++<<<<<<< HEAD
+ +	if (dev_use_swiotlb(dev) && iova_offset(iovad, phys | size)) {
+ +		void *padding_start;
+ +		size_t padding_size, aligned_size;
+ +
+++=======
++ 	if (dev_use_swiotlb(dev, size, dir) &&
++ 	    iova_offset(iovad, phys | size)) {
+++>>>>>>> 2650073f1b58 (iommu/dma: fix zeroing of bounce buffer padding used by untrusted devices)
+  		if (!is_swiotlb_active(dev)) {
+  			dev_warn_once(dev, "DMA bounce buffers are inactive, unable to map unaligned transaction.\n");
+  			return DMA_MAPPING_ERROR;
+  		}
+  
+++<<<<<<< HEAD
+ +		aligned_size = iova_align(iovad, size);
+ +		phys = swiotlb_tbl_map_single(dev, phys, size, aligned_size,
+++=======
++ 		trace_swiotlb_bounced(dev, phys, size);
++ 
++ 		phys = swiotlb_tbl_map_single(dev, phys, size,
+++>>>>>>> 2650073f1b58 (iommu/dma: fix zeroing of bounce buffer padding used by untrusted devices)
+  					      iova_mask(iovad), dir, attrs);
+  
+  		if (phys == DMA_MAPPING_ERROR)
+* Unmerged path drivers/iommu/dma-iommu.c
+diff --git a/include/linux/iova.h b/include/linux/iova.h
+index 4f41bb5086bf..faa13a06f6c9 100644
+--- a/include/linux/iova.h
++++ b/include/linux/iova.h
+@@ -67,6 +67,11 @@ static inline size_t iova_align(struct iova_domain *iovad, size_t size)
+ 	return ALIGN(size, iovad->granule);
+ }
+ 
++static inline size_t iova_align_down(struct iova_domain *iovad, size_t size)
++{
++	return ALIGN_DOWN(size, iovad->granule);
++}
++
+ static inline dma_addr_t iova_dma_addr(struct iova_domain *iovad, struct iova *iova)
+ {
+ 	return (dma_addr_t)iova->pfn_lo << iova_shift(iovad);
