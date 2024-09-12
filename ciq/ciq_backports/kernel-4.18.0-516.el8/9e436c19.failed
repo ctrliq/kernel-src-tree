@@ -1,0 +1,357 @@
+s390/pkey: add support for ecc clear key
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-516.el8
+commit-author Harald Freudenberger <freude@linux.ibm.com>
+commit 9e436c195e2d6d3a0db6921e14ef2c85e559ae5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-516.el8/9e436c19.failed
+
+Add support for a new 'non CCA clear key token' with these
+ECC clear keys supported:
+
+- ECC P256
+- ECC P384
+- ECC P521
+- ECC ED25519
+- ECC ED448
+
+This makes it possible to derive a protected key from this
+ECC clear key input via PKEY_KBLOB2PROTK3 ioctl. As of now
+the only way to derive protected keys from these clear key
+tokens is via PCKMO instruction. For AES keys an alternate
+path via creating a secure key from the clear key and then
+derive a protected key from the secure key exists. This
+alternate path is not implemented for ECC keys as it would
+require to rearrange and maybe recalculate the clear key
+material for input to derive an CCA or EP11 ECC secure key.
+
+	Signed-off-by: Harald Freudenberger <freude@linux.ibm.com>
+	Reviewed-by: Holger Dengler <dengler@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit 9e436c195e2d6d3a0db6921e14ef2c85e559ae5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/pkey_api.c
+diff --cc drivers/s390/crypto/pkey_api.c
+index 3930e75c24bd,e58bfd225323..000000000000
+--- a/drivers/s390/crypto/pkey_api.c
++++ b/drivers/s390/crypto/pkey_api.c
+@@@ -32,8 -33,10 +33,9 @@@ MODULE_AUTHOR("IBM Corporation")
+  MODULE_DESCRIPTION("s390 protected key interface");
+  
+  #define KEYBLOBBUFSIZE 8192	/* key buffer size used for internal processing */
++ #define MINKEYBLOBBUFSIZE (sizeof(struct keytoken_header))
+  #define PROTKEYBLOBBUFSIZE 256	/* protected key buffer size used internal */
+  #define MAXAPQNSINLIST 64	/* max 64 apqns within a apqn list */
+ -#define AES_WK_VP_SIZE 32	/* Size of WK VP block appended to a prot key */
+  
+  /*
+   * debug feature data and functions
+@@@ -71,29 -74,44 +73,56 @@@ struct protaeskeytoken 
+  } __packed;
+  
+  /* inside view of a clear key token (type 0x00 version 0x02) */
+- struct clearaeskeytoken {
+- 	u8  type;	 /* 0x00 for PAES specific key tokens */
++ struct clearkeytoken {
++ 	u8  type;	/* 0x00 for PAES specific key tokens */
+  	u8  res0[3];
+- 	u8  version;	 /* 0x02 for clear AES key token */
++ 	u8  version;	/* 0x02 for clear key token */
+  	u8  res1[3];
+++<<<<<<< HEAD
+ +	u32 keytype;	 /* key type, one of the PKEY_KEYTYPE values */
+ +	u32 len;	 /* bytes actually stored in clearkey[] */
+ +	u8  clearkey[0]; /* clear key value */
+++=======
++ 	u32 keytype;	/* key type, one of the PKEY_KEYTYPE_* values */
++ 	u32 len;	/* bytes actually stored in clearkey[] */
++ 	u8  clearkey[]; /* clear key value */
+++>>>>>>> 9e436c195e2d (s390/pkey: add support for ecc clear key)
+  } __packed;
+  
++ /* helper function which translates the PKEY_KEYTYPE_AES_* to their keysize */
++ static inline u32 pkey_keytype_aes_to_size(u32 keytype)
++ {
++ 	switch (keytype) {
++ 	case PKEY_KEYTYPE_AES_128:
++ 		return 16;
++ 	case PKEY_KEYTYPE_AES_192:
++ 		return 24;
++ 	case PKEY_KEYTYPE_AES_256:
++ 		return 32;
++ 	default:
++ 		return 0;
++ 	}
++ }
++ 
+  /*
+ - * Create a protected key from a clear key value via PCKMO instruction.
+ + * Create a protected key from a clear key value.
+   */
+ -static int pkey_clr2protkey(u32 keytype, const u8 *clrkey,
+ -			    u8 *protkey, u32 *protkeylen, u32 *protkeytype)
+ +static int pkey_clr2protkey(u32 keytype,
+ +			    const struct pkey_clrkey *clrkey,
+ +			    struct pkey_protkey *protkey)
+  {
+  	/* mask of available pckmo subfunctions */
+  	static cpacf_mask_t pckmo_functions;
+  
+++<<<<<<< HEAD
+++=======
++ 	u8 paramblock[112];
++ 	u32 pkeytype;
++ 	int keysize;
+++>>>>>>> 9e436c195e2d (s390/pkey: add support for ecc clear key)
+  	long fc;
+ +	int keysize;
+ +	u8 paramblock[64];
+  
+  	switch (keytype) {
+  	case PKEY_KEYTYPE_AES_128:
+@@@ -105,11 -127,43 +138,43 @@@
+  		fc = CPACF_PCKMO_ENC_AES_192_KEY;
+  		break;
+  	case PKEY_KEYTYPE_AES_256:
++ 		/* 32 byte key, 32 byte aes wkvp, total 64 bytes */
+  		keysize = 32;
++ 		pkeytype = keytype;
+  		fc = CPACF_PCKMO_ENC_AES_256_KEY;
+  		break;
++ 	case PKEY_KEYTYPE_ECC_P256:
++ 		/* 32 byte key, 32 byte aes wkvp, total 64 bytes */
++ 		keysize = 32;
++ 		pkeytype = PKEY_KEYTYPE_ECC;
++ 		fc = CPACF_PCKMO_ENC_ECC_P256_KEY;
++ 		break;
++ 	case PKEY_KEYTYPE_ECC_P384:
++ 		/* 48 byte key, 32 byte aes wkvp, total 80 bytes */
++ 		keysize = 48;
++ 		pkeytype = PKEY_KEYTYPE_ECC;
++ 		fc = CPACF_PCKMO_ENC_ECC_P384_KEY;
++ 		break;
++ 	case PKEY_KEYTYPE_ECC_P521:
++ 		/* 80 byte key, 32 byte aes wkvp, total 112 bytes */
++ 		keysize = 80;
++ 		pkeytype = PKEY_KEYTYPE_ECC;
++ 		fc = CPACF_PCKMO_ENC_ECC_P521_KEY;
++ 		break;
++ 	case PKEY_KEYTYPE_ECC_ED25519:
++ 		/* 32 byte key, 32 byte aes wkvp, total 64 bytes */
++ 		keysize = 32;
++ 		pkeytype = PKEY_KEYTYPE_ECC;
++ 		fc = CPACF_PCKMO_ENC_ECC_ED25519_KEY;
++ 		break;
++ 	case PKEY_KEYTYPE_ECC_ED448:
++ 		/* 64 byte key, 32 byte aes wkvp, total 96 bytes */
++ 		keysize = 64;
++ 		pkeytype = PKEY_KEYTYPE_ECC;
++ 		fc = CPACF_PCKMO_ENC_ECC_ED448_KEY;
++ 		break;
+  	default:
+ -		DEBUG_ERR("%s unknown/unsupported keytype %u\n",
+ +		DEBUG_ERR("%s unknown/unsupported keytype %d\n",
+  			  __func__, keytype);
+  		return -EINVAL;
+  	}
+@@@ -133,10 -193,10 +198,17 @@@
+  	/* call the pckmo instruction */
+  	cpacf_pckmo(fc, paramblock);
+  
+++<<<<<<< HEAD
+ +	/* copy created protected key */
+ +	protkey->type = keytype;
+ +	protkey->len = keysize + 32;
+ +	memcpy(protkey->protkey, paramblock, keysize + 32);
+++=======
++ 	/* copy created protected key to key buffer including the wkvp block */
++ 	*protkeylen = keysize + AES_WK_VP_SIZE;
++ 	memcpy(protkey, paramblock, *protkeylen);
++ 	*protkeytype = pkeytype;
+++>>>>>>> 9e436c195e2d (s390/pkey: add support for ecc clear key)
+  
+  	return 0;
+  }
+@@@ -391,11 -558,10 +559,15 @@@ static int nonccatokecc2pkey(const stru
+   * Transform a non-CCA key token into a protected key
+   */
+  static int pkey_nonccatok2pkey(const u8 *key, u32 keylen,
+ -			       u8 *protkey, u32 *protkeylen, u32 *protkeytype)
+ +			       struct pkey_protkey *protkey)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct keytoken_header *hdr = (struct keytoken_header *)key;
+++>>>>>>> 9e436c195e2d (s390/pkey: add support for ecc clear key)
+  	int rc = -EINVAL;
+ +	u8 *tmpbuf = NULL;
+ +	struct keytoken_header *hdr = (struct keytoken_header *)key;
+  
+  	switch (hdr->version) {
+  	case TOKVER_PROTECTED_KEY: {
+@@@ -412,51 -579,31 +584,54 @@@
+  		break;
+  	}
+  	case TOKVER_CLEAR_KEY: {
+- 		struct clearaeskeytoken *t;
+- 		struct pkey_clrkey ckey;
+- 		union u_tmpbuf {
+- 			u8 skey[SECKEYBLOBSIZE];
+- 			u8 ep11key[MAXEP11AESKEYBLOBSIZE];
+- 		};
+- 		size_t tmpbuflen = sizeof(union u_tmpbuf);
+- 
+- 		if (keylen < sizeof(struct clearaeskeytoken))
+- 			goto out;
+- 		t = (struct clearaeskeytoken *)key;
+- 		if (keylen != sizeof(*t) + t->len)
+- 			goto out;
+- 		if ((t->keytype == PKEY_KEYTYPE_AES_128 && t->len == 16) ||
+- 		    (t->keytype == PKEY_KEYTYPE_AES_192 && t->len == 24) ||
+- 		    (t->keytype == PKEY_KEYTYPE_AES_256 && t->len == 32))
+- 			memcpy(ckey.clrkey, t->clearkey, t->len);
+- 		else
+- 			goto out;
+- 		/* alloc temp key buffer space */
+- 		tmpbuf = kmalloc(tmpbuflen, GFP_ATOMIC);
+- 		if (!tmpbuf) {
+- 			rc = -ENOMEM;
++ 		struct clearkeytoken *t = (struct clearkeytoken *)key;
++ 
++ 		if (keylen < sizeof(struct clearkeytoken) ||
++ 		    keylen != sizeof(*t) + t->len)
+  			goto out;
++ 		switch (t->keytype) {
++ 		case PKEY_KEYTYPE_AES_128:
++ 		case PKEY_KEYTYPE_AES_192:
++ 		case PKEY_KEYTYPE_AES_256:
++ 			rc = nonccatokaes2pkey(t, protkey,
++ 					       protkeylen, protkeytype);
++ 			break;
++ 		case PKEY_KEYTYPE_ECC_P256:
++ 		case PKEY_KEYTYPE_ECC_P384:
++ 		case PKEY_KEYTYPE_ECC_P521:
++ 		case PKEY_KEYTYPE_ECC_ED25519:
++ 		case PKEY_KEYTYPE_ECC_ED448:
++ 			rc = nonccatokecc2pkey(t, protkey,
++ 					       protkeylen, protkeytype);
++ 			break;
++ 		default:
++ 			DEBUG_ERR("%s unknown/unsupported non cca clear key type %u\n",
++ 				  __func__, t->keytype);
++ 			return -EINVAL;
+  		}
+++<<<<<<< HEAD
+ +		/* try direct way with the PCKMO instruction */
+ +		rc = pkey_clr2protkey(t->keytype, &ckey, protkey);
+ +		if (rc == 0)
+ +			break;
+ +		/* PCKMO failed, so try the CCA secure key way */
+ +		zcrypt_wait_api_operational();
+ +		rc = cca_clr2seckey(0xFFFF, 0xFFFF, t->keytype,
+ +				    ckey.clrkey, tmpbuf);
+ +		if (rc == 0)
+ +			rc = pkey_skey2pkey(tmpbuf, protkey);
+ +		if (rc == 0)
+ +			break;
+ +		/* if the CCA way also failed, let's try via EP11 */
+ +		rc = pkey_clr2ep11key(ckey.clrkey, t->len,
+ +				      tmpbuf, &tmpbuflen);
+ +		if (rc == 0)
+ +			rc = pkey_ep11key2pkey(tmpbuf, protkey);
+ +		/* now we should really have an protected key */
+ +		DEBUG_ERR("%s unable to build protected key from clear",
+ +			  __func__);
+++=======
+++>>>>>>> 9e436c195e2d (s390/pkey: add support for ecc clear key)
+  		break;
+  	}
+  	case TOKVER_EP11_AES: {
+@@@ -1130,19 -1273,10 +1303,23 @@@ static int pkey_keyblob2pkey3(const str
+  
+  static void *_copy_key_from_user(void __user *ukey, size_t keylen)
+  {
+++<<<<<<< HEAD
+ +	void *kkey;
+ +
+ +	if (!ukey || keylen < MINKEYBLOBSIZE || keylen > KEYBLOBBUFSIZE)
+++=======
++ 	if (!ukey || keylen < MINKEYBLOBBUFSIZE || keylen > KEYBLOBBUFSIZE)
+++>>>>>>> 9e436c195e2d (s390/pkey: add support for ecc clear key)
+  		return ERR_PTR(-EINVAL);
+ +	kkey = kmalloc(keylen, GFP_KERNEL);
+ +	if (!kkey)
+ +		return ERR_PTR(-ENOMEM);
+ +	if (copy_from_user(kkey, ukey, keylen)) {
+ +		kfree(kkey);
+ +		return ERR_PTR(-EFAULT);
+ +	}
+  
+ -	return memdup_user(ukey, keylen);
+ +	return kkey;
+  }
+  
+  static void *_copy_apqns_from_user(void __user *uapqns, size_t nr_apqns)
+diff --git a/arch/s390/include/asm/cpacf.h b/arch/s390/include/asm/cpacf.h
+index 89b7d9c7a5d7..4bfc981ffd4d 100644
+--- a/arch/s390/include/asm/cpacf.h
++++ b/arch/s390/include/asm/cpacf.h
+@@ -2,7 +2,7 @@
+ /*
+  * CP Assist for Cryptographic Functions (CPACF)
+  *
+- * Copyright IBM Corp. 2003, 2017
++ * Copyright IBM Corp. 2003, 2023
+  * Author(s): Thomas Spatzier
+  *	      Jan Glauber
+  *	      Harald Freudenberger (freude@de.ibm.com)
+@@ -132,6 +132,11 @@
+ #define CPACF_PCKMO_ENC_AES_128_KEY	0x12
+ #define CPACF_PCKMO_ENC_AES_192_KEY	0x13
+ #define CPACF_PCKMO_ENC_AES_256_KEY	0x14
++#define CPACF_PCKMO_ENC_ECC_P256_KEY	0x20
++#define CPACF_PCKMO_ENC_ECC_P384_KEY	0x21
++#define CPACF_PCKMO_ENC_ECC_P521_KEY	0x22
++#define CPACF_PCKMO_ENC_ECC_ED25519_KEY	0x28
++#define CPACF_PCKMO_ENC_ECC_ED448_KEY	0x29
+ 
+ /*
+  * Function codes for the PRNO (PERFORM RANDOM NUMBER OPERATION)
+diff --git a/arch/s390/include/uapi/asm/pkey.h b/arch/s390/include/uapi/asm/pkey.h
+index 924b876f992c..f7bae1c63bd6 100644
+--- a/arch/s390/include/uapi/asm/pkey.h
++++ b/arch/s390/include/uapi/asm/pkey.h
+@@ -2,7 +2,7 @@
+ /*
+  * Userspace interface to the pkey device driver
+  *
+- * Copyright IBM Corp. 2017, 2019
++ * Copyright IBM Corp. 2017, 2023
+  *
+  * Author: Harald Freudenberger <freude@de.ibm.com>
+  *
+@@ -32,10 +32,15 @@
+ #define MINKEYBLOBSIZE	SECKEYBLOBSIZE
+ 
+ /* defines for the type field within the pkey_protkey struct */
+-#define PKEY_KEYTYPE_AES_128		      1
+-#define PKEY_KEYTYPE_AES_192		      2
+-#define PKEY_KEYTYPE_AES_256		      3
+-#define PKEY_KEYTYPE_ECC		      4
++#define PKEY_KEYTYPE_AES_128		1
++#define PKEY_KEYTYPE_AES_192		2
++#define PKEY_KEYTYPE_AES_256		3
++#define PKEY_KEYTYPE_ECC		4
++#define PKEY_KEYTYPE_ECC_P256		5
++#define PKEY_KEYTYPE_ECC_P384		6
++#define PKEY_KEYTYPE_ECC_P521		7
++#define PKEY_KEYTYPE_ECC_ED25519	8
++#define PKEY_KEYTYPE_ECC_ED448		9
+ 
+ /* the newer ioctls use a pkey_key_type enum for type information */
+ enum pkey_key_type {
+* Unmerged path drivers/s390/crypto/pkey_api.c
