@@ -1,0 +1,139 @@
+netfilter: nf_tables: fix table flag updates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-534.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 179d9ba5559a756f4322583388b3213fe4e391b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-534.el8/179d9ba5.failed
+
+The dormant flag need to be updated from the preparation phase,
+otherwise, two consecutive requests to dorm a table in the same batch
+might try to remove the same hooks twice, resulting in the following
+warning:
+
+ hook not found, pf 3 num 0
+ WARNING: CPU: 0 PID: 334 at net/netfilter/core.c:480 __nf_unregister_net_hook+0x1eb/0x610 net/netfilter/core.c:480
+ Modules linked in:
+ CPU: 0 PID: 334 Comm: kworker/u4:5 Not tainted 5.12.0-syzkaller #0
+ Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
+ Workqueue: netns cleanup_net
+ RIP: 0010:__nf_unregister_net_hook+0x1eb/0x610 net/netfilter/core.c:480
+
+This patch is a partial revert of 0ce7cf4127f1 ("netfilter: nftables:
+update table flags from the commit phase") to restore the previous
+behaviour.
+
+However, there is still another problem: A batch containing a series of
+dorm-wakeup-dorm table and vice-versa also trigger the warning above
+since hook unregistration happens from the preparation phase, while hook
+registration occurs from the commit phase.
+
+To fix this problem, this patch adds two internal flags to annotate the
+original dormant flag status which are __NFT_TABLE_F_WAS_DORMANT and
+__NFT_TABLE_F_WAS_AWAKEN, to restore it from the abort path.
+
+The __NFT_TABLE_F_UPDATE bitmask allows to handle the dormant flag update
+with one single transaction.
+
+	Reported-by: syzbot+7ad5cd1615f2d89c6e7e@syzkaller.appspotmail.com
+Fixes: 0ce7cf4127f1 ("netfilter: nftables: update table flags from the commit phase")
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 179d9ba5559a756f4322583388b3213fe4e391b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+diff --cc net/netfilter/nf_tables_api.c
+index 4dd3d2e4449b,72bc759179ef..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -718,20 -728,16 +718,21 @@@ static int nf_tables_fill_table_info(st
+  				     int family, const struct nft_table *table)
+  {
+  	struct nlmsghdr *nlh;
+ +	struct nfgenmsg *nfmsg;
+  
+  	event = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, event);
+ -	nlh = nfnl_msg_put(skb, portid, seq, event, flags, family,
+ -			   NFNETLINK_V0, nft_base_seq(net));
+ -	if (!nlh)
+ +	nlh = nlmsg_put(skb, portid, seq, event, sizeof(struct nfgenmsg), flags);
+ +	if (nlh == NULL)
+  		goto nla_put_failure;
+  
+ +	nfmsg = nlmsg_data(nlh);
+ +	nfmsg->nfgen_family	= family;
+ +	nfmsg->version		= NFNETLINK_V0;
+ +	nfmsg->res_id		= htons(net->nft.base_seq & 0xffff);
+ +
+  	if (nla_put_string(skb, NFTA_TABLE_NAME, table->name) ||
+- 	    nla_put_be32(skb, NFTA_TABLE_FLAGS, htonl(table->flags)) ||
++ 	    nla_put_be32(skb, NFTA_TABLE_FLAGS,
++ 			 htonl(table->flags & NFT_TABLE_F_MASK)) ||
+  	    nla_put_be32(skb, NFTA_TABLE_USE, htonl(table->use)) ||
+  	    nla_put_be64(skb, NFTA_TABLE_HANDLE, cpu_to_be64(table->handle),
+  			 NFTA_TABLE_PAD))
+@@@ -962,21 -988,27 +965,31 @@@ static int nf_tables_updtable(struct nf
+  
+  	if ((flags & NFT_TABLE_F_DORMANT) &&
+  	    !(ctx->table->flags & NFT_TABLE_F_DORMANT)) {
+- 		nft_trans_table_state(trans) = NFT_TABLE_STATE_DORMANT;
++ 		ctx->table->flags |= NFT_TABLE_F_DORMANT;
++ 		if (!(ctx->table->flags & __NFT_TABLE_F_UPDATE))
++ 			ctx->table->flags |= __NFT_TABLE_F_WAS_AWAKEN;
+  	} else if (!(flags & NFT_TABLE_F_DORMANT) &&
+  		   ctx->table->flags & NFT_TABLE_F_DORMANT) {
+- 		ret = nf_tables_table_enable(ctx->net, ctx->table);
+- 		if (ret >= 0)
+- 			nft_trans_table_state(trans) = NFT_TABLE_STATE_WAKEUP;
++ 		ctx->table->flags &= ~NFT_TABLE_F_DORMANT;
++ 		if (!(ctx->table->flags & __NFT_TABLE_F_UPDATE)) {
++ 			ret = nf_tables_table_enable(ctx->net, ctx->table);
++ 			if (ret < 0)
++ 				goto err_register_hooks;
++ 
++ 			ctx->table->flags |= __NFT_TABLE_F_WAS_DORMANT;
++ 		}
+  	}
+- 	if (ret < 0)
+- 		goto err;
+  
+- 	nft_trans_table_flags(trans) = flags;
+  	nft_trans_table_update(trans) = true;
+++<<<<<<< HEAD
+ +	list_add_tail(&trans->list, &ctx->net->nft.commit_list);
+++=======
++ 	nft_trans_commit_list_add_tail(ctx->net, trans);
++ 
+++>>>>>>> 179d9ba5559a (netfilter: nf_tables: fix table flag updates)
+  	return 0;
+- err:
++ 
++ err_register_hooks:
+  	nft_trans_destroy(trans);
+  	return ret;
+  }
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index bb3d5316c6d5..204dcaff025d 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -1479,16 +1479,10 @@ struct nft_trans_chain {
+ 
+ struct nft_trans_table {
+ 	bool				update;
+-	u8				state;
+-	u32				flags;
+ };
+ 
+ #define nft_trans_table_update(trans)	\
+ 	(((struct nft_trans_table *)trans->data)->update)
+-#define nft_trans_table_state(trans)	\
+-	(((struct nft_trans_table *)trans->data)->state)
+-#define nft_trans_table_flags(trans)	\
+-	(((struct nft_trans_table *)trans->data)->flags)
+ 
+ struct nft_trans_elem {
+ 	struct nft_set			*set;
+* Unmerged path net/netfilter/nf_tables_api.c
