@@ -1,0 +1,2424 @@
+rxrpc: Make the I/O thread take over the call and local processor work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 5e6ef4f1017c7f844e305283bbd8875af475e2fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/5e6ef4f1.failed
+
+Move the functions from the call->processor and local->processor work items
+into the domain of the I/O thread.
+
+The call event processor, now called from the I/O thread, then takes over
+the job of cranking the call state machine, processing incoming packets and
+transmitting DATA, ACK and ABORT packets.  In a future patch,
+rxrpc_send_ACK() will transmit the ACK on the spot rather than queuing it
+for later transmission.
+
+The call event processor becomes purely received-skb driven.  It only
+transmits things in response to events.  We use "pokes" to queue a dummy
+skb to make it do things like start/resume transmitting data.  Timer expiry
+also results in pokes.
+
+The connection event processor, becomes similar, though crypto events, such
+as dealing with CHALLENGE and RESPONSE packets is offloaded to a work item
+to avoid doing crypto in the I/O thread.
+
+The local event processor is removed and VERSION response packets are
+generated directly from the packet parser.  Similarly, ABORTs generated in
+response to protocol errors will be transmitted immediately rather than
+being pushed onto a queue for later transmission.
+
+Changes:
+========
+ver #2)
+ - Fix a couple of introduced lock context imbalances.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit 5e6ef4f1017c7f844e305283bbd8875af475e2fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/trace/events/rxrpc.h
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/call_accept.c
+#	net/rxrpc/call_event.c
+#	net/rxrpc/call_object.c
+#	net/rxrpc/conn_object.c
+#	net/rxrpc/input.c
+#	net/rxrpc/io_thread.c
+#	net/rxrpc/local_event.c
+#	net/rxrpc/local_object.c
+#	net/rxrpc/output.c
+#	net/rxrpc/peer_event.c
+#	net/rxrpc/sendmsg.c
+diff --cc include/trace/events/rxrpc.h
+index 2a52121d73a0,c49b0c233594..000000000000
+--- a/include/trace/events/rxrpc.h
++++ b/include/trace/events/rxrpc.h
+@@@ -16,44 -16,122 +16,126 @@@
+  /*
+   * Declare tracing information enums and their string mappings for display.
+   */
+ -#define rxrpc_call_poke_traces \
+ -	EM(rxrpc_call_poke_error,		"Error")	\
+ -	EM(rxrpc_call_poke_idle,		"Idle")		\
+ -	EM(rxrpc_call_poke_start,		"Start")	\
+ -	EM(rxrpc_call_poke_timer,		"Timer")	\
+ -	E_(rxrpc_call_poke_timer_now,		"Timer-now")
+ -
+  #define rxrpc_skb_traces \
+++<<<<<<< HEAD
+ +	EM(rxrpc_skb_ack,			"ACK") \
+ +	EM(rxrpc_skb_cleaned,			"CLN") \
+ +	EM(rxrpc_skb_cloned_jumbo,		"CLJ") \
+ +	EM(rxrpc_skb_freed,			"FRE") \
+ +	EM(rxrpc_skb_got,			"GOT") \
+ +	EM(rxrpc_skb_lost,			"*L*") \
+ +	EM(rxrpc_skb_new,			"NEW") \
+ +	EM(rxrpc_skb_purged,			"PUR") \
+ +	EM(rxrpc_skb_received,			"RCV") \
+ +	EM(rxrpc_skb_rotated,			"ROT") \
+ +	EM(rxrpc_skb_seen,			"SEE") \
+ +	EM(rxrpc_skb_unshared,			"UNS") \
+ +	E_(rxrpc_skb_unshared_nomem,		"US0")
+ +
+ +#define rxrpc_local_traces \
+ +	EM(rxrpc_local_got,			"GOT") \
+ +	EM(rxrpc_local_new,			"NEW") \
+ +	EM(rxrpc_local_processing,		"PRO") \
+ +	EM(rxrpc_local_put,			"PUT") \
+ +	EM(rxrpc_local_queued,			"QUE") \
+ +	E_(rxrpc_local_tx_ack,			"TAK")
+ +
+ +#define rxrpc_peer_traces \
+ +	EM(rxrpc_peer_got,			"GOT") \
+ +	EM(rxrpc_peer_new,			"NEW") \
+ +	EM(rxrpc_peer_processing,		"PRO") \
+ +	E_(rxrpc_peer_put,			"PUT")
+++=======
++ 	EM(rxrpc_skb_eaten_by_unshare,		"ETN unshare  ") \
++ 	EM(rxrpc_skb_eaten_by_unshare_nomem,	"ETN unshar-nm") \
++ 	EM(rxrpc_skb_get_conn_work,		"GET conn-work") \
++ 	EM(rxrpc_skb_get_local_work,		"GET locl-work") \
++ 	EM(rxrpc_skb_get_reject_work,		"GET rej-work ") \
++ 	EM(rxrpc_skb_get_to_recvmsg,		"GET to-recv  ") \
++ 	EM(rxrpc_skb_get_to_recvmsg_oos,	"GET to-recv-o") \
++ 	EM(rxrpc_skb_new_encap_rcv,		"NEW encap-rcv") \
++ 	EM(rxrpc_skb_new_error_report,		"NEW error-rpt") \
++ 	EM(rxrpc_skb_new_jumbo_subpacket,	"NEW jumbo-sub") \
++ 	EM(rxrpc_skb_new_unshared,		"NEW unshared ") \
++ 	EM(rxrpc_skb_put_conn_work,		"PUT conn-work") \
++ 	EM(rxrpc_skb_put_error_report,		"PUT error-rep") \
++ 	EM(rxrpc_skb_put_input,			"PUT input    ") \
++ 	EM(rxrpc_skb_put_jumbo_subpacket,	"PUT jumbo-sub") \
++ 	EM(rxrpc_skb_put_purge,			"PUT purge    ") \
++ 	EM(rxrpc_skb_put_rotate,		"PUT rotate   ") \
++ 	EM(rxrpc_skb_put_unknown,		"PUT unknown  ") \
++ 	EM(rxrpc_skb_see_conn_work,		"SEE conn-work") \
++ 	EM(rxrpc_skb_see_recvmsg,		"SEE recvmsg  ") \
++ 	EM(rxrpc_skb_see_reject,		"SEE reject   ") \
++ 	EM(rxrpc_skb_see_rotate,		"SEE rotate   ") \
++ 	E_(rxrpc_skb_see_version,		"SEE version  ")
++ 
++ #define rxrpc_local_traces \
++ 	EM(rxrpc_local_free,			"FREE        ") \
++ 	EM(rxrpc_local_get_call,		"GET call    ") \
++ 	EM(rxrpc_local_get_client_conn,		"GET conn-cln") \
++ 	EM(rxrpc_local_get_for_use,		"GET for-use ") \
++ 	EM(rxrpc_local_get_peer,		"GET peer    ") \
++ 	EM(rxrpc_local_get_prealloc_conn,	"GET conn-pre") \
++ 	EM(rxrpc_local_new,			"NEW         ") \
++ 	EM(rxrpc_local_put_bind,		"PUT bind    ") \
++ 	EM(rxrpc_local_put_call,		"PUT call    ") \
++ 	EM(rxrpc_local_put_for_use,		"PUT for-use ") \
++ 	EM(rxrpc_local_put_kill_conn,		"PUT conn-kil") \
++ 	EM(rxrpc_local_put_peer,		"PUT peer    ") \
++ 	EM(rxrpc_local_put_prealloc_conn,	"PUT conn-pre") \
++ 	EM(rxrpc_local_put_release_sock,	"PUT rel-sock") \
++ 	EM(rxrpc_local_see_tx_ack,		"SEE tx-ack  ") \
++ 	EM(rxrpc_local_stop,			"STOP        ") \
++ 	EM(rxrpc_local_stopped,			"STOPPED     ") \
++ 	EM(rxrpc_local_unuse_bind,		"UNU bind    ") \
++ 	EM(rxrpc_local_unuse_conn_work,		"UNU conn-wrk") \
++ 	EM(rxrpc_local_unuse_peer_keepalive,	"UNU peer-kpa") \
++ 	EM(rxrpc_local_unuse_release_sock,	"UNU rel-sock") \
++ 	EM(rxrpc_local_use_conn_work,		"USE conn-wrk") \
++ 	EM(rxrpc_local_use_lookup,		"USE lookup  ") \
++ 	E_(rxrpc_local_use_peer_keepalive,	"USE peer-kpa")
++ 
++ #define rxrpc_peer_traces \
++ 	EM(rxrpc_peer_free,			"FREE        ") \
++ 	EM(rxrpc_peer_get_accept,		"GET accept  ") \
++ 	EM(rxrpc_peer_get_activate_call,	"GET act-call") \
++ 	EM(rxrpc_peer_get_bundle,		"GET bundle  ") \
++ 	EM(rxrpc_peer_get_client_conn,		"GET cln-conn") \
++ 	EM(rxrpc_peer_get_input,		"GET input   ") \
++ 	EM(rxrpc_peer_get_input_error,		"GET inpt-err") \
++ 	EM(rxrpc_peer_get_keepalive,		"GET keepaliv") \
++ 	EM(rxrpc_peer_get_lookup_client,	"GET look-cln") \
++ 	EM(rxrpc_peer_get_service_conn,		"GET srv-conn") \
++ 	EM(rxrpc_peer_new_client,		"NEW client  ") \
++ 	EM(rxrpc_peer_new_prealloc,		"NEW prealloc") \
++ 	EM(rxrpc_peer_put_bundle,		"PUT bundle  ") \
++ 	EM(rxrpc_peer_put_call,			"PUT call    ") \
++ 	EM(rxrpc_peer_put_conn,			"PUT conn    ") \
++ 	EM(rxrpc_peer_put_discard_tmp,		"PUT disc-tmp") \
++ 	EM(rxrpc_peer_put_input,		"PUT input   ") \
++ 	EM(rxrpc_peer_put_input_error,		"PUT inpt-err") \
++ 	E_(rxrpc_peer_put_keepalive,		"PUT keepaliv")
++ 
++ #define rxrpc_bundle_traces \
++ 	EM(rxrpc_bundle_free,			"FREE        ") \
++ 	EM(rxrpc_bundle_get_client_call,	"GET clt-call") \
++ 	EM(rxrpc_bundle_get_client_conn,	"GET clt-conn") \
++ 	EM(rxrpc_bundle_get_service_conn,	"GET svc-conn") \
++ 	EM(rxrpc_bundle_put_conn,		"PUT conn    ") \
++ 	EM(rxrpc_bundle_put_discard,		"PUT discard ") \
++ 	E_(rxrpc_bundle_new,			"NEW         ")
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  
+  #define rxrpc_conn_traces \
+ -	EM(rxrpc_conn_free,			"FREE        ") \
+ -	EM(rxrpc_conn_get_activate_call,	"GET act-call") \
+ -	EM(rxrpc_conn_get_call_input,		"GET inp-call") \
+ -	EM(rxrpc_conn_get_conn_input,		"GET inp-conn") \
+ -	EM(rxrpc_conn_get_idle,			"GET idle    ") \
+ -	EM(rxrpc_conn_get_poke,			"GET poke    ") \
+ -	EM(rxrpc_conn_get_service_conn,		"GET svc-conn") \
+ -	EM(rxrpc_conn_new_client,		"NEW client  ") \
+ -	EM(rxrpc_conn_new_service,		"NEW service ") \
+ -	EM(rxrpc_conn_put_call,			"PUT call    ") \
+ -	EM(rxrpc_conn_put_call_input,		"PUT inp-call") \
+ -	EM(rxrpc_conn_put_conn_input,		"PUT inp-conn") \
+ -	EM(rxrpc_conn_put_discard,		"PUT discard ") \
+ -	EM(rxrpc_conn_put_discard_idle,		"PUT disc-idl") \
+ -	EM(rxrpc_conn_put_local_dead,		"PUT loc-dead") \
+ -	EM(rxrpc_conn_put_noreuse,		"PUT noreuse ") \
+ -	EM(rxrpc_conn_put_poke,			"PUT poke    ") \
+ -	EM(rxrpc_conn_put_service_reaped,	"PUT svc-reap") \
+ -	EM(rxrpc_conn_put_unbundle,		"PUT unbundle") \
+ -	EM(rxrpc_conn_put_unidle,		"PUT unidle  ") \
+ -	EM(rxrpc_conn_queue_challenge,		"QUE chall   ") \
+ -	EM(rxrpc_conn_queue_retry_work,		"QUE retry-wk") \
+ -	EM(rxrpc_conn_queue_rx_work,		"QUE rx-work ") \
+ -	EM(rxrpc_conn_queue_timer,		"QUE timer   ") \
+ -	EM(rxrpc_conn_see_new_service_conn,	"SEE new-svc ") \
+ -	EM(rxrpc_conn_see_reap_service,		"SEE reap-svc") \
+ -	E_(rxrpc_conn_see_work,			"SEE work    ")
+ +	EM(rxrpc_conn_got,			"GOT") \
+ +	EM(rxrpc_conn_new_client,		"NWc") \
+ +	EM(rxrpc_conn_new_service,		"NWs") \
+ +	EM(rxrpc_conn_put_client,		"PTc") \
+ +	EM(rxrpc_conn_put_service,		"PTs") \
+ +	EM(rxrpc_conn_queued,			"QUE") \
+ +	EM(rxrpc_conn_reap_service,		"RPs") \
+ +	E_(rxrpc_conn_seen,			"SEE")
+  
+  #define rxrpc_client_traces \
+  	EM(rxrpc_client_activate_chans,		"Activa") \
+@@@ -91,15 -170,8 +173,18 @@@
+  	EM(rxrpc_call_put_release_sock_tba,	"PUT rls-sk-a") \
+  	EM(rxrpc_call_put_send_ack,		"PUT send-ack") \
+  	EM(rxrpc_call_put_sendmsg,		"PUT sendmsg ") \
+ +	EM(rxrpc_call_put_timer,		"PUT timer   ") \
+ +	EM(rxrpc_call_put_timer_already,	"PUT timer-al") \
+  	EM(rxrpc_call_put_unnotify,		"PUT unnotify") \
+  	EM(rxrpc_call_put_userid_exists,	"PUT u-exists") \
+++<<<<<<< HEAD
+ +	EM(rxrpc_call_put_work,			"PUT work    ") \
+ +	EM(rxrpc_call_queue_abort,		"QUE abort   ") \
+ +	EM(rxrpc_call_queue_requeue,		"QUE requeue ") \
+ +	EM(rxrpc_call_queue_resend,		"QUE resend  ") \
+ +	EM(rxrpc_call_queue_timer,		"QUE timer   ") \
+++=======
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	EM(rxrpc_call_see_accept,		"SEE accept  ") \
+  	EM(rxrpc_call_see_activate_client,	"SEE act-clnt") \
+  	EM(rxrpc_call_see_connect_failed,	"SEE con-fail") \
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,6b993a3d4186..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -279,13 -283,13 +279,22 @@@ struct rxrpc_local 
+  	struct rxrpc_net	*rxnet;		/* The network ns in which this resides */
+  	struct hlist_node	link;
+  	struct socket		*socket;	/* my UDP socket */
+++<<<<<<< HEAD
+ +	struct work_struct	processor;
+++=======
++ 	struct task_struct	*io_thread;
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	struct list_head	ack_tx_queue;	/* List of ACKs that need sending */
+  	spinlock_t		ack_tx_lock;	/* ACK list lock */
+  	struct rxrpc_sock __rcu	*service;	/* Service(s) listening on this endpoint */
+  	struct rw_semaphore	defrag_sem;	/* control re-enablement of IP DF bit */
+++<<<<<<< HEAD
+ +	struct sk_buff_head	reject_queue;	/* packets awaiting rejection */
+ +	struct sk_buff_head	event_queue;	/* endpoint event packets awaiting processing */
+++=======
++ 	struct sk_buff_head	rx_queue;	/* Received packets */
++ 	struct list_head	call_attend_q;	/* Calls requiring immediate attention */
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	struct rb_root		client_bundles;	/* Client connection bundles by socket params */
+  	spinlock_t		client_bundles_lock; /* Lock for client_bundles */
+  	spinlock_t		lock;		/* access lock */
+@@@ -505,9 -524,8 +514,13 @@@ enum rxrpc_call_flag 
+  	RXRPC_CALL_DISCONNECTED,	/* The call has been disconnected */
+  	RXRPC_CALL_KERNEL,		/* The call was made by the kernel */
+  	RXRPC_CALL_UPGRADE,		/* Service upgrade was requested for the call */
+++<<<<<<< HEAD
+ +	RXRPC_CALL_DELAY_ACK_PENDING,	/* DELAY ACK generation is pending */
+ +	RXRPC_CALL_IDLE_ACK_PENDING,	/* IDLE ACK generation is pending */
+++=======
++ 	RXRPC_CALL_EXCLUSIVE,		/* The call uses a once-only connection */
++ 	RXRPC_CALL_RX_IS_IDLE,		/* Reception is idle - send an ACK */
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  };
+  
+  /*
+@@@ -585,7 -604,7 +596,11 @@@ struct rxrpc_call 
+  	u32			next_rx_timo;	/* Timeout for next Rx packet (jif) */
+  	u32			next_req_timo;	/* Timeout for next Rx request packet (jif) */
+  	struct timer_list	timer;		/* Combined event timer */
+++<<<<<<< HEAD
+ +	struct work_struct	processor;	/* Event processor */
+++=======
++ 	struct work_struct	destroyer;	/* In-process-context destroyer */
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	rxrpc_notify_rx_t	notify_rx;	/* kernel service Rx notification function */
+  	struct list_head	link;		/* link in master call list */
+  	struct list_head	chan_wait_link;	/* Link in conn->bundle->waiting_calls */
+@@@ -793,9 -810,9 +804,15 @@@ extern struct workqueue_struct *rxrpc_w
+   */
+  int rxrpc_service_prealloc(struct rxrpc_sock *, gfp_t);
+  void rxrpc_discard_prealloc(struct rxrpc_sock *);
+++<<<<<<< HEAD
+ +struct rxrpc_call *rxrpc_new_incoming_call(struct rxrpc_local *,
+ +					   struct rxrpc_sock *,
+ +					   struct sk_buff *);
+++=======
++ bool rxrpc_new_incoming_call(struct rxrpc_local *, struct rxrpc_peer *,
++ 			     struct rxrpc_connection *, struct sockaddr_rxrpc *,
++ 			     struct sk_buff *);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  void rxrpc_accept_incoming_calls(struct rxrpc_local *);
+  int rxrpc_user_charge_accept(struct rxrpc_sock *, unsigned long);
+  
+@@@ -815,7 -832,7 +832,11 @@@ void rxrpc_reduce_call_timer(struct rxr
+  			     unsigned long now,
+  			     enum rxrpc_timer_trace why);
+  
+++<<<<<<< HEAD
+ +void rxrpc_delete_call_timer(struct rxrpc_call *call);
+++=======
++ void rxrpc_input_call_event(struct rxrpc_call *call, struct sk_buff *skb);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  
+  /*
+   * call_object.c
+@@@ -835,10 -853,8 +856,13 @@@ void rxrpc_incoming_call(struct rxrpc_s
+  			 struct sk_buff *);
+  void rxrpc_release_call(struct rxrpc_sock *, struct rxrpc_call *);
+  void rxrpc_release_calls_on_socket(struct rxrpc_sock *);
+++<<<<<<< HEAD
+ +bool __rxrpc_queue_call(struct rxrpc_call *, enum rxrpc_call_trace);
+ +bool rxrpc_queue_call(struct rxrpc_call *, enum rxrpc_call_trace);
+++=======
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  void rxrpc_see_call(struct rxrpc_call *, enum rxrpc_call_trace);
+- bool rxrpc_try_get_call(struct rxrpc_call *, enum rxrpc_call_trace);
++ struct rxrpc_call *rxrpc_try_get_call(struct rxrpc_call *, enum rxrpc_call_trace);
+  void rxrpc_get_call(struct rxrpc_call *, enum rxrpc_call_trace);
+  void rxrpc_put_call(struct rxrpc_call *, enum rxrpc_call_trace);
+  void rxrpc_cleanup_call(struct rxrpc_call *);
+@@@ -887,18 -904,20 +912,25 @@@ int rxrpc_input_conn_packet(struct rxrp
+  extern unsigned int rxrpc_connection_expiry;
+  extern unsigned int rxrpc_closed_conn_expiry;
+  
+++<<<<<<< HEAD
+ +struct rxrpc_connection *rxrpc_alloc_connection(gfp_t);
+ +struct rxrpc_connection *rxrpc_find_connection_rcu(struct rxrpc_local *,
+ +						   struct sk_buff *,
+ +						   struct rxrpc_peer **);
+++=======
++ struct rxrpc_connection *rxrpc_alloc_connection(struct rxrpc_net *, gfp_t);
++ struct rxrpc_connection *rxrpc_find_client_connection_rcu(struct rxrpc_local *,
++ 							  struct sockaddr_rxrpc *,
++ 							  struct sk_buff *);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  void __rxrpc_disconnect_call(struct rxrpc_connection *, struct rxrpc_call *);
+  void rxrpc_disconnect_call(struct rxrpc_call *);
+ -void rxrpc_kill_client_conn(struct rxrpc_connection *);
+ -void rxrpc_queue_conn(struct rxrpc_connection *, enum rxrpc_conn_trace);
+ -void rxrpc_see_connection(struct rxrpc_connection *, enum rxrpc_conn_trace);
+ -struct rxrpc_connection *rxrpc_get_connection(struct rxrpc_connection *,
+ -					      enum rxrpc_conn_trace);
+ -struct rxrpc_connection *rxrpc_get_connection_maybe(struct rxrpc_connection *,
+ -						    enum rxrpc_conn_trace);
+ -void rxrpc_put_connection(struct rxrpc_connection *, enum rxrpc_conn_trace);
+ +void rxrpc_kill_connection(struct rxrpc_connection *);
+ +bool rxrpc_queue_conn(struct rxrpc_connection *);
+ +void rxrpc_see_connection(struct rxrpc_connection *);
+ +struct rxrpc_connection *rxrpc_get_connection(struct rxrpc_connection *);
+ +struct rxrpc_connection *rxrpc_get_connection_maybe(struct rxrpc_connection *);
+ +void rxrpc_put_service_conn(struct rxrpc_connection *);
+  void rxrpc_service_connection_reaper(struct work_struct *);
+  void rxrpc_destroy_all_connections(struct rxrpc_net *);
+  
+@@@ -942,7 -950,19 +974,23 @@@ void rxrpc_unpublish_service_conn(struc
+  /*
+   * input.c
+   */
+++<<<<<<< HEAD
+ +int rxrpc_input_packet(struct sock *, struct sk_buff *);
+++=======
++ void rxrpc_input_call_packet(struct rxrpc_call *, struct sk_buff *);
++ void rxrpc_implicit_end_call(struct rxrpc_call *, struct sk_buff *);
++ 
++ /*
++  * io_thread.c
++  */
++ int rxrpc_encap_rcv(struct sock *, struct sk_buff *);
++ void rxrpc_error_report(struct sock *);
++ int rxrpc_io_thread(void *data);
++ static inline void rxrpc_wake_up_io_thread(struct rxrpc_local *local)
++ {
++ 	wake_up_process(local->io_thread);
++ }
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  
+  /*
+   * insecure.c
+@@@ -967,22 -989,45 +1017,31 @@@ void rxrpc_send_version_request(struct 
+   * local_object.c
+   */
+  struct rxrpc_local *rxrpc_lookup_local(struct net *, const struct sockaddr_rxrpc *);
+++<<<<<<< HEAD
+ +struct rxrpc_local *rxrpc_get_local(struct rxrpc_local *);
+ +struct rxrpc_local *rxrpc_get_local_maybe(struct rxrpc_local *);
+ +void rxrpc_put_local(struct rxrpc_local *);
+ +struct rxrpc_local *rxrpc_use_local(struct rxrpc_local *);
+ +void rxrpc_unuse_local(struct rxrpc_local *);
+ +void rxrpc_queue_local(struct rxrpc_local *);
+++=======
++ struct rxrpc_local *rxrpc_get_local(struct rxrpc_local *, enum rxrpc_local_trace);
++ struct rxrpc_local *rxrpc_get_local_maybe(struct rxrpc_local *, enum rxrpc_local_trace);
++ void rxrpc_put_local(struct rxrpc_local *, enum rxrpc_local_trace);
++ struct rxrpc_local *rxrpc_use_local(struct rxrpc_local *, enum rxrpc_local_trace);
++ void rxrpc_unuse_local(struct rxrpc_local *, enum rxrpc_local_trace);
++ void rxrpc_destroy_local(struct rxrpc_local *local);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  void rxrpc_destroy_all_locals(struct rxrpc_net *);
+  
+ -static inline bool __rxrpc_unuse_local(struct rxrpc_local *local,
+ -				       enum rxrpc_local_trace why)
+ -{
+ -	unsigned int debug_id = local->debug_id;
+ -	int r, u;
+ -
+ -	r = refcount_read(&local->ref);
+ -	u = atomic_dec_return(&local->active_users);
+ -	trace_rxrpc_local(debug_id, why, r, u);
+ -	return u == 0;
+ -}
+ -
+ -static inline bool __rxrpc_use_local(struct rxrpc_local *local,
+ -				     enum rxrpc_local_trace why)
+ +static inline bool __rxrpc_unuse_local(struct rxrpc_local *local)
+  {
+ -	int r, u;
+ -
+ -	r = refcount_read(&local->ref);
+ -	u = atomic_fetch_add_unless(&local->active_users, 1, 0);
+ -	trace_rxrpc_local(local->debug_id, why, r, u);
+ -	return u != 0;
+ +	return atomic_dec_return(&local->active_users) == 0;
+  }
+  
+ -static inline void rxrpc_see_local(struct rxrpc_local *local,
+ -				   enum rxrpc_local_trace why)
+ +static inline bool __rxrpc_use_local(struct rxrpc_local *local)
+  {
+ -	int r, u;
+ -
+ -	r = refcount_read(&local->ref);
+ -	u = atomic_read(&local->active_users);
+ -	trace_rxrpc_local(local->debug_id, why, r, u);
+ +	return atomic_fetch_add_unless(&local->active_users, 1, 0) != 0;
+  }
+  
+  /*
+@@@ -1012,8 -1057,9 +1071,8 @@@ static inline struct rxrpc_net *rxrpc_n
+  void rxrpc_transmit_ack_packets(struct rxrpc_local *);
+  int rxrpc_send_abort_packet(struct rxrpc_call *);
+  int rxrpc_send_data_packet(struct rxrpc_call *, struct rxrpc_txbuf *);
+- void rxrpc_reject_packets(struct rxrpc_local *);
++ void rxrpc_reject_packet(struct rxrpc_local *local, struct sk_buff *skb);
+  void rxrpc_send_keepalive(struct rxrpc_peer *);
+ -void rxrpc_transmit_one(struct rxrpc_call *call, struct rxrpc_txbuf *txb);
+  
+  /*
+   * peer_event.c
+diff --cc net/rxrpc/call_accept.c
+index afe1f587aaf0,87b46c2a1985..000000000000
+--- a/net/rxrpc/call_accept.c
++++ b/net/rxrpc/call_accept.c
+@@@ -334,23 -321,21 +319,35 @@@ static struct rxrpc_call *rxrpc_alloc_i
+   * If this is for a kernel service, when we allocate the call, it will have
+   * three refs on it: (1) the kernel service, (2) the user_call_ID tree, (3) the
+   * retainer ref obtained from the backlog buffer.  Prealloc calls for userspace
+++<<<<<<< HEAD
+ + * services only have the ref from the backlog buffer.  We want to pass this
+ + * ref to non-BH context to dispose of.
+ + *
+ + * If we want to report an error, we mark the skb with the packet type and
+ + * abort code and return NULL.
+ + *
+ + * The call is returned with the user access mutex held.
+ + */
+ +struct rxrpc_call *rxrpc_new_incoming_call(struct rxrpc_local *local,
+ +					   struct rxrpc_sock *rx,
+ +					   struct sk_buff *skb)
+++=======
++  * services only have the ref from the backlog buffer.
++  *
++  * If we want to report an error, we mark the skb with the packet type and
++  * abort code and return false.
++  */
++ bool rxrpc_new_incoming_call(struct rxrpc_local *local,
++ 			     struct rxrpc_peer *peer,
++ 			     struct rxrpc_connection *conn,
++ 			     struct sockaddr_rxrpc *peer_srx,
++ 			     struct sk_buff *skb)
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  {
+- 	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
+  	const struct rxrpc_security *sec = NULL;
+- 	struct rxrpc_connection *conn;
+- 	struct rxrpc_peer *peer = NULL;
++ 	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
+  	struct rxrpc_call *call = NULL;
++ 	struct rxrpc_sock *rx;
+  
+  	_enter("");
+  
+@@@ -364,20 -376,8 +388,25 @@@
+  		goto no_call;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* The peer, connection and call may all have sprung into existence due
+ +	 * to a duplicate packet being handled on another CPU in parallel, so
+ +	 * we have to recheck the routing.  However, we're now holding
+ +	 * rx->incoming_lock, so the values should remain stable.
+ +	 */
+ +	conn = rxrpc_find_connection_rcu(local, skb, &peer);
+ +
+ +	if (!conn) {
+ +		sec = rxrpc_get_incoming_security(rx, skb);
+ +		if (!sec)
+ +			goto no_call;
+ +	}
+ +
+ +	call = rxrpc_alloc_incoming_call(rx, local, peer, conn, sec, skb);
+++=======
++ 	call = rxrpc_alloc_incoming_call(rx, local, peer, conn, sec, peer_srx,
++ 					 skb);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	if (!call) {
+  		skb->mark = RXRPC_SKB_MARK_REJECT_BUSY;
+  		goto no_call;
+@@@ -394,50 -394,41 +423,65 @@@
+  		rx->notify_new_call(&rx->sk, call, call->user_call_ID);
+  
+  	spin_lock(&conn->state_lock);
+- 	switch (conn->state) {
+- 	case RXRPC_CONN_SERVICE_UNSECURED:
++ 	if (conn->state == RXRPC_CONN_SERVICE_UNSECURED) {
+  		conn->state = RXRPC_CONN_SERVICE_CHALLENGING;
+  		set_bit(RXRPC_CONN_EV_CHALLENGE, &call->conn->events);
+++<<<<<<< HEAD
+ +		rxrpc_queue_conn(call->conn);
+ +		break;
+ +
+ +	case RXRPC_CONN_SERVICE:
+ +		write_lock(&call->state_lock);
+ +		if (call->state < RXRPC_CALL_COMPLETE)
+ +			call->state = RXRPC_CALL_SERVER_RECV_REQUEST;
+ +		write_unlock(&call->state_lock);
+ +		break;
+ +
+ +	case RXRPC_CONN_REMOTELY_ABORTED:
+ +		rxrpc_set_call_completion(call, RXRPC_CALL_REMOTELY_ABORTED,
+ +					  conn->abort_code, conn->error);
+ +		break;
+ +	case RXRPC_CONN_LOCALLY_ABORTED:
+ +		rxrpc_abort_call("CON", call, sp->hdr.seq,
+ +				 conn->abort_code, conn->error);
+ +		break;
+ +	default:
+ +		BUG();
+++=======
++ 		rxrpc_queue_conn(call->conn, rxrpc_conn_queue_challenge);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	}
+  	spin_unlock(&conn->state_lock);
+- 	spin_unlock(&rx->incoming_lock);
+  
+- 	rxrpc_send_ping(call, skb);
++ 	spin_unlock(&rx->incoming_lock);
++ 	rcu_read_unlock();
+  
+ -	if (hlist_unhashed(&call->error_link)) {
+ -		spin_lock(&call->peer->lock);
+ -		hlist_add_head(&call->error_link, &call->peer->error_targets);
+ -		spin_unlock(&call->peer->lock);
+ -	}
+ +	/* We have to discard the prealloc queue's ref here and rely on a
+ +	 * combination of the RCU read lock and refs held either by the socket
+ +	 * (recvmsg queue, to-be-accepted queue or user ID tree) or the kernel
+ +	 * service to prevent the call from being deallocated too early.
+ +	 */
+ +	rxrpc_put_call(call, rxrpc_call_put_discard_prealloc);
+  
+  	_leave(" = %p{%d}", call, call->debug_id);
+- 	return call;
+- 
++ 	rxrpc_input_call_event(call, skb);
++ 	rxrpc_put_call(call, rxrpc_call_put_input);
++ 	return true;
++ 
++ unsupported_service:
++ 	trace_rxrpc_abort(0, "INV", sp->hdr.cid, sp->hdr.callNumber, sp->hdr.seq,
++ 			  RX_INVALID_OPERATION, EOPNOTSUPP);
++ 	skb->priority = RX_INVALID_OPERATION;
++ 	goto reject;
+  no_call:
+  	spin_unlock(&rx->incoming_lock);
+- 	_leave(" = NULL [%u]", skb->mark);
+- 	return NULL;
++ reject:
++ 	rcu_read_unlock();
++ 	_leave(" = f [%u]", skb->mark);
++ 	return false;
++ discard:
++ 	rcu_read_unlock();
++ 	return true;
+  }
+  
+  /*
+diff --cc net/rxrpc/call_event.c
+index a95f4604cb29,9db62fa55c62..000000000000
+--- a/net/rxrpc/call_event.c
++++ b/net/rxrpc/call_event.c
+@@@ -111,12 -106,7 +106,16 @@@ void rxrpc_send_ACK(struct rxrpc_call *
+  	spin_unlock_bh(&local->ack_tx_lock);
+  	trace_rxrpc_send_ack(call, why, ack_reason, serial);
+  
+++<<<<<<< HEAD
+ +	if (in_task()) {
+ +		rxrpc_transmit_ack_packets(call->peer->local);
+ +	} else {
+ +		rxrpc_get_local(local);
+ +		rxrpc_queue_local(local);
+ +	}
+++=======
++ 	rxrpc_wake_up_io_thread(local);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  }
+  
+  /*
+@@@ -148,17 -137,6 +146,20 @@@ void rxrpc_resend(struct rxrpc_call *ca
+  	max_age = ktime_sub_us(now, jiffies_to_usecs(call->peer->rto_j));
+  	oldest = now;
+  
+++<<<<<<< HEAD
+ +	/* See if there's an ACK saved with a soft-ACK table in it. */
+ +	if (call->acks_soft_tbl) {
+ +		spin_lock_bh(&call->acks_ack_lock);
+ +		ack_skb = call->acks_soft_tbl;
+ +		if (ack_skb) {
+ +			rxrpc_get_skb(ack_skb, rxrpc_skb_ack);
+ +			ack = (void *)ack_skb->data + sizeof(struct rxrpc_wire_header);
+ +		}
+ +		spin_unlock_bh(&call->acks_ack_lock);
+ +	}
+ +
+++=======
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	if (list_empty(&call->tx_buffer))
+  		goto no_resend;
+  
+@@@ -249,10 -225,7 +248,12 @@@
+  	}
+  
+  no_further_resend:
+- 	spin_unlock(&call->tx_lock);
+  no_resend:
+++<<<<<<< HEAD
+ +	rxrpc_free_skb(ack_skb, rxrpc_skb_freed);
+ +
+++=======
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	resend_at = nsecs_to_jiffies(ktime_to_ns(ktime_sub(now, oldest)));
+  	resend_at += jiffies + rxrpc_get_rto_backoff(call->peer,
+  						     !list_empty(&retrans_queue));
+@@@ -291,6 -260,85 +288,19 @@@ out
+  	_leave("");
+  }
+  
+ -static bool rxrpc_tx_window_has_space(struct rxrpc_call *call)
+ -{
+ -	unsigned int winsize = min_t(unsigned int, call->tx_winsize,
+ -				     call->cong_cwnd + call->cong_extra);
+ -	rxrpc_seq_t window = call->acks_hard_ack, wtop = window + winsize;
+ -	rxrpc_seq_t tx_top = call->tx_top;
+ -	int space;
+ -
+ -	space = wtop - tx_top;
+ -	return space > 0;
+ -}
+ -
+ -/*
+ - * Decant some if the sendmsg prepared queue into the transmission buffer.
+ - */
+ -static void rxrpc_decant_prepared_tx(struct rxrpc_call *call)
+ -{
+ -	struct rxrpc_txbuf *txb;
+ -
+ -	if (rxrpc_is_client_call(call) &&
+ -	    !test_bit(RXRPC_CALL_EXPOSED, &call->flags))
+ -		rxrpc_expose_client_call(call);
+ -
+ -	while ((txb = list_first_entry_or_null(&call->tx_sendmsg,
+ -					       struct rxrpc_txbuf, call_link))) {
+ -		spin_lock(&call->tx_lock);
+ -		list_del(&txb->call_link);
+ -		spin_unlock(&call->tx_lock);
+ -
+ -		call->tx_top = txb->seq;
+ -		list_add_tail(&txb->call_link, &call->tx_buffer);
+ -
+ -		rxrpc_transmit_one(call, txb);
+ -
+ -		// TODO: Drain the transmission buffers.  Do this somewhere better
+ -		if (after(call->acks_hard_ack, call->tx_bottom + 16))
+ -			rxrpc_shrink_call_tx_buffer(call);
+ -
+ -		if (!rxrpc_tx_window_has_space(call))
+ -			break;
+ -	}
+ -}
+ -
+ -static void rxrpc_transmit_some_data(struct rxrpc_call *call)
+ -{
+ -	switch (call->state) {
+ -	case RXRPC_CALL_SERVER_ACK_REQUEST:
+ -		if (list_empty(&call->tx_sendmsg))
+ -			return;
+ -		fallthrough;
+ -
+ -	case RXRPC_CALL_SERVER_SEND_REPLY:
+ -	case RXRPC_CALL_SERVER_AWAIT_ACK:
+ -	case RXRPC_CALL_CLIENT_SEND_REQUEST:
+ -	case RXRPC_CALL_CLIENT_AWAIT_REPLY:
+ -		if (!rxrpc_tx_window_has_space(call))
+ -			return;
+ -		if (list_empty(&call->tx_sendmsg))
+ -			return;
+ -		rxrpc_decant_prepared_tx(call);
+ -		break;
+ -	default:
+ -		return;
+ -	}
+ -}
+ -
++ /*
++  * Ping the other end to fill our RTT cache and to retrieve the rwind
++  * and MTU parameters.
++  */
++ static void rxrpc_send_initial_ping(struct rxrpc_call *call)
++ {
++ 	if (call->peer->rtt_count < 3 ||
++ 	    ktime_before(ktime_add_ms(call->peer->rtt_last_req, 1000),
++ 			 ktime_get_real()))
++ 		rxrpc_send_ACK(call, RXRPC_ACK_PING, 0,
++ 			       rxrpc_propose_ack_ping_for_params);
++ }
++ 
+  /*
+   * Handle retransmission and deferred ACK/abort generation.
+   */
+@@@ -308,26 -354,13 +316,34 @@@ void rxrpc_input_call_event(struct rxrp
+  	_enter("{%d,%s,%lx}",
+  	       call->debug_id, rxrpc_call_states[call->state], call->events);
+  
+++<<<<<<< HEAD
+ +recheck_state:
+ +	/* Limit the number of times we do this before returning to the manager */
+ +	iterations++;
+ +	if (iterations > 5)
+ +		goto requeue;
+ +
+ +	if (test_and_clear_bit(RXRPC_CALL_EV_ABORT, &call->events)) {
+ +		rxrpc_send_abort_packet(call);
+ +		goto recheck_state;
+ +	}
+ +
+ +	if (READ_ONCE(call->acks_hard_ack) != call->tx_bottom)
+ +		rxrpc_shrink_call_tx_buffer(call);
+ +
+ +	if (call->state == RXRPC_CALL_COMPLETE) {
+ +		rxrpc_delete_call_timer(call);
+ +		goto out_put;
+ +	}
+++=======
++ 	if (call->state == RXRPC_CALL_COMPLETE)
++ 		goto out;
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  
+- 	/* Work out if any timeouts tripped */
++ 	if (skb && skb->mark == RXRPC_SKB_MARK_ERROR)
++ 		goto out;
++ 
++ 	/* If we see our async-event poke, check for timeout trippage. */
+  	now = jiffies;
+  	t = READ_ONCE(call->expect_rx_by);
+  	if (time_after_eq(now, t)) {
+@@@ -384,11 -417,19 +400,22 @@@
+  	if (time_after_eq(now, t)) {
+  		trace_rxrpc_timer(call, rxrpc_timer_exp_resend, now);
+  		cmpxchg(&call->resend_at, t, now + MAX_JIFFY_OFFSET);
+- 		set_bit(RXRPC_CALL_EV_RESEND, &call->events);
++ 		resend = true;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (skb)
++ 		rxrpc_input_call_packet(call, skb);
++ 
++ 	rxrpc_transmit_some_data(call);
++ 
++ 	if (test_and_clear_bit(RXRPC_CALL_EV_INITIAL_PING, &call->events))
++ 		rxrpc_send_initial_ping(call);
++ 
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	/* Process events */
+- 	if (test_and_clear_bit(RXRPC_CALL_EV_EXPIRED, &call->events)) {
++ 	if (expired) {
+  		if (test_bit(RXRPC_CALL_RX_HEARD, &call->flags) &&
+  		    (int)call->conn->hi_serial - (int)call->rx_serial > 0) {
+  			trace_rxrpc_call_reset(call);
+@@@ -417,31 -462,25 +448,43 @@@
+  
+  #define set(T) { t = READ_ONCE(T); if (time_before(t, next)) next = t; }
+  
+- 	set(call->expect_req_by);
+- 	set(call->expect_term_by);
+- 	set(call->delay_ack_at);
+- 	set(call->ack_lost_at);
+- 	set(call->resend_at);
+- 	set(call->keepalive_at);
+- 	set(call->ping_at);
++ 		set(call->expect_req_by);
++ 		set(call->expect_term_by);
++ 		set(call->delay_ack_at);
++ 		set(call->ack_lost_at);
++ 		set(call->resend_at);
++ 		set(call->keepalive_at);
++ 		set(call->ping_at);
+  
+- 	now = jiffies;
+- 	if (time_after_eq(now, next))
+- 		goto recheck_state;
++ 		now = jiffies;
++ 		if (time_after_eq(now, next))
++ 			rxrpc_poke_call(call, rxrpc_call_poke_timer_now);
+  
+++<<<<<<< HEAD
+ +	rxrpc_reduce_call_timer(call, next, now, rxrpc_timer_restart);
+ +
+ +	/* other events may have been raised since we started checking */
+ +	if (call->events && call->state < RXRPC_CALL_COMPLETE)
+ +		goto requeue;
+++=======
++ 		rxrpc_reduce_call_timer(call, next, now, rxrpc_timer_restart);
++ 	}
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  
+ +out_put:
+ +	rxrpc_put_call(call, rxrpc_call_put_work);
+  out:
++ 	if (call->state == RXRPC_CALL_COMPLETE)
++ 		del_timer_sync(&call->timer);
++ 	if (call->acks_hard_ack != call->tx_bottom)
++ 		rxrpc_shrink_call_tx_buffer(call);
+  	_leave("");
+++<<<<<<< HEAD
+ +	return;
+ +
+ +requeue:
+ +	__rxrpc_queue_call(call, rxrpc_call_queue_requeue);
+ +	goto out;
+++=======
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  }
+diff --cc net/rxrpc/call_object.c
+index ad495d0d21a8,d441a715d988..000000000000
+--- a/net/rxrpc/call_object.c
++++ b/net/rxrpc/call_object.c
+@@@ -53,9 -71,7 +53,13 @@@ static void rxrpc_call_timer_expired(st
+  
+  	if (call->state < RXRPC_CALL_COMPLETE) {
+  		trace_rxrpc_timer_expired(call, jiffies);
+++<<<<<<< HEAD
+ +		__rxrpc_queue_call(call, rxrpc_call_queue_timer);
+ +	} else {
+ +		rxrpc_put_call(call, rxrpc_call_put_already_queued);
+++=======
++ 		rxrpc_poke_call(call, rxrpc_call_poke_timer);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	}
+  }
+  
+@@@ -139,7 -148,7 +143,11 @@@ struct rxrpc_call *rxrpc_alloc_call(str
+  				  &rxrpc_call_user_mutex_lock_class_key);
+  
+  	timer_setup(&call->timer, rxrpc_call_timer_expired, 0);
+++<<<<<<< HEAD
+ +	INIT_WORK(&call->processor, &rxrpc_process_call);
+++=======
++ 	INIT_WORK(&call->destroyer, rxrpc_destroy_call);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	INIT_LIST_HEAD(&call->link);
+  	INIT_LIST_HEAD(&call->chan_wait_link);
+  	INIT_LIST_HEAD(&call->accept_link);
+@@@ -151,8 -162,6 +159,11 @@@
+  	init_waitqueue_head(&call->waitq);
+  	spin_lock_init(&call->notify_lock);
+  	spin_lock_init(&call->tx_lock);
+++<<<<<<< HEAD
+ +	spin_lock_init(&call->input_lock);
+ +	spin_lock_init(&call->acks_ack_lock);
+++=======
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	rwlock_init(&call->state_lock);
+  	refcount_set(&call->ref, 1);
+  	call->debug_id = debug_id;
+@@@ -415,49 -462,17 +450,53 @@@ void rxrpc_incoming_call(struct rxrpc_s
+  	conn->channels[chan].call_counter = call->call_id;
+  	conn->channels[chan].call_id = call->call_id;
+  	rcu_assign_pointer(conn->channels[chan].call, call);
++ 	spin_unlock(&conn->state_lock);
+  
+ -	spin_lock(&conn->peer->lock);
+ -	hlist_add_head(&call->error_link, &conn->peer->error_targets);
+ -	spin_unlock(&conn->peer->lock);
+ +	spin_lock(&conn->params.peer->lock);
+ +	hlist_add_head_rcu(&call->error_link, &conn->params.peer->error_targets);
+ +	spin_unlock(&conn->params.peer->lock);
+ +
+ +	_net("CALL incoming %d on CONN %d", call->debug_id, call->conn->debug_id);
+  
+  	rxrpc_start_call_timer(call);
+  	_leave("");
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Queue a call's work processor, getting a ref to pass to the work queue.
+ + */
+ +bool rxrpc_queue_call(struct rxrpc_call *call, enum rxrpc_call_trace why)
+ +{
+ +	int n;
+ +
+ +	if (!__refcount_inc_not_zero(&call->ref, &n))
+ +		return false;
+ +	if (rxrpc_queue_work(&call->processor))
+ +		trace_rxrpc_call(call->debug_id, n + 1, 0, why);
+ +	else
+ +		rxrpc_put_call(call, rxrpc_call_put_already_queued);
+ +	return true;
+ +}
+ +
+ +/*
+ + * Queue a call's work processor, passing the callers ref to the work queue.
+ + */
+ +bool __rxrpc_queue_call(struct rxrpc_call *call, enum rxrpc_call_trace why)
+ +{
+ +	int n = refcount_read(&call->ref);
+ +
+ +	ASSERTCMP(n, >=, 1);
+ +	if (rxrpc_queue_work(&call->processor))
+ +		trace_rxrpc_call(call->debug_id, n, 0, why);
+ +	else
+ +		rxrpc_put_call(call, rxrpc_call_put_already_queued);
+ +	return true;
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+   * Note the re-emergence of a call.
+   */
+  void rxrpc_see_call(struct rxrpc_call *call, enum rxrpc_call_trace why)
+@@@ -633,19 -645,32 +673,41 @@@ static void rxrpc_destroy_call(struct w
+  }
+  
+  /*
+ - * Final call destruction - but must be done in process context.
+ + * Final call destruction under RCU.
+   */
+ -static void rxrpc_destroy_call(struct work_struct *work)
+ +static void rxrpc_rcu_destroy_call(struct rcu_head *rcu)
+  {
+ -	struct rxrpc_call *call = container_of(work, struct rxrpc_call, destroyer);
+ -	struct rxrpc_txbuf *txb;
+ +	struct rxrpc_call *call = container_of(rcu, struct rxrpc_call, rcu);
+  
+++<<<<<<< HEAD
+ +	if (in_softirq()) {
+ +		INIT_WORK(&call->processor, rxrpc_destroy_call);
+ +		if (!rxrpc_queue_work(&call->processor))
+ +			BUG();
+ +	} else {
+ +		rxrpc_destroy_call(&call->processor);
+ +	}
+++=======
++ 	del_timer_sync(&call->timer);
++ 
++ 	rxrpc_cleanup_ring(call);
++ 	while ((txb = list_first_entry_or_null(&call->tx_sendmsg,
++ 					       struct rxrpc_txbuf, call_link))) {
++ 		list_del(&txb->call_link);
++ 		rxrpc_put_txbuf(txb, rxrpc_txbuf_put_cleaned);
++ 	}
++ 	while ((txb = list_first_entry_or_null(&call->tx_buffer,
++ 					       struct rxrpc_txbuf, call_link))) {
++ 		list_del(&txb->call_link);
++ 		rxrpc_put_txbuf(txb, rxrpc_txbuf_put_cleaned);
++ 	}
++ 
++ 	rxrpc_put_txbuf(call->tx_pending, rxrpc_txbuf_put_cleaned);
++ 	rxrpc_put_connection(call->conn, rxrpc_conn_put_call);
++ 	rxrpc_put_peer(call->peer, rxrpc_peer_put_call);
++ 	rxrpc_put_local(call->local, rxrpc_local_put_call);
++ 	call_rcu(&call->rcu, rxrpc_rcu_free_call);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  }
+  
+  /*
+@@@ -662,16 -683,15 +724,28 @@@ void rxrpc_cleanup_call(struct rxrpc_ca
+  	ASSERTCMP(call->state, ==, RXRPC_CALL_COMPLETE);
+  	ASSERT(test_bit(RXRPC_CALL_RELEASED, &call->flags));
+  
+++<<<<<<< HEAD
+ +	rxrpc_cleanup_ring(call);
+ +	while ((txb = list_first_entry_or_null(&call->tx_buffer,
+ +					       struct rxrpc_txbuf, call_link))) {
+ +		list_del(&txb->call_link);
+ +		rxrpc_put_txbuf(txb, rxrpc_txbuf_put_cleaned);
+ +	}
+ +	rxrpc_put_txbuf(call->tx_pending, rxrpc_txbuf_put_cleaned);
+ +	rxrpc_free_skb(call->acks_soft_tbl, rxrpc_skb_cleaned);
+ +
+ +	call_rcu(&call->rcu, rxrpc_rcu_destroy_call);
+++=======
++ 	del_timer(&call->timer);
++ 
++ 	if (rcu_read_lock_held())
++ 		/* Can't use the rxrpc workqueue as we need to cancel/flush
++ 		 * something that may be running/waiting there.
++ 		 */
++ 		schedule_work(&call->destroyer);
++ 	else
++ 		rxrpc_destroy_call(&call->destroyer);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  }
+  
+  /*
+diff --cc net/rxrpc/conn_object.c
+index 156bd26daf74,3c8f83dacb2b..000000000000
+--- a/net/rxrpc/conn_object.c
++++ b/net/rxrpc/conn_object.c
+@@@ -67,89 -72,55 +67,134 @@@ struct rxrpc_connection *rxrpc_alloc_co
+   *
+   * The caller must be holding the RCU read lock.
+   */
+++<<<<<<< HEAD
+ +struct rxrpc_connection *rxrpc_find_connection_rcu(struct rxrpc_local *local,
+ +						   struct sk_buff *skb,
+ +						   struct rxrpc_peer **_peer)
+++=======
++ struct rxrpc_connection *rxrpc_find_client_connection_rcu(struct rxrpc_local *local,
++ 							  struct sockaddr_rxrpc *srx,
++ 							  struct sk_buff *skb)
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  {
+  	struct rxrpc_connection *conn;
+- 	struct rxrpc_conn_proto k;
+  	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
+ +	struct sockaddr_rxrpc srx;
+  	struct rxrpc_peer *peer;
+  
+  	_enter(",%x", sp->hdr.cid & RXRPC_CIDMASK);
+  
+++<<<<<<< HEAD
+ +	if (rxrpc_extract_addr_from_skb(&srx, skb) < 0)
+ +		goto not_found;
+ +
+ +	if (srx.transport.family != local->srx.transport.family &&
+ +	    (srx.transport.family == AF_INET &&
+ +	     local->srx.transport.family != AF_INET6)) {
+ +		pr_warn_ratelimited("AF_RXRPC: Protocol mismatch %u not %u\n",
+ +				    srx.transport.family,
+ +				    local->srx.transport.family);
+ +		goto not_found;
+ +	}
+ +
+ +	k.epoch	= sp->hdr.epoch;
+ +	k.cid	= sp->hdr.cid & RXRPC_CIDMASK;
+ +
+ +	if (rxrpc_to_server(sp)) {
+ +		/* We need to look up service connections by the full protocol
+ +		 * parameter set.  We look up the peer first as an intermediate
+ +		 * step and then the connection from the peer's tree.
+ +		 */
+ +		peer = rxrpc_lookup_peer_rcu(local, &srx);
+ +		if (!peer)
+ +			goto not_found;
+ +		*_peer = peer;
+ +		conn = rxrpc_find_service_conn_rcu(peer, skb);
+ +		if (!conn || refcount_read(&conn->ref) == 0)
+ +			goto not_found;
+ +		_leave(" = %p", conn);
+ +		return conn;
+ +	} else {
+ +		/* Look up client connections by connection ID alone as their
+ +		 * IDs are unique for this machine.
+ +		 */
+ +		conn = idr_find(&rxrpc_client_conn_ids,
+ +				sp->hdr.cid >> RXRPC_CIDSHIFT);
+ +		if (!conn || refcount_read(&conn->ref) == 0) {
+ +			_debug("no conn");
+ +			goto not_found;
+ +		}
+ +
+ +		if (conn->proto.epoch != k.epoch ||
+ +		    conn->params.local != local)
+ +			goto not_found;
+ +
+ +		peer = conn->params.peer;
+ +		switch (srx.transport.family) {
+ +		case AF_INET:
+ +			if (peer->srx.transport.sin.sin_port !=
+ +			    srx.transport.sin.sin_port ||
+ +			    peer->srx.transport.sin.sin_addr.s_addr !=
+ +			    srx.transport.sin.sin_addr.s_addr)
+ +				goto not_found;
+ +			break;
+ +#ifdef CONFIG_AF_RXRPC_IPV6
+ +		case AF_INET6:
+ +			if (peer->srx.transport.sin6.sin6_port !=
+ +			    srx.transport.sin6.sin6_port ||
+ +			    memcmp(&peer->srx.transport.sin6.sin6_addr,
+ +				   &srx.transport.sin6.sin6_addr,
+ +				   sizeof(struct in6_addr)) != 0)
+ +				goto not_found;
+ +			break;
+ +#endif
+ +		default:
+ +			BUG();
+ +		}
+ +
+ +		_leave(" = %p", conn);
+ +		return conn;
+++=======
++ 	/* Look up client connections by connection ID alone as their IDs are
++ 	 * unique for this machine.
++ 	 */
++ 	conn = idr_find(&rxrpc_client_conn_ids, sp->hdr.cid >> RXRPC_CIDSHIFT);
++ 	if (!conn || refcount_read(&conn->ref) == 0) {
++ 		_debug("no conn");
++ 		goto not_found;
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	}
+  
++ 	if (conn->proto.epoch != sp->hdr.epoch ||
++ 	    conn->local != local)
++ 		goto not_found;
++ 
++ 	peer = conn->peer;
++ 	switch (srx->transport.family) {
++ 	case AF_INET:
++ 		if (peer->srx.transport.sin.sin_port !=
++ 		    srx->transport.sin.sin_port ||
++ 		    peer->srx.transport.sin.sin_addr.s_addr !=
++ 		    srx->transport.sin.sin_addr.s_addr)
++ 			goto not_found;
++ 		break;
++ #ifdef CONFIG_AF_RXRPC_IPV6
++ 	case AF_INET6:
++ 		if (peer->srx.transport.sin6.sin6_port !=
++ 		    srx->transport.sin6.sin6_port ||
++ 		    memcmp(&peer->srx.transport.sin6.sin6_addr,
++ 			   &srx->transport.sin6.sin6_addr,
++ 			   sizeof(struct in6_addr)) != 0)
++ 			goto not_found;
++ 		break;
++ #endif
++ 	default:
++ 		BUG();
++ 	}
++ 
++ 	_leave(" = %p", conn);
++ 	return conn;
++ 
+  not_found:
+  	_leave(" = NULL");
+  	return NULL;
+diff --cc net/rxrpc/input.c
+index b5326e160685,7ae7046f0b03..000000000000
+--- a/net/rxrpc/input.c
++++ b/net/rxrpc/input.c
+@@@ -552,29 -551,9 +544,32 @@@ static void rxrpc_input_data(struct rxr
+  	       skb->len, seq0);
+  
+  	state = READ_ONCE(call->state);
+ -	if (state >= RXRPC_CALL_COMPLETE)
+ +	if (state >= RXRPC_CALL_COMPLETE) {
+ +		rxrpc_free_skb(skb, rxrpc_skb_freed);
+  		return;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	/* Unshare the packet so that it can be modified for in-place
+ +	 * decryption.
+ +	 */
+ +	if (sp->hdr.securityIndex != 0) {
+ +		struct sk_buff *nskb = skb_unshare(skb, GFP_ATOMIC);
+ +		if (!nskb) {
+ +			rxrpc_eaten_skb(skb, rxrpc_skb_unshared_nomem);
+ +			return;
+ +		}
+  
+ +		if (nskb != skb) {
+ +			rxrpc_eaten_skb(skb, rxrpc_skb_received);
+ +			skb = nskb;
+ +			rxrpc_new_skb(skb, rxrpc_skb_unshared);
+ +			sp = rxrpc_skb(skb);
+ +		}
+ +	}
+ +
+++=======
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	if (state == RXRPC_CALL_SERVER_RECV_REQUEST) {
+  		unsigned long timo = READ_ONCE(call->next_req_timo);
+  		unsigned long now, expect_req_by;
+@@@ -604,12 -581,9 +599,12 @@@
+  	}
+  	skb = NULL;
+  
+- out:
++ out_notify:
+  	trace_rxrpc_notify_socket(call->debug_id, serial);
+  	rxrpc_notify_socket(call);
+ +
+ +	spin_unlock(&call->input_lock);
+ +	rxrpc_free_skb(skb, rxrpc_skb_freed);
+  	_leave(" [queued]");
+  }
+  
+@@@ -802,7 -749,6 +771,10 @@@ static void rxrpc_input_ack(struct rxrp
+  	struct rxrpc_ackpacket ack;
+  	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
+  	struct rxrpc_ackinfo info;
+++<<<<<<< HEAD
+ +	struct sk_buff *skb_old = NULL, *skb_put = skb;
+++=======
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	rxrpc_serial_t ack_serial, acked_serial;
+  	rxrpc_seq_t first_soft_ack, hard_ack, prev_pkt;
+  	int nr_acks, offset, ioffset;
+@@@ -810,10 -756,8 +782,15 @@@
+  	_enter("");
+  
+  	offset = sizeof(struct rxrpc_wire_header);
+++<<<<<<< HEAD
+ +	if (skb_copy_bits(skb, offset, &ack, sizeof(ack)) < 0) {
+ +		rxrpc_proto_abort("XAK", call, 0);
+ +		goto out_not_locked;
+ +	}
+++=======
++ 	if (skb_copy_bits(skb, offset, &ack, sizeof(ack)) < 0)
++ 		return rxrpc_proto_abort("XAK", call, 0);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	offset += sizeof(ack);
+  
+  	ack_serial = sp->hdr.serial;
+@@@ -886,31 -830,19 +863,42 @@@
+  		trace_rxrpc_rx_discard_ack(call->debug_id, ack_serial,
+  					   first_soft_ack, call->acks_first_seq,
+  					   prev_pkt, call->acks_prev_seq);
+++<<<<<<< HEAD
+ +		goto out_not_locked;
+++=======
++ 		return;
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	}
+  
+  	info.rxMTU = 0;
+  	ioffset = offset + nr_acks + 3;
+  	if (skb->len >= ioffset + sizeof(info) &&
+++<<<<<<< HEAD
+ +	    skb_copy_bits(skb, ioffset, &info, sizeof(info)) < 0) {
+ +		rxrpc_proto_abort("XAI", call, 0);
+ +		goto out_not_locked;
+ +	}
+++=======
++ 	    skb_copy_bits(skb, ioffset, &info, sizeof(info)) < 0)
++ 		return rxrpc_proto_abort("XAI", call, 0);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  
+  	if (nr_acks > 0)
+  		skb_condense(skb);
+  
+++<<<<<<< HEAD
+ +	spin_lock(&call->input_lock);
+ +
+ +	/* Discard any out-of-order or duplicate ACKs (inside lock). */
+ +	if (!rxrpc_is_ack_valid(call, first_soft_ack, prev_pkt)) {
+ +		trace_rxrpc_rx_discard_ack(call->debug_id, ack_serial,
+ +					   first_soft_ack, call->acks_first_seq,
+ +					   prev_pkt, call->acks_prev_seq);
+ +		goto out;
+ +	}
+++=======
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	call->acks_latest_ts = skb->tstamp;
+- 
+  	call->acks_first_seq = first_soft_ack;
+  	call->acks_prev_seq = prev_pkt;
+  
+@@@ -965,24 -887,10 +943,31 @@@
+  	}
+  
+  	if (nr_acks > 0) {
+++<<<<<<< HEAD
+ +		if (offset > (int)skb->len - nr_acks) {
+ +			rxrpc_proto_abort("XSA", call, 0);
+ +			goto out;
+ +		}
+ +
+ +		spin_lock(&call->acks_ack_lock);
+ +		skb_old = call->acks_soft_tbl;
+ +		call->acks_soft_tbl = skb;
+ +		spin_unlock(&call->acks_ack_lock);
+ +
+ +		rxrpc_input_soft_acks(call, skb->data + offset, first_soft_ack,
+ +				      nr_acks, &summary);
+ +		skb_put = NULL;
+ +	} else if (call->acks_soft_tbl) {
+ +		spin_lock(&call->acks_ack_lock);
+ +		skb_old = call->acks_soft_tbl;
+ +		call->acks_soft_tbl = NULL;
+ +		spin_unlock(&call->acks_ack_lock);
+++=======
++ 		if (offset > (int)skb->len - nr_acks)
++ 			return rxrpc_proto_abort("XSA", call, 0);
++ 		rxrpc_input_soft_acks(call, skb->data + offset, first_soft_ack,
++ 				      nr_acks, &summary);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	}
+  
+  	if (test_bit(RXRPC_CALL_TX_LAST, &call->flags) &&
+@@@ -992,11 -900,6 +977,14 @@@
+  				   rxrpc_propose_ack_ping_for_lost_reply);
+  
+  	rxrpc_congestion_management(call, skb, &summary, acked_serial);
+++<<<<<<< HEAD
+ +out:
+ +	spin_unlock(&call->input_lock);
+ +out_not_locked:
+ +	rxrpc_free_skb(skb_put, rxrpc_skb_freed);
+ +	rxrpc_free_skb(skb_old, rxrpc_skb_freed);
+++=======
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  }
+  
+  /*
+@@@ -1030,8 -929,7 +1018,12 @@@ static void rxrpc_input_abort(struct rx
+  /*
+   * Process an incoming call packet.
+   */
+++<<<<<<< HEAD
+ +static void rxrpc_input_call_packet(struct rxrpc_call *call,
+ +				    struct sk_buff *skb)
+++=======
++ void rxrpc_input_call_packet(struct rxrpc_call *call, struct sk_buff *skb)
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  {
+  	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
+  	unsigned long timo;
+@@@ -1087,10 -988,10 +1086,16 @@@ no_free
+   *
+   * TODO: If callNumber > call_id + 1, renegotiate security.
+   */
+++<<<<<<< HEAD
+ +static void rxrpc_input_implicit_end_call(struct rxrpc_sock *rx,
+ +					  struct rxrpc_connection *conn,
+ +					  struct rxrpc_call *call)
+++=======
++ void rxrpc_implicit_end_call(struct rxrpc_call *call, struct sk_buff *skb)
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  {
++ 	struct rxrpc_connection *conn = call->conn;
++ 
+  	switch (READ_ONCE(call->state)) {
+  	case RXRPC_CALL_SERVER_AWAIT_ACK:
+  		rxrpc_call_completed(call);
+@@@ -1106,367 -1005,9 +1109,373 @@@
+  		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock(&rx->incoming_lock);
+++=======
++ 	rxrpc_input_call_event(call, skb);
++ 
++ 	spin_lock(&conn->bundle->channel_lock);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	__rxrpc_disconnect_call(conn, call);
+ -	spin_unlock(&conn->bundle->channel_lock);
+ +	spin_unlock(&rx->incoming_lock);
+ +}
+ +
+ +/*
+ + * post connection-level events to the connection
+ + * - this includes challenges, responses, some aborts and call terminal packet
+ + *   retransmission.
+ + */
+ +static void rxrpc_post_packet_to_conn(struct rxrpc_connection *conn,
+ +				      struct sk_buff *skb)
+ +{
+ +	_enter("%p,%p", conn, skb);
+ +
+ +	skb_queue_tail(&conn->rx_queue, skb);
+ +	rxrpc_queue_conn(conn);
+ +}
+ +
+ +/*
+ + * post endpoint-level events to the local endpoint
+ + * - this includes debug and version messages
+ + */
+ +static void rxrpc_post_packet_to_local(struct rxrpc_local *local,
+ +				       struct sk_buff *skb)
+ +{
+ +	_enter("%p,%p", local, skb);
+ +
+ +	if (rxrpc_get_local_maybe(local)) {
+ +		skb_queue_tail(&local->event_queue, skb);
+ +		rxrpc_queue_local(local);
+ +	} else {
+ +		rxrpc_free_skb(skb, rxrpc_skb_freed);
+ +	}
+ +}
+ +
+ +/*
+ + * put a packet up for transport-level abort
+ + */
+ +static void rxrpc_reject_packet(struct rxrpc_local *local, struct sk_buff *skb)
+ +{
+ +	if (rxrpc_get_local_maybe(local)) {
+ +		skb_queue_tail(&local->reject_queue, skb);
+ +		rxrpc_queue_local(local);
+ +	} else {
+ +		rxrpc_free_skb(skb, rxrpc_skb_freed);
+ +	}
+ +}
+ +
+ +/*
+ + * Extract the wire header from a packet and translate the byte order.
+ + */
+ +static noinline
+ +int rxrpc_extract_header(struct rxrpc_skb_priv *sp, struct sk_buff *skb)
+ +{
+ +	struct rxrpc_wire_header whdr;
+ +
+ +	/* dig out the RxRPC connection details */
+ +	if (skb_copy_bits(skb, 0, &whdr, sizeof(whdr)) < 0) {
+ +		trace_rxrpc_rx_eproto(NULL, sp->hdr.serial,
+ +				      tracepoint_string("bad_hdr"));
+ +		return -EBADMSG;
+ +	}
+ +
+ +	memset(sp, 0, sizeof(*sp));
+ +	sp->hdr.epoch		= ntohl(whdr.epoch);
+ +	sp->hdr.cid		= ntohl(whdr.cid);
+ +	sp->hdr.callNumber	= ntohl(whdr.callNumber);
+ +	sp->hdr.seq		= ntohl(whdr.seq);
+ +	sp->hdr.serial		= ntohl(whdr.serial);
+ +	sp->hdr.flags		= whdr.flags;
+ +	sp->hdr.type		= whdr.type;
+ +	sp->hdr.userStatus	= whdr.userStatus;
+ +	sp->hdr.securityIndex	= whdr.securityIndex;
+ +	sp->hdr._rsvd		= ntohs(whdr._rsvd);
+ +	sp->hdr.serviceId	= ntohs(whdr.serviceId);
+ +	return 0;
+ +}
+ +
+ +/*
+ + * Extract the abort code from an ABORT packet and stash it in skb->priority.
+ + */
+ +static bool rxrpc_extract_abort(struct sk_buff *skb)
+ +{
+ +	__be32 wtmp;
+ +
+ +	if (skb_copy_bits(skb, sizeof(struct rxrpc_wire_header),
+ +			  &wtmp, sizeof(wtmp)) < 0)
+ +		return false;
+ +	skb->priority = ntohl(wtmp);
+ +	return true;
+ +}
+ +
+ +/*
+ + * handle data received on the local endpoint
+ + * - may be called in interrupt context
+ + *
+ + * [!] Note that as this is called from the encap_rcv hook, the socket is not
+ + * held locked by the caller and nothing prevents sk_user_data on the UDP from
+ + * being cleared in the middle of processing this function.
+ + *
+ + * Called with the RCU read lock held from the IP layer via UDP.
+ + */
+ +int rxrpc_input_packet(struct sock *udp_sk, struct sk_buff *skb)
+ +{
+ +	struct rxrpc_local *local = rcu_dereference_sk_user_data(udp_sk);
+ +	struct rxrpc_connection *conn;
+ +	struct rxrpc_channel *chan;
+ +	struct rxrpc_call *call = NULL;
+ +	struct rxrpc_skb_priv *sp;
+ +	struct rxrpc_peer *peer = NULL;
+ +	struct rxrpc_sock *rx = NULL;
+ +	unsigned int channel;
+ +
+ +	_enter("%p", udp_sk);
+ +
+ +	if (unlikely(!local)) {
+ +		kfree_skb(skb);
+ +		return 0;
+ +	}
+ +	if (skb->tstamp == 0)
+ +		skb->tstamp = ktime_get_real();
+ +
+ +	rxrpc_new_skb(skb, rxrpc_skb_received);
+ +
+ +	skb_pull(skb, sizeof(struct udphdr));
+ +
+ +	/* The UDP protocol already released all skb resources;
+ +	 * we are free to add our own data there.
+ +	 */
+ +	sp = rxrpc_skb(skb);
+ +
+ +	/* dig out the RxRPC connection details */
+ +	if (rxrpc_extract_header(sp, skb) < 0)
+ +		goto bad_message;
+ +
+ +	if (IS_ENABLED(CONFIG_AF_RXRPC_INJECT_LOSS)) {
+ +		static int lose;
+ +		if ((lose++ & 7) == 7) {
+ +			trace_rxrpc_rx_lose(sp);
+ +			rxrpc_free_skb(skb, rxrpc_skb_lost);
+ +			return 0;
+ +		}
+ +	}
+ +
+ +	if (skb->tstamp == 0)
+ +		skb->tstamp = ktime_get_real();
+ +	trace_rxrpc_rx_packet(sp);
+ +
+ +	switch (sp->hdr.type) {
+ +	case RXRPC_PACKET_TYPE_VERSION:
+ +		if (rxrpc_to_client(sp))
+ +			goto discard;
+ +		rxrpc_post_packet_to_local(local, skb);
+ +		goto out;
+ +
+ +	case RXRPC_PACKET_TYPE_BUSY:
+ +		if (rxrpc_to_server(sp))
+ +			goto discard;
+ +		fallthrough;
+ +	case RXRPC_PACKET_TYPE_ACK:
+ +	case RXRPC_PACKET_TYPE_ACKALL:
+ +		if (sp->hdr.callNumber == 0)
+ +			goto bad_message;
+ +		break;
+ +	case RXRPC_PACKET_TYPE_ABORT:
+ +		if (!rxrpc_extract_abort(skb))
+ +			return true; /* Just discard if malformed */
+ +		break;
+ +
+ +	case RXRPC_PACKET_TYPE_DATA:
+ +		if (sp->hdr.callNumber == 0 ||
+ +		    sp->hdr.seq == 0)
+ +			goto bad_message;
+ +
+ +		/* Unshare the packet so that it can be modified for in-place
+ +		 * decryption.
+ +		 */
+ +		if (sp->hdr.securityIndex != 0) {
+ +			struct sk_buff *nskb = skb_unshare(skb, GFP_ATOMIC);
+ +			if (!nskb) {
+ +				rxrpc_eaten_skb(skb, rxrpc_skb_unshared_nomem);
+ +				goto out;
+ +			}
+ +
+ +			if (nskb != skb) {
+ +				rxrpc_eaten_skb(skb, rxrpc_skb_received);
+ +				skb = nskb;
+ +				rxrpc_new_skb(skb, rxrpc_skb_unshared);
+ +				sp = rxrpc_skb(skb);
+ +			}
+ +		}
+ +		break;
+ +
+ +	case RXRPC_PACKET_TYPE_CHALLENGE:
+ +		if (rxrpc_to_server(sp))
+ +			goto discard;
+ +		break;
+ +	case RXRPC_PACKET_TYPE_RESPONSE:
+ +		if (rxrpc_to_client(sp))
+ +			goto discard;
+ +		break;
+ +
+ +		/* Packet types 9-11 should just be ignored. */
+ +	case RXRPC_PACKET_TYPE_PARAMS:
+ +	case RXRPC_PACKET_TYPE_10:
+ +	case RXRPC_PACKET_TYPE_11:
+ +		goto discard;
+ +
+ +	default:
+ +		goto bad_message;
+ +	}
+ +
+ +	if (sp->hdr.serviceId == 0)
+ +		goto bad_message;
+ +
+ +	if (rxrpc_to_server(sp)) {
+ +		/* Weed out packets to services we're not offering.  Packets
+ +		 * that would begin a call are explicitly rejected and the rest
+ +		 * are just discarded.
+ +		 */
+ +		rx = rcu_dereference(local->service);
+ +		if (!rx || (sp->hdr.serviceId != rx->srx.srx_service &&
+ +			    sp->hdr.serviceId != rx->second_service)) {
+ +			if (sp->hdr.type == RXRPC_PACKET_TYPE_DATA &&
+ +			    sp->hdr.seq == 1)
+ +				goto unsupported_service;
+ +			goto discard;
+ +		}
+ +	}
+ +
+ +	conn = rxrpc_find_connection_rcu(local, skb, &peer);
+ +	if (conn) {
+ +		if (sp->hdr.securityIndex != conn->security_ix)
+ +			goto wrong_security;
+ +
+ +		if (sp->hdr.serviceId != conn->service_id) {
+ +			int old_id;
+ +
+ +			if (!test_bit(RXRPC_CONN_PROBING_FOR_UPGRADE, &conn->flags))
+ +				goto reupgrade;
+ +			old_id = cmpxchg(&conn->service_id, conn->params.service_id,
+ +					 sp->hdr.serviceId);
+ +
+ +			if (old_id != conn->params.service_id &&
+ +			    old_id != sp->hdr.serviceId)
+ +				goto reupgrade;
+ +		}
+ +
+ +		if (sp->hdr.callNumber == 0) {
+ +			/* Connection-level packet */
+ +			_debug("CONN %p {%d}", conn, conn->debug_id);
+ +			rxrpc_post_packet_to_conn(conn, skb);
+ +			goto out;
+ +		}
+ +
+ +		if ((int)sp->hdr.serial - (int)conn->hi_serial > 0)
+ +			conn->hi_serial = sp->hdr.serial;
+ +
+ +		/* Call-bound packets are routed by connection channel. */
+ +		channel = sp->hdr.cid & RXRPC_CHANNELMASK;
+ +		chan = &conn->channels[channel];
+ +
+ +		/* Ignore really old calls */
+ +		if (sp->hdr.callNumber < chan->last_call)
+ +			goto discard;
+ +
+ +		if (sp->hdr.callNumber == chan->last_call) {
+ +			if (chan->call ||
+ +			    sp->hdr.type == RXRPC_PACKET_TYPE_ABORT)
+ +				goto discard;
+ +
+ +			/* For the previous service call, if completed
+ +			 * successfully, we discard all further packets.
+ +			 */
+ +			if (rxrpc_conn_is_service(conn) &&
+ +			    chan->last_type == RXRPC_PACKET_TYPE_ACK)
+ +				goto discard;
+ +
+ +			/* But otherwise we need to retransmit the final packet
+ +			 * from data cached in the connection record.
+ +			 */
+ +			if (sp->hdr.type == RXRPC_PACKET_TYPE_DATA)
+ +				trace_rxrpc_rx_data(chan->call_debug_id,
+ +						    sp->hdr.seq,
+ +						    sp->hdr.serial,
+ +						    sp->hdr.flags);
+ +			rxrpc_post_packet_to_conn(conn, skb);
+ +			goto out;
+ +		}
+ +
+ +		call = rcu_dereference(chan->call);
+ +
+ +		if (sp->hdr.callNumber > chan->call_id) {
+ +			if (rxrpc_to_client(sp))
+ +				goto reject_packet;
+ +			if (call)
+ +				rxrpc_input_implicit_end_call(rx, conn, call);
+ +			call = NULL;
+ +		}
+ +
+ +		if (call) {
+ +			if (sp->hdr.serviceId != call->service_id)
+ +				call->service_id = sp->hdr.serviceId;
+ +			if ((int)sp->hdr.serial - (int)call->rx_serial > 0)
+ +				call->rx_serial = sp->hdr.serial;
+ +			if (!test_bit(RXRPC_CALL_RX_HEARD, &call->flags))
+ +				set_bit(RXRPC_CALL_RX_HEARD, &call->flags);
+ +		}
+ +	}
+ +
+ +	if (!call || refcount_read(&call->ref) == 0) {
+ +		if (rxrpc_to_client(sp) ||
+ +		    sp->hdr.type != RXRPC_PACKET_TYPE_DATA)
+ +			goto bad_message;
+ +		if (sp->hdr.seq != 1)
+ +			goto discard;
+ +		call = rxrpc_new_incoming_call(local, rx, skb);
+ +		if (!call)
+ +			goto reject_packet;
+ +	}
+ +
+ +	/* Process a call packet; this either discards or passes on the ref
+ +	 * elsewhere.
+ +	 */
+ +	rxrpc_input_call_packet(call, skb);
+ +	goto out;
+ +
+ +discard:
+ +	rxrpc_free_skb(skb, rxrpc_skb_freed);
+ +out:
+ +	trace_rxrpc_rx_done(0, 0);
+ +	return 0;
+ +
+ +wrong_security:
+ +	trace_rxrpc_abort(0, "SEC", sp->hdr.cid, sp->hdr.callNumber, sp->hdr.seq,
+ +			  RXKADINCONSISTENCY, EBADMSG);
+ +	skb->priority = RXKADINCONSISTENCY;
+ +	goto post_abort;
+ +
+ +unsupported_service:
+ +	trace_rxrpc_abort(0, "INV", sp->hdr.cid, sp->hdr.callNumber, sp->hdr.seq,
+ +			  RX_INVALID_OPERATION, EOPNOTSUPP);
+ +	skb->priority = RX_INVALID_OPERATION;
+ +	goto post_abort;
+ +
+ +reupgrade:
+ +	trace_rxrpc_abort(0, "UPG", sp->hdr.cid, sp->hdr.callNumber, sp->hdr.seq,
+ +			  RX_PROTOCOL_ERROR, EBADMSG);
+ +	goto protocol_error;
+ +
+ +bad_message:
+ +	trace_rxrpc_abort(0, "BAD", sp->hdr.cid, sp->hdr.callNumber, sp->hdr.seq,
+ +			  RX_PROTOCOL_ERROR, EBADMSG);
+ +protocol_error:
+ +	skb->priority = RX_PROTOCOL_ERROR;
+ +post_abort:
+ +	skb->mark = RXRPC_SKB_MARK_REJECT_ABORT;
+ +reject_packet:
+ +	trace_rxrpc_rx_done(skb->mark, skb->priority);
+ +	rxrpc_reject_packet(local, skb);
+ +	_leave(" [badmsg]");
+ +	return 0;
+  }
+diff --cc net/rxrpc/local_event.c
+index f23a3fbabbda,5e69ea6b233d..000000000000
+--- a/net/rxrpc/local_event.c
++++ b/net/rxrpc/local_event.c
+@@@ -73,40 -73,3 +73,43 @@@ void rxrpc_send_version_request(struct 
+  
+  	_leave("");
+  }
+++<<<<<<< HEAD
+ +
+ +/*
+ + * Process event packets targeted at a local endpoint.
+ + */
+ +void rxrpc_process_local_events(struct rxrpc_local *local)
+ +{
+ +	struct sk_buff *skb;
+ +	char v;
+ +
+ +	_enter("");
+ +
+ +	skb = skb_dequeue(&local->event_queue);
+ +	if (skb) {
+ +		struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
+ +
+ +		rxrpc_see_skb(skb, rxrpc_skb_seen);
+ +		_debug("{%d},{%u}", local->debug_id, sp->hdr.type);
+ +
+ +		switch (sp->hdr.type) {
+ +		case RXRPC_PACKET_TYPE_VERSION:
+ +			if (skb_copy_bits(skb, sizeof(struct rxrpc_wire_header),
+ +					  &v, 1) < 0)
+ +				return;
+ +			if (v == 0)
+ +				rxrpc_send_version_request(local, &sp->hdr, skb);
+ +			break;
+ +
+ +		default:
+ +			/* Just ignore anything we don't understand */
+ +			break;
+ +		}
+ +
+ +		rxrpc_free_skb(skb, rxrpc_skb_freed);
+ +	}
+ +
+ +	_leave("");
+ +}
+++=======
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+diff --cc net/rxrpc/local_object.c
+index 846558613c7f,c73a5a1bc088..000000000000
+--- a/net/rxrpc/local_object.c
++++ b/net/rxrpc/local_object.c
+@@@ -20,9 -20,22 +20,8 @@@
+  #include <net/af_rxrpc.h>
+  #include "ar-internal.h"
+  
+- static void rxrpc_local_processor(struct work_struct *);
+  static void rxrpc_local_rcu(struct rcu_head *);
+  
+ -/*
+ - * Handle an ICMP/ICMP6 error turning up at the tunnel.  Push it through the
+ - * usual mechanism so that it gets parsed and presented through the UDP
+ - * socket's error_report().
+ - */
+ -static void rxrpc_encap_err_rcv(struct sock *sk, struct sk_buff *skb, int err,
+ -				__be16 port, u32 info, u8 *payload)
+ -{
+ -	if (ip_hdr(skb)->version == IPVERSION)
+ -		return ip_icmp_error(sk, skb, err, port, info, payload);
+ -	if (IS_ENABLED(CONFIG_AF_RXRPC_IPV6))
+ -		return ipv6_icmp_error(sk, skb, err, port, info, payload);
+ -}
+ -
+  /*
+   * Compare a local to an address.  Return -ve, 0 or +ve to indicate less than,
+   * same or greater than.
+@@@ -86,9 -99,8 +85,13 @@@ static struct rxrpc_local *rxrpc_alloc_
+  		INIT_LIST_HEAD(&local->ack_tx_queue);
+  		spin_lock_init(&local->ack_tx_lock);
+  		init_rwsem(&local->defrag_sem);
+++<<<<<<< HEAD
+ +		skb_queue_head_init(&local->reject_queue);
+ +		skb_queue_head_init(&local->event_queue);
+++=======
++ 		skb_queue_head_init(&local->rx_queue);
++ 		INIT_LIST_HEAD(&local->call_attend_q);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  		local->client_bundles = RB_ROOT;
+  		spin_lock_init(&local->client_bundles_lock);
+  		spin_lock_init(&local->lock);
+@@@ -277,45 -300,28 +280,48 @@@ struct rxrpc_local *rxrpc_get_local(str
+  /*
+   * Get a ref on a local endpoint unless its usage has already reached 0.
+   */
+ -struct rxrpc_local *rxrpc_get_local_maybe(struct rxrpc_local *local,
+ -					  enum rxrpc_local_trace why)
+ +struct rxrpc_local *rxrpc_get_local_maybe(struct rxrpc_local *local)
+  {
+ -	int r, u;
+ +	const void *here = __builtin_return_address(0);
+ +	int r;
+  
+ -	if (local && __refcount_inc_not_zero(&local->ref, &r)) {
+ -		u = atomic_read(&local->active_users);
+ -		trace_rxrpc_local(local->debug_id, why, r + 1, u);
+ -		return local;
+ +	if (local) {
+ +		if (__refcount_inc_not_zero(&local->ref, &r))
+ +			trace_rxrpc_local(local->debug_id, rxrpc_local_got,
+ +					  r + 1, here);
+ +		else
+ +			local = NULL;
+  	}
+ +	return local;
+ +}
+  
+ -	return NULL;
+ +/*
+++<<<<<<< HEAD
+ + * Queue a local endpoint and pass the caller's reference to the work item.
+ + */
+ +void rxrpc_queue_local(struct rxrpc_local *local)
+ +{
+ +	const void *here = __builtin_return_address(0);
+ +	unsigned int debug_id = local->debug_id;
+ +	int r = refcount_read(&local->ref);
+ +
+ +	if (rxrpc_queue_work(&local->processor))
+ +		trace_rxrpc_local(debug_id, rxrpc_local_queued, r + 1, here);
+ +	else
+ +		rxrpc_put_local(local);
+  }
+  
+  /*
+++=======
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+   * Drop a ref on a local endpoint.
+   */
+ -void rxrpc_put_local(struct rxrpc_local *local, enum rxrpc_local_trace why)
+ +void rxrpc_put_local(struct rxrpc_local *local)
+  {
+ +	const void *here = __builtin_return_address(0);
+  	unsigned int debug_id;
+  	bool dead;
+ -	int r, u;
+ +	int r;
+  
+  	if (local) {
+  		debug_id = local->debug_id;
+@@@ -347,16 -355,12 +353,16 @@@ struct rxrpc_local *rxrpc_use_local(str
+  
+  /*
+   * Cease using a local endpoint.  Once the number of active users reaches 0, we
+-  * start the closure of the transport in the work processor.
++  * start the closure of the transport in the I/O thread..
+   */
+ -void rxrpc_unuse_local(struct rxrpc_local *local, enum rxrpc_local_trace why)
+ +void rxrpc_unuse_local(struct rxrpc_local *local)
+  {
+ -	if (local && __rxrpc_unuse_local(local, why))
+ -		kthread_stop(local->io_thread);
+ +	if (local) {
+ +		if (__rxrpc_unuse_local(local)) {
+ +			rxrpc_get_local(local);
+ +			rxrpc_queue_local(local);
+ +		}
+ +	}
+  }
+  
+  /*
+@@@ -393,68 -397,18 +399,78 @@@ static void rxrpc_local_destroyer(struc
+  	/* At this point, there should be no more packets coming in to the
+  	 * local endpoint.
+  	 */
+++<<<<<<< HEAD
+ +	rxrpc_purge_queue(&local->reject_queue);
+ +	rxrpc_purge_queue(&local->event_queue);
+ +}
+ +
+ +/*
+ + * Process events on an endpoint.  The work item carries a ref which
+ + * we must release.
+ + */
+ +static void rxrpc_local_processor(struct work_struct *work)
+ +{
+ +	struct rxrpc_local *local =
+ +		container_of(work, struct rxrpc_local, processor);
+ +	bool again;
+ +
+ +	if (local->dead)
+ +		return;
+ +
+ +	trace_rxrpc_local(local->debug_id, rxrpc_local_processing,
+ +			  refcount_read(&local->ref), NULL);
+ +
+ +	do {
+ +		again = false;
+ +		if (!__rxrpc_use_local(local)) {
+ +			rxrpc_local_destroyer(local);
+ +			break;
+ +		}
+ +
+ +		if (!list_empty(&local->ack_tx_queue)) {
+ +			rxrpc_transmit_ack_packets(local);
+ +			again = true;
+ +		}
+ +
+ +		if (!skb_queue_empty(&local->reject_queue)) {
+ +			rxrpc_reject_packets(local);
+ +			again = true;
+ +		}
+ +
+ +		if (!skb_queue_empty(&local->event_queue)) {
+ +			rxrpc_process_local_events(local);
+ +			again = true;
+ +		}
+ +
+ +		__rxrpc_unuse_local(local);
+ +	} while (again);
+ +
+ +	rxrpc_put_local(local);
+ +}
+ +
+ +/*
+++=======
++ 	rxrpc_purge_queue(&local->rx_queue);
++ }
++ 
++ /*
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+   * Destroy a local endpoint after the RCU grace period expires.
+   */
+  static void rxrpc_local_rcu(struct rcu_head *rcu)
+  {
+  	struct rxrpc_local *local = container_of(rcu, struct rxrpc_local, rcu);
+  
+++<<<<<<< HEAD
+ +	_enter("%d", local->debug_id);
+ +
+ +	ASSERT(!work_pending(&local->processor));
+ +
+ +	_net("DESTROY LOCAL %d", local->debug_id);
+++=======
++ 	rxrpc_see_local(local, rxrpc_local_free);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	kfree(local);
+- 	_leave("");
+  }
+  
+  /*
+diff --cc net/rxrpc/output.c
+index 71b6fea4598b,2ea1fa1b8a6f..000000000000
+--- a/net/rxrpc/output.c
++++ b/net/rxrpc/output.c
+@@@ -615,52 -608,42 +607,88 @@@ void rxrpc_reject_packet(struct rxrpc_l
+  
+  	memset(&whdr, 0, sizeof(whdr));
+  
+++<<<<<<< HEAD
+ +	while ((skb = skb_dequeue(&local->reject_queue))) {
+ +		rxrpc_see_skb(skb, rxrpc_skb_seen);
+ +		sp = rxrpc_skb(skb);
+ +
+ +		switch (skb->mark) {
+ +		case RXRPC_SKB_MARK_REJECT_BUSY:
+ +			whdr.type = RXRPC_PACKET_TYPE_BUSY;
+ +			size = sizeof(whdr);
+ +			ioc = 1;
+ +			break;
+ +		case RXRPC_SKB_MARK_REJECT_ABORT:
+ +			whdr.type = RXRPC_PACKET_TYPE_ABORT;
+ +			code = htonl(skb->priority);
+ +			size = sizeof(whdr) + sizeof(code);
+ +			ioc = 2;
+ +			break;
+ +		default:
+ +			rxrpc_free_skb(skb, rxrpc_skb_freed);
+ +			continue;
+ +		}
+ +
+ +		if (rxrpc_extract_addr_from_skb(&srx, skb) == 0) {
+ +			msg.msg_namelen = srx.transport_len;
+ +
+ +			whdr.epoch	= htonl(sp->hdr.epoch);
+ +			whdr.cid	= htonl(sp->hdr.cid);
+ +			whdr.callNumber	= htonl(sp->hdr.callNumber);
+ +			whdr.serviceId	= htons(sp->hdr.serviceId);
+ +			whdr.flags	= sp->hdr.flags;
+ +			whdr.flags	^= RXRPC_CLIENT_INITIATED;
+ +			whdr.flags	&= RXRPC_CLIENT_INITIATED;
+ +
+ +			iov_iter_kvec(&msg.msg_iter, WRITE, iov, ioc, size);
+ +			ret = do_udp_sendmsg(local->socket, &msg, size);
+ +			if (ret < 0)
+ +				trace_rxrpc_tx_fail(local->debug_id, 0, ret,
+ +						    rxrpc_tx_point_reject);
+ +			else
+ +				trace_rxrpc_tx_packet(local->debug_id, &whdr,
+ +						      rxrpc_tx_point_reject);
+ +		}
+ +
+ +		rxrpc_free_skb(skb, rxrpc_skb_freed);
+++=======
++ 	switch (skb->mark) {
++ 	case RXRPC_SKB_MARK_REJECT_BUSY:
++ 		whdr.type = RXRPC_PACKET_TYPE_BUSY;
++ 		size = sizeof(whdr);
++ 		ioc = 1;
++ 		break;
++ 	case RXRPC_SKB_MARK_REJECT_ABORT:
++ 		whdr.type = RXRPC_PACKET_TYPE_ABORT;
++ 		code = htonl(skb->priority);
++ 		size = sizeof(whdr) + sizeof(code);
++ 		ioc = 2;
++ 		break;
++ 	default:
++ 		return;
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	}
+  
+- 	_leave("");
++ 	if (rxrpc_extract_addr_from_skb(&srx, skb) == 0) {
++ 		msg.msg_namelen = srx.transport_len;
++ 
++ 		whdr.epoch	= htonl(sp->hdr.epoch);
++ 		whdr.cid	= htonl(sp->hdr.cid);
++ 		whdr.callNumber	= htonl(sp->hdr.callNumber);
++ 		whdr.serviceId	= htons(sp->hdr.serviceId);
++ 		whdr.flags	= sp->hdr.flags;
++ 		whdr.flags	^= RXRPC_CLIENT_INITIATED;
++ 		whdr.flags	&= RXRPC_CLIENT_INITIATED;
++ 
++ 		iov_iter_kvec(&msg.msg_iter, WRITE, iov, ioc, size);
++ 		ret = do_udp_sendmsg(local->socket, &msg, size);
++ 		if (ret < 0)
++ 			trace_rxrpc_tx_fail(local->debug_id, 0, ret,
++ 					    rxrpc_tx_point_reject);
++ 		else
++ 			trace_rxrpc_tx_packet(local->debug_id, &whdr,
++ 					      rxrpc_tx_point_reject);
++ 	}
+  }
+  
+  /*
+diff --cc net/rxrpc/peer_event.c
+index b5160a878fe1,fb8096e93d2c..000000000000
+--- a/net/rxrpc/peer_event.c
++++ b/net/rxrpc/peer_event.c
+@@@ -18,16 -18,16 +18,16 @@@
+  #include <net/ip.h>
+  #include "ar-internal.h"
+  
+- static void rxrpc_store_error(struct rxrpc_peer *, struct sock_exterr_skb *);
+- static void rxrpc_distribute_error(struct rxrpc_peer *, int,
+- 				   enum rxrpc_call_completion);
++ static void rxrpc_store_error(struct rxrpc_peer *, struct sk_buff *);
++ static void rxrpc_distribute_error(struct rxrpc_peer *, struct sk_buff *,
++ 				   enum rxrpc_call_completion, int);
+  
+  /*
+ - * Find the peer associated with a local error.
+ + * Find the peer associated with an ICMP packet.
+   */
+ -static struct rxrpc_peer *rxrpc_lookup_peer_local_rcu(struct rxrpc_local *local,
+ -						      const struct sk_buff *skb,
+ -						      struct sockaddr_rxrpc *srx)
+ +static struct rxrpc_peer *rxrpc_lookup_peer_icmp_rcu(struct rxrpc_local *local,
+ +						     const struct sk_buff *skb,
+ +						     struct sockaddr_rxrpc *srx)
+  {
+  	struct sock_exterr_skb *serr = SKB_EXT_ERR(skb);
+  
+@@@ -194,20 -157,13 +194,26 @@@ void rxrpc_error_report(struct sock *sk
+  	if ((serr->ee.ee_origin == SO_EE_ORIGIN_ICMP &&
+  	     serr->ee.ee_type == ICMP_DEST_UNREACH &&
+  	     serr->ee.ee_code == ICMP_FRAG_NEEDED)) {
+ -		rxrpc_adjust_mtu(peer, serr->ee.ee_info);
+ -		goto out;
+ +		rxrpc_adjust_mtu(peer, serr);
+ +		rcu_read_unlock();
+ +		rxrpc_free_skb(skb, rxrpc_skb_freed);
+ +		rxrpc_put_peer(peer);
+ +		_leave(" [MTU update]");
+ +		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	rxrpc_store_error(peer, serr);
+ +	rcu_read_unlock();
+ +	rxrpc_free_skb(skb, rxrpc_skb_freed);
+ +	rxrpc_put_peer(peer);
+ +
+ +	_leave("");
+++=======
++ 	rxrpc_store_error(peer, skb);
++ out:
++ 	rxrpc_put_peer(peer, rxrpc_peer_put_input_error);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  }
+  
+  /*
+@@@ -222,46 -178,7 +228,42 @@@ static void rxrpc_store_error(struct rx
+  
+  	_enter("");
+  
+- 	ee = &serr->ee;
+- 
+- 	err = ee->ee_errno;
+- 
+  	switch (ee->ee_origin) {
+ +	case SO_EE_ORIGIN_ICMP:
+ +		switch (ee->ee_type) {
+ +		case ICMP_DEST_UNREACH:
+ +			switch (ee->ee_code) {
+ +			case ICMP_NET_UNREACH:
+ +				_net("Rx Received ICMP Network Unreachable");
+ +				break;
+ +			case ICMP_HOST_UNREACH:
+ +				_net("Rx Received ICMP Host Unreachable");
+ +				break;
+ +			case ICMP_PORT_UNREACH:
+ +				_net("Rx Received ICMP Port Unreachable");
+ +				break;
+ +			case ICMP_NET_UNKNOWN:
+ +				_net("Rx Received ICMP Unknown Network");
+ +				break;
+ +			case ICMP_HOST_UNKNOWN:
+ +				_net("Rx Received ICMP Unknown Host");
+ +				break;
+ +			default:
+ +				_net("Rx Received ICMP DestUnreach code=%u",
+ +				     ee->ee_code);
+ +				break;
+ +			}
+ +			break;
+ +
+ +		case ICMP_TIME_EXCEEDED:
+ +			_net("Rx Received ICMP TTL Exceeded");
+ +			break;
+ +
+ +		default:
+ +			break;
+ +		}
+ +		break;
+ +
+  	case SO_EE_ORIGIN_NONE:
+  	case SO_EE_ORIGIN_LOCAL:
+  		compl = RXRPC_CALL_LOCAL_ERROR;
+@@@ -281,15 -199,29 +283,22 @@@
+  /*
+   * Distribute an error that occurred on a peer.
+   */
+- static void rxrpc_distribute_error(struct rxrpc_peer *peer, int error,
+- 				   enum rxrpc_call_completion compl)
++ static void rxrpc_distribute_error(struct rxrpc_peer *peer, struct sk_buff *skb,
++ 				   enum rxrpc_call_completion compl, int err)
+  {
+  	struct rxrpc_call *call;
+ -	HLIST_HEAD(error_targets);
+ -
+ -	spin_lock(&peer->lock);
+ -	hlist_move_list(&peer->error_targets, &error_targets);
+ -
+ -	while (!hlist_empty(&error_targets)) {
+ -		call = hlist_entry(error_targets.first,
+ -				   struct rxrpc_call, error_link);
+ -		hlist_del_init(&call->error_link);
+ -		spin_unlock(&peer->lock);
+  
+ +	hlist_for_each_entry_rcu(call, &peer->error_targets, error_link) {
+  		rxrpc_see_call(call, rxrpc_call_see_distribute_error);
+++<<<<<<< HEAD
+ +		rxrpc_set_call_completion(call, compl, 0, -error);
+++=======
++ 		rxrpc_set_call_completion(call, compl, 0, -err);
++ 		rxrpc_input_call_event(call, skb);
++ 
++ 		spin_lock(&peer->lock);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	}
+ -
+ -	spin_unlock(&peer->lock);
+  }
+  
+  /*
+diff --cc net/rxrpc/sendmsg.c
+index 1fde52736bb8,58e0a36f6aa9..000000000000
+--- a/net/rxrpc/sendmsg.c
++++ b/net/rxrpc/sendmsg.c
+@@@ -206,8 -170,7 +206,12 @@@ static void rxrpc_queue_packet(struct r
+  {
+  	unsigned long now;
+  	rxrpc_seq_t seq = txb->seq;
+++<<<<<<< HEAD
+ +	bool last = test_bit(RXRPC_TXBUF_LAST, &txb->flags);
+ +	int ret;
+++=======
++ 	bool last = test_bit(RXRPC_TXBUF_LAST, &txb->flags), poke;
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  
+  	rxrpc_inc_stat(call->rxnet, stat_tx_data);
+  
+@@@ -230,6 -186,13 +234,16 @@@
+  	else
+  		trace_rxrpc_txqueue(call, rxrpc_txqueue_queue);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Add the packet to the call's output buffer */
++ 	spin_lock(&call->tx_lock);
++ 	poke = list_empty(&call->tx_sendmsg);
++ 	list_add_tail(&txb->call_link, &call->tx_sendmsg);
++ 	call->tx_prepared = seq;
++ 	spin_unlock(&call->tx_lock);
++ 
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  	if (last || call->state == RXRPC_CALL_SERVER_ACK_REQUEST) {
+  		_debug("________awaiting reply/ACK__________");
+  		write_lock_bh(&call->state_lock);
+@@@ -258,30 -221,8 +272,35 @@@
+  		write_unlock_bh(&call->state_lock);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (seq == 1 && rxrpc_is_client_call(call))
+ +		rxrpc_expose_client_call(call);
+ +
+ +	ret = rxrpc_send_data_packet(call, txb);
+ +	if (ret < 0) {
+ +		switch (ret) {
+ +		case -ENETUNREACH:
+ +		case -EHOSTUNREACH:
+ +		case -ECONNREFUSED:
+ +			rxrpc_set_call_completion(call, RXRPC_CALL_LOCAL_ERROR,
+ +						  0, ret);
+ +			goto out;
+ +		}
+ +	} else {
+ +		unsigned long now = jiffies;
+ +		unsigned long resend_at = now + call->peer->rto_j;
+ +
+ +		WRITE_ONCE(call->resend_at, resend_at);
+ +		rxrpc_reduce_call_timer(call, resend_at, now,
+ +					rxrpc_timer_set_for_send);
+ +	}
+ +
+ +out:
+ +	rxrpc_put_txbuf(txb, rxrpc_txbuf_put_trans);
+++=======
++ 	if (poke)
++ 		rxrpc_poke_call(call, rxrpc_call_poke_start);
+++>>>>>>> 5e6ef4f1017c (rxrpc: Make the I/O thread take over the call and local processor work)
+  }
+  
+  /*
+* Unmerged path net/rxrpc/io_thread.c
+* Unmerged path include/trace/events/rxrpc.h
+* Unmerged path net/rxrpc/ar-internal.h
+* Unmerged path net/rxrpc/call_accept.c
+* Unmerged path net/rxrpc/call_event.c
+* Unmerged path net/rxrpc/call_object.c
+diff --git a/net/rxrpc/conn_event.c b/net/rxrpc/conn_event.c
+index abf03a5b1d31..62a1756f8f4d 100644
+--- a/net/rxrpc/conn_event.c
++++ b/net/rxrpc/conn_event.c
+@@ -483,3 +483,63 @@ void rxrpc_process_connection(struct work_struct *work)
+ 	_leave("");
+ 	return;
+ }
++
++/*
++ * post connection-level events to the connection
++ * - this includes challenges, responses, some aborts and call terminal packet
++ *   retransmission.
++ */
++static void rxrpc_post_packet_to_conn(struct rxrpc_connection *conn,
++				      struct sk_buff *skb)
++{
++	_enter("%p,%p", conn, skb);
++
++	rxrpc_get_skb(skb, rxrpc_skb_get_conn_work);
++	skb_queue_tail(&conn->rx_queue, skb);
++	rxrpc_queue_conn(conn, rxrpc_conn_queue_rx_work);
++}
++
++/*
++ * Input a connection-level packet.
++ */
++int rxrpc_input_conn_packet(struct rxrpc_connection *conn, struct sk_buff *skb)
++{
++	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
++
++	if (conn->state >= RXRPC_CONN_REMOTELY_ABORTED) {
++		_leave(" = -ECONNABORTED [%u]", conn->state);
++		return -ECONNABORTED;
++	}
++
++	_enter("{%d},{%u,%%%u},", conn->debug_id, sp->hdr.type, sp->hdr.serial);
++
++	switch (sp->hdr.type) {
++	case RXRPC_PACKET_TYPE_DATA:
++	case RXRPC_PACKET_TYPE_ACK:
++		rxrpc_conn_retransmit_call(conn, skb,
++					   sp->hdr.cid & RXRPC_CHANNELMASK);
++		return 0;
++
++	case RXRPC_PACKET_TYPE_BUSY:
++		/* Just ignore BUSY packets for now. */
++		return 0;
++
++	case RXRPC_PACKET_TYPE_ABORT:
++		conn->error = -ECONNABORTED;
++		conn->abort_code = skb->priority;
++		conn->state = RXRPC_CONN_REMOTELY_ABORTED;
++		set_bit(RXRPC_CONN_DONT_REUSE, &conn->flags);
++		rxrpc_abort_calls(conn, RXRPC_CALL_REMOTELY_ABORTED, sp->hdr.serial);
++		return -ECONNABORTED;
++
++	case RXRPC_PACKET_TYPE_CHALLENGE:
++	case RXRPC_PACKET_TYPE_RESPONSE:
++		rxrpc_post_packet_to_conn(conn, skb);
++		return 0;
++
++	default:
++		trace_rxrpc_rx_eproto(NULL, sp->hdr.serial,
++				      tracepoint_string("bad_conn_pkt"));
++		return -EPROTO;
++	}
++}
+* Unmerged path net/rxrpc/conn_object.c
+* Unmerged path net/rxrpc/input.c
+* Unmerged path net/rxrpc/io_thread.c
+* Unmerged path net/rxrpc/local_event.c
+* Unmerged path net/rxrpc/local_object.c
+* Unmerged path net/rxrpc/output.c
+* Unmerged path net/rxrpc/peer_event.c
+diff --git a/net/rxrpc/recvmsg.c b/net/rxrpc/recvmsg.c
+index c84d2b620396..b09e1e378c38 100644
+--- a/net/rxrpc/recvmsg.c
++++ b/net/rxrpc/recvmsg.c
+@@ -253,11 +253,8 @@ static void rxrpc_rotate_rx_window(struct rxrpc_call *call)
+ 	acked = atomic_add_return(call->rx_consumed - old_consumed,
+ 				  &call->ackr_nr_consumed);
+ 	if (acked > 2 &&
+-	    !test_and_set_bit(RXRPC_CALL_IDLE_ACK_PENDING, &call->flags)) {
+-		rxrpc_send_ACK(call, RXRPC_ACK_IDLE, serial,
+-			       rxrpc_propose_ack_rotate_rx);
+-		rxrpc_transmit_ack_packets(call->peer->local);
+-	}
++	    !test_and_set_bit(RXRPC_CALL_RX_IS_IDLE, &call->flags))
++		rxrpc_poke_call(call, rxrpc_call_poke_idle);
+ }
+ 
+ /*
+@@ -377,7 +374,7 @@ static int rxrpc_recvmsg_data(struct socket *sock, struct rxrpc_call *call,
+ 	trace_rxrpc_recvdata(call, rxrpc_recvmsg_data_return, seq,
+ 			     rx_pkt_offset, rx_pkt_len, ret);
+ 	if (ret == -EAGAIN)
+-		set_bit(RXRPC_CALL_RX_UNDERRUN, &call->flags);
++		set_bit(RXRPC_CALL_RX_IS_IDLE, &call->flags);
+ 	return ret;
+ }
+ 
+* Unmerged path net/rxrpc/sendmsg.c
