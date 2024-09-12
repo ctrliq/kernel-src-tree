@@ -1,0 +1,157 @@
+net: introduce default_rps_mask netns attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 605cfa1b1090b5d9e227d8a8f7d08fdd04f07724
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/605cfa1b.failed
+
+If RPS is enabled, this allows configuring a default rps
+mask, which is effective since receive queue creation time.
+
+A default RPS mask allows the system admin to ensure proper
+isolation, avoiding races at network namespace or device
+creation time.
+
+The default RPS mask is initially empty, and can be
+modified via a newly added sysctl entry.
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Simon Horman <simon.horman@corigine.com>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 605cfa1b1090b5d9e227d8a8f7d08fdd04f07724)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/sysctl_net_core.c
+diff --cc net/core/sysctl_net_core.c
+index 5ff9b3d67973,7130e6d9e263..000000000000
+--- a/net/core/sysctl_net_core.c
++++ b/net/core/sysctl_net_core.c
+@@@ -36,9 -36,71 +37,74 @@@ static int net_msg_warn;	/* Unused, bu
+  int sysctl_fb_tunnels_only_for_init_net __read_mostly = 0;
+  EXPORT_SYMBOL(sysctl_fb_tunnels_only_for_init_net);
+  
+++<<<<<<< HEAD
+++=======
++ /* 0 - Keep current behavior:
++  *     IPv4: inherit all current settings from init_net
++  *     IPv6: reset all settings to default
++  * 1 - Both inherit all current settings from init_net
++  * 2 - Both reset all settings to default
++  * 3 - Both inherit all settings from current netns
++  */
++ int sysctl_devconf_inherit_init_net __read_mostly;
++ EXPORT_SYMBOL(sysctl_devconf_inherit_init_net);
++ 
++ #if IS_ENABLED(CONFIG_NET_FLOW_LIMIT) || IS_ENABLED(CONFIG_RPS)
++ static void dump_cpumask(void *buffer, size_t *lenp, loff_t *ppos,
++ 			 struct cpumask *mask)
++ {
++ 	char kbuf[128];
++ 	int len;
++ 
++ 	if (*ppos || !*lenp) {
++ 		*lenp = 0;
++ 		return;
++ 	}
++ 
++ 	len = min(sizeof(kbuf) - 1, *lenp);
++ 	len = scnprintf(kbuf, len, "%*pb", cpumask_pr_args(mask));
++ 	if (!len) {
++ 		*lenp = 0;
++ 		return;
++ 	}
++ 
++ 	if (len < *lenp)
++ 		kbuf[len++] = '\n';
++ 	memcpy(buffer, kbuf, len);
++ 	*lenp = len;
++ 	*ppos += len;
++ }
++ #endif
++ 
+++>>>>>>> 605cfa1b1090 (net: introduce default_rps_mask netns attribute)
+  #ifdef CONFIG_RPS
++ struct cpumask rps_default_mask;
++ 
++ static int rps_default_mask_sysctl(struct ctl_table *table, int write,
++ 				   void *buffer, size_t *lenp, loff_t *ppos)
++ {
++ 	int err = 0;
++ 
++ 	rtnl_lock();
++ 	if (write) {
++ 		err = cpumask_parse(buffer, &rps_default_mask);
++ 		if (err)
++ 			goto done;
++ 
++ 		err = rps_cpumask_housekeeping(&rps_default_mask);
++ 		if (err)
++ 			goto done;
++ 	} else {
++ 		dump_cpumask(buffer, lenp, ppos, &rps_default_mask);
++ 	}
++ 
++ done:
++ 	rtnl_unlock();
++ 	return err;
++ }
++ 
+  static int rps_sock_flow_sysctl(struct ctl_table *table, int write,
+ -				void *buffer, size_t *lenp, loff_t *ppos)
+ +				void __user *buffer, size_t *lenp, loff_t *ppos)
+  {
+  	unsigned int orig_size, size;
+  	int ret, i;
+diff --git a/Documentation/sysctl/net.txt b/Documentation/sysctl/net.txt
+index ad8173a26e1d..bd810395f487 100644
+--- a/Documentation/sysctl/net.txt
++++ b/Documentation/sysctl/net.txt
+@@ -180,6 +180,12 @@ rmem_max
+ 
+ The maximum receive socket buffer size in bytes.
+ 
++rps_default_mask
++----------------
++
++The default RPS CPU mask used on newly created network devices. An empty
++mask means RPS disabled by default.
++
+ tstamp_allow_data
+ -----------------
+ Allow processes to receive tx timestamps looped together with the original
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 8337e8582f12..f23ed3e6190f 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -213,6 +213,7 @@ struct net_device_core_stats {
+ #include <linux/static_key.h>
+ extern struct static_key_false rps_needed;
+ extern struct static_key_false rfs_needed;
++extern struct cpumask rps_default_mask;
+ #endif
+ 
+ struct neighbour;
+diff --git a/net/core/net-sysfs.c b/net/core/net-sysfs.c
+index 10667cc2a611..5fa649c8b39f 100644
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@ -1074,6 +1074,13 @@ static int rx_queue_add_kobject(struct net_device *dev, int index)
+ 			goto err;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_RPS) && IS_ENABLED(CONFIG_SYSCTL)
++	if (!cpumask_empty(&rps_default_mask)) {
++		error = netdev_rx_queue_set_rps_mask(queue, &rps_default_mask);
++		if (error)
++			goto err;
++	}
++#endif
+ 	kobject_uevent(kobj, KOBJ_ADD);
+ 
+ 	return error;
+* Unmerged path net/core/sysctl_net_core.c
