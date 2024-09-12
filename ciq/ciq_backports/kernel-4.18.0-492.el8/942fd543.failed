@@ -1,0 +1,614 @@
+iommu: Remove SVM_FLAG_SUPERVISOR_MODE support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-492.el8
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit 942fd5435dccb273f90176b046ae6bbba60cfbd8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-492.el8/942fd543.failed
+
+The current kernel DMA with PASID support is based on the SVA with a flag
+SVM_FLAG_SUPERVISOR_MODE. The IOMMU driver binds the kernel memory address
+space to a PASID of the device. The device driver programs the device with
+kernel virtual address (KVA) for DMA access. There have been security and
+functional issues with this approach:
+
+- The lack of IOTLB synchronization upon kernel page table updates.
+  (vmalloc, module/BPF loading, CONFIG_DEBUG_PAGEALLOC etc.)
+- Other than slight more protection, using kernel virtual address (KVA)
+  has little advantage over physical address. There are also no use
+  cases yet where DMA engines need kernel virtual addresses for in-kernel
+  DMA.
+
+This removes SVM_FLAG_SUPERVISOR_MODE support from the IOMMU interface.
+The device drivers are suggested to handle kernel DMA with PASID through
+the kernel DMA APIs.
+
+The drvdata parameter in iommu_sva_bind_device() and all callbacks is not
+needed anymore. Cleanup them as well.
+
+Link: https://lore.kernel.org/linux-iommu/20210511194726.GP1002214@nvidia.com/
+	Signed-off-by: Jacob Pan <jacob.jun.pan@linux.intel.com>
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+	Reviewed-by: Jean-Philippe Brucker <jean-philippe@linaro.org>
+	Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+	Reviewed-by: Fenghua Yu <fenghua.yu@intel.com>
+	Tested-by: Zhangfei Gao <zhangfei.gao@linaro.org>
+	Tested-by: Tony Zhu <tony.zhu@intel.com>
+Link: https://lore.kernel.org/r/20221031005917.45690-4-baolu.lu@linux.intel.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 942fd5435dccb273f90176b046ae6bbba60cfbd8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel/svm.c
+#	drivers/misc/uacce/uacce.c
+#	include/linux/intel-iommu.h
+#	include/linux/intel-svm.h
+#	include/linux/iommu.h
+diff --cc drivers/iommu/intel/svm.c
+index fe5757ae6e60,94bc47b68c93..000000000000
+--- a/drivers/iommu/intel/svm.c
++++ b/drivers/iommu/intel/svm.c
+@@@ -305,210 -296,7 +305,214 @@@ out
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int intel_svm_bind_gpasid(struct iommu_domain *domain, struct device *dev,
+ +			  struct iommu_gpasid_bind_data *data)
+ +{
+ +	struct intel_iommu *iommu = device_to_iommu(dev, NULL, NULL);
+ +	struct intel_svm_dev *sdev = NULL;
+ +	struct dmar_domain *dmar_domain;
+ +	struct device_domain_info *info;
+ +	struct intel_svm *svm = NULL;
+ +	unsigned long iflags;
+ +	int ret = 0;
+ +
+ +	if (WARN_ON(!iommu) || !data)
+ +		return -EINVAL;
+ +
+ +	if (data->format != IOMMU_PASID_FORMAT_INTEL_VTD)
+ +		return -EINVAL;
+ +
+ +	/* IOMMU core ensures argsz is more than the start of the union */
+ +	if (data->argsz < offsetofend(struct iommu_gpasid_bind_data, vendor.vtd))
+ +		return -EINVAL;
+ +
+ +	/* Make sure no undefined flags are used in vendor data */
+ +	if (data->vendor.vtd.flags & ~(IOMMU_SVA_VTD_GPASID_LAST - 1))
+ +		return -EINVAL;
+ +
+ +	if (!dev_is_pci(dev))
+ +		return -ENOTSUPP;
+ +
+ +	/* VT-d supports devices with full 20 bit PASIDs only */
+ +	if (pci_max_pasids(to_pci_dev(dev)) != PASID_MAX)
+ +		return -EINVAL;
+ +
+ +	/*
+ +	 * We only check host PASID range, we have no knowledge to check
+ +	 * guest PASID range.
+ +	 */
+ +	if (data->hpasid <= 0 || data->hpasid >= PASID_MAX)
+ +		return -EINVAL;
+ +
+ +	info = get_domain_info(dev);
+ +	if (!info)
+ +		return -EINVAL;
+ +
+ +	dmar_domain = to_dmar_domain(domain);
+ +
+ +	mutex_lock(&pasid_mutex);
+ +	ret = pasid_to_svm_sdev(dev, data->hpasid, &svm, &sdev);
+ +	if (ret)
+ +		goto out;
+ +
+ +	if (sdev) {
+ +		/*
+ +		 * Do not allow multiple bindings of the same device-PASID since
+ +		 * there is only one SL page tables per PASID. We may revisit
+ +		 * once sharing PGD across domains are supported.
+ +		 */
+ +		dev_warn_ratelimited(dev, "Already bound with PASID %u\n",
+ +				     svm->pasid);
+ +		ret = -EBUSY;
+ +		goto out;
+ +	}
+ +
+ +	if (!svm) {
+ +		/* We come here when PASID has never been bond to a device. */
+ +		svm = kzalloc(sizeof(*svm), GFP_KERNEL);
+ +		if (!svm) {
+ +			ret = -ENOMEM;
+ +			goto out;
+ +		}
+ +		/* REVISIT: upper layer/VFIO can track host process that bind
+ +		 * the PASID. ioasid_set = mm might be sufficient for vfio to
+ +		 * check pasid VMM ownership. We can drop the following line
+ +		 * once VFIO and IOASID set check is in place.
+ +		 */
+ +		svm->mm = get_task_mm(current);
+ +		svm->pasid = data->hpasid;
+ +		if (data->flags & IOMMU_SVA_GPASID_VAL) {
+ +			svm->gpasid = data->gpasid;
+ +			svm->flags |= SVM_FLAG_GUEST_PASID;
+ +		}
+ +		pasid_private_add(data->hpasid, svm);
+ +		INIT_LIST_HEAD_RCU(&svm->devs);
+ +		mmput(svm->mm);
+ +	}
+ +	sdev = kzalloc(sizeof(*sdev), GFP_KERNEL);
+ +	if (!sdev) {
+ +		ret = -ENOMEM;
+ +		goto out;
+ +	}
+ +	sdev->dev = dev;
+ +	sdev->sid = PCI_DEVID(info->bus, info->devfn);
+ +	sdev->iommu = iommu;
+ +
+ +	/* Only count users if device has aux domains */
+ +	if (iommu_dev_feature_enabled(dev, IOMMU_DEV_FEAT_AUX))
+ +		sdev->users = 1;
+ +
+ +	/* Set up device context entry for PASID if not enabled already */
+ +	ret = intel_iommu_enable_pasid(iommu, sdev->dev);
+ +	if (ret) {
+ +		dev_err_ratelimited(dev, "Failed to enable PASID capability\n");
+ +		kfree(sdev);
+ +		goto out;
+ +	}
+ +
+ +	/*
+ +	 * PASID table is per device for better security. Therefore, for
+ +	 * each bind of a new device even with an existing PASID, we need to
+ +	 * call the nested mode setup function here.
+ +	 */
+ +	spin_lock_irqsave(&iommu->lock, iflags);
+ +	ret = intel_pasid_setup_nested(iommu, dev,
+ +				       (pgd_t *)(uintptr_t)data->gpgd,
+ +				       data->hpasid, &data->vendor.vtd, dmar_domain,
+ +				       data->addr_width);
+ +	spin_unlock_irqrestore(&iommu->lock, iflags);
+ +	if (ret) {
+ +		dev_err_ratelimited(dev, "Failed to set up PASID %llu in nested mode, Err %d\n",
+ +				    data->hpasid, ret);
+ +		/*
+ +		 * PASID entry should be in cleared state if nested mode
+ +		 * set up failed. So we only need to clear IOASID tracking
+ +		 * data such that free call will succeed.
+ +		 */
+ +		kfree(sdev);
+ +		goto out;
+ +	}
+ +
+ +	svm->flags |= SVM_FLAG_GUEST_MODE;
+ +
+ +	init_rcu_head(&sdev->rcu);
+ +	list_add_rcu(&sdev->list, &svm->devs);
+ + out:
+ +	if (!IS_ERR_OR_NULL(svm) && list_empty(&svm->devs)) {
+ +		pasid_private_remove(data->hpasid);
+ +		kfree(svm);
+ +	}
+ +
+ +	mutex_unlock(&pasid_mutex);
+ +	return ret;
+ +}
+ +
+ +int intel_svm_unbind_gpasid(struct device *dev, u32 pasid)
+ +{
+ +	struct intel_iommu *iommu = device_to_iommu(dev, NULL, NULL);
+ +	struct intel_svm_dev *sdev;
+ +	struct intel_svm *svm;
+ +	int ret;
+ +
+ +	if (WARN_ON(!iommu))
+ +		return -EINVAL;
+ +
+ +	mutex_lock(&pasid_mutex);
+ +	ret = pasid_to_svm_sdev(dev, pasid, &svm, &sdev);
+ +	if (ret)
+ +		goto out;
+ +
+ +	if (sdev) {
+ +		if (iommu_dev_feature_enabled(dev, IOMMU_DEV_FEAT_AUX))
+ +			sdev->users--;
+ +		if (!sdev->users) {
+ +			list_del_rcu(&sdev->list);
+ +			intel_pasid_tear_down_entry(iommu, dev,
+ +						    svm->pasid, false);
+ +			intel_svm_drain_prq(dev, svm->pasid);
+ +			kfree_rcu(sdev, rcu);
+ +
+ +			if (list_empty(&svm->devs)) {
+ +				/*
+ +				 * We do not free the IOASID here in that
+ +				 * IOMMU driver did not allocate it.
+ +				 * Unlike native SVM, IOASID for guest use was
+ +				 * allocated prior to the bind call.
+ +				 * In any case, if the free call comes before
+ +				 * the unbind, IOMMU driver will get notified
+ +				 * and perform cleanup.
+ +				 */
+ +				pasid_private_remove(pasid);
+ +				kfree(svm);
+ +			}
+ +		}
+ +	}
+ +out:
+ +	mutex_unlock(&pasid_mutex);
+ +	return ret;
+ +}
+ +
+ +static void _load_pasid(void *unused)
+ +{
+ +	update_pasid();
+ +}
+ +
+ +static void load_pasid(struct mm_struct *mm, u32 pasid)
+ +{
+ +	mutex_lock(&mm->context.lock);
+ +
+ +	/* Update PASID MSR on all CPUs running the mm's tasks. */
+ +	on_each_cpu_mask(mm_cpumask(mm), _load_pasid, NULL, true);
+ +
+ +	mutex_unlock(&mm->context.lock);
+ +}
+ +
+ +static int intel_svm_alloc_pasid(struct device *dev, struct mm_struct *mm,
+ +				 unsigned int flags)
+++=======
++ static int intel_svm_alloc_pasid(struct device *dev, struct mm_struct *mm)
+++>>>>>>> 942fd5435dcc (iommu: Remove SVM_FLAG_SUPERVISOR_MODE support)
+  {
+  	ioasid_t max_pasid = dev_is_pci(dev) ?
+  			pci_max_pasids(to_pci_dev(dev)) : intel_pasid_max_id;
+@@@ -518,13 -306,12 +522,12 @@@
+  
+  static struct iommu_sva *intel_svm_bind_mm(struct intel_iommu *iommu,
+  					   struct device *dev,
+- 					   struct mm_struct *mm,
+- 					   unsigned int flags)
++ 					   struct mm_struct *mm)
+  {
+ -	struct device_domain_info *info = dev_iommu_priv_get(dev);
+ +	struct device_domain_info *info = get_domain_info(dev);
+ +	unsigned long iflags, sflags;
+  	struct intel_svm_dev *sdev;
+  	struct intel_svm *svm;
+ -	unsigned long sflags;
+  	int ret = 0;
+  
+  	svm = pasid_private_find(mm->pasid);
+@@@ -585,14 -368,9 +584,18 @@@
+  	}
+  
+  	/* Setup the pasid table: */
+++<<<<<<< HEAD
+ +	sflags = (flags & SVM_FLAG_SUPERVISOR_MODE) ?
+ +			PASID_FLAG_SUPERVISOR_MODE : 0;
+ +	sflags |= cpu_feature_enabled(X86_FEATURE_LA57) ? PASID_FLAG_FL5LP : 0;
+ +	spin_lock_irqsave(&iommu->lock, iflags);
+++=======
++ 	sflags = cpu_feature_enabled(X86_FEATURE_LA57) ? PASID_FLAG_FL5LP : 0;
+++>>>>>>> 942fd5435dcc (iommu: Remove SVM_FLAG_SUPERVISOR_MODE support)
+  	ret = intel_pasid_setup_first_level(iommu, dev, mm->pgd, mm->pasid,
+  					    FLPT_DEFAULT_DID, sflags);
+ +	spin_unlock_irqrestore(&iommu->lock, iflags);
+ +
+  	if (ret)
+  		goto free_sdev;
+  
+diff --cc include/linux/intel-iommu.h
+index b9494fd422a2,33e5bcaf2a6c..000000000000
+--- a/include/linux/intel-iommu.h
++++ b/include/linux/intel-iommu.h
+@@@ -778,11 -748,7 +778,15 @@@ struct intel_iommu *device_to_iommu(str
+  extern void intel_svm_check(struct intel_iommu *iommu);
+  extern int intel_svm_enable_prq(struct intel_iommu *iommu);
+  extern int intel_svm_finish_prq(struct intel_iommu *iommu);
+++<<<<<<< HEAD:include/linux/intel-iommu.h
+ +int intel_svm_bind_gpasid(struct iommu_domain *domain, struct device *dev,
+ +			  struct iommu_gpasid_bind_data *data);
+ +int intel_svm_unbind_gpasid(struct device *dev, u32 pasid);
+ +struct iommu_sva *intel_svm_bind(struct device *dev, struct mm_struct *mm,
+ +				 void *drvdata);
+++=======
++ struct iommu_sva *intel_svm_bind(struct device *dev, struct mm_struct *mm);
+++>>>>>>> 942fd5435dcc (iommu: Remove SVM_FLAG_SUPERVISOR_MODE support):drivers/iommu/intel/iommu.h
+  void intel_svm_unbind(struct iommu_sva *handle);
+  u32 intel_svm_get_pasid(struct iommu_sva *handle);
+  int intel_svm_page_response(struct device *dev, struct iommu_fault_event *evt,
+diff --cc include/linux/intel-svm.h
+index f498ffa0be6f,f9a0d44f6fdb..000000000000
+--- a/include/linux/intel-svm.h
++++ b/include/linux/intel-svm.h
+@@@ -21,29 -13,4 +21,32 @@@
+  #define PRQ_RING_MASK	((0x1000 << PRQ_ORDER) - 0x20)
+  #define PRQ_DEPTH	((0x1000 << PRQ_ORDER) >> 5)
+  
+++<<<<<<< HEAD
+ +/*
+ + * The SVM_FLAG_SUPERVISOR_MODE flag requests a PASID which can be used only
+ + * for access to kernel addresses. No IOTLB flushes are automatically done
+ + * for kernel mappings; it is valid only for access to the kernel's static
+ + * 1:1 mapping of physical memory — not to vmalloc or even module mappings.
+ + * A future API addition may permit the use of such ranges, by means of an
+ + * explicit IOTLB flush call (akin to the DMA API's unmap method).
+ + *
+ + * It is unlikely that we will ever hook into flush_tlb_kernel_range() to
+ + * do such IOTLB flushes automatically.
+ + */
+ +#define SVM_FLAG_SUPERVISOR_MODE	BIT(0)
+ +/*
+ + * The SVM_FLAG_GUEST_MODE flag is used when a PASID bind is for guest
+ + * processes. Compared to the host bind, the primary differences are:
+ + * 1. mm life cycle management
+ + * 2. fault reporting
+ + */
+ +#define SVM_FLAG_GUEST_MODE		BIT(1)
+ +/*
+ + * The SVM_FLAG_GUEST_PASID flag is used when a guest has its own PASID space,
+ + * which requires guest and host PASID translation at both directions.
+ + */
+ +#define SVM_FLAG_GUEST_PASID		BIT(2)
+ +
+++=======
+++>>>>>>> 942fd5435dcc (iommu: Remove SVM_FLAG_SUPERVISOR_MODE support)
+  #endif /* __INTEL_SVM_H__ */
+diff --cc include/linux/iommu.h
+index f09b16982db4,72bb0531aa76..000000000000
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@@ -231,9 -203,69 +231,75 @@@ struct iommu_iotlb_gather 
+   * struct iommu_ops - iommu ops and capabilities
+   * @capable: check capability
+   * @domain_alloc: allocate iommu domain
+++<<<<<<< HEAD
+ + * @domain_free: free iommu domain
+ + * @attach_dev: attach device to an iommu domain
+ + * @detach_dev: detach device from an iommu domain
+++=======
++  * @probe_device: Add device to iommu driver handling
++  * @release_device: Remove device from iommu driver handling
++  * @probe_finalize: Do final setup work after the device is added to an IOMMU
++  *                  group and attached to the groups domain
++  * @device_group: find iommu group for a particular device
++  * @get_resv_regions: Request list of reserved regions for a device
++  * @of_xlate: add OF master IDs to iommu grouping
++  * @is_attach_deferred: Check if domain attach should be deferred from iommu
++  *                      driver init to device driver init (default no)
++  * @dev_enable/disable_feat: per device entries to enable/disable
++  *                               iommu specific features.
++  * @sva_bind: Bind process address space to device
++  * @sva_unbind: Unbind process address space from device
++  * @sva_get_pasid: Get PASID associated to a SVA handle
++  * @page_response: handle page request response
++  * @def_domain_type: device default domain type, return value:
++  *		- IOMMU_DOMAIN_IDENTITY: must use an identity domain
++  *		- IOMMU_DOMAIN_DMA: must use a dma domain
++  *		- 0: use the default setting
++  * @default_domain_ops: the default ops for domains
++  * @pgsize_bitmap: bitmap of all possible supported page sizes
++  * @owner: Driver module providing these ops
++  */
++ struct iommu_ops {
++ 	bool (*capable)(struct device *dev, enum iommu_cap);
++ 
++ 	/* Domain allocation and freeing by the iommu driver */
++ 	struct iommu_domain *(*domain_alloc)(unsigned iommu_domain_type);
++ 
++ 	struct iommu_device *(*probe_device)(struct device *dev);
++ 	void (*release_device)(struct device *dev);
++ 	void (*probe_finalize)(struct device *dev);
++ 	struct iommu_group *(*device_group)(struct device *dev);
++ 
++ 	/* Request/Free a list of reserved regions for a device */
++ 	void (*get_resv_regions)(struct device *dev, struct list_head *list);
++ 
++ 	int (*of_xlate)(struct device *dev, struct of_phandle_args *args);
++ 	bool (*is_attach_deferred)(struct device *dev);
++ 
++ 	/* Per device IOMMU features */
++ 	int (*dev_enable_feat)(struct device *dev, enum iommu_dev_features f);
++ 	int (*dev_disable_feat)(struct device *dev, enum iommu_dev_features f);
++ 
++ 	struct iommu_sva *(*sva_bind)(struct device *dev, struct mm_struct *mm);
++ 	void (*sva_unbind)(struct iommu_sva *handle);
++ 	u32 (*sva_get_pasid)(struct iommu_sva *handle);
++ 
++ 	int (*page_response)(struct device *dev,
++ 			     struct iommu_fault_event *evt,
++ 			     struct iommu_page_response *msg);
++ 
++ 	int (*def_domain_type)(struct device *dev);
++ 
++ 	const struct iommu_domain_ops *default_domain_ops;
++ 	unsigned long pgsize_bitmap;
++ 	struct module *owner;
++ };
++ 
++ /**
++  * struct iommu_domain_ops - domain specific operations
++  * @attach_dev: attach an iommu domain to a device
++  * @detach_dev: detach an iommu domain from a device
+++>>>>>>> 942fd5435dcc (iommu: Remove SVM_FLAG_SUPERVISOR_MODE support)
+   * @map: map a physically contiguous memory region to an iommu domain
+   * @map_pages: map a physically contiguous set of pages of the same size to
+   *             an iommu domain.
+@@@ -743,14 -665,9 +809,13 @@@ void iommu_release_device(struct devic
+  
+  int iommu_dev_enable_feature(struct device *dev, enum iommu_dev_features f);
+  int iommu_dev_disable_feature(struct device *dev, enum iommu_dev_features f);
+ +bool iommu_dev_feature_enabled(struct device *dev, enum iommu_dev_features f);
+ +int iommu_aux_attach_device(struct iommu_domain *domain, struct device *dev);
+ +void iommu_aux_detach_device(struct iommu_domain *domain, struct device *dev);
+ +int iommu_aux_get_pasid(struct iommu_domain *domain, struct device *dev);
+  
+  struct iommu_sva *iommu_sva_bind_device(struct device *dev,
+- 					struct mm_struct *mm,
+- 					void *drvdata);
++ 					struct mm_struct *mm);
+  void iommu_sva_unbind_device(struct iommu_sva *handle);
+  u32 iommu_sva_get_pasid(struct iommu_sva *handle);
+  
+@@@ -1091,25 -997,8 +1156,25 @@@ iommu_dev_disable_feature(struct devic
+  	return -ENODEV;
+  }
+  
+ +static inline int
+ +iommu_aux_attach_device(struct iommu_domain *domain, struct device *dev)
+ +{
+ +	return -ENODEV;
+ +}
+ +
+ +static inline void
+ +iommu_aux_detach_device(struct iommu_domain *domain, struct device *dev)
+ +{
+ +}
+ +
+ +static inline int
+ +iommu_aux_get_pasid(struct iommu_domain *domain, struct device *dev)
+ +{
+ +	return -ENODEV;
+ +}
+ +
+  static inline struct iommu_sva *
+- iommu_sva_bind_device(struct device *dev, struct mm_struct *mm, void *drvdata)
++ iommu_sva_bind_device(struct device *dev, struct mm_struct *mm)
+  {
+  	return NULL;
+  }
+* Unmerged path drivers/misc/uacce/uacce.c
+diff --git a/drivers/dma/idxd/cdev.c b/drivers/dma/idxd/cdev.c
+index a9b96b18772f..e13e92609943 100644
+--- a/drivers/dma/idxd/cdev.c
++++ b/drivers/dma/idxd/cdev.c
+@@ -6,7 +6,6 @@
+ #include <linux/pci.h>
+ #include <linux/device.h>
+ #include <linux/sched/task.h>
+-#include <linux/intel-svm.h>
+ #include <linux/io-64-nonatomic-lo-hi.h>
+ #include <linux/cdev.h>
+ #include <linux/fs.h>
+@@ -100,7 +99,7 @@ static int idxd_cdev_open(struct inode *inode, struct file *filp)
+ 	filp->private_data = ctx;
+ 
+ 	if (device_user_pasid_enabled(idxd)) {
+-		sva = iommu_sva_bind_device(dev, current->mm, NULL);
++		sva = iommu_sva_bind_device(dev, current->mm);
+ 		if (IS_ERR(sva)) {
+ 			rc = PTR_ERR(sva);
+ 			dev_err(dev, "pasid allocation failed: %d\n", rc);
+diff --git a/drivers/dma/idxd/init.c b/drivers/dma/idxd/init.c
+index af7e8b5a8ffd..ddcdb5ef133a 100644
+--- a/drivers/dma/idxd/init.c
++++ b/drivers/dma/idxd/init.c
+@@ -14,7 +14,6 @@
+ #include <linux/io-64-nonatomic-lo-hi.h>
+ #include <linux/device.h>
+ #include <linux/idr.h>
+-#include <linux/intel-svm.h>
+ #include <linux/iommu.h>
+ #include <uapi/linux/idxd.h>
+ #include <linux/dmaengine.h>
+@@ -506,29 +505,7 @@ static struct idxd_device *idxd_alloc(struct pci_dev *pdev, struct idxd_driver_d
+ 
+ static int idxd_enable_system_pasid(struct idxd_device *idxd)
+ {
+-	int flags;
+-	unsigned int pasid;
+-	struct iommu_sva *sva;
+-
+-	flags = SVM_FLAG_SUPERVISOR_MODE;
+-
+-	sva = iommu_sva_bind_device(&idxd->pdev->dev, NULL, &flags);
+-	if (IS_ERR(sva)) {
+-		dev_warn(&idxd->pdev->dev,
+-			 "iommu sva bind failed: %ld\n", PTR_ERR(sva));
+-		return PTR_ERR(sva);
+-	}
+-
+-	pasid = iommu_sva_get_pasid(sva);
+-	if (pasid == IOMMU_PASID_INVALID) {
+-		iommu_sva_unbind_device(sva);
+-		return -ENODEV;
+-	}
+-
+-	idxd->sva = sva;
+-	idxd->pasid = pasid;
+-	dev_dbg(&idxd->pdev->dev, "system pasid: %u\n", pasid);
+-	return 0;
++	return -EOPNOTSUPP;
+ }
+ 
+ static void idxd_disable_system_pasid(struct idxd_device *idxd)
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
+index dc096e0ee0fe..0f70c3dceaa4 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
+@@ -367,8 +367,7 @@ __arm_smmu_sva_bind(struct device *dev, struct mm_struct *mm)
+ 	return ERR_PTR(ret);
+ }
+ 
+-struct iommu_sva *
+-arm_smmu_sva_bind(struct device *dev, struct mm_struct *mm, void *drvdata)
++struct iommu_sva *arm_smmu_sva_bind(struct device *dev, struct mm_struct *mm)
+ {
+ 	struct iommu_sva *handle;
+ 	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+index cd48590ada30..d2ba86470c42 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+@@ -754,8 +754,7 @@ bool arm_smmu_master_sva_enabled(struct arm_smmu_master *master);
+ int arm_smmu_master_enable_sva(struct arm_smmu_master *master);
+ int arm_smmu_master_disable_sva(struct arm_smmu_master *master);
+ bool arm_smmu_master_iopf_supported(struct arm_smmu_master *master);
+-struct iommu_sva *arm_smmu_sva_bind(struct device *dev, struct mm_struct *mm,
+-				    void *drvdata);
++struct iommu_sva *arm_smmu_sva_bind(struct device *dev, struct mm_struct *mm);
+ void arm_smmu_sva_unbind(struct iommu_sva *handle);
+ u32 arm_smmu_sva_get_pasid(struct iommu_sva *handle);
+ void arm_smmu_sva_notifier_synchronize(void);
+@@ -791,7 +790,7 @@ static inline bool arm_smmu_master_iopf_supported(struct arm_smmu_master *master
+ }
+ 
+ static inline struct iommu_sva *
+-arm_smmu_sva_bind(struct device *dev, struct mm_struct *mm, void *drvdata)
++arm_smmu_sva_bind(struct device *dev, struct mm_struct *mm)
+ {
+ 	return ERR_PTR(-ENODEV);
+ }
+* Unmerged path drivers/iommu/intel/svm.c
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index cb17cd1c57b4..929781dd7a1a 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -3083,7 +3083,7 @@ EXPORT_SYMBOL_GPL(iommu_aux_get_pasid);
+  * On error, returns an ERR_PTR value.
+  */
+ struct iommu_sva *
+-iommu_sva_bind_device(struct device *dev, struct mm_struct *mm, void *drvdata)
++iommu_sva_bind_device(struct device *dev, struct mm_struct *mm)
+ {
+ 	struct iommu_group *group;
+ 	struct iommu_sva *handle = ERR_PTR(-EINVAL);
+@@ -3108,7 +3108,7 @@ iommu_sva_bind_device(struct device *dev, struct mm_struct *mm, void *drvdata)
+ 	if (iommu_group_device_count(group) != 1)
+ 		goto out_unlock;
+ 
+-	handle = ops->sva_bind(dev, mm, drvdata);
++	handle = ops->sva_bind(dev, mm);
+ 
+ out_unlock:
+ 	mutex_unlock(&group->mutex);
+* Unmerged path drivers/misc/uacce/uacce.c
+* Unmerged path include/linux/intel-iommu.h
+* Unmerged path include/linux/intel-svm.h
+* Unmerged path include/linux/iommu.h
