@@ -194,7 +194,7 @@ static inline struct slave *to_slave(struct kobject *kobj)
 struct bond_up_slave {
 	unsigned int	count;
 	struct rcu_head rcu;
-	struct slave	*arr[0];
+	struct slave	*arr[];
 };
 
 /*
