@@ -1,0 +1,140 @@
+mm: migrate: fix THP's mapcount on isolation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-525.el8
+commit-author Gavin Shan <gshan@redhat.com>
+commit 829ae0f81ce093d674ff2256f66a714753e9ce32
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-525.el8/829ae0f8.failed
+
+The issue is reported when removing memory through virtio_mem device.  The
+transparent huge page, experienced copy-on-write fault, is wrongly
+regarded as pinned.  The transparent huge page is escaped from being
+isolated in isolate_migratepages_block().  The transparent huge page can't
+be migrated and the corresponding memory block can't be put into offline
+state.
+
+Fix it by replacing page_mapcount() with total_mapcount().  With this, the
+transparent huge page can be isolated and migrated, and the memory block
+can be put into offline state.  Besides, The page's refcount is increased
+a bit earlier to avoid the page is released when the check is executed.
+
+Link: https://lkml.kernel.org/r/20221124095523.31061-1-gshan@redhat.com
+Fixes: 1da2f328fa64 ("mm,thp,compaction,cma: allow THP migration for CMA allocations")
+	Signed-off-by: Gavin Shan <gshan@redhat.com>
+	Reported-by: Zhenyu Zhang <zhenyzha@redhat.com>
+	Tested-by: Zhenyu Zhang <zhenyzha@redhat.com>
+	Suggested-by: David Hildenbrand <david@redhat.com>
+	Acked-by: David Hildenbrand <david@redhat.com>
+	Cc: Alistair Popple <apopple@nvidia.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: William Kucharski <william.kucharski@oracle.com>
+	Cc: Zi Yan <ziy@nvidia.com>
+	Cc: <stable@vger.kernel.org>	[5.7+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 829ae0f81ce093d674ff2256f66a714753e9ce32)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/compaction.c
+diff --cc mm/compaction.c
+index d100fe2df1cb,1f6da31dd9a5..000000000000
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@@ -972,22 -985,6 +972,25 @@@ isolate_migratepages_block(struct compa
+  		}
+  
+  		/*
+++<<<<<<< HEAD
+ +		 * Migration will fail if an anonymous page is pinned in memory,
+ +		 * so avoid taking lru_lock and isolating it unnecessarily in an
+ +		 * admittedly racy check.
+ +		 */
+ +		if (!page_mapping(page) &&
+ +		    page_count(page) > page_mapcount(page))
+ +			goto isolate_fail;
+ +
+ +		/*
+ +		 * Only allow to migrate anonymous pages in GFP_NOFS context
+ +		 * because those do not depend on fs locks.
+ +		 */
+ +		if (!(cc->gfp_mask & __GFP_FS) && page_mapping(page))
+ +			goto isolate_fail;
+ +
+ +		/*
+++=======
+++>>>>>>> 829ae0f81ce0 (mm: migrate: fix THP's mapcount on isolation)
+  		 * Be careful not to clear PageLRU until after we're
+  		 * sure the page is not being freed elsewhere -- the
+  		 * page release code relies on it.
+@@@ -995,9 -992,62 +998,30 @@@
+  		if (unlikely(!get_page_unless_zero(page)))
+  			goto isolate_fail;
+  
+++<<<<<<< HEAD
+ +		if (__isolate_lru_page_prepare(page, isolate_mode) != 0)
+++=======
++ 		/*
++ 		 * Migration will fail if an anonymous page is pinned in memory,
++ 		 * so avoid taking lru_lock and isolating it unnecessarily in an
++ 		 * admittedly racy check.
++ 		 */
++ 		mapping = page_mapping(page);
++ 		if (!mapping && (page_count(page) - 1) > total_mapcount(page))
++ 			goto isolate_fail_put;
++ 
++ 		/*
++ 		 * Only allow to migrate anonymous pages in GFP_NOFS context
++ 		 * because those do not depend on fs locks.
++ 		 */
++ 		if (!(cc->gfp_mask & __GFP_FS) && mapping)
++ 			goto isolate_fail_put;
++ 
++ 		/* Only take pages on LRU: a check now makes later tests safe */
++ 		if (!PageLRU(page))
+++>>>>>>> 829ae0f81ce0 (mm: migrate: fix THP's mapcount on isolation)
+  			goto isolate_fail_put;
+  
+ -		/* Compaction might skip unevictable pages but CMA takes them */
+ -		if (!(mode & ISOLATE_UNEVICTABLE) && PageUnevictable(page))
+ -			goto isolate_fail_put;
+ -
+ -		/*
+ -		 * To minimise LRU disruption, the caller can indicate with
+ -		 * ISOLATE_ASYNC_MIGRATE that it only wants to isolate pages
+ -		 * it will be able to migrate without blocking - clean pages
+ -		 * for the most part.  PageWriteback would require blocking.
+ -		 */
+ -		if ((mode & ISOLATE_ASYNC_MIGRATE) && PageWriteback(page))
+ -			goto isolate_fail_put;
+ -
+ -		if ((mode & ISOLATE_ASYNC_MIGRATE) && PageDirty(page)) {
+ -			bool migrate_dirty;
+ -
+ -			/*
+ -			 * Only pages without mappings or that have a
+ -			 * ->migrate_folio callback are possible to migrate
+ -			 * without blocking. However, we can be racing with
+ -			 * truncation so it's necessary to lock the page
+ -			 * to stabilise the mapping as truncation holds
+ -			 * the page lock until after the page is removed
+ -			 * from the page cache.
+ -			 */
+ -			if (!trylock_page(page))
+ -				goto isolate_fail_put;
+ -
+ -			mapping = page_mapping(page);
+ -			migrate_dirty = !mapping ||
+ -					mapping->a_ops->migrate_folio;
+ -			unlock_page(page);
+ -			if (!migrate_dirty)
+ -				goto isolate_fail_put;
+ -		}
+ -
+  		/* Try isolate the page */
+  		if (!TestClearPageLRU(page))
+  			goto isolate_fail_put;
+* Unmerged path mm/compaction.c
