@@ -1,0 +1,268 @@
+ice: restore timestamp configuration after device reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-535.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 7758017911a4f2578d54c318e8fe77bcb5899054
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-535.el8/77580179.failed
+
+The driver calls ice_ptp_cfg_timestamp() during ice_ptp_prepare_for_reset()
+to disable timestamping while the device is resetting. This operation
+destroys the user requested configuration. While the driver does call
+ice_ptp_cfg_timestamp in ice_rebuild() to restore some hardware settings
+after a reset, it unconditionally passes true or false, resulting in
+failure to restore previous user space configuration.
+
+This results in a device reset forcibly disabling timestamp configuration
+regardless of current user settings.
+
+This was not detected previously due to a quirk of the LinuxPTP ptp4l
+application. If ptp4l detects a missing timestamp, it enters a fault state
+and performs recovery logic which includes executing SIOCSHWTSTAMP again,
+restoring the now accidentally cleared configuration.
+
+Not every application does this, and for these applications, timestamps
+will mysteriously stop after a PF reset, without being restored until an
+application restart.
+
+Fix this by replacing ice_ptp_cfg_timestamp() with two new functions:
+
+1) ice_ptp_disable_timestamp_mode() which unconditionally disables the
+   timestamping logic in ice_ptp_prepare_for_reset() and ice_ptp_release()
+
+2) ice_ptp_restore_timestamp_mode() which calls
+   ice_ptp_restore_tx_interrupt() to restore Tx timestamping configuration,
+   calls ice_set_rx_tstamp() to restore Rx timestamping configuration, and
+   issues an immediate TSYN_TX interrupt to ensure that timestamps which
+   may have occurred during the device reset get processed.
+
+Modify the ice_ptp_set_timestamp_mode to directly save the user
+configuration and then call ice_ptp_restore_timestamp_mode. This way, reset
+no longer destroys the saved user configuration.
+
+This obsoletes the ice_set_tx_tstamp() function which can now be safely
+removed.
+
+With this change, all devices should now restore Tx and Rx timestamping
+functionality correctly after a PF reset without application intervention.
+
+Fixes: 77a781155a65 ("ice: enable receive hardware timestamping")
+Fixes: ea9b847cda64 ("ice: enable transmit timestamps for E810 devices")
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Jesse Brandeburg <jesse.brandeburg@intel.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+	Tested-by: Pucha Himasekhar Reddy <himasekharx.reddy.pucha@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit 7758017911a4f2578d54c318e8fe77bcb5899054)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_main.c
+#	drivers/net/ethernet/intel/ice/ice_ptp.h
+diff --cc drivers/net/ethernet/intel/ice/ice_main.c
+index 0372bc28af1a,fb9c93f37e84..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@@ -7636,6 -7450,11 +7627,14 @@@ static void ice_rebuild(struct ice_pf *
+  	clear_bit(ICE_RESET_FAILED, pf->state);
+  
+  	ice_plug_aux_dev(pf);
+++<<<<<<< HEAD
+++=======
++ 	if (ice_is_feature_supported(pf, ICE_F_SRIOV_LAG))
++ 		ice_lag_rebuild(pf);
++ 
++ 	/* Restore timestamp mode settings after VSI rebuild */
++ 	ice_ptp_restore_timestamp_mode(pf);
+++>>>>>>> 7758017911a4 (ice: restore timestamp configuration after device reset)
+  	return;
+  
+  err_vsi_rebuild:
+diff --cc drivers/net/ethernet/intel/ice/ice_ptp.h
+index d94c22329df0,06a330867fc9..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.h
+@@@ -291,8 -291,8 +291,12 @@@ struct ice_ptp 
+  struct ice_pf;
+  int ice_ptp_set_ts_config(struct ice_pf *pf, struct ifreq *ifr);
+  int ice_ptp_get_ts_config(struct ice_pf *pf, struct ifreq *ifr);
+++<<<<<<< HEAD
+ +void ice_ptp_cfg_timestamp(struct ice_pf *pf, bool ena);
+ +int ice_get_ptp_clock_index(struct ice_pf *pf);
+++=======
++ void ice_ptp_restore_timestamp_mode(struct ice_pf *pf);
+++>>>>>>> 7758017911a4 (ice: restore timestamp configuration after device reset)
+  
+  void ice_ptp_extts_event(struct ice_pf *pf);
+  s8 ice_ptp_request_ts(struct ice_ptp_tx *tx, struct sk_buff *skb);
+@@@ -317,12 -317,7 +321,16 @@@ static inline int ice_ptp_get_ts_config
+  	return -EOPNOTSUPP;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void ice_ptp_cfg_timestamp(struct ice_pf *pf, bool ena) { }
+ +static inline int ice_get_ptp_clock_index(struct ice_pf *pf)
+ +{
+ +	return -1;
+ +}
+ +
+++=======
++ static inline void ice_ptp_restore_timestamp_mode(struct ice_pf *pf) { }
+++>>>>>>> 7758017911a4 (ice: restore timestamp configuration after device reset)
+  static inline void ice_ptp_extts_event(struct ice_pf *pf) { }
+  static inline s8
+  ice_ptp_request_ts(struct ice_ptp_tx *tx, struct sk_buff *skb)
+* Unmerged path drivers/net/ethernet/intel/ice/ice_main.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp.c b/drivers/net/ethernet/intel/ice/ice_ptp.c
+index 709165af04f0..faef646fe1ce 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@ -294,18 +294,6 @@ static void ice_ptp_cfg_tx_interrupt(struct ice_pf *pf)
+ 	wr32(hw, PFINT_OICR_ENA, val);
+ }
+ 
+-/**
+- * ice_set_tx_tstamp - Enable or disable Tx timestamping
+- * @pf: The PF pointer to search in
+- * @on: bool value for whether timestamps are enabled or disabled
+- */
+-static void ice_set_tx_tstamp(struct ice_pf *pf, bool on)
+-{
+-	pf->ptp.tstamp_config.tx_type = on ? HWTSTAMP_TX_ON : HWTSTAMP_TX_OFF;
+-
+-	ice_ptp_cfg_tx_interrupt(pf);
+-}
+-
+ /**
+  * ice_set_rx_tstamp - Enable or disable Rx timestamping
+  * @pf: The PF pointer to search in
+@@ -317,7 +305,7 @@ static void ice_set_rx_tstamp(struct ice_pf *pf, bool on)
+ 	u16 i;
+ 
+ 	vsi = ice_get_main_vsi(pf);
+-	if (!vsi)
++	if (!vsi || !vsi->rx_rings)
+ 		return;
+ 
+ 	/* Set the timestamp flag for all the Rx rings */
+@@ -326,23 +314,50 @@ static void ice_set_rx_tstamp(struct ice_pf *pf, bool on)
+ 			continue;
+ 		vsi->rx_rings[i]->ptp_rx = on;
+ 	}
++}
++
++/**
++ * ice_ptp_disable_timestamp_mode - Disable current timestamp mode
++ * @pf: Board private structure
++ *
++ * Called during preparation for reset to temporarily disable timestamping on
++ * the device. Called during remove to disable timestamping while cleaning up
++ * driver resources.
++ */
++static void ice_ptp_disable_timestamp_mode(struct ice_pf *pf)
++{
++	struct ice_hw *hw = &pf->hw;
++	u32 val;
++
++	val = rd32(hw, PFINT_OICR_ENA);
++	val &= ~PFINT_OICR_TSYN_TX_M;
++	wr32(hw, PFINT_OICR_ENA, val);
+ 
+-	pf->ptp.tstamp_config.rx_filter = on ? HWTSTAMP_FILTER_ALL :
+-					       HWTSTAMP_FILTER_NONE;
++	ice_set_rx_tstamp(pf, false);
+ }
+ 
+ /**
+- * ice_ptp_cfg_timestamp - Configure timestamp for init/deinit
++ * ice_ptp_restore_timestamp_mode - Restore timestamp configuration
+  * @pf: Board private structure
+- * @ena: bool value to enable or disable time stamp
+  *
+- * This function will configure timestamping during PTP initialization
+- * and deinitialization
++ * Called at the end of rebuild to restore timestamp configuration after
++ * a device reset.
+  */
+-void ice_ptp_cfg_timestamp(struct ice_pf *pf, bool ena)
++void ice_ptp_restore_timestamp_mode(struct ice_pf *pf)
+ {
+-	ice_set_tx_tstamp(pf, ena);
+-	ice_set_rx_tstamp(pf, ena);
++	struct ice_hw *hw = &pf->hw;
++	bool enable_rx;
++
++	ice_ptp_cfg_tx_interrupt(pf);
++
++	enable_rx = pf->ptp.tstamp_config.rx_filter == HWTSTAMP_FILTER_ALL;
++	ice_set_rx_tstamp(pf, enable_rx);
++
++	/* Trigger an immediate software interrupt to ensure that timestamps
++	 * which occurred during reset are handled now.
++	 */
++	wr32(hw, PFINT_OICR, PFINT_OICR_TSYN_TX_M);
++	ice_flush(hw);
+ }
+ 
+ /**
+@@ -2182,10 +2197,10 @@ ice_ptp_set_timestamp_mode(struct ice_pf *pf, struct hwtstamp_config *config)
+ {
+ 	switch (config->tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+-		ice_set_tx_tstamp(pf, false);
++		pf->ptp.tstamp_config.tx_type = HWTSTAMP_TX_OFF;
+ 		break;
+ 	case HWTSTAMP_TX_ON:
+-		ice_set_tx_tstamp(pf, true);
++		pf->ptp.tstamp_config.tx_type = HWTSTAMP_TX_ON;
+ 		break;
+ 	default:
+ 		return -ERANGE;
+@@ -2193,7 +2208,7 @@ ice_ptp_set_timestamp_mode(struct ice_pf *pf, struct hwtstamp_config *config)
+ 
+ 	switch (config->rx_filter) {
+ 	case HWTSTAMP_FILTER_NONE:
+-		ice_set_rx_tstamp(pf, false);
++		pf->ptp.tstamp_config.rx_filter = HWTSTAMP_FILTER_NONE;
+ 		break;
+ 	case HWTSTAMP_FILTER_PTP_V1_L4_EVENT:
+ 	case HWTSTAMP_FILTER_PTP_V1_L4_SYNC:
+@@ -2209,12 +2224,15 @@ ice_ptp_set_timestamp_mode(struct ice_pf *pf, struct hwtstamp_config *config)
+ 	case HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ:
+ 	case HWTSTAMP_FILTER_NTP_ALL:
+ 	case HWTSTAMP_FILTER_ALL:
+-		ice_set_rx_tstamp(pf, true);
++		pf->ptp.tstamp_config.rx_filter = HWTSTAMP_FILTER_ALL;
+ 		break;
+ 	default:
+ 		return -ERANGE;
+ 	}
+ 
++	/* Immediately update the device timestamping mode */
++	ice_ptp_restore_timestamp_mode(pf);
++
+ 	return 0;
+ }
+ 
+@@ -2859,7 +2877,7 @@ void ice_ptp_prepare_for_reset(struct ice_pf *pf)
+ 	clear_bit(ICE_FLAG_PTP, pf->flags);
+ 
+ 	/* Disable timestamping for both Tx and Rx */
+-	ice_ptp_cfg_timestamp(pf, false);
++	ice_ptp_disable_timestamp_mode(pf);
+ 
+ 	kthread_cancel_delayed_work_sync(&ptp->work);
+ 
+@@ -3181,7 +3199,7 @@ void ice_ptp_release(struct ice_pf *pf)
+ 		return;
+ 
+ 	/* Disable timestamping for both Tx and Rx */
+-	ice_ptp_cfg_timestamp(pf, false);
++	ice_ptp_disable_timestamp_mode(pf);
+ 
+ 	ice_ptp_remove_auxbus_device(pf);
+ 
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.h
