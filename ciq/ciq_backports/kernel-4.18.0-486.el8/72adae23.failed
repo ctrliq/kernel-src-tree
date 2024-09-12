@@ -1,0 +1,159 @@
+md: Change active_io to percpu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-486.el8
+commit-author Xiao Ni <xni@redhat.com>
+commit 72adae23a72cb12e2ef0dcd7c0aa042867f27998
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-486.el8/72adae23.failed
+
+Now the type of active_io is atomic. It's used to count how many ios are
+in the submitting process and it's added and decreased very time. But it
+only needs to check if it's zero when suspending the raid. So we can
+switch atomic to percpu to improve the performance.
+
+After switching active_io to percpu type, we use the state of active_io
+to judge if the raid device is suspended. And we don't need to wake up
+->sb_wait in md_handle_request anymore. It's done in the callback function
+which is registered when initing active_io. The argument mddev->suspended
+is only used to count how many users are trying to set raid to suspend
+state.
+
+	Signed-off-by: Xiao Ni <xni@redhat.com>
+	Signed-off-by: Song Liu <song@kernel.org>
+(cherry picked from commit 72adae23a72cb12e2ef0dcd7c0aa042867f27998)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index 61becfcdd730,da6370835c47..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -378,28 -380,10 +378,35 @@@ EXPORT_SYMBOL_GPL(md_new_event)
+  static LIST_HEAD(all_mddevs);
+  static DEFINE_SPINLOCK(all_mddevs_lock);
+  
+++<<<<<<< HEAD
+ +/*
+ + * iterates through all used mddevs in the system.
+ + * We take care to grab the all_mddevs_lock whenever navigating
+ + * the list, and to always hold a refcount when unlocked.
+ + * Any code which breaks out of this loop while own
+ + * a reference to the current mddev and must mddev_put it.
+ + */
+ +#define for_each_mddev(_mddev,_tmp)					\
+ +									\
+ +	for (({ spin_lock(&all_mddevs_lock);				\
+ +		_tmp = all_mddevs.next;					\
+ +		_mddev = NULL;});					\
+ +	     ({ if (_tmp != &all_mddevs)				\
+ +			mddev_get(list_entry(_tmp, struct mddev, all_mddevs));\
+ +		spin_unlock(&all_mddevs_lock);				\
+ +		if (_mddev) mddev_put(_mddev);				\
+ +		_mddev = list_entry(_tmp, struct mddev, all_mddevs);	\
+ +		_tmp != &all_mddevs;});					\
+ +	     ({ spin_lock(&all_mddevs_lock);				\
+ +		_tmp = _tmp->next;})					\
+ +		)
+ +
+++=======
++ static bool is_md_suspended(struct mddev *mddev)
++ {
++ 	return percpu_ref_is_dying(&mddev->active_io);
++ }
+++>>>>>>> 72adae23a72c (md: Change active_io to percpu)
+  /* Rather than calling directly into the personality make_request function,
+   * IO requests come here first so that we can check if the device is
+   * being suspended pending a reconfiguration.
+@@@ -454,8 -433,7 +456,12 @@@ check_suspended
+  		goto check_suspended;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (atomic_dec_and_test(&mddev->active_io) && mddev->suspended)
+ +		wake_up(&mddev->sb_wait);
+++=======
++ 	percpu_ref_put(&mddev->active_io);
+++>>>>>>> 72adae23a72c (md: Change active_io to percpu)
+  }
+  EXPORT_SYMBOL(md_handle_request);
+  
+@@@ -5934,9 -5840,14 +5945,14 @@@ int md_run(struct mddev *mddev
+  			}
+  		}
+  		sysfs_notify_dirent_safe(rdev->sysfs_state);
+ -		nowait = nowait && bdev_nowait(rdev->bdev);
+ +		nowait = nowait && blk_queue_nowait(bdev_get_queue(rdev->bdev));
+  	}
+  
++ 	err = percpu_ref_init(&mddev->active_io, active_io_release,
++ 				PERCPU_REF_ALLOW_REINIT, GFP_KERNEL);
++ 	if (err)
++ 		return err;
++ 
+  	if (!bioset_initialized(&mddev->bio_set)) {
+  		err = bioset_init(&mddev->bio_set, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS);
+  		if (err)
+@@@ -7939,23 -7823,33 +7958,40 @@@ static void md_release(struct gendisk *
+  	mddev_put(mddev);
+  }
+  
+ -static unsigned int md_check_events(struct gendisk *disk, unsigned int clearing)
+ +static int md_media_changed(struct gendisk *disk)
+ +{
+ +	struct mddev *mddev = disk->private_data;
+ +
+ +	return mddev->changed;
+ +}
+ +
+ +static int md_revalidate(struct gendisk *disk)
+  {
+  	struct mddev *mddev = disk->private_data;
+ -	unsigned int ret = 0;
+  
+ -	if (mddev->changed)
+ -		ret = DISK_EVENT_MEDIA_CHANGE;
+  	mddev->changed = 0;
+ -	return ret;
+ +	return 0;
+  }
+++<<<<<<< HEAD
+ +static const struct block_device_operations md_fops =
+++=======
++ 
++ static void md_free_disk(struct gendisk *disk)
++ {
++ 	struct mddev *mddev = disk->private_data;
++ 
++ 	percpu_ref_exit(&mddev->writes_pending);
++ 	percpu_ref_exit(&mddev->active_io);
++ 	bioset_exit(&mddev->bio_set);
++ 	bioset_exit(&mddev->sync_set);
++ 
++ 	mddev_free(mddev);
++ }
++ 
++ const struct block_device_operations md_fops =
+++>>>>>>> 72adae23a72c (md: Change active_io to percpu)
+  {
+  	.owner		= THIS_MODULE,
+ -	.submit_bio	= md_submit_bio,
+  	.open		= md_open,
+  	.release	= md_release,
+  	.ioctl		= md_ioctl,
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 9c4ff5dfcf62..906d02f885ca 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -320,7 +320,7 @@ struct mddev {
+ 	unsigned long			sb_flags;
+ 
+ 	int				suspended;
+-	atomic_t			active_io;
++	struct percpu_ref		active_io;
+ 	int				ro;
+ 	int				sysfs_active; /* set when sysfs deletes
+ 						       * are happening, so run/
