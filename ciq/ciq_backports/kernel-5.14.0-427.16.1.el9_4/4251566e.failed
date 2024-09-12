@@ -1,0 +1,330 @@
+EDAC/amd64: Cache and use GPU node map
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-427.16.1.el9_4
+commit-author Yazen Ghannam <yazen.ghannam@amd.com>
+commit 4251566ebc1cf95ae26a1e5a24cdac1ac25e942f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.16.1.el9_4/4251566e.failed
+
+AMD systems have historically provided an "AMD Node ID" that is a unique
+identifier for each die in a multi-die package. This was associated with
+a unique instance of the AMD Northbridge on a legacy system. And now it
+is associated with a unique instance of the AMD Data Fabric on modern
+systems. Each instance is referred to as a "Node"; this is an
+AMD-specific term not to be confused with NUMA nodes.
+
+The data fabric provides a number of interfaces accessible through a set
+of functions in a single PCI device. There is one PCI device per Data
+Fabric (AMD Node), and multi-die systems will see multiple such PCI
+devices. The AMD Node ID matches a Node's position in the PCI hierarchy.
+For example, the Node 0 is accessed using the first PCI device, Node 1
+is accessed using the second, and so on. A logical CPU can find its AMD
+Node ID using CPUID. Furthermore, the AMD Node ID is used within the
+hardware fabric, so it is not purely a logical value.
+
+Heterogeneous AMD systems, with a CPU Data Fabric connected to GPU data
+fabrics, follow a similar convention. Each CPU and GPU die has a unique
+AMD Node ID value, and each Node ID corresponds to PCI devices in
+sequential order.
+
+However, there are two caveats:
+1) GPUs are not x86, and they don't have CPUID to read their AMD Node ID
+like on CPUs. This means the value is more implicit and based on PCI
+enumeration and hardware-specifics.
+2) There is a gap in the hardware values for AMD Node IDs. Values 0-7
+are for CPUs and values 8-15 are for GPUs.
+
+For example, a system with one CPU die and two GPUs dies will have the
+following values:
+  CPU0 -> AMD Node 0
+  GPU0 -> AMD Node 8
+  GPU1 -> AMD Node 9
+
+EDAC is the only subsystem where this has a practical effect. Memory
+errors on AMD systems are commonly reported through MCA to a CPU on the
+local AMD Node. The error information is passed along to EDAC where the
+AMD EDAC modules use the AMD Node ID of reporting logical CPU to access
+AMD Node information.
+
+However, memory errors from a GPU die will be reported to the CPU die.
+Therefore, the logical CPU's AMD Node ID can't be used since it won't
+match the AMD Node ID of the GPU die. The AMD Node ID of the GPU die is
+provided as part of the MCA information, and the value will match the
+hardware enumeration (e.g. 8-15).
+
+Handle this situation by discovering GPU dies the same way as CPU dies
+in the AMD NB code. But do a "node id" fixup in AMD64 EDAC where it's
+needed.
+
+The GPU data fabrics provide a register with the base AMD Node ID for
+their local "type", i.e. GPU data fabric. This value is the same for all
+fabrics of the same type in a system.
+
+Read and cache the base AMD Node ID from one of the GPU devices during
+module initialization. Use this to fixup the "node id" when reporting
+memory errors at runtime.
+
+  [ bp: Squash a fix making gpu_node_map static as reported by
+        Tom Rix <trix@redhat.com>.
+    Link: https://lore.kernel.org/r/20230610210930.174074-1-trix@redhat.com ]
+
+	Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Co-developed-by: Muralidhara M K <muralidhara.mk@amd.com>
+	Signed-off-by: Muralidhara M K <muralidhara.mk@amd.com>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Link: https://lore.kernel.org/r/20230515113537.1052146-6-muralimk@amd.com
+(cherry picked from commit 4251566ebc1cf95ae26a1e5a24cdac1ac25e942f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/edac/amd64_edac.c
+diff --cc drivers/edac/amd64_edac.c
+index 1a04fd81d40a,c52834db5c98..000000000000
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@@ -3680,6 -3754,227 +3750,230 @@@ static int umc_hw_info_get(struct amd64
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The CPUs have one channel per UMC, so UMC number is equivalent to a
++  * channel number. The GPUs have 8 channels per UMC, so the UMC number no
++  * longer works as a channel number.
++  *
++  * The channel number within a GPU UMC is given in MCA_IPID[15:12].
++  * However, the IDs are split such that two UMC values go to one UMC, and
++  * the channel numbers are split in two groups of four.
++  *
++  * Refer to comment on gpu_get_umc_base().
++  *
++  * For example,
++  * UMC0 CH[3:0] = 0x0005[3:0]000
++  * UMC0 CH[7:4] = 0x0015[3:0]000
++  * UMC1 CH[3:0] = 0x0025[3:0]000
++  * UMC1 CH[7:4] = 0x0035[3:0]000
++  */
++ static void gpu_get_err_info(struct mce *m, struct err_info *err)
++ {
++ 	u8 ch = (m->ipid & GENMASK(31, 0)) >> 20;
++ 	u8 phy = ((m->ipid >> 12) & 0xf);
++ 
++ 	err->channel = ch % 2 ? phy + 4 : phy;
++ 	err->csrow = phy;
++ }
++ 
++ static int gpu_addr_mask_to_cs_size(struct amd64_pvt *pvt, u8 umc,
++ 				    unsigned int cs_mode, int csrow_nr)
++ {
++ 	u32 addr_mask_orig = pvt->csels[umc].csmasks[csrow_nr];
++ 
++ 	return __addr_mask_to_cs_size(addr_mask_orig, cs_mode, csrow_nr, csrow_nr >> 1);
++ }
++ 
++ static void gpu_debug_display_dimm_sizes(struct amd64_pvt *pvt, u8 ctrl)
++ {
++ 	int size, cs_mode, cs = 0;
++ 
++ 	edac_printk(KERN_DEBUG, EDAC_MC, "UMC%d chip selects:\n", ctrl);
++ 
++ 	cs_mode = CS_EVEN_PRIMARY | CS_ODD_PRIMARY;
++ 
++ 	for_each_chip_select(cs, ctrl, pvt) {
++ 		size = gpu_addr_mask_to_cs_size(pvt, ctrl, cs_mode, cs);
++ 		amd64_info(EDAC_MC ": %d: %5dMB\n", cs, size);
++ 	}
++ }
++ 
++ static void gpu_dump_misc_regs(struct amd64_pvt *pvt)
++ {
++ 	struct amd64_umc *umc;
++ 	u32 i;
++ 
++ 	for_each_umc(i) {
++ 		umc = &pvt->umc[i];
++ 
++ 		edac_dbg(1, "UMC%d UMC cfg: 0x%x\n", i, umc->umc_cfg);
++ 		edac_dbg(1, "UMC%d SDP ctrl: 0x%x\n", i, umc->sdp_ctrl);
++ 		edac_dbg(1, "UMC%d ECC ctrl: 0x%x\n", i, umc->ecc_ctrl);
++ 		edac_dbg(1, "UMC%d All HBMs support ECC: yes\n", i);
++ 
++ 		gpu_debug_display_dimm_sizes(pvt, i);
++ 	}
++ }
++ 
++ static u32 gpu_get_csrow_nr_pages(struct amd64_pvt *pvt, u8 dct, int csrow_nr)
++ {
++ 	u32 nr_pages;
++ 	int cs_mode = CS_EVEN_PRIMARY | CS_ODD_PRIMARY;
++ 
++ 	nr_pages   = gpu_addr_mask_to_cs_size(pvt, dct, cs_mode, csrow_nr);
++ 	nr_pages <<= 20 - PAGE_SHIFT;
++ 
++ 	edac_dbg(0, "csrow: %d, channel: %d\n", csrow_nr, dct);
++ 	edac_dbg(0, "nr_pages/channel: %u\n", nr_pages);
++ 
++ 	return nr_pages;
++ }
++ 
++ static void gpu_init_csrows(struct mem_ctl_info *mci)
++ {
++ 	struct amd64_pvt *pvt = mci->pvt_info;
++ 	struct dimm_info *dimm;
++ 	u8 umc, cs;
++ 
++ 	for_each_umc(umc) {
++ 		for_each_chip_select(cs, umc, pvt) {
++ 			if (!csrow_enabled(cs, umc, pvt))
++ 				continue;
++ 
++ 			dimm = mci->csrows[umc]->channels[cs]->dimm;
++ 
++ 			edac_dbg(1, "MC node: %d, csrow: %d\n",
++ 				 pvt->mc_node_id, cs);
++ 
++ 			dimm->nr_pages = gpu_get_csrow_nr_pages(pvt, umc, cs);
++ 			dimm->edac_mode = EDAC_SECDED;
++ 			dimm->mtype = MEM_HBM2;
++ 			dimm->dtype = DEV_X16;
++ 			dimm->grain = 64;
++ 		}
++ 	}
++ }
++ 
++ static void gpu_setup_mci_misc_attrs(struct mem_ctl_info *mci)
++ {
++ 	struct amd64_pvt *pvt = mci->pvt_info;
++ 
++ 	mci->mtype_cap		= MEM_FLAG_HBM2;
++ 	mci->edac_ctl_cap	= EDAC_FLAG_SECDED;
++ 
++ 	mci->edac_cap		= EDAC_FLAG_EC;
++ 	mci->mod_name		= EDAC_MOD_STR;
++ 	mci->ctl_name		= pvt->ctl_name;
++ 	mci->dev_name		= pci_name(pvt->F3);
++ 	mci->ctl_page_to_phys	= NULL;
++ 
++ 	gpu_init_csrows(mci);
++ }
++ 
++ /* ECC is enabled by default on GPU nodes */
++ static bool gpu_ecc_enabled(struct amd64_pvt *pvt)
++ {
++ 	return true;
++ }
++ 
++ static inline u32 gpu_get_umc_base(u8 umc, u8 channel)
++ {
++ 	/*
++ 	 * On CPUs, there is one channel per UMC, so UMC numbering equals
++ 	 * channel numbering. On GPUs, there are eight channels per UMC,
++ 	 * so the channel numbering is different from UMC numbering.
++ 	 *
++ 	 * On CPU nodes channels are selected in 6th nibble
++ 	 * UMC chY[3:0]= [(chY*2 + 1) : (chY*2)]50000;
++ 	 *
++ 	 * On GPU nodes channels are selected in 3rd nibble
++ 	 * HBM chX[3:0]= [Y  ]5X[3:0]000;
++ 	 * HBM chX[7:4]= [Y+1]5X[3:0]000
++ 	 */
++ 	umc *= 2;
++ 
++ 	if (channel >= 4)
++ 		umc++;
++ 
++ 	return 0x50000 + (umc << 20) + ((channel % 4) << 12);
++ }
++ 
++ static void gpu_read_mc_regs(struct amd64_pvt *pvt)
++ {
++ 	u8 nid = pvt->mc_node_id;
++ 	struct amd64_umc *umc;
++ 	u32 i, umc_base;
++ 
++ 	/* Read registers from each UMC */
++ 	for_each_umc(i) {
++ 		umc_base = gpu_get_umc_base(i, 0);
++ 		umc = &pvt->umc[i];
++ 
++ 		amd_smn_read(nid, umc_base + UMCCH_UMC_CFG, &umc->umc_cfg);
++ 		amd_smn_read(nid, umc_base + UMCCH_SDP_CTRL, &umc->sdp_ctrl);
++ 		amd_smn_read(nid, umc_base + UMCCH_ECC_CTRL, &umc->ecc_ctrl);
++ 	}
++ }
++ 
++ static void gpu_read_base_mask(struct amd64_pvt *pvt)
++ {
++ 	u32 base_reg, mask_reg;
++ 	u32 *base, *mask;
++ 	int umc, cs;
++ 
++ 	for_each_umc(umc) {
++ 		for_each_chip_select(cs, umc, pvt) {
++ 			base_reg = gpu_get_umc_base(umc, cs) + UMCCH_BASE_ADDR;
++ 			base = &pvt->csels[umc].csbases[cs];
++ 
++ 			if (!amd_smn_read(pvt->mc_node_id, base_reg, base)) {
++ 				edac_dbg(0, "  DCSB%d[%d]=0x%08x reg: 0x%x\n",
++ 					 umc, cs, *base, base_reg);
++ 			}
++ 
++ 			mask_reg = gpu_get_umc_base(umc, cs) + UMCCH_ADDR_MASK;
++ 			mask = &pvt->csels[umc].csmasks[cs];
++ 
++ 			if (!amd_smn_read(pvt->mc_node_id, mask_reg, mask)) {
++ 				edac_dbg(0, "  DCSM%d[%d]=0x%08x reg: 0x%x\n",
++ 					 umc, cs, *mask, mask_reg);
++ 			}
++ 		}
++ 	}
++ }
++ 
++ static void gpu_prep_chip_selects(struct amd64_pvt *pvt)
++ {
++ 	int umc;
++ 
++ 	for_each_umc(umc) {
++ 		pvt->csels[umc].b_cnt = 8;
++ 		pvt->csels[umc].m_cnt = 8;
++ 	}
++ }
++ 
++ static int gpu_hw_info_get(struct amd64_pvt *pvt)
++ {
++ 	int ret;
++ 
++ 	ret = gpu_get_node_map();
++ 	if (ret)
++ 		return ret;
++ 
++ 	pvt->umc = kcalloc(pvt->max_mcs, sizeof(struct amd64_umc), GFP_KERNEL);
++ 	if (!pvt->umc)
++ 		return -ENOMEM;
++ 
++ 	gpu_prep_chip_selects(pvt);
++ 	gpu_read_base_mask(pvt);
++ 	gpu_read_mc_regs(pvt);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 4251566ebc1c (EDAC/amd64: Cache and use GPU node map)
+  static void hw_info_put(struct amd64_pvt *pvt)
+  {
+  	pci_dev_put(pvt->F1);
+* Unmerged path drivers/edac/amd64_edac.c
+diff --git a/drivers/edac/amd64_edac.h b/drivers/edac/amd64_edac.h
+index e84fe0d4120a..a9d62907a7a0 100644
+--- a/drivers/edac/amd64_edac.h
++++ b/drivers/edac/amd64_edac.h
+@@ -16,6 +16,7 @@
+ #include <linux/slab.h>
+ #include <linux/mmzone.h>
+ #include <linux/edac.h>
++#include <linux/bitfield.h>
+ #include <asm/cpu_device_id.h>
+ #include <asm/msr.h>
+ #include "edac_module.h"
