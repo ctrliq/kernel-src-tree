@@ -1,0 +1,194 @@
+drm/amdgpu: drop redundant sched job cleanup when cs is aborted
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Guchun Chen <guchun.chen@amd.com>
+commit 1253685f0d3eb3eab0bfc4bf15ab341a5f3da0c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/1253685f.failed
+
+Once command submission failed due to userptr invalidation in
+amdgpu_cs_submit, legacy code will perform cleanup of scheduler
+job. However, it's not needed at all, as former commit has integrated
+job cleanup stuff into amdgpu_job_free. Otherwise, because of double
+free, a NULL pointer dereference will occur in such scenario.
+
+Bug: https://gitlab.freedesktop.org/drm/amd/-/issues/2457
+Fixes: f7d66fb2ea43 ("drm/amdgpu: cleanup scheduler job initialization v2")
+	Signed-off-by: Guchun Chen <guchun.chen@amd.com>
+	Reviewed-by: Christian König <christian.koenig@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 1253685f0d3eb3eab0bfc4bf15ab341a5f3da0c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 7e350ea0368b,2eb2c66843a8..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@@ -1210,14 -1262,28 +1210,33 @@@ static int amdgpu_cs_submit(struct amdg
+  	uint64_t seq;
+  	int r;
+  
+ -	for (i = 0; i < p->gang_size; ++i)
+ -		drm_sched_job_arm(&p->jobs[i]->base);
+ +	job = p->job;
+ +	p->job = NULL;
+  
+ -	for (i = 0; i < p->gang_size; ++i) {
+ -		struct dma_fence *fence;
+ +	r = drm_sched_job_init(&job->base, entity, &fpriv->vm);
+ +	if (r)
+ +		goto error_unlock;
+  
+++<<<<<<< HEAD
+ +	drm_sched_job_arm(&job->base);
+++=======
++ 		if (p->jobs[i] == leader)
++ 			continue;
++ 
++ 		fence = &p->jobs[i]->base.s_fence->scheduled;
++ 		dma_fence_get(fence);
++ 		r = drm_sched_job_add_dependency(&leader->base, fence);
++ 		if (r) {
++ 			dma_fence_put(fence);
++ 			return r;
++ 		}
++ 	}
++ 
++ 	if (p->gang_size > 1) {
++ 		for (i = 0; i < p->gang_size; ++i)
++ 			amdgpu_job_set_gang_leader(p->jobs[i], leader);
++ 	}
+++>>>>>>> 1253685f0d3e (drm/amdgpu: drop redundant sched job cleanup when cs is aborted)
+  
+  	/* No memory allocation is allowed while holding the notifier lock.
+  	 * The lock is held until amdgpu_cs_submit is finished and fence is
+@@@ -1236,59 -1303,87 +1255,67 @@@
+  	}
+  	if (r) {
+  		r = -EAGAIN;
+++<<<<<<< HEAD
+ +		goto error_abort;
+++=======
++ 		mutex_unlock(&p->adev->notifier_lock);
++ 		return r;
+++>>>>>>> 1253685f0d3e (drm/amdgpu: drop redundant sched job cleanup when cs is aborted)
+  	}
+  
+ -	p->fence = dma_fence_get(&leader->base.s_fence->finished);
+ -	list_for_each_entry(e, &p->validated, tv.head) {
+ -
+ -		/* Everybody except for the gang leader uses READ */
+ -		for (i = 0; i < p->gang_size; ++i) {
+ -			if (p->jobs[i] == leader)
+ -				continue;
+ -
+ -			dma_resv_add_fence(e->tv.bo->base.resv,
+ -					   &p->jobs[i]->base.s_fence->finished,
+ -					   DMA_RESV_USAGE_READ);
+ -		}
+ -
+ -		/* The gang leader is remembered as writer */
+ -		e->tv.num_shared = 0;
+ -	}
+ +	p->fence = dma_fence_get(&job->base.s_fence->finished);
+  
+ -	seq = amdgpu_ctx_add_fence(p->ctx, p->entities[p->gang_leader_idx],
+ -				   p->fence);
+ +	seq = amdgpu_ctx_add_fence(p->ctx, entity, p->fence);
+  	amdgpu_cs_post_dependencies(p);
+  
+ -	if ((leader->preamble_status & AMDGPU_PREAMBLE_IB_PRESENT) &&
+ +	if ((job->preamble_status & AMDGPU_PREAMBLE_IB_PRESENT) &&
+  	    !p->ctx->preamble_presented) {
+ -		leader->preamble_status |= AMDGPU_PREAMBLE_IB_PRESENT_FIRST;
+ +		job->preamble_status |= AMDGPU_PREAMBLE_IB_PRESENT_FIRST;
+  		p->ctx->preamble_presented = true;
+  	}
+  
+  	cs->out.handle = seq;
+ -	leader->uf_sequence = seq;
+ +	job->uf_sequence = seq;
+ +
+ +	amdgpu_job_free_resources(job);
+  
+ +	trace_amdgpu_cs_ioctl(job);
+  	amdgpu_vm_bo_trace_cs(&fpriv->vm, &p->ticket);
+ -	for (i = 0; i < p->gang_size; ++i) {
+ -		amdgpu_job_free_resources(p->jobs[i]);
+ -		trace_amdgpu_cs_ioctl(p->jobs[i]);
+ -		drm_sched_entity_push_job(&p->jobs[i]->base);
+ -		p->jobs[i] = NULL;
+ -	}
+ +	drm_sched_entity_push_job(&job->base);
+  
+  	amdgpu_vm_move_to_lru_tail(p->adev, &fpriv->vm);
+ -	ttm_eu_fence_buffer_objects(&p->ticket, &p->validated, p->fence);
+  
+ +	/* Make sure all BOs are remembered as writers */
+ +	amdgpu_bo_list_for_each_entry(e, p->bo_list)
+ +		e->tv.num_shared = 0;
+ +
+ +	ttm_eu_fence_buffer_objects(&p->ticket, &p->validated, p->fence);
+  	mutex_unlock(&p->adev->notifier_lock);
+  	mutex_unlock(&p->bo_list->bo_list_mutex);
+ -	return 0;
+ -}
+  
+ -/* Cleanup the parser structure */
+ -static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser)
+ -{
+ -	unsigned i;
+ +	return 0;
+++<<<<<<< HEAD
+  
+ -	amdgpu_sync_free(&parser->sync);
+ -	for (i = 0; i < parser->num_post_deps; i++) {
+ -		drm_syncobj_put(parser->post_deps[i].syncobj);
+ -		kfree(parser->post_deps[i].chain);
+ -	}
+ -	kfree(parser->post_deps);
+ +error_abort:
+ +	drm_sched_job_cleanup(&job->base);
+ +	mutex_unlock(&p->adev->notifier_lock);
+  
+ -	dma_fence_put(parser->fence);
+ +error_unlock:
+ +	amdgpu_job_free(job);
+ +	return r;
+++=======
+++>>>>>>> 1253685f0d3e (drm/amdgpu: drop redundant sched job cleanup when cs is aborted)
+ +}
+  
+ -	if (parser->ctx)
+ -		amdgpu_ctx_put(parser->ctx);
+ -	if (parser->bo_list)
+ -		amdgpu_bo_list_put(parser->bo_list);
+ +static void trace_amdgpu_cs_ibs(struct amdgpu_cs_parser *parser)
+ +{
+ +	int i;
+  
+ -	for (i = 0; i < parser->nchunks; i++)
+ -		kvfree(parser->chunks[i].kdata);
+ -	kvfree(parser->chunks);
+ -	for (i = 0; i < parser->gang_size; ++i) {
+ -		if (parser->jobs[i])
+ -			amdgpu_job_free(parser->jobs[i]);
+ -	}
+ -	if (parser->uf_entry.tv.bo) {
+ -		struct amdgpu_bo *uf = ttm_to_amdgpu_bo(parser->uf_entry.tv.bo);
+ +	if (!trace_amdgpu_cs_enabled())
+ +		return;
+  
+ -		amdgpu_bo_unref(&uf);
+ -	}
+ +	for (i = 0; i < parser->job->num_ibs; i++)
+ +		trace_amdgpu_cs(parser, i);
+  }
+  
+  int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
