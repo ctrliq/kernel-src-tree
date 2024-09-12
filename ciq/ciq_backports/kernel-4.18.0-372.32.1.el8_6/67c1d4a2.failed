@@ -1,0 +1,213 @@
+x86/ftrace: Use text_gen_insn()
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 67c1d4a28064f9ec63df03f7798e4a334176a9cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/67c1d4a2.failed
+
+Replace the ftrace_code_union with the generic text_gen_insn() helper,
+which does exactly this.
+
+	Tested-by: Alexei Starovoitov <ast@kernel.org>
+	Tested-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/20191111132457.932808000@infradead.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 67c1d4a28064f9ec63df03f7798e4a334176a9cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/text-patching.h
+#	arch/x86/kernel/ftrace.c
+diff --cc arch/x86/include/asm/text-patching.h
+index 47a8c6185e2b,ad8f9f433a1b..000000000000
+--- a/arch/x86/include/asm/text-patching.h
++++ b/arch/x86/include/asm/text-patching.h
+@@@ -71,6 -61,65 +71,68 @@@ static inline void int3_emulate_jmp(str
+  #define JMP8_INSN_SIZE		2
+  #define JMP8_INSN_OPCODE	0xEB
+  
+++<<<<<<< HEAD
+++=======
++ static inline int text_opcode_size(u8 opcode)
++ {
++ 	int size = 0;
++ 
++ #define __CASE(insn)	\
++ 	case insn##_INSN_OPCODE: size = insn##_INSN_SIZE; break
++ 
++ 	switch(opcode) {
++ 	__CASE(INT3);
++ 	__CASE(CALL);
++ 	__CASE(JMP32);
++ 	__CASE(JMP8);
++ 	}
++ 
++ #undef __CASE
++ 
++ 	return size;
++ }
++ 
++ union text_poke_insn {
++ 	u8 text[POKE_MAX_OPCODE_SIZE];
++ 	struct {
++ 		u8 opcode;
++ 		s32 disp;
++ 	} __attribute__((packed));
++ };
++ 
++ static __always_inline
++ void *text_gen_insn(u8 opcode, const void *addr, const void *dest)
++ {
++ 	static union text_poke_insn insn; /* per instance */
++ 	int size = text_opcode_size(opcode);
++ 
++ 	insn.opcode = opcode;
++ 
++ 	if (size > 1) {
++ 		insn.disp = (long)dest - (long)(addr + size);
++ 		if (size == 2) {
++ 			/*
++ 			 * Ensure that for JMP9 the displacement
++ 			 * actually fits the signed byte.
++ 			 */
++ 			BUG_ON((insn.disp >> 31) != (insn.disp >> 7));
++ 		}
++ 	}
++ 
++ 	return &insn.text;
++ }
++ 
++ extern int after_bootmem;
++ extern __ro_after_init struct mm_struct *poking_mm;
++ extern __ro_after_init unsigned long poking_addr;
++ 
++ #ifndef CONFIG_UML_X86
++ static inline void int3_emulate_jmp(struct pt_regs *regs, unsigned long ip)
++ {
++ 	regs->ip = ip;
++ }
++ 
+++>>>>>>> 67c1d4a28064 (x86/ftrace: Use text_gen_insn())
+  static inline void int3_emulate_push(struct pt_regs *regs, unsigned long val)
+  {
+  	/*
+diff --cc arch/x86/kernel/ftrace.c
+index 65f676625c82,2a179fb35cd1..000000000000
+--- a/arch/x86/kernel/ftrace.c
++++ b/arch/x86/kernel/ftrace.c
+@@@ -53,70 -63,19 +53,79 @@@ int ftrace_arch_code_modify_post_proces
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +union ftrace_code_union {
+ +	char code[MCOUNT_INSN_SIZE];
+ +	struct {
+ +		unsigned char op;
+ +		int offset;
+ +	} __attribute__((packed));
+ +};
+ +
+ +static int ftrace_calc_offset(long ip, long addr)
+ +{
+ +	return (int)(addr - ip);
+ +}
+ +
+ +static unsigned char *
+ +ftrace_text_replace(unsigned char op, unsigned long ip, unsigned long addr)
+ +{
+ +	static union ftrace_code_union calc;
+ +
+ +	calc.op		= op;
+ +	calc.offset	= ftrace_calc_offset(ip + MCOUNT_INSN_SIZE, addr);
+ +
+ +	return calc.code;
+ +}
+ +
+ +static unsigned char *
+ +ftrace_call_replace(unsigned long ip, unsigned long addr)
+ +{
+ +	return ftrace_text_replace(0xe8, ip, addr);
+ +}
+ +
+ +static inline int
+ +within(unsigned long addr, unsigned long start, unsigned long end)
+ +{
+ +	return addr >= start && addr < end;
+ +}
+ +
+ +static unsigned long text_ip_addr(unsigned long ip)
+ +{
+ +	/*
+ +	 * On x86_64, kernel text mappings are mapped read-only, so we use
+ +	 * the kernel identity mapping instead of the kernel text mapping
+ +	 * to modify the kernel text.
+ +	 *
+ +	 * For 32bit kernels, these mappings are same and we can use
+ +	 * kernel identity mapping to modify code.
+ +	 */
+ +	if (within(ip, (unsigned long)_text, (unsigned long)_etext))
+ +		ip = (unsigned long)__va(__pa_symbol(ip));
+ +
+ +	return ip;
+ +}
+ +
+ +static const unsigned char *ftrace_nop_replace(void)
+++=======
++ static const char *ftrace_nop_replace(void)
+++>>>>>>> 67c1d4a28064 (x86/ftrace: Use text_gen_insn())
+  {
+  	return ideal_nops[NOP_ATOMIC5];
+  }
+  
+ -static const char *ftrace_call_replace(unsigned long ip, unsigned long addr)
+ +static int
+ +ftrace_modify_code_direct(unsigned long ip, unsigned const char *old_code,
+ +		   unsigned const char *new_code)
+  {
+++<<<<<<< HEAD
+ +	unsigned char replaced[MCOUNT_INSN_SIZE];
+++=======
++ 	return text_gen_insn(CALL_INSN_OPCODE, (void *)ip, (void *)addr);
++ }
+++>>>>>>> 67c1d4a28064 (x86/ftrace: Use text_gen_insn())
+  
+ -static int ftrace_verify_code(unsigned long ip, const char *old_code)
+ -{
+ -	char cur_code[MCOUNT_INSN_SIZE];
+ +	ftrace_expected = old_code;
+  
+  	/*
+  	 * Note:
+@@@ -976,9 -542,9 +985,13 @@@ void arch_ftrace_trampoline_free(struc
+  #ifdef CONFIG_DYNAMIC_FTRACE
+  extern void ftrace_graph_call(void);
+  
+ -static const char *ftrace_jmp_replace(unsigned long ip, unsigned long addr)
+ +static unsigned char *ftrace_jmp_replace(unsigned long ip, unsigned long addr)
+  {
+++<<<<<<< HEAD
+ +	return ftrace_text_replace(0xe9, ip, addr);
+++=======
++ 	return text_gen_insn(JMP32_INSN_OPCODE, (void *)ip, (void *)addr);
+++>>>>>>> 67c1d4a28064 (x86/ftrace: Use text_gen_insn())
+  }
+  
+  static int ftrace_mod_jmp(unsigned long ip, void *func)
+* Unmerged path arch/x86/include/asm/text-patching.h
+* Unmerged path arch/x86/kernel/ftrace.c
