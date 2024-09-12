@@ -1,0 +1,216 @@
+mptcp: cleanup MPJ subflow list handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 3e5014909b5661b3da59990d72a317a45ba3b284
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/3e501490.failed
+
+We can simplify the join list handling leveraging the
+mptcp_release_cb(): if we can acquire the msk socket
+lock at mptcp_finish_join time, move the new subflow
+directly into the conn_list, otherwise place it on join_list and
+let the release_cb process such list.
+
+Since pending MPJ connection are now always processed
+in a timely way, we can avoid flushing the join list
+every time we have to process all the current subflows.
+
+Additionally we can now use the mptcp data lock to protect
+the join_list, removing the additional spin lock.
+
+Finally, the MPJ handshake is now always finalized under the
+msk socket lock, we can drop the additional synchronization
+between mptcp_finish_join() and mptcp_close().
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3e5014909b5661b3da59990d72a317a45ba3b284)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/pm_netlink.c
+#	net/mptcp/protocol.c
+#	net/mptcp/protocol.h
+#	net/mptcp/subflow.c
+diff --cc net/mptcp/pm_netlink.c
+index 91db0ac49364,75af1f701e1d..000000000000
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@@ -535,8 -577,61 +534,63 @@@ static void mptcp_pm_nl_subflow_establi
+  	mptcp_pm_create_subflow_or_signal_addr(msk);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Fill all the local addresses into the array addrs[],
++  * and return the array size.
++  */
++ static unsigned int fill_local_addresses_vec(struct mptcp_sock *msk,
++ 					     struct mptcp_addr_info *addrs)
++ {
++ 	struct sock *sk = (struct sock *)msk;
++ 	struct mptcp_pm_addr_entry *entry;
++ 	struct mptcp_addr_info local;
++ 	struct pm_nl_pernet *pernet;
++ 	unsigned int subflows_max;
++ 	int i = 0;
++ 
++ 	pernet = net_generic(sock_net(sk), pm_nl_pernet_id);
++ 	subflows_max = mptcp_pm_get_subflows_max(msk);
++ 
++ 	rcu_read_lock();
++ 	list_for_each_entry_rcu(entry, &pernet->local_addr_list, list) {
++ 		if (!(entry->flags & MPTCP_PM_ADDR_FLAG_FULLMESH))
++ 			continue;
++ 
++ 		if (entry->addr.family != sk->sk_family) {
++ #if IS_ENABLED(CONFIG_MPTCP_IPV6)
++ 			if ((entry->addr.family == AF_INET &&
++ 			     !ipv6_addr_v4mapped(&sk->sk_v6_daddr)) ||
++ 			    (sk->sk_family == AF_INET &&
++ 			     !ipv6_addr_v4mapped(&entry->addr.addr6)))
++ #endif
++ 				continue;
++ 		}
++ 
++ 		if (msk->pm.subflows < subflows_max) {
++ 			msk->pm.subflows++;
++ 			addrs[i++] = entry->addr;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	/* If the array is empty, fill in the single
++ 	 * 'IPADDRANY' local address
++ 	 */
++ 	if (!i) {
++ 		memset(&local, 0, sizeof(local));
++ 		local.family = msk->pm.remote.family;
++ 
++ 		msk->pm.subflows++;
++ 		addrs[i++] = local;
++ 	}
++ 
++ 	return i;
++ }
++ 
+++>>>>>>> 3e5014909b56 (mptcp: cleanup MPJ subflow list handling)
+  static void mptcp_pm_nl_add_addr_received(struct mptcp_sock *msk)
+  {
+ -	struct mptcp_addr_info addrs[MPTCP_PM_ADDR_MAX];
+  	struct sock *sk = (struct sock *)msk;
+  	unsigned int add_addr_accept_max;
+  	struct mptcp_addr_info remote;
+diff --cc net/mptcp/protocol.c
+index 49157b943d15,c5f64fb0474d..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -1564,11 -1540,10 +1555,10 @@@ void __mptcp_push_pending(struct sock *
+  			int ret = 0;
+  
+  			prev_ssk = ssk;
+- 			__mptcp_flush_join_list(msk);
+  			ssk = mptcp_subflow_get_send(msk);
+  
+ -			/* First check. If the ssk has changed since
+ -			 * the last round, release prev_ssk
+ +			/* try to keep the subflow socket lock across
+ +			 * consecutive xmit on the same socket
+  			 */
+  			if (ssk != prev_ssk && prev_ssk)
+  				mptcp_push_release(prev_ssk, &info);
+@@@ -2789,7 -2824,7 +2769,11 @@@ static int mptcp_disconnect(struct soc
+  	struct mptcp_subflow_context *subflow;
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+  
+++<<<<<<< HEAD
+ +	mptcp_do_flush_join_list(msk);
+++=======
++ 	inet_sk_state_store(sk, TCP_CLOSE);
+++>>>>>>> 3e5014909b56 (mptcp: cleanup MPJ subflow list handling)
+  
+  	mptcp_for_each_subflow(msk, subflow) {
+  		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+diff --cc net/mptcp/protocol.h
+index 9fc0155d6c66,962f3b6b6a1d..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -238,7 -257,10 +238,14 @@@ struct mptcp_sock 
+  	bool		snd_data_fin_enable;
+  	bool		rcv_fastclose;
+  	bool		use_64bit_ack; /* Set when we received a 64-bit DSN */
+++<<<<<<< HEAD
+ +	spinlock_t	join_list_lock;
+++=======
++ 	bool		csum_enabled;
++ 	u8		recvmsg_inq:1,
++ 			cork:1,
++ 			nodelay:1;
+++>>>>>>> 3e5014909b56 (mptcp: cleanup MPJ subflow list handling)
+  	struct work_struct work;
+  	struct sk_buff  *ooo_last_skb;
+  	struct rb_root  out_of_order_queue;
+diff --cc net/mptcp/subflow.c
+index e3b8c16e14c9,a1cd39f97659..000000000000
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@@ -1320,8 -1441,8 +1320,13 @@@ int __mptcp_subflow_connect(struct soc
+  	subflow->request_bkup = !!(flags & MPTCP_PM_ADDR_FLAG_BACKUP);
+  	mptcp_info2sockaddr(remote, &addr, ssk->sk_family);
+  
+++<<<<<<< HEAD
+ +	mptcp_add_pending_subflow(msk, subflow);
+ +	mptcp_sockopt_sync(msk, ssk);
+++=======
++ 	sock_hold(ssk);
++ 	list_add_tail(&subflow->node, &msk->conn_list);
+++>>>>>>> 3e5014909b56 (mptcp: cleanup MPJ subflow list handling)
+  	err = kernel_connect(sf, (struct sockaddr *)&addr, addrlen, O_NONBLOCK);
+  	if (err && err != -EINPROGRESS)
+  		goto failed_unlink;
+* Unmerged path net/mptcp/pm_netlink.c
+* Unmerged path net/mptcp/protocol.c
+* Unmerged path net/mptcp/protocol.h
+diff --git a/net/mptcp/sockopt.c b/net/mptcp/sockopt.c
+index 4bb6810160b1..3101cfebf3d4 100644
+--- a/net/mptcp/sockopt.c
++++ b/net/mptcp/sockopt.c
+@@ -730,27 +730,15 @@ void mptcp_sockopt_sync(struct mptcp_sock *msk, struct sock *ssk)
+ 	}
+ }
+ 
+-void mptcp_sockopt_sync_all(struct mptcp_sock *msk)
++void mptcp_sockopt_sync_locked(struct mptcp_sock *msk, struct sock *ssk)
+ {
+-	struct mptcp_subflow_context *subflow;
+-	struct sock *sk = (struct sock *)msk;
+-	u32 seq;
+-
+-	seq = sockopt_seq_reset(sk);
++	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
+ 
+-	mptcp_for_each_subflow(msk, subflow) {
+-		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+-		u32 sseq = READ_ONCE(subflow->setsockopt_seq);
++	msk_owned_by_me(msk);
+ 
+-		if (sseq != msk->setsockopt_seq) {
+-			__mptcp_sockopt_sync(msk, ssk);
+-			WRITE_ONCE(subflow->setsockopt_seq, seq);
+-		} else if (sseq != seq) {
+-			WRITE_ONCE(subflow->setsockopt_seq, seq);
+-		}
++	if (READ_ONCE(subflow->setsockopt_seq) != msk->setsockopt_seq) {
++		sync_socket_options(msk, ssk);
+ 
+-		cond_resched();
++		subflow->setsockopt_seq = msk->setsockopt_seq;
+ 	}
+-
+-	msk->setsockopt_seq = seq;
+ }
+* Unmerged path net/mptcp/subflow.c
