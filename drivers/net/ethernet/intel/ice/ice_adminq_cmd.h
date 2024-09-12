@@ -1392,6 +1392,7 @@ struct ice_aqc_get_link_topo {
 	struct ice_aqc_link_topo_addr addr;
 	u8 node_part_num;
 #define ICE_AQC_GET_LINK_TOPO_NODE_NR_PCA9575	0x21
+#define ICE_AQC_GET_LINK_TOPO_NODE_NR_C827	0x31
 	u8 rsvd[9];
 };
 
@@ -2088,16 +2089,6 @@ struct ice_aqc_driver_shared_params {
 	__le32 param_val;
 	__le32 addr_high;
 	__le32 addr_low;
-};
-
-enum ice_aqc_driver_params {
-	/* OS clock index for PTP timer Domain 0 */
-	ICE_AQC_DRIVER_PARAM_CLK_IDX_TMR0 = 0,
-	/* OS clock index for PTP timer Domain 1 */
-	ICE_AQC_DRIVER_PARAM_CLK_IDX_TMR1,
-
-	/* Add new parameters above */
-	ICE_AQC_DRIVER_PARAM_MAX = 16,
 };
 
 /* Lan Queue Overflow Event (direct, 0x1001) */
