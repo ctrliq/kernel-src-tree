@@ -1,0 +1,104 @@
+prlimit: do_prlimit needs to have a speculation check
+
+jira LE-1907
+cve CVE-2023-0458
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+commit 739790605705ddcf18f21782b9c99ad7d53a8c11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/73979060.failed
+
+do_prlimit() adds the user-controlled resource value to a pointer that
+will subsequently be dereferenced.  In order to help prevent this
+codepath from being used as a spectre "gadget" a barrier needs to be
+added after checking the range.
+
+	Reported-by: Jordy Zomer <jordyzomer@google.com>
+	Tested-by: Jordy Zomer <jordyzomer@google.com>
+	Suggested-by: Linus Torvalds <torvalds@linuxfoundation.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 739790605705ddcf18f21782b9c99ad7d53a8c11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sys.c
+diff --cc kernel/sys.c
+index 9255e4282413,88b31f096fb2..000000000000
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@@ -1390,6 -1433,70 +1390,73 @@@ SYSCALL_DEFINE2(setdomainname, char __u
+  	return errno;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* make sure you are allowed to change @tsk limits before calling this */
++ static int do_prlimit(struct task_struct *tsk, unsigned int resource,
++ 		      struct rlimit *new_rlim, struct rlimit *old_rlim)
++ {
++ 	struct rlimit *rlim;
++ 	int retval = 0;
++ 
++ 	if (resource >= RLIM_NLIMITS)
++ 		return -EINVAL;
++ 	resource = array_index_nospec(resource, RLIM_NLIMITS);
++ 
++ 	if (new_rlim) {
++ 		if (new_rlim->rlim_cur > new_rlim->rlim_max)
++ 			return -EINVAL;
++ 		if (resource == RLIMIT_NOFILE &&
++ 				new_rlim->rlim_max > sysctl_nr_open)
++ 			return -EPERM;
++ 	}
++ 
++ 	/* Holding a refcount on tsk protects tsk->signal from disappearing. */
++ 	rlim = tsk->signal->rlim + resource;
++ 	task_lock(tsk->group_leader);
++ 	if (new_rlim) {
++ 		/*
++ 		 * Keep the capable check against init_user_ns until cgroups can
++ 		 * contain all limits.
++ 		 */
++ 		if (new_rlim->rlim_max > rlim->rlim_max &&
++ 				!capable(CAP_SYS_RESOURCE))
++ 			retval = -EPERM;
++ 		if (!retval)
++ 			retval = security_task_setrlimit(tsk, resource, new_rlim);
++ 	}
++ 	if (!retval) {
++ 		if (old_rlim)
++ 			*old_rlim = *rlim;
++ 		if (new_rlim)
++ 			*rlim = *new_rlim;
++ 	}
++ 	task_unlock(tsk->group_leader);
++ 
++ 	/*
++ 	 * RLIMIT_CPU handling. Arm the posix CPU timer if the limit is not
++ 	 * infinite. In case of RLIM_INFINITY the posix CPU timer code
++ 	 * ignores the rlimit.
++ 	 */
++ 	if (!retval && new_rlim && resource == RLIMIT_CPU &&
++ 	    new_rlim->rlim_cur != RLIM_INFINITY &&
++ 	    IS_ENABLED(CONFIG_POSIX_TIMERS)) {
++ 		/*
++ 		 * update_rlimit_cpu can fail if the task is exiting, but there
++ 		 * may be other tasks in the thread group that are not exiting,
++ 		 * and they need their cpu timers adjusted.
++ 		 *
++ 		 * The group_leader is the last task to be released, so if we
++ 		 * cannot update_rlimit_cpu on it, then the entire process is
++ 		 * exiting and we do not need to update at all.
++ 		 */
++ 		update_rlimit_cpu(tsk->group_leader, new_rlim->rlim_cur);
++ 	}
++ 
++ 	return retval;
++ }
++ 
+++>>>>>>> 739790605705 (prlimit: do_prlimit needs to have a speculation check)
+  SYSCALL_DEFINE2(getrlimit, unsigned int, resource, struct rlimit __user *, rlim)
+  {
+  	struct rlimit value;
+* Unmerged path kernel/sys.c
