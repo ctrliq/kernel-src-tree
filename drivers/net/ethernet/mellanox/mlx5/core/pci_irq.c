@@ -195,7 +195,8 @@ static bool irq_pool_is_sf_pool(struct mlx5_irq_pool *pool)
 	return !strncmp("mlx5_sf", pool->name, strlen("mlx5_sf"));
 }
 
-static struct mlx5_irq *irq_request(struct mlx5_irq_pool *pool, int i)
+static struct mlx5_irq *irq_request(struct mlx5_irq_pool *pool, int i,
+				    struct cpumask *affinity)
 {
 	struct mlx5_core_dev *dev = pool->dev;
 	char name[MLX5_MAX_IRQ_NAME];
@@ -224,6 +225,10 @@ static struct mlx5_irq *irq_request(struct mlx5_irq_pool *pool, int i)
 		err = -ENOMEM;
 		goto err_cpumask;
 	}
+	if (affinity) {
+		cpumask_copy(irq->mask, affinity);
+		irq_set_affinity_hint(irq->irqn, irq->mask);
+	}
 	irq->pool = pool;
 	kref_init(&irq->kref);
 	irq->index = i;
@@ -235,6 +240,7 @@ static struct mlx5_irq *irq_request(struct mlx5_irq_pool *pool, int i)
 	}
 	return irq;
 err_xa:
+	irq_set_affinity_hint(irq->irqn, NULL);
 	free_cpumask_var(irq->mask);
 err_cpumask:
 	free_irq(irq->irqn, &irq->nh);
@@ -284,7 +290,6 @@ int mlx5_irq_get_index(struct mlx5_irq *irq)
 static struct mlx5_irq *irq_pool_create_irq(struct mlx5_irq_pool *pool,
 					    struct cpumask *affinity)
 {
-	struct mlx5_irq *irq;
 	u32 irq_index;
 	int err;
 
@@ -292,12 +297,7 @@ static struct mlx5_irq *irq_pool_create_irq(struct mlx5_irq_pool *pool,
 		       GFP_KERNEL);
 	if (err)
 		return ERR_PTR(err);
-	irq = irq_request(pool, irq_index);
-	if (IS_ERR(irq))
-		return irq;
-	cpumask_copy(irq->mask, affinity);
-	irq_set_affinity_hint(irq->irqn, irq->mask);
-	return irq;
+	return irq_request(pool, irq_index, affinity);
 }
 
 /* looking for the irq with the smallest refcount and the same affinity */
@@ -373,11 +373,7 @@ irq_pool_request_vector(struct mlx5_irq_pool *pool, int vecidx,
 		kref_get(&irq->kref);
 		goto unlock;
 	}
-	irq = irq_request(pool, vecidx);
-	if (IS_ERR(irq) || !affinity)
-		goto unlock;
-	cpumask_copy(irq->mask, affinity);
-	irq_set_affinity_hint(irq->irqn, irq->mask);
+	irq = irq_request(pool, vecidx, affinity);
 unlock:
 	mutex_unlock(&pool->lock);
 	return irq;
