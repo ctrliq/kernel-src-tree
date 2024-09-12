@@ -1,0 +1,144 @@
+wifi: cfg80211: remove BSS pointer from cfg80211_disassoc_request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 8f6e0dfc2245d8ca1a3335a06a1219c56df04bb8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/8f6e0dfc.failed
+
+The race described by the comment in mac80211 hasn't existed
+since the locking rework to use the same lock and for MLO we
+need to pass the AP MLD address, so just pass the BSSID or
+AP MLD address instead of the BSS struct pointer, and adjust
+all the code accordingly.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 8f6e0dfc2245d8ca1a3335a06a1219c56df04bb8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/mlme.c
+#	net/wireless/mlme.c
+diff --cc net/mac80211/mlme.c
+index fc4128b322c2,a2b4536c3a24..000000000000
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@@ -6318,24 -6424,17 +6318,31 @@@ int ieee80211_mgd_deauth(struct ieee802
+  int ieee80211_mgd_disassoc(struct ieee80211_sub_if_data *sdata,
+  			   struct cfg80211_disassoc_request *req)
+  {
+ +	struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
+ +	u8 bssid[ETH_ALEN];
+  	u8 frame_buf[IEEE80211_DEAUTH_FRAME_LEN];
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * cfg80211 should catch this ... but it's racy since
+ +	 * we can receive a disassoc frame, process it, hand it
+ +	 * to cfg80211 while that's in a locked section already
+ +	 * trying to tell us that the user wants to disconnect.
+ +	 */
+ +	if (ifmgd->assoc_bss != req->bss)
+ +		return -ENOLINK;
+++=======
++ 	if (!sdata->u.mgd.associated ||
++ 	    memcmp(sdata->vif.cfg.ap_addr, req->ap_addr, ETH_ALEN))
++ 		return -ENOTCONN;
+++>>>>>>> 8f6e0dfc2245 (wifi: cfg80211: remove BSS pointer from cfg80211_disassoc_request)
+  
+  	sdata_info(sdata,
+  		   "disassociating from %pM by local choice (Reason: %u=%s)\n",
+- 		   req->bss->bssid, req->reason_code, ieee80211_get_reason_code_string(req->reason_code));
++ 		   req->ap_addr, req->reason_code,
++ 		   ieee80211_get_reason_code_string(req->reason_code));
+  
+ +	memcpy(bssid, req->bss->bssid, ETH_ALEN);
+  	ieee80211_set_disassoc(sdata, IEEE80211_STYPE_DISASSOC,
+  			       req->reason_code, !req->local_state_change,
+  			       frame_buf);
+diff --cc net/wireless/mlme.c
+index 50b275862655,4a35b3559daa..000000000000
+--- a/net/wireless/mlme.c
++++ b/net/wireless/mlme.c
+@@@ -383,12 -386,10 +384,16 @@@ int cfg80211_mlme_disassoc(struct cfg80
+  
+  	ASSERT_WDEV_LOCK(wdev);
+  
+ -	if (!wdev->connected)
+ +	if (!wdev->current_bss)
+  		return -ENOTCONN;
+  
+++<<<<<<< HEAD
+ +	if (ether_addr_equal(wdev->current_bss->pub.bssid, bssid))
+ +		req.bss = &wdev->current_bss->pub;
+ +	else
+++=======
++ 	if (memcmp(wdev->u.client.connected_addr, ap_addr, ETH_ALEN))
+++>>>>>>> 8f6e0dfc2245 (wifi: cfg80211: remove BSS pointer from cfg80211_disassoc_request)
+  		return -ENOTCONN;
+  
+  	err = rdev_disassoc(rdev, dev, &req);
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index c1cd11874b0d..3ed881c8422b 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -2809,7 +2809,7 @@ struct cfg80211_assoc_request {
+  * This structure provides information needed to complete IEEE 802.11
+  * deauthentication.
+  *
+- * @bssid: the BSSID of the BSS to deauthenticate from
++ * @bssid: the BSSID or AP MLD address to deauthenticate from
+  * @ie: Extra IEs to add to Deauthentication frame or %NULL
+  * @ie_len: Length of ie buffer in octets
+  * @reason_code: The reason code for the deauthentication
+@@ -2830,7 +2830,7 @@ struct cfg80211_deauth_request {
+  * This structure provides information needed to complete IEEE 802.11
+  * disassociation.
+  *
+- * @bss: the BSS to disassociate from
++ * @ap_addr: the BSSID or AP MLD address to disassociate from
+  * @ie: Extra IEs to add to Disassociation frame or %NULL
+  * @ie_len: Length of ie buffer in octets
+  * @reason_code: The reason code for the disassociation
+@@ -2838,7 +2838,7 @@ struct cfg80211_deauth_request {
+  *	Disassociation frame is to be transmitted.
+  */
+ struct cfg80211_disassoc_request {
+-	struct cfg80211_bss *bss;
++	const u8 *ap_addr;
+ 	const u8 *ie;
+ 	size_t ie_len;
+ 	u16 reason_code;
+* Unmerged path net/mac80211/mlme.c
+diff --git a/net/wireless/core.h b/net/wireless/core.h
+index de29999a1dc9..68ba48217a32 100644
+--- a/net/wireless/core.h
++++ b/net/wireless/core.h
+@@ -375,7 +375,7 @@ int cfg80211_mlme_deauth(struct cfg80211_registered_device *rdev,
+ 			 const u8 *ie, int ie_len, u16 reason,
+ 			 bool local_state_change);
+ int cfg80211_mlme_disassoc(struct cfg80211_registered_device *rdev,
+-			   struct net_device *dev, const u8 *bssid,
++			   struct net_device *dev, const u8 *ap_addr,
+ 			   const u8 *ie, int ie_len, u16 reason,
+ 			   bool local_state_change);
+ void cfg80211_mlme_down(struct cfg80211_registered_device *rdev,
+* Unmerged path net/wireless/mlme.c
+diff --git a/net/wireless/trace.h b/net/wireless/trace.h
+index a309a5f4b33c..218cdcb59007 100644
+--- a/net/wireless/trace.h
++++ b/net/wireless/trace.h
+@@ -1294,10 +1294,7 @@ TRACE_EVENT(rdev_disassoc,
+ 	TP_fast_assign(
+ 		WIPHY_ASSIGN;
+ 		NETDEV_ASSIGN;
+-		if (req->bss)
+-			MAC_ASSIGN(bssid, req->bss->bssid);
+-		else
+-			eth_zero_addr(__entry->bssid);
++		MAC_ASSIGN(bssid, req->ap_addr);
+ 		__entry->reason_code = req->reason_code;
+ 		__entry->local_state_change = req->local_state_change;
+ 	),
