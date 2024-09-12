@@ -150,6 +150,7 @@ static void ip_expire(struct timer_list *t)
 	if (qp->q.flags & INET_FRAG_COMPLETE)
 		goto out;
 
+	qp->q.flags |= INET_FRAG_DROP;
 	ipq_kill(qp);
 	__IP_INC_STATS(net, IPSTATS_MIB_REASMFAILS);
 	__IP_INC_STATS(net, IPSTATS_MIB_REASMTIMEOUT);
@@ -191,7 +192,7 @@ out:
 	spin_unlock(&qp->q.lock);
 out_rcu_unlock:
 	rcu_read_unlock();
-	kfree_skb(head);
+	kfree_skb_reason(head, SKB_DROP_REASON_FRAG_REASM_TIMEOUT);
 	ipq_put(qp);
 }
 
@@ -255,7 +256,8 @@ static int ip_frag_reinit(struct ipq *qp)
 		return -ETIMEDOUT;
 	}
 
-	sum_truesize = inet_frag_rbtree_purge(&qp->q.rb_fragments);
+	sum_truesize = inet_frag_rbtree_purge(&qp->q.rb_fragments,
+					      SKB_DROP_REASON_FRAG_TOO_FAR);
 	sub_frag_mem_limit(qp->q.net, sum_truesize);
 
 	qp->q.flags = 0;

@@ -322,7 +322,8 @@ struct mlx5e_params {
 		u8 num_tc;
 		struct netdev_tc_txq tc_to_txq[TC_MAX_QUEUE];
 		struct {
-			struct mlx5e_mqprio_rl *rl;
+			u64 max_rate[TC_MAX_QUEUE];
+			u32 hw_id[TC_MAX_QUEUE];
 		} channel;
 	} mqprio;
 	bool rx_cqe_compress_def;
@@ -355,7 +356,6 @@ enum {
 	MLX5E_RQ_STATE_AM,
 	MLX5E_RQ_STATE_NO_CSUM_COMPLETE,
 	MLX5E_RQ_STATE_CSUM_FULL, /* cqe_csum_full hw bit is set */
-	MLX5E_RQ_STATE_FPGA_TLS, /* FPGA TLS enabled */
 	MLX5E_RQ_STATE_MINI_CQE_HW_STRIDX, /* set when mini_cqe_resp_stride_index cap is used */
 	MLX5E_RQ_STATE_SHAMPO, /* set when SHAMPO cap is used */
 };
@@ -921,7 +921,7 @@ struct mlx5e_priv {
 	struct mlx5e_rx_res       *rx_res;
 	u32                       *tx_rates;
 
-	struct mlx5e_flow_steering fs;
+	struct mlx5e_flow_steering *fs;
 
 	struct workqueue_struct    *wq;
 	struct work_struct         update_carrier_work;
@@ -1024,7 +1024,6 @@ void mlx5e_shampo_dealloc_hd(struct mlx5e_rq *rq, u16 len, u16 start, bool close
 void mlx5e_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats);
 void mlx5e_fold_sw_stats64(struct mlx5e_priv *priv, struct rtnl_link_stats64 *s);
 
-void mlx5e_init_l2_addr(struct mlx5e_priv *priv);
 int mlx5e_self_test_num(struct mlx5e_priv *priv);
 int mlx5e_self_test_fill_strings(struct mlx5e_priv *priv, u8 *data);
 void mlx5e_self_test(struct net_device *ndev, struct ethtool_test *etest,

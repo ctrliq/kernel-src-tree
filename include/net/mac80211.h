@@ -18,6 +18,7 @@
 #include <linux/if_ether.h>
 #include <linux/skbuff.h>
 #include <linux/ieee80211.h>
+#include <linux/lockdep.h>
 #include <net/cfg80211.h>
 #include <net/codel.h>
 #include <net/ieee80211_radiotap.h>
@@ -1799,6 +1800,9 @@ struct ieee80211_vif_cfg {
  * @link_conf: in case of MLD, the per-link BSS configuration,
  *	indexed by link ID
  * @valid_links: bitmap of valid links, or 0 for non-MLO.
+ * @active_links: The bitmap of active links, or 0 for non-MLO.
+ *	The driver shouldn't change this directly, but use the
+ *	API calls meant for that purpose.
  * @addr: address of this interface
  * @p2p: indicates whether this AP or STA interface is a p2p
  *	interface, i.e. a GO or p2p-sta respectively
@@ -1834,7 +1838,7 @@ struct ieee80211_vif {
 	struct ieee80211_vif_cfg cfg;
 	struct ieee80211_bss_conf bss_conf;
 	struct ieee80211_bss_conf __rcu *link_conf[IEEE80211_MLD_MAX_NUM_LINKS];
-	u16 valid_links;
+	u16 valid_links, active_links;
 	u8 addr[ETH_ALEN] __aligned(2);
 	bool p2p;
 
@@ -1861,12 +1865,11 @@ struct ieee80211_vif {
 	u8 drv_priv[] __aligned(sizeof(void *));
 };
 
-/* FIXME: for now loop over all the available links; later will be changed
- * to loop only over the active links.
- */
-#define for_each_vif_active_link(vif, link, link_id)			     \
-	for (link_id = 0; link_id < ARRAY_SIZE((vif)->link_conf); link_id++) \
-		if ((link = rcu_dereference((vif)->link_conf[link_id])))
+#define for_each_vif_active_link(vif, link, link_id)				\
+	for (link_id = 0; link_id < ARRAY_SIZE((vif)->link_conf); link_id++)	\
+		if ((!(vif)->active_links ||					\
+		     (vif)->active_links & BIT(link_id)) &&			\
+		    (link = rcu_dereference((vif)->link_conf[link_id])))
 
 static inline bool ieee80211_vif_is_mesh(struct ieee80211_vif *vif)
 {
@@ -1898,6 +1901,19 @@ struct ieee80211_vif *wdev_to_ieee80211_vif(struct wireless_dev *wdev);
  * This can also be useful to get the netdev associated to a vif.
  */
 struct wireless_dev *ieee80211_vif_to_wdev(struct ieee80211_vif *vif);
+
+/**
+ * lockdep_vif_mutex_held - for lockdep checks on link poiners
+ * @vif: the interface to check
+ */
+static inline bool lockdep_vif_mutex_held(struct ieee80211_vif *vif)
+{
+	return lockdep_is_held(&ieee80211_vif_to_wdev(vif)->mtx);
+}
+
+#define link_conf_dereference_protected(vif, link_id)		\
+	rcu_dereference_protected((vif)->link_conf[link_id],	\
+				  lockdep_vif_mutex_held(vif))
 
 /**
  * enum ieee80211_key_flags - key flags
@@ -1980,6 +1996,7 @@ enum ieee80211_key_flags {
  * 	- Temporal Authenticator Rx MIC Key (64 bits)
  * @icv_len: The ICV length for this key type
  * @iv_len: The IV length for this key type
+ * @link_id: the link ID for MLO, or -1 for non-MLO or pairwise keys
  */
 struct ieee80211_key_conf {
 	atomic64_t tx_pn;
@@ -1989,6 +2006,7 @@ struct ieee80211_key_conf {
 	u8 hw_key_idx;
 	s8 keyidx;
 	u16 flags;
+	s8 link_id;
 	u8 keylen;
 	u8 key[];
 };
@@ -2126,6 +2144,34 @@ struct ieee80211_sta_txpwr {
 };
 
 /**
+ * struct ieee80211_sta_aggregates - info that is aggregated from active links
+ *
+ * Used for any per-link data that needs to be aggregated and updated in the
+ * main &struct ieee80211_sta when updated or the active links change.
+ *
+ * @max_amsdu_len: indicates the maximal length of an A-MSDU in bytes.
+ *	This field is always valid for packets with a VHT preamble.
+ *	For packets with a HT preamble, additional limits apply:
+ *
+ *	* If the skb is transmitted as part of a BA agreement, the
+ *	  A-MSDU maximal size is min(max_amsdu_len, 4065) bytes.
+ *	* If the skb is not part of a BA agreement, the A-MSDU maximal
+ *	  size is min(max_amsdu_len, 7935) bytes.
+ *
+ * Both additional HT limits must be enforced by the low level
+ * driver. This is defined by the spec (IEEE 802.11-2012 section
+ * 8.3.2.2 NOTE 2).
+ * @max_rc_amsdu_len: Maximum A-MSDU size in bytes recommended by rate control.
+ * @max_tid_amsdu_len: Maximum A-MSDU size in bytes for this TID
+ */
+struct ieee80211_sta_aggregates {
+	u16 max_amsdu_len;
+
+	u16 max_rc_amsdu_len;
+	u16 max_tid_amsdu_len[IEEE80211_NUM_TIDS];
+};
+
+/**
  * struct ieee80211_link_sta - station Link specific info
  * All link specific info for a STA link for a non MLD STA(single)
  * or a MLD STA(multiple entries) are stored here.
@@ -2160,6 +2206,8 @@ struct ieee80211_link_sta {
 	struct ieee80211_sta_he_cap he_cap;
 	struct ieee80211_he_6ghz_capa he_6ghz_capa;
 	struct ieee80211_sta_eht_cap eht_cap;
+
+	struct ieee80211_sta_aggregates agg;
 
 	u8 rx_nss;
 	enum ieee80211_sta_rx_bandwidth bandwidth;
@@ -2200,9 +2248,10 @@ struct ieee80211_link_sta {
  * @max_amsdu_subframes: indicates the maximal number of MSDUs in a single
  *	A-MSDU. Taken from the Extended Capabilities element. 0 means
  *	unlimited.
+ * @cur: currently valid data as aggregated from the active links
+ *	For non MLO STA it will point to the deflink data. For MLO STA
+ *	ieee80211_sta_recalc_aggregates() must be called to update it.
  * @support_p2p_ps: indicates whether the STA supports P2P PS mechanism or not.
- * @max_rc_amsdu_len: Maximum A-MSDU size in bytes recommended by rate control.
- * @max_tid_amsdu_len: Maximum A-MSDU size in bytes for this TID
  * @txq: per-TID data TX queues (if driver uses the TXQ abstraction); note that
  *	the last entry (%IEEE80211_NUM_TIDS) is used for non-data frames
  * @deflink: This holds the default link STA information, for non MLO STA all link
@@ -2232,25 +2281,9 @@ struct ieee80211_sta {
 	bool mlo;
 	u8 max_amsdu_subframes;
 
-	/**
-	 * @max_amsdu_len:
-	 * indicates the maximal length of an A-MSDU in bytes.
-	 * This field is always valid for packets with a VHT preamble.
-	 * For packets with a HT preamble, additional limits apply:
-	 *
-	 * * If the skb is transmitted as part of a BA agreement, the
-	 *   A-MSDU maximal size is min(max_amsdu_len, 4065) bytes.
-	 * * If the skb is not part of a BA aggreement, the A-MSDU maximal
-	 *   size is min(max_amsdu_len, 7935) bytes.
-	 *
-	 * Both additional HT limits must be enforced by the low level
-	 * driver. This is defined by the spec (IEEE 802.11-2012 section
-	 * 8.3.2.2 NOTE 2).
-	 */
-	u16 max_amsdu_len;
+	struct ieee80211_sta_aggregates *cur;
+
 	bool support_p2p_ps;
-	u16 max_rc_amsdu_len;
-	u16 max_tid_amsdu_len[IEEE80211_NUM_TIDS];
 
 	struct ieee80211_txq *txq[IEEE80211_NUM_TIDS + 1];
 
@@ -2262,13 +2295,24 @@ struct ieee80211_sta {
 	u8 drv_priv[] __aligned(sizeof(void *));
 };
 
-/* FIXME: need to loop only over links which are active and check the actual
- * lock
- */
-#define for_each_sta_active_link(sta, link_sta, link_id)		         \
-	for (link_id = 0; link_id < ARRAY_SIZE((sta)->link); link_id++)	         \
-		if (((link_sta) = rcu_dereference_protected((sta)->link[link_id],\
-							    1)))	         \
+#ifdef CONFIG_LOCKDEP
+bool lockdep_sta_mutex_held(struct ieee80211_sta *pubsta);
+#else
+static inline bool lockdep_sta_mutex_held(struct ieee80211_sta *pubsta)
+{
+	return true;
+}
+#endif
+
+#define link_sta_dereference_protected(sta, link_id)		\
+	rcu_dereference_protected((sta)->link[link_id],		\
+				  lockdep_sta_mutex_held(sta))
+
+#define for_each_sta_active_link(vif, sta, link_sta, link_id)			\
+	for (link_id = 0; link_id < ARRAY_SIZE((sta)->link); link_id++)		\
+		if ((!(vif)->active_links ||					\
+		     (vif)->active_links & BIT(link_id)) &&			\
+		    ((link_sta) = link_sta_dereference_protected(sta, link_id)))
 
 /**
  * enum sta_notify_cmd - sta notify command
@@ -6049,6 +6093,19 @@ void ieee80211_sta_eosp(struct ieee80211_sta *pubsta);
 void ieee80211_send_eosp_nullfunc(struct ieee80211_sta *pubsta, int tid);
 
 /**
+ * ieee80211_sta_recalc_aggregates - recalculate aggregate data after a change
+ * @pubsta: the station
+ *
+ * Call this function after changing a per-link aggregate data as referenced in
+ * &struct ieee80211_sta_aggregates by accessing the agg field of
+ * &struct ieee80211_link_sta.
+ *
+ * With non MLO the data in deflink will be referenced directly. In that case
+ * there is no need to call this function.
+ */
+void ieee80211_sta_recalc_aggregates(struct ieee80211_sta *pubsta);
+
+/**
  * ieee80211_sta_register_airtime - register airtime usage for a sta/tid
  *
  * Register airtime usage for a given sta on a given tid. The driver must call
@@ -7098,5 +7155,46 @@ static inline bool ieee80211_is_tx_data(struct sk_buff *skb)
 	return info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP ||
 	       ieee80211_is_data(hdr->frame_control);
 }
+
+/**
+ * ieee80211_set_active_links - set active links in client mode
+ * @vif: interface to set active links on
+ * @active_links: the new active links bitmap
+ *
+ * This changes the active links on an interface. The interface
+ * must be in client mode (in AP mode, all links are always active),
+ * and @active_links must be a subset of the vif's valid_links.
+ *
+ * If a link is switched off and another is switched on at the same
+ * time (e.g. active_links going from 0x1 to 0x10) then you will get
+ * a sequence of calls like
+ *  - change_vif_links(0x11)
+ *  - unassign_vif_chanctx(link_id=0)
+ *  - change_sta_links(0x11) for each affected STA (the AP)
+ *    (TDLS connections on now inactive links should be torn down)
+ *  - remove group keys on the old link (link_id 0)
+ *  - add new group keys (GTK/IGTK/BIGTK) on the new link (link_id 4)
+ *  - change_sta_links(0x10) for each affected STA (the AP)
+ *  - assign_vif_chanctx(link_id=4)
+ *  - change_vif_links(0x10)
+ *
+ * Note: This function acquires some mac80211 locks and must not
+ *	 be called with any driver locks held that could cause a
+ *	 lock dependency inversion. Best call it without locks.
+ */
+int ieee80211_set_active_links(struct ieee80211_vif *vif, u16 active_links);
+
+/**
+ * ieee80211_set_active_links_async - asynchronously set active links
+ * @vif: interface to set active links on
+ * @active_links: the new active links bitmap
+ *
+ * See ieee80211_set_active_links() for more information, the only
+ * difference here is that the link change is triggered async and
+ * can be called in any context, but the link switch will only be
+ * completed after it returns.
+ */
+void ieee80211_set_active_links_async(struct ieee80211_vif *vif,
+				      u16 active_links);
 
 #endif /* MAC80211_H */

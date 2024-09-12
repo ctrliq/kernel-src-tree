@@ -6783,6 +6783,19 @@ void netif_napi_add_weight(struct net_device *dev, struct napi_struct *napi,
 }
 EXPORT_SYMBOL(netif_napi_add_weight);
 
+/* netif_napi_add has changed its API, dropping its weight parameter, but the
+ * previous version needs to be preserved in RHEL 8 because it was a kABI
+ * protected symbol. Preserve the symbol here so old drivers can still link it,
+ * but make newer users to use the new version, defined as macro in netdevice.h
+ */
+#undef netif_napi_add
+void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
+		    int (*poll)(struct napi_struct *, int), int weight)
+{
+	netif_napi_add_weight(dev, napi, poll, weight);
+}
+EXPORT_SYMBOL(netif_napi_add);
+
 void napi_disable(struct napi_struct *n)
 {
 	might_sleep();

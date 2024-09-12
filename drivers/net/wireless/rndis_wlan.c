@@ -501,14 +501,16 @@ static int rndis_join_ibss(struct wiphy *wiphy, struct net_device *dev,
 static int rndis_leave_ibss(struct wiphy *wiphy, struct net_device *dev);
 
 static int rndis_add_key(struct wiphy *wiphy, struct net_device *netdev,
-			 u8 key_index, bool pairwise, const u8 *mac_addr,
-			 struct key_params *params);
+			 int link_id,  u8 key_index, bool pairwise,
+			 const u8 *mac_addr, struct key_params *params);
 
 static int rndis_del_key(struct wiphy *wiphy, struct net_device *netdev,
-			 u8 key_index, bool pairwise, const u8 *mac_addr);
+			 int link_id, u8 key_index, bool pairwise,
+			 const u8 *mac_addr);
 
 static int rndis_set_default_key(struct wiphy *wiphy, struct net_device *netdev,
-				 u8 key_index, bool unicast, bool multicast);
+				 int link_id, u8 key_index, bool unicast,
+				 bool multicast);
 
 static int rndis_get_station(struct wiphy *wiphy, struct net_device *dev,
 			     const u8 *mac, struct station_info *sinfo);
@@ -2392,8 +2394,8 @@ static int rndis_leave_ibss(struct wiphy *wiphy, struct net_device *dev)
 }
 
 static int rndis_add_key(struct wiphy *wiphy, struct net_device *netdev,
-			 u8 key_index, bool pairwise, const u8 *mac_addr,
-			 struct key_params *params)
+			 int link_id,  u8 key_index, bool pairwise,
+			 const u8 *mac_addr, struct key_params *params)
 {
 	struct rndis_wlan_private *priv = wiphy_priv(wiphy);
 	struct usbnet *usbdev = priv->usbdev;
@@ -2428,7 +2430,8 @@ static int rndis_add_key(struct wiphy *wiphy, struct net_device *netdev,
 }
 
 static int rndis_del_key(struct wiphy *wiphy, struct net_device *netdev,
-			 u8 key_index, bool pairwise, const u8 *mac_addr)
+			 int link_id, u8 key_index, bool pairwise,
+			 const u8 *mac_addr)
 {
 	struct rndis_wlan_private *priv = wiphy_priv(wiphy);
 	struct usbnet *usbdev = priv->usbdev;
@@ -2439,7 +2442,8 @@ static int rndis_del_key(struct wiphy *wiphy, struct net_device *netdev,
 }
 
 static int rndis_set_default_key(struct wiphy *wiphy, struct net_device *netdev,
-				 u8 key_index, bool unicast, bool multicast)
+				 int link_id, u8 key_index, bool unicast,
+				 bool multicast)
 {
 	struct rndis_wlan_private *priv = wiphy_priv(wiphy);
 	struct usbnet *usbdev = priv->usbdev;

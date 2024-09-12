@@ -371,7 +371,7 @@ static void *generate_lfp_data_ptrs(struct drm_i915_private *i915,
 	 * include block 41 and thus we don't need to
 	 * generate one.
 	 */
-	if (i915->display.vbt.version < 155)
+	if (i915->vbt.version < 155)
 		return NULL;
 
 	fp_timing_size = 38;

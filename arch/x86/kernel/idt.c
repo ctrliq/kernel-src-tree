@@ -35,12 +35,16 @@
 #define SYSG(_vector, _addr)				\
 	G(_vector, _addr, DEFAULT_STACK, GATE_INTERRUPT, DPL3, __KERNEL_CS)
 
+#ifdef CONFIG_X86_64
 /*
  * Interrupt gate with interrupt stack. The _ist index is the index in
  * the tss.ist[] array, but for the descriptor it needs to start at 1.
  */
 #define ISTG(_vector, _addr, _ist)			\
 	G(_vector, _addr, _ist + 1, GATE_INTERRUPT, DPL0, __KERNEL_CS)
+#else
+#define ISTG(_vector, _addr, _ist)	INTG(_vector, _addr)
+#endif
 
 /* Task gate */
 #define TSKG(_vector, _gdt)				\
@@ -59,6 +63,9 @@ static const __initconst struct idt_data early_idts[] = {
 #ifdef CONFIG_X86_32
 	INTG(X86_TRAP_PF,		page_fault),
 #endif
+#ifdef CONFIG_INTEL_TDX_GUEST
+	INTG(X86_TRAP_VE,		virtualization_exception),
+#endif
 };
 
 /*
@@ -69,7 +76,7 @@ static const __initconst struct idt_data early_idts[] = {
  */
 static const __initconst struct idt_data def_idts[] = {
 	INTG(X86_TRAP_DE,		divide_error),
-	INTG(X86_TRAP_NMI,		nmi),
+	ISTG(X86_TRAP_NMI,		nmi, IST_INDEX_NMI),
 	INTG(X86_TRAP_BR,		bounds),
 	INTG(X86_TRAP_UD,		invalid_op),
 	INTG(X86_TRAP_NM,		device_not_available),
@@ -86,12 +93,16 @@ static const __initconst struct idt_data def_idts[] = {
 #ifdef CONFIG_X86_32
 	TSKG(X86_TRAP_DF,		GDT_ENTRY_DOUBLEFAULT_TSS),
 #else
-	INTG(X86_TRAP_DF,		double_fault),
+	ISTG(X86_TRAP_DF,		double_fault, IST_INDEX_DF),
 #endif
-	INTG(X86_TRAP_DB,		debug),
+	ISTG(X86_TRAP_DB,		debug, IST_INDEX_DB),
 
 #ifdef CONFIG_X86_MCE
-	INTG(X86_TRAP_MC,		&machine_check),
+	ISTG(X86_TRAP_MC,		&machine_check, IST_INDEX_MCE),
+#endif
+
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	ISTG(X86_TRAP_VC,		vmm_communication, IST_INDEX_VC),
 #endif
 
 	SYSG(X86_TRAP_OF,		overflow),
@@ -173,22 +184,6 @@ struct desc_ptr idt_descr __ro_after_init = {
 gate_desc debug_idt_table[IDT_ENTRIES] __page_aligned_bss;
 
 /*
- * The exceptions which use Interrupt stacks. They are setup after
- * cpu_init() when the TSS has been initialized.
- */
-static const __initconst struct idt_data ist_idts[] = {
-	ISTG(X86_TRAP_DB,	debug,		IST_INDEX_DB),
-	ISTG(X86_TRAP_NMI,	nmi,		IST_INDEX_NMI),
-	ISTG(X86_TRAP_DF,	double_fault,	IST_INDEX_DF),
-#ifdef CONFIG_X86_MCE
-	ISTG(X86_TRAP_MC,	&machine_check,	IST_INDEX_MCE),
-#endif
-#ifdef CONFIG_AMD_MEM_ENCRYPT
-	ISTG(X86_TRAP_VC,	vmm_communication, IST_INDEX_VC),
-#endif
-};
-
-/*
  * Override for the debug_idt. Same as the default, but with interrupt
  * stack set to DEFAULT_STACK (0). Required for NMI trap handling.
  */
@@ -257,14 +252,6 @@ void __init idt_setup_early_pf(void)
 {
 	idt_setup_from_table(idt_table, early_pf_idts,
 			     ARRAY_SIZE(early_pf_idts), true);
-}
-
-/**
- * idt_setup_ist_traps - Initialize the idt table with traps using IST
- */
-void __init idt_setup_ist_traps(void)
-{
-	idt_setup_from_table(idt_table, ist_idts, ARRAY_SIZE(ist_idts), true);
 }
 
 /**

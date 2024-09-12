@@ -63,7 +63,6 @@ enum memcg_memory_event {
 enum percpu_stats_state {
 	MEMCG_PERCPU_STATS_ACTIVE = 0,
 	MEMCG_PERCPU_STATS_DISABLED,
-	MEMCG_PERCPU_VMSTATS_FLUSHED,
 	MEMCG_PERCPU_STATS_FLUSHED,
 	MEMCG_PERCPU_STATS_FREED
 };
@@ -77,6 +76,10 @@ struct mem_cgroup_reclaim_cookie {
 
 #define MEM_CGROUP_ID_SHIFT	16
 #define MEM_CGROUP_ID_MAX	USHRT_MAX
+
+#ifdef __GENKSYMS__
+#define mem_cgroup_per_node	__mem_cgroup_per_node
+#endif
 
 struct mem_cgroup_id {
 	int id;
@@ -109,10 +112,6 @@ struct lruvec_stat {
 	long count[NR_VM_NODE_STAT_ITEMS];
 };
 
-struct batched_lruvec_stat {
-	s32 count[NR_VM_NODE_STAT_ITEMS];
-};
-
 /*
  * Bitmap and deferred work of shrinker::id corresponding to memcg-aware
  * shrinkers, which have elements charged to this memcg.
@@ -123,45 +122,47 @@ struct shrinker_info {
 	unsigned long *map;
 };
 
+struct lruvec_stats_percpu {
+	/* Local (CPU and cgroup) state */
+	long state[NR_VM_NODE_STAT_ITEMS];
+
+	/* Delta calculation for lockless upward propagation */
+	long state_prev[NR_VM_NODE_STAT_ITEMS];
+};
+
+struct lruvec_stats {
+	/* Aggregated (CPU and subtree) state */
+	long state[NR_VM_NODE_STAT_ITEMS];
+
+	/* Pending child counts during tree propagation */
+	long state_pending[NR_VM_NODE_STAT_ITEMS];
+};
+
 /*
  * per-node information in memory controller.
  */
 struct mem_cgroup_per_node {
 	struct lruvec		lruvec;
 
-	/* Subtree VM stats (batched updates) */
-	RH_KABI_REPLACE(struct lruvec_stat __percpu *lruvec_stat_cpu,
-			struct batched_lruvec_stat __percpu *lruvec_stat_cpu)
-	atomic_long_t		lruvec_stat[NR_VM_NODE_STAT_ITEMS];
+	struct lruvec_stats_percpu __percpu	*lruvec_stats_percpu;
+	struct lruvec_stats			lruvec_stats;
 
 	unsigned long		lru_zone_size[MAX_NR_ZONES][NR_LRU_LISTS];
 
-	RH_KABI_REPLACE_SPLIT(struct mem_cgroup_reclaim_iter iter[DEF_PRIORITY + 1],
-			      struct mem_cgroup_reclaim_iter iter,
-	/*
-	 * Legacy local VM stats. This should be struct lruvec_stat and
-	 * cannot be optimized to struct batched_lruvec_stat. Because
-	 * the threshold of the lruvec_stat_cpu can be as big as
-	 * MEMCG_CHARGE_BATCH * PAGE_SIZE. It can fit into s32. But this
-	 * filed has no upper limit.
-	 */
-			      struct lruvec_stat __percpu *lruvec_stat_local)
+	struct mem_cgroup_reclaim_iter	iter;
+
+	struct shrinker_info __rcu	*shrinker_info;
 
 	struct rb_node		tree_node;	/* RB tree node */
 	unsigned long		usage_in_excess;/* Set to the value by which */
 						/* the soft limit is exceeded*/
 	bool			on_tree;
-	RH_KABI_DEPRECATE(bool,	congested)
-	RH_KABI_FILL_HOLE(unsigned short nid)
-
+	unsigned short		nid;
 	struct mem_cgroup	*memcg;		/* Back pointer, we cannot */
 						/* use container_of	   */
-	/*
-	 * RHEL8: The mem_cgroup_per_node is dynamically allocated at
-	 * boot time and so is perfectly fine to be extended in size.
-	 */
-	RH_KABI_EXTEND(struct shrinker_info __rcu	*shrinker_info)
 };
+
+#undef mem_cgroup_per_node
 
 struct mem_cgroup_threshold {
 	struct eventfd_ctx *eventfd;
@@ -997,7 +998,7 @@ static inline unsigned long lruvec_page_state(struct lruvec *lruvec,
 		return node_page_state(lruvec_pgdat(lruvec), idx);
 
 	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
-	x = atomic_long_read(&pn->lruvec_stat[idx]);
+	x = READ_ONCE(pn->lruvec_stats.state[idx]);
 #ifdef CONFIG_SMP
 	if (x < 0)
 		x = 0;
@@ -1020,13 +1021,16 @@ static inline unsigned long lruvec_page_state_local(struct lruvec *lruvec,
 		return 0;
 
 	for_each_possible_cpu(cpu)
-		x += per_cpu(pn->lruvec_stat_local->count[idx], cpu);
+		x += per_cpu(pn->lruvec_stats_percpu->state[idx], cpu);
 #ifdef CONFIG_SMP
 	if (x < 0)
 		x = 0;
 #endif
 	return x;
 }
+
+void mem_cgroup_flush_stats(void);
+void mem_cgroup_flush_stats_delayed(void);
 
 void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
 			      int val);
@@ -1436,6 +1440,14 @@ static inline unsigned long lruvec_page_state_local(struct lruvec *lruvec,
 						    enum node_stat_item idx)
 {
 	return node_page_state(lruvec_pgdat(lruvec), idx);
+}
+
+static inline void mem_cgroup_flush_stats(void)
+{
+}
+
+static inline void mem_cgroup_flush_stats_delayed(void)
+{
 }
 
 static inline void __mod_memcg_lruvec_state(struct lruvec *lruvec,

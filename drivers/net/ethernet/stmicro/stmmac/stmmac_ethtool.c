@@ -279,6 +279,18 @@ static const struct stmmac_stats stmmac_mmc[] = {
 };
 #define STMMAC_MMC_STATS_LEN ARRAY_SIZE(stmmac_mmc)
 
+static const char stmmac_qstats_tx_string[][ETH_GSTRING_LEN] = {
+	"tx_pkt_n",
+	"tx_irq_n",
+#define STMMAC_TXQ_STATS ARRAY_SIZE(stmmac_qstats_tx_string)
+};
+
+static const char stmmac_qstats_rx_string[][ETH_GSTRING_LEN] = {
+	"rx_pkt_n",
+	"rx_irq_n",
+#define STMMAC_RXQ_STATS ARRAY_SIZE(stmmac_qstats_rx_string)
+};
+
 static void stmmac_ethtool_getdrvinfo(struct net_device *dev,
 				      struct ethtool_drvinfo *info)
 {
@@ -538,6 +550,31 @@ stmmac_set_pauseparam(struct net_device *netdev,
 	}
 }
 
+static void stmmac_get_per_qstats(struct stmmac_priv *priv, u64 *data)
+{
+	u32 tx_cnt = priv->plat->tx_queues_to_use;
+	u32 rx_cnt = priv->plat->rx_queues_to_use;
+	int q, stat;
+	char *p;
+
+	for (q = 0; q < tx_cnt; q++) {
+		p = (char *)priv + offsetof(struct stmmac_priv,
+					    xstats.txq_stats[q].tx_pkt_n);
+		for (stat = 0; stat < STMMAC_TXQ_STATS; stat++) {
+			*data++ = (*(unsigned long *)p);
+			p += sizeof(unsigned long);
+		}
+	}
+	for (q = 0; q < rx_cnt; q++) {
+		p = (char *)priv + offsetof(struct stmmac_priv,
+					    xstats.rxq_stats[q].rx_pkt_n);
+		for (stat = 0; stat < STMMAC_RXQ_STATS; stat++) {
+			*data++ = (*(unsigned long *)p);
+			p += sizeof(unsigned long);
+		}
+	}
+}
+
 static void stmmac_get_ethtool_stats(struct net_device *dev,
 				 struct ethtool_stats *dummy, u64 *data)
 {
@@ -588,16 +625,21 @@ static void stmmac_get_ethtool_stats(struct net_device *dev,
 		data[j++] = (stmmac_gstrings_stats[i].sizeof_stat ==
 			     sizeof(u64)) ? (*(u64 *)p) : (*(u32 *)p);
 	}
+	stmmac_get_per_qstats(priv, &data[j]);
 }
 
 static int stmmac_get_sset_count(struct net_device *netdev, int sset)
 {
 	struct stmmac_priv *priv = netdev_priv(netdev);
+	u32 tx_cnt = priv->plat->tx_queues_to_use;
+	u32 rx_cnt = priv->plat->rx_queues_to_use;
 	int i, len, safety_len = 0;
 
 	switch (sset) {
 	case ETH_SS_STATS:
-		len = STMMAC_STATS_LEN;
+		len = STMMAC_STATS_LEN +
+		      STMMAC_TXQ_STATS * tx_cnt +
+		      STMMAC_RXQ_STATS * rx_cnt;
 
 		if (priv->dma_cap.rmon)
 			len += STMMAC_MMC_STATS_LEN;
@@ -615,6 +657,28 @@ static int stmmac_get_sset_count(struct net_device *netdev, int sset)
 		return len;
 	default:
 		return -EOPNOTSUPP;
+	}
+}
+
+static void stmmac_get_qstats_string(struct stmmac_priv *priv, u8 *data)
+{
+	u32 tx_cnt = priv->plat->tx_queues_to_use;
+	u32 rx_cnt = priv->plat->rx_queues_to_use;
+	int q, stat;
+
+	for (q = 0; q < tx_cnt; q++) {
+		for (stat = 0; stat < STMMAC_TXQ_STATS; stat++) {
+			snprintf(data, ETH_GSTRING_LEN, "q%d_%s", q,
+				 stmmac_qstats_tx_string[stat]);
+			data += ETH_GSTRING_LEN;
+		}
+	}
+	for (q = 0; q < rx_cnt; q++) {
+		for (stat = 0; stat < STMMAC_RXQ_STATS; stat++) {
+			snprintf(data, ETH_GSTRING_LEN, "q%d_%s", q,
+				 stmmac_qstats_rx_string[stat]);
+			data += ETH_GSTRING_LEN;
+		}
 	}
 }
 
@@ -648,6 +712,7 @@ static void stmmac_get_strings(struct net_device *dev, u32 stringset, u8 *data)
 				ETH_GSTRING_LEN);
 			p += ETH_GSTRING_LEN;
 		}
+		stmmac_get_qstats_string(priv, p);
 		break;
 	default:
 		WARN_ON(1);
@@ -742,14 +807,6 @@ static int stmmac_ethtool_op_set_eee(struct net_device *dev,
 	if (priv->tx_lpi_enabled != edata->tx_lpi_enabled)
 		netdev_warn(priv->dev,
 			    "Setting EEE tx-lpi is not supported\n");
-
-	if (priv->hw->xpcs) {
-		ret = xpcs_config_eee(priv->hw->xpcs_args,
-				      priv->plat->mult_fact_100ns,
-				      edata->eee_enabled);
-		if (ret)
-			return ret;
-	}
 
 	if (!edata->eee_enabled)
 		stmmac_disable_eee_mode(priv);

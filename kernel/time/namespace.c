@@ -305,14 +305,14 @@ static int timens_install(struct nsproxy *nsproxy, struct ns_common *new)
 	return 0;
 }
 
-int timens_on_fork(struct nsproxy *nsproxy, struct task_struct *tsk)
+void timens_on_fork(struct nsproxy *nsproxy, struct task_struct *tsk)
 {
 	struct ns_common *nsc = &nsproxy->time_ns_for_children->ns;
 	struct time_namespace *ns = to_time_ns(nsc);
 
 	/* create_new_namespaces() already incremented the ref counter */
 	if (nsproxy->time_ns == nsproxy->time_ns_for_children)
-		return 0;
+		return;
 
 	timens_set_vvar_page(tsk, ns);
 
@@ -321,8 +321,6 @@ int timens_on_fork(struct nsproxy *nsproxy, struct task_struct *tsk)
 	get_time_ns(ns);
 	put_time_ns(nsproxy->time_ns);
 	nsproxy->time_ns = ns;
-
-	return 0;
 }
 
 static struct user_namespace *timens_owner(struct ns_common *ns)
