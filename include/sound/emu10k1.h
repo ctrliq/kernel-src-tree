@@ -1490,7 +1490,6 @@ enum {
 struct snd_emu10k1;
 
 struct snd_emu10k1_voice {
-	struct snd_emu10k1 *emu;
 	int number;
 	unsigned int use: 1,
 	    pcm: 1,
