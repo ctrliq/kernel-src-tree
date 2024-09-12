@@ -1,0 +1,171 @@
+ASoC: SOF: remove incorrect clearing of prepared flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+commit 8e84b6a4e7f188638748d2ac0455a94799530aa1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/8e84b6a4.failed
+
+When the system is suspended while a PCM is paused, it doesn't receive
+the SUSPEND trigger. So, the SOF driver has to ensure that the PCM and
+the widgets associated with the paused PCM are freed in the firmware
+during suspend. This is handled in the
+sof_tear_down_left_over_pipelines() call. But since the state of this
+PCM is SUSPENDED, we end up clearing the prepared flag for the PCM
+before freeing it. This results in IPC errors while freeing the widgets.
+But because the widget use_counts are reset to 0 even though the IPC
+fails, releasing the paused stream after resuming from suspend proceeds
+normally.
+
+Fix the IPC errors by removing the clearing of the prepared flag in
+sof_set_hw_params_upon_resume(). In fact, we can remove the
+sof_set_hw_params_upon_resume() and call
+snd_sof_dsp_hw_params_upon_resume() directly. This will ensure that the
+PCM is freed in the firmware before the IPC's for freeing the widgets
+are sent.
+
+BugLink: https://github.com/thesofproject/linux/issues/3543
+	Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+	Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+	Signed-off-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+	Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Link: https://lore.kernel.org/r/20220421203201.1550328-2-pierre-louis.bossart@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 8e84b6a4e7f188638748d2ac0455a94799530aa1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/sof-audio.c
+#	sound/soc/sof/sof-audio.h
+diff --cc sound/soc/sof/sof-audio.c
+index 32b0a6fa550f,7ecc84f9872b..000000000000
+--- a/sound/soc/sof/sof-audio.c
++++ b/sound/soc/sof/sof-audio.c
+@@@ -572,84 -413,15 +572,89 @@@ bool snd_sof_stream_suspend_ignored(str
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +int sof_set_hw_params_upon_resume(struct device *dev)
+ +{
+ +	struct snd_sof_dev *sdev = dev_get_drvdata(dev);
+ +	struct snd_pcm_substream *substream;
+ +	struct snd_sof_pcm *spcm;
+ +	snd_pcm_state_t state;
+ +	int dir;
+ +
+ +	/*
+ +	 * SOF requires hw_params to be set-up internally upon resume.
+ +	 * So, set the flag to indicate this for those streams that
+ +	 * have been suspended.
+ +	 */
+ +	list_for_each_entry(spcm, &sdev->pcm_list, list) {
+ +		for_each_pcm_streams(dir) {
+ +			/*
+ +			 * do not reset hw_params upon resume for streams that
+ +			 * were kept running during suspend
+ +			 */
+ +			if (spcm->stream[dir].suspend_ignored)
+ +				continue;
+ +
+ +			substream = spcm->stream[dir].substream;
+ +			if (!substream || !substream->runtime)
+ +				continue;
+ +
+ +			state = substream->runtime->status->state;
+ +			if (state == SNDRV_PCM_STATE_SUSPENDED)
+ +				spcm->prepared[dir] = false;
+ +		}
+ +	}
+ +
+ +	/* set internal flag for BE */
+ +	return snd_sof_dsp_hw_params_upon_resume(sdev);
+ +}
+ +
+ +int sof_set_up_pipelines(struct snd_sof_dev *sdev, bool verify)
+++=======
++ int sof_pcm_stream_free(struct snd_sof_dev *sdev, struct snd_pcm_substream *substream,
++ 			struct snd_sof_pcm *spcm, int dir, bool free_widget_list)
+++>>>>>>> 8e84b6a4e7f1 (ASoC: SOF: remove incorrect clearing of prepared flag)
+  {
+ -	const struct sof_ipc_pcm_ops *pcm_ops = sdev->ipc->ops->pcm;
+ +	struct sof_ipc_fw_version *v = &sdev->fw_ready.version;
+ +	struct snd_sof_widget *swidget;
+ +	struct snd_sof_route *sroute;
+  	int ret;
+  
+ -	/* Send PCM_FREE IPC to reset pipeline */
+ -	if (pcm_ops->hw_free && spcm->prepared[substream->stream]) {
+ -		ret = pcm_ops->hw_free(sdev->component, substream);
+ +	/* restore pipeline components */
+ +	list_for_each_entry(swidget, &sdev->widget_list, list) {
+ +		/* only set up the widgets belonging to static pipelines */
+ +		if (!verify && swidget->dynamic_pipeline_widget)
+ +			continue;
+ +
+ +		/*
+ +		 * For older firmware, skip scheduler widgets in this loop,
+ +		 * sof_widget_setup() will be called in the 'complete pipeline' loop
+ +		 */
+ +		if (v->abi_version < SOF_ABI_VER(3, 19, 0) &&
+ +		    swidget->id == snd_soc_dapm_scheduler)
+ +			continue;
+ +
+ +		/* update DAI config. The IPC will be sent in sof_widget_setup() */
+ +		if (WIDGET_IS_DAI(swidget->id)) {
+ +			struct snd_sof_dai *dai = swidget->private;
+ +			struct sof_dai_private_data *private = dai->private;
+ +			struct sof_ipc_dai_config *config;
+ +
+ +			if (!dai || !private || !private->dai_config)
+ +				continue;
+ +
+ +			config = private->dai_config;
+ +			/*
+ +			 * The link DMA channel would be invalidated for running
+ +			 * streams but not for streams that were in the PAUSED
+ +			 * state during suspend. So invalidate it here before setting
+ +			 * the dai config in the DSP.
+ +			 */
+ +			if (config->type == SOF_DAI_INTEL_HDA)
+ +				config->hda.link_dma_ch = DMA_CHAN_INVALID;
+ +		}
+ +
+ +		ret = sof_widget_setup(sdev, swidget);
+  		if (ret < 0)
+  			return ret;
+  	}
+diff --cc sound/soc/sof/sof-audio.h
+index 8fa422446727,f36c4f62bc99..000000000000
+--- a/sound/soc/sof/sof-audio.h
++++ b/sound/soc/sof/sof-audio.h
+@@@ -382,9 -434,6 +382,12 @@@ int snd_sof_ipc_set_get_comp_data(struc
+  int sof_pcm_dai_link_fixup(struct snd_soc_pcm_runtime *rtd, struct snd_pcm_hw_params *params);
+  
+  /* PM */
+++<<<<<<< HEAD
+ +int sof_set_up_pipelines(struct snd_sof_dev *sdev, bool verify);
+ +int sof_tear_down_pipelines(struct snd_sof_dev *sdev, bool verify);
+ +int sof_set_hw_params_upon_resume(struct device *dev);
+++=======
+++>>>>>>> 8e84b6a4e7f1 (ASoC: SOF: remove incorrect clearing of prepared flag)
+  bool snd_sof_stream_suspend_ignored(struct snd_sof_dev *sdev);
+  bool snd_sof_dsp_only_d0i3_compatible_stream_active(struct snd_sof_dev *sdev);
+  
+diff --git a/sound/soc/sof/pm.c b/sound/soc/sof/pm.c
+index 1e40cb6e8b58..0189619352ea 100644
+--- a/sound/soc/sof/pm.c
++++ b/sound/soc/sof/pm.c
+@@ -195,7 +195,7 @@ static int sof_suspend(struct device *dev, bool runtime_suspend)
+ 
+ 	/* prepare for streams to be resumed properly upon resume */
+ 	if (!runtime_suspend) {
+-		ret = sof_set_hw_params_upon_resume(sdev->dev);
++		ret = snd_sof_dsp_hw_params_upon_resume(sdev);
+ 		if (ret < 0) {
+ 			dev_err(sdev->dev,
+ 				"error: setting hw_params flag during suspend %d\n",
+* Unmerged path sound/soc/sof/sof-audio.c
+* Unmerged path sound/soc/sof/sof-audio.h
