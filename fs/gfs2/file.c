@@ -1062,8 +1062,7 @@ out_unlock:
 		gfs2_glock_dq(gh);
 out_uninit:
 	gfs2_holder_uninit(gh);
-	if (statfs_gh)
-		kfree(statfs_gh);
+	kfree(statfs_gh);
 	from->count = orig_count - written;
 	return written ? written : ret;
 }
