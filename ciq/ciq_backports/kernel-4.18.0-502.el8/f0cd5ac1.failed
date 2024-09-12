@@ -1,0 +1,210 @@
+arm64: entry: fix NMI {user, kernel}->kernel transitions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit f0cd5ac1e4c53cb691b3ed3cda1031e1c42153e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/f0cd5ac1.failed
+
+Exceptions which can be taken at (almost) any time are consdiered to be
+NMIs. On arm64 that includes:
+
+* SDEI events
+* GICv3 Pseudo-NMIs
+* Kernel stack overflows
+* Unexpected/unhandled exceptions
+
+... but currently debug exceptions (BRKs, breakpoints, watchpoints,
+single-step) are not considered NMIs.
+
+As these can be taken at any time, kernel features (lockdep, RCU,
+ftrace) may not be in a consistent kernel state. For example, we may
+take an NMI from the idle code or partway through an entry/exit path.
+
+While nmi_enter() and nmi_exit() handle most of this state, notably they
+don't save/restore the lockdep state across an NMI being taken and
+handled. When interrupts are enabled and an NMI is taken, lockdep may
+see interrupts become disabled within the NMI code, but not see
+interrupts become enabled when returning from the NMI, leaving lockdep
+believing interrupts are disabled when they are actually disabled.
+
+The x86 code handles this in idtentry_{enter,exit}_nmi(), which will
+shortly be moved to the generic entry code. As we can't use either yet,
+we copy the x86 approach in arm64-specific helpers. All the NMI
+entrypoints are marked as noinstr to prevent any instrumentation
+handling code being invoked before the state has been corrected.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20201130115950.22492-11-mark.rutland@arm.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit f0cd5ac1e4c53cb691b3ed3cda1031e1c42153e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/exception.h
+#	arch/arm64/kernel/traps.c
+diff --cc arch/arm64/include/asm/exception.h
+index 3b6f98ffe307,0756191f44f6..000000000000
+--- a/arch/arm64/include/asm/exception.h
++++ b/arch/arm64/include/asm/exception.h
+@@@ -45,6 -34,9 +45,12 @@@ static inline u32 disr_to_esr(u64 disr
+  asmlinkage void noinstr enter_el1_irq_or_nmi(struct pt_regs *regs);
+  asmlinkage void noinstr exit_el1_irq_or_nmi(struct pt_regs *regs);
+  asmlinkage void enter_from_user_mode(void);
+++<<<<<<< HEAD
+++=======
++ asmlinkage void exit_to_user_mode(void);
++ void arm64_enter_nmi(struct pt_regs *regs);
++ void arm64_exit_nmi(struct pt_regs *regs);
+++>>>>>>> f0cd5ac1e4c5 (arm64: entry: fix NMI {user, kernel}->kernel transitions)
+  void do_mem_abort(unsigned long addr, unsigned int esr, struct pt_regs *regs);
+  void do_undefinstr(struct pt_regs *regs);
+  void do_bti(struct pt_regs *regs);
+diff --cc arch/arm64/kernel/traps.c
+index ace19f467da4,2059d8f43f55..000000000000
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@@ -45,6 -34,8 +45,11 @@@
+  #include <asm/daifflags.h>
+  #include <asm/debug-monitors.h>
+  #include <asm/esr.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/exception.h>
++ #include <asm/extable.h>
+++>>>>>>> f0cd5ac1e4c5 (arm64: entry: fix NMI {user, kernel}->kernel transitions)
+  #include <asm/insn.h>
+  #include <asm/kprobes.h>
+  #include <asm/traps.h>
+@@@ -945,36 -878,9 +954,36 @@@ asmlinkage void noinstr do_serror(struc
+  	if (!arm64_is_ras_serror(esr) || arm64_is_fatal_ras_serror(regs, esr))
+  		arm64_serror_panic(regs, esr);
+  
+- 	nmi_exit();
++ 	arm64_exit_nmi(regs);
+  }
+  
+ +asmlinkage void enter_from_user_mode(void)
+ +{
+ +	CT_WARN_ON(ct_state() != CONTEXT_USER);
+ +	user_exit_irqoff();
+ +}
+ +NOKPROBE_SYMBOL(enter_from_user_mode);
+ +
+ +void __pte_error(const char *file, int line, unsigned long val)
+ +{
+ +	pr_err("%s:%d: bad pte %016lx.\n", file, line, val);
+ +}
+ +
+ +void __pmd_error(const char *file, int line, unsigned long val)
+ +{
+ +	pr_err("%s:%d: bad pmd %016lx.\n", file, line, val);
+ +}
+ +
+ +void __pud_error(const char *file, int line, unsigned long val)
+ +{
+ +	pr_err("%s:%d: bad pud %016lx.\n", file, line, val);
+ +}
+ +
+ +void __pgd_error(const char *file, int line, unsigned long val)
+ +{
+ +	pr_err("%s:%d: bad pgd %016lx.\n", file, line, val);
+ +}
+ +
+  /* GENERIC_BUG traps */
+  
+  int is_valid_bugaddr(unsigned long addr)
+* Unmerged path arch/arm64/include/asm/exception.h
+diff --git a/arch/arm64/kernel/entry-common.c b/arch/arm64/kernel/entry-common.c
+index c764ba2d11d7..fae11451386a 100644
+--- a/arch/arm64/kernel/entry-common.c
++++ b/arch/arm64/kernel/entry-common.c
+@@ -63,10 +63,40 @@ static void noinstr exit_to_kernel_mode(struct pt_regs *regs)
+ 	}
+ }
+ 
++void noinstr arm64_enter_nmi(struct pt_regs *regs)
++{
++	regs->lockdep_hardirqs = lockdep_hardirqs_enabled();
++
++	__nmi_enter();
++	lockdep_hardirqs_off(CALLER_ADDR0);
++	lockdep_hardirq_enter();
++	rcu_nmi_enter();
++
++	trace_hardirqs_off_finish();
++	ftrace_nmi_enter();
++}
++
++void noinstr arm64_exit_nmi(struct pt_regs *regs)
++{
++	bool restore = regs->lockdep_hardirqs;
++
++	ftrace_nmi_exit();
++	if (restore) {
++		trace_hardirqs_on_prepare();
++		lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++	}
++
++	rcu_nmi_exit();
++	lockdep_hardirq_exit();
++	if (restore)
++		lockdep_hardirqs_on(CALLER_ADDR0);
++	__nmi_exit();
++}
++
+ asmlinkage void noinstr enter_el1_irq_or_nmi(struct pt_regs *regs)
+ {
+ 	if (IS_ENABLED(CONFIG_ARM64_PSEUDO_NMI) && !interrupts_enabled(regs))
+-		nmi_enter();
++		arm64_enter_nmi(regs);
+ 	else
+ 		enter_from_kernel_mode(regs);
+ }
+@@ -74,7 +104,7 @@ asmlinkage void noinstr enter_el1_irq_or_nmi(struct pt_regs *regs)
+ asmlinkage void noinstr exit_el1_irq_or_nmi(struct pt_regs *regs)
+ {
+ 	if (IS_ENABLED(CONFIG_ARM64_PSEUDO_NMI) && !interrupts_enabled(regs))
+-		nmi_exit();
++		arm64_exit_nmi(regs);
+ 	else
+ 		exit_to_kernel_mode(regs);
+ }
+diff --git a/arch/arm64/kernel/sdei.c b/arch/arm64/kernel/sdei.c
+index e396e69e33a1..2a709a18ecfc 100644
+--- a/arch/arm64/kernel/sdei.c
++++ b/arch/arm64/kernel/sdei.c
+@@ -10,6 +10,7 @@
+ #include <linux/uaccess.h>
+ 
+ #include <asm/alternative.h>
++#include <asm/exception.h>
+ #include <asm/kprobes.h>
+ #include <asm/mmu.h>
+ #include <asm/ptrace.h>
+@@ -247,16 +248,16 @@ static __kprobes unsigned long _sdei_handler(struct pt_regs *regs,
+ }
+ 
+ 
+-asmlinkage __kprobes notrace unsigned long
++asmlinkage noinstr unsigned long
+ __sdei_handler(struct pt_regs *regs, struct sdei_registered_event *arg)
+ {
+ 	unsigned long ret;
+ 
+-	nmi_enter();
++	arm64_enter_nmi(regs);
+ 
+ 	ret = _sdei_handler(regs, arg);
+ 
+-	nmi_exit();
++	arm64_exit_nmi(regs);
+ 
+ 	return ret;
+ }
+* Unmerged path arch/arm64/kernel/traps.c
