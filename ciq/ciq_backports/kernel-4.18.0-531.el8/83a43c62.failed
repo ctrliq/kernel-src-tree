@@ -1,0 +1,623 @@
+perf/x86/amd/uncore: Add group exclusivity
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-531.el8
+commit-author Sandipan Das <sandipan.das@amd.com>
+commit 83a43c622123e714b0317a57176b336187f5deb3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-531.el8/83a43c62.failed
+
+In some cases, it may be necessary to restrict opening PMU events to a
+subset of CPUs. E.g. Unified Memory Controller (UMC) PMUs are specific
+to each active memory channel and the MSR address space for the PERF_CTL
+and PERF_CTR registers is reused on each socket. Thus, opening events
+for a specific UMC PMU should be restricted to CPUs belonging to the
+same socket as that of the UMC. The "cpumask" of the PMU should also
+reflect this accordingly.
+
+Uncore PMUs which require this can use the new group attribute in struct
+amd_uncore_pmu to set a valid group ID during the scan() phase. Later,
+during init(), an uncore context for a CPU will be unavailable if the
+group ID does not match.
+
+	Signed-off-by: Sandipan Das <sandipan.das@amd.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/937d6d71010a48ea4e069f4904b3116a5f99ecdf.1696425185.git.sandipan.das@amd.com
+(cherry picked from commit 83a43c622123e714b0317a57176b336187f5deb3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/amd/uncore.c
+diff --cc arch/x86/events/amd/uncore.c
+index 63fc97aecaf4,318982951dd2..000000000000
+--- a/arch/x86/events/amd/uncore.c
++++ b/arch/x86/events/amd/uncore.c
+@@@ -29,6 -26,8 +29,11 @@@
+  #define RDPMC_BASE_LLC		10
+  
+  #define COUNTER_SHIFT		16
+++<<<<<<< HEAD
+++=======
++ #define UNCORE_NAME_LEN		16
++ #define UNCORE_GROUP_MAX	256
+++>>>>>>> 83a43c622123 (perf/x86/amd/uncore: Add group exclusivity)
+  
+  #undef pr_fmt
+  #define pr_fmt(fmt)	"amd_uncore: " fmt
+@@@ -53,33 -41,50 +58,73 @@@ struct amd_uncore 
+  	struct hlist_node node;
+  };
+  
+++<<<<<<< HEAD
+ +static struct amd_uncore * __percpu *amd_uncore_nb;
+ +static struct amd_uncore * __percpu *amd_uncore_llc;
+++=======
++ struct amd_uncore_pmu {
++ 	char name[UNCORE_NAME_LEN];
++ 	int num_counters;
++ 	int rdpmc_base;
++ 	u32 msr_base;
++ 	int group;
++ 	cpumask_t active_mask;
++ 	struct pmu pmu;
++ 	struct amd_uncore_ctx * __percpu *ctx;
++ };
+++>>>>>>> 83a43c622123 (perf/x86/amd/uncore: Add group exclusivity)
+  
+ -enum {
+ -	UNCORE_TYPE_DF,
+ -	UNCORE_TYPE_L3,
+ +static struct pmu amd_nb_pmu;
+ +static struct pmu amd_llc_pmu;
+  
+ -	UNCORE_TYPE_MAX
+ -};
+ +static cpumask_t amd_nb_active_mask;
+ +static cpumask_t amd_llc_active_mask;
+  
+++<<<<<<< HEAD
+ +static bool is_nb_event(struct perf_event *event)
+++=======
++ union amd_uncore_info {
++ 	struct {
++ 		u64	aux_data:32;	/* auxiliary data */
++ 		u64	num_pmcs:8;	/* number of counters */
++ 		u64	gid:8;		/* group id */
++ 		u64	cid:8;		/* context id */
++ 	} split;
++ 	u64		full;
++ };
++ 
++ struct amd_uncore {
++ 	union amd_uncore_info * __percpu info;
++ 	struct amd_uncore_pmu *pmus;
++ 	unsigned int num_pmus;
++ 	bool init_done;
++ 	void (*scan)(struct amd_uncore *uncore, unsigned int cpu);
++ 	int  (*init)(struct amd_uncore *uncore, unsigned int cpu);
++ 	void (*move)(struct amd_uncore *uncore, unsigned int cpu);
++ 	void (*free)(struct amd_uncore *uncore, unsigned int cpu);
++ };
++ 
++ static struct amd_uncore uncores[UNCORE_TYPE_MAX];
++ 
++ static struct amd_uncore_pmu *event_to_amd_uncore_pmu(struct perf_event *event)
+++>>>>>>> 83a43c622123 (perf/x86/amd/uncore: Add group exclusivity)
+ +{
+ +	return event->pmu->type == amd_nb_pmu.type;
+ +}
+ +
+ +static bool is_llc_event(struct perf_event *event)
+  {
+ -	return container_of(event->pmu, struct amd_uncore_pmu, pmu);
+ +	return event->pmu->type == amd_llc_pmu.type;
+ +}
+ +
+ +static struct amd_uncore *event_to_amd_uncore(struct perf_event *event)
+ +{
+ +	if (is_nb_event(event) && amd_uncore_nb)
+ +		return *per_cpu_ptr(amd_uncore_nb, event->cpu);
+ +	else if (is_llc_event(event) && amd_uncore_llc)
+ +		return *per_cpu_ptr(amd_uncore_llc, event->cpu);
+ +
+ +	return NULL;
+  }
+  
+  static void amd_uncore_read(struct perf_event *event)
+@@@ -399,86 -367,111 +444,158 @@@ static const struct attribute_group *am
+  	NULL,
+  };
+  
+ -static __always_inline
+ -int amd_uncore_ctx_cid(struct amd_uncore *uncore, unsigned int cpu)
+ +static struct pmu amd_nb_pmu = {
+ +	.task_ctx_nr	= perf_invalid_context,
+ +	.attr_groups	= amd_uncore_df_attr_groups,
+ +	.name		= "amd_nb",
+ +	.event_init	= amd_uncore_event_init,
+ +	.add		= amd_uncore_add,
+ +	.del		= amd_uncore_del,
+ +	.start		= amd_uncore_start,
+ +	.stop		= amd_uncore_stop,
+ +	.read		= amd_uncore_read,
+ +	.capabilities	= PERF_PMU_CAP_NO_EXCLUDE | PERF_PMU_CAP_NO_INTERRUPT,
+ +	.module		= THIS_MODULE,
+ +};
+ +
+ +static struct pmu amd_llc_pmu = {
+ +	.task_ctx_nr	= perf_invalid_context,
+ +	.attr_groups	= amd_uncore_l3_attr_groups,
+ +	.attr_update	= amd_uncore_l3_attr_update,
+ +	.name		= "amd_l2",
+ +	.event_init	= amd_uncore_event_init,
+ +	.add		= amd_uncore_add,
+ +	.del		= amd_uncore_del,
+ +	.start		= amd_uncore_start,
+ +	.stop		= amd_uncore_stop,
+ +	.read		= amd_uncore_read,
+ +	.capabilities	= PERF_PMU_CAP_NO_EXCLUDE | PERF_PMU_CAP_NO_INTERRUPT,
+ +	.module		= THIS_MODULE,
+ +};
+ +
+ +static struct amd_uncore *amd_uncore_alloc(unsigned int cpu)
+  {
+ -	union amd_uncore_info *info = per_cpu_ptr(uncore->info, cpu);
+ -	return info->split.cid;
+ +	return kzalloc_node(sizeof(struct amd_uncore), GFP_KERNEL,
+ +			cpu_to_node(cpu));
+  }
+  
+++<<<<<<< HEAD
+ +static inline struct perf_event **
+ +amd_uncore_events_alloc(unsigned int num, unsigned int cpu)
+++=======
++ static __always_inline
++ int amd_uncore_ctx_gid(struct amd_uncore *uncore, unsigned int cpu)
++ {
++ 	union amd_uncore_info *info = per_cpu_ptr(uncore->info, cpu);
++ 	return info->split.gid;
++ }
++ 
++ static __always_inline
++ int amd_uncore_ctx_num_pmcs(struct amd_uncore *uncore, unsigned int cpu)
+++>>>>>>> 83a43c622123 (perf/x86/amd/uncore: Add group exclusivity)
+  {
+ -	union amd_uncore_info *info = per_cpu_ptr(uncore->info, cpu);
+ -	return info->split.num_pmcs;
+ +	return kzalloc_node(sizeof(struct perf_event *) * num, GFP_KERNEL,
+ +			    cpu_to_node(cpu));
+  }
+  
+ -static void amd_uncore_ctx_free(struct amd_uncore *uncore, unsigned int cpu)
+ +static int amd_uncore_cpu_up_prepare(unsigned int cpu)
+  {
+ -	struct amd_uncore_pmu *pmu;
+ -	struct amd_uncore_ctx *ctx;
+ -	int i;
+ -
+ -	if (!uncore->init_done)
+ -		return;
+ -
+ -	for (i = 0; i < uncore->num_pmus; i++) {
+ -		pmu = &uncore->pmus[i];
+ -		ctx = *per_cpu_ptr(pmu->ctx, cpu);
+ -		if (!ctx)
+ -			continue;
+ +	struct amd_uncore *uncore_nb = NULL, *uncore_llc = NULL;
+  
+ -		if (cpu == ctx->cpu)
+ -			cpumask_clear_cpu(cpu, &pmu->active_mask);
+ -
+ -		if (!--ctx->refcnt) {
+ -			kfree(ctx->events);
+ -			kfree(ctx);
+ -		}
+ -
+ -		*per_cpu_ptr(pmu->ctx, cpu) = NULL;
+ +	if (amd_uncore_nb) {
+ +		*per_cpu_ptr(amd_uncore_nb, cpu) = NULL;
+ +		uncore_nb = amd_uncore_alloc(cpu);
+ +		if (!uncore_nb)
+ +			goto fail;
+ +		uncore_nb->cpu = cpu;
+ +		uncore_nb->num_counters = num_counters_nb;
+ +		uncore_nb->rdpmc_base = RDPMC_BASE_NB;
+ +		uncore_nb->msr_base = MSR_F15H_NB_PERF_CTL;
+ +		uncore_nb->active_mask = &amd_nb_active_mask;
+ +		uncore_nb->pmu = &amd_nb_pmu;
+ +		uncore_nb->events = amd_uncore_events_alloc(num_counters_nb, cpu);
+ +		if (!uncore_nb->events)
+ +			goto fail;
+ +		uncore_nb->id = -1;
+ +		*per_cpu_ptr(amd_uncore_nb, cpu) = uncore_nb;
+  	}
+ -}
+  
+++<<<<<<< HEAD
+ +	if (amd_uncore_llc) {
+ +		*per_cpu_ptr(amd_uncore_llc, cpu) = NULL;
+ +		uncore_llc = amd_uncore_alloc(cpu);
+ +		if (!uncore_llc)
+ +			goto fail;
+ +		uncore_llc->cpu = cpu;
+ +		uncore_llc->num_counters = num_counters_llc;
+ +		uncore_llc->rdpmc_base = RDPMC_BASE_LLC;
+ +		uncore_llc->msr_base = MSR_F16H_L2I_PERF_CTL;
+ +		uncore_llc->active_mask = &amd_llc_active_mask;
+ +		uncore_llc->pmu = &amd_llc_pmu;
+ +		uncore_llc->events = amd_uncore_events_alloc(num_counters_llc, cpu);
+ +		if (!uncore_llc->events)
+ +			goto fail;
+ +		uncore_llc->id = -1;
+ +		*per_cpu_ptr(amd_uncore_llc, cpu) = uncore_llc;
+++=======
++ static int amd_uncore_ctx_init(struct amd_uncore *uncore, unsigned int cpu)
++ {
++ 	struct amd_uncore_ctx *curr, *prev;
++ 	struct amd_uncore_pmu *pmu;
++ 	int node, cid, gid, i, j;
++ 
++ 	if (!uncore->init_done || !uncore->num_pmus)
++ 		return 0;
++ 
++ 	cid = amd_uncore_ctx_cid(uncore, cpu);
++ 	gid = amd_uncore_ctx_gid(uncore, cpu);
++ 
++ 	for (i = 0; i < uncore->num_pmus; i++) {
++ 		pmu = &uncore->pmus[i];
++ 		*per_cpu_ptr(pmu->ctx, cpu) = NULL;
++ 		curr = NULL;
++ 
++ 		/* Check for group exclusivity */
++ 		if (gid != pmu->group)
++ 			continue;
++ 
++ 		/* Find a sibling context */
++ 		for_each_online_cpu(j) {
++ 			if (cpu == j)
++ 				continue;
++ 
++ 			prev = *per_cpu_ptr(pmu->ctx, j);
++ 			if (!prev)
++ 				continue;
++ 
++ 			if (cid == amd_uncore_ctx_cid(uncore, j)) {
++ 				curr = prev;
++ 				break;
++ 			}
++ 		}
++ 
++ 		/* Allocate context if sibling does not exist */
++ 		if (!curr) {
++ 			node = cpu_to_node(cpu);
++ 			curr = kzalloc_node(sizeof(*curr), GFP_KERNEL, node);
++ 			if (!curr)
++ 				goto fail;
++ 
++ 			curr->cpu = cpu;
++ 			curr->events = kzalloc_node(sizeof(*curr->events) *
++ 						    pmu->num_counters,
++ 						    GFP_KERNEL, node);
++ 			if (!curr->events) {
++ 				kfree(curr);
++ 				goto fail;
++ 			}
++ 
++ 			cpumask_set_cpu(cpu, &pmu->active_mask);
++ 		}
++ 
++ 		curr->refcnt++;
++ 		*per_cpu_ptr(pmu->ctx, cpu) = curr;
+++>>>>>>> 83a43c622123 (perf/x86/amd/uncore: Add group exclusivity)
+  	}
+  
+  	return 0;
+@@@ -646,14 -567,298 +763,302 @@@ static int amd_uncore_cpu_dead(unsigne
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int amd_uncore_df_event_init(struct perf_event *event)
++ {
++ 	struct hw_perf_event *hwc = &event->hw;
++ 	int ret = amd_uncore_event_init(event);
++ 
++ 	if (ret || pmu_version < 2)
++ 		return ret;
++ 
++ 	hwc->config = event->attr.config &
++ 		      (pmu_version >= 2 ? AMD64_PERFMON_V2_RAW_EVENT_MASK_NB :
++ 					  AMD64_RAW_EVENT_MASK_NB);
++ 
++ 	return 0;
++ }
++ 
++ static int amd_uncore_df_add(struct perf_event *event, int flags)
++ {
++ 	int ret = amd_uncore_add(event, flags & ~PERF_EF_START);
++ 	struct hw_perf_event *hwc = &event->hw;
++ 
++ 	if (ret)
++ 		return ret;
++ 
++ 	/*
++ 	 * The first four DF counters are accessible via RDPMC index 6 to 9
++ 	 * followed by the L3 counters from index 10 to 15. For processors
++ 	 * with more than four DF counters, the DF RDPMC assignments become
++ 	 * discontiguous as the additional counters are accessible starting
++ 	 * from index 16.
++ 	 */
++ 	if (hwc->idx >= NUM_COUNTERS_NB)
++ 		hwc->event_base_rdpmc += NUM_COUNTERS_L3;
++ 
++ 	/* Delayed start after rdpmc base update */
++ 	if (flags & PERF_EF_START)
++ 		amd_uncore_start(event, PERF_EF_RELOAD);
++ 
++ 	return 0;
++ }
++ 
++ static
++ void amd_uncore_df_ctx_scan(struct amd_uncore *uncore, unsigned int cpu)
++ {
++ 	union cpuid_0x80000022_ebx ebx;
++ 	union amd_uncore_info info;
++ 
++ 	if (!boot_cpu_has(X86_FEATURE_PERFCTR_NB))
++ 		return;
++ 
++ 	info.split.aux_data = 0;
++ 	info.split.num_pmcs = NUM_COUNTERS_NB;
++ 	info.split.gid = 0;
++ 	info.split.cid = topology_die_id(cpu);
++ 
++ 	if (pmu_version >= 2) {
++ 		ebx.full = cpuid_ebx(EXT_PERFMON_DEBUG_FEATURES);
++ 		info.split.num_pmcs = ebx.split.num_df_pmc;
++ 	}
++ 
++ 	*per_cpu_ptr(uncore->info, cpu) = info;
++ }
++ 
++ static
++ int amd_uncore_df_ctx_init(struct amd_uncore *uncore, unsigned int cpu)
++ {
++ 	struct attribute **df_attr = amd_uncore_df_format_attr;
++ 	struct amd_uncore_pmu *pmu;
++ 
++ 	/* Run just once */
++ 	if (uncore->init_done)
++ 		return amd_uncore_ctx_init(uncore, cpu);
++ 
++ 	/* No grouping, single instance for a system */
++ 	uncore->pmus = kzalloc(sizeof(*uncore->pmus), GFP_KERNEL);
++ 	if (!uncore->pmus) {
++ 		uncore->num_pmus = 0;
++ 		goto done;
++ 	}
++ 
++ 	/*
++ 	 * For Family 17h and above, the Northbridge counters are repurposed
++ 	 * as Data Fabric counters. The PMUs are exported based on family as
++ 	 * either NB or DF.
++ 	 */
++ 	pmu = &uncore->pmus[0];
++ 	strscpy(pmu->name, boot_cpu_data.x86 >= 0x17 ? "amd_df" : "amd_nb",
++ 		sizeof(pmu->name));
++ 	pmu->num_counters = amd_uncore_ctx_num_pmcs(uncore, cpu);
++ 	pmu->msr_base = MSR_F15H_NB_PERF_CTL;
++ 	pmu->rdpmc_base = RDPMC_BASE_NB;
++ 	pmu->group = amd_uncore_ctx_gid(uncore, cpu);
++ 
++ 	if (pmu_version >= 2) {
++ 		*df_attr++ = &format_attr_event14v2.attr;
++ 		*df_attr++ = &format_attr_umask12.attr;
++ 	} else if (boot_cpu_data.x86 >= 0x17) {
++ 		*df_attr = &format_attr_event14.attr;
++ 	}
++ 
++ 	pmu->ctx = alloc_percpu(struct amd_uncore_ctx *);
++ 	if (!pmu->ctx)
++ 		goto done;
++ 
++ 	pmu->pmu = (struct pmu) {
++ 		.task_ctx_nr	= perf_invalid_context,
++ 		.attr_groups	= amd_uncore_df_attr_groups,
++ 		.name		= pmu->name,
++ 		.event_init	= amd_uncore_df_event_init,
++ 		.add		= amd_uncore_df_add,
++ 		.del		= amd_uncore_del,
++ 		.start		= amd_uncore_start,
++ 		.stop		= amd_uncore_stop,
++ 		.read		= amd_uncore_read,
++ 		.capabilities	= PERF_PMU_CAP_NO_EXCLUDE | PERF_PMU_CAP_NO_INTERRUPT,
++ 		.module		= THIS_MODULE,
++ 	};
++ 
++ 	if (perf_pmu_register(&pmu->pmu, pmu->pmu.name, -1)) {
++ 		free_percpu(pmu->ctx);
++ 		pmu->ctx = NULL;
++ 		goto done;
++ 	}
++ 
++ 	pr_info("%d %s%s counters detected\n", pmu->num_counters,
++ 		boot_cpu_data.x86_vendor == X86_VENDOR_HYGON ?  "HYGON " : "",
++ 		pmu->pmu.name);
++ 
++ 	uncore->num_pmus = 1;
++ 
++ done:
++ 	uncore->init_done = true;
++ 
++ 	return amd_uncore_ctx_init(uncore, cpu);
++ }
++ 
++ static int amd_uncore_l3_event_init(struct perf_event *event)
++ {
++ 	int ret = amd_uncore_event_init(event);
++ 	struct hw_perf_event *hwc = &event->hw;
++ 	u64 config = event->attr.config;
++ 	u64 mask;
++ 
++ 	hwc->config = config & AMD64_RAW_EVENT_MASK_NB;
++ 
++ 	/*
++ 	 * SliceMask and ThreadMask need to be set for certain L3 events.
++ 	 * For other events, the two fields do not affect the count.
++ 	 */
++ 	if (ret || boot_cpu_data.x86 < 0x17)
++ 		return ret;
++ 
++ 	mask = config & (AMD64_L3_F19H_THREAD_MASK | AMD64_L3_SLICEID_MASK |
++ 			 AMD64_L3_EN_ALL_CORES | AMD64_L3_EN_ALL_SLICES |
++ 			 AMD64_L3_COREID_MASK);
++ 
++ 	if (boot_cpu_data.x86 <= 0x18)
++ 		mask = ((config & AMD64_L3_SLICE_MASK) ? : AMD64_L3_SLICE_MASK) |
++ 		       ((config & AMD64_L3_THREAD_MASK) ? : AMD64_L3_THREAD_MASK);
++ 
++ 	/*
++ 	 * If the user doesn't specify a ThreadMask, they're not trying to
++ 	 * count core 0, so we enable all cores & threads.
++ 	 * We'll also assume that they want to count slice 0 if they specify
++ 	 * a ThreadMask and leave SliceId and EnAllSlices unpopulated.
++ 	 */
++ 	else if (!(config & AMD64_L3_F19H_THREAD_MASK))
++ 		mask = AMD64_L3_F19H_THREAD_MASK | AMD64_L3_EN_ALL_SLICES |
++ 		       AMD64_L3_EN_ALL_CORES;
++ 
++ 	hwc->config |= mask;
++ 
++ 	return 0;
++ }
++ 
++ static
++ void amd_uncore_l3_ctx_scan(struct amd_uncore *uncore, unsigned int cpu)
++ {
++ 	union amd_uncore_info info;
++ 
++ 	if (!boot_cpu_has(X86_FEATURE_PERFCTR_LLC))
++ 		return;
++ 
++ 	info.split.aux_data = 0;
++ 	info.split.num_pmcs = NUM_COUNTERS_L2;
++ 	info.split.gid = 0;
++ 	info.split.cid = get_llc_id(cpu);
++ 
++ 	if (boot_cpu_data.x86 >= 0x17)
++ 		info.split.num_pmcs = NUM_COUNTERS_L3;
++ 
++ 	*per_cpu_ptr(uncore->info, cpu) = info;
++ }
++ 
++ static
++ int amd_uncore_l3_ctx_init(struct amd_uncore *uncore, unsigned int cpu)
++ {
++ 	struct attribute **l3_attr = amd_uncore_l3_format_attr;
++ 	struct amd_uncore_pmu *pmu;
++ 
++ 	/* Run just once */
++ 	if (uncore->init_done)
++ 		return amd_uncore_ctx_init(uncore, cpu);
++ 
++ 	/* No grouping, single instance for a system */
++ 	uncore->pmus = kzalloc(sizeof(*uncore->pmus), GFP_KERNEL);
++ 	if (!uncore->pmus) {
++ 		uncore->num_pmus = 0;
++ 		goto done;
++ 	}
++ 
++ 	/*
++ 	 * For Family 17h and above, L3 cache counters are available instead
++ 	 * of L2 cache counters. The PMUs are exported based on family as
++ 	 * either L2 or L3.
++ 	 */
++ 	pmu = &uncore->pmus[0];
++ 	strscpy(pmu->name, boot_cpu_data.x86 >= 0x17 ? "amd_l3" : "amd_l2",
++ 		sizeof(pmu->name));
++ 	pmu->num_counters = amd_uncore_ctx_num_pmcs(uncore, cpu);
++ 	pmu->msr_base = MSR_F16H_L2I_PERF_CTL;
++ 	pmu->rdpmc_base = RDPMC_BASE_LLC;
++ 	pmu->group = amd_uncore_ctx_gid(uncore, cpu);
++ 
++ 	if (boot_cpu_data.x86 >= 0x17) {
++ 		*l3_attr++ = &format_attr_event8.attr;
++ 		*l3_attr++ = &format_attr_umask8.attr;
++ 		*l3_attr++ = boot_cpu_data.x86 >= 0x19 ?
++ 			     &format_attr_threadmask2.attr :
++ 			     &format_attr_threadmask8.attr;
++ 	}
++ 
++ 	pmu->ctx = alloc_percpu(struct amd_uncore_ctx *);
++ 	if (!pmu->ctx)
++ 		goto done;
++ 
++ 	pmu->pmu = (struct pmu) {
++ 		.task_ctx_nr	= perf_invalid_context,
++ 		.attr_groups	= amd_uncore_l3_attr_groups,
++ 		.attr_update	= amd_uncore_l3_attr_update,
++ 		.name		= pmu->name,
++ 		.event_init	= amd_uncore_l3_event_init,
++ 		.add		= amd_uncore_add,
++ 		.del		= amd_uncore_del,
++ 		.start		= amd_uncore_start,
++ 		.stop		= amd_uncore_stop,
++ 		.read		= amd_uncore_read,
++ 		.capabilities	= PERF_PMU_CAP_NO_EXCLUDE | PERF_PMU_CAP_NO_INTERRUPT,
++ 		.module		= THIS_MODULE,
++ 	};
++ 
++ 	if (perf_pmu_register(&pmu->pmu, pmu->pmu.name, -1)) {
++ 		free_percpu(pmu->ctx);
++ 		pmu->ctx = NULL;
++ 		goto done;
++ 	}
++ 
++ 	pr_info("%d %s%s counters detected\n", pmu->num_counters,
++ 		boot_cpu_data.x86_vendor == X86_VENDOR_HYGON ?  "HYGON " : "",
++ 		pmu->pmu.name);
++ 
++ 	uncore->num_pmus = 1;
++ 
++ done:
++ 	uncore->init_done = true;
++ 
++ 	return amd_uncore_ctx_init(uncore, cpu);
++ }
++ 
++ static struct amd_uncore uncores[UNCORE_TYPE_MAX] = {
++ 	/* UNCORE_TYPE_DF */
++ 	{
++ 		.scan = amd_uncore_df_ctx_scan,
++ 		.init = amd_uncore_df_ctx_init,
++ 		.move = amd_uncore_ctx_move,
++ 		.free = amd_uncore_ctx_free,
++ 	},
++ 	/* UNCORE_TYPE_L3 */
++ 	{
++ 		.scan = amd_uncore_l3_ctx_scan,
++ 		.init = amd_uncore_l3_ctx_init,
++ 		.move = amd_uncore_ctx_move,
++ 		.free = amd_uncore_ctx_free,
++ 	},
++ };
++ 
+++>>>>>>> 83a43c622123 (perf/x86/amd/uncore: Add group exclusivity)
+  static int __init amd_uncore_init(void)
+  {
+ -	struct amd_uncore *uncore;
+ -	int ret, i;
+ +	struct attribute **df_attr = amd_uncore_df_format_attr;
+ +	struct attribute **l3_attr = amd_uncore_l3_format_attr;
+ +	union cpuid_0x80000022_ebx ebx;
+ +	int ret = -ENODEV;
+  
+ -	if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD &&
+ -	    boot_cpu_data.x86_vendor != X86_VENDOR_HYGON)
+ +	if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD)
+  		return -ENODEV;
+  
+  	if (!boot_cpu_has(X86_FEATURE_TOPOEXT))
+* Unmerged path arch/x86/events/amd/uncore.c
