@@ -1,0 +1,246 @@
+cifs: Fix pages array leak when writedata alloc failed in cifs_writedata_alloc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Zhang Xiaoxu <zhangxiaoxu5@huawei.com>
+commit 4153d789e299b29cbc57276d687c92f3a098e59b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/4153d789.failed
+
+There is a memory leak when writedata alloc failed:
+
+  unreferenced object 0xffff888192364000 (size 8192):
+    comm "sync", pid 22839, jiffies 4297313967 (age 60.230s)
+    hex dump (first 32 bytes):
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+    backtrace:
+      [<0000000027de0814>] __kmalloc+0x4d/0x150
+      [<00000000b21e81ab>] cifs_writepages+0x35f/0x14a0
+      [<0000000076f7d20e>] do_writepages+0x10a/0x360
+      [<00000000d6a36edc>] filemap_fdatawrite_wbc+0x95/0xc0
+      [<000000005751a323>] __filemap_fdatawrite_range+0xa7/0xe0
+      [<0000000088afb0ca>] file_write_and_wait_range+0x66/0xb0
+      [<0000000063dbc443>] cifs_strict_fsync+0x80/0x5f0
+      [<00000000c4624754>] __x64_sys_fsync+0x40/0x70
+      [<000000002c0dc744>] do_syscall_64+0x35/0x80
+      [<0000000052f46bee>] entry_SYSCALL_64_after_hwframe+0x46/0xb0
+
+cifs_writepages+0x35f/0x14a0 is:
+  kmalloc_array at include/linux/slab.h:628
+  (inlined by) kcalloc at include/linux/slab.h:659
+  (inlined by) cifs_writedata_alloc at fs/cifs/file.c:2438
+  (inlined by) wdata_alloc_and_fillpages at fs/cifs/file.c:2527
+  (inlined by) cifs_writepages at fs/cifs/file.c:2705
+
+If writedata alloc failed in cifs_writedata_alloc(), the pages array
+should be freed.
+
+Fixes: 8e7360f67e75 ("CIFS: Add support for direct pages in wdata")
+	Signed-off-by: Zhang Xiaoxu <zhangxiaoxu5@huawei.com>
+	Reviewed-by: Paulo Alcantara (SUSE) <pc@cjr.nz>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 4153d789e299b29cbc57276d687c92f3a098e59b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/file.c
+diff --cc fs/cifs/file.c
+index c0811d111e46,d9fbf1ec6029..000000000000
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@@ -2130,6 -2279,190 +2130,192 @@@ cifs_get_readable_path(struct cifs_tco
+  	return -ENOENT;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void
++ cifs_writedata_release(struct kref *refcount)
++ {
++ 	struct cifs_writedata *wdata = container_of(refcount,
++ 					struct cifs_writedata, refcount);
++ #ifdef CONFIG_CIFS_SMB_DIRECT
++ 	if (wdata->mr) {
++ 		smbd_deregister_mr(wdata->mr);
++ 		wdata->mr = NULL;
++ 	}
++ #endif
++ 
++ 	if (wdata->cfile)
++ 		cifsFileInfo_put(wdata->cfile);
++ 
++ 	kvfree(wdata->pages);
++ 	kfree(wdata);
++ }
++ 
++ /*
++  * Write failed with a retryable error. Resend the write request. It's also
++  * possible that the page was redirtied so re-clean the page.
++  */
++ static void
++ cifs_writev_requeue(struct cifs_writedata *wdata)
++ {
++ 	int i, rc = 0;
++ 	struct inode *inode = d_inode(wdata->cfile->dentry);
++ 	struct TCP_Server_Info *server;
++ 	unsigned int rest_len;
++ 
++ 	server = tlink_tcon(wdata->cfile->tlink)->ses->server;
++ 	i = 0;
++ 	rest_len = wdata->bytes;
++ 	do {
++ 		struct cifs_writedata *wdata2;
++ 		unsigned int j, nr_pages, wsize, tailsz, cur_len;
++ 
++ 		wsize = server->ops->wp_retry_size(inode);
++ 		if (wsize < rest_len) {
++ 			nr_pages = wsize / PAGE_SIZE;
++ 			if (!nr_pages) {
++ 				rc = -EOPNOTSUPP;
++ 				break;
++ 			}
++ 			cur_len = nr_pages * PAGE_SIZE;
++ 			tailsz = PAGE_SIZE;
++ 		} else {
++ 			nr_pages = DIV_ROUND_UP(rest_len, PAGE_SIZE);
++ 			cur_len = rest_len;
++ 			tailsz = rest_len - (nr_pages - 1) * PAGE_SIZE;
++ 		}
++ 
++ 		wdata2 = cifs_writedata_alloc(nr_pages, cifs_writev_complete);
++ 		if (!wdata2) {
++ 			rc = -ENOMEM;
++ 			break;
++ 		}
++ 
++ 		for (j = 0; j < nr_pages; j++) {
++ 			wdata2->pages[j] = wdata->pages[i + j];
++ 			lock_page(wdata2->pages[j]);
++ 			clear_page_dirty_for_io(wdata2->pages[j]);
++ 		}
++ 
++ 		wdata2->sync_mode = wdata->sync_mode;
++ 		wdata2->nr_pages = nr_pages;
++ 		wdata2->offset = page_offset(wdata2->pages[0]);
++ 		wdata2->pagesz = PAGE_SIZE;
++ 		wdata2->tailsz = tailsz;
++ 		wdata2->bytes = cur_len;
++ 
++ 		rc = cifs_get_writable_file(CIFS_I(inode), FIND_WR_ANY,
++ 					    &wdata2->cfile);
++ 		if (!wdata2->cfile) {
++ 			cifs_dbg(VFS, "No writable handle to retry writepages rc=%d\n",
++ 				 rc);
++ 			if (!is_retryable_error(rc))
++ 				rc = -EBADF;
++ 		} else {
++ 			wdata2->pid = wdata2->cfile->pid;
++ 			rc = server->ops->async_writev(wdata2,
++ 						       cifs_writedata_release);
++ 		}
++ 
++ 		for (j = 0; j < nr_pages; j++) {
++ 			unlock_page(wdata2->pages[j]);
++ 			if (rc != 0 && !is_retryable_error(rc)) {
++ 				SetPageError(wdata2->pages[j]);
++ 				end_page_writeback(wdata2->pages[j]);
++ 				put_page(wdata2->pages[j]);
++ 			}
++ 		}
++ 
++ 		kref_put(&wdata2->refcount, cifs_writedata_release);
++ 		if (rc) {
++ 			if (is_retryable_error(rc))
++ 				continue;
++ 			i += nr_pages;
++ 			break;
++ 		}
++ 
++ 		rest_len -= cur_len;
++ 		i += nr_pages;
++ 	} while (i < wdata->nr_pages);
++ 
++ 	/* cleanup remaining pages from the original wdata */
++ 	for (; i < wdata->nr_pages; i++) {
++ 		SetPageError(wdata->pages[i]);
++ 		end_page_writeback(wdata->pages[i]);
++ 		put_page(wdata->pages[i]);
++ 	}
++ 
++ 	if (rc != 0 && !is_retryable_error(rc))
++ 		mapping_set_error(inode->i_mapping, rc);
++ 	kref_put(&wdata->refcount, cifs_writedata_release);
++ }
++ 
++ void
++ cifs_writev_complete(struct work_struct *work)
++ {
++ 	struct cifs_writedata *wdata = container_of(work,
++ 						struct cifs_writedata, work);
++ 	struct inode *inode = d_inode(wdata->cfile->dentry);
++ 	int i = 0;
++ 
++ 	if (wdata->result == 0) {
++ 		spin_lock(&inode->i_lock);
++ 		cifs_update_eof(CIFS_I(inode), wdata->offset, wdata->bytes);
++ 		spin_unlock(&inode->i_lock);
++ 		cifs_stats_bytes_written(tlink_tcon(wdata->cfile->tlink),
++ 					 wdata->bytes);
++ 	} else if (wdata->sync_mode == WB_SYNC_ALL && wdata->result == -EAGAIN)
++ 		return cifs_writev_requeue(wdata);
++ 
++ 	for (i = 0; i < wdata->nr_pages; i++) {
++ 		struct page *page = wdata->pages[i];
++ 
++ 		if (wdata->result == -EAGAIN)
++ 			__set_page_dirty_nobuffers(page);
++ 		else if (wdata->result < 0)
++ 			SetPageError(page);
++ 		end_page_writeback(page);
++ 		cifs_readpage_to_fscache(inode, page);
++ 		put_page(page);
++ 	}
++ 	if (wdata->result != -EAGAIN)
++ 		mapping_set_error(inode->i_mapping, wdata->result);
++ 	kref_put(&wdata->refcount, cifs_writedata_release);
++ }
++ 
++ struct cifs_writedata *
++ cifs_writedata_alloc(unsigned int nr_pages, work_func_t complete)
++ {
++ 	struct cifs_writedata *writedata = NULL;
++ 	struct page **pages =
++ 		kcalloc(nr_pages, sizeof(struct page *), GFP_NOFS);
++ 	if (pages) {
++ 		writedata = cifs_writedata_direct_alloc(pages, complete);
++ 		if (!writedata)
++ 			kvfree(pages);
++ 	}
++ 
++ 	return writedata;
++ }
++ 
++ struct cifs_writedata *
++ cifs_writedata_direct_alloc(struct page **pages, work_func_t complete)
++ {
++ 	struct cifs_writedata *wdata;
++ 
++ 	wdata = kzalloc(sizeof(*wdata), GFP_NOFS);
++ 	if (wdata != NULL) {
++ 		wdata->pages = pages;
++ 		kref_init(&wdata->refcount);
++ 		INIT_LIST_HEAD(&wdata->list);
++ 		init_completion(&wdata->done);
++ 		INIT_WORK(&wdata->work, complete);
++ 	}
++ 	return wdata;
++ }
++ 
++ 
+++>>>>>>> 4153d789e299 (cifs: Fix pages array leak when writedata alloc failed in cifs_writedata_alloc())
+  static int cifs_partialpagewrite(struct page *page, unsigned from, unsigned to)
+  {
+  	struct address_space *mapping = page->mapping;
+* Unmerged path fs/cifs/file.c
