@@ -1,0 +1,235 @@
+powerpc/rtas: export rtas_error_rc() for reuse.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-516.el8
+commit-author Mahesh Salgaonkar <mahesh@linux.ibm.com>
+commit e160bf64e2d3df7bf83ed41d09390a32490be6c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-516.el8/e160bf64.failed
+
+Also, #define descriptive names for common rtas return codes and use it
+instead of numeric values.
+
+	Signed-off-by: Mahesh Salgaonkar <mahesh@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://msgid.link/169235811556.193557.1023625262204809514.stgit@jupiter
+
+(cherry picked from commit e160bf64e2d3df7bf83ed41d09390a32490be6c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/rtas.c
+diff --cc arch/powerpc/kernel/rtas.c
+index e4e726eeccec,eddc031c4b95..000000000000
+--- a/arch/powerpc/kernel/rtas.c
++++ b/arch/powerpc/kernel/rtas.c
+@@@ -506,47 -1208,152 +506,69 @@@ unsigned int rtas_busy_delay_time(int s
+  
+  	return ms;
+  }
+ +EXPORT_SYMBOL(rtas_busy_delay_time);
+  
+ -/*
+ - * Early boot fallback for rtas_busy_delay().
+ - */
+ -static bool __init rtas_busy_delay_early(int status)
+ -{
+ -	static size_t successive_ext_delays __initdata;
+ -	bool retry;
+ -
+ -	switch (status) {
+ -	case RTAS_EXTENDED_DELAY_MIN...RTAS_EXTENDED_DELAY_MAX:
+ -		/*
+ -		 * In the unlikely case that we receive an extended
+ -		 * delay status in early boot, the OS is probably not
+ -		 * the cause, and there's nothing we can do to clear
+ -		 * the condition. Best we can do is delay for a bit
+ -		 * and hope it's transient. Lie to the caller if it
+ -		 * seems like we're stuck in a retry loop.
+ -		 */
+ -		mdelay(1);
+ -		retry = true;
+ -		successive_ext_delays += 1;
+ -		if (successive_ext_delays > 1000) {
+ -			pr_err("too many extended delays, giving up\n");
+ -			dump_stack();
+ -			retry = false;
+ -			successive_ext_delays = 0;
+ -		}
+ -		break;
+ -	case RTAS_BUSY:
+ -		retry = true;
+ -		successive_ext_delays = 0;
+ -		break;
+ -	default:
+ -		retry = false;
+ -		successive_ext_delays = 0;
+ -		break;
+ -	}
+ -
+ -	return retry;
+ -}
+ -
+ -/**
+ - * rtas_busy_delay() - helper for RTAS busy and extended delay statuses
+ - *
+ - * @status: a value returned from rtas_call() or similar APIs which return
+ - *          the status of a RTAS function call.
+ - *
+ - * Context: Process context. May sleep or schedule.
+ - *
+ - * Return:
+ - * * true  - @status is RTAS_BUSY or an extended delay hint. The
+ - *           caller may assume that the CPU has been yielded if necessary,
+ - *           and that an appropriate delay for @status has elapsed.
+ - *           Generally the caller should reattempt the RTAS call which
+ - *           yielded @status.
+ - *
+ - * * false - @status is not @RTAS_BUSY nor an extended delay hint. The
+ - *           caller is responsible for handling @status.
+ - */
+ -bool __ref rtas_busy_delay(int status)
+ +/* For an RTAS busy status code, perform the hinted delay. */
+ +unsigned int rtas_busy_delay(int status)
+  {
+  	unsigned int ms;
+ -	bool ret;
+ -
+ -	/*
+ -	 * Can't do timed sleeps before timekeeping is up.
+ -	 */
+ -	if (system_state < SYSTEM_SCHEDULING)
+ -		return rtas_busy_delay_early(status);
+  
+ -	switch (status) {
+ -	case RTAS_EXTENDED_DELAY_MIN...RTAS_EXTENDED_DELAY_MAX:
+ -		ret = true;
+ -		ms = rtas_busy_delay_time(status);
+ -		/*
+ -		 * The extended delay hint can be as high as 100 seconds.
+ -		 * Surely any function returning such a status is either
+ -		 * buggy or isn't going to be significantly slowed by us
+ -		 * polling at 1HZ. Clamp the sleep time to one second.
+ -		 */
+ -		ms = clamp(ms, 1U, 1000U);
+ -		/*
+ -		 * The delay hint is an order-of-magnitude suggestion, not
+ -		 * a minimum. It is fine, possibly even advantageous, for
+ -		 * us to pause for less time than hinted. For small values,
+ -		 * use usleep_range() to ensure we don't sleep much longer
+ -		 * than actually needed.
+ -		 *
+ -		 * See Documentation/timers/timers-howto.rst for
+ -		 * explanation of the threshold used here. In effect we use
+ -		 * usleep_range() for 9900 and 9901, msleep() for
+ -		 * 9902-9905.
+ -		 */
+ -		if (ms <= 20)
+ -			usleep_range(ms * 100, ms * 1000);
+ -		else
+ -			msleep(ms);
+ -		break;
+ -	case RTAS_BUSY:
+ -		ret = true;
+ -		/*
+ -		 * We should call again immediately if there's no other
+ -		 * work to do.
+ -		 */
+ -		cond_resched();
+ -		break;
+ -	default:
+ -		ret = false;
+ -		/*
+ -		 * Not a busy or extended delay status; the caller should
+ -		 * handle @status itself. Ensure we warn on misuses in
+ -		 * atomic context regardless.
+ -		 */
+ -		might_sleep();
+ -		break;
+ -	}
+ +	might_sleep();
+ +	ms = rtas_busy_delay_time(status);
+ +	if (ms && need_resched())
+ +		msleep(ms);
+  
+ -	return ret;
+ +	return ms;
+  }
+ -EXPORT_SYMBOL_GPL(rtas_busy_delay);
+ +EXPORT_SYMBOL(rtas_busy_delay);
+  
+- static int rtas_error_rc(int rtas_rc)
++ int rtas_error_rc(int rtas_rc)
+  {
+  	int rc;
+  
+  	switch (rtas_rc) {
+++<<<<<<< HEAD
+ +		case -1: 		/* Hardware Error */
+ +			rc = -EIO;
+ +			break;
+ +		case -3:		/* Bad indicator/domain/etc */
+ +			rc = -EINVAL;
+ +			break;
+ +		case -9000:		/* Isolation error */
+ +			rc = -EFAULT;
+ +			break;
+ +		case -9001:		/* Outstanding TCE/PTE */
+ +			rc = -EEXIST;
+ +			break;
+ +		case -9002:		/* No usable slot */
+ +			rc = -ENODEV;
+ +			break;
+ +		default:
+ +			printk(KERN_ERR "%s: unexpected RTAS error %d\n",
+ +					__func__, rtas_rc);
+ +			rc = -ERANGE;
+ +			break;
+++=======
++ 	case RTAS_HARDWARE_ERROR:	/* Hardware Error */
++ 		rc = -EIO;
++ 		break;
++ 	case RTAS_INVALID_PARAMETER:	/* Bad indicator/domain/etc */
++ 		rc = -EINVAL;
++ 		break;
++ 	case -9000:			/* Isolation error */
++ 		rc = -EFAULT;
++ 		break;
++ 	case -9001:			/* Outstanding TCE/PTE */
++ 		rc = -EEXIST;
++ 		break;
++ 	case -9002:			/* No usable slot */
++ 		rc = -ENODEV;
++ 		break;
++ 	default:
++ 		pr_err("%s: unexpected error %d\n", __func__, rtas_rc);
++ 		rc = -ERANGE;
++ 		break;
+++>>>>>>> e160bf64e2d3 (powerpc/rtas: export rtas_error_rc() for reuse.)
+  	}
+  	return rc;
+  }
+diff --git a/arch/powerpc/include/asm/rtas.h b/arch/powerpc/include/asm/rtas.h
+index a42143160e07..19387367f0e3 100644
+--- a/arch/powerpc/include/asm/rtas.h
++++ b/arch/powerpc/include/asm/rtas.h
+@@ -25,7 +25,9 @@
+ #define RTAS_RMOBUF_MAX (64 * 1024)
+ 
+ /* RTAS return status codes */
++#define RTAS_HARDWARE_ERROR	-1    /* Hardware Error */
+ #define RTAS_BUSY		-2    /* RTAS Busy */
++#define RTAS_INVALID_PARAMETER	-3    /* Invalid indicator/domain/sensor etc. */
+ #define RTAS_EXTENDED_DELAY_MIN	9900
+ #define RTAS_EXTENDED_DELAY_MAX	9905
+ 
+@@ -377,6 +379,7 @@ extern void rtas_progress(char *s, unsigned short hex);
+ extern int rtas_suspend_cpu(struct rtas_suspend_me_data *data);
+ extern int rtas_suspend_last_cpu(struct rtas_suspend_me_data *data);
+ int rtas_ibm_suspend_me(int *fw_status);
++int rtas_error_rc(int rtas_rc);
+ 
+ struct rtc_time;
+ extern time64_t rtas_get_boot_time(void);
+* Unmerged path arch/powerpc/kernel/rtas.c
