@@ -1,0 +1,221 @@
+x86/efistub: Branch straight to kernel entry point from C code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit d2d7a54f69b67cd0a30e0ebb5307cb2de625baac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/d2d7a54f.failed
+
+Instead of returning to the calling code in assembler that does nothing
+more than perform an indirect call with the boot_params pointer in
+register ESI/RSI, perform the jump directly from the EFI stub C code.
+This will allow the asm entrypoint code to be dropped entirely in
+subsequent patches.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Link: https://lore.kernel.org/r/20230807162720.545787-4-ardb@kernel.org
+(cherry picked from commit d2d7a54f69b67cd0a30e0ebb5307cb2de625baac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/eboot.c
+diff --cc arch/x86/boot/compressed/eboot.c
+index 19db743a88f9,40a10db2d85e..000000000000
+--- a/arch/x86/boot/compressed/eboot.c
++++ b/arch/x86/boot/compressed/eboot.c
+@@@ -841,45 -803,39 +841,60 @@@ static efi_status_t exit_boot(struct bo
+  	return EFI_SUCCESS;
+  }
+  
++ static void __noreturn enter_kernel(unsigned long kernel_addr,
++ 				    struct boot_params *boot_params)
++ {
++ 	/* enter decompressed kernel with boot_params pointer in RSI/ESI */
++ 	asm("jmp *%0"::"r"(kernel_addr), "S"(boot_params));
++ 
++ 	unreachable();
++ }
++ 
+  /*
+++<<<<<<< HEAD:arch/x86/boot/compressed/eboot.c
+ + * On success we return a pointer to a boot_params structure, and NULL
+ + * on failure.
+++=======
++  * On success, this routine will jump to the relocated image directly and never
++  * return.  On failure, it will exit to the firmware via efi_exit() instead of
++  * returning.
+++>>>>>>> d2d7a54f69b6 (x86/efistub: Branch straight to kernel entry point from C code):drivers/firmware/efi/libstub/x86-stub.c
+   */
+ -asmlinkage unsigned long efi_main(efi_handle_t handle,
+ -				  efi_system_table_t *sys_table_arg,
+ -				  struct boot_params *boot_params)
+ +struct boot_params *
+ +efi_main(struct efi_config *c, struct boot_params *boot_params)
+  {
+  	unsigned long bzimage_addr = (unsigned long)startup_32;
+ -	unsigned long buffer_start, buffer_end;
+ +	struct desc_ptr *gdt = NULL;
+ +	efi_loaded_image_t *image;
+  	struct setup_header *hdr = &boot_params->hdr;
+ -	const struct linux_efi_initrd *initrd = NULL;
+  	efi_status_t status;
+ +	struct desc_struct *desc;
+ +	void *handle;
+ +	efi_system_table_t *_table;
+ +	bool is64;
+ +	unsigned long cmdline_paddr;
+ +
+ +	efi_early = c;
+ +
+ +	_table = (efi_system_table_t *)(unsigned long)efi_early->table;
+ +	handle = (void *)(unsigned long)efi_early->image_handle;
+ +	is64 = efi_early->is64;
+ +
+ +	sys_table = _table;
+  
+ -	efi_system_table = sys_table_arg;
+  	/* Check if we were booted by the EFI firmware */
+ -	if (efi_system_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+ -		efi_exit(handle, EFI_INVALID_PARAMETER);
+ +	if (sys_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+ +		goto fail;
+  
+ -	efi_dxe_table = get_efi_config_table(EFI_DXE_SERVICES_TABLE_GUID);
+ +	if (is64)
+ +		setup_boot_services64(efi_early);
+ +	else
+ +		setup_boot_services32(efi_early);
+ +
+ +	efi_dxe_table = get_efi_config_table(sys_table, EFI_DXE_SERVICES_TABLE_GUID);
+  	if (efi_dxe_table &&
+  	    efi_dxe_table->hdr.signature != EFI_DXE_SERVICES_TABLE_SIGNATURE) {
+ -		efi_warn("Ignoring DXE services table: invalid signature\n");
+ +		efi_printk(sys_table, "Ignoring DXE services table: invalid signature\n");
+  		efi_dxe_table = NULL;
+  	}
+  
+@@@ -937,110 -959,12 +952,119 @@@
+  		goto fail;
+  	}
+  
+++<<<<<<< HEAD:arch/x86/boot/compressed/eboot.c
+ +	gdt->size = 0x800;
+ +	status = efi_low_alloc(sys_table, gdt->size, 8,
+ +			   (unsigned long *)&gdt->address);
+ +	if (status != EFI_SUCCESS) {
+ +		efi_printk(sys_table, "Failed to allocate memory for 'gdt'\n");
+ +		goto fail;
+ +	}
+++=======
++ 	if (IS_ENABLED(CONFIG_X86_64))
++ 		bzimage_addr += startup_64 - startup_32;
++ 
++ 	enter_kernel(bzimage_addr, boot_params);
++ fail:
++ 	efi_err("efi_main() failed!\n");
+++>>>>>>> d2d7a54f69b6 (x86/efistub: Branch straight to kernel entry point from C code):drivers/firmware/efi/libstub/x86-stub.c
+ +
+ +	status = exit_boot(boot_params, handle, is64);
+ +	if (status != EFI_SUCCESS) {
+ +		efi_printk(sys_table, "exit_boot() failed!\n");
+ +		goto fail;
+ +	}
+ +
+ +	memset((char *)gdt->address, 0x0, gdt->size);
+ +	desc = (struct desc_struct *)gdt->address;
+ +
+ +	/* The first GDT is a dummy. */
+ +	desc++;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		/* __KERNEL32_CS */
+ +		desc->limit0	= 0xffff;
+ +		desc->base0	= 0x0000;
+ +		desc->base1	= 0x0000;
+ +		desc->type	= SEG_TYPE_CODE | SEG_TYPE_EXEC_READ;
+ +		desc->s		= DESC_TYPE_CODE_DATA;
+ +		desc->dpl	= 0;
+ +		desc->p		= 1;
+ +		desc->limit1	= 0xf;
+ +		desc->avl	= 0;
+ +		desc->l		= 0;
+ +		desc->d		= SEG_OP_SIZE_32BIT;
+ +		desc->g		= SEG_GRANULARITY_4KB;
+ +		desc->base2	= 0x00;
+ +
+ +		desc++;
+ +	} else {
+ +		/* Second entry is unused on 32-bit */
+ +		desc++;
+ +	}
+ +
+ +	/* __KERNEL_CS */
+ +	desc->limit0	= 0xffff;
+ +	desc->base0	= 0x0000;
+ +	desc->base1	= 0x0000;
+ +	desc->type	= SEG_TYPE_CODE | SEG_TYPE_EXEC_READ;
+ +	desc->s		= DESC_TYPE_CODE_DATA;
+ +	desc->dpl	= 0;
+ +	desc->p		= 1;
+ +	desc->limit1	= 0xf;
+ +	desc->avl	= 0;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		desc->l = 1;
+ +		desc->d = 0;
+ +	} else {
+ +		desc->l = 0;
+ +		desc->d = SEG_OP_SIZE_32BIT;
+ +	}
+ +	desc->g		= SEG_GRANULARITY_4KB;
+ +	desc->base2	= 0x00;
+ +	desc++;
+ +
+ +	/* __KERNEL_DS */
+ +	desc->limit0	= 0xffff;
+ +	desc->base0	= 0x0000;
+ +	desc->base1	= 0x0000;
+ +	desc->type	= SEG_TYPE_DATA | SEG_TYPE_READ_WRITE;
+ +	desc->s		= DESC_TYPE_CODE_DATA;
+ +	desc->dpl	= 0;
+ +	desc->p		= 1;
+ +	desc->limit1	= 0xf;
+ +	desc->avl	= 0;
+ +	desc->l		= 0;
+ +	desc->d		= SEG_OP_SIZE_32BIT;
+ +	desc->g		= SEG_GRANULARITY_4KB;
+ +	desc->base2	= 0x00;
+ +	desc++;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		/* Task segment value */
+ +		desc->limit0	= 0x0000;
+ +		desc->base0	= 0x0000;
+ +		desc->base1	= 0x0000;
+ +		desc->type	= SEG_TYPE_TSS;
+ +		desc->s		= 0;
+ +		desc->dpl	= 0;
+ +		desc->p		= 1;
+ +		desc->limit1	= 0x0;
+ +		desc->avl	= 0;
+ +		desc->l		= 0;
+ +		desc->d		= 0;
+ +		desc->g		= SEG_GRANULARITY_4KB;
+ +		desc->base2	= 0x00;
+ +		desc++;
+ +	}
+ +
+ +	asm volatile("cli");
+ +	asm volatile ("lgdt %0" : : "m" (*gdt));
+ +
+ +	return boot_params;
+ +fail:
+ +	efi_printk(sys_table, "efi_main() failed!\n");
+  
+ -	efi_exit(handle, status);
+ +	return NULL;
+  }
+* Unmerged path arch/x86/boot/compressed/eboot.c
