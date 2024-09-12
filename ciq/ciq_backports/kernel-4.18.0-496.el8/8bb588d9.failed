@@ -1,0 +1,262 @@
+wifi: cfg80211: Extend cfg80211_update_owe_info_event() for MLD AP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Veerendranath Jakkam <quic_vjakkam@quicinc.com>
+commit 8bb588d975019748ebdab9448e9a274b7463c13b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/8bb588d9.failed
+
+Add support to offload OWE processing to user space for MLD AP when
+driver's SME in use.
+
+Add new parameters in struct cfg80211_update_owe_info to provide below
+information in cfg80211_update_owe_info_event() call:
+- MLO link ID of the AP, with which station requested (re)association.
+  This is applicable for both MLO and non-MLO station connections when
+  the AP affiliated with an MLD.
+- Station's MLD address if the connection is MLO capable.
+
+	Signed-off-by: Veerendranath Jakkam <quic_vjakkam@quicinc.com>
+Link: https://lore.kernel.org/r/20230126143256.960563-3-quic_vjakkam@quicinc.com
+[reformat the trace event macro]
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 8bb588d975019748ebdab9448e9a274b7463c13b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/quantenna/qtnfmac/event.c
+diff --cc drivers/net/wireless/quantenna/qtnfmac/event.c
+index 68da81bec4e9,f0158737aed6..000000000000
+--- a/drivers/net/wireless/quantenna/qtnfmac/event.c
++++ b/drivers/net/wireless/quantenna/qtnfmac/event.c
+@@@ -474,6 -553,126 +474,129 @@@ static int qtnf_event_handle_radar(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ qtnf_event_handle_external_auth(struct qtnf_vif *vif,
++ 				const struct qlink_event_external_auth *ev,
++ 				u16 len)
++ {
++ 	struct cfg80211_external_auth_params auth = {0};
++ 	struct wiphy *wiphy = priv_to_wiphy(vif->mac);
++ 	int ret;
++ 
++ 	if (len < sizeof(*ev)) {
++ 		pr_err("MAC%u: payload is too short\n", vif->mac->macid);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!wiphy->registered || !vif->netdev)
++ 		return 0;
++ 
++ 	if (ev->ssid_len) {
++ 		int len = clamp_val(ev->ssid_len, 0, IEEE80211_MAX_SSID_LEN);
++ 
++ 		memcpy(auth.ssid.ssid, ev->ssid, len);
++ 		auth.ssid.ssid_len = len;
++ 	}
++ 
++ 	auth.key_mgmt_suite = le32_to_cpu(ev->akm_suite);
++ 	ether_addr_copy(auth.bssid, ev->bssid);
++ 	auth.action = ev->action;
++ 
++ 	pr_debug("%s: external SAE processing: bss=%pM action=%u akm=%u\n",
++ 		 vif->netdev->name, auth.bssid, auth.action,
++ 		 auth.key_mgmt_suite);
++ 
++ 	ret = cfg80211_external_auth_request(vif->netdev, &auth, GFP_KERNEL);
++ 	if (ret)
++ 		pr_warn("failed to offload external auth request\n");
++ 
++ 	return ret;
++ }
++ 
++ static int
++ qtnf_event_handle_mic_failure(struct qtnf_vif *vif,
++ 			      const struct qlink_event_mic_failure *mic_ev,
++ 			      u16 len)
++ {
++ 	struct wiphy *wiphy = priv_to_wiphy(vif->mac);
++ 	u8 pairwise;
++ 
++ 	if (len < sizeof(*mic_ev)) {
++ 		pr_err("VIF%u.%u: payload is too short (%u < %zu)\n",
++ 		       vif->mac->macid, vif->vifid, len,
++ 		       sizeof(struct qlink_event_mic_failure));
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!wiphy->registered || !vif->netdev)
++ 		return 0;
++ 
++ 	if (vif->wdev.iftype != NL80211_IFTYPE_STATION) {
++ 		pr_err("VIF%u.%u: MIC_FAILURE event when not in STA mode\n",
++ 		       vif->mac->macid, vif->vifid);
++ 		return -EPROTO;
++ 	}
++ 
++ 	pairwise = mic_ev->pairwise ?
++ 		NL80211_KEYTYPE_PAIRWISE : NL80211_KEYTYPE_GROUP;
++ 
++ 	pr_info("%s: MIC error: src=%pM key_index=%u pairwise=%u\n",
++ 		vif->netdev->name, mic_ev->src, mic_ev->key_index, pairwise);
++ 
++ 	cfg80211_michael_mic_failure(vif->netdev, mic_ev->src, pairwise,
++ 				     mic_ev->key_index, NULL, GFP_KERNEL);
++ 
++ 	return 0;
++ }
++ 
++ static int
++ qtnf_event_handle_update_owe(struct qtnf_vif *vif,
++ 			     const struct qlink_event_update_owe *owe_ev,
++ 			     u16 len)
++ {
++ 	struct wiphy *wiphy = priv_to_wiphy(vif->mac);
++ 	struct cfg80211_update_owe_info owe_info = {};
++ 	const u16 ie_len = len - sizeof(*owe_ev);
++ 	u8 *ie;
++ 
++ 	if (len < sizeof(*owe_ev)) {
++ 		pr_err("VIF%u.%u: payload is too short (%u < %zu)\n",
++ 		       vif->mac->macid, vif->vifid, len,
++ 		       sizeof(struct qlink_event_update_owe));
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!wiphy->registered || !vif->netdev)
++ 		return 0;
++ 
++ 	if (vif->wdev.iftype != NL80211_IFTYPE_AP) {
++ 		pr_err("VIF%u.%u: UPDATE_OWE event when not in AP mode\n",
++ 		       vif->mac->macid, vif->vifid);
++ 		return -EPROTO;
++ 	}
++ 
++ 	ie = kzalloc(ie_len, GFP_KERNEL);
++ 	if (!ie)
++ 		return -ENOMEM;
++ 
++ 	memcpy(owe_info.peer, owe_ev->peer, ETH_ALEN);
++ 	memcpy(ie, owe_ev->ies, ie_len);
++ 	owe_info.ie_len = ie_len;
++ 	owe_info.ie = ie;
++ 	owe_info.assoc_link_id = -1;
++ 
++ 	pr_info("%s: external OWE processing: peer=%pM\n",
++ 		vif->netdev->name, owe_ev->peer);
++ 
++ 	cfg80211_update_owe_info_event(vif->netdev, &owe_info, GFP_KERNEL);
++ 	kfree(ie);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 8bb588d97501 (wifi: cfg80211: Extend cfg80211_update_owe_info_event() for MLD AP)
+  static int qtnf_event_parse(struct qtnf_wmac *mac,
+  			    const struct sk_buff *event_skb)
+  {
+* Unmerged path drivers/net/wireless/quantenna/qtnfmac/event.c
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index 9c31af81583f..f325c4d597a9 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -3897,12 +3897,22 @@ struct cfg80211_pmsr_request {
+  *	the IEs of the remote peer in the event from the host driver and
+  *	the constructed IEs by the user space in the request interface.
+  * @ie_len: Length of IEs in octets.
++ * @assoc_link_id: MLO link ID of the AP, with which (re)association requested
++ *	by peer. This will be filled by driver for both MLO and non-MLO station
++ *	connections when the AP affiliated with an MLD. For non-MLD AP mode, it
++ *	will be -1. Used only with OWE update event (driver to user space).
++ * @peer_mld_addr: For MLO connection, MLD address of the peer. For non-MLO
++ *	connection, it will be all zeros. This is applicable only when
++ *	@assoc_link_id is not -1, i.e., the AP affiliated with an MLD. Used only
++ *	with OWE update event (driver to user space).
+  */
+ struct cfg80211_update_owe_info {
+ 	u8 peer[ETH_ALEN] __aligned(2);
+ 	u16 status;
+ 	const u8 *ie;
+ 	size_t ie_len;
++	int assoc_link_id;
++	u8 peer_mld_addr[ETH_ALEN] __aligned(2);
+ };
+ 
+ /**
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index 862c445b7699..605314ffed6b 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -19778,6 +19778,17 @@ void cfg80211_update_owe_info_event(struct net_device *netdev,
+ 	    nla_put(msg, NL80211_ATTR_IE, owe_info->ie_len, owe_info->ie))
+ 		goto nla_put_failure;
+ 
++	if (owe_info->assoc_link_id != -1) {
++		if (nla_put_u8(msg, NL80211_ATTR_MLO_LINK_ID,
++			       owe_info->assoc_link_id))
++			goto nla_put_failure;
++
++		if (!is_zero_ether_addr(owe_info->peer_mld_addr) &&
++		    nla_put(msg, NL80211_ATTR_MLD_ADDR, ETH_ALEN,
++			    owe_info->peer_mld_addr))
++			goto nla_put_failure;
++	}
++
+ 	genlmsg_end(msg, hdr);
+ 
+ 	genlmsg_multicast_netns(&nl80211_fam, wiphy_net(&rdev->wiphy), msg, 0,
+diff --git a/net/wireless/trace.h b/net/wireless/trace.h
+index 640466cf77cc..f047b55a5a69 100644
+--- a/net/wireless/trace.h
++++ b/net/wireless/trace.h
+@@ -3748,20 +3748,30 @@ TRACE_EVENT(cfg80211_pmsr_complete,
+ );
+ 
+ TRACE_EVENT(cfg80211_update_owe_info_event,
+-	    TP_PROTO(struct wiphy *wiphy, struct net_device *netdev,
+-		     struct cfg80211_update_owe_info *owe_info),
+-	    TP_ARGS(wiphy, netdev, owe_info),
+-	    TP_STRUCT__entry(WIPHY_ENTRY
+-			     NETDEV_ENTRY
+-			     MAC_ENTRY(peer)
+-			     __dynamic_array(u8, ie, owe_info->ie_len)),
+-	    TP_fast_assign(WIPHY_ASSIGN;
+-			   NETDEV_ASSIGN;
+-			   MAC_ASSIGN(peer, owe_info->peer);
+-			   memcpy(__get_dynamic_array(ie), owe_info->ie,
+-				  owe_info->ie_len);),
+-	    TP_printk(WIPHY_PR_FMT ", " NETDEV_PR_FMT ", peer: %pM",
+-		      WIPHY_PR_ARG, NETDEV_PR_ARG, __entry->peer)
++	TP_PROTO(struct wiphy *wiphy, struct net_device *netdev,
++		 struct cfg80211_update_owe_info *owe_info),
++	TP_ARGS(wiphy, netdev, owe_info),
++	TP_STRUCT__entry(
++		WIPHY_ENTRY
++		NETDEV_ENTRY
++		MAC_ENTRY(peer)
++		__dynamic_array(u8, ie, owe_info->ie_len)
++		__field(int, assoc_link_id)
++		MAC_ENTRY(peer_mld_addr)
++	),
++	TP_fast_assign(
++		WIPHY_ASSIGN;
++		NETDEV_ASSIGN;
++		MAC_ASSIGN(peer, owe_info->peer);
++		memcpy(__get_dynamic_array(ie), owe_info->ie,
++		       owe_info->ie_len);
++		__entry->assoc_link_id = owe_info->assoc_link_id;
++		MAC_ASSIGN(peer_mld_addr, owe_info->peer_mld_addr);
++	),
++	TP_printk(WIPHY_PR_FMT ", " NETDEV_PR_FMT ", peer: %pM,"
++	          " assoc_link_id: %d, peer_mld_addr: %pM",
++		  WIPHY_PR_ARG, NETDEV_PR_ARG, __entry->peer,
++		  __entry->assoc_link_id, __entry->peer_mld_addr)
+ );
+ 
+ TRACE_EVENT(cfg80211_bss_color_notify,
