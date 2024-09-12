@@ -1,0 +1,366 @@
+usb: musb: Add support for PolarFire SoC's musb controller
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Conor Dooley <conor.dooley@microchip.com>
+commit 7a96b6ea90a439f73e42b640eef2386c2c644570
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/7a96b6ea.failed
+
+Add support for Microchips's PolarFire SoC's musb controller in host,
+peripheral and otg mode.
+
+	Tested-by: Valentina Fernandez <valentina.fernandezalanis@microchip.com>
+	Signed-off-by: Conor Dooley <conor.dooley@microchip.com>
+Link: https://lore.kernel.org/r/20220613114642.1615292-2-conor.dooley@microchip.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 7a96b6ea90a439f73e42b640eef2386c2c644570)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/musb/Kconfig
+#	drivers/usb/musb/Makefile
+diff --cc drivers/usb/musb/Kconfig
+index 52f8e2b57ad5,f906dfd360d3..000000000000
+--- a/drivers/usb/musb/Kconfig
++++ b/drivers/usb/musb/Kconfig
+@@@ -111,14 -110,30 +111,25 @@@ config USB_MUSB_UX50
+  
+  config USB_MUSB_JZ4740
+  	tristate "JZ4740"
+ -	depends on OF
+ +	depends on NOP_USB_XCEIV
+  	depends on MIPS || COMPILE_TEST
+  	depends on USB_MUSB_GADGET
+ -	depends on USB=n || USB_OTG_DISABLE_EXTERNAL_HUB
+ -	select USB_ROLE_SWITCH
+ +	depends on USB=n || USB_OTG_BLACKLIST_HUB
+  
+ -config USB_MUSB_MEDIATEK
+ -	tristate "MediaTek platforms"
+ -	depends on ARCH_MEDIATEK || COMPILE_TEST
+ -	depends on NOP_USB_XCEIV
+ -	select GENERIC_PHY
+ -	select USB_ROLE_SWITCH
+ +config USB_MUSB_AM335X_CHILD
+ +	tristate
+  
++ config USB_MUSB_POLARFIRE_SOC
++ 	tristate "Microchip PolarFire SoC platforms"
++ 	depends on SOC_MICROCHIP_POLARFIRE || COMPILE_TEST
++ 	depends on NOP_USB_XCEIV
++ 	select USB_MUSB_DUAL_ROLE
++ 	help
++ 	  Say Y here to enable support for USB on Microchip's PolarFire SoC.
++ 
++ 	  This support is also available as a module.  If so, the module
++ 	  will be called mpfs.
++ 
+  comment "MUSB DMA mode"
+  
+  config MUSB_PIO_ONLY
+@@@ -142,7 -157,7 +153,11 @@@ config USB_UX500_DM
+  
+  config USB_INVENTRA_DMA
+  	bool 'Inventra'
+++<<<<<<< HEAD
+ +	depends on USB_MUSB_OMAP2PLUS
+++=======
++ 	depends on USB_MUSB_OMAP2PLUS || USB_MUSB_MEDIATEK || USB_MUSB_JZ4740 || USB_MUSB_POLARFIRE_SOC
+++>>>>>>> 7a96b6ea90a4 (usb: musb: Add support for PolarFire SoC's musb controller)
+  	help
+  	  Enable DMA transfers using Mentor's engine.
+  
+diff --cc drivers/usb/musb/Makefile
+index 3a88c79e650c,51dd54a8de49..000000000000
+--- a/drivers/usb/musb/Makefile
++++ b/drivers/usb/musb/Makefile
+@@@ -24,9 -24,8 +24,14 @@@ obj-$(CONFIG_USB_MUSB_DA8XX)			+= da8xx
+  obj-$(CONFIG_USB_MUSB_UX500)			+= ux500.o
+  obj-$(CONFIG_USB_MUSB_JZ4740)			+= jz4740.o
+  obj-$(CONFIG_USB_MUSB_SUNXI)			+= sunxi.o
+++<<<<<<< HEAD
+ +
+ +
+ +obj-$(CONFIG_USB_MUSB_AM335X_CHILD)		+= musb_am335x.o
+++=======
++ obj-$(CONFIG_USB_MUSB_MEDIATEK)      		+= mediatek.o
++ obj-$(CONFIG_USB_MUSB_POLARFIRE_SOC)		+= mpfs.o
+++>>>>>>> 7a96b6ea90a4 (usb: musb: Add support for PolarFire SoC's musb controller)
+  
+  # the kconfig must guarantee that only one of the
+  # possible I/O schemes will be enabled at a time ...
+* Unmerged path drivers/usb/musb/Kconfig
+* Unmerged path drivers/usb/musb/Makefile
+diff --git a/drivers/usb/musb/mpfs.c b/drivers/usb/musb/mpfs.c
+new file mode 100644
+index 000000000000..99666ef8af06
+--- /dev/null
++++ b/drivers/usb/musb/mpfs.c
+@@ -0,0 +1,265 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * PolarFire SoC (MPFS) MUSB Glue Layer
++ *
++ * Copyright (c) 2020-2022 Microchip Corporation. All rights reserved.
++ * Based on {omap2430,tusb6010,ux500}.c
++ *
++ */
++
++#include <linux/clk.h>
++#include <linux/dma-mapping.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/usb/usb_phy_generic.h>
++#include "musb_core.h"
++#include "musb_dma.h"
++
++#define MPFS_MUSB_MAX_EP_NUM	8
++#define MPFS_MUSB_RAM_BITS	12
++
++struct mpfs_glue {
++	struct device *dev;
++	struct platform_device *musb;
++	struct platform_device *phy;
++	struct clk *clk;
++};
++
++static struct musb_fifo_cfg mpfs_musb_mode_cfg[] = {
++	{ .hw_ep_num = 1, .style = FIFO_TX, .maxpacket = 512, },
++	{ .hw_ep_num = 1, .style = FIFO_RX, .maxpacket = 512, },
++	{ .hw_ep_num = 2, .style = FIFO_TX, .maxpacket = 512, },
++	{ .hw_ep_num = 2, .style = FIFO_RX, .maxpacket = 512, },
++	{ .hw_ep_num = 3, .style = FIFO_TX, .maxpacket = 512, },
++	{ .hw_ep_num = 3, .style = FIFO_RX, .maxpacket = 512, },
++	{ .hw_ep_num = 4, .style = FIFO_TX, .maxpacket = 1024, },
++	{ .hw_ep_num = 4, .style = FIFO_RX, .maxpacket = 4096, },
++};
++
++static const struct musb_hdrc_config mpfs_musb_hdrc_config = {
++	.fifo_cfg = mpfs_musb_mode_cfg,
++	.fifo_cfg_size = ARRAY_SIZE(mpfs_musb_mode_cfg),
++	.multipoint = true,
++	.dyn_fifo = true,
++	.num_eps = MPFS_MUSB_MAX_EP_NUM,
++	.ram_bits = MPFS_MUSB_RAM_BITS,
++};
++
++static irqreturn_t mpfs_musb_interrupt(int irq, void *__hci)
++{
++	unsigned long flags;
++	irqreturn_t ret = IRQ_NONE;
++	struct musb *musb = __hci;
++
++	spin_lock_irqsave(&musb->lock, flags);
++
++	musb->int_usb = musb_readb(musb->mregs, MUSB_INTRUSB);
++	musb->int_tx = musb_readw(musb->mregs, MUSB_INTRTX);
++	musb->int_rx = musb_readw(musb->mregs, MUSB_INTRRX);
++
++	if (musb->int_usb || musb->int_tx || musb->int_rx) {
++		musb_writeb(musb->mregs, MUSB_INTRUSB, musb->int_usb);
++		musb_writew(musb->mregs, MUSB_INTRTX, musb->int_tx);
++		musb_writew(musb->mregs, MUSB_INTRRX, musb->int_rx);
++		ret = musb_interrupt(musb);
++	}
++
++	spin_unlock_irqrestore(&musb->lock, flags);
++
++	return ret;
++}
++
++static void mpfs_musb_set_vbus(struct musb *musb, int is_on)
++{
++	u8 devctl;
++
++	/*
++	 * HDRC controls CPEN, but beware current surges during device
++	 * connect.  They can trigger transient overcurrent conditions
++	 * that must be ignored.
++	 */
++	devctl = musb_readb(musb->mregs, MUSB_DEVCTL);
++
++	if (is_on) {
++		musb->is_active = 1;
++		musb->xceiv->otg->default_a = 1;
++		musb->xceiv->otg->state = OTG_STATE_A_WAIT_VRISE;
++		devctl |= MUSB_DEVCTL_SESSION;
++		MUSB_HST_MODE(musb);
++	} else {
++		musb->is_active = 0;
++
++		/*
++		 * NOTE:  skipping A_WAIT_VFALL -> A_IDLE and
++		 * jumping right to B_IDLE...
++		 */
++		musb->xceiv->otg->default_a = 0;
++		musb->xceiv->otg->state = OTG_STATE_B_IDLE;
++		devctl &= ~MUSB_DEVCTL_SESSION;
++
++		MUSB_DEV_MODE(musb);
++	}
++
++	musb_writeb(musb->mregs, MUSB_DEVCTL, devctl);
++
++	dev_dbg(musb->controller, "VBUS %s, devctl %02x\n",
++		usb_otg_state_string(musb->xceiv->otg->state),
++		musb_readb(musb->mregs, MUSB_DEVCTL));
++}
++
++static int mpfs_musb_init(struct musb *musb)
++{
++	struct device *dev = musb->controller;
++
++	musb->xceiv = devm_usb_get_phy(dev, USB_PHY_TYPE_USB2);
++	if (IS_ERR(musb->xceiv)) {
++		dev_err(dev, "HS UDC: no transceiver configured\n");
++		return PTR_ERR(musb->xceiv);
++	}
++
++	musb->dyn_fifo = true;
++	musb->isr = mpfs_musb_interrupt;
++
++	musb_platform_set_vbus(musb, 1);
++
++	return 0;
++}
++
++static const struct musb_platform_ops mpfs_ops = {
++	.quirks		= MUSB_DMA_INVENTRA,
++	.init		= mpfs_musb_init,
++	.fifo_mode	= 2,
++#ifdef CONFIG_USB_INVENTRA_DMA
++	.dma_init	= musbhs_dma_controller_create,
++	.dma_exit	= musbhs_dma_controller_destroy,
++#endif
++	.set_vbus	= mpfs_musb_set_vbus
++};
++
++static int mpfs_probe(struct platform_device *pdev)
++{
++	struct musb_hdrc_platform_data *pdata = dev_get_platdata(&pdev->dev);
++	struct mpfs_glue *glue;
++	struct platform_device *musb_pdev;
++	struct device *dev = &pdev->dev;
++	struct clk *clk;
++	int ret;
++
++	glue = devm_kzalloc(dev, sizeof(*glue), GFP_KERNEL);
++	if (!glue)
++		return -ENOMEM;
++
++	musb_pdev = platform_device_alloc("musb-hdrc", PLATFORM_DEVID_AUTO);
++	if (!musb_pdev) {
++		dev_err(dev, "failed to allocate musb device\n");
++		return -ENOMEM;
++	}
++
++	clk = devm_clk_get(&pdev->dev, NULL);
++	if (IS_ERR(clk)) {
++		dev_err(&pdev->dev, "failed to get clock\n");
++		ret = PTR_ERR(clk);
++		goto err_phy_release;
++	}
++
++	ret = clk_prepare_enable(clk);
++	if (ret) {
++		dev_err(&pdev->dev, "failed to enable clock\n");
++		goto err_phy_release;
++	}
++
++	musb_pdev->dev.parent = dev;
++	musb_pdev->dev.coherent_dma_mask = DMA_BIT_MASK(39);
++	musb_pdev->dev.dma_mask = &musb_pdev->dev.coherent_dma_mask;
++	device_set_of_node_from_dev(&musb_pdev->dev, dev);
++
++	glue->dev = dev;
++	glue->musb = musb_pdev;
++	glue->clk = clk;
++
++	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
++	if (!pdata)
++		goto err_clk_disable;
++
++	pdata->config = &mpfs_musb_hdrc_config;
++	pdata->platform_ops = &mpfs_ops;
++
++	pdata->mode = usb_get_dr_mode(dev);
++	if (pdata->mode == USB_DR_MODE_UNKNOWN) {
++		dev_info(dev, "No dr_mode property found, defaulting to otg\n");
++		pdata->mode = USB_DR_MODE_OTG;
++	}
++
++	glue->phy = usb_phy_generic_register();
++	if (IS_ERR(glue->phy)) {
++		dev_err(dev, "failed to register usb-phy %ld\n",
++			PTR_ERR(glue->phy));
++		goto err_clk_disable;
++	}
++
++	platform_set_drvdata(pdev, glue);
++
++	ret = platform_device_add_resources(musb_pdev, pdev->resource, pdev->num_resources);
++	if (ret) {
++		dev_err(dev, "failed to add resources\n");
++		goto err_clk_disable;
++	}
++
++	ret = platform_device_add_data(musb_pdev, pdata, sizeof(*pdata));
++	if (ret) {
++		dev_err(dev, "failed to add platform_data\n");
++		goto err_clk_disable;
++	}
++
++	ret = platform_device_add(musb_pdev);
++	if (ret) {
++		dev_err(dev, "failed to register musb device\n");
++		goto err_clk_disable;
++	}
++
++	dev_info(&pdev->dev, "Registered MPFS MUSB driver\n");
++	return 0;
++
++err_clk_disable:
++	clk_disable_unprepare(clk);
++
++err_phy_release:
++	usb_phy_generic_unregister(glue->phy);
++	platform_device_put(musb_pdev);
++	return ret;
++}
++
++static int mpfs_remove(struct platform_device *pdev)
++{
++	struct mpfs_glue *glue = platform_get_drvdata(pdev);
++
++	platform_device_unregister(glue->musb);
++	usb_phy_generic_unregister(pdev);
++
++	return 0;
++}
++
++#ifdef CONFIG_OF
++static const struct of_device_id mpfs_id_table[] = {
++	{ .compatible = "microchip,mpfs-musb" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mpfs_id_table);
++#endif
++
++static struct platform_driver mpfs_musb_driver = {
++	.probe = mpfs_probe,
++	.remove = mpfs_remove,
++	.driver = {
++		.name = "mpfs-musb",
++		.of_match_table = of_match_ptr(mpfs_id_table)
++	},
++};
++
++module_platform_driver(mpfs_musb_driver);
++
++MODULE_DESCRIPTION("PolarFire SoC MUSB Glue Layer");
++MODULE_LICENSE("GPL");
