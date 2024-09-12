@@ -13,7 +13,6 @@ KUnit - Unit Testing for the Linux Kernel
 	api/index
 	style
 	faq
-	tips
 	running_tips
 
 What is KUnit?
