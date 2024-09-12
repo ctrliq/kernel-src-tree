@@ -1,0 +1,365 @@
+EDAC/ghes: Add a notifier for reporting memory errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-541.el8
+commit-author Jia He <justin.he@arm.com>
+commit 8e40612f6146da1333e9bb5cfd9af7511c063d93
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-541.el8/8e40612f.failed
+
+In order to make it a proper module and disentangle it from facilities,
+add a notifier for reporting memory errors. Use an atomic notifier
+because calls sites like ghes_proc_in_irq() run in interrupt context.
+
+  [ bp: Massage commit message. ]
+
+	Suggested-by: Borislav Petkov <bp@alien8.de>
+	Signed-off-by: Jia He <justin.he@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20221010023559.69655-3-justin.he@arm.com
+(cherry picked from commit 8e40612f6146da1333e9bb5cfd9af7511c063d93)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/apei/ghes.c
+#	drivers/edac/ghes_edac.c
+diff --cc drivers/acpi/apei/ghes.c
+index 0b21f8827cc4,55013e024ba3..000000000000
+--- a/drivers/acpi/apei/ghes.c
++++ b/drivers/acpi/apei/ghes.c
+@@@ -1512,9 -1498,16 +1514,24 @@@ static int __init ghes_init(void
+  		pr_info(GHES_PFX "APEI firmware first mode is enabled by APEI bit.\n");
+  	else
+  		pr_info(GHES_PFX "Failed to enable APEI firmware first mode.\n");
+ +
+ +	return 0;
+ +err:
+ +	return rc;
+  }
+++<<<<<<< HEAD
+ +device_initcall(ghes_init);
+++=======
++ 
++ void ghes_register_report_chain(struct notifier_block *nb)
++ {
++ 	atomic_notifier_chain_register(&ghes_report_chain, nb);
++ }
++ EXPORT_SYMBOL_GPL(ghes_register_report_chain);
++ 
++ void ghes_unregister_report_chain(struct notifier_block *nb)
++ {
++ 	atomic_notifier_chain_unregister(&ghes_report_chain, nb);
++ }
++ EXPORT_SYMBOL_GPL(ghes_unregister_report_chain);
+++>>>>>>> 8e40612f6146 (EDAC/ghes: Add a notifier for reporting memory errors)
+diff --cc drivers/edac/ghes_edac.c
+index 0365a010a90d,7b8d56a769f6..000000000000
+--- a/drivers/edac/ghes_edac.c
++++ b/drivers/edac/ghes_edac.c
+@@@ -16,7 -14,10 +16,8 @@@
+  #include <linux/dmi.h>
+  #include "edac_module.h"
+  #include <ras/ras_event.h>
++ #include <linux/notifier.h>
+  
+ -#define OTHER_DETAIL_LEN	400
+ -
+  struct ghes_pvt {
+  	struct mem_ctl_info *mci;
+  
+@@@ -115,109 -114,168 +116,116 @@@ static void dimm_setup_label(struct dim
+  		 (device && *device) ? device : "");
+  }
+  
+ -static void assign_dmi_dimm_info(struct dimm_info *dimm, struct memdev_dmi_entry *entry)
+ +static void ghes_edac_dmidecode(const struct dmi_header *dh, void *arg)
+  {
+ -	u16 rdr_mask = BIT(7) | BIT(13);
+ +	struct ghes_edac_dimm_fill *dimm_fill = arg;
+ +	struct mem_ctl_info *mci = dimm_fill->mci;
+ +
+ +	if (dh->type == DMI_ENTRY_MEM_DEVICE) {
+ +		struct memdev_dmi_entry *entry = (struct memdev_dmi_entry *)dh;
+ +		struct dimm_info *dimm = edac_get_dimm(mci, dimm_fill->count, 0, 0);
+ +		u16 rdr_mask = BIT(7) | BIT(13);
+ +
+ +		if (entry->size == 0xffff) {
+ +			pr_info("Can't get DIMM%i size\n",
+ +				dimm_fill->count);
+ +			dimm->nr_pages = MiB_TO_PAGES(32);/* Unknown */
+ +		} else if (entry->size == 0x7fff) {
+ +			dimm->nr_pages = MiB_TO_PAGES(entry->extended_size);
+ +		} else {
+ +			if (entry->size & BIT(15))
+ +				dimm->nr_pages = MiB_TO_PAGES((entry->size & 0x7fff) << 10);
+ +			else
+ +				dimm->nr_pages = MiB_TO_PAGES(entry->size);
+ +		}
+  
+ -	if (entry->size == 0xffff) {
+ -		pr_info("Can't get DIMM%i size\n", dimm->idx);
+ -		dimm->nr_pages = MiB_TO_PAGES(32);/* Unknown */
+ -	} else if (entry->size == 0x7fff) {
+ -		dimm->nr_pages = MiB_TO_PAGES(entry->extended_size);
+ -	} else {
+ -		if (entry->size & BIT(15))
+ -			dimm->nr_pages = MiB_TO_PAGES((entry->size & 0x7fff) << 10);
+ -		else
+ -			dimm->nr_pages = MiB_TO_PAGES(entry->size);
+ -	}
+ +		switch (entry->memory_type) {
+ +		case 0x12:
+ +			if (entry->type_detail & BIT(13))
+ +				dimm->mtype = MEM_RDDR;
+ +			else
+ +				dimm->mtype = MEM_DDR;
+ +			break;
+ +		case 0x13:
+ +			if (entry->type_detail & BIT(13))
+ +				dimm->mtype = MEM_RDDR2;
+ +			else
+ +				dimm->mtype = MEM_DDR2;
+ +			break;
+ +		case 0x14:
+ +			dimm->mtype = MEM_FB_DDR2;
+ +			break;
+ +		case 0x18:
+ +			if (entry->type_detail & BIT(12))
+ +				dimm->mtype = MEM_NVDIMM;
+ +			else if (entry->type_detail & BIT(13))
+ +				dimm->mtype = MEM_RDDR3;
+ +			else
+ +				dimm->mtype = MEM_DDR3;
+ +			break;
+ +		case 0x1a:
+ +			if (entry->type_detail & BIT(12))
+ +				dimm->mtype = MEM_NVDIMM;
+ +			else if (entry->type_detail & BIT(13))
+ +				dimm->mtype = MEM_RDDR4;
+ +			else
+ +				dimm->mtype = MEM_DDR4;
+ +			break;
+ +		default:
+ +			if (entry->type_detail & BIT(6))
+ +				dimm->mtype = MEM_RMBS;
+ +			else if ((entry->type_detail & rdr_mask) == rdr_mask)
+ +				dimm->mtype = MEM_RDR;
+ +			else if (entry->type_detail & BIT(7))
+ +				dimm->mtype = MEM_SDR;
+ +			else if (entry->type_detail & BIT(9))
+ +				dimm->mtype = MEM_EDO;
+ +			else
+ +				dimm->mtype = MEM_UNKNOWN;
+ +		}
+  
+ -	switch (entry->memory_type) {
+ -	case 0x12:
+ -		if (entry->type_detail & BIT(13))
+ -			dimm->mtype = MEM_RDDR;
+ +		/*
+ +		 * Actually, we can only detect if the memory has bits for
+ +		 * checksum or not
+ +		 */
+ +		if (entry->total_width == entry->data_width)
+ +			dimm->edac_mode = EDAC_NONE;
+  		else
+ -			dimm->mtype = MEM_DDR;
+ -		break;
+ -	case 0x13:
+ -		if (entry->type_detail & BIT(13))
+ -			dimm->mtype = MEM_RDDR2;
+ -		else
+ -			dimm->mtype = MEM_DDR2;
+ -		break;
+ -	case 0x14:
+ -		dimm->mtype = MEM_FB_DDR2;
+ -		break;
+ -	case 0x18:
+ -		if (entry->type_detail & BIT(12))
+ -			dimm->mtype = MEM_NVDIMM;
+ -		else if (entry->type_detail & BIT(13))
+ -			dimm->mtype = MEM_RDDR3;
+ -		else
+ -			dimm->mtype = MEM_DDR3;
+ -		break;
+ -	case 0x1a:
+ -		if (entry->type_detail & BIT(12))
+ -			dimm->mtype = MEM_NVDIMM;
+ -		else if (entry->type_detail & BIT(13))
+ -			dimm->mtype = MEM_RDDR4;
+ -		else
+ -			dimm->mtype = MEM_DDR4;
+ -		break;
+ -	default:
+ -		if (entry->type_detail & BIT(6))
+ -			dimm->mtype = MEM_RMBS;
+ -		else if ((entry->type_detail & rdr_mask) == rdr_mask)
+ -			dimm->mtype = MEM_RDR;
+ -		else if (entry->type_detail & BIT(7))
+ -			dimm->mtype = MEM_SDR;
+ -		else if (entry->type_detail & BIT(9))
+ -			dimm->mtype = MEM_EDO;
+ -		else
+ -			dimm->mtype = MEM_UNKNOWN;
+ -	}
+ -
+ -	/*
+ -	 * Actually, we can only detect if the memory has bits for
+ -	 * checksum or not
+ -	 */
+ -	if (entry->total_width == entry->data_width)
+ -		dimm->edac_mode = EDAC_NONE;
+ -	else
+ -		dimm->edac_mode = EDAC_SECDED;
+ -
+ -	dimm->dtype = DEV_UNKNOWN;
+ -	dimm->grain = 128;		/* Likely, worse case */
+ -
+ -	dimm_setup_label(dimm, entry->handle);
+ -
+ -	if (dimm->nr_pages) {
+ -		edac_dbg(1, "DIMM%i: %s size = %d MB%s\n",
+ -			dimm->idx, edac_mem_types[dimm->mtype],
+ -			PAGES_TO_MiB(dimm->nr_pages),
+ -			(dimm->edac_mode != EDAC_NONE) ? "(ECC)" : "");
+ -		edac_dbg(2, "\ttype %d, detail 0x%02x, width %d(total %d)\n",
+ -			entry->memory_type, entry->type_detail,
+ -			entry->total_width, entry->data_width);
+ -	}
+ -
+ -	dimm->smbios_handle = entry->handle;
+ -}
+ +			dimm->edac_mode = EDAC_SECDED;
+  
+ -static void enumerate_dimms(const struct dmi_header *dh, void *arg)
+ -{
+ -	struct memdev_dmi_entry *entry = (struct memdev_dmi_entry *)dh;
+ -	struct ghes_hw_desc *hw = (struct ghes_hw_desc *)arg;
+ -	struct dimm_info *d;
+ -
+ -	if (dh->type != DMI_ENTRY_MEM_DEVICE)
+ -		return;
+ -
+ -	/* Enlarge the array with additional 16 */
+ -	if (!hw->num_dimms || !(hw->num_dimms % 16)) {
+ -		struct dimm_info *new;
+ -
+ -		new = krealloc_array(hw->dimms, hw->num_dimms + 16,
+ -				     sizeof(struct dimm_info), GFP_KERNEL);
+ -		if (!new) {
+ -			WARN_ON_ONCE(1);
+ -			return;
+ +		dimm->dtype = DEV_UNKNOWN;
+ +		dimm->grain = 128;		/* Likely, worse case */
+ +
+ +		dimm_setup_label(dimm, entry->handle);
+ +
+ +		if (dimm->nr_pages) {
+ +			edac_dbg(1, "DIMM%i: %s size = %d MB%s\n",
+ +				dimm_fill->count, edac_mem_types[dimm->mtype],
+ +				PAGES_TO_MiB(dimm->nr_pages),
+ +				(dimm->edac_mode != EDAC_NONE) ? "(ECC)" : "");
+ +			edac_dbg(2, "\ttype %d, detail 0x%02x, width %d(total %d)\n",
+ +				entry->memory_type, entry->type_detail,
+ +				entry->total_width, entry->data_width);
+  		}
+  
+ -		hw->dimms = new;
+ -	}
+ -
+ -	d = &hw->dimms[hw->num_dimms];
+ -	d->idx = hw->num_dimms;
+ -
+ -	assign_dmi_dimm_info(d, entry);
+ -
+ -	hw->num_dimms++;
+ -}
+ -
+ -static void ghes_scan_system(void)
+ -{
+ -	if (system_scanned)
+ -		return;
+ -
+ -	dmi_walk(enumerate_dimms, &ghes_hw);
+ -
+ -	system_scanned = true;
+ -}
+ -
+ -static int print_mem_error_other_detail(const struct cper_sec_mem_err *mem, char *msg,
+ -					const char *location, unsigned int len)
+ -{
+ -	u32 n;
+ -
+ -	if (!msg)
+ -		return 0;
+ -
+ -	n = 0;
+ -	len -= 1;
+ +		dimm->smbios_handle = entry->handle;
+  
+ -	n += scnprintf(msg + n, len - n, "APEI location: %s ", location);
+ -
+ -	if (!(mem->validation_bits & CPER_MEM_VALID_ERROR_STATUS))
+ -		goto out;
+ -
+ -	n += scnprintf(msg + n, len - n, "status(0x%016llx): ", mem->error_status);
+ -	n += scnprintf(msg + n, len - n, "%s ", cper_mem_err_status_str(mem->error_status));
+ -
+ -out:
+ -	msg[n] = '\0';
+ -
+ -	return n;
+ +		dimm_fill->count++;
+ +	}
+  }
+  
+- void ghes_edac_report_mem_error(int sev, struct cper_sec_mem_err *mem_err)
++ static int ghes_edac_report_mem_error(struct notifier_block *nb,
++ 				      unsigned long val, void *data)
+  {
+++<<<<<<< HEAD
+ +	enum hw_event_mc_err_type type;
+++=======
++ 	struct cper_sec_mem_err *mem_err = (struct cper_sec_mem_err *)data;
++ 	struct cper_mem_err_compact cmem;
+++>>>>>>> 8e40612f6146 (EDAC/ghes: Add a notifier for reporting memory errors)
+  	struct edac_raw_error_desc *e;
+  	struct mem_ctl_info *mci;
++ 	unsigned long sev = val;
+  	struct ghes_pvt *pvt;
+  	unsigned long flags;
+  	char *p;
+* Unmerged path drivers/acpi/apei/ghes.c
+* Unmerged path drivers/edac/ghes_edac.c
+diff --git a/include/acpi/ghes.h b/include/acpi/ghes.h
+index 292a5c40bd0c..150d88c838ef 100644
+--- a/include/acpi/ghes.h
++++ b/include/acpi/ghes.h
+@@ -76,18 +76,11 @@ int ghes_estatus_pool_init(unsigned int num_ghes);
+ /* From drivers/edac/ghes_edac.c */
+ 
+ #ifdef CONFIG_EDAC_GHES
+-void ghes_edac_report_mem_error(int sev, struct cper_sec_mem_err *mem_err);
+-
+ int ghes_edac_register(struct ghes *ghes, struct device *dev);
+ 
+ void ghes_edac_unregister(struct ghes *ghes);
+ 
+ #else
+-static inline void ghes_edac_report_mem_error(int sev,
+-				       struct cper_sec_mem_err *mem_err)
+-{
+-}
+-
+ static inline int ghes_edac_register(struct ghes *ghes, struct device *dev)
+ {
+ 	return -ENODEV;
+@@ -145,4 +138,7 @@ int ghes_notify_sea(void);
+ static inline int ghes_notify_sea(void) { return -ENOENT; }
+ #endif
+ 
++struct notifier_block;
++extern void ghes_register_report_chain(struct notifier_block *nb);
++extern void ghes_unregister_report_chain(struct notifier_block *nb);
+ #endif /* GHES_H */
