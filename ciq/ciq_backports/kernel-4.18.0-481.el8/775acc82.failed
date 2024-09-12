@@ -1,0 +1,191 @@
+x86/traps: Refactor exc_general_protection()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+commit 775acc82a88fd36f5e89a08d39874fdeeaa04247
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/775acc82.failed
+
+TDX brings a new exception -- Virtualization Exception (#VE). Handling
+of #VE structurally very similar to handling #GP.
+
+Extract two helpers from exc_general_protection() that can be reused for
+handling #VE.
+
+No functional changes.
+
+	Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+Link: https://lkml.kernel.org/r/20220405232939.73860-7-kirill.shutemov@linux.intel.com
+(cherry picked from commit 775acc82a88fd36f5e89a08d39874fdeeaa04247)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/traps.c
+diff --cc arch/x86/kernel/traps.c
+index 462aa0afd7cd,db8d22a0d003..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -526,13 -686,40 +526,50 @@@ static bool try_fixup_enqcmd_gp(void
+  #endif
+  }
+  
+++<<<<<<< HEAD
+ +dotraplinkage void
+ +do_general_protection(struct pt_regs *regs, long error_code)
+ +{
+ +	const char *desc = "general protection fault";
+ +	struct task_struct *tsk;
+ +
+ +	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+++=======
++ static bool gp_try_fixup_and_notify(struct pt_regs *regs, int trapnr,
++ 				    unsigned long error_code, const char *str)
++ {
++ 	if (fixup_exception(regs, trapnr, error_code, 0))
++ 		return true;
++ 
++ 	current->thread.error_code = error_code;
++ 	current->thread.trap_nr = trapnr;
++ 
++ 	/*
++ 	 * To be potentially processing a kprobe fault and to trust the result
++ 	 * from kprobe_running(), we have to be non-preemptible.
++ 	 */
++ 	if (!preemptible() && kprobe_running() &&
++ 	    kprobe_fault_handler(regs, trapnr))
++ 		return true;
++ 
++ 	return notify_die(DIE_GPF, str, regs, error_code, trapnr, SIGSEGV) == NOTIFY_STOP;
++ }
++ 
++ static void gp_user_force_sig_segv(struct pt_regs *regs, int trapnr,
++ 				   unsigned long error_code, const char *str)
++ {
++ 	current->thread.error_code = error_code;
++ 	current->thread.trap_nr = trapnr;
++ 	show_signal(current, SIGSEGV, "", str, regs, error_code);
++ 	force_sig(SIGSEGV);
++ }
++ 
++ DEFINE_IDTENTRY_ERRORCODE(exc_general_protection)
++ {
++ 	char desc[sizeof(GPFSTR) + 50 + 2*sizeof(unsigned long) + 1] = GPFSTR;
++ 	enum kernel_gp_hint hint = GP_NO_HINT;
++ 	unsigned long gp_addr;
+++>>>>>>> 775acc82a88f (x86/traps: Refactor exc_general_protection())
+  
+  	if (user_mode(regs) && try_fixup_enqcmd_gp())
+  		return;
+@@@ -550,33 -737,82 +587,97 @@@
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	tsk = current;
+ +	if (!user_mode(regs)) {
+ +		if (fixup_exception(regs, X86_TRAP_GP))
+ +			return;
+ +
+ +		tsk->thread.error_code = error_code;
+ +		tsk->thread.trap_nr = X86_TRAP_GP;
+ +		if (notify_die(DIE_GPF, desc, regs, error_code,
+ +			       X86_TRAP_GP, SIGSEGV) != NOTIFY_STOP)
+ +			die(desc, regs, error_code);
+ +		return;
+ +	}
+ +
+ +	tsk->thread.error_code = error_code;
+ +	tsk->thread.trap_nr = X86_TRAP_GP;
+ +
+ +	if (fixup_vdso_exception(regs, X86_TRAP_GP, error_code, 0))
+++=======
++ 	if (user_mode(regs)) {
++ 		if (fixup_iopl_exception(regs))
++ 			goto exit;
++ 
++ 		if (fixup_vdso_exception(regs, X86_TRAP_GP, error_code, 0))
++ 			goto exit;
++ 
++ 		gp_user_force_sig_segv(regs, X86_TRAP_GP, error_code, desc);
++ 		goto exit;
++ 	}
++ 
++ 	if (gp_try_fixup_and_notify(regs, X86_TRAP_GP, error_code, desc))
++ 		goto exit;
++ 
++ 	if (error_code)
++ 		snprintf(desc, sizeof(desc), "segment-related " GPFSTR);
++ 	else
++ 		hint = get_kernel_gp_address(regs, &gp_addr);
++ 
++ 	if (hint != GP_NO_HINT)
++ 		snprintf(desc, sizeof(desc), GPFSTR ", %s 0x%lx",
++ 			 (hint == GP_NON_CANONICAL) ? "probably for non-canonical address"
++ 						    : "maybe for address",
++ 			 gp_addr);
++ 
++ 	/*
++ 	 * KASAN is interested only in the non-canonical case, clear it
++ 	 * otherwise.
++ 	 */
++ 	if (hint != GP_NON_CANONICAL)
++ 		gp_addr = 0;
++ 
++ 	die_addr(desc, regs, error_code, gp_addr);
++ 
++ exit:
++ 	cond_local_irq_disable(regs);
++ }
++ 
++ static bool do_int3(struct pt_regs *regs)
++ {
++ 	int res;
++ 
++ #ifdef CONFIG_KGDB_LOW_LEVEL_TRAP
++ 	if (kgdb_ll_trap(DIE_INT3, "int3", regs, 0, X86_TRAP_BP,
++ 			 SIGTRAP) == NOTIFY_STOP)
++ 		return true;
++ #endif /* CONFIG_KGDB_LOW_LEVEL_TRAP */
++ 
++ #ifdef CONFIG_KPROBES
++ 	if (kprobe_int3_handler(regs))
++ 		return true;
++ #endif
++ 	res = notify_die(DIE_INT3, "int3", regs, 0, X86_TRAP_BP, SIGTRAP);
++ 
++ 	return res == NOTIFY_STOP;
++ }
++ NOKPROBE_SYMBOL(do_int3);
++ 
++ static void do_int3_user(struct pt_regs *regs)
++ {
++ 	if (do_int3(regs))
+++>>>>>>> 775acc82a88f (x86/traps: Refactor exc_general_protection())
+  		return;
+  
+ -	cond_local_irq_enable(regs);
+ -	do_trap(X86_TRAP_BP, SIGTRAP, "int3", regs, 0, 0, NULL);
+ -	cond_local_irq_disable(regs);
+ +	show_signal(tsk, SIGSEGV, "", desc, regs, error_code);
+ +
+ +	force_sig(SIGSEGV, tsk);
+  }
+ +NOKPROBE_SYMBOL(do_general_protection);
+  
+ -DEFINE_IDTENTRY_RAW(exc_int3)
+ +dotraplinkage void notrace do_int3(struct pt_regs *regs, long error_code)
+  {
+ -	/*
+ -	 * poke_int3_handler() is completely self contained code; it does (and
+ -	 * must) *NOT* call out to anything, lest it hits upon yet another
+ -	 * INT3.
+ -	 */
+  	if (poke_int3_handler(regs))
+  		return;
+  
+* Unmerged path arch/x86/kernel/traps.c
