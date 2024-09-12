@@ -496,22 +496,24 @@ int amd_sof_acp_probe(struct snd_sof_dev *sdev)
 	if (ret < 0) {
 		dev_err(sdev->dev, "failed to register IRQ %d\n",
 			sdev->ipc_irq);
-		pci_dev_put(adata->smn_dev);
-		return ret;
+		goto free_smn_dev;
 	}
 
 	ret = acp_init(sdev);
-	if (ret < 0) {
-		free_irq(sdev->ipc_irq, sdev);
-		pci_dev_put(adata->smn_dev);
-		return ret;
-	}
+	if (ret < 0)
+		goto free_ipc_irq;
 
 	acp_memory_init(sdev);
 
 	acp_dsp_stream_init(sdev);
 
 	return 0;
+
+free_ipc_irq:
+	free_irq(sdev->ipc_irq, sdev);
+free_smn_dev:
+	pci_dev_put(adata->smn_dev);
+	return ret;
 }
 EXPORT_SYMBOL(amd_sof_acp_probe);
 
