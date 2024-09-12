@@ -1,0 +1,119 @@
+tun: avoid double free in tun_free_netdev
+
+jira LE-1907
+cve CVE-2022-4744
+Rebuild_History Non-Buildable kernel-4.18.0-513.el8
+commit-author George Kennedy <george.kennedy@oracle.com>
+commit 158b515f703e75e7d68289bf4d98c664e1d632df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-513.el8/158b515f.failed
+
+Avoid double free in tun_free_netdev() by moving the
+dev->tstats and tun->security allocs to a new ndo_init routine
+(tun_net_init()) that will be called by register_netdevice().
+ndo_init is paired with the desctructor (tun_free_netdev()),
+so if there's an error in register_netdevice() the destructor
+will handle the frees.
+
+BUG: KASAN: double-free or invalid-free in selinux_tun_dev_free_security+0x1a/0x20 security/selinux/hooks.c:5605
+
+CPU: 0 PID: 25750 Comm: syz-executor416 Not tainted 5.16.0-rc2-syzk #1
+Hardware name: Red Hat KVM, BIOS
+Call Trace:
+<TASK>
+__dump_stack lib/dump_stack.c:88 [inline]
+dump_stack_lvl+0x89/0xb5 lib/dump_stack.c:106
+print_address_description.constprop.9+0x28/0x160 mm/kasan/report.c:247
+kasan_report_invalid_free+0x55/0x80 mm/kasan/report.c:372
+____kasan_slab_free mm/kasan/common.c:346 [inline]
+__kasan_slab_free+0x107/0x120 mm/kasan/common.c:374
+kasan_slab_free include/linux/kasan.h:235 [inline]
+slab_free_hook mm/slub.c:1723 [inline]
+slab_free_freelist_hook mm/slub.c:1749 [inline]
+slab_free mm/slub.c:3513 [inline]
+kfree+0xac/0x2d0 mm/slub.c:4561
+selinux_tun_dev_free_security+0x1a/0x20 security/selinux/hooks.c:5605
+security_tun_dev_free_security+0x4f/0x90 security/security.c:2342
+tun_free_netdev+0xe6/0x150 drivers/net/tun.c:2215
+netdev_run_todo+0x4df/0x840 net/core/dev.c:10627
+rtnl_unlock+0x13/0x20 net/core/rtnetlink.c:112
+__tun_chr_ioctl+0x80c/0x2870 drivers/net/tun.c:3302
+tun_chr_ioctl+0x2f/0x40 drivers/net/tun.c:3311
+vfs_ioctl fs/ioctl.c:51 [inline]
+__do_sys_ioctl fs/ioctl.c:874 [inline]
+__se_sys_ioctl fs/ioctl.c:860 [inline]
+__x64_sys_ioctl+0x19d/0x220 fs/ioctl.c:860
+do_syscall_x64 arch/x86/entry/common.c:50 [inline]
+do_syscall_64+0x3a/0x80 arch/x86/entry/common.c:80
+entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+	Reported-by: syzkaller <syzkaller@googlegroups.com>
+	Signed-off-by: George Kennedy <george.kennedy@oracle.com>
+	Suggested-by: Jakub Kicinski <kuba@kernel.org>
+Link: https://lore.kernel.org/r/1639679132-19884-1-git-send-email-george.kennedy@oracle.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 158b515f703e75e7d68289bf4d98c664e1d632df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/tun.c
+diff --cc drivers/net/tun.c
+index e614370581d2,45a67e72a02c..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -2803,42 -2762,17 +2849,23 @@@ static int tun_set_iff(struct net *net
+  		tun->rx_batched = 0;
+  		RCU_INIT_POINTER(tun->steering_prog, NULL);
+  
+- 		dev->tstats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
+- 		if (!dev->tstats) {
+- 			err = -ENOMEM;
+- 			goto err_free_dev;
+- 		}
++ 		tun->ifr = ifr;
++ 		tun->file = file;
+  
+- 		spin_lock_init(&tun->lock);
+- 
+- 		err = security_tun_dev_alloc_security(&tun->security);
+- 		if (err < 0)
+- 			goto err_free_stat;
+- 
+- 		tun_net_init(dev);
+- 		tun_flow_init(tun);
+- 
+- 		dev->hw_features = NETIF_F_SG | NETIF_F_FRAGLIST |
+- 				   TUN_USER_FEATURES | NETIF_F_HW_VLAN_CTAG_TX |
+- 				   NETIF_F_HW_VLAN_STAG_TX;
+- 		dev->features = dev->hw_features | NETIF_F_LLTX;
+- 		dev->vlan_features = dev->features &
+- 				     ~(NETIF_F_HW_VLAN_CTAG_TX |
+- 				       NETIF_F_HW_VLAN_STAG_TX);
+- 
+- 		tun->flags = (tun->flags & ~TUN_FEATURES) |
+- 			      (ifr->ifr_flags & TUN_FEATURES);
+- 
+- 		INIT_LIST_HEAD(&tun->disabled);
+- 		err = tun_attach(tun, file, false, ifr->ifr_flags & IFF_NAPI,
+- 				 ifr->ifr_flags & IFF_NAPI_FRAGS, false);
+- 		if (err < 0)
+- 			goto err_free_flow;
++ 		tun_net_initialize(dev);
+  
+  		err = register_netdevice(tun->dev);
+++<<<<<<< HEAD
+ +		if (err < 0)
+ +			goto err_detach;
+ +		/* free_netdev() won't check refcnt, to aovid race
+++=======
++ 		if (err < 0) {
++ 			free_netdev(dev);
++ 			return err;
++ 		}
++ 		/* free_netdev() won't check refcnt, to avoid race
+++>>>>>>> 158b515f703e (tun: avoid double free in tun_free_netdev)
+  		 * with dev_put() we need publish tun after registration.
+  		 */
+  		rcu_assign_pointer(tfile->tun, tun);
+* Unmerged path drivers/net/tun.c
