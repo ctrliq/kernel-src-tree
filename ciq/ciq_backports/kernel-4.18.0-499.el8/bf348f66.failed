@@ -1,0 +1,242 @@
+KVM: x86: lapic: Rename [GET/SET]_APIC_DEST_FIELD to [GET/SET]_XAPIC_DEST_FIELD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-499.el8
+commit-author Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+commit bf348f667ed36c0799dd6d10adb7be9cdfea48c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-499.el8/bf348f66.failed
+
+To signify that the macros only support 8-bit xAPIC destination ID.
+
+	Suggested-by: Maxim Levitsky <mlevitsk@redhat.com>
+	Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+	Reviewed-by: Pankaj Gupta <pankaj.gupta@amd.com>
+	Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+	Reviewed-by: Paolo Bonzini <pbonzini@redhat.com>
+Message-Id: <20220519102709.24125-3-suravee.suthikulpanit@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit bf348f667ed36c0799dd6d10adb7be9cdfea48c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/apic/ipi.c
+diff --cc arch/x86/kernel/apic/ipi.c
+index 82f9244fe61f,2a6509e8c840..000000000000
+--- a/arch/x86/kernel/apic/ipi.c
++++ b/arch/x86/kernel/apic/ipi.c
+@@@ -1,24 -1,114 +1,128 @@@
+  // SPDX-License-Identifier: GPL-2.0
+ -
+  #include <linux/cpumask.h>
+ -#include <linux/smp.h>
+ -#include <asm/io_apic.h>
+ -
+ -#include "local.h"
+ -
+ -DEFINE_STATIC_KEY_FALSE(apic_use_ipi_shorthand);
+ -
+ +#include <linux/interrupt.h>
+ +
+ +#include <linux/mm.h>
+ +#include <linux/delay.h>
+ +#include <linux/spinlock.h>
+ +#include <linux/kernel_stat.h>
+ +#include <linux/mc146818rtc.h>
+ +#include <linux/cache.h>
+ +#include <linux/cpu.h>
+ +
+ +#include <asm/smp.h>
+ +#include <asm/mtrr.h>
+ +#include <asm/tlbflush.h>
+ +#include <asm/mmu_context.h>
+ +#include <asm/apic.h>
+ +#include <asm/proto.h>
+ +#include <asm/ipi.h>
+ +
+++<<<<<<< HEAD
+ +void __default_send_IPI_shortcut(unsigned int shortcut, int vector, unsigned int dest)
+++=======
++ #ifdef CONFIG_SMP
++ static int apic_ipi_shorthand_off __ro_after_init;
++ 
++ static __init int apic_ipi_shorthand(char *str)
++ {
++ 	get_option(&str, &apic_ipi_shorthand_off);
++ 	return 1;
++ }
++ __setup("no_ipi_broadcast=", apic_ipi_shorthand);
++ 
++ static int __init print_ipi_mode(void)
++ {
++ 	pr_info("IPI shorthand broadcast: %s\n",
++ 		apic_ipi_shorthand_off ? "disabled" : "enabled");
++ 	return 0;
++ }
++ late_initcall(print_ipi_mode);
++ 
++ void apic_smt_update(void)
++ {
++ 	/*
++ 	 * Do not switch to broadcast mode if:
++ 	 * - Disabled on the command line
++ 	 * - Only a single CPU is online
++ 	 * - Not all present CPUs have been at least booted once
++ 	 *
++ 	 * The latter is important as the local APIC might be in some
++ 	 * random state and a broadcast might cause havoc. That's
++ 	 * especially true for NMI broadcasting.
++ 	 */
++ 	if (apic_ipi_shorthand_off || num_online_cpus() == 1 ||
++ 	    !cpumask_equal(cpu_present_mask, &cpus_booted_once_mask)) {
++ 		static_branch_disable(&apic_use_ipi_shorthand);
++ 	} else {
++ 		static_branch_enable(&apic_use_ipi_shorthand);
++ 	}
++ }
++ 
++ void apic_send_IPI_allbutself(unsigned int vector)
++ {
++ 	if (num_online_cpus() < 2)
++ 		return;
++ 
++ 	if (static_branch_likely(&apic_use_ipi_shorthand))
++ 		apic->send_IPI_allbutself(vector);
++ 	else
++ 		apic->send_IPI_mask_allbutself(cpu_online_mask, vector);
++ }
++ 
++ /*
++  * Send a 'reschedule' IPI to another CPU. It goes straight through and
++  * wastes no time serializing anything. Worst case is that we lose a
++  * reschedule ...
++  */
++ void native_smp_send_reschedule(int cpu)
++ {
++ 	if (unlikely(cpu_is_offline(cpu))) {
++ 		WARN(1, "sched: Unexpected reschedule of offline CPU#%d!\n", cpu);
++ 		return;
++ 	}
++ 	apic->send_IPI(cpu, RESCHEDULE_VECTOR);
++ }
++ 
++ void native_send_call_func_single_ipi(int cpu)
++ {
++ 	apic->send_IPI(cpu, CALL_FUNCTION_SINGLE_VECTOR);
++ }
++ 
++ void native_send_call_func_ipi(const struct cpumask *mask)
++ {
++ 	if (static_branch_likely(&apic_use_ipi_shorthand)) {
++ 		unsigned int cpu = smp_processor_id();
++ 
++ 		if (!cpumask_or_equal(mask, cpumask_of(cpu), cpu_online_mask))
++ 			goto sendmask;
++ 
++ 		if (cpumask_test_cpu(cpu, mask))
++ 			apic->send_IPI_all(CALL_FUNCTION_VECTOR);
++ 		else if (num_online_cpus() > 1)
++ 			apic->send_IPI_allbutself(CALL_FUNCTION_VECTOR);
++ 		return;
++ 	}
++ 
++ sendmask:
++ 	apic->send_IPI_mask(mask, CALL_FUNCTION_VECTOR);
++ }
++ 
++ #endif /* CONFIG_SMP */
++ 
++ static inline int __prepare_ICR2(unsigned int mask)
++ {
++ 	return SET_XAPIC_DEST_FIELD(mask);
++ }
++ 
++ static inline void __xapic_wait_icr_idle(void)
++ {
++ 	while (native_apic_mem_read(APIC_ICR) & APIC_ICR_BUSY)
++ 		cpu_relax();
++ }
++ 
++ void __default_send_IPI_shortcut(unsigned int shortcut, int vector)
+++>>>>>>> bf348f667ed3 (KVM: x86: lapic: Rename [GET/SET]_APIC_DEST_FIELD to [GET/SET]_XAPIC_DEST_FIELD)
+  {
+  	/*
+  	 * Subtle. In the case of the 'never do double writes' workaround
+diff --git a/arch/x86/hyperv/hv_apic.c b/arch/x86/hyperv/hv_apic.c
+index db2d92fb44da..fb8b2c088681 100644
+--- a/arch/x86/hyperv/hv_apic.c
++++ b/arch/x86/hyperv/hv_apic.c
+@@ -46,7 +46,7 @@ static void hv_apic_icr_write(u32 low, u32 id)
+ {
+ 	u64 reg_val;
+ 
+-	reg_val = SET_APIC_DEST_FIELD(id);
++	reg_val = SET_XAPIC_DEST_FIELD(id);
+ 	reg_val = reg_val << 32;
+ 	reg_val |= low;
+ 
+diff --git a/arch/x86/include/asm/apicdef.h b/arch/x86/include/asm/apicdef.h
+index 5716f22f81ac..863c2cad5872 100644
+--- a/arch/x86/include/asm/apicdef.h
++++ b/arch/x86/include/asm/apicdef.h
+@@ -89,8 +89,8 @@
+ #define		APIC_DM_EXTINT		0x00700
+ #define		APIC_VECTOR_MASK	0x000FF
+ #define	APIC_ICR2	0x310
+-#define		GET_APIC_DEST_FIELD(x)	(((x) >> 24) & 0xFF)
+-#define		SET_APIC_DEST_FIELD(x)	((x) << 24)
++#define		GET_XAPIC_DEST_FIELD(x)	(((x) >> 24) & 0xFF)
++#define		SET_XAPIC_DEST_FIELD(x)	((x) << 24)
+ #define	APIC_LVTT	0x320
+ #define	APIC_LVTTHMR	0x330
+ #define	APIC_LVTPC	0x340
+diff --git a/arch/x86/kernel/apic/apic.c b/arch/x86/kernel/apic/apic.c
+index 3ddab367c447..ace6311d5e44 100644
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@ -270,7 +270,7 @@ void native_apic_icr_write(u32 low, u32 id)
+ 	unsigned long flags;
+ 
+ 	local_irq_save(flags);
+-	apic_write(APIC_ICR2, SET_APIC_DEST_FIELD(id));
++	apic_write(APIC_ICR2, SET_XAPIC_DEST_FIELD(id));
+ 	apic_write(APIC_ICR, low);
+ 	local_irq_restore(flags);
+ }
+* Unmerged path arch/x86/kernel/apic/ipi.c
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 6a824c72689d..e5d7474fca71 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -1327,7 +1327,7 @@ void kvm_apic_send_ipi(struct kvm_lapic *apic, u32 icr_low, u32 icr_high)
+ 	if (apic_x2apic_mode(apic))
+ 		irq.dest_id = icr_high;
+ 	else
+-		irq.dest_id = GET_APIC_DEST_FIELD(icr_high);
++		irq.dest_id = GET_XAPIC_DEST_FIELD(icr_high);
+ 
+ 	trace_kvm_apic_ipi(icr_low, irq.dest_id);
+ 
+diff --git a/arch/x86/kvm/svm/avic.c b/arch/x86/kvm/svm/avic.c
+index 049066ca6396..1fa3c2c51575 100644
+--- a/arch/x86/kvm/svm/avic.c
++++ b/arch/x86/kvm/svm/avic.c
+@@ -304,7 +304,7 @@ static int avic_kick_target_vcpus_fast(struct kvm *kvm, struct kvm_lapic *source
+ 	if (apic_x2apic_mode(source))
+ 		dest = icrh;
+ 	else
+-		dest = GET_APIC_DEST_FIELD(icrh);
++		dest = GET_XAPIC_DEST_FIELD(icrh);
+ 
+ 	if (dest_mode == APIC_DEST_PHYSICAL) {
+ 		/* broadcast destination, use slow path */
+@@ -396,7 +396,7 @@ static void avic_kick_target_vcpus(struct kvm *kvm, struct kvm_lapic *source,
+ 	 */
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+ 		if (kvm_apic_match_dest(vcpu, source, icrl & APIC_SHORT_MASK,
+-					GET_APIC_DEST_FIELD(icrh),
++					GET_XAPIC_DEST_FIELD(icrh),
+ 					icrl & APIC_DEST_MASK)) {
+ 			vcpu->arch.apic->irr_pending = true;
+ 			svm_complete_interrupt_delivery(vcpu,
