@@ -1,0 +1,164 @@
+ASoC: SOF: sof-audio: setup sched widgets during pipeline complete step
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+commit 01429183f479c54c1b5d15453a8ce574ea43e525
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/01429183.failed
+
+Older firmware prior to ABI 3.19 has a dependency where the scheduler
+widgets need to be setup last. Moving the call to sof_widget_setup()
+before the pipeline_complete() call also helps remove the need for the
+'reverse' direction when walking through the widget list - this was
+only working because of the topology macros but the topology does not
+require any order.
+
+Fixes: 5fcdbb2d45df ("ASoC: SOF: Add support for dynamic pipelines")
+	Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+	Signed-off-by: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+Link: https://lore.kernel.org/r/20211123171606.129350-1-kai.vehmanen@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 01429183f479c54c1b5d15453a8ce574ea43e525)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/sof-audio.c
+diff --cc sound/soc/sof/sof-audio.c
+index f17b0b574e42,f4e142ec0fbd..000000000000
+--- a/sound/soc/sof/sof-audio.c
++++ b/sound/soc/sof/sof-audio.c
+@@@ -308,18 -635,45 +308,56 @@@ const struct sof_ipc_pipe_new *snd_sof_
+  	return NULL;
+  }
+  
+ -int sof_set_up_pipelines(struct snd_sof_dev *sdev, bool verify)
+ +int sof_set_up_pipelines(struct device *dev)
+  {
+++<<<<<<< HEAD
+ +	struct snd_sof_dev *sdev = dev_get_drvdata(dev);
+++=======
++ 	struct sof_ipc_fw_version *v = &sdev->fw_ready.version;
+++>>>>>>> 01429183f479 (ASoC: SOF: sof-audio: setup sched widgets during pipeline complete step)
+  	struct snd_sof_widget *swidget;
+  	struct snd_sof_route *sroute;
+ +	struct snd_sof_dai *dai;
+  	int ret;
+  
+  	/* restore pipeline components */
+++<<<<<<< HEAD
+ +	list_for_each_entry_reverse(swidget, &sdev->widget_list, list) {
+ +		/* reset widget use_count after resuming */
+ +		swidget->use_count = 0;
+++=======
++ 	list_for_each_entry(swidget, &sdev->widget_list, list) {
++ 		/* only set up the widgets belonging to static pipelines */
++ 		if (!verify && swidget->dynamic_pipeline_widget)
++ 			continue;
++ 
++ 		/*
++ 		 * For older firmware, skip scheduler widgets in this loop,
++ 		 * sof_widget_setup() will be called in the 'complete pipeline' loop
++ 		 */
++ 		if (v->abi_version < SOF_ABI_VER(3, 19, 0) &&
++ 		    swidget->id == snd_soc_dapm_scheduler)
++ 			continue;
++ 
++ 		/* update DAI config. The IPC will be sent in sof_widget_setup() */
++ 		if (WIDGET_IS_DAI(swidget->id)) {
++ 			struct snd_sof_dai *dai = swidget->private;
++ 			struct sof_ipc_dai_config *config;
++ 
++ 			if (!dai || !dai->dai_config)
++ 				continue;
++ 
++ 			config = dai->dai_config;
++ 			/*
++ 			 * The link DMA channel would be invalidated for running
++ 			 * streams but not for streams that were in the PAUSED
++ 			 * state during suspend. So invalidate it here before setting
++ 			 * the dai config in the DSP.
++ 			 */
++ 			if (config->type == SOF_DAI_INTEL_HDA)
++ 				config->hda.link_dma_ch = DMA_CHAN_INVALID;
++ 		}
+++>>>>>>> 01429183f479 (ASoC: SOF: sof-audio: setup sched widgets during pipeline complete step)
+  
+  		ret = sof_widget_setup(sdev, swidget);
+  		if (ret < 0)
+@@@ -377,8 -699,18 +415,21 @@@
+  	list_for_each_entry(swidget, &sdev->widget_list, list) {
+  		switch (swidget->id) {
+  		case snd_soc_dapm_scheduler:
+++<<<<<<< HEAD
+++=======
++ 			/* only complete static pipelines */
++ 			if (!verify && swidget->dynamic_pipeline_widget)
++ 				continue;
++ 
++ 			if (v->abi_version < SOF_ABI_VER(3, 19, 0)) {
++ 				ret = sof_widget_setup(sdev, swidget);
++ 				if (ret < 0)
++ 					return ret;
++ 			}
++ 
+++>>>>>>> 01429183f479 (ASoC: SOF: sof-audio: setup sched widgets during pipeline complete step)
+  			swidget->complete =
+ -				snd_sof_complete_pipeline(sdev, swidget);
+ +				snd_sof_complete_pipeline(dev, swidget);
+  			break;
+  		default:
+  			break;
+@@@ -389,21 -721,38 +440,40 @@@
+  }
+  
+  /*
+ - * For older firmware, this function doesn't free widgets for static pipelines during suspend.
+ - * It only resets use_count for all widgets.
+ + * This function doesn't free widgets. It only resets the set up status for all routes and
+ + * use_count for all widgets.
+   */
+ -int sof_tear_down_pipelines(struct snd_sof_dev *sdev, bool verify)
+ +void sof_tear_down_pipelines(struct device *dev)
+  {
+ -	struct sof_ipc_fw_version *v = &sdev->fw_ready.version;
+ +	struct snd_sof_dev *sdev = dev_get_drvdata(dev);
+  	struct snd_sof_widget *swidget;
+  	struct snd_sof_route *sroute;
+ -	int ret;
+  
+  	/*
+ -	 * This function is called during suspend and for one-time topology verification during
+ -	 * first boot. In both cases, there is no need to protect swidget->use_count and
+ -	 * sroute->setup because during suspend all streams are suspended and during topology
+ -	 * loading the sound card unavailable to open PCMs.
+ +	 * No need to protect swidget->use_count and sroute->setup as this function is called only
+ +	 * during the suspend callback and all streams should be suspended by then
+  	 */
+++<<<<<<< HEAD
+ +	list_for_each_entry(swidget, &sdev->widget_list, list)
+ +		swidget->use_count = 0;
+++=======
++ 	list_for_each_entry(swidget, &sdev->widget_list, list) {
++ 		if (swidget->dynamic_pipeline_widget)
++ 			continue;
++ 
++ 		/* Do not free widgets for static pipelines with FW ABI older than 3.19 */
++ 		if (!verify && !swidget->dynamic_pipeline_widget &&
++ 		    v->abi_version < SOF_ABI_VER(3, 19, 0)) {
++ 			swidget->use_count = 0;
++ 			swidget->complete = 0;
++ 			continue;
++ 		}
++ 
++ 		ret = sof_widget_free(sdev, swidget);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
+++>>>>>>> 01429183f479 (ASoC: SOF: sof-audio: setup sched widgets during pipeline complete step)
+  
+  	list_for_each_entry(sroute, &sdev->route_list, list)
+  		sroute->setup = false;
+* Unmerged path sound/soc/sof/sof-audio.c
