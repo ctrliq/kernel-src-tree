@@ -1,0 +1,303 @@
+xfs: use current->journal_info for detecting transaction recursion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 756b1c343333a5aefcc26b0409f3fd16f72281bf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/756b1c34.failed
+
+Because the iomap code using PF_MEMALLOC_NOFS to detect transaction
+recursion in XFS is just wrong. Remove it from the iomap code and
+replace it with XFS specific internal checks using
+current->journal_info instead.
+
+[djwong: This change also realigns the lifetime of NOFS flag changes to
+match the incore transaction, instead of the inconsistent scheme we have
+now.]
+
+Fixes: 9070733b4efa ("xfs: abstract PF_FSTRANS to PF_MEMALLOC_NOFS")
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 756b1c343333a5aefcc26b0409f3fd16f72281bf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+diff --cc fs/xfs/xfs_aops.c
+index 2b0f57d78af0,b4186d666157..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -57,6 -51,33 +57,36 @@@ xfs_setfilesize
+  	if (error)
+  		return error;
+  
+++<<<<<<< HEAD
+++=======
++ 	ioend->io_private = tp;
++ 
++ 	/*
++ 	 * We may pass freeze protection with a transaction.  So tell lockdep
++ 	 * we released it.
++ 	 */
++ 	__sb_writers_release(ioend->io_inode->i_sb, SB_FREEZE_FS);
++ 	/*
++ 	 * We hand off the transaction to the completion thread now, so
++ 	 * clear the flag here.
++ 	 */
++ 	xfs_trans_clear_context(tp);
++ 	return 0;
++ }
++ 
++ /*
++  * Update on-disk file size now that data has been written to disk.
++  */
++ STATIC int
++ __xfs_setfilesize(
++ 	struct xfs_inode	*ip,
++ 	struct xfs_trans	*tp,
++ 	xfs_off_t		offset,
++ 	size_t			size)
++ {
++ 	xfs_fsize_t		isize;
++ 
+++>>>>>>> 756b1c343333 (xfs: use current->journal_info for detecting transaction recursion)
+  	xfs_ilock(ip, XFS_ILOCK_EXCL);
+  	isize = xfs_new_eof(ip, offset + size);
+  	if (!isize) {
+@@@ -74,6 -95,48 +104,51 @@@
+  	return xfs_trans_commit(tp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int
++ xfs_setfilesize(
++ 	struct xfs_inode	*ip,
++ 	xfs_off_t		offset,
++ 	size_t			size)
++ {
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_trans	*tp;
++ 	int			error;
++ 
++ 	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_fsyncts, 0, 0, 0, &tp);
++ 	if (error)
++ 		return error;
++ 
++ 	return __xfs_setfilesize(ip, tp, offset, size);
++ }
++ 
++ STATIC int
++ xfs_setfilesize_ioend(
++ 	struct iomap_ioend	*ioend,
++ 	int			error)
++ {
++ 	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
++ 	struct xfs_trans	*tp = ioend->io_private;
++ 
++ 	/*
++ 	 * The transaction may have been allocated in the I/O submission thread,
++ 	 * thus we need to mark ourselves as being in a transaction manually.
++ 	 * Similarly for freeze protection.
++ 	 */
++ 	xfs_trans_set_context(tp);
++ 	__sb_writers_acquired(VFS_I(ip)->i_sb, SB_FREEZE_FS);
++ 
++ 	/* we abort the update if there was an IO error */
++ 	if (error) {
++ 		xfs_trans_cancel(tp);
++ 		return error;
++ 	}
++ 
++ 	return __xfs_setfilesize(ip, tp, ioend->io_offset, ioend->io_size);
++ }
++ 
+++>>>>>>> 756b1c343333 (xfs: use current->journal_info for detecting transaction recursion)
+  /*
+   * IO write completion.
+   */
+diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
+index 3234651c90e8..6a8614b565b4 100644
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@ -1530,13 +1530,6 @@ iomap_do_writepage(struct page *page, struct writeback_control *wbc, void *data)
+ 			PF_MEMALLOC))
+ 		goto redirty;
+ 
+-	/*
+-	 * Given that we do not allow direct reclaim to call us, we should
+-	 * never be called in a recursive filesystem reclaim context.
+-	 */
+-	if (WARN_ON_ONCE(current->flags & PF_MEMALLOC_NOFS))
+-		goto redirty;
+-
+ 	/*
+ 	 * Is this page beyond the end of the file?
+ 	 *
+diff --git a/fs/xfs/libxfs/xfs_btree.c b/fs/xfs/libxfs/xfs_btree.c
+index b56ff451adce..5b6fcb9b44e2 100644
+--- a/fs/xfs/libxfs/xfs_btree.c
++++ b/fs/xfs/libxfs/xfs_btree.c
+@@ -2805,7 +2805,7 @@ xfs_btree_split_worker(
+ 	struct xfs_btree_split_args	*args = container_of(work,
+ 						struct xfs_btree_split_args, work);
+ 	unsigned long		pflags;
+-	unsigned long		new_pflags = PF_MEMALLOC_NOFS;
++	unsigned long		new_pflags = 0;
+ 
+ 	/*
+ 	 * we are in a transaction context here, but may also be doing work
+@@ -2817,12 +2817,20 @@ xfs_btree_split_worker(
+ 		new_pflags |= PF_MEMALLOC | PF_SWAPWRITE | PF_KSWAPD;
+ 
+ 	current_set_flags_nested(&pflags, new_pflags);
++	xfs_trans_set_context(args->cur->bc_tp);
+ 
+ 	args->result = __xfs_btree_split(args->cur, args->level, args->ptrp,
+ 					 args->key, args->curp, args->stat);
+-	complete(args->done);
+ 
++	xfs_trans_clear_context(args->cur->bc_tp);
+ 	current_restore_flags_nested(&pflags, new_pflags);
++
++	/*
++	 * Do not access args after complete() has run here. We don't own args
++	 * and the owner may run and free args before we return here.
++	 */
++	complete(args->done);
++
+ }
+ 
+ /*
+* Unmerged path fs/xfs/xfs_aops.c
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index 377f3961d7ed..b22a09e9daee 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -72,6 +72,7 @@ xfs_trans_free(
+ 	xfs_extent_busy_clear(tp->t_mountp, &tp->t_busy, false);
+ 
+ 	trace_xfs_trans_free(tp, _RET_IP_);
++	xfs_trans_clear_context(tp);
+ 	if (!(tp->t_flags & XFS_TRANS_NO_WRITECOUNT))
+ 		sb_end_intwrite(tp->t_mountp->m_super);
+ 	xfs_trans_free_dqinfo(tp);
+@@ -123,7 +124,8 @@ xfs_trans_dup(
+ 
+ 	ntp->t_rtx_res = tp->t_rtx_res - tp->t_rtx_res_used;
+ 	tp->t_rtx_res = tp->t_rtx_res_used;
+-	ntp->t_pflags = tp->t_pflags;
++
++	xfs_trans_switch_context(tp, ntp);
+ 
+ 	/* move deferred ops over to the new tp */
+ 	xfs_defer_move(ntp, tp);
+@@ -157,9 +159,6 @@ xfs_trans_reserve(
+ 	int			error = 0;
+ 	bool			rsvd = (tp->t_flags & XFS_TRANS_RESERVE) != 0;
+ 
+-	/* Mark this thread as being in a transaction */
+-	current_set_flags_nested(&tp->t_pflags, PF_MEMALLOC_NOFS);
+-
+ 	/*
+ 	 * Attempt to reserve the needed disk blocks by decrementing
+ 	 * the number needed from the number available.  This will
+@@ -167,10 +166,8 @@ xfs_trans_reserve(
+ 	 */
+ 	if (blocks > 0) {
+ 		error = xfs_mod_fdblocks(mp, -((int64_t)blocks), rsvd);
+-		if (error != 0) {
+-			current_restore_flags_nested(&tp->t_pflags, PF_MEMALLOC_NOFS);
++		if (error != 0)
+ 			return -ENOSPC;
+-		}
+ 		tp->t_blk_res += blocks;
+ 	}
+ 
+@@ -244,9 +241,6 @@ xfs_trans_reserve(
+ 		xfs_mod_fdblocks(mp, (int64_t)blocks, rsvd);
+ 		tp->t_blk_res = 0;
+ 	}
+-
+-	current_restore_flags_nested(&tp->t_pflags, PF_MEMALLOC_NOFS);
+-
+ 	return error;
+ }
+ 
+@@ -272,6 +266,7 @@ xfs_trans_alloc(
+ 	tp = kmem_cache_zalloc(xfs_trans_zone, GFP_KERNEL | __GFP_NOFAIL);
+ 	if (!(flags & XFS_TRANS_NO_WRITECOUNT))
+ 		sb_start_intwrite(mp->m_super);
++	xfs_trans_set_context(tp);
+ 
+ 	/*
+ 	 * Zero-reservation ("empty") transactions can't modify anything, so
+@@ -900,7 +895,6 @@ __xfs_trans_commit(
+ 
+ 	xfs_log_commit_cil(mp, tp, &commit_lsn, regrant);
+ 
+-	current_restore_flags_nested(&tp->t_pflags, PF_MEMALLOC_NOFS);
+ 	xfs_trans_free(tp);
+ 
+ 	/*
+@@ -932,7 +926,6 @@ __xfs_trans_commit(
+ 			xfs_log_ticket_ungrant(mp->m_log, tp->t_ticket);
+ 		tp->t_ticket = NULL;
+ 	}
+-	current_restore_flags_nested(&tp->t_pflags, PF_MEMALLOC_NOFS);
+ 	xfs_trans_free_items(tp, !!error);
+ 	xfs_trans_free(tp);
+ 
+@@ -992,9 +985,6 @@ xfs_trans_cancel(
+ 		tp->t_ticket = NULL;
+ 	}
+ 
+-	/* mark this thread as no longer being in a transaction */
+-	current_restore_flags_nested(&tp->t_pflags, PF_MEMALLOC_NOFS);
+-
+ 	xfs_trans_free_items(tp, dirty);
+ 	xfs_trans_free(tp);
+ }
+diff --git a/fs/xfs/xfs_trans.h b/fs/xfs/xfs_trans.h
+index 8b03fbfe9a1b..9dd745cf77c9 100644
+--- a/fs/xfs/xfs_trans.h
++++ b/fs/xfs/xfs_trans.h
+@@ -281,4 +281,34 @@ int xfs_trans_alloc_ichange(struct xfs_inode *ip, struct xfs_dquot *udqp,
+ 		struct xfs_dquot *gdqp, struct xfs_dquot *pdqp, bool force,
+ 		struct xfs_trans **tpp);
+ 
++static inline void
++xfs_trans_set_context(
++	struct xfs_trans	*tp)
++{
++	ASSERT(current->journal_info == NULL);
++	tp->t_pflags = memalloc_nofs_save();
++	current->journal_info = tp;
++}
++
++static inline void
++xfs_trans_clear_context(
++	struct xfs_trans	*tp)
++{
++	if (current->journal_info == tp) {
++		memalloc_nofs_restore(tp->t_pflags);
++		current->journal_info = NULL;
++	}
++}
++
++static inline void
++xfs_trans_switch_context(
++	struct xfs_trans	*old_tp,
++	struct xfs_trans	*new_tp)
++{
++	ASSERT(current->journal_info == old_tp);
++	new_tp->t_pflags = old_tp->t_pflags;
++	old_tp->t_pflags = 0;
++	current->journal_info = new_tp;
++}
++
+ #endif	/* __XFS_TRANS_H__ */
