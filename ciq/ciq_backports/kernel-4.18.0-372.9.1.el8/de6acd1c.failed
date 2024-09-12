@@ -1,0 +1,199 @@
+ice: fix adding different tunnels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+commit de6acd1cdd4d38823b7f4adae82e8a7d62993354
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/de6acd1c.failed
+
+Adding filters with the same values inside for VXLAN and Geneve causes HW
+error, because it looks exactly the same. To choose between different
+type of tunnels new recipe is needed. Add storing tunnel types in
+creating recipes function and start checking it in finding function.
+
+Change getting open tunnels function to return port on correct tunnel
+type. This is needed to copy correct port to dummy packet.
+
+Block user from adding enc_dst_port via tc flower, because VXLAN and
+Geneve filters can be created only with destination port which was
+previously opened.
+
+Fixes: 8b032a55c1bd5 ("ice: low level support for tunnels")
+	Signed-off-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+	Tested-by: Sandeep Penigalapati <sandeep.penigalapati@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit de6acd1cdd4d38823b7f4adae82e8a7d62993354)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_switch.c
+#	drivers/net/ethernet/intel/ice/ice_tc_lib.c
+diff --cc drivers/net/ethernet/intel/ice/ice_switch.c
+index 436584f83302,183d93033890..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_switch.c
++++ b/drivers/net/ethernet/intel/ice/ice_switch.c
+@@@ -4278,8 -4660,9 +4282,9 @@@ ice_add_adv_recipe(struct ice_hw *hw, s
+  		/* Success if found a recipe that match the existing criteria */
+  		goto err_unroll;
+  
++ 	rm->tun_type = rinfo->tun_type;
+  	/* Recipe we need does not exist, add a recipe */
+ -	status = ice_add_sw_recipe(hw, rm, profiles);
+ +	status = ice_add_sw_recipe(hw, rm, match_tun_mask, profiles);
+  	if (status)
+  		goto err_unroll;
+  
+@@@ -4528,6 -4949,50 +4533,53 @@@ ice_fill_adv_dummy_packet(struct ice_ad
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_fill_adv_packet_tun - fill dummy packet with udp tunnel port
++  * @hw: pointer to the hardware structure
++  * @tun_type: tunnel type
++  * @pkt: dummy packet to fill in
++  * @offsets: offset info for the dummy packet
++  */
++ static enum ice_status
++ ice_fill_adv_packet_tun(struct ice_hw *hw, enum ice_sw_tunnel_type tun_type,
++ 			u8 *pkt, const struct ice_dummy_pkt_offsets *offsets)
++ {
++ 	u16 open_port, i;
++ 
++ 	switch (tun_type) {
++ 	case ICE_SW_TUN_VXLAN:
++ 		if (!ice_get_open_tunnel_port(hw, &open_port, TNL_VXLAN))
++ 			return ICE_ERR_CFG;
++ 		break;
++ 	case ICE_SW_TUN_GENEVE:
++ 		if (!ice_get_open_tunnel_port(hw, &open_port, TNL_GENEVE))
++ 			return ICE_ERR_CFG;
++ 		break;
++ 	default:
++ 		/* Nothing needs to be done for this tunnel type */
++ 		return 0;
++ 	}
++ 
++ 	/* Find the outer UDP protocol header and insert the port number */
++ 	for (i = 0; offsets[i].type != ICE_PROTOCOL_LAST; i++) {
++ 		if (offsets[i].type == ICE_UDP_OF) {
++ 			struct ice_l4_hdr *hdr;
++ 			u16 offset;
++ 
++ 			offset = offsets[i].offset;
++ 			hdr = (struct ice_l4_hdr *)&pkt[offset];
++ 			hdr->dst_port = cpu_to_be16(open_port);
++ 
++ 			return 0;
++ 		}
++ 	}
++ 
++ 	return ICE_ERR_CFG;
++ }
++ 
++ /**
+++>>>>>>> de6acd1cdd4d (ice: fix adding different tunnels)
+   * ice_find_adv_rule_entry - Search a rule entry
+   * @hw: pointer to the hardware structure
+   * @lkups: lookup elements or match criteria for the advanced recipe, one
+@@@ -5074,7 -5555,14 +5126,18 @@@ ice_rem_adv_rule(struct ice_hw *hw, str
+  			return ICE_ERR_CFG;
+  	}
+  
+++<<<<<<< HEAD
+ +	rid = ice_find_recp(hw, &lkup_exts);
+++=======
++ 	/* Create any special protocol/offset pairs, such as looking at tunnel
++ 	 * bits by extracting metadata
++ 	 */
++ 	status = ice_add_special_words(rinfo, &lkup_exts);
++ 	if (status)
++ 		return status;
++ 
++ 	rid = ice_find_recp(hw, &lkup_exts, rinfo->tun_type);
+++>>>>>>> de6acd1cdd4d (ice: fix adding different tunnels)
+  	/* If did not find a recipe that match the existing criteria */
+  	if (rid == ICE_MAX_NUM_RECIPES)
+  		return ICE_ERR_PARAM;
+* Unmerged path drivers/net/ethernet/intel/ice/ice_tc_lib.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_ethtool_fdir.c b/drivers/net/ethernet/intel/ice/ice_ethtool_fdir.c
+index 38960bcc384c..b6e7f47c8c78 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool_fdir.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool_fdir.c
+@@ -1268,7 +1268,7 @@ ice_fdir_write_all_fltr(struct ice_pf *pf, struct ice_fdir_fltr *input,
+ 		bool is_tun = tun == ICE_FD_HW_SEG_TUN;
+ 		int err;
+ 
+-		if (is_tun && !ice_get_open_tunnel_port(&pf->hw, &port_num))
++		if (is_tun && !ice_get_open_tunnel_port(&pf->hw, &port_num, TNL_ALL))
+ 			continue;
+ 		err = ice_fdir_write_fltr(pf, input, add, is_tun);
+ 		if (err)
+@@ -1652,7 +1652,7 @@ int ice_add_fdir_ethtool(struct ice_vsi *vsi, struct ethtool_rxnfc *cmd)
+ 	}
+ 
+ 	/* return error if not an update and no available filters */
+-	fltrs_needed = ice_get_open_tunnel_port(hw, &tunnel_port) ? 2 : 1;
++	fltrs_needed = ice_get_open_tunnel_port(hw, &tunnel_port, TNL_ALL) ? 2 : 1;
+ 	if (!ice_fdir_find_fltr_by_idx(hw, fsp->location) &&
+ 	    ice_fdir_num_avail_fltr(hw, pf->vsi[vsi->idx]) < fltrs_needed) {
+ 		dev_err(dev, "Failed to add filter.  The maximum number of flow director filters has been reached.\n");
+diff --git a/drivers/net/ethernet/intel/ice/ice_fdir.c b/drivers/net/ethernet/intel/ice/ice_fdir.c
+index cbd8424631e3..4dca009bdd50 100644
+--- a/drivers/net/ethernet/intel/ice/ice_fdir.c
++++ b/drivers/net/ethernet/intel/ice/ice_fdir.c
+@@ -924,7 +924,7 @@ ice_fdir_get_gen_prgm_pkt(struct ice_hw *hw, struct ice_fdir_fltr *input,
+ 		memcpy(pkt, ice_fdir_pkt[idx].pkt, ice_fdir_pkt[idx].pkt_len);
+ 		loc = pkt;
+ 	} else {
+-		if (!ice_get_open_tunnel_port(hw, &tnl_port))
++		if (!ice_get_open_tunnel_port(hw, &tnl_port, TNL_ALL))
+ 			return ICE_ERR_DOES_NOT_EXIST;
+ 		if (!ice_fdir_pkt[idx].tun_pkt)
+ 			return ICE_ERR_PARAM;
+diff --git a/drivers/net/ethernet/intel/ice/ice_flex_pipe.c b/drivers/net/ethernet/intel/ice/ice_flex_pipe.c
+index 5e8f3256f8ea..1005ca0746ad 100644
+--- a/drivers/net/ethernet/intel/ice/ice_flex_pipe.c
++++ b/drivers/net/ethernet/intel/ice/ice_flex_pipe.c
+@@ -1871,9 +1871,11 @@ static struct ice_buf *ice_pkg_buf(struct ice_buf_build *bld)
+  * ice_get_open_tunnel_port - retrieve an open tunnel port
+  * @hw: pointer to the HW structure
+  * @port: returns open port
++ * @type: type of tunnel, can be TNL_LAST if it doesn't matter
+  */
+ bool
+-ice_get_open_tunnel_port(struct ice_hw *hw, u16 *port)
++ice_get_open_tunnel_port(struct ice_hw *hw, u16 *port,
++			 enum ice_tunnel_type type)
+ {
+ 	bool res = false;
+ 	u16 i;
+@@ -1881,7 +1883,8 @@ ice_get_open_tunnel_port(struct ice_hw *hw, u16 *port)
+ 	mutex_lock(&hw->tnl_lock);
+ 
+ 	for (i = 0; i < hw->tnl.count && i < ICE_TUNNEL_MAX_ENTRIES; i++)
+-		if (hw->tnl.tbl[i].valid && hw->tnl.tbl[i].port) {
++		if (hw->tnl.tbl[i].valid && hw->tnl.tbl[i].port &&
++		    (type == TNL_LAST || type == hw->tnl.tbl[i].type)) {
+ 			*port = hw->tnl.tbl[i].port;
+ 			res = true;
+ 			break;
+diff --git a/drivers/net/ethernet/intel/ice/ice_flex_pipe.h b/drivers/net/ethernet/intel/ice/ice_flex_pipe.h
+index 344c2637facd..a2863f38fd1f 100644
+--- a/drivers/net/ethernet/intel/ice/ice_flex_pipe.h
++++ b/drivers/net/ethernet/intel/ice/ice_flex_pipe.h
+@@ -33,7 +33,8 @@ enum ice_status
+ ice_get_sw_fv_list(struct ice_hw *hw, u8 *prot_ids, u16 ids_cnt,
+ 		   unsigned long *bm, struct list_head *fv_list);
+ bool
+-ice_get_open_tunnel_port(struct ice_hw *hw, u16 *port);
++ice_get_open_tunnel_port(struct ice_hw *hw, u16 *port,
++			 enum ice_tunnel_type type);
+ int ice_udp_tunnel_set_port(struct net_device *netdev, unsigned int table,
+ 			    unsigned int idx, struct udp_tunnel_info *ti);
+ int ice_udp_tunnel_unset_port(struct net_device *netdev, unsigned int table,
+* Unmerged path drivers/net/ethernet/intel/ice/ice_switch.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_tc_lib.c
