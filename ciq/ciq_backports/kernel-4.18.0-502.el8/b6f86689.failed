@@ -1,0 +1,163 @@
+x86/microcode: Rip out the subsys interface gunk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Borislav Petkov <bp@suse.de>
+commit b6f86689d5b740f2cc3ac3a1032c7374b24381cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/b6f86689.failed
+
+This is a left-over from the old days when CPU hotplug wasn't as robust
+as it is now. Currently, microcode gets loaded early on the CPU init
+path and there's no need to attempt to load it again, which that subsys
+interface callback is doing.
+
+The only other thing that the subsys interface init path was doing is
+adding the
+
+  /sys/devices/system/cpu/cpu*/microcode/
+
+hierarchy.
+
+So add a function which gets called on each CPU after all the necessary
+driver setup has happened. Use schedule_on_each_cpu() which can block
+because the sysfs creating code does kmem_cache_zalloc() which can block
+too and the initial version of this where it did that setup in an IPI
+handler of on_each_cpu() can cause a deadlock of the sort:
+
+  lock(fs_reclaim);
+  <Interrupt>
+    lock(fs_reclaim);
+
+as the IPI handler runs in IRQ context.
+
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Ashok Raj <ashok.raj@intel.com>
+Link: https://lore.kernel.org/r/20221028142638.28498-2-bp@alien8.de
+(cherry picked from commit b6f86689d5b740f2cc3ac3a1032c7374b24381cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/microcode/core.c
+diff --cc arch/x86/kernel/cpu/microcode/core.c
+index 98b42808eaaf,4c222e667567..000000000000
+--- a/arch/x86/kernel/cpu/microcode/core.c
++++ b/arch/x86/kernel/cpu/microcode/core.c
+@@@ -744,48 -636,10 +744,10 @@@ static enum ucode_state microcode_updat
+  	return microcode_init_cpu(cpu, false);
+  }
+  
+- static int mc_device_add(struct device *dev, struct subsys_interface *sif)
+- {
+- 	int err, cpu = dev->id;
+- 
+- 	if (!cpu_online(cpu))
+- 		return 0;
+- 
+- 	pr_debug("CPU%d added\n", cpu);
+- 
+- 	err = sysfs_create_group(&dev->kobj, &mc_attr_group);
+- 	if (err)
+- 		return err;
+- 
+- 	if (microcode_init_cpu(cpu, true) == UCODE_ERROR)
+- 		return -EINVAL;
+- 
+- 	return err;
+- }
+- 
+- static void mc_device_remove(struct device *dev, struct subsys_interface *sif)
+- {
+- 	int cpu = dev->id;
+- 
+- 	if (!cpu_online(cpu))
+- 		return;
+- 
+- 	pr_debug("CPU%d removed\n", cpu);
+- 	microcode_fini_cpu(cpu);
+- 	sysfs_remove_group(&dev->kobj, &mc_attr_group);
+- }
+- 
+- static struct subsys_interface mc_cpu_interface = {
+- 	.name			= "microcode",
+- 	.subsys			= &cpu_subsys,
+- 	.add_dev		= mc_device_add,
+- 	.remove_dev		= mc_device_remove,
+- };
+- 
+  /**
+ - * microcode_bsp_resume - Update boot CPU microcode during resume.
+ + * mc_bp_resume - Update boot CPU microcode during resume.
+   */
+ -void microcode_bsp_resume(void)
+ +static void mc_bp_resume(void)
+  {
+  	int cpu = smp_processor_id();
+  	struct ucode_cpu_info *uci = ucode_cpu_info + cpu;
+@@@ -828,8 -685,22 +793,20 @@@ static int mc_cpu_down_prep(unsigned in
+  	return 0;
+  }
+  
++ static void setup_online_cpu(struct work_struct *work)
++ {
++ 	int cpu = smp_processor_id();
++ 	struct ucode_cpu_info *uci = ucode_cpu_info + cpu;
++ 
++ 	memset(uci, 0, sizeof(*uci));
++ 
++ 	microcode_ops->collect_cpu_info(cpu, &uci->cpu_sig);
++ 
++ 	mc_cpu_online(cpu);
++ }
++ 
+  static struct attribute *cpu_root_microcode_attrs[] = {
+ -#ifdef CONFIG_MICROCODE_LATE_LOADING
+  	&dev_attr_reload.attr,
+ -#endif
+  	NULL
+  };
+  
+@@@ -875,12 -737,11 +843,17 @@@ static int __init microcode_init(void
+  
+  	if (error) {
+  		pr_err("Error creating microcode group!\n");
+- 		goto out_driver;
++ 		goto out_pdev;
+  	}
+  
+++<<<<<<< HEAD
+ +	error = microcode_dev_init();
+ +	if (error)
+ +		goto out_ucode_group;
+++=======
++ 	/* Do per-CPU setup */
++ 	schedule_on_each_cpu(setup_online_cpu);
+++>>>>>>> b6f86689d5b7 (x86/microcode: Rip out the subsys interface gunk)
+  
+  	register_syscore_ops(&mc_syscore_ops);
+  	cpuhp_setup_state_nocalls(CPUHP_AP_MICROCODE_LOADER, "x86/microcode:starting",
+@@@ -892,19 -753,6 +865,22 @@@
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+ + out_ucode_group:
+ +	sysfs_remove_group(&cpu_subsys.dev_root->kobj,
+ +			   &cpu_root_microcode_group);
+ +
+ + out_driver:
+ +	cpus_read_lock();
+ +	mutex_lock(&microcode_mutex);
+ +
+ +	subsys_interface_unregister(&mc_cpu_interface);
+ +
+ +	mutex_unlock(&microcode_mutex);
+ +	cpus_read_unlock();
+ +
+++=======
+++>>>>>>> b6f86689d5b7 (x86/microcode: Rip out the subsys interface gunk)
+   out_pdev:
+  	platform_device_unregister(microcode_pdev);
+  	return error;
+* Unmerged path arch/x86/kernel/cpu/microcode/core.c
