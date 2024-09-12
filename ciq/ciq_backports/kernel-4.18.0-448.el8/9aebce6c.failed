@@ -1,0 +1,322 @@
+wifi: mac80211: validate link address doesn't change
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 9aebce6c97bfd7dafd364be2e5b3af7a78af2662
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/9aebce6c.failed
+
+When modifying a link station, validate that the link address
+doesn't change, except the first time the link is created.
+
+Fixes: b95eb7f0eee4 ("wifi: cfg80211/mac80211: separate link params from station params")
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 9aebce6c97bfd7dafd364be2e5b3af7a78af2662)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/cfg.c
+diff --cc net/mac80211/cfg.c
+index 968555a65d49,fa4379761e12..000000000000
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@@ -1548,36 -1596,88 +1548,53 @@@ static void sta_apply_mesh_params(struc
+  #endif
+  }
+  
+++<<<<<<< HEAD
+ +static void sta_apply_airtime_params(struct ieee80211_local *local,
+ +				     struct sta_info *sta,
+ +				     struct station_parameters *params)
+++=======
++ static int sta_link_apply_parameters(struct ieee80211_local *local,
++ 				     struct sta_info *sta, bool new_link,
++ 				     struct link_station_parameters *params)
+++>>>>>>> 9aebce6c97bf (wifi: mac80211: validate link address doesn't change)
+  {
+ -	int ret = 0;
+ -	struct ieee80211_supported_band *sband;
+ -	struct ieee80211_sub_if_data *sdata = sta->sdata;
+ -	u32 link_id = params->link_id < 0 ? 0 : params->link_id;
+ -	struct ieee80211_link_data *link =
+ -		sdata_dereference(sdata->link[link_id], sdata);
+ -	struct link_sta_info *link_sta =
+ -		rcu_dereference_protected(sta->link[link_id],
+ -					  lockdep_is_held(&local->sta_mtx));
+ -
+ -	if (!link || !link_sta)
+ -		return -EINVAL;
+ +	u8 ac;
+  
+ -	sband = ieee80211_get_link_sband(link);
+ -	if (!sband)
+ -		return -EINVAL;
+ +	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+ +		struct airtime_sched_info *air_sched = &local->airtime[ac];
+ +		struct airtime_info *air_info = &sta->airtime[ac];
+ +		struct txq_info *txqi;
+ +		u8 tid;
+ +
+ +		spin_lock_bh(&air_sched->lock);
+ +		for (tid = 0; tid < IEEE80211_NUM_TIDS + 1; tid++) {
+ +			if (air_info->weight == params->airtime_weight ||
+ +			    !sta->sta.txq[tid] ||
+ +			    ac != ieee80211_ac_from_tid(tid))
+ +				continue;
+ +
+++<<<<<<< HEAD
+ +			airtime_weight_set(air_info, params->airtime_weight);
+  
+ +			txqi = to_txq_info(sta->sta.txq[tid]);
+ +			if (RB_EMPTY_NODE(&txqi->schedule_order))
+ +				continue;
+ +
+ +			ieee80211_update_airtime_weight(local, air_sched,
+ +							0, true);
+ +		}
+ +		spin_unlock_bh(&air_sched->lock);
+++=======
++ 	if (params->link_mac) {
++ 		if (new_link) {
++ 			memcpy(link_sta->addr, params->link_mac, ETH_ALEN);
++ 			memcpy(link_sta->pub->addr, params->link_mac, ETH_ALEN);
++ 		} else if (!ether_addr_equal(link_sta->addr,
++ 					     params->link_mac)) {
++ 			return -EINVAL;
++ 		}
+++>>>>>>> 9aebce6c97bf (wifi: mac80211: validate link address doesn't change)
+  	}
+ -
+ -	if (params->txpwr_set) {
+ -		link_sta->pub->txpwr.type = params->txpwr.type;
+ -		if (params->txpwr.type == NL80211_TX_POWER_LIMITED)
+ -			link_sta->pub->txpwr.power = params->txpwr.power;
+ -		ret = drv_sta_set_txpwr(local, sdata, sta);
+ -		if (ret)
+ -			return ret;
+ -	}
+ -
+ -	if (params->supported_rates &&
+ -	    params->supported_rates_len) {
+ -		ieee80211_parse_bitrates(link->conf->chandef.width,
+ -					 sband, params->supported_rates,
+ -					 params->supported_rates_len,
+ -					 &link_sta->pub->supp_rates[sband->band]);
+ -	}
+ -
+ -	if (params->ht_capa)
+ -		ieee80211_ht_cap_ie_to_sta_ht_cap(sdata, sband,
+ -						  params->ht_capa, link_sta);
+ -
+ -	/* VHT can override some HT caps such as the A-MSDU max length */
+ -	if (params->vht_capa)
+ -		ieee80211_vht_cap_ie_to_sta_vht_cap(sdata, sband,
+ -						    params->vht_capa, link_sta);
+ -
+ -	if (params->he_capa)
+ -		ieee80211_he_cap_ie_to_sta_he_cap(sdata, sband,
+ -						  (void *)params->he_capa,
+ -						  params->he_capa_len,
+ -						  (void *)params->he_6ghz_capa,
+ -						  link_sta);
+ -
+ -	if (params->eht_capa)
+ -		ieee80211_eht_cap_ie_to_sta_eht_cap(sdata, sband,
+ -						    (u8 *)params->he_capa,
+ -						    params->he_capa_len,
+ -						    params->eht_capa,
+ -						    params->eht_capa_len,
+ -						    link_sta);
+ -
+ -	if (params->opmode_notif_used) {
+ -		/* returned value is only needed for rc update, but the
+ -		 * rc isn't initialized here yet, so ignore it
+ -		 */
+ -		__ieee80211_vht_handle_opmode(sdata, link_sta,
+ -					      params->opmode_notif,
+ -					      sband->band);
+ -	}
+ -
+ -	return ret;
+  }
+  
+  static int sta_apply_parameters(struct ieee80211_local *local,
+@@@ -1720,53 -1802,10 +1737,60 @@@
+  	if (params->listen_interval >= 0)
+  		sta->listen_interval = params->listen_interval;
+  
+++<<<<<<< HEAD
+ +	if (params->sta_modify_mask & STATION_PARAM_APPLY_STA_TXPOWER) {
+ +		sta->sta.txpwr.type = params->txpwr.type;
+ +		if (params->txpwr.type == NL80211_TX_POWER_LIMITED)
+ +			sta->sta.txpwr.power = params->txpwr.power;
+ +		ret = drv_sta_set_txpwr(local, sdata, sta);
+ +		if (ret)
+ +			return ret;
+ +	}
+ +
+ +	if (params->supported_rates && params->supported_rates_len) {
+ +		ieee80211_parse_bitrates(&sdata->vif.bss_conf.chandef,
+ +					 sband, params->supported_rates,
+ +					 params->supported_rates_len,
+ +					 &sta->sta.supp_rates[sband->band]);
+ +	}
+ +
+ +	if (params->ht_capa)
+ +		ieee80211_ht_cap_ie_to_sta_ht_cap(sdata, sband,
+ +						  params->ht_capa, sta);
+ +
+ +	/* VHT can override some HT caps such as the A-MSDU max length */
+ +	if (params->vht_capa)
+ +		ieee80211_vht_cap_ie_to_sta_vht_cap(sdata, sband,
+ +						    params->vht_capa, sta);
+ +
+ +	if (params->he_capa)
+ +		ieee80211_he_cap_ie_to_sta_he_cap(sdata, sband,
+ +						  (void *)params->he_capa,
+ +						  params->he_capa_len,
+ +						  (void *)params->he_6ghz_capa,
+ +						  sta);
+ +
+ +	if (params->eht_capa)
+ +		ieee80211_eht_cap_ie_to_sta_eht_cap(sdata, sband,
+ +						    (u8 *)params->he_capa,
+ +						    params->he_capa_len,
+ +						    params->eht_capa,
+ +						    params->eht_capa_len,
+ +						    sta);
+ +
+ +	if (params->opmode_notif_used) {
+ +		/* returned value is only needed for rc update, but the
+ +		 * rc isn't initialized here yet, so ignore it
+ +		 */
+ +		__ieee80211_vht_handle_opmode(sdata, sta, params->opmode_notif,
+ +					      sband->band);
+ +	}
+++=======
++ 	ret = sta_link_apply_parameters(local, sta, false,
++ 					&params->link_sta_params);
++ 	if (ret)
++ 		return ret;
+++>>>>>>> 9aebce6c97bf (wifi: mac80211: validate link address doesn't change)
+  
+  	if (params->support_p2p_ps >= 0)
+  		sta->sta.support_p2p_ps = params->support_p2p_ps;
+@@@ -4535,6 -4638,111 +4559,114 @@@ static void ieee80211_del_intf_link(str
+  	ieee80211_vif_set_links(sdata, wdev->valid_links);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int sta_add_link_station(struct ieee80211_local *local,
++ 				struct ieee80211_sub_if_data *sdata,
++ 				struct link_station_parameters *params)
++ {
++ 	struct sta_info *sta;
++ 	int ret;
++ 
++ 	sta = sta_info_get_bss(sdata, params->mld_mac);
++ 	if (!sta)
++ 		return -ENOENT;
++ 
++ 	if (sta->sta.valid_links & BIT(params->link_id))
++ 		return -EALREADY;
++ 
++ 	ret = ieee80211_sta_allocate_link(sta, params->link_id);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = sta_link_apply_parameters(local, sta, true, params);
++ 	if (ret) {
++ 		ieee80211_sta_free_link(sta, params->link_id);
++ 		return ret;
++ 	}
++ 
++ 	/* ieee80211_sta_activate_link frees the link upon failure */
++ 	return ieee80211_sta_activate_link(sta, params->link_id);
++ }
++ 
++ static int
++ ieee80211_add_link_station(struct wiphy *wiphy, struct net_device *dev,
++ 			   struct link_station_parameters *params)
++ {
++ 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++ 	struct ieee80211_local *local = wiphy_priv(wiphy);
++ 	int ret;
++ 
++ 	mutex_lock(&sdata->local->sta_mtx);
++ 	ret = sta_add_link_station(local, sdata, params);
++ 	mutex_unlock(&sdata->local->sta_mtx);
++ 
++ 	return ret;
++ }
++ 
++ static int sta_mod_link_station(struct ieee80211_local *local,
++ 				struct ieee80211_sub_if_data *sdata,
++ 				struct link_station_parameters *params)
++ {
++ 	struct sta_info *sta;
++ 
++ 	sta = sta_info_get_bss(sdata, params->mld_mac);
++ 	if (!sta)
++ 		return -ENOENT;
++ 
++ 	if (!(sta->sta.valid_links & BIT(params->link_id)))
++ 		return -EINVAL;
++ 
++ 	return sta_link_apply_parameters(local, sta, false, params);
++ }
++ 
++ static int
++ ieee80211_mod_link_station(struct wiphy *wiphy, struct net_device *dev,
++ 			   struct link_station_parameters *params)
++ {
++ 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++ 	struct ieee80211_local *local = wiphy_priv(wiphy);
++ 	int ret;
++ 
++ 	mutex_lock(&sdata->local->sta_mtx);
++ 	ret = sta_mod_link_station(local, sdata, params);
++ 	mutex_unlock(&sdata->local->sta_mtx);
++ 
++ 	return ret;
++ }
++ 
++ static int sta_del_link_station(struct ieee80211_sub_if_data *sdata,
++ 				struct link_station_del_parameters *params)
++ {
++ 	struct sta_info *sta;
++ 
++ 	sta = sta_info_get_bss(sdata, params->mld_mac);
++ 	if (!sta)
++ 		return -ENOENT;
++ 
++ 	if (!(sta->sta.valid_links & BIT(params->link_id)))
++ 		return -EINVAL;
++ 
++ 	ieee80211_sta_remove_link(sta, params->link_id);
++ 
++ 	return 0;
++ }
++ 
++ static int
++ ieee80211_del_link_station(struct wiphy *wiphy, struct net_device *dev,
++ 			   struct link_station_del_parameters *params)
++ {
++ 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++ 	int ret;
++ 
++ 	mutex_lock(&sdata->local->sta_mtx);
++ 	ret = sta_del_link_station(sdata, params);
++ 	mutex_unlock(&sdata->local->sta_mtx);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 9aebce6c97bf (wifi: mac80211: validate link address doesn't change)
+  const struct cfg80211_ops mac80211_config_ops = {
+  	.add_virtual_intf = ieee80211_add_iface,
+  	.del_virtual_intf = ieee80211_del_iface,
+* Unmerged path net/mac80211/cfg.c
