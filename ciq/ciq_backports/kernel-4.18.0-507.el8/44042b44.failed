@@ -1,0 +1,700 @@
+mm/page_alloc: allow high-order pages to be stored on the per-cpu lists
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-507.el8
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit 44042b4498728f4376e84bae1ac8016d146d850b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-507.el8/44042b44.failed
+
+The per-cpu page allocator (PCP) only stores order-0 pages.  This means
+that all THP and "cheap" high-order allocations including SLUB contends on
+the zone->lock.  This patch extends the PCP allocator to store THP and
+"cheap" high-order pages.  Note that struct per_cpu_pages increases in
+size to 256 bytes (4 cache lines) on x86-64.
+
+Note that this is not necessarily a universal performance win because of
+how it is implemented.  High-order pages can cause pcp->high to be
+exceeded prematurely for lower-orders so for example, a large number of
+THP pages being freed could release order-0 pages from the PCP lists.
+Hence, much depends on the allocation/free pattern as observed by a single
+CPU to determine if caching helps or hurts a particular workload.
+
+That said, basic performance testing passed.  The following is a netperf
+UDP_STREAM test which hits the relevant patches as some of the network
+allocations are high-order.
+
+netperf-udp
+                                 5.13.0-rc2             5.13.0-rc2
+                           mm-pcpburst-v3r4   mm-pcphighorder-v1r7
+Hmean     send-64         261.46 (   0.00%)      266.30 *   1.85%*
+Hmean     send-128        516.35 (   0.00%)      536.78 *   3.96%*
+Hmean     send-256       1014.13 (   0.00%)     1034.63 *   2.02%*
+Hmean     send-1024      3907.65 (   0.00%)     4046.11 *   3.54%*
+Hmean     send-2048      7492.93 (   0.00%)     7754.85 *   3.50%*
+Hmean     send-3312     11410.04 (   0.00%)    11772.32 *   3.18%*
+Hmean     send-4096     13521.95 (   0.00%)    13912.34 *   2.89%*
+Hmean     send-8192     21660.50 (   0.00%)    22730.72 *   4.94%*
+Hmean     send-16384    31902.32 (   0.00%)    32637.50 *   2.30%*
+
+Functionally, a patch like this is necessary to make bulk allocation of
+high-order pages work with similar performance to order-0 bulk
+allocations.  The bulk allocator is not updated in this series as it would
+have to be determined by bulk allocation users how they want to track the
+order of pages allocated with the bulk allocator.
+
+Link: https://lkml.kernel.org/r/20210611135753.GC30378@techsingularity.net
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Zi Yan <ziy@nvidia.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 44042b4498728f4376e84bae1ac8016d146d850b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/internal.h
+#	mm/page_alloc.c
+diff --cc mm/internal.h
+index f11a5be64e34,6ec2cea9926b..000000000000
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@@ -231,6 -203,11 +231,14 @@@ extern void post_alloc_hook(struct pag
+  					gfp_t gfp_flags);
+  extern int user_min_free_kbytes;
+  
+++<<<<<<< HEAD
+++=======
++ extern void free_unref_page(struct page *page, unsigned int order);
++ extern void free_unref_page_list(struct list_head *list);
++ 
++ extern void zone_pcp_update(struct zone *zone, int cpu_online);
++ extern void zone_pcp_reset(struct zone *zone);
+++>>>>>>> 44042b449872 (mm/page_alloc: allow high-order pages to be stored on the per-cpu lists)
+  extern void zone_pcp_disable(struct zone *zone);
+  extern void zone_pcp_enable(struct zone *zone);
+  
+diff --cc mm/page_alloc.c
+index 5ee43c5e468f,34f097ecfe08..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -650,6 -674,57 +650,60 @@@ out
+  	add_taint(TAINT_BAD_PAGE, LOCKDEP_NOW_UNRELIABLE);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline unsigned int order_to_pindex(int migratetype, int order)
++ {
++ 	int base = order;
++ 
++ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
++ 	if (order > PAGE_ALLOC_COSTLY_ORDER) {
++ 		VM_BUG_ON(order != pageblock_order);
++ 		base = PAGE_ALLOC_COSTLY_ORDER + 1;
++ 	}
++ #else
++ 	VM_BUG_ON(order > PAGE_ALLOC_COSTLY_ORDER);
++ #endif
++ 
++ 	return (MIGRATE_PCPTYPES * base) + migratetype;
++ }
++ 
++ static inline int pindex_to_order(unsigned int pindex)
++ {
++ 	int order = pindex / MIGRATE_PCPTYPES;
++ 
++ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
++ 	if (order > PAGE_ALLOC_COSTLY_ORDER) {
++ 		order = pageblock_order;
++ 		VM_BUG_ON(order != pageblock_order);
++ 	}
++ #else
++ 	VM_BUG_ON(order > PAGE_ALLOC_COSTLY_ORDER);
++ #endif
++ 
++ 	return order;
++ }
++ 
++ static inline bool pcp_allowed_order(unsigned int order)
++ {
++ 	if (order <= PAGE_ALLOC_COSTLY_ORDER)
++ 		return true;
++ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
++ 	if (order == pageblock_order)
++ 		return true;
++ #endif
++ 	return false;
++ }
++ 
++ static inline void free_the_page(struct page *page, unsigned int order)
++ {
++ 	if (pcp_allowed_order(order))		/* Via pcp? */
++ 		free_unref_page(page, order);
++ 	else
++ 		__free_pages_ok(page, order, FPI_NONE);
++ }
++ 
+++>>>>>>> 44042b449872 (mm/page_alloc: allow high-order pages to be stored on the per-cpu lists)
+  /*
+   * Higher-order pages are called "compound pages".  They are structured thusly:
+   *
+@@@ -668,26 -743,9 +722,26 @@@
+  void free_compound_page(struct page *page)
+  {
+  	mem_cgroup_uncharge(page);
+- 	__free_pages_ok(page, compound_order(page), FPI_NONE);
++ 	free_the_page(page, compound_order(page));
+  }
+  
+ +static void prep_compound_head(struct page *page, unsigned int order)
+ +{
+ +	set_compound_page_dtor(page, COMPOUND_PAGE_DTOR);
+ +	set_compound_order(page, order);
+ +	atomic_set(compound_mapcount_ptr(page), -1);
+ +	if (hpage_pincount_available(page))
+ +		atomic_set(compound_pincount_ptr(page), 0);
+ +}
+ +
+ +static void prep_compound_tail(struct page *head, int tail_idx)
+ +{
+ +	struct page *p = head + tail_idx;
+ +
+ +	p->mapping = TAIL_MAPPING;
+ +	set_compound_head(p, head);
+ +}
+ +
+  void prep_compound_page(struct page *page, unsigned int order)
+  {
+  	int i;
+@@@ -1318,9 -1393,9 +1372,13 @@@ static __always_inline bool free_pages_
+   * to pcp lists. With debug_pagealloc also enabled, they are also rechecked when
+   * moved from pcp lists to free lists.
+   */
+- static bool free_pcp_prepare(struct page *page)
++ static bool free_pcp_prepare(struct page *page, unsigned int order)
+  {
+++<<<<<<< HEAD
+ +	return free_pages_prepare(page, 0, true);
+++=======
++ 	return free_pages_prepare(page, order, true, FPI_NONE);
+++>>>>>>> 44042b449872 (mm/page_alloc: allow high-order pages to be stored on the per-cpu lists)
+  }
+  
+  static bool bulkfree_pcp_prepare(struct page *page)
+@@@ -1337,12 -1412,12 +1395,18 @@@
+   * debug_pagealloc enabled, they are checked also immediately when being freed
+   * to the pcp lists.
+   */
+- static bool free_pcp_prepare(struct page *page)
++ static bool free_pcp_prepare(struct page *page, unsigned int order)
+  {
+  	if (debug_pagealloc_enabled_static())
+++<<<<<<< HEAD
+ +		return free_pages_prepare(page, 0, true);
+ +	else
+ +		return free_pages_prepare(page, 0, false);
+++=======
++ 		return free_pages_prepare(page, order, true, FPI_NONE);
++ 	else
++ 		return free_pages_prepare(page, order, false, FPI_NONE);
+++>>>>>>> 44042b449872 (mm/page_alloc: allow high-order pages to be stored on the per-cpu lists)
+  }
+  
+  static bool bulkfree_pcp_prepare(struct page *page)
+@@@ -1431,9 -1515,14 +1504,10 @@@ static void free_pcppages_bulk(struct z
+  				prefetch_buddy(page);
+  				prefetch_nr--;
+  			}
+- 		} while (--count && --batch_free && !list_empty(list));
++ 		} while (count > 0 && --batch_free && !list_empty(list));
+  	}
++ 	pcp->count -= nr_freed;
+  
+ -	/*
+ -	 * local_lock_irq held so equivalent to spin_lock_irqsave for
+ -	 * both PREEMPT_RT and non-PREEMPT_RT configurations.
+ -	 */
+  	spin_lock(&zone->lock);
+  	isolated_pageblocks = has_isolate_pageblock(zone);
+  
+@@@ -3205,36 -3334,66 +3285,100 @@@ static bool free_unref_page_prepare(str
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static void free_unref_page_commit(struct page *page, unsigned long pfn)
+ +{
+ +	struct zone *zone = page_zone(page);
+ +	struct per_cpu_pages *pcp;
+ +	int migratetype;
+++=======
++ static int nr_pcp_free(struct per_cpu_pages *pcp, int high, int batch)
++ {
++ 	int min_nr_free, max_nr_free;
++ 
++ 	/* Check for PCP disabled or boot pageset */
++ 	if (unlikely(high < batch))
++ 		return 1;
++ 
++ 	/* Leave at least pcp->batch pages on the list */
++ 	min_nr_free = batch;
++ 	max_nr_free = high - batch;
++ 
++ 	/*
++ 	 * Double the number of pages freed each time there is subsequent
++ 	 * freeing of pages without any allocation.
++ 	 */
++ 	batch <<= pcp->free_factor;
++ 	if (batch < max_nr_free)
++ 		pcp->free_factor++;
++ 	batch = clamp(batch, min_nr_free, max_nr_free);
++ 
++ 	return batch;
++ }
++ 
++ static int nr_pcp_high(struct per_cpu_pages *pcp, struct zone *zone)
++ {
++ 	int high = READ_ONCE(pcp->high);
++ 
++ 	if (unlikely(!high))
++ 		return 0;
++ 
++ 	if (!test_bit(ZONE_RECLAIM_ACTIVE, &zone->flags))
++ 		return high;
++ 
++ 	/*
++ 	 * If reclaim is active, limit the number of pages that can be
++ 	 * stored on pcp lists
++ 	 */
++ 	return min(READ_ONCE(pcp->batch) << 2, high);
++ }
++ 
++ static void free_unref_page_commit(struct page *page, unsigned long pfn,
++ 				   int migratetype, unsigned int order)
++ {
++ 	struct zone *zone = page_zone(page);
++ 	struct per_cpu_pages *pcp;
++ 	int high;
++ 	int pindex;
+++>>>>>>> 44042b449872 (mm/page_alloc: allow high-order pages to be stored on the per-cpu lists)
+  
+ +	migratetype = get_pcppage_migratetype(page);
+  	__count_vm_event(PGFREE);
+++<<<<<<< HEAD
+ +
+ +	/*
+ +	 * We only track unmovable, reclaimable and movable on pcp lists.
+ +	 * Free ISOLATE pages back to the allocator because they are being
+ +	 * offlined but treat HIGHATOMIC as movable pages so we can get those
+ +	 * areas back if necessary. Otherwise, we may have to free
+ +	 * excessively into the page allocator
+ +	 */
+ +	if (migratetype >= MIGRATE_PCPTYPES) {
+ +		if (unlikely(is_migrate_isolate(migratetype))) {
+ +			free_one_page(zone, page, pfn, 0, migratetype,
+ +				      FPI_NONE);
+ +			return;
+ +		}
+ +		migratetype = MIGRATE_MOVABLE;
+ +	}
+ +
+ +	pcp = &this_cpu_ptr(zone->pageset)->pcp;
+ +	list_add(&page->lru, &pcp->lists[migratetype]);
+ +	pcp->count++;
+ +	if (pcp->count >= READ_ONCE(pcp->high))
+ +		free_pcppages_bulk(zone, READ_ONCE(pcp->batch), pcp);
+++=======
++ 	pcp = this_cpu_ptr(zone->per_cpu_pageset);
++ 	pindex = order_to_pindex(migratetype, order);
++ 	list_add(&page->lru, &pcp->lists[pindex]);
++ 	pcp->count += 1 << order;
++ 	high = nr_pcp_high(pcp, zone);
++ 	if (pcp->count >= high) {
++ 		int batch = READ_ONCE(pcp->batch);
++ 
++ 		free_pcppages_bulk(zone, nr_pcp_free(pcp, high, batch), pcp);
++ 	}
+++>>>>>>> 44042b449872 (mm/page_alloc: allow high-order pages to be stored on the per-cpu lists)
+  }
+  
+  /*
+@@@ -3244,13 -3403,30 +3388,35 @@@ void free_unref_page(struct page *page
+  {
+  	unsigned long flags;
+  	unsigned long pfn = page_to_pfn(page);
+ -	int migratetype;
+  
+- 	if (!free_unref_page_prepare(page, pfn))
++ 	if (!free_unref_page_prepare(page, pfn, order))
+  		return;
+  
+++<<<<<<< HEAD
+ +	local_irq_save(flags);
+ +	free_unref_page_commit(page, pfn);
+ +	local_irq_restore(flags);
+++=======
++ 	/*
++ 	 * We only track unmovable, reclaimable and movable on pcp lists.
++ 	 * Place ISOLATE pages on the isolated list because they are being
++ 	 * offlined but treat HIGHATOMIC as movable pages so we can get those
++ 	 * areas back if necessary. Otherwise, we may have to free
++ 	 * excessively into the page allocator
++ 	 */
++ 	migratetype = get_pcppage_migratetype(page);
++ 	if (unlikely(migratetype >= MIGRATE_PCPTYPES)) {
++ 		if (unlikely(is_migrate_isolate(migratetype))) {
++ 			free_one_page(page_zone(page), page, pfn, order, migratetype, FPI_NONE);
++ 			return;
++ 		}
++ 		migratetype = MIGRATE_MOVABLE;
++ 	}
++ 
++ 	local_lock_irqsave(&pagesets.lock, flags);
++ 	free_unref_page_commit(page, pfn, migratetype, order);
++ 	local_unlock_irqrestore(&pagesets.lock, flags);
+++>>>>>>> 44042b449872 (mm/page_alloc: allow high-order pages to be stored on the per-cpu lists)
+  }
+  
+  /*
+@@@ -3265,18 -3442,39 +3431,22 @@@ void free_unref_page_list(struct list_h
+  	/* Prepare pages for freeing */
+  	list_for_each_entry_safe(page, next, list, lru) {
+  		pfn = page_to_pfn(page);
+- 		if (!free_unref_page_prepare(page, pfn))
++ 		if (!free_unref_page_prepare(page, pfn, 0))
+  			list_del(&page->lru);
+ -
+ -		/*
+ -		 * Free isolated pages directly to the allocator, see
+ -		 * comment in free_unref_page.
+ -		 */
+ -		migratetype = get_pcppage_migratetype(page);
+ -		if (unlikely(migratetype >= MIGRATE_PCPTYPES)) {
+ -			if (unlikely(is_migrate_isolate(migratetype))) {
+ -				list_del(&page->lru);
+ -				free_one_page(page_zone(page), page, pfn, 0,
+ -							migratetype, FPI_NONE);
+ -				continue;
+ -			}
+ -
+ -			/*
+ -			 * Non-isolated types over MIGRATE_PCPTYPES get added
+ -			 * to the MIGRATE_MOVABLE pcp list.
+ -			 */
+ -			set_pcppage_migratetype(page, MIGRATE_MOVABLE);
+ -		}
+ -
+  		set_page_private(page, pfn);
+  	}
+  
+ -	local_lock_irqsave(&pagesets.lock, flags);
+ +	local_irq_save(flags);
+  	list_for_each_entry_safe(page, next, list, lru) {
+ -		pfn = page_private(page);
+ +		unsigned long pfn = page_private(page);
+ +
+  		set_page_private(page, 0);
+ -		migratetype = get_pcppage_migratetype(page);
+  		trace_mm_page_free_batched(page);
+++<<<<<<< HEAD
+ +		free_unref_page_commit(page, pfn);
+++=======
++ 		free_unref_page_commit(page, pfn, migratetype, 0);
+++>>>>>>> 44042b449872 (mm/page_alloc: allow high-order pages to be stored on the per-cpu lists)
+  
+  		/*
+  		 * Guard against excessive IRQ disabled times when we get
+@@@ -3409,7 -3609,9 +3579,13 @@@ static inline void zone_statistics(stru
+  }
+  
+  /* Remove page from the per-cpu list, caller must protect the list */
+++<<<<<<< HEAD
+ +static struct page *__rmqueue_pcplist(struct zone *zone, int migratetype,
+++=======
++ static inline
++ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
++ 			int migratetype,
+++>>>>>>> 44042b449872 (mm/page_alloc: allow high-order pages to be stored on the per-cpu lists)
+  			unsigned int alloc_flags,
+  			struct per_cpu_pages *pcp,
+  			struct list_head *list)
+@@@ -3443,15 -3660,22 +3634,30 @@@ static struct page *rmqueue_pcplist(str
+  	struct page *page;
+  	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	local_irq_save(flags);
+ +	pcp = &this_cpu_ptr(zone->pageset)->pcp;
+ +	list = &pcp->lists[migratetype];
+ +	page = __rmqueue_pcplist(zone,  migratetype, alloc_flags, pcp, list);
+++=======
++ 	local_lock_irqsave(&pagesets.lock, flags);
++ 
++ 	/*
++ 	 * On allocation, reduce the number of pages that are batch freed.
++ 	 * See nr_pcp_free() where free_factor is increased for subsequent
++ 	 * frees.
++ 	 */
++ 	pcp = this_cpu_ptr(zone->per_cpu_pageset);
++ 	pcp->free_factor >>= 1;
++ 	list = &pcp->lists[order_to_pindex(migratetype, order)];
++ 	page = __rmqueue_pcplist(zone, order, migratetype, alloc_flags, pcp, list);
++ 	local_unlock_irqrestore(&pagesets.lock, flags);
+++>>>>>>> 44042b449872 (mm/page_alloc: allow high-order pages to be stored on the per-cpu lists)
+  	if (page) {
+  		__count_zid_vm_events(PGALLOC, page_zonenum(page), 1);
+ -		zone_statistics(preferred_zone, zone, 1);
+ +		zone_statistics(preferred_zone, zone);
+  	}
+ +	local_irq_restore(flags);
+  	return page;
+  }
+  
+@@@ -4974,10 -5184,156 +5180,158 @@@ static inline void finalise_ac(gfp_t gf
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * __alloc_pages_bulk - Allocate a number of order-0 pages to a list or array
++  * @gfp: GFP flags for the allocation
++  * @preferred_nid: The preferred NUMA node ID to allocate from
++  * @nodemask: Set of nodes to allocate from, may be NULL
++  * @nr_pages: The number of pages desired on the list or array
++  * @page_list: Optional list to store the allocated pages
++  * @page_array: Optional array to store the pages
++  *
++  * This is a batched version of the page allocator that attempts to
++  * allocate nr_pages quickly. Pages are added to page_list if page_list
++  * is not NULL, otherwise it is assumed that the page_array is valid.
++  *
++  * For lists, nr_pages is the number of pages that should be allocated.
++  *
++  * For arrays, only NULL elements are populated with pages and nr_pages
++  * is the maximum number of pages that will be stored in the array.
++  *
++  * Returns the number of pages on the list or array.
++  */
++ unsigned long __alloc_pages_bulk(gfp_t gfp, int preferred_nid,
++ 			nodemask_t *nodemask, int nr_pages,
++ 			struct list_head *page_list,
++ 			struct page **page_array)
++ {
++ 	struct page *page;
++ 	unsigned long flags;
++ 	struct zone *zone;
++ 	struct zoneref *z;
++ 	struct per_cpu_pages *pcp;
++ 	struct list_head *pcp_list;
++ 	struct alloc_context ac;
++ 	gfp_t alloc_gfp;
++ 	unsigned int alloc_flags = ALLOC_WMARK_LOW;
++ 	int nr_populated = 0, nr_account = 0;
++ 
++ 	if (unlikely(nr_pages <= 0))
++ 		return 0;
++ 
++ 	/*
++ 	 * Skip populated array elements to determine if any pages need
++ 	 * to be allocated before disabling IRQs.
++ 	 */
++ 	while (page_array && nr_populated < nr_pages && page_array[nr_populated])
++ 		nr_populated++;
++ 
++ 	/* Already populated array? */
++ 	if (unlikely(page_array && nr_pages - nr_populated == 0))
++ 		return nr_populated;
++ 
++ 	/* Use the single page allocator for one page. */
++ 	if (nr_pages - nr_populated == 1)
++ 		goto failed;
++ 
++ 	/* May set ALLOC_NOFRAGMENT, fragmentation will return 1 page. */
++ 	gfp &= gfp_allowed_mask;
++ 	alloc_gfp = gfp;
++ 	if (!prepare_alloc_pages(gfp, 0, preferred_nid, nodemask, &ac, &alloc_gfp, &alloc_flags))
++ 		return 0;
++ 	gfp = alloc_gfp;
++ 
++ 	/* Find an allowed local zone that meets the low watermark. */
++ 	for_each_zone_zonelist_nodemask(zone, z, ac.zonelist, ac.highest_zoneidx, ac.nodemask) {
++ 		unsigned long mark;
++ 
++ 		if (cpusets_enabled() && (alloc_flags & ALLOC_CPUSET) &&
++ 		    !__cpuset_zone_allowed(zone, gfp)) {
++ 			continue;
++ 		}
++ 
++ 		if (nr_online_nodes > 1 && zone != ac.preferred_zoneref->zone &&
++ 		    zone_to_nid(zone) != zone_to_nid(ac.preferred_zoneref->zone)) {
++ 			goto failed;
++ 		}
++ 
++ 		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK) + nr_pages;
++ 		if (zone_watermark_fast(zone, 0,  mark,
++ 				zonelist_zone_idx(ac.preferred_zoneref),
++ 				alloc_flags, gfp)) {
++ 			break;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * If there are no allowed local zones that meets the watermarks then
++ 	 * try to allocate a single page and reclaim if necessary.
++ 	 */
++ 	if (unlikely(!zone))
++ 		goto failed;
++ 
++ 	/* Attempt the batch allocation */
++ 	local_lock_irqsave(&pagesets.lock, flags);
++ 	pcp = this_cpu_ptr(zone->per_cpu_pageset);
++ 	pcp_list = &pcp->lists[order_to_pindex(ac.migratetype, 0)];
++ 
++ 	while (nr_populated < nr_pages) {
++ 
++ 		/* Skip existing pages */
++ 		if (page_array && page_array[nr_populated]) {
++ 			nr_populated++;
++ 			continue;
++ 		}
++ 
++ 		page = __rmqueue_pcplist(zone, 0, ac.migratetype, alloc_flags,
++ 								pcp, pcp_list);
++ 		if (unlikely(!page)) {
++ 			/* Try and get at least one page */
++ 			if (!nr_populated)
++ 				goto failed_irq;
++ 			break;
++ 		}
++ 		nr_account++;
++ 
++ 		prep_new_page(page, 0, gfp, 0);
++ 		if (page_list)
++ 			list_add(&page->lru, page_list);
++ 		else
++ 			page_array[nr_populated] = page;
++ 		nr_populated++;
++ 	}
++ 
++ 	local_unlock_irqrestore(&pagesets.lock, flags);
++ 
++ 	__count_zid_vm_events(PGALLOC, zone_idx(zone), nr_account);
++ 	zone_statistics(ac.preferred_zoneref->zone, zone, nr_account);
++ 
++ 	return nr_populated;
++ 
++ failed_irq:
++ 	local_unlock_irqrestore(&pagesets.lock, flags);
++ 
++ failed:
++ 	page = __alloc_pages(gfp, 0, preferred_nid, nodemask);
++ 	if (page) {
++ 		if (page_list)
++ 			list_add(&page->lru, page_list);
++ 		else
++ 			page_array[nr_populated] = page;
++ 		nr_populated++;
++ 	}
++ 
++ 	return nr_populated;
++ }
++ EXPORT_SYMBOL_GPL(__alloc_pages_bulk);
++ 
++ /*
+++>>>>>>> 44042b449872 (mm/page_alloc: allow high-order pages to be stored on the per-cpu lists)
+   * This is the 'heart' of the zoned buddy allocator.
+   */
+ -struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
+ +struct page *
+ +__alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
+  							nodemask_t *nodemask)
+  {
+  	struct page *page;
+@@@ -6436,17 -6853,15 +6790,26 @@@ static void pageset_update(struct per_c
+  	WRITE_ONCE(pcp->high, high);
+  }
+  
+ -static void per_cpu_pages_init(struct per_cpu_pages *pcp, struct per_cpu_zonestat *pzstats)
+ +static void pageset_init(struct per_cpu_pageset *p)
+  {
+++<<<<<<< HEAD
+ +	struct per_cpu_pages *pcp;
+ +	int migratetype;
+++=======
++ 	int pindex;
+++>>>>>>> 44042b449872 (mm/page_alloc: allow high-order pages to be stored on the per-cpu lists)
+  
+ -	memset(pcp, 0, sizeof(*pcp));
+ -	memset(pzstats, 0, sizeof(*pzstats));
+ +	memset(p, 0, sizeof(*p));
+  
+++<<<<<<< HEAD
+ +	pcp = &p->pcp;
+ +	pcp->count = 0;
+ +	for (migratetype = 0; migratetype < MIGRATE_PCPTYPES; migratetype++)
+ +		INIT_LIST_HEAD(&pcp->lists[migratetype]);
+++=======
++ 	for (pindex = 0; pindex < NR_PCP_LISTS; pindex++)
++ 		INIT_LIST_HEAD(&pcp->lists[pindex]);
+++>>>>>>> 44042b449872 (mm/page_alloc: allow high-order pages to be stored on the per-cpu lists)
+  
+  	/*
+  	 * Set batch and high values safe for a boot pageset. A true percpu
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 359c7b6779ee..80c6a179fb54 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -368,6 +368,24 @@ enum zone_watermarks {
+ 	NR_WMARK
+ };
+ 
++/*
++ * One per migratetype for each PAGE_ALLOC_COSTLY_ORDER plus one additional
++ * for pageblock size for THP if configured.
++ */
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++#define NR_PCP_THP 1
++#else
++#define NR_PCP_THP 0
++#endif
++#define NR_PCP_LISTS (MIGRATE_PCPTYPES * (PAGE_ALLOC_COSTLY_ORDER + 1 + NR_PCP_THP))
++
++/*
++ * Shift to encode migratetype and order in the same integer, with order
++ * in the least significant bits.
++ */
++#define NR_PCP_ORDER_WIDTH 8
++#define NR_PCP_ORDER_MASK ((1<<NR_PCP_ORDER_WIDTH) - 1)
++
+ #define min_wmark_pages(z) (z->_watermark[WMARK_MIN] + z->watermark_boost)
+ #define low_wmark_pages(z) (z->_watermark[WMARK_LOW] + z->watermark_boost)
+ #define high_wmark_pages(z) (z->_watermark[WMARK_HIGH] + z->watermark_boost)
+@@ -379,7 +397,7 @@ struct per_cpu_pages {
+ 	int batch;		/* chunk size for buddy add/remove */
+ 
+ 	/* Lists of pages, one per migrate type stored on the pcp-lists */
+-	struct list_head lists[MIGRATE_PCPTYPES];
++	struct list_head lists[NR_PCP_LISTS];
+ };
+ 
+ struct per_cpu_pageset {
+* Unmerged path mm/internal.h
+* Unmerged path mm/page_alloc.c
+diff --git a/mm/swap.c b/mm/swap.c
+index bf459c2683b2..76855e281f4e 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -93,7 +93,7 @@ static void __put_single_page(struct page *page)
+ {
+ 	__page_cache_release(page);
+ 	mem_cgroup_uncharge(page);
+-	free_unref_page(page);
++	free_unref_page(page, 0);
+ }
+ 
+ static void __put_compound_page(struct page *page)
