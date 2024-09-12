@@ -1,0 +1,137 @@
+s390/vfio-ap: make sure nib is shared
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-523.el8
+commit-author Tony Krowiak <akrowiak@linux.ibm.com>
+commit f88fb1335733029b4630fb93cfaad349a81e57b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-523.el8/f88fb133.failed
+
+Since the NIB is visible by HW, KVM and the (PV) guest it needs to be
+in non-secure or secure but shared storage. Return code 6 is used to
+indicate to a PV guest that its NIB would be on secure, unshared
+storage and therefore the NIB address is invalid.
+
+Unfortunately we have no easy way to check if a page is unshared after
+vfio_pin_pages() since it will automatically export an unshared page
+if the UV pin shared call did not succeed due to a page being in
+unshared state.
+
+Therefore we use the fact that UV pinning it a second time is a nop
+but trying to pin an exported page is an error (0x102). If we
+encounter this error, we do a vfio unpin and import the page again,
+since vfio_pin_pages() exported it.
+
+	Signed-off-by: Janosch Frank <frankja@linux.ibm.com>
+	Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Acked-by: Halil Pasic <pasic@linux.ibm.com>
+	Tested-by: Viktor Mihajlovski <mihajlov@linux.ibm.com>
+Link: https://lore.kernel.org/r/20230815184333.6554-13-akrowiak@linux.ibm.com
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit f88fb1335733029b4630fb93cfaad349a81e57b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/vfio_ap_ops.c
+diff --cc drivers/s390/crypto/vfio_ap_ops.c
+index ef0d06898296,0509f80622cd..000000000000
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@@ -334,6 -335,53 +334,56 @@@ end_free
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * vfio_ap_validate_nib - validate a notification indicator byte (nib) address.
++  *
++  * @vcpu: the object representing the vcpu executing the PQAP(AQIC) instruction.
++  * @nib: the location for storing the nib address.
++  *
++  * When the PQAP(AQIC) instruction is executed, general register 2 contains the
++  * address of the notification indicator byte (nib) used for IRQ notification.
++  * This function parses and validates the nib from gr2.
++  *
++  * Return: returns zero if the nib address is a valid; otherwise, returns
++  *	   -EINVAL.
++  */
++ static int vfio_ap_validate_nib(struct kvm_vcpu *vcpu, dma_addr_t *nib)
++ {
++ 	*nib = vcpu->run->s.regs.gprs[2];
++ 
++ 	if (!*nib)
++ 		return -EINVAL;
++ 	if (kvm_is_error_hva(gfn_to_hva(vcpu->kvm, *nib >> PAGE_SHIFT)))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static int ensure_nib_shared(unsigned long addr, struct gmap *gmap)
++ {
++ 	int ret;
++ 
++ 	/*
++ 	 * The nib has to be located in shared storage since guest and
++ 	 * host access it. vfio_pin_pages() will do a pin shared and
++ 	 * if that fails (possibly because it's not a shared page) it
++ 	 * calls export. We try to do a second pin shared here so that
++ 	 * the UV gives us an error code if we try to pin a non-shared
++ 	 * page.
++ 	 *
++ 	 * If the page is already pinned shared the UV will return a success.
++ 	 */
++ 	ret = uv_pin_shared(addr);
++ 	if (ret) {
++ 		/* vfio_pin_pages() likely exported the page so let's re-import */
++ 		gmap_convert_to_secure(gmap, addr);
++ 	}
++ 	return ret;
++ }
++ 
++ /**
+++>>>>>>> f88fb1335733 (s390/vfio-ap: make sure nib is shared)
+   * vfio_ap_irq_enable - Enable Interruption for a APQN
+   *
+   * @q:	 the vfio_ap_queue holding AQIC parameters
+@@@ -377,13 -441,31 +427,35 @@@ static struct ap_queue_status vfio_ap_i
+  	kvm = q->matrix_mdev->kvm;
+  	gisa = kvm->arch.gisa_int.origin;
+  
+ -	h_nib = page_to_phys(h_page) | (nib & ~PAGE_MASK);
+ +	h_nib = (h_pfn << PAGE_SHIFT) | (nib & ~PAGE_MASK);
+  	aqic_gisa.gisc = isc;
+++<<<<<<< HEAD
+ +	aqic_gisa.isc = kvm_s390_gisc_register(kvm, isc);
+++=======
++ 
++ 	/* NIB in non-shared storage is a rc 6 for PV guests */
++ 	if (kvm_s390_pv_cpu_is_protected(vcpu) &&
++ 	    ensure_nib_shared(h_nib & PAGE_MASK, kvm->arch.gmap)) {
++ 		vfio_unpin_pages(&q->matrix_mdev->vdev, nib, 1);
++ 		status.response_code = AP_RESPONSE_INVALID_ADDRESS;
++ 		return status;
++ 	}
++ 
++ 	nisc = kvm_s390_gisc_register(kvm, isc);
++ 	if (nisc < 0) {
++ 		VFIO_AP_DBF_WARN("%s: gisc registration failed: nisc=%d, isc=%d, apqn=%#04x\n",
++ 				 __func__, nisc, isc, q->apqn);
++ 
++ 		status.response_code = AP_RESPONSE_INVALID_GISA;
++ 		return status;
++ 	}
++ 
++ 	aqic_gisa.isc = nisc;
+++>>>>>>> f88fb1335733 (s390/vfio-ap: make sure nib is shared)
+  	aqic_gisa.ir = 1;
+ -	aqic_gisa.gisa = virt_to_phys(gisa) >> 4;
+ +	aqic_gisa.gisa = (uint64_t)gisa >> 4;
+  
+ -	status = ap_aqic(q->apqn, aqic_gisa, h_nib);
+ +	status = ap_aqic(q->apqn, aqic_gisa, (void *)h_nib);
+  	switch (status.response_code) {
+  	case AP_RESPONSE_NORMAL:
+  		/* See if we did clear older IRQ configuration */
+* Unmerged path drivers/s390/crypto/vfio_ap_ops.c
