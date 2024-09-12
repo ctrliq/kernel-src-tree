@@ -1,0 +1,92 @@
+sched/core: Fixed missing rq clock update before calling set_rq_offline()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-521.el8
+commit-author Hao Jia <jiahao.os@bytedance.com>
+commit cab3ecaed5cdcc9c36a96874b4c45056a46ece45
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-521.el8/cab3ecae.failed
+
+When using a cpufreq governor that uses
+cpufreq_add_update_util_hook(), it is possible to trigger a missing
+update_rq_clock() warning for the CPU hotplug path:
+
+  rq_attach_root()
+    set_rq_offline()
+      rq_offline_rt()
+	__disable_runtime()
+	  sched_rt_rq_enqueue()
+	    enqueue_top_rt_rq()
+	      cpufreq_update_util()
+		data->func(data, rq_clock(rq), flags)
+
+Move update_rq_clock() from sched_cpu_deactivate() (one of it's
+callers) into set_rq_offline() such that it covers all
+set_rq_offline() usage.
+
+Additionally change rq_attach_root() to use rq_lock_irqsave() so that
+it will properly manage the runqueue clock flags.
+
+	Suggested-by: Ben Segall <bsegall@google.com>
+	Signed-off-by: Hao Jia <jiahao.os@bytedance.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Vincent Guittot <vincent.guittot@linaro.org>
+Link: https://lkml.kernel.org/r/20230613082012.49615-2-jiahao.os@bytedance.com
+(cherry picked from commit cab3ecaed5cdcc9c36a96874b4c45056a46ece45)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/topology.c
+diff --cc kernel/sched/topology.c
+index a08475a0efee,d3a3b2646ec4..000000000000
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@@ -461,9 -487,9 +461,13 @@@ static void free_rootdomain(struct rcu_
+  void rq_attach_root(struct rq *rq, struct root_domain *rd)
+  {
+  	struct root_domain *old_rd = NULL;
+- 	unsigned long flags;
++ 	struct rq_flags rf;
+  
+++<<<<<<< HEAD
+ +	raw_spin_lock_irqsave(&rq->lock, flags);
+++=======
++ 	rq_lock_irqsave(rq, &rf);
+++>>>>>>> cab3ecaed5cd (sched/core: Fixed missing rq clock update before calling set_rq_offline())
+  
+  	if (rq->rd) {
+  		old_rd = rq->rd;
+@@@ -489,7 -515,7 +493,11 @@@
+  	if (cpumask_test_cpu(rq->cpu, cpu_active_mask))
+  		set_rq_online(rq);
+  
+++<<<<<<< HEAD
+ +	raw_spin_unlock_irqrestore(&rq->lock, flags);
+++=======
++ 	rq_unlock_irqrestore(rq, &rf);
+++>>>>>>> cab3ecaed5cd (sched/core: Fixed missing rq clock update before calling set_rq_offline())
+  
+  	if (old_rd)
+  		call_rcu(&old_rd->rcu, free_rootdomain);
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 59d8d0210ade..5acc15abf0c7 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -6980,6 +6980,7 @@ void set_rq_offline(struct rq *rq)
+ 	if (rq->online) {
+ 		const struct sched_class *class;
+ 
++		update_rq_clock(rq);
+ 		for_each_class(class) {
+ 			if (class->rq_offline)
+ 				class->rq_offline(rq);
+@@ -7114,7 +7115,6 @@ int sched_cpu_deactivate(unsigned int cpu)
+ 
+ 	rq_lock_irqsave(rq, &rf);
+ 	if (rq->rd) {
+-		update_rq_clock(rq);
+ 		BUG_ON(!cpumask_test_cpu(cpu, rq->rd->span));
+ 		set_rq_offline(rq);
+ 	}
+* Unmerged path kernel/sched/topology.c
