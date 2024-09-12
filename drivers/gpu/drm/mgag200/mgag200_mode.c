@@ -817,6 +817,11 @@ mgag200_simple_display_pipe_enable(struct drm_simple_display_pipe *pipe,
 	else
 		mgag200_crtc_set_gamma_linear(mdev, fb->format);
 
+	if (crtc_state->gamma_lut)
+		mgag200_crtc_set_gamma(mdev, format, crtc_state->gamma_lut->data);
+	else
+		mgag200_crtc_set_gamma_linear(mdev, format);
+
 	mgag200_enable_display(mdev);
 
 	mgag200_handle_damage(mdev, fb, &fullscreen, &shadow_plane_state->data[0]);
