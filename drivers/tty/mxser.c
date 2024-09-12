@@ -355,7 +355,6 @@ struct mxser_port {
 	int IER;		/* Interrupt Enable Register */
 	int MCR;		/* Modem control register */
 
-	unsigned char stop_rx;
 	unsigned char ldisc_stop_rx;
 
 	int custom_divisor;
@@ -2476,7 +2475,6 @@ static int mxser_initbrd(struct mxser_board *brd)
 		tty_port_init(&info->port);
 		info->port.ops = &mxser_port_ops;
 		info->board = brd;
-		info->stop_rx = 0;
 		info->ldisc_stop_rx = 0;
 
 		/* Enhance mode enabled here */
