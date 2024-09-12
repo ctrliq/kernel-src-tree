@@ -1,0 +1,260 @@
+xhci: prepare for operation w/o shared hcd
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Heiner Kallweit <hkallweit1@gmail.com>
+commit 873f323618c202cd0675324a1027dcecc7745d0b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/873f3236.failed
+
+This patch prepares xhci for the following scenario:
+- If either of the root hubs has no ports, then omit shared hcd
+- Main hcd can be USB3 if there are no USB2 ports
+
+	Signed-off-by: Heiner Kallweit <hkallweit1@gmail.com>
+	Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Link: https://lore.kernel.org/r/20220511220450.85367-3-mathias.nyman@linux.intel.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 873f323618c202cd0675324a1027dcecc7745d0b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/host/xhci.h
+diff --cc drivers/usb/host/xhci.h
+index dccb8a1bd895,c792a3148e49..000000000000
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@@ -1909,6 -1909,10 +1909,13 @@@ struct xhci_hcd 
+  	struct xhci_hub		usb3_rhub;
+  	/* support xHCI 1.0 spec USB2 hardware LPM */
+  	unsigned		hw_lpm_support:1;
+++<<<<<<< HEAD
+++=======
++ 	/* Broken Suspend flag for SNPS Suspend resume issue */
++ 	unsigned		broken_suspend:1;
++ 	/* Indicates that omitting hcd is supported if root hub has no ports */
++ 	unsigned		allow_single_roothub:1;
+++>>>>>>> 873f323618c2 (xhci: prepare for operation w/o shared hcd)
+  	/* cached usb2 extened protocol capabilites */
+  	u32                     *ext_caps;
+  	unsigned int            num_ext_caps;
+diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
+index 59c70e1f2c8e..3e392cb6eecb 100644
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -707,6 +707,7 @@ static int xhci_enter_test_mode(struct xhci_hcd *xhci,
+ 				u16 test_mode, u16 wIndex, unsigned long *flags)
+ 	__must_hold(&xhci->lock)
+ {
++	struct usb_hcd *usb3_hcd = xhci_get_usb3_hcd(xhci);
+ 	int i, retval;
+ 
+ 	/* Disable all Device Slots */
+@@ -727,7 +728,7 @@ static int xhci_enter_test_mode(struct xhci_hcd *xhci,
+ 	xhci_dbg(xhci, "Disable all port (PP = 0)\n");
+ 	/* Power off USB3 ports*/
+ 	for (i = 0; i < xhci->usb3_rhub.num_ports; i++)
+-		xhci_set_port_power(xhci, xhci->shared_hcd, i, false, flags);
++		xhci_set_port_power(xhci, usb3_hcd, i, false, flags);
+ 	/* Power off USB2 ports*/
+ 	for (i = 0; i < xhci->usb2_rhub.num_ports; i++)
+ 		xhci_set_port_power(xhci, xhci->main_hcd, i, false, flags);
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index a02530514c0e..67f9a5d179c5 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -1072,7 +1072,7 @@ static u32 xhci_find_real_port_number(struct xhci_hcd *xhci,
+ 	struct usb_hcd *hcd;
+ 
+ 	if (udev->speed >= USB_SPEED_SUPER)
+-		hcd = xhci->shared_hcd;
++		hcd = xhci_get_usb3_hcd(xhci);
+ 	else
+ 		hcd = xhci->main_hcd;
+ 
+@@ -2362,10 +2362,11 @@ static int xhci_setup_port_arrays(struct xhci_hcd *xhci, gfp_t flags)
+ 		xhci->usb2_rhub.num_ports = USB_MAXCHILDREN;
+ 	}
+ 
+-	/*
+-	 * Note we could have all USB 3.0 ports, or all USB 2.0 ports.
+-	 * Not sure how the USB core will handle a hub with no ports...
+-	 */
++	if (!xhci->usb2_rhub.num_ports)
++		xhci_info(xhci, "USB2 root hub has no ports\n");
++
++	if (!xhci->usb3_rhub.num_ports)
++		xhci_info(xhci, "USB3 root hub has no ports\n");
+ 
+ 	xhci_create_rhub_port_array(xhci, &xhci->usb2_rhub, flags);
+ 	xhci_create_rhub_port_array(xhci, &xhci->usb3_rhub, flags);
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 48dfd607cd85..0cf48f8acde2 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -486,6 +486,10 @@ static void compliance_mode_recovery(struct timer_list *t)
+ 
+ 	xhci = from_timer(xhci, t, comp_mode_recovery_timer);
+ 	rhub = &xhci->usb3_rhub;
++	hcd = rhub->hcd;
++
++	if (!hcd)
++		return;
+ 
+ 	for (i = 0; i < rhub->num_ports; i++) {
+ 		temp = readl(rhub->ports[i]->addr);
+@@ -499,7 +503,6 @@ static void compliance_mode_recovery(struct timer_list *t)
+ 					i + 1);
+ 			xhci_dbg_trace(xhci, trace_xhci_dbg_quirks,
+ 					"Attempting compliance mode recovery");
+-			hcd = xhci->shared_hcd;
+ 
+ 			if (hcd->state == HC_STATE_SUSPENDED)
+ 				usb_hcd_resume_root_hub(hcd);
+@@ -612,14 +615,11 @@ static int xhci_run_finished(struct xhci_hcd *xhci)
+ 		xhci_halt(xhci);
+ 		return -ENODEV;
+ 	}
+-	xhci->shared_hcd->state = HC_STATE_RUNNING;
+ 	xhci->cmd_ring_state = CMD_RING_STATE_RUNNING;
+ 
+ 	if (xhci->quirks & XHCI_NEC_HOST)
+ 		xhci_ring_cmd_db(xhci);
+ 
+-	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
+-			"Finished xhci_run for USB3 roothub");
+ 	return 0;
+ }
+ 
+@@ -695,12 +695,15 @@ int xhci_run(struct usb_hcd *hcd)
+ 	}
+ 	set_bit(HCD_FLAG_DEFER_RH_REGISTER, &hcd->flags);
+ 	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
+-			"Finished xhci_run for USB2 roothub");
++			"Finished %s for main hcd", __func__);
+ 
+ 	xhci_create_dbc_dev(xhci);
+ 
+ 	xhci_debugfs_init(xhci);
+ 
++	if (xhci_has_one_roothub(xhci))
++		return xhci_run_finished(xhci);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(xhci_run);
+@@ -993,7 +996,7 @@ int xhci_suspend(struct xhci_hcd *xhci, bool do_wakeup)
+ 		return 0;
+ 
+ 	if (hcd->state != HC_STATE_SUSPENDED ||
+-			xhci->shared_hcd->state != HC_STATE_SUSPENDED)
++	    (xhci->shared_hcd && xhci->shared_hcd->state != HC_STATE_SUSPENDED))
+ 		return -EINVAL;
+ 
+ 	/* Clear root port wake on bits if wakeup not allowed. */
+@@ -1010,15 +1013,18 @@ int xhci_suspend(struct xhci_hcd *xhci, bool do_wakeup)
+ 		 __func__, hcd->self.busnum);
+ 	clear_bit(HCD_FLAG_POLL_RH, &hcd->flags);
+ 	del_timer_sync(&hcd->rh_timer);
+-	clear_bit(HCD_FLAG_POLL_RH, &xhci->shared_hcd->flags);
+-	del_timer_sync(&xhci->shared_hcd->rh_timer);
++	if (xhci->shared_hcd) {
++		clear_bit(HCD_FLAG_POLL_RH, &xhci->shared_hcd->flags);
++		del_timer_sync(&xhci->shared_hcd->rh_timer);
++	}
+ 
+ 	if (xhci->quirks & XHCI_SUSPEND_DELAY)
+ 		usleep_range(1000, 1500);
+ 
+ 	spin_lock_irq(&xhci->lock);
+ 	clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
+-	clear_bit(HCD_FLAG_HW_ACCESSIBLE, &xhci->shared_hcd->flags);
++	if (xhci->shared_hcd)
++		clear_bit(HCD_FLAG_HW_ACCESSIBLE, &xhci->shared_hcd->flags);
+ 	/* step 1: stop endpoint */
+ 	/* skipped assuming that port suspend has done */
+ 
+@@ -1118,7 +1124,8 @@ int xhci_resume(struct xhci_hcd *xhci, bool hibernated)
+ 		msleep(100);
+ 
+ 	set_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
+-	set_bit(HCD_FLAG_HW_ACCESSIBLE, &xhci->shared_hcd->flags);
++	if (xhci->shared_hcd)
++		set_bit(HCD_FLAG_HW_ACCESSIBLE, &xhci->shared_hcd->flags);
+ 
+ 	spin_lock_irq(&xhci->lock);
+ 
+@@ -1178,7 +1185,8 @@ int xhci_resume(struct xhci_hcd *xhci, bool hibernated)
+ 
+ 		/* Let the USB core know _both_ roothubs lost power. */
+ 		usb_root_hub_lost_power(xhci->main_hcd->self.root_hub);
+-		usb_root_hub_lost_power(xhci->shared_hcd->self.root_hub);
++		if (xhci->shared_hcd)
++			usb_root_hub_lost_power(xhci->shared_hcd->self.root_hub);
+ 
+ 		xhci_dbg(xhci, "Stop HCD\n");
+ 		xhci_halt(xhci);
+@@ -1218,12 +1226,13 @@ int xhci_resume(struct xhci_hcd *xhci, bool hibernated)
+ 
+ 		xhci_dbg(xhci, "Start the primary HCD\n");
+ 		retval = xhci_run(hcd->primary_hcd);
+-		if (!retval) {
++		if (!retval && secondary_hcd) {
+ 			xhci_dbg(xhci, "Start the secondary HCD\n");
+ 			retval = xhci_run(secondary_hcd);
+ 		}
+ 		hcd->state = HC_STATE_SUSPENDED;
+-		xhci->shared_hcd->state = HC_STATE_SUSPENDED;
++		if (xhci->shared_hcd)
++			xhci->shared_hcd->state = HC_STATE_SUSPENDED;
+ 		goto done;
+ 	}
+ 
+@@ -1261,7 +1270,8 @@ int xhci_resume(struct xhci_hcd *xhci, bool hibernated)
+ 		}
+ 
+ 		if (pending_portevent) {
+-			usb_hcd_resume_root_hub(xhci->shared_hcd);
++			if (xhci->shared_hcd)
++				usb_hcd_resume_root_hub(xhci->shared_hcd);
+ 			usb_hcd_resume_root_hub(hcd);
+ 		}
+ 	}
+@@ -1280,8 +1290,10 @@ int xhci_resume(struct xhci_hcd *xhci, bool hibernated)
+ 	/* Re-enable port polling. */
+ 	xhci_dbg(xhci, "%s: starting usb%d port polling.\n",
+ 		 __func__, hcd->self.busnum);
+-	set_bit(HCD_FLAG_POLL_RH, &xhci->shared_hcd->flags);
+-	usb_hcd_poll_rh_status(xhci->shared_hcd);
++	if (xhci->shared_hcd) {
++		set_bit(HCD_FLAG_POLL_RH, &xhci->shared_hcd->flags);
++		usb_hcd_poll_rh_status(xhci->shared_hcd);
++	}
+ 	set_bit(HCD_FLAG_POLL_RH, &hcd->flags);
+ 	usb_hcd_poll_rh_status(hcd);
+ 
+@@ -5280,9 +5292,7 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
+ 
+ 	xhci = hcd_to_xhci(hcd);
+ 
+-	if (usb_hcd_is_primary_hcd(hcd)) {
+-		xhci_hcd_init_usb2_data(xhci, hcd);
+-	} else {
++	if (!usb_hcd_is_primary_hcd(hcd)) {
+ 		xhci_hcd_init_usb3_data(xhci, hcd);
+ 		return 0;
+ 	}
+@@ -5363,6 +5373,11 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
+ 		return retval;
+ 	xhci_dbg(xhci, "Called HCD init\n");
+ 
++	if (xhci_hcd_is_usb3(hcd))
++		xhci_hcd_init_usb3_data(xhci, hcd);
++	else
++		xhci_hcd_init_usb2_data(xhci, hcd);
++
+ 	xhci_info(xhci, "hcc params 0x%08x hci version 0x%x quirks 0x%016llx\n",
+ 		  xhci->hcc_params, xhci->hci_version, xhci->quirks);
+ 
+* Unmerged path drivers/usb/host/xhci.h
