@@ -1,0 +1,308 @@
+ASoC: SOF: sof-audio: Set up widgets from source to sink
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+commit 5da0590a090b096279227cf2b044b1ef9b9c6c1b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/5da0590a.failed
+
+For IPC3, the order of setting up the widgets associated with a PCM
+doesn't matter. But for IPC4, widgets must be set up from the source to
+the sink in order. In order to accommodate this, change the
+sof_widget_list_setup/free() functions to set up/free widgets starting
+with the source widget all the way to the sink widget for all pipelines.
+
+	Signed-off-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+	Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+	Reviewed-by: Péter Ujfalusi <peter.ujfalusi@linux.intel.com>
+	Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Reviewed-by: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+Link: https://lore.kernel.org/r/20220426171743.171061-4-ranjani.sridharan@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 5da0590a090b096279227cf2b044b1ef9b9c6c1b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/sof-audio.h
+diff --cc sound/soc/sof/sof-audio.h
+index 8fa422446727,88def7074d2d..000000000000
+--- a/sound/soc/sof/sof-audio.h
++++ b/sound/soc/sof/sof-audio.h
+@@@ -29,14 -29,56 +29,35 @@@
+  #define DMA_CHAN_INVALID	0xFFFFFFFF
+  
+  #define WIDGET_IS_DAI(id) ((id) == snd_soc_dapm_dai_in || (id) == snd_soc_dapm_dai_out)
++ #define WIDGET_IS_AIF(id) ((id) == snd_soc_dapm_aif_in || (id) == snd_soc_dapm_aif_out)
++ #define WIDGET_IS_AIF_OR_DAI(id) (WIDGET_IS_DAI(id) || WIDGET_IS_AIF(id))
+  
+++<<<<<<< HEAD
+++=======
++ #define SOF_DAI_CLK_INTEL_SSP_MCLK	0
++ #define SOF_DAI_CLK_INTEL_SSP_BCLK	1
++ 
++ enum sof_widget_op {
++ 	SOF_WIDGET_FREE,
++ 	SOF_WIDGET_SETUP,
++ };
++ 
++ /*
++  * Volume fractional word length define to 16 sets
++  * the volume linear gain value to use Qx.16 format
++  */
++ #define VOLUME_FWL	16
++ 
++ #define SOF_TLV_ITEMS 3
++ 
+++>>>>>>> 5da0590a090b (ASoC: SOF: sof-audio: Set up widgets from source to sink)
+  struct snd_sof_widget;
+  struct snd_sof_route;
+ -struct snd_sof_control;
+ -struct snd_sof_dai;
+ -
+ -struct snd_sof_dai_config_data {
+ -	int dai_index;
+ -	int dai_data; /* contains DAI-specific information */
+ -};
+ -
+ -/**
+ - * struct sof_ipc_pcm_ops - IPC-specific PCM ops
+ - * @hw_params: Function pointer for hw_params
+ - * @hw_free: Function pointer for hw_free
+ - * @trigger: Function pointer for trigger
+ - * @dai_link_fixup: Function pointer for DAI link fixup
+ - */
+ -struct sof_ipc_pcm_ops {
+ -	int (*hw_params)(struct snd_soc_component *component, struct snd_pcm_substream *substream,
+ -			 struct snd_pcm_hw_params *params,
+ -			 struct snd_sof_platform_stream_params *platform_params);
+ -	int (*hw_free)(struct snd_soc_component *component, struct snd_pcm_substream *substream);
+ -	int (*trigger)(struct snd_soc_component *component,  struct snd_pcm_substream *substream,
+ -		       int cmd);
+ -	int (*dai_link_fixup)(struct snd_soc_pcm_runtime *rtd, struct snd_pcm_hw_params *params);
+ -};
+  
+  /**
+ - * struct sof_ipc_tplg_control_ops - IPC-specific ops for topology kcontrol IO
+ + * struct ipc_tplg_control_ops - IPC-specific ops for topology kcontrol IO
+   */
+ -struct sof_ipc_tplg_control_ops {
+ +struct ipc_tplg_control_ops {
+  	bool (*volume_put)(struct snd_sof_control *scontrol, struct snd_ctl_elem_value *ucontrol);
+  	int (*volume_get)(struct snd_sof_control *scontrol, struct snd_ctl_elem_value *ucontrol);
+  	bool (*switch_put)(struct snd_sof_control *scontrol, struct snd_ctl_elem_value *ucontrol);
+diff --git a/sound/soc/sof/sof-audio.c b/sound/soc/sof/sof-audio.c
+index 32b0a6fa550f..e892321496d4 100644
+--- a/sound/soc/sof/sof-audio.c
++++ b/sound/soc/sof/sof-audio.c
+@@ -414,28 +414,134 @@ static int sof_setup_pipeline_connections(struct snd_sof_dev *sdev,
+ 	return 0;
+ }
+ 
++/*
++ * free all widgets in the sink path starting from the source widget
++ * (DAI type for capture, AIF type for playback)
++ */
++static int sof_free_widgets_in_path(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget *widget,
++				    int dir)
++{
++	struct snd_soc_dapm_path *p;
++	int err;
++	int ret = 0;
++
++	/* free all widgets even in case of error to keep use counts balanced */
++	snd_soc_dapm_widget_for_each_sink_path(widget, p) {
++		if (!p->walking && p->sink->dobj.private && widget->dobj.private) {
++			p->walking = true;
++			if (WIDGET_IS_AIF_OR_DAI(widget->id)) {
++				err = sof_widget_free(sdev, widget->dobj.private);
++				if (err < 0)
++					ret = err;
++			}
++
++			err = sof_widget_free(sdev, p->sink->dobj.private);
++			if (err < 0)
++				ret = err;
++
++			err = sof_free_widgets_in_path(sdev, p->sink, dir);
++			if (err < 0)
++				ret = err;
++			p->walking = false;
++		}
++	}
++
++	return ret;
++}
++
++/*
++ * set up all widgets in the sink path starting from the source widget
++ * (DAI type for capture, AIF type for playback).
++ * The error path in this function ensures that all successfully set up widgets getting freed.
++ */
++static int sof_set_up_widgets_in_path(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget *widget,
++				      int dir)
++{
++	struct snd_soc_dapm_path *p;
++	int ret;
++
++	snd_soc_dapm_widget_for_each_sink_path(widget, p) {
++		if (!p->walking && p->sink->dobj.private && widget->dobj.private) {
++			p->walking = true;
++			if (WIDGET_IS_AIF_OR_DAI(widget->id)) {
++				ret = sof_widget_setup(sdev, widget->dobj.private);
++				if (ret < 0)
++					goto out;
++			}
++
++			ret = sof_widget_setup(sdev, p->sink->dobj.private);
++			if (ret < 0) {
++				if (WIDGET_IS_AIF_OR_DAI(widget->id))
++					sof_widget_free(sdev, widget->dobj.private);
++				goto out;
++			}
++
++			ret = sof_set_up_widgets_in_path(sdev, p->sink, dir);
++			if (ret < 0) {
++				if (WIDGET_IS_AIF_OR_DAI(widget->id))
++					sof_widget_free(sdev, widget->dobj.private);
++				sof_widget_free(sdev, p->sink->dobj.private);
++			}
++out:
++			p->walking = false;
++			if (ret < 0)
++				return ret;
++		}
++	}
++
++	return 0;
++}
++
++static int
++sof_setup_or_free_widgets_in_order(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget_list *list,
++				   bool dir, enum sof_widget_op op)
++{
++	struct snd_soc_dapm_widget *widget;
++	int ret, i;
++
++	for_each_dapm_widgets(list, i, widget) {
++		/* starting widget for playback is AIF type */
++		if (dir == SNDRV_PCM_STREAM_PLAYBACK && !WIDGET_IS_AIF(widget->id))
++			continue;
++
++		/* starting widget for capture is DAI type */
++		if (dir == SNDRV_PCM_STREAM_CAPTURE && !WIDGET_IS_DAI(widget->id))
++			continue;
++
++		switch (op) {
++		case SOF_WIDGET_SETUP:
++			ret = sof_set_up_widgets_in_path(sdev, widget, dir);
++			break;
++		case SOF_WIDGET_FREE:
++			ret = sof_free_widgets_in_path(sdev, widget, dir);
++			break;
++		default:
++			dev_err(sdev->dev, "Invalid widget op %d\n", op);
++			return -EINVAL;
++		}
++		if (ret < 0) {
++			dev_err(sdev->dev, "Failed to %s connected widgets\n",
++				op == SOF_WIDGET_SETUP ? "set up" : "free");
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
+ int sof_widget_list_setup(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm, int dir)
+ {
+ 	struct snd_soc_dapm_widget_list *list = spcm->stream[dir].list;
+ 	struct snd_soc_dapm_widget *widget;
+-	int i, ret, num_widgets;
++	int i, ret;
+ 
+ 	/* nothing to set up */
+ 	if (!list)
+ 		return 0;
+ 
+-	/* set up widgets in the list */
+-	for_each_dapm_widgets(list, num_widgets, widget) {
+-		struct snd_sof_widget *swidget = widget->dobj.private;
+-
+-		if (!swidget)
+-			continue;
+-
+-		/* set up the widget */
+-		ret = sof_widget_setup(sdev, swidget);
+-		if (ret < 0)
+-			goto widget_free;
+-	}
++	ret = sof_setup_or_free_widgets_in_order(sdev, list, dir, SOF_WIDGET_SETUP);
++	if (ret < 0)
++		return ret;
+ 
+ 	/*
+ 	 * error in setting pipeline connections will result in route status being reset for
+@@ -474,18 +580,7 @@ int sof_widget_list_setup(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm, in
+ 	return 0;
+ 
+ widget_free:
+-	/* free all widgets that have been set up successfully */
+-	for_each_dapm_widgets(list, i, widget) {
+-		struct snd_sof_widget *swidget = widget->dobj.private;
+-
+-		if (!swidget)
+-			continue;
+-
+-		if (!num_widgets--)
+-			break;
+-
+-		sof_widget_free(sdev, swidget);
+-	}
++	sof_setup_or_free_widgets_in_order(sdev, list, dir, SOF_WIDGET_FREE);
+ 
+ 	return ret;
+ }
+@@ -493,37 +588,18 @@ int sof_widget_list_setup(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm, in
+ int sof_widget_list_free(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm, int dir)
+ {
+ 	struct snd_soc_dapm_widget_list *list = spcm->stream[dir].list;
+-	struct snd_soc_dapm_widget *widget;
+-	int i, ret;
+-	int ret1 = 0;
++	int ret;
+ 
+ 	/* nothing to free */
+ 	if (!list)
+ 		return 0;
+ 
+-	/*
+-	 * Free widgets in the list. This can fail but continue freeing other widgets to keep
+-	 * use_counts balanced.
+-	 */
+-	for_each_dapm_widgets(list, i, widget) {
+-		struct snd_sof_widget *swidget = widget->dobj.private;
+-
+-		if (!swidget)
+-			continue;
+-
+-		/*
+-		 * free widget and its pipe_widget. Either of these can fail, but free as many as
+-		 * possible before freeing the list and returning the error.
+-		 */
+-		ret = sof_widget_free(sdev, swidget);
+-		if (ret < 0)
+-			ret1 = ret;
+-	}
++	ret = sof_setup_or_free_widgets_in_order(sdev, list, dir, SOF_WIDGET_FREE);
+ 
+ 	snd_soc_dapm_dai_free_widgets(&list);
+ 	spcm->stream[dir].list = NULL;
+ 
+-	return ret1;
++	return ret;
+ }
+ 
+ /*
+* Unmerged path sound/soc/sof/sof-audio.h
