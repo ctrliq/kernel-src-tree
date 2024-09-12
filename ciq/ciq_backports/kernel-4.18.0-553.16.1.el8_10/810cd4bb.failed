@@ -1,0 +1,152 @@
+vfio/pci: Lock external INTx masking ops
+
+jira LE-1907
+cve CVE-2024-26810
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Alex Williamson <alex.williamson@redhat.com>
+commit 810cd4bb53456d0503cc4e7934e063835152c1b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/810cd4bb.failed
+
+Mask operations through config space changes to DisINTx may race INTx
+configuration changes via ioctl.  Create wrappers that add locking for
+paths outside of the core interrupt code.
+
+In particular, irq_type is updated holding igate, therefore testing
+is_intx() requires holding igate.  For example clearing DisINTx from
+config space can otherwise race changes of the interrupt configuration.
+
+This aligns interfaces which may trigger the INTx eventfd into two
+camps, one side serialized by igate and the other only enabled while
+INTx is configured.  A subsequent patch introduces synchronization for
+the latter flows.
+
+	Cc:  <stable@vger.kernel.org>
+Fixes: 89e1f7d4c66d ("vfio: Add PCI device driver")
+	Reported-by: Reinette Chatre <reinette.chatre@intel.com>
+	Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Reviewed-by: Eric Auger <eric.auger@redhat.com>
+Link: https://lore.kernel.org/r/20240308230557.805580-3-alex.williamson@redhat.com
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 810cd4bb53456d0503cc4e7934e063835152c1b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/pci/vfio_pci_intrs.c
+diff --cc drivers/vfio/pci/vfio_pci_intrs.c
+index c989f777bf77,75c85eec21b3..000000000000
+--- a/drivers/vfio/pci/vfio_pci_intrs.c
++++ b/drivers/vfio/pci/vfio_pci_intrs.c
+@@@ -30,17 -86,28 +30,24 @@@
+   */
+  static void vfio_send_intx_eventfd(void *opaque, void *unused)
+  {
+ -	struct vfio_pci_core_device *vdev = opaque;
+ +	struct vfio_pci_device *vdev = opaque;
+  
+ -	if (likely(is_intx(vdev) && !vdev->virq_disabled)) {
+ -		struct vfio_pci_irq_ctx *ctx;
+ -
+ -		ctx = vfio_irq_ctx_get(vdev, 0);
+ -		if (WARN_ON_ONCE(!ctx))
+ -			return;
+ -		eventfd_signal(ctx->trigger);
+ -	}
+ +	if (likely(is_intx(vdev) && !vdev->virq_disabled))
+ +		eventfd_signal(vdev->ctx[0].trigger, 1);
+  }
+  
+++<<<<<<< HEAD
+ +void vfio_pci_intx_mask(struct vfio_pci_device *vdev)
+++=======
++ /* Returns true if the INTx vfio_pci_irq_ctx.masked value is changed. */
++ static bool __vfio_pci_intx_mask(struct vfio_pci_core_device *vdev)
+++>>>>>>> 810cd4bb5345 (vfio/pci: Lock external INTx masking ops)
+  {
+  	struct pci_dev *pdev = vdev->pdev;
+ -	struct vfio_pci_irq_ctx *ctx;
+  	unsigned long flags;
+ -	bool masked_changed = false;
+  
++ 	lockdep_assert_held(&vdev->igate);
++ 
+  	spin_lock_irqsave(&vdev->irqlock, flags);
+  
+  	/*
+@@@ -62,12 -136,26 +69,23 @@@
+  		else
+  			disable_irq_nosync(pdev->irq);
+  
+ -		ctx->masked = true;
+ -		masked_changed = true;
+ +		vdev->ctx[0].masked = true;
+  	}
+  
+ -out_unlock:
+  	spin_unlock_irqrestore(&vdev->irqlock, flags);
+ -	return masked_changed;
+  }
+  
++ bool vfio_pci_intx_mask(struct vfio_pci_core_device *vdev)
++ {
++ 	bool mask_changed;
++ 
++ 	mutex_lock(&vdev->igate);
++ 	mask_changed = __vfio_pci_intx_mask(vdev);
++ 	mutex_unlock(&vdev->igate);
++ 
++ 	return mask_changed;
++ }
++ 
+  /*
+   * If this is triggered by an eventfd, we can't call eventfd_signal
+   * or else we'll deadlock on the eventfd wait queue.  Return >0 when
+@@@ -110,15 -207,25 +128,28 @@@ static int vfio_pci_intx_unmask_handler
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +void vfio_pci_intx_unmask(struct vfio_pci_device *vdev)
+++=======
++ static void __vfio_pci_intx_unmask(struct vfio_pci_core_device *vdev)
+++>>>>>>> 810cd4bb5345 (vfio/pci: Lock external INTx masking ops)
+  {
++ 	lockdep_assert_held(&vdev->igate);
++ 
+  	if (vfio_pci_intx_unmask_handler(vdev, NULL) > 0)
+  		vfio_send_intx_eventfd(vdev, NULL);
+  }
+  
++ void vfio_pci_intx_unmask(struct vfio_pci_core_device *vdev)
++ {
++ 	mutex_lock(&vdev->igate);
++ 	__vfio_pci_intx_unmask(vdev);
++ 	mutex_unlock(&vdev->igate);
++ }
++ 
+  static irqreturn_t vfio_intx_handler(int irq, void *dev_id)
+  {
+ -	struct vfio_pci_core_device *vdev = dev_id;
+ -	struct vfio_pci_irq_ctx *ctx;
+ +	struct vfio_pci_device *vdev = dev_id;
+  	unsigned long flags;
+  	int ret = IRQ_NONE;
+  
+@@@ -432,9 -589,13 +463,9 @@@ static int vfio_pci_set_intx_unmask(str
+  	} else if (flags & VFIO_IRQ_SET_DATA_BOOL) {
+  		uint8_t unmask = *(uint8_t *)data;
+  		if (unmask)
+- 			vfio_pci_intx_unmask(vdev);
++ 			__vfio_pci_intx_unmask(vdev);
+  	} else if (flags & VFIO_IRQ_SET_DATA_EVENTFD) {
+ -		struct vfio_pci_irq_ctx *ctx = vfio_irq_ctx_get(vdev, 0);
+  		int32_t fd = *(int32_t *)data;
+ -
+ -		if (WARN_ON_ONCE(!ctx))
+ -			return -EINVAL;
+  		if (fd >= 0)
+  			return vfio_virqfd_enable((void *) vdev,
+  						  vfio_pci_intx_unmask_handler,
+* Unmerged path drivers/vfio/pci/vfio_pci_intrs.c
