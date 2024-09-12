@@ -1,0 +1,322 @@
+ice: virtchnl rss hena support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.10.1.el8_7
+commit-author Md Fahad Iqbal Polash <md.fahad.iqbal.polash@intel.com>
+commit e384cf35bf0c83284eb37785d21d39bbe2568adf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.10.1.el8_7/e384cf35.failed
+
+Add support for 2 virtchnl msgs:
+VIRTCHNL_OP_SET_RSS_HENA
+VIRTCHNL_OP_GET_RSS_HENA_CAPS
+
+The first one allows VFs to clear all previously programmed
+RSS configuration and customize it. The second one returns
+the RSS HENA bits allowed by the hardware.
+
+Introduce ice_err_to_virt_err which converts kernel
+specific errors to virtchnl errors.
+
+	Signed-off-by: Md Fahad Iqbal Polash <md.fahad.iqbal.polash@intel.com>
+	Signed-off-by: Wojciech Drewek <wojciech.drewek@intel.com>
+	Reviewed-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e384cf35bf0c83284eb37785d21d39bbe2568adf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_virtchnl.c
+#	drivers/net/ethernet/intel/ice/ice_virtchnl.h
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl.c
+index 758593d3a71a,ec90e594986e..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl.c
+@@@ -2453,6 -2482,164 +2453,167 @@@ error_param
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_vc_get_rss_hena - return the RSS HENA bits allowed by the hardware
++  * @vf: pointer to the VF info
++  */
++ static int ice_vc_get_rss_hena(struct ice_vf *vf)
++ {
++ 	enum virtchnl_status_code v_ret = VIRTCHNL_STATUS_SUCCESS;
++ 	struct virtchnl_rss_hena *vrh = NULL;
++ 	int len = 0, ret;
++ 
++ 	if (!test_bit(ICE_VF_STATE_ACTIVE, vf->vf_states)) {
++ 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		goto err;
++ 	}
++ 
++ 	if (!test_bit(ICE_FLAG_RSS_ENA, vf->pf->flags)) {
++ 		dev_err(ice_pf_to_dev(vf->pf), "RSS not supported by PF\n");
++ 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		goto err;
++ 	}
++ 
++ 	len = sizeof(struct virtchnl_rss_hena);
++ 	vrh = kzalloc(len, GFP_KERNEL);
++ 	if (!vrh) {
++ 		v_ret = VIRTCHNL_STATUS_ERR_NO_MEMORY;
++ 		len = 0;
++ 		goto err;
++ 	}
++ 
++ 	vrh->hena = ICE_DEFAULT_RSS_HENA;
++ err:
++ 	/* send the response back to the VF */
++ 	ret = ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_GET_RSS_HENA_CAPS, v_ret,
++ 				    (u8 *)vrh, len);
++ 	kfree(vrh);
++ 	return ret;
++ }
++ 
++ /**
++  * ice_vc_set_rss_hena - set RSS HENA bits for the VF
++  * @vf: pointer to the VF info
++  * @msg: pointer to the msg buffer
++  */
++ static int ice_vc_set_rss_hena(struct ice_vf *vf, u8 *msg)
++ {
++ 	struct virtchnl_rss_hena *vrh = (struct virtchnl_rss_hena *)msg;
++ 	enum virtchnl_status_code v_ret = VIRTCHNL_STATUS_SUCCESS;
++ 	struct ice_pf *pf = vf->pf;
++ 	struct ice_vsi *vsi;
++ 	struct device *dev;
++ 	int status;
++ 
++ 	dev = ice_pf_to_dev(pf);
++ 
++ 	if (!test_bit(ICE_VF_STATE_ACTIVE, vf->vf_states)) {
++ 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		goto err;
++ 	}
++ 
++ 	if (!test_bit(ICE_FLAG_RSS_ENA, pf->flags)) {
++ 		dev_err(dev, "RSS not supported by PF\n");
++ 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		goto err;
++ 	}
++ 
++ 	vsi = ice_get_vf_vsi(vf);
++ 	if (!vsi) {
++ 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		goto err;
++ 	}
++ 
++ 	/* clear all previously programmed RSS configuration to allow VF drivers
++ 	 * the ability to customize the RSS configuration and/or completely
++ 	 * disable RSS
++ 	 */
++ 	status = ice_rem_vsi_rss_cfg(&pf->hw, vsi->idx);
++ 	if (status && !vrh->hena) {
++ 		/* only report failure to clear the current RSS configuration if
++ 		 * that was clearly the VF's intention (i.e. vrh->hena = 0)
++ 		 */
++ 		v_ret = ice_err_to_virt_err(status);
++ 		goto err;
++ 	} else if (status) {
++ 		/* allow the VF to update the RSS configuration even on failure
++ 		 * to clear the current RSS confguration in an attempt to keep
++ 		 * RSS in a working state
++ 		 */
++ 		dev_warn(dev, "Failed to clear the RSS configuration for VF %u\n",
++ 			 vf->vf_id);
++ 	}
++ 
++ 	if (vrh->hena) {
++ 		status = ice_add_avf_rss_cfg(&pf->hw, vsi->idx, vrh->hena);
++ 		v_ret = ice_err_to_virt_err(status);
++ 	}
++ 
++ 	/* send the response to the VF */
++ err:
++ 	return ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_SET_RSS_HENA, v_ret,
++ 				     NULL, 0);
++ }
++ 
++ /**
++  * ice_vc_query_rxdid - query RXDID supported by DDP package
++  * @vf: pointer to VF info
++  *
++  * Called from VF to query a bitmap of supported flexible
++  * descriptor RXDIDs of a DDP package.
++  */
++ static int ice_vc_query_rxdid(struct ice_vf *vf)
++ {
++ 	enum virtchnl_status_code v_ret = VIRTCHNL_STATUS_SUCCESS;
++ 	struct virtchnl_supported_rxdids *rxdid = NULL;
++ 	struct ice_hw *hw = &vf->pf->hw;
++ 	struct ice_pf *pf = vf->pf;
++ 	int len = 0;
++ 	int ret, i;
++ 	u32 regval;
++ 
++ 	if (!test_bit(ICE_VF_STATE_ACTIVE, vf->vf_states)) {
++ 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		goto err;
++ 	}
++ 
++ 	if (!(vf->driver_caps & VIRTCHNL_VF_OFFLOAD_RX_FLEX_DESC)) {
++ 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		goto err;
++ 	}
++ 
++ 	len = sizeof(struct virtchnl_supported_rxdids);
++ 	rxdid = kzalloc(len, GFP_KERNEL);
++ 	if (!rxdid) {
++ 		v_ret = VIRTCHNL_STATUS_ERR_NO_MEMORY;
++ 		len = 0;
++ 		goto err;
++ 	}
++ 
++ 	/* Read flexiflag registers to determine whether the
++ 	 * corresponding RXDID is configured and supported or not.
++ 	 * Since Legacy 16byte descriptor format is not supported,
++ 	 * start from Legacy 32byte descriptor.
++ 	 */
++ 	for (i = ICE_RXDID_LEGACY_1; i < ICE_FLEX_DESC_RXDID_MAX_NUM; i++) {
++ 		regval = rd32(hw, GLFLXP_RXDID_FLAGS(i, 0));
++ 		if ((regval >> GLFLXP_RXDID_FLAGS_FLEXIFLAG_4N_S)
++ 			& GLFLXP_RXDID_FLAGS_FLEXIFLAG_4N_M)
++ 			rxdid->supported_rxdids |= BIT(i);
++ 	}
++ 
++ 	pf->supported_rxdids = rxdid->supported_rxdids;
++ 
++ err:
++ 	ret = ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_GET_SUPPORTED_RXDIDS,
++ 				    v_ret, (u8 *)rxdid, len);
++ 	kfree(rxdid);
++ 	return ret;
++ }
++ 
++ /**
+++>>>>>>> e384cf35bf0c (ice: virtchnl rss hena support)
+   * ice_vf_init_vlan_stripping - enable/disable VLAN stripping on initialization
+   * @vf: VF to enable/disable VLAN stripping for on initialization
+   *
+@@@ -3486,6 -3673,9 +3647,12 @@@ static const struct ice_virtchnl_ops ic
+  	.cfg_promiscuous_mode_msg = ice_vc_cfg_promiscuous_mode_msg,
+  	.add_vlan_msg = ice_vc_add_vlan_msg,
+  	.remove_vlan_msg = ice_vc_remove_vlan_msg,
+++<<<<<<< HEAD
+++=======
++ 	.query_rxdid = ice_vc_query_rxdid,
++ 	.get_rss_hena = ice_vc_get_rss_hena,
++ 	.set_rss_hena_msg = ice_vc_set_rss_hena,
+++>>>>>>> e384cf35bf0c (ice: virtchnl rss hena support)
+  	.ena_vlan_stripping = ice_vc_ena_vlan_stripping,
+  	.dis_vlan_stripping = ice_vc_dis_vlan_stripping,
+  	.handle_rss_cfg_msg = ice_vc_handle_rss_cfg,
+@@@ -3654,10 -3808,13 +3821,20 @@@ static const struct ice_virtchnl_ops ic
+  	.config_rss_lut = ice_vc_config_rss_lut,
+  	.get_stats_msg = ice_vc_get_stats_msg,
+  	.cfg_promiscuous_mode_msg = ice_vc_repr_cfg_promiscuous_mode,
+++<<<<<<< HEAD
+ +	.add_vlan_msg = ice_vc_repr_add_vlan,
+ +	.remove_vlan_msg = ice_vc_repr_del_vlan,
+ +	.ena_vlan_stripping = ice_vc_repr_ena_vlan_stripping,
+ +	.dis_vlan_stripping = ice_vc_repr_dis_vlan_stripping,
+++=======
++ 	.add_vlan_msg = ice_vc_add_vlan_msg,
++ 	.remove_vlan_msg = ice_vc_remove_vlan_msg,
++ 	.query_rxdid = ice_vc_query_rxdid,
++ 	.get_rss_hena = ice_vc_get_rss_hena,
++ 	.set_rss_hena_msg = ice_vc_set_rss_hena,
++ 	.ena_vlan_stripping = ice_vc_ena_vlan_stripping,
++ 	.dis_vlan_stripping = ice_vc_dis_vlan_stripping,
+++>>>>>>> e384cf35bf0c (ice: virtchnl rss hena support)
+  	.handle_rss_cfg_msg = ice_vc_handle_rss_cfg,
+  	.add_fdir_fltr_msg = ice_vc_add_fdir_fltr,
+  	.del_fdir_fltr_msg = ice_vc_del_fdir_fltr,
+@@@ -3796,6 -3953,15 +3973,18 @@@ error_handler
+  	case VIRTCHNL_OP_DEL_VLAN:
+  		err = ops->remove_vlan_msg(vf, msg);
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case VIRTCHNL_OP_GET_SUPPORTED_RXDIDS:
++ 		err = ops->query_rxdid(vf);
++ 		break;
++ 	case VIRTCHNL_OP_GET_RSS_HENA_CAPS:
++ 		err = ops->get_rss_hena(vf);
++ 		break;
++ 	case VIRTCHNL_OP_SET_RSS_HENA:
++ 		err = ops->set_rss_hena_msg(vf, msg);
++ 		break;
+++>>>>>>> e384cf35bf0c (ice: virtchnl rss hena support)
+  	case VIRTCHNL_OP_ENABLE_VLAN_STRIPPING:
+  		err = ops->ena_vlan_stripping(vf);
+  		break;
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl.h
+index b5a3fd8adbb4,b454654d7b0c..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl.h
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl.h
+@@@ -35,6 -36,9 +35,12 @@@ struct ice_virtchnl_ops 
+  	int (*cfg_promiscuous_mode_msg)(struct ice_vf *vf, u8 *msg);
+  	int (*add_vlan_msg)(struct ice_vf *vf, u8 *msg);
+  	int (*remove_vlan_msg)(struct ice_vf *vf, u8 *msg);
+++<<<<<<< HEAD
+++=======
++ 	int (*query_rxdid)(struct ice_vf *vf);
++ 	int (*get_rss_hena)(struct ice_vf *vf);
++ 	int (*set_rss_hena_msg)(struct ice_vf *vf, u8 *msg);
+++>>>>>>> e384cf35bf0c (ice: virtchnl rss hena support)
+  	int (*ena_vlan_stripping)(struct ice_vf *vf);
+  	int (*dis_vlan_stripping)(struct ice_vf *vf);
+  	int (*handle_rss_cfg_msg)(struct ice_vf *vf, u8 *msg, bool add);
+diff --git a/drivers/net/ethernet/intel/ice/ice_vf_lib.c b/drivers/net/ethernet/intel/ice/ice_vf_lib.c
+index 68149467980b..29296c42b6f4 100644
+--- a/drivers/net/ethernet/intel/ice/ice_vf_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_vf_lib.c
+@@ -694,6 +694,30 @@ void ice_dis_vf_qs(struct ice_vf *vf)
+ 	ice_set_vf_state_qs_dis(vf);
+ }
+ 
++/**
++ * ice_err_to_virt_err - translate errors for VF return code
++ * @err: error return code
++ */
++enum virtchnl_status_code ice_err_to_virt_err(int err)
++{
++	switch (err) {
++	case 0:
++		return VIRTCHNL_STATUS_SUCCESS;
++	case -EINVAL:
++	case -ENODEV:
++		return VIRTCHNL_STATUS_ERR_PARAM;
++	case -ENOMEM:
++		return VIRTCHNL_STATUS_ERR_NO_MEMORY;
++	case -EALREADY:
++	case -EBUSY:
++	case -EIO:
++	case -ENOSPC:
++		return VIRTCHNL_STATUS_ERR_ADMIN_QUEUE_ERROR;
++	default:
++		return VIRTCHNL_STATUS_ERR_NOT_SUPPORTED;
++	}
++}
++
+ /**
+  * ice_check_vf_init - helper to check if VF init complete
+  * @vf: the pointer to the VF to check
+diff --git a/drivers/net/ethernet/intel/ice/ice_vf_lib_private.h b/drivers/net/ethernet/intel/ice/ice_vf_lib_private.h
+index 15887e772c76..9c8ef2b01f0f 100644
+--- a/drivers/net/ethernet/intel/ice/ice_vf_lib_private.h
++++ b/drivers/net/ethernet/intel/ice/ice_vf_lib_private.h
+@@ -25,6 +25,7 @@
+ 
+ void ice_dis_vf_qs(struct ice_vf *vf);
+ int ice_check_vf_init(struct ice_vf *vf);
++enum virtchnl_status_code ice_err_to_virt_err(int err);
+ struct ice_port_info *ice_vf_get_port_info(struct ice_vf *vf);
+ int ice_vsi_apply_spoofchk(struct ice_vsi *vsi, bool enable);
+ bool ice_is_vf_trusted(struct ice_vf *vf);
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl.h
