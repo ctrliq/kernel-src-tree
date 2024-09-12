@@ -1,0 +1,164 @@
+iomap/gfs2: Unlock and put folio in page_done handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-483.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 80baab88bb93eeaa133b426d24dfc0775a8cf824
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-483.el8/80baab88.failed
+
+When an iomap defines a ->page_done() handler in its page_ops, delegate
+unlocking the folio and putting the folio reference to that handler.
+
+This allows to fix a race between journaled data writes and folio
+writeback in gfs2: before this change, gfs2_iomap_page_done() was called
+after unlocking the folio, so writeback could start writing back the
+folio's buffers before they could be marked for writing to the journal.
+Also, try_to_free_buffers() could free the buffers before
+gfs2_iomap_page_done() was done adding the buffers to the current
+current transaction.  With this change, gfs2_iomap_page_done() adds the
+buffers to the current transaction while the folio is still locked, so
+the problems described above can no longer occur.
+
+The only current user of ->page_done() is gfs2, so other filesystems are
+not affected.  To catch out any out-of-tree users, switch from a page to
+a folio in ->page_done().
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 80baab88bb93eeaa133b426d24dfc0775a8cf824)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/iomap/buffered-io.c
+#	include/linux/iomap.h
+diff --cc fs/iomap/buffered-io.c
+index fa25b9a66020,a9082078e4ed..000000000000
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@@ -629,25 -575,42 +629,43 @@@ __iomap_write_begin(struct inode *inode
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int iomap_write_begin_inline(struct inode *inode,
+ +		struct page *page, struct iomap *srcmap)
+++=======
++ static void __iomap_put_folio(struct iomap_iter *iter, loff_t pos, size_t ret,
++ 		struct folio *folio)
++ {
++ 	const struct iomap_page_ops *page_ops = iter->iomap.page_ops;
++ 
++ 	if (page_ops && page_ops->page_done) {
++ 		page_ops->page_done(iter->inode, pos, ret, folio);
++ 	} else if (folio) {
++ 		folio_unlock(folio);
++ 		folio_put(folio);
++ 	}
++ }
++ 
++ static int iomap_write_begin_inline(const struct iomap_iter *iter,
++ 		struct folio *folio)
+++>>>>>>> 80baab88bb93 (iomap/gfs2: Unlock and put folio in page_done handler)
+  {
+  	/* needs more work for the tailpacking case; disable for now */
+ -	if (WARN_ON_ONCE(iomap_iter_srcmap(iter)->offset != 0))
+ +	if (WARN_ON_ONCE(srcmap->offset != 0))
+  		return -EIO;
+ -	return iomap_read_inline_data(iter, folio);
+ +	return iomap_read_inline_data(inode, page, srcmap);
+  }
+  
+ -static int iomap_write_begin(struct iomap_iter *iter, loff_t pos,
+ -		size_t len, struct folio **foliop)
+ +static int
+ +iomap_write_begin(struct inode *inode, loff_t pos, unsigned len, unsigned flags,
+ +		struct page **pagep, struct iomap *iomap, struct iomap *srcmap)
+  {
+ -	const struct iomap_page_ops *page_ops = iter->iomap.page_ops;
+ -	const struct iomap *srcmap = iomap_iter_srcmap(iter);
+ -	struct folio *folio;
+ -	unsigned fgp = FGP_LOCK | FGP_WRITE | FGP_CREAT | FGP_STABLE | FGP_NOFS;
+ +	const struct iomap_page_ops *page_ops = iomap->page_ops;
+ +	struct page *page;
+  	int status = 0;
+  
+ -	if (iter->flags & IOMAP_NOWAIT)
+ -		fgp |= FGP_NOWAIT;
+ -
+ -	BUG_ON(pos + len > iter->iomap.offset + iter->iomap.length);
+ -	if (srcmap != &iter->iomap)
+ +	BUG_ON(pos + len > iomap->offset + iomap->length);
+ +	if (srcmap != iomap)
+  		BUG_ON(pos + len > srcmap->offset + srcmap->length);
+  
+  	if (fatal_signal_pending(current))
+diff --cc include/linux/iomap.h
+index de14aa38147e,743e2a909162..000000000000
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@@ -129,7 -138,24 +130,28 @@@ static inline bool iomap_inline_data_va
+  struct iomap_page_ops {
+  	int (*page_prepare)(struct inode *inode, loff_t pos, unsigned len);
+  	void (*page_done)(struct inode *inode, loff_t pos, unsigned copied,
+++<<<<<<< HEAD
+ +			struct page *page);
+++=======
++ 			struct folio *folio);
++ 
++ 	/*
++ 	 * Check that the cached iomap still maps correctly to the filesystem's
++ 	 * internal extent map. FS internal extent maps can change while iomap
++ 	 * is iterating a cached iomap, so this hook allows iomap to detect that
++ 	 * the iomap needs to be refreshed during a long running write
++ 	 * operation.
++ 	 *
++ 	 * The filesystem can store internal state (e.g. a sequence number) in
++ 	 * iomap->validity_cookie when the iomap is first mapped to be able to
++ 	 * detect changes between mapping time and whenever .iomap_valid() is
++ 	 * called.
++ 	 *
++ 	 * This is called with the folio over the specified file position held
++ 	 * locked by the iomap code.
++ 	 */
++ 	bool (*iomap_valid)(struct inode *inode, const struct iomap *iomap);
+++>>>>>>> 80baab88bb93 (iomap/gfs2: Unlock and put folio in page_done handler)
+  };
+  
+  /*
+diff --git a/fs/gfs2/bmap.c b/fs/gfs2/bmap.c
+index ce3cf71ff2cb..7a0efbeeb9b1 100644
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@ -976,14 +976,23 @@ static int gfs2_iomap_page_prepare(struct inode *inode, loff_t pos,
+ }
+ 
+ static void gfs2_iomap_page_done(struct inode *inode, loff_t pos,
+-				 unsigned copied, struct page *page)
++				 unsigned copied, struct folio *folio)
+ {
+ 	struct gfs2_trans *tr = current->journal_info;
+ 	struct gfs2_inode *ip = GFS2_I(inode);
+ 	struct gfs2_sbd *sdp = GFS2_SB(inode);
+ 
+-	if (page && !gfs2_is_stuffed(ip))
+-		gfs2_page_add_databufs(ip, page, offset_in_page(pos), copied);
++	if (!folio) {
++		gfs2_trans_end(sdp);
++		return;
++	}
++
++	if (!gfs2_is_stuffed(ip))
++		gfs2_page_add_databufs(ip, &folio->page, offset_in_page(pos),
++				       copied);
++
++	folio_unlock(folio);
++	folio_put(folio);
+ 
+ 	if (tr->tr_num_buf_new)
+ 		__mark_inode_dirty(inode, I_DIRTY_DATASYNC);
+* Unmerged path fs/iomap/buffered-io.c
+* Unmerged path include/linux/iomap.h
