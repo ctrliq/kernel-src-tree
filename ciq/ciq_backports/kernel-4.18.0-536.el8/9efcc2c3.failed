@@ -1,0 +1,157 @@
+md/raid1-10: don't handle pluged bio by daemon thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-536.el8
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit 9efcc2c3df7612eea02daa159ae7c6ac44420513
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-536.el8/9efcc2c3.failed
+
+current->bio_list will be set under submit_bio() context, in this case
+bitmap io will be added to the list and wait for current io submission to
+finish, while current io submission must wait for bitmap io to be done.
+commit 874807a83139 ("md/raid1{,0}: fix deadlock in bitmap_unplug.") fix
+the deadlock by handling plugged bio by daemon thread.
+
+On the one hand, the deadlock won't exist after commit a214b949d8e3
+("blk-mq: only flush requests from the plug in blk_mq_submit_bio"). On
+the other hand, current solution makes it impossible to flush plugged bio
+in raid1/10_make_request(), because this will cause that all the writes
+will goto daemon thread.
+
+In order to limit the number of plugged bio, commit 874807a83139
+("md/raid1{,0}: fix deadlock in bitmap_unplug.") is reverted, and the
+deadlock is fixed by handling bitmap io asynchronously.
+
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+	Signed-off-by: Song Liu <song@kernel.org>
+Link: https://lore.kernel.org/r/20230529131106.2123367-7-yukuai1@huaweicloud.com
+(cherry picked from commit 9efcc2c3df7612eea02daa159ae7c6ac44420513)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1-10.c
+diff --cc drivers/md/raid1-10.c
+index b2d6a269dec4,c62bcb17c67b..000000000000
+--- a/drivers/md/raid1-10.c
++++ b/drivers/md/raid1-10.c
+@@@ -111,3 -110,59 +111,62 @@@ static void md_bio_reset_resync_pages(s
+  		size -= len;
+  	} while (idx++ < RESYNC_PAGES && size > 0);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ 
++ static inline void raid1_submit_write(struct bio *bio)
++ {
++ 	struct md_rdev *rdev = (struct md_rdev *)bio->bi_bdev;
++ 
++ 	bio->bi_next = NULL;
++ 	bio_set_dev(bio, rdev->bdev);
++ 	if (test_bit(Faulty, &rdev->flags))
++ 		bio_io_error(bio);
++ 	else if (unlikely(bio_op(bio) ==  REQ_OP_DISCARD &&
++ 			  !bdev_max_discard_sectors(bio->bi_bdev)))
++ 		/* Just ignore it */
++ 		bio_endio(bio);
++ 	else
++ 		submit_bio_noacct(bio);
++ }
++ 
++ static inline bool raid1_add_bio_to_plug(struct mddev *mddev, struct bio *bio,
++ 				      blk_plug_cb_fn unplug)
++ {
++ 	struct raid1_plug_cb *plug = NULL;
++ 	struct blk_plug_cb *cb;
++ 
++ 	/*
++ 	 * If bitmap is not enabled, it's safe to submit the io directly, and
++ 	 * this can get optimal performance.
++ 	 */
++ 	if (!md_bitmap_enabled(mddev->bitmap)) {
++ 		raid1_submit_write(bio);
++ 		return true;
++ 	}
++ 
++ 	cb = blk_check_plugged(unplug, mddev, sizeof(*plug));
++ 	if (!cb)
++ 		return false;
++ 
++ 	plug = container_of(cb, struct raid1_plug_cb, cb);
++ 	bio_list_add(&plug->pending, bio);
++ 
++ 	return true;
++ }
++ 
++ /*
++  * current->bio_list will be set under submit_bio() context, in this case bitmap
++  * io will be added to the list and wait for current io submission to finish,
++  * while current io submission must wait for bitmap io to be done. In order to
++  * avoid such deadlock, submit bitmap io asynchronously.
++  */
++ static inline void raid1_prepare_flush_writes(struct bitmap *bitmap)
++ {
++ 	if (current->bio_list)
++ 		md_bitmap_unplug_async(bitmap);
++ 	else
++ 		md_bitmap_unplug(bitmap);
++ }
+++>>>>>>> 9efcc2c3df76 (md/raid1-10: don't handle pluged bio by daemon thread)
+* Unmerged path drivers/md/raid1-10.c
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index f1e614f61aa9..2a8a89522f2e 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -830,7 +830,7 @@ static int raid1_congested(struct mddev *mddev, int bits)
+ static void flush_bio_list(struct r1conf *conf, struct bio *bio)
+ {
+ 	/* flush any pending bitmap writes to disk before proceeding w/ I/O */
+-	md_bitmap_unplug(conf->mddev->bitmap);
++	raid1_prepare_flush_writes(conf->mddev->bitmap);
+ 	wake_up(&conf->wait_barrier);
+ 
+ 	while (bio) { /* submit pending writes */
+@@ -1222,7 +1222,7 @@ static void raid1_unplug(struct blk_plug_cb *cb, bool from_schedule)
+ 	struct r1conf *conf = mddev->private;
+ 	struct bio *bio;
+ 
+-	if (from_schedule || current->bio_list) {
++	if (from_schedule) {
+ 		spin_lock_irq(&conf->device_lock);
+ 		bio_list_merge(&conf->pending_bio_list, &plug->pending);
+ 		conf->pending_count += plug->pending_cnt;
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index adefeb0e43ad..6e9791660acb 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -939,9 +939,7 @@ static void flush_pending_writes(struct r10conf *conf)
+ 		__set_current_state(TASK_RUNNING);
+ 
+ 		blk_start_plug(&plug);
+-		/* flush any pending bitmap writes to disk
+-		 * before proceeding w/ I/O */
+-		md_bitmap_unplug(conf->mddev->bitmap);
++		raid1_prepare_flush_writes(conf->mddev->bitmap);
+ 		wake_up(&conf->wait_barrier);
+ 
+ 		while (bio) { /* submit pending writes */
+@@ -1158,7 +1156,7 @@ static void raid10_unplug(struct blk_plug_cb *cb, bool from_schedule)
+ 	struct r10conf *conf = mddev->private;
+ 	struct bio *bio;
+ 
+-	if (from_schedule || current->bio_list) {
++	if (from_schedule) {
+ 		spin_lock_irq(&conf->device_lock);
+ 		bio_list_merge(&conf->pending_bio_list, &plug->pending);
+ 		conf->pending_count += plug->pending_cnt;
+@@ -1171,7 +1169,7 @@ static void raid10_unplug(struct blk_plug_cb *cb, bool from_schedule)
+ 
+ 	/* we aren't scheduling, so we can do the write-out directly. */
+ 	bio = bio_list_get(&plug->pending);
+-	md_bitmap_unplug(mddev->bitmap);
++	raid1_prepare_flush_writes(mddev->bitmap);
+ 	wake_up(&conf->wait_barrier);
+ 
+ 	while (bio) { /* submit pending writes */
