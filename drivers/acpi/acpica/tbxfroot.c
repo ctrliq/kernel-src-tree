@@ -140,7 +140,11 @@ acpi_find_root_pointer(acpi_physical_address *table_address)
 
 	/* EBDA present? */
 
-	if (physical_address > 0x400) {
+	/*
+	 * Check that the EBDA pointer from memory is sane and does not point
+	 * above valid low memory
+	 */
+	if (physical_address > 0x400 && physical_address < 0xA0000) {
 		/*
 		 * Calculate the scan window size
 		 * The EBDA is not guaranteed to be larger than a ki_b and in case
