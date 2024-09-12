@@ -1,0 +1,483 @@
+gfs2: Rework freeze / thaw logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-513.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit b77b4a4815a9651d1d6e07b8e6548eee9531a5eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-513.el8/b77b4a48.failed
+
+So far, at mount time, gfs2 would take the freeze glock in shared mode
+and then immediately drop it again, turning it into a cached glock that
+can be reclaimed at any time.  To freeze the filesystem cluster-wide,
+the node initiating the freeze would take the freeze glock in exclusive
+mode, which would cause the freeze glock's freeze_go_sync() callback to
+run on each node.  There, gfs2 would freeze the filesystem and schedule
+gfs2_freeze_func() to run.  gfs2_freeze_func() would re-acquire the
+freeze glock in shared mode, thaw the filesystem, and drop the freeze
+glock again.  The initiating node would keep the freeze glock held in
+exclusive mode.  To thaw the filesystem, the initiating node would drop
+the freeze glock again, which would allow gfs2_freeze_func() to resume
+on all nodes, leaving the filesystem in the thawed state.
+
+It turns out that in freeze_go_sync(), we cannot reliably and safely
+freeze the filesystem.  This is primarily because the final unmount of a
+filesystem takes a write lock on the s_umount rw semaphore before
+calling into gfs2_put_super(), and freeze_go_sync() needs to call
+freeze_super() which also takes a write lock on the same semaphore,
+causing a deadlock.  We could work around this by trying to take an
+active reference on the super block first, which would prevent unmount
+from running at the same time.  But that can fail, and freeze_go_sync()
+isn't actually allowed to fail.
+
+To get around this, this patch changes the freeze glock locking scheme
+as follows:
+
+At mount time, each node takes the freeze glock in shared mode.  To
+freeze a filesystem, the initiating node first freezes the filesystem
+locally and then drops and re-acquires the freeze glock in exclusive
+mode.  All other nodes notice that there is contention on the freeze
+glock in their go_callback callbacks, and they schedule
+gfs2_freeze_func() to run.  There, they freeze the filesystem locally
+and drop and re-acquire the freeze glock before re-thawing the
+filesystem.  This is happening outside of the glock state engine, so
+there, we are allowed to fail.
+
+From a cluster point of view, taking and immediately dropping a glock is
+indistinguishable from taking the glock and only dropping it upon
+contention, so this new scheme is compatible with the old one.
+
+Thanks to Li Dong <lidong@vivo.com> for reporting a locking bug in
+gfs2_freeze_func() in a previous version of this commit.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit b77b4a4815a9651d1d6e07b8e6548eee9531a5eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glops.c
+#	fs/gfs2/super.c
+#	fs/gfs2/util.c
+diff --cc fs/gfs2/glops.c
+index 5257700d2d79,7c48c7afd6a4..000000000000
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@@ -537,50 -561,33 +537,39 @@@ static void inode_go_dump(struct seq_fi
+  }
+  
+  /**
+-  * freeze_go_sync - promote/demote the freeze glock
++  * freeze_go_callback - A cluster node is requesting a freeze
+   * @gl: the glock
+++<<<<<<< HEAD
+ + * @state: the requested state
+ + * @flags:
+ + *
+++=======
++  * @remote: true if this came from a different cluster node
+++>>>>>>> b77b4a4815a9 (gfs2: Rework freeze / thaw logic)
+   */
+  
+- static int freeze_go_sync(struct gfs2_glock *gl)
++ static void freeze_go_callback(struct gfs2_glock *gl, bool remote)
+  {
+- 	int error = 0;
+  	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
++ 	struct super_block *sb = sdp->sd_vfs;
++ 
++ 	if (!remote ||
++ 	    gl->gl_state != LM_ST_SHARED ||
++ 	    gl->gl_demote_state != LM_ST_UNLOCKED)
++ 		return;
+  
+  	/*
+- 	 * We need to check gl_state == LM_ST_SHARED here and not gl_req ==
+- 	 * LM_ST_EXCLUSIVE. That's because when any node does a freeze,
+- 	 * all the nodes should have the freeze glock in SH mode and they all
+- 	 * call do_xmote: One for EX and the others for UN. They ALL must
+- 	 * freeze locally, and they ALL must queue freeze work. The freeze_work
+- 	 * calls freeze_func, which tries to reacquire the freeze glock in SH,
+- 	 * effectively waiting for the thaw on the node who holds it in EX.
+- 	 * Once thawed, the work func acquires the freeze glock in
+- 	 * SH and everybody goes back to thawed.
++ 	 * Try to get an active super block reference to prevent racing with
++ 	 * unmount (see trylock_super()).  But note that unmount isn't the only
++ 	 * place where a write lock on s_umount is taken, and we can fail here
++ 	 * because of things like remount as well.
+  	 */
+- 	if (gl->gl_state == LM_ST_SHARED && !gfs2_withdrawn(sdp) &&
+- 	    !test_bit(SDF_NORECOVERY, &sdp->sd_flags)) {
+- 		atomic_set(&sdp->sd_freeze_state, SFS_STARTING_FREEZE);
+- 		error = freeze_super(sdp->sd_vfs);
+- 		if (error) {
+- 			fs_info(sdp, "GFS2: couldn't freeze filesystem: %d\n",
+- 				error);
+- 			if (gfs2_withdrawn(sdp)) {
+- 				atomic_set(&sdp->sd_freeze_state, SFS_UNFROZEN);
+- 				return 0;
+- 			}
+- 			gfs2_assert_withdraw(sdp, 0);
+- 		}
+- 		queue_work(gfs2_freeze_wq, &sdp->sd_freeze_work);
+- 		if (test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags))
+- 			gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_FREEZE |
+- 				       GFS2_LFC_FREEZE_GO_SYNC);
+- 		else /* read-only mounts */
+- 			atomic_set(&sdp->sd_freeze_state, SFS_FROZEN);
++ 	if (down_read_trylock(&sb->s_umount)) {
++ 		atomic_inc(&sb->s_active);
++ 		up_read(&sb->s_umount);
++ 		if (!queue_work(gfs2_freeze_wq, &sdp->sd_freeze_work))
++ 			deactivate_super(sb);
+  	}
+- 	return 0;
+  }
+  
+  /**
+diff --cc fs/gfs2/super.c
+index 62f48d6e172b,81c8d07a4540..000000000000
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@@ -371,10 -354,13 +376,12 @@@ static int gfs2_lock_fs_check_clean(str
+  		list_add(&lfcc->list, &list);
+  	}
+  
++ 	gfs2_freeze_unlock(&sdp->sd_freeze_gh);
++ 
+  	error = gfs2_glock_nq_init(sdp->sd_freeze_gl, LM_ST_EXCLUSIVE,
+ -				   LM_FLAG_NOEXP | GL_NOPID,
+ -				   &sdp->sd_freeze_gh);
+ +				   LM_FLAG_NOEXP, &sdp->sd_freeze_gh);
+  	if (error)
+- 		goto out;
++ 		goto relock_shared;
+  
+  	list_for_each_entry(jd, &sdp->sd_jindex_list, jd_list) {
+  		error = gfs2_jdesc_check(jd);
+@@@ -679,31 -684,82 +694,88 @@@ static int gfs2_sync_fs(struct super_bl
+  	return sdp->sd_log_error;
+  }
+  
+- void gfs2_freeze_func(struct work_struct *work)
++ static int gfs2_freeze_locally(struct gfs2_sbd *sdp)
+  {
+- 	int error;
+- 	struct gfs2_holder freeze_gh;
+- 	struct gfs2_sbd *sdp = container_of(work, struct gfs2_sbd, sd_freeze_work);
+  	struct super_block *sb = sdp->sd_vfs;
++ 	int error;
+  
+- 	atomic_inc(&sb->s_active);
+- 	error = gfs2_freeze_lock_shared(sdp, &freeze_gh, 0);
+- 	if (error) {
+- 		gfs2_assert_withdraw(sdp, 0);
+- 	} else {
+- 		atomic_set(&sdp->sd_freeze_state, SFS_UNFROZEN);
+- 		error = thaw_super(sb);
+- 		if (error) {
+- 			fs_info(sdp, "GFS2: couldn't thaw filesystem: %d\n",
+- 				error);
+- 			gfs2_assert_withdraw(sdp, 0);
++ 	atomic_set(&sdp->sd_freeze_state, SFS_STARTING_FREEZE);
++ 
++ 	error = freeze_super(sb);
++ 	if (error)
++ 		goto fail;
++ 
++ 	if (test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags)) {
++ 		gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_FREEZE |
++ 			       GFS2_LFC_FREEZE_GO_SYNC);
++ 		if (gfs2_withdrawn(sdp)) {
++ 			thaw_super(sb);
++ 			error = -EIO;
++ 			goto fail;
+  		}
+- 		gfs2_freeze_unlock(&freeze_gh);
+  	}
++ 	return 0;
++ 
++ fail:
++ 	atomic_set(&sdp->sd_freeze_state, SFS_UNFROZEN);
++ 	return error;
++ }
++ 
++ static int gfs2_do_thaw(struct gfs2_sbd *sdp)
++ {
++ 	struct super_block *sb = sdp->sd_vfs;
++ 	int error;
++ 
++ 	error = gfs2_freeze_lock_shared(sdp, &sdp->sd_freeze_gh, 0);
++ 	if (error)
++ 		goto fail;
++ 	error = thaw_super(sb);
++ 	if (!error)
++ 		return 0;
++ 
++ fail:
++ 	fs_info(sdp, "GFS2: couldn't thaw filesystem: %d\n", error);
++ 	gfs2_assert_withdraw(sdp, 0);
++ 	return error;
++ }
++ 
++ void gfs2_freeze_func(struct work_struct *work)
++ {
++ 	struct gfs2_sbd *sdp = container_of(work, struct gfs2_sbd, sd_freeze_work);
++ 	struct super_block *sb = sdp->sd_vfs;
++ 	int error;
++ 
++ 	mutex_lock(&sdp->sd_freeze_mutex);
++ 	error = -EBUSY;
++ 	if (atomic_read(&sdp->sd_freeze_state) != SFS_UNFROZEN)
++ 		goto freeze_failed;
++ 
++ 	error = gfs2_freeze_locally(sdp);
++ 	if (error)
++ 		goto freeze_failed;
++ 
++ 	gfs2_freeze_unlock(&sdp->sd_freeze_gh);
++ 	atomic_set(&sdp->sd_freeze_state, SFS_FROZEN);
++ 
++ 	error = gfs2_do_thaw(sdp);
++ 	if (error)
++ 		goto out;
++ 
++ 	atomic_set(&sdp->sd_freeze_state, SFS_UNFROZEN);
++ 	goto out;
++ 
++ freeze_failed:
++ 	fs_info(sdp, "GFS2: couldn't freeze filesystem: %d\n", error);
++ 
++ out:
++ 	mutex_unlock(&sdp->sd_freeze_mutex);
+  	deactivate_super(sb);
+++<<<<<<< HEAD
+ +	clear_bit(SDF_FS_FROZEN, &sdp->sd_flags);
+ +	wake_up_bit(&sdp->sd_flags, SDF_FS_FROZEN);
+ +	return;
+++=======
+++>>>>>>> b77b4a4815a9 (gfs2: Rework freeze / thaw logic)
+  }
+  
+  /**
+@@@ -745,8 -807,12 +823,16 @@@ static int gfs2_freeze_super(struct sup
+  		fs_err(sdp, "retrying...\n");
+  		msleep(1000);
+  	}
+++<<<<<<< HEAD
+ +	set_bit(SDF_FS_FROZEN, &sdp->sd_flags);
+++=======
++ 
+++>>>>>>> b77b4a4815a9 (gfs2: Rework freeze / thaw logic)
+  out:
++ 	if (!error) {
++ 		set_bit(SDF_FREEZE_INITIATOR, &sdp->sd_flags);
++ 		atomic_set(&sdp->sd_freeze_state, SFS_FROZEN);
++ 	}
+  	mutex_unlock(&sdp->sd_freeze_mutex);
+  	return error;
+  }
+@@@ -760,17 -826,39 +846,43 @@@
+  static int gfs2_thaw_super(struct super_block *sb)
+  {
+  	struct gfs2_sbd *sdp = sb->s_fs_info;
++ 	int error;
+  
+- 	mutex_lock(&sdp->sd_freeze_mutex);
+- 	if (atomic_read(&sdp->sd_freeze_state) != SFS_FROZEN ||
+- 	    !gfs2_holder_initialized(&sdp->sd_freeze_gh)) {
+- 		mutex_unlock(&sdp->sd_freeze_mutex);
+- 		return -EINVAL;
++ 	if (!mutex_trylock(&sdp->sd_freeze_mutex))
++ 		return -EBUSY;
++ 	error = -EINVAL;
++ 	if (!test_bit(SDF_FREEZE_INITIATOR, &sdp->sd_flags))
++ 		goto out;
++ 
++ 	gfs2_freeze_unlock(&sdp->sd_freeze_gh);
++ 
++ 	error = gfs2_do_thaw(sdp);
++ 
++ 	if (!error) {
++ 		clear_bit(SDF_FREEZE_INITIATOR, &sdp->sd_flags);
++ 		atomic_set(&sdp->sd_freeze_state, SFS_UNFROZEN);
+  	}
++ out:
++ 	mutex_unlock(&sdp->sd_freeze_mutex);
++ 	return error;
++ }
++ 
++ void gfs2_thaw_freeze_initiator(struct super_block *sb)
++ {
++ 	struct gfs2_sbd *sdp = sb->s_fs_info;
++ 
++ 	mutex_lock(&sdp->sd_freeze_mutex);
++ 	if (!test_bit(SDF_FREEZE_INITIATOR, &sdp->sd_flags))
++ 		goto out;
+  
+  	gfs2_freeze_unlock(&sdp->sd_freeze_gh);
++ 
++ out:
+  	mutex_unlock(&sdp->sd_freeze_mutex);
+++<<<<<<< HEAD
+ +	return wait_on_bit(&sdp->sd_flags, SDF_FS_FROZEN, TASK_INTERRUPTIBLE);
+++=======
+++>>>>>>> b77b4a4815a9 (gfs2: Rework freeze / thaw logic)
+  }
+  
+  /**
+diff --cc fs/gfs2/util.c
+index 8db57f0f2c81,00494dffb47c..000000000000
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@@ -188,15 -180,8 +181,20 @@@ static void signal_our_withdraw(struct 
+  	}
+  	sdp->sd_jinode_gh.gh_flags |= GL_NOCACHE;
+  	gfs2_glock_dq(&sdp->sd_jinode_gh);
+++<<<<<<< HEAD
+ +	if (test_bit(SDF_FS_FROZEN, &sdp->sd_flags)) {
+ +		/* Make sure gfs2_thaw_super works if partially-frozen */
+ +		flush_work(&sdp->sd_freeze_work);
+ +		atomic_set(&sdp->sd_freeze_state, SFS_FROZEN);
+ +		thaw_super(sdp->sd_vfs);
+ +	} else {
+ +		wait_on_bit(&i_gl->gl_flags, GLF_DEMOTE,
+ +			    TASK_UNINTERRUPTIBLE);
+ +	}
+++=======
++ 	gfs2_thaw_freeze_initiator(sdp->sd_vfs);
++ 	wait_on_bit(&i_gl->gl_flags, GLF_DEMOTE, TASK_UNINTERRUPTIBLE);
+++>>>>>>> b77b4a4815a9 (gfs2: Rework freeze / thaw logic)
+  
+  	/*
+  	 * holder_uninit to force glock_put, to force dlm to let go
+* Unmerged path fs/gfs2/glops.c
+diff --git a/fs/gfs2/log.c b/fs/gfs2/log.c
+index aded98844110..4c953afed760 100644
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@ -1080,8 +1080,6 @@ void gfs2_log_flush(struct gfs2_sbd *sdp, struct gfs2_glock *gl, u32 flags)
+ 		if (flags & (GFS2_LOG_HEAD_FLUSH_SHUTDOWN |
+ 			     GFS2_LOG_HEAD_FLUSH_FREEZE))
+ 			gfs2_log_shutdown(sdp);
+-		if (flags & GFS2_LOG_HEAD_FLUSH_FREEZE)
+-			atomic_set(&sdp->sd_freeze_state, SFS_FROZEN);
+ 	}
+ 
+ out_end:
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index 698fc2257f73..1f3e2b2767c3 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -1118,7 +1118,6 @@ static int gfs2_fill_super(struct super_block *sb, struct fs_context *fc)
+ 	int silent = fc->sb_flags & SB_SILENT;
+ 	struct gfs2_sbd *sdp;
+ 	struct gfs2_holder mount_gh;
+-	struct gfs2_holder freeze_gh;
+ 	int error;
+ 
+ 	sdp = init_sbd(sb);
+@@ -1244,15 +1243,15 @@ static int gfs2_fill_super(struct super_block *sb, struct fs_context *fc)
+ 		}
+ 	}
+ 
+-	error = gfs2_freeze_lock_shared(sdp, &freeze_gh, 0);
++	error = gfs2_freeze_lock_shared(sdp, &sdp->sd_freeze_gh, 0);
+ 	if (error)
+ 		goto fail_per_node;
+ 
+ 	if (!sb_rdonly(sb))
+ 		error = gfs2_make_fs_rw(sdp);
+ 
+-	gfs2_freeze_unlock(&freeze_gh);
+ 	if (error) {
++		gfs2_freeze_unlock(&sdp->sd_freeze_gh);
+ 		if (sdp->sd_quotad_process)
+ 			kthread_stop(sdp->sd_quotad_process);
+ 		sdp->sd_quotad_process = NULL;
+diff --git a/fs/gfs2/recovery.c b/fs/gfs2/recovery.c
+index 121d7855a3af..3d3f523f6be2 100644
+--- a/fs/gfs2/recovery.c
++++ b/fs/gfs2/recovery.c
+@@ -408,7 +408,7 @@ void gfs2_recover_func(struct work_struct *work)
+ 	struct gfs2_inode *ip = GFS2_I(jd->jd_inode);
+ 	struct gfs2_sbd *sdp = GFS2_SB(jd->jd_inode);
+ 	struct gfs2_log_header_host head;
+-	struct gfs2_holder j_gh, ji_gh, thaw_gh;
++	struct gfs2_holder j_gh, ji_gh;
+ 	ktime_t t_start, t_jlck, t_jhd, t_tlck, t_rep;
+ 	int ro = 0;
+ 	unsigned int pass;
+@@ -469,14 +469,14 @@ void gfs2_recover_func(struct work_struct *work)
+ 		ktime_ms_delta(t_jhd, t_jlck));
+ 
+ 	if (!(head.lh_flags & GFS2_LOG_HEAD_UNMOUNT)) {
+-		fs_info(sdp, "jid=%u: Acquiring the freeze glock...\n",
+-			jd->jd_jid);
+-
+-		/* Acquire a shared hold on the freeze glock */
++		mutex_lock(&sdp->sd_freeze_mutex);
+ 
+-		error = gfs2_freeze_lock_shared(sdp, &thaw_gh, LM_FLAG_PRIORITY);
+-		if (error)
++		if (atomic_read(&sdp->sd_freeze_state) != SFS_UNFROZEN) {
++			mutex_unlock(&sdp->sd_freeze_mutex);
++			fs_warn(sdp, "jid=%u: Can't replay: filesystem "
++				"is frozen\n", jd->jd_jid);
+ 			goto fail_gunlock_ji;
++		}
+ 
+ 		if (test_bit(SDF_RORECOVERY, &sdp->sd_flags)) {
+ 			ro = 1;
+@@ -500,7 +500,7 @@ void gfs2_recover_func(struct work_struct *work)
+ 			fs_warn(sdp, "jid=%u: Can't replay: read-only block "
+ 				"device\n", jd->jd_jid);
+ 			error = -EROFS;
+-			goto fail_gunlock_thaw;
++			goto fail_gunlock_nofreeze;
+ 		}
+ 
+ 		t_tlck = ktime_get();
+@@ -518,7 +518,7 @@ void gfs2_recover_func(struct work_struct *work)
+ 			lops_after_scan(jd, error, pass);
+ 			if (error) {
+ 				up_read(&sdp->sd_log_flush_lock);
+-				goto fail_gunlock_thaw;
++				goto fail_gunlock_nofreeze;
+ 			}
+ 		}
+ 
+@@ -526,7 +526,7 @@ void gfs2_recover_func(struct work_struct *work)
+ 		clean_journal(jd, &head);
+ 		up_read(&sdp->sd_log_flush_lock);
+ 
+-		gfs2_freeze_unlock(&thaw_gh);
++		mutex_unlock(&sdp->sd_freeze_mutex);
+ 		t_rep = ktime_get();
+ 		fs_info(sdp, "jid=%u: Journal replayed in %lldms [jlck:%lldms, "
+ 			"jhead:%lldms, tlck:%lldms, replay:%lldms]\n",
+@@ -547,8 +547,8 @@ void gfs2_recover_func(struct work_struct *work)
+ 	fs_info(sdp, "jid=%u: Done\n", jd->jd_jid);
+ 	goto done;
+ 
+-fail_gunlock_thaw:
+-	gfs2_freeze_unlock(&thaw_gh);
++fail_gunlock_nofreeze:
++	mutex_unlock(&sdp->sd_freeze_mutex);
+ fail_gunlock_ji:
+ 	if (jlocked) {
+ 		gfs2_glock_dq_uninit(&ji_gh);
+* Unmerged path fs/gfs2/super.c
+diff --git a/fs/gfs2/super.h b/fs/gfs2/super.h
+index 7063c285f458..22618fbfe007 100644
+--- a/fs/gfs2/super.h
++++ b/fs/gfs2/super.h
+@@ -46,6 +46,7 @@ extern void update_statfs(struct gfs2_sbd *sdp, struct buffer_head *m_bh,
+ 			  struct buffer_head *l_bh);
+ extern int gfs2_statfs_sync(struct super_block *sb, int type);
+ extern void gfs2_freeze_func(struct work_struct *work);
++extern void gfs2_thaw_freeze_initiator(struct super_block *sb);
+ 
+ extern void free_lcl_statfs_inodes(struct gfs2_sbd *sdp);
+ extern struct inode *find_lcl_statfs_inode(struct gfs2_sbd *sdp,
+* Unmerged path fs/gfs2/util.c
