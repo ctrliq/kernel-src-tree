@@ -1,0 +1,349 @@
+x86/retpoline,kprobes: Fix position of thunk sections with CONFIG_LTO_CLANG
+
+jira LE-1907
+cve CVE-2023-20569
+Rebuild_History Non-Buildable kernel-4.18.0-521.el8
+commit-author Petr Pavlu <petr.pavlu@suse.com>
+commit 79cd2a11224eab86d6673fe8a11d2046ae9d2757
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-521.el8/79cd2a11.failed
+
+The linker script arch/x86/kernel/vmlinux.lds.S matches the thunk
+sections ".text.__x86.*" from arch/x86/lib/retpoline.S as follows:
+
+  .text {
+    [...]
+    TEXT_TEXT
+    [...]
+    __indirect_thunk_start = .;
+    *(.text.__x86.*)
+    __indirect_thunk_end = .;
+    [...]
+  }
+
+Macro TEXT_TEXT references TEXT_MAIN which normally expands to only
+".text". However, with CONFIG_LTO_CLANG, TEXT_MAIN becomes
+".text .text.[0-9a-zA-Z_]*" which wrongly matches also the thunk
+sections. The output layout is then different than expected. For
+instance, the currently defined range [__indirect_thunk_start,
+__indirect_thunk_end] becomes empty.
+
+Prevent the problem by using ".." as the first separator, for example,
+".text..__x86.indirect_thunk". This pattern is utilized by other
+explicit section names which start with one of the standard prefixes,
+such as ".text" or ".data", and that need to be individually selected in
+the linker script.
+
+  [ nathan: Fix conflicts with SRSO and fold in fix issue brought up by
+    Andrew Cooper in post-review:
+    https://lore.kernel.org/20230803230323.1478869-1-andrew.cooper3@citrix.com ]
+
+Fixes: dc5723b02e52 ("kbuild: add support for Clang LTO")
+	Signed-off-by: Petr Pavlu <petr.pavlu@suse.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Nathan Chancellor <nathan@kernel.org>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Link: https://lore.kernel.org/r/20230711091952.27944-2-petr.pavlu@suse.com
+(cherry picked from commit 79cd2a11224eab86d6673fe8a11d2046ae9d2757)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/vmlinux.lds.S
+#	arch/x86/lib/retpoline.S
+#	tools/objtool/check.c
+diff --cc arch/x86/kernel/vmlinux.lds.S
+index 6df2973aa8ce,dfb8783cb4c7..000000000000
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@@ -122,36 -129,44 +122,63 @@@ SECTION
+  		HEAD_TEXT
+  		TEXT_TEXT
+  		SCHED_TEXT
+ +		CPUIDLE_TEXT
+  		LOCK_TEXT
+  		KPROBES_TEXT
+++<<<<<<< HEAD
+ +		ALIGN_ENTRY_TEXT_BEGIN
+ +		ENTRY_TEXT
+ +		IRQENTRY_TEXT
+++=======
++ 		SOFTIRQENTRY_TEXT
++ #ifdef CONFIG_RETPOLINE
++ 		__indirect_thunk_start = .;
++ 		*(.text..__x86.indirect_thunk)
++ 		*(.text..__x86.return_thunk)
++ 		__indirect_thunk_end = .;
++ #endif
++ 		STATIC_CALL_TEXT
++ 
++ 		ALIGN_ENTRY_TEXT_BEGIN
++ #ifdef CONFIG_CPU_SRSO
++ 		*(.text..__x86.rethunk_untrain)
++ #endif
++ 
++ 		ENTRY_TEXT
++ 
++ #ifdef CONFIG_CPU_SRSO
++ 		/*
++ 		 * See the comment above srso_untrain_ret_alias()'s
++ 		 * definition.
++ 		 */
++ 		. = srso_untrain_ret_alias | (1 << 2) | (1 << 8) | (1 << 14) | (1 << 20);
++ 		*(.text..__x86.rethunk_safe)
++ #endif
+++>>>>>>> 79cd2a11224e (x86/retpoline,kprobes: Fix position of thunk sections with CONFIG_LTO_CLANG)
+  		ALIGN_ENTRY_TEXT_END
+ +		SOFTIRQENTRY_TEXT
+ +		*(.fixup)
+  		*(.gnu.warning)
+  
+ -	} :text =0xcccc
+ +#ifdef CONFIG_RETPOLINE
+ +		__indirect_thunk_start = .;
+ +		*(.text.__x86.*)
+ +		__indirect_thunk_end = .;
+ +#endif
+ +
+ +		/* End of text section */
+ +		_etext = .;
+ +	} :text = 0x9090
+  
+ -	/* End of text section, which should occupy whole number of pages */
+ -	_etext = .;
+ -	. = ALIGN(PAGE_SIZE);
+ +	NOTES :text :note
+ +
+ +	EXCEPTION_TABLE(16) :text = 0x9090
+  
+ -	X86_ALIGN_RODATA_BEGIN
+ +	/* .text should occupy whole number of pages */
+ +	. = ALIGN(PAGE_SIZE);
+ +	X64_ALIGN_RODATA_BEGIN
+  	RO_DATA(PAGE_SIZE)
+ -	X86_ALIGN_RODATA_END
+ +	X64_ALIGN_RODATA_END
+  
+  	/* Data */
+  	.data : AT(ADDR(.data) - LOAD_OFFSET) {
+diff --cc arch/x86/lib/retpoline.S
+index ce2b806fe45d,8db74d811ce2..000000000000
+--- a/arch/x86/lib/retpoline.S
++++ b/arch/x86/lib/retpoline.S
+@@@ -5,17 -5,42 +5,41 @@@
+  #include <asm/dwarf2.h>
+  #include <asm/cpufeatures.h>
+  #include <asm/alternative.h>
+ -#include <asm/asm-offsets.h>
+  #include <asm/export.h>
+  #include <asm/nospec-branch.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/unwind_hints.h>
++ #include <asm/percpu.h>
++ #include <asm/frame.h>
++ #include <asm/nops.h>
++ 
++ 	.section .text..__x86.indirect_thunk
++ 
++ 
++ .macro POLINE reg
++ 	ANNOTATE_INTRA_FUNCTION_CALL
++ 	call    .Ldo_rop_\@
++ 	int3
++ .Ldo_rop_\@:
++ 	mov     %\reg, (%_ASM_SP)
++ 	UNWIND_HINT_FUNC
++ .endm
++ 
++ .macro RETPOLINE reg
++ 	POLINE \reg
++ 	RET
++ .endm
+++>>>>>>> 79cd2a11224e (x86/retpoline,kprobes: Fix position of thunk sections with CONFIG_LTO_CLANG)
+  
+  .macro THUNK reg
+ +	.section .text.__x86.indirect_thunk
+  
+ -	.align RETPOLINE_THUNK_SIZE
+ -SYM_INNER_LABEL(__x86_indirect_thunk_\reg, SYM_L_GLOBAL)
+ -	UNWIND_HINT_UNDEFINED
+ -	ANNOTATE_NOENDBR
+ -
+ -	ALTERNATIVE_2 __stringify(RETPOLINE \reg), \
+ -		      __stringify(lfence; ANNOTATE_RETPOLINE_SAFE; jmp *%\reg; int3), X86_FEATURE_RETPOLINE_LFENCE, \
+ -		      __stringify(ANNOTATE_RETPOLINE_SAFE; jmp *%\reg), ALT_NOT(X86_FEATURE_RETPOLINE)
+ -
+ +SYM_FUNC_START(__x86_indirect_thunk_\reg)
+ +	CFI_STARTPROC
+ +	JMP_NOSPEC %\reg
+ +	CFI_ENDPROC
+ +SYM_FUNC_END(__x86_indirect_thunk_\reg)
+  .endm
+  
+  /*
+@@@ -53,7 -132,47 +77,51 @@@ GENERATE_THUNK(r15
+   */
+  #ifdef CONFIG_RETHUNK
+  
+++<<<<<<< HEAD
+ +	.section .text.__x86.return_thunk
+++=======
++ /*
++  * srso_untrain_ret_alias() and srso_safe_ret_alias() are placed at
++  * special addresses:
++  *
++  * - srso_untrain_ret_alias() is 2M aligned
++  * - srso_safe_ret_alias() is also in the same 2M page but bits 2, 8, 14
++  * and 20 in its virtual address are set (while those bits in the
++  * srso_untrain_ret_alias() function are cleared).
++  *
++  * This guarantees that those two addresses will alias in the branch
++  * target buffer of Zen3/4 generations, leading to any potential
++  * poisoned entries at that BTB slot to get evicted.
++  *
++  * As a result, srso_safe_ret_alias() becomes a safe return.
++  */
++ #ifdef CONFIG_CPU_SRSO
++ 	.section .text..__x86.rethunk_untrain
++ 
++ SYM_START(srso_untrain_ret_alias, SYM_L_GLOBAL, SYM_A_NONE)
++ 	ANNOTATE_NOENDBR
++ 	ASM_NOP2
++ 	lfence
++ 	jmp __x86_return_thunk
++ SYM_FUNC_END(srso_untrain_ret_alias)
++ __EXPORT_THUNK(srso_untrain_ret_alias)
++ 
++ 	.section .text..__x86.rethunk_safe
++ #endif
++ 
++ /* Needs a definition for the __x86_return_thunk alternative below. */
++ SYM_START(srso_safe_ret_alias, SYM_L_GLOBAL, SYM_A_NONE)
++ #ifdef CONFIG_CPU_SRSO
++ 	lea 8(%_ASM_SP), %_ASM_SP
++ 	UNWIND_HINT_FUNC
++ #endif
++ 	ANNOTATE_UNRET_SAFE
++ 	ret
++ 	int3
++ SYM_FUNC_END(srso_safe_ret_alias)
++ 
++ 	.section .text..__x86.return_thunk
+++>>>>>>> 79cd2a11224e (x86/retpoline,kprobes: Fix position of thunk sections with CONFIG_LTO_CLANG)
+  
+  /*
+   * Safety details here pertain to the AMD Zen{1,2} microarchitecture:
+diff --cc tools/objtool/check.c
+index 4b7db795960d,e2ee10ce7703..000000000000
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@@ -256,35 -386,76 +256,104 @@@ static int decode_instructions(struct o
+  		    strncmp(sec->name, ".discard.", 9))
+  			sec->text = true;
+  
+++<<<<<<< HEAD
+ +		for (offset = 0; offset < sec->len; offset += insn->len) {
+ +			insn = malloc(sizeof(*insn));
+ +			if (!insn) {
+ +				WARN("malloc failed");
+++=======
++ 		if (!strcmp(sec->name, ".noinstr.text") ||
++ 		    !strcmp(sec->name, ".entry.text") ||
++ 		    !strcmp(sec->name, ".cpuidle.text") ||
++ 		    !strncmp(sec->name, ".text..__x86.", 13))
++ 			sec->noinstr = true;
++ 
++ 		/*
++ 		 * .init.text code is ran before userspace and thus doesn't
++ 		 * strictly need retpolines, except for modules which are
++ 		 * loaded late, they very much do need retpoline in their
++ 		 * .init.text
++ 		 */
++ 		if (!strcmp(sec->name, ".init.text") && !opts.module)
++ 			sec->init = true;
++ 
++ 		for (offset = 0; offset < sec->sh.sh_size; offset += insn->len) {
++ 			if (!insns || idx == INSN_CHUNK_MAX) {
++ 				insns = calloc(sizeof(*insn), INSN_CHUNK_SIZE);
++ 				if (!insns) {
++ 					WARN("malloc failed");
++ 					return -1;
++ 				}
++ 				idx = 0;
++ 			} else {
++ 				idx++;
++ 			}
++ 			insn = &insns[idx];
++ 			insn->idx = idx;
++ 
++ 			INIT_LIST_HEAD(&insn->call_node);
++ 			insn->sec = sec;
++ 			insn->offset = offset;
++ 			insn->prev_len = prev_len;
++ 
++ 			ret = arch_decode_instruction(file, sec, offset,
++ 						      sec->sh.sh_size - offset,
++ 						      insn);
++ 			if (ret)
++ 				return ret;
++ 
++ 			prev_len = insn->len;
++ 
++ 			/*
++ 			 * By default, "ud2" is a dead end unless otherwise
++ 			 * annotated, because GCC 7 inserts it for certain
++ 			 * divide-by-zero cases.
++ 			 */
++ 			if (insn->type == INSN_BUG)
++ 				insn->dead_end = true;
++ 
++ 			hash_add(file->insn_hash, &insn->hash, sec_offset_hash(sec, insn->offset));
++ 			nr_insns++;
++ 		}
++ 
++ //		printf("%s: last chunk used: %d\n", sec->name, (int)idx);
++ 
++ 		sec_for_each_sym(sec, func) {
++ 			if (func->type != STT_NOTYPE && func->type != STT_FUNC)
++ 				continue;
++ 
++ 			if (func->offset == sec->sh.sh_size) {
++ 				/* Heuristic: likely an "end" symbol */
++ 				if (func->type == STT_NOTYPE)
++ 					continue;
++ 				WARN("%s(): STT_FUNC at end of section",
++ 				     func->name);
+++>>>>>>> 79cd2a11224e (x86/retpoline,kprobes: Fix position of thunk sections with CONFIG_LTO_CLANG)
+  				return -1;
+  			}
+ +			memset(insn, 0, sizeof(*insn));
+ +			INIT_LIST_HEAD(&insn->alts);
+ +			INIT_LIST_HEAD(&insn->stack_ops);
+ +			INIT_LIST_HEAD(&insn->call_node);
+ +			clear_insn_state(&insn->state);
+  
+ -			if (func->return_thunk || func->alias != func)
+ +			insn->sec = sec;
+ +			insn->offset = offset;
+ +
+ +			ret = arch_decode_instruction(file->elf, sec, offset,
+ +						      sec->len - offset,
+ +						      &insn->len, &insn->type,
+ +						      &insn->immediate,
+ +						      &insn->stack_ops);
+ +			if (ret)
+ +				goto err;
+ +
+ +			hash_add(file->insn_hash, &insn->hash, insn->offset);
+ +			list_add_tail(&insn->list, &file->insn_list);
+ +		}
+ +
+ +		list_for_each_entry(func, &sec->symbol_list, list) {
+ +			if (func->type != STT_FUNC)
+  				continue;
+  
+  			if (!find_insn(file, sec, func->offset)) {
+* Unmerged path arch/x86/kernel/vmlinux.lds.S
+* Unmerged path arch/x86/lib/retpoline.S
+* Unmerged path tools/objtool/check.c
