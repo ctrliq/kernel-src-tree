@@ -1,0 +1,216 @@
+cachefiles: fix memory leak in cachefiles_add_cache()
+
+jira LE-1907
+cve CVE-2024-26840
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Baokun Li <libaokun1@huawei.com>
+commit e21a2f17566cbd64926fb8f16323972f7a064444
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/e21a2f17.failed
+
+The following memory leak was reported after unbinding /dev/cachefiles:
+
+==================================================================
+unreferenced object 0xffff9b674176e3c0 (size 192):
+  comm "cachefilesd2", pid 680, jiffies 4294881224
+  hex dump (first 32 bytes):
+    01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  backtrace (crc ea38a44b):
+    [<ffffffff8eb8a1a5>] kmem_cache_alloc+0x2d5/0x370
+    [<ffffffff8e917f86>] prepare_creds+0x26/0x2e0
+    [<ffffffffc002eeef>] cachefiles_determine_cache_security+0x1f/0x120
+    [<ffffffffc00243ec>] cachefiles_add_cache+0x13c/0x3a0
+    [<ffffffffc0025216>] cachefiles_daemon_write+0x146/0x1c0
+    [<ffffffff8ebc4a3b>] vfs_write+0xcb/0x520
+    [<ffffffff8ebc5069>] ksys_write+0x69/0xf0
+    [<ffffffff8f6d4662>] do_syscall_64+0x72/0x140
+    [<ffffffff8f8000aa>] entry_SYSCALL_64_after_hwframe+0x6e/0x76
+==================================================================
+
+Put the reference count of cache_cred in cachefiles_daemon_unbind() to
+fix the problem. And also put cache_cred in cachefiles_add_cache() error
+branch to avoid memory leaks.
+
+Fixes: 9ae326a69004 ("CacheFiles: A cache that backs onto a mounted filesystem")
+CC: stable@vger.kernel.org
+	Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Link: https://lore.kernel.org/r/20240217081431.796809-1-libaokun1@huawei.com
+	Acked-by: David Howells <dhowells@redhat.com>
+	Reviewed-by: Jingbo Xu <jefflexu@linux.alibaba.com>
+	Reviewed-by: Jeff Layton <jlayton@kernel.org>
+	Signed-off-by: Christian Brauner <brauner@kernel.org>
+(cherry picked from commit e21a2f17566cbd64926fb8f16323972f7a064444)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cachefiles/cache.c
+#	fs/cachefiles/daemon.c
+diff --cc fs/cachefiles/daemon.c
+index 3fdee214a5bb,6465e2574230..000000000000
+--- a/fs/cachefiles/daemon.c
++++ b/fs/cachefiles/daemon.c
+@@@ -669,84 -743,84 +669,121 @@@ inval
+  }
+  
+  /*
+ - * Bind a directory as a cache
+ + * see if we have space for a number of pages and/or a number of files in the
+ + * cache
+   */
+ -static int cachefiles_daemon_bind(struct cachefiles_cache *cache, char *args)
+ +int cachefiles_has_space(struct cachefiles_cache *cache,
+ +			 unsigned fnr, unsigned bnr)
+  {
+ -	_enter("{%u,%u,%u,%u,%u,%u},%s",
+ -	       cache->frun_percent,
+ -	       cache->fcull_percent,
+ -	       cache->fstop_percent,
+ -	       cache->brun_percent,
+ -	       cache->bcull_percent,
+ -	       cache->bstop_percent,
+ -	       args);
+ -
+ -	if (cache->fstop_percent >= cache->fcull_percent ||
+ -	    cache->fcull_percent >= cache->frun_percent ||
+ -	    cache->frun_percent  >= 100)
+ -		return -ERANGE;
+ -
+ -	if (cache->bstop_percent >= cache->bcull_percent ||
+ -	    cache->bcull_percent >= cache->brun_percent ||
+ -	    cache->brun_percent  >= 100)
+ -		return -ERANGE;
+ -
+ -	if (!cache->rootdirname) {
+ -		pr_err("No cache directory specified\n");
+ -		return -EINVAL;
+ +	struct kstatfs stats;
+ +	struct path path = {
+ +		.mnt	= cache->mnt,
+ +		.dentry	= cache->mnt->mnt_root,
+ +	};
+ +	int ret;
+ +
+ +	//_enter("{%llu,%llu,%llu,%llu,%llu,%llu},%u,%u",
+ +	//       (unsigned long long) cache->frun,
+ +	//       (unsigned long long) cache->fcull,
+ +	//       (unsigned long long) cache->fstop,
+ +	//       (unsigned long long) cache->brun,
+ +	//       (unsigned long long) cache->bcull,
+ +	//       (unsigned long long) cache->bstop,
+ +	//       fnr, bnr);
+ +
+ +	/* find out how many pages of blockdev are available */
+ +	memset(&stats, 0, sizeof(stats));
+ +
+ +	ret = vfs_statfs(&path, &stats);
+ +	if (ret < 0) {
+ +		if (ret == -EIO)
+ +			cachefiles_io_error(cache, "statfs failed");
+ +		_leave(" = %d", ret);
+ +		return ret;
+  	}
+  
+ -	/* Don't permit already bound caches to be re-bound */
+ -	if (test_bit(CACHEFILES_READY, &cache->flags)) {
+ -		pr_err("Cache already bound\n");
+ -		return -EBUSY;
+ +	stats.f_bavail >>= cache->bshift;
+ +
+ +	//_debug("avail %llu,%llu",
+ +	//       (unsigned long long) stats.f_ffree,
+ +	//       (unsigned long long) stats.f_bavail);
+ +
+ +	/* see if there is sufficient space */
+ +	if (stats.f_ffree > fnr)
+ +		stats.f_ffree -= fnr;
+ +	else
+ +		stats.f_ffree = 0;
+ +
+ +	if (stats.f_bavail > bnr)
+ +		stats.f_bavail -= bnr;
+ +	else
+ +		stats.f_bavail = 0;
+ +
+ +	ret = -ENOBUFS;
+ +	if (stats.f_ffree < cache->fstop ||
+ +	    stats.f_bavail < cache->bstop)
+ +		goto begin_cull;
+ +
+ +	ret = 0;
+ +	if (stats.f_ffree < cache->fcull ||
+ +	    stats.f_bavail < cache->bcull)
+ +		goto begin_cull;
+ +
+ +	if (test_bit(CACHEFILES_CULLING, &cache->flags) &&
+ +	    stats.f_ffree >= cache->frun &&
+ +	    stats.f_bavail >= cache->brun &&
+ +	    test_and_clear_bit(CACHEFILES_CULLING, &cache->flags)
+ +	    ) {
+ +		_debug("cease culling");
+ +		cachefiles_state_changed(cache);
+  	}
+  
+ -	if (IS_ENABLED(CONFIG_CACHEFILES_ONDEMAND)) {
+ -		if (!strcmp(args, "ondemand")) {
+ -			set_bit(CACHEFILES_ONDEMAND_MODE, &cache->flags);
+ -		} else if (*args) {
+ -			pr_err("Invalid argument to the 'bind' command\n");
+ -			return -EINVAL;
+ -		}
+ -	} else if (*args) {
+ -		pr_err("'bind' command doesn't take an argument\n");
+ -		return -EINVAL;
+ +	//_leave(" = 0");
+ +	return 0;
+ +
+ +begin_cull:
+ +	if (!test_and_set_bit(CACHEFILES_CULLING, &cache->flags)) {
+ +		_debug("### CULL CACHE ###");
+ +		cachefiles_state_changed(cache);
+  	}
+  
+++<<<<<<< HEAD
+ +	_leave(" = %d", ret);
+ +	return ret;
+++=======
++ 	/* Make sure we have copies of the tag string */
++ 	if (!cache->tag) {
++ 		/*
++ 		 * The tag string is released by the fops->release()
++ 		 * function, so we don't release it on error here
++ 		 */
++ 		cache->tag = kstrdup("CacheFiles", GFP_KERNEL);
++ 		if (!cache->tag)
++ 			return -ENOMEM;
++ 	}
++ 
++ 	return cachefiles_add_cache(cache);
++ }
++ 
++ /*
++  * Unbind a cache.
++  */
++ static void cachefiles_daemon_unbind(struct cachefiles_cache *cache)
++ {
++ 	_enter("");
++ 
++ 	if (test_bit(CACHEFILES_READY, &cache->flags))
++ 		cachefiles_withdraw_cache(cache);
++ 
++ 	cachefiles_put_directory(cache->graveyard);
++ 	cachefiles_put_directory(cache->store);
++ 	mntput(cache->mnt);
++ 	put_cred(cache->cache_cred);
++ 
++ 	kfree(cache->rootdirname);
++ 	kfree(cache->secctx);
++ 	kfree(cache->tag);
++ 
++ 	_leave("");
+++>>>>>>> e21a2f17566c (cachefiles: fix memory leak in cachefiles_add_cache())
+  }
+* Unmerged path fs/cachefiles/cache.c
+* Unmerged path fs/cachefiles/cache.c
+* Unmerged path fs/cachefiles/daemon.c
