@@ -1,0 +1,164 @@
+KVM: SVM: Handle multiple logical targets in AVIC kick fastpath
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-499.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit bbfc7aa62a4a9baff264f1fd91175b6249843984
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-499.el8/bbfc7aa6.failed
+
+Iterate over all target logical IDs in the AVIC kick fastpath instead of
+bailing if there is more than one target.  Now that KVM inhibits AVIC if
+vCPUs aren't mapped 1:1 with logical IDs, each bit in the destination is
+guaranteed to match to at most one vCPU, i.e. iterating over the bitmap
+is guaranteed to kick each valid target exactly once.
+
+	Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20230106011306.85230-29-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit bbfc7aa62a4a9baff264f1fd91175b6249843984)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/avic.c
+diff --cc arch/x86/kvm/svm/avic.c
+index df188fbaa28e,2c6737f72bd4..000000000000
+--- a/arch/x86/kvm/svm/avic.c
++++ b/arch/x86/kvm/svm/avic.c
+@@@ -311,6 -315,62 +311,63 @@@ void avic_ring_doorbell(struct kvm_vcp
+  	put_cpu();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ static void avic_kick_vcpu(struct kvm_vcpu *vcpu, u32 icrl)
++ {
++ 	vcpu->arch.apic->irr_pending = true;
++ 	svm_complete_interrupt_delivery(vcpu,
++ 					icrl & APIC_MODE_MASK,
++ 					icrl & APIC_INT_LEVELTRIG,
++ 					icrl & APIC_VECTOR_MASK);
++ }
++ 
++ static void avic_kick_vcpu_by_physical_id(struct kvm *kvm, u32 physical_id,
++ 					  u32 icrl)
++ {
++ 	/*
++ 	 * KVM inhibits AVIC if any vCPU ID diverges from the vCPUs APIC ID,
++ 	 * i.e. APIC ID == vCPU ID.
++ 	 */
++ 	struct kvm_vcpu *target_vcpu = kvm_get_vcpu_by_id(kvm, physical_id);
++ 
++ 	/* Once again, nothing to do if the target vCPU doesn't exist. */
++ 	if (unlikely(!target_vcpu))
++ 		return;
++ 
++ 	avic_kick_vcpu(target_vcpu, icrl);
++ }
++ 
++ static void avic_kick_vcpu_by_logical_id(struct kvm *kvm, u32 *avic_logical_id_table,
++ 					 u32 logid_index, u32 icrl)
++ {
++ 	u32 physical_id;
++ 
++ 	if (avic_logical_id_table) {
++ 		u32 logid_entry = avic_logical_id_table[logid_index];
++ 
++ 		/* Nothing to do if the logical destination is invalid. */
++ 		if (unlikely(!(logid_entry & AVIC_LOGICAL_ID_ENTRY_VALID_MASK)))
++ 			return;
++ 
++ 		physical_id = logid_entry &
++ 			      AVIC_LOGICAL_ID_ENTRY_GUEST_PHYSICAL_ID_MASK;
++ 	} else {
++ 		/*
++ 		 * For x2APIC, the logical APIC ID is a read-only value that is
++ 		 * derived from the x2APIC ID, thus the x2APIC ID can be found
++ 		 * by reversing the calculation (stored in logid_index).  Note,
++ 		 * bits 31:20 of the x2APIC ID aren't propagated to the logical
++ 		 * ID, but KVM limits the x2APIC ID limited to KVM_MAX_VCPU_IDS.
++ 		 */
++ 		physical_id = logid_index;
++ 	}
++ 
++ 	avic_kick_vcpu_by_physical_id(kvm, physical_id, icrl);
++ }
++ 
+++>>>>>>> bbfc7aa62a4a (KVM: SVM: Handle multiple logical targets in AVIC kick fastpath)
+  /*
+   * A fast-path version of avic_kick_target_vcpus(), which attempts to match
+   * destination APIC ID to vCPU without looping through all vCPUs.
+@@@ -366,54 -425,21 +422,38 @@@ static int avic_kick_target_vcpus_fast(
+  		if (unlikely(!bitmap))
+  			return 0;
+  
+- 		if (!is_power_of_2(bitmap))
+- 			/* multiple logical destinations, use slow path */
+- 			return -EINVAL;
+- 
+- 		logid_index = cluster + __ffs(bitmap);
+- 
+- 		if (apic_x2apic_mode(source)) {
+- 			/*
+- 			 * For x2APIC, the logical APIC ID is a read-only value
+- 			 * that is derived from the x2APIC ID, thus the x2APIC
+- 			 * ID can be found by reversing the calculation (done
+- 			 * above).  Note, bits 31:20 of the x2APIC ID are not
+- 			 * propagated to the logical ID, but KVM limits the
+- 			 * x2APIC ID limited to KVM_MAX_VCPU_IDS.
+- 			 */
+- 			l1_physical_id = logid_index;
+- 		} else {
+- 			u32 *avic_logical_id_table =
+- 				page_address(kvm_svm->avic_logical_id_table_page);
+- 
+- 			u32 logid_entry = avic_logical_id_table[logid_index];
++ 		if (apic_x2apic_mode(source))
++ 			avic_logical_id_table = NULL;
++ 		else
++ 			avic_logical_id_table = page_address(kvm_svm->avic_logical_id_table_page);
+  
+- 			if (WARN_ON_ONCE(index != logid_index))
+- 				return -EINVAL;
+- 
+- 			/* Nothing to do if the logical destination is invalid. */
+- 			if (unlikely(!(logid_entry & AVIC_LOGICAL_ID_ENTRY_VALID_MASK)))
+- 				return 0;
+- 
+- 			l1_physical_id = logid_entry &
+- 					 AVIC_LOGICAL_ID_ENTRY_GUEST_PHYSICAL_ID_MASK;
+- 		}
++ 		/*
++ 		 * AVIC is inhibited if vCPUs aren't mapped 1:1 with logical
++ 		 * IDs, thus each bit in the destination is guaranteed to map
++ 		 * to at most one vCPU.
++ 		 */
++ 		for_each_set_bit(i, &bitmap, 16)
++ 			avic_kick_vcpu_by_logical_id(kvm, avic_logical_id_table,
++ 						     cluster + i, icrl);
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * KVM inhibits AVIC if any vCPU ID diverges from the vCPUs APIC ID,
+ +	 * i.e. APIC ID == vCPU ID.  Once again, nothing to do if the target
+ +	 * vCPU doesn't exist.
+ +	 */
+ +	target_vcpu = kvm_get_vcpu_by_id(kvm, l1_physical_id);
+ +	if (unlikely(!target_vcpu))
+ +		return 0;
+ +
+ +	target_vcpu->arch.apic->irr_pending = true;
+ +	svm_complete_interrupt_delivery(target_vcpu,
+ +					icrl & APIC_MODE_MASK,
+ +					icrl & APIC_INT_LEVELTRIG,
+ +					icrl & APIC_VECTOR_MASK);
+++=======
+++>>>>>>> bbfc7aa62a4a (KVM: SVM: Handle multiple logical targets in AVIC kick fastpath)
+  	return 0;
+  }
+  
+* Unmerged path arch/x86/kvm/svm/avic.c
