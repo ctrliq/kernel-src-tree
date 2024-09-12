@@ -1,5 +1,4 @@
 /*
- *   fs/cifs/smb2proto.h
  *
  *   Copyright (c) International Business Machines  Corp., 2002, 2011
  *                 Etersoft, 2012

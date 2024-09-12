@@ -1,5 +1,4 @@
 /*
- *   fs/cifs/connect.c
  *
  *   Copyright (C) International Business Machines  Corp., 2002,2011
  *   Author(s): Steve French (sfrench@us.ibm.com)

@@ -1,5 +1,4 @@
 /*
- *   fs/cifs/xattr.c
  *
  *   Copyright (c) International Business Machines  Corp., 2003, 2007
  *   Author(s): Steve French (sfrench@us.ibm.com)

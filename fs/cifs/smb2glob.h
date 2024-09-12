@@ -1,5 +1,4 @@
 /*
- *   fs/cifs/smb2glob.h
  *
  *   Definitions for various global variables and structures
  *

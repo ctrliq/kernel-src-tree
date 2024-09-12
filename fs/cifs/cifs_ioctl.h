@@ -1,5 +1,4 @@
 /*
- *   fs/cifs/cifs_ioctl.h
  *
  *   Structure definitions for io control for cifs/smb3
  *

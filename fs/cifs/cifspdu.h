@@ -1,5 +1,4 @@
 /*
- *   fs/cifs/cifspdu.h
  *
  *   Copyright (c) International Business Machines  Corp., 2002,2009
  *   Author(s): Steve French (sfrench@us.ibm.com)

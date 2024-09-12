@@ -1,5 +1,5 @@
 /*
- *   fs/cifs/cache.c - CIFS filesystem cache index structure definitions
+ *   CIFS filesystem cache index structure definitions
  *
  *   Copyright (c) 2010 Novell, Inc.
  *   Authors(s): Suresh Jayaraman (sjayaraman@suse.de>

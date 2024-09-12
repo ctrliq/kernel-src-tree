@@ -1,5 +1,4 @@
 /*
- *   fs/cifs_debug.c
  *
  *   Copyright (C) International Business Machines  Corp., 2000,2005
  *

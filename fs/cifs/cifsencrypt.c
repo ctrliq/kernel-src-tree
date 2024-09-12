@@ -1,5 +1,4 @@
 /*
- *   fs/cifs/cifsencrypt.c
  *
  *   Encryption and hashing operations relating to NTLM, NTLMv2.  See MS-NLMP
  *   for more detailed information

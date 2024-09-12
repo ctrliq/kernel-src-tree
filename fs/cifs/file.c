@@ -1,5 +1,4 @@
 /*
- *   fs/cifs/file.c
  *
  *   vfs operations that deal with files
  *

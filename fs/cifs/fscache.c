@@ -1,5 +1,5 @@
 /*
- *   fs/cifs/fscache.c - CIFS filesystem cache interface
+ *   CIFS filesystem cache interface
  *
  *   Copyright (c) 2010 Novell, Inc.
  *   Author(s): Suresh Jayaraman <sjayaraman@suse.de>

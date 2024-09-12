@@ -1,5 +1,4 @@
 /*
- *   fs/cifs/smb2pdu.c
  *
  *   Copyright (C) International Business Machines  Corp., 2009, 2013
  *                 Etersoft, 2012
