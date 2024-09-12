@@ -1,0 +1,77 @@
+net: tcp better handling of reordering then loss cases
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.13.1.el8_6
+commit-author Yuchung Cheng <ycheng@google.com>
+commit a29cb6914681a55667436a9eb7a42e28da8cf387
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.13.1.el8_6/a29cb691.failed
+
+This patch aims to improve the situation when reordering and loss are
+ocurring in the same flight of packets.
+
+Previously the reordering would first induce a spurious recovery, then
+the subsequent ACK may undo the cwnd (based on the timestamps e.g.).
+However the current loss recovery does not proceed to invoke
+RACK to install a reordering timer. If some packets are also lost, this
+may lead to a long RTO-based recovery. An example is
+https://groups.google.com/g/bbr-dev/c/OFHADvJbTEI
+
+The solution is to after reverting the recovery, always invoke RACK
+to either mount the RACK timer to fast retransmit after the reordering
+window, or restarts the recovery if new loss is identified. Hence
+it is possible the sender may go from Recovery to Disorder/Open to
+Recovery again in one ACK.
+
+	Reported-by: mingkun bian <bianmingkun@gmail.com>
+	Signed-off-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a29cb6914681a55667436a9eb7a42e28da8cf387)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_input.c
+diff --cc net/ipv4/tcp_input.c
+index 7e4a08487916,7d5e59f688de..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -2904,18 -2945,22 +2907,34 @@@ static void tcp_fastretrans_alert(struc
+  	case TCP_CA_Recovery:
+  		if (!(flag & FLAG_SND_UNA_ADVANCED)) {
+  			if (tcp_is_reno(tp))
+++<<<<<<< HEAD
+ +				tcp_add_reno_sack(sk, num_dupack);
+ +		} else {
+ +			if (tcp_try_undo_partial(sk, prior_snd_una))
+ +				return;
+ +			/* Partial ACK arrived. Force fast retransmit. */
+ +			do_lost = tcp_force_fast_retransmit(sk);
+ +		}
+ +		if (tcp_try_undo_dsack(sk)) {
+ +			tcp_try_keep_open(sk);
+++=======
++ 				tcp_add_reno_sack(sk, num_dupack, ece_ack);
++ 		} else if (tcp_try_undo_partial(sk, prior_snd_una, &do_lost))
+++>>>>>>> a29cb6914681 (net: tcp better handling of reordering then loss cases)
+  			return;
+- 		}
++ 
++ 		if (tcp_try_undo_dsack(sk))
++ 			tcp_try_keep_open(sk);
++ 
+  		tcp_identify_packet_loss(sk, ack_flag);
++ 		if (icsk->icsk_ca_state != TCP_CA_Recovery) {
++ 			if (!tcp_time_to_recover(sk, flag))
++ 				return;
++ 			/* Undo reverts the recovery state. If loss is evident,
++ 			 * starts a new recovery (e.g. reordering then loss);
++ 			 */
++ 			tcp_enter_recovery(sk, ece_ack);
++ 		}
+  		break;
+  	case TCP_CA_Loss:
+  		tcp_process_loss(sk, flag, num_dupack, rexmit);
+* Unmerged path net/ipv4/tcp_input.c
