@@ -1,0 +1,347 @@
+smb3: Replace smb2pdu 1-element arrays with flex-arrays
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-546.el8
+commit-author Kees Cook <keescook@chromium.org>
+commit eb3e28c1e89b4984308777231887e41aa8a0151f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-546.el8/eb3e28c1.failed
+
+The kernel is globally removing the ambiguous 0-length and 1-element
+arrays in favor of flexible arrays, so that we can gain both compile-time
+and run-time array bounds checking[1].
+
+Replace the trailing 1-element array with a flexible array in the
+following structures:
+
+	struct smb2_err_rsp
+	struct smb2_tree_connect_req
+	struct smb2_negotiate_rsp
+	struct smb2_sess_setup_req
+	struct smb2_sess_setup_rsp
+	struct smb2_read_req
+	struct smb2_read_rsp
+	struct smb2_write_req
+	struct smb2_write_rsp
+	struct smb2_query_directory_req
+	struct smb2_query_directory_rsp
+	struct smb2_set_info_req
+	struct smb2_change_notify_rsp
+	struct smb2_create_rsp
+	struct smb2_query_info_req
+	struct smb2_query_info_rsp
+
+Replace the trailing 1-element array with a flexible array, but leave
+the existing structure padding:
+
+	struct smb2_file_all_info
+	struct smb2_lock_req
+
+Adjust all related size calculations to match the changes to sizeof().
+
+No machine code output or .data section differences are produced after
+these changes.
+
+[1] For lots of details, see both:
+    https://docs.kernel.org/process/deprecated.html#zero-length-and-one-element-arrays
+    https://people.kernel.org/kees/bounded-flexible-arrays-in-c
+
+	Cc: Steve French <sfrench@samba.org>
+	Cc: Paulo Alcantara <pc@cjr.nz>
+	Cc: Ronnie Sahlberg <lsahlber@redhat.com>
+	Cc: Shyam Prasad N <sprasad@microsoft.com>
+	Cc: Tom Talpey <tom@talpey.com>
+	Cc: Namjae Jeon <linkinjeon@kernel.org>
+	Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
+	Cc: linux-cifs@vger.kernel.org
+	Cc: samba-technical@lists.samba.org
+	Reviewed-by: Namjae Jeon <linkinjeon@kernel.org>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit eb3e28c1e89b4984308777231887e41aa8a0151f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/smb2file.c
+#	fs/cifs/smb2misc.c
+#	fs/cifs/smb2pdu.c
+#	fs/cifs/smb2pdu.h
+#	fs/ksmbd/smb2ops.c
+#	fs/ksmbd/smb2pdu.c
+#	fs/smbfs_common/smb2pdu.h
+diff --cc fs/cifs/smb2file.c
+index 2fa3ba354cc9,a7475bc05cac..000000000000
+--- a/fs/cifs/smb2file.c
++++ b/fs/cifs/smb2file.c
+@@@ -33,10 -20,83 +33,88 @@@
+  #include "cifs_unicode.h"
+  #include "fscache.h"
+  #include "smb2proto.h"
+ -#include "smb2status.h"
+  
+++<<<<<<< HEAD
+ +int
+ +smb2_open_file(const unsigned int xid, struct cifs_open_parms *oparms,
+ +	       __u32 *oplock, FILE_ALL_INFO *buf)
+++=======
++ static struct smb2_symlink_err_rsp *symlink_data(const struct kvec *iov)
++ {
++ 	struct smb2_err_rsp *err = iov->iov_base;
++ 	struct smb2_symlink_err_rsp *sym = ERR_PTR(-EINVAL);
++ 	u32 len;
++ 
++ 	if (err->ErrorContextCount) {
++ 		struct smb2_error_context_rsp *p, *end;
++ 
++ 		len = (u32)err->ErrorContextCount * (offsetof(struct smb2_error_context_rsp,
++ 							      ErrorContextData) +
++ 						     sizeof(struct smb2_symlink_err_rsp));
++ 		if (le32_to_cpu(err->ByteCount) < len || iov->iov_len < len + sizeof(*err) + 1)
++ 			return ERR_PTR(-EINVAL);
++ 
++ 		p = (struct smb2_error_context_rsp *)err->ErrorData;
++ 		end = (struct smb2_error_context_rsp *)((u8 *)err + iov->iov_len);
++ 		do {
++ 			if (le32_to_cpu(p->ErrorId) == SMB2_ERROR_ID_DEFAULT) {
++ 				sym = (struct smb2_symlink_err_rsp *)&p->ErrorContextData;
++ 				break;
++ 			}
++ 			cifs_dbg(FYI, "%s: skipping unhandled error context: 0x%x\n",
++ 				 __func__, le32_to_cpu(p->ErrorId));
++ 
++ 			len = ALIGN(le32_to_cpu(p->ErrorDataLength), 8);
++ 			p = (struct smb2_error_context_rsp *)((u8 *)&p->ErrorContextData + len);
++ 		} while (p < end);
++ 	} else if (le32_to_cpu(err->ByteCount) >= sizeof(*sym) &&
++ 		   iov->iov_len >= SMB2_SYMLINK_STRUCT_SIZE) {
++ 		sym = (struct smb2_symlink_err_rsp *)err->ErrorData;
++ 	}
++ 
++ 	if (!IS_ERR(sym) && (le32_to_cpu(sym->SymLinkErrorTag) != SYMLINK_ERROR_TAG ||
++ 			     le32_to_cpu(sym->ReparseTag) != IO_REPARSE_TAG_SYMLINK))
++ 		sym = ERR_PTR(-EINVAL);
++ 
++ 	return sym;
++ }
++ 
++ int smb2_parse_symlink_response(struct cifs_sb_info *cifs_sb, const struct kvec *iov, char **path)
++ {
++ 	struct smb2_symlink_err_rsp *sym;
++ 	unsigned int sub_offs, sub_len;
++ 	unsigned int print_offs, print_len;
++ 	char *s;
++ 
++ 	if (!cifs_sb || !iov || !iov->iov_base || !iov->iov_len || !path)
++ 		return -EINVAL;
++ 
++ 	sym = symlink_data(iov);
++ 	if (IS_ERR(sym))
++ 		return PTR_ERR(sym);
++ 
++ 	sub_len = le16_to_cpu(sym->SubstituteNameLength);
++ 	sub_offs = le16_to_cpu(sym->SubstituteNameOffset);
++ 	print_len = le16_to_cpu(sym->PrintNameLength);
++ 	print_offs = le16_to_cpu(sym->PrintNameOffset);
++ 
++ 	if (iov->iov_len < SMB2_SYMLINK_STRUCT_SIZE + sub_offs + sub_len ||
++ 	    iov->iov_len < SMB2_SYMLINK_STRUCT_SIZE + print_offs + print_len)
++ 		return -EINVAL;
++ 
++ 	s = cifs_strndup_from_utf16((char *)sym->PathBuffer + sub_offs, sub_len, true,
++ 				    cifs_sb->local_nls);
++ 	if (!s)
++ 		return -ENOMEM;
++ 	convert_delimiter(s, '/');
++ 	cifs_dbg(FYI, "%s: symlink target: %s\n", __func__, s);
++ 
++ 	*path = s;
++ 	return 0;
++ }
++ 
++ int smb2_open_file(const unsigned int xid, struct cifs_open_parms *oparms, __u32 *oplock, void *buf)
+++>>>>>>> eb3e28c1e89b (smb3: Replace smb2pdu 1-element arrays with flex-arrays)
+  {
+  	int rc;
+  	__le16 *smb2_path;
+diff --cc fs/cifs/smb2misc.c
+index 586cfdc3cc5f,3935a60db5c3..000000000000
+--- a/fs/cifs/smb2misc.c
++++ b/fs/cifs/smb2misc.c
+@@@ -107,13 -96,28 +107,24 @@@ static __u32 get_neg_ctxt_len(struct sm
+  	   (pneg_rsp->DialectRevision != cpu_to_le16(SMB311_PROT_ID)))
+  		return 0;
+  
+ -	/*
+ -	 * if SPNEGO blob present (ie the RFC2478 GSS info which indicates
+ -	 * which security mechanisms the server supports) make sure that
+ -	 * the negotiate contexts start after it
+ -	 */
+ +	/* Make sure that negotiate contexts start after gss security blob */
+  	nc_offset = le32_to_cpu(pneg_rsp->NegotiateContextOffset);
+ -	/*
+ -	 * non_ctxlen is at least shdr->StructureSize + pdu->StructureSize2
+ -	 * and the latter is 1 byte bigger than the fix-sized area of the
+ -	 * NEGOTIATE response
+ -	 */
+ -	if (nc_offset + 1 < non_ctxlen) {
+ -		pr_warn_once("Invalid negotiate context offset %d\n", nc_offset);
+ +	if (nc_offset < non_ctxlen) {
+ +		pr_warn_once("Invalid negotiate context offset\n");
+  		return 0;
+++<<<<<<< HEAD
+ +	}
+ +	size_of_pad_before_neg_ctxts = nc_offset - non_ctxlen;
+++=======
++ 	} else if (nc_offset + 1 == non_ctxlen) {
++ 		cifs_dbg(FYI, "no SPNEGO security blob in negprot rsp\n");
++ 		size_of_pad_before_neg_ctxts = 0;
++ 	} else if (non_ctxlen == SMB311_NEGPROT_BASE_SIZE + 1)
++ 		/* has padding, but no SPNEGO blob */
++ 		size_of_pad_before_neg_ctxts = nc_offset - non_ctxlen + 1;
++ 	else
++ 		size_of_pad_before_neg_ctxts = nc_offset - non_ctxlen;
+++>>>>>>> eb3e28c1e89b (smb3: Replace smb2pdu 1-element arrays with flex-arrays)
+  
+  	/* Verify that at least minimal negotiate contexts fit within frame */
+  	if (len < nc_offset + (neg_count * sizeof(struct smb2_neg_context))) {
+diff --cc fs/cifs/smb2pdu.c
+index 688737135aa3,4982f5e65e13..000000000000
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@@ -3577,9 -3767,28 +3576,32 @@@ SMB2_change_notify(const unsigned int x
+  		cifs_stats_fail_inc(tcon, SMB2_CHANGE_NOTIFY_HE);
+  		trace_smb3_notify_err(xid, persistent_fid, tcon->tid, ses->Suid,
+  				(u8)watch_tree, completion_filter, rc);
+ -	} else {
+ +	} else
+  		trace_smb3_notify_done(xid, persistent_fid, tcon->tid,
+++<<<<<<< HEAD
+ +				ses->Suid, (u8)watch_tree, completion_filter);
+++=======
++ 			ses->Suid, (u8)watch_tree, completion_filter);
++ 		/* validate that notify information is plausible */
++ 		if ((rsp_iov.iov_base == NULL) ||
++ 		    (rsp_iov.iov_len < sizeof(struct smb2_change_notify_rsp) + 1))
++ 			goto cnotify_exit;
++ 
++ 		smb_rsp = (struct smb2_change_notify_rsp *)rsp_iov.iov_base;
++ 
++ 		smb2_validate_iov(le16_to_cpu(smb_rsp->OutputBufferOffset),
++ 				le32_to_cpu(smb_rsp->OutputBufferLength), &rsp_iov,
++ 				sizeof(struct file_notify_information));
++ 
++ 		*out_data = kmemdup((char *)smb_rsp + le16_to_cpu(smb_rsp->OutputBufferOffset),
++ 				le32_to_cpu(smb_rsp->OutputBufferLength), GFP_KERNEL);
++ 		if (*out_data == NULL) {
++ 			rc = -ENOMEM;
++ 			goto cnotify_exit;
++ 		} else
++ 			*plen = le32_to_cpu(smb_rsp->OutputBufferLength);
++ 	}
+++>>>>>>> eb3e28c1e89b (smb3: Replace smb2pdu 1-element arrays with flex-arrays)
+  
+   cnotify_exit:
+  	if (rqst.rq_iov)
+diff --cc fs/cifs/smb2pdu.h
+index fa57b03ca98c,2114e8a0c63a..000000000000
+--- a/fs/cifs/smb2pdu.h
++++ b/fs/cifs/smb2pdu.h
+@@@ -213,15 -56,8 +213,20 @@@ struct smb2_rdma_encryption_transform 
+  
+  #define COMPOUND_FID 0xFFFFFFFFFFFFFFFFULL
+  
+++<<<<<<< HEAD
+ +#define SMB2_ERROR_STRUCTURE_SIZE2 cpu_to_le16(9)
+ +
+ +struct smb2_err_rsp {
+ +	struct smb2_sync_hdr sync_hdr;
+ +	__le16 StructureSize;
+ +	__le16 Reserved; /* MBZ */
+ +	__le32 ByteCount;  /* even if zero, at least one byte follows */
+ +	__u8   ErrorData[1];  /* variable length */
+ +} __packed;
+++=======
++ #define SMB2_SYMLINK_STRUCT_SIZE \
++ 	(sizeof(struct smb2_err_rsp) + sizeof(struct smb2_symlink_err_rsp))
+++>>>>>>> eb3e28c1e89b (smb3: Replace smb2pdu 1-element arrays with flex-arrays)
+  
+  #define SYMLINK_ERROR_TAG 0x4c4d5953
+  
+* Unmerged path fs/ksmbd/smb2ops.c
+* Unmerged path fs/ksmbd/smb2pdu.c
+* Unmerged path fs/smbfs_common/smb2pdu.h
+* Unmerged path fs/cifs/smb2file.c
+* Unmerged path fs/cifs/smb2misc.c
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index be2adafb89a0..f2f9fa3f9559 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -5553,7 +5553,7 @@ struct smb_version_values smb20_values = {
+ 	.header_size = sizeof(struct smb2_sync_hdr),
+ 	.header_preamble_size = 0,
+ 	.max_header_size = MAX_SMB2_HDR_SIZE,
+-	.read_rsp_size = sizeof(struct smb2_read_rsp) - 1,
++	.read_rsp_size = sizeof(struct smb2_read_rsp),
+ 	.lock_cmd = SMB2_LOCK,
+ 	.cap_unix = 0,
+ 	.cap_nt_find = SMB2_NT_FIND,
+@@ -5574,7 +5574,7 @@ struct smb_version_values smb21_values = {
+ 	.header_size = sizeof(struct smb2_sync_hdr),
+ 	.header_preamble_size = 0,
+ 	.max_header_size = MAX_SMB2_HDR_SIZE,
+-	.read_rsp_size = sizeof(struct smb2_read_rsp) - 1,
++	.read_rsp_size = sizeof(struct smb2_read_rsp),
+ 	.lock_cmd = SMB2_LOCK,
+ 	.cap_unix = 0,
+ 	.cap_nt_find = SMB2_NT_FIND,
+@@ -5595,7 +5595,7 @@ struct smb_version_values smb3any_values = {
+ 	.header_size = sizeof(struct smb2_sync_hdr),
+ 	.header_preamble_size = 0,
+ 	.max_header_size = MAX_SMB2_HDR_SIZE,
+-	.read_rsp_size = sizeof(struct smb2_read_rsp) - 1,
++	.read_rsp_size = sizeof(struct smb2_read_rsp),
+ 	.lock_cmd = SMB2_LOCK,
+ 	.cap_unix = 0,
+ 	.cap_nt_find = SMB2_NT_FIND,
+@@ -5616,7 +5616,7 @@ struct smb_version_values smbdefault_values = {
+ 	.header_size = sizeof(struct smb2_sync_hdr),
+ 	.header_preamble_size = 0,
+ 	.max_header_size = MAX_SMB2_HDR_SIZE,
+-	.read_rsp_size = sizeof(struct smb2_read_rsp) - 1,
++	.read_rsp_size = sizeof(struct smb2_read_rsp),
+ 	.lock_cmd = SMB2_LOCK,
+ 	.cap_unix = 0,
+ 	.cap_nt_find = SMB2_NT_FIND,
+@@ -5637,7 +5637,7 @@ struct smb_version_values smb30_values = {
+ 	.header_size = sizeof(struct smb2_sync_hdr),
+ 	.header_preamble_size = 0,
+ 	.max_header_size = MAX_SMB2_HDR_SIZE,
+-	.read_rsp_size = sizeof(struct smb2_read_rsp) - 1,
++	.read_rsp_size = sizeof(struct smb2_read_rsp),
+ 	.lock_cmd = SMB2_LOCK,
+ 	.cap_unix = 0,
+ 	.cap_nt_find = SMB2_NT_FIND,
+@@ -5658,7 +5658,7 @@ struct smb_version_values smb302_values = {
+ 	.header_size = sizeof(struct smb2_sync_hdr),
+ 	.header_preamble_size = 0,
+ 	.max_header_size = MAX_SMB2_HDR_SIZE,
+-	.read_rsp_size = sizeof(struct smb2_read_rsp) - 1,
++	.read_rsp_size = sizeof(struct smb2_read_rsp),
+ 	.lock_cmd = SMB2_LOCK,
+ 	.cap_unix = 0,
+ 	.cap_nt_find = SMB2_NT_FIND,
+@@ -5679,7 +5679,7 @@ struct smb_version_values smb311_values = {
+ 	.header_size = sizeof(struct smb2_sync_hdr),
+ 	.header_preamble_size = 0,
+ 	.max_header_size = MAX_SMB2_HDR_SIZE,
+-	.read_rsp_size = sizeof(struct smb2_read_rsp) - 1,
++	.read_rsp_size = sizeof(struct smb2_read_rsp),
+ 	.lock_cmd = SMB2_LOCK,
+ 	.cap_unix = 0,
+ 	.cap_nt_find = SMB2_NT_FIND,
+* Unmerged path fs/cifs/smb2pdu.c
+* Unmerged path fs/cifs/smb2pdu.h
+* Unmerged path fs/ksmbd/smb2ops.c
+* Unmerged path fs/ksmbd/smb2pdu.c
+* Unmerged path fs/smbfs_common/smb2pdu.h
