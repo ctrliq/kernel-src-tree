@@ -149,8 +149,8 @@ static int sof_resume(struct device *dev, bool runtime_resume)
 		return ret;
 	}
 
-	/* resume DMA trace, only need send ipc */
-	ret = snd_sof_init_trace_ipc(sdev);
+	/* resume DMA trace */
+	ret = snd_sof_trace_resume(sdev);
 	if (ret < 0) {
 		/* non fatal */
 		dev_warn(sdev->dev,
@@ -212,8 +212,8 @@ static int sof_suspend(struct device *dev, bool runtime_suspend)
 
 	sof_tear_down_pipelines(sdev, false);
 
-	/* release trace */
-	snd_sof_release_trace(sdev);
+	/* suspend DMA trace */
+	snd_sof_trace_suspend(sdev, pm_state);
 
 #if IS_ENABLED(CONFIG_SND_SOC_SOF_DEBUG_ENABLE_DEBUGFS_CACHE)
 	/* cache debugfs contents during runtime suspend */
