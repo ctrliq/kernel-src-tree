@@ -1,0 +1,266 @@
+x86/mm/cpa: Generalize __set_memory_enc_pgtable()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Brijesh Singh <brijesh.singh@amd.com>
+commit 1e8c5971c249893ac33ca983c32bafcf5d50c727
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/1e8c5971.failed
+
+The kernel provides infrastructure to set or clear the encryption mask
+from the pages for AMD SEV, but TDX requires few tweaks.
+
+- TDX and SEV have different requirements to the cache and TLB
+  flushing.
+
+- TDX has own routine to notify VMM about page encryption status change.
+
+Modify __set_memory_enc_pgtable() and make it flexible enough to cover
+both AMD SEV and Intel TDX. The AMD-specific behavior is isolated in the
+callbacks under x86_platform.guest. TDX will provide own version of said
+callbacks.
+
+  [ bp: Beat into submission. ]
+
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Link: https://lore.kernel.org/r/20220223043528.2093214-1-brijesh.singh@amd.com
+(cherry picked from commit 1e8c5971c249893ac33ca983c32bafcf5d50c727)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/mem_encrypt_amd.c
+diff --cc arch/x86/mm/mem_encrypt_amd.c
+index 48e92fcc23e3,6169053c2854..000000000000
+--- a/arch/x86/mm/mem_encrypt_amd.c
++++ b/arch/x86/mm/mem_encrypt_amd.c
+@@@ -179,22 -177,6 +179,25 @@@ void __init sme_map_bootdata(char *real
+  	__sme_early_map_unmap_mem(__va(cmdline_paddr), COMMAND_LINE_SIZE, true);
+  }
+  
+++<<<<<<< HEAD
+ +void __init sme_early_init(void)
+ +{
+ +	unsigned int i;
+ +
+ +	if (!sme_me_mask)
+ +		return;
+ +
+ +	early_pmd_flags = __sme_set(early_pmd_flags);
+ +
+ +	__supported_pte_mask = __sme_set(__supported_pte_mask);
+ +
+ +	/* Update the protection map with memory encryption mask */
+ +	for (i = 0; i < ARRAY_SIZE(protection_map); i++)
+ +		protection_map[i] = pgprot_encrypted(protection_map[i]);
+ +}
+ +
+++=======
+++>>>>>>> 1e8c5971c249 (x86/mm/cpa: Generalize __set_memory_enc_pgtable())
+  void __init sev_setup_arch(void)
+  {
+  	phys_addr_t total_mem = memblock_phys_mem_size();
+@@@ -409,56 -414,33 +435,80 @@@ int __init early_set_memory_encrypted(u
+  
+  void __init early_set_mem_enc_dec_hypercall(unsigned long vaddr, int npages, bool enc)
+  {
+- 	notify_range_enc_status_changed(vaddr, npages, enc);
++ 	enc_dec_hypercall(vaddr, npages, enc);
++ }
++ 
++ void __init sme_early_init(void)
++ {
++ 	unsigned int i;
++ 
++ 	if (!sme_me_mask)
++ 		return;
++ 
++ 	early_pmd_flags = __sme_set(early_pmd_flags);
++ 
++ 	__supported_pte_mask = __sme_set(__supported_pte_mask);
++ 
++ 	/* Update the protection map with memory encryption mask */
++ 	for (i = 0; i < ARRAY_SIZE(protection_map); i++)
++ 		protection_map[i] = pgprot_encrypted(protection_map[i]);
++ 
++ 	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
++ 		swiotlb_force = SWIOTLB_FORCE;
++ 
++ 	x86_platform.guest.enc_status_change_prepare = amd_enc_status_change_prepare;
++ 	x86_platform.guest.enc_status_change_finish  = amd_enc_status_change_finish;
++ 	x86_platform.guest.enc_tlb_flush_required    = amd_enc_tlb_flush_required;
++ 	x86_platform.guest.enc_cache_flush_required  = amd_enc_cache_flush_required;
+  }
+  
+ +/*
+ + * SME and SEV are very similar but they are not the same, so there are
+ + * times that the kernel will need to distinguish between SME and SEV. The
+ + * cc_platform_has() function is used for this.  When a distinction isn't
+ + * needed, the CC_ATTR_MEM_ENCRYPT attribute can be used.
+ + *
+ + * The trampoline code is a good example for this requirement.  Before
+ + * paging is activated, SME will access all memory as decrypted, but SEV
+ + * will access all memory as encrypted.  So, when APs are being brought
+ + * up under SME the trampoline area cannot be encrypted, whereas under SEV
+ + * the trampoline area must be encrypted.
+ + */
+ +
+ +/* Keep sme_active in order to break Red Hat kABI */
+ +bool sme_active(void)
+ +{
+ +       return sme_me_mask && !cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT);
+ +}
+ +EXPORT_SYMBOL(sme_active);
+ +
+ +/* Override for DMA direct allocation check - ARCH_HAS_FORCE_DMA_UNENCRYPTED */
+ +bool force_dma_unencrypted(struct device *dev)
+ +{
+ +	/*
+ +	 * For SEV, all DMA must be to unencrypted addresses.
+ +	 */
+ +	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
+ +		return true;
+ +
+ +	/*
+ +	 * For SME, all DMA must be to unencrypted addresses if the
+ +	 * device does not support DMA to addresses that include the
+ +	 * encryption mask.
+ +	 */
+ +	if (cc_platform_has(CC_ATTR_HOST_MEM_ENCRYPT)) {
+ +		u64 dma_enc_mask = DMA_BIT_MASK(__ffs64(sme_me_mask));
+ +		u64 dma_dev_mask = min_not_zero(dev->coherent_dma_mask,
+ +						dev->bus_dma_limit);
+ +
+ +		if (dma_dev_mask <= dma_enc_mask)
+ +			return true;
+ +	}
+ +
+ +	return false;
+ +}
+ +
+ +/* Architecture __weak replacement functions */
+  void __init mem_encrypt_free_decrypted_mem(void)
+  {
+  	unsigned long vaddr, vaddr_end, npages;
+diff --git a/arch/x86/include/asm/set_memory.h b/arch/x86/include/asm/set_memory.h
+index 5b7d97a7f32f..f9d48d550bb1 100644
+--- a/arch/x86/include/asm/set_memory.h
++++ b/arch/x86/include/asm/set_memory.h
+@@ -81,7 +81,6 @@ int set_pages_rw(struct page *page, int numpages);
+ int set_direct_map_invalid_noflush(struct page *page);
+ int set_direct_map_default_noflush(struct page *page);
+ bool kernel_page_present(struct page *page);
+-void notify_range_enc_status_changed(unsigned long vaddr, int npages, bool enc);
+ 
+ extern int kernel_set_to_readonly;
+ void set_kernel_text_rw(void);
+diff --git a/arch/x86/include/asm/x86_init.h b/arch/x86/include/asm/x86_init.h
+index 7ea73e6130f1..0d86436025db 100644
+--- a/arch/x86/include/asm/x86_init.h
++++ b/arch/x86/include/asm/x86_init.h
+@@ -149,6 +149,21 @@ struct x86_init_acpi {
+ 	void (*reduced_hw_early_init)(void);
+ };
+ 
++/**
++ * struct x86_guest - Functions used by misc guest incarnations like SEV, TDX, etc.
++ *
++ * @enc_status_change_prepare	Notify HV before the encryption status of a range is changed
++ * @enc_status_change_finish	Notify HV after the encryption status of a range is changed
++ * @enc_tlb_flush_required	Returns true if a TLB flush is needed before changing page encryption status
++ * @enc_cache_flush_required	Returns true if a cache flush is needed before changing page encryption status
++ */
++struct x86_guest {
++	void (*enc_status_change_prepare)(unsigned long vaddr, int npages, bool enc);
++	bool (*enc_status_change_finish)(unsigned long vaddr, int npages, bool enc);
++	bool (*enc_tlb_flush_required)(bool enc);
++	bool (*enc_cache_flush_required)(void);
++};
++
+ /**
+  * struct x86_init_ops - functions for platform specific setup
+  *
+@@ -295,6 +310,7 @@ struct x86_platform_ops {
+ 	struct x86_legacy_features legacy;
+ 	void (*set_legacy_features)(void);
+ 	struct x86_hyper_runtime hyper;
++	struct x86_guest guest;
+ };
+ 
+ struct pci_dev;
+diff --git a/arch/x86/kernel/x86_init.c b/arch/x86/kernel/x86_init.c
+index b2d582b66a17..44e5181c95a3 100644
+--- a/arch/x86/kernel/x86_init.c
++++ b/arch/x86/kernel/x86_init.c
+@@ -110,6 +110,11 @@ struct x86_cpuinit_ops x86_cpuinit = {
+ 
+ static void default_nmi_init(void) { };
+ 
++static void enc_status_change_prepare_noop(unsigned long vaddr, int npages, bool enc) { }
++static bool enc_status_change_finish_noop(unsigned long vaddr, int npages, bool enc) { return false; }
++static bool enc_tlb_flush_required_noop(bool enc) { return false; }
++static bool enc_cache_flush_required_noop(void) { return false; }
++
+ struct x86_platform_ops x86_platform __ro_after_init = {
+ 	.calibrate_cpu			= native_calibrate_cpu_early,
+ 	.calibrate_tsc			= native_calibrate_tsc,
+@@ -119,9 +124,16 @@ struct x86_platform_ops x86_platform __ro_after_init = {
+ 	.is_untracked_pat_range		= is_ISA_range,
+ 	.nmi_init			= default_nmi_init,
+ 	.get_nmi_reason			= default_get_nmi_reason,
+-	.save_sched_clock_state 	= tsc_save_sched_clock_state,
+-	.restore_sched_clock_state 	= tsc_restore_sched_clock_state,
++	.save_sched_clock_state		= tsc_save_sched_clock_state,
++	.restore_sched_clock_state	= tsc_restore_sched_clock_state,
+ 	.hyper.pin_vcpu			= x86_op_int_noop,
++
++	.guest = {
++		.enc_status_change_prepare = enc_status_change_prepare_noop,
++		.enc_status_change_finish  = enc_status_change_finish_noop,
++		.enc_tlb_flush_required	   = enc_tlb_flush_required_noop,
++		.enc_cache_flush_required  = enc_cache_flush_required_noop,
++	},
+ };
+ 
+ EXPORT_SYMBOL_GPL(x86_platform);
+* Unmerged path arch/x86/mm/mem_encrypt_amd.c
+diff --git a/arch/x86/mm/pat/set_memory.c b/arch/x86/mm/pat/set_memory.c
+index 9b895e03953f..d721d869d4d2 100644
+--- a/arch/x86/mm/pat/set_memory.c
++++ b/arch/x86/mm/pat/set_memory.c
+@@ -1972,10 +1972,12 @@ static int __set_memory_enc_pgtable(unsigned long addr, int numpages, bool enc)
+ 	kmap_flush_unused();
+ 	vm_unmap_aliases();
+ 
+-	/*
+-	 * Before changing the encryption attribute, we need to flush caches.
+-	 */
+-	cpa_flush(&cpa, !this_cpu_has(X86_FEATURE_SME_COHERENT));
++	/* Flush the caches as needed before changing the encryption attribute. */
++	if (x86_platform.guest.enc_tlb_flush_required(enc))
++		cpa_flush(&cpa, x86_platform.guest.enc_cache_flush_required());
++
++	/* Notify hypervisor that we are about to set/clr encryption attribute. */
++	x86_platform.guest.enc_status_change_prepare(addr, numpages, enc);
+ 
+ 	ret = __change_page_attr_set_clr(&cpa, 1);
+ 
+@@ -1988,11 +1990,11 @@ static int __set_memory_enc_pgtable(unsigned long addr, int numpages, bool enc)
+ 	 */
+ 	cpa_flush(&cpa, 0);
+ 
+-	/*
+-	 * Notify hypervisor that a given memory range is mapped encrypted
+-	 * or decrypted.
+-	 */
+-	notify_range_enc_status_changed(addr, numpages, enc);
++	/* Notify hypervisor that we have successfully set/clr encryption attribute. */
++	if (!ret) {
++		if (!x86_platform.guest.enc_status_change_finish(addr, numpages, enc))
++			ret = -EIO;
++	}
+ 
+ 	return ret;
+ }
