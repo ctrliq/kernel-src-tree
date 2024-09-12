@@ -1,0 +1,96 @@
+swiotlb: don't panic!
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-492.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit 639205ed206f98fcfa826933946f0844615784ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-492.el8/639205ed.failed
+
+The panics in swiotlb are relics of a bygone era, some of them
+inadvertently inherited from a memblock refactor, and all of them
+unnecessary since they are in places that may also fail gracefully
+anyway.
+
+Convert the panics in swiotlb_init_remap() into non-fatal warnings
+more consistent with the other bail-out paths there and in
+swiotlb_init_late() (but don't bother trying to roll anything back,
+since if anything does actually fail that early, the aim is merely to
+keep going as far as possible to get more diagnostic information out
+of the inevitably-dying kernel). It's not for SWIOTLB to decide that the
+system is terminally compromised just because there *might* turn out to
+be one or more 32-bit devices that might want to make streaming DMA
+mappings, especially since we already handle the no-buffer case later
+if it turns out someone did want it.
+
+Similarly though, downgrade that panic in swiotlb_tbl_map_single(),
+since even if we do get to that point it's an overly extreme reaction.
+It makes little difference to the DMA API caller whether a mapping fails
+because the buffer is full or because there is no buffer, and once again
+it's not for SWIOTLB to presume that any particular DMA mapping is so
+fundamental to the operation of the system that it must be terminal if
+it could never succeed. Even if the caller handles failure by futilely
+retrying forever, a single stuck thread is considerably less impactful
+to the user than a needless panic.
+
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 639205ed206f98fcfa826933946f0844615784ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/dma/swiotlb.c
+diff --cc kernel/dma/swiotlb.c
+index 578a68baba6f,339a990554e7..000000000000
+--- a/kernel/dma/swiotlb.c
++++ b/kernel/dma/swiotlb.c
+@@@ -338,25 -343,30 +338,42 @@@ retry
+  	}
+  
+  	if (remap && remap(tlb, nslabs) < 0) {
+ -		memblock_free(tlb, PAGE_ALIGN(bytes));
+ +		memblock_free(__pa(tlb), PAGE_ALIGN(bytes));
+  
+  		nslabs = ALIGN(nslabs >> 1, IO_TLB_SEGSIZE);
+- 		if (nslabs < IO_TLB_MIN_SLABS)
+- 			panic("%s: Failed to remap %zu bytes\n",
+- 			      __func__, bytes);
+- 		goto retry;
++ 		if (nslabs >= IO_TLB_MIN_SLABS)
++ 			goto retry;
++ 
++ 		pr_warn("%s: Failed to remap %zu bytes\n", __func__, bytes);
++ 		return;
+  	}
+  
+  	alloc_size = PAGE_ALIGN(array_size(sizeof(*mem->slots), nslabs));
+++<<<<<<< HEAD
+ +	mem->slots = memblock_alloc_nopanic(alloc_size, PAGE_SIZE);
+ +	if (!mem->slots)
+ +		panic("%s: Failed to allocate %zu bytes align=0x%lx\n",
+ +		      __func__, alloc_size, PAGE_SIZE);
+ +
+ +	mem->areas = memblock_alloc_nopanic(sizeof(struct io_tlb_area) *
+ +		default_nareas, SMP_CACHE_BYTES);
+ +	if (!mem->areas)
+ +		panic("%s: Failed to allocate mem->areas.\n", __func__);
+++=======
++ 	mem->slots = memblock_alloc(alloc_size, PAGE_SIZE);
++ 	if (!mem->slots) {
++ 		pr_warn("%s: Failed to allocate %zu bytes align=0x%lx\n",
++ 			__func__, alloc_size, PAGE_SIZE);
++ 		return;
++ 	}
++ 
++ 	mem->areas = memblock_alloc(array_size(sizeof(struct io_tlb_area),
++ 		default_nareas), SMP_CACHE_BYTES);
++ 	if (!mem->areas) {
++ 		pr_warn("%s: Failed to allocate mem->areas.\n", __func__);
++ 		return;
++ 	}
+++>>>>>>> 639205ed206f (swiotlb: don't panic!)
+  
+  	swiotlb_init_io_tlb_mem(mem, __pa(tlb), nslabs, flags, false,
+  				default_nareas);
+* Unmerged path kernel/dma/swiotlb.c
