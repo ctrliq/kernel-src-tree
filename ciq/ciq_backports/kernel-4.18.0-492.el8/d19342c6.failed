@@ -1,0 +1,173 @@
+cifs: sanitize paths in cifs_update_super_prepath.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-492.el8
+commit-author Thiago Rafael Becker <tbecker@redhat.com>
+commit d19342c6609b67f2ba83b9eccca2777e3687f625
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-492.el8/d19342c6.failed
+
+After a server reboot, clients are failing to move files with ENOENT.
+This is caused by DFS referrals containing multiple separators, which
+the server move call doesn't recognize.
+
+v1: Initial patch.
+v2: Move prototype to header.
+
+Link: https://bugzilla.redhat.com/show_bug.cgi?id=2182472
+Fixes: a31080899d5f ("cifs: sanitize multiple delimiters in prepath")
+Actually-Fixes: 24e0a1eff9e2 ("cifs: switch to new mount api")
+	Reviewed-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+	Signed-off-by: Thiago Rafael Becker <tbecker@redhat.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit d19342c6609b67f2ba83b9eccca2777e3687f625)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/fs_context.h
+#	fs/cifs/misc.c
+diff --cc fs/cifs/fs_context.h
+index fbf69f1591d9,f4eaf8558902..000000000000
+--- a/fs/cifs/fs_context.h
++++ b/fs/cifs/fs_context.h
+@@@ -276,4 -282,12 +276,15 @@@ static inline struct smb3_fs_context *s
+  extern int smb3_fs_context_dup(struct smb3_fs_context *new_ctx, struct smb3_fs_context *ctx);
+  extern void smb3_update_mnt_flags(struct cifs_sb_info *cifs_sb);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * max deferred close timeout (jiffies) - 2^30
++  */
++ #define SMB3_MAX_DCLOSETIMEO (1 << 30)
++ #define SMB3_DEF_DCLOSETIMEO (1 * HZ) /* even 1 sec enough to help eg open/write/close/open/read */
++ 
++ extern char *cifs_sanitize_prepath(char *prepath, gfp_t gfp);
++ 
+++>>>>>>> d19342c6609b (cifs: sanitize paths in cifs_update_super_prepath.)
+  #endif
+diff --cc fs/cifs/misc.c
+index e3ff9aaf98a5,7f085ed2d866..000000000000
+--- a/fs/cifs/misc.c
++++ b/fs/cifs/misc.c
+@@@ -1166,34 -1275,46 +1166,40 @@@ static inline void cifs_put_tcon_super(
+  }
+  #endif
+  
+ -int cifs_wait_for_server_reconnect(struct TCP_Server_Info *server, bool retry)
+ +int update_super_prepath(struct cifs_tcon *tcon, char *prefix)
+  {
+ -	int timeout = 10;
+ -	int rc;
+ +	struct super_block *sb;
+ +	struct cifs_sb_info *cifs_sb;
+ +	int rc = 0;
+  
+ -	spin_lock(&server->srv_lock);
+ -	if (server->tcpStatus != CifsNeedReconnect) {
+ -		spin_unlock(&server->srv_lock);
+ -		return 0;
+ -	}
+ -	timeout *= server->nr_targets;
+ -	spin_unlock(&server->srv_lock);
+ +	sb = cifs_get_tcon_super(tcon);
+ +	if (IS_ERR(sb))
+ +		return PTR_ERR(sb);
+  
+ -	/*
+ -	 * Give demultiplex thread up to 10 seconds to each target available for
+ -	 * reconnect -- should be greater than cifs socket timeout which is 7
+ -	 * seconds.
+ -	 *
+ -	 * On "soft" mounts we wait once. Hard mounts keep retrying until
+ -	 * process is killed or server comes back on-line.
+ -	 */
+ -	do {
+ -		rc = wait_event_interruptible_timeout(server->response_q,
+ -						      (server->tcpStatus != CifsNeedReconnect),
+ -						      timeout * HZ);
+ -		if (rc < 0) {
+ -			cifs_dbg(FYI, "%s: aborting reconnect due to received signal\n",
+ -				 __func__);
+ -			return -ERESTARTSYS;
+ -		}
+ +	cifs_sb = CIFS_SB(sb);
+  
+ -		/* are we still trying to reconnect? */
+ -		spin_lock(&server->srv_lock);
+ -		if (server->tcpStatus != CifsNeedReconnect) {
+ -			spin_unlock(&server->srv_lock);
+ -			return 0;
+ +	kfree(cifs_sb->prepath);
+ +
+ +	if (prefix && *prefix) {
+++<<<<<<< HEAD
+ +		cifs_sb->prepath = kstrdup(prefix, GFP_ATOMIC);
+ +		if (!cifs_sb->prepath) {
+ +			rc = -ENOMEM;
+ +			goto out;
+  		}
+ -		spin_unlock(&server->srv_lock);
+ -	} while (retry);
+++=======
+++		cifs_sb->prepath = cifs_sanitize_prepath(prefix, GFP_ATOMIC);
+++		if (!cifs_sb->prepath)
+++			return -ENOMEM;
+++>>>>>>> d19342c6609b (cifs: sanitize paths in cifs_update_super_prepath.)
+ +
+ +		convert_delimiter(cifs_sb->prepath, CIFS_DIR_SEP(cifs_sb));
+ +	} else
+ +		cifs_sb->prepath = NULL;
+  
+ -	cifs_dbg(FYI, "%s: gave up waiting on reconnect\n", __func__);
+ -	return -EHOSTDOWN;
+ +	cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_USE_PREFIX_PATH;
+ +
+ +out:
+ +	cifs_put_tcon_super(sb);
+ +	return rc;
+  }
+diff --git a/fs/cifs/fs_context.c b/fs/cifs/fs_context.c
+index ba4dc25a2659..222f3628e52c 100644
+--- a/fs/cifs/fs_context.c
++++ b/fs/cifs/fs_context.c
+@@ -451,13 +451,14 @@ int smb3_parse_opt(const char *options, const char *key, char **val)
+  * but there are some bugs that prevent rename from working if there are
+  * multiple delimiters.
+  *
+- * Returns a sanitized duplicate of @path. The caller is responsible for
+- * cleaning up the original.
++ * Returns a sanitized duplicate of @path. @gfp indicates the GFP_* flags
++ * for kstrdup.
++ * The caller is responsible for freeing the original.
+  */
+ #define IS_DELIM(c) ((c) == '/' || (c) == '\\')
+-static char *sanitize_path(char *path)
++char *cifs_sanitize_prepath(char *prepath, gfp_t gfp)
+ {
+-	char *cursor1 = path, *cursor2 = path;
++	char *cursor1 = prepath, *cursor2 = prepath;
+ 
+ 	/* skip all prepended delimiters */
+ 	while (IS_DELIM(*cursor1))
+@@ -479,7 +480,7 @@ static char *sanitize_path(char *path)
+ 		cursor2--;
+ 
+ 	*(cursor2) = '\0';
+-	return kstrdup(path, GFP_KERNEL);
++	return kstrdup(prepath, gfp);
+ }
+ 
+ /*
+@@ -541,7 +542,7 @@ smb3_parse_devname(const char *devname, struct smb3_fs_context *ctx)
+ 	if (!*pos)
+ 		return 0;
+ 
+-	ctx->prepath = sanitize_path(pos);
++	ctx->prepath = cifs_sanitize_prepath(pos, GFP_KERNEL);
+ 	if (!ctx->prepath)
+ 		return -ENOMEM;
+ 
+* Unmerged path fs/cifs/fs_context.h
+* Unmerged path fs/cifs/misc.c
