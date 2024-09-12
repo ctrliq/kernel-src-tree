@@ -14,7 +14,7 @@
 #include <linux/sock_diag.h>
 #include <net/udp.h>
 
-#include <linux/rh_features.h>
+#include <linux/rh_flags.h>
 
 struct bpf_stab {
 	struct bpf_map map;
@@ -68,7 +68,7 @@ int sock_map_get_from_fd(const union bpf_attr *attr, struct bpf_prog *prog)
 	struct fd f;
 	int ret;
 
-	rh_mark_used_feature("eBPF/sockmap");
+	rh_add_flag("eBPF/sockmap");
 
 	if (attr->attach_flags || attr->replace_bpf_fd)
 		return -EINVAL;

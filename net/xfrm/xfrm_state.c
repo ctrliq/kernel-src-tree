@@ -165,13 +165,13 @@ static void xfrm_hash_resize(struct work_struct *work)
 
 	osrc = xfrm_state_deref_prot(net->xfrm.state_bysrc, net);
 	ospi = xfrm_state_deref_prot(net->xfrm.state_byspi, net);
-	oseq = xfrm_state_deref_prot(net->xfrm.state_byseq, net);
+	oseq = xfrm_state_deref_prot(net->xfrm_state_byseq, net);
 	ohashmask = net->xfrm.state_hmask;
 
 	rcu_assign_pointer(net->xfrm.state_bydst, ndst);
 	rcu_assign_pointer(net->xfrm.state_bysrc, nsrc);
 	rcu_assign_pointer(net->xfrm.state_byspi, nspi);
-	rcu_assign_pointer(net->xfrm.state_byseq, nseq);
+	rcu_assign_pointer(net->xfrm_state_byseq, nseq);
 	net->xfrm.state_hmask = nhashmask;
 
 	write_seqcount_end(&net->xfrm_state_hash_generation);
@@ -1043,7 +1043,7 @@ found:
 			}
 			if (x->km.seq) {
 				h = xfrm_seq_hash(net, x->km.seq);
-				hlist_add_head_rcu(&x->byseq, net->xfrm.state_byseq + h);
+				hlist_add_head_rcu(&x->byseq, net->xfrm_state_byseq + h);
 			}
 			x->lft.hard_add_expires_seconds = net->xfrm.sysctl_acq_expires;
 			hrtimer_start(&x->mtimer,
@@ -1163,7 +1163,7 @@ static void __xfrm_state_insert(struct xfrm_state *x)
 	if (x->km.seq) {
 		h = xfrm_seq_hash(net, x->km.seq);
 
-		hlist_add_head_rcu(&x->byseq, net->xfrm.state_byseq + h);
+		hlist_add_head_rcu(&x->byseq, net->xfrm_state_byseq + h);
 	}
 
 	hrtimer_start(&x->mtimer, ktime_set(1, 0), HRTIMER_MODE_REL_SOFT);
@@ -1763,7 +1763,7 @@ static struct xfrm_state *__xfrm_find_acq_byseq(struct net *net, u32 mark, u32 s
 	unsigned int h = xfrm_seq_hash(net, seq);
 	struct xfrm_state *x;
 
-	hlist_for_each_entry_rcu(x, net->xfrm.state_byseq + h, byseq) {
+	hlist_for_each_entry_rcu(x, net->xfrm_state_byseq + h, byseq) {
 		if (x->km.seq == seq &&
 		    (mark & x->mark.m) == x->mark.v &&
 		    x->km.state == XFRM_STATE_ACQ) {
@@ -2434,8 +2434,8 @@ int __net_init xfrm_state_init(struct net *net)
 	net->xfrm.state_byspi = xfrm_hash_alloc(sz);
 	if (!net->xfrm.state_byspi)
 		goto out_byspi;
-	net->xfrm.state_byseq = xfrm_hash_alloc(sz);
-	if (!net->xfrm.state_byseq)
+	net->xfrm_state_byseq = xfrm_hash_alloc(sz);
+	if (!net->xfrm_state_byseq)
 		goto out_byseq;
 	net->xfrm.state_hmask = ((sz / sizeof(struct hlist_head)) - 1);
 
@@ -2467,8 +2467,8 @@ void xfrm_state_fini(struct net *net)
 	WARN_ON(!list_empty(&net->xfrm.state_all));
 
 	sz = (net->xfrm.state_hmask + 1) * sizeof(struct hlist_head);
-	WARN_ON(!hlist_empty(net->xfrm.state_byseq));
-	xfrm_hash_free(net->xfrm.state_byseq, sz);
+	WARN_ON(!hlist_empty(net->xfrm_state_byseq));
+	xfrm_hash_free(net->xfrm_state_byseq, sz);
 	WARN_ON(!hlist_empty(net->xfrm.state_byspi));
 	xfrm_hash_free(net->xfrm.state_byspi, sz);
 	WARN_ON(!hlist_empty(net->xfrm.state_bysrc));

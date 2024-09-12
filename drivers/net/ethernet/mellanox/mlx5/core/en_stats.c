@@ -34,6 +34,7 @@
 #include "en.h"
 #include "en_accel/tls.h"
 #include "en_accel/en_accel.h"
+#include "en/ptp.h"
 
 static unsigned int stats_grps_num(struct mlx5e_priv *priv)
 {
@@ -403,13 +404,21 @@ static void mlx5e_stats_grp_sw_update_stats_ptp(struct mlx5e_priv *priv,
 {
 	int i;
 
-	if (!priv->port_ptp_opened)
+	if (!priv->tx_ptp_opened && !priv->rx_ptp_opened)
 		return;
 
-	mlx5e_stats_grp_sw_update_stats_ch_stats(s, &priv->port_ptp_stats.ch);
+	mlx5e_stats_grp_sw_update_stats_ch_stats(s, &priv->ptp_stats.ch);
 
-	for (i = 0; i < priv->max_opened_tc; i++) {
-		mlx5e_stats_grp_sw_update_stats_sq(s, &priv->port_ptp_stats.sq[i]);
+	if (priv->tx_ptp_opened) {
+		for (i = 0; i < priv->max_opened_tc; i++) {
+			mlx5e_stats_grp_sw_update_stats_sq(s, &priv->ptp_stats.sq[i]);
+
+			/* https://gcc.gnu.org/bugzilla/show_bug.cgi?id=92657 */
+			barrier();
+		}
+	}
+	if (priv->rx_ptp_opened) {
+		mlx5e_stats_grp_sw_update_stats_rq_stats(s, &priv->ptp_stats.rq);
 
 		/* https://gcc.gnu.org/bugzilla/show_bug.cgi?id=92657 */
 		barrier();
@@ -442,7 +451,7 @@ static MLX5E_DECLARE_STATS_GRP_OP_UPDATE_STATS(sw)
 
 	memset(s, 0, sizeof(*s));
 
-	for (i = 0; i < priv->max_nch; i++) {
+	for (i = 0; i < priv->stats_nch; i++) {
 		struct mlx5e_channel_stats *channel_stats =
 			&priv->channel_stats[i];
 		int j;
@@ -1907,6 +1916,38 @@ static const struct counter_desc ptp_cq_stats_desc[] = {
 	{ MLX5E_DECLARE_PTP_CQ_STAT(struct mlx5e_ptp_cq_stats, abort_abs_diff_ns) },
 };
 
+static const struct counter_desc ptp_rq_stats_desc[] = {
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, packets) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, bytes) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, csum_complete) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, csum_complete_tail) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, csum_complete_tail_slow) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, csum_unnecessary) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, csum_unnecessary_inner) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, csum_none) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, xdp_drop) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, xdp_redirect) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, lro_packets) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, lro_bytes) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, ecn_mark) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, removed_vlan_packets) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, wqe_err) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, mpwqe_filler_cqes) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, mpwqe_filler_strides) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, oversize_pkts_sw_drop) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, buff_alloc_err) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, cqe_compress_blks) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, cqe_compress_pkts) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, cache_reuse) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, cache_full) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, cache_empty) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, cache_busy) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, cache_waive) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, congst_umr) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, arfs_err) },
+	{ MLX5E_DECLARE_PTP_RQ_STAT(struct mlx5e_rq_stats, recover) },
+};
+
 static const struct counter_desc qos_sq_stats_desc[] = {
 	{ MLX5E_DECLARE_QOS_TX_STAT(struct mlx5e_sq_stats, packets) },
 	{ MLX5E_DECLARE_QOS_TX_STAT(struct mlx5e_sq_stats, bytes) },
@@ -1951,6 +1992,7 @@ static const struct counter_desc qos_sq_stats_desc[] = {
 #define NUM_PTP_SQ_STATS		ARRAY_SIZE(ptp_sq_stats_desc)
 #define NUM_PTP_CH_STATS		ARRAY_SIZE(ptp_ch_stats_desc)
 #define NUM_PTP_CQ_STATS		ARRAY_SIZE(ptp_cq_stats_desc)
+#define NUM_PTP_RQ_STATS                ARRAY_SIZE(ptp_rq_stats_desc)
 #define NUM_QOS_SQ_STATS		ARRAY_SIZE(qos_sq_stats_desc)
 
 static MLX5E_DECLARE_STATS_GRP_OP_NUM_STATS(qos)
@@ -1997,32 +2039,46 @@ static MLX5E_DECLARE_STATS_GRP_OP_UPDATE_STATS(qos) { return; }
 
 static MLX5E_DECLARE_STATS_GRP_OP_NUM_STATS(ptp)
 {
-	return priv->port_ptp_opened ?
-	       NUM_PTP_CH_STATS +
-	       ((NUM_PTP_SQ_STATS + NUM_PTP_CQ_STATS) * priv->max_opened_tc) :
-	       0;
+	int num = NUM_PTP_CH_STATS;
+
+	if (!priv->tx_ptp_opened && !priv->rx_ptp_opened)
+		return 0;
+
+	if (priv->tx_ptp_opened)
+		num += (NUM_PTP_SQ_STATS + NUM_PTP_CQ_STATS) * priv->max_opened_tc;
+	if (priv->rx_ptp_opened)
+		num += NUM_PTP_RQ_STATS;
+
+	return num;
 }
 
 static MLX5E_DECLARE_STATS_GRP_OP_FILL_STRS(ptp)
 {
 	int i, tc;
 
-	if (!priv->port_ptp_opened)
+	if (!priv->tx_ptp_opened && !priv->rx_ptp_opened)
 		return idx;
 
 	for (i = 0; i < NUM_PTP_CH_STATS; i++)
 		sprintf(data + (idx++) * ETH_GSTRING_LEN,
-			ptp_ch_stats_desc[i].format);
+			"%s", ptp_ch_stats_desc[i].format);
 
-	for (tc = 0; tc < priv->max_opened_tc; tc++)
-		for (i = 0; i < NUM_PTP_SQ_STATS; i++)
-			sprintf(data + (idx++) * ETH_GSTRING_LEN,
-				ptp_sq_stats_desc[i].format, tc);
+	if (priv->tx_ptp_opened) {
+		for (tc = 0; tc < priv->max_opened_tc; tc++)
+			for (i = 0; i < NUM_PTP_SQ_STATS; i++)
+				sprintf(data + (idx++) * ETH_GSTRING_LEN,
+					ptp_sq_stats_desc[i].format, tc);
 
-	for (tc = 0; tc < priv->max_opened_tc; tc++)
-		for (i = 0; i < NUM_PTP_CQ_STATS; i++)
+		for (tc = 0; tc < priv->max_opened_tc; tc++)
+			for (i = 0; i < NUM_PTP_CQ_STATS; i++)
+				sprintf(data + (idx++) * ETH_GSTRING_LEN,
+					ptp_cq_stats_desc[i].format, tc);
+	}
+	if (priv->rx_ptp_opened) {
+		for (i = 0; i < NUM_PTP_RQ_STATS; i++)
 			sprintf(data + (idx++) * ETH_GSTRING_LEN,
-				ptp_cq_stats_desc[i].format, tc);
+				ptp_rq_stats_desc[i].format, MLX5E_PTP_CHANNEL_IX);
+	}
 	return idx;
 }
 
@@ -2030,26 +2086,33 @@ static MLX5E_DECLARE_STATS_GRP_OP_FILL_STATS(ptp)
 {
 	int i, tc;
 
-	if (!priv->port_ptp_opened)
+	if (!priv->tx_ptp_opened && !priv->rx_ptp_opened)
 		return idx;
 
 	for (i = 0; i < NUM_PTP_CH_STATS; i++)
 		data[idx++] =
-			MLX5E_READ_CTR64_CPU(&priv->port_ptp_stats.ch,
+			MLX5E_READ_CTR64_CPU(&priv->ptp_stats.ch,
 					     ptp_ch_stats_desc, i);
 
-	for (tc = 0; tc < priv->max_opened_tc; tc++)
-		for (i = 0; i < NUM_PTP_SQ_STATS; i++)
-			data[idx++] =
-				MLX5E_READ_CTR64_CPU(&priv->port_ptp_stats.sq[tc],
-						     ptp_sq_stats_desc, i);
+	if (priv->tx_ptp_opened) {
+		for (tc = 0; tc < priv->max_opened_tc; tc++)
+			for (i = 0; i < NUM_PTP_SQ_STATS; i++)
+				data[idx++] =
+					MLX5E_READ_CTR64_CPU(&priv->ptp_stats.sq[tc],
+							     ptp_sq_stats_desc, i);
 
-	for (tc = 0; tc < priv->max_opened_tc; tc++)
-		for (i = 0; i < NUM_PTP_CQ_STATS; i++)
+		for (tc = 0; tc < priv->max_opened_tc; tc++)
+			for (i = 0; i < NUM_PTP_CQ_STATS; i++)
+				data[idx++] =
+					MLX5E_READ_CTR64_CPU(&priv->ptp_stats.cq[tc],
+							     ptp_cq_stats_desc, i);
+	}
+	if (priv->rx_ptp_opened) {
+		for (i = 0; i < NUM_PTP_RQ_STATS; i++)
 			data[idx++] =
-				MLX5E_READ_CTR64_CPU(&priv->port_ptp_stats.cq[tc],
-						     ptp_cq_stats_desc, i);
-
+				MLX5E_READ_CTR64_CPU(&priv->ptp_stats.rq,
+						     ptp_rq_stats_desc, i);
+	}
 	return idx;
 }
 
@@ -2057,7 +2120,7 @@ static MLX5E_DECLARE_STATS_GRP_OP_UPDATE_STATS(ptp) { return; }
 
 static MLX5E_DECLARE_STATS_GRP_OP_NUM_STATS(channels)
 {
-	int max_nch = priv->max_nch;
+	int max_nch = priv->stats_nch;
 
 	return (NUM_RQ_STATS * max_nch) +
 	       (NUM_CH_STATS * max_nch) +
@@ -2071,7 +2134,7 @@ static MLX5E_DECLARE_STATS_GRP_OP_NUM_STATS(channels)
 static MLX5E_DECLARE_STATS_GRP_OP_FILL_STRS(channels)
 {
 	bool is_xsk = priv->xsk.ever_used;
-	int max_nch = priv->max_nch;
+	int max_nch = priv->stats_nch;
 	int i, j, tc;
 
 	for (i = 0; i < max_nch; i++)
@@ -2113,7 +2176,7 @@ static MLX5E_DECLARE_STATS_GRP_OP_FILL_STRS(channels)
 static MLX5E_DECLARE_STATS_GRP_OP_FILL_STATS(channels)
 {
 	bool is_xsk = priv->xsk.ever_used;
-	int max_nch = priv->max_nch;
+	int max_nch = priv->stats_nch;
 	int i, j, tc;
 
 	for (i = 0; i < max_nch; i++)

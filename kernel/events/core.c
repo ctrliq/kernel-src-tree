@@ -57,7 +57,7 @@
 
 #include <asm/irq_regs.h>
 
-#include <linux/rh_features.h>
+#include <linux/rh_flags.h>
 
 typedef int (*remote_function_f)(void *);
 
@@ -9981,7 +9981,7 @@ static int perf_event_set_bpf_prog(struct perf_event *event, u32 prog_fd)
 	struct bpf_prog *prog;
 	int ret;
 
-	rh_mark_used_feature("eBPF/event");
+	rh_add_flag("eBPF/event");
 
 	if (!perf_event_is_tracing(event))
 		return perf_event_set_bpf_handler(event, prog_fd);

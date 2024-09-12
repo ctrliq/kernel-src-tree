@@ -1627,6 +1627,17 @@ static int fw_devlink_create_devlink(struct device *con,
 	sup_dev = get_dev_from_fwnode(sup_handle);
 	if (sup_dev) {
 		/*
+		 * If it's one of those drivers that don't actually bind to
+		 * their device using driver core, then don't wait on this
+		 * supplier device indefinitely.
+		 */
+		if (sup_dev->links.status == DL_DEV_NO_DRIVER &&
+		    sup_handle->flags & FWNODE_FLAG_INITIALIZED) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		/*
 		 * If this fails, it is due to cycles in device links.  Just
 		 * give up on this link and treat it as invalid.
 		 */
@@ -1644,6 +1655,10 @@ static int fw_devlink_create_devlink(struct device *con,
 
 		goto out;
 	}
+
+	/* Supplier that's already initialized without a struct device. */
+	if (sup_handle->flags & FWNODE_FLAG_INITIALIZED)
+		return -EINVAL;
 
 	/*
 	 * DL_FLAG_SYNC_STATE_ONLY doesn't block probing and supports
@@ -4471,6 +4486,8 @@ define_dev_printk_level(_dev_info, KERN_INFO);
  * This helper implements common pattern present in probe functions for error
  * checking: print debug or error message depending if the error value is
  * -EPROBE_DEFER and propagate error upwards.
+ * In case of -EPROBE_DEFER it sets also defer probe reason, which can be
+ * checked later by reading devices_deferred debugfs attribute.
  * It replaces code sequence:
  * 	if (err != -EPROBE_DEFER)
  * 		dev_err(dev, ...);
@@ -4492,10 +4509,12 @@ int dev_err_probe(const struct device *dev, int err, const char *fmt, ...)
 	vaf.fmt = fmt;
 	vaf.va = &args;
 
-	if (err != -EPROBE_DEFER)
+	if (err != -EPROBE_DEFER) {
 		dev_err(dev, "error %pe: %pV", ERR_PTR(err), &vaf);
-	else
+	} else {
+		device_set_deferred_probe_reason(dev, &vaf);
 		dev_dbg(dev, "error %pe: %pV", ERR_PTR(err), &vaf);
+	}
 
 	va_end(args);
 

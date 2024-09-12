@@ -413,6 +413,10 @@ struct snd_sof_dsp_ops sof_imx8_ops = {
 	.block_read	= sof_block_read,
 	.block_write	= sof_block_write,
 
+	/* Mailbox IO */
+	.mailbox_read	= sof_mailbox_read,
+	.mailbox_write	= sof_mailbox_write,
+
 	/* ipc */
 	.send_msg	= imx8_send_msg,
 	.fw_ready	= sof_fw_ready,
@@ -437,7 +441,7 @@ struct snd_sof_dsp_ops sof_imx8_ops = {
 	.pcm_close = sof_stream_pcm_close,
 
 	/* Firmware ops */
-	.arch_ops = &sof_xtensa_arch_ops,
+	.dsp_arch_ops = &sof_xtensa_arch_ops,
 
 	/* DAI drivers */
 	.drv = imx8_dai,
@@ -464,6 +468,10 @@ struct snd_sof_dsp_ops sof_imx8x_ops = {
 	.block_read	= sof_block_read,
 	.block_write	= sof_block_write,
 
+	/* Mailbox IO */
+	.mailbox_read	= sof_mailbox_read,
+	.mailbox_write	= sof_mailbox_write,
+
 	/* ipc */
 	.send_msg	= imx8_send_msg,
 	.fw_ready	= sof_fw_ready,
@@ -488,7 +496,7 @@ struct snd_sof_dsp_ops sof_imx8x_ops = {
 	.pcm_close = sof_stream_pcm_close,
 
 	/* Firmware ops */
-	.arch_ops = &sof_xtensa_arch_ops,
+	.dsp_arch_ops = &sof_xtensa_arch_ops,
 
 	/* DAI drivers */
 	.drv = imx8_dai,
@@ -503,5 +511,4 @@ struct snd_sof_dsp_ops sof_imx8x_ops = {
 };
 EXPORT_SYMBOL(sof_imx8x_ops);
 
-MODULE_IMPORT_NS(SND_SOC_SOF_XTENSA);
 MODULE_LICENSE("Dual BSD/GPL");

@@ -81,7 +81,7 @@
 #include <linux/btf_ids.h>
 #include <net/tls.h>
 
-#include <linux/rh_features.h>
+#include <linux/rh_flags.h>
 
 static const struct bpf_func_proto *
 bpf_sk_base_func_proto(enum bpf_func_id func_id);
@@ -1582,7 +1582,7 @@ int sk_attach_bpf(u32 ufd, struct sock *sk)
 	if (IS_ERR(prog))
 		return PTR_ERR(prog);
 
-	rh_mark_used_feature("eBPF/sock");
+	rh_add_flag("eBPF/sock");
 
 	err = __sk_attach_prog(prog, sk);
 	if (err < 0) {
@@ -1607,7 +1607,7 @@ int sk_reuseport_attach_bpf(u32 ufd, struct sock *sk)
 	if (IS_ERR(prog))
 		return PTR_ERR(prog);
 
-	rh_mark_used_feature("eBPF/reuseport");
+	rh_add_flag("eBPF/reuseport");
 
 	if (prog->type == BPF_PROG_TYPE_SK_REUSEPORT) {
 		/* Like other non BPF_PROG_TYPE_SOCKET_FILTER

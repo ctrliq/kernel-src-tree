@@ -1038,7 +1038,7 @@ enum {
 struct mlx5_mkey_seg {
 	/* This is a two bit field occupying bits 31-30.
 	 * bit 31 is always 0,
-	 * bit 30 is zero for regular MRs and 1 (e.g free) for UMRs that do not have tanslation
+	 * bit 30 is zero for regular MRs and 1 (e.g free) for UMRs that do not have translation
 	 */
 	u8		status;
 	u8		pcie_control;
@@ -1145,6 +1145,8 @@ enum mlx5_flex_parser_protos {
 	MLX5_FLEX_PROTO_GENEVE	      = 1 << 3,
 	MLX5_FLEX_PROTO_CW_MPLS_GRE   = 1 << 4,
 	MLX5_FLEX_PROTO_CW_MPLS_UDP   = 1 << 5,
+	MLX5_FLEX_PROTO_ICMP	      = 1 << 8,
+	MLX5_FLEX_PROTO_ICMPV6	      = 1 << 9,
 };
 
 /* MLX5 DEV CAPs */

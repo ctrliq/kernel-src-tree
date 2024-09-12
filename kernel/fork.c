@@ -1077,14 +1077,17 @@ fail_nopgd:
 struct mm_struct *mm_alloc(void)
 {
 	struct mm_struct *mm;
+	off_t mm_rh_offset = sizeof(struct mm_struct) + cpumask_size();
 
 	mm = allocate_mm();
 	if (!mm)
 		return NULL;
 
 	memset(mm, 0, sizeof(*mm));
-	mm->mm_rh = (struct mm_struct_rh *)((unsigned long)mm + sizeof(struct mm_struct) +
-					    cpumask_size());
+	memset((void *)((unsigned long) mm + mm_rh_offset),
+	       0, sizeof(struct mm_struct_rh));
+	mm->mm_rh = (struct mm_struct_rh *)((unsigned long) mm + mm_rh_offset);
+
 	return mm_init(mm, current, current_user_ns());
 }
 
@@ -1349,6 +1352,22 @@ void exec_mm_release(struct task_struct *tsk, struct mm_struct *mm)
 	mm_release(tsk, mm);
 }
 
+/*
+ * RHEL: dup_mm_rh() copies the mm_struct_rh extra area at the bottom of
+ * the oldmm slab object over to the newly allocated mm struct,
+ * and resets mm->mm_rh accordingly.
+ */
+void dup_mm_rh(struct mm_struct *mm, struct mm_struct *oldmm)
+{
+	off_t mm_rh_offset = sizeof(struct mm_struct) + cpumask_size();
+
+	memcpy((void *)((unsigned long) mm + mm_rh_offset),
+	       (void *)((unsigned long) oldmm + mm_rh_offset),
+	       sizeof(struct mm_struct_rh));
+
+	mm->mm_rh = (struct mm_struct_rh *)((unsigned long) mm + mm_rh_offset);
+}
+
 /**
  * dup_mm() - duplicates an existing mm structure
  * @tsk: the task_struct with which the new mm will be associated.
@@ -1370,6 +1389,7 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
 		goto fail_nomem;
 
 	memcpy(mm, oldmm, sizeof(*mm));
+	dup_mm_rh(mm, oldmm);
 
 	if (!mm_init(mm, tsk, mm->user_ns))
 		goto fail_nomem;

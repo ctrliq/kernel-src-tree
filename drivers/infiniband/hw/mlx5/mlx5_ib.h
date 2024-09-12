@@ -548,6 +548,7 @@ static inline const struct mlx5_umr_wr *umr_wr(const struct ib_send_wr *wr)
 
 enum mlx5_ib_cq_pr_flags {
 	MLX5_IB_CQ_PR_FLAGS_CQE_128_PAD	= 1 << 0,
+	MLX5_IB_CQ_PR_FLAGS_REAL_TIME_TS = 1 << 1,
 };
 
 struct mlx5_ib_cq {
@@ -1059,6 +1060,7 @@ struct mlx5_ib_dev {
 	struct mutex			slow_path_mutex;
 	struct ib_odp_caps	odp_caps;
 	u64			odp_max_size;
+	struct mutex		odp_eq_mutex;
 	struct mlx5_ib_pf_eq	odp_pf_eq;
 
 	struct xarray		odp_mkeys;
@@ -1254,7 +1256,7 @@ struct mlx5_ib_mr *mlx5_ib_alloc_implicit_mr(struct mlx5_ib_pd *pd,
 					     struct ib_udata *udata,
 					     int access_flags);
 void mlx5_ib_free_implicit_mr(struct mlx5_ib_mr *mr);
-void mlx5_ib_fence_odp_mr(struct mlx5_ib_mr *mr);
+void mlx5_ib_free_odp_mr(struct mlx5_ib_mr *mr);
 struct ib_mr *mlx5_ib_rereg_user_mr(struct ib_mr *ib_mr, int flags, u64 start,
 				    u64 length, u64 virt_addr, int access_flags,
 				    struct ib_pd *pd, struct ib_udata *udata);
@@ -1302,8 +1304,6 @@ int mlx5_mr_cache_cleanup(struct mlx5_ib_dev *dev);
 
 struct mlx5_ib_mr *mlx5_mr_cache_alloc(struct mlx5_ib_dev *dev,
 				       unsigned int entry, int access_flags);
-void mlx5_mr_cache_free(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr);
-int mlx5_mr_cache_invalidate(struct mlx5_ib_mr *mr);
 
 int mlx5_ib_check_mr_status(struct ib_mr *ibmr, u32 check_mask,
 			    struct ib_mr_status *mr_status);
@@ -1322,8 +1322,8 @@ struct ib_mr *mlx5_ib_reg_dm_mr(struct ib_pd *pd, struct ib_dm *dm,
 				struct uverbs_attr_bundle *attrs);
 
 #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
-void mlx5_ib_internal_fill_odp_caps(struct mlx5_ib_dev *dev);
 int mlx5_ib_odp_init_one(struct mlx5_ib_dev *ibdev);
+int mlx5r_odp_create_eq(struct mlx5_ib_dev *dev, struct mlx5_ib_pf_eq *eq);
 void mlx5_ib_odp_cleanup_one(struct mlx5_ib_dev *ibdev);
 int __init mlx5_ib_odp_init(void);
 void mlx5_ib_odp_cleanup(void);
@@ -1337,12 +1337,12 @@ int mlx5_ib_advise_mr_prefetch(struct ib_pd *pd,
 			       enum ib_uverbs_advise_mr_advice advice,
 			       u32 flags, struct ib_sge *sg_list, u32 num_sge);
 #else /* CONFIG_INFINIBAND_ON_DEMAND_PAGING */
-static inline void mlx5_ib_internal_fill_odp_caps(struct mlx5_ib_dev *dev)
-{
-	return;
-}
-
 static inline int mlx5_ib_odp_init_one(struct mlx5_ib_dev *ibdev) { return 0; }
+static inline int mlx5r_odp_create_eq(struct mlx5_ib_dev *dev,
+				      struct mlx5_ib_pf_eq *eq)
+{
+	return 0;
+}
 static inline void mlx5_ib_odp_cleanup_one(struct mlx5_ib_dev *ibdev) {}
 static inline int mlx5_ib_odp_init(void) { return 0; }
 static inline void mlx5_ib_odp_cleanup(void)				    {}
@@ -1594,5 +1594,11 @@ static inline bool mlx5_ib_lag_should_assign_affinity(struct mlx5_ib_dev *dev)
 	return dev->lag_active ||
 		(MLX5_CAP_GEN(dev->mdev, num_lag_ports) > 1 &&
 		 MLX5_CAP_GEN(dev->mdev, lag_tx_port_affinity));
+}
+
+static inline bool rt_supported(int ts_cap)
+{
+	return ts_cap == MLX5_TIMESTAMP_FORMAT_CAP_REAL_TIME ||
+	       ts_cap == MLX5_TIMESTAMP_FORMAT_CAP_FREE_RUNNING_AND_REAL_TIME;
 }
 #endif /* MLX5_IB_H */

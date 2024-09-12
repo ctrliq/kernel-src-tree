@@ -6,8 +6,8 @@
 
 #define ICE_BYTES_PER_WORD	2
 #define ICE_BYTES_PER_DWORD	4
+#define ICE_CHNL_MAX_TC		16
 
-#include "ice_status.h"
 #include "ice_hw_autogen.h"
 #include "ice_osdep.h"
 #include "ice_controlq.h"
@@ -138,7 +138,9 @@ enum ice_vsi_type {
 	ICE_VSI_PF = 0,
 	ICE_VSI_VF = 1,
 	ICE_VSI_CTRL = 3,	/* equates to ICE_VSI_PF with 1 queue pair */
+	ICE_VSI_CHNL = 4,
 	ICE_VSI_LB = 6,
+	ICE_VSI_SWITCHDEV_CTRL = 7,
 };
 
 struct ice_link_status {
@@ -228,8 +230,8 @@ enum ice_fd_hw_seg {
 	ICE_FD_HW_SEG_MAX,
 };
 
-/* 2 VSI = 1 ICE_VSI_PF + 1 ICE_VSI_CTRL */
-#define ICE_MAX_FDIR_VSI_PER_FILTER	2
+/* 1 ICE_VSI_PF + 1 ICE_VSI_CTRL + ICE_CHNL_MAX_TC */
+#define ICE_MAX_FDIR_VSI_PER_FILTER	(2 + ICE_CHNL_MAX_TC)
 
 struct ice_fd_hw_prof {
 	struct ice_flow_seg_info *fdir_seg[ICE_FD_HW_SEG_MAX];
@@ -277,6 +279,10 @@ struct ice_hw_common_caps {
 #define ICE_NVM_PENDING_NETLIST			BIT(2)
 	bool nvm_unified_update;
 #define ICE_NVM_MGMT_UNIFIED_UPD_SUPPORT	BIT(3)
+	/* PCIe reset avoidance */
+	bool pcie_reset_avoidance;
+	/* Post update reset restriction */
+	bool reset_restrict_support;
 };
 
 /* IEEE 1588 TIME_SYNC specific info */
@@ -590,6 +596,8 @@ struct ice_sched_vsi_info {
 	struct list_head list_entry;
 	u16 max_lanq[ICE_MAX_TRAFFIC_CLASS];
 	u16 max_rdmaq[ICE_MAX_TRAFFIC_CLASS];
+	/* bw_t_info saves VSI BW information */
+	struct ice_bw_type_info bw_t_info[ICE_MAX_TRAFFIC_CLASS];
 };
 
 /* driver defines the policy */
@@ -934,6 +942,8 @@ struct ice_hw {
 	struct mutex rss_locks;	/* protect RSS configuration */
 	struct list_head rss_list_head;
 	struct ice_mbx_snapshot mbx_snapshot;
+	DECLARE_BITMAP(hw_ptype, ICE_FLOW_PTYPE_MAX);
+	u16 io_expander_handle;
 };
 
 /* Statistics collected by each port, VSI, VEB, and S-channel */

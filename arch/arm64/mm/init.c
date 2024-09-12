@@ -480,10 +480,12 @@ void __init bootmem_init(void)
 
 	max_pfn = max_low_pfn = max;
 
-	arm64_numa_init();
+	arch_numa_init();
 	/*
 	 * Sparsemem tries to allocate bootmem in memory_present(), so must be
 	 * done after the fixed reservations.
+	 * initialize node_online_map that gets used in hugetlb_cma_reserve()
+	 * while allocating required CMA size across online nodes.
 	 */
 	arm64_memory_present();
 

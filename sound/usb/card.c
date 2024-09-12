@@ -57,8 +57,6 @@
 MODULE_AUTHOR("Takashi Iwai <tiwai@suse.de>");
 MODULE_DESCRIPTION("USB Audio");
 MODULE_LICENSE("GPL");
-MODULE_SUPPORTED_DEVICE("{{Generic,USB Audio}}");
-
 
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;	/* Index 0-MAX */
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;	/* ID for this card */
@@ -69,6 +67,7 @@ static int pid[SNDRV_CARDS] = { [0 ... (SNDRV_CARDS-1)] = -1 };
 static int device_setup[SNDRV_CARDS]; /* device parameter for this card */
 static bool ignore_ctl_error;
 static bool autoclock = true;
+static bool lowlatency = true;
 static char *quirk_alias[SNDRV_CARDS];
 static char *delayed_register[SNDRV_CARDS];
 static bool implicit_fb[SNDRV_CARDS];
@@ -94,6 +93,8 @@ MODULE_PARM_DESC(ignore_ctl_error,
 		 "Ignore errors from USB controller for mixer interfaces.");
 module_param(autoclock, bool, 0444);
 MODULE_PARM_DESC(autoclock, "Enable auto-clock selection for UAC2 devices (default: yes).");
+module_param(lowlatency, bool, 0444);
+MODULE_PARM_DESC(lowlatency, "Enable low latency playback (default: yes).");
 module_param_array(quirk_alias, charp, NULL, 0444);
 MODULE_PARM_DESC(quirk_alias, "Quirk aliases, e.g. 0123abcd:5678beef.");
 module_param_array(delayed_register, charp, NULL, 0444);
@@ -382,6 +383,9 @@ static const struct usb_audio_device_name usb_audio_names[] = {
 
 	DEVICE_NAME(0x046d, 0x0990, "Logitech, Inc.", "QuickCam Pro 9000"),
 
+	DEVICE_NAME(0x05e1, 0x0408, "Syntek", "STK1160"),
+	DEVICE_NAME(0x05e1, 0x0480, "Hauppauge", "Woodbury"),
+
 	/* ASUS ROG Strix */
 	PROFILE_NAME(0x0b05, 0x1917,
 		     "Realtek", "ALC1220-VB-DT", "Realtek-ALC1220-VB-Desktop"),
@@ -410,6 +414,8 @@ static const struct usb_audio_device_name usb_audio_names[] = {
 	PROFILE_NAME(0x0db0, 0x543d,
 		     "Realtek", "ALC1220-VB-DT", "Realtek-ALC1220-VB-Desktop"),
 
+	DEVICE_NAME(0x0fd9, 0x0008, "Hauppauge", "HVR-950Q"),
+
 	/* Stanton/N2IT Final Scratch v1 device ('Scratchamp') */
 	DEVICE_NAME(0x103d, 0x0100, "Stanton", "ScratchAmp"),
 	DEVICE_NAME(0x103d, 0x0101, "Stanton", "ScratchAmp"),
@@ -427,6 +433,22 @@ static const struct usb_audio_device_name usb_audio_names[] = {
 	/* Asrock TRX40 Creator */
 	PROFILE_NAME(0x26ce, 0x0a01,
 		     "Realtek", "ALC1220-VB-DT", "Realtek-ALC1220-VB-Desktop"),
+
+	DEVICE_NAME(0x2040, 0x7200, "Hauppauge", "HVR-950Q"),
+	DEVICE_NAME(0x2040, 0x7201, "Hauppauge", "HVR-950Q-MXL"),
+	DEVICE_NAME(0x2040, 0x7210, "Hauppauge", "HVR-950Q"),
+	DEVICE_NAME(0x2040, 0x7211, "Hauppauge", "HVR-950Q-MXL"),
+	DEVICE_NAME(0x2040, 0x7213, "Hauppauge", "HVR-950Q"),
+	DEVICE_NAME(0x2040, 0x7217, "Hauppauge", "HVR-950Q"),
+	DEVICE_NAME(0x2040, 0x721b, "Hauppauge", "HVR-950Q"),
+	DEVICE_NAME(0x2040, 0x721e, "Hauppauge", "HVR-950Q"),
+	DEVICE_NAME(0x2040, 0x721f, "Hauppauge", "HVR-950Q"),
+	DEVICE_NAME(0x2040, 0x7240, "Hauppauge", "HVR-850"),
+	DEVICE_NAME(0x2040, 0x7260, "Hauppauge", "HVR-950Q"),
+	DEVICE_NAME(0x2040, 0x7270, "Hauppauge", "HVR-950Q"),
+	DEVICE_NAME(0x2040, 0x7280, "Hauppauge", "HVR-950Q"),
+	DEVICE_NAME(0x2040, 0x7281, "Hauppauge", "HVR-950Q-MXL"),
+	DEVICE_NAME(0x2040, 0x8200, "Hauppauge", "Woodbury"),
 
 	{ } /* terminator */
 };
@@ -603,6 +625,7 @@ static int snd_usb_audio_create(struct usb_interface *intf,
 	chip->setup = device_setup[idx];
 	chip->generic_implicit_fb = implicit_fb[idx];
 	chip->autoclock = autoclock;
+	chip->lowlatency = lowlatency;
 	atomic_set(&chip->active, 1); /* avoid autopm during probing */
 	atomic_set(&chip->usage_count, 0);
 	atomic_set(&chip->shutdown, 0);
@@ -790,6 +813,12 @@ static int usb_audio_probe(struct usb_interface *intf,
 
 	dev_set_drvdata(&dev->dev, chip);
 
+	if (ignore_ctl_error)
+		chip->quirk_flags |= QUIRK_FLAG_IGNORE_CTL_ERROR;
+
+	if (chip->quirk_flags & QUIRK_FLAG_DISABLE_AUTOSUSPEND)
+		usb_disable_autosuspend(interface_to_usbdev(intf));
+
 	/*
 	 * For devices with more than one control interface, we assume the
 	 * first contains the audio controls. We might need a more specific
@@ -811,7 +840,7 @@ static int usb_audio_probe(struct usb_interface *intf,
 		err = snd_usb_create_streams(chip, ifnum);
 		if (err < 0)
 			goto __error;
-		err = snd_usb_create_mixer(chip, ifnum, ignore_ctl_error);
+		err = snd_usb_create_mixer(chip, ifnum);
 		if (err < 0)
 			goto __error;
 	}
@@ -902,7 +931,7 @@ static void usb_audio_disconnect(struct usb_interface *intf)
 		}
 	}
 
-	if (chip->quirk_type == QUIRK_SETUP_DISABLE_AUTOSUSPEND)
+	if (chip->quirk_flags & QUIRK_FLAG_DISABLE_AUTOSUSPEND)
 		usb_enable_autosuspend(interface_to_usbdev(intf));
 
 	chip->num_interfaces--;

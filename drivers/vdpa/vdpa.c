@@ -14,7 +14,6 @@
 #include <uapi/linux/vdpa.h>
 #include <net/genetlink.h>
 #include <linux/mod_devicetable.h>
-#include <linux/virtio_net.h>
 #include <linux/virtio_ids.h>
 
 static LIST_HEAD(mdev_head);
@@ -396,7 +395,7 @@ static void vdpa_get_config_unlocked(struct vdpa_device *vdev,
 	 * If it does happen we assume a legacy guest.
 	 */
 	if (!vdev->features_valid)
-		vdpa_set_features(vdev, 0);
+		vdpa_set_features(vdev, 0, true);
 	ops->get_config(vdev, offset, buf, len);
 }
 
@@ -505,6 +504,16 @@ static int vdpa_mgmtdev_fill(const struct vdpa_mgmt_dev *mdev, struct sk_buff *m
 		err = -EMSGSIZE;
 		goto msg_err;
 	}
+	if (nla_put_u32(msg, VDPA_ATTR_DEV_MGMTDEV_MAX_VQS,
+			mdev->max_supported_vqs)) {
+		err = -EMSGSIZE;
+		goto msg_err;
+	}
+	if (nla_put_u64_64bit(msg, VDPA_ATTR_DEV_SUPPORTED_FEATURES,
+			      mdev->supported_features, VDPA_ATTR_PAD)) {
+		err = -EMSGSIZE;
+		goto msg_err;
+	}
 
 	genlmsg_end(msg, hdr);
 	return 0;
@@ -571,9 +580,16 @@ out:
 	return msg->len;
 }
 
+#define VDPA_DEV_NET_ATTRS_MASK (BIT_ULL(VDPA_ATTR_DEV_NET_CFG_MACADDR) | \
+				 BIT_ULL(VDPA_ATTR_DEV_NET_CFG_MTU)     | \
+				 BIT_ULL(VDPA_ATTR_DEV_NET_CFG_MAX_VQP))
+
 static int vdpa_nl_cmd_dev_add_set_doit(struct sk_buff *skb, struct genl_info *info)
 {
+	struct vdpa_dev_set_config config = {};
+	struct nlattr **nl_attrs = info->attrs;
 	struct vdpa_mgmt_dev *mdev;
+	const u8 *macaddr;
 	const char *name;
 	int err = 0;
 
@@ -582,6 +598,36 @@ static int vdpa_nl_cmd_dev_add_set_doit(struct sk_buff *skb, struct genl_info *i
 
 	name = nla_data(info->attrs[VDPA_ATTR_DEV_NAME]);
 
+	if (nl_attrs[VDPA_ATTR_DEV_NET_CFG_MACADDR]) {
+		macaddr = nla_data(nl_attrs[VDPA_ATTR_DEV_NET_CFG_MACADDR]);
+		memcpy(config.net.mac, macaddr, sizeof(config.net.mac));
+		config.mask |= BIT_ULL(VDPA_ATTR_DEV_NET_CFG_MACADDR);
+	}
+	if (nl_attrs[VDPA_ATTR_DEV_NET_CFG_MTU]) {
+		config.net.mtu =
+			nla_get_u16(nl_attrs[VDPA_ATTR_DEV_NET_CFG_MTU]);
+		config.mask |= BIT_ULL(VDPA_ATTR_DEV_NET_CFG_MTU);
+	}
+	if (nl_attrs[VDPA_ATTR_DEV_NET_CFG_MAX_VQP]) {
+		config.net.max_vq_pairs =
+			nla_get_u16(nl_attrs[VDPA_ATTR_DEV_NET_CFG_MAX_VQP]);
+		if (!config.net.max_vq_pairs) {
+			NL_SET_ERR_MSG_MOD(info->extack,
+					   "At least one pair of VQs is required");
+			return -EINVAL;
+		}
+		config.mask |= BIT_ULL(VDPA_ATTR_DEV_NET_CFG_MAX_VQP);
+	}
+
+	/* Skip checking capability if user didn't prefer to configure any
+	 * device networking attributes. It is likely that user might have used
+	 * a device specific method to configure such attributes or using device
+	 * default attributes.
+	 */
+	if ((config.mask & VDPA_DEV_NET_ATTRS_MASK) &&
+	    !netlink_capable(skb, CAP_NET_ADMIN))
+		return -EPERM;
+
 	mutex_lock(&vdpa_dev_mutex);
 	mdev = vdpa_mgmtdev_get_from_attr(info->attrs);
 	if (IS_ERR(mdev)) {
@@ -589,8 +635,14 @@ static int vdpa_nl_cmd_dev_add_set_doit(struct sk_buff *skb, struct genl_info *i
 		err = PTR_ERR(mdev);
 		goto err;
 	}
+	if ((config.mask & mdev->config_attr_mask) != config.mask) {
+		NL_SET_ERR_MSG_MOD(info->extack,
+				   "All provided attributes are not supported");
+		err = -EOPNOTSUPP;
+		goto err;
+	}
 
-	err = mdev->ops->dev_add(mdev, name);
+	err = mdev->ops->dev_add(mdev, name, &config);
 err:
 	mutex_unlock(&vdpa_dev_mutex);
 	return err;
@@ -766,7 +818,7 @@ static int vdpa_dev_net_mq_config_fill(struct vdpa_device *vdev,
 {
 	u16 val_u16;
 
-	if ((features & (1ULL << VIRTIO_NET_F_MQ)) == 0)
+	if ((features & BIT_ULL(VIRTIO_NET_F_MQ)) == 0)
 		return 0;
 
 	val_u16 = le16_to_cpu(config->max_virtqueue_pairs);
@@ -793,7 +845,10 @@ static int vdpa_dev_net_config_fill(struct vdpa_device *vdev, struct sk_buff *ms
 	if (nla_put_u16(msg, VDPA_ATTR_DEV_NET_CFG_MTU, val_u16))
 		return -EMSGSIZE;
 
-	features = vdev->config->get_features(vdev);
+	features = vdev->config->get_driver_features(vdev);
+	if (nla_put_u64_64bit(msg, VDPA_ATTR_DEV_NEGOTIATED_FEATURES, features,
+			      VDPA_ATTR_PAD))
+		return -EMSGSIZE;
 
 	return vdpa_dev_net_mq_config_fill(vdev, msg, features, &config);
 }
@@ -940,6 +995,9 @@ static const struct nla_policy vdpa_nl_policy[VDPA_ATTR_MAX + 1] = {
 	[VDPA_ATTR_MGMTDEV_BUS_NAME] = { .type = NLA_NUL_STRING },
 	[VDPA_ATTR_MGMTDEV_DEV_NAME] = { .type = NLA_STRING },
 	[VDPA_ATTR_DEV_NAME] = { .type = NLA_STRING },
+	[VDPA_ATTR_DEV_NET_CFG_MACADDR] = NLA_POLICY_ETH_ADDR,
+	/* virtio spec 1.1 section 5.1.4.1 for valid MTU range */
+	[VDPA_ATTR_DEV_NET_CFG_MTU] = NLA_POLICY_MIN(NLA_U16, 68),
 };
 
 static const struct genl_ops vdpa_nl_ops[] = {

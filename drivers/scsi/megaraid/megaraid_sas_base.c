@@ -180,10 +180,7 @@ static struct pci_device_id megasas_pci_table[] = {
 
 MODULE_DEVICE_TABLE(pci, megasas_pci_table);
 
-/*
- * PCI ID table for all unsupported controllers
- */
-static struct pci_device_id unsupported_ids_table[] = {
+static struct pci_device_id rh_unmaintained_pci_table[] = {
 
 	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS0079GEN2)},
 	/* gen2*/
@@ -191,6 +188,13 @@ static struct pci_device_id unsupported_ids_table[] = {
 	/* skinny*/
 	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS0071SKINNY)},
 	/* skinny*/
+	{}
+};
+
+static struct pci_device_id rh_deprecated_pci_table[] = {
+
+	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_FUSION)},
+	/* Fusion */
 	{}
 };
 
@@ -7400,7 +7404,8 @@ static int megasas_probe_one(struct pci_dev *pdev,
 	struct megasas_instance *instance;
 	u16 control = 0;
 
-	pci_hw_deprecated(unsupported_ids_table, pdev);
+	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
+	pci_hw_unmaintained(rh_unmaintained_pci_table, pdev);
 
 	switch (pdev->device) {
 	case PCI_DEVICE_ID_LSI_AERO_10E0:

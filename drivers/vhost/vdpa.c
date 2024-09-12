@@ -262,7 +262,7 @@ static long vhost_vdpa_get_features(struct vhost_vdpa *v, u64 __user *featurep)
 	const struct vdpa_config_ops *ops = vdpa->config;
 	u64 features;
 
-	features = ops->get_features(vdpa);
+	features = ops->get_device_features(vdpa);
 
 	if (copy_to_user(featurep, &features, sizeof(features)))
 		return -EFAULT;
@@ -286,7 +286,7 @@ static long vhost_vdpa_set_features(struct vhost_vdpa *v, u64 __user *featurep)
 	if (copy_from_user(&features, featurep, sizeof(features)))
 		return -EFAULT;
 
-	if (vdpa_set_features(vdpa, features))
+	if (vdpa_set_features(vdpa, features, false))
 		return -EINVAL;
 
 	return 0;

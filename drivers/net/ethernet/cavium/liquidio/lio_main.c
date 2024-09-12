@@ -907,7 +907,7 @@ liquidio_probe(struct pci_dev *pdev,
 	dev_info(&pdev->dev, "Initializing device %x:%x.\n",
 		 (u32)pdev->vendor, (u32)pdev->device);
 
-	pci_hw_unmaintained(ent, pdev);
+	pci_hw_deprecated(ent, pdev);
 
 	/* Assign octeon_device for this device to the private data area. */
 	pci_set_drvdata(pdev, oct_dev);

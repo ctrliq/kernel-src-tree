@@ -839,6 +839,8 @@ struct mpi3mr_ioc {
  * @send_ack: Event acknowledgment required or not
  * @process_evt: Bottomhalf processing required or not
  * @evt_ctx: Event context to send in Ack
+ * @pending_at_sml: waiting for device add/remove API to complete
+ * @discard: discard this event
  * @ref_count: kref count
  * @event_data: Actual MPI3 event data
  */
@@ -850,6 +852,8 @@ struct mpi3mr_fwevt {
 	bool send_ack;
 	bool process_evt;
 	u32 evt_ctx;
+	bool pending_at_sml;
+	bool discard;
 	struct kref ref_count;
 	char event_data[0] __aligned(4);
 };
@@ -913,5 +917,7 @@ void mpi3mr_flush_host_io(struct mpi3mr_ioc *mrioc);
 void mpi3mr_invalidate_devhandles(struct mpi3mr_ioc *mrioc);
 void mpi3mr_rfresh_tgtdevs(struct mpi3mr_ioc *mrioc);
 void mpi3mr_flush_delayed_rmhs_list(struct mpi3mr_ioc *mrioc);
+int mpi3mr_process_op_reply_q(struct mpi3mr_ioc *mrioc,
+	struct mpi3mr_intr_info *intr_info);
 
 #endif /*MPI3MR_H_INCLUDED*/

@@ -3206,6 +3206,7 @@ static int wm8962_beep_event(struct input_dev *dev, unsigned int type,
 	case SND_BELL:
 		if (hz)
 			hz = 1000;
+		fallthrough;
 	case SND_TONE:
 		break;
 	default:

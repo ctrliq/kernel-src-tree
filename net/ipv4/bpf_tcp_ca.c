@@ -10,7 +10,7 @@
 #include <net/tcp.h>
 #include <net/bpf_sk_storage.h>
 
-#include <linux/rh_features.h>
+#include <linux/rh_flags.h>
 
 static u32 optional_ops[] = {
 	offsetof(struct tcp_congestion_ops, init),
@@ -280,7 +280,7 @@ static int bpf_tcp_ca_check_member(const struct btf_type *t,
 
 static int bpf_tcp_ca_reg(void *kdata)
 {
-	rh_mark_used_feature("eBPF/tcp_congestion_ops");
+	rh_add_flag("eBPF/tcp_congestion_ops");
 	return tcp_register_congestion_control(kdata);
 }
 

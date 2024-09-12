@@ -29,7 +29,6 @@
 MODULE_AUTHOR("Matt Wu <Matt_Wu@acersoftech.com.cn>");
 MODULE_DESCRIPTION("ALI M5451");
 MODULE_LICENSE("GPL");
-MODULE_SUPPORTED_DEVICE("{{ALI,M5451,pci},{ALI,M5451}}");
 
 static int index = SNDRV_DEFAULT_IDX1;	/* Index */
 static char *id = SNDRV_DEFAULT_STR1;	/* ID for this card */
@@ -2027,7 +2026,7 @@ static int snd_ali_create(struct snd_card *card,
 			  int pcm_streams,
 			  int spdif_support)
 {
-	struct snd_ali *codec;
+	struct snd_ali *codec = card->private_data;
 	int i, err;
 	unsigned short cmdw;
 

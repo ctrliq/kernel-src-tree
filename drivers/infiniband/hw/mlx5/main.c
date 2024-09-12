@@ -1825,6 +1825,12 @@ static int set_ucontext_resp(struct ib_ucontext *uctx,
 	if (MLX5_CAP_GEN(dev->mdev, ece_support))
 		resp->comp_mask |= MLX5_IB_ALLOC_UCONTEXT_RESP_MASK_ECE;
 
+	if (rt_supported(MLX5_CAP_GEN(dev->mdev, sq_ts_format)) &&
+	    rt_supported(MLX5_CAP_GEN(dev->mdev, rq_ts_format)) &&
+	    rt_supported(MLX5_CAP_ROCE(dev->mdev, qp_ts_format)))
+		resp->comp_mask |=
+			MLX5_IB_ALLOC_UCONTEXT_RESP_MASK_REAL_TIME_TS;
+
 	resp->num_dyn_bfregs = bfregi->num_dyn_bfregs;
 
 	if (MLX5_CAP_GEN(dev->mdev, drain_sigerr))
@@ -3686,8 +3692,6 @@ static int mlx5_ib_stage_init_init(struct mlx5_ib_dev *dev)
 		dev->port[i].roce.native_port_num = i + 1;
 		dev->port[i].roce.last_port_state = IB_PORT_DOWN;
 	}
-
-	mlx5_ib_internal_fill_odp_caps(dev);
 
 	err = mlx5_ib_init_multiport_master(dev);
 	if (err)

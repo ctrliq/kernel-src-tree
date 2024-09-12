@@ -39,7 +39,7 @@ static void ice_info_get_dsn(struct ice_pf *pf, struct ice_info_ctx *ctx)
 static void ice_info_pba(struct ice_pf *pf, struct ice_info_ctx *ctx)
 {
 	struct ice_hw *hw = &pf->hw;
-	enum ice_status status;
+	int status;
 
 	status = ice_read_pba_string(hw, (u8 *)ctx->buf, sizeof(ctx->buf));
 	if (status)
@@ -251,7 +251,6 @@ static int ice_devlink_info_get(struct devlink *devlink,
 	struct device *dev = ice_pf_to_dev(pf);
 	struct ice_hw *hw = &pf->hw;
 	struct ice_info_ctx *ctx;
-	enum ice_status status;
 	size_t i;
 	int err;
 
@@ -266,20 +265,19 @@ static int ice_devlink_info_get(struct devlink *devlink,
 		return -ENOMEM;
 
 	/* discover capabilities first */
-	status = ice_discover_dev_caps(hw, &ctx->dev_caps);
-	if (status) {
+	err = ice_discover_dev_caps(hw, &ctx->dev_caps);
+	if (err) {
 		dev_dbg(dev, "Failed to discover device capabilities, status %d aq_err %s\n",
-			status, ice_aq_str(hw->adminq.sq_last_status));
+			err, ice_aq_str(hw->adminq.sq_last_status));
 		NL_SET_ERR_MSG_MOD(extack, "Unable to discover device capabilities");
-		err = -EIO;
 		goto out_free_ctx;
 	}
 
 	if (ctx->dev_caps.common_cap.nvm_update_pending_orom) {
-		status = ice_get_inactive_orom_ver(hw, &ctx->pending_orom);
-		if (status) {
+		err = ice_get_inactive_orom_ver(hw, &ctx->pending_orom);
+		if (err) {
 			dev_dbg(dev, "Unable to read inactive Option ROM version data, status %d aq_err %s\n",
-				status, ice_aq_str(hw->adminq.sq_last_status));
+				err, ice_aq_str(hw->adminq.sq_last_status));
 
 			/* disable display of pending Option ROM */
 			ctx->dev_caps.common_cap.nvm_update_pending_orom = false;
@@ -287,10 +285,10 @@ static int ice_devlink_info_get(struct devlink *devlink,
 	}
 
 	if (ctx->dev_caps.common_cap.nvm_update_pending_nvm) {
-		status = ice_get_inactive_nvm_ver(hw, &ctx->pending_nvm);
-		if (status) {
+		err = ice_get_inactive_nvm_ver(hw, &ctx->pending_nvm);
+		if (err) {
 			dev_dbg(dev, "Unable to read inactive NVM version data, status %d aq_err %s\n",
-				status, ice_aq_str(hw->adminq.sq_last_status));
+				err, ice_aq_str(hw->adminq.sq_last_status));
 
 			/* disable display of pending Option ROM */
 			ctx->dev_caps.common_cap.nvm_update_pending_nvm = false;
@@ -298,10 +296,10 @@ static int ice_devlink_info_get(struct devlink *devlink,
 	}
 
 	if (ctx->dev_caps.common_cap.nvm_update_pending_netlist) {
-		status = ice_get_inactive_netlist_ver(hw, &ctx->pending_netlist);
-		if (status) {
+		err = ice_get_inactive_netlist_ver(hw, &ctx->pending_netlist);
+		if (err) {
 			dev_dbg(dev, "Unable to read inactive Netlist version data, status %d aq_err %s\n",
-				status, ice_aq_str(hw->adminq.sq_last_status));
+				err, ice_aq_str(hw->adminq.sq_last_status));
 
 			/* disable display of pending Option ROM */
 			ctx->dev_caps.common_cap.nvm_update_pending_netlist = false;
@@ -373,57 +371,105 @@ out_free_ctx:
 }
 
 /**
- * ice_devlink_flash_update - Update firmware stored in flash on the device
- * @devlink: pointer to devlink associated with device to update
- * @params: flash update parameters
+ * ice_devlink_reload_empr_start - Start EMP reset to activate new firmware
+ * @devlink: pointer to the devlink instance to reload
+ * @netns_change: if true, the network namespace is changing
+ * @action: the action to perform. Must be DEVLINK_RELOAD_ACTION_FW_ACTIVATE
+ * @limit: limits on what reload should do, such as not resetting
  * @extack: netlink extended ACK structure
  *
- * Perform a device flash update. The bulk of the update logic is contained
- * within the ice_flash_pldm_image function.
+ * Allow user to activate new Embedded Management Processor firmware by
+ * issuing device specific EMP reset. Called in response to
+ * a DEVLINK_CMD_RELOAD with the DEVLINK_RELOAD_ACTION_FW_ACTIVATE.
  *
- * Returns: zero on success, or an error code on failure.
+ * Note that teardown and rebuild of the driver state happens automatically as
+ * part of an interrupt and watchdog task. This is because all physical
+ * functions on the device must be able to reset when an EMP reset occurs from
+ * any source.
  */
 static int
-ice_devlink_flash_update(struct devlink *devlink,
-			 struct devlink_flash_update_params *params,
-			 struct netlink_ext_ack *extack)
+ice_devlink_reload_empr_start(struct devlink *devlink, bool netns_change,
+			      enum devlink_reload_action action,
+			      enum devlink_reload_limit limit,
+			      struct netlink_ext_ack *extack)
 {
 	struct ice_pf *pf = devlink_priv(devlink);
+	struct device *dev = ice_pf_to_dev(pf);
 	struct ice_hw *hw = &pf->hw;
-	u8 preservation;
+	u8 pending;
 	int err;
 
-	if (!params->overwrite_mask) {
-		/* preserve all settings and identifiers */
-		preservation = ICE_AQC_NVM_PRESERVE_ALL;
-	} else if (params->overwrite_mask == DEVLINK_FLASH_OVERWRITE_SETTINGS) {
-		/* overwrite settings, but preserve the vital device identifiers */
-		preservation = ICE_AQC_NVM_PRESERVE_SELECTED;
-	} else if (params->overwrite_mask == (DEVLINK_FLASH_OVERWRITE_SETTINGS |
-					      DEVLINK_FLASH_OVERWRITE_IDENTIFIERS)) {
-		/* overwrite both settings and identifiers, preserve nothing */
-		preservation = ICE_AQC_NVM_NO_PRESERVATION;
-	} else {
-		NL_SET_ERR_MSG_MOD(extack, "Requested overwrite mask is not supported");
-		return -EOPNOTSUPP;
-	}
-
-	if (!hw->dev_caps.common_cap.nvm_unified_update) {
-		NL_SET_ERR_MSG_MOD(extack, "Current firmware does not support unified update");
-		return -EOPNOTSUPP;
-	}
-
-	err = ice_check_for_pending_update(pf, NULL, extack);
+	err = ice_get_pending_updates(pf, &pending, extack);
 	if (err)
 		return err;
 
-	devlink_flash_update_status_notify(devlink, "Preparing to flash", NULL, 0, 0);
+	/* pending is a bitmask of which flash banks have a pending update,
+	 * including the main NVM bank, the Option ROM bank, and the netlist
+	 * bank. If any of these bits are set, then there is a pending update
+	 * waiting to be activated.
+	 */
+	if (!pending) {
+		NL_SET_ERR_MSG_MOD(extack, "No pending firmware update");
+		return -ECANCELED;
+	}
 
-	return ice_flash_pldm_image(pf, params->fw, preservation, extack);
+	if (pf->fw_emp_reset_disabled) {
+		NL_SET_ERR_MSG_MOD(extack, "EMP reset is not available. To activate firmware, a reboot or power cycle is needed");
+		return -ECANCELED;
+	}
+
+	dev_dbg(dev, "Issuing device EMP reset to activate firmware\n");
+
+	err = ice_aq_nvm_update_empr(hw);
+	if (err) {
+		dev_err(dev, "Failed to trigger EMP device reset to reload firmware, err %d aq_err %s\n",
+			err, ice_aq_str(hw->adminq.sq_last_status));
+		NL_SET_ERR_MSG_MOD(extack, "Failed to trigger EMP device reset to reload firmware");
+		return err;
+	}
+
+	return 0;
+}
+
+/**
+ * ice_devlink_reload_empr_finish - Wait for EMP reset to finish
+ * @devlink: pointer to the devlink instance reloading
+ * @action: the action requested
+ * @limit: limits imposed by userspace, such as not resetting
+ * @actions_performed: on return, indicate what actions actually performed
+ * @extack: netlink extended ACK structure
+ *
+ * Wait for driver to finish rebuilding after EMP reset is completed. This
+ * includes time to wait for both the actual device reset as well as the time
+ * for the driver's rebuild to complete.
+ */
+static int
+ice_devlink_reload_empr_finish(struct devlink *devlink,
+			       enum devlink_reload_action action,
+			       enum devlink_reload_limit limit,
+			       u32 *actions_performed,
+			       struct netlink_ext_ack *extack)
+{
+	struct ice_pf *pf = devlink_priv(devlink);
+	int err;
+
+	*actions_performed = BIT(DEVLINK_RELOAD_ACTION_FW_ACTIVATE);
+
+	err = ice_wait_for_reset(pf, 60 * HZ);
+	if (err) {
+		NL_SET_ERR_MSG_MOD(extack, "Device still resetting after 1 minute");
+		return err;
+	}
+
+	return 0;
 }
 
 static const struct devlink_ops ice_devlink_ops = {
 	.supported_flash_update_params = DEVLINK_SUPPORT_FLASH_UPDATE_OVERWRITE_MASK,
+	.reload_actions = BIT(DEVLINK_RELOAD_ACTION_FW_ACTIVATE),
+	/* The ice driver currently does not support driver reinit */
+	.reload_down = ice_devlink_reload_empr_start,
+	.reload_up = ice_devlink_reload_empr_finish,
 	.eswitch_mode_get = ice_eswitch_mode_get,
 	.eswitch_mode_set = ice_eswitch_mode_set,
 	.info_get = ice_devlink_info_get,
@@ -585,6 +631,7 @@ void ice_devlink_register(struct ice_pf *pf)
 	struct devlink *devlink = priv_to_devlink(pf);
 	struct device *dev = ice_pf_to_dev(pf);
 	devlink_register(devlink, dev);
+	devlink_reload_enable(devlink);
 }
 
 /**
@@ -595,7 +642,9 @@ void ice_devlink_register(struct ice_pf *pf)
  */
 void ice_devlink_unregister(struct ice_pf *pf)
 {
-	devlink_unregister(priv_to_devlink(pf));
+	struct devlink *devlink = priv_to_devlink(pf);
+	devlink_reload_disable(devlink);
+	devlink_unregister(devlink);
 }
 
 int ice_devlink_register_params(struct ice_pf *pf)
@@ -619,11 +668,15 @@ int ice_devlink_register_params(struct ice_pf *pf)
 					   DEVLINK_PARAM_GENERIC_ID_ENABLE_ROCE,
 					   value);
 
+	devlink_params_publish(devlink);
+
 	return 0;
 }
 
 void ice_devlink_unregister_params(struct ice_pf *pf)
 {
+	devlink_params_unpublish(priv_to_devlink(pf));
+
 	devlink_params_unregister(priv_to_devlink(pf), ice_devlink_params,
 				  ARRAY_SIZE(ice_devlink_params));
 }
@@ -766,9 +819,9 @@ static int ice_devlink_nvm_snapshot(struct devlink *devlink,
 	struct ice_pf *pf = devlink_priv(devlink);
 	struct device *dev = ice_pf_to_dev(pf);
 	struct ice_hw *hw = &pf->hw;
-	enum ice_status status;
 	void *nvm_data;
 	u32 nvm_size;
+	int status;
 
 	nvm_size = hw->flash.flash_size;
 	nvm_data = vzalloc(nvm_size);
@@ -781,7 +834,7 @@ static int ice_devlink_nvm_snapshot(struct devlink *devlink,
 			status, hw->adminq.sq_last_status);
 		NL_SET_ERR_MSG_MOD(extack, "Failed to acquire NVM semaphore");
 		vfree(nvm_data);
-		return -EIO;
+		return status;
 	}
 
 	status = ice_read_flat_nvm(hw, 0, &nvm_size, nvm_data, false);
@@ -791,7 +844,7 @@ static int ice_devlink_nvm_snapshot(struct devlink *devlink,
 		NL_SET_ERR_MSG_MOD(extack, "Failed to read NVM contents");
 		ice_release_nvm(hw);
 		vfree(nvm_data);
-		return -EIO;
+		return status;
 	}
 
 	ice_release_nvm(hw);
@@ -883,8 +936,8 @@ ice_devlink_devcaps_snapshot(struct devlink *devlink,
 	struct ice_pf *pf = devlink_priv(devlink);
 	struct device *dev = ice_pf_to_dev(pf);
 	struct ice_hw *hw = &pf->hw;
-	enum ice_status status;
 	void *devcaps;
+	int status;
 
 	devcaps = vzalloc(ICE_AQ_MAX_BUF_LEN);
 	if (!devcaps)
@@ -897,7 +950,7 @@ ice_devlink_devcaps_snapshot(struct devlink *devlink,
 			status, hw->adminq.sq_last_status);
 		NL_SET_ERR_MSG_MOD(extack, "Failed to read device capabilities");
 		vfree(devcaps);
-		return -EIO;
+		return status;
 	}
 
 	*data = (u8 *)devcaps;
