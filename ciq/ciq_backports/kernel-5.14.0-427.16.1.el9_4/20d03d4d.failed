@@ -1,0 +1,251 @@
+mlxbf_gige: support 10M/100M/1G speeds on BlueField-3
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-427.16.1.el9_4
+commit-author David Thompson <davthompson@nvidia.com>
+commit 20d03d4d9437771a9b6d38d4a6027a70d78d9865
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.16.1.el9_4/20d03d4d.failed
+
+The BlueField-3 OOB interface supports 10Mbps, 100Mbps, and 1Gbps speeds.
+The external PHY is responsible for autonegotiating the speed with the
+link partner. Once the autonegotiation is done, the BlueField PLU needs
+to be configured accordingly.
+
+This patch does two things:
+1) Initialize the advertised control flow/duplex/speed in the probe
+   based on the BlueField SoC generation (2 or 3)
+2) Adjust the PLU speed config in the PHY interrupt handler
+
+	Signed-off-by: David Thompson <davthompson@nvidia.com>
+	Signed-off-by: Asmaa Mnebhi <asmaa@nvidia.com>
+	Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 20d03d4d9437771a9b6d38d4a6027a70d78d9865)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxbf_gige/mlxbf_gige.h
+diff --cc drivers/net/ethernet/mellanox/mlxbf_gige/mlxbf_gige.h
+index 5a1027b07215,a453b9cd9033..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxbf_gige/mlxbf_gige.h
++++ b/drivers/net/ethernet/mellanox/mlxbf_gige/mlxbf_gige.h
+@@@ -67,6 -68,29 +68,32 @@@ struct mlxbf_gige_stats 
+  	u64 rx_filter_discard_pkts;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlxbf_gige_reg_param {
++ 	u32 mask;
++ 	u32 shift;
++ };
++ 
++ struct mlxbf_gige_mdio_gw {
++ 	u32 gw_address;
++ 	u32 read_data_address;
++ 	struct mlxbf_gige_reg_param busy;
++ 	struct mlxbf_gige_reg_param write_data;
++ 	struct mlxbf_gige_reg_param read_data;
++ 	struct mlxbf_gige_reg_param devad;
++ 	struct mlxbf_gige_reg_param partad;
++ 	struct mlxbf_gige_reg_param opcode;
++ 	struct mlxbf_gige_reg_param st1;
++ };
++ 
++ struct mlxbf_gige_link_cfg {
++ 	void (*set_phy_link_mode)(struct phy_device *phydev);
++ 	void (*adjust_link)(struct net_device *netdev);
++ 	phy_interface_t phy_mode;
++ };
++ 
+++>>>>>>> 20d03d4d9437 (mlxbf_gige: support 10M/100M/1G speeds on BlueField-3)
+  struct mlxbf_gige {
+  	void __iomem *base;
+  	void __iomem *llu_base;
+@@@ -102,6 -126,9 +129,12 @@@
+  	u8 valid_polarity;
+  	struct napi_struct napi;
+  	struct mlxbf_gige_stats stats;
+++<<<<<<< HEAD
+++=======
++ 	u8 hw_version;
++ 	struct mlxbf_gige_mdio_gw *mdio_gw;
++ 	int prev_speed;
+++>>>>>>> 20d03d4d9437 (mlxbf_gige: support 10M/100M/1G speeds on BlueField-3)
+  };
+  
+  /* Rx Work Queue Element definitions */
+* Unmerged path drivers/net/ethernet/mellanox/mlxbf_gige/mlxbf_gige.h
+diff --git a/drivers/net/ethernet/mellanox/mlxbf_gige/mlxbf_gige_main.c b/drivers/net/ethernet/mellanox/mlxbf_gige/mlxbf_gige_main.c
+index e3a17a4604d9..576faa538641 100644
+--- a/drivers/net/ethernet/mellanox/mlxbf_gige/mlxbf_gige_main.c
++++ b/drivers/net/ethernet/mellanox/mlxbf_gige/mlxbf_gige_main.c
+@@ -263,13 +263,99 @@ static const struct net_device_ops mlxbf_gige_netdev_ops = {
+ 	.ndo_get_stats64        = mlxbf_gige_get_stats64,
+ };
+ 
+-static void mlxbf_gige_adjust_link(struct net_device *netdev)
++static void mlxbf_gige_bf2_adjust_link(struct net_device *netdev)
+ {
+ 	struct phy_device *phydev = netdev->phydev;
+ 
+ 	phy_print_status(phydev);
+ }
+ 
++static void mlxbf_gige_bf3_adjust_link(struct net_device *netdev)
++{
++	struct mlxbf_gige *priv = netdev_priv(netdev);
++	struct phy_device *phydev = netdev->phydev;
++	u8 sgmii_mode;
++	u16 ipg_size;
++	u32 val;
++
++	if (phydev->link && phydev->speed != priv->prev_speed) {
++		switch (phydev->speed) {
++		case 1000:
++			ipg_size = MLXBF_GIGE_1G_IPG_SIZE;
++			sgmii_mode = MLXBF_GIGE_1G_SGMII_MODE;
++			break;
++		case 100:
++			ipg_size = MLXBF_GIGE_100M_IPG_SIZE;
++			sgmii_mode = MLXBF_GIGE_100M_SGMII_MODE;
++			break;
++		case 10:
++			ipg_size = MLXBF_GIGE_10M_IPG_SIZE;
++			sgmii_mode = MLXBF_GIGE_10M_SGMII_MODE;
++			break;
++		default:
++			return;
++		}
++
++		val = readl(priv->plu_base + MLXBF_GIGE_PLU_TX_REG0);
++		val &= ~(MLXBF_GIGE_PLU_TX_IPG_SIZE_MASK | MLXBF_GIGE_PLU_TX_SGMII_MODE_MASK);
++		val |= FIELD_PREP(MLXBF_GIGE_PLU_TX_IPG_SIZE_MASK, ipg_size);
++		val |= FIELD_PREP(MLXBF_GIGE_PLU_TX_SGMII_MODE_MASK, sgmii_mode);
++		writel(val, priv->plu_base + MLXBF_GIGE_PLU_TX_REG0);
++
++		val = readl(priv->plu_base + MLXBF_GIGE_PLU_RX_REG0);
++		val &= ~MLXBF_GIGE_PLU_RX_SGMII_MODE_MASK;
++		val |= FIELD_PREP(MLXBF_GIGE_PLU_RX_SGMII_MODE_MASK, sgmii_mode);
++		writel(val, priv->plu_base + MLXBF_GIGE_PLU_RX_REG0);
++
++		priv->prev_speed = phydev->speed;
++	}
++
++	phy_print_status(phydev);
++}
++
++static void mlxbf_gige_bf2_set_phy_link_mode(struct phy_device *phydev)
++{
++	/* MAC only supports 1000T full duplex mode */
++	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_1000baseT_Half_BIT);
++	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_100baseT_Full_BIT);
++	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_100baseT_Half_BIT);
++	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_10baseT_Full_BIT);
++	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_10baseT_Half_BIT);
++
++	/* Only symmetric pause with flow control enabled is supported so no
++	 * need to negotiate pause.
++	 */
++	linkmode_clear_bit(ETHTOOL_LINK_MODE_Pause_BIT, phydev->advertising);
++	linkmode_clear_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, phydev->advertising);
++}
++
++static void mlxbf_gige_bf3_set_phy_link_mode(struct phy_device *phydev)
++{
++	/* MAC only supports full duplex mode */
++	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_1000baseT_Half_BIT);
++	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_100baseT_Half_BIT);
++	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_10baseT_Half_BIT);
++
++	/* Only symmetric pause with flow control enabled is supported so no
++	 * need to negotiate pause.
++	 */
++	linkmode_clear_bit(ETHTOOL_LINK_MODE_Pause_BIT, phydev->advertising);
++	linkmode_clear_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, phydev->advertising);
++}
++
++static struct mlxbf_gige_link_cfg mlxbf_gige_link_cfgs[] = {
++	[MLXBF_GIGE_VERSION_BF2] = {
++		.set_phy_link_mode = mlxbf_gige_bf2_set_phy_link_mode,
++		.adjust_link = mlxbf_gige_bf2_adjust_link,
++		.phy_mode = PHY_INTERFACE_MODE_GMII
++	},
++	[MLXBF_GIGE_VERSION_BF3] = {
++		.set_phy_link_mode = mlxbf_gige_bf3_set_phy_link_mode,
++		.adjust_link = mlxbf_gige_bf3_adjust_link,
++		.phy_mode = PHY_INTERFACE_MODE_SGMII
++	}
++};
++
+ static int mlxbf_gige_probe(struct platform_device *pdev)
+ {
+ 	struct phy_device *phydev;
+@@ -372,25 +458,14 @@ static int mlxbf_gige_probe(struct platform_device *pdev)
+ 	phydev->irq = phy_irq;
+ 
+ 	err = phy_connect_direct(netdev, phydev,
+-				 mlxbf_gige_adjust_link,
+-				 PHY_INTERFACE_MODE_GMII);
++				 mlxbf_gige_link_cfgs[priv->hw_version].adjust_link,
++				 mlxbf_gige_link_cfgs[priv->hw_version].phy_mode);
+ 	if (err) {
+ 		dev_err(&pdev->dev, "Could not attach to PHY\n");
+ 		goto out;
+ 	}
+ 
+-	/* MAC only supports 1000T full duplex mode */
+-	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_1000baseT_Half_BIT);
+-	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_100baseT_Full_BIT);
+-	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_100baseT_Half_BIT);
+-	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_10baseT_Full_BIT);
+-	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_10baseT_Half_BIT);
+-
+-	/* Only symmetric pause with flow control enabled is supported so no
+-	 * need to negotiate pause.
+-	 */
+-	linkmode_clear_bit(ETHTOOL_LINK_MODE_Pause_BIT, phydev->advertising);
+-	linkmode_clear_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, phydev->advertising);
++	mlxbf_gige_link_cfgs[priv->hw_version].set_phy_link_mode(phydev);
+ 
+ 	/* Display information about attached PHY device */
+ 	phy_attached_info(phydev);
+diff --git a/drivers/net/ethernet/mellanox/mlxbf_gige/mlxbf_gige_regs.h b/drivers/net/ethernet/mellanox/mlxbf_gige/mlxbf_gige_regs.h
+index 7be3a793984d..155cca80071f 100644
+--- a/drivers/net/ethernet/mellanox/mlxbf_gige/mlxbf_gige_regs.h
++++ b/drivers/net/ethernet/mellanox/mlxbf_gige/mlxbf_gige_regs.h
+@@ -8,6 +8,8 @@
+ #ifndef __MLXBF_GIGE_REGS_H__
+ #define __MLXBF_GIGE_REGS_H__
+ 
++#include <linux/bitfield.h>
++
+ #define MLXBF_GIGE_VERSION                            0x0000
+ #define MLXBF_GIGE_VERSION_BF2                        0x0
+ #define MLXBF_GIGE_STATUS                             0x0010
+@@ -77,4 +79,23 @@
+  */
+ #define MLXBF_GIGE_MMIO_REG_SZ                        (MLXBF_GIGE_MAC_CFG + 8)
+ 
++#define MLXBF_GIGE_PLU_TX_REG0                        0x80
++#define MLXBF_GIGE_PLU_TX_IPG_SIZE_MASK               GENMASK(11, 0)
++#define MLXBF_GIGE_PLU_TX_SGMII_MODE_MASK             GENMASK(15, 14)
++
++#define MLXBF_GIGE_PLU_RX_REG0                        0x10
++#define MLXBF_GIGE_PLU_RX_SGMII_MODE_MASK             GENMASK(25, 24)
++
++#define MLXBF_GIGE_1G_SGMII_MODE                      0x0
++#define MLXBF_GIGE_10M_SGMII_MODE                     0x1
++#define MLXBF_GIGE_100M_SGMII_MODE                    0x2
++
++/* ipg_size default value for 1G is fixed by HW to 11 + End = 12.
++ * So for 100M it is 12 * 10 - 1 = 119
++ * For 10M, it is 12 * 100 - 1 = 1199
++ */
++#define MLXBF_GIGE_1G_IPG_SIZE                        11
++#define MLXBF_GIGE_100M_IPG_SIZE                      119
++#define MLXBF_GIGE_10M_IPG_SIZE                       1199
++
+ #endif /* !defined(__MLXBF_GIGE_REGS_H__) */
