@@ -1,0 +1,128 @@
+bpf ppc64: Access only if addr is kernel address
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+commit 9c70c7147ffec31de67d33243570a533b29f9759
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/9c70c714.failed
+
+On PPC64 with KUAP enabled, any kernel code which wants to
+access userspace needs to be surrounded by disable-enable KUAP.
+But that is not happening for BPF_PROBE_MEM load instruction.
+So, when BPF program tries to access invalid userspace address,
+page-fault handler considers it as bad KUAP fault:
+
+  Kernel attempted to read user page (d0000000) - exploit attempt? (uid: 0)
+
+Considering the fact that PTR_TO_BTF_ID (which uses BPF_PROBE_MEM
+mode) could either be a valid kernel pointer or NULL but should
+never be a pointer to userspace address, execute BPF_PROBE_MEM load
+only if addr is kernel address, otherwise set dst_reg=0 and move on.
+
+This will catch NULL, valid or invalid userspace pointers. Only bad
+kernel pointer will be handled by BPF exception table.
+
+[Alexei suggested for x86]
+
+	Suggested-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+	Signed-off-by: Hari Bathini <hbathini@linux.ibm.com>
+	Reviewed-by: Christophe Leroy <christophe.leroy@csgroup.eu>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20211012123056.485795-7-hbathini@linux.ibm.com
+
+(cherry picked from commit 9c70c7147ffec31de67d33243570a533b29f9759)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/net/bpf_jit_comp64.c
+diff --cc arch/powerpc/net/bpf_jit_comp64.c
+index cbb5838adebc,472d4a551945..000000000000
+--- a/arch/powerpc/net/bpf_jit_comp64.c
++++ b/arch/powerpc/net/bpf_jit_comp64.c
+@@@ -780,25 -779,66 +780,79 @@@ emit_clear
+  		 */
+  		/* dst = *(u8 *)(ul) (src + off) */
+  		case BPF_LDX | BPF_MEM | BPF_B:
+ -		case BPF_LDX | BPF_PROBE_MEM | BPF_B:
+ +			EMIT(PPC_RAW_LBZ(dst_reg, src_reg, off));
+ +			if (insn_is_zext(&insn[i + 1]))
+ +				addrs[++i] = ctx->idx * 4;
+ +			break;
+  		/* dst = *(u16 *)(ul) (src + off) */
+  		case BPF_LDX | BPF_MEM | BPF_H:
+ -		case BPF_LDX | BPF_PROBE_MEM | BPF_H:
+ +			EMIT(PPC_RAW_LHZ(dst_reg, src_reg, off));
+ +			if (insn_is_zext(&insn[i + 1]))
+ +				addrs[++i] = ctx->idx * 4;
+ +			break;
+  		/* dst = *(u32 *)(ul) (src + off) */
+  		case BPF_LDX | BPF_MEM | BPF_W:
+ -		case BPF_LDX | BPF_PROBE_MEM | BPF_W:
+ +			EMIT(PPC_RAW_LWZ(dst_reg, src_reg, off));
+ +			if (insn_is_zext(&insn[i + 1]))
+ +				addrs[++i] = ctx->idx * 4;
+ +			break;
+  		/* dst = *(u64 *)(ul) (src + off) */
+  		case BPF_LDX | BPF_MEM | BPF_DW:
+++<<<<<<< HEAD
+ +			PPC_BPF_LL(dst_reg, src_reg, off);
+++=======
++ 		case BPF_LDX | BPF_PROBE_MEM | BPF_DW:
++ 			/*
++ 			 * As PTR_TO_BTF_ID that uses BPF_PROBE_MEM mode could either be a valid
++ 			 * kernel pointer or NULL but not a userspace address, execute BPF_PROBE_MEM
++ 			 * load only if addr is kernel address (see is_kernel_addr()), otherwise
++ 			 * set dst_reg=0 and move on.
++ 			 */
++ 			if (BPF_MODE(code) == BPF_PROBE_MEM) {
++ 				EMIT(PPC_RAW_ADDI(b2p[TMP_REG_1], src_reg, off));
++ 				if (IS_ENABLED(CONFIG_PPC_BOOK3E_64))
++ 					PPC_LI64(b2p[TMP_REG_2], 0x8000000000000000ul);
++ 				else /* BOOK3S_64 */
++ 					PPC_LI64(b2p[TMP_REG_2], PAGE_OFFSET);
++ 				EMIT(PPC_RAW_CMPLD(b2p[TMP_REG_1], b2p[TMP_REG_2]));
++ 				PPC_BCC(COND_GT, (ctx->idx + 4) * 4);
++ 				EMIT(PPC_RAW_LI(dst_reg, 0));
++ 				/*
++ 				 * Check if 'off' is word aligned because PPC_BPF_LL()
++ 				 * (BPF_DW case) generates two instructions if 'off' is not
++ 				 * word-aligned and one instruction otherwise.
++ 				 */
++ 				if (BPF_SIZE(code) == BPF_DW && (off & 3))
++ 					PPC_JMP((ctx->idx + 3) * 4);
++ 				else
++ 					PPC_JMP((ctx->idx + 2) * 4);
++ 			}
++ 
++ 			switch (size) {
++ 			case BPF_B:
++ 				EMIT(PPC_RAW_LBZ(dst_reg, src_reg, off));
++ 				break;
++ 			case BPF_H:
++ 				EMIT(PPC_RAW_LHZ(dst_reg, src_reg, off));
++ 				break;
++ 			case BPF_W:
++ 				EMIT(PPC_RAW_LWZ(dst_reg, src_reg, off));
++ 				break;
++ 			case BPF_DW:
++ 				PPC_BPF_LL(dst_reg, src_reg, off);
++ 				break;
++ 			}
++ 
++ 			if (size != BPF_DW && insn_is_zext(&insn[i + 1]))
++ 				addrs[++i] = ctx->idx * 4;
++ 
++ 			if (BPF_MODE(code) == BPF_PROBE_MEM) {
++ 				ret = bpf_add_extable_entry(fp, image, pass, ctx, ctx->idx - 1,
++ 							    4, dst_reg);
++ 				if (ret)
++ 					return ret;
++ 			}
+++>>>>>>> 9c70c7147ffe (bpf ppc64: Access only if addr is kernel address)
+  			break;
+  
+  		/*
+* Unmerged path arch/powerpc/net/bpf_jit_comp64.c
