@@ -1,0 +1,444 @@
+x86/resctrl: Create mba_sc configuration in the rdt_domain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author James Morse <james.morse@arm.com>
+commit 781096d971dfe3c5f9401a300bdb0b148a600584
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/781096d9.failed
+
+To support resctrl's MBA software controller, the architecture must provide
+a second configuration array to hold the mbps_val[] from user-space.
+
+This complicates the interface between the architecture specific code and
+the filesystem portions of resctrl that will move to /fs/, to allow
+multiple architectures to support resctrl.
+
+Make the filesystem parts of resctrl create an array for the mba_sc
+values. The software controller can be changed to use this, allowing
+the architecture code to only consider the values configured in hardware.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Jamie Iles <quic_jiles@quicinc.com>
+	Reviewed-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Tested-by: Xin Hao <xhao@linux.alibaba.com>
+	Tested-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Tested-by: Cristian Marussi <cristian.marussi@arm.com>
+Link: https://lore.kernel.org/r/20220902154829.30399-9-james.morse@arm.com
+(cherry picked from commit 781096d971dfe3c5f9401a300bdb0b148a600584)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/rdtgroup.c
+#	include/linux/resctrl.h
+diff --cc arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index e5f7b979a288,f7ebd019e7a5..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@@ -1941,16 -1877,42 +1941,40 @@@ static int set_cache_qos_cfg(int level
+  /* Restore the qos cfg state when a domain comes online */
+  void rdt_domain_reconfigure_cdp(struct rdt_resource *r)
+  {
+ -	struct rdt_hw_resource *hw_res = resctrl_to_arch_res(r);
+ -
+ -	if (!r->cdp_capable)
+ +	if (!r->alloc_capable)
+  		return;
+  
+ -	if (r->rid == RDT_RESOURCE_L2)
+ -		l2_qos_cfg_update(&hw_res->cdp_enabled);
+ +	if (r == &rdt_resources_all[RDT_RESOURCE_L2DATA])
+ +		l2_qos_cfg_update(&r->alloc_enabled);
+  
+ -	if (r->rid == RDT_RESOURCE_L3)
+ -		l3_qos_cfg_update(&hw_res->cdp_enabled);
+ +	if (r == &rdt_resources_all[RDT_RESOURCE_L3DATA])
+ +		l3_qos_cfg_update(&r->alloc_enabled);
+  }
+  
++ static int mba_sc_domain_allocate(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	u32 num_closid = resctrl_arch_get_num_closid(r);
++ 	int cpu = cpumask_any(&d->cpu_mask);
++ 	int i;
++ 
++ 	d->mbps_val = kcalloc_node(num_closid, sizeof(*d->mbps_val),
++ 				   GFP_KERNEL, cpu_to_node(cpu));
++ 	if (!d->mbps_val)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < num_closid; i++)
++ 		d->mbps_val[i] = MBA_MAX_MBPS;
++ 
++ 	return 0;
++ }
++ 
++ static void mba_sc_domain_destroy(struct rdt_resource *r,
++ 				  struct rdt_domain *d)
++ {
++ 	kfree(d->mbps_val);
++ 	d->mbps_val = NULL;
++ }
++ 
+  /*
+   * MBA software controller is supported only if
+   * MBM is supported and MBA is in linear scale.
+@@@ -1969,16 -1931,21 +1993,28 @@@ static bool supports_mba_mbps(void
+   */
+  static int set_mba_sc(bool mba_sc)
+  {
+++<<<<<<< HEAD
+ +	struct rdt_resource *r = &rdt_resources_all[RDT_RESOURCE_MBA];
+ +	struct rdt_domain *d;
+++=======
++ 	struct rdt_resource *r = &rdt_resources_all[RDT_RESOURCE_MBA].r_resctrl;
++ 	u32 num_closid = resctrl_arch_get_num_closid(r);
++ 	struct rdt_domain *d;
++ 	int i;
+++>>>>>>> 781096d971df (x86/resctrl: Create mba_sc configuration in the rdt_domain)
+  
+  	if (!supports_mba_mbps() || mba_sc == is_mba_sc(r))
+  		return -EINVAL;
+  
+  	r->membw.mba_sc = mba_sc;
+ +	list_for_each_entry(d, &r->domains, list)
+ +		setup_default_ctrlval(r, d->ctrl_val, d->mbps_val);
+  
++ 	list_for_each_entry(d, &r->domains, list) {
++ 		for (i = 0; i < num_closid; i++)
++ 			d->mbps_val[i] = MBA_MAX_MBPS;
++ 	}
++ 
+  	return 0;
+  }
+  
+@@@ -3213,6 -3268,110 +3249,113 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void domain_destroy_mon_state(struct rdt_domain *d)
++ {
++ 	bitmap_free(d->rmid_busy_llc);
++ 	kfree(d->mbm_total);
++ 	kfree(d->mbm_local);
++ }
++ 
++ void resctrl_offline_domain(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	lockdep_assert_held(&rdtgroup_mutex);
++ 
++ 	if (supports_mba_mbps() && r->rid == RDT_RESOURCE_MBA)
++ 		mba_sc_domain_destroy(r, d);
++ 
++ 	if (!r->mon_capable)
++ 		return;
++ 
++ 	/*
++ 	 * If resctrl is mounted, remove all the
++ 	 * per domain monitor data directories.
++ 	 */
++ 	if (static_branch_unlikely(&rdt_mon_enable_key))
++ 		rmdir_mondata_subdir_allrdtgrp(r, d->id);
++ 
++ 	if (is_mbm_enabled())
++ 		cancel_delayed_work(&d->mbm_over);
++ 	if (is_llc_occupancy_enabled() && has_busy_rmid(r, d)) {
++ 		/*
++ 		 * When a package is going down, forcefully
++ 		 * decrement rmid->ebusy. There is no way to know
++ 		 * that the L3 was flushed and hence may lead to
++ 		 * incorrect counts in rare scenarios, but leaving
++ 		 * the RMID as busy creates RMID leaks if the
++ 		 * package never comes back.
++ 		 */
++ 		__check_limbo(d, true);
++ 		cancel_delayed_work(&d->cqm_limbo);
++ 	}
++ 
++ 	domain_destroy_mon_state(d);
++ }
++ 
++ static int domain_setup_mon_state(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	size_t tsize;
++ 
++ 	if (is_llc_occupancy_enabled()) {
++ 		d->rmid_busy_llc = bitmap_zalloc(r->num_rmid, GFP_KERNEL);
++ 		if (!d->rmid_busy_llc)
++ 			return -ENOMEM;
++ 	}
++ 	if (is_mbm_total_enabled()) {
++ 		tsize = sizeof(*d->mbm_total);
++ 		d->mbm_total = kcalloc(r->num_rmid, tsize, GFP_KERNEL);
++ 		if (!d->mbm_total) {
++ 			bitmap_free(d->rmid_busy_llc);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 	if (is_mbm_local_enabled()) {
++ 		tsize = sizeof(*d->mbm_local);
++ 		d->mbm_local = kcalloc(r->num_rmid, tsize, GFP_KERNEL);
++ 		if (!d->mbm_local) {
++ 			bitmap_free(d->rmid_busy_llc);
++ 			kfree(d->mbm_total);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int resctrl_online_domain(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	int err;
++ 
++ 	lockdep_assert_held(&rdtgroup_mutex);
++ 
++ 	if (supports_mba_mbps() && r->rid == RDT_RESOURCE_MBA)
++ 		/* RDT_RESOURCE_MBA is never mon_capable */
++ 		return mba_sc_domain_allocate(r, d);
++ 
++ 	if (!r->mon_capable)
++ 		return 0;
++ 
++ 	err = domain_setup_mon_state(r, d);
++ 	if (err)
++ 		return err;
++ 
++ 	if (is_mbm_enabled()) {
++ 		INIT_DELAYED_WORK(&d->mbm_over, mbm_handle_overflow);
++ 		mbm_setup_overflow_handler(d, MBM_OVERFLOW_INTERVAL);
++ 	}
++ 
++ 	if (is_llc_occupancy_enabled())
++ 		INIT_DELAYED_WORK(&d->cqm_limbo, cqm_handle_limbo);
++ 
++ 	/* If resctrl is mounted, add per domain monitor data directories. */
++ 	if (static_branch_unlikely(&rdt_mon_enable_key))
++ 		mkdir_mondata_subdir_allrdtgrp(r, d);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 781096d971df (x86/resctrl: Create mba_sc configuration in the rdt_domain)
+  /*
+   * rdtgroup_init - rdtgroup initialization
+   *
+diff --cc include/linux/resctrl.h
+index 9b05af9b3e28,93dfe553b364..000000000000
+--- a/include/linux/resctrl.h
++++ b/include/linux/resctrl.h
+@@@ -13,4 -15,191 +13,194 @@@ int proc_resctrl_show(struct seq_file *
+  
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /* max value for struct rdt_domain's mbps_val */
++ #define MBA_MAX_MBPS   U32_MAX
++ 
++ /**
++  * enum resctrl_conf_type - The type of configuration.
++  * @CDP_NONE:	No prioritisation, both code and data are controlled or monitored.
++  * @CDP_CODE:	Configuration applies to instruction fetches.
++  * @CDP_DATA:	Configuration applies to reads and writes.
++  */
++ enum resctrl_conf_type {
++ 	CDP_NONE,
++ 	CDP_CODE,
++ 	CDP_DATA,
++ };
++ 
++ #define CDP_NUM_TYPES	(CDP_DATA + 1)
++ 
++ /**
++  * struct resctrl_staged_config - parsed configuration to be applied
++  * @new_ctrl:		new ctrl value to be loaded
++  * @have_new_ctrl:	whether the user provided new_ctrl is valid
++  */
++ struct resctrl_staged_config {
++ 	u32			new_ctrl;
++ 	bool			have_new_ctrl;
++ };
++ 
++ /**
++  * struct rdt_domain - group of CPUs sharing a resctrl resource
++  * @list:		all instances of this resource
++  * @id:			unique id for this instance
++  * @cpu_mask:		which CPUs share this resource
++  * @rmid_busy_llc:	bitmap of which limbo RMIDs are above threshold
++  * @mbm_total:		saved state for MBM total bandwidth
++  * @mbm_local:		saved state for MBM local bandwidth
++  * @mbm_over:		worker to periodically read MBM h/w counters
++  * @cqm_limbo:		worker to periodically read CQM h/w counters
++  * @mbm_work_cpu:	worker CPU for MBM h/w counters
++  * @cqm_work_cpu:	worker CPU for CQM h/w counters
++  * @plr:		pseudo-locked region (if any) associated with domain
++  * @staged_config:	parsed configuration to be applied
++  * @mbps_val:		When mba_sc is enabled, this holds the array of user
++  *			specified control values for mba_sc in MBps, indexed
++  *			by closid
++  */
++ struct rdt_domain {
++ 	struct list_head		list;
++ 	int				id;
++ 	struct cpumask			cpu_mask;
++ 	unsigned long			*rmid_busy_llc;
++ 	struct mbm_state		*mbm_total;
++ 	struct mbm_state		*mbm_local;
++ 	struct delayed_work		mbm_over;
++ 	struct delayed_work		cqm_limbo;
++ 	int				mbm_work_cpu;
++ 	int				cqm_work_cpu;
++ 	struct pseudo_lock_region	*plr;
++ 	struct resctrl_staged_config	staged_config[CDP_NUM_TYPES];
++ 	u32				*mbps_val;
++ };
++ 
++ /**
++  * struct resctrl_cache - Cache allocation related data
++  * @cbm_len:		Length of the cache bit mask
++  * @min_cbm_bits:	Minimum number of consecutive bits to be set
++  * @shareable_bits:	Bitmask of shareable resource with other
++  *			executing entities
++  * @arch_has_sparse_bitmaps:	True if a bitmap like f00f is valid.
++  * @arch_has_empty_bitmaps:	True if the '0' bitmap is valid.
++  * @arch_has_per_cpu_cfg:	True if QOS_CFG register for this cache
++  *				level has CPU scope.
++  */
++ struct resctrl_cache {
++ 	unsigned int	cbm_len;
++ 	unsigned int	min_cbm_bits;
++ 	unsigned int	shareable_bits;
++ 	bool		arch_has_sparse_bitmaps;
++ 	bool		arch_has_empty_bitmaps;
++ 	bool		arch_has_per_cpu_cfg;
++ };
++ 
++ /**
++  * enum membw_throttle_mode - System's memory bandwidth throttling mode
++  * @THREAD_THROTTLE_UNDEFINED:	Not relevant to the system
++  * @THREAD_THROTTLE_MAX:	Memory bandwidth is throttled at the core
++  *				always using smallest bandwidth percentage
++  *				assigned to threads, aka "max throttling"
++  * @THREAD_THROTTLE_PER_THREAD:	Memory bandwidth is throttled at the thread
++  */
++ enum membw_throttle_mode {
++ 	THREAD_THROTTLE_UNDEFINED = 0,
++ 	THREAD_THROTTLE_MAX,
++ 	THREAD_THROTTLE_PER_THREAD,
++ };
++ 
++ /**
++  * struct resctrl_membw - Memory bandwidth allocation related data
++  * @min_bw:		Minimum memory bandwidth percentage user can request
++  * @bw_gran:		Granularity at which the memory bandwidth is allocated
++  * @delay_linear:	True if memory B/W delay is in linear scale
++  * @arch_needs_linear:	True if we can't configure non-linear resources
++  * @throttle_mode:	Bandwidth throttling mode when threads request
++  *			different memory bandwidths
++  * @mba_sc:		True if MBA software controller(mba_sc) is enabled
++  * @mb_map:		Mapping of memory B/W percentage to memory B/W delay
++  */
++ struct resctrl_membw {
++ 	u32				min_bw;
++ 	u32				bw_gran;
++ 	u32				delay_linear;
++ 	bool				arch_needs_linear;
++ 	enum membw_throttle_mode	throttle_mode;
++ 	bool				mba_sc;
++ 	u32				*mb_map;
++ };
++ 
++ struct rdt_parse_data;
++ struct resctrl_schema;
++ 
++ /**
++  * struct rdt_resource - attributes of a resctrl resource
++  * @rid:		The index of the resource
++  * @alloc_capable:	Is allocation available on this machine
++  * @mon_capable:	Is monitor feature available on this machine
++  * @num_rmid:		Number of RMIDs available
++  * @cache_level:	Which cache level defines scope of this resource
++  * @cache:		Cache allocation related data
++  * @membw:		If the component has bandwidth controls, their properties.
++  * @domains:		All domains for this resource
++  * @name:		Name to use in "schemata" file.
++  * @data_width:		Character width of data when displaying
++  * @default_ctrl:	Specifies default cache cbm or memory B/W percent.
++  * @format_str:		Per resource format string to show domain value
++  * @parse_ctrlval:	Per resource function pointer to parse control values
++  * @evt_list:		List of monitoring events
++  * @fflags:		flags to choose base and info files
++  * @cdp_capable:	Is the CDP feature available on this resource
++  */
++ struct rdt_resource {
++ 	int			rid;
++ 	bool			alloc_capable;
++ 	bool			mon_capable;
++ 	int			num_rmid;
++ 	int			cache_level;
++ 	struct resctrl_cache	cache;
++ 	struct resctrl_membw	membw;
++ 	struct list_head	domains;
++ 	char			*name;
++ 	int			data_width;
++ 	u32			default_ctrl;
++ 	const char		*format_str;
++ 	int			(*parse_ctrlval)(struct rdt_parse_data *data,
++ 						 struct resctrl_schema *s,
++ 						 struct rdt_domain *d);
++ 	struct list_head	evt_list;
++ 	unsigned long		fflags;
++ 	bool			cdp_capable;
++ };
++ 
++ /**
++  * struct resctrl_schema - configuration abilities of a resource presented to
++  *			   user-space
++  * @list:	Member of resctrl_schema_all.
++  * @name:	The name to use in the "schemata" file.
++  * @conf_type:	Whether this schema is specific to code/data.
++  * @res:	The resource structure exported by the architecture to describe
++  *		the hardware that is configured by this schema.
++  * @num_closid:	The number of closid that can be used with this schema. When
++  *		features like CDP are enabled, this will be lower than the
++  *		hardware supports for the resource.
++  */
++ struct resctrl_schema {
++ 	struct list_head		list;
++ 	char				name[8];
++ 	enum resctrl_conf_type		conf_type;
++ 	struct rdt_resource		*res;
++ 	u32				num_closid;
++ };
++ 
++ /* The number of closid supported by this resource regardless of CDP */
++ u32 resctrl_arch_get_num_closid(struct rdt_resource *r);
++ int resctrl_arch_update_domains(struct rdt_resource *r, u32 closid);
++ u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_domain *d,
++ 			    u32 closid, enum resctrl_conf_type type);
++ int resctrl_online_domain(struct rdt_resource *r, struct rdt_domain *d);
++ void resctrl_offline_domain(struct rdt_resource *r, struct rdt_domain *d);
++ 
+++>>>>>>> 781096d971df (x86/resctrl: Create mba_sc configuration in the rdt_domain)
+  #endif /* _RESCTRL_H */
+diff --git a/arch/x86/kernel/cpu/resctrl/internal.h b/arch/x86/kernel/cpu/resctrl/internal.h
+index 9780c2d2c637..ec7aa009bdfe 100644
+--- a/arch/x86/kernel/cpu/resctrl/internal.h
++++ b/arch/x86/kernel/cpu/resctrl/internal.h
+@@ -35,7 +35,6 @@
+ #define MBM_OVERFLOW_INTERVAL		1000
+ #define MAX_MBA_BW			100u
+ #define MBA_IS_LINEAR			0x4
+-#define MBA_MAX_MBPS			U32_MAX
+ #define MAX_MBA_BW_AMD			0x800
+ #define MBM_CNTR_WIDTH_OFFSET_AMD	20
+ 
+* Unmerged path arch/x86/kernel/cpu/resctrl/rdtgroup.c
+* Unmerged path include/linux/resctrl.h
