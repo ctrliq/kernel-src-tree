@@ -1,0 +1,129 @@
+rxrpc: Fix I/O thread startup getting skipped
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 8fbcc83334a7b5b42b6bc1fae2458bf25eb57768
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/8fbcc833.failed
+
+When starting a kthread, the __kthread_create_on_node() function, as called
+from kthread_run(), waits for a completion to indicate that the task_struct
+(or failure state) of the new kernel thread is available before continuing.
+
+This does not wait, however, for the thread function to be invoked and,
+indeed, will skip it if kthread_stop() gets called before it gets there.
+
+If this happens, though, kthread_run() will have returned successfully,
+indicating that the thread was started and returning the task_struct
+pointer.  The actual error indication is returned by kthread_stop().
+
+Note that this is ambiguous, as the caller cannot tell whether the -EINTR
+error code came from kthread() or from the thread function.
+
+This was encountered in the new rxrpc I/O thread, where if the system is
+being pounded hard by, say, syzbot, the check of KTHREAD_SHOULD_STOP can be
+delayed long enough for kthread_stop() to get called when rxrpc releases a
+socket - and this causes an oops because the I/O thread function doesn't
+get started and thus doesn't remove the rxrpc_local struct from the
+local_endpoints list.
+
+Fix this by using a completion to wait for the thread to actually enter
+rxrpc_io_thread().  This makes sure the thread can't be prematurely
+stopped and makes sure the relied-upon cleanup is done.
+
+Fixes: a275da62e8c1 ("rxrpc: Create a per-local endpoint receive queue and I/O thread")
+	Reported-by: syzbot+3538a6a72efa8b059c38@syzkaller.appspotmail.com
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: Hillf Danton <hdanton@sina.com>
+Link: https://lore.kernel.org/r/000000000000229f1505ef2b6159@google.com/
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8fbcc83334a7b5b42b6bc1fae2458bf25eb57768)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/io_thread.c
+#	net/rxrpc/local_object.c
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,37f3aec784cc..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -279,13 -286,12 +279,18 @@@ struct rxrpc_local 
+  	struct rxrpc_net	*rxnet;		/* The network ns in which this resides */
+  	struct hlist_node	link;
+  	struct socket		*socket;	/* my UDP socket */
+++<<<<<<< HEAD
+ +	struct work_struct	processor;
+ +	struct list_head	ack_tx_queue;	/* List of ACKs that need sending */
+ +	spinlock_t		ack_tx_lock;	/* ACK list lock */
+++=======
++ 	struct task_struct	*io_thread;
++ 	struct completion	io_thread_ready; /* Indication that the I/O thread started */
+++>>>>>>> 8fbcc83334a7 (rxrpc: Fix I/O thread startup getting skipped)
+  	struct rxrpc_sock __rcu	*service;	/* Service(s) listening on this endpoint */
+  	struct rw_semaphore	defrag_sem;	/* control re-enablement of IP DF bit */
+ -	struct sk_buff_head	rx_queue;	/* Received packets */
+ -	struct list_head	call_attend_q;	/* Calls requiring immediate attention */
+ +	struct sk_buff_head	reject_queue;	/* packets awaiting rejection */
+ +	struct sk_buff_head	event_queue;	/* endpoint event packets awaiting processing */
+  	struct rb_root		client_bundles;	/* Client connection bundles by socket params */
+  	spinlock_t		client_bundles_lock; /* Lock for client_bundles */
+  	spinlock_t		lock;		/* access lock */
+diff --cc net/rxrpc/local_object.c
+index 846558613c7f,270b63d8f37a..000000000000
+--- a/net/rxrpc/local_object.c
++++ b/net/rxrpc/local_object.c
+@@@ -83,12 -96,10 +83,18 @@@ static struct rxrpc_local *rxrpc_alloc_
+  		atomic_set(&local->active_users, 1);
+  		local->rxnet = rxnet;
+  		INIT_HLIST_NODE(&local->link);
+ +		INIT_WORK(&local->processor, rxrpc_local_processor);
+ +		INIT_LIST_HEAD(&local->ack_tx_queue);
+ +		spin_lock_init(&local->ack_tx_lock);
+  		init_rwsem(&local->defrag_sem);
+++<<<<<<< HEAD
+ +		skb_queue_head_init(&local->reject_queue);
+ +		skb_queue_head_init(&local->event_queue);
+++=======
++ 		init_completion(&local->io_thread_ready);
++ 		skb_queue_head_init(&local->rx_queue);
++ 		INIT_LIST_HEAD(&local->call_attend_q);
+++>>>>>>> 8fbcc83334a7 (rxrpc: Fix I/O thread startup getting skipped)
+  		local->client_bundles = RB_ROOT;
+  		spin_lock_init(&local->client_bundles_lock);
+  		spin_lock_init(&local->lock);
+@@@ -170,8 -183,24 +176,20 @@@ static int rxrpc_open_socket(struct rxr
+  		BUG();
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	io_thread = kthread_run(rxrpc_io_thread, local,
++ 				"krxrpcio/%u", ntohs(udp_conf.local_udp_port));
++ 	if (IS_ERR(io_thread)) {
++ 		ret = PTR_ERR(io_thread);
++ 		goto error_sock;
++ 	}
++ 
++ 	wait_for_completion(&local->io_thread_ready);
++ 	local->io_thread = io_thread;
+++>>>>>>> 8fbcc83334a7 (rxrpc: Fix I/O thread startup getting skipped)
+  	_leave(" = 0");
+  	return 0;
+ -
+ -error_sock:
+ -	kernel_sock_shutdown(local->socket, SHUT_RDWR);
+ -	local->socket->sk->sk_user_data = NULL;
+ -	sock_release(local->socket);
+ -	local->socket = NULL;
+ -	return ret;
+  }
+  
+  /*
+* Unmerged path net/rxrpc/io_thread.c
+* Unmerged path net/rxrpc/ar-internal.h
+* Unmerged path net/rxrpc/io_thread.c
+* Unmerged path net/rxrpc/local_object.c
