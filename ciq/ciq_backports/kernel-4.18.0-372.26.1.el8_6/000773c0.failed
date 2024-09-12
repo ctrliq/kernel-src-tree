@@ -1,0 +1,309 @@
+ice: factor VF variables to separate structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.26.1.el8_6
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 000773c00f52f2a6084ec04c2efdc2a28ee29d9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.26.1.el8_6/000773c0.failed
+
+We maintain a number of values for VFs within the ice_pf structure. This
+includes the VF table, the number of allocated VFs, the maximum number
+of supported SR-IOV VFs, the number of queue pairs per VF, the number of
+MSI-X vectors per VF, and a bitmap of the VFs with detected MDD events.
+
+We're about to add a few more variables to this list. Clean this up
+first by extracting these members out into a new ice_vfs structure
+defined in ice_virtchnl_pf.h
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Konrad Jankowski <konrad0.jankowski@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 000773c00f52f2a6084ec04c2efdc2a28ee29d9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_ethtool.c
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+diff --cc drivers/net/ethernet/intel/ice/ice_ethtool.c
+index 3e0089fcaa98,1181f41ff5fe..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@@ -1295,6 -1295,14 +1295,17 @@@ static int ice_set_priv_flags(struct ne
+  		change_bit(ICE_FLAG_VF_TRUE_PROMISC_ENA, pf->flags);
+  		ret = -EAGAIN;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (test_bit(ICE_FLAG_VF_VLAN_PRUNING, change_flags) &&
++ 	    pf->vfs.num_alloc) {
++ 		dev_err(dev, "vf-vlan-pruning: VLAN pruning cannot be changed while VFs are active.\n");
++ 		/* toggle bit back to previous state */
++ 		change_bit(ICE_FLAG_VF_VLAN_PRUNING, pf->flags);
++ 		ret = -EOPNOTSUPP;
++ 	}
+++>>>>>>> 000773c00f52 (ice: factor VF variables to separate structure)
+  ethtool_exit:
+  	clear_bit(ICE_FLAG_ETHTOOL_CTXT, pf->flags);
+  	return ret;
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+index e45882c22848,fd83fa39d0cf..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+@@@ -497,10 -498,12 +497,11 @@@ static void ice_dis_vf_qs(struct ice_v
+  void ice_free_vfs(struct ice_pf *pf)
+  {
+  	struct device *dev = ice_pf_to_dev(pf);
++ 	struct ice_vfs *vfs = &pf->vfs;
+  	struct ice_hw *hw = &pf->hw;
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	unsigned int i;
+  
+- 	if (!pf->vf)
++ 	if (!vfs->table)
+  		return;
+  
+  	ice_eswitch_release(pf);
+@@@ -1396,16 -1461,18 +1397,24 @@@ bool ice_reset_all_vfs(struct ice_pf *p
+  	struct device *dev = ice_pf_to_dev(pf);
+  	struct ice_hw *hw = &pf->hw;
+  	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	int v, i;
+  
+  	/* If we don't have any VFs, then there is nothing to reset */
+- 	if (!pf->num_alloc_vfs)
++ 	if (!pf->vfs.num_alloc)
+  		return false;
+  
+  	/* clear all malicious info if the VFs are getting reset */
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, i)
+ +		if (ice_mbx_clear_malvf(&hw->mbx_snapshot, pf->malvfs, ICE_MAX_VF_COUNT, i))
+ +			dev_dbg(dev, "failed to clear malicious VF state for VF %u\n", i);
+++=======
++ 	ice_for_each_vf(pf, bkt, vf)
++ 		if (ice_mbx_clear_malvf(&hw->mbx_snapshot, pf->vfs.malvfs,
++ 					ICE_MAX_VF_COUNT, vf->vf_id))
++ 			dev_dbg(dev, "failed to clear malicious VF state for VF %u\n",
++ 				vf->vf_id);
+++>>>>>>> 000773c00f52 (ice: factor VF variables to separate structure)
+  
+  	/* If VFs have been disabled, there is no need to reset */
+  	if (test_and_set_bit(ICE_VF_DIS, pf->state))
+@@@ -2009,15 -2097,14 +2019,15 @@@ void ice_process_vflr_event(struct ice_
+  	u32 reg;
+  
+  	if (!test_and_clear_bit(ICE_VFLR_EVENT_PENDING, pf->state) ||
+- 	    !pf->num_alloc_vfs)
++ 	    !pf->vfs.num_alloc)
+  		return;
+  
+ -	ice_for_each_vf(pf, bkt, vf) {
+ +	ice_for_each_vf(pf, vf_id) {
+ +		struct ice_vf *vf = &pf->vf[vf_id];
+  		u32 reg_idx, bit_idx;
+  
+ -		reg_idx = (hw->func_caps.vf_base_id + vf->vf_id) / 32;
+ -		bit_idx = (hw->func_caps.vf_base_id + vf->vf_id) % 32;
+ +		reg_idx = (hw->func_caps.vf_base_id + vf_id) / 32;
+ +		bit_idx = (hw->func_caps.vf_base_id + vf_id) % 32;
+  		/* read GLGEN_VFLRSTAT register to find out the flr VFs */
+  		reg = rd32(hw, GLGEN_VFLRSTAT(reg_idx));
+  		if (reg & BIT(bit_idx)) {
+@@@ -4601,10 -5728,8 +4611,10 @@@ void ice_vc_process_vf_msg(struct ice_p
+  		return;
+  	}
+  
+- 	vf = &pf->vf[vf_id];
++ 	vf = &pf->vfs.table[vf_id];
+  
+ +	mutex_lock(&vf->cfg_lock);
+ +
+  	/* Check if VF is disabled. */
+  	if (test_bit(ICE_VF_STATE_DIS, vf->vf_states)) {
+  		err = -EPERM;
+@@@ -5151,14 -6310,12 +5161,14 @@@ void ice_print_vfs_mdd_events(struct ic
+  		return;
+  
+  	/* VF MDD event logs are rate limited to one second intervals */
+- 	if (time_is_after_jiffies(pf->last_printed_mdd_jiffies + HZ * 1))
++ 	if (time_is_after_jiffies(pf->vfs.last_printed_mdd_jiffies + HZ * 1))
+  		return;
+  
+- 	pf->last_printed_mdd_jiffies = jiffies;
++ 	pf->vfs.last_printed_mdd_jiffies = jiffies;
+  
+ -	ice_for_each_vf(pf, bkt, vf) {
+ +	ice_for_each_vf(pf, i) {
+ +		struct ice_vf *vf = &pf->vf[i];
+ +
+  		/* only print Rx MDD event message if there are new events */
+  		if (vf->mdd_rx_events.count != vf->mdd_rx_events.last_printed) {
+  			vf->mdd_rx_events.last_printed =
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+index 8f27255cc0cc,1448e3177215..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+@@@ -37,8 -39,20 +37,25 @@@
+  #define ICE_MAX_VF_RESET_TRIES		40
+  #define ICE_MAX_VF_RESET_SLEEP_MS	20
+  
+++<<<<<<< HEAD
+ +#define ice_for_each_vf(pf, i) \
+ +	for ((i) = 0; (i) < (pf)->num_alloc_vfs; (i)++)
+++=======
++ /**
++  * ice_for_each_vf - Iterate over each VF entry
++  * @pf: pointer to the PF private structure
++  * @bkt: bucket index used for iteration
++  * @entry: pointer to the VF entry currently being processed in the loop.
++  *
++  * The bkt variable is an unsigned integer iterator used to traverse the VF
++  * entries. It is *not* guaranteed to be the VF's vf_id. Do not assume it is.
++  * Use vf->vf_id to get the id number if needed.
++  */
++ #define ice_for_each_vf(pf, bkt, entry)					\
++ 	for ((bkt) = 0, (entry) = &(pf)->vfs.table[0];			\
++ 	     (bkt) < (pf)->vfs.num_alloc;				\
++ 	     (bkt)++, (entry)++)
+++>>>>>>> 000773c00f52 (ice: factor VF variables to separate structure)
+  
+  /* Specific VF states */
+  enum ice_vf_states {
+@@@ -93,8 -107,26 +110,19 @@@ struct ice_vc_vf_ops 
+  	int (*handle_rss_cfg_msg)(struct ice_vf *vf, u8 *msg, bool add);
+  	int (*add_fdir_fltr_msg)(struct ice_vf *vf, u8 *msg);
+  	int (*del_fdir_fltr_msg)(struct ice_vf *vf, u8 *msg);
+ -	int (*get_offload_vlan_v2_caps)(struct ice_vf *vf);
+ -	int (*add_vlan_v2_msg)(struct ice_vf *vf, u8 *msg);
+ -	int (*remove_vlan_v2_msg)(struct ice_vf *vf, u8 *msg);
+ -	int (*ena_vlan_stripping_v2_msg)(struct ice_vf *vf, u8 *msg);
+ -	int (*dis_vlan_stripping_v2_msg)(struct ice_vf *vf, u8 *msg);
+ -	int (*ena_vlan_insertion_v2_msg)(struct ice_vf *vf, u8 *msg);
+ -	int (*dis_vlan_insertion_v2_msg)(struct ice_vf *vf, u8 *msg);
+  };
+  
++ /* Virtchnl/SR-IOV config info */
++ struct ice_vfs {
++ 	struct ice_vf *table;		/* table of VF entries */
++ 	u16 num_alloc;			/* number of allocated VFs */
++ 	u16 num_supported;		/* max supported VFs on this PF */
++ 	u16 num_qps_per;		/* number of queue pairs per VF */
++ 	u16 num_msix_per;		/* number of MSI-X vectors per VF */
++ 	unsigned long last_printed_mdd_jiffies;	/* MDD message rate limit */
++ 	DECLARE_BITMAP(malvfs, ICE_MAX_VF_COUNT); /* malicious VF indicator */
++ };
++ 
+  /* VF information structure */
+  struct ice_vf {
+  	struct ice_pf *pf;
+diff --git a/drivers/net/ethernet/intel/ice/ice.h b/drivers/net/ethernet/intel/ice/ice.h
+index 54ee457baca7..0418df026d99 100644
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -523,15 +523,7 @@ struct ice_pf {
+ 	struct ice_vsi **vsi;		/* VSIs created by the driver */
+ 	struct ice_sw *first_sw;	/* first switch created by firmware */
+ 	u16 eswitch_mode;		/* current mode of eswitch */
+-	/* Virtchnl/SR-IOV config info */
+-	struct ice_vf *vf;
+-	u16 num_alloc_vfs;		/* actual number of VFs allocated */
+-	u16 num_vfs_supported;		/* num VFs supported for this PF */
+-	u16 num_qps_per_vf;
+-	u16 num_msix_per_vf;
+-	/* used to ratelimit the MDD event logging */
+-	unsigned long last_printed_mdd_jiffies;
+-	DECLARE_BITMAP(malvfs, ICE_MAX_VF_COUNT);
++	struct ice_vfs vfs;
+ 	DECLARE_BITMAP(features, ICE_F_MAX);
+ 	DECLARE_BITMAP(state, ICE_STATE_NBITS);
+ 	DECLARE_BITMAP(flags, ICE_PF_FLAGS_NBITS);
+diff --git a/drivers/net/ethernet/intel/ice/ice_eswitch.c b/drivers/net/ethernet/intel/ice/ice_eswitch.c
+index 34a4474731de..a43b93146f9e 100644
+--- a/drivers/net/ethernet/intel/ice/ice_eswitch.c
++++ b/drivers/net/ethernet/intel/ice/ice_eswitch.c
+@@ -173,10 +173,20 @@ static void ice_eswitch_remap_rings_to_vectors(struct ice_pf *pf)
+ 	int q_id;
+ 
+ 	ice_for_each_txq(vsi, q_id) {
+-		struct ice_repr *repr = pf->vf[q_id].repr;
+-		struct ice_q_vector *q_vector = repr->q_vector;
+-		struct ice_tx_ring *tx_ring = vsi->tx_rings[q_id];
+-		struct ice_rx_ring *rx_ring = vsi->rx_rings[q_id];
++		struct ice_q_vector *q_vector;
++		struct ice_tx_ring *tx_ring;
++		struct ice_rx_ring *rx_ring;
++		struct ice_repr *repr;
++		struct ice_vf *vf;
++
++		if (WARN_ON(q_id >= pf->vfs.num_alloc))
++			continue;
++
++		vf = &pf->vfs.table[q_id];
++		repr = vf->repr;
++		q_vector = repr->q_vector;
++		tx_ring = vsi->tx_rings[q_id];
++		rx_ring = vsi->rx_rings[q_id];
+ 
+ 		q_vector->vsi = vsi;
+ 		q_vector->reg_idx = vsi->q_vectors[0]->reg_idx;
+@@ -519,7 +529,7 @@ ice_eswitch_mode_set(struct devlink *devlink, u16 mode,
+ 	if (pf->eswitch_mode == mode)
+ 		return 0;
+ 
+-	if (pf->num_alloc_vfs) {
++	if (pf->vfs.num_alloc) {
+ 		dev_info(ice_pf_to_dev(pf), "Changing eswitch mode is allowed only if there is no VFs created");
+ 		NL_SET_ERR_MSG_MOD(extack, "Changing eswitch mode is allowed only if there is no VFs created");
+ 		return -EOPNOTSUPP;
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ethtool.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index 80f50982752a..dba7ded2ebe4 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -216,8 +216,8 @@ static void ice_vsi_set_num_qs(struct ice_vsi *vsi, u16 vf_id)
+ 		/* The number of queues for ctrl VSI is equal to number of VFs.
+ 		 * Each ring is associated to the corresponding VF_PR netdev.
+ 		 */
+-		vsi->alloc_txq = pf->num_alloc_vfs;
+-		vsi->alloc_rxq = pf->num_alloc_vfs;
++		vsi->alloc_txq = pf->vfs.num_alloc;
++		vsi->alloc_rxq = pf->vfs.num_alloc;
+ 		vsi->num_q_vectors = 1;
+ 		break;
+ 	case ICE_VSI_VF:
+@@ -226,12 +226,12 @@ static void ice_vsi_set_num_qs(struct ice_vsi *vsi, u16 vf_id)
+ 			vf->num_vf_qs = vf->num_req_qs;
+ 		vsi->alloc_txq = vf->num_vf_qs;
+ 		vsi->alloc_rxq = vf->num_vf_qs;
+-		/* pf->num_msix_per_vf includes (VF miscellaneous vector +
++		/* pf->vfs.num_msix_per includes (VF miscellaneous vector +
+ 		 * data queue interrupts). Since vsi->num_q_vectors is number
+ 		 * of queues vectors, subtract 1 (ICE_NONQ_VECS_VF) from the
+ 		 * original vector count
+ 		 */
+-		vsi->num_q_vectors = pf->num_msix_per_vf - ICE_NONQ_VECS_VF;
++		vsi->num_q_vectors = pf->vfs.num_msix_per - ICE_NONQ_VECS_VF;
+ 		break;
+ 	case ICE_VSI_CTRL:
+ 		vsi->alloc_txq = 1;
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index 4135abb34828..6b82cc0b7a3a 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -3773,7 +3773,7 @@ static void ice_set_pf_caps(struct ice_pf *pf)
+ 	clear_bit(ICE_FLAG_SRIOV_CAPABLE, pf->flags);
+ 	if (func_caps->common_cap.sr_iov_1_1) {
+ 		set_bit(ICE_FLAG_SRIOV_CAPABLE, pf->flags);
+-		pf->num_vfs_supported = min_t(int, func_caps->num_allocd_vfs,
++		pf->vfs.num_supported = min_t(int, func_caps->num_allocd_vfs,
+ 					      ICE_MAX_VF_COUNT);
+ 	}
+ 	clear_bit(ICE_FLAG_RSS_ENA, pf->flags);
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
