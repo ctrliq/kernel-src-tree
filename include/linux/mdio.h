@@ -352,6 +352,8 @@ int mdiobus_write(struct mii_bus *bus, int addr, u32 regnum, u16 val);
 int mdiobus_write_nested(struct mii_bus *bus, int addr, u32 regnum, u16 val);
 int mdiobus_modify(struct mii_bus *bus, int addr, u32 regnum, u16 mask,
 		   u16 set);
+int mdiobus_modify_changed(struct mii_bus *bus, int addr, u32 regnum,
+			   u16 mask, u16 set);
 
 static inline int mdiodev_read(struct mdio_device *mdiodev, u32 regnum)
 {
