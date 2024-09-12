@@ -1,0 +1,188 @@
+gfs2: Get rid of some unnecessary quota locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 8d89e068deccb4f34d412df4042f37a75e126259
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/8d89e068.failed
+
+With the locking the previous patch has introduced for each struct
+gfs2_quota_data object, sd_quota_mutex has become largely irrelevant.
+By waiting on the buffer head instead of waiting on the mutex in
+get_bh(), it becomes completely irrelevant and can be removed.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 8d89e068deccb4f34d412df4042f37a75e126259)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/quota.c
+diff --cc fs/gfs2/quota.c
+index a5ead0a8fccb,931a133a5f96..000000000000
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@@ -381,59 -393,68 +381,80 @@@ static void slot_put(struct gfs2_quota_
+  
+  static int bh_get(struct gfs2_quota_data *qd)
+  {
+ -	struct gfs2_sbd *sdp = qd->qd_sbd;
+ -	struct inode *inode = sdp->sd_qc_inode;
+ -	struct gfs2_inode *ip = GFS2_I(inode);
+ +	struct gfs2_sbd *sdp = qd->qd_gl->gl_name.ln_sbd;
+ +	struct gfs2_inode *ip = GFS2_I(sdp->sd_qc_inode);
+  	unsigned int block, offset;
+++<<<<<<< HEAD
+ +	struct buffer_head *bh;
+++=======
++ 	struct buffer_head *bh = NULL;
++ 	struct iomap iomap = { };
+++>>>>>>> 8d89e068decc (gfs2: Get rid of some unnecessary quota locking)
+  	int error;
+ +	struct buffer_head bh_map = { .b_state = 0, .b_blocknr = 0 };
+  
+- 	mutex_lock(&sdp->sd_quota_mutex);
+- 
+- 	if (qd->qd_bh_count++) {
+- 		mutex_unlock(&sdp->sd_quota_mutex);
++ 	spin_lock(&qd->qd_lockref.lock);
++ 	if (qd->qd_bh_count) {
++ 		qd->qd_bh_count++;
++ 		spin_unlock(&qd->qd_lockref.lock);
+  		return 0;
+  	}
++ 	spin_unlock(&qd->qd_lockref.lock);
+  
+  	block = qd->qd_slot / sdp->sd_qc_per_block;
+  	offset = qd->qd_slot % sdp->sd_qc_per_block;
+  
+ -	error = gfs2_iomap_get(inode,
+ -			       (loff_t)block << inode->i_blkbits,
+ -			       i_blocksize(inode), &iomap);
+ +	bh_map.b_size = BIT(ip->i_inode.i_blkbits);
+ +	error = gfs2_block_map(&ip->i_inode, block, &bh_map, 0);
+  	if (error)
+++<<<<<<< HEAD
+ +		goto fail;
+ +	error = gfs2_meta_read(ip->i_gl, bh_map.b_blocknr, DIO_WAIT, 0, &bh);
+++=======
++ 		return error;
++ 	error = -ENOENT;
++ 	if (iomap.type != IOMAP_MAPPED)
++ 		return error;
++ 
++ 	error = gfs2_meta_read(ip->i_gl, iomap.addr >> inode->i_blkbits,
++ 			       DIO_WAIT, 0, &bh);
+++>>>>>>> 8d89e068decc (gfs2: Get rid of some unnecessary quota locking)
+  	if (error)
+- 		goto fail;
++ 		return error;
+  	error = -EIO;
+  	if (gfs2_metatype_check(sdp, bh, GFS2_METATYPE_QC))
+- 		goto fail_brelse;
+- 
+- 	qd->qd_bh = bh;
+- 	qd->qd_bh_qc = (struct gfs2_quota_change *)
+- 		(bh->b_data + sizeof(struct gfs2_meta_header) +
+- 		 offset * sizeof(struct gfs2_quota_change));
+- 
+- 	mutex_unlock(&sdp->sd_quota_mutex);
++ 		goto out;
+  
+- 	return 0;
++ 	spin_lock(&qd->qd_lockref.lock);
++ 	if (qd->qd_bh == NULL) {
++ 		qd->qd_bh = bh;
++ 		qd->qd_bh_qc = (struct gfs2_quota_change *)
++ 			(bh->b_data + sizeof(struct gfs2_meta_header) +
++ 			 offset * sizeof(struct gfs2_quota_change));
++ 		bh = NULL;
++ 	}
++ 	qd->qd_bh_count++;
++ 	spin_unlock(&qd->qd_lockref.lock);
++ 	error = 0;
+  
+- fail_brelse:
++ out:
+  	brelse(bh);
+- fail:
+- 	qd->qd_bh_count--;
+- 	mutex_unlock(&sdp->sd_quota_mutex);
+  	return error;
+  }
+  
+  static void bh_put(struct gfs2_quota_data *qd)
+  {
+++<<<<<<< HEAD
+ +	struct gfs2_sbd *sdp = qd->qd_gl->gl_name.ln_sbd;
+++=======
++ 	struct gfs2_sbd *sdp = qd->qd_sbd;
++ 	struct buffer_head *bh = NULL;
+++>>>>>>> 8d89e068decc (gfs2: Get rid of some unnecessary quota locking)
+  
+- 	mutex_lock(&sdp->sd_quota_mutex);
++ 	spin_lock(&qd->qd_lockref.lock);
+  	gfs2_assert(sdp, qd->qd_bh_count);
+  	if (!--qd->qd_bh_count) {
+- 		brelse(qd->qd_bh);
++ 		bh = qd->qd_bh;
+  		qd->qd_bh = NULL;
+  		qd->qd_bh_qc = NULL;
+  	}
+@@@ -668,12 -673,12 +690,11 @@@ static int sort_qd(const void *a, cons
+  
+  static void do_qc(struct gfs2_quota_data *qd, s64 change)
+  {
+ -	struct gfs2_sbd *sdp = qd->qd_sbd;
+ +	struct gfs2_sbd *sdp = qd->qd_gl->gl_name.ln_sbd;
+  	struct gfs2_inode *ip = GFS2_I(sdp->sd_qc_inode);
+  	struct gfs2_quota_change *qc = qd->qd_bh_qc;
+ -	bool needs_put = false;
+  	s64 x;
+  
+- 	mutex_lock(&sdp->sd_quota_mutex);
+  	gfs2_trans_add_meta(ip->i_gl, qd->qd_bh);
+  
+  	/*
+@@@ -711,9 -714,14 +732,8 @@@
+  	}
+  	qc->qc_change = cpu_to_be64(x);
+  
+ -	spin_unlock(&qd->qd_lockref.lock);
+ -
+ -	if (needs_put) {
+ -		slot_put(qd);
+ -		qd_put(qd);
+ -	}
+  	if (change < 0) /* Reset quiet flag if we freed some blocks */
+  		clear_bit(QDF_QMSG_QUIET, &qd->qd_flags);
+- 	mutex_unlock(&sdp->sd_quota_mutex);
+  }
+  
+  static int gfs2_write_buf_to_page(struct gfs2_sbd *sdp, unsigned long index,
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index f58302d2d280..5425cd90b005 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -787,7 +787,6 @@ struct gfs2_sbd {
+ 
+ 	struct list_head sd_quota_list;
+ 	atomic_t sd_quota_count;
+-	struct mutex sd_quota_mutex;
+ 	struct mutex sd_quota_sync_mutex;
+ 	wait_queue_head_t sd_quota_wait;
+ 
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index 5ad257a74c4b..4e43ec3b894a 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -105,7 +105,6 @@ static struct gfs2_sbd *init_sbd(struct super_block *sb)
+ 	init_completion(&sdp->sd_journal_ready);
+ 
+ 	INIT_LIST_HEAD(&sdp->sd_quota_list);
+-	mutex_init(&sdp->sd_quota_mutex);
+ 	mutex_init(&sdp->sd_quota_sync_mutex);
+ 	init_waitqueue_head(&sdp->sd_quota_wait);
+ 	spin_lock_init(&sdp->sd_bitmap_lock);
+* Unmerged path fs/gfs2/quota.c
