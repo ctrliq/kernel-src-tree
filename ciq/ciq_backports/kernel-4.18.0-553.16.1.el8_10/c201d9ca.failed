@@ -1,0 +1,637 @@
+xfs: rename xfs_bmap_add_free to xfs_free_extent_later
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Darrick J. Wong <djwong@kernel.org>
+commit c201d9ca5392b20f04882848a071025b0e194c17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/c201d9ca.failed
+
+xfs_bmap_add_free isn't a block mapping function; it schedules deferred
+freeing operations for a later point in a compound transaction chain.
+While it's primarily used by bunmapi, its use has expanded beyond that.
+Move it to xfs_alloc.c and rename the function since it's now general
+freeing functionality.  Bring the slab cache bits in line with the
+way we handle the other intent items.
+
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Chandan Babu R <chandan.babu@oracle.com>
+(cherry picked from commit c201d9ca5392b20f04882848a071025b0e194c17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_alloc.c
+#	fs/xfs/libxfs/xfs_bmap.c
+#	fs/xfs/libxfs/xfs_bmap.h
+#	fs/xfs/libxfs/xfs_defer.c
+#	fs/xfs/xfs_extfree_item.c
+#	fs/xfs/xfs_super.c
+diff --cc fs/xfs/libxfs/xfs_alloc.c
+index 2debb6bf24be,9bc1a03a8167..000000000000
+--- a/fs/xfs/libxfs/xfs_alloc.c
++++ b/fs/xfs/libxfs/xfs_alloc.c
+@@@ -27,7 -27,7 +27,11 @@@
+  #include "xfs_ag_resv.h"
+  #include "xfs_bmap.h"
+  
+++<<<<<<< HEAD
+ +extern kmem_zone_t	*xfs_bmap_free_item_zone;
+++=======
++ struct kmem_cache	*xfs_extfree_item_cache;
+++>>>>>>> c201d9ca5392 (xfs: rename xfs_bmap_add_free to xfs_free_extent_later)
+  
+  struct workqueue_struct *xfs_alloc_wq;
+  
+@@@ -2489,10 -2459,10 +2493,17 @@@ xfs_defer_agfl_block
+  	struct xfs_mount		*mp = tp->t_mountp;
+  	struct xfs_extent_free_item	*new;		/* new element */
+  
+++<<<<<<< HEAD
+ +	ASSERT(xfs_bmap_free_item_zone != NULL);
+ +	ASSERT(oinfo != NULL);
+ +
+ +	new = kmem_cache_alloc(xfs_bmap_free_item_zone,
+++=======
++ 	ASSERT(xfs_extfree_item_cache != NULL);
++ 	ASSERT(oinfo != NULL);
++ 
++ 	new = kmem_cache_alloc(xfs_extfree_item_cache,
+++>>>>>>> c201d9ca5392 (xfs: rename xfs_bmap_add_free to xfs_free_extent_later)
+  			       GFP_KERNEL | __GFP_NOFAIL);
+  	new->xefi_startblock = XFS_AGB_TO_FSB(mp, agno, agbno);
+  	new->xefi_blockcount = 1;
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index d4005787a5af,4dccd4d90622..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -37,8 -37,7 +37,12 @@@
+  #include "xfs_icache.h"
+  #include "xfs_iomap.h"
+  
+++<<<<<<< HEAD
+ +
+ +kmem_zone_t		*xfs_bmap_free_item_zone;
+++=======
++ struct kmem_cache		*xfs_bmap_intent_cache;
+++>>>>>>> c201d9ca5392 (xfs: rename xfs_bmap_add_free to xfs_free_extent_later)
+  
+  /*
+   * Miscellaneous helper functions
+@@@ -522,56 -522,6 +526,59 @@@ xfs_bmap_validate_ret
+  #endif /* DEBUG */
+  
+  /*
+++<<<<<<< HEAD
+ + * bmap free list manipulation functions
+ + */
+ +
+ +/*
+ + * Add the extent to the list of extents to be free at transaction end.
+ + * The list is maintained sorted (by block number).
+ + */
+ +void
+ +__xfs_bmap_add_free(
+ +	struct xfs_trans		*tp,
+ +	xfs_fsblock_t			bno,
+ +	xfs_filblks_t			len,
+ +	const struct xfs_owner_info	*oinfo,
+ +	bool				skip_discard)
+ +{
+ +	struct xfs_extent_free_item	*new;		/* new element */
+ +#ifdef DEBUG
+ +	struct xfs_mount		*mp = tp->t_mountp;
+ +	xfs_agnumber_t			agno;
+ +	xfs_agblock_t			agbno;
+ +
+ +	ASSERT(bno != NULLFSBLOCK);
+ +	ASSERT(len > 0);
+ +	ASSERT(len <= MAXEXTLEN);
+ +	ASSERT(!isnullstartblock(bno));
+ +	agno = XFS_FSB_TO_AGNO(mp, bno);
+ +	agbno = XFS_FSB_TO_AGBNO(mp, bno);
+ +	ASSERT(agno < mp->m_sb.sb_agcount);
+ +	ASSERT(agbno < mp->m_sb.sb_agblocks);
+ +	ASSERT(len < mp->m_sb.sb_agblocks);
+ +	ASSERT(agbno + len <= mp->m_sb.sb_agblocks);
+ +#endif
+ +	ASSERT(xfs_bmap_free_item_zone != NULL);
+ +
+ +	new = kmem_cache_alloc(xfs_bmap_free_item_zone,
+ +			       GFP_KERNEL | __GFP_NOFAIL);
+ +	new->xefi_startblock = bno;
+ +	new->xefi_blockcount = (xfs_extlen_t)len;
+ +	if (oinfo)
+ +		new->xefi_oinfo = *oinfo;
+ +	else
+ +		new->xefi_oinfo = XFS_RMAP_OINFO_SKIP_UPDATE;
+ +	new->xefi_skip_discard = skip_discard;
+ +	trace_xfs_bmap_free_defer(tp->t_mountp,
+ +			XFS_FSB_TO_AGNO(tp->t_mountp, bno), 0,
+ +			XFS_FSB_TO_AGBNO(tp->t_mountp, bno), len);
+ +	xfs_defer_add(tp, XFS_DEFER_OPS_TYPE_FREE, &new->xefi_list);
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> c201d9ca5392 (xfs: rename xfs_bmap_add_free to xfs_free_extent_later)
+   * Inode fork format manipulation functions
+   */
+  
+diff --cc fs/xfs/libxfs/xfs_bmap.h
+index 67641f669918,03d9aaf87413..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.h
++++ b/fs/xfs/libxfs/xfs_bmap.h
+@@@ -13,8 -13,6 +13,11 @@@ struct xfs_inode
+  struct xfs_mount;
+  struct xfs_trans;
+  
+++<<<<<<< HEAD
+ +extern kmem_zone_t	*xfs_bmap_free_item_zone;
+ +
+++=======
+++>>>>>>> c201d9ca5392 (xfs: rename xfs_bmap_add_free to xfs_free_extent_later)
+  /*
+   * Argument structure for xfs_bmap_alloc.
+   */
+diff --cc fs/xfs/libxfs/xfs_defer.c
+index eff4a127188e,0805ade2d300..000000000000
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@@ -18,6 -18,12 +18,15 @@@
+  #include "xfs_trace.h"
+  #include "xfs_icache.h"
+  #include "xfs_log.h"
+++<<<<<<< HEAD
+++=======
++ #include "xfs_rmap.h"
++ #include "xfs_refcount.h"
++ #include "xfs_bmap.h"
++ #include "xfs_alloc.h"
++ 
++ static struct kmem_cache	*xfs_defer_pending_cache;
+++>>>>>>> c201d9ca5392 (xfs: rename xfs_bmap_add_free to xfs_free_extent_later)
+  
+  /*
+   * Deferred Operations in XFS
+@@@ -742,3 -792,82 +751,85 @@@ xfs_defer_ops_continue
+  
+  	kmem_free(dfc);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /* Release the resources captured and continued during recovery. */
++ void
++ xfs_defer_resources_rele(
++ 	struct xfs_defer_resources	*dres)
++ {
++ 	unsigned short			i;
++ 
++ 	for (i = 0; i < dres->dr_inos; i++) {
++ 		xfs_iunlock(dres->dr_ip[i], XFS_ILOCK_EXCL);
++ 		xfs_irele(dres->dr_ip[i]);
++ 		dres->dr_ip[i] = NULL;
++ 	}
++ 
++ 	for (i = 0; i < dres->dr_bufs; i++) {
++ 		xfs_buf_relse(dres->dr_bp[i]);
++ 		dres->dr_bp[i] = NULL;
++ 	}
++ 
++ 	dres->dr_inos = 0;
++ 	dres->dr_bufs = 0;
++ 	dres->dr_ordered = 0;
++ }
++ 
++ static inline int __init
++ xfs_defer_init_cache(void)
++ {
++ 	xfs_defer_pending_cache = kmem_cache_create("xfs_defer_pending",
++ 			sizeof(struct xfs_defer_pending),
++ 			0, 0, NULL);
++ 
++ 	return xfs_defer_pending_cache != NULL ? 0 : -ENOMEM;
++ }
++ 
++ static inline void
++ xfs_defer_destroy_cache(void)
++ {
++ 	kmem_cache_destroy(xfs_defer_pending_cache);
++ 	xfs_defer_pending_cache = NULL;
++ }
++ 
++ /* Set up caches for deferred work items. */
++ int __init
++ xfs_defer_init_item_caches(void)
++ {
++ 	int				error;
++ 
++ 	error = xfs_defer_init_cache();
++ 	if (error)
++ 		return error;
++ 	error = xfs_rmap_intent_init_cache();
++ 	if (error)
++ 		goto err;
++ 	error = xfs_refcount_intent_init_cache();
++ 	if (error)
++ 		goto err;
++ 	error = xfs_bmap_intent_init_cache();
++ 	if (error)
++ 		goto err;
++ 	error = xfs_extfree_intent_init_cache();
++ 	if (error)
++ 		goto err;
++ 
++ 	return 0;
++ err:
++ 	xfs_defer_destroy_item_caches();
++ 	return error;
++ }
++ 
++ /* Destroy all the deferred work item caches, if they've been allocated. */
++ void
++ xfs_defer_destroy_item_caches(void)
++ {
++ 	xfs_extfree_intent_destroy_cache();
++ 	xfs_bmap_intent_destroy_cache();
++ 	xfs_refcount_intent_destroy_cache();
++ 	xfs_rmap_intent_destroy_cache();
++ 	xfs_defer_destroy_cache();
++ }
+++>>>>>>> c201d9ca5392 (xfs: rename xfs_bmap_add_free to xfs_free_extent_later)
+diff --cc fs/xfs/xfs_extfree_item.c
+index f0baca0aa89e,eb378e345f13..000000000000
+--- a/fs/xfs/xfs_extfree_item.c
++++ b/fs/xfs/xfs_extfree_item.c
+@@@ -482,7 -482,7 +482,11 @@@ xfs_extent_free_finish_item
+  			free->xefi_startblock,
+  			free->xefi_blockcount,
+  			&free->xefi_oinfo, free->xefi_skip_discard);
+++<<<<<<< HEAD
+ +	kmem_cache_free(xfs_bmap_free_item_zone, free);
+++=======
++ 	kmem_cache_free(xfs_extfree_item_cache, free);
+++>>>>>>> c201d9ca5392 (xfs: rename xfs_bmap_add_free to xfs_free_extent_later)
+  	return error;
+  }
+  
+@@@ -502,7 -502,7 +506,11 @@@ xfs_extent_free_cancel_item
+  	struct xfs_extent_free_item	*free;
+  
+  	free = container_of(item, struct xfs_extent_free_item, xefi_list);
+++<<<<<<< HEAD
+ +	kmem_cache_free(xfs_bmap_free_item_zone, free);
+++=======
++ 	kmem_cache_free(xfs_extfree_item_cache, free);
+++>>>>>>> c201d9ca5392 (xfs: rename xfs_bmap_add_free to xfs_free_extent_later)
+  }
+  
+  const struct xfs_defer_op_type xfs_extent_free_defer_type = {
+@@@ -564,7 -564,7 +572,11 @@@ xfs_agfl_free_finish_item
+  	extp->ext_len = free->xefi_blockcount;
+  	efdp->efd_next_extent++;
+  
+++<<<<<<< HEAD
+ +	kmem_cache_free(xfs_bmap_free_item_zone, free);
+++=======
++ 	kmem_cache_free(xfs_extfree_item_cache, free);
+++>>>>>>> c201d9ca5392 (xfs: rename xfs_bmap_add_free to xfs_free_extent_later)
+  	return error;
+  }
+  
+diff --cc fs/xfs/xfs_super.c
+index aff427b69139,f4c508428aad..000000000000
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@@ -1883,43 -1953,41 +1883,49 @@@ static struct file_system_type xfs_fs_t
+  MODULE_ALIAS_FS("xfs");
+  
+  STATIC int __init
+ -xfs_init_caches(void)
+ +xfs_init_zones(void)
+  {
+ -	int		error;
+ -
+ -	xfs_log_ticket_cache = kmem_cache_create("xfs_log_ticket",
+ +	xfs_log_ticket_zone = kmem_cache_create("xfs_log_ticket",
+  						sizeof(struct xlog_ticket),
+  						0, 0, NULL);
+ -	if (!xfs_log_ticket_cache)
+ +	if (!xfs_log_ticket_zone)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	xfs_bmap_free_item_zone = kmem_cache_create("xfs_bmap_free_item",
+ +					sizeof(struct xfs_extent_free_item),
+ +					0, 0, NULL);
+ +	if (!xfs_bmap_free_item_zone)
+ +		goto out_destroy_log_ticket_zone;
+ +
+ +	xfs_btree_cur_zone = kmem_cache_create("xfs_btree_cur",
+ +					       sizeof(struct xfs_btree_cur),
+ +					       0, 0, NULL);
+ +	if (!xfs_btree_cur_zone)
+ +		goto out_destroy_bmap_free_item_zone;
+++=======
++ 	error = xfs_btree_init_cur_caches();
++ 	if (error)
++ 		goto out_destroy_log_ticket_cache;
+++>>>>>>> c201d9ca5392 (xfs: rename xfs_bmap_add_free to xfs_free_extent_later)
+  
+ -	error = xfs_defer_init_item_caches();
+ -	if (error)
+ -		goto out_destroy_btree_cur_cache;
+ -
+ -	xfs_da_state_cache = kmem_cache_create("xfs_da_state",
+ +	xfs_da_state_zone = kmem_cache_create("xfs_da_state",
+  					      sizeof(struct xfs_da_state),
+  					      0, 0, NULL);
+ -	if (!xfs_da_state_cache)
+ -		goto out_destroy_defer_item_cache;
+ +	if (!xfs_da_state_zone)
+ +		goto out_destroy_btree_cur_zone;
+  
+ -	xfs_ifork_cache = kmem_cache_create("xfs_ifork",
+ +	xfs_ifork_zone = kmem_cache_create("xfs_ifork",
+  					   sizeof(struct xfs_ifork),
+  					   0, 0, NULL);
+ -	if (!xfs_ifork_cache)
+ -		goto out_destroy_da_state_cache;
+ +	if (!xfs_ifork_zone)
+ +		goto out_destroy_da_state_zone;
+  
+ -	xfs_trans_cache = kmem_cache_create("xfs_trans",
+ +	xfs_trans_zone = kmem_cache_create("xfs_trans",
+  					   sizeof(struct xfs_trans),
+  					   0, 0, NULL);
+ -	if (!xfs_trans_cache)
+ -		goto out_destroy_ifork_cache;
+ +	if (!xfs_trans_zone)
+ +		goto out_destroy_ifork_zone;
+  
+  
+  	/*
+@@@ -2009,40 -2077,40 +2015,77 @@@
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+ + out_destroy_bud_zone:
+ +	kmem_cache_destroy(xfs_bud_zone);
+ + out_destroy_cui_zone:
+ +	kmem_cache_destroy(xfs_cui_zone);
+ + out_destroy_cud_zone:
+ +	kmem_cache_destroy(xfs_cud_zone);
+ + out_destroy_rui_zone:
+ +	kmem_cache_destroy(xfs_rui_zone);
+ + out_destroy_rud_zone:
+ +	kmem_cache_destroy(xfs_rud_zone);
+ + out_destroy_icreate_zone:
+ +	kmem_cache_destroy(xfs_icreate_zone);
+ + out_destroy_ili_zone:
+ +	kmem_cache_destroy(xfs_ili_zone);
+ + out_destroy_inode_zone:
+ +	kmem_cache_destroy(xfs_inode_zone);
+ + out_destroy_efi_zone:
+ +	kmem_cache_destroy(xfs_efi_zone);
+ + out_destroy_efd_zone:
+ +	kmem_cache_destroy(xfs_efd_zone);
+ + out_destroy_buf_item_zone:
+ +	kmem_cache_destroy(xfs_buf_item_zone);
+ + out_destroy_trans_zone:
+ +	kmem_cache_destroy(xfs_trans_zone);
+ + out_destroy_ifork_zone:
+ +	kmem_cache_destroy(xfs_ifork_zone);
+ + out_destroy_da_state_zone:
+ +	kmem_cache_destroy(xfs_da_state_zone);
+ + out_destroy_btree_cur_zone:
+ +	kmem_cache_destroy(xfs_btree_cur_zone);
+ + out_destroy_bmap_free_item_zone:
+ +	kmem_cache_destroy(xfs_bmap_free_item_zone);
+ + out_destroy_log_ticket_zone:
+ +	kmem_cache_destroy(xfs_log_ticket_zone);
+++=======
++  out_destroy_bud_cache:
++ 	kmem_cache_destroy(xfs_bud_cache);
++  out_destroy_cui_cache:
++ 	kmem_cache_destroy(xfs_cui_cache);
++  out_destroy_cud_cache:
++ 	kmem_cache_destroy(xfs_cud_cache);
++  out_destroy_rui_cache:
++ 	kmem_cache_destroy(xfs_rui_cache);
++  out_destroy_rud_cache:
++ 	kmem_cache_destroy(xfs_rud_cache);
++  out_destroy_icreate_cache:
++ 	kmem_cache_destroy(xfs_icreate_cache);
++  out_destroy_ili_cache:
++ 	kmem_cache_destroy(xfs_ili_cache);
++  out_destroy_inode_cache:
++ 	kmem_cache_destroy(xfs_inode_cache);
++  out_destroy_efi_cache:
++ 	kmem_cache_destroy(xfs_efi_cache);
++  out_destroy_efd_cache:
++ 	kmem_cache_destroy(xfs_efd_cache);
++  out_destroy_buf_item_cache:
++ 	kmem_cache_destroy(xfs_buf_item_cache);
++  out_destroy_trans_cache:
++ 	kmem_cache_destroy(xfs_trans_cache);
++  out_destroy_ifork_cache:
++ 	kmem_cache_destroy(xfs_ifork_cache);
++  out_destroy_da_state_cache:
++ 	kmem_cache_destroy(xfs_da_state_cache);
++  out_destroy_defer_item_cache:
++ 	xfs_defer_destroy_item_caches();
++  out_destroy_btree_cur_cache:
++ 	xfs_btree_destroy_cur_caches();
++  out_destroy_log_ticket_cache:
++ 	kmem_cache_destroy(xfs_log_ticket_cache);
+++>>>>>>> c201d9ca5392 (xfs: rename xfs_bmap_add_free to xfs_free_extent_later)
+   out:
+  	return -ENOMEM;
+  }
+@@@ -2055,24 -2123,24 +2098,45 @@@ xfs_destroy_zones(void
+  	 * destroy caches.
+  	 */
+  	rcu_barrier();
+++<<<<<<< HEAD
+ +	kmem_cache_destroy(xfs_bui_zone);
+ +	kmem_cache_destroy(xfs_bud_zone);
+ +	kmem_cache_destroy(xfs_cui_zone);
+ +	kmem_cache_destroy(xfs_cud_zone);
+ +	kmem_cache_destroy(xfs_rui_zone);
+ +	kmem_cache_destroy(xfs_rud_zone);
+ +	kmem_cache_destroy(xfs_icreate_zone);
+ +	kmem_cache_destroy(xfs_ili_zone);
+ +	kmem_cache_destroy(xfs_inode_zone);
+ +	kmem_cache_destroy(xfs_efi_zone);
+ +	kmem_cache_destroy(xfs_efd_zone);
+ +	kmem_cache_destroy(xfs_buf_item_zone);
+ +	kmem_cache_destroy(xfs_trans_zone);
+ +	kmem_cache_destroy(xfs_ifork_zone);
+ +	kmem_cache_destroy(xfs_da_state_zone);
+ +	kmem_cache_destroy(xfs_btree_cur_zone);
+ +	kmem_cache_destroy(xfs_bmap_free_item_zone);
+ +	kmem_cache_destroy(xfs_log_ticket_zone);
+++=======
++ 	kmem_cache_destroy(xfs_bui_cache);
++ 	kmem_cache_destroy(xfs_bud_cache);
++ 	kmem_cache_destroy(xfs_cui_cache);
++ 	kmem_cache_destroy(xfs_cud_cache);
++ 	kmem_cache_destroy(xfs_rui_cache);
++ 	kmem_cache_destroy(xfs_rud_cache);
++ 	kmem_cache_destroy(xfs_icreate_cache);
++ 	kmem_cache_destroy(xfs_ili_cache);
++ 	kmem_cache_destroy(xfs_inode_cache);
++ 	kmem_cache_destroy(xfs_efi_cache);
++ 	kmem_cache_destroy(xfs_efd_cache);
++ 	kmem_cache_destroy(xfs_buf_item_cache);
++ 	kmem_cache_destroy(xfs_trans_cache);
++ 	kmem_cache_destroy(xfs_ifork_cache);
++ 	kmem_cache_destroy(xfs_da_state_cache);
++ 	xfs_defer_destroy_item_caches();
++ 	xfs_btree_destroy_cur_caches();
++ 	kmem_cache_destroy(xfs_log_ticket_cache);
+++>>>>>>> c201d9ca5392 (xfs: rename xfs_bmap_add_free to xfs_free_extent_later)
+  }
+  
+  STATIC int __init
+diff --git a/fs/xfs/libxfs/xfs_ag.c b/fs/xfs/libxfs/xfs_ag.c
+index 23949ec287d3..c2e2440e229d 100644
+--- a/fs/xfs/libxfs/xfs_ag.c
++++ b/fs/xfs/libxfs/xfs_ag.c
+@@ -850,7 +850,7 @@ xfs_ag_shrink_space(
+ 		if (err2 != -ENOSPC)
+ 			goto resv_err;
+ 
+-		__xfs_bmap_add_free(*tpp, args.fsbno, delta, NULL, true);
++		__xfs_free_extent_later(*tpp, args.fsbno, delta, NULL, true);
+ 
+ 		/*
+ 		 * Roll the transaction before trying to re-init the per-ag
+* Unmerged path fs/xfs/libxfs/xfs_alloc.c
+diff --git a/fs/xfs/libxfs/xfs_alloc.h b/fs/xfs/libxfs/xfs_alloc.h
+index 8f05e92ddf79..12f102f02e49 100644
+--- a/fs/xfs/libxfs/xfs_alloc.h
++++ b/fs/xfs/libxfs/xfs_alloc.h
+@@ -247,4 +247,36 @@ xfs_buf_to_agfl_bno(
+ 	return bp->b_addr;
+ }
+ 
++void __xfs_free_extent_later(struct xfs_trans *tp, xfs_fsblock_t bno,
++		xfs_filblks_t len, const struct xfs_owner_info *oinfo,
++		bool skip_discard);
++
++/*
++ * List of extents to be free "later".
++ * The list is kept sorted on xbf_startblock.
++ */
++struct xfs_extent_free_item {
++	struct list_head	xefi_list;
++	xfs_fsblock_t		xefi_startblock;/* starting fs block number */
++	xfs_extlen_t		xefi_blockcount;/* number of blocks in extent */
++	bool			xefi_skip_discard;
++	struct xfs_owner_info	xefi_oinfo;	/* extent owner */
++};
++
++static inline void
++xfs_free_extent_later(
++	struct xfs_trans		*tp,
++	xfs_fsblock_t			bno,
++	xfs_filblks_t			len,
++	const struct xfs_owner_info	*oinfo)
++{
++	__xfs_free_extent_later(tp, bno, len, oinfo, false);
++}
++
++
++extern struct kmem_cache	*xfs_extfree_item_cache;
++
++int __init xfs_extfree_intent_init_cache(void);
++void xfs_extfree_intent_destroy_cache(void);
++
+ #endif	/* __XFS_ALLOC_H__ */
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+* Unmerged path fs/xfs/libxfs/xfs_bmap.h
+diff --git a/fs/xfs/libxfs/xfs_bmap_btree.c b/fs/xfs/libxfs/xfs_bmap_btree.c
+index 1ceba020940e..c1672b3389be 100644
+--- a/fs/xfs/libxfs/xfs_bmap_btree.c
++++ b/fs/xfs/libxfs/xfs_bmap_btree.c
+@@ -286,7 +286,7 @@ xfs_bmbt_free_block(
+ 	struct xfs_owner_info	oinfo;
+ 
+ 	xfs_rmap_ino_bmbt_owner(&oinfo, ip->i_ino, cur->bc_ino.whichfork);
+-	xfs_bmap_add_free(cur->bc_tp, fsbno, 1, &oinfo);
++	xfs_free_extent_later(cur->bc_tp, fsbno, 1, &oinfo);
+ 	ip->i_nblocks--;
+ 
+ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+* Unmerged path fs/xfs/libxfs/xfs_defer.c
+diff --git a/fs/xfs/libxfs/xfs_ialloc.c b/fs/xfs/libxfs/xfs_ialloc.c
+index 19eb7ec0103f..387ea8d7cc1c 100644
+--- a/fs/xfs/libxfs/xfs_ialloc.c
++++ b/fs/xfs/libxfs/xfs_ialloc.c
+@@ -1828,7 +1828,7 @@ xfs_difree_inode_chunk(
+ 
+ 	if (!xfs_inobt_issparse(rec->ir_holemask)) {
+ 		/* not sparse, calculate extent info directly */
+-		xfs_bmap_add_free(tp, XFS_AGB_TO_FSB(mp, agno, sagbno),
++		xfs_free_extent_later(tp, XFS_AGB_TO_FSB(mp, agno, sagbno),
+ 				  M_IGEO(mp)->ialloc_blks,
+ 				  &XFS_RMAP_OINFO_INODES);
+ 		return;
+@@ -1873,7 +1873,7 @@ xfs_difree_inode_chunk(
+ 
+ 		ASSERT(agbno % mp->m_sb.sb_spino_align == 0);
+ 		ASSERT(contigblk % mp->m_sb.sb_spino_align == 0);
+-		xfs_bmap_add_free(tp, XFS_AGB_TO_FSB(mp, agno, agbno),
++		xfs_free_extent_later(tp, XFS_AGB_TO_FSB(mp, agno, agbno),
+ 				  contigblk, &XFS_RMAP_OINFO_INODES);
+ 
+ 		/* reset range to current bit and carry on... */
+diff --git a/fs/xfs/libxfs/xfs_refcount.c b/fs/xfs/libxfs/xfs_refcount.c
+index d48712931122..271f296af1b9 100644
+--- a/fs/xfs/libxfs/xfs_refcount.c
++++ b/fs/xfs/libxfs/xfs_refcount.c
+@@ -1088,7 +1088,7 @@ xfs_refcount_adjust_extents(
+ 				fsbno = XFS_AGB_TO_FSB(cur->bc_mp,
+ 						cur->bc_ag.pag->pag_agno,
+ 						tmp.rc_startblock);
+-				xfs_bmap_add_free(cur->bc_tp, fsbno,
++				xfs_free_extent_later(cur->bc_tp, fsbno,
+ 						  tmp.rc_blockcount, oinfo);
+ 			}
+ 
+@@ -1133,7 +1133,7 @@ xfs_refcount_adjust_extents(
+ 			fsbno = XFS_AGB_TO_FSB(cur->bc_mp,
+ 					cur->bc_ag.pag->pag_agno,
+ 					ext.rc_startblock);
+-			xfs_bmap_add_free(cur->bc_tp, fsbno, ext.rc_blockcount,
++			xfs_free_extent_later(cur->bc_tp, fsbno, ext.rc_blockcount,
+ 					  oinfo);
+ 		}
+ 
+@@ -1858,7 +1858,7 @@ xfs_refcount_recover_cow_leftovers(
+ 				rr->rr_rrec.rc_blockcount);
+ 
+ 		/* Free the block. */
+-		xfs_bmap_add_free(tp, fsb, rr->rr_rrec.rc_blockcount, NULL);
++		xfs_free_extent_later(tp, fsb, rr->rr_rrec.rc_blockcount, NULL);
+ 
+ 		error = xfs_trans_commit(tp);
+ 		if (error)
+* Unmerged path fs/xfs/xfs_extfree_item.c
+diff --git a/fs/xfs/xfs_reflink.c b/fs/xfs/xfs_reflink.c
+index 64f0a9bc5183..0fe0841f5806 100644
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@ -615,7 +615,7 @@ xfs_reflink_cancel_cow_blocks(
+ 			xfs_refcount_free_cow_extent(*tpp, del.br_startblock,
+ 					del.br_blockcount);
+ 
+-			xfs_bmap_add_free(*tpp, del.br_startblock,
++			xfs_free_extent_later(*tpp, del.br_startblock,
+ 					  del.br_blockcount, NULL);
+ 
+ 			/* Roll the transaction */
+* Unmerged path fs/xfs/xfs_super.c
