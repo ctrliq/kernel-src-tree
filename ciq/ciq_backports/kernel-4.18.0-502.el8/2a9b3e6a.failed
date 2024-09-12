@@ -1,0 +1,129 @@
+arm64: entry: fix EL1 debug transitions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit 2a9b3e6ac69a8bf177d8496a11e749e2dc72fa22
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/2a9b3e6a.failed
+
+In debug_exception_enter() and debug_exception_exit() we trace hardirqs
+on/off while RCU isn't guaranteed to be watching, and we don't save and
+restore the hardirq state, and so may return with this having changed.
+
+Handle this appropriately with new entry/exit helpers which do the bare
+minimum to ensure this is appropriately maintained, without marking
+debug exceptions as NMIs. These are placed in entry-common.c with the
+other entry/exit helpers.
+
+In future we'll want to reconsider whether some debug exceptions should
+be NMIs, but this will require a significant refactoring, and for now
+this should prevent issues with lockdep and RCU.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Cc: Catalin Marins <catalin.marinas@arm.com>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20201130115950.22492-12-mark.rutland@arm.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 2a9b3e6ac69a8bf177d8496a11e749e2dc72fa22)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/mm/fault.c
+diff --cc arch/arm64/mm/fault.c
+index 464083ad510b,795d224f184f..000000000000
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@@ -809,25 -789,6 +809,28 @@@ void __init hook_debug_fault_code(int n
+   */
+  static void debug_exception_enter(struct pt_regs *regs)
+  {
+++<<<<<<< HEAD
+ +	/*
+ +	 * Tell lockdep we disabled irqs in entry.S. Do nothing if they were
+ +	 * already disabled to preserve the last enabled/disabled addresses.
+ +	 */
+ +	if (interrupts_enabled(regs))
+ +		trace_hardirqs_off();
+ +
+ +	if (user_mode(regs)) {
+ +		RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+ +	} else {
+ +		/*
+ +		 * We might have interrupted pretty much anything.  In
+ +		 * fact, if we're a debug exception, we can even interrupt
+ +		 * NMI processing. We don't want this code makes in_nmi()
+ +		 * to return true, but we need to notify RCU.
+ +		 */
+ +		rcu_nmi_enter();
+ +	}
+ +
+++=======
+++>>>>>>> 2a9b3e6ac69a (arm64: entry: fix EL1 debug transitions)
+  	preempt_disable();
+  
+  	/* This code is a bit fragile.  Test it. */
+@@@ -838,12 -799,6 +841,15 @@@ NOKPROBE_SYMBOL(debug_exception_enter)
+  static void debug_exception_exit(struct pt_regs *regs)
+  {
+  	preempt_enable_no_resched();
+++<<<<<<< HEAD
+ +
+ +	if (!user_mode(regs))
+ +		rcu_nmi_exit();
+ +
+ +	if (interrupts_enabled(regs))
+ +		trace_hardirqs_on();
+++=======
+++>>>>>>> 2a9b3e6ac69a (arm64: entry: fix EL1 debug transitions)
+  }
+  NOKPROBE_SYMBOL(debug_exception_exit);
+  
+diff --git a/arch/arm64/kernel/entry-common.c b/arch/arm64/kernel/entry-common.c
+index c764ba2d11d7..92aab7ad1d3e 100644
+--- a/arch/arm64/kernel/entry-common.c
++++ b/arch/arm64/kernel/entry-common.c
+@@ -120,6 +120,30 @@ static void noinstr el1_inv(struct pt_regs *regs, unsigned long esr)
+ 	exit_to_kernel_mode(regs);
+ }
+ 
++static void noinstr arm64_enter_el1_dbg(struct pt_regs *regs)
++{
++	regs->lockdep_hardirqs = lockdep_hardirqs_enabled();
++
++	lockdep_hardirqs_off(CALLER_ADDR0);
++	rcu_nmi_enter();
++
++	trace_hardirqs_off_finish();
++}
++
++static void noinstr arm64_exit_el1_dbg(struct pt_regs *regs)
++{
++	bool restore = regs->lockdep_hardirqs;
++
++	if (restore) {
++		trace_hardirqs_on_prepare();
++		lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++	}
++
++	rcu_nmi_exit();
++	if (restore)
++		lockdep_hardirqs_on(CALLER_ADDR0);
++}
++
+ static void noinstr el1_dbg(struct pt_regs *regs, unsigned long esr)
+ {
+ 	unsigned long far = read_sysreg(far_el1);
+@@ -132,7 +156,9 @@ static void noinstr el1_dbg(struct pt_regs *regs, unsigned long esr)
+ 	if (system_uses_irq_prio_masking())
+ 		gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
+ 
++	arm64_enter_el1_dbg(regs);
+ 	do_debug_exception(far, esr, regs);
++	arm64_exit_el1_dbg(regs);
+ }
+ 
+ static void noinstr el1_fpac(struct pt_regs *regs, unsigned long esr)
+* Unmerged path arch/arm64/mm/fault.c
