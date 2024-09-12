@@ -1,0 +1,226 @@
+x86/resctrl: Move mbm_overflow_count() into resctrl_arch_rmid_read()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author James Morse <james.morse@arm.com>
+commit 1d81d15db39c2b517bc58f63008c6255dd08aafe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/1d81d15d.failed
+
+resctrl_arch_rmid_read() is intended as the function that an
+architecture agnostic resctrl filesystem driver can use to
+read a value in bytes from a counter. Currently the function returns
+the MBM values in chunks directly from hardware. When reading a bandwidth
+counter, mbm_overflow_count() must be used to correct for any possible
+overflow.
+
+mbm_overflow_count() is architecture specific, its behaviour should
+be part of resctrl_arch_rmid_read().
+
+Move the mbm_overflow_count() calls into resctrl_arch_rmid_read().
+This allows the resctrl filesystems's prev_msr to be removed in
+favour of the architecture private version.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Jamie Iles <quic_jiles@quicinc.com>
+	Reviewed-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Tested-by: Xin Hao <xhao@linux.alibaba.com>
+	Tested-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Tested-by: Cristian Marussi <cristian.marussi@arm.com>
+Link: https://lore.kernel.org/r/20220902154829.30399-18-james.morse@arm.com
+(cherry picked from commit 1d81d15db39c2b517bc58f63008c6255dd08aafe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/internal.h
+#	arch/x86/kernel/cpu/resctrl/monitor.c
+diff --cc arch/x86/kernel/cpu/resctrl/internal.h
+index 9780c2d2c637,8039e8aba7de..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/internal.h
++++ b/arch/x86/kernel/cpu/resctrl/internal.h
+@@@ -287,16 -281,14 +287,24 @@@ struct rftype 
+  /**
+   * struct mbm_state - status for each MBM counter in each domain
+   * @chunks:	Total data moved (multiply by rdt_group.mon_scale to get bytes)
+++<<<<<<< HEAD
+ + * @prev_msr:	Value of IA32_QM_CTR for this RMID last time we read it
+ + * @prev_bw_msr:Value of previous IA32_QM_CTR for bandwidth counting
+++=======
++  * @prev_bw_chunks: Previous chunks value read for bandwidth calculation
+++>>>>>>> 1d81d15db39c (x86/resctrl: Move mbm_overflow_count() into resctrl_arch_rmid_read())
+   * @prev_bw:	The most recent bandwidth in MBps
+   * @delta_bw:	Difference between the current and previous bandwidth
+   * @delta_comp:	Indicates whether to compute the delta_bw
+   */
+  struct mbm_state {
+  	u64	chunks;
+++<<<<<<< HEAD
+ +	u64	prev_msr;
+ +	u64	prev_bw_msr;
+++=======
++ 	u64	prev_bw_chunks;
+++>>>>>>> 1d81d15db39c (x86/resctrl: Move mbm_overflow_count() into resctrl_arch_rmid_read())
+  	u32	prev_bw;
+  	u32	delta_bw;
+  	bool	delta_comp;
+diff --cc arch/x86/kernel/cpu/resctrl/monitor.c
+index 810114991b5b,862a4462ed60..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/monitor.c
++++ b/arch/x86/kernel/cpu/resctrl/monitor.c
+@@@ -145,9 -137,54 +145,56 @@@ static inline struct rmid_entry *__rmid
+  	return entry;
+  }
+  
+ -static struct arch_mbm_state *get_arch_mbm_state(struct rdt_hw_domain *hw_dom,
+ -						 u32 rmid,
+ -						 enum resctrl_event_id eventid)
+ +static u64 __rmid_read(u32 rmid, u32 eventid)
+  {
+++<<<<<<< HEAD
+ +	u64 val;
+++=======
++ 	switch (eventid) {
++ 	case QOS_L3_OCCUP_EVENT_ID:
++ 		return NULL;
++ 	case QOS_L3_MBM_TOTAL_EVENT_ID:
++ 		return &hw_dom->arch_mbm_total[rmid];
++ 	case QOS_L3_MBM_LOCAL_EVENT_ID:
++ 		return &hw_dom->arch_mbm_local[rmid];
++ 	}
++ 
++ 	/* Never expect to get here */
++ 	WARN_ON_ONCE(1);
++ 
++ 	return NULL;
++ }
++ 
++ void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_domain *d,
++ 			     u32 rmid, enum resctrl_event_id eventid)
++ {
++ 	struct rdt_hw_domain *hw_dom = resctrl_to_arch_dom(d);
++ 	struct arch_mbm_state *am;
++ 
++ 	am = get_arch_mbm_state(hw_dom, rmid, eventid);
++ 	if (am)
++ 		memset(am, 0, sizeof(*am));
++ }
++ 
++ static u64 mbm_overflow_count(u64 prev_msr, u64 cur_msr, unsigned int width)
++ {
++ 	u64 shift = 64 - width, chunks;
++ 
++ 	chunks = (cur_msr << shift) - (prev_msr << shift);
++ 	return chunks >> shift;
++ }
++ 
++ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain *d,
++ 			   u32 rmid, enum resctrl_event_id eventid, u64 *val)
++ {
++ 	struct rdt_hw_resource *hw_res = resctrl_to_arch_res(r);
++ 	struct rdt_hw_domain *hw_dom = resctrl_to_arch_dom(d);
++ 	struct arch_mbm_state *am;
++ 	u64 msr_val;
++ 
++ 	if (!cpumask_test_cpu(smp_processor_id(), &d->cpu_mask))
++ 		return -EINVAL;
+++>>>>>>> 1d81d15db39c (x86/resctrl: Move mbm_overflow_count() into resctrl_arch_rmid_read())
+  
+  	/*
+  	 * As per the SDM, when IA32_QM_EVTSEL.EvtID (bits 7:0) is configured
+@@@ -158,16 -195,22 +205,26 @@@
+  	 * are error bits.
+  	 */
+  	wrmsr(MSR_IA32_QM_EVTSEL, eventid, rmid);
+ -	rdmsrl(MSR_IA32_QM_CTR, msr_val);
+ +	rdmsrl(MSR_IA32_QM_CTR, val);
+  
+ -	if (msr_val & RMID_VAL_ERROR)
+ -		return -EIO;
+ -	if (msr_val & RMID_VAL_UNAVAIL)
+ -		return -EINVAL;
+ +	return val;
+ +}
+  
+++<<<<<<< HEAD
+ +static bool rmid_dirty(struct rmid_entry *entry)
+ +{
+ +	u64 val = __rmid_read(entry->rmid, QOS_L3_OCCUP_EVENT_ID);
+++=======
++ 	am = get_arch_mbm_state(hw_dom, rmid, eventid);
++ 	if (am) {
++ 		*val = mbm_overflow_count(am->prev_msr, msr_val, hw_res->mbm_width);
++ 		am->prev_msr = msr_val;
++ 	} else {
++ 		*val = msr_val;
++ 	}
+++>>>>>>> 1d81d15db39c (x86/resctrl: Move mbm_overflow_count() into resctrl_arch_rmid_read())
+  
+ -	return 0;
+ +	return val >= resctrl_cqm_threshold;
+  }
+  
+  /*
+@@@ -285,23 -339,18 +342,37 @@@ void free_rmid(u32 rmid
+  		list_add_tail(&entry->list, &rmid_free_lru);
+  }
+  
+++<<<<<<< HEAD
+ +static u64 mbm_overflow_count(u64 prev_msr, u64 cur_msr, unsigned int width)
+ +{
+ +	u64 shift = 64 - width, chunks;
+ +
+ +	chunks = (cur_msr << shift) - (prev_msr << shift);
+ +	return chunks >> shift;
+ +}
+ +
+ +static u64 __mon_event_count(u32 rmid, struct rmid_read *rr)
+ +{
+ +	struct mbm_state *m;
+ +	u64 chunks, tval;
+++=======
++ static int __mon_event_count(u32 rmid, struct rmid_read *rr)
++ {
++ 	struct mbm_state *m;
++ 	u64 tval = 0;
++ 
++ 	if (rr->first)
++ 		resctrl_arch_reset_rmid(rr->r, rr->d, rmid, rr->evtid);
++ 
++ 	rr->err = resctrl_arch_rmid_read(rr->r, rr->d, rmid, rr->evtid, &tval);
++ 	if (rr->err)
++ 		return rr->err;
+++>>>>>>> 1d81d15db39c (x86/resctrl: Move mbm_overflow_count() into resctrl_arch_rmid_read())
+  
+ +	tval = __rmid_read(rmid, rr->evtid);
+ +	if (tval & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL)) {
+ +		return tval;
+ +	}
+  	switch (rr->evtid) {
+  	case QOS_L3_OCCUP_EVENT_ID:
+  		rr->val += tval;
+@@@ -322,13 -371,10 +393,20 @@@
+  
+  	if (rr->first) {
+  		memset(m, 0, sizeof(struct mbm_state));
+++<<<<<<< HEAD
+ +		m->prev_bw_msr = m->prev_msr = tval;
+ +		return 0;
+ +	}
+ +
+ +	chunks = mbm_overflow_count(m->prev_msr, tval, rr->r->mbm_width);
+ +	m->chunks += chunks;
+ +	m->prev_msr = tval;
+++=======
++ 		return 0;
++ 	}
++ 
++ 	m->chunks += tval;
+++>>>>>>> 1d81d15db39c (x86/resctrl: Move mbm_overflow_count() into resctrl_arch_rmid_read())
+  
+  	rr->val += get_corrected_mbm_count(rmid, m->chunks);
+  
+* Unmerged path arch/x86/kernel/cpu/resctrl/internal.h
+* Unmerged path arch/x86/kernel/cpu/resctrl/monitor.c
