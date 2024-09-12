@@ -1,0 +1,1439 @@
+ice: convert VF storage to hash table with krefs and RCU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.26.1.el8_6
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 3d5985a185e6abfc0b38ed187819016a79eca864
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.26.1.el8_6/3d5985a1.failed
+
+The ice driver stores VF structures in a simple array which is allocated
+once at the time of VF creation. The VF structures are then accessed
+from the array by their VF ID. The ID must be between 0 and the number
+of allocated VFs.
+
+Multiple threads can access this table:
+
+ * .ndo operations such as .ndo_get_vf_cfg or .ndo_set_vf_trust
+ * interrupts, such as due to messages from the VF using the virtchnl
+   communication
+ * processing such as device reset
+ * commands to add or remove VFs
+
+The current implementation does not keep track of when all threads are
+done operating on a VF and can potentially result in use-after-free
+issues caused by one thread accessing a VF structure after it has been
+released when removing VFs. Some of these are prevented with various
+state flags and checks.
+
+In addition, this structure is quite static and does not support a
+planned future where virtualization can be more dynamic. As we begin to
+look at supporting Scalable IOV with the ice driver (as opposed to just
+supporting Single Root IOV), this structure is not sufficient.
+
+In the future, VFs will be able to be added and removed individually and
+dynamically.
+
+To allow for this, and to better protect against a whole class of
+use-after-free bugs, replace the VF storage with a combination of a hash
+table and krefs to reference track all of the accesses to VFs through
+the hash table.
+
+A hash table still allows efficient look up of the VF given its ID, but
+also allows adding and removing VFs. It does not require contiguous VF
+IDs.
+
+The use of krefs allows the cleanup of the VF memory to be delayed until
+after all threads have released their reference (by calling ice_put_vf).
+
+To prevent corruption of the hash table, a combination of RCU and the
+mutex table_lock are used. Addition and removal from the hash table use
+the RCU-aware hash macros. This allows simple read-only look ups that
+iterate to locate a single VF can be fast using RCU. Accesses which
+modify the hash table, or which can't take RCU because they sleep, will
+hold the mutex lock.
+
+By using this design, we have a stronger guarantee that the VF structure
+can't be released until after all threads are finished operating on it.
+We also pave the way for the more dynamic Scalable IOV implementation in
+the future.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Konrad Jankowski <konrad0.jankowski@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 3d5985a185e6abfc0b38ed187819016a79eca864)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_eswitch.c
+#	drivers/net/ethernet/intel/ice/ice_ethtool.c
+#	drivers/net/ethernet/intel/ice/ice_lib.c
+#	drivers/net/ethernet/intel/ice/ice_main.c
+#	drivers/net/ethernet/intel/ice/ice_repr.c
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_fdir.c
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+diff --cc drivers/net/ethernet/intel/ice/ice_eswitch.c
+index 34a4474731de,9a84d746a6c4..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_eswitch.c
++++ b/drivers/net/ethernet/intel/ice/ice_eswitch.c
+@@@ -207,11 -222,13 +209,18 @@@ static void ice_eswitch_remap_rings_to_
+  static void
+  ice_eswitch_release_reprs(struct ice_pf *pf, struct ice_vsi *ctrl_vsi)
+  {
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	int i;
+  
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, i) {
+ +		struct ice_vsi *vsi = pf->vf[i].repr->src_vsi;
+ +		struct ice_vf *vf = &pf->vf[i];
+++=======
++ 	lockdep_assert_held(&pf->vfs.table_lock);
++ 
++ 	ice_for_each_vf(pf, bkt, vf) {
++ 		struct ice_vsi *vsi = vf->repr->src_vsi;
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  
+  		/* Skip VFs that aren't configured */
+  		if (!vf->repr->dst)
+@@@ -235,11 -252,13 +244,18 @@@ static int ice_eswitch_setup_reprs(stru
+  {
+  	struct ice_vsi *ctrl_vsi = pf->switchdev.control_vsi;
+  	int max_vsi_num = 0;
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	int i;
+  
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, i) {
+ +		struct ice_vsi *vsi = pf->vf[i].repr->src_vsi;
+ +		struct ice_vf *vf = &pf->vf[i];
+++=======
++ 	lockdep_assert_held(&pf->vfs.table_lock);
++ 
++ 	ice_for_each_vf(pf, bkt, vf) {
++ 		struct ice_vsi *vsi = vf->repr->src_vsi;
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  
+  		ice_remove_vsi_fltr(&pf->hw, vsi->idx);
+  		vf->repr->dst = metadata_dst_alloc(0, METADATA_HW_PORT_MUX,
+@@@ -414,10 -433,13 +430,17 @@@ ice_eswitch_vsi_setup(struct ice_pf *pf
+   */
+  static void ice_eswitch_napi_del(struct ice_pf *pf)
+  {
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	int i;
+  
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, i)
+ +		netif_napi_del(&pf->vf[i].repr->q_vector->napi);
+++=======
++ 	lockdep_assert_held(&pf->vfs.table_lock);
++ 
++ 	ice_for_each_vf(pf, bkt, vf)
++ 		netif_napi_del(&vf->repr->q_vector->napi);
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  }
+  
+  /**
+@@@ -426,10 -448,13 +449,17 @@@
+   */
+  static void ice_eswitch_napi_enable(struct ice_pf *pf)
+  {
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	int i;
+  
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, i)
+ +		napi_enable(&pf->vf[i].repr->q_vector->napi);
+++=======
++ 	lockdep_assert_held(&pf->vfs.table_lock);
++ 
++ 	ice_for_each_vf(pf, bkt, vf)
++ 		napi_enable(&vf->repr->q_vector->napi);
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  }
+  
+  /**
+@@@ -438,10 -463,13 +468,17 @@@
+   */
+  static void ice_eswitch_napi_disable(struct ice_pf *pf)
+  {
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	int i;
+  
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, i)
+ +		napi_disable(&pf->vf[i].repr->q_vector->napi);
+++=======
++ 	lockdep_assert_held(&pf->vfs.table_lock);
++ 
++ 	ice_for_each_vf(pf, bkt, vf)
++ 		napi_disable(&vf->repr->q_vector->napi);
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  }
+  
+  /**
+@@@ -610,9 -638,11 +647,11 @@@ int ice_eswitch_configure(struct ice_p
+   */
+  static void ice_eswitch_start_all_tx_queues(struct ice_pf *pf)
+  {
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	struct ice_repr *repr;
+ +	int i;
+  
++ 	lockdep_assert_held(&pf->vfs.table_lock);
++ 
+  	if (test_bit(ICE_DOWN, pf->state))
+  		return;
+  
+@@@ -629,9 -658,11 +668,11 @@@
+   */
+  void ice_eswitch_stop_all_tx_queues(struct ice_pf *pf)
+  {
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	struct ice_repr *repr;
+ +	int i;
+  
++ 	lockdep_assert_held(&pf->vfs.table_lock);
++ 
+  	if (test_bit(ICE_DOWN, pf->state))
+  		return;
+  
+diff --cc drivers/net/ethernet/intel/ice/ice_ethtool.c
+index 3e0089fcaa98,399625892f9e..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@@ -315,16 -316,20 +315,30 @@@ out
+   */
+  static bool ice_active_vfs(struct ice_pf *pf)
+  {
+++<<<<<<< HEAD
+ +	unsigned int i;
+ +
+ +	ice_for_each_vf(pf, i) {
+ +		struct ice_vf *vf = &pf->vf[i];
+ +
+ +		if (test_bit(ICE_VF_STATE_ACTIVE, vf->vf_states))
+ +			return true;
+++=======
++ 	bool active = false;
++ 	struct ice_vf *vf;
++ 	unsigned int bkt;
++ 
++ 	rcu_read_lock();
++ 	ice_for_each_vf_rcu(pf, bkt, vf) {
++ 		if (test_bit(ICE_VF_STATE_ACTIVE, vf->vf_states)) {
++ 			active = true;
++ 			break;
++ 		}
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  	}
++ 	rcu_read_unlock();
+  
+- 	return false;
++ 	return active;
+  }
+  
+  /**
+diff --cc drivers/net/ethernet/intel/ice/ice_lib.c
+index 80f50982752a,113a2c56c14c..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@@ -441,8 -439,10 +441,15 @@@ static irqreturn_t ice_eswitch_msix_cle
+  	if (!q_vector->tx.tx_ring && !q_vector->rx.rx_ring)
+  		return IRQ_HANDLED;
+  
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, i)
+ +		napi_schedule(&pf->vf[i].repr->q_vector->napi);
+++=======
++ 	rcu_read_lock();
++ 	ice_for_each_vf_rcu(pf, bkt, vf)
++ 		napi_schedule(&vf->repr->q_vector->napi);
++ 	rcu_read_unlock();
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  
+  	return IRQ_HANDLED;
+  }
+@@@ -1321,6 -1334,36 +1328,39 @@@ ice_get_res(struct ice_pf *pf, struct i
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_get_vf_ctrl_res - Get VF control VSI resource
++  * @pf: pointer to the PF structure
++  * @vsi: the VSI to allocate a resource for
++  *
++  * Look up whether another VF has already allocated the control VSI resource.
++  * If so, re-use this resource so that we share it among all VFs.
++  *
++  * Otherwise, allocate the resource and return it.
++  */
++ static int ice_get_vf_ctrl_res(struct ice_pf *pf, struct ice_vsi *vsi)
++ {
++ 	struct ice_vf *vf;
++ 	unsigned int bkt;
++ 	int base;
++ 
++ 	rcu_read_lock();
++ 	ice_for_each_vf_rcu(pf, bkt, vf) {
++ 		if (vf != vsi->vf && vf->ctrl_vsi_idx != ICE_NO_VSI) {
++ 			base = pf->vsi[vf->ctrl_vsi_idx]->base_vector;
++ 			rcu_read_unlock();
++ 			return base;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return ice_get_res(pf, pf->irq_tracker, vsi->num_q_vectors,
++ 			   ICE_RES_VF_CTRL_VEC_ID);
++ }
++ 
++ /**
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+   * ice_vsi_setup_vector_base - Set up the base vector for the given VSI
+   * @vsi: ptr to the VSI
+   *
+@@@ -3069,6 -2889,37 +3109,40 @@@ void ice_napi_del(struct ice_vsi *vsi
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_free_vf_ctrl_res - Free the VF control VSI resource
++  * @pf: pointer to PF structure
++  * @vsi: the VSI to free resources for
++  *
++  * Check if the VF control VSI resource is still in use. If no VF is using it
++  * any more, release the VSI resource. Otherwise, leave it to be cleaned up
++  * once no other VF uses it.
++  */
++ static void ice_free_vf_ctrl_res(struct ice_pf *pf,  struct ice_vsi *vsi)
++ {
++ 	struct ice_vf *vf;
++ 	unsigned int bkt;
++ 
++ 	rcu_read_lock();
++ 	ice_for_each_vf_rcu(pf, bkt, vf) {
++ 		if (vf != vsi->vf && vf->ctrl_vsi_idx != ICE_NO_VSI) {
++ 			rcu_read_unlock();
++ 			return;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	/* No other VFs left that have control VSI. It is now safe to reclaim
++ 	 * SW interrupts back to the common pool.
++ 	 */
++ 	ice_free_res(pf->irq_tracker, vsi->base_vector,
++ 		     ICE_RES_VF_CTRL_VEC_ID);
++ 	pf->num_avail_sw_msix += vsi->num_q_vectors;
++ }
++ 
++ /**
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+   * ice_vsi_release - Delete a VSI and free its resources
+   * @vsi: the VSI being removed
+   *
+diff --cc drivers/net/ethernet/intel/ice/ice_main.c
+index 4135abb34828,289e5c99e313..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@@ -518,8 -521,10 +518,15 @@@ ice_prepare_for_reset(struct ice_pf *pf
+  		ice_vc_notify_reset(pf);
+  
+  	/* Disable VFs until reset is completed */
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, i)
+ +		ice_set_vf_state_qs_dis(&pf->vf[i]);
+++=======
++ 	mutex_lock(&pf->vfs.table_lock);
++ 	ice_for_each_vf(pf, bkt, vf)
++ 		ice_set_vf_state_qs_dis(vf);
++ 	mutex_unlock(&pf->vfs.table_lock);
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  
+  	if (ice_is_eswitch_mode_switchdev(pf)) {
+  		if (reset_type != ICE_RESET_PFR)
+@@@ -1749,12 -1758,11 +1756,18 @@@ static void ice_handle_mdd_event(struc
+  	/* Check to see if one of the VFs caused an MDD event, and then
+  	 * increment counters and set print pending
+  	 */
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, i) {
+ +		struct ice_vf *vf = &pf->vf[i];
+ +
+ +		reg = rd32(hw, VP_MDET_TX_PQM(i));
+++=======
++ 	mutex_lock(&pf->vfs.table_lock);
++ 	ice_for_each_vf(pf, bkt, vf) {
++ 		reg = rd32(hw, VP_MDET_TX_PQM(vf->vf_id));
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  		if (reg & VP_MDET_TX_PQM_VALID_M) {
+ -			wr32(hw, VP_MDET_TX_PQM(vf->vf_id), 0xFFFF);
+ +			wr32(hw, VP_MDET_TX_PQM(i), 0xFFFF);
+  			vf->mdd_tx_events.count++;
+  			set_bit(ICE_MDD_VF_PRINT_PENDING, pf->state);
+  			if (netif_msg_tx_err(pf))
+diff --cc drivers/net/ethernet/intel/ice/ice_repr.c
+index 787f51c8ddb2,2adfaf21e056..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_repr.c
++++ b/drivers/net/ethernet/intel/ice/ice_repr.c
+@@@ -338,13 -338,13 +338,19 @@@ static void ice_repr_rem(struct ice_vf 
+   */
+  void ice_repr_rem_from_all_vfs(struct ice_pf *pf)
+  {
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	int i;
+ +
+ +	ice_for_each_vf(pf, i) {
+ +		struct ice_vf *vf = &pf->vf[i];
+  
+++<<<<<<< HEAD
+++=======
++ 	lockdep_assert_held(&pf->vfs.table_lock);
++ 
++ 	ice_for_each_vf(pf, bkt, vf)
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  		ice_repr_rem(vf);
+ +	}
+  }
+  
+  /**
+@@@ -353,12 -353,13 +359,18 @@@
+   */
+  int ice_repr_add_for_all_vfs(struct ice_pf *pf)
+  {
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+  	int err;
+ +	int i;
+ +
+ +	ice_for_each_vf(pf, i) {
+ +		struct ice_vf *vf = &pf->vf[i];
+  
+++<<<<<<< HEAD
+++=======
++ 	lockdep_assert_held(&pf->vfs.table_lock);
++ 
++ 	ice_for_each_vf(pf, bkt, vf) {
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  		err = ice_repr_add(vf);
+  		if (err)
+  			goto err;
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl_fdir.c
+index d64df81d4893,07989f1d08ef..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_fdir.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_fdir.c
+@@@ -1576,10 -1578,10 +1576,15 @@@ void ice_flush_fdir_ctx(struct ice_pf *
+  	if (!test_and_clear_bit(ICE_FD_VF_FLUSH_CTX, pf->state))
+  		return;
+  
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, i) {
+++=======
++ 	mutex_lock(&pf->vfs.table_lock);
++ 	ice_for_each_vf(pf, bkt, vf) {
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  		struct device *dev = ice_pf_to_dev(pf);
+  		enum virtchnl_fdir_prgm_status status;
+ +		struct ice_vf *vf = &pf->vf[i];
+  		struct ice_vf_fdir_ctx *ctx;
+  		unsigned long flags;
+  		int ret;
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+index e45882c22848,4840570c494d..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+@@@ -173,18 -175,107 +173,122 @@@ struct ice_vsi *ice_get_vf_vsi(struct i
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * ice_validate_vf_id - helper to check if VF ID is valid
+ + * @pf: pointer to the PF structure
+ + * @vf_id: the ID of the VF to check
+++=======
++  * ice_get_vf_by_id - Get pointer to VF by ID
++  * @pf: the PF private structure
++  * @vf_id: the VF ID to locate
++  *
++  * Locate and return a pointer to the VF structure associated with a given ID.
++  * Returns NULL if the ID does not have a valid VF structure associated with
++  * it.
++  *
++  * This function takes a reference to the VF, which must be released by
++  * calling ice_put_vf() once the caller is finished accessing the VF structure
++  * returned.
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+   */
+ -struct ice_vf *ice_get_vf_by_id(struct ice_pf *pf, u16 vf_id)
+ +static int ice_validate_vf_id(struct ice_pf *pf, u16 vf_id)
+  {
+++<<<<<<< HEAD
+ +	/* vf_id range is only valid for 0-255, and should always be unsigned */
+ +	if (vf_id >= pf->num_alloc_vfs) {
+ +		dev_err(ice_pf_to_dev(pf), "Invalid VF ID: %u\n", vf_id);
+ +		return -EINVAL;
+ +	}
+ +	return 0;
+++=======
++ 	struct ice_vf *vf;
++ 
++ 	rcu_read_lock();
++ 	hash_for_each_possible_rcu(pf->vfs.table, vf, entry, vf_id) {
++ 		if (vf->vf_id == vf_id) {
++ 			struct ice_vf *found;
++ 
++ 			if (kref_get_unless_zero(&vf->refcnt))
++ 				found = vf;
++ 			else
++ 				found = NULL;
++ 
++ 			rcu_read_unlock();
++ 			return found;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return NULL;
++ }
++ 
++ /**
++  * ice_release_vf - Release VF associated with a refcount
++  * @ref: the kref decremented to zero
++  *
++  * Callback function for kref_put to release a VF once its reference count has
++  * hit zero.
++  */
++ static void ice_release_vf(struct kref *ref)
++ {
++ 	struct ice_vf *vf = container_of(ref, struct ice_vf, refcnt);
++ 
++ 	mutex_destroy(&vf->cfg_lock);
++ 
++ 	kfree_rcu(vf, rcu);
++ }
++ 
++ /**
++  * ice_put_vf - Release a reference to a VF
++  * @vf: the VF structure to decrease reference count on
++  *
++  * This must be called after ice_get_vf_by_id() once the reference to the VF
++  * structure is no longer used. Otherwise, the VF structure will never be
++  * freed.
++  */
++ void ice_put_vf(struct ice_vf *vf)
++ {
++ 	kref_put(&vf->refcnt, ice_release_vf);
++ }
++ 
++ /**
++  * ice_has_vfs - Return true if the PF has any associated VFs
++  * @pf: the PF private structure
++  *
++  * Return whether or not the PF has any allocated VFs.
++  *
++  * Note that this function only guarantees that there are no VFs at the point
++  * of calling it. It does not guarantee that no more VFs will be added.
++  */
++ bool ice_has_vfs(struct ice_pf *pf)
++ {
++ 	/* A simple check that the hash table is not empty does not require
++ 	 * the mutex or rcu_read_lock.
++ 	 */
++ 	return !hash_empty(pf->vfs.table);
++ }
++ 
++ /**
++  * ice_get_num_vfs - Get number of allocated VFs
++  * @pf: the PF private structure
++  *
++  * Return the total number of allocated VFs. NOTE: VF IDs are not guaranteed
++  * to be contiguous. Do not assume that a VF ID is guaranteed to be less than
++  * the output of this function.
++  */
++ u16 ice_get_num_vfs(struct ice_pf *pf)
++ {
++ 	struct ice_vf *vf;
++ 	unsigned int bkt;
++ 	u16 num_vfs = 0;
++ 
++ 	rcu_read_lock();
++ 	ice_for_each_vf_rcu(pf, bkt, vf)
++ 		num_vfs++;
++ 	rcu_read_unlock();
++ 
++ 	return num_vfs;
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  }
+  
+  /**
+@@@ -215,11 -332,11 +345,16 @@@ ice_vc_vf_broadcast(struct ice_pf *pf, 
+  		    enum virtchnl_status_code v_retval, u8 *msg, u16 msglen)
+  {
+  	struct ice_hw *hw = &pf->hw;
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	unsigned int i;
+  
+ +	ice_for_each_vf(pf, i) {
+ +		struct ice_vf *vf = &pf->vf[i];
+ +
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&pf->vfs.table_lock);
++ 	ice_for_each_vf(pf, bkt, vf) {
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  		/* Not all vfs are enabled so skip the ones that are not */
+  		if (!test_bit(ICE_VF_STATE_INIT, vf->vf_states) &&
+  		    !test_bit(ICE_VF_STATE_ACTIVE, vf->vf_states))
+@@@ -497,14 -615,14 +633,12 @@@ static void ice_dis_vf_qs(struct ice_v
+  void ice_free_vfs(struct ice_pf *pf)
+  {
+  	struct device *dev = ice_pf_to_dev(pf);
+ -	struct ice_vfs *vfs = &pf->vfs;
+  	struct ice_hw *hw = &pf->hw;
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	unsigned int i;
+  
+ -	if (!ice_has_vfs(pf))
+ +	if (!pf->vf)
+  		return;
+  
+- 	ice_eswitch_release(pf);
+- 
+  	while (test_and_set_bit(ICE_VF_DIS, pf->state))
+  		usleep_range(1000, 2000);
+  
+@@@ -517,9 -635,11 +651,17 @@@
+  	else
+  		dev_warn(dev, "VFs are assigned - not disabling SR-IOV\n");
+  
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, i) {
+ +		struct ice_vf *vf = &pf->vf[i];
+ +
+++=======
++ 	mutex_lock(&vfs->table_lock);
++ 
++ 	ice_eswitch_release(pf);
++ 
++ 	ice_for_each_vf(pf, bkt, vf) {
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  		mutex_lock(&vf->cfg_lock);
+  
+  		ice_dis_vf_qs(vf);
+@@@ -553,10 -671,10 +693,17 @@@
+  	if (ice_sriov_free_msix_res(pf))
+  		dev_err(dev, "Failed to free MSIX resources used by SR-IOV\n");
+  
+++<<<<<<< HEAD
+ +	pf->num_qps_per_vf = 0;
+ +	pf->num_alloc_vfs = 0;
+ +	devm_kfree(dev, pf->vf);
+ +	pf->vf = NULL;
+++=======
++ 	vfs->num_qps_per = 0;
++ 	ice_free_vf_entries(pf);
++ 
++ 	mutex_unlock(&vfs->table_lock);
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  
+  	clear_bit(ICE_VF_DIS, pf->state);
+  	clear_bit(ICE_FLAG_SRIOV_ENA, pf->flags);
+@@@ -1396,24 -1580,30 +1545,28 @@@ bool ice_reset_all_vfs(struct ice_pf *p
+  	struct device *dev = ice_pf_to_dev(pf);
+  	struct ice_hw *hw = &pf->hw;
+  	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	int v, i;
+  
+  	/* If we don't have any VFs, then there is nothing to reset */
+ -	if (!ice_has_vfs(pf))
+ +	if (!pf->num_alloc_vfs)
+  		return false;
+  
++ 	mutex_lock(&pf->vfs.table_lock);
++ 
+  	/* clear all malicious info if the VFs are getting reset */
+ -	ice_for_each_vf(pf, bkt, vf)
+ -		if (ice_mbx_clear_malvf(&hw->mbx_snapshot, pf->vfs.malvfs,
+ -					ICE_MAX_VF_COUNT, vf->vf_id))
+ -			dev_dbg(dev, "failed to clear malicious VF state for VF %u\n",
+ -				vf->vf_id);
+ +	ice_for_each_vf(pf, i)
+ +		if (ice_mbx_clear_malvf(&hw->mbx_snapshot, pf->malvfs, ICE_MAX_VF_COUNT, i))
+ +			dev_dbg(dev, "failed to clear malicious VF state for VF %u\n", i);
+  
+  	/* If VFs have been disabled, there is no need to reset */
+- 	if (test_and_set_bit(ICE_VF_DIS, pf->state))
++ 	if (test_and_set_bit(ICE_VF_DIS, pf->state)) {
++ 		mutex_unlock(&pf->vfs.table_lock);
+  		return false;
++ 	}
+  
+  	/* Begin reset on all VFs at once */
+ -	ice_for_each_vf(pf, bkt, vf)
+ -		ice_trigger_vf_reset(vf, is_vflr, true);
+ +	ice_for_each_vf(pf, v)
+ +		ice_trigger_vf_reset(&pf->vf[v], is_vflr, true);
+  
+  	/* HW requires some time to make sure it can flush the FIFO for a VF
+  	 * when it resets it. Poll the VPGEN_VFRSTAT register for each VF in
+@@@ -1626,10 -1817,13 +1781,17 @@@ bool ice_reset_vf(struct ice_vf *vf, bo
+   */
+  void ice_vc_notify_link_state(struct ice_pf *pf)
+  {
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	int i;
+  
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, i)
+ +		ice_vc_notify_vf_link_state(&pf->vf[i]);
+++=======
++ 	mutex_lock(&pf->vfs.table_lock);
++ 	ice_for_each_vf(pf, bkt, vf)
++ 		ice_vc_notify_vf_link_state(vf);
++ 	mutex_unlock(&pf->vfs.table_lock);
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  }
+  
+  /**
+@@@ -1735,11 -1938,14 +1897,18 @@@ release_vsi
+  static int ice_start_vfs(struct ice_pf *pf)
+  {
+  	struct ice_hw *hw = &pf->hw;
+ -	unsigned int bkt, it_cnt;
+ -	struct ice_vf *vf;
+ -	int retval;
+ +	int retval, i;
+ +
+ +	ice_for_each_vf(pf, i) {
+ +		struct ice_vf *vf = &pf->vf[i];
+  
+++<<<<<<< HEAD
+++=======
++ 	lockdep_assert_held(&pf->vfs.table_lock);
++ 
++ 	it_cnt = 0;
++ 	ice_for_each_vf(pf, bkt, vf) {
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  		ice_clear_vf_reset_trigger(vf);
+  
+  		retval = ice_init_vf_vsi_res(vf);
+@@@ -1769,18 -1978,38 +1938,48 @@@ teardown
+  }
+  
+  /**
+-  * ice_set_dflt_settings_vfs - set VF defaults during initialization/creation
+-  * @pf: PF holding reference to all VFs for default configuration
++  * ice_create_vf_entries - Allocate and insert VF entries
++  * @pf: pointer to the PF structure
++  * @num_vfs: the number of VFs to allocate
++  *
++  * Allocate new VF entries and insert them into the hash table. Set some
++  * basic default fields for initializing the new VFs.
++  *
++  * After this function exits, the hash table will have num_vfs entries
++  * inserted.
++  *
++  * Returns 0 on success or an integer error code on failure.
+   */
+- static void ice_set_dflt_settings_vfs(struct ice_pf *pf)
++ static int ice_create_vf_entries(struct ice_pf *pf, u16 num_vfs)
+  {
+++<<<<<<< HEAD
+ +	int i;
+ +
+ +	ice_for_each_vf(pf, i) {
+ +		struct ice_vf *vf = &pf->vf[i];
+ +
+ +		vf->pf = pf;
+ +		vf->vf_id = i;
+++=======
++ 	struct ice_vfs *vfs = &pf->vfs;
++ 	struct ice_vf *vf;
++ 	u16 vf_id;
++ 	int err;
++ 
++ 	lockdep_assert_held(&vfs->table_lock);
++ 
++ 	for (vf_id = 0; vf_id < num_vfs; vf_id++) {
++ 		vf = kzalloc(sizeof(*vf), GFP_KERNEL);
++ 		if (!vf) {
++ 			err = -ENOMEM;
++ 			goto err_free_entries;
++ 		}
++ 		kref_init(&vf->refcnt);
++ 
++ 		vf->pf = pf;
++ 		vf->vf_id = vf_id;
++ 
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  		vf->vf_sw_id = pf->first_sw;
+  		/* assign default capabilities */
+  		set_bit(ICE_VIRTCHNL_VF_CAP_L2, &vf->vf_caps);
+@@@ -1797,27 -2026,15 +1996,36 @@@
+  		ice_vc_set_dflt_vf_ops(&vf->vc_ops);
+  
+  		mutex_init(&vf->cfg_lock);
++ 
++ 		hash_add_rcu(vfs->table, &vf->entry, vf_id);
+  	}
+++<<<<<<< HEAD
+ +}
+ +
+ +/**
+ + * ice_alloc_vfs - allocate num_vfs in the PF structure
+ + * @pf: PF to store the allocated VFs in
+ + * @num_vfs: number of VFs to allocate
+ + */
+ +static int ice_alloc_vfs(struct ice_pf *pf, int num_vfs)
+ +{
+ +	struct ice_vf *vfs;
+ +
+ +	vfs = devm_kcalloc(ice_pf_to_dev(pf), num_vfs, sizeof(*vfs),
+ +			   GFP_KERNEL);
+ +	if (!vfs)
+ +		return -ENOMEM;
+ +
+ +	pf->vf = vfs;
+ +	pf->num_alloc_vfs = num_vfs;
+++=======
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  
+  	return 0;
++ 
++ err_free_entries:
++ 	ice_free_vf_entries(pf);
++ 	return err;
+  }
+  
+  /**
+@@@ -1838,14 -2055,10 +2046,19 @@@ static int ice_ena_vfs(struct ice_pf *p
+  	ice_flush(hw);
+  
+  	ret = pci_enable_sriov(pf->pdev, num_vfs);
+++<<<<<<< HEAD
+ +	if (ret) {
+ +		pf->num_alloc_vfs = 0;
+ +		goto err_unroll_intr;
+ +	}
+ +
+ +	ret = ice_alloc_vfs(pf, num_vfs);
+++=======
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  	if (ret)
+- 		goto err_pci_disable_sriov;
++ 		goto err_unroll_intr;
++ 
++ 	mutex_lock(&pf->vfs.table_lock);
+  
+  	if (ice_set_per_vf_res(pf, num_vfs)) {
+  		dev_err(dev, "Not enough resources for %d VFs, try with fewer number of VFs\n",
+@@@ -1872,13 -2090,14 +2090,21 @@@
+  	if (test_and_clear_bit(ICE_OICR_INTR_DIS, pf->state))
+  		ice_irq_dynamic_ena(hw, NULL, NULL);
+  
++ 	mutex_unlock(&pf->vfs.table_lock);
++ 
+  	return 0;
+  
++ err_unroll_vf_entries:
++ 	ice_free_vf_entries(pf);
+  err_unroll_sriov:
+++<<<<<<< HEAD
+ +	devm_kfree(dev, pf->vf);
+ +	pf->vf = NULL;
+ +	pf->num_alloc_vfs = 0;
+ +err_pci_disable_sriov:
+++=======
++ 	mutex_unlock(&pf->vfs.table_lock);
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  	pci_disable_sriov(pf->pdev);
+  err_unroll_intr:
+  	/* rearm interrupts here */
+@@@ -2009,15 -2229,15 +2235,20 @@@ void ice_process_vflr_event(struct ice_
+  	u32 reg;
+  
+  	if (!test_and_clear_bit(ICE_VFLR_EVENT_PENDING, pf->state) ||
+ -	    !ice_has_vfs(pf))
+ +	    !pf->num_alloc_vfs)
+  		return;
+  
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, vf_id) {
+ +		struct ice_vf *vf = &pf->vf[vf_id];
+++=======
++ 	mutex_lock(&pf->vfs.table_lock);
++ 	ice_for_each_vf(pf, bkt, vf) {
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  		u32 reg_idx, bit_idx;
+  
+ -		reg_idx = (hw->func_caps.vf_base_id + vf->vf_id) / 32;
+ -		bit_idx = (hw->func_caps.vf_base_id + vf->vf_id) % 32;
+ +		reg_idx = (hw->func_caps.vf_base_id + vf_id) / 32;
+ +		bit_idx = (hw->func_caps.vf_base_id + vf_id) % 32;
+  		/* read GLGEN_VFLRSTAT register to find out the flr VFs */
+  		reg = rd32(hw, GLGEN_VFLRSTAT(reg_idx));
+  		if (reg & BIT(bit_idx)) {
+@@@ -2049,10 -2274,11 +2285,15 @@@ static void ice_vc_reset_vf(struct ice_
+   */
+  static struct ice_vf *ice_get_vf_from_pfq(struct ice_pf *pf, u16 pfq)
+  {
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ +	unsigned int vf_id;
+  
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, vf_id) {
+ +		struct ice_vf *vf = &pf->vf[vf_id];
+++=======
++ 	rcu_read_lock();
++ 	ice_for_each_vf_rcu(pf, bkt, vf) {
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  		struct ice_vsi *vsi;
+  		u16 rxq_idx;
+  
+@@@ -2839,13 -3118,14 +3091,13 @@@ int ice_set_vf_spoofchk(struct net_devi
+  	int ret;
+  
+  	dev = ice_pf_to_dev(pf);
+ -
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ +	if (ice_validate_vf_id(pf, vf_id))
+  		return -EINVAL;
+  
+ +	vf = &pf->vf[vf_id];
+  	ret = ice_check_vf_ready_for_cfg(vf);
+  	if (ret)
+- 		return ret;
++ 		goto out_put_vf;
+  
+  	vf_vsi = ice_get_vf_vsi(vf);
+  	if (!vf_vsi) {
+@@@ -2862,36 -3144,22 +3116,42 @@@
+  
+  	if (ena == vf->spoofchk) {
+  		dev_dbg(dev, "VF spoofchk already %s\n", ena ? "ON" : "OFF");
+- 		return 0;
++ 		ret = 0;
++ 		goto out_put_vf;
+  	}
+  
+ -	if (ena)
+ -		ret = ice_vsi_ena_spoofchk(vf_vsi);
+ -	else
+ -		ret = ice_vsi_dis_spoofchk(vf_vsi);
+ -	if (ret)
+ -		dev_err(dev, "Failed to set spoofchk %s for VF %d VSI %d\n error %d\n",
+ -			ena ? "ON" : "OFF", vf->vf_id, vf_vsi->vsi_num, ret);
+ -	else
+ -		vf->spoofchk = ena;
+ +	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+ +	if (!ctx)
+ +		return -ENOMEM;
+ +
+++<<<<<<< HEAD
+ +	ctx->info.sec_flags = vf_vsi->info.sec_flags;
+ +	ctx->info.valid_sections = cpu_to_le16(ICE_AQ_VSI_PROP_SECURITY_VALID);
+ +	if (ena) {
+ +		ctx->info.sec_flags |=
+ +			ICE_AQ_VSI_SEC_FLAG_ENA_MAC_ANTI_SPOOF;
+ +	} else {
+ +		ctx->info.sec_flags &=
+ +			~(ICE_AQ_VSI_SEC_FLAG_ENA_MAC_ANTI_SPOOF);
+ +	}
+ +
+ +	ret = ice_update_vsi(&pf->hw, vf_vsi->idx, ctx, NULL);
+ +	if (ret) {
+ +		dev_err(dev, "Failed to %sable spoofchk on VF %d VSI %d\n error %d\n",
+ +			ena ? "en" : "dis", vf->vf_id, vf_vsi->vsi_num, ret);
+ +		goto out;
+ +	}
+ +
+ +	/* only update spoofchk state and VSI context on success */
+ +	vf_vsi->info.sec_flags = ctx->info.sec_flags;
+ +	vf->spoofchk = ena;
+  
+ +out:
+ +	kfree(ctx);
+++=======
++ out_put_vf:
++ 	ice_put_vf(vf);
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  	return ret;
+  }
+  
+@@@ -2904,18 -3172,22 +3164,30 @@@
+   */
+  bool ice_is_any_vf_in_promisc(struct ice_pf *pf)
+  {
+++<<<<<<< HEAD
+ +	int vf_idx;
+ +
+ +	ice_for_each_vf(pf, vf_idx) {
+ +		struct ice_vf *vf = &pf->vf[vf_idx];
+ +
+++=======
++ 	bool is_vf_promisc = false;
++ 	struct ice_vf *vf;
++ 	unsigned int bkt;
++ 
++ 	rcu_read_lock();
++ 	ice_for_each_vf_rcu(pf, bkt, vf) {
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  		/* found a VF that has promiscuous mode configured */
+  		if (test_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states) ||
+- 		    test_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states))
+- 			return true;
++ 		    test_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states)) {
++ 			is_vf_promisc = true;
++ 			break;
++ 		}
+  	}
++ 	rcu_read_unlock();
+  
+- 	return false;
++ 	return is_vf_promisc;
+  }
+  
+  /**
+@@@ -4067,17 -4333,22 +4339,24 @@@ ice_set_vf_port_vlan(struct net_device 
+  		return -EPROTONOSUPPORT;
+  	}
+  
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ -		return -EINVAL;
+ -
+ +	vf = &pf->vf[vf_id];
+  	ret = ice_check_vf_ready_for_cfg(vf);
+  	if (ret)
+- 		return ret;
++ 		goto out_put_vf;
+  
+ -	if (ice_vf_get_port_vlan_prio(vf) == qos &&
+ -	    ice_vf_get_port_vlan_tpid(vf) == local_vlan_proto &&
+ -	    ice_vf_get_port_vlan_id(vf) == vlan_id) {
+ +	vlanprio = vlan_id | (qos << VLAN_PRIO_SHIFT);
+ +
+ +	if (vf->port_vlan_info == vlanprio) {
+  		/* duplicate request, so just return success */
+++<<<<<<< HEAD
+ +		dev_dbg(dev, "Duplicate pvid %d request\n", vlanprio);
+ +		return 0;
+++=======
++ 		dev_dbg(dev, "Duplicate port VLAN %u, QoS %u, TPID 0x%04x request\n",
++ 			vlan_id, qos, local_vlan_proto);
++ 		ret = 0;
++ 		goto out_put_vf;
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  	}
+  
+  	mutex_lock(&vf->cfg_lock);
+@@@ -4622,20 -5912,32 +4903,46 @@@ void ice_vc_process_vf_msg(struct ice_p
+  			err = -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!ice_vc_is_opcode_allowed(vf, v_opcode)) {
++ 		ice_vc_send_msg_to_vf(vf, v_opcode,
++ 				      VIRTCHNL_STATUS_ERR_NOT_SUPPORTED, NULL,
++ 				      0);
++ 		ice_put_vf(vf);
++ 		return;
++ 	}
++ 
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  error_handler:
+  	if (err) {
+  		ice_vc_send_msg_to_vf(vf, v_opcode, VIRTCHNL_STATUS_ERR_PARAM,
+  				      NULL, 0);
+  		dev_err(dev, "Invalid message from VF %d, opcode %d, len %d, error %d\n",
+  			vf_id, v_opcode, msglen, err);
+++<<<<<<< HEAD
+ +		goto finish;
+ +	}
+ +
+ +	if (!ice_vc_is_opcode_allowed(vf, v_opcode)) {
+ +		ice_vc_send_msg_to_vf(vf, v_opcode,
+ +				      VIRTCHNL_STATUS_ERR_NOT_SUPPORTED, NULL,
+ +				      0);
+ +		goto finish;
+++=======
++ 		ice_put_vf(vf);
++ 		return;
++ 	}
++ 
++ 	/* VF is being configured in another context that triggers a VFR, so no
++ 	 * need to process this message
++ 	 */
++ 	if (!mutex_trylock(&vf->cfg_lock)) {
++ 		dev_info(dev, "VF %u is being configured in another context that will trigger a VFR, so there is no need to handle this message\n",
++ 			 vf->vf_id);
++ 		ice_put_vf(vf);
++ 		return;
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  	}
+  
+  	switch (v_opcode) {
+@@@ -4727,8 -6050,8 +5034,9 @@@
+  			 vf_id, v_opcode, err);
+  	}
+  
+ +finish:
+  	mutex_unlock(&vf->cfg_lock);
++ 	ice_put_vf(vf);
+  }
+  
+  /**
+@@@ -4744,14 -6067,15 +5052,20 @@@ ice_get_vf_cfg(struct net_device *netde
+  {
+  	struct ice_pf *pf = ice_netdev_to_pf(netdev);
+  	struct ice_vf *vf;
+ -	int ret;
+  
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ +	if (ice_validate_vf_id(pf, vf_id))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	vf = &pf->vf[vf_id];
+ +
+ +	if (ice_check_vf_init(pf, vf))
+ +		return -EBUSY;
+++=======
++ 	ret = ice_check_vf_ready_for_cfg(vf);
++ 	if (ret)
++ 		goto out_put_vf;
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  
+  	ivi->vf = vf_id;
+  	ether_addr_copy(ivi->mac, vf->hw_lan_addr.addr);
+@@@ -4828,11 -6154,16 +5145,13 @@@ int ice_set_vf_mac(struct net_device *n
+  		return -EINVAL;
+  	}
+  
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ -		return -EINVAL;
+ -
+ +	vf = &pf->vf[vf_id];
+  	/* nothing left to do, unicast MAC already set */
+  	if (ether_addr_equal(vf->dev_lan_addr.addr, mac) &&
+- 	    ether_addr_equal(vf->hw_lan_addr.addr, mac))
+- 		return 0;
++ 	    ether_addr_equal(vf->hw_lan_addr.addr, mac)) {
++ 		ret = 0;
++ 		goto out_put_vf;
++ 	}
+  
+  	ret = ice_check_vf_ready_for_cfg(vf);
+  	if (ret)
+@@@ -4887,17 -6222,19 +5210,19 @@@ int ice_set_vf_trust(struct net_device 
+  		return -EOPNOTSUPP;
+  	}
+  
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ +	if (ice_validate_vf_id(pf, vf_id))
+  		return -EINVAL;
+  
+ +	vf = &pf->vf[vf_id];
+  	ret = ice_check_vf_ready_for_cfg(vf);
+  	if (ret)
+- 		return ret;
++ 		goto out_put_vf;
+  
+  	/* Check if already trusted */
+- 	if (trusted == vf->trusted)
+- 		return 0;
++ 	if (trusted == vf->trusted) {
++ 		ret = 0;
++ 		goto out_put_vf;
++ 	}
+  
+  	mutex_lock(&vf->cfg_lock);
+  
+@@@ -4925,13 -6264,13 +5252,13 @@@ int ice_set_vf_link_state(struct net_de
+  	struct ice_vf *vf;
+  	int ret;
+  
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ +	if (ice_validate_vf_id(pf, vf_id))
+  		return -EINVAL;
+  
+ +	vf = &pf->vf[vf_id];
+  	ret = ice_check_vf_ready_for_cfg(vf);
+  	if (ret)
+- 		return ret;
++ 		goto out_put_vf;
+  
+  	switch (link_state) {
+  	case IFLA_VF_LINK_STATE_AUTO:
+@@@ -4960,10 -6302,14 +5290,17 @@@ out_put_vf
+   */
+  static int ice_calc_all_vfs_min_tx_rate(struct ice_pf *pf)
+  {
+ -	struct ice_vf *vf;
+ -	unsigned int bkt;
+ -	int rate = 0;
+ +	int rate = 0, i;
+  
+++<<<<<<< HEAD
+ +	ice_for_each_vf(pf, i)
+ +		rate += pf->vf[i].min_tx_rate;
+++=======
++ 	rcu_read_lock();
++ 	ice_for_each_vf_rcu(pf, bkt, vf)
++ 		rate += vf->min_tx_rate;
++ 	rcu_read_unlock();
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  
+  	return rate;
+  }
+@@@ -5018,13 -6364,14 +5355,13 @@@ ice_set_vf_bw(struct net_device *netdev
+  	int ret;
+  
+  	dev = ice_pf_to_dev(pf);
+ -
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ +	if (ice_validate_vf_id(pf, vf_id))
+  		return -EINVAL;
+  
+ +	vf = &pf->vf[vf_id];
+  	ret = ice_check_vf_ready_for_cfg(vf);
+  	if (ret)
+- 		return ret;
++ 		goto out_put_vf;
+  
+  	vsi = ice_get_vf_vsi(vf);
+  
+@@@ -5085,17 -6438,19 +5428,19 @@@ int ice_get_vf_stats(struct net_device 
+  	struct ice_vf *vf;
+  	int ret;
+  
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ +	if (ice_validate_vf_id(pf, vf_id))
+  		return -EINVAL;
+  
+ +	vf = &pf->vf[vf_id];
+  	ret = ice_check_vf_ready_for_cfg(vf);
+  	if (ret)
+- 		return ret;
++ 		goto out_put_vf;
+  
+  	vsi = ice_get_vf_vsi(vf);
+- 	if (!vsi)
+- 		return -EINVAL;
++ 	if (!vsi) {
++ 		ret = -EINVAL;
++ 		goto out_put_vf;
++ 	}
+  
+  	ice_update_eth_stats(vsi);
+  	stats = &vsi->eth_stats;
+@@@ -5151,14 -6509,13 +5498,19 @@@ void ice_print_vfs_mdd_events(struct ic
+  		return;
+  
+  	/* VF MDD event logs are rate limited to one second intervals */
+ -	if (time_is_after_jiffies(pf->vfs.last_printed_mdd_jiffies + HZ * 1))
+ +	if (time_is_after_jiffies(pf->last_printed_mdd_jiffies + HZ * 1))
+  		return;
+  
+ -	pf->vfs.last_printed_mdd_jiffies = jiffies;
+ +	pf->last_printed_mdd_jiffies = jiffies;
+ +
+ +	ice_for_each_vf(pf, i) {
+ +		struct ice_vf *vf = &pf->vf[i];
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&pf->vfs.table_lock);
++ 	ice_for_each_vf(pf, bkt, vf) {
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  		/* only print Rx MDD event message if there are new events */
+  		if (vf->mdd_rx_events.count != vf->mdd_rx_events.last_printed) {
+  			vf->mdd_rx_events.last_printed =
+@@@ -5227,13 -6585,12 +5580,16 @@@ ice_is_malicious_vf(struct ice_pf *pf, 
+  	struct ice_vf *vf;
+  	int status;
+  
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ +	if (ice_validate_vf_id(pf, vf_id))
+  		return false;
+  
+++<<<<<<< HEAD
+ +	vf = &pf->vf[vf_id];
+ +	/* Check if VF is disabled. */
+++=======
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  	if (test_bit(ICE_VF_STATE_DIS, vf->vf_states))
+- 		return false;
++ 		goto out_put_vf;
+  
+  	mbxdata.num_msg_proc = num_msg_proc;
+  	mbxdata.num_pending_arq = num_msg_pending;
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+index 8f27255cc0cc,02e3d306f6dd..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+@@@ -37,8 -39,50 +37,55 @@@
+  #define ICE_MAX_VF_RESET_TRIES		40
+  #define ICE_MAX_VF_RESET_SLEEP_MS	20
+  
+++<<<<<<< HEAD
+ +#define ice_for_each_vf(pf, i) \
+ +	for ((i) = 0; (i) < (pf)->num_alloc_vfs; (i)++)
+++=======
++ /* VF Hash Table access functions
++  *
++  * These functions provide abstraction for interacting with the VF hash table.
++  * In general, direct access to the hash table should be avoided outside of
++  * these functions where possible.
++  *
++  * The VF entries in the hash table are protected by reference counting to
++  * track lifetime of accesses from the table. The ice_get_vf_by_id() function
++  * obtains a reference to the VF structure which must be dropped by using
++  * ice_put_vf().
++  */
++ 
++ /**
++  * ice_for_each_vf - Iterate over each VF entry
++  * @pf: pointer to the PF private structure
++  * @bkt: bucket index used for iteration
++  * @vf: pointer to the VF entry currently being processed in the loop.
++  *
++  * The bkt variable is an unsigned integer iterator used to traverse the VF
++  * entries. It is *not* guaranteed to be the VF's vf_id. Do not assume it is.
++  * Use vf->vf_id to get the id number if needed.
++  *
++  * The caller is expected to be under the table_lock mutex for the entire
++  * loop. Use this iterator if your loop is long or if it might sleep.
++  */
++ #define ice_for_each_vf(pf, bkt, vf) \
++ 	hash_for_each((pf)->vfs.table, (bkt), (vf), entry)
++ 
++ /**
++  * ice_for_each_vf_rcu - Iterate over each VF entry protected by RCU
++  * @pf: pointer to the PF private structure
++  * @bkt: bucket index used for iteration
++  * @vf: pointer to the VF entry currently being processed in the loop.
++  *
++  * The bkt variable is an unsigned integer iterator used to traverse the VF
++  * entries. It is *not* guaranteed to be the VF's vf_id. Do not assume it is.
++  * Use vf->vf_id to get the id number if needed.
++  *
++  * The caller is expected to be under rcu_read_lock() for the entire loop.
++  * Only use this iterator if your loop is short and you can guarantee it does
++  * not sleep.
++  */
++ #define ice_for_each_vf_rcu(pf, bkt, vf) \
++ 	hash_for_each_rcu((pf)->vfs.table, (bkt), (vf), entry)
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  
+  /* Specific VF states */
+  enum ice_vf_states {
+@@@ -93,6 -137,24 +140,27 @@@ struct ice_vc_vf_ops 
+  	int (*handle_rss_cfg_msg)(struct ice_vf *vf, u8 *msg, bool add);
+  	int (*add_fdir_fltr_msg)(struct ice_vf *vf, u8 *msg);
+  	int (*del_fdir_fltr_msg)(struct ice_vf *vf, u8 *msg);
+++<<<<<<< HEAD
+++=======
++ 	int (*get_offload_vlan_v2_caps)(struct ice_vf *vf);
++ 	int (*add_vlan_v2_msg)(struct ice_vf *vf, u8 *msg);
++ 	int (*remove_vlan_v2_msg)(struct ice_vf *vf, u8 *msg);
++ 	int (*ena_vlan_stripping_v2_msg)(struct ice_vf *vf, u8 *msg);
++ 	int (*dis_vlan_stripping_v2_msg)(struct ice_vf *vf, u8 *msg);
++ 	int (*ena_vlan_insertion_v2_msg)(struct ice_vf *vf, u8 *msg);
++ 	int (*dis_vlan_insertion_v2_msg)(struct ice_vf *vf, u8 *msg);
++ };
++ 
++ /* Virtchnl/SR-IOV config info */
++ struct ice_vfs {
++ 	DECLARE_HASHTABLE(table, 8);	/* table of VF entries */
++ 	struct mutex table_lock;	/* Lock for protecting the hash table */
++ 	u16 num_supported;		/* max supported VFs on this PF */
++ 	u16 num_qps_per;		/* number of queue pairs per VF */
++ 	u16 num_msix_per;		/* number of MSI-X vectors per VF */
++ 	unsigned long last_printed_mdd_jiffies;	/* MDD message rate limit */
++ 	DECLARE_BITMAP(malvfs, ICE_MAX_VF_COUNT); /* malicious VF indicator */
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  };
+  
+  /* VF information structure */
+@@@ -150,6 -218,10 +221,13 @@@ struct ice_vf 
+  };
+  
+  #ifdef CONFIG_PCI_IOV
+++<<<<<<< HEAD
+++=======
++ struct ice_vf *ice_get_vf_by_id(struct ice_pf *pf, u16 vf_id);
++ void ice_put_vf(struct ice_vf *vf);
++ bool ice_has_vfs(struct ice_pf *pf);
++ u16 ice_get_num_vfs(struct ice_pf *pf);
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  struct ice_vsi *ice_get_vf_vsi(struct ice_vf *vf);
+  void ice_process_vflr_event(struct ice_pf *pf);
+  int ice_sriov_configure(struct pci_dev *pdev, int num_vfs);
+@@@ -207,7 -279,27 +285,29 @@@ in
+  ice_vc_send_msg_to_vf(struct ice_vf *vf, u32 v_opcode,
+  		      enum virtchnl_status_code v_retval, u8 *msg, u16 msglen);
+  bool ice_vc_isvalid_vsi_id(struct ice_vf *vf, u16 vsi_id);
+ -bool ice_vf_is_port_vlan_ena(struct ice_vf *vf);
+  #else /* CONFIG_PCI_IOV */
+++<<<<<<< HEAD
+++=======
++ static inline struct ice_vf *ice_get_vf_by_id(struct ice_pf *pf, u16 vf_id)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void ice_put_vf(struct ice_vf *vf)
++ {
++ }
++ 
++ static inline bool ice_has_vfs(struct ice_pf *pf)
++ {
++ 	return false;
++ }
++ 
++ static inline u16 ice_get_num_vfs(struct ice_pf *pf)
++ {
++ 	return 0;
++ }
++ 
+++>>>>>>> 3d5985a185e6 (ice: convert VF storage to hash table with krefs and RCU)
+  static inline void ice_process_vflr_event(struct ice_pf *pf) { }
+  static inline void ice_free_vfs(struct ice_pf *pf) { }
+  static inline
+* Unmerged path drivers/net/ethernet/intel/ice/ice_eswitch.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ethtool.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_lib.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_main.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_repr.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_fdir.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
