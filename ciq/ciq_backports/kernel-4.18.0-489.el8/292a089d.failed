@@ -1,0 +1,1249 @@
+treewide: Convert del_timer*() to timer_shutdown*()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-489.el8
+commit-author Steven Rostedt (Google) <rostedt@goodmis.org>
+commit 292a089d78d3e2f7944e60bb897c977785a321e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-489.el8/292a089d.failed
+
+Due to several bugs caused by timers being re-armed after they are
+shutdown and just before they are freed, a new state of timers was added
+called "shutdown".  After a timer is set to this state, then it can no
+longer be re-armed.
+
+The following script was run to find all the trivial locations where
+del_timer() or del_timer_sync() is called in the same function that the
+object holding the timer is freed.  It also ignores any locations where
+the timer->function is modified between the del_timer*() and the free(),
+as that is not considered a "trivial" case.
+
+This was created by using a coccinelle script and the following
+commands:
+
+    $ cat timer.cocci
+    @@
+    expression ptr, slab;
+    identifier timer, rfield;
+    @@
+    (
+    -       del_timer(&ptr->timer);
+    +       timer_shutdown(&ptr->timer);
+    |
+    -       del_timer_sync(&ptr->timer);
+    +       timer_shutdown_sync(&ptr->timer);
+    )
+      ... when strict
+          when != ptr->timer
+    (
+            kfree_rcu(ptr, rfield);
+    |
+            kmem_cache_free(slab, ptr);
+    |
+            kfree(ptr);
+    )
+
+    $ spatch timer.cocci . > /tmp/t.patch
+    $ patch -p1 < /tmp/t.patch
+
+Link: https://lore.kernel.org/lkml/20221123201306.823305113@linutronix.de/
+	Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+	Acked-by: Pavel Machek <pavel@ucw.cz> [ LED ]
+	Acked-by: Kalle Valo <kvalo@kernel.org> [ wireless ]
+	Acked-by: Paolo Abeni <pabeni@redhat.com> [ networking ]
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 292a089d78d3e2f7944e60bb897c977785a321e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-iolatency.c
+#	block/kyber-iosched.c
+#	drivers/atm/idt77252.c
+#	drivers/block/loop.c
+#	drivers/isdn/mISDN/l1oip_core.c
+#	drivers/leds/trigger/ledtrig-activity.c
+#	drivers/leds/trigger/ledtrig-heartbeat.c
+#	drivers/leds/trigger/ledtrig-transient.c
+#	drivers/net/wireless/microchip/wilc1000/hif.c
+#	drivers/nfc/pn533/pn533.c
+#	drivers/nfc/pn533/uart.c
+#	drivers/pcmcia/omap_cf.c
+#	drivers/staging/media/atomisp/i2c/atomisp-lm3554.c
+#	net/ipv4/ipmr.c
+#	net/ipv6/ip6mr.c
+#	net/netfilter/xt_IDLETIMER.c
+#	net/sunrpc/svc.c
+diff --cc block/blk-iolatency.c
+index 8f7b1011fab5,ecdc10741836..000000000000
+--- a/block/blk-iolatency.c
++++ b/block/blk-iolatency.c
+@@@ -563,7 -644,8 +563,12 @@@ static void blkcg_iolatency_exit(struc
+  {
+  	struct blk_iolatency *blkiolat = BLKIOLATENCY(rqos);
+  
+++<<<<<<< HEAD
+ +	del_timer_sync(&blkiolat->timer);
+++=======
++ 	timer_shutdown_sync(&blkiolat->timer);
++ 	flush_work(&blkiolat->enable_work);
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  	blkcg_deactivate_policy(rqos->q, &blkcg_policy_iolatency);
+  	kfree(blkiolat);
+  }
+diff --cc block/kyber-iosched.c
+index 6df74a3a3cd3,2146969237bf..000000000000
+--- a/block/kyber-iosched.c
++++ b/block/kyber-iosched.c
+@@@ -441,7 -434,8 +441,12 @@@ static void kyber_exit_sched(struct ele
+  	struct kyber_queue_data *kqd = e->elevator_data;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	del_timer_sync(&kqd->timer);
+++=======
++ 	timer_shutdown_sync(&kqd->timer);
++ 	blk_stat_disable_accounting(kqd->q);
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  
+  	for (i = 0; i < KYBER_NUM_DOMAINS; i++)
+  		sbitmap_queue_free(&kqd->domain_tokens[i]);
+diff --cc drivers/atm/idt77252.c
+index 6e737142ceaa,eec0cc2144e0..000000000000
+--- a/drivers/atm/idt77252.c
++++ b/drivers/atm/idt77252.c
+@@@ -3767,6 -3752,7 +3767,10 @@@ static void __exit idt77252_exit(void
+  		card = idt77252_chain;
+  		dev = card->atmdev;
+  		idt77252_chain = card->next;
+++<<<<<<< HEAD
+++=======
++ 		timer_shutdown_sync(&card->tst_timer);
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  
+  		if (dev->phy->stop)
+  			dev->phy->stop(dev);
+diff --cc drivers/block/loop.c
+index 09eee6f59781,1518a6423279..000000000000
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@@ -2012,9 -1748,20 +2012,24 @@@ out_unlock
+  	mutex_unlock(&lo->lo_mutex);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void lo_free_disk(struct gendisk *disk)
++ {
++ 	struct loop_device *lo = disk->private_data;
++ 
++ 	if (lo->workqueue)
++ 		destroy_workqueue(lo->workqueue);
++ 	loop_free_idle_workers(lo, true);
++ 	timer_shutdown_sync(&lo->timer);
++ 	mutex_destroy(&lo->lo_mutex);
++ 	kfree(lo);
++ }
++ 
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  static const struct block_device_operations lo_fops = {
+  	.owner =	THIS_MODULE,
+ +	.open =		lo_open,
+  	.release =	lo_release,
+  	.ioctl =	lo_ioctl,
+  #ifdef CONFIG_COMPAT
+diff --cc drivers/isdn/mISDN/l1oip_core.c
+index 072bb5e36c18,f010b35a0531..000000000000
+--- a/drivers/isdn/mISDN/l1oip_core.c
++++ b/drivers/isdn/mISDN/l1oip_core.c
+@@@ -1246,11 -1234,10 +1246,16 @@@ release_card(struct l1oip *hc
+  {
+  	int	ch;
+  
+ -	hc->shutdown = true;
+ +	if (timer_pending(&hc->keep_tl))
+ +		del_timer(&hc->keep_tl);
+  
+++<<<<<<< HEAD
+ +	if (timer_pending(&hc->timeout_tl))
+ +		del_timer(&hc->timeout_tl);
+++=======
++ 	timer_shutdown_sync(&hc->keep_tl);
++ 	timer_shutdown_sync(&hc->timeout_tl);
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  
+  	cancel_work_sync(&hc->workq);
+  
+diff --cc drivers/leds/trigger/ledtrig-activity.c
+index f082c507a9da,33cbf8413658..000000000000
+--- a/drivers/leds/trigger/ledtrig-activity.c
++++ b/drivers/leds/trigger/ledtrig-activity.c
+@@@ -207,15 -206,11 +207,21 @@@ static int activity_activate(struct led
+  
+  static void activity_deactivate(struct led_classdev *led_cdev)
+  {
+ -	struct activity_data *activity_data = led_get_trigger_data(led_cdev);
+ -
+ +	struct activity_data *activity_data = led_cdev->trigger_data;
+ +
+++<<<<<<< HEAD
+ +	if (led_cdev->activated) {
+ +		del_timer_sync(&activity_data->timer);
+ +		device_remove_file(led_cdev->dev, &dev_attr_invert);
+ +		kfree(activity_data);
+ +		clear_bit(LED_BLINK_SW, &led_cdev->work_flags);
+ +		led_cdev->activated = false;
+ +	}
+++=======
++ 	timer_shutdown_sync(&activity_data->timer);
++ 	kfree(activity_data);
++ 	clear_bit(LED_BLINK_SW, &led_cdev->work_flags);
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  }
+  
+  static struct led_trigger activity_led_trigger = {
+diff --cc drivers/leds/trigger/ledtrig-heartbeat.c
+index 0831535259b2,393b3ae832f4..000000000000
+--- a/drivers/leds/trigger/ledtrig-heartbeat.c
++++ b/drivers/leds/trigger/ledtrig-heartbeat.c
+@@@ -151,15 -148,12 +151,21 @@@ static int heartbeat_trig_activate(stru
+  
+  static void heartbeat_trig_deactivate(struct led_classdev *led_cdev)
+  {
+ -	struct heartbeat_trig_data *heartbeat_data =
+ -		led_get_trigger_data(led_cdev);
+ -
+ +	struct heartbeat_trig_data *heartbeat_data = led_cdev->trigger_data;
+ +
+++<<<<<<< HEAD
+ +	if (led_cdev->activated) {
+ +		del_timer_sync(&heartbeat_data->timer);
+ +		device_remove_file(led_cdev->dev, &dev_attr_invert);
+ +		kfree(heartbeat_data);
+ +		clear_bit(LED_BLINK_SW, &led_cdev->work_flags);
+ +		led_cdev->activated = false;
+ +	}
+++=======
++ 	timer_shutdown_sync(&heartbeat_data->timer);
++ 	kfree(heartbeat_data);
++ 	clear_bit(LED_BLINK_SW, &led_cdev->work_flags);
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  }
+  
+  static struct led_trigger heartbeat_led_trigger = {
+diff --cc drivers/leds/trigger/ledtrig-transient.c
+index a55fc58179a9,f111fa7635e5..000000000000
+--- a/drivers/leds/trigger/ledtrig-transient.c
++++ b/drivers/leds/trigger/ledtrig-transient.c
+@@@ -197,19 -178,11 +197,25 @@@ err_out
+  
+  static void transient_trig_deactivate(struct led_classdev *led_cdev)
+  {
+ -	struct transient_trig_data *transient_data = led_get_trigger_data(led_cdev);
+ +	struct transient_trig_data *transient_data = led_cdev->trigger_data;
+  
+++<<<<<<< HEAD
+ +	if (led_cdev->activated) {
+ +		del_timer_sync(&transient_data->timer);
+ +		led_set_brightness_nosleep(led_cdev,
+ +					transient_data->restore_state);
+ +		device_remove_file(led_cdev->dev, &dev_attr_activate);
+ +		device_remove_file(led_cdev->dev, &dev_attr_duration);
+ +		device_remove_file(led_cdev->dev, &dev_attr_state);
+ +		led_cdev->trigger_data = NULL;
+ +		led_cdev->activated = false;
+ +		kfree(transient_data);
+ +	}
+++=======
++ 	timer_shutdown_sync(&transient_data->timer);
++ 	led_set_brightness_nosleep(led_cdev, transient_data->restore_state);
++ 	kfree(transient_data);
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  }
+  
+  static struct led_trigger transient_trigger = {
+diff --cc drivers/nfc/pn533/pn533.c
+index a0cc1cc45292,b19c39dcfbd9..000000000000
+--- a/drivers/nfc/pn533/pn533.c
++++ b/drivers/nfc/pn533/pn533.c
+@@@ -2672,8 -2791,8 +2672,13 @@@ void pn533_unregister_device(struct pn5
+  {
+  	struct pn533_cmd *cmd, *n;
+  
+++<<<<<<< HEAD
+ +	nfc_unregister_device(priv->nfc_dev);
+ +	nfc_free_device(priv->nfc_dev);
+++=======
++ 	/* delete the timer before cleanup the worker */
++ 	timer_shutdown_sync(&priv->listen_timer);
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  
+  	flush_delayed_work(&priv->poll_work);
+  	destroy_workqueue(priv->wq);
+diff --cc drivers/pcmcia/omap_cf.c
+index c2a17a79f0b2,e613818dc0bc..000000000000
+--- a/drivers/pcmcia/omap_cf.c
++++ b/drivers/pcmcia/omap_cf.c
+@@@ -323,8 -296,7 +323,12 @@@ static int __exit omap_cf_remove(struc
+  
+  	cf->active = 0;
+  	pcmcia_unregister_socket(&cf->socket);
+++<<<<<<< HEAD
+ +	del_timer_sync(&cf->timer);
+ +	iounmap((void __iomem *) cf->socket.io_offset);
+++=======
++ 	timer_shutdown_sync(&cf->timer);
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  	release_mem_region(cf->phys_cf, SZ_8K);
+  	free_irq(cf->irq, cf);
+  	kfree(cf);
+diff --cc net/ipv4/ipmr.c
+index cd7ddd33e5dc,eec1f6df80d8..000000000000
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@@ -420,8 -412,9 +420,14 @@@ static struct mr_table *ipmr_new_table(
+  
+  static void ipmr_free_table(struct mr_table *mrt)
+  {
+++<<<<<<< HEAD
+ +	del_timer_sync(&mrt->ipmr_expire_timer);
+ +	mroute_clean_tables(mrt, true);
+++=======
++ 	timer_shutdown_sync(&mrt->ipmr_expire_timer);
++ 	mroute_clean_tables(mrt, MRT_FLUSH_VIFS | MRT_FLUSH_VIFS_STATIC |
++ 				 MRT_FLUSH_MFC | MRT_FLUSH_MFC_STATIC);
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  	rhltable_destroy(&mrt->mfc_hash);
+  	kfree(mrt);
+  }
+diff --cc net/ipv6/ip6mr.c
+index 90fc41700ffa,51cf37abd142..000000000000
+--- a/net/ipv6/ip6mr.c
++++ b/net/ipv6/ip6mr.c
+@@@ -398,8 -392,9 +398,14 @@@ static struct mr_table *ip6mr_new_table
+  
+  static void ip6mr_free_table(struct mr_table *mrt)
+  {
+++<<<<<<< HEAD
+ +	del_timer_sync(&mrt->ipmr_expire_timer);
+ +	mroute_clean_tables(mrt, true);
+++=======
++ 	timer_shutdown_sync(&mrt->ipmr_expire_timer);
++ 	mroute_clean_tables(mrt, MRT6_FLUSH_MIFS | MRT6_FLUSH_MIFS_STATIC |
++ 				 MRT6_FLUSH_MFC | MRT6_FLUSH_MFC_STATIC);
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  	rhltable_destroy(&mrt->mfc_hash);
+  	kfree(mrt);
+  }
+diff --cc net/netfilter/xt_IDLETIMER.c
+index eb4cbd244c3d,8d36303f3935..000000000000
+--- a/net/netfilter/xt_IDLETIMER.c
++++ b/net/netfilter/xt_IDLETIMER.c
+@@@ -266,7 -426,38 +266,42 @@@ static void idletimer_tg_destroy(const 
+  	mutex_unlock(&list_mutex);
+  }
+  
+++<<<<<<< HEAD
+ +static struct xt_target idletimer_tg __read_mostly = {
+++=======
++ static void idletimer_tg_destroy_v1(const struct xt_tgdtor_param *par)
++ {
++ 	const struct idletimer_tg_info_v1 *info = par->targinfo;
++ 
++ 	pr_debug("destroy targinfo %s\n", info->label);
++ 
++ 	mutex_lock(&list_mutex);
++ 
++ 	if (--info->timer->refcnt == 0) {
++ 		pr_debug("deleting timer %s\n", info->label);
++ 
++ 		list_del(&info->timer->entry);
++ 		if (info->timer->timer_type & XT_IDLETIMER_ALARM) {
++ 			alarm_cancel(&info->timer->alarm);
++ 		} else {
++ 			timer_shutdown_sync(&info->timer->timer);
++ 		}
++ 		cancel_work_sync(&info->timer->work);
++ 		sysfs_remove_file(idletimer_tg_kobj, &info->timer->attr.attr);
++ 		kfree(info->timer->attr.attr.name);
++ 		kfree(info->timer);
++ 	} else {
++ 		pr_debug("decreased refcnt of timer %s to %u\n",
++ 			 info->label, info->timer->refcnt);
++ 	}
++ 
++ 	mutex_unlock(&list_mutex);
++ }
++ 
++ 
++ static struct xt_target idletimer_tg[] __read_mostly = {
++ 	{
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  	.name		= "IDLETIMER",
+  	.family		= NFPROTO_UNSPEC,
+  	.target		= idletimer_tg_target,
+diff --cc net/sunrpc/svc.c
+index d86946c8a719,85f0c3cfc877..000000000000
+--- a/net/sunrpc/svc.c
++++ b/net/sunrpc/svc.c
+@@@ -509,35 -557,17 +509,40 @@@ out_err
+  }
+  EXPORT_SYMBOL_GPL(svc_create_pooled);
+  
+ +void svc_shutdown_net(struct svc_serv *serv, struct net *net)
+ +{
+ +	svc_close_net(serv, net);
+ +
+ +	if (serv->sv_ops->svo_shutdown)
+ +		serv->sv_ops->svo_shutdown(serv, net);
+ +}
+ +EXPORT_SYMBOL_GPL(svc_shutdown_net);
+ +
+  /*
+   * Destroy an RPC service. Should be called with appropriate locking to
+ - * protect sv_permsocks and sv_tempsocks.
+ + * protect the sv_nrthreads, sv_permsocks and sv_tempsocks.
+   */
+  void
+ -svc_destroy(struct kref *ref)
+ +svc_destroy(struct svc_serv *serv)
+  {
+ -	struct svc_serv *serv = container_of(ref, struct svc_serv, sv_refcnt);
+ +	dprintk("svc: svc_destroy(%s, %d)\n",
+ +				serv->sv_program->pg_name,
+ +				serv->sv_nrthreads);
+ +
+ +	if (serv->sv_nrthreads) {
+ +		if (--(serv->sv_nrthreads) != 0) {
+ +			svc_sock_update_bufs(serv);
+ +			return;
+ +		}
+ +	} else
+ +		printk("svc_destroy: no threads for serv=%p!\n", serv);
+  
+++<<<<<<< HEAD
+ +	del_timer_sync(&serv->sv_temptimer);
+++=======
++ 	dprintk("svc: svc_destroy(%s)\n", serv->sv_program->pg_name);
++ 	timer_shutdown_sync(&serv->sv_temptimer);
+++>>>>>>> 292a089d78d3 (treewide: Convert del_timer*() to timer_shutdown*())
+  
+  	/*
+  	 * The last user is gone and thus all sockets have to be destroyed to
+* Unmerged path drivers/net/wireless/microchip/wilc1000/hif.c
+* Unmerged path drivers/nfc/pn533/uart.c
+* Unmerged path drivers/staging/media/atomisp/i2c/atomisp-lm3554.c
+diff --git a/arch/sh/drivers/push-switch.c b/arch/sh/drivers/push-switch.c
+index 762bc5619910..e54efc013710 100644
+--- a/arch/sh/drivers/push-switch.c
++++ b/arch/sh/drivers/push-switch.c
+@@ -105,7 +105,7 @@ static int switch_drv_remove(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, NULL);
+ 	flush_work(&psw->work);
+-	del_timer_sync(&psw->debounce);
++	timer_shutdown_sync(&psw->debounce);
+ 	free_irq(irq, pdev);
+ 
+ 	kfree(psw);
+diff --git a/block/blk-iocost.c b/block/blk-iocost.c
+index eebcc0c22125..b00fe6a774bd 100644
+--- a/block/blk-iocost.c
++++ b/block/blk-iocost.c
+@@ -1938,7 +1938,7 @@ static void ioc_rqos_exit(struct rq_qos *rqos)
+ 	ioc->running = IOC_STOP;
+ 	spin_unlock_irq(&ioc->lock);
+ 
+-	del_timer_sync(&ioc->timer);
++	timer_shutdown_sync(&ioc->timer);
+ 	free_percpu(ioc->pcpu_stat);
+ 	kfree(ioc);
+ }
+* Unmerged path block/blk-iolatency.c
+* Unmerged path block/kyber-iosched.c
+diff --git a/drivers/acpi/apei/ghes.c b/drivers/acpi/apei/ghes.c
+index c8d24589a579..5dbe6175bb4f 100644
+--- a/drivers/acpi/apei/ghes.c
++++ b/drivers/acpi/apei/ghes.c
+@@ -1419,7 +1419,7 @@ static int ghes_remove(struct platform_device *ghes_dev)
+ 	ghes->flags |= GHES_EXITING;
+ 	switch (generic->notify.type) {
+ 	case ACPI_HEST_NOTIFY_POLLED:
+-		del_timer_sync(&ghes->timer);
++		timer_shutdown_sync(&ghes->timer);
+ 		break;
+ 	case ACPI_HEST_NOTIFY_EXTERNAL:
+ 		free_irq(ghes->irq, ghes);
+* Unmerged path drivers/atm/idt77252.c
+diff --git a/drivers/block/drbd/drbd_main.c b/drivers/block/drbd/drbd_main.c
+index 66d54fea4ad5..79587547e9ed 100644
+--- a/drivers/block/drbd/drbd_main.c
++++ b/drivers/block/drbd/drbd_main.c
+@@ -2218,7 +2218,7 @@ void drbd_destroy_device(struct kref *kref)
+ 	struct drbd_resource *resource = device->resource;
+ 	struct drbd_peer_device *peer_device, *tmp_peer_device;
+ 
+-	del_timer_sync(&device->request_timer);
++	timer_shutdown_sync(&device->request_timer);
+ 
+ 	/* paranoia asserts */
+ 	D_ASSERT(device, device->open_cnt == 0);
+* Unmerged path drivers/block/loop.c
+diff --git a/drivers/bluetooth/hci_bcsp.c b/drivers/bluetooth/hci_bcsp.c
+index 27829273f3c9..0c8972253a73 100644
+--- a/drivers/bluetooth/hci_bcsp.c
++++ b/drivers/bluetooth/hci_bcsp.c
+@@ -752,7 +752,7 @@ static int bcsp_close(struct hci_uart *hu)
+ {
+ 	struct bcsp_struct *bcsp = hu->priv;
+ 
+-	del_timer_sync(&bcsp->tbcsp);
++	timer_shutdown_sync(&bcsp->tbcsp);
+ 
+ 	hu->priv = NULL;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_sw_fence.c b/drivers/gpu/drm/i915/i915_sw_fence.c
+index ae984c66c48a..a7efe9a66d95 100644
+--- a/drivers/gpu/drm/i915/i915_sw_fence.c
++++ b/drivers/gpu/drm/i915/i915_sw_fence.c
+@@ -467,7 +467,7 @@ static void irq_i915_sw_fence_work(struct irq_work *wrk)
+ 	struct i915_sw_dma_fence_cb_timer *cb =
+ 		container_of(wrk, typeof(*cb), work);
+ 
+-	del_timer_sync(&cb->timer);
++	timer_shutdown_sync(&cb->timer);
+ 	dma_fence_put(cb->dma);
+ 
+ 	kfree_rcu(cb, rcu);
+diff --git a/drivers/hid/hid-wiimote-core.c b/drivers/hid/hid-wiimote-core.c
+index 66193fda7b8d..d019cf5db8bf 100644
+--- a/drivers/hid/hid-wiimote-core.c
++++ b/drivers/hid/hid-wiimote-core.c
+@@ -1766,7 +1766,7 @@ static void wiimote_destroy(struct wiimote_data *wdata)
+ 	spin_unlock_irqrestore(&wdata->state.lock, flags);
+ 
+ 	cancel_work_sync(&wdata->init_worker);
+-	del_timer_sync(&wdata->timer);
++	timer_shutdown_sync(&wdata->timer);
+ 
+ 	device_remove_file(&wdata->hdev->dev, &dev_attr_devtype);
+ 	device_remove_file(&wdata->hdev->dev, &dev_attr_extension);
+diff --git a/drivers/input/keyboard/locomokbd.c b/drivers/input/keyboard/locomokbd.c
+index daf6a753ca61..538695a663b4 100644
+--- a/drivers/input/keyboard/locomokbd.c
++++ b/drivers/input/keyboard/locomokbd.c
+@@ -310,7 +310,7 @@ static int locomokbd_remove(struct locomo_dev *dev)
+ 
+ 	free_irq(dev->irq[0], locomokbd);
+ 
+-	del_timer_sync(&locomokbd->timer);
++	timer_shutdown_sync(&locomokbd->timer);
+ 
+ 	input_unregister_device(locomokbd->input);
+ 	locomo_set_drvdata(dev, NULL);
+diff --git a/drivers/input/keyboard/omap-keypad.c b/drivers/input/keyboard/omap-keypad.c
+index 5fe7a5633e33..5ec30698c082 100644
+--- a/drivers/input/keyboard/omap-keypad.c
++++ b/drivers/input/keyboard/omap-keypad.c
+@@ -296,7 +296,7 @@ static int omap_kp_remove(struct platform_device *pdev)
+ 	omap_writew(1, OMAP1_MPUIO_BASE + OMAP_MPUIO_KBD_MASKIT);
+ 	free_irq(omap_kp->irq, omap_kp);
+ 
+-	del_timer_sync(&omap_kp->timer);
++	timer_shutdown_sync(&omap_kp->timer);
+ 	tasklet_kill(&kp_tasklet);
+ 
+ 	/* unregister everything */
+diff --git a/drivers/input/mouse/alps.c b/drivers/input/mouse/alps.c
+index 34700eda0429..1ff4e66800a1 100644
+--- a/drivers/input/mouse/alps.c
++++ b/drivers/input/mouse/alps.c
+@@ -2970,7 +2970,7 @@ static void alps_disconnect(struct psmouse *psmouse)
+ 	struct alps_data *priv = psmouse->private;
+ 
+ 	psmouse_reset(psmouse);
+-	del_timer_sync(&priv->timer);
++	timer_shutdown_sync(&priv->timer);
+ 	if (priv->dev2)
+ 		input_unregister_device(priv->dev2);
+ 	if (!IS_ERR_OR_NULL(priv->dev3))
+* Unmerged path drivers/isdn/mISDN/l1oip_core.c
+diff --git a/drivers/isdn/mISDN/timerdev.c b/drivers/isdn/mISDN/timerdev.c
+index 211ed6cffd10..9b90e4e2995b 100644
+--- a/drivers/isdn/mISDN/timerdev.c
++++ b/drivers/isdn/mISDN/timerdev.c
+@@ -83,7 +83,7 @@ mISDN_close(struct inode *ino, struct file *filep)
+ 	while (!list_empty(list)) {
+ 		timer = list_first_entry(list, struct mISDNtimer, list);
+ 		spin_unlock_irq(&dev->lock);
+-		del_timer_sync(&timer->tl);
++		timer_shutdown_sync(&timer->tl);
+ 		spin_lock_irq(&dev->lock);
+ 		/* it might have been moved to ->expired */
+ 		list_del(&timer->list);
+@@ -213,7 +213,7 @@ misdn_del_timer(struct mISDNtimerdev *dev, int id)
+ 			list_del_init(&timer->list);
+ 			timer->id = -1;
+ 			spin_unlock_irq(&dev->lock);
+-			del_timer_sync(&timer->tl);
++			timer_shutdown_sync(&timer->tl);
+ 			kfree(timer);
+ 			return id;
+ 		}
+* Unmerged path drivers/leds/trigger/ledtrig-activity.c
+* Unmerged path drivers/leds/trigger/ledtrig-heartbeat.c
+diff --git a/drivers/leds/trigger/ledtrig-pattern.c b/drivers/leds/trigger/ledtrig-pattern.c
+index ce7acd115dd8..a0ae624ada4b 100644
+--- a/drivers/leds/trigger/ledtrig-pattern.c
++++ b/drivers/leds/trigger/ledtrig-pattern.c
+@@ -378,7 +378,7 @@ static void pattern_trig_deactivate(struct led_classdev *led_cdev)
+ 	if (led_cdev->pattern_clear)
+ 		led_cdev->pattern_clear(led_cdev);
+ 
+-	del_timer_sync(&data->timer);
++	timer_shutdown_sync(&data->timer);
+ 
+ 	led_set_brightness(led_cdev, LED_OFF);
+ 	kfree(data);
+* Unmerged path drivers/leds/trigger/ledtrig-transient.c
+diff --git a/drivers/media/pci/ivtv/ivtv-driver.c b/drivers/media/pci/ivtv/ivtv-driver.c
+index 6b2ffdc96961..eca3f07f6667 100644
+--- a/drivers/media/pci/ivtv/ivtv-driver.c
++++ b/drivers/media/pci/ivtv/ivtv-driver.c
+@@ -1426,7 +1426,7 @@ static void ivtv_remove(struct pci_dev *pdev)
+ 
+ 	/* Interrupts */
+ 	ivtv_set_irq_mask(itv, 0xffffffff);
+-	del_timer_sync(&itv->dma_timer);
++	timer_shutdown_sync(&itv->dma_timer);
+ 
+ 	/* Kill irq worker */
+ 	kthread_flush_worker(&itv->irq_worker);
+diff --git a/drivers/media/usb/pvrusb2/pvrusb2-hdw.c b/drivers/media/usb/pvrusb2/pvrusb2-hdw.c
+index 3d31dd81ff6a..4d33584e5cfb 100644
+--- a/drivers/media/usb/pvrusb2/pvrusb2-hdw.c
++++ b/drivers/media/usb/pvrusb2/pvrusb2-hdw.c
+@@ -2606,10 +2606,10 @@ struct pvr2_hdw *pvr2_hdw_create(struct usb_interface *intf,
+ 	return hdw;
+  fail:
+ 	if (hdw) {
+-		del_timer_sync(&hdw->quiescent_timer);
+-		del_timer_sync(&hdw->decoder_stabilization_timer);
+-		del_timer_sync(&hdw->encoder_run_timer);
+-		del_timer_sync(&hdw->encoder_wait_timer);
++		timer_shutdown_sync(&hdw->quiescent_timer);
++		timer_shutdown_sync(&hdw->decoder_stabilization_timer);
++		timer_shutdown_sync(&hdw->encoder_run_timer);
++		timer_shutdown_sync(&hdw->encoder_wait_timer);
+ 		flush_work(&hdw->workpoll);
+ 		v4l2_device_unregister(&hdw->v4l2_dev);
+ 		usb_free_urb(hdw->ctl_read_urb);
+@@ -2669,10 +2669,10 @@ void pvr2_hdw_destroy(struct pvr2_hdw *hdw)
+ 	if (!hdw) return;
+ 	pvr2_trace(PVR2_TRACE_INIT,"pvr2_hdw_destroy: hdw=%p",hdw);
+ 	flush_work(&hdw->workpoll);
+-	del_timer_sync(&hdw->quiescent_timer);
+-	del_timer_sync(&hdw->decoder_stabilization_timer);
+-	del_timer_sync(&hdw->encoder_run_timer);
+-	del_timer_sync(&hdw->encoder_wait_timer);
++	timer_shutdown_sync(&hdw->quiescent_timer);
++	timer_shutdown_sync(&hdw->decoder_stabilization_timer);
++	timer_shutdown_sync(&hdw->encoder_run_timer);
++	timer_shutdown_sync(&hdw->encoder_wait_timer);
+ 	if (hdw->fw_buffer) {
+ 		kfree(hdw->fw_buffer);
+ 		hdw->fw_buffer = NULL;
+diff --git a/drivers/media/usb/s2255/s2255drv.c b/drivers/media/usb/s2255/s2255drv.c
+index cb35c7c5c54f..7f1f8164aff6 100644
+--- a/drivers/media/usb/s2255/s2255drv.c
++++ b/drivers/media/usb/s2255/s2255drv.c
+@@ -1495,7 +1495,7 @@ static void s2255_destroy(struct s2255_dev *dev)
+ 	/* board shutdown stops the read pipe if it is running */
+ 	s2255_board_shutdown(dev);
+ 	/* make sure firmware still not trying to load */
+-	del_timer_sync(&dev->timer);  /* only started in .probe and .open */
++	timer_shutdown_sync(&dev->timer);  /* only started in .probe and .open */
+ 	if (dev->fw_data->fw_urb) {
+ 		usb_kill_urb(dev->fw_data->fw_urb);
+ 		usb_free_urb(dev->fw_data->fw_urb);
+@@ -2330,7 +2330,7 @@ static int s2255_probe(struct usb_interface *interface,
+ errorFWDATA2:
+ 	usb_free_urb(dev->fw_data->fw_urb);
+ errorFWURB:
+-	del_timer_sync(&dev->timer);
++	timer_shutdown_sync(&dev->timer);
+ errorEP:
+ 	usb_put_dev(dev->udev);
+ errorUDEV:
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_main.c b/drivers/net/ethernet/intel/i40e/i40e_main.c
+index 30d37615e202..b4c41a855a32 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@ -15589,7 +15589,7 @@ static int i40e_init_recovery_mode(struct i40e_pf *pf, struct i40e_hw *hw)
+ 
+ err_switch_setup:
+ 	i40e_reset_interrupt_capability(pf);
+-	del_timer_sync(&pf->service_timer);
++	timer_shutdown_sync(&pf->service_timer);
+ 	i40e_shutdown_adminq(hw);
+ 	iounmap(hw->hw_addr);
+ 	pci_disable_pcie_error_reporting(pf->pdev);
+@@ -16209,7 +16209,7 @@ static int i40e_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	kfree(pf->vsi);
+ err_switch_setup:
+ 	i40e_reset_interrupt_capability(pf);
+-	del_timer_sync(&pf->service_timer);
++	timer_shutdown_sync(&pf->service_timer);
+ err_mac_addr:
+ err_configure_lan_hmc:
+ 	(void)i40e_shutdown_lan_hmc(hw);
+@@ -16271,7 +16271,7 @@ static void i40e_remove(struct pci_dev *pdev)
+ 	set_bit(__I40E_SUSPENDED, pf->state);
+ 	set_bit(__I40E_DOWN, pf->state);
+ 	if (pf->service_timer.function)
+-		del_timer_sync(&pf->service_timer);
++		timer_shutdown_sync(&pf->service_timer);
+ 	if (pf->service_task.func)
+ 		cancel_work_sync(&pf->service_task);
+ 
+diff --git a/drivers/net/ethernet/marvell/sky2.c b/drivers/net/ethernet/marvell/sky2.c
+index ac7f1dd7766a..23dbb10c3c18 100644
+--- a/drivers/net/ethernet/marvell/sky2.c
++++ b/drivers/net/ethernet/marvell/sky2.c
+@@ -5128,7 +5128,7 @@ static void sky2_remove(struct pci_dev *pdev)
+ 	if (!hw)
+ 		return;
+ 
+-	del_timer_sync(&hw->watchdog_timer);
++	timer_shutdown_sync(&hw->watchdog_timer);
+ 	cancel_work_sync(&hw->restart_work);
+ 
+ 	for (i = hw->ports-1; i >= 0; --i)
+diff --git a/drivers/net/ethernet/sun/sunvnet.c b/drivers/net/ethernet/sun/sunvnet.c
+index a7d77a37dd97..848347f29b51 100644
+--- a/drivers/net/ethernet/sun/sunvnet.c
++++ b/drivers/net/ethernet/sun/sunvnet.c
+@@ -523,7 +523,7 @@ static int vnet_port_remove(struct vio_dev *vdev)
+ 		hlist_del_rcu(&port->hash);
+ 
+ 		synchronize_rcu();
+-		del_timer_sync(&port->clean_timer);
++		timer_shutdown_sync(&port->clean_timer);
+ 		sunvnet_port_rm_txq_common(port);
+ 		netif_napi_del(&port->napi);
+ 		sunvnet_port_free_tx_bufs_common(port);
+diff --git a/drivers/net/usb/sierra_net.c b/drivers/net/usb/sierra_net.c
+index 52584435db91..43b8c07012d6 100644
+--- a/drivers/net/usb/sierra_net.c
++++ b/drivers/net/usb/sierra_net.c
+@@ -769,7 +769,7 @@ static void sierra_net_unbind(struct usbnet *dev, struct usb_interface *intf)
+ 	dev_dbg(&dev->udev->dev, "%s", __func__);
+ 
+ 	/* kill the timer and work */
+-	del_timer_sync(&priv->sync_timer);
++	timer_shutdown_sync(&priv->sync_timer);
+ 	cancel_work_sync(&priv->sierra_net_kevent);
+ 
+ 	/* tell modem we are going away */
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/btcoex.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/btcoex.c
+index f9f18ff451ea..7ea2631b8069 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/btcoex.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/btcoex.c
+@@ -394,7 +394,7 @@ void brcmf_btcoex_detach(struct brcmf_cfg80211_info *cfg)
+ 
+ 	if (cfg->btcoex->timer_on) {
+ 		cfg->btcoex->timer_on = false;
+-		del_timer_sync(&cfg->btcoex->timer);
++		timer_shutdown_sync(&cfg->btcoex->timer);
+ 	}
+ 
+ 	cancel_work_sync(&cfg->btcoex->work);
+diff --git a/drivers/net/wireless/intel/iwlwifi/iwl-dbg-tlv.c b/drivers/net/wireless/intel/iwlwifi/iwl-dbg-tlv.c
+index 3237d4b528b5..119d83acafd1 100644
+--- a/drivers/net/wireless/intel/iwlwifi/iwl-dbg-tlv.c
++++ b/drivers/net/wireless/intel/iwlwifi/iwl-dbg-tlv.c
+@@ -371,7 +371,7 @@ void iwl_dbg_tlv_del_timers(struct iwl_trans *trans)
+ 	struct iwl_dbg_tlv_timer_node *node, *tmp;
+ 
+ 	list_for_each_entry_safe(node, tmp, timer_list, list) {
+-		del_timer_sync(&node->timer);
++		timer_shutdown_sync(&node->timer);
+ 		list_del(&node->list);
+ 		kfree(node);
+ 	}
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/sta.c b/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
+index 013aca70c3d3..a9b5014da4ed 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
+@@ -2845,7 +2845,7 @@ int iwl_mvm_sta_rx_agg(struct iwl_mvm *mvm, struct ieee80211_sta *sta,
+ 
+ 		/* synchronize all rx queues so we can safely delete */
+ 		iwl_mvm_free_reorder(mvm, baid_data);
+-		del_timer_sync(&baid_data->session_timer);
++		timer_shutdown_sync(&baid_data->session_timer);
+ 		RCU_INIT_POINTER(mvm->baid_map[baid], NULL);
+ 		kfree_rcu(baid_data, rcu_head);
+ 		IWL_DEBUG_HT(mvm, "BAID %d is free\n", baid);
+diff --git a/drivers/net/wireless/intersil/hostap/hostap_ap.c b/drivers/net/wireless/intersil/hostap/hostap_ap.c
+index d1884b8913e7..1995c33dbf76 100644
+--- a/drivers/net/wireless/intersil/hostap/hostap_ap.c
++++ b/drivers/net/wireless/intersil/hostap/hostap_ap.c
+@@ -136,7 +136,7 @@ static void ap_free_sta(struct ap_data *ap, struct sta_info *sta)
+ 
+ 	if (!sta->ap)
+ 		kfree(sta->u.sta.challenge);
+-	del_timer_sync(&sta->timer);
++	timer_shutdown_sync(&sta->timer);
+ #endif /* PRISM2_NO_KERNEL_IEEE80211_MGMT */
+ 
+ 	kfree(sta);
+diff --git a/drivers/net/wireless/marvell/mwifiex/main.c b/drivers/net/wireless/marvell/mwifiex/main.c
+index ec9d0fe1160b..7c17f4dd2e23 100644
+--- a/drivers/net/wireless/marvell/mwifiex/main.c
++++ b/drivers/net/wireless/marvell/mwifiex/main.c
+@@ -123,7 +123,7 @@ static int mwifiex_unregister(struct mwifiex_adapter *adapter)
+ 	if (adapter->if_ops.cleanup_if)
+ 		adapter->if_ops.cleanup_if(adapter);
+ 
+-	del_timer_sync(&adapter->cmd_timer);
++	timer_shutdown_sync(&adapter->cmd_timer);
+ 
+ 	/* Free private structures */
+ 	for (i = 0; i < adapter->priv_num; i++) {
+* Unmerged path drivers/net/wireless/microchip/wilc1000/hif.c
+* Unmerged path drivers/nfc/pn533/pn533.c
+* Unmerged path drivers/nfc/pn533/uart.c
+diff --git a/drivers/pcmcia/bcm63xx_pcmcia.c b/drivers/pcmcia/bcm63xx_pcmcia.c
+index 16f573173471..baf26f38eebe 100644
+--- a/drivers/pcmcia/bcm63xx_pcmcia.c
++++ b/drivers/pcmcia/bcm63xx_pcmcia.c
+@@ -442,7 +442,7 @@ static int bcm63xx_drv_pcmcia_remove(struct platform_device *pdev)
+ 	struct resource *res;
+ 
+ 	skt = platform_get_drvdata(pdev);
+-	del_timer_sync(&skt->timer);
++	timer_shutdown_sync(&skt->timer);
+ 	iounmap(skt->base);
+ 	iounmap(skt->io_base);
+ 	res = skt->reg_res;
+diff --git a/drivers/pcmcia/electra_cf.c b/drivers/pcmcia/electra_cf.c
+index b31abe35ed2c..dd5dcb3e1b21 100644
+--- a/drivers/pcmcia/electra_cf.c
++++ b/drivers/pcmcia/electra_cf.c
+@@ -341,7 +341,7 @@ static int electra_cf_remove(struct platform_device *ofdev)
+ 	cf->active = 0;
+ 	pcmcia_unregister_socket(&cf->socket);
+ 	free_irq(cf->irq, cf);
+-	del_timer_sync(&cf->timer);
++	timer_shutdown_sync(&cf->timer);
+ 
+ 	__iounmap_at(cf->io_virt, cf->io_size);
+ 	iounmap(cf->mem_base);
+* Unmerged path drivers/pcmcia/omap_cf.c
+diff --git a/drivers/pcmcia/pd6729.c b/drivers/pcmcia/pd6729.c
+index f0af9985ca09..a0a2e7f18356 100644
+--- a/drivers/pcmcia/pd6729.c
++++ b/drivers/pcmcia/pd6729.c
+@@ -727,7 +727,7 @@ static int pd6729_pci_probe(struct pci_dev *dev,
+ 	if (irq_mode == 1)
+ 		free_irq(dev->irq, socket);
+ 	else
+-		del_timer_sync(&socket->poll_timer);
++		timer_shutdown_sync(&socket->poll_timer);
+ err_out_free_res:
+ 	pci_release_regions(dev);
+ err_out_disable:
+@@ -754,7 +754,7 @@ static void pd6729_pci_remove(struct pci_dev *dev)
+ 	if (irq_mode == 1)
+ 		free_irq(dev->irq, socket);
+ 	else
+-		del_timer_sync(&socket->poll_timer);
++		timer_shutdown_sync(&socket->poll_timer);
+ 	pci_release_regions(dev);
+ 	pci_disable_device(dev);
+ 
+diff --git a/drivers/pcmcia/yenta_socket.c b/drivers/pcmcia/yenta_socket.c
+index 4ff20437999f..cebc19983b5c 100644
+--- a/drivers/pcmcia/yenta_socket.c
++++ b/drivers/pcmcia/yenta_socket.c
+@@ -811,7 +811,7 @@ static void yenta_close(struct pci_dev *dev)
+ 	if (sock->cb_irq)
+ 		free_irq(sock->cb_irq, sock);
+ 	else
+-		del_timer_sync(&sock->poll_timer);
++		timer_shutdown_sync(&sock->poll_timer);
+ 
+ 	iounmap(sock->base);
+ 	yenta_free_resources(sock);
+@@ -1282,7 +1282,7 @@ static int yenta_probe(struct pci_dev *dev, const struct pci_device_id *id)
+ 	if (socket->cb_irq)
+ 		free_irq(socket->cb_irq, socket);
+ 	else
+-		del_timer_sync(&socket->poll_timer);
++		timer_shutdown_sync(&socket->poll_timer);
+  unmap:
+ 	iounmap(socket->base);
+ 	yenta_free_resources(socket);
+diff --git a/drivers/scsi/qla2xxx/qla_edif.c b/drivers/scsi/qla2xxx/qla_edif.c
+index 00ccc41cef14..e4240aae5f9e 100644
+--- a/drivers/scsi/qla2xxx/qla_edif.c
++++ b/drivers/scsi/qla2xxx/qla_edif.c
+@@ -416,7 +416,7 @@ static void __qla2x00_release_all_sadb(struct scsi_qla_host *vha,
+ 				 */
+ 				if (edif_entry->delete_sa_index !=
+ 						INVALID_EDIF_SA_INDEX) {
+-					del_timer(&edif_entry->timer);
++					timer_shutdown(&edif_entry->timer);
+ 
+ 					/* build and send the aen */
+ 					fcport->edif.rx_sa_set = 1;
+@@ -2799,7 +2799,7 @@ qla28xx_sa_update_iocb_entry(scsi_qla_host_t *v, struct req_que *req,
+ 			    "%s: removing edif_entry %p, new sa_index: 0x%x\n",
+ 			    __func__, edif_entry, pkt->sa_index);
+ 			qla_edif_list_delete_sa_index(sp->fcport, edif_entry);
+-			del_timer(&edif_entry->timer);
++			timer_shutdown(&edif_entry->timer);
+ 
+ 			ql_dbg(ql_dbg_edif, vha, 0x5033,
+ 			    "%s: releasing edif_entry %p, new sa_index: 0x%x\n",
+* Unmerged path drivers/staging/media/atomisp/i2c/atomisp-lm3554.c
+diff --git a/drivers/staging/wlan-ng/prism2usb.c b/drivers/staging/wlan-ng/prism2usb.c
+index a58c2524e0f4..f4a784ab78cd 100644
+--- a/drivers/staging/wlan-ng/prism2usb.c
++++ b/drivers/staging/wlan-ng/prism2usb.c
+@@ -164,9 +164,9 @@ static void prism2sta_disconnect_usb(struct usb_interface *interface)
+ 		 */
+ 		prism2sta_ifstate(wlandev, P80211ENUM_ifstate_disable);
+ 
+-		del_timer_sync(&hw->throttle);
+-		del_timer_sync(&hw->reqtimer);
+-		del_timer_sync(&hw->resptimer);
++		timer_shutdown_sync(&hw->throttle);
++		timer_shutdown_sync(&hw->reqtimer);
++		timer_shutdown_sync(&hw->resptimer);
+ 
+ 		/* Unlink all the URBs. This "removes the wheels"
+ 		 * from the entire CTLX handling mechanism.
+diff --git a/drivers/tty/n_gsm.c b/drivers/tty/n_gsm.c
+index a3a47969dec0..25a9edac8845 100644
+--- a/drivers/tty/n_gsm.c
++++ b/drivers/tty/n_gsm.c
+@@ -1682,7 +1682,7 @@ static void gsm_dlci_free(struct tty_port *port)
+ {
+ 	struct gsm_dlci *dlci = container_of(port, struct gsm_dlci, port);
+ 
+-	del_timer_sync(&dlci->t1);
++	timer_shutdown_sync(&dlci->t1);
+ 	dlci->gsm->dlci[dlci->addr] = NULL;
+ 	kfifo_free(dlci->fifo);
+ 	while ((dlci->skb = skb_dequeue(&dlci->skb_list)))
+diff --git a/drivers/tty/sysrq.c b/drivers/tty/sysrq.c
+index 56d1917f50cf..7a568c2428cc 100644
+--- a/drivers/tty/sysrq.c
++++ b/drivers/tty/sysrq.c
+@@ -940,7 +940,7 @@ static void sysrq_disconnect(struct input_handle *handle)
+ 
+ 	input_close_device(handle);
+ 	cancel_work_sync(&sysrq->reinject_work);
+-	del_timer_sync(&sysrq->keyreset_timer);
++	timer_shutdown_sync(&sysrq->keyreset_timer);
+ 	input_unregister_handle(handle);
+ 	kfree(sysrq);
+ }
+diff --git a/drivers/usb/gadget/udc/m66592-udc.c b/drivers/usb/gadget/udc/m66592-udc.c
+index a8288df6aadf..2055ef01ce6c 100644
+--- a/drivers/usb/gadget/udc/m66592-udc.c
++++ b/drivers/usb/gadget/udc/m66592-udc.c
+@@ -1519,7 +1519,7 @@ static int m66592_remove(struct platform_device *pdev)
+ 
+ 	usb_del_gadget_udc(&m66592->gadget);
+ 
+-	del_timer_sync(&m66592->timer);
++	timer_shutdown_sync(&m66592->timer);
+ 	iounmap(m66592->reg);
+ 	free_irq(platform_get_irq(pdev, 0), m66592);
+ 	m66592_free_request(&m66592->ep[0].ep, m66592->ep0_req);
+diff --git a/drivers/usb/serial/garmin_gps.c b/drivers/usb/serial/garmin_gps.c
+index be8441b71d06..78a86555515d 100644
+--- a/drivers/usb/serial/garmin_gps.c
++++ b/drivers/usb/serial/garmin_gps.c
+@@ -1405,7 +1405,7 @@ static int garmin_port_remove(struct usb_serial_port *port)
+ 
+ 	usb_kill_anchored_urbs(&garmin_data_p->write_urbs);
+ 	usb_kill_urb(port->interrupt_in_urb);
+-	del_timer_sync(&garmin_data_p->timer);
++	timer_shutdown_sync(&garmin_data_p->timer);
+ 	kfree(garmin_data_p);
+ 	return 0;
+ }
+diff --git a/drivers/usb/serial/mos7840.c b/drivers/usb/serial/mos7840.c
+index b98825d48331..ca48edcd681c 100644
+--- a/drivers/usb/serial/mos7840.c
++++ b/drivers/usb/serial/mos7840.c
+@@ -1729,8 +1729,8 @@ static int mos7840_port_remove(struct usb_serial_port *port)
+ 		/* Turn off LED */
+ 		mos7840_set_led_sync(port, MODEM_CONTROL_REGISTER, 0x0300);
+ 
+-		del_timer_sync(&mos7840_port->led_timer1);
+-		del_timer_sync(&mos7840_port->led_timer2);
++		timer_shutdown_sync(&mos7840_port->led_timer1);
++		timer_shutdown_sync(&mos7840_port->led_timer2);
+ 
+ 		usb_kill_urb(mos7840_port->led_urb);
+ 		usb_free_urb(mos7840_port->led_urb);
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index f8cd8d427861..6e8b427e0534 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -1043,7 +1043,7 @@ static void ext4_put_super(struct super_block *sb)
+ 	}
+ 
+ 	ext4_es_unregister_shrinker(sbi);
+-	del_timer_sync(&sbi->s_err_report);
++	timer_shutdown_sync(&sbi->s_err_report);
+ 	ext4_release_system_zone(sb);
+ 	ext4_mb_release(sb);
+ 	ext4_ext_release(sb);
+diff --git a/fs/nilfs2/segment.c b/fs/nilfs2/segment.c
+index 8458b13448ae..84470ed53206 100644
+--- a/fs/nilfs2/segment.c
++++ b/fs/nilfs2/segment.c
+@@ -2754,7 +2754,7 @@ static void nilfs_segctor_destroy(struct nilfs_sc_info *sci)
+ 
+ 	down_write(&nilfs->ns_segctor_sem);
+ 
+-	del_timer_sync(&sci->sc_timer);
++	timer_shutdown_sync(&sci->sc_timer);
+ 	kfree(sci);
+ }
+ 
+diff --git a/net/802/garp.c b/net/802/garp.c
+index 7f50d47470bd..e7532179a76a 100644
+--- a/net/802/garp.c
++++ b/net/802/garp.c
+@@ -608,7 +608,7 @@ void garp_uninit_applicant(struct net_device *dev, struct garp_application *appl
+ 
+ 	/* Delete timer and generate a final TRANSMIT_PDU event to flush out
+ 	 * all pending messages before the applicant is gone. */
+-	del_timer_sync(&app->join_timer);
++	timer_shutdown_sync(&app->join_timer);
+ 
+ 	spin_lock_bh(&app->lock);
+ 	garp_gid_event(app, GARP_EVENT_TRANSMIT_PDU);
+diff --git a/net/802/mrp.c b/net/802/mrp.c
+index a808dd5bbb27..d9a78d371434 100644
+--- a/net/802/mrp.c
++++ b/net/802/mrp.c
+@@ -893,8 +893,8 @@ void mrp_uninit_applicant(struct net_device *dev, struct mrp_application *appl)
+ 	/* Delete timer and generate a final TX event to flush out
+ 	 * all pending messages before the applicant is gone.
+ 	 */
+-	del_timer_sync(&app->join_timer);
+-	del_timer_sync(&app->periodic_timer);
++	timer_shutdown_sync(&app->join_timer);
++	timer_shutdown_sync(&app->periodic_timer);
+ 
+ 	spin_lock_bh(&app->lock);
+ 	mrp_mad_event(app, MRP_EVENT_TX);
+diff --git a/net/bridge/br_multicast.c b/net/bridge/br_multicast.c
+index 15c2876dcd11..8c9dd62f5a50 100644
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@ -606,7 +606,7 @@ static void br_multicast_destroy_mdb_entry(struct net_bridge_mcast_gc *gc)
+ 	WARN_ON(!hlist_unhashed(&mp->mdb_node));
+ 	WARN_ON(mp->ports);
+ 
+-	del_timer_sync(&mp->timer);
++	timer_shutdown_sync(&mp->timer);
+ 	kfree_rcu(mp, rcu);
+ }
+ 
+@@ -647,7 +647,7 @@ static void br_multicast_destroy_group_src(struct net_bridge_mcast_gc *gc)
+ 	src = container_of(gc, struct net_bridge_group_src, mcast_gc);
+ 	WARN_ON(!hlist_unhashed(&src->node));
+ 
+-	del_timer_sync(&src->timer);
++	timer_shutdown_sync(&src->timer);
+ 	kfree_rcu(src, rcu);
+ }
+ 
+@@ -671,8 +671,8 @@ static void br_multicast_destroy_port_group(struct net_bridge_mcast_gc *gc)
+ 	WARN_ON(!hlist_unhashed(&pg->mglist));
+ 	WARN_ON(!hlist_empty(&pg->src_list));
+ 
+-	del_timer_sync(&pg->rexmit_timer);
+-	del_timer_sync(&pg->timer);
++	timer_shutdown_sync(&pg->rexmit_timer);
++	timer_shutdown_sync(&pg->timer);
+ 	kfree_rcu(pg, rcu);
+ }
+ 
+diff --git a/net/bridge/br_multicast_eht.c b/net/bridge/br_multicast_eht.c
+index f91c071d1608..c126aa4e7551 100644
+--- a/net/bridge/br_multicast_eht.c
++++ b/net/bridge/br_multicast_eht.c
+@@ -142,7 +142,7 @@ static void br_multicast_destroy_eht_set_entry(struct net_bridge_mcast_gc *gc)
+ 	set_h = container_of(gc, struct net_bridge_group_eht_set_entry, mcast_gc);
+ 	WARN_ON(!RB_EMPTY_NODE(&set_h->rb_node));
+ 
+-	del_timer_sync(&set_h->timer);
++	timer_shutdown_sync(&set_h->timer);
+ 	kfree(set_h);
+ }
+ 
+@@ -154,7 +154,7 @@ static void br_multicast_destroy_eht_set(struct net_bridge_mcast_gc *gc)
+ 	WARN_ON(!RB_EMPTY_NODE(&eht_set->rb_node));
+ 	WARN_ON(!RB_EMPTY_ROOT(&eht_set->entry_tree));
+ 
+-	del_timer_sync(&eht_set->timer);
++	timer_shutdown_sync(&eht_set->timer);
+ 	kfree(eht_set);
+ }
+ 
+diff --git a/net/core/gen_estimator.c b/net/core/gen_estimator.c
+index 917501187b89..eb115f5a8017 100644
+--- a/net/core/gen_estimator.c
++++ b/net/core/gen_estimator.c
+@@ -212,7 +212,7 @@ void gen_kill_estimator(struct net_rate_estimator __rcu **rate_est)
+ 
+ 	est = xchg((__force struct net_rate_estimator **)rate_est, NULL);
+ 	if (est) {
+-		del_timer_sync(&est->timer);
++		timer_shutdown_sync(&est->timer);
+ 		kfree_rcu(est, rcu);
+ 	}
+ }
+* Unmerged path net/ipv4/ipmr.c
+* Unmerged path net/ipv6/ip6mr.c
+diff --git a/net/mac80211/mesh_pathtbl.c b/net/mac80211/mesh_pathtbl.c
+index 69d5e1ec6ede..3b81e6df3f34 100644
+--- a/net/mac80211/mesh_pathtbl.c
++++ b/net/mac80211/mesh_pathtbl.c
+@@ -512,7 +512,7 @@ static void mesh_path_free_rcu(struct mesh_table *tbl,
+ 	mpath->flags |= MESH_PATH_RESOLVING | MESH_PATH_DELETED;
+ 	mesh_gate_del(tbl, mpath);
+ 	spin_unlock_bh(&mpath->state_lock);
+-	del_timer_sync(&mpath->timer);
++	timer_shutdown_sync(&mpath->timer);
+ 	atomic_dec(&sdata->u.mesh.mpaths);
+ 	atomic_dec(&tbl->entries);
+ 	mesh_path_flush_pending(mpath);
+diff --git a/net/netfilter/ipset/ip_set_list_set.c b/net/netfilter/ipset/ip_set_list_set.c
+index efef9b76be2e..0c3352be04ea 100644
+--- a/net/netfilter/ipset/ip_set_list_set.c
++++ b/net/netfilter/ipset/ip_set_list_set.c
+@@ -431,7 +431,7 @@ list_set_destroy(struct ip_set *set)
+ 	struct set_elem *e, *n;
+ 
+ 	if (SET_WITH_TIMEOUT(set))
+-		del_timer_sync(&map->gc);
++		timer_shutdown_sync(&map->gc);
+ 
+ 	list_for_each_entry_safe(e, n, &map->members, list) {
+ 		list_del(&e->list);
+diff --git a/net/netfilter/ipvs/ip_vs_lblc.c b/net/netfilter/ipvs/ip_vs_lblc.c
+index b9f375e6dc93..4e5cffc12428 100644
+--- a/net/netfilter/ipvs/ip_vs_lblc.c
++++ b/net/netfilter/ipvs/ip_vs_lblc.c
+@@ -389,7 +389,7 @@ static void ip_vs_lblc_done_svc(struct ip_vs_service *svc)
+ 	struct ip_vs_lblc_table *tbl = svc->sched_data;
+ 
+ 	/* remove periodic timer */
+-	del_timer_sync(&tbl->periodic_timer);
++	timer_shutdown_sync(&tbl->periodic_timer);
+ 
+ 	/* got to clean up table entries here */
+ 	ip_vs_lblc_flush(svc);
+diff --git a/net/netfilter/ipvs/ip_vs_lblcr.c b/net/netfilter/ipvs/ip_vs_lblcr.c
+index 542c4949937a..0d579005c216 100644
+--- a/net/netfilter/ipvs/ip_vs_lblcr.c
++++ b/net/netfilter/ipvs/ip_vs_lblcr.c
+@@ -552,7 +552,7 @@ static void ip_vs_lblcr_done_svc(struct ip_vs_service *svc)
+ 	struct ip_vs_lblcr_table *tbl = svc->sched_data;
+ 
+ 	/* remove periodic timer */
+-	del_timer_sync(&tbl->periodic_timer);
++	timer_shutdown_sync(&tbl->periodic_timer);
+ 
+ 	/* got to clean up table entries here */
+ 	ip_vs_lblcr_flush(svc);
+* Unmerged path net/netfilter/xt_IDLETIMER.c
+diff --git a/net/netfilter/xt_LED.c b/net/netfilter/xt_LED.c
+index 19846445504d..7df3fcec7a8a 100644
+--- a/net/netfilter/xt_LED.c
++++ b/net/netfilter/xt_LED.c
+@@ -180,7 +180,7 @@ static void led_tg_destroy(const struct xt_tgdtor_param *par)
+ 
+ 	list_del(&ledinternal->list);
+ 
+-	del_timer_sync(&ledinternal->timer);
++	timer_shutdown_sync(&ledinternal->timer);
+ 
+ 	led_trigger_unregister(&ledinternal->netfilter_led_trigger);
+ 
+diff --git a/net/sched/cls_flow.c b/net/sched/cls_flow.c
+index 54c96d2f07b9..27cfe20ec235 100644
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@ -371,7 +371,7 @@ static const struct nla_policy flow_policy[TCA_FLOW_MAX + 1] = {
+ 
+ static void __flow_destroy_filter(struct flow_filter *f)
+ {
+-	del_timer_sync(&f->perturb_timer);
++	timer_shutdown_sync(&f->perturb_timer);
+ 	tcf_exts_destroy(&f->exts);
+ 	tcf_em_tree_destroy(&f->ematches);
+ 	tcf_exts_put_net(&f->exts);
+* Unmerged path net/sunrpc/svc.c
+diff --git a/net/tipc/discover.c b/net/tipc/discover.c
+index dbb920241a4b..68a2f4188d1a 100644
+--- a/net/tipc/discover.c
++++ b/net/tipc/discover.c
+@@ -384,7 +384,7 @@ int tipc_disc_create(struct net *net, struct tipc_bearer *b,
+  */
+ void tipc_disc_delete(struct tipc_discoverer *d)
+ {
+-	del_timer_sync(&d->timer);
++	timer_shutdown_sync(&d->timer);
+ 	kfree_skb(d->skb);
+ 	kfree(d);
+ }
+diff --git a/net/tipc/monitor.c b/net/tipc/monitor.c
+index 1d90f39129ca..6e711793b413 100644
+--- a/net/tipc/monitor.c
++++ b/net/tipc/monitor.c
+@@ -669,7 +669,7 @@ void tipc_mon_delete(struct net *net, int bearer_id)
+ 	}
+ 	mon->self = NULL;
+ 	write_unlock_bh(&mon->lock);
+-	del_timer_sync(&mon->timer);
++	timer_shutdown_sync(&mon->timer);
+ 	kfree(self->domain);
+ 	kfree(self);
+ 	kfree(mon);
+diff --git a/sound/i2c/other/ak4117.c b/sound/i2c/other/ak4117.c
+index 1bc43e927d82..640501bb3ca6 100644
+--- a/sound/i2c/other/ak4117.c
++++ b/sound/i2c/other/ak4117.c
+@@ -47,7 +47,7 @@ static void reg_dump(struct ak4117 *ak4117)
+ 
+ static void snd_ak4117_free(struct ak4117 *chip)
+ {
+-	del_timer_sync(&chip->timer);
++	timer_shutdown_sync(&chip->timer);
+ 	kfree(chip);
+ }
+ 
+diff --git a/sound/synth/emux/emux.c b/sound/synth/emux/emux.c
+index a870759d179e..0006c3ddb51d 100644
+--- a/sound/synth/emux/emux.c
++++ b/sound/synth/emux/emux.c
+@@ -129,7 +129,7 @@ int snd_emux_free(struct snd_emux *emu)
+ 	if (! emu)
+ 		return -EINVAL;
+ 
+-	del_timer_sync(&emu->tlist);
++	timer_shutdown_sync(&emu->tlist);
+ 
+ 	snd_emux_proc_free(emu);
+ 	snd_emux_delete_virmidi(emu);
