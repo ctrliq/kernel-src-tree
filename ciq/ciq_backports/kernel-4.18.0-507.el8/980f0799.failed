@@ -1,0 +1,125 @@
+bonding: add software tx timestamping support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-507.el8
+commit-author Hangbin Liu <liuhangbin@gmail.com>
+commit 980f0799a15c75403f1f9284a32b6056b9660144
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-507.el8/980f0799.failed
+
+Currently, bonding only obtain the timestamp (ts) information of
+the active slave, which is available only for modes 1, 5, and 6.
+For other modes, bonding only has software rx timestamping support.
+
+However, some users who use modes such as LACP also want tx timestamp
+support. To address this issue, let's check the ts information of each
+slave. If all slaves support tx timestamping, we can enable tx
+timestamping support for the bond.
+
+Add a note that the get_ts_info may be called with RCU, or rtnl or
+reference on the device in ethtool.h>
+
+	Suggested-by: Miroslav Lichvar <mlichvar@redhat.com>
+	Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+	Acked-by: Jay Vosburgh <jay.vosburgh@canonical.com>
+Link: https://lore.kernel.org/r/20230418034841.2566262-1-liuhangbin@gmail.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 980f0799a15c75403f1f9284a32b6056b9660144)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index f99aa29504af,db7e650d9ebb..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -5003,6 -5692,72 +5003,75 @@@ static void bond_ethtool_get_drvinfo(st
+  		 BOND_ABI_VERSION);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bond_ethtool_get_ts_info(struct net_device *bond_dev,
++ 				    struct ethtool_ts_info *info)
++ {
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	struct ethtool_ts_info ts_info;
++ 	const struct ethtool_ops *ops;
++ 	struct net_device *real_dev;
++ 	bool sw_tx_support = false;
++ 	struct phy_device *phydev;
++ 	struct list_head *iter;
++ 	struct slave *slave;
++ 	int ret = 0;
++ 
++ 	rcu_read_lock();
++ 	real_dev = bond_option_active_slave_get_rcu(bond);
++ 	dev_hold(real_dev);
++ 	rcu_read_unlock();
++ 
++ 	if (real_dev) {
++ 		ops = real_dev->ethtool_ops;
++ 		phydev = real_dev->phydev;
++ 
++ 		if (phy_has_tsinfo(phydev)) {
++ 			ret = phy_ts_info(phydev, info);
++ 			goto out;
++ 		} else if (ops->get_ts_info) {
++ 			ret = ops->get_ts_info(real_dev, info);
++ 			goto out;
++ 		}
++ 	} else {
++ 		/* Check if all slaves support software tx timestamping */
++ 		rcu_read_lock();
++ 		bond_for_each_slave_rcu(bond, slave, iter) {
++ 			ret = -1;
++ 			ops = slave->dev->ethtool_ops;
++ 			phydev = slave->dev->phydev;
++ 
++ 			if (phy_has_tsinfo(phydev))
++ 				ret = phy_ts_info(phydev, &ts_info);
++ 			else if (ops->get_ts_info)
++ 				ret = ops->get_ts_info(slave->dev, &ts_info);
++ 
++ 			if (!ret && (ts_info.so_timestamping & SOF_TIMESTAMPING_TX_SOFTWARE)) {
++ 				sw_tx_support = true;
++ 				continue;
++ 			}
++ 
++ 			sw_tx_support = false;
++ 			break;
++ 		}
++ 		rcu_read_unlock();
++ 	}
++ 
++ 	ret = 0;
++ 	info->so_timestamping = SOF_TIMESTAMPING_RX_SOFTWARE |
++ 				SOF_TIMESTAMPING_SOFTWARE;
++ 	if (sw_tx_support)
++ 		info->so_timestamping |= SOF_TIMESTAMPING_TX_SOFTWARE;
++ 
++ 	info->phc_index = -1;
++ 
++ out:
++ 	dev_put(real_dev);
++ 	return ret;
++ }
++ 
+++>>>>>>> 980f0799a15c (bonding: add software tx timestamping support)
+  static const struct ethtool_ops bond_ethtool_ops = {
+  	.get_drvinfo		= bond_ethtool_get_drvinfo,
+  	.get_link		= ethtool_op_get_link,
+* Unmerged path drivers/net/bonding/bond_main.c
+diff --git a/include/linux/ethtool.h b/include/linux/ethtool.h
+index 1c6f89d06698..a36b66ed79ae 100644
+--- a/include/linux/ethtool.h
++++ b/include/linux/ethtool.h
+@@ -577,6 +577,7 @@ struct ethtool_ops_extended_rh {
+  * @get_dump_data: Get dump data.
+  * @set_dump: Set dump specific flags to the device.
+  * @get_ts_info: Get the time stamping and PTP hardware clock capabilities.
++ *	It may be called with RCU, or rtnl or reference on the device.
+  *	Drivers supporting transmit time stamps in software should set this to
+  *	ethtool_op_get_ts_info().
+  * @get_module_info: Get the size and type of the eeprom contained within
