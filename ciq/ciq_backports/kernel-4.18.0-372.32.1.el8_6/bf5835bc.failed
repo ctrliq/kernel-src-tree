@@ -1,0 +1,219 @@
+intel_idle: Disable IBRS during long idle
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit bf5835bcdb9635c97f85120dba9bfa21e111130f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/bf5835bc.failed
+
+Having IBRS enabled while the SMT sibling is idle unnecessarily slows
+down the running sibling. OTOH, disabling IBRS around idle takes two
+MSR writes, which will increase the idle latency.
+
+Therefore, only disable IBRS around deeper idle states. Shallow idle
+states are bounded by the tick in duration, since NOHZ is not allowed
+for them by virtue of their short target residency.
+
+Only do this for mwait-driven idle, since that keeps interrupts disabled
+across idle, which makes disabling IBRS vs IRQ-entry a non-issue.
+
+Note: C6 is a random threshold, most importantly C1 probably shouldn't
+disable IBRS, benchmarking needed.
+
+	Suggested-by: Tim Chen <tim.c.chen@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@kernel.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit bf5835bcdb9635c97f85120dba9bfa21e111130f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/nospec-branch.h
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/include/asm/nospec-branch.h
+index 12722d2e7709,ce1acb557162..000000000000
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@@ -267,6 -254,8 +267,11 @@@ static inline void indirect_branch_pred
+  
+  /* The Intel SPEC CTRL MSR base value cache */
+  extern u64 x86_spec_ctrl_base;
+++<<<<<<< HEAD
+++=======
++ extern void write_spec_ctrl_current(u64 val, bool force);
++ extern u64 spec_ctrl_current(void);
+++>>>>>>> bf5835bcdb96 (intel_idle: Disable IBRS during long idle)
+  
+  /*
+   * With retpoline, we must use IBRS to restrict branch prediction
+diff --cc arch/x86/kernel/cpu/bugs.c
+index ff842ff87312,00e9c769ce0b..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -54,6 -56,36 +54,34 @@@ EXPORT_SYMBOL_GPL(x86_spec_ctrl_base)
+  static DEFINE_MUTEX(spec_ctrl_mutex);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Keep track of the SPEC_CTRL MSR value for the current task, which may differ
++  * from x86_spec_ctrl_base due to STIBP/SSB in __speculation_ctrl_update().
++  */
++ void write_spec_ctrl_current(u64 val, bool force)
++ {
++ 	if (this_cpu_read(x86_spec_ctrl_current) == val)
++ 		return;
++ 
++ 	this_cpu_write(x86_spec_ctrl_current, val);
++ 
++ 	/*
++ 	 * When KERNEL_IBRS this MSR is written on return-to-user, unless
++ 	 * forced the update can be delayed until that time.
++ 	 */
++ 	if (force || !cpu_feature_enabled(X86_FEATURE_KERNEL_IBRS))
++ 		wrmsrl(MSR_IA32_SPEC_CTRL, val);
++ }
++ 
++ u64 spec_ctrl_current(void)
++ {
++ 	return this_cpu_read(x86_spec_ctrl_current);
++ }
++ EXPORT_SYMBOL_GPL(spec_ctrl_current);
++ 
++ /*
+++>>>>>>> bf5835bcdb96 (intel_idle: Disable IBRS during long idle)
+   * The vendor and possibly platform specific bits which can be modified in
+   * x86_spec_ctrl_base.
+   */
+* Unmerged path arch/x86/include/asm/nospec-branch.h
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+diff --git a/drivers/idle/intel_idle.c b/drivers/idle/intel_idle.c
+index dce9b18aa205..abd38c25741a 100644
+--- a/drivers/idle/intel_idle.c
++++ b/drivers/idle/intel_idle.c
+@@ -47,11 +47,13 @@
+ #include <linux/tick.h>
+ #include <trace/events/power.h>
+ #include <linux/sched.h>
++#include <linux/sched/smt.h>
+ #include <linux/notifier.h>
+ #include <linux/cpu.h>
+ #include <linux/moduleparam.h>
+ #include <asm/cpu_device_id.h>
+ #include <asm/intel-family.h>
++#include <asm/nospec-branch.h>
+ #include <asm/mwait.h>
+ #include <asm/msr.h>
+ 
+@@ -99,6 +101,12 @@ static unsigned int mwait_substates __initdata;
+  */
+ #define CPUIDLE_FLAG_ALWAYS_ENABLE	BIT(15)
+ 
++/*
++ * Disable IBRS across idle (when KERNEL_IBRS), is exclusive vs IRQ_ENABLE
++ * above.
++ */
++#define CPUIDLE_FLAG_IBRS		BIT(16)
++
+ /*
+  * MWAIT takes an 8-bit "hint" in EAX "suggesting"
+  * the C-state (top nibble) and sub-state (bottom nibble)
+@@ -156,6 +164,24 @@ static __cpuidle int intel_idle_irq(struct cpuidle_device *dev,
+ 	return ret;
+ }
+ 
++static __cpuidle int intel_idle_ibrs(struct cpuidle_device *dev,
++				     struct cpuidle_driver *drv, int index)
++{
++	bool smt_active = sched_smt_active();
++	u64 spec_ctrl = spec_ctrl_current();
++	int ret;
++
++	if (smt_active)
++		wrmsrl(MSR_IA32_SPEC_CTRL, 0);
++
++	ret = __intel_idle(dev, drv, index);
++
++	if (smt_active)
++		wrmsrl(MSR_IA32_SPEC_CTRL, spec_ctrl);
++
++	return ret;
++}
++
+ /**
+  * intel_idle_s2idle - Ask the processor to enter the given idle state.
+  * @dev: cpuidle device of the target CPU.
+@@ -677,7 +703,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
+ 	{
+ 		.name = "C6",
+ 		.desc = "MWAIT 0x20",
+-		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED,
++		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
+ 		.exit_latency = 85,
+ 		.target_residency = 200,
+ 		.enter = &intel_idle,
+@@ -685,7 +711,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
+ 	{
+ 		.name = "C7s",
+ 		.desc = "MWAIT 0x33",
+-		.flags = MWAIT2flg(0x33) | CPUIDLE_FLAG_TLB_FLUSHED,
++		.flags = MWAIT2flg(0x33) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
+ 		.exit_latency = 124,
+ 		.target_residency = 800,
+ 		.enter = &intel_idle,
+@@ -693,7 +719,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
+ 	{
+ 		.name = "C8",
+ 		.desc = "MWAIT 0x40",
+-		.flags = MWAIT2flg(0x40) | CPUIDLE_FLAG_TLB_FLUSHED,
++		.flags = MWAIT2flg(0x40) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
+ 		.exit_latency = 200,
+ 		.target_residency = 800,
+ 		.enter = &intel_idle,
+@@ -701,7 +727,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
+ 	{
+ 		.name = "C9",
+ 		.desc = "MWAIT 0x50",
+-		.flags = MWAIT2flg(0x50) | CPUIDLE_FLAG_TLB_FLUSHED,
++		.flags = MWAIT2flg(0x50) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
+ 		.exit_latency = 480,
+ 		.target_residency = 5000,
+ 		.enter = &intel_idle,
+@@ -709,7 +735,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
+ 	{
+ 		.name = "C10",
+ 		.desc = "MWAIT 0x60",
+-		.flags = MWAIT2flg(0x60) | CPUIDLE_FLAG_TLB_FLUSHED,
++		.flags = MWAIT2flg(0x60) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
+ 		.exit_latency = 890,
+ 		.target_residency = 5000,
+ 		.enter = &intel_idle,
+@@ -738,7 +764,7 @@ static struct cpuidle_state skx_cstates[] __initdata = {
+ 	{
+ 		.name = "C6",
+ 		.desc = "MWAIT 0x20",
+-		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED,
++		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
+ 		.exit_latency = 133,
+ 		.target_residency = 600,
+ 		.enter = &intel_idle,
+@@ -1601,6 +1627,12 @@ static void __init intel_idle_init_cstates_icpu(struct cpuidle_driver *drv)
+ 		if (cpuidle_state_table[cstate].flags & CPUIDLE_FLAG_IRQ_ENABLE)
+ 			drv->states[drv->state_count].enter = intel_idle_irq;
+ 
++		if (cpu_feature_enabled(X86_FEATURE_KERNEL_IBRS) &&
++		    cpuidle_state_table[cstate].flags & CPUIDLE_FLAG_IBRS) {
++			WARN_ON_ONCE(cpuidle_state_table[cstate].flags & CPUIDLE_FLAG_IRQ_ENABLE);
++			drv->states[drv->state_count].enter = intel_idle_ibrs;
++		}
++
+ 		if ((disabled_states_mask & BIT(drv->state_count)) ||
+ 		    ((icpu->use_acpi && force_use_acpi) &&
+ 		     intel_idle_off_by_default(mwait_hint) &&
