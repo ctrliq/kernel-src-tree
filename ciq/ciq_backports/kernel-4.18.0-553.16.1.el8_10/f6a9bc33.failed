@@ -1,0 +1,517 @@
+cifs: allocate buffer in the caller of build_path_from_dentry()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit f6a9bc336b600e1266e6eebb0972d75d5b93aea9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/f6a9bc33.failed
+
+build_path_from_dentry() open-codes dentry_path_raw().  The reason
+we can't use dentry_path_raw() in there (and postprocess the
+result as needed) is that the callers of build_path_from_dentry()
+expect that the object to be freed on cleanup and the string to
+be used are at the same address.  That's painful, since the path
+is naturally built end-to-beginning - we start at the leaf and
+go through the ancestors, accumulating the pathname.
+
+Life would be easier if we left the buffer allocation to callers.
+It wouldn't be exact-sized buffer, but none of the callers keep
+the result for long - it's always freed before the caller returns.
+So there's no need to do exact-sized allocation; better use
+__getname()/__putname(), same as we do for pathname arguments
+of syscalls.  What's more, there's no need to do allocation under
+spinlocks, so GFP_ATOMIC is not needed.
+
+Next patch will replace the open-coded dentry_path_raw() (in
+build_path_from_dentry_optional_prefix()) with calling the real
+thing.  This patch only introduces wrappers for allocating/freeing
+the buffers and switches to new calling conventions:
+	build_path_from_dentry(dentry, buf)
+expects buf to be address of a page-sized object or NULL,
+return value is a pathname built inside that buffer on success,
+ERR_PTR(-ENOMEM) if buf is NULL and ERR_PTR(-ENAMETOOLONG) if
+the pathname won't fit into page.  Note that we don't need to
+check for failure when allocating the buffer in the caller -
+build_path_from_dentry() will do the right thing.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit f6a9bc336b600e1266e6eebb0972d75d5b93aea9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsproto.h
+#	fs/cifs/dir.c
+#	fs/cifs/file.c
+#	fs/cifs/inode.c
+#	fs/cifs/ioctl.c
+#	fs/cifs/link.c
+#	fs/cifs/readdir.c
+#	fs/cifs/smb2ops.c
+#	fs/cifs/xattr.c
+diff --cc fs/cifs/cifsproto.h
+index ee13d2e5ee97,c8faa3e82fe7..000000000000
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@@ -69,9 -69,20 +69,24 @@@ extern int init_cifs_idmap(void)
+  extern void exit_cifs_idmap(void);
+  extern int init_cifs_spnego(void);
+  extern void exit_cifs_spnego(void);
+++<<<<<<< HEAD
+ +extern char *build_path_from_dentry(struct dentry *);
+++=======
++ extern const char *build_path_from_dentry(struct dentry *, void *);
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  extern char *build_path_from_dentry_optional_prefix(struct dentry *direntry,
+- 						    bool prefix);
++ 						    void *page, bool prefix);
++ static inline void *alloc_dentry_path(void)
++ {
++ 	return __getname();
++ }
++ 
++ static inline void free_dentry_path(void *page)
++ {
++ 	if (page)
++ 		__putname(page);
++ }
++ 
+  extern char *cifs_build_path_to_root(struct smb3_fs_context *ctx,
+  				     struct cifs_sb_info *cifs_sb,
+  				     struct cifs_tcon *tcon,
+diff --cc fs/cifs/dir.c
+index 26bfed1a114a,6e855f004f50..000000000000
+--- a/fs/cifs/dir.c
++++ b/fs/cifs/dir.c
+@@@ -78,8 -78,8 +78,13 @@@ cifs_build_path_to_root(struct smb3_fs_
+  }
+  
+  /* Note: caller must free return buffer */
+++<<<<<<< HEAD
+ +char *
+ +build_path_from_dentry(struct dentry *direntry)
+++=======
++ const char *
++ build_path_from_dentry(struct dentry *direntry, void *page)
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  {
+  	struct cifs_sb_info *cifs_sb = CIFS_SB(direntry->d_sb);
+  	struct cifs_tcon *tcon = cifs_sb_master_tcon(cifs_sb);
+@@@ -233,7 -225,8 +230,12 @@@ cifs_do_create(struct inode *inode, str
+  	int desired_access;
+  	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
+  	struct cifs_tcon *tcon = tlink_tcon(tlink);
+++<<<<<<< HEAD
+ +	char *full_path = NULL;
+++=======
++ 	const char *full_path;
++ 	void *page = alloc_dentry_path();
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	FILE_ALL_INFO *buf = NULL;
+  	struct inode *newinode = NULL;
+  	int disposition;
+@@@ -622,7 -614,8 +626,12 @@@ int cifs_mknod(struct inode *inode, str
+  	struct cifs_sb_info *cifs_sb;
+  	struct tcon_link *tlink;
+  	struct cifs_tcon *tcon;
+++<<<<<<< HEAD
+ +	char *full_path = NULL;
+++=======
++ 	const char *full_path;
++ 	void *page;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  
+  	if (!old_valid_dev(device_number))
+  		return -EINVAL;
+@@@ -663,8 -656,8 +672,13 @@@ cifs_lookup(struct inode *parent_dir_in
+  	struct tcon_link *tlink;
+  	struct cifs_tcon *pTcon;
+  	struct inode *newInode = NULL;
+++<<<<<<< HEAD
+ +	char *full_path = NULL;
+ +	int retry_count = 0;
+++=======
++ 	const char *full_path;
++ 	void *page;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  
+  	xid = get_xid();
+  
+diff --cc fs/cifs/file.c
+index 3290ff0412dd,3d4e6e7dac1d..000000000000
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@@ -524,7 -530,8 +524,12 @@@ int cifs_open(struct inode *inode, stru
+  	struct cifs_tcon *tcon;
+  	struct tcon_link *tlink;
+  	struct cifsFileInfo *cfile = NULL;
+++<<<<<<< HEAD
+ +	char *full_path = NULL;
+++=======
++ 	void *page;
++ 	const char *full_path;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	bool posix_open_ok = false;
+  	struct cifs_fid fid;
+  	struct cifs_pending_open open;
+@@@ -683,7 -691,8 +689,12 @@@ cifs_reopen_file(struct cifsFileInfo *c
+  	struct TCP_Server_Info *server;
+  	struct cifsInodeInfo *cinode;
+  	struct inode *inode;
+++<<<<<<< HEAD
+ +	char *full_path = NULL;
+++=======
++ 	void *page;
++ 	const char *full_path;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	int desired_access;
+  	int disposition = FILE_OPEN;
+  	int create_options = CREATE_NOT_DIR;
+@@@ -2063,10 -2072,8 +2074,13 @@@ cifs_get_writable_path(struct cifs_tco
+  		       int flags,
+  		       struct cifsFileInfo **ret_file)
+  {
+- 	struct list_head *tmp;
+  	struct cifsFileInfo *cfile;
+++<<<<<<< HEAD
+ +	struct cifsInodeInfo *cinode;
+ +	char *full_path;
+++=======
++ 	void *page = alloc_dentry_path();
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  
+  	*ret_file = NULL;
+  
+@@@ -2098,10 -2104,8 +2111,13 @@@ in
+  cifs_get_readable_path(struct cifs_tcon *tcon, const char *name,
+  		       struct cifsFileInfo **ret_file)
+  {
+- 	struct list_head *tmp;
+  	struct cifsFileInfo *cfile;
+++<<<<<<< HEAD
+ +	struct cifsInodeInfo *cinode;
+ +	char *full_path;
+++=======
++ 	void *page = alloc_dentry_path();
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  
+  	*ret_file = NULL;
+  
+diff --cc fs/cifs/inode.c
+index 3c6cd383548e,fe3a50a39f41..000000000000
+--- a/fs/cifs/inode.c
++++ b/fs/cifs/inode.c
+@@@ -1603,7 -1609,8 +1603,12 @@@ int cifs_unlink(struct inode *dir, stru
+  {
+  	int rc = 0;
+  	unsigned int xid;
+++<<<<<<< HEAD
+ +	char *full_path = NULL;
+++=======
++ 	const char *full_path;
++ 	void *page;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	struct inode *inode = d_inode(dentry);
+  	struct cifsInodeInfo *cifs_inode;
+  	struct super_block *sb = dir->i_sb;
+@@@ -1869,7 -1868,8 +1875,12 @@@ int cifs_mkdir(struct inode *inode, str
+  	struct tcon_link *tlink;
+  	struct cifs_tcon *tcon;
+  	struct TCP_Server_Info *server;
+++<<<<<<< HEAD
+ +	char *full_path;
+++=======
++ 	const char *full_path;
++ 	void *page;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  
+  	cifs_dbg(FYI, "In cifs_mkdir, mode = %04ho inode = 0x%p\n",
+  		 mode, inode);
+@@@ -1941,7 -1942,8 +1953,12 @@@ int cifs_rmdir(struct inode *inode, str
+  	struct tcon_link *tlink;
+  	struct cifs_tcon *tcon;
+  	struct TCP_Server_Info *server;
+++<<<<<<< HEAD
+ +	char *full_path = NULL;
+++=======
++ 	const char *full_path;
++ 	void *page = alloc_dentry_path();
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	struct cifsInodeInfo *cifsInode;
+  
+  	cifs_dbg(FYI, "cifs_rmdir, inode = 0x%p\n", inode);
+@@@ -2071,12 -2073,12 +2088,17 @@@ do_rename_exit
+  }
+  
+  int
+ -cifs_rename2(struct user_namespace *mnt_userns, struct inode *source_dir,
+ -	     struct dentry *source_dentry, struct inode *target_dir,
+ -	     struct dentry *target_dentry, unsigned int flags)
+ +cifs_rename2(struct inode *source_dir, struct dentry *source_dentry,
+ +	     struct inode *target_dir, struct dentry *target_dentry,
+ +	     unsigned int flags)
+  {
+++<<<<<<< HEAD
+ +	char *from_name = NULL;
+ +	char *to_name = NULL;
+++=======
++ 	const char *from_name, *to_name;
++ 	void *page1, *page2;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	struct cifs_sb_info *cifs_sb;
+  	struct tcon_link *tlink;
+  	struct cifs_tcon *tcon;
+@@@ -2318,7 -2320,8 +2338,12 @@@ int cifs_revalidate_dentry_attr(struct 
+  	int rc = 0;
+  	struct inode *inode = d_inode(dentry);
+  	struct super_block *sb = dentry->d_sb;
+++<<<<<<< HEAD
+ +	char *full_path = NULL;
+++=======
++ 	const char *full_path;
++ 	void *page;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	int count = 0;
+  
+  	if (inode == NULL)
+@@@ -2606,7 -2616,8 +2630,12 @@@ cifs_setattr_unix(struct dentry *dirent
+  {
+  	int rc;
+  	unsigned int xid;
+++<<<<<<< HEAD
+ +	char *full_path = NULL;
+++=======
++ 	const char *full_path;
++ 	void *page = alloc_dentry_path();
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	struct inode *inode = d_inode(direntry);
+  	struct cifsInodeInfo *cifsInode = CIFS_I(inode);
+  	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
+@@@ -2757,7 -2768,8 +2786,12 @@@ cifs_setattr_nounix(struct dentry *dire
+  	struct cifsInodeInfo *cifsInode = CIFS_I(inode);
+  	struct cifsFileInfo *wfile;
+  	struct cifs_tcon *tcon;
+++<<<<<<< HEAD
+ +	char *full_path = NULL;
+++=======
++ 	const char *full_path;
++ 	void *page = alloc_dentry_path();
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	int rc = -EACCES;
+  	__u32 dosattr = 0;
+  	__u64 mode = NO_CHANGE_64;
+@@@ -2770,17 -2782,14 +2804,22 @@@
+  	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_PERM)
+  		attrs->ia_valid |= ATTR_FORCE;
+  
+++<<<<<<< HEAD
+ +	rc = setattr_prepare(direntry, attrs);
+ +	if (rc < 0) {
+ +		free_xid(xid);
+ +		return rc;
+ +	}
+++=======
++ 	rc = setattr_prepare(&init_user_ns, direntry, attrs);
++ 	if (rc < 0)
++ 		goto cifs_setattr_exit;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  
+- 	full_path = build_path_from_dentry(direntry);
+- 	if (full_path == NULL) {
+- 		rc = -ENOMEM;
+- 		free_xid(xid);
+- 		return rc;
++ 	full_path = build_path_from_dentry(direntry, page);
++ 	if (IS_ERR(full_path)) {
++ 		rc = PTR_ERR(full_path);
++ 		goto cifs_setattr_exit;
+  	}
+  
+  	/*
+diff --cc fs/cifs/ioctl.c
+index dcde44ff6cf9,08d99fec593e..000000000000
+--- a/fs/cifs/ioctl.c
++++ b/fs/cifs/ioctl.c
+@@@ -42,7 -42,8 +42,12 @@@ static long cifs_ioctl_query_info(unsig
+  	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
+  	struct cifs_tcon *tcon = cifs_sb_master_tcon(cifs_sb);
+  	struct dentry *dentry = filep->f_path.dentry;
+++<<<<<<< HEAD
+ +	unsigned char *path;
+++=======
++ 	const unsigned char *path;
++ 	void *page = alloc_dentry_path();
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	__le16 *utf16_path = NULL, root_path;
+  	int rc = 0;
+  
+diff --cc fs/cifs/link.c
+index 94dab4309fbb,616e1bc0cc0a..000000000000
+--- a/fs/cifs/link.c
++++ b/fs/cifs/link.c
+@@@ -510,8 -510,8 +510,13 @@@ cifs_hardlink(struct dentry *old_file, 
+  {
+  	int rc = -EACCES;
+  	unsigned int xid;
+++<<<<<<< HEAD
+ +	char *from_name = NULL;
+ +	char *to_name = NULL;
+++=======
++ 	const char *from_name, *to_name;
++ 	void *page1, *page2;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
+  	struct tcon_link *tlink;
+  	struct cifs_tcon *tcon;
+@@@ -600,7 -606,8 +611,12 @@@ cifs_get_link(struct dentry *direntry, 
+  {
+  	int rc = -ENOMEM;
+  	unsigned int xid;
+++<<<<<<< HEAD
+ +	char *full_path = NULL;
+++=======
++ 	const char *full_path;
++ 	void *page;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	char *target_path = NULL;
+  	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
+  	struct tcon_link *tlink = NULL;
+@@@ -668,7 -678,8 +686,12 @@@ cifs_symlink(struct inode *inode, struc
+  	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
+  	struct tcon_link *tlink;
+  	struct cifs_tcon *pTcon;
+++<<<<<<< HEAD
+ +	char *full_path = NULL;
+++=======
++ 	const char *full_path;
++ 	void *page = alloc_dentry_path();
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	struct inode *newinode = NULL;
+  
+  	xid = get_xid();
+diff --cc fs/cifs/readdir.c
+index 7ceb92f8b16b,7531e8905881..000000000000
+--- a/fs/cifs/readdir.c
++++ b/fs/cifs/readdir.c
+@@@ -963,7 -942,8 +963,12 @@@ int cifs_readdir(struct file *file, str
+  	char *tmp_buf = NULL;
+  	char *end_of_smb;
+  	unsigned int max_len;
+++<<<<<<< HEAD
+ +	char *full_path = NULL;
+++=======
++ 	const char *full_path;
++ 	void *page = alloc_dentry_path();
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  
+  	xid = get_xid();
+  
+diff --cc fs/cifs/smb2ops.c
+index d524ace3b0c8,65fc65b26d84..000000000000
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@@ -2212,7 -2221,8 +2212,12 @@@ smb3_notify(const unsigned int xid, str
+  	struct cifs_open_parms oparms;
+  	struct cifs_fid fid;
+  	struct cifs_tcon *tcon;
+++<<<<<<< HEAD
+ +	unsigned char *path = NULL;
+++=======
++ 	const unsigned char *path;
++ 	void *page = alloc_dentry_path();
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  	__le16 *utf16_path = NULL;
+  	u8 oplock = SMB2_OPLOCK_LEVEL_NONE;
+  	int rc = 0;
+diff --cc fs/cifs/xattr.c
+index 4706a9ba0db1,e351b945135b..000000000000
+--- a/fs/cifs/xattr.c
++++ b/fs/cifs/xattr.c
+@@@ -109,7 -112,8 +109,12 @@@ static int cifs_xattr_set(const struct 
+  	struct cifs_sb_info *cifs_sb = CIFS_SB(sb);
+  	struct tcon_link *tlink;
+  	struct cifs_tcon *pTcon;
+++<<<<<<< HEAD
+ +	char *full_path;
+++=======
++ 	const char *full_path;
++ 	void *page;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  
+  	tlink = cifs_sb_tlink(cifs_sb);
+  	if (IS_ERR(tlink))
+@@@ -289,7 -299,8 +295,12 @@@ static int cifs_xattr_get(const struct 
+  	struct cifs_sb_info *cifs_sb = CIFS_SB(sb);
+  	struct tcon_link *tlink;
+  	struct cifs_tcon *pTcon;
+++<<<<<<< HEAD
+ +	char *full_path;
+++=======
++ 	const char *full_path;
++ 	void *page;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  
+  	tlink = cifs_sb_tlink(cifs_sb);
+  	if (IS_ERR(tlink))
+@@@ -397,7 -418,8 +409,12 @@@ ssize_t cifs_listxattr(struct dentry *d
+  	struct cifs_sb_info *cifs_sb = CIFS_SB(direntry->d_sb);
+  	struct tcon_link *tlink;
+  	struct cifs_tcon *pTcon;
+++<<<<<<< HEAD
+ +	char *full_path;
+++=======
++ 	const char *full_path;
++ 	void *page;
+++>>>>>>> f6a9bc336b60 (cifs: allocate buffer in the caller of build_path_from_dentry())
+  
+  	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_XATTR)
+  		return -EOPNOTSUPP;
+diff --git a/fs/cifs/cifs_dfs_ref.c b/fs/cifs/cifs_dfs_ref.c
+index 382f125110da..32303b341c21 100644
+--- a/fs/cifs/cifs_dfs_ref.c
++++ b/fs/cifs/cifs_dfs_ref.c
+@@ -308,6 +308,7 @@ static struct vfsmount *cifs_dfs_do_automount(struct dentry *mntpt)
+ 	struct cifs_sb_info *cifs_sb;
+ 	struct cifs_ses *ses;
+ 	struct cifs_tcon *tcon;
++	void *page;
+ 	char *full_path, *root_path;
+ 	unsigned int xid;
+ 	int rc;
+@@ -330,10 +331,13 @@ static struct vfsmount *cifs_dfs_do_automount(struct dentry *mntpt)
+ 		goto cdda_exit;
+ 	}
+ 
++	page = alloc_dentry_path();
+ 	/* always use tree name prefix */
+-	full_path = build_path_from_dentry_optional_prefix(mntpt, true);
+-	if (full_path == NULL)
+-		goto cdda_exit;
++	full_path = build_path_from_dentry_optional_prefix(mntpt, page, true);
++	if (IS_ERR(full_path)) {
++		mnt = ERR_CAST(full_path);
++		goto free_full_path;
++	}
+ 
+ 	convert_delimiter(full_path, '\\');
+ 
+@@ -391,7 +395,7 @@ static struct vfsmount *cifs_dfs_do_automount(struct dentry *mntpt)
+ free_root_path:
+ 	kfree(root_path);
+ free_full_path:
+-	kfree(full_path);
++	free_dentry_path(page);
+ cdda_exit:
+ 	cifs_dbg(FYI, "leaving %s\n" , __func__);
+ 	return mnt;
+* Unmerged path fs/cifs/cifsproto.h
+* Unmerged path fs/cifs/dir.c
+* Unmerged path fs/cifs/file.c
+* Unmerged path fs/cifs/inode.c
+* Unmerged path fs/cifs/ioctl.c
+* Unmerged path fs/cifs/link.c
+* Unmerged path fs/cifs/readdir.c
+* Unmerged path fs/cifs/smb2ops.c
+* Unmerged path fs/cifs/xattr.c
