@@ -1,0 +1,217 @@
+mptcp: use the workqueue to destroy unaccepted sockets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-529.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit b6985b9b82954caa53f862d6059d06c0526254f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-529.el8/b6985b9b.failed
+
+Christoph reported a UaF at token lookup time after having
+refactored the passive socket initialization part:
+
+  BUG: KASAN: use-after-free in __token_bucket_busy+0x253/0x260
+  Read of size 4 at addr ffff88810698d5b0 by task syz-executor653/3198
+
+  CPU: 1 PID: 3198 Comm: syz-executor653 Not tainted 6.2.0-rc59af4eaa31c1f6c00c8f1e448ed99a45c66340dd5 #6
+  Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.13.0-0-gf21b5a4aeb02-prebuilt.qemu.org 04/01/2014
+  Call Trace:
+   <TASK>
+   dump_stack_lvl+0x6e/0x91
+   print_report+0x16a/0x46f
+   kasan_report+0xad/0x130
+   __token_bucket_busy+0x253/0x260
+   mptcp_token_new_connect+0x13d/0x490
+   mptcp_connect+0x4ed/0x860
+   __inet_stream_connect+0x80e/0xd90
+   tcp_sendmsg_fastopen+0x3ce/0x710
+   mptcp_sendmsg+0xff1/0x1a20
+   inet_sendmsg+0x11d/0x140
+   __sys_sendto+0x405/0x490
+   __x64_sys_sendto+0xdc/0x1b0
+   do_syscall_64+0x3b/0x90
+   entry_SYSCALL_64_after_hwframe+0x72/0xdc
+
+We need to properly clean-up all the paired MPTCP-level
+resources and be sure to release the msk last, even when
+the unaccepted subflow is destroyed by the TCP internals
+via inet_child_forget().
+
+We can re-use the existing MPTCP_WORK_CLOSE_SUBFLOW infra,
+explicitly checking that for the critical scenario: the
+closed subflow is the MPC one, the msk is not accepted and
+eventually going through full cleanup.
+
+With such change, __mptcp_destroy_sock() is always called
+on msk sockets, even on accepted ones. We don't need anymore
+to transiently drop one sk reference at msk clone time.
+
+Please note this commit depends on the parent one:
+
+  mptcp: refactor passive socket initialization
+
+Fixes: 58b09919626b ("mptcp: create msk early")
+	Cc: stable@vger.kernel.org
+Reported-and-tested-by: Christoph Paasch <cpaasch@apple.com>
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/347
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+	Signed-off-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit b6985b9b82954caa53f862d6059d06c0526254f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+#	net/mptcp/protocol.h
+#	net/mptcp/subflow.c
+diff --cc net/mptcp/protocol.c
+index 235f6c6f03b1,2a2093d61835..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -2246,9 -2323,25 +2246,31 @@@ static void __mptcp_close_ssk(struct so
+  
+  	lock_sock_nested(ssk, SINGLE_DEPTH_NESTING);
+  
+++<<<<<<< HEAD
+ +	sock_orphan(ssk);
+ +
+ +	need_push = __mptcp_retransmit_pending_data(sk);
+++=======
++ 	if (flags & MPTCP_CF_FASTCLOSE) {
++ 		/* be sure to force the tcp_disconnect() path,
++ 		 * to generate the egress reset
++ 		 */
++ 		ssk->sk_lingertime = 0;
++ 		sock_set_flag(ssk, SOCK_LINGER);
++ 		subflow->send_fastclose = 1;
++ 	}
++ 
++ 	need_push = (flags & MPTCP_CF_PUSH) && __mptcp_retransmit_pending_data(sk);
++ 	if (!dispose_it) {
++ 		tcp_disconnect(ssk, 0);
++ 		msk->subflow->state = SS_UNCONNECTED;
++ 		mptcp_subflow_ctx_reset(subflow);
++ 		release_sock(ssk);
++ 
++ 		goto out;
++ 	}
++ 
+++>>>>>>> b6985b9b8295 (mptcp: use the workqueue to destroy unaccepted sockets)
+  	subflow->disposable = 1;
+  
+  	/* if ssk hit tcp_done(), tcp_cleanup_ulp() cleared the related ops
+@@@ -2462,16 -2651,17 +2509,13 @@@ static void mptcp_worker(struct work_st
+  	 * closed, but we need the msk around to reply to incoming DATA_FIN,
+  	 * even if it is orphaned and in FIN_WAIT2 state
+  	 */
+ -	if (sock_flag(sk, SOCK_DEAD)) {
+ -		if (mptcp_check_close_timeout(sk)) {
+ -			inet_sk_state_store(sk, TCP_CLOSE);
+ -			mptcp_do_fastclose(sk);
+ -		}
+ -		if (sk->sk_state == TCP_CLOSE) {
+ -			__mptcp_destroy_sock(sk);
+ -			goto unlock;
+ -		}
+ +	if (sock_flag(sk, SOCK_DEAD) &&
+ +	    (mptcp_check_close_timeout(sk) || sk->sk_state == TCP_CLOSE)) {
+ +		inet_sk_state_store(sk, TCP_CLOSE);
+ +		__mptcp_destroy_sock(sk);
+ +		goto unlock;
+  	}
+  
+- 	if (test_and_clear_bit(MPTCP_WORK_CLOSE_SUBFLOW, &msk->flags))
+- 		__mptcp_close_subflow(msk);
+- 
+  	if (test_and_clear_bit(MPTCP_WORK_RTX, &msk->flags))
+  		__mptcp_retrans(sk);
+  
+@@@ -2827,7 -3099,10 +2871,8 @@@ struct sock *mptcp_sk_clone(const struc
+  	msk->local_key = subflow_req->local_key;
+  	msk->token = subflow_req->token;
+  	msk->subflow = NULL;
++ 	msk->in_accept_queue = 1;
+  	WRITE_ONCE(msk->fully_established, false);
+ -	if (mp_opt->suboptions & OPTION_MPTCP_CSUMREQD)
+ -		WRITE_ONCE(msk->csum_enabled, true);
+  
+  	msk->write_seq = subflow_req->idsn + 1;
+  	msk->snd_nxt = msk->write_seq;
+@@@ -3379,25 -3722,11 +3421,31 @@@ static int mptcp_stream_accept(struct s
+  		struct mptcp_subflow_context *subflow;
+  		struct sock *newsk = newsock->sk;
+  
+++<<<<<<< HEAD
+++=======
++ 		set_bit(SOCK_CUSTOM_SOCKOPT, &newsock->flags);
++ 		msk->in_accept_queue = 0;
++ 
+++>>>>>>> b6985b9b8295 (mptcp: use the workqueue to destroy unaccepted sockets)
+  		lock_sock(newsk);
+  
+ +		/* PM/worker can now acquire the first subflow socket
+ +		 * lock without racing with listener queue cleanup,
+ +		 * we can notify it, if needed.
+ +		 *
+ +		 * Even if remote has reset the initial subflow by now
+ +		 * the refcnt is still at least one.
+ +		 */
+ +		subflow = mptcp_subflow_ctx(msk->first);
+ +		list_add(&subflow->node, &msk->conn_list);
+ +		sock_hold(msk->first);
+ +		if (mptcp_is_fully_established(newsk))
+ +			mptcp_pm_fully_established(msk, msk->first, GFP_KERNEL);
+ +
+ +		mptcp_copy_inaddrs(newsk, msk->first);
+ +		mptcp_rcv_space_init(msk, msk->first);
+ +		mptcp_propagate_sndbuf(newsk, msk->first);
+ +
+  		/* set ssk->sk_socket of accept()ed flows to mptcp socket.
+  		 * This is needed so NOSPACE flag can be set from tcp stack.
+  		 */
+diff --cc net/mptcp/protocol.h
+index c1c84a9105a7,3a2db1b862dd..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -249,9 -290,14 +249,16 @@@ struct mptcp_sock 
+  	bool		rcv_fastclose;
+  	bool		use_64bit_ack; /* Set when we received a 64-bit DSN */
+  	bool		csum_enabled;
+ -	bool		allow_infinite_fallback;
+ -	u8		mpc_endpoint_id;
+  	u8		recvmsg_inq:1,
+  			cork:1,
+++<<<<<<< HEAD
+ +			nodelay:1;
+++=======
++ 			nodelay:1,
++ 			fastopening:1,
++ 			in_accept_queue:1;
++ 	int		connect_flags;
+++>>>>>>> b6985b9b8295 (mptcp: use the workqueue to destroy unaccepted sockets)
+  	struct work_struct work;
+  	struct sk_buff  *ooo_last_skb;
+  	struct rb_root  out_of_order_queue;
+diff --cc net/mptcp/subflow.c
+index f7dbf4057ccc,932a3e0eb22d..000000000000
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@@ -671,7 -822,9 +672,13 @@@ create_child
+  				goto dispose_child;
+  			}
+  
+++<<<<<<< HEAD
+ +			subflow_drop_ctx(child);
+++=======
++ 			if (new_msk)
++ 				mptcp_copy_inaddrs(new_msk, child);
++ 			mptcp_subflow_drop_ctx(child);
+++>>>>>>> b6985b9b8295 (mptcp: use the workqueue to destroy unaccepted sockets)
+  			goto out;
+  		}
+  
+* Unmerged path net/mptcp/protocol.c
+* Unmerged path net/mptcp/protocol.h
+* Unmerged path net/mptcp/subflow.c
