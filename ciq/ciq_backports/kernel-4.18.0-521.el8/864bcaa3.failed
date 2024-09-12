@@ -1,0 +1,142 @@
+x86/cpu/kvm: Provide UNTRAIN_RET_VM
+
+jira LE-1907
+cve CVE-2023-20569
+Rebuild_History Non-Buildable kernel-4.18.0-521.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 864bcaa38ee44ec6c0e43f79c2d2997b977e26b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-521.el8/864bcaa3.failed
+
+Similar to how it doesn't make sense to have UNTRAIN_RET have two
+untrain calls, it also doesn't make sense for VMEXIT to have an extra
+IBPB call.
+
+This cures VMEXIT doing potentially unret+IBPB or double IBPB.
+Also, the (SEV) VMEXIT case seems to have been overlooked.
+
+Redefine the meaning of the synthetic IBPB flags to:
+
+ - ENTRY_IBPB     -- issue IBPB on entry  (was: entry + VMEXIT)
+ - IBPB_ON_VMEXIT -- issue IBPB on VMEXIT
+
+And have 'retbleed=ibpb' set *BOTH* feature flags to ensure it retains
+the previous behaviour and issues IBPB on entry+VMEXIT.
+
+The new 'srso=ibpb_vmexit' option only sets IBPB_ON_VMEXIT.
+
+Create UNTRAIN_RET_VM specifically for the VMEXIT case, and have that
+check IBPB_ON_VMEXIT.
+
+All this avoids having the VMEXIT case having to check both ENTRY_IBPB
+and IBPB_ON_VMEXIT and simplifies the alternatives.
+
+Fixes: fb3bd914b3ec ("x86/srso: Add a Speculative RAS Overflow mitigation")
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Link: https://lore.kernel.org/r/20230814121149.109557833@infradead.org
+(cherry picked from commit 864bcaa38ee44ec6c0e43f79c2d2997b977e26b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/nospec-branch.h
+#	arch/x86/kvm/svm/vmenter.S
+diff --cc arch/x86/include/asm/nospec-branch.h
+index 53e56fc9cf70,c55cc243592e..000000000000
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@@ -189,10 -289,43 +189,50 @@@
+   * where we have a stack but before any RET instruction.
+   */
+  .macro UNTRAIN_RET
+++<<<<<<< HEAD
+ +#if defined(CONFIG_CPU_UNRET_ENTRY) || defined(CONFIG_CPU_IBPB_ENTRY)
+ +	ALTERNATIVE_2 "",						\
+ +	              CALL_ZEN_UNTRAIN_RET, X86_FEATURE_UNRET,		\
+ +		      "call entry_ibpb", X86_FEATURE_ENTRY_IBPB
+++=======
++ #if defined(CONFIG_CPU_UNRET_ENTRY) || defined(CONFIG_CPU_IBPB_ENTRY) || \
++ 	defined(CONFIG_CALL_DEPTH_TRACKING) || defined(CONFIG_CPU_SRSO)
++ 	VALIDATE_UNRET_END
++ 	ALTERNATIVE_3 "",						\
++ 		      CALL_UNTRAIN_RET, X86_FEATURE_UNRET,		\
++ 		      "call entry_ibpb", X86_FEATURE_ENTRY_IBPB,	\
++ 		      __stringify(RESET_CALL_DEPTH), X86_FEATURE_CALL_DEPTH
++ #endif
++ .endm
++ 
++ .macro UNTRAIN_RET_VM
++ #if defined(CONFIG_CPU_UNRET_ENTRY) || defined(CONFIG_CPU_IBPB_ENTRY) || \
++ 	defined(CONFIG_CALL_DEPTH_TRACKING) || defined(CONFIG_CPU_SRSO)
++ 	VALIDATE_UNRET_END
++ 	ALTERNATIVE_3 "",						\
++ 		      CALL_UNTRAIN_RET, X86_FEATURE_UNRET,		\
++ 		      "call entry_ibpb", X86_FEATURE_IBPB_ON_VMEXIT,	\
++ 		      __stringify(RESET_CALL_DEPTH), X86_FEATURE_CALL_DEPTH
++ #endif
++ .endm
++ 
++ .macro UNTRAIN_RET_FROM_CALL
++ #if defined(CONFIG_CPU_UNRET_ENTRY) || defined(CONFIG_CPU_IBPB_ENTRY) || \
++ 	defined(CONFIG_CALL_DEPTH_TRACKING)
++ 	VALIDATE_UNRET_END
++ 	ALTERNATIVE_3 "",						\
++ 		      CALL_UNTRAIN_RET, X86_FEATURE_UNRET,		\
++ 		      "call entry_ibpb", X86_FEATURE_ENTRY_IBPB,	\
++ 		      __stringify(RESET_CALL_DEPTH_FROM_CALL), X86_FEATURE_CALL_DEPTH
++ #endif
++ .endm
++ 
++ 
++ .macro CALL_DEPTH_ACCOUNT
++ #ifdef CONFIG_CALL_DEPTH_TRACKING
++ 	ALTERNATIVE "",							\
++ 		    __stringify(ASM_INCREMENT_CALL_DEPTH), X86_FEATURE_CALL_DEPTH
+++>>>>>>> 864bcaa38ee4 (x86/cpu/kvm: Provide UNTRAIN_RET_VM)
+  #endif
+  .endm
+  
+diff --cc arch/x86/kvm/svm/vmenter.S
+index 723f8534986c,ef2ebabb059c..000000000000
+--- a/arch/x86/kvm/svm/vmenter.S
++++ b/arch/x86/kvm/svm/vmenter.S
+@@@ -117,7 -222,7 +117,11 @@@ SYM_FUNC_START(__svm_vcpu_run
+  	 * because interrupt handlers won't sanitize 'ret' if the return is
+  	 * from the kernel.
+  	 */
+++<<<<<<< HEAD
+ +	UNTRAIN_RET
+++=======
++ 	UNTRAIN_RET_VM
+++>>>>>>> 864bcaa38ee4 (x86/cpu/kvm: Provide UNTRAIN_RET_VM)
+  
+  	/*
+  	 * Clear all general purpose registers except RSP and RAX to prevent
+@@@ -206,8 -359,11 +210,8 @@@ SYM_FUNC_START(__svm_sev_es_vcpu_run
+  	 * because interrupt handlers won't sanitize RET if the return is
+  	 * from the kernel.
+  	 */
+- 	UNTRAIN_RET
++ 	UNTRAIN_RET_VM
+  
+ -	/* "Pop" @spec_ctrl_intercepted.  */
+ -	pop %_ASM_BX
+ -
+  	pop %_ASM_BX
+  
+  #ifdef CONFIG_X86_64
+* Unmerged path arch/x86/include/asm/nospec-branch.h
+diff --git a/arch/x86/kernel/cpu/bugs.c b/arch/x86/kernel/cpu/bugs.c
+index adea0002a1a8..306fc5382350 100644
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -1029,6 +1029,7 @@ static void __init retbleed_select_mitigation(void)
+ 
+ 	case RETBLEED_MITIGATION_IBPB:
+ 		setup_force_cpu_cap(X86_FEATURE_ENTRY_IBPB);
++		setup_force_cpu_cap(X86_FEATURE_IBPB_ON_VMEXIT);
+ 		mitigate_smt = true;
+ 		break;
+ 
+* Unmerged path arch/x86/kvm/svm/vmenter.S
