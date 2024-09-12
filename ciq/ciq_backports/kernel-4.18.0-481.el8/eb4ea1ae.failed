@@ -1,0 +1,189 @@
+x86/boot: Port I/O: Allow to hook up alternative helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+commit eb4ea1ae8f45e3249e7586f30be8977478202a37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/eb4ea1ae.failed
+
+Port I/O instructions trigger #VE in the TDX environment. In response to
+the exception, kernel emulates these instructions using hypercalls.
+
+But during early boot, on the decompression stage, it is cumbersome to
+deal with #VE. It is cleaner to go to hypercalls directly, bypassing #VE
+handling.
+
+Add a way to hook up alternative port I/O helpers in the boot stub with
+a new pio_ops structure.  For now, set the ops structure to just call
+the normal I/O operation functions.
+
+out*()/in*() macros redefined to use pio_ops callbacks. It eliminates
+need in changing call sites. io_delay() changed to use port I/O helper
+instead of inline assembly.
+
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+Link: https://lkml.kernel.org/r/20220405232939.73860-16-kirill.shutemov@linux.intel.com
+(cherry picked from commit eb4ea1ae8f45e3249e7586f30be8977478202a37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/misc.c
+diff --cc arch/x86/boot/compressed/misc.c
+index 246873efe6af,fa8969fad011..000000000000
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@@ -365,6 -373,16 +367,19 @@@ asmlinkage __visible void *extract_kern
+  	lines = boot_params->screen_info.orig_video_lines;
+  	cols = boot_params->screen_info.orig_video_cols;
+  
+++<<<<<<< HEAD
+++=======
++ 	init_default_io_ops();
++ 
++ 	/*
++ 	 * Detect TDX guest environment.
++ 	 *
++ 	 * It has to be done before console_init() in order to use
++ 	 * paravirtualized port I/O operations if needed.
++ 	 */
++ 	early_tdx_detect();
++ 
+++>>>>>>> eb4ea1ae8f45 (x86/boot: Port I/O: Allow to hook up alternative helpers)
+  	console_init();
+  
+  	/*
+diff --git a/arch/x86/boot/boot.h b/arch/x86/boot/boot.h
+index c5246b9ca635..fe76924521ac 100644
+--- a/arch/x86/boot/boot.h
++++ b/arch/x86/boot/boot.h
+@@ -25,10 +25,10 @@
+ #include <linux/edd.h>
+ #include <asm/setup.h>
+ #include <asm/asm.h>
+-#include <asm/shared/io.h>
+ #include "bitops.h"
+ #include "ctype.h"
+ #include "cpuflags.h"
++#include "io.h"
+ 
+ /* Useful macros */
+ #define ARRAY_SIZE(x) (sizeof(x) / sizeof(*(x)))
+@@ -41,7 +41,7 @@ extern struct boot_params boot_params;
+ static inline void io_delay(void)
+ {
+ 	const u16 DELAY_PORT = 0x80;
+-	asm volatile("outb %%al,%0" : : "dN" (DELAY_PORT));
++	outb(0, DELAY_PORT);
+ }
+ 
+ /* These functions are used to reference data in other segments. */
+* Unmerged path arch/x86/boot/compressed/misc.c
+diff --git a/arch/x86/boot/compressed/misc.h b/arch/x86/boot/compressed/misc.h
+index 9aed4d7bc538..e2f4f0348d26 100644
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@ -24,13 +24,13 @@
+ #include <asm/bootparam.h>
+ #include <asm/bootparam_utils.h>
+ #include <asm/desc_defs.h>
+-#include <asm/shared/io.h>
+ 
+ #define BOOT_CTYPE_H
+ #include <linux/acpi.h>
+ 
+ #define BOOT_BOOT_H
+ #include "../ctype.h"
++#include "../io.h"
+ 
+ #ifdef CONFIG_X86_64
+ #define memptr long
+diff --git a/arch/x86/boot/io.h b/arch/x86/boot/io.h
+new file mode 100644
+index 000000000000..110880907f87
+--- /dev/null
++++ b/arch/x86/boot/io.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef BOOT_IO_H
++#define BOOT_IO_H
++
++#include <asm/shared/io.h>
++
++#undef inb
++#undef inw
++#undef inl
++#undef outb
++#undef outw
++#undef outl
++
++struct port_io_ops {
++	u8	(*f_inb)(u16 port);
++	void	(*f_outb)(u8 v, u16 port);
++	void	(*f_outw)(u16 v, u16 port);
++};
++
++extern struct port_io_ops pio_ops;
++
++/*
++ * Use the normal I/O instructions by default.
++ * TDX guests override these to use hypercalls.
++ */
++static inline void init_default_io_ops(void)
++{
++	pio_ops.f_inb  = __inb;
++	pio_ops.f_outb = __outb;
++	pio_ops.f_outw = __outw;
++}
++
++/*
++ * Redirect port I/O operations via pio_ops callbacks.
++ * TDX guests override these callbacks with TDX-specific helpers.
++ */
++#define inb  pio_ops.f_inb
++#define outb pio_ops.f_outb
++#define outw pio_ops.f_outw
++
++#endif
+diff --git a/arch/x86/boot/main.c b/arch/x86/boot/main.c
+index 7266ce31f264..3c7f76dca867 100644
+--- a/arch/x86/boot/main.c
++++ b/arch/x86/boot/main.c
+@@ -19,6 +19,8 @@
+ 
+ struct boot_params boot_params __attribute__((aligned(16)));
+ 
++struct port_io_ops pio_ops;
++
+ char *HEAP = _end;
+ char *heap_end = _end;		/* Default end of heap = no heap */
+ 
+@@ -135,6 +137,8 @@ static void init_heap(void)
+ 
+ void main(void)
+ {
++	init_default_io_ops();
++
+ 	/* First, copy the boot header into the "zeropage" */
+ 	copy_boot_params();
+ 
+diff --git a/arch/x86/realmode/rm/wakemain.c b/arch/x86/realmode/rm/wakemain.c
+index 1d6437e6d2ba..a6f4d8388ad8 100644
+--- a/arch/x86/realmode/rm/wakemain.c
++++ b/arch/x86/realmode/rm/wakemain.c
+@@ -62,8 +62,12 @@ static void send_morse(const char *pattern)
+ 	}
+ }
+ 
++struct port_io_ops pio_ops;
++
+ void main(void)
+ {
++	init_default_io_ops();
++
+ 	/* Kill machine if structures are wrong */
+ 	if (wakeup_header.real_magic != 0x12345678)
+ 		while (1)
