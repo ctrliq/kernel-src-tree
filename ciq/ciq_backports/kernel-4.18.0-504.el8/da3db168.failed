@@ -1,0 +1,163 @@
+KVM: x86: Virtualize FLUSH_L1D and passthrough MSR_IA32_FLUSH_CMD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-504.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit da3db168fb671f15e393b227f5c312c698ecb6ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-504.el8/da3db168.failed
+
+Virtualize FLUSH_L1D so that the guest can use the performant L1D flush
+if one of the many mitigations might require a flush in the guest, e.g.
+Linux provides an option to flush the L1D when switching mms.
+
+Passthrough MSR_IA32_FLUSH_CMD for write when it's supported in hardware
+and exposed to the guest, i.e. always let the guest write it directly if
+FLUSH_L1D is fully supported.
+
+Forward writes to hardware in host context on the off chance that KVM
+ends up emulating a WRMSR, or in the really unlikely scenario where
+userspace wants to force a flush.  Restrict these forwarded WRMSRs to
+the known command out of an abundance of caution.  Passing through the
+MSR means the guest can throw any and all values at hardware, but doing
+so in host context is arguably a bit more dangerous.
+
+Link: https://lkml.kernel.org/r/CALMp9eTt3xzAEoQ038bJQ9LN0ZOXrSWsN7xnNUD%2B0SS%3DWwF7Pg%40mail.gmail.com
+Link: https://lore.kernel.org/all/20230201132905.549148-2-eesposit@redhat.com
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20230322011440.2195485-6-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit da3db168fb671f15e393b227f5c312c698ecb6ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 113ed764876d,3c58dbae7b4c..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -3491,9 -3615,31 +3491,35 @@@ int kvm_set_msr_common(struct kvm_vcpu 
+  			return 1;
+  
+  		vcpu->arch.perf_capabilities = data;
+ -		kvm_pmu_refresh(vcpu);
+ +
+  		return 0;
+++<<<<<<< HEAD
+ +		}
+++=======
++ 	case MSR_IA32_PRED_CMD:
++ 		if (!msr_info->host_initiated && !guest_has_pred_cmd_msr(vcpu))
++ 			return 1;
++ 
++ 		if (!boot_cpu_has(X86_FEATURE_IBPB) || (data & ~PRED_CMD_IBPB))
++ 			return 1;
++ 		if (!data)
++ 			break;
++ 
++ 		wrmsrl(MSR_IA32_PRED_CMD, PRED_CMD_IBPB);
++ 		break;
++ 	case MSR_IA32_FLUSH_CMD:
++ 		if (!msr_info->host_initiated &&
++ 		    !guest_cpuid_has(vcpu, X86_FEATURE_FLUSH_L1D))
++ 			return 1;
++ 
++ 		if (!boot_cpu_has(X86_FEATURE_FLUSH_L1D) || (data & ~L1D_FLUSH))
++ 			return 1;
++ 		if (!data)
++ 			break;
++ 
++ 		wrmsrl(MSR_IA32_FLUSH_CMD, L1D_FLUSH);
++ 		break;
+++>>>>>>> da3db168fb67 (KVM: x86: Virtualize FLUSH_L1D and passthrough MSR_IA32_FLUSH_CMD)
+  	case MSR_EFER:
+  		return set_efer(vcpu, msr_info);
+  	case MSR_K7_HWCR:
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index 2fa8ac162555..eec55b2b9e94 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -594,7 +594,7 @@ void kvm_set_cpu_caps(void)
+ 		F(SPEC_CTRL_SSBD) | F(ARCH_CAPABILITIES) | F(INTEL_STIBP) |
+ 		F(MD_CLEAR) | F(AVX512_VP2INTERSECT) | F(FSRM) |
+ 		F(SERIALIZE) | F(TSXLDTRK) | F(AVX512_FP16) |
+-		F(AMX_TILE) | F(AMX_INT8) | F(AMX_BF16)
++		F(AMX_TILE) | F(AMX_INT8) | F(AMX_BF16) | F(FLUSH_L1D)
+ 	);
+ 
+ 	/* TSC_ADJUST and ARCH_CAPABILITIES are emulated in software. */
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 55114013bb30..f582782e6f01 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -95,6 +95,7 @@ static const struct svm_direct_access_msrs {
+ #endif
+ 	{ .index = MSR_IA32_SPEC_CTRL,			.always = false },
+ 	{ .index = MSR_IA32_PRED_CMD,			.always = false },
++	{ .index = MSR_IA32_FLUSH_CMD,			.always = false },
+ 	{ .index = MSR_IA32_LASTBRANCHFROMIP,		.always = false },
+ 	{ .index = MSR_IA32_LASTBRANCHTOIP,		.always = false },
+ 	{ .index = MSR_IA32_LASTINTFROMIP,		.always = false },
+@@ -4112,6 +4113,10 @@ static void svm_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
+ 		set_msr_interception(vcpu, svm->msrpm, MSR_IA32_PRED_CMD, 0,
+ 				     !!guest_has_pred_cmd_msr(vcpu));
+ 
++	if (boot_cpu_has(X86_FEATURE_FLUSH_L1D))
++		set_msr_interception(vcpu, svm->msrpm, MSR_IA32_FLUSH_CMD, 0,
++				     !!guest_cpuid_has(vcpu, X86_FEATURE_FLUSH_L1D));
++
+ 	/* For sev guests, the memory encryption bit is not reserved in CR3.  */
+ 	if (sev_guest(vcpu->kvm)) {
+ 		best = kvm_find_cpuid_entry(vcpu, 0x8000001F, 0);
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index 560bbc99c649..6f654c8e9e81 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -686,6 +686,9 @@ static inline bool nested_vmx_prepare_msr_bitmap(struct kvm_vcpu *vcpu,
+ 	nested_vmx_set_intercept_for_msr(vmx, msr_bitmap_l1, msr_bitmap_l0,
+ 					 MSR_IA32_PRED_CMD, MSR_TYPE_W);
+ 
++	nested_vmx_set_intercept_for_msr(vmx, msr_bitmap_l1, msr_bitmap_l0,
++					 MSR_IA32_FLUSH_CMD, MSR_TYPE_W);
++
+ 	kvm_vcpu_unmap(vcpu, &vmx->nested.msr_bitmap_map, false);
+ 
+ 	vmx->nested.force_msr_bitmap_recalc = false;
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 963d6a23078b..41523a439f39 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -157,6 +157,7 @@ module_param(allow_smaller_maxphyaddr, bool, S_IRUGO);
+ static u32 vmx_possible_passthrough_msrs[MAX_POSSIBLE_PASSTHROUGH_MSRS] = {
+ 	MSR_IA32_SPEC_CTRL,
+ 	MSR_IA32_PRED_CMD,
++	MSR_IA32_FLUSH_CMD,
+ 	MSR_IA32_TSC,
+ #ifdef CONFIG_X86_64
+ 	MSR_FS_BASE,
+@@ -7431,6 +7432,10 @@ static void vmx_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
+ 		vmx_set_intercept_for_msr(vcpu, MSR_IA32_PRED_CMD, MSR_TYPE_W,
+ 					  !guest_has_pred_cmd_msr(vcpu));
+ 
++	if (boot_cpu_has(X86_FEATURE_FLUSH_L1D))
++		vmx_set_intercept_for_msr(vcpu, MSR_IA32_FLUSH_CMD, MSR_TYPE_W,
++					  !guest_cpuid_has(vcpu, X86_FEATURE_FLUSH_L1D));
++
+ 	set_cr4_guest_host_mask(vmx);
+ 
+ 	vmx_write_encls_bitmap(vcpu, NULL);
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index 1e7f9453894b..14475d075815 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -356,7 +356,7 @@ struct vcpu_vmx {
+ 	struct lbr_desc lbr_desc;
+ 
+ 	/* Save desired MSR intercept (read: pass-through) state */
+-#define MAX_POSSIBLE_PASSTHROUGH_MSRS	15
++#define MAX_POSSIBLE_PASSTHROUGH_MSRS	16
+ 	struct {
+ 		DECLARE_BITMAP(read, MAX_POSSIBLE_PASSTHROUGH_MSRS);
+ 		DECLARE_BITMAP(write, MAX_POSSIBLE_PASSTHROUGH_MSRS);
+* Unmerged path arch/x86/kvm/x86.c
