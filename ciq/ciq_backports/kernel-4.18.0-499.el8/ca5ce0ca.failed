@@ -1,0 +1,300 @@
+ASoC: SOF: ipc4/intel: Add support for chained DMA
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-499.el8
+commit-author Jyri Sarha <jyri.sarha@intel.com>
+commit ca5ce0caa67fa9eeecaa29d895c2e4c3151c159e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-499.el8/ca5ce0ca.failed
+
+Add logic for setting up and tearing down chained DMA connections.
+
+Since pipelines are not used, all the logic to set the pipeline states
+can be bypassed, with only the DMA programming sequences remaining. In
+addition the same format needs to be used for host- and link-DMA,
+without the usual fixup to use the S32_LE format on the link.
+
+Note however that for convenience and compatibility with existing
+definitions, the topology relies on the concept of pipelines with a
+'USE_CHAIN_DMA' token indicating that all the logic shall be bypassed.
+
+Unlike 'normal' ALSA sequences, the chain DMA is not programmed in
+hw_params/hw_free. The IPC message to set-up and tear-down chained DMA
+are sent in sof_ipc4_trigger_pipelines(), but the contents prepared
+earlier.
+
+Chained DMA is only supported by the Intel HDA DAI for now, and only
+S16_LE and S32_LE formats are supported for now.
+
+	Signed-off-by: Jyri Sarha <jyri.sarha@intel.com>
+	Reviewed-by: Rander Wang <rander.wang@intel.com>
+	Signed-off-by: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+Link: https://lore.kernel.org/r/20230321092654.7292-4-peter.ujfalusi@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit ca5ce0caa67fa9eeecaa29d895c2e4c3151c159e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/ipc4-topology.c
+diff --cc sound/soc/sof/ipc4-topology.c
+index 537221b37f67,f1e1aed94da4..000000000000
+--- a/sound/soc/sof/ipc4-topology.c
++++ b/sound/soc/sof/ipc4-topology.c
+@@@ -2240,12 -2330,15 +2330,24 @@@ static int sof_ipc4_route_setup(struct 
+  	u32 header, extension;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (!src_fw_module || !sink_fw_module) {
+ +		/* The NULL module will print as "(efault)" */
+ +		dev_err(sdev->dev, "source %s or sink %s widget weren't set up properly\n",
+ +			src_fw_module->man4_module_entry.name,
+ +			sink_fw_module->man4_module_entry.name);
+ +		return -ENODEV;
+++=======
++ 	/* no route set up if chain DMA is used */
++ 	if (src_pipeline->use_chain_dma || sink_pipeline->use_chain_dma) {
++ 		if (!src_pipeline->use_chain_dma || !sink_pipeline->use_chain_dma) {
++ 			dev_err(sdev->dev,
++ 				"use_chain_dma must be set for both src %s and sink %s pipelines\n",
++ 				src_widget->widget->name, sink_widget->widget->name);
++ 			return -EINVAL;
++ 		}
++ 		return 0;
+++>>>>>>> ca5ce0caa67f (ASoC: SOF: ipc4/intel: Add support for chained DMA)
+  	}
+  
+  	sroute->src_queue_id = sof_ipc4_get_queue_id(src_widget, sink_widget,
+diff --git a/include/uapi/sound/sof/tokens.h b/include/uapi/sound/sof/tokens.h
+index bd02842124f9..bbc37877aaff 100644
+--- a/include/uapi/sound/sof/tokens.h
++++ b/include/uapi/sound/sof/tokens.h
+@@ -54,6 +54,7 @@
+ #define SOF_TKN_SCHED_DYNAMIC_PIPELINE		206
+ #define SOF_TKN_SCHED_LP_MODE			207
+ #define SOF_TKN_SCHED_MEM_USAGE			208
++#define SOF_TKN_SCHED_USE_CHAIN_DMA		209
+ 
+ /* volume */
+ #define SOF_TKN_VOLUME_RAMP_STEP_TYPE		250
+diff --git a/sound/soc/sof/intel/hda-dai-ops.c b/sound/soc/sof/intel/hda-dai-ops.c
+index be109f33715f..de48f13259f1 100644
+--- a/sound/soc/sof/intel/hda-dai-ops.c
++++ b/sound/soc/sof/intel/hda-dai-ops.c
+@@ -277,6 +277,15 @@ static const struct hda_dai_widget_dma_ops hda_ipc4_dma_ops = {
+ 	.post_trigger = hda_ipc4_post_trigger
+ };
+ 
++static const struct hda_dai_widget_dma_ops hda_ipc4_chain_dma_ops = {
++	.get_hext_stream = hda_get_hext_stream,
++	.assign_hext_stream = hda_assign_hext_stream,
++	.release_hext_stream = hda_release_hext_stream,
++	.setup_hext_stream = hda_setup_hext_stream,
++	.reset_hext_stream = hda_reset_hext_stream,
++	.trigger = hda_trigger,
++};
++
+ static int hda_ipc3_post_trigger(struct snd_sof_dev *sdev, struct snd_soc_dai *cpu_dai,
+ 				 struct snd_pcm_substream *substream, int cmd)
+ {
+@@ -331,8 +340,15 @@ hda_select_dai_widget_ops(struct snd_sof_dev *sdev, struct snd_sof_widget *swidg
+ 	{
+ 		struct sof_ipc4_copier *ipc4_copier = sdai->private;
+ 
+-		if (ipc4_copier->dai_type == SOF_DAI_INTEL_HDA)
++		if (ipc4_copier->dai_type == SOF_DAI_INTEL_HDA) {
++			struct snd_sof_widget *pipe_widget = swidget->spipe->pipe_widget;
++			struct sof_ipc4_pipeline *pipeline = pipe_widget->private;
++
++			if (pipeline->use_chain_dma)
++				return &hda_ipc4_chain_dma_ops;
++
+ 			return &hda_ipc4_dma_ops;
++		}
+ 		break;
+ 	}
+ 	default:
+diff --git a/sound/soc/sof/ipc4-pcm.c b/sound/soc/sof/ipc4-pcm.c
+index b789926dce2a..a2cd21256e44 100644
+--- a/sound/soc/sof/ipc4-pcm.c
++++ b/sound/soc/sof/ipc4-pcm.c
+@@ -193,6 +193,88 @@ sof_ipc4_update_pipeline_state(struct snd_sof_dev *sdev, int state, int cmd,
+  * prepare ioctl before the START trigger.
+  */
+ 
++/*
++ * Chained DMA is a special case where there is no processing on
++ * DSP. The samples are just moved over by host side DMA to a single
++ * buffer on DSP and directly from there to link DMA. However, the
++ * model on SOF driver has two notional pipelines, one at host DAI,
++ * and another at link DAI. They both shall have the use_chain_dma
++ * attribute.
++ */
++
++static int sof_ipc4_chain_dma_trigger(struct snd_sof_dev *sdev,
++				      struct snd_sof_pcm_stream_pipeline_list *pipeline_list,
++				      int state, int cmd)
++{
++	bool allocate, enable, set_fifo_size;
++	struct sof_ipc4_msg msg = {{ 0 }};
++	int i;
++
++	switch (state) {
++	case SOF_IPC4_PIPE_RUNNING: /* Allocate and start chained dma */
++		allocate = true;
++		enable = true;
++		/*
++		 * SOF assumes creation of a new stream from the presence of fifo_size
++		 * in the message, so we must leave it out in pause release case.
++		 */
++		if (cmd == SNDRV_PCM_TRIGGER_PAUSE_RELEASE)
++			set_fifo_size = false;
++		else
++			set_fifo_size = true;
++		break;
++	case SOF_IPC4_PIPE_PAUSED: /* Disable chained DMA. */
++		allocate = true;
++		enable = false;
++		set_fifo_size = false;
++		break;
++	case SOF_IPC4_PIPE_RESET: /* Disable and free chained DMA. */
++		allocate = false;
++		enable = false;
++		set_fifo_size = false;
++		break;
++	default:
++		dev_err(sdev->dev, "Unexpected state %d", state);
++		return -EINVAL;
++	}
++
++	msg.primary = SOF_IPC4_MSG_TYPE_SET(SOF_IPC4_GLB_CHAIN_DMA);
++	msg.primary |= SOF_IPC4_MSG_DIR(SOF_IPC4_MSG_REQUEST);
++	msg.primary |= SOF_IPC4_MSG_TARGET(SOF_IPC4_FW_GEN_MSG);
++
++	/*
++	 * To set-up the DMA chain, the host DMA ID and SCS setting
++	 * are retrieved from the host pipeline configuration. Likewise
++	 * the link DMA ID and fifo_size are retrieved from the link
++	 * pipeline configuration.
++	 */
++	for (i = 0; i < pipeline_list->count; i++) {
++		struct snd_sof_pipeline *spipe = pipeline_list->pipelines[i];
++		struct snd_sof_widget *pipe_widget = spipe->pipe_widget;
++		struct sof_ipc4_pipeline *pipeline = pipe_widget->private;
++
++		if (!pipeline->use_chain_dma) {
++			dev_err(sdev->dev,
++				"All pipelines in chained DMA stream should have use_chain_dma attribute set.");
++			return -EINVAL;
++		}
++
++		msg.primary |= pipeline->msg.primary;
++
++		/* Add fifo_size (actually DMA buffer size) field to the message */
++		if (set_fifo_size)
++			msg.extension |= pipeline->msg.extension;
++	}
++
++	if (allocate)
++		msg.primary |= SOF_IPC4_GLB_CHAIN_DMA_ALLOCATE_MASK;
++
++	if (enable)
++		msg.primary |= SOF_IPC4_GLB_CHAIN_DMA_ENABLE_MASK;
++
++	return sof_ipc_tx_message(sdev->ipc, &msg, 0, NULL, 0);
++}
++
+ static int sof_ipc4_trigger_pipelines(struct snd_soc_component *component,
+ 				      struct snd_pcm_substream *substream, int state, int cmd)
+ {
+@@ -201,6 +283,8 @@ static int sof_ipc4_trigger_pipelines(struct snd_soc_component *component,
+ 	struct snd_sof_pcm_stream_pipeline_list *pipeline_list;
+ 	struct sof_ipc4_fw_data *ipc4_data = sdev->private;
+ 	struct ipc4_pipeline_set_state_data *trigger_list;
++	struct snd_sof_widget *pipe_widget;
++	struct sof_ipc4_pipeline *pipeline;
+ 	struct snd_sof_pipeline *spipe;
+ 	struct snd_sof_pcm *spcm;
+ 	int ret;
+@@ -218,6 +302,17 @@ static int sof_ipc4_trigger_pipelines(struct snd_soc_component *component,
+ 	if (!pipeline_list->pipelines || !pipeline_list->count)
+ 		return 0;
+ 
++	spipe = pipeline_list->pipelines[0];
++	pipe_widget = spipe->pipe_widget;
++	pipeline = pipe_widget->private;
++
++	/*
++	 * If use_chain_dma attribute is set we proceed to chained DMA
++	 * trigger function that handles the rest for the substream.
++	 */
++	if (pipeline->use_chain_dma)
++		return sof_ipc4_chain_dma_trigger(sdev, pipeline_list, state, cmd);
++
+ 	/* allocate memory for the pipeline data */
+ 	trigger_list = kzalloc(struct_size(trigger_list, pipeline_ids, pipeline_list->count),
+ 			       GFP_KERNEL);
+@@ -422,8 +517,10 @@ static int sof_ipc4_pcm_dai_link_fixup(struct snd_soc_pcm_runtime *rtd,
+ 	struct snd_soc_component *component = snd_soc_rtdcom_lookup(rtd, SOF_AUDIO_PCM_DRV_NAME);
+ 	struct snd_sof_dai *dai = snd_sof_find_dai(component, rtd->dai_link->name);
+ 	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(component);
++	struct snd_soc_dai *cpu_dai = asoc_rtd_to_cpu(rtd, 0);
+ 	struct sof_ipc4_copier *ipc4_copier;
+-	int ret;
++	bool use_chain_dma = false;
++	int dir;
+ 
+ 	if (!dai) {
+ 		dev_err(component->dev, "%s: No DAI found with name %s\n", __func__,
+@@ -438,9 +535,26 @@ static int sof_ipc4_pcm_dai_link_fixup(struct snd_soc_pcm_runtime *rtd,
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = sof_ipc4_pcm_dai_link_fixup_rate(sdev, params, ipc4_copier);
+-	if (ret)
+-		return ret;
++	for_each_pcm_streams(dir) {
++		struct snd_soc_dapm_widget *w = snd_soc_dai_get_widget(cpu_dai, dir);
++
++		if (w) {
++			struct snd_sof_widget *swidget = w->dobj.private;
++			struct snd_sof_widget *pipe_widget = swidget->spipe->pipe_widget;
++			struct sof_ipc4_pipeline *pipeline = pipe_widget->private;
++
++			if (pipeline->use_chain_dma)
++				use_chain_dma = true;
++		}
++	}
++
++	/* Chain DMA does not use copiers, so no fixup needed */
++	if (!use_chain_dma) {
++		int ret = sof_ipc4_pcm_dai_link_fixup_rate(sdev, params, ipc4_copier);
++
++		if (ret)
++			return ret;
++	}
+ 
+ 	switch (ipc4_copier->dai_type) {
+ 	case SOF_DAI_INTEL_SSP:
+* Unmerged path sound/soc/sof/ipc4-topology.c
+diff --git a/sound/soc/sof/ipc4-topology.h b/sound/soc/sof/ipc4-topology.h
+index 015027b23588..cf007282867b 100644
+--- a/sound/soc/sof/ipc4-topology.h
++++ b/sound/soc/sof/ipc4-topology.h
+@@ -126,6 +126,7 @@ struct sof_ipc4_copier_config_set_sink_format {
+  * @mem_usage: Memory usage
+  * @core_id: Target core for the pipeline
+  * @state: Pipeline state
++ * @use_chain_dma: flag to indicate if the firmware shall use chained DMA
+  * @msg: message structure for pipeline
+  * @skip_during_fe_trigger: skip triggering this pipeline during the FE DAI trigger
+  */
+@@ -135,6 +136,7 @@ struct sof_ipc4_pipeline {
+ 	uint32_t mem_usage;
+ 	uint32_t core_id;
+ 	int state;
++	bool use_chain_dma;
+ 	struct sof_ipc4_msg msg;
+ 	bool skip_during_fe_trigger;
+ };
