@@ -1,0 +1,383 @@
+x86/resctrl: Add resctrl_arch_get_num_closid()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author James Morse <james.morse@arm.com>
+commit eb6f3187694158ca36e50083e861531488d5c1b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/eb6f3187.failed
+
+To initialise struct resctrl_schema's num_closid, schemata_list_create()
+reaches into the architectures private structure to retrieve num_closid
+from the struct rdt_hw_resource. The 'half the closids' behaviour should
+be part of the filesystem parts of resctrl that are the same on any
+architecture. struct resctrl_schema's num_closid should include any
+correction for CDP.
+
+Having two properties called num_closid is likely to be confusing when
+they have different values.
+
+Add a helper to read the resource's num_closid from the arch code.
+This should return the number of closid that the resource supports,
+regardless of whether CDP is in use. Once the CDP resources are merged,
+schemata_list_create() can apply the correction itself.
+
+Using a type with an obvious size for the arch helper means changing the
+type of num_closid to u32, which matches the type already used by struct
+rdtgroup.
+
+reset_all_ctrls() does not use resctrl_arch_get_num_closid(), even
+though it sets up a structure for modifying the hardware. This function
+will be part of the architecture code, the maximum closid should be the
+maximum value the hardware has, regardless of the way resctrl is using
+it. All the uses of num_closid in core.c are naturally part of the
+architecture specific code.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Jamie Iles <jamie@nuviainc.com>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Tested-by: Babu Moger <babu.moger@amd.com>
+Link: https://lkml.kernel.org/r/20210728170637.25610-9-james.morse@arm.com
+(cherry picked from commit eb6f3187694158ca36e50083e861531488d5c1b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/internal.h
+#	arch/x86/kernel/cpu/resctrl/rdtgroup.c
+#	include/linux/resctrl.h
+diff --cc arch/x86/kernel/cpu/resctrl/internal.h
+index 6a5f60a37219,c4bc5fae5a29..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/internal.h
++++ b/arch/x86/kernel/cpu/resctrl/internal.h
+@@@ -446,40 -368,27 +446,58 @@@ struct rdt_parse_data 
+  };
+  
+  /**
+++<<<<<<< HEAD
+ + * struct rdt_resource - attributes of an RDT resource
+ + * @rid:		The index of the resource
+ + * @alloc_enabled:	Is allocation enabled on this machine
+ + * @mon_enabled:	Is monitoring enabled for this feature
+ + * @alloc_capable:	Is allocation available on this machine
+ + * @mon_capable:	Is monitor feature available on this machine
+ + * @name:		Name to use in "schemata" file
+ + * @num_closid:		Number of CLOSIDs available
+ + * @cache_level:	Which cache level defines scope of this resource
+ + * @default_ctrl:	Specifies default cache cbm or memory B/W percent.
+++=======
++  * struct rdt_hw_resource - arch private attributes of a resctrl resource
++  * @conf_type:		The type that should be used when configuring. temporary
++  * @r_resctrl:		Attributes of the resource used directly by resctrl.
++  * @num_closid:		Maximum number of closid this hardware can support,
++  *			regardless of CDP. This is exposed via
++  *			resctrl_arch_get_num_closid() to avoid confusion
++  *			with struct resctrl_schema's property of the same name,
++  *			which has been corrected for features like CDP.
+++>>>>>>> eb6f31876941 (x86/resctrl: Add resctrl_arch_get_num_closid())
+   * @msr_base:		Base MSR address for CBMs
+   * @msr_update:		Function pointer to update QOS MSRs
+ + * @data_width:		Character width of data when displaying
+ + * @domains:		All domains for this resource
+ + * @cache:		Cache allocation related data
+ + * @membw:		If the component has bandwidth controls, their properties.
+ + * @format_str:		Per resource format string to show domain value
+ + * @parse_ctrlval:	Per resource function pointer to parse control values
+ + * @evt_list:		List of monitoring events
+ + * @num_rmid:		Number of RMIDs available
+   * @mon_scale:		cqm counter * mon_scale = occupancy in bytes
+   * @mbm_width:		Monitor width, to detect and correct for overflow.
+ - *
+ - * Members of this structure are either private to the architecture
+ - * e.g. mbm_width, or accessed via helpers that provide abstraction. e.g.
+ - * msr_update and msr_base.
+ + * @fflags:		flags to choose base and info files
+   */
+++<<<<<<< HEAD
+ +struct rdt_resource {
+ +	int			rid;
+ +	bool			alloc_enabled;
+ +	bool			mon_enabled;
+ +	bool			alloc_capable;
+ +	bool			mon_capable;
+ +	char			*name;
+ +	int			num_closid;
+ +	int			cache_level;
+ +	u32			default_ctrl;
+++=======
++ struct rdt_hw_resource {
++ 	enum resctrl_conf_type	conf_type;
++ 	struct rdt_resource	r_resctrl;
++ 	u32			num_closid;
+++>>>>>>> eb6f31876941 (x86/resctrl: Add resctrl_arch_get_num_closid())
+  	unsigned int		msr_base;
+  	void (*msr_update)	(struct rdt_domain *d, struct msr_param *m,
+  				 struct rdt_resource *r);
+diff --cc arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index fc8061800ae6,09ffe9a4a32b..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@@ -108,12 -103,12 +108,17 @@@ int closids_supported(void
+  
+  static void closid_init(void)
+  {
+++<<<<<<< HEAD
+ +	struct rdt_resource *r;
+ +	int rdt_min_closid = 32;
+++=======
++ 	struct resctrl_schema *s;
++ 	u32 rdt_min_closid = 32;
+++>>>>>>> eb6f31876941 (x86/resctrl: Add resctrl_arch_get_num_closid())
+  
+  	/* Compute rdt_min_closid across all resources */
+ -	list_for_each_entry(s, &resctrl_schema_all, list)
+ -		rdt_min_closid = min(rdt_min_closid, s->num_closid);
+ +	for_each_alloc_enabled_rdt_resource(r)
+ +		rdt_min_closid = min(rdt_min_closid, r->num_closid);
+  
+  	closid_free_map = BIT_MASK(rdt_min_closid) - 1;
+  
+@@@ -2122,6 -2122,37 +2127,40 @@@ static int rdt_enable_ctx(struct rdt_fs
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int schemata_list_create(void)
++ {
++ 	struct resctrl_schema *s;
++ 	struct rdt_resource *r;
++ 
++ 	for_each_alloc_enabled_rdt_resource(r) {
++ 		s = kzalloc(sizeof(*s), GFP_KERNEL);
++ 		if (!s)
++ 			return -ENOMEM;
++ 
++ 		s->res = r;
++ 		s->conf_type = resctrl_to_arch_res(r)->conf_type;
++ 		s->num_closid = resctrl_arch_get_num_closid(r);
++ 
++ 		INIT_LIST_HEAD(&s->list);
++ 		list_add(&s->list, &resctrl_schema_all);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void schemata_list_destroy(void)
++ {
++ 	struct resctrl_schema *s, *tmp;
++ 
++ 	list_for_each_entry_safe(s, tmp, &resctrl_schema_all, list) {
++ 		list_del(&s->list);
++ 		kfree(s);
++ 	}
++ }
++ 
+++>>>>>>> eb6f31876941 (x86/resctrl: Add resctrl_arch_get_num_closid())
+  static int rdt_get_tree(struct fs_context *fc)
+  {
+  	struct rdt_fs_context *ctx = rdt_fc2context(fc);
+diff --cc include/linux/resctrl.h
+index 9b05af9b3e28,b9d200592e54..000000000000
+--- a/include/linux/resctrl.h
++++ b/include/linux/resctrl.h
+@@@ -13,4 -15,175 +13,178 @@@ int proc_resctrl_show(struct seq_file *
+  
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * enum resctrl_conf_type - The type of configuration.
++  * @CDP_NONE:	No prioritisation, both code and data are controlled or monitored.
++  * @CDP_CODE:	Configuration applies to instruction fetches.
++  * @CDP_DATA:	Configuration applies to reads and writes.
++  */
++ enum resctrl_conf_type {
++ 	CDP_NONE,
++ 	CDP_CODE,
++ 	CDP_DATA,
++ };
++ 
++ /**
++  * struct rdt_domain - group of CPUs sharing a resctrl resource
++  * @list:		all instances of this resource
++  * @id:			unique id for this instance
++  * @cpu_mask:		which CPUs share this resource
++  * @new_ctrl:		new ctrl value to be loaded
++  * @have_new_ctrl:	did user provide new_ctrl for this domain
++  * @rmid_busy_llc:	bitmap of which limbo RMIDs are above threshold
++  * @mbm_total:		saved state for MBM total bandwidth
++  * @mbm_local:		saved state for MBM local bandwidth
++  * @mbm_over:		worker to periodically read MBM h/w counters
++  * @cqm_limbo:		worker to periodically read CQM h/w counters
++  * @mbm_work_cpu:	worker CPU for MBM h/w counters
++  * @cqm_work_cpu:	worker CPU for CQM h/w counters
++  * @plr:		pseudo-locked region (if any) associated with domain
++  */
++ struct rdt_domain {
++ 	struct list_head		list;
++ 	int				id;
++ 	struct cpumask			cpu_mask;
++ 	u32				new_ctrl;
++ 	bool				have_new_ctrl;
++ 	unsigned long			*rmid_busy_llc;
++ 	struct mbm_state		*mbm_total;
++ 	struct mbm_state		*mbm_local;
++ 	struct delayed_work		mbm_over;
++ 	struct delayed_work		cqm_limbo;
++ 	int				mbm_work_cpu;
++ 	int				cqm_work_cpu;
++ 	struct pseudo_lock_region	*plr;
++ };
++ 
++ /**
++  * struct resctrl_cache - Cache allocation related data
++  * @cbm_len:		Length of the cache bit mask
++  * @min_cbm_bits:	Minimum number of consecutive bits to be set
++  * @cbm_idx_mult:	Multiplier of CBM index
++  * @cbm_idx_offset:	Offset of CBM index. CBM index is computed by:
++  *			closid * cbm_idx_multi + cbm_idx_offset
++  *			in a cache bit mask
++  * @shareable_bits:	Bitmask of shareable resource with other
++  *			executing entities
++  * @arch_has_sparse_bitmaps:	True if a bitmap like f00f is valid.
++  * @arch_has_empty_bitmaps:	True if the '0' bitmap is valid.
++  * @arch_has_per_cpu_cfg:	True if QOS_CFG register for this cache
++  *				level has CPU scope.
++  */
++ struct resctrl_cache {
++ 	unsigned int	cbm_len;
++ 	unsigned int	min_cbm_bits;
++ 	unsigned int	cbm_idx_mult;	// TODO remove this
++ 	unsigned int	cbm_idx_offset; // TODO remove this
++ 	unsigned int	shareable_bits;
++ 	bool		arch_has_sparse_bitmaps;
++ 	bool		arch_has_empty_bitmaps;
++ 	bool		arch_has_per_cpu_cfg;
++ };
++ 
++ /**
++  * enum membw_throttle_mode - System's memory bandwidth throttling mode
++  * @THREAD_THROTTLE_UNDEFINED:	Not relevant to the system
++  * @THREAD_THROTTLE_MAX:	Memory bandwidth is throttled at the core
++  *				always using smallest bandwidth percentage
++  *				assigned to threads, aka "max throttling"
++  * @THREAD_THROTTLE_PER_THREAD:	Memory bandwidth is throttled at the thread
++  */
++ enum membw_throttle_mode {
++ 	THREAD_THROTTLE_UNDEFINED = 0,
++ 	THREAD_THROTTLE_MAX,
++ 	THREAD_THROTTLE_PER_THREAD,
++ };
++ 
++ /**
++  * struct resctrl_membw - Memory bandwidth allocation related data
++  * @min_bw:		Minimum memory bandwidth percentage user can request
++  * @bw_gran:		Granularity at which the memory bandwidth is allocated
++  * @delay_linear:	True if memory B/W delay is in linear scale
++  * @arch_needs_linear:	True if we can't configure non-linear resources
++  * @throttle_mode:	Bandwidth throttling mode when threads request
++  *			different memory bandwidths
++  * @mba_sc:		True if MBA software controller(mba_sc) is enabled
++  * @mb_map:		Mapping of memory B/W percentage to memory B/W delay
++  */
++ struct resctrl_membw {
++ 	u32				min_bw;
++ 	u32				bw_gran;
++ 	u32				delay_linear;
++ 	bool				arch_needs_linear;
++ 	enum membw_throttle_mode	throttle_mode;
++ 	bool				mba_sc;
++ 	u32				*mb_map;
++ };
++ 
++ struct rdt_parse_data;
++ 
++ /**
++  * struct rdt_resource - attributes of a resctrl resource
++  * @rid:		The index of the resource
++  * @alloc_enabled:	Is allocation enabled on this machine
++  * @mon_enabled:	Is monitoring enabled for this feature
++  * @alloc_capable:	Is allocation available on this machine
++  * @mon_capable:	Is monitor feature available on this machine
++  * @num_rmid:		Number of RMIDs available
++  * @cache_level:	Which cache level defines scope of this resource
++  * @cache:		Cache allocation related data
++  * @membw:		If the component has bandwidth controls, their properties.
++  * @domains:		All domains for this resource
++  * @name:		Name to use in "schemata" file.
++  * @data_width:		Character width of data when displaying
++  * @default_ctrl:	Specifies default cache cbm or memory B/W percent.
++  * @format_str:		Per resource format string to show domain value
++  * @parse_ctrlval:	Per resource function pointer to parse control values
++  * @evt_list:		List of monitoring events
++  * @fflags:		flags to choose base and info files
++  */
++ struct rdt_resource {
++ 	int			rid;
++ 	bool			alloc_enabled;
++ 	bool			mon_enabled;
++ 	bool			alloc_capable;
++ 	bool			mon_capable;
++ 	int			num_rmid;
++ 	int			cache_level;
++ 	struct resctrl_cache	cache;
++ 	struct resctrl_membw	membw;
++ 	struct list_head	domains;
++ 	char			*name;
++ 	int			data_width;
++ 	u32			default_ctrl;
++ 	const char		*format_str;
++ 	int			(*parse_ctrlval)(struct rdt_parse_data *data,
++ 						 struct rdt_resource *r,
++ 						 struct rdt_domain *d);
++ 	struct list_head	evt_list;
++ 	unsigned long		fflags;
++ 
++ };
++ 
++ /**
++  * struct resctrl_schema - configuration abilities of a resource presented to
++  *			   user-space
++  * @list:	Member of resctrl_schema_all.
++  * @conf_type:	Whether this schema is specific to code/data.
++  * @res:	The resource structure exported by the architecture to describe
++  *		the hardware that is configured by this schema.
++  * @num_closid:	The number of closid that can be used with this schema. When
++  *		features like CDP are enabled, this will be lower than the
++  *		hardware supports for the resource.
++  */
++ struct resctrl_schema {
++ 	struct list_head		list;
++ 	enum resctrl_conf_type		conf_type;
++ 	struct rdt_resource		*res;
++ 	u32				num_closid;
++ };
++ 
++ /* The number of closid supported by this resource regardless of CDP */
++ u32 resctrl_arch_get_num_closid(struct rdt_resource *r);
++ 
+++>>>>>>> eb6f31876941 (x86/resctrl: Add resctrl_arch_get_num_closid())
+  #endif /* _RESCTRL_H */
+diff --git a/arch/x86/kernel/cpu/resctrl/core.c b/arch/x86/kernel/cpu/resctrl/core.c
+index 916eb976301b..680b0239b1bc 100644
+--- a/arch/x86/kernel/cpu/resctrl/core.c
++++ b/arch/x86/kernel/cpu/resctrl/core.c
+@@ -425,6 +425,11 @@ struct rdt_domain *get_domain_from_cpu(int cpu, struct rdt_resource *r)
+ 	return NULL;
+ }
+ 
++u32 resctrl_arch_get_num_closid(struct rdt_resource *r)
++{
++	return resctrl_to_arch_res(r)->num_closid;
++}
++
+ void rdt_ctrl_update(void *arg)
+ {
+ 	struct msr_param *m = arg;
+* Unmerged path arch/x86/kernel/cpu/resctrl/internal.h
+* Unmerged path arch/x86/kernel/cpu/resctrl/rdtgroup.c
+* Unmerged path include/linux/resctrl.h
