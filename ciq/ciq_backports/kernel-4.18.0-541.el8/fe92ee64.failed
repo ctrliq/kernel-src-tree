@@ -1,0 +1,467 @@
+Bluetooth: hci_core: Rework hci_conn_params flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-541.el8
+commit-author Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+commit fe92ee6425a2c79ee84f0b9b8a14117200d15f7d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-541.el8/fe92ee64.failed
+
+This reworks hci_conn_params flags to use bitmap_* helpers and add
+support for setting the supported flags in hdev->conn_flags so it can
+easily be accessed.
+
+	Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit fe92ee6425a2c79ee84f0b9b8a14117200d15f7d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/hci_sync.c
+diff --cc net/bluetooth/hci_sync.c
+index 07531ca61812,c1b01718a797..000000000000
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@@ -2898,6 -4716,224 +2898,227 @@@ int hci_start_discovery_sync(struct hci
+  
+  	queue_delayed_work(hdev->req_workqueue, &hdev->le_scan_disable,
+  			   timeout);
+++<<<<<<< HEAD
+++=======
++ 	return 0;
++ }
++ 
++ static void hci_suspend_monitor_sync(struct hci_dev *hdev)
++ {
++ 	switch (hci_get_adv_monitor_offload_ext(hdev)) {
++ 	case HCI_ADV_MONITOR_EXT_MSFT:
++ 		msft_suspend_sync(hdev);
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ }
++ 
++ /* This function disables discovery and mark it as paused */
++ static int hci_pause_discovery_sync(struct hci_dev *hdev)
++ {
++ 	int old_state = hdev->discovery.state;
++ 	int err;
++ 
++ 	/* If discovery already stopped/stopping/paused there nothing to do */
++ 	if (old_state == DISCOVERY_STOPPED || old_state == DISCOVERY_STOPPING ||
++ 	    hdev->discovery_paused)
++ 		return 0;
++ 
++ 	hci_discovery_set_state(hdev, DISCOVERY_STOPPING);
++ 	err = hci_stop_discovery_sync(hdev);
++ 	if (err)
++ 		return err;
++ 
++ 	hdev->discovery_paused = true;
++ 	hdev->discovery_old_state = old_state;
++ 	hci_discovery_set_state(hdev, DISCOVERY_STOPPED);
++ 
++ 	return 0;
++ }
++ 
++ static int hci_update_event_filter_sync(struct hci_dev *hdev)
++ {
++ 	struct bdaddr_list_with_flags *b;
++ 	u8 scan = SCAN_DISABLED;
++ 	bool scanning = test_bit(HCI_PSCAN, &hdev->flags);
++ 	int err;
++ 
++ 	if (!hci_dev_test_flag(hdev, HCI_BREDR_ENABLED))
++ 		return 0;
++ 
++ 	/* Always clear event filter when starting */
++ 	hci_clear_event_filter_sync(hdev);
++ 
++ 	list_for_each_entry(b, &hdev->accept_list, list) {
++ 		if (!test_bit(HCI_CONN_FLAG_REMOTE_WAKEUP, b->flags))
++ 			continue;
++ 
++ 		bt_dev_dbg(hdev, "Adding event filters for %pMR", &b->bdaddr);
++ 
++ 		err =  hci_set_event_filter_sync(hdev, HCI_FLT_CONN_SETUP,
++ 						 HCI_CONN_SETUP_ALLOW_BDADDR,
++ 						 &b->bdaddr,
++ 						 HCI_CONN_SETUP_AUTO_ON);
++ 		if (err)
++ 			bt_dev_dbg(hdev, "Failed to set event filter for %pMR",
++ 				   &b->bdaddr);
++ 		else
++ 			scan = SCAN_PAGE;
++ 	}
++ 
++ 	if (scan && !scanning)
++ 		hci_write_scan_enable_sync(hdev, scan);
++ 	else if (!scan && scanning)
++ 		hci_write_scan_enable_sync(hdev, scan);
++ 
++ 	return 0;
++ }
++ 
++ /* This function performs the HCI suspend procedures in the follow order:
++  *
++  * Pause discovery (active scanning/inquiry)
++  * Pause Directed Advertising/Advertising
++  * Disconnect all connections
++  * Set suspend_status to BT_SUSPEND_DISCONNECT if hdev cannot wakeup
++  * otherwise:
++  * Update event mask (only set events that are allowed to wake up the host)
++  * Update event filter (with devices marked with HCI_CONN_FLAG_REMOTE_WAKEUP)
++  * Update passive scanning (lower duty cycle)
++  * Set suspend_status to BT_SUSPEND_CONFIGURE_WAKE
++  */
++ int hci_suspend_sync(struct hci_dev *hdev)
++ {
++ 	int err;
++ 
++ 	/* If marked as suspended there nothing to do */
++ 	if (hdev->suspended)
++ 		return 0;
++ 
++ 	/* Mark device as suspended */
++ 	hdev->suspended = true;
++ 
++ 	/* Pause discovery if not already stopped */
++ 	hci_pause_discovery_sync(hdev);
++ 
++ 	/* Pause other advertisements */
++ 	hci_pause_advertising_sync(hdev);
++ 
++ 	/* Disable page scan if enabled */
++ 	if (test_bit(HCI_PSCAN, &hdev->flags))
++ 		hci_write_scan_enable_sync(hdev, SCAN_DISABLED);
++ 
++ 	/* Suspend monitor filters */
++ 	hci_suspend_monitor_sync(hdev);
++ 
++ 	/* Prevent disconnects from causing scanning to be re-enabled */
++ 	hdev->scanning_paused = true;
++ 
++ 	/* Soft disconnect everything (power off) */
++ 	err = hci_disconnect_all_sync(hdev, HCI_ERROR_REMOTE_POWER_OFF);
++ 	if (err) {
++ 		/* Set state to BT_RUNNING so resume doesn't notify */
++ 		hdev->suspend_state = BT_RUNNING;
++ 		hci_resume_sync(hdev);
++ 		return err;
++ 	}
++ 
++ 	/* Only configure accept list if disconnect succeeded and wake
++ 	 * isn't being prevented.
++ 	 */
++ 	if (!hdev->wakeup || !hdev->wakeup(hdev)) {
++ 		hdev->suspend_state = BT_SUSPEND_DISCONNECT;
++ 		return 0;
++ 	}
++ 
++ 	/* Unpause to take care of updating scanning params */
++ 	hdev->scanning_paused = false;
++ 
++ 	/* Update event mask so only the allowed event can wakeup the host */
++ 	hci_set_event_mask_sync(hdev);
++ 
++ 	/* Enable event filter for paired devices */
++ 	hci_update_event_filter_sync(hdev);
++ 
++ 	/* Update LE passive scan if enabled */
++ 	hci_update_passive_scan_sync(hdev);
++ 
++ 	/* Pause scan changes again. */
++ 	hdev->scanning_paused = true;
++ 
++ 	hdev->suspend_state = BT_SUSPEND_CONFIGURE_WAKE;
++ 
++ 	return 0;
++ }
++ 
++ /* This function resumes discovery */
++ static int hci_resume_discovery_sync(struct hci_dev *hdev)
++ {
++ 	int err;
++ 
++ 	/* If discovery not paused there nothing to do */
++ 	if (!hdev->discovery_paused)
++ 		return 0;
++ 
++ 	hdev->discovery_paused = false;
++ 
++ 	hci_discovery_set_state(hdev, DISCOVERY_STARTING);
++ 
++ 	err = hci_start_discovery_sync(hdev);
++ 
++ 	hci_discovery_set_state(hdev, err ? DISCOVERY_STOPPED :
++ 				DISCOVERY_FINDING);
++ 
++ 	return err;
++ }
++ 
++ static void hci_resume_monitor_sync(struct hci_dev *hdev)
++ {
++ 	switch (hci_get_adv_monitor_offload_ext(hdev)) {
++ 	case HCI_ADV_MONITOR_EXT_MSFT:
++ 		msft_resume_sync(hdev);
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ }
++ 
++ /* This function performs the HCI suspend procedures in the follow order:
++  *
++  * Restore event mask
++  * Clear event filter
++  * Update passive scanning (normal duty cycle)
++  * Resume Directed Advertising/Advertising
++  * Resume discovery (active scanning/inquiry)
++  */
++ int hci_resume_sync(struct hci_dev *hdev)
++ {
++ 	/* If not marked as suspended there nothing to do */
++ 	if (!hdev->suspended)
++ 		return 0;
++ 
++ 	hdev->suspended = false;
++ 	hdev->scanning_paused = false;
++ 
++ 	/* Restore event mask */
++ 	hci_set_event_mask_sync(hdev);
++ 
++ 	/* Clear any event filters and restore scan state */
++ 	hci_clear_event_filter_sync(hdev);
++ 	hci_update_scan_sync(hdev);
++ 
++ 	/* Reset passive scanning to normal */
++ 	hci_update_passive_scan_sync(hdev);
++ 
++ 	/* Resume monitor filters */
++ 	hci_resume_monitor_sync(hdev);
++ 
++ 	/* Resume other advertisements */
++ 	hci_resume_advertising_sync(hdev);
++ 
++ 	/* Resume discovery */
++ 	hci_resume_discovery_sync(hdev);
+++>>>>>>> fe92ee6425a2 (Bluetooth: hci_core: Rework hci_conn_params flags)
+  
+  	return 0;
+  }
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index c24a8da7cd2c..cb0e1d117b0b 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -152,22 +152,21 @@ struct bdaddr_list_with_irk {
+ 	u8 local_irk[16];
+ };
+ 
+-struct bdaddr_list_with_flags {
+-	struct list_head list;
+-	bdaddr_t bdaddr;
+-	u8 bdaddr_type;
+-	u32 current_flags;
+-};
+-
+ enum hci_conn_flags {
+ 	HCI_CONN_FLAG_REMOTE_WAKEUP,
+-	HCI_CONN_FLAG_MAX
+-};
+ 
+-#define hci_conn_test_flag(nr, flags) ((flags) & (1U << nr))
++	__HCI_CONN_NUM_FLAGS,
++};
+ 
+ /* Make sure number of flags doesn't exceed sizeof(current_flags) */
+-static_assert(HCI_CONN_FLAG_MAX < 32);
++static_assert(__HCI_CONN_NUM_FLAGS < 32);
++
++struct bdaddr_list_with_flags {
++	struct list_head list;
++	bdaddr_t bdaddr;
++	u8 bdaddr_type;
++	DECLARE_BITMAP(flags, __HCI_CONN_NUM_FLAGS);
++};
+ 
+ struct bt_uuid {
+ 	struct list_head list;
+@@ -569,6 +568,7 @@ struct hci_dev {
+ 	struct rfkill		*rfkill;
+ 
+ 	DECLARE_BITMAP(dev_flags, __HCI_NUM_FLAGS);
++	DECLARE_BITMAP(conn_flags, __HCI_CONN_NUM_FLAGS);
+ 
+ 	__s8			adv_tx_power;
+ 	__u8			adv_data[HCI_MAX_EXT_AD_LENGTH];
+@@ -764,7 +764,7 @@ struct hci_conn_params {
+ 
+ 	struct hci_conn *conn;
+ 	bool explicit_connect;
+-	u32 current_flags;
++	DECLARE_BITMAP(flags, __HCI_CONN_NUM_FLAGS);
+ };
+ 
+ extern struct list_head hci_dev_list;
+diff --git a/net/bluetooth/hci_core.c b/net/bluetooth/hci_core.c
+index 23a7b84ac8d7..626d929ac19f 100644
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@ -3354,7 +3354,7 @@ int hci_bdaddr_list_add_with_flags(struct list_head *list, bdaddr_t *bdaddr,
+ 
+ 	bacpy(&entry->bdaddr, bdaddr);
+ 	entry->bdaddr_type = type;
+-	entry->current_flags = flags;
++	bitmap_from_u64(entry->flags, flags);
+ 
+ 	list_add(&entry->list, list);
+ 
+@@ -3887,6 +3887,12 @@ int hci_register_dev(struct hci_dev *hdev)
+ 	if (test_bit(HCI_QUIRK_RAW_DEVICE, &hdev->quirks))
+ 		hci_dev_set_flag(hdev, HCI_UNCONFIGURED);
+ 
++	/* Mark Remote Wakeup connection flag as supported if driver has wakeup
++	 * callback.
++	 */
++	if (hdev->wakeup)
++		set_bit(HCI_CONN_FLAG_REMOTE_WAKEUP, hdev->conn_flags);
++
+ 	hci_sock_dev_event(hdev, HCI_DEV_REG);
+ 	hci_dev_hold(hdev);
+ 
+diff --git a/net/bluetooth/hci_request.c b/net/bluetooth/hci_request.c
+index 3752bb99bec5..77106513a16d 100644
+--- a/net/bluetooth/hci_request.c
++++ b/net/bluetooth/hci_request.c
+@@ -484,8 +484,8 @@ static int add_to_accept_list(struct hci_request *req,
+ 	}
+ 
+ 	/* During suspend, only wakeable devices can be in accept list */
+-	if (hdev->suspended && !hci_conn_test_flag(HCI_CONN_FLAG_REMOTE_WAKEUP,
+-						   params->current_flags))
++	if (hdev->suspended &&
++	    !test_bit(HCI_CONN_FLAG_REMOTE_WAKEUP, params->flags))
+ 		return 0;
+ 
+ 	*num_entries += 1;
+* Unmerged path net/bluetooth/hci_sync.c
+diff --git a/net/bluetooth/mgmt.c b/net/bluetooth/mgmt.c
+index 036ea352710a..c88886234adf 100644
+--- a/net/bluetooth/mgmt.c
++++ b/net/bluetooth/mgmt.c
+@@ -4350,8 +4350,6 @@ static int set_exp_feature(struct sock *sk, struct hci_dev *hdev,
+ 			       MGMT_STATUS_NOT_SUPPORTED);
+ }
+ 
+-#define SUPPORTED_DEVICE_FLAGS() ((1U << HCI_CONN_FLAG_MAX) - 1)
+-
+ static int get_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
+ 			    u16 data_len)
+ {
+@@ -4359,7 +4357,7 @@ static int get_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
+ 	struct mgmt_rp_get_device_flags rp;
+ 	struct bdaddr_list_with_flags *br_params;
+ 	struct hci_conn_params *params;
+-	u32 supported_flags = SUPPORTED_DEVICE_FLAGS();
++	u32 supported_flags;
+ 	u32 current_flags = 0;
+ 	u8 status = MGMT_STATUS_INVALID_PARAMS;
+ 
+@@ -4368,6 +4366,9 @@ static int get_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
+ 
+ 	hci_dev_lock(hdev);
+ 
++	bitmap_to_arr32(&supported_flags, hdev->conn_flags,
++			__HCI_CONN_NUM_FLAGS);
++
+ 	memset(&rp, 0, sizeof(rp));
+ 
+ 	if (cp->addr.type == BDADDR_BREDR) {
+@@ -4377,7 +4378,8 @@ static int get_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
+ 		if (!br_params)
+ 			goto done;
+ 
+-		current_flags = br_params->current_flags;
++		bitmap_to_arr32(&current_flags, br_params->flags,
++				__HCI_CONN_NUM_FLAGS);
+ 	} else {
+ 		params = hci_conn_params_lookup(hdev, &cp->addr.bdaddr,
+ 						le_addr_type(cp->addr.type));
+@@ -4385,7 +4387,8 @@ static int get_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
+ 		if (!params)
+ 			goto done;
+ 
+-		current_flags = params->current_flags;
++		bitmap_to_arr32(&current_flags, params->flags,
++				__HCI_CONN_NUM_FLAGS);
+ 	}
+ 
+ 	bacpy(&rp.addr.bdaddr, &cp->addr.bdaddr);
+@@ -4423,13 +4426,16 @@ static int set_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
+ 	struct bdaddr_list_with_flags *br_params;
+ 	struct hci_conn_params *params;
+ 	u8 status = MGMT_STATUS_INVALID_PARAMS;
+-	u32 supported_flags = SUPPORTED_DEVICE_FLAGS();
++	u32 supported_flags;
+ 	u32 current_flags = __le32_to_cpu(cp->current_flags);
+ 
+ 	bt_dev_dbg(hdev, "Set device flags %pMR (type 0x%x) = 0x%x",
+ 		   &cp->addr.bdaddr, cp->addr.type,
+ 		   __le32_to_cpu(current_flags));
+ 
++	bitmap_to_arr32(&supported_flags, hdev->conn_flags,
++			__HCI_CONN_NUM_FLAGS);
++
+ 	if ((supported_flags | current_flags) != supported_flags) {
+ 		bt_dev_warn(hdev, "Bad flag given (0x%x) vs supported (0x%0x)",
+ 			    current_flags, supported_flags);
+@@ -4444,7 +4450,7 @@ static int set_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
+ 							      cp->addr.type);
+ 
+ 		if (br_params) {
+-			br_params->current_flags = current_flags;
++			bitmap_from_u64(br_params->flags, current_flags);
+ 			status = MGMT_STATUS_SUCCESS;
+ 		} else {
+ 			bt_dev_warn(hdev, "No such BR/EDR device %pMR (0x%x)",
+@@ -4454,7 +4460,7 @@ static int set_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
+ 		params = hci_conn_params_lookup(hdev, &cp->addr.bdaddr,
+ 						le_addr_type(cp->addr.type));
+ 		if (params) {
+-			params->current_flags = current_flags;
++			bitmap_from_u64(params->flags, current_flags);
+ 			status = MGMT_STATUS_SUCCESS;
+ 		} else {
+ 			bt_dev_warn(hdev, "No such LE device %pMR (0x%x)",
+@@ -7017,6 +7023,7 @@ static int add_device(struct sock *sk, struct hci_dev *hdev,
+ 	struct hci_conn_params *params;
+ 	int err;
+ 	u32 current_flags = 0;
++	u32 supported_flags;
+ 
+ 	bt_dev_dbg(hdev, "sock %p", sk);
+ 
+@@ -7088,7 +7095,8 @@ static int add_device(struct sock *sk, struct hci_dev *hdev,
+ 		params = hci_conn_params_lookup(hdev, &cp->addr.bdaddr,
+ 						addr_type);
+ 		if (params)
+-			current_flags = params->current_flags;
++			bitmap_to_arr32(&current_flags, params->flags,
++					__HCI_CONN_NUM_FLAGS);
+ 	}
+ 
+ 	err = hci_cmd_sync_queue(hdev, add_device_sync, NULL, NULL);
+@@ -7097,8 +7105,10 @@ static int add_device(struct sock *sk, struct hci_dev *hdev,
+ 
+ added:
+ 	device_added(sk, hdev, &cp->addr.bdaddr, cp->addr.type, cp->action);
++	bitmap_to_arr32(&supported_flags, hdev->conn_flags,
++			__HCI_CONN_NUM_FLAGS);
+ 	device_flags_changed(NULL, hdev, &cp->addr.bdaddr, cp->addr.type,
+-			     SUPPORTED_DEVICE_FLAGS(), current_flags);
++			     supported_flags, current_flags);
+ 
+ 	err = mgmt_cmd_complete(sk, hdev->id, MGMT_OP_ADD_DEVICE,
+ 				MGMT_STATUS_SUCCESS, &cp->addr,
