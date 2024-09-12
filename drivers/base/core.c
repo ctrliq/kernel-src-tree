@@ -14,6 +14,7 @@
 #include <linux/err.h>
 #include <linux/fwnode.h>
 #include <linux/init.h>
+#include <linux/kstrtox.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -1566,7 +1567,7 @@ early_param("fw_devlink", fw_devlink_setup);
 static bool fw_devlink_strict;
 static int __init fw_devlink_strict_setup(char *arg)
 {
-	return strtobool(arg, &fw_devlink_strict);
+	return kstrtobool(arg, &fw_devlink_strict);
 }
 early_param("fw_devlink.strict", fw_devlink_strict_setup);
 
@@ -2155,7 +2156,7 @@ ssize_t device_store_bool(struct device *dev, struct device_attribute *attr,
 {
 	struct dev_ext_attribute *ea = to_ext_attr(attr);
 
-	if (strtobool(buf, ea->var) < 0)
+	if (kstrtobool(buf, ea->var) < 0)
 		return -EINVAL;
 
 	return size;
@@ -2411,7 +2412,7 @@ static ssize_t online_store(struct device *dev, struct device_attribute *attr,
 	bool val;
 	int ret;
 
-	ret = strtobool(buf, &val);
+	ret = kstrtobool(buf, &val);
 	if (ret < 0)
 		return ret;
 
