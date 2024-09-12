@@ -1,0 +1,116 @@
+net/mlx5: Support internal port as decap route device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Ariel Levkovich <lariel@nvidia.com>
+commit b16eb3c81fe27978afdb2c111908d4d627a88d99
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/b16eb3c8.failed
+
+When performing route device lookup for decap action, support
+the case of ovs internal port as the lookup result.
+
+In such case, an internal port struct is mapped and attached
+to the flow attributes so that the source port matching of the
+rule will match on the internal port's metadata value.
+
+	Signed-off-by: Ariel Levkovich <lariel@nvidia.com>
+	Reviewed-by: Vlad Buslov <vladbu@nvidia.com>
+	Reviewed-by: Roi Dayan <roid@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit b16eb3c81fe27978afdb2c111908d4d627a88d99)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 36dc4da53fcf,835caa1c7b74..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -1445,8 -1455,31 +1466,36 @@@ mlx5e_tc_add_fdb_flow(struct mlx5e_pri
+  			goto err_out;
+  	}
+  
+++<<<<<<< HEAD
+ +	parse_attr = attr->parse_attr;
+ +	esw_attr = attr->esw_attr;
+++=======
++ 	if (netif_is_ovs_master(parse_attr->filter_dev)) {
++ 		struct mlx5e_tc_int_port *int_port;
++ 
++ 		if (attr->chain) {
++ 			NL_SET_ERR_MSG_MOD(extack,
++ 					   "Internal port rule is only supported on chain 0");
++ 			return -EOPNOTSUPP;
++ 		}
++ 
++ 		if (attr->dest_chain) {
++ 			NL_SET_ERR_MSG_MOD(extack,
++ 					   "Internal port rule offload doesn't support goto action");
++ 			return -EOPNOTSUPP;
++ 		}
++ 
++ 		int_port = mlx5e_tc_int_port_get(mlx5e_get_int_port_priv(priv),
++ 						 parse_attr->filter_dev->ifindex,
++ 						 flow_flag_test(flow, EGRESS) ?
++ 						 MLX5E_TC_INT_PORT_EGRESS :
++ 						 MLX5E_TC_INT_PORT_INGRESS);
++ 		if (IS_ERR(int_port))
++ 			return PTR_ERR(int_port);
++ 
++ 		esw_attr->int_port = int_port;
++ 	}
+++>>>>>>> b16eb3c81fe2 (net/mlx5: Support internal port as decap route device)
+  
+  	for (out_index = 0; out_index < MLX5_MAX_FLOW_FWD_VPORTS; out_index++) {
+  		struct net_device *out_dev;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
+index 2a3e7549b53d..3737ba2e80f5 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
+@@ -698,6 +698,7 @@ int mlx5e_tc_tun_route_lookup(struct mlx5e_priv *priv,
+ 			      struct mlx5_flow_attr *flow_attr)
+ {
+ 	struct mlx5_esw_flow_attr *esw_attr = flow_attr->esw_attr;
++	struct mlx5e_tc_int_port *int_port;
+ 	TC_TUN_ROUTE_ATTR_INIT(attr);
+ 	u16 vport_num;
+ 	int err = 0;
+@@ -722,17 +723,25 @@ int mlx5e_tc_tun_route_lookup(struct mlx5e_priv *priv,
+ 	if (err)
+ 		return err;
+ 
+-	if (attr.route_dev->netdev_ops != &mlx5e_netdev_ops ||
+-	    !mlx5e_tc_is_vf_tunnel(attr.out_dev, attr.route_dev))
+-		goto out;
+-
+-	err = mlx5e_tc_query_route_vport(attr.out_dev, attr.route_dev, &vport_num);
+-	if (err)
+-		goto out;
++	if (attr.route_dev->netdev_ops == &mlx5e_netdev_ops &&
++	    mlx5e_tc_is_vf_tunnel(attr.out_dev, attr.route_dev)) {
++		err = mlx5e_tc_query_route_vport(attr.out_dev, attr.route_dev, &vport_num);
++		if (err)
++			goto out;
+ 
+-	esw_attr->rx_tun_attr->vni = MLX5_GET(fte_match_param, spec->match_value,
+-					      misc_parameters.vxlan_vni);
+-	esw_attr->rx_tun_attr->decap_vport = vport_num;
++		esw_attr->rx_tun_attr->vni = MLX5_GET(fte_match_param, spec->match_value,
++						      misc_parameters.vxlan_vni);
++		esw_attr->rx_tun_attr->decap_vport = vport_num;
++	} else if (netif_is_ovs_master(attr.route_dev)) {
++		int_port = mlx5e_tc_int_port_get(mlx5e_get_int_port_priv(priv),
++						 attr.route_dev->ifindex,
++						 MLX5E_TC_INT_PORT_INGRESS);
++		if (IS_ERR(int_port)) {
++			err = PTR_ERR(int_port);
++			goto out;
++		}
++		esw_attr->int_port = int_port;
++	}
+ 
+ out:
+ 	if (flow_attr->tun_ip_version == 4)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
