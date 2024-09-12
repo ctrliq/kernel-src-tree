@@ -1,0 +1,343 @@
+arm64: extable: add `type` and `data` fields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.13.1.el8_7
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit d6e2cc56477538255160ed02fdb11b0da60356cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.13.1.el8_7/d6e2cc56.failed
+
+Subsequent patches will add specialized handlers for fixups, in addition
+to the simple PC fixup and BPF handlers we have today. In preparation,
+this patch adds a new `type` field to struct exception_table_entry, and
+uses this to distinguish the fixup and BPF cases. A `data` field is also
+added so that subsequent patches can associate data specific to each
+exception site (e.g. register numbers).
+
+Handlers are named ex_handler_*() for consistency, following the exmaple
+of x86. At the same time, get_ex_fixup() is split out into a helper so
+that it can be used by other ex_handler_*() functions ins subsequent
+patches.
+
+This patch will increase the size of the exception tables, which will be
+remedied by subsequent patches removing redundant fixup code. There
+should be no functional change as a result of this patch.
+
+Since each entry is now 12 bytes in size, we must reduce the alignment
+of each entry from `.align 3` (i.e. 8 bytes) to `.align 2` (i.e. 4
+bytes), which is the natrual alignment of the `insn` and `fixup` fields.
+The current 8-byte alignment is a holdover from when the `insn` and
+`fixup` fields was 8 bytes, and while not harmful has not been necessary
+since commit:
+
+  6c94f27ac847ff8e ("arm64: switch to relative exception tables")
+
+Similarly, RO_EXCEPTION_TABLE_ALIGN is dropped to 4 bytes.
+
+Concurrently with this patch, x86's exception table entry format is
+being updated (similarly to a 12-byte format, with 32-bytes of absolute
+data). Once both have been merged it should be possible to unify the
+sorttable logic for the two.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Reviewed-by: Ard Biesheuvel <ardb@kernel.org>
+	Cc: Alexei Starovoitov <ast@kernel.org>
+	Cc: Andrii Nakryiko <andrii@kernel.org>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Daniel Borkmann <daniel@iogearbox.net>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: Jean-Philippe Brucker <jean-philippe@linaro.org>
+	Cc: Robin Murphy <robin.murphy@arm.com>
+	Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20211019160219.5202-11-mark.rutland@arm.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit d6e2cc56477538255160ed02fdb11b0da60356cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/asm-extable.h
+#	arch/arm64/include/asm/extable.h
+#	arch/arm64/kernel/vmlinux.lds.S
+#	arch/arm64/mm/extable.c
+#	scripts/sortextable.c
+diff --cc arch/arm64/include/asm/extable.h
+index c5b899b4a700,8b300dd28def..000000000000
+--- a/arch/arm64/include/asm/extable.h
++++ b/arch/arm64/include/asm/extable.h
+@@@ -22,13 -23,32 +23,35 @@@ struct exception_table_entr
+  
+  #define ARCH_HAS_RELATIVE_EXTABLE
+  
+++<<<<<<< HEAD
+++=======
++ #define swap_ex_entry_fixup(a, b, tmp, delta)		\
++ do {							\
++ 	(a)->fixup = (b)->fixup + (delta);		\
++ 	(b)->fixup = (tmp).fixup - (delta);		\
++ 	(a)->type = (b)->type;				\
++ 	(b)->type = (tmp).type;				\
++ 	(a)->data = (b)->data;				\
++ 	(b)->data = (tmp).data;				\
++ } while (0)
++ 
++ static inline bool in_bpf_jit(struct pt_regs *regs)
++ {
++ 	if (!IS_ENABLED(CONFIG_BPF_JIT))
++ 		return false;
++ 
++ 	return regs->pc >= BPF_JIT_REGION_START &&
++ 	       regs->pc < BPF_JIT_REGION_END;
++ }
++ 
+++>>>>>>> d6e2cc564775 (arm64: extable: add `type` and `data` fields)
+  #ifdef CONFIG_BPF_JIT
+- bool arm64_bpf_fixup_exception(const struct exception_table_entry *ex,
+- 			      struct pt_regs *regs);
++ bool ex_handler_bpf(const struct exception_table_entry *ex,
++ 		    struct pt_regs *regs);
+  #else /* !CONFIG_BPF_JIT */
+  static inline
+- bool arm64_bpf_fixup_exception(const struct exception_table_entry *ex,
+- 			       struct pt_regs *regs)
++ bool ex_handler_bpf(const struct exception_table_entry *ex,
++ 		    struct pt_regs *regs)
+  {
+  	return false;
+  }
+diff --cc arch/arm64/kernel/vmlinux.lds.S
+index badc781d3632,fa8a8e8ddcfd..000000000000
+--- a/arch/arm64/kernel/vmlinux.lds.S
++++ b/arch/arm64/kernel/vmlinux.lds.S
+@@@ -5,6 -5,61 +5,64 @@@
+   * Written by Martin Mares <mj@atrey.karlin.mff.cuni.cz>
+   */
+  
+++<<<<<<< HEAD
+++=======
++ #include <asm/hyp_image.h>
++ #ifdef CONFIG_KVM
++ #define HYPERVISOR_EXTABLE					\
++ 	. = ALIGN(SZ_8);					\
++ 	__start___kvm_ex_table = .;				\
++ 	*(__kvm_ex_table)					\
++ 	__stop___kvm_ex_table = .;
++ 
++ #define HYPERVISOR_DATA_SECTIONS				\
++ 	HYP_SECTION_NAME(.rodata) : {				\
++ 		. = ALIGN(PAGE_SIZE);				\
++ 		__hyp_rodata_start = .;				\
++ 		*(HYP_SECTION_NAME(.data..ro_after_init))	\
++ 		*(HYP_SECTION_NAME(.rodata))			\
++ 		. = ALIGN(PAGE_SIZE);				\
++ 		__hyp_rodata_end = .;				\
++ 	}
++ 
++ #define HYPERVISOR_PERCPU_SECTION				\
++ 	. = ALIGN(PAGE_SIZE);					\
++ 	HYP_SECTION_NAME(.data..percpu) : {			\
++ 		*(HYP_SECTION_NAME(.data..percpu))		\
++ 	}
++ 
++ #define HYPERVISOR_RELOC_SECTION				\
++ 	.hyp.reloc : ALIGN(4) {					\
++ 		__hyp_reloc_begin = .;				\
++ 		*(.hyp.reloc)					\
++ 		__hyp_reloc_end = .;				\
++ 	}
++ 
++ #define BSS_FIRST_SECTIONS					\
++ 	__hyp_bss_start = .;					\
++ 	*(HYP_SECTION_NAME(.bss))				\
++ 	. = ALIGN(PAGE_SIZE);					\
++ 	__hyp_bss_end = .;
++ 
++ /*
++  * We require that __hyp_bss_start and __bss_start are aligned, and enforce it
++  * with an assertion. But the BSS_SECTION macro places an empty .sbss section
++  * between them, which can in some cases cause the linker to misalign them. To
++  * work around the issue, force a page alignment for __bss_start.
++  */
++ #define SBSS_ALIGN			PAGE_SIZE
++ #else /* CONFIG_KVM */
++ #define HYPERVISOR_EXTABLE
++ #define HYPERVISOR_DATA_SECTIONS
++ #define HYPERVISOR_PERCPU_SECTION
++ #define HYPERVISOR_RELOC_SECTION
++ #define SBSS_ALIGN			0
++ #endif
++ 
++ #define RO_EXCEPTION_TABLE_ALIGN	4
++ #define RUNTIME_DISCARD_EXIT
++ 
+++>>>>>>> d6e2cc564775 (arm64: extable: add `type` and `data` fields)
+  #include <asm-generic/vmlinux.lds.h>
+  #include <asm/cache.h>
+  #include <asm/kernel-pgtable.h>
+diff --cc arch/arm64/mm/extable.c
+index 3552fd77dbaf,c2951b963335..000000000000
+--- a/arch/arm64/mm/extable.c
++++ b/arch/arm64/mm/extable.c
+@@@ -6,19 -6,38 +6,48 @@@
+  #include <linux/extable.h>
+  #include <linux/uaccess.h>
+  
++ #include <asm/asm-extable.h>
++ 
++ typedef bool (*ex_handler_t)(const struct exception_table_entry *,
++ 			     struct pt_regs *);
++ 
++ static inline unsigned long
++ get_ex_fixup(const struct exception_table_entry *ex)
++ {
++ 	return ((unsigned long)&ex->fixup + ex->fixup);
++ }
++ 
++ static bool ex_handler_fixup(const struct exception_table_entry *ex,
++ 			     struct pt_regs *regs)
++ {
++ 	regs->pc = get_ex_fixup(ex);
++ 	return true;
++ }
++ 
+  bool fixup_exception(struct pt_regs *regs)
+  {
+ -	const struct exception_table_entry *ex;
+ +	const struct exception_table_entry *fixup;
+  
+ -	ex = search_exception_tables(instruction_pointer(regs));
+ -	if (!ex)
+ +	fixup = search_exception_tables(instruction_pointer(regs));
+ +	if (!fixup)
+  		return false;
+  
+++<<<<<<< HEAD
+ +	if (IS_ENABLED(CONFIG_BPF_JIT) &&
+ +	    regs->pc >= BPF_JIT_REGION_START &&
+ +	    regs->pc < BPF_JIT_REGION_END)
+ +		return arm64_bpf_fixup_exception(fixup, regs);
+ +
+ +	regs->pc = (unsigned long)&fixup->fixup + fixup->fixup;
+ +	return true;
+++=======
++ 	switch (ex->type) {
++ 	case EX_TYPE_FIXUP:
++ 		return ex_handler_fixup(ex, regs);
++ 	case EX_TYPE_BPF:
++ 		return ex_handler_bpf(ex, regs);
++ 	}
++ 
++ 	BUG();
+++>>>>>>> d6e2cc564775 (arm64: extable: add `type` and `data` fields)
+  }
+diff --cc scripts/sortextable.c
+index d202bff8b35f,ee95bb47a50d..000000000000
+--- a/scripts/sortextable.c
++++ b/scripts/sortextable.c
+@@@ -209,11 -206,63 +209,67 @@@ static int compare_relative_table(cons
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:scripts/sortextable.c
+++=======
++ static void sort_relative_table(char *extab_image, int image_size)
++ {
++ 	int i = 0;
++ 
++ 	/*
++ 	 * Do the same thing the runtime sort does, first normalize to
++ 	 * being relative to the start of the section.
++ 	 */
++ 	while (i < image_size) {
++ 		uint32_t *loc = (uint32_t *)(extab_image + i);
++ 		w(r(loc) + i, loc);
++ 		i += 4;
++ 	}
++ 
++ 	qsort(extab_image, image_size / 8, 8, compare_relative_table);
++ 
++ 	/* Now denormalize. */
++ 	i = 0;
++ 	while (i < image_size) {
++ 		uint32_t *loc = (uint32_t *)(extab_image + i);
++ 		w(r(loc) - i, loc);
++ 		i += 4;
++ 	}
++ }
++ 
++ static void arm64_sort_relative_table(char *extab_image, int image_size)
++ {
++ 	int i = 0;
++ 
++ 	while (i < image_size) {
++ 		uint32_t *loc = (uint32_t *)(extab_image + i);
++ 
++ 		w(r(loc) + i, loc);
++ 		w(r(loc + 1) + i + 4, loc + 1);
++ 		/* Don't touch the fixup type or data */
++ 
++ 		i += sizeof(uint32_t) * 3;
++ 	}
++ 
++ 	qsort(extab_image, image_size / 12, 12, compare_relative_table);
++ 
++ 	i = 0;
++ 	while (i < image_size) {
++ 		uint32_t *loc = (uint32_t *)(extab_image + i);
++ 
++ 		w(r(loc) - i, loc);
++ 		w(r(loc + 1) - (i + 4), loc + 1);
++ 		/* Don't touch the fixup type or data */
++ 
++ 		i += sizeof(uint32_t) * 3;
++ 	}
++ }
++ 
+++>>>>>>> d6e2cc564775 (arm64: extable: add `type` and `data` fields):scripts/sorttable.c
+  static void x86_sort_relative_table(char *extab_image, int image_size)
+  {
+ -	int i = 0;
+ +	int i;
+  
+ +	i = 0;
+  	while (i < image_size) {
+  		uint32_t *loc = (uint32_t *)(extab_image + i);
+  
+* Unmerged path arch/arm64/include/asm/asm-extable.h
+* Unmerged path arch/arm64/include/asm/asm-extable.h
+* Unmerged path arch/arm64/include/asm/extable.h
+* Unmerged path arch/arm64/kernel/vmlinux.lds.S
+* Unmerged path arch/arm64/mm/extable.c
+diff --git a/arch/arm64/net/bpf_jit_comp.c b/arch/arm64/net/bpf_jit_comp.c
+index 75e505f1f18e..3dd3d20e9c64 100644
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@ -24,6 +24,7 @@
+ #include <linux/printk.h>
+ #include <linux/slab.h>
+ 
++#include <asm/asm-extable.h>
+ #include <asm/byteorder.h>
+ #include <asm/cacheflush.h>
+ #include <asm/debug-monitors.h>
+@@ -368,8 +369,8 @@ static void build_epilogue(struct jit_ctx *ctx)
+ #define BPF_FIXUP_OFFSET_MASK	GENMASK(26, 0)
+ #define BPF_FIXUP_REG_MASK	GENMASK(31, 27)
+ 
+-bool arm64_bpf_fixup_exception(const struct exception_table_entry *ex,
+-			       struct pt_regs *regs)
++bool ex_handler_bpf(const struct exception_table_entry *ex,
++		    struct pt_regs *regs)
+ {
+ 	off_t offset = FIELD_GET(BPF_FIXUP_OFFSET_MASK, ex->fixup);
+ 	int dst_reg = FIELD_GET(BPF_FIXUP_REG_MASK, ex->fixup);
+@@ -422,6 +423,8 @@ static int add_exception_handler(const struct bpf_insn *insn,
+ 	ex->fixup = FIELD_PREP(BPF_FIXUP_OFFSET_MASK, offset) |
+ 		    FIELD_PREP(BPF_FIXUP_REG_MASK, dst_reg);
+ 
++	ex->type = EX_TYPE_BPF;
++
+ 	ctx->exentry_idx++;
+ 	return 0;
+ }
+* Unmerged path scripts/sortextable.c
