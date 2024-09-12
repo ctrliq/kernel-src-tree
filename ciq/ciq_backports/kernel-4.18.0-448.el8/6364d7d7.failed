@@ -1,0 +1,135 @@
+bpf, x64: Factor out emission of REX byte in more cases
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Jie Meng <jmeng@fb.com>
+commit 6364d7d75a0e015a405d1f8a07f267f076c36ca6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/6364d7d7.failed
+
+Introduce a single reg version of maybe_emit_mod() and factor out
+common code in more cases.
+
+	Signed-off-by: Jie Meng <jmeng@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Song Liu <songliubraving@fb.com>
+Link: https://lore.kernel.org/bpf/20211006194135.608932-1-jmeng@fb.com
+(cherry picked from commit 6364d7d75a0e015a405d1f8a07f267f076c36ca6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/net/bpf_jit_comp.c
+diff --cc arch/x86/net/bpf_jit_comp.c
+index 24683a5418da,e474718d152b..000000000000
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@@ -1067,63 -1069,51 +1077,98 @@@ static int do_jit(struct bpf_prog *bpf_
+  			 */
+  			EMIT2(0x31, 0xd2);
+  
+++<<<<<<< HEAD
+ +			if (BPF_CLASS(insn->code) == BPF_ALU64)
+ +				/* div r11 */
+ +				EMIT3(0x49, 0xF7, 0xF3);
+ +			else
+ +				/* div r11d */
+ +				EMIT3(0x41, 0xF7, 0xF3);
+++=======
++ 			/* div src_reg */
++ 			maybe_emit_1mod(&prog, src_reg, is64);
++ 			EMIT2(0xF7, add_1reg(0xF0, src_reg));
+++>>>>>>> 6364d7d75a0e (bpf, x64: Factor out emission of REX byte in more cases)
+  
+ -			if (BPF_OP(insn->code) == BPF_MOD &&
+ -			    dst_reg != BPF_REG_3)
+ -				/* mov dst_reg, rdx */
+ -				emit_mov_reg(&prog, is64, dst_reg, BPF_REG_3);
+ -			else if (BPF_OP(insn->code) == BPF_DIV &&
+ -				 dst_reg != BPF_REG_0)
+ -				/* mov dst_reg, rax */
+ -				emit_mov_reg(&prog, is64, dst_reg, BPF_REG_0);
+ +			if (BPF_OP(insn->code) == BPF_MOD)
+ +				/* mov r11, rdx */
+ +				EMIT3(0x49, 0x89, 0xD3);
+ +			else
+ +				/* mov r11, rax */
+ +				EMIT3(0x49, 0x89, 0xC3);
+ +
+ +			EMIT1(0x5A); /* pop rdx */
+ +			EMIT1(0x58); /* pop rax */
+ +
+ +			/* mov dst_reg, r11 */
+ +			EMIT_mov(dst_reg, AUX_REG);
+ +			break;
+ +
+ +		case BPF_ALU | BPF_MUL | BPF_K:
+ +		case BPF_ALU | BPF_MUL | BPF_X:
+ +		case BPF_ALU64 | BPF_MUL | BPF_K:
+ +		case BPF_ALU64 | BPF_MUL | BPF_X:
+ +		{
+ +			bool is64 = BPF_CLASS(insn->code) == BPF_ALU64;
+ +
+ +			if (dst_reg != BPF_REG_0)
+ +				EMIT1(0x50); /* push rax */
+ +			if (dst_reg != BPF_REG_3)
+ +				EMIT1(0x52); /* push rdx */
+ +
+ +			/* mov r11, dst_reg */
+ +			EMIT_mov(AUX_REG, dst_reg);
+ +
+ +			if (BPF_SRC(insn->code) == BPF_X)
+ +				emit_mov_reg(&prog, is64, BPF_REG_0, src_reg);
+ +			else
+ +				emit_mov_imm32(&prog, is64, BPF_REG_0, imm32);
+ +
+ +			if (is64)
+ +				EMIT1(add_1mod(0x48, AUX_REG));
+ +			else if (is_ereg(AUX_REG))
+ +				EMIT1(add_1mod(0x40, AUX_REG));
+ +			/* mul(q) r11 */
+ +			EMIT2(0xF7, add_1reg(0xE0, AUX_REG));
+  
+  			if (dst_reg != BPF_REG_3)
+  				EMIT1(0x5A); /* pop rdx */
+ -			if (dst_reg != BPF_REG_0)
+ +			if (dst_reg != BPF_REG_0) {
+ +				/* mov dst_reg, rax */
+ +				EMIT_mov(dst_reg, BPF_REG_0);
+  				EMIT1(0x58); /* pop rax */
+ +			}
+  			break;
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		case BPF_ALU | BPF_MUL | BPF_K:
++ 		case BPF_ALU64 | BPF_MUL | BPF_K:
++ 			maybe_emit_mod(&prog, dst_reg, dst_reg,
++ 				       BPF_CLASS(insn->code) == BPF_ALU64);
++ 
++ 			if (is_imm8(imm32))
++ 				/* imul dst_reg, dst_reg, imm8 */
++ 				EMIT3(0x6B, add_2reg(0xC0, dst_reg, dst_reg),
++ 				      imm32);
++ 			else
++ 				/* imul dst_reg, dst_reg, imm32 */
++ 				EMIT2_off32(0x69,
++ 					    add_2reg(0xC0, dst_reg, dst_reg),
++ 					    imm32);
++ 			break;
++ 
++ 		case BPF_ALU | BPF_MUL | BPF_X:
++ 		case BPF_ALU64 | BPF_MUL | BPF_X:
++ 			maybe_emit_mod(&prog, src_reg, dst_reg,
++ 				       BPF_CLASS(insn->code) == BPF_ALU64);
++ 
++ 			/* imul dst_reg, src_reg */
++ 			EMIT3(0x0F, 0xAF, add_2reg(0xC0, src_reg, dst_reg));
++ 			break;
++ 
+++>>>>>>> 6364d7d75a0e (bpf, x64: Factor out emission of REX byte in more cases)
+  			/* Shifts */
+  		case BPF_ALU | BPF_LSH | BPF_K:
+  		case BPF_ALU | BPF_RSH | BPF_K:
+* Unmerged path arch/x86/net/bpf_jit_comp.c
