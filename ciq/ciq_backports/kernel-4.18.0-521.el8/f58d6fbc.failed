@@ -1,0 +1,357 @@
+x86/CPU/AMD: Fix the DIV(0) initial fix attempt
+
+jira LE-1907
+cve CVE-2023-20588
+Rebuild_History Non-Buildable kernel-4.18.0-521.el8
+commit-author Borislav Petkov (AMD) <bp@alien8.de>
+commit f58d6fbcb7c848b7f2469be339bc571f2e9d245b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-521.el8/f58d6fbc.failed
+
+Initially, it was thought that doing an innocuous division in the #DE
+handler would take care to prevent any leaking of old data from the
+divider but by the time the fault is raised, the speculation has already
+advanced too far and such data could already have been used by younger
+operations.
+
+Therefore, do the innocuous division on every exit to userspace so that
+userspace doesn't see any potentially old data from integer divisions in
+kernel space.
+
+Do the same before VMRUN too, to protect host data from leaking into the
+guest too.
+
+Fixes: 77245f1c3c64 ("x86/CPU/AMD: Do not leak quotient data after a division by 0")
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Cc: <stable@kernel.org>
+Link: https://lore.kernel.org/r/20230811213824.10025-1-bp@alien8.de
+(cherry picked from commit f58d6fbcb7c848b7f2469be339bc571f2e9d245b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/entry-common.h
+#	arch/x86/kernel/cpu/amd.c
+#	arch/x86/kernel/traps.c
+#	arch/x86/kvm/svm/svm.c
+diff --cc arch/x86/kernel/cpu/amd.c
+index e12be0977a83,7eca6a8abbb1..000000000000
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@@ -1330,3 -1300,33 +1330,36 @@@ void amd_check_microcode(void
+  {
+  	on_each_cpu(zenbleed_check_cpu, NULL, 1);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ bool cpu_has_ibpb_brtype_microcode(void)
++ {
++ 	switch (boot_cpu_data.x86) {
++ 	/* Zen1/2 IBPB flushes branch type predictions too. */
++ 	case 0x17:
++ 		return boot_cpu_has(X86_FEATURE_AMD_IBPB);
++ 	case 0x19:
++ 		/* Poke the MSR bit on Zen3/4 to check its presence. */
++ 		if (!wrmsrl_safe(MSR_IA32_PRED_CMD, PRED_CMD_SBPB)) {
++ 			setup_force_cpu_cap(X86_FEATURE_SBPB);
++ 			return true;
++ 		} else {
++ 			return false;
++ 		}
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ /*
++  * Issue a DIV 0/1 insn to clear any division data from previous DIV
++  * operations.
++  */
++ void noinstr amd_clear_divider(void)
++ {
++ 	asm volatile(ALTERNATIVE("", "div %2\n\t", X86_BUG_DIV0)
++ 		     :: "a" (0), "d" (0), "r" (1));
++ }
++ EXPORT_SYMBOL_GPL(amd_clear_divider);
+++>>>>>>> f58d6fbcb7c8 (x86/CPU/AMD: Fix the DIV(0) initial fix attempt)
+diff --cc arch/x86/kernel/traps.c
+index 68ab7cadc72c,4a817d20ce3b..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -217,23 -186,197 +217,201 @@@ static void do_error_trap(struct pt_reg
+  	}
+  }
+  
+ -/*
+ - * Posix requires to provide the address of the faulting instruction for
+ - * SIGILL (#UD) and SIGFPE (#DE) in the si_addr member of siginfo_t.
+ - *
+ - * This address is usually regs->ip, but when an uprobe moved the code out
+ - * of line then regs->ip points to the XOL code which would confuse
+ - * anything which analyzes the fault address vs. the unmodified binary. If
+ - * a trap happened in XOL code then uprobe maps regs->ip back to the
+ - * original instruction address.
+ - */
+ -static __always_inline void __user *error_get_trap_addr(struct pt_regs *regs)
+ -{
+ -	return (void __user *)uprobe_get_trap_addr(regs);
+ +#define IP ((void __user *)uprobe_get_trap_addr(regs))
+ +#define DO_ERROR(trapnr, signr, sicode, addr, str, name)		   \
+ +dotraplinkage void do_##name(struct pt_regs *regs, long error_code)	   \
+ +{									   \
+ +	do_error_trap(regs, error_code, str, trapnr, signr, sicode, addr); \
+  }
+  
+++<<<<<<< HEAD
+ +DO_ERROR(X86_TRAP_DE,     SIGFPE,  FPE_INTDIV,   IP, "divide error",        divide_error)
+ +DO_ERROR(X86_TRAP_OF,     SIGSEGV,          0, NULL, "overflow",            overflow)
+ +DO_ERROR(X86_TRAP_UD,     SIGILL,  ILL_ILLOPN,   IP, "invalid opcode",      invalid_op)
+ +DO_ERROR(X86_TRAP_OLD_MF, SIGFPE,           0, NULL, "coprocessor segment overrun", coprocessor_segment_overrun)
+ +DO_ERROR(X86_TRAP_TS,     SIGSEGV,          0, NULL, "invalid TSS",         invalid_TSS)
+ +DO_ERROR(X86_TRAP_NP,     SIGBUS,           0, NULL, "segment not present", segment_not_present)
+ +DO_ERROR(X86_TRAP_SS,     SIGBUS,           0, NULL, "stack segment",       stack_segment)
+ +#undef IP
+ +
+ +dotraplinkage void do_alignment_check(struct pt_regs *regs, long error_code)
+++=======
++ DEFINE_IDTENTRY(exc_divide_error)
++ {
++ 	do_error_trap(regs, 0, "divide error", X86_TRAP_DE, SIGFPE,
++ 		      FPE_INTDIV, error_get_trap_addr(regs));
++ }
++ 
++ DEFINE_IDTENTRY(exc_overflow)
++ {
++ 	do_error_trap(regs, 0, "overflow", X86_TRAP_OF, SIGSEGV, 0, NULL);
++ }
++ 
++ #ifdef CONFIG_X86_KERNEL_IBT
++ 
++ static __ro_after_init bool ibt_fatal = true;
++ 
++ extern void ibt_selftest_ip(void); /* code label defined in asm below */
++ 
++ enum cp_error_code {
++ 	CP_EC        = (1 << 15) - 1,
++ 
++ 	CP_RET       = 1,
++ 	CP_IRET      = 2,
++ 	CP_ENDBR     = 3,
++ 	CP_RSTRORSSP = 4,
++ 	CP_SETSSBSY  = 5,
++ 
++ 	CP_ENCL	     = 1 << 15,
++ };
++ 
++ DEFINE_IDTENTRY_ERRORCODE(exc_control_protection)
++ {
++ 	if (!cpu_feature_enabled(X86_FEATURE_IBT)) {
++ 		pr_err("Unexpected #CP\n");
++ 		BUG();
++ 	}
++ 
++ 	if (WARN_ON_ONCE(user_mode(regs) || (error_code & CP_EC) != CP_ENDBR))
++ 		return;
++ 
++ 	if (unlikely(regs->ip == (unsigned long)&ibt_selftest_ip)) {
++ 		regs->ax = 0;
++ 		return;
++ 	}
++ 
++ 	pr_err("Missing ENDBR: %pS\n", (void *)instruction_pointer(regs));
++ 	if (!ibt_fatal) {
++ 		printk(KERN_DEFAULT CUT_HERE);
++ 		__warn(__FILE__, __LINE__, (void *)regs->ip, TAINT_WARN, regs, NULL);
++ 		return;
++ 	}
++ 	BUG();
++ }
++ 
++ /* Must be noinline to ensure uniqueness of ibt_selftest_ip. */
++ noinline bool ibt_selftest(void)
++ {
++ 	unsigned long ret;
++ 
++ 	asm ("	lea ibt_selftest_ip(%%rip), %%rax\n\t"
++ 	     ANNOTATE_RETPOLINE_SAFE
++ 	     "	jmp *%%rax\n\t"
++ 	     "ibt_selftest_ip:\n\t"
++ 	     UNWIND_HINT_FUNC
++ 	     ANNOTATE_NOENDBR
++ 	     "	nop\n\t"
++ 
++ 	     : "=a" (ret) : : "memory");
++ 
++ 	return !ret;
++ }
++ 
++ static int __init ibt_setup(char *str)
++ {
++ 	if (!strcmp(str, "off"))
++ 		setup_clear_cpu_cap(X86_FEATURE_IBT);
++ 
++ 	if (!strcmp(str, "warn"))
++ 		ibt_fatal = false;
++ 
++ 	return 1;
++ }
++ 
++ __setup("ibt=", ibt_setup);
++ 
++ #endif /* CONFIG_X86_KERNEL_IBT */
++ 
++ #ifdef CONFIG_X86_F00F_BUG
++ void handle_invalid_op(struct pt_regs *regs)
++ #else
++ static inline void handle_invalid_op(struct pt_regs *regs)
++ #endif
++ {
++ 	do_error_trap(regs, 0, "invalid opcode", X86_TRAP_UD, SIGILL,
++ 		      ILL_ILLOPN, error_get_trap_addr(regs));
++ }
++ 
++ static noinstr bool handle_bug(struct pt_regs *regs)
++ {
++ 	bool handled = false;
++ 
++ 	/*
++ 	 * Normally @regs are unpoisoned by irqentry_enter(), but handle_bug()
++ 	 * is a rare case that uses @regs without passing them to
++ 	 * irqentry_enter().
++ 	 */
++ 	kmsan_unpoison_entry_regs(regs);
++ 	if (!is_valid_bugaddr(regs->ip))
++ 		return handled;
++ 
++ 	/*
++ 	 * All lies, just get the WARN/BUG out.
++ 	 */
++ 	instrumentation_begin();
++ 	/*
++ 	 * Since we're emulating a CALL with exceptions, restore the interrupt
++ 	 * state to what it was at the exception site.
++ 	 */
++ 	if (regs->flags & X86_EFLAGS_IF)
++ 		raw_local_irq_enable();
++ 	if (report_bug(regs->ip, regs) == BUG_TRAP_TYPE_WARN ||
++ 	    handle_cfi_failure(regs) == BUG_TRAP_TYPE_WARN) {
++ 		regs->ip += LEN_UD2;
++ 		handled = true;
++ 	}
++ 	if (regs->flags & X86_EFLAGS_IF)
++ 		raw_local_irq_disable();
++ 	instrumentation_end();
++ 
++ 	return handled;
++ }
++ 
++ DEFINE_IDTENTRY_RAW(exc_invalid_op)
++ {
++ 	irqentry_state_t state;
++ 
++ 	/*
++ 	 * We use UD2 as a short encoding for 'CALL __WARN', as such
++ 	 * handle it before exception entry to avoid recursive WARN
++ 	 * in case exception entry is the one triggering WARNs.
++ 	 */
++ 	if (!user_mode(regs) && handle_bug(regs))
++ 		return;
++ 
++ 	state = irqentry_enter(regs);
++ 	instrumentation_begin();
++ 	handle_invalid_op(regs);
++ 	instrumentation_end();
++ 	irqentry_exit(regs, state);
++ }
++ 
++ DEFINE_IDTENTRY(exc_coproc_segment_overrun)
++ {
++ 	do_error_trap(regs, 0, "coprocessor segment overrun",
++ 		      X86_TRAP_OLD_MF, SIGFPE, 0, NULL);
++ }
++ 
++ DEFINE_IDTENTRY_ERRORCODE(exc_invalid_tss)
++ {
++ 	do_error_trap(regs, error_code, "invalid TSS", X86_TRAP_TS, SIGSEGV,
++ 		      0, NULL);
++ }
++ 
++ DEFINE_IDTENTRY_ERRORCODE(exc_segment_not_present)
++ {
++ 	do_error_trap(regs, error_code, "segment not present", X86_TRAP_NP,
++ 		      SIGBUS, 0, NULL);
++ }
++ 
++ DEFINE_IDTENTRY_ERRORCODE(exc_stack_segment)
++ {
++ 	do_error_trap(regs, error_code, "stack segment", X86_TRAP_SS, SIGBUS,
++ 		      0, NULL);
++ }
++ 
++ DEFINE_IDTENTRY_ERRORCODE(exc_alignment_check)
+++>>>>>>> f58d6fbcb7c8 (x86/CPU/AMD: Fix the DIV(0) initial fix attempt)
+  {
+  	char *str = "alignment check";
+  
+diff --cc arch/x86/kvm/svm/svm.c
+index 2ba5390bb9ee,d4bfdc607fe7..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -3819,37 -4000,26 +3819,46 @@@ static fastpath_t svm_exit_handlers_fas
+  	return EXIT_FASTPATH_NONE;
+  }
+  
+ -static noinstr void svm_vcpu_enter_exit(struct kvm_vcpu *vcpu, bool spec_ctrl_intercepted)
+ +static noinstr void svm_vcpu_enter_exit(struct kvm_vcpu *vcpu)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+ +	unsigned long vmcb_pa = svm->current_vmcb->pa;
+  
+ -	guest_state_enter_irqoff();
+ +	kvm_guest_enter_irqoff();
+  
+++<<<<<<< HEAD
+ +	if (sev_es_guest(vcpu->kvm)) {
+ +		__svm_sev_es_vcpu_run(vmcb_pa);
+ +	} else {
+ +		struct svm_cpu_data *sd = per_cpu(svm_data, vcpu->cpu);
+++=======
++ 	amd_clear_divider();
++ 
++ 	if (sev_es_guest(vcpu->kvm))
++ 		__svm_sev_es_vcpu_run(svm, spec_ctrl_intercepted);
++ 	else
++ 		__svm_vcpu_run(svm, spec_ctrl_intercepted);
+++>>>>>>> f58d6fbcb7c8 (x86/CPU/AMD: Fix the DIV(0) initial fix attempt)
+  
+ -	guest_state_exit_irqoff();
+ +		/*
+ +		 * Use a single vmcb (vmcb01 because it's always valid) for
+ +		 * context switching guest state via VMLOAD/VMSAVE, that way
+ +		 * the state doesn't need to be copied between vmcb01 and
+ +		 * vmcb02 when switching vmcbs for nested virtualization.
+ +		 */
+ +		vmload(svm->vmcb01.pa);
+ +		__svm_vcpu_run(vmcb_pa, (unsigned long *)&vcpu->arch.regs);
+ +		vmsave(svm->vmcb01.pa);
+ +
+ +		vmload(__sme_page_pa(sd->save_area));
+ +	}
+ +
+ +	kvm_guest_exit_irqoff();
+  }
+  
+ -static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+ +static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+ -	bool spec_ctrl_intercepted = msr_write_intercepted(vcpu, MSR_IA32_SPEC_CTRL);
+  
+  	trace_kvm_entry(vcpu);
+  
+* Unmerged path arch/x86/include/asm/entry-common.h
+* Unmerged path arch/x86/include/asm/entry-common.h
+* Unmerged path arch/x86/kernel/cpu/amd.c
+* Unmerged path arch/x86/kernel/traps.c
+* Unmerged path arch/x86/kvm/svm/svm.c
