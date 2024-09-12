@@ -1,0 +1,145 @@
+x86/alternatives: Add and use text_gen_insn() helper
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 63f62addb88ec4b358cf4574789bc3180c689e9a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/63f62add.failed
+
+Provide a simple helper function to create common instruction
+encodings.
+
+	Tested-by: Alexei Starovoitov <ast@kernel.org>
+	Tested-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Daniel Bristot de Oliveira <bristot@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Masami Hiramatsu <mhiramat@kernel.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/20191111132457.703538332@infradead.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 63f62addb88ec4b358cf4574789bc3180c689e9a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/jump_label.c
+diff --cc arch/x86/kernel/jump_label.c
+index e7e19b66018c,9c4498ea0b3c..000000000000
+--- a/arch/x86/kernel/jump_label.c
++++ b/arch/x86/kernel/jump_label.c
+@@@ -16,17 -16,7 +16,21 @@@
+  #include <asm/alternative.h>
+  #include <asm/text-patching.h>
+  
+++<<<<<<< HEAD
+ +#ifdef HAVE_JUMP_LABEL
+ +
+ +union jump_code_union {
+ +	char code[JUMP_LABEL_NOP_SIZE];
+ +	struct {
+ +		char jump;
+ +		int offset;
+ +	} __attribute__((packed));
+ +};
+ +
+ +static void bug_at(unsigned char *ip, int line)
+++=======
++ static void bug_at(const void *ip, int line)
+++>>>>>>> 63f62addb88e (x86/alternatives: Add and use text_gen_insn() helper)
+  {
+  	/*
+  	 * The location is not an op that we were expecting.
+diff --git a/arch/x86/include/asm/text-patching.h b/arch/x86/include/asm/text-patching.h
+index 47a8c6185e2b..eda7bf45110b 100644
+--- a/arch/x86/include/asm/text-patching.h
++++ b/arch/x86/include/asm/text-patching.h
+@@ -49,6 +49,8 @@ extern void text_poke_bp(void *addr, const void *opcode, size_t len, const void
+ extern void text_poke_queue(void *addr, const void *opcode, size_t len, const void *emulate);
+ extern void text_poke_finish(void);
+ 
++extern void *text_gen_insn(u8 opcode, const void *addr, const void *dest);
++
+ extern int after_bootmem;
+ extern __ro_after_init struct mm_struct *poking_mm;
+ extern __ro_after_init unsigned long poking_addr;
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 57fff6ac78c6..873daff375d3 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -1084,3 +1084,39 @@ void text_poke_bp(void *addr, const void *opcode, size_t len, const void *emulat
+ 	text_poke_loc_init(&tp, addr, opcode, len, emulate);
+ 	text_poke_bp_batch(&tp, 1);
+ }
++
++union text_poke_insn {
++	u8 text[POKE_MAX_OPCODE_SIZE];
++	struct {
++		u8 opcode;
++		s32 disp;
++	} __attribute__((packed));
++};
++
++void *text_gen_insn(u8 opcode, const void *addr, const void *dest)
++{
++	static union text_poke_insn insn; /* text_mutex */
++	int size = 0;
++
++	lockdep_assert_held(&text_mutex);
++
++	insn.opcode = opcode;
++
++#define __CASE(insn)	\
++	case insn##_INSN_OPCODE: size = insn##_INSN_SIZE; break
++
++	switch(opcode) {
++	__CASE(INT3);
++	__CASE(CALL);
++	__CASE(JMP32);
++	__CASE(JMP8);
++	}
++
++	if (size > 1) {
++		insn.disp = (long)dest - (long)(addr + size);
++		if (size == 2)
++			BUG_ON((insn.disp >> 31) != (insn.disp >> 7));
++	}
++
++	return &insn.text;
++}
+* Unmerged path arch/x86/kernel/jump_label.c
+diff --git a/arch/x86/kernel/kprobes/opt.c b/arch/x86/kernel/kprobes/opt.c
+index 0448efa0d2f1..17efd7ec5cc9 100644
+--- a/arch/x86/kernel/kprobes/opt.c
++++ b/arch/x86/kernel/kprobes/opt.c
+@@ -460,18 +460,13 @@ void arch_optimize_kprobes(struct list_head *oplist)
+ void arch_unoptimize_kprobe(struct optimized_kprobe *op)
+ {
+ 	u8 insn_buff[RELATIVEJUMP_SIZE];
+-	u8 emulate_buff[RELATIVEJUMP_SIZE];
+ 
+ 	/* Set int3 to first byte for kprobes */
+ 	insn_buff[0] = BREAKPOINT_INSTRUCTION;
+ 	memcpy(insn_buff + 1, op->optinsn.copied_insn, RELATIVE_ADDR_SIZE);
+ 
+-	emulate_buff[0] = RELATIVEJUMP_OPCODE;
+-	*(s32 *)(&emulate_buff[1]) = (s32)((long)op->optinsn.insn -
+-			((long)op->kp.addr + RELATIVEJUMP_SIZE));
+-
+ 	text_poke_bp(op->kp.addr, insn_buff, RELATIVEJUMP_SIZE,
+-		     emulate_buff);
++		     text_gen_insn(JMP32_INSN_OPCODE, op->kp.addr, op->optinsn.insn));
+ }
+ 
+ /*
