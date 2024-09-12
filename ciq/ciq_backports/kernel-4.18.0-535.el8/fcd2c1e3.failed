@@ -1,0 +1,231 @@
+ice: PTP: add clock domain number to auxiliary interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-535.el8
+commit-author Michal Michalik <michal.michalik@intel.com>
+commit fcd2c1e3139a27766ef263bd2011195dbc8a79f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-535.el8/fcd2c1e3.failed
+
+The PHC clock id used to be moved between PFs using FW admin queue
+shared parameters - move the implementation to auxiliary bus.
+
+	Signed-off-by: Karol Kolacinski <karol.kolacinski@intel.com>
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Signed-off-by: Michal Michalik <michal.michalik@intel.com>
+	Tested-by: Pucha Himasekhar Reddy <himasekharx.reddy.pucha@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit fcd2c1e3139a27766ef263bd2011195dbc8a79f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_ptp.c
+diff --cc drivers/net/ethernet/intel/ice/ice_ptp.c
+index 1e87eee54f2c,5293df2d57a8..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@@ -340,131 -340,6 +340,134 @@@ void ice_ptp_cfg_timestamp(struct ice_p
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * ice_get_ptp_clock_index - Get the PTP clock index
+ + * @pf: the PF pointer
+ + *
+ + * Determine the clock index of the PTP clock associated with this device. If
+ + * this is the PF controlling the clock, just use the local access to the
+ + * clock device pointer.
+ + *
+ + * Otherwise, read from the driver shared parameters to determine the clock
+ + * index value.
+ + *
+ + * Returns: the index of the PTP clock associated with this device, or -1 if
+ + * there is no associated clock.
+ + */
+ +int ice_get_ptp_clock_index(struct ice_pf *pf)
+ +{
+ +	struct device *dev = ice_pf_to_dev(pf);
+ +	enum ice_aqc_driver_params param_idx;
+ +	struct ice_hw *hw = &pf->hw;
+ +	u8 tmr_idx;
+ +	u32 value;
+ +	int err;
+ +
+ +	/* Use the ptp_clock structure if we're the main PF */
+ +	if (pf->ptp.clock)
+ +		return ptp_clock_index(pf->ptp.clock);
+ +
+ +	tmr_idx = hw->func_caps.ts_func_info.tmr_index_assoc;
+ +	if (!tmr_idx)
+ +		param_idx = ICE_AQC_DRIVER_PARAM_CLK_IDX_TMR0;
+ +	else
+ +		param_idx = ICE_AQC_DRIVER_PARAM_CLK_IDX_TMR1;
+ +
+ +	err = ice_aq_get_driver_param(hw, param_idx, &value, NULL);
+ +	if (err) {
+ +		dev_err(dev, "Failed to read PTP clock index parameter, err %d aq_err %s\n",
+ +			err, ice_aq_str(hw->adminq.sq_last_status));
+ +		return -1;
+ +	}
+ +
+ +	/* The PTP clock index is an integer, and will be between 0 and
+ +	 * INT_MAX. The highest bit of the driver shared parameter is used to
+ +	 * indicate whether or not the currently stored clock index is valid.
+ +	 */
+ +	if (!(value & PTP_SHARED_CLK_IDX_VALID))
+ +		return -1;
+ +
+ +	return value & ~PTP_SHARED_CLK_IDX_VALID;
+ +}
+ +
+ +/**
+ + * ice_set_ptp_clock_index - Set the PTP clock index
+ + * @pf: the PF pointer
+ + *
+ + * Set the PTP clock index for this device into the shared driver parameters,
+ + * so that other PFs associated with this device can read it.
+ + *
+ + * If the PF is unable to store the clock index, it will log an error, but
+ + * will continue operating PTP.
+ + */
+ +static void ice_set_ptp_clock_index(struct ice_pf *pf)
+ +{
+ +	struct device *dev = ice_pf_to_dev(pf);
+ +	enum ice_aqc_driver_params param_idx;
+ +	struct ice_hw *hw = &pf->hw;
+ +	u8 tmr_idx;
+ +	u32 value;
+ +	int err;
+ +
+ +	if (!pf->ptp.clock)
+ +		return;
+ +
+ +	tmr_idx = hw->func_caps.ts_func_info.tmr_index_assoc;
+ +	if (!tmr_idx)
+ +		param_idx = ICE_AQC_DRIVER_PARAM_CLK_IDX_TMR0;
+ +	else
+ +		param_idx = ICE_AQC_DRIVER_PARAM_CLK_IDX_TMR1;
+ +
+ +	value = (u32)ptp_clock_index(pf->ptp.clock);
+ +	if (value > INT_MAX) {
+ +		dev_err(dev, "PTP Clock index is too large to store\n");
+ +		return;
+ +	}
+ +	value |= PTP_SHARED_CLK_IDX_VALID;
+ +
+ +	err = ice_aq_set_driver_param(hw, param_idx, value, NULL);
+ +	if (err) {
+ +		dev_err(dev, "Failed to set PTP clock index parameter, err %d aq_err %s\n",
+ +			err, ice_aq_str(hw->adminq.sq_last_status));
+ +	}
+ +}
+ +
+ +/**
+ + * ice_clear_ptp_clock_index - Clear the PTP clock index
+ + * @pf: the PF pointer
+ + *
+ + * Clear the PTP clock index for this device. Must be called when
+ + * unregistering the PTP clock, in order to ensure other PFs stop reporting
+ + * a clock object that no longer exists.
+ + */
+ +static void ice_clear_ptp_clock_index(struct ice_pf *pf)
+ +{
+ +	struct device *dev = ice_pf_to_dev(pf);
+ +	enum ice_aqc_driver_params param_idx;
+ +	struct ice_hw *hw = &pf->hw;
+ +	u8 tmr_idx;
+ +	int err;
+ +
+ +	/* Do not clear the index if we don't own the timer */
+ +	if (!hw->func_caps.ts_func_info.src_tmr_owned)
+ +		return;
+ +
+ +	tmr_idx = hw->func_caps.ts_func_info.tmr_index_assoc;
+ +	if (!tmr_idx)
+ +		param_idx = ICE_AQC_DRIVER_PARAM_CLK_IDX_TMR0;
+ +	else
+ +		param_idx = ICE_AQC_DRIVER_PARAM_CLK_IDX_TMR1;
+ +
+ +	err = ice_aq_set_driver_param(hw, param_idx, 0, NULL);
+ +	if (err) {
+ +		dev_dbg(dev, "Failed to clear PTP clock index parameter, err %d aq_err %s\n",
+ +			err, ice_aq_str(hw->adminq.sq_last_status));
+ +	}
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> fcd2c1e3139a (ice: PTP: add clock domain number to auxiliary interface)
+   * ice_ptp_read_src_clk_reg - Read the source clock register
+   * @pf: Board private structure
+   * @sts: Optional parameter for holding a pair of system timestamps from
+diff --git a/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h b/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
+index 5b3b8875f06f..346360c6207b 100644
+--- a/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
++++ b/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
+@@ -2091,11 +2091,6 @@ struct ice_aqc_driver_shared_params {
+ };
+ 
+ enum ice_aqc_driver_params {
+-	/* OS clock index for PTP timer Domain 0 */
+-	ICE_AQC_DRIVER_PARAM_CLK_IDX_TMR0 = 0,
+-	/* OS clock index for PTP timer Domain 1 */
+-	ICE_AQC_DRIVER_PARAM_CLK_IDX_TMR1,
+-
+ 	/* Add new parameters above */
+ 	ICE_AQC_DRIVER_PARAM_MAX = 16,
+ };
+diff --git a/drivers/net/ethernet/intel/ice/ice_ethtool.c b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+index d46ba92fd3f9..ebb662b8b291 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@ -3287,7 +3287,7 @@ ice_get_ts_info(struct net_device *dev, struct ethtool_ts_info *info)
+ 				SOF_TIMESTAMPING_RX_HARDWARE |
+ 				SOF_TIMESTAMPING_RAW_HARDWARE;
+ 
+-	info->phc_index = ice_get_ptp_clock_index(pf);
++	info->phc_index = ice_ptp_clock_index(pf);
+ 
+ 	info->tx_types = BIT(HWTSTAMP_TX_OFF) | BIT(HWTSTAMP_TX_ON);
+ 
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp.h b/drivers/net/ethernet/intel/ice/ice_ptp.h
+index d94c22329df0..8f6f94392756 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.h
+@@ -288,11 +288,11 @@ struct ice_ptp {
+ #define ETH_GLTSYN_ENA(_i)		(0x03000348 + ((_i) * 4))
+ 
+ #if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
++int ice_ptp_clock_index(struct ice_pf *pf);
+ struct ice_pf;
+ int ice_ptp_set_ts_config(struct ice_pf *pf, struct ifreq *ifr);
+ int ice_ptp_get_ts_config(struct ice_pf *pf, struct ifreq *ifr);
+ void ice_ptp_cfg_timestamp(struct ice_pf *pf, bool ena);
+-int ice_get_ptp_clock_index(struct ice_pf *pf);
+ 
+ void ice_ptp_extts_event(struct ice_pf *pf);
+ s8 ice_ptp_request_ts(struct ice_ptp_tx *tx, struct sk_buff *skb);
+@@ -318,10 +318,6 @@ static inline int ice_ptp_get_ts_config(struct ice_pf *pf, struct ifreq *ifr)
+ }
+ 
+ static inline void ice_ptp_cfg_timestamp(struct ice_pf *pf, bool ena) { }
+-static inline int ice_get_ptp_clock_index(struct ice_pf *pf)
+-{
+-	return -1;
+-}
+ 
+ static inline void ice_ptp_extts_event(struct ice_pf *pf) { }
+ static inline s8
+@@ -344,5 +340,10 @@ static inline void ice_ptp_release(struct ice_pf *pf) { }
+ static inline void ice_ptp_link_change(struct ice_pf *pf, u8 port, bool linkup)
+ {
+ }
++
++static inline int ice_ptp_clock_index(struct ice_pf *pf)
++{
++	return -1;
++}
+ #endif /* IS_ENABLED(CONFIG_PTP_1588_CLOCK) */
+ #endif /* _ICE_PTP_H_ */
