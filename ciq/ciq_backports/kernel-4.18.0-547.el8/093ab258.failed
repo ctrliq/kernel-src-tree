@@ -1,0 +1,140 @@
+x86/boot: Define setup size in linker script
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit 093ab258e3fb1d1d3afdfd4a69403d44ce90e360
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/093ab258.failed
+
+The setup block contains the real mode startup code that is used when
+booting from a legacy BIOS, along with the boot_params/setup_data that
+is used by legacy x86 bootloaders to pass the command line and initial
+ramdisk parameters, among other things.
+
+The setup block also contains the PE/COFF header of the entire combined
+image, which includes the compressed kernel image, the decompressor and
+the EFI stub.
+
+This PE header describes the layout of the executable image in memory,
+and currently, the fact that the setup block precedes it makes it rather
+fiddly to get the right values into the right place in the final image.
+
+Let's make things a bit easier by defining the setup_size in the linker
+script so it can be referenced from the asm code directly, rather than
+having to rely on the build tool to calculate it. For the time being,
+add 64 bytes of fixed padding for the .reloc and .compat sections - this
+will be removed in a subsequent patch after the PE/COFF header has been
+reorganized.
+
+This change has no impact on the resulting bzImage binary when
+configured with CONFIG_EFI_MIXED=y.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20230915171623.655440-13-ardb@google.com
+(cherry picked from commit 093ab258e3fb1d1d3afdfd4a69403d44ce90e360)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/tools/build.c
+diff --cc arch/x86/boot/tools/build.c
+index db1a6f7dea68,745d64b6d930..000000000000
+--- a/arch/x86/boot/tools/build.c
++++ b/arch/x86/boot/tools/build.c
+@@@ -48,13 -48,11 +48,21 @@@ typedef unsigned int   u32
+  u8 buf[SETUP_SECT_MAX*512];
+  
+  #define PECOFF_RELOC_RESERVE 0x20
+++<<<<<<< HEAD
+ +
+ +unsigned long efi32_stub_entry;
+ +unsigned long efi64_stub_entry;
+ +unsigned long efi_pe_entry;
+ +unsigned long startup_64;
+ +unsigned long _ehead;
+ +unsigned long _end;
+++=======
++ #define PECOFF_COMPAT_RESERVE 0x20
++ 
++ static unsigned long efi_pe_entry;
++ static unsigned long efi32_pe_entry;
++ static unsigned long _end;
+++>>>>>>> 093ab258e3fb (x86/boot: Define setup size in linker script)
+  
+  /*----------------------------------------------------------------------*/
+  
+@@@ -375,35 -374,19 +383,34 @@@ int main(int argc, char ** argv
+  		die("Unable to mmap '%s': %m", argv[2]);
+  	/* Number of 16-byte paragraphs, including space for a 4-byte CRC */
+  	sys_size = (sz + 15 + 4) / 16;
+ -#ifdef CONFIG_EFI_STUB
+ -	/*
+ -	 * COFF requires minimum 32-byte alignment of sections, and
+ -	 * adding a signature is problematic without that alignment.
+ -	 */
+ -	sys_size = (sys_size + 1) & ~1;
+ -#endif
+  
+  	/* Patch the setup code with the appropriate size parameters */
+- 	buf[0x1f1] = setup_sectors-1;
+  	put_unaligned_le32(sys_size, &buf[0x1f4]);
+  
+ -	update_pecoff_text(setup_sectors * 512, i + (sys_size * 16));
+ +	init_sz = get_unaligned_le32(&buf[0x260]);
+ +#ifdef CONFIG_EFI_STUB
+ +	/*
+ +	 * The decompression buffer will start at ImageBase. When relocating
+ +	 * the compressed kernel to its end, we must ensure that the head
+ +	 * section does not get overwritten.  The head section occupies
+ +	 * [i, i + _ehead), and the destination is [init_sz - _end, init_sz).
+ +	 *
+ +	 * At present these should never overlap, because 'i' is at most 32k
+ +	 * because of SETUP_SECT_MAX, '_ehead' is less than 1k, and the
+ +	 * calculation of INIT_SIZE in boot/header.S ensures that
+ +	 * 'init_sz - _end' is at least 64k.
+ +	 *
+ +	 * For future-proofing, increase init_sz if necessary.
+ +	 */
+ +
+ +	if (init_sz - _end < i + _ehead) {
+ +		init_sz = (i + _ehead + _end + 4095) & ~4095;
+ +		put_unaligned_le32(init_sz, &buf[0x260]);
+ +	}
+ +#endif
+ +	update_pecoff_text(setup_sectors * 512, i + (sys_size * 16), init_sz);
+  
+ +	efi_stub_entry_update();
+  
+  	crc = partial_crc32(buf, i, crc);
+  	if (fwrite(buf, 1, i, dest) != i)
+diff --git a/arch/x86/boot/header.S b/arch/x86/boot/header.S
+index 941d1e9413b4..b4945dca8bc8 100644
+--- a/arch/x86/boot/header.S
++++ b/arch/x86/boot/header.S
+@@ -261,7 +261,7 @@ sentinel:	.byte 0xff, 0xff        /* Used to detect broken loaders */
+ 
+ 	.globl	hdr
+ hdr:
+-setup_sects:	.byte 0			/* Filled in by build.c */
++		.byte setup_sects - 1
+ root_flags:	.word ROOT_RDONLY
+ syssize:	.long 0			/* Filled in by build.c */
+ ram_size:	.word 0			/* Obsolete */
+diff --git a/arch/x86/boot/setup.ld b/arch/x86/boot/setup.ld
+index 96a6c7563538..38951f7cd356 100644
+--- a/arch/x86/boot/setup.ld
++++ b/arch/x86/boot/setup.ld
+@@ -38,6 +38,10 @@ SECTIONS
+ 	.signature	: {
+ 		setup_sig = .;
+ 		LONG(0x5a5aaa55)
++
++		/* Reserve some extra space for the reloc and compat sections */
++		setup_size = ALIGN(ABSOLUTE(.) + 64, 512);
++		setup_sects = ABSOLUTE(setup_size / 512);
+ 	}
+ 
+ 
+* Unmerged path arch/x86/boot/tools/build.c
