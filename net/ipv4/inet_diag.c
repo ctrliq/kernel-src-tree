@@ -1042,7 +1042,7 @@ skip_listen_ht:
 
 		for (i = s_i; i < hashinfo->bhash_size; i++) {
 			struct inet_bind_hashbucket *ibb;
-			struct inet_bind2_bucket *tb2;
+			struct inet_bind_bucket *tb;
 			struct sock *sk_arr[SKARR_SZ];
 			int num_arr[SKARR_SZ];
 			int idx, accum, res;
@@ -1050,14 +1050,14 @@ skip_listen_ht:
 resume_bind_walk:
 			num = 0;
 			accum = 0;
-			ibb = &hashinfo->bhash2[i];
+			ibb = &hashinfo->bhash[i];
 
 			spin_lock_bh(&ibb->lock);
-			inet_bind_bucket_for_each(tb2, &ibb->chain) {
-				if (!net_eq(ib2_net(tb2), net))
+			inet_bind_bucket_for_each(tb, &ibb->chain) {
+				if (!net_eq(ib_net(tb), net))
 					continue;
 
-				sk_for_each_bound_bhash2(sk, &tb2->owners) {
+				sk_for_each_bound(sk, &tb->owners) {
 					struct inet_sock *inet = inet_sk(sk);
 
 					if (num < s_num)
@@ -1096,7 +1096,7 @@ pause_bind_walk:
 					if (res < 0)
 						num = num_arr[idx];
 				}
-				sock_put(sk_arr[idx]);
+				sock_gen_put(sk_arr[idx]);
 			}
 			if (res < 0)
 				goto done;
