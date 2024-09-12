@@ -1,0 +1,228 @@
+mptcp: do not block subflows creation on errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit a88c9e49693759f9eb49dcda6c45a0d32b07634c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/a88c9e49.failed
+
+If the MPTCP configuration allows for multiple subflows
+creation, and the first additional subflows never reach
+the fully established status - e.g. due to packets drop or
+reset - the in kernel path manager do not move to the
+next subflow.
+
+This patch introduces a new PM helper to cope with MPJ
+subflow creation failure and delay and hook it where appropriate.
+
+Such helper triggers additional subflow creation, as needed
+and updates the PM subflow counter, if the current one is
+closing.
+
+Additionally start all the needed additional subflows
+as soon as the MPTCP socket is fully established, so we don't
+have to cope with slow MPJ handshake blocking the next subflow
+creation.
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a88c9e49693759f9eb49dcda6c45a0d32b07634c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/pm_netlink.c
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/pm_netlink.c
+index 91db0ac49364,5efb63ab1fa3..000000000000
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@@ -257,12 -251,17 +257,23 @@@ unsigned int mptcp_pm_get_local_addr_ma
+  }
+  EXPORT_SYMBOL_GPL(mptcp_pm_get_local_addr_max);
+  
+- static void check_work_pending(struct mptcp_sock *msk)
++ bool mptcp_pm_nl_check_work_pending(struct mptcp_sock *msk)
+  {
+++<<<<<<< HEAD
+ +	if (msk->pm.add_addr_signaled == mptcp_pm_get_add_addr_signal_max(msk) &&
+ +	    (msk->pm.local_addr_used == mptcp_pm_get_local_addr_max(msk) ||
+ +	     msk->pm.subflows == mptcp_pm_get_subflows_max(msk)))
+++=======
++ 	struct pm_nl_pernet *pernet = net_generic(sock_net((struct sock *)msk), pm_nl_pernet_id);
++ 
++ 	if (msk->pm.subflows == mptcp_pm_get_subflows_max(msk) ||
++ 	    (find_next_and_bit(pernet->id_bitmap, msk->pm.id_avail_bitmap,
++ 			       MPTCP_PM_MAX_ADDR_ID + 1, 0) == MPTCP_PM_MAX_ADDR_ID + 1)) {
+++>>>>>>> a88c9e496937 (mptcp: do not block subflows creation on errors)
+  		WRITE_ONCE(msk->pm.work_pending, false);
++ 		return false;
++ 	}
++ 	return true;
+  }
+  
+  struct mptcp_pm_add_entry *
+@@@ -476,6 -511,19 +494,22 @@@ static void mptcp_pm_create_subflow_or_
+  	local_addr_max = mptcp_pm_get_local_addr_max(msk);
+  	subflows_max = mptcp_pm_get_subflows_max(msk);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* do lazy endpoint usage accounting for the MPC subflows */
++ 	if (unlikely(!(msk->pm.status & BIT(MPTCP_PM_MPC_ENDPOINT_ACCOUNTED))) && msk->first) {
++ 		struct mptcp_addr_info mpc_addr;
++ 		int mpc_id;
++ 
++ 		local_address((struct sock_common *)msk->first, &mpc_addr);
++ 		mpc_id = lookup_id_by_addr(pernet, &mpc_addr);
++ 		if (mpc_id >= 0)
++ 			__clear_bit(mpc_id, msk->pm.id_avail_bitmap);
++ 
++ 		msk->pm.status |= BIT(MPTCP_PM_MPC_ENDPOINT_ACCOUNTED);
++ 	}
++ 
+++>>>>>>> a88c9e496937 (mptcp: do not block subflows creation on errors)
+  	pr_debug("local %d:%d signal %d:%d subflows %d:%d\n",
+  		 msk->pm.local_addr_used, local_addr_max,
+  		 msk->pm.add_addr_signaled, add_addr_signal_max,
+@@@ -501,28 -544,28 +535,53 @@@
+  	}
+  
+  	/* check if should create a new subflow */
+++<<<<<<< HEAD
+ +	if (msk->pm.local_addr_used < local_addr_max &&
+ +	    msk->pm.subflows < subflows_max) {
+ +		local = select_local_address(pernet, msk);
+ +		if (local) {
+ +			bool fullmesh = !!(local->flags & MPTCP_PM_ADDR_FLAG_FULLMESH);
+ +			struct mptcp_addr_info addrs[MPTCP_PM_ADDR_MAX];
+ +			int i, nr;
+ +
+ +			msk->pm.local_addr_used++;
+ +			check_work_pending(msk);
+ +			nr = fill_remote_addresses_vec(msk, fullmesh, addrs);
+ +			spin_unlock_bh(&msk->pm.lock);
+ +			for (i = 0; i < nr; i++)
+ +				__mptcp_subflow_connect(sk, &local->addr, &addrs[i]);
+ +			spin_lock_bh(&msk->pm.lock);
+ +			return;
+ +		}
+ +
+ +		/* lookup failed, avoid fourther attempts later */
+ +		msk->pm.local_addr_used = local_addr_max;
+ +		check_work_pending(msk);
+ +	}
+++=======
++ 	while (msk->pm.local_addr_used < local_addr_max &&
++ 	       msk->pm.subflows < subflows_max) {
++ 		struct mptcp_addr_info addrs[MPTCP_PM_ADDR_MAX];
++ 		bool fullmesh;
++ 		int i, nr;
++ 
++ 		local = select_local_address(pernet, msk);
++ 		if (!local)
++ 			break;
++ 
++ 		fullmesh = !!(local->flags & MPTCP_PM_ADDR_FLAG_FULLMESH);
++ 
++ 		msk->pm.local_addr_used++;
++ 		nr = fill_remote_addresses_vec(msk, fullmesh, addrs);
++ 		if (nr)
++ 			__clear_bit(local->addr.id, msk->pm.id_avail_bitmap);
++ 		spin_unlock_bh(&msk->pm.lock);
++ 		for (i = 0; i < nr; i++)
++ 			__mptcp_subflow_connect(sk, &local->addr, &addrs[i]);
++ 		spin_lock_bh(&msk->pm.lock);
++ 	}
++ 	mptcp_pm_nl_check_work_pending(msk);
+++>>>>>>> a88c9e496937 (mptcp: do not block subflows creation on errors)
+  }
+  
+  static void mptcp_pm_nl_fully_established(struct mptcp_sock *msk)
+@@@ -689,9 -778,9 +750,8 @@@ static void mptcp_pm_nl_rm_addr_or_subf
+  			spin_lock_bh(&msk->pm.lock);
+  
+  			removed = true;
+- 			msk->pm.subflows--;
+  			__MPTCP_INC_STATS(sock_net(sk), rm_type);
+  		}
+ -		__set_bit(rm_list->ids[1], msk->pm.id_avail_bitmap);
+  		if (!removed)
+  			continue;
+  
+diff --cc net/mptcp/protocol.c
+index 49157b943d15,3e8cfaed00b5..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -2295,7 -2332,13 +2295,17 @@@ void mptcp_close_ssk(struct sock *sk, s
+  {
+  	if (sk->sk_state == TCP_ESTABLISHED)
+  		mptcp_event(MPTCP_EVENT_SUB_CLOSED, mptcp_sk(sk), ssk, GFP_KERNEL);
+++<<<<<<< HEAD
+ +	__mptcp_close_ssk(sk, ssk, subflow);
+++=======
++ 
++ 	/* subflow aborted before reaching the fully_established status
++ 	 * attempt the creation of the next subflow
++ 	 */
++ 	mptcp_pm_subflow_check_next(mptcp_sk(sk), ssk, subflow);
++ 
++ 	__mptcp_close_ssk(sk, ssk, subflow, MPTCP_CF_PUSH);
+++>>>>>>> a88c9e496937 (mptcp: do not block subflows creation on errors)
+  }
+  
+  static unsigned int mptcp_sync_mss(struct sock *sk, u32 pmtu)
+diff --git a/net/mptcp/pm.c b/net/mptcp/pm.c
+index f1b21b1c8ed0..136d696332b1 100644
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@ -172,9 +172,28 @@ void mptcp_pm_subflow_established(struct mptcp_sock *msk)
+ 	spin_unlock_bh(&pm->lock);
+ }
+ 
+-void mptcp_pm_subflow_closed(struct mptcp_sock *msk, u8 id)
++void mptcp_pm_subflow_check_next(struct mptcp_sock *msk, const struct sock *ssk,
++				 const struct mptcp_subflow_context *subflow)
+ {
+-	pr_debug("msk=%p", msk);
++	struct mptcp_pm_data *pm = &msk->pm;
++	bool update_subflows;
++
++	update_subflows = (ssk->sk_state == TCP_CLOSE) &&
++			  (subflow->request_join || subflow->mp_join);
++	if (!READ_ONCE(pm->work_pending) && !update_subflows)
++		return;
++
++	spin_lock_bh(&pm->lock);
++	if (update_subflows)
++		pm->subflows--;
++
++	/* Even if this subflow is not really established, tell the PM to try
++	 * to pick the next ones, if possible.
++	 */
++	if (mptcp_pm_nl_check_work_pending(msk))
++		mptcp_pm_schedule_work(msk, MPTCP_PM_SUBFLOW_ESTABLISHED);
++
++	spin_unlock_bh(&pm->lock);
+ }
+ 
+ void mptcp_pm_add_addr_received(struct mptcp_sock *msk,
+* Unmerged path net/mptcp/pm_netlink.c
+* Unmerged path net/mptcp/protocol.c
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 9fc0155d6c66..46c1dfd4ef99 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -687,7 +687,9 @@ void mptcp_pm_fully_established(struct mptcp_sock *msk, const struct sock *ssk,
+ bool mptcp_pm_allow_new_subflow(struct mptcp_sock *msk);
+ void mptcp_pm_connection_closed(struct mptcp_sock *msk);
+ void mptcp_pm_subflow_established(struct mptcp_sock *msk);
+-void mptcp_pm_subflow_closed(struct mptcp_sock *msk, u8 id);
++bool mptcp_pm_nl_check_work_pending(struct mptcp_sock *msk);
++void mptcp_pm_subflow_check_next(struct mptcp_sock *msk, const struct sock *ssk,
++				 const struct mptcp_subflow_context *subflow);
+ void mptcp_pm_add_addr_received(struct mptcp_sock *msk,
+ 				const struct mptcp_addr_info *addr);
+ void mptcp_pm_add_addr_echoed(struct mptcp_sock *msk,
