@@ -1,0 +1,145 @@
+mm/hugetlb: add dedicated func to get 'allowed' nodemask for current process
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-487.el8
+commit-author Feng Tang <feng.tang@intel.com>
+commit d2226ebd5484afcf9f9b71b394ec1567a7730eb1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-487.el8/d2226ebd.failed
+
+Muchun Song found that after MPOL_PREFERRED_MANY policy was introduced in
+commit b27abaccf8e8 ("mm/mempolicy: add MPOL_PREFERRED_MANY for multiple
+preferred nodes"), the policy_nodemask_current()'s semantics for this new
+policy has been changed, which returns 'preferred' nodes instead of
+'allowed' nodes.
+
+With the changed semantic of policy_nodemask_current, a task with
+MPOL_PREFERRED_MANY policy could fail to get its reservation even though
+it can fall back to other nodes (either defined by cpusets or all online
+nodes) for that reservation failing mmap calles unnecessarily early.
+
+The fix is to not consider MPOL_PREFERRED_MANY for reservations at all
+because they, unlike MPOL_MBIND, do not pose any actual hard constrain.
+
+Michal suggested the policy_nodemask_current() is only used by hugetlb,
+and could be moved to hugetlb code with more explicit name to enforce the
+'allowed' semantics for which only MPOL_BIND policy matters.
+
+apply_policy_zone() is made extern to be called in hugetlb code and its
+return value is changed to bool.
+
+[1]. https://lore.kernel.org/lkml/20220801084207.39086-1-songmuchun@bytedance.com/t/
+
+Link: https://lkml.kernel.org/r/20220805005903.95563-1-feng.tang@intel.com
+Fixes: b27abaccf8e8 ("mm/mempolicy: add MPOL_PREFERRED_MANY for multiple preferred nodes")
+	Signed-off-by: Feng Tang <feng.tang@intel.com>
+	Reported-by: Muchun Song <songmuchun@bytedance.com>
+	Suggested-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Reviewed-by: Muchun Song <songmuchun@bytedance.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Ben Widawsky <bwidawsk@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit d2226ebd5484afcf9f9b71b394ec1567a7730eb1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mempolicy.h
+diff --cc include/linux/mempolicy.h
+index e553c56f6be7,d232de7cdc56..000000000000
+--- a/include/linux/mempolicy.h
++++ b/include/linux/mempolicy.h
+@@@ -214,6 -177,13 +207,16 @@@ static inline bool vma_migratable(struc
+  extern int mpol_misplaced(struct page *, struct vm_area_struct *, unsigned long);
+  extern void mpol_put_task_policy(struct task_struct *);
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool mpol_is_preferred_many(struct mempolicy *pol)
++ {
++ 	return  (pol->mode == MPOL_PREFERRED_MANY);
++ }
++ 
++ extern bool apply_policy_zone(struct mempolicy *policy, enum zone_type zone);
++ 
+++>>>>>>> d2226ebd5484 (mm/hugetlb: add dedicated func to get 'allowed' nodemask for current process)
+  #else
+  
+  struct mempolicy {};
+@@@ -318,9 -288,10 +321,17 @@@ static inline void mpol_put_task_policy
+  {
+  }
+  
+++<<<<<<< HEAD
+ +static inline nodemask_t *policy_nodemask_current(gfp_t gfp)
+ +{
+ +	return NULL;
+ +}
+++=======
++ static inline bool mpol_is_preferred_many(struct mempolicy *pol)
++ {
++ 	return  false;
++ }
++ 
+++>>>>>>> d2226ebd5484 (mm/hugetlb: add dedicated func to get 'allowed' nodemask for current process)
+  #endif /* CONFIG_NUMA */
+  #endif
+* Unmerged path include/linux/mempolicy.h
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index c02becfcdb0d..a5d9f95fe42c 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -3445,18 +3445,34 @@ static int __init default_hugepagesz_setup(char *s)
+ }
+ __setup("default_hugepagesz=", default_hugepagesz_setup);
+ 
++static nodemask_t *policy_mbind_nodemask(gfp_t gfp)
++{
++#ifdef CONFIG_NUMA
++	struct mempolicy *mpol = get_task_policy(current);
++
++	/*
++	 * Only enforce MPOL_BIND policy which overlaps with cpuset policy
++	 * (from policy_nodemask) specifically for hugetlb case
++	 */
++	if (mpol->mode == MPOL_BIND &&
++		(apply_policy_zone(mpol, gfp_zone(gfp)) &&
++		 cpuset_nodemask_valid_mems_allowed(&mpol->nodes)))
++		return &mpol->nodes;
++#endif
++	return NULL;
++}
++
+ static unsigned int allowed_mems_nr(struct hstate *h)
+ {
+ 	int node;
+ 	unsigned int nr = 0;
+-	nodemask_t *mpol_allowed;
++	nodemask_t *mbind_nodemask;
+ 	unsigned int *array = h->free_huge_pages_node;
+ 	gfp_t gfp_mask = htlb_alloc_mask(h);
+ 
+-	mpol_allowed = policy_nodemask_current(gfp_mask);
+-
++	mbind_nodemask = policy_mbind_nodemask(gfp_mask);
+ 	for_each_node_mask(node, cpuset_current_mems_allowed) {
+-		if (!mpol_allowed || node_isset(node, *mpol_allowed))
++		if (!mbind_nodemask || node_isset(node, *mbind_nodemask))
+ 			nr += array[node];
+ 	}
+ 
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index cac6addbd083..d75d2c74966b 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -1806,7 +1806,7 @@ bool vma_policy_mof(struct vm_area_struct *vma)
+ 	return pol->flags & MPOL_F_MOF;
+ }
+ 
+-static int apply_policy_zone(struct mempolicy *policy, enum zone_type zone)
++bool apply_policy_zone(struct mempolicy *policy, enum zone_type zone)
+ {
+ 	enum zone_type dynamic_policy_zone = policy_zone;
+ 
