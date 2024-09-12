@@ -1,0 +1,198 @@
+mm: vmscan: make rotations a secondary factor in balancing anon vs file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 0538a82c39e94d49fa6985c6a0101ca819be11ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/0538a82c.failed
+
+We noticed a 2% webserver throughput regression after upgrading from 5.6. 
+This could be tracked down to a shift in the anon/file reclaim balance
+(confirmed with swappiness) that resulted in worse reclaim efficiency and
+thus more kswapd activity for the same outcome.
+
+The change that exposed the problem is aae466b0052e ("mm/swap: implement
+workingset detection for anonymous LRU").  By qualifying swapins based on
+their refault distance, it lowered the cost of anon reclaim in this
+workload, in turn causing (much) more anon scanning than before.  Scanning
+the anon list is more expensive due to the higher ratio of mmapped pages
+that may rotate during reclaim, and so the result was an increase in %sys
+time.
+
+Right now, rotations aren't considered a cost when balancing scan pressure
+between LRUs.  We can end up with very few file refaults putting all the
+scan pressure on hot anon pages that are rotated en masse, don't get
+reclaimed, and never push back on the file LRU again.  We still only
+reclaim file cache in that case, but we burn a lot CPU rotating anon
+pages.  It's "fair" from an LRU age POV, but doesn't reflect the real cost
+it imposes on the system.
+
+Consider rotations as a secondary factor in balancing the LRUs.  This
+doesn't attempt to make a precise comparison between IO cost and CPU cost,
+it just says: if reloads are about comparable between the lists, or
+rotations are overwhelmingly different, adjust for CPU work.
+
+This fixed the regression on our webservers.  It has since been deployed
+to the entire Meta fleet and hasn't caused any problems.
+
+Link: https://lkml.kernel.org/r/20221013193113.726425-1-hannes@cmpxchg.org
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Rik van Riel <riel@surriel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 0538a82c39e94d49fa6985c6a0101ca819be11ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/swap.h
+#	mm/swap.c
+#	mm/vmscan.c
+#	mm/workingset.c
+diff --cc include/linux/swap.h
+index 5f51ae805ed3,369d7799205d..000000000000
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@@ -325,11 -384,28 +325,36 @@@ extern unsigned long nr_free_pagecache_
+  
+  
+  /* linux/mm/swap.c */
+++<<<<<<< HEAD
+ +extern void lru_note_cost(struct lruvec *lruvec, bool file,
+ +			  unsigned int nr_pages);
+ +extern void lru_note_cost_page(struct page *);
+ +extern void lru_cache_add(struct page *);
+ +extern void mark_page_accessed(struct page *);
+++=======
++ void lru_note_cost(struct lruvec *lruvec, bool file,
++ 		   unsigned int nr_io, unsigned int nr_rotated);
++ void lru_note_cost_refault(struct folio *);
++ void folio_add_lru(struct folio *);
++ void folio_add_lru_vma(struct folio *, struct vm_area_struct *);
++ void lru_cache_add(struct page *);
++ void mark_page_accessed(struct page *);
++ void folio_mark_accessed(struct folio *);
++ 
++ extern atomic_t lru_disable_count;
++ 
++ static inline bool lru_cache_disabled(void)
++ {
++ 	return atomic_read(&lru_disable_count);
++ }
++ 
++ static inline void lru_cache_enable(void)
++ {
++ 	atomic_dec(&lru_disable_count);
++ }
++ 
++ extern void lru_cache_disable(void);
+++>>>>>>> 0538a82c39e9 (mm: vmscan: make rotations a secondary factor in balancing anon vs file)
+  extern void lru_add_drain(void);
+  extern void lru_add_drain_cpu(int cpu);
+  extern void lru_add_drain_cpu_zone(struct zone *zone);
+diff --cc mm/swap.c
+index 2d512d09898b,2f12a2ee1d3a..000000000000
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@@ -289,21 -347,21 +301,28 @@@ void lru_note_cost(struct lruvec *lruve
+  	} while ((lruvec = parent_lruvec(lruvec)));
+  }
+  
+++<<<<<<< HEAD
+ +void lru_note_cost_page(struct page *page)
+ +{
+ +	lru_note_cost(mem_cgroup_page_lruvec(page),
+ +		      page_is_file_lru(page), thp_nr_pages(page));
+++=======
++ void lru_note_cost_refault(struct folio *folio)
++ {
++ 	lru_note_cost(folio_lruvec(folio), folio_is_file_lru(folio),
++ 		      folio_nr_pages(folio), 0);
+++>>>>>>> 0538a82c39e9 (mm: vmscan: make rotations a secondary factor in balancing anon vs file)
+  }
+  
+ -static void folio_activate_fn(struct lruvec *lruvec, struct folio *folio)
+ +static void __activate_page(struct page *page, struct lruvec *lruvec)
+  {
+ -	if (!folio_test_active(folio) && !folio_test_unevictable(folio)) {
+ -		long nr_pages = folio_nr_pages(folio);
+ +	if (!PageActive(page) && !PageUnevictable(page)) {
+ +		int nr_pages = thp_nr_pages(page);
+  
+ -		lruvec_del_folio(lruvec, folio);
+ -		folio_set_active(folio);
+ -		lruvec_add_folio(lruvec, folio);
+ -		trace_mm_lru_activate(folio);
+ +		del_page_from_lru_list(page, lruvec);
+ +		SetPageActive(page);
+ +		add_page_to_lru_list(page, lruvec);
+ +		trace_mm_lru_activate(page);
+  
+  		__count_vm_events(PGACTIVATE, nr_pages);
+  		__count_memcg_events(lruvec_memcg(lruvec), PGACTIVATE,
+diff --cc mm/vmscan.c
+index 11f514f4fcf5,ffe402e095d3..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -2326,17 -2499,17 +2326,23 @@@ shrink_inactive_list(unsigned long nr_t
+  	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
+  	spin_unlock_irq(&lruvec->lru_lock);
+  
+++<<<<<<< HEAD
+ +	lru_note_cost(lruvec, file, stat.nr_pageout);
+ +	mem_cgroup_uncharge_list(&page_list);
+ +	free_unref_page_list(&page_list);
+++=======
++ 	lru_note_cost(lruvec, file, stat.nr_pageout, nr_scanned - nr_reclaimed);
++ 	mem_cgroup_uncharge_list(&folio_list);
++ 	free_unref_page_list(&folio_list);
+++>>>>>>> 0538a82c39e9 (mm: vmscan: make rotations a secondary factor in balancing anon vs file)
+  
+  	/*
+ -	 * If dirty folios are scanned that are not queued for IO, it
+ +	 * If dirty pages are scanned that are not queued for IO, it
+  	 * implies that flushers are not doing their job. This can
+ -	 * happen when memory pressure pushes dirty folios to the end of
+ +	 * happen when memory pressure pushes dirty pages to the end of
+  	 * the LRU before the dirty limits are breached and the dirty
+  	 * data has expired. It can also happen when the proportion of
+ -	 * dirty folios grows not through writes but through memory
+ +	 * dirty pages grows not through writes but through memory
+  	 * pressure reclaiming all the clean cache. And in some cases,
+  	 * the flushers simply cannot keep up with the allocation
+  	 * rate. Nudge the flusher threads in case they are asleep.
+diff --cc mm/workingset.c
+index 2ad3de738d84,d2d02978588c..000000000000
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@@ -373,16 -485,16 +373,21 @@@ void workingset_refault(struct page *pa
+  	if (refault_distance > workingset_size)
+  		goto out;
+  
+ -	folio_set_active(folio);
+ -	workingset_age_nonresident(lruvec, nr);
+ -	mod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + file, nr);
+ +	SetPageActive(page);
+ +	workingset_age_nonresident(lruvec, thp_nr_pages(page));
+ +	inc_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + file);
+  
+ -	/* Folio was active prior to eviction */
+ +	/* Page was active prior to eviction */
+  	if (workingset) {
+ -		folio_set_workingset(folio);
+ +		SetPageWorkingset(page);
+  		/* XXX: Move to lru_cache_add() when it supports new vs putback */
+++<<<<<<< HEAD
+ +		lru_note_cost_page(page);
+ +		inc_lruvec_state(lruvec, WORKINGSET_RESTORE_BASE + file);
+++=======
++ 		lru_note_cost_refault(folio);
++ 		mod_lruvec_state(lruvec, WORKINGSET_RESTORE_BASE + file, nr);
+++>>>>>>> 0538a82c39e9 (mm: vmscan: make rotations a secondary factor in balancing anon vs file)
+  	}
+  out:
+  	rcu_read_unlock();
+* Unmerged path include/linux/swap.h
+* Unmerged path mm/swap.c
+* Unmerged path mm/vmscan.c
+* Unmerged path mm/workingset.c
