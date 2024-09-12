@@ -222,13 +222,17 @@ def parse_tests(request: KunitParseRequest, input_data: Iterable[str]) -> KunitR
 	parse_end = time.time()
 
 	if request.json:
-		json_obj = kunit_json.get_json_result(
+		json_str = kunit_json.get_json_result(
 					test=test_result,
 					def_config='kunit_defconfig',
-					build_dir=request.build_dir,
-					json_path=request.json)
+					build_dir=request.build_dir)
 		if request.json == 'stdout':
-			print(json_obj)
+			print(json_str)
+		else:
+			with open(request.json, 'w') as f:
+				f.write(json_str)
+			kunit_parser.print_with_timestamp("Test results stored in %s" %
+				os.path.abspath(request.json))
 
 	if test_result.status != kunit_parser.TestStatus.SUCCESS:
 		return KunitResult(KunitStatus.TEST_FAILURE, test_result,
