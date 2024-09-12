@@ -1,0 +1,137 @@
+KVM: arm64: Don't retrieve memory slot again in page fault handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Gavin Shan <gshan@redhat.com>
+commit 10ba2d17d2972926c60e01dace6d7a3f8d968c4f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/10ba2d17.failed
+
+We needn't retrieve the memory slot again in user_mem_abort() because
+the corresponding memory slot has been passed from the caller. This
+would save some CPU cycles. For example, the time used to write 1GB
+memory, which is backed by 2MB hugetlb pages and write-protected, is
+dropped by 6.8% from 928ms to 864ms.
+
+	Signed-off-by: Gavin Shan <gshan@redhat.com>
+	Reviewed-by: Keqian Zhu <zhukeqian1@huawei.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/20210316041126.81860-4-gshan@redhat.com
+(cherry picked from commit 10ba2d17d2972926c60e01dace6d7a3f8d968c4f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kvm/mmu.c
+diff --cc arch/arm64/kvm/mmu.c
+index aeda0db193c0,2491b40a294a..000000000000
+--- a/arch/arm64/kvm/mmu.c
++++ b/arch/arm64/kvm/mmu.c
+@@@ -1735,9 -840,13 +1735,13 @@@ static int user_mem_abort(struct kvm_vc
+  	 * gfn_to_pfn_prot (which calls get_user_pages), so that we don't risk
+  	 * the page we just got a reference to gets unmapped before we have a
+  	 * chance to grab the mmu_lock, which ensure that if the page gets
+ -	 * unmapped afterwards, the call to kvm_unmap_hva will take it away
+ +	 * unmapped afterwards, the call to kvm_unmap_gfn will take it away
+  	 * from us again properly. This smp_rmb() interacts with the smp_wmb()
+  	 * in kvm_mmu_notifier_invalidate_<page|range_end>.
++ 	 *
++ 	 * Besides, __gfn_to_pfn_memslot() instead of gfn_to_pfn_prot() is
++ 	 * used to avoid unnecessary overhead introduced to locate the memory
++ 	 * slot because it's always fixed even @gfn is adjusted for huge pages.
+  	 */
+  	smp_rmb();
+  
+@@@ -1784,66 -886,38 +1789,73 @@@
+  		vma_pagesize = transparent_hugepage_adjust(memslot, hva,
+  							   &pfn, &fault_ipa);
+  	if (writable)
+ -		prot |= KVM_PGTABLE_PROT_W;
+ +		kvm_set_pfn_dirty(pfn);
+  
+ -	if (fault_status != FSC_PERM && !device)
+ +	if (fault_status != FSC_PERM && !is_iomap(flags))
+  		clean_dcache_guest_page(pfn, vma_pagesize);
+  
+ -	if (exec_fault) {
+ -		prot |= KVM_PGTABLE_PROT_X;
+ +	if (exec_fault)
+  		invalidate_icache_guest_page(pfn, vma_pagesize);
+ -	}
+  
+ -	if (device)
+ -		prot |= KVM_PGTABLE_PROT_DEVICE;
+ -	else if (cpus_have_const_cap(ARM64_HAS_CACHE_DIC))
+ -		prot |= KVM_PGTABLE_PROT_X;
+ +	/*
+ +	 * If we took an execution fault we have made the
+ +	 * icache/dcache coherent above and should now let the s2
+ +	 * mapping be executable.
+ +	 *
+ +	 * Write faults (!exec_fault && FSC_PERM) are orthogonal to
+ +	 * execute permissions, and we preserve whatever we have.
+ +	 */
+ +	needs_exec = exec_fault ||
+ +		(fault_status == FSC_PERM &&
+ +		 stage2_is_exec(kvm, fault_ipa, vma_pagesize));
+  
+++<<<<<<< HEAD
+  	/*
+ -	 * Under the premise of getting a FSC_PERM fault, we just need to relax
+ -	 * permissions only if vma_pagesize equals fault_granule. Otherwise,
+ -	 * kvm_pgtable_stage2_map() should be called to change block size.
+ +	 * If PUD_SIZE == PMD_SIZE, there is no real PUD level, and
+ +	 * all we have is a 2-level page table. Trying to map a PUD in
+ +	 * this case would be fatally wrong.
+  	 */
+ -	if (fault_status == FSC_PERM && vma_pagesize == fault_granule) {
+ -		ret = kvm_pgtable_stage2_relax_perms(pgt, fault_ipa, prot);
+ +	if (PUD_SIZE != PMD_SIZE && vma_pagesize == PUD_SIZE) {
+ +		pud_t new_pud = kvm_pfn_pud(pfn, mem_type);
+ +
+ +		new_pud = kvm_pud_mkhuge(new_pud);
+ +		if (writable)
+ +			new_pud = kvm_s2pud_mkwrite(new_pud);
+ +
+ +		if (needs_exec)
+ +			new_pud = kvm_s2pud_mkexec(new_pud);
+ +
+ +		ret = stage2_set_pud_huge(kvm, memcache, fault_ipa, &new_pud);
+ +	} else if (vma_pagesize == PMD_SIZE) {
+ +		pmd_t new_pmd = kvm_pfn_pmd(pfn, mem_type);
+ +
+ +		new_pmd = kvm_pmd_mkhuge(new_pmd);
+ +
+ +		if (writable)
+ +			new_pmd = kvm_s2pmd_mkwrite(new_pmd);
+ +
+ +		if (needs_exec)
+ +			new_pmd = kvm_s2pmd_mkexec(new_pmd);
+ +
+ +		ret = stage2_set_pmd_huge(kvm, memcache, fault_ipa, &new_pmd);
+  	} else {
+ -		ret = kvm_pgtable_stage2_map(pgt, fault_ipa, vma_pagesize,
+ -					     __pfn_to_phys(pfn), prot,
+ -					     memcache);
+ -	}
+ +		pte_t new_pte = kvm_pfn_pte(pfn, mem_type);
+ +
+ +		if (writable) {
+ +			new_pte = kvm_s2pte_mkwrite(new_pte);
+ +			mark_page_dirty(kvm, gfn);
+ +		}
+ +
+ +		if (needs_exec)
+ +			new_pte = kvm_s2pte_mkexec(new_pte);
+  
+ +		ret = stage2_set_pte(kvm, memcache, fault_ipa, &new_pte, flags);
+++=======
++ 	/* Mark the page dirty only if the fault is handled successfully */
++ 	if (writable && !ret) {
++ 		kvm_set_pfn_dirty(pfn);
++ 		mark_page_dirty_in_slot(kvm, memslot, gfn);
+++>>>>>>> 10ba2d17d297 (KVM: arm64: Don't retrieve memory slot again in page fault handler)
+  	}
+  
+  out_unlock:
+* Unmerged path arch/arm64/kvm/mmu.c
