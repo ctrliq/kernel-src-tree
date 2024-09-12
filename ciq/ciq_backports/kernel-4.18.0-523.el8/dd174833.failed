@@ -1,0 +1,95 @@
+s390/vfio-ap: remove upper limit on wait for queue reset to complete
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-523.el8
+commit-author Tony Krowiak <akrowiak@linux.ibm.com>
+commit dd174833e44e7717f88f0925b1f78e9ba1d2626e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-523.el8/dd174833.failed
+
+The architecture does not define an upper limit on how long a queue reset
+(RAPQ/ZAPQ) can take to complete. In order to ensure both the security
+requirements and prevent resource leakage and corruption in the hypervisor,
+it is necessary to remove the upper limit (200ms) the vfio_ap driver
+currently waits for a reset to complete. This, of course, may result in a
+hang which is a less than desirable user experience, but until a firmware
+solution is provided, this is a necessary evil.
+
+	Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Reviewed-by: Jason J. Herne <jjherne@linux.ibm.com>
+	Acked-by: Halil Pasic <pasic@linux.ibm.com>
+	Tested-by: Viktor Mihajlovski <mihajlov@linux.ibm.com>
+Link: https://lore.kernel.org/r/20230815184333.6554-6-akrowiak@linux.ibm.com
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit dd174833e44e7717f88f0925b1f78e9ba1d2626e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/vfio_ap_ops.c
+diff --cc drivers/s390/crypto/vfio_ap_ops.c
+index ef0d06898296,2517868aad56..000000000000
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@@ -1576,15 -1665,10 +1603,11 @@@ static int apq_reset_check(struct vfio_
+  	return ret;
+  }
+  
+ -static int vfio_ap_mdev_reset_queue(struct vfio_ap_queue *q)
+ +static int vfio_ap_mdev_reset_queue(struct vfio_ap_queue *q,
+ +				    unsigned int retry)
+  {
+  	struct ap_queue_status status;
+- 	int ret;
++ 	int ret = 0;
+  
+  	if (!q)
+  		return 0;
+@@@ -1593,29 -1676,22 +1615,46 @@@
+  	q->reset_rc = status.response_code;
+  	switch (status.response_code) {
+  	case AP_RESPONSE_NORMAL:
+++<<<<<<< HEAD
+ +		ret = 0;
+ +		/* if the reset has not completed, wait for it to take effect */
+ +		if (!status.queue_empty || status.irq_enabled)
+ +			ret = apq_reset_check(q);
+ +		break;
+ +	case AP_RESPONSE_RESET_IN_PROGRESS:
+ +		if (retry--) {
+ +			msleep(20);
+ +			goto retry_zapq;
+ +		}
+ +		ret = -EBUSY;
+++=======
++ 	case AP_RESPONSE_RESET_IN_PROGRESS:
++ 	case AP_RESPONSE_BUSY:
++ 		/* Let's verify whether the ZAPQ completed successfully */
++ 		ret = apq_reset_check(q);
++ 		break;
++ 	case AP_RESPONSE_DECONFIGURED:
++ 		/*
++ 		 * When an AP adapter is deconfigured, the associated
++ 		 * queues are reset, so let's set the status response code to 0
++ 		 * so the queue may be passed through (i.e., not filtered) and
++ 		 * return a value indicating the reset completed successfully.
++ 		 */
++ 		q->reset_rc = 0;
++ 		vfio_ap_free_aqic_resources(q);
+++>>>>>>> dd174833e44e (s390/vfio-ap: remove upper limit on wait for queue reset to complete)
+  		break;
+ +	case AP_RESPONSE_Q_NOT_AVAIL:
+ +	case AP_RESPONSE_DECONFIGURED:
+ +	case AP_RESPONSE_CHECKSTOPPED:
+ +		WARN_ONCE(status.irq_enabled,
+ +			  "PQAP/ZAPQ for %02x.%04x failed with rc=%u while IRQ enabled",
+ +			  AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn),
+ +			  status.response_code);
+ +		ret = -EBUSY;
+ +		goto free_resources;
+  	default:
+ +		/* things are really broken, give up */
+  		WARN(true,
+  		     "PQAP/ZAPQ for %02x.%04x failed with invalid rc=%u\n",
+  		     AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn),
+* Unmerged path drivers/s390/crypto/vfio_ap_ops.c
