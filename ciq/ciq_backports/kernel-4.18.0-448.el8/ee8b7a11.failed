@@ -1,0 +1,539 @@
+net: make drivers set the TSO limit not the GSO limit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit ee8b7a1156f357613646d6c69d07ac5a087a1071
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/ee8b7a11.failed
+
+Drivers should call the TSO setting helper, GSO is controllable
+by user space.
+
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ee8b7a1156f357613646d6c69d07ac5a087a1071)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+#	drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+#	drivers/net/usb/ax88179_178a.c
+#	drivers/net/usb/lan78xx.c
+#	net/core/dev.c
+diff --cc drivers/net/usb/ax88179_178a.c
+index a4896f396c7c,7a8c11a26eb5..000000000000
+--- a/drivers/net/usb/ax88179_178a.c
++++ b/drivers/net/usb/ax88179_178a.c
+@@@ -1387,11 -1377,12 +1387,17 @@@ static int ax88179_bind(struct usbnet *
+  	dev->mii.phy_id = 0x03;
+  	dev->mii.supports_gmii = 1;
+  
+ -	dev->net->features |= NETIF_F_SG | NETIF_F_IP_CSUM |
+ -			      NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM | NETIF_F_TSO;
+ +	dev->net->features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
+ +			      NETIF_F_RXCSUM;
+  
+++<<<<<<< HEAD
+ +	dev->net->hw_features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
+ +				 NETIF_F_RXCSUM;
+++=======
++ 	dev->net->hw_features |= dev->net->features;
++ 
++ 	netif_set_tso_max_size(dev->net, 16384);
+++>>>>>>> ee8b7a1156f3 (net: make drivers set the TSO limit not the GSO limit)
+  
+  	/* Enable checksum offload */
+  	*tmp = AX_RXCOE_IP | AX_RXCOE_TCP | AX_RXCOE_UDP |
+diff --cc drivers/net/usb/lan78xx.c
+index f311372359fd,636a405844c5..000000000000
+--- a/drivers/net/usb/lan78xx.c
++++ b/drivers/net/usb/lan78xx.c
+@@@ -3658,12 -4351,31 +3658,35 @@@ static int lan78xx_probe(struct usb_int
+  
+  	skb_queue_head_init(&dev->rxq);
+  	skb_queue_head_init(&dev->txq);
+ -	skb_queue_head_init(&dev->rxq_done);
+ +	skb_queue_head_init(&dev->done);
+ +	skb_queue_head_init(&dev->rxq_pause);
+  	skb_queue_head_init(&dev->txq_pend);
+ -	skb_queue_head_init(&dev->rxq_overflow);
+  	mutex_init(&dev->phy_mutex);
+++<<<<<<< HEAD
+++=======
++ 	mutex_init(&dev->dev_mutex);
++ 
++ 	ret = lan78xx_urb_config_init(dev);
++ 	if (ret < 0)
++ 		goto out2;
++ 
++ 	ret = lan78xx_alloc_tx_resources(dev);
++ 	if (ret < 0)
++ 		goto out2;
++ 
++ 	ret = lan78xx_alloc_rx_resources(dev);
++ 	if (ret < 0)
++ 		goto out3;
++ 
++ 	/* MTU range: 68 - 9000 */
++ 	netdev->max_mtu = MAX_SINGLE_PACKET_SIZE;
++ 
++ 	netif_set_tso_max_size(netdev, LAN78XX_TSO_SIZE(dev));
++ 
++ 	netif_napi_add(netdev, &dev->napi, lan78xx_poll, NAPI_POLL_WEIGHT);
+++>>>>>>> ee8b7a1156f3 (net: make drivers set the TSO limit not the GSO limit)
+  
+ +	tasklet_init(&dev->bh, lan78xx_bh, (unsigned long)dev);
+  	INIT_DELAYED_WORK(&dev->wq, lan78xx_delayedwork);
+  	init_usb_anchor(&dev->deferred);
+  
+diff --cc net/core/dev.c
+index 60f0f5f733c1,f036ccb61da4..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -3072,10 -2993,55 +3072,58 @@@ undo_rx
+  EXPORT_SYMBOL(netif_set_real_num_queues);
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * netif_set_tso_max_size() - set the max size of TSO frames supported
++  * @dev:	netdev to update
++  * @size:	max skb->len of a TSO frame
++  *
++  * Set the limit on the size of TSO super-frames the device can handle.
++  * Unless explicitly set the stack will assume the value of %GSO_MAX_SIZE.
++  */
++ void netif_set_tso_max_size(struct net_device *dev, unsigned int size)
++ {
++ 	dev->tso_max_size = size;
++ 	if (size < READ_ONCE(dev->gso_max_size))
++ 		netif_set_gso_max_size(dev, size);
++ }
++ EXPORT_SYMBOL(netif_set_tso_max_size);
++ 
++ /**
++  * netif_set_tso_max_segs() - set the max number of segs supported for TSO
++  * @dev:	netdev to update
++  * @segs:	max number of TCP segments
++  *
++  * Set the limit on the number of TCP segments the device can generate from
++  * a single TSO super-frame.
++  * Unless explicitly set the stack will assume the value of %GSO_MAX_SEGS.
++  */
++ void netif_set_tso_max_segs(struct net_device *dev, unsigned int segs)
++ {
++ 	dev->tso_max_segs = segs;
++ 	if (segs < READ_ONCE(dev->gso_max_segs))
++ 		netif_set_gso_max_segs(dev, segs);
++ }
++ EXPORT_SYMBOL(netif_set_tso_max_segs);
++ 
++ /**
++  * netif_inherit_tso_max() - copy all TSO limits from a lower device to an upper
++  * @to:		netdev to update
++  * @from:	netdev from which to copy the limits
++  */
++ void netif_inherit_tso_max(struct net_device *to, const struct net_device *from)
++ {
++ 	netif_set_tso_max_size(to, from->tso_max_size);
++ 	netif_set_tso_max_segs(to, from->tso_max_segs);
++ }
++ EXPORT_SYMBOL(netif_inherit_tso_max);
++ 
++ /**
+++>>>>>>> ee8b7a1156f3 (net: make drivers set the TSO limit not the GSO limit)
+   * netif_get_num_default_rss_queues - default number of RSS queues
+   *
+ - * Default value is the number of physical cores if there are only 1 or 2, or
+ - * divided by 2 if there are more.
+ + * This routine should set an upper limit on the number of RSS queues
+ + * used by default by multiqueue devices.
+   */
+  int netif_get_num_default_rss_queues(void)
+  {
+* Unmerged path drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+* Unmerged path drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index 6d9784fc7b53..aa728ba9d32a 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -1398,8 +1398,8 @@ static void bond_compute_features(struct bonding *bond)
+ 	struct list_head *iter;
+ 	struct slave *slave;
+ 	unsigned short max_hard_header_len = ETH_HLEN;
+-	unsigned int gso_max_size = GSO_MAX_SIZE;
+-	u16 gso_max_segs = GSO_MAX_SEGS;
++	unsigned int tso_max_size = TSO_MAX_SIZE;
++	u16 tso_max_segs = TSO_MAX_SEGS;
+ 
+ 	if (!bond_has_slaves(bond))
+ 		goto done;
+@@ -1428,8 +1428,8 @@ static void bond_compute_features(struct bonding *bond)
+ 		if (slave->dev->hard_header_len > max_hard_header_len)
+ 			max_hard_header_len = slave->dev->hard_header_len;
+ 
+-		gso_max_size = min(gso_max_size, slave->dev->gso_max_size);
+-		gso_max_segs = min(gso_max_segs, slave->dev->gso_max_segs);
++		tso_max_size = min(tso_max_size, slave->dev->tso_max_size);
++		tso_max_segs = min(tso_max_segs, slave->dev->tso_max_segs);
+ 	}
+ 	bond_dev->hard_header_len = max_hard_header_len;
+ 
+@@ -1442,8 +1442,8 @@ static void bond_compute_features(struct bonding *bond)
+ 	bond_dev->hw_enc_features |= xfrm_features;
+ #endif /* CONFIG_XFRM_OFFLOAD */
+ 	bond_dev->mpls_features = mpls_features;
+-	netif_set_gso_max_segs(bond_dev, gso_max_segs);
+-	netif_set_gso_max_size(bond_dev, gso_max_size);
++	netif_set_tso_max_segs(bond_dev, tso_max_segs);
++	netif_set_tso_max_size(bond_dev, tso_max_size);
+ 
+ 	bond_dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
+ 	if ((bond_dev->priv_flags & IFF_XMIT_DST_RELEASE_PERM) &&
+diff --git a/drivers/net/ethernet/atheros/atl1e/atl1e_main.c b/drivers/net/ethernet/atheros/atl1e/atl1e_main.c
+index 616f21059d94..0a8c903be2c5 100644
+--- a/drivers/net/ethernet/atheros/atl1e/atl1e_main.c
++++ b/drivers/net/ethernet/atheros/atl1e/atl1e_main.c
+@@ -2401,7 +2401,7 @@ static int atl1e_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 
+ 	INIT_WORK(&adapter->reset_task, atl1e_reset_task);
+ 	INIT_WORK(&adapter->link_chg_task, atl1e_link_chg_task);
+-	netif_set_gso_max_size(netdev, MAX_TSO_SEG_SIZE);
++	netif_set_tso_max_size(netdev, MAX_TSO_SEG_SIZE);
+ 	err = register_netdev(netdev);
+ 	if (err) {
+ 		netdev_err(netdev, "register netdevice failed\n");
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_main.c b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+index 135a8c204230..5686868d4ff6 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+@@ -3512,7 +3512,7 @@ static int setup_nic_devices(struct octeon_device *octeon_dev)
+ 					      | NETIF_F_TSO | NETIF_F_TSO6
+ 					      | NETIF_F_LRO;
+ 		}
+-		netif_set_gso_max_size(netdev, OCTNIC_GSO_MAX_SIZE);
++		netif_set_tso_max_size(netdev, OCTNIC_GSO_MAX_SIZE);
+ 
+ 		/*  Copy of transmit encapsulation capabilities:
+ 		 *  TSO, TSO6, Checksums for this device
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+index a2925a6ccf3a..8d1a46740ca2 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+@@ -2077,7 +2077,7 @@ static int setup_nic_devices(struct octeon_device *octeon_dev)
+ 				      | NETIF_F_TSO | NETIF_F_TSO6
+ 				      | NETIF_F_GRO
+ 				      | NETIF_F_LRO;
+-		netif_set_gso_max_size(netdev, OCTNIC_GSO_MAX_SIZE);
++		netif_set_tso_max_size(netdev, OCTNIC_GSO_MAX_SIZE);
+ 
+ 		/* Copy of transmit encapsulation capabilities:
+ 		 * TSO, TSO6, Checksums for this device
+diff --git a/drivers/net/ethernet/emulex/benet/be_main.c b/drivers/net/ethernet/emulex/benet/be_main.c
+index df2e15abf150..e56de55e9bc7 100644
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@ -5215,7 +5215,7 @@ static void be_netdev_init(struct net_device *netdev)
+ 
+ 	netdev->flags |= IFF_MULTICAST;
+ 
+-	netif_set_gso_max_size(netdev, BE_MAX_GSO_SIZE - ETH_HLEN);
++	netif_set_tso_max_size(netdev, BE_MAX_GSO_SIZE - ETH_HLEN);
+ 
+ 	netdev->netdev_ops = &be_netdev_ops;
+ 
+diff --git a/drivers/net/ethernet/freescale/fec_main.c b/drivers/net/ethernet/freescale/fec_main.c
+index 3a1e60d8aef0..f9e2de17133d 100644
+--- a/drivers/net/ethernet/freescale/fec_main.c
++++ b/drivers/net/ethernet/freescale/fec_main.c
+@@ -3212,7 +3212,7 @@ static int fec_enet_init(struct net_device *ndev)
+ 		ndev->features |= NETIF_F_HW_VLAN_CTAG_RX;
+ 
+ 	if (fep->quirks & FEC_QUIRK_HAS_CSUM) {
+-		netif_set_gso_max_segs(ndev, FEC_MAX_TSO_SEGS);
++		netif_set_tso_max_segs(ndev, FEC_MAX_TSO_SEGS);
+ 
+ 		/* enable hw accelerator */
+ 		ndev->features |= (NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM
+diff --git a/drivers/net/ethernet/hisilicon/hns/hns_enet.c b/drivers/net/ethernet/hisilicon/hns/hns_enet.c
+index fe5e7ede9f4f..411993583c96 100644
+--- a/drivers/net/ethernet/hisilicon/hns/hns_enet.c
++++ b/drivers/net/ethernet/hisilicon/hns/hns_enet.c
+@@ -1819,7 +1819,7 @@ static int hns_nic_set_features(struct net_device *netdev,
+ 			priv->ops.fill_desc = fill_tso_desc;
+ 			priv->ops.maybe_stop_tx = hns_nic_maybe_stop_tso;
+ 			/* The chip only support 7*4096 */
+-			netif_set_gso_max_size(netdev, 7 * 4096);
++			netif_set_tso_max_size(netdev, 7 * 4096);
+ 		} else {
+ 			priv->ops.fill_desc = fill_v2_desc;
+ 			priv->ops.maybe_stop_tx = hns_nic_maybe_stop_tx;
+@@ -2210,7 +2210,7 @@ static void hns_nic_set_priv_ops(struct net_device *netdev)
+ 			priv->ops.fill_desc = fill_tso_desc;
+ 			priv->ops.maybe_stop_tx = hns_nic_maybe_stop_tso;
+ 			/* This chip only support 7*4096 */
+-			netif_set_gso_max_size(netdev, 7 * 4096);
++			netif_set_tso_max_size(netdev, 7 * 4096);
+ 		} else {
+ 			priv->ops.fill_desc = fill_v2_desc;
+ 			priv->ops.maybe_stop_tx = hns_nic_maybe_stop_tx;
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index a809d702dedd..1b2a4d3e9c8e 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -5052,12 +5052,12 @@ static void ixgbe_configure_dcb(struct ixgbe_adapter *adapter)
+ 
+ 	if (!(adapter->flags & IXGBE_FLAG_DCB_ENABLED)) {
+ 		if (hw->mac.type == ixgbe_mac_82598EB)
+-			netif_set_gso_max_size(adapter->netdev, 65536);
++			netif_set_tso_max_size(adapter->netdev, 65536);
+ 		return;
+ 	}
+ 
+ 	if (hw->mac.type == ixgbe_mac_82598EB)
+-		netif_set_gso_max_size(adapter->netdev, 32768);
++		netif_set_tso_max_size(adapter->netdev, 32768);
+ 
+ #ifdef IXGBE_FCOE
+ 	if (adapter->netdev->features & NETIF_F_FCOE_MTU)
+diff --git a/drivers/net/ethernet/marvell/mv643xx_eth.c b/drivers/net/ethernet/marvell/mv643xx_eth.c
+index cb4c7654089a..3564a7f7bfbf 100644
+--- a/drivers/net/ethernet/marvell/mv643xx_eth.c
++++ b/drivers/net/ethernet/marvell/mv643xx_eth.c
+@@ -3206,7 +3206,7 @@ static int mv643xx_eth_probe(struct platform_device *pdev)
+ 	dev->hw_features = dev->features;
+ 
+ 	dev->priv_flags |= IFF_UNICAST_FLT;
+-	netif_set_gso_max_segs(dev, MV643XX_MAX_TSO_SEGS);
++	netif_set_tso_max_segs(dev, MV643XX_MAX_TSO_SEGS);
+ 
+ 	/* MTU range: 64 - 9500 */
+ 	dev->min_mtu = 64;
+diff --git a/drivers/net/ethernet/marvell/mvneta.c b/drivers/net/ethernet/marvell/mvneta.c
+index 6038965452d4..fd70a5fb9403 100644
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@ -4516,7 +4516,7 @@ static int mvneta_probe(struct platform_device *pdev)
+ 	dev->hw_features |= dev->features;
+ 	dev->vlan_features |= dev->features;
+ 	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
+-	netif_set_gso_max_segs(dev, MVNETA_MAX_TSO_SEGS);
++	netif_set_tso_max_segs(dev, MVNETA_MAX_TSO_SEGS);
+ 
+ 	/* MTU range: 68 - 9676 */
+ 	dev->min_mtu = ETH_MIN_MTU;
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index e63128b6b7c2..48deaf2ffa01 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -4716,7 +4716,7 @@ static int mvpp2_port_probe(struct platform_device *pdev,
+ 	}
+ 
+ 	dev->vlan_features |= features;
+-	netif_set_gso_max_segs(dev, MVPP2_MAX_TSO_SEGS);
++	netif_set_tso_max_segs(dev, MVPP2_MAX_TSO_SEGS);
+ 	dev->priv_flags |= IFF_UNICAST_FLT;
+ 
+ 	/* MTU range: 68 - 9704 */
+* Unmerged path drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+* Unmerged path drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index d610ea3930a9..3e01b5d2c4a8 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -4046,7 +4046,7 @@ static void nfp_net_netdev_init(struct nfp_net *nn)
+ 	netdev->min_mtu = ETH_MIN_MTU;
+ 	netdev->max_mtu = nn->max_mtu;
+ 
+-	netif_set_gso_max_segs(netdev, NFP_NET_LSO_MAX_SEGS);
++	netif_set_tso_max_segs(netdev, NFP_NET_LSO_MAX_SEGS);
+ 
+ 	netif_carrier_off(netdev);
+ 
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c b/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+index d53ef087792c..736d47d232ea 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+@@ -380,7 +380,7 @@ int nfp_repr_init(struct nfp_app *app, struct net_device *netdev,
+ 
+ 	/* Advertise but disable TSO by default. */
+ 	netdev->features &= ~(NETIF_F_TSO | NETIF_F_TSO6);
+-	netif_set_gso_max_segs(netdev, NFP_NET_LSO_MAX_SEGS);
++	netif_set_tso_max_segs(netdev, NFP_NET_LSO_MAX_SEGS);
+ 
+ 	netdev->priv_flags |= IFF_NO_QUEUE | IFF_DISABLE_NETPOLL;
+ 	netdev->features |= NETIF_F_LLTX;
+diff --git a/drivers/net/ethernet/realtek/r8169_main.c b/drivers/net/ethernet/realtek/r8169_main.c
+index af8f470ce7fa..a84850d8a7f6 100644
+--- a/drivers/net/ethernet/realtek/r8169_main.c
++++ b/drivers/net/ethernet/realtek/r8169_main.c
+@@ -5410,12 +5410,12 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	 */
+ 	if (rtl_chip_supports_csum_v2(tp)) {
+ 		dev->hw_features |= NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6;
+-		netif_set_gso_max_size(dev, RTL_GSO_MAX_SIZE_V2);
+-		netif_set_gso_max_segs(dev, RTL_GSO_MAX_SEGS_V2);
++		netif_set_tso_max_size(dev, RTL_GSO_MAX_SIZE_V2);
++		netif_set_tso_max_segs(dev, RTL_GSO_MAX_SEGS_V2);
+ 	} else {
+ 		dev->hw_features |= NETIF_F_SG | NETIF_F_TSO;
+-		netif_set_gso_max_size(dev, RTL_GSO_MAX_SIZE_V1);
+-		netif_set_gso_max_segs(dev, RTL_GSO_MAX_SEGS_V1);
++		netif_set_tso_max_size(dev, RTL_GSO_MAX_SIZE_V1);
++		netif_set_tso_max_segs(dev, RTL_GSO_MAX_SEGS_V1);
+ 	}
+ 
+ 	dev->hw_features |= NETIF_F_RXALL;
+diff --git a/drivers/net/ethernet/sfc/ef100_nic.c b/drivers/net/ethernet/sfc/ef100_nic.c
+index a07cbf45a326..919e5d80dc63 100644
+--- a/drivers/net/ethernet/sfc/ef100_nic.c
++++ b/drivers/net/ethernet/sfc/ef100_nic.c
+@@ -1005,11 +1005,13 @@ static int ef100_process_design_param(struct efx_nic *efx,
+ 		return 0;
+ 	case ESE_EF100_DP_GZ_TSO_MAX_PAYLOAD_LEN:
+ 		nic_data->tso_max_payload_len = min_t(u64, reader->value, GSO_MAX_SIZE);
+-		netif_set_gso_max_size(efx->net_dev, nic_data->tso_max_payload_len);
++		netif_set_tso_max_size(efx->net_dev,
++				       nic_data->tso_max_payload_len);
+ 		return 0;
+ 	case ESE_EF100_DP_GZ_TSO_MAX_PAYLOAD_NUM_SEGS:
+ 		nic_data->tso_max_payload_num_segs = min_t(u64, reader->value, 0xffff);
+-		netif_set_gso_max_segs(efx->net_dev, nic_data->tso_max_payload_num_segs);
++		netif_set_tso_max_segs(efx->net_dev,
++				       nic_data->tso_max_payload_num_segs);
+ 		return 0;
+ 	case ESE_EF100_DP_GZ_TSO_MAX_NUM_FRAMES:
+ 		nic_data->tso_max_frames = min_t(u64, reader->value, 0xffff);
+@@ -1134,7 +1136,8 @@ static int ef100_probe_main(struct efx_nic *efx)
+ 	nic_data->tso_max_frames = ESE_EF100_DP_GZ_TSO_MAX_NUM_FRAMES_DEFAULT;
+ 	nic_data->tso_max_payload_num_segs = ESE_EF100_DP_GZ_TSO_MAX_PAYLOAD_NUM_SEGS_DEFAULT;
+ 	nic_data->tso_max_payload_len = ESE_EF100_DP_GZ_TSO_MAX_PAYLOAD_LEN_DEFAULT;
+-	netif_set_gso_max_segs(net_dev, ESE_EF100_DP_GZ_TSO_MAX_HDR_NUM_SEGS_DEFAULT);
++	netif_set_tso_max_segs(net_dev,
++			       ESE_EF100_DP_GZ_TSO_MAX_HDR_NUM_SEGS_DEFAULT);
+ 	/* Read design parameters */
+ 	rc = ef100_check_design_params(efx);
+ 	if (rc) {
+diff --git a/drivers/net/ethernet/sfc/efx.c b/drivers/net/ethernet/sfc/efx.c
+index 62eaf90feb63..59caa466a377 100644
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -711,7 +711,7 @@ static int efx_register_netdev(struct efx_nic *efx)
+ 	if (efx_nic_rev(efx) >= EFX_REV_HUNT_A0)
+ 		net_dev->priv_flags |= IFF_UNICAST_FLT;
+ 	net_dev->ethtool_ops = &efx_ethtool_ops;
+-	netif_set_gso_max_segs(net_dev, EFX_TSO_MAX_SEGS);
++	netif_set_tso_max_segs(net_dev, EFX_TSO_MAX_SEGS);
+ 	net_dev->min_mtu = EFX_MIN_MTU;
+ 	net_dev->max_mtu = EFX_MAX_MTU;
+ 
+diff --git a/drivers/net/ethernet/sfc/falcon/efx.c b/drivers/net/ethernet/sfc/falcon/efx.c
+index e73a06debd2b..24822d21fe03 100644
+--- a/drivers/net/ethernet/sfc/falcon/efx.c
++++ b/drivers/net/ethernet/sfc/falcon/efx.c
+@@ -2297,7 +2297,7 @@ static int ef4_register_netdev(struct ef4_nic *efx)
+ 	net_dev->irq = efx->pci_dev->irq;
+ 	net_dev->netdev_ops = &ef4_netdev_ops;
+ 	net_dev->ethtool_ops = &ef4_ethtool_ops;
+-	netif_set_gso_max_segs(net_dev, EF4_TSO_MAX_SEGS);
++	netif_set_tso_max_segs(net_dev, EF4_TSO_MAX_SEGS);
+ 	net_dev->min_mtu = EF4_MIN_MTU;
+ 	net_dev->max_mtu = EF4_MAX_MTU;
+ 
+diff --git a/drivers/net/hyperv/rndis_filter.c b/drivers/net/hyperv/rndis_filter.c
+index 9a969936e658..55c2503a07d0 100644
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@ -1439,7 +1439,7 @@ static int rndis_netdev_set_hwcaps(struct rndis_device *rndis_device,
+ 	 */
+ 	net->features &= ~NETVSC_SUPPORTED_HW_FEATURES | net->hw_features;
+ 
+-	netif_set_gso_max_size(net, gso_max_size);
++	netif_set_tso_max_size(net, gso_max_size);
+ 
+ 	ret = rndis_filter_set_offload_params(net, nvdev, &offloads);
+ 
+diff --git a/drivers/net/usb/aqc111.c b/drivers/net/usb/aqc111.c
+index 7e44110746dd..397910418627 100644
+--- a/drivers/net/usb/aqc111.c
++++ b/drivers/net/usb/aqc111.c
+@@ -735,7 +735,7 @@ static int aqc111_bind(struct usbnet *dev, struct usb_interface *intf)
+ 	dev->net->features |= AQ_SUPPORT_FEATURE;
+ 	dev->net->vlan_features |= AQ_SUPPORT_VLAN_FEATURE;
+ 
+-	netif_set_gso_max_size(dev->net, 65535);
++	netif_set_tso_max_size(dev->net, 65535);
+ 
+ 	aqc111_read_fw_version(dev, aqc111_data);
+ 	aqc111_data->autoneg = AUTONEG_ENABLE;
+* Unmerged path drivers/net/usb/ax88179_178a.c
+* Unmerged path drivers/net/usb/lan78xx.c
+diff --git a/drivers/net/usb/r8152.c b/drivers/net/usb/r8152.c
+index 80892785eb88..2c400360e5f2 100644
+--- a/drivers/net/usb/r8152.c
++++ b/drivers/net/usb/r8152.c
+@@ -6786,7 +6786,7 @@ static int rtl8152_probe(struct usb_interface *intf,
+ 	}
+ 
+ 	netdev->ethtool_ops = &ops;
+-	netif_set_gso_max_size(netdev, RTL_LIMITED_TSO_SIZE);
++	netif_set_tso_max_size(netdev, RTL_LIMITED_TSO_SIZE);
+ 
+ 	/* MTU range: 68 - 1500 or 9194 */
+ 	netdev->min_mtu = ETH_MIN_MTU;
+diff --git a/drivers/s390/net/qeth_l2_main.c b/drivers/s390/net/qeth_l2_main.c
+index 1ce6f4218cfe..5c2c1d645646 100644
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@ -1186,7 +1186,7 @@ static int qeth_l2_setup_netdev(struct qeth_card *card)
+ 	if (card->dev->hw_features & (NETIF_F_TSO | NETIF_F_TSO6)) {
+ 		card->dev->needed_headroom = sizeof(struct qeth_hdr_tso);
+ 		netif_keep_dst(card->dev);
+-		netif_set_gso_max_size(card->dev,
++		netif_set_tso_max_size(card->dev,
+ 				       PAGE_SIZE * (QDIO_MAX_ELEMENTS_PER_BUFFER - 1));
+ 	}
+ 
+diff --git a/drivers/s390/net/qeth_l3_main.c b/drivers/s390/net/qeth_l3_main.c
+index 874d8c4d5a8b..70d2e7d05a3d 100644
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@ -1907,7 +1907,7 @@ static int qeth_l3_setup_netdev(struct qeth_card *card)
+ 
+ 	netif_keep_dst(card->dev);
+ 	if (card->dev->hw_features & (NETIF_F_TSO | NETIF_F_TSO6))
+-		netif_set_gso_max_size(card->dev,
++		netif_set_tso_max_size(card->dev,
+ 				       PAGE_SIZE * (QETH_MAX_BUFFER_ELEMENTS(card) - 1));
+ 
+ 	netif_napi_add(card->dev, &card->napi, qeth_poll, QETH_NAPI_WEIGHT);
+diff --git a/net/bridge/br_if.c b/net/bridge/br_if.c
+index 9c1a368cc2d8..e0ea24ce4bfc 100644
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -519,16 +519,16 @@ void br_mtu_auto_adjust(struct net_bridge *br)
+ 
+ static void br_set_gso_limits(struct net_bridge *br)
+ {
+-	unsigned int gso_max_size = GSO_MAX_SIZE;
+-	u16 gso_max_segs = GSO_MAX_SEGS;
++	unsigned int tso_max_size = TSO_MAX_SIZE;
+ 	const struct net_bridge_port *p;
++	u16 tso_max_segs = TSO_MAX_SEGS;
+ 
+ 	list_for_each_entry(p, &br->port_list, list) {
+-		gso_max_size = min(gso_max_size, p->dev->gso_max_size);
+-		gso_max_segs = min(gso_max_segs, p->dev->gso_max_segs);
++		tso_max_size = min(tso_max_size, p->dev->tso_max_size);
++		tso_max_segs = min(tso_max_segs, p->dev->tso_max_segs);
+ 	}
+-	netif_set_gso_max_size(br->dev, gso_max_size);
+-	netif_set_gso_max_segs(br->dev, gso_max_segs);
++	netif_set_tso_max_size(br->dev, tso_max_size);
++	netif_set_tso_max_segs(br->dev, tso_max_segs);
+ }
+ 
+ /*
+* Unmerged path net/core/dev.c
