@@ -1,0 +1,169 @@
+mm/page_alloc: do not prefetch buddies during bulk free
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-507.el8
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit 2a791f4412cba41330453527a3045cf39818e72a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-507.el8/2a791f44.failed
+
+free_pcppages_bulk() has taken two passes through the pcp lists since
+commit 0a5f4e5b4562 ("mm/free_pcppages_bulk: do not hold lock when
+picking pages to free") due to deferring the cost of selecting PCP lists
+until the zone lock is held.
+
+As the list processing now takes place under the zone lock, it's less
+clear that this will always benefit for two reasons.
+
+1. There is a guaranteed cost to calculating the buddy which definitely
+   has to be calculated again. However, as the zone lock is held and
+   there is no deferring of buddy merging, there is no guarantee that the
+   prefetch will have completed when the second buddy calculation takes
+   place and buddies are being merged.  With or without the prefetch, there
+   may be further stalls depending on how many pages get merged. In other
+   words, a stall due to merging is inevitable and at best only one stall
+   might be avoided at the cost of calculating the buddy location twice.
+
+2. As the zone lock is held, prefetch_nr makes less sense as once
+   prefetch_nr expires, the cache lines of interest have already been
+   merged.
+
+The main concern is that there is a definite cost to calculating the
+buddy location early for the prefetch and it is a "maybe win" depending
+on whether the CPU prefetch logic and memory is fast enough.  Remove the
+prefetch logic on the basis that reduced instructions in a path is
+always a saving where as the prefetch might save one memory stall
+depending on the CPU and memory.
+
+In most cases, this has marginal benefit as the calculations are a small
+part of the overall freeing of pages.  However, it was detectable on at
+least one machine.
+
+                              5.17.0-rc3             5.17.0-rc3
+                    mm-highpcplimit-v2r1     mm-noprefetch-v1r1
+Min       elapsed      630.00 (   0.00%)      610.00 (   3.17%)
+Amean     elapsed      639.00 (   0.00%)      623.00 *   2.50%*
+Max       elapsed      660.00 (   0.00%)      660.00 (   0.00%)
+
+Link: https://lkml.kernel.org/r/20220221094119.15282-2-mgorman@techsingularity.net
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Suggested-by: Aaron Lu <aaron.lu@intel.com>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Reviewed-by: Aaron Lu <aaron.lu@intel.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2a791f4412cba41330453527a3045cf39818e72a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_alloc.c
+diff --cc mm/page_alloc.c
+index c5bf723f114f,279852eae9db..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -1351,35 -1429,20 +1351,32 @@@ static bool bulkfree_pcp_prepare(struc
+  }
+  #endif /* CONFIG_DEBUG_VM */
+  
+- static inline void prefetch_buddy(struct page *page, unsigned int order)
+- {
+- 	unsigned long pfn = page_to_pfn(page);
+- 	unsigned long buddy_pfn = __find_buddy_pfn(pfn, order);
+- 	struct page *buddy = page + (buddy_pfn - pfn);
+- 
+- 	prefetch(buddy);
+- }
+- 
+  /*
+   * Frees a number of pages from the PCP lists
+ - * Assumes all pages on list are in same zone.
+ + * Assumes all pages on list are in same zone, and of same order.
+   * count is the number of pages to free.
+ + *
+ + * If the zone was previously in an "all pages pinned" state then look to
+ + * see if this freeing clears that state.
+ + *
+ + * And clear the zone's pages_scanned counter, to hold off the "all pages are
+ + * pinned" detection logic.
+   */
+  static void free_pcppages_bulk(struct zone *zone, int count,
+ -					struct per_cpu_pages *pcp,
+ -					int pindex)
+ +					struct per_cpu_pages *pcp)
+  {
+++<<<<<<< HEAD
+ +	int migratetype = 0;
+ +	int batch_free = 0;
+ +	int prefetch_nr = READ_ONCE(pcp->batch);
+++=======
++ 	int min_pindex = 0;
++ 	int max_pindex = NR_PCP_LISTS - 1;
++ 	unsigned int order;
+++>>>>>>> 2a791f4412cb (mm/page_alloc: do not prefetch buddies during bulk free)
+  	bool isolated_pageblocks;
+ -	struct page *page;
+ +	struct page *page, *tmp;
+ +	LIST_HEAD(head);
+  
+  	/*
+  	 * Ensure proper count is passed which otherwise would stuck in the
+@@@ -1416,42 -1495,17 +1413,54 @@@
+  			if (bulkfree_pcp_prepare(page))
+  				continue;
+  
+++<<<<<<< HEAD
+ +			list_add_tail(&page->lru, &head);
+ +
+ +			/*
+ +			 * We are going to put the page back to the global
+ +			 * pool, prefetch its buddy to speed up later access
+ +			 * under zone->lock. It is believed the overhead of
+ +			 * an additional test and calculating buddy_pfn here
+ +			 * can be offset by reduced memory latency later. To
+ +			 * avoid excessive prefetching due to large count, only
+ +			 * prefetch buddy for the first pcp->batch nr of pages.
+ +			 */
+ +			if (prefetch_nr) {
+ +				prefetch_buddy(page, order);
+ +				prefetch_nr--;
+ +			}
+ +		} while (--count && --batch_free && !list_empty(list));
+++=======
++ 			/* MIGRATE_ISOLATE page should not go to pcplists */
++ 			VM_BUG_ON_PAGE(is_migrate_isolate(mt), page);
++ 			/* Pageblock could have been isolated meanwhile */
++ 			if (unlikely(isolated_pageblocks))
++ 				mt = get_pageblock_migratetype(page);
++ 
++ 			__free_one_page(page, page_to_pfn(page), zone, order, mt, FPI_NONE);
++ 			trace_mm_page_pcpu_drain(page, order, mt);
++ 		} while (count > 0 && !list_empty(list));
+++>>>>>>> 2a791f4412cb (mm/page_alloc: do not prefetch buddies during bulk free)
+  	}
+  
+ +	spin_lock(&zone->lock);
+ +	isolated_pageblocks = has_isolate_pageblock(zone);
+ +
+ +	/*
+ +	 * Use safe version since after __free_one_page(),
+ +	 * page->lru.next will not point to original list.
+ +	 */
+ +	list_for_each_entry_safe(page, tmp, &head, lru) {
+ +		int mt = get_pcppage_migratetype(page);
+ +		/* MIGRATE_ISOLATE page should not go to pcplists */
+ +		VM_BUG_ON_PAGE(is_migrate_isolate(mt), page);
+ +		/* Pageblock could have been isolated meanwhile */
+ +		if (unlikely(isolated_pageblocks))
+ +			mt = get_pageblock_migratetype(page);
+ +
+ +		__free_one_page(page, page_to_pfn(page), zone, 0, mt, FPI_NONE);
+ +		trace_mm_page_pcpu_drain(page, 0, mt);
+ +	}
+  	spin_unlock(&zone->lock);
+  }
+  
+* Unmerged path mm/page_alloc.c
