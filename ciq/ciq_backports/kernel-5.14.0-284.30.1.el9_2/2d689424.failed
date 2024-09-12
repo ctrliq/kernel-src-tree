@@ -1,0 +1,320 @@
+rxrpc: Move call state changes from sendmsg to I/O thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 2d689424b6184535890c251f937ccf815fde9cd2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/2d689424.failed
+
+Move all the call state changes that are made in rxrpc_sendmsg() to the I/O
+thread.  This is a step towards removing the call state lock.
+
+This requires the switch to the RXRPC_CALL_CLIENT_AWAIT_REPLY and
+RXRPC_CALL_SERVER_SEND_REPLY states to be done when the last packet is
+decanted from ->tx_sendmsg to ->tx_buffer in the I/O thread, not when it is
+added to ->tx_sendmsg by sendmsg().
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit 2d689424b6184535890c251f937ccf815fde9cd2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/call_event.c
+#	net/rxrpc/sendmsg.c
+diff --cc net/rxrpc/call_event.c
+index a95f4604cb29,2e3c01060d59..000000000000
+--- a/net/rxrpc/call_event.c
++++ b/net/rxrpc/call_event.c
+@@@ -291,6 -251,131 +291,134 @@@ out
+  	_leave("");
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Start transmitting the reply to a service.  This cancels the need to ACK the
++  * request if we haven't yet done so.
++  */
++ static void rxrpc_begin_service_reply(struct rxrpc_call *call)
++ {
++ 	unsigned long now;
++ 
++ 	write_lock(&call->state_lock);
++ 
++ 	if (call->state == RXRPC_CALL_SERVER_ACK_REQUEST) {
++ 		now = jiffies;
++ 		call->state = RXRPC_CALL_SERVER_SEND_REPLY;
++ 		WRITE_ONCE(call->delay_ack_at, now + MAX_JIFFY_OFFSET);
++ 		if (call->ackr_reason == RXRPC_ACK_DELAY)
++ 			call->ackr_reason = 0;
++ 		trace_rxrpc_timer(call, rxrpc_timer_init_for_send_reply, now);
++ 	}
++ 
++ 	write_unlock(&call->state_lock);
++ }
++ 
++ /*
++  * Close the transmission phase.  After this point there is no more data to be
++  * transmitted in the call.
++  */
++ static void rxrpc_close_tx_phase(struct rxrpc_call *call)
++ {
++ 	_debug("________awaiting reply/ACK__________");
++ 
++ 	write_lock(&call->state_lock);
++ 	switch (call->state) {
++ 	case RXRPC_CALL_CLIENT_SEND_REQUEST:
++ 		call->state = RXRPC_CALL_CLIENT_AWAIT_REPLY;
++ 		break;
++ 	case RXRPC_CALL_SERVER_SEND_REPLY:
++ 		call->state = RXRPC_CALL_SERVER_AWAIT_ACK;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 	write_unlock(&call->state_lock);
++ }
++ 
++ static bool rxrpc_tx_window_has_space(struct rxrpc_call *call)
++ {
++ 	unsigned int winsize = min_t(unsigned int, call->tx_winsize,
++ 				     call->cong_cwnd + call->cong_extra);
++ 	rxrpc_seq_t window = call->acks_hard_ack, wtop = window + winsize;
++ 	rxrpc_seq_t tx_top = call->tx_top;
++ 	int space;
++ 
++ 	space = wtop - tx_top;
++ 	return space > 0;
++ }
++ 
++ /*
++  * Decant some if the sendmsg prepared queue into the transmission buffer.
++  */
++ static void rxrpc_decant_prepared_tx(struct rxrpc_call *call)
++ {
++ 	struct rxrpc_txbuf *txb;
++ 
++ 	if (!test_bit(RXRPC_CALL_EXPOSED, &call->flags)) {
++ 		if (list_empty(&call->tx_sendmsg))
++ 			return;
++ 		rxrpc_expose_client_call(call);
++ 	}
++ 
++ 	while ((txb = list_first_entry_or_null(&call->tx_sendmsg,
++ 					       struct rxrpc_txbuf, call_link))) {
++ 		spin_lock(&call->tx_lock);
++ 		list_del(&txb->call_link);
++ 		spin_unlock(&call->tx_lock);
++ 
++ 		call->tx_top = txb->seq;
++ 		list_add_tail(&txb->call_link, &call->tx_buffer);
++ 
++ 		if (txb->wire.flags & RXRPC_LAST_PACKET)
++ 			rxrpc_close_tx_phase(call);
++ 
++ 		rxrpc_transmit_one(call, txb);
++ 
++ 		if (!rxrpc_tx_window_has_space(call))
++ 			break;
++ 	}
++ }
++ 
++ static void rxrpc_transmit_some_data(struct rxrpc_call *call)
++ {
++ 	switch (call->state) {
++ 	case RXRPC_CALL_SERVER_ACK_REQUEST:
++ 		if (list_empty(&call->tx_sendmsg))
++ 			return;
++ 		rxrpc_begin_service_reply(call);
++ 		fallthrough;
++ 
++ 	case RXRPC_CALL_SERVER_SEND_REPLY:
++ 	case RXRPC_CALL_CLIENT_SEND_REQUEST:
++ 		if (!rxrpc_tx_window_has_space(call))
++ 			return;
++ 		if (list_empty(&call->tx_sendmsg)) {
++ 			rxrpc_inc_stat(call->rxnet, stat_tx_data_underflow);
++ 			return;
++ 		}
++ 		rxrpc_decant_prepared_tx(call);
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ }
++ 
++ /*
++  * Ping the other end to fill our RTT cache and to retrieve the rwind
++  * and MTU parameters.
++  */
++ static void rxrpc_send_initial_ping(struct rxrpc_call *call)
++ {
++ 	if (call->peer->rtt_count < 3 ||
++ 	    ktime_before(ktime_add_ms(call->peer->rtt_last_req, 1000),
++ 			 ktime_get_real()))
++ 		rxrpc_send_ACK(call, RXRPC_ACK_PING, 0,
++ 			       rxrpc_propose_ack_ping_for_params);
++ }
++ 
+++>>>>>>> 2d689424b618 (rxrpc: Move call state changes from sendmsg to I/O thread)
+  /*
+   * Handle retransmission and deferred ACK/abort generation.
+   */
+diff --cc net/rxrpc/sendmsg.c
+index 45c09f0de6fe,0428528abbf4..000000000000
+--- a/net/rxrpc/sendmsg.c
++++ b/net/rxrpc/sendmsg.c
+@@@ -204,10 -189,8 +204,9 @@@ static void rxrpc_queue_packet(struct r
+  			       struct rxrpc_txbuf *txb,
+  			       rxrpc_notify_end_tx_t notify_end_tx)
+  {
+- 	unsigned long now;
+  	rxrpc_seq_t seq = txb->seq;
+ -	bool last = test_bit(RXRPC_TXBUF_LAST, &txb->flags), poke;
+ +	bool last = test_bit(RXRPC_TXBUF_LAST, &txb->flags);
+ +	int ret;
+  
+  	rxrpc_inc_stat(call->rxnet, stat_tx_data);
+  
+@@@ -230,58 -206,17 +229,72 @@@
+  	else
+  		trace_rxrpc_txqueue(call, rxrpc_txqueue_queue);
+  
+++<<<<<<< HEAD
+ +	if (last || call->state == RXRPC_CALL_SERVER_ACK_REQUEST) {
+ +		_debug("________awaiting reply/ACK__________");
+ +		write_lock_bh(&call->state_lock);
+ +		switch (call->state) {
+ +		case RXRPC_CALL_CLIENT_SEND_REQUEST:
+ +			call->state = RXRPC_CALL_CLIENT_AWAIT_REPLY;
+ +			rxrpc_notify_end_tx(rx, call, notify_end_tx);
+ +			break;
+ +		case RXRPC_CALL_SERVER_ACK_REQUEST:
+ +			call->state = RXRPC_CALL_SERVER_SEND_REPLY;
+ +			now = jiffies;
+ +			WRITE_ONCE(call->delay_ack_at, now + MAX_JIFFY_OFFSET);
+ +			if (call->ackr_reason == RXRPC_ACK_DELAY)
+ +				call->ackr_reason = 0;
+ +			trace_rxrpc_timer(call, rxrpc_timer_init_for_send_reply, now);
+ +			if (!last)
+ +				break;
+ +			fallthrough;
+ +		case RXRPC_CALL_SERVER_SEND_REPLY:
+ +			call->state = RXRPC_CALL_SERVER_AWAIT_ACK;
+ +			rxrpc_notify_end_tx(rx, call, notify_end_tx);
+ +			break;
+ +		default:
+ +			break;
+ +		}
+ +		write_unlock_bh(&call->state_lock);
+ +	}
+ +
+ +	if (seq == 1 && rxrpc_is_client_call(call))
+ +		rxrpc_expose_client_call(call);
+ +
+ +	ret = rxrpc_send_data_packet(call, txb);
+ +	if (ret < 0) {
+ +		switch (ret) {
+ +		case -ENETUNREACH:
+ +		case -EHOSTUNREACH:
+ +		case -ECONNREFUSED:
+ +			rxrpc_set_call_completion(call, RXRPC_CALL_LOCAL_ERROR,
+ +						  0, ret);
+ +			goto out;
+ +		}
+ +	} else {
+ +		unsigned long now = jiffies;
+ +		unsigned long resend_at = now + call->peer->rto_j;
+ +
+ +		WRITE_ONCE(call->resend_at, resend_at);
+ +		rxrpc_reduce_call_timer(call, resend_at, now,
+ +					rxrpc_timer_set_for_send);
+ +	}
+ +
+ +out:
+ +	rxrpc_put_txbuf(txb, rxrpc_txbuf_put_trans);
+++=======
++ 	/* Add the packet to the call's output buffer */
++ 	spin_lock(&call->tx_lock);
++ 	poke = list_empty(&call->tx_sendmsg);
++ 	list_add_tail(&txb->call_link, &call->tx_sendmsg);
++ 	call->tx_prepared = seq;
++ 	if (last)
++ 		rxrpc_notify_end_tx(rx, call, notify_end_tx);
++ 	spin_unlock(&call->tx_lock);
++ 
++ 	if (poke)
++ 		rxrpc_poke_call(call, rxrpc_call_poke_start);
+++>>>>>>> 2d689424b618 (rxrpc: Move call state changes from sendmsg to I/O thread)
+  }
+  
+  /*
+@@@ -716,11 -649,7 +733,15 @@@ int rxrpc_do_sendmsg(struct rxrpc_sock 
+  		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	state = READ_ONCE(call->state);
+ +	_debug("CALL %d USR %lx ST %d on CONN %p",
+ +	       call->debug_id, call->user_call_ID, state, call->conn);
+ +
+ +	if (state >= RXRPC_CALL_COMPLETE) {
+++=======
++ 	if (rxrpc_call_is_complete(call)) {
+++>>>>>>> 2d689424b618 (rxrpc: Move call state changes from sendmsg to I/O thread)
+  		/* it's too late for this call */
+  		ret = -ESHUTDOWN;
+  	} else if (p.command == RXRPC_CMD_SEND_ABORT) {
+@@@ -776,24 -705,10 +797,31 @@@ int rxrpc_kernel_send_data(struct socke
+  	_debug("CALL %d USR %lx ST %d on CONN %p",
+  	       call->debug_id, call->user_call_ID, call->state, call->conn);
+  
+++<<<<<<< HEAD
+ +	switch (READ_ONCE(call->state)) {
+ +	case RXRPC_CALL_CLIENT_SEND_REQUEST:
+ +	case RXRPC_CALL_SERVER_ACK_REQUEST:
+ +	case RXRPC_CALL_SERVER_SEND_REPLY:
+ +		ret = rxrpc_send_data(rxrpc_sk(sock->sk), call, msg, len,
+ +				      notify_end_tx, &dropped_lock);
+ +		break;
+ +	case RXRPC_CALL_COMPLETE:
+ +		read_lock_bh(&call->state_lock);
+ +		ret = call->error;
+ +		read_unlock_bh(&call->state_lock);
+ +		break;
+ +	default:
+ +		/* Request phase complete for this client call */
+ +		trace_rxrpc_rx_eproto(call, 0, tracepoint_string("late_send"));
+ +		ret = -EPROTO;
+ +		break;
+ +	}
+++=======
++ 	ret = rxrpc_send_data(rxrpc_sk(sock->sk), call, msg, len,
++ 			      notify_end_tx, &dropped_lock);
++ 	if (ret == -ESHUTDOWN)
++ 		ret = call->error;
+++>>>>>>> 2d689424b618 (rxrpc: Move call state changes from sendmsg to I/O thread)
+  
+  	if (!dropped_lock)
+  		mutex_unlock(&call->user_mutex);
+diff --git a/Documentation/networking/rxrpc.rst b/Documentation/networking/rxrpc.rst
+index 39494a6ea739..e1af54424192 100644
+--- a/Documentation/networking/rxrpc.rst
++++ b/Documentation/networking/rxrpc.rst
+@@ -880,8 +880,8 @@ The kernel interface functions are as follows:
+ 
+      notify_end_rx can be NULL or it can be used to specify a function to be
+      called when the call changes state to end the Tx phase.  This function is
+-     called with the call-state spinlock held to prevent any reply or final ACK
+-     from being delivered first.
++     called with a spinlock held to prevent the last DATA packet from being
++     transmitted until the function returns.
+ 
+  (#) Receive data from a call::
+ 
+* Unmerged path net/rxrpc/call_event.c
+* Unmerged path net/rxrpc/sendmsg.c
