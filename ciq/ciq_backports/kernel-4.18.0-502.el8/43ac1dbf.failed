@@ -1,0 +1,143 @@
+x86/resctrl: Merge the ctrl_val arrays
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author James Morse <james.morse@arm.com>
+commit 43ac1dbf6101722944758f364ea39859d5db3ce0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/43ac1dbf.failed
+
+Each struct rdt_hw_resource has its own ctrl_val[] array. When CDP is
+enabled, two resources are in use, each with its own ctrl_val[] array
+that holds half of the configuration used by hardware. One uses the odd
+slots, the other the even. rdt_cdp_peer_get() is the helper to find the
+alternate resource, its domain, and corresponding entry in the other
+ctrl_val[] array.
+
+Once the CDP resources are merged there will be one struct
+rdt_hw_resource and one ctrl_val[] array for each hardware resource.
+This will include changes to rdt_cdp_peer_get(), making it hard to
+bisect any issue.
+
+Merge the ctrl_val[] arrays for three CODE/DATA/NONE resources first.
+Doing this before merging the resources temporarily complicates
+allocating and freeing the ctrl_val arrays. Add a helper to allocate
+the ctrl_val array, that returns the value on the L2 or L3 resource if
+it already exists. This gets removed once the resources are merged, and
+there really is only one ctrl_val[] array.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Jamie Iles <jamie@nuviainc.com>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Tested-by: Babu Moger <babu.moger@amd.com>
+Link: https://lkml.kernel.org/r/20210728170637.25610-22-james.morse@arm.com
+(cherry picked from commit 43ac1dbf6101722944758f364ea39859d5db3ce0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/core.c
+diff --cc arch/x86/kernel/cpu/resctrl/core.c
+index 916eb976301b,4c0b1265ffd4..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/core.c
++++ b/arch/x86/kernel/cpu/resctrl/core.c
+@@@ -490,16 -509,69 +490,75 @@@ void setup_default_ctrlval(struct rdt_r
+  	}
+  }
+  
++ static u32 *alloc_ctrlval_array(struct rdt_resource *r, struct rdt_domain *d,
++ 				bool mba_sc)
++ {
++ 	/* these are for the underlying hardware, they may not match r/d */
++ 	struct rdt_domain *underlying_domain;
++ 	struct rdt_hw_resource *hw_res;
++ 	struct rdt_hw_domain *hw_dom;
++ 	bool remapped;
++ 
++ 	switch (r->rid) {
++ 	case RDT_RESOURCE_L3DATA:
++ 	case RDT_RESOURCE_L3CODE:
++ 		hw_res = &rdt_resources_all[RDT_RESOURCE_L3];
++ 		remapped = true;
++ 		break;
++ 	case RDT_RESOURCE_L2DATA:
++ 	case RDT_RESOURCE_L2CODE:
++ 		hw_res = &rdt_resources_all[RDT_RESOURCE_L2];
++ 		remapped = true;
++ 		break;
++ 	default:
++ 		hw_res = resctrl_to_arch_res(r);
++ 		remapped = false;
++ 	}
++ 
++ 	/*
++ 	 * If we changed the resource, we need to search for the underlying
++ 	 * domain. Doing this for all resources would make it tricky to add the
++ 	 * first resource, as domains aren't added to a resource list until
++ 	 * after the ctrlval arrays have been allocated.
++ 	 */
++ 	if (remapped)
++ 		underlying_domain = rdt_find_domain(&hw_res->r_resctrl, d->id,
++ 						    NULL);
++ 	else
++ 		underlying_domain = d;
++ 	hw_dom = resctrl_to_arch_dom(underlying_domain);
++ 
++ 	if (mba_sc) {
++ 		if (hw_dom->mbps_val)
++ 			return hw_dom->mbps_val;
++ 		return kmalloc_array(hw_res->num_closid,
++ 				     sizeof(*hw_dom->mbps_val), GFP_KERNEL);
++ 	} else {
++ 		if (hw_dom->ctrl_val)
++ 			return hw_dom->ctrl_val;
++ 		return kmalloc_array(hw_res->num_closid,
++ 				     sizeof(*hw_dom->ctrl_val), GFP_KERNEL);
++ 	}
++ }
++ 
+  static int domain_setup_ctrlval(struct rdt_resource *r, struct rdt_domain *d)
+  {
+ -	struct rdt_hw_resource *hw_res = resctrl_to_arch_res(r);
+ -	struct rdt_hw_domain *hw_dom = resctrl_to_arch_dom(d);
+  	struct msr_param m;
+  	u32 *dc, *dm;
+  
+++<<<<<<< HEAD
+ +	dc = kmalloc_array(r->num_closid, sizeof(*d->ctrl_val), GFP_KERNEL);
+ +	if (!dc)
+ +		return -ENOMEM;
+ +
+ +	dm = kmalloc_array(r->num_closid, sizeof(*d->mbps_val), GFP_KERNEL);
+++=======
++ 	dc = alloc_ctrlval_array(r, d, false);
++ 	if (!dc)
++ 		return -ENOMEM;
++ 
++ 	dm = alloc_ctrlval_array(r, d, true);
+++>>>>>>> 43ac1dbf6101 (x86/resctrl: Merge the ctrl_val arrays)
+  	if (!dm) {
+  		kfree(dc);
+  		return -ENOMEM;
+@@@ -654,8 -730,14 +713,19 @@@ static void domain_remove_cpu(int cpu, 
+  		if (d->plr)
+  			d->plr->d = NULL;
+  
+++<<<<<<< HEAD
+ +		kfree(d->ctrl_val);
+ +		kfree(d->mbps_val);
+++=======
++ 		/* temporary: these four don't have a unique ctrlval array */
++ 		if (r->rid != RDT_RESOURCE_L3CODE &&
++ 		    r->rid != RDT_RESOURCE_L3DATA &&
++ 		    r->rid != RDT_RESOURCE_L2CODE &&
++ 		    r->rid != RDT_RESOURCE_L2DATA) {
++ 			kfree(hw_dom->ctrl_val);
++ 			kfree(hw_dom->mbps_val);
++ 		}
+++>>>>>>> 43ac1dbf6101 (x86/resctrl: Merge the ctrl_val arrays)
+  		bitmap_free(d->rmid_busy_llc);
+  		kfree(d->mbm_total);
+  		kfree(d->mbm_local);
+* Unmerged path arch/x86/kernel/cpu/resctrl/core.c
