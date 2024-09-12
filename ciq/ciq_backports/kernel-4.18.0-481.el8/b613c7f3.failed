@@ -1,0 +1,127 @@
+locking/rwsem: Prevent non-first waiter from spinning in down_write() slowpath
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Waiman Long <longman@redhat.com>
+commit b613c7f31476c44316bfac1af7cac714b7d6bef9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/b613c7f3.failed
+
+A non-first waiter can potentially spin in the for loop of
+rwsem_down_write_slowpath() without sleeping but fail to acquire the
+lock even if the rwsem is free if the following sequence happens:
+
+  Non-first RT waiter    First waiter      Lock holder
+  -------------------    ------------      -----------
+  Acquire wait_lock
+  rwsem_try_write_lock():
+    Set handoff bit if RT or
+      wait too long
+    Set waiter->handoff_set
+  Release wait_lock
+                         Acquire wait_lock
+                         Inherit waiter->handoff_set
+                         Release wait_lock
+					   Clear owner
+                                           Release lock
+  if (waiter.handoff_set) {
+    rwsem_spin_on_owner(();
+    if (OWNER_NULL)
+      goto trylock_again;
+  }
+  trylock_again:
+  Acquire wait_lock
+  rwsem_try_write_lock():
+     if (first->handoff_set && (waiter != first))
+	return false;
+  Release wait_lock
+
+A non-first waiter cannot really acquire the rwsem even if it mistakenly
+believes that it can spin on OWNER_NULL value. If that waiter happens
+to be an RT task running on the same CPU as the first waiter, it can
+block the first waiter from acquiring the rwsem leading to live lock.
+Fix this problem by making sure that a non-first waiter cannot spin in
+the slowpath loop without sleeping.
+
+Fixes: d257cc8cb8d5 ("locking/rwsem: Make handoff bit handling more consistent")
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+	Tested-by: Mukesh Ojha <quic_mojha@quicinc.com>
+	Reviewed-by: Mukesh Ojha <quic_mojha@quicinc.com>
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/20230126003628.365092-2-longman@redhat.com
+(cherry picked from commit b613c7f31476c44316bfac1af7cac714b7d6bef9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/rwsem.c
+diff --cc kernel/locking/rwsem.c
+index 665677d32e74,be2df9ea7c30..000000000000
+--- a/kernel/locking/rwsem.c
++++ b/kernel/locking/rwsem.c
+@@@ -565,13 -616,26 +565,35 @@@ static inline bool rwsem_try_write_lock
+  	do {
+  		bool has_handoff = !!(count & RWSEM_FLAG_HANDOFF);
+  
+++<<<<<<< HEAD
+ +		if (has_handoff && wstate == WRITER_NOT_FIRST)
+ +			return false;
+++=======
++ 		if (has_handoff) {
++ 			/*
++ 			 * Honor handoff bit and yield only when the first
++ 			 * waiter is the one that set it. Otherwisee, we
++ 			 * still try to acquire the rwsem.
++ 			 */
++ 			if (first->handoff_set && (waiter != first))
++ 				return false;
++ 		}
+++>>>>>>> b613c7f31476 (locking/rwsem: Prevent non-first waiter from spinning in down_write() slowpath)
+  
+  		new = count;
+  
+  		if (count & RWSEM_LOCK_MASK) {
+++<<<<<<< HEAD
+ +			if (has_handoff || (wstate != WRITER_HANDOFF))
+++=======
++ 			/*
++ 			 * A waiter (first or not) can set the handoff bit
++ 			 * if it is an RT task or wait in the wait queue
++ 			 * for too long.
++ 			 */
++ 			if (has_handoff || (!rt_task(waiter->task) &&
++ 					    !time_after(jiffies, waiter->timeout)))
+++>>>>>>> b613c7f31476 (locking/rwsem: Prevent non-first waiter from spinning in down_write() slowpath)
+  				return false;
+  
+  			new |= RWSEM_FLAG_HANDOFF;
+@@@ -585,12 -649,21 +607,19 @@@
+  	} while (!atomic_long_try_cmpxchg_acquire(&sem->count, &count, new));
+  
+  	/*
+- 	 * We have either acquired the lock with handoff bit cleared or
+- 	 * set the handoff bit.
++ 	 * We have either acquired the lock with handoff bit cleared or set
++ 	 * the handoff bit. Only the first waiter can have its handoff_set
++ 	 * set here to enable optimistic spinning in slowpath loop.
+  	 */
+++<<<<<<< HEAD
+ +	if (new & RWSEM_FLAG_HANDOFF)
+++=======
++ 	if (new & RWSEM_FLAG_HANDOFF) {
++ 		first->handoff_set = true;
++ 		lockevent_inc(rwsem_wlock_handoff);
+++>>>>>>> b613c7f31476 (locking/rwsem: Prevent non-first waiter from spinning in down_write() slowpath)
+  		return false;
+ -	}
+  
+ -	/*
+ -	 * Have rwsem_try_write_lock() fully imply rwsem_del_waiter() on
+ -	 * success.
+ -	 */
+ -	list_del(&waiter->list);
+  	rwsem_set_owner(sem);
+  	return true;
+  }
+* Unmerged path kernel/locking/rwsem.c
