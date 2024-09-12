@@ -1,0 +1,213 @@
+net: stmmac: bump tc when get underflow error from DMA descriptor
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Xiaoliang Yang <xiaoliang.yang_1@nxp.com>
+commit 3a6c12a0c6c3f857f47efe0e40011360063a35bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/3a6c12a0.failed
+
+In DMA threshold mode, frame underflow errors may sometimes occur when
+the TC(threshold control) value is not enough. The TC value need to be
+bumped up in this case.
+
+There is no underflow interrupt bit on DMA_CH(#i)_Status of dwmac4, so
+the DMA threshold cannot be bumped up in stmmac_dma_interrupt(). The
+i.mx8mp board observed an underflow error while running NFS boot, the
+NFS rootfs could not be mounted.
+
+The underflow error can be got from the DMA descriptor TDES3 on dwmac4.
+This patch bump up tc value once underflow error is got from TDES3.
+
+	Signed-off-by: Xiaoliang Yang <xiaoliang.yang_1@nxp.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3a6c12a0c6c3f857f47efe0e40011360063a35bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+diff --cc drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 5960a222106f,7e3e1bc0f61d..000000000000
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@@ -127,6 -130,10 +127,13 @@@ static irqreturn_t stmmac_mac_interrupt
+  static irqreturn_t stmmac_safety_interrupt(int irq, void *dev_id);
+  static irqreturn_t stmmac_msi_intr_tx(int irq, void *data);
+  static irqreturn_t stmmac_msi_intr_rx(int irq, void *data);
+++<<<<<<< HEAD
+++=======
++ static void stmmac_tx_timer_arm(struct stmmac_priv *priv, u32 queue);
++ static void stmmac_flush_tx_descriptors(struct stmmac_priv *priv, int queue);
++ static void stmmac_set_dma_operation_mode(struct stmmac_priv *priv, u32 txmode,
++ 					  u32 rxmode, u32 chan);
+++>>>>>>> 3a6c12a0c6c3 (net: stmmac: bump tc when get underflow error from DMA descriptor)
+  
+  #ifdef CONFIG_DEBUG_FS
+  static const struct net_device_ops stmmac_netdev_ops;
+@@@ -2114,6 -2373,116 +2121,119 @@@ static void stmmac_dma_operation_mode(s
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool stmmac_xdp_xmit_zc(struct stmmac_priv *priv, u32 queue, u32 budget)
++ {
++ 	struct netdev_queue *nq = netdev_get_tx_queue(priv->dev, queue);
++ 	struct stmmac_tx_queue *tx_q = &priv->tx_queue[queue];
++ 	struct xsk_buff_pool *pool = tx_q->xsk_pool;
++ 	unsigned int entry = tx_q->cur_tx;
++ 	struct dma_desc *tx_desc = NULL;
++ 	struct xdp_desc xdp_desc;
++ 	bool work_done = true;
++ 
++ 	/* Avoids TX time-out as we are sharing with slow path */
++ 	txq_trans_cond_update(nq);
++ 
++ 	budget = min(budget, stmmac_tx_avail(priv, queue));
++ 
++ 	while (budget-- > 0) {
++ 		dma_addr_t dma_addr;
++ 		bool set_ic;
++ 
++ 		/* We are sharing with slow path and stop XSK TX desc submission when
++ 		 * available TX ring is less than threshold.
++ 		 */
++ 		if (unlikely(stmmac_tx_avail(priv, queue) < STMMAC_TX_XSK_AVAIL) ||
++ 		    !netif_carrier_ok(priv->dev)) {
++ 			work_done = false;
++ 			break;
++ 		}
++ 
++ 		if (!xsk_tx_peek_desc(pool, &xdp_desc))
++ 			break;
++ 
++ 		if (likely(priv->extend_desc))
++ 			tx_desc = (struct dma_desc *)(tx_q->dma_etx + entry);
++ 		else if (tx_q->tbs & STMMAC_TBS_AVAIL)
++ 			tx_desc = &tx_q->dma_entx[entry].basic;
++ 		else
++ 			tx_desc = tx_q->dma_tx + entry;
++ 
++ 		dma_addr = xsk_buff_raw_get_dma(pool, xdp_desc.addr);
++ 		xsk_buff_raw_dma_sync_for_device(pool, dma_addr, xdp_desc.len);
++ 
++ 		tx_q->tx_skbuff_dma[entry].buf_type = STMMAC_TXBUF_T_XSK_TX;
++ 
++ 		/* To return XDP buffer to XSK pool, we simple call
++ 		 * xsk_tx_completed(), so we don't need to fill up
++ 		 * 'buf' and 'xdpf'.
++ 		 */
++ 		tx_q->tx_skbuff_dma[entry].buf = 0;
++ 		tx_q->xdpf[entry] = NULL;
++ 
++ 		tx_q->tx_skbuff_dma[entry].map_as_page = false;
++ 		tx_q->tx_skbuff_dma[entry].len = xdp_desc.len;
++ 		tx_q->tx_skbuff_dma[entry].last_segment = true;
++ 		tx_q->tx_skbuff_dma[entry].is_jumbo = false;
++ 
++ 		stmmac_set_desc_addr(priv, tx_desc, dma_addr);
++ 
++ 		tx_q->tx_count_frames++;
++ 
++ 		if (!priv->tx_coal_frames[queue])
++ 			set_ic = false;
++ 		else if (tx_q->tx_count_frames % priv->tx_coal_frames[queue] == 0)
++ 			set_ic = true;
++ 		else
++ 			set_ic = false;
++ 
++ 		if (set_ic) {
++ 			tx_q->tx_count_frames = 0;
++ 			stmmac_set_tx_ic(priv, tx_desc);
++ 			priv->xstats.tx_set_ic_bit++;
++ 		}
++ 
++ 		stmmac_prepare_tx_desc(priv, tx_desc, 1, xdp_desc.len,
++ 				       true, priv->mode, true, true,
++ 				       xdp_desc.len);
++ 
++ 		stmmac_enable_dma_transmission(priv, priv->ioaddr);
++ 
++ 		tx_q->cur_tx = STMMAC_GET_ENTRY(tx_q->cur_tx, priv->dma_tx_size);
++ 		entry = tx_q->cur_tx;
++ 	}
++ 
++ 	if (tx_desc) {
++ 		stmmac_flush_tx_descriptors(priv, queue);
++ 		xsk_tx_release(pool);
++ 	}
++ 
++ 	/* Return true if all of the 3 conditions are met
++ 	 *  a) TX Budget is still available
++ 	 *  b) work_done = true when XSK TX desc peek is empty (no more
++ 	 *     pending XSK TX for transmission)
++ 	 */
++ 	return !!budget && work_done;
++ }
++ 
++ static void stmmac_bump_dma_threshold(struct stmmac_priv *priv, u32 chan)
++ {
++ 	if (unlikely(priv->xstats.threshold != SF_DMA_MODE) && tc <= 256) {
++ 		tc += 64;
++ 
++ 		if (priv->plat->force_thresh_dma_mode)
++ 			stmmac_set_dma_operation_mode(priv, tc, tc, chan);
++ 		else
++ 			stmmac_set_dma_operation_mode(priv, tc, SF_DMA_MODE,
++ 						      chan);
++ 
++ 		priv->xstats.threshold = tc;
++ 	}
++ }
++ 
+++>>>>>>> 3a6c12a0c6c3 (net: stmmac: bump tc when get underflow error from DMA descriptor)
+  /**
+   * stmmac_tx_clean - to manage the transmission completion
+   * @priv: driver private structure
+diff --git a/drivers/net/ethernet/stmicro/stmmac/common.h b/drivers/net/ethernet/stmicro/stmmac/common.h
+index 2f8e5961a08a..31099da53160 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/common.h
++++ b/drivers/net/ethernet/stmicro/stmmac/common.h
+@@ -309,6 +309,7 @@ enum tx_frame_status {
+ 	tx_not_ls = 0x1,
+ 	tx_err = 0x2,
+ 	tx_dma_own = 0x4,
++	tx_err_bump_tc = 0x8,
+ };
+ 
+ enum dma_irq_status {
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c b/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c
+index d52acdec7794..394df8829691 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c
+@@ -35,6 +35,8 @@ static int dwmac4_wrback_get_tx_status(void *data, struct stmmac_extra_stats *x,
+ 		return tx_not_ls;
+ 
+ 	if (unlikely(tdes3 & TDES3_ERROR_SUMMARY)) {
++		ret = tx_err;
++
+ 		if (unlikely(tdes3 & TDES3_JABBER_TIMEOUT))
+ 			x->tx_jabber++;
+ 		if (unlikely(tdes3 & TDES3_PACKET_FLUSHED))
+@@ -56,16 +58,16 @@ static int dwmac4_wrback_get_tx_status(void *data, struct stmmac_extra_stats *x,
+ 		if (unlikely(tdes3 & TDES3_EXCESSIVE_DEFERRAL))
+ 			x->tx_deferred++;
+ 
+-		if (unlikely(tdes3 & TDES3_UNDERFLOW_ERROR))
++		if (unlikely(tdes3 & TDES3_UNDERFLOW_ERROR)) {
+ 			x->tx_underflow++;
++			ret |= tx_err_bump_tc;
++		}
+ 
+ 		if (unlikely(tdes3 & TDES3_IP_HDR_ERROR))
+ 			x->tx_ip_header_error++;
+ 
+ 		if (unlikely(tdes3 & TDES3_PAYLOAD_ERROR))
+ 			x->tx_payload_error++;
+-
+-		ret = tx_err;
+ 	}
+ 
+ 	if (unlikely(tdes3 & TDES3_DEFERRED))
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
