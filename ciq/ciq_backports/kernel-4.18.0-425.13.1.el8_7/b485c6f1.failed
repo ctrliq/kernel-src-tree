@@ -1,0 +1,221 @@
+mm: vmscan: remove deadlock due to throttling failing to make progress
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.13.1.el8_7
+commit-author Mel Gorman <mgorman@suse.de>
+commit b485c6f1f9f54b81443efda5f3d8a5036ba2cd91
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.13.1.el8_7/b485c6f1.failed
+
+A soft lockup bug in kcompactd was reported in a private bugzilla with
+the following visible in dmesg;
+
+  watchdog: BUG: soft lockup - CPU#33 stuck for 26s! [kcompactd0:479]
+  watchdog: BUG: soft lockup - CPU#33 stuck for 52s! [kcompactd0:479]
+  watchdog: BUG: soft lockup - CPU#33 stuck for 78s! [kcompactd0:479]
+  watchdog: BUG: soft lockup - CPU#33 stuck for 104s! [kcompactd0:479]
+
+The machine had 256G of RAM with no swap and an earlier failed
+allocation indicated that node 0 where kcompactd was run was potentially
+unreclaimable;
+
+  Node 0 active_anon:29355112kB inactive_anon:2913528kB active_file:0kB
+    inactive_file:0kB unevictable:64kB isolated(anon):0kB isolated(file):0kB
+    mapped:8kB dirty:0kB writeback:0kB shmem:26780kB shmem_thp:
+    0kB shmem_pmdmapped: 0kB anon_thp: 23480320kB writeback_tmp:0kB
+    kernel_stack:2272kB pagetables:24500kB all_unreclaimable? yes
+
+Vlastimil Babka investigated a crash dump and found that a task
+migrating pages was trying to drain PCP lists;
+
+  PID: 52922  TASK: ffff969f820e5000  CPU: 19  COMMAND: "kworker/u128:3"
+  Call Trace:
+     __schedule
+     schedule
+     schedule_timeout
+     wait_for_completion
+     __flush_work
+     __drain_all_pages
+     __alloc_pages_slowpath.constprop.114
+     __alloc_pages
+     alloc_migration_target
+     migrate_pages
+     migrate_to_node
+     do_migrate_pages
+     cpuset_migrate_mm_workfn
+     process_one_work
+     worker_thread
+     kthread
+     ret_from_fork
+
+This failure is specific to CONFIG_PREEMPT=n builds.  The root of the
+problem is that kcompact0 is not rescheduling on a CPU while a task that
+has isolated a large number of the pages from the LRU is waiting on
+kcompact0 to reschedule so the pages can be released.  While
+shrink_inactive_list() only loops once around too_many_isolated, reclaim
+can continue without rescheduling if sc->skipped_deactivate == 1 which
+could happen if there was no file LRU and the inactive anon list was not
+low.
+
+Link: https://lkml.kernel.org/r/20220203100326.GD3301@suse.de
+Fixes: d818fca1cac3 ("mm/vmscan: throttle reclaim and compaction when too may pages are isolated")
+	Signed-off-by: Mel Gorman <mgorman@suse.de>
+	Debugged-by: Vlastimil Babka <vbabka@suse.cz>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: David Rientjes <rientjes@google.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b485c6f1f9f54b81443efda5f3d8a5036ba2cd91)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/vmscan.c
+diff --cc mm/vmscan.c
+index e3ffc3c3d8d7,59b14e0d696c..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -991,6 -1021,134 +991,137 @@@ static void handle_write_error(struct a
+  	unlock_page(page);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool skip_throttle_noprogress(pg_data_t *pgdat)
++ {
++ 	int reclaimable = 0, write_pending = 0;
++ 	int i;
++ 
++ 	/*
++ 	 * If kswapd is disabled, reschedule if necessary but do not
++ 	 * throttle as the system is likely near OOM.
++ 	 */
++ 	if (pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES)
++ 		return true;
++ 
++ 	/*
++ 	 * If there are a lot of dirty/writeback pages then do not
++ 	 * throttle as throttling will occur when the pages cycle
++ 	 * towards the end of the LRU if still under writeback.
++ 	 */
++ 	for (i = 0; i < MAX_NR_ZONES; i++) {
++ 		struct zone *zone = pgdat->node_zones + i;
++ 
++ 		if (!populated_zone(zone))
++ 			continue;
++ 
++ 		reclaimable += zone_reclaimable_pages(zone);
++ 		write_pending += zone_page_state_snapshot(zone,
++ 						  NR_ZONE_WRITE_PENDING);
++ 	}
++ 	if (2 * write_pending <= reclaimable)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ void reclaim_throttle(pg_data_t *pgdat, enum vmscan_throttle_state reason)
++ {
++ 	wait_queue_head_t *wqh = &pgdat->reclaim_wait[reason];
++ 	long timeout, ret;
++ 	DEFINE_WAIT(wait);
++ 
++ 	/*
++ 	 * Do not throttle IO workers, kthreads other than kswapd or
++ 	 * workqueues. They may be required for reclaim to make
++ 	 * forward progress (e.g. journalling workqueues or kthreads).
++ 	 */
++ 	if (!current_is_kswapd() &&
++ 	    current->flags & (PF_IO_WORKER|PF_KTHREAD)) {
++ 		cond_resched();
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * These figures are pulled out of thin air.
++ 	 * VMSCAN_THROTTLE_ISOLATED is a transient condition based on too many
++ 	 * parallel reclaimers which is a short-lived event so the timeout is
++ 	 * short. Failing to make progress or waiting on writeback are
++ 	 * potentially long-lived events so use a longer timeout. This is shaky
++ 	 * logic as a failure to make progress could be due to anything from
++ 	 * writeback to a slow device to excessive references pages at the tail
++ 	 * of the inactive LRU.
++ 	 */
++ 	switch(reason) {
++ 	case VMSCAN_THROTTLE_WRITEBACK:
++ 		timeout = HZ/10;
++ 
++ 		if (atomic_inc_return(&pgdat->nr_writeback_throttled) == 1) {
++ 			WRITE_ONCE(pgdat->nr_reclaim_start,
++ 				node_page_state(pgdat, NR_THROTTLED_WRITTEN));
++ 		}
++ 
++ 		break;
++ 	case VMSCAN_THROTTLE_CONGESTED:
++ 		fallthrough;
++ 	case VMSCAN_THROTTLE_NOPROGRESS:
++ 		if (skip_throttle_noprogress(pgdat)) {
++ 			cond_resched();
++ 			return;
++ 		}
++ 
++ 		timeout = 1;
++ 
++ 		break;
++ 	case VMSCAN_THROTTLE_ISOLATED:
++ 		timeout = HZ/50;
++ 		break;
++ 	default:
++ 		WARN_ON_ONCE(1);
++ 		timeout = HZ;
++ 		break;
++ 	}
++ 
++ 	prepare_to_wait(wqh, &wait, TASK_UNINTERRUPTIBLE);
++ 	ret = schedule_timeout(timeout);
++ 	finish_wait(wqh, &wait);
++ 
++ 	if (reason == VMSCAN_THROTTLE_WRITEBACK)
++ 		atomic_dec(&pgdat->nr_writeback_throttled);
++ 
++ 	trace_mm_vmscan_throttled(pgdat->node_id, jiffies_to_usecs(timeout),
++ 				jiffies_to_usecs(timeout - ret),
++ 				reason);
++ }
++ 
++ /*
++  * Account for pages written if tasks are throttled waiting on dirty
++  * pages to clean. If enough pages have been cleaned since throttling
++  * started then wakeup the throttled tasks.
++  */
++ void __acct_reclaim_writeback(pg_data_t *pgdat, struct folio *folio,
++ 							int nr_throttled)
++ {
++ 	unsigned long nr_written;
++ 
++ 	node_stat_add_folio(folio, NR_THROTTLED_WRITTEN);
++ 
++ 	/*
++ 	 * This is an inaccurate read as the per-cpu deltas may not
++ 	 * be synchronised. However, given that the system is
++ 	 * writeback throttled, it is not worth taking the penalty
++ 	 * of getting an accurate count. At worst, the throttle
++ 	 * timeout guarantees forward progress.
++ 	 */
++ 	nr_written = node_page_state(pgdat, NR_THROTTLED_WRITTEN) -
++ 		READ_ONCE(pgdat->nr_reclaim_start);
++ 
++ 	if (nr_written > SWAP_CLUSTER_MAX * nr_throttled)
++ 		wake_up(&pgdat->reclaim_wait[VMSCAN_THROTTLE_WRITEBACK]);
++ }
++ 
+++>>>>>>> b485c6f1f9f5 (mm: vmscan: remove deadlock due to throttling failing to make progress)
+  /* possible outcome of pageout() */
+  typedef enum {
+  	/* failed to write page out, page is locked */
+* Unmerged path mm/vmscan.c
