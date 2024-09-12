@@ -1,0 +1,346 @@
+net/mlx5e: Use mlx5e_safe_switch_channels when channels are closed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Maxim Mikityanskiy <maximmi@mellanox.com>
+commit 69cc4185dcbaaedc52d5d8d13b4aac2a3836a874
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/69cc4185.failed
+
+This commit uses new functionality of mlx5e_safe_switch_channels
+introduced by the previous commit to reduce the amount of repeating
+similar code all over the driver.
+
+It's very common in mlx5e to call mlx5e_safe_switch_channels when the
+channels are open, but assign parameters and run hardware commands
+manually when the channels are closed.
+
+After the previous commit it's no longer needed to do such manual things
+every time, so this commit removes unneeded code and relies on the new
+functionality of mlx5e_safe_switch_channels. Some of the places are
+refactored and simplified, where more complex flows are used to change
+configuration on the fly, without recreating the channels (the logic is
+rewritten in a more robust way, with a reset required by default and a
+list of exceptions).
+
+	Signed-off-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 69cc4185dcbaaedc52d5d8d13b4aac2a3836a874)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+index f9afbdefded5,d907c1acd4d5..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+@@@ -528,3 -749,64 +528,67 @@@ void mlx5e_ptp_deactivate_channel(struc
+  
+  	napi_disable(&c->napi);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int mlx5e_ptp_get_rqn(struct mlx5e_ptp *c, u32 *rqn)
++ {
++ 	if (!c || !test_bit(MLX5E_PTP_STATE_RX, c->state))
++ 		return -EINVAL;
++ 
++ 	*rqn = c->rq.rqn;
++ 	return 0;
++ }
++ 
++ int mlx5e_ptp_alloc_rx_fs(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_ptp_fs *ptp_fs;
++ 
++ 	if (!priv->profile->rx_ptp_support)
++ 		return 0;
++ 
++ 	ptp_fs = kzalloc(sizeof(*ptp_fs), GFP_KERNEL);
++ 	if (!ptp_fs)
++ 		return -ENOMEM;
++ 
++ 	priv->fs.ptp_fs = ptp_fs;
++ 	return 0;
++ }
++ 
++ void mlx5e_ptp_free_rx_fs(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_ptp_fs *ptp_fs = priv->fs.ptp_fs;
++ 
++ 	if (!priv->profile->rx_ptp_support)
++ 		return;
++ 
++ 	mlx5e_ptp_rx_unset_fs(priv);
++ 	kfree(ptp_fs);
++ }
++ 
++ int mlx5e_ptp_rx_manage_fs(struct mlx5e_priv *priv, bool set)
++ {
++ 	struct mlx5e_ptp *c = priv->channels.ptp;
++ 
++ 	if (!priv->profile->rx_ptp_support)
++ 		return 0;
++ 
++ 	if (!test_bit(MLX5E_STATE_OPENED, &priv->state))
++ 		return 0;
++ 
++ 	if (set) {
++ 		if (!c || !test_bit(MLX5E_PTP_STATE_RX, c->state)) {
++ 			netdev_WARN_ONCE(priv->netdev, "Don't try to add PTP RX-FS rules");
++ 			return -EINVAL;
++ 		}
++ 		return mlx5e_ptp_rx_set_fs(priv);
++ 	}
++ 	/* set == false */
++ 	if (c && test_bit(MLX5E_PTP_STATE_RX, c->state)) {
++ 		netdev_WARN_ONCE(priv->netdev, "Don't try to remove PTP RX-FS rules");
++ 		return -EINVAL;
++ 	}
++ 	mlx5e_ptp_rx_unset_fs(priv);
++ 	return 0;
++ }
+++>>>>>>> 69cc4185dcba (net/mlx5e: Use mlx5e_safe_switch_channels when channels are closed)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 12c3751bdd22,0e5539afc3a0..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -4030,6 -4042,16 +4014,19 @@@ int mlx5e_hwstamp_set(struct mlx5e_pri
+  		return -ERANGE;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (new_channels.params.ptp_rx == priv->channels.params.ptp_rx)
++ 		goto out;
++ 
++ 	err = mlx5e_safe_switch_channels(priv, &new_channels, mlx5e_ptp_rx_manage_fs_ctx,
++ 					 &new_channels.params.ptp_rx);
++ 	if (err) {
++ 		mutex_unlock(&priv->state_lock);
++ 		return err;
++ 	}
++ out:
+++>>>>>>> 69cc4185dcba (net/mlx5e: Use mlx5e_safe_switch_channels when channels are closed)
+  	memcpy(&priv->tstamp, &config, sizeof(config));
+  	mutex_unlock(&priv->state_lock);
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_dcbnl.c b/drivers/net/ethernet/mellanox/mlx5/core/en_dcbnl.c
+index f23c67575073..9d4d83159603 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_dcbnl.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_dcbnl.c
+@@ -1150,8 +1150,6 @@ static int mlx5e_update_trust_state_hw(struct mlx5e_priv *priv, void *context)
+ static int mlx5e_set_trust_state(struct mlx5e_priv *priv, u8 trust_state)
+ {
+ 	struct mlx5e_channels new_channels = {};
+-	bool reset_channels = true;
+-	bool opened;
+ 	int err = 0;
+ 
+ 	mutex_lock(&priv->state_lock);
+@@ -1160,25 +1158,18 @@ static int mlx5e_set_trust_state(struct mlx5e_priv *priv, u8 trust_state)
+ 	mlx5e_params_calc_trust_tx_min_inline_mode(priv->mdev, &new_channels.params,
+ 						   trust_state);
+ 
+-	opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+-	if (!opened)
+-		reset_channels = false;
+-
+ 	/* Skip if tx_min_inline is the same */
+ 	if (new_channels.params.tx_min_inline_mode ==
+-	    priv->channels.params.tx_min_inline_mode)
+-		reset_channels = false;
+-
+-	if (reset_channels) {
+-		err = mlx5e_safe_switch_channels(priv, &new_channels,
+-						 mlx5e_update_trust_state_hw,
+-						 &trust_state);
+-	} else {
++	    priv->channels.params.tx_min_inline_mode) {
+ 		err = mlx5e_update_trust_state_hw(priv, &trust_state);
+-		if (!err && !opened)
+-			priv->channels.params = new_channels.params;
++		goto out;
+ 	}
+ 
++	err = mlx5e_safe_switch_channels(priv, &new_channels,
++					 mlx5e_update_trust_state_hw,
++					 &trust_state);
++
++out:
+ 	mutex_unlock(&priv->state_lock);
+ 
+ 	return err;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index ece5963738c0..53554aaf3234 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -372,11 +372,6 @@ int mlx5e_ethtool_set_ringparam(struct mlx5e_priv *priv,
+ 	if (err)
+ 		goto unlock;
+ 
+-	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+-		priv->channels.params = new_channels.params;
+-		goto unlock;
+-	}
+-
+ 	err = mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
+ 
+ unlock:
+@@ -424,6 +419,7 @@ int mlx5e_ethtool_set_channels(struct mlx5e_priv *priv,
+ 	unsigned int count = ch->combined_count;
+ 	struct mlx5e_channels new_channels = {};
+ 	bool arfs_enabled;
++	bool opened;
+ 	int err = 0;
+ 
+ 	if (!count) {
+@@ -461,19 +457,9 @@ int mlx5e_ethtool_set_channels(struct mlx5e_priv *priv,
+ 	new_channels.params = *cur_params;
+ 	new_channels.params.num_channels = count;
+ 
+-	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+-		struct mlx5e_params old_params;
+-
+-		old_params = *cur_params;
+-		*cur_params = new_channels.params;
+-		err = mlx5e_num_channels_changed(priv);
+-		if (err)
+-			*cur_params = old_params;
++	opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+ 
+-		goto out;
+-	}
+-
+-	arfs_enabled = priv->netdev->features & NETIF_F_NTUPLE;
++	arfs_enabled = opened && (priv->netdev->features & NETIF_F_NTUPLE);
+ 	if (arfs_enabled)
+ 		mlx5e_arfs_disable(priv);
+ 
+@@ -626,12 +612,10 @@ int mlx5e_ethtool_set_coalesce(struct mlx5e_priv *priv,
+ 		mlx5e_reset_tx_moderation(&new_channels.params, mode);
+ 	}
+ 
+-	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+-		priv->channels.params = new_channels.params;
+-		goto out;
+-	}
+-
+-	if (!reset_rx && !reset_tx) {
++	/* If DIM state hasn't changed, it's possible to modify interrupt
++	 * moderation parameters on the fly, even if the channels are open.
++	 */
++	if (!reset_rx && !reset_tx && test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+ 		if (!coal->use_adaptive_rx_coalesce)
+ 			mlx5e_set_priv_channels_rx_coalesce(priv, coal);
+ 		if (!coal->use_adaptive_tx_coalesce)
+@@ -1889,11 +1873,6 @@ static int set_pflag_cqe_based_moder(struct net_device *netdev, bool enable,
+ 	else
+ 		mlx5e_set_tx_cq_mode_params(&new_channels.params, cq_period_mode);
+ 
+-	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+-		priv->channels.params = new_channels.params;
+-		return 0;
+-	}
+-
+ 	return mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
+ }
+ 
+@@ -1922,10 +1901,6 @@ int mlx5e_modify_rx_cqe_compression_locked(struct mlx5e_priv *priv, bool new_val
+ 	new_channels.params = priv->channels.params;
+ 	MLX5E_SET_PFLAG(&new_channels.params, MLX5E_PFLAG_RX_CQE_COMPRESS, new_val);
+ 
+-	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+-		priv->channels.params = new_channels.params;
+-		return 0;
+-	}
+ 
+ 	err = mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
+ 	if (err)
+@@ -1983,11 +1958,6 @@ static int set_pflag_rx_striding_rq(struct net_device *netdev, bool enable)
+ 	MLX5E_SET_PFLAG(&new_channels.params, MLX5E_PFLAG_RX_STRIDING_RQ, enable);
+ 	mlx5e_set_rq_type(mdev, &new_channels.params);
+ 
+-	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+-		priv->channels.params = new_channels.params;
+-		return 0;
+-	}
+-
+ 	return mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
+ }
+ 
+@@ -2018,7 +1988,6 @@ static int set_pflag_tx_mpwqe_common(struct net_device *netdev, u32 flag, bool e
+ 	struct mlx5e_priv *priv = netdev_priv(netdev);
+ 	struct mlx5_core_dev *mdev = priv->mdev;
+ 	struct mlx5e_channels new_channels = {};
+-	int err;
+ 
+ 	if (enable && !mlx5e_tx_mpwqe_supported(mdev))
+ 		return -EOPNOTSUPP;
+@@ -2027,13 +1996,7 @@ static int set_pflag_tx_mpwqe_common(struct net_device *netdev, u32 flag, bool e
+ 
+ 	MLX5E_SET_PFLAG(&new_channels.params, flag, enable);
+ 
+-	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+-		priv->channels.params = new_channels.params;
+-		return 0;
+-	}
+-
+-	err = mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
+-	return err;
++	return mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
+ }
+ 
+ static int set_pflag_xdp_tx_mpwqe(struct net_device *netdev, bool enable)
+@@ -2073,20 +2036,8 @@ static int set_pflag_tx_port_ts(struct net_device *netdev, bool enable)
+ 	 * has the same log_sq_size.
+ 	 */
+ 
+-	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+-		struct mlx5e_params old_params;
+-
+-		old_params = priv->channels.params;
+-		priv->channels.params = new_channels.params;
+-		err = mlx5e_num_channels_changed(priv);
+-		if (err)
+-			priv->channels.params = old_params;
+-		goto out;
+-	}
+-
+ 	err = mlx5e_safe_switch_channels(priv, &new_channels,
+ 					 mlx5e_num_channels_changed_ctx, NULL);
+-out:
+ 	if (!err)
+ 		priv->port_ptp_opened = true;
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+index e73e098ed210..812ed4f7e0b9 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@ -481,20 +481,11 @@ static int mlx5i_change_mtu(struct net_device *netdev, int new_mtu)
+ {
+ 	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
+ 	struct mlx5e_channels new_channels = {};
+-	struct mlx5e_params *params;
+ 	int err = 0;
+ 
+ 	mutex_lock(&priv->state_lock);
+ 
+-	params = &priv->channels.params;
+-
+-	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+-		params->sw_mtu = new_mtu;
+-		netdev->mtu = params->sw_mtu;
+-		goto out;
+-	}
+-
+-	new_channels.params = *params;
++	new_channels.params = priv->channels.params;
+ 	new_channels.params.sw_mtu = new_mtu;
+ 
+ 	err = mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
