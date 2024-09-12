@@ -1,0 +1,174 @@
+scsi: target: iscsi: Extract auth functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-494.el8
+commit-author Dmitry Bogdanov <d.bogdanov@yadro.com>
+commit a75fcb0912a549c6c1da8395f33271ce06e84acd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-494.el8/a75fcb09.failed
+
+Create functions that answers simple questions: Whether authentication is
+required, what credentials, whether connection is autenticated.
+
+Link: https://lore.kernel.org/r/20220523095905.26070-3-d.bogdanov@yadro.com
+	Reviewed-by: Roman Bolshakov <r.bolshakov@yadro.com>
+	Reviewed-by: Konstantin Shelekhin <k.shelekhin@yadro.com>
+	Reviewed-by: Mike Christie <michael.christie@oracle.com>
+	Reviewed-by: Lee Duncan <lduncan@suse.com>
+	Signed-off-by: Dmitry Bogdanov <d.bogdanov@yadro.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit a75fcb0912a549c6c1da8395f33271ce06e84acd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/iscsi/iscsi_target_nego.c
+diff --cc drivers/target/iscsi/iscsi_target_nego.c
+index 5e35f8260dd3,f06f16d63fe6..000000000000
+--- a/drivers/target/iscsi/iscsi_target_nego.c
++++ b/drivers/target/iscsi/iscsi_target_nego.c
+@@@ -102,46 -94,44 +102,48 @@@ int extract_param
+  	return 0;
+  }
+  
++ static struct iscsi_node_auth *iscsi_get_node_auth(struct iscsit_conn *conn)
++ {
++ 	struct iscsi_portal_group *tpg;
++ 	struct iscsi_node_acl *nacl;
++ 	struct se_node_acl *se_nacl;
++ 
++ 	if (conn->sess->sess_ops->SessionType)
++ 		return &iscsit_global->discovery_acl.node_auth;
++ 
++ 	se_nacl = conn->sess->se_sess->se_node_acl;
++ 	if (!se_nacl) {
++ 		pr_err("Unable to locate struct se_node_acl for CHAP auth\n");
++ 		return NULL;
++ 	}
++ 
++ 	if (se_nacl->dynamic_node_acl) {
++ 		tpg = to_iscsi_tpg(se_nacl->se_tpg);
++ 		return &tpg->tpg_demo_auth;
++ 	}
++ 
++ 	nacl = to_iscsi_nacl(se_nacl);
++ 
++ 	return &nacl->node_auth;
++ }
++ 
+  static u32 iscsi_handle_authentication(
+ -	struct iscsit_conn *conn,
+ +	struct iscsi_conn *conn,
+  	char *in_buf,
+  	char *out_buf,
+  	int in_length,
+  	int *out_length,
+  	unsigned char *authtype)
+  {
+++<<<<<<< HEAD
+ +	struct iscsi_session *sess = conn->sess;
+++=======
+++>>>>>>> a75fcb0912a5 (scsi: target: iscsi: Extract auth functions)
+  	struct iscsi_node_auth *auth;
+- 	struct iscsi_node_acl *nacl;
+- 	struct iscsi_portal_group *tpg;
+- 	struct se_node_acl *se_nacl;
+  
+- 	if (!sess->sess_ops->SessionType) {
+- 		/*
+- 		 * For SessionType=Normal
+- 		 */
+- 		se_nacl = conn->sess->se_sess->se_node_acl;
+- 		if (!se_nacl) {
+- 			pr_err("Unable to locate struct se_node_acl for"
+- 					" CHAP auth\n");
+- 			return -1;
+- 		}
+- 
+- 		if (se_nacl->dynamic_node_acl) {
+- 			tpg = to_iscsi_tpg(se_nacl->se_tpg);
+- 
+- 			auth = &tpg->tpg_demo_auth;
+- 		} else {
+- 			nacl = to_iscsi_nacl(se_nacl);
+- 
+- 			auth = &nacl->node_auth;
+- 		}
+- 	} else {
+- 		/*
+- 		 * For SessionType=Discovery
+- 		 */
+- 		auth = &iscsit_global->discovery_acl.node_auth;
+- 	}
++ 	auth = iscsi_get_node_auth(conn);
++ 	if (!auth)
++ 		return -1;
+  
+  	if (strstr("CHAP", authtype))
+  		strcpy(conn->sess->auth_type, "CHAP");
+@@@ -821,8 -811,39 +823,39 @@@ static int iscsi_target_do_authenticati
+  	return 0;
+  }
+  
++ static bool iscsi_conn_auth_required(struct iscsit_conn *conn)
++ {
++ 	struct se_node_acl *se_nacl;
++ 
++ 	if (conn->sess->sess_ops->SessionType) {
++ 		/*
++ 		 * For SessionType=Discovery
++ 		 */
++ 		return conn->tpg->tpg_attrib.authentication;
++ 	}
++ 	/*
++ 	 * For SessionType=Normal
++ 	 */
++ 	se_nacl = conn->sess->se_sess->se_node_acl;
++ 	if (!se_nacl) {
++ 		pr_debug("Unknown ACL %s is trying to connect\n",
++ 			 se_nacl->initiatorname);
++ 		return true;
++ 	}
++ 
++ 	if (se_nacl->dynamic_node_acl) {
++ 		pr_debug("Dynamic ACL %s is trying to connect\n",
++ 			 se_nacl->initiatorname);
++ 		return conn->tpg->tpg_attrib.authentication;
++ 	}
++ 
++ 	pr_debug("Known ACL %s is trying to connect\n",
++ 		 se_nacl->initiatorname);
++ 	return conn->tpg->tpg_attrib.authentication;
++ }
++ 
+  static int iscsi_target_handle_csg_zero(
+ -	struct iscsit_conn *conn,
+ +	struct iscsi_conn *conn,
+  	struct iscsi_login *login)
+  {
+  	int ret;
+@@@ -912,7 -937,19 +949,23 @@@ do_auth
+  	return iscsi_target_do_authentication(conn, login);
+  }
+  
+++<<<<<<< HEAD
+ +static int iscsi_target_handle_csg_one(struct iscsi_conn *conn, struct iscsi_login *login)
+++=======
++ static bool iscsi_conn_authenticated(struct iscsit_conn *conn,
++ 				     struct iscsi_login *login)
++ {
++ 	if (!iscsi_conn_auth_required(conn))
++ 		return true;
++ 
++ 	if (login->auth_complete)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static int iscsi_target_handle_csg_one(struct iscsit_conn *conn, struct iscsi_login *login)
+++>>>>>>> a75fcb0912a5 (scsi: target: iscsi: Extract auth functions)
+  {
+  	int ret;
+  	u32 payload_length;
+* Unmerged path drivers/target/iscsi/iscsi_target_nego.c
