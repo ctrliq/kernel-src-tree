@@ -1,0 +1,204 @@
+amd-pstate: Fix amd_pstate mode switch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-518.el8
+commit-author Wyes Karny <wyes.karny@amd.com>
+commit 4654e9f9f43993eb9ce383fa7c88d14b052b8cc3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-518.el8/4654e9f9.failed
+
+amd_pstate mode can be changed by writing the mode name to the `status`
+sysfs. But some combinations are not working. Fix this issue by taking
+care of the edge cases.
+
+Before the fix the mode change combination test fails:
+
+ #./pst_test.sh
+Test passed: from: disable, to
+Test passed: from: disable, to disable
+Test failed: 1, From mode: disable, to mode: passive
+Test failed: 1, From mode: disable, to mode: active
+Test failed: 1, From mode: passive, to mode: active
+Test passed: from: passive, to disable
+Test failed: 1, From mode: passive, to mode: passive
+Test failed: 1, From mode: passive, to mode: active
+Test failed: 1, From mode: active, to mode: active
+Test passed: from: active, to disable
+Test failed: 1, From mode: active, to mode: passive
+Test failed: 1, From mode: active, to mode: active
+
+After the fix test passes:
+
+ #./pst_test.sh
+Test passed: from: disable, to
+Test passed: from: disable, to disable
+Test passed: from: disable, to passive
+Test passed: from: disable, to active
+Test passed: from: passive, to active
+Test passed: from: passive, to disable
+Test passed: from: passive, to passive
+Test passed: from: passive, to active
+Test passed: from: active, to active
+Test passed: from: active, to disable
+Test passed: from: active, to passive
+Test passed: from: active, to active
+
+Fixes: abd61c08ef349 ("cpufreq: amd-pstate: add driver working mode switch support")
+	Acked-by: Huang Rui <ray.huang@amd.com>
+	Reviewed-by: Alexey Kardashevskiy <aik@amd.com>
+	Signed-off-by: Wyes Karny <wyes.karny@amd.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 4654e9f9f43993eb9ce383fa7c88d14b052b8cc3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/amd-pstate.c
+diff --cc drivers/cpufreq/amd-pstate.c
+index 2c71ef90154d,8dd46fad151e..000000000000
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@@ -650,6 -767,139 +650,142 @@@ static ssize_t show_amd_pstate_highest_
+  	return sysfs_emit(buf, "%u\n", perf);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t show_energy_performance_available_preferences(
++ 				struct cpufreq_policy *policy, char *buf)
++ {
++ 	int i = 0;
++ 	int offset = 0;
++ 
++ 	while (energy_perf_strings[i] != NULL)
++ 		offset += sysfs_emit_at(buf, offset, "%s ", energy_perf_strings[i++]);
++ 
++ 	sysfs_emit_at(buf, offset, "\n");
++ 
++ 	return offset;
++ }
++ 
++ static ssize_t store_energy_performance_preference(
++ 		struct cpufreq_policy *policy, const char *buf, size_t count)
++ {
++ 	struct amd_cpudata *cpudata = policy->driver_data;
++ 	char str_preference[21];
++ 	ssize_t ret;
++ 
++ 	ret = sscanf(buf, "%20s", str_preference);
++ 	if (ret != 1)
++ 		return -EINVAL;
++ 
++ 	ret = match_string(energy_perf_strings, -1, str_preference);
++ 	if (ret < 0)
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&amd_pstate_limits_lock);
++ 	ret = amd_pstate_set_energy_pref_index(cpudata, ret);
++ 	mutex_unlock(&amd_pstate_limits_lock);
++ 
++ 	return ret ?: count;
++ }
++ 
++ static ssize_t show_energy_performance_preference(
++ 				struct cpufreq_policy *policy, char *buf)
++ {
++ 	struct amd_cpudata *cpudata = policy->driver_data;
++ 	int preference;
++ 
++ 	preference = amd_pstate_get_energy_pref_index(cpudata);
++ 	if (preference < 0)
++ 		return preference;
++ 
++ 	return sysfs_emit(buf, "%s\n", energy_perf_strings[preference]);
++ }
++ 
++ static ssize_t amd_pstate_show_status(char *buf)
++ {
++ 	if (!current_pstate_driver)
++ 		return sysfs_emit(buf, "disable\n");
++ 
++ 	return sysfs_emit(buf, "%s\n", amd_pstate_mode_string[cppc_state]);
++ }
++ 
++ static void amd_pstate_driver_cleanup(void)
++ {
++ 	current_pstate_driver = NULL;
++ }
++ 
++ static int amd_pstate_update_status(const char *buf, size_t size)
++ {
++ 	int ret = 0;
++ 	int mode_idx;
++ 
++ 	if (size > 7 || size < 6)
++ 		return -EINVAL;
++ 	mode_idx = get_mode_idx_from_str(buf, size);
++ 
++ 	switch(mode_idx) {
++ 	case AMD_PSTATE_DISABLE:
++ 		if (current_pstate_driver) {
++ 			cpufreq_unregister_driver(current_pstate_driver);
++ 			amd_pstate_driver_cleanup();
++ 		}
++ 		break;
++ 	case AMD_PSTATE_PASSIVE:
++ 		if (current_pstate_driver) {
++ 			if (current_pstate_driver == &amd_pstate_driver)
++ 				return 0;
++ 			cpufreq_unregister_driver(current_pstate_driver);
++ 		}
++ 
++ 		current_pstate_driver = &amd_pstate_driver;
++ 		cppc_state = AMD_PSTATE_PASSIVE;
++ 		ret = cpufreq_register_driver(current_pstate_driver);
++ 		break;
++ 	case AMD_PSTATE_ACTIVE:
++ 		if (current_pstate_driver) {
++ 			if (current_pstate_driver == &amd_pstate_epp_driver)
++ 				return 0;
++ 			cpufreq_unregister_driver(current_pstate_driver);
++ 		}
++ 
++ 		current_pstate_driver = &amd_pstate_epp_driver;
++ 		cppc_state = AMD_PSTATE_ACTIVE;
++ 		ret = cpufreq_register_driver(current_pstate_driver);
++ 		break;
++ 	default:
++ 		ret = -EINVAL;
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static ssize_t show_status(struct kobject *kobj,
++ 			   struct kobj_attribute *attr, char *buf)
++ {
++ 	ssize_t ret;
++ 
++ 	mutex_lock(&amd_pstate_driver_lock);
++ 	ret = amd_pstate_show_status(buf);
++ 	mutex_unlock(&amd_pstate_driver_lock);
++ 
++ 	return ret;
++ }
++ 
++ static ssize_t store_status(struct kobject *a, struct kobj_attribute *b,
++ 			    const char *buf, size_t count)
++ {
++ 	char *p = memchr(buf, '\n', count);
++ 	int ret;
++ 
++ 	mutex_lock(&amd_pstate_driver_lock);
++ 	ret = amd_pstate_update_status(buf, p ? p - buf : count);
++ 	mutex_unlock(&amd_pstate_driver_lock);
++ 
++ 	return ret < 0 ? ret : count;
++ }
++ 
+++>>>>>>> 4654e9f9f439 (amd-pstate: Fix amd_pstate mode switch)
+  cpufreq_freq_attr_ro(amd_pstate_max_freq);
+  cpufreq_freq_attr_ro(amd_pstate_lowest_nonlinear_freq);
+  
+* Unmerged path drivers/cpufreq/amd-pstate.c
