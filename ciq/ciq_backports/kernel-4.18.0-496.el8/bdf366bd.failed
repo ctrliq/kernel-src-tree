@@ -1,0 +1,106 @@
+net/sched: taprio: don't allow dynamic max_sdu to go negative after stab adjustment
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit bdf366bd867c4565b535a5825df7ddcb4773fc28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/bdf366bd.failed
+
+The overhead specified in the size table comes from the user. With small
+time intervals (or gates always closed), the overhead can be larger than
+the max interval for that traffic class, and their difference is
+negative.
+
+What we want to happen is for max_sdu_dynamic to have the smallest
+non-zero value possible (1) which means that all packets on that traffic
+class are dropped on enqueue. However, since max_sdu_dynamic is u32, a
+negative is represented as a large value and oversized dropping never
+happens.
+
+Use max_t with int to force a truncation of max_frm_len to no smaller
+than dev->hard_header_len + 1, which in turn makes max_sdu_dynamic no
+smaller than 1.
+
+Fixes: fed87cc6718a ("net/sched: taprio: automatically calculate queueMaxSDU based on TC gate durations")
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Reviewed-by: Kurt Kanzenbach <kurt@linutronix.de>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit bdf366bd867c4565b535a5825df7ddcb4773fc28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_taprio.c
+diff --cc net/sched/sch_taprio.c
+index 45d4da9669a4,53ba4d6b0218..000000000000
+--- a/net/sched/sch_taprio.c
++++ b/net/sched/sch_taprio.c
+@@@ -228,7 -244,62 +228,66 @@@ static ktime_t get_interval_end_time(st
+  
+  static int length_to_duration(struct taprio_sched *q, int len)
+  {
+++<<<<<<< HEAD
+ +	return div_u64(len * atomic64_read(&q->picos_per_byte), 1000);
+++=======
++ 	return div_u64(len * atomic64_read(&q->picos_per_byte), PSEC_PER_NSEC);
++ }
++ 
++ static int duration_to_length(struct taprio_sched *q, u64 duration)
++ {
++ 	return div_u64(duration * PSEC_PER_NSEC, atomic64_read(&q->picos_per_byte));
++ }
++ 
++ /* Sets sched->max_sdu[] and sched->max_frm_len[] to the minimum between the
++  * q->max_sdu[] requested by the user and the max_sdu dynamically determined by
++  * the maximum open gate durations at the given link speed.
++  */
++ static void taprio_update_queue_max_sdu(struct taprio_sched *q,
++ 					struct sched_gate_list *sched,
++ 					struct qdisc_size_table *stab)
++ {
++ 	struct net_device *dev = qdisc_dev(q->root);
++ 	int num_tc = netdev_get_num_tc(dev);
++ 	u32 max_sdu_from_user;
++ 	u32 max_sdu_dynamic;
++ 	u32 max_sdu;
++ 	int tc;
++ 
++ 	for (tc = 0; tc < num_tc; tc++) {
++ 		max_sdu_from_user = q->max_sdu[tc] ?: U32_MAX;
++ 
++ 		/* TC gate never closes => keep the queueMaxSDU
++ 		 * selected by the user
++ 		 */
++ 		if (sched->max_open_gate_duration[tc] == sched->cycle_time) {
++ 			max_sdu_dynamic = U32_MAX;
++ 		} else {
++ 			u32 max_frm_len;
++ 
++ 			max_frm_len = duration_to_length(q, sched->max_open_gate_duration[tc]);
++ 			/* Compensate for L1 overhead from size table,
++ 			 * but don't let the frame size go negative
++ 			 */
++ 			if (stab) {
++ 				max_frm_len -= stab->szopts.overhead;
++ 				max_frm_len = max_t(int, max_frm_len,
++ 						    dev->hard_header_len + 1);
++ 			}
++ 			max_sdu_dynamic = max_frm_len - dev->hard_header_len;
++ 		}
++ 
++ 		max_sdu = min(max_sdu_dynamic, max_sdu_from_user);
++ 
++ 		if (max_sdu != U32_MAX) {
++ 			sched->max_frm_len[tc] = max_sdu + dev->hard_header_len;
++ 			sched->max_sdu[tc] = max_sdu;
++ 		} else {
++ 			sched->max_frm_len[tc] = U32_MAX; /* never oversized */
++ 			sched->max_sdu[tc] = 0;
++ 		}
++ 	}
+++>>>>>>> bdf366bd867c (net/sched: taprio: don't allow dynamic max_sdu to go negative after stab adjustment)
+  }
+  
+  /* Returns the entry corresponding to next available interval. If
+* Unmerged path net/sched/sch_taprio.c
