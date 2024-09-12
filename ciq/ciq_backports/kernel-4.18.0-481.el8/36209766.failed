@@ -1,0 +1,216 @@
+x86/traps: Cleanup do_general_protection()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Borislav Petkov <bp@suse.de>
+commit 36209766cede1fe9d39f3d3418d93bbf71ad21c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/36209766.failed
+
+Hoist the user_mode() case up because it is less code and can be dealt
+with up-front like the other special cases UMIP and vm86.
+
+This saves an indentation level for the kernel-mode #GP case and allows
+to "unfold" the code more so that it is more readable.
+
+No functional changes.
+
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: x86@kernel.org
+(cherry picked from commit 36209766cede1fe9d39f3d3418d93bbf71ad21c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/traps.c
+diff --cc arch/x86/kernel/traps.c
+index 462aa0afd7cd,ca395ad28b4e..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -475,68 -520,59 +475,75 @@@ exit_trap
+  	do_trap(X86_TRAP_BR, SIGSEGV, "bounds", regs, error_code, 0, NULL);
+  }
+  
+ -enum kernel_gp_hint {
+ -	GP_NO_HINT,
+ -	GP_NON_CANONICAL,
+ -	GP_CANONICAL
+ -};
+ -
+  /*
+ - * When an uncaught #GP occurs, try to determine the memory address accessed by
+ - * the instruction and return that address to the caller. Also, try to figure
+ - * out whether any part of the access to that address was non-canonical.
+ + * The unprivileged ENQCMD instruction generates #GPs if the
+ + * IA32_PASID MSR has not been populated.  If possible, populate
+ + * the MSR from a PASID previously allocated to the mm.
+   */
+ -static enum kernel_gp_hint get_kernel_gp_address(struct pt_regs *regs,
+ -						 unsigned long *addr)
+ +static bool try_fixup_enqcmd_gp(void)
+  {
+ -	u8 insn_buf[MAX_INSN_SIZE];
+ -	struct insn insn;
+ +#ifdef CONFIG_IOMMU_SVA
+ +	u32 pasid;
+  
+ -	if (probe_kernel_read(insn_buf, (void *)regs->ip, MAX_INSN_SIZE))
+ -		return GP_NO_HINT;
+ +	/*
+ +	 * MSR_IA32_PASID is managed using XSAVE.  Directly
+ +	 * writing to the MSR is only possible when fpregs
+ +	 * are valid and the fpstate is not.  This is
+ +	 * guaranteed when handling a userspace exception
+ +	 * in *before* interrupts are re-enabled.
+ +	 */
+ +	lockdep_assert_irqs_disabled();
+  
+ -	kernel_insn_init(&insn, insn_buf, MAX_INSN_SIZE);
+ -	insn_get_modrm(&insn);
+ -	insn_get_sib(&insn);
+ +	/*
+ +	 * Hardware without ENQCMD will not generate
+ +	 * #GPs that can be fixed up here.
+ +	 */
+ +	if (!cpu_feature_enabled(X86_FEATURE_ENQCMD))
+ +		return false;
+  
+ -	*addr = (unsigned long)insn_get_addr_ref(&insn, regs);
+ -	if (*addr == -1UL)
+ -		return GP_NO_HINT;
+ +	pasid = current->mm->pasid;
+  
+ -#ifdef CONFIG_X86_64
+  	/*
+ -	 * Check that:
+ -	 *  - the operand is not in the kernel half
+ -	 *  - the last byte of the operand is not in the user canonical half
+ +	 * If the mm has not been allocated a
+ +	 * PASID, the #GP can not be fixed up.
+  	 */
+ -	if (*addr < ~__VIRTUAL_MASK &&
+ -	    *addr + insn.opnd_bytes - 1 > __VIRTUAL_MASK)
+ -		return GP_NON_CANONICAL;
+ -#endif
+ +	if (!pasid_valid(pasid))
+ +		return false;
+  
+ -	return GP_CANONICAL;
+ -}
+ +	/*
+ +	 * Did this thread already have its PASID activated?
+ +	 * If so, the #GP must be from something else.
+ +	 */
+ +	if (current->pasid_activated)
+ +		return false;
+ +
+ +	wrmsrl(MSR_IA32_PASID, pasid | MSR_IA32_PASID_VALID);
+ +	current->pasid_activated = 1;
+  
+ -#define GPFSTR "general protection fault"
+ +	return true;
+ +#else
+ +	return false;
+ +#endif
+ +}
+  
+ -dotraplinkage void do_general_protection(struct pt_regs *regs, long error_code)
+ +dotraplinkage void
+ +do_general_protection(struct pt_regs *regs, long error_code)
+  {
+++<<<<<<< HEAD
+ +	const char *desc = "general protection fault";
+++=======
++ 	char desc[sizeof(GPFSTR) + 50 + 2*sizeof(unsigned long) + 1] = GPFSTR;
++ 	enum kernel_gp_hint hint = GP_NO_HINT;
+++>>>>>>> 36209766cede (x86/traps: Cleanup do_general_protection())
+  	struct task_struct *tsk;
++ 	unsigned long gp_addr;
++ 	int ret;
+  
+  	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+ +
+ +	if (user_mode(regs) && try_fixup_enqcmd_gp())
+ +		return;
+ +
+  	cond_local_irq_enable(regs);
+  
+  	if (static_cpu_has(X86_FEATURE_UMIP)) {
+@@@ -551,15 -587,14 +558,26 @@@
+  	}
+  
+  	tsk = current;
+++<<<<<<< HEAD
+ +	if (!user_mode(regs)) {
+ +		if (fixup_exception(regs, X86_TRAP_GP))
+ +			return;
+++=======
+++>>>>>>> 36209766cede (x86/traps: Cleanup do_general_protection())
+  
++ 	if (user_mode(regs)) {
+  		tsk->thread.error_code = error_code;
+  		tsk->thread.trap_nr = X86_TRAP_GP;
+++<<<<<<< HEAD
+ +		if (notify_die(DIE_GPF, desc, regs, error_code,
+ +			       X86_TRAP_GP, SIGSEGV) != NOTIFY_STOP)
+ +			die(desc, regs, error_code);
+++=======
++ 
++ 		show_signal(tsk, SIGSEGV, "", desc, regs, error_code);
++ 		force_sig(SIGSEGV);
++ 
+++>>>>>>> 36209766cede (x86/traps: Cleanup do_general_protection())
+  		return;
+  	}
+  
+@@@ -566,12 -604,39 +587,48 @@@
+  	tsk->thread.error_code = error_code;
+  	tsk->thread.trap_nr = X86_TRAP_GP;
+  
+++<<<<<<< HEAD
+ +	if (fixup_vdso_exception(regs, X86_TRAP_GP, error_code, 0))
+ +		return;
+ +
+ +	show_signal(tsk, SIGSEGV, "", desc, regs, error_code);
+ +
+ +	force_sig(SIGSEGV, tsk);
+++=======
++ 	/*
++ 	 * To be potentially processing a kprobe fault and to trust the result
++ 	 * from kprobe_running(), we have to be non-preemptible.
++ 	 */
++ 	if (!preemptible() &&
++ 	    kprobe_running() &&
++ 	    kprobe_fault_handler(regs, X86_TRAP_GP))
++ 		return;
++ 
++ 	ret = notify_die(DIE_GPF, desc, regs, error_code, X86_TRAP_GP, SIGSEGV);
++ 	if (ret == NOTIFY_STOP)
++ 		return;
++ 
++ 	if (error_code)
++ 		snprintf(desc, sizeof(desc), "segment-related " GPFSTR);
++ 	else
++ 		hint = get_kernel_gp_address(regs, &gp_addr);
++ 
++ 	if (hint != GP_NO_HINT)
++ 		snprintf(desc, sizeof(desc), GPFSTR ", %s 0x%lx",
++ 			 (hint == GP_NON_CANONICAL) ? "probably for non-canonical address"
++ 						    : "maybe for address",
++ 			 gp_addr);
++ 
++ 	/*
++ 	 * KASAN is interested only in the non-canonical case, clear it
++ 	 * otherwise.
++ 	 */
++ 	if (hint != GP_NON_CANONICAL)
++ 		gp_addr = 0;
++ 
++ 	die_addr(desc, regs, error_code, gp_addr);
++ 
+++>>>>>>> 36209766cede (x86/traps: Cleanup do_general_protection())
+  }
+  NOKPROBE_SYMBOL(do_general_protection);
+  
+* Unmerged path arch/x86/kernel/traps.c
