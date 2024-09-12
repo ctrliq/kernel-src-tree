@@ -1321,11 +1321,13 @@ static int snd_hdsp_midi_output_write (struct hdsp_midi *hmidi)
 	spin_lock_irqsave (&hmidi->lock, flags);
 	if (hmidi->output) {
 		if (!snd_rawmidi_transmit_empty (hmidi->output)) {
-			if ((n_pending = snd_hdsp_midi_output_possible (hmidi->hdsp, hmidi->id)) > 0) {
+			n_pending = snd_hdsp_midi_output_possible(hmidi->hdsp, hmidi->id);
+			if (n_pending > 0) {
 				if (n_pending > (int)sizeof (buf))
 					n_pending = sizeof (buf);
 
-				if ((to_write = snd_rawmidi_transmit (hmidi->output, buf, n_pending)) > 0) {
+				to_write = snd_rawmidi_transmit(hmidi->output, buf, n_pending);
+				if (to_write > 0) {
 					for (i = 0; i < to_write; ++i)
 						snd_hdsp_midi_write_byte (hmidi->hdsp, hmidi->id, buf[i]);
 				}
@@ -1344,7 +1346,8 @@ static int snd_hdsp_midi_input_read (struct hdsp_midi *hmidi)
 	int i;
 
 	spin_lock_irqsave (&hmidi->lock, flags);
-	if ((n_pending = snd_hdsp_midi_input_available (hmidi->hdsp, hmidi->id)) > 0) {
+	n_pending = snd_hdsp_midi_input_available(hmidi->hdsp, hmidi->id);
+	if (n_pending > 0) {
 		if (hmidi->input) {
 			if (n_pending > (int)sizeof (buf))
 				n_pending = sizeof (buf);
@@ -3326,7 +3329,9 @@ static int snd_hdsp_create_controls(struct snd_card *card, struct hdsp *hdsp)
 	}
 
 	for (idx = 0; idx < ARRAY_SIZE(snd_hdsp_controls); idx++) {
-		if ((err = snd_ctl_add(card, kctl = snd_ctl_new1(&snd_hdsp_controls[idx], hdsp))) < 0)
+		kctl = snd_ctl_new1(&snd_hdsp_controls[idx], hdsp);
+		err = snd_ctl_add(card, kctl);
+		if (err < 0)
 			return err;
 		if (idx == 1)	/* IEC958 (S/PDIF) Stream */
 			hdsp->spdif_ctl = kctl;
@@ -3335,12 +3340,16 @@ static int snd_hdsp_create_controls(struct snd_card *card, struct hdsp *hdsp)
 	/* ADAT SyncCheck status */
 	snd_hdsp_adat_sync_check.name = "ADAT Lock Status";
 	snd_hdsp_adat_sync_check.index = 1;
-	if ((err = snd_ctl_add (card, kctl = snd_ctl_new1(&snd_hdsp_adat_sync_check, hdsp))))
+	kctl = snd_ctl_new1(&snd_hdsp_adat_sync_check, hdsp);
+	err = snd_ctl_add(card, kctl);
+	if (err < 0)
 		return err;
 	if (hdsp->io_type == Digiface || hdsp->io_type == H9652) {
 		for (idx = 1; idx < 3; ++idx) {
 			snd_hdsp_adat_sync_check.index = idx+1;
-			if ((err = snd_ctl_add (card, kctl = snd_ctl_new1(&snd_hdsp_adat_sync_check, hdsp))))
+			kctl = snd_ctl_new1(&snd_hdsp_adat_sync_check, hdsp);
+			err = snd_ctl_add(card, kctl);
+			if (err < 0)
 				return err;
 		}
 	}
@@ -3348,7 +3357,9 @@ static int snd_hdsp_create_controls(struct snd_card *card, struct hdsp *hdsp)
 	/* DA, AD and Phone gain and XLR breakout cable controls for H9632 cards */
 	if (hdsp->io_type == H9632) {
 		for (idx = 0; idx < ARRAY_SIZE(snd_hdsp_9632_controls); idx++) {
-			if ((err = snd_ctl_add(card, kctl = snd_ctl_new1(&snd_hdsp_9632_controls[idx], hdsp))) < 0)
+			kctl = snd_ctl_new1(&snd_hdsp_9632_controls[idx], hdsp);
+			err = snd_ctl_add(card, kctl);
+			if (err < 0)
 				return err;
 		}
 	}
@@ -3366,8 +3377,10 @@ static int snd_hdsp_create_controls(struct snd_card *card, struct hdsp *hdsp)
 
 	/* AEB control for H96xx card */
 	if (hdsp->io_type == H9632 || hdsp->io_type == H9652) {
-		if ((err = snd_ctl_add(card, kctl = snd_ctl_new1(&snd_hdsp_96xx_aeb, hdsp))) < 0)
-				return err;
+		kctl = snd_ctl_new1(&snd_hdsp_96xx_aeb, hdsp);
+		err = snd_ctl_add(card, kctl);
+		if (err < 0)
+			return err;
 	}
 
 	return 0;
@@ -3946,7 +3959,8 @@ static char *hdsp_channel_buffer_location(struct hdsp *hdsp,
         if (snd_BUG_ON(channel < 0 || channel >= hdsp->max_channels))
 		return NULL;
 
-	if ((mapped_channel = hdsp->channel_map[channel]) < 0)
+	mapped_channel = hdsp->channel_map[channel];
+	if (mapped_channel < 0)
 		return NULL;
 
 	if (stream == SNDRV_PCM_STREAM_CAPTURE)
@@ -4118,7 +4132,8 @@ static int snd_hdsp_hw_params(struct snd_pcm_substream *substream,
 
 	spin_lock_irq(&hdsp->lock);
 	if (! hdsp->clock_source_locked) {
-		if ((err = hdsp_set_rate(hdsp, params_rate(params), 0)) < 0) {
+		err = hdsp_set_rate(hdsp, params_rate(params), 0);
+		if (err < 0) {
 			spin_unlock_irq(&hdsp->lock);
 			_snd_pcm_hw_param_setempty(params, SNDRV_PCM_HW_PARAM_RATE);
 			return err;
@@ -4126,7 +4141,8 @@ static int snd_hdsp_hw_params(struct snd_pcm_substream *substream,
 	}
 	spin_unlock_irq(&hdsp->lock);
 
-	if ((err = hdsp_set_interrupt_interval(hdsp, params_period_size(params))) < 0) {
+	err = hdsp_set_interrupt_interval(hdsp, params_period_size(params));
+	if (err < 0) {
 		_snd_pcm_hw_param_setempty(params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
 		return err;
 	}
@@ -4858,13 +4874,15 @@ static int snd_hdsp_hwdep_ioctl(struct snd_hwdep *hw, struct file *file, unsigne
 
 		if (hdsp->io_type == H9652 || hdsp->io_type == H9632) return -EINVAL;
 		if (hdsp->io_type == Undefined) {
-			if ((err = hdsp_get_iobox_version(hdsp)) < 0)
+			err = hdsp_get_iobox_version(hdsp);
+			if (err < 0)
 				return err;
 		}
 		memset(&hdsp_version, 0, sizeof(hdsp_version));
 		hdsp_version.io_type = hdsp->io_type;
 		hdsp_version.firmware_rev = hdsp->firmware_rev;
-		if ((err = copy_to_user(argp, &hdsp_version, sizeof(hdsp_version))))
+		err = copy_to_user(argp, &hdsp_version, sizeof(hdsp_version));
+		if (err < 0)
 		    	return -EFAULT;
 		break;
 	}
@@ -4904,17 +4922,20 @@ static int snd_hdsp_hwdep_ioctl(struct snd_hwdep *hw, struct file *file, unsigne
 
 		hdsp->state |= HDSP_FirmwareCached;
 
-		if ((err = snd_hdsp_load_firmware_from_cache(hdsp)) < 0)
+		err = snd_hdsp_load_firmware_from_cache(hdsp);
+		if (err < 0)
 			return err;
 
 		if (!(hdsp->state & HDSP_InitializationComplete)) {
-			if ((err = snd_hdsp_enable_io(hdsp)) < 0)
+			err = snd_hdsp_enable_io(hdsp);
+			if (err < 0)
 				return err;
 
 			snd_hdsp_initialize_channels(hdsp);
 			snd_hdsp_initialize_midi_flush(hdsp);
 
-			if ((err = snd_hdsp_create_alsa_devices(hdsp->card, hdsp)) < 0) {
+			err = snd_hdsp_create_alsa_devices(hdsp->card, hdsp);
+			if (err < 0) {
 				dev_err(hdsp->card->dev,
 					"error creating alsa devices\n");
 				return err;
@@ -4964,7 +4985,8 @@ static int snd_hdsp_create_hwdep(struct snd_card *card, struct hdsp *hdsp)
 	struct snd_hwdep *hw;
 	int err;
 
-	if ((err = snd_hwdep_new(card, "HDSP hwdep", 0, &hw)) < 0)
+	err = snd_hwdep_new(card, "HDSP hwdep", 0, &hw);
+	if (err < 0)
 		return err;
 
 	hdsp->hwdep = hw;
@@ -4982,7 +5004,8 @@ static int snd_hdsp_create_pcm(struct snd_card *card, struct hdsp *hdsp)
 	struct snd_pcm *pcm;
 	int err;
 
-	if ((err = snd_pcm_new(card, hdsp->card_name, 0, 1, 1, &pcm)) < 0)
+	err = snd_pcm_new(card, hdsp->card_name, 0, 1, 1, &pcm);
+	if (err < 0)
 		return err;
 
 	hdsp->pcm = pcm;
@@ -5088,28 +5111,32 @@ static int snd_hdsp_create_alsa_devices(struct snd_card *card, struct hdsp *hdsp
 {
 	int err;
 
-	if ((err = snd_hdsp_create_pcm(card, hdsp)) < 0) {
+	err = snd_hdsp_create_pcm(card, hdsp);
+	if (err < 0) {
 		dev_err(card->dev,
 			"Error creating pcm interface\n");
 		return err;
 	}
 
 
-	if ((err = snd_hdsp_create_midi(card, hdsp, 0)) < 0) {
+	err = snd_hdsp_create_midi(card, hdsp, 0);
+	if (err < 0) {
 		dev_err(card->dev,
 			"Error creating first midi interface\n");
 		return err;
 	}
 
 	if (hdsp->io_type == Digiface || hdsp->io_type == H9652) {
-		if ((err = snd_hdsp_create_midi(card, hdsp, 1)) < 0) {
+		err = snd_hdsp_create_midi(card, hdsp, 1);
+		if (err < 0) {
 			dev_err(card->dev,
 				"Error creating second midi interface\n");
 			return err;
 		}
 	}
 
-	if ((err = snd_hdsp_create_controls(card, hdsp)) < 0) {
+	err = snd_hdsp_create_controls(card, hdsp);
+	if (err < 0) {
 		dev_err(card->dev,
 			"Error creating ctl interface\n");
 		return err;
@@ -5123,7 +5150,8 @@ static int snd_hdsp_create_alsa_devices(struct snd_card *card, struct hdsp *hdsp
 	hdsp->capture_substream = NULL;
 	hdsp->playback_substream = NULL;
 
-	if ((err = snd_hdsp_set_defaults(hdsp)) < 0) {
+	err = snd_hdsp_set_defaults(hdsp);
+	if (err < 0) {
 		dev_err(card->dev,
 			"Error setting default values\n");
 		return err;
@@ -5134,7 +5162,8 @@ static int snd_hdsp_create_alsa_devices(struct snd_card *card, struct hdsp *hdsp
 		sprintf(card->longname, "%s at 0x%lx, irq %d", hdsp->card_name,
 			hdsp->port, hdsp->irq);
 
-		if ((err = snd_card_register(card)) < 0) {
+		err = snd_card_register(card);
+		if (err < 0) {
 			dev_err(card->dev,
 				"error registering card\n");
 			return err;
@@ -5155,7 +5184,8 @@ static int hdsp_request_fw_loader(struct hdsp *hdsp)
 	if (hdsp->io_type == H9652 || hdsp->io_type == H9632)
 		return 0;
 	if (hdsp->io_type == Undefined) {
-		if ((err = hdsp_get_iobox_version(hdsp)) < 0)
+		err = hdsp_get_iobox_version(hdsp);
+		if (err < 0)
 			return err;
 		if (hdsp->io_type == H9652 || hdsp->io_type == H9632)
 			return 0;
@@ -5201,21 +5231,25 @@ static int hdsp_request_fw_loader(struct hdsp *hdsp)
 
 	hdsp->state |= HDSP_FirmwareCached;
 
-	if ((err = snd_hdsp_load_firmware_from_cache(hdsp)) < 0)
+	err = snd_hdsp_load_firmware_from_cache(hdsp);
+	if (err < 0)
 		return err;
 
 	if (!(hdsp->state & HDSP_InitializationComplete)) {
-		if ((err = snd_hdsp_enable_io(hdsp)) < 0)
+		err = snd_hdsp_enable_io(hdsp);
+		if (err < 0)
 			return err;
 
-		if ((err = snd_hdsp_create_hwdep(hdsp->card, hdsp)) < 0) {
+		err = snd_hdsp_create_hwdep(hdsp->card, hdsp);
+		if (err < 0) {
 			dev_err(hdsp->card->dev,
 				"error creating hwdep device\n");
 			return err;
 		}
 		snd_hdsp_initialize_channels(hdsp);
 		snd_hdsp_initialize_midi_flush(hdsp);
-		if ((err = snd_hdsp_create_alsa_devices(hdsp->card, hdsp)) < 0) {
+		err = snd_hdsp_create_alsa_devices(hdsp->card, hdsp);
+		if (err < 0) {
 			dev_err(hdsp->card->dev,
 				"error creating alsa devices\n");
 			return err;
@@ -5284,15 +5318,18 @@ static int snd_hdsp_create(struct snd_card *card,
 		is_9632 = 1;
 	}
 
-	if ((err = pci_enable_device(pci)) < 0)
+	err = pci_enable_device(pci);
+	if (err < 0)
 		return err;
 
 	pci_set_master(hdsp->pci);
 
-	if ((err = pci_request_regions(pci, "hdsp")) < 0)
+	err = pci_request_regions(pci, "hdsp");
+	if (err < 0)
 		return err;
 	hdsp->port = pci_resource_start(pci, 0);
-	if ((hdsp->iobase = ioremap(hdsp->port, HDSP_IO_EXTENT)) == NULL) {
+	hdsp->iobase = ioremap(hdsp->port, HDSP_IO_EXTENT);
+	if (!hdsp->iobase) {
 		dev_err(hdsp->card->dev, "unable to remap region 0x%lx-0x%lx\n",
 			hdsp->port, hdsp->port + HDSP_IO_EXTENT - 1);
 		return -EBUSY;
@@ -5310,7 +5347,8 @@ static int snd_hdsp_create(struct snd_card *card,
 	hdsp->use_midi_tasklet = 1;
 	hdsp->dds_value = 0;
 
-	if ((err = snd_hdsp_initialize_memory(hdsp)) < 0)
+	err = snd_hdsp_initialize_memory(hdsp);
+	if (err < 0)
 		return err;
 
 	if (!is_9652 && !is_9632) {
@@ -5322,7 +5360,8 @@ static int snd_hdsp_create(struct snd_card *card,
 			return err;
 
 		if ((hdsp_read (hdsp, HDSP_statusRegister) & HDSP_DllError) != 0) {
-			if ((err = hdsp_request_fw_loader(hdsp)) < 0)
+			err = hdsp_request_fw_loader(hdsp);
+			if (err < 0)
 				/* we don't fail as this can happen
 				   if userspace is not ready for
 				   firmware upload
@@ -5335,7 +5374,8 @@ static int snd_hdsp_create(struct snd_card *card,
 			/* we defer initialization */
 			dev_info(hdsp->card->dev,
 				 "card initialization pending : waiting for firmware\n");
-			if ((err = snd_hdsp_create_hwdep(card, hdsp)) < 0)
+			err = snd_hdsp_create_hwdep(card, hdsp);
+			if (err < 0)
 				return err;
 			return 0;
 		} else {
@@ -5350,7 +5390,8 @@ static int snd_hdsp_create(struct snd_card *card,
 		}
 	}
 
-	if ((err = snd_hdsp_enable_io(hdsp)) != 0)
+	err = snd_hdsp_enable_io(hdsp);
+	if (err)
 		return err;
 
 	if (is_9652)
@@ -5359,7 +5400,8 @@ static int snd_hdsp_create(struct snd_card *card,
 	if (is_9632)
 		hdsp->io_type = H9632;
 
-	if ((err = snd_hdsp_create_hwdep(card, hdsp)) < 0)
+	err = snd_hdsp_create_hwdep(card, hdsp);
+	if (err < 0)
 		return err;
 
 	snd_hdsp_initialize_channels(hdsp);
@@ -5367,7 +5409,8 @@ static int snd_hdsp_create(struct snd_card *card,
 
 	hdsp->state |= HDSP_FirmwareLoaded;
 
-	if ((err = snd_hdsp_create_alsa_devices(card, hdsp)) < 0)
+	err = snd_hdsp_create_alsa_devices(card, hdsp);
+	if (err < 0)
 		return err;
 
 	return 0;
