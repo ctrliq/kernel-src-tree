@@ -714,7 +714,11 @@ struct inode {
 	atomic_t		i_dio_count;
 	atomic_t		i_writecount;
 #if defined(CONFIG_IMA) || defined(CONFIG_FILE_LOCKING)
+#ifndef CONFIG_ARM64
 	atomic_t		i_readcount; /* struct files open RO */
+#else
+	RH_KABI_FILL_HOLE(atomic_t i_readcount)
+#endif
 #endif
 	const struct file_operations	*i_fop;	/* former ->i_op->default_file_ops */
 	struct file_lock_context	*i_flctx;
