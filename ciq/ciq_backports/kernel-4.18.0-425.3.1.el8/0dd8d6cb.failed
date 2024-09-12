@@ -1,0 +1,191 @@
+rtc: Check return value from mc146818_get_time()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Mateusz Jończyk <mat.jonczyk@o2.pl>
+commit 0dd8d6cb9eddfe637bcd821bbfd40ebd5a0737b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/0dd8d6cb.failed
+
+There are 4 users of mc146818_get_time() and none of them was checking
+the return value from this function. Change this.
+
+Print the appropriate warnings in callers of mc146818_get_time() instead
+of in the function mc146818_get_time() itself, in order not to add
+strings to rtc-mc146818-lib.c, which is kind of a library.
+
+The callers of alpha_rtc_read_time() and cmos_read_time() may use the
+contents of (struct rtc_time *) even when the functions return a failure
+code. Therefore, set the contents of (struct rtc_time *) to 0x00,
+which looks more sensible then 0xff and aligns with the (possibly
+stale?) comment in cmos_read_time:
+
+	/*
+	 * If pm_trace abused the RTC for storage, set the timespec to 0,
+	 * which tells the caller that this RTC value is unusable.
+	 */
+
+For consistency, do this in mc146818_get_time().
+
+Note: hpet_rtc_interrupt() may call mc146818_get_time() many times a
+second. It is very unlikely, though, that the RTC suddenly stops
+working and mc146818_get_time() would consistently fail.
+
+Only compile-tested on alpha.
+
+	Signed-off-by: Mateusz Jończyk <mat.jonczyk@o2.pl>
+	Cc: Richard Henderson <rth@twiddle.net>
+	Cc: Ivan Kokshaysky <ink@jurassic.park.msu.ru>
+	Cc: Matt Turner <mattst88@gmail.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Alessandro Zummo <a.zummo@towertech.it>
+	Cc: Alexandre Belloni <alexandre.belloni@bootlin.com>
+	Cc: linux-alpha@vger.kernel.org
+	Cc: x86@kernel.org
+	Signed-off-by: Alexandre Belloni <alexandre.belloni@bootlin.com>
+Link: https://lore.kernel.org/r/20211210200131.153887-4-mat.jonczyk@o2.pl
+(cherry picked from commit 0dd8d6cb9eddfe637bcd821bbfd40ebd5a0737b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/rtc/rtc-cmos.c
+#	drivers/rtc/rtc-mc146818-lib.c
+diff --cc drivers/rtc/rtc-cmos.c
+index 09b28541ecd4,d0f58cca5c20..000000000000
+--- a/drivers/rtc/rtc-cmos.c
++++ b/drivers/rtc/rtc-cmos.c
+@@@ -220,11 -231,12 +222,20 @@@ static int cmos_read_time(struct devic
+  	if (!pm_trace_rtc_valid())
+  		return -EIO;
+  
+++<<<<<<< HEAD
+ +	/* REVISIT:  if the clock has a "century" register, use
+ +	 * that instead of the heuristic in mc146818_get_time().
+ +	 * That'll make Y3K compatility (year > 2070) easy!
+ +	 */
+ +	mc146818_get_time(t);
+++=======
++ 	ret = mc146818_get_time(t);
++ 	if (ret < 0) {
++ 		dev_err_ratelimited(dev, "unable to read current time\n");
++ 		return ret;
++ 	}
++ 
+++>>>>>>> 0dd8d6cb9edd (rtc: Check return value from mc146818_get_time())
+  	return 0;
+  }
+  
+diff --cc drivers/rtc/rtc-mc146818-lib.c
+index 2f1772a358ca,ccd974b8a75a..000000000000
+--- a/drivers/rtc/rtc-mc146818-lib.c
++++ b/drivers/rtc/rtc-mc146818-lib.c
+@@@ -31,17 -19,37 +31,29 @@@ unsigned int mc146818_get_time(struct r
+  	unsigned int real_year;
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ again:
++ 	spin_lock_irqsave(&rtc_lock, flags);
++ 	/* Ensure that the RTC is accessible. Bit 6 must be 0! */
++ 	if (WARN_ON_ONCE((CMOS_READ(RTC_VALID) & 0x40) != 0)) {
++ 		spin_unlock_irqrestore(&rtc_lock, flags);
++ 		memset(time, 0, sizeof(*time));
++ 		return -EIO;
++ 	}
++ 
+++>>>>>>> 0dd8d6cb9edd (rtc: Check return value from mc146818_get_time())
+  	/*
+ -	 * Check whether there is an update in progress during which the
+ -	 * readout is unspecified. The maximum update time is ~2ms. Poll
+ -	 * every msec for completion.
+ -	 *
+ -	 * Store the second value before checking UIP so a long lasting NMI
+ -	 * which happens to hit after the UIP check cannot make an update
+ -	 * cycle invisible.
+ +	 * read RTC once any update in progress is done. The update
+ +	 * can take just over 2ms. We wait 20ms. There is no need to
+ +	 * to poll-wait (up to 1s - eeccch) for the falling edge of RTC_UIP.
+ +	 * If you need to know *exactly* when a second has started, enable
+ +	 * periodic update complete interrupts, (via ioctl) and then
+ +	 * immediately read /dev/rtc which will block until you get the IRQ.
+ +	 * Once the read clears, read the RTC time (again via ioctl). Easy.
+  	 */
+ -	time->tm_sec = CMOS_READ(RTC_SECONDS);
+ -
+ -	if (CMOS_READ(RTC_FREQ_SELECT) & RTC_UIP) {
+ -		spin_unlock_irqrestore(&rtc_lock, flags);
+ -		mdelay(1);
+ -		goto again;
+ -	}
+ -
+ -	/* Revalidate the above readout */
+ -	if (time->tm_sec != CMOS_READ(RTC_SECONDS)) {
+ -		spin_unlock_irqrestore(&rtc_lock, flags);
+ -		goto again;
+ -	}
+ +	if (mc146818_is_updating())
+ +		mdelay(20);
+  
+  	/*
+  	 * Only the values that we read from the RTC are set. We leave
+diff --git a/arch/alpha/kernel/rtc.c b/arch/alpha/kernel/rtc.c
+index 1376a2867048..a6ffea2810ec 100644
+--- a/arch/alpha/kernel/rtc.c
++++ b/arch/alpha/kernel/rtc.c
+@@ -80,7 +80,12 @@ init_rtc_epoch(void)
+ static int
+ alpha_rtc_read_time(struct device *dev, struct rtc_time *tm)
+ {
+-	mc146818_get_time(tm);
++	int ret = mc146818_get_time(tm);
++
++	if (ret < 0) {
++		dev_err_ratelimited(dev, "unable to read current time\n");
++		return ret;
++	}
+ 
+ 	/* Adjust for non-default epochs.  It's easier to depend on the
+ 	   generic __get_rtc_time and adjust the epoch here than create
+diff --git a/arch/x86/kernel/hpet.c b/arch/x86/kernel/hpet.c
+index d2b1ac1d4c4a..bfef5d695ab5 100644
+--- a/arch/x86/kernel/hpet.c
++++ b/arch/x86/kernel/hpet.c
+@@ -1412,8 +1412,12 @@ irqreturn_t hpet_rtc_interrupt(int irq, void *dev_id)
+ 	hpet_rtc_timer_reinit();
+ 	memset(&curr_time, 0, sizeof(struct rtc_time));
+ 
+-	if (hpet_rtc_flags & (RTC_UIE | RTC_AIE))
+-		mc146818_get_time(&curr_time);
++	if (hpet_rtc_flags & (RTC_UIE | RTC_AIE)) {
++		if (unlikely(mc146818_get_time(&curr_time) < 0)) {
++			pr_err_ratelimited("unable to read current time from RTC\n");
++			return IRQ_HANDLED;
++		}
++	}
+ 
+ 	if (hpet_rtc_flags & RTC_UIE &&
+ 	    curr_time.tm_sec != hpet_prev_update_sec) {
+diff --git a/drivers/base/power/trace.c b/drivers/base/power/trace.c
+index 21dbb44500f8..f68298a8d395 100644
+--- a/drivers/base/power/trace.c
++++ b/drivers/base/power/trace.c
+@@ -120,7 +120,11 @@ static unsigned int read_magic_time(void)
+ 	struct rtc_time time;
+ 	unsigned int val;
+ 
+-	mc146818_get_time(&time);
++	if (mc146818_get_time(&time) < 0) {
++		pr_err("Unable to read current time from RTC\n");
++		return 0;
++	}
++
+ 	pr_info("RTC time: %ptRt, date: %ptRd\n", &time, &time);
+ 	val = time.tm_year;				/* 100 years */
+ 	if (val > 100)
+* Unmerged path drivers/rtc/rtc-cmos.c
+* Unmerged path drivers/rtc/rtc-mc146818-lib.c
