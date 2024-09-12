@@ -1,0 +1,299 @@
+netfilter: nf_tables: integrate pipapo into commit protocol
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-534.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 212ed75dc5fb9d1423b3942c8f872a868cda3466
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-534.el8/212ed75d.failed
+
+The pipapo set backend follows copy-on-update approach, maintaining one
+clone of the existing datastructure that is being updated. The clone
+and current datastructures are swapped via rcu from the commit step.
+
+The existing integration with the commit protocol is flawed because
+there is no operation to clean up the clone if the transaction is
+aborted. Moreover, the datastructure swap happens on set element
+activation.
+
+This patch adds two new operations for sets: commit and abort, these new
+operations are invoked from the commit and abort steps, after the
+transactions have been digested, and it updates the pipapo set backend
+to use it.
+
+This patch adds a new ->pending_update field to sets to maintain a list
+of sets that require this new commit and abort operations.
+
+Fixes: 3c4287f62044 ("nf_tables: Add set type for arbitrary concatenation of ranges")
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 212ed75dc5fb9d1423b3942c8f872a868cda3466)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nft_set_pipapo.c
+diff --cc net/netfilter/nf_tables_api.c
+index c52a1dd1b5bc,3bb0800b3849..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -4256,44 -4913,13 +4256,45 @@@ static int nf_tables_newset(struct net 
+  	if (err < 0)
+  		goto err_set_init;
+  
+ -	err = nft_set_expr_alloc(&ctx, set, nla, set->exprs, &num_exprs, flags);
+ -	if (err < 0)
+ -		goto err_set_destroy;
+ +	if (nla[NFTA_SET_EXPR]) {
+ +		expr = nft_set_elem_expr_alloc(&ctx, set, nla[NFTA_SET_EXPR]);
+ +		if (IS_ERR(expr)) {
+ +			err = PTR_ERR(expr);
+ +			goto err_set_expr_alloc;
+ +		}
+ +		set->exprs[0] = expr;
+ +		set->num_exprs++;
+ +	} else if (nla[NFTA_SET_EXPRESSIONS]) {
+ +		struct nft_expr *expr;
+ +		struct nlattr *tmp;
+ +		int left;
+ +
+ +		if (!(flags & NFT_SET_EXPR)) {
+ +			err = -EINVAL;
+ +			goto err_set_expr_alloc;
+ +		}
+ +		i = 0;
+ +		nla_for_each_nested(tmp, nla[NFTA_SET_EXPRESSIONS], left) {
+ +			if (i == NFT_SET_EXPR_MAX) {
+ +				err = -E2BIG;
+ +				goto err_set_expr_alloc;
+ +			}
+ +			if (nla_type(tmp) != NFTA_LIST_ELEM) {
+ +				err = -EINVAL;
+ +				goto err_set_expr_alloc;
+ +			}
+ +			expr = nft_set_elem_expr_alloc(&ctx, set, tmp);
+ +			if (IS_ERR(expr)) {
+ +				err = PTR_ERR(expr);
+ +				goto err_set_expr_alloc;
+ +			}
+ +			set->exprs[i++] = expr;
+ +			set->num_exprs++;
+ +		}
+ +	}
+  
+ -	set->num_exprs = num_exprs;
+  	set->handle = nf_tables_alloc_handle(table);
++ 	INIT_LIST_HEAD(&set->pending_update);
+  
+  	err = nft_trans_set_add(&ctx, NFT_MSG_NEWSET, set);
+  	if (err < 0)
+@@@ -7847,9 -9276,25 +7848,24 @@@ static void nf_tables_commit_audit_log(
+  	}
+  }
+  
++ static void nft_set_commit_update(struct list_head *set_update_list)
++ {
++ 	struct nft_set *set, *next;
++ 
++ 	list_for_each_entry_safe(set, next, set_update_list, pending_update) {
++ 		list_del_init(&set->pending_update);
++ 
++ 		if (!set->ops->commit)
++ 			continue;
++ 
++ 		set->ops->commit(set);
++ 	}
++ }
++ 
+  static int nf_tables_commit(struct net *net, struct sk_buff *skb)
+  {
+ -	struct nftables_pernet *nft_net = nft_pernet(net);
+  	struct nft_trans *trans, *next;
++ 	LIST_HEAD(set_update_list);
+  	struct nft_trans_elem *te;
+  	struct nft_chain *chain;
+  	struct nft_table *table;
+@@@ -7990,10 -9465,15 +8006,19 @@@
+  		case NFT_MSG_NEWSETELEM:
+  			te = (struct nft_trans_elem *)trans->data;
+  
+ -			nft_setelem_activate(net, te->set, &te->elem);
+ +			te->set->ops->activate(net, te->set, &te->elem);
+  			nf_tables_setelem_notify(&trans->ctx, te->set,
+  						 &te->elem,
+++<<<<<<< HEAD
+ +						 NFT_MSG_NEWSETELEM, 0);
+++=======
++ 						 NFT_MSG_NEWSETELEM);
++ 			if (te->set->ops->commit &&
++ 			    list_empty(&te->set->pending_update)) {
++ 				list_add_tail(&te->set->pending_update,
++ 					      &set_update_list);
++ 			}
+++>>>>>>> 212ed75dc5fb (netfilter: nf_tables: integrate pipapo into commit protocol)
+  			nft_trans_destroy(trans);
+  			break;
+  		case NFT_MSG_DELSETELEM:
+@@@ -8001,10 -9482,17 +8026,24 @@@
+  
+  			nf_tables_setelem_notify(&trans->ctx, te->set,
+  						 &te->elem,
+++<<<<<<< HEAD
+ +						 NFT_MSG_DELSETELEM, 0);
+ +			te->set->ops->remove(net, te->set, &te->elem);
+ +			atomic_dec(&te->set->nelems);
+ +			te->set->ndeact--;
+++=======
++ 						 trans->msg_type);
++ 			nft_setelem_remove(net, te->set, &te->elem);
++ 			if (!nft_setelem_is_catchall(te->set, &te->elem)) {
++ 				atomic_dec(&te->set->nelems);
++ 				te->set->ndeact--;
++ 			}
++ 			if (te->set->ops->commit &&
++ 			    list_empty(&te->set->pending_update)) {
++ 				list_add_tail(&te->set->pending_update,
++ 					      &set_update_list);
++ 			}
+++>>>>>>> 212ed75dc5fb (netfilter: nf_tables: integrate pipapo into commit protocol)
+  			break;
+  		case NFT_MSG_NEWOBJ:
+  			if (nft_trans_obj_update(trans)) {
+@@@ -8043,9 -9555,11 +8082,11 @@@
+  		}
+  	}
+  
++ 	nft_set_commit_update(&set_update_list);
++ 
+  	nft_commit_notify(net, NETLINK_CB(skb).portid);
+  	nf_tables_gen_notify(net, skb, NFT_MSG_NEWGEN);
+ -	nf_tables_commit_audit_log(&adl, nft_net->base_seq);
+ +	nf_tables_commit_audit_log(&adl, net->nft.base_seq);
+  	nf_tables_commit_release(net);
+  
+  	return 0;
+@@@ -8095,9 -9616,25 +8136,24 @@@ static void nf_tables_abort_release(str
+  	kfree(trans);
+  }
+  
++ static void nft_set_abort_update(struct list_head *set_update_list)
++ {
++ 	struct nft_set *set, *next;
++ 
++ 	list_for_each_entry_safe(set, next, set_update_list, pending_update) {
++ 		list_del_init(&set->pending_update);
++ 
++ 		if (!set->ops->abort)
++ 			continue;
++ 
++ 		set->ops->abort(set);
++ 	}
++ }
++ 
+  static int __nf_tables_abort(struct net *net, enum nfnl_abort_action action)
+  {
+ -	struct nftables_pernet *nft_net = nft_pernet(net);
+  	struct nft_trans *trans, *next;
++ 	LIST_HEAD(set_update_list);
+  	struct nft_trans_elem *te;
+  
+  	if (action == NFNL_ABORT_VALIDATE &&
+@@@ -8178,16 -9741,30 +8234,33 @@@
+  				break;
+  			}
+  			te = (struct nft_trans_elem *)trans->data;
+++<<<<<<< HEAD
+ +			te->set->ops->remove(net, te->set, &te->elem);
+ +			atomic_dec(&te->set->nelems);
+++=======
++ 			nft_setelem_remove(net, te->set, &te->elem);
++ 			if (!nft_setelem_is_catchall(te->set, &te->elem))
++ 				atomic_dec(&te->set->nelems);
++ 
++ 			if (te->set->ops->abort &&
++ 			    list_empty(&te->set->pending_update)) {
++ 				list_add_tail(&te->set->pending_update,
++ 					      &set_update_list);
++ 			}
+++>>>>>>> 212ed75dc5fb (netfilter: nf_tables: integrate pipapo into commit protocol)
+  			break;
+  		case NFT_MSG_DELSETELEM:
+ -		case NFT_MSG_DESTROYSETELEM:
+  			te = (struct nft_trans_elem *)trans->data;
+  
+ -			nft_setelem_data_activate(net, te->set, &te->elem);
+ -			nft_setelem_activate(net, te->set, &te->elem);
+ -			if (!nft_setelem_is_catchall(te->set, &te->elem))
+ -				te->set->ndeact--;
+ +			nft_set_elem_activate(net, te->set, &te->elem);
+ +			te->set->ops->activate(net, te->set, &te->elem);
+ +			te->set->ndeact--;
+  
++ 			if (te->set->ops->abort &&
++ 			    list_empty(&te->set->pending_update)) {
++ 				list_add_tail(&te->set->pending_update,
++ 					      &set_update_list);
++ 			}
+  			nft_trans_destroy(trans);
+  			break;
+  		case NFT_MSG_NEWOBJ:
+diff --cc net/netfilter/nft_set_pipapo.c
+index 0181617f9628,15e451dc3fc4..000000000000
+--- a/net/netfilter/nft_set_pipapo.c
++++ b/net/netfilter/nft_set_pipapo.c
+@@@ -2136,3 -2256,28 +2159,31 @@@ struct nft_set_type nft_set_pipapo_typ
+  		.elemsize	= offsetof(struct nft_pipapo_elem, ext),
+  	},
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ #if defined(CONFIG_X86_64) && !defined(CONFIG_UML)
++ const struct nft_set_type nft_set_pipapo_avx2_type = {
++ 	.features	= NFT_SET_INTERVAL | NFT_SET_MAP | NFT_SET_OBJECT |
++ 			  NFT_SET_TIMEOUT,
++ 	.ops		= {
++ 		.lookup		= nft_pipapo_avx2_lookup,
++ 		.insert		= nft_pipapo_insert,
++ 		.activate	= nft_pipapo_activate,
++ 		.deactivate	= nft_pipapo_deactivate,
++ 		.flush		= nft_pipapo_flush,
++ 		.remove		= nft_pipapo_remove,
++ 		.walk		= nft_pipapo_walk,
++ 		.get		= nft_pipapo_get,
++ 		.privsize	= nft_pipapo_privsize,
++ 		.estimate	= nft_pipapo_avx2_estimate,
++ 		.init		= nft_pipapo_init,
++ 		.destroy	= nft_pipapo_destroy,
++ 		.gc_init	= nft_pipapo_gc_init,
++ 		.commit		= nft_pipapo_commit,
++ 		.abort		= nft_pipapo_abort,
++ 		.elemsize	= offsetof(struct nft_pipapo_elem, ext),
++ 	},
++ };
++ #endif
+++>>>>>>> 212ed75dc5fb (netfilter: nf_tables: integrate pipapo into commit protocol)
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index afd104d4fe75..4d0f960c9ae1 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -387,7 +387,8 @@ struct nft_set_ops {
+ 					       const struct nft_set *set,
+ 					       const struct nft_set_elem *elem,
+ 					       unsigned int flags);
+-
++	void				(*commit)(const struct nft_set *set);
++	void				(*abort)(const struct nft_set *set);
+ 	u64				(*privsize)(const struct nlattr * const nla[],
+ 						    const struct nft_set_desc *desc);
+ 	bool				(*estimate)(const struct nft_set_desc *desc,
+@@ -489,6 +490,7 @@ struct nft_set {
+ 	u16				policy;
+ 	u16				udlen;
+ 	unsigned char			*udata;
++	struct list_head		pending_update;
+ 	/* runtime data below here */
+ 	const struct nft_set_ops	*ops ____cacheline_aligned;
+ 	u16				flags:14,
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nft_set_pipapo.c
