@@ -1,0 +1,183 @@
+regmap-irq: Remove mask_writeonly and regmap_irq_update_bits()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Aidan MacDonald <aidanmacdonald.0x0@gmail.com>
+commit ad22b3e98f9430896bd4bd8f4fbff4667f02a0c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/ad22b3e9.failed
+
+Commit a71411dbf6c8 ("regmap: irq: add chip option mask_writeonly")
+introduced the mask_writeonly option, but it isn't used now and it
+appears it's never been used by any in-tree drivers. The motivation
+for the option is mentioned in the commit message,
+
+    Some irq controllers have writeonly/multipurpose register
+    layouts. In those cases we read invalid data back. [...]
+
+The option causes mask register updates to use regmap_write_bits()
+instead of regmap_update_bits().
+
+However, regmap_write_bits() doesn't solve the reading invalid data
+problem. It's still a read-modify-write op like regmap_update_bits().
+The difference is that 'update bits' will only write the new value
+if it is different from the current value, while 'write bits' will
+write the new value unconditionally, even if it's the same as the
+current value.
+
+This seems like a bit of a specialized use case and probably isn't
+that useful for regmap-irq, so let's just remove the option and go
+back to using an 'update bits' op for the mask registers. We can
+always add the option back if some driver ends up needing it in the
+future.
+
+	Signed-off-by: Aidan MacDonald <aidanmacdonald.0x0@gmail.com>
+Link: https://lore.kernel.org/r/20220623211420.918875-7-aidanmacdonald.0x0@gmail.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit ad22b3e98f9430896bd4bd8f4fbff4667f02a0c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/regmap.h
+diff --cc include/linux/regmap.h
+index ad88f0dc7119,6489b3610362..000000000000
+--- a/include/linux/regmap.h
++++ b/include/linux/regmap.h
+@@@ -1172,9 -1445,29 +1172,8 @@@ struct regmap_irq 
+   *
+   * @name:        Descriptive name for IRQ controller.
+   *
+ - * @main_status: Base main status register address. For chips which have
+ - *		 interrupts arranged in separate sub-irq blocks with own IRQ
+ - *		 registers and which have a main IRQ registers indicating
+ - *		 sub-irq blocks with unhandled interrupts. For such chips fill
+ - *		 sub-irq register information in status_base, mask_base and
+ - *		 ack_base.
+ - * @num_main_status_bits: Should be given to chips where number of meaningfull
+ - *			  main status bits differs from num_regs.
+ - * @sub_reg_offsets: arrays of mappings from main register bits to sub irq
+ - *		     registers. First item in array describes the registers
+ - *		     for first main status bit. Second array for second bit etc.
+ - *		     Offset is given as sub register status offset to
+ - *		     status_base. Should contain num_regs arrays.
+ - *		     Can be provided for chips with more complex mapping than
+ - *		     1.st bit to 1.st sub-reg, 2.nd bit to 2.nd sub-reg, ...
+ - *		     When used with not_fixed_stride, each one-element array
+ - *		     member contains offset calculated as address from each
+ - *		     peripheral to first peripheral.
+ - * @num_main_regs: Number of 'main status' irq registers for chips which have
+ - *		   main_status set.
+ - *
+   * @status_base: Base status register address.
+   * @mask_base:   Base mask register address.
+-  * @mask_writeonly: Base mask register is write only.
+   * @unmask_base:  Base unmask register address. for chips who have
+   *                separate mask and unmask registers
+   * @ack_base:    Base ack address. If zero then the chip is clear on read.
+@@@ -1219,17 -1531,20 +1218,32 @@@ struct regmap_irq_chip 
+  	unsigned int ack_base;
+  	unsigned int wake_base;
+  	unsigned int type_base;
+ -	unsigned int *virt_reg_base;
+  	unsigned int irq_reg_stride;
+++<<<<<<< HEAD
+ +	bool mask_writeonly:1;
+ +	bool init_ack_masked:1;
+ +	bool mask_invert:1;
+ +	bool use_ack:1;
+ +	bool ack_invert:1;
+ +	bool clear_ack:1;
+ +	bool wake_invert:1;
+ +	bool runtime_pm:1;
+ +	bool type_invert:1;
+ +	bool status_invert:1;
+++=======
++ 	unsigned int init_ack_masked:1;
++ 	unsigned int mask_invert:1;
++ 	unsigned int use_ack:1;
++ 	unsigned int ack_invert:1;
++ 	unsigned int clear_ack:1;
++ 	unsigned int wake_invert:1;
++ 	unsigned int runtime_pm:1;
++ 	unsigned int type_invert:1;
++ 	unsigned int type_in_mask:1;
++ 	unsigned int clear_on_unmask:1;
++ 	unsigned int not_fixed_stride:1;
++ 	unsigned int status_invert:1;
+++>>>>>>> ad22b3e98f94 (regmap-irq: Remove mask_writeonly and regmap_irq_update_bits())
+  
+  	int num_regs;
+  
+diff --git a/drivers/base/regmap/regmap-irq.c b/drivers/base/regmap/regmap-irq.c
+index edf2854ce062..4d5421a640bd 100644
+--- a/drivers/base/regmap/regmap-irq.c
++++ b/drivers/base/regmap/regmap-irq.c
+@@ -60,16 +60,6 @@ static void regmap_irq_lock(struct irq_data *data)
+ 	mutex_lock(&d->lock);
+ }
+ 
+-static int regmap_irq_update_bits(struct regmap_irq_chip_data *d,
+-				  unsigned int reg, unsigned int mask,
+-				  unsigned int val)
+-{
+-	if (d->chip->mask_writeonly)
+-		return regmap_write_bits(d->map, reg, mask, val);
+-	else
+-		return regmap_update_bits(d->map, reg, mask, val);
+-}
+-
+ static void regmap_irq_sync_unlock(struct irq_data *data)
+ {
+ 	struct regmap_irq_chip_data *d = irq_data_get_irq_chip_data(data);
+@@ -94,11 +84,11 @@ static void regmap_irq_sync_unlock(struct irq_data *data)
+ 		reg = d->chip->mask_base +
+ 			(i * map->reg_stride * d->irq_reg_stride);
+ 		if (d->chip->mask_invert) {
+-			ret = regmap_irq_update_bits(d, reg,
++			ret = regmap_update_bits(d->map, reg,
+ 					 d->mask_buf_def[i], ~d->mask_buf[i]);
+ 		} else if (d->chip->unmask_base) {
+ 			/* set mask with mask_base register */
+-			ret = regmap_irq_update_bits(d, reg,
++			ret = regmap_update_bits(d->map, reg,
+ 					d->mask_buf_def[i], ~d->mask_buf[i]);
+ 			if (ret < 0)
+ 				dev_err(d->map->dev,
+@@ -107,12 +97,12 @@ static void regmap_irq_sync_unlock(struct irq_data *data)
+ 			unmask_offset = d->chip->unmask_base -
+ 							d->chip->mask_base;
+ 			/* clear mask with unmask_base register */
+-			ret = regmap_irq_update_bits(d,
++			ret = regmap_update_bits(d->map,
+ 					reg + unmask_offset,
+ 					d->mask_buf_def[i],
+ 					d->mask_buf[i]);
+ 		} else {
+-			ret = regmap_irq_update_bits(d, reg,
++			ret = regmap_update_bits(d->map, reg,
+ 					 d->mask_buf_def[i], d->mask_buf[i]);
+ 		}
+ 		if (ret != 0)
+@@ -554,17 +544,17 @@ int regmap_add_irq_chip_fwnode(struct fwnode_handle *fwnode,
+ 		reg = chip->mask_base +
+ 			(i * map->reg_stride * d->irq_reg_stride);
+ 		if (chip->mask_invert)
+-			ret = regmap_irq_update_bits(d, reg,
++			ret = regmap_update_bits(d->map, reg,
+ 					 d->mask_buf[i], ~d->mask_buf[i]);
+ 		else if (d->chip->unmask_base) {
+ 			unmask_offset = d->chip->unmask_base -
+ 					d->chip->mask_base;
+-			ret = regmap_irq_update_bits(d,
++			ret = regmap_update_bits(d->map,
+ 					reg + unmask_offset,
+ 					d->mask_buf[i],
+ 					d->mask_buf[i]);
+ 		} else
+-			ret = regmap_irq_update_bits(d, reg,
++			ret = regmap_update_bits(d->map, reg,
+ 					 d->mask_buf[i], d->mask_buf[i]);
+ 		if (ret != 0) {
+ 			dev_err(map->dev, "Failed to set masks in 0x%x: %d\n",
+* Unmerged path include/linux/regmap.h
