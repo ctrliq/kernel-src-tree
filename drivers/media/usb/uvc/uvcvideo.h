@@ -575,6 +575,7 @@ struct uvc_device {
 	struct usb_host_endpoint *int_ep;
 	struct urb *int_urb;
 	struct uvc_status *status;
+	bool flush_status;
 
 	struct input_dev *input;
 	char input_phys[64];
