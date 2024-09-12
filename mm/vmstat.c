@@ -1892,7 +1892,6 @@ int vmstat_refresh(struct ctl_table *table, int write,
 		if (val < 0) {
 			pr_warn("%s: %s %ld\n",
 				__func__, zone_stat_name(i), val);
-			err = -EINVAL;
 		}
 	}
 #ifdef CONFIG_NUMA
@@ -1901,7 +1900,6 @@ int vmstat_refresh(struct ctl_table *table, int write,
 		if (val < 0) {
 			pr_warn("%s: %s %ld\n",
 				__func__, numa_stat_name(i), val);
-			err = -EINVAL;
 		}
 	}
 #endif
@@ -1910,11 +1908,8 @@ int vmstat_refresh(struct ctl_table *table, int write,
 		if (val < 0) {
 			pr_warn("%s: %s %ld\n",
 				__func__, node_stat_name(i), val);
-			err = -EINVAL;
 		}
 	}
-	if (err)
-		return err;
 	if (write)
 		*ppos += *lenp;
 	else
