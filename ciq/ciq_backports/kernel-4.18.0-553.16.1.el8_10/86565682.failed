@@ -1,0 +1,165 @@
+atl1c: Work around the DMA RX overflow issue
+
+jira LE-1907
+cve CVE-2023-52834
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Sieng-Piaw Liew <liew.s.piaw@gmail.com>
+commit 86565682e9053e5deb128193ea9e88531bbae9cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/86565682.failed
+
+This is based on alx driver commit 881d0327db37 ("net: alx: Work around
+the DMA RX overflow issue").
+
+The alx and atl1c drivers had RX overflow error which was why a custom
+allocator was created to avoid certain addresses. The simpler workaround
+then created for alx driver, but not for atl1c due to lack of tester.
+
+Instead of using a custom allocator, check the allocated skb address and
+use skb_reserve() to move away from problematic 0x...fc0 address.
+
+Tested on AR8131 on Acer 4540.
+
+	Signed-off-by: Sieng-Piaw Liew <liew.s.piaw@gmail.com>
+Link: https://lore.kernel.org/r/20230912010711.12036-1-liew.s.piaw@gmail.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit 86565682e9053e5deb128193ea9e88531bbae9cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/atheros/atl1c/atl1c.h
+#	drivers/net/ethernet/atheros/atl1c/atl1c_main.c
+diff --cc drivers/net/ethernet/atheros/atl1c/atl1c.h
+index c46b489ce9b4,63ba64dbb731..000000000000
+--- a/drivers/net/ethernet/atheros/atl1c/atl1c.h
++++ b/drivers/net/ethernet/atheros/atl1c/atl1c.h
+@@@ -512,16 -503,13 +512,23 @@@ struct atl1c_rrd_ring 
+  	u16 count;		/* number of descriptors in the ring */
+  	u16 next_to_use;
+  	u16 next_to_clean;
+++<<<<<<< HEAD
+++=======
++ 	struct napi_struct napi;
+++>>>>>>> 86565682e905 (atl1c: Work around the DMA RX overflow issue)
+  };
+  
+  /* board specific private data structure */
+  struct atl1c_adapter {
+  	struct net_device   *netdev;
+  	struct pci_dev      *pdev;
+++<<<<<<< HEAD
+ +	struct napi_struct  napi;
+ +	struct page         *rx_page;
+ +	unsigned int	    rx_page_offset;
+ +	unsigned int	    rx_frag_size;
+++=======
+++>>>>>>> 86565682e905 (atl1c: Work around the DMA RX overflow issue)
+  	struct atl1c_hw        hw;
+  	struct atl1c_hw_stats  hw_stats;
+  	struct mii_if_info  mii;    /* MII interface info */
+diff --cc drivers/net/ethernet/atheros/atl1c/atl1c_main.c
+index bd50166190fc,74b78164cf74..000000000000
+--- a/drivers/net/ethernet/atheros/atl1c/atl1c_main.c
++++ b/drivers/net/ethernet/atheros/atl1c/atl1c_main.c
+@@@ -485,10 -487,6 +484,13 @@@ static void atl1c_set_rxbufsize(struct 
+  
+  	adapter->rx_buffer_len = mtu > AT_RX_BUF_SIZE ?
+  		roundup(mtu + ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN, 8) : AT_RX_BUF_SIZE;
+++<<<<<<< HEAD
+ +
+ +	head_size = SKB_DATA_ALIGN(adapter->rx_buffer_len + NET_SKB_PAD) +
+ +		    SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+ +	adapter->rx_frag_size = roundup_pow_of_two(head_size);
+++=======
+++>>>>>>> 86565682e905 (atl1c: Work around the DMA RX overflow issue)
+  }
+  
+  static netdev_features_t atl1c_fix_features(struct net_device *netdev,
+@@@ -960,10 -971,6 +962,13 @@@ static void atl1c_free_ring_resources(s
+  		kfree(adapter->tpd_ring[0].buffer_info);
+  		adapter->tpd_ring[0].buffer_info = NULL;
+  	}
+++<<<<<<< HEAD
+ +	if (adapter->rx_page) {
+ +		put_page(adapter->rx_page);
+ +		adapter->rx_page = NULL;
+ +	}
+++=======
+++>>>>>>> 86565682e905 (atl1c: Work around the DMA RX overflow issue)
+  }
+  
+  /**
+@@@ -1666,39 -1742,11 +1671,47 @@@ static inline void atl1c_rx_checksum(st
+  	skb_checksum_none_assert(skb);
+  }
+  
+++<<<<<<< HEAD
+ +static struct sk_buff *atl1c_alloc_skb(struct atl1c_adapter *adapter)
+ +{
+ +	struct sk_buff *skb;
+ +	struct page *page;
+ +
+ +	if (adapter->rx_frag_size > PAGE_SIZE)
+ +		return netdev_alloc_skb(adapter->netdev,
+ +					adapter->rx_buffer_len);
+ +
+ +	page = adapter->rx_page;
+ +	if (!page) {
+ +		adapter->rx_page = page = alloc_page(GFP_ATOMIC);
+ +		if (unlikely(!page))
+ +			return NULL;
+ +		adapter->rx_page_offset = 0;
+ +	}
+ +
+ +	skb = build_skb(page_address(page) + adapter->rx_page_offset,
+ +			adapter->rx_frag_size);
+ +	if (likely(skb)) {
+ +		skb_reserve(skb, NET_SKB_PAD);
+ +		adapter->rx_page_offset += adapter->rx_frag_size;
+ +		if (adapter->rx_page_offset >= PAGE_SIZE)
+ +			adapter->rx_page = NULL;
+ +		else
+ +			get_page(page);
+ +	}
+ +	return skb;
+ +}
+ +
+ +static int atl1c_alloc_rx_buffer(struct atl1c_adapter *adapter)
+ +{
+ +	struct atl1c_rfd_ring *rfd_ring = &adapter->rfd_ring;
+++=======
++ static int atl1c_alloc_rx_buffer(struct atl1c_adapter *adapter, u32 queue,
++ 				 bool napi_mode)
++ {
++ 	struct atl1c_rfd_ring *rfd_ring = &adapter->rfd_ring[queue];
++ 	struct atl1c_rrd_ring *rrd_ring = &adapter->rrd_ring[queue];
+++>>>>>>> 86565682e905 (atl1c: Work around the DMA RX overflow issue)
+  	struct pci_dev *pdev = adapter->pdev;
+  	struct atl1c_buffer *buffer_info, *next_info;
+  	struct sk_buff *skb;
+@@@ -1717,7 -1765,18 +1730,22 @@@
+  	while (next_info->flags & ATL1C_BUFFER_FREE) {
+  		rfd_desc = ATL1C_RFD_DESC(rfd_ring, rfd_next_to_use);
+  
+++<<<<<<< HEAD
+ +		skb = atl1c_alloc_skb(adapter);
+++=======
++ 		/* When DMA RX address is set to something like
++ 		 * 0x....fc0, it will be very likely to cause DMA
++ 		 * RFD overflow issue.
++ 		 *
++ 		 * To work around it, we apply rx skb with 64 bytes
++ 		 * longer space, and offset the address whenever
++ 		 * 0x....fc0 is detected.
++ 		 */
++ 		if (likely(napi_mode))
++ 			skb = napi_alloc_skb(&rrd_ring->napi, adapter->rx_buffer_len + 64);
++ 		else
++ 			skb = netdev_alloc_skb(adapter->netdev, adapter->rx_buffer_len + 64);
+++>>>>>>> 86565682e905 (atl1c: Work around the DMA RX overflow issue)
+  		if (unlikely(!skb)) {
+  			if (netif_msg_rx_err(adapter))
+  				dev_warn(&pdev->dev, "alloc rx buffer failed\n");
+* Unmerged path drivers/net/ethernet/atheros/atl1c/atl1c.h
+* Unmerged path drivers/net/ethernet/atheros/atl1c/atl1c_main.c
