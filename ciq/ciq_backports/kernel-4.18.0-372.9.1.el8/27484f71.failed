@@ -1,0 +1,171 @@
+net/mlx5e: Offload tc rules that redirect to ovs internal port
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Ariel Levkovich <lariel@nvidia.com>
+commit 27484f7170edabbda7b53650cd24d38295cffe60
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/27484f71.failed
+
+Allow offloading rules that redirect to ovs internal port
+ingress and egress.
+
+To support redirect to ingress device, offloading of REDIRECT_INGRESS
+action is added.
+
+When a tc rule redirects to ovs internal port, the hw rule will
+overwrite the input vport value in reg_c0 with a new vport metadata
+value that is mapped for this internal port using the internal
+port mapping api that is introduce in previous patches.
+After that the hw rule will redirect the packet to the root table
+to continue processing with the new vport metadata value.
+
+The new vport metadata value indicates that this packet is now
+arriving through an internal port and therefore should be processed
+using rules that apply on the same internal port as the filter device.
+Therefore, following rules that apply on this internal port will have
+to match on the same vport metadata value as part of their matching
+keys to make sure the packet belongs to the internal port.
+
+	Signed-off-by: Ariel Levkovich <lariel@nvidia.com>
+	Reviewed-by: Vlad Buslov <vladbu@nvidia.com>
+	Reviewed-by: Roi Dayan <roid@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 27484f7170edabbda7b53650cd24d38295cffe60)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index ff4d59984b35,21c37a1a4796..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -3744,20 -3892,39 +3803,38 @@@ static int parse_tc_fdb_actions(struct 
+  	bool encap = false, decap = false;
+  	u32 action = attr->action;
+  	int err, i, if_count = 0;
++ 	bool ptype_host = false;
+  	bool mpls_push = false;
+  
+ -	if (!flow_action_has_entries(flow_action)) {
+ -		NL_SET_ERR_MSG_MOD(extack, "Flow action doesn't have any entries");
+ +	if (!flow_action_has_entries(flow_action))
+  		return -EINVAL;
+ -	}
+  
+  	if (!flow_action_hw_stats_check(flow_action, extack,
+ -					FLOW_ACTION_HW_STATS_DELAYED_BIT)) {
+ -		NL_SET_ERR_MSG_MOD(extack, "Flow action HW stats type is not supported");
+ +					FLOW_ACTION_HW_STATS_DELAYED_BIT))
+  		return -EOPNOTSUPP;
+ -	}
+  
+  	esw_attr = attr->esw_attr;
+  	parse_attr = attr->parse_attr;
+  
+  	flow_action_for_each(i, act, flow_action) {
+  		switch (act->id) {
+++<<<<<<< HEAD
+++=======
++ 		case FLOW_ACTION_ACCEPT:
++ 			action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
++ 				MLX5_FLOW_CONTEXT_ACTION_COUNT;
++ 			attr->flags |= MLX5_ESW_ATTR_FLAG_ACCEPT;
++ 			break;
++ 		case FLOW_ACTION_PTYPE:
++ 			if (act->ptype != PACKET_HOST) {
++ 				NL_SET_ERR_MSG_MOD(extack,
++ 						   "skbedit ptype is only supported with type host");
++ 				return -EOPNOTSUPP;
++ 			}
++ 
++ 			ptype_host = true;
++ 			break;
+++>>>>>>> 27484f7170ed (net/mlx5e: Offload tc rules that redirect to ovs internal port)
+  		case FLOW_ACTION_DROP:
+  			action |= MLX5_FLOW_CONTEXT_ACTION_DROP |
+  				  MLX5_FLOW_CONTEXT_ACTION_COUNT;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_priv.h b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_priv.h
+index c340bf90354a..b689701ac7d8 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_priv.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_priv.h
+@@ -174,4 +174,6 @@ void mlx5e_flow_put(struct mlx5e_priv *priv, struct mlx5e_tc_flow *flow);
+ 
+ struct mlx5_fc *mlx5e_tc_get_counter(struct mlx5e_tc_flow *flow);
+ 
++struct mlx5e_tc_int_port_priv *
++mlx5e_get_int_port_priv(struct mlx5e_priv *priv);
+ #endif /* __MLX5_EN_TC_PRIV_H__ */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+index df0f63c21e72..339ad8c39050 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+@@ -283,6 +283,12 @@ bool mlx5e_tc_is_vf_tunnel(struct net_device *out_dev, struct net_device *route_
+ int mlx5e_tc_query_route_vport(struct net_device *out_dev, struct net_device *route_dev,
+ 			       u16 *vport);
+ 
++int mlx5e_set_fwd_to_int_port_actions(struct mlx5e_priv *priv,
++				      struct mlx5_flow_attr *attr,
++				      int ifindex,
++				      enum mlx5e_tc_int_port_type type,
++				      u32 *action,
++				      int out_index);
+ #else /* CONFIG_MLX5_CLS_ACT */
+ static inline int  mlx5e_tc_nic_init(struct mlx5e_priv *priv) { return 0; }
+ static inline void mlx5e_tc_nic_cleanup(struct mlx5e_priv *priv) {}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index fd48fcf08e5f..cbe3b995e583 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -456,6 +456,7 @@ struct mlx5_esw_flow_attr {
+ 	struct mlx5_eswitch_rep *in_rep;
+ 	struct mlx5_core_dev	*in_mdev;
+ 	struct mlx5_core_dev    *counter_dev;
++	struct mlx5e_tc_int_port *dest_int_port;
+ 
+ 	int split_count;
+ 	int out_count;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index a066d41cc204..b27e8ec36460 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -291,8 +291,11 @@ esw_setup_chain_src_port_rewrite(struct mlx5_flow_destination *dest,
+ 		err = esw_setup_chain_dest(dest, flow_act, chains, attr->dest_chain, 1, 0, *i);
+ 		if (err)
+ 			goto err_setup_chain;
+-		flow_act->action |= MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT;
+-		flow_act->pkt_reformat = esw_attr->dests[j].pkt_reformat;
++
++		if (esw_attr->dests[j].pkt_reformat) {
++			flow_act->action |= MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT;
++			flow_act->pkt_reformat = esw_attr->dests[j].pkt_reformat;
++		}
+ 	}
+ 	return 0;
+ 
+@@ -316,7 +319,8 @@ esw_is_indir_table(struct mlx5_eswitch *esw, struct mlx5_flow_attr *attr)
+ 	int i;
+ 
+ 	for (i = esw_attr->split_count; i < esw_attr->out_count; i++)
+-		if (mlx5_esw_indir_table_needed(esw, attr, esw_attr->dests[i].rep->vport,
++		if (esw_attr->dests[i].rep &&
++		    mlx5_esw_indir_table_needed(esw, attr, esw_attr->dests[i].rep->vport,
+ 						esw_attr->dests[i].mdev))
+ 			return true;
+ 	return false;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads_termtbl.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads_termtbl.c
+index b45954905845..f577ba9624c7 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads_termtbl.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads_termtbl.c
+@@ -229,7 +229,8 @@ mlx5_eswitch_termtbl_required(struct mlx5_eswitch *esw,
+ 
+ 	/* hairpin */
+ 	for (i = esw_attr->split_count; i < esw_attr->out_count; i++)
+-		if (esw_attr->dests[i].rep->vport == MLX5_VPORT_UPLINK)
++		if (esw_attr->dests[i].rep &&
++		    esw_attr->dests[i].rep->vport == MLX5_VPORT_UPLINK)
+ 			return true;
+ 
+ 	return false;
