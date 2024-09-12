@@ -697,8 +697,7 @@ static int program_rcvarray(struct hfi1_filedata *fd, struct tid_user_buf *tbuf,
 			return ret;
 		mapped += npages;
 
-		tidinfo = rcventry2tidinfo(rcventry - uctxt->expected_base) |
-			EXP_TID_SET(LEN, npages);
+		tidinfo = create_tid(rcventry - uctxt->expected_base, npages);
 		tidlist[(*tididx)++] = tidinfo;
 		grp->used++;
 		grp->map |= 1 << useidx++;
@@ -888,9 +887,8 @@ static int tid_rb_invalidate(void *arg, struct mmu_rb_node *mnode)
 	spin_lock(&fdata->invalid_lock);
 	if (fdata->invalid_tid_idx < uctxt->expected_count) {
 		fdata->invalid_tids[fdata->invalid_tid_idx] =
-			rcventry2tidinfo(node->rcventry - uctxt->expected_base);
-		fdata->invalid_tids[fdata->invalid_tid_idx] |=
-			EXP_TID_SET(LEN, node->npages);
+			create_tid(node->rcventry - uctxt->expected_base,
+				   node->npages);
 		if (!fdata->invalid_tid_idx) {
 			unsigned long *ev;
 
