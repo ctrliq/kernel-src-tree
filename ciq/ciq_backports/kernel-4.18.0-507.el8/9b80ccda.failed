@@ -1,0 +1,107 @@
+bonding: fix missed rcu protection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-507.el8
+commit-author Hangbin Liu <liuhangbin@gmail.com>
+commit 9b80ccda233fa6c59de411bf889cc4d0e028f2c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-507.el8/9b80ccda.failed
+
+When removing the rcu_read_lock in bond_ethtool_get_ts_info() as
+discussed [1], I didn't notice it could be called via setsockopt,
+which doesn't hold rcu lock, as syzbot pointed:
+
+  stack backtrace:
+  CPU: 0 PID: 3599 Comm: syz-executor317 Not tainted 5.18.0-rc5-syzkaller-01392-g01f4685797a5 #0
+  Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
+  Call Trace:
+   <TASK>
+   __dump_stack lib/dump_stack.c:88 [inline]
+   dump_stack_lvl+0xcd/0x134 lib/dump_stack.c:106
+   bond_option_active_slave_get_rcu include/net/bonding.h:353 [inline]
+   bond_ethtool_get_ts_info+0x32c/0x3a0 drivers/net/bonding/bond_main.c:5595
+   __ethtool_get_ts_info+0x173/0x240 net/ethtool/common.c:554
+   ethtool_get_phc_vclocks+0x99/0x110 net/ethtool/common.c:568
+   sock_timestamping_bind_phc net/core/sock.c:869 [inline]
+   sock_set_timestamping+0x3a3/0x7e0 net/core/sock.c:916
+   sock_setsockopt+0x543/0x2ec0 net/core/sock.c:1221
+   __sys_setsockopt+0x55e/0x6a0 net/socket.c:2223
+   __do_sys_setsockopt net/socket.c:2238 [inline]
+   __se_sys_setsockopt net/socket.c:2235 [inline]
+   __x64_sys_setsockopt+0xba/0x150 net/socket.c:2235
+   do_syscall_x64 arch/x86/entry/common.c:50 [inline]
+   do_syscall_64+0x35/0xb0 arch/x86/entry/common.c:80
+   entry_SYSCALL_64_after_hwframe+0x44/0xae
+  RIP: 0033:0x7f8902c8eb39
+
+Fix it by adding rcu_read_lock and take a ref on the real_dev.
+Since dev_hold() and dev_put() can take NULL these days, we can
+skip checking if real_dev exist.
+
+[1] https://lore.kernel.org/netdev/27565.1642742439@famine/
+
+	Reported-by: syzbot+92beb3d46aab498710fa@syzkaller.appspotmail.com
+Fixes: aa6034678e87 ("bonding: use rcu_dereference_rtnl when get bonding active slave")
+	Suggested-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Suggested-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+	Reviewed-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Link: https://lore.kernel.org/r/20220519020148.1058344-1-liuhangbin@gmail.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 9b80ccda233fa6c59de411bf889cc4d0e028f2c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index f99aa29504af,b5c5196e03ee..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -5003,6 -5584,42 +5003,45 @@@ static void bond_ethtool_get_drvinfo(st
+  		 BOND_ABI_VERSION);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bond_ethtool_get_ts_info(struct net_device *bond_dev,
++ 				    struct ethtool_ts_info *info)
++ {
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	const struct ethtool_ops *ops;
++ 	struct net_device *real_dev;
++ 	struct phy_device *phydev;
++ 	int ret = 0;
++ 
++ 	rcu_read_lock();
++ 	real_dev = bond_option_active_slave_get_rcu(bond);
++ 	dev_hold(real_dev);
++ 	rcu_read_unlock();
++ 
++ 	if (real_dev) {
++ 		ops = real_dev->ethtool_ops;
++ 		phydev = real_dev->phydev;
++ 
++ 		if (phy_has_tsinfo(phydev)) {
++ 			ret = phy_ts_info(phydev, info);
++ 			goto out;
++ 		} else if (ops->get_ts_info) {
++ 			ret = ops->get_ts_info(real_dev, info);
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	info->so_timestamping = SOF_TIMESTAMPING_RX_SOFTWARE |
++ 				SOF_TIMESTAMPING_SOFTWARE;
++ 	info->phc_index = -1;
++ 
++ out:
++ 	dev_put(real_dev);
++ 	return ret;
++ }
++ 
+++>>>>>>> 9b80ccda233f (bonding: fix missed rcu protection)
+  static const struct ethtool_ops bond_ethtool_ops = {
+  	.get_drvinfo		= bond_ethtool_get_drvinfo,
+  	.get_link		= ethtool_op_get_link,
+* Unmerged path drivers/net/bonding/bond_main.c
