@@ -1,0 +1,712 @@
+sched, smp: Trace smp callback causing an IPI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-518.el8
+commit-author Valentin Schneider <vschneid@redhat.com>
+commit 68f4ff04dbada18dad79659c266a8e5e29e458cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-518.el8/68f4ff04.failed
+
+Context
+=======
+
+The newly-introduced ipi_send_cpumask tracepoint has a "callback" parameter
+which so far has only been fed with NULL.
+
+While CSD_TYPE_SYNC/ASYNC and CSD_TYPE_IRQ_WORK share a similar backing
+struct layout (meaning their callback func can be accessed without caring
+about the actual CSD type), CSD_TYPE_TTWU doesn't even have a function
+attached to its struct. This means we need to check the type of a CSD
+before eventually dereferencing its associated callback.
+
+This isn't as trivial as it sounds: the CSD type is stored in
+__call_single_node.u_flags, which get cleared right before the callback is
+executed via csd_unlock(). This implies checking the CSD type before it is
+enqueued on the call_single_queue, as the target CPU's queue can be flushed
+before we get to sending an IPI.
+
+Furthermore, send_call_function_single_ipi() only has a CPU parameter, and
+would need to have an additional argument to trickle down the invoked
+function. This is somewhat silly, as the extra argument will always be
+pushed down to the function even when nothing is being traced, which is
+unnecessary overhead.
+
+Changes
+=======
+
+send_call_function_single_ipi() is only used by smp.c, and is defined in
+sched/core.c as it contains scheduler-specific ops (set_nr_if_polling() of
+a CPU's idle task).
+
+Split it into two parts: the scheduler bits remain in sched/core.c, and the
+actual IPI emission is moved into smp.c. This lets us define an
+__always_inline helper function that can take the related callback as
+parameter without creating useless register pressure in the non-traced path
+which only gains a (disabled) static branch.
+
+Do the same thing for the multi IPI case.
+
+	Signed-off-by: Valentin Schneider <vschneid@redhat.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20230307143558.294354-8-vschneid@redhat.com
+(cherry picked from commit 68f4ff04dbada18dad79659c266a8e5e29e458cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/smp.h
+#	kernel/smp.c
+diff --cc kernel/sched/core.c
+index 9ba44485051c,b0a48cfc0a22..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -2402,171 -4577,202 +2402,186 @@@ static int ttwu_runnable(struct task_st
+  
+  	return ret;
+  }
+ -__setup("schedstats=", setup_schedstats);
+  
+ -#ifdef CONFIG_PROC_SYSCTL
+ -static int sysctl_schedstats(struct ctl_table *table, int write, void *buffer,
+ -		size_t *lenp, loff_t *ppos)
+ +#ifdef CONFIG_SMP
+ +void sched_ttwu_pending(void *arg)
+  {
+ -	struct ctl_table t;
+ -	int err;
+ -	int state = static_branch_likely(&sched_schedstats);
+ +	struct llist_node *llist = arg;
+ +	struct rq *rq = this_rq();
+ +	struct task_struct *p, *t;
+ +	struct rq_flags rf;
+  
+ -	if (write && !capable(CAP_SYS_ADMIN))
+ -		return -EPERM;
+ +	if (!llist)
+ +		return;
+  
+ -	t = *table;
+ -	t.data = &state;
+ -	err = proc_dointvec_minmax(&t, write, buffer, lenp, ppos);
+ -	if (err < 0)
+ -		return err;
+ -	if (write)
+ -		set_schedstats(state);
+ -	return err;
+ -}
+ -#endif /* CONFIG_PROC_SYSCTL */
+ -#endif /* CONFIG_SCHEDSTATS */
+ +	rq_lock_irqsave(rq, &rf);
+ +	update_rq_clock(rq);
+  
+ -#ifdef CONFIG_SYSCTL
+ -static struct ctl_table sched_core_sysctls[] = {
+ -#ifdef CONFIG_SCHEDSTATS
+ -	{
+ -		.procname       = "sched_schedstats",
+ -		.data           = NULL,
+ -		.maxlen         = sizeof(unsigned int),
+ -		.mode           = 0644,
+ -		.proc_handler   = sysctl_schedstats,
+ -		.extra1         = SYSCTL_ZERO,
+ -		.extra2         = SYSCTL_ONE,
+ -	},
+ -#endif /* CONFIG_SCHEDSTATS */
+ -#ifdef CONFIG_UCLAMP_TASK
+ -	{
+ -		.procname       = "sched_util_clamp_min",
+ -		.data           = &sysctl_sched_uclamp_util_min,
+ -		.maxlen         = sizeof(unsigned int),
+ -		.mode           = 0644,
+ -		.proc_handler   = sysctl_sched_uclamp_handler,
+ -	},
+ -	{
+ -		.procname       = "sched_util_clamp_max",
+ -		.data           = &sysctl_sched_uclamp_util_max,
+ -		.maxlen         = sizeof(unsigned int),
+ -		.mode           = 0644,
+ -		.proc_handler   = sysctl_sched_uclamp_handler,
+ -	},
+ -	{
+ -		.procname       = "sched_util_clamp_min_rt_default",
+ -		.data           = &sysctl_sched_uclamp_util_min_rt_default,
+ -		.maxlen         = sizeof(unsigned int),
+ -		.mode           = 0644,
+ -		.proc_handler   = sysctl_sched_uclamp_handler,
+ -	},
+ -#endif /* CONFIG_UCLAMP_TASK */
+ -#ifdef CONFIG_NUMA_BALANCING
+ -	{
+ -		.procname	= "numa_balancing",
+ -		.data		= NULL, /* filled in by handler */
+ -		.maxlen		= sizeof(unsigned int),
+ -		.mode		= 0644,
+ -		.proc_handler	= sysctl_numa_balancing,
+ -		.extra1		= SYSCTL_ZERO,
+ -		.extra2		= SYSCTL_FOUR,
+ -	},
+ -#endif /* CONFIG_NUMA_BALANCING */
+ -	{}
+ -};
+ -static int __init sched_core_sysctl_init(void)
+ -{
+ -	register_sysctl_init("kernel", sched_core_sysctls);
+ -	return 0;
+ +	llist_for_each_entry_safe(p, t, llist, wake_entry.llist) {
+ +		if (WARN_ON_ONCE(p->on_cpu))
+ +			smp_cond_load_acquire(&p->on_cpu, !VAL);
+ +
+ +		if (WARN_ON_ONCE(task_cpu(p) != cpu_of(rq)))
+ +			set_task_cpu(p, cpu_of(rq));
+ +
+ +		ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0, &rf);
+ +	}
+ +
+ +	/*
+ +	 * Must be after enqueueing at least once task such that
+ +	 * idle_cpu() does not observe a false-negative -- if it does,
+ +	 * it is possible for select_idle_siblings() to stack a number
+ +	 * of tasks on this CPU during that window.
+ +	 *
+ +	 * It is ok to clear ttwu_pending when another task pending.
+ +	 * We will receive IPI after local irq enabled and then enqueue it.
+ +	 * Since now nr_running > 0, idle_cpu() will always get correct result.
+ +	 */
+ +	WRITE_ONCE(rq->ttwu_pending, 0);
+ +	rq_unlock_irqrestore(rq, &rf);
+  }
+ -late_initcall(sched_core_sysctl_init);
+ -#endif /* CONFIG_SYSCTL */
+  
+- void send_call_function_single_ipi(int cpu)
++ /*
+ - * fork()/clone()-time setup:
+++ * Prepare the scene for sending an IPI for a remote smp_call
+++ *
+++ * Returns true if the caller can proceed with sending the IPI.
+++ * Returns false otherwise.
++  */
+ -int sched_fork(unsigned long clone_flags, struct task_struct *p)
+++bool call_function_single_prep_ipi(int cpu)
+  {
+ -	__sched_fork(clone_flags, p);
+ -	/*
+ -	 * We mark the process as NEW here. This guarantees that
+ -	 * nobody will actually run it, and a signal or other external
+ -	 * event cannot wake it up and insert it on the runqueue either.
+ -	 */
+ -	p->__state = TASK_NEW;
+++<<<<<<< HEAD
+ +	struct rq *rq = cpu_rq(cpu);
+  
+ -	/*
+ -	 * Make sure we do not leak PI boosting priority to the child.
+ -	 */
+ -	p->prio = current->normal_prio;
+ +	if (!set_nr_if_polling(rq->idle))
+ +		arch_send_call_function_single_ipi(cpu);
+ +	else
+ +		trace_sched_wake_idle_without_ipi(cpu);
+++=======
+++	if (set_nr_if_polling(cpu_rq(cpu)->idle)) {
+++		trace_sched_wake_idle_without_ipi(cpu);
+++		return false;
+++	}
+++
+++	return true;
+++>>>>>>> 68f4ff04dbad (sched, smp: Trace smp callback causing an IPI)
+ +}
+  
+ -	uclamp_fork(p);
+ +/*
+ + * Queue a task on the target CPUs wake_list and wake the CPU via IPI if
+ + * necessary. The wakee CPU on receipt of the IPI will queue the task
+ + * via sched_ttwu_wakeup() for activation so the wakee incurs the cost
+ + * of the wakeup instead of the waker.
+ + */
+ +static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
+ +{
+ +	struct rq *rq = cpu_rq(cpu);
+  
+ -	/*
+ -	 * Revert to default priority/policy on fork if requested.
+ -	 */
+ -	if (unlikely(p->sched_reset_on_fork)) {
+ -		if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
+ -			p->policy = SCHED_NORMAL;
+ -			p->static_prio = NICE_TO_PRIO(0);
+ -			p->rt_priority = 0;
+ -		} else if (PRIO_TO_NICE(p->static_prio) < 0)
+ -			p->static_prio = NICE_TO_PRIO(0);
+ +	p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
+  
+ -		p->prio = p->normal_prio = p->static_prio;
+ -		set_load_weight(p, false);
+ +	WRITE_ONCE(rq->ttwu_pending, 1);
+ +	__smp_call_single_queue(cpu, &p->wake_entry.llist);
+ +}
+  
+ -		/*
+ -		 * We don't need the reset flag anymore after the fork. It has
+ -		 * fulfilled its duty:
+ -		 */
+ -		p->sched_reset_on_fork = 0;
+ -	}
+ +void wake_up_if_idle(int cpu)
+ +{
+ +	struct rq *rq = cpu_rq(cpu);
+ +	struct rq_flags rf;
+  
+ -	if (dl_prio(p->prio))
+ -		return -EAGAIN;
+ -	else if (rt_prio(p->prio))
+ -		p->sched_class = &rt_sched_class;
+ -	else
+ -		p->sched_class = &fair_sched_class;
+ +	rcu_read_lock();
+  
+ -	init_entity_runnable_average(&p->se);
+ +	if (!is_idle_task(rcu_dereference(rq->curr)))
+ +		goto out;
+  
+ +	rq_lock_irqsave(rq, &rf);
+ +	if (is_idle_task(rq->curr))
+ +		resched_curr(rq);
+ +	/* Else CPU is not idle, do nothing here: */
+ +	rq_unlock_irqrestore(rq, &rf);
+  
+ -#ifdef CONFIG_SCHED_INFO
+ -	if (likely(sched_info_on()))
+ -		memset(&p->sched_info, 0, sizeof(p->sched_info));
+ -#endif
+ -#if defined(CONFIG_SMP)
+ -	p->on_cpu = 0;
+ -#endif
+ -	init_task_preempt_count(p);
+ -#ifdef CONFIG_SMP
+ -	plist_node_init(&p->pushable_tasks, MAX_PRIO);
+ -	RB_CLEAR_NODE(&p->pushable_dl_tasks);
+ -#endif
+ -	return 0;
+ +out:
+ +	rcu_read_unlock();
+  }
+  
+ -void sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
+ +bool cpus_share_cache(int this_cpu, int that_cpu)
+  {
+ -	unsigned long flags;
+ +	if (this_cpu == that_cpu)
+ +		return true;
+  
+ +	return per_cpu(sd_llc_id, this_cpu) == per_cpu(sd_llc_id, that_cpu);
+ +}
+ +
+ +static inline bool ttwu_queue_cond(struct task_struct *p, int cpu)
+ +{
+  	/*
+ -	 * Because we're not yet on the pid-hash, p->pi_lock isn't strictly
+ -	 * required yet, but lockdep gets upset if rules are violated.
+ +	 * Do not complicate things with the async wake_list while the CPU is
+ +	 * in hotplug state.
+  	 */
+ -	raw_spin_lock_irqsave(&p->pi_lock, flags);
+ -#ifdef CONFIG_CGROUP_SCHED
+ -	if (1) {
+ -		struct task_group *tg;
+ -		tg = container_of(kargs->cset->subsys[cpu_cgrp_id],
+ -				  struct task_group, css);
+ -		tg = autogroup_task_group(p, tg);
+ -		p->sched_task_group = tg;
+ -	}
+ -#endif
+ -	rseq_migrate(p);
+ +	if (!cpu_active(cpu))
+ +		return false;
+ +
+ +	/* Ensure the task will still be allowed to run on the CPU. */
+ +	if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+ +		return false;
+ +
+  	/*
+ -	 * We're setting the CPU for the first time, we don't migrate,
+ -	 * so use __set_task_cpu().
+ +	 * If the CPU does not share cache, then queue the task on the
+ +	 * remote rqs wakelist to avoid accessing remote data.
+  	 */
+ -	__set_task_cpu(p, smp_processor_id());
+ -	if (p->sched_class->task_fork)
+ -		p->sched_class->task_fork(p);
+ -	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+ +	if (!cpus_share_cache(smp_processor_id(), cpu))
+ +		return true;
+ +
+ +	if (cpu == smp_processor_id())
+ +		return false;
+ +
+ +	/*
+ +	 * If the wakee cpu is idle, or the task is descheduling and the
+ +	 * only running task on the CPU, then use the wakelist to offload
+ +	 * the task activation to the idle (or soon-to-be-idle) CPU as
+ +	 * the current CPU is likely busy. nr_running is checked to
+ +	 * avoid unnecessary task stacking.
+ +	 *
+ +	 * Note that we can only get here with (wakee) p->on_rq=0,
+ +	 * p->on_cpu can be whatever, we've done the dequeue, so
+ +	 * the wakee has been accounted out of ->nr_running.
+ +	 */
+ +	if (!cpu_rq(cpu)->nr_running)
+ +		return true;
+ +
+ +	return false;
+  }
+  
+ -void sched_post_fork(struct task_struct *p)
+ +static bool ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
+  {
+ -	uclamp_post_fork(p);
+ +	if (sched_feat(TTWU_QUEUE) && ttwu_queue_cond(p, cpu)) {
+ +		sched_clock_cpu(cpu); /* Sync clocks across CPUs */
+ +		__ttwu_queue_wakelist(p, cpu, wake_flags);
+ +		return true;
+ +	}
+ +
+ +	return false;
+  }
+  
+ -unsigned long to_ratio(u64 period, u64 runtime)
+ +#else /* !CONFIG_SMP */
+ +
+ +static inline bool ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
+  {
+ -	if (runtime == RUNTIME_INF)
+ -		return BW_UNIT;
+ +	return false;
+ +}
+  
+ -	/*
+ -	 * Doing this here saves a lot of checks in all
+ -	 * the calling paths, and returning zero seems
+ -	 * safe for them anyway.
+ -	 */
+ -	if (period == 0)
+ -		return 0;
+ +#endif /* CONFIG_SMP */
+  
+ -	return div64_u64(runtime << BW_SHIFT, period);
+ +static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
+ +{
+ +	struct rq *rq = cpu_rq(cpu);
+ +	struct rq_flags rf;
+ +
+ +	if (ttwu_queue_wakelist(p, cpu, wake_flags))
+ +		return;
+ +
+ +	rq_lock(rq, &rf);
+ +	update_rq_clock(rq);
+ +	ttwu_do_activate(rq, p, wake_flags, &rf);
+ +	rq_unlock(rq, &rf);
+  }
+  
+  /*
+diff --cc kernel/sched/smp.h
+index 9620e323162c,21ac44428bb0..000000000000
+--- a/kernel/sched/smp.h
++++ b/kernel/sched/smp.h
+@@@ -6,4 -6,10 +6,14 @@@
+  
+  extern void sched_ttwu_pending(void *arg);
+  
+++<<<<<<< HEAD
+ +extern void send_call_function_single_ipi(int cpu);
+++=======
++ extern bool call_function_single_prep_ipi(int cpu);
++ 
++ #ifdef CONFIG_SMP
++ extern void flush_smp_call_function_queue(void);
++ #else
++ static inline void flush_smp_call_function_queue(void) { }
++ #endif
+++>>>>>>> 68f4ff04dbad (sched, smp: Trace smp callback causing an IPI)
+diff --cc kernel/smp.c
+index 1810061cceb0,37e9613a0889..000000000000
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@@ -96,6 -103,155 +96,158 @@@ void __init call_function_init(void
+  	smpcfd_prepare_cpu(smp_processor_id());
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static __always_inline void
++ send_call_function_single_ipi(int cpu, smp_call_func_t func)
++ {
++ 	if (call_function_single_prep_ipi(cpu)) {
++ 		trace_ipi_send_cpumask(cpumask_of(cpu), _RET_IP_, func);
++ 		arch_send_call_function_single_ipi(cpu);
++ 	}
++ }
++ 
++ static __always_inline void
++ send_call_function_ipi_mask(struct cpumask *mask, smp_call_func_t func)
++ {
++ 	trace_ipi_send_cpumask(mask, _RET_IP_, func);
++ 	arch_send_call_function_ipi_mask(mask);
++ }
++ 
++ #ifdef CONFIG_CSD_LOCK_WAIT_DEBUG
++ 
++ static DEFINE_STATIC_KEY_MAYBE(CONFIG_CSD_LOCK_WAIT_DEBUG_DEFAULT, csdlock_debug_enabled);
++ 
++ /*
++  * Parse the csdlock_debug= kernel boot parameter.
++  *
++  * If you need to restore the old "ext" value that once provided
++  * additional debugging information, reapply the following commits:
++  *
++  * de7b09ef658d ("locking/csd_lock: Prepare more CSD lock debugging")
++  * a5aabace5fb8 ("locking/csd_lock: Add more data to CSD lock debugging")
++  */
++ static int __init csdlock_debug(char *str)
++ {
++ 	int ret;
++ 	unsigned int val = 0;
++ 
++ 	ret = get_option(&str, &val);
++ 	if (ret) {
++ 		if (val)
++ 			static_branch_enable(&csdlock_debug_enabled);
++ 		else
++ 			static_branch_disable(&csdlock_debug_enabled);
++ 	}
++ 
++ 	return 1;
++ }
++ __setup("csdlock_debug=", csdlock_debug);
++ 
++ static DEFINE_PER_CPU(call_single_data_t *, cur_csd);
++ static DEFINE_PER_CPU(smp_call_func_t, cur_csd_func);
++ static DEFINE_PER_CPU(void *, cur_csd_info);
++ 
++ static ulong csd_lock_timeout = 5000;  /* CSD lock timeout in milliseconds. */
++ module_param(csd_lock_timeout, ulong, 0444);
++ 
++ static atomic_t csd_bug_count = ATOMIC_INIT(0);
++ 
++ /* Record current CSD work for current CPU, NULL to erase. */
++ static void __csd_lock_record(struct __call_single_data *csd)
++ {
++ 	if (!csd) {
++ 		smp_mb(); /* NULL cur_csd after unlock. */
++ 		__this_cpu_write(cur_csd, NULL);
++ 		return;
++ 	}
++ 	__this_cpu_write(cur_csd_func, csd->func);
++ 	__this_cpu_write(cur_csd_info, csd->info);
++ 	smp_wmb(); /* func and info before csd. */
++ 	__this_cpu_write(cur_csd, csd);
++ 	smp_mb(); /* Update cur_csd before function call. */
++ 		  /* Or before unlock, as the case may be. */
++ }
++ 
++ static __always_inline void csd_lock_record(struct __call_single_data *csd)
++ {
++ 	if (static_branch_unlikely(&csdlock_debug_enabled))
++ 		__csd_lock_record(csd);
++ }
++ 
++ static int csd_lock_wait_getcpu(struct __call_single_data *csd)
++ {
++ 	unsigned int csd_type;
++ 
++ 	csd_type = CSD_TYPE(csd);
++ 	if (csd_type == CSD_TYPE_ASYNC || csd_type == CSD_TYPE_SYNC)
++ 		return csd->node.dst; /* Other CSD_TYPE_ values might not have ->dst. */
++ 	return -1;
++ }
++ 
++ /*
++  * Complain if too much time spent waiting.  Note that only
++  * the CSD_TYPE_SYNC/ASYNC types provide the destination CPU,
++  * so waiting on other types gets much less information.
++  */
++ static bool csd_lock_wait_toolong(struct __call_single_data *csd, u64 ts0, u64 *ts1, int *bug_id)
++ {
++ 	int cpu = -1;
++ 	int cpux;
++ 	bool firsttime;
++ 	u64 ts2, ts_delta;
++ 	call_single_data_t *cpu_cur_csd;
++ 	unsigned int flags = READ_ONCE(csd->node.u_flags);
++ 	unsigned long long csd_lock_timeout_ns = csd_lock_timeout * NSEC_PER_MSEC;
++ 
++ 	if (!(flags & CSD_FLAG_LOCK)) {
++ 		if (!unlikely(*bug_id))
++ 			return true;
++ 		cpu = csd_lock_wait_getcpu(csd);
++ 		pr_alert("csd: CSD lock (#%d) got unstuck on CPU#%02d, CPU#%02d released the lock.\n",
++ 			 *bug_id, raw_smp_processor_id(), cpu);
++ 		return true;
++ 	}
++ 
++ 	ts2 = sched_clock();
++ 	ts_delta = ts2 - *ts1;
++ 	if (likely(ts_delta <= csd_lock_timeout_ns || csd_lock_timeout_ns == 0))
++ 		return false;
++ 
++ 	firsttime = !*bug_id;
++ 	if (firsttime)
++ 		*bug_id = atomic_inc_return(&csd_bug_count);
++ 	cpu = csd_lock_wait_getcpu(csd);
++ 	if (WARN_ONCE(cpu < 0 || cpu >= nr_cpu_ids, "%s: cpu = %d\n", __func__, cpu))
++ 		cpux = 0;
++ 	else
++ 		cpux = cpu;
++ 	cpu_cur_csd = smp_load_acquire(&per_cpu(cur_csd, cpux)); /* Before func and info. */
++ 	pr_alert("csd: %s non-responsive CSD lock (#%d) on CPU#%d, waiting %llu ns for CPU#%02d %pS(%ps).\n",
++ 		 firsttime ? "Detected" : "Continued", *bug_id, raw_smp_processor_id(), ts2 - ts0,
++ 		 cpu, csd->func, csd->info);
++ 	if (cpu_cur_csd && csd != cpu_cur_csd) {
++ 		pr_alert("\tcsd: CSD lock (#%d) handling prior %pS(%ps) request.\n",
++ 			 *bug_id, READ_ONCE(per_cpu(cur_csd_func, cpux)),
++ 			 READ_ONCE(per_cpu(cur_csd_info, cpux)));
++ 	} else {
++ 		pr_alert("\tcsd: CSD lock (#%d) %s.\n",
++ 			 *bug_id, !cpu_cur_csd ? "unresponsive" : "handling this request");
++ 	}
++ 	if (cpu >= 0) {
++ 		dump_cpu_task(cpu);
++ 		if (!cpu_cur_csd) {
++ 			pr_alert("csd: Re-sending CSD lock (#%d) IPI from CPU#%02d to CPU#%02d\n", *bug_id, raw_smp_processor_id(), cpu);
++ 			arch_send_call_function_single_ipi(cpu);
++ 		}
++ 	}
++ 	dump_stack();
++ 	*ts1 = ts2;
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 68f4ff04dbad (sched, smp: Trace smp callback causing an IPI)
+  /*
+   * csd_lock/csd_unlock used to serialize access to per-cpu csd resources
+   *
+@@@ -128,12 -313,11 +280,11 @@@ static __always_inline void csd_unlock(
+  	/*
+  	 * ensure we're all done before releasing data:
+  	 */
+ -	smp_store_release(&csd->node.u_flags, 0);
+ +	smp_store_release(&csd->flags, 0);
+  }
+  
+- static DEFINE_PER_CPU_SHARED_ALIGNED(call_single_data_t, csd_data);
+- 
+- void __smp_call_single_queue(int cpu, struct llist_node *node)
++ static __always_inline void
++ raw_smp_call_single_queue(int cpu, struct llist_node *node, smp_call_func_t func)
+  {
+  	/*
+  	 * The list addition should be visible to the target CPU when it pops
+@@@ -506,52 -764,57 +682,83 @@@ static void smp_call_function_many_cond
+  	cpu = cpumask_first_and(mask, cpu_online_mask);
+  	if (cpu == this_cpu)
+  		cpu = cpumask_next_and(cpu, mask, cpu_online_mask);
+ -	if (cpu < nr_cpu_ids)
+ -		run_remote = true;
+  
+ -	if (run_remote) {
+ -		cfd = this_cpu_ptr(&cfd_data);
+ -		cpumask_and(cfd->cpumask, mask, cpu_online_mask);
+ -		__cpumask_clear_cpu(this_cpu, cfd->cpumask);
+ +	/* No online cpus?  We're done. */
+ +	if (cpu >= nr_cpu_ids)
+ +		return;
+  
+ -		cpumask_clear(cfd->cpumask_ipi);
+ -		for_each_cpu(cpu, cfd->cpumask) {
+ -			call_single_data_t *csd = per_cpu_ptr(cfd->csd, cpu);
+ +	/* Do we have another CPU which isn't us? */
+ +	next_cpu = cpumask_next_and(cpu, mask, cpu_online_mask);
+ +	if (next_cpu == this_cpu)
+ +		next_cpu = cpumask_next_and(next_cpu, mask, cpu_online_mask);
+  
+++<<<<<<< HEAD
+ +	/* Fastpath: do that cpu by itself. */
+ +	if (next_cpu >= nr_cpu_ids) {
+ +		if (!cond_func || cond_func(cpu, info))
+ +			smp_call_function_single(cpu, func, info, wait);
+ +		return;
+++=======
++ 			if (cond_func && !cond_func(cpu, info))
++ 				continue;
++ 
++ 			csd_lock(csd);
++ 			if (wait)
++ 				csd->node.u_flags |= CSD_TYPE_SYNC;
++ 			csd->func = func;
++ 			csd->info = info;
++ #ifdef CONFIG_CSD_LOCK_WAIT_DEBUG
++ 			csd->node.src = smp_processor_id();
++ 			csd->node.dst = cpu;
++ #endif
++ 			if (llist_add(&csd->node.llist, &per_cpu(call_single_queue, cpu))) {
++ 				__cpumask_set_cpu(cpu, cfd->cpumask_ipi);
++ 				nr_cpus++;
++ 				last_cpu = cpu;
++ 			}
++ 		}
++ 
++ 		/*
++ 		 * Choose the most efficient way to send an IPI. Note that the
++ 		 * number of CPUs might be zero due to concurrent changes to the
++ 		 * provided mask.
++ 		 */
++ 		if (nr_cpus == 1)
++ 			send_call_function_single_ipi(last_cpu, func);
++ 		else if (likely(nr_cpus > 1))
++ 			send_call_function_ipi_mask(cfd->cpumask_ipi, func);
+++>>>>>>> 68f4ff04dbad (sched, smp: Trace smp callback causing an IPI)
+  	}
+  
+ -	if (run_local && (!cond_func || cond_func(this_cpu, info))) {
+ -		unsigned long flags;
+ +	cfd = this_cpu_ptr(&cfd_data);
+  
+ -		local_irq_save(flags);
+ -		func(info);
+ -		local_irq_restore(flags);
+ +	cpumask_and(cfd->cpumask, mask, cpu_online_mask);
+ +	__cpumask_clear_cpu(this_cpu, cfd->cpumask);
+ +
+ +	/* Some callers race with other cpus changing the passed mask */
+ +	if (unlikely(!cpumask_weight(cfd->cpumask)))
+ +		return;
+ +
+ +	cpumask_clear(cfd->cpumask_ipi);
+ +	for_each_cpu(cpu, cfd->cpumask) {
+ +		call_single_data_t *csd = per_cpu_ptr(cfd->csd, cpu);
+ +
+ +		if (cond_func && !cond_func(cpu, info))
+ +			continue;
+ +
+ +		csd_lock(csd);
+ +		if (wait)
+ +			csd->flags |= CSD_TYPE_SYNC;
+ +		csd->func = func;
+ +		csd->info = info;
+ +		if (llist_add(&csd->llist, &per_cpu(call_single_queue, cpu)))
+ +			__cpumask_set_cpu(cpu, cfd->cpumask_ipi);
+  	}
+  
+ -	if (run_remote && wait) {
+ +	/* Send a message to all CPUs in the map */
+ +	arch_send_call_function_ipi_mask(cfd->cpumask_ipi);
+ +
+ +	if (wait) {
+  		for_each_cpu(cpu, cfd->cpumask) {
+  			call_single_data_t *csd;
+  
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/smp.h
+* Unmerged path kernel/smp.c
