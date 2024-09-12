@@ -1,0 +1,283 @@
+x86/decompressor: Only call the trampoline when changing paging levels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit f97b67a773cd84bd8b55c0a0ec32448a87fc56bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/f97b67a7.failed
+
+Since the current and desired number of paging levels are known when the
+trampoline is being prepared, avoid calling the trampoline at all if it
+is clear that calling it is not going to result in a change to the
+number of paging levels.
+
+Given that the CPU is already running in long mode, the PAE and LA57
+settings are necessarily consistent with the currently active page
+tables, and other fields in CR4 will be initialized by the startup code
+in the kernel proper. So limit the manipulation of CR4 to toggling the
+LA57 bit, which is the only thing that really needs doing at this point
+in the boot. This also means that there is no need to pass the value of
+l5_required to toggle_la57(), as it will not be called unless CR4.LA57
+needs to toggle.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Link: https://lore.kernel.org/r/20230807162720.545787-14-ardb@kernel.org
+(cherry picked from commit f97b67a773cd84bd8b55c0a0ec32448a87fc56bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/head_64.S
+#	arch/x86/boot/compressed/pgtable_64.c
+diff --cc arch/x86/boot/compressed/head_64.S
+index c4f3be19a58f,8730b1d58e2b..000000000000
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@@ -561,90 -511,86 +557,156 @@@ SYM_FUNC_END(efi64_stub_entry
+  /*
+   * Jump to the decompressed kernel.
+   */
+ -	movq	%r15, %rsi
+  	jmp	*%rax
+++<<<<<<< HEAD
+++=======
++ SYM_FUNC_END(.Lrelocated)
++ 
++ /*
++  * This is the 32-bit trampoline that will be copied over to low memory. It
++  * will be called using the ordinary 64-bit calling convention from code
++  * running in 64-bit mode.
++  *
++  * Return address is at the top of the stack (might be above 4G).
++  * The first argument (EDI) contains the 32-bit addressable base of the
++  * trampoline memory.
++  */
++ 	.section ".rodata", "a", @progbits
++ SYM_CODE_START(trampoline_32bit_src)
++ 	/*
++ 	 * Preserve callee save 64-bit registers on the stack: this is
++ 	 * necessary because the architecture does not guarantee that GPRs will
++ 	 * retain their full 64-bit values across a 32-bit mode switch.
++ 	 */
++ 	pushq	%r15
++ 	pushq	%r14
++ 	pushq	%r13
++ 	pushq	%r12
++ 	pushq	%rbp
++ 	pushq	%rbx
++ 
++ 	/* Preserve top half of RSP in a legacy mode GPR to avoid truncation */
++ 	movq	%rsp, %rbx
++ 	shrq	$32, %rbx
++ 
++ 	/* Switch to compatibility mode (CS.L = 0 CS.D = 1) via far return */
++ 	pushq	$__KERNEL32_CS
++ 	leaq	0f(%rip), %rax
++ 	pushq	%rax
++ 	lretq
++ 
++ 	/*
++ 	 * The 32-bit code below will do a far jump back to long mode and end
++ 	 * up here after reconfiguring the number of paging levels. First, the
++ 	 * stack pointer needs to be restored to its full 64-bit value before
++ 	 * the callee save register contents can be popped from the stack.
++ 	 */
++ .Lret:
++ 	shlq	$32, %rbx
++ 	orq	%rbx, %rsp
++ 
++ 	/* Restore the preserved 64-bit registers */
++ 	popq	%rbx
++ 	popq	%rbp
++ 	popq	%r12
++ 	popq	%r13
++ 	popq	%r14
++ 	popq	%r15
++ 	retq
+++>>>>>>> f97b67a773cd (x86/decompressor: Only call the trampoline when changing paging levels)
+  
+  	.code32
+ -0:
+ +/*
+ + * This is the 32-bit trampoline that will be copied over to low memory.
+ + *
+ + * RDI contains the return address (might be above 4G).
+ + * ECX contains the base address of the trampoline memory.
+ + * Non zero RDX means trampoline needs to enable 5-level paging.
+ + */
+ +SYM_CODE_START(trampoline_32bit_src)
+ +	/* Set up data and stack segments */
+ +	movl	$__KERNEL_DS, %eax
+ +	movl	%eax, %ds
+ +	movl	%eax, %ss
+ +
+ +	/* Set up new stack */
+ +	leal	TRAMPOLINE_32BIT_STACK_END(%ecx), %esp
+ +
+  	/* Disable paging */
+  	movl	%cr0, %eax
+  	btrl	$X86_CR0_PG_BIT, %eax
+  	movl	%eax, %cr0
+  
+++<<<<<<< HEAD
+ +	/* Check what paging mode we want to be in after the trampoline */
+ +	testl	%edx, %edx
+ +	jz	1f
+ +
+ +	/* We want 5-level paging: don't touch CR3 if it already points to 5-level page tables */
+ +	movl	%cr4, %eax
+ +	testl	$X86_CR4_LA57, %eax
+ +	jnz	3f
+ +	jmp	2f
+ +1:
+ +	/* We want 4-level paging: don't touch CR3 if it already points to 4-level page tables */
+ +	movl	%cr4, %eax
+ +	testl	$X86_CR4_LA57, %eax
+ +	jz	3f
+ +2:
+++=======
+++>>>>>>> f97b67a773cd (x86/decompressor: Only call the trampoline when changing paging levels)
+  	/* Point CR3 to the trampoline's new top level page table */
+ -	leal	TRAMPOLINE_32BIT_PGTABLE_OFFSET(%edi), %eax
+ +	leal	TRAMPOLINE_32BIT_PGTABLE_OFFSET(%ecx), %eax
+  	movl	%eax, %cr3
+- 3:
++ 
+  	/* Set EFER.LME=1 as a precaution in case hypervsior pulls the rug */
+ +	pushl	%ecx
+ +	pushl	%edx
+  	movl	$MSR_EFER, %ecx
+  	rdmsr
+  	btsl	$_EFER_LME, %eax
+  	/* Avoid writing EFER if no change was made (for TDX guest) */
+  	jc	1f
+  	wrmsr
+++<<<<<<< HEAD
+ +1:	popl	%edx
+ +	popl	%ecx
+ +
+ +#ifdef CONFIG_X86_MCE
+ +	/*
+ +	 * Preserve CR4.MCE if the kernel will enable #MC support.
+ +	 * Clearing MCE may fault in some environments (that also force #MC
+ +	 * support). Any machine check that occurs before #MC support is fully
+ +	 * configured will crash the system regardless of the CR4.MCE value set
+ +	 * here.
+ +	 */
+ +	movl	%cr4, %eax
+ +	andl	$X86_CR4_MCE, %eax
+ +#else
+ +	movl	$0, %eax
+ +#endif
+ +
+ +	/* Enable PAE and LA57 (if required) paging modes */
+ +	orl	$X86_CR4_PAE, %eax
+ +	testl	%edx, %edx
+ +	jz	1f
+ +	orl	$X86_CR4_LA57, %eax
+ +1:
+++=======
++ 1:
++ 	/* Toggle CR4.LA57 */
++ 	movl	%cr4, %eax
++ 	btcl	$X86_CR4_LA57_BIT, %eax
+++>>>>>>> f97b67a773cd (x86/decompressor: Only call the trampoline when changing paging levels)
+  	movl	%eax, %cr4
+  
+ +	/* Calculate address of paging_enabled() once we are executing in the trampoline */
+ +	leal	.Lpaging_enabled - trampoline_32bit_src + TRAMPOLINE_32BIT_CODE_OFFSET(%ecx), %eax
+ +
+ +	/* Prepare the stack for far return to Long Mode */
+ +	pushl	$__KERNEL_CS
+ +	pushl	%eax
+ +
+  	/* Enable paging again. */
+  	movl	%cr0, %eax
+  	btsl	$X86_CR0_PG_BIT, %eax
+diff --cc arch/x86/boot/compressed/pgtable_64.c
+index af8b429eafb0,4213473ae548..000000000000
+--- a/arch/x86/boot/compressed/pgtable_64.c
++++ b/arch/x86/boot/compressed/pgtable_64.c
+@@@ -105,12 -101,13 +105,17 @@@ static unsigned long find_trampoline_pl
+  	return bios_start - TRAMPOLINE_32BIT_SIZE;
+  }
+  
+ -asmlinkage void configure_5level_paging(struct boot_params *bp)
+ +struct paging_config paging_prepare(void *rmode)
+  {
+++<<<<<<< HEAD
+ +	struct paging_config paging_config = {};
+++=======
++ 	void (*toggle_la57)(void *trampoline);
++ 	bool l5_required = false;
+++>>>>>>> f97b67a773cd (x86/decompressor: Only call the trampoline when changing paging levels)
+  
+  	/* Initialize boot_params. Required for cmdline_find_option_bool(). */
+ -	boot_params = bp;
+ +	boot_params = rmode;
+  
+  	/*
+  	 * Check if LA57 is desired and supported.
+@@@ -136,9 -133,14 +141,20 @@@
+  		ptrs_per_p4d = 512;
+  	}
+  
+++<<<<<<< HEAD
+ +	paging_config.trampoline_start = find_trampoline_placement();
+ +
+ +	trampoline_32bit = (unsigned long *)paging_config.trampoline_start;
+++=======
++ 	/*
++ 	 * The trampoline will not be used if the paging mode is already set to
++ 	 * the desired one.
++ 	 */
++ 	if (l5_required == !!(native_read_cr4() & X86_CR4_LA57))
++ 		return;
++ 
++ 	trampoline_32bit = (unsigned long *)find_trampoline_placement();
+++>>>>>>> f97b67a773cd (x86/decompressor: Only call the trampoline when changing paging levels)
+  
+  	/* Preserve trampoline memory */
+  	memcpy(trampoline_save, trampoline_32bit, TRAMPOLINE_32BIT_SIZE);
+@@@ -155,19 -167,9 +171,20 @@@
+  	 *
+  	 * The new page table will be used by trampoline code for switching
+  	 * from 4- to 5-level paging or vice versa.
+- 	 *
+- 	 * If switching is not required, the page table is unused: trampoline
+- 	 * code wouldn't touch CR3.
+  	 */
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * We are not going to use the page table in trampoline memory if we
+ +	 * are already in the desired paging mode.
+ +	 */
+ +	if (paging_config.l5_required == !!(native_read_cr4() & X86_CR4_LA57))
+ +		goto out;
+ +
+ +	if (paging_config.l5_required) {
+++=======
++ 	if (l5_required) {
+++>>>>>>> f97b67a773cd (x86/decompressor: Only call the trampoline when changing paging levels)
+  		/*
+  		 * For 4- to 5-level paging transition, set up current CR3 as
+  		 * the first and the only entry in a new top-level page table.
+@@@ -189,8 -191,7 +206,12 @@@
+  		       (void *)src, PAGE_SIZE);
+  	}
+  
+++<<<<<<< HEAD
+ +out:
+ +	return paging_config;
+++=======
++ 	toggle_la57(trampoline_32bit);
+++>>>>>>> f97b67a773cd (x86/decompressor: Only call the trampoline when changing paging levels)
+  }
+  
+  void cleanup_trampoline(void *pgtable)
+* Unmerged path arch/x86/boot/compressed/head_64.S
+* Unmerged path arch/x86/boot/compressed/pgtable_64.c
