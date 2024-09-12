@@ -19063,7 +19063,7 @@ static void nl80211_ch_switch_notify(struct cfg80211_registered_device *rdev,
 				     struct cfg80211_chan_def *chandef,
 				     gfp_t gfp,
 				     enum nl80211_commands notif,
-				     u8 count, bool quiet)
+				     u8 count, bool quiet, u16 punct_bitmap)
 {
 	struct wireless_dev *wdev = netdev->ieee80211_ptr;
 	struct sk_buff *msg;
@@ -19097,6 +19097,9 @@ static void nl80211_ch_switch_notify(struct cfg80211_registered_device *rdev,
 			goto nla_put_failure;
 	}
 
+	if (nla_put_u32(msg, NL80211_ATTR_PUNCT_BITMAP, punct_bitmap))
+		goto nla_put_failure;
+
 	genlmsg_end(msg, hdr);
 
 	genlmsg_multicast_netns(&nl80211_fam, wiphy_net(&rdev->wiphy), msg, 0,
@@ -19109,7 +19112,7 @@ static void nl80211_ch_switch_notify(struct cfg80211_registered_device *rdev,
 
 void cfg80211_ch_switch_notify(struct net_device *dev,
 			       struct cfg80211_chan_def *chandef,
-			       unsigned int link_id)
+			       unsigned int link_id, u16 punct_bitmap)
 {
 	struct wireless_dev *wdev = dev->ieee80211_ptr;
 	struct wiphy *wiphy = wdev->wiphy;
@@ -19118,7 +19121,7 @@ void cfg80211_ch_switch_notify(struct net_device *dev,
 	ASSERT_WDEV_LOCK(wdev);
 	WARN_INVALID_LINK_ID(wdev, link_id);
 
-	trace_cfg80211_ch_switch_notify(dev, chandef, link_id);
+	trace_cfg80211_ch_switch_notify(dev, chandef, link_id, punct_bitmap);
 
 	switch (wdev->iftype) {
 	case NL80211_IFTYPE_STATION:
@@ -19146,14 +19149,15 @@ void cfg80211_ch_switch_notify(struct net_device *dev,
 	cfg80211_sched_dfs_chan_update(rdev);
 
 	nl80211_ch_switch_notify(rdev, dev, link_id, chandef, GFP_KERNEL,
-				 NL80211_CMD_CH_SWITCH_NOTIFY, 0, false);
+				 NL80211_CMD_CH_SWITCH_NOTIFY, 0, false,
+				 punct_bitmap);
 }
 EXPORT_SYMBOL(cfg80211_ch_switch_notify);
 
 void cfg80211_ch_switch_started_notify(struct net_device *dev,
 				       struct cfg80211_chan_def *chandef,
 				       unsigned int link_id, u8 count,
-				       bool quiet)
+				       bool quiet, u16 punct_bitmap)
 {
 	struct wireless_dev *wdev = dev->ieee80211_ptr;
 	struct wiphy *wiphy = wdev->wiphy;
@@ -19162,11 +19166,13 @@ void cfg80211_ch_switch_started_notify(struct net_device *dev,
 	ASSERT_WDEV_LOCK(wdev);
 	WARN_INVALID_LINK_ID(wdev, link_id);
 
-	trace_cfg80211_ch_switch_started_notify(dev, chandef, link_id);
+	trace_cfg80211_ch_switch_started_notify(dev, chandef, link_id,
+						punct_bitmap);
+
 
 	nl80211_ch_switch_notify(rdev, dev, link_id, chandef, GFP_KERNEL,
 				 NL80211_CMD_CH_SWITCH_STARTED_NOTIFY,
-				 count, quiet);
+				 count, quiet, punct_bitmap);
 }
 EXPORT_SYMBOL(cfg80211_ch_switch_started_notify);
 
@@ -19872,6 +19878,17 @@ void cfg80211_update_owe_info_event(struct net_device *netdev,
 	if (!owe_info->ie_len ||
 	    nla_put(msg, NL80211_ATTR_IE, owe_info->ie_len, owe_info->ie))
 		goto nla_put_failure;
+
+	if (owe_info->assoc_link_id != -1) {
+		if (nla_put_u8(msg, NL80211_ATTR_MLO_LINK_ID,
+			       owe_info->assoc_link_id))
+			goto nla_put_failure;
+
+		if (!is_zero_ether_addr(owe_info->peer_mld_addr) &&
+		    nla_put(msg, NL80211_ATTR_MLD_ADDR, ETH_ALEN,
+			    owe_info->peer_mld_addr))
+			goto nla_put_failure;
+	}
 
 	genlmsg_end(msg, hdr);
 

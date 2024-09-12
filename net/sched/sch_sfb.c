@@ -461,8 +461,6 @@ static void sfb_reset(struct Qdisc *sch)
 
 	if (likely(q->qdisc))
 		qdisc_reset(q->qdisc);
-	sch->qstats.backlog = 0;
-	sch->q.qlen = 0;
 	q->slot = 0;
 	q->double_buffering = false;
 	sfb_zero_all_buckets(q);

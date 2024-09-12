@@ -3244,39 +3244,47 @@ TRACE_EVENT(cfg80211_chandef_dfs_required,
 TRACE_EVENT(cfg80211_ch_switch_notify,
 	TP_PROTO(struct net_device *netdev,
 		 struct cfg80211_chan_def *chandef,
-		 unsigned int link_id),
-	TP_ARGS(netdev, chandef, link_id),
+		 unsigned int link_id,
+		 u16 punct_bitmap),
+	TP_ARGS(netdev, chandef, link_id, punct_bitmap),
 	TP_STRUCT__entry(
 		NETDEV_ENTRY
 		CHAN_DEF_ENTRY
 		__field(unsigned int, link_id)
+		__field(u16, punct_bitmap)
 	),
 	TP_fast_assign(
 		NETDEV_ASSIGN;
 		CHAN_DEF_ASSIGN(chandef);
 		__entry->link_id = link_id;
+		__entry->punct_bitmap = punct_bitmap;
 	),
-	TP_printk(NETDEV_PR_FMT ", " CHAN_DEF_PR_FMT ", link:%d",
-		  NETDEV_PR_ARG, CHAN_DEF_PR_ARG, __entry->link_id)
+	TP_printk(NETDEV_PR_FMT ", " CHAN_DEF_PR_FMT ", link:%d, punct_bitmap:%u",
+		  NETDEV_PR_ARG, CHAN_DEF_PR_ARG, __entry->link_id,
+		  __entry->punct_bitmap)
 );
 
 TRACE_EVENT(cfg80211_ch_switch_started_notify,
 	TP_PROTO(struct net_device *netdev,
 		 struct cfg80211_chan_def *chandef,
-		 unsigned int link_id),
-	TP_ARGS(netdev, chandef, link_id),
+		 unsigned int link_id,
+		 u16 punct_bitmap),
+	TP_ARGS(netdev, chandef, link_id, punct_bitmap),
 	TP_STRUCT__entry(
 		NETDEV_ENTRY
 		CHAN_DEF_ENTRY
 		__field(unsigned int, link_id)
+		__field(u16, punct_bitmap)
 	),
 	TP_fast_assign(
 		NETDEV_ASSIGN;
 		CHAN_DEF_ASSIGN(chandef);
 		__entry->link_id = link_id;
+		__entry->punct_bitmap = punct_bitmap;
 	),
-	TP_printk(NETDEV_PR_FMT ", " CHAN_DEF_PR_FMT ", link:%d",
-		  NETDEV_PR_ARG, CHAN_DEF_PR_ARG, __entry->link_id)
+	TP_printk(NETDEV_PR_FMT ", " CHAN_DEF_PR_FMT ", link:%d, punct_bitmap:%u",
+		  NETDEV_PR_ARG, CHAN_DEF_PR_ARG, __entry->link_id,
+		  __entry->punct_bitmap)
 );
 
 TRACE_EVENT(cfg80211_radar_event,
@@ -3748,20 +3756,30 @@ TRACE_EVENT(cfg80211_pmsr_complete,
 );
 
 TRACE_EVENT(cfg80211_update_owe_info_event,
-	    TP_PROTO(struct wiphy *wiphy, struct net_device *netdev,
-		     struct cfg80211_update_owe_info *owe_info),
-	    TP_ARGS(wiphy, netdev, owe_info),
-	    TP_STRUCT__entry(WIPHY_ENTRY
-			     NETDEV_ENTRY
-			     MAC_ENTRY(peer)
-			     __dynamic_array(u8, ie, owe_info->ie_len)),
-	    TP_fast_assign(WIPHY_ASSIGN;
-			   NETDEV_ASSIGN;
-			   MAC_ASSIGN(peer, owe_info->peer);
-			   memcpy(__get_dynamic_array(ie), owe_info->ie,
-				  owe_info->ie_len);),
-	    TP_printk(WIPHY_PR_FMT ", " NETDEV_PR_FMT ", peer: %pM",
-		      WIPHY_PR_ARG, NETDEV_PR_ARG, __entry->peer)
+	TP_PROTO(struct wiphy *wiphy, struct net_device *netdev,
+		 struct cfg80211_update_owe_info *owe_info),
+	TP_ARGS(wiphy, netdev, owe_info),
+	TP_STRUCT__entry(
+		WIPHY_ENTRY
+		NETDEV_ENTRY
+		MAC_ENTRY(peer)
+		__dynamic_array(u8, ie, owe_info->ie_len)
+		__field(int, assoc_link_id)
+		MAC_ENTRY(peer_mld_addr)
+	),
+	TP_fast_assign(
+		WIPHY_ASSIGN;
+		NETDEV_ASSIGN;
+		MAC_ASSIGN(peer, owe_info->peer);
+		memcpy(__get_dynamic_array(ie), owe_info->ie,
+		       owe_info->ie_len);
+		__entry->assoc_link_id = owe_info->assoc_link_id;
+		MAC_ASSIGN(peer_mld_addr, owe_info->peer_mld_addr);
+	),
+	TP_printk(WIPHY_PR_FMT ", " NETDEV_PR_FMT ", peer: %pM,"
+	          " assoc_link_id: %d, peer_mld_addr: %pM",
+		  WIPHY_PR_ARG, NETDEV_PR_ARG, __entry->peer,
+		  __entry->assoc_link_id, __entry->peer_mld_addr)
 );
 
 TRACE_EVENT(cfg80211_bss_color_notify,

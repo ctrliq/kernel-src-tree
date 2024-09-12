@@ -28,6 +28,7 @@ Contents:
    mptcp-sysctl
    statistics
    switchdev
+   tc-queue-filters
    tipc
    vxlan
 

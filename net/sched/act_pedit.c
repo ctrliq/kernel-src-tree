@@ -24,6 +24,7 @@
 #include <net/tc_act/tc_pedit.h>
 #include <uapi/linux/tc_act/tc_pedit.h>
 #include <net/pkt_cls.h>
+#include <net/tc_wrapper.h>
 
 static struct tc_action_ops act_pedit_ops;
 
@@ -349,8 +350,9 @@ static int pedit_skb_hdr_offset(struct sk_buff *skb,
 	return ret;
 }
 
-static int tcf_pedit_act(struct sk_buff *skb, const struct tc_action *a,
-			 struct tcf_result *res)
+TC_INDIRECT_SCOPE int tcf_pedit_act(struct sk_buff *skb,
+				    const struct tc_action *a,
+				    struct tcf_result *res)
 {
 	enum pedit_header_type htype = TCA_PEDIT_KEY_EX_HDR_TYPE_NETWORK;
 	enum pedit_cmd cmd = TCA_PEDIT_KEY_EX_CMD_SET;

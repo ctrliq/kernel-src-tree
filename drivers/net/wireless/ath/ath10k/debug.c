@@ -10,7 +10,6 @@
 #include <linux/vmalloc.h>
 #include <linux/crc32.h>
 #include <linux/firmware.h>
-#include <linux/kstrtox.h>
 
 #include "core.h"
 #include "debug.h"

@@ -6267,7 +6267,7 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 			continue;
 		}
 
-		s = find_next_bit_wrap(ctx.sectors_to_do, stripe_cnt, s);
+		s = find_first_bit(ctx.sectors_to_do, stripe_cnt);
 		if (s == stripe_cnt)
 			break;
 

@@ -645,6 +645,7 @@ struct ieee80211_fils_discovery {
  * @csa_active: marks whether a channel switch is going on. Internally it is
  *	write-protected by sdata_lock and local->mtx so holding either is fine
  *	for read access.
+ * @csa_punct_bitmap: new puncturing bitmap for channel switch
  * @mu_mimo_owner: indicates interface owns MU-MIMO capability
  * @chanctx_conf: The channel context this interface is assigned to, or %NULL
  *	when it is not assigned. This pointer is RCU-protected due to the TX
@@ -741,6 +742,8 @@ struct ieee80211_bss_conf {
 	u16 eht_puncturing;
 
 	bool csa_active;
+	u16 csa_punct_bitmap;
+
 	bool mu_mimo_owner;
 	struct ieee80211_chanctx_conf __rcu *chanctx_conf;
 
@@ -1850,6 +1853,10 @@ struct ieee80211_vif_cfg {
  * @addr: address of this interface
  * @p2p: indicates whether this AP or STA interface is a p2p
  *	interface, i.e. a GO or p2p-sta respectively
+ * @netdev_features: tx netdev features supported by the hardware for this
+ *	vif. mac80211 initializes this to hw->netdev_features, and the driver
+ *	can mask out specific tx features. mac80211 will handle software fixup
+ *	for masked offloads (GSO, CSUM)
  * @driver_flags: flags/capabilities the driver has for this interface,
  *	these need to be set (or cleared) when the interface is added
  *	or, if supported by the driver, the interface type is changed
@@ -1871,8 +1878,6 @@ struct ieee80211_vif_cfg {
  * @drv_priv: data area for driver use, will always be aligned to
  *	sizeof(void \*).
  * @txq: the multicast data TX queue
- * @txqs_stopped: per AC flag to indicate that intermediate TXQs are stopped,
- *	protected by fq->lock.
  * @offload_flags: 802.3 -> 802.11 enapsulation offload flags, see
  *	&enum ieee80211_offload_flags.
  * @mbssid_tx_vif: Pointer to the transmitting interface if MBSSID is enabled.
@@ -1891,6 +1896,7 @@ struct ieee80211_vif {
 
 	struct ieee80211_txq *txq;
 
+	netdev_features_t netdev_features;
 	u32 driver_flags;
 	u32 offload_flags;
 
@@ -1900,8 +1906,6 @@ struct ieee80211_vif {
 
 	bool probe_req_reg;
 	bool rx_mcast_action_reg;
-
-	bool txqs_stopped[IEEE80211_NUM_ACS];
 
 	struct ieee80211_vif *mbssid_tx_vif;
 

@@ -20,6 +20,8 @@
 #include <net/sch_generic.h>
 #include <net/pkt_cls.h>
 
+#include "sch_mqprio_lib.h"
+
 struct mqprio_sched {
 	struct Qdisc		**qdiscs;
 	u16 mode;
@@ -30,16 +32,9 @@ struct mqprio_sched {
 	u64 max_rate[TC_QOPT_MAX_QUEUE];
 };
 
-/* Returns true if the intervals [a, b) and [c, d) overlap. */
-static bool intervals_overlap(int a, int b, int c, int d)
-{
-	int left = max(a, c), right = min(b, d);
-
-	return left < right;
-}
-
 static int mqprio_enable_offload(struct Qdisc *sch,
-				 const struct tc_mqprio_qopt *qopt)
+				 const struct tc_mqprio_qopt *qopt,
+				 struct netlink_ext_ack *extack)
 {
 	struct tc_mqprio_qopt_offload mqprio = {.qopt = *qopt};
 	struct mqprio_sched *priv = qdisc_priv(sch);
@@ -113,19 +108,11 @@ static void mqprio_destroy(struct Qdisc *sch)
 		netdev_set_num_tc(dev, 0);
 }
 
-static int mqprio_parse_opt(struct net_device *dev, struct tc_mqprio_qopt *qopt)
+static int mqprio_parse_opt(struct net_device *dev, struct tc_mqprio_qopt *qopt,
+			    const struct tc_mqprio_caps *caps,
+			    struct netlink_ext_ack *extack)
 {
-	int i, j;
-
-	/* Verify num_tc is not out of max range */
-	if (qopt->num_tc > TC_MAX_QUEUE)
-		return -EINVAL;
-
-	/* Verify priority mapping uses valid tcs */
-	for (i = 0; i < TC_BITMASK + 1; i++) {
-		if (qopt->prio_tc_map[i] >= qopt->num_tc)
-			return -EINVAL;
-	}
+	int err;
 
 	/* Limit qopt->hw to maximum supported offload value.  Drivers have
 	 * the option of overriding this later if they don't support the a
@@ -134,34 +121,23 @@ static int mqprio_parse_opt(struct net_device *dev, struct tc_mqprio_qopt *qopt)
 	if (qopt->hw > TC_MQPRIO_HW_OFFLOAD_MAX)
 		qopt->hw = TC_MQPRIO_HW_OFFLOAD_MAX;
 
-	/* If hardware offload is requested we will leave it to the device
-	 * to either populate the queue counts itself or to validate the
-	 * provided queue counts.  If ndo_setup_tc is not present then
-	 * hardware doesn't support offload and we should return an error.
+	/* If hardware offload is requested, we will leave 3 options to the
+	 * device driver:
+	 * - populate the queue counts itself (and ignore what was requested)
+	 * - validate the provided queue counts by itself (and apply them)
+	 * - request queue count validation here (and apply them)
 	 */
-	if (qopt->hw)
-		return dev->netdev_ops->ndo_setup_tc ? 0 : -EINVAL;
+	err = mqprio_validate_qopt(dev, qopt,
+				   !qopt->hw || caps->validate_queue_counts,
+				   false, extack);
+	if (err)
+		return err;
 
-	for (i = 0; i < qopt->num_tc; i++) {
-		unsigned int last = qopt->offset[i] + qopt->count[i];
-
-		/* Verify the queue count is in tx range being equal to the
-		 * real_num_tx_queues indicates the last queue is in use.
-		 */
-		if (qopt->offset[i] >= dev->real_num_tx_queues ||
-		    !qopt->count[i] ||
-		    last > dev->real_num_tx_queues)
-			return -EINVAL;
-
-		/* Verify that the offset and counts do not overlap */
-		for (j = i + 1; j < qopt->num_tc; j++) {
-			if (intervals_overlap(qopt->offset[i], last,
-					      qopt->offset[j],
-					      qopt->offset[j] +
-					      qopt->count[j]))
-				return -EINVAL;
-		}
-	}
+	/* If ndo_setup_tc is not present then hardware doesn't support offload
+	 * and we should return an error.
+	 */
+	if (qopt->hw && !dev->netdev_ops->ndo_setup_tc)
+		return -EINVAL;
 
 	return 0;
 }
@@ -251,6 +227,7 @@ static int mqprio_init(struct Qdisc *sch, struct nlattr *opt,
 	struct Qdisc *qdisc;
 	int i, err = -EOPNOTSUPP;
 	struct tc_mqprio_qopt *qopt = NULL;
+	struct tc_mqprio_caps caps;
 	int len;
 
 	BUILD_BUG_ON(TC_MAX_QUEUE != TC_QOPT_MAX_QUEUE);
@@ -269,8 +246,11 @@ static int mqprio_init(struct Qdisc *sch, struct nlattr *opt,
 	if (!opt || nla_len(opt) < sizeof(*qopt))
 		return -EINVAL;
 
+	qdisc_offload_query_caps(dev, TC_SETUP_QDISC_MQPRIO,
+				 &caps, sizeof(caps));
+
 	qopt = nla_data(opt);
-	if (mqprio_parse_opt(dev, qopt))
+	if (mqprio_parse_opt(dev, qopt, &caps, extack))
 		return -EINVAL;
 
 	len = nla_len(opt) - NLA_ALIGN(sizeof(*qopt));
@@ -304,7 +284,7 @@ static int mqprio_init(struct Qdisc *sch, struct nlattr *opt,
 	 * supplied and verified mapping
 	 */
 	if (qopt->hw) {
-		err = mqprio_enable_offload(sch, qopt);
+		err = mqprio_enable_offload(sch, qopt, extack);
 		if (err)
 			return err;
 	} else {
@@ -423,7 +403,7 @@ static int mqprio_dump(struct Qdisc *sch, struct sk_buff *skb)
 	struct nlattr *nla = (struct nlattr *)skb_tail_pointer(skb);
 	struct tc_mqprio_qopt opt = { 0 };
 	struct Qdisc *qdisc;
-	unsigned int ntx, tc;
+	unsigned int ntx;
 
 	sch->q.qlen = 0;
 	gnet_stats_basic_sync_init(&sch->bstats);
@@ -447,14 +427,8 @@ static int mqprio_dump(struct Qdisc *sch, struct sk_buff *skb)
 		spin_unlock_bh(qdisc_lock(qdisc));
 	}
 
-	opt.num_tc = netdev_get_num_tc(dev);
-	memcpy(opt.prio_tc_map, dev->prio_tc_map, sizeof(opt.prio_tc_map));
+	mqprio_qopt_reconstruct(dev, &opt);
 	opt.hw = priv->hw_offload;
-
-	for (tc = 0; tc < netdev_get_num_tc(dev); tc++) {
-		opt.count[tc] = dev->tc_to_txq[tc].count;
-		opt.offset[tc] = dev->tc_to_txq[tc].offset;
-	}
 
 	if (nla_put(skb, TCA_OPTIONS, sizeof(opt), &opt))
 		goto nla_put_failure;

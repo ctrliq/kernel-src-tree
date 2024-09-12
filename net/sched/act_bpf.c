@@ -22,6 +22,7 @@
 
 #include <linux/tc_act/tc_bpf.h>
 #include <net/tc_act/tc_bpf.h>
+#include <net/tc_wrapper.h>
 
 #include <linux/rh_flags.h>
 
@@ -37,8 +38,9 @@ struct tcf_bpf_cfg {
 
 static struct tc_action_ops act_bpf_ops;
 
-static int tcf_bpf_act(struct sk_buff *skb, const struct tc_action *act,
-		       struct tcf_result *res)
+TC_INDIRECT_SCOPE int tcf_bpf_act(struct sk_buff *skb,
+				  const struct tc_action *act,
+				  struct tcf_result *res)
 {
 	bool at_ingress = skb_at_tc_ingress(skb);
 	struct tcf_bpf *prog = to_bpf(act);

@@ -317,8 +317,8 @@ static void igt_mm_config(u64 *size, u64 *chunk_size)
 	s &= -ms;
 
 	/* Convert from pages to bytes */
-	*chunk_size = (u64)ms << 12;
-	*size = (u64)s << 12;
+	*chunk_size = (u64)ms << PAGE_SHIFT;
+	*size = (u64)s << PAGE_SHIFT;
 }
 
 static void igt_buddy_alloc_pathological(struct kunit *test)

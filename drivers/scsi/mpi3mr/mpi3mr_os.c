@@ -4696,8 +4696,9 @@ static int mpi3mr_qcmd(struct Scsi_Host *shost,
 	if (scmd->device->host->shost_state == SHOST_RECOVERY &&
 		scmd->cmnd[0] == TEST_UNIT_READY &&
 		(stgt_priv_data->dev_removed || (dev_handle == MPI3MR_INVALID_DEV_HANDLE))) {
-		scsi_build_sense(scmd, 0, UNIT_ATTENTION, 0x29, 0x07);
-		scsi_done(scmd);
+		scsi_build_sense_buffer(0, scmd->sense_buffer, UNIT_ATTENTION, 0x29, 0x07);
+		scmd->result = SAM_STAT_CHECK_CONDITION;
+		scmd->scsi_done(scmd);
 		goto out;
 	}
 

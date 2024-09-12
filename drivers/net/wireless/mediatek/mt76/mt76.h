@@ -1276,6 +1276,7 @@ mt76_tx_status_get_hw(struct mt76_dev *dev, struct sk_buff *skb)
 void mt76_put_txwi(struct mt76_dev *dev, struct mt76_txwi_cache *t);
 void mt76_put_rxwi(struct mt76_dev *dev, struct mt76_txwi_cache *t);
 struct mt76_txwi_cache *mt76_get_rxwi(struct mt76_dev *dev);
+void mt76_free_pending_rxwi(struct mt76_dev *dev);
 void mt76_rx_complete(struct mt76_dev *dev, struct sk_buff_head *frames,
 		      struct napi_struct *napi);
 void mt76_rx_poll_complete(struct mt76_dev *dev, enum mt76_rxq_id q,
@@ -1415,6 +1416,12 @@ s8 mt76_get_rate_power_limits(struct mt76_phy *phy,
 			      struct ieee80211_channel *chan,
 			      struct mt76_power_limits *dest,
 			      s8 target_power);
+
+static inline bool mt76_queue_is_wed_rx(struct mt76_queue *q)
+{
+	return (q->flags & MT_QFLAG_WED) &&
+	       FIELD_GET(MT_QFLAG_WED_TYPE, q->flags) == MT76_WED_Q_RX;
+}
 
 struct mt76_txwi_cache *
 mt76_token_release(struct mt76_dev *dev, int token, bool *wake);

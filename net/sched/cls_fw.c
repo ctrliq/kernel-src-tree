@@ -25,6 +25,7 @@
 #include <net/act_api.h>
 #include <net/pkt_cls.h>
 #include <net/sch_generic.h>
+#include <net/tc_wrapper.h>
 
 #define HTSIZE 256
 
@@ -51,8 +52,9 @@ static u32 fw_hash(u32 handle)
 	return handle % HTSIZE;
 }
 
-static int fw_classify(struct sk_buff *skb, const struct tcf_proto *tp,
-		       struct tcf_result *res)
+TC_INDIRECT_SCOPE int fw_classify(struct sk_buff *skb,
+				  const struct tcf_proto *tp,
+				  struct tcf_result *res)
 {
 	struct fw_head *head = rcu_dereference_bh(tp->root);
 	struct fw_filter *f;
