@@ -1,0 +1,169 @@
+x86/efistub: Clear BSS in EFI handover protocol entrypoint
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit d7156b986d4cc0657fa6dc05c9fcf51c3d55a0fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/d7156b98.failed
+
+The so-called EFI handover protocol is value-add from the distros that
+permits a loader to simply copy a PE kernel image into memory and call
+an alternative entrypoint that is described by an embedded boot_params
+structure.
+
+Most implementations of this protocol do not bother to check the PE
+header for minimum alignment, section placement, etc, and therefore also
+don't clear the image's BSS, or even allocate enough memory for it.
+
+Allocating more memory on the fly is rather difficult, but at least
+clear the BSS region explicitly when entering in this manner, so that
+the EFI stub code does not get confused by global variables that were
+not zero-initialized correctly.
+
+When booting in mixed mode, this BSS clearing must occur before any
+global state is created, so clear it in the 32-bit asm entry point.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Link: https://lore.kernel.org/r/20230807162720.545787-7-ardb@kernel.org
+(cherry picked from commit d7156b986d4cc0657fa6dc05c9fcf51c3d55a0fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/eboot.c
+#	arch/x86/boot/compressed/efi_mixed.S
+diff --cc arch/x86/boot/compressed/eboot.c
+index c2a7652f4460,9247dbc7dbbd..000000000000
+--- a/arch/x86/boot/compressed/eboot.c
++++ b/arch/x86/boot/compressed/eboot.c
+@@@ -950,96 -959,33 +950,120 @@@ efi_main(struct efi_config *c, struct b
+  		goto fail;
+  	}
+  
+ -	if (IS_ENABLED(CONFIG_X86_64))
+ -		bzimage_addr += startup_64 - startup_32;
+ +	memset((char *)gdt->address, 0x0, gdt->size);
+ +	desc = (struct desc_struct *)gdt->address;
+ +
+ +	/* The first GDT is a dummy. */
+ +	desc++;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		/* __KERNEL32_CS */
+ +		desc->limit0	= 0xffff;
+ +		desc->base0	= 0x0000;
+ +		desc->base1	= 0x0000;
+ +		desc->type	= SEG_TYPE_CODE | SEG_TYPE_EXEC_READ;
+ +		desc->s		= DESC_TYPE_CODE_DATA;
+ +		desc->dpl	= 0;
+ +		desc->p		= 1;
+ +		desc->limit1	= 0xf;
+ +		desc->avl	= 0;
+ +		desc->l		= 0;
+ +		desc->d		= SEG_OP_SIZE_32BIT;
+ +		desc->g		= SEG_GRANULARITY_4KB;
+ +		desc->base2	= 0x00;
+ +
+ +		desc++;
+ +	} else {
+ +		/* Second entry is unused on 32-bit */
+ +		desc++;
+ +	}
+ +
+ +	/* __KERNEL_CS */
+ +	desc->limit0	= 0xffff;
+ +	desc->base0	= 0x0000;
+ +	desc->base1	= 0x0000;
+ +	desc->type	= SEG_TYPE_CODE | SEG_TYPE_EXEC_READ;
+ +	desc->s		= DESC_TYPE_CODE_DATA;
+ +	desc->dpl	= 0;
+ +	desc->p		= 1;
+ +	desc->limit1	= 0xf;
+ +	desc->avl	= 0;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		desc->l = 1;
+ +		desc->d = 0;
+ +	} else {
+ +		desc->l = 0;
+ +		desc->d = SEG_OP_SIZE_32BIT;
+ +	}
+ +	desc->g		= SEG_GRANULARITY_4KB;
+ +	desc->base2	= 0x00;
+ +	desc++;
+ +
+ +	/* __KERNEL_DS */
+ +	desc->limit0	= 0xffff;
+ +	desc->base0	= 0x0000;
+ +	desc->base1	= 0x0000;
+ +	desc->type	= SEG_TYPE_DATA | SEG_TYPE_READ_WRITE;
+ +	desc->s		= DESC_TYPE_CODE_DATA;
+ +	desc->dpl	= 0;
+ +	desc->p		= 1;
+ +	desc->limit1	= 0xf;
+ +	desc->avl	= 0;
+ +	desc->l		= 0;
+ +	desc->d		= SEG_OP_SIZE_32BIT;
+ +	desc->g		= SEG_GRANULARITY_4KB;
+ +	desc->base2	= 0x00;
+ +	desc++;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		/* Task segment value */
+ +		desc->limit0	= 0x0000;
+ +		desc->base0	= 0x0000;
+ +		desc->base1	= 0x0000;
+ +		desc->type	= SEG_TYPE_TSS;
+ +		desc->s		= 0;
+ +		desc->dpl	= 0;
+ +		desc->p		= 1;
+ +		desc->limit1	= 0x0;
+ +		desc->avl	= 0;
+ +		desc->l		= 0;
+ +		desc->d		= 0;
+ +		desc->g		= SEG_GRANULARITY_4KB;
+ +		desc->base2	= 0x00;
+ +		desc++;
+ +	}
+ +
+ +	asm volatile("cli");
+ +	asm volatile ("lgdt %0" : : "m" (*gdt));
+  
+ -	enter_kernel(bzimage_addr, boot_params);
+ +	return boot_params;
+  fail:
+ -	efi_err("efi_stub_entry() failed!\n");
+ +	efi_printk(sys_table, "efi_main() failed!\n");
+  
+ -	efi_exit(handle, status);
+ +	return NULL;
+  }
+++<<<<<<< HEAD:arch/x86/boot/compressed/eboot.c
+++=======
++ 
++ #ifdef CONFIG_EFI_HANDOVER_PROTOCOL
++ void efi_handover_entry(efi_handle_t handle, efi_system_table_t *sys_table_arg,
++ 			struct boot_params *boot_params)
++ {
++ 	extern char _bss[], _ebss[];
++ 
++ 	memset(_bss, 0, _ebss - _bss);
++ 	efi_stub_entry(handle, sys_table_arg, boot_params);
++ }
++ 
++ #ifndef CONFIG_EFI_MIXED
++ extern __alias(efi_handover_entry)
++ void efi32_stub_entry(efi_handle_t handle, efi_system_table_t *sys_table_arg,
++ 		      struct boot_params *boot_params);
++ 
++ extern __alias(efi_handover_entry)
++ void efi64_stub_entry(efi_handle_t handle, efi_system_table_t *sys_table_arg,
++ 		      struct boot_params *boot_params);
++ #endif
++ #endif
+++>>>>>>> d7156b986d4c (x86/efistub: Clear BSS in EFI handover protocol entrypoint):drivers/firmware/efi/libstub/x86-stub.c
+* Unmerged path arch/x86/boot/compressed/efi_mixed.S
+* Unmerged path arch/x86/boot/compressed/eboot.c
+* Unmerged path arch/x86/boot/compressed/efi_mixed.S
