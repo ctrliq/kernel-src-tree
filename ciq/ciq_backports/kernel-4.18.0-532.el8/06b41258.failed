@@ -1,0 +1,204 @@
+igc: Add lock to safeguard global Qbv variables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-532.el8
+commit-author Muhammad Husaini Zulkifli <muhammad.husaini.zulkifli@intel.com>
+commit 06b412589eef780b792e73df131d35dc43cc4a49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-532.el8/06b41258.failed
+
+Access to shared variables through hrtimer requires locking in order
+to protect the variables because actions to write into these variables
+(oper_gate_closed, admin_gate_closed, and qbv_transition) might potentially
+occur simultaneously. This patch provides a locking mechanisms to avoid
+such scenarios.
+
+Fixes: 175c241288c0 ("igc: Fix TX Hang issue when QBV Gate is closed")
+	Suggested-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Muhammad Husaini Zulkifli <muhammad.husaini.zulkifli@intel.com>
+	Tested-by: Naama Meir <naamax.meir@linux.intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Link: https://lore.kernel.org/r/20230807205129.3129346-1-anthony.l.nguyen@intel.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 06b412589eef780b792e73df131d35dc43cc4a49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/igc/igc.h
+#	drivers/net/ethernet/intel/igc/igc_main.c
+diff --cc drivers/net/ethernet/intel/igc/igc.h
+index 9902f726f06a,38901d2a4680..000000000000
+--- a/drivers/net/ethernet/intel/igc/igc.h
++++ b/drivers/net/ethernet/intel/igc/igc.h
+@@@ -187,8 -191,14 +187,17 @@@ struct igc_adapter 
+  	int tc_setup_type;
+  	ktime_t base_time;
+  	ktime_t cycle_time;
+ -	bool taprio_offload_enable;
+ +	bool qbv_enable;
+  	u32 qbv_config_change_errors;
+++<<<<<<< HEAD
+++=======
++ 	bool qbv_transition;
++ 	unsigned int qbv_count;
++ 	/* Access to oper_gate_closed, admin_gate_closed and qbv_transition
++ 	 * are protected by the qbv_tx_lock.
++ 	 */
++ 	spinlock_t qbv_tx_lock;
+++>>>>>>> 06b412589eef (igc: Add lock to safeguard global Qbv variables)
+  
+  	/* OS defined structs */
+  	struct pci_dev *pdev;
+diff --cc drivers/net/ethernet/intel/igc/igc_main.c
+index c3bbfc3b6577,6f557e843e49..000000000000
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@@ -6082,7 -6127,9 +6084,11 @@@ static int igc_qbv_clear_schedule(struc
+  
+  	adapter->base_time = 0;
+  	adapter->cycle_time = NSEC_PER_SEC;
+ -	adapter->taprio_offload_enable = false;
+  	adapter->qbv_config_change_errors = 0;
+++<<<<<<< HEAD
+++=======
++ 	adapter->qbv_count = 0;
+++>>>>>>> 06b412589eef (igc: Add lock to safeguard global Qbv variables)
+  
+  	for (i = 0; i < adapter->num_tx_queues; i++) {
+  		struct igc_ring *ring = adapter->tx_ring[i];
+@@@ -6090,8 -6137,28 +6096,31 @@@
+  		ring->start_time = 0;
+  		ring->end_time = NSEC_PER_SEC;
+  		ring->max_sdu = 0;
+++<<<<<<< HEAD
+++=======
+  	}
+  
++ 	spin_lock_irqsave(&adapter->qbv_tx_lock, flags);
++ 
++ 	adapter->qbv_transition = false;
++ 
++ 	for (i = 0; i < adapter->num_tx_queues; i++) {
++ 		struct igc_ring *ring = adapter->tx_ring[i];
++ 
++ 		ring->oper_gate_closed = false;
++ 		ring->admin_gate_closed = false;
+++>>>>>>> 06b412589eef (igc: Add lock to safeguard global Qbv variables)
++ 	}
++ 
++ 	spin_unlock_irqrestore(&adapter->qbv_tx_lock, flags);
++ 
++ 	return 0;
++ }
++ 
++ static int igc_tsn_clear_schedule(struct igc_adapter *adapter)
++ {
++ 	igc_qbv_clear_schedule(adapter);
++ 
+  	return 0;
+  }
+  
+@@@ -6101,6 -6168,8 +6130,11 @@@ static int igc_save_qbv_schedule(struc
+  	bool queue_configured[IGC_MAX_TX_QUEUES] = { };
+  	struct igc_hw *hw = &adapter->hw;
+  	u32 start_time = 0, end_time = 0;
+++<<<<<<< HEAD
+++=======
++ 	struct timespec64 now;
++ 	unsigned long flags;
+++>>>>>>> 06b412589eef (igc: Add lock to safeguard global Qbv variables)
+  	size_t n;
+  	int i;
+  
+@@@ -6495,6 -6587,85 +6533,88 @@@ u32 igc_rd32(struct igc_hw *hw, u32 reg
+  	return value;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Mapping HW RSS Type to enum xdp_rss_hash_type */
++ static enum xdp_rss_hash_type igc_xdp_rss_type[IGC_RSS_TYPE_MAX_TABLE] = {
++ 	[IGC_RSS_TYPE_NO_HASH]		= XDP_RSS_TYPE_L2,
++ 	[IGC_RSS_TYPE_HASH_TCP_IPV4]	= XDP_RSS_TYPE_L4_IPV4_TCP,
++ 	[IGC_RSS_TYPE_HASH_IPV4]	= XDP_RSS_TYPE_L3_IPV4,
++ 	[IGC_RSS_TYPE_HASH_TCP_IPV6]	= XDP_RSS_TYPE_L4_IPV6_TCP,
++ 	[IGC_RSS_TYPE_HASH_IPV6_EX]	= XDP_RSS_TYPE_L3_IPV6_EX,
++ 	[IGC_RSS_TYPE_HASH_IPV6]	= XDP_RSS_TYPE_L3_IPV6,
++ 	[IGC_RSS_TYPE_HASH_TCP_IPV6_EX] = XDP_RSS_TYPE_L4_IPV6_TCP_EX,
++ 	[IGC_RSS_TYPE_HASH_UDP_IPV4]	= XDP_RSS_TYPE_L4_IPV4_UDP,
++ 	[IGC_RSS_TYPE_HASH_UDP_IPV6]	= XDP_RSS_TYPE_L4_IPV6_UDP,
++ 	[IGC_RSS_TYPE_HASH_UDP_IPV6_EX] = XDP_RSS_TYPE_L4_IPV6_UDP_EX,
++ 	[10] = XDP_RSS_TYPE_NONE, /* RSS Type above 9 "Reserved" by HW  */
++ 	[11] = XDP_RSS_TYPE_NONE, /* keep array sized for SW bit-mask   */
++ 	[12] = XDP_RSS_TYPE_NONE, /* to handle future HW revisons       */
++ 	[13] = XDP_RSS_TYPE_NONE,
++ 	[14] = XDP_RSS_TYPE_NONE,
++ 	[15] = XDP_RSS_TYPE_NONE,
++ };
++ 
++ static int igc_xdp_rx_hash(const struct xdp_md *_ctx, u32 *hash,
++ 			   enum xdp_rss_hash_type *rss_type)
++ {
++ 	const struct igc_xdp_buff *ctx = (void *)_ctx;
++ 
++ 	if (!(ctx->xdp.rxq->dev->features & NETIF_F_RXHASH))
++ 		return -ENODATA;
++ 
++ 	*hash = le32_to_cpu(ctx->rx_desc->wb.lower.hi_dword.rss);
++ 	*rss_type = igc_xdp_rss_type[igc_rss_type(ctx->rx_desc)];
++ 
++ 	return 0;
++ }
++ 
++ static int igc_xdp_rx_timestamp(const struct xdp_md *_ctx, u64 *timestamp)
++ {
++ 	const struct igc_xdp_buff *ctx = (void *)_ctx;
++ 
++ 	if (igc_test_staterr(ctx->rx_desc, IGC_RXDADV_STAT_TSIP)) {
++ 		*timestamp = ctx->rx_ts;
++ 
++ 		return 0;
++ 	}
++ 
++ 	return -ENODATA;
++ }
++ 
++ static const struct xdp_metadata_ops igc_xdp_metadata_ops = {
++ 	.xmo_rx_hash			= igc_xdp_rx_hash,
++ 	.xmo_rx_timestamp		= igc_xdp_rx_timestamp,
++ };
++ 
++ static enum hrtimer_restart igc_qbv_scheduling_timer(struct hrtimer *timer)
++ {
++ 	struct igc_adapter *adapter = container_of(timer, struct igc_adapter,
++ 						   hrtimer);
++ 	unsigned long flags;
++ 	unsigned int i;
++ 
++ 	spin_lock_irqsave(&adapter->qbv_tx_lock, flags);
++ 
++ 	adapter->qbv_transition = true;
++ 	for (i = 0; i < adapter->num_tx_queues; i++) {
++ 		struct igc_ring *tx_ring = adapter->tx_ring[i];
++ 
++ 		if (tx_ring->admin_gate_closed) {
++ 			tx_ring->admin_gate_closed = false;
++ 			tx_ring->oper_gate_closed = true;
++ 		} else {
++ 			tx_ring->oper_gate_closed = false;
++ 		}
++ 	}
++ 	adapter->qbv_transition = false;
++ 
++ 	spin_unlock_irqrestore(&adapter->qbv_tx_lock, flags);
++ 
++ 	return HRTIMER_NORESTART;
++ }
++ 
+++>>>>>>> 06b412589eef (igc: Add lock to safeguard global Qbv variables)
+  /**
+   * igc_probe - Device Initialization Routine
+   * @pdev: PCI device information struct
+* Unmerged path drivers/net/ethernet/intel/igc/igc.h
+* Unmerged path drivers/net/ethernet/intel/igc/igc_main.c
