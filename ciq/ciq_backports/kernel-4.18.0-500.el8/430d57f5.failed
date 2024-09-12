@@ -1,0 +1,241 @@
+usb: core: stop USB enumeration if too many retries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-500.el8
+commit-author Ray Chi <raychi@google.com>
+commit 430d57f53eb1cdbf9ba9bbd397317912b3cd2de5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-500.el8/430d57f5.failed
+
+When a broken USB accessory connects to a USB host, usbcore might
+keep doing enumeration retries. If the host has a watchdog mechanism,
+the kernel panic will happen on the host.
+
+This patch provides an attribute early_stop to limit the numbers of retries
+for each port of a hub. If a port was marked with early_stop attribute,
+unsuccessful connection attempts will fail quickly. In addition, if an
+early_stop port has failed to initialize, it will ignore all future
+connection events until early_stop attribute is clear.
+
+	Signed-off-by: Ray Chi <raychi@google.com>
+	Reviewed-by: Alan Stern <stern@rowland.harvard.edu>
+Link: https://lore.kernel.org/r/20221107072754.3336357-1-raychi@google.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 430d57f53eb1cdbf9ba9bbd397317912b3cd2de5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/ABI/testing/sysfs-bus-usb
+diff --cc Documentation/ABI/testing/sysfs-bus-usb
+index 59986ff0678f,545c2dd97ed0..000000000000
+--- a/Documentation/ABI/testing/sysfs-bus-usb
++++ b/Documentation/ABI/testing/sysfs-bus-usb
+@@@ -238,6 -244,37 +238,40 @@@ Description
+  		is permitted, "u2" if only u2 is permitted, "u1_u2" if both u1 and
+  		u2 are permitted.
+  
+++<<<<<<< HEAD
+++=======
++ What:		/sys/bus/usb/devices/.../<hub_interface>/port<X>/connector
++ Date:		December 2021
++ Contact:	Heikki Krogerus <heikki.krogerus@linux.intel.com>
++ Description:
++ 		Link to the USB Type-C connector when available. This link is
++ 		only created when USB Type-C Connector Class is enabled, and
++ 		only if the system firmware is capable of describing the
++ 		connection between a port and its connector.
++ 
++ What:		/sys/bus/usb/devices/.../<hub_interface>/port<X>/disable
++ Date:		June 2022
++ Contact:	Michael Grzeschik <m.grzeschik@pengutronix.de>
++ Description:
++ 		This file controls the state of a USB port, including
++ 		Vbus power output (but only on hubs that support
++ 		power switching -- most hubs don't support it). If
++ 		a port is disabled, the port is unusable: Devices
++ 		attached to the port will not be detected, initialized,
++ 		or enumerated.
++ 
++ What:		/sys/bus/usb/devices/.../<hub_interface>/port<X>/early_stop
++ Date:		Sep 2022
++ Contact:	Ray Chi <raychi@google.com>
++ Description:
++ 		Some USB hosts have some watchdog mechanisms so that the device
++ 		may enter ramdump if it takes a long time during port initialization.
++ 		This attribute allows each port just has two attempts so that the
++ 		port initialization will be failed quickly. In addition, if a port
++ 		which is marked with early_stop has failed to initialize, it will ignore
++ 		all future connections until this attribute is clear.
++ 
+++>>>>>>> 430d57f53eb1 (usb: core: stop USB enumeration if too many retries)
+  What:		/sys/bus/usb/devices/.../power/usb2_lpm_l1_timeout
+  Date:		May 2013
+  Contact:	Mathias Nyman <mathias.nyman@linux.intel.com>
+* Unmerged path Documentation/ABI/testing/sysfs-bus-usb
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index 8c508e877d90..f5d96a507701 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -3074,6 +3074,48 @@ static int hub_port_reset(struct usb_hub *hub, int port1,
+ 	return status;
+ }
+ 
++/*
++ * hub_port_stop_enumerate - stop USB enumeration or ignore port events
++ * @hub: target hub
++ * @port1: port num of the port
++ * @retries: port retries number of hub_port_init()
++ *
++ * Return:
++ *    true: ignore port actions/events or give up connection attempts.
++ *    false: keep original behavior.
++ *
++ * This function will be based on retries to check whether the port which is
++ * marked with early_stop attribute would stop enumeration or ignore events.
++ *
++ * Note:
++ * This function didn't change anything if early_stop is not set, and it will
++ * prevent all connection attempts when early_stop is set and the attempts of
++ * the port are more than 1.
++ */
++static bool hub_port_stop_enumerate(struct usb_hub *hub, int port1, int retries)
++{
++	struct usb_port *port_dev = hub->ports[port1 - 1];
++
++	if (port_dev->early_stop) {
++		if (port_dev->ignore_event)
++			return true;
++
++		/*
++		 * We want unsuccessful attempts to fail quickly.
++		 * Since some devices may need one failure during
++		 * port initialization, we allow two tries but no
++		 * more.
++		 */
++		if (retries < 2)
++			return false;
++
++		port_dev->ignore_event = 1;
++	} else
++		port_dev->ignore_event = 0;
++
++	return port_dev->ignore_event;
++}
++
+ /* Check if a port is power on */
+ int usb_port_is_power_on(struct usb_hub *hub, unsigned int portstatus)
+ {
+@@ -4789,6 +4831,11 @@ hub_port_init(struct usb_hub *hub, struct usb_device *udev, int port1,
+ 	do_new_scheme = use_new_scheme(udev, retry_counter, port_dev);
+ 
+ 	for (retries = 0; retries < GET_DESCRIPTOR_TRIES; (++retries, msleep(100))) {
++		if (hub_port_stop_enumerate(hub, port1, retries)) {
++			retval = -ENODEV;
++			break;
++		}
++
+ 		if (do_new_scheme) {
+ 			struct usb_device_descriptor *buf;
+ 			int r = 0;
+@@ -5239,6 +5286,11 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
+ 	status = 0;
+ 
+ 	for (i = 0; i < PORT_INIT_TRIES; i++) {
++		if (hub_port_stop_enumerate(hub, port1, i)) {
++			status = -ENODEV;
++			break;
++		}
++
+ 		usb_lock_port(port_dev);
+ 		mutex_lock(hcd->address0_mutex);
+ 		retry_locked = true;
+@@ -5607,6 +5659,10 @@ static void port_event(struct usb_hub *hub, int port1)
+ 	if (!pm_runtime_active(&port_dev->dev))
+ 		return;
+ 
++	/* skip port actions if ignore_event and early_stop are true */
++	if (port_dev->ignore_event && port_dev->early_stop)
++		return;
++
+ 	if (hub_handle_remote_wakeup(hub, port1, portstatus, portchange))
+ 		connect_change = 1;
+ 
+@@ -5920,6 +5976,10 @@ static int usb_reset_and_verify_device(struct usb_device *udev)
+ 	mutex_lock(hcd->address0_mutex);
+ 
+ 	for (i = 0; i < PORT_INIT_TRIES; ++i) {
++		if (hub_port_stop_enumerate(parent_hub, port1, i)) {
++			ret = -ENODEV;
++			break;
++		}
+ 
+ 		/* ep0 maxpacket size may change; let the HCD know about it.
+ 		 * Other endpoints will be handled by re-enumeration. */
+diff --git a/drivers/usb/core/hub.h b/drivers/usb/core/hub.h
+index 3fcb38099ce3..0de57e0efa19 100644
+--- a/drivers/usb/core/hub.h
++++ b/drivers/usb/core/hub.h
+@@ -89,6 +89,8 @@ struct usb_hub {
+  * @is_superspeed cache super-speed status
+  * @usb3_lpm_u1_permit: whether USB3 U1 LPM is permitted.
+  * @usb3_lpm_u2_permit: whether USB3 U2 LPM is permitted.
++ * @early_stop: whether port initialization will be stopped earlier.
++ * @ignore_event: whether events of the port are ignored.
+  */
+ struct usb_port {
+ 	struct usb_device *child;
+@@ -102,6 +104,8 @@ struct usb_port {
+ 	u32 over_current_count;
+ 	u8 portnum;
+ 	u32 quirks;
++	unsigned int early_stop:1;
++	unsigned int ignore_event:1;
+ 	unsigned int is_superspeed:1;
+ 	unsigned int usb3_lpm_u1_permit:1;
+ 	unsigned int usb3_lpm_u2_permit:1;
+diff --git a/drivers/usb/core/port.c b/drivers/usb/core/port.c
+index d375eb4a9b45..c0b7b604e233 100644
+--- a/drivers/usb/core/port.c
++++ b/drivers/usb/core/port.c
+@@ -17,6 +17,32 @@ static int usb_port_block_power_off;
+ 
+ static const struct attribute_group *port_dev_group[];
+ 
++static ssize_t early_stop_show(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	struct usb_port *port_dev = to_usb_port(dev);
++
++	return sysfs_emit(buf, "%s\n", port_dev->early_stop ? "yes" : "no");
++}
++
++static ssize_t early_stop_store(struct device *dev, struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct usb_port *port_dev = to_usb_port(dev);
++	bool value;
++
++	if (kstrtobool(buf, &value))
++		return -EINVAL;
++
++	if (value)
++		port_dev->early_stop = 1;
++	else
++		port_dev->early_stop = 0;
++
++	return count;
++}
++static DEVICE_ATTR_RW(early_stop);
++
+ static ssize_t disable_show(struct device *dev,
+ 			      struct device_attribute *attr, char *buf)
+ {
+@@ -236,6 +262,7 @@ static struct attribute *port_dev_attrs[] = {
+ 	&dev_attr_quirks.attr,
+ 	&dev_attr_over_current_count.attr,
+ 	&dev_attr_disable.attr,
++	&dev_attr_early_stop.attr,
+ 	NULL,
+ };
+ 
