@@ -1,0 +1,134 @@
+wifi: mac80211: add support for restricting netdev features per vif
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Felix Fietkau <nbd@nbd.name>
+commit 7d360f6061db01830adfdb1eaa3977b19db0c30b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/7d360f60.failed
+
+This can be used to selectively disable feature flags for checksum offload,
+scatter/gather or GSO by changing vif->netdev_features.
+Removing features from vif->netdev_features does not affect the netdev
+features themselves, but instead fixes up skbs in the tx path so that the
+offloads are not needed in the driver.
+
+Aside from making it easier to deal with vif type based hardware limitations,
+this also makes it possible to optimize performance on hardware without native
+GSO support by declaring GSO support in hw->netdev_features and removing it
+from vif->netdev_features. This allows mac80211 to handle GSO segmentation
+after the sta lookup, but before itxq enqueue, thus reducing the number of
+unnecessary sta lookups, as well as some other per-packet processing.
+
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+Link: https://lore.kernel.org/r/20221010094338.78070-1-nbd@nbd.name
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 7d360f6061db01830adfdb1eaa3977b19db0c30b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/tx.c
+diff --cc net/mac80211/tx.c
+index af821ca35576,2171cd1ca807..000000000000
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@@ -4498,13 -4557,13 +4569,21 @@@ static void ieee80211_8023_xmit(struct 
+  	struct ieee80211_tx_info *info;
+  	struct ieee80211_local *local = sdata->local;
+  	struct tid_ampdu_tx *tid_tx;
++ 	struct sk_buff *seg, *next;
++ 	unsigned int skbs = 0, len = 0;
++ 	u16 queue;
+  	u8 tid;
+  
+++<<<<<<< HEAD
+ +	if (local->ops->wake_tx_queue) {
+ +		u16 queue = __ieee80211_select_queue(sdata, sta, skb);
+ +		skb_set_queue_mapping(skb, queue);
+ +		skb_get_hash(skb);
+ +	}
+++=======
++ 	queue = ieee80211_select_queue(sdata, sta, skb);
++ 	skb_set_queue_mapping(skb, queue);
+++>>>>>>> 7d360f6061db (wifi: mac80211: add support for restricting netdev features per vif)
+  
+  	if (unlikely(test_bit(SCAN_SW_SCANNING, &local->scanning)) &&
+  	    test_bit(SDATA_STATE_OFFCHANNEL, &sdata->state))
+diff --git a/include/net/fq_impl.h b/include/net/fq_impl.h
+index 6540781e8d40..58edbcc3c764 100644
+--- a/include/net/fq_impl.h
++++ b/include/net/fq_impl.h
+@@ -201,6 +201,7 @@ static void fq_tin_enqueue(struct fq *fq,
+ 			   fq_skb_free_t free_func)
+ {
+ 	struct fq_flow *flow;
++	struct sk_buff *next;
+ 	bool oom;
+ 
+ 	lockdep_assert_held(&fq->lock);
+@@ -215,11 +216,15 @@ static void fq_tin_enqueue(struct fq *fq,
+ 	}
+ 
+ 	flow->tin = tin;
+-	flow->backlog += skb->len;
+-	tin->backlog_bytes += skb->len;
+-	tin->backlog_packets++;
+-	fq->memory_usage += skb->truesize;
+-	fq->backlog++;
++	skb_list_walk_safe(skb, skb, next) {
++		skb_mark_not_on_list(skb);
++		flow->backlog += skb->len;
++		tin->backlog_bytes += skb->len;
++		tin->backlog_packets++;
++		fq->memory_usage += skb->truesize;
++		fq->backlog++;
++		__skb_queue_tail(&flow->queue, skb);
++	}
+ 
+ 	if (list_empty(&flow->flowchain)) {
+ 		flow->deficit = fq->quantum;
+@@ -227,7 +232,6 @@ static void fq_tin_enqueue(struct fq *fq,
+ 			      &tin->new_flows);
+ 	}
+ 
+-	__skb_queue_tail(&flow->queue, skb);
+ 	oom = (fq->memory_usage > fq->memory_limit);
+ 	while (fq->backlog > fq->limit || oom) {
+ 		flow = fq_find_fattest_flow(fq);
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index 877a6acd9be9..6cd6b56dda88 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -1807,6 +1807,10 @@ struct ieee80211_vif_cfg {
+  * @addr: address of this interface
+  * @p2p: indicates whether this AP or STA interface is a p2p
+  *	interface, i.e. a GO or p2p-sta respectively
++ * @netdev_features: tx netdev features supported by the hardware for this
++ *	vif. mac80211 initializes this to hw->netdev_features, and the driver
++ *	can mask out specific tx features. mac80211 will handle software fixup
++ *	for masked offloads (GSO, CSUM)
+  * @driver_flags: flags/capabilities the driver has for this interface,
+  *	these need to be set (or cleared) when the interface is added
+  *	or, if supported by the driver, the interface type is changed
+@@ -1848,6 +1852,7 @@ struct ieee80211_vif {
+ 
+ 	struct ieee80211_txq *txq;
+ 
++	netdev_features_t netdev_features;
+ 	u32 driver_flags;
+ 	u32 offload_flags;
+ 
+diff --git a/net/mac80211/iface.c b/net/mac80211/iface.c
+index e2cdf38330b6..16833dab173f 100644
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -2181,6 +2181,7 @@ int ieee80211_if_add(struct ieee80211_local *local, const char *name,
+ 		ndev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
+ 		ndev->hw_features |= ndev->features &
+ 					MAC80211_SUPPORTED_FEATURES_TX;
++		sdata->vif.netdev_features = local->hw.netdev_features;
+ 
+ 		netdev_set_default_ethtool_ops(ndev, &ieee80211_ethtool_ops);
+ 
+* Unmerged path net/mac80211/tx.c
