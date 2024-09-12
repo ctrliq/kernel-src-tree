@@ -1,0 +1,396 @@
+ALSA: core: Move mmap handler into memalloc ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Takashi Iwai <tiwai@suse.de>
+commit a202bd1ad86d59c07f24f0a201c5ade320b51e30
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/a202bd1a.failed
+
+This patch moves the mmap handling code into the common memalloc
+handler.  It allows us to reduce the memory-type specific code in PCM
+code gracefully.
+
+Link: https://lore.kernel.org/r/20210609162551.7842-5-tiwai@suse.de
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit a202bd1ad86d59c07f24f0a201c5ade320b51e30)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/sound/memalloc.h
+#	sound/core/memalloc.c
+#	sound/core/memalloc_local.h
+diff --cc include/sound/memalloc.h
+index 3ab084438fdc,1918c60f1f35..000000000000
+--- a/include/sound/memalloc.h
++++ b/include/sound/memalloc.h
+@@@ -9,9 -9,9 +9,14 @@@
+  #ifndef __SOUND_MEMALLOC_H
+  #define __SOUND_MEMALLOC_H
+  
+ +#include <asm/page.h>
+ +
+  struct device;
+++<<<<<<< HEAD
+++=======
++ struct page;
++ struct vm_area_struct;
+++>>>>>>> a202bd1ad86d (ALSA: core: Move mmap handler into memalloc ops)
+  
+  /*
+   * buffer device info
+@@@ -123,6 -70,13 +128,8 @@@ int snd_dma_alloc_pages(int type, struc
+  int snd_dma_alloc_pages_fallback(int type, struct device *dev, size_t size,
+                                   struct snd_dma_buffer *dmab);
+  void snd_dma_free_pages(struct snd_dma_buffer *dmab);
++ int snd_dma_buffer_mmap(struct snd_dma_buffer *dmab,
++ 			struct vm_area_struct *area);
+  
+ -dma_addr_t snd_sgbuf_get_addr(struct snd_dma_buffer *dmab, size_t offset);
+ -struct page *snd_sgbuf_get_page(struct snd_dma_buffer *dmab, size_t offset);
+ -unsigned int snd_sgbuf_get_chunk_size(struct snd_dma_buffer *dmab,
+ -				      unsigned int ofs, unsigned int size);
+ -
+  #endif /* __SOUND_MEMALLOC_H */
+  
+diff --cc sound/core/memalloc.c
+index fb571e6ead5e,bdcb9230acf8..000000000000
+--- a/sound/core/memalloc.c
++++ b/sound/core/memalloc.c
+@@@ -226,32 -120,271 +226,297 @@@ EXPORT_SYMBOL(snd_dma_alloc_pages_fallb
+   */
+  void snd_dma_free_pages(struct snd_dma_buffer *dmab)
+  {
+ -	const struct snd_malloc_ops *ops = snd_dma_get_ops(dmab);
+ -
+ -	if (ops && ops->free)
+ -		ops->free(dmab);
+ +	switch (dmab->dev.type) {
+ +	case SNDRV_DMA_TYPE_CONTINUOUS:
+ +		free_pages_exact(dmab->area, dmab->bytes);
+ +		break;
+ +	case SNDRV_DMA_TYPE_VMALLOC:
+ +		vfree(dmab->area);
+ +		break;
+ +#ifdef CONFIG_HAS_DMA
+ +#ifdef CONFIG_GENERIC_ALLOCATOR
+ +	case SNDRV_DMA_TYPE_DEV_IRAM:
+ +		snd_free_dev_iram(dmab);
+ +		break;
+ +#endif /* CONFIG_GENERIC_ALLOCATOR */
+ +	case SNDRV_DMA_TYPE_DEV:
+ +	case SNDRV_DMA_TYPE_DEV_UC:
+ +		snd_free_dev_pages(dmab);
+ +		break;
+ +#endif
+ +#ifdef CONFIG_SND_DMA_SGBUF
+ +	case SNDRV_DMA_TYPE_DEV_SG:
+ +	case SNDRV_DMA_TYPE_DEV_UC_SG:
+ +		snd_free_sgbuf_pages(dmab);
+ +		break;
+ +#endif
+ +	default:
+ +		pr_err("snd-malloc: invalid device type %d\n", dmab->dev.type);
+ +	}
+  }
+  EXPORT_SYMBOL(snd_dma_free_pages);
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * snd_dma_buffer_mmap - perform mmap of the given DMA buffer
++  * @dmab: buffer allocation information
++  * @area: VM area information
++  */
++ int snd_dma_buffer_mmap(struct snd_dma_buffer *dmab,
++ 			struct vm_area_struct *area)
++ {
++ 	const struct snd_malloc_ops *ops = snd_dma_get_ops(dmab);
++ 
++ 	if (ops && ops->mmap)
++ 		return ops->mmap(dmab, area);
++ 	else
++ 		return -ENOENT;
++ }
++ EXPORT_SYMBOL(snd_dma_buffer_mmap);
++ 
++ /**
++  * snd_sgbuf_get_addr - return the physical address at the corresponding offset
++  * @dmab: buffer allocation information
++  * @offset: offset in the ring buffer
++  */
++ dma_addr_t snd_sgbuf_get_addr(struct snd_dma_buffer *dmab, size_t offset)
++ {
++ 	const struct snd_malloc_ops *ops = snd_dma_get_ops(dmab);
++ 
++ 	if (ops && ops->get_addr)
++ 		return ops->get_addr(dmab, offset);
++ 	else
++ 		return dmab->addr + offset;
++ }
++ EXPORT_SYMBOL(snd_sgbuf_get_addr);
++ 
++ /**
++  * snd_sgbuf_get_page - return the physical page at the corresponding offset
++  * @dmab: buffer allocation information
++  * @offset: offset in the ring buffer
++  */
++ struct page *snd_sgbuf_get_page(struct snd_dma_buffer *dmab, size_t offset)
++ {
++ 	const struct snd_malloc_ops *ops = snd_dma_get_ops(dmab);
++ 
++ 	if (ops && ops->get_page)
++ 		return ops->get_page(dmab, offset);
++ 	else
++ 		return virt_to_page(dmab->area + offset);
++ }
++ EXPORT_SYMBOL(snd_sgbuf_get_page);
++ 
++ /**
++  * snd_sgbuf_get_chunk_size - compute the max chunk size with continuous pages
++  *	on sg-buffer
++  * @dmab: buffer allocation information
++  * @ofs: offset in the ring buffer
++  * @size: the requested size
++  */
++ unsigned int snd_sgbuf_get_chunk_size(struct snd_dma_buffer *dmab,
++ 				      unsigned int ofs, unsigned int size)
++ {
++ 	const struct snd_malloc_ops *ops = snd_dma_get_ops(dmab);
++ 
++ 	if (ops && ops->get_chunk_size)
++ 		return ops->get_chunk_size(dmab, ofs, size);
++ 	else
++ 		return size;
++ }
++ EXPORT_SYMBOL(snd_sgbuf_get_chunk_size);
++ 
++ /*
++  * Continuous pages allocator
++  */
++ static int snd_dma_continuous_alloc(struct snd_dma_buffer *dmab, size_t size)
++ {
++ 	gfp_t gfp = snd_mem_get_gfp_flags(dmab, GFP_KERNEL);
++ 
++ 	dmab->area = alloc_pages_exact(size, gfp);
++ 	return 0;
++ }
++ 
++ static void snd_dma_continuous_free(struct snd_dma_buffer *dmab)
++ {
++ 	free_pages_exact(dmab->area, dmab->bytes);
++ }
++ 
++ static const struct snd_malloc_ops snd_dma_continuous_ops = {
++ 	.alloc = snd_dma_continuous_alloc,
++ 	.free = snd_dma_continuous_free,
++ };
++ 
++ /*
++  * VMALLOC allocator
++  */
++ static int snd_dma_vmalloc_alloc(struct snd_dma_buffer *dmab, size_t size)
++ {
++ 	gfp_t gfp = snd_mem_get_gfp_flags(dmab, GFP_KERNEL | __GFP_HIGHMEM);
++ 
++ 	dmab->area = __vmalloc(size, gfp);
++ 	return 0;
++ }
++ 
++ static void snd_dma_vmalloc_free(struct snd_dma_buffer *dmab)
++ {
++ 	vfree(dmab->area);
++ }
++ 
++ static dma_addr_t snd_dma_vmalloc_get_addr(struct snd_dma_buffer *dmab,
++ 					   size_t offset)
++ {
++ 	return page_to_phys(vmalloc_to_page(dmab->area + offset)) +
++ 		offset % PAGE_SIZE;
++ }
++ 
++ static struct page *snd_dma_vmalloc_get_page(struct snd_dma_buffer *dmab,
++ 					     size_t offset)
++ {
++ 	return vmalloc_to_page(dmab->area + offset);
++ }
++ 
++ static unsigned int
++ snd_dma_vmalloc_get_chunk_size(struct snd_dma_buffer *dmab,
++ 			       unsigned int ofs, unsigned int size)
++ {
++ 	ofs %= PAGE_SIZE;
++ 	size += ofs;
++ 	if (size > PAGE_SIZE)
++ 		size = PAGE_SIZE;
++ 	return size - ofs;
++ }
++ 
++ static const struct snd_malloc_ops snd_dma_vmalloc_ops = {
++ 	.alloc = snd_dma_vmalloc_alloc,
++ 	.free = snd_dma_vmalloc_free,
++ 	.get_addr = snd_dma_vmalloc_get_addr,
++ 	.get_page = snd_dma_vmalloc_get_page,
++ 	.get_chunk_size = snd_dma_vmalloc_get_chunk_size,
++ };
++ 
++ #ifdef CONFIG_HAS_DMA
++ /*
++  * IRAM allocator
++  */
++ #ifdef CONFIG_GENERIC_ALLOCATOR
++ static int snd_dma_iram_alloc(struct snd_dma_buffer *dmab, size_t size)
++ {
++ 	struct device *dev = dmab->dev.dev;
++ 	struct gen_pool *pool;
++ 
++ 	if (dev->of_node) {
++ 		pool = of_gen_pool_get(dev->of_node, "iram", 0);
++ 		/* Assign the pool into private_data field */
++ 		dmab->private_data = pool;
++ 
++ 		dmab->area = gen_pool_dma_alloc_align(pool, size, &dmab->addr,
++ 						      PAGE_SIZE);
++ 		if (dmab->area)
++ 			return 0;
++ 	}
++ 
++ 	/* Internal memory might have limited size and no enough space,
++ 	 * so if we fail to malloc, try to fetch memory traditionally.
++ 	 */
++ 	dmab->dev.type = SNDRV_DMA_TYPE_DEV;
++ 	return __snd_dma_alloc_pages(dmab, size);
++ }
++ 
++ static void snd_dma_iram_free(struct snd_dma_buffer *dmab)
++ {
++ 	struct gen_pool *pool = dmab->private_data;
++ 
++ 	if (pool && dmab->area)
++ 		gen_pool_free(pool, (unsigned long)dmab->area, dmab->bytes);
++ }
++ 
++ static int snd_dma_iram_mmap(struct snd_dma_buffer *dmab,
++ 			     struct vm_area_struct *area)
++ {
++ 	area->vm_page_prot = pgprot_writecombine(area->vm_page_prot);
++ 	return remap_pfn_range(area, area->vm_start,
++ 			       dmab->addr >> PAGE_SHIFT,
++ 			       area->vm_end - area->vm_start,
++ 			       area->vm_page_prot);
++ }
++ 
++ static const struct snd_malloc_ops snd_dma_iram_ops = {
++ 	.alloc = snd_dma_iram_alloc,
++ 	.free = snd_dma_iram_free,
++ 	.mmap = snd_dma_iram_mmap,
++ };
++ #endif /* CONFIG_GENERIC_ALLOCATOR */
++ 
++ /*
++  * Coherent device pages allocator
++  */
++ static int snd_dma_dev_alloc(struct snd_dma_buffer *dmab, size_t size)
++ {
++ 	gfp_t gfp_flags;
++ 
++ 	gfp_flags = GFP_KERNEL
++ 		| __GFP_COMP	/* compound page lets parts be mapped */
++ 		| __GFP_NORETRY /* don't trigger OOM-killer */
++ 		| __GFP_NOWARN; /* no stack trace print - this call is non-critical */
++ 	dmab->area = dma_alloc_coherent(dmab->dev.dev, size, &dmab->addr,
++ 					gfp_flags);
++ #ifdef CONFIG_X86
++ 	if (dmab->area && dmab->dev.type == SNDRV_DMA_TYPE_DEV_UC)
++ 		set_memory_wc((unsigned long)dmab->area,
++ 			      PAGE_ALIGN(size) >> PAGE_SHIFT);
++ #endif
++ 	return 0;
++ }
++ 
++ static void snd_dma_dev_free(struct snd_dma_buffer *dmab)
++ {
++ #ifdef CONFIG_X86
++ 	if (dmab->dev.type == SNDRV_DMA_TYPE_DEV_UC)
++ 		set_memory_wb((unsigned long)dmab->area,
++ 			      PAGE_ALIGN(dmab->bytes) >> PAGE_SHIFT);
++ #endif
++ 	dma_free_coherent(dmab->dev.dev, dmab->bytes, dmab->area, dmab->addr);
++ }
++ 
++ static int snd_dma_dev_mmap(struct snd_dma_buffer *dmab,
++ 			    struct vm_area_struct *area)
++ {
++ 	return dma_mmap_coherent(dmab->dev.dev, area,
++ 				 dmab->area, dmab->addr, dmab->bytes);
++ }
++ 
++ static const struct snd_malloc_ops snd_dma_dev_ops = {
++ 	.alloc = snd_dma_dev_alloc,
++ 	.free = snd_dma_dev_free,
++ 	.mmap = snd_dma_dev_mmap,
++ };
++ #endif /* CONFIG_HAS_DMA */
++ 
++ /*
++  * Entry points
++  */
++ static const struct snd_malloc_ops *dma_ops[] = {
++ 	[SNDRV_DMA_TYPE_CONTINUOUS] = &snd_dma_continuous_ops,
++ 	[SNDRV_DMA_TYPE_VMALLOC] = &snd_dma_vmalloc_ops,
++ #ifdef CONFIG_HAS_DMA
++ 	[SNDRV_DMA_TYPE_DEV] = &snd_dma_dev_ops,
++ 	[SNDRV_DMA_TYPE_DEV_UC] = &snd_dma_dev_ops,
++ #ifdef CONFIG_GENERIC_ALLOCATOR
++ 	[SNDRV_DMA_TYPE_DEV_IRAM] = &snd_dma_iram_ops,
++ #endif /* CONFIG_GENERIC_ALLOCATOR */
++ #endif /* CONFIG_HAS_DMA */
++ #ifdef CONFIG_SND_DMA_SGBUF
++ 	[SNDRV_DMA_TYPE_DEV_SG] = &snd_dma_sg_ops,
++ 	[SNDRV_DMA_TYPE_DEV_UC_SG] = &snd_dma_sg_ops,
++ #endif
++ };
++ 
++ static const struct snd_malloc_ops *snd_dma_get_ops(struct snd_dma_buffer *dmab)
++ {
++ 	if (WARN_ON_ONCE(dmab->dev.type <= SNDRV_DMA_TYPE_UNKNOWN ||
++ 			 dmab->dev.type >= ARRAY_SIZE(dma_ops)))
++ 		return NULL;
++ 	return dma_ops[dmab->dev.type];
++ }
+++>>>>>>> a202bd1ad86d (ALSA: core: Move mmap handler into memalloc ops)
+* Unmerged path sound/core/memalloc_local.h
+* Unmerged path include/sound/memalloc.h
+* Unmerged path sound/core/memalloc.c
+* Unmerged path sound/core/memalloc_local.h
+diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
+index 57f05317826e..9137c695f7f4 100644
+--- a/sound/core/pcm_native.c
++++ b/sound/core/pcm_native.c
+@@ -3718,22 +3718,9 @@ int snd_pcm_lib_default_mmap(struct snd_pcm_substream *substream,
+ 			     struct vm_area_struct *area)
+ {
+ 	area->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+-#ifdef CONFIG_GENERIC_ALLOCATOR
+-	if (substream->dma_buffer.dev.type == SNDRV_DMA_TYPE_DEV_IRAM) {
+-		area->vm_page_prot = pgprot_writecombine(area->vm_page_prot);
+-		return remap_pfn_range(area, area->vm_start,
+-				substream->dma_buffer.addr >> PAGE_SHIFT,
+-				area->vm_end - area->vm_start, area->vm_page_prot);
+-	}
+-#endif /* CONFIG_GENERIC_ALLOCATOR */
+-	if (IS_ENABLED(CONFIG_HAS_DMA) && !substream->ops->page &&
+-	    (substream->dma_buffer.dev.type == SNDRV_DMA_TYPE_DEV ||
+-	     substream->dma_buffer.dev.type == SNDRV_DMA_TYPE_DEV_UC))
+-		return dma_mmap_coherent(substream->dma_buffer.dev.dev,
+-					 area,
+-					 substream->runtime->dma_area,
+-					 substream->runtime->dma_addr,
+-					 substream->runtime->dma_bytes);
++	if (!substream->ops->page &&
++	    !snd_dma_buffer_mmap(snd_pcm_get_dma_buf(substream), area))
++		return 0;
+ 	/* mmap with fault handler */
+ 	area->vm_ops = &snd_pcm_vm_ops_data_fault;
+ 	return 0;
