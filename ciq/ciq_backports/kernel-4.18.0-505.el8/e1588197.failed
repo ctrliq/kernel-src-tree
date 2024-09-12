@@ -1,0 +1,393 @@
+ice: move vsi_type assignment from ice_vsi_alloc to ice_vsi_cfg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-505.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit e15881970692f9e65175e9dcb1f4d2dba0672861
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-505.el8/e1588197.failed
+
+The ice_vsi_alloc and ice_vsi_cfg functions are used together to allocate
+and configure a new VSI, called as part of the ice_vsi_setup function.
+
+In the future with the addition of the subfunction code the ice driver
+will want to be able to allocate a VSI while delaying the configuration to
+a later point of the port activation.
+
+Currently this requires that the port code know what type of VSI should
+be allocated. This is required because ice_vsi_alloc assigns the VSI type.
+
+Refactor the ice_vsi_alloc and ice_vsi_cfg functions so that VSI type
+assignment isn't done until the configuration stage. This will allow the
+devlink port addition logic to reserve a VSI as early as possible before
+the type of the port is known. In this way, the port add can fail in the
+event that all hardware VSI resources are exhausted.
+
+Since the ice_vsi_cfg function already takes the ice_vsi_cfg_params
+structure, this is relatively straight forward.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Gurucharan G <gurucharanx.g@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit e15881970692f9e65175e9dcb1f4d2dba0672861)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_lib.c
+diff --cc drivers/net/ethernet/intel/ice/ice_lib.c
+index dc99c12b0643,960197b2301c..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@@ -448,58 -545,68 +448,72 @@@ static irqreturn_t ice_eswitch_msix_cle
+  }
+  
+  /**
+ - * ice_vsi_alloc_stat_arrays - Allocate statistics arrays
+ - * @vsi: VSI pointer
+ + * ice_vsi_alloc - Allocates the next available struct VSI in the PF
+ + * @pf: board private structure
+++<<<<<<< HEAD
+ + * @vsi_type: type of VSI
+ + * @ch: ptr to channel
+ + * @vf: VF for ICE_VSI_VF and ICE_VSI_CTRL
+++=======
+++>>>>>>> e15881970692 (ice: move vsi_type assignment from ice_vsi_alloc to ice_vsi_cfg)
+ + *
+-  * The VF pointer is used for ICE_VSI_VF and ICE_VSI_CTRL. For ICE_VSI_CTRL,
+-  * it may be NULL in the case there is no association with a VF. For
+-  * ICE_VSI_VF the VF pointer *must not* be NULL.
+++ * Reserves a VSI index from the PF and allocates an empty VSI structure
+++ * without a type. The VSI structure must later be initialized by calling
+++ * ice_vsi_cfg().
+ + *
+ + * returns a pointer to a VSI on success, NULL on failure.
+   */
+ -static int ice_vsi_alloc_stat_arrays(struct ice_vsi *vsi)
+++<<<<<<< HEAD
+ +static struct ice_vsi *
+ +ice_vsi_alloc(struct ice_pf *pf, enum ice_vsi_type vsi_type,
+ +	      struct ice_channel *ch, struct ice_vf *vf)
+++=======
+++static struct ice_vsi *ice_vsi_alloc(struct ice_pf *pf)
+++>>>>>>> e15881970692 (ice: move vsi_type assignment from ice_vsi_alloc to ice_vsi_cfg)
+  {
+ -	struct ice_vsi_stats *vsi_stat;
+ -	struct ice_pf *pf = vsi->back;
+ -
+ -	if (vsi->type == ICE_VSI_CHNL)
+ -		return 0;
+ -	if (!pf->vsi_stats)
+ -		return -ENOENT;
+ -
+ -	if (pf->vsi_stats[vsi->idx])
+ -	/* realloc will happen in rebuild path */
+ -		return 0;
+ -
+ -	vsi_stat = kzalloc(sizeof(*vsi_stat), GFP_KERNEL);
+ -	if (!vsi_stat)
+ -		return -ENOMEM;
+ +	struct device *dev = ice_pf_to_dev(pf);
+ +	struct ice_vsi *vsi = NULL;
+  
+ -	vsi_stat->tx_ring_stats =
+ -		kcalloc(vsi->alloc_txq, sizeof(*vsi_stat->tx_ring_stats),
+ -			GFP_KERNEL);
+ -	if (!vsi_stat->tx_ring_stats)
+ -		goto err_alloc_tx;
+++<<<<<<< HEAD
+ +	if (WARN_ON(vsi_type == ICE_VSI_VF && !vf))
+ +		return NULL;
+  
+ -	vsi_stat->rx_ring_stats =
+ -		kcalloc(vsi->alloc_rxq, sizeof(*vsi_stat->rx_ring_stats),
+ -			GFP_KERNEL);
+ -	if (!vsi_stat->rx_ring_stats)
+ -		goto err_alloc_rx;
+++=======
+++>>>>>>> e15881970692 (ice: move vsi_type assignment from ice_vsi_alloc to ice_vsi_cfg)
+ +	/* Need to protect the allocation of the VSIs at the PF level */
+ +	mutex_lock(&pf->sw_mutex);
+  
+ -	pf->vsi_stats[vsi->idx] = vsi_stat;
+ +	/* If we have already allocated our maximum number of VSIs,
+ +	 * pf->next_vsi will be ICE_NO_VSI. If not, pf->next_vsi index
+ +	 * is available to be populated
+ +	 */
+ +	if (pf->next_vsi == ICE_NO_VSI) {
+ +		dev_dbg(dev, "out of VSI slots!\n");
+ +		goto unlock_pf;
+ +	}
+  
+ -	return 0;
+ +	vsi = devm_kzalloc(dev, sizeof(*vsi), GFP_KERNEL);
+ +	if (!vsi)
+ +		goto unlock_pf;
+  
+ -err_alloc_rx:
+ -	kfree(vsi_stat->rx_ring_stats);
+ -err_alloc_tx:
+ -	kfree(vsi_stat->tx_ring_stats);
+ -	kfree(vsi_stat);
+ -	pf->vsi_stats[vsi->idx] = NULL;
+ -	return -ENOMEM;
+ -}
+++<<<<<<< HEAD
+ +	vsi->type = vsi_type;
+++=======
+++>>>>>>> e15881970692 (ice: move vsi_type assignment from ice_vsi_alloc to ice_vsi_cfg)
+ +	vsi->back = pf;
+ +	set_bit(ICE_VSI_DOWN, vsi->state);
+  
+ -/**
+ - * ice_vsi_alloc_def - set default values for already allocated VSI
+ - * @vsi: ptr to VSI
+ - * @ch: ptr to channel
+ - */
+ -static int
+ -ice_vsi_alloc_def(struct ice_vsi *vsi, struct ice_channel *ch)
+ -{
+ -	if (vsi->type != ICE_VSI_CHNL) {
+ -		ice_vsi_set_num_qs(vsi);
+ -		if (ice_vsi_alloc_arrays(vsi))
+ -			return -ENOMEM;
+ -	}
+ +	if (vsi_type == ICE_VSI_VF)
+ +		ice_vsi_set_num_qs(vsi, vf);
+ +	else if (vsi_type != ICE_VSI_CHNL)
+ +		ice_vsi_set_num_qs(vsi, NULL);
+  
+  	switch (vsi->type) {
+  	case ICE_VSI_SWITCHDEV_CTRL:
+ +		if (ice_vsi_alloc_arrays(vsi))
+ +			goto err_rings;
+ +
+++<<<<<<< HEAD
+  		/* Setup eswitch MSIX irq handler for VSI */
+  		vsi->irq_handler = ice_eswitch_msix_clean_rings;
+  		break;
+@@@ -543,28 -663,21 +557,30 @@@
+  		goto unlock_pf;
+  	}
+  
+ -	vsi = devm_kzalloc(dev, sizeof(*vsi), GFP_KERNEL);
+ -	if (!vsi)
+ -		goto unlock_pf;
+ -
+ -	vsi->back = pf;
+ -	set_bit(ICE_VSI_DOWN, vsi->state);
+ +	if (vsi->type == ICE_VSI_CTRL && !vf) {
+ +		/* Use the last VSI slot as the index for PF control VSI */
+ +		vsi->idx = pf->num_alloc_vsi - 1;
+ +		pf->ctrl_vsi_idx = vsi->idx;
+ +		pf->vsi[vsi->idx] = vsi;
+ +	} else {
+ +		/* fill slot and make note of the index */
+ +		vsi->idx = pf->next_vsi;
+ +		pf->vsi[pf->next_vsi] = vsi;
+  
+ -	/* fill slot and make note of the index */
+ -	vsi->idx = pf->next_vsi;
+ -	pf->vsi[pf->next_vsi] = vsi;
+ +		/* prepare pf->next_vsi for next use */
+ +		pf->next_vsi = ice_get_free_slot(pf->vsi, pf->num_alloc_vsi,
+ +						 pf->next_vsi);
+ +	}
+  
+ -	/* prepare pf->next_vsi for next use */
+ -	pf->next_vsi = ice_get_free_slot(pf->vsi, pf->num_alloc_vsi,
+ -					 pf->next_vsi);
+ +	if (vsi->type == ICE_VSI_CTRL && vf)
+ +		vf->ctrl_vsi_idx = vsi->idx;
+ +	goto unlock_pf;
+  
+ +err_rings:
+ +	devm_kfree(dev, vsi);
+ +	vsi = NULL;
+++=======
+++>>>>>>> e15881970692 (ice: move vsi_type assignment from ice_vsi_alloc to ice_vsi_cfg)
+  unlock_pf:
+  	mutex_unlock(&pf->sw_mutex);
+  	return vsi;
+@@@ -2637,29 -2817,155 +2653,173 @@@ ice_vsi_setup(struct ice_pf *pf, struc
+  		goto unroll_vsi_init;
+  	}
+  
+ -	return 0;
+ +	/* configure VSI nodes based on number of queues and TC's */
+ +	ice_for_each_traffic_class(i) {
+ +		if (!(vsi->tc_cfg.ena_tc & BIT(i)))
+ +			continue;
+  
+++<<<<<<< HEAD
+ +		if (vsi->type == ICE_VSI_CHNL) {
+ +			if (!vsi->alloc_txq && vsi->num_txq)
+ +				max_txqs[i] = vsi->num_txq;
+ +			else
+ +				max_txqs[i] = pf->num_lan_tx;
+ +		} else {
+ +			max_txqs[i] = vsi->alloc_txq;
+ +		}
+++=======
++ unroll_vector_base:
++ 	/* reclaim SW interrupts back to the common pool */
++ 	ice_free_res(pf->irq_tracker, vsi->base_vector, vsi->idx);
++ 	pf->num_avail_sw_msix += vsi->num_q_vectors;
++ unroll_alloc_q_vector:
++ 	ice_vsi_free_q_vectors(vsi);
++ unroll_vsi_init:
++ 	ice_vsi_delete_from_hw(vsi);
++ unroll_get_qs:
++ 	ice_vsi_put_qs(vsi);
++ unroll_vsi_alloc_stat:
++ 	ice_vsi_free_stats(vsi);
++ unroll_vsi_alloc:
++ 	ice_vsi_free_arrays(vsi);
++ 	return ret;
++ }
++ 
++ /**
++  * ice_vsi_cfg - configure a previously allocated VSI
++  * @vsi: pointer to VSI
++  * @params: parameters used to configure this VSI
++  */
++ int ice_vsi_cfg(struct ice_vsi *vsi, struct ice_vsi_cfg_params *params)
++ {
++ 	struct ice_pf *pf = vsi->back;
++ 	int ret;
++ 
++ 	if (WARN_ON(params->type == ICE_VSI_VF && !params->vf))
++ 		return -EINVAL;
++ 
++ 	vsi->type = params->type;
++ 	vsi->port_info = params->pi;
++ 
++ 	/* For VSIs which don't have a connected VF, this will be NULL */
++ 	vsi->vf = params->vf;
++ 
++ 	ret = ice_vsi_cfg_def(vsi, params);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = ice_vsi_cfg_tc_lan(vsi->back, vsi);
++ 	if (ret)
++ 		ice_vsi_decfg(vsi);
++ 
++ 	if (vsi->type == ICE_VSI_CTRL) {
++ 		if (vsi->vf) {
++ 			WARN_ON(vsi->vf->ctrl_vsi_idx != ICE_NO_VSI);
++ 			vsi->vf->ctrl_vsi_idx = vsi->idx;
++ 		} else {
++ 			WARN_ON(pf->ctrl_vsi_idx != ICE_NO_VSI);
++ 			pf->ctrl_vsi_idx = vsi->idx;
++ 		}
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ /**
++  * ice_vsi_decfg - remove all VSI configuration
++  * @vsi: pointer to VSI
++  */
++ void ice_vsi_decfg(struct ice_vsi *vsi)
++ {
++ 	struct ice_pf *pf = vsi->back;
++ 	int err;
++ 
++ 	/* The Rx rule will only exist to remove if the LLDP FW
++ 	 * engine is currently stopped
++ 	 */
++ 	if (!ice_is_safe_mode(pf) && vsi->type == ICE_VSI_PF &&
++ 	    !test_bit(ICE_FLAG_FW_LLDP_AGENT, pf->flags))
++ 		ice_cfg_sw_lldp(vsi, false, false);
++ 
++ 	ice_fltr_remove_all(vsi);
++ 	ice_rm_vsi_lan_cfg(vsi->port_info, vsi->idx);
++ 	err = ice_rm_vsi_rdma_cfg(vsi->port_info, vsi->idx);
++ 	if (err)
++ 		dev_err(ice_pf_to_dev(pf), "Failed to remove RDMA scheduler config for VSI %u, err %d\n",
++ 			vsi->vsi_num, err);
++ 
++ 	if (ice_is_xdp_ena_vsi(vsi))
++ 		/* return value check can be skipped here, it always returns
++ 		 * 0 if reset is in progress
++ 		 */
++ 		ice_destroy_xdp_rings(vsi);
++ 
++ 	ice_vsi_clear_rings(vsi);
++ 	ice_vsi_free_q_vectors(vsi);
++ 	ice_vsi_put_qs(vsi);
++ 	ice_vsi_free_arrays(vsi);
++ 
++ 	/* SR-IOV determines needed MSIX resources all at once instead of per
++ 	 * VSI since when VFs are spawned we know how many VFs there are and how
++ 	 * many interrupts each VF needs. SR-IOV MSIX resources are also
++ 	 * cleared in the same manner.
++ 	 */
++ 	if (vsi->type == ICE_VSI_CTRL && vsi->vf) {
++ 		ice_free_vf_ctrl_res(pf, vsi);
++ 	} else if (vsi->type != ICE_VSI_VF) {
++ 		/* reclaim SW interrupts back to the common pool */
++ 		ice_free_res(pf->irq_tracker, vsi->base_vector, vsi->idx);
++ 		pf->num_avail_sw_msix += vsi->num_q_vectors;
++ 		vsi->base_vector = 0;
+++>>>>>>> e15881970692 (ice: move vsi_type assignment from ice_vsi_alloc to ice_vsi_cfg)
+  	}
+  
+ -	if (vsi->type == ICE_VSI_VF &&
+ -	    vsi->agg_node && vsi->agg_node->valid)
+ -		vsi->agg_node->num_vsis--;
+ -	if (vsi->agg_node) {
+ -		vsi->agg_node->valid = false;
+ -		vsi->agg_node->agg_id = 0;
+ +	dev_dbg(dev, "vsi->tc_cfg.ena_tc = %d\n", vsi->tc_cfg.ena_tc);
+ +	ret = ice_cfg_vsi_lan(vsi->port_info, vsi->idx, vsi->tc_cfg.ena_tc,
+ +			      max_txqs);
+ +	if (ret) {
+ +		dev_err(dev, "VSI %d failed lan queue config, error %d\n",
+ +			vsi->vsi_num, ret);
+ +		goto unroll_clear_rings;
+  	}
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ /**
++  * ice_vsi_setup - Set up a VSI by a given type
++  * @pf: board private structure
++  * @params: parameters to use when creating the VSI
++  *
++  * This allocates the sw VSI structure and its queue resources.
++  *
++  * Returns pointer to the successfully allocated and configured VSI sw struct on
++  * success, NULL on failure.
++  */
++ struct ice_vsi *
++ ice_vsi_setup(struct ice_pf *pf, struct ice_vsi_cfg_params *params)
++ {
++ 	struct device *dev = ice_pf_to_dev(pf);
++ 	struct ice_vsi *vsi;
++ 	int ret;
++ 
++ 	/* ice_vsi_setup can only initialize a new VSI, and we must have
++ 	 * a port_info structure for it.
++ 	 */
++ 	if (WARN_ON(!(params->flags & ICE_VSI_FLAG_INIT)) ||
++ 	    WARN_ON(!params->pi))
++ 		return NULL;
++ 
++ 	vsi = ice_vsi_alloc(pf);
++ 	if (!vsi) {
++ 		dev_err(dev, "could not allocate VSI\n");
++ 		return NULL;
++ 	}
++ 
++ 	ret = ice_vsi_cfg(vsi, params);
++ 	if (ret)
++ 		goto err_vsi_cfg;
+++>>>>>>> e15881970692 (ice: move vsi_type assignment from ice_vsi_alloc to ice_vsi_cfg)
+  
+  	/* Add switch rule to drop all Tx Flow Control Frames, of look up
+  	 * type ETHERTYPE from VSIs, and restrict malicious VF from sending
+* Unmerged path drivers/net/ethernet/intel/ice/ice_lib.c
