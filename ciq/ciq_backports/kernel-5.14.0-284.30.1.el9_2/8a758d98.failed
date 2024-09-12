@@ -1,0 +1,222 @@
+rxrpc: Stash the network namespace pointer in rxrpc_local
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 8a758d98dba380a7d32a98b0840ad707e3036233
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/8a758d98.failed
+
+Stash the network namespace pointer in the rxrpc_local struct in addition
+to a pointer to the rxrpc-specific net namespace info.  Use this to remove
+some places where the socket is passed as a parameter.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit 8a758d98dba380a7d32a98b0840ad707e3036233)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/ar-internal.h
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,9cf763c338bc..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -276,16 -283,16 +276,17 @@@ struct rxrpc_local 
+  	struct rcu_head		rcu;
+  	atomic_t		active_users;	/* Number of users of the local endpoint */
+  	refcount_t		ref;		/* Number of references to the structure */
+- 	struct rxrpc_net	*rxnet;		/* The network ns in which this resides */
++ 	struct net		*net;		/* The network namespace */
++ 	struct rxrpc_net	*rxnet;		/* Our bits in the network namespace */
+  	struct hlist_node	link;
+  	struct socket		*socket;	/* my UDP socket */
+ -	struct task_struct	*io_thread;
+ -	struct completion	io_thread_ready; /* Indication that the I/O thread started */
+ +	struct work_struct	processor;
+ +	struct list_head	ack_tx_queue;	/* List of ACKs that need sending */
+ +	spinlock_t		ack_tx_lock;	/* ACK list lock */
+  	struct rxrpc_sock __rcu	*service;	/* Service(s) listening on this endpoint */
+  	struct rw_semaphore	defrag_sem;	/* control re-enablement of IP DF bit */
+ -	struct sk_buff_head	rx_queue;	/* Received packets */
+ -	struct list_head	call_attend_q;	/* Calls requiring immediate attention */
+ +	struct sk_buff_head	reject_queue;	/* packets awaiting rejection */
+ +	struct sk_buff_head	event_queue;	/* endpoint event packets awaiting processing */
+  	struct rb_root		client_bundles;	/* Client connection bundles by socket params */
+  	spinlock_t		client_bundles_lock; /* Lock for client_bundles */
+  	spinlock_t		lock;		/* access lock */
+@@@ -1026,16 -1064,15 +1027,24 @@@ void rxrpc_peer_keepalive_worker(struc
+   */
+  struct rxrpc_peer *rxrpc_lookup_peer_rcu(struct rxrpc_local *,
+  					 const struct sockaddr_rxrpc *);
+++<<<<<<< HEAD
+ +struct rxrpc_peer *rxrpc_lookup_peer(struct rxrpc_sock *, struct rxrpc_local *,
+ +				     struct sockaddr_rxrpc *, gfp_t);
+ +struct rxrpc_peer *rxrpc_alloc_peer(struct rxrpc_local *, gfp_t);
+ +void rxrpc_new_incoming_peer(struct rxrpc_sock *, struct rxrpc_local *,
+ +			     struct rxrpc_peer *);
+++=======
++ struct rxrpc_peer *rxrpc_lookup_peer(struct rxrpc_local *local,
++ 				     struct sockaddr_rxrpc *srx, gfp_t gfp);
++ struct rxrpc_peer *rxrpc_alloc_peer(struct rxrpc_local *, gfp_t,
++ 				    enum rxrpc_peer_trace);
++ void rxrpc_new_incoming_peer(struct rxrpc_local *local, struct rxrpc_peer *peer);
+++>>>>>>> 8a758d98dba3 (rxrpc: Stash the network namespace pointer in rxrpc_local)
+  void rxrpc_destroy_all_peers(struct rxrpc_net *);
+ -struct rxrpc_peer *rxrpc_get_peer(struct rxrpc_peer *, enum rxrpc_peer_trace);
+ -struct rxrpc_peer *rxrpc_get_peer_maybe(struct rxrpc_peer *, enum rxrpc_peer_trace);
+ -void rxrpc_put_peer(struct rxrpc_peer *, enum rxrpc_peer_trace);
+ +struct rxrpc_peer *rxrpc_get_peer(struct rxrpc_peer *);
+ +struct rxrpc_peer *rxrpc_get_peer_maybe(struct rxrpc_peer *);
+ +void rxrpc_put_peer(struct rxrpc_peer *);
+ +void rxrpc_put_peer_locked(struct rxrpc_peer *);
+  
+  /*
+   * proc.c
+* Unmerged path net/rxrpc/ar-internal.h
+diff --git a/net/rxrpc/call_accept.c b/net/rxrpc/call_accept.c
+index afe1f587aaf0..15d680d0938f 100644
+--- a/net/rxrpc/call_accept.c
++++ b/net/rxrpc/call_accept.c
+@@ -295,7 +295,7 @@ static struct rxrpc_call *rxrpc_alloc_incoming_call(struct rxrpc_sock *rx,
+ 					  (peer_tail + 1) &
+ 					  (RXRPC_BACKLOG_MAX - 1));
+ 
+-			rxrpc_new_incoming_peer(rx, local, peer);
++			rxrpc_new_incoming_peer(local, peer);
+ 		}
+ 
+ 		/* Now allocate and set up the connection */
+diff --git a/net/rxrpc/conn_client.c b/net/rxrpc/conn_client.c
+index 827c1308297c..0545442024a4 100644
+--- a/net/rxrpc/conn_client.c
++++ b/net/rxrpc/conn_client.c
+@@ -363,7 +363,7 @@ static struct rxrpc_bundle *rxrpc_prep_call(struct rxrpc_sock *rx,
+ 
+ 	_enter("{%d,%lx},", call->debug_id, call->user_call_ID);
+ 
+-	cp->peer = rxrpc_lookup_peer(rx, cp->local, srx, gfp);
++	cp->peer = rxrpc_lookup_peer(cp->local, srx, gfp);
+ 	if (!cp->peer)
+ 		goto error;
+ 
+diff --git a/net/rxrpc/local_object.c b/net/rxrpc/local_object.c
+index 846558613c7f..f0debb7ccdad 100644
+--- a/net/rxrpc/local_object.c
++++ b/net/rxrpc/local_object.c
+@@ -72,7 +72,7 @@ static long rxrpc_local_cmp_key(const struct rxrpc_local *local,
+ /*
+  * Allocate a new local endpoint.
+  */
+-static struct rxrpc_local *rxrpc_alloc_local(struct rxrpc_net *rxnet,
++static struct rxrpc_local *rxrpc_alloc_local(struct net *net,
+ 					     const struct sockaddr_rxrpc *srx)
+ {
+ 	struct rxrpc_local *local;
+@@ -81,7 +81,8 @@ static struct rxrpc_local *rxrpc_alloc_local(struct rxrpc_net *rxnet,
+ 	if (local) {
+ 		refcount_set(&local->ref, 1);
+ 		atomic_set(&local->active_users, 1);
+-		local->rxnet = rxnet;
++		local->net = net;
++		local->rxnet = rxrpc_net(net);
+ 		INIT_HLIST_NODE(&local->link);
+ 		INIT_WORK(&local->processor, rxrpc_local_processor);
+ 		INIT_LIST_HEAD(&local->ack_tx_queue);
+@@ -221,7 +222,7 @@ struct rxrpc_local *rxrpc_lookup_local(struct net *net,
+ 		goto found;
+ 	}
+ 
+-	local = rxrpc_alloc_local(rxnet, srx);
++	local = rxrpc_alloc_local(net, srx);
+ 	if (!local)
+ 		goto nomem;
+ 
+diff --git a/net/rxrpc/peer_object.c b/net/rxrpc/peer_object.c
+index 041a51225c5f..1f4ea29354a7 100644
+--- a/net/rxrpc/peer_object.c
++++ b/net/rxrpc/peer_object.c
+@@ -149,10 +149,10 @@ struct rxrpc_peer *rxrpc_lookup_peer_rcu(struct rxrpc_local *local,
+  * assess the MTU size for the network interface through which this peer is
+  * reached
+  */
+-static void rxrpc_assess_MTU_size(struct rxrpc_sock *rx,
++static void rxrpc_assess_MTU_size(struct rxrpc_local *local,
+ 				  struct rxrpc_peer *peer)
+ {
+-	struct net *net = sock_net(&rx->sk);
++	struct net *net = local->net;
+ 	struct dst_entry *dst;
+ 	struct rtable *rt;
+ 	struct flowi fl;
+@@ -238,11 +238,11 @@ struct rxrpc_peer *rxrpc_alloc_peer(struct rxrpc_local *local, gfp_t gfp)
+ /*
+  * Initialise peer record.
+  */
+-static void rxrpc_init_peer(struct rxrpc_sock *rx, struct rxrpc_peer *peer,
++static void rxrpc_init_peer(struct rxrpc_local *local, struct rxrpc_peer *peer,
+ 			    unsigned long hash_key)
+ {
+ 	peer->hash_key = hash_key;
+-	rxrpc_assess_MTU_size(rx, peer);
++	rxrpc_assess_MTU_size(local, peer);
+ 	peer->mtu = peer->if_mtu;
+ 	peer->rtt_last_req = ktime_get_real();
+ 
+@@ -274,8 +274,7 @@ static void rxrpc_init_peer(struct rxrpc_sock *rx, struct rxrpc_peer *peer,
+ /*
+  * Set up a new peer.
+  */
+-static struct rxrpc_peer *rxrpc_create_peer(struct rxrpc_sock *rx,
+-					    struct rxrpc_local *local,
++static struct rxrpc_peer *rxrpc_create_peer(struct rxrpc_local *local,
+ 					    struct sockaddr_rxrpc *srx,
+ 					    unsigned long hash_key,
+ 					    gfp_t gfp)
+@@ -287,7 +286,7 @@ static struct rxrpc_peer *rxrpc_create_peer(struct rxrpc_sock *rx,
+ 	peer = rxrpc_alloc_peer(local, gfp);
+ 	if (peer) {
+ 		memcpy(&peer->srx, srx, sizeof(*srx));
+-		rxrpc_init_peer(rx, peer, hash_key);
++		rxrpc_init_peer(local, peer, hash_key);
+ 	}
+ 
+ 	_leave(" = %p", peer);
+@@ -305,14 +304,13 @@ static void rxrpc_free_peer(struct rxrpc_peer *peer)
+  * since we've already done a search in the list from the non-reentrant context
+  * (the data_ready handler) that is the only place we can add new peers.
+  */
+-void rxrpc_new_incoming_peer(struct rxrpc_sock *rx, struct rxrpc_local *local,
+-			     struct rxrpc_peer *peer)
++void rxrpc_new_incoming_peer(struct rxrpc_local *local, struct rxrpc_peer *peer)
+ {
+ 	struct rxrpc_net *rxnet = local->rxnet;
+ 	unsigned long hash_key;
+ 
+ 	hash_key = rxrpc_peer_hash_key(local, &peer->srx);
+-	rxrpc_init_peer(rx, peer, hash_key);
++	rxrpc_init_peer(local, peer, hash_key);
+ 
+ 	spin_lock(&rxnet->peer_hash_lock);
+ 	hash_add_rcu(rxnet->peer_hash, &peer->hash_link, hash_key);
+@@ -323,8 +321,7 @@ void rxrpc_new_incoming_peer(struct rxrpc_sock *rx, struct rxrpc_local *local,
+ /*
+  * obtain a remote transport endpoint for the specified address
+  */
+-struct rxrpc_peer *rxrpc_lookup_peer(struct rxrpc_sock *rx,
+-				     struct rxrpc_local *local,
++struct rxrpc_peer *rxrpc_lookup_peer(struct rxrpc_local *local,
+ 				     struct sockaddr_rxrpc *srx, gfp_t gfp)
+ {
+ 	struct rxrpc_peer *peer, *candidate;
+@@ -344,7 +341,7 @@ struct rxrpc_peer *rxrpc_lookup_peer(struct rxrpc_sock *rx,
+ 		/* The peer is not yet present in hash - create a candidate
+ 		 * for a new record and then redo the search.
+ 		 */
+-		candidate = rxrpc_create_peer(rx, local, srx, hash_key, gfp);
++		candidate = rxrpc_create_peer(local, srx, hash_key, gfp);
+ 		if (!candidate) {
+ 			_leave(" = NULL [nomem]");
+ 			return NULL;
