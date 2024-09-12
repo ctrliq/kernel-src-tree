@@ -1,0 +1,5321 @@
+treewide: use prandom_u32_max() when possible, part 1
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-490.el8
+commit-author Jason A. Donenfeld <Jason@zx2c4.com>
+commit 81895a65ec63ee1daec3255dc1a06675d2fbe915
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-490.el8/81895a65.failed
+
+Rather than incurring a division or requesting too many random bytes for
+the given range, use the prandom_u32_max() function, which only takes
+the minimum required bytes from the RNG and avoids divisions. This was
+done mechanically with this coccinelle script:
+
+@basic@
+expression E;
+type T;
+identifier get_random_u32 =~ "get_random_int|prandom_u32|get_random_u32";
+typedef u64;
+@@
+(
+- ((T)get_random_u32() % (E))
++ prandom_u32_max(E)
+|
+- ((T)get_random_u32() & ((E) - 1))
++ prandom_u32_max(E * XXX_MAKE_SURE_E_IS_POW2)
+|
+- ((u64)(E) * get_random_u32() >> 32)
++ prandom_u32_max(E)
+|
+- ((T)get_random_u32() & ~PAGE_MASK)
++ prandom_u32_max(PAGE_SIZE)
+)
+
+@multi_line@
+identifier get_random_u32 =~ "get_random_int|prandom_u32|get_random_u32";
+identifier RAND;
+expression E;
+@@
+
+-       RAND = get_random_u32();
+        ... when != RAND
+-       RAND %= (E);
++       RAND = prandom_u32_max(E);
+
+// Find a potential literal
+@literal_mask@
+expression LITERAL;
+type T;
+identifier get_random_u32 =~ "get_random_int|prandom_u32|get_random_u32";
+position p;
+@@
+
+        ((T)get_random_u32()@p & (LITERAL))
+
+// Add one to the literal.
+@script:python add_one@
+literal << literal_mask.LITERAL;
+RESULT;
+@@
+
+value = None
+if literal.startswith('0x'):
+        value = int(literal, 16)
+elif literal[0] in '123456789':
+        value = int(literal, 10)
+if value is None:
+        print("I don't know how to handle %s" % (literal))
+        cocci.include_match(False)
+elif value == 2**32 - 1 or value == 2**31 - 1 or value == 2**24 - 1 or value == 2**16 - 1 or value == 2**8 - 1:
+        print("Skipping 0x%x for cleanup elsewhere" % (value))
+        cocci.include_match(False)
+elif value & (value + 1) != 0:
+        print("Skipping 0x%x because it's not a power of two minus one" % (value))
+        cocci.include_match(False)
+elif literal.startswith('0x'):
+        coccinelle.RESULT = cocci.make_expr("0x%x" % (value + 1))
+else:
+        coccinelle.RESULT = cocci.make_expr("%d" % (value + 1))
+
+// Replace the literal mask with the calculated result.
+@plus_one@
+expression literal_mask.LITERAL;
+position literal_mask.p;
+expression add_one.RESULT;
+identifier FUNC;
+@@
+
+-       (FUNC()@p & (LITERAL))
++       prandom_u32_max(RESULT)
+
+@collapse_ret@
+type T;
+identifier VAR;
+expression E;
+@@
+
+ {
+-       T VAR;
+-       VAR = (E);
+-       return VAR;
++       return E;
+ }
+
+@drop_var@
+type T;
+identifier VAR;
+@@
+
+ {
+-       T VAR;
+        ... when != VAR
+ }
+
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: Yury Norov <yury.norov@gmail.com>
+	Reviewed-by: KP Singh <kpsingh@kernel.org>
+	Reviewed-by: Jan Kara <jack@suse.cz> # for ext4 and sbitmap
+	Reviewed-by: Christoph Böhmwalder <christoph.boehmwalder@linbit.com> # for drbd
+	Acked-by: Jakub Kicinski <kuba@kernel.org>
+	Acked-by: Heiko Carstens <hca@linux.ibm.com> # for s390
+	Acked-by: Ulf Hansson <ulf.hansson@linaro.org> # for mmc
+	Acked-by: Darrick J. Wong <djwong@kernel.org> # for xfs
+	Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+(cherry picked from commit 81895a65ec63ee1daec3255dc1a06675d2fbe915)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/loongarch/kernel/process.c
+#	arch/loongarch/kernel/vdso.c
+#	arch/mips/kernel/vdso.c
+#	arch/parisc/kernel/vdso.c
+#	arch/s390/kernel/vdso.c
+#	crypto/testmgr.c
+#	drivers/infiniband/hw/hns/hns_roce_ah.c
+#	drivers/infiniband/ulp/rtrs/rtrs-clt.c
+#	drivers/media/test-drivers/vivid/vivid-touch-cap.c
+#	drivers/mmc/host/dw_mmc.c
+#	drivers/net/phy/at803x.c
+#	fs/f2fs/gc.c
+#	fs/f2fs/segment.c
+#	include/linux/nodemask.h
+#	kernel/bpf/core.c
+#	kernel/time/clocksource.c
+#	lib/reed_solomon/test_rslib.c
+#	lib/sbitmap.c
+#	lib/test_kasan.c
+#	net/core/pktgen.c
+#	net/netfilter/ipvs/ip_vs_twos.c
+diff --cc arch/mips/kernel/vdso.c
+index 019035d7225c,5fd9bf1d596c..000000000000
+--- a/arch/mips/kernel/vdso.c
++++ b/arch/mips/kernel/vdso.c
+@@@ -67,32 -69,21 +67,39 @@@ static int __init init_vdso(void
+  }
+  subsys_initcall(init_vdso);
+  
+ -static unsigned long vdso_base(void)
+ +void update_vsyscall(struct timekeeper *tk)
+  {
+ -	unsigned long base = STACK_TOP;
+ -
+ -	if (IS_ENABLED(CONFIG_MIPS_FP_SUPPORT)) {
+ -		/* Skip the delay slot emulation page */
+ -		base += PAGE_SIZE;
+ +	vdso_data_write_begin(&vdso_data);
+ +
+ +	vdso_data.xtime_sec = tk->xtime_sec;
+ +	vdso_data.xtime_nsec = tk->tkr_mono.xtime_nsec;
+ +	vdso_data.wall_to_mono_sec = tk->wall_to_monotonic.tv_sec;
+ +	vdso_data.wall_to_mono_nsec = tk->wall_to_monotonic.tv_nsec;
+ +	vdso_data.cs_shift = tk->tkr_mono.shift;
+ +
+ +	vdso_data.clock_mode = tk->tkr_mono.clock->archdata.vdso_clock_mode;
+ +	if (vdso_data.clock_mode != VDSO_CLOCK_NONE) {
+ +		vdso_data.cs_mult = tk->tkr_mono.mult;
+ +		vdso_data.cs_cycle_last = tk->tkr_mono.cycle_last;
+ +		vdso_data.cs_mask = tk->tkr_mono.mask;
+  	}
+  
+++<<<<<<< HEAD
+ +	vdso_data_write_end(&vdso_data);
+ +}
+++=======
++ 	if (current->flags & PF_RANDOMIZE) {
++ 		base += prandom_u32_max(VDSO_RANDOMIZE_SIZE);
++ 		base = PAGE_ALIGN(base);
++ 	}
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  
+ -	return base;
+ +void update_vsyscall_tz(void)
+ +{
+ +	if (vdso_data.clock_mode != VDSO_CLOCK_NONE) {
+ +		vdso_data.tz_minuteswest = sys_tz.tz_minuteswest;
+ +		vdso_data.tz_dsttime = sys_tz.tz_dsttime;
+ +	}
+  }
+  
+  int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+diff --cc arch/s390/kernel/vdso.c
+index 92608348bda7,3105ca5bd470..000000000000
+--- a/arch/s390/kernel/vdso.c
++++ b/arch/s390/kernel/vdso.c
+@@@ -274,51 -210,71 +274,114 @@@ out_up
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned long vdso_addr(unsigned long start, unsigned long len)
++ {
++ 	unsigned long addr, end, offset;
++ 
++ 	/*
++ 	 * Round up the start address. It can start out unaligned as a result
++ 	 * of stack start randomization.
++ 	 */
++ 	start = PAGE_ALIGN(start);
++ 
++ 	/* Round the lowest possible end address up to a PMD boundary. */
++ 	end = (start + len + PMD_SIZE - 1) & PMD_MASK;
++ 	if (end >= VDSO_BASE)
++ 		end = VDSO_BASE;
++ 	end -= len;
++ 
++ 	if (end > start) {
++ 		offset = prandom_u32_max(((end - start) >> PAGE_SHIFT) + 1);
++ 		addr = start + (offset << PAGE_SHIFT);
++ 	} else {
++ 		addr = start;
++ 	}
++ 	return addr;
++ }
++ 
++ unsigned long vdso_size(void)
++ {
++ 	unsigned long size = VVAR_NR_PAGES * PAGE_SIZE;
++ 
++ 	if (is_compat_task())
++ 		size += vdso32_end - vdso32_start;
++ 	else
++ 		size += vdso64_end - vdso64_start;
++ 	return PAGE_ALIGN(size);
++ }
++ 
++ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
++ {
++ 	unsigned long addr = VDSO_BASE;
++ 	unsigned long size = vdso_size();
++ 
++ 	if (current->flags & PF_RANDOMIZE)
++ 		addr = vdso_addr(current->mm->start_stack + PAGE_SIZE, size);
++ 	return map_vdso(addr, size);
++ }
++ 
++ static struct page ** __init vdso_setup_pages(void *start, void *end)
++ {
++ 	int pages = (end - start) >> PAGE_SHIFT;
++ 	struct page **pagelist;
++ 	int i;
++ 
++ 	pagelist = kcalloc(pages + 1, sizeof(struct page *), GFP_KERNEL);
++ 	if (!pagelist)
++ 		panic("%s: Cannot allocate page list for VDSO", __func__);
++ 	for (i = 0; i < pages; i++)
++ 		pagelist[i] = virt_to_page(start + i * PAGE_SIZE);
++ 	return pagelist;
++ }
++ 
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  static int __init vdso_init(void)
+  {
+ -	vdso64_mapping.pages = vdso_setup_pages(vdso64_start, vdso64_end);
+ -	if (IS_ENABLED(CONFIG_COMPAT))
+ -		vdso32_mapping.pages = vdso_setup_pages(vdso32_start, vdso32_end);
+ +	int i;
+ +
+ +	vdso_init_data(vdso_data);
+ +#ifdef CONFIG_COMPAT
+ +	/* Calculate the size of the 32 bit vDSO */
+ +	vdso32_pages = ((&vdso32_end - &vdso32_start
+ +			 + PAGE_SIZE - 1) >> PAGE_SHIFT) + 1;
+ +
+ +	/* Make sure pages are in the correct state */
+ +	vdso32_pagelist = kcalloc(vdso32_pages + 1, sizeof(struct page *),
+ +				  GFP_KERNEL);
+ +	BUG_ON(vdso32_pagelist == NULL);
+ +	for (i = 0; i < vdso32_pages - 1; i++) {
+ +		struct page *pg = virt_to_page(vdso32_kbase + i*PAGE_SIZE);
+ +		ClearPageReserved(pg);
+ +		get_page(pg);
+ +		vdso32_pagelist[i] = pg;
+ +	}
+ +	vdso32_pagelist[vdso32_pages - 1] = virt_to_page(vdso_data);
+ +	vdso32_pagelist[vdso32_pages] = NULL;
+ +#endif
+ +
+ +	/* Calculate the size of the 64 bit vDSO */
+ +	vdso64_pages = ((&vdso64_end - &vdso64_start
+ +			 + PAGE_SIZE - 1) >> PAGE_SHIFT) + 1;
+ +
+ +	/* Make sure pages are in the correct state */
+ +	vdso64_pagelist = kcalloc(vdso64_pages + 1, sizeof(struct page *),
+ +				  GFP_KERNEL);
+ +	BUG_ON(vdso64_pagelist == NULL);
+ +	for (i = 0; i < vdso64_pages - 1; i++) {
+ +		struct page *pg = virt_to_page(vdso64_kbase + i*PAGE_SIZE);
+ +		ClearPageReserved(pg);
+ +		get_page(pg);
+ +		vdso64_pagelist[i] = pg;
+ +	}
+ +	vdso64_pagelist[vdso64_pages - 1] = virt_to_page(vdso_data);
+ +	vdso64_pagelist[vdso64_pages] = NULL;
+ +	if (vdso_alloc_per_cpu(&S390_lowcore))
+ +		BUG();
+ +
+ +	get_page(virt_to_page(vdso_data));
+ +
+  	return 0;
+  }
+ -arch_initcall(vdso_init);
+ +early_initcall(vdso_init);
+diff --cc crypto/testmgr.c
+index 3dd3f8428f73,bff4833dbe7c..000000000000
+--- a/crypto/testmgr.c
++++ b/crypto/testmgr.c
+@@@ -172,10 -191,2179 +172,2183 @@@ static void testmgr_free_buf(char *buf[
+  	int i;
+  
+  	for (i = 0; i < XBUFSIZE; i++)
+ -		free_pages((unsigned long)buf[i], order);
+ +		free_page((unsigned long)buf[i]);
+  }
+  
+++<<<<<<< HEAD
+ +static int ahash_guard_result(char *result, char c, int size)
+++=======
++ static void testmgr_free_buf(char *buf[XBUFSIZE])
++ {
++ 	__testmgr_free_buf(buf, 0);
++ }
++ 
++ #define TESTMGR_POISON_BYTE	0xfe
++ #define TESTMGR_POISON_LEN	16
++ 
++ static inline void testmgr_poison(void *addr, size_t len)
++ {
++ 	memset(addr, TESTMGR_POISON_BYTE, len);
++ }
++ 
++ /* Is the memory region still fully poisoned? */
++ static inline bool testmgr_is_poison(const void *addr, size_t len)
++ {
++ 	return memchr_inv(addr, TESTMGR_POISON_BYTE, len) == NULL;
++ }
++ 
++ /* flush type for hash algorithms */
++ enum flush_type {
++ 	/* merge with update of previous buffer(s) */
++ 	FLUSH_TYPE_NONE = 0,
++ 
++ 	/* update with previous buffer(s) before doing this one */
++ 	FLUSH_TYPE_FLUSH,
++ 
++ 	/* likewise, but also export and re-import the intermediate state */
++ 	FLUSH_TYPE_REIMPORT,
++ };
++ 
++ /* finalization function for hash algorithms */
++ enum finalization_type {
++ 	FINALIZATION_TYPE_FINAL,	/* use final() */
++ 	FINALIZATION_TYPE_FINUP,	/* use finup() */
++ 	FINALIZATION_TYPE_DIGEST,	/* use digest() */
++ };
++ 
++ /*
++  * Whether the crypto operation will occur in-place, and if so whether the
++  * source and destination scatterlist pointers will coincide (req->src ==
++  * req->dst), or whether they'll merely point to two separate scatterlists
++  * (req->src != req->dst) that reference the same underlying memory.
++  *
++  * This is only relevant for algorithm types that support in-place operation.
++  */
++ enum inplace_mode {
++ 	OUT_OF_PLACE,
++ 	INPLACE_ONE_SGLIST,
++ 	INPLACE_TWO_SGLISTS,
++ };
++ 
++ #define TEST_SG_TOTAL	10000
++ 
++ /**
++  * struct test_sg_division - description of a scatterlist entry
++  *
++  * This struct describes one entry of a scatterlist being constructed to check a
++  * crypto test vector.
++  *
++  * @proportion_of_total: length of this chunk relative to the total length,
++  *			 given as a proportion out of TEST_SG_TOTAL so that it
++  *			 scales to fit any test vector
++  * @offset: byte offset into a 2-page buffer at which this chunk will start
++  * @offset_relative_to_alignmask: if true, add the algorithm's alignmask to the
++  *				  @offset
++  * @flush_type: for hashes, whether an update() should be done now vs.
++  *		continuing to accumulate data
++  * @nosimd: if doing the pending update(), do it with SIMD disabled?
++  */
++ struct test_sg_division {
++ 	unsigned int proportion_of_total;
++ 	unsigned int offset;
++ 	bool offset_relative_to_alignmask;
++ 	enum flush_type flush_type;
++ 	bool nosimd;
++ };
++ 
++ /**
++  * struct testvec_config - configuration for testing a crypto test vector
++  *
++  * This struct describes the data layout and other parameters with which each
++  * crypto test vector can be tested.
++  *
++  * @name: name of this config, logged for debugging purposes if a test fails
++  * @inplace_mode: whether and how to operate on the data in-place, if applicable
++  * @req_flags: extra request_flags, e.g. CRYPTO_TFM_REQ_MAY_SLEEP
++  * @src_divs: description of how to arrange the source scatterlist
++  * @dst_divs: description of how to arrange the dst scatterlist, if applicable
++  *	      for the algorithm type.  Defaults to @src_divs if unset.
++  * @iv_offset: misalignment of the IV in the range [0..MAX_ALGAPI_ALIGNMASK+1],
++  *	       where 0 is aligned to a 2*(MAX_ALGAPI_ALIGNMASK+1) byte boundary
++  * @iv_offset_relative_to_alignmask: if true, add the algorithm's alignmask to
++  *				     the @iv_offset
++  * @key_offset: misalignment of the key, where 0 is default alignment
++  * @key_offset_relative_to_alignmask: if true, add the algorithm's alignmask to
++  *				      the @key_offset
++  * @finalization_type: what finalization function to use for hashes
++  * @nosimd: execute with SIMD disabled?  Requires !CRYPTO_TFM_REQ_MAY_SLEEP.
++  */
++ struct testvec_config {
++ 	const char *name;
++ 	enum inplace_mode inplace_mode;
++ 	u32 req_flags;
++ 	struct test_sg_division src_divs[XBUFSIZE];
++ 	struct test_sg_division dst_divs[XBUFSIZE];
++ 	unsigned int iv_offset;
++ 	unsigned int key_offset;
++ 	bool iv_offset_relative_to_alignmask;
++ 	bool key_offset_relative_to_alignmask;
++ 	enum finalization_type finalization_type;
++ 	bool nosimd;
++ };
++ 
++ #define TESTVEC_CONFIG_NAMELEN	192
++ 
++ /*
++  * The following are the lists of testvec_configs to test for each algorithm
++  * type when the basic crypto self-tests are enabled, i.e. when
++  * CONFIG_CRYPTO_MANAGER_DISABLE_TESTS is unset.  They aim to provide good test
++  * coverage, while keeping the test time much shorter than the full fuzz tests
++  * so that the basic tests can be enabled in a wider range of circumstances.
++  */
++ 
++ /* Configs for skciphers and aeads */
++ static const struct testvec_config default_cipher_testvec_configs[] = {
++ 	{
++ 		.name = "in-place (one sglist)",
++ 		.inplace_mode = INPLACE_ONE_SGLIST,
++ 		.src_divs = { { .proportion_of_total = 10000 } },
++ 	}, {
++ 		.name = "in-place (two sglists)",
++ 		.inplace_mode = INPLACE_TWO_SGLISTS,
++ 		.src_divs = { { .proportion_of_total = 10000 } },
++ 	}, {
++ 		.name = "out-of-place",
++ 		.inplace_mode = OUT_OF_PLACE,
++ 		.src_divs = { { .proportion_of_total = 10000 } },
++ 	}, {
++ 		.name = "unaligned buffer, offset=1",
++ 		.src_divs = { { .proportion_of_total = 10000, .offset = 1 } },
++ 		.iv_offset = 1,
++ 		.key_offset = 1,
++ 	}, {
++ 		.name = "buffer aligned only to alignmask",
++ 		.src_divs = {
++ 			{
++ 				.proportion_of_total = 10000,
++ 				.offset = 1,
++ 				.offset_relative_to_alignmask = true,
++ 			},
++ 		},
++ 		.iv_offset = 1,
++ 		.iv_offset_relative_to_alignmask = true,
++ 		.key_offset = 1,
++ 		.key_offset_relative_to_alignmask = true,
++ 	}, {
++ 		.name = "two even aligned splits",
++ 		.src_divs = {
++ 			{ .proportion_of_total = 5000 },
++ 			{ .proportion_of_total = 5000 },
++ 		},
++ 	}, {
++ 		.name = "uneven misaligned splits, may sleep",
++ 		.req_flags = CRYPTO_TFM_REQ_MAY_SLEEP,
++ 		.src_divs = {
++ 			{ .proportion_of_total = 1900, .offset = 33 },
++ 			{ .proportion_of_total = 3300, .offset = 7  },
++ 			{ .proportion_of_total = 4800, .offset = 18 },
++ 		},
++ 		.iv_offset = 3,
++ 		.key_offset = 3,
++ 	}, {
++ 		.name = "misaligned splits crossing pages, inplace",
++ 		.inplace_mode = INPLACE_ONE_SGLIST,
++ 		.src_divs = {
++ 			{
++ 				.proportion_of_total = 7500,
++ 				.offset = PAGE_SIZE - 32
++ 			}, {
++ 				.proportion_of_total = 2500,
++ 				.offset = PAGE_SIZE - 7
++ 			},
++ 		},
++ 	}
++ };
++ 
++ static const struct testvec_config default_hash_testvec_configs[] = {
++ 	{
++ 		.name = "init+update+final aligned buffer",
++ 		.src_divs = { { .proportion_of_total = 10000 } },
++ 		.finalization_type = FINALIZATION_TYPE_FINAL,
++ 	}, {
++ 		.name = "init+finup aligned buffer",
++ 		.src_divs = { { .proportion_of_total = 10000 } },
++ 		.finalization_type = FINALIZATION_TYPE_FINUP,
++ 	}, {
++ 		.name = "digest aligned buffer",
++ 		.src_divs = { { .proportion_of_total = 10000 } },
++ 		.finalization_type = FINALIZATION_TYPE_DIGEST,
++ 	}, {
++ 		.name = "init+update+final misaligned buffer",
++ 		.src_divs = { { .proportion_of_total = 10000, .offset = 1 } },
++ 		.finalization_type = FINALIZATION_TYPE_FINAL,
++ 		.key_offset = 1,
++ 	}, {
++ 		.name = "digest buffer aligned only to alignmask",
++ 		.src_divs = {
++ 			{
++ 				.proportion_of_total = 10000,
++ 				.offset = 1,
++ 				.offset_relative_to_alignmask = true,
++ 			},
++ 		},
++ 		.finalization_type = FINALIZATION_TYPE_DIGEST,
++ 		.key_offset = 1,
++ 		.key_offset_relative_to_alignmask = true,
++ 	}, {
++ 		.name = "init+update+update+final two even splits",
++ 		.src_divs = {
++ 			{ .proportion_of_total = 5000 },
++ 			{
++ 				.proportion_of_total = 5000,
++ 				.flush_type = FLUSH_TYPE_FLUSH,
++ 			},
++ 		},
++ 		.finalization_type = FINALIZATION_TYPE_FINAL,
++ 	}, {
++ 		.name = "digest uneven misaligned splits, may sleep",
++ 		.req_flags = CRYPTO_TFM_REQ_MAY_SLEEP,
++ 		.src_divs = {
++ 			{ .proportion_of_total = 1900, .offset = 33 },
++ 			{ .proportion_of_total = 3300, .offset = 7  },
++ 			{ .proportion_of_total = 4800, .offset = 18 },
++ 		},
++ 		.finalization_type = FINALIZATION_TYPE_DIGEST,
++ 	}, {
++ 		.name = "digest misaligned splits crossing pages",
++ 		.src_divs = {
++ 			{
++ 				.proportion_of_total = 7500,
++ 				.offset = PAGE_SIZE - 32,
++ 			}, {
++ 				.proportion_of_total = 2500,
++ 				.offset = PAGE_SIZE - 7,
++ 			},
++ 		},
++ 		.finalization_type = FINALIZATION_TYPE_DIGEST,
++ 	}, {
++ 		.name = "import/export",
++ 		.src_divs = {
++ 			{
++ 				.proportion_of_total = 6500,
++ 				.flush_type = FLUSH_TYPE_REIMPORT,
++ 			}, {
++ 				.proportion_of_total = 3500,
++ 				.flush_type = FLUSH_TYPE_REIMPORT,
++ 			},
++ 		},
++ 		.finalization_type = FINALIZATION_TYPE_FINAL,
++ 	}
++ };
++ 
++ static unsigned int count_test_sg_divisions(const struct test_sg_division *divs)
++ {
++ 	unsigned int remaining = TEST_SG_TOTAL;
++ 	unsigned int ndivs = 0;
++ 
++ 	do {
++ 		remaining -= divs[ndivs++].proportion_of_total;
++ 	} while (remaining);
++ 
++ 	return ndivs;
++ }
++ 
++ #define SGDIVS_HAVE_FLUSHES	BIT(0)
++ #define SGDIVS_HAVE_NOSIMD	BIT(1)
++ 
++ static bool valid_sg_divisions(const struct test_sg_division *divs,
++ 			       unsigned int count, int *flags_ret)
++ {
++ 	unsigned int total = 0;
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < count && total != TEST_SG_TOTAL; i++) {
++ 		if (divs[i].proportion_of_total <= 0 ||
++ 		    divs[i].proportion_of_total > TEST_SG_TOTAL - total)
++ 			return false;
++ 		total += divs[i].proportion_of_total;
++ 		if (divs[i].flush_type != FLUSH_TYPE_NONE)
++ 			*flags_ret |= SGDIVS_HAVE_FLUSHES;
++ 		if (divs[i].nosimd)
++ 			*flags_ret |= SGDIVS_HAVE_NOSIMD;
++ 	}
++ 	return total == TEST_SG_TOTAL &&
++ 		memchr_inv(&divs[i], 0, (count - i) * sizeof(divs[0])) == NULL;
++ }
++ 
++ /*
++  * Check whether the given testvec_config is valid.  This isn't strictly needed
++  * since every testvec_config should be valid, but check anyway so that people
++  * don't unknowingly add broken configs that don't do what they wanted.
++  */
++ static bool valid_testvec_config(const struct testvec_config *cfg)
++ {
++ 	int flags = 0;
++ 
++ 	if (cfg->name == NULL)
++ 		return false;
++ 
++ 	if (!valid_sg_divisions(cfg->src_divs, ARRAY_SIZE(cfg->src_divs),
++ 				&flags))
++ 		return false;
++ 
++ 	if (cfg->dst_divs[0].proportion_of_total) {
++ 		if (!valid_sg_divisions(cfg->dst_divs,
++ 					ARRAY_SIZE(cfg->dst_divs), &flags))
++ 			return false;
++ 	} else {
++ 		if (memchr_inv(cfg->dst_divs, 0, sizeof(cfg->dst_divs)))
++ 			return false;
++ 		/* defaults to dst_divs=src_divs */
++ 	}
++ 
++ 	if (cfg->iv_offset +
++ 	    (cfg->iv_offset_relative_to_alignmask ? MAX_ALGAPI_ALIGNMASK : 0) >
++ 	    MAX_ALGAPI_ALIGNMASK + 1)
++ 		return false;
++ 
++ 	if ((flags & (SGDIVS_HAVE_FLUSHES | SGDIVS_HAVE_NOSIMD)) &&
++ 	    cfg->finalization_type == FINALIZATION_TYPE_DIGEST)
++ 		return false;
++ 
++ 	if ((cfg->nosimd || (flags & SGDIVS_HAVE_NOSIMD)) &&
++ 	    (cfg->req_flags & CRYPTO_TFM_REQ_MAY_SLEEP))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ struct test_sglist {
++ 	char *bufs[XBUFSIZE];
++ 	struct scatterlist sgl[XBUFSIZE];
++ 	struct scatterlist sgl_saved[XBUFSIZE];
++ 	struct scatterlist *sgl_ptr;
++ 	unsigned int nents;
++ };
++ 
++ static int init_test_sglist(struct test_sglist *tsgl)
++ {
++ 	return __testmgr_alloc_buf(tsgl->bufs, 1 /* two pages per buffer */);
++ }
++ 
++ static void destroy_test_sglist(struct test_sglist *tsgl)
++ {
++ 	return __testmgr_free_buf(tsgl->bufs, 1 /* two pages per buffer */);
++ }
++ 
++ /**
++  * build_test_sglist() - build a scatterlist for a crypto test
++  *
++  * @tsgl: the scatterlist to build.  @tsgl->bufs[] contains an array of 2-page
++  *	  buffers which the scatterlist @tsgl->sgl[] will be made to point into.
++  * @divs: the layout specification on which the scatterlist will be based
++  * @alignmask: the algorithm's alignmask
++  * @total_len: the total length of the scatterlist to build in bytes
++  * @data: if non-NULL, the buffers will be filled with this data until it ends.
++  *	  Otherwise the buffers will be poisoned.  In both cases, some bytes
++  *	  past the end of each buffer will be poisoned to help detect overruns.
++  * @out_divs: if non-NULL, the test_sg_division to which each scatterlist entry
++  *	      corresponds will be returned here.  This will match @divs except
++  *	      that divisions resolving to a length of 0 are omitted as they are
++  *	      not included in the scatterlist.
++  *
++  * Return: 0 or a -errno value
++  */
++ static int build_test_sglist(struct test_sglist *tsgl,
++ 			     const struct test_sg_division *divs,
++ 			     const unsigned int alignmask,
++ 			     const unsigned int total_len,
++ 			     struct iov_iter *data,
++ 			     const struct test_sg_division *out_divs[XBUFSIZE])
++ {
++ 	struct {
++ 		const struct test_sg_division *div;
++ 		size_t length;
++ 	} partitions[XBUFSIZE];
++ 	const unsigned int ndivs = count_test_sg_divisions(divs);
++ 	unsigned int len_remaining = total_len;
++ 	unsigned int i;
++ 
++ 	BUILD_BUG_ON(ARRAY_SIZE(partitions) != ARRAY_SIZE(tsgl->sgl));
++ 	if (WARN_ON(ndivs > ARRAY_SIZE(partitions)))
++ 		return -EINVAL;
++ 
++ 	/* Calculate the (div, length) pairs */
++ 	tsgl->nents = 0;
++ 	for (i = 0; i < ndivs; i++) {
++ 		unsigned int len_this_sg =
++ 			min(len_remaining,
++ 			    (total_len * divs[i].proportion_of_total +
++ 			     TEST_SG_TOTAL / 2) / TEST_SG_TOTAL);
++ 
++ 		if (len_this_sg != 0) {
++ 			partitions[tsgl->nents].div = &divs[i];
++ 			partitions[tsgl->nents].length = len_this_sg;
++ 			tsgl->nents++;
++ 			len_remaining -= len_this_sg;
++ 		}
++ 	}
++ 	if (tsgl->nents == 0) {
++ 		partitions[tsgl->nents].div = &divs[0];
++ 		partitions[tsgl->nents].length = 0;
++ 		tsgl->nents++;
++ 	}
++ 	partitions[tsgl->nents - 1].length += len_remaining;
++ 
++ 	/* Set up the sgl entries and fill the data or poison */
++ 	sg_init_table(tsgl->sgl, tsgl->nents);
++ 	for (i = 0; i < tsgl->nents; i++) {
++ 		unsigned int offset = partitions[i].div->offset;
++ 		void *addr;
++ 
++ 		if (partitions[i].div->offset_relative_to_alignmask)
++ 			offset += alignmask;
++ 
++ 		while (offset + partitions[i].length + TESTMGR_POISON_LEN >
++ 		       2 * PAGE_SIZE) {
++ 			if (WARN_ON(offset <= 0))
++ 				return -EINVAL;
++ 			offset /= 2;
++ 		}
++ 
++ 		addr = &tsgl->bufs[i][offset];
++ 		sg_set_buf(&tsgl->sgl[i], addr, partitions[i].length);
++ 
++ 		if (out_divs)
++ 			out_divs[i] = partitions[i].div;
++ 
++ 		if (data) {
++ 			size_t copy_len, copied;
++ 
++ 			copy_len = min(partitions[i].length, data->count);
++ 			copied = copy_from_iter(addr, copy_len, data);
++ 			if (WARN_ON(copied != copy_len))
++ 				return -EINVAL;
++ 			testmgr_poison(addr + copy_len, partitions[i].length +
++ 				       TESTMGR_POISON_LEN - copy_len);
++ 		} else {
++ 			testmgr_poison(addr, partitions[i].length +
++ 				       TESTMGR_POISON_LEN);
++ 		}
++ 	}
++ 
++ 	sg_mark_end(&tsgl->sgl[tsgl->nents - 1]);
++ 	tsgl->sgl_ptr = tsgl->sgl;
++ 	memcpy(tsgl->sgl_saved, tsgl->sgl, tsgl->nents * sizeof(tsgl->sgl[0]));
++ 	return 0;
++ }
++ 
++ /*
++  * Verify that a scatterlist crypto operation produced the correct output.
++  *
++  * @tsgl: scatterlist containing the actual output
++  * @expected_output: buffer containing the expected output
++  * @len_to_check: length of @expected_output in bytes
++  * @unchecked_prefix_len: number of ignored bytes in @tsgl prior to real result
++  * @check_poison: verify that the poison bytes after each chunk are intact?
++  *
++  * Return: 0 if correct, -EINVAL if incorrect, -EOVERFLOW if buffer overrun.
++  */
++ static int verify_correct_output(const struct test_sglist *tsgl,
++ 				 const char *expected_output,
++ 				 unsigned int len_to_check,
++ 				 unsigned int unchecked_prefix_len,
++ 				 bool check_poison)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < tsgl->nents; i++) {
++ 		struct scatterlist *sg = &tsgl->sgl_ptr[i];
++ 		unsigned int len = sg->length;
++ 		unsigned int offset = sg->offset;
++ 		const char *actual_output;
++ 
++ 		if (unchecked_prefix_len) {
++ 			if (unchecked_prefix_len >= len) {
++ 				unchecked_prefix_len -= len;
++ 				continue;
++ 			}
++ 			offset += unchecked_prefix_len;
++ 			len -= unchecked_prefix_len;
++ 			unchecked_prefix_len = 0;
++ 		}
++ 		len = min(len, len_to_check);
++ 		actual_output = page_address(sg_page(sg)) + offset;
++ 		if (memcmp(expected_output, actual_output, len) != 0)
++ 			return -EINVAL;
++ 		if (check_poison &&
++ 		    !testmgr_is_poison(actual_output + len, TESTMGR_POISON_LEN))
++ 			return -EOVERFLOW;
++ 		len_to_check -= len;
++ 		expected_output += len;
++ 	}
++ 	if (WARN_ON(len_to_check != 0))
++ 		return -EINVAL;
++ 	return 0;
++ }
++ 
++ static bool is_test_sglist_corrupted(const struct test_sglist *tsgl)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < tsgl->nents; i++) {
++ 		if (tsgl->sgl[i].page_link != tsgl->sgl_saved[i].page_link)
++ 			return true;
++ 		if (tsgl->sgl[i].offset != tsgl->sgl_saved[i].offset)
++ 			return true;
++ 		if (tsgl->sgl[i].length != tsgl->sgl_saved[i].length)
++ 			return true;
++ 	}
++ 	return false;
++ }
++ 
++ struct cipher_test_sglists {
++ 	struct test_sglist src;
++ 	struct test_sglist dst;
++ };
++ 
++ static struct cipher_test_sglists *alloc_cipher_test_sglists(void)
++ {
++ 	struct cipher_test_sglists *tsgls;
++ 
++ 	tsgls = kmalloc(sizeof(*tsgls), GFP_KERNEL);
++ 	if (!tsgls)
++ 		return NULL;
++ 
++ 	if (init_test_sglist(&tsgls->src) != 0)
++ 		goto fail_kfree;
++ 	if (init_test_sglist(&tsgls->dst) != 0)
++ 		goto fail_destroy_src;
++ 
++ 	return tsgls;
++ 
++ fail_destroy_src:
++ 	destroy_test_sglist(&tsgls->src);
++ fail_kfree:
++ 	kfree(tsgls);
++ 	return NULL;
++ }
++ 
++ static void free_cipher_test_sglists(struct cipher_test_sglists *tsgls)
++ {
++ 	if (tsgls) {
++ 		destroy_test_sglist(&tsgls->src);
++ 		destroy_test_sglist(&tsgls->dst);
++ 		kfree(tsgls);
++ 	}
++ }
++ 
++ /* Build the src and dst scatterlists for an skcipher or AEAD test */
++ static int build_cipher_test_sglists(struct cipher_test_sglists *tsgls,
++ 				     const struct testvec_config *cfg,
++ 				     unsigned int alignmask,
++ 				     unsigned int src_total_len,
++ 				     unsigned int dst_total_len,
++ 				     const struct kvec *inputs,
++ 				     unsigned int nr_inputs)
++ {
++ 	struct iov_iter input;
++ 	int err;
++ 
++ 	iov_iter_kvec(&input, WRITE, inputs, nr_inputs, src_total_len);
++ 	err = build_test_sglist(&tsgls->src, cfg->src_divs, alignmask,
++ 				cfg->inplace_mode != OUT_OF_PLACE ?
++ 					max(dst_total_len, src_total_len) :
++ 					src_total_len,
++ 				&input, NULL);
++ 	if (err)
++ 		return err;
++ 
++ 	/*
++ 	 * In-place crypto operations can use the same scatterlist for both the
++ 	 * source and destination (req->src == req->dst), or can use separate
++ 	 * scatterlists (req->src != req->dst) which point to the same
++ 	 * underlying memory.  Make sure to test both cases.
++ 	 */
++ 	if (cfg->inplace_mode == INPLACE_ONE_SGLIST) {
++ 		tsgls->dst.sgl_ptr = tsgls->src.sgl;
++ 		tsgls->dst.nents = tsgls->src.nents;
++ 		return 0;
++ 	}
++ 	if (cfg->inplace_mode == INPLACE_TWO_SGLISTS) {
++ 		/*
++ 		 * For now we keep it simple and only test the case where the
++ 		 * two scatterlists have identical entries, rather than
++ 		 * different entries that split up the same memory differently.
++ 		 */
++ 		memcpy(tsgls->dst.sgl, tsgls->src.sgl,
++ 		       tsgls->src.nents * sizeof(tsgls->src.sgl[0]));
++ 		memcpy(tsgls->dst.sgl_saved, tsgls->src.sgl,
++ 		       tsgls->src.nents * sizeof(tsgls->src.sgl[0]));
++ 		tsgls->dst.sgl_ptr = tsgls->dst.sgl;
++ 		tsgls->dst.nents = tsgls->src.nents;
++ 		return 0;
++ 	}
++ 	/* Out of place */
++ 	return build_test_sglist(&tsgls->dst,
++ 				 cfg->dst_divs[0].proportion_of_total ?
++ 					cfg->dst_divs : cfg->src_divs,
++ 				 alignmask, dst_total_len, NULL, NULL);
++ }
++ 
++ /*
++  * Support for testing passing a misaligned key to setkey():
++  *
++  * If cfg->key_offset is set, copy the key into a new buffer at that offset,
++  * optionally adding alignmask.  Else, just use the key directly.
++  */
++ static int prepare_keybuf(const u8 *key, unsigned int ksize,
++ 			  const struct testvec_config *cfg,
++ 			  unsigned int alignmask,
++ 			  const u8 **keybuf_ret, const u8 **keyptr_ret)
++ {
++ 	unsigned int key_offset = cfg->key_offset;
++ 	u8 *keybuf = NULL, *keyptr = (u8 *)key;
++ 
++ 	if (key_offset != 0) {
++ 		if (cfg->key_offset_relative_to_alignmask)
++ 			key_offset += alignmask;
++ 		keybuf = kmalloc(key_offset + ksize, GFP_KERNEL);
++ 		if (!keybuf)
++ 			return -ENOMEM;
++ 		keyptr = keybuf + key_offset;
++ 		memcpy(keyptr, key, ksize);
++ 	}
++ 	*keybuf_ret = keybuf;
++ 	*keyptr_ret = keyptr;
++ 	return 0;
++ }
++ 
++ /* Like setkey_f(tfm, key, ksize), but sometimes misalign the key */
++ #define do_setkey(setkey_f, tfm, key, ksize, cfg, alignmask)		\
++ ({									\
++ 	const u8 *keybuf, *keyptr;					\
++ 	int err;							\
++ 									\
++ 	err = prepare_keybuf((key), (ksize), (cfg), (alignmask),	\
++ 			     &keybuf, &keyptr);				\
++ 	if (err == 0) {							\
++ 		err = setkey_f((tfm), keyptr, (ksize));			\
++ 		kfree(keybuf);						\
++ 	}								\
++ 	err;								\
++ })
++ 
++ #ifdef CONFIG_CRYPTO_MANAGER_EXTRA_TESTS
++ 
++ /* Generate a random length in range [0, max_len], but prefer smaller values */
++ static unsigned int generate_random_length(unsigned int max_len)
++ {
++ 	unsigned int len = prandom_u32_max(max_len + 1);
++ 
++ 	switch (prandom_u32_max(4)) {
++ 	case 0:
++ 		return len % 64;
++ 	case 1:
++ 		return len % 256;
++ 	case 2:
++ 		return len % 1024;
++ 	default:
++ 		return len;
++ 	}
++ }
++ 
++ /* Flip a random bit in the given nonempty data buffer */
++ static void flip_random_bit(u8 *buf, size_t size)
++ {
++ 	size_t bitpos;
++ 
++ 	bitpos = prandom_u32_max(size * 8);
++ 	buf[bitpos / 8] ^= 1 << (bitpos % 8);
++ }
++ 
++ /* Flip a random byte in the given nonempty data buffer */
++ static void flip_random_byte(u8 *buf, size_t size)
++ {
++ 	buf[prandom_u32_max(size)] ^= 0xff;
++ }
++ 
++ /* Sometimes make some random changes to the given nonempty data buffer */
++ static void mutate_buffer(u8 *buf, size_t size)
++ {
++ 	size_t num_flips;
++ 	size_t i;
++ 
++ 	/* Sometimes flip some bits */
++ 	if (prandom_u32_max(4) == 0) {
++ 		num_flips = min_t(size_t, 1 << prandom_u32_max(8), size * 8);
++ 		for (i = 0; i < num_flips; i++)
++ 			flip_random_bit(buf, size);
++ 	}
++ 
++ 	/* Sometimes flip some bytes */
++ 	if (prandom_u32_max(4) == 0) {
++ 		num_flips = min_t(size_t, 1 << prandom_u32_max(8), size);
++ 		for (i = 0; i < num_flips; i++)
++ 			flip_random_byte(buf, size);
++ 	}
++ }
++ 
++ /* Randomly generate 'count' bytes, but sometimes make them "interesting" */
++ static void generate_random_bytes(u8 *buf, size_t count)
++ {
++ 	u8 b;
++ 	u8 increment;
++ 	size_t i;
++ 
++ 	if (count == 0)
++ 		return;
++ 
++ 	switch (prandom_u32_max(8)) { /* Choose a generation strategy */
++ 	case 0:
++ 	case 1:
++ 		/* All the same byte, plus optional mutations */
++ 		switch (prandom_u32_max(4)) {
++ 		case 0:
++ 			b = 0x00;
++ 			break;
++ 		case 1:
++ 			b = 0xff;
++ 			break;
++ 		default:
++ 			b = (u8)prandom_u32();
++ 			break;
++ 		}
++ 		memset(buf, b, count);
++ 		mutate_buffer(buf, count);
++ 		break;
++ 	case 2:
++ 		/* Ascending or descending bytes, plus optional mutations */
++ 		increment = (u8)prandom_u32();
++ 		b = (u8)prandom_u32();
++ 		for (i = 0; i < count; i++, b += increment)
++ 			buf[i] = b;
++ 		mutate_buffer(buf, count);
++ 		break;
++ 	default:
++ 		/* Fully random bytes */
++ 		for (i = 0; i < count; i++)
++ 			buf[i] = (u8)prandom_u32();
++ 	}
++ }
++ 
++ static char *generate_random_sgl_divisions(struct test_sg_division *divs,
++ 					   size_t max_divs, char *p, char *end,
++ 					   bool gen_flushes, u32 req_flags)
++ {
++ 	struct test_sg_division *div = divs;
++ 	unsigned int remaining = TEST_SG_TOTAL;
++ 
++ 	do {
++ 		unsigned int this_len;
++ 		const char *flushtype_str;
++ 
++ 		if (div == &divs[max_divs - 1] || prandom_u32_max(2) == 0)
++ 			this_len = remaining;
++ 		else
++ 			this_len = 1 + prandom_u32_max(remaining);
++ 		div->proportion_of_total = this_len;
++ 
++ 		if (prandom_u32_max(4) == 0)
++ 			div->offset = (PAGE_SIZE - 128) + prandom_u32_max(128);
++ 		else if (prandom_u32_max(2) == 0)
++ 			div->offset = prandom_u32_max(32);
++ 		else
++ 			div->offset = prandom_u32_max(PAGE_SIZE);
++ 		if (prandom_u32_max(8) == 0)
++ 			div->offset_relative_to_alignmask = true;
++ 
++ 		div->flush_type = FLUSH_TYPE_NONE;
++ 		if (gen_flushes) {
++ 			switch (prandom_u32_max(4)) {
++ 			case 0:
++ 				div->flush_type = FLUSH_TYPE_REIMPORT;
++ 				break;
++ 			case 1:
++ 				div->flush_type = FLUSH_TYPE_FLUSH;
++ 				break;
++ 			}
++ 		}
++ 
++ 		if (div->flush_type != FLUSH_TYPE_NONE &&
++ 		    !(req_flags & CRYPTO_TFM_REQ_MAY_SLEEP) &&
++ 		    prandom_u32_max(2) == 0)
++ 			div->nosimd = true;
++ 
++ 		switch (div->flush_type) {
++ 		case FLUSH_TYPE_FLUSH:
++ 			if (div->nosimd)
++ 				flushtype_str = "<flush,nosimd>";
++ 			else
++ 				flushtype_str = "<flush>";
++ 			break;
++ 		case FLUSH_TYPE_REIMPORT:
++ 			if (div->nosimd)
++ 				flushtype_str = "<reimport,nosimd>";
++ 			else
++ 				flushtype_str = "<reimport>";
++ 			break;
++ 		default:
++ 			flushtype_str = "";
++ 			break;
++ 		}
++ 
++ 		BUILD_BUG_ON(TEST_SG_TOTAL != 10000); /* for "%u.%u%%" */
++ 		p += scnprintf(p, end - p, "%s%u.%u%%@%s+%u%s", flushtype_str,
++ 			       this_len / 100, this_len % 100,
++ 			       div->offset_relative_to_alignmask ?
++ 					"alignmask" : "",
++ 			       div->offset, this_len == remaining ? "" : ", ");
++ 		remaining -= this_len;
++ 		div++;
++ 	} while (remaining);
++ 
++ 	return p;
++ }
++ 
++ /* Generate a random testvec_config for fuzz testing */
++ static void generate_random_testvec_config(struct testvec_config *cfg,
++ 					   char *name, size_t max_namelen)
++ {
++ 	char *p = name;
++ 	char * const end = name + max_namelen;
++ 
++ 	memset(cfg, 0, sizeof(*cfg));
++ 
++ 	cfg->name = name;
++ 
++ 	p += scnprintf(p, end - p, "random:");
++ 
++ 	switch (prandom_u32_max(4)) {
++ 	case 0:
++ 	case 1:
++ 		cfg->inplace_mode = OUT_OF_PLACE;
++ 		break;
++ 	case 2:
++ 		cfg->inplace_mode = INPLACE_ONE_SGLIST;
++ 		p += scnprintf(p, end - p, " inplace_one_sglist");
++ 		break;
++ 	default:
++ 		cfg->inplace_mode = INPLACE_TWO_SGLISTS;
++ 		p += scnprintf(p, end - p, " inplace_two_sglists");
++ 		break;
++ 	}
++ 
++ 	if (prandom_u32_max(2) == 0) {
++ 		cfg->req_flags |= CRYPTO_TFM_REQ_MAY_SLEEP;
++ 		p += scnprintf(p, end - p, " may_sleep");
++ 	}
++ 
++ 	switch (prandom_u32_max(4)) {
++ 	case 0:
++ 		cfg->finalization_type = FINALIZATION_TYPE_FINAL;
++ 		p += scnprintf(p, end - p, " use_final");
++ 		break;
++ 	case 1:
++ 		cfg->finalization_type = FINALIZATION_TYPE_FINUP;
++ 		p += scnprintf(p, end - p, " use_finup");
++ 		break;
++ 	default:
++ 		cfg->finalization_type = FINALIZATION_TYPE_DIGEST;
++ 		p += scnprintf(p, end - p, " use_digest");
++ 		break;
++ 	}
++ 
++ 	if (!(cfg->req_flags & CRYPTO_TFM_REQ_MAY_SLEEP) &&
++ 	    prandom_u32_max(2) == 0) {
++ 		cfg->nosimd = true;
++ 		p += scnprintf(p, end - p, " nosimd");
++ 	}
++ 
++ 	p += scnprintf(p, end - p, " src_divs=[");
++ 	p = generate_random_sgl_divisions(cfg->src_divs,
++ 					  ARRAY_SIZE(cfg->src_divs), p, end,
++ 					  (cfg->finalization_type !=
++ 					   FINALIZATION_TYPE_DIGEST),
++ 					  cfg->req_flags);
++ 	p += scnprintf(p, end - p, "]");
++ 
++ 	if (cfg->inplace_mode == OUT_OF_PLACE && prandom_u32_max(2) == 0) {
++ 		p += scnprintf(p, end - p, " dst_divs=[");
++ 		p = generate_random_sgl_divisions(cfg->dst_divs,
++ 						  ARRAY_SIZE(cfg->dst_divs),
++ 						  p, end, false,
++ 						  cfg->req_flags);
++ 		p += scnprintf(p, end - p, "]");
++ 	}
++ 
++ 	if (prandom_u32_max(2) == 0) {
++ 		cfg->iv_offset = 1 + prandom_u32_max(MAX_ALGAPI_ALIGNMASK);
++ 		p += scnprintf(p, end - p, " iv_offset=%u", cfg->iv_offset);
++ 	}
++ 
++ 	if (prandom_u32_max(2) == 0) {
++ 		cfg->key_offset = 1 + prandom_u32_max(MAX_ALGAPI_ALIGNMASK);
++ 		p += scnprintf(p, end - p, " key_offset=%u", cfg->key_offset);
++ 	}
++ 
++ 	WARN_ON_ONCE(!valid_testvec_config(cfg));
++ }
++ 
++ static void crypto_disable_simd_for_test(void)
++ {
++ 	migrate_disable();
++ 	__this_cpu_write(crypto_simd_disabled_for_test, true);
++ }
++ 
++ static void crypto_reenable_simd_for_test(void)
++ {
++ 	__this_cpu_write(crypto_simd_disabled_for_test, false);
++ 	migrate_enable();
++ }
++ 
++ /*
++  * Given an algorithm name, build the name of the generic implementation of that
++  * algorithm, assuming the usual naming convention.  Specifically, this appends
++  * "-generic" to every part of the name that is not a template name.  Examples:
++  *
++  *	aes => aes-generic
++  *	cbc(aes) => cbc(aes-generic)
++  *	cts(cbc(aes)) => cts(cbc(aes-generic))
++  *	rfc7539(chacha20,poly1305) => rfc7539(chacha20-generic,poly1305-generic)
++  *
++  * Return: 0 on success, or -ENAMETOOLONG if the generic name would be too long
++  */
++ static int build_generic_driver_name(const char *algname,
++ 				     char driver_name[CRYPTO_MAX_ALG_NAME])
++ {
++ 	const char *in = algname;
++ 	char *out = driver_name;
++ 	size_t len = strlen(algname);
++ 
++ 	if (len >= CRYPTO_MAX_ALG_NAME)
++ 		goto too_long;
++ 	do {
++ 		const char *in_saved = in;
++ 
++ 		while (*in && *in != '(' && *in != ')' && *in != ',')
++ 			*out++ = *in++;
++ 		if (*in != '(' && in > in_saved) {
++ 			len += 8;
++ 			if (len >= CRYPTO_MAX_ALG_NAME)
++ 				goto too_long;
++ 			memcpy(out, "-generic", 8);
++ 			out += 8;
++ 		}
++ 	} while ((*out++ = *in++) != '\0');
++ 	return 0;
++ 
++ too_long:
++ 	pr_err("alg: generic driver name for \"%s\" would be too long\n",
++ 	       algname);
++ 	return -ENAMETOOLONG;
++ }
++ #else /* !CONFIG_CRYPTO_MANAGER_EXTRA_TESTS */
++ static void crypto_disable_simd_for_test(void)
++ {
++ }
++ 
++ static void crypto_reenable_simd_for_test(void)
++ {
++ }
++ #endif /* !CONFIG_CRYPTO_MANAGER_EXTRA_TESTS */
++ 
++ static int build_hash_sglist(struct test_sglist *tsgl,
++ 			     const struct hash_testvec *vec,
++ 			     const struct testvec_config *cfg,
++ 			     unsigned int alignmask,
++ 			     const struct test_sg_division *divs[XBUFSIZE])
++ {
++ 	struct kvec kv;
++ 	struct iov_iter input;
++ 
++ 	kv.iov_base = (void *)vec->plaintext;
++ 	kv.iov_len = vec->psize;
++ 	iov_iter_kvec(&input, WRITE, &kv, 1, vec->psize);
++ 	return build_test_sglist(tsgl, cfg->src_divs, alignmask, vec->psize,
++ 				 &input, divs);
++ }
++ 
++ static int check_hash_result(const char *type,
++ 			     const u8 *result, unsigned int digestsize,
++ 			     const struct hash_testvec *vec,
++ 			     const char *vec_name,
++ 			     const char *driver,
++ 			     const struct testvec_config *cfg)
++ {
++ 	if (memcmp(result, vec->digest, digestsize) != 0) {
++ 		pr_err("alg: %s: %s test failed (wrong result) on test vector %s, cfg=\"%s\"\n",
++ 		       type, driver, vec_name, cfg->name);
++ 		return -EINVAL;
++ 	}
++ 	if (!testmgr_is_poison(&result[digestsize], TESTMGR_POISON_LEN)) {
++ 		pr_err("alg: %s: %s overran result buffer on test vector %s, cfg=\"%s\"\n",
++ 		       type, driver, vec_name, cfg->name);
++ 		return -EOVERFLOW;
++ 	}
++ 	return 0;
++ }
++ 
++ static inline int check_shash_op(const char *op, int err,
++ 				 const char *driver, const char *vec_name,
++ 				 const struct testvec_config *cfg)
++ {
++ 	if (err)
++ 		pr_err("alg: shash: %s %s() failed with err %d on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, err, vec_name, cfg->name);
++ 	return err;
++ }
++ 
++ /* Test one hash test vector in one configuration, using the shash API */
++ static int test_shash_vec_cfg(const struct hash_testvec *vec,
++ 			      const char *vec_name,
++ 			      const struct testvec_config *cfg,
++ 			      struct shash_desc *desc,
++ 			      struct test_sglist *tsgl,
++ 			      u8 *hashstate)
++ {
++ 	struct crypto_shash *tfm = desc->tfm;
++ 	const unsigned int alignmask = crypto_shash_alignmask(tfm);
++ 	const unsigned int digestsize = crypto_shash_digestsize(tfm);
++ 	const unsigned int statesize = crypto_shash_statesize(tfm);
++ 	const char *driver = crypto_shash_driver_name(tfm);
++ 	const struct test_sg_division *divs[XBUFSIZE];
++ 	unsigned int i;
++ 	u8 result[HASH_MAX_DIGESTSIZE + TESTMGR_POISON_LEN];
++ 	int err;
++ 
++ 	/* Set the key, if specified */
++ 	if (vec->ksize) {
++ 		err = do_setkey(crypto_shash_setkey, tfm, vec->key, vec->ksize,
++ 				cfg, alignmask);
++ 		if (err) {
++ 			if (err == vec->setkey_error)
++ 				return 0;
++ 			pr_err("alg: shash: %s setkey failed on test vector %s; expected_error=%d, actual_error=%d, flags=%#x\n",
++ 			       driver, vec_name, vec->setkey_error, err,
++ 			       crypto_shash_get_flags(tfm));
++ 			return err;
++ 		}
++ 		if (vec->setkey_error) {
++ 			pr_err("alg: shash: %s setkey unexpectedly succeeded on test vector %s; expected_error=%d\n",
++ 			       driver, vec_name, vec->setkey_error);
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	/* Build the scatterlist for the source data */
++ 	err = build_hash_sglist(tsgl, vec, cfg, alignmask, divs);
++ 	if (err) {
++ 		pr_err("alg: shash: %s: error preparing scatterlist for test vector %s, cfg=\"%s\"\n",
++ 		       driver, vec_name, cfg->name);
++ 		return err;
++ 	}
++ 
++ 	/* Do the actual hashing */
++ 
++ 	testmgr_poison(desc->__ctx, crypto_shash_descsize(tfm));
++ 	testmgr_poison(result, digestsize + TESTMGR_POISON_LEN);
++ 
++ 	if (cfg->finalization_type == FINALIZATION_TYPE_DIGEST ||
++ 	    vec->digest_error) {
++ 		/* Just using digest() */
++ 		if (tsgl->nents != 1)
++ 			return 0;
++ 		if (cfg->nosimd)
++ 			crypto_disable_simd_for_test();
++ 		err = crypto_shash_digest(desc, sg_virt(&tsgl->sgl[0]),
++ 					  tsgl->sgl[0].length, result);
++ 		if (cfg->nosimd)
++ 			crypto_reenable_simd_for_test();
++ 		if (err) {
++ 			if (err == vec->digest_error)
++ 				return 0;
++ 			pr_err("alg: shash: %s digest() failed on test vector %s; expected_error=%d, actual_error=%d, cfg=\"%s\"\n",
++ 			       driver, vec_name, vec->digest_error, err,
++ 			       cfg->name);
++ 			return err;
++ 		}
++ 		if (vec->digest_error) {
++ 			pr_err("alg: shash: %s digest() unexpectedly succeeded on test vector %s; expected_error=%d, cfg=\"%s\"\n",
++ 			       driver, vec_name, vec->digest_error, cfg->name);
++ 			return -EINVAL;
++ 		}
++ 		goto result_ready;
++ 	}
++ 
++ 	/* Using init(), zero or more update(), then final() or finup() */
++ 
++ 	if (cfg->nosimd)
++ 		crypto_disable_simd_for_test();
++ 	err = crypto_shash_init(desc);
++ 	if (cfg->nosimd)
++ 		crypto_reenable_simd_for_test();
++ 	err = check_shash_op("init", err, driver, vec_name, cfg);
++ 	if (err)
++ 		return err;
++ 
++ 	for (i = 0; i < tsgl->nents; i++) {
++ 		if (i + 1 == tsgl->nents &&
++ 		    cfg->finalization_type == FINALIZATION_TYPE_FINUP) {
++ 			if (divs[i]->nosimd)
++ 				crypto_disable_simd_for_test();
++ 			err = crypto_shash_finup(desc, sg_virt(&tsgl->sgl[i]),
++ 						 tsgl->sgl[i].length, result);
++ 			if (divs[i]->nosimd)
++ 				crypto_reenable_simd_for_test();
++ 			err = check_shash_op("finup", err, driver, vec_name,
++ 					     cfg);
++ 			if (err)
++ 				return err;
++ 			goto result_ready;
++ 		}
++ 		if (divs[i]->nosimd)
++ 			crypto_disable_simd_for_test();
++ 		err = crypto_shash_update(desc, sg_virt(&tsgl->sgl[i]),
++ 					  tsgl->sgl[i].length);
++ 		if (divs[i]->nosimd)
++ 			crypto_reenable_simd_for_test();
++ 		err = check_shash_op("update", err, driver, vec_name, cfg);
++ 		if (err)
++ 			return err;
++ 		if (divs[i]->flush_type == FLUSH_TYPE_REIMPORT) {
++ 			/* Test ->export() and ->import() */
++ 			testmgr_poison(hashstate + statesize,
++ 				       TESTMGR_POISON_LEN);
++ 			err = crypto_shash_export(desc, hashstate);
++ 			err = check_shash_op("export", err, driver, vec_name,
++ 					     cfg);
++ 			if (err)
++ 				return err;
++ 			if (!testmgr_is_poison(hashstate + statesize,
++ 					       TESTMGR_POISON_LEN)) {
++ 				pr_err("alg: shash: %s export() overran state buffer on test vector %s, cfg=\"%s\"\n",
++ 				       driver, vec_name, cfg->name);
++ 				return -EOVERFLOW;
++ 			}
++ 			testmgr_poison(desc->__ctx, crypto_shash_descsize(tfm));
++ 			err = crypto_shash_import(desc, hashstate);
++ 			err = check_shash_op("import", err, driver, vec_name,
++ 					     cfg);
++ 			if (err)
++ 				return err;
++ 		}
++ 	}
++ 
++ 	if (cfg->nosimd)
++ 		crypto_disable_simd_for_test();
++ 	err = crypto_shash_final(desc, result);
++ 	if (cfg->nosimd)
++ 		crypto_reenable_simd_for_test();
++ 	err = check_shash_op("final", err, driver, vec_name, cfg);
++ 	if (err)
++ 		return err;
++ result_ready:
++ 	return check_hash_result("shash", result, digestsize, vec, vec_name,
++ 				 driver, cfg);
++ }
++ 
++ static int do_ahash_op(int (*op)(struct ahash_request *req),
++ 		       struct ahash_request *req,
++ 		       struct crypto_wait *wait, bool nosimd)
++ {
++ 	int err;
++ 
++ 	if (nosimd)
++ 		crypto_disable_simd_for_test();
++ 
++ 	err = op(req);
++ 
++ 	if (nosimd)
++ 		crypto_reenable_simd_for_test();
++ 
++ 	return crypto_wait_req(err, wait);
++ }
++ 
++ static int check_nonfinal_ahash_op(const char *op, int err,
++ 				   u8 *result, unsigned int digestsize,
++ 				   const char *driver, const char *vec_name,
++ 				   const struct testvec_config *cfg)
++ {
++ 	if (err) {
++ 		pr_err("alg: ahash: %s %s() failed with err %d on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, err, vec_name, cfg->name);
++ 		return err;
++ 	}
++ 	if (!testmgr_is_poison(result, digestsize)) {
++ 		pr_err("alg: ahash: %s %s() used result buffer on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		return -EINVAL;
++ 	}
++ 	return 0;
++ }
++ 
++ /* Test one hash test vector in one configuration, using the ahash API */
++ static int test_ahash_vec_cfg(const struct hash_testvec *vec,
++ 			      const char *vec_name,
++ 			      const struct testvec_config *cfg,
++ 			      struct ahash_request *req,
++ 			      struct test_sglist *tsgl,
++ 			      u8 *hashstate)
++ {
++ 	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
++ 	const unsigned int alignmask = crypto_ahash_alignmask(tfm);
++ 	const unsigned int digestsize = crypto_ahash_digestsize(tfm);
++ 	const unsigned int statesize = crypto_ahash_statesize(tfm);
++ 	const char *driver = crypto_ahash_driver_name(tfm);
++ 	const u32 req_flags = CRYPTO_TFM_REQ_MAY_BACKLOG | cfg->req_flags;
++ 	const struct test_sg_division *divs[XBUFSIZE];
++ 	DECLARE_CRYPTO_WAIT(wait);
++ 	unsigned int i;
++ 	struct scatterlist *pending_sgl;
++ 	unsigned int pending_len;
++ 	u8 result[HASH_MAX_DIGESTSIZE + TESTMGR_POISON_LEN];
++ 	int err;
++ 
++ 	/* Set the key, if specified */
++ 	if (vec->ksize) {
++ 		err = do_setkey(crypto_ahash_setkey, tfm, vec->key, vec->ksize,
++ 				cfg, alignmask);
++ 		if (err) {
++ 			if (err == vec->setkey_error)
++ 				return 0;
++ 			pr_err("alg: ahash: %s setkey failed on test vector %s; expected_error=%d, actual_error=%d, flags=%#x\n",
++ 			       driver, vec_name, vec->setkey_error, err,
++ 			       crypto_ahash_get_flags(tfm));
++ 			return err;
++ 		}
++ 		if (vec->setkey_error) {
++ 			pr_err("alg: ahash: %s setkey unexpectedly succeeded on test vector %s; expected_error=%d\n",
++ 			       driver, vec_name, vec->setkey_error);
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	/* Build the scatterlist for the source data */
++ 	err = build_hash_sglist(tsgl, vec, cfg, alignmask, divs);
++ 	if (err) {
++ 		pr_err("alg: ahash: %s: error preparing scatterlist for test vector %s, cfg=\"%s\"\n",
++ 		       driver, vec_name, cfg->name);
++ 		return err;
++ 	}
++ 
++ 	/* Do the actual hashing */
++ 
++ 	testmgr_poison(req->__ctx, crypto_ahash_reqsize(tfm));
++ 	testmgr_poison(result, digestsize + TESTMGR_POISON_LEN);
++ 
++ 	if (cfg->finalization_type == FINALIZATION_TYPE_DIGEST ||
++ 	    vec->digest_error) {
++ 		/* Just using digest() */
++ 		ahash_request_set_callback(req, req_flags, crypto_req_done,
++ 					   &wait);
++ 		ahash_request_set_crypt(req, tsgl->sgl, result, vec->psize);
++ 		err = do_ahash_op(crypto_ahash_digest, req, &wait, cfg->nosimd);
++ 		if (err) {
++ 			if (err == vec->digest_error)
++ 				return 0;
++ 			pr_err("alg: ahash: %s digest() failed on test vector %s; expected_error=%d, actual_error=%d, cfg=\"%s\"\n",
++ 			       driver, vec_name, vec->digest_error, err,
++ 			       cfg->name);
++ 			return err;
++ 		}
++ 		if (vec->digest_error) {
++ 			pr_err("alg: ahash: %s digest() unexpectedly succeeded on test vector %s; expected_error=%d, cfg=\"%s\"\n",
++ 			       driver, vec_name, vec->digest_error, cfg->name);
++ 			return -EINVAL;
++ 		}
++ 		goto result_ready;
++ 	}
++ 
++ 	/* Using init(), zero or more update(), then final() or finup() */
++ 
++ 	ahash_request_set_callback(req, req_flags, crypto_req_done, &wait);
++ 	ahash_request_set_crypt(req, NULL, result, 0);
++ 	err = do_ahash_op(crypto_ahash_init, req, &wait, cfg->nosimd);
++ 	err = check_nonfinal_ahash_op("init", err, result, digestsize,
++ 				      driver, vec_name, cfg);
++ 	if (err)
++ 		return err;
++ 
++ 	pending_sgl = NULL;
++ 	pending_len = 0;
++ 	for (i = 0; i < tsgl->nents; i++) {
++ 		if (divs[i]->flush_type != FLUSH_TYPE_NONE &&
++ 		    pending_sgl != NULL) {
++ 			/* update() with the pending data */
++ 			ahash_request_set_callback(req, req_flags,
++ 						   crypto_req_done, &wait);
++ 			ahash_request_set_crypt(req, pending_sgl, result,
++ 						pending_len);
++ 			err = do_ahash_op(crypto_ahash_update, req, &wait,
++ 					  divs[i]->nosimd);
++ 			err = check_nonfinal_ahash_op("update", err,
++ 						      result, digestsize,
++ 						      driver, vec_name, cfg);
++ 			if (err)
++ 				return err;
++ 			pending_sgl = NULL;
++ 			pending_len = 0;
++ 		}
++ 		if (divs[i]->flush_type == FLUSH_TYPE_REIMPORT) {
++ 			/* Test ->export() and ->import() */
++ 			testmgr_poison(hashstate + statesize,
++ 				       TESTMGR_POISON_LEN);
++ 			err = crypto_ahash_export(req, hashstate);
++ 			err = check_nonfinal_ahash_op("export", err,
++ 						      result, digestsize,
++ 						      driver, vec_name, cfg);
++ 			if (err)
++ 				return err;
++ 			if (!testmgr_is_poison(hashstate + statesize,
++ 					       TESTMGR_POISON_LEN)) {
++ 				pr_err("alg: ahash: %s export() overran state buffer on test vector %s, cfg=\"%s\"\n",
++ 				       driver, vec_name, cfg->name);
++ 				return -EOVERFLOW;
++ 			}
++ 
++ 			testmgr_poison(req->__ctx, crypto_ahash_reqsize(tfm));
++ 			err = crypto_ahash_import(req, hashstate);
++ 			err = check_nonfinal_ahash_op("import", err,
++ 						      result, digestsize,
++ 						      driver, vec_name, cfg);
++ 			if (err)
++ 				return err;
++ 		}
++ 		if (pending_sgl == NULL)
++ 			pending_sgl = &tsgl->sgl[i];
++ 		pending_len += tsgl->sgl[i].length;
++ 	}
++ 
++ 	ahash_request_set_callback(req, req_flags, crypto_req_done, &wait);
++ 	ahash_request_set_crypt(req, pending_sgl, result, pending_len);
++ 	if (cfg->finalization_type == FINALIZATION_TYPE_FINAL) {
++ 		/* finish with update() and final() */
++ 		err = do_ahash_op(crypto_ahash_update, req, &wait, cfg->nosimd);
++ 		err = check_nonfinal_ahash_op("update", err, result, digestsize,
++ 					      driver, vec_name, cfg);
++ 		if (err)
++ 			return err;
++ 		err = do_ahash_op(crypto_ahash_final, req, &wait, cfg->nosimd);
++ 		if (err) {
++ 			pr_err("alg: ahash: %s final() failed with err %d on test vector %s, cfg=\"%s\"\n",
++ 			       driver, err, vec_name, cfg->name);
++ 			return err;
++ 		}
++ 	} else {
++ 		/* finish with finup() */
++ 		err = do_ahash_op(crypto_ahash_finup, req, &wait, cfg->nosimd);
++ 		if (err) {
++ 			pr_err("alg: ahash: %s finup() failed with err %d on test vector %s, cfg=\"%s\"\n",
++ 			       driver, err, vec_name, cfg->name);
++ 			return err;
++ 		}
++ 	}
++ 
++ result_ready:
++ 	return check_hash_result("ahash", result, digestsize, vec, vec_name,
++ 				 driver, cfg);
++ }
++ 
++ static int test_hash_vec_cfg(const struct hash_testvec *vec,
++ 			     const char *vec_name,
++ 			     const struct testvec_config *cfg,
++ 			     struct ahash_request *req,
++ 			     struct shash_desc *desc,
++ 			     struct test_sglist *tsgl,
++ 			     u8 *hashstate)
++ {
++ 	int err;
++ 
++ 	/*
++ 	 * For algorithms implemented as "shash", most bugs will be detected by
++ 	 * both the shash and ahash tests.  Test the shash API first so that the
++ 	 * failures involve less indirection, so are easier to debug.
++ 	 */
++ 
++ 	if (desc) {
++ 		err = test_shash_vec_cfg(vec, vec_name, cfg, desc, tsgl,
++ 					 hashstate);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	return test_ahash_vec_cfg(vec, vec_name, cfg, req, tsgl, hashstate);
++ }
++ 
++ static int test_hash_vec(const struct hash_testvec *vec, unsigned int vec_num,
++ 			 struct ahash_request *req, struct shash_desc *desc,
++ 			 struct test_sglist *tsgl, u8 *hashstate)
++ {
++ 	char vec_name[16];
++ 	unsigned int i;
++ 	int err;
++ 
++ 	sprintf(vec_name, "%u", vec_num);
++ 
++ 	for (i = 0; i < ARRAY_SIZE(default_hash_testvec_configs); i++) {
++ 		err = test_hash_vec_cfg(vec, vec_name,
++ 					&default_hash_testvec_configs[i],
++ 					req, desc, tsgl, hashstate);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ #ifdef CONFIG_CRYPTO_MANAGER_EXTRA_TESTS
++ 	if (!noextratests) {
++ 		struct testvec_config cfg;
++ 		char cfgname[TESTVEC_CONFIG_NAMELEN];
++ 
++ 		for (i = 0; i < fuzz_iterations; i++) {
++ 			generate_random_testvec_config(&cfg, cfgname,
++ 						       sizeof(cfgname));
++ 			err = test_hash_vec_cfg(vec, vec_name, &cfg,
++ 						req, desc, tsgl, hashstate);
++ 			if (err)
++ 				return err;
++ 			cond_resched();
++ 		}
++ 	}
++ #endif
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_CRYPTO_MANAGER_EXTRA_TESTS
++ /*
++  * Generate a hash test vector from the given implementation.
++  * Assumes the buffers in 'vec' were already allocated.
++  */
++ static void generate_random_hash_testvec(struct shash_desc *desc,
++ 					 struct hash_testvec *vec,
++ 					 unsigned int maxkeysize,
++ 					 unsigned int maxdatasize,
++ 					 char *name, size_t max_namelen)
++ {
++ 	/* Data */
++ 	vec->psize = generate_random_length(maxdatasize);
++ 	generate_random_bytes((u8 *)vec->plaintext, vec->psize);
++ 
++ 	/*
++ 	 * Key: length in range [1, maxkeysize], but usually choose maxkeysize.
++ 	 * If algorithm is unkeyed, then maxkeysize == 0 and set ksize = 0.
++ 	 */
++ 	vec->setkey_error = 0;
++ 	vec->ksize = 0;
++ 	if (maxkeysize) {
++ 		vec->ksize = maxkeysize;
++ 		if (prandom_u32_max(4) == 0)
++ 			vec->ksize = 1 + prandom_u32_max(maxkeysize);
++ 		generate_random_bytes((u8 *)vec->key, vec->ksize);
++ 
++ 		vec->setkey_error = crypto_shash_setkey(desc->tfm, vec->key,
++ 							vec->ksize);
++ 		/* If the key couldn't be set, no need to continue to digest. */
++ 		if (vec->setkey_error)
++ 			goto done;
++ 	}
++ 
++ 	/* Digest */
++ 	vec->digest_error = crypto_shash_digest(desc, vec->plaintext,
++ 						vec->psize, (u8 *)vec->digest);
++ done:
++ 	snprintf(name, max_namelen, "\"random: psize=%u ksize=%u\"",
++ 		 vec->psize, vec->ksize);
++ }
++ 
++ /*
++  * Test the hash algorithm represented by @req against the corresponding generic
++  * implementation, if one is available.
++  */
++ static int test_hash_vs_generic_impl(const char *generic_driver,
++ 				     unsigned int maxkeysize,
++ 				     struct ahash_request *req,
++ 				     struct shash_desc *desc,
++ 				     struct test_sglist *tsgl,
++ 				     u8 *hashstate)
++ {
++ 	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
++ 	const unsigned int digestsize = crypto_ahash_digestsize(tfm);
++ 	const unsigned int blocksize = crypto_ahash_blocksize(tfm);
++ 	const unsigned int maxdatasize = (2 * PAGE_SIZE) - TESTMGR_POISON_LEN;
++ 	const char *algname = crypto_hash_alg_common(tfm)->base.cra_name;
++ 	const char *driver = crypto_ahash_driver_name(tfm);
++ 	char _generic_driver[CRYPTO_MAX_ALG_NAME];
++ 	struct crypto_shash *generic_tfm = NULL;
++ 	struct shash_desc *generic_desc = NULL;
++ 	unsigned int i;
++ 	struct hash_testvec vec = { 0 };
++ 	char vec_name[64];
++ 	struct testvec_config *cfg;
++ 	char cfgname[TESTVEC_CONFIG_NAMELEN];
++ 	int err;
++ 
++ 	if (noextratests)
++ 		return 0;
++ 
++ 	if (!generic_driver) { /* Use default naming convention? */
++ 		err = build_generic_driver_name(algname, _generic_driver);
++ 		if (err)
++ 			return err;
++ 		generic_driver = _generic_driver;
++ 	}
++ 
++ 	if (strcmp(generic_driver, driver) == 0) /* Already the generic impl? */
++ 		return 0;
++ 
++ 	generic_tfm = crypto_alloc_shash(generic_driver, 0, 0);
++ 	if (IS_ERR(generic_tfm)) {
++ 		err = PTR_ERR(generic_tfm);
++ 		if (err == -ENOENT) {
++ 			pr_warn("alg: hash: skipping comparison tests for %s because %s is unavailable\n",
++ 				driver, generic_driver);
++ 			return 0;
++ 		}
++ 		pr_err("alg: hash: error allocating %s (generic impl of %s): %d\n",
++ 		       generic_driver, algname, err);
++ 		return err;
++ 	}
++ 
++ 	cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
++ 	if (!cfg) {
++ 		err = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	generic_desc = kzalloc(sizeof(*desc) +
++ 			       crypto_shash_descsize(generic_tfm), GFP_KERNEL);
++ 	if (!generic_desc) {
++ 		err = -ENOMEM;
++ 		goto out;
++ 	}
++ 	generic_desc->tfm = generic_tfm;
++ 
++ 	/* Check the algorithm properties for consistency. */
++ 
++ 	if (digestsize != crypto_shash_digestsize(generic_tfm)) {
++ 		pr_err("alg: hash: digestsize for %s (%u) doesn't match generic impl (%u)\n",
++ 		       driver, digestsize,
++ 		       crypto_shash_digestsize(generic_tfm));
++ 		err = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (blocksize != crypto_shash_blocksize(generic_tfm)) {
++ 		pr_err("alg: hash: blocksize for %s (%u) doesn't match generic impl (%u)\n",
++ 		       driver, blocksize, crypto_shash_blocksize(generic_tfm));
++ 		err = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * Now generate test vectors using the generic implementation, and test
++ 	 * the other implementation against them.
++ 	 */
++ 
++ 	vec.key = kmalloc(maxkeysize, GFP_KERNEL);
++ 	vec.plaintext = kmalloc(maxdatasize, GFP_KERNEL);
++ 	vec.digest = kmalloc(digestsize, GFP_KERNEL);
++ 	if (!vec.key || !vec.plaintext || !vec.digest) {
++ 		err = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	for (i = 0; i < fuzz_iterations * 8; i++) {
++ 		generate_random_hash_testvec(generic_desc, &vec,
++ 					     maxkeysize, maxdatasize,
++ 					     vec_name, sizeof(vec_name));
++ 		generate_random_testvec_config(cfg, cfgname, sizeof(cfgname));
++ 
++ 		err = test_hash_vec_cfg(&vec, vec_name, cfg,
++ 					req, desc, tsgl, hashstate);
++ 		if (err)
++ 			goto out;
++ 		cond_resched();
++ 	}
++ 	err = 0;
++ out:
++ 	kfree(cfg);
++ 	kfree(vec.key);
++ 	kfree(vec.plaintext);
++ 	kfree(vec.digest);
++ 	crypto_free_shash(generic_tfm);
++ 	kfree_sensitive(generic_desc);
++ 	return err;
++ }
++ #else /* !CONFIG_CRYPTO_MANAGER_EXTRA_TESTS */
++ static int test_hash_vs_generic_impl(const char *generic_driver,
++ 				     unsigned int maxkeysize,
++ 				     struct ahash_request *req,
++ 				     struct shash_desc *desc,
++ 				     struct test_sglist *tsgl,
++ 				     u8 *hashstate)
++ {
++ 	return 0;
++ }
++ #endif /* !CONFIG_CRYPTO_MANAGER_EXTRA_TESTS */
++ 
++ static int alloc_shash(const char *driver, u32 type, u32 mask,
++ 		       struct crypto_shash **tfm_ret,
++ 		       struct shash_desc **desc_ret)
++ {
++ 	struct crypto_shash *tfm;
++ 	struct shash_desc *desc;
++ 
++ 	tfm = crypto_alloc_shash(driver, type, mask);
++ 	if (IS_ERR(tfm)) {
++ 		if (PTR_ERR(tfm) == -ENOENT) {
++ 			/*
++ 			 * This algorithm is only available through the ahash
++ 			 * API, not the shash API, so skip the shash tests.
++ 			 */
++ 			return 0;
++ 		}
++ 		pr_err("alg: hash: failed to allocate shash transform for %s: %ld\n",
++ 		       driver, PTR_ERR(tfm));
++ 		return PTR_ERR(tfm);
++ 	}
++ 
++ 	desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL);
++ 	if (!desc) {
++ 		crypto_free_shash(tfm);
++ 		return -ENOMEM;
++ 	}
++ 	desc->tfm = tfm;
++ 
++ 	*tfm_ret = tfm;
++ 	*desc_ret = desc;
++ 	return 0;
++ }
++ 
++ static int __alg_test_hash(const struct hash_testvec *vecs,
++ 			   unsigned int num_vecs, const char *driver,
++ 			   u32 type, u32 mask,
++ 			   const char *generic_driver, unsigned int maxkeysize)
++ {
++ 	struct crypto_ahash *atfm = NULL;
++ 	struct ahash_request *req = NULL;
++ 	struct crypto_shash *stfm = NULL;
++ 	struct shash_desc *desc = NULL;
++ 	struct test_sglist *tsgl = NULL;
++ 	u8 *hashstate = NULL;
++ 	unsigned int statesize;
++ 	unsigned int i;
++ 	int err;
++ 
++ 	/*
++ 	 * Always test the ahash API.  This works regardless of whether the
++ 	 * algorithm is implemented as ahash or shash.
++ 	 */
++ 
++ 	atfm = crypto_alloc_ahash(driver, type, mask);
++ 	if (IS_ERR(atfm)) {
++ 		pr_err("alg: hash: failed to allocate transform for %s: %ld\n",
++ 		       driver, PTR_ERR(atfm));
++ 		return PTR_ERR(atfm);
++ 	}
++ 	driver = crypto_ahash_driver_name(atfm);
++ 
++ 	req = ahash_request_alloc(atfm, GFP_KERNEL);
++ 	if (!req) {
++ 		pr_err("alg: hash: failed to allocate request for %s\n",
++ 		       driver);
++ 		err = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * If available also test the shash API, to cover corner cases that may
++ 	 * be missed by testing the ahash API only.
++ 	 */
++ 	err = alloc_shash(driver, type, mask, &stfm, &desc);
++ 	if (err)
++ 		goto out;
++ 
++ 	tsgl = kmalloc(sizeof(*tsgl), GFP_KERNEL);
++ 	if (!tsgl || init_test_sglist(tsgl) != 0) {
++ 		pr_err("alg: hash: failed to allocate test buffers for %s\n",
++ 		       driver);
++ 		kfree(tsgl);
++ 		tsgl = NULL;
++ 		err = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	statesize = crypto_ahash_statesize(atfm);
++ 	if (stfm)
++ 		statesize = max(statesize, crypto_shash_statesize(stfm));
++ 	hashstate = kmalloc(statesize + TESTMGR_POISON_LEN, GFP_KERNEL);
++ 	if (!hashstate) {
++ 		pr_err("alg: hash: failed to allocate hash state buffer for %s\n",
++ 		       driver);
++ 		err = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	for (i = 0; i < num_vecs; i++) {
++ 		if (fips_enabled && vecs[i].fips_skip)
++ 			continue;
++ 
++ 		err = test_hash_vec(&vecs[i], i, req, desc, tsgl, hashstate);
++ 		if (err)
++ 			goto out;
++ 		cond_resched();
++ 	}
++ 	err = test_hash_vs_generic_impl(generic_driver, maxkeysize, req,
++ 					desc, tsgl, hashstate);
++ out:
++ 	kfree(hashstate);
++ 	if (tsgl) {
++ 		destroy_test_sglist(tsgl);
++ 		kfree(tsgl);
++ 	}
++ 	kfree(desc);
++ 	crypto_free_shash(stfm);
++ 	ahash_request_free(req);
++ 	crypto_free_ahash(atfm);
++ 	return err;
++ }
++ 
++ static int alg_test_hash(const struct alg_test_desc *desc, const char *driver,
++ 			 u32 type, u32 mask)
++ {
++ 	const struct hash_testvec *template = desc->suite.hash.vecs;
++ 	unsigned int tcount = desc->suite.hash.count;
++ 	unsigned int nr_unkeyed, nr_keyed;
++ 	unsigned int maxkeysize = 0;
++ 	int err;
++ 
++ 	/*
++ 	 * For OPTIONAL_KEY algorithms, we have to do all the unkeyed tests
++ 	 * first, before setting a key on the tfm.  To make this easier, we
++ 	 * require that the unkeyed test vectors (if any) are listed first.
++ 	 */
++ 
++ 	for (nr_unkeyed = 0; nr_unkeyed < tcount; nr_unkeyed++) {
++ 		if (template[nr_unkeyed].ksize)
++ 			break;
++ 	}
++ 	for (nr_keyed = 0; nr_unkeyed + nr_keyed < tcount; nr_keyed++) {
++ 		if (!template[nr_unkeyed + nr_keyed].ksize) {
++ 			pr_err("alg: hash: test vectors for %s out of order, "
++ 			       "unkeyed ones must come first\n", desc->alg);
++ 			return -EINVAL;
++ 		}
++ 		maxkeysize = max_t(unsigned int, maxkeysize,
++ 				   template[nr_unkeyed + nr_keyed].ksize);
++ 	}
++ 
++ 	err = 0;
++ 	if (nr_unkeyed) {
++ 		err = __alg_test_hash(template, nr_unkeyed, driver, type, mask,
++ 				      desc->generic_driver, maxkeysize);
++ 		template += nr_unkeyed;
++ 	}
++ 
++ 	if (!err && nr_keyed)
++ 		err = __alg_test_hash(template, nr_keyed, driver, type, mask,
++ 				      desc->generic_driver, maxkeysize);
++ 
++ 	return err;
++ }
++ 
++ static int test_aead_vec_cfg(int enc, const struct aead_testvec *vec,
++ 			     const char *vec_name,
++ 			     const struct testvec_config *cfg,
++ 			     struct aead_request *req,
++ 			     struct cipher_test_sglists *tsgls)
++ {
++ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
++ 	const unsigned int alignmask = crypto_aead_alignmask(tfm);
++ 	const unsigned int ivsize = crypto_aead_ivsize(tfm);
++ 	const unsigned int authsize = vec->clen - vec->plen;
++ 	const char *driver = crypto_aead_driver_name(tfm);
++ 	const u32 req_flags = CRYPTO_TFM_REQ_MAY_BACKLOG | cfg->req_flags;
++ 	const char *op = enc ? "encryption" : "decryption";
++ 	DECLARE_CRYPTO_WAIT(wait);
++ 	u8 _iv[3 * (MAX_ALGAPI_ALIGNMASK + 1) + MAX_IVLEN];
++ 	u8 *iv = PTR_ALIGN(&_iv[0], 2 * (MAX_ALGAPI_ALIGNMASK + 1)) +
++ 		 cfg->iv_offset +
++ 		 (cfg->iv_offset_relative_to_alignmask ? alignmask : 0);
++ 	struct kvec input[2];
++ 	int err;
++ 
++ 	/* Set the key */
++ 	if (vec->wk)
++ 		crypto_aead_set_flags(tfm, CRYPTO_TFM_REQ_FORBID_WEAK_KEYS);
++ 	else
++ 		crypto_aead_clear_flags(tfm, CRYPTO_TFM_REQ_FORBID_WEAK_KEYS);
++ 
++ 	err = do_setkey(crypto_aead_setkey, tfm, vec->key, vec->klen,
++ 			cfg, alignmask);
++ 	if (err && err != vec->setkey_error) {
++ 		pr_err("alg: aead: %s setkey failed on test vector %s; expected_error=%d, actual_error=%d, flags=%#x\n",
++ 		       driver, vec_name, vec->setkey_error, err,
++ 		       crypto_aead_get_flags(tfm));
++ 		return err;
++ 	}
++ 	if (!err && vec->setkey_error) {
++ 		pr_err("alg: aead: %s setkey unexpectedly succeeded on test vector %s; expected_error=%d\n",
++ 		       driver, vec_name, vec->setkey_error);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Set the authentication tag size */
++ 	err = crypto_aead_setauthsize(tfm, authsize);
++ 	if (err && err != vec->setauthsize_error) {
++ 		pr_err("alg: aead: %s setauthsize failed on test vector %s; expected_error=%d, actual_error=%d\n",
++ 		       driver, vec_name, vec->setauthsize_error, err);
++ 		return err;
++ 	}
++ 	if (!err && vec->setauthsize_error) {
++ 		pr_err("alg: aead: %s setauthsize unexpectedly succeeded on test vector %s; expected_error=%d\n",
++ 		       driver, vec_name, vec->setauthsize_error);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (vec->setkey_error || vec->setauthsize_error)
++ 		return 0;
++ 
++ 	/* The IV must be copied to a buffer, as the algorithm may modify it */
++ 	if (WARN_ON(ivsize > MAX_IVLEN))
++ 		return -EINVAL;
++ 	if (vec->iv)
++ 		memcpy(iv, vec->iv, ivsize);
++ 	else
++ 		memset(iv, 0, ivsize);
++ 
++ 	/* Build the src/dst scatterlists */
++ 	input[0].iov_base = (void *)vec->assoc;
++ 	input[0].iov_len = vec->alen;
++ 	input[1].iov_base = enc ? (void *)vec->ptext : (void *)vec->ctext;
++ 	input[1].iov_len = enc ? vec->plen : vec->clen;
++ 	err = build_cipher_test_sglists(tsgls, cfg, alignmask,
++ 					vec->alen + (enc ? vec->plen :
++ 						     vec->clen),
++ 					vec->alen + (enc ? vec->clen :
++ 						     vec->plen),
++ 					input, 2);
++ 	if (err) {
++ 		pr_err("alg: aead: %s %s: error preparing scatterlists for test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		return err;
++ 	}
++ 
++ 	/* Do the actual encryption or decryption */
++ 	testmgr_poison(req->__ctx, crypto_aead_reqsize(tfm));
++ 	aead_request_set_callback(req, req_flags, crypto_req_done, &wait);
++ 	aead_request_set_crypt(req, tsgls->src.sgl_ptr, tsgls->dst.sgl_ptr,
++ 			       enc ? vec->plen : vec->clen, iv);
++ 	aead_request_set_ad(req, vec->alen);
++ 	if (cfg->nosimd)
++ 		crypto_disable_simd_for_test();
++ 	err = enc ? crypto_aead_encrypt(req) : crypto_aead_decrypt(req);
++ 	if (cfg->nosimd)
++ 		crypto_reenable_simd_for_test();
++ 	err = crypto_wait_req(err, &wait);
++ 
++ 	/* Check that the algorithm didn't overwrite things it shouldn't have */
++ 	if (req->cryptlen != (enc ? vec->plen : vec->clen) ||
++ 	    req->assoclen != vec->alen ||
++ 	    req->iv != iv ||
++ 	    req->src != tsgls->src.sgl_ptr ||
++ 	    req->dst != tsgls->dst.sgl_ptr ||
++ 	    crypto_aead_reqtfm(req) != tfm ||
++ 	    req->base.complete != crypto_req_done ||
++ 	    req->base.flags != req_flags ||
++ 	    req->base.data != &wait) {
++ 		pr_err("alg: aead: %s %s corrupted request struct on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		if (req->cryptlen != (enc ? vec->plen : vec->clen))
++ 			pr_err("alg: aead: changed 'req->cryptlen'\n");
++ 		if (req->assoclen != vec->alen)
++ 			pr_err("alg: aead: changed 'req->assoclen'\n");
++ 		if (req->iv != iv)
++ 			pr_err("alg: aead: changed 'req->iv'\n");
++ 		if (req->src != tsgls->src.sgl_ptr)
++ 			pr_err("alg: aead: changed 'req->src'\n");
++ 		if (req->dst != tsgls->dst.sgl_ptr)
++ 			pr_err("alg: aead: changed 'req->dst'\n");
++ 		if (crypto_aead_reqtfm(req) != tfm)
++ 			pr_err("alg: aead: changed 'req->base.tfm'\n");
++ 		if (req->base.complete != crypto_req_done)
++ 			pr_err("alg: aead: changed 'req->base.complete'\n");
++ 		if (req->base.flags != req_flags)
++ 			pr_err("alg: aead: changed 'req->base.flags'\n");
++ 		if (req->base.data != &wait)
++ 			pr_err("alg: aead: changed 'req->base.data'\n");
++ 		return -EINVAL;
++ 	}
++ 	if (is_test_sglist_corrupted(&tsgls->src)) {
++ 		pr_err("alg: aead: %s %s corrupted src sgl on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		return -EINVAL;
++ 	}
++ 	if (tsgls->dst.sgl_ptr != tsgls->src.sgl &&
++ 	    is_test_sglist_corrupted(&tsgls->dst)) {
++ 		pr_err("alg: aead: %s %s corrupted dst sgl on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Check for unexpected success or failure, or wrong error code */
++ 	if ((err == 0 && vec->novrfy) ||
++ 	    (err != vec->crypt_error && !(err == -EBADMSG && vec->novrfy))) {
++ 		char expected_error[32];
++ 
++ 		if (vec->novrfy &&
++ 		    vec->crypt_error != 0 && vec->crypt_error != -EBADMSG)
++ 			sprintf(expected_error, "-EBADMSG or %d",
++ 				vec->crypt_error);
++ 		else if (vec->novrfy)
++ 			sprintf(expected_error, "-EBADMSG");
++ 		else
++ 			sprintf(expected_error, "%d", vec->crypt_error);
++ 		if (err) {
++ 			pr_err("alg: aead: %s %s failed on test vector %s; expected_error=%s, actual_error=%d, cfg=\"%s\"\n",
++ 			       driver, op, vec_name, expected_error, err,
++ 			       cfg->name);
++ 			return err;
++ 		}
++ 		pr_err("alg: aead: %s %s unexpectedly succeeded on test vector %s; expected_error=%s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, expected_error, cfg->name);
++ 		return -EINVAL;
++ 	}
++ 	if (err) /* Expectedly failed. */
++ 		return 0;
++ 
++ 	/* Check for the correct output (ciphertext or plaintext) */
++ 	err = verify_correct_output(&tsgls->dst, enc ? vec->ctext : vec->ptext,
++ 				    enc ? vec->clen : vec->plen,
++ 				    vec->alen,
++ 				    enc || cfg->inplace_mode == OUT_OF_PLACE);
++ 	if (err == -EOVERFLOW) {
++ 		pr_err("alg: aead: %s %s overran dst buffer on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		return err;
++ 	}
++ 	if (err) {
++ 		pr_err("alg: aead: %s %s test failed (wrong result) on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int test_aead_vec(int enc, const struct aead_testvec *vec,
++ 			 unsigned int vec_num, struct aead_request *req,
++ 			 struct cipher_test_sglists *tsgls)
++ {
++ 	char vec_name[16];
++ 	unsigned int i;
++ 	int err;
++ 
++ 	if (enc && vec->novrfy)
++ 		return 0;
++ 
++ 	sprintf(vec_name, "%u", vec_num);
++ 
++ 	for (i = 0; i < ARRAY_SIZE(default_cipher_testvec_configs); i++) {
++ 		err = test_aead_vec_cfg(enc, vec, vec_name,
++ 					&default_cipher_testvec_configs[i],
++ 					req, tsgls);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ #ifdef CONFIG_CRYPTO_MANAGER_EXTRA_TESTS
++ 	if (!noextratests) {
++ 		struct testvec_config cfg;
++ 		char cfgname[TESTVEC_CONFIG_NAMELEN];
++ 
++ 		for (i = 0; i < fuzz_iterations; i++) {
++ 			generate_random_testvec_config(&cfg, cfgname,
++ 						       sizeof(cfgname));
++ 			err = test_aead_vec_cfg(enc, vec, vec_name,
++ 						&cfg, req, tsgls);
++ 			if (err)
++ 				return err;
++ 			cond_resched();
++ 		}
++ 	}
++ #endif
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_CRYPTO_MANAGER_EXTRA_TESTS
++ 
++ struct aead_extra_tests_ctx {
++ 	struct aead_request *req;
++ 	struct crypto_aead *tfm;
++ 	const struct alg_test_desc *test_desc;
++ 	struct cipher_test_sglists *tsgls;
++ 	unsigned int maxdatasize;
++ 	unsigned int maxkeysize;
++ 
++ 	struct aead_testvec vec;
++ 	char vec_name[64];
++ 	char cfgname[TESTVEC_CONFIG_NAMELEN];
++ 	struct testvec_config cfg;
++ };
++ 
++ /*
++  * Make at least one random change to a (ciphertext, AAD) pair.  "Ciphertext"
++  * here means the full ciphertext including the authentication tag.  The
++  * authentication tag (and hence also the ciphertext) is assumed to be nonempty.
++  */
++ static void mutate_aead_message(struct aead_testvec *vec, bool aad_iv,
++ 				unsigned int ivsize)
++ {
++ 	const unsigned int aad_tail_size = aad_iv ? ivsize : 0;
++ 	const unsigned int authsize = vec->clen - vec->plen;
++ 
++ 	if (prandom_u32_max(2) == 0 && vec->alen > aad_tail_size) {
++ 		 /* Mutate the AAD */
++ 		flip_random_bit((u8 *)vec->assoc, vec->alen - aad_tail_size);
++ 		if (prandom_u32_max(2) == 0)
++ 			return;
++ 	}
++ 	if (prandom_u32_max(2) == 0) {
++ 		/* Mutate auth tag (assuming it's at the end of ciphertext) */
++ 		flip_random_bit((u8 *)vec->ctext + vec->plen, authsize);
++ 	} else {
++ 		/* Mutate any part of the ciphertext */
++ 		flip_random_bit((u8 *)vec->ctext, vec->clen);
++ 	}
++ }
++ 
++ /*
++  * Minimum authentication tag size in bytes at which we assume that we can
++  * reliably generate inauthentic messages, i.e. not generate an authentic
++  * message by chance.
++  */
++ #define MIN_COLLISION_FREE_AUTHSIZE 8
++ 
++ static void generate_aead_message(struct aead_request *req,
++ 				  const struct aead_test_suite *suite,
++ 				  struct aead_testvec *vec,
++ 				  bool prefer_inauthentic)
++ {
++ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
++ 	const unsigned int ivsize = crypto_aead_ivsize(tfm);
++ 	const unsigned int authsize = vec->clen - vec->plen;
++ 	const bool inauthentic = (authsize >= MIN_COLLISION_FREE_AUTHSIZE) &&
++ 				 (prefer_inauthentic || prandom_u32_max(4) == 0);
++ 
++ 	/* Generate the AAD. */
++ 	generate_random_bytes((u8 *)vec->assoc, vec->alen);
++ 	if (suite->aad_iv && vec->alen >= ivsize)
++ 		/* Avoid implementation-defined behavior. */
++ 		memcpy((u8 *)vec->assoc + vec->alen - ivsize, vec->iv, ivsize);
++ 
++ 	if (inauthentic && prandom_u32_max(2) == 0) {
++ 		/* Generate a random ciphertext. */
++ 		generate_random_bytes((u8 *)vec->ctext, vec->clen);
++ 	} else {
++ 		int i = 0;
++ 		struct scatterlist src[2], dst;
++ 		u8 iv[MAX_IVLEN];
++ 		DECLARE_CRYPTO_WAIT(wait);
++ 
++ 		/* Generate a random plaintext and encrypt it. */
++ 		sg_init_table(src, 2);
++ 		if (vec->alen)
++ 			sg_set_buf(&src[i++], vec->assoc, vec->alen);
++ 		if (vec->plen) {
++ 			generate_random_bytes((u8 *)vec->ptext, vec->plen);
++ 			sg_set_buf(&src[i++], vec->ptext, vec->plen);
++ 		}
++ 		sg_init_one(&dst, vec->ctext, vec->alen + vec->clen);
++ 		memcpy(iv, vec->iv, ivsize);
++ 		aead_request_set_callback(req, 0, crypto_req_done, &wait);
++ 		aead_request_set_crypt(req, src, &dst, vec->plen, iv);
++ 		aead_request_set_ad(req, vec->alen);
++ 		vec->crypt_error = crypto_wait_req(crypto_aead_encrypt(req),
++ 						   &wait);
++ 		/* If encryption failed, we're done. */
++ 		if (vec->crypt_error != 0)
++ 			return;
++ 		memmove((u8 *)vec->ctext, vec->ctext + vec->alen, vec->clen);
++ 		if (!inauthentic)
++ 			return;
++ 		/*
++ 		 * Mutate the authentic (ciphertext, AAD) pair to get an
++ 		 * inauthentic one.
++ 		 */
++ 		mutate_aead_message(vec, suite->aad_iv, ivsize);
++ 	}
++ 	vec->novrfy = 1;
++ 	if (suite->einval_allowed)
++ 		vec->crypt_error = -EINVAL;
++ }
++ 
++ /*
++  * Generate an AEAD test vector 'vec' using the implementation specified by
++  * 'req'.  The buffers in 'vec' must already be allocated.
++  *
++  * If 'prefer_inauthentic' is true, then this function will generate inauthentic
++  * test vectors (i.e. vectors with 'vec->novrfy=1') more often.
++  */
++ static void generate_random_aead_testvec(struct aead_request *req,
++ 					 struct aead_testvec *vec,
++ 					 const struct aead_test_suite *suite,
++ 					 unsigned int maxkeysize,
++ 					 unsigned int maxdatasize,
++ 					 char *name, size_t max_namelen,
++ 					 bool prefer_inauthentic)
++ {
++ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
++ 	const unsigned int ivsize = crypto_aead_ivsize(tfm);
++ 	const unsigned int maxauthsize = crypto_aead_maxauthsize(tfm);
++ 	unsigned int authsize;
++ 	unsigned int total_len;
++ 
++ 	/* Key: length in [0, maxkeysize], but usually choose maxkeysize */
++ 	vec->klen = maxkeysize;
++ 	if (prandom_u32_max(4) == 0)
++ 		vec->klen = prandom_u32_max(maxkeysize + 1);
++ 	generate_random_bytes((u8 *)vec->key, vec->klen);
++ 	vec->setkey_error = crypto_aead_setkey(tfm, vec->key, vec->klen);
++ 
++ 	/* IV */
++ 	generate_random_bytes((u8 *)vec->iv, ivsize);
++ 
++ 	/* Tag length: in [0, maxauthsize], but usually choose maxauthsize */
++ 	authsize = maxauthsize;
++ 	if (prandom_u32_max(4) == 0)
++ 		authsize = prandom_u32_max(maxauthsize + 1);
++ 	if (prefer_inauthentic && authsize < MIN_COLLISION_FREE_AUTHSIZE)
++ 		authsize = MIN_COLLISION_FREE_AUTHSIZE;
++ 	if (WARN_ON(authsize > maxdatasize))
++ 		authsize = maxdatasize;
++ 	maxdatasize -= authsize;
++ 	vec->setauthsize_error = crypto_aead_setauthsize(tfm, authsize);
++ 
++ 	/* AAD, plaintext, and ciphertext lengths */
++ 	total_len = generate_random_length(maxdatasize);
++ 	if (prandom_u32_max(4) == 0)
++ 		vec->alen = 0;
++ 	else
++ 		vec->alen = generate_random_length(total_len);
++ 	vec->plen = total_len - vec->alen;
++ 	vec->clen = vec->plen + authsize;
++ 
++ 	/*
++ 	 * Generate the AAD, plaintext, and ciphertext.  Not applicable if the
++ 	 * key or the authentication tag size couldn't be set.
++ 	 */
++ 	vec->novrfy = 0;
++ 	vec->crypt_error = 0;
++ 	if (vec->setkey_error == 0 && vec->setauthsize_error == 0)
++ 		generate_aead_message(req, suite, vec, prefer_inauthentic);
++ 	snprintf(name, max_namelen,
++ 		 "\"random: alen=%u plen=%u authsize=%u klen=%u novrfy=%d\"",
++ 		 vec->alen, vec->plen, authsize, vec->klen, vec->novrfy);
++ }
++ 
++ static void try_to_generate_inauthentic_testvec(
++ 					struct aead_extra_tests_ctx *ctx)
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  {
+  	int i;
+  
+@@@ -1070,45 -2734,454 +3243,435 @@@ out_nobuf
+  	return ret;
+  }
+  
+ -static int test_skcipher_vec_cfg(int enc, const struct cipher_testvec *vec,
+ -				 const char *vec_name,
+ -				 const struct testvec_config *cfg,
+ -				 struct skcipher_request *req,
+ -				 struct cipher_test_sglists *tsgls)
+ +static int __test_skcipher(struct crypto_skcipher *tfm, int enc,
+ +			   const struct cipher_testvec *template,
+ +			   unsigned int tcount,
+ +			   const bool diff_dst, const int align_offset)
+  {
+ -	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+ -	const unsigned int alignmask = crypto_skcipher_alignmask(tfm);
+ -	const unsigned int ivsize = crypto_skcipher_ivsize(tfm);
+ -	const char *driver = crypto_skcipher_driver_name(tfm);
+ -	const u32 req_flags = CRYPTO_TFM_REQ_MAY_BACKLOG | cfg->req_flags;
+ -	const char *op = enc ? "encryption" : "decryption";
+ -	DECLARE_CRYPTO_WAIT(wait);
+ -	u8 _iv[3 * (MAX_ALGAPI_ALIGNMASK + 1) + MAX_IVLEN];
+ -	u8 *iv = PTR_ALIGN(&_iv[0], 2 * (MAX_ALGAPI_ALIGNMASK + 1)) +
+ -		 cfg->iv_offset +
+ -		 (cfg->iv_offset_relative_to_alignmask ? alignmask : 0);
+ -	struct kvec input;
+ -	int err;
+ +	const char *algo =
+ +		crypto_tfm_alg_driver_name(crypto_skcipher_tfm(tfm));
+ +	unsigned int i, j, k, n, temp;
+ +	char *q;
+ +	struct skcipher_request *req;
+ +	struct scatterlist sg[8];
+ +	struct scatterlist sgout[8];
+ +	const char *e, *d;
+ +	struct crypto_wait wait;
+ +	const char *input, *result;
+ +	void *data;
+ +	char iv[MAX_IVLEN];
+ +	char *xbuf[XBUFSIZE];
+ +	char *xoutbuf[XBUFSIZE];
+ +	int ret = -ENOMEM;
+ +	unsigned int ivsize = crypto_skcipher_ivsize(tfm);
+  
+ -	/* Set the key */
+ -	if (vec->wk)
+ -		crypto_skcipher_set_flags(tfm, CRYPTO_TFM_REQ_FORBID_WEAK_KEYS);
+ +	if (testmgr_alloc_buf(xbuf))
+ +		goto out_nobuf;
+ +
+ +	if (diff_dst && testmgr_alloc_buf(xoutbuf))
+ +		goto out_nooutbuf;
+ +
+ +	if (diff_dst)
+ +		d = "-ddst";
+  	else
+ -		crypto_skcipher_clear_flags(tfm,
+ -					    CRYPTO_TFM_REQ_FORBID_WEAK_KEYS);
+ -	err = do_setkey(crypto_skcipher_setkey, tfm, vec->key, vec->klen,
+ -			cfg, alignmask);
+ -	if (err) {
+ -		if (err == vec->setkey_error)
+ -			return 0;
+ -		pr_err("alg: skcipher: %s setkey failed on test vector %s; expected_error=%d, actual_error=%d, flags=%#x\n",
+ -		       driver, vec_name, vec->setkey_error, err,
+ -		       crypto_skcipher_get_flags(tfm));
+ -		return err;
+ -	}
+ -	if (vec->setkey_error) {
+ -		pr_err("alg: skcipher: %s setkey unexpectedly succeeded on test vector %s; expected_error=%d\n",
+ -		       driver, vec_name, vec->setkey_error);
+ -		return -EINVAL;
+ -	}
+ +		d = "";
+  
+ -	/* The IV must be copied to a buffer, as the algorithm may modify it */
+ -	if (ivsize) {
+ -		if (WARN_ON(ivsize > MAX_IVLEN))
+ -			return -EINVAL;
+ -		if (vec->generates_iv && !enc)
+ -			memcpy(iv, vec->iv_out, ivsize);
+ -		else if (vec->iv)
+ -			memcpy(iv, vec->iv, ivsize);
+ -		else
+ -			memset(iv, 0, ivsize);
+ -	} else {
+ -		if (vec->generates_iv) {
+ -			pr_err("alg: skcipher: %s has ivsize=0 but test vector %s generates IV!\n",
+ -			       driver, vec_name);
+ -			return -EINVAL;
+ -		}
+ -		iv = NULL;
+ -	}
+ +	if (enc == ENCRYPT)
+ +	        e = "encryption";
+ +	else
+ +		e = "decryption";
+  
+++<<<<<<< HEAD
+ +	crypto_init_wait(&wait);
+++=======
++ 	/* Build the src/dst scatterlists */
++ 	input.iov_base = enc ? (void *)vec->ptext : (void *)vec->ctext;
++ 	input.iov_len = vec->len;
++ 	err = build_cipher_test_sglists(tsgls, cfg, alignmask,
++ 					vec->len, vec->len, &input, 1);
++ 	if (err) {
++ 		pr_err("alg: skcipher: %s %s: error preparing scatterlists for test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		return err;
++ 	}
++ 
++ 	/* Do the actual encryption or decryption */
++ 	testmgr_poison(req->__ctx, crypto_skcipher_reqsize(tfm));
++ 	skcipher_request_set_callback(req, req_flags, crypto_req_done, &wait);
++ 	skcipher_request_set_crypt(req, tsgls->src.sgl_ptr, tsgls->dst.sgl_ptr,
++ 				   vec->len, iv);
++ 	if (cfg->nosimd)
++ 		crypto_disable_simd_for_test();
++ 	err = enc ? crypto_skcipher_encrypt(req) : crypto_skcipher_decrypt(req);
++ 	if (cfg->nosimd)
++ 		crypto_reenable_simd_for_test();
++ 	err = crypto_wait_req(err, &wait);
++ 
++ 	/* Check that the algorithm didn't overwrite things it shouldn't have */
++ 	if (req->cryptlen != vec->len ||
++ 	    req->iv != iv ||
++ 	    req->src != tsgls->src.sgl_ptr ||
++ 	    req->dst != tsgls->dst.sgl_ptr ||
++ 	    crypto_skcipher_reqtfm(req) != tfm ||
++ 	    req->base.complete != crypto_req_done ||
++ 	    req->base.flags != req_flags ||
++ 	    req->base.data != &wait) {
++ 		pr_err("alg: skcipher: %s %s corrupted request struct on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		if (req->cryptlen != vec->len)
++ 			pr_err("alg: skcipher: changed 'req->cryptlen'\n");
++ 		if (req->iv != iv)
++ 			pr_err("alg: skcipher: changed 'req->iv'\n");
++ 		if (req->src != tsgls->src.sgl_ptr)
++ 			pr_err("alg: skcipher: changed 'req->src'\n");
++ 		if (req->dst != tsgls->dst.sgl_ptr)
++ 			pr_err("alg: skcipher: changed 'req->dst'\n");
++ 		if (crypto_skcipher_reqtfm(req) != tfm)
++ 			pr_err("alg: skcipher: changed 'req->base.tfm'\n");
++ 		if (req->base.complete != crypto_req_done)
++ 			pr_err("alg: skcipher: changed 'req->base.complete'\n");
++ 		if (req->base.flags != req_flags)
++ 			pr_err("alg: skcipher: changed 'req->base.flags'\n");
++ 		if (req->base.data != &wait)
++ 			pr_err("alg: skcipher: changed 'req->base.data'\n");
++ 		return -EINVAL;
++ 	}
++ 	if (is_test_sglist_corrupted(&tsgls->src)) {
++ 		pr_err("alg: skcipher: %s %s corrupted src sgl on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		return -EINVAL;
++ 	}
++ 	if (tsgls->dst.sgl_ptr != tsgls->src.sgl &&
++ 	    is_test_sglist_corrupted(&tsgls->dst)) {
++ 		pr_err("alg: skcipher: %s %s corrupted dst sgl on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Check for success or failure */
++ 	if (err) {
++ 		if (err == vec->crypt_error)
++ 			return 0;
++ 		pr_err("alg: skcipher: %s %s failed on test vector %s; expected_error=%d, actual_error=%d, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, vec->crypt_error, err, cfg->name);
++ 		return err;
++ 	}
++ 	if (vec->crypt_error) {
++ 		pr_err("alg: skcipher: %s %s unexpectedly succeeded on test vector %s; expected_error=%d, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, vec->crypt_error, cfg->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Check for the correct output (ciphertext or plaintext) */
++ 	err = verify_correct_output(&tsgls->dst, enc ? vec->ctext : vec->ptext,
++ 				    vec->len, 0, true);
++ 	if (err == -EOVERFLOW) {
++ 		pr_err("alg: skcipher: %s %s overran dst buffer on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		return err;
++ 	}
++ 	if (err) {
++ 		pr_err("alg: skcipher: %s %s test failed (wrong result) on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		return err;
++ 	}
++ 
++ 	/* If applicable, check that the algorithm generated the correct IV */
++ 	if (vec->iv_out && memcmp(iv, vec->iv_out, ivsize) != 0) {
++ 		pr_err("alg: skcipher: %s %s test failed (wrong output IV) on test vector %s, cfg=\"%s\"\n",
++ 		       driver, op, vec_name, cfg->name);
++ 		hexdump(iv, ivsize);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int test_skcipher_vec(int enc, const struct cipher_testvec *vec,
++ 			     unsigned int vec_num,
++ 			     struct skcipher_request *req,
++ 			     struct cipher_test_sglists *tsgls)
++ {
++ 	char vec_name[16];
++ 	unsigned int i;
++ 	int err;
++ 
++ 	if (fips_enabled && vec->fips_skip)
++ 		return 0;
++ 
++ 	sprintf(vec_name, "%u", vec_num);
++ 
++ 	for (i = 0; i < ARRAY_SIZE(default_cipher_testvec_configs); i++) {
++ 		err = test_skcipher_vec_cfg(enc, vec, vec_name,
++ 					    &default_cipher_testvec_configs[i],
++ 					    req, tsgls);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ #ifdef CONFIG_CRYPTO_MANAGER_EXTRA_TESTS
++ 	if (!noextratests) {
++ 		struct testvec_config cfg;
++ 		char cfgname[TESTVEC_CONFIG_NAMELEN];
++ 
++ 		for (i = 0; i < fuzz_iterations; i++) {
++ 			generate_random_testvec_config(&cfg, cfgname,
++ 						       sizeof(cfgname));
++ 			err = test_skcipher_vec_cfg(enc, vec, vec_name,
++ 						    &cfg, req, tsgls);
++ 			if (err)
++ 				return err;
++ 			cond_resched();
++ 		}
++ 	}
++ #endif
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_CRYPTO_MANAGER_EXTRA_TESTS
++ /*
++  * Generate a symmetric cipher test vector from the given implementation.
++  * Assumes the buffers in 'vec' were already allocated.
++  */
++ static void generate_random_cipher_testvec(struct skcipher_request *req,
++ 					   struct cipher_testvec *vec,
++ 					   unsigned int maxdatasize,
++ 					   char *name, size_t max_namelen)
++ {
++ 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
++ 	const unsigned int maxkeysize = crypto_skcipher_max_keysize(tfm);
++ 	const unsigned int ivsize = crypto_skcipher_ivsize(tfm);
++ 	struct scatterlist src, dst;
++ 	u8 iv[MAX_IVLEN];
++ 	DECLARE_CRYPTO_WAIT(wait);
++ 
++ 	/* Key: length in [0, maxkeysize], but usually choose maxkeysize */
++ 	vec->klen = maxkeysize;
++ 	if (prandom_u32_max(4) == 0)
++ 		vec->klen = prandom_u32_max(maxkeysize + 1);
++ 	generate_random_bytes((u8 *)vec->key, vec->klen);
++ 	vec->setkey_error = crypto_skcipher_setkey(tfm, vec->key, vec->klen);
++ 
++ 	/* IV */
++ 	generate_random_bytes((u8 *)vec->iv, ivsize);
++ 
++ 	/* Plaintext */
++ 	vec->len = generate_random_length(maxdatasize);
++ 	generate_random_bytes((u8 *)vec->ptext, vec->len);
++ 
++ 	/* If the key couldn't be set, no need to continue to encrypt. */
++ 	if (vec->setkey_error)
++ 		goto done;
++ 
++ 	/* Ciphertext */
++ 	sg_init_one(&src, vec->ptext, vec->len);
++ 	sg_init_one(&dst, vec->ctext, vec->len);
++ 	memcpy(iv, vec->iv, ivsize);
++ 	skcipher_request_set_callback(req, 0, crypto_req_done, &wait);
++ 	skcipher_request_set_crypt(req, &src, &dst, vec->len, iv);
++ 	vec->crypt_error = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
++ 	if (vec->crypt_error != 0) {
++ 		/*
++ 		 * The only acceptable error here is for an invalid length, so
++ 		 * skcipher decryption should fail with the same error too.
++ 		 * We'll test for this.  But to keep the API usage well-defined,
++ 		 * explicitly initialize the ciphertext buffer too.
++ 		 */
++ 		memset((u8 *)vec->ctext, 0, vec->len);
++ 	}
++ done:
++ 	snprintf(name, max_namelen, "\"random: len=%u klen=%u\"",
++ 		 vec->len, vec->klen);
++ }
++ 
++ /*
++  * Test the skcipher algorithm represented by @req against the corresponding
++  * generic implementation, if one is available.
++  */
++ static int test_skcipher_vs_generic_impl(const char *generic_driver,
++ 					 struct skcipher_request *req,
++ 					 struct cipher_test_sglists *tsgls)
++ {
++ 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
++ 	const unsigned int maxkeysize = crypto_skcipher_max_keysize(tfm);
++ 	const unsigned int ivsize = crypto_skcipher_ivsize(tfm);
++ 	const unsigned int blocksize = crypto_skcipher_blocksize(tfm);
++ 	const unsigned int maxdatasize = (2 * PAGE_SIZE) - TESTMGR_POISON_LEN;
++ 	const char *algname = crypto_skcipher_alg(tfm)->base.cra_name;
++ 	const char *driver = crypto_skcipher_driver_name(tfm);
++ 	char _generic_driver[CRYPTO_MAX_ALG_NAME];
++ 	struct crypto_skcipher *generic_tfm = NULL;
++ 	struct skcipher_request *generic_req = NULL;
++ 	unsigned int i;
++ 	struct cipher_testvec vec = { 0 };
++ 	char vec_name[64];
++ 	struct testvec_config *cfg;
++ 	char cfgname[TESTVEC_CONFIG_NAMELEN];
++ 	int err;
++ 
++ 	if (noextratests)
++ 		return 0;
++ 
++ 	/* Keywrap isn't supported here yet as it handles its IV differently. */
++ 	if (strncmp(algname, "kw(", 3) == 0)
++ 		return 0;
++ 
++ 	if (!generic_driver) { /* Use default naming convention? */
++ 		err = build_generic_driver_name(algname, _generic_driver);
++ 		if (err)
++ 			return err;
++ 		generic_driver = _generic_driver;
++ 	}
++ 
++ 	if (strcmp(generic_driver, driver) == 0) /* Already the generic impl? */
++ 		return 0;
++ 
++ 	generic_tfm = crypto_alloc_skcipher(generic_driver, 0, 0);
++ 	if (IS_ERR(generic_tfm)) {
++ 		err = PTR_ERR(generic_tfm);
++ 		if (err == -ENOENT) {
++ 			pr_warn("alg: skcipher: skipping comparison tests for %s because %s is unavailable\n",
++ 				driver, generic_driver);
++ 			return 0;
++ 		}
++ 		pr_err("alg: skcipher: error allocating %s (generic impl of %s): %d\n",
++ 		       generic_driver, algname, err);
++ 		return err;
++ 	}
++ 
++ 	cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
++ 	if (!cfg) {
++ 		err = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	generic_req = skcipher_request_alloc(generic_tfm, GFP_KERNEL);
++ 	if (!generic_req) {
++ 		err = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	/* Check the algorithm properties for consistency. */
++ 
++ 	if (crypto_skcipher_min_keysize(tfm) !=
++ 	    crypto_skcipher_min_keysize(generic_tfm)) {
++ 		pr_err("alg: skcipher: min keysize for %s (%u) doesn't match generic impl (%u)\n",
++ 		       driver, crypto_skcipher_min_keysize(tfm),
++ 		       crypto_skcipher_min_keysize(generic_tfm));
++ 		err = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (maxkeysize != crypto_skcipher_max_keysize(generic_tfm)) {
++ 		pr_err("alg: skcipher: max keysize for %s (%u) doesn't match generic impl (%u)\n",
++ 		       driver, maxkeysize,
++ 		       crypto_skcipher_max_keysize(generic_tfm));
++ 		err = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (ivsize != crypto_skcipher_ivsize(generic_tfm)) {
++ 		pr_err("alg: skcipher: ivsize for %s (%u) doesn't match generic impl (%u)\n",
++ 		       driver, ivsize, crypto_skcipher_ivsize(generic_tfm));
++ 		err = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (blocksize != crypto_skcipher_blocksize(generic_tfm)) {
++ 		pr_err("alg: skcipher: blocksize for %s (%u) doesn't match generic impl (%u)\n",
++ 		       driver, blocksize,
++ 		       crypto_skcipher_blocksize(generic_tfm));
++ 		err = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * Now generate test vectors using the generic implementation, and test
++ 	 * the other implementation against them.
++ 	 */
++ 
++ 	vec.key = kmalloc(maxkeysize, GFP_KERNEL);
++ 	vec.iv = kmalloc(ivsize, GFP_KERNEL);
++ 	vec.ptext = kmalloc(maxdatasize, GFP_KERNEL);
++ 	vec.ctext = kmalloc(maxdatasize, GFP_KERNEL);
++ 	if (!vec.key || !vec.iv || !vec.ptext || !vec.ctext) {
++ 		err = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	for (i = 0; i < fuzz_iterations * 8; i++) {
++ 		generate_random_cipher_testvec(generic_req, &vec, maxdatasize,
++ 					       vec_name, sizeof(vec_name));
++ 		generate_random_testvec_config(cfg, cfgname, sizeof(cfgname));
++ 
++ 		err = test_skcipher_vec_cfg(ENCRYPT, &vec, vec_name,
++ 					    cfg, req, tsgls);
++ 		if (err)
++ 			goto out;
++ 		err = test_skcipher_vec_cfg(DECRYPT, &vec, vec_name,
++ 					    cfg, req, tsgls);
++ 		if (err)
++ 			goto out;
++ 		cond_resched();
++ 	}
++ 	err = 0;
++ out:
++ 	kfree(cfg);
++ 	kfree(vec.key);
++ 	kfree(vec.iv);
++ 	kfree(vec.ptext);
++ 	kfree(vec.ctext);
++ 	crypto_free_skcipher(generic_tfm);
++ 	skcipher_request_free(generic_req);
++ 	return err;
++ }
++ #else /* !CONFIG_CRYPTO_MANAGER_EXTRA_TESTS */
++ static int test_skcipher_vs_generic_impl(const char *generic_driver,
++ 					 struct skcipher_request *req,
++ 					 struct cipher_test_sglists *tsgls)
++ {
++ 	return 0;
++ }
++ #endif /* !CONFIG_CRYPTO_MANAGER_EXTRA_TESTS */
++ 
++ static int test_skcipher(int enc, const struct cipher_test_suite *suite,
++ 			 struct skcipher_request *req,
++ 			 struct cipher_test_sglists *tsgls)
++ {
++ 	unsigned int i;
++ 	int err;
++ 
++ 	for (i = 0; i < suite->count; i++) {
++ 		err = test_skcipher_vec(enc, &suite->vecs[i], i, req, tsgls);
++ 		if (err)
++ 			return err;
++ 		cond_resched();
++ 	}
++ 	return 0;
++ }
++ 
++ static int alg_test_skcipher(const struct alg_test_desc *desc,
++ 			     const char *driver, u32 type, u32 mask)
++ {
++ 	const struct cipher_test_suite *suite = &desc->suite.cipher;
++ 	struct crypto_skcipher *tfm;
++ 	struct skcipher_request *req = NULL;
++ 	struct cipher_test_sglists *tsgls = NULL;
++ 	int err;
++ 
++ 	if (suite->count <= 0) {
++ 		pr_err("alg: skcipher: empty test suite for %s\n", driver);
++ 		return -EINVAL;
++ 	}
++ 
++ 	tfm = crypto_alloc_skcipher(driver, type, mask);
++ 	if (IS_ERR(tfm)) {
++ 		pr_err("alg: skcipher: failed to allocate transform for %s: %ld\n",
++ 		       driver, PTR_ERR(tfm));
++ 		return PTR_ERR(tfm);
++ 	}
++ 	driver = crypto_skcipher_driver_name(tfm);
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  
+  	req = skcipher_request_alloc(tfm, GFP_KERNEL);
+  	if (!req) {
+diff --cc drivers/infiniband/hw/hns/hns_roce_ah.c
+index b222dce832f0,480c062dd04f..000000000000
+--- a/drivers/infiniband/hw/hns/hns_roce_ah.c
++++ b/drivers/infiniband/hw/hns/hns_roce_ah.c
+@@@ -35,9 -35,20 +35,26 @@@
+  #include <rdma/ib_cache.h>
+  #include "hns_roce_device.h"
+  
+++<<<<<<< HEAD
+ +#define HNS_ROCE_PORT_NUM_SHIFT		24
+ +#define HNS_ROCE_VLAN_SL_BIT_MASK	7
+ +#define HNS_ROCE_VLAN_SL_SHIFT		13
+++=======
++ static inline u16 get_ah_udp_sport(const struct rdma_ah_attr *ah_attr)
++ {
++ 	u32 fl = ah_attr->grh.flow_label;
++ 	u16 sport;
++ 
++ 	if (!fl)
++ 		sport = prandom_u32_max(IB_ROCE_UDP_ENCAP_VALID_PORT_MAX + 1 -
++ 					IB_ROCE_UDP_ENCAP_VALID_PORT_MIN) +
++ 			IB_ROCE_UDP_ENCAP_VALID_PORT_MIN;
++ 	else
++ 		sport = rdma_flow_label_to_udp_sport(fl);
++ 
++ 	return sport;
++ }
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  
+  int hns_roce_create_ah(struct ib_ah *ibah, struct rdma_ah_init_attr *init_attr,
+  		       struct ib_udata *udata)
+diff --cc drivers/mmc/host/dw_mmc.c
+index 80dc2fd6576c,c78bbc22e0d1..000000000000
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@@ -1813,6 -1821,73 +1813,76 @@@ static const struct mmc_host_ops dw_mci
+  	.prepare_hs400_tuning	= dw_mci_prepare_hs400_tuning,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_FAULT_INJECTION
++ static enum hrtimer_restart dw_mci_fault_timer(struct hrtimer *t)
++ {
++ 	struct dw_mci *host = container_of(t, struct dw_mci, fault_timer);
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&host->irq_lock, flags);
++ 
++ 	/*
++ 	 * Only inject an error if we haven't already got an error or data over
++ 	 * interrupt.
++ 	 */
++ 	if (!host->data_status) {
++ 		host->data_status = SDMMC_INT_DCRC;
++ 		set_bit(EVENT_DATA_ERROR, &host->pending_events);
++ 		tasklet_schedule(&host->tasklet);
++ 	}
++ 
++ 	spin_unlock_irqrestore(&host->irq_lock, flags);
++ 
++ 	return HRTIMER_NORESTART;
++ }
++ 
++ static void dw_mci_start_fault_timer(struct dw_mci *host)
++ {
++ 	struct mmc_data *data = host->data;
++ 
++ 	if (!data || data->blocks <= 1)
++ 		return;
++ 
++ 	if (!should_fail(&host->fail_data_crc, 1))
++ 		return;
++ 
++ 	/*
++ 	 * Try to inject the error at random points during the data transfer.
++ 	 */
++ 	hrtimer_start(&host->fault_timer,
++ 		      ms_to_ktime(prandom_u32_max(25)),
++ 		      HRTIMER_MODE_REL);
++ }
++ 
++ static void dw_mci_stop_fault_timer(struct dw_mci *host)
++ {
++ 	hrtimer_cancel(&host->fault_timer);
++ }
++ 
++ static void dw_mci_init_fault(struct dw_mci *host)
++ {
++ 	host->fail_data_crc = (struct fault_attr) FAULT_ATTR_INITIALIZER;
++ 
++ 	hrtimer_init(&host->fault_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++ 	host->fault_timer.function = dw_mci_fault_timer;
++ }
++ #else
++ static void dw_mci_init_fault(struct dw_mci *host)
++ {
++ }
++ 
++ static void dw_mci_start_fault_timer(struct dw_mci *host)
++ {
++ }
++ 
++ static void dw_mci_stop_fault_timer(struct dw_mci *host)
++ {
++ }
++ #endif
++ 
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  static void dw_mci_request_end(struct dw_mci *host, struct mmc_request *mrq)
+  	__releases(&host->lock)
+  	__acquires(&host->lock)
+diff --cc drivers/net/phy/at803x.c
+index f3ad34a377df,349b7b1dbbf2..000000000000
+--- a/drivers/net/phy/at803x.c
++++ b/drivers/net/phy/at803x.c
+@@@ -1093,6 -1610,409 +1093,412 @@@ static int at803x_cable_test_start(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int qca83xx_config_init(struct phy_device *phydev)
++ {
++ 	u8 switch_revision;
++ 
++ 	switch_revision = phydev->dev_flags & QCA8K_DEVFLAGS_REVISION_MASK;
++ 
++ 	switch (switch_revision) {
++ 	case 1:
++ 		/* For 100M waveform */
++ 		at803x_debug_reg_write(phydev, AT803X_DEBUG_ANALOG_TEST_CTRL, 0x02ea);
++ 		/* Turn on Gigabit clock */
++ 		at803x_debug_reg_write(phydev, AT803X_DEBUG_REG_GREEN, 0x68a0);
++ 		break;
++ 
++ 	case 2:
++ 		phy_write_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_ADV, 0x0);
++ 		fallthrough;
++ 	case 4:
++ 		phy_write_mmd(phydev, MDIO_MMD_PCS, MDIO_AZ_DEBUG, 0x803f);
++ 		at803x_debug_reg_write(phydev, AT803X_DEBUG_REG_GREEN, 0x6860);
++ 		at803x_debug_reg_write(phydev, AT803X_DEBUG_SYSTEM_CTRL_MODE, 0x2c46);
++ 		at803x_debug_reg_write(phydev, AT803X_DEBUG_REG_3C, 0x6000);
++ 		break;
++ 	}
++ 
++ 	/* QCA8327 require DAC amplitude adjustment for 100m set to +6%.
++ 	 * Disable on init and enable only with 100m speed following
++ 	 * qca original source code.
++ 	 */
++ 	if (phydev->drv->phy_id == QCA8327_A_PHY_ID ||
++ 	    phydev->drv->phy_id == QCA8327_B_PHY_ID)
++ 		at803x_debug_reg_mask(phydev, AT803X_DEBUG_ANALOG_TEST_CTRL,
++ 				      QCA8327_DEBUG_MANU_CTRL_EN, 0);
++ 
++ 	/* Following original QCA sourcecode set port to prefer master */
++ 	phy_set_bits(phydev, MII_CTRL1000, CTL1000_PREFER_MASTER);
++ 
++ 	return 0;
++ }
++ 
++ static void qca83xx_link_change_notify(struct phy_device *phydev)
++ {
++ 	/* QCA8337 doesn't require DAC Amplitude adjustement */
++ 	if (phydev->drv->phy_id == QCA8337_PHY_ID)
++ 		return;
++ 
++ 	/* Set DAC Amplitude adjustment to +6% for 100m on link running */
++ 	if (phydev->state == PHY_RUNNING) {
++ 		if (phydev->speed == SPEED_100)
++ 			at803x_debug_reg_mask(phydev, AT803X_DEBUG_ANALOG_TEST_CTRL,
++ 					      QCA8327_DEBUG_MANU_CTRL_EN,
++ 					      QCA8327_DEBUG_MANU_CTRL_EN);
++ 	} else {
++ 		/* Reset DAC Amplitude adjustment */
++ 		at803x_debug_reg_mask(phydev, AT803X_DEBUG_ANALOG_TEST_CTRL,
++ 				      QCA8327_DEBUG_MANU_CTRL_EN, 0);
++ 	}
++ }
++ 
++ static int qca83xx_resume(struct phy_device *phydev)
++ {
++ 	int ret, val;
++ 
++ 	/* Skip reset if not suspended */
++ 	if (!phydev->suspended)
++ 		return 0;
++ 
++ 	/* Reinit the port, reset values set by suspend */
++ 	qca83xx_config_init(phydev);
++ 
++ 	/* Reset the port on port resume */
++ 	phy_set_bits(phydev, MII_BMCR, BMCR_RESET | BMCR_ANENABLE);
++ 
++ 	/* On resume from suspend the switch execute a reset and
++ 	 * restart auto-negotiation. Wait for reset to complete.
++ 	 */
++ 	ret = phy_read_poll_timeout(phydev, MII_BMCR, val, !(val & BMCR_RESET),
++ 				    50000, 600000, true);
++ 	if (ret)
++ 		return ret;
++ 
++ 	msleep(1);
++ 
++ 	return 0;
++ }
++ 
++ static int qca83xx_suspend(struct phy_device *phydev)
++ {
++ 	u16 mask = 0;
++ 
++ 	/* Only QCA8337 support actual suspend.
++ 	 * QCA8327 cause port unreliability when phy suspend
++ 	 * is set.
++ 	 */
++ 	if (phydev->drv->phy_id == QCA8337_PHY_ID) {
++ 		genphy_suspend(phydev);
++ 	} else {
++ 		mask |= ~(BMCR_SPEED1000 | BMCR_FULLDPLX);
++ 		phy_modify(phydev, MII_BMCR, mask, 0);
++ 	}
++ 
++ 	at803x_debug_reg_mask(phydev, AT803X_DEBUG_REG_GREEN,
++ 			      AT803X_DEBUG_GATE_CLK_IN1000, 0);
++ 
++ 	at803x_debug_reg_mask(phydev, AT803X_DEBUG_REG_HIB_CTRL,
++ 			      AT803X_DEBUG_HIB_CTRL_EN_ANY_CHANGE |
++ 			      AT803X_DEBUG_HIB_CTRL_SEL_RST_80U, 0);
++ 
++ 	return 0;
++ }
++ 
++ static int qca808x_phy_fast_retrain_config(struct phy_device *phydev)
++ {
++ 	int ret;
++ 
++ 	/* Enable fast retrain */
++ 	ret = genphy_c45_fast_retrain(phydev, true);
++ 	if (ret)
++ 		return ret;
++ 
++ 	phy_write_mmd(phydev, MDIO_MMD_AN, QCA808X_PHY_MMD7_TOP_OPTION1,
++ 			QCA808X_TOP_OPTION1_DATA);
++ 	phy_write_mmd(phydev, MDIO_MMD_PMAPMD, QCA808X_PHY_MMD1_MSE_THRESHOLD_20DB,
++ 			QCA808X_MSE_THRESHOLD_20DB_VALUE);
++ 	phy_write_mmd(phydev, MDIO_MMD_PMAPMD, QCA808X_PHY_MMD1_MSE_THRESHOLD_17DB,
++ 			QCA808X_MSE_THRESHOLD_17DB_VALUE);
++ 	phy_write_mmd(phydev, MDIO_MMD_PMAPMD, QCA808X_PHY_MMD1_MSE_THRESHOLD_27DB,
++ 			QCA808X_MSE_THRESHOLD_27DB_VALUE);
++ 	phy_write_mmd(phydev, MDIO_MMD_PMAPMD, QCA808X_PHY_MMD1_MSE_THRESHOLD_28DB,
++ 			QCA808X_MSE_THRESHOLD_28DB_VALUE);
++ 	phy_write_mmd(phydev, MDIO_MMD_PCS, QCA808X_PHY_MMD3_DEBUG_1,
++ 			QCA808X_MMD3_DEBUG_1_VALUE);
++ 	phy_write_mmd(phydev, MDIO_MMD_PCS, QCA808X_PHY_MMD3_DEBUG_4,
++ 			QCA808X_MMD3_DEBUG_4_VALUE);
++ 	phy_write_mmd(phydev, MDIO_MMD_PCS, QCA808X_PHY_MMD3_DEBUG_5,
++ 			QCA808X_MMD3_DEBUG_5_VALUE);
++ 	phy_write_mmd(phydev, MDIO_MMD_PCS, QCA808X_PHY_MMD3_DEBUG_3,
++ 			QCA808X_MMD3_DEBUG_3_VALUE);
++ 	phy_write_mmd(phydev, MDIO_MMD_PCS, QCA808X_PHY_MMD3_DEBUG_6,
++ 			QCA808X_MMD3_DEBUG_6_VALUE);
++ 	phy_write_mmd(phydev, MDIO_MMD_PCS, QCA808X_PHY_MMD3_DEBUG_2,
++ 			QCA808X_MMD3_DEBUG_2_VALUE);
++ 
++ 	return 0;
++ }
++ 
++ static int qca808x_phy_ms_random_seed_set(struct phy_device *phydev)
++ {
++ 	u16 seed_value = prandom_u32_max(QCA808X_MASTER_SLAVE_SEED_RANGE);
++ 
++ 	return at803x_debug_reg_mask(phydev, QCA808X_PHY_DEBUG_LOCAL_SEED,
++ 			QCA808X_MASTER_SLAVE_SEED_CFG,
++ 			FIELD_PREP(QCA808X_MASTER_SLAVE_SEED_CFG, seed_value));
++ }
++ 
++ static int qca808x_phy_ms_seed_enable(struct phy_device *phydev, bool enable)
++ {
++ 	u16 seed_enable = 0;
++ 
++ 	if (enable)
++ 		seed_enable = QCA808X_MASTER_SLAVE_SEED_ENABLE;
++ 
++ 	return at803x_debug_reg_mask(phydev, QCA808X_PHY_DEBUG_LOCAL_SEED,
++ 			QCA808X_MASTER_SLAVE_SEED_ENABLE, seed_enable);
++ }
++ 
++ static int qca808x_config_init(struct phy_device *phydev)
++ {
++ 	int ret;
++ 
++ 	/* Active adc&vga on 802.3az for the link 1000M and 100M */
++ 	ret = phy_modify_mmd(phydev, MDIO_MMD_PCS, QCA808X_PHY_MMD3_ADDR_CLD_CTRL7,
++ 			QCA808X_8023AZ_AFE_CTRL_MASK, QCA808X_8023AZ_AFE_EN);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Adjust the threshold on 802.3az for the link 1000M */
++ 	ret = phy_write_mmd(phydev, MDIO_MMD_PCS,
++ 			QCA808X_PHY_MMD3_AZ_TRAINING_CTRL, QCA808X_MMD3_AZ_TRAINING_VAL);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Config the fast retrain for the link 2500M */
++ 	ret = qca808x_phy_fast_retrain_config(phydev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Configure lower ramdom seed to make phy linked as slave mode */
++ 	ret = qca808x_phy_ms_random_seed_set(phydev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Enable seed */
++ 	ret = qca808x_phy_ms_seed_enable(phydev, true);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Configure adc threshold as 100mv for the link 10M */
++ 	return at803x_debug_reg_mask(phydev, QCA808X_PHY_DEBUG_ADC_THRESHOLD,
++ 			QCA808X_ADC_THRESHOLD_MASK, QCA808X_ADC_THRESHOLD_100MV);
++ }
++ 
++ static int qca808x_read_status(struct phy_device *phydev)
++ {
++ 	int ret;
++ 
++ 	ret = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_10GBT_STAT);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	linkmode_mod_bit(ETHTOOL_LINK_MODE_2500baseT_Full_BIT, phydev->lp_advertising,
++ 			ret & MDIO_AN_10GBT_STAT_LP2_5G);
++ 
++ 	ret = genphy_read_status(phydev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = at803x_read_specific_status(phydev);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (phydev->link) {
++ 		if (phydev->speed == SPEED_2500)
++ 			phydev->interface = PHY_INTERFACE_MODE_2500BASEX;
++ 		else
++ 			phydev->interface = PHY_INTERFACE_MODE_SGMII;
++ 	} else {
++ 		/* generate seed as a lower random value to make PHY linked as SLAVE easily,
++ 		 * except for master/slave configuration fault detected.
++ 		 * the reason for not putting this code into the function link_change_notify is
++ 		 * the corner case where the link partner is also the qca8081 PHY and the seed
++ 		 * value is configured as the same value, the link can't be up and no link change
++ 		 * occurs.
++ 		 */
++ 		if (phydev->master_slave_state == MASTER_SLAVE_STATE_ERR) {
++ 			qca808x_phy_ms_seed_enable(phydev, false);
++ 		} else {
++ 			qca808x_phy_ms_random_seed_set(phydev);
++ 			qca808x_phy_ms_seed_enable(phydev, true);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int qca808x_soft_reset(struct phy_device *phydev)
++ {
++ 	int ret;
++ 
++ 	ret = genphy_soft_reset(phydev);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	return qca808x_phy_ms_seed_enable(phydev, true);
++ }
++ 
++ static bool qca808x_cdt_fault_length_valid(int cdt_code)
++ {
++ 	switch (cdt_code) {
++ 	case QCA808X_CDT_STATUS_STAT_SHORT:
++ 	case QCA808X_CDT_STATUS_STAT_OPEN:
++ 		return true;
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ static int qca808x_cable_test_result_trans(int cdt_code)
++ {
++ 	switch (cdt_code) {
++ 	case QCA808X_CDT_STATUS_STAT_NORMAL:
++ 		return ETHTOOL_A_CABLE_RESULT_CODE_OK;
++ 	case QCA808X_CDT_STATUS_STAT_SHORT:
++ 		return ETHTOOL_A_CABLE_RESULT_CODE_SAME_SHORT;
++ 	case QCA808X_CDT_STATUS_STAT_OPEN:
++ 		return ETHTOOL_A_CABLE_RESULT_CODE_OPEN;
++ 	case QCA808X_CDT_STATUS_STAT_FAIL:
++ 	default:
++ 		return ETHTOOL_A_CABLE_RESULT_CODE_UNSPEC;
++ 	}
++ }
++ 
++ static int qca808x_cdt_fault_length(struct phy_device *phydev, int pair)
++ {
++ 	int val;
++ 	u32 cdt_length_reg = 0;
++ 
++ 	switch (pair) {
++ 	case ETHTOOL_A_CABLE_PAIR_A:
++ 		cdt_length_reg = QCA808X_MMD3_CDT_DIAG_PAIR_A;
++ 		break;
++ 	case ETHTOOL_A_CABLE_PAIR_B:
++ 		cdt_length_reg = QCA808X_MMD3_CDT_DIAG_PAIR_B;
++ 		break;
++ 	case ETHTOOL_A_CABLE_PAIR_C:
++ 		cdt_length_reg = QCA808X_MMD3_CDT_DIAG_PAIR_C;
++ 		break;
++ 	case ETHTOOL_A_CABLE_PAIR_D:
++ 		cdt_length_reg = QCA808X_MMD3_CDT_DIAG_PAIR_D;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_PCS, cdt_length_reg);
++ 	if (val < 0)
++ 		return val;
++ 
++ 	return (FIELD_GET(QCA808X_CDT_DIAG_LENGTH, val) * 824) / 10;
++ }
++ 
++ static int qca808x_cable_test_start(struct phy_device *phydev)
++ {
++ 	int ret;
++ 
++ 	/* perform CDT with the following configs:
++ 	 * 1. disable hibernation.
++ 	 * 2. force PHY working in MDI mode.
++ 	 * 3. for PHY working in 1000BaseT.
++ 	 * 4. configure the threshold.
++ 	 */
++ 
++ 	ret = at803x_debug_reg_mask(phydev, QCA808X_DBG_AN_TEST, QCA808X_HIBERNATION_EN, 0);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	ret = at803x_config_mdix(phydev, ETH_TP_MDI);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/* Force 1000base-T needs to configure PMA/PMD and MII_BMCR */
++ 	phydev->duplex = DUPLEX_FULL;
++ 	phydev->speed = SPEED_1000;
++ 	ret = genphy_c45_pma_setup_forced(phydev);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	ret = genphy_setup_forced(phydev);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/* configure the thresholds for open, short, pair ok test */
++ 	phy_write_mmd(phydev, MDIO_MMD_PCS, 0x8074, 0xc040);
++ 	phy_write_mmd(phydev, MDIO_MMD_PCS, 0x8076, 0xc040);
++ 	phy_write_mmd(phydev, MDIO_MMD_PCS, 0x8077, 0xa060);
++ 	phy_write_mmd(phydev, MDIO_MMD_PCS, 0x8078, 0xc050);
++ 	phy_write_mmd(phydev, MDIO_MMD_PCS, 0x807a, 0xc060);
++ 	phy_write_mmd(phydev, MDIO_MMD_PCS, 0x807e, 0xb060);
++ 
++ 	return 0;
++ }
++ 
++ static int qca808x_cable_test_get_status(struct phy_device *phydev, bool *finished)
++ {
++ 	int ret, val;
++ 	int pair_a, pair_b, pair_c, pair_d;
++ 
++ 	*finished = false;
++ 
++ 	ret = at803x_cdt_start(phydev, 0);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = at803x_cdt_wait_for_completion(phydev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_PCS, QCA808X_MMD3_CDT_STATUS);
++ 	if (val < 0)
++ 		return val;
++ 
++ 	pair_a = FIELD_GET(QCA808X_CDT_CODE_PAIR_A, val);
++ 	pair_b = FIELD_GET(QCA808X_CDT_CODE_PAIR_B, val);
++ 	pair_c = FIELD_GET(QCA808X_CDT_CODE_PAIR_C, val);
++ 	pair_d = FIELD_GET(QCA808X_CDT_CODE_PAIR_D, val);
++ 
++ 	ethnl_cable_test_result(phydev, ETHTOOL_A_CABLE_PAIR_A,
++ 				qca808x_cable_test_result_trans(pair_a));
++ 	ethnl_cable_test_result(phydev, ETHTOOL_A_CABLE_PAIR_B,
++ 				qca808x_cable_test_result_trans(pair_b));
++ 	ethnl_cable_test_result(phydev, ETHTOOL_A_CABLE_PAIR_C,
++ 				qca808x_cable_test_result_trans(pair_c));
++ 	ethnl_cable_test_result(phydev, ETHTOOL_A_CABLE_PAIR_D,
++ 				qca808x_cable_test_result_trans(pair_d));
++ 
++ 	if (qca808x_cdt_fault_length_valid(pair_a))
++ 		ethnl_cable_test_fault_length(phydev, ETHTOOL_A_CABLE_PAIR_A,
++ 				qca808x_cdt_fault_length(phydev, ETHTOOL_A_CABLE_PAIR_A));
++ 	if (qca808x_cdt_fault_length_valid(pair_b))
++ 		ethnl_cable_test_fault_length(phydev, ETHTOOL_A_CABLE_PAIR_B,
++ 				qca808x_cdt_fault_length(phydev, ETHTOOL_A_CABLE_PAIR_B));
++ 	if (qca808x_cdt_fault_length_valid(pair_c))
++ 		ethnl_cable_test_fault_length(phydev, ETHTOOL_A_CABLE_PAIR_C,
++ 				qca808x_cdt_fault_length(phydev, ETHTOOL_A_CABLE_PAIR_C));
++ 	if (qca808x_cdt_fault_length_valid(pair_d))
++ 		ethnl_cable_test_fault_length(phydev, ETHTOOL_A_CABLE_PAIR_D,
++ 				qca808x_cdt_fault_length(phydev, ETHTOOL_A_CABLE_PAIR_D));
++ 
++ 	*finished = true;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  static struct phy_driver at803x_driver[] = {
+  {
+  	/* Qualcomm Atheros AR8035 */
+diff --cc fs/f2fs/gc.c
+index 9093be6e7a7d,4546e01b2ee0..000000000000
+--- a/fs/f2fs/gc.c
++++ b/fs/f2fs/gc.c
+@@@ -196,7 -281,9 +196,13 @@@ static void select_policy(struct f2fs_s
+  		p->max_search = sbi->max_victim_search;
+  
+  	/* let's select beginning hot/small space first in no_heap mode*/
+++<<<<<<< HEAD
+ +	if (test_opt(sbi, NOHEAP) &&
+++=======
++ 	if (f2fs_need_rand_seg(sbi))
++ 		p->offset = prandom_u32_max(MAIN_SECS(sbi) * sbi->segs_per_sec);
++ 	else if (test_opt(sbi, NOHEAP) &&
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  		(type == CURSEG_HOT_DATA || IS_NODESEG(type)))
+  		p->offset = 0;
+  	else
+diff --cc fs/f2fs/segment.c
+index 9efce174c51a,acf3d3fa4363..000000000000
+--- a/fs/f2fs/segment.c
++++ b/fs/f2fs/segment.c
+@@@ -2151,12 -2529,26 +2151,22 @@@ static void reset_curseg(struct f2fs_sb
+  
+  static unsigned int __get_next_segno(struct f2fs_sb_info *sbi, int type)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct curseg_info *curseg = CURSEG_I(sbi, type);
++ 	unsigned short seg_type = curseg->seg_type;
++ 
++ 	sanity_check_seg_type(sbi, seg_type);
++ 	if (f2fs_need_rand_seg(sbi))
++ 		return prandom_u32_max(MAIN_SECS(sbi) * sbi->segs_per_sec);
++ 
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  	/* if segs_per_sec is large than 1, we need to keep original policy. */
+ -	if (__is_large_section(sbi))
+ -		return curseg->segno;
+ -
+ -	/* inmem log may not locate on any segment after mount */
+ -	if (!curseg->inited)
+ -		return 0;
+ -
+ -	if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED)))
+ -		return 0;
+ +	if (sbi->segs_per_sec != 1)
+ +		return CURSEG_I(sbi, type)->segno;
+  
+  	if (test_opt(sbi, NOHEAP) &&
+ -		(seg_type == CURSEG_HOT_DATA || IS_NODESEG(seg_type)))
+ +		(type == CURSEG_HOT_DATA || IS_NODESEG(type)))
+  		return 0;
+  
+  	if (SIT_I(sbi)->last_victim[ALLOC_NEXT])
+@@@ -2192,12 -2586,15 +2202,18 @@@ static void new_curseg(struct f2fs_sb_i
+  	curseg->next_segno = segno;
+  	reset_curseg(sbi, type, 1);
+  	curseg->alloc_type = LFS;
+++<<<<<<< HEAD
+++=======
++ 	if (F2FS_OPTION(sbi).fs_mode == FS_MODE_FRAGMENT_BLK)
++ 		curseg->fragment_remained_chunk =
++ 				prandom_u32_max(sbi->max_fragment_chunk) + 1;
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  }
+  
+ -static int __next_free_blkoff(struct f2fs_sb_info *sbi,
+ -					int segno, block_t start)
+ +static void __next_free_blkoff(struct f2fs_sb_info *sbi,
+ +			struct curseg_info *seg, block_t start)
+  {
+ -	struct seg_entry *se = get_seg_entry(sbi, segno);
+ +	struct seg_entry *se = get_seg_entry(sbi, seg->segno);
+  	int entries = SIT_VBLOCK_MAP_SIZE / sizeof(unsigned long);
+  	unsigned long *target_map = SIT_I(sbi)->tmp_map;
+  	unsigned long *ckpt_map = (unsigned long *)se->ckpt_valid_map;
+@@@ -2220,10 -2615,27 +2236,28 @@@
+  static void __refresh_next_blkoff(struct f2fs_sb_info *sbi,
+  				struct curseg_info *seg)
+  {
+ -	if (seg->alloc_type == SSR) {
+ -		seg->next_blkoff =
+ -			__next_free_blkoff(sbi, seg->segno,
+ -						seg->next_blkoff + 1);
+ -	} else {
+ +	if (seg->alloc_type == SSR)
+ +		__next_free_blkoff(sbi, seg, seg->next_blkoff + 1);
+ +	else
+  		seg->next_blkoff++;
+++<<<<<<< HEAD
+++=======
++ 		if (F2FS_OPTION(sbi).fs_mode == FS_MODE_FRAGMENT_BLK) {
++ 			/* To allocate block chunks in different sizes, use random number */
++ 			if (--seg->fragment_remained_chunk <= 0) {
++ 				seg->fragment_remained_chunk =
++ 				   prandom_u32_max(sbi->max_fragment_chunk) + 1;
++ 				seg->next_blkoff +=
++ 				   prandom_u32_max(sbi->max_fragment_hole) + 1;
++ 			}
++ 		}
++ 	}
++ }
++ 
++ bool f2fs_segment_has_free_slot(struct f2fs_sb_info *sbi, int segno)
++ {
++ 	return __next_free_blkoff(sbi, segno, 0) < sbi->blocks_per_seg;
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  }
+  
+  /*
+diff --cc include/linux/nodemask.h
+index 3107aef23235,efef68c9352a..000000000000
+--- a/include/linux/nodemask.h
++++ b/include/linux/nodemask.h
+@@@ -495,14 -502,28 +495,32 @@@ static inline int num_node_state(enum n
+  
+  #endif
+  
+ -static inline int node_random(const nodemask_t *maskp)
+ -{
+  #if defined(CONFIG_NUMA) && (MAX_NUMNODES > 1)
+++<<<<<<< HEAD
+ +extern int node_random(const nodemask_t *maskp);
+++=======
++ 	int w, bit;
++ 
++ 	w = nodes_weight(*maskp);
++ 	switch (w) {
++ 	case 0:
++ 		bit = NUMA_NO_NODE;
++ 		break;
++ 	case 1:
++ 		bit = first_node(*maskp);
++ 		break;
++ 	default:
++ 		bit = find_nth_bit(maskp->bits, MAX_NUMNODES, prandom_u32_max(w));
++ 		break;
++ 	}
++ 	return bit;
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  #else
+ +static inline int node_random(const nodemask_t *mask)
+ +{
+  	return 0;
+ -#endif
+  }
+ +#endif
+  
+  #define node_online_map 	node_states[N_ONLINE]
+  #define node_possible_map 	node_states[N_POSSIBLE]
+diff --cc kernel/bpf/core.c
+index 7d76b902c771,53c6c98bda7b..000000000000
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@@ -892,10 -1029,10 +892,10 @@@ bpf_jit_binary_alloc(unsigned int progl
+  	/* Fill space with illegal/arch-dep instructions. */
+  	bpf_fill_ill_insns(hdr, size);
+  
+ -	hdr->size = size;
+ +	hdr->pages = pages;
+  	hole = min_t(unsigned int, size - (proglen + sizeof(*hdr)),
+  		     PAGE_SIZE - sizeof(*hdr));
+- 	start = (get_random_int() % hole) & ~(alignment - 1);
++ 	start = prandom_u32_max(hole) & ~(alignment - 1);
+  
+  	/* Leave a random number of instructions before BPF code. */
+  	*image_ptr = &hdr->image[start];
+@@@ -905,10 -1042,122 +905,126 @@@
+  
+  void bpf_jit_binary_free(struct bpf_binary_header *hdr)
+  {
+ -	u32 size = hdr->size;
+ +	u32 pages = hdr->pages;
+  
+  	bpf_jit_free_exec(hdr);
+++<<<<<<< HEAD
+ +	bpf_jit_uncharge_modmem(pages);
+++=======
++ 	bpf_jit_uncharge_modmem(size);
++ }
++ 
++ /* Allocate jit binary from bpf_prog_pack allocator.
++  * Since the allocated memory is RO+X, the JIT engine cannot write directly
++  * to the memory. To solve this problem, a RW buffer is also allocated at
++  * as the same time. The JIT engine should calculate offsets based on the
++  * RO memory address, but write JITed program to the RW buffer. Once the
++  * JIT engine finishes, it calls bpf_jit_binary_pack_finalize, which copies
++  * the JITed program to the RO memory.
++  */
++ struct bpf_binary_header *
++ bpf_jit_binary_pack_alloc(unsigned int proglen, u8 **image_ptr,
++ 			  unsigned int alignment,
++ 			  struct bpf_binary_header **rw_header,
++ 			  u8 **rw_image,
++ 			  bpf_jit_fill_hole_t bpf_fill_ill_insns)
++ {
++ 	struct bpf_binary_header *ro_header;
++ 	u32 size, hole, start;
++ 
++ 	WARN_ON_ONCE(!is_power_of_2(alignment) ||
++ 		     alignment > BPF_IMAGE_ALIGNMENT);
++ 
++ 	/* add 16 bytes for a random section of illegal instructions */
++ 	size = round_up(proglen + sizeof(*ro_header) + 16, BPF_PROG_CHUNK_SIZE);
++ 
++ 	if (bpf_jit_charge_modmem(size))
++ 		return NULL;
++ 	ro_header = bpf_prog_pack_alloc(size, bpf_fill_ill_insns);
++ 	if (!ro_header) {
++ 		bpf_jit_uncharge_modmem(size);
++ 		return NULL;
++ 	}
++ 
++ 	*rw_header = kvmalloc(size, GFP_KERNEL);
++ 	if (!*rw_header) {
++ 		bpf_arch_text_copy(&ro_header->size, &size, sizeof(size));
++ 		bpf_prog_pack_free(ro_header);
++ 		bpf_jit_uncharge_modmem(size);
++ 		return NULL;
++ 	}
++ 
++ 	/* Fill space with illegal/arch-dep instructions. */
++ 	bpf_fill_ill_insns(*rw_header, size);
++ 	(*rw_header)->size = size;
++ 
++ 	hole = min_t(unsigned int, size - (proglen + sizeof(*ro_header)),
++ 		     BPF_PROG_CHUNK_SIZE - sizeof(*ro_header));
++ 	start = prandom_u32_max(hole) & ~(alignment - 1);
++ 
++ 	*image_ptr = &ro_header->image[start];
++ 	*rw_image = &(*rw_header)->image[start];
++ 
++ 	return ro_header;
++ }
++ 
++ /* Copy JITed text from rw_header to its final location, the ro_header. */
++ int bpf_jit_binary_pack_finalize(struct bpf_prog *prog,
++ 				 struct bpf_binary_header *ro_header,
++ 				 struct bpf_binary_header *rw_header)
++ {
++ 	void *ptr;
++ 
++ 	ptr = bpf_arch_text_copy(ro_header, rw_header, rw_header->size);
++ 
++ 	kvfree(rw_header);
++ 
++ 	if (IS_ERR(ptr)) {
++ 		bpf_prog_pack_free(ro_header);
++ 		return PTR_ERR(ptr);
++ 	}
++ 	return 0;
++ }
++ 
++ /* bpf_jit_binary_pack_free is called in two different scenarios:
++  *   1) when the program is freed after;
++  *   2) when the JIT engine fails (before bpf_jit_binary_pack_finalize).
++  * For case 2), we need to free both the RO memory and the RW buffer.
++  *
++  * bpf_jit_binary_pack_free requires proper ro_header->size. However,
++  * bpf_jit_binary_pack_alloc does not set it. Therefore, ro_header->size
++  * must be set with either bpf_jit_binary_pack_finalize (normal path) or
++  * bpf_arch_text_copy (when jit fails).
++  */
++ void bpf_jit_binary_pack_free(struct bpf_binary_header *ro_header,
++ 			      struct bpf_binary_header *rw_header)
++ {
++ 	u32 size = ro_header->size;
++ 
++ 	bpf_prog_pack_free(ro_header);
++ 	kvfree(rw_header);
++ 	bpf_jit_uncharge_modmem(size);
++ }
++ 
++ struct bpf_binary_header *
++ bpf_jit_binary_pack_hdr(const struct bpf_prog *fp)
++ {
++ 	unsigned long real_start = (unsigned long)fp->bpf_func;
++ 	unsigned long addr;
++ 
++ 	addr = real_start & BPF_PROG_CHUNK_MASK;
++ 	return (void *)addr;
++ }
++ 
++ static inline struct bpf_binary_header *
++ bpf_jit_binary_hdr(const struct bpf_prog *fp)
++ {
++ 	unsigned long real_start = (unsigned long)fp->bpf_func;
++ 	unsigned long addr;
++ 
++ 	addr = real_start & PAGE_MASK;
++ 	return (void *)addr;
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  }
+  
+  /* This symbol is only overridden by archs that have different
+diff --cc kernel/time/clocksource.c
+index 8b91ac6c88ec,8058bec87ace..000000000000
+--- a/kernel/time/clocksource.c
++++ b/kernel/time/clocksource.c
+@@@ -198,12 -205,193 +198,194 @@@ void clocksource_mark_unstable(struct c
+  	spin_unlock_irqrestore(&watchdog_lock, flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ ulong max_cswd_read_retries = 2;
++ module_param(max_cswd_read_retries, ulong, 0644);
++ EXPORT_SYMBOL_GPL(max_cswd_read_retries);
++ static int verify_n_cpus = 8;
++ module_param(verify_n_cpus, int, 0644);
++ 
++ enum wd_read_status {
++ 	WD_READ_SUCCESS,
++ 	WD_READ_UNSTABLE,
++ 	WD_READ_SKIP
++ };
++ 
++ static enum wd_read_status cs_watchdog_read(struct clocksource *cs, u64 *csnow, u64 *wdnow)
++ {
++ 	unsigned int nretries;
++ 	u64 wd_end, wd_end2, wd_delta;
++ 	int64_t wd_delay, wd_seq_delay;
++ 
++ 	for (nretries = 0; nretries <= max_cswd_read_retries; nretries++) {
++ 		local_irq_disable();
++ 		*wdnow = watchdog->read(watchdog);
++ 		*csnow = cs->read(cs);
++ 		wd_end = watchdog->read(watchdog);
++ 		wd_end2 = watchdog->read(watchdog);
++ 		local_irq_enable();
++ 
++ 		wd_delta = clocksource_delta(wd_end, *wdnow, watchdog->mask);
++ 		wd_delay = clocksource_cyc2ns(wd_delta, watchdog->mult,
++ 					      watchdog->shift);
++ 		if (wd_delay <= WATCHDOG_MAX_SKEW) {
++ 			if (nretries > 1 || nretries >= max_cswd_read_retries) {
++ 				pr_warn("timekeeping watchdog on CPU%d: %s retried %d times before success\n",
++ 					smp_processor_id(), watchdog->name, nretries);
++ 			}
++ 			return WD_READ_SUCCESS;
++ 		}
++ 
++ 		/*
++ 		 * Now compute delay in consecutive watchdog read to see if
++ 		 * there is too much external interferences that cause
++ 		 * significant delay in reading both clocksource and watchdog.
++ 		 *
++ 		 * If consecutive WD read-back delay > WATCHDOG_MAX_SKEW/2,
++ 		 * report system busy, reinit the watchdog and skip the current
++ 		 * watchdog test.
++ 		 */
++ 		wd_delta = clocksource_delta(wd_end2, wd_end, watchdog->mask);
++ 		wd_seq_delay = clocksource_cyc2ns(wd_delta, watchdog->mult, watchdog->shift);
++ 		if (wd_seq_delay > WATCHDOG_MAX_SKEW/2)
++ 			goto skip_test;
++ 	}
++ 
++ 	pr_warn("timekeeping watchdog on CPU%d: %s read-back delay of %lldns, attempt %d, marking unstable\n",
++ 		smp_processor_id(), watchdog->name, wd_delay, nretries);
++ 	return WD_READ_UNSTABLE;
++ 
++ skip_test:
++ 	pr_info("timekeeping watchdog on CPU%d: %s wd-wd read-back delay of %lldns\n",
++ 		smp_processor_id(), watchdog->name, wd_seq_delay);
++ 	pr_info("wd-%s-wd read-back delay of %lldns, clock-skew test skipped!\n",
++ 		cs->name, wd_delay);
++ 	return WD_READ_SKIP;
++ }
++ 
++ static u64 csnow_mid;
++ static cpumask_t cpus_ahead;
++ static cpumask_t cpus_behind;
++ static cpumask_t cpus_chosen;
++ 
++ static void clocksource_verify_choose_cpus(void)
++ {
++ 	int cpu, i, n = verify_n_cpus;
++ 
++ 	if (n < 0) {
++ 		/* Check all of the CPUs. */
++ 		cpumask_copy(&cpus_chosen, cpu_online_mask);
++ 		cpumask_clear_cpu(smp_processor_id(), &cpus_chosen);
++ 		return;
++ 	}
++ 
++ 	/* If no checking desired, or no other CPU to check, leave. */
++ 	cpumask_clear(&cpus_chosen);
++ 	if (n == 0 || num_online_cpus() <= 1)
++ 		return;
++ 
++ 	/* Make sure to select at least one CPU other than the current CPU. */
++ 	cpu = cpumask_first(cpu_online_mask);
++ 	if (cpu == smp_processor_id())
++ 		cpu = cpumask_next(cpu, cpu_online_mask);
++ 	if (WARN_ON_ONCE(cpu >= nr_cpu_ids))
++ 		return;
++ 	cpumask_set_cpu(cpu, &cpus_chosen);
++ 
++ 	/* Force a sane value for the boot parameter. */
++ 	if (n > nr_cpu_ids)
++ 		n = nr_cpu_ids;
++ 
++ 	/*
++ 	 * Randomly select the specified number of CPUs.  If the same
++ 	 * CPU is selected multiple times, that CPU is checked only once,
++ 	 * and no replacement CPU is selected.  This gracefully handles
++ 	 * situations where verify_n_cpus is greater than the number of
++ 	 * CPUs that are currently online.
++ 	 */
++ 	for (i = 1; i < n; i++) {
++ 		cpu = prandom_u32_max(nr_cpu_ids);
++ 		cpu = cpumask_next(cpu - 1, cpu_online_mask);
++ 		if (cpu >= nr_cpu_ids)
++ 			cpu = cpumask_first(cpu_online_mask);
++ 		if (!WARN_ON_ONCE(cpu >= nr_cpu_ids))
++ 			cpumask_set_cpu(cpu, &cpus_chosen);
++ 	}
++ 
++ 	/* Don't verify ourselves. */
++ 	cpumask_clear_cpu(smp_processor_id(), &cpus_chosen);
++ }
++ 
++ static void clocksource_verify_one_cpu(void *csin)
++ {
++ 	struct clocksource *cs = (struct clocksource *)csin;
++ 
++ 	csnow_mid = cs->read(cs);
++ }
++ 
++ void clocksource_verify_percpu(struct clocksource *cs)
++ {
++ 	int64_t cs_nsec, cs_nsec_max = 0, cs_nsec_min = LLONG_MAX;
++ 	u64 csnow_begin, csnow_end;
++ 	int cpu, testcpu;
++ 	s64 delta;
++ 
++ 	if (verify_n_cpus == 0)
++ 		return;
++ 	cpumask_clear(&cpus_ahead);
++ 	cpumask_clear(&cpus_behind);
++ 	cpus_read_lock();
++ 	preempt_disable();
++ 	clocksource_verify_choose_cpus();
++ 	if (cpumask_empty(&cpus_chosen)) {
++ 		preempt_enable();
++ 		cpus_read_unlock();
++ 		pr_warn("Not enough CPUs to check clocksource '%s'.\n", cs->name);
++ 		return;
++ 	}
++ 	testcpu = smp_processor_id();
++ 	pr_warn("Checking clocksource %s synchronization from CPU %d to CPUs %*pbl.\n", cs->name, testcpu, cpumask_pr_args(&cpus_chosen));
++ 	for_each_cpu(cpu, &cpus_chosen) {
++ 		if (cpu == testcpu)
++ 			continue;
++ 		csnow_begin = cs->read(cs);
++ 		smp_call_function_single(cpu, clocksource_verify_one_cpu, cs, 1);
++ 		csnow_end = cs->read(cs);
++ 		delta = (s64)((csnow_mid - csnow_begin) & cs->mask);
++ 		if (delta < 0)
++ 			cpumask_set_cpu(cpu, &cpus_behind);
++ 		delta = (csnow_end - csnow_mid) & cs->mask;
++ 		if (delta < 0)
++ 			cpumask_set_cpu(cpu, &cpus_ahead);
++ 		delta = clocksource_delta(csnow_end, csnow_begin, cs->mask);
++ 		cs_nsec = clocksource_cyc2ns(delta, cs->mult, cs->shift);
++ 		if (cs_nsec > cs_nsec_max)
++ 			cs_nsec_max = cs_nsec;
++ 		if (cs_nsec < cs_nsec_min)
++ 			cs_nsec_min = cs_nsec;
++ 	}
++ 	preempt_enable();
++ 	cpus_read_unlock();
++ 	if (!cpumask_empty(&cpus_ahead))
++ 		pr_warn("        CPUs %*pbl ahead of CPU %d for clocksource %s.\n",
++ 			cpumask_pr_args(&cpus_ahead), testcpu, cs->name);
++ 	if (!cpumask_empty(&cpus_behind))
++ 		pr_warn("        CPUs %*pbl behind CPU %d for clocksource %s.\n",
++ 			cpumask_pr_args(&cpus_behind), testcpu, cs->name);
++ 	if (!cpumask_empty(&cpus_ahead) || !cpumask_empty(&cpus_behind))
++ 		pr_warn("        CPU %d check durations %lldns - %lldns for clocksource %s.\n",
++ 			testcpu, cs_nsec_min, cs_nsec_max, cs->name);
++ }
++ EXPORT_SYMBOL_GPL(clocksource_verify_percpu);
++ 
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  static void clocksource_watchdog(struct timer_list *unused)
+  {
+ +	struct clocksource *cs;
+  	u64 csnow, wdnow, cslast, wdlast, delta;
+ -	int next_cpu, reset_pending;
+  	int64_t wd_nsec, cs_nsec;
+ -	struct clocksource *cs;
+ -	enum wd_read_status read_ret;
+ -	u32 md;
+ +	int next_cpu, reset_pending;
+  
+  	spin_lock(&watchdog_lock);
+  	if (!watchdog_running)
+diff --cc lib/sbitmap.c
+index 0956b5ca3935,055dac069afb..000000000000
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@@ -42,13 -29,12 +42,18 @@@ static int init_alloc_hint(struct sbitm
+  static inline unsigned update_alloc_hint_before_get(struct sbitmap *sb,
+  						    unsigned int depth)
+  {
+ +	unsigned int __percpu *alloc_hint = *SB_ALLOC_HINT_PTR(sb);
+  	unsigned hint;
+  
+ -	hint = this_cpu_read(*sb->alloc_hint);
+ +	hint = this_cpu_read(*alloc_hint);
+  	if (unlikely(hint >= depth)) {
+++<<<<<<< HEAD
+ +		hint = depth ? prandom_u32() % depth : 0;
+ +		this_cpu_write(*alloc_hint, hint);
+++=======
++ 		hint = depth ? prandom_u32_max(depth) : 0;
++ 		this_cpu_write(*sb->alloc_hint, hint);
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  	}
+  
+  	return hint;
+diff --cc lib/test_kasan.c
+index ab6bd7f3db58,2503ae2ae65d..000000000000
+--- a/lib/test_kasan.c
++++ b/lib/test_kasan.c
+@@@ -1057,6 -1309,18 +1057,21 @@@ static void match_all_not_assigned(stru
+  		KUNIT_EXPECT_LT(test, (u8)get_tag(ptr), (u8)KASAN_TAG_KERNEL);
+  		free_pages((unsigned long)ptr, order);
+  	}
+++<<<<<<< HEAD:lib/test_kasan.c
+++=======
++ 
++ 	if (!IS_ENABLED(CONFIG_KASAN_VMALLOC))
++ 		return;
++ 
++ 	for (i = 0; i < 256; i++) {
++ 		size = prandom_u32_max(1024) + 1;
++ 		ptr = vmalloc(size);
++ 		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
++ 		KUNIT_EXPECT_GE(test, (u8)get_tag(ptr), (u8)KASAN_TAG_MIN);
++ 		KUNIT_EXPECT_LT(test, (u8)get_tag(ptr), (u8)KASAN_TAG_KERNEL);
++ 		vfree(ptr);
++ 	}
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1):mm/kasan/kasan_test.c
+  }
+  
+  /* Check that 0xff works as a match-all pointer tag for tag-based modes. */
+diff --cc net/core/pktgen.c
+index e791962b909f,5ca4f953034c..000000000000
+--- a/net/core/pktgen.c
++++ b/net/core/pktgen.c
+@@@ -2489,6 -2587,14 +2488,17 @@@ static void mod_cur_headers(struct pktg
+  				t = pkt_dev->min_pkt_size;
+  		}
+  		pkt_dev->cur_pkt_size = t;
+++<<<<<<< HEAD
+++=======
++ 	} else if (pkt_dev->n_imix_entries > 0) {
++ 		struct imix_pkt *entry;
++ 		__u32 t = prandom_u32_max(IMIX_PRECISION);
++ 		__u8 entry_index = pkt_dev->imix_distribution[t];
++ 
++ 		entry = &pkt_dev->imix_entries[entry_index];
++ 		entry->count_so_far++;
++ 		pkt_dev->cur_pkt_size = entry->size;
+++>>>>>>> 81895a65ec63 (treewide: use prandom_u32_max() when possible, part 1)
+  	}
+  
+  	set_cur_queue_map(pkt_dev);
+* Unmerged path arch/loongarch/kernel/process.c
+* Unmerged path arch/loongarch/kernel/vdso.c
+* Unmerged path arch/parisc/kernel/vdso.c
+* Unmerged path drivers/infiniband/ulp/rtrs/rtrs-clt.c
+* Unmerged path drivers/media/test-drivers/vivid/vivid-touch-cap.c
+* Unmerged path lib/reed_solomon/test_rslib.c
+* Unmerged path net/netfilter/ipvs/ip_vs_twos.c
+diff --git a/arch/arm/kernel/process.c b/arch/arm/kernel/process.c
+index d9c299133111..2c2e2055cff7 100644
+--- a/arch/arm/kernel/process.c
++++ b/arch/arm/kernel/process.c
+@@ -394,7 +394,7 @@ static unsigned long sigpage_addr(const struct mm_struct *mm,
+ 
+ 	slots = ((last - first) >> PAGE_SHIFT) + 1;
+ 
+-	offset = get_random_int() % slots;
++	offset = prandom_u32_max(slots);
+ 
+ 	addr = first + (offset << PAGE_SHIFT);
+ 
+diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
+index c5ade249ec70..2789b9955774 100644
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -611,7 +611,7 @@ unsigned long get_wchan(struct task_struct *p)
+ unsigned long arch_align_stack(unsigned long sp)
+ {
+ 	if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+-		sp -= get_random_int() & ~PAGE_MASK;
++		sp -= prandom_u32_max(PAGE_SIZE);
+ 	return sp & ~0xf;
+ }
+ 
+* Unmerged path arch/loongarch/kernel/process.c
+* Unmerged path arch/loongarch/kernel/vdso.c
+diff --git a/arch/mips/kernel/process.c b/arch/mips/kernel/process.c
+index 9670e70139fd..901161e0e3b4 100644
+--- a/arch/mips/kernel/process.c
++++ b/arch/mips/kernel/process.c
+@@ -651,7 +651,7 @@ unsigned long get_wchan(struct task_struct *task)
+ unsigned long arch_align_stack(unsigned long sp)
+ {
+ 	if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+-		sp -= get_random_int() & ~PAGE_MASK;
++		sp -= prandom_u32_max(PAGE_SIZE);
+ 
+ 	return sp & ALMASK;
+ }
+* Unmerged path arch/mips/kernel/vdso.c
+* Unmerged path arch/parisc/kernel/vdso.c
+diff --git a/arch/powerpc/kernel/process.c b/arch/powerpc/kernel/process.c
+index 911a19258011..c0c0442c61d1 100644
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@ -2175,7 +2175,7 @@ void notrace __ppc64_runlatch_off(void)
+ unsigned long arch_align_stack(unsigned long sp)
+ {
+ 	if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+-		sp -= get_random_int() & ~PAGE_MASK;
++		sp -= prandom_u32_max(PAGE_SIZE);
+ 	return sp & ~0xf;
+ }
+ 
+diff --git a/arch/s390/kernel/process.c b/arch/s390/kernel/process.c
+index 9c89d715e3dc..2ef9a84efac5 100644
+--- a/arch/s390/kernel/process.c
++++ b/arch/s390/kernel/process.c
+@@ -223,7 +223,7 @@ unsigned long get_wchan(struct task_struct *p)
+ unsigned long arch_align_stack(unsigned long sp)
+ {
+ 	if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+-		sp -= get_random_int() & ~PAGE_MASK;
++		sp -= prandom_u32_max(PAGE_SIZE);
+ 	return sp & ~0xf;
+ }
+ 
+* Unmerged path arch/s390/kernel/vdso.c
+diff --git a/arch/sparc/vdso/vma.c b/arch/sparc/vdso/vma.c
+index f51595f861b8..580e7768b2fa 100644
+--- a/arch/sparc/vdso/vma.c
++++ b/arch/sparc/vdso/vma.c
+@@ -167,7 +167,7 @@ static unsigned long vdso_addr(unsigned long start, unsigned int len)
+ 	unsigned int offset;
+ 
+ 	/* This loses some more bits than a modulo, but is cheaper */
+-	offset = get_random_int() & (PTRS_PER_PTE - 1);
++	offset = prandom_u32_max(PTRS_PER_PTE);
+ 	return start + (offset << PAGE_SHIFT);
+ }
+ 
+diff --git a/arch/um/kernel/process.c b/arch/um/kernel/process.c
+index 691b83b10649..4c02c42323b4 100644
+--- a/arch/um/kernel/process.c
++++ b/arch/um/kernel/process.c
+@@ -352,7 +352,7 @@ int singlestepping(void * t)
+ unsigned long arch_align_stack(unsigned long sp)
+ {
+ 	if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+-		sp -= get_random_int() % 8192;
++		sp -= prandom_u32_max(8192);
+ 	return sp & ~0xf;
+ }
+ #endif
+diff --git a/arch/x86/entry/vdso/vma.c b/arch/x86/entry/vdso/vma.c
+index 21866de9aa69..bda54b8e398e 100644
+--- a/arch/x86/entry/vdso/vma.c
++++ b/arch/x86/entry/vdso/vma.c
+@@ -343,7 +343,7 @@ static unsigned long vdso_addr(unsigned long start, unsigned len)
+ 	end -= len;
+ 
+ 	if (end > start) {
+-		offset = get_random_int() % (((end - start) >> PAGE_SHIFT) + 1);
++		offset = prandom_u32_max(((end - start) >> PAGE_SHIFT) + 1);
+ 		addr = start + (offset << PAGE_SHIFT);
+ 	} else {
+ 		addr = start;
+diff --git a/arch/x86/kernel/module.c b/arch/x86/kernel/module.c
+index e18a12d64318..8281cbd968b8 100644
+--- a/arch/x86/kernel/module.c
++++ b/arch/x86/kernel/module.c
+@@ -65,7 +65,7 @@ static unsigned long int get_module_load_offset(void)
+ 		 */
+ 		if (module_load_offset == 0)
+ 			module_load_offset =
+-				(get_random_int() % 1024 + 1) * PAGE_SIZE;
++				(prandom_u32_max(1024) + 1) * PAGE_SIZE;
+ 		mutex_unlock(&module_kaslr_mutex);
+ 	}
+ 	return module_load_offset;
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index a62f200aa736..69d03aa75479 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -939,7 +939,7 @@ early_param("idle", idle_setup);
+ unsigned long arch_align_stack(unsigned long sp)
+ {
+ 	if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+-		sp -= get_random_int() % 8192;
++		sp -= prandom_u32_max(8192);
+ 	return sp & ~0xf;
+ }
+ 
+diff --git a/arch/x86/mm/pat/cpa-test.c b/arch/x86/mm/pat/cpa-test.c
+index facce271e8b9..d184def2c3d4 100644
+--- a/arch/x86/mm/pat/cpa-test.c
++++ b/arch/x86/mm/pat/cpa-test.c
+@@ -137,10 +137,10 @@ static int pageattr_test(void)
+ 	failed += print_split(&sa);
+ 
+ 	for (i = 0; i < NTEST; i++) {
+-		unsigned long pfn = prandom_u32() % max_pfn_mapped;
++		unsigned long pfn = prandom_u32_max(max_pfn_mapped);
+ 
+ 		addr[i] = (unsigned long)__va(pfn << PAGE_SHIFT);
+-		len[i] = prandom_u32() % NPAGES;
++		len[i] = prandom_u32_max(NPAGES);
+ 		len[i] = min_t(unsigned long, len[i], max_pfn_mapped - pfn - 1);
+ 
+ 		if (len[i] == 0)
+* Unmerged path crypto/testmgr.c
+diff --git a/drivers/block/drbd/drbd_receiver.c b/drivers/block/drbd/drbd_receiver.c
+index 1c486b55de07..0e2a1cce84ce 100644
+--- a/drivers/block/drbd/drbd_receiver.c
++++ b/drivers/block/drbd/drbd_receiver.c
+@@ -790,7 +790,7 @@ static struct socket *drbd_wait_for_connect(struct drbd_connection *connection,
+ 
+ 	timeo = connect_int * HZ;
+ 	/* 28.5% random jitter */
+-	timeo += (prandom_u32() & 1) ? timeo / 7 : -timeo / 7;
++	timeo += prandom_u32_max(2) ? timeo / 7 : -timeo / 7;
+ 
+ 	err = wait_for_completion_interruptible_timeout(&ad->door_bell, timeo);
+ 	if (err <= 0)
+@@ -1013,7 +1013,7 @@ static int conn_connect(struct drbd_connection *connection)
+ 				drbd_warn(connection, "Error receiving initial packet\n");
+ 				sock_release(s);
+ randomize:
+-				if (prandom_u32() & 1)
++				if (prandom_u32_max(2))
+ 					goto retry;
+ 			}
+ 		}
+diff --git a/drivers/crypto/chelsio/chtls/chtls_io.c b/drivers/crypto/chelsio/chtls/chtls_io.c
+index 2e26b79b2857..a552af302491 100644
+--- a/drivers/crypto/chelsio/chtls/chtls_io.c
++++ b/drivers/crypto/chelsio/chtls/chtls_io.c
+@@ -931,8 +931,8 @@ static int csk_wait_memory(struct chtls_dev *cdev,
+ 	noblock = (*timeo_p ? false : true);
+ 	sndbuf = cdev->max_host_sndbuf;
+ 	if (csk_mem_free(cdev, sk)) {
+-		current_timeo = (prandom_u32() % (HZ / 5)) + 2;
+-		vm_wait = (prandom_u32() % (HZ / 5)) + 2;
++		current_timeo = prandom_u32_max(HZ / 5) + 2;
++		vm_wait = prandom_u32_max(HZ / 5) + 2;
+ 	}
+ 
+ 	add_wait_queue(sk_sleep(sk), &wait);
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+index 140a795f707f..87f72c9d58ab 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+@@ -2461,7 +2461,7 @@ gen8_dispatch_bsd_engine(struct drm_i915_private *dev_priv,
+ 	/* Check whether the file_priv has already selected one ring. */
+ 	if ((int)file_priv->bsd_engine < 0)
+ 		file_priv->bsd_engine =
+-			get_random_int() % num_vcs_engines(dev_priv);
++			prandom_u32_max(num_vcs_engines(dev_priv));
+ 
+ 	return file_priv->bsd_engine;
+ }
+diff --git a/drivers/infiniband/core/cma.c b/drivers/infiniband/core/cma.c
+index c32d1ffd7703..26d1772179b8 100644
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@ -3807,7 +3807,7 @@ static int cma_alloc_any_port(enum rdma_ucm_port_space ps,
+ 
+ 	inet_get_local_port_range(net, &low, &high);
+ 	remaining = (high - low) + 1;
+-	rover = prandom_u32() % remaining + low;
++	rover = prandom_u32_max(remaining) + low;
+ retry:
+ 	if (last_used_port != rover) {
+ 		struct rdma_bind_list *bind_list;
+diff --git a/drivers/infiniband/hw/cxgb4/id_table.c b/drivers/infiniband/hw/cxgb4/id_table.c
+index f64e7e02b129..280d61466855 100644
+--- a/drivers/infiniband/hw/cxgb4/id_table.c
++++ b/drivers/infiniband/hw/cxgb4/id_table.c
+@@ -54,7 +54,7 @@ u32 c4iw_id_alloc(struct c4iw_id_table *alloc)
+ 
+ 	if (obj < alloc->max) {
+ 		if (alloc->flags & C4IW_ID_TABLE_F_RANDOM)
+-			alloc->last += prandom_u32() % RANDOM_SKIP;
++			alloc->last += prandom_u32_max(RANDOM_SKIP);
+ 		else
+ 			alloc->last = obj + 1;
+ 		if (alloc->last >= alloc->max)
+@@ -85,7 +85,7 @@ int c4iw_id_table_alloc(struct c4iw_id_table *alloc, u32 start, u32 num,
+ 	alloc->start = start;
+ 	alloc->flags = flags;
+ 	if (flags & C4IW_ID_TABLE_F_RANDOM)
+-		alloc->last = prandom_u32() % RANDOM_SKIP;
++		alloc->last = prandom_u32_max(RANDOM_SKIP);
+ 	else
+ 		alloc->last = 0;
+ 	alloc->max = num;
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_ah.c
+* Unmerged path drivers/infiniband/ulp/rtrs/rtrs-clt.c
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index 4dfc7b36b405..1bf8e02930ea 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -402,7 +402,7 @@ static bool check_should_bypass(struct cached_dev *dc, struct bio *bio)
+ 	}
+ 
+ 	if (bypass_torture_test(dc)) {
+-		if ((get_random_int() & 3) == 3)
++		if (prandom_u32_max(4) == 3)
+ 			goto skip;
+ 		else
+ 			goto rescale;
+* Unmerged path drivers/media/test-drivers/vivid/vivid-touch-cap.c
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index e8a14a936cc7..7f2c24e1acb5 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -99,8 +99,8 @@ static void mmc_should_fail_request(struct mmc_host *host,
+ 	    !should_fail(&host->fail_mmc_request, data->blksz * data->blocks))
+ 		return;
+ 
+-	data->error = data_errors[prandom_u32() % ARRAY_SIZE(data_errors)];
+-	data->bytes_xfered = (prandom_u32() % (data->bytes_xfered >> 9)) << 9;
++	data->error = data_errors[prandom_u32_max(ARRAY_SIZE(data_errors))];
++	data->bytes_xfered = prandom_u32_max(data->bytes_xfered >> 9) << 9;
+ }
+ 
+ #else /* CONFIG_FAIL_MMC_REQUEST */
+* Unmerged path drivers/mmc/host/dw_mmc.c
+diff --git a/drivers/mtd/nand/raw/nandsim.c b/drivers/mtd/nand/raw/nandsim.c
+index f8edacde49ab..80049cac4bae 100644
+--- a/drivers/mtd/nand/raw/nandsim.c
++++ b/drivers/mtd/nand/raw/nandsim.c
+@@ -1416,9 +1416,9 @@ static void do_bit_flips(struct nandsim *ns, int num)
+ 	if (bitflips && prandom_u32() < (1 << 22)) {
+ 		int flips = 1;
+ 		if (bitflips > 1)
+-			flips = (prandom_u32() % (int) bitflips) + 1;
++			flips = prandom_u32_max(bitflips) + 1;
+ 		while (flips--) {
+-			int pos = prandom_u32() % (num * 8);
++			int pos = prandom_u32_max(num * 8);
+ 			ns->buf.byte[pos / 8] ^= (1 << (pos % 8));
+ 			NS_WARN("read_page: flipping bit %d in page %d "
+ 				"reading from %d ecc: corrected=%u failed=%u\n",
+diff --git a/drivers/mtd/tests/mtd_nandecctest.c b/drivers/mtd/tests/mtd_nandecctest.c
+index 88b6c81cebbe..102f9763ed74 100644
+--- a/drivers/mtd/tests/mtd_nandecctest.c
++++ b/drivers/mtd/tests/mtd_nandecctest.c
+@@ -46,7 +46,7 @@ struct nand_ecc_test {
+ static void single_bit_error_data(void *error_data, void *correct_data,
+ 				size_t size)
+ {
+-	unsigned int offset = prandom_u32() % (size * BITS_PER_BYTE);
++	unsigned int offset = prandom_u32_max(size * BITS_PER_BYTE);
+ 
+ 	memcpy(error_data, correct_data, size);
+ 	__change_bit_le(offset, error_data);
+@@ -57,9 +57,9 @@ static void double_bit_error_data(void *error_data, void *correct_data,
+ {
+ 	unsigned int offset[2];
+ 
+-	offset[0] = prandom_u32() % (size * BITS_PER_BYTE);
++	offset[0] = prandom_u32_max(size * BITS_PER_BYTE);
+ 	do {
+-		offset[1] = prandom_u32() % (size * BITS_PER_BYTE);
++		offset[1] = prandom_u32_max(size * BITS_PER_BYTE);
+ 	} while (offset[0] == offset[1]);
+ 
+ 	memcpy(error_data, correct_data, size);
+@@ -70,7 +70,7 @@ static void double_bit_error_data(void *error_data, void *correct_data,
+ 
+ static unsigned int random_ecc_bit(size_t size)
+ {
+-	unsigned int offset = prandom_u32() % (3 * BITS_PER_BYTE);
++	unsigned int offset = prandom_u32_max(3 * BITS_PER_BYTE);
+ 
+ 	if (size == 256) {
+ 		/*
+@@ -78,7 +78,7 @@ static unsigned int random_ecc_bit(size_t size)
+ 		 * and 17th bit) in ECC code for 256 byte data block
+ 		 */
+ 		while (offset == 16 || offset == 17)
+-			offset = prandom_u32() % (3 * BITS_PER_BYTE);
++			offset = prandom_u32_max(3 * BITS_PER_BYTE);
+ 	}
+ 
+ 	return offset;
+diff --git a/drivers/mtd/tests/stresstest.c b/drivers/mtd/tests/stresstest.c
+index 0fe1217f94b9..6ef1184f6382 100644
+--- a/drivers/mtd/tests/stresstest.c
++++ b/drivers/mtd/tests/stresstest.c
+@@ -57,9 +57,8 @@ static int rand_eb(void)
+ 	unsigned int eb;
+ 
+ again:
+-	eb = prandom_u32();
+ 	/* Read or write up 2 eraseblocks at a time - hence 'ebcnt - 1' */
+-	eb %= (ebcnt - 1);
++	eb = prandom_u32_max(ebcnt - 1);
+ 	if (bbt[eb])
+ 		goto again;
+ 	return eb;
+@@ -67,20 +66,12 @@ static int rand_eb(void)
+ 
+ static int rand_offs(void)
+ {
+-	unsigned int offs;
+-
+-	offs = prandom_u32();
+-	offs %= bufsize;
+-	return offs;
++	return prandom_u32_max(bufsize);
+ }
+ 
+ static int rand_len(int offs)
+ {
+-	unsigned int len;
+-
+-	len = prandom_u32();
+-	len %= (bufsize - offs);
+-	return len;
++	return prandom_u32_max(bufsize - offs);
+ }
+ 
+ static int do_read(void)
+@@ -139,7 +130,7 @@ static int do_write(void)
+ 
+ static int do_operation(void)
+ {
+-	if (prandom_u32() & 1)
++	if (prandom_u32_max(2))
+ 		return do_read();
+ 	else
+ 		return do_write();
+diff --git a/drivers/mtd/ubi/debug.c b/drivers/mtd/ubi/debug.c
+index 7bc96294ae4d..7c58b572404a 100644
+--- a/drivers/mtd/ubi/debug.c
++++ b/drivers/mtd/ubi/debug.c
+@@ -655,7 +655,7 @@ int ubi_dbg_power_cut(struct ubi_device *ubi, int caller)
+ 
+ 		if (ubi->dbg.power_cut_max > ubi->dbg.power_cut_min) {
+ 			range = ubi->dbg.power_cut_max - ubi->dbg.power_cut_min;
+-			ubi->dbg.power_cut_counter += prandom_u32() % range;
++			ubi->dbg.power_cut_counter += prandom_u32_max(range);
+ 		}
+ 		return 0;
+ 	}
+diff --git a/drivers/mtd/ubi/debug.h b/drivers/mtd/ubi/debug.h
+index eb8985e5c178..f5a15d80c529 100644
+--- a/drivers/mtd/ubi/debug.h
++++ b/drivers/mtd/ubi/debug.h
+@@ -86,7 +86,7 @@ static inline int ubi_dbg_is_bgt_disabled(const struct ubi_device *ubi)
+ static inline int ubi_dbg_is_bitflip(const struct ubi_device *ubi)
+ {
+ 	if (ubi->dbg.emulate_bitflips)
+-		return !(prandom_u32() % 200);
++		return !prandom_u32_max(200);
+ 	return 0;
+ }
+ 
+@@ -100,7 +100,7 @@ static inline int ubi_dbg_is_bitflip(const struct ubi_device *ubi)
+ static inline int ubi_dbg_is_write_failure(const struct ubi_device *ubi)
+ {
+ 	if (ubi->dbg.emulate_io_failures)
+-		return !(prandom_u32() % 500);
++		return !prandom_u32_max(500);
+ 	return 0;
+ }
+ 
+@@ -114,7 +114,7 @@ static inline int ubi_dbg_is_write_failure(const struct ubi_device *ubi)
+ static inline int ubi_dbg_is_erase_failure(const struct ubi_device *ubi)
+ {
+ 	if (ubi->dbg.emulate_io_failures)
+-		return !(prandom_u32() % 400);
++		return !prandom_u32_max(400);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/broadcom/cnic.c b/drivers/net/ethernet/broadcom/cnic.c
+index 38fdc6da2b97..e83c1abecae8 100644
+--- a/drivers/net/ethernet/broadcom/cnic.c
++++ b/drivers/net/ethernet/broadcom/cnic.c
+@@ -4103,8 +4103,7 @@ static int cnic_cm_alloc_mem(struct cnic_dev *dev)
+ 	for (i = 0; i < MAX_CM_SK_TBL_SZ; i++)
+ 		atomic_set(&cp->csk_tbl[i].ref_count, 0);
+ 
+-	port_id = prandom_u32();
+-	port_id %= CNIC_LOCAL_PORT_RANGE;
++	port_id = prandom_u32_max(CNIC_LOCAL_PORT_RANGE);
+ 	if (cnic_init_id_tbl(&cp->csk_port_tbl, CNIC_LOCAL_PORT_RANGE,
+ 			     CNIC_LOCAL_PORT_MIN, port_id)) {
+ 		cnic_cm_free_mem(dev);
+diff --git a/drivers/net/hamradio/baycom_epp.c b/drivers/net/hamradio/baycom_epp.c
+index 1e62d00732f2..275180795f98 100644
+--- a/drivers/net/hamradio/baycom_epp.c
++++ b/drivers/net/hamradio/baycom_epp.c
+@@ -453,7 +453,7 @@ static int transmit(struct baycom_state *bc, int cnt, unsigned char stat)
+ 			if ((--bc->hdlctx.slotcnt) > 0)
+ 				return 0;
+ 			bc->hdlctx.slotcnt = bc->ch_params.slottime;
+-			if ((prandom_u32() % 256) > bc->ch_params.ppersist)
++			if (prandom_u32_max(256) > bc->ch_params.ppersist)
+ 				return 0;
+ 		}
+ 	}
+diff --git a/drivers/net/hamradio/hdlcdrv.c b/drivers/net/hamradio/hdlcdrv.c
+index 97e3bc60c3e7..482005777276 100644
+--- a/drivers/net/hamradio/hdlcdrv.c
++++ b/drivers/net/hamradio/hdlcdrv.c
+@@ -389,7 +389,7 @@ void hdlcdrv_arbitrate(struct net_device *dev, struct hdlcdrv_state *s)
+ 	if ((--s->hdlctx.slotcnt) > 0)
+ 		return;
+ 	s->hdlctx.slotcnt = s->ch_params.slottime;
+-	if ((prandom_u32() % 256) > s->ch_params.ppersist)
++	if (prandom_u32_max(256) > s->ch_params.ppersist)
+ 		return;
+ 	start_tx(dev, s);
+ }
+diff --git a/drivers/net/hamradio/yam.c b/drivers/net/hamradio/yam.c
+index 16ec7af6ab7b..41cc688578f9 100644
+--- a/drivers/net/hamradio/yam.c
++++ b/drivers/net/hamradio/yam.c
+@@ -641,7 +641,7 @@ static void yam_arbitrate(struct net_device *dev)
+ 	yp->slotcnt = yp->slot / 10;
+ 
+ 	/* is random > persist ? */
+-	if ((prandom_u32() % 256) > yp->pers)
++	if (prandom_u32_max(256) > yp->pers)
+ 		return;
+ 
+ 	yam_start_tx(dev, yp);
+* Unmerged path drivers/net/phy/at803x.c
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/p2p.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/p2p.c
+index 479041f070f9..10d9d9c63b28 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/p2p.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/p2p.c
+@@ -1128,7 +1128,7 @@ static void brcmf_p2p_afx_handler(struct work_struct *work)
+ 	if (afx_hdl->is_listen && afx_hdl->my_listen_chan)
+ 		/* 100ms ~ 300ms */
+ 		err = brcmf_p2p_discover_listen(p2p, afx_hdl->my_listen_chan,
+-						100 * (1 + prandom_u32() % 3));
++						100 * (1 + prandom_u32_max(3)));
+ 	else
+ 		err = brcmf_p2p_act_frm_search(p2p, afx_hdl->peer_listen_chan);
+ 
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mac-ctxt.c b/drivers/net/wireless/intel/iwlwifi/mvm/mac-ctxt.c
+index ed586e6d7d64..de0c545d50fd 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mac-ctxt.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mac-ctxt.c
+@@ -1099,7 +1099,7 @@ static void iwl_mvm_mac_ctxt_cmd_fill_ap(struct iwl_mvm *mvm,
+ 			iwl_mvm_mac_ap_iterator, &data);
+ 
+ 		if (data.beacon_device_ts) {
+-			u32 rand = (prandom_u32() % (64 - 36)) + 36;
++			u32 rand = prandom_u32_max(64 - 36) + 36;
+ 			mvmvif->ap_beacon_time = data.beacon_device_ts +
+ 				ieee80211_tu_to_usec(data.beacon_int * rand /
+ 						     100);
+diff --git a/drivers/scsi/fcoe/fcoe_ctlr.c b/drivers/scsi/fcoe/fcoe_ctlr.c
+index 1409c7687853..3d38e5f835e0 100644
+--- a/drivers/scsi/fcoe/fcoe_ctlr.c
++++ b/drivers/scsi/fcoe/fcoe_ctlr.c
+@@ -2241,7 +2241,7 @@ static void fcoe_ctlr_vn_restart(struct fcoe_ctlr *fip)
+ 
+ 	if (fip->probe_tries < FIP_VN_RLIM_COUNT) {
+ 		fip->probe_tries++;
+-		wait = prandom_u32() % FIP_VN_PROBE_WAIT;
++		wait = prandom_u32_max(FIP_VN_PROBE_WAIT);
+ 	} else
+ 		wait = FIP_VN_RLIM_INT;
+ 	mod_timer(&fip->timer, jiffies + msecs_to_jiffies(wait));
+@@ -3133,7 +3133,7 @@ static void fcoe_ctlr_vn_timeout(struct fcoe_ctlr *fip)
+ 					  fcoe_all_vn2vn, 0);
+ 			fip->port_ka_time = jiffies +
+ 				 msecs_to_jiffies(FIP_VN_BEACON_INT +
+-					(prandom_u32() % FIP_VN_BEACON_FUZZ));
++					prandom_u32_max(FIP_VN_BEACON_FUZZ));
+ 		}
+ 		if (time_before(fip->port_ka_time, next_time))
+ 			next_time = fip->port_ka_time;
+diff --git a/drivers/scsi/qedi/qedi_main.c b/drivers/scsi/qedi/qedi_main.c
+index d2d4f7fc7fd7..e317e91388c1 100644
+--- a/drivers/scsi/qedi/qedi_main.c
++++ b/drivers/scsi/qedi/qedi_main.c
+@@ -618,7 +618,7 @@ static int qedi_cm_alloc_mem(struct qedi_ctx *qedi)
+ 				sizeof(struct qedi_endpoint *)), GFP_KERNEL);
+ 	if (!qedi->ep_tbl)
+ 		return -ENOMEM;
+-	port_id = prandom_u32() % QEDI_LOCAL_PORT_RANGE;
++	port_id = prandom_u32_max(QEDI_LOCAL_PORT_RANGE);
+ 	if (qedi_init_id_tbl(&qedi->lcl_port_tbl, QEDI_LOCAL_PORT_RANGE,
+ 			     QEDI_LOCAL_PORT_MIN, port_id)) {
+ 		qedi_cm_free_mem(qedi);
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index 5349f6620f59..e7a850b965ad 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -344,7 +344,7 @@ static int ceph_fill_fragtree(struct inode *inode,
+ 	if (nsplits != ci->i_fragtree_nsplits) {
+ 		update = true;
+ 	} else if (nsplits) {
+-		i = prandom_u32() % nsplits;
++		i = prandom_u32_max(nsplits);
+ 		id = le32_to_cpu(fragtree->splits[i].frag);
+ 		if (!__ceph_find_frag(ci, id))
+ 			update = true;
+diff --git a/fs/ceph/mdsmap.c b/fs/ceph/mdsmap.c
+index 8d0a6d2c2da4..3fbabc98e1f7 100644
+--- a/fs/ceph/mdsmap.c
++++ b/fs/ceph/mdsmap.c
+@@ -29,7 +29,7 @@ static int __mdsmap_get_random_mds(struct ceph_mdsmap *m, bool ignore_laggy)
+ 		return -1;
+ 
+ 	/* pick */
+-	n = prandom_u32() % n;
++	n = prandom_u32_max(n);
+ 	for (j = 0, i = 0; i < m->possible_max_rank; i++) {
+ 		if (CEPH_MDS_IS_READY(i, ignore_laggy))
+ 			j++;
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index f8cd8d427861..83a44eebbb7b 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -3264,8 +3264,7 @@ static int ext4_lazyinit_thread(void *arg)
+ 			}
+ 			if (!progress) {
+ 				elr->lr_next_sched = jiffies +
+-					(prandom_u32()
+-					 % (EXT4_DEF_LI_MAX_START_DELAY * HZ));
++					prandom_u32_max(EXT4_DEF_LI_MAX_START_DELAY * HZ);
+ 			}
+ 			if (time_before(elr->lr_next_sched, next_wakeup))
+ 				next_wakeup = elr->lr_next_sched;
+@@ -3408,8 +3407,8 @@ static struct ext4_li_request *ext4_li_request_new(struct super_block *sb,
+ 	 * spread the inode table initialization requests
+ 	 * better.
+ 	 */
+-	elr->lr_next_sched = jiffies + (prandom_u32() %
+-				(EXT4_DEF_LI_MAX_START_DELAY * HZ));
++	elr->lr_next_sched = jiffies + prandom_u32_max(
++				EXT4_DEF_LI_MAX_START_DELAY * HZ);
+ 	return elr;
+ }
+ 
+* Unmerged path fs/f2fs/gc.c
+* Unmerged path fs/f2fs/segment.c
+diff --git a/fs/ubifs/debug.c b/fs/ubifs/debug.c
+index 7cd8a7b95299..400619ba9f84 100644
+--- a/fs/ubifs/debug.c
++++ b/fs/ubifs/debug.c
+@@ -2453,7 +2453,7 @@ int dbg_check_nondata_nodes_order(struct ubifs_info *c, struct list_head *head)
+ 
+ static inline int chance(unsigned int n, unsigned int out_of)
+ {
+-	return !!((prandom_u32() % out_of) + 1 <= n);
++	return !!(prandom_u32_max(out_of) + 1 <= n);
+ 
+ }
+ 
+@@ -2471,13 +2471,13 @@ static int power_cut_emulated(struct ubifs_info *c, int lnum, int write)
+ 			if (chance(1, 2)) {
+ 				d->pc_delay = 1;
+ 				/* Fail within 1 minute */
+-				delay = prandom_u32() % 60000;
++				delay = prandom_u32_max(60000);
+ 				d->pc_timeout = jiffies;
+ 				d->pc_timeout += msecs_to_jiffies(delay);
+ 				ubifs_warn(c, "failing after %lums", delay);
+ 			} else {
+ 				d->pc_delay = 2;
+-				delay = prandom_u32() % 10000;
++				delay = prandom_u32_max(10000);
+ 				/* Fail within 10000 operations */
+ 				d->pc_cnt_max = delay;
+ 				ubifs_warn(c, "failing after %lu calls", delay);
+@@ -2557,7 +2557,7 @@ static int corrupt_data(const struct ubifs_info *c, const void *buf,
+ 	unsigned int from, to, ffs = chance(1, 2);
+ 	unsigned char *p = (void *)buf;
+ 
+-	from = prandom_u32() % len;
++	from = prandom_u32_max(len);
+ 	/* Corruption span max to end of write unit */
+ 	to = min(len, ALIGN(from + 1, c->max_write_size));
+ 
+diff --git a/fs/ubifs/lpt_commit.c b/fs/ubifs/lpt_commit.c
+index 78da65b2fb85..e1ca1cd8a482 100644
+--- a/fs/ubifs/lpt_commit.c
++++ b/fs/ubifs/lpt_commit.c
+@@ -2008,28 +2008,28 @@ static int dbg_populate_lsave(struct ubifs_info *c)
+ 
+ 	if (!dbg_is_chk_gen(c))
+ 		return 0;
+-	if (prandom_u32() & 3)
++	if (prandom_u32_max(4))
+ 		return 0;
+ 
+ 	for (i = 0; i < c->lsave_cnt; i++)
+ 		c->lsave[i] = c->main_first;
+ 
+ 	list_for_each_entry(lprops, &c->empty_list, list)
+-		c->lsave[prandom_u32() % c->lsave_cnt] = lprops->lnum;
++		c->lsave[prandom_u32_max(c->lsave_cnt)] = lprops->lnum;
+ 	list_for_each_entry(lprops, &c->freeable_list, list)
+-		c->lsave[prandom_u32() % c->lsave_cnt] = lprops->lnum;
++		c->lsave[prandom_u32_max(c->lsave_cnt)] = lprops->lnum;
+ 	list_for_each_entry(lprops, &c->frdi_idx_list, list)
+-		c->lsave[prandom_u32() % c->lsave_cnt] = lprops->lnum;
++		c->lsave[prandom_u32_max(c->lsave_cnt)] = lprops->lnum;
+ 
+ 	heap = &c->lpt_heap[LPROPS_DIRTY_IDX - 1];
+ 	for (i = 0; i < heap->cnt; i++)
+-		c->lsave[prandom_u32() % c->lsave_cnt] = heap->arr[i]->lnum;
++		c->lsave[prandom_u32_max(c->lsave_cnt)] = heap->arr[i]->lnum;
+ 	heap = &c->lpt_heap[LPROPS_DIRTY - 1];
+ 	for (i = 0; i < heap->cnt; i++)
+-		c->lsave[prandom_u32() % c->lsave_cnt] = heap->arr[i]->lnum;
++		c->lsave[prandom_u32_max(c->lsave_cnt)] = heap->arr[i]->lnum;
+ 	heap = &c->lpt_heap[LPROPS_FREE - 1];
+ 	for (i = 0; i < heap->cnt; i++)
+-		c->lsave[prandom_u32() % c->lsave_cnt] = heap->arr[i]->lnum;
++		c->lsave[prandom_u32_max(c->lsave_cnt)] = heap->arr[i]->lnum;
+ 
+ 	return 1;
+ }
+diff --git a/fs/ubifs/tnc_commit.c b/fs/ubifs/tnc_commit.c
+index a9df94ad46a3..41009a4f5f2c 100644
+--- a/fs/ubifs/tnc_commit.c
++++ b/fs/ubifs/tnc_commit.c
+@@ -685,7 +685,7 @@ static int alloc_idx_lebs(struct ubifs_info *c, int cnt)
+ 		c->ilebs[c->ileb_cnt++] = lnum;
+ 		dbg_cmt("LEB %d", lnum);
+ 	}
+-	if (dbg_is_chk_index(c) && !(prandom_u32() & 7))
++	if (dbg_is_chk_index(c) && !prandom_u32_max(8))
+ 		return -ENOSPC;
+ 	return 0;
+ }
+diff --git a/fs/xfs/libxfs/xfs_alloc.c b/fs/xfs/libxfs/xfs_alloc.c
+index 6929157d8d6e..5cf71ee9c384 100644
+--- a/fs/xfs/libxfs/xfs_alloc.c
++++ b/fs/xfs/libxfs/xfs_alloc.c
+@@ -1501,7 +1501,7 @@ xfs_alloc_ag_vextent_lastblock(
+ 
+ #ifdef DEBUG
+ 	/* Randomly don't execute the first algorithm. */
+-	if (prandom_u32() & 1)
++	if (prandom_u32_max(2))
+ 		return 0;
+ #endif
+ 
+diff --git a/fs/xfs/libxfs/xfs_ialloc.c b/fs/xfs/libxfs/xfs_ialloc.c
+index aaf8805a82df..825a9bf22c1e 100644
+--- a/fs/xfs/libxfs/xfs_ialloc.c
++++ b/fs/xfs/libxfs/xfs_ialloc.c
+@@ -637,7 +637,7 @@ xfs_ialloc_ag_alloc(
+ 	/* randomly do sparse inode allocations */
+ 	if (xfs_sb_version_hassparseinodes(&tp->t_mountp->m_sb) &&
+ 	    igeo->ialloc_min_blks < igeo->ialloc_blks)
+-		do_sparse = prandom_u32() & 1;
++		do_sparse = prandom_u32_max(2);
+ #endif
+ 
+ 	/*
+diff --git a/fs/xfs/xfs_error.c b/fs/xfs/xfs_error.c
+index ce3bc1b291a1..00af145c0cff 100644
+--- a/fs/xfs/xfs_error.c
++++ b/fs/xfs/xfs_error.c
+@@ -264,7 +264,7 @@ xfs_errortag_test(
+ 
+ 	ASSERT(error_tag < XFS_ERRTAG_MAX);
+ 	randfactor = mp->m_errortag[error_tag];
+-	if (!randfactor || prandom_u32() % randfactor)
++	if (!randfactor || prandom_u32_max(randfactor))
+ 		return false;
+ 
+ 	xfs_warn_ratelimited(mp,
+* Unmerged path include/linux/nodemask.h
+* Unmerged path kernel/bpf/core.c
+diff --git a/kernel/locking/test-ww_mutex.c b/kernel/locking/test-ww_mutex.c
+index 950cf04b5b60..fd8ea3f14709 100644
+--- a/kernel/locking/test-ww_mutex.c
++++ b/kernel/locking/test-ww_mutex.c
+@@ -412,7 +412,7 @@ static int *get_random_order(int count)
+ 		order[n] = n;
+ 
+ 	for (n = count - 1; n > 1; n--) {
+-		r = get_random_int() % (n + 1);
++		r = prandom_u32_max(n + 1);
+ 		if (r != n) {
+ 			tmp = order[n];
+ 			order[n] = order[r];
+@@ -551,7 +551,7 @@ static void stress_one_work(struct work_struct *work)
+ {
+ 	struct stress *stress = container_of(work, typeof(*stress), work);
+ 	const int nlocks = stress->nlocks;
+-	struct ww_mutex *lock = stress->locks + (get_random_int() % nlocks);
++	struct ww_mutex *lock = stress->locks + prandom_u32_max(nlocks);
+ 	int err;
+ 
+ 	do {
+* Unmerged path kernel/time/clocksource.c
+diff --git a/lib/fault-inject.c b/lib/fault-inject.c
+index e26aa4f65eb9..3dfacb42d570 100644
+--- a/lib/fault-inject.c
++++ b/lib/fault-inject.c
+@@ -133,7 +133,7 @@ bool should_fail(struct fault_attr *attr, ssize_t size)
+ 			return false;
+ 	}
+ 
+-	if (attr->probability <= prandom_u32() % 100)
++	if (attr->probability <= prandom_u32_max(100))
+ 		return false;
+ 
+ 	if (!fail_stacktrace(attr))
+diff --git a/lib/find_bit_benchmark.c b/lib/find_bit_benchmark.c
+index 5367ffa5c18f..d512bac5769f 100644
+--- a/lib/find_bit_benchmark.c
++++ b/lib/find_bit_benchmark.c
+@@ -146,8 +146,8 @@ static int __init find_bit_test(void)
+ 	bitmap_zero(bitmap2, BITMAP_LEN);
+ 
+ 	while (nbits--) {
+-		__set_bit(prandom_u32() % BITMAP_LEN, bitmap);
+-		__set_bit(prandom_u32() % BITMAP_LEN, bitmap2);
++		__set_bit(prandom_u32_max(BITMAP_LEN), bitmap);
++		__set_bit(prandom_u32_max(BITMAP_LEN), bitmap2);
+ 	}
+ 
+ 	test_find_next_bit(bitmap, BITMAP_LEN);
+diff --git a/lib/kobject.c b/lib/kobject.c
+index 9e5d537e0443..8145e8f3c1b5 100644
+--- a/lib/kobject.c
++++ b/lib/kobject.c
+@@ -696,7 +696,7 @@ static void kobject_release(struct kref *kref)
+ {
+ 	struct kobject *kobj = container_of(kref, struct kobject, kref);
+ #ifdef CONFIG_DEBUG_KOBJECT_RELEASE
+-	unsigned long delay = HZ + HZ * (get_random_int() & 0x3);
++	unsigned long delay = HZ + HZ * prandom_u32_max(4);
+ 	pr_info("kobject: '%s' (%p): %s, parent %p (delayed %ld)\n",
+ 		 kobject_name(kobj), kobj, __func__, kobj->parent, delay);
+ 	INIT_DELAYED_WORK(&kobj->release, kobject_delayed_cleanup);
+* Unmerged path lib/reed_solomon/test_rslib.c
+* Unmerged path lib/sbitmap.c
+diff --git a/lib/test-string_helpers.c b/lib/test-string_helpers.c
+index 25b5cbfb7615..3349f3ddc528 100644
+--- a/lib/test-string_helpers.c
++++ b/lib/test-string_helpers.c
+@@ -398,7 +398,7 @@ static int __init test_string_helpers_init(void)
+ 	for (i = 0; i < UNESCAPE_ANY + 1; i++)
+ 		test_string_unescape("unescape", i, false);
+ 	test_string_unescape("unescape inplace",
+-			     get_random_int() % (UNESCAPE_ANY + 1), true);
++			     prandom_u32_max(UNESCAPE_ANY + 1), true);
+ 
+ 	/* Without dictionary */
+ 	for (i = 0; i < (ESCAPE_ANY_NP | ESCAPE_HEX) + 1; i++)
+diff --git a/lib/test_hexdump.c b/lib/test_hexdump.c
+index 626f580b4ff7..2b3892fa2346 100644
+--- a/lib/test_hexdump.c
++++ b/lib/test_hexdump.c
+@@ -149,7 +149,7 @@ static void __init test_hexdump(size_t len, int rowsize, int groupsize,
+ static void __init test_hexdump_set(int rowsize, bool ascii)
+ {
+ 	size_t d = min_t(size_t, sizeof(data_b), rowsize);
+-	size_t len = get_random_int() % d + 1;
++	size_t len = prandom_u32_max(d) + 1;
+ 
+ 	test_hexdump(len, rowsize, 4, ascii);
+ 	test_hexdump(len, rowsize, 2, ascii);
+@@ -208,11 +208,11 @@ static void __init test_hexdump_overflow(size_t buflen, size_t len,
+ static void __init test_hexdump_overflow_set(size_t buflen, bool ascii)
+ {
+ 	unsigned int i = 0;
+-	int rs = (get_random_int() % 2 + 1) * 16;
++	int rs = (prandom_u32_max(2) + 1) * 16;
+ 
+ 	do {
+ 		int gs = 1 << i;
+-		size_t len = get_random_int() % rs + gs;
++		size_t len = prandom_u32_max(rs) + gs;
+ 
+ 		test_hexdump_overflow(buflen, rounddown(len, gs), rs, gs, ascii);
+ 	} while (i++ < 3);
+@@ -223,11 +223,11 @@ static int __init test_hexdump_init(void)
+ 	unsigned int i;
+ 	int rowsize;
+ 
+-	rowsize = (get_random_int() % 2 + 1) * 16;
++	rowsize = (prandom_u32_max(2) + 1) * 16;
+ 	for (i = 0; i < 16; i++)
+ 		test_hexdump_set(rowsize, false);
+ 
+-	rowsize = (get_random_int() % 2 + 1) * 16;
++	rowsize = (prandom_u32_max(2) + 1) * 16;
+ 	for (i = 0; i < 16; i++)
+ 		test_hexdump_set(rowsize, true);
+ 
+* Unmerged path lib/test_kasan.c
+diff --git a/lib/test_list_sort.c b/lib/test_list_sort.c
+index ccfd98dbf57c..b4d86c164261 100644
+--- a/lib/test_list_sort.c
++++ b/lib/test_list_sort.c
+@@ -71,7 +71,7 @@ static void list_sort_test(struct kunit *test)
+ 		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, el);
+ 
+ 		 /* force some equivalencies */
+-		el->value = prandom_u32() % (TEST_LIST_LEN / 3);
++		el->value = prandom_u32_max(TEST_LIST_LEN / 3);
+ 		el->serial = i;
+ 		el->poison1 = TEST_POISON1;
+ 		el->poison2 = TEST_POISON2;
+diff --git a/mm/slub.c b/mm/slub.c
+index 4c99ceadd4a0..9e1e5204dd49 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -1826,7 +1826,7 @@ static bool shuffle_freelist(struct kmem_cache *s, struct page *page)
+ 		return false;
+ 
+ 	freelist_count = oo_objects(s->oo);
+-	pos = get_random_int() % freelist_count;
++	pos = prandom_u32_max(freelist_count);
+ 
+ 	page_limit = page->objects * s->size;
+ 	start = fixup_red_left(s, page_address(page));
+diff --git a/net/802/garp.c b/net/802/garp.c
+index 7f50d47470bd..7e2a14e8005c 100644
+--- a/net/802/garp.c
++++ b/net/802/garp.c
+@@ -397,7 +397,7 @@ static void garp_join_timer_arm(struct garp_applicant *app)
+ {
+ 	unsigned long delay;
+ 
+-	delay = (u64)msecs_to_jiffies(garp_join_time) * prandom_u32() >> 32;
++	delay = prandom_u32_max(msecs_to_jiffies(garp_join_time));
+ 	mod_timer(&app->join_timer, jiffies + delay);
+ }
+ 
+diff --git a/net/802/mrp.c b/net/802/mrp.c
+index a808dd5bbb27..59d721537905 100644
+--- a/net/802/mrp.c
++++ b/net/802/mrp.c
+@@ -582,7 +582,7 @@ static void mrp_join_timer_arm(struct mrp_applicant *app)
+ {
+ 	unsigned long delay;
+ 
+-	delay = (u64)msecs_to_jiffies(mrp_join_time) * prandom_u32() >> 32;
++	delay = prandom_u32_max(msecs_to_jiffies(mrp_join_time));
+ 	mod_timer(&app->join_timer, jiffies + delay);
+ }
+ 
+diff --git a/net/ceph/mon_client.c b/net/ceph/mon_client.c
+index a5c6da17a7b0..cc69e782baae 100644
+--- a/net/ceph/mon_client.c
++++ b/net/ceph/mon_client.c
+@@ -222,7 +222,7 @@ static void pick_new_mon(struct ceph_mon_client *monc)
+ 				max--;
+ 		}
+ 
+-		n = prandom_u32() % max;
++		n = prandom_u32_max(max);
+ 		if (o >= 0 && n >= o)
+ 			n++;
+ 
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index 03fff24de23f..06bb565ad7f3 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -1500,7 +1500,7 @@ static bool target_should_be_paused(struct ceph_osd_client *osdc,
+ 
+ static int pick_random_replica(const struct ceph_osds *acting)
+ {
+-	int i = prandom_u32() % acting->size;
++	int i = prandom_u32_max(acting->size);
+ 
+ 	dout("%s picked osd%d, primary osd%d\n", __func__,
+ 	     acting->osds[i], acting->primary);
+diff --git a/net/core/neighbour.c b/net/core/neighbour.c
+index dd7fafc23ee0..a2fd6482312f 100644
+--- a/net/core/neighbour.c
++++ b/net/core/neighbour.c
+@@ -115,7 +115,7 @@ static void neigh_cleanup_and_release(struct neighbour *neigh)
+ 
+ unsigned long neigh_rand_reach_time(unsigned long base)
+ {
+-	return base ? (prandom_u32() % base) + (base >> 1) : 0;
++	return base ? prandom_u32_max(base) + (base >> 1) : 0;
+ }
+ EXPORT_SYMBOL(neigh_rand_reach_time);
+ 
+* Unmerged path net/core/pktgen.c
+diff --git a/net/core/stream.c b/net/core/stream.c
+index a166a32b411f..7c57396bd857 100644
+--- a/net/core/stream.c
++++ b/net/core/stream.c
+@@ -123,7 +123,7 @@ int sk_stream_wait_memory(struct sock *sk, long *timeo_p)
+ 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
+ 
+ 	if (sk_stream_memory_free(sk))
+-		current_timeo = vm_wait = (prandom_u32() % (HZ / 5)) + 2;
++		current_timeo = vm_wait = prandom_u32_max(HZ / 5) + 2;
+ 
+ 	add_wait_queue(sk_sleep(sk), &wait);
+ 
+diff --git a/net/ipv4/igmp.c b/net/ipv4/igmp.c
+index 1c2fdc26474d..33bc0639e9b3 100644
+--- a/net/ipv4/igmp.c
++++ b/net/ipv4/igmp.c
+@@ -219,7 +219,7 @@ static void igmp_stop_timer(struct ip_mc_list *im)
+ /* It must be called with locked im->lock */
+ static void igmp_start_timer(struct ip_mc_list *im, int max_delay)
+ {
+-	int tv = prandom_u32() % max_delay;
++	int tv = prandom_u32_max(max_delay);
+ 
+ 	im->tm_running = 1;
+ 	if (!mod_timer(&im->timer, jiffies+tv+2))
+@@ -228,7 +228,7 @@ static void igmp_start_timer(struct ip_mc_list *im, int max_delay)
+ 
+ static void igmp_gq_start_timer(struct in_device *in_dev)
+ {
+-	int tv = prandom_u32() % in_dev->mr_maxdelay;
++	int tv = prandom_u32_max(in_dev->mr_maxdelay);
+ 	unsigned long exp = jiffies + tv + 2;
+ 
+ 	if (in_dev->mr_gq_running &&
+@@ -242,7 +242,7 @@ static void igmp_gq_start_timer(struct in_device *in_dev)
+ 
+ static void igmp_ifc_start_timer(struct in_device *in_dev, int delay)
+ {
+-	int tv = prandom_u32() % delay;
++	int tv = prandom_u32_max(delay);
+ 
+ 	if (!mod_timer(&in_dev->mr_ifc_timer, jiffies+tv+2))
+ 		in_dev_hold(in_dev);
+diff --git a/net/ipv4/inet_connection_sock.c b/net/ipv4/inet_connection_sock.c
+index f6ce2dcb6bfd..115056556a5f 100644
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@ -209,7 +209,7 @@ inet_csk_find_open_port(struct sock *sk, struct inet_bind_bucket **tb_ret, int *
+ 	if (likely(remaining > 1))
+ 		remaining &= ~1U;
+ 
+-	offset = prandom_u32() % remaining;
++	offset = prandom_u32_max(remaining);
+ 	/* __inet_hash_connect() favors ports having @low parity
+ 	 * We do the opposite to not pollute connect() users.
+ 	 */
+diff --git a/net/ipv4/inet_hashtables.c b/net/ipv4/inet_hashtables.c
+index e033ab4071e1..9b7d6f2c01f4 100644
+--- a/net/ipv4/inet_hashtables.c
++++ b/net/ipv4/inet_hashtables.c
+@@ -876,7 +876,7 @@ int __inet_hash_connect(struct inet_timewait_death_row *death_row,
+ 	 * on low contention the randomness is maximal and on high contention
+ 	 * it may be inexistent.
+ 	 */
+-	i = max_t(int, i, (prandom_u32() & 7) * 2);
++	i = max_t(int, i, prandom_u32_max(8) * 2);
+ 	WRITE_ONCE(table_perturb[index], READ_ONCE(table_perturb[index]) + i + 2);
+ 
+ 	/* Head lock still held and bh's disabled */
+diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
+index f7293f68fada..2f430c05b23f 100644
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -107,7 +107,7 @@ static inline u32 cstamp_delta(unsigned long cstamp)
+ static inline s32 rfc3315_s14_backoff_init(s32 irt)
+ {
+ 	/* multiply 'initial retransmission time' by 0.9 .. 1.1 */
+-	u64 tmp = (900000 + prandom_u32() % 200001) * (u64)irt;
++	u64 tmp = (900000 + prandom_u32_max(200001)) * (u64)irt;
+ 	do_div(tmp, 1000000);
+ 	return (s32)tmp;
+ }
+@@ -115,11 +115,11 @@ static inline s32 rfc3315_s14_backoff_init(s32 irt)
+ static inline s32 rfc3315_s14_backoff_update(s32 rt, s32 mrt)
+ {
+ 	/* multiply 'retransmission timeout' by 1.9 .. 2.1 */
+-	u64 tmp = (1900000 + prandom_u32() % 200001) * (u64)rt;
++	u64 tmp = (1900000 + prandom_u32_max(200001)) * (u64)rt;
+ 	do_div(tmp, 1000000);
+ 	if ((s32)tmp > mrt) {
+ 		/* multiply 'maximum retransmission time' by 0.9 .. 1.1 */
+-		tmp = (900000 + prandom_u32() % 200001) * (u64)mrt;
++		tmp = (900000 + prandom_u32_max(200001)) * (u64)mrt;
+ 		do_div(tmp, 1000000);
+ 	}
+ 	return (s32)tmp;
+@@ -3947,7 +3947,7 @@ static void addrconf_dad_kick(struct inet6_ifaddr *ifp)
+ 	if (ifp->flags & IFA_F_OPTIMISTIC)
+ 		rand_num = 0;
+ 	else
+-		rand_num = prandom_u32() % (idev->cnf.rtr_solicit_delay ? : 1);
++		rand_num = prandom_u32_max(idev->cnf.rtr_solicit_delay ?: 1);
+ 
+ 	nonce = 0;
+ 	if (idev->cnf.enhanced_dad ||
+diff --git a/net/ipv6/mcast.c b/net/ipv6/mcast.c
+index 109d8cd70433..61d05c9203ba 100644
+--- a/net/ipv6/mcast.c
++++ b/net/ipv6/mcast.c
+@@ -1036,7 +1036,7 @@ bool ipv6_chk_mcast_addr(struct net_device *dev, const struct in6_addr *group,
+ 
+ static void mld_gq_start_timer(struct inet6_dev *idev)
+ {
+-	unsigned long tv = prandom_u32() % idev->mc_maxdelay;
++	unsigned long tv = prandom_u32_max(idev->mc_maxdelay);
+ 
+ 	idev->mc_gq_running = 1;
+ 	if (!mod_timer(&idev->mc_gq_timer, jiffies+tv+2))
+@@ -1052,7 +1052,7 @@ static void mld_gq_stop_timer(struct inet6_dev *idev)
+ 
+ static void mld_ifc_start_timer(struct inet6_dev *idev, unsigned long delay)
+ {
+-	unsigned long tv = prandom_u32() % delay;
++	unsigned long tv = prandom_u32_max(delay);
+ 
+ 	if (!mod_timer(&idev->mc_ifc_timer, jiffies+tv+2))
+ 		in6_dev_hold(idev);
+@@ -1067,7 +1067,7 @@ static void mld_ifc_stop_timer(struct inet6_dev *idev)
+ 
+ static void mld_dad_start_timer(struct inet6_dev *idev, unsigned long delay)
+ {
+-	unsigned long tv = prandom_u32() % delay;
++	unsigned long tv = prandom_u32_max(delay);
+ 
+ 	if (!mod_timer(&idev->mc_dad_timer, jiffies+tv+2))
+ 		in6_dev_hold(idev);
+@@ -1098,7 +1098,7 @@ static void igmp6_group_queried(struct ifmcaddr6 *ma, unsigned long resptime)
+ 	}
+ 
+ 	if (delay >= resptime)
+-		delay = prandom_u32() % resptime;
++		delay = prandom_u32_max(resptime);
+ 
+ 	ma->mca_timer.expires = jiffies + delay;
+ 	if (!mod_timer(&ma->mca_timer, jiffies + delay))
+@@ -2420,7 +2420,7 @@ static void igmp6_join_group(struct ifmcaddr6 *ma)
+ 
+ 	igmp6_send(&ma->mca_addr, ma->idev->dev, ICMPV6_MGM_REPORT);
+ 
+-	delay = prandom_u32() % unsolicited_report_interval(ma->idev);
++	delay = prandom_u32_max(unsolicited_report_interval(ma->idev));
+ 
+ 	spin_lock_bh(&ma->mca_lock);
+ 	if (del_timer(&ma->mca_timer)) {
+* Unmerged path net/netfilter/ipvs/ip_vs_twos.c
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index 684547c67d91..3cf8775d07b2 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -1305,7 +1305,7 @@ static bool fanout_flow_is_huge(struct packet_sock *po, struct sk_buff *skb)
+ 		if (READ_ONCE(history[i]) == rxhash)
+ 			count++;
+ 
+-	victim = prandom_u32() % ROLLOVER_HLEN;
++	victim = prandom_u32_max(ROLLOVER_HLEN);
+ 
+ 	/* Avoid dirtying the cache line if possible */
+ 	if (READ_ONCE(history[victim]) != rxhash)
+diff --git a/net/sched/act_gact.c b/net/sched/act_gact.c
+index 495fc0563c89..957af8043302 100644
+--- a/net/sched/act_gact.c
++++ b/net/sched/act_gact.c
+@@ -31,7 +31,7 @@ static struct tc_action_ops act_gact_ops;
+ static int gact_net_rand(struct tcf_gact *gact)
+ {
+ 	smp_rmb(); /* coupled with smp_wmb() in tcf_gact_init() */
+-	if (prandom_u32() % gact->tcfg_pval)
++	if (prandom_u32_max(gact->tcfg_pval))
+ 		return gact->tcf_action;
+ 	return gact->tcfg_paction;
+ }
+diff --git a/net/sched/act_sample.c b/net/sched/act_sample.c
+index e6a52a52f077..daca73ce5e8b 100644
+--- a/net/sched/act_sample.c
++++ b/net/sched/act_sample.c
+@@ -172,7 +172,7 @@ static int tcf_sample_act(struct sk_buff *skb, const struct tc_action *a,
+ 	psample_group = rcu_dereference_bh(s->psample_group);
+ 
+ 	/* randomly sample packets according to rate */
+-	if (psample_group && (prandom_u32() % s->rate == 0)) {
++	if (psample_group && (prandom_u32_max(s->rate) == 0)) {
+ 		if (!skb_at_tc_ingress(skb)) {
+ 			md.in_ifindex = skb->skb_iif;
+ 			md.out_ifindex = skb->dev->ifindex;
+diff --git a/net/sched/sch_netem.c b/net/sched/sch_netem.c
+index 18d77cc178ef..e38b4ea67a7a 100644
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@ -517,8 +517,8 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 			goto finish_segs;
+ 		}
+ 
+-		skb->data[prandom_u32() % skb_headlen(skb)] ^=
+-			1<<(prandom_u32() % 8);
++		skb->data[prandom_u32_max(skb_headlen(skb))] ^=
++			1<<prandom_u32_max(8);
+ 	}
+ 
+ 	if (unlikely(sch->q.qlen >= sch->limit)) {
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index cc0d20544db3..201a38c5f7b2 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -8582,7 +8582,7 @@ static int sctp_get_port_local(struct sock *sk, union sctp_addr *addr)
+ 
+ 		inet_get_local_port_range(net, &low, &high);
+ 		remaining = (high - low) + 1;
+-		rover = prandom_u32() % remaining + low;
++		rover = prandom_u32_max(remaining) + low;
+ 
+ 		do {
+ 			rover++;
+diff --git a/net/sunrpc/cache.c b/net/sunrpc/cache.c
+index 67a459bccb56..2aec43552537 100644
+--- a/net/sunrpc/cache.c
++++ b/net/sunrpc/cache.c
+@@ -677,7 +677,7 @@ static void cache_limit_defers(void)
+ 
+ 	/* Consider removing either the first or the last */
+ 	if (cache_defer_cnt > DFR_MAX) {
+-		if (prandom_u32() & 1)
++		if (prandom_u32_max(2))
+ 			discard = list_entry(cache_defer_list.next,
+ 					     struct cache_deferred_req, recent);
+ 		else
+diff --git a/net/sunrpc/xprtsock.c b/net/sunrpc/xprtsock.c
+index 138f2309c853..08440caa1f94 100644
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@ -1594,7 +1594,7 @@ static int xs_get_random_port(void)
+ 	if (max < min)
+ 		return -EADDRINUSE;
+ 	range = max - min + 1;
+-	rand = (unsigned short) prandom_u32() % range;
++	rand = prandom_u32_max(range);
+ 	return rand + min;
+ }
+ 
+diff --git a/net/tipc/socket.c b/net/tipc/socket.c
+index f859e858fef7..4d24cecaafdc 100644
+--- a/net/tipc/socket.c
++++ b/net/tipc/socket.c
+@@ -3013,7 +3013,7 @@ static int tipc_sk_insert(struct tipc_sock *tsk)
+ 	struct net *net = sock_net(sk);
+ 	struct tipc_net *tn = net_generic(net, tipc_net_id);
+ 	u32 remaining = (TIPC_MAX_PORT - TIPC_MIN_PORT) + 1;
+-	u32 portid = prandom_u32() % remaining + TIPC_MIN_PORT;
++	u32 portid = prandom_u32_max(remaining) + TIPC_MIN_PORT;
+ 
+ 	while (remaining--) {
+ 		portid++;
+diff --git a/net/xfrm/xfrm_state.c b/net/xfrm/xfrm_state.c
+index e57288275a83..415647abe233 100644
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@ -1854,7 +1854,7 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high)
+ 	} else {
+ 		u32 spi = 0;
+ 		for (h = 0; h < high-low+1; h++) {
+-			spi = low + prandom_u32()%(high-low+1);
++			spi = low + prandom_u32_max(high - low + 1);
+ 			x0 = xfrm_state_lookup(net, mark, &x->id.daddr, htonl(spi), x->id.proto, x->props.family);
+ 			if (x0 == NULL) {
+ 				newspi = htonl(spi);
