@@ -1,0 +1,221 @@
+rxrpc: Wrap accesses to get call state to put the barrier in one place
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit d41b3f5b96881809c73f86e3ca436c9426610b7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/d41b3f5b.failed
+
+Wrap accesses to get the state of a call from outside of the I/O thread in
+a single place so that the barrier needed to order wrt the error code and
+abort code is in just that place.
+
+Also use a barrier when setting the call state and again when reading the
+call state such that the auxiliary completion info (error code, abort code)
+can be read without taking a read lock on the call state lock.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit d41b3f5b96881809c73f86e3ca436c9426610b7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/call_state.c
+#	net/rxrpc/sendmsg.c
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,9e992487649c..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -855,6 -886,40 +855,43 @@@ static inline bool rxrpc_is_client_call
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * call_state.c
++  */
++ bool __rxrpc_set_call_completion(struct rxrpc_call *call,
++ 				 enum rxrpc_call_completion compl,
++ 				 u32 abort_code,
++ 				 int error);
++ bool rxrpc_set_call_completion(struct rxrpc_call *call,
++ 			       enum rxrpc_call_completion compl,
++ 			       u32 abort_code,
++ 			       int error);
++ bool __rxrpc_call_completed(struct rxrpc_call *call);
++ bool rxrpc_call_completed(struct rxrpc_call *call);
++ bool __rxrpc_abort_call(struct rxrpc_call *call, rxrpc_seq_t seq,
++ 			u32 abort_code, int error, enum rxrpc_abort_reason why);
++ bool rxrpc_abort_call(struct rxrpc_call *call, rxrpc_seq_t seq,
++ 		      u32 abort_code, int error, enum rxrpc_abort_reason why);
++ 
++ static inline enum rxrpc_call_state rxrpc_call_state(const struct rxrpc_call *call)
++ {
++ 	/* Order read ->state before read ->error. */
++ 	return smp_load_acquire(&call->state);
++ }
++ 
++ static inline bool rxrpc_call_is_complete(const struct rxrpc_call *call)
++ {
++ 	return rxrpc_call_state(call) == RXRPC_CALL_COMPLETE;
++ }
++ 
++ static inline bool rxrpc_call_has_failed(const struct rxrpc_call *call)
++ {
++ 	return rxrpc_call_is_complete(call) && call->completion != RXRPC_CALL_SUCCEEDED;
++ }
++ 
++ /*
+++>>>>>>> d41b3f5b9688 (rxrpc: Wrap accesses to get call state to put the barrier in one place)
+   * conn_client.c
+   */
+  extern unsigned int rxrpc_reap_client_connections;
+diff --cc net/rxrpc/sendmsg.c
+index 45c09f0de6fe,f0b5822f3e04..000000000000
+--- a/net/rxrpc/sendmsg.c
++++ b/net/rxrpc/sendmsg.c
+@@@ -18,6 -18,27 +18,30 @@@
+  #include "ar-internal.h"
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Propose an abort to be made in the I/O thread.
++  */
++ bool rxrpc_propose_abort(struct rxrpc_call *call, s32 abort_code, int error,
++ 			 enum rxrpc_abort_reason why)
++ {
++ 	_enter("{%d},%d,%d,%u", call->debug_id, abort_code, error, why);
++ 
++ 	if (!call->send_abort && !rxrpc_call_is_complete(call)) {
++ 		call->send_abort_why = why;
++ 		call->send_abort_err = error;
++ 		call->send_abort_seq = 0;
++ 		/* Request abort locklessly vs rxrpc_input_call_event(). */
++ 		smp_store_release(&call->send_abort, abort_code);
++ 		rxrpc_poke_call(call, rxrpc_call_poke_abort);
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ /*
+++>>>>>>> d41b3f5b9688 (rxrpc: Wrap accesses to get call state to put the barrier in one place)
+   * Return true if there's sufficient Tx queue space.
+   */
+  static bool rxrpc_check_tx_space(struct rxrpc_call *call, rxrpc_seq_t *_tx_win)
+@@@ -134,14 -124,9 +158,14 @@@ static int rxrpc_wait_for_tx_window_non
+  		if (rxrpc_check_tx_space(call, NULL))
+  			return 0;
+  
+- 		if (call->state >= RXRPC_CALL_COMPLETE)
++ 		if (rxrpc_call_is_complete(call))
+  			return call->error;
+  
+ +		if (READ_ONCE(call->acks_hard_ack) != call->tx_bottom) {
+ +			rxrpc_shrink_call_tx_buffer(call);
+ +			continue;
+ +		}
+ +
+  		trace_rxrpc_txqueue(call, rxrpc_txqueue_wait);
+  		*timeo = schedule_timeout(*timeo);
+  	}
+@@@ -415,12 -375,9 +439,18 @@@ reload
+  
+  success:
+  	ret = copied;
+++<<<<<<< HEAD
+ +	if (READ_ONCE(call->state) == RXRPC_CALL_COMPLETE) {
+ +		read_lock_bh(&call->state_lock);
+ +		if (call->error < 0)
+ +			ret = call->error;
+ +		read_unlock_bh(&call->state_lock);
+ +	}
+++=======
++ 	if (rxrpc_call_is_complete(call) &&
++ 	    call->error < 0)
++ 		ret = call->error;
+++>>>>>>> d41b3f5b9688 (rxrpc: Wrap accesses to get call state to put the barrier in one place)
+  out:
+  	call->tx_pending = txb;
+  	_leave(" = %d", ret);
+* Unmerged path net/rxrpc/call_state.c
+diff --git a/net/rxrpc/af_rxrpc.c b/net/rxrpc/af_rxrpc.c
+index 0f4d34f420f0..82fa2f7b90b4 100644
+--- a/net/rxrpc/af_rxrpc.c
++++ b/net/rxrpc/af_rxrpc.c
+@@ -380,7 +380,7 @@ EXPORT_SYMBOL(rxrpc_kernel_end_call);
+ bool rxrpc_kernel_check_life(const struct socket *sock,
+ 			     const struct rxrpc_call *call)
+ {
+-	return call->state != RXRPC_CALL_COMPLETE;
++	return !rxrpc_call_is_complete(call);
+ }
+ EXPORT_SYMBOL(rxrpc_kernel_check_life);
+ 
+* Unmerged path net/rxrpc/ar-internal.h
+* Unmerged path net/rxrpc/call_state.c
+diff --git a/net/rxrpc/recvmsg.c b/net/rxrpc/recvmsg.c
+index c84d2b620396..4a2a76b2aba4 100644
+--- a/net/rxrpc/recvmsg.c
++++ b/net/rxrpc/recvmsg.c
+@@ -168,7 +168,7 @@ static int rxrpc_recvmsg_term(struct rxrpc_call *call, struct msghdr *msg)
+ 		ret = put_cmsg(msg, SOL_RXRPC, RXRPC_LOCAL_ERROR, 4, &tmp);
+ 		break;
+ 	default:
+-		pr_err("Invalid terminal call state %u\n", call->state);
++		pr_err("Invalid terminal call state %u\n", call->completion);
+ 		BUG();
+ 		break;
+ 	}
+@@ -190,7 +190,7 @@ static void rxrpc_end_rx_phase(struct rxrpc_call *call, rxrpc_serial_t serial)
+ 
+ 	trace_rxrpc_receive(call, rxrpc_receive_end, 0, whigh);
+ 
+-	if (call->state == RXRPC_CALL_CLIENT_RECV_REPLY)
++	if (rxrpc_call_state(call) == RXRPC_CALL_CLIENT_RECV_REPLY)
+ 		rxrpc_propose_delay_ACK(call, serial, rxrpc_propose_ack_terminal_ack);
+ 
+ 	write_lock_bh(&call->state_lock);
+@@ -291,7 +291,7 @@ static int rxrpc_recvmsg_data(struct socket *sock, struct rxrpc_call *call,
+ 	rx_pkt_offset = call->rx_pkt_offset;
+ 	rx_pkt_len = call->rx_pkt_len;
+ 
+-	if (call->state >= RXRPC_CALL_SERVER_ACK_REQUEST) {
++	if (rxrpc_call_state(call) >= RXRPC_CALL_SERVER_ACK_REQUEST) {
+ 		seq = lower_32_bits(atomic64_read(&call->ackr_window)) - 1;
+ 		ret = 1;
+ 		goto done;
+@@ -498,7 +498,7 @@ int rxrpc_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
+ 		msg->msg_namelen = len;
+ 	}
+ 
+-	switch (READ_ONCE(call->state)) {
++	switch (rxrpc_call_state(call)) {
+ 	case RXRPC_CALL_CLIENT_RECV_REPLY:
+ 	case RXRPC_CALL_SERVER_RECV_REQUEST:
+ 	case RXRPC_CALL_SERVER_ACK_REQUEST:
+@@ -519,7 +519,7 @@ int rxrpc_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
+ 	if (ret < 0)
+ 		goto error_unlock_call;
+ 
+-	if (call->state == RXRPC_CALL_COMPLETE) {
++	if (rxrpc_call_is_complete(call)) {
+ 		ret = rxrpc_recvmsg_term(call, msg);
+ 		if (ret < 0)
+ 			goto error_unlock_call;
+@@ -599,7 +599,7 @@ int rxrpc_kernel_recv_data(struct socket *sock, struct rxrpc_call *call,
+ 
+ 	mutex_lock(&call->user_mutex);
+ 
+-	switch (READ_ONCE(call->state)) {
++	switch (rxrpc_call_state(call)) {
+ 	case RXRPC_CALL_CLIENT_RECV_REPLY:
+ 	case RXRPC_CALL_SERVER_RECV_REQUEST:
+ 	case RXRPC_CALL_SERVER_ACK_REQUEST:
+* Unmerged path net/rxrpc/sendmsg.c
