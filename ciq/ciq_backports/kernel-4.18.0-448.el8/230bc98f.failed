@@ -1,0 +1,137 @@
+NFS: Improve heuristic for readdirplus
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 230bc98f7a2a49eb472d184bdec91fd3096384b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/230bc98f.failed
+
+The heuristic for readdirplus is designed to try to detect 'ls -l' and
+similar patterns. It does so by looking for cache hit/miss patterns in
+both the attribute cache and in the dcache of the files in a given
+directory, and then sets a flag for the readdirplus code to interpret.
+
+The problem with this approach is that a single attribute or dcache miss
+can cause the NFS code to force a refresh of the attributes for the
+entire set of files contained in the directory.
+
+To be able to make a more nuanced decision, let's sample the number of
+hits and misses in the set of open directory descriptors. That allows us
+to set thresholds at which we start preferring READDIRPLUS over regular
+READDIR, or at which we start to force a re-read of the remaining
+readdir cache using READDIRPLUS.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 230bc98f7a2a49eb472d184bdec91fd3096384b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/dir.c
+#	include/linux/nfs_fs.h
+diff --cc fs/nfs/dir.c
+index b30d5fb16526,098fc1bdaac8..000000000000
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@@ -1114,7 -1178,7 +1138,11 @@@ static int nfs_readdir(struct file *fil
+  		goto out;
+  	desc->file = file;
+  	desc->ctx = ctx;
+++<<<<<<< HEAD
+ +	desc->plus = nfs_use_readdirplus(inode, ctx);
+++=======
++ 	desc->page_index_max = -1;
+++>>>>>>> 230bc98f7a2a (NFS: Improve heuristic for readdirplus)
+  
+  	spin_lock(&file->f_lock);
+  	desc->dir_cookie = dir_ctx->dir_cookie;
+@@@ -1125,7 -1189,10 +1153,9 @@@
+  	desc->last_cookie = dir_ctx->last_cookie;
+  	desc->attr_gencount = dir_ctx->attr_gencount;
+  	desc->eof = dir_ctx->eof;
+ -	nfs_set_dtsize(desc, dir_ctx->dtsize);
+  	memcpy(desc->verf, dir_ctx->verf, sizeof(desc->verf));
++ 	cache_hits = atomic_xchg(&dir_ctx->cache_hits, 0);
++ 	cache_misses = atomic_xchg(&dir_ctx->cache_misses, 0);
+  	spin_unlock(&file->f_lock);
+  
+  	if (desc->eof) {
+diff --cc include/linux/nfs_fs.h
+index f07136abc22c,20a4cf0acad2..000000000000
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@@ -105,8 -109,10 +107,9 @@@ struct nfs_open_dir_context 
+  	__u64 dup_cookie;
+  	__u64 last_cookie;
+  	pgoff_t page_index;
+ -	unsigned int dtsize;
+  	signed char duped;
+  	bool eof;
++ 	struct rcu_head rcu_head;
+  };
+  
+  /*
+@@@ -276,8 -282,6 +278,11 @@@ struct nfs4_copy_state 
+  #define NFS_INO_INVALIDATING	(3)		/* inode is being invalidated */
+  #define NFS_INO_PRESERVE_UNLINKED (4)		/* preserve file if removed while open */
+  #define NFS_INO_FSCACHE		(5)		/* inode can be cached by FS-Cache */
+++<<<<<<< HEAD
+ +#define NFS_INO_FSCACHE_LOCK	(6)		/* FS-Cache cookie management lock */
+ +#define NFS_INO_FORCE_READDIR	(7)		/* force readdirplus */
+++=======
+++>>>>>>> 230bc98f7a2a (NFS: Improve heuristic for readdirplus)
+  #define NFS_INO_LAYOUTCOMMIT	(9)		/* layoutcommit required */
+  #define NFS_INO_LAYOUTCOMMITTING (10)		/* layoutcommit inflight */
+  #define NFS_INO_LAYOUTSTATS	(11)		/* layoutstats inflight */
+* Unmerged path fs/nfs/dir.c
+diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c
+index d40260446017..277c8cfdf904 100644
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -790,7 +790,7 @@ static void nfs_readdirplus_parent_cache_miss(struct dentry *dentry)
+ 	if (!nfs_server_capable(d_inode(dentry), NFS_CAP_READDIRPLUS))
+ 		return;
+ 	parent = dget_parent(dentry);
+-	nfs_force_use_readdirplus(d_inode(parent));
++	nfs_readdir_record_entry_cache_miss(d_inode(parent));
+ 	dput(parent);
+ }
+ 
+@@ -801,7 +801,7 @@ static void nfs_readdirplus_parent_cache_hit(struct dentry *dentry)
+ 	if (!nfs_server_capable(d_inode(dentry), NFS_CAP_READDIRPLUS))
+ 		return;
+ 	parent = dget_parent(dentry);
+-	nfs_advise_use_readdirplus(d_inode(parent));
++	nfs_readdir_record_entry_cache_hit(d_inode(parent));
+ 	dput(parent);
+ }
+ 
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index 6feac9339858..5f3109a53bee 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -366,8 +366,8 @@ extern struct nfs_client *nfs_init_client(struct nfs_client *clp,
+ 			   const struct nfs_client_initdata *);
+ 
+ /* dir.c */
+-extern void nfs_advise_use_readdirplus(struct inode *dir);
+-extern void nfs_force_use_readdirplus(struct inode *dir);
++extern void nfs_readdir_record_entry_cache_hit(struct inode *dir);
++extern void nfs_readdir_record_entry_cache_miss(struct inode *dir);
+ extern unsigned long nfs_access_cache_count(struct shrinker *shrink,
+ 					    struct shrink_control *sc);
+ extern unsigned long nfs_access_cache_scan(struct shrinker *shrink,
+diff --git a/fs/nfs/nfstrace.h b/fs/nfs/nfstrace.h
+index 794c6335d183..49a4cf965ca7 100644
+--- a/fs/nfs/nfstrace.h
++++ b/fs/nfs/nfstrace.h
+@@ -37,7 +37,6 @@
+ 
+ #define nfs_show_nfsi_flags(v) \
+ 	__print_flags(v, "|", \
+-			{ BIT(NFS_INO_ADVISE_RDPLUS), "ADVISE_RDPLUS" }, \
+ 			{ BIT(NFS_INO_STALE), "STALE" }, \
+ 			{ BIT(NFS_INO_ACL_LRU_SET), "ACL_LRU_SET" }, \
+ 			{ BIT(NFS_INO_INVALIDATING), "INVALIDATING" }, \
+* Unmerged path include/linux/nfs_fs.h
