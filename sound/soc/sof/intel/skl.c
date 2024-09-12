@@ -51,7 +51,7 @@ static int skl_dsp_ipc_get_mailbox_offset(struct snd_sof_dev *sdev)
 
 /* skylake ops */
 struct snd_sof_dsp_ops sof_skl_ops;
-EXPORT_SYMBOL_NS(sof_skl_ops, SND_SOC_SOF_INTEL_HDA_COMMON);
+EXPORT_SYMBOL(sof_skl_ops);
 
 int sof_skl_ops_init(struct snd_sof_dev *sdev)
 {
@@ -97,7 +97,7 @@ int sof_skl_ops_init(struct snd_sof_dev *sdev)
 
 	return 0;
 };
-EXPORT_SYMBOL_NS(sof_skl_ops_init, SND_SOC_SOF_INTEL_HDA_COMMON);
+EXPORT_SYMBOL(sof_skl_ops_init);
 
 const struct sof_intel_dsp_desc skl_chip_info = {
 	.cores_num = 2,
@@ -115,4 +115,4 @@ const struct sof_intel_dsp_desc skl_chip_info = {
 	.disable_interrupts = hda_dsp_disable_interrupts,
 	.hw_ip_version = SOF_INTEL_CAVS_1_5,
 };
-EXPORT_SYMBOL_NS(skl_chip_info, SND_SOC_SOF_INTEL_HDA_COMMON);
+EXPORT_SYMBOL(skl_chip_info);

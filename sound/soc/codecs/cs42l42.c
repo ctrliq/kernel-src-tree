@@ -15,12 +15,12 @@
 #include <linux/types.h>
 #include <linux/init.h>
 #include <linux/delay.h>
-#include <linux/i2c.h>
 #include <linux/gpio.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/acpi.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/regulator/consumer.h>
 #include <linux/gpio/consumer.h>
@@ -172,7 +172,7 @@ static const struct reg_default cs42l42_reg_defaults[] = {
 	{ CS42L42_ASP_RX_DAI1_CH2_BIT_LSB,	0x00 },
 };
 
-static bool cs42l42_readable_register(struct device *dev, unsigned int reg)
+bool cs42l42_readable_register(struct device *dev, unsigned int reg)
 {
 	switch (reg) {
 	case CS42L42_PAGE_REGISTER:
@@ -332,8 +332,9 @@ static bool cs42l42_readable_register(struct device *dev, unsigned int reg)
 		return false;
 	}
 }
+EXPORT_SYMBOL_GPL(cs42l42_readable_register);
 
-static bool cs42l42_volatile_register(struct device *dev, unsigned int reg)
+bool cs42l42_volatile_register(struct device *dev, unsigned int reg)
 {
 	switch (reg) {
 	case CS42L42_DEVID_AB:
@@ -365,8 +366,9 @@ static bool cs42l42_volatile_register(struct device *dev, unsigned int reg)
 		return false;
 	}
 }
+EXPORT_SYMBOL_GPL(cs42l42_volatile_register);
 
-static const struct regmap_range_cfg cs42l42_page_range = {
+const struct regmap_range_cfg cs42l42_page_range = {
 	.name = "Pages",
 	.range_min = 0,
 	.range_max = CS42L42_MAX_REGISTER,
@@ -376,8 +378,9 @@ static const struct regmap_range_cfg cs42l42_page_range = {
 	.window_start = 0,
 	.window_len = 256,
 };
+EXPORT_SYMBOL_GPL(cs42l42_page_range);
 
-static const struct regmap_config cs42l42_regmap = {
+const struct regmap_config cs42l42_regmap = {
 	.reg_bits = 8,
 	.val_bits = 8,
 
@@ -395,6 +398,7 @@ static const struct regmap_config cs42l42_regmap = {
 	.use_single_read = true,
 	.use_single_write = true,
 };
+EXPORT_SYMBOL_GPL(cs42l42_regmap);
 
 static DECLARE_TLV_DB_SCALE(adc_tlv, -9700, 100, true);
 static DECLARE_TLV_DB_SCALE(mixer_tlv, -6300, 100, true);
@@ -522,6 +526,10 @@ static const struct snd_soc_dapm_widget cs42l42_dapm_widgets[] = {
 
 	/* Playback/Capture Requirements */
 	SND_SOC_DAPM_SUPPLY("SCLK", CS42L42_ASP_CLK_CFG, CS42L42_ASP_SCLK_EN_SHIFT, 0, NULL, 0),
+
+	/* Soundwire SRC power control */
+	SND_SOC_DAPM_PGA("DACSRC", CS42L42_PWR_CTL2, CS42L42_DAC_SRC_PDNB_SHIFT, 0, NULL, 0),
+	SND_SOC_DAPM_PGA("ADCSRC", CS42L42_PWR_CTL2, CS42L42_ADC_SRC_PDNB_SHIFT, 0, NULL, 0),
 };
 
 static const struct snd_soc_dapm_route cs42l42_audio_map[] = {
@@ -581,7 +589,7 @@ static int cs42l42_set_jack(struct snd_soc_component *component, struct snd_soc_
 	return 0;
 }
 
-static const struct snd_soc_component_driver cs42l42_soc_component = {
+const struct snd_soc_component_driver cs42l42_soc_component = {
 	.set_jack		= cs42l42_set_jack,
 	.dapm_widgets		= cs42l42_dapm_widgets,
 	.num_dapm_widgets	= ARRAY_SIZE(cs42l42_dapm_widgets),
@@ -591,6 +599,7 @@ static const struct snd_soc_component_driver cs42l42_soc_component = {
 	.num_controls		= ARRAY_SIZE(cs42l42_snd_controls),
 	.endianness		= 1,
 };
+EXPORT_SYMBOL_GPL(cs42l42_soc_component);
 
 /* Switch to SCLK. Atomic delay after the write to allow the switch to complete. */
 static const struct reg_sequence cs42l42_to_sclk_seq[] = {
@@ -648,8 +657,8 @@ static const struct cs42l42_pll_params pll_ratio_table[] = {
 	{ 24576000, 1, 0x03, 0x40, 0x000000, 0x03, 0x10, 12288000, 128, 1}
 };
 
-static int cs42l42_pll_config(struct snd_soc_component *component, unsigned int clk,
-			      unsigned int sample_rate)
+int cs42l42_pll_config(struct snd_soc_component *component, unsigned int clk,
+		       unsigned int sample_rate)
 {
 	struct cs42l42_private *cs42l42 = snd_soc_component_get_drvdata(component);
 	int i;
@@ -735,8 +744,9 @@ static int cs42l42_pll_config(struct snd_soc_component *component, unsigned int 
 
 	return -EINVAL;
 }
+EXPORT_SYMBOL_GPL(cs42l42_pll_config);
 
-static void cs42l42_src_config(struct snd_soc_component *component, unsigned int sample_rate)
+void cs42l42_src_config(struct snd_soc_component *component, unsigned int sample_rate)
 {
 	struct cs42l42_private *cs42l42 = snd_soc_component_get_drvdata(component);
 	unsigned int fs;
@@ -768,6 +778,7 @@ static void cs42l42_src_config(struct snd_soc_component *component, unsigned int
 				      CS42L42_CLK_OASRC_SEL_MASK,
 				      fs << CS42L42_CLK_OASRC_SEL_SHIFT);
 }
+EXPORT_SYMBOL_GPL(cs42l42_src_config);
 
 static int cs42l42_asp_config(struct snd_soc_component *component,
 			      unsigned int sclk, unsigned int sample_rate)
@@ -1008,7 +1019,7 @@ static int cs42l42_set_bclk_ratio(struct snd_soc_dai *dai,
 	return 0;
 }
 
-static int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 {
 	struct snd_soc_component *component = dai->component;
 	struct cs42l42_private *cs42l42 = snd_soc_component_get_drvdata(component);
@@ -1101,6 +1112,7 @@ static int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(cs42l42_mute_stream);
 
 #define CS42L42_FORMATS (SNDRV_PCM_FMTBIT_S16_LE |\
 			 SNDRV_PCM_FMTBIT_S24_LE |\
@@ -1115,7 +1127,7 @@ static const struct snd_soc_dai_ops cs42l42_ops = {
 	.mute_stream	= cs42l42_mute_stream,
 };
 
-static struct snd_soc_dai_driver cs42l42_dai = {
+struct snd_soc_dai_driver cs42l42_dai = {
 		.name = "cs42l42",
 		.playback = {
 			.stream_name = "Playback",
@@ -1135,6 +1147,7 @@ static struct snd_soc_dai_driver cs42l42_dai = {
 		.symmetric_sample_bits = 1,
 		.ops = &cs42l42_ops,
 };
+EXPORT_SYMBOL_GPL(cs42l42_dai);
 
 static void cs42l42_manual_hs_type_detect(struct cs42l42_private *cs42l42)
 {
@@ -1642,7 +1655,7 @@ static const struct cs42l42_irq_params irq_params_table[] = {
 		CS42L42_TSRS_PLUG_VAL_MASK}
 };
 
-static irqreturn_t cs42l42_irq_thread(int irq, void *data)
+irqreturn_t cs42l42_irq_thread(int irq, void *data)
 {
 	struct cs42l42_private *cs42l42 = (struct cs42l42_private *)data;
 	unsigned int stickies[12];
@@ -1651,9 +1664,11 @@ static irqreturn_t cs42l42_irq_thread(int irq, void *data)
 	unsigned int current_button_status;
 	unsigned int i;
 
+	pm_runtime_get_sync(cs42l42->dev);
 	mutex_lock(&cs42l42->irq_lock);
 	if (cs42l42->suspended || !cs42l42->init_done) {
 		mutex_unlock(&cs42l42->irq_lock);
+		pm_runtime_put_autosuspend(cs42l42->dev);
 		return IRQ_NONE;
 	}
 
@@ -1756,9 +1771,12 @@ static irqreturn_t cs42l42_irq_thread(int irq, void *data)
 	}
 
 	mutex_unlock(&cs42l42->irq_lock);
+	pm_runtime_mark_last_busy(cs42l42->dev);
+	pm_runtime_put_autosuspend(cs42l42->dev);
 
 	return IRQ_HANDLED;
 }
+EXPORT_SYMBOL_GPL(cs42l42_irq_thread);
 
 static void cs42l42_set_interrupt_masks(struct cs42l42_private *cs42l42)
 {
@@ -2127,12 +2145,15 @@ static const struct reg_sequence __maybe_unused cs42l42_shutdown_seq[] = {
 	REG_SEQ0(CS42L42_PWR_CTL1,		0xFF)
 };
 
-static int __maybe_unused cs42l42_suspend(struct device *dev)
+int cs42l42_suspend(struct device *dev)
 {
 	struct cs42l42_private *cs42l42 = dev_get_drvdata(dev);
 	unsigned int reg;
 	u8 save_regs[ARRAY_SIZE(cs42l42_shutdown_seq)];
 	int i, ret;
+
+	if (!cs42l42->init_done)
+		return 0;
 
 	/*
 	 * Wait for threaded irq handler to be idle and stop it processing
@@ -2187,11 +2208,15 @@ static int __maybe_unused cs42l42_suspend(struct device *dev)
 	return 0;
 
 }
+EXPORT_SYMBOL_GPL(cs42l42_suspend);
 
-static int __maybe_unused cs42l42_resume(struct device *dev)
+int cs42l42_resume(struct device *dev)
 {
 	struct cs42l42_private *cs42l42 = dev_get_drvdata(dev);
 	int ret;
+
+	if (!cs42l42->init_done)
+		return 0;
 
 	/*
 	 * If jack was unplugged and re-plugged during suspend it could
@@ -2214,8 +2239,9 @@ static int __maybe_unused cs42l42_resume(struct device *dev)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(cs42l42_resume);
 
-static void __maybe_unused cs42l42_resume_restore(struct device *dev)
+void cs42l42_resume_restore(struct device *dev)
 {
 	struct cs42l42_private *cs42l42 = dev_get_drvdata(dev);
 
@@ -2232,6 +2258,7 @@ static void __maybe_unused cs42l42_resume_restore(struct device *dev)
 
 	dev_dbg(dev, "System resumed\n");
 }
+EXPORT_SYMBOL_GPL(cs42l42_resume_restore);
 
 static int __maybe_unused cs42l42_i2c_resume(struct device *dev)
 {
@@ -2246,9 +2273,9 @@ static int __maybe_unused cs42l42_i2c_resume(struct device *dev)
 	return 0;
 }
 
-static int cs42l42_common_probe(struct cs42l42_private *cs42l42,
-				const struct snd_soc_component_driver *component_drv,
-				struct snd_soc_dai_driver *dai)
+int cs42l42_common_probe(struct cs42l42_private *cs42l42,
+			 const struct snd_soc_component_driver *component_drv,
+			 struct snd_soc_dai_driver *dai)
 {
 	int ret, i;
 
@@ -2321,8 +2348,9 @@ err_disable_noreset:
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(cs42l42_common_probe);
 
-static int cs42l42_init(struct cs42l42_private *cs42l42)
+int cs42l42_init(struct cs42l42_private *cs42l42)
 {
 	unsigned int reg;
 	int devid, ret;
@@ -2335,11 +2363,11 @@ static int cs42l42_init(struct cs42l42_private *cs42l42)
 		goto err_disable;
 	}
 
-	if (devid != CS42L42_CHIP_ID) {
+	if (devid != cs42l42->devid) {
 		ret = -ENODEV;
 		dev_err(cs42l42->dev,
-			"CS42L42 Device ID (%X). Expected %X\n",
-			devid, CS42L42_CHIP_ID);
+			"CS42L%x Device ID (%X). Expected %X\n",
+			cs42l42->devid & 0xff, devid, cs42l42->devid);
 		goto err_disable;
 	}
 
@@ -2350,7 +2378,8 @@ static int cs42l42_init(struct cs42l42_private *cs42l42)
 	}
 
 	dev_info(cs42l42->dev,
-		 "Cirrus Logic CS42L42, Revision: %02X\n", reg & 0xFF);
+		 "Cirrus Logic CS42L%x, Revision: %02X\n",
+		 cs42l42->devid & 0xff, reg & 0xFF);
 
 	/* Power up the codec */
 	regmap_update_bits(cs42l42->regmap, CS42L42_PWR_CTL1,
@@ -2372,6 +2401,18 @@ static int cs42l42_init(struct cs42l42_private *cs42l42)
 	ret = cs42l42_handle_device_data(cs42l42->dev, cs42l42);
 	if (ret != 0)
 		goto err_shutdown;
+
+	/*
+	 * SRC power is linked to ASP power so doesn't work in Soundwire mode.
+	 * Override it and use DAPM to control SRC power for Soundwire.
+	 */
+	if (cs42l42->sdw_peripheral) {
+		regmap_update_bits(cs42l42->regmap, CS42L42_PWR_CTL2,
+				   CS42L42_SRC_PDN_OVERRIDE_MASK |
+				   CS42L42_DAC_SRC_PDNB_MASK |
+				   CS42L42_ADC_SRC_PDNB_MASK,
+				   CS42L42_SRC_PDN_OVERRIDE_MASK);
+	}
 
 	/* Setup headset detection */
 	cs42l42_setup_hs_type_detect(cs42l42);
@@ -2401,8 +2442,9 @@ err_disable:
 				cs42l42->supplies);
 	return ret;
 }
+EXPORT_SYMBOL_GPL(cs42l42_init);
 
-static void cs42l42_common_remove(struct cs42l42_private *cs42l42)
+void cs42l42_common_remove(struct cs42l42_private *cs42l42)
 {
 	if (cs42l42->irq)
 		free_irq(cs42l42->irq, cs42l42);
@@ -2420,85 +2462,7 @@ static void cs42l42_common_remove(struct cs42l42_private *cs42l42)
 	gpiod_set_value_cansleep(cs42l42->reset_gpio, 0);
 	regulator_bulk_disable(ARRAY_SIZE(cs42l42->supplies), cs42l42->supplies);
 }
-
-static int cs42l42_i2c_probe(struct i2c_client *i2c_client)
-{
-	struct device *dev = &i2c_client->dev;
-	struct cs42l42_private *cs42l42;
-	struct regmap *regmap;
-	int ret;
-
-	cs42l42 = devm_kzalloc(dev, sizeof(struct cs42l42_private), GFP_KERNEL);
-	if (!cs42l42)
-		return -ENOMEM;
-
-	regmap = devm_regmap_init_i2c(i2c_client, &cs42l42_regmap);
-	if (IS_ERR(regmap)) {
-		ret = PTR_ERR(regmap);
-		dev_err(&i2c_client->dev, "regmap_init() failed: %d\n", ret);
-		return ret;
-	}
-
-	cs42l42->dev = dev;
-	cs42l42->regmap = regmap;
-	cs42l42->irq = i2c_client->irq;
-
-	ret = cs42l42_common_probe(cs42l42, &cs42l42_soc_component, &cs42l42_dai);
-	if (ret)
-		return ret;
-
-	return cs42l42_init(cs42l42);
-}
-
-static int cs42l42_i2c_remove(struct i2c_client *i2c_client)
-{
-	struct cs42l42_private *cs42l42 = dev_get_drvdata(&i2c_client->dev);
-
-	cs42l42_common_remove(cs42l42);
-
-	return 0;
-}
-
-static const struct dev_pm_ops cs42l42_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(cs42l42_suspend, cs42l42_i2c_resume)
-};
-
-#ifdef CONFIG_OF
-static const struct of_device_id cs42l42_of_match[] = {
-	{ .compatible = "cirrus,cs42l42", },
-	{}
-};
-MODULE_DEVICE_TABLE(of, cs42l42_of_match);
-#endif
-
-#ifdef CONFIG_ACPI
-static const struct acpi_device_id cs42l42_acpi_match[] = {
-	{"10134242", 0,},
-	{}
-};
-MODULE_DEVICE_TABLE(acpi, cs42l42_acpi_match);
-#endif
-
-static const struct i2c_device_id cs42l42_id[] = {
-	{"cs42l42", 0},
-	{}
-};
-
-MODULE_DEVICE_TABLE(i2c, cs42l42_id);
-
-static struct i2c_driver cs42l42_i2c_driver = {
-	.driver = {
-		.name = "cs42l42",
-		.pm = &cs42l42_pm_ops,
-		.of_match_table = of_match_ptr(cs42l42_of_match),
-		.acpi_match_table = ACPI_PTR(cs42l42_acpi_match),
-		},
-	.id_table = cs42l42_id,
-	.probe_new = cs42l42_i2c_probe,
-	.remove = cs42l42_i2c_remove,
-};
-
-module_i2c_driver(cs42l42_i2c_driver);
+EXPORT_SYMBOL_GPL(cs42l42_common_remove);
 
 MODULE_DESCRIPTION("ASoC CS42L42 driver");
 MODULE_AUTHOR("James Schulman, Cirrus Logic Inc, <james.schulman@cirrus.com>");

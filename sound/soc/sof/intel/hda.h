@@ -658,10 +658,10 @@ int hda_dsp_stream_spib_config(struct snd_sof_dev *sdev,
 			       int enable, u32 size);
 
 int hda_ipc_msg_data(struct snd_sof_dev *sdev,
-		     struct snd_pcm_substream *substream,
+		     struct snd_sof_pcm_stream *sps,
 		     void *p, size_t sz);
 int hda_set_stream_data_offset(struct snd_sof_dev *sdev,
-			       struct snd_pcm_substream *substream,
+			       struct snd_sof_pcm_stream *sps,
 			       size_t posn_offset);
 
 /*
@@ -715,16 +715,41 @@ void hda_dsp_ctrl_stop_chip(struct snd_sof_dev *sdev);
 void sof_hda_bus_init(struct snd_sof_dev *sdev, struct device *dev);
 void sof_hda_bus_exit(struct snd_sof_dev *sdev);
 
-#if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
+#if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA_AUDIO_CODEC)
 /*
  * HDA Codec operations.
  */
-void hda_codec_probe_bus(struct snd_sof_dev *sdev,
-			 bool hda_codec_use_common_hdmi);
+void hda_codec_probe_bus(struct snd_sof_dev *sdev);
 void hda_codec_jack_wake_enable(struct snd_sof_dev *sdev, bool enable);
 void hda_codec_jack_check(struct snd_sof_dev *sdev);
+void hda_codec_check_for_state_change(struct snd_sof_dev *sdev);
+void hda_codec_init_cmd_io(struct snd_sof_dev *sdev);
+void hda_codec_resume_cmd_io(struct snd_sof_dev *sdev);
+void hda_codec_stop_cmd_io(struct snd_sof_dev *sdev);
+void hda_codec_suspend_cmd_io(struct snd_sof_dev *sdev);
+void hda_codec_detect_mask(struct snd_sof_dev *sdev);
+void hda_codec_rirb_status_clear(struct snd_sof_dev *sdev);
+bool hda_codec_check_rirb_status(struct snd_sof_dev *sdev);
+void hda_codec_set_codec_wakeup(struct snd_sof_dev *sdev, bool status);
+void hda_codec_device_remove(struct snd_sof_dev *sdev);
 
-#endif /* CONFIG_SND_SOC_SOF_HDA */
+#else
+
+static inline void hda_codec_probe_bus(struct snd_sof_dev *sdev) { }
+static inline void hda_codec_jack_wake_enable(struct snd_sof_dev *sdev, bool enable) { }
+static inline void hda_codec_jack_check(struct snd_sof_dev *sdev) { }
+static inline void hda_codec_check_for_state_change(struct snd_sof_dev *sdev) { }
+static inline void hda_codec_init_cmd_io(struct snd_sof_dev *sdev) { }
+static inline void hda_codec_resume_cmd_io(struct snd_sof_dev *sdev) { }
+static inline void hda_codec_stop_cmd_io(struct snd_sof_dev *sdev) { }
+static inline void hda_codec_suspend_cmd_io(struct snd_sof_dev *sdev) { }
+static inline void hda_codec_detect_mask(struct snd_sof_dev *sdev) { }
+static inline void hda_codec_rirb_status_clear(struct snd_sof_dev *sdev) { }
+static inline bool hda_codec_check_rirb_status(struct snd_sof_dev *sdev) { return false; }
+static inline void hda_codec_set_codec_wakeup(struct snd_sof_dev *sdev, bool status) { }
+static inline void hda_codec_device_remove(struct snd_sof_dev *sdev) { }
+
+#endif /* CONFIG_SND_SOC_SOF_HDA_AUDIO_CODEC */
 
 #if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA_AUDIO_CODEC) && IS_ENABLED(CONFIG_SND_HDA_CODEC_HDMI)
 
@@ -734,28 +759,11 @@ int hda_codec_i915_exit(struct snd_sof_dev *sdev);
 
 #else
 
-static inline void hda_codec_i915_display_power(struct snd_sof_dev *sdev,
-						bool enable) { }
+static inline void hda_codec_i915_display_power(struct snd_sof_dev *sdev, bool enable) { }
 static inline int hda_codec_i915_init(struct snd_sof_dev *sdev) { return 0; }
 static inline int hda_codec_i915_exit(struct snd_sof_dev *sdev) { return 0; }
 
 #endif
-
-#if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
-
-int hda_bus_ml_get_capabilities(struct hdac_bus *bus);
-void hda_bus_ml_free(struct hdac_bus *bus);
-void hda_bus_ml_put_all(struct hdac_bus *bus);
-void hda_bus_ml_reset_losidv(struct hdac_bus *bus);
-
-#else
-
-static inline int hda_bus_ml_get_capabilities(struct hdac_bus *bus) { return 0; }
-static inline void hda_bus_ml_free(struct hdac_bus *bus) { }
-static inline void hda_bus_ml_put_all(struct hdac_bus *bus) { }
-static inline void hda_bus_ml_reset_losidv(struct hdac_bus *bus) { }
-
-#endif /* CONFIG_SND_SOC_SOF_HDA */
 
 /*
  * Trace Control.

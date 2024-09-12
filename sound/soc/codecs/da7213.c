@@ -2022,9 +2022,10 @@ static int da7213_i2c_probe(struct i2c_client *i2c)
 	return ret;
 }
 
-static void da7213_i2c_remove(struct i2c_client *i2c)
+static int da7213_i2c_remove(struct i2c_client *i2c)
 {
 	pm_runtime_disable(&i2c->dev);
+	return 0;
 }
 
 static int __maybe_unused da7213_runtime_suspend(struct device *dev)

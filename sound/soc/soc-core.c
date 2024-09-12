@@ -1059,7 +1059,9 @@ int snd_soc_add_pcm_runtimes(struct snd_soc_card *card,
 			     struct snd_soc_dai_link *dai_link,
 			     int num_dai_link)
 {
-	for (int i = 0; i < num_dai_link; i++) {
+	int i;
+
+	for (i = 0; i < num_dai_link; i++) {
 		int ret = snd_soc_add_pcm_runtime(card, dai_link + i);
 
 		if (ret < 0)

@@ -286,7 +286,7 @@ int sof_client_ipc_set_get_data(struct sof_client_dev *cdev, void *ipc_msg,
 
 	return -EINVAL;
 }
-EXPORT_SYMBOL_NS_GPL(sof_client_ipc_set_get_data, SND_SOC_SOF_CLIENT);
+EXPORT_SYMBOL_GPL(sof_client_ipc_set_get_data);
 
 #ifdef CONFIG_SND_SOC_SOF_INTEL_IPC4
 struct sof_ipc4_fw_module *sof_client_ipc4_find_module(struct sof_client_dev *c, const guid_t *uuid)
@@ -299,7 +299,7 @@ struct sof_ipc4_fw_module *sof_client_ipc4_find_module(struct sof_client_dev *c,
 
 	return NULL;
 }
-EXPORT_SYMBOL_NS_GPL(sof_client_ipc4_find_module, SND_SOC_SOF_CLIENT);
+EXPORT_SYMBOL_GPL(sof_client_ipc4_find_module);
 #endif
 
 int sof_suspend_clients(struct snd_sof_dev *sdev, pm_message_t state)
