@@ -49,6 +49,7 @@
 #include "en_tc.h"
 #include "en/mapping.h"
 #include "devlink.h"
+#include "lag/lag.h"
 
 #define mlx5_esw_for_each_rep(esw, i, rep) \
 	xa_for_each(&((esw)->offloads.vport_reps), i, rep)
