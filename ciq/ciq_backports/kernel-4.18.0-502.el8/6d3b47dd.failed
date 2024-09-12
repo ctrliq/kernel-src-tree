@@ -1,0 +1,154 @@
+x86/resctrl: Apply READ_ONCE/WRITE_ONCE to task_struct.{rmid,closid}
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Valentin Schneider <valentin.schneider@arm.com>
+commit 6d3b47ddffed70006cf4ba360eef61e9ce097d8f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/6d3b47dd.failed
+
+A CPU's current task can have its {closid, rmid} fields read locally
+while they are being concurrently written to from another CPU.
+This can happen anytime __resctrl_sched_in() races with either
+__rdtgroup_move_task() or rdt_move_group_tasks().
+
+Prevent load / store tearing for those accesses by giving them the
+READ_ONCE() / WRITE_ONCE() treatment.
+
+	Signed-off-by: Valentin Schneider <valentin.schneider@arm.com>
+	Signed-off-by: Reinette Chatre <reinette.chatre@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/9921fda88ad81afb9885b517fbe864a2bc7c35a9.1608243147.git.reinette.chatre@intel.com
+(cherry picked from commit 6d3b47ddffed70006cf4ba360eef61e9ce097d8f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/rdtgroup.c
+diff --cc arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index fc8061800ae6,f9190adc52cb..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@@ -573,49 -546,49 +573,62 @@@ out
+  static int __rdtgroup_move_task(struct task_struct *tsk,
+  				struct rdtgroup *rdtgrp)
+  {
+ -	/* If the task is already in rdtgrp, no need to move the task. */
+ -	if ((rdtgrp->type == RDTCTRL_GROUP && tsk->closid == rdtgrp->closid &&
+ -	     tsk->rmid == rdtgrp->mon.rmid) ||
+ -	    (rdtgrp->type == RDTMON_GROUP && tsk->rmid == rdtgrp->mon.rmid &&
+ -	     tsk->closid == rdtgrp->mon.parent->closid))
+ -		return 0;
+ +	struct task_move_callback *callback;
+ +	int ret;
+ +
+ +	callback = kzalloc(sizeof(*callback), GFP_KERNEL);
+ +	if (!callback)
+ +		return -ENOMEM;
+ +	callback->work.func = move_myself;
+ +	callback->rdtgrp = rdtgrp;
+  
+  	/*
+ -	 * Set the task's closid/rmid before the PQR_ASSOC MSR can be
+ -	 * updated by them.
+ -	 *
+ -	 * For ctrl_mon groups, move both closid and rmid.
+ -	 * For monitor groups, can move the tasks only from
+ -	 * their parent CTRL group.
+ +	 * Take a refcount, so rdtgrp cannot be freed before the
+ +	 * callback has been invoked.
+  	 */
+++<<<<<<< HEAD
+ +	atomic_inc(&rdtgrp->waitcount);
+ +	ret = task_work_add(tsk, &callback->work, true);
+ +	if (ret) {
+ +		/*
+ +		 * Task is exiting. Drop the refcount and free the callback.
+ +		 * No need to check the refcount as the group cannot be
+ +		 * deleted before the write function unlocks rdtgroup_mutex.
+ +		 */
+ +		atomic_dec(&rdtgrp->waitcount);
+ +		kfree(callback);
+ +		rdt_last_cmd_puts("Task exited\n");
+ +	} else {
+ +		/*
+ +		 * For ctrl_mon groups move both closid and rmid.
+ +		 * For monitor groups, can move the tasks only from
+ +		 * their parent CTRL group.
+ +		 */
+ +		if (rdtgrp->type == RDTCTRL_GROUP) {
+ +			tsk->closid = rdtgrp->closid;
+ +			tsk->rmid = rdtgrp->mon.rmid;
+ +		} else if (rdtgrp->type == RDTMON_GROUP) {
+ +			if (rdtgrp->mon.parent->closid == tsk->closid) {
+ +				tsk->rmid = rdtgrp->mon.rmid;
+ +			} else {
+ +				rdt_last_cmd_puts("Can't move task to different control group\n");
+ +				ret = -EINVAL;
+ +			}
+++=======
++ 
++ 	if (rdtgrp->type == RDTCTRL_GROUP) {
++ 		WRITE_ONCE(tsk->closid, rdtgrp->closid);
++ 		WRITE_ONCE(tsk->rmid, rdtgrp->mon.rmid);
++ 	} else if (rdtgrp->type == RDTMON_GROUP) {
++ 		if (rdtgrp->mon.parent->closid == tsk->closid) {
++ 			WRITE_ONCE(tsk->rmid, rdtgrp->mon.rmid);
++ 		} else {
++ 			rdt_last_cmd_puts("Can't move task to different control group\n");
++ 			return -EINVAL;
+++>>>>>>> 6d3b47ddffed (x86/resctrl: Apply READ_ONCE/WRITE_ONCE to task_struct.{rmid,closid})
+  		}
+  	}
+ -
+ -	/*
+ -	 * Ensure the task's closid and rmid are written before determining if
+ -	 * the task is current that will decide if it will be interrupted.
+ -	 */
+ -	barrier();
+ -
+ -	/*
+ -	 * By now, the task's closid and rmid are set. If the task is current
+ -	 * on a CPU, the PQR_ASSOC MSR needs to be updated to make the resource
+ -	 * group go into effect. If the task is not current, the MSR will be
+ -	 * updated when the task is scheduled in.
+ -	 */
+ -	update_task_closid_rmid(tsk);
+ -
+ -	return 0;
+ +	return ret;
+  }
+  
+  static bool is_closid_match(struct task_struct *t, struct rdtgroup *r)
+diff --git a/arch/x86/include/asm/resctrl.h b/arch/x86/include/asm/resctrl.h
+index 07603064df8f..d60ed0668a59 100644
+--- a/arch/x86/include/asm/resctrl.h
++++ b/arch/x86/include/asm/resctrl.h
+@@ -56,19 +56,22 @@ static void __resctrl_sched_in(void)
+ 	struct resctrl_pqr_state *state = this_cpu_ptr(&pqr_state);
+ 	u32 closid = state->default_closid;
+ 	u32 rmid = state->default_rmid;
++	u32 tmp;
+ 
+ 	/*
+ 	 * If this task has a closid/rmid assigned, use it.
+ 	 * Else use the closid/rmid assigned to this cpu.
+ 	 */
+ 	if (static_branch_likely(&rdt_alloc_enable_key)) {
+-		if (current->closid)
+-			closid = current->closid;
++		tmp = READ_ONCE(current->closid);
++		if (tmp)
++			closid = tmp;
+ 	}
+ 
+ 	if (static_branch_likely(&rdt_mon_enable_key)) {
+-		if (current->rmid)
+-			rmid = current->rmid;
++		tmp = READ_ONCE(current->rmid);
++		if (tmp)
++			rmid = tmp;
+ 	}
+ 
+ 	if (closid != state->cur_closid || rmid != state->cur_rmid) {
+* Unmerged path arch/x86/kernel/cpu/resctrl/rdtgroup.c
