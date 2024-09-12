@@ -1,0 +1,221 @@
+mm/page_alloc: simplify how many pages are selected per pcp list during bulk free
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-507.el8
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit fd56eef258a17bbc8eda2ca773fa538f354c5f49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-507.el8/fd56eef2.failed
+
+free_pcppages_bulk() selects pages to free by round-robining between
+lists.  Originally this was to evenly shrink pages by migratetype but
+uneven freeing is inevitable due to high pages.  Simplify list selection
+by starting with a list that definitely has pages on it in
+free_unref_page_commit() and for drain, it does not matter where
+draining starts as all pages are removed.
+
+Link: https://lkml.kernel.org/r/20220217002227.5739-4-mgorman@techsingularity.net
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Tested-by: Aaron Lu <aaron.lu@intel.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Jesper Dangaard Brouer <brouer@redhat.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit fd56eef258a17bbc8eda2ca773fa538f354c5f49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_alloc.c
+diff --cc mm/page_alloc.c
+index c5bf723f114f,21f68377d40f..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -1362,20 -1440,16 +1362,27 @@@ static inline void prefetch_buddy(struc
+  
+  /*
+   * Frees a number of pages from the PCP lists
+ - * Assumes all pages on list are in same zone.
+ + * Assumes all pages on list are in same zone, and of same order.
+   * count is the number of pages to free.
+ + *
+ + * If the zone was previously in an "all pages pinned" state then look to
+ + * see if this freeing clears that state.
+ + *
+ + * And clear the zone's pages_scanned counter, to hold off the "all pages are
+ + * pinned" detection logic.
+   */
+  static void free_pcppages_bulk(struct zone *zone, int count,
+- 					struct per_cpu_pages *pcp)
++ 					struct per_cpu_pages *pcp,
++ 					int pindex)
+  {
+++<<<<<<< HEAD
+ +	int migratetype = 0;
+ +	int batch_free = 0;
+++=======
++ 	int min_pindex = 0;
++ 	int max_pindex = NR_PCP_LISTS - 1;
++ 	unsigned int order;
+++>>>>>>> fd56eef258a1 (mm/page_alloc: simplify how many pages are selected per pcp list during bulk free)
+  	int prefetch_nr = READ_ONCE(pcp->batch);
+  	bool isolated_pageblocks;
+  	struct page *page, *tmp;
+@@@ -1386,32 -1460,33 +1393,50 @@@
+  	 * below while (list_empty(list)) loop.
+  	 */
+  	count = min(pcp->count, count);
+ -	while (count > 0) {
+ +	while (count) {
+  		struct list_head *list;
++ 		int nr_pages;
+  
+- 		/*
+- 		 * Remove pages from lists in a round-robin fashion. A
+- 		 * batch_free count is maintained that is incremented when an
+- 		 * empty list is encountered.  This is so more pages are freed
+- 		 * off fuller lists instead of spinning excessively around empty
+- 		 * lists
+- 		 */
++ 		/* Remove pages from lists in a round-robin fashion. */
+  		do {
+++<<<<<<< HEAD
+ +			batch_free++;
+ +			if (++migratetype == MIGRATE_PCPTYPES)
+ +				migratetype = 0;
+ +			list = &pcp->lists[migratetype];
+ +		} while (list_empty(list));
+ +
+ +		/* This is the only non-empty list. Free them all. */
+ +		if (batch_free == MIGRATE_PCPTYPES)
+ +			batch_free = count;
+ +
+++=======
++ 			if (++pindex > max_pindex)
++ 				pindex = min_pindex;
++ 			list = &pcp->lists[pindex];
++ 			if (!list_empty(list))
++ 				break;
++ 
++ 			if (pindex == max_pindex)
++ 				max_pindex--;
++ 			if (pindex == min_pindex)
++ 				min_pindex++;
++ 		} while (1);
++ 
++ 		order = pindex_to_order(pindex);
++ 		nr_pages = 1 << order;
++ 		BUILD_BUG_ON(MAX_ORDER >= (1<<NR_PCP_ORDER_WIDTH));
+++>>>>>>> fd56eef258a1 (mm/page_alloc: simplify how many pages are selected per pcp list during bulk free)
+  		do {
+  			page = list_last_entry(list, struct page, lru);
+  			/* must delete to avoid corrupting pcp list */
+  			list_del(&page->lru);
+++<<<<<<< HEAD
+ +			pcp->count--;
+++=======
++ 			count -= nr_pages;
++ 			pcp->count -= nr_pages;
+++>>>>>>> fd56eef258a1 (mm/page_alloc: simplify how many pages are selected per pcp list during bulk free)
+  
+  			if (bulkfree_pcp_prepare(page))
+  				continue;
+@@@ -1431,9 -1510,13 +1456,13 @@@
+  				prefetch_buddy(page, order);
+  				prefetch_nr--;
+  			}
+++<<<<<<< HEAD
+ +		} while (--count && --batch_free && !list_empty(list));
+++=======
++ 		} while (count > 0 && !list_empty(list));
+++>>>>>>> fd56eef258a1 (mm/page_alloc: simplify how many pages are selected per pcp list during bulk free)
+  	}
+  
+ -	/*
+ -	 * local_lock_irq held so equivalent to spin_lock_irqsave for
+ -	 * both PREEMPT_RT and non-PREEMPT_RT configurations.
+ -	 */
+  	spin_lock(&zone->lock);
+  	isolated_pageblocks = has_isolate_pageblock(zone);
+  
+@@@ -2967,8 -3065,8 +2996,13 @@@ void drain_zone_pages(struct zone *zone
+  	batch = READ_ONCE(pcp->batch);
+  	to_drain = min(pcp->count, batch);
+  	if (to_drain > 0)
+++<<<<<<< HEAD
+ +		free_pcppages_bulk(zone, to_drain, pcp);
+ +	local_irq_restore(flags);
+++=======
++ 		free_pcppages_bulk(zone, to_drain, pcp, 0);
++ 	local_unlock_irqrestore(&pagesets.lock, flags);
+++>>>>>>> fd56eef258a1 (mm/page_alloc: simplify how many pages are selected per pcp list during bulk free)
+  }
+  #endif
+  
+@@@ -2982,16 -3080,15 +3016,22 @@@
+  static void drain_pages_zone(unsigned int cpu, struct zone *zone)
+  {
+  	unsigned long flags;
+ +	struct per_cpu_pageset *pset;
+  	struct per_cpu_pages *pcp;
+  
+ -	local_lock_irqsave(&pagesets.lock, flags);
+ +	local_irq_save(flags);
+ +	pset = per_cpu_ptr(zone->pageset, cpu);
+  
+ -	pcp = per_cpu_ptr(zone->per_cpu_pageset, cpu);
+ +	pcp = &pset->pcp;
+  	if (pcp->count)
+++<<<<<<< HEAD
+ +		free_pcppages_bulk(zone, pcp->count, pcp);
+ +	local_irq_restore(flags);
+++=======
++ 		free_pcppages_bulk(zone, pcp->count, pcp, 0);
++ 
++ 	local_unlock_irqrestore(&pagesets.lock, flags);
+++>>>>>>> fd56eef258a1 (mm/page_alloc: simplify how many pages are selected per pcp list during bulk free)
+  }
+  
+  /*
+@@@ -3209,10 -3355,33 +3249,36 @@@ static void free_unref_page_commit(stru
+  {
+  	struct zone *zone = page_zone(page);
+  	struct per_cpu_pages *pcp;
+++<<<<<<< HEAD
+++=======
++ 	int high;
++ 	int pindex;
++ 
++ 	__count_vm_event(PGFREE);
++ 	pcp = this_cpu_ptr(zone->per_cpu_pageset);
++ 	pindex = order_to_pindex(migratetype, order);
++ 	list_add(&page->lru, &pcp->lists[pindex]);
++ 	pcp->count += 1 << order;
++ 	high = nr_pcp_high(pcp, zone);
++ 	if (pcp->count >= high) {
++ 		int batch = READ_ONCE(pcp->batch);
++ 
++ 		free_pcppages_bulk(zone, nr_pcp_free(pcp, high, batch), pcp, pindex);
++ 	}
++ }
++ 
++ /*
++  * Free a pcp page
++  */
++ void free_unref_page(struct page *page, unsigned int order)
++ {
++ 	unsigned long flags;
++ 	unsigned long pfn = page_to_pfn(page);
+++>>>>>>> fd56eef258a1 (mm/page_alloc: simplify how many pages are selected per pcp list during bulk free)
+  	int migratetype;
+  
+ -	if (!free_unref_page_prepare(page, pfn, order))
+ -		return;
+ +	migratetype = get_pcppage_migratetype(page);
+ +	__count_vm_event(PGFREE);
+  
+  	/*
+  	 * We only track unmovable, reclaimable and movable on pcp lists.
+* Unmerged path mm/page_alloc.c
