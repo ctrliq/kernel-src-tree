@@ -1,0 +1,138 @@
+driver core: add deferring probe reason to devices_deferred property
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Andrzej Hajda <a.hajda@samsung.com>
+commit d090b70ede02370014a1cf8acd211d1ed0fa9fd9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/d090b70e.failed
+
+/sys/kernel/debug/devices_deferred property contains list of deferred devices.
+This list does not contain reason why the driver deferred probe, the patch
+improves it.
+The natural place to set the reason is dev_err_probe function introduced
+recently, ie. if dev_err_probe will be called with -EPROBE_DEFER instead of
+printk the message will be attached to a deferred device and printed when user
+reads devices_deferred property.
+
+	Signed-off-by: Andrzej Hajda <a.hajda@samsung.com>
+	Reviewed-by: Mark Brown <broonie@kernel.org>
+	Reviewed-by: Javier Martinez Canillas <javierm@redhat.com>
+	Reviewed-by: Andy Shevchenko <andy.shevchenko@gmail.com>
+	Reviewed-by: Rafael J. Wysocki <rafael@kernel.org>
+Link: https://lore.kernel.org/r/20200713144324.23654-3-a.hajda@samsung.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit d090b70ede02370014a1cf8acd211d1ed0fa9fd9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/base.h
+#	drivers/base/core.c
+diff --cc drivers/base/base.h
+index b4dfedfeac5c,91cfb8405abd..000000000000
+--- a/drivers/base/base.h
++++ b/drivers/base/base.h
+@@@ -78,11 -90,12 +78,16 @@@ struct device_private 
+  	struct klist_node knode_parent;
+  	struct klist_node knode_driver;
+  	struct klist_node knode_bus;
+ -	struct klist_node knode_class;
+  	struct list_head deferred_probe;
+++<<<<<<< HEAD
+++=======
++ 	struct device_driver *async_driver;
++ 	char *deferred_probe_reason;
+++>>>>>>> d090b70ede02 (driver core: add deferring probe reason to devices_deferred property)
+  	struct device *device;
+ -	u8 dead:1;
+ +	RH_KABI_EXTEND(struct device_driver *async_driver)
+ +	RH_KABI_EXTEND(u8 dead:1)
+ +
+  };
+  #define to_device_private_parent(obj)	\
+  	container_of(obj, struct device_private, knode_parent)
+@@@ -125,7 -133,10 +130,9 @@@ extern void device_release_driver_inter
+  					   struct device *parent);
+  
+  extern void driver_detach(struct device_driver *drv);
+ -extern int driver_probe_device(struct device_driver *drv, struct device *dev);
+  extern void driver_deferred_probe_del(struct device *dev);
++ extern void device_set_deferred_probe_reason(const struct device *dev,
++ 					     struct va_format *vaf);
+  static inline int driver_match_device(struct device_driver *drv,
+  				      struct device *dev)
+  {
+diff --cc drivers/base/core.c
+index e736ab40e755,778c7a435cbd..000000000000
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@@ -4492,10 -4236,12 +4494,19 @@@ int dev_err_probe(const struct device *
+  	vaf.fmt = fmt;
+  	vaf.va = &args;
+  
+++<<<<<<< HEAD
+ +	if (err != -EPROBE_DEFER)
+ +		dev_err(dev, "error %pe: %pV", ERR_PTR(err), &vaf);
+ +	else
+ +		dev_dbg(dev, "error %pe: %pV", ERR_PTR(err), &vaf);
+++=======
++ 	if (err != -EPROBE_DEFER) {
++ 		dev_err(dev, "error %d: %pV", err, &vaf);
++ 	} else {
++ 		device_set_deferred_probe_reason(dev, &vaf);
++ 		dev_dbg(dev, "error %d: %pV", err, &vaf);
++ 	}
+++>>>>>>> d090b70ede02 (driver core: add deferring probe reason to devices_deferred property)
+  
+  	va_end(args);
+  
+* Unmerged path drivers/base/base.h
+* Unmerged path drivers/base/core.c
+diff --git a/drivers/base/dd.c b/drivers/base/dd.c
+index 984241ca88a0..2a89af84bfb9 100644
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -157,6 +157,8 @@ void driver_deferred_probe_del(struct device *dev)
+ 	if (!list_empty(&dev->p->deferred_probe)) {
+ 		dev_dbg(dev, "Removed from deferred list\n");
+ 		list_del_init(&dev->p->deferred_probe);
++		kfree(dev->p->deferred_probe_reason);
++		dev->p->deferred_probe_reason = NULL;
+ 	}
+ 	mutex_unlock(&deferred_probe_mutex);
+ }
+@@ -227,6 +229,23 @@ void device_unblock_probing(void)
+ 	driver_deferred_probe_trigger();
+ }
+ 
++/**
++ * device_set_deferred_probe_reason() - Set defer probe reason message for device
++ * @dev: the pointer to the struct device
++ * @vaf: the pointer to va_format structure with message
++ */
++void device_set_deferred_probe_reason(const struct device *dev, struct va_format *vaf)
++{
++	const char *drv = dev_driver_string(dev);
++
++	mutex_lock(&deferred_probe_mutex);
++
++	kfree(dev->p->deferred_probe_reason);
++	dev->p->deferred_probe_reason = kasprintf(GFP_KERNEL, "%s: %pV", drv, vaf);
++
++	mutex_unlock(&deferred_probe_mutex);
++}
++
+ /*
+  * deferred_devs_show() - Show the devices in the deferred probe pending list.
+  */
+@@ -237,7 +256,8 @@ static int deferred_devs_show(struct seq_file *s, void *data)
+ 	mutex_lock(&deferred_probe_mutex);
+ 
+ 	list_for_each_entry(curr, &deferred_probe_pending_list, deferred_probe)
+-		seq_printf(s, "%s\n", dev_name(curr->device));
++		seq_printf(s, "%s\t%s", dev_name(curr->device),
++			   curr->device->p->deferred_probe_reason ?: "\n");
+ 
+ 	mutex_unlock(&deferred_probe_mutex);
+ 
