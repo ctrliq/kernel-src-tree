@@ -1,0 +1,222 @@
+x86/compressed/acpi: Move EFI detection to helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Michael Roth <michael.roth@amd.com>
+commit 7c4146e8885512719a50b641e9277a1712e052ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/7c4146e8.failed
+
+Future patches for SEV-SNP-validated CPUID will also require early
+parsing of the EFI configuration. Incrementally move the related code
+into a set of helpers that can be re-used for that purpose.
+
+First, carve out the functionality which determines the EFI environment
+type the machine is booting on.
+
+  [ bp: Massage commit message. ]
+
+	Signed-off-by: Michael Roth <michael.roth@amd.com>
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20220307213356.2797205-25-brijesh.singh@amd.com
+(cherry picked from commit 7c4146e8885512719a50b641e9277a1712e052ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/Makefile
+diff --cc arch/x86/boot/compressed/Makefile
+index 3ffaacf049db,e69c3d2e0628..000000000000
+--- a/arch/x86/boot/compressed/Makefile
++++ b/arch/x86/boot/compressed/Makefile
+@@@ -96,36 -102,12 +96,42 @@@ endi
+  
+  vmlinux-objs-$(CONFIG_ACPI) += $(obj)/acpi.o
+  
+++<<<<<<< HEAD
+ +$(obj)/eboot.o: KBUILD_CFLAGS += -fshort-wchar -mno-red-zone
+++=======
++ vmlinux-objs-$(CONFIG_EFI_MIXED) += $(obj)/efi_thunk_$(BITS).o
++ vmlinux-objs-$(CONFIG_EFI) += $(obj)/efi.o
++ efi-obj-$(CONFIG_EFI_STUB) = $(objtree)/drivers/firmware/efi/libstub/lib.a
+++>>>>>>> 7c4146e88855 (x86/compressed/acpi: Move EFI detection to helper)
+ +
+ +vmlinux-objs-$(CONFIG_EFI_STUB) += $(obj)/eboot.o $(obj)/efi_stub_$(BITS).o \
+ +	$(objtree)/drivers/firmware/efi/libstub/lib.a
+ +vmlinux-objs-$(CONFIG_EFI_MIXED) += $(obj)/efi_thunk_$(BITS).o
+  
+ -$(obj)/vmlinux: $(vmlinux-objs-y) $(efi-obj-y) FORCE
+ -	$(call if_changed,ld)
+ +# The compressed kernel is built with -fPIC/-fPIE so that a boot loader
+ +# can place it anywhere in memory and it will still run. However, since
+ +# it is executed as-is without any ELF relocation processing performed
+ +# (and has already had all relocation sections stripped from the binary),
+ +# none of the code can use data relocations (e.g. static assignments of
+ +# pointer values), since they will be meaningless at runtime. This check
+ +# will refuse to link the vmlinux if any of these relocations are found.
+ +quiet_cmd_check_data_rel = DATAREL $@
+ +define cmd_check_data_rel
+ +	for obj in $(filter %.o,$^); do \
+ +		${CROSS_COMPILE}readelf -S $$obj | grep -qF .rel.local && { \
+ +			echo "error: $$obj has data relocations!" >&2; \
+ +			exit 1; \
+ +		} || true; \
+ +	done
+ +endef
+ +
+ +# We need to run two commands under "if_changed", so merge them into a
+ +# single invocation.
+ +quiet_cmd_check-and-link-vmlinux = LD      $@
+ +      cmd_check-and-link-vmlinux = $(cmd_check_data_rel); $(cmd_ld)
+ +
+ +$(obj)/vmlinux: $(vmlinux-objs-y) FORCE
+ +	$(call if_changed,check-and-link-vmlinux)
+  
+  OBJCOPYFLAGS_vmlinux.bin :=  -R .comment -S
+  $(obj)/vmlinux.bin: vmlinux FORCE
+* Unmerged path arch/x86/boot/compressed/Makefile
+diff --git a/arch/x86/boot/compressed/acpi.c b/arch/x86/boot/compressed/acpi.c
+index 15255f388a85..fa5bd2f37d44 100644
+--- a/arch/x86/boot/compressed/acpi.c
++++ b/arch/x86/boot/compressed/acpi.c
+@@ -111,7 +111,7 @@ static acpi_physical_address kexec_get_rsdp_addr(void)
+ 	efi_system_table_64_t *systab;
+ 	struct efi_setup_data *esd;
+ 	struct efi_info *ei;
+-	char *sig;
++	enum efi_type et;
+ 
+ 	esd = (struct efi_setup_data *)get_kexec_setup_data_addr();
+ 	if (!esd)
+@@ -122,10 +122,9 @@ static acpi_physical_address kexec_get_rsdp_addr(void)
+ 		return 0;
+ 	}
+ 
+-	ei = &boot_params->efi_info;
+-	sig = (char *)&ei->efi_loader_signature;
+-	if (strncmp(sig, EFI64_LOADER_SIGNATURE, 4)) {
+-		debug_putstr("Wrong kexec EFI loader signature.\n");
++	et = efi_get_type(boot_params);
++	if (et != EFI_TYPE_64) {
++		debug_putstr("Unexpected kexec EFI environment (expected 64-bit EFI).\n");
+ 		return 0;
+ 	}
+ 
+@@ -146,29 +145,22 @@ static acpi_physical_address efi_get_rsdp_addr(void)
+ 	unsigned long systab, config_tables;
+ 	unsigned int nr_tables;
+ 	struct efi_info *ei;
++	enum efi_type et;
+ 	bool efi_64;
+-	char *sig;
+-
+-	ei = &boot_params->efi_info;
+-	sig = (char *)&ei->efi_loader_signature;
+ 
+-	if (!strncmp(sig, EFI64_LOADER_SIGNATURE, 4)) {
++	et = efi_get_type(boot_params);
++	if (et == EFI_TYPE_64)
+ 		efi_64 = true;
+-	} else if (!strncmp(sig, EFI32_LOADER_SIGNATURE, 4)) {
++	else if (et == EFI_TYPE_32)
+ 		efi_64 = false;
+-	} else {
+-		debug_putstr("Wrong EFI loader signature.\n");
++	else
+ 		return 0;
+-	}
+ 
+ 	/* Get systab from boot params. */
++	ei = &boot_params->efi_info;
+ #ifdef CONFIG_X86_64
+ 	systab = ei->efi_systab | ((__u64)ei->efi_systab_hi << 32);
+ #else
+-	if (ei->efi_systab_hi || ei->efi_memmap_hi) {
+-		debug_putstr("Error getting RSDP address: EFI system table located above 4GB.\n");
+-		return 0;
+-	}
+ 	systab = ei->efi_systab;
+ #endif
+ 	if (!systab)
+diff --git a/arch/x86/boot/compressed/efi.c b/arch/x86/boot/compressed/efi.c
+new file mode 100644
+index 000000000000..bad0ce3e2ef6
+--- /dev/null
++++ b/arch/x86/boot/compressed/efi.c
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Helpers for early access to EFI configuration table.
++ *
++ * Originally derived from arch/x86/boot/compressed/acpi.c
++ */
++
++#include "misc.h"
++#include <linux/efi.h>
++#include <asm/efi.h>
++
++/**
++ * efi_get_type - Given a pointer to boot_params, determine the type of EFI environment.
++ *
++ * @bp:         pointer to boot_params
++ *
++ * Return: EFI_TYPE_{32,64} for valid EFI environments, EFI_TYPE_NONE otherwise.
++ */
++enum efi_type efi_get_type(struct boot_params *bp)
++{
++	struct efi_info *ei;
++	enum efi_type et;
++	const char *sig;
++
++	ei = &bp->efi_info;
++	sig = (char *)&ei->efi_loader_signature;
++
++	if (!strncmp(sig, EFI64_LOADER_SIGNATURE, 4)) {
++		et = EFI_TYPE_64;
++	} else if (!strncmp(sig, EFI32_LOADER_SIGNATURE, 4)) {
++		et = EFI_TYPE_32;
++	} else {
++		debug_putstr("No EFI environment detected.\n");
++		et = EFI_TYPE_NONE;
++	}
++
++#ifndef CONFIG_X86_64
++	/*
++	 * Existing callers like acpi.c treat this case as an indicator to
++	 * fall-through to non-EFI, rather than an error, so maintain that
++	 * functionality here as well.
++	 */
++	if (ei->efi_systab_hi || ei->efi_memmap_hi) {
++		debug_putstr("EFI system table is located above 4GB and cannot be accessed.\n");
++		et = EFI_TYPE_NONE;
++	}
++#endif
++
++	return et;
++}
+diff --git a/arch/x86/boot/compressed/misc.h b/arch/x86/boot/compressed/misc.h
+index 5bf08eb0ecdc..f5cee5a8bf23 100644
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@ -168,4 +168,20 @@ void boot_stage2_vc(void);
+ 
+ unsigned long sev_verify_cbit(unsigned long cr3);
+ 
++enum efi_type {
++	EFI_TYPE_64,
++	EFI_TYPE_32,
++	EFI_TYPE_NONE,
++};
++
++#ifdef CONFIG_EFI
++/* helpers for early EFI config table access */
++enum efi_type efi_get_type(struct boot_params *bp);
++#else
++static inline enum efi_type efi_get_type(struct boot_params *bp)
++{
++	return EFI_TYPE_NONE;
++}
++#endif /* CONFIG_EFI */
++
+ #endif /* BOOT_COMPRESSED_MISC_H */
