@@ -1,0 +1,135 @@
+bnxt: don't handle XDP in netpoll
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-532.el8
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit 37b61cda9c1606cd8b6445d900ca9dc03185e8b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-532.el8/37b61cda.failed
+
+Similarly to other recently fixed drivers make sure we don't
+try to access XDP or page pool APIs when NAPI budget is 0.
+NAPI budget of 0 may mean that we are in netpoll.
+
+This may result in running software IRQs in hard IRQ context,
+leading to deadlocks or crashes.
+
+To make sure bnapi->tx_pkts don't get wiped without handling
+the events, move clearing the field into the handler itself.
+Remember to clear tx_pkts after reset (bnxt_enable_napi())
+as it's technically possible that netpoll will accumulate
+some tx_pkts and then a reset will happen, leaving tx_pkts
+out of sync with reality.
+
+Fixes: 322b87ca55f2 ("bnxt_en: add page_pool support")
+	Reviewed-by: Andy Gospodarek <gospo@broadcom.com>
+	Reviewed-by: Michael Chan <michael.chan@broadcom.com>
+Link: https://lore.kernel.org/r/20230728205020.2784844-1-kuba@kernel.org
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 37b61cda9c1606cd8b6445d900ca9dc03185e8b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 1b04c4decd96,06b238bef9dd..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -702,20 -689,12 +703,25 @@@ next_tx_int
+  		dev_kfree_skb_any(skb);
+  	}
+  
+++<<<<<<< HEAD
+ +	netdev_tx_completed_queue(txq, nr_pkts, tx_bytes);
+ +	txr->tx_cons = cons;
+++=======
++ 	bnapi->tx_pkts = 0;
++ 	WRITE_ONCE(txr->tx_cons, cons);
+++>>>>>>> 37b61cda9c16 (bnxt: don't handle XDP in netpoll)
+ +
+ +	/* Need to make the tx_cons update visible to bnxt_start_xmit()
+ +	 * before checking for netif_tx_queue_stopped().  Without the
+ +	 * memory barrier, there is a small possibility that bnxt_start_xmit()
+ +	 * will miss it and cause the queue to be stopped forever.
+ +	 */
+ +	smp_mb();
+  
+ -	__netif_txq_completed_wake(txq, nr_pkts, tx_bytes,
+ -				   bnxt_tx_avail(bp, txr), bp->tx_wake_thresh,
+ -				   READ_ONCE(txr->dev_state) == BNXT_DEV_STATE_CLOSING);
+ +	if (unlikely(netif_tx_queue_stopped(txq)) &&
+ +	    bnxt_tx_avail(bp, txr) >= bp->tx_wake_thresh &&
+ +	    READ_ONCE(txr->dev_state) != BNXT_DEV_STATE_CLOSING)
+ +		netif_tx_wake_queue(txq);
+  }
+  
+  static struct page *__bnxt_alloc_rx_page(struct bnxt *bp, dma_addr_t *mapping,
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+index e71fd06aa420,7f2f9a317d47..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+@@@ -78,8 -134,11 +79,11 @@@ void bnxt_tx_int_xdp(struct bnxt *bp, s
+  	struct bnxt_sw_tx_bd *tx_buf;
+  	u16 tx_cons = txr->tx_cons;
+  	u16 last_tx_cons = tx_cons;
+ -	int i, j, frags;
+ +	int i;
+  
++ 	if (!budget)
++ 		return;
++ 
+  	for (i = 0; i < nr_pkts; i++) {
+  		tx_buf = &txr->tx_buf_ring[tx_cons];
+  
+@@@ -99,7 -158,16 +103,13 @@@
+  		}
+  		tx_cons = NEXT_TX(tx_cons);
+  	}
+++<<<<<<< HEAD
+ +	txr->tx_cons = tx_cons;
+++=======
++ 
++ 	bnapi->tx_pkts = 0;
++ 	WRITE_ONCE(txr->tx_cons, tx_cons);
+++>>>>>>> 37b61cda9c16 (bnxt: don't handle XDP in netpoll)
+  	if (rx_doorbell_needed) {
+  		tx_buf = &txr->tx_buf_ring[last_tx_cons];
+  		bnxt_db_write(bp, &rxr->rx_db, tx_buf->rx_prod);
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.h
+index b392009c007d,5e412c5655ba..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.h
+@@@ -14,8 -14,9 +14,14 @@@ DECLARE_STATIC_KEY_FALSE(bnxt_xdp_locki
+  
+  struct bnxt_sw_tx_bd *bnxt_xmit_bd(struct bnxt *bp,
+  				   struct bnxt_tx_ring_info *txr,
+++<<<<<<< HEAD
+ +				   dma_addr_t mapping, u32 len);
+ +void bnxt_tx_int_xdp(struct bnxt *bp, struct bnxt_napi *bnapi, int nr_pkts);
+++=======
++ 				   dma_addr_t mapping, u32 len,
++ 				   struct xdp_buff *xdp);
++ void bnxt_tx_int_xdp(struct bnxt *bp, struct bnxt_napi *bnapi, int budget);
+++>>>>>>> 37b61cda9c16 (bnxt: don't handle XDP in netpoll)
+  bool bnxt_rx_xdp(struct bnxt *bp, struct bnxt_rx_ring_info *rxr, u16 cons,
+  		 struct xdp_buff xdp, struct page *page, u8 **data_ptr,
+  		 unsigned int *len, u8 *event);
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.h b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 1cedf5cc0c99..67378b8bbec0 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -1003,7 +1003,7 @@ struct bnxt_napi {
+ 	struct bnxt_tx_ring_info	*tx_ring;
+ 
+ 	void			(*tx_int)(struct bnxt *, struct bnxt_napi *,
+-					  int);
++					  int budget);
+ 	int			tx_pkts;
+ 	u8			events;
+ 
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.h
