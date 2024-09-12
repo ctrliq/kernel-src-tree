@@ -442,8 +442,9 @@ static void cgwb_release_workfn(struct work_struct *work)
 	list_del(&wb->offline_node);
 	spin_unlock_irq(&cgwb_lock);
 
-	wb_exit(wb);
+	/* RHEL: This WARN_ON_ONCE() check must be done before wb_exit() */
 	WARN_ON_ONCE(!list_empty(&wb->b_attached));
+	wb_exit(wb);
 	call_rcu(&wb->rcu, cgwb_free_rcu);
 }
 

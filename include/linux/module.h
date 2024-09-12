@@ -485,8 +485,10 @@ struct module {
 #endif
 	RH_KABI_USE(1, unsigned int num_bpf_raw_events);
 	RH_KABI_USE(2, struct bpf_raw_event_map *bpf_raw_events);
-	RH_KABI_RESERVE(3);
-	RH_KABI_RESERVE(4);
+#if IS_ENABLED(CONFIG_KUNIT)
+	RH_KABI_USE(3, int num_kunit_suites);
+	RH_KABI_USE(4, struct kunit_suite **kunit_suites);
+#endif
 } ____cacheline_aligned __randomize_layout;
 #ifndef MODULE_ARCH_INIT
 #define MODULE_ARCH_INIT {}

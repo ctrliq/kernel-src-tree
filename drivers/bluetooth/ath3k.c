@@ -234,7 +234,7 @@ static int ath3k_load_firmware(struct usb_device *udev,
 
 	err = usb_control_msg_send(udev, 0, USB_REQ_DFU_DNLOAD, USB_TYPE_VENDOR,
 				   0, 0, firmware->data, FW_HDR_SIZE,
-				   USB_CTRL_SET_TIMEOUT);
+				   USB_CTRL_SET_TIMEOUT, GFP_KERNEL);
 	if (err) {
 		BT_ERR("Can't change to loading configuration err");
 		goto error;
@@ -272,7 +272,8 @@ static int ath3k_get_state(struct usb_device *udev, unsigned char *state)
 {
 	return usb_control_msg_recv(udev, 0, ATH3K_GETSTATE,
 				    USB_TYPE_VENDOR | USB_DIR_IN, 0, 0,
-				    state, 1, USB_CTRL_SET_TIMEOUT);
+				    state, 1, USB_CTRL_SET_TIMEOUT,
+				    GFP_KERNEL);
 }
 
 static int ath3k_get_version(struct usb_device *udev,
@@ -280,7 +281,8 @@ static int ath3k_get_version(struct usb_device *udev,
 {
 	return usb_control_msg_recv(udev, 0, ATH3K_GETVERSION,
 				    USB_TYPE_VENDOR | USB_DIR_IN, 0, 0,
-				    version, sizeof(*version), USB_CTRL_SET_TIMEOUT);
+				    version, sizeof(*version), USB_CTRL_SET_TIMEOUT,
+				    GFP_KERNEL);
 }
 
 static int ath3k_load_fwfile(struct usb_device *udev,
@@ -302,7 +304,8 @@ static int ath3k_load_fwfile(struct usb_device *udev,
 	size = min_t(uint, count, FW_HDR_SIZE);
 
 	ret = usb_control_msg_send(udev, 0, ATH3K_DNLOAD, USB_TYPE_VENDOR, 0, 0,
-				   firmware->data, size, USB_CTRL_SET_TIMEOUT);
+				   firmware->data, size, USB_CTRL_SET_TIMEOUT,
+				   GFP_KERNEL);
 	if (ret) {
 		BT_ERR("Can't change to loading configuration err");
 		kfree(send_buf);
@@ -339,7 +342,7 @@ static int ath3k_load_fwfile(struct usb_device *udev,
 static void ath3k_switch_pid(struct usb_device *udev)
 {
 	usb_control_msg_send(udev, 0, USB_REG_SWITCH_VID_PID, USB_TYPE_VENDOR,
-			     0, 0, NULL, 0, USB_CTRL_SET_TIMEOUT);
+			     0, 0, NULL, 0, USB_CTRL_SET_TIMEOUT, GFP_KERNEL);
 }
 
 static int ath3k_set_normal_mode(struct usb_device *udev)
@@ -360,7 +363,7 @@ static int ath3k_set_normal_mode(struct usb_device *udev)
 
 	return usb_control_msg_send(udev, 0, ATH3K_SET_NORMAL_MODE,
 				    USB_TYPE_VENDOR, 0, 0, NULL, 0,
-				    USB_CTRL_SET_TIMEOUT);
+				    USB_CTRL_SET_TIMEOUT, GFP_KERNEL);
 }
 
 static int ath3k_load_patch(struct usb_device *udev)

@@ -68,19 +68,26 @@ static void kasan_test_exit(struct kunit *test)
  * KASAN report; causes a test failure otherwise. This relies on a KUnit
  * resource named "kasan_data". Do not use this name for KUnit resources
  * outside of KASAN tests.
+
+ * Since the compiler doesn't see that the expression can change the fail_data
+ * fields, it can reorder or optimize away the accesses to those fields.
+ * Use READ/WRITE_ONCE() for the accesses and compiler barriers around the
+ * expression to prevent that.
  */
 #define KUNIT_EXPECT_KASAN_FAIL(test, expression) do { \
-	fail_data.report_expected = true; \
-	fail_data.report_found = false; \
+	WRITE_ONCE(fail_data.report_expected, true); \
+	WRITE_ONCE(fail_data.report_found, false); \
 	kunit_add_named_resource(test, \
 				NULL, \
 				NULL, \
 				&resource, \
 				"kasan_data", &fail_data); \
+	barrier(); \
 	expression; \
+	barrier(); \
 	KUNIT_EXPECT_EQ(test, \
-			fail_data.report_expected, \
-			fail_data.report_found); \
+			READ_ONCE(fail_data.report_expected), \
+			READ_ONCE(fail_data.report_found)); \
 } while (0)
 
 #define KASAN_TEST_NEEDS_CONFIG_ON(test, config) do {			\
