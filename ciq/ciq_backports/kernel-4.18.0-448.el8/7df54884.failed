@@ -1,0 +1,350 @@
+x86/bugs: Add "unknown" reporting for MMIO Stale Data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+commit 7df548840c496b0141fb2404b889c346380c2b22
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/7df54884.failed
+
+Older Intel CPUs that are not in the affected processor list for MMIO
+Stale Data vulnerabilities currently report "Not affected" in sysfs,
+which may not be correct. Vulnerability status for these older CPUs is
+unknown.
+
+Add known-not-affected CPUs to the whitelist. Report "unknown"
+mitigation status for CPUs that are not in blacklist, whitelist and also
+don't enumerate MSR ARCH_CAPABILITIES bits that reflect hardware
+immunity to MMIO Stale Data vulnerabilities.
+
+Mitigation is not deployed when the status is unknown.
+
+  [ bp: Massage, fixup. ]
+
+Fixes: 8d50cdf8b834 ("x86/speculation/mmio: Add sysfs reporting for Processor MMIO Stale Data")
+	Suggested-by: Andrew Cooper <andrew.cooper3@citrix.com>
+	Suggested-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/a932c154772f2121794a5f2eded1a11013114711.1657846269.git.pawan.kumar.gupta@linux.intel.com
+(cherry picked from commit 7df548840c496b0141fb2404b889c346380c2b22)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/hw-vuln/processor_mmio_stale_data.rst
+#	arch/x86/include/asm/cpufeatures.h
+#	arch/x86/kernel/cpu/bugs.c
+#	arch/x86/kernel/cpu/common.c
+diff --cc arch/x86/include/asm/cpufeatures.h
+index 05564117439b,ef4775c6db01..000000000000
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@@ -448,5 -456,9 +448,12 @@@
+  #define X86_BUG_TAA			X86_BUG(22) /* CPU is affected by TSX Async Abort(TAA) */
+  #define X86_BUG_ITLB_MULTIHIT		X86_BUG(23) /* CPU may incur MCE during certain page attribute changes */
+  #define X86_BUG_SRBDS			X86_BUG(24) /* CPU may leak RNG bits if not mitigated */
+++<<<<<<< HEAD
+++=======
++ #define X86_BUG_MMIO_STALE_DATA		X86_BUG(25) /* CPU is affected by Processor MMIO Stale Data vulnerabilities */
++ #define X86_BUG_MMIO_UNKNOWN		X86_BUG(26) /* CPU is too old and its MMIO Stale Data status is unknown */
++ #define X86_BUG_RETBLEED		X86_BUG(27) /* CPU is affected by RETBleed */
++ #define X86_BUG_EIBRS_PBRSB		X86_BUG(28) /* EIBRS is vulnerable to Post Barrier RSB Predictions */
+++>>>>>>> 7df548840c49 (x86/bugs: Add "unknown" reporting for MMIO Stale Data)
+  
+  #endif /* _ASM_X86_CPUFEATURES_H */
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 951579a17911,da7c361f47e0..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -387,6 -410,99 +387,102 @@@ static int __init tsx_async_abort_parse
+  early_param("tsx_async_abort", tsx_async_abort_parse_cmdline);
+  
+  #undef pr_fmt
+++<<<<<<< HEAD
+++=======
++ #define pr_fmt(fmt)	"MMIO Stale Data: " fmt
++ 
++ enum mmio_mitigations {
++ 	MMIO_MITIGATION_OFF,
++ 	MMIO_MITIGATION_UCODE_NEEDED,
++ 	MMIO_MITIGATION_VERW,
++ };
++ 
++ /* Default mitigation for Processor MMIO Stale Data vulnerabilities */
++ static enum mmio_mitigations mmio_mitigation __ro_after_init = MMIO_MITIGATION_VERW;
++ static bool mmio_nosmt __ro_after_init = false;
++ 
++ static const char * const mmio_strings[] = {
++ 	[MMIO_MITIGATION_OFF]		= "Vulnerable",
++ 	[MMIO_MITIGATION_UCODE_NEEDED]	= "Vulnerable: Clear CPU buffers attempted, no microcode",
++ 	[MMIO_MITIGATION_VERW]		= "Mitigation: Clear CPU buffers",
++ };
++ 
++ static void __init mmio_select_mitigation(void)
++ {
++ 	u64 ia32_cap;
++ 
++ 	if (!boot_cpu_has_bug(X86_BUG_MMIO_STALE_DATA) ||
++ 	     boot_cpu_has_bug(X86_BUG_MMIO_UNKNOWN) ||
++ 	     cpu_mitigations_off()) {
++ 		mmio_mitigation = MMIO_MITIGATION_OFF;
++ 		return;
++ 	}
++ 
++ 	if (mmio_mitigation == MMIO_MITIGATION_OFF)
++ 		return;
++ 
++ 	ia32_cap = x86_read_arch_cap_msr();
++ 
++ 	/*
++ 	 * Enable CPU buffer clear mitigation for host and VMM, if also affected
++ 	 * by MDS or TAA. Otherwise, enable mitigation for VMM only.
++ 	 */
++ 	if (boot_cpu_has_bug(X86_BUG_MDS) || (boot_cpu_has_bug(X86_BUG_TAA) &&
++ 					      boot_cpu_has(X86_FEATURE_RTM)))
++ 		static_branch_enable(&mds_user_clear);
++ 	else
++ 		static_branch_enable(&mmio_stale_data_clear);
++ 
++ 	/*
++ 	 * If Processor-MMIO-Stale-Data bug is present and Fill Buffer data can
++ 	 * be propagated to uncore buffers, clearing the Fill buffers on idle
++ 	 * is required irrespective of SMT state.
++ 	 */
++ 	if (!(ia32_cap & ARCH_CAP_FBSDP_NO))
++ 		static_branch_enable(&mds_idle_clear);
++ 
++ 	/*
++ 	 * Check if the system has the right microcode.
++ 	 *
++ 	 * CPU Fill buffer clear mitigation is enumerated by either an explicit
++ 	 * FB_CLEAR or by the presence of both MD_CLEAR and L1D_FLUSH on MDS
++ 	 * affected systems.
++ 	 */
++ 	if ((ia32_cap & ARCH_CAP_FB_CLEAR) ||
++ 	    (boot_cpu_has(X86_FEATURE_MD_CLEAR) &&
++ 	     boot_cpu_has(X86_FEATURE_FLUSH_L1D) &&
++ 	     !(ia32_cap & ARCH_CAP_MDS_NO)))
++ 		mmio_mitigation = MMIO_MITIGATION_VERW;
++ 	else
++ 		mmio_mitigation = MMIO_MITIGATION_UCODE_NEEDED;
++ 
++ 	if (mmio_nosmt || cpu_mitigations_auto_nosmt())
++ 		cpu_smt_disable(false);
++ }
++ 
++ static int __init mmio_stale_data_parse_cmdline(char *str)
++ {
++ 	if (!boot_cpu_has_bug(X86_BUG_MMIO_STALE_DATA))
++ 		return 0;
++ 
++ 	if (!str)
++ 		return -EINVAL;
++ 
++ 	if (!strcmp(str, "off")) {
++ 		mmio_mitigation = MMIO_MITIGATION_OFF;
++ 	} else if (!strcmp(str, "full")) {
++ 		mmio_mitigation = MMIO_MITIGATION_VERW;
++ 	} else if (!strcmp(str, "full,nosmt")) {
++ 		mmio_mitigation = MMIO_MITIGATION_VERW;
++ 		mmio_nosmt = true;
++ 	}
++ 
++ 	return 0;
++ }
++ early_param("mmio_stale_data", mmio_stale_data_parse_cmdline);
++ 
++ #undef pr_fmt
+++>>>>>>> 7df548840c49 (x86/bugs: Add "unknown" reporting for MMIO Stale Data)
+  #define pr_fmt(fmt)     "" fmt
+  
+  static void __init md_clear_update_mitigation(void)
+@@@ -411,6 -537,24 +507,27 @@@ out
+  		pr_info("MDS: %s\n", mds_strings[mds_mitigation]);
+  	if (boot_cpu_has_bug(X86_BUG_TAA))
+  		pr_info("TAA: %s\n", taa_strings[taa_mitigation]);
+++<<<<<<< HEAD
+++=======
++ 	if (boot_cpu_has_bug(X86_BUG_MMIO_STALE_DATA))
++ 		pr_info("MMIO Stale Data: %s\n", mmio_strings[mmio_mitigation]);
++ 	else if (boot_cpu_has_bug(X86_BUG_MMIO_UNKNOWN))
++ 		pr_info("MMIO Stale Data: Unknown: No mitigations\n");
++ }
++ 
++ static void __init md_clear_select_mitigation(void)
++ {
++ 	mds_select_mitigation();
++ 	taa_select_mitigation();
++ 	mmio_select_mitigation();
++ 
++ 	/*
++ 	 * As MDS, TAA and MMIO Stale Data mitigations are inter-related, update
++ 	 * and print their mitigation after MDS, TAA and MMIO Stale Data
++ 	 * mitigation selection is done.
++ 	 */
++ 	md_clear_update_mitigation();
+++>>>>>>> 7df548840c49 (x86/bugs: Add "unknown" reporting for MMIO Stale Data)
+  }
+  
+  #undef pr_fmt
+@@@ -1916,8 -2427,12 +2036,9 @@@ static ssize_t cpu_show_common(struct d
+  		return srbds_show_state(buf);
+  
+  	case X86_BUG_MMIO_STALE_DATA:
++ 	case X86_BUG_MMIO_UNKNOWN:
+  		return mmio_stale_data_show_state(buf);
+  
+ -	case X86_BUG_RETBLEED:
+ -		return retbleed_show_state(buf);
+ -
+  	default:
+  		break;
+  	}
+@@@ -1972,6 -2487,14 +2093,9 @@@ ssize_t cpu_show_srbds(struct device *d
+  
+  ssize_t cpu_show_mmio_stale_data(struct device *dev, struct device_attribute *attr, char *buf)
+  {
+- 	return cpu_show_common(dev, attr, buf, X86_BUG_MMIO_STALE_DATA);
++ 	if (boot_cpu_has_bug(X86_BUG_MMIO_UNKNOWN))
++ 		return cpu_show_common(dev, attr, buf, X86_BUG_MMIO_UNKNOWN);
++ 	else
++ 		return cpu_show_common(dev, attr, buf, X86_BUG_MMIO_STALE_DATA);
+  }
+ -
+ -ssize_t cpu_show_retbleed(struct device *dev, struct device_attribute *attr, char *buf)
+ -{
+ -	return cpu_show_common(dev, attr, buf, X86_BUG_RETBLEED);
+ -}
+  #endif
+diff --cc arch/x86/kernel/cpu/common.c
+index 375d82321a80,3e508f239098..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -1024,6 -1134,9 +1024,12 @@@ static void identify_cpu_without_cpuid(
+  #define MSBDS_ONLY		BIT(5)
+  #define NO_SWAPGS		BIT(6)
+  #define NO_ITLB_MULTIHIT	BIT(7)
+++<<<<<<< HEAD
+++=======
++ #define NO_SPECTRE_V2		BIT(8)
++ #define NO_MMIO			BIT(9)
++ #define NO_EIBRS_PBRSB		BIT(10)
+++>>>>>>> 7df548840c49 (x86/bugs: Add "unknown" reporting for MMIO Stale Data)
+  
+  #define VULNWL(vendor, family, model, whitelist)	\
+  	X86_MATCH_VENDOR_FAM_MODEL(vendor, family, model, whitelist)
+@@@ -1039,8 -1155,15 +1045,13 @@@ static const __initconst struct x86_cpu
+  	VULNWL(CENTAUR,	5, X86_MODEL_ANY,	NO_SPECULATION),
+  	VULNWL(INTEL,	5, X86_MODEL_ANY,	NO_SPECULATION),
+  	VULNWL(NSC,	5, X86_MODEL_ANY,	NO_SPECULATION),
+ -	VULNWL(VORTEX,	5, X86_MODEL_ANY,	NO_SPECULATION),
+ -	VULNWL(VORTEX,	6, X86_MODEL_ANY,	NO_SPECULATION),
+  
+  	/* Intel Family 6 */
++ 	VULNWL_INTEL(TIGERLAKE,			NO_MMIO),
++ 	VULNWL_INTEL(TIGERLAKE_L,		NO_MMIO),
++ 	VULNWL_INTEL(ALDERLAKE,			NO_MMIO),
++ 	VULNWL_INTEL(ALDERLAKE_L,		NO_MMIO),
++ 
+  	VULNWL_INTEL(ATOM_SALTWELL,		NO_SPECULATION | NO_ITLB_MULTIHIT),
+  	VULNWL_INTEL(ATOM_SALTWELL_TABLET,	NO_SPECULATION | NO_ITLB_MULTIHIT),
+  	VULNWL_INTEL(ATOM_SALTWELL_MID,		NO_SPECULATION | NO_ITLB_MULTIHIT),
+@@@ -1057,10 -1180,11 +1068,16 @@@
+  	VULNWL_INTEL(CORE_YONAH,		NO_SSB),
+  
+  	VULNWL_INTEL(ATOM_AIRMONT_MID,		NO_L1TF | MSBDS_ONLY | NO_SWAPGS | NO_ITLB_MULTIHIT),
+ -	VULNWL_INTEL(ATOM_AIRMONT_NP,		NO_L1TF | NO_SWAPGS | NO_ITLB_MULTIHIT),
+  
+++<<<<<<< HEAD
+ +	VULNWL_INTEL(ATOM_GOLDMONT,		NO_MDS | NO_L1TF | NO_SWAPGS | NO_ITLB_MULTIHIT),
+ +	VULNWL_INTEL(ATOM_GOLDMONT_D,		NO_MDS | NO_L1TF | NO_SWAPGS | NO_ITLB_MULTIHIT),
+ +	VULNWL_INTEL(ATOM_GOLDMONT_PLUS,	NO_MDS | NO_L1TF | NO_SWAPGS | NO_ITLB_MULTIHIT),
+++=======
++ 	VULNWL_INTEL(ATOM_GOLDMONT,		NO_MDS | NO_L1TF | NO_SWAPGS | NO_ITLB_MULTIHIT | NO_MMIO),
++ 	VULNWL_INTEL(ATOM_GOLDMONT_D,		NO_MDS | NO_L1TF | NO_SWAPGS | NO_ITLB_MULTIHIT | NO_MMIO),
++ 	VULNWL_INTEL(ATOM_GOLDMONT_PLUS,	NO_MDS | NO_L1TF | NO_SWAPGS | NO_ITLB_MULTIHIT | NO_MMIO | NO_EIBRS_PBRSB),
+++>>>>>>> 7df548840c49 (x86/bugs: Add "unknown" reporting for MMIO Stale Data)
+  
+  	/*
+  	 * Technically, swapgs isn't serializing on AMD (despite it previously
+@@@ -1070,16 -1194,23 +1087,25 @@@
+  	 * good enough for our purposes.
+  	 */
+  
+ -	VULNWL_INTEL(ATOM_TREMONT,		NO_EIBRS_PBRSB),
+ -	VULNWL_INTEL(ATOM_TREMONT_L,		NO_EIBRS_PBRSB),
+ -	VULNWL_INTEL(ATOM_TREMONT_D,		NO_ITLB_MULTIHIT | NO_EIBRS_PBRSB),
+ +	VULNWL_INTEL(ATOM_TREMONT_D,		NO_ITLB_MULTIHIT),
+  
+  	/* AMD Family 0xf - 0x12 */
+- 	VULNWL_AMD(0x0f,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_SWAPGS | NO_ITLB_MULTIHIT),
+- 	VULNWL_AMD(0x10,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_SWAPGS | NO_ITLB_MULTIHIT),
+- 	VULNWL_AMD(0x11,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_SWAPGS | NO_ITLB_MULTIHIT),
+- 	VULNWL_AMD(0x12,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_SWAPGS | NO_ITLB_MULTIHIT),
++ 	VULNWL_AMD(0x0f,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_SWAPGS | NO_ITLB_MULTIHIT | NO_MMIO),
++ 	VULNWL_AMD(0x10,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_SWAPGS | NO_ITLB_MULTIHIT | NO_MMIO),
++ 	VULNWL_AMD(0x11,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_SWAPGS | NO_ITLB_MULTIHIT | NO_MMIO),
++ 	VULNWL_AMD(0x12,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_SWAPGS | NO_ITLB_MULTIHIT | NO_MMIO),
+  
+  	/* FAMILY_ANY must be last, otherwise 0x0f - 0x12 matches won't work */
+++<<<<<<< HEAD
+ +	VULNWL_AMD(X86_FAMILY_ANY,	NO_MELTDOWN | NO_L1TF | NO_MDS | NO_SWAPGS | NO_ITLB_MULTIHIT),
+++=======
++ 	VULNWL_AMD(X86_FAMILY_ANY,	NO_MELTDOWN | NO_L1TF | NO_MDS | NO_SWAPGS | NO_ITLB_MULTIHIT | NO_MMIO),
++ 	VULNWL_HYGON(X86_FAMILY_ANY,	NO_MELTDOWN | NO_L1TF | NO_MDS | NO_SWAPGS | NO_ITLB_MULTIHIT | NO_MMIO),
++ 
++ 	/* Zhaoxin Family 7 */
++ 	VULNWL(CENTAUR,	7, X86_MODEL_ANY,	NO_SPECTRE_V2 | NO_SWAPGS | NO_MMIO),
++ 	VULNWL(ZHAOXIN,	7, X86_MODEL_ANY,	NO_SPECTRE_V2 | NO_SWAPGS | NO_MMIO),
+++>>>>>>> 7df548840c49 (x86/bugs: Add "unknown" reporting for MMIO Stale Data)
+  	{}
+  };
+  
+@@@ -1175,9 -1351,40 +1201,39 @@@ static void __init cpu_set_bug_bits(str
+  	 */
+  	if ((cpu_has(c, X86_FEATURE_RDRAND) ||
+  	     cpu_has(c, X86_FEATURE_RDSEED)) &&
+ -	    cpu_matches(cpu_vuln_blacklist, SRBDS | MMIO_SBDS))
+ +	    cpu_matches(cpu_vuln_blacklist, SRBDS))
+  		    setup_force_cpu_bug(X86_BUG_SRBDS);
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Processor MMIO Stale Data bug enumeration
++ 	 *
++ 	 * Affected CPU list is generally enough to enumerate the vulnerability,
++ 	 * but for virtualization case check for ARCH_CAP MSR bits also, VMM may
++ 	 * not want the guest to enumerate the bug.
++ 	 *
++ 	 * Set X86_BUG_MMIO_UNKNOWN for CPUs that are neither in the blacklist,
++ 	 * nor in the whitelist and also don't enumerate MSR ARCH_CAP MMIO bits.
++ 	 */
++ 	if (!arch_cap_mmio_immune(ia32_cap)) {
++ 		if (cpu_matches(cpu_vuln_blacklist, MMIO))
++ 			setup_force_cpu_bug(X86_BUG_MMIO_STALE_DATA);
++ 		else if (!cpu_matches(cpu_vuln_whitelist, NO_MMIO))
++ 			setup_force_cpu_bug(X86_BUG_MMIO_UNKNOWN);
++ 	}
++ 
++ 	if (!cpu_has(c, X86_FEATURE_BTC_NO)) {
++ 		if (cpu_matches(cpu_vuln_blacklist, RETBLEED) || (ia32_cap & ARCH_CAP_RSBA))
++ 			setup_force_cpu_bug(X86_BUG_RETBLEED);
++ 	}
++ 
++ 	if (cpu_has(c, X86_FEATURE_IBRS_ENHANCED) &&
++ 	    !cpu_matches(cpu_vuln_whitelist, NO_EIBRS_PBRSB) &&
++ 	    !(ia32_cap & ARCH_CAP_PBRSB_NO))
++ 		setup_force_cpu_bug(X86_BUG_EIBRS_PBRSB);
++ 
+++>>>>>>> 7df548840c49 (x86/bugs: Add "unknown" reporting for MMIO Stale Data)
+  	if (cpu_matches(cpu_vuln_whitelist, NO_MELTDOWN))
+  		return;
+  
+* Unmerged path Documentation/admin-guide/hw-vuln/processor_mmio_stale_data.rst
+* Unmerged path Documentation/admin-guide/hw-vuln/processor_mmio_stale_data.rst
+* Unmerged path arch/x86/include/asm/cpufeatures.h
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+* Unmerged path arch/x86/kernel/cpu/common.c
