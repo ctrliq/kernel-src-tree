@@ -1,0 +1,155 @@
+tty: n_gsm: fix flow control handling in tx path
+
+jira LE-1907
+cve CVE-2023-6546
+Rebuild_History Non-Buildable kernel-4.18.0-541.el8
+commit-author Daniel Starke <daniel.starke@siemens.com>
+commit 59ff0680ecbfec742b1e0381e7cc46b41eb06647
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-541.el8/59ff0680.failed
+
+The current implementation constipates all transmission paths during flow
+control except for flow control frames. However, these may not be located
+at the beginning of the transmission queue of the control channel.
+Ensure that flow control frames in the transmission queue for the control
+channel are always handled even if constipated by skipping through other
+messages.
+
+Fixes: 0af021678d5d ("tty: n_gsm: fix deadlock and link starvation in outgoing data path")
+	Signed-off-by: Daniel Starke <daniel.starke@siemens.com>
+Link: https://lore.kernel.org/r/20220707113223.3685-3-daniel.starke@siemens.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 59ff0680ecbfec742b1e0381e7cc46b41eb06647)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/n_gsm.c
+diff --cc drivers/tty/n_gsm.c
+index 8ea93c6da6cd,51447ccccbab..000000000000
+--- a/drivers/tty/n_gsm.c
++++ b/drivers/tty/n_gsm.c
+@@@ -795,59 -871,81 +795,72 @@@ static bool gsm_is_flow_ctrl_msg(struc
+  }
+  
+  /**
+ - *	gsm_data_kick	-	poke the queue
+ + *	gsm_data_kick		-	poke the queue
+   *	@gsm: GSM Mux
+ + *	@dlci: DLCI sending the data
+   *
+   *	The tty device has called us to indicate that room has appeared in
+ - *	the transmit queue. Ram more data into the pipe if we have any.
+ + *	the transmit queue. Ram more data into the pipe if we have any
+   *	If we have been flow-stopped by a CMD_FCOFF, then we can only
+ - *	send messages on DLCI0 until CMD_FCON. The caller must hold
+ - *	the gsm tx lock.
+ + *	send messages on DLCI0 until CMD_FCON
+ + *
+ + *	FIXME: lock against link layer control transmissions
+   */
+ -static int gsm_data_kick(struct gsm_mux *gsm)
+ +
+ +static void gsm_data_kick(struct gsm_mux *gsm, struct gsm_dlci *dlci)
+  {
+  	struct gsm_msg *msg, *nmsg;
+ -	struct gsm_dlci *dlci;
+ -	int ret;
+ -
+ -	clear_bit(TTY_DO_WRITE_WAKEUP, &gsm->tty->flags);
+ +	int len;
+  
+ -	/* Serialize control messages and control channel messages first */
+ -	list_for_each_entry_safe(msg, nmsg, &gsm->tx_ctrl_list, list) {
+ +	list_for_each_entry_safe(msg, nmsg, &gsm->tx_list, list) {
+  		if (gsm->constipated && !gsm_is_flow_ctrl_msg(msg))
+++<<<<<<< HEAD
+++=======
++ 			continue;
++ 		ret = gsm_send_packet(gsm, msg);
++ 		switch (ret) {
++ 		case -ENOSPC:
++ 			return -ENOSPC;
++ 		case -ENODEV:
++ 			/* ldisc not open */
++ 			gsm->tx_bytes -= msg->len;
++ 			list_del(&msg->list);
++ 			kfree(msg);
+++>>>>>>> 59ff0680ecbf (tty: n_gsm: fix flow control handling in tx path)
+  			continue;
+ -		default:
+ -			if (ret >= 0) {
+ -				list_del(&msg->list);
+ -				kfree(msg);
+ -			}
+ -			break;
+ +		if (gsm->encoding != 0) {
+ +			gsm->txframe[0] = GSM1_SOF;
+ +			len = gsm_stuff_frame(msg->data,
+ +						gsm->txframe + 1, msg->len);
+ +			gsm->txframe[len + 1] = GSM1_SOF;
+ +			len += 2;
+ +		} else {
+ +			gsm->txframe[0] = GSM0_SOF;
+ +			memcpy(gsm->txframe + 1 , msg->data, msg->len);
+ +			gsm->txframe[msg->len + 1] = GSM0_SOF;
+ +			len = msg->len + 2;
+  		}
+ -	}
+ -
+ -	if (gsm->constipated)
+ -		return -EAGAIN;
+  
+ -	/* Serialize other channels */
+ -	if (list_empty(&gsm->tx_data_list))
+ -		return 0;
+ -	list_for_each_entry_safe(msg, nmsg, &gsm->tx_data_list, list) {
+ -		dlci = gsm->dlci[msg->addr];
+ -		/* Send only messages for DLCIs with valid state */
+ -		if (dlci->state != DLCI_OPEN) {
+ -			gsm->tx_bytes -= msg->len;
+ -			list_del(&msg->list);
+ -			kfree(msg);
+ -			continue;
+ -		}
+ -		ret = gsm_send_packet(gsm, msg);
+ -		switch (ret) {
+ -		case -ENOSPC:
+ -			return -ENOSPC;
+ -		case -ENODEV:
+ -			/* ldisc not open */
+ -			gsm->tx_bytes -= msg->len;
+ -			list_del(&msg->list);
+ -			kfree(msg);
+ -			continue;
+ -		default:
+ -			if (ret >= 0) {
+ -				list_del(&msg->list);
+ -				kfree(msg);
+ -			}
+ +		if (debug & 4)
+ +			gsm_hex_dump_bytes(__func__, gsm->txframe, len);
+ +		if (gsmld_output(gsm, gsm->txframe, len) <= 0)
+  			break;
+ +		/* FIXME: Can eliminate one SOF in many more cases */
+ +		gsm->tx_bytes -= msg->len;
+ +
+ +		list_del(&msg->list);
+ +		kfree(msg);
+ +
+ +		if (dlci) {
+ +			tty_port_tty_wakeup(&dlci->port);
+ +		} else {
+ +			int i = 0;
+ +
+ +			for (i = 0; i < NUM_DLCI; i++)
+ +				if (gsm->dlci[i])
+ +					tty_port_tty_wakeup(&gsm->dlci[i]->port);
+  		}
+  	}
+ -
+ -	return 1;
+  }
+  
+  /**
+* Unmerged path drivers/tty/n_gsm.c
