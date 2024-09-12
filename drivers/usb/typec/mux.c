@@ -22,7 +22,7 @@ static int switch_fwnode_match(struct device *dev, const void *fwnode)
 	if (!is_typec_switch(dev))
 		return 0;
 
-	return dev_fwnode(dev) == fwnode;
+	return device_match_fwnode(dev, fwnode);
 }
 
 static void *typec_switch_match(struct fwnode_handle *fwnode, const char *id,
@@ -190,7 +190,7 @@ static int mux_fwnode_match(struct device *dev, const void *fwnode)
 	if (!is_typec_mux(dev))
 		return 0;
 
-	return dev_fwnode(dev) == fwnode;
+	return device_match_fwnode(dev, fwnode);
 }
 
 static void *typec_mux_match(struct fwnode_handle *fwnode, const char *id,
