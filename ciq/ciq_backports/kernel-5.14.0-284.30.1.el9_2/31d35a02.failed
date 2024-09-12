@@ -1,0 +1,216 @@
+rxrpc: Fix the return value of rxrpc_new_incoming_call()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 31d35a02ad5b803354fe0727686fcbace7a343fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/31d35a02.failed
+
+Dan Carpenter sayeth[1]:
+
+  The patch 5e6ef4f1017c: "rxrpc: Make the I/O thread take over the
+  call and local processor work" from Jan 23, 2020, leads to the
+  following Smatch static checker warning:
+
+	net/rxrpc/io_thread.c:283 rxrpc_input_packet()
+	warn: bool is not less than zero.
+
+Fix this (for now) by changing rxrpc_new_incoming_call() to return an int
+with 0 or error code rather than bool.  Note that the actual return value
+of rxrpc_input_packet() is currently ignored.  I have a separate patch to
+clean that up.
+
+Fixes: 5e6ef4f1017c ("rxrpc: Make the I/O thread take over the call and local processor work")
+	Reported-by: Dan Carpenter <error27@gmail.com>
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+Link: http://lists.infradead.org/pipermail/linux-afs/2022-December/006123.html [1]
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 31d35a02ad5b803354fe0727686fcbace7a343fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/call_accept.c
+#	net/rxrpc/io_thread.c
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,18092526d3c8..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -793,9 -812,9 +793,15 @@@ extern struct workqueue_struct *rxrpc_w
+   */
+  int rxrpc_service_prealloc(struct rxrpc_sock *, gfp_t);
+  void rxrpc_discard_prealloc(struct rxrpc_sock *);
+++<<<<<<< HEAD
+ +struct rxrpc_call *rxrpc_new_incoming_call(struct rxrpc_local *,
+ +					   struct rxrpc_sock *,
+ +					   struct sk_buff *);
+++=======
++ int rxrpc_new_incoming_call(struct rxrpc_local *, struct rxrpc_peer *,
++ 			    struct rxrpc_connection *, struct sockaddr_rxrpc *,
++ 			    struct sk_buff *);
+++>>>>>>> 31d35a02ad5b (rxrpc: Fix the return value of rxrpc_new_incoming_call())
+  void rxrpc_accept_incoming_calls(struct rxrpc_local *);
+  int rxrpc_user_charge_accept(struct rxrpc_sock *, unsigned long);
+  
+diff --cc net/rxrpc/call_accept.c
+index afe1f587aaf0,c02401656fa9..000000000000
+--- a/net/rxrpc/call_accept.c
++++ b/net/rxrpc/call_accept.c
+@@@ -334,26 -321,51 +334,64 @@@ static struct rxrpc_call *rxrpc_alloc_i
+   * If this is for a kernel service, when we allocate the call, it will have
+   * three refs on it: (1) the kernel service, (2) the user_call_ID tree, (3) the
+   * retainer ref obtained from the backlog buffer.  Prealloc calls for userspace
+ - * services only have the ref from the backlog buffer.
+ + * services only have the ref from the backlog buffer.  We want to pass this
+ + * ref to non-BH context to dispose of.
+   *
+   * If we want to report an error, we mark the skb with the packet type and
+ - * abort code and return false.
+ + * abort code and return NULL.
+ + *
+ + * The call is returned with the user access mutex held.
+   */
+++<<<<<<< HEAD
+ +struct rxrpc_call *rxrpc_new_incoming_call(struct rxrpc_local *local,
+ +					   struct rxrpc_sock *rx,
+ +					   struct sk_buff *skb)
+++=======
++ int rxrpc_new_incoming_call(struct rxrpc_local *local,
++ 			    struct rxrpc_peer *peer,
++ 			    struct rxrpc_connection *conn,
++ 			    struct sockaddr_rxrpc *peer_srx,
++ 			    struct sk_buff *skb)
+++>>>>>>> 31d35a02ad5b (rxrpc: Fix the return value of rxrpc_new_incoming_call())
+  {
+ -	const struct rxrpc_security *sec = NULL;
+  	struct rxrpc_skb_priv *sp = rxrpc_skb(skb);
+ +	const struct rxrpc_security *sec = NULL;
+ +	struct rxrpc_connection *conn;
+ +	struct rxrpc_peer *peer = NULL;
+  	struct rxrpc_call *call = NULL;
+ -	struct rxrpc_sock *rx;
+  
+  	_enter("");
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Don't set up a call for anything other than the first DATA packet. */
++ 	if (sp->hdr.seq != 1 ||
++ 	    sp->hdr.type != RXRPC_PACKET_TYPE_DATA)
++ 		return 0; /* Just discard */
++ 
++ 	rcu_read_lock();
++ 
++ 	/* Weed out packets to services we're not offering.  Packets that would
++ 	 * begin a call are explicitly rejected and the rest are just
++ 	 * discarded.
++ 	 */
++ 	rx = rcu_dereference(local->service);
++ 	if (!rx || (sp->hdr.serviceId != rx->srx.srx_service &&
++ 		    sp->hdr.serviceId != rx->second_service)
++ 	    ) {
++ 		if (sp->hdr.type == RXRPC_PACKET_TYPE_DATA &&
++ 		    sp->hdr.seq == 1)
++ 			goto unsupported_service;
++ 		goto discard;
++ 	}
++ 
++ 	if (!conn) {
++ 		sec = rxrpc_get_incoming_security(rx, skb);
++ 		if (!sec)
++ 			goto reject;
++ 	}
++ 
+++>>>>>>> 31d35a02ad5b (rxrpc: Fix the return value of rxrpc_new_incoming_call())
+  	spin_lock(&rx->incoming_lock);
+  	if (rx->sk.sk_state == RXRPC_SERVER_LISTEN_DISABLED ||
+  	    rx->sk.sk_state == RXRPC_CLOSE) {
+@@@ -394,50 -394,41 +432,66 @@@
+  		rx->notify_new_call(&rx->sk, call, call->user_call_ID);
+  
+  	spin_lock(&conn->state_lock);
+ -	if (conn->state == RXRPC_CONN_SERVICE_UNSECURED) {
+ +	switch (conn->state) {
+ +	case RXRPC_CONN_SERVICE_UNSECURED:
+  		conn->state = RXRPC_CONN_SERVICE_CHALLENGING;
+  		set_bit(RXRPC_CONN_EV_CHALLENGE, &call->conn->events);
+ -		rxrpc_queue_conn(call->conn, rxrpc_conn_queue_challenge);
+ +		rxrpc_queue_conn(call->conn);
+ +		break;
+ +
+ +	case RXRPC_CONN_SERVICE:
+ +		write_lock(&call->state_lock);
+ +		if (call->state < RXRPC_CALL_COMPLETE)
+ +			call->state = RXRPC_CALL_SERVER_RECV_REQUEST;
+ +		write_unlock(&call->state_lock);
+ +		break;
+ +
+ +	case RXRPC_CONN_REMOTELY_ABORTED:
+ +		rxrpc_set_call_completion(call, RXRPC_CALL_REMOTELY_ABORTED,
+ +					  conn->abort_code, conn->error);
+ +		break;
+ +	case RXRPC_CONN_LOCALLY_ABORTED:
+ +		rxrpc_abort_call("CON", call, sp->hdr.seq,
+ +				 conn->abort_code, conn->error);
+ +		break;
+ +	default:
+ +		BUG();
+  	}
+  	spin_unlock(&conn->state_lock);
+ -
+  	spin_unlock(&rx->incoming_lock);
+ -	rcu_read_unlock();
+  
+ -	if (hlist_unhashed(&call->error_link)) {
+ -		spin_lock(&call->peer->lock);
+ -		hlist_add_head(&call->error_link, &call->peer->error_targets);
+ -		spin_unlock(&call->peer->lock);
+ -	}
+ +	rxrpc_send_ping(call, skb);
+ +
+ +	/* We have to discard the prealloc queue's ref here and rely on a
+ +	 * combination of the RCU read lock and refs held either by the socket
+ +	 * (recvmsg queue, to-be-accepted queue or user ID tree) or the kernel
+ +	 * service to prevent the call from being deallocated too early.
+ +	 */
+ +	rxrpc_put_call(call, rxrpc_call_put_discard_prealloc);
+  
+  	_leave(" = %p{%d}", call, call->debug_id);
+++<<<<<<< HEAD
+ +	return call;
+++=======
++ 	rxrpc_input_call_event(call, skb);
++ 	rxrpc_put_call(call, rxrpc_call_put_input);
++ 	return 0;
+++>>>>>>> 31d35a02ad5b (rxrpc: Fix the return value of rxrpc_new_incoming_call())
+  
+ -unsupported_service:
+ -	trace_rxrpc_abort(0, "INV", sp->hdr.cid, sp->hdr.callNumber, sp->hdr.seq,
+ -			  RX_INVALID_OPERATION, EOPNOTSUPP);
+ -	skb->priority = RX_INVALID_OPERATION;
+ -	goto reject;
+  no_call:
+  	spin_unlock(&rx->incoming_lock);
+++<<<<<<< HEAD
+ +	_leave(" = NULL [%u]", skb->mark);
+ +	return NULL;
+++=======
++ reject:
++ 	rcu_read_unlock();
++ 	_leave(" = f [%u]", skb->mark);
++ 	return -EPROTO;
++ discard:
++ 	rcu_read_unlock();
++ 	return 0;
+++>>>>>>> 31d35a02ad5b (rxrpc: Fix the return value of rxrpc_new_incoming_call())
+  }
+  
+  /*
+* Unmerged path net/rxrpc/io_thread.c
+* Unmerged path net/rxrpc/ar-internal.h
+* Unmerged path net/rxrpc/call_accept.c
+* Unmerged path net/rxrpc/io_thread.c
