@@ -816,7 +816,7 @@ free_q:
 	kfree(queue);
 	return err;
 }
-EXPORT_SYMBOL_NS(mana_gd_create_mana_eq, NET_MANA);
+EXPORT_SYMBOL(mana_gd_create_mana_eq);
 
 int mana_gd_create_mana_wq_cq(struct gdma_dev *gd,
 			      const struct gdma_queue_spec *spec,
@@ -893,7 +893,7 @@ void mana_gd_destroy_queue(struct gdma_context *gc, struct gdma_queue *queue)
 	mana_gd_free_memory(gmi);
 	kfree(queue);
 }
-EXPORT_SYMBOL_NS(mana_gd_destroy_queue, NET_MANA);
+EXPORT_SYMBOL(mana_gd_destroy_queue);
 
 int mana_gd_verify_vf_version(struct pci_dev *pdev)
 {
@@ -970,7 +970,7 @@ int mana_gd_register_device(struct gdma_dev *gd)
 
 	return 0;
 }
-EXPORT_SYMBOL_NS(mana_gd_register_device, NET_MANA);
+EXPORT_SYMBOL(mana_gd_register_device);
 
 int mana_gd_deregister_device(struct gdma_dev *gd)
 {
@@ -1001,7 +1001,7 @@ int mana_gd_deregister_device(struct gdma_dev *gd)
 
 	return err;
 }
-EXPORT_SYMBOL_NS(mana_gd_deregister_device, NET_MANA);
+EXPORT_SYMBOL(mana_gd_deregister_device);
 
 u32 mana_gd_wq_avail_space(struct gdma_queue *wq)
 {
