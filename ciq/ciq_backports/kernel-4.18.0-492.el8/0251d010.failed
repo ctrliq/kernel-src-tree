@@ -1,0 +1,342 @@
+iommu: Add gfp parameter to iommu_alloc_resv_region
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-492.el8
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit 0251d0107cfb0bb5ab2d3f97710487b9522db020
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-492.el8/0251d010.failed
+
+Add gfp parameter to iommu_alloc_resv_region() for the callers to specify
+the memory allocation behavior. Thus iommu_alloc_resv_region() could also
+be available in critical contexts.
+
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Tested-by: Alex Williamson <alex.williamson@redhat.com>
+Link: https://lore.kernel.org/r/20220927053109.4053662-2-baolu.lu@linux.intel.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 0251d0107cfb0bb5ab2d3f97710487b9522db020)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/apple-dart.c
+#	drivers/iommu/mtk_iommu.c
+diff --cc drivers/iommu/mtk_iommu.c
+index 3b13f8a4f57a,2ab2ecfe01f8..000000000000
+--- a/drivers/iommu/mtk_iommu.c
++++ b/drivers/iommu/mtk_iommu.c
+@@@ -516,39 -896,111 +516,73 @@@ static int mtk_iommu_of_xlate(struct de
+  	return iommu_fwspec_add_ids(dev, args->args, 1);
+  }
+  
+++<<<<<<< HEAD
+ +static struct iommu_ops mtk_iommu_ops = {
+++=======
++ static void mtk_iommu_get_resv_regions(struct device *dev,
++ 				       struct list_head *head)
++ {
++ 	struct mtk_iommu_data *data = dev_iommu_priv_get(dev);
++ 	unsigned int regionid = mtk_iommu_get_iova_region_id(dev, data->plat_data), i;
++ 	const struct mtk_iommu_iova_region *resv, *curdom;
++ 	struct iommu_resv_region *region;
++ 	int prot = IOMMU_WRITE | IOMMU_READ;
++ 
++ 	if ((int)regionid < 0)
++ 		return;
++ 	curdom = data->plat_data->iova_region + regionid;
++ 	for (i = 0; i < data->plat_data->iova_region_nr; i++) {
++ 		resv = data->plat_data->iova_region + i;
++ 
++ 		/* Only reserve when the region is inside the current domain */
++ 		if (resv->iova_base <= curdom->iova_base ||
++ 		    resv->iova_base + resv->size >= curdom->iova_base + curdom->size)
++ 			continue;
++ 
++ 		region = iommu_alloc_resv_region(resv->iova_base, resv->size,
++ 						 prot, IOMMU_RESV_RESERVED,
++ 						 GFP_KERNEL);
++ 		if (!region)
++ 			return;
++ 
++ 		list_add_tail(&region->list, head);
++ 	}
++ }
++ 
++ static const struct iommu_ops mtk_iommu_ops = {
+++>>>>>>> 0251d0107cfb (iommu: Add gfp parameter to iommu_alloc_resv_region)
+  	.domain_alloc	= mtk_iommu_domain_alloc,
+ -	.probe_device	= mtk_iommu_probe_device,
+ -	.release_device	= mtk_iommu_release_device,
+ +	.domain_free	= mtk_iommu_domain_free,
+ +	.attach_dev	= mtk_iommu_attach_device,
+ +	.detach_dev	= mtk_iommu_detach_device,
+ +	.map		= mtk_iommu_map,
+ +	.unmap		= mtk_iommu_unmap,
+ +	.flush_iotlb_all = mtk_iommu_flush_iotlb_all,
+ +	.iotlb_sync	= mtk_iommu_iotlb_sync,
+ +	.iova_to_phys	= mtk_iommu_iova_to_phys,
+ +	.add_device	= mtk_iommu_add_device,
+ +	.remove_device	= mtk_iommu_remove_device,
+  	.device_group	= mtk_iommu_device_group,
+  	.of_xlate	= mtk_iommu_of_xlate,
+ -	.get_resv_regions = mtk_iommu_get_resv_regions,
+  	.pgsize_bitmap	= SZ_4K | SZ_64K | SZ_1M | SZ_16M,
+ -	.owner		= THIS_MODULE,
+ -	.default_domain_ops = &(const struct iommu_domain_ops) {
+ -		.attach_dev	= mtk_iommu_attach_device,
+ -		.detach_dev	= mtk_iommu_detach_device,
+ -		.map		= mtk_iommu_map,
+ -		.unmap		= mtk_iommu_unmap,
+ -		.flush_iotlb_all = mtk_iommu_flush_iotlb_all,
+ -		.iotlb_sync	= mtk_iommu_iotlb_sync,
+ -		.iotlb_sync_map	= mtk_iommu_sync_map,
+ -		.iova_to_phys	= mtk_iommu_iova_to_phys,
+ -		.free		= mtk_iommu_domain_free,
+ -	}
+  };
+  
+ -static int mtk_iommu_hw_init(const struct mtk_iommu_data *data, unsigned int bankid)
+ +static int mtk_iommu_hw_init(const struct mtk_iommu_data *data)
+  {
+ -	const struct mtk_iommu_bank_data *bankx = &data->bank[bankid];
+ -	const struct mtk_iommu_bank_data *bank0 = &data->bank[0];
+  	u32 regval;
+ +	int ret;
+  
+ -	/*
+ -	 * Global control settings are in bank0. May re-init these global registers
+ -	 * since no sure if there is bank0 consumers.
+ -	 */
+ -	if (MTK_IOMMU_HAS_FLAG(data->plat_data, TF_PORT_TO_ADDR_MT8173)) {
+ -		regval = F_MMU_PREFETCH_RT_REPLACE_MOD |
+ -			 F_MMU_TF_PROT_TO_PROGRAM_ADDR_MT8173;
+ -	} else {
+ -		regval = readl_relaxed(bank0->base + REG_MMU_CTRL_REG);
+ -		regval |= F_MMU_TF_PROT_TO_PROGRAM_ADDR;
+ -	}
+ -	writel_relaxed(regval, bank0->base + REG_MMU_CTRL_REG);
+ -
+ -	if (data->enable_4GB &&
+ -	    MTK_IOMMU_HAS_FLAG(data->plat_data, HAS_VLD_PA_RNG)) {
+ -		/*
+ -		 * If 4GB mode is enabled, the validate PA range is from
+ -		 * 0x1_0000_0000 to 0x1_ffff_ffff. here record bit[32:30].
+ -		 */
+ -		regval = F_MMU_VLD_PA_RNG(7, 4);
+ -		writel_relaxed(regval, bank0->base + REG_MMU_VLD_PA_RNG);
+ -	}
+ -	if (MTK_IOMMU_HAS_FLAG(data->plat_data, DCM_DISABLE))
+ -		writel_relaxed(F_MMU_DCM, bank0->base + REG_MMU_DCM_DIS);
+ -	else
+ -		writel_relaxed(0, bank0->base + REG_MMU_DCM_DIS);
+ -
+ -	if (MTK_IOMMU_HAS_FLAG(data->plat_data, WR_THROT_EN)) {
+ -		/* write command throttling mode */
+ -		regval = readl_relaxed(bank0->base + REG_MMU_WR_LEN_CTRL);
+ -		regval &= ~F_MMU_WR_THROT_DIS_MASK;
+ -		writel_relaxed(regval, bank0->base + REG_MMU_WR_LEN_CTRL);
+ +	ret = clk_prepare_enable(data->bclk);
+ +	if (ret) {
+ +		dev_err(data->dev, "Failed to enable iommu bclk(%d)\n", ret);
+ +		return ret;
+  	}
+  
+ -	if (MTK_IOMMU_HAS_FLAG(data->plat_data, RESET_AXI)) {
+ -		/* The register is called STANDARD_AXI_MODE in this case */
+ -		regval = 0;
+ -	} else {
+ -		regval = readl_relaxed(bank0->base + REG_MMU_MISC_CTRL);
+ -		if (!MTK_IOMMU_HAS_FLAG(data->plat_data, STD_AXI_MODE))
+ -			regval &= ~F_MMU_STANDARD_AXI_MODE_MASK;
+ -		if (MTK_IOMMU_HAS_FLAG(data->plat_data, OUT_ORDER_WR_EN))
+ -			regval &= ~F_MMU_IN_ORDER_WR_EN_MASK;
+ -	}
+ -	writel_relaxed(regval, bank0->base + REG_MMU_MISC_CTRL);
+ +	regval = F_MMU_TF_PROTECT_SEL(2, data);
+ +	if (data->m4u_plat == M4U_MT8173)
+ +		regval |= F_MMU_PREFETCH_RT_REPLACE_MOD;
+ +	writel_relaxed(regval, data->base + REG_MMU_CTRL_REG);
+  
+ -	/* Independent settings for each bank */
+  	regval = F_L2_MULIT_HIT_EN |
+  		F_TABLE_WALK_FAULT_INT_EN |
+  		F_PREETCH_FIFO_OVERFLOW_INT_EN |
+* Unmerged path drivers/iommu/apple-dart.c
+diff --git a/drivers/acpi/arm64/iort.c b/drivers/acpi/arm64/iort.c
+index a8cec8261c44..c2fbdea02af4 100644
+--- a/drivers/acpi/arm64/iort.c
++++ b/drivers/acpi/arm64/iort.c
+@@ -1167,7 +1167,8 @@ static void iort_iommu_msi_get_resv_regions(struct device *dev,
+ 			struct iommu_resv_region *region;
+ 
+ 			region = iommu_alloc_resv_region(base + SZ_64K, SZ_64K,
+-							 prot, IOMMU_RESV_MSI);
++							 prot, IOMMU_RESV_MSI,
++							 GFP_KERNEL);
+ 			if (region)
+ 				list_add_tail(&region->list, head);
+ 		}
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index 1a3fd46dcc44..69da62664094 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -2184,7 +2184,8 @@ static void amd_iommu_get_resv_regions(struct device *dev,
+ 			type = IOMMU_RESV_RESERVED;
+ 
+ 		region = iommu_alloc_resv_region(entry->address_start,
+-						 length, prot, type);
++						 length, prot, type,
++						 GFP_KERNEL);
+ 		if (!region) {
+ 			dev_err(dev, "Out of memory allocating dm-regions\n");
+ 			return;
+@@ -2194,14 +2195,14 @@ static void amd_iommu_get_resv_regions(struct device *dev,
+ 
+ 	region = iommu_alloc_resv_region(MSI_RANGE_START,
+ 					 MSI_RANGE_END - MSI_RANGE_START + 1,
+-					 0, IOMMU_RESV_MSI);
++					 0, IOMMU_RESV_MSI, GFP_KERNEL);
+ 	if (!region)
+ 		return;
+ 	list_add_tail(&region->list, head);
+ 
+ 	region = iommu_alloc_resv_region(HT_RANGE_START,
+ 					 HT_RANGE_END - HT_RANGE_START + 1,
+-					 0, IOMMU_RESV_RESERVED);
++					 0, IOMMU_RESV_RESERVED, GFP_KERNEL);
+ 	if (!region)
+ 		return;
+ 	list_add_tail(&region->list, head);
+* Unmerged path drivers/iommu/apple-dart.c
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+index 7e15a8d7ff4b..958e6fdd58dc 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+@@ -2751,7 +2751,7 @@ static void arm_smmu_get_resv_regions(struct device *dev,
+ 	int prot = IOMMU_WRITE | IOMMU_NOEXEC | IOMMU_MMIO;
+ 
+ 	region = iommu_alloc_resv_region(MSI_IOVA_BASE, MSI_IOVA_LENGTH,
+-					 prot, IOMMU_RESV_SW_MSI);
++					 prot, IOMMU_RESV_SW_MSI, GFP_KERNEL);
+ 	if (!region)
+ 		return;
+ 
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu.c b/drivers/iommu/arm/arm-smmu/arm-smmu.c
+index 7345be86f60e..cc0bea51e9a5 100644
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu.c
+@@ -1552,7 +1552,7 @@ static void arm_smmu_get_resv_regions(struct device *dev,
+ 	int prot = IOMMU_WRITE | IOMMU_NOEXEC | IOMMU_MMIO;
+ 
+ 	region = iommu_alloc_resv_region(MSI_IOVA_BASE, MSI_IOVA_LENGTH,
+-					 prot, IOMMU_RESV_SW_MSI);
++					 prot, IOMMU_RESV_SW_MSI, GFP_KERNEL);
+ 	if (!region)
+ 		return;
+ 
+diff --git a/drivers/iommu/intel/iommu.c b/drivers/iommu/intel/iommu.c
+index 7bd5cdab7eef..c98057ddd7c8 100644
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@ -5368,7 +5368,8 @@ static void intel_iommu_get_resv_regions(struct device *device,
+ 				IOMMU_RESV_DIRECT_RELAXABLE : IOMMU_RESV_DIRECT;
+ 
+ 			resv = iommu_alloc_resv_region(rmrr->base_address,
+-						       length, prot, type);
++						       length, prot, type,
++						       GFP_KERNEL);
+ 			if (!resv)
+ 				break;
+ 
+@@ -5383,7 +5384,8 @@ static void intel_iommu_get_resv_regions(struct device *device,
+ 
+ 		if ((pdev->class >> 8) == PCI_CLASS_BRIDGE_ISA) {
+ 			reg = iommu_alloc_resv_region(0, 1UL << 24, prot,
+-						   IOMMU_RESV_DIRECT_RELAXABLE);
++					IOMMU_RESV_DIRECT_RELAXABLE,
++					GFP_KERNEL);
+ 			if (reg)
+ 				list_add_tail(&reg->list, head);
+ 		}
+@@ -5392,7 +5394,7 @@ static void intel_iommu_get_resv_regions(struct device *device,
+ 
+ 	reg = iommu_alloc_resv_region(IOAPIC_RANGE_START,
+ 				      IOAPIC_RANGE_END - IOAPIC_RANGE_START + 1,
+-				      0, IOMMU_RESV_MSI);
++				      0, IOMMU_RESV_MSI, GFP_KERNEL);
+ 	if (!reg)
+ 		return;
+ 	list_add_tail(&reg->list, head);
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index cb17cd1c57b4..bf0929119565 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -450,7 +450,7 @@ static int iommu_insert_resv_region(struct iommu_resv_region *new,
+ 	LIST_HEAD(stack);
+ 
+ 	nr = iommu_alloc_resv_region(new->start, new->length,
+-				     new->prot, new->type);
++				     new->prot, new->type, GFP_KERNEL);
+ 	if (!nr)
+ 		return -ENOMEM;
+ 
+@@ -2838,11 +2838,12 @@ EXPORT_SYMBOL(generic_iommu_put_resv_regions);
+ 
+ struct iommu_resv_region *iommu_alloc_resv_region(phys_addr_t start,
+ 						  size_t length, int prot,
+-						  enum iommu_resv_type type)
++						  enum iommu_resv_type type,
++						  gfp_t gfp)
+ {
+ 	struct iommu_resv_region *region;
+ 
+-	region = kzalloc(sizeof(*region), GFP_KERNEL);
++	region = kzalloc(sizeof(*region), gfp);
+ 	if (!region)
+ 		return NULL;
+ 
+* Unmerged path drivers/iommu/mtk_iommu.c
+diff --git a/drivers/iommu/virtio-iommu.c b/drivers/iommu/virtio-iommu.c
+index 781eb6ac60b2..1935dee123bd 100644
+--- a/drivers/iommu/virtio-iommu.c
++++ b/drivers/iommu/virtio-iommu.c
+@@ -443,11 +443,13 @@ static int viommu_add_resv_mem(struct viommu_endpoint *vdev,
+ 		fallthrough;
+ 	case VIRTIO_IOMMU_RESV_MEM_T_RESERVED:
+ 		region = iommu_alloc_resv_region(start, size, 0,
+-						 IOMMU_RESV_RESERVED);
++						 IOMMU_RESV_RESERVED,
++						 GFP_KERNEL);
+ 		break;
+ 	case VIRTIO_IOMMU_RESV_MEM_T_MSI:
+ 		region = iommu_alloc_resv_region(start, size, prot,
+-						 IOMMU_RESV_MSI);
++						 IOMMU_RESV_MSI,
++						 GFP_KERNEL);
+ 		break;
+ 	}
+ 	if (!region)
+@@ -830,7 +832,8 @@ static void viommu_get_resv_regions(struct device *dev, struct list_head *head)
+ 	 */
+ 	if (!msi) {
+ 		msi = iommu_alloc_resv_region(MSI_IOVA_BASE, MSI_IOVA_LENGTH,
+-					      prot, IOMMU_RESV_SW_MSI);
++					      prot, IOMMU_RESV_SW_MSI,
++					      GFP_KERNEL);
+ 		if (!msi)
+ 			return;
+ 
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index f09b16982db4..25cc7dc02b17 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -533,7 +533,7 @@ extern void iommu_set_default_translated(bool cmd_line);
+ extern bool iommu_default_passthrough(void);
+ extern struct iommu_resv_region *
+ iommu_alloc_resv_region(phys_addr_t start, size_t length, int prot,
+-			enum iommu_resv_type type);
++			enum iommu_resv_type type, gfp_t gfp);
+ extern int iommu_get_group_resv_regions(struct iommu_group *group,
+ 					struct list_head *head);
+ 
