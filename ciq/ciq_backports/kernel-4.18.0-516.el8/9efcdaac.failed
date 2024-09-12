@@ -1,0 +1,145 @@
+powerpc/eeh: Set channel state after notifying the drivers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-516.el8
+commit-author Ganesh Goudar <ganeshgr@linux.ibm.com>
+commit 9efcdaac36e1643a1b7f5337e6143ce142d381b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-516.el8/9efcdaac.failed
+
+When a PCI error is encountered 6th time in an hour we
+set the channel state to perm_failure and notify the
+driver about the permanent failure.
+
+However, after upstream commit 38ddc011478e ("powerpc/eeh:
+Make permanently failed devices non-actionable"), EEH handler
+stops calling any routine once the device is marked as
+permanent failure. This issue can lead to fatal consequences
+like kernel hang with certain PCI devices.
+
+Following log is observed with lpfc driver, with and without
+this change, Without this change kernel hangs, If PCI error
+is encountered 6 times for a device in an hour.
+
+Without the change
+
+ EEH: Beginning: 'error_detected(permanent failure)'
+ PCI 0132:60:00.0#600000: EEH: not actionable (1,1,1)
+ PCI 0132:60:00.1#600000: EEH: not actionable (1,1,1)
+ EEH: Finished:'error_detected(permanent failure)'
+
+With the change
+
+ EEH: Beginning: 'error_detected(permanent failure)'
+ EEH: Invoking lpfc->error_detected(permanent failure)
+ EEH: lpfc driver reports: 'disconnect'
+ EEH: Invoking lpfc->error_detected(permanent failure)
+ EEH: lpfc driver reports: 'disconnect'
+ EEH: Finished:'error_detected(permanent failure)'
+
+To fix the issue, set channel state to permanent failure after
+notifying the drivers.
+
+Fixes: 38ddc011478e ("powerpc/eeh: Make permanently failed devices non-actionable")
+	Suggested-by: Mahesh Salgaonkar <mahesh@linux.ibm.com>
+	Signed-off-by: Ganesh Goudar <ganeshgr@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20230209105649.127707-1-ganeshgr@linux.ibm.com
+
+(cherry picked from commit 9efcdaac36e1643a1b7f5337e6143ce142d381b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/eeh_driver.c
+diff --cc arch/powerpc/kernel/eeh_driver.c
+index 7c20b571f7c9,438568a472d0..000000000000
+--- a/arch/powerpc/kernel/eeh_driver.c
++++ b/arch/powerpc/kernel/eeh_driver.c
+@@@ -1070,45 -1049,47 +1070,53 @@@ void eeh_handle_normal_event(struct eeh
+  		}
+  
+  		pr_info("EEH: Recovery successful.\n");
+ -		goto out;
+ -	}
+ +	} else  {
+ +		/*
+ +		 * About 90% of all real-life EEH failures in the field
+ +		 * are due to poorly seated PCI cards. Only 10% or so are
+ +		 * due to actual, failed cards.
+ +		 */
+ +		pr_err("EEH: Unable to recover from failure from PHB#%x-PE#%x.\n"
+ +		       "Please try reseating or replacing it\n",
+ +			pe->phb->global_number, pe->addr);
+  
+ -recover_failed:
+ -	/*
+ -	 * About 90% of all real-life EEH failures in the field
+ -	 * are due to poorly seated PCI cards. Only 10% or so are
+ -	 * due to actual, failed cards.
+ -	 */
+ -	pr_err("EEH: Unable to recover from failure from PHB#%x-PE#%x.\n"
+ -		"Please try reseating or replacing it\n",
+ -		pe->phb->global_number, pe->addr);
+ +		eeh_slot_error_detail(pe, EEH_LOG_PERM);
+  
+ -	eeh_slot_error_detail(pe, EEH_LOG_PERM);
+ +		/* Notify all devices that they're about to go down. */
+ +		eeh_set_channel_state(pe, pci_channel_io_perm_failure);
+ +		eeh_set_irq_state(pe, false);
+ +		eeh_pe_report("error_detected(permanent failure)", pe,
+ +			      eeh_report_failure, NULL);
+  
+++<<<<<<< HEAD
+ +		/* Mark the PE to be removed permanently */
+ +		eeh_pe_state_mark(pe, EEH_PE_REMOVED);
+++=======
++ 	/* Notify all devices that they're about to go down. */
++ 	eeh_set_irq_state(pe, false);
++ 	eeh_pe_report("error_detected(permanent failure)", pe,
++ 		      eeh_report_failure, NULL);
++ 	eeh_set_channel_state(pe, pci_channel_io_perm_failure);
+++>>>>>>> 9efcdaac36e1 (powerpc/eeh: Set channel state after notifying the drivers)
+  
+ -	/* Mark the PE to be removed permanently */
+ -	eeh_pe_state_mark(pe, EEH_PE_REMOVED);
+ -
+ -	/*
+ -	 * Shut down the device drivers for good. We mark
+ -	 * all removed devices correctly to avoid access
+ -	 * the their PCI config any more.
+ -	 */
+ -	if (pe->type & EEH_PE_VF) {
+ -		eeh_pe_dev_traverse(pe, eeh_rmv_device, NULL);
+ -		eeh_pe_dev_mode_mark(pe, EEH_DEV_REMOVED);
+ -	} else {
+ -		eeh_pe_state_clear(pe, EEH_PE_PRI_BUS, true);
+ -		eeh_pe_dev_mode_mark(pe, EEH_DEV_REMOVED);
+ -
+ -		pci_lock_rescan_remove();
+ -		pci_hp_remove_devices(bus);
+ -		pci_unlock_rescan_remove();
+ -		/* The passed PE should no longer be used */
+ -		return;
+ +		/*
+ +		 * Shut down the device drivers for good. We mark
+ +		 * all removed devices correctly to avoid access
+ +		 * the their PCI config any more.
+ +		 */
+ +		if (pe->type & EEH_PE_VF) {
+ +			eeh_pe_dev_traverse(pe, eeh_rmv_device, NULL);
+ +			eeh_pe_dev_mode_mark(pe, EEH_DEV_REMOVED);
+ +		} else {
+ +			eeh_pe_state_clear(pe, EEH_PE_PRI_BUS, true);
+ +			eeh_pe_dev_mode_mark(pe, EEH_DEV_REMOVED);
+ +
+ +			pci_lock_rescan_remove();
+ +			pci_hp_remove_devices(bus);
+ +			pci_unlock_rescan_remove();
+ +			/* The passed PE should no longer be used */
+ +			return;
+ +		}
+  	}
+  
+  out:
+* Unmerged path arch/powerpc/kernel/eeh_driver.c
