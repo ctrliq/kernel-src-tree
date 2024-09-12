@@ -1,0 +1,204 @@
+overflow: Provide constant expression struct_size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-526.el8
+commit-author Kees Cook <keescook@chromium.org>
+commit 230f6fa2c1db6a3f3e668cfe95995ac8e6eee212
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-526.el8/230f6fa2.failed
+
+There have been cases where struct_size() (or flex_array_size()) needs
+to be calculated for an initializer, which requires it be a constant
+expression. This is possible when the "count" argument is a constant
+expression, so provide this ability for the helpers.
+
+	Cc: Gustavo A. R. Silva <gustavoars@kernel.org>
+	Cc: Nathan Chancellor <nathan@kernel.org>
+	Cc: Nick Desaulniers <ndesaulniers@google.com>
+	Cc: Rasmus Villemoes <linux@rasmusvillemoes.dk>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: Gustavo A. R. Silva <gustavoars@kernel.org>
+	Tested-by: Gustavo A. R. Silva <gustavoars@kernel.org>
+Link: https://lore.kernel.org/lkml/20220210010407.GA701603@embeddedor
+(cherry picked from commit 230f6fa2c1db6a3f3e668cfe95995ac8e6eee212)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/overflow.h
+#	lib/test_overflow.c
+diff --cc include/linux/overflow.h
+index cbdbf2e8887f,f1221d11f8e5..000000000000
+--- a/include/linux/overflow.h
++++ b/include/linux/overflow.h
+@@@ -4,14 -4,12 +4,15 @@@
+  
+  #include <linux/compiler.h>
+  #include <linux/limits.h>
++ #include <linux/const.h>
+  
+  /*
+ - * We need to compute the minimum and maximum values representable in a given
+ - * type. These macros may also be useful elsewhere. It would seem more obvious
+ - * to do something like:
+ + * In the fallback code below, we need to compute the minimum and
+ + * maximum values representable in a given type. These macros may also
+ + * be useful elsewhere, so we provide them outside the
+ + * COMPILER_HAS_GENERIC_BUILTIN_OVERFLOW block.
+ + *
+ + * It would seem more obvious to do something like
+   *
+   * #define type_min(T) (T)(is_signed_type(T) ? (T)1 << (8*sizeof(T)-1) : 0)
+   * #define type_max(T) (T)(is_signed_type(T) ? ((T)1 << (8*sizeof(T)-1)) - 1 : ~(T)0)
+@@@ -349,7 -222,25 +350,30 @@@ static inline __must_check size_t __ab_
+   * Return: number of bytes needed or SIZE_MAX on overflow.
+   */
+  #define flex_array_size(p, member, count)				\
+++<<<<<<< HEAD
+ +	array_size(count,						\
+ +		    sizeof(*(p)->member) + __must_be_array((p)->member))
+++=======
++ 	__builtin_choose_expr(__is_constexpr(count),			\
++ 		(count) * sizeof(*(p)->member) + __must_be_array((p)->member),	\
++ 		size_mul(count, sizeof(*(p)->member) + __must_be_array((p)->member)))
++ 
++ /**
++  * struct_size() - Calculate size of structure with trailing flexible array.
++  *
++  * @p: Pointer to the structure.
++  * @member: Name of the array member.
++  * @count: Number of elements in the array.
++  *
++  * Calculates size of memory needed for structure @p followed by an
++  * array of @count number of @member elements.
++  *
++  * Return: number of bytes needed or SIZE_MAX on overflow.
++  */
++ #define struct_size(p, member, count)					\
++ 	__builtin_choose_expr(__is_constexpr(count),			\
++ 		sizeof(*(p)) + flex_array_size(p, member, count),	\
++ 		size_add(sizeof(*(p)), flex_array_size(p, member, count)))
+++>>>>>>> 230f6fa2c1db (overflow: Provide constant expression struct_size)
+  
+  #endif /* __LINUX_OVERFLOW_H */
+diff --cc lib/test_overflow.c
+index cea37ae82615,f6530fce799d..000000000000
+--- a/lib/test_overflow.c
++++ b/lib/test_overflow.c
+@@@ -594,6 -594,111 +594,114 @@@ static int __init test_overflow_allocat
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct __test_flex_array {
++ 	unsigned long flags;
++ 	size_t count;
++ 	unsigned long data[];
++ };
++ 
++ static int __init test_overflow_size_helpers(void)
++ {
++ 	/* Make sure struct_size() can be used in a constant expression. */
++ 	u8 ce_array[struct_size((struct __test_flex_array *)0, data, 55)];
++ 	struct __test_flex_array *obj;
++ 	int count = 0;
++ 	int err = 0;
++ 	int var;
++ 	volatile int unconst = 0;
++ 
++ 	/* Verify constant expression against runtime version. */
++ 	var = 55;
++ 	OPTIMIZER_HIDE_VAR(var);
++ 	err |= sizeof(ce_array) != struct_size(obj, data, var);
++ 
++ #define check_one_size_helper(expected, func, args...)	({	\
++ 	bool __failure = false;					\
++ 	size_t _r;						\
++ 								\
++ 	_r = func(args);					\
++ 	if (_r != (expected)) {					\
++ 		pr_warn("expected " #func "(" #args ") "	\
++ 			"to return %zu but got %zu instead\n",	\
++ 			(size_t)(expected), _r);		\
++ 		__failure = true;				\
++ 	}							\
++ 	count++;						\
++ 	__failure;						\
++ })
++ 
++ 	var = 4;
++ 	err |= check_one_size_helper(20,       size_mul, var++, 5);
++ 	err |= check_one_size_helper(20,       size_mul, 4, var++);
++ 	err |= check_one_size_helper(0,	       size_mul, 0, 3);
++ 	err |= check_one_size_helper(0,	       size_mul, 3, 0);
++ 	err |= check_one_size_helper(6,	       size_mul, 2, 3);
++ 	err |= check_one_size_helper(SIZE_MAX, size_mul, SIZE_MAX,  1);
++ 	err |= check_one_size_helper(SIZE_MAX, size_mul, SIZE_MAX,  3);
++ 	err |= check_one_size_helper(SIZE_MAX, size_mul, SIZE_MAX, -3);
++ 
++ 	var = 4;
++ 	err |= check_one_size_helper(9,        size_add, var++, 5);
++ 	err |= check_one_size_helper(9,        size_add, 4, var++);
++ 	err |= check_one_size_helper(9,	       size_add, 9, 0);
++ 	err |= check_one_size_helper(9,	       size_add, 0, 9);
++ 	err |= check_one_size_helper(5,	       size_add, 2, 3);
++ 	err |= check_one_size_helper(SIZE_MAX, size_add, SIZE_MAX,  1);
++ 	err |= check_one_size_helper(SIZE_MAX, size_add, SIZE_MAX,  3);
++ 	err |= check_one_size_helper(SIZE_MAX, size_add, SIZE_MAX, -3);
++ 
++ 	var = 4;
++ 	err |= check_one_size_helper(1,        size_sub, var--, 3);
++ 	err |= check_one_size_helper(1,        size_sub, 4, var--);
++ 	err |= check_one_size_helper(1,        size_sub, 3, 2);
++ 	err |= check_one_size_helper(9,	       size_sub, 9, 0);
++ 	err |= check_one_size_helper(SIZE_MAX, size_sub, 9, -3);
++ 	err |= check_one_size_helper(SIZE_MAX, size_sub, 0, 9);
++ 	err |= check_one_size_helper(SIZE_MAX, size_sub, 2, 3);
++ 	err |= check_one_size_helper(SIZE_MAX, size_sub, SIZE_MAX,  0);
++ 	err |= check_one_size_helper(SIZE_MAX, size_sub, SIZE_MAX, 10);
++ 	err |= check_one_size_helper(SIZE_MAX, size_sub, 0,  SIZE_MAX);
++ 	err |= check_one_size_helper(SIZE_MAX, size_sub, 14, SIZE_MAX);
++ 	err |= check_one_size_helper(SIZE_MAX - 2, size_sub, SIZE_MAX - 1,  1);
++ 	err |= check_one_size_helper(SIZE_MAX - 4, size_sub, SIZE_MAX - 1,  3);
++ 	err |= check_one_size_helper(1,		size_sub, SIZE_MAX - 1, -3);
++ 
++ 	var = 4;
++ 	err |= check_one_size_helper(4 * sizeof(*obj->data),
++ 				     flex_array_size, obj, data, var++);
++ 	err |= check_one_size_helper(5 * sizeof(*obj->data),
++ 				     flex_array_size, obj, data, var++);
++ 	err |= check_one_size_helper(0, flex_array_size, obj, data, 0 + unconst);
++ 	err |= check_one_size_helper(sizeof(*obj->data),
++ 				     flex_array_size, obj, data, 1 + unconst);
++ 	err |= check_one_size_helper(7 * sizeof(*obj->data),
++ 				     flex_array_size, obj, data, 7 + unconst);
++ 	err |= check_one_size_helper(SIZE_MAX,
++ 				     flex_array_size, obj, data, -1 + unconst);
++ 	err |= check_one_size_helper(SIZE_MAX,
++ 				     flex_array_size, obj, data, SIZE_MAX - 4 + unconst);
++ 
++ 	var = 4;
++ 	err |= check_one_size_helper(sizeof(*obj) + (4 * sizeof(*obj->data)),
++ 				     struct_size, obj, data, var++);
++ 	err |= check_one_size_helper(sizeof(*obj) + (5 * sizeof(*obj->data)),
++ 				     struct_size, obj, data, var++);
++ 	err |= check_one_size_helper(sizeof(*obj), struct_size, obj, data, 0 + unconst);
++ 	err |= check_one_size_helper(sizeof(*obj) + sizeof(*obj->data),
++ 				     struct_size, obj, data, 1 + unconst);
++ 	err |= check_one_size_helper(SIZE_MAX,
++ 				     struct_size, obj, data, -3 + unconst);
++ 	err |= check_one_size_helper(SIZE_MAX,
++ 				     struct_size, obj, data, SIZE_MAX - 3 + unconst);
++ 
++ 	pr_info("%d overflow size helper tests finished\n", count);
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 230f6fa2c1db (overflow: Provide constant expression struct_size)
+  static int __init test_module_init(void)
+  {
+  	int err = 0;
+* Unmerged path include/linux/overflow.h
+* Unmerged path lib/test_overflow.c
