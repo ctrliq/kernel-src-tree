@@ -1,0 +1,253 @@
+x86/decompressor: Call trampoline directly from C code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit 64ef578b6b6866bec012544416946533444036c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/64ef578b.failed
+
+Instead of returning to the asm calling code to invoke the trampoline,
+call it straight from the C code that sets it up. That way, the struct
+return type is no longer needed for returning two values, and the call
+can be made conditional more cleanly in a subsequent patch.
+
+This means that all callee save 64-bit registers need to be preserved
+and restored, as their contents may not survive the legacy mode switch.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Link: https://lore.kernel.org/r/20230807162720.545787-13-ardb@kernel.org
+(cherry picked from commit 64ef578b6b6866bec012544416946533444036c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/head_64.S
+#	arch/x86/boot/compressed/pgtable_64.c
+diff --cc arch/x86/boot/compressed/head_64.S
+index c4f3be19a58f,cd6e3e175389..000000000000
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@@ -372,40 -430,14 +372,40 @@@ SYM_CODE_START(startup_64
+  #endif
+  
+  	/*
+- 	 * paging_prepare() sets up the trampoline and checks if we need to
+- 	 * enable 5-level paging.
+- 	 *
+- 	 * paging_prepare() returns a two-quadword structure which lands
+- 	 * into RDX:RAX:
+- 	 *   - Address of the trampoline is returned in RAX.
+- 	 *   - Non zero RDX means trampoline needs to enable 5-level
+- 	 *     paging.
++ 	 * configure_5level_paging() updates the number of paging levels using
++ 	 * a trampoline in 32-bit addressable memory if the current number does
++ 	 * not match the desired number.
+  	 *
+ -	 * Pass the boot_params pointer as the first argument.
+ +	 * RSI holds real mode data and needs to be preserved across
+ +	 * this function call.
+ +	 */
+++<<<<<<< HEAD
+ +	pushq	%rsi
+ +	movq	%rsi, %rdi		/* real mode address */
+ +	call	paging_prepare
+ +	popq	%rsi
+ +
+ +	/* Save the trampoline address in RCX */
+ +	movq	%rax, %rcx
+ +
+ +	/*
+ +	 * Load the address of trampoline_return() into RDI.
+ +	 * It will be used by the trampoline to return to the main code.
+  	 */
+ +	leaq	trampoline_return(%rip), %rdi
+ +
+ +	/* Switch to compatibility mode (CS.L = 0 CS.D = 1) via far return */
+ +	pushq	$__KERNEL32_CS
+ +	leaq	TRAMPOLINE_32BIT_CODE_OFFSET(%rax), %rax
+ +	pushq	%rax
+ +	lretq
+ +trampoline_return:
+ +	/* Restore the stack, the 32-bit trampoline uses its own stack */
+ +	leaq	boot_stack_end(%rbx), %rsp
+++=======
++ 	movq	%r15, %rdi
++ 	call	configure_5level_paging
+++>>>>>>> 64ef578b6b68 (x86/decompressor: Call trampoline directly from C code)
+  
+  	/*
+  	 * cleanup_trampoline() would restore trampoline memory.
+@@@ -561,25 -515,65 +561,82 @@@ SYM_FUNC_END(efi64_stub_entry
+  /*
+   * Jump to the decompressed kernel.
+   */
+ -	movq	%r15, %rsi
+  	jmp	*%rax
+++<<<<<<< HEAD
+++=======
++ SYM_FUNC_END(.Lrelocated)
++ 
++ /*
++  * This is the 32-bit trampoline that will be copied over to low memory. It
++  * will be called using the ordinary 64-bit calling convention from code
++  * running in 64-bit mode.
++  *
++  * Return address is at the top of the stack (might be above 4G).
++  * The first argument (EDI) contains the 32-bit addressable base of the
++  * trampoline memory. A non-zero second argument (ESI) means that the
++  * trampoline needs to enable 5-level paging.
++  */
++ 	.section ".rodata", "a", @progbits
++ SYM_CODE_START(trampoline_32bit_src)
++ 	/*
++ 	 * Preserve callee save 64-bit registers on the stack: this is
++ 	 * necessary because the architecture does not guarantee that GPRs will
++ 	 * retain their full 64-bit values across a 32-bit mode switch.
++ 	 */
++ 	pushq	%r15
++ 	pushq	%r14
++ 	pushq	%r13
++ 	pushq	%r12
++ 	pushq	%rbp
++ 	pushq	%rbx
++ 
++ 	/* Preserve top half of RSP in a legacy mode GPR to avoid truncation */
++ 	movq	%rsp, %rbx
++ 	shrq	$32, %rbx
++ 
++ 	/* Switch to compatibility mode (CS.L = 0 CS.D = 1) via far return */
++ 	pushq	$__KERNEL32_CS
++ 	leaq	0f(%rip), %rax
++ 	pushq	%rax
++ 	lretq
++ 
++ 	/*
++ 	 * The 32-bit code below will do a far jump back to long mode and end
++ 	 * up here after reconfiguring the number of paging levels. First, the
++ 	 * stack pointer needs to be restored to its full 64-bit value before
++ 	 * the callee save register contents can be popped from the stack.
++ 	 */
++ .Lret:
++ 	shlq	$32, %rbx
++ 	orq	%rbx, %rsp
++ 
++ 	/* Restore the preserved 64-bit registers */
++ 	popq	%rbx
++ 	popq	%rbp
++ 	popq	%r12
++ 	popq	%r13
++ 	popq	%r14
++ 	popq	%r15
++ 	retq
+++>>>>>>> 64ef578b6b68 (x86/decompressor: Call trampoline directly from C code)
+  
+  	.code32
+ -0:
+ +/*
+ + * This is the 32-bit trampoline that will be copied over to low memory.
+ + *
+ + * RDI contains the return address (might be above 4G).
+ + * ECX contains the base address of the trampoline memory.
+ + * Non zero RDX means trampoline needs to enable 5-level paging.
+ + */
+ +SYM_CODE_START(trampoline_32bit_src)
+ +	/* Set up data and stack segments */
+ +	movl	$__KERNEL_DS, %eax
+ +	movl	%eax, %ds
+ +	movl	%eax, %ss
+ +
+ +	/* Set up new stack */
+ +	leal	TRAMPOLINE_32BIT_STACK_END(%ecx), %esp
+ +
+  	/* Disable paging */
+  	movl	%cr0, %eax
+  	btrl	$X86_CR0_PG_BIT, %eax
+diff --cc arch/x86/boot/compressed/pgtable_64.c
+index af8b429eafb0,f9cc86b2ee55..000000000000
+--- a/arch/x86/boot/compressed/pgtable_64.c
++++ b/arch/x86/boot/compressed/pgtable_64.c
+@@@ -20,16 -11,11 +20,11 @@@ unsigned long __force_order
+  
+  #ifdef CONFIG_X86_5LEVEL
+  /* __pgtable_l5_enabled needs to be in .data to avoid being cleared along with .bss */
+ -unsigned int __section(".data") __pgtable_l5_enabled;
+ -unsigned int __section(".data") pgdir_shift = 39;
+ -unsigned int __section(".data") ptrs_per_p4d = 1;
+ +unsigned int __section(.data) __pgtable_l5_enabled;
+ +unsigned int __section(.data) pgdir_shift = 39;
+ +unsigned int __section(.data) ptrs_per_p4d = 1;
+  #endif
+  
+- struct paging_config {
+- 	unsigned long trampoline_start;
+- 	unsigned long l5_required;
+- };
+- 
+  /* Buffer to preserve trampoline memory */
+  static char trampoline_save[TRAMPOLINE_32BIT_SIZE];
+  
+@@@ -38,9 -24,9 +33,9 @@@
+   * purposes.
+   *
+   * Avoid putting the pointer into .bss as it will be cleared between
+-  * paging_prepare() and extract_kernel().
++  * configure_5level_paging() and extract_kernel().
+   */
+ -unsigned long *trampoline_32bit __section(".data");
+ +unsigned long *trampoline_32bit __section(.data);
+  
+  extern struct boot_params *boot_params;
+  int cmdline_find_option_bool(const char *option);
+@@@ -105,12 -101,13 +100,17 @@@ static unsigned long find_trampoline_pl
+  	return bios_start - TRAMPOLINE_32BIT_SIZE;
+  }
+  
+- struct paging_config paging_prepare(void *rmode)
++ asmlinkage void configure_5level_paging(struct boot_params *bp)
+  {
+++<<<<<<< HEAD
+ +	struct paging_config paging_config = {};
+++=======
++ 	void (*toggle_la57)(void *trampoline, bool enable_5lvl);
++ 	bool l5_required = false;
+++>>>>>>> 64ef578b6b68 (x86/decompressor: Call trampoline directly from C code)
+  
+  	/* Initialize boot_params. Required for cmdline_find_option_bool(). */
+- 	boot_params = rmode;
++ 	boot_params = bp;
+  
+  	/*
+  	 * Check if LA57 is desired and supported.
+@@@ -147,10 -142,20 +145,27 @@@
+  	memset(trampoline_32bit, 0, TRAMPOLINE_32BIT_SIZE);
+  
+  	/* Copy trampoline code in place */
+++<<<<<<< HEAD
+ +	memcpy(trampoline_32bit + TRAMPOLINE_32BIT_CODE_OFFSET / sizeof(unsigned long),
+ +			&trampoline_32bit_src, TRAMPOLINE_32BIT_CODE_SIZE);
+ +
+ +	/*
+++=======
++ 	toggle_la57 = memcpy(trampoline_32bit +
++ 			TRAMPOLINE_32BIT_CODE_OFFSET / sizeof(unsigned long),
++ 			&trampoline_32bit_src, TRAMPOLINE_32BIT_CODE_SIZE);
++ 
++ 	/*
++ 	 * Avoid the need for a stack in the 32-bit trampoline code, by using
++ 	 * LJMP rather than LRET to return back to long mode. LJMP takes an
++ 	 * immediate absolute address, which needs to be adjusted based on the
++ 	 * placement of the trampoline.
++ 	 */
++ 	*(u32 *)((u8 *)toggle_la57 + trampoline_ljmp_imm_offset) +=
++ 						(unsigned long)toggle_la57;
++ 
++ 	/*
+++>>>>>>> 64ef578b6b68 (x86/decompressor: Call trampoline directly from C code)
+  	 * The code below prepares page table in trampoline memory.
+  	 *
+  	 * The new page table will be used by trampoline code for switching
+* Unmerged path arch/x86/boot/compressed/head_64.S
+* Unmerged path arch/x86/boot/compressed/pgtable_64.c
