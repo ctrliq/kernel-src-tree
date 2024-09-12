@@ -1,0 +1,90 @@
+locking: Mark racy reads of owner->on_cpu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Marco Elver <elver@google.com>
+commit 4cf75fd4a2545ca4deea992f929602c9fdbe8058
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/4cf75fd4.failed
+
+One of the more frequent data races reported by KCSAN is the racy read
+in mutex_spin_on_owner(), which is usually reported as "race of unknown
+origin" without showing the writer. This is due to the racing write
+occurring in kernel/sched. Locally enabling KCSAN in kernel/sched shows:
+
+ | write (marked) to 0xffff97f205079934 of 4 bytes by task 316 on cpu 6:
+ |  finish_task                kernel/sched/core.c:4632 [inline]
+ |  finish_task_switch         kernel/sched/core.c:4848
+ |  context_switch             kernel/sched/core.c:4975 [inline]
+ |  __schedule                 kernel/sched/core.c:6253
+ |  schedule                   kernel/sched/core.c:6326
+ |  schedule_preempt_disabled  kernel/sched/core.c:6385
+ |  __mutex_lock_common        kernel/locking/mutex.c:680
+ |  __mutex_lock               kernel/locking/mutex.c:740 [inline]
+ |  __mutex_lock_slowpath      kernel/locking/mutex.c:1028
+ |  mutex_lock                 kernel/locking/mutex.c:283
+ |  tty_open_by_driver         drivers/tty/tty_io.c:2062 [inline]
+ |  ...
+ |
+ | read to 0xffff97f205079934 of 4 bytes by task 322 on cpu 3:
+ |  mutex_spin_on_owner        kernel/locking/mutex.c:370
+ |  mutex_optimistic_spin      kernel/locking/mutex.c:480
+ |  __mutex_lock_common        kernel/locking/mutex.c:610
+ |  __mutex_lock               kernel/locking/mutex.c:740 [inline]
+ |  __mutex_lock_slowpath      kernel/locking/mutex.c:1028
+ |  mutex_lock                 kernel/locking/mutex.c:283
+ |  tty_open_by_driver         drivers/tty/tty_io.c:2062 [inline]
+ |  ...
+ |
+ | value changed: 0x00000001 -> 0x00000000
+
+This race is clearly intentional, and the potential for miscompilation
+is slim due to surrounding barrier() and cpu_relax(), and the value
+being used as a boolean.
+
+Nevertheless, marking this reader would more clearly denote intent and
+make it obvious that concurrency is expected. Use READ_ONCE() to avoid
+having to reason about compiler optimizations now and in future.
+
+With previous refactor, mark the read to owner->on_cpu in owner_on_cpu(),
+which immediately precedes the loop executing mutex_spin_on_owner().
+
+	Signed-off-by: Marco Elver <elver@google.com>
+	Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20211203075935.136808-3-wangkefeng.wang@huawei.com
+(cherry picked from commit 4cf75fd4a2545ca4deea992f929602c9fdbe8058)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+diff --cc include/linux/sched.h
+index 3641dfde2dd2,0b9b0e3f4791..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -2078,6 -2170,20 +2078,23 @@@ extern long sched_getaffinity(pid_t pid
+  #define TASK_SIZE_OF(tsk)	TASK_SIZE
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_SMP
++ static inline bool owner_on_cpu(struct task_struct *owner)
++ {
++ 	/*
++ 	 * As lock holder preemption issue, we both skip spinning if
++ 	 * task is not on cpu or its cpu is preempted
++ 	 */
++ 	return READ_ONCE(owner->on_cpu) && !vcpu_is_preempted(task_cpu(owner));
++ }
++ 
++ /* Returns effective CPU energy utilization, as seen by the scheduler */
++ unsigned long sched_cpu_util(int cpu, unsigned long max);
++ #endif /* CONFIG_SMP */
++ 
+++>>>>>>> 4cf75fd4a254 (locking: Mark racy reads of owner->on_cpu)
+  #ifdef CONFIG_RSEQ
+  
+  /*
+* Unmerged path include/linux/sched.h
