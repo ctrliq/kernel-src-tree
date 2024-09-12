@@ -1,0 +1,220 @@
+virtio-mem: Paravirtualized memory hotunplug part 2
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-511.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit 255f598507083905995ecab96392770ae03aac7f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-511.el8/255f5985.failed
+
+We also want to unplug online memory (contained in online memory blocks
+and, therefore, managed by the buddy), and eventually replug it later.
+
+When requested to unplug memory, we use alloc_contig_range() to allocate
+subblocks in online memory blocks (so we are the owner) and send them to
+our hypervisor. When requested to plug memory, we can replug such memory
+using free_contig_range() after asking our hypervisor.
+
+We also want to mark all allocated pages PG_offline, so nobody will
+touch them. To differentiate pages that were never onlined when
+onlining the memory block from pages allocated via alloc_contig_range(), we
+use PageDirty(). Based on this flag, virtio_mem_fake_online() can either
+online the pages for the first time or use free_contig_range().
+
+It is worth noting that there are no guarantees on how much memory can
+actually get unplugged again. All device memory might completely be
+fragmented with unmovable data, such that no subblock can get unplugged.
+
+We are not touching the ZONE_MOVABLE. If memory is onlined to the
+ZONE_MOVABLE, it can only get unplugged after that memory was offlined
+manually by user space. In normal operation, virtio-mem memory is
+suggested to be onlined to ZONE_NORMAL. In the future, we will try to
+make unplug more likely to succeed.
+
+Add a module parameter to control if online memory shall be touched.
+
+As we want to access alloc_contig_range()/free_contig_range() from
+kernel module context, export the symbols.
+
+Note: Whenever virtio-mem uses alloc_contig_range(), all affected pages
+are on the same node, in the same zone, and contain no holes.
+
+	Acked-by: Michal Hocko <mhocko@suse.com> # to export contig range allocator API
+	Tested-by: Pankaj Gupta <pankaj.gupta.linux@gmail.com>
+	Cc: "Michael S. Tsirkin" <mst@redhat.com>
+	Cc: Jason Wang <jasowang@redhat.com>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Igor Mammedov <imammedo@redhat.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Cc: Stefan Hajnoczi <stefanha@redhat.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Mike Rapoport <rppt@linux.ibm.com>
+	Cc: Alexander Duyck <alexander.h.duyck@linux.intel.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+Link: https://lore.kernel.org/r/20200507140139.17083-6-david@redhat.com
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+(cherry picked from commit 255f598507083905995ecab96392770ae03aac7f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/virtio/Kconfig
+#	drivers/virtio/virtio_mem.c
+#	mm/page_alloc.c
+diff --cc drivers/virtio/Kconfig
+index 28a2794652bc,4c1e14615001..000000000000
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@@ -75,6 -78,23 +75,26 @@@ config VIRTIO_BALLOO
+  
+  	 If unsure, say M.
+  
+++<<<<<<< HEAD
+++=======
++ config VIRTIO_MEM
++ 	tristate "Virtio mem driver"
++ 	default m
++ 	depends on X86_64
++ 	depends on VIRTIO
++ 	depends on MEMORY_HOTPLUG_SPARSE
++ 	depends on MEMORY_HOTREMOVE
++ 	select CONTIG_ALLOC
++ 	help
++ 	 This driver provides access to virtio-mem paravirtualized memory
++ 	 devices, allowing to hotplug and hotunplug memory.
++ 
++ 	 This driver was only tested under x86-64, but should theoretically
++ 	 work on all architectures that support memory hotplug and hotremove.
++ 
++ 	 If unsure, say M.
++ 
+++>>>>>>> 255f59850708 (virtio-mem: Paravirtualized memory hotunplug part 2)
+  config VIRTIO_INPUT
+  	tristate "Virtio input driver"
+  	depends on VIRTIO
+diff --cc mm/page_alloc.c
+index 3fef0c2fab98,ce1c9df54eac..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -8897,6 -8603,108 +8897,111 @@@ done
+  				pfn_max_align_up(end), migratetype);
+  	return ret;
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL(alloc_contig_range);
++ 
++ static int __alloc_contig_pages(unsigned long start_pfn,
++ 				unsigned long nr_pages, gfp_t gfp_mask)
++ {
++ 	unsigned long end_pfn = start_pfn + nr_pages;
++ 
++ 	return alloc_contig_range(start_pfn, end_pfn, MIGRATE_MOVABLE,
++ 				  gfp_mask);
++ }
++ 
++ static bool pfn_range_valid_contig(struct zone *z, unsigned long start_pfn,
++ 				   unsigned long nr_pages)
++ {
++ 	unsigned long i, end_pfn = start_pfn + nr_pages;
++ 	struct page *page;
++ 
++ 	for (i = start_pfn; i < end_pfn; i++) {
++ 		page = pfn_to_online_page(i);
++ 		if (!page)
++ 			return false;
++ 
++ 		if (page_zone(page) != z)
++ 			return false;
++ 
++ 		if (PageReserved(page))
++ 			return false;
++ 
++ 		if (page_count(page) > 0)
++ 			return false;
++ 
++ 		if (PageHuge(page))
++ 			return false;
++ 	}
++ 	return true;
++ }
++ 
++ static bool zone_spans_last_pfn(const struct zone *zone,
++ 				unsigned long start_pfn, unsigned long nr_pages)
++ {
++ 	unsigned long last_pfn = start_pfn + nr_pages - 1;
++ 
++ 	return zone_spans_pfn(zone, last_pfn);
++ }
++ 
++ /**
++  * alloc_contig_pages() -- tries to find and allocate contiguous range of pages
++  * @nr_pages:	Number of contiguous pages to allocate
++  * @gfp_mask:	GFP mask to limit search and used during compaction
++  * @nid:	Target node
++  * @nodemask:	Mask for other possible nodes
++  *
++  * This routine is a wrapper around alloc_contig_range(). It scans over zones
++  * on an applicable zonelist to find a contiguous pfn range which can then be
++  * tried for allocation with alloc_contig_range(). This routine is intended
++  * for allocation requests which can not be fulfilled with the buddy allocator.
++  *
++  * The allocated memory is always aligned to a page boundary. If nr_pages is a
++  * power of two then the alignment is guaranteed to be to the given nr_pages
++  * (e.g. 1GB request would be aligned to 1GB).
++  *
++  * Allocated pages can be freed with free_contig_range() or by manually calling
++  * __free_page() on each allocated page.
++  *
++  * Return: pointer to contiguous pages on success, or NULL if not successful.
++  */
++ struct page *alloc_contig_pages(unsigned long nr_pages, gfp_t gfp_mask,
++ 				int nid, nodemask_t *nodemask)
++ {
++ 	unsigned long ret, pfn, flags;
++ 	struct zonelist *zonelist;
++ 	struct zone *zone;
++ 	struct zoneref *z;
++ 
++ 	zonelist = node_zonelist(nid, gfp_mask);
++ 	for_each_zone_zonelist_nodemask(zone, z, zonelist,
++ 					gfp_zone(gfp_mask), nodemask) {
++ 		spin_lock_irqsave(&zone->lock, flags);
++ 
++ 		pfn = ALIGN(zone->zone_start_pfn, nr_pages);
++ 		while (zone_spans_last_pfn(zone, pfn, nr_pages)) {
++ 			if (pfn_range_valid_contig(zone, pfn, nr_pages)) {
++ 				/*
++ 				 * We release the zone lock here because
++ 				 * alloc_contig_range() will also lock the zone
++ 				 * at some point. If there's an allocation
++ 				 * spinning on this lock, it may win the race
++ 				 * and cause alloc_contig_range() to fail...
++ 				 */
++ 				spin_unlock_irqrestore(&zone->lock, flags);
++ 				ret = __alloc_contig_pages(pfn, nr_pages,
++ 							gfp_mask);
++ 				if (!ret)
++ 					return pfn_to_page(pfn);
++ 				spin_lock_irqsave(&zone->lock, flags);
++ 			}
++ 			pfn += nr_pages;
++ 		}
++ 		spin_unlock_irqrestore(&zone->lock, flags);
++ 	}
++ 	return NULL;
++ }
+++>>>>>>> 255f59850708 (virtio-mem: Paravirtualized memory hotunplug part 2)
+  #endif /* CONFIG_CONTIG_ALLOC */
+  
+  void free_contig_range(unsigned long pfn, unsigned int nr_pages)
+* Unmerged path drivers/virtio/virtio_mem.c
+* Unmerged path drivers/virtio/Kconfig
+* Unmerged path drivers/virtio/virtio_mem.c
+* Unmerged path mm/page_alloc.c
