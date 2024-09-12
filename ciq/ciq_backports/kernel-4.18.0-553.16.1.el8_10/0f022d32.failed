@@ -1,0 +1,130 @@
+net/sched: Fix mirred deadlock on device recursion
+
+jira LE-1907
+cve CVE-2024-27010
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Eric Dumazet <edumazet@google.com>
+commit 0f022d32c3eca477fbf79a205243a6123ed0fe11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/0f022d32.failed
+
+When the mirred action is used on a classful egress qdisc and a packet is
+mirrored or redirected to self we hit a qdisc lock deadlock.
+See trace below.
+
+[..... other info removed for brevity....]
+[   82.890906]
+[   82.890906] ============================================
+[   82.890906] WARNING: possible recursive locking detected
+[   82.890906] 6.8.0-05205-g77fadd89fe2d-dirty #213 Tainted: G        W
+[   82.890906] --------------------------------------------
+[   82.890906] ping/418 is trying to acquire lock:
+[   82.890906] ffff888006994110 (&sch->q.lock){+.-.}-{3:3}, at:
+__dev_queue_xmit+0x1778/0x3550
+[   82.890906]
+[   82.890906] but task is already holding lock:
+[   82.890906] ffff888006994110 (&sch->q.lock){+.-.}-{3:3}, at:
+__dev_queue_xmit+0x1778/0x3550
+[   82.890906]
+[   82.890906] other info that might help us debug this:
+[   82.890906]  Possible unsafe locking scenario:
+[   82.890906]
+[   82.890906]        CPU0
+[   82.890906]        ----
+[   82.890906]   lock(&sch->q.lock);
+[   82.890906]   lock(&sch->q.lock);
+[   82.890906]
+[   82.890906]  *** DEADLOCK ***
+[   82.890906]
+[..... other info removed for brevity....]
+
+Example setup (eth0->eth0) to recreate
+tc qdisc add dev eth0 root handle 1: htb default 30
+tc filter add dev eth0 handle 1: protocol ip prio 2 matchall \
+     action mirred egress redirect dev eth0
+
+Another example(eth0->eth1->eth0) to recreate
+tc qdisc add dev eth0 root handle 1: htb default 30
+tc filter add dev eth0 handle 1: protocol ip prio 2 matchall \
+     action mirred egress redirect dev eth1
+
+tc qdisc add dev eth1 root handle 1: htb default 30
+tc filter add dev eth1 handle 1: protocol ip prio 2 matchall \
+     action mirred egress redirect dev eth0
+
+We fix this by adding an owner field (CPU id) to struct Qdisc set after
+root qdisc is entered. When the softirq enters it a second time, if the
+qdisc owner is the same CPU, the packet is dropped to break the loop.
+
+	Reported-by: Mingshuai Ren <renmingshuai@huawei.com>
+Closes: https://lore.kernel.org/netdev/20240314111713.5979-1-renmingshuai@huawei.com/
+Fixes: 3bcb846ca4cf ("net: get rid of spin_trylock() in net_tx_action()")
+Fixes: e578d9c02587 ("net: sched: use counter to break reclassify loops")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reviewed-by: Victor Nogueira <victor@mojatatu.com>
+	Reviewed-by: Pedro Tammela <pctammela@mojatatu.com>
+	Tested-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+Link: https://lore.kernel.org/r/20240415210728.36949-1-victor@mojatatu.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 0f022d32c3eca477fbf79a205243a6123ed0fe11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_generic.c
+diff --cc net/sched/sch_generic.c
+index cd18fcf3c393,4a2c763e2d11..000000000000
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@@ -923,7 -974,8 +923,12 @@@ struct Qdisc *qdisc_alloc(struct netdev
+  	sch->enqueue = ops->enqueue;
+  	sch->dequeue = ops->dequeue;
+  	sch->dev_queue = dev_queue;
+++<<<<<<< HEAD
+ +	dev_hold(dev);
+++=======
++ 	sch->owner = -1;
++ 	netdev_hold(dev, &sch->dev_tracker, GFP_KERNEL);
+++>>>>>>> 0f022d32c3ec (net/sched: Fix mirred deadlock on device recursion)
+  	refcount_set(&sch->refcnt, 1);
+  
+  	return sch;
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 924181499484..d0fa7cfdbf29 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -116,6 +116,7 @@ struct Qdisc {
+ 	struct qdisc_skb_head	q;
+ 	struct gnet_stats_basic_sync bstats;
+ 	struct gnet_stats_queue	qstats;
++	int                     owner;
+ 	unsigned long		state;
+ 	unsigned long		state2; /* must be written under qdisc spinlock */
+ 	struct Qdisc            *next_sched;
+diff --git a/net/core/dev.c b/net/core/dev.c
+index f6a94d846053..900bec123602 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3941,6 +3941,10 @@ static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
+ 		return rc;
+ 	}
+ 
++	if (unlikely(READ_ONCE(q->owner) == smp_processor_id())) {
++		kfree_skb_reason(skb, SKB_DROP_REASON_TC_RECLASSIFY_LOOP);
++		return NET_XMIT_DROP;
++	}
+ 	/*
+ 	 * Heuristic to force contended enqueues to serialize on a
+ 	 * separate lock before trying to get qdisc main lock.
+@@ -3976,7 +3980,9 @@ static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
+ 		qdisc_run_end(q);
+ 		rc = NET_XMIT_SUCCESS;
+ 	} else {
++		WRITE_ONCE(q->owner, smp_processor_id());
+ 		rc = dev_qdisc_enqueue(skb, q, &to_free, txq);
++		WRITE_ONCE(q->owner, -1);
+ 		if (qdisc_run_begin(q)) {
+ 			if (unlikely(contended)) {
+ 				spin_unlock(&q->busylock);
+* Unmerged path net/sched/sch_generic.c
