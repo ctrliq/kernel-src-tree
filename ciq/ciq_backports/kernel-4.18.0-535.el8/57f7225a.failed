@@ -1,0 +1,311 @@
+scsi: scsi_debug: Only allow sdebug_max_queue be modified when no shosts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-535.el8
+commit-author John Garry <john.g.garry@oracle.com>
+commit 57f7225a4fe25425c29402adad990c7409958c40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-535.el8/57f7225a.failed
+
+The shost->can_queue value is initially used to set per-HW queue context
+tag depth in the block layer. This ensures that the shost is not sent too
+many commands which it can deal with. However lowering sdebug_max_queue
+separately means that we can easily overload the shost, as in the following
+example:
+
+$ cat /sys/bus/pseudo/drivers/scsi_debug/max_queue
+192
+$ cat /sys/class/scsi_host/host0/can_queue
+192
+$ echo 100 > /sys/bus/pseudo/drivers/scsi_debug/max_queue
+$ cat /sys/class/scsi_host/host0/can_queue
+192
+$ fio --filename=/dev/sda --direct=1 --rw=read --bs=4k --iodepth=256
+--runtime=1200 --numjobs=10 --time_based --group_reporting
+--name=iops-test-job --eta-newline=1 --readonly    --ioengine=io_uring
+--hipri --exitall_on_error
+iops-test-job: (g=0): rw=read, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=io_uring, iodepth=256
+...
+fio-3.28
+Starting 10 processes
+[  111.269885] scsi_io_completion_action: 400 callbacks suppressed
+[  111.269885] blk_print_req_error: 400 callbacks suppressed
+[  111.269889] I/O error, dev sda, sector 440 op 0x0:(READ) flags 0x1200000 phys_seg 1 prio class 2
+[  111.269892] sd 0:0:0:0: [sda] tag#132 FAILED Result: hostbyte=DID_ABORT driverbyte=DRIVER_OK cmd_age=0s
+[  111.269897] sd 0:0:0:0: [sda] tag#132 CDB: Read(10) 28 00 00 00 01 68 00 00 08 00
+[  111.277058] I/O error, dev sda, sector 360 op 0x0:(READ) flags 0x1200000 phys_seg 1 prio class 2
+
+[...]
+
+Ensure that this cannot happen by allowing sdebug_max_queue be modified
+only when we have no shosts. As such, any shost->can_queue value will match
+sdebug_max_queue, and sdebug_max_queue cannot be modified separately.
+
+Since retired_max_queue is no longer set, remove support.
+
+Continue to apply the restriction that sdebug_host_max_queue cannot be
+modified when sdebug_host_max_queue is set. Adding support for that would
+mean extra code, and no one has complained about this restriction
+previously.
+
+A command like the following may be used to remove a shost:
+echo -1 > /sys/bus/pseudo/drivers/scsi_debug/add_host
+
+	Signed-off-by: John Garry <john.g.garry@oracle.com>
+Link: https://lore.kernel.org/r/20230327074310.1862889-11-john.g.garry@oracle.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 57f7225a4fe25425c29402adad990c7409958c40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_debug.c
+diff --cc drivers/scsi/scsi_debug.c
+index a67473cb28e1,66b0c831da3b..000000000000
+--- a/drivers/scsi/scsi_debug.c
++++ b/drivers/scsi/scsi_debug.c
+@@@ -4918,75 -4925,58 +4917,96 @@@ static u32 get_tag(struct scsi_cmnd *cm
+  /* Queued (deferred) command completions converge here. */
+  static void sdebug_q_cmd_complete(struct sdebug_defer *sd_dp)
+  {
+ -	struct sdebug_queued_cmd *sqcp = container_of(sd_dp, struct sdebug_queued_cmd, sd_dp);
+ +	bool aborted = sd_dp->aborted;
+  	int qc_idx;
+++<<<<<<< HEAD
+ +	int retiring = 0;
+ +	unsigned long iflags;
+++=======
++ 	unsigned long flags, iflags;
++ 	struct scsi_cmnd *scp = sqcp->scmd;
++ 	struct sdebug_scsi_cmd *sdsc;
++ 	bool aborted;
+++>>>>>>> 57f7225a4fe2 (scsi: scsi_debug: Only allow sdebug_max_queue be modified when no shosts)
+  	struct sdebug_queue *sqp;
+ +	struct sdebug_queued_cmd *sqcp;
+ +	struct scsi_cmnd *scp;
+ +	struct sdebug_dev_info *devip;
+  
+ -	qc_idx = sd_dp->sqa_idx;
+ +	if (unlikely(aborted))
+ +		sd_dp->aborted = false;
+ +	qc_idx = sd_dp->qc_idx;
+ +	sqp = sdebug_q_arr + sd_dp->sqa_idx;
+  	if (sdebug_statistics) {
+  		atomic_inc(&sdebug_completions);
+  		if (raw_smp_processor_id() != sd_dp->issuing_cpu)
+  			atomic_inc(&sdebug_miss_cpus);
+  	}
+ -	if (!scp) {
+ -		pr_err("scmd=NULL\n");
+ -		goto out;
+ -	}
+  	if (unlikely((qc_idx < 0) || (qc_idx >= SDEBUG_CANQUEUE))) {
+  		pr_err("wild qc_idx=%d\n", qc_idx);
+ -		goto out;
+ +		return;
+  	}
+ -
+ -	sdsc = scsi_cmd_priv(scp);
+ -	sqp = get_queue(scp);
+  	spin_lock_irqsave(&sqp->qc_lock, iflags);
+++<<<<<<< HEAD
+ +	WRITE_ONCE(sd_dp->defer_t, SDEB_DEFER_NONE);
+ +	sqcp = &sqp->qc_arr[qc_idx];
+ +	scp = sqcp->a_cmnd;
+ +	if (unlikely(scp == NULL)) {
+ +		spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +		pr_err("scp is NULL, sqa_idx=%d, qc_idx=%d, hc_idx=%d\n",
+ +		       sd_dp->sqa_idx, qc_idx, sd_dp->hc_idx);
+ +		return;
+ +	}
+ +	devip = (struct sdebug_dev_info *)scp->device->hostdata;
+ +	if (likely(devip))
+ +		atomic_dec(&devip->num_in_q);
+ +	else
+ +		pr_err("devip=NULL\n");
+ +	if (unlikely(atomic_read(&retired_max_queue) > 0))
+ +		retiring = 1;
+ +
+ +	sqcp->a_cmnd = NULL;
+++=======
++ 	spin_lock_irqsave(&sdsc->lock, flags);
++ 	aborted = sd_dp->aborted;
++ 	if (unlikely(aborted))
++ 		sd_dp->aborted = false;
++ 	ASSIGN_QUEUED_CMD(scp, NULL);
++ 
++ 	sqp->qc_arr[qc_idx] = NULL;
+++>>>>>>> 57f7225a4fe2 (scsi: scsi_debug: Only allow sdebug_max_queue be modified when no shosts)
+  	if (unlikely(!test_and_clear_bit(qc_idx, sqp->in_use_bm))) {
+ -		spin_unlock_irqrestore(&sdsc->lock, flags);
+  		spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ -		pr_err("Unexpected completion qc_idx=%d\n", qc_idx);
+ -		goto out;
+ +		pr_err("Unexpected completion\n");
+ +		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (unlikely(retiring)) {	/* user has reduced max_queue */
+ +		int k, retval;
+ +
+ +		retval = atomic_read(&retired_max_queue);
+ +		if (qc_idx >= retval) {
+ +			spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ +			pr_err("index %d too large\n", retval);
+ +			return;
+ +		}
+ +		k = find_last_bit(sqp->in_use_bm, retval);
+ +		if ((k < sdebug_max_queue) || (k == retval))
+ +			atomic_set(&retired_max_queue, 0);
+ +		else
+ +			atomic_set(&retired_max_queue, k + 1);
+ +	}
+++=======
++ 	spin_unlock_irqrestore(&sdsc->lock, flags);
+++>>>>>>> 57f7225a4fe2 (scsi: scsi_debug: Only allow sdebug_max_queue be modified when no shosts)
+  	spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ -
+ -	if (aborted) {
+ -		pr_info("bypassing scsi_done() due to aborted cmd, kicking-off EH\n");
+ -		blk_abort_request(scsi_cmd_to_rq(scp));
+ -		goto out;
+ +	if (unlikely(aborted)) {
+ +		if (sdebug_verbose)
+ +			pr_info("bypassing scsi_done() due to aborted cmd\n");
+ +		return;
+  	}
+ -
+ -	scsi_done(scp); /* callback to mid level */
+ -out:
+ -	sdebug_free_queued_cmd(sqcp);
+ +	scp->scsi_done(scp); /* callback to mid level */
+  }
+  
+  /* When high resolution timer goes off this function is called. */
+@@@ -6446,22 -6414,14 +6465,33 @@@ static ssize_t max_queue_store(struct d
+  	if ((count > 0) && (1 == sscanf(buf, "%d", &n)) && (n > 0) &&
+  	    (n <= SDEBUG_CANQUEUE) &&
+  	    (sdebug_host_max_queue == 0)) {
+++<<<<<<< HEAD
+ +		block_unblock_all_queues(true);
+ +		k = 0;
+ +		for (j = 0, sqp = sdebug_q_arr; j < submit_queues;
+ +		     ++j, ++sqp) {
+ +			a = find_last_bit(sqp->in_use_bm, SDEBUG_CANQUEUE);
+ +			if (a > k)
+ +				k = a;
+ +		}
+ +		sdebug_max_queue = n;
+ +		if (k == SDEBUG_CANQUEUE)
+ +			atomic_set(&retired_max_queue, 0);
+ +		else if (k >= n)
+ +			atomic_set(&retired_max_queue, k + 1);
+ +		else
+ +			atomic_set(&retired_max_queue, 0);
+ +		block_unblock_all_queues(false);
+++=======
++ 		mutex_lock(&sdebug_host_list_mutex);
++ 
++ 		/* We may only change sdebug_max_queue when we have no shosts */
++ 		if (list_empty(&sdebug_host_list))
++ 			sdebug_max_queue = n;
++ 		else
++ 			count = -EBUSY;
++ 		mutex_unlock(&sdebug_host_list_mutex);
+++>>>>>>> 57f7225a4fe2 (scsi: scsi_debug: Only allow sdebug_max_queue be modified when no shosts)
+  		return count;
+  	}
+  	return -EINVAL;
+@@@ -7498,9 -7463,86 +7527,85 @@@ static int sdebug_map_queues(struct Scs
+  
+  		qoff += map->nr_queues;
+  	}
+ -}
+  
+ -struct sdebug_blk_mq_poll_data {
+ -	unsigned int queue_num;
+ -	int *num_entries;
+ -};
+ +	return 0;
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * We don't handle aborted commands here, but it does not seem possible to have
++  * aborted polled commands from schedule_resp()
++  */
++ static bool sdebug_blk_mq_poll_iter(struct request *rq, void *opaque)
++ {
++ 	struct sdebug_blk_mq_poll_data *data = opaque;
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
++ 	struct sdebug_scsi_cmd *sdsc = scsi_cmd_priv(cmd);
++ 	struct sdebug_defer *sd_dp;
++ 	u32 unique_tag = blk_mq_unique_tag(rq);
++ 	u16 hwq = blk_mq_unique_tag_to_hwq(unique_tag);
++ 	struct sdebug_queued_cmd *sqcp;
++ 	struct sdebug_queue *sqp;
++ 	unsigned long flags;
++ 	int queue_num = data->queue_num;
++ 	int qc_idx;
++ 	ktime_t time;
++ 
++ 	/* We're only interested in one queue for this iteration */
++ 	if (hwq != queue_num)
++ 		return true;
++ 
++ 	/* Subsequent checks would fail if this failed, but check anyway */
++ 	if (!test_bit(SCMD_STATE_INFLIGHT, &cmd->state))
++ 		return true;
++ 
++ 	time = ktime_get_boottime();
++ 
++ 	spin_lock_irqsave(&sdsc->lock, flags);
++ 	sqcp = TO_QUEUED_CMD(cmd);
++ 	if (!sqcp) {
++ 		spin_unlock_irqrestore(&sdsc->lock, flags);
++ 		return true;
++ 	}
++ 
++ 	sqp = sdebug_q_arr + queue_num;
++ 	sd_dp = &sqcp->sd_dp;
++ 
++ 	if (READ_ONCE(sd_dp->defer_t) != SDEB_DEFER_POLL) {
++ 		spin_unlock_irqrestore(&sdsc->lock, flags);
++ 		return true;
++ 	}
++ 
++ 	if (time < sd_dp->cmpl_ts) {
++ 		spin_unlock_irqrestore(&sdsc->lock, flags);
++ 		return true;
++ 	}
++ 
++ 	qc_idx = sd_dp->sqa_idx;
++ 	sqp->qc_arr[qc_idx] = NULL;
++ 	if (unlikely(!test_and_clear_bit(qc_idx, sqp->in_use_bm))) {
++ 		spin_unlock_irqrestore(&sdsc->lock, flags);
++ 		pr_err("Unexpected completion sqp %p queue_num=%d qc_idx=%u\n",
++ 			sqp, queue_num, qc_idx);
++ 		sdebug_free_queued_cmd(sqcp);
++ 		return true;
++ 	}
++ 
++ 	ASSIGN_QUEUED_CMD(cmd, NULL);
++ 	spin_unlock_irqrestore(&sdsc->lock, flags);
++ 
++ 	if (sdebug_statistics) {
++ 		atomic_inc(&sdebug_completions);
++ 		if (raw_smp_processor_id() != sd_dp->issuing_cpu)
++ 			atomic_inc(&sdebug_miss_cpus);
++ 	}
++ 
++ 	sdebug_free_queued_cmd(sqcp);
++ 
++ 	scsi_done(cmd); /* callback to mid level */
++ 	(*data->num_entries)++;
++ 	return true;
+++>>>>>>> 57f7225a4fe2 (scsi: scsi_debug: Only allow sdebug_max_queue be modified when no shosts)
+  }
+  
+  static int sdebug_blk_mq_poll(struct Scsi_Host *shost, unsigned int queue_num)
+* Unmerged path drivers/scsi/scsi_debug.c
