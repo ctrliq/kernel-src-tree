@@ -1,0 +1,294 @@
+wifi: mac80211: maintain link-sta hash table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit ba6ddab94fc63813ad582c55dd95ed596420d101
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/ba6ddab9.failed
+
+Maintain a hash table of link-sta addresses so we can find
+them for management frames etc. where addresses haven't
+been replaced by the drivers to the MLD address yet.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit ba6ddab94fc63813ad582c55dd95ed596420d101)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/sta_info.c
+#	net/mac80211/sta_info.h
+diff --cc net/mac80211/sta_info.c
+index f2be4a7c4886,ccd792af6b56..000000000000
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@@ -245,6 -299,38 +293,41 @@@ struct sta_info *sta_info_get_by_idx(st
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void sta_info_free_link(struct link_sta_info *link_sta)
++ {
++ 	free_percpu(link_sta->pcpu_rx_stats);
++ }
++ 
++ static void sta_remove_link(struct sta_info *sta, unsigned int link_id,
++ 			    bool unhash)
++ {
++ 	struct sta_link_alloc *alloc = NULL;
++ 	struct link_sta_info *link_sta;
++ 
++ 	link_sta = rcu_dereference_protected(sta->link[link_id],
++ 					     lockdep_is_held(&sta->local->sta_mtx));
++ 
++ 	if (WARN_ON(!link_sta))
++ 		return;
++ 
++ 	if (unhash)
++ 		link_sta_info_hash_del(sta->local, link_sta);
++ 
++ 	if (link_sta != &sta->deflink)
++ 		alloc = container_of(link_sta, typeof(*alloc), info);
++ 
++ 	sta->sta.valid_links &= ~BIT(link_id);
++ 	RCU_INIT_POINTER(sta->link[link_id], NULL);
++ 	RCU_INIT_POINTER(sta->sta.link[link_id], NULL);
++ 	if (alloc) {
++ 		sta_info_free_link(&alloc->info);
++ 		kfree_rcu(alloc, rcu_head);
++ 	}
++ }
++ 
+++>>>>>>> ba6ddab94fc6 (wifi: mac80211: maintain link-sta hash table)
+  /**
+   * sta_info_free - free STA
+   *
+@@@ -258,6 -344,15 +341,18 @@@
+   */
+  void sta_info_free(struct ieee80211_local *local, struct sta_info *sta)
+  {
+++<<<<<<< HEAD
+++=======
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(sta->link); i++) {
++ 		if (!(sta->sta.valid_links & BIT(i)))
++ 			continue;
++ 
++ 		sta_remove_link(sta, i, true);
++ 	}
++ 
+++>>>>>>> ba6ddab94fc6 (wifi: mac80211: maintain link-sta hash table)
+  	/*
+  	 * If we had used sta_info_pre_move_state() then we might not
+  	 * have gone through the state transitions down again, so do
+@@@ -2602,3 -2712,92 +2704,95 @@@ void ieee80211_sta_set_expected_through
+  
+  	sta_update_codel_params(sta, thr);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int ieee80211_sta_allocate_link(struct sta_info *sta, unsigned int link_id)
++ {
++ 	struct ieee80211_sub_if_data *sdata = sta->sdata;
++ 	struct sta_link_alloc *alloc;
++ 	int ret;
++ 
++ 	lockdep_assert_held(&sdata->local->sta_mtx);
++ 
++ 	/* must represent an MLD from the start */
++ 	if (WARN_ON(!sta->sta.valid_links))
++ 		return -EINVAL;
++ 
++ 	if (WARN_ON(sta->sta.valid_links & BIT(link_id) ||
++ 		    sta->link[link_id]))
++ 		return -EBUSY;
++ 
++ 	alloc = kzalloc(sizeof(*alloc), GFP_KERNEL);
++ 	if (!alloc)
++ 		return -ENOMEM;
++ 
++ 	ret = sta_info_alloc_link(sdata->local, &alloc->info, GFP_KERNEL);
++ 	if (ret) {
++ 		kfree(alloc);
++ 		return ret;
++ 	}
++ 
++ 	sta_info_add_link(sta, link_id, &alloc->info, &alloc->sta);
++ 
++ 	return 0;
++ }
++ 
++ static int link_sta_info_hash_add(struct ieee80211_local *local,
++ 				  struct link_sta_info *link_sta)
++ {
++ 	return rhltable_insert(&local->link_sta_hash,
++ 			       &link_sta->link_hash_node,
++ 			       link_sta_rht_params);
++ }
++ 
++ int ieee80211_sta_activate_link(struct sta_info *sta, unsigned int link_id)
++ {
++ 	struct ieee80211_sub_if_data *sdata = sta->sdata;
++ 	struct link_sta_info *link_sta;
++ 	u16 old_links = sta->sta.valid_links;
++ 	u16 new_links = old_links | BIT(link_id);
++ 	int ret;
++ 
++ 	link_sta = rcu_dereference_protected(sta->link[link_id],
++ 					     lockdep_is_held(&sdata->local->sta_mtx));
++ 
++ 	if (WARN_ON(old_links == new_links || !link_sta))
++ 		return -EINVAL;
++ 
++ 	sta->sta.valid_links = new_links;
++ 
++ 	if (!test_sta_flag(sta, WLAN_STA_INSERTED)) {
++ 		ret = 0;
++ 		goto hash;
++ 	}
++ 
++ 	ret = drv_change_sta_links(sdata->local, sdata, &sta->sta,
++ 				   old_links, new_links);
++ 	if (ret) {
++ 		sta->sta.valid_links = old_links;
++ 		sta_remove_link(sta, link_id, false);
++ 	}
++ 
++ hash:
++ 	link_sta_info_hash_add(sdata->local, link_sta);
++ 
++ 	return ret;
++ }
++ 
++ void ieee80211_sta_remove_link(struct sta_info *sta, unsigned int link_id)
++ {
++ 	struct ieee80211_sub_if_data *sdata = sta->sdata;
++ 
++ 	lockdep_assert_held(&sdata->local->sta_mtx);
++ 
++ 	sta->sta.valid_links &= ~BIT(link_id);
++ 
++ 	if (test_sta_flag(sta, WLAN_STA_INSERTED))
++ 		drv_change_sta_links(sdata->local, sdata, &sta->sta,
++ 				     sta->sta.valid_links,
++ 				     sta->sta.valid_links & ~BIT(link_id));
++ 
++ 	sta_remove_link(sta, link_id, true);
++ }
+++>>>>>>> ba6ddab94fc6 (wifi: mac80211: maintain link-sta hash table)
+diff --cc net/mac80211/sta_info.h
+index addc78b398f0,218430790660..000000000000
+--- a/net/mac80211/sta_info.h
++++ b/net/mac80211/sta_info.h
+@@@ -484,6 -484,90 +484,93 @@@ struct ieee80211_fragment_cache 
+  #define STA_SLOW_THRESHOLD 6000 /* 6 Mbps */
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * struct link_sta_info - Link STA information
++  * All link specific sta info are stored here for reference. This can be
++  * a single entry for non-MLD STA or multiple entries for MLD STA
++  * @addr: Link MAC address - Can be same as MLD STA mac address and is always
++  *	same for non-MLD STA. This is used as key for searching link STA
++  * @link_id: Link ID uniquely identifying the link STA. This is 0 for non-MLD
++  *	and set to the corresponding vif LinkId for MLD STA
++  * @link_hash_node: hash node for rhashtable
++  * @sta: Points to the STA info
++  * @gtk: group keys negotiated with this station, if any
++  * @tx_stats: TX statistics
++  * @tx_stats.packets: # of packets transmitted
++  * @tx_stats.bytes: # of bytes in all packets transmitted
++  * @tx_stats.last_rate: last TX rate
++  * @tx_stats.msdu: # of transmitted MSDUs per TID
++  * @rx_stats: RX statistics
++  * @rx_stats_avg: averaged RX statistics
++  * @rx_stats_avg.signal: averaged signal
++  * @rx_stats_avg.chain_signal: averaged per-chain signal
++  * @pcpu_rx_stats: per-CPU RX statistics, assigned only if the driver needs
++  *	this (by advertising the USES_RSS hw flag)
++  * @status_stats: TX status statistics
++  * @status_stats.filtered: # of filtered frames
++  * @status_stats.retry_failed: # of frames that failed after retry
++  * @status_stats.retry_count: # of retries attempted
++  * @status_stats.lost_packets: # of lost packets
++  * @status_stats.last_pkt_time: timestamp of last ACKed packet
++  * @status_stats.msdu_retries: # of MSDU retries
++  * @status_stats.msdu_failed: # of failed MSDUs
++  * @status_stats.last_ack: last ack timestamp (jiffies)
++  * @status_stats.last_ack_signal: last ACK signal
++  * @status_stats.ack_signal_filled: last ACK signal validity
++  * @status_stats.avg_ack_signal: average ACK signal
++  * @pub: public (driver visible) link STA data
++  * TODO Move other link params from sta_info as required for MLD operation
++  */
++ struct link_sta_info {
++ 	u8 addr[ETH_ALEN];
++ 	u8 link_id;
++ 
++ 	struct rhlist_head link_hash_node;
++ 
++ 	struct sta_info *sta;
++ 	struct ieee80211_key __rcu *gtk[NUM_DEFAULT_KEYS +
++ 					NUM_DEFAULT_MGMT_KEYS +
++ 					NUM_DEFAULT_BEACON_KEYS];
++ 	struct ieee80211_sta_rx_stats __percpu *pcpu_rx_stats;
++ 
++ 	/* Updated from RX path only, no locking requirements */
++ 	struct ieee80211_sta_rx_stats rx_stats;
++ 	struct {
++ 		struct ewma_signal signal;
++ 		struct ewma_signal chain_signal[IEEE80211_MAX_CHAINS];
++ 	} rx_stats_avg;
++ 
++ 	/* Updated from TX status path only, no locking requirements */
++ 	struct {
++ 		unsigned long filtered;
++ 		unsigned long retry_failed, retry_count;
++ 		unsigned int lost_packets;
++ 		unsigned long last_pkt_time;
++ 		u64 msdu_retries[IEEE80211_NUM_TIDS + 1];
++ 		u64 msdu_failed[IEEE80211_NUM_TIDS + 1];
++ 		unsigned long last_ack;
++ 		s8 last_ack_signal;
++ 		bool ack_signal_filled;
++ 		struct ewma_avg_signal avg_ack_signal;
++ 	} status_stats;
++ 
++ 	/* Updated from TX path only, no locking requirements */
++ 	struct {
++ 		u64 packets[IEEE80211_NUM_ACS];
++ 		u64 bytes[IEEE80211_NUM_ACS];
++ 		struct ieee80211_tx_rate last_rate;
++ 		struct rate_info last_rate_info;
++ 		u64 msdu[IEEE80211_NUM_TIDS + 1];
++ 	} tx_stats;
++ 
++ 	enum ieee80211_sta_rx_bandwidth cur_max_bandwidth;
++ 
++ 	struct ieee80211_link_sta *pub;
++ };
++ 
++ /**
+++>>>>>>> ba6ddab94fc6 (wifi: mac80211: maintain link-sta hash table)
+   * struct sta_info - STA information
+   *
+   * This structure collects information about a station that
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index be4db4fb3d33..b9085c2aa08e 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1343,6 +1343,7 @@ struct ieee80211_local {
+ 	unsigned long num_sta;
+ 	struct list_head sta_list;
+ 	struct rhltable sta_hash;
++	struct rhltable link_sta_hash;
+ 	struct timer_list sta_cleanup;
+ 	int sta_generation;
+ 
+* Unmerged path net/mac80211/sta_info.c
+* Unmerged path net/mac80211/sta_info.h
