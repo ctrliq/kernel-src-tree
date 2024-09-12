@@ -1,0 +1,213 @@
+x86/compressed: Add helper for validating pages in the decompression stage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Brijesh Singh <brijesh.singh@amd.com>
+commit 4f9c403e44e5e88feb27d5e617d1adc9cc7ef684
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/4f9c403e.failed
+
+Many of the integrity guarantees of SEV-SNP are enforced through the
+Reverse Map Table (RMP). Each RMP entry contains the GPA at which a
+particular page of DRAM should be mapped. The VMs can request the
+hypervisor to add pages in the RMP table via the Page State Change
+VMGEXIT defined in the GHCB specification.
+
+Inside each RMP entry is a Validated flag; this flag is automatically
+cleared to 0 by the CPU hardware when a new RMP entry is created for a
+guest. Each VM page can be either validated or invalidated, as indicated
+by the Validated flag in the RMP entry. Memory access to a private page
+that is not validated generates a #VC. A VM must use the PVALIDATE
+instruction to validate a private page before using it.
+
+To maintain the security guarantee of SEV-SNP guests, when transitioning
+pages from private to shared, the guest must invalidate the pages before
+asking the hypervisor to change the page state to shared in the RMP table.
+
+After the pages are mapped private in the page table, the guest must
+issue a page state change VMGEXIT to mark the pages private in the RMP
+table and validate them.
+
+Upon boot, BIOS should have validated the entire system memory.
+During the kernel decompression stage, early_setup_ghcb() uses
+set_page_decrypted() to make the GHCB page shared (i.e. clear encryption
+attribute). And while exiting from the decompression, it calls
+set_page_encrypted() to make the page private.
+
+Add snp_set_page_{private,shared}() helpers that are used by
+set_page_{decrypted,encrypted}() to change the page state in the RMP
+table.
+
+  [ bp: Massage commit message and comments. ]
+
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20220307213356.2797205-16-brijesh.singh@amd.com
+(cherry picked from commit 4f9c403e44e5e88feb27d5e617d1adc9cc7ef684)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/sev.c
+diff --cc arch/x86/boot/compressed/sev.c
+index 213b126ba7e3,5f2c26860df7..000000000000
+--- a/arch/x86/boot/compressed/sev.c
++++ b/arch/x86/boot/compressed/sev.c
+@@@ -117,11 -116,54 +117,61 @@@ static enum es_result vc_read_mem(struc
+  /* Include code for early handlers */
+  #include "../../kernel/sev-shared.c"
+  
+++<<<<<<< HEAD
+ +static bool early_setup_sev_es(void)
+++=======
++ static inline bool sev_snp_enabled(void)
++ {
++ 	return sev_status & MSR_AMD64_SEV_SNP_ENABLED;
++ }
++ 
++ static void __page_state_change(unsigned long paddr, enum psc_op op)
++ {
++ 	u64 val;
++ 
++ 	if (!sev_snp_enabled())
++ 		return;
++ 
++ 	/*
++ 	 * If private -> shared then invalidate the page before requesting the
++ 	 * state change in the RMP table.
++ 	 */
++ 	if (op == SNP_PAGE_STATE_SHARED && pvalidate(paddr, RMP_PG_SIZE_4K, 0))
++ 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PVALIDATE);
++ 
++ 	/* Issue VMGEXIT to change the page state in RMP table. */
++ 	sev_es_wr_ghcb_msr(GHCB_MSR_PSC_REQ_GFN(paddr >> PAGE_SHIFT, op));
++ 	VMGEXIT();
++ 
++ 	/* Read the response of the VMGEXIT. */
++ 	val = sev_es_rd_ghcb_msr();
++ 	if ((GHCB_RESP_CODE(val) != GHCB_MSR_PSC_RESP) || GHCB_MSR_PSC_RESP_VAL(val))
++ 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PSC);
++ 
++ 	/*
++ 	 * Now that page state is changed in the RMP table, validate it so that it is
++ 	 * consistent with the RMP entry.
++ 	 */
++ 	if (op == SNP_PAGE_STATE_PRIVATE && pvalidate(paddr, RMP_PG_SIZE_4K, 1))
++ 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PVALIDATE);
++ }
++ 
++ void snp_set_page_private(unsigned long paddr)
++ {
++ 	__page_state_change(paddr, SNP_PAGE_STATE_PRIVATE);
++ }
++ 
++ void snp_set_page_shared(unsigned long paddr)
++ {
++ 	__page_state_change(paddr, SNP_PAGE_STATE_SHARED);
++ }
++ 
++ static bool early_setup_ghcb(void)
+++>>>>>>> 4f9c403e44e5 (x86/compressed: Add helper for validating pages in the decompression stage)
+  {
+ +	if (!sev_es_negotiate_protocol())
+ +		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_PROT_UNSUPPORTED);
+ +
+  	if (set_page_decrypted((unsigned long)&boot_ghcb_page))
+  		return false;
+  
+diff --git a/arch/x86/boot/compressed/ident_map_64.c b/arch/x86/boot/compressed/ident_map_64.c
+index e8851d437d75..077c00732463 100644
+--- a/arch/x86/boot/compressed/ident_map_64.c
++++ b/arch/x86/boot/compressed/ident_map_64.c
+@@ -285,15 +285,31 @@ static int set_clr_page_flags(struct x86_mapping_info *info,
+ 	 * Changing encryption attributes of a page requires to flush it from
+ 	 * the caches.
+ 	 */
+-	if ((set | clr) & _PAGE_ENC)
++	if ((set | clr) & _PAGE_ENC) {
+ 		clflush_page(address);
+ 
++		/*
++		 * If the encryption attribute is being cleared, change the page state
++		 * to shared in the RMP table.
++		 */
++		if (clr)
++			snp_set_page_shared(__pa(address & PAGE_MASK));
++	}
++
+ 	/* Update PTE */
+ 	pte = *ptep;
+ 	pte = pte_set_flags(pte, set);
+ 	pte = pte_clear_flags(pte, clr);
+ 	set_pte(ptep, pte);
+ 
++	/*
++	 * If the encryption attribute is being set, then change the page state to
++	 * private in the RMP entry. The page state change must be done after the PTE
++	 * is updated.
++	 */
++	if (set & _PAGE_ENC)
++		snp_set_page_private(__pa(address & PAGE_MASK));
++
+ 	/* Flush TLB after changing encryption attribute */
+ 	write_cr3(top_level_pgt);
+ 
+diff --git a/arch/x86/boot/compressed/misc.h b/arch/x86/boot/compressed/misc.h
+index 5bf08eb0ecdc..18c472a56b56 100644
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@ -121,12 +121,16 @@ void set_sev_encryption_mask(void);
+ #ifdef CONFIG_AMD_MEM_ENCRYPT
+ void sev_es_shutdown_ghcb(void);
+ extern bool sev_es_check_ghcb_fault(unsigned long address);
++void snp_set_page_private(unsigned long paddr);
++void snp_set_page_shared(unsigned long paddr);
+ #else
+ static inline void sev_es_shutdown_ghcb(void) { }
+ static inline bool sev_es_check_ghcb_fault(unsigned long address)
+ {
+ 	return false;
+ }
++static inline void snp_set_page_private(unsigned long paddr) { }
++static inline void snp_set_page_shared(unsigned long paddr) { }
+ #endif
+ 
+ /* acpi.c */
+* Unmerged path arch/x86/boot/compressed/sev.c
+diff --git a/arch/x86/include/asm/sev-common.h b/arch/x86/include/asm/sev-common.h
+index 94f0ea574049..c5dd1bd79083 100644
+--- a/arch/x86/include/asm/sev-common.h
++++ b/arch/x86/include/asm/sev-common.h
+@@ -57,6 +57,32 @@
+ #define GHCB_MSR_AP_RESET_HOLD_REQ	0x006
+ #define GHCB_MSR_AP_RESET_HOLD_RESP	0x007
+ 
++/*
++ * SNP Page State Change Operation
++ *
++ * GHCBData[55:52] - Page operation:
++ *   0x0001	Page assignment, Private
++ *   0x0002	Page assignment, Shared
++ */
++enum psc_op {
++	SNP_PAGE_STATE_PRIVATE = 1,
++	SNP_PAGE_STATE_SHARED,
++};
++
++#define GHCB_MSR_PSC_REQ		0x014
++#define GHCB_MSR_PSC_REQ_GFN(gfn, op)			\
++	/* GHCBData[55:52] */				\
++	(((u64)((op) & 0xf) << 52) |			\
++	/* GHCBData[51:12] */				\
++	((u64)((gfn) & GENMASK_ULL(39, 0)) << 12) |	\
++	/* GHCBData[11:0] */				\
++	GHCB_MSR_PSC_REQ)
++
++#define GHCB_MSR_PSC_RESP		0x015
++#define GHCB_MSR_PSC_RESP_VAL(val)			\
++	/* GHCBData[63:32] */				\
++	(((u64)(val) & GENMASK_ULL(63, 32)) >> 32)
++
+ /* GHCB Hypervisor Feature Request/Response */
+ #define GHCB_MSR_HV_FT_REQ		0x080
+ #define GHCB_MSR_HV_FT_RESP		0x081
