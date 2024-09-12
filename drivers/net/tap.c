@@ -362,7 +362,7 @@ rx_handler_result_t tap_handle_frame(struct sk_buff **pskb)
 			segs->next = NULL;
 			if (ptr_ring_produce(&q->ring, segs)) {
 				drop_reason = SKB_DROP_REASON_FULL_RING;
-				kfree_skb_reason(skb, drop_reason);
+				kfree_skb_reason(segs, drop_reason);
 				kfree_skb_list_reason(nskb, drop_reason);
 				break;
 			}

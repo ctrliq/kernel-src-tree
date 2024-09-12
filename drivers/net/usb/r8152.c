@@ -6836,7 +6836,7 @@ static int rtl8152_probe(struct usb_interface *intf,
 	set_ethernet_addr(tp);
 
 	usb_set_intfdata(intf, tp);
-	netif_napi_add(netdev, &tp->napi, r8152_poll, RTL8152_NAPI_WEIGHT);
+	netif_napi_add_weight(netdev, &tp->napi, r8152_poll, RTL8152_NAPI_WEIGHT);
 
 	ret = register_netdev(netdev);
 	if (ret != 0) {

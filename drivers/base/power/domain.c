@@ -514,6 +514,7 @@ static int _genpd_power_on(struct generic_pm_domain *genpd, bool timed)
 	if (!genpd->power_on)
 		goto out;
 
+	timed = timed && genpd->gd && !genpd->states[state_idx].fwnode;
 	if (!timed) {
 		ret = genpd->power_on(genpd);
 		if (ret)
@@ -532,7 +533,7 @@ static int _genpd_power_on(struct generic_pm_domain *genpd, bool timed)
 		goto out;
 
 	genpd->states[state_idx].power_on_latency_ns = elapsed_ns;
-	genpd->max_off_time_changed = true;
+	genpd->gd->max_off_time_changed = true;
 	pr_debug("%s: Power-%s latency exceeded, new value %lld ns\n",
 		 genpd->name, "on", elapsed_ns);
 
@@ -563,6 +564,7 @@ static int _genpd_power_off(struct generic_pm_domain *genpd, bool timed)
 	if (!genpd->power_off)
 		goto out;
 
+	timed = timed && genpd->gd && !genpd->states[state_idx].fwnode;
 	if (!timed) {
 		ret = genpd->power_off(genpd);
 		if (ret)
@@ -581,7 +583,7 @@ static int _genpd_power_off(struct generic_pm_domain *genpd, bool timed)
 		goto out;
 
 	genpd->states[state_idx].power_off_latency_ns = elapsed_ns;
-	genpd->max_off_time_changed = true;
+	genpd->gd->max_off_time_changed = true;
 	pr_debug("%s: Power-%s latency exceeded, new value %lld ns\n",
 		 genpd->name, "off", elapsed_ns);
 
@@ -773,7 +775,7 @@ static int genpd_dev_pm_qos_notifier(struct notifier_block *nb,
 	dev = gpd_data->base.dev;
 
 	for (;;) {
-		struct generic_pm_domain *genpd;
+		struct generic_pm_domain *genpd = ERR_PTR(-ENODATA);
 		struct pm_domain_data *pdd;
 		struct gpd_timing_data *td;
 
@@ -783,18 +785,17 @@ static int genpd_dev_pm_qos_notifier(struct notifier_block *nb,
 				dev->power.subsys_data->domain_data : NULL;
 		if (pdd) {
 			td = to_gpd_data(pdd)->td;
-			if (td)
+			if (td) {
 				td->constraint_changed = true;
-			genpd = dev_to_genpd(dev);
-		} else {
-			genpd = ERR_PTR(-ENODATA);
+				genpd = dev_to_genpd(dev);
+			}
 		}
 
 		spin_unlock_irq(&dev->power.lock);
 
 		if (!IS_ERR(genpd)) {
 			genpd_lock(genpd);
-			genpd->max_off_time_changed = true;
+			genpd->gd->max_off_time_changed = true;
 			genpd_unlock(genpd);
 		}
 
@@ -923,7 +924,7 @@ static int genpd_runtime_suspend(struct device *dev)
 			td->suspend_latency_ns = elapsed_ns;
 			dev_dbg(dev, "suspend latency exceeded, %lld ns\n",
 				elapsed_ns);
-			genpd->max_off_time_changed = true;
+			genpd->gd->max_off_time_changed = true;
 			td->constraint_changed = true;
 		}
 	}
@@ -1003,7 +1004,7 @@ static int genpd_runtime_resume(struct device *dev)
 			td->resume_latency_ns = elapsed_ns;
 			dev_dbg(dev, "resume latency exceeded, %lld ns\n",
 				elapsed_ns);
-			genpd->max_off_time_changed = true;
+			genpd->gd->max_off_time_changed = true;
 			td->constraint_changed = true;
 		}
 	}
@@ -1642,6 +1643,7 @@ static int genpd_get_cpu(struct generic_pm_domain *genpd, struct device *dev)
 static int genpd_add_device(struct generic_pm_domain *genpd, struct device *dev,
 			    struct device *base_dev)
 {
+	struct genpd_governor_data *gd = genpd->gd;
 	struct generic_pm_domain_data *gpd_data;
 	int ret;
 
@@ -1650,7 +1652,7 @@ static int genpd_add_device(struct generic_pm_domain *genpd, struct device *dev,
 	if (IS_ERR_OR_NULL(genpd) || IS_ERR_OR_NULL(dev))
 		return -EINVAL;
 
-	gpd_data = genpd_alloc_dev_data(dev, genpd->gov);
+	gpd_data = genpd_alloc_dev_data(dev, gd);
 	if (IS_ERR(gpd_data))
 		return PTR_ERR(gpd_data);
 
@@ -1666,7 +1668,8 @@ static int genpd_add_device(struct generic_pm_domain *genpd, struct device *dev,
 	dev_pm_domain_set(dev, &genpd->domain);
 
 	genpd->device_count++;
-	genpd->max_off_time_changed = true;
+	if (gd)
+		gd->max_off_time_changed = true;
 
 	list_add_tail(&gpd_data->base.list_node, &genpd->dev_list);
 
@@ -1720,7 +1723,8 @@ static int genpd_remove_device(struct generic_pm_domain *genpd,
 	}
 
 	genpd->device_count--;
-	genpd->max_off_time_changed = true;
+	if (genpd->gd)
+		genpd->gd->max_off_time_changed = true;
 
 	genpd_clear_cpumask(genpd, gpd_data->cpu);
 	dev_pm_domain_set(dev, NULL);
@@ -1993,6 +1997,53 @@ static int genpd_set_default_power_state(struct generic_pm_domain *genpd)
 	return 0;
 }
 
+static int genpd_alloc_data(struct generic_pm_domain *genpd)
+{
+	struct genpd_governor_data *gd = NULL;
+	int ret;
+
+	if (genpd_is_cpu_domain(genpd) &&
+	    !zalloc_cpumask_var(&genpd->cpus, GFP_KERNEL))
+		return -ENOMEM;
+
+	if (genpd->gov) {
+		gd = kzalloc(sizeof(*gd), GFP_KERNEL);
+		if (!gd) {
+			ret = -ENOMEM;
+			goto free;
+		}
+
+		gd->max_off_time_ns = -1;
+		gd->max_off_time_changed = true;
+		gd->next_wakeup = KTIME_MAX;
+	}
+
+	/* Use only one "off" state if there were no states declared */
+	if (genpd->state_count == 0) {
+		ret = genpd_set_default_power_state(genpd);
+		if (ret)
+			goto free;
+	}
+
+	genpd->gd = gd;
+	return 0;
+
+free:
+	if (genpd_is_cpu_domain(genpd))
+		free_cpumask_var(genpd->cpus);
+	kfree(gd);
+	return ret;
+}
+
+static void genpd_free_data(struct generic_pm_domain *genpd)
+{
+	if (genpd_is_cpu_domain(genpd))
+		free_cpumask_var(genpd->cpus);
+	if (genpd->free_states)
+		genpd->free_states(genpd->states, genpd->state_count);
+	kfree(genpd->gd);
+}
+
 static void genpd_lock_init(struct generic_pm_domain *genpd)
 {
 	if (genpd->flags & GENPD_FLAG_IRQ_SAFE) {
@@ -2030,9 +2081,6 @@ int pm_genpd_init(struct generic_pm_domain *genpd,
 	atomic_set(&genpd->sd_count, 0);
 	genpd->status = is_off ? GENPD_STATE_OFF : GENPD_STATE_ON;
 	genpd->device_count = 0;
-	genpd->max_off_time_ns = -1;
-	genpd->max_off_time_changed = true;
-	genpd->next_wakeup = KTIME_MAX;
 	genpd->provider = NULL;
 	genpd->has_provider = false;
 	genpd->accounting_time = ktime_get_mono_fast_ns();
@@ -2061,21 +2109,13 @@ int pm_genpd_init(struct generic_pm_domain *genpd,
 			!genpd_status_on(genpd))
 		return -EINVAL;
 
-	if (genpd_is_cpu_domain(genpd) &&
-	    !zalloc_cpumask_var(&genpd->cpus, GFP_KERNEL))
-		return -ENOMEM;
-
-	/* Use only one "off" state if there were no states declared */
-	if (genpd->state_count == 0) {
-		ret = genpd_set_default_power_state(genpd);
-		if (ret) {
-			if (genpd_is_cpu_domain(genpd))
-				free_cpumask_var(genpd->cpus);
-			return ret;
-		}
-	} else if (!gov && genpd->state_count > 1) {
+	/* Multiple states but no governor doesn't make sense. */
+	if (!gov && genpd->state_count > 1)
 		pr_warn("%s : no governor for states\n", genpd->name);
-	}
+
+	ret = genpd_alloc_data(genpd);
+	if (ret)
+		return ret;
 
 	device_initialize(&genpd->dev);
 	dev_set_name(&genpd->dev, "%s", genpd->name);
@@ -2120,10 +2160,7 @@ static int genpd_remove(struct generic_pm_domain *genpd)
 	genpd_unlock(genpd);
 	genpd_debug_remove(genpd);
 	cancel_work_sync(&genpd->power_off_work);
-	if (genpd_is_cpu_domain(genpd))
-		free_cpumask_var(genpd->cpus);
-	if (genpd->free_states)
-		genpd->free_states(genpd->states, genpd->state_count);
+	genpd_free_data(genpd);
 
 	pr_debug("%s: removed %s\n", __func__, genpd->name);
 

@@ -240,7 +240,10 @@ syscall_return_via_sysret:
 
 	popq	%rdi
 	popq	%rsp
+
+SYM_INNER_LABEL(entry_SYSRETQ_unsafe_stack, SYM_L_GLOBAL)
 	USERGS_SYSRET64
+SYM_INNER_LABEL(entry_SYSRETQ_end, SYM_L_GLOBAL)
 SYM_CODE_END(entry_SYSCALL_64)
 
 /*
@@ -1052,6 +1055,9 @@ idtentry coprocessor_error		do_coprocessor_error		has_error_code=0
 idtentry alignment_check		do_alignment_check		has_error_code=1
 idtentry simd_coprocessor_error		do_simd_coprocessor_error	has_error_code=0
 idtentry_vc vmm_communication		do_vmm_communication
+#ifdef CONFIG_INTEL_TDX_GUEST
+idtentry virtualization_exception	do_virtualization_exception	has_error_code=0
+#endif
 
 	/*
 	 * Reload gs selector with exception handling

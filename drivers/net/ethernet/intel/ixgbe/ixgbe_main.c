@@ -1810,7 +1810,7 @@ static void ixgbe_pull_tail(struct ixgbe_ring *rx_ring,
 
 	/* update all of the pointers */
 	skb_frag_size_sub(frag, pull_len);
-	frag->page_offset += pull_len;
+	skb_frag_off_add(frag, pull_len);
 	skb->data_len -= pull_len;
 	skb->tail += pull_len;
 }
@@ -1842,7 +1842,7 @@ static void ixgbe_dma_sync_frag(struct ixgbe_ring *rx_ring,
 
 		dma_sync_single_range_for_cpu(rx_ring->dev,
 					      IXGBE_CB(skb)->dma,
-					      frag->page_offset,
+					      skb_frag_off(frag),
 					      skb_frag_size(frag),
 					      DMA_FROM_DEVICE);
 	}
@@ -8892,7 +8892,7 @@ static int ixgbe_set_mac(struct net_device *netdev, void *p)
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
 
-	memcpy(netdev->dev_addr, addr->sa_data, netdev->addr_len);
+	eth_hw_addr_set(netdev, addr->sa_data);
 	memcpy(hw->mac.addr, addr->sa_data, netdev->addr_len);
 
 	ixgbe_mac_set_default_filter(adapter);
@@ -10826,7 +10826,7 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	netdev->netdev_ops = &ixgbe_netdev_ops;
 	ixgbe_set_ethtool_ops(netdev);
 	netdev->watchdog_timeo = 5 * HZ;
-	strlcpy(netdev->name, pci_name(pdev), sizeof(netdev->name));
+	strscpy(netdev->name, pci_name(pdev), sizeof(netdev->name));
 
 	/* Setup hw api */
 	hw->mac.ops   = *ii->mac_ops;
@@ -11045,7 +11045,7 @@ skip_sriov:
 	eth_platform_get_mac_address(&adapter->pdev->dev,
 				     adapter->hw.mac.perm_addr);
 
-	memcpy(netdev->dev_addr, hw->mac.perm_addr, netdev->addr_len);
+	eth_hw_addr_set(netdev, hw->mac.perm_addr);
 
 	if (!is_valid_ether_addr(netdev->dev_addr)) {
 		e_dev_err("invalid MAC address\n");
@@ -11117,7 +11117,7 @@ skip_sriov:
 
 	err = ixgbe_read_pba_string_generic(hw, part_str, sizeof(part_str));
 	if (err)
-		strlcpy(part_str, "Unknown", sizeof(part_str));
+		strscpy(part_str, "Unknown", sizeof(part_str));
 	if (ixgbe_is_sfp(hw) && hw->phy.sfp_type != ixgbe_sfp_type_not_present)
 		e_dev_info("MAC: %d, PHY: %d, SFP+: %d, PBA No: %s\n",
 			   hw->mac.type, hw->phy.type, hw->phy.sfp_type,

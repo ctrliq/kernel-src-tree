@@ -10,7 +10,7 @@
 #include "intel_huc.h"
 #include "i915_drv.h"
 
-#include <linux/device/bus.h>
+#include <linux/device.h>
 #include <linux/mei_aux.h>
 
 /**

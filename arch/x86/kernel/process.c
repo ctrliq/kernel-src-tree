@@ -44,6 +44,7 @@
 #include <asm/prctl.h>
 #include <asm/spec-ctrl.h>
 #include <asm/proto.h>
+#include <asm/tdx.h>
 
 #include "process.h"
 
@@ -862,6 +863,9 @@ void select_idle_routine(const struct cpuinfo_x86 *c)
 	} else if (prefer_mwait_c1_over_halt(c)) {
 		pr_info("using mwait in idle threads\n");
 		x86_idle = mwait_idle;
+	} else if (cpu_feature_enabled(X86_FEATURE_TDX_GUEST)) {
+		pr_info("using TDX aware idle routine\n");
+		x86_idle = tdx_safe_halt;
 	} else
 		x86_idle = default_idle;
 }

@@ -297,6 +297,9 @@ static int __test_hash(struct crypto_ahash *tfm,
 
 	j = 0;
 	for (i = 0; i < tcount; i++) {
+		if (fips_enabled && template[i].fips_skip)
+			continue;
+
 		if (template[i].np)
 			continue;
 
@@ -389,6 +392,9 @@ static int __test_hash(struct crypto_ahash *tfm,
 		if (align_offset != 0)
 			break;
 
+		if (fips_enabled && template[i].fips_skip)
+			continue;
+
 		if (!template[i].np)
 			continue;
 
@@ -454,6 +460,9 @@ static int __test_hash(struct crypto_ahash *tfm,
 		/* alignment tests are only done with continuous buffers */
 		if (align_offset != 0)
 			break;
+
+		if (fips_enabled && template[i].fips_skip)
+			continue;
 
 		if (template[i].np < 2)
 			continue;

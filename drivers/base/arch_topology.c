@@ -536,7 +536,7 @@ const struct cpumask *cpu_clustergroup_mask(int cpu)
 	 */
 	if (cpumask_subset(cpu_coregroup_mask(cpu),
 			   &cpu_topology[cpu].cluster_sibling))
-		return cpu_smt_mask(cpu);
+		return topology_sibling_cpumask(cpu);
 
 	return &cpu_topology[cpu].cluster_sibling;
 }

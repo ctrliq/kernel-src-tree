@@ -152,7 +152,7 @@ int mana_gd_send_request(struct gdma_context *gc, u32 req_len, const void *req,
 
 	return mana_hwc_send_request(hwc, req_len, req, resp_len, resp);
 }
-EXPORT_SYMBOL_NS(mana_gd_send_request, NET_MANA);
+EXPORT_SYMBOL(mana_gd_send_request);
 
 int mana_gd_alloc_memory(struct gdma_context *gc, unsigned int length,
 			 struct gdma_mem_info *gmi)
@@ -694,7 +694,7 @@ int mana_gd_destroy_dma_region(struct gdma_context *gc,
 
 	return 0;
 }
-EXPORT_SYMBOL_NS(mana_gd_destroy_dma_region, NET_MANA);
+EXPORT_SYMBOL(mana_gd_destroy_dma_region);
 
 static int mana_gd_create_dma_region(struct gdma_dev *gd,
 				     struct gdma_mem_info *gmi)

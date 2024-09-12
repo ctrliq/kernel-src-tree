@@ -651,7 +651,7 @@ void mana_uncfg_vport(struct mana_port_context *apc)
 	WARN_ON(apc->vport_use_count < 0);
 	mutex_unlock(&apc->vport_mutex);
 }
-EXPORT_SYMBOL_NS(mana_uncfg_vport, NET_MANA);
+EXPORT_SYMBOL(mana_uncfg_vport);
 
 int mana_cfg_vport(struct mana_port_context *apc, u32 protection_dom_id,
 		   u32 doorbell_pg_id)
@@ -721,7 +721,7 @@ out:
 
 	return err;
 }
-EXPORT_SYMBOL_NS(mana_cfg_vport, NET_MANA);
+EXPORT_SYMBOL(mana_cfg_vport);
 
 static int mana_cfg_vport_steering(struct mana_port_context *apc,
 				   enum TRI_STATE rx,
@@ -843,7 +843,7 @@ int mana_create_wq_obj(struct mana_port_context *apc,
 out:
 	return err;
 }
-EXPORT_SYMBOL_NS(mana_create_wq_obj, NET_MANA);
+EXPORT_SYMBOL(mana_create_wq_obj);
 
 void mana_destroy_wq_obj(struct mana_port_context *apc, u32 wq_type,
 			 mana_handle_t wq_obj)
@@ -871,7 +871,7 @@ void mana_destroy_wq_obj(struct mana_port_context *apc, u32 wq_type,
 		netdev_err(ndev, "Failed to destroy WQ object: %d, 0x%x\n", err,
 			   resp.hdr.status);
 }
-EXPORT_SYMBOL_NS(mana_destroy_wq_obj, NET_MANA);
+EXPORT_SYMBOL(mana_destroy_wq_obj);
 
 static void mana_destroy_eq(struct mana_context *ac)
 {
@@ -1561,7 +1561,7 @@ static int mana_create_txq(struct mana_port_context *apc,
 
 		gc->cq_table[cq->gdma_id] = cq->gdma_cq;
 
-		netif_tx_napi_add(net, &cq->napi, mana_poll, NAPI_POLL_WEIGHT);
+		netif_napi_add_tx(net, &cq->napi, mana_poll);
 		napi_enable(&cq->napi);
 
 		mana_gd_ring_cq(cq->gdma_cq, SET_ARM_BIT);
@@ -1792,7 +1792,7 @@ static struct mana_rxq *mana_create_rxq(struct mana_port_context *apc,
 
 	gc->cq_table[cq->gdma_id] = cq->gdma_cq;
 
-	netif_napi_add(ndev, &cq->napi, mana_poll, 1);
+	netif_napi_add_weight(ndev, &cq->napi, mana_poll, 1);
 
 	WARN_ON(xdp_rxq_info_reg(&rxq->xdp_rxq, ndev, rxq_idx,
 				 cq->napi.napi_id));

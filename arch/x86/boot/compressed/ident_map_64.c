@@ -110,6 +110,7 @@ void kernel_add_identity_map(unsigned long start, unsigned long end)
 void initialize_identity_maps(void *rmode)
 {
 	unsigned long cmdline;
+	struct setup_data *sd;
 
 	/* Exclude the encryption mask from __PHYSICAL_MASK */
 	physical_mask &= ~sme_me_mask;
@@ -163,8 +164,21 @@ void initialize_identity_maps(void *rmode)
 	cmdline = get_cmd_line_ptr();
 	kernel_add_identity_map(cmdline, cmdline + COMMAND_LINE_SIZE);
 
+	/*
+	 * Also map the setup_data entries passed via boot_params in case they
+	 * need to be accessed by uncompressed kernel via the identity mapping.
+	 */
+	sd = (struct setup_data *)boot_params->hdr.setup_data;
+	while (sd) {
+		unsigned long sd_addr = (unsigned long)sd;
+
+		kernel_add_identity_map(sd_addr, sd_addr + sizeof(*sd) + sd->len);
+		sd = (struct setup_data *)sd->next;
+	}
+
+	sev_prep_identity_maps(top_level_pgt);
+
 	/* Load the new page-table. */
-	sev_verify_cbit(top_level_pgt);
 	write_cr3(top_level_pgt);
 }
 
@@ -285,14 +299,30 @@ static int set_clr_page_flags(struct x86_mapping_info *info,
 	 * Changing encryption attributes of a page requires to flush it from
 	 * the caches.
 	 */
-	if ((set | clr) & _PAGE_ENC)
+	if ((set | clr) & _PAGE_ENC) {
 		clflush_page(address);
+
+		/*
+		 * If the encryption attribute is being cleared, change the page state
+		 * to shared in the RMP table.
+		 */
+		if (clr)
+			snp_set_page_shared(__pa(address & PAGE_MASK));
+	}
 
 	/* Update PTE */
 	pte = *ptep;
 	pte = pte_set_flags(pte, set);
 	pte = pte_clear_flags(pte, clr);
 	set_pte(ptep, pte);
+
+	/*
+	 * If the encryption attribute is being set, then change the page state to
+	 * private in the RMP entry. The page state change must be done after the PTE
+	 * is updated.
+	 */
+	if (set & _PAGE_ENC)
+		snp_set_page_private(__pa(address & PAGE_MASK));
 
 	/* Flush TLB after changing encryption attribute */
 	write_cr3(top_level_pgt);

@@ -18,8 +18,6 @@
 #include "ixgbe_phy.h"
 
 
-#define IXGBE_ALL_RAR_ENTRIES 16
-
 enum {NETDEV_STATS, IXGBE_STATS};
 
 struct ixgbe_stats {
@@ -469,9 +467,8 @@ static int ixgbe_set_link_ksettings(struct net_device *netdev,
 		 * this function does not support duplex forcing, but can
 		 * limit the advertising of the adapter to the specified speed
 		 */
-		if (!bitmap_subset(cmd->link_modes.advertising,
-				   cmd->link_modes.supported,
-				   __ETHTOOL_LINK_MODE_MASK_NBITS))
+		if (!linkmode_subset(cmd->link_modes.advertising,
+				     cmd->link_modes.supported))
 			return -EINVAL;
 
 		/* only allow one speed at a time if no autoneg */
@@ -1109,12 +1106,12 @@ static void ixgbe_get_drvinfo(struct net_device *netdev,
 {
 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
 
-	strlcpy(drvinfo->driver, ixgbe_driver_name, sizeof(drvinfo->driver));
+	strscpy(drvinfo->driver, ixgbe_driver_name, sizeof(drvinfo->driver));
 
-	strlcpy(drvinfo->fw_version, adapter->eeprom_id,
+	strscpy(drvinfo->fw_version, adapter->eeprom_id,
 		sizeof(drvinfo->fw_version));
 
-	strlcpy(drvinfo->bus_info, pci_name(adapter->pdev),
+	strscpy(drvinfo->bus_info, pci_name(adapter->pdev),
 		sizeof(drvinfo->bus_info));
 
 	drvinfo->n_priv_flags = IXGBE_PRIV_FLAGS_STR_LEN;

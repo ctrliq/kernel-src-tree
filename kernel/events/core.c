@@ -13415,3 +13415,10 @@ struct cgroup_subsys perf_event_cgrp_subsys = {
 	.threaded	= true,
 };
 #endif /* CONFIG_CGROUP_PERF */
+
+static int perf_snapshot_branch_stack_stub(struct perf_branch_entry *entries, unsigned int cnt)
+{
+	return 0;
+}
+
+DEFINE_STATIC_CALL(perf_snapshot_branch_stack, perf_snapshot_branch_stack_stub);

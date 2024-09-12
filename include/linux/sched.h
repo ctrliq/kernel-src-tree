@@ -921,7 +921,10 @@ struct task_struct {
 #ifdef CONFIG_IOMMU_SVA
 	RH_KABI_FILL_HOLE(unsigned	pasid_activated:1)
 #endif
-
+#ifdef CONFIG_TASK_DELAY_ACCT
+	/* delay due to memory thrashing */
+	RH_KABI_FILL_HOLE(unsigned	in_thrashing:1)
+#endif
 	unsigned long			atomic_flags; /* Flags requiring atomic access. */
 
 	struct restart_block		restart_block;
