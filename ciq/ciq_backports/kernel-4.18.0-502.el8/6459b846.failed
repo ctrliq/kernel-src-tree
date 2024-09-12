@@ -1,0 +1,195 @@
+arm64: entry: consolidate Cortex-A76 erratum 1463225 workaround
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit 6459b8469753e9feaa8b34691d097cffad905931
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/6459b846.failed
+
+The workaround for Cortex-A76 erratum 1463225 is split across the
+syscall and debug handlers in separate files. This structure currently
+forces us to do some redundant work for debug exceptions from EL0, is a
+little difficult to follow, and gets in the way of some future rework of
+the exception entry code as it requires exceptions to be unmasked late
+in the syscall handling path.
+
+To simplify things, and as a preparatory step for future rework of
+exception entry, this patch moves all the workaround logic into
+entry-common.c. As the debug handler only needs to run for EL1 debug
+exceptions, we no longer call it for EL0 debug exceptions, and no longer
+need to check user_mode(regs) as this is always false. For clarity
+cortex_a76_erratum_1463225_debug_handler() is changed to return bool.
+
+In the SVC path, the workaround is applied earlier, but this should have
+no functional impact as exceptions are still masked. In the debug path
+we run the fixup before explicitly disabling preemption, but we will not
+attempt to preempt before returning from the exception.
+
+There should be no functional change as a result of this patch.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20210202120341.28858-1-mark.rutland@arm.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 6459b8469753e9feaa8b34691d097cffad905931)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/entry-common.c
+#	arch/arm64/kernel/syscall.c
+diff --cc arch/arm64/kernel/entry-common.c
+index c764ba2d11d7,9d3588450473..000000000000
+--- a/arch/arm64/kernel/entry-common.c
++++ b/arch/arm64/kernel/entry-common.c
+@@@ -132,7 -234,10 +181,14 @@@ static void noinstr el1_dbg(struct pt_r
+  	if (system_uses_irq_prio_masking())
+  		gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
+  
+++<<<<<<< HEAD
+ +	do_debug_exception(far, esr, regs);
+++=======
++ 	arm64_enter_el1_dbg(regs);
++ 	if (!cortex_a76_erratum_1463225_debug_handler(regs))
++ 		do_debug_exception(far, esr, regs);
++ 	arm64_exit_el1_dbg(regs);
+++>>>>>>> 6459b8469753 (arm64: entry: consolidate Cortex-A76 erratum 1463225 workaround)
+  }
+  
+  static void noinstr el1_fpac(struct pt_regs *regs, unsigned long esr)
+@@@ -291,6 -411,8 +347,11 @@@ static void noinstr el0_svc(struct pt_r
+  	if (system_uses_irq_prio_masking())
+  		gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
+  
+++<<<<<<< HEAD
+++=======
++ 	enter_from_user_mode();
++ 	cortex_a76_erratum_1463225_svc_handler();
+++>>>>>>> 6459b8469753 (arm64: entry: consolidate Cortex-A76 erratum 1463225 workaround)
+  	do_el0_svc(regs);
+  }
+  
+@@@ -367,6 -489,8 +428,11 @@@ static void noinstr el0_svc_compat(stru
+  	if (system_uses_irq_prio_masking())
+  		gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
+  
+++<<<<<<< HEAD
+++=======
++ 	enter_from_user_mode();
++ 	cortex_a76_erratum_1463225_svc_handler();
+++>>>>>>> 6459b8469753 (arm64: entry: consolidate Cortex-A76 erratum 1463225 workaround)
+  	do_el0_svc_compat(regs);
+  }
+  
+diff --cc arch/arm64/kernel/syscall.c
+index 5327f6c82832,b9cf12b271d7..000000000000
+--- a/arch/arm64/kernel/syscall.c
++++ b/arch/arm64/kernel/syscall.c
+@@@ -116,12 -91,34 +87,15 @@@ static void el0_svc_common(struct pt_re
+  	 * (Similarly for HVC and SMC elsewhere.)
+  	 */
+  
+++<<<<<<< HEAD
+ +	cortex_a76_erratum_1463225_svc_handler();
+ +	user_exit_irqoff();
+++=======
+++>>>>>>> 6459b8469753 (arm64: entry: consolidate Cortex-A76 erratum 1463225 workaround)
+  	local_daif_restore(DAIF_PROCCTX);
+  
+ -	if (flags & _TIF_MTE_ASYNC_FAULT) {
+ -		/*
+ -		 * Process the asynchronous tag check fault before the actual
+ -		 * syscall. do_notify_resume() will send a signal to userspace
+ -		 * before the syscall is restarted.
+ -		 */
+ -		regs->regs[0] = -ERESTARTNOINTR;
+ -		return;
+ -	}
+ -
+  	if (has_syscall_work(flags)) {
+ -		/*
+ -		 * The de-facto standard way to skip a system call using ptrace
+ -		 * is to set the system call to -1 (NO_SYSCALL) and set x0 to a
+ -		 * suitable error code for consumption by userspace. However,
+ -		 * this cannot be distinguished from a user-issued syscall(-1)
+ -		 * and so we must set x0 to -ENOSYS here in case the tracer doesn't
+ -		 * issue the skip and we fall into trace_exit with x0 preserved.
+ -		 *
+ -		 * This is slightly odd because it also means that if a tracer
+ -		 * sets the system call number to -1 but does not initialise x0,
+ -		 * then x0 will be preserved for all system calls apart from a
+ -		 * user-issued syscall(-1). However, requesting a skip and not
+ -		 * setting the return value is unlikely to do anything sensible
+ -		 * anyway.
+ -		 */
+ +		/* set default errno for user-issued syscall(-1) */
+  		if (scno == NO_SYSCALL)
+  			regs->regs[0] = -ENOSYS;
+  		scno = syscall_trace_enter(regs);
+diff --git a/arch/arm64/kernel/cpu_errata.c b/arch/arm64/kernel/cpu_errata.c
+index 061de6c63604..795e121c8eea 100644
+--- a/arch/arm64/kernel/cpu_errata.c
++++ b/arch/arm64/kernel/cpu_errata.c
+@@ -493,8 +493,6 @@ static const struct midr_range arm64_ssb_cpus[] = {
+ };
+ 
+ #ifdef CONFIG_ARM64_ERRATUM_1463225
+-DEFINE_PER_CPU(int, __in_cortex_a76_erratum_1463225_wa);
+-
+ static bool
+ has_cortex_a76_erratum_1463225(const struct arm64_cpu_capabilities *entry,
+ 			       int scope)
+* Unmerged path arch/arm64/kernel/entry-common.c
+* Unmerged path arch/arm64/kernel/syscall.c
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 464083ad510b..d90ad9621d54 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -847,44 +847,12 @@ static void debug_exception_exit(struct pt_regs *regs)
+ }
+ NOKPROBE_SYMBOL(debug_exception_exit);
+ 
+-#ifdef CONFIG_ARM64_ERRATUM_1463225
+-DECLARE_PER_CPU(int, __in_cortex_a76_erratum_1463225_wa);
+-
+-static int cortex_a76_erratum_1463225_debug_handler(struct pt_regs *regs)
+-{
+-	if (user_mode(regs))
+-		return 0;
+-
+-	if (!__this_cpu_read(__in_cortex_a76_erratum_1463225_wa))
+-		return 0;
+-
+-	/*
+-	 * We've taken a dummy step exception from the kernel to ensure
+-	 * that interrupts are re-enabled on the syscall path. Return back
+-	 * to cortex_a76_erratum_1463225_svc_handler() with debug exceptions
+-	 * masked so that we can safely restore the mdscr and get on with
+-	 * handling the syscall.
+-	 */
+-	regs->pstate |= PSR_D_BIT;
+-	return 1;
+-}
+-#else
+-static int cortex_a76_erratum_1463225_debug_handler(struct pt_regs *regs)
+-{
+-	return 0;
+-}
+-#endif /* CONFIG_ARM64_ERRATUM_1463225 */
+-NOKPROBE_SYMBOL(cortex_a76_erratum_1463225_debug_handler);
+-
+ void do_debug_exception(unsigned long addr_if_watchpoint, unsigned int esr,
+ 			struct pt_regs *regs)
+ {
+ 	const struct fault_info *inf = esr_to_debug_fault_info(esr);
+ 	unsigned long pc = instruction_pointer(regs);
+ 
+-	if (cortex_a76_erratum_1463225_debug_handler(regs))
+-		return;
+-
+ 	debug_exception_enter(regs);
+ 
+ 	if (user_mode(regs) && !is_ttbr0_addr(pc))
