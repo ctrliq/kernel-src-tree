@@ -1,0 +1,137 @@
+wifi: mac80211: mlme: look up beacon elems only if needed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 74e1309acedc1f091722f33e752aeb87d4ed4c33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/74e1309a.failed
+
+If NEED_DTIM_BEFORE_ASSOC isn't set, then we don't need
+to enter an RCU critical section and look up the beacon
+elements.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 74e1309acedc1f091722f33e752aeb87d4ed4c33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/mlme.c
+diff --cc net/mac80211/mlme.c
+index 446accddbebd,059b66d158ff..000000000000
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@@ -5909,12 -6270,12 +5909,19 @@@ int ieee80211_mgd_assoc(struct ieee8021
+  	struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
+  	struct ieee80211_bss *bss = (void *)req->bss->priv;
+  	struct ieee80211_mgd_assoc_data *assoc_data;
+++<<<<<<< HEAD
+ +	const struct cfg80211_bss_ies *beacon_ies;
+ +	struct ieee80211_supported_band *sband;
+ +	struct ieee80211_bss_conf *bss_conf = &sdata->vif.bss_conf;
+ +	const struct element *ssid_elem, *ht_elem, *vht_elem;
+++=======
++ 	struct ieee80211_vif_cfg *vif_cfg = &sdata->vif.cfg;
++ 	const struct element *ssid_elem;
++ 	struct ieee80211_link_data *link = &sdata->deflink;
++ 	ieee80211_conn_flags_t conn_flags = 0;
+++>>>>>>> 74e1309acedc (wifi: mac80211: mlme: look up beacon elems only if needed)
+  	int i, err;
+ -	bool override;
+ +	bool override = false;
+  
+  	assoc_data = kzalloc(sizeof(*assoc_data) + req->ie_len, GFP_KERNEL);
+  	if (!assoc_data)
+@@@ -6157,66 -6478,34 +6164,83 @@@
+  	if (err)
+  		goto err_clear;
+  
+ -	if (link->u.mgd.req_smps == IEEE80211_SMPS_AUTOMATIC) {
+ +	if (ifmgd->req_smps == IEEE80211_SMPS_AUTOMATIC) {
+  		if (ifmgd->powersave)
+ -			link->smps_mode = IEEE80211_SMPS_DYNAMIC;
+ +			sdata->smps_mode = IEEE80211_SMPS_DYNAMIC;
+  		else
+ -			link->smps_mode = IEEE80211_SMPS_OFF;
+ +			sdata->smps_mode = IEEE80211_SMPS_OFF;
+  	} else {
+ -		link->smps_mode = link->u.mgd.req_smps;
+ +		sdata->smps_mode = ifmgd->req_smps;
+  	}
+  
+- 	rcu_read_lock();
+- 	beacon_ies = rcu_dereference(req->bss->beacon_ies);
++ 	if (ieee80211_hw_check(&sdata->local->hw, NEED_DTIM_BEFORE_ASSOC)) {
++ 		const struct cfg80211_bss_ies *beacon_ies;
+  
+++<<<<<<< HEAD
+ +	if (ieee80211_hw_check(&sdata->local->hw, NEED_DTIM_BEFORE_ASSOC) &&
+ +	    !beacon_ies) {
+ +		/*
+ +		 * Wait up to one beacon interval ...
+ +		 * should this be more if we miss one?
+ +		 */
+ +		sdata_info(sdata, "waiting for beacon from %pM\n",
+ +			   ifmgd->bssid);
+ +		assoc_data->timeout = TU_TO_EXP_TIME(req->bss->beacon_interval);
+ +		assoc_data->timeout_started = true;
+ +		assoc_data->need_beacon = true;
+ +	} else if (beacon_ies) {
+ +		const struct element *elem;
+ +		u8 dtim_count = 0;
+ +
+ +		ieee80211_get_dtim(beacon_ies, &dtim_count,
+ +				   &ifmgd->dtim_period);
+ +
+ +		ifmgd->have_beacon = true;
+ +		assoc_data->timeout = jiffies;
+ +		assoc_data->timeout_started = true;
+ +
+ +		if (ieee80211_hw_check(&local->hw, TIMING_BEACON_ONLY)) {
+ +			sdata->vif.bss_conf.sync_tsf = beacon_ies->tsf;
+ +			sdata->vif.bss_conf.sync_device_ts =
+ +				bss->device_ts_beacon;
+ +			sdata->vif.bss_conf.sync_dtim_count = dtim_count;
+ +		}
+ +
+ +		elem = cfg80211_find_ext_elem(WLAN_EID_EXT_MULTIPLE_BSSID_CONFIGURATION,
+ +					      beacon_ies->data, beacon_ies->len);
+ +		if (elem && elem->datalen >= 3)
+ +			sdata->vif.bss_conf.profile_periodicity = elem->data[2];
+ +		else
+ +			sdata->vif.bss_conf.profile_periodicity = 0;
+ +
+ +		elem = cfg80211_find_elem(WLAN_EID_EXT_CAPABILITY,
+ +					  beacon_ies->data, beacon_ies->len);
+ +		if (elem && elem->datalen >= 11 &&
+ +		    (elem->data[10] & WLAN_EXT_CAPA11_EMA_SUPPORT))
+ +			sdata->vif.bss_conf.ema_ap = true;
+ +		else
+ +			sdata->vif.bss_conf.ema_ap = false;
+ +	} else {
+ +		assoc_data->timeout = jiffies;
+ +		assoc_data->timeout_started = true;
+++=======
++ 		rcu_read_lock();
++ 		beacon_ies = rcu_dereference(req->bss->beacon_ies);
++ 
++ 		if (beacon_ies) {
++ 			/*
++ 			 * Wait up to one beacon interval ...
++ 			 * should this be more if we miss one?
++ 			 */
++ 			sdata_info(sdata, "waiting for beacon from %pM\n",
++ 				   link->u.mgd.bssid);
++ 			assoc_data->timeout = TU_TO_EXP_TIME(req->bss->beacon_interval);
++ 			assoc_data->timeout_started = true;
++ 			assoc_data->need_beacon = true;
++ 		}
++ 		rcu_read_unlock();
+++>>>>>>> 74e1309acedc (wifi: mac80211: mlme: look up beacon elems only if needed)
+  	}
+- 	rcu_read_unlock();
+  
+  	run_again(sdata, assoc_data->timeout);
+  
+* Unmerged path net/mac80211/mlme.c
