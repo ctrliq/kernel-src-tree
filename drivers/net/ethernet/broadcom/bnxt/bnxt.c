@@ -330,6 +330,22 @@ static void bnxt_sched_reset_rxr(struct bnxt *bp, struct bnxt_rx_ring_info *rxr)
 	rxr->rx_next_cons = 0xffff;
 }
 
+void bnxt_sched_reset_txr(struct bnxt *bp, struct bnxt_tx_ring_info *txr,
+			  int idx)
+{
+	struct bnxt_napi *bnapi = txr->bnapi;
+
+	if (bnapi->tx_fault)
+		return;
+
+	netdev_err(bp->dev, "Invalid Tx completion (ring:%d tx_pkts:%d cons:%u prod:%u i:%d)",
+		   txr->txq_index, bnapi->tx_pkts,
+		   txr->tx_cons, txr->tx_prod, idx);
+	WARN_ON_ONCE(1);
+	bnapi->tx_fault = 1;
+	bnxt_queue_sp_work(bp, BNXT_RESET_TASK_SP_EVENT);
+}
+
 const u16 bnxt_lhint_arr[] = {
 	TX_BD_FLAGS_LHINT_512_AND_SMALLER,
 	TX_BD_FLAGS_LHINT_512_TO_1023,
@@ -685,12 +701,13 @@ tx_kick_pending:
 	return NETDEV_TX_OK;
 }
 
-static void bnxt_tx_int(struct bnxt *bp, struct bnxt_napi *bnapi, int nr_pkts)
+static void bnxt_tx_int(struct bnxt *bp, struct bnxt_napi *bnapi, int budget)
 {
 	struct bnxt_tx_ring_info *txr = bnapi->tx_ring;
 	struct netdev_queue *txq = netdev_get_tx_queue(bp->dev, txr->txq_index);
 	u16 cons = txr->tx_cons;
 	struct pci_dev *pdev = bp->pdev;
+	int nr_pkts = bnapi->tx_pkts;
 	int i;
 	unsigned int tx_bytes = 0;
 
@@ -703,6 +720,11 @@ static void bnxt_tx_int(struct bnxt *bp, struct bnxt_napi *bnapi, int nr_pkts)
 		cons = NEXT_TX(cons);
 		skb = tx_buf->skb;
 		tx_buf->skb = NULL;
+
+		if (unlikely(!skb)) {
+			bnxt_sched_reset_txr(bp, txr, i);
+			return;
+		}
 
 		tx_bytes += skb->len;
 
@@ -740,6 +762,7 @@ next_tx_int:
 		dev_kfree_skb_any(skb);
 	}
 
+	bnapi->tx_pkts = 0;
 	netdev_tx_completed_queue(txq, nr_pkts, tx_bytes);
 	txr->tx_cons = cons;
 
@@ -2523,12 +2546,11 @@ static int __bnxt_poll_work(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
 	return rx_pkts;
 }
 
-static void __bnxt_poll_work_done(struct bnxt *bp, struct bnxt_napi *bnapi)
+static void __bnxt_poll_work_done(struct bnxt *bp, struct bnxt_napi *bnapi,
+				  int budget)
 {
-	if (bnapi->tx_pkts) {
-		bnapi->tx_int(bp, bnapi, bnapi->tx_pkts);
-		bnapi->tx_pkts = 0;
-	}
+	if (bnapi->tx_pkts && !bnapi->tx_fault)
+		bnapi->tx_int(bp, bnapi, budget);
 
 	if ((bnapi->events & BNXT_RX_EVENT) && !(bnapi->in_reset)) {
 		struct bnxt_rx_ring_info *rxr = bnapi->rx_ring;
@@ -2554,7 +2576,7 @@ static int bnxt_poll_work(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
 	 */
 	bnxt_db_cq(bp, &cpr->cp_db, cpr->cp_raw_cons);
 
-	__bnxt_poll_work_done(bp, bnapi);
+	__bnxt_poll_work_done(bp, bnapi, budget);
 	return rx_pkts;
 }
 
@@ -2685,7 +2707,7 @@ static int __bnxt_poll_cqs(struct bnxt *bp, struct bnxt_napi *bnapi, int budget)
 }
 
 static void __bnxt_poll_cqs_done(struct bnxt *bp, struct bnxt_napi *bnapi,
-				 u64 dbr_type)
+				 u64 dbr_type, int budget)
 {
 	struct bnxt_cp_ring_info *cpr = &bnapi->cp_ring;
 	int i;
@@ -2701,7 +2723,7 @@ static void __bnxt_poll_cqs_done(struct bnxt *bp, struct bnxt_napi *bnapi,
 			cpr2->had_work_done = 0;
 		}
 	}
-	__bnxt_poll_work_done(bp, bnapi);
+	__bnxt_poll_work_done(bp, bnapi, budget);
 }
 
 static int bnxt_poll_p5(struct napi_struct *napi, int budget)
@@ -2731,7 +2753,8 @@ static int bnxt_poll_p5(struct napi_struct *napi, int budget)
 			if (cpr->has_more_work)
 				break;
 
-			__bnxt_poll_cqs_done(bp, bnapi, DBR_TYPE_CQ_ARMALL);
+			__bnxt_poll_cqs_done(bp, bnapi, DBR_TYPE_CQ_ARMALL,
+					     budget);
 			cpr->cp_raw_cons = raw_cons;
 			if (napi_complete_done(napi, work_done))
 				BNXT_DB_NQ_ARM_P5(&cpr->cp_db,
@@ -2761,7 +2784,7 @@ static int bnxt_poll_p5(struct napi_struct *napi, int budget)
 		}
 		raw_cons = NEXT_RAW_CMP(raw_cons);
 	}
-	__bnxt_poll_cqs_done(bp, bnapi, DBR_TYPE_CQ);
+	__bnxt_poll_cqs_done(bp, bnapi, DBR_TYPE_CQ, budget);
 	if (raw_cons != cpr->cp_raw_cons) {
 		cpr->cp_raw_cons = raw_cons;
 		BNXT_DB_NQ_P5(&cpr->cp_db, raw_cons);
@@ -9368,10 +9391,14 @@ static void bnxt_enable_napi(struct bnxt *bp)
 		struct bnxt_napi *bnapi = bp->bnapi[i];
 		struct bnxt_cp_ring_info *cpr;
 
+		bnapi->tx_fault = 0;
+
 		cpr = &bnapi->cp_ring;
 		if (bnapi->in_reset)
 			cpr->sw_stats.rx.rx_resets++;
 		bnapi->in_reset = false;
+
+		bnapi->tx_pkts = 0;
 
 		if (bnapi->rx_ring) {
 			INIT_WORK(&cpr->dim.work, bnxt_dim_work);
