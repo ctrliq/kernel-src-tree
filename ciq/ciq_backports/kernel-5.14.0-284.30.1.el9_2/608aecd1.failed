@@ -1,0 +1,178 @@
+rxrpc: Fix locking issues in rxrpc_put_peer_locked()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 608aecd16a31269485e2980898029dd01b03a73e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/608aecd1.failed
+
+Now that rxrpc_put_local() may call kthread_stop(), it can't be called
+under spinlock as it might sleep.  This can cause a problem in the peer
+keepalive code in rxrpc as it tries to avoid dropping the peer_hash_lock
+from the point it needs to re-add peer->keepalive_link to going round the
+loop again in rxrpc_peer_keepalive_dispatch().
+
+Fix this by just dropping the lock when we don't need it and accepting that
+we'll have to take it again.  This code is only called about every 20s for
+each peer, so not very often.
+
+This allows rxrpc_put_peer_unlocked() to be removed also.
+
+If triggered, this bug produces an oops like the following, as reproduced
+by a syzbot reproducer for a different oops[1]:
+
+BUG: sleeping function called from invalid context at kernel/sched/completion.c:101
+...
+RCU nest depth: 0, expected: 0
+3 locks held by kworker/u9:0/50:
+ #0: ffff88810e74a138 ((wq_completion)krxrpcd){+.+.}-{0:0}, at: process_one_work+0x294/0x636
+ #1: ffff8881013a7e20 ((work_completion)(&rxnet->peer_keepalive_work)){+.+.}-{0:0}, at: process_one_work+0x294/0x636
+ #2: ffff88817d366390 (&rxnet->peer_hash_lock){+.+.}-{2:2}, at: rxrpc_peer_keepalive_dispatch+0x2bd/0x35f
+...
+Call Trace:
+ <TASK>
+ dump_stack_lvl+0x4c/0x5f
+ __might_resched+0x2cf/0x2f2
+ __wait_for_common+0x87/0x1e8
+ kthread_stop+0x14d/0x255
+ rxrpc_peer_keepalive_dispatch+0x333/0x35f
+ rxrpc_peer_keepalive_worker+0x2e9/0x449
+ process_one_work+0x3c1/0x636
+ worker_thread+0x25f/0x359
+ kthread+0x1a6/0x1b5
+ ret_from_fork+0x1f/0x30
+
+Fixes: a275da62e8c1 ("rxrpc: Create a per-local endpoint receive queue and I/O thread")
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+Link: https://lore.kernel.org/r/0000000000002b4a9f05ef2b616f@google.com/ [1]
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 608aecd16a31269485e2980898029dd01b03a73e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/peer_event.c
+#	net/rxrpc/peer_object.c
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,5b732a4af009..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -1032,10 -1070,9 +1032,16 @@@ struct rxrpc_peer *rxrpc_alloc_peer(str
+  void rxrpc_new_incoming_peer(struct rxrpc_sock *, struct rxrpc_local *,
+  			     struct rxrpc_peer *);
+  void rxrpc_destroy_all_peers(struct rxrpc_net *);
+++<<<<<<< HEAD
+ +struct rxrpc_peer *rxrpc_get_peer(struct rxrpc_peer *);
+ +struct rxrpc_peer *rxrpc_get_peer_maybe(struct rxrpc_peer *);
+ +void rxrpc_put_peer(struct rxrpc_peer *);
+ +void rxrpc_put_peer_locked(struct rxrpc_peer *);
+++=======
++ struct rxrpc_peer *rxrpc_get_peer(struct rxrpc_peer *, enum rxrpc_peer_trace);
++ struct rxrpc_peer *rxrpc_get_peer_maybe(struct rxrpc_peer *, enum rxrpc_peer_trace);
++ void rxrpc_put_peer(struct rxrpc_peer *, enum rxrpc_peer_trace);
+++>>>>>>> 608aecd16a31 (rxrpc: Fix locking issues in rxrpc_put_peer_locked())
+  
+  /*
+   * proc.c
+diff --cc net/rxrpc/peer_event.c
+index b5160a878fe1,552ba84a255c..000000000000
+--- a/net/rxrpc/peer_event.c
++++ b/net/rxrpc/peer_event.c
+@@@ -303,21 -235,23 +303,28 @@@ static void rxrpc_peer_keepalive_dispat
+  	struct rxrpc_peer *peer;
+  	const u8 mask = ARRAY_SIZE(rxnet->peer_keepalive) - 1;
+  	time64_t keepalive_at;
++ 	bool use;
+  	int slot;
+  
+ -	spin_lock(&rxnet->peer_hash_lock);
+ +	spin_lock_bh(&rxnet->peer_hash_lock);
+  
+  	while (!list_empty(collector)) {
+  		peer = list_entry(collector->next,
+  				  struct rxrpc_peer, keepalive_link);
+  
+  		list_del_init(&peer->keepalive_link);
+ -		if (!rxrpc_get_peer_maybe(peer, rxrpc_peer_get_keepalive))
+ +		if (!rxrpc_get_peer_maybe(peer))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		if (__rxrpc_use_local(peer->local)) {
+ +			spin_unlock_bh(&rxnet->peer_hash_lock);
+++=======
++ 		use = __rxrpc_use_local(peer->local, rxrpc_local_use_peer_keepalive);
++ 		spin_unlock(&rxnet->peer_hash_lock);
+++>>>>>>> 608aecd16a31 (rxrpc: Fix locking issues in rxrpc_put_peer_locked())
+  
++ 		if (use) {
+  			keepalive_at = peer->last_tx_at + RXRPC_KEEPALIVE_TIME;
+  			slot = keepalive_at - base;
+  			_debug("%02x peer %u t=%d {%pISp}",
+@@@ -335,15 -269,17 +342,23 @@@
+  			 */
+  			slot += cursor;
+  			slot &= mask;
+ -			spin_lock(&rxnet->peer_hash_lock);
+ +			spin_lock_bh(&rxnet->peer_hash_lock);
+  			list_add_tail(&peer->keepalive_link,
+  				      &rxnet->peer_keepalive[slot & mask]);
+++<<<<<<< HEAD
+ +			rxrpc_unuse_local(peer->local);
+ +		}
+ +		rxrpc_put_peer_locked(peer);
+++=======
++ 			spin_unlock(&rxnet->peer_hash_lock);
++ 			rxrpc_unuse_local(peer->local, rxrpc_local_unuse_peer_keepalive);
++ 		}
++ 		rxrpc_put_peer(peer, rxrpc_peer_put_keepalive);
++ 		spin_lock(&rxnet->peer_hash_lock);
+++>>>>>>> 608aecd16a31 (rxrpc: Fix locking issues in rxrpc_put_peer_locked())
+  	}
+  
+ -	spin_unlock(&rxnet->peer_hash_lock);
+ +	spin_unlock_bh(&rxnet->peer_hash_lock);
+  }
+  
+  /*
+diff --cc net/rxrpc/peer_object.c
+index 041a51225c5f,82de295393a0..000000000000
+--- a/net/rxrpc/peer_object.c
++++ b/net/rxrpc/peer_object.c
+@@@ -444,26 -439,6 +444,29 @@@ void rxrpc_put_peer(struct rxrpc_peer *
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Drop a ref on a peer record where the caller already holds the
+ + * peer_hash_lock.
+ + */
+ +void rxrpc_put_peer_locked(struct rxrpc_peer *peer)
+ +{
+ +	const void *here = __builtin_return_address(0);
+ +	unsigned int debug_id = peer->debug_id;
+ +	bool dead;
+ +	int r;
+ +
+ +	dead = __refcount_dec_and_test(&peer->ref, &r);
+ +	trace_rxrpc_peer(debug_id, rxrpc_peer_put, r - 1, here);
+ +	if (dead) {
+ +		hash_del_rcu(&peer->hash_link);
+ +		list_del_init(&peer->keepalive_link);
+ +		rxrpc_free_peer(peer);
+ +	}
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 608aecd16a31 (rxrpc: Fix locking issues in rxrpc_put_peer_locked())
+   * Make sure all peer records have been discarded.
+   */
+  void rxrpc_destroy_all_peers(struct rxrpc_net *rxnet)
+* Unmerged path net/rxrpc/ar-internal.h
+* Unmerged path net/rxrpc/peer_event.c
+* Unmerged path net/rxrpc/peer_object.c
