@@ -1,0 +1,140 @@
+ice: call ice_is_malicious_vf() from ice_vc_process_vf_msg()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-535.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit be96815c616822d3800405b8fbebe3e069d6eed2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-535.el8/be96815c.failed
+
+The main loop in __ice_clean_ctrlq first checks if a VF might be malicious
+before calling ice_vc_process_vf_msg(). This results in duplicate code in
+both functions to obtain a reference to the VF, and exports the
+ice_is_malicious_vf() from ice_virtchnl.c unnecessarily.
+
+Refactor ice_is_malicious_vf() to be a static function that takes a pointer
+to the VF. Call this in ice_vc_process_vf_msg() just after we obtain a
+reference to the VF by calling ice_get_vf_by_id.
+
+Pass the mailbox data from the __ice_clean_ctrlq function into
+ice_vc_process_vf_msg() instead of calling ice_is_malicious_vf().
+
+This reduces the number of exported functions and avoids the need to obtain
+the VF reference twice for every mailbox message.
+
+Note that the state check for ICE_VF_STATE_DIS is kept in
+ice_is_malicious_vf() and we call this before checking that state in
+ice_vc_process_vf_msg. This is intentional, as we stop responding to VF
+messages from a VF once we detect that it may be overflowing the mailbox.
+This ensures that we continue to silently ignore the message as before
+without responding via ice_vc_send_msg_to_vf().
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+	Tested-by: Marek Szlosek <marek.szlosek@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit be96815c616822d3800405b8fbebe3e069d6eed2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_main.c
+#	drivers/net/ethernet/intel/ice/ice_virtchnl.c
+#	drivers/net/ethernet/intel/ice/ice_virtchnl.h
+diff --cc drivers/net/ethernet/intel/ice/ice_main.c
+index 64dc188a9607,20b3f3e6eda1..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@@ -1531,8 -1512,12 +1531,17 @@@ static int __ice_clean_ctrlq(struct ice
+  			ice_vf_lan_overflow_event(pf, &event);
+  			break;
+  		case ice_mbx_opc_send_msg_to_pf:
+++<<<<<<< HEAD
+ +			if (!ice_is_malicious_vf(pf, &event, i, pending))
+ +				ice_vc_process_vf_msg(pf, &event);
+++=======
++ 			data.num_msg_proc = i;
++ 			data.num_pending_arq = pending;
++ 			data.max_num_msgs_mbx = hw->mailboxq.num_rq_entries;
++ 			data.async_watermark_val = ICE_MBX_OVERFLOW_WATERMARK;
++ 
++ 			ice_vc_process_vf_msg(pf, &event, &data);
+++>>>>>>> be96815c6168 (ice: call ice_is_malicious_vf() from ice_vc_process_vf_msg())
+  			break;
+  		case ice_aqc_opc_fw_logging:
+  			ice_output_fw_log(hw, &event.desc, event.msg_buf);
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl.c
+index 87267cca97b2,97243c616d5d..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl.c
+@@@ -3836,6 -3834,47 +3836,50 @@@ void ice_virtchnl_set_repr_ops(struct i
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_is_malicious_vf - check if this vf might be overflowing mailbox
++  * @vf: the VF to check
++  * @mbxdata: data about the state of the mailbox
++  *
++  * Detect if a given VF might be malicious and attempting to overflow the PF
++  * mailbox. If so, log a warning message and ignore this event.
++  */
++ static bool
++ ice_is_malicious_vf(struct ice_vf *vf, struct ice_mbx_data *mbxdata)
++ {
++ 	bool report_malvf = false;
++ 	struct device *dev;
++ 	struct ice_pf *pf;
++ 	int status;
++ 
++ 	pf = vf->pf;
++ 	dev = ice_pf_to_dev(pf);
++ 
++ 	if (test_bit(ICE_VF_STATE_DIS, vf->vf_states))
++ 		return vf->mbx_info.malicious;
++ 
++ 	/* check to see if we have a newly malicious VF */
++ 	status = ice_mbx_vf_state_handler(&pf->hw, mbxdata, &vf->mbx_info,
++ 					  &report_malvf);
++ 	if (status)
++ 		dev_warn_ratelimited(dev, "Unable to check status of mailbox overflow for VF %u MAC %pM, status %d\n",
++ 				     vf->vf_id, vf->dev_lan_addr, status);
++ 
++ 	if (report_malvf) {
++ 		struct ice_vsi *pf_vsi = ice_get_main_vsi(pf);
++ 		u8 zero_addr[ETH_ALEN] = {};
++ 
++ 		dev_warn(dev, "VF MAC %pM on PF MAC %pM is generating asynchronous messages and may be overflowing the PF message queue. Please see the Adapter User Guide for more information\n",
++ 			 vf->dev_lan_addr,
++ 			 pf_vsi ? pf_vsi->netdev->dev_addr : zero_addr);
++ 	}
++ 
++ 	return vf->mbx_info.malicious;
++ }
++ 
++ /**
+++>>>>>>> be96815c6168 (ice: call ice_is_malicious_vf() from ice_vc_process_vf_msg())
+   * ice_vc_process_vf_msg - Process request from VF
+   * @pf: pointer to the PF structure
+   * @event: pointer to the AQ event
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl.h
+index 6d5af29c855e,cd747718de73..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl.h
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl.h
+@@@ -63,7 -63,8 +63,12 @@@ in
+  ice_vc_send_msg_to_vf(struct ice_vf *vf, u32 v_opcode,
+  		      enum virtchnl_status_code v_retval, u8 *msg, u16 msglen);
+  bool ice_vc_isvalid_vsi_id(struct ice_vf *vf, u16 vsi_id);
+++<<<<<<< HEAD
+ +void ice_vc_process_vf_msg(struct ice_pf *pf, struct ice_rq_event_info *event);
+++=======
++ void ice_vc_process_vf_msg(struct ice_pf *pf, struct ice_rq_event_info *event,
++ 			   struct ice_mbx_data *mbxdata);
+++>>>>>>> be96815c6168 (ice: call ice_is_malicious_vf() from ice_vc_process_vf_msg())
+  #else /* CONFIG_PCI_IOV */
+  static inline void ice_virtchnl_set_dflt_ops(struct ice_vf *vf) { }
+  static inline void ice_virtchnl_set_repr_ops(struct ice_vf *vf) { }
+* Unmerged path drivers/net/ethernet/intel/ice/ice_main.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl.h
