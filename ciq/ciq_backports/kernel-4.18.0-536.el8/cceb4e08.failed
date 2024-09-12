@@ -1,0 +1,113 @@
+Drivers: hv: vmbus: Support >64 VPs for a fully enlightened TDX/SNP VM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-536.el8
+commit-author Dexuan Cui <decui@microsoft.com>
+commit cceb4e0810b61c7f5837c17e966b9b718dd62d22
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-536.el8/cceb4e08.failed
+
+Don't set *this_cpu_ptr(hyperv_pcpu_input_arg) before the function
+set_memory_decrypted() returns, otherwise we run into this ticky issue:
+
+For a fully enlightened TDX/SNP VM, in hv_common_cpu_init(),
+*this_cpu_ptr(hyperv_pcpu_input_arg) is an encrypted page before
+the set_memory_decrypted() returns.
+
+When such a VM has more than 64 VPs, if the hyperv_pcpu_input_arg is not
+NULL, hv_common_cpu_init() -> set_memory_decrypted() -> ... ->
+cpa_flush() -> on_each_cpu() -> ... -> hv_send_ipi_mask() -> ... ->
+__send_ipi_mask_ex() tries to call hv_do_rep_hypercall() with the
+hyperv_pcpu_input_arg as the hypercall input page, which must be a
+decrypted page in such a VM, but the page is still encrypted at this
+point, and a fatal fault is triggered.
+
+Fix the issue by setting *this_cpu_ptr(hyperv_pcpu_input_arg) after
+set_memory_decrypted(): if the hyperv_pcpu_input_arg is NULL,
+__send_ipi_mask_ex() returns HV_STATUS_INVALID_PARAMETER immediately,
+and hv_send_ipi_mask() falls back to orig_apic.send_IPI_mask(),
+which can use x2apic_send_IPI_all(), which may be slightly slower than
+the hypercall but still works correctly in such a VM.
+
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+	Reviewed-by: Tianyu Lan <tiala@microsoft.com>
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+Link: https://lore.kernel.org/r/20230824080712.30327-6-decui@microsoft.com
+(cherry picked from commit cceb4e0810b61c7f5837c17e966b9b718dd62d22)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/hv_common.c
+diff --cc drivers/hv/hv_common.c
+index c00e1e18c2ea,4c858e1636da..000000000000
+--- a/drivers/hv/hv_common.c
++++ b/drivers/hv/hv_common.c
+@@@ -127,18 -360,53 +127,65 @@@ int hv_common_cpu_init(unsigned int cpu
+  	u64 msr_vp_index;
+  	gfp_t flags;
+  	int pgcount = hv_root_partition ? 2 : 1;
+++<<<<<<< HEAD
+++=======
++ 	void *mem;
++ 	int ret;
+++>>>>>>> cceb4e0810b6 (Drivers: hv: vmbus: Support >64 VPs for a fully enlightened TDX/SNP VM)
+  
+  	/* hv_cpu_init() can be called with IRQs disabled from hv_resume() */
+  	flags = irqs_disabled() ? GFP_ATOMIC : GFP_KERNEL;
+  
+  	inputarg = (void **)this_cpu_ptr(hyperv_pcpu_input_arg);
+ +	*inputarg = kmalloc(pgcount * HV_HYP_PAGE_SIZE, flags);
+ +	if (!(*inputarg))
+ +		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	if (hv_root_partition) {
+ +		outputarg = (void **)this_cpu_ptr(hyperv_pcpu_output_arg);
+ +		*outputarg = (char *)(*inputarg) + HV_HYP_PAGE_SIZE;
+++=======
++ 	/*
++ 	 * hyperv_pcpu_input_arg and hyperv_pcpu_output_arg memory is already
++ 	 * allocated if this CPU was previously online and then taken offline
++ 	 */
++ 	if (!*inputarg) {
++ 		mem = kmalloc(pgcount * HV_HYP_PAGE_SIZE, flags);
++ 		if (!mem)
++ 			return -ENOMEM;
++ 
++ 		if (hv_root_partition) {
++ 			outputarg = (void **)this_cpu_ptr(hyperv_pcpu_output_arg);
++ 			*outputarg = (char *)mem + HV_HYP_PAGE_SIZE;
++ 		}
++ 
++ 		if (hv_isolation_type_en_snp() || hv_isolation_type_tdx()) {
++ 			ret = set_memory_decrypted((unsigned long)mem, pgcount);
++ 			if (ret) {
++ 				/* It may be unsafe to free 'mem' */
++ 				return ret;
++ 			}
++ 
++ 			memset(mem, 0x00, pgcount * HV_HYP_PAGE_SIZE);
++ 		}
++ 
++ 		/*
++ 		 * In a fully enlightened TDX/SNP VM with more than 64 VPs, if
++ 		 * hyperv_pcpu_input_arg is not NULL, set_memory_decrypted() ->
++ 		 * ... -> cpa_flush()-> ... -> __send_ipi_mask_ex() tries to
++ 		 * use hyperv_pcpu_input_arg as the hypercall input page, which
++ 		 * must be a decrypted page in such a VM, but the page is still
++ 		 * encrypted before set_memory_decrypted() returns. Fix this by
++ 		 * setting *inputarg after the above set_memory_decrypted(): if
++ 		 * hyperv_pcpu_input_arg is NULL, __send_ipi_mask_ex() returns
++ 		 * HV_STATUS_INVALID_PARAMETER immediately, and the function
++ 		 * hv_send_ipi_mask() falls back to orig_apic.send_IPI_mask(),
++ 		 * which may be slightly slower than the hypercall, but still
++ 		 * works correctly in such a VM.
++ 		 */
++ 		*inputarg = mem;
+++>>>>>>> cceb4e0810b6 (Drivers: hv: vmbus: Support >64 VPs for a fully enlightened TDX/SNP VM)
+  	}
+  
+  	msr_vp_index = hv_get_register(HV_REGISTER_VP_INDEX);
+* Unmerged path drivers/hv/hv_common.c
