@@ -1,0 +1,169 @@
+inet: inet_defrag: prevent sk release while still in use
+
+jira LE-1907
+cve CVE-2024-26921
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Florian Westphal <fw@strlen.de>
+commit 18685451fc4e546fc0e718580d32df3c0e5c8272
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/18685451.failed
+
+ip_local_out() and other functions can pass skb->sk as function argument.
+
+If the skb is a fragment and reassembly happens before such function call
+returns, the sk must not be released.
+
+This affects skb fragments reassembled via netfilter or similar
+modules, e.g. openvswitch or ct_act.c, when run as part of tx pipeline.
+
+Eric Dumazet made an initial analysis of this bug.  Quoting Eric:
+  Calling ip_defrag() in output path is also implying skb_orphan(),
+  which is buggy because output path relies on sk not disappearing.
+
+  A relevant old patch about the issue was :
+  8282f27449bf ("inet: frag: Always orphan skbs inside ip_defrag()")
+
+  [..]
+
+  net/ipv4/ip_output.c depends on skb->sk being set, and probably to an
+  inet socket, not an arbitrary one.
+
+  If we orphan the packet in ipvlan, then downstream things like FQ
+  packet scheduler will not work properly.
+
+  We need to change ip_defrag() to only use skb_orphan() when really
+  needed, ie whenever frag_list is going to be used.
+
+Eric suggested to stash sk in fragment queue and made an initial patch.
+However there is a problem with this:
+
+If skb is refragmented again right after, ip_do_fragment() will copy
+head->sk to the new fragments, and sets up destructor to sock_wfree.
+IOW, we have no choice but to fix up sk_wmem accouting to reflect the
+fully reassembled skb, else wmem will underflow.
+
+This change moves the orphan down into the core, to last possible moment.
+As ip_defrag_offset is aliased with sk_buff->sk member, we must move the
+offset into the FRAG_CB, else skb->sk gets clobbered.
+
+This allows to delay the orphaning long enough to learn if the skb has
+to be queued or if the skb is completing the reasm queue.
+
+In the former case, things work as before, skb is orphaned.  This is
+safe because skb gets queued/stolen and won't continue past reasm engine.
+
+In the latter case, we will steal the skb->sk reference, reattach it to
+the head skb, and fix up wmem accouting when inet_frag inflates truesize.
+
+Fixes: 7026b1ddb6b8 ("netfilter: Pass socket pointer down through okfn().")
+Diagnosed-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: xingwei lee <xrivendell7@gmail.com>
+	Reported-by: yue sun <samsun1006219@gmail.com>
+	Reported-by: syzbot+e5167d7144a62715044c@syzkaller.appspotmail.com
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://lore.kernel.org/r/20240326101845.30836-1-fw@strlen.de
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit 18685451fc4e546fc0e718580d32df3c0e5c8272)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/inet_fragment.c
+diff --cc net/ipv4/inet_fragment.c
+index 7c1925de4435,c88c9034d630..000000000000
+--- a/net/ipv4/inet_fragment.c
++++ b/net/ipv4/inet_fragment.c
+@@@ -445,7 -555,9 +484,13 @@@ EXPORT_SYMBOL(inet_frag_reasm_prepare)
+  void inet_frag_reasm_finish(struct inet_frag_queue *q, struct sk_buff *head,
+  			    void *reasm_data, bool try_coalesce)
+  {
+++<<<<<<< HEAD
+ +	struct sk_buff **nextp = (struct sk_buff **)reasm_data;
+++=======
++ 	struct sock *sk = is_skb_wmem(head) ? head->sk : NULL;
++ 	const unsigned int head_truesize = head->truesize;
++ 	struct sk_buff **nextp = reasm_data;
+++>>>>>>> 18685451fc4e (inet: inet_defrag: prevent sk release while still in use)
+  	struct rb_node *rbn;
+  	struct sk_buff *fp;
+  	int sum_truesize;
+@@@ -501,12 -613,16 +546,19 @@@
+  			rbn = rbnext;
+  		}
+  	}
+ -	sub_frag_mem_limit(q->fqdir, sum_truesize);
+ +	sub_frag_mem_limit(q->net, sum_truesize);
+  
+  	*nextp = NULL;
+ -	skb_mark_not_on_list(head);
+ +	head->next = NULL;
+  	head->prev = NULL;
+  	head->tstamp = q->stamp;
+++<<<<<<< HEAD
+++=======
++ 	head->mono_delivery_time = q->mono_delivery_time;
++ 
++ 	if (sk)
++ 		refcount_add(sum_truesize - head_truesize, &sk->sk_wmem_alloc);
+++>>>>>>> 18685451fc4e (inet: inet_defrag: prevent sk release while still in use)
+  }
+  EXPORT_SYMBOL(inet_frag_reasm_finish);
+  
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 6b846ed9c2ba..5647379b4f37 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -739,10 +739,7 @@ struct sk_buff {
+ 		RH_KABI_EXTEND(struct list_head	list)
+ 	};
+ 
+-	union {
+-		struct sock		*sk;
+-		int			ip_defrag_offset;
+-	};
++	struct sock		*sk;
+ 
+ 	union {
+ 		ktime_t		tstamp;
+* Unmerged path net/ipv4/inet_fragment.c
+diff --git a/net/ipv4/ip_fragment.c b/net/ipv4/ip_fragment.c
+index 63c9b1783a6f..7c307502457c 100644
+--- a/net/ipv4/ip_fragment.c
++++ b/net/ipv4/ip_fragment.c
+@@ -385,6 +385,7 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
+ 	}
+ 
+ 	skb_dst_drop(skb);
++	skb_orphan(skb);
+ 	return -EINPROGRESS;
+ 
+ insert_error:
+@@ -489,7 +490,6 @@ int ip_defrag(struct net *net, struct sk_buff *skb, u32 user)
+ 	struct ipq *qp;
+ 
+ 	__IP_INC_STATS(net, IPSTATS_MIB_REASMREQDS);
+-	skb_orphan(skb);
+ 
+ 	/* Lookup (or create) queue header */
+ 	qp = ip_find(net, ip_hdr(skb), user, vif);
+diff --git a/net/ipv6/netfilter/nf_conntrack_reasm.c b/net/ipv6/netfilter/nf_conntrack_reasm.c
+index ae518872f8ef..5500ccd31ab0 100644
+--- a/net/ipv6/netfilter/nf_conntrack_reasm.c
++++ b/net/ipv6/netfilter/nf_conntrack_reasm.c
+@@ -307,6 +307,7 @@ static int nf_ct_frag6_queue(struct frag_queue *fq, struct sk_buff *skb,
+ 	}
+ 
+ 	skb_dst_drop(skb);
++	skb_orphan(skb);
+ 	return -EINPROGRESS;
+ 
+ insert_error:
+@@ -483,7 +484,6 @@ int nf_ct_frag6_gather(struct net *net, struct sk_buff *skb, u32 user)
+ 	hdr = ipv6_hdr(skb);
+ 	fhdr = (struct frag_hdr *)skb_transport_header(skb);
+ 
+-	skb_orphan(skb);
+ 	fq = fq_find(net, fhdr->identification, user, hdr,
+ 		     skb->dev ? skb->dev->ifindex : 0);
+ 	if (fq == NULL) {
