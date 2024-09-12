@@ -1,0 +1,220 @@
+blk-throttle: fix that io throttle can only work for single bio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit 320fb0f91e55ba248d4bad106b408e59099cfa89
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/320fb0f9.failed
+
+Test scripts:
+cd /sys/fs/cgroup/blkio/
+echo "8:0 1024" > blkio.throttle.write_bps_device
+echo $$ > cgroup.procs
+dd if=/dev/zero of=/dev/sda bs=10k count=1 oflag=direct &
+dd if=/dev/zero of=/dev/sda bs=10k count=1 oflag=direct &
+
+Test result:
+10240 bytes (10 kB, 10 KiB) copied, 10.0134 s, 1.0 kB/s
+10240 bytes (10 kB, 10 KiB) copied, 10.0135 s, 1.0 kB/s
+
+The problem is that the second bio is finished after 10s instead of 20s.
+
+Root cause:
+1) second bio will be flagged:
+
+__blk_throtl_bio
+ while (true) {
+  ...
+  if (sq->nr_queued[rw]) -> some bio is throttled already
+   break
+ };
+ bio_set_flag(bio, BIO_THROTTLED); -> flag the bio
+
+2) flagged bio will be dispatched without waiting:
+
+throtl_dispatch_tg
+ tg_may_dispatch
+  tg_with_in_bps_limit
+   if (bps_limit == U64_MAX || bio_flagged(bio, BIO_THROTTLED))
+    *wait = 0; -> wait time is zero
+    return true;
+
+commit 9f5ede3c01f9 ("block: throttle split bio in case of iops limit")
+support to count split bios for iops limit, thus it adds flagged bio
+checking in tg_with_in_bps_limit() so that split bios will only count
+once for bps limit, however, it introduce a new problem that io throttle
+won't work if multiple bios are throttled.
+
+In order to fix the problem, handle iops/bps limit in different ways:
+
+1) for iops limit, there is no flag to record if the bio is throttled,
+   and iops is always applied.
+2) for bps limit, original bio will be flagged with BIO_BPS_THROTTLED,
+   and io throttle will ignore bio with the flag.
+
+Noted this patch also remove the code to set flag in __bio_clone(), it's
+introduced in commit 111be8839817 ("block-throttle: avoid double
+charge"), and author thinks split bio can be resubmited and throttled
+again, which is wrong because split bio will continue to dispatch from
+caller.
+
+Fixes: 9f5ede3c01f9 ("block: throttle split bio in case of iops limit")
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+	Acked-by: Tejun Heo <tj@kernel.org>
+Link: https://lore.kernel.org/r/20220829022240.3348319-2-yukuai1@huaweicloud.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 320fb0f91e55ba248d4bad106b408e59099cfa89)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-throttle.c
+#	block/blk-throttle.h
+#	include/linux/bio.h
+#	include/linux/blk_types.h
+diff --cc block/blk-throttle.c
+index 51edc90904b3,a5e495b67827..000000000000
+--- a/block/blk-throttle.c
++++ b/block/blk-throttle.c
+@@@ -2302,10 -2205,6 +2296,13 @@@ again
+  	}
+  
+  out_unlock:
+++<<<<<<< HEAD
+ +	spin_unlock_irq(&q->queue_lock);
+ +out:
+ +	bio_set_flag(bio, BIO_THROTTLED);
+ +
+++=======
+++>>>>>>> 320fb0f91e55 (blk-throttle: fix that io throttle can only work for single bio)
+  #ifdef CONFIG_BLK_DEV_THROTTLING_LOW
+  	if (throttled || !td->track_bio_latency)
+  		bio->bi_issue.value |= BIO_ISSUE_THROTL_SKIP_LATENCY;
+diff --cc include/linux/bio.h
+index 5137fc960baf,2c5806997bbf..000000000000
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@@ -504,47 -505,15 +504,55 @@@ static inline void bio_clone_blkg_assoc
+  					      struct bio *src) { }
+  #endif	/* CONFIG_BLK_CGROUP */
+  
+ -static inline void bio_set_dev(struct bio *bio, struct block_device *bdev)
+ +#ifdef CONFIG_HIGHMEM
+ +/*
+ + * remember never ever reenable interrupts between a bvec_kmap_irq and
+ + * bvec_kunmap_irq!
+ + */
+ +static inline char *bvec_kmap_irq(struct bio_vec *bvec, unsigned long *flags)
+  {
+++<<<<<<< HEAD
+ +	unsigned long addr;
+ +
+ +	/*
+ +	 * might not be a highmem page, but the preempt/irq count
+ +	 * balancing is a lot nicer this way
+ +	 */
+ +	local_irq_save(*flags);
+ +	addr = (unsigned long) kmap_atomic(bvec->bv_page);
+ +
+ +	BUG_ON(addr & ~PAGE_MASK);
+ +
+ +	return (char *) addr + bvec->bv_offset;
+++=======
++ 	bio_clear_flag(bio, BIO_REMAPPED);
++ 	if (bio->bi_bdev != bdev)
++ 		bio_clear_flag(bio, BIO_BPS_THROTTLED);
++ 	bio->bi_bdev = bdev;
++ 	bio_associate_blkg(bio);
+++>>>>>>> 320fb0f91e55 (blk-throttle: fix that io throttle can only work for single bio)
+ +}
+ +
+ +static inline void bvec_kunmap_irq(char *buffer, unsigned long *flags)
+ +{
+ +	unsigned long ptr = (unsigned long) buffer & PAGE_MASK;
+ +
+ +	kunmap_atomic((void *) ptr);
+ +	local_irq_restore(*flags);
+ +}
+ +
+ +#else
+ +static inline char *bvec_kmap_irq(struct bio_vec *bvec, unsigned long *flags)
+ +{
+ +	return page_address(bvec->bv_page) + bvec->bv_offset;
+  }
+  
+ +static inline void bvec_kunmap_irq(char *buffer, unsigned long *flags)
+ +{
+ +	*flags = 0;
+ +}
+ +#endif
+ +
+  /*
+   * BIO list management for use by remapping drivers (e.g. DM or MD) and loop.
+   *
+diff --cc include/linux/blk_types.h
+index cc62703cd319,41afb4cfb9b0..000000000000
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@@ -256,22 -317,25 +256,34 @@@ struct bio 
+  /*
+   * bio flags
+   */
+++<<<<<<< HEAD
+ +#define BIO_NO_PAGE_REF	0	/* don't put release vec pages */
+ +#define BIO_SEG_VALID	1	/* bi_phys_segments valid */
+ +#define BIO_CLONED	2	/* doesn't own data */
+ +#define BIO_BOUNCED	3	/* bio is a bounce bio */
+ +#define BIO_USER_MAPPED 4	/* contains user pages */
+ +#define BIO_NULL_MAPPED 5	/* contains invalid user pages */
+ +#define BIO_QUIET	6	/* Make BIO Quiet */
+ +#define BIO_CHAIN	7	/* chained bio, ->bi_remaining in effect */
+ +#define BIO_REFFED	8	/* bio has elevated ->bi_cnt */
+ +#define BIO_THROTTLED	9	/* This bio has already been subjected to
+++=======
++ enum {
++ 	BIO_NO_PAGE_REF,	/* don't put release vec pages */
++ 	BIO_CLONED,		/* doesn't own data */
++ 	BIO_BOUNCED,		/* bio is a bounce bio */
++ 	BIO_WORKINGSET,		/* contains userspace workingset pages */
++ 	BIO_QUIET,		/* Make BIO Quiet */
++ 	BIO_CHAIN,		/* chained bio, ->bi_remaining in effect */
++ 	BIO_REFFED,		/* bio has elevated ->bi_cnt */
++ 	BIO_BPS_THROTTLED,	/* This bio has already been subjected to
+++>>>>>>> 320fb0f91e55 (blk-throttle: fix that io throttle can only work for single bio)
+  				 * throttling rules. Don't do it again. */
+ -	BIO_TRACE_COMPLETION,	/* bio_endio() should trace the final completion
+ +#define BIO_TRACE_COMPLETION 10	/* bio_endio() should trace the final completion
+  				 * of this bio. */
+ -	BIO_CGROUP_ACCT,	/* has been accounted to a cgroup */
+ -	BIO_QOS_THROTTLED,	/* bio went through rq_qos throttle path */
+ -	BIO_QOS_MERGED,		/* but went through rq_qos merge path */
+ -	BIO_REMAPPED,
+ -	BIO_ZONE_WRITE_LOCKED,	/* Owns a zoned device zone write lock */
+ -	BIO_FLAG_LAST
+ -};
+ +#define BIO_QUEUE_ENTERED 11	/* can use blk_queue_enter_live() */
+ +#define BIO_TRACKED 12		/* set if bio goes through the rq_qos path */
+ +#define	BIO_CGROUP_ACCT	BIO_QUEUE_ENTERED /* has been accounted to a cgroup */
+  
+  typedef __u32 __bitwise blk_mq_req_flags_t;
+  
+* Unmerged path block/blk-throttle.h
+diff --git a/block/bio.c b/block/bio.c
+index bcbd9cae239c..70eb27f9a374 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -645,8 +645,6 @@ EXPORT_SYMBOL(bio_phys_segments);
+ static int __bio_clone(struct bio *bio, struct bio *bio_src, gfp_t gfp)
+ {
+ 	bio_set_flag(bio, BIO_CLONED);
+-	if (bio_flagged(bio_src, BIO_THROTTLED))
+-		bio_set_flag(bio, BIO_THROTTLED);
+ 	bio->bi_ioprio = bio_src->bi_ioprio;
+ 	bio->bi_write_hint = bio_src->bi_write_hint;
+ 	bio->bi_iter = bio_src->bi_iter;
+* Unmerged path block/blk-throttle.c
+* Unmerged path block/blk-throttle.h
+* Unmerged path include/linux/bio.h
+* Unmerged path include/linux/blk_types.h
