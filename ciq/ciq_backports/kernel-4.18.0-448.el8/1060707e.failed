@@ -1,0 +1,335 @@
+ptp: introduce helpers to adjust by scaled parts per million
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 1060707e380994e7c9b754b6eb74f25459b4a5b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/1060707e.failed
+
+Many drivers implement the .adjfreq or .adjfine PTP op function with the
+same basic logic:
+
+  1. Determine a base frequency value
+  2. Multiply this by the abs() of the requested adjustment, then divide by
+     the appropriate divisor (1 billion, or 65,536 billion).
+  3. Add or subtract this difference from the base frequency to calculate a
+     new adjustment.
+
+A few drivers need the difference and direction rather than the combined
+new increment value.
+
+I recently converted the Intel drivers to .adjfine and the scaled parts per
+million (65.536 parts per billion) logic. To avoid overflow with minimal
+loss of precision, mul_u64_u64_div_u64 was used.
+
+The basic logic used by all of these drivers is very similar, and leads to
+a lot of duplicate code to perform the same task.
+
+Rather than keep this duplicate code, introduce diff_by_scaled_ppm and
+adjust_by_scaled_ppm. These helper functions calculate the difference or
+adjustment necessary based on the scaled parts per million input.
+
+The diff_by_scaled_ppm function returns true if the difference should be
+subtracted, and false otherwise.
+
+Update the Intel drivers to use the new helper functions. Other vendor
+drivers will be converted to .adjfine and this helper function in the
+following changes.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Acked-by: Richard Cochran <richardcochran@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1060707e380994e7c9b754b6eb74f25459b4a5b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/igb/igb_ptp.c
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
+#	include/linux/ptp_clock_kernel.h
+diff --cc drivers/net/ethernet/intel/igb/igb_ptp.c
+index 02fec948ce64,6f471b91f562..000000000000
+--- a/drivers/net/ethernet/intel/igb/igb_ptp.c
++++ b/drivers/net/ethernet/intel/igb/igb_ptp.c
+@@@ -195,24 -195,9 +195,26 @@@ static int igb_ptp_adjfreq_82576(struc
+  	struct igb_adapter *igb = container_of(ptp, struct igb_adapter,
+  					       ptp_caps);
+  	struct e1000_hw *hw = &igb->hw;
+- 	int neg_adj = 0;
+- 	u64 rate;
+- 	u32 incvalue;
++ 	u64 incvalue;
+  
+++<<<<<<< HEAD
+ +	if (ppb < 0) {
+ +		neg_adj = 1;
+ +		ppb = -ppb;
+ +	}
+ +	rate = ppb;
+ +	rate <<= 14;
+ +	rate = div_u64(rate, 1953125);
+ +
+ +	incvalue = 16 << IGB_82576_TSYNC_SHIFT;
+ +
+ +	if (neg_adj)
+ +		incvalue -= rate;
+ +	else
+ +		incvalue += rate;
+++=======
++ 	incvalue = adjust_by_scaled_ppm(INCVALUE_82576, scaled_ppm);
+++>>>>>>> 1060707e3809 (ptp: introduce helpers to adjust by scaled parts per million)
+  
+  	wr32(E1000_TIMINCA, INCPERIOD_82576 | (incvalue & INCVALUE_82576_MASK));
+  
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
+index 27a71fa26d3c,fd3f77a9e28d..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
+@@@ -445,23 -451,11 +445,31 @@@ static int ixgbe_ptp_adjfreq_82599(stru
+  	struct ixgbe_adapter *adapter =
+  		container_of(ptp, struct ixgbe_adapter, ptp_caps);
+  	struct ixgbe_hw *hw = &adapter->hw;
+++<<<<<<< HEAD
+ +	u64 freq, incval;
+ +	u32 diff;
+ +	int neg_adj = 0;
+ +
+ +	if (ppb < 0) {
+ +		neg_adj = 1;
+ +		ppb = -ppb;
+ +	}
+ +
+ +	smp_mb();
+ +	incval = READ_ONCE(adapter->base_incval);
+ +
+ +	freq = incval;
+ +	freq *= ppb;
+ +	diff = div_u64(freq, 1000000000ULL);
+ +
+ +	incval = neg_adj ? (incval - diff) : (incval + diff);
+++=======
++ 	u64 incval;
++ 
++ 	smp_mb();
++ 	incval = READ_ONCE(adapter->base_incval);
++ 	incval = adjust_by_scaled_ppm(incval, scaled_ppm);
+++>>>>>>> 1060707e3809 (ptp: introduce helpers to adjust by scaled parts per million)
+  
+  	switch (hw->mac.type) {
+  	case ixgbe_mac_X540:
+@@@ -496,16 -492,11 +504,24 @@@ static int ixgbe_ptp_adjfreq_X550(struc
+  	struct ixgbe_adapter *adapter =
+  			container_of(ptp, struct ixgbe_adapter, ptp_caps);
+  	struct ixgbe_hw *hw = &adapter->hw;
+++<<<<<<< HEAD
+ +	int neg_adj = 0;
+ +	u64 rate = IXGBE_X550_BASE_PERIOD;
+ +	u32 inca;
+ +
+ +	if (ppb < 0) {
+ +		neg_adj = 1;
+ +		ppb = -ppb;
+ +	}
+ +	rate *= ppb;
+ +	rate = div_u64(rate, 1000000000ULL);
+++=======
++ 	bool neg_adj;
++ 	u64 rate;
++ 	u32 inca;
++ 
++ 	neg_adj = diff_by_scaled_ppm(IXGBE_X550_BASE_PERIOD, scaled_ppm, &rate);
+++>>>>>>> 1060707e3809 (ptp: introduce helpers to adjust by scaled parts per million)
+  
+  	/* warn if rate is too large */
+  	if (rate >= INCVALUE_MASK)
+diff --cc include/linux/ptp_clock_kernel.h
+index 794cd19149d6,f4781c5766d6..000000000000
+--- a/include/linux/ptp_clock_kernel.h
++++ b/include/linux/ptp_clock_kernel.h
+@@@ -184,7 -222,79 +184,83 @@@ struct ptp_clock_event 
+  	};
+  };
+  
+++<<<<<<< HEAD
+ +#if IS_REACHABLE(CONFIG_PTP_1588_CLOCK)
+++=======
++ /**
++  * scaled_ppm_to_ppb() - convert scaled ppm to ppb
++  *
++  * @ppm:    Parts per million, but with a 16 bit binary fractional field
++  */
++ static inline long scaled_ppm_to_ppb(long ppm)
++ {
++ 	/*
++ 	 * The 'freq' field in the 'struct timex' is in parts per
++ 	 * million, but with a 16 bit binary fractional field.
++ 	 *
++ 	 * We want to calculate
++ 	 *
++ 	 *    ppb = scaled_ppm * 1000 / 2^16
++ 	 *
++ 	 * which simplifies to
++ 	 *
++ 	 *    ppb = scaled_ppm * 125 / 2^13
++ 	 */
++ 	s64 ppb = 1 + ppm;
++ 
++ 	ppb *= 125;
++ 	ppb >>= 13;
++ 	return (long)ppb;
++ }
++ 
++ /**
++  * diff_by_scaled_ppm - Calculate difference using scaled ppm
++  * @base: the base increment value to adjust
++  * @scaled_ppm: scaled parts per million to adjust by
++  * @diff: on return, the absolute value of calculated diff
++  *
++  * Calculate the difference to adjust the base increment using scaled parts
++  * per million.
++  *
++  * Use mul_u64_u64_div_u64 to perform the difference calculation in avoid
++  * possible overflow.
++  *
++  * Returns: true if scaled_ppm is negative, false otherwise
++  */
++ static inline bool diff_by_scaled_ppm(u64 base, long scaled_ppm, u64 *diff)
++ {
++ 	bool negative = false;
++ 
++ 	if (scaled_ppm < 0) {
++ 		negative = true;
++ 		scaled_ppm = -scaled_ppm;
++ 	}
++ 
++ 	*diff = mul_u64_u64_div_u64(base, (u64)scaled_ppm, 1000000ULL << 16);
++ 
++ 	return negative;
++ }
++ 
++ /**
++  * adjust_by_scaled_ppm - Adjust a base increment by scaled parts per million
++  * @base: the base increment value to adjust
++  * @scaled_ppm: scaled parts per million frequency adjustment
++  *
++  * Helper function which calculates a new increment value based on the
++  * requested scaled parts per million adjustment.
++  */
++ static inline u64 adjust_by_scaled_ppm(u64 base, long scaled_ppm)
++ {
++ 	u64 diff;
++ 
++ 	if (diff_by_scaled_ppm(base, scaled_ppm, &diff))
++ 		return base - diff;
++ 
++ 	return base + diff;
++ }
++ 
++ #if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
+++>>>>>>> 1060707e3809 (ptp: introduce helpers to adjust by scaled parts per million)
+  
+  /**
+   * ptp_clock_register() - register a PTP hardware clock driver
+diff --git a/drivers/net/ethernet/intel/e1000e/ptp.c b/drivers/net/ethernet/intel/e1000e/ptp.c
+index 0e488e4fa5c1..6e5a1720e6cd 100644
+--- a/drivers/net/ethernet/intel/e1000e/ptp.c
++++ b/drivers/net/ethernet/intel/e1000e/ptp.c
+@@ -29,17 +29,11 @@ static int e1000e_phc_adjfine(struct ptp_clock_info *ptp, long delta)
+ 	struct e1000_adapter *adapter = container_of(ptp, struct e1000_adapter,
+ 						     ptp_clock_info);
+ 	struct e1000_hw *hw = &adapter->hw;
+-	bool neg_adj = false;
+ 	unsigned long flags;
+-	u64 adjustment;
+-	u32 timinca, incvalue;
++	u64 incvalue;
++	u32 timinca;
+ 	s32 ret_val;
+ 
+-	if (delta < 0) {
+-		neg_adj = true;
+-		delta = -delta;
+-	}
+-
+ 	/* Get the System Time Register SYSTIM base frequency */
+ 	ret_val = e1000e_get_base_timinca(adapter, &timinca);
+ 	if (ret_val)
+@@ -48,11 +42,7 @@ static int e1000e_phc_adjfine(struct ptp_clock_info *ptp, long delta)
+ 	spin_lock_irqsave(&adapter->systim_lock, flags);
+ 
+ 	incvalue = timinca & E1000_TIMINCA_INCVALUE_MASK;
+-
+-	adjustment = mul_u64_u64_div_u64(incvalue, (u64)delta,
+-					 1000000ULL << 16);
+-
+-	incvalue = neg_adj ? (incvalue - adjustment) : (incvalue + adjustment);
++	incvalue = adjust_by_scaled_ppm(incvalue, delta);
+ 
+ 	timinca &= ~E1000_TIMINCA_INCVALUE_MASK;
+ 	timinca |= incvalue;
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_ptp.c b/drivers/net/ethernet/intel/i40e/i40e_ptp.c
+index 2d3533f38d7b..33afa13b7812 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_ptp.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_ptp.c
+@@ -347,23 +347,12 @@ static int i40e_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
+ {
+ 	struct i40e_pf *pf = container_of(ptp, struct i40e_pf, ptp_caps);
+ 	struct i40e_hw *hw = &pf->hw;
+-	u64 adj, freq, diff;
+-	int neg_adj = 0;
+-
+-	if (scaled_ppm < 0) {
+-		neg_adj = 1;
+-		scaled_ppm = -scaled_ppm;
+-	}
++	u64 adj, base_adj;
+ 
+ 	smp_mb(); /* Force any pending update before accessing. */
+-	freq = I40E_PTP_40GB_INCVAL * READ_ONCE(pf->ptp_adj_mult);
+-	diff = mul_u64_u64_div_u64(freq, (u64)scaled_ppm,
+-				   1000000ULL << 16);
++	base_adj = I40E_PTP_40GB_INCVAL * READ_ONCE(pf->ptp_adj_mult);
+ 
+-	if (neg_adj)
+-		adj = I40E_PTP_40GB_INCVAL - diff;
+-	else
+-		adj = I40E_PTP_40GB_INCVAL + diff;
++	adj = adjust_by_scaled_ppm(base_adj, scaled_ppm);
+ 
+ 	wr32(hw, I40E_PRTTSYN_INC_L, adj & 0xFFFFFFFF);
+ 	wr32(hw, I40E_PRTTSYN_INC_H, adj >> 32);
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp.c b/drivers/net/ethernet/intel/ice/ice_ptp.c
+index 2adbd14de486..f45aa23c79dd 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@ -1441,24 +1441,10 @@ static int ice_ptp_adjfine(struct ptp_clock_info *info, long scaled_ppm)
+ {
+ 	struct ice_pf *pf = ptp_info_to_pf(info);
+ 	struct ice_hw *hw = &pf->hw;
+-	u64 incval, diff;
+-	int neg_adj = 0;
++	u64 incval;
+ 	int err;
+ 
+-	incval = ice_base_incval(pf);
+-
+-	if (scaled_ppm < 0) {
+-		neg_adj = 1;
+-		scaled_ppm = -scaled_ppm;
+-	}
+-
+-	diff = mul_u64_u64_div_u64(incval, (u64)scaled_ppm,
+-				   1000000ULL << 16);
+-	if (neg_adj)
+-		incval -= diff;
+-	else
+-		incval += diff;
+-
++	incval = adjust_by_scaled_ppm(ice_base_incval(pf), scaled_ppm);
+ 	err = ice_ptp_write_incval_locked(hw, incval);
+ 	if (err) {
+ 		dev_err(ice_pf_to_dev(pf), "PTP failed to set incval, err %d\n",
+* Unmerged path drivers/net/ethernet/intel/igb/igb_ptp.c
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
+* Unmerged path include/linux/ptp_clock_kernel.h
