@@ -666,8 +666,6 @@ SYM_CODE_END(trampoline_32bit_src)
 	.data
 gdt64:
 	.word	gdt_end - gdt
-	.long	0
-	.word	0
 	.quad   0
 	.balign	8
 gdt:
