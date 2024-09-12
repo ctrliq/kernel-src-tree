@@ -1,0 +1,100 @@
+NFS: Clear the file access cache upon login
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 0eb43812c0270ee3d005ff32f91f7d0a6c4943af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/0eb43812.failed
+
+POSIX typically only refreshes the user's supplementary group
+information upon login. Since NFS servers may often refresh their
+concept of the user supplementary group membership at their own cadence,
+it is possible for the NFS client's access cache to become stale due to
+the user's group membership changing on the server after the user has
+already logged in on the client.
+While it is reasonable to expect that such group membership changes are
+rare, and that we do not want to optimise the cache to accommodate them,
+it is also not unreasonable for the user to expect that if they log out
+and log back in again, that the staleness would clear up.
+
+	Reviewed-by: Benjamin Coddington <bcodding@redhat.com>
+	Tested-by: Benjamin Coddington <bcodding@redhat.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 0eb43812c0270ee3d005ff32f91f7d0a6c4943af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/nfs_fs.h
+diff --cc include/linux/nfs_fs.h
+index 94a6b834caf8,d92fdfd2444c..000000000000
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@@ -61,7 -56,10 +61,14 @@@
+  struct nfs_access_entry {
+  	struct rb_node		rb_node;
+  	struct list_head	lru;
+++<<<<<<< HEAD
+ +	const struct cred *	cred;
+++=======
++ 	kuid_t			fsuid;
++ 	kgid_t			fsgid;
++ 	struct group_info	*group_info;
++ 	u64			timestamp;
+++>>>>>>> 0eb43812c027 (NFS: Clear the file access cache upon login)
+  	__u32			mask;
+  	struct rcu_head		rcu_head;
+  };
+diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
+index 0ab405849d16..389659b662bd 100644
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -2828,9 +2828,28 @@ static struct nfs_access_entry *nfs_access_search_rbtree(struct inode *inode, co
+ 	return NULL;
+ }
+ 
++static u64 nfs_access_login_time(const struct task_struct *task,
++				 const struct cred *cred)
++{
++	const struct task_struct *parent;
++	u64 ret;
++
++	rcu_read_lock();
++	for (;;) {
++		parent = rcu_dereference(task->real_parent);
++		if (parent == task || cred_fscmp(parent->cred, cred) != 0)
++			break;
++		task = parent;
++	}
++	ret = task->start_time;
++	rcu_read_unlock();
++	return ret;
++}
++
+ static int nfs_access_get_cached_locked(struct inode *inode, const struct cred *cred, u32 *mask, bool may_block)
+ {
+ 	struct nfs_inode *nfsi = NFS_I(inode);
++	u64 login_time = nfs_access_login_time(current, cred);
+ 	struct nfs_access_entry *cache;
+ 	bool retry = true;
+ 	int err;
+@@ -2858,6 +2877,9 @@ static int nfs_access_get_cached_locked(struct inode *inode, const struct cred *
+ 		spin_lock(&inode->i_lock);
+ 		retry = false;
+ 	}
++	err = -ENOENT;
++	if ((s64)(login_time - cache->timestamp) > 0)
++		goto out;
+ 	*mask = cache->mask;
+ 	list_move_tail(&cache->lru, &nfsi->access_cache_entry_lru);
+ 	err = 0;
+@@ -2935,6 +2957,7 @@ static void nfs_access_add_rbtree(struct inode *inode, struct nfs_access_entry *
+ 		else
+ 			goto found;
+ 	}
++	set->timestamp = ktime_get_ns();
+ 	rb_link_node(&set->rb_node, parent, p);
+ 	rb_insert_color(&set->rb_node, root_node);
+ 	list_add_tail(&set->lru, &nfsi->access_cache_entry_lru);
+* Unmerged path include/linux/nfs_fs.h
