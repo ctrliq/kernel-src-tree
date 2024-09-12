@@ -1,0 +1,241 @@
+ice: introduce new type of VSI for switchdev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Grzegorz Nitka <grzegorz.nitka@intel.com>
+commit f66756e0ead7a1e80fb53fe03ff1728bcc7600da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/f66756e0.failed
+
+New type of VSI has to be defined for switchdev control plane
+VSI. Number of allocated Tx and Rx queue has to be equal to
+amount of VFs, because each port representor should have one
+Tx and Rx queue.
+
+Also to not increase number of used irqs too much, control plane
+VSI uses only one q_vector and handle all queues in one irq.
+To allow handling all queues in one irq , new function to clean
+msix for eswitch was introduced. This function will schedule napi
+for each representor instead of scheduling it only for one like in
+normal clean irq function.
+
+Only one additional msix has to be requested. Always try to request
+it in ice_ena_msix_range function.
+
+	Signed-off-by: Grzegorz Nitka <grzegorz.nitka@intel.com>
+	Tested-by: Sandeep Penigalapati <sandeep.penigalapati@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit f66756e0ead7a1e80fb53fe03ff1728bcc7600da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_base.c
+diff --cc drivers/net/ethernet/intel/ice/ice_base.c
+index 074b50cd4d82,d7a5ac9346bc..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_base.c
++++ b/drivers/net/ethernet/intel/ice/ice_base.c
+@@@ -749,7 -773,14 +776,18 @@@ ice_vsi_cfg_txq(struct ice_vsi *vsi, st
+  	/* Add unique software queue handle of the Tx queue per
+  	 * TC into the VSI Tx ring
+  	 */
+++<<<<<<< HEAD
+ +	ring->q_handle = ice_calc_txq_handle(vsi, ring, tc);
+++=======
++ 	if (vsi->type == ICE_VSI_SWITCHDEV_CTRL) {
++ 		ring->q_handle = ice_eswitch_calc_q_handle(ring);
++ 
++ 		if (ring->q_handle == ICE_INVAL_Q_INDEX)
++ 			return -ENODEV;
++ 	} else {
++ 		ring->q_handle = ice_calc_q_handle(vsi, ring, tc);
++ 	}
+++>>>>>>> f66756e0ead7 (ice: introduce new type of VSI for switchdev)
+  
+  	status = ice_ena_vsi_txq(vsi->port_info, vsi->idx, tc, ring->q_handle,
+  				 1, qg_buf, buf_len, NULL);
+diff --git a/drivers/net/ethernet/intel/ice/ice.h b/drivers/net/ethernet/intel/ice/ice.h
+index ffdeecf46b8e..628015eea329 100644
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -85,6 +85,7 @@
+ #define ICE_FDIR_MSIX		2
+ #define ICE_RDMA_NUM_AEQ_MSIX	4
+ #define ICE_MIN_RDMA_MSIX	2
++#define ICE_ESWITCH_MSIX	1
+ #define ICE_NO_VSI		0xffff
+ #define ICE_VSI_MAP_CONTIG	0
+ #define ICE_VSI_MAP_SCATTER	1
+* Unmerged path drivers/net/ethernet/intel/ice/ice_base.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_eswitch.c b/drivers/net/ethernet/intel/ice/ice_eswitch.c
+index 242cdbbce61c..8d8f80f45788 100644
+--- a/drivers/net/ethernet/intel/ice/ice_eswitch.c
++++ b/drivers/net/ethernet/intel/ice/ice_eswitch.c
+@@ -261,7 +261,7 @@ static void ice_eswitch_release_env(struct ice_pf *pf)
+ static struct ice_vsi *
+ ice_eswitch_vsi_setup(struct ice_pf *pf, struct ice_port_info *pi)
+ {
+-	return NULL;
++	return ice_vsi_setup(pf, pi, ICE_VSI_SWITCHDEV_CTRL, ICE_INVAL_VFID);
+ }
+ 
+ /**
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index eb5bfd9b933b..69e6ef5726d6 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -24,6 +24,8 @@ const char *ice_vsi_type_str(enum ice_vsi_type vsi_type)
+ 		return "ICE_VSI_CTRL";
+ 	case ICE_VSI_LB:
+ 		return "ICE_VSI_LB";
++	case ICE_VSI_SWITCHDEV_CTRL:
++		return "ICE_VSI_SWITCHDEV_CTRL";
+ 	default:
+ 		return "unknown";
+ 	}
+@@ -132,6 +134,7 @@ static void ice_vsi_set_num_desc(struct ice_vsi *vsi)
+ {
+ 	switch (vsi->type) {
+ 	case ICE_VSI_PF:
++	case ICE_VSI_SWITCHDEV_CTRL:
+ 	case ICE_VSI_CTRL:
+ 	case ICE_VSI_LB:
+ 		/* a user could change the values of num_[tr]x_desc using
+@@ -200,6 +203,14 @@ static void ice_vsi_set_num_qs(struct ice_vsi *vsi, u16 vf_id)
+ 					   max_t(int, vsi->alloc_rxq,
+ 						 vsi->alloc_txq));
+ 		break;
++	case ICE_VSI_SWITCHDEV_CTRL:
++		/* The number of queues for ctrl VSI is equal to number of VFs.
++		 * Each ring is associated to the corresponding VF_PR netdev.
++		 */
++		vsi->alloc_txq = pf->num_alloc_vfs;
++		vsi->alloc_rxq = pf->num_alloc_vfs;
++		vsi->num_q_vectors = 1;
++		break;
+ 	case ICE_VSI_VF:
+ 		vf = &pf->vf[vsi->vf_id];
+ 		if (vf->num_req_qs)
+@@ -408,6 +419,21 @@ static irqreturn_t ice_msix_clean_rings(int __always_unused irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
++static irqreturn_t ice_eswitch_msix_clean_rings(int __always_unused irq, void *data)
++{
++	struct ice_q_vector *q_vector = (struct ice_q_vector *)data;
++	struct ice_pf *pf = q_vector->vsi->back;
++	int i;
++
++	if (!q_vector->tx.ring && !q_vector->rx.ring)
++		return IRQ_HANDLED;
++
++	ice_for_each_vf(pf, i)
++		napi_schedule(&pf->vf[i].repr->q_vector->napi);
++
++	return IRQ_HANDLED;
++}
++
+ /**
+  * ice_vsi_alloc - Allocates the next available struct VSI in the PF
+  * @pf: board private structure
+@@ -448,6 +474,13 @@ ice_vsi_alloc(struct ice_pf *pf, enum ice_vsi_type vsi_type, u16 vf_id)
+ 		ice_vsi_set_num_qs(vsi, ICE_INVAL_VFID);
+ 
+ 	switch (vsi->type) {
++	case ICE_VSI_SWITCHDEV_CTRL:
++		if (ice_vsi_alloc_arrays(vsi))
++			goto err_rings;
++
++		/* Setup eswitch MSIX irq handler for VSI */
++		vsi->irq_handler = ice_eswitch_msix_clean_rings;
++		break;
+ 	case ICE_VSI_PF:
+ 		if (ice_vsi_alloc_arrays(vsi))
+ 			goto err_rings;
+@@ -707,6 +740,12 @@ static void ice_vsi_set_rss_params(struct ice_vsi *vsi)
+ 				      BIT(cap->rss_table_entry_width));
+ 		vsi->rss_lut_type = ICE_AQC_GSET_RSS_LUT_TABLE_TYPE_PF;
+ 		break;
++	case ICE_VSI_SWITCHDEV_CTRL:
++		vsi->rss_table_size = ICE_VSIQF_HLUT_ARRAY_SIZE;
++		vsi->rss_size = min_t(u16, num_online_cpus(),
++				      BIT(cap->rss_table_entry_width));
++		vsi->rss_lut_type = ICE_AQC_GSET_RSS_LUT_TABLE_TYPE_VSI;
++		break;
+ 	case ICE_VSI_VF:
+ 		/* VF VSI will get a small RSS table.
+ 		 * For VSI_LUT, LUT size should be set to 64 bytes.
+@@ -980,6 +1019,9 @@ static int ice_vsi_init(struct ice_vsi *vsi, bool init_vsi)
+ 	case ICE_VSI_PF:
+ 		ctxt->flags = ICE_AQ_VSI_TYPE_PF;
+ 		break;
++	case ICE_VSI_SWITCHDEV_CTRL:
++		ctxt->flags = ICE_AQ_VSI_TYPE_VMDQ2;
++		break;
+ 	case ICE_VSI_VF:
+ 		ctxt->flags = ICE_AQ_VSI_TYPE_VF;
+ 		/* VF number here is the absolute VF number (0-255) */
+@@ -2333,6 +2375,7 @@ static void ice_set_agg_vsi(struct ice_vsi *vsi)
+ 	case ICE_VSI_CTRL:
+ 	case ICE_VSI_LB:
+ 	case ICE_VSI_PF:
++	case ICE_VSI_SWITCHDEV_CTRL:
+ 		max_agg_nodes = ICE_MAX_PF_AGG_NODES;
+ 		agg_node_id_start = ICE_PF_AGG_NODE_ID_START;
+ 		agg_node_iter = &pf->pf_agg_node[0];
+@@ -2484,6 +2527,7 @@ ice_vsi_setup(struct ice_pf *pf, struct ice_port_info *pi,
+ 
+ 	switch (vsi->type) {
+ 	case ICE_VSI_CTRL:
++	case ICE_VSI_SWITCHDEV_CTRL:
+ 	case ICE_VSI_PF:
+ 		ret = ice_vsi_alloc_q_vectors(vsi);
+ 		if (ret)
+@@ -2793,7 +2837,8 @@ void ice_dis_vsi(struct ice_vsi *vsi, bool locked)
+ 		} else {
+ 			ice_vsi_close(vsi);
+ 		}
+-	} else if (vsi->type == ICE_VSI_CTRL) {
++	} else if (vsi->type == ICE_VSI_CTRL ||
++		   vsi->type == ICE_VSI_SWITCHDEV_CTRL) {
+ 		ice_vsi_close(vsi);
+ 	}
+ }
+@@ -3181,6 +3226,7 @@ int ice_vsi_rebuild(struct ice_vsi *vsi, bool init_vsi)
+ 
+ 	switch (vtype) {
+ 	case ICE_VSI_CTRL:
++	case ICE_VSI_SWITCHDEV_CTRL:
+ 	case ICE_VSI_PF:
+ 		ret = ice_vsi_alloc_q_vectors(vsi);
+ 		if (ret)
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index d20272ce0d5c..0fe09dde9ceb 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -3548,6 +3548,13 @@ static int ice_ena_msix_range(struct ice_pf *pf)
+ 		v_left -= needed;
+ 	}
+ 
++	/* reserve for switchdev */
++	needed = ICE_ESWITCH_MSIX;
++	if (v_left < needed)
++		goto no_hw_vecs_left_err;
++	v_budget += needed;
++	v_left -= needed;
++
+ 	/* total used for non-traffic vectors */
+ 	v_other = v_budget;
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_type.h b/drivers/net/ethernet/intel/ice/ice_type.h
+index 6705f56be020..e064439fc1a9 100644
+--- a/drivers/net/ethernet/intel/ice/ice_type.h
++++ b/drivers/net/ethernet/intel/ice/ice_type.h
+@@ -139,6 +139,7 @@ enum ice_vsi_type {
+ 	ICE_VSI_VF = 1,
+ 	ICE_VSI_CTRL = 3,	/* equates to ICE_VSI_PF with 1 queue pair */
+ 	ICE_VSI_LB = 6,
++	ICE_VSI_SWITCHDEV_CTRL = 7,
+ };
+ 
+ struct ice_link_status {
