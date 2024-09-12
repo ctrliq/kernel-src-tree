@@ -1,0 +1,239 @@
+crypto: qat - add internal timer for qat 4xxx
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-530.el8
+commit-author Damian Muszynski <damian.muszynski@intel.com>
+commit fd77d8da1fa85a7549ce3cd50222f9f795cc5f5d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-530.el8/fd77d8da.failed
+
+The power management feature in QAT 4xxx devices can disable clock
+sources used to implement timers. Because of that, the firmware needs to
+get an external reliable source of time.
+
+Add a kernel delayed work that periodically sends an event to the
+firmware. This is triggered every 200ms. At each execution, the driver
+sends a sync request to the firmware reporting the current timestamp
+counter value.
+
+This is a pre-requisite for enabling the heartbeat, telemetry and
+rate limiting features.
+
+	Signed-off-by: Damian Muszynski <damian.muszynski@intel.com>
+	Reviewed-by: Giovanni Cabiddu <giovanni.cabiddu@intel.com>
+	Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit fd77d8da1fa85a7549ce3cd50222f9f795cc5f5d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/qat/qat_common/adf_admin.c
+#	drivers/crypto/qat/qat_common/adf_gen4_timer.c
+#	drivers/crypto/qat/qat_common/adf_gen4_timer.h
+diff --cc drivers/crypto/qat/qat_common/adf_admin.c
+index 118775ee02f2,d6cb7f50bb5a..000000000000
+--- a/drivers/crypto/qat/qat_common/adf_admin.c
++++ b/drivers/crypto/qat/qat_common/adf_admin.c
+@@@ -223,6 -223,36 +223,39 @@@ static int adf_get_dc_capabilities(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:drivers/crypto/qat/qat_common/adf_admin.c
+++=======
++ int adf_get_ae_fw_counters(struct adf_accel_dev *accel_dev, u16 ae, u64 *reqs, u64 *resps)
++ {
++ 	struct icp_qat_fw_init_admin_resp resp = { };
++ 	struct icp_qat_fw_init_admin_req req = { };
++ 	int ret;
++ 
++ 	req.cmd_id = ICP_QAT_FW_COUNTERS_GET;
++ 
++ 	ret = adf_put_admin_msg_sync(accel_dev, ae, &req, &resp);
++ 	if (ret || resp.status)
++ 		return -EFAULT;
++ 
++ 	*reqs = resp.req_rec_count;
++ 	*resps = resp.resp_sent_count;
++ 
++ 	return 0;
++ }
++ 
++ int adf_send_admin_tim_sync(struct adf_accel_dev *accel_dev, u32 cnt)
++ {
++ 	u32 ae_mask = accel_dev->hw_device->ae_mask;
++ 	struct icp_qat_fw_init_admin_req req = { };
++ 	struct icp_qat_fw_init_admin_resp resp = { };
++ 
++ 	req.cmd_id = ICP_QAT_FW_SYNC;
++ 	req.int_timer_ticks = cnt;
++ 
++ 	return adf_send_admin(accel_dev, &req, &resp, ae_mask);
++ }
++ 
+++>>>>>>> fd77d8da1fa8 (crypto: qat - add internal timer for qat 4xxx):drivers/crypto/intel/qat/qat_common/adf_admin.c
+  /**
+   * adf_send_admin_init() - Function sends init message to FW
+   * @accel_dev: Pointer to acceleration device.
+* Unmerged path drivers/crypto/qat/qat_common/adf_gen4_timer.c
+* Unmerged path drivers/crypto/qat/qat_common/adf_gen4_timer.h
+diff --git a/drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c b/drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
+index e543a9e24a06..831d460bc503 100644
+--- a/drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
++++ b/drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
+@@ -8,6 +8,7 @@
+ #include <adf_gen4_hw_data.h>
+ #include <adf_gen4_pfvf.h>
+ #include <adf_gen4_pm.h>
++#include <adf_gen4_timer.h>
+ #include "adf_4xxx_hw_data.h"
+ #include "icp_qat_hw.h"
+ 
+@@ -508,6 +509,8 @@ void adf_init_hw_data_4xxx(struct adf_hw_device_data *hw_data, u32 dev_id)
+ 	hw_data->enable_pm = adf_gen4_enable_pm;
+ 	hw_data->handle_pm_interrupt = adf_gen4_handle_pm_interrupt;
+ 	hw_data->dev_config = adf_gen4_dev_config;
++	hw_data->start_timer = adf_gen4_timer_start;
++	hw_data->stop_timer = adf_gen4_timer_stop;
+ 
+ 	adf_gen4_init_hw_csr_ops(&hw_data->csr_ops);
+ 	adf_gen4_init_pf_pfvf_ops(&hw_data->pfvf_ops);
+diff --git a/drivers/crypto/qat/qat_common/Makefile b/drivers/crypto/qat/qat_common/Makefile
+index 1fb8d50f509f..73aa8115e743 100644
+--- a/drivers/crypto/qat/qat_common/Makefile
++++ b/drivers/crypto/qat/qat_common/Makefile
+@@ -17,6 +17,7 @@ intel_qat-objs := adf_cfg.o \
+ 	adf_gen4_pm.o \
+ 	adf_gen2_dc.o \
+ 	adf_gen4_dc.o \
++	adf_gen4_timer.o \
+ 	qat_crypto.o \
+ 	qat_compression.o \
+ 	qat_comp_algs.o \
+diff --git a/drivers/crypto/qat/qat_common/adf_accel_devices.h b/drivers/crypto/qat/qat_common/adf_accel_devices.h
+index 0399417b91fc..5240185a023e 100644
+--- a/drivers/crypto/qat/qat_common/adf_accel_devices.h
++++ b/drivers/crypto/qat/qat_common/adf_accel_devices.h
+@@ -188,6 +188,8 @@ struct adf_hw_device_data {
+ 	int (*init_admin_comms)(struct adf_accel_dev *accel_dev);
+ 	void (*exit_admin_comms)(struct adf_accel_dev *accel_dev);
+ 	int (*send_admin_init)(struct adf_accel_dev *accel_dev);
++	int (*start_timer)(struct adf_accel_dev *accel_dev);
++	void (*stop_timer)(struct adf_accel_dev *accel_dev);
+ 	int (*init_arb)(struct adf_accel_dev *accel_dev);
+ 	void (*exit_arb)(struct adf_accel_dev *accel_dev);
+ 	const u32 *(*get_arb_mapping)(struct adf_accel_dev *accel_dev);
+@@ -295,6 +297,7 @@ struct adf_accel_dev {
+ 	struct list_head list;
+ 	struct module *owner;
+ 	struct adf_accel_pci accel_pci_dev;
++	struct adf_timer *timer;
+ 	union {
+ 		struct {
+ 			/* protects VF2PF interrupts access */
+* Unmerged path drivers/crypto/qat/qat_common/adf_admin.c
+diff --git a/drivers/crypto/qat/qat_common/adf_common_drv.h b/drivers/crypto/qat/qat_common/adf_common_drv.h
+index b8132eb9bc2a..b0852b2d3e7f 100644
+--- a/drivers/crypto/qat/qat_common/adf_common_drv.h
++++ b/drivers/crypto/qat/qat_common/adf_common_drv.h
+@@ -95,6 +95,7 @@ int adf_init_admin_comms(struct adf_accel_dev *accel_dev);
+ void adf_exit_admin_comms(struct adf_accel_dev *accel_dev);
+ int adf_send_admin_init(struct adf_accel_dev *accel_dev);
+ int adf_init_admin_pm(struct adf_accel_dev *accel_dev, u32 idle_delay);
++int adf_send_admin_tim_sync(struct adf_accel_dev *accel_dev, u32 cnt);
+ int adf_init_arb(struct adf_accel_dev *accel_dev);
+ void adf_exit_arb(struct adf_accel_dev *accel_dev);
+ void adf_update_ring_arb(struct adf_etr_ring_data *ring);
+@@ -193,6 +194,8 @@ int qat_uclo_set_cfg_ae_mask(struct icp_qat_fw_loader_handle *handle,
+ int adf_init_misc_wq(void);
+ void adf_exit_misc_wq(void);
+ bool adf_misc_wq_queue_work(struct work_struct *work);
++bool adf_misc_wq_queue_delayed_work(struct delayed_work *work,
++				    unsigned long delay);
+ #if defined(CONFIG_PCI_IOV)
+ int adf_sriov_configure(struct pci_dev *pdev, int numvfs);
+ void adf_disable_sriov(struct adf_accel_dev *accel_dev);
+* Unmerged path drivers/crypto/qat/qat_common/adf_gen4_timer.c
+* Unmerged path drivers/crypto/qat/qat_common/adf_gen4_timer.h
+diff --git a/drivers/crypto/qat/qat_common/adf_init.c b/drivers/crypto/qat/qat_common/adf_init.c
+index 0985f64ab11a..86b8d96d419f 100644
+--- a/drivers/crypto/qat/qat_common/adf_init.c
++++ b/drivers/crypto/qat/qat_common/adf_init.c
+@@ -162,6 +162,7 @@ static int adf_dev_start(struct adf_accel_dev *accel_dev)
+ 	struct adf_hw_device_data *hw_data = accel_dev->hw_device;
+ 	struct service_hndl *service;
+ 	struct list_head *list_itr;
++	int ret;
+ 
+ 	set_bit(ADF_STATUS_STARTING, &accel_dev->status);
+ 
+@@ -186,6 +187,14 @@ static int adf_dev_start(struct adf_accel_dev *accel_dev)
+ 		return -EFAULT;
+ 	}
+ 
++	if (hw_data->start_timer) {
++		ret = hw_data->start_timer(accel_dev);
++		if (ret) {
++			dev_err(&GET_DEV(accel_dev), "Failed to start internal sync timer\n");
++			return ret;
++		}
++	}
++
+ 	list_for_each(list_itr, &service_table) {
+ 		service = list_entry(list_itr, struct service_hndl, list);
+ 		if (service->event_hld(accel_dev, ADF_EVENT_START)) {
+@@ -231,6 +240,7 @@ static int adf_dev_start(struct adf_accel_dev *accel_dev)
+  */
+ static void adf_dev_stop(struct adf_accel_dev *accel_dev)
+ {
++	struct adf_hw_device_data *hw_data = accel_dev->hw_device;
+ 	struct service_hndl *service;
+ 	struct list_head *list_itr;
+ 	bool wait = false;
+@@ -264,6 +274,9 @@ static void adf_dev_stop(struct adf_accel_dev *accel_dev)
+ 		}
+ 	}
+ 
++	if (hw_data->stop_timer)
++		hw_data->stop_timer(accel_dev);
++
+ 	if (wait)
+ 		msleep(100);
+ 
+diff --git a/drivers/crypto/qat/qat_common/adf_isr.c b/drivers/crypto/qat/qat_common/adf_isr.c
+index ad9e135b8560..2aba194a7c29 100644
+--- a/drivers/crypto/qat/qat_common/adf_isr.c
++++ b/drivers/crypto/qat/qat_common/adf_isr.c
+@@ -380,3 +380,9 @@ bool adf_misc_wq_queue_work(struct work_struct *work)
+ {
+ 	return queue_work(adf_misc_wq, work);
+ }
++
++bool adf_misc_wq_queue_delayed_work(struct delayed_work *work,
++				    unsigned long delay)
++{
++	return queue_delayed_work(adf_misc_wq, work, delay);
++}
+diff --git a/drivers/crypto/qat/qat_common/icp_qat_fw_init_admin.h b/drivers/crypto/qat/qat_common/icp_qat_fw_init_admin.h
+index 56cb827f93ea..d853c9242acf 100644
+--- a/drivers/crypto/qat/qat_common/icp_qat_fw_init_admin.h
++++ b/drivers/crypto/qat/qat_common/icp_qat_fw_init_admin.h
+@@ -37,6 +37,9 @@ struct icp_qat_fw_init_admin_req {
+ 			__u16 ibuf_size_in_kb;
+ 			__u16 resrvd3;
+ 		};
++		struct {
++			__u32 int_timer_ticks;
++		};
+ 		__u32 idle_filter;
+ 	};
+ 
+@@ -97,6 +100,8 @@ struct icp_qat_fw_init_admin_resp {
+ 	};
+ } __packed;
+ 
++#define ICP_QAT_FW_SYNC ICP_QAT_FW_HEARTBEAT_SYNC
++
+ #define ICP_QAT_FW_COMN_HEARTBEAT_OK 0
+ #define ICP_QAT_FW_COMN_HEARTBEAT_BLOCKED 1
+ #define ICP_QAT_FW_COMN_HEARTBEAT_FLAG_BITPOS 0
