@@ -1270,7 +1270,7 @@ static bool gfs2_upgrade_iopen_glock(struct inode *inode)
 		gfs2_glock_dq(gh);
 		return false;
 	}
-	return true;
+	return gfs2_glock_holder_ready(gh) == 0;
 }
 
 /**
