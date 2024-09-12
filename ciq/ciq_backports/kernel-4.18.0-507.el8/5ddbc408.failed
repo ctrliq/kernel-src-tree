@@ -1,0 +1,214 @@
+x86, kcsan: Add __no_kcsan to noinstr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-507.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 5ddbc4082e1072eeeae52ff561a88620a05be08f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-507.el8/5ddbc408.failed
+
+The 'noinstr' function attribute means no-instrumentation, this should
+very much include *SAN. Because lots of that is broken at present,
+only include KCSAN for now, as that is limited to clang11, which has
+sane function attribute behaviour.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+(cherry picked from commit 5ddbc4082e1072eeeae52ff561a88620a05be08f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/compiler_types.h
+diff --cc include/linux/compiler_types.h
+index 4fb18f107703,a8b4266084a1..000000000000
+--- a/include/linux/compiler_types.h
++++ b/include/linux/compiler_types.h
+@@@ -118,65 -104,61 +118,89 @@@ struct ftrace_likely_data 
+  	unsigned long			constant;
+  };
+  
+++<<<<<<< HEAD
+ +/* Section for code which can't be instrumented at all */
+ +#define noinstr								\
+ +	noinline notrace __attribute((__section__(".noinstr.text")))
+ +
+ +#endif /* __KERNEL__ */
+++=======
++ #ifdef CONFIG_ENABLE_MUST_CHECK
++ #define __must_check		__attribute__((__warn_unused_result__))
++ #else
++ #define __must_check
++ #endif
++ 
++ #if defined(CC_USING_HOTPATCH)
++ #define notrace			__attribute__((hotpatch(0, 0)))
++ #elif defined(CC_USING_PATCHABLE_FUNCTION_ENTRY)
++ #define notrace			__attribute__((patchable_function_entry(0, 0)))
++ #else
++ #define notrace			__attribute__((__no_instrument_function__))
++ #endif
++ 
++ /*
++  * it doesn't make sense on ARM (currently the only user of __naked)
++  * to trace naked functions because then mcount is called without
++  * stack and frame pointer being set up and there is no chance to
++  * restore the lr register to the value before mcount was called.
++  */
++ #define __naked			__attribute__((__naked__)) notrace
+++>>>>>>> 5ddbc4082e10 (x86, kcsan: Add __no_kcsan to noinstr)
+ +
+ +#endif /* __ASSEMBLY__ */
+  
+ -#define __compiler_offsetof(a, b)	__builtin_offsetof(a, b)
+ +#ifdef __KERNEL__
+  
+ -/*
+ - * Prefer gnu_inline, so that extern inline functions do not emit an
+ - * externally visible function. This makes extern inline behave as per gnu89
+ - * semantics rather than c99. This prevents multiple symbol definition errors
+ - * of extern inline functions at link time.
+ - * A lot of inline functions can cause havoc with function tracing.
+ - */
+ -#define inline inline __gnu_inline __inline_maybe_unused notrace
+ +/* Don't. Just don't. */
+ +#define __deprecated
+ +#define __deprecated_for_modules
+ +
+ +#ifndef __must_check
+ +#define __must_check
+ +#endif
+ +
+ +#ifndef CONFIG_ENABLE_MUST_CHECK
+ +#undef __must_check
+ +#define __must_check
+ +#endif
+ +
+ +#ifndef __malloc
+ +#define __malloc
+ +#endif
+  
+  /*
+ - * gcc provides both __inline__ and __inline as alternate spellings of
+ - * the inline keyword, though the latter is undocumented. New kernel
+ - * code should only use the inline spelling, but some existing code
+ - * uses __inline__. Since we #define inline above, to ensure
+ - * __inline__ has the same semantics, we need this #define.
+ + * Allow us to avoid 'defined but not used' warnings on functions and data,
+ + * as well as force them to be emitted to the assembly file.
+ + *
+ + * As of gcc 3.4, static functions that are not marked with attribute((used))
+ + * may be elided from the assembly file.  As of gcc 3.4, static data not so
+ + * marked will not be elided, but this may change in a future gcc version.
+ + *
+ + * NOTE: Because distributions shipped with a backported unit-at-a-time
+ + * compiler in gcc 3.3, we must define __used to be __attribute__((used))
+ + * for gcc >=3.3 instead of 3.4.
+ + *
+ + * In prior versions of gcc, such functions and data would be emitted, but
+ + * would be warned about except with attribute((unused)).
+   *
+ - * However, the spelling __inline is strictly reserved for referring
+ - * to the bare keyword.
+ + * Mark functions that are referenced only in inline assembly as __used so
+ + * the code is emitted even though it appears to be unreferenced.
+   */
+ -#define __inline__ inline
+ +#ifndef __used
+ +# define __used			/* unimplemented */
+ +#endif
+  
+ -/*
+ - * GCC does not warn about unused static inline functions for -Wunused-function.
+ - * Suppress the warning in clang as well by using __maybe_unused, but enable it
+ - * for W=1 build. This will allow clang to find unused functions. Remove the
+ - * __inline_maybe_unused entirely after fixing most of -Wunused-function warnings.
+ - */
+ -#ifdef KBUILD_EXTRA_WARN1
+ -#define __inline_maybe_unused
+ -#else
+ -#define __inline_maybe_unused __maybe_unused
+ +#ifndef __maybe_unused
+ +# define __maybe_unused		/* unimplemented */
+ +#endif
+ +
+ +#ifndef __always_unused
+ +# define __always_unused	/* unimplemented */
+ +#endif
+ +
+ +#ifndef noinline
+ +#define noinline
+  #endif
+  
+  /*
+@@@ -185,34 -167,48 +209,38 @@@
+   */
+  #define noinline_for_stack noinline
+  
+ -/*
+ - * Sanitizer helper attributes: Because using __always_inline and
+ - * __no_sanitize_* conflict, provide helper attributes that will either expand
+ - * to __no_sanitize_* in compilation units where instrumentation is enabled
+ - * (__SANITIZE_*__), or __always_inline in compilation units without
+ - * instrumentation (__SANITIZE_*__ undefined).
+ - */
+ -#ifdef __SANITIZE_ADDRESS__
+ -/*
+ - * We can't declare function 'inline' because __no_sanitize_address conflicts
+ - * with inlining. Attempt to inline it may cause a build failure.
+ - *     https://gcc.gnu.org/bugzilla/show_bug.cgi?id=67368
+ - * '__maybe_unused' allows us to avoid defined-but-not-used warnings.
+ - */
+ -# define __no_kasan_or_inline __no_sanitize_address notrace __maybe_unused
+ -# define __no_sanitize_or_inline __no_kasan_or_inline
+ -#else
+ -# define __no_kasan_or_inline __always_inline
+ -#endif
+ -
+ -#define __no_kcsan __no_sanitize_thread
+ -#ifdef __SANITIZE_THREAD__
+ -# define __no_sanitize_or_inline __no_kcsan notrace __maybe_unused
+ -#endif
+ -
+ -#ifndef __no_sanitize_or_inline
+ -#define __no_sanitize_or_inline __always_inline
+ +#ifndef __always_inline
+ +#define __always_inline inline
+  #endif
+  
++ /* Section for code which can't be instrumented at all */
++ #define noinstr								\
++ 	noinline notrace __attribute((__section__(".noinstr.text"))) __no_kcsan
++ 
+  #endif /* __KERNEL__ */
+  
+ -#endif /* __ASSEMBLY__ */
+ -
+  /*
+ - * The below symbols may be defined for one or more, but not ALL, of the above
+ - * compilers. We don't consider that to be an error, so set them to nothing.
+ - * For example, some of them are for compiler specific plugins.
+ + * From the GCC manual:
+ + *
+ + * Many functions do not examine any values except their arguments,
+ + * and have no effects except the return value.  Basically this is
+ + * just slightly more strict class than the `pure' attribute above,
+ + * since function is not allowed to read global memory.
+ + *
+ + * Note that a function that has pointer arguments and examines the
+ + * data pointed to must _not_ be declared `const'.  Likewise, a
+ + * function that calls a non-`const' function usually must not be
+ + * `const'.  It does not make sense for a `const' function to return
+ + * `void'.
+   */
+ +#ifndef __attribute_const__
+ +# define __attribute_const__	/* unimplemented */
+ +#endif
+ +
+ +#ifndef __designated_init
+ +# define __designated_init
+ +#endif
+ +
+  #ifndef __latent_entropy
+  # define __latent_entropy
+  #endif
+* Unmerged path include/linux/compiler_types.h
