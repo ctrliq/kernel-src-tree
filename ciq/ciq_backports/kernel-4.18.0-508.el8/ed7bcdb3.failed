@@ -1,0 +1,129 @@
+NFS: Add support for eager writes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-508.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit ed7bcdb374d20fab9e9dc36853a6735c047ad1b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-508.el8/ed7bcdb3.failed
+
+Support eager writing to the server, meaning that we write the data to
+cache on the server, and wait for that to complete. This ensures that we
+see ENOSPC errors immediately.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit ed7bcdb374d20fab9e9dc36853a6735c047ad1b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/file.c
+#	include/linux/nfs_fs_sb.h
+diff --cc fs/nfs/file.c
+index d8b0450f39fa,16ad5050e046..000000000000
+--- a/fs/nfs/file.c
++++ b/fs/nfs/file.c
+@@@ -633,25 -648,34 +633,43 @@@ ssize_t nfs_file_write(struct kiocb *io
+  
+  	written = result;
+  	iocb->ki_pos += written;
+++<<<<<<< HEAD
+ +	nfs_add_stats(inode, NFSIOS_NORMALWRITTENBYTES, written);
+++=======
++ 
++ 	if (mntflags & NFS_MOUNT_WRITE_EAGER) {
++ 		result = filemap_fdatawrite_range(file->f_mapping,
++ 						  iocb->ki_pos - written,
++ 						  iocb->ki_pos - 1);
++ 		if (result < 0)
++ 			goto out;
++ 	}
++ 	if (mntflags & NFS_MOUNT_WRITE_WAIT) {
++ 		result = filemap_fdatawait_range(file->f_mapping,
++ 						 iocb->ki_pos - written,
++ 						 iocb->ki_pos - 1);
++ 		if (result < 0)
++ 			goto out;
++ 	}
+++>>>>>>> ed7bcdb374d2 (NFS: Add support for eager writes)
+  	result = generic_write_sync(iocb, written);
+  	if (result < 0)
+ -		goto out;
+ +		return result;
+  
+ +out:
+  	/* Return error values */
+  	error = filemap_check_wb_err(file->f_mapping, since);
+ -	if (nfs_need_check_write(file, inode, error)) {
+ -		int err = nfs_wb_all(inode);
+ -		if (err < 0)
+ -			result = err;
+ +	switch (error) {
+ +	default:
+ +		break;
+ +	case -EDQUOT:
+ +	case -EFBIG:
+ +	case -ENOSPC:
+ +		nfs_wb_all(inode);
+ +		error = file_check_and_advance_wb_err(file);
+ +		if (error < 0)
+ +			result = error;
+  	}
+ -	nfs_add_stats(inode, NFSIOS_NORMALWRITTENBYTES, written);
+ -out:
+  	return result;
+  
+  out_swapfile:
+diff --cc include/linux/nfs_fs_sb.h
+index 1e2e696a9754,6f76b32a0238..000000000000
+--- a/include/linux/nfs_fs_sb.h
++++ b/include/linux/nfs_fs_sb.h
+@@@ -154,7 -153,8 +154,12 @@@ struct nfs_server 
+  #define NFS_MOUNT_LOCAL_FCNTL		0x200000
+  #define NFS_MOUNT_SOFTERR		0x400000
+  #define NFS_MOUNT_SOFTREVAL		0x800000
+++<<<<<<< HEAD
+ +#define NFS_MOUNT_TRUNK_DISCOVERY	0x04000000
+++=======
++ #define NFS_MOUNT_WRITE_EAGER		0x01000000
++ #define NFS_MOUNT_WRITE_WAIT		0x02000000
+++>>>>>>> ed7bcdb374d2 (NFS: Add support for eager writes)
+  
+  	unsigned int		caps;		/* server capabilities */
+  	unsigned int		rsize;		/* read size */
+* Unmerged path fs/nfs/file.c
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index 8341ae058ad0..5b3c8a71a705 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -698,16 +698,23 @@ int nfs_writepages(struct address_space *mapping, struct writeback_control *wbc)
+ {
+ 	struct inode *inode = mapping->host;
+ 	struct nfs_pageio_descriptor pgio;
+-	struct nfs_io_completion *ioc;
++	struct nfs_io_completion *ioc = NULL;
++	unsigned int mntflags = NFS_SERVER(inode)->flags;
++	int priority = 0;
+ 	int err;
+ 
+ 	nfs_inc_stats(inode, NFSIOS_VFSWRITEPAGES);
+ 
+-	ioc = nfs_io_completion_alloc(GFP_KERNEL);
+-	if (ioc)
+-		nfs_io_completion_init(ioc, nfs_io_completion_commit, inode);
++	if (!(mntflags & NFS_MOUNT_WRITE_EAGER) || wbc->for_kupdate ||
++	    wbc->for_background || wbc->for_sync || wbc->for_reclaim) {
++		ioc = nfs_io_completion_alloc(GFP_KERNEL);
++		if (ioc)
++			nfs_io_completion_init(ioc, nfs_io_completion_commit,
++					       inode);
++		priority = wb_priority(wbc);
++	}
+ 
+-	nfs_pageio_init_write(&pgio, inode, wb_priority(wbc), false,
++	nfs_pageio_init_write(&pgio, inode, priority, false,
+ 				&nfs_async_write_completion_ops);
+ 	pgio.pg_io_completion = ioc;
+ 	err = write_cache_pages(mapping, wbc, nfs_writepages_callback, &pgio);
+* Unmerged path include/linux/nfs_fs_sb.h
