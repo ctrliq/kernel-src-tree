@@ -1,0 +1,168 @@
+s390/vfio-ap: store entire AP queue status word with the queue object
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-523.el8
+commit-author Tony Krowiak <akrowiak@linux.ibm.com>
+commit 62aab082e9993163731656ce270cd3c1d29079af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-523.el8/62aab082.failed
+
+Store the entire AP queue status word returned from the ZAPQ command with
+the struct vfio_ap_queue object instead of just the response code field.
+The other information contained in the status word is need by the
+apq_reset_check function to display a proper message to indicate that the
+vfio_ap driver is waiting for the ZAPQ to complete because the queue is
+not empty or IRQs are still enabled.
+
+	Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Tested-by: Viktor Mihajlovski <mihajlov@linux.ibm.com>
+Link: https://lore.kernel.org/r/20230815184333.6554-7-akrowiak@linux.ibm.com
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 62aab082e9993163731656ce270cd3c1d29079af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/vfio_ap_ops.c
+diff --cc drivers/s390/crypto/vfio_ap_ops.c
+index ef0d06898296,43224f7a40ea..000000000000
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@@ -1560,23 -1621,48 +1560,57 @@@ static int apq_status_check(int apqn, s
+  	}
+  }
+  
+ -#define WAIT_MSG "Waited %dms for reset of queue %02x.%04x (%u, %u, %u)"
+ -
+  static int apq_reset_check(struct vfio_ap_queue *q)
+  {
+ -	int ret = -EBUSY, elapsed = 0;
+ +	int ret;
+ +	int iters = MAX_RESET_CHECK_WAIT / AP_RESET_INTERVAL;
+  	struct ap_queue_status status;
+  
+++<<<<<<< HEAD
+ +	for (; iters > 0; iters--) {
+++=======
++ 	memcpy(&status, &q->reset_status, sizeof(status));
++ 	while (true) {
+++>>>>>>> 62aab082e999 (s390/vfio-ap: store entire AP queue status word with the queue object)
+  		msleep(AP_RESET_INTERVAL);
+ -		elapsed += AP_RESET_INTERVAL;
+  		status = ap_tapq(q->apqn, NULL);
+  		ret = apq_status_check(q->apqn, &status);
+ -		if (ret == -EIO)
+ +		if (ret != -EBUSY)
+  			return ret;
+++<<<<<<< HEAD
+++=======
++ 		if (ret == -EBUSY) {
++ 			pr_notice_ratelimited(WAIT_MSG, elapsed,
++ 					      AP_QID_CARD(q->apqn),
++ 					      AP_QID_QUEUE(q->apqn),
++ 					      status.response_code,
++ 					      status.queue_empty,
++ 					      status.irq_enabled);
++ 		} else {
++ 			if (q->reset_status.response_code == AP_RESPONSE_RESET_IN_PROGRESS ||
++ 			    q->reset_status.response_code == AP_RESPONSE_BUSY) {
++ 				status = ap_zapq(q->apqn, 0);
++ 				memcpy(&q->reset_status, &status, sizeof(status));
++ 				continue;
++ 			}
++ 			/*
++ 			 * When an AP adapter is deconfigured, the
++ 			 * associated queues are reset, so let's set the
++ 			 * status response code to 0 so the queue may be
++ 			 * passed through (i.e., not filtered)
++ 			 */
++ 			if (status.response_code == AP_RESPONSE_DECONFIGURED)
++ 				q->reset_status.response_code = 0;
++ 			if (q->saved_isc != VFIO_AP_ISC_INVALID)
++ 				vfio_ap_free_aqic_resources(q);
++ 			break;
++ 		}
+++>>>>>>> 62aab082e999 (s390/vfio-ap: store entire AP queue status word with the queue object)
+  	}
+ +	WARN_ONCE(iters <= 0,
+ +		  "timeout verifying reset of queue %02x.%04x (%u, %u, %u)",
+ +		  AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn),
+ +		  status.queue_empty, status.irq_enabled, status.response_code);
+  	return ret;
+  }
+  
+@@@ -1588,34 -1673,27 +1622,47 @@@ static int vfio_ap_mdev_reset_queue(str
+  
+  	if (!q)
+  		return 0;
+ +retry_zapq:
+  	status = ap_zapq(q->apqn, 0);
+- 	q->reset_rc = status.response_code;
++ 	memcpy(&q->reset_status, &status, sizeof(status));
+  	switch (status.response_code) {
+  	case AP_RESPONSE_NORMAL:
+ +		ret = 0;
+ +		/* if the reset has not completed, wait for it to take effect */
+ +		if (!status.queue_empty || status.irq_enabled)
+ +			ret = apq_reset_check(q);
+ +		break;
+  	case AP_RESPONSE_RESET_IN_PROGRESS:
+ -	case AP_RESPONSE_BUSY:
+ -		/* Let's verify whether the ZAPQ completed successfully */
+ -		ret = apq_reset_check(q);
+ +		if (retry--) {
+ +			msleep(20);
+ +			goto retry_zapq;
+ +		}
+ +		ret = -EBUSY;
+  		break;
+ +	case AP_RESPONSE_Q_NOT_AVAIL:
+  	case AP_RESPONSE_DECONFIGURED:
+++<<<<<<< HEAD
+ +	case AP_RESPONSE_CHECKSTOPPED:
+ +		WARN_ONCE(status.irq_enabled,
+ +			  "PQAP/ZAPQ for %02x.%04x failed with rc=%u while IRQ enabled",
+ +			  AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn),
+ +			  status.response_code);
+ +		ret = -EBUSY;
+ +		goto free_resources;
+++=======
++ 		/*
++ 		 * When an AP adapter is deconfigured, the associated
++ 		 * queues are reset, so let's set the status response code to 0
++ 		 * so the queue may be passed through (i.e., not filtered) and
++ 		 * return a value indicating the reset completed successfully.
++ 		 */
++ 		q->reset_status.response_code = 0;
++ 		ret = 0;
++ 		vfio_ap_free_aqic_resources(q);
++ 		break;
+++>>>>>>> 62aab082e999 (s390/vfio-ap: store entire AP queue status word with the queue object)
+  	default:
+ +		/* things are really broken, give up */
+  		WARN(true,
+  		     "PQAP/ZAPQ for %02x.%04x failed with invalid rc=%u\n",
+  		     AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn),
+* Unmerged path drivers/s390/crypto/vfio_ap_ops.c
+diff --git a/drivers/s390/crypto/vfio_ap_private.h b/drivers/s390/crypto/vfio_ap_private.h
+index 69446da9e20a..e9c09215bb3a 100644
+--- a/drivers/s390/crypto/vfio_ap_private.h
++++ b/drivers/s390/crypto/vfio_ap_private.h
+@@ -134,7 +134,7 @@ struct ap_matrix_mdev {
+  * @apqn: the APQN of the AP queue device
+  * @saved_isc: the guest ISC registered with the GIB interface
+  * @mdev_qnode: allows the vfio_ap_queue struct to be added to a hashtable
+- * @reset_rc: the status response code from the last reset of the queue
++ * @reset_status: the status from the last reset of the queue
+  */
+ struct vfio_ap_queue {
+ 	struct ap_matrix_mdev *matrix_mdev;
+@@ -143,7 +143,7 @@ struct vfio_ap_queue {
+ #define VFIO_AP_ISC_INVALID 0xff
+ 	unsigned char saved_isc;
+ 	struct hlist_node mdev_qnode;
+-	unsigned int reset_rc;
++	struct ap_queue_status reset_status;
+ };
+ 
+ int vfio_ap_mdev_register(void);
