@@ -27,6 +27,7 @@
 #include <asm/fpu/xcr.h>
 #include <asm/processor.h>
 #include <asm/realmode.h>
+#include <asm/setup.h>
 #include <asm/traps.h>
 #include <asm/svm.h>
 #include <asm/smp.h>
@@ -86,9 +87,6 @@ struct ghcb_state {
 
 static DEFINE_PER_CPU(struct sev_es_runtime_data*, runtime_data);
 DEFINE_STATIC_KEY_FALSE(sev_es_enable_key);
-
-/* Needed in vc_early_forward_exception */
-void do_early_exception(struct pt_regs *regs, int trapnr);
 
 static __always_inline bool on_vc_stack(struct pt_regs *regs)
 {
@@ -199,9 +197,6 @@ static __always_inline struct ghcb *sev_es_get_ghcb(struct ghcb_state *state)
 
 	return ghcb;
 }
-
-/* Needed in vc_early_forward_exception */
-void do_early_exception(struct pt_regs *regs, int trapnr);
 
 static inline u64 sev_es_rd_ghcb_msr(void)
 {
