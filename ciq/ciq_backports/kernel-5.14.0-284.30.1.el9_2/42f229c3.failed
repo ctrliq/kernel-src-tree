@@ -1,0 +1,282 @@
+rxrpc: Fix incoming call setup race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 42f229c350f57a8e825f7591e17cbc5c87e50235
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/42f229c3.failed
+
+An incoming call can race with rxrpc socket destruction, leading to a
+leaked call.  This may result in an oops when the call timer eventually
+expires:
+
+   BUG: kernel NULL pointer dereference, address: 0000000000000874
+   RIP: 0010:_raw_spin_lock_irqsave+0x2a/0x50
+   Call Trace:
+    <IRQ>
+    try_to_wake_up+0x59/0x550
+    ? __local_bh_enable_ip+0x37/0x80
+    ? rxrpc_poke_call+0x52/0x110 [rxrpc]
+    ? rxrpc_poke_call+0x110/0x110 [rxrpc]
+    ? rxrpc_poke_call+0x110/0x110 [rxrpc]
+    call_timer_fn+0x24/0x120
+
+with a warning in the kernel log looking something like:
+
+   rxrpc: Call 00000000ba5e571a still in use (1,SvAwtACK,1061d,0)!
+
+incurred during rmmod of rxrpc.  The 1061d is the call flags:
+
+   RECVMSG_READ_ALL, RX_HEARD, BEGAN_RX_TIMER, RX_LAST, EXPOSED,
+   IS_SERVICE, RELEASED
+
+but no DISCONNECTED flag (0x800), so it's an incoming (service) call and
+it's still connected.
+
+The race appears to be that:
+
+ (1) rxrpc_new_incoming_call() consults the service struct, checks sk_state
+     and allocates a call - then pauses, possibly for an interrupt.
+
+ (2) rxrpc_release_sock() sets RXRPC_CLOSE, nulls the service pointer,
+     discards the prealloc and releases all calls attached to the socket.
+
+ (3) rxrpc_new_incoming_call() resumes, launching the new call, including
+     its timer and attaching it to the socket.
+
+Fix this by read-locking local->services_lock to access the AF_RXRPC socket
+providing the service rather than RCU in rxrpc_new_incoming_call().
+There's no real need to use RCU here as local->services_lock is only
+write-locked by the socket side in two places: when binding and when
+shutting down.
+
+Fixes: 5e6ef4f1017c ("rxrpc: Make the I/O thread take over the call and local processor work")
+	Reported-by: Marc Dionne <marc.dionne@auristor.com>
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit 42f229c350f57a8e825f7591e17cbc5c87e50235)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/call_accept.c
+#	net/rxrpc/security.c
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,433060cade03..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -276,18 -277,26 +276,24 @@@ struct rxrpc_local 
+  	struct rcu_head		rcu;
+  	atomic_t		active_users;	/* Number of users of the local endpoint */
+  	refcount_t		ref;		/* Number of references to the structure */
+ -	struct net		*net;		/* The network namespace */
+ -	struct rxrpc_net	*rxnet;		/* Our bits in the network namespace */
+ +	struct rxrpc_net	*rxnet;		/* The network ns in which this resides */
+  	struct hlist_node	link;
+  	struct socket		*socket;	/* my UDP socket */
+++<<<<<<< HEAD
+ +	struct work_struct	processor;
+ +	struct list_head	ack_tx_queue;	/* List of ACKs that need sending */
+ +	spinlock_t		ack_tx_lock;	/* ACK list lock */
+ +	struct rxrpc_sock __rcu	*service;	/* Service(s) listening on this endpoint */
+++=======
++ 	struct task_struct	*io_thread;
++ 	struct completion	io_thread_ready; /* Indication that the I/O thread started */
++ 	struct rxrpc_sock	*service;	/* Service(s) listening on this endpoint */
+++>>>>>>> 42f229c350f5 (rxrpc: Fix incoming call setup race)
+  	struct rw_semaphore	defrag_sem;	/* control re-enablement of IP DF bit */
+ -	struct sk_buff_head	rx_queue;	/* Received packets */
+ -	struct list_head	conn_attend_q;	/* Conns requiring immediate attention */
+ -	struct list_head	call_attend_q;	/* Calls requiring immediate attention */
+ -
+ +	struct sk_buff_head	reject_queue;	/* packets awaiting rejection */
+ +	struct sk_buff_head	event_queue;	/* endpoint event packets awaiting processing */
+  	struct rb_root		client_bundles;	/* Client connection bundles by socket params */
+  	spinlock_t		client_bundles_lock; /* Lock for client_bundles */
+ -	bool			kill_all_client_conns;
+ -	struct list_head	idle_client_conns;
+ -	struct timer_list	client_conn_reap_timer;
+ -	unsigned long		client_conn_flags;
+ -#define RXRPC_CLIENT_CONN_REAP_TIMER	0	/* The client conn reap timer expired */
+ -
+  	spinlock_t		lock;		/* access lock */
+  	rwlock_t		services_lock;	/* lock for services list */
+  	int			debug_id;	/* debug ID for printks */
+diff --cc net/rxrpc/call_accept.c
+index afe1f587aaf0,3e8689fdc437..000000000000
+--- a/net/rxrpc/call_accept.c
++++ b/net/rxrpc/call_accept.c
+@@@ -354,6 -338,33 +354,35 @@@ struct rxrpc_call *rxrpc_new_incoming_c
+  
+  	_enter("");
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Don't set up a call for anything other than a DATA packet. */
++ 	if (sp->hdr.type != RXRPC_PACKET_TYPE_DATA)
++ 		return rxrpc_protocol_error(skb, rxrpc_eproto_no_service_call);
++ 
++ 	read_lock(&local->services_lock);
++ 
++ 	/* Weed out packets to services we're not offering.  Packets that would
++ 	 * begin a call are explicitly rejected and the rest are just
++ 	 * discarded.
++ 	 */
++ 	rx = local->service;
++ 	if (!rx || (sp->hdr.serviceId != rx->srx.srx_service &&
++ 		    sp->hdr.serviceId != rx->second_service)
++ 	    ) {
++ 		if (sp->hdr.type == RXRPC_PACKET_TYPE_DATA &&
++ 		    sp->hdr.seq == 1)
++ 			goto unsupported_service;
++ 		goto discard;
++ 	}
++ 
++ 	if (!conn) {
++ 		sec = rxrpc_get_incoming_security(rx, skb);
++ 		if (!sec)
++ 			goto unsupported_security;
++ 	}
++ 
+++>>>>>>> 42f229c350f5 (rxrpc: Fix incoming call setup race)
+  	spin_lock(&rx->incoming_lock);
+  	if (rx->sk.sk_state == RXRPC_SERVER_LISTEN_DISABLED ||
+  	    rx->sk.sk_state == RXRPC_CLOSE) {
+@@@ -394,50 -391,43 +423,73 @@@
+  		rx->notify_new_call(&rx->sk, call, call->user_call_ID);
+  
+  	spin_lock(&conn->state_lock);
+ -	if (conn->state == RXRPC_CONN_SERVICE_UNSECURED) {
+ +	switch (conn->state) {
+ +	case RXRPC_CONN_SERVICE_UNSECURED:
+  		conn->state = RXRPC_CONN_SERVICE_CHALLENGING;
+  		set_bit(RXRPC_CONN_EV_CHALLENGE, &call->conn->events);
+ -		rxrpc_queue_conn(call->conn, rxrpc_conn_queue_challenge);
+ +		rxrpc_queue_conn(call->conn);
+ +		break;
+ +
+ +	case RXRPC_CONN_SERVICE:
+ +		write_lock(&call->state_lock);
+ +		if (call->state < RXRPC_CALL_COMPLETE)
+ +			call->state = RXRPC_CALL_SERVER_RECV_REQUEST;
+ +		write_unlock(&call->state_lock);
+ +		break;
+ +
+ +	case RXRPC_CONN_REMOTELY_ABORTED:
+ +		rxrpc_set_call_completion(call, RXRPC_CALL_REMOTELY_ABORTED,
+ +					  conn->abort_code, conn->error);
+ +		break;
+ +	case RXRPC_CONN_LOCALLY_ABORTED:
+ +		rxrpc_abort_call("CON", call, sp->hdr.seq,
+ +				 conn->abort_code, conn->error);
+ +		break;
+ +	default:
+ +		BUG();
+  	}
+  	spin_unlock(&conn->state_lock);
+ -
+  	spin_unlock(&rx->incoming_lock);
+++<<<<<<< HEAD
+++=======
++ 	read_unlock(&local->services_lock);
+++>>>>>>> 42f229c350f5 (rxrpc: Fix incoming call setup race)
+  
+ -	if (hlist_unhashed(&call->error_link)) {
+ -		spin_lock(&call->peer->lock);
+ -		hlist_add_head(&call->error_link, &call->peer->error_targets);
+ -		spin_unlock(&call->peer->lock);
+ -	}
+ +	rxrpc_send_ping(call, skb);
+ +
+ +	/* We have to discard the prealloc queue's ref here and rely on a
+ +	 * combination of the RCU read lock and refs held either by the socket
+ +	 * (recvmsg queue, to-be-accepted queue or user ID tree) or the kernel
+ +	 * service to prevent the call from being deallocated too early.
+ +	 */
+ +	rxrpc_put_call(call, rxrpc_call_put_discard_prealloc);
+  
+  	_leave(" = %p{%d}", call, call->debug_id);
+ -	rxrpc_input_call_event(call, skb);
+ -	rxrpc_put_call(call, rxrpc_call_put_input);
+ -	return true;
+ +	return call;
+  
+++<<<<<<< HEAD
+ +no_call:
+ +	spin_unlock(&rx->incoming_lock);
+ +	_leave(" = NULL [%u]", skb->mark);
+ +	return NULL;
+++=======
++ unsupported_service:
++ 	read_unlock(&local->services_lock);
++ 	return rxrpc_direct_abort(skb, rxrpc_abort_service_not_offered,
++ 				  RX_INVALID_OPERATION, -EOPNOTSUPP);
++ unsupported_security:
++ 	read_unlock(&local->services_lock);
++ 	return rxrpc_direct_abort(skb, rxrpc_abort_service_not_offered,
++ 				  RX_INVALID_OPERATION, -EKEYREJECTED);
++ no_call:
++ 	spin_unlock(&rx->incoming_lock);
++ 	read_unlock(&local->services_lock);
++ 	_leave(" = f [%u]", skb->mark);
++ 	return false;
++ discard:
++ 	read_unlock(&local->services_lock);
++ 	return true;
+++>>>>>>> 42f229c350f5 (rxrpc: Fix incoming call setup race)
+  }
+  
+  /*
+diff --cc net/rxrpc/security.c
+index 50cb5f1ee0c0,cb8dd1d3b1d4..000000000000
+--- a/net/rxrpc/security.c
++++ b/net/rxrpc/security.c
+@@@ -161,9 -178,9 +161,13 @@@ struct key *rxrpc_look_up_server_securi
+  		sprintf(kdesc, "%u:%u",
+  			sp->hdr.serviceId, sp->hdr.securityIndex);
+  
+- 	rcu_read_lock();
++ 	read_lock(&conn->local->services_lock);
+  
+++<<<<<<< HEAD
+ +	rx = rcu_dereference(conn->params.local->service);
+++=======
++ 	rx = conn->local->service;
+++>>>>>>> 42f229c350f5 (rxrpc: Fix incoming call setup race)
+  	if (!rx)
+  		goto out;
+  
+diff --git a/net/rxrpc/af_rxrpc.c b/net/rxrpc/af_rxrpc.c
+index 0f4d34f420f0..1df9cb1f9275 100644
+--- a/net/rxrpc/af_rxrpc.c
++++ b/net/rxrpc/af_rxrpc.c
+@@ -155,10 +155,10 @@ static int rxrpc_bind(struct socket *sock, struct sockaddr *saddr, int len)
+ 
+ 		if (service_id) {
+ 			write_lock(&local->services_lock);
+-			if (rcu_access_pointer(local->service))
++			if (local->service)
+ 				goto service_in_use;
+ 			rx->local = local;
+-			rcu_assign_pointer(local->service, rx);
++			local->service = rx;
+ 			write_unlock(&local->services_lock);
+ 
+ 			rx->sk.sk_state = RXRPC_SERVER_BOUND;
+@@ -872,9 +872,9 @@ static int rxrpc_release_sock(struct sock *sk)
+ 
+ 	sk->sk_state = RXRPC_CLOSE;
+ 
+-	if (rx->local && rcu_access_pointer(rx->local->service) == rx) {
++	if (rx->local && rx->local->service == rx) {
+ 		write_lock(&rx->local->services_lock);
+-		rcu_assign_pointer(rx->local->service, NULL);
++		rx->local->service = NULL;
+ 		write_unlock(&rx->local->services_lock);
+ 	}
+ 
+* Unmerged path net/rxrpc/ar-internal.h
+* Unmerged path net/rxrpc/call_accept.c
+* Unmerged path net/rxrpc/security.c
