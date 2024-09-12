@@ -20,6 +20,7 @@
 #include <asm/zcrypt.h>
 
 #include "vfio_ap_private.h"
+#include "vfio_ap_debug.h"
 
 #define VFIO_AP_MDEV_TYPE_HWVIRT "passthrough"
 #define VFIO_AP_MDEV_NAME_HWVIRT "VFIO AP Passthrough Device"
@@ -28,12 +29,11 @@
 #define AP_QUEUE_UNASSIGNED "unassigned"
 #define AP_QUEUE_IN_USE "in use"
 
-#define MAX_RESET_CHECK_WAIT	200	/* Sleep max 200ms for reset check	*/
 #define AP_RESET_INTERVAL		20	/* Reset sleep interval (20ms)		*/
 
 static int vfio_ap_mdev_reset_queues(struct ap_queue_table *qtable);
 static struct vfio_ap_queue *vfio_ap_find_queue(int apqn);
-static int vfio_ap_mdev_reset_queue(struct vfio_ap_queue *q, unsigned int retry);
+static void vfio_ap_mdev_reset_queue(struct vfio_ap_queue *q);
 
 /**
  * get_update_locks_for_kvm: Acquire the locks required to dynamically update a
@@ -334,11 +334,65 @@ end_free:
 }
 
 /**
+ * vfio_ap_validate_nib - validate a notification indicator byte (nib) address.
+ *
+ * @vcpu: the object representing the vcpu executing the PQAP(AQIC) instruction.
+ * @nib: the location for storing the nib address.
+ * @g_pfn: the location for storing the page frame number of the page containing
+ *	   the nib.
+ *
+ * When the PQAP(AQIC) instruction is executed, general register 2 contains the
+ * address of the notification indicator byte (nib) used for IRQ notification.
+ * This function parses the nib from gr2 and calculates the page frame
+ * number for the guest of the page containing the nib. The values are
+ * stored in @nib and @g_pfn respectively.
+ *
+ * The g_pfn of the nib is then validated to ensure the nib address is valid.
+ *
+ * Return: returns zero if the nib address is a valid; otherwise, returns
+ *	   -EINVAL.
+ */
+static int vfio_ap_validate_nib(struct kvm_vcpu *vcpu, unsigned long *nib,
+				unsigned long *g_pfn)
+{
+	*nib = vcpu->run->s.regs.gprs[2];
+	*g_pfn = *nib >> PAGE_SHIFT;
+
+	if (kvm_is_error_hva(gfn_to_hva(vcpu->kvm, *g_pfn)))
+		return -EINVAL;
+
+	return 0;
+}
+
+static int ensure_nib_shared(unsigned long addr, struct gmap *gmap)
+{
+	int ret;
+
+	/*
+	 * The nib has to be located in shared storage since guest and
+	 * host access it. vfio_pin_pages() will do a pin shared and
+	 * if that fails (possibly because it's not a shared page) it
+	 * calls export. We try to do a second pin shared here so that
+	 * the UV gives us an error code if we try to pin a non-shared
+	 * page.
+	 *
+	 * If the page is already pinned shared the UV will return a success.
+	 */
+	ret = uv_pin_shared(addr);
+	if (ret) {
+		/* vfio_pin_pages() likely exported the page so let's re-import */
+		gmap_convert_to_secure(gmap, addr);
+	}
+	return ret;
+}
+
+/**
  * vfio_ap_irq_enable - Enable Interruption for a APQN
  *
  * @q:	 the vfio_ap_queue holding AQIC parameters
  * @isc: the guest ISC to register with the GIB interface
- * @nib: the notification indicator byte to pin.
+ * @vcpu: the vcpu object containing the registers specifying the parameters
+ *	  passed to the PQAP(AQIC) instruction.
  *
  * Pin the NIB saved in *q
  * Register the guest ISC to GIB interface and retrieve the
@@ -354,22 +408,36 @@ end_free:
  */
 static struct ap_queue_status vfio_ap_irq_enable(struct vfio_ap_queue *q,
 						 int isc,
-						 unsigned long nib)
+						 struct kvm_vcpu *vcpu)
 {
+	unsigned long nib;
 	union ap_qirq_ctrl aqic_gisa = { .value = 0 };
 	struct ap_queue_status status = {};
 	struct kvm_s390_gisa *gisa;
+	int nisc;
 	struct kvm *kvm;
 	unsigned long h_nib, g_pfn, h_pfn;
 	int ret;
 
-	g_pfn = nib >> PAGE_SHIFT;
+	/* Verify that the notification indicator byte address is valid */
+	if (vfio_ap_validate_nib(vcpu, &nib, &g_pfn)) {
+		VFIO_AP_DBF_WARN("%s: invalid NIB address: nib=%#lx, g_pfn=%#lx, apqn=%#04x\n",
+				 __func__, nib, g_pfn, q->apqn);
+
+		status.response_code = AP_RESPONSE_INVALID_ADDRESS;
+		return status;
+	}
+
 	ret = vfio_pin_pages(mdev_dev(q->matrix_mdev->mdev), &g_pfn, 1,
 			     IOMMU_READ | IOMMU_WRITE, &h_pfn);
 	switch (ret) {
 	case 1:
 		break;
 	default:
+		VFIO_AP_DBF_WARN("%s: vfio_pin_pages failed: rc=%d,"
+				 "nib=%#lx, g_pfn=%#lx, apqn=%#04x\n",
+				 __func__, ret, nib, g_pfn, q->apqn);
+
 		status.response_code = AP_RESPONSE_INVALID_ADDRESS;
 		return status;
 	}
@@ -379,7 +447,25 @@ static struct ap_queue_status vfio_ap_irq_enable(struct vfio_ap_queue *q,
 
 	h_nib = (h_pfn << PAGE_SHIFT) | (nib & ~PAGE_MASK);
 	aqic_gisa.gisc = isc;
-	aqic_gisa.isc = kvm_s390_gisc_register(kvm, isc);
+
+	/* NIB in non-shared storage is a rc 6 for PV guests */
+	if (kvm_s390_pv_cpu_is_protected(vcpu) &&
+	    ensure_nib_shared(h_nib & PAGE_MASK, kvm->arch.gmap)) {
+		vfio_unpin_pages(mdev_dev(q->matrix_mdev->mdev), &nib, 1);
+		status.response_code = AP_RESPONSE_INVALID_ADDRESS;
+		return status;
+	}
+
+	nisc = kvm_s390_gisc_register(kvm, isc);
+	if (nisc < 0) {
+		VFIO_AP_DBF_WARN("%s: gisc registration failed: nisc=%d, isc=%d, apqn=%#04x\n",
+				 __func__, nisc, isc, q->apqn);
+
+		status.response_code = AP_RESPONSE_INVALID_GISA;
+		return status;
+	}
+
+	aqic_gisa.isc = nisc;
 	aqic_gisa.ir = 1;
 	aqic_gisa.gisa = (uint64_t)gisa >> 4;
 
@@ -401,6 +487,16 @@ static struct ap_queue_status vfio_ap_irq_enable(struct vfio_ap_queue *q,
 			status.response_code);
 		vfio_ap_irq_disable(q);
 		break;
+	}
+
+	if (status.response_code != AP_RESPONSE_NORMAL) {
+		VFIO_AP_DBF_WARN("%s: PQAP(AQIC) failed with status=%#02x: "
+				 "zone=%#x, ir=%#x, gisc=%#x, f=%#x,"
+				 "gisa=%#x, isc=%#x, apqn=%#04x\n",
+				 __func__, status.response_code,
+				 aqic_gisa.zone, aqic_gisa.ir, aqic_gisa.gisc,
+				 aqic_gisa.gf, aqic_gisa.gisa, aqic_gisa.isc,
+				 q->apqn);
 	}
 
 	return status;
@@ -460,8 +556,7 @@ static int handle_pqap(struct kvm_vcpu *vcpu)
 
 	/* If IR bit(16) is set we enable the interrupt */
 	if ((status >> (63 - 16)) & 0x01)
-		qstatus = vfio_ap_irq_enable(q, status & 0x07,
-					     vcpu->run->s.regs.gprs[2]);
+		qstatus = vfio_ap_irq_enable(q, status & 0x07, vcpu);
 	else
 		qstatus = vfio_ap_irq_disable(q);
 
@@ -551,7 +646,7 @@ static bool vfio_ap_mdev_filter_matrix(unsigned long *apm, unsigned long *aqm,
 			 */
 			apqn = AP_MKQID(apid, apqi);
 			q = vfio_ap_mdev_get_queue(matrix_mdev, apqn);
-			if (!q || q->reset_rc) {
+			if (!q || q->reset_status.response_code) {
 				clear_bit_inv(apid,
 					      matrix_mdev->shadow_apcb.apm);
 				break;
@@ -1550,7 +1645,18 @@ static int apq_status_check(int apqn, struct ap_queue_status *status)
 	case AP_RESPONSE_DECONFIGURED:
 		return 0;
 	case AP_RESPONSE_RESET_IN_PROGRESS:
+	case AP_RESPONSE_BUSY:
 		return -EBUSY;
+	case AP_RESPONSE_ASSOC_SECRET_NOT_UNIQUE:
+	case AP_RESPONSE_ASSOC_FAILED:
+		/*
+		 * These asynchronous response codes indicate a PQAP(AAPQ)
+		 * instruction to associate a secret with the guest failed. All
+		 * subsequent AP instructions will end with the asynchronous
+		 * response code until the AP queue is reset; so, let's return
+		 * a value indicating a reset needs to be performed again.
+		 */
+		return -EAGAIN;
 	default:
 		WARN(true,
 		     "failed to verify reset of queue %02x.%04x: TAPQ rc=%u\n",
@@ -1560,92 +1666,105 @@ static int apq_status_check(int apqn, struct ap_queue_status *status)
 	}
 }
 
-static int apq_reset_check(struct vfio_ap_queue *q)
-{
-	int ret;
-	int iters = MAX_RESET_CHECK_WAIT / AP_RESET_INTERVAL;
-	struct ap_queue_status status;
+#define WAIT_MSG "Waited %dms for reset of queue %02x.%04x (%u, %u, %u)"
 
-	for (; iters > 0; iters--) {
+static void apq_reset_check(struct work_struct *reset_work)
+{
+	int ret = -EBUSY, elapsed = 0;
+	struct ap_queue_status status;
+	struct vfio_ap_queue *q;
+
+	q = container_of(reset_work, struct vfio_ap_queue, reset_work);
+	memcpy(&status, &q->reset_status, sizeof(status));
+	while (true) {
 		msleep(AP_RESET_INTERVAL);
+		elapsed += AP_RESET_INTERVAL;
 		status = ap_tapq(q->apqn, NULL);
 		ret = apq_status_check(q->apqn, &status);
-		if (ret != -EBUSY)
-			return ret;
+		if (ret == -EIO)
+			return;
+		if (ret == -EBUSY) {
+			pr_notice_ratelimited(WAIT_MSG, elapsed,
+					      AP_QID_CARD(q->apqn),
+					      AP_QID_QUEUE(q->apqn),
+					      status.response_code,
+					      status.queue_empty,
+					      status.irq_enabled);
+		} else {
+			if (q->reset_status.response_code == AP_RESPONSE_RESET_IN_PROGRESS ||
+			    q->reset_status.response_code == AP_RESPONSE_BUSY ||
+			    q->reset_status.response_code == AP_RESPONSE_STATE_CHANGE_IN_PROGRESS ||
+			    ret == -EAGAIN) {
+				status = ap_zapq(q->apqn, 0);
+				memcpy(&q->reset_status, &status, sizeof(status));
+				continue;
+			}
+			/*
+			 * When an AP adapter is deconfigured, the
+			 * associated queues are reset, so let's set the
+			 * status response code to 0 so the queue may be
+			 * passed through (i.e., not filtered)
+			 */
+			if (status.response_code == AP_RESPONSE_DECONFIGURED)
+				q->reset_status.response_code = 0;
+			if (q->saved_isc != VFIO_AP_ISC_INVALID)
+				vfio_ap_free_aqic_resources(q);
+			break;
+		}
 	}
-	WARN_ONCE(iters <= 0,
-		  "timeout verifying reset of queue %02x.%04x (%u, %u, %u)",
-		  AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn),
-		  status.queue_empty, status.irq_enabled, status.response_code);
-	return ret;
 }
 
-static int vfio_ap_mdev_reset_queue(struct vfio_ap_queue *q,
-				    unsigned int retry)
+static void vfio_ap_mdev_reset_queue(struct vfio_ap_queue *q)
 {
 	struct ap_queue_status status;
-	int ret;
 
 	if (!q)
-		return 0;
-retry_zapq:
+		return;
 	status = ap_zapq(q->apqn, 0);
-	q->reset_rc = status.response_code;
+	memcpy(&q->reset_status, &status, sizeof(status));
 	switch (status.response_code) {
 	case AP_RESPONSE_NORMAL:
-		ret = 0;
-		/* if the reset has not completed, wait for it to take effect */
-		if (!status.queue_empty || status.irq_enabled)
-			ret = apq_reset_check(q);
-		break;
 	case AP_RESPONSE_RESET_IN_PROGRESS:
-		if (retry--) {
-			msleep(20);
-			goto retry_zapq;
-		}
-		ret = -EBUSY;
+	case AP_RESPONSE_BUSY:
+	case AP_RESPONSE_STATE_CHANGE_IN_PROGRESS:
+		/*
+		 * Let's verify whether the ZAPQ completed successfully on a work queue.
+		 */
+		queue_work(system_long_wq, &q->reset_work);
 		break;
-	case AP_RESPONSE_Q_NOT_AVAIL:
 	case AP_RESPONSE_DECONFIGURED:
-	case AP_RESPONSE_CHECKSTOPPED:
-		WARN_ONCE(status.irq_enabled,
-			  "PQAP/ZAPQ for %02x.%04x failed with rc=%u while IRQ enabled",
-			  AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn),
-			  status.response_code);
-		ret = -EBUSY;
-		goto free_resources;
+		/*
+		 * When an AP adapter is deconfigured, the associated
+		 * queues are reset, so let's set the status response code to 0
+		 * so the queue may be passed through (i.e., not filtered).
+		 */
+		q->reset_status.response_code = 0;
+		vfio_ap_free_aqic_resources(q);
+		break;
 	default:
-		/* things are really broken, give up */
 		WARN(true,
 		     "PQAP/ZAPQ for %02x.%04x failed with invalid rc=%u\n",
 		     AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn),
 		     status.response_code);
-		return -EIO;
 	}
-
-free_resources:
-	vfio_ap_free_aqic_resources(q);
-
-	return ret;
 }
 
 static int vfio_ap_mdev_reset_queues(struct ap_queue_table *qtable)
 {
-	int ret, loop_cursor, rc = 0;
+	int ret = 0, loop_cursor;
 	struct vfio_ap_queue *q;
 
+	hash_for_each(qtable->queues, loop_cursor, q, mdev_qnode)
+		vfio_ap_mdev_reset_queue(q);
+
 	hash_for_each(qtable->queues, loop_cursor, q, mdev_qnode) {
-		ret = vfio_ap_mdev_reset_queue(q, 1);
-		/*
-		 * Regardless whether a queue turns out to be busy, or
-		 * is not operational, we need to continue resetting
-		 * the remaining queues.
-		 */
-		if (ret)
-			rc = ret;
+		flush_work(&q->reset_work);
+
+		if (q->reset_status.response_code)
+			ret = -EIO;
 	}
 
-	return rc;
+	return ret;
 }
 
 static int vfio_ap_mdev_open(struct mdev_device *mdev)
@@ -1839,6 +1958,8 @@ int vfio_ap_mdev_probe_queue(struct ap_device *apdev)
 
 	q->apqn = to_ap_queue(&apdev->device)->qid;
 	q->saved_isc = VFIO_AP_ISC_INVALID;
+	memset(&q->reset_status, 0, sizeof(q->reset_status));
+	INIT_WORK(&q->reset_work, apq_reset_check);
 	matrix_mdev = get_update_locks_by_apqn(q->apqn);
 
 	if (matrix_mdev) {
@@ -1887,7 +2008,8 @@ void vfio_ap_mdev_remove_queue(struct ap_device *apdev)
 		}
 	}
 
-	vfio_ap_mdev_reset_queue(q, 1);
+	vfio_ap_mdev_reset_queue(q);
+	flush_work(&q->reset_work);
 	dev_set_drvdata(&apdev->device, NULL);
 	kfree(q);
 	release_update_locks_for_mdev(matrix_mdev);
