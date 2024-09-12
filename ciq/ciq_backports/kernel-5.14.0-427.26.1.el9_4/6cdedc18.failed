@@ -1,0 +1,114 @@
+can: j1939: prevent deadlock by changing j1939_socks_lock to rwlock
+
+jira LE-1907
+cve CVE-2023-52638
+Rebuild_History Non-Buildable kernel-5.14.0-427.26.1.el9_4
+commit-author Ziqi Zhao <astrajoan@yahoo.com>
+commit 6cdedc18ba7b9dacc36466e27e3267d201948c8d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.26.1.el9_4/6cdedc18.failed
+
+The following 3 locks would race against each other, causing the
+deadlock situation in the Syzbot bug report:
+
+- j1939_socks_lock
+- active_session_list_lock
+- sk_session_queue_lock
+
+A reasonable fix is to change j1939_socks_lock to an rwlock, since in
+the rare situations where a write lock is required for the linked list
+that j1939_socks_lock is protecting, the code does not attempt to
+acquire any more locks. This would break the circular lock dependency,
+where, for example, the current thread already locks j1939_socks_lock
+and attempts to acquire sk_session_queue_lock, and at the same time,
+another thread attempts to acquire j1939_socks_lock while holding
+sk_session_queue_lock.
+
+NOTE: This patch along does not fix the unregister_netdevice bug
+reported by Syzbot; instead, it solves a deadlock situation to prepare
+for one or more further patches to actually fix the Syzbot bug, which
+appears to be a reference counting problem within the j1939 codebase.
+
+	Reported-by: <syzbot+1591462f226d9cbf0564@syzkaller.appspotmail.com>
+	Signed-off-by: Ziqi Zhao <astrajoan@yahoo.com>
+	Reviewed-by: Oleksij Rempel <o.rempel@pengutronix.de>
+	Acked-by: Oleksij Rempel <o.rempel@pengutronix.de>
+Link: https://lore.kernel.org/all/20230721162226.8639-1-astrajoan@yahoo.com
+[mkl: remove unrelated newline change]
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Marc Kleine-Budde <mkl@pengutronix.de>
+(cherry picked from commit 6cdedc18ba7b9dacc36466e27e3267d201948c8d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/can/j1939/socket.c
+diff --cc net/can/j1939/socket.c
+index f0a16f3f8bb4,94cfc2315e54..000000000000
+--- a/net/can/j1939/socket.c
++++ b/net/can/j1939/socket.c
+@@@ -1008,8 -1067,34 +1008,32 @@@ void j1939_sk_errqueue(struct j1939_ses
+  		kfree_skb(skb);
+  };
+  
+++<<<<<<< HEAD
+++=======
++ void j1939_sk_errqueue(struct j1939_session *session,
++ 		       enum j1939_sk_errqueue_type type)
++ {
++ 	struct j1939_priv *priv = session->priv;
++ 	struct j1939_sock *jsk;
++ 
++ 	if (session->sk) {
++ 		/* send TX notifications to the socket of origin  */
++ 		__j1939_sk_errqueue(session, session->sk, type);
++ 		return;
++ 	}
++ 
++ 	/* spread RX notifications to all sockets subscribed to this session */
++ 	read_lock_bh(&priv->j1939_socks_lock);
++ 	list_for_each_entry(jsk, &priv->j1939_socks, list) {
++ 		if (j1939_sk_recv_match_one(jsk, &session->skcb))
++ 			__j1939_sk_errqueue(session, &jsk->sk, type);
++ 	}
++ 	read_unlock_bh(&priv->j1939_socks_lock);
++ };
++ 
+++>>>>>>> 6cdedc18ba7b (can: j1939: prevent deadlock by changing j1939_socks_lock to rwlock)
+  void j1939_sk_send_loop_abort(struct sock *sk, int err)
+  {
+ -	struct j1939_sock *jsk = j1939_sk(sk);
+ -
+ -	if (jsk->state & J1939_SOCK_ERRQUEUE)
+ -		return;
+ -
+  	sk->sk_err = err;
+  
+  	sk_error_report(sk);
+diff --git a/net/can/j1939/j1939-priv.h b/net/can/j1939/j1939-priv.h
+index 12369b604ce9..2cb81ad81ecd 100644
+--- a/net/can/j1939/j1939-priv.h
++++ b/net/can/j1939/j1939-priv.h
+@@ -83,7 +83,7 @@ struct j1939_priv {
+ 	unsigned int tp_max_packet_size;
+ 
+ 	/* lock for j1939_socks list */
+-	spinlock_t j1939_socks_lock;
++	rwlock_t j1939_socks_lock;
+ 	struct list_head j1939_socks;
+ 
+ 	struct kref rx_kref;
+diff --git a/net/can/j1939/main.c b/net/can/j1939/main.c
+index 0e9af9075069..1d7e2f554d15 100644
+--- a/net/can/j1939/main.c
++++ b/net/can/j1939/main.c
+@@ -264,7 +264,7 @@ struct j1939_priv *j1939_netdev_start(struct net_device *ndev)
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	j1939_tp_init(priv);
+-	spin_lock_init(&priv->j1939_socks_lock);
++	rwlock_init(&priv->j1939_socks_lock);
+ 	INIT_LIST_HEAD(&priv->j1939_socks);
+ 
+ 	spin_lock(&j1939_netdev_lock);
+* Unmerged path net/can/j1939/socket.c
