@@ -1,0 +1,205 @@
+ACPI: CPPC: Add auto select register read/write support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-518.el8
+commit-author Wyes Karny <wyes.karny@amd.com>
+commit c984f5d5d45bd5f80d6a9d8541e809300c963aca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-518.el8/c984f5d5.failed
+
+For some AMD shared memory based systems, the autonomous selection bit
+needed to be set explicitly. Add autonomous selection register related
+APIs to acpi driver, which amd_pstate driver uses later.
+
+	Acked-by: Huang Rui <ray.huang@amd.com>
+	Reviewed-by: Mario Limonciello <mario.limonciello@amd.com>
+	Tested-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+	Signed-off-by: Wyes Karny <wyes.karny@amd.com>
+[ rjw: Fixed up kerneldoc comments, white space adjustment, subject edits ]
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit c984f5d5d45bd5f80d6a9d8541e809300c963aca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/acpi/cppc_acpi.h
+diff --cc include/acpi/cppc_acpi.h
+index 31a86482bedc,6126c977ece0..000000000000
+--- a/include/acpi/cppc_acpi.h
++++ b/include/acpi/cppc_acpi.h
+@@@ -112,6 -108,8 +112,11 @@@ struct cppc_perf_caps 
+  	u32 lowest_nonlinear_perf;
+  	u32 lowest_freq;
+  	u32 nominal_freq;
+++<<<<<<< HEAD
+++=======
++ 	u32 energy_perf;
++ 	bool auto_sel;
+++>>>>>>> c984f5d5d45b (ACPI: CPPC: Add auto select register read/write support)
+  };
+  
+  struct cppc_perf_ctrls {
+@@@ -148,7 -148,14 +153,16 @@@ extern bool acpi_cpc_valid(void)
+  extern bool cppc_allow_fast_switch(void);
+  extern int acpi_get_psd_map(unsigned int cpu, struct cppc_cpudata *cpu_data);
+  extern unsigned int cppc_get_transition_latency(int cpu);
+ -extern bool cpc_ffh_supported(void);
+  extern bool cpc_supported_by_cpu(void);
+++<<<<<<< HEAD
+++=======
++ extern int cpc_read_ffh(int cpunum, struct cpc_reg *reg, u64 *val);
++ extern int cpc_write_ffh(int cpunum, struct cpc_reg *reg, u64 val);
++ extern int cppc_get_epp_perf(int cpunum, u64 *epp_perf);
++ extern int cppc_set_epp_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls, bool enable);
++ extern int cppc_get_auto_sel_caps(int cpunum, struct cppc_perf_caps *perf_caps);
++ extern int cppc_set_auto_sel(int cpu, bool enable);
+++>>>>>>> c984f5d5d45b (ACPI: CPPC: Add auto select register read/write support)
+  #else /* !CONFIG_ACPI_CPPC_LIB */
+  static inline int cppc_get_desired_perf(int cpunum, u64 *desired_perf)
+  {
+@@@ -186,6 -197,34 +200,37 @@@ static inline unsigned int cppc_get_tra
+  {
+  	return CPUFREQ_ETERNAL;
+  }
+++<<<<<<< HEAD
+++=======
++ static inline bool cpc_ffh_supported(void)
++ {
++ 	return false;
++ }
++ static inline int cpc_read_ffh(int cpunum, struct cpc_reg *reg, u64 *val)
++ {
++ 	return -ENOTSUPP;
++ }
++ static inline int cpc_write_ffh(int cpunum, struct cpc_reg *reg, u64 val)
++ {
++ 	return -ENOTSUPP;
++ }
++ static inline int cppc_set_epp_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls, bool enable)
++ {
++ 	return -ENOTSUPP;
++ }
++ static inline int cppc_get_epp_perf(int cpunum, u64 *epp_perf)
++ {
++ 	return -ENOTSUPP;
++ }
++ static inline int cppc_set_auto_sel(int cpu, bool enable)
++ {
++ 	return -ENOTSUPP;
++ }
++ static inline int cppc_get_auto_sel_caps(int cpunum, struct cppc_perf_caps *perf_caps)
++ {
++ 	return -ENOTSUPP;
++ }
+++>>>>>>> c984f5d5d45b (ACPI: CPPC: Add auto select register read/write support)
+  #endif /* !CONFIG_ACPI_CPPC_LIB */
+  
+  #endif /* _CPPC_ACPI_H*/
+diff --git a/drivers/acpi/cppc_acpi.c b/drivers/acpi/cppc_acpi.c
+index 87f5c0db8ad1..2e098ba3eb1c 100644
+--- a/drivers/acpi/cppc_acpi.c
++++ b/drivers/acpi/cppc_acpi.c
+@@ -1327,6 +1327,102 @@ int cppc_get_perf_ctrs(int cpunum, struct cppc_perf_fb_ctrs *perf_fb_ctrs)
+ }
+ EXPORT_SYMBOL_GPL(cppc_get_perf_ctrs);
+ 
++/**
++ * cppc_get_auto_sel_caps - Read autonomous selection register.
++ * @cpunum : CPU from which to read register.
++ * @perf_caps : struct where autonomous selection register value is updated.
++ */
++int cppc_get_auto_sel_caps(int cpunum, struct cppc_perf_caps *perf_caps)
++{
++	struct cpc_desc *cpc_desc = per_cpu(cpc_desc_ptr, cpunum);
++	struct cpc_register_resource *auto_sel_reg;
++	u64  auto_sel;
++
++	if (!cpc_desc) {
++		pr_debug("No CPC descriptor for CPU:%d\n", cpunum);
++		return -ENODEV;
++	}
++
++	auto_sel_reg = &cpc_desc->cpc_regs[AUTO_SEL_ENABLE];
++
++	if (!CPC_SUPPORTED(auto_sel_reg))
++		pr_warn_once("Autonomous mode is not unsupported!\n");
++
++	if (CPC_IN_PCC(auto_sel_reg)) {
++		int pcc_ss_id = per_cpu(cpu_pcc_subspace_idx, cpunum);
++		struct cppc_pcc_data *pcc_ss_data = NULL;
++		int ret = 0;
++
++		if (pcc_ss_id < 0)
++			return -ENODEV;
++
++		pcc_ss_data = pcc_data[pcc_ss_id];
++
++		down_write(&pcc_ss_data->pcc_lock);
++
++		if (send_pcc_cmd(pcc_ss_id, CMD_READ) >= 0) {
++			cpc_read(cpunum, auto_sel_reg, &auto_sel);
++			perf_caps->auto_sel = (bool)auto_sel;
++		} else {
++			ret = -EIO;
++		}
++
++		up_write(&pcc_ss_data->pcc_lock);
++
++		return ret;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(cppc_get_auto_sel_caps);
++
++/**
++ * cppc_set_auto_sel - Write autonomous selection register.
++ * @cpu    : CPU to which to write register.
++ * @enable : the desired value of autonomous selection resiter to be updated.
++ */
++int cppc_set_auto_sel(int cpu, bool enable)
++{
++	int pcc_ss_id = per_cpu(cpu_pcc_subspace_idx, cpu);
++	struct cpc_register_resource *auto_sel_reg;
++	struct cpc_desc *cpc_desc = per_cpu(cpc_desc_ptr, cpu);
++	struct cppc_pcc_data *pcc_ss_data = NULL;
++	int ret = -EINVAL;
++
++	if (!cpc_desc) {
++		pr_debug("No CPC descriptor for CPU:%d\n", cpu);
++		return -ENODEV;
++	}
++
++	auto_sel_reg = &cpc_desc->cpc_regs[AUTO_SEL_ENABLE];
++
++	if (CPC_IN_PCC(auto_sel_reg)) {
++		if (pcc_ss_id < 0) {
++			pr_debug("Invalid pcc_ss_id\n");
++			return -ENODEV;
++		}
++
++		if (CPC_SUPPORTED(auto_sel_reg)) {
++			ret = cpc_write(cpu, auto_sel_reg, enable);
++			if (ret)
++				return ret;
++		}
++
++		pcc_ss_data = pcc_data[pcc_ss_id];
++
++		down_write(&pcc_ss_data->pcc_lock);
++		/* after writing CPC, transfer the ownership of PCC to platform */
++		ret = send_pcc_cmd(pcc_ss_id, CMD_WRITE);
++		up_write(&pcc_ss_data->pcc_lock);
++	} else {
++		ret = -ENOTSUPP;
++		pr_debug("_CPC in PCC is not supported\n");
++	}
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(cppc_set_auto_sel);
++
+ /**
+  * cppc_set_enable - Set to enable CPPC on the processor by writing the
+  * Continuous Performance Control package EnableRegister field.
+* Unmerged path include/acpi/cppc_acpi.h
