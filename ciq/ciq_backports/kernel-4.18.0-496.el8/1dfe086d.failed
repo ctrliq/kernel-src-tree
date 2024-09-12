@@ -1,0 +1,397 @@
+net/sched: taprio: centralize mqprio qopt validation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit 1dfe086dd7efb36d3d619a90782c6ca186a1bae9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/1dfe086d.failed
+
+There is a lot of code in taprio which is "borrowed" from mqprio.
+It makes sense to put a stop to the "borrowing" and start actually
+reusing code.
+
+Because taprio and mqprio are built as part of different kernel modules,
+code reuse can only take place either by writing it as static inline
+(limiting), putting it in sch_generic.o (not generic enough), or
+creating a third auto-selectable kernel module which only holds library
+code. I opted for the third variant.
+
+In a previous change, mqprio gained support for reverse TC:TXQ mappings,
+something which taprio still denies. Make taprio use the same validation
+logic so that it supports this configuration as well.
+
+The taprio code didn't enforce TXQ overlaps in txtime-assist mode and
+that looks intentional, even if I've no idea why that might be. Preserve
+that, but add a comment.
+
+There isn't any dedicated MAINTAINERS entry for mqprio, so nothing to
+update there.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Reviewed-by: Simon Horman <simon.horman@corigine.com>
+	Reviewed-by: Gerhard Engleder <gerhard@engleder-embedded.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1dfe086dd7efb36d3d619a90782c6ca186a1bae9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_mqprio.c
+diff --cc net/sched/sch_mqprio.c
+index 80a83b1244de,9303d2a1e840..000000000000
+--- a/net/sched/sch_mqprio.c
++++ b/net/sched/sch_mqprio.c
+@@@ -30,16 -29,9 +32,19 @@@ struct mqprio_sched 
+  	u64 max_rate[TC_QOPT_MAX_QUEUE];
+  };
+  
+++<<<<<<< HEAD
+ +/* Returns true if the intervals [a, b) and [c, d) overlap. */
+ +static bool intervals_overlap(int a, int b, int c, int d)
+ +{
+ +	int left = max(a, c), right = min(b, d);
+ +
+ +	return left < right;
+ +}
+ +
+++=======
+++>>>>>>> 1dfe086dd7ef (net/sched: taprio: centralize mqprio qopt validation)
+  static int mqprio_enable_offload(struct Qdisc *sch,
+ -				 const struct tc_mqprio_qopt *qopt,
+ -				 struct netlink_ext_ack *extack)
+ +				 const struct tc_mqprio_qopt *qopt)
+  {
+  	struct tc_mqprio_qopt_offload mqprio = {.qopt = *qopt};
+  	struct mqprio_sched *priv = qdisc_priv(sch);
+@@@ -113,19 -105,11 +118,23 @@@ static void mqprio_destroy(struct Qdis
+  		netdev_set_num_tc(dev, 0);
+  }
+  
+ -static int mqprio_parse_opt(struct net_device *dev, struct tc_mqprio_qopt *qopt,
+ -			    const struct tc_mqprio_caps *caps,
+ -			    struct netlink_ext_ack *extack)
+ +static int mqprio_parse_opt(struct net_device *dev, struct tc_mqprio_qopt *qopt)
+  {
+++<<<<<<< HEAD
+ +	int i, j;
+ +
+ +	/* Verify num_tc is not out of max range */
+ +	if (qopt->num_tc > TC_MAX_QUEUE)
+ +		return -EINVAL;
+ +
+ +	/* Verify priority mapping uses valid tcs */
+ +	for (i = 0; i < TC_BITMASK + 1; i++) {
+ +		if (qopt->prio_tc_map[i] >= qopt->num_tc)
+ +			return -EINVAL;
+ +	}
+++=======
++ 	int err;
+++>>>>>>> 1dfe086dd7ef (net/sched: taprio: centralize mqprio qopt validation)
+  
+  	/* Limit qopt->hw to maximum supported offload value.  Drivers have
+  	 * the option of overriding this later if they don't support the a
+@@@ -134,34 -118,23 +143,42 @@@
+  	if (qopt->hw > TC_MQPRIO_HW_OFFLOAD_MAX)
+  		qopt->hw = TC_MQPRIO_HW_OFFLOAD_MAX;
+  
+ -	/* If hardware offload is requested, we will leave 3 options to the
+ -	 * device driver:
+ -	 * - populate the queue counts itself (and ignore what was requested)
+ -	 * - validate the provided queue counts by itself (and apply them)
+ -	 * - request queue count validation here (and apply them)
+ +	/* If hardware offload is requested we will leave it to the device
+ +	 * to either populate the queue counts itself or to validate the
+ +	 * provided queue counts.  If ndo_setup_tc is not present then
+ +	 * hardware doesn't support offload and we should return an error.
+  	 */
+++<<<<<<< HEAD
+ +	if (qopt->hw)
+ +		return dev->netdev_ops->ndo_setup_tc ? 0 : -EINVAL;
+++=======
++ 	err = mqprio_validate_qopt(dev, qopt,
++ 				   !qopt->hw || caps->validate_queue_counts,
++ 				   false, extack);
++ 	if (err)
++ 		return err;
+++>>>>>>> 1dfe086dd7ef (net/sched: taprio: centralize mqprio qopt validation)
+  
+ -	/* If ndo_setup_tc is not present then hardware doesn't support offload
+ -	 * and we should return an error.
+ -	 */
+ -	if (qopt->hw && !dev->netdev_ops->ndo_setup_tc)
+ -		return -EINVAL;
+ +	for (i = 0; i < qopt->num_tc; i++) {
+ +		unsigned int last = qopt->offset[i] + qopt->count[i];
+ +
+ +		/* Verify the queue count is in tx range being equal to the
+ +		 * real_num_tx_queues indicates the last queue is in use.
+ +		 */
+ +		if (qopt->offset[i] >= dev->real_num_tx_queues ||
+ +		    !qopt->count[i] ||
+ +		    last > dev->real_num_tx_queues)
+ +			return -EINVAL;
+ +
+ +		/* Verify that the offset and counts do not overlap */
+ +		for (j = i + 1; j < qopt->num_tc; j++) {
+ +			if (intervals_overlap(qopt->offset[i], last,
+ +					      qopt->offset[j],
+ +					      qopt->offset[j] +
+ +					      qopt->count[j]))
+ +				return -EINVAL;
+ +		}
+ +	}
+  
+  	return 0;
+  }
+diff --git a/net/sched/Kconfig b/net/sched/Kconfig
+index ce6df2cc7f43..e3aec67815a0 100644
+--- a/net/sched/Kconfig
++++ b/net/sched/Kconfig
+@@ -194,8 +194,14 @@ config NET_SCH_ETF
+ 	  To compile this code as a module, choose M here: the
+ 	  module will be called sch_etf.
+ 
++config NET_SCH_MQPRIO_LIB
++	tristate
++	help
++	  Common library for manipulating mqprio queue configurations.
++
+ config NET_SCH_TAPRIO
+ 	tristate "Time Aware Priority (taprio) Scheduler"
++	select NET_SCH_MQPRIO_LIB
+ 	help
+ 	  Say Y here if you want to use the Time Aware Priority (taprio) packet
+ 	  scheduling algorithm.
+@@ -252,6 +258,7 @@ config NET_SCH_DRR
+ 
+ config NET_SCH_MQPRIO
+ 	tristate "Multi-queue priority scheduler (MQPRIO)"
++	select NET_SCH_MQPRIO_LIB
+ 	help
+ 	  Say Y here if you want to use the Multi-queue Priority scheduler.
+ 	  This scheduler allows QOS to be offloaded on NICs that have support
+diff --git a/net/sched/Makefile b/net/sched/Makefile
+index dd14ef413fda..7911eec09837 100644
+--- a/net/sched/Makefile
++++ b/net/sched/Makefile
+@@ -52,6 +52,7 @@ obj-$(CONFIG_NET_SCH_DRR)	+= sch_drr.o
+ obj-$(CONFIG_NET_SCH_PLUG)	+= sch_plug.o
+ obj-$(CONFIG_NET_SCH_ETS)	+= sch_ets.o
+ obj-$(CONFIG_NET_SCH_MQPRIO)	+= sch_mqprio.o
++obj-$(CONFIG_NET_SCH_MQPRIO_LIB) += sch_mqprio_lib.o
+ obj-$(CONFIG_NET_SCH_SKBPRIO)	+= sch_skbprio.o
+ obj-$(CONFIG_NET_SCH_CHOKE)	+= sch_choke.o
+ obj-$(CONFIG_NET_SCH_QFQ)	+= sch_qfq.o
+* Unmerged path net/sched/sch_mqprio.c
+diff --git a/net/sched/sch_mqprio_lib.c b/net/sched/sch_mqprio_lib.c
+new file mode 100644
+index 000000000000..e782b412a000
+--- /dev/null
++++ b/net/sched/sch_mqprio_lib.c
+@@ -0,0 +1,103 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/net.h>
++#include <linux/netdevice.h>
++#include <linux/netlink.h>
++#include <linux/types.h>
++#include <net/pkt_sched.h>
++
++#include "sch_mqprio_lib.h"
++
++/* Returns true if the intervals [a, b) and [c, d) overlap. */
++static bool intervals_overlap(int a, int b, int c, int d)
++{
++	int left = max(a, c), right = min(b, d);
++
++	return left < right;
++}
++
++static int mqprio_validate_queue_counts(struct net_device *dev,
++					const struct tc_mqprio_qopt *qopt,
++					bool allow_overlapping_txqs,
++					struct netlink_ext_ack *extack)
++{
++	int i, j;
++
++	for (i = 0; i < qopt->num_tc; i++) {
++		unsigned int last = qopt->offset[i] + qopt->count[i];
++
++		if (!qopt->count[i]) {
++			NL_SET_ERR_MSG_FMT_MOD(extack, "No queues for TC %d",
++					       i);
++			return -EINVAL;
++		}
++
++		/* Verify the queue count is in tx range being equal to the
++		 * real_num_tx_queues indicates the last queue is in use.
++		 */
++		if (qopt->offset[i] >= dev->real_num_tx_queues ||
++		    last > dev->real_num_tx_queues) {
++			NL_SET_ERR_MSG_FMT_MOD(extack,
++					       "Queues %d:%d for TC %d exceed the %d TX queues available",
++					       qopt->count[i], qopt->offset[i],
++					       i, dev->real_num_tx_queues);
++			return -EINVAL;
++		}
++
++		if (allow_overlapping_txqs)
++			continue;
++
++		/* Verify that the offset and counts do not overlap */
++		for (j = i + 1; j < qopt->num_tc; j++) {
++			if (intervals_overlap(qopt->offset[i], last,
++					      qopt->offset[j],
++					      qopt->offset[j] +
++					      qopt->count[j])) {
++				NL_SET_ERR_MSG_FMT_MOD(extack,
++						       "TC %d queues %d@%d overlap with TC %d queues %d@%d",
++						       i, qopt->count[i], qopt->offset[i],
++						       j, qopt->count[j], qopt->offset[j]);
++				return -EINVAL;
++			}
++		}
++	}
++
++	return 0;
++}
++
++int mqprio_validate_qopt(struct net_device *dev, struct tc_mqprio_qopt *qopt,
++			 bool validate_queue_counts,
++			 bool allow_overlapping_txqs,
++			 struct netlink_ext_ack *extack)
++{
++	int i, err;
++
++	/* Verify num_tc is not out of max range */
++	if (qopt->num_tc > TC_MAX_QUEUE) {
++		NL_SET_ERR_MSG(extack,
++			       "Number of traffic classes is outside valid range");
++		return -EINVAL;
++	}
++
++	/* Verify priority mapping uses valid tcs */
++	for (i = 0; i <= TC_BITMASK; i++) {
++		if (qopt->prio_tc_map[i] >= qopt->num_tc) {
++			NL_SET_ERR_MSG(extack,
++				       "Invalid traffic class in priority to traffic class mapping");
++			return -EINVAL;
++		}
++	}
++
++	if (validate_queue_counts) {
++		err = mqprio_validate_queue_counts(dev, qopt,
++						   allow_overlapping_txqs,
++						   extack);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mqprio_validate_qopt);
++
++MODULE_LICENSE("GPL");
+diff --git a/net/sched/sch_mqprio_lib.h b/net/sched/sch_mqprio_lib.h
+new file mode 100644
+index 000000000000..353787a25648
+--- /dev/null
++++ b/net/sched/sch_mqprio_lib.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __SCH_MQPRIO_LIB_H
++#define __SCH_MQPRIO_LIB_H
++
++#include <linux/types.h>
++
++struct net_device;
++struct netlink_ext_ack;
++struct tc_mqprio_qopt;
++
++int mqprio_validate_qopt(struct net_device *dev, struct tc_mqprio_qopt *qopt,
++			 bool validate_queue_counts,
++			 bool allow_overlapping_txqs,
++			 struct netlink_ext_ack *extack);
++
++#endif
+diff --git a/net/sched/sch_taprio.c b/net/sched/sch_taprio.c
+index 4945908881c4..f8c38ba6d0bf 100644
+--- a/net/sched/sch_taprio.c
++++ b/net/sched/sch_taprio.c
+@@ -24,6 +24,8 @@
+ #include <net/sock.h>
+ #include <net/tcp.h>
+ 
++#include "sch_mqprio_lib.h"
++
+ static LIST_HEAD(taprio_list);
+ 
+ #define TAPRIO_ALL_GATES_OPEN -1
+@@ -922,7 +924,7 @@ static int taprio_parse_mqprio_opt(struct net_device *dev,
+ 				   struct netlink_ext_ack *extack,
+ 				   u32 taprio_flags)
+ {
+-	int i, j;
++	bool allow_overlapping_txqs = TXTIME_ASSIST_IS_ENABLED(taprio_flags);
+ 
+ 	if (!qopt && !dev->num_tc) {
+ 		NL_SET_ERR_MSG(extack, "'mqprio' configuration is necessary");
+@@ -935,52 +937,17 @@ static int taprio_parse_mqprio_opt(struct net_device *dev,
+ 	if (dev->num_tc)
+ 		return 0;
+ 
+-	/* Verify num_tc is not out of max range */
+-	if (qopt->num_tc > TC_MAX_QUEUE) {
+-		NL_SET_ERR_MSG(extack, "Number of traffic classes is outside valid range");
+-		return -EINVAL;
+-	}
+-
+ 	/* taprio imposes that traffic classes map 1:n to tx queues */
+ 	if (qopt->num_tc > dev->num_tx_queues) {
+ 		NL_SET_ERR_MSG(extack, "Number of traffic classes is greater than number of HW queues");
+ 		return -EINVAL;
+ 	}
+ 
+-	/* Verify priority mapping uses valid tcs */
+-	for (i = 0; i <= TC_BITMASK; i++) {
+-		if (qopt->prio_tc_map[i] >= qopt->num_tc) {
+-			NL_SET_ERR_MSG(extack, "Invalid traffic class in priority to traffic class mapping");
+-			return -EINVAL;
+-		}
+-	}
+-
+-	for (i = 0; i < qopt->num_tc; i++) {
+-		unsigned int last = qopt->offset[i] + qopt->count[i];
+-
+-		/* Verify the queue count is in tx range being equal to the
+-		 * real_num_tx_queues indicates the last queue is in use.
+-		 */
+-		if (qopt->offset[i] >= dev->num_tx_queues ||
+-		    !qopt->count[i] ||
+-		    last > dev->real_num_tx_queues) {
+-			NL_SET_ERR_MSG(extack, "Invalid queue in traffic class to queue mapping");
+-			return -EINVAL;
+-		}
+-
+-		if (TXTIME_ASSIST_IS_ENABLED(taprio_flags))
+-			continue;
+-
+-		/* Verify that the offset and counts do not overlap */
+-		for (j = i + 1; j < qopt->num_tc; j++) {
+-			if (last > qopt->offset[j]) {
+-				NL_SET_ERR_MSG(extack, "Detected overlap in the traffic class to queue mapping");
+-				return -EINVAL;
+-			}
+-		}
+-	}
+-
+-	return 0;
++	/* For some reason, in txtime-assist mode, we allow TXQ ranges for
++	 * different TCs to overlap, and just validate the TXQ ranges.
++	 */
++	return mqprio_validate_qopt(dev, qopt, true, allow_overlapping_txqs,
++				    extack);
+ }
+ 
+ static int taprio_get_start_time(struct Qdisc *sch,
