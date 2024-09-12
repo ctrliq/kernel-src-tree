@@ -1,0 +1,882 @@
+libceph: optionally use bounce buffer on recv path in crc mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 038b8d1d1ab1cce11a158d30bf080ff41a2cfd15
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/038b8d1d.failed
+
+Both msgr1 and msgr2 in crc mode are zero copy in the sense that
+message data is read from the socket directly into the destination
+buffer.  We assume that the destination buffer is stable (i.e. remains
+unchanged while it is being read to) though.  Otherwise, CRC errors
+ensue:
+
+  libceph: read_partial_message 0000000048edf8ad data crc 1063286393 != exp. 228122706
+  libceph: osd1 (1)192.168.122.1:6843 bad crc/signature
+
+  libceph: bad data crc, calculated 57958023, expected 1805382778
+  libceph: osd2 (2)192.168.122.1:6876 integrity error, bad crc
+
+Introduce rxbounce option to enable use of a bounce buffer when
+receiving message data.  In particular this is needed if a mapped
+image is a Windows VM disk, passed to QEMU.  Windows has a system-wide
+"dummy" page that may be mapped into the destination buffer (potentially
+more than once into the same buffer) by the Windows Memory Manager in
+an effort to generate a single large I/O [1][2].  QEMU makes a point of
+preserving overlap relationships when cloning I/O vectors, so krbd gets
+exposed to this behaviour.
+
+[1] "What Is Really in That MDL?"
+    https://docs.microsoft.com/en-us/previous-versions/windows/hardware/design/dn614012(v=vs.85)
+[2] https://blogs.msmvps.com/kernelmustard/2005/05/04/dummy-pages/
+
+URL: https://bugzilla.redhat.com/show_bug.cgi?id=1973317
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+	Reviewed-by: Jeff Layton <jlayton@kernel.org>
+(cherry picked from commit 038b8d1d1ab1cce11a158d30bf080ff41a2cfd15)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ceph/libceph.h
+#	net/ceph/ceph_common.c
+diff --cc include/linux/ceph/libceph.h
+index d9a630271c9a,edf62eaa6285..000000000000
+--- a/include/linux/ceph/libceph.h
++++ b/include/linux/ceph/libceph.h
+@@@ -32,10 -32,10 +32,17 @@@
+  #define CEPH_OPT_NOSHARE          (1<<1) /* don't share client with other sbs */
+  #define CEPH_OPT_MYIP             (1<<2) /* specified my ip */
+  #define CEPH_OPT_NOCRC            (1<<3) /* no data crc on writes (msgr1) */
+++<<<<<<< HEAD
+ +#define CEPH_OPT_NOMSGAUTH	  (1<<4) /* don't require msg signing feat */
+ +#define CEPH_OPT_TCP_NODELAY	  (1<<5) /* TCP_NODELAY on TCP sockets */
+ +#define CEPH_OPT_NOMSGSIGN	  (1<<6) /* don't sign msgs (msgr1) */
+ +#define CEPH_OPT_ABORT_ON_FULL	  (1<<7) /* abort w/ ENOSPC when full */
+++=======
++ #define CEPH_OPT_TCP_NODELAY      (1<<4) /* TCP_NODELAY on TCP sockets */
++ #define CEPH_OPT_NOMSGSIGN        (1<<5) /* don't sign msgs (msgr1) */
++ #define CEPH_OPT_ABORT_ON_FULL    (1<<6) /* abort w/ ENOSPC when full */
++ #define CEPH_OPT_RXBOUNCE         (1<<7) /* double-buffer read data */
+++>>>>>>> 038b8d1d1ab1 (libceph: optionally use bounce buffer on recv path in crc mode)
+  
+  #define CEPH_OPT_DEFAULT   (CEPH_OPT_TCP_NODELAY)
+  
+diff --cc net/ceph/ceph_common.c
+index bcb9947fb365,4c6441536d55..000000000000
+--- a/net/ceph/ceph_common.c
++++ b/net/ceph/ceph_common.c
+@@@ -266,51 -239,100 +266,133 @@@ enum 
+  	Opt_crush_location,
+  	Opt_read_from_replica,
+  	Opt_ms_mode,
+ +	Opt_last_string,
+  	/* string args above */
+  	Opt_share,
+ +	Opt_noshare,
+  	Opt_crc,
+ +	Opt_nocrc,
+  	Opt_cephx_require_signatures,
+ +	Opt_nocephx_require_signatures,
+  	Opt_cephx_sign_messages,
+ +	Opt_nocephx_sign_messages,
+  	Opt_tcp_nodelay,
+ +	Opt_notcp_nodelay,
+  	Opt_abort_on_full,
++ 	Opt_rxbounce,
+  };
+  
+ -enum {
+ -	Opt_read_from_replica_no,
+ -	Opt_read_from_replica_balance,
+ -	Opt_read_from_replica_localize,
+ +static match_table_t opt_tokens = {
+ +	{Opt_osdtimeout, "osdtimeout=%d"},
+ +	{Opt_osdkeepalivetimeout, "osdkeepalive=%d"},
+ +	{Opt_mount_timeout, "mount_timeout=%d"},
+ +	{Opt_osd_idle_ttl, "osd_idle_ttl=%d"},
+ +	{Opt_osd_request_timeout, "osd_request_timeout=%d"},
+ +	/* int args above */
+ +	{Opt_fsid, "fsid=%s"},
+ +	{Opt_name, "name=%s"},
+ +	{Opt_secret, "secret=%s"},
+ +	{Opt_key, "key=%s"},
+ +	{Opt_ip, "ip=%s"},
+ +	{Opt_crush_location, "crush_location=%s"},
+ +	{Opt_read_from_replica, "read_from_replica=%s"},
+ +	{Opt_ms_mode, "ms_mode=%s"},
+ +	/* string args above */
+ +	{Opt_share, "share"},
+ +	{Opt_noshare, "noshare"},
+ +	{Opt_crc, "crc"},
+ +	{Opt_nocrc, "nocrc"},
+ +	{Opt_cephx_require_signatures, "cephx_require_signatures"},
+ +	{Opt_nocephx_require_signatures, "nocephx_require_signatures"},
+ +	{Opt_cephx_sign_messages, "cephx_sign_messages"},
+ +	{Opt_nocephx_sign_messages, "nocephx_sign_messages"},
+ +	{Opt_tcp_nodelay, "tcp_nodelay"},
+ +	{Opt_notcp_nodelay, "notcp_nodelay"},
+ +	{Opt_abort_on_full, "abort_on_full"},
+ +	{-1, NULL}
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct constant_table ceph_param_read_from_replica[] = {
++ 	{"no",		Opt_read_from_replica_no},
++ 	{"balance",	Opt_read_from_replica_balance},
++ 	{"localize",	Opt_read_from_replica_localize},
++ 	{}
++ };
++ 
++ enum ceph_ms_mode {
++ 	Opt_ms_mode_legacy,
++ 	Opt_ms_mode_crc,
++ 	Opt_ms_mode_secure,
++ 	Opt_ms_mode_prefer_crc,
++ 	Opt_ms_mode_prefer_secure
++ };
++ 
++ static const struct constant_table ceph_param_ms_mode[] = {
++ 	{"legacy",		Opt_ms_mode_legacy},
++ 	{"crc",			Opt_ms_mode_crc},
++ 	{"secure",		Opt_ms_mode_secure},
++ 	{"prefer-crc",		Opt_ms_mode_prefer_crc},
++ 	{"prefer-secure",	Opt_ms_mode_prefer_secure},
++ 	{}
++ };
++ 
++ static const struct fs_parameter_spec ceph_parameters[] = {
++ 	fsparam_flag	("abort_on_full",		Opt_abort_on_full),
++ 	__fsparam	(NULL, "cephx_require_signatures", Opt_cephx_require_signatures,
++ 			 fs_param_neg_with_no|fs_param_deprecated, NULL),
++ 	fsparam_flag_no ("cephx_sign_messages",		Opt_cephx_sign_messages),
++ 	fsparam_flag_no ("crc",				Opt_crc),
++ 	fsparam_string	("crush_location",		Opt_crush_location),
++ 	fsparam_string	("fsid",			Opt_fsid),
++ 	fsparam_string	("ip",				Opt_ip),
++ 	fsparam_string	("key",				Opt_key),
++ 	fsparam_u32	("mount_timeout",		Opt_mount_timeout),
++ 	fsparam_string	("name",			Opt_name),
++ 	fsparam_u32	("osd_idle_ttl",		Opt_osd_idle_ttl),
++ 	fsparam_u32	("osd_request_timeout",		Opt_osd_request_timeout),
++ 	fsparam_u32	("osdkeepalive",		Opt_osdkeepalivetimeout),
++ 	fsparam_enum	("read_from_replica",		Opt_read_from_replica,
++ 			 ceph_param_read_from_replica),
++ 	fsparam_flag	("rxbounce",			Opt_rxbounce),
++ 	fsparam_enum	("ms_mode",			Opt_ms_mode,
++ 			 ceph_param_ms_mode),
++ 	fsparam_string	("secret",			Opt_secret),
++ 	fsparam_flag_no ("share",			Opt_share),
++ 	fsparam_flag_no ("tcp_nodelay",			Opt_tcp_nodelay),
++ 	{}
++ };
++ 
++ struct ceph_options *ceph_alloc_options(void)
++ {
++ 	struct ceph_options *opt;
++ 
++ 	opt = kzalloc(sizeof(*opt), GFP_KERNEL);
++ 	if (!opt)
++ 		return NULL;
++ 
++ 	opt->crush_locs = RB_ROOT;
++ 	opt->mon_addr = kcalloc(CEPH_MAX_MON, sizeof(*opt->mon_addr),
++ 				GFP_KERNEL);
++ 	if (!opt->mon_addr) {
++ 		kfree(opt);
++ 		return NULL;
++ 	}
++ 
++ 	opt->flags = CEPH_OPT_DEFAULT;
++ 	opt->osd_keepalive_timeout = CEPH_OSD_KEEPALIVE_DEFAULT;
++ 	opt->mount_timeout = CEPH_MOUNT_TIMEOUT_DEFAULT;
++ 	opt->osd_idle_ttl = CEPH_OSD_IDLE_TTL_DEFAULT;
++ 	opt->osd_request_timeout = CEPH_OSD_REQUEST_TIMEOUT_DEFAULT;
++ 	opt->read_from_replica = CEPH_READ_FROM_REPLICA_DEFAULT;
++ 	opt->con_modes[0] = CEPH_CON_MODE_UNKNOWN;
++ 	opt->con_modes[1] = CEPH_CON_MODE_UNKNOWN;
++ 	return opt;
++ }
++ EXPORT_SYMBOL(ceph_alloc_options);
++ 
+++>>>>>>> 038b8d1d1ab1 (libceph: optionally use bounce buffer on recv path in crc mode)
+  void ceph_destroy_options(struct ceph_options *opt)
+  {
+  	dout("destroy_options %p\n", opt);
+@@@ -371,264 -397,209 +453,273 @@@ out
+  	return err;
+  }
+  
+ -int ceph_parse_mon_ips(const char *buf, size_t len, struct ceph_options *opt,
+ -		       struct fc_log *l, char delim)
+ +struct ceph_options *
+ +ceph_parse_options(char *options, const char *dev_name,
+ +			const char *dev_name_end,
+ +			int (*parse_extra_token)(char *c, void *private),
+ +			void *private)
+  {
+ -	struct p_log log = {.prefix = "libceph", .log = l};
+ -	int ret;
+ +	struct ceph_options *opt;
+ +	const char *c;
+ +	int err = -ENOMEM;
+ +	substring_t argstr[MAX_OPT_ARGS];
+  
+ -	/* ip1[:port1][<delim>ip2[:port2]...] */
+ -	ret = ceph_parse_ips(buf, buf + len, opt->mon_addr, CEPH_MAX_MON,
+ -			     &opt->num_mon, delim);
+ -	if (ret) {
+ -		error_plog(&log, "Failed to parse monitor IPs: %d", ret);
+ -		return ret;
+ -	}
+ +	opt = kzalloc(sizeof(*opt), GFP_KERNEL);
+ +	if (!opt)
+ +		return ERR_PTR(-ENOMEM);
+  
+ -	return 0;
+ -}
+ -EXPORT_SYMBOL(ceph_parse_mon_ips);
+ +	opt->crush_locs = RB_ROOT;
+ +	opt->mon_addr = kcalloc(CEPH_MAX_MON, sizeof(*opt->mon_addr),
+ +				GFP_KERNEL);
+ +	if (!opt->mon_addr)
+ +		goto out;
+  
+ -int ceph_parse_param(struct fs_parameter *param, struct ceph_options *opt,
+ -		     struct fc_log *l)
+ -{
+ -	struct fs_parse_result result;
+ -	int token, err;
+ -	struct p_log log = {.prefix = "libceph", .log = l};
+ -
+ -	token = __fs_parse(&log, ceph_parameters, param, &result);
+ -	dout("%s fs_parse '%s' token %d\n", __func__, param->key, token);
+ -	if (token < 0)
+ -		return token;
+ -
+ -	switch (token) {
+ -	case Opt_ip:
+ -		err = ceph_parse_ips(param->string,
+ -				     param->string + param->size,
+ -				     &opt->my_addr, 1, NULL, ',');
+ -		if (err) {
+ -			error_plog(&log, "Failed to parse ip: %d", err);
+ -			return err;
+ -		}
+ -		opt->flags |= CEPH_OPT_MYIP;
+ -		break;
+ +	dout("parse_options %p options '%s' dev_name '%s'\n", opt, options,
+ +	     dev_name);
+  
+ -	case Opt_fsid:
+ -		err = ceph_parse_fsid(param->string, &opt->fsid);
+ -		if (err) {
+ -			error_plog(&log, "Failed to parse fsid: %d", err);
+ -			return err;
+ -		}
+ -		opt->flags |= CEPH_OPT_FSID;
+ -		break;
+ -	case Opt_name:
+ -		kfree(opt->name);
+ -		opt->name = param->string;
+ -		param->string = NULL;
+ -		break;
+ -	case Opt_secret:
+ -		ceph_crypto_key_destroy(opt->key);
+ -		kfree(opt->key);
+ +	/* start with defaults */
+ +	opt->flags = CEPH_OPT_DEFAULT;
+ +	opt->osd_keepalive_timeout = CEPH_OSD_KEEPALIVE_DEFAULT;
+ +	opt->mount_timeout = CEPH_MOUNT_TIMEOUT_DEFAULT;
+ +	opt->osd_idle_ttl = CEPH_OSD_IDLE_TTL_DEFAULT;
+ +	opt->osd_request_timeout = CEPH_OSD_REQUEST_TIMEOUT_DEFAULT;
+ +	opt->read_from_replica = CEPH_READ_FROM_REPLICA_DEFAULT;
+  
+ -		opt->key = kzalloc(sizeof(*opt->key), GFP_KERNEL);
+ -		if (!opt->key)
+ -			return -ENOMEM;
+ -		err = ceph_crypto_key_unarmor(opt->key, param->string);
+ -		if (err) {
+ -			error_plog(&log, "Failed to parse secret: %d", err);
+ -			return err;
+ -		}
+ -		break;
+ -	case Opt_key:
+ -		ceph_crypto_key_destroy(opt->key);
+ -		kfree(opt->key);
+ +	/* get mon ip(s) */
+ +	/* ip1[:port1][,ip2[:port2]...] */
+ +	err = ceph_parse_ips(dev_name, dev_name_end, opt->mon_addr,
+ +			     CEPH_MAX_MON, &opt->num_mon);
+ +	if (err < 0)
+ +		goto out;
+  
+ -		opt->key = kzalloc(sizeof(*opt->key), GFP_KERNEL);
+ -		if (!opt->key)
+ -			return -ENOMEM;
+ -		return get_secret(opt->key, param->string, &log);
+ -	case Opt_crush_location:
+ -		ceph_clear_crush_locs(&opt->crush_locs);
+ -		err = ceph_parse_crush_location(param->string,
+ -						&opt->crush_locs);
+ -		if (err) {
+ -			error_plog(&log, "Failed to parse CRUSH location: %d",
+ -				   err);
+ -			return err;
+ +	/* parse mount options */
+ +	while ((c = strsep(&options, ",")) != NULL) {
+ +		int token, intval;
+ +		if (!*c)
+ +			continue;
+ +		err = -EINVAL;
+ +		token = match_token((char *)c, opt_tokens, argstr);
+ +		if (token < 0 && parse_extra_token) {
+ +			/* extra? */
+ +			err = parse_extra_token((char *)c, private);
+ +			if (err < 0) {
+ +				pr_err("bad option at '%s'\n", c);
+ +				goto out;
+ +			}
+ +			continue;
+  		}
+ -		break;
+ -	case Opt_read_from_replica:
+ -		switch (result.uint_32) {
+ -		case Opt_read_from_replica_no:
+ -			opt->read_from_replica = 0;
+ +		if (token < Opt_last_int) {
+ +			err = match_int(&argstr[0], &intval);
+ +			if (err < 0) {
+ +				pr_err("bad option arg (not int) at '%s'\n", c);
+ +				goto out;
+ +			}
+ +			dout("got int token %d val %d\n", token, intval);
+ +		} else if (token > Opt_last_int && token < Opt_last_string) {
+ +			dout("got string token %d val %s\n", token,
+ +			     argstr[0].from);
+ +		} else {
+ +			dout("got token %d\n", token);
+ +		}
+ +		switch (token) {
+ +		case Opt_ip:
+ +			err = ceph_parse_ips(argstr[0].from,
+ +					     argstr[0].to,
+ +					     &opt->my_addr,
+ +					     1, NULL);
+ +			if (err < 0)
+ +				goto out;
+ +			opt->flags |= CEPH_OPT_MYIP;
+  			break;
+ -		case Opt_read_from_replica_balance:
+ -			opt->read_from_replica = CEPH_OSD_FLAG_BALANCE_READS;
+ +
+ +		case Opt_fsid:
+ +			err = parse_fsid(argstr[0].from, &opt->fsid);
+ +			if (err == 0)
+ +				opt->flags |= CEPH_OPT_FSID;
+  			break;
+ -		case Opt_read_from_replica_localize:
+ -			opt->read_from_replica = CEPH_OSD_FLAG_LOCALIZE_READS;
+ +		case Opt_name:
+ +			kfree(opt->name);
+ +			opt->name = kstrndup(argstr[0].from,
+ +					      argstr[0].to-argstr[0].from,
+ +					      GFP_KERNEL);
+ +			if (!opt->name) {
+ +				err = -ENOMEM;
+ +				goto out;
+ +			}
+  			break;
+ -		default:
+ -			BUG();
+ -		}
+ -		break;
+ -	case Opt_ms_mode:
+ -		switch (result.uint_32) {
+ -		case Opt_ms_mode_legacy:
+ -			opt->con_modes[0] = CEPH_CON_MODE_UNKNOWN;
+ -			opt->con_modes[1] = CEPH_CON_MODE_UNKNOWN;
+ +		case Opt_secret:
+ +			ceph_crypto_key_destroy(opt->key);
+ +			kfree(opt->key);
+ +
+ +		        opt->key = kzalloc(sizeof(*opt->key), GFP_KERNEL);
+ +			if (!opt->key) {
+ +				err = -ENOMEM;
+ +				goto out;
+ +			}
+ +			err = ceph_crypto_key_unarmor(opt->key, argstr[0].from);
+ +			if (err < 0)
+ +				goto out;
+  			break;
+ -		case Opt_ms_mode_crc:
+ -			opt->con_modes[0] = CEPH_CON_MODE_CRC;
+ -			opt->con_modes[1] = CEPH_CON_MODE_UNKNOWN;
+ +		case Opt_key:
+ +			ceph_crypto_key_destroy(opt->key);
+ +			kfree(opt->key);
+ +
+ +		        opt->key = kzalloc(sizeof(*opt->key), GFP_KERNEL);
+ +			if (!opt->key) {
+ +				err = -ENOMEM;
+ +				goto out;
+ +			}
+ +			err = get_secret(opt->key, argstr[0].from);
+ +			if (err < 0)
+ +				goto out;
+  			break;
+ -		case Opt_ms_mode_secure:
+ -			opt->con_modes[0] = CEPH_CON_MODE_SECURE;
+ -			opt->con_modes[1] = CEPH_CON_MODE_UNKNOWN;
+ +		case Opt_crush_location:
+ +			ceph_clear_crush_locs(&opt->crush_locs);
+ +			err = ceph_parse_crush_location(argstr[0].from,
+ +							&opt->crush_locs);
+ +			if (err) {
+ +				pr_err("failed to parse CRUSH location: %d\n",
+ +				       err);
+ +				goto out;
+ +			}
+  			break;
+ -		case Opt_ms_mode_prefer_crc:
+ -			opt->con_modes[0] = CEPH_CON_MODE_CRC;
+ -			opt->con_modes[1] = CEPH_CON_MODE_SECURE;
+ +		case Opt_read_from_replica:
+ +			if (!strcmp(argstr[0].from, "no")) {
+ +				opt->read_from_replica = 0;
+ +			} else if (!strcmp(argstr[0].from, "balance")) {
+ +				opt->read_from_replica = CEPH_OSD_FLAG_BALANCE_READS;
+ +			} else if (!strcmp(argstr[0].from, "localize")) {
+ +				opt->read_from_replica = CEPH_OSD_FLAG_LOCALIZE_READS;
+ +			} else {
+ +				err = -EINVAL;
+ +				goto out;
+ +			}
+  			break;
+ -		case Opt_ms_mode_prefer_secure:
+ -			opt->con_modes[0] = CEPH_CON_MODE_SECURE;
+ -			opt->con_modes[1] = CEPH_CON_MODE_CRC;
+ +
+ +			/* misc */
+ +		case Opt_osdtimeout:
+ +			pr_warn("ignoring deprecated osdtimeout option\n");
+ +			break;
+ +		case Opt_osdkeepalivetimeout:
+ +			/* 0 isn't well defined right now, reject it */
+ +			if (intval < 1 || intval > INT_MAX / 1000) {
+ +				pr_err("osdkeepalive out of range\n");
+ +				err = -EINVAL;
+ +				goto out;
+ +			}
+ +			opt->osd_keepalive_timeout =
+ +					msecs_to_jiffies(intval * 1000);
+ +			break;
+ +		case Opt_osd_idle_ttl:
+ +			/* 0 isn't well defined right now, reject it */
+ +			if (intval < 1 || intval > INT_MAX / 1000) {
+ +				pr_err("osd_idle_ttl out of range\n");
+ +				err = -EINVAL;
+ +				goto out;
+ +			}
+ +			opt->osd_idle_ttl = msecs_to_jiffies(intval * 1000);
+ +			break;
+ +		case Opt_mount_timeout:
+ +			/* 0 is "wait forever" (i.e. infinite timeout) */
+ +			if (intval < 0 || intval > INT_MAX / 1000) {
+ +				pr_err("mount_timeout out of range\n");
+ +				err = -EINVAL;
+ +				goto out;
+ +			}
+ +			opt->mount_timeout = msecs_to_jiffies(intval * 1000);
+ +			break;
+ +		case Opt_osd_request_timeout:
+ +			/* 0 is "wait forever" (i.e. infinite timeout) */
+ +			if (intval < 0 || intval > INT_MAX / 1000) {
+ +				pr_err("osd_request_timeout out of range\n");
+ +				err = -EINVAL;
+ +				goto out;
+ +			}
+ +			opt->osd_request_timeout = msecs_to_jiffies(intval * 1000);
+  			break;
+ -		default:
+ -			BUG();
+ -		}
+ -		break;
+  
+ -	case Opt_osdkeepalivetimeout:
+ -		/* 0 isn't well defined right now, reject it */
+ -		if (result.uint_32 < 1 || result.uint_32 > INT_MAX / 1000)
+ -			goto out_of_range;
+ -		opt->osd_keepalive_timeout =
+ -		    msecs_to_jiffies(result.uint_32 * 1000);
+ -		break;
+ -	case Opt_osd_idle_ttl:
+ -		/* 0 isn't well defined right now, reject it */
+ -		if (result.uint_32 < 1 || result.uint_32 > INT_MAX / 1000)
+ -			goto out_of_range;
+ -		opt->osd_idle_ttl = msecs_to_jiffies(result.uint_32 * 1000);
+ -		break;
+ -	case Opt_mount_timeout:
+ -		/* 0 is "wait forever" (i.e. infinite timeout) */
+ -		if (result.uint_32 > INT_MAX / 1000)
+ -			goto out_of_range;
+ -		opt->mount_timeout = msecs_to_jiffies(result.uint_32 * 1000);
+ -		break;
+ -	case Opt_osd_request_timeout:
+ -		/* 0 is "wait forever" (i.e. infinite timeout) */
+ -		if (result.uint_32 > INT_MAX / 1000)
+ -			goto out_of_range;
+ -		opt->osd_request_timeout =
+ -		    msecs_to_jiffies(result.uint_32 * 1000);
+ -		break;
+ +		case Opt_ms_mode:
+ +			if (!strcmp(argstr[0].from, "legacy")) {
+ +				opt->con_modes[0] = CEPH_CON_MODE_UNKNOWN;
+ +				opt->con_modes[1] = CEPH_CON_MODE_UNKNOWN;
+ +			} else if (!strcmp(argstr[0].from, "crc")) {
+ +				opt->con_modes[0] = CEPH_CON_MODE_CRC;
+ +				opt->con_modes[1] = CEPH_CON_MODE_UNKNOWN;
+ +			} else if (!strcmp(argstr[0].from, "secure")) {
+ +				opt->con_modes[0] = CEPH_CON_MODE_SECURE;
+ +				opt->con_modes[1] = CEPH_CON_MODE_UNKNOWN;
+ +			} else if (!strcmp(argstr[0].from, "prefer-crc")) {
+ +				opt->con_modes[0] = CEPH_CON_MODE_CRC;
+ +				opt->con_modes[1] = CEPH_CON_MODE_SECURE;
+ +			} else if (!strcmp(argstr[0].from, "prefer-secure")) {
+ +				opt->con_modes[0] = CEPH_CON_MODE_SECURE;
+ +				opt->con_modes[1] = CEPH_CON_MODE_CRC;
+ +			} else {
+ +				err = -EINVAL;
+ +				goto out;
+ +			}
+ +			break;
+  
+ -	case Opt_share:
+ -		if (!result.negated)
+ +		case Opt_share:
+  			opt->flags &= ~CEPH_OPT_NOSHARE;
+ -		else
+ +			break;
+ +		case Opt_noshare:
+  			opt->flags |= CEPH_OPT_NOSHARE;
+ -		break;
+ -	case Opt_crc:
+ -		if (!result.negated)
+ +			break;
+ +
+ +		case Opt_crc:
+  			opt->flags &= ~CEPH_OPT_NOCRC;
+ -		else
+ +			break;
+ +		case Opt_nocrc:
+  			opt->flags |= CEPH_OPT_NOCRC;
+ -		break;
+ -	case Opt_cephx_require_signatures:
+ -		if (!result.negated)
+ -			warn_plog(&log, "Ignoring cephx_require_signatures");
+ -		else
+ -			warn_plog(&log, "Ignoring nocephx_require_signatures, use nocephx_sign_messages");
+ -		break;
+ -	case Opt_cephx_sign_messages:
+ -		if (!result.negated)
+ +			break;
+ +
+ +		case Opt_cephx_require_signatures:
+ +			opt->flags &= ~CEPH_OPT_NOMSGAUTH;
+ +			break;
+ +		case Opt_nocephx_require_signatures:
+ +			opt->flags |= CEPH_OPT_NOMSGAUTH;
+ +			break;
+ +		case Opt_cephx_sign_messages:
+  			opt->flags &= ~CEPH_OPT_NOMSGSIGN;
+ -		else
+ +			break;
+ +		case Opt_nocephx_sign_messages:
+  			opt->flags |= CEPH_OPT_NOMSGSIGN;
+ -		break;
+ -	case Opt_tcp_nodelay:
+ -		if (!result.negated)
+ +			break;
+ +
+ +		case Opt_tcp_nodelay:
+  			opt->flags |= CEPH_OPT_TCP_NODELAY;
+ -		else
+ +			break;
+ +		case Opt_notcp_nodelay:
+  			opt->flags &= ~CEPH_OPT_TCP_NODELAY;
+ -		break;
+ +			break;
+  
+++<<<<<<< HEAD
+ +		case Opt_abort_on_full:
+ +			opt->flags |= CEPH_OPT_ABORT_ON_FULL;
+ +			break;
+++=======
++ 	case Opt_abort_on_full:
++ 		opt->flags |= CEPH_OPT_ABORT_ON_FULL;
++ 		break;
++ 	case Opt_rxbounce:
++ 		opt->flags |= CEPH_OPT_RXBOUNCE;
++ 		break;
+++>>>>>>> 038b8d1d1ab1 (libceph: optionally use bounce buffer on recv path in crc mode)
+  
+ -	default:
+ -		BUG();
+ +		default:
+ +			BUG_ON(token);
+ +		}
+  	}
+  
+ -	return 0;
+ +	/* success */
+ +	return opt;
+  
+ -out_of_range:
+ -	return inval_plog(&log, "%s out of range", param->key);
+ +out:
+ +	ceph_destroy_options(opt);
+ +	return ERR_PTR(err);
+  }
+ -EXPORT_SYMBOL(ceph_parse_param);
+ +EXPORT_SYMBOL(ceph_parse_options);
+  
+  int ceph_print_client_options(struct seq_file *m, struct ceph_client *client,
+  			      bool show_all)
+* Unmerged path include/linux/ceph/libceph.h
+diff --git a/include/linux/ceph/messenger.h b/include/linux/ceph/messenger.h
+index 9041e9e486da..492d3e4a8590 100644
+--- a/include/linux/ceph/messenger.h
++++ b/include/linux/ceph/messenger.h
+@@ -461,6 +461,7 @@ struct ceph_connection {
+ 	struct ceph_msg *out_msg;        /* sending message (== tail of
+ 					    out_sent) */
+ 
++	struct page *bounce_page;
+ 	u32 in_front_crc, in_middle_crc, in_data_crc;  /* calculated crc */
+ 
+ 	struct timespec64 last_keepalive_ack; /* keepalive2 ack stamp */
+* Unmerged path net/ceph/ceph_common.c
+diff --git a/net/ceph/messenger.c b/net/ceph/messenger.c
+index 42e4fcb1c64c..f70b7f1cfffa 100644
+--- a/net/ceph/messenger.c
++++ b/net/ceph/messenger.c
+@@ -515,6 +515,10 @@ static void ceph_con_reset_protocol(struct ceph_connection *con)
+ 		ceph_msg_put(con->out_msg);
+ 		con->out_msg = NULL;
+ 	}
++	if (con->bounce_page) {
++		__free_page(con->bounce_page);
++		con->bounce_page = NULL;
++	}
+ 
+ 	if (ceph_msgr2(from_msgr(con->msgr)))
+ 		ceph_con_v2_reset_protocol(con);
+diff --git a/net/ceph/messenger_v1.c b/net/ceph/messenger_v1.c
+index 2cb5ffdf071a..6b014eca3a13 100644
+--- a/net/ceph/messenger_v1.c
++++ b/net/ceph/messenger_v1.c
+@@ -992,8 +992,7 @@ static int read_partial_message_section(struct ceph_connection *con,
+ 
+ static int read_partial_msg_data(struct ceph_connection *con)
+ {
+-	struct ceph_msg *msg = con->in_msg;
+-	struct ceph_msg_data_cursor *cursor = &msg->cursor;
++	struct ceph_msg_data_cursor *cursor = &con->in_msg->cursor;
+ 	bool do_datacrc = !ceph_test_opt(from_msgr(con->msgr), NOCRC);
+ 	struct page *page;
+ 	size_t page_offset;
+@@ -1001,9 +1000,6 @@ static int read_partial_msg_data(struct ceph_connection *con)
+ 	u32 crc = 0;
+ 	int ret;
+ 
+-	if (!msg->num_data_items)
+-		return -EIO;
+-
+ 	if (do_datacrc)
+ 		crc = con->in_data_crc;
+ 	while (cursor->total_resid) {
+@@ -1031,6 +1027,46 @@ static int read_partial_msg_data(struct ceph_connection *con)
+ 	return 1;	/* must return > 0 to indicate success */
+ }
+ 
++static int read_partial_msg_data_bounce(struct ceph_connection *con)
++{
++	struct ceph_msg_data_cursor *cursor = &con->in_msg->cursor;
++	struct page *page;
++	size_t off, len;
++	u32 crc;
++	int ret;
++
++	if (unlikely(!con->bounce_page)) {
++		con->bounce_page = alloc_page(GFP_NOIO);
++		if (!con->bounce_page) {
++			pr_err("failed to allocate bounce page\n");
++			return -ENOMEM;
++		}
++	}
++
++	crc = con->in_data_crc;
++	while (cursor->total_resid) {
++		if (!cursor->resid) {
++			ceph_msg_data_advance(cursor, 0);
++			continue;
++		}
++
++		page = ceph_msg_data_next(cursor, &off, &len, NULL);
++		ret = ceph_tcp_recvpage(con->sock, con->bounce_page, 0, len);
++		if (ret <= 0) {
++			con->in_data_crc = crc;
++			return ret;
++		}
++
++		crc = crc32c(crc, page_address(con->bounce_page), ret);
++		memcpy_to_page(page, off, page_address(con->bounce_page), ret);
++
++		ceph_msg_data_advance(cursor, ret);
++	}
++	con->in_data_crc = crc;
++
++	return 1;	/* must return > 0 to indicate success */
++}
++
+ /*
+  * read (part of) a message.
+  */
+@@ -1141,7 +1177,13 @@ static int read_partial_message(struct ceph_connection *con)
+ 
+ 	/* (page) data */
+ 	if (data_len) {
+-		ret = read_partial_msg_data(con);
++		if (!m->num_data_items)
++			return -EIO;
++
++		if (ceph_test_opt(from_msgr(con->msgr), RXBOUNCE))
++			ret = read_partial_msg_data_bounce(con);
++		else
++			ret = read_partial_msg_data(con);
+ 		if (ret <= 0)
+ 			return ret;
+ 	}
+diff --git a/net/ceph/messenger_v2.c b/net/ceph/messenger_v2.c
+index 6ecf12c3a868..7af6e73f93ff 100644
+--- a/net/ceph/messenger_v2.c
++++ b/net/ceph/messenger_v2.c
+@@ -1753,7 +1753,7 @@ static int prepare_read_control_remainder(struct ceph_connection *con)
+ 	return 0;
+ }
+ 
+-static void prepare_read_data(struct ceph_connection *con)
++static int prepare_read_data(struct ceph_connection *con)
+ {
+ 	struct bio_vec bv;
+ 
+@@ -1762,23 +1762,55 @@ static void prepare_read_data(struct ceph_connection *con)
+ 				  data_len(con->in_msg));
+ 
+ 	get_bvec_at(&con->v2.in_cursor, &bv);
+-	set_in_bvec(con, &bv);
++	if (ceph_test_opt(from_msgr(con->msgr), RXBOUNCE)) {
++		if (unlikely(!con->bounce_page)) {
++			con->bounce_page = alloc_page(GFP_NOIO);
++			if (!con->bounce_page) {
++				pr_err("failed to allocate bounce page\n");
++				return -ENOMEM;
++			}
++		}
++
++		bv.bv_page = con->bounce_page;
++		bv.bv_offset = 0;
++		set_in_bvec(con, &bv);
++	} else {
++		set_in_bvec(con, &bv);
++	}
+ 	con->v2.in_state = IN_S_PREPARE_READ_DATA_CONT;
++	return 0;
+ }
+ 
+ static void prepare_read_data_cont(struct ceph_connection *con)
+ {
+ 	struct bio_vec bv;
+ 
+-	con->in_data_crc = ceph_crc32c_page(con->in_data_crc,
+-					    con->v2.in_bvec.bv_page,
+-					    con->v2.in_bvec.bv_offset,
+-					    con->v2.in_bvec.bv_len);
++	if (ceph_test_opt(from_msgr(con->msgr), RXBOUNCE)) {
++		con->in_data_crc = crc32c(con->in_data_crc,
++					  page_address(con->bounce_page),
++					  con->v2.in_bvec.bv_len);
++
++		get_bvec_at(&con->v2.in_cursor, &bv);
++		memcpy_to_page(bv.bv_page, bv.bv_offset,
++			       page_address(con->bounce_page),
++			       con->v2.in_bvec.bv_len);
++	} else {
++		con->in_data_crc = ceph_crc32c_page(con->in_data_crc,
++						    con->v2.in_bvec.bv_page,
++						    con->v2.in_bvec.bv_offset,
++						    con->v2.in_bvec.bv_len);
++	}
+ 
+ 	ceph_msg_data_advance(&con->v2.in_cursor, con->v2.in_bvec.bv_len);
+ 	if (con->v2.in_cursor.total_resid) {
+ 		get_bvec_at(&con->v2.in_cursor, &bv);
+-		set_in_bvec(con, &bv);
++		if (ceph_test_opt(from_msgr(con->msgr), RXBOUNCE)) {
++			bv.bv_page = con->bounce_page;
++			bv.bv_offset = 0;
++			set_in_bvec(con, &bv);
++		} else {
++			set_in_bvec(con, &bv);
++		}
+ 		WARN_ON(con->v2.in_state != IN_S_PREPARE_READ_DATA_CONT);
+ 		return;
+ 	}
+@@ -1791,14 +1823,13 @@ static void prepare_read_data_cont(struct ceph_connection *con)
+ 	con->v2.in_state = IN_S_HANDLE_EPILOGUE;
+ }
+ 
+-static void prepare_read_tail_plain(struct ceph_connection *con)
++static int prepare_read_tail_plain(struct ceph_connection *con)
+ {
+ 	struct ceph_msg *msg = con->in_msg;
+ 
+ 	if (!front_len(msg) && !middle_len(msg)) {
+ 		WARN_ON(!data_len(msg));
+-		prepare_read_data(con);
+-		return;
++		return prepare_read_data(con);
+ 	}
+ 
+ 	reset_in_kvecs(con);
+@@ -1817,6 +1848,7 @@ static void prepare_read_tail_plain(struct ceph_connection *con)
+ 		add_in_kvec(con, con->v2.in_buf, CEPH_EPILOGUE_PLAIN_LEN);
+ 		con->v2.in_state = IN_S_HANDLE_EPILOGUE;
+ 	}
++	return 0;
+ }
+ 
+ static void prepare_read_enc_page(struct ceph_connection *con)
+@@ -2699,8 +2731,7 @@ static int __handle_control(struct ceph_connection *con, void *p)
+ 	if (con_secure(con))
+ 		return prepare_read_tail_secure(con);
+ 
+-	prepare_read_tail_plain(con);
+-	return 0;
++	return prepare_read_tail_plain(con);
+ }
+ 
+ static int handle_preamble(struct ceph_connection *con)
+@@ -2856,8 +2887,7 @@ static int populate_in_iter(struct ceph_connection *con)
+ 			ret = handle_control_remainder(con);
+ 			break;
+ 		case IN_S_PREPARE_READ_DATA:
+-			prepare_read_data(con);
+-			ret = 0;
++			ret = prepare_read_data(con);
+ 			break;
+ 		case IN_S_PREPARE_READ_DATA_CONT:
+ 			prepare_read_data_cont(con);
