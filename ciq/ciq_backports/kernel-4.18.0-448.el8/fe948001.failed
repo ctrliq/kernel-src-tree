@@ -1,0 +1,99 @@
+mptcp: don't orphan ssk in mptcp_close()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Menglong Dong <imagedong@tencent.com>
+commit fe94800184f22d4778628f1321dce5acb7513d84
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/fe948001.failed
+
+All of the subflows of a msk will be orphaned in mptcp_close(), which
+means the subflows are in DEAD state. After then, DATA_FIN will be sent,
+and the other side will response with a DATA_ACK for this DATA_FIN.
+
+However, if the other side still has pending data, the data that received
+on these subflows will not be passed to the msk, as they are DEAD and
+subflow_data_ready() will not be called in tcp_data_ready(). Therefore,
+these data can't be acked, and they will be retransmitted again and again,
+until timeout.
+
+Fix this by setting ssk->sk_socket and ssk->sk_wq to 'NULL', instead of
+orphaning the subflows in __mptcp_close(), as Paolo suggested.
+
+Fixes: e16163b6e2b7 ("mptcp: refactor shutdown and close")
+	Reviewed-by: Biao Jiang <benbjiang@tencent.com>
+	Reviewed-by: Mengen Sun <mengensun@tencent.com>
+	Signed-off-by: Menglong Dong <imagedong@tencent.com>
+	Reviewed-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit fe94800184f22d4778628f1321dce5acb7513d84)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index ce2891e982c4,1dbc62537259..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -2257,13 -2335,26 +2257,36 @@@ static void __mptcp_close_ssk(struct so
+  
+  	lock_sock_nested(ssk, SINGLE_DEPTH_NESTING);
+  
+++<<<<<<< HEAD
+ +	/* if we are invoked by the msk cleanup code, the subflow is
+ +	 * already orphaned
+ +	 */
+ +	if (ssk->sk_socket)
+ +		sock_orphan(ssk);
+ +
+ +	need_push = __mptcp_retransmit_pending_data(sk);
+++=======
++ 	if (flags & MPTCP_CF_FASTCLOSE) {
++ 		/* be sure to force the tcp_disconnect() path,
++ 		 * to generate the egress reset
++ 		 */
++ 		ssk->sk_lingertime = 0;
++ 		sock_set_flag(ssk, SOCK_LINGER);
++ 		subflow->send_fastclose = 1;
++ 	}
++ 
++ 	need_push = (flags & MPTCP_CF_PUSH) && __mptcp_retransmit_pending_data(sk);
++ 	if (!dispose_it) {
++ 		tcp_disconnect(ssk, 0);
++ 		msk->subflow->state = SS_UNCONNECTED;
++ 		mptcp_subflow_ctx_reset(subflow);
++ 		release_sock(ssk);
++ 
++ 		goto out;
++ 	}
++ 
++ 	sock_orphan(ssk);
+++>>>>>>> fe94800184f2 (mptcp: don't orphan ssk in mptcp_close())
+  	subflow->disposable = 1;
+  
+  	/* if ssk hit tcp_done(), tcp_cleanup_ulp() cleared the related ops
+@@@ -2748,7 -2929,17 +2771,21 @@@ cleanup
+  		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+  		bool slow = lock_sock_fast_nested(ssk);
+  
+++<<<<<<< HEAD
+ +		sock_orphan(ssk);
+++=======
++ 		/* since the close timeout takes precedence on the fail one,
++ 		 * cancel the latter
++ 		 */
++ 		if (ssk == msk->first)
++ 			subflow->fail_tout = 0;
++ 
++ 		/* detach from the parent socket, but allow data_ready to
++ 		 * push incoming data into the mptcp stack, to properly ack it
++ 		 */
++ 		ssk->sk_socket = NULL;
++ 		ssk->sk_wq = NULL;
+++>>>>>>> fe94800184f2 (mptcp: don't orphan ssk in mptcp_close())
+  		unlock_sock_fast(ssk, slow);
+  	}
+  	sock_orphan(sk);
+* Unmerged path net/mptcp/protocol.c
