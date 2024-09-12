@@ -14,6 +14,7 @@
 #include <linux/thunderbolt.h>
 #include <linux/uuid.h>
 #include <linux/bitfield.h>
+#include <linux/moduleparam.h>
 
 #include "tb_regs.h"
 #include "ctl.h"

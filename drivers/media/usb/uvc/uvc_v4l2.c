@@ -26,14 +26,84 @@
 
 #include "uvcvideo.h"
 
+static int uvc_control_add_xu_mapping(struct uvc_video_chain *chain,
+				      struct uvc_control_mapping *map,
+				      const struct uvc_xu_control_mapping *xmap)
+{
+	unsigned int i;
+	size_t size;
+	int ret;
+
+	/*
+	 * Prevent excessive memory consumption, as well as integer
+	 * overflows.
+	 */
+	if (xmap->menu_count == 0 ||
+	    xmap->menu_count > UVC_MAX_CONTROL_MENU_ENTRIES)
+		return -EINVAL;
+
+	map->menu_names = NULL;
+	map->menu_mapping = NULL;
+
+	map->menu_mask = BIT_MASK(xmap->menu_count);
+
+	size = xmap->menu_count * sizeof(*map->menu_mapping);
+	map->menu_mapping = kzalloc(size, GFP_KERNEL);
+	if (!map->menu_mapping) {
+		ret = -ENOMEM;
+		goto done;
+	}
+
+	for (i = 0; i < xmap->menu_count ; i++) {
+		if (copy_from_user((u32 *)&map->menu_mapping[i],
+				   &xmap->menu_info[i].value,
+				   sizeof(map->menu_mapping[i]))) {
+			ret = -EACCES;
+			goto done;
+		}
+	}
+
+	/*
+	 * Always use the standard naming if available, otherwise copy the
+	 * names supplied by userspace.
+	 */
+	if (!v4l2_ctrl_get_menu(map->id)) {
+		size = xmap->menu_count * sizeof(map->menu_names[0]);
+		map->menu_names = kzalloc(size, GFP_KERNEL);
+		if (!map->menu_names) {
+			ret = -ENOMEM;
+			goto done;
+		}
+
+		for (i = 0; i < xmap->menu_count ; i++) {
+			/* sizeof(names[i]) - 1: to take care of \0 */
+			if (copy_from_user((char *)map->menu_names[i],
+					   xmap->menu_info[i].name,
+					   sizeof(map->menu_names[i]) - 1)) {
+				ret = -EACCES;
+				goto done;
+			}
+		}
+	}
+
+	ret = uvc_ctrl_add_mapping(chain, map);
+
+done:
+	kfree(map->menu_names);
+	map->menu_names = NULL;
+	kfree(map->menu_mapping);
+	map->menu_mapping = NULL;
+
+	return ret;
+}
+
 /* ------------------------------------------------------------------------
  * UVC ioctls
  */
-static int uvc_ioctl_ctrl_map(struct uvc_video_chain *chain,
-	struct uvc_xu_control_mapping *xmap)
+static int uvc_ioctl_xu_ctrl_map(struct uvc_video_chain *chain,
+				 struct uvc_xu_control_mapping *xmap)
 {
 	struct uvc_control_mapping *map;
-	unsigned int size;
 	int ret;
 
 	map = kzalloc(sizeof(*map), GFP_KERNEL);
@@ -41,7 +111,15 @@ static int uvc_ioctl_ctrl_map(struct uvc_video_chain *chain,
 		return -ENOMEM;
 
 	map->id = xmap->id;
-	memcpy(map->name, xmap->name, sizeof(map->name));
+	/* Non standard control id. */
+	if (v4l2_ctrl_get_name(map->id) == NULL) {
+		if (xmap->name[0] == '\0') {
+			ret = -EINVAL;
+			goto free_map;
+		}
+		xmap->name[sizeof(xmap->name) - 1] = '\0';
+		map->name = xmap->name;
+	}
 	memcpy(map->entity, xmap->entity, sizeof(map->entity));
 	map->selector = xmap->selector;
 	map->size = xmap->size;
@@ -53,39 +131,20 @@ static int uvc_ioctl_ctrl_map(struct uvc_video_chain *chain,
 	case V4L2_CTRL_TYPE_INTEGER:
 	case V4L2_CTRL_TYPE_BOOLEAN:
 	case V4L2_CTRL_TYPE_BUTTON:
+		ret = uvc_ctrl_add_mapping(chain, map);
 		break;
 
 	case V4L2_CTRL_TYPE_MENU:
-		/*
-		 * Prevent excessive memory consumption, as well as integer
-		 * overflows.
-		 */
-		if (xmap->menu_count == 0 ||
-		    xmap->menu_count > UVC_MAX_CONTROL_MENU_ENTRIES) {
-			ret = -EINVAL;
-			goto free_map;
-		}
-
-		size = xmap->menu_count * sizeof(*map->menu_info);
-		map->menu_info = memdup_user(xmap->menu_info, size);
-		if (IS_ERR(map->menu_info)) {
-			ret = PTR_ERR(map->menu_info);
-			goto free_map;
-		}
-
-		map->menu_mask = GENMASK(xmap->menu_count - 1, 0);
+		ret = uvc_control_add_xu_mapping(chain, map, xmap);
 		break;
 
 	default:
 		uvc_dbg(chain->dev, CONTROL,
 			"Unsupported V4L2 control type %u\n", xmap->v4l2_type);
 		ret = -ENOTTY;
-		goto free_map;
+		break;
 	}
 
-	ret = uvc_ctrl_add_mapping(chain, map);
-
-	kfree(map->menu_info);
 free_map:
 	kfree(map);
 
@@ -1001,6 +1060,25 @@ static int uvc_ioctl_query_ext_ctrl(struct file *file, void *fh,
 	return 0;
 }
 
+static int uvc_ctrl_check_access(struct uvc_video_chain *chain,
+				 struct v4l2_ext_controls *ctrls,
+				 unsigned long ioctl)
+{
+	struct v4l2_ext_control *ctrl = ctrls->controls;
+	unsigned int i;
+	int ret = 0;
+
+	for (i = 0; i < ctrls->count; ++ctrl, ++i) {
+		ret = uvc_ctrl_is_accessible(chain, ctrl->id, ctrls, ioctl);
+		if (ret)
+			break;
+	}
+
+	ctrls->error_idx = ioctl == VIDIOC_TRY_EXT_CTRLS ? i : ctrls->count;
+
+	return ret;
+}
+
 static int uvc_ioctl_g_ext_ctrls(struct file *file, void *fh,
 				 struct v4l2_ext_controls *ctrls)
 {
@@ -1009,6 +1087,10 @@ static int uvc_ioctl_g_ext_ctrls(struct file *file, void *fh,
 	struct v4l2_ext_control *ctrl = ctrls->controls;
 	unsigned int i;
 	int ret;
+
+	ret = uvc_ctrl_check_access(chain, ctrls, VIDIOC_G_EXT_CTRLS);
+	if (ret < 0)
+		return ret;
 
 	if (ctrls->which == V4L2_CTRL_WHICH_DEF_VAL) {
 		for (i = 0; i < ctrls->count; ++ctrl, ++i) {
@@ -1046,12 +1128,16 @@ static int uvc_ioctl_g_ext_ctrls(struct file *file, void *fh,
 
 static int uvc_ioctl_s_try_ext_ctrls(struct uvc_fh *handle,
 				     struct v4l2_ext_controls *ctrls,
-				     bool commit)
+				     unsigned long ioctl)
 {
 	struct v4l2_ext_control *ctrl = ctrls->controls;
 	struct uvc_video_chain *chain = handle->chain;
 	unsigned int i;
 	int ret;
+
+	ret = uvc_ctrl_check_access(chain, ctrls, ioctl);
+	if (ret < 0)
+		return ret;
 
 	ret = uvc_ctrl_begin(chain);
 	if (ret < 0)
@@ -1061,15 +1147,16 @@ static int uvc_ioctl_s_try_ext_ctrls(struct uvc_fh *handle,
 		ret = uvc_ctrl_set(handle, ctrl);
 		if (ret < 0) {
 			uvc_ctrl_rollback(handle);
-			ctrls->error_idx = commit ? ctrls->count : i;
+			ctrls->error_idx = ioctl == VIDIOC_S_EXT_CTRLS ?
+						    ctrls->count : i;
 			return ret;
 		}
 	}
 
 	ctrls->error_idx = 0;
 
-	if (commit)
-		return uvc_ctrl_commit(handle, ctrls->controls, ctrls->count);
+	if (ioctl == VIDIOC_S_EXT_CTRLS)
+		return uvc_ctrl_commit(handle, ctrls);
 	else
 		return uvc_ctrl_rollback(handle);
 }
@@ -1079,7 +1166,7 @@ static int uvc_ioctl_s_ext_ctrls(struct file *file, void *fh,
 {
 	struct uvc_fh *handle = fh;
 
-	return uvc_ioctl_s_try_ext_ctrls(handle, ctrls, true);
+	return uvc_ioctl_s_try_ext_ctrls(handle, ctrls, VIDIOC_S_EXT_CTRLS);
 }
 
 static int uvc_ioctl_try_ext_ctrls(struct file *file, void *fh,
@@ -1087,7 +1174,7 @@ static int uvc_ioctl_try_ext_ctrls(struct file *file, void *fh,
 {
 	struct uvc_fh *handle = fh;
 
-	return uvc_ioctl_s_try_ext_ctrls(handle, ctrls, false);
+	return uvc_ioctl_s_try_ext_ctrls(handle, ctrls, VIDIOC_TRY_EXT_CTRLS);
 }
 
 static int uvc_ioctl_querymenu(struct file *file, void *fh,
@@ -1277,7 +1364,7 @@ static long uvc_ioctl_default(struct file *file, void *fh, bool valid_prio,
 	switch (cmd) {
 	/* Dynamic controls. */
 	case UVCIOC_CTRL_MAP:
-		return uvc_ioctl_ctrl_map(chain, arg);
+		return uvc_ioctl_xu_ctrl_map(chain, arg);
 
 	case UVCIOC_CTRL_QUERY:
 		return uvc_xu_ctrl_query(chain, arg);
@@ -1390,7 +1477,7 @@ static long uvc_v4l2_compat_ioctl32(struct file *file,
 		ret = uvc_v4l2_get_xu_mapping(&karg.xmap, up);
 		if (ret)
 			return ret;
-		ret = uvc_ioctl_ctrl_map(handle->chain, &karg.xmap);
+		ret = uvc_ioctl_xu_ctrl_map(handle->chain, &karg.xmap);
 		if (ret)
 			return ret;
 		ret = uvc_v4l2_put_xu_mapping(&karg.xmap, up);

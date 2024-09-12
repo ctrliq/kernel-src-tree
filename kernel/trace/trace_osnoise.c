@@ -2363,7 +2363,7 @@ static int init_tracefs(void)
 	if (!tmp)
 		goto err;
 
-	tmp = trace_create_file("options", TRACE_MODE_WRITE, top_dir, NULL,
+	tmp = trace_create_file("options", 0640, top_dir, NULL,
 				&osnoise_options_fops);
 	if (!tmp)
 		goto err;

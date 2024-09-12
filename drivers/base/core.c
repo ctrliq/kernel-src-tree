@@ -14,7 +14,6 @@
 #include <linux/err.h>
 #include <linux/fwnode.h>
 #include <linux/init.h>
-#include <linux/kstrtox.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -55,6 +54,7 @@ static DEFINE_MUTEX(fwnode_link_lock);
 static bool fw_devlink_is_permissive(void);
 static void __fw_devlink_link_to_consumers(struct device *dev);
 static bool fw_devlink_drv_reg_done;
+static bool fw_devlink_best_effort;
 
 /**
  * __fwnode_link_add - Create a link between two fwnode_handles.
@@ -74,13 +74,15 @@ static bool fw_devlink_drv_reg_done;
  * are ignored and there is no reference counting.
  */
 static int __fwnode_link_add(struct fwnode_handle *con,
-			     struct fwnode_handle *sup)
+			     struct fwnode_handle *sup, u8 flags)
 {
 	struct fwnode_link *link;
 
 	list_for_each_entry(link, &sup->consumers, s_hook)
-		if (link->consumer == con)
+		if (link->consumer == con) {
+			link->flags |= flags;
 			return 0;
+		}
 
 	link = kzalloc(sizeof(*link), GFP_KERNEL);
 	if (!link)
@@ -90,10 +92,11 @@ static int __fwnode_link_add(struct fwnode_handle *con,
 	INIT_LIST_HEAD(&link->s_hook);
 	link->consumer = con;
 	INIT_LIST_HEAD(&link->c_hook);
+	link->flags = flags;
 
 	list_add(&link->s_hook, &sup->consumers);
 	list_add(&link->c_hook, &con->suppliers);
-	pr_debug("%pfwP Linked as a fwnode consumer to %pfwP\n",
+	pr_debug("%pfwf Linked as a fwnode consumer to %pfwf\n",
 		 con, sup);
 
 	return 0;
@@ -104,7 +107,7 @@ int fwnode_link_add(struct fwnode_handle *con, struct fwnode_handle *sup)
 	int ret;
 
 	mutex_lock(&fwnode_link_lock);
-	ret = __fwnode_link_add(con, sup);
+	ret = __fwnode_link_add(con, sup, 0);
 	mutex_unlock(&fwnode_link_lock);
 	return ret;
 }
@@ -117,11 +120,24 @@ int fwnode_link_add(struct fwnode_handle *con, struct fwnode_handle *sup)
  */
 static void __fwnode_link_del(struct fwnode_link *link)
 {
-	pr_debug("%pfwP Dropping the fwnode link to %pfwP\n",
+	pr_debug("%pfwf Dropping the fwnode link to %pfwf\n",
 		 link->consumer, link->supplier);
 	list_del(&link->s_hook);
 	list_del(&link->c_hook);
 	kfree(link);
+}
+
+/**
+ * __fwnode_link_cycle - Mark a fwnode link as being part of a cycle.
+ * @link: the fwnode_link to be marked
+ *
+ * The fwnode_link_lock needs to be held when this function is called.
+ */
+static void __fwnode_link_cycle(struct fwnode_link *link)
+{
+	pr_debug("%pfwf: Relaxing link with %pfwf\n",
+		 link->consumer, link->supplier);
+	link->flags |= FWLINK_FLAG_CYCLE;
 }
 
 /**
@@ -197,7 +213,7 @@ static void __fwnode_links_move_consumers(struct fwnode_handle *from,
 	struct fwnode_link *link, *tmp;
 
 	list_for_each_entry_safe(link, tmp, &from->consumers, s_hook) {
-		__fwnode_link_add(link->consumer, to);
+		__fwnode_link_add(link->consumer, to, link->flags);
 		__fwnode_link_del(link);
 	}
 }
@@ -229,7 +245,6 @@ static void __fw_devlink_pickup_dangling_consumers(struct fwnode_handle *fwnode,
 		__fw_devlink_pickup_dangling_consumers(child, new_sup);
 }
 
-#ifdef CONFIG_SRCU
 static DEFINE_MUTEX(device_links_lock);
 DEFINE_STATIC_SRCU(device_links_srcu);
 
@@ -252,30 +267,6 @@ void device_links_read_unlock(int idx)
 {
 	srcu_read_unlock(&device_links_srcu, idx);
 }
-#else /* !CONFIG_SRCU */
-static DECLARE_RWSEM(device_links_lock);
-
-static inline void device_links_write_lock(void)
-{
-	down_write(&device_links_lock);
-}
-
-static inline void device_links_write_unlock(void)
-{
-	up_write(&device_links_lock);
-}
-
-int device_links_read_lock(void)
-{
-	down_read(&device_links_lock);
-	return 0;
-}
-
-void device_links_read_unlock(int not_used)
-{
-	up_read(&device_links_lock);
-}
-#endif /* !CONFIG_SRCU */
 
 static bool device_is_ancestor(struct device *dev, struct device *target)
 {
@@ -1005,6 +996,26 @@ static void device_links_missing_supplier(struct device *dev)
 	}
 }
 
+static bool dev_is_best_effort(struct device *dev)
+{
+	return fw_devlink_best_effort && dev->can_match;
+}
+
+static struct fwnode_handle *fwnode_links_check_suppliers(
+						struct fwnode_handle *fwnode)
+{
+	struct fwnode_link *link;
+
+	if (!fwnode || fw_devlink_is_permissive())
+		return NULL;
+
+	list_for_each_entry(link, &fwnode->suppliers, c_hook)
+		if (!(link->flags & FWLINK_FLAG_CYCLE))
+			return link->supplier;
+
+	return NULL;
+}
+
 /**
  * device_links_check_suppliers - Check presence of supplier drivers.
  * @dev: Consumer device.
@@ -1024,7 +1035,7 @@ static void device_links_missing_supplier(struct device *dev)
 int device_links_check_suppliers(struct device *dev)
 {
 	struct device_link *link;
-	int ret = 0;
+	int ret = 0, fwnode_ret = 0;
 	struct fwnode_handle *sup_fw;
 
 	/*
@@ -1032,17 +1043,19 @@ int device_links_check_suppliers(struct device *dev)
 	 * probe.
 	 */
         mutex_lock(&fwnode_link_lock);
-	if (dev->fwnode && !list_empty(&dev->fwnode->suppliers) &&
-	    !fw_devlink_is_permissive()) {
-		sup_fw = list_first_entry(&dev->fwnode->suppliers,
-					  struct fwnode_link,
-					  c_hook)->supplier;
-		dev_err_probe(dev, -EPROBE_DEFER, "wait for supplier %pfwP\n",
-			      sup_fw);
-		mutex_unlock(&fwnode_link_lock);
-		return -EPROBE_DEFER;
+	sup_fw = fwnode_links_check_suppliers(dev->fwnode);
+	if (sup_fw) {
+		if (!dev_is_best_effort(dev)) {
+			fwnode_ret = -EPROBE_DEFER;
+			dev_err_probe(dev, -EPROBE_DEFER,
+				    "wait for supplier %pfwf\n", sup_fw);
+		} else {
+			fwnode_ret = -EAGAIN;
+		}
 	}
 	mutex_unlock(&fwnode_link_lock);
+	if (fwnode_ret == -EPROBE_DEFER)
+		return fwnode_ret;
 
 	device_links_write_lock();
 
@@ -1052,6 +1065,14 @@ int device_links_check_suppliers(struct device *dev)
 
 		if (link->status != DL_STATE_AVAILABLE &&
 		    !(link->flags & DL_FLAG_SYNC_STATE_ONLY)) {
+
+			if (dev_is_best_effort(dev) &&
+			    link->flags & DL_FLAG_INFERRED &&
+			    !link->supplier->can_match) {
+				ret = -EAGAIN;
+				continue;
+			}
+
 			device_links_missing_supplier(dev);
 			dev_err_probe(dev, -EPROBE_DEFER,
 				      "supplier %s not ready\n",
@@ -1064,7 +1085,8 @@ int device_links_check_suppliers(struct device *dev)
 	dev->links.status = DL_DEV_PROBING;
 
 	device_links_write_unlock();
-	return ret;
+
+	return ret ? ret : fwnode_ret;
 }
 
 /**
@@ -1211,7 +1233,9 @@ static ssize_t waiting_for_supplier_show(struct device *dev,
 	bool val;
 
 	device_lock(dev);
-	val = !list_empty(&dev->fwnode->suppliers);
+	mutex_lock(&fwnode_link_lock);
+	val = !!fwnode_links_check_suppliers(dev->fwnode);
+	mutex_unlock(&fwnode_link_lock);
 	device_unlock(dev);
 	return sysfs_emit(buf, "%u\n", val);
 }
@@ -1334,6 +1358,18 @@ void device_links_driver_bound(struct device *dev)
 			 * When DL_FLAG_SYNC_STATE_ONLY is set, it means no
 			 * other DL_MANAGED_LINK_FLAGS have been set. So, it's
 			 * save to drop the managed link completely.
+			 */
+			device_link_drop_managed(link);
+		} else if (dev_is_best_effort(dev) &&
+			   link->flags & DL_FLAG_INFERRED &&
+			   link->status != DL_STATE_CONSUMER_PROBE &&
+			   !link->supplier->can_match) {
+			/*
+			 * When dev_is_best_effort() is true, we ignore device
+			 * links to suppliers that don't have a driver.  If the
+			 * consumer device still managed to probe, there's no
+			 * point in maintaining a device link in a weird state
+			 * (consumer probed before supplier). So delete it.
 			 */
 			device_link_drop_managed(link);
 		} else {
@@ -1703,6 +1739,62 @@ void fw_devlink_drivers_done(void)
 	class_for_each_device(&devlink_class, NULL, NULL,
 			      fw_devlink_no_driver);
 	device_links_write_unlock();
+}
+
+/**
+ * wait_for_init_devices_probe - Try to probe any device needed for init
+ *
+ * Some devices might need to be probed and bound successfully before the kernel
+ * boot sequence can finish and move on to init/userspace. For example, a
+ * network interface might need to be bound to be able to mount a NFS rootfs.
+ *
+ * With fw_devlink=on by default, some of these devices might be blocked from
+ * probing because they are waiting on a optional supplier that doesn't have a
+ * driver. While fw_devlink will eventually identify such devices and unblock
+ * the probing automatically, it might be too late by the time it unblocks the
+ * probing of devices. For example, the IP4 autoconfig might timeout before
+ * fw_devlink unblocks probing of the network interface.
+ *
+ * This function is available to temporarily try and probe all devices that have
+ * a driver even if some of their suppliers haven't been added or don't have
+ * drivers.
+ *
+ * The drivers can then decide which of the suppliers are optional vs mandatory
+ * and probe the device if possible. By the time this function returns, all such
+ * "best effort" probes are guaranteed to be completed. If a device successfully
+ * probes in this mode, we delete all fw_devlink discovered dependencies of that
+ * device where the supplier hasn't yet probed successfully because they have to
+ * be optional dependencies.
+ *
+ * Any devices that didn't successfully probe go back to being treated as if
+ * this function was never called.
+ *
+ * This also means that some devices that aren't needed for init and could have
+ * waited for their optional supplier to probe (when the supplier's module is
+ * loaded later on) would end up probing prematurely with limited functionality.
+ * So call this function only when boot would fail without it.
+ */
+void __init wait_for_init_devices_probe(void)
+{
+	if (!fw_devlink_flags || fw_devlink_is_permissive())
+		return;
+
+	/*
+	 * Wait for all ongoing probes to finish so that the "best effort" is
+	 * only applied to devices that can't probe otherwise.
+	 */
+	wait_for_device_probe();
+
+	pr_info("Trying to probe devices needed for running init ...\n");
+	fw_devlink_best_effort = true;
+	driver_deferred_probe_trigger();
+
+	/*
+	 * Wait for all "best effort" probes to finish before going back to
+	 * normal enforcement.
+	 */
+	wait_for_device_probe();
+	fw_devlink_best_effort = false;
 }
 
 static void fw_devlink_unblock_consumers(struct device *dev)
@@ -2330,7 +2422,7 @@ static void device_release(struct kobject *kobj)
 
 static const void *device_namespace(struct kobject *kobj)
 {
-	struct device *dev = kobj_to_dev(kobj);
+	const struct device *dev = kobj_to_dev(kobj);
 	const void *ns = NULL;
 
 	if (dev->class && dev->class->ns_type)
@@ -2341,7 +2433,7 @@ static const void *device_namespace(struct kobject *kobj)
 
 static void device_get_ownership(struct kobject *kobj, kuid_t *uid, kgid_t *gid)
 {
-	struct device *dev = kobj_to_dev(kobj);
+	const struct device *dev = kobj_to_dev(kobj);
 
 	if (dev->class && dev->class->get_ownership)
 		dev->class->get_ownership(dev, uid, gid);
@@ -2580,11 +2672,6 @@ union device_attr_group_devres {
 	const struct attribute_group **groups;
 };
 
-static int devm_attr_group_match(struct device *dev, void *res, void *data)
-{
-	return ((union device_attr_group_devres *)res)->group == data;
-}
-
 static void devm_attr_group_remove(struct device *dev, void *res)
 {
 	union device_attr_group_devres *devres = res;
@@ -2636,23 +2723,6 @@ int devm_device_add_group(struct device *dev, const struct attribute_group *grp)
 EXPORT_SYMBOL_GPL(devm_device_add_group);
 
 /**
- * devm_device_remove_group: remove a managed group from a device
- * @dev:	device to remove the group from
- * @grp:	group to remove
- *
- * This function removes a group of attributes from a device. The attributes
- * previously have to have been created for this group, otherwise it will fail.
- */
-void devm_device_remove_group(struct device *dev,
-			      const struct attribute_group *grp)
-{
-	WARN_ON(devres_release(dev, devm_attr_group_remove,
-			       devm_attr_group_match,
-			       /* cast away const */ (void *)grp));
-}
-EXPORT_SYMBOL_GPL(devm_device_remove_group);
-
-/**
  * devm_device_add_groups - create a bunch of managed attribute groups
  * @dev:	The device to create the group for
  * @groups:	The attribute groups to create, NULL terminated
@@ -2687,23 +2757,6 @@ int devm_device_add_groups(struct device *dev,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(devm_device_add_groups);
-
-/**
- * devm_device_remove_groups - remove a list of managed groups
- *
- * @dev:	The device for the groups to be removed from
- * @groups:	NULL terminated list of groups to be removed
- *
- * If groups is not NULL, remove the specified groups from the device.
- */
-void devm_device_remove_groups(struct device *dev,
-			       const struct attribute_group **groups)
-{
-	WARN_ON(devres_release(dev, devm_attr_groups_remove,
-			       devm_attr_group_match,
-			       /* cast away const */ (void *)groups));
-}
-EXPORT_SYMBOL_GPL(devm_device_remove_groups);
 
 static int device_add_attrs(struct device *dev)
 {
@@ -3063,8 +3116,9 @@ static DEFINE_MUTEX(gdp_mutex);
 static struct kobject *get_device_parent(struct device *dev,
 					 struct device *parent)
 {
+	struct kobject *kobj = NULL;
+
 	if (dev->class) {
-		struct kobject *kobj = NULL;
 		struct kobject *parent_kobj;
 		struct kobject *k;
 
@@ -3112,8 +3166,15 @@ static struct kobject *get_device_parent(struct device *dev,
 	}
 
 	/* subsystems can specify a default root directory for their devices */
-	if (!parent && dev->bus && dev->bus->dev_root)
-		return &dev->bus->dev_root->kobj;
+	if (!parent && dev->bus) {
+		struct device *dev_root = bus_get_dev_root(dev->bus);
+
+		if (dev_root) {
+			kobj = &dev_root->kobj;
+			put_device(dev_root);
+			return kobj;
+		}
+	}
 
 	if (parent)
 		return &parent->kobj;
@@ -3485,10 +3546,7 @@ int device_add(struct device *dev)
 	/* Notify clients of device addition.  This call must come
 	 * after dpm_sysfs_add() and before kobject_uevent().
 	 */
-	if (dev->bus)
-		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
-					     BUS_NOTIFY_ADD_DEVICE, dev);
-
+	bus_notify(dev, BUS_NOTIFY_ADD_DEVICE);
 	kobject_uevent(&dev->kobj, KOBJ_ADD);
 
 	/*
@@ -3667,9 +3725,7 @@ void device_del(struct device *dev)
 	/* Notify clients of device removal.  This call must come
 	 * before dpm_sysfs_remove().
 	 */
-	if (dev->bus)
-		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
-					     BUS_NOTIFY_DEL_DEVICE, dev);
+	bus_notify(dev, BUS_NOTIFY_DEL_DEVICE);
 
 	dpm_sysfs_remove(dev);
 	if (parent)
@@ -3700,9 +3756,7 @@ void device_del(struct device *dev)
 	device_platform_notify_remove(dev);
 	device_links_purge(dev);
 
-	if (dev->bus)
-		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
-					     BUS_NOTIFY_REMOVED_DEVICE, dev);
+	bus_notify(dev, BUS_NOTIFY_REMOVED_DEVICE);
 	kobject_uevent(&dev->kobj, KOBJ_REMOVE);
 	glue_dir = get_glue_dir(dev);
 	kobject_del(&dev->kobj);
@@ -3769,7 +3823,7 @@ static struct device *next_device(struct klist_iter *i)
  * a name. This memory is returned in tmp and needs to be
  * freed by the caller.
  */
-const char *device_get_devnode(struct device *dev,
+const char *device_get_devnode(const struct device *dev,
 			       umode_t *mode, kuid_t *uid, kgid_t *gid,
 			       const char **tmp)
 {

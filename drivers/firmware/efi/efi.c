@@ -62,6 +62,8 @@ struct efi __read_mostly efi = {
 };
 EXPORT_SYMBOL(efi);
 
+static unsigned long __initdata rt_prop = EFI_INVALID_TABLE_ADDR;
+
 struct mm_struct efi_mm = {
 	.mm_rb			= RB_ROOT,
 	.mm_users		= ATOMIC_INIT(2),
@@ -219,11 +221,13 @@ static struct efivar_operations generic_ops;
 static int generic_ops_register(void)
 {
 	generic_ops.get_variable = efi.get_variable;
-	generic_ops.set_variable = efi.set_variable;
-	generic_ops.set_variable_nonblocking = efi.set_variable_nonblocking;
 	generic_ops.get_next_variable = efi.get_next_variable;
 	generic_ops.query_variable_store = efi_query_variable_store;
 
+	if (efi_rt_services_supported(EFI_RT_SUPPORTED_SET_VARIABLE)) {
+		generic_ops.set_variable = efi.set_variable;
+		generic_ops.set_variable_nonblocking = efi.set_variable_nonblocking;
+	}
 	return efivars_register(&generic_efivars, &generic_ops, efi_kobj);
 }
 
@@ -369,12 +373,14 @@ static int __init efisubsys_init(void)
 		return -ENOMEM;
 	}
 
-	error = generic_ops_register();
-	if (error)
-		goto err_put;
-
-	if (efi_enabled(EFI_RUNTIME_SERVICES))
+	if (efi_rt_services_supported(EFI_RT_SUPPORTED_GET_VARIABLE |
+				      EFI_RT_SUPPORTED_GET_NEXT_VARIABLE_NAME)) {
+		error = generic_ops_register();
+		if (error)
+			goto err_put;
 		efivar_ssdt_load();
+		platform_device_register_simple("efivars", 0, NULL, 0);
+	}
 
 	error = sysfs_create_group(efi_kobj, &efi_subsys_attr_group);
 	if (error) {
@@ -399,7 +405,9 @@ static int __init efisubsys_init(void)
 err_remove_group:
 	sysfs_remove_group(efi_kobj, &efi_subsys_attr_group);
 err_unregister:
-	generic_ops_unregister();
+	if (efi_rt_services_supported(EFI_RT_SUPPORTED_GET_VARIABLE |
+				      EFI_RT_SUPPORTED_GET_NEXT_VARIABLE_NAME))
+		generic_ops_unregister();
 err_put:
 	kobject_put(efi_kobj);
 	return error;
@@ -496,6 +504,7 @@ static __initdata efi_config_table_type_t common_tables[] = {
 	{LINUX_EFI_TPM_EVENT_LOG_GUID, "TPMEventLog", &efi.tpm_log},
 	{LINUX_EFI_TPM_FINAL_LOG_GUID, "TPMFinalLog", &efi.tpm_final_log},
 	{LINUX_EFI_MEMRESERVE_TABLE_GUID, "MEMRESERVE", &efi.mem_reserve},
+	{EFI_RT_PROPERTIES_TABLE_GUID, "RTPROP", &rt_prop},
 #ifdef CONFIG_EFI_RCI2_TABLE
 	{DELLEMC_EFI_RCI2_TABLE_GUID, NULL, &rci2_table_phys},
 #endif
@@ -644,6 +653,16 @@ int __init efi_config_parse_tables(void *config_tables, int count, int sz,
 		}
 	}
 
+	if (rt_prop != EFI_INVALID_TABLE_ADDR) {
+		efi_rt_properties_table_t *tbl;
+
+		tbl = early_memremap(rt_prop, sizeof(*tbl));
+		if (tbl) {
+			efi.runtime_supported_mask &= tbl->runtime_services_supported;
+			early_memunmap(tbl, sizeof(*tbl));
+		}
+	}
+
 	return 0;
 }
 
@@ -673,20 +692,6 @@ int __init efi_config_init(efi_config_table_type_t *arch_tables)
 	early_memunmap(config_tables, efi.systab->nr_tables * sz);
 	return ret;
 }
-
-#ifdef CONFIG_EFI_VARS_MODULE
-static int __init efi_load_efivars(void)
-{
-	struct platform_device *pdev;
-
-	if (!efi_enabled(EFI_RUNTIME_SERVICES))
-		return 0;
-
-	pdev = platform_device_register_simple("efivars", 0, NULL, 0);
-	return PTR_ERR_OR_ZERO(pdev);
-}
-device_initcall(efi_load_efivars);
-#endif
 
 #ifdef CONFIG_EFI_PARAMS_FROM_FDT
 

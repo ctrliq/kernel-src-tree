@@ -73,6 +73,11 @@ static inline u8 get_this_hybrid_cpu_type(void)
 	return 0;
 }
 #endif
+#ifdef CONFIG_IA32_FEAT_CTL
+void init_ia32_feat_ctl(struct cpuinfo_x86 *c);
+#else
+static inline void init_ia32_feat_ctl(struct cpuinfo_x86 *c) {}
+#endif
 
 struct ucode_cpu_info;
 

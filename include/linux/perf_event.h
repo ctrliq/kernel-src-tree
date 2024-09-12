@@ -1034,7 +1034,7 @@ struct perf_sample_data {
 	 * Fields set by perf_sample_data_init(), group so as to
 	 * minimize the cachelines touched.
 	 */
-	u64				sample_flags;
+	RH_KABI_BROKEN_INSERT(u64				sample_flags)
 	u64				addr;
 	struct perf_raw_record		*raw;
 	struct perf_branch_stack	*br_stack;

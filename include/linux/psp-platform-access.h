@@ -35,6 +35,21 @@ struct psp_request {
 int psp_send_platform_access_msg(enum psp_platform_access_msg, struct psp_request *req);
 
 /**
+ * psp_ring_platform_doorbell() - Ring platform doorbell
+ *
+ * This function is intended to be used by drivers outside of ccp to ring the
+ * platform doorbell with a message.
+ *
+ * Returns:
+ *  0:           success
+ *  -%EBUSY:     mailbox in recovery or in use
+ *  -%ENODEV:    driver not bound with PSP device
+ *  -%ETIMEDOUT: request timed out
+ *  -%EIO:       error will be stored in result argument
+ */
+int psp_ring_platform_doorbell(int msg, u32 *result);
+
+/**
  * psp_check_platform_access_status() - Checks whether platform features is ready
  *
  * This function is intended to be used by drivers outside of ccp to determine

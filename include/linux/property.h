@@ -381,9 +381,8 @@ int device_add_properties(struct device *dev,
 			  const struct property_entry *properties);
 void device_remove_properties(struct device *dev);
 
-bool device_dma_supported(struct device *dev);
-
-enum dev_dma_attr device_get_dma_attr(struct device *dev);
+bool device_dma_supported(const struct device *dev);
+enum dev_dma_attr device_get_dma_attr(const struct device *dev);
 
 const void *device_get_match_data(const struct device *dev);
 
