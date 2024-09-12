@@ -1156,7 +1156,7 @@ static inline int iwl_trans_d3_suspend(struct iwl_trans *trans, bool test,
 {
 	might_sleep();
 	if (!trans->ops->d3_suspend)
-		return 0;
+		return -EOPNOTSUPP;
 
 	return trans->ops->d3_suspend(trans, test, reset);
 }
@@ -1167,7 +1167,7 @@ static inline int iwl_trans_d3_resume(struct iwl_trans *trans,
 {
 	might_sleep();
 	if (!trans->ops->d3_resume)
-		return 0;
+		return -EOPNOTSUPP;
 
 	return trans->ops->d3_resume(trans, status, test, reset);
 }
