@@ -1,0 +1,226 @@
+x86/speculation: Warn about Spectre v2 LFENCE mitigation
+
+jira LE-1907
+cve CVE-2021-26401
+cve CVE-2022-0002
+cve CVE-2022-0001
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Josh Poimboeuf <jpoimboe@redhat.com>
+commit eafd987d4a82c7bb5aa12f0e3b4f8f3dea93e678
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/eafd987d.failed
+
+With:
+
+  f8a66d608a3e ("x86,bugs: Unconditionally allow spectre_v2=retpoline,amd")
+
+it became possible to enable the LFENCE "retpoline" on Intel. However,
+Intel doesn't recommend it, as it has some weaknesses compared to
+retpoline.
+
+Now AMD doesn't recommend it either.
+
+It can still be left available as a cmdline option. It's faster than
+retpoline but is weaker in certain scenarios -- particularly SMT, but
+even non-SMT may be vulnerable in some cases.
+
+So just unconditionally warn if the user requests it on the cmdline.
+
+  [ bp: Massage commit message. ]
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit eafd987d4a82c7bb5aa12f0e3b4f8f3dea93e678)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 7357f251348a,cfd116423908..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -618,6 -651,17 +618,20 @@@ static inline const char *spectre_v2_mo
+  static inline const char *spectre_v2_module_string(void) { return ""; }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #define SPECTRE_V2_LFENCE_MSG "WARNING: LFENCE mitigation is not recommended for this CPU, data leaks possible!\n"
++ #define SPECTRE_V2_EIBRS_EBPF_MSG "WARNING: Unprivileged eBPF is enabled with eIBRS on, data leaks possible via Spectre v2 BHB attacks!\n"
++ 
++ #ifdef CONFIG_BPF_SYSCALL
++ void unpriv_ebpf_notify(int new_state)
++ {
++ 	if (spectre_v2_enabled == SPECTRE_V2_EIBRS && !new_state)
++ 		pr_err(SPECTRE_V2_EIBRS_EBPF_MSG);
++ }
++ #endif
++ 
+++>>>>>>> eafd987d4a82 (x86/speculation: Warn about Spectre v2 LFENCE mitigation)
+  static inline bool match_option(const char *arg, int arglen, const char *opt)
+  {
+  	int len = strlen(opt);
+@@@ -890,86 -965,64 +904,93 @@@ static void __init spectre_v2_select_mi
+  	case SPECTRE_V2_CMD_FORCE:
+  	case SPECTRE_V2_CMD_AUTO:
+  		if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED)) {
+ -			mode = SPECTRE_V2_EIBRS;
+ -			break;
+ +set_ibrs_enhanced:
+ +			mode = SPECTRE_V2_IBRS_ENHANCED;
+ +			/* Force it so VMEXIT will restore correctly */
+ +			x86_spec_ctrl_base |= SPEC_CTRL_IBRS;
+ +			wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
+ +			goto specv2_set_mode;
+  		}
+  
+ -		mode = spectre_v2_select_retpoline();
+ -		break;
+ +		/*
+ +		 * For Skylake, we print a warning if IBRS isn't chosen.
+ +		 */
+ +		if (is_skylake_era() && boot_cpu_has(X86_FEATURE_IBRS)) {
+ +			pr_warn("Using retpoline on Skylake-generation processors may not fully mitigate the vulnerability.\n");
+ +			pr_warn("Add the \"spectre_v2=ibrs\" kernel boot flag to enable IBRS on Skylake systems that need full mitigation.\n");
+ +		}
+  
+++<<<<<<< HEAD
+ +		/* Fall through */
+++=======
++ 	case SPECTRE_V2_CMD_RETPOLINE_LFENCE:
++ 		pr_err(SPECTRE_V2_LFENCE_MSG);
++ 		mode = SPECTRE_V2_LFENCE;
++ 		break;
+++>>>>>>> eafd987d4a82 (x86/speculation: Warn about Spectre v2 LFENCE mitigation)
+  
+ -	case SPECTRE_V2_CMD_RETPOLINE_GENERIC:
+ -		mode = SPECTRE_V2_RETPOLINE;
+ +		if (IS_ENABLED(CONFIG_RETPOLINE))
+ +			goto retpoline_auto;
+  		break;
+ -
+ -	case SPECTRE_V2_CMD_RETPOLINE:
+ -		mode = spectre_v2_select_retpoline();
+ -		break;
+ -
+ -	case SPECTRE_V2_CMD_EIBRS:
+ -		mode = SPECTRE_V2_EIBRS;
+ +	case SPECTRE_V2_CMD_RETPOLINE_AMD:
+ +		if (IS_ENABLED(CONFIG_RETPOLINE))
+ +			goto retpoline_amd;
+  		break;
+ -
+ -	case SPECTRE_V2_CMD_EIBRS_LFENCE:
+ -		mode = SPECTRE_V2_EIBRS_LFENCE;
+ +	case SPECTRE_V2_CMD_RETPOLINE_GENERIC:
+ +		if (IS_ENABLED(CONFIG_RETPOLINE))
+ +			goto retpoline_generic;
+  		break;
+ -
+ -	case SPECTRE_V2_CMD_EIBRS_RETPOLINE:
+ -		mode = SPECTRE_V2_EIBRS_RETPOLINE;
+ +	case SPECTRE_V2_CMD_RETPOLINE:
+ +		if (IS_ENABLED(CONFIG_RETPOLINE))
+ +			goto retpoline_auto;
+  		break;
+ +	case SPECTRE_V2_CMD_IBRS:
+ +		if (spec_ctrl_enable_ibrs()) {
+ +			mode = SPECTRE_V2_IBRS;
+ +			goto specv2_set_mode;
+ +		}
+ +		goto retpoline_auto;
+ +	case SPECTRE_V2_CMD_IBRS_ALWAYS:
+ +		/* Fall back to IBRS_ENHANCED if feature present */
+ +		if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED))
+ +			goto set_ibrs_enhanced;
+ +
+ +		if (spec_ctrl_enable_ibrs_always()) {
+ +			mode = SPECTRE_V2_IBRS_ALWAYS;
+ +			goto specv2_set_mode;
+ +		}
+ +		goto retpoline_auto;
+ +	case SPECTRE_V2_CMD_RETPOLINE_IBRS_USER:
+ +		goto retpoline_auto;
+  	}
+ +	pr_err("Spectre mitigation: kernel not compiled with retpoline; no mitigation available!");
+ +	return;
+  
+ -	if (mode == SPECTRE_V2_EIBRS && unprivileged_ebpf_enabled())
+ -		pr_err(SPECTRE_V2_EIBRS_EBPF_MSG);
+ -
+ -	if (spectre_v2_in_eibrs_mode(mode)) {
+ -		/* Force it so VMEXIT will restore correctly */
+ -		x86_spec_ctrl_base |= SPEC_CTRL_IBRS;
+ -		wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
+ -	}
+ -
+ -	switch (mode) {
+ -	case SPECTRE_V2_NONE:
+ -	case SPECTRE_V2_EIBRS:
+ -		break;
+ -
+ -	case SPECTRE_V2_LFENCE:
+ -	case SPECTRE_V2_EIBRS_LFENCE:
+ -		setup_force_cpu_cap(X86_FEATURE_RETPOLINE_LFENCE);
+ -		fallthrough;
+ -
+ -	case SPECTRE_V2_RETPOLINE:
+ -	case SPECTRE_V2_EIBRS_RETPOLINE:
+ +retpoline_auto:
+ +	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) {
+ +	retpoline_amd:
+ +		if (!boot_cpu_has(X86_FEATURE_LFENCE_RDTSC)) {
+ +			pr_err("Spectre mitigation: LFENCE not serializing, switching to generic retpoline\n");
+ +			goto retpoline_generic;
+ +		}
+ +		mode = SPECTRE_V2_RETPOLINE_AMD;
+ +		setup_force_cpu_cap(X86_FEATURE_RETPOLINE_AMD);
+ +		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
+ +	} else {
+ +	retpoline_generic:
+ +		mode = SPECTRE_V2_RETPOLINE_GENERIC;
+  		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
+ -		break;
+  	}
+  
+ +	/*
+ +	 * Check SPECTRE_V2_CMD_RETPOLINE_IBRS_USER mode.
+ +	 */
+ +	if ((cmd == SPECTRE_V2_CMD_RETPOLINE_IBRS_USER) &&
+ +	    boot_cpu_has(X86_FEATURE_RETPOLINE) &&
+ +	    spec_ctrl_enable_retpoline_ibrs_user())
+ +		mode = SPECTRE_V2_RETPOLINE_IBRS_USER;
+ +
+ +specv2_set_mode:
+  	spectre_v2_enabled = mode;
+  	pr_info("%s\n", spectre_v2_strings[mode]);
+  
+@@@ -1704,6 -1787,23 +1725,26 @@@ static char *ibpb_state(void
+  	return "";
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t spectre_v2_show_state(char *buf)
++ {
++ 	if (spectre_v2_enabled == SPECTRE_V2_LFENCE)
++ 		return sprintf(buf, "Vulnerable: LFENCE\n");
++ 
++ 	if (spectre_v2_enabled == SPECTRE_V2_EIBRS && unprivileged_ebpf_enabled())
++ 		return sprintf(buf, "Vulnerable: Unprivileged eBPF enabled\n");
++ 
++ 	return sprintf(buf, "%s%s%s%s%s%s\n",
++ 		       spectre_v2_strings[spectre_v2_enabled],
++ 		       ibpb_state(),
++ 		       boot_cpu_has(X86_FEATURE_USE_IBRS_FW) ? ", IBRS_FW" : "",
++ 		       stibp_state(),
++ 		       boot_cpu_has(X86_FEATURE_RSB_CTXSW) ? ", RSB filling" : "",
++ 		       spectre_v2_module_string());
++ }
++ 
+++>>>>>>> eafd987d4a82 (x86/speculation: Warn about Spectre v2 LFENCE mitigation)
+  static ssize_t srbds_show_state(char *buf)
+  {
+  	return sprintf(buf, "%s\n", srbds_strings[srbds_mitigation]);
+* Unmerged path arch/x86/kernel/cpu/bugs.c
