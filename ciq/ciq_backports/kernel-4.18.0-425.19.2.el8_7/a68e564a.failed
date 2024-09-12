@@ -1,0 +1,982 @@
+ceph: blocklist the kclient when receiving corrupted snap trace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.19.2.el8_7
+commit-author Xiubo Li <xiubli@redhat.com>
+commit a68e564adcaa69b0930809fb64d9d5f7d9c32ba9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.19.2.el8_7/a68e564a.failed
+
+When received corrupted snap trace we don't know what exactly has
+happened in MDS side. And we shouldn't continue IOs and metadatas
+access to MDS, which may corrupt or get incorrect contents.
+
+This patch will just block all the further IO/MDS requests
+immediately and then evict the kclient itself.
+
+The reason why we still need to evict the kclient just after
+blocking all the further IOs is that the MDS could revoke the caps
+faster.
+
+Link: https://tracker.ceph.com/issues/57686
+	Signed-off-by: Xiubo Li <xiubli@redhat.com>
+	Reviewed-by: Venky Shankar <vshankar@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit a68e564adcaa69b0930809fb64d9d5f7d9c32ba9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/addr.c
+#	fs/ceph/snap.c
+#	fs/ceph/super.h
+diff --cc fs/ceph/addr.c
+index 003f1856bd0f,cac4083e387a..000000000000
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@@ -147,345 -149,304 +147,513 @@@ static void ceph_invalidatepage(struct 
+  		return;
+  	}
+  
+ -	WARN_ON(!folio_test_locked(folio));
+ -	if (folio_test_private(folio)) {
+ -		dout("%p invalidate_folio idx %lu full dirty page\n",
+ -		     inode, folio->index);
+ +	ceph_invalidate_fscache_page(inode, page);
+  
+++<<<<<<< HEAD
+ +	WARN_ON(!PageLocked(page));
+ +	if (!PagePrivate(page))
+++=======
++ 		snapc = folio_detach_private(folio);
++ 		ceph_put_wrbuffer_cap_refs(ci, 1, snapc);
++ 		ceph_put_snap_context(snapc);
++ 	}
++ 
++ 	folio_wait_fscache(folio);
++ }
++ 
++ static bool ceph_release_folio(struct folio *folio, gfp_t gfp)
++ {
++ 	struct inode *inode = folio->mapping->host;
++ 
++ 	dout("%llx:%llx release_folio idx %lu (%sdirty)\n",
++ 	     ceph_vinop(inode),
++ 	     folio->index, folio_test_dirty(folio) ? "" : "not ");
++ 
++ 	if (folio_test_private(folio))
++ 		return false;
++ 
++ 	if (folio_test_fscache(folio)) {
++ 		if (current_is_kswapd() || !(gfp & __GFP_FS))
++ 			return false;
++ 		folio_wait_fscache(folio);
++ 	}
++ 	ceph_fscache_note_page_release(inode);
++ 	return true;
++ }
++ 
++ static void ceph_netfs_expand_readahead(struct netfs_io_request *rreq)
++ {
++ 	struct inode *inode = rreq->inode;
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	struct ceph_file_layout *lo = &ci->i_layout;
++ 	u32 blockoff;
++ 	u64 blockno;
++ 
++ 	/* Expand the start downward */
++ 	blockno = div_u64_rem(rreq->start, lo->stripe_unit, &blockoff);
++ 	rreq->start = blockno * lo->stripe_unit;
++ 	rreq->len += blockoff;
++ 
++ 	/* Now, round up the length to the next block */
++ 	rreq->len = roundup(rreq->len, lo->stripe_unit);
++ }
++ 
++ static bool ceph_netfs_clamp_length(struct netfs_io_subrequest *subreq)
++ {
++ 	struct inode *inode = subreq->rreq->inode;
++ 	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	u64 objno, objoff;
++ 	u32 xlen;
++ 
++ 	/* Truncate the extent at the end of the current block */
++ 	ceph_calc_file_object_mapping(&ci->i_layout, subreq->start, subreq->len,
++ 				      &objno, &objoff, &xlen);
++ 	subreq->len = min(xlen, fsc->mount_options->rsize);
++ 	return true;
++ }
++ 
++ static void finish_netfs_read(struct ceph_osd_request *req)
++ {
++ 	struct ceph_fs_client *fsc = ceph_inode_to_client(req->r_inode);
++ 	struct ceph_osd_data *osd_data = osd_req_op_extent_osd_data(req, 0);
++ 	struct netfs_io_subrequest *subreq = req->r_priv;
++ 	int num_pages;
++ 	int err = req->r_result;
++ 
++ 	ceph_update_read_metrics(&fsc->mdsc->metric, req->r_start_latency,
++ 				 req->r_end_latency, osd_data->length, err);
++ 
++ 	dout("%s: result %d subreq->len=%zu i_size=%lld\n", __func__, req->r_result,
++ 	     subreq->len, i_size_read(req->r_inode));
++ 
++ 	/* no object means success but no data */
++ 	if (err == -ENOENT)
++ 		err = 0;
++ 	else if (err == -EBLOCKLISTED)
++ 		fsc->blocklisted = true;
++ 
++ 	if (err >= 0 && err < subreq->len)
++ 		__set_bit(NETFS_SREQ_CLEAR_TAIL, &subreq->flags);
++ 
++ 	netfs_subreq_terminated(subreq, err, false);
++ 
++ 	num_pages = calc_pages_for(osd_data->alignment, osd_data->length);
++ 	ceph_put_page_vector(osd_data->pages, num_pages, false);
++ 	iput(req->r_inode);
++ }
++ 
++ static bool ceph_netfs_issue_op_inline(struct netfs_io_subrequest *subreq)
++ {
++ 	struct netfs_io_request *rreq = subreq->rreq;
++ 	struct inode *inode = rreq->inode;
++ 	struct ceph_mds_reply_info_parsed *rinfo;
++ 	struct ceph_mds_reply_info_in *iinfo;
++ 	struct ceph_mds_request *req;
++ 	struct ceph_mds_client *mdsc = ceph_sb_to_mdsc(inode->i_sb);
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	struct iov_iter iter;
++ 	ssize_t err = 0;
++ 	size_t len;
++ 	int mode;
++ 
++ 	__set_bit(NETFS_SREQ_CLEAR_TAIL, &subreq->flags);
++ 	__clear_bit(NETFS_SREQ_COPY_TO_CACHE, &subreq->flags);
++ 
++ 	if (subreq->start >= inode->i_size)
++ 		goto out;
++ 
++ 	/* We need to fetch the inline data. */
++ 	mode = ceph_try_to_choose_auth_mds(inode, CEPH_STAT_CAP_INLINE_DATA);
++ 	req = ceph_mdsc_create_request(mdsc, CEPH_MDS_OP_GETATTR, mode);
++ 	if (IS_ERR(req)) {
++ 		err = PTR_ERR(req);
++ 		goto out;
++ 	}
++ 	req->r_ino1 = ci->i_vino;
++ 	req->r_args.getattr.mask = cpu_to_le32(CEPH_STAT_CAP_INLINE_DATA);
++ 	req->r_num_caps = 2;
++ 
++ 	err = ceph_mdsc_do_request(mdsc, NULL, req);
++ 	if (err < 0)
++ 		goto out;
++ 
++ 	rinfo = &req->r_reply_info;
++ 	iinfo = &rinfo->targeti;
++ 	if (iinfo->inline_version == CEPH_INLINE_NONE) {
++ 		/* The data got uninlined */
++ 		ceph_mdsc_put_request(req);
++ 		return false;
++ 	}
++ 
++ 	len = min_t(size_t, iinfo->inline_len - subreq->start, subreq->len);
++ 	iov_iter_xarray(&iter, ITER_DEST, &rreq->mapping->i_pages, subreq->start, len);
++ 	err = copy_to_iter(iinfo->inline_data + subreq->start, len, &iter);
++ 	if (err == 0)
++ 		err = -EFAULT;
++ 
++ 	ceph_mdsc_put_request(req);
++ out:
++ 	netfs_subreq_terminated(subreq, err, false);
++ 	return true;
++ }
++ 
++ static void ceph_netfs_issue_read(struct netfs_io_subrequest *subreq)
++ {
++ 	struct netfs_io_request *rreq = subreq->rreq;
++ 	struct inode *inode = rreq->inode;
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
++ 	struct ceph_osd_request *req = NULL;
++ 	struct ceph_vino vino = ceph_vino(inode);
++ 	struct iov_iter iter;
++ 	struct page **pages;
++ 	size_t page_off;
++ 	int err = 0;
++ 	u64 len = subreq->len;
++ 
++ 	if (ceph_inode_is_shutdown(inode)) {
++ 		err = -EIO;
++ 		goto out;
++ 	}
++ 
++ 	if (ceph_has_inline_data(ci) && ceph_netfs_issue_op_inline(subreq))
+++>>>>>>> a68e564adcaa (ceph: blocklist the kclient when receiving corrupted snap trace)
+  		return;
+  
+ -	req = ceph_osdc_new_request(&fsc->client->osdc, &ci->i_layout, vino, subreq->start, &len,
+ -			0, 1, CEPH_OSD_OP_READ,
+ -			CEPH_OSD_FLAG_READ | fsc->client->osdc.client->options->read_from_replica,
+ -			NULL, ci->i_truncate_seq, ci->i_truncate_size, false);
+ -	if (IS_ERR(req)) {
+ -		err = PTR_ERR(req);
+ -		req = NULL;
+ -		goto out;
+ +	dout("%p invalidatepage %p idx %lu full dirty page\n",
+ +	     inode, page, page->index);
+ +
+ +	ceph_put_wrbuffer_cap_refs(ci, 1, snapc);
+ +	ceph_put_snap_context(snapc);
+ +	page->private = 0;
+ +	ClearPagePrivate(page);
+ +}
+ +
+ +static int ceph_releasepage(struct page *page, gfp_t g)
+ +{
+ +	dout("%p releasepage %p idx %lu (%sdirty)\n", page->mapping->host,
+ +	     page, page->index, PageDirty(page) ? "" : "not ");
+ +
+ +	/* Can we release the page from the cache? */
+ +	if (!ceph_release_fscache_page(page, g))
+ +		return 0;
+ +
+ +	return !PagePrivate(page);
+ +}
+ +
+ +/* read a single page, without unlocking it. */
+ +static int ceph_do_readpage(struct file *filp, struct page *page)
+ +{
+ +	struct inode *inode = file_inode(filp);
+ +	struct ceph_inode_info *ci = ceph_inode(inode);
+ +	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+ +	struct ceph_osd_client *osdc = &fsc->client->osdc;
+ +	struct ceph_osd_request *req;
+ +	struct ceph_vino vino = ceph_vino(inode);
+ +	int err = 0;
+ +	u64 off = page_offset(page);
+ +	u64 len = PAGE_SIZE;
+ +
+ +	if (off >= i_size_read(inode)) {
+ +		zero_user_segment(page, 0, PAGE_SIZE);
+ +		SetPageUptodate(page);
+ +		return 0;
+  	}
+  
+ -	dout("%s: pos=%llu orig_len=%zu len=%llu\n", __func__, subreq->start, subreq->len, len);
+ -	iov_iter_xarray(&iter, ITER_DEST, &rreq->mapping->i_pages, subreq->start, len);
+ -	err = iov_iter_get_pages_alloc2(&iter, &pages, len, &page_off);
+ +	if (ci->i_inline_version != CEPH_INLINE_NONE) {
+ +		/*
+ +		 * Uptodate inline data should have been added
+ +		 * into page cache while getting Fcr caps.
+ +		 */
+ +		if (off == 0)
+ +			return -EINVAL;
+ +		zero_user_segment(page, 0, PAGE_SIZE);
+ +		SetPageUptodate(page);
+ +		return 0;
+ +	}
+ +
+ +	err = ceph_readpage_from_fscache(inode, page);
+ +	if (err == 0)
+ +		return -EINPROGRESS;
+ +
+ +	dout("readpage ino %llx.%llx file %p off %llu len %llu page %p index %lu\n",
+ +	     vino.ino, vino.snap, filp, off, len, page, page->index);
+ +	req = ceph_osdc_new_request(osdc, &ci->i_layout, vino, off, &len, 0, 1,
+ +				    CEPH_OSD_OP_READ, CEPH_OSD_FLAG_READ, NULL,
+ +				    ci->i_truncate_seq, ci->i_truncate_size,
+ +				    false);
+ +	if (IS_ERR(req))
+ +		return PTR_ERR(req);
+ +
+ +	osd_req_op_extent_osd_data_pages(req, 0, &page, len, 0, false, false);
+ +
+ +	err = ceph_osdc_start_request(osdc, req, false);
+ +	if (!err)
+ +		err = ceph_osdc_wait_request(osdc, req);
+ +
+ +	ceph_update_read_metrics(&fsc->mdsc->metric, req->r_start_latency,
+ +				 req->r_end_latency, len, err);
+ +
+ +	ceph_osdc_put_request(req);
+ +	dout("readpage result %d\n", err);
+ +
+ +	if (err == -ENOENT)
+ +		err = 0;
+  	if (err < 0) {
+ -		dout("%s: iov_ter_get_pages_alloc returned %d\n", __func__, err);
+ +		ceph_fscache_readpage_cancel(inode, page);
+ +		if (err == -EBLOCKLISTED)
+ +			fsc->blocklisted = true;
+  		goto out;
+  	}
+ +	if (err < PAGE_SIZE)
+ +		/* zero fill remainder of page */
+ +		zero_user_segment(page, err, PAGE_SIZE);
+ +	else
+ +		flush_dcache_page(page);
+  
+ -	/* should always give us a page-aligned read */
+ -	WARN_ON_ONCE(page_off);
+ -	len = err;
+ -	err = 0;
+ -
+ -	osd_req_op_extent_osd_data_pages(req, 0, pages, len, 0, false, false);
+ -	req->r_callback = finish_netfs_read;
+ -	req->r_priv = subreq;
+ -	req->r_inode = inode;
+ -	ihold(inode);
+ +	SetPageUptodate(page);
+ +	ceph_readpage_to_fscache(inode, page);
+  
+ -	ceph_osdc_start_request(req->r_osdc, req);
+  out:
+ -	ceph_osdc_put_request(req);
+ -	if (err)
+ -		netfs_subreq_terminated(subreq, err, false);
+ -	dout("%s: result %d\n", __func__, err);
+ +	return err < 0 ? err : 0;
+  }
+  
+ -static int ceph_init_request(struct netfs_io_request *rreq, struct file *file)
+ +static int ceph_readpage(struct file *filp, struct page *page)
+  {
+ -	struct inode *inode = rreq->inode;
+ -	int got = 0, want = CEPH_CAP_FILE_CACHE;
+ -	int ret = 0;
+ +	int r = ceph_do_readpage(filp, page);
+ +	if (r != -EINPROGRESS)
+ +		unlock_page(page);
+ +	else
+ +		r = 0;
+ +	return r;
+ +}
+  
+ -	if (rreq->origin != NETFS_READAHEAD)
+ -		return 0;
+ +/*
+ + * Finish an async read(ahead) op.
+ + */
+ +static void finish_read(struct ceph_osd_request *req)
+ +{
+ +	struct inode *inode = req->r_inode;
+ +	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+ +	struct ceph_osd_data *osd_data;
+ +	int rc = req->r_result <= 0 ? req->r_result : 0;
+ +	int bytes = req->r_result >= 0 ? req->r_result : 0;
+ +	int len = bytes;
+ +	int num_pages;
+ +	int i;
+  
+ -	if (file) {
+ -		struct ceph_rw_context *rw_ctx;
+ -		struct ceph_file_info *fi = file->private_data;
+ +	dout("finish_read %p req %p rc %d bytes %d\n", inode, req, rc, bytes);
+ +	if (rc == -EBLOCKLISTED)
+ +		ceph_inode_to_client(inode)->blocklisted = true;
+  
+ -		rw_ctx = ceph_find_rw_context(fi);
+ -		if (rw_ctx)
+ -			return 0;
+ +	/* unlock all pages, zeroing any data we didn't read */
+ +	osd_data = osd_req_op_extent_osd_data(req, 0);
+ +	BUG_ON(osd_data->type != CEPH_OSD_DATA_TYPE_PAGES);
+ +	num_pages = calc_pages_for((u64)osd_data->alignment,
+ +					(u64)osd_data->length);
+ +	for (i = 0; i < num_pages; i++) {
+ +		struct page *page = osd_data->pages[i];
+ +
+ +		if (rc < 0 && rc != -ENOENT) {
+ +			ceph_fscache_readpage_cancel(inode, page);
+ +			goto unlock;
+ +		}
+ +		if (bytes < (int)PAGE_SIZE) {
+ +			/* zero (remainder of) page */
+ +			int s = bytes < 0 ? 0 : bytes;
+ +			zero_user_segment(page, s, PAGE_SIZE);
+ +		}
+ + 		dout("finish_read %p uptodate %p idx %lu\n", inode, page,
+ +		     page->index);
+ +		flush_dcache_page(page);
+ +		SetPageUptodate(page);
+ +		ceph_readpage_to_fscache(inode, page);
+ +unlock:
+ +		unlock_page(page);
+ +		put_page(page);
+ +		bytes -= PAGE_SIZE;
+  	}
+  
+ -	/*
+ -	 * readahead callers do not necessarily hold Fcb caps
+ -	 * (e.g. fadvise, madvise).
+ -	 */
+ -	ret = ceph_try_get_caps(inode, CEPH_CAP_FILE_RD, want, true, &got);
+ -	if (ret < 0) {
+ -		dout("start_read %p, error getting cap\n", inode);
+ -		return ret;
+ +	ceph_update_read_metrics(&fsc->mdsc->metric, req->r_start_latency,
+ +				 req->r_end_latency, len, rc);
+ +
+ +	kfree(osd_data->pages);
+ +}
+ +
+ +/*
+ + * start an async read(ahead) operation.  return nr_pages we submitted
+ + * a read for on success, or negative error code.
+ + */
+ +static int start_read(struct inode *inode, struct ceph_rw_context *rw_ctx,
+ +		      struct list_head *page_list, int max)
+ +{
+ +	struct ceph_osd_client *osdc =
+ +		&ceph_inode_to_client(inode)->client->osdc;
+ +	struct ceph_inode_info *ci = ceph_inode(inode);
+ +	struct page *page = list_entry(page_list->prev, struct page, lru);
+ +	struct ceph_vino vino;
+ +	struct ceph_osd_request *req;
+ +	u64 off;
+ +	u64 len;
+ +	int i;
+ +	struct page **pages;
+ +	pgoff_t next_index;
+ +	int nr_pages = 0;
+ +	int got = 0;
+ +	int ret = 0;
+ +
+ +	if (!rw_ctx) {
+ +		/* caller of readpages does not hold buffer and read caps
+ +		 * (fadvise, madvise and readahead cases) */
+ +		int want = CEPH_CAP_FILE_CACHE;
+ +		ret = ceph_try_get_caps(inode, CEPH_CAP_FILE_RD, want,
+ +					true, &got);
+ +		if (ret < 0) {
+ +			dout("start_read %p, error getting cap\n", inode);
+ +		} else if (!(got & want)) {
+ +			dout("start_read %p, no cache cap\n", inode);
+ +			ret = 0;
+ +		}
+ +		if (ret <= 0) {
+ +			if (got)
+ +				ceph_put_cap_refs(ci, got);
+ +			while (!list_empty(page_list)) {
+ +				page = list_entry(page_list->prev,
+ +						  struct page, lru);
+ +				list_del(&page->lru);
+ +				put_page(page);
+ +			}
+ +			return ret;
+ +		}
+  	}
+  
+ -	if (!(got & want)) {
+ -		dout("start_read %p, no cache cap\n", inode);
+ -		return -EACCES;
+ +	off = (u64) page_offset(page);
+ +
+ +	/* count pages */
+ +	next_index = page->index;
+ +	list_for_each_entry_reverse(page, page_list, lru) {
+ +		if (page->index != next_index)
+ +			break;
+ +		nr_pages++;
+ +		next_index++;
+ +		if (max && nr_pages == max)
+ +			break;
+ +	}
+ +	len = nr_pages << PAGE_SHIFT;
+ +	dout("start_read %p nr_pages %d is %lld~%lld\n", inode, nr_pages,
+ +	     off, len);
+ +	vino = ceph_vino(inode);
+ +	req = ceph_osdc_new_request(osdc, &ci->i_layout, vino, off, &len,
+ +				    0, 1, CEPH_OSD_OP_READ,
+ +				    CEPH_OSD_FLAG_READ, NULL,
+ +				    ci->i_truncate_seq, ci->i_truncate_size,
+ +				    false);
+ +	if (IS_ERR(req)) {
+ +		ret = PTR_ERR(req);
+ +		goto out;
+  	}
+ -	if (ret == 0)
+ -		return -EACCES;
+  
+ -	rreq->netfs_priv = (void *)(uintptr_t)got;
+ -	return 0;
+ -}
+ +	/* build page vector */
+ +	nr_pages = calc_pages_for(0, len);
+ +	pages = kmalloc_array(nr_pages, sizeof(*pages), GFP_KERNEL);
+ +	if (!pages) {
+ +		ret = -ENOMEM;
+ +		goto out_put;
+ +	}
+ +	for (i = 0; i < nr_pages; ++i) {
+ +		page = list_entry(page_list->prev, struct page, lru);
+ +		BUG_ON(PageLocked(page));
+ +		list_del(&page->lru);
+ +
+ + 		dout("start_read %p adding %p idx %lu\n", inode, page,
+ +		     page->index);
+ +		if (add_to_page_cache_lru(page, &inode->i_data, page->index,
+ +					  GFP_KERNEL)) {
+ +			ceph_fscache_uncache_page(inode, page);
+ +			put_page(page);
+ +			dout("start_read %p add_to_page_cache failed %p\n",
+ +			     inode, page);
+ +			nr_pages = i;
+ +			if (nr_pages > 0) {
+ +				len = nr_pages << PAGE_SHIFT;
+ +				osd_req_op_extent_update(req, 0, len);
+ +				break;
+ +			}
+ +			goto out_pages;
+ +		}
+ +		pages[i] = page;
+ +	}
+ +	osd_req_op_extent_osd_data_pages(req, 0, pages, len, 0, false, false);
+ +	req->r_callback = finish_read;
+ +	req->r_inode = inode;
+  
+ -static void ceph_netfs_free_request(struct netfs_io_request *rreq)
+ -{
+ -	struct ceph_inode_info *ci = ceph_inode(rreq->inode);
+ -	int got = (uintptr_t)rreq->netfs_priv;
+ +	dout("start_read %p starting %p %lld~%lld\n", inode, req, off, len);
+ +	ret = ceph_osdc_start_request(osdc, req, false);
+ +	if (ret < 0)
+ +		goto out_pages;
+ +	ceph_osdc_put_request(req);
+  
+ +	/* After adding locked pages to page cache, the inode holds cache cap.
+ +	 * So we can drop our cap refs. */
+  	if (got)
+  		ceph_put_cap_refs(ci, got);
+ -}
+  
+ -const struct netfs_request_ops ceph_netfs_ops = {
+ -	.init_request		= ceph_init_request,
+ -	.free_request		= ceph_netfs_free_request,
+ -	.begin_cache_operation	= ceph_begin_cache_operation,
+ -	.issue_read		= ceph_netfs_issue_read,
+ -	.expand_readahead	= ceph_netfs_expand_readahead,
+ -	.clamp_length		= ceph_netfs_clamp_length,
+ -	.check_write_begin	= ceph_netfs_check_write_begin,
+ -};
+ +	return nr_pages;
+  
+ -#ifdef CONFIG_CEPH_FSCACHE
+ -static void ceph_set_page_fscache(struct page *page)
+ -{
+ -	set_page_fscache(page);
+ +out_pages:
+ +	for (i = 0; i < nr_pages; ++i) {
+ +		ceph_fscache_readpage_cancel(inode, pages[i]);
+ +		unlock_page(pages[i]);
+ +	}
+ +	ceph_put_page_vector(pages, nr_pages, false);
+ +out_put:
+ +	ceph_osdc_put_request(req);
+ +out:
+ +	if (got)
+ +		ceph_put_cap_refs(ci, got);
+ +	return ret;
+  }
+  
+ -static void ceph_fscache_write_terminated(void *priv, ssize_t error, bool was_async)
+ +
+ +/*
+ + * Read multiple pages.  Leave pages we don't read + unlock in page_list;
+ + * the caller (VM) cleans them up.
+ + */
+ +static int ceph_readpages(struct file *file, struct address_space *mapping,
+ +			  struct list_head *page_list, unsigned nr_pages)
+  {
+ -	struct inode *inode = priv;
+ +	struct inode *inode = file_inode(file);
+ +	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+ +	struct ceph_file_info *fi = file->private_data;
+ +	struct ceph_rw_context *rw_ctx;
+ +	int rc = 0;
+ +	int max = 0;
+  
+ -	if (IS_ERR_VALUE(error) && error != -ENOBUFS)
+ -		ceph_fscache_invalidate(inode, false);
+ -}
+ +	if (ceph_inode(inode)->i_inline_version != CEPH_INLINE_NONE)
+ +		return -EINVAL;
+  
+ -static void ceph_fscache_write_to_cache(struct inode *inode, u64 off, u64 len, bool caching)
+ -{
+ -	struct ceph_inode_info *ci = ceph_inode(inode);
+ -	struct fscache_cookie *cookie = ceph_fscache_cookie(ci);
+ +	rc = ceph_readpages_from_fscache(mapping->host, mapping, page_list,
+ +					 &nr_pages);
+  
+ -	fscache_write_to_cache(cookie, inode->i_mapping, off, len, i_size_read(inode),
+ -			       ceph_fscache_write_terminated, inode, caching);
+ -}
+ -#else
+ -static inline void ceph_set_page_fscache(struct page *page)
+ -{
+ -}
+ +	if (rc == 0)
+ +		goto out;
+  
+ -static inline void ceph_fscache_write_to_cache(struct inode *inode, u64 off, u64 len, bool caching)
+ -{
+ +	rw_ctx = ceph_find_rw_context(fi);
+ +	max = fsc->mount_options->rsize >> PAGE_SHIFT;
+ +	dout("readpages %p file %p ctx %p nr_pages %d max %d\n",
+ +	     inode, file, rw_ctx, nr_pages, max);
+ +	while (!list_empty(page_list)) {
+ +		rc = start_read(inode, rw_ctx, page_list, max);
+ +		if (rc < 0)
+ +			goto out;
+ +	}
+ +out:
+ +	ceph_fscache_readpages_cancel(inode, page_list);
+ +
+ +	dout("readpages %p file %p ret %d\n", inode, file, rc);
+ +	return rc;
+  }
+ -#endif /* CONFIG_CEPH_FSCACHE */
+  
+  struct ceph_writeback_ctl
+  {
+@@@ -1730,16 -1645,18 +1901,24 @@@ void ceph_fill_inline_data(struct inod
+  	}
+  }
+  
+ -int ceph_uninline_data(struct file *file)
+ +int ceph_uninline_data(struct file *filp, struct page *locked_page)
+  {
+ -	struct inode *inode = file_inode(file);
+ +	struct inode *inode = file_inode(filp);
+  	struct ceph_inode_info *ci = ceph_inode(inode);
+  	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+++<<<<<<< HEAD
+ +	struct ceph_osd_request *req;
+ +	struct page *page = NULL;
+ +	u64 len, inline_version;
+++=======
++ 	struct ceph_osd_request *req = NULL;
++ 	struct ceph_cap_flush *prealloc_cf = NULL;
++ 	struct folio *folio = NULL;
++ 	u64 inline_version = CEPH_INLINE_NONE;
++ 	struct page *pages[1];
+++>>>>>>> a68e564adcaa (ceph: blocklist the kclient when receiving corrupted snap trace)
+  	int err = 0;
+ -	u64 len;
+ +	bool from_pagecache = false;
+  
+  	spin_lock(&ci->i_ceph_lock);
+  	inline_version = ci->i_inline_version;
+@@@ -1748,47 -1665,32 +1927,68 @@@
+  	dout("uninline_data %p %llx.%llx inline_version %llu\n",
+  	     inode, ceph_vinop(inode), inline_version);
+  
+++<<<<<<< HEAD
+ +	if (inline_version == 1 || /* initial version, no data */
+ +	    inline_version == CEPH_INLINE_NONE)
+++=======
++ 	if (ceph_inode_is_shutdown(inode)) {
++ 		err = -EIO;
++ 		goto out;
++ 	}
++ 
++ 	if (inline_version == CEPH_INLINE_NONE)
++ 		return 0;
++ 
++ 	prealloc_cf = ceph_alloc_cap_flush();
++ 	if (!prealloc_cf)
++ 		return -ENOMEM;
++ 
++ 	if (inline_version == 1) /* initial version, no data */
++ 		goto out_uninline;
++ 
++ 	folio = read_mapping_folio(inode->i_mapping, 0, file);
++ 	if (IS_ERR(folio)) {
++ 		err = PTR_ERR(folio);
+++>>>>>>> a68e564adcaa (ceph: blocklist the kclient when receiving corrupted snap trace)
+  		goto out;
+ -	}
+  
+ -	folio_lock(folio);
+ +	if (locked_page) {
+ +		page = locked_page;
+ +		WARN_ON(!PageUptodate(page));
+ +	} else if (ceph_caps_issued(ci) &
+ +		   (CEPH_CAP_FILE_CACHE|CEPH_CAP_FILE_LAZYIO)) {
+ +		page = find_get_page(inode->i_mapping, 0);
+ +		if (page) {
+ +			if (PageUptodate(page)) {
+ +				from_pagecache = true;
+ +				lock_page(page);
+ +			} else {
+ +				put_page(page);
+ +				page = NULL;
+ +			}
+ +		}
+ +	}
+  
+ -	len = i_size_read(inode);
+ -	if (len > folio_size(folio))
+ -		len = folio_size(folio);
+ +	if (page) {
+ +		len = i_size_read(inode);
+ +		if (len > PAGE_SIZE)
+ +			len = PAGE_SIZE;
+ +	} else {
+ +		page = __page_cache_alloc(GFP_NOFS);
+ +		if (!page) {
+ +			err = -ENOMEM;
+ +			goto out;
+ +		}
+ +		err = __ceph_do_getattr(inode, page,
+ +					CEPH_STAT_CAP_INLINE_DATA, true);
+ +		if (err < 0) {
+ +			/* no inline data */
+ +			if (err == -ENODATA)
+ +				err = 0;
+ +			goto out;
+ +		}
+ +		len = err;
+ +	}
+  
+  	req = ceph_osdc_new_request(&fsc->client->osdc, &ci->i_layout,
+  				    ceph_vino(inode), 0, &len, 0, 1,
+diff --cc fs/ceph/snap.c
+index 22d72686ae87,87007203f130..000000000000
+--- a/fs/ceph/snap.c
++++ b/fs/ceph/snap.c
+@@@ -707,8 -766,11 +708,15 @@@ int ceph_update_snap_trace(struct ceph_
+  	__le64 *prior_parent_snaps;        /* encoded */
+  	struct ceph_snap_realm *realm;
+  	struct ceph_snap_realm *first_realm = NULL;
+++<<<<<<< HEAD
+ +	int invalidate = 0;
+++=======
++ 	struct ceph_snap_realm *realm_to_rebuild = NULL;
++ 	struct ceph_client *client = mdsc->fsc->client;
++ 	int rebuild_snapcs;
+++>>>>>>> a68e564adcaa (ceph: blocklist the kclient when receiving corrupted snap trace)
+  	int err = -ENOMEM;
++ 	int ret;
+  	LIST_HEAD(dirty_realms);
+  
+  	lockdep_assert_held_write(&mdsc->snap_rwsem);
+@@@ -815,7 -886,28 +823,32 @@@ fail
+  		ceph_put_snap_realm(mdsc, realm);
+  	if (first_realm)
+  		ceph_put_snap_realm(mdsc, first_realm);
+++<<<<<<< HEAD
+ +	pr_err("update_snap_trace error %d\n", err);
+++=======
++ 	pr_err("%s error %d\n", __func__, err);
++ 
++ 	/*
++ 	 * When receiving a corrupted snap trace we don't know what
++ 	 * exactly has happened in MDS side. And we shouldn't continue
++ 	 * writing to OSD, which may corrupt the snapshot contents.
++ 	 *
++ 	 * Just try to blocklist this kclient and then this kclient
++ 	 * must be remounted to continue after the corrupted metadata
++ 	 * fixed in the MDS side.
++ 	 */
++ 	WRITE_ONCE(mdsc->fsc->mount_state, CEPH_MOUNT_FENCE_IO);
++ 	ret = ceph_monc_blocklist_add(&client->monc, &client->msgr.inst.addr);
++ 	if (ret)
++ 		pr_err("%s failed to blocklist %s: %d\n", __func__,
++ 		       ceph_pr_addr(&client->msgr.inst.addr), ret);
++ 
++ 	WARN(1, "%s: %s%sdo remount to continue%s",
++ 	     __func__, ret ? "" : ceph_pr_addr(&client->msgr.inst.addr),
++ 	     ret ? "" : " was blocklisted, ",
++ 	     err == -EIO ? " after corrupted snaptrace is fixed" : "");
++ 
+++>>>>>>> a68e564adcaa (ceph: blocklist the kclient when receiving corrupted snap trace)
+  	return err;
+  }
+  
+diff --cc fs/ceph/super.h
+index e363a1bbd4c8,07c6906cda70..000000000000
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@@ -98,8 -97,22 +98,24 @@@ struct ceph_mount_options 
+  	char *mds_namespace;  /* default NULL */
+  	char *server_path;    /* default NULL (means "/") */
+  	char *fscache_uniq;   /* default NULL */
+ -	char *mon_addr;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* mount state */
++ enum {
++ 	CEPH_MOUNT_MOUNTING,
++ 	CEPH_MOUNT_MOUNTED,
++ 	CEPH_MOUNT_UNMOUNTING,
++ 	CEPH_MOUNT_UNMOUNTED,
++ 	CEPH_MOUNT_SHUTDOWN,
++ 	CEPH_MOUNT_RECOVER,
++ 	CEPH_MOUNT_FENCE_IO,
++ };
++ 
++ #define CEPH_ASYNC_CREATE_CONFLICT_BITS 8
++ 
+++>>>>>>> a68e564adcaa (ceph: blocklist the kclient when receiving corrupted snap trace)
+  struct ceph_fs_client {
+  	struct super_block *sb;
+  
+* Unmerged path fs/ceph/addr.c
+diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
+index 39960643fe04..200a435e0300 100644
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -4068,6 +4068,7 @@ void ceph_handle_caps(struct ceph_mds_session *session,
+ 	void *p, *end;
+ 	struct cap_extra_info extra_info = {};
+ 	bool queue_trunc;
++	bool close_sessions = false;
+ 
+ 	dout("handle_caps from mds%d\n", session->s_mds);
+ 
+@@ -4205,9 +4206,13 @@ void ceph_handle_caps(struct ceph_mds_session *session,
+ 		realm = NULL;
+ 		if (snaptrace_len) {
+ 			down_write(&mdsc->snap_rwsem);
+-			ceph_update_snap_trace(mdsc, snaptrace,
+-					       snaptrace + snaptrace_len,
+-					       false, &realm);
++			if (ceph_update_snap_trace(mdsc, snaptrace,
++						   snaptrace + snaptrace_len,
++						   false, &realm)) {
++				up_write(&mdsc->snap_rwsem);
++				close_sessions = true;
++				goto done;
++			}
+ 			downgrade_write(&mdsc->snap_rwsem);
+ 		} else {
+ 			down_read(&mdsc->snap_rwsem);
+@@ -4267,6 +4272,11 @@ void ceph_handle_caps(struct ceph_mds_session *session,
+ 	iput(inode);
+ out:
+ 	ceph_put_string(extra_info.pool_ns);
++
++	/* Defer closing the sessions after s_mutex lock being released */
++	if (close_sessions)
++		ceph_mdsc_close_sessions(mdsc);
++
+ 	return;
+ 
+ flush_cap_releases:
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index 11352195bf50..770806ac7617 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -1993,6 +1993,9 @@ static int ceph_zero_partial_object(struct inode *inode,
+ 	loff_t zero = 0;
+ 	int op;
+ 
++	if (ceph_inode_is_shutdown(inode))
++		return -EIO;
++
+ 	if (!length) {
+ 		op = offset ? CEPH_OSD_OP_DELETE : CEPH_OSD_OP_TRUNCATE;
+ 		length = &zero;
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index 051da0178045..153705677c7a 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -709,6 +709,9 @@ static struct ceph_mds_session *register_session(struct ceph_mds_client *mdsc,
+ {
+ 	struct ceph_mds_session *s;
+ 
++	if (READ_ONCE(mdsc->fsc->mount_state) == CEPH_MOUNT_FENCE_IO)
++		return ERR_PTR(-EIO);
++
+ 	if (mds >= mdsc->mdsmap->possible_max_rank)
+ 		return ERR_PTR(-EINVAL);
+ 
+@@ -1378,6 +1381,9 @@ static int __open_session(struct ceph_mds_client *mdsc,
+ 	int mstate;
+ 	int mds = session->s_mds;
+ 
++	if (READ_ONCE(mdsc->fsc->mount_state) == CEPH_MOUNT_FENCE_IO)
++		return -EIO;
++
+ 	/* wait for mds to go active? */
+ 	mstate = ceph_mdsmap_get_state(mdsc->mdsmap, mds);
+ 	dout("open_session to mds%d (%s)\n", mds,
+@@ -2736,6 +2742,11 @@ static void __do_request(struct ceph_mds_client *mdsc,
+ 		return;
+ 	}
+ 
++	if (READ_ONCE(mdsc->fsc->mount_state) == CEPH_MOUNT_FENCE_IO) {
++		dout("do_request metadata corrupted\n");
++		err = -EIO;
++		goto finish;
++	}
+ 	if (req->r_timeout &&
+ 	    time_after_eq(jiffies, req->r_started + req->r_timeout)) {
+ 		dout("do_request timed out\n");
+@@ -3052,6 +3063,7 @@ static void handle_reply(struct ceph_mds_session *session, struct ceph_msg *msg)
+ 	u64 tid;
+ 	int err, result;
+ 	int mds = session->s_mds;
++	bool close_sessions = false;
+ 
+ 	if (msg->front.iov_len < sizeof(*head)) {
+ 		pr_err("mdsc_handle_reply got corrupt (short) reply\n");
+@@ -3187,10 +3199,17 @@ static void handle_reply(struct ceph_mds_session *session, struct ceph_msg *msg)
+ 	realm = NULL;
+ 	if (rinfo->snapblob_len) {
+ 		down_write(&mdsc->snap_rwsem);
+-		ceph_update_snap_trace(mdsc, rinfo->snapblob,
++		err = ceph_update_snap_trace(mdsc, rinfo->snapblob,
+ 				rinfo->snapblob + rinfo->snapblob_len,
+ 				le32_to_cpu(head->op) == CEPH_MDS_OP_RMSNAP,
+ 				&realm);
++		if (err) {
++			up_write(&mdsc->snap_rwsem);
++			close_sessions = true;
++			if (err == -EIO)
++				ceph_msg_dump(msg);
++			goto out_err;
++		}
+ 		downgrade_write(&mdsc->snap_rwsem);
+ 	} else {
+ 		down_read(&mdsc->snap_rwsem);
+@@ -3248,6 +3267,10 @@ static void handle_reply(struct ceph_mds_session *session, struct ceph_msg *msg)
+ 				     req->r_end_latency, err);
+ out:
+ 	ceph_mdsc_put_request(req);
++
++	/* Defer closing the sessions after s_mutex lock being released */
++	if (close_sessions)
++		ceph_mdsc_close_sessions(mdsc);
+ 	return;
+ }
+ 
+@@ -4790,7 +4813,7 @@ static bool done_closing_sessions(struct ceph_mds_client *mdsc, int skipped)
+ }
+ 
+ /*
+- * called after sb is ro.
++ * called after sb is ro or when metadata corrupted.
+  */
+ void ceph_mdsc_close_sessions(struct ceph_mds_client *mdsc)
+ {
+@@ -5080,7 +5103,8 @@ static void mds_peer_reset(struct ceph_connection *con)
+ 	struct ceph_mds_client *mdsc = s->s_mdsc;
+ 
+ 	pr_warn("mds%d closed our session\n", s->s_mds);
+-	send_mds_reconnect(mdsc, s);
++	if (READ_ONCE(mdsc->fsc->mount_state) != CEPH_MOUNT_FENCE_IO)
++		send_mds_reconnect(mdsc, s);
+ }
+ 
+ static void mds_dispatch(struct ceph_connection *con, struct ceph_msg *msg)
+* Unmerged path fs/ceph/snap.c
+* Unmerged path fs/ceph/super.h
