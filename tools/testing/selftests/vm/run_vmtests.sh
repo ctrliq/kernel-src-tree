@@ -213,4 +213,15 @@ CATEGORY="vmalloc" run_test ./test_vmalloc.sh smoke
 
 CATEGORY="hmm" run_test ./test_hmm.sh smoke
 
+# protection_keys tests
+if [ -x ./protection_keys_32 ]
+then
+	run_test ./protection_keys_32
+fi
+
+if [ -x ./protection_keys_64 ]
+then
+	run_test ./protection_keys_64
+fi
+
 exit $exitcode
