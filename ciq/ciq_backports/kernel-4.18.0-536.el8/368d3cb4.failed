@@ -1,0 +1,236 @@
+page_pool: fix inconsistency for page_pool_ring_[un]lock()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-536.el8
+commit-author Yunsheng Lin <linyunsheng@huawei.com>
+commit 368d3cb406cdd074d1df2ad9ec06d1bfcb664882
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-536.el8/368d3cb4.failed
+
+page_pool_ring_[un]lock() use in_softirq() to decide which
+spin lock variant to use, and when they are called in the
+context with in_softirq() being false, spin_lock_bh() is
+called in page_pool_ring_lock() while spin_unlock() is
+called in page_pool_ring_unlock(), because spin_lock_bh()
+has disabled the softirq in page_pool_ring_lock(), which
+causes inconsistency for spin lock pair calling.
+
+This patch fixes it by returning in_softirq state from
+page_pool_producer_lock(), and use it to decide which
+spin lock variant to use in page_pool_producer_unlock().
+
+As pool->ring has both producer and consumer lock, so
+rename it to page_pool_producer_[un]lock() to reflect
+the actual usage. Also move them to page_pool.c as they
+are only used there, and remove the 'inline' as the
+compiler may have better idea to do inlining or not.
+
+Fixes: 7886244736a4 ("net: page_pool: Add bulk support for ptr_ring")
+	Signed-off-by: Yunsheng Lin <linyunsheng@huawei.com>
+	Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Acked-by: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+Link: https://lore.kernel.org/r/20230522031714.5089-1-linyunsheng@huawei.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 368d3cb406cdd074d1df2ad9ec06d1bfcb664882)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/page_pool.c
+diff --cc net/core/page_pool.c
+index 0933437e1585,a3e12a61d456..000000000000
+--- a/net/core/page_pool.c
++++ b/net/core/page_pool.c
+@@@ -23,6 -26,137 +23,140 @@@
+  #define DEFER_TIME (msecs_to_jiffies(1000))
+  #define DEFER_WARN_INTERVAL (60 * HZ)
+  
+++<<<<<<< HEAD
+++=======
++ #define BIAS_MAX	LONG_MAX
++ 
++ #ifdef CONFIG_PAGE_POOL_STATS
++ /* alloc_stat_inc is intended to be used in softirq context */
++ #define alloc_stat_inc(pool, __stat)	(pool->alloc_stats.__stat++)
++ /* recycle_stat_inc is safe to use when preemption is possible. */
++ #define recycle_stat_inc(pool, __stat)							\
++ 	do {										\
++ 		struct page_pool_recycle_stats __percpu *s = pool->recycle_stats;	\
++ 		this_cpu_inc(s->__stat);						\
++ 	} while (0)
++ 
++ #define recycle_stat_add(pool, __stat, val)						\
++ 	do {										\
++ 		struct page_pool_recycle_stats __percpu *s = pool->recycle_stats;	\
++ 		this_cpu_add(s->__stat, val);						\
++ 	} while (0)
++ 
++ static const char pp_stats[][ETH_GSTRING_LEN] = {
++ 	"rx_pp_alloc_fast",
++ 	"rx_pp_alloc_slow",
++ 	"rx_pp_alloc_slow_ho",
++ 	"rx_pp_alloc_empty",
++ 	"rx_pp_alloc_refill",
++ 	"rx_pp_alloc_waive",
++ 	"rx_pp_recycle_cached",
++ 	"rx_pp_recycle_cache_full",
++ 	"rx_pp_recycle_ring",
++ 	"rx_pp_recycle_ring_full",
++ 	"rx_pp_recycle_released_ref",
++ };
++ 
++ bool page_pool_get_stats(struct page_pool *pool,
++ 			 struct page_pool_stats *stats)
++ {
++ 	int cpu = 0;
++ 
++ 	if (!stats)
++ 		return false;
++ 
++ 	/* The caller is responsible to initialize stats. */
++ 	stats->alloc_stats.fast += pool->alloc_stats.fast;
++ 	stats->alloc_stats.slow += pool->alloc_stats.slow;
++ 	stats->alloc_stats.slow_high_order += pool->alloc_stats.slow_high_order;
++ 	stats->alloc_stats.empty += pool->alloc_stats.empty;
++ 	stats->alloc_stats.refill += pool->alloc_stats.refill;
++ 	stats->alloc_stats.waive += pool->alloc_stats.waive;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		const struct page_pool_recycle_stats *pcpu =
++ 			per_cpu_ptr(pool->recycle_stats, cpu);
++ 
++ 		stats->recycle_stats.cached += pcpu->cached;
++ 		stats->recycle_stats.cache_full += pcpu->cache_full;
++ 		stats->recycle_stats.ring += pcpu->ring;
++ 		stats->recycle_stats.ring_full += pcpu->ring_full;
++ 		stats->recycle_stats.released_refcnt += pcpu->released_refcnt;
++ 	}
++ 
++ 	return true;
++ }
++ EXPORT_SYMBOL(page_pool_get_stats);
++ 
++ u8 *page_pool_ethtool_stats_get_strings(u8 *data)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(pp_stats); i++) {
++ 		memcpy(data, pp_stats[i], ETH_GSTRING_LEN);
++ 		data += ETH_GSTRING_LEN;
++ 	}
++ 
++ 	return data;
++ }
++ EXPORT_SYMBOL(page_pool_ethtool_stats_get_strings);
++ 
++ int page_pool_ethtool_stats_get_count(void)
++ {
++ 	return ARRAY_SIZE(pp_stats);
++ }
++ EXPORT_SYMBOL(page_pool_ethtool_stats_get_count);
++ 
++ u64 *page_pool_ethtool_stats_get(u64 *data, void *stats)
++ {
++ 	struct page_pool_stats *pool_stats = stats;
++ 
++ 	*data++ = pool_stats->alloc_stats.fast;
++ 	*data++ = pool_stats->alloc_stats.slow;
++ 	*data++ = pool_stats->alloc_stats.slow_high_order;
++ 	*data++ = pool_stats->alloc_stats.empty;
++ 	*data++ = pool_stats->alloc_stats.refill;
++ 	*data++ = pool_stats->alloc_stats.waive;
++ 	*data++ = pool_stats->recycle_stats.cached;
++ 	*data++ = pool_stats->recycle_stats.cache_full;
++ 	*data++ = pool_stats->recycle_stats.ring;
++ 	*data++ = pool_stats->recycle_stats.ring_full;
++ 	*data++ = pool_stats->recycle_stats.released_refcnt;
++ 
++ 	return data;
++ }
++ EXPORT_SYMBOL(page_pool_ethtool_stats_get);
++ 
++ #else
++ #define alloc_stat_inc(pool, __stat)
++ #define recycle_stat_inc(pool, __stat)
++ #define recycle_stat_add(pool, __stat, val)
++ #endif
++ 
++ static bool page_pool_producer_lock(struct page_pool *pool)
++ 	__acquires(&pool->ring.producer_lock)
++ {
++ 	bool in_softirq = in_softirq();
++ 
++ 	if (in_softirq)
++ 		spin_lock(&pool->ring.producer_lock);
++ 	else
++ 		spin_lock_bh(&pool->ring.producer_lock);
++ 
++ 	return in_softirq;
++ }
++ 
++ static void page_pool_producer_unlock(struct page_pool *pool,
++ 				      bool in_softirq)
++ 	__releases(&pool->ring.producer_lock)
++ {
++ 	if (in_softirq)
++ 		spin_unlock(&pool->ring.producer_lock);
++ 	else
++ 		spin_unlock_bh(&pool->ring.producer_lock);
++ }
++ 
+++>>>>>>> 368d3cb406cd (page_pool: fix inconsistency for page_pool_ring_[un]lock())
+  static int page_pool_init(struct page_pool *pool,
+  			  const struct page_pool_params *params)
+  {
+@@@ -433,12 -659,16 +568,17 @@@ void page_pool_put_page_bulk(struct pag
+  		return;
+  
+  	/* Bulk producer into ptr_ring page_pool cache */
+- 	page_pool_ring_lock(pool);
++ 	in_softirq = page_pool_producer_lock(pool);
+  	for (i = 0; i < bulk_len; i++) {
+ -		if (__ptr_ring_produce(&pool->ring, data[i])) {
+ -			/* ring full */
+ -			recycle_stat_inc(pool, ring_full);
+ -			break;
+ -		}
+ +		if (__ptr_ring_produce(&pool->ring, data[i]))
+ +			break; /* ring full */
+  	}
+++<<<<<<< HEAD
+ +	page_pool_ring_unlock(pool);
+++=======
++ 	recycle_stat_add(pool, ring, i);
++ 	page_pool_producer_unlock(pool, in_softirq);
+++>>>>>>> 368d3cb406cd (page_pool: fix inconsistency for page_pool_ring_[un]lock())
+  
+  	/* Hopefully all pages was return into ptr_ring */
+  	if (likely(i == bulk_len))
+diff --git a/include/net/page_pool.h b/include/net/page_pool.h
+index b22980c822b1..8598e1660cfb 100644
+--- a/include/net/page_pool.h
++++ b/include/net/page_pool.h
+@@ -223,22 +223,4 @@ static inline void page_pool_nid_changed(struct page_pool *pool, int new_nid)
+ 		page_pool_update_nid(pool, new_nid);
+ }
+ 
+-static inline void page_pool_ring_lock(struct page_pool *pool)
+-	__acquires(&pool->ring.producer_lock)
+-{
+-	if (in_softirq())
+-		spin_lock(&pool->ring.producer_lock);
+-	else
+-		spin_lock_bh(&pool->ring.producer_lock);
+-}
+-
+-static inline void page_pool_ring_unlock(struct page_pool *pool)
+-	__releases(&pool->ring.producer_lock)
+-{
+-	if (in_softirq())
+-		spin_unlock(&pool->ring.producer_lock);
+-	else
+-		spin_unlock_bh(&pool->ring.producer_lock);
+-}
+-
+ #endif /* _NET_PAGE_POOL_H */
+* Unmerged path net/core/page_pool.c
