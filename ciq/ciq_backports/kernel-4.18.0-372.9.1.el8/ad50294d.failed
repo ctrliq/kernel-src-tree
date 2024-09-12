@@ -1,0 +1,235 @@
+RDMA/mlx5: Create ODP EQ only when ODP MR is created
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Shay Drory <shayd@nvidia.com>
+commit ad50294d4d6b573654cddf09a689592414b28b45
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/ad50294d.failed
+
+There is no need to create the ODP EQ if the user doesn't use ODP MRs.
+Hence, create it only when the first ODP MR is created. This EQ will be
+destroyed only when the device is unloaded.
+This will decrease the number of EQs created per device. for example: If
+we creates 1K devices (SF/VF/etc'), than we will decrease the num of EQs
+by 1K.
+
+Link: https://lore.kernel.org/r/20210314125418.179716-1-leon@kernel.org
+	Signed-off-by: Shay Drory <shayd@nvidia.com>
+	Reviewed-by: Maor Gottlieb <maorg@nvidia.com>
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit ad50294d4d6b573654cddf09a689592414b28b45)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mr.c
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index 4344f79c242a,eeb9f7e15634..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -1476,26 -1451,62 +1476,34 @@@ struct ib_mr *mlx5_ib_reg_user_mr(struc
+  	struct mlx5_ib_dev *dev = to_mdev(pd->device);
+  	struct mlx5_ib_mr *mr = NULL;
+  	bool xlt_with_umr;
+ +	struct ib_umem *umem;
+  	int err;
+  
+ -	xlt_with_umr = mlx5_ib_can_load_pas_with_umr(dev, umem->length);
+ -	if (xlt_with_umr) {
+ -		mr = alloc_cacheable_mr(pd, umem, iova, access_flags);
+ -	} else {
+ -		unsigned int page_size = mlx5_umem_find_best_pgsz(
+ -			umem, mkc, log_page_size, 0, iova);
+ -
+ -		mutex_lock(&dev->slow_path_mutex);
+ -		mr = reg_create(pd, umem, iova, access_flags, page_size, true);
+ -		mutex_unlock(&dev->slow_path_mutex);
+ -	}
+ -	if (IS_ERR(mr)) {
+ -		ib_umem_release(umem);
+ -		return ERR_CAST(mr);
+ -	}
+ -
+ -	mlx5_ib_dbg(dev, "mkey 0x%x\n", mr->mmkey.key);
+ -
+ -	atomic_add(ib_umem_num_pages(umem), &dev->mdev->priv.reg_pages);
+ -
+ -	if (xlt_with_umr) {
+ -		/*
+ -		 * If the MR was created with reg_create then it will be
+ -		 * configured properly but left disabled. It is safe to go ahead
+ -		 * and configure it again via UMR while enabling it.
+ -		 */
+ -		err = mlx5_ib_update_mr_pas(mr, MLX5_IB_UPD_XLT_ENABLE);
+ -		if (err) {
+ -			mlx5_ib_dereg_mr(&mr->ibmr, NULL);
+ -			return ERR_PTR(err);
+ -		}
+ -	}
+ -	return &mr->ibmr;
+ -}
+ +	if (!IS_ENABLED(CONFIG_INFINIBAND_USER_MEM))
+ +		return ERR_PTR(-EOPNOTSUPP);
+  
+ -static struct ib_mr *create_user_odp_mr(struct ib_pd *pd, u64 start, u64 length,
+ -					u64 iova, int access_flags,
+ -					struct ib_udata *udata)
+ -{
+ -	struct mlx5_ib_dev *dev = to_mdev(pd->device);
+ -	struct ib_umem_odp *odp;
+ -	struct mlx5_ib_mr *mr;
+ -	int err;
+++<<<<<<< HEAD
+ +	mlx5_ib_dbg(dev, "start 0x%llx, virt_addr 0x%llx, length 0x%llx, access_flags 0x%x\n",
+ +		    start, virt_addr, length, access_flags);
+  
+ -	if (!IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING))
+ -		return ERR_PTR(-EOPNOTSUPP);
+ +	xlt_with_umr = mlx5_ib_can_load_pas_with_umr(dev, length);
+ +	/* ODP requires xlt update via umr to work. */
+ +	if (!xlt_with_umr && (access_flags & IB_ACCESS_ON_DEMAND))
+ +		return ERR_PTR(-EINVAL);
+  
+ +	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING) && !start &&
+ +	    length == U64_MAX) {
+ +		if (virt_addr != start)
+++=======
++ 	err = mlx5r_odp_create_eq(dev, &dev->odp_pf_eq);
++ 	if (err)
++ 		return ERR_PTR(err);
++ 	if (!start && length == U64_MAX) {
++ 		if (iova != 0)
+++>>>>>>> ad50294d4d6b (RDMA/mlx5: Create ODP EQ only when ODP MR is created)
+  			return ERR_PTR(-EINVAL);
+ -		if (!(dev->odp_caps.general_caps & IB_ODP_SUPPORT_IMPLICIT))
+ +		if (!(access_flags & IB_ACCESS_ON_DEMAND) ||
+ +		    !(dev->odp_caps.general_caps & IB_ODP_SUPPORT_IMPLICIT))
+  			return ERR_PTR(-EINVAL);
+  
+  		mr = mlx5_ib_alloc_implicit_mr(to_mpd(pd), udata, access_flags);
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index ba5066be432c..6e936046c1d4 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -1073,6 +1073,7 @@ struct mlx5_ib_dev {
+ 	struct mutex			slow_path_mutex;
+ 	struct ib_odp_caps	odp_caps;
+ 	u64			odp_max_size;
++	struct mutex		odp_eq_mutex;
+ 	struct mlx5_ib_pf_eq	odp_pf_eq;
+ 
+ 	struct xarray		odp_mkeys;
+@@ -1348,6 +1349,7 @@ struct ib_mr *mlx5_ib_reg_dm_mr(struct ib_pd *pd, struct ib_dm *dm,
+ #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ void mlx5_ib_internal_fill_odp_caps(struct mlx5_ib_dev *dev);
+ int mlx5_ib_odp_init_one(struct mlx5_ib_dev *ibdev);
++int mlx5r_odp_create_eq(struct mlx5_ib_dev *dev, struct mlx5_ib_pf_eq *eq);
+ void mlx5_ib_odp_cleanup_one(struct mlx5_ib_dev *ibdev);
+ int __init mlx5_ib_odp_init(void);
+ void mlx5_ib_odp_cleanup(void);
+@@ -1367,6 +1369,11 @@ static inline void mlx5_ib_internal_fill_odp_caps(struct mlx5_ib_dev *dev)
+ }
+ 
+ static inline int mlx5_ib_odp_init_one(struct mlx5_ib_dev *ibdev) { return 0; }
++static inline int mlx5r_odp_create_eq(struct mlx5_ib_dev *dev,
++				      struct mlx5_ib_pf_eq *eq)
++{
++	return 0;
++}
+ static inline void mlx5_ib_odp_cleanup_one(struct mlx5_ib_dev *ibdev) {}
+ static inline int mlx5_ib_odp_init(void) { return 0; }
+ static inline void mlx5_ib_odp_cleanup(void)				    {}
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
+diff --git a/drivers/infiniband/hw/mlx5/odp.c b/drivers/infiniband/hw/mlx5/odp.c
+index 4701fc81d8a6..add8af22d22e 100644
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@ -1550,20 +1550,24 @@ enum {
+ 	MLX5_IB_NUM_PF_DRAIN	= 64,
+ };
+ 
+-static int
+-mlx5_ib_create_pf_eq(struct mlx5_ib_dev *dev, struct mlx5_ib_pf_eq *eq)
++int mlx5r_odp_create_eq(struct mlx5_ib_dev *dev, struct mlx5_ib_pf_eq *eq)
+ {
+ 	struct mlx5_eq_param param = {};
+-	int err;
++	int err = 0;
+ 
++	mutex_lock(&dev->odp_eq_mutex);
++	if (eq->core)
++		goto unlock;
+ 	INIT_WORK(&eq->work, mlx5_ib_eq_pf_action);
+ 	spin_lock_init(&eq->lock);
+ 	eq->dev = dev;
+ 
+ 	eq->pool = mempool_create_kmalloc_pool(MLX5_IB_NUM_PF_DRAIN,
+ 					       sizeof(struct mlx5_pagefault));
+-	if (!eq->pool)
+-		return -ENOMEM;
++	if (!eq->pool) {
++		err = -ENOMEM;
++		goto unlock;
++	}
+ 
+ 	eq->wq = alloc_workqueue("mlx5_ib_page_fault",
+ 				 WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM,
+@@ -1574,7 +1578,7 @@ mlx5_ib_create_pf_eq(struct mlx5_ib_dev *dev, struct mlx5_ib_pf_eq *eq)
+ 	}
+ 
+ 	eq->irq_nb.notifier_call = mlx5_ib_eq_pf_int;
+-	param = (struct mlx5_eq_param) {
++	param = (struct mlx5_eq_param){
+ 		.irq_index = 0,
+ 		.nent = MLX5_IB_NUM_PF_EQE,
+ 	};
+@@ -1590,21 +1594,27 @@ mlx5_ib_create_pf_eq(struct mlx5_ib_dev *dev, struct mlx5_ib_pf_eq *eq)
+ 		goto err_eq;
+ 	}
+ 
++	mutex_unlock(&dev->odp_eq_mutex);
+ 	return 0;
+ err_eq:
+ 	mlx5_eq_destroy_generic(dev->mdev, eq->core);
+ err_wq:
++	eq->core = NULL;
+ 	destroy_workqueue(eq->wq);
+ err_mempool:
+ 	mempool_destroy(eq->pool);
++unlock:
++	mutex_unlock(&dev->odp_eq_mutex);
+ 	return err;
+ }
+ 
+ static int
+-mlx5_ib_destroy_pf_eq(struct mlx5_ib_dev *dev, struct mlx5_ib_pf_eq *eq)
++mlx5_ib_odp_destroy_eq(struct mlx5_ib_dev *dev, struct mlx5_ib_pf_eq *eq)
+ {
+ 	int err;
+ 
++	if (!eq->core)
++		return 0;
+ 	mlx5_eq_disable(dev->mdev, eq->core, &eq->irq_nb);
+ 	err = mlx5_eq_destroy_generic(dev->mdev, eq->core);
+ 	cancel_work_sync(&eq->work);
+@@ -1662,8 +1672,7 @@ int mlx5_ib_odp_init_one(struct mlx5_ib_dev *dev)
+ 		}
+ 	}
+ 
+-	ret = mlx5_ib_create_pf_eq(dev, &dev->odp_pf_eq);
+-
++	mutex_init(&dev->odp_eq_mutex);
+ 	return ret;
+ }
+ 
+@@ -1672,7 +1681,7 @@ void mlx5_ib_odp_cleanup_one(struct mlx5_ib_dev *dev)
+ 	if (!(dev->odp_caps.general_caps & IB_ODP_SUPPORT))
+ 		return;
+ 
+-	mlx5_ib_destroy_pf_eq(dev, &dev->odp_pf_eq);
++	mlx5_ib_odp_destroy_eq(dev, &dev->odp_pf_eq);
+ }
+ 
+ int mlx5_ib_odp_init(void)
