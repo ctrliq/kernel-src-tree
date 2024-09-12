@@ -1,0 +1,101 @@
+iommu/amd: Allocate page table using numa locality info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-537.el8
+commit-author Vasant Hegde <vasant.hegde@amd.com>
+commit 0d571dcbe7c6d36dcfcb8e04a49cc01fe462d171
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-537.el8/0d571dcb.failed
+
+Introduce 'struct protection_domain->nid' variable. It will contain
+IOMMU NUMA node ID. And allocate page table pages using IOMMU numa
+locality info. This optimizes page table walk by IOMMU.
+
+	Signed-off-by: Vasant Hegde <vasant.hegde@amd.com>
+Link: https://lore.kernel.org/r/20230321092348.6127-2-vasant.hegde@amd.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 0d571dcbe7c6d36dcfcb8e04a49cc01fe462d171)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd/io_pgtable_v2.c
+* Unmerged path drivers/iommu/amd/io_pgtable_v2.c
+diff --git a/drivers/iommu/amd/amd_iommu.h b/drivers/iommu/amd/amd_iommu.h
+index 6dbfe5e99f38..6913e5ad16d6 100644
+--- a/drivers/iommu/amd/amd_iommu.h
++++ b/drivers/iommu/amd/amd_iommu.h
+@@ -120,6 +120,14 @@ static inline int get_pci_sbdf_id(struct pci_dev *pdev)
+ 	return PCI_SEG_DEVID_TO_SBDF(seg, devid);
+ }
+ 
++static inline void *alloc_pgtable_page(int nid, gfp_t gfp)
++{
++	struct page *page;
++
++	page = alloc_pages_node(nid, gfp | __GFP_ZERO, 0);
++	return page ? page_address(page) : NULL;
++}
++
+ extern bool translation_pre_enabled(struct amd_iommu *iommu);
+ extern bool amd_iommu_is_attach_deferred(struct iommu_domain *domain,
+ 					 struct device *dev);
+diff --git a/drivers/iommu/amd/amd_iommu_types.h b/drivers/iommu/amd/amd_iommu_types.h
+index b88377ea51d6..b566ef20f024 100644
+--- a/drivers/iommu/amd/amd_iommu_types.h
++++ b/drivers/iommu/amd/amd_iommu_types.h
+@@ -544,6 +544,7 @@ struct protection_domain {
+ 	spinlock_t lock;	/* mostly used to lock the page table*/
+ 	u16 id;			/* the domain id written to the device table */
+ 	int glx;		/* Number of levels for GCR3 table */
++	int nid;		/* Node ID */
+ 	u64 *gcr3_tbl;		/* Guest CR3 table */
+ 	unsigned long flags;	/* flags to find out type of domain */
+ 	unsigned dev_cnt;	/* devices assigned to this domain */
+diff --git a/drivers/iommu/amd/io_pgtable.c b/drivers/iommu/amd/io_pgtable.c
+index 4ab0c7f60bf1..eed8a4122beb 100644
+--- a/drivers/iommu/amd/io_pgtable.c
++++ b/drivers/iommu/amd/io_pgtable.c
+@@ -156,7 +156,7 @@ static bool increase_address_space(struct protection_domain *domain,
+ 	bool ret = true;
+ 	u64 *pte;
+ 
+-	pte = (void *)get_zeroed_page(gfp);
++	pte = alloc_pgtable_page(domain->nid, gfp);
+ 	if (!pte)
+ 		return false;
+ 
+@@ -250,7 +250,7 @@ static u64 *alloc_pte(struct protection_domain *domain,
+ 
+ 		if (!IOMMU_PTE_PRESENT(__pte) ||
+ 		    pte_level == PAGE_MODE_NONE) {
+-			page = (u64 *)get_zeroed_page(gfp);
++			page = alloc_pgtable_page(domain->nid, gfp);
+ 
+ 			if (!page)
+ 				return NULL;
+* Unmerged path drivers/iommu/amd/io_pgtable_v2.c
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index 1c7264c4fd73..6cc0fff123a9 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -1629,6 +1629,10 @@ static void do_attach(struct iommu_dev_data *dev_data,
+ 	dev_data->domain = domain;
+ 	list_add(&dev_data->list, &domain->dev_list);
+ 
++	/* Update NUMA Node ID */
++	if (domain->nid == NUMA_NO_NODE)
++		domain->nid = dev_to_node(dev_data->dev);
++
+ 	/* Do reference counting */
+ 	domain->dev_iommu[iommu->index] += 1;
+ 	domain->dev_cnt                 += 1;
+@@ -2044,6 +2048,8 @@ static struct protection_domain *protection_domain_alloc(unsigned int type)
+ 	if (type == IOMMU_DOMAIN_IDENTITY)
+ 		return domain;
+ 
++	domain->nid = NUMA_NO_NODE;
++
+ 	pgtbl_ops = alloc_io_pgtable_ops(pgtable, &domain->iop.pgtbl_cfg, domain);
+ 	if (!pgtbl_ops)
+ 		goto out_err;
