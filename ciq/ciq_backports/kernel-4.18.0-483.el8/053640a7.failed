@@ -1,0 +1,86 @@
+gfs2: Dequeue waiters when withdrawn
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-483.el8
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 053640a73838400dca23087d66a9c0db579adafb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-483.el8/053640a7.failed
+
+When a withdraw occurs, ordinary (not system) glocks may not be granted
+anymore. Later, when the file system is unmounted, gfs2_gl_hash_clear()
+tries to clear out all the glocks, but these un-grantable pending
+waiters prevent some glocks from being freed. So the unmount hangs, at
+least for its ten-minute timeout period.
+
+This patch takes measures to remove any pending waiters from
+the glocks that will never be granted. This allows the unmount to
+proceed in a reasonable period of time.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 053640a73838400dca23087d66a9c0db579adafb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.h
+diff --cc fs/gfs2/glock.h
+index 885d044e536c,0199a3dcb114..000000000000
+--- a/fs/gfs2/glock.h
++++ b/fs/gfs2/glock.h
+@@@ -254,8 -274,7 +254,12 @@@ extern void gfs2_cancel_delete_work(str
+  extern bool gfs2_delete_work_queued(const struct gfs2_glock *gl);
+  extern void gfs2_flush_delete_work(struct gfs2_sbd *sdp);
+  extern void gfs2_gl_hash_clear(struct gfs2_sbd *sdp);
+++<<<<<<< HEAD
+ +extern void gfs2_glock_finish_truncate(struct gfs2_inode *ip);
+ +extern void gfs2_wait_truncate(struct gfs2_inode *ip);
+++=======
++ extern void gfs2_gl_dq_holders(struct gfs2_sbd *sdp);
+++>>>>>>> 053640a73838 (gfs2: Dequeue waiters when withdrawn)
+  extern void gfs2_glock_thaw(struct gfs2_sbd *sdp);
+  extern void gfs2_glock_add_to_lru(struct gfs2_glock *gl);
+  extern void gfs2_glock_free(struct gfs2_glock *gl);
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index c93fbf5976fd..7086314ea8ec 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -2202,6 +2202,20 @@ static void dump_glock_func(struct gfs2_glock *gl)
+ 	dump_glock(NULL, gl, true);
+ }
+ 
++static void withdraw_dq(struct gfs2_glock *gl)
++{
++	spin_lock(&gl->gl_lockref.lock);
++	if (!__lockref_is_dead(&gl->gl_lockref) &&
++	    glock_blocked_by_withdraw(gl))
++		do_error(gl, LM_OUT_ERROR); /* remove pending waiters */
++	spin_unlock(&gl->gl_lockref.lock);
++}
++
++void gfs2_gl_dq_holders(struct gfs2_sbd *sdp)
++{
++	glock_hash_walk(withdraw_dq, sdp);
++}
++
+ /**
+  * gfs2_gl_hash_clear - Empty out the glock hash table
+  * @sdp: the filesystem
+* Unmerged path fs/gfs2/glock.h
+diff --git a/fs/gfs2/util.c b/fs/gfs2/util.c
+index a0914d094154..a7ae525f2bd6 100644
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@ -165,6 +165,11 @@ static void signal_our_withdraw(struct gfs2_sbd *sdp)
+ 		}
+ 		if (!ret)
+ 			gfs2_make_fs_ro(sdp);
++		/*
++		 * Dequeue any pending non-system glock holders that can no
++		 * longer be granted because the file system is withdrawn.
++		 */
++		gfs2_gl_dq_holders(sdp);
+ 		gfs2_freeze_unlock(&freeze_gh);
+ 	}
+ 
