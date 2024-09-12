@@ -1,0 +1,179 @@
+net/sched: mqprio: add extack messages for queue count validation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit d404959fa23a6fc79ba3989f0491a1e747e30532
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/d404959f.failed
+
+To make mqprio more user-friendly, create netlink extended ack messages
+which say exactly what is wrong about the queue counts. This uses the
+new support for printf-formatted extack messages.
+
+Example:
+
+$ tc qdisc add dev eno0 root handle 1: mqprio num_tc 8 \
+	map 0 1 2 3 4 5 6 7 queues 3@0 1@1 1@2 1@3 1@4 1@5 1@6 1@7 hw 0
+Error: sch_mqprio: TC 0 queues 3@0 overlap with TC 1 queues 1@1.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Simon Horman <simon.horman@corigine.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d404959fa23a6fc79ba3989f0491a1e747e30532)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_mqprio.c
+diff --cc net/sched/sch_mqprio.c
+index 80a83b1244de,d2a2dc068408..000000000000
+--- a/net/sched/sch_mqprio.c
++++ b/net/sched/sch_mqprio.c
+@@@ -38,8 -35,54 +38,57 @@@ static bool intervals_overlap(int a, in
+  	return left < right;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mqprio_validate_queue_counts(struct net_device *dev,
++ 					const struct tc_mqprio_qopt *qopt,
++ 					struct netlink_ext_ack *extack)
++ {
++ 	int i, j;
++ 
++ 	for (i = 0; i < qopt->num_tc; i++) {
++ 		unsigned int last = qopt->offset[i] + qopt->count[i];
++ 
++ 		if (!qopt->count[i]) {
++ 			NL_SET_ERR_MSG_FMT_MOD(extack, "No queues for TC %d",
++ 					       i);
++ 			return -EINVAL;
++ 		}
++ 
++ 		/* Verify the queue count is in tx range being equal to the
++ 		 * real_num_tx_queues indicates the last queue is in use.
++ 		 */
++ 		if (qopt->offset[i] >= dev->real_num_tx_queues ||
++ 		    last > dev->real_num_tx_queues) {
++ 			NL_SET_ERR_MSG_FMT_MOD(extack,
++ 					       "Queues %d:%d for TC %d exceed the %d TX queues available",
++ 					       qopt->count[i], qopt->offset[i],
++ 					       i, dev->real_num_tx_queues);
++ 			return -EINVAL;
++ 		}
++ 
++ 		/* Verify that the offset and counts do not overlap */
++ 		for (j = i + 1; j < qopt->num_tc; j++) {
++ 			if (intervals_overlap(qopt->offset[i], last,
++ 					      qopt->offset[j],
++ 					      qopt->offset[j] +
++ 					      qopt->count[j])) {
++ 				NL_SET_ERR_MSG_FMT_MOD(extack,
++ 						       "TC %d queues %d@%d overlap with TC %d queues %d@%d",
++ 						       i, qopt->count[i], qopt->offset[i],
++ 						       j, qopt->count[j], qopt->offset[j]);
++ 				return -EINVAL;
++ 			}
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> d404959fa23a (net/sched: mqprio: add extack messages for queue count validation)
+  static int mqprio_enable_offload(struct Qdisc *sch,
+- 				 const struct tc_mqprio_qopt *qopt)
++ 				 const struct tc_mqprio_qopt *qopt,
++ 				 struct netlink_ext_ack *extack)
+  {
+  	struct tc_mqprio_qopt_offload mqprio = {.qopt = *qopt};
+  	struct mqprio_sched *priv = qdisc_priv(sch);
+@@@ -113,9 -156,11 +162,15 @@@ static void mqprio_destroy(struct Qdis
+  		netdev_set_num_tc(dev, 0);
+  }
+  
+++<<<<<<< HEAD
+ +static int mqprio_parse_opt(struct net_device *dev, struct tc_mqprio_qopt *qopt)
+++=======
++ static int mqprio_parse_opt(struct net_device *dev, struct tc_mqprio_qopt *qopt,
++ 			    const struct tc_mqprio_caps *caps,
++ 			    struct netlink_ext_ack *extack)
+++>>>>>>> d404959fa23a (net/sched: mqprio: add extack messages for queue count validation)
+  {
+ -	int i, err;
+ +	int i, j;
+  
+  	/* Verify num_tc is not out of max range */
+  	if (qopt->num_tc > TC_MAX_QUEUE)
+@@@ -134,34 -179,23 +189,42 @@@
+  	if (qopt->hw > TC_MQPRIO_HW_OFFLOAD_MAX)
+  		qopt->hw = TC_MQPRIO_HW_OFFLOAD_MAX;
+  
+ -	/* If hardware offload is requested, we will leave 3 options to the
+ -	 * device driver:
+ -	 * - populate the queue counts itself (and ignore what was requested)
+ -	 * - validate the provided queue counts by itself (and apply them)
+ -	 * - request queue count validation here (and apply them)
+ +	/* If hardware offload is requested we will leave it to the device
+ +	 * to either populate the queue counts itself or to validate the
+ +	 * provided queue counts.  If ndo_setup_tc is not present then
+ +	 * hardware doesn't support offload and we should return an error.
+  	 */
+++<<<<<<< HEAD
+ +	if (qopt->hw)
+ +		return dev->netdev_ops->ndo_setup_tc ? 0 : -EINVAL;
+++=======
++ 	if (!qopt->hw || caps->validate_queue_counts) {
++ 		err = mqprio_validate_queue_counts(dev, qopt, extack);
++ 		if (err)
++ 			return err;
++ 	}
+++>>>>>>> d404959fa23a (net/sched: mqprio: add extack messages for queue count validation)
+  
+ -	/* If ndo_setup_tc is not present then hardware doesn't support offload
+ -	 * and we should return an error.
+ -	 */
+ -	if (qopt->hw && !dev->netdev_ops->ndo_setup_tc)
+ -		return -EINVAL;
+ +	for (i = 0; i < qopt->num_tc; i++) {
+ +		unsigned int last = qopt->offset[i] + qopt->count[i];
+ +
+ +		/* Verify the queue count is in tx range being equal to the
+ +		 * real_num_tx_queues indicates the last queue is in use.
+ +		 */
+ +		if (qopt->offset[i] >= dev->real_num_tx_queues ||
+ +		    !qopt->count[i] ||
+ +		    last > dev->real_num_tx_queues)
+ +			return -EINVAL;
+ +
+ +		/* Verify that the offset and counts do not overlap */
+ +		for (j = i + 1; j < qopt->num_tc; j++) {
+ +			if (intervals_overlap(qopt->offset[i], last,
+ +					      qopt->offset[j],
+ +					      qopt->offset[j] +
+ +					      qopt->count[j]))
+ +				return -EINVAL;
+ +		}
+ +	}
+  
+  	return 0;
+  }
+@@@ -275,8 -310,11 +338,12 @@@ static int mqprio_init(struct Qdisc *sc
+  	if (!opt || nla_len(opt) < sizeof(*qopt))
+  		return -EINVAL;
+  
+ -	qdisc_offload_query_caps(dev, TC_SETUP_QDISC_MQPRIO,
+ -				 &caps, sizeof(caps));
+ -
+  	qopt = nla_data(opt);
+++<<<<<<< HEAD
+ +	if (mqprio_parse_opt(dev, qopt))
+++=======
++ 	if (mqprio_parse_opt(dev, qopt, &caps, extack))
+++>>>>>>> d404959fa23a (net/sched: mqprio: add extack messages for queue count validation)
+  		return -EINVAL;
+  
+  	len = nla_len(opt) - NLA_ALIGN(sizeof(*qopt));
+* Unmerged path net/sched/sch_mqprio.c
