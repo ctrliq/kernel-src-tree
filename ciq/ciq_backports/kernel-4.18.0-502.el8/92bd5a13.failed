@@ -1,0 +1,692 @@
+x86/resctrl: Add interface to write mbm_total_bytes_config
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Babu Moger <babu.moger@amd.com>
+commit 92bd5a1390335bb3cc76bdf1b4356edbc94d408d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/92bd5a13.failed
+
+The event configuration for mbm_total_bytes can be changed by the user by
+writing to the file /sys/fs/resctrl/info/L3_MON/mbm_total_bytes_config.
+
+The event configuration settings are domain specific and affect all the
+CPUs in the domain.
+
+Following are the types of events supported:
+
+  ====  ===========================================================
+  Bits   Description
+  ====  ===========================================================
+  6      Dirty Victims from the QOS domain to all types of memory
+  5      Reads to slow memory in the non-local NUMA domain
+  4      Reads to slow memory in the local NUMA domain
+  3      Non-temporal writes to non-local NUMA domain
+  2      Non-temporal writes to local NUMA domain
+  1      Reads to memory in the non-local NUMA domain
+  0      Reads to memory in the local NUMA domain
+  ====  ===========================================================
+
+For example:
+
+To change the mbm_total_bytes to count only reads on domain 0, the bits
+0, 1, 4 and 5 needs to be set, which is 110011b (in hex 0x33).
+Run the command:
+
+  $echo  0=0x33 > /sys/fs/resctrl/info/L3_MON/mbm_total_bytes_config
+
+To change the mbm_total_bytes to count all the slow memory reads on domain 1,
+the bits 4 and 5 needs to be set which is 110000b (in hex 0x30).
+Run the command:
+
+  $echo  1=0x30 > /sys/fs/resctrl/info/L3_MON/mbm_total_bytes_config
+
+	Signed-off-by: Babu Moger <babu.moger@amd.com>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lore.kernel.org/r/20230113152039.770054-12-babu.moger@amd.com
+(cherry picked from commit 92bd5a1390335bb3cc76bdf1b4356edbc94d408d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/monitor.c
+#	arch/x86/kernel/cpu/resctrl/rdtgroup.c
+#	include/linux/resctrl.h
+diff --cc arch/x86/kernel/cpu/resctrl/monitor.c
+index 3b6b1365b5d9,7fe51488e136..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/monitor.c
++++ b/arch/x86/kernel/cpu/resctrl/monitor.c
+@@@ -158,16 -159,105 +158,94 @@@ static u64 __rmid_read(u32 rmid, u32 ev
+  	 * are error bits.
+  	 */
+  	wrmsr(MSR_IA32_QM_EVTSEL, eventid, rmid);
+ -	rdmsrl(MSR_IA32_QM_CTR, msr_val);
+ -
+ -	if (msr_val & RMID_VAL_ERROR)
+ -		return -EIO;
+ -	if (msr_val & RMID_VAL_UNAVAIL)
+ -		return -EINVAL;
+ +	rdmsrl(MSR_IA32_QM_CTR, val);
+  
+ -	*val = msr_val;
+ -	return 0;
+ +	return val;
+  }
+  
+ -static struct arch_mbm_state *get_arch_mbm_state(struct rdt_hw_domain *hw_dom,
+ -						 u32 rmid,
+ -						 enum resctrl_event_id eventid)
+ +static bool rmid_dirty(struct rmid_entry *entry)
+  {
+ -	switch (eventid) {
+ -	case QOS_L3_OCCUP_EVENT_ID:
+ -		return NULL;
+ -	case QOS_L3_MBM_TOTAL_EVENT_ID:
+ -		return &hw_dom->arch_mbm_total[rmid];
+ -	case QOS_L3_MBM_LOCAL_EVENT_ID:
+ -		return &hw_dom->arch_mbm_local[rmid];
+ -	}
+ +	u64 val = __rmid_read(entry->rmid, QOS_L3_OCCUP_EVENT_ID);
+  
+++<<<<<<< HEAD
+ +	return val >= resctrl_cqm_threshold;
+++=======
++ 	/* Never expect to get here */
++ 	WARN_ON_ONCE(1);
++ 
++ 	return NULL;
++ }
++ 
++ void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_domain *d,
++ 			     u32 rmid, enum resctrl_event_id eventid)
++ {
++ 	struct rdt_hw_domain *hw_dom = resctrl_to_arch_dom(d);
++ 	struct arch_mbm_state *am;
++ 
++ 	am = get_arch_mbm_state(hw_dom, rmid, eventid);
++ 	if (am) {
++ 		memset(am, 0, sizeof(*am));
++ 
++ 		/* Record any initial, non-zero count value. */
++ 		__rmid_read(rmid, eventid, &am->prev_msr);
++ 	}
++ }
++ 
++ /*
++  * Assumes that hardware counters are also reset and thus that there is
++  * no need to record initial non-zero counts.
++  */
++ void resctrl_arch_reset_rmid_all(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	struct rdt_hw_domain *hw_dom = resctrl_to_arch_dom(d);
++ 
++ 	if (is_mbm_total_enabled())
++ 		memset(hw_dom->arch_mbm_total, 0,
++ 		       sizeof(*hw_dom->arch_mbm_total) * r->num_rmid);
++ 
++ 	if (is_mbm_local_enabled())
++ 		memset(hw_dom->arch_mbm_local, 0,
++ 		       sizeof(*hw_dom->arch_mbm_local) * r->num_rmid);
++ }
++ 
++ static u64 mbm_overflow_count(u64 prev_msr, u64 cur_msr, unsigned int width)
++ {
++ 	u64 shift = 64 - width, chunks;
++ 
++ 	chunks = (cur_msr << shift) - (prev_msr << shift);
++ 	return chunks >> shift;
++ }
++ 
++ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain *d,
++ 			   u32 rmid, enum resctrl_event_id eventid, u64 *val)
++ {
++ 	struct rdt_hw_resource *hw_res = resctrl_to_arch_res(r);
++ 	struct rdt_hw_domain *hw_dom = resctrl_to_arch_dom(d);
++ 	struct arch_mbm_state *am;
++ 	u64 msr_val, chunks;
++ 	int ret;
++ 
++ 	if (!cpumask_test_cpu(smp_processor_id(), &d->cpu_mask))
++ 		return -EINVAL;
++ 
++ 	ret = __rmid_read(rmid, eventid, &msr_val);
++ 	if (ret)
++ 		return ret;
++ 
++ 	am = get_arch_mbm_state(hw_dom, rmid, eventid);
++ 	if (am) {
++ 		am->chunks += mbm_overflow_count(am->prev_msr, msr_val,
++ 						 hw_res->mbm_width);
++ 		chunks = get_corrected_mbm_count(rmid, am->chunks);
++ 		am->prev_msr = msr_val;
++ 	} else {
++ 		chunks = msr_val;
++ 	}
++ 
++ 	*val = chunks * hw_res->mon_scale;
++ 
++ 	return 0;
+++>>>>>>> 92bd5a139033 (x86/resctrl: Add interface to write mbm_total_bytes_config)
+  }
+  
+  /*
+diff --cc arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index 2b966c66b88f,03284a61c1a0..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@@ -1486,6 -1420,224 +1486,227 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct mon_config_info {
++ 	u32 evtid;
++ 	u32 mon_config;
++ };
++ 
++ #define INVALID_CONFIG_INDEX   UINT_MAX
++ 
++ /**
++  * mon_event_config_index_get - get the hardware index for the
++  *                              configurable event
++  * @evtid: event id.
++  *
++  * Return: 0 for evtid == QOS_L3_MBM_TOTAL_EVENT_ID
++  *         1 for evtid == QOS_L3_MBM_LOCAL_EVENT_ID
++  *         INVALID_CONFIG_INDEX for invalid evtid
++  */
++ static inline unsigned int mon_event_config_index_get(u32 evtid)
++ {
++ 	switch (evtid) {
++ 	case QOS_L3_MBM_TOTAL_EVENT_ID:
++ 		return 0;
++ 	case QOS_L3_MBM_LOCAL_EVENT_ID:
++ 		return 1;
++ 	default:
++ 		/* Should never reach here */
++ 		return INVALID_CONFIG_INDEX;
++ 	}
++ }
++ 
++ static void mon_event_config_read(void *info)
++ {
++ 	struct mon_config_info *mon_info = info;
++ 	unsigned int index;
++ 	u32 h;
++ 
++ 	index = mon_event_config_index_get(mon_info->evtid);
++ 	if (index == INVALID_CONFIG_INDEX) {
++ 		pr_warn_once("Invalid event id %d\n", mon_info->evtid);
++ 		return;
++ 	}
++ 	rdmsr(MSR_IA32_EVT_CFG_BASE + index, mon_info->mon_config, h);
++ 
++ 	/* Report only the valid event configuration bits */
++ 	mon_info->mon_config &= MAX_EVT_CONFIG_BITS;
++ }
++ 
++ static void mondata_config_read(struct rdt_domain *d, struct mon_config_info *mon_info)
++ {
++ 	smp_call_function_any(&d->cpu_mask, mon_event_config_read, mon_info, 1);
++ }
++ 
++ static int mbm_config_show(struct seq_file *s, struct rdt_resource *r, u32 evtid)
++ {
++ 	struct mon_config_info mon_info = {0};
++ 	struct rdt_domain *dom;
++ 	bool sep = false;
++ 
++ 	mutex_lock(&rdtgroup_mutex);
++ 
++ 	list_for_each_entry(dom, &r->domains, list) {
++ 		if (sep)
++ 			seq_puts(s, ";");
++ 
++ 		memset(&mon_info, 0, sizeof(struct mon_config_info));
++ 		mon_info.evtid = evtid;
++ 		mondata_config_read(dom, &mon_info);
++ 
++ 		seq_printf(s, "%d=0x%02x", dom->id, mon_info.mon_config);
++ 		sep = true;
++ 	}
++ 	seq_puts(s, "\n");
++ 
++ 	mutex_unlock(&rdtgroup_mutex);
++ 
++ 	return 0;
++ }
++ 
++ static int mbm_total_bytes_config_show(struct kernfs_open_file *of,
++ 				       struct seq_file *seq, void *v)
++ {
++ 	struct rdt_resource *r = of->kn->parent->priv;
++ 
++ 	mbm_config_show(seq, r, QOS_L3_MBM_TOTAL_EVENT_ID);
++ 
++ 	return 0;
++ }
++ 
++ static int mbm_local_bytes_config_show(struct kernfs_open_file *of,
++ 				       struct seq_file *seq, void *v)
++ {
++ 	struct rdt_resource *r = of->kn->parent->priv;
++ 
++ 	mbm_config_show(seq, r, QOS_L3_MBM_LOCAL_EVENT_ID);
++ 
++ 	return 0;
++ }
++ 
++ static void mon_event_config_write(void *info)
++ {
++ 	struct mon_config_info *mon_info = info;
++ 	unsigned int index;
++ 
++ 	index = mon_event_config_index_get(mon_info->evtid);
++ 	if (index == INVALID_CONFIG_INDEX) {
++ 		pr_warn_once("Invalid event id %d\n", mon_info->evtid);
++ 		return;
++ 	}
++ 	wrmsr(MSR_IA32_EVT_CFG_BASE + index, mon_info->mon_config, 0);
++ }
++ 
++ static int mbm_config_write_domain(struct rdt_resource *r,
++ 				   struct rdt_domain *d, u32 evtid, u32 val)
++ {
++ 	struct mon_config_info mon_info = {0};
++ 	int ret = 0;
++ 
++ 	/* mon_config cannot be more than the supported set of events */
++ 	if (val > MAX_EVT_CONFIG_BITS) {
++ 		rdt_last_cmd_puts("Invalid event configuration\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/*
++ 	 * Read the current config value first. If both are the same then
++ 	 * no need to write it again.
++ 	 */
++ 	mon_info.evtid = evtid;
++ 	mondata_config_read(d, &mon_info);
++ 	if (mon_info.mon_config == val)
++ 		goto out;
++ 
++ 	mon_info.mon_config = val;
++ 
++ 	/*
++ 	 * Update MSR_IA32_EVT_CFG_BASE MSR on one of the CPUs in the
++ 	 * domain. The MSRs offset from MSR MSR_IA32_EVT_CFG_BASE
++ 	 * are scoped at the domain level. Writing any of these MSRs
++ 	 * on one CPU is observed by all the CPUs in the domain.
++ 	 */
++ 	smp_call_function_any(&d->cpu_mask, mon_event_config_write,
++ 			      &mon_info, 1);
++ 
++ 	/*
++ 	 * When an Event Configuration is changed, the bandwidth counters
++ 	 * for all RMIDs and Events will be cleared by the hardware. The
++ 	 * hardware also sets MSR_IA32_QM_CTR.Unavailable (bit 62) for
++ 	 * every RMID on the next read to any event for every RMID.
++ 	 * Subsequent reads will have MSR_IA32_QM_CTR.Unavailable (bit 62)
++ 	 * cleared while it is tracked by the hardware. Clear the
++ 	 * mbm_local and mbm_total counts for all the RMIDs.
++ 	 */
++ 	resctrl_arch_reset_rmid_all(r, d);
++ 
++ out:
++ 	return ret;
++ }
++ 
++ static int mon_config_write(struct rdt_resource *r, char *tok, u32 evtid)
++ {
++ 	char *dom_str = NULL, *id_str;
++ 	unsigned long dom_id, val;
++ 	struct rdt_domain *d;
++ 	int ret = 0;
++ 
++ next:
++ 	if (!tok || tok[0] == '\0')
++ 		return 0;
++ 
++ 	/* Start processing the strings for each domain */
++ 	dom_str = strim(strsep(&tok, ";"));
++ 	id_str = strsep(&dom_str, "=");
++ 
++ 	if (!id_str || kstrtoul(id_str, 10, &dom_id)) {
++ 		rdt_last_cmd_puts("Missing '=' or non-numeric domain id\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!dom_str || kstrtoul(dom_str, 16, &val)) {
++ 		rdt_last_cmd_puts("Non-numeric event configuration value\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	list_for_each_entry(d, &r->domains, list) {
++ 		if (d->id == dom_id) {
++ 			ret = mbm_config_write_domain(r, d, evtid, val);
++ 			if (ret)
++ 				return -EINVAL;
++ 			goto next;
++ 		}
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ 
++ static ssize_t mbm_total_bytes_config_write(struct kernfs_open_file *of,
++ 					    char *buf, size_t nbytes,
++ 					    loff_t off)
++ {
++ 	struct rdt_resource *r = of->kn->parent->priv;
++ 	int ret;
++ 
++ 	/* Valid input requires a trailing newline */
++ 	if (nbytes == 0 || buf[nbytes - 1] != '\n')
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&rdtgroup_mutex);
++ 
++ 	rdt_last_cmd_clear();
++ 
++ 	buf[nbytes - 1] = '\0';
++ 
++ 	ret = mon_config_write(r, buf, QOS_L3_MBM_TOTAL_EVENT_ID);
++ 
++ 	mutex_unlock(&rdtgroup_mutex);
++ 
++ 	return ret ?: nbytes;
++ }
++ 
+++>>>>>>> 92bd5a139033 (x86/resctrl: Add interface to write mbm_total_bytes_config)
+  /* rdtgroup information files for one cache resource. */
+  static struct rftype res_common_files[] = {
+  	{
+@@@ -1585,6 -1737,19 +1806,22 @@@
+  		.fflags		= RF_MON_INFO | RFTYPE_RES_CACHE,
+  	},
+  	{
+++<<<<<<< HEAD
+++=======
++ 		.name		= "mbm_total_bytes_config",
++ 		.mode		= 0644,
++ 		.kf_ops		= &rdtgroup_kf_single_ops,
++ 		.seq_show	= mbm_total_bytes_config_show,
++ 		.write		= mbm_total_bytes_config_write,
++ 	},
++ 	{
++ 		.name		= "mbm_local_bytes_config",
++ 		.mode		= 0444,
++ 		.kf_ops		= &rdtgroup_kf_single_ops,
++ 		.seq_show	= mbm_local_bytes_config_show,
++ 	},
++ 	{
+++>>>>>>> 92bd5a139033 (x86/resctrl: Add interface to write mbm_total_bytes_config)
+  		.name		= "cpus",
+  		.mode		= 0644,
+  		.kf_ops		= &rdtgroup_kf_single_ops,
+diff --cc include/linux/resctrl.h
+index 9b05af9b3e28,8334eeacfec5..000000000000
+--- a/include/linux/resctrl.h
++++ b/include/linux/resctrl.h
+@@@ -13,4 -15,253 +13,256 @@@ int proc_resctrl_show(struct seq_file *
+  
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /* max value for struct rdt_domain's mbps_val */
++ #define MBA_MAX_MBPS   U32_MAX
++ 
++ /**
++  * enum resctrl_conf_type - The type of configuration.
++  * @CDP_NONE:	No prioritisation, both code and data are controlled or monitored.
++  * @CDP_CODE:	Configuration applies to instruction fetches.
++  * @CDP_DATA:	Configuration applies to reads and writes.
++  */
++ enum resctrl_conf_type {
++ 	CDP_NONE,
++ 	CDP_CODE,
++ 	CDP_DATA,
++ };
++ 
++ #define CDP_NUM_TYPES	(CDP_DATA + 1)
++ 
++ /*
++  * Event IDs, the values match those used to program IA32_QM_EVTSEL before
++  * reading IA32_QM_CTR on RDT systems.
++  */
++ enum resctrl_event_id {
++ 	QOS_L3_OCCUP_EVENT_ID		= 0x01,
++ 	QOS_L3_MBM_TOTAL_EVENT_ID	= 0x02,
++ 	QOS_L3_MBM_LOCAL_EVENT_ID	= 0x03,
++ };
++ 
++ /**
++  * struct resctrl_staged_config - parsed configuration to be applied
++  * @new_ctrl:		new ctrl value to be loaded
++  * @have_new_ctrl:	whether the user provided new_ctrl is valid
++  */
++ struct resctrl_staged_config {
++ 	u32			new_ctrl;
++ 	bool			have_new_ctrl;
++ };
++ 
++ /**
++  * struct rdt_domain - group of CPUs sharing a resctrl resource
++  * @list:		all instances of this resource
++  * @id:			unique id for this instance
++  * @cpu_mask:		which CPUs share this resource
++  * @rmid_busy_llc:	bitmap of which limbo RMIDs are above threshold
++  * @mbm_total:		saved state for MBM total bandwidth
++  * @mbm_local:		saved state for MBM local bandwidth
++  * @mbm_over:		worker to periodically read MBM h/w counters
++  * @cqm_limbo:		worker to periodically read CQM h/w counters
++  * @mbm_work_cpu:	worker CPU for MBM h/w counters
++  * @cqm_work_cpu:	worker CPU for CQM h/w counters
++  * @plr:		pseudo-locked region (if any) associated with domain
++  * @staged_config:	parsed configuration to be applied
++  * @mbps_val:		When mba_sc is enabled, this holds the array of user
++  *			specified control values for mba_sc in MBps, indexed
++  *			by closid
++  */
++ struct rdt_domain {
++ 	struct list_head		list;
++ 	int				id;
++ 	struct cpumask			cpu_mask;
++ 	unsigned long			*rmid_busy_llc;
++ 	struct mbm_state		*mbm_total;
++ 	struct mbm_state		*mbm_local;
++ 	struct delayed_work		mbm_over;
++ 	struct delayed_work		cqm_limbo;
++ 	int				mbm_work_cpu;
++ 	int				cqm_work_cpu;
++ 	struct pseudo_lock_region	*plr;
++ 	struct resctrl_staged_config	staged_config[CDP_NUM_TYPES];
++ 	u32				*mbps_val;
++ };
++ 
++ /**
++  * struct resctrl_cache - Cache allocation related data
++  * @cbm_len:		Length of the cache bit mask
++  * @min_cbm_bits:	Minimum number of consecutive bits to be set.
++  *			The value 0 means the architecture can support
++  *			zero CBM.
++  * @shareable_bits:	Bitmask of shareable resource with other
++  *			executing entities
++  * @arch_has_sparse_bitmaps:	True if a bitmap like f00f is valid.
++  * @arch_has_per_cpu_cfg:	True if QOS_CFG register for this cache
++  *				level has CPU scope.
++  */
++ struct resctrl_cache {
++ 	unsigned int	cbm_len;
++ 	unsigned int	min_cbm_bits;
++ 	unsigned int	shareable_bits;
++ 	bool		arch_has_sparse_bitmaps;
++ 	bool		arch_has_per_cpu_cfg;
++ };
++ 
++ /**
++  * enum membw_throttle_mode - System's memory bandwidth throttling mode
++  * @THREAD_THROTTLE_UNDEFINED:	Not relevant to the system
++  * @THREAD_THROTTLE_MAX:	Memory bandwidth is throttled at the core
++  *				always using smallest bandwidth percentage
++  *				assigned to threads, aka "max throttling"
++  * @THREAD_THROTTLE_PER_THREAD:	Memory bandwidth is throttled at the thread
++  */
++ enum membw_throttle_mode {
++ 	THREAD_THROTTLE_UNDEFINED = 0,
++ 	THREAD_THROTTLE_MAX,
++ 	THREAD_THROTTLE_PER_THREAD,
++ };
++ 
++ /**
++  * struct resctrl_membw - Memory bandwidth allocation related data
++  * @min_bw:		Minimum memory bandwidth percentage user can request
++  * @bw_gran:		Granularity at which the memory bandwidth is allocated
++  * @delay_linear:	True if memory B/W delay is in linear scale
++  * @arch_needs_linear:	True if we can't configure non-linear resources
++  * @throttle_mode:	Bandwidth throttling mode when threads request
++  *			different memory bandwidths
++  * @mba_sc:		True if MBA software controller(mba_sc) is enabled
++  * @mb_map:		Mapping of memory B/W percentage to memory B/W delay
++  */
++ struct resctrl_membw {
++ 	u32				min_bw;
++ 	u32				bw_gran;
++ 	u32				delay_linear;
++ 	bool				arch_needs_linear;
++ 	enum membw_throttle_mode	throttle_mode;
++ 	bool				mba_sc;
++ 	u32				*mb_map;
++ };
++ 
++ struct rdt_parse_data;
++ struct resctrl_schema;
++ 
++ /**
++  * struct rdt_resource - attributes of a resctrl resource
++  * @rid:		The index of the resource
++  * @alloc_capable:	Is allocation available on this machine
++  * @mon_capable:	Is monitor feature available on this machine
++  * @num_rmid:		Number of RMIDs available
++  * @cache_level:	Which cache level defines scope of this resource
++  * @cache:		Cache allocation related data
++  * @membw:		If the component has bandwidth controls, their properties.
++  * @domains:		All domains for this resource
++  * @name:		Name to use in "schemata" file.
++  * @data_width:		Character width of data when displaying
++  * @default_ctrl:	Specifies default cache cbm or memory B/W percent.
++  * @format_str:		Per resource format string to show domain value
++  * @parse_ctrlval:	Per resource function pointer to parse control values
++  * @evt_list:		List of monitoring events
++  * @fflags:		flags to choose base and info files
++  * @cdp_capable:	Is the CDP feature available on this resource
++  */
++ struct rdt_resource {
++ 	int			rid;
++ 	bool			alloc_capable;
++ 	bool			mon_capable;
++ 	int			num_rmid;
++ 	int			cache_level;
++ 	struct resctrl_cache	cache;
++ 	struct resctrl_membw	membw;
++ 	struct list_head	domains;
++ 	char			*name;
++ 	int			data_width;
++ 	u32			default_ctrl;
++ 	const char		*format_str;
++ 	int			(*parse_ctrlval)(struct rdt_parse_data *data,
++ 						 struct resctrl_schema *s,
++ 						 struct rdt_domain *d);
++ 	struct list_head	evt_list;
++ 	unsigned long		fflags;
++ 	bool			cdp_capable;
++ };
++ 
++ /**
++  * struct resctrl_schema - configuration abilities of a resource presented to
++  *			   user-space
++  * @list:	Member of resctrl_schema_all.
++  * @name:	The name to use in the "schemata" file.
++  * @conf_type:	Whether this schema is specific to code/data.
++  * @res:	The resource structure exported by the architecture to describe
++  *		the hardware that is configured by this schema.
++  * @num_closid:	The number of closid that can be used with this schema. When
++  *		features like CDP are enabled, this will be lower than the
++  *		hardware supports for the resource.
++  */
++ struct resctrl_schema {
++ 	struct list_head		list;
++ 	char				name[8];
++ 	enum resctrl_conf_type		conf_type;
++ 	struct rdt_resource		*res;
++ 	u32				num_closid;
++ };
++ 
++ /* The number of closid supported by this resource regardless of CDP */
++ u32 resctrl_arch_get_num_closid(struct rdt_resource *r);
++ int resctrl_arch_update_domains(struct rdt_resource *r, u32 closid);
++ 
++ /*
++  * Update the ctrl_val and apply this config right now.
++  * Must be called on one of the domain's CPUs.
++  */
++ int resctrl_arch_update_one(struct rdt_resource *r, struct rdt_domain *d,
++ 			    u32 closid, enum resctrl_conf_type t, u32 cfg_val);
++ 
++ u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_domain *d,
++ 			    u32 closid, enum resctrl_conf_type type);
++ int resctrl_online_domain(struct rdt_resource *r, struct rdt_domain *d);
++ void resctrl_offline_domain(struct rdt_resource *r, struct rdt_domain *d);
++ 
++ /**
++  * resctrl_arch_rmid_read() - Read the eventid counter corresponding to rmid
++  *			      for this resource and domain.
++  * @r:			resource that the counter should be read from.
++  * @d:			domain that the counter should be read from.
++  * @rmid:		rmid of the counter to read.
++  * @eventid:		eventid to read, e.g. L3 occupancy.
++  * @val:		result of the counter read in bytes.
++  *
++  * Call from process context on a CPU that belongs to domain @d.
++  *
++  * Return:
++  * 0 on success, or -EIO, -EINVAL etc on error.
++  */
++ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain *d,
++ 			   u32 rmid, enum resctrl_event_id eventid, u64 *val);
++ 
++ /**
++  * resctrl_arch_reset_rmid() - Reset any private state associated with rmid
++  *			       and eventid.
++  * @r:		The domain's resource.
++  * @d:		The rmid's domain.
++  * @rmid:	The rmid whose counter values should be reset.
++  * @eventid:	The eventid whose counter values should be reset.
++  *
++  * This can be called from any CPU.
++  */
++ void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_domain *d,
++ 			     u32 rmid, enum resctrl_event_id eventid);
++ 
++ /**
++  * resctrl_arch_reset_rmid_all() - Reset all private state associated with
++  *				   all rmids and eventids.
++  * @r:		The resctrl resource.
++  * @d:		The domain for which all architectural counter state will
++  *		be cleared.
++  *
++  * This can be called from any CPU.
++  */
++ void resctrl_arch_reset_rmid_all(struct rdt_resource *r, struct rdt_domain *d);
++ 
++ extern unsigned int resctrl_rmid_realloc_threshold;
++ extern unsigned int resctrl_rmid_realloc_limit;
++ 
+++>>>>>>> 92bd5a139033 (x86/resctrl: Add interface to write mbm_total_bytes_config)
+  #endif /* _RESCTRL_H */
+* Unmerged path arch/x86/kernel/cpu/resctrl/monitor.c
+* Unmerged path arch/x86/kernel/cpu/resctrl/rdtgroup.c
+* Unmerged path include/linux/resctrl.h
