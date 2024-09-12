@@ -1,0 +1,195 @@
+arm64: entry: convert SError handlers to C
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit bb8e93a287a5f5f10fe7a9d8f612f6105c9622ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/bb8e93a2.failed
+
+For various reasons we'd like to convert the bulk of arm64's exception
+triage logic to C. As a step towards that, this patch converts the EL1
+and EL0 SError triage logic to C.
+
+Separate C functions are added for the native and compat cases so that
+in subsequent patches we can handle native/compat differences in C.
+
+There should be no functional change as a result of this patch.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+	Acked-by: Marc Zyngier <maz@kernel.org>
+	Reviewed-by: Joey Gouly <joey.gouly@arm.com>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20210607094624.34689-4-mark.rutland@arm.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit bb8e93a287a5f5f10fe7a9d8f612f6105c9622ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/entry-common.c
+#	arch/arm64/kernel/entry.S
+#	arch/arm64/kernel/traps.c
+diff --cc arch/arm64/kernel/entry-common.c
+index c764ba2d11d7,3b7943721077..000000000000
+--- a/arch/arm64/kernel/entry-common.c
++++ b/arch/arm64/kernel/entry-common.c
+@@@ -178,6 -279,34 +178,37 @@@ asmlinkage void noinstr el1_sync_handle
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ asmlinkage void noinstr el1_error_handler(struct pt_regs *regs)
++ {
++ 	unsigned long esr = read_sysreg(esr_el1);
++ 
++ 	local_daif_restore(DAIF_ERRCTX);
++ 	arm64_enter_nmi(regs);
++ 	do_serror(regs, esr);
++ 	arm64_exit_nmi(regs);
++ }
++ 
++ asmlinkage void noinstr enter_from_user_mode(void)
++ {
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	CT_WARN_ON(ct_state() != CONTEXT_USER);
++ 	user_exit_irqoff();
++ 	trace_hardirqs_off_finish();
++ }
++ 
++ asmlinkage void noinstr exit_to_user_mode(void)
++ {
++ 	mte_check_tfsr_exit();
++ 
++ 	trace_hardirqs_on_prepare();
++ 	lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++ 	user_enter_irqoff();
++ 	lockdep_hardirqs_on(CALLER_ADDR0);
++ }
++ 
+++>>>>>>> bb8e93a287a5 (arm64: entry: convert SError handlers to C)
+  static void noinstr el0_da(struct pt_regs *regs, unsigned long esr)
+  {
+  	unsigned long far = read_sysreg(far_el1);
+diff --cc arch/arm64/kernel/entry.S
+index ba52009f8045,656f3129bfef..000000000000
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@@ -687,25 -780,15 +689,33 @@@ SYM_CODE_END(el0_fiq
+  
+  SYM_CODE_START_LOCAL(el1_error)
+  	kernel_entry 1
+++<<<<<<< HEAD
+ +	mrs	x1, esr_el1
+ +	gic_prio_kentry_setup tmp=x2
+ +	enable_dbg
+++=======
+++>>>>>>> bb8e93a287a5 (arm64: entry: convert SError handlers to C)
+  	mov	x0, sp
+- 	bl	do_serror
++ 	bl	el1_error_handler
+  	kernel_exit 1
+  SYM_CODE_END(el1_error)
+  
+  SYM_CODE_START_LOCAL(el0_error)
+  	kernel_entry 0
+++<<<<<<< HEAD
+ +el0_error_naked:
+ +	mrs	x25, esr_el1
+ +	gic_prio_kentry_setup tmp=x2
+ +	ct_user_exit_irqoff
+ +	enable_dbg
+ +	mov	x0, sp
+ +	mov	x1, x25
+ +	bl	do_serror
+ +	enable_da_f
+++=======
++ 	mov	x0, sp
++ 	bl	el0_error_handler
+++>>>>>>> bb8e93a287a5 (arm64: entry: convert SError handlers to C)
+  	b	ret_to_user
+  SYM_CODE_END(el0_error)
+  
+diff --cc arch/arm64/kernel/traps.c
+index af27331eeca1,5fd12d19ef4b..000000000000
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@@ -936,42 -869,11 +936,50 @@@ bool arm64_is_fatal_ras_serror(struct p
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +asmlinkage void do_serror(struct pt_regs *regs, unsigned int esr)
+ +{
+ +	nmi_enter();
+ +
+ +	/* non-RAS errors are not containable */
+ +	if (!arm64_is_ras_serror(esr) || arm64_is_fatal_ras_serror(regs, esr))
+ +		arm64_serror_panic(regs, esr);
+ +
+ +	nmi_exit();
+ +}
+ +
+ +asmlinkage void enter_from_user_mode(void)
+ +{
+ +	CT_WARN_ON(ct_state() != CONTEXT_USER);
+ +	user_exit_irqoff();
+ +}
+ +NOKPROBE_SYMBOL(enter_from_user_mode);
+ +
+ +void __pte_error(const char *file, int line, unsigned long val)
+ +{
+ +	pr_err("%s:%d: bad pte %016lx.\n", file, line, val);
+ +}
+ +
+ +void __pmd_error(const char *file, int line, unsigned long val)
+ +{
+ +	pr_err("%s:%d: bad pmd %016lx.\n", file, line, val);
+ +}
+ +
+ +void __pud_error(const char *file, int line, unsigned long val)
+ +{
+ +	pr_err("%s:%d: bad pud %016lx.\n", file, line, val);
+ +}
+ +
+ +void __pgd_error(const char *file, int line, unsigned long val)
+ +{
+ +	pr_err("%s:%d: bad pgd %016lx.\n", file, line, val);
+++=======
++ void do_serror(struct pt_regs *regs, unsigned int esr)
++ {
++ 	/* non-RAS errors are not containable */
++ 	if (!arm64_is_ras_serror(esr) || arm64_is_fatal_ras_serror(regs, esr))
++ 		arm64_serror_panic(regs, esr);
+++>>>>>>> bb8e93a287a5 (arm64: entry: convert SError handlers to C)
+  }
+  
+  /* GENERIC_BUG traps */
+diff --git a/arch/arm64/include/asm/exception.h b/arch/arm64/include/asm/exception.h
+index 2868b53551a4..ef1a1a87279f 100644
+--- a/arch/arm64/include/asm/exception.h
++++ b/arch/arm64/include/asm/exception.h
+@@ -43,8 +43,11 @@ static inline u32 disr_to_esr(u64 disr)
+ }
+ 
+ asmlinkage void el1_sync_handler(struct pt_regs *regs);
++asmlinkage void el1_error_handler(struct pt_regs *regs);
+ asmlinkage void el0_sync_handler(struct pt_regs *regs);
++asmlinkage void el0_error_handler(struct pt_regs *regs);
+ asmlinkage void el0_sync_compat_handler(struct pt_regs *regs);
++asmlinkage void el0_error_compat_handler(struct pt_regs *regs);
+ 
+ asmlinkage void noinstr enter_el1_irq_or_nmi(struct pt_regs *regs);
+ asmlinkage void noinstr exit_el1_irq_or_nmi(struct pt_regs *regs);
+@@ -65,4 +68,5 @@ void do_cp15instr(unsigned int esr, struct pt_regs *regs);
+ void do_el0_svc(struct pt_regs *regs);
+ void do_el0_svc_compat(struct pt_regs *regs);
+ void do_ptrauth_fault(struct pt_regs *regs, unsigned int esr);
++void do_serror(struct pt_regs *regs, unsigned int esr);
+ #endif	/* __ASM_EXCEPTION_H */
+* Unmerged path arch/arm64/kernel/entry-common.c
+* Unmerged path arch/arm64/kernel/entry.S
+* Unmerged path arch/arm64/kernel/traps.c
