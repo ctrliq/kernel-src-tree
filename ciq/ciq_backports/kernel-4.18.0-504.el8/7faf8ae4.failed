@@ -1,0 +1,143 @@
+media: uvcvideo: Fix handling on Bitmask controls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-504.el8
+commit-author Ricardo Ribalda <ribalda@chromium.org>
+commit 7faf8ae4277156da32eada72c07f5edeb82cd9e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-504.el8/7faf8ae4.failed
+
+Minimum and step values for V4L2_CTRL_TYPE_BITMASK controls should be 0.
+There is no need to query the camera firmware about this and maybe get
+invalid results.
+
+Also value should be masked to the max value advertised by the
+hardware.
+
+Finally, handle UVC 1.5 mask controls that use MAX instead of RES to
+describe the valid bits.
+
+Fixes v4l2-compliane:
+Control ioctls (Input 0):
+                fail: v4l2-test-controls.cpp(97): minimum must be 0 for a bitmask control
+	test VIDIOC_QUERY_EXT_CTRL/QUERYMENU: FAIL
+
+	Signed-off-by: Ricardo Ribalda <ribalda@chromium.org>
+	Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+	Signed-off-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+(cherry picked from commit 7faf8ae4277156da32eada72c07f5edeb82cd9e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/media/usb/uvc/uvc_ctrl.c
+diff --cc drivers/media/usb/uvc/uvc_ctrl.c
+index 0b5a224748c7,65d41946ef1a..000000000000
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@@ -1114,6 -1085,101 +1114,104 @@@ static int uvc_query_v4l2_class(struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Check if control @v4l2_id can be accessed by the given control @ioctl
++  * (VIDIOC_G_EXT_CTRLS, VIDIOC_TRY_EXT_CTRLS or VIDIOC_S_EXT_CTRLS).
++  *
++  * For set operations on slave controls, check if the master's value is set to
++  * manual, either in the others controls set in the same ioctl call, or from
++  * the master's current value. This catches VIDIOC_S_EXT_CTRLS calls that set
++  * both the master and slave control, such as for instance setting
++  * auto_exposure=1, exposure_time_absolute=251.
++  */
++ int uvc_ctrl_is_accessible(struct uvc_video_chain *chain, u32 v4l2_id,
++ 			   const struct v4l2_ext_controls *ctrls,
++ 			   unsigned long ioctl)
++ {
++ 	struct uvc_control_mapping *master_map = NULL;
++ 	struct uvc_control *master_ctrl = NULL;
++ 	struct uvc_control_mapping *mapping;
++ 	struct uvc_control *ctrl;
++ 	bool read = ioctl == VIDIOC_G_EXT_CTRLS;
++ 	s32 val;
++ 	int ret;
++ 	int i;
++ 
++ 	if (__uvc_query_v4l2_class(chain, v4l2_id, 0) >= 0)
++ 		return -EACCES;
++ 
++ 	ctrl = uvc_find_control(chain, v4l2_id, &mapping);
++ 	if (!ctrl)
++ 		return -EINVAL;
++ 
++ 	if (!(ctrl->info.flags & UVC_CTRL_FLAG_GET_CUR) && read)
++ 		return -EACCES;
++ 
++ 	if (!(ctrl->info.flags & UVC_CTRL_FLAG_SET_CUR) && !read)
++ 		return -EACCES;
++ 
++ 	if (ioctl != VIDIOC_S_EXT_CTRLS || !mapping->master_id)
++ 		return 0;
++ 
++ 	/*
++ 	 * Iterate backwards in cases where the master control is accessed
++ 	 * multiple times in the same ioctl. We want the last value.
++ 	 */
++ 	for (i = ctrls->count - 1; i >= 0; i--) {
++ 		if (ctrls->controls[i].id == mapping->master_id)
++ 			return ctrls->controls[i].value ==
++ 					mapping->master_manual ? 0 : -EACCES;
++ 	}
++ 
++ 	__uvc_find_control(ctrl->entity, mapping->master_id, &master_map,
++ 			   &master_ctrl, 0);
++ 
++ 	if (!master_ctrl || !(master_ctrl->info.flags & UVC_CTRL_FLAG_GET_CUR))
++ 		return 0;
++ 
++ 	ret = __uvc_ctrl_get(chain, master_ctrl, master_map, &val);
++ 	if (ret >= 0 && val != mapping->master_manual)
++ 		return -EACCES;
++ 
++ 	return 0;
++ }
++ 
++ static const char *uvc_map_get_name(const struct uvc_control_mapping *map)
++ {
++ 	const char *name;
++ 
++ 	if (map->name)
++ 		return map->name;
++ 
++ 	name = v4l2_ctrl_get_name(map->id);
++ 	if (name)
++ 		return name;
++ 
++ 	return "Unknown Control";
++ }
++ 
++ static u32 uvc_get_ctrl_bitmap(struct uvc_control *ctrl,
++ 			       struct uvc_control_mapping *mapping)
++ {
++ 	/*
++ 	 * Some controls, like CT_AE_MODE_CONTROL, use GET_RES to represent
++ 	 * the number of bits supported. Those controls do not list GET_MAX
++ 	 * as supported.
++ 	 */
++ 	if (ctrl->info.flags & UVC_CTRL_FLAG_GET_RES)
++ 		return mapping->get(mapping, UVC_GET_RES,
++ 				    uvc_ctrl_data(ctrl, UVC_CTRL_DATA_RES));
++ 
++ 	if (ctrl->info.flags & UVC_CTRL_FLAG_GET_MAX)
++ 		return mapping->get(mapping, UVC_GET_MAX,
++ 				    uvc_ctrl_data(ctrl, UVC_CTRL_DATA_MAX));
++ 
++ 	return ~0;
++ }
++ 
+++>>>>>>> 7faf8ae42771 (media: uvcvideo: Fix handling on Bitmask controls)
+  static int __uvc_query_v4l2_ctrl(struct uvc_video_chain *chain,
+  	struct uvc_control *ctrl,
+  	struct uvc_control_mapping *mapping,
+* Unmerged path drivers/media/usb/uvc/uvc_ctrl.c
