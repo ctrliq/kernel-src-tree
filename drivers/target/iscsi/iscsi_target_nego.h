@@ -4,6 +4,7 @@
 
 #define DECIMAL         0
 #define HEX             1
+#define BASE64          2
 
 struct iscsi_conn;
 struct iscsi_login;
