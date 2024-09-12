@@ -1,0 +1,198 @@
+powerpc: Ignore DSI error caused by the copy/paste instruction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Haren Myneni <haren@linux.ibm.com>
+commit 335e1a91042764629fbbcd8c7e40379fa3762d35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/335e1a91.failed
+
+The data storage interrupt (DSI) error will be generated when the
+paste operation is issued on the suspended Nest Accelerator (NX)
+window due to NX state changes. The hypervisor expects the
+partition to ignore this error during page fault handling.
+To differentiate DSI caused by an actual HW configuration or by
+the NX window, a new “ibm,pi-features” type value is defined.
+Byte 0, bit 3 of pi-attribute-specifier-type is now defined to
+indicate this DSI error. If this error is not ignored, the user
+space can get SIGBUS when the NX request is issued.
+
+This patch adds changes to read ibm,pi-features property and ignore
+DSI error during page fault handling if MMU_FTR_NX_DSI is defined.
+
+	Signed-off-by: Haren Myneni <haren@linux.ibm.com>
+[mpe: Mention PAPR version in comment]
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/b9cd844b85eb8f70459109ce1b14e44c4cc85fa7.camel@linux.ibm.com
+(cherry picked from commit 335e1a91042764629fbbcd8c7e40379fa3762d35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/mmu.h
+diff --cc arch/powerpc/include/asm/mmu.h
+index 1702d81e3a33,94b981152667..000000000000
+--- a/arch/powerpc/include/asm/mmu.h
++++ b/arch/powerpc/include/asm/mmu.h
+@@@ -111,9 -120,11 +111,12 @@@
+   */
+  #define MMU_FTR_1T_SEGMENT		ASM_CONST(0x40000000)
+  
++ // NX paste RMA reject in DSI
++ #define MMU_FTR_NX_DSI			ASM_CONST(0x80000000)
++ 
+  /* MMU feature bit sets for various CPUs */
+ -#define MMU_FTRS_DEFAULT_HPTE_ARCH_V2	(MMU_FTR_HPTE_TABLE | MMU_FTR_TLBIEL | MMU_FTR_16M_PAGE)
+ +#define MMU_FTRS_DEFAULT_HPTE_ARCH_V2	\
+ +	MMU_FTR_HPTE_TABLE | MMU_FTR_PPCAS_ARCH_V2
+  #define MMU_FTRS_POWER		MMU_FTRS_DEFAULT_HPTE_ARCH_V2
+  #define MMU_FTRS_PPC970		MMU_FTRS_POWER | MMU_FTR_TLBIE_CROP_VA
+  #define MMU_FTRS_POWER5		MMU_FTRS_POWER | MMU_FTR_LOCKLESS_TLBIE
+@@@ -145,11 -180,23 +148,16 @@@ enum 
+  		MMU_FTR_NO_SLBIE_B | MMU_FTR_16M_PAGE | MMU_FTR_TLBIEL |
+  		MMU_FTR_LOCKLESS_TLBIE | MMU_FTR_CI_LARGE_PAGE |
+  		MMU_FTR_1T_SEGMENT | MMU_FTR_TLBIE_CROP_VA |
+ -		MMU_FTR_68_BIT_VA | MMU_FTR_HPTE_TABLE |
+ -#endif
+ +		MMU_FTR_KERNEL_RO | MMU_FTR_68_BIT_VA |
+  #ifdef CONFIG_PPC_RADIX_MMU
+  		MMU_FTR_TYPE_RADIX |
+++<<<<<<< HEAD
+ +		MMU_FTR_GTSE |
+++=======
++ 		MMU_FTR_GTSE | MMU_FTR_NX_DSI |
++ #endif /* CONFIG_PPC_RADIX_MMU */
+++>>>>>>> 335e1a910427 (powerpc: Ignore DSI error caused by the copy/paste instruction)
+  #endif
+ -#ifdef CONFIG_PPC_KUAP
+ -	MMU_FTR_BOOK3S_KUAP |
+ -#endif /* CONFIG_PPC_KUAP */
+ -#ifdef CONFIG_PPC_MEM_KEYS
+ -	MMU_FTR_PKEY |
+ -#endif
+ -#ifdef CONFIG_PPC_KUEP
+ -	MMU_FTR_BOOK3S_KUEP |
+ -#endif /* CONFIG_PPC_KUAP */
+ -
+  		0,
+  };
+  
+* Unmerged path arch/powerpc/include/asm/mmu.h
+diff --git a/arch/powerpc/kernel/prom.c b/arch/powerpc/kernel/prom.c
+index edfd8c3ba085..6d1e9b4720b8 100644
+--- a/arch/powerpc/kernel/prom.c
++++ b/arch/powerpc/kernel/prom.c
+@@ -140,7 +140,7 @@ static void __init move_device_tree(void)
+ }
+ 
+ /*
+- * ibm,pa-features is a per-cpu property that contains a string of
++ * ibm,pa/pi-features is a per-cpu property that contains a string of
+  * attribute descriptors, each of which has a 2 byte header plus up
+  * to 254 bytes worth of processor attribute bits.  First header
+  * byte specifies the number of bytes following the header.
+@@ -152,15 +152,17 @@ static void __init move_device_tree(void)
+  * is supported/not supported.  Note that the bit numbers are
+  * big-endian to match the definition in PAPR.
+  */
+-static struct ibm_pa_feature {
++struct ibm_feature {
+ 	unsigned long	cpu_features;	/* CPU_FTR_xxx bit */
+ 	unsigned long	mmu_features;	/* MMU_FTR_xxx bit */
+ 	unsigned int	cpu_user_ftrs;	/* PPC_FEATURE_xxx bit */
+ 	unsigned int	cpu_user_ftrs2;	/* PPC_FEATURE2_xxx bit */
+-	unsigned char	pabyte;		/* byte number in ibm,pa-features */
++	unsigned char	pabyte;		/* byte number in ibm,pa/pi-features */
+ 	unsigned char	pabit;		/* bit number (big-endian) */
+ 	unsigned char	invert;		/* if 1, pa bit set => clear feature */
+-} ibm_pa_features[] __initdata = {
++};
++
++static struct ibm_feature ibm_pa_features[] __initdata = {
+ 	{ .pabyte = 0,  .pabit = 0, .cpu_user_ftrs = PPC_FEATURE_HAS_MMU },
+ 	{ .pabyte = 0,  .pabit = 1, .cpu_user_ftrs = PPC_FEATURE_HAS_FPU },
+ 	{ .pabyte = 0,  .pabit = 3, .cpu_features  = CPU_FTR_CTRL },
+@@ -183,9 +185,19 @@ static struct ibm_pa_feature {
+ 	{ .pabyte = 64, .pabit = 0, .cpu_features = CPU_FTR_DAWR1 },
+ };
+ 
++/*
++ * ibm,pi-features property provides the support of processor specific
++ * options not described in ibm,pa-features. Right now use byte 0, bit 3
++ * which indicates the occurrence of DSI interrupt when the paste operation
++ * on the suspended NX window.
++ */
++static struct ibm_feature ibm_pi_features[] __initdata = {
++	{ .pabyte = 0, .pabit = 3, .mmu_features  = MMU_FTR_NX_DSI },
++};
++
+ static void __init scan_features(unsigned long node, const unsigned char *ftrs,
+ 				 unsigned long tablelen,
+-				 struct ibm_pa_feature *fp,
++				 struct ibm_feature *fp,
+ 				 unsigned long ft_size)
+ {
+ 	unsigned long i, len, bit;
+@@ -222,17 +234,18 @@ static void __init scan_features(unsigned long node, const unsigned char *ftrs,
+ 	}
+ }
+ 
+-static void __init check_cpu_pa_features(unsigned long node)
++static void __init check_cpu_features(unsigned long node, char *name,
++				      struct ibm_feature *fp,
++				      unsigned long size)
+ {
+ 	const unsigned char *pa_ftrs;
+ 	int tablelen;
+ 
+-	pa_ftrs = of_get_flat_dt_prop(node, "ibm,pa-features", &tablelen);
++	pa_ftrs = of_get_flat_dt_prop(node, name, &tablelen);
+ 	if (pa_ftrs == NULL)
+ 		return;
+ 
+-	scan_features(node, pa_ftrs, tablelen,
+-		      ibm_pa_features, ARRAY_SIZE(ibm_pa_features));
++	scan_features(node, pa_ftrs, tablelen, fp, size);
+ }
+ 
+ #ifdef CONFIG_PPC_BOOK3S_64
+@@ -384,7 +397,10 @@ static int __init early_init_dt_scan_cpus(unsigned long node,
+ 			identify_cpu(0, be32_to_cpup(prop));
+ 
+ 		check_cpu_feature_properties(node);
+-		check_cpu_pa_features(node);
++		check_cpu_features(node, "ibm,pa-features", ibm_pa_features,
++				   ARRAY_SIZE(ibm_pa_features));
++		check_cpu_features(node, "ibm,pi-features", ibm_pi_features,
++				   ARRAY_SIZE(ibm_pi_features));
+ 	}
+ 
+ 	identical_pvr_fixup(node);
+diff --git a/arch/powerpc/mm/fault.c b/arch/powerpc/mm/fault.c
+index 8dce601f125c..af2ac790c9ca 100644
+--- a/arch/powerpc/mm/fault.c
++++ b/arch/powerpc/mm/fault.c
+@@ -448,7 +448,22 @@ static void sanity_check_fault(bool is_write, bool is_user,
+ #if defined(CONFIG_PPC_8xx)
+ #define page_fault_is_bad(__err)	((__err) & DSISR_NOEXEC_OR_G)
+ #elif defined(CONFIG_PPC64)
+-#define page_fault_is_bad(__err)	((__err) & DSISR_BAD_FAULT_64S)
++static int page_fault_is_bad(unsigned long err)
++{
++	unsigned long flag = DSISR_BAD_FAULT_64S;
++
++	/*
++	 * PAPR+ v2.11 § 14.15.3.4.1 (unreleased)
++	 * If byte 0, bit 3 of pi-attribute-specifier-type in
++	 * ibm,pi-features property is defined, ignore the DSI error
++	 * which is caused by the paste instruction on the
++	 * suspended NX window.
++	 */
++	if (mmu_has_feature(MMU_FTR_NX_DSI))
++		flag &= ~DSISR_BAD_COPYPASTE;
++
++	return err & flag;
++}
+ #else
+ #define page_fault_is_bad(__err)	((__err) & DSISR_BAD_FAULT_32S)
+ #endif
