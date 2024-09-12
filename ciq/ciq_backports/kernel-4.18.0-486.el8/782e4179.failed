@@ -1,0 +1,116 @@
+mm/kmemleak: fix UAF bug in kmemleak_scan()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-486.el8
+commit-author Waiman Long <longman@redhat.com>
+commit 782e4179535971c3574c367bfaaefea8970b3e0b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-486.el8/782e4179.failed
+
+Commit 6edda04ccc7c ("mm/kmemleak: prevent soft lockup in first object
+iteration loop of kmemleak_scan()") fixes soft lockup problem in
+kmemleak_scan() by periodically doing a cond_resched().  It does take a
+reference of the current object before doing it.  Unfortunately, if the
+object has been deleted from the object_list, the next object pointed to
+by its next pointer may no longer be valid after coming back from
+cond_resched().  This can result in use-after-free and other nasty
+problem.
+
+Fix this problem by adding a del_state flag into kmemleak_object structure
+to synchronize the object deletion process between kmemleak_cond_resched()
+and __remove_object() to make sure that the object remained in the
+object_list in the duration of the cond_resched() call.
+
+Link: https://lkml.kernel.org/r/20230119040111.350923-3-longman@redhat.com
+Fixes: 6edda04ccc7c ("mm/kmemleak: prevent soft lockup in first object iteration loop of kmemleak_scan()")
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Muchun Song <songmuchun@bytedance.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 782e4179535971c3574c367bfaaefea8970b3e0b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kmemleak.c
+diff --cc mm/kmemleak.c
+index 030b8ad41a4a,d9b242cfdb1c..000000000000
+--- a/mm/kmemleak.c
++++ b/mm/kmemleak.c
+@@@ -26,15 -13,18 +26,30 @@@
+   *
+   * The following locks and mutexes are used by kmemleak:
+   *
+++<<<<<<< HEAD
+ + * - kmemleak_lock (raw_spinlock_t): protects the object_list modifications and
+ + *   accesses to the object_tree_root. The object_list is the main list
+ + *   holding the metadata (struct kmemleak_object) for the allocated memory
+ + *   blocks. The object_tree_root is a red black tree used to look-up
+ + *   metadata based on a pointer to the corresponding memory block.  The
+ + *   kmemleak_object structures are added to the object_list and
+ + *   object_tree_root in the create_object() function called from the
+ + *   kmemleak_alloc() callback and removed in delete_object() called from the
+ + *   kmemleak_free() callback
+++=======
++  * - kmemleak_lock (raw_spinlock_t): protects the object_list as well as
++  *   del_state modifications and accesses to the object_tree_root (or
++  *   object_phys_tree_root). The object_list is the main list holding the
++  *   metadata (struct kmemleak_object) for the allocated memory blocks.
++  *   The object_tree_root and object_phys_tree_root are red
++  *   black trees used to look-up metadata based on a pointer to the
++  *   corresponding memory block. The object_phys_tree_root is for objects
++  *   allocated with physical address. The kmemleak_object structures are
++  *   added to the object_list and object_tree_root (or object_phys_tree_root)
++  *   in the create_object() function called from the kmemleak_alloc() (or
++  *   kmemleak_alloc_phys()) callback and removed in delete_object() called from
++  *   the kmemleak_free() callback
+++>>>>>>> 782e41795359 (mm/kmemleak: fix UAF bug in kmemleak_scan())
+   * - kmemleak_object.lock (raw_spinlock_t): protects a kmemleak_object.
+   *   Accesses to the metadata (e.g. count) are protected by this lock. Note
+   *   that some members of this structure may be protected by other means
+@@@ -185,7 -176,14 +201,12 @@@ struct kmemleak_object 
+  #define OBJECT_NO_SCAN		(1 << 2)
+  /* flag set to fully scan the object when scan_area allocation failed */
+  #define OBJECT_FULL_SCAN	(1 << 3)
+ -/* flag set for object allocated with physical address */
+ -#define OBJECT_PHYS		(1 << 4)
+  
++ /* set when __remove_object() called */
++ #define DELSTATE_REMOVED	(1 << 0)
++ /* set to temporarily prevent deletion from object_list */
++ #define DELSTATE_NO_DELETE	(1 << 1)
++ 
+  #define HEX_PREFIX		"    "
+  /* number of bytes to print per line; must be 16 or 32 */
+  #define HEX_ROW_SIZE		16
+@@@ -547,8 -575,12 +568,17 @@@ static struct kmemleak_object *find_and
+   */
+  static void __remove_object(struct kmemleak_object *object)
+  {
+++<<<<<<< HEAD
+ +	rb_erase(&object->rb_node, &object_tree_root);
+ +	list_del_rcu(&object->object_list);
+++=======
++ 	rb_erase(&object->rb_node, object->flags & OBJECT_PHYS ?
++ 				   &object_phys_tree_root :
++ 				   &object_tree_root);
++ 	if (!(object->del_state & DELSTATE_NO_DELETE))
++ 		list_del_rcu(&object->object_list);
++ 	object->del_state |= DELSTATE_REMOVED;
+++>>>>>>> 782e41795359 (mm/kmemleak: fix UAF bug in kmemleak_scan())
+  }
+  
+  /*
+@@@ -610,9 -652,10 +640,10 @@@ static struct kmemleak_object *create_o
+  	object->count = 0;			/* white color initially */
+  	object->jiffies = jiffies;
+  	object->checksum = 0;
++ 	object->del_state = 0;
+  
+  	/* task information */
+ -	if (in_hardirq()) {
+ +	if (in_irq()) {
+  		object->pid = 0;
+  		strncpy(object->comm, "hardirq", sizeof(object->comm));
+  	} else if (in_serving_softirq()) {
+* Unmerged path mm/kmemleak.c
