@@ -1,0 +1,211 @@
+KVM: x86/speculation: Disable Fill buffer clear within guests
+
+jira LE-1907
+cve CVE-2022-21166
+cve CVE-2022-21125
+cve CVE-2022-21123
+Rebuild_History Non-Buildable kernel-4.18.0-372.26.1.el8_6
+commit-author Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+commit 027bbb884be006b05d9c577d6401686053aa789e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.26.1.el8_6/027bbb88.failed
+
+The enumeration of MD_CLEAR in CPUID(EAX=7,ECX=0).EDX{bit 10} is not an
+accurate indicator on all CPUs of whether the VERW instruction will
+overwrite fill buffers. FB_CLEAR enumeration in
+IA32_ARCH_CAPABILITIES{bit 17} covers the case of CPUs that are not
+vulnerable to MDS/TAA, indicating that microcode does overwrite fill
+buffers.
+
+Guests running in VMM environments may not be aware of all the
+capabilities/vulnerabilities of the host CPU. Specifically, a guest may
+apply MDS/TAA mitigations when a virtual CPU is enumerated as vulnerable
+to MDS/TAA even when the physical CPU is not. On CPUs that enumerate
+FB_CLEAR_CTRL the VMM may set FB_CLEAR_DIS to skip overwriting of fill
+buffers by the VERW instruction. This is done by setting FB_CLEAR_DIS
+during VMENTER and resetting on VMEXIT. For guests that enumerate
+FB_CLEAR (explicitly asking for fill buffer clear capability) the VMM
+will not use FB_CLEAR_DIS.
+
+Irrespective of guest state, host overwrites CPU buffers before VMENTER
+to protect itself from an MMIO capable guest, as part of mitigation for
+MMIO Stale Data vulnerabilities.
+
+	Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit 027bbb884be006b05d9c577d6401686053aa789e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/msr-index.h
+#	arch/x86/kvm/vmx/vmx.c
+#	tools/arch/x86/include/asm/msr-index.h
+diff --cc arch/x86/include/asm/msr-index.h
+index b2d79100948a,4425d6773183..000000000000
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@@ -114,6 -114,30 +114,33 @@@
+  						 * Not susceptible to
+  						 * TSX Async Abort (TAA) vulnerabilities.
+  						 */
+++<<<<<<< HEAD
+++=======
++ #define ARCH_CAP_SBDR_SSDP_NO		BIT(13)	/*
++ 						 * Not susceptible to SBDR and SSDP
++ 						 * variants of Processor MMIO stale data
++ 						 * vulnerabilities.
++ 						 */
++ #define ARCH_CAP_FBSDP_NO		BIT(14)	/*
++ 						 * Not susceptible to FBSDP variant of
++ 						 * Processor MMIO stale data
++ 						 * vulnerabilities.
++ 						 */
++ #define ARCH_CAP_PSDP_NO		BIT(15)	/*
++ 						 * Not susceptible to PSDP variant of
++ 						 * Processor MMIO stale data
++ 						 * vulnerabilities.
++ 						 */
++ #define ARCH_CAP_FB_CLEAR		BIT(17)	/*
++ 						 * VERW clears CPU fill buffer
++ 						 * even on MDS_NO CPUs.
++ 						 */
++ #define ARCH_CAP_FB_CLEAR_CTRL		BIT(18)	/*
++ 						 * MSR_IA32_MCU_OPT_CTRL[FB_CLEAR_DIS]
++ 						 * bit available to control VERW
++ 						 * behavior.
++ 						 */
+++>>>>>>> 027bbb884be0 (KVM: x86/speculation: Disable Fill buffer clear within guests)
+  
+  #define MSR_IA32_FLUSH_CMD		0x0000010b
+  #define L1D_FLUSH			BIT(0)	/*
+@@@ -128,9 -152,10 +155,15 @@@
+  #define TSX_CTRL_RTM_DISABLE		BIT(0)	/* Disable RTM feature */
+  #define TSX_CTRL_CPUID_CLEAR		BIT(1)	/* Disable TSX enumeration */
+  
+ +/* SRBDS support */
+  #define MSR_IA32_MCU_OPT_CTRL		0x00000123
+++<<<<<<< HEAD
+ +#define RNGDS_MITG_DIS			BIT(0)
+++=======
++ #define RNGDS_MITG_DIS			BIT(0)	/* SRBDS support */
++ #define RTM_ALLOW			BIT(1)	/* TSX development mode */
++ #define FB_CLEAR_DIS			BIT(3)	/* CPU Fill buffer clear disable */
+++>>>>>>> 027bbb884be0 (KVM: x86/speculation: Disable Fill buffer clear within guests)
+  
+  #define MSR_IA32_SYSENTER_CS		0x00000174
+  #define MSR_IA32_SYSENTER_ESP		0x00000175
+diff --cc arch/x86/kvm/vmx/vmx.c
+index f2ea88608626,6e8fb36bc49a..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -6601,7 -6836,12 +6664,9 @@@ static noinstr void vmx_vcpu_enter_exit
+  		vmx_l1d_flush(vcpu);
+  	else if (static_branch_unlikely(&mds_user_clear))
+  		mds_clear_cpu_buffers();
+ -	else if (static_branch_unlikely(&mmio_stale_data_clear) &&
+ -		 kvm_arch_has_assigned_device(vcpu->kvm))
+ -		mds_clear_cpu_buffers();
+  
++ 	vmx_disable_fb_clear(vmx);
++ 
+  	if (vcpu->arch.cr2 != native_read_cr2())
+  		native_write_cr2(vcpu->arch.cr2);
+  
+@@@ -6610,7 -6850,9 +6675,13 @@@
+  
+  	vcpu->arch.cr2 = native_read_cr2();
+  
+++<<<<<<< HEAD
+ +	kvm_guest_exit_irqoff();
+++=======
++ 	vmx_enable_fb_clear(vmx);
++ 
++ 	guest_state_exit_irqoff();
+++>>>>>>> 027bbb884be0 (KVM: x86/speculation: Disable Fill buffer clear within guests)
+  }
+  
+  static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
+diff --cc tools/arch/x86/include/asm/msr-index.h
+index 6a454a4fbca3,4425d6773183..000000000000
+--- a/tools/arch/x86/include/asm/msr-index.h
++++ b/tools/arch/x86/include/asm/msr-index.h
+@@@ -114,6 -114,30 +114,33 @@@
+  						 * Not susceptible to
+  						 * TSX Async Abort (TAA) vulnerabilities.
+  						 */
+++<<<<<<< HEAD
+++=======
++ #define ARCH_CAP_SBDR_SSDP_NO		BIT(13)	/*
++ 						 * Not susceptible to SBDR and SSDP
++ 						 * variants of Processor MMIO stale data
++ 						 * vulnerabilities.
++ 						 */
++ #define ARCH_CAP_FBSDP_NO		BIT(14)	/*
++ 						 * Not susceptible to FBSDP variant of
++ 						 * Processor MMIO stale data
++ 						 * vulnerabilities.
++ 						 */
++ #define ARCH_CAP_PSDP_NO		BIT(15)	/*
++ 						 * Not susceptible to PSDP variant of
++ 						 * Processor MMIO stale data
++ 						 * vulnerabilities.
++ 						 */
++ #define ARCH_CAP_FB_CLEAR		BIT(17)	/*
++ 						 * VERW clears CPU fill buffer
++ 						 * even on MDS_NO CPUs.
++ 						 */
++ #define ARCH_CAP_FB_CLEAR_CTRL		BIT(18)	/*
++ 						 * MSR_IA32_MCU_OPT_CTRL[FB_CLEAR_DIS]
++ 						 * bit available to control VERW
++ 						 * behavior.
++ 						 */
+++>>>>>>> 027bbb884be0 (KVM: x86/speculation: Disable Fill buffer clear within guests)
+  
+  #define MSR_IA32_FLUSH_CMD		0x0000010b
+  #define L1D_FLUSH			BIT(0)	/*
+@@@ -128,6 -152,11 +155,14 @@@
+  #define TSX_CTRL_RTM_DISABLE		BIT(0)	/* Disable RTM feature */
+  #define TSX_CTRL_CPUID_CLEAR		BIT(1)	/* Disable TSX enumeration */
+  
+++<<<<<<< HEAD
+++=======
++ #define MSR_IA32_MCU_OPT_CTRL		0x00000123
++ #define RNGDS_MITG_DIS			BIT(0)	/* SRBDS support */
++ #define RTM_ALLOW			BIT(1)	/* TSX development mode */
++ #define FB_CLEAR_DIS			BIT(3)	/* CPU Fill buffer clear disable */
++ 
+++>>>>>>> 027bbb884be0 (KVM: x86/speculation: Disable Fill buffer clear within guests)
+  #define MSR_IA32_SYSENTER_CS		0x00000174
+  #define MSR_IA32_SYSENTER_ESP		0x00000175
+  #define MSR_IA32_SYSENTER_EIP		0x00000176
+* Unmerged path arch/x86/include/asm/msr-index.h
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index f064df2316dd..c2764e4bd698 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -325,6 +325,8 @@ struct vcpu_vmx {
+ 	u64 msr_ia32_feature_control_valid_bits;
+ 	/* SGX Launch Control public key hash */
+ 	u64 msr_ia32_sgxlepubkeyhash[4];
++	u64 msr_ia32_mcu_opt_ctrl;
++	bool disable_fb_clear;
+ 
+ 	struct pt_desc pt_desc;
+ 	struct lbr_desc lbr_desc;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 3e40344015c8..7893615b6252 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1552,6 +1552,9 @@ static u64 kvm_get_arch_capabilities(void)
+ 		 */
+ 	}
+ 
++	/* Guests don't need to know "Fill buffer clear control" exists */
++	data &= ~ARCH_CAP_FB_CLEAR_CTRL;
++
+ 	return data;
+ }
+ 
+* Unmerged path tools/arch/x86/include/asm/msr-index.h
