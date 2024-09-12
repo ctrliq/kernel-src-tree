@@ -1,0 +1,143 @@
+kernel, fs: Introduce and use set_restart_fn() and arch_set_restart_data()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-487.el8
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit 5abbe51a526253b9f003e9a0a195638dc882d660
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-487.el8/5abbe51a.failed
+
+Preparation for fixing get_nr_restart_syscall() on X86 for COMPAT.
+
+Add a new helper which sets restart_block->fn and calls a dummy
+arch_set_restart_data() helper.
+
+Fixes: 609c19a385c8 ("x86/ptrace: Stop setting TS_COMPAT in ptrace code")
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/20210201174641.GA17871@redhat.com
+
+(cherry picked from commit 5abbe51a526253b9f003e9a0a195638dc882d660)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/select.c
+diff --cc fs/select.c
+index 64d96664baba,945896d0ac9e..000000000000
+--- a/fs/select.c
++++ b/fs/select.c
+@@@ -980,10 -1055,9 +980,16 @@@ static long do_restart_poll(struct rest
+  
+  	ret = do_sys_poll(ufds, nfds, to);
+  
+++<<<<<<< HEAD
+ +	if (ret == -EINTR) {
+ +		restart_block->fn = do_restart_poll;
+ +		ret = -ERESTART_RESTARTBLOCK;
+ +	}
+++=======
++ 	if (ret == -ERESTARTNOHAND)
++ 		ret = set_restart_fn(restart_block, do_restart_poll);
++ 
+++>>>>>>> 5abbe51a5262 (kernel, fs: Introduce and use set_restart_fn() and arch_set_restart_data())
+  	return ret;
+  }
+  
+* Unmerged path fs/select.c
+diff --git a/include/linux/thread_info.h b/include/linux/thread_info.h
+index b3767db8cf56..833306277f46 100644
+--- a/include/linux/thread_info.h
++++ b/include/linux/thread_info.h
+@@ -11,6 +11,7 @@
+ #include <linux/types.h>
+ #include <linux/bug.h>
+ #include <linux/restart_block.h>
++#include <linux/errno.h>
+ 
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ /*
+@@ -39,6 +40,18 @@ enum {
+ 
+ #ifdef __KERNEL__
+ 
++#ifndef arch_set_restart_data
++#define arch_set_restart_data(restart) do { } while (0)
++#endif
++
++static inline long set_restart_fn(struct restart_block *restart,
++					long (*fn)(struct restart_block *))
++{
++	restart->fn = fn;
++	arch_set_restart_data(restart);
++	return -ERESTART_RESTARTBLOCK;
++}
++
+ #ifndef THREAD_ALIGN
+ #define THREAD_ALIGN	THREAD_SIZE
+ #endif
+diff --git a/kernel/futex.c b/kernel/futex.c
+index e325c9c50d18..83eb7e9c7e06 100644
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -2968,14 +2968,13 @@ static int futex_wait(u32 __user *uaddr, unsigned int flags, u32 val,
+ 		goto out;
+ 
+ 	restart = &current->restart_block;
+-	restart->fn = futex_wait_restart;
+ 	restart->futex.uaddr = uaddr;
+ 	restart->futex.val = val;
+ 	restart->futex.time = *abs_time;
+ 	restart->futex.bitset = bitset;
+ 	restart->futex.flags = flags | FLAGS_HAS_TIMEOUT;
+ 
+-	ret = -ERESTART_RESTARTBLOCK;
++	ret = set_restart_fn(restart, futex_wait_restart);
+ 
+ out:
+ 	if (to) {
+diff --git a/kernel/time/alarmtimer.c b/kernel/time/alarmtimer.c
+index 528cd3a7b06c..5c692fe95d96 100644
+--- a/kernel/time/alarmtimer.c
++++ b/kernel/time/alarmtimer.c
+@@ -857,9 +857,9 @@ static int alarm_timer_nsleep(const clockid_t which_clock, int flags,
+ 	if (flags == TIMER_ABSTIME)
+ 		return -ERESTARTNOHAND;
+ 
+-	restart->fn = alarm_timer_nsleep_restart;
+ 	restart->nanosleep.clockid = type;
+ 	restart->nanosleep.expires = exp;
++	set_restart_fn(restart, alarm_timer_nsleep_restart);
+ 	return ret;
+ }
+ 
+diff --git a/kernel/time/hrtimer.c b/kernel/time/hrtimer.c
+index 48c129c76d21..b2677204b415 100644
+--- a/kernel/time/hrtimer.c
++++ b/kernel/time/hrtimer.c
+@@ -2120,9 +2120,9 @@ long hrtimer_nanosleep(ktime_t rqtp, const enum hrtimer_mode mode,
+ 	}
+ 
+ 	restart = &current->restart_block;
+-	restart->fn = hrtimer_nanosleep_restart;
+ 	restart->nanosleep.clockid = t.timer.base->clockid;
+ 	restart->nanosleep.expires = hrtimer_get_expires_tv64(&t.timer);
++	set_restart_fn(restart, hrtimer_nanosleep_restart);
+ out:
+ 	destroy_hrtimer_on_stack(&t.timer);
+ 	return ret;
+diff --git a/kernel/time/posix-cpu-timers.c b/kernel/time/posix-cpu-timers.c
+index bd856eee9ba4..d6378f9d0ea5 100644
+--- a/kernel/time/posix-cpu-timers.c
++++ b/kernel/time/posix-cpu-timers.c
+@@ -1342,8 +1342,8 @@ static int posix_cpu_nsleep(const clockid_t which_clock, int flags,
+ 		if (flags & TIMER_ABSTIME)
+ 			return -ERESTARTNOHAND;
+ 
+-		restart_block->fn = posix_cpu_nsleep_restart;
+ 		restart_block->nanosleep.clockid = which_clock;
++		set_restart_fn(restart_block, posix_cpu_nsleep_restart);
+ 	}
+ 	return error;
+ }
