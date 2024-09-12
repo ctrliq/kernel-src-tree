@@ -202,7 +202,6 @@ struct kernfs_syscall_ops {
 	RH_KABI_RESERVE(4)
 };
 
-#if 0
 struct kernfs_root {
 	/* published fields */
 	struct kernfs_node	*kn;
@@ -219,8 +218,9 @@ struct kernfs_root {
 
 	wait_queue_head_t	deactivate_waitq;
 	RH_KABI_EXTEND(struct rw_semaphore	kernfs_rwsem)
+	RH_KABI_EXTEND(struct rw_semaphore	kernfs_iattr_rwsem)
+	RH_KABI_EXTEND(struct rw_semaphore	kernfs_supers_rwsem)
 };
-#endif
 
 struct kernfs_node *kernfs_root_to_node(struct kernfs_root *root);
 

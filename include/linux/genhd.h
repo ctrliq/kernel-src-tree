@@ -199,8 +199,10 @@ struct gendisk {
 	char disk_name[DISK_NAME_LEN];	/* name of major driver */
 	RH_KABI_DEPRECATE_FN(char *, devnode, struct gendisk *gd, umode_t *mode)
 
-	unsigned short events;		/* supported events */
-	unsigned short event_flags;	/* flags related to event processing */
+	RH_KABI_REPLACE_SPLIT(unsigned int events,
+			unsigned short events,
+			unsigned short event_flags)	/* supported events */
+	RH_KABI_DEPRECATE(unsigned int, async_events)	/* async events, subset of all */
 
 	/* Array of pointers to partitions indexed by partno.
 	 * Protected with matching bdev lock but stat and other
