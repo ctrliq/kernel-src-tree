@@ -3636,7 +3636,7 @@ static int add_unformed_module(struct module *mod)
 	mutex_lock(&module_mutex);
 	old = find_module_all(mod->name, strlen(mod->name), true);
 	if (old != NULL) {
-		if (old->state == MODULE_STATE_COMING
+		if (old->state != MODULE_STATE_LIVE
 		    || old->state == MODULE_STATE_UNFORMED) {
 			/* Wait in case it fails to load. */
 			mutex_unlock(&module_mutex);
@@ -3644,11 +3644,11 @@ static int add_unformed_module(struct module *mod)
 					       finished_loading(mod->name));
 			if (err)
 				goto out_unlocked;
-
 			/* The module might have gone in the meantime. */
 			mutex_lock(&module_mutex);
 			old = find_module_all(mod->name, strlen(mod->name),
 					      true);
+
 		}
 
 		/*
