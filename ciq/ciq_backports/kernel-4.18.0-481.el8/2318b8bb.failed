@@ -1,0 +1,141 @@
+net/mlx5: E-switch, Destroy legacy fdb table when needed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Chris Mi <cmi@nvidia.com>
+commit 2318b8bb94a3a21363cd0d49cad5934bd1e2d60e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/2318b8bb.failed
+
+The cited commit removes eswitch mode none. But when disabling
+sriov in legacy mode or changing from switchdev to legacy mode
+without sriov enabled, the legacy fdb table is not destroyed.
+
+It is not the right behavior. Destroy legacy fdb table in above
+two caes.
+
+Fixes: f019679ea5f2 ("net/mlx5: E-switch, Remove dependency between sriov and eswitch mode")
+	Signed-off-by: Chris Mi <cmi@nvidia.com>
+	Reviewed-by: Roi Dayan <roid@nvidia.com>
+	Reviewed-by: Eli Cohen <elic@nvidia.com>
+	Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+	Reviewed-by: Vlad Buslov <vladbu@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 2318b8bb94a3a21363cd0d49cad5934bd1e2d60e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index b4f03e2a26bb,374e3fbdc2cf..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1339,19 -1333,51 +1339,65 @@@ int mlx5_eswitch_enable(struct mlx5_esw
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +void mlx5_eswitch_disable_locked(struct mlx5_eswitch *esw, bool clear_vf)
+++=======
++ /* When disabling sriov, free driver level resources. */
++ void mlx5_eswitch_disable_sriov(struct mlx5_eswitch *esw, bool clear_vf)
++ {
++ 	if (!mlx5_esw_allowed(esw))
++ 		return;
++ 
++ 	devl_assert_locked(priv_to_devlink(esw->dev));
++ 	down_write(&esw->mode_lock);
++ 	/* If driver is unloaded, this function is called twice by remove_one()
++ 	 * and mlx5_unload(). Prevent the second call.
++ 	 */
++ 	if (!esw->esw_funcs.num_vfs && !clear_vf)
++ 		goto unlock;
++ 
++ 	esw_info(esw->dev, "Unload vfs: mode(%s), nvfs(%d), active vports(%d)\n",
++ 		 esw->mode == MLX5_ESWITCH_LEGACY ? "LEGACY" : "OFFLOADS",
++ 		 esw->esw_funcs.num_vfs, esw->enabled_vports);
++ 
++ 	mlx5_eswitch_unload_vf_vports(esw, esw->esw_funcs.num_vfs);
++ 	if (clear_vf)
++ 		mlx5_eswitch_clear_vf_vports_info(esw);
++ 	/* If disabling sriov in switchdev mode, free meta rules here
++ 	 * because it depends on num_vfs.
++ 	 */
++ 	if (esw->mode == MLX5_ESWITCH_OFFLOADS) {
++ 		struct devlink *devlink = priv_to_devlink(esw->dev);
++ 
++ 		devl_rate_nodes_destroy(devlink);
++ 	}
++ 	/* Destroy legacy fdb when disabling sriov in legacy mode. */
++ 	if (esw->mode == MLX5_ESWITCH_LEGACY)
++ 		mlx5_eswitch_disable_locked(esw);
++ 
++ 	esw->esw_funcs.num_vfs = 0;
++ 
++ unlock:
++ 	up_write(&esw->mode_lock);
++ }
++ 
++ /* Free resources for corresponding eswitch mode. It is called by devlink
++  * when changing eswitch mode or modprobe when unloading driver.
++  */
++ void mlx5_eswitch_disable_locked(struct mlx5_eswitch *esw)
+++>>>>>>> 2318b8bb94a3 (net/mlx5: E-switch, Destroy legacy fdb table when needed)
+  {
+  	struct devlink *devlink = priv_to_devlink(esw->dev);
+ +	int old_mode;
+ +
+ +	lockdep_assert_held_exclusive(&esw->mode_lock);
+ +
+ +	if (esw->mode == MLX5_ESWITCH_NONE)
+ +		return;
+ +
+ +	esw_info(esw->dev, "Disable: mode(%s), nvfs(%d), active vports(%d)\n",
+ +		 esw->mode == MLX5_ESWITCH_LEGACY ? "LEGACY" : "OFFLOADS",
+ +		 esw->esw_funcs.num_vfs, esw->enabled_vports);
+  
+  	/* Notify eswitch users that it is exiting from current mode.
+  	 * So that it can do necessary cleanup before the eswitch is disabled.
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 510a60292c5b,8c6c9bcb3dc3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -3255,20 -3384,19 +3255,33 @@@ err_metadata
+  static int esw_offloads_stop(struct mlx5_eswitch *esw,
+  			     struct netlink_ext_ack *extack)
+  {
+ -	int err;
+ +	int err, err1;
+  
+++<<<<<<< HEAD
+ +	mlx5_eswitch_disable_locked(esw, false);
+ +	err = mlx5_eswitch_enable_locked(esw, MLX5_ESWITCH_LEGACY,
+ +					 MLX5_ESWITCH_IGNORE_NUM_VFS);
+ +	if (err) {
+++=======
++ 	esw->mode = MLX5_ESWITCH_LEGACY;
++ 
++ 	/* If changing from switchdev to legacy mode without sriov enabled,
++ 	 * no need to create legacy fdb.
++ 	 */
++ 	if (!mlx5_sriov_is_enabled(esw->dev))
++ 		return 0;
++ 
++ 	err = mlx5_eswitch_enable_locked(esw, MLX5_ESWITCH_IGNORE_NUM_VFS);
++ 	if (err)
+++>>>>>>> 2318b8bb94a3 (net/mlx5: E-switch, Destroy legacy fdb table when needed)
+  		NL_SET_ERR_MSG_MOD(extack, "Failed setting eswitch to legacy");
+ +		err1 = mlx5_eswitch_enable_locked(esw, MLX5_ESWITCH_OFFLOADS,
+ +						  MLX5_ESWITCH_IGNORE_NUM_VFS);
+ +		if (err1) {
+ +			NL_SET_ERR_MSG_MOD(extack,
+ +					   "Failed setting eswitch back to offloads");
+ +		}
+ +	}
+  
+  	return err;
+  }
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
