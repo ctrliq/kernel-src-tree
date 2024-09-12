@@ -1,0 +1,120 @@
+iomap/gfs2: Unlock and put folio in page_done handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 80baab88bb93eeaa133b426d24dfc0775a8cf824
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/80baab88.failed
+
+When an iomap defines a ->page_done() handler in its page_ops, delegate
+unlocking the folio and putting the folio reference to that handler.
+
+This allows to fix a race between journaled data writes and folio
+writeback in gfs2: before this change, gfs2_iomap_page_done() was called
+after unlocking the folio, so writeback could start writing back the
+folio's buffers before they could be marked for writing to the journal.
+Also, try_to_free_buffers() could free the buffers before
+gfs2_iomap_page_done() was done adding the buffers to the current
+current transaction.  With this change, gfs2_iomap_page_done() adds the
+buffers to the current transaction while the folio is still locked, so
+the problems described above can no longer occur.
+
+The only current user of ->page_done() is gfs2, so other filesystems are
+not affected.  To catch out any out-of-tree users, switch from a page to
+a folio in ->page_done().
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 80baab88bb93eeaa133b426d24dfc0775a8cf824)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/iomap/buffered-io.c
+diff --cc fs/iomap/buffered-io.c
+index 03a8dcf6cf9d,a9082078e4ed..000000000000
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@@ -581,8 -575,21 +581,24 @@@ static int __iomap_write_begin(const st
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __iomap_put_folio(struct iomap_iter *iter, loff_t pos, size_t ret,
++ 		struct folio *folio)
++ {
++ 	const struct iomap_page_ops *page_ops = iter->iomap.page_ops;
++ 
++ 	if (page_ops && page_ops->page_done) {
++ 		page_ops->page_done(iter->inode, pos, ret, folio);
++ 	} else if (folio) {
++ 		folio_unlock(folio);
++ 		folio_put(folio);
++ 	}
++ }
++ 
+++>>>>>>> 80baab88bb93 (iomap/gfs2: Unlock and put folio in page_done handler)
+  static int iomap_write_begin_inline(const struct iomap_iter *iter,
+ -		struct folio *folio)
+ +		struct page *page)
+  {
+  	/* needs more work for the tailpacking case; disable for now */
+  	if (WARN_ON_ONCE(iomap_iter_srcmap(iter)->offset != 0))
+diff --git a/fs/gfs2/bmap.c b/fs/gfs2/bmap.c
+index d33948cd5389..49dc44dd8a61 100644
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@ -969,14 +969,23 @@ static int gfs2_iomap_page_prepare(struct inode *inode, loff_t pos,
+ }
+ 
+ static void gfs2_iomap_page_done(struct inode *inode, loff_t pos,
+-				 unsigned copied, struct page *page)
++				 unsigned copied, struct folio *folio)
+ {
+ 	struct gfs2_trans *tr = current->journal_info;
+ 	struct gfs2_inode *ip = GFS2_I(inode);
+ 	struct gfs2_sbd *sdp = GFS2_SB(inode);
+ 
+-	if (page && !gfs2_is_stuffed(ip))
+-		gfs2_page_add_databufs(ip, page, offset_in_page(pos), copied);
++	if (!folio) {
++		gfs2_trans_end(sdp);
++		return;
++	}
++
++	if (!gfs2_is_stuffed(ip))
++		gfs2_page_add_databufs(ip, &folio->page, offset_in_page(pos),
++				       copied);
++
++	folio_unlock(folio);
++	folio_put(folio);
+ 
+ 	if (tr->tr_num_buf_new)
+ 		__mark_inode_dirty(inode, I_DIRTY_DATASYNC);
+* Unmerged path fs/iomap/buffered-io.c
+diff --git a/include/linux/iomap.h b/include/linux/iomap.h
+index a5c03dc4a004..6beb56a7a91e 100644
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@ -131,13 +131,14 @@ static inline bool iomap_inline_data_valid(const struct iomap *iomap)
+  * associated with them.
+  *
+  * When page_prepare succeeds, page_done will always be called to do any
+- * cleanup work necessary.  In that page_done call, @page will be NULL if the
+- * associated page could not be obtained.
++ * cleanup work necessary.  In that page_done call, @folio will be NULL if the
++ * associated folio could not be obtained.  When folio is not NULL, page_done
++ * is responsible for unlocking and putting the folio.
+  */
+ struct iomap_page_ops {
+ 	int (*page_prepare)(struct inode *inode, loff_t pos, unsigned len);
+ 	void (*page_done)(struct inode *inode, loff_t pos, unsigned copied,
+-			struct page *page);
++			struct folio *folio);
+ 
+ 	/*
+ 	 * Check that the cached iomap still maps correctly to the filesystem's
