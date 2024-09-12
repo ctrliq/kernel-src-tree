@@ -1,0 +1,259 @@
+PM: domains: Allocate governor data dynamically based on a genpd governor
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Ulf Hansson <ulf.hansson@linaro.org>
+commit f38d1a6d002526a4e8840e9bb19733e9d4ce1a67
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/f38d1a6d.failed
+
+If a genpd doesn't have an associated governor assigned, several variables
+in the struct generic_pm_domain becomes superfluous.
+
+Rather than wasting memory in allocated genpds, let's move the variables
+from the struct generic_pm_domain into a new separate struct. In this way,
+we can instead dynamically decide when we need to allocate the
+corresponding data for it.
+
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit f38d1a6d002526a4e8840e9bb19733e9d4ce1a67)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/power/domain.c
+diff --cc drivers/base/power/domain.c
+index 9e2b595b8793,a7de5fb8f073..000000000000
+--- a/drivers/base/power/domain.c
++++ b/drivers/base/power/domain.c
+@@@ -1990,6 -1972,53 +1994,56 @@@ static int genpd_set_default_power_stat
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int genpd_alloc_data(struct generic_pm_domain *genpd)
++ {
++ 	struct genpd_governor_data *gd = NULL;
++ 	int ret;
++ 
++ 	if (genpd_is_cpu_domain(genpd) &&
++ 	    !zalloc_cpumask_var(&genpd->cpus, GFP_KERNEL))
++ 		return -ENOMEM;
++ 
++ 	if (genpd->gov) {
++ 		gd = kzalloc(sizeof(*gd), GFP_KERNEL);
++ 		if (!gd) {
++ 			ret = -ENOMEM;
++ 			goto free;
++ 		}
++ 
++ 		gd->max_off_time_ns = -1;
++ 		gd->max_off_time_changed = true;
++ 		gd->next_wakeup = KTIME_MAX;
++ 	}
++ 
++ 	/* Use only one "off" state if there were no states declared */
++ 	if (genpd->state_count == 0) {
++ 		ret = genpd_set_default_power_state(genpd);
++ 		if (ret)
++ 			goto free;
++ 	}
++ 
++ 	genpd->gd = gd;
++ 	return 0;
++ 
++ free:
++ 	if (genpd_is_cpu_domain(genpd))
++ 		free_cpumask_var(genpd->cpus);
++ 	kfree(gd);
++ 	return ret;
++ }
++ 
++ static void genpd_free_data(struct generic_pm_domain *genpd)
++ {
++ 	if (genpd_is_cpu_domain(genpd))
++ 		free_cpumask_var(genpd->cpus);
++ 	if (genpd->free_states)
++ 		genpd->free_states(genpd->states, genpd->state_count);
++ 	kfree(genpd->gd);
++ }
++ 
+++>>>>>>> f38d1a6d0025 (PM: domains: Allocate governor data dynamically based on a genpd governor)
+  static void genpd_lock_init(struct generic_pm_domain *genpd)
+  {
+  	if (genpd->flags & GENPD_FLAG_IRQ_SAFE) {
+* Unmerged path drivers/base/power/domain.c
+diff --git a/drivers/base/power/domain_governor.c b/drivers/base/power/domain_governor.c
+index 7a93ac03e051..01fe87aa7a62 100644
+--- a/drivers/base/power/domain_governor.c
++++ b/drivers/base/power/domain_governor.c
+@@ -148,19 +148,21 @@ static void update_domain_next_wakeup(struct generic_pm_domain *genpd, ktime_t n
+ 	}
+ 
+ 	list_for_each_entry(link, &genpd->parent_links, parent_node) {
+-		next_wakeup = link->child->next_wakeup;
++		struct genpd_governor_data *cgd = link->child->gd;
++
++		next_wakeup = cgd ? cgd->next_wakeup : KTIME_MAX;
+ 		if (next_wakeup != KTIME_MAX && !ktime_before(next_wakeup, now))
+ 			if (ktime_before(next_wakeup, domain_wakeup))
+ 				domain_wakeup = next_wakeup;
+ 	}
+ 
+-	genpd->next_wakeup = domain_wakeup;
++	genpd->gd->next_wakeup = domain_wakeup;
+ }
+ 
+ static bool next_wakeup_allows_state(struct generic_pm_domain *genpd,
+ 				     unsigned int state, ktime_t now)
+ {
+-	ktime_t domain_wakeup = genpd->next_wakeup;
++	ktime_t domain_wakeup = genpd->gd->next_wakeup;
+ 	s64 idle_time_ns, min_sleep_ns;
+ 
+ 	min_sleep_ns = genpd->states[state].power_off_latency_ns +
+@@ -190,8 +192,9 @@ static bool __default_power_down_ok(struct dev_pm_domain *pd,
+ 	 * All subdomains have been powered off already at this point.
+ 	 */
+ 	list_for_each_entry(link, &genpd->parent_links, parent_node) {
+-		struct generic_pm_domain *sd = link->child;
+-		s64 sd_max_off_ns = sd->max_off_time_ns;
++		struct genpd_governor_data *cgd = link->child->gd;
++
++		s64 sd_max_off_ns = cgd ? cgd->max_off_time_ns : -1;
+ 
+ 		if (sd_max_off_ns < 0)
+ 			continue;
+@@ -249,7 +252,7 @@ static bool __default_power_down_ok(struct dev_pm_domain *pd,
+ 	 * time and the time needed to turn the domain on is the maximum
+ 	 * theoretical time this domain can spend in the "off" state.
+ 	 */
+-	genpd->max_off_time_ns = min_off_time_ns -
++	genpd->gd->max_off_time_ns = min_off_time_ns -
+ 		genpd->states[state].power_on_latency_ns;
+ 	return true;
+ }
+@@ -264,6 +267,7 @@ static bool __default_power_down_ok(struct dev_pm_domain *pd,
+ static bool _default_power_down_ok(struct dev_pm_domain *pd, ktime_t now)
+ {
+ 	struct generic_pm_domain *genpd = pd_to_genpd(pd);
++	struct genpd_governor_data *gd = genpd->gd;
+ 	int state_idx = genpd->state_count - 1;
+ 	struct gpd_link *link;
+ 
+@@ -274,11 +278,11 @@ static bool _default_power_down_ok(struct dev_pm_domain *pd, ktime_t now)
+ 	 * cannot be met.
+ 	 */
+ 	update_domain_next_wakeup(genpd, now);
+-	if ((genpd->flags & GENPD_FLAG_MIN_RESIDENCY) && (genpd->next_wakeup != KTIME_MAX)) {
++	if ((genpd->flags & GENPD_FLAG_MIN_RESIDENCY) && (gd->next_wakeup != KTIME_MAX)) {
+ 		/* Let's find out the deepest domain idle state, the devices prefer */
+ 		while (state_idx >= 0) {
+ 			if (next_wakeup_allows_state(genpd, state_idx, now)) {
+-				genpd->max_off_time_changed = true;
++				gd->max_off_time_changed = true;
+ 				break;
+ 			}
+ 			state_idx--;
+@@ -286,14 +290,14 @@ static bool _default_power_down_ok(struct dev_pm_domain *pd, ktime_t now)
+ 
+ 		if (state_idx < 0) {
+ 			state_idx = 0;
+-			genpd->cached_power_down_ok = false;
++			gd->cached_power_down_ok = false;
+ 			goto done;
+ 		}
+ 	}
+ 
+-	if (!genpd->max_off_time_changed) {
+-		genpd->state_idx = genpd->cached_power_down_state_idx;
+-		return genpd->cached_power_down_ok;
++	if (!gd->max_off_time_changed) {
++		genpd->state_idx = gd->cached_power_down_state_idx;
++		return gd->cached_power_down_ok;
+ 	}
+ 
+ 	/*
+@@ -302,12 +306,16 @@ static bool _default_power_down_ok(struct dev_pm_domain *pd, ktime_t now)
+ 	 * going to be called for any parent until this instance
+ 	 * returns.
+ 	 */
+-	list_for_each_entry(link, &genpd->child_links, child_node)
+-		link->parent->max_off_time_changed = true;
++	list_for_each_entry(link, &genpd->child_links, child_node) {
++		struct genpd_governor_data *pgd = link->parent->gd;
++
++		if (pgd)
++			pgd->max_off_time_changed = true;
++	}
+ 
+-	genpd->max_off_time_ns = -1;
+-	genpd->max_off_time_changed = false;
+-	genpd->cached_power_down_ok = true;
++	gd->max_off_time_ns = -1;
++	gd->max_off_time_changed = false;
++	gd->cached_power_down_ok = true;
+ 
+ 	/*
+ 	 * Find a state to power down to, starting from the state
+@@ -315,7 +323,7 @@ static bool _default_power_down_ok(struct dev_pm_domain *pd, ktime_t now)
+ 	 */
+ 	while (!__default_power_down_ok(pd, state_idx)) {
+ 		if (state_idx == 0) {
+-			genpd->cached_power_down_ok = false;
++			gd->cached_power_down_ok = false;
+ 			break;
+ 		}
+ 		state_idx--;
+@@ -323,8 +331,8 @@ static bool _default_power_down_ok(struct dev_pm_domain *pd, ktime_t now)
+ 
+ done:
+ 	genpd->state_idx = state_idx;
+-	genpd->cached_power_down_state_idx = genpd->state_idx;
+-	return genpd->cached_power_down_ok;
++	gd->cached_power_down_state_idx = genpd->state_idx;
++	return gd->cached_power_down_ok;
+ }
+ 
+ static bool default_power_down_ok(struct dev_pm_domain *pd)
+diff --git a/include/linux/pm_domain.h b/include/linux/pm_domain.h
+index d492153c894b..6f175988b8ed 100644
+--- a/include/linux/pm_domain.h
++++ b/include/linux/pm_domain.h
+@@ -92,6 +92,14 @@ struct gpd_dev_ops {
+ 	int (*stop)(struct device *dev);
+ };
+ 
++struct genpd_governor_data {
++	s64 max_off_time_ns;
++	bool max_off_time_changed;
++	ktime_t next_wakeup;
++	bool cached_power_down_ok;
++	bool cached_power_down_state_idx;
++};
++
+ struct genpd_power_state {
+ 	s64 power_off_latency_ns;
+ 	s64 power_on_latency_ns;
+@@ -115,6 +123,7 @@ struct generic_pm_domain {
+ 	struct list_head child_links;	/* Links with PM domain as a child */
+ 	struct list_head dev_list;	/* List of devices */
+ 	struct dev_power_governor *gov;
++	struct genpd_governor_data *gd;	/* Data used by a genpd governor. */
+ 	struct work_struct power_off_work;
+ 	struct fwnode_handle *provider;	/* Identity of the domain provider */
+ 	bool has_provider;
+@@ -135,11 +144,6 @@ struct generic_pm_domain {
+ 	int (*set_performance_state)(struct generic_pm_domain *genpd,
+ 				     unsigned int state);
+ 	struct gpd_dev_ops dev_ops;
+-	s64 max_off_time_ns;	/* Maximum allowed "suspended" time. */
+-	ktime_t next_wakeup;	/* Maintained by the domain governor */
+-	bool max_off_time_changed;
+-	bool cached_power_down_ok;
+-	bool cached_power_down_state_idx;
+ 	int (*attach_dev)(struct generic_pm_domain *domain,
+ 			  struct device *dev);
+ 	void (*detach_dev)(struct generic_pm_domain *domain,
