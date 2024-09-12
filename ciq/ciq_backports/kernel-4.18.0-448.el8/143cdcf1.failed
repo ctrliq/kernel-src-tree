@@ -1,0 +1,1014 @@
+ASoC: SOF: loader: Switch to use the fw_loader ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+commit 143cdcf1780eae05c33184380987d29682ac1ad6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/143cdcf1.failed
+
+Since we have the fw_loader ops implementation for IPC3, we can start
+using it and remove most of the IPC dependent code from the file.
+
+	Signed-off-by: Peter Ujfalusi <peter.ujfalusi@linux.intel.com>
+	Reviewed-by: Bard Liao <yung-chuan.liao@linux.intel.com>
+	Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Reviewed-by: Rander Wang <rander.wang@intel.com>
+	Signed-off-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Link: https://lore.kernel.org/r/20220425221129.124615-5-ranjani.sridharan@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 143cdcf1780eae05c33184380987d29682ac1ad6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/ipc.c
+#	sound/soc/sof/sof-priv.h
+diff --cc sound/soc/sof/ipc.c
+index ed366c99fce2,a6ec4b5a4923..000000000000
+--- a/sound/soc/sof/ipc.c
++++ b/sound/soc/sof/ipc.c
+@@@ -476,528 -137,6 +476,531 @@@ void snd_sof_ipc_reply(struct snd_sof_d
+  }
+  EXPORT_SYMBOL(snd_sof_ipc_reply);
+  
+++<<<<<<< HEAD
+ +static void ipc_comp_notification(struct snd_sof_dev *sdev, void *msg_buf)
+ +{
+ +	struct sof_ipc_cmd_hdr *hdr = msg_buf;
+ +	u32 msg_type = hdr->cmd & SOF_CMD_TYPE_MASK;
+ +
+ +	switch (msg_type) {
+ +	case SOF_IPC_COMP_GET_VALUE:
+ +	case SOF_IPC_COMP_GET_DATA:
+ +		break;
+ +	default:
+ +		dev_err(sdev->dev, "error: unhandled component message %#x\n", msg_type);
+ +		return;
+ +	}
+ +
+ +	snd_sof_control_notify(sdev, msg_buf);
+ +}
+ +
+ +/* DSP firmware has sent host a message  */
+ +void snd_sof_ipc_msgs_rx(struct snd_sof_dev *sdev)
+ +{
+ +	ipc_rx_callback rx_callback = NULL;
+ +	struct sof_ipc_cmd_hdr hdr;
+ +	void *msg_buf;
+ +	u32 cmd;
+ +	int err;
+ +
+ +	/* read back header */
+ +	err = snd_sof_ipc_msg_data(sdev, NULL, &hdr, sizeof(hdr));
+ +	if (err < 0) {
+ +		dev_warn(sdev->dev, "failed to read IPC header: %d\n", err);
+ +		return;
+ +	}
+ +
+ +	if (hdr.size < sizeof(hdr)) {
+ +		dev_err(sdev->dev, "The received message size is invalid\n");
+ +		return;
+ +	}
+ +
+ +	ipc_log_header(sdev->dev, "ipc rx", hdr.cmd);
+ +
+ +	cmd = hdr.cmd & SOF_GLB_TYPE_MASK;
+ +
+ +	/* check message type */
+ +	switch (cmd) {
+ +	case SOF_IPC_GLB_REPLY:
+ +		dev_err(sdev->dev, "error: ipc reply unknown\n");
+ +		break;
+ +	case SOF_IPC_FW_READY:
+ +		/* check for FW boot completion */
+ +		if (sdev->fw_state == SOF_FW_BOOT_IN_PROGRESS) {
+ +			err = sof_ops(sdev)->fw_ready(sdev, cmd);
+ +			if (err < 0)
+ +				sof_set_fw_state(sdev, SOF_FW_BOOT_READY_FAILED);
+ +			else
+ +				sof_set_fw_state(sdev, SOF_FW_BOOT_READY_OK);
+ +
+ +			/* wake up firmware loader */
+ +			wake_up(&sdev->boot_wait);
+ +		}
+ +		break;
+ +	case SOF_IPC_GLB_COMPOUND:
+ +	case SOF_IPC_GLB_TPLG_MSG:
+ +	case SOF_IPC_GLB_PM_MSG:
+ +		break;
+ +	case SOF_IPC_GLB_COMP_MSG:
+ +		rx_callback = ipc_comp_notification;
+ +		break;
+ +	case SOF_IPC_GLB_STREAM_MSG:
+ +		rx_callback = ipc_stream_message;
+ +		break;
+ +	case SOF_IPC_GLB_TRACE_MSG:
+ +		rx_callback = ipc_trace_message;
+ +		break;
+ +	default:
+ +		dev_err(sdev->dev, "%s: Unknown DSP message: 0x%x\n", __func__, cmd);
+ +		break;
+ +	}
+ +
+ +	if (rx_callback) {
+ +		/* read the full message as we have rx handler for it */
+ +		msg_buf = kmalloc(hdr.size, GFP_KERNEL);
+ +		if (!msg_buf)
+ +			return;
+ +
+ +		err = snd_sof_ipc_msg_data(sdev, NULL, msg_buf, hdr.size);
+ +		if (err < 0)
+ +			dev_err(sdev->dev, "%s: Failed to read message: %d\n",
+ +				__func__, err);
+ +		else
+ +			rx_callback(sdev, msg_buf);
+ +
+ +		kfree(msg_buf);
+ +	}
+ +
+ +	ipc_log_header(sdev->dev, "ipc rx done", hdr.cmd);
+ +}
+ +EXPORT_SYMBOL(snd_sof_ipc_msgs_rx);
+ +
+ +/*
+ + * IPC trace mechanism.
+ + */
+ +
+ +static void ipc_trace_message(struct snd_sof_dev *sdev, void *msg_buf)
+ +{
+ +	struct sof_ipc_cmd_hdr *hdr = msg_buf;
+ +	u32 msg_type = hdr->cmd & SOF_CMD_TYPE_MASK;
+ +
+ +	switch (msg_type) {
+ +	case SOF_IPC_TRACE_DMA_POSITION:
+ +		snd_sof_trace_update_pos(sdev, msg_buf);
+ +		break;
+ +	default:
+ +		dev_err(sdev->dev, "error: unhandled trace message %#x\n", msg_type);
+ +		break;
+ +	}
+ +}
+ +
+ +/*
+ + * IPC stream position.
+ + */
+ +
+ +static void ipc_period_elapsed(struct snd_sof_dev *sdev, u32 msg_id)
+ +{
+ +	struct snd_soc_component *scomp = sdev->component;
+ +	struct snd_sof_pcm_stream *stream;
+ +	struct sof_ipc_stream_posn posn;
+ +	struct snd_sof_pcm *spcm;
+ +	int direction, ret;
+ +
+ +	spcm = snd_sof_find_spcm_comp(scomp, msg_id, &direction);
+ +	if (!spcm) {
+ +		dev_err(sdev->dev,
+ +			"error: period elapsed for unknown stream, msg_id %d\n",
+ +			msg_id);
+ +		return;
+ +	}
+ +
+ +	stream = &spcm->stream[direction];
+ +	ret = snd_sof_ipc_msg_data(sdev, stream->substream, &posn, sizeof(posn));
+ +	if (ret < 0) {
+ +		dev_warn(sdev->dev, "failed to read stream position: %d\n", ret);
+ +		return;
+ +	}
+ +
+ +	dev_vdbg(sdev->dev, "posn : host 0x%llx dai 0x%llx wall 0x%llx\n",
+ +		 posn.host_posn, posn.dai_posn, posn.wallclock);
+ +
+ +	memcpy(&stream->posn, &posn, sizeof(posn));
+ +
+ +	if (spcm->pcm.compress)
+ +		snd_sof_compr_fragment_elapsed(stream->cstream);
+ +	else if (stream->substream->runtime &&
+ +		 !stream->substream->runtime->no_period_wakeup)
+ +		/* only inform ALSA for period_wakeup mode */
+ +		snd_sof_pcm_period_elapsed(stream->substream);
+ +}
+ +
+ +/* DSP notifies host of an XRUN within FW */
+ +static void ipc_xrun(struct snd_sof_dev *sdev, u32 msg_id)
+ +{
+ +	struct snd_soc_component *scomp = sdev->component;
+ +	struct snd_sof_pcm_stream *stream;
+ +	struct sof_ipc_stream_posn posn;
+ +	struct snd_sof_pcm *spcm;
+ +	int direction, ret;
+ +
+ +	spcm = snd_sof_find_spcm_comp(scomp, msg_id, &direction);
+ +	if (!spcm) {
+ +		dev_err(sdev->dev, "error: XRUN for unknown stream, msg_id %d\n",
+ +			msg_id);
+ +		return;
+ +	}
+ +
+ +	stream = &spcm->stream[direction];
+ +	ret = snd_sof_ipc_msg_data(sdev, stream->substream, &posn, sizeof(posn));
+ +	if (ret < 0) {
+ +		dev_warn(sdev->dev, "failed to read overrun position: %d\n", ret);
+ +		return;
+ +	}
+ +
+ +	dev_dbg(sdev->dev,  "posn XRUN: host %llx comp %d size %d\n",
+ +		posn.host_posn, posn.xrun_comp_id, posn.xrun_size);
+ +
+ +#if defined(CONFIG_SND_SOC_SOF_DEBUG_XRUN_STOP)
+ +	/* stop PCM on XRUN - used for pipeline debug */
+ +	memcpy(&stream->posn, &posn, sizeof(posn));
+ +	snd_pcm_stop_xrun(stream->substream);
+ +#endif
+ +}
+ +
+ +/* stream notifications from DSP FW */
+ +static void ipc_stream_message(struct snd_sof_dev *sdev, void *msg_buf)
+ +{
+ +	struct sof_ipc_cmd_hdr *hdr = msg_buf;
+ +	u32 msg_type = hdr->cmd & SOF_CMD_TYPE_MASK;
+ +	u32 msg_id = SOF_IPC_MESSAGE_ID(hdr->cmd);
+ +
+ +	switch (msg_type) {
+ +	case SOF_IPC_STREAM_POSITION:
+ +		ipc_period_elapsed(sdev, msg_id);
+ +		break;
+ +	case SOF_IPC_STREAM_TRIG_XRUN:
+ +		ipc_xrun(sdev, msg_id);
+ +		break;
+ +	default:
+ +		dev_err(sdev->dev, "error: unhandled stream message %#x\n",
+ +			msg_id);
+ +		break;
+ +	}
+ +}
+ +
+ +/* get stream position IPC - use faster MMIO method if available on platform */
+ +int snd_sof_ipc_stream_posn(struct snd_soc_component *scomp,
+ +			    struct snd_sof_pcm *spcm, int direction,
+ +			    struct sof_ipc_stream_posn *posn)
+ +{
+ +	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(scomp);
+ +	struct sof_ipc_stream stream;
+ +	int err;
+ +
+ +	/* read position via slower IPC */
+ +	stream.hdr.size = sizeof(stream);
+ +	stream.hdr.cmd = SOF_IPC_GLB_STREAM_MSG | SOF_IPC_STREAM_POSITION;
+ +	stream.comp_id = spcm->stream[direction].comp_id;
+ +
+ +	/* send IPC to the DSP */
+ +	err = sof_ipc_tx_message(sdev->ipc,
+ +				 stream.hdr.cmd, &stream, sizeof(stream), posn,
+ +				 sizeof(*posn));
+ +	if (err < 0) {
+ +		dev_err(sdev->dev, "error: failed to get stream %d position\n",
+ +			stream.comp_id);
+ +		return err;
+ +	}
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(snd_sof_ipc_stream_posn);
+ +
+ +static int sof_get_ctrl_copy_params(enum sof_ipc_ctrl_type ctrl_type,
+ +				    struct sof_ipc_ctrl_data *src,
+ +				    struct sof_ipc_ctrl_data *dst,
+ +				    struct sof_ipc_ctrl_data_params *sparams)
+ +{
+ +	switch (ctrl_type) {
+ +	case SOF_CTRL_TYPE_VALUE_CHAN_GET:
+ +	case SOF_CTRL_TYPE_VALUE_CHAN_SET:
+ +		sparams->src = (u8 *)src->chanv;
+ +		sparams->dst = (u8 *)dst->chanv;
+ +		break;
+ +	case SOF_CTRL_TYPE_DATA_GET:
+ +	case SOF_CTRL_TYPE_DATA_SET:
+ +		sparams->src = (u8 *)src->data->data;
+ +		sparams->dst = (u8 *)dst->data->data;
+ +		break;
+ +	default:
+ +		return -EINVAL;
+ +	}
+ +
+ +	/* calculate payload size and number of messages */
+ +	sparams->pl_size = SOF_IPC_MSG_MAX_SIZE - sparams->hdr_bytes;
+ +	sparams->num_msg = DIV_ROUND_UP(sparams->msg_bytes, sparams->pl_size);
+ +
+ +	return 0;
+ +}
+ +
+ +static int sof_set_get_large_ctrl_data(struct snd_sof_dev *sdev,
+ +				       struct sof_ipc_ctrl_data *cdata,
+ +				       struct sof_ipc_ctrl_data_params *sparams,
+ +				       bool set)
+ +{
+ +	struct sof_ipc_ctrl_data *partdata;
+ +	size_t send_bytes;
+ +	size_t offset = 0;
+ +	size_t msg_bytes;
+ +	size_t pl_size;
+ +	int err;
+ +	int i;
+ +
+ +	/* allocate max ipc size because we have at least one */
+ +	partdata = kzalloc(SOF_IPC_MSG_MAX_SIZE, GFP_KERNEL);
+ +	if (!partdata)
+ +		return -ENOMEM;
+ +
+ +	if (set)
+ +		err = sof_get_ctrl_copy_params(cdata->type, cdata, partdata,
+ +					       sparams);
+ +	else
+ +		err = sof_get_ctrl_copy_params(cdata->type, partdata, cdata,
+ +					       sparams);
+ +	if (err < 0) {
+ +		kfree(partdata);
+ +		return err;
+ +	}
+ +
+ +	msg_bytes = sparams->msg_bytes;
+ +	pl_size = sparams->pl_size;
+ +
+ +	/* copy the header data */
+ +	memcpy(partdata, cdata, sparams->hdr_bytes);
+ +
+ +	/* Serialise IPC TX */
+ +	mutex_lock(&sdev->ipc->tx_mutex);
+ +
+ +	/* copy the payload data in a loop */
+ +	for (i = 0; i < sparams->num_msg; i++) {
+ +		send_bytes = min(msg_bytes, pl_size);
+ +		partdata->num_elems = send_bytes;
+ +		partdata->rhdr.hdr.size = sparams->hdr_bytes + send_bytes;
+ +		partdata->msg_index = i;
+ +		msg_bytes -= send_bytes;
+ +		partdata->elems_remaining = msg_bytes;
+ +
+ +		if (set)
+ +			memcpy(sparams->dst, sparams->src + offset, send_bytes);
+ +
+ +		err = sof_ipc_tx_message_unlocked(sdev->ipc,
+ +						  partdata,
+ +						  partdata->rhdr.hdr.size,
+ +						  partdata,
+ +						  partdata->rhdr.hdr.size);
+ +		if (err < 0)
+ +			break;
+ +
+ +		if (!set)
+ +			memcpy(sparams->dst + offset, sparams->src, send_bytes);
+ +
+ +		offset += pl_size;
+ +	}
+ +
+ +	mutex_unlock(&sdev->ipc->tx_mutex);
+ +
+ +	kfree(partdata);
+ +	return err;
+ +}
+ +
+ +/*
+ + * IPC get()/set() for kcontrols.
+ + */
+ +int snd_sof_ipc_set_get_comp_data(struct snd_sof_control *scontrol, bool set)
+ +{
+ +	struct snd_soc_component *scomp = scontrol->scomp;
+ +	struct sof_ipc_ctrl_data *cdata = scontrol->control_data;
+ +	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(scomp);
+ +	struct sof_ipc_fw_ready *ready = &sdev->fw_ready;
+ +	struct sof_ipc_fw_version *v = &ready->version;
+ +	struct sof_ipc_ctrl_data_params sparams;
+ +	enum sof_ipc_ctrl_type ctrl_type;
+ +	struct snd_sof_widget *swidget;
+ +	bool widget_found = false;
+ +	size_t send_bytes;
+ +	u32 ipc_cmd;
+ +	int err;
+ +
+ +	list_for_each_entry(swidget, &sdev->widget_list, list) {
+ +		if (swidget->comp_id == scontrol->comp_id) {
+ +			widget_found = true;
+ +			break;
+ +		}
+ +	}
+ +
+ +	if (!widget_found) {
+ +		dev_err(sdev->dev, "error: can't find widget with id %d\n", scontrol->comp_id);
+ +		return -EINVAL;
+ +	}
+ +
+ +	/*
+ +	 * Volatile controls should always be part of static pipelines and the widget use_count
+ +	 * would always be > 0 in this case. For the others, just return the cached value if the
+ +	 * widget is not set up.
+ +	 */
+ +	if (!swidget->use_count)
+ +		return 0;
+ +
+ +	/* read or write firmware volume */
+ +	if (scontrol->readback_offset != 0) {
+ +		/* write/read value header via mmaped region */
+ +		send_bytes = sizeof(struct sof_ipc_ctrl_value_chan) *
+ +		cdata->num_elems;
+ +		if (set)
+ +			err = snd_sof_dsp_block_write(sdev, SOF_FW_BLK_TYPE_IRAM,
+ +						      scontrol->readback_offset,
+ +						      cdata->chanv, send_bytes);
+ +
+ +		else
+ +			err = snd_sof_dsp_block_read(sdev, SOF_FW_BLK_TYPE_IRAM,
+ +						     scontrol->readback_offset,
+ +						     cdata->chanv, send_bytes);
+ +
+ +		if (err)
+ +			dev_err_once(sdev->dev, "error: %s TYPE_IRAM failed\n",
+ +				     set ? "write to" :  "read from");
+ +		return err;
+ +	}
+ +
+ +	/*
+ +	 * Select the IPC cmd and the ctrl_type based on the ctrl_cmd and the
+ +	 * direction
+ +	 * Note: SOF_CTRL_TYPE_VALUE_COMP_* is not used and supported currently
+ +	 *	 for ctrl_type
+ +	 */
+ +	if (cdata->cmd == SOF_CTRL_CMD_BINARY) {
+ +		ipc_cmd = set ? SOF_IPC_COMP_SET_DATA : SOF_IPC_COMP_GET_DATA;
+ +		ctrl_type = set ? SOF_CTRL_TYPE_DATA_SET : SOF_CTRL_TYPE_DATA_GET;
+ +	} else {
+ +		ipc_cmd = set ? SOF_IPC_COMP_SET_VALUE : SOF_IPC_COMP_GET_VALUE;
+ +		ctrl_type = set ? SOF_CTRL_TYPE_VALUE_CHAN_SET : SOF_CTRL_TYPE_VALUE_CHAN_GET;
+ +	}
+ +
+ +	cdata->rhdr.hdr.cmd = SOF_IPC_GLB_COMP_MSG | ipc_cmd;
+ +	cdata->type = ctrl_type;
+ +	cdata->comp_id = scontrol->comp_id;
+ +	cdata->msg_index = 0;
+ +
+ +	/* calculate header and data size */
+ +	switch (cdata->type) {
+ +	case SOF_CTRL_TYPE_VALUE_CHAN_GET:
+ +	case SOF_CTRL_TYPE_VALUE_CHAN_SET:
+ +		sparams.msg_bytes = scontrol->num_channels *
+ +			sizeof(struct sof_ipc_ctrl_value_chan);
+ +		sparams.hdr_bytes = sizeof(struct sof_ipc_ctrl_data);
+ +		sparams.elems = scontrol->num_channels;
+ +		break;
+ +	case SOF_CTRL_TYPE_DATA_GET:
+ +	case SOF_CTRL_TYPE_DATA_SET:
+ +		sparams.msg_bytes = cdata->data->size;
+ +		sparams.hdr_bytes = sizeof(struct sof_ipc_ctrl_data) +
+ +			sizeof(struct sof_abi_hdr);
+ +		sparams.elems = cdata->data->size;
+ +		break;
+ +	default:
+ +		return -EINVAL;
+ +	}
+ +
+ +	cdata->rhdr.hdr.size = sparams.msg_bytes + sparams.hdr_bytes;
+ +	cdata->num_elems = sparams.elems;
+ +	cdata->elems_remaining = 0;
+ +
+ +	/* send normal size ipc in one part */
+ +	if (cdata->rhdr.hdr.size <= SOF_IPC_MSG_MAX_SIZE) {
+ +		err = sof_ipc_tx_message(sdev->ipc, cdata->rhdr.hdr.cmd, cdata,
+ +					 cdata->rhdr.hdr.size, cdata,
+ +					 cdata->rhdr.hdr.size);
+ +
+ +		if (err < 0)
+ +			dev_err(sdev->dev, "error: set/get ctrl ipc comp %d\n",
+ +				cdata->comp_id);
+ +
+ +		return err;
+ +	}
+ +
+ +	/* data is bigger than max ipc size, chop into smaller pieces */
+ +	dev_dbg(sdev->dev, "large ipc size %u, control size %u\n",
+ +		cdata->rhdr.hdr.size, scontrol->size);
+ +
+ +	/* large messages is only supported from ABI 3.3.0 onwards */
+ +	if (v->abi_version < SOF_ABI_VER(3, 3, 0)) {
+ +		dev_err(sdev->dev, "error: incompatible FW ABI version\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	err = sof_set_get_large_ctrl_data(sdev, cdata, &sparams, set);
+ +
+ +	if (err < 0)
+ +		dev_err(sdev->dev, "error: set/get large ctrl ipc comp %d\n",
+ +			cdata->comp_id);
+ +
+ +	return err;
+ +}
+ +EXPORT_SYMBOL(snd_sof_ipc_set_get_comp_data);
+ +
+ +int snd_sof_ipc_valid(struct snd_sof_dev *sdev)
+ +{
+ +	struct sof_ipc_fw_ready *ready = &sdev->fw_ready;
+ +	struct sof_ipc_fw_version *v = &ready->version;
+ +
+ +	dev_info(sdev->dev,
+ +		 "Firmware info: version %d:%d:%d-%s\n",  v->major, v->minor,
+ +		 v->micro, v->tag);
+ +	dev_info(sdev->dev,
+ +		 "Firmware: ABI %d:%d:%d Kernel ABI %d:%d:%d\n",
+ +		 SOF_ABI_VERSION_MAJOR(v->abi_version),
+ +		 SOF_ABI_VERSION_MINOR(v->abi_version),
+ +		 SOF_ABI_VERSION_PATCH(v->abi_version),
+ +		 SOF_ABI_MAJOR, SOF_ABI_MINOR, SOF_ABI_PATCH);
+ +
+ +	if (SOF_ABI_VERSION_INCOMPATIBLE(SOF_ABI_VERSION, v->abi_version)) {
+ +		dev_err(sdev->dev, "error: incompatible FW ABI version\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (SOF_ABI_VERSION_MINOR(v->abi_version) > SOF_ABI_MINOR) {
+ +		if (!IS_ENABLED(CONFIG_SND_SOC_SOF_STRICT_ABI_CHECKS)) {
+ +			dev_warn(sdev->dev, "warn: FW ABI is more recent than kernel\n");
+ +		} else {
+ +			dev_err(sdev->dev, "error: FW ABI is more recent than kernel\n");
+ +			return -EINVAL;
+ +		}
+ +	}
+ +
+ +	if (ready->flags & SOF_IPC_INFO_BUILD) {
+ +		dev_info(sdev->dev,
+ +			 "Firmware debug build %d on %s-%s - options:\n"
+ +			 " GDB: %s\n"
+ +			 " lock debug: %s\n"
+ +			 " lock vdebug: %s\n",
+ +			 v->build, v->date, v->time,
+ +			 (ready->flags & SOF_IPC_INFO_GDB) ?
+ +				"enabled" : "disabled",
+ +			 (ready->flags & SOF_IPC_INFO_LOCKS) ?
+ +				"enabled" : "disabled",
+ +			 (ready->flags & SOF_IPC_INFO_LOCKSV) ?
+ +				"enabled" : "disabled");
+ +	}
+ +
+ +	/* copy the fw_version into debugfs at first boot */
+ +	memcpy(&sdev->fw_version, v, sizeof(*v));
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(snd_sof_ipc_valid);
+ +
+++=======
+++>>>>>>> 143cdcf1780e (ASoC: SOF: loader: Switch to use the fw_loader ops)
+  struct snd_sof_ipc *snd_sof_ipc_init(struct snd_sof_dev *sdev)
+  {
+  	struct snd_sof_ipc *ipc;
+diff --cc sound/soc/sof/sof-priv.h
+index 538862b12104,38cdca6a10fd..000000000000
+--- a/sound/soc/sof/sof-priv.h
++++ b/sound/soc/sof/sof-priv.h
+@@@ -560,13 -619,13 +560,23 @@@ struct snd_sof_ipc *snd_sof_ipc_init(st
+  void snd_sof_ipc_free(struct snd_sof_dev *sdev);
+  void snd_sof_ipc_get_reply(struct snd_sof_dev *sdev);
+  void snd_sof_ipc_reply(struct snd_sof_dev *sdev, u32 msg_id);
+++<<<<<<< HEAD
+ +void snd_sof_ipc_msgs_rx(struct snd_sof_dev *sdev);
+ +int snd_sof_ipc_valid(struct snd_sof_dev *sdev);
+ +int sof_ipc_tx_message(struct snd_sof_ipc *ipc, u32 header,
+ +		       void *msg_data, size_t msg_bytes, void *reply_data,
+ +		       size_t reply_bytes);
+ +int sof_ipc_tx_message_no_pm(struct snd_sof_ipc *ipc, u32 header,
+ +			     void *msg_data, size_t msg_bytes,
+++=======
++ static inline void snd_sof_ipc_msgs_rx(struct snd_sof_dev *sdev)
++ {
++ 	sdev->ipc->ops->rx_msg(sdev);
++ }
++ int sof_ipc_tx_message(struct snd_sof_ipc *ipc, void *msg_data, size_t msg_bytes,
++ 		       void *reply_data, size_t reply_bytes);
++ int sof_ipc_tx_message_no_pm(struct snd_sof_ipc *ipc, void *msg_data, size_t msg_bytes,
+++>>>>>>> 143cdcf1780e (ASoC: SOF: loader: Switch to use the fw_loader ops)
+  			     void *reply_data, size_t reply_bytes);
+  int sof_ipc_send_msg(struct snd_sof_dev *sdev, void *msg_data, size_t msg_bytes,
+  		     size_t reply_bytes);
+* Unmerged path sound/soc/sof/ipc.c
+diff --git a/sound/soc/sof/loader.c b/sound/soc/sof/loader.c
+index b0d192749734..478c3a22dfca 100644
+--- a/sound/soc/sof/loader.c
++++ b/sound/soc/sof/loader.c
+@@ -16,285 +16,6 @@
+ #include "sof-priv.h"
+ #include "ops.h"
+ 
+-static int get_ext_windows(struct snd_sof_dev *sdev,
+-			   const struct sof_ipc_ext_data_hdr *ext_hdr)
+-{
+-	const struct sof_ipc_window *w =
+-		container_of(ext_hdr, struct sof_ipc_window, ext_hdr);
+-
+-	if (w->num_windows == 0 || w->num_windows > SOF_IPC_MAX_ELEMS)
+-		return -EINVAL;
+-
+-	if (sdev->info_window) {
+-		if (memcmp(sdev->info_window, w, ext_hdr->hdr.size)) {
+-			dev_err(sdev->dev, "error: mismatch between window descriptor from extended manifest and mailbox");
+-			return -EINVAL;
+-		}
+-		return 0;
+-	}
+-
+-	/* keep a local copy of the data */
+-	sdev->info_window = devm_kmemdup(sdev->dev, w, ext_hdr->hdr.size,
+-					 GFP_KERNEL);
+-	if (!sdev->info_window)
+-		return -ENOMEM;
+-
+-	return 0;
+-}
+-
+-static int get_cc_info(struct snd_sof_dev *sdev,
+-		       const struct sof_ipc_ext_data_hdr *ext_hdr)
+-{
+-	int ret;
+-
+-	const struct sof_ipc_cc_version *cc =
+-		container_of(ext_hdr, struct sof_ipc_cc_version, ext_hdr);
+-
+-	if (sdev->cc_version) {
+-		if (memcmp(sdev->cc_version, cc, cc->ext_hdr.hdr.size)) {
+-			dev_err(sdev->dev, "error: receive diverged cc_version descriptions");
+-			return -EINVAL;
+-		}
+-		return 0;
+-	}
+-
+-	dev_dbg(sdev->dev, "Firmware info: used compiler %s %d:%d:%d%s used optimization flags %s\n",
+-		cc->name, cc->major, cc->minor, cc->micro, cc->desc,
+-		cc->optim);
+-
+-	/* create read-only cc_version debugfs to store compiler version info */
+-	/* use local copy of the cc_version to prevent data corruption */
+-	if (sdev->first_boot) {
+-		sdev->cc_version = devm_kmalloc(sdev->dev, cc->ext_hdr.hdr.size,
+-						GFP_KERNEL);
+-
+-		if (!sdev->cc_version)
+-			return -ENOMEM;
+-
+-		memcpy(sdev->cc_version, cc, cc->ext_hdr.hdr.size);
+-		ret = snd_sof_debugfs_buf_item(sdev, sdev->cc_version,
+-					       cc->ext_hdr.hdr.size,
+-					       "cc_version", 0444);
+-
+-		/* errors are only due to memory allocation, not debugfs */
+-		if (ret < 0) {
+-			dev_err(sdev->dev, "error: snd_sof_debugfs_buf_item failed\n");
+-			return ret;
+-		}
+-	}
+-
+-	return 0;
+-}
+-
+-static int ext_man_get_fw_version(struct snd_sof_dev *sdev,
+-				  const struct sof_ext_man_elem_header *hdr)
+-{
+-	const struct sof_ext_man_fw_version *v =
+-		container_of(hdr, struct sof_ext_man_fw_version, hdr);
+-
+-	memcpy(&sdev->fw_ready.version, &v->version, sizeof(v->version));
+-	sdev->fw_ready.flags = v->flags;
+-
+-	/* log ABI versions and check FW compatibility */
+-	return snd_sof_ipc_valid(sdev);
+-}
+-
+-static int ext_man_get_windows(struct snd_sof_dev *sdev,
+-			       const struct sof_ext_man_elem_header *hdr)
+-{
+-	const struct sof_ext_man_window *w;
+-
+-	w = container_of(hdr, struct sof_ext_man_window, hdr);
+-
+-	return get_ext_windows(sdev, &w->ipc_window.ext_hdr);
+-}
+-
+-static int ext_man_get_cc_info(struct snd_sof_dev *sdev,
+-			       const struct sof_ext_man_elem_header *hdr)
+-{
+-	const struct sof_ext_man_cc_version *cc;
+-
+-	cc = container_of(hdr, struct sof_ext_man_cc_version, hdr);
+-
+-	return get_cc_info(sdev, &cc->cc_version.ext_hdr);
+-}
+-
+-static int ext_man_get_dbg_abi_info(struct snd_sof_dev *sdev,
+-				    const struct sof_ext_man_elem_header *hdr)
+-{
+-	const struct ext_man_dbg_abi *dbg_abi =
+-		container_of(hdr, struct ext_man_dbg_abi, hdr);
+-
+-	if (sdev->first_boot)
+-		dev_dbg(sdev->dev,
+-			"Firmware: DBG_ABI %d:%d:%d\n",
+-			SOF_ABI_VERSION_MAJOR(dbg_abi->dbg_abi.abi_dbg_version),
+-			SOF_ABI_VERSION_MINOR(dbg_abi->dbg_abi.abi_dbg_version),
+-			SOF_ABI_VERSION_PATCH(dbg_abi->dbg_abi.abi_dbg_version));
+-
+-	return 0;
+-}
+-
+-static int ext_man_get_config_data(struct snd_sof_dev *sdev,
+-				   const struct sof_ext_man_elem_header *hdr)
+-{
+-	const struct sof_ext_man_config_data *config =
+-		container_of(hdr, struct sof_ext_man_config_data, hdr);
+-	const struct sof_config_elem *elem;
+-	int elems_counter;
+-	int elems_size;
+-	int ret = 0;
+-	int i;
+-
+-	/* calculate elements counter */
+-	elems_size = config->hdr.size - sizeof(struct sof_ext_man_elem_header);
+-	elems_counter = elems_size / sizeof(struct sof_config_elem);
+-
+-	dev_dbg(sdev->dev, "%s can hold up to %d config elements\n",
+-		__func__, elems_counter);
+-
+-	for (i = 0; i < elems_counter; ++i) {
+-		elem = &config->elems[i];
+-		dev_dbg(sdev->dev, "%s get index %d token %d val %d\n",
+-			__func__, i, elem->token, elem->value);
+-		switch (elem->token) {
+-		case SOF_EXT_MAN_CONFIG_EMPTY:
+-			/* unused memory space is zero filled - mapped to EMPTY elements */
+-			break;
+-		case SOF_EXT_MAN_CONFIG_IPC_MSG_SIZE:
+-			/* TODO: use ipc msg size from config data */
+-			break;
+-		case SOF_EXT_MAN_CONFIG_MEMORY_USAGE_SCAN:
+-			if (sdev->first_boot && elem->value)
+-				ret = snd_sof_dbg_memory_info_init(sdev);
+-			break;
+-		default:
+-			dev_info(sdev->dev, "Unknown firmware configuration token %d value %d",
+-				 elem->token, elem->value);
+-			break;
+-		}
+-		if (ret < 0) {
+-			dev_err(sdev->dev, "error: processing sof_ext_man_config_data failed for token %d value 0x%x, %d\n",
+-				elem->token, elem->value, ret);
+-			return ret;
+-		}
+-	}
+-
+-	return 0;
+-}
+-
+-static ssize_t snd_sof_ext_man_size(const struct firmware *fw)
+-{
+-	const struct sof_ext_man_header *head;
+-
+-	head = (struct sof_ext_man_header *)fw->data;
+-
+-	/*
+-	 * assert fw size is big enough to contain extended manifest header,
+-	 * it prevents from reading unallocated memory from `head` in following
+-	 * step.
+-	 */
+-	if (fw->size < sizeof(*head))
+-		return -EINVAL;
+-
+-	/*
+-	 * When fw points to extended manifest,
+-	 * then first u32 must be equal SOF_EXT_MAN_MAGIC_NUMBER.
+-	 */
+-	if (head->magic == SOF_EXT_MAN_MAGIC_NUMBER)
+-		return head->full_size;
+-
+-	/* otherwise given fw don't have an extended manifest */
+-	return 0;
+-}
+-
+-/* parse extended FW manifest data structures */
+-static int snd_sof_fw_ext_man_parse(struct snd_sof_dev *sdev,
+-				    const struct firmware *fw)
+-{
+-	const struct sof_ext_man_elem_header *elem_hdr;
+-	const struct sof_ext_man_header *head;
+-	ssize_t ext_man_size;
+-	ssize_t remaining;
+-	uintptr_t iptr;
+-	int ret = 0;
+-
+-	head = (struct sof_ext_man_header *)fw->data;
+-	remaining = head->full_size - head->header_size;
+-	ext_man_size = snd_sof_ext_man_size(fw);
+-
+-	/* Assert firmware starts with extended manifest */
+-	if (ext_man_size <= 0)
+-		return ext_man_size;
+-
+-	/* incompatible version */
+-	if (SOF_EXT_MAN_VERSION_INCOMPATIBLE(SOF_EXT_MAN_VERSION,
+-					     head->header_version)) {
+-		dev_err(sdev->dev, "error: extended manifest version 0x%X differ from used 0x%X\n",
+-			head->header_version, SOF_EXT_MAN_VERSION);
+-		return -EINVAL;
+-	}
+-
+-	/* get first extended manifest element header */
+-	iptr = (uintptr_t)fw->data + head->header_size;
+-
+-	while (remaining > sizeof(*elem_hdr)) {
+-		elem_hdr = (struct sof_ext_man_elem_header *)iptr;
+-
+-		dev_dbg(sdev->dev, "found sof_ext_man header type %d size 0x%X\n",
+-			elem_hdr->type, elem_hdr->size);
+-
+-		if (elem_hdr->size < sizeof(*elem_hdr) ||
+-		    elem_hdr->size > remaining) {
+-			dev_err(sdev->dev, "error: invalid sof_ext_man header size, type %d size 0x%X\n",
+-				elem_hdr->type, elem_hdr->size);
+-			return -EINVAL;
+-		}
+-
+-		/* process structure data */
+-		switch (elem_hdr->type) {
+-		case SOF_EXT_MAN_ELEM_FW_VERSION:
+-			ret = ext_man_get_fw_version(sdev, elem_hdr);
+-			break;
+-		case SOF_EXT_MAN_ELEM_WINDOW:
+-			ret = ext_man_get_windows(sdev, elem_hdr);
+-			break;
+-		case SOF_EXT_MAN_ELEM_CC_VERSION:
+-			ret = ext_man_get_cc_info(sdev, elem_hdr);
+-			break;
+-		case SOF_EXT_MAN_ELEM_DBG_ABI:
+-			ret = ext_man_get_dbg_abi_info(sdev, elem_hdr);
+-			break;
+-		case SOF_EXT_MAN_ELEM_CONFIG_DATA:
+-			ret = ext_man_get_config_data(sdev, elem_hdr);
+-			break;
+-		case SOF_EXT_MAN_ELEM_PLATFORM_CONFIG_DATA:
+-			ret = snd_sof_dsp_parse_platform_ext_manifest(sdev, elem_hdr);
+-			break;
+-		default:
+-			dev_info(sdev->dev, "unknown sof_ext_man header type %d size 0x%X\n",
+-				 elem_hdr->type, elem_hdr->size);
+-			break;
+-		}
+-
+-		if (ret < 0) {
+-			dev_err(sdev->dev, "error: failed to parse sof_ext_man header type %d size 0x%X\n",
+-				elem_hdr->type, elem_hdr->size);
+-			return ret;
+-		}
+-
+-		remaining -= elem_hdr->size;
+-		iptr += elem_hdr->size;
+-	}
+-
+-	if (remaining) {
+-		dev_err(sdev->dev, "error: sof_ext_man header is inconsistent\n");
+-		return -EINVAL;
+-	}
+-
+-	return ext_man_size;
+-}
+-
+ /* generic module parser for mmaped DSPs */
+ int snd_sof_parse_module_memcpy(struct snd_sof_dev *sdev,
+ 				struct snd_sof_mod_hdr *module)
+@@ -378,96 +99,6 @@ int snd_sof_parse_module_memcpy(struct snd_sof_dev *sdev,
+ }
+ EXPORT_SYMBOL(snd_sof_parse_module_memcpy);
+ 
+-static int check_header(struct snd_sof_dev *sdev, const struct firmware *fw,
+-			size_t fw_offset)
+-{
+-	struct snd_sof_fw_header *header;
+-	size_t fw_size = fw->size - fw_offset;
+-
+-	if (fw->size <= fw_offset) {
+-		dev_err(sdev->dev, "error: firmware size must be greater than firmware offset\n");
+-		return -EINVAL;
+-	}
+-
+-	/* Read the header information from the data pointer */
+-	header = (struct snd_sof_fw_header *)(fw->data + fw_offset);
+-
+-	/* verify FW sig */
+-	if (strncmp(header->sig, SND_SOF_FW_SIG, SND_SOF_FW_SIG_SIZE) != 0) {
+-		dev_err(sdev->dev, "error: invalid firmware signature\n");
+-		return -EINVAL;
+-	}
+-
+-	/* check size is valid */
+-	if (fw_size != header->file_size + sizeof(*header)) {
+-		dev_err(sdev->dev, "error: invalid filesize mismatch got 0x%zx expected 0x%zx\n",
+-			fw_size, header->file_size + sizeof(*header));
+-		return -EINVAL;
+-	}
+-
+-	dev_dbg(sdev->dev, "header size=0x%x modules=0x%x abi=0x%x size=%zu\n",
+-		header->file_size, header->num_modules,
+-		header->abi, sizeof(*header));
+-
+-	return 0;
+-}
+-
+-static int load_modules(struct snd_sof_dev *sdev, const struct firmware *fw,
+-			size_t fw_offset)
+-{
+-	struct snd_sof_fw_header *header;
+-	struct snd_sof_mod_hdr *module;
+-	int (*load_module)(struct snd_sof_dev *sof_dev,
+-			   struct snd_sof_mod_hdr *hdr);
+-	int ret, count;
+-	size_t remaining;
+-
+-	header = (struct snd_sof_fw_header *)(fw->data + fw_offset);
+-	load_module = sof_ops(sdev)->load_module;
+-	if (!load_module)
+-		return -EINVAL;
+-
+-	/* parse each module */
+-	module = (struct snd_sof_mod_hdr *)(fw->data + fw_offset +
+-					    sizeof(*header));
+-	remaining = fw->size - sizeof(*header) - fw_offset;
+-	/* check for wrap */
+-	if (remaining > fw->size) {
+-		dev_err(sdev->dev, "error: fw size smaller than header size\n");
+-		return -EINVAL;
+-	}
+-
+-	for (count = 0; count < header->num_modules; count++) {
+-		/* check for wrap */
+-		if (remaining < sizeof(*module)) {
+-			dev_err(sdev->dev, "error: not enough data remaining\n");
+-			return -EINVAL;
+-		}
+-
+-		/* minus header size of module */
+-		remaining -= sizeof(*module);
+-
+-		/* module */
+-		ret = load_module(sdev, module);
+-		if (ret < 0) {
+-			dev_err(sdev->dev, "error: invalid module %d\n", count);
+-			return ret;
+-		}
+-
+-		if (remaining < module->size) {
+-			dev_err(sdev->dev, "error: not enough data remaining\n");
+-			return -EINVAL;
+-		}
+-
+-		/* minus body size of module */
+-		remaining -=  module->size;
+-		module = (struct snd_sof_mod_hdr *)((u8 *)module
+-			+ sizeof(*module) + module->size);
+-	}
+-
+-	return 0;
+-}
+-
+ int snd_sof_load_firmware_raw(struct snd_sof_dev *sdev)
+ {
+ 	struct snd_sof_pdata *plat_data = sdev->pdata;
+@@ -499,7 +130,7 @@ int snd_sof_load_firmware_raw(struct snd_sof_dev *sdev)
+ 	}
+ 
+ 	/* check for extended manifest */
+-	ext_man_size = snd_sof_fw_ext_man_parse(sdev, plat_data->fw);
++	ext_man_size = sdev->ipc->ops->fw_loader->parse_ext_manifest(sdev);
+ 	if (ext_man_size > 0) {
+ 		/* when no error occurred, drop extended manifest */
+ 		plat_data->fw_offset = ext_man_size;
+@@ -529,7 +160,7 @@ int snd_sof_load_firmware_memcpy(struct snd_sof_dev *sdev)
+ 		return ret;
+ 
+ 	/* make sure the FW header and file is valid */
+-	ret = check_header(sdev, plat_data->fw, plat_data->fw_offset);
++	ret = sdev->ipc->ops->fw_loader->validate(sdev);
+ 	if (ret < 0) {
+ 		dev_err(sdev->dev, "error: invalid FW header\n");
+ 		goto error;
+@@ -543,10 +174,12 @@ int snd_sof_load_firmware_memcpy(struct snd_sof_dev *sdev)
+ 	}
+ 
+ 	/* parse and load firmware modules to DSP */
+-	ret = load_modules(sdev, plat_data->fw, plat_data->fw_offset);
+-	if (ret < 0) {
+-		dev_err(sdev->dev, "error: invalid FW modules\n");
+-		goto error;
++	if (sdev->ipc->ops->fw_loader->load_fw_to_dsp) {
++		ret = sdev->ipc->ops->fw_loader->load_fw_to_dsp(sdev);
++		if (ret < 0) {
++			dev_err(sdev->dev, "Firmware loading failed\n");
++			goto error;
++		}
+ 	}
+ 
+ 	return 0;
+* Unmerged path sound/soc/sof/sof-priv.h
