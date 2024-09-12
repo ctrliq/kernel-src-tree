@@ -1,0 +1,409 @@
+iov_iter: Introduce fault_in_iov_iter_writeable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.16.1.el8_6
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit cdd591fc86e38ad3899196066219fbbd845f3162
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.16.1.el8_6/cdd591fc.failed
+
+Introduce a new fault_in_iov_iter_writeable helper for safely faulting
+in an iterator for writing.  Uses get_user_pages() to fault in the pages
+without actually writing to them, which would be destructive.
+
+We'll use fault_in_iov_iter_writeable in gfs2 once we've determined that
+the iterator passed to .read_iter isn't in memory.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit cdd591fc86e38ad3899196066219fbbd845f3162)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/pagemap.h
+#	include/linux/uio.h
+#	mm/gup.c
+diff --cc include/linux/pagemap.h
+index 0871f183968b,2f7dd14083d9..000000000000
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@@ -548,61 -733,11 +548,67 @@@ void page_endio(struct page *page, boo
+  extern void add_page_wait_queue(struct page *page, wait_queue_entry_t *waiter);
+  
+  /*
+ - * Fault in userspace address range.
+ + * Fault everything in given userspace address range in.
+   */
+++<<<<<<< HEAD
+ +static inline int fault_in_pages_writeable(char __user *uaddr, size_t size)
+ +{
+ +	char __user *end = uaddr + size - 1;
+ +
+ +	if (unlikely(size == 0))
+ +		return 0;
+ +
+ +	if (unlikely(uaddr > end))
+ +		return -EFAULT;
+ +	/*
+ +	 * Writing zeroes into userspace here is OK, because we know that if
+ +	 * the zero gets there, we'll be overwriting it.
+ +	 */
+ +	do {
+ +		if (unlikely(__put_user(0, uaddr) != 0))
+ +			return -EFAULT;
+ +		uaddr += PAGE_SIZE;
+ +	} while (uaddr <= end);
+ +
+ +	/* Check whether the range spilled into the next page. */
+ +	if (((unsigned long)uaddr & PAGE_MASK) ==
+ +			((unsigned long)end & PAGE_MASK))
+ +		return __put_user(0, end);
+ +
+ +	return 0;
+ +}
+ +
+ +static inline int fault_in_pages_readable(const char __user *uaddr, size_t size)
+ +{
+ +	volatile char c;
+ +	const char __user *end = uaddr + size - 1;
+ +
+ +	if (unlikely(size == 0))
+ +		return 0;
+ +
+ +	if (unlikely(uaddr > end))
+ +		return -EFAULT;
+ +
+ +	do {
+ +		if (unlikely(__get_user(c, uaddr) != 0))
+ +			return -EFAULT;
+ +		uaddr += PAGE_SIZE;
+ +	} while (uaddr <= end);
+ +
+ +	/* Check whether the range spilled into the next page. */
+ +	if (((unsigned long)uaddr & PAGE_MASK) ==
+ +			((unsigned long)end & PAGE_MASK)) {
+ +		return __get_user(c, end);
+ +	}
+ +
+ +	(void)c;
+ +	return 0;
+ +}
+++=======
++ size_t fault_in_writeable(char __user *uaddr, size_t size);
++ size_t fault_in_safe_writeable(const char __user *uaddr, size_t size);
++ size_t fault_in_readable(const char __user *uaddr, size_t size);
+++>>>>>>> cdd591fc86e3 (iov_iter: Introduce fault_in_iov_iter_writeable)
+  
+  int add_to_page_cache_locked(struct page *page, struct address_space *mapping,
+  				pgoff_t index, gfp_t gfp_mask);
+diff --cc include/linux/uio.h
+index d49cf8113657,25d1c24fd829..000000000000
+--- a/include/linux/uio.h
++++ b/include/linux/uio.h
+@@@ -126,19 -129,12 +126,24 @@@ static inline struct iovec iov_iter_iov
+  	};
+  }
+  
+ -size_t copy_page_from_iter_atomic(struct page *page, unsigned offset,
+ -				  size_t bytes, struct iov_iter *i);
+ +#define iov_for_each(iov, iter, start)				\
+ +	if (iov_iter_type(start) == ITER_IOVEC ||		\
+ +	    iov_iter_type(start) == ITER_KVEC)			\
+ +	for (iter = (start);					\
+ +	     (iter).count &&					\
+ +	     ((iov = iov_iter_iovec(&(iter))), 1);		\
+ +	     iov_iter_advance(&(iter), (iov).iov_len))
+ +
+ +size_t iov_iter_copy_from_user_atomic(struct page *page,
+ +		struct iov_iter *i, unsigned long offset, size_t bytes);
+  void iov_iter_advance(struct iov_iter *i, size_t bytes);
+  void iov_iter_revert(struct iov_iter *i, size_t bytes);
+++<<<<<<< HEAD
+ +int iov_iter_fault_in_readable(const struct iov_iter *i, size_t bytes);
+++=======
++ size_t fault_in_iov_iter_readable(const struct iov_iter *i, size_t bytes);
++ size_t fault_in_iov_iter_writeable(const struct iov_iter *i, size_t bytes);
+++>>>>>>> cdd591fc86e3 (iov_iter: Introduce fault_in_iov_iter_writeable)
+  size_t iov_iter_single_seg_count(const struct iov_iter *i);
+  size_t copy_page_to_iter(struct page *page, size_t offset, size_t bytes,
+  			 struct iov_iter *i);
+diff --cc mm/gup.c
+index 992475088545,795f15c410cc..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -1652,40 -1656,191 +1652,115 @@@ finish_or_fault
+  }
+  #endif /* !CONFIG_MMU */
+  
+ -/**
+ - * fault_in_writeable - fault in userspace address range for writing
+ - * @uaddr: start of address range
+ - * @size: size of address range
+ - *
+ - * Returns the number of bytes not faulted in (like copy_to_user() and
+ - * copy_from_user()).
+ - */
+ -size_t fault_in_writeable(char __user *uaddr, size_t size)
+ +#if defined(CONFIG_FS_DAX) || defined (CONFIG_CMA)
+ +static bool check_dax_vmas(struct vm_area_struct **vmas, long nr_pages)
+  {
+ -	char __user *start = uaddr, *end;
+ +	long i;
+ +	struct vm_area_struct *vma_prev = NULL;
+  
+ -	if (unlikely(size == 0))
+ -		return 0;
+ -	if (!PAGE_ALIGNED(uaddr)) {
+ -		if (unlikely(__put_user(0, uaddr) != 0))
+ -			return size;
+ -		uaddr = (char __user *)PAGE_ALIGN((unsigned long)uaddr);
+ -	}
+ -	end = (char __user *)PAGE_ALIGN((unsigned long)start + size);
+ -	if (unlikely(end < start))
+ -		end = NULL;
+ -	while (uaddr != end) {
+ -		if (unlikely(__put_user(0, uaddr) != 0))
+ -			goto out;
+ -		uaddr += PAGE_SIZE;
+ -	}
+ +	for (i = 0; i < nr_pages; i++) {
+ +		struct vm_area_struct *vma = vmas[i];
+  
+ -out:
+ -	if (size > uaddr - start)
+ -		return size - (uaddr - start);
+ -	return 0;
+ +		if (vma == vma_prev)
+ +			continue;
+ +
+ +		vma_prev = vma;
+ +
+ +		if (vma_is_fsdax(vma))
+ +			return true;
+ +	}
+ +	return false;
+  }
+ -EXPORT_SYMBOL(fault_in_writeable);
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_CMA
+ +static long check_and_migrate_cma_pages(struct task_struct *tsk,
+ +					struct mm_struct *mm,
+ +					unsigned long start,
+ +					unsigned long nr_pages,
+ +					struct page **pages,
+ +					struct vm_area_struct **vmas,
+ +					unsigned int gup_flags)
+++=======
++ /*
++  * fault_in_safe_writeable - fault in an address range for writing
++  * @uaddr: start of address range
++  * @size: length of address range
++  *
++  * Faults in an address range using get_user_pages, i.e., without triggering
++  * hardware page faults.  This is primarily useful when we already know that
++  * some or all of the pages in the address range aren't in memory.
++  *
++  * Other than fault_in_writeable(), this function is non-destructive.
++  *
++  * Note that we don't pin or otherwise hold the pages referenced that we fault
++  * in.  There's no guarantee that they'll stay in memory for any duration of
++  * time.
++  *
++  * Returns the number of bytes not faulted in, like copy_to_user() and
++  * copy_from_user().
++  */
++ size_t fault_in_safe_writeable(const char __user *uaddr, size_t size)
++ {
++ 	unsigned long start = (unsigned long)untagged_addr(uaddr);
++ 	unsigned long end, nstart, nend;
++ 	struct mm_struct *mm = current->mm;
++ 	struct vm_area_struct *vma = NULL;
++ 	int locked = 0;
++ 
++ 	nstart = start & PAGE_MASK;
++ 	end = PAGE_ALIGN(start + size);
++ 	if (end < nstart)
++ 		end = 0;
++ 	for (; nstart != end; nstart = nend) {
++ 		unsigned long nr_pages;
++ 		long ret;
++ 
++ 		if (!locked) {
++ 			locked = 1;
++ 			mmap_read_lock(mm);
++ 			vma = find_vma(mm, nstart);
++ 		} else if (nstart >= vma->vm_end)
++ 			vma = vma->vm_next;
++ 		if (!vma || vma->vm_start >= end)
++ 			break;
++ 		nend = end ? min(end, vma->vm_end) : vma->vm_end;
++ 		if (vma->vm_flags & (VM_IO | VM_PFNMAP))
++ 			continue;
++ 		if (nstart < vma->vm_start)
++ 			nstart = vma->vm_start;
++ 		nr_pages = (nend - nstart) / PAGE_SIZE;
++ 		ret = __get_user_pages_locked(mm, nstart, nr_pages,
++ 					      NULL, NULL, &locked,
++ 					      FOLL_TOUCH | FOLL_WRITE);
++ 		if (ret <= 0)
++ 			break;
++ 		nend = nstart + ret * PAGE_SIZE;
++ 	}
++ 	if (locked)
++ 		mmap_read_unlock(mm);
++ 	if (nstart == end)
++ 		return 0;
++ 	return size - min_t(size_t, nstart - start, size);
++ }
++ EXPORT_SYMBOL(fault_in_safe_writeable);
++ 
++ /**
++  * fault_in_readable - fault in userspace address range for reading
++  * @uaddr: start of user address range
++  * @size: size of user address range
++  *
++  * Returns the number of bytes not faulted in (like copy_to_user() and
++  * copy_from_user()).
++  */
++ size_t fault_in_readable(const char __user *uaddr, size_t size)
+++>>>>>>> cdd591fc86e3 (iov_iter: Introduce fault_in_iov_iter_writeable)
+  {
+ -	const char __user *start = uaddr, *end;
+ -	volatile char c;
+ -
+ -	if (unlikely(size == 0))
+ -		return 0;
+ -	if (!PAGE_ALIGNED(uaddr)) {
+ -		if (unlikely(__get_user(c, uaddr) != 0))
+ -			return size;
+ -		uaddr = (const char __user *)PAGE_ALIGN((unsigned long)uaddr);
+ -	}
+ -	end = (const char __user *)PAGE_ALIGN((unsigned long)start + size);
+ -	if (unlikely(end < start))
+ -		end = NULL;
+ -	while (uaddr != end) {
+ -		if (unlikely(__get_user(c, uaddr) != 0))
+ -			goto out;
+ -		uaddr += PAGE_SIZE;
+ -	}
+ -
+ -out:
+ -	(void)c;
+ -	if (size > uaddr - start)
+ -		return size - (uaddr - start);
+ -	return 0;
+ -}
+ -EXPORT_SYMBOL(fault_in_readable);
+ -
+ -/**
+ - * get_dump_page() - pin user page in memory while writing it to core dump
+ - * @addr: user address
+ - *
+ - * Returns struct page pointer of user page pinned for dump,
+ - * to be freed afterwards by put_page().
+ - *
+ - * Returns NULL on any kind of failure - a hole must then be inserted into
+ - * the corefile, to preserve alignment with its headers; and also returns
+ - * NULL wherever the ZERO_PAGE, or an anonymous pte_none, has been found -
+ - * allowing a hole to be left in the corefile to save disk space.
+ - *
+ - * Called without mmap_lock (takes and releases the mmap_lock by itself).
+ - */
+ -#ifdef CONFIG_ELF_CORE
+ -struct page *get_dump_page(unsigned long addr)
+ -{
+ -	struct mm_struct *mm = current->mm;
+ -	struct page *page;
+ -	int locked = 1;
+ -	int ret;
+ -
+ -	if (mmap_read_lock_killable(mm))
+ -		return NULL;
+ -	ret = __get_user_pages_locked(mm, addr, 1, &page, NULL, &locked,
+ -				      FOLL_FORCE | FOLL_DUMP | FOLL_GET);
+ -	if (locked)
+ -		mmap_read_unlock(mm);
+ -	return (ret == 1) ? page : NULL;
+ -}
+ -#endif /* CONFIG_ELF_CORE */
+ -
+ -#ifdef CONFIG_MIGRATION
+ -/*
+ - * Check whether all pages are pinnable, if so return number of pages.  If some
+ - * pages are not pinnable, migrate them, and unpin all pages. Return zero if
+ - * pages were migrated, or if some pages were not successfully isolated.
+ - * Return negative error if migration fails.
+ - */
+ -static long check_and_migrate_movable_pages(unsigned long nr_pages,
+ -					    struct page **pages,
+ -					    unsigned int gup_flags)
+ -{
+ -	unsigned long i;
+ -	unsigned long isolation_error_count = 0;
+ -	bool drain_allow = true;
+ -	LIST_HEAD(movable_page_list);
+ -	long ret = 0;
+ -	struct page *prev_head = NULL;
+ -	struct page *head;
+ +	unsigned long i, isolation_error_count;
+ +	bool drain_allow;
+ +	LIST_HEAD(cma_page_list);
+ +	long ret = nr_pages;
+ +	struct page *prev_head, *head;
+  	struct migration_target_control mtc = {
+  		.nid = NUMA_NO_NODE,
+  		.gfp_mask = GFP_USER | __GFP_NOWARN,
+* Unmerged path include/linux/pagemap.h
+* Unmerged path include/linux/uio.h
+diff --git a/lib/iov_iter.c b/lib/iov_iter.c
+index ca9bcc01dca1..0d464b47c152 100644
+--- a/lib/iov_iter.c
++++ b/lib/iov_iter.c
+@@ -440,6 +440,45 @@ int iov_iter_fault_in_readable(const struct iov_iter *i, size_t bytes)
+ }
+ EXPORT_SYMBOL(iov_iter_fault_in_readable);
+ 
++/*
++ * fault_in_iov_iter_writeable - fault in iov iterator for writing
++ * @i: iterator
++ * @size: maximum length
++ *
++ * Faults in the iterator using get_user_pages(), i.e., without triggering
++ * hardware page faults.  This is primarily useful when we already know that
++ * some or all of the pages in @i aren't in memory.
++ *
++ * Returns the number of bytes not faulted in, like copy_to_user() and
++ * copy_from_user().
++ *
++ * Always returns 0 for non-user-space iterators.
++ */
++size_t fault_in_iov_iter_writeable(const struct iov_iter *i, size_t size)
++{
++	if (iter_is_iovec(i)) {
++		size_t count = min(size, iov_iter_count(i));
++		const struct iovec *p;
++		size_t skip;
++
++		size -= count;
++		for (p = i->iov, skip = i->iov_offset; count; p++, skip = 0) {
++			size_t len = min(count, p->iov_len - skip);
++			size_t ret;
++
++			if (unlikely(!len))
++				continue;
++			ret = fault_in_safe_writeable(p->iov_base + skip, len);
++			count -= len - ret;
++			if (ret)
++				break;
++		}
++		return count + size;
++	}
++	return 0;
++}
++EXPORT_SYMBOL(fault_in_iov_iter_writeable);
++
+ void iov_iter_init(struct iov_iter *i, unsigned int direction,
+ 			const struct iovec *iov, unsigned long nr_segs,
+ 			size_t count)
+* Unmerged path mm/gup.c
