@@ -1,0 +1,182 @@
+md/md-bitmap: add a new helper to unplug bitmap asynchrously
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-536.el8
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit a022325ab970cf04b66ca128a87345714aa44b99
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-536.el8/a022325a.failed
+
+If bitmap is enabled, bitmap must update before submitting write io, this
+is why unplug callback must move these io to 'conf->pending_io_list' if
+'current->bio_list' is not empty, which will suffer performance
+degradation.
+
+A new helper md_bitmap_unplug_async() is introduced to submit bitmap io
+in a kworker, so that submit bitmap io in raid10_unplug() doesn't require
+that 'current->bio_list' is empty.
+
+This patch prepare to limit the number of plugged bio.
+
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+	Signed-off-by: Song Liu <song@kernel.org>
+Link: https://lore.kernel.org/r/20230529131106.2123367-6-yukuai1@huaweicloud.com
+(cherry picked from commit a022325ab970cf04b66ca128a87345714aa44b99)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+#	drivers/md/md.h
+diff --cc drivers/md/md.c
+index 9235f23894a5,cf3733c90c47..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -95,7 -83,7 +95,11 @@@ static struct module *md_cluster_mod
+  static DECLARE_WAIT_QUEUE_HEAD(resync_wait);
+  static struct workqueue_struct *md_wq;
+  static struct workqueue_struct *md_misc_wq;
+++<<<<<<< HEAD
+ +static struct workqueue_struct *md_rdev_misc_wq;
+++=======
++ struct workqueue_struct *md_bitmap_wq;
+++>>>>>>> a022325ab970 (md/md-bitmap: add a new helper to unplug bitmap asynchrously)
+  
+  static int remove_and_add_spares(struct mddev *mddev,
+  				 struct md_rdev *this);
+@@@ -9777,9 -9638,10 +9781,16 @@@ static int __init md_init(void
+  	if (!md_misc_wq)
+  		goto err_misc_wq;
+  
+++<<<<<<< HEAD
+ +	md_rdev_misc_wq = alloc_workqueue("md_rdev_misc", 0, 0);
+ +	if (!md_rdev_misc_wq)
+ +		goto err_rdev_misc_wq;
+++=======
++ 	md_bitmap_wq = alloc_workqueue("md_bitmap", WQ_MEM_RECLAIM | WQ_UNBOUND,
++ 				       0);
++ 	if (!md_bitmap_wq)
++ 		goto err_bitmap_wq;
+++>>>>>>> a022325ab970 (md/md-bitmap: add a new helper to unplug bitmap asynchrously)
+  
+  	ret = __register_blkdev(MD_MAJOR, "md", md_probe);
+  	if (ret < 0)
+@@@ -9799,8 -9661,8 +9810,13 @@@
+  err_mdp:
+  	unregister_blkdev(MD_MAJOR, "md");
+  err_md:
+++<<<<<<< HEAD
+ +	destroy_workqueue(md_rdev_misc_wq);
+ +err_rdev_misc_wq:
+++=======
++ 	destroy_workqueue(md_bitmap_wq);
++ err_bitmap_wq:
+++>>>>>>> a022325ab970 (md/md-bitmap: add a new helper to unplug bitmap asynchrously)
+  	destroy_workqueue(md_misc_wq);
+  err_misc_wq:
+  	destroy_workqueue(md_wq);
+@@@ -10084,14 -9949,17 +10100,15 @@@ static __exit void md_exit(void
+  		mddev->ctime = 0;
+  		mddev->hold_active = 0;
+  		/*
+ -		 * As the mddev is now fully clear, mddev_put will schedule
+ -		 * the mddev for destruction by a workqueue, and the
+ +		 * for_each_mddev() will call mddev_put() at the end of each
+ +		 * iteration.  As the mddev is now fully clear, this will
+ +		 * schedule the mddev for destruction by a workqueue, and the
+  		 * destroy_workqueue() below will wait for that to complete.
+  		 */
+ -		mddev_put(mddev);
+ -		spin_lock(&all_mddevs_lock);
+  	}
+ -	spin_unlock(&all_mddevs_lock);
+ -
+ +	destroy_workqueue(md_rdev_misc_wq);
+  	destroy_workqueue(md_misc_wq);
++ 	destroy_workqueue(md_bitmap_wq);
+  	destroy_workqueue(md_wq);
+  }
+  
+diff --cc drivers/md/md.h
+index 5395b1ad0d86,bfd2306bc750..000000000000
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@@ -859,7 -844,20 +859,23 @@@ static inline void mddev_check_writesam
+  static inline void mddev_check_write_zeroes(struct mddev *mddev, struct bio *bio)
+  {
+  	if (bio_op(bio) == REQ_OP_WRITE_ZEROES &&
+ -	    !bio->bi_bdev->bd_disk->queue->limits.max_write_zeroes_sectors)
+ +	    !bio->bi_disk->queue->limits.max_write_zeroes_sectors)
+  		mddev->queue->limits.max_write_zeroes_sectors = 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ struct mdu_array_info_s;
++ struct mdu_disk_info_s;
++ 
++ extern int mdp_major;
++ extern struct workqueue_struct *md_bitmap_wq;
++ void md_autostart_arrays(int part);
++ int md_set_array_info(struct mddev *mddev, struct mdu_array_info_s *info);
++ int md_add_new_disk(struct mddev *mddev, struct mdu_disk_info_s *info);
++ int do_md_run(struct mddev *mddev);
++ 
++ extern const struct block_device_operations md_fops;
++ 
+++>>>>>>> a022325ab970 (md/md-bitmap: add a new helper to unplug bitmap asynchrously)
+  #endif /* _MD_MD_H */
+diff --git a/drivers/md/md-bitmap.c b/drivers/md/md-bitmap.c
+index 3d69295dbf59..3a8905c5e37e 100644
+--- a/drivers/md/md-bitmap.c
++++ b/drivers/md/md-bitmap.c
+@@ -1059,6 +1059,35 @@ void md_bitmap_unplug(struct bitmap *bitmap)
+ }
+ EXPORT_SYMBOL(md_bitmap_unplug);
+ 
++struct bitmap_unplug_work {
++	struct work_struct work;
++	struct bitmap *bitmap;
++	struct completion *done;
++};
++
++static void md_bitmap_unplug_fn(struct work_struct *work)
++{
++	struct bitmap_unplug_work *unplug_work =
++		container_of(work, struct bitmap_unplug_work, work);
++
++	md_bitmap_unplug(unplug_work->bitmap);
++	complete(unplug_work->done);
++}
++
++void md_bitmap_unplug_async(struct bitmap *bitmap)
++{
++	DECLARE_COMPLETION_ONSTACK(done);
++	struct bitmap_unplug_work unplug_work;
++
++	INIT_WORK_ONSTACK(&unplug_work.work, md_bitmap_unplug_fn);
++	unplug_work.bitmap = bitmap;
++	unplug_work.done = &done;
++
++	queue_work(md_bitmap_wq, &unplug_work.work);
++	wait_for_completion(&done);
++}
++EXPORT_SYMBOL(md_bitmap_unplug_async);
++
+ static void md_bitmap_set_memory_bits(struct bitmap *bitmap, sector_t offset, int needed);
+ /* * bitmap_init_from_disk -- called at bitmap_create time to initialize
+  * the in-memory bitmap from the on-disk bitmap -- also, sets up the
+diff --git a/drivers/md/md-bitmap.h b/drivers/md/md-bitmap.h
+index cfd7395de8fd..8a2ec83facc8 100644
+--- a/drivers/md/md-bitmap.h
++++ b/drivers/md/md-bitmap.h
+@@ -264,6 +264,7 @@ void md_bitmap_sync_with_cluster(struct mddev *mddev,
+ 				 sector_t new_lo, sector_t new_hi);
+ 
+ void md_bitmap_unplug(struct bitmap *bitmap);
++void md_bitmap_unplug_async(struct bitmap *bitmap);
+ void md_bitmap_daemon_work(struct mddev *mddev);
+ 
+ int md_bitmap_resize(struct bitmap *bitmap, sector_t blocks,
+* Unmerged path drivers/md/md.c
+* Unmerged path drivers/md/md.h
