@@ -1,0 +1,253 @@
+cifs: Fix UAF in cifs_demultiplex_thread()
+
+jira LE-1907
+cve CVE-2023-1192
+Rebuild_History Non-Buildable kernel-4.18.0-523.el8
+commit-author Zhang Xiaoxu <zhangxiaoxu5@huawei.com>
+commit d527f51331cace562393a8038d870b3e9916686f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-523.el8/d527f513.failed
+
+There is a UAF when xfstests on cifs:
+
+  BUG: KASAN: use-after-free in smb2_is_network_name_deleted+0x27/0x160
+  Read of size 4 at addr ffff88810103fc08 by task cifsd/923
+
+  CPU: 1 PID: 923 Comm: cifsd Not tainted 6.1.0-rc4+ #45
+  ...
+  Call Trace:
+   <TASK>
+   dump_stack_lvl+0x34/0x44
+   print_report+0x171/0x472
+   kasan_report+0xad/0x130
+   kasan_check_range+0x145/0x1a0
+   smb2_is_network_name_deleted+0x27/0x160
+   cifs_demultiplex_thread.cold+0x172/0x5a4
+   kthread+0x165/0x1a0
+   ret_from_fork+0x1f/0x30
+   </TASK>
+
+  Allocated by task 923:
+   kasan_save_stack+0x1e/0x40
+   kasan_set_track+0x21/0x30
+   __kasan_slab_alloc+0x54/0x60
+   kmem_cache_alloc+0x147/0x320
+   mempool_alloc+0xe1/0x260
+   cifs_small_buf_get+0x24/0x60
+   allocate_buffers+0xa1/0x1c0
+   cifs_demultiplex_thread+0x199/0x10d0
+   kthread+0x165/0x1a0
+   ret_from_fork+0x1f/0x30
+
+  Freed by task 921:
+   kasan_save_stack+0x1e/0x40
+   kasan_set_track+0x21/0x30
+   kasan_save_free_info+0x2a/0x40
+   ____kasan_slab_free+0x143/0x1b0
+   kmem_cache_free+0xe3/0x4d0
+   cifs_small_buf_release+0x29/0x90
+   SMB2_negotiate+0x8b7/0x1c60
+   smb2_negotiate+0x51/0x70
+   cifs_negotiate_protocol+0xf0/0x160
+   cifs_get_smb_ses+0x5fa/0x13c0
+   mount_get_conns+0x7a/0x750
+   cifs_mount+0x103/0xd00
+   cifs_smb3_do_mount+0x1dd/0xcb0
+   smb3_get_tree+0x1d5/0x300
+   vfs_get_tree+0x41/0xf0
+   path_mount+0x9b3/0xdd0
+   __x64_sys_mount+0x190/0x1d0
+   do_syscall_64+0x35/0x80
+   entry_SYSCALL_64_after_hwframe+0x46/0xb0
+
+The UAF is because:
+
+ mount(pid: 921)               | cifsd(pid: 923)
+-------------------------------|-------------------------------
+                               | cifs_demultiplex_thread
+SMB2_negotiate                 |
+ cifs_send_recv                |
+  compound_send_recv           |
+   smb_send_rqst               |
+    wait_for_response          |
+     wait_event_state      [1] |
+                               |  standard_receive3
+                               |   cifs_handle_standard
+                               |    handle_mid
+                               |     mid->resp_buf = buf;  [2]
+                               |     dequeue_mid           [3]
+     KILL the process      [4] |
+    resp_iov[i].iov_base = buf |
+ free_rsp_buf              [5] |
+                               |   is_network_name_deleted [6]
+                               |   callback
+
+1. After send request to server, wait the response until
+    mid->mid_state != SUBMITTED;
+2. Receive response from server, and set it to mid;
+3. Set the mid state to RECEIVED;
+4. Kill the process, the mid state already RECEIVED, get 0;
+5. Handle and release the negotiate response;
+6. UAF.
+
+It can be easily reproduce with add some delay in [3] - [6].
+
+Only sync call has the problem since async call's callback is
+executed in cifsd process.
+
+Add an extra state to mark the mid state to READY before wakeup the
+waitter, then it can get the resp safely.
+
+Fixes: ec637e3ffb6b ("[CIFS] Avoid extra large buffer allocation (and memcpy) in cifs_readpages")
+	Reviewed-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+	Signed-off-by: Zhang Xiaoxu <zhangxiaoxu5@huawei.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit d527f51331cace562393a8038d870b3e9916686f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/transport.c
+diff --cc fs/cifs/transport.c
+index f9e683badfaa,14710afdc2a3..000000000000
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@@ -99,12 -89,13 +101,13 @@@ static void _cifs_mid_q_entry_release(s
+  	struct TCP_Server_Info *server = midEntry->server;
+  
+  	if (midEntry->resp_buf && (midEntry->mid_flags & MID_WAIT_CANCELLED) &&
+- 	    midEntry->mid_state == MID_RESPONSE_RECEIVED &&
++ 	    (midEntry->mid_state == MID_RESPONSE_RECEIVED ||
++ 	     midEntry->mid_state == MID_RESPONSE_READY) &&
+  	    server->ops->handle_cancelled_mid)
+ -		server->ops->handle_cancelled_mid(midEntry, server);
+ +		server->ops->handle_cancelled_mid(midEntry->resp_buf, server);
+  
+  	midEntry->mid_state = MID_FREE;
+ -	atomic_dec(&mid_count);
+ +	atomic_dec(&midCount);
+  	if (midEntry->large_buf)
+  		cifs_buf_release(midEntry->resp_buf);
+  	else
+@@@ -723,8 -739,10 +726,15 @@@ wait_for_response(struct TCP_Server_Inf
+  {
+  	int error;
+  
+++<<<<<<< HEAD:fs/cifs/transport.c
+ +	error = wait_event_freezekillable_unsafe(server->response_q,
+ +				    midQ->mid_state != MID_REQUEST_SUBMITTED);
+++=======
++ 	error = wait_event_state(server->response_q,
++ 				 midQ->mid_state != MID_REQUEST_SUBMITTED &&
++ 				 midQ->mid_state != MID_RESPONSE_RECEIVED,
++ 				 (TASK_KILLABLE|TASK_FREEZABLE_UNSAFE));
+++>>>>>>> d527f51331ca (cifs: Fix UAF in cifs_demultiplex_thread()):fs/smb/client/transport.c
+  	if (error < 0)
+  		return -ERESTARTSYS;
+  
+@@@ -876,10 -892,10 +886,15 @@@ cifs_sync_mid_result(struct mid_q_entr
+  	cifs_dbg(FYI, "%s: cmd=%d mid=%llu state=%d\n",
+  		 __func__, le16_to_cpu(mid->command), mid->mid, mid->mid_state);
+  
+ -	spin_lock(&server->mid_lock);
+ +	spin_lock(&GlobalMid_Lock);
+  	switch (mid->mid_state) {
+++<<<<<<< HEAD:fs/cifs/transport.c
+ +	case MID_RESPONSE_RECEIVED:
+ +		spin_unlock(&GlobalMid_Lock);
+++=======
++ 	case MID_RESPONSE_READY:
++ 		spin_unlock(&server->mid_lock);
+++>>>>>>> d527f51331ca (cifs: Fix UAF in cifs_demultiplex_thread()):fs/smb/client/transport.c
+  		return rc;
+  	case MID_RETRY_NEEDED:
+  		rc = -EAGAIN;
+@@@ -1159,12 -1211,13 +1177,13 @@@ compound_send_recv(const unsigned int x
+  	}
+  	if (rc != 0) {
+  		for (; i < num_rqst; i++) {
+ -			cifs_server_dbg(FYI, "Cancelling wait for mid %llu cmd: %d\n",
+ +			cifs_server_dbg(VFS, "Cancelling wait for mid %llu cmd: %d\n",
+  				 midQ[i]->mid, le16_to_cpu(midQ[i]->command));
+  			send_cancel(server, &rqst[i], midQ[i]);
+ -			spin_lock(&server->mid_lock);
+ +			spin_lock(&GlobalMid_Lock);
+  			midQ[i]->mid_flags |= MID_WAIT_CANCELLED;
+- 			if (midQ[i]->mid_state == MID_REQUEST_SUBMITTED) {
++ 			if (midQ[i]->mid_state == MID_REQUEST_SUBMITTED ||
++ 			    midQ[i]->mid_state == MID_RESPONSE_RECEIVED) {
+  				midQ[i]->callback = cifs_cancelled_callback;
+  				cancelled_mid[i] = true;
+  				credits[i].value = 0;
+@@@ -1363,11 -1424,12 +1382,17 @@@ SendReceive(const unsigned int xid, str
+  	rc = wait_for_response(server, midQ);
+  	if (rc != 0) {
+  		send_cancel(server, &rqst, midQ);
+++<<<<<<< HEAD:fs/cifs/transport.c
+ +		spin_lock(&GlobalMid_Lock);
+ +		if (midQ->mid_state == MID_REQUEST_SUBMITTED) {
+++=======
++ 		spin_lock(&server->mid_lock);
++ 		if (midQ->mid_state == MID_REQUEST_SUBMITTED ||
++ 		    midQ->mid_state == MID_RESPONSE_RECEIVED) {
+++>>>>>>> d527f51331ca (cifs: Fix UAF in cifs_demultiplex_thread()):fs/smb/client/transport.c
+  			/* no longer considered to be "in-flight" */
+ -			midQ->callback = release_mid;
+ -			spin_unlock(&server->mid_lock);
+ +			midQ->callback = DeleteMidQEntry;
+ +			spin_unlock(&GlobalMid_Lock);
+  			add_credits(server, &credits, 0);
+  			return rc;
+  		}
+@@@ -1508,10 -1573,13 +1534,11 @@@ SendReceiveBlockingLock(const unsigned 
+  		 (server->tcpStatus != CifsNew)));
+  
+  	/* Were we interrupted by a signal ? */
+ -	spin_lock(&server->srv_lock);
+  	if ((rc == -ERESTARTSYS) &&
+- 		(midQ->mid_state == MID_REQUEST_SUBMITTED) &&
++ 		(midQ->mid_state == MID_REQUEST_SUBMITTED ||
++ 		 midQ->mid_state == MID_RESPONSE_RECEIVED) &&
+  		((server->tcpStatus == CifsGood) ||
+  		 (server->tcpStatus == CifsNew))) {
+ -		spin_unlock(&server->srv_lock);
+  
+  		if (in_buf->Command == SMB_COM_TRANSACTION2) {
+  			/* POSIX lock. We send a NT_CANCEL SMB to cause the
+@@@ -1538,14 -1606,15 +1565,20 @@@
+  		rc = wait_for_response(server, midQ);
+  		if (rc) {
+  			send_cancel(server, &rqst, midQ);
+++<<<<<<< HEAD:fs/cifs/transport.c
+ +			spin_lock(&GlobalMid_Lock);
+ +			if (midQ->mid_state == MID_REQUEST_SUBMITTED) {
+++=======
++ 			spin_lock(&server->mid_lock);
++ 			if (midQ->mid_state == MID_REQUEST_SUBMITTED ||
++ 			    midQ->mid_state == MID_RESPONSE_RECEIVED) {
+++>>>>>>> d527f51331ca (cifs: Fix UAF in cifs_demultiplex_thread()):fs/smb/client/transport.c
+  				/* no longer considered to be "in-flight" */
+ -				midQ->callback = release_mid;
+ -				spin_unlock(&server->mid_lock);
+ +				midQ->callback = DeleteMidQEntry;
+ +				spin_unlock(&GlobalMid_Lock);
+  				return rc;
+  			}
+ -			spin_unlock(&server->mid_lock);
+ +			spin_unlock(&GlobalMid_Lock);
+  		}
+  
+  		/* We got the response - restart system call. */
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index 8112c08fc99a..28ee1ef4b114 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -1685,6 +1685,7 @@ static inline bool is_retryable_error(int error)
+ #define   MID_RETRY_NEEDED      8 /* session closed while this request out */
+ #define   MID_RESPONSE_MALFORMED 0x10
+ #define   MID_SHUTDOWN		 0x20
++#define   MID_RESPONSE_READY 0x40 /* ready for other process handle the rsp */
+ 
+ /* Flags */
+ #define   MID_WAIT_CANCELLED	 1 /* Cancelled while waiting for response */
+* Unmerged path fs/cifs/transport.c
