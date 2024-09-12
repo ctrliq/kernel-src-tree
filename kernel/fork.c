@@ -105,6 +105,7 @@
 #include <trace/events/sched.h>
 
 #include <linux/rh_tasklist_lock.h>
+#include <linux/rh_kabi_aux.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/task.h>
@@ -1746,6 +1747,11 @@ static void pidfd_show_fdinfo(struct seq_file *m, struct file *f)
 }
 #endif
 
+static int wait_pidfd_ctor(void *pid, void *wait_pidfd, void *data)
+{
+	init_waitqueue_head(wait_pidfd);
+	return 0;
+}
 /*
  * Poll support for process exit notification.
  */
@@ -1753,9 +1759,15 @@ static __poll_t pidfd_poll(struct file *file, struct poll_table_struct *pts)
 {
 	struct task_struct *task;
 	struct pid *pid = file->private_data;
+	wait_queue_head_t *wait_pidfd;
 	__poll_t poll_flags = 0;
 
-	poll_wait(file, &pid->wait_pidfd, pts);
+	wait_pidfd = kabi_aux_get_or_alloc(pid, 0, sizeof(wait_queue_head_t),
+					   GFP_KERNEL, wait_pidfd_ctor, NULL);
+	if (wait_pidfd)
+		poll_wait(file, wait_pidfd, pts);
+	else
+		return EPOLLERR;
 
 	rcu_read_lock();
 	task = pid_task(pid, PIDTYPE_PID);

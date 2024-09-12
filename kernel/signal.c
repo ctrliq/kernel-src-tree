@@ -56,6 +56,7 @@
 #include "audit.h"	/* audit_signal_info() */
 
 #include <linux/rh_tasklist_lock.h>
+#include <linux/rh_kabi_aux.h>
 
 /*
  * SLAB caches for signal bits.
@@ -1843,9 +1844,12 @@ ret:
 static void do_notify_pidfd(struct task_struct *task)
 {
 	struct pid *pid;
+	wait_queue_head_t *wait_pidfd;
 
 	pid = task_pid(task);
-	wake_up_all(&pid->wait_pidfd);
+	wait_pidfd = kabi_aux_get(pid, 0);
+	if (wait_pidfd)
+		wake_up_all(wait_pidfd);
 }
 
 /*
