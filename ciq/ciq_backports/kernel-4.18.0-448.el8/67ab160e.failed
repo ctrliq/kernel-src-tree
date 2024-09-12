@@ -1,0 +1,611 @@
+sfc: insert default MAE rules to connect VFs to representors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Edward Cree <ecree.xilinx@gmail.com>
+commit 67ab160ed08f5bb55aff55aa41e6bde56cb83661
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/67ab160e.failed
+
+Default rules are low-priority switching rules which the hardware uses
+ in the absence of higher-priority rules.  Each representor requires a
+ corresponding rule matching traffic from its representee VF and
+ delivering to the PF (where a check on INGRESS_MPORT in
+ __ef100_rx_packet() will direct it to the representor).  No rule is
+ required in the reverse direction, because representor TX uses a TX
+ override descriptor to bypass the MAE and deliver directly to the VF.
+Since inserting any rule into the MAE disables the firmware's own
+ default rules, also insert a pair of rules to connect the PF to the
+ physical network port and vice-versa.
+
+	Signed-off-by: Edward Cree <ecree.xilinx@gmail.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 67ab160ed08f5bb55aff55aa41e6bde56cb83661)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/Makefile
+#	drivers/net/ethernet/sfc/ef100.c
+#	drivers/net/ethernet/sfc/ef100_netdev.c
+#	drivers/net/ethernet/sfc/ef100_nic.c
+#	drivers/net/ethernet/sfc/ef100_rep.c
+#	drivers/net/ethernet/sfc/ef100_rep.h
+#	drivers/net/ethernet/sfc/mae.c
+#	drivers/net/ethernet/sfc/mae.h
+diff --cc drivers/net/ethernet/sfc/Makefile
+index b9298031ea51,bb06fa228367..000000000000
+--- a/drivers/net/ethernet/sfc/Makefile
++++ b/drivers/net/ethernet/sfc/Makefile
+@@@ -8,7 -8,8 +8,12 @@@ sfc-y			+= efx.o efx_common.o efx_chann
+  			   ef100.o ef100_nic.o ef100_netdev.o \
+  			   ef100_ethtool.o ef100_rx.o ef100_tx.o
+  sfc-$(CONFIG_SFC_MTD)	+= mtd.o
+++<<<<<<< HEAD
+ +sfc-$(CONFIG_SFC_SRIOV)	+= sriov.o ef10_sriov.o ef100_sriov.o
+++=======
++ sfc-$(CONFIG_SFC_SRIOV)	+= sriov.o ef10_sriov.o ef100_sriov.o ef100_rep.o \
++                            mae.o tc.o
+++>>>>>>> 67ab160ed08f (sfc: insert default MAE rules to connect VFs to representors)
+  
+  obj-$(CONFIG_SFC)	+= sfc.o
+  
+diff --cc drivers/net/ethernet/sfc/ef100.c
+index a77100239e7c,71aab3d0480f..000000000000
+--- a/drivers/net/ethernet/sfc/ef100.c
++++ b/drivers/net/ethernet/sfc/ef100.c
+@@@ -430,21 -429,18 +430,29 @@@ static void ef100_pci_remove(struct pci
+  	if (!efx)
+  		return;
+  
+++<<<<<<< HEAD
+ +	rtnl_lock();
+ +	dev_close(efx->net_dev);
+ +	rtnl_unlock();
+++=======
++ 	probe_data = container_of(efx, struct efx_probe_data, efx);
++ 	ef100_remove_netdev(probe_data);
++ #ifdef CONFIG_SFC_SRIOV
++ 	efx_fini_struct_tc(efx);
++ #endif
+ -
+++>>>>>>> 67ab160ed08f (sfc: insert default MAE rules to connect VFs to representors)
+ +
+ +	/* Unregistering our netdev notifier triggers unbinding of TC indirect
+ +	 * blocks, so we have to do it before PCI removal.
+ +	 */
+ +	unregister_netdevice_notifier(&efx->netdev_notifier);
+ +#if defined(CONFIG_SFC_SRIOV)
+ +	if (!efx->type->is_vf)
+ +		efx_ef100_pci_sriov_disable(efx);
+ +#endif
+  	ef100_remove(efx);
+  	efx_fini_io(efx);
+ -
+ -	pci_dbg(pci_dev, "shutdown successful\n");
+ -
+ -	pci_disable_pcie_error_reporting(pci_dev);
+ +	netif_dbg(efx, drv, efx->net_dev, "shutdown successful\n");
+  
+  	pci_set_drvdata(pci_dev, NULL);
+  	efx_fini_struct(efx);
+diff --cc drivers/net/ethernet/sfc/ef100_netdev.c
+index 7a80979f4ab7,17b9d37218cb..000000000000
+--- a/drivers/net/ethernet/sfc/ef100_netdev.c
++++ b/drivers/net/ethernet/sfc/ef100_netdev.c
+@@@ -295,3 -309,115 +295,118 @@@ void ef100_unregister_netdev(struct efx
+  		unregister_netdev(efx->net_dev);
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ void ef100_remove_netdev(struct efx_probe_data *probe_data)
++ {
++ 	struct efx_nic *efx = &probe_data->efx;
++ 
++ 	if (!efx->net_dev)
++ 		return;
++ 
++ 	rtnl_lock();
++ 	dev_close(efx->net_dev);
++ 	rtnl_unlock();
++ 
++ 	unregister_netdevice_notifier(&efx->netdev_notifier);
++ #if defined(CONFIG_SFC_SRIOV)
++ 	if (!efx->type->is_vf)
++ 		efx_ef100_pci_sriov_disable(efx, true);
++ #endif
++ 
++ 	ef100_unregister_netdev(efx);
++ 
++ #ifdef CONFIG_SFC_SRIOV
++ 	efx_fini_tc(efx);
++ #endif
++ 
++ 	down_write(&efx->filter_sem);
++ 	efx_mcdi_filter_table_remove(efx);
++ 	up_write(&efx->filter_sem);
++ 	efx_fini_channels(efx);
++ 	kfree(efx->phy_data);
++ 	efx->phy_data = NULL;
++ 
++ 	free_netdev(efx->net_dev);
++ 	efx->net_dev = NULL;
++ 	efx->state = STATE_PROBED;
++ }
++ 
++ int ef100_probe_netdev(struct efx_probe_data *probe_data)
++ {
++ 	struct efx_nic *efx = &probe_data->efx;
++ 	struct efx_probe_data **probe_ptr;
++ 	struct net_device *net_dev;
++ 	int rc;
++ 
++ 	if (efx->mcdi->fn_flags &
++ 			(1 << MC_CMD_DRV_ATTACH_EXT_OUT_FLAG_NO_ACTIVE_PORT)) {
++ 		pci_info(efx->pci_dev, "No network port on this PCI function");
++ 		return 0;
++ 	}
++ 
++ 	/* Allocate and initialise a struct net_device */
++ 	net_dev = alloc_etherdev_mq(sizeof(probe_data), EFX_MAX_CORE_TX_QUEUES);
++ 	if (!net_dev)
++ 		return -ENOMEM;
++ 	probe_ptr = netdev_priv(net_dev);
++ 	*probe_ptr = probe_data;
++ 	efx->net_dev = net_dev;
++ 	SET_NETDEV_DEV(net_dev, &efx->pci_dev->dev);
++ 
++ 	net_dev->features |= efx->type->offload_features;
++ 	net_dev->hw_features |= efx->type->offload_features;
++ 	net_dev->hw_enc_features |= efx->type->offload_features;
++ 	net_dev->vlan_features |= NETIF_F_HW_CSUM | NETIF_F_SG |
++ 				  NETIF_F_HIGHDMA | NETIF_F_ALL_TSO;
++ 	netif_set_tso_max_segs(net_dev,
++ 			       ESE_EF100_DP_GZ_TSO_MAX_HDR_NUM_SEGS_DEFAULT);
++ 	efx->mdio.dev = net_dev;
++ 
++ 	rc = efx_ef100_init_datapath_caps(efx);
++ 	if (rc < 0)
++ 		goto fail;
++ 
++ 	rc = ef100_phy_probe(efx);
++ 	if (rc)
++ 		goto fail;
++ 
++ 	rc = efx_init_channels(efx);
++ 	if (rc)
++ 		goto fail;
++ 
++ 	down_write(&efx->filter_sem);
++ 	rc = ef100_filter_table_probe(efx);
++ 	up_write(&efx->filter_sem);
++ 	if (rc)
++ 		goto fail;
++ 
++ 	netdev_rss_key_fill(efx->rss_context.rx_hash_key,
++ 			    sizeof(efx->rss_context.rx_hash_key));
++ 
++ 	/* Don't fail init if RSS setup doesn't work. */
++ 	efx_mcdi_push_default_indir_table(efx, efx->n_rx_channels);
++ 
++ 	rc = ef100_register_netdev(efx);
++ 	if (rc)
++ 		goto fail;
++ 
++ 	if (!efx->type->is_vf) {
++ 		rc = ef100_probe_netdev_pf(efx);
++ 		if (rc)
++ 			goto fail;
++ 	}
++ 
++ 	efx->netdev_notifier.notifier_call = ef100_netdev_event;
++ 	rc = register_netdevice_notifier(&efx->netdev_notifier);
++ 	if (rc) {
++ 		netif_err(efx, probe, efx->net_dev,
++ 			  "Failed to register netdevice notifier, rc=%d\n", rc);
++ 		goto fail;
++ 	}
++ 
++ fail:
++ 	return rc;
++ }
+++>>>>>>> 67ab160ed08f (sfc: insert default MAE rules to connect VFs to representors)
+diff --cc drivers/net/ethernet/sfc/ef100_nic.c
+index e5b782dbc5d1,25cd43e3fcf7..000000000000
+--- a/drivers/net/ethernet/sfc/ef100_nic.c
++++ b/drivers/net/ethernet/sfc/ef100_nic.c
+@@@ -1104,6 -1090,34 +1104,37 @@@ int ef100_probe_pf(struct efx_nic *efx
+  	eth_hw_addr_set(net_dev, net_dev->perm_addr);
+  	memcpy(nic_data->port_id, net_dev->perm_addr, ETH_ALEN);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!nic_data->grp_mae)
++ 		return 0;
++ 
++ #ifdef CONFIG_SFC_SRIOV
++ 	rc = efx_init_struct_tc(efx);
++ 	if (rc)
++ 		return rc;
++ 
++ 	rc = efx_ef100_get_base_mport(efx);
++ 	if (rc) {
++ 		netif_warn(efx, probe, net_dev,
++ 			   "Failed to probe base mport rc %d; representors will not function\n",
++ 			   rc);
++ 	}
++ 
++ 	rc = efx_init_tc(efx);
++ 	if (rc) {
++ 		/* Either we don't have an MAE at all (i.e. legacy v-switching),
++ 		 * or we do but we failed to probe it.  In the latter case, we
++ 		 * may not have set up default rules, in which case we won't be
++ 		 * able to pass any traffic.  However, we don't fail the probe,
++ 		 * because the user might need to use the netdevice to apply
++ 		 * configuration changes to fix whatever's wrong with the MAE.
++ 		 */
++ 		netif_warn(efx, probe, net_dev, "Failed to probe MAE rc %d\n",
++ 			   rc);
++ 	}
++ #endif
+++>>>>>>> 67ab160ed08f (sfc: insert default MAE rules to connect VFs to representors)
+  	return 0;
+  
+  fail:
+* Unmerged path drivers/net/ethernet/sfc/ef100_rep.c
+* Unmerged path drivers/net/ethernet/sfc/ef100_rep.h
+* Unmerged path drivers/net/ethernet/sfc/mae.c
+* Unmerged path drivers/net/ethernet/sfc/mae.h
+* Unmerged path drivers/net/ethernet/sfc/Makefile
+* Unmerged path drivers/net/ethernet/sfc/ef100.c
+* Unmerged path drivers/net/ethernet/sfc/ef100_netdev.c
+* Unmerged path drivers/net/ethernet/sfc/ef100_nic.c
+* Unmerged path drivers/net/ethernet/sfc/ef100_rep.c
+* Unmerged path drivers/net/ethernet/sfc/ef100_rep.h
+* Unmerged path drivers/net/ethernet/sfc/mae.c
+* Unmerged path drivers/net/ethernet/sfc/mae.h
+diff --git a/drivers/net/ethernet/sfc/mcdi.h b/drivers/net/ethernet/sfc/mcdi.h
+index f74f6ce8b27d..26bc69f76801 100644
+--- a/drivers/net/ethernet/sfc/mcdi.h
++++ b/drivers/net/ethernet/sfc/mcdi.h
+@@ -205,6 +205,8 @@ void efx_mcdi_sensor_event(struct efx_nic *efx, efx_qword_t *ev);
+ 	((_ofst) + BUILD_BUG_ON_ZERO((_ofst) & (_align - 1)))
+ #define _MCDI_DWORD(_buf, _field)					\
+ 	((_buf) + (_MCDI_CHECK_ALIGN(MC_CMD_ ## _field ## _OFST, 4) >> 2))
++#define _MCDI_STRUCT_DWORD(_buf, _field)				\
++	((_buf) + (_MCDI_CHECK_ALIGN(_field ## _OFST, 4) >> 2))
+ 
+ #define MCDI_BYTE(_buf, _field)						\
+ 	((void)BUILD_BUG_ON_ZERO(MC_CMD_ ## _field ## _LEN != 1),	\
+@@ -214,6 +216,8 @@ void efx_mcdi_sensor_event(struct efx_nic *efx, efx_qword_t *ev);
+ 	 le16_to_cpu(*(__force const __le16 *)MCDI_PTR(_buf, _field)))
+ #define MCDI_SET_DWORD(_buf, _field, _value)				\
+ 	EFX_POPULATE_DWORD_1(*_MCDI_DWORD(_buf, _field), EFX_DWORD_0, _value)
++#define MCDI_STRUCT_SET_DWORD(_buf, _field, _value)			\
++	EFX_POPULATE_DWORD_1(*_MCDI_STRUCT_DWORD(_buf, _field), EFX_DWORD_0, _value)
+ #define MCDI_DWORD(_buf, _field)					\
+ 	EFX_DWORD_FIELD(*_MCDI_DWORD(_buf, _field), EFX_DWORD_0)
+ #define MCDI_POPULATE_DWORD_1(_buf, _field, _name1, _value1)		\
+diff --git a/drivers/net/ethernet/sfc/mcdi_pcol_mae.h b/drivers/net/ethernet/sfc/mcdi_pcol_mae.h
+new file mode 100644
+index 000000000000..ff6d80c8e486
+--- /dev/null
++++ b/drivers/net/ethernet/sfc/mcdi_pcol_mae.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/****************************************************************************
++ * Driver for Solarflare network controllers and boards
++ * Copyright 2019 Solarflare Communications Inc.
++ * Copyright 2019-2022 Xilinx, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published
++ * by the Free Software Foundation, incorporated herein by reference.
++ */
++
++#ifndef MCDI_PCOL_MAE_H
++#define MCDI_PCOL_MAE_H
++/* MCDI definitions for Match-Action Engine functionality, that are
++ * missing from the main mcdi_pcol.h
++ */
++
++/* MC_CMD_MAE_COUNTER_LIST_ALLOC is not (yet) a released API, but the
++ * following value is needed as an argument to MC_CMD_MAE_ACTION_SET_ALLOC.
++ */
++/* enum: A counter ID that is guaranteed never to represent a real counter */
++#define          MC_CMD_MAE_COUNTER_LIST_ALLOC_OUT_COUNTER_LIST_ID_NULL 0xffffffff
++
++#endif /* MCDI_PCOL_MAE_H */
+diff --git a/drivers/net/ethernet/sfc/net_driver.h b/drivers/net/ethernet/sfc/net_driver.h
+index 17d4a973828a..860f9a88f118 100644
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -975,6 +975,7 @@ enum efx_xdp_tx_queues_mode {
+  * @xdp_rxq_info_failed: Have any of the rx queues failed to initialise their
+  *      xdp_rxq_info structures?
+  * @netdev_notifier: Netdevice notifier.
++ * @tc: state for TC offload (EF100).
+  * @mem_bar: The BAR that is mapped into membase.
+  * @reg_base: Offset from the start of the bar to the function control window.
+  * @monitor_work: Hardware monitor workitem
+@@ -1156,6 +1157,7 @@ struct efx_nic {
+ 	bool xdp_rxq_info_failed;
+ 
+ 	struct notifier_block netdev_notifier;
++	struct efx_tc_state *tc;
+ 
+ 	unsigned int mem_bar;
+ 	u32 reg_base;
+diff --git a/drivers/net/ethernet/sfc/tc.c b/drivers/net/ethernet/sfc/tc.c
+new file mode 100644
+index 000000000000..0fb01f73c56e
+--- /dev/null
++++ b/drivers/net/ethernet/sfc/tc.c
+@@ -0,0 +1,183 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/****************************************************************************
++ * Driver for Solarflare network controllers and boards
++ * Copyright 2019 Solarflare Communications Inc.
++ * Copyright 2020-2022 Xilinx Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published
++ * by the Free Software Foundation, incorporated herein by reference.
++ */
++
++#include "tc.h"
++#include "mae.h"
++#include "ef100_rep.h"
++
++static void efx_tc_free_action_set(struct efx_nic *efx,
++				   struct efx_tc_action_set *act, bool in_hw)
++{
++	/* Failure paths calling this on the 'running action' set in_hw=false,
++	 * because if the alloc had succeeded we'd've put it in acts.list and
++	 * not still have it in act.
++	 */
++	if (in_hw) {
++		efx_mae_free_action_set(efx, act->fw_id);
++		/* in_hw is true iff we are on an acts.list; make sure to
++		 * remove ourselves from that list before we are freed.
++		 */
++		list_del(&act->list);
++	}
++	kfree(act);
++}
++
++static void efx_tc_free_action_set_list(struct efx_nic *efx,
++					struct efx_tc_action_set_list *acts,
++					bool in_hw)
++{
++	struct efx_tc_action_set *act, *next;
++
++	/* Failure paths set in_hw=false, because usually the acts didn't get
++	 * to efx_mae_alloc_action_set_list(); if they did, the failure tree
++	 * has a separate efx_mae_free_action_set_list() before calling us.
++	 */
++	if (in_hw)
++		efx_mae_free_action_set_list(efx, acts);
++	/* Any act that's on the list will be in_hw even if the list isn't */
++	list_for_each_entry_safe(act, next, &acts->list, list)
++		efx_tc_free_action_set(efx, act, true);
++	/* Don't kfree, as acts is embedded inside a struct efx_tc_flow_rule */
++}
++
++static void efx_tc_delete_rule(struct efx_nic *efx, struct efx_tc_flow_rule *rule)
++{
++	efx_mae_delete_rule(efx, rule->fw_id);
++
++	/* Release entries in subsidiary tables */
++	efx_tc_free_action_set_list(efx, &rule->acts, true);
++	rule->fw_id = MC_CMD_MAE_ACTION_RULE_INSERT_OUT_ACTION_RULE_ID_NULL;
++}
++
++static int efx_tc_configure_default_rule(struct efx_nic *efx, u32 ing_port,
++					 u32 eg_port, struct efx_tc_flow_rule *rule)
++{
++	struct efx_tc_action_set_list *acts = &rule->acts;
++	struct efx_tc_match *match = &rule->match;
++	struct efx_tc_action_set *act;
++	int rc;
++
++	match->value.ingress_port = ing_port;
++	match->mask.ingress_port = ~0;
++	act = kzalloc(sizeof(*act), GFP_KERNEL);
++	if (!act)
++		return -ENOMEM;
++	act->deliver = 1;
++	act->dest_mport = eg_port;
++	rc = efx_mae_alloc_action_set(efx, act);
++	if (rc)
++		goto fail1;
++	EFX_WARN_ON_PARANOID(!list_empty(&acts->list));
++	list_add_tail(&act->list, &acts->list);
++	rc = efx_mae_alloc_action_set_list(efx, acts);
++	if (rc)
++		goto fail2;
++	rc = efx_mae_insert_rule(efx, match, EFX_TC_PRIO_DFLT,
++				 acts->fw_id, &rule->fw_id);
++	if (rc)
++		goto fail3;
++	return 0;
++fail3:
++	efx_mae_free_action_set_list(efx, acts);
++fail2:
++	list_del(&act->list);
++	efx_mae_free_action_set(efx, act->fw_id);
++fail1:
++	kfree(act);
++	return rc;
++}
++
++static int efx_tc_configure_default_rule_pf(struct efx_nic *efx)
++{
++	struct efx_tc_flow_rule *rule = &efx->tc->dflt.pf;
++	u32 ing_port, eg_port;
++
++	efx_mae_mport_uplink(efx, &ing_port);
++	efx_mae_mport_wire(efx, &eg_port);
++	return efx_tc_configure_default_rule(efx, ing_port, eg_port, rule);
++}
++
++static int efx_tc_configure_default_rule_wire(struct efx_nic *efx)
++{
++	struct efx_tc_flow_rule *rule = &efx->tc->dflt.wire;
++	u32 ing_port, eg_port;
++
++	efx_mae_mport_wire(efx, &ing_port);
++	efx_mae_mport_uplink(efx, &eg_port);
++	return efx_tc_configure_default_rule(efx, ing_port, eg_port, rule);
++}
++
++int efx_tc_configure_default_rule_rep(struct efx_rep *efv)
++{
++	struct efx_tc_flow_rule *rule = &efv->dflt;
++	struct efx_nic *efx = efv->parent;
++	u32 ing_port, eg_port;
++
++	efx_mae_mport_mport(efx, efv->mport, &ing_port);
++	efx_mae_mport_uplink(efx, &eg_port);
++	return efx_tc_configure_default_rule(efx, ing_port, eg_port, rule);
++}
++
++void efx_tc_deconfigure_default_rule(struct efx_nic *efx,
++				     struct efx_tc_flow_rule *rule)
++{
++	if (rule->fw_id != MC_CMD_MAE_ACTION_RULE_INSERT_OUT_ACTION_RULE_ID_NULL)
++		efx_tc_delete_rule(efx, rule);
++	rule->fw_id = MC_CMD_MAE_ACTION_RULE_INSERT_OUT_ACTION_RULE_ID_NULL;
++}
++
++int efx_init_tc(struct efx_nic *efx)
++{
++	int rc;
++
++	rc = efx_tc_configure_default_rule_pf(efx);
++	if (rc)
++		return rc;
++	return efx_tc_configure_default_rule_wire(efx);
++}
++
++void efx_fini_tc(struct efx_nic *efx)
++{
++	/* We can get called even if efx_init_struct_tc() failed */
++	if (!efx->tc)
++		return;
++	efx_tc_deconfigure_default_rule(efx, &efx->tc->dflt.pf);
++	efx_tc_deconfigure_default_rule(efx, &efx->tc->dflt.wire);
++}
++
++int efx_init_struct_tc(struct efx_nic *efx)
++{
++	if (efx->type->is_vf)
++		return 0;
++
++	efx->tc = kzalloc(sizeof(*efx->tc), GFP_KERNEL);
++	if (!efx->tc)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&efx->tc->dflt.pf.acts.list);
++	efx->tc->dflt.pf.fw_id = MC_CMD_MAE_ACTION_RULE_INSERT_OUT_ACTION_RULE_ID_NULL;
++	INIT_LIST_HEAD(&efx->tc->dflt.wire.acts.list);
++	efx->tc->dflt.wire.fw_id = MC_CMD_MAE_ACTION_RULE_INSERT_OUT_ACTION_RULE_ID_NULL;
++	return 0;
++}
++
++void efx_fini_struct_tc(struct efx_nic *efx)
++{
++	if (!efx->tc)
++		return;
++
++	EFX_WARN_ON_PARANOID(efx->tc->dflt.pf.fw_id !=
++			     MC_CMD_MAE_ACTION_RULE_INSERT_OUT_ACTION_RULE_ID_NULL);
++	EFX_WARN_ON_PARANOID(efx->tc->dflt.wire.fw_id !=
++			     MC_CMD_MAE_ACTION_RULE_INSERT_OUT_ACTION_RULE_ID_NULL);
++	kfree(efx->tc);
++	efx->tc = NULL;
++}
+diff --git a/drivers/net/ethernet/sfc/tc.h b/drivers/net/ethernet/sfc/tc.h
+new file mode 100644
+index 000000000000..46c5101eaa8d
+--- /dev/null
++++ b/drivers/net/ethernet/sfc/tc.h
+@@ -0,0 +1,76 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/****************************************************************************
++ * Driver for Solarflare network controllers and boards
++ * Copyright 2019 Solarflare Communications Inc.
++ * Copyright 2020-2022 Xilinx Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published
++ * by the Free Software Foundation, incorporated herein by reference.
++ */
++
++#ifndef EFX_TC_H
++#define EFX_TC_H
++#include "net_driver.h"
++
++struct efx_tc_action_set {
++	u16 deliver:1;
++	u32 dest_mport;
++	u32 fw_id; /* index of this entry in firmware actions table */
++	struct list_head list;
++};
++
++struct efx_tc_match_fields {
++	/* L1 */
++	u32 ingress_port;
++};
++
++struct efx_tc_match {
++	struct efx_tc_match_fields value;
++	struct efx_tc_match_fields mask;
++};
++
++struct efx_tc_action_set_list {
++	struct list_head list;
++	u32 fw_id;
++};
++
++struct efx_tc_flow_rule {
++	struct efx_tc_match match;
++	struct efx_tc_action_set_list acts;
++	u32 fw_id;
++};
++
++enum efx_tc_rule_prios {
++	EFX_TC_PRIO_DFLT, /* Default switch rule; one of efx_tc_default_rules */
++	EFX_TC_PRIO__NUM
++};
++
++/**
++ * struct efx_tc_state - control plane data for TC offload
++ *
++ * @dflt: Match-action rules for default switching; at priority
++ *	%EFX_TC_PRIO_DFLT.  Named by *ingress* port
++ * @dflt.pf: rule for traffic ingressing from PF (egresses to wire)
++ * @dflt.wire: rule for traffic ingressing from wire (egresses to PF)
++ */
++struct efx_tc_state {
++	struct {
++		struct efx_tc_flow_rule pf;
++		struct efx_tc_flow_rule wire;
++	} dflt;
++};
++
++struct efx_rep;
++
++int efx_tc_configure_default_rule_rep(struct efx_rep *efv);
++void efx_tc_deconfigure_default_rule(struct efx_nic *efx,
++				     struct efx_tc_flow_rule *rule);
++
++int efx_init_tc(struct efx_nic *efx);
++void efx_fini_tc(struct efx_nic *efx);
++
++int efx_init_struct_tc(struct efx_nic *efx);
++void efx_fini_struct_tc(struct efx_nic *efx);
++
++#endif /* EFX_TC_H */
