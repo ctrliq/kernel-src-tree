@@ -1,0 +1,311 @@
+sched/cputime: Add vtime guest task state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.13.1.el8_6
+commit-author Frederic Weisbecker <frederic@kernel.org>
+commit e6d5bf3e321ca664d12eb00ceb40bd58987ce8a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.13.1.el8_6/e6d5bf3e.failed
+
+Record guest as a VTIME state instead of guessing it from VTIME_SYS and
+PF_VCPU. This is going to simplify the cputime read side especially as
+its state machine is going to further expand in order to fully support
+kcpustat on nohz_full.
+
+	Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Jacek Anaszewski <jacek.anaszewski@gmail.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Pavel Machek <pavel@ucw.cz>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Rafael J . Wysocki <rjw@rjwysocki.net>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Viresh Kumar <viresh.kumar@linaro.org>
+	Cc: Wanpeng Li <wanpengli@tencent.com>
+	Cc: Yauheni Kaliuta <yauheni.kaliuta@redhat.com>
+Link: https://lkml.kernel.org/r/20191016025700.31277-4-frederic@kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit e6d5bf3e321ca664d12eb00ceb40bd58987ce8a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/sched/cputime.c
+diff --cc include/linux/sched.h
+index 6d61d76e88d8,988c4da00c31..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -315,10 -249,14 +315,15 @@@ struct prev_cputime 
+  enum vtime_state {
+  	/* Task is sleeping or running in a CPU with VTIME inactive: */
+  	VTIME_INACTIVE = 0,
+ -	/* Task is idle */
+ -	VTIME_IDLE,
+ -	/* Task runs in kernelspace in a CPU with VTIME active: */
+ -	VTIME_SYS,
+  	/* Task runs in userspace in a CPU with VTIME active: */
+  	VTIME_USER,
+++<<<<<<< HEAD
+ +	/* Task runs in kernelspace in a CPU with VTIME active: */
+ +	VTIME_SYS,
+++=======
++ 	/* Task runs as guests in a CPU with VTIME active: */
++ 	VTIME_GUEST,
+++>>>>>>> e6d5bf3e321c (sched/cputime: Add vtime guest task state)
+  };
+  
+  struct vtime {
+diff --cc kernel/sched/cputime.c
+index 747f703a8f36,34086afc3518..000000000000
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@@ -687,6 -729,16 +687,19 @@@ static void vtime_account_guest(struct 
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __vtime_account_kernel(struct task_struct *tsk,
++ 				   struct vtime *vtime)
++ {
++ 	/* We might have scheduled out from guest path */
++ 	if (vtime->state == VTIME_GUEST)
++ 		vtime_account_guest(tsk, vtime);
++ 	else
++ 		vtime_account_system(tsk, vtime);
++ }
++ 
+++>>>>>>> e6d5bf3e321c (sched/cputime: Add vtime guest task state)
+  void vtime_account_kernel(struct task_struct *tsk)
+  {
+  	struct vtime *vtime = &tsk->vtime;
+@@@ -772,9 -826,14 +787,18 @@@ void arch_vtime_task_switch(struct task
+  	vtime = &current->vtime;
+  
+  	write_seqcount_begin(&vtime->seqcount);
+++<<<<<<< HEAD
+ +	vtime->state = VTIME_SYS;
+++=======
++ 	if (is_idle_task(current))
++ 		vtime->state = VTIME_IDLE;
++ 	else if (current->flags & PF_VCPU)
++ 		vtime->state = VTIME_GUEST;
++ 	else
++ 		vtime->state = VTIME_SYS;
+++>>>>>>> e6d5bf3e321c (sched/cputime: Add vtime guest task state)
+  	vtime->starttime = sched_clock();
+ -	vtime->cpu = smp_processor_id();
+ +	prev->task_struct_rh->vtime_cpu = smp_processor_id();
+  	write_seqcount_end(&vtime->seqcount);
+  }
+  
+@@@ -846,200 -902,13 +870,200 @@@ bool task_cputime(struct task_struct *t
+  		delta = vtime_delta(vtime);
+  
+  		/*
+- 		 * Task runs either in user or kernel space, add pending nohz time to
+- 		 * the right place.
++ 		 * Task runs either in user (including guest) or kernel space,
++ 		 * add pending nohz time to the right place.
+  		 */
+- 		if (vtime->state == VTIME_USER || t->flags & PF_VCPU)
+- 			*utime += vtime->utime + delta;
+- 		else if (vtime->state == VTIME_SYS)
++ 		if (vtime->state == VTIME_SYS)
+  			*stime += vtime->stime + delta;
++ 		else
++ 			*utime += vtime->utime + delta;
+  	} while (read_seqcount_retry(&vtime->seqcount, seq));
+ +
+ +	return ret;
+ +}
+ +
+ +static int vtime_state_fetch(struct vtime *vtime, int cpu, unsigned int vtime_cpu)
+ +{
+ +	int state = READ_ONCE(vtime->state);
+ +
+ +	/*
+ +	 * We raced against a context switch, fetch the
+ +	 * kcpustat task again.
+ +	 */
+ +	if (vtime_cpu != cpu && vtime_cpu != -1)
+ +		return -EAGAIN;
+ +
+ +	/*
+ +	 * Two possible things here:
+ +	 * 1) We are seeing the scheduling out task (prev) or any past one.
+ +	 * 2) We are seeing the scheduling in task (next) but it hasn't
+ +	 *    passed though vtime_task_switch() yet so the pending
+ +	 *    cputime of the prev task may not be flushed yet.
+ +	 *
+ +	 * Case 1) is ok but 2) is not. So wait for a safe VTIME state.
+ +	 */
+ +	if (state == VTIME_INACTIVE)
+ +		return -EAGAIN;
+ +
+ +	return state;
+ +}
+ +
+ +static int kcpustat_field_vtime(u64 *cpustat,
+ +				struct vtime *vtime,
+ +				enum cpu_usage_stat usage,
+ +				int cpu, u64 *val,
+ +				unsigned int vtime_cpu)
+ +{
+ +	unsigned int seq;
+ +
+ +	do {
+ +		int state;
+ +
+ +		seq = read_seqcount_begin(&vtime->seqcount);
+ +
+ +		state = vtime_state_fetch(vtime, cpu, vtime_cpu);
+ +		if (state < 0)
+ +			return state;
+ +
+ +		*val = cpustat[usage];
+ +
+ +		if (state == VTIME_SYS)
+ +			*val += vtime->stime + vtime_delta(vtime);
+ +
+ +	} while (read_seqcount_retry(&vtime->seqcount, seq));
+ +
+ +	return 0;
+ +}
+ +
+ +u64 kcpustat_field(struct kernel_cpustat *kcpustat,
+ +		   enum cpu_usage_stat usage, int cpu)
+ +{
+ +	u64 *cpustat = kcpustat->cpustat;
+ +	struct rq *rq;
+ +	u64 val;
+ +	int err;
+ +
+ +	if (!vtime_accounting_enabled_cpu(cpu))
+ +		return cpustat[usage];
+ +
+ +	/* Only support sys vtime for now */
+ +	if (usage != CPUTIME_SYSTEM)
+ +		return cpustat[usage];
+ +
+ +	rq = cpu_rq(cpu);
+ +
+ +	for (;;) {
+ +		struct task_struct *curr;
+ +		struct vtime *vtime;
+ +
+ +		rcu_read_lock();
+ +		curr = rcu_dereference(rq->curr);
+ +		if (WARN_ON_ONCE(!curr)) {
+ +			rcu_read_unlock();
+ +			return cpustat[usage];
+ +		}
+ +
+ +		vtime = &curr->vtime;
+ +		err = kcpustat_field_vtime(cpustat, vtime, usage, cpu, &val,
+ +					   curr->task_struct_rh->vtime_cpu);
+ +		rcu_read_unlock();
+ +
+ +		if (!err)
+ +			return val;
+ +
+ +		cpu_relax();
+ +	}
+ +}
+ +EXPORT_SYMBOL_GPL(kcpustat_field);
+ +
+ +static int kcpustat_cpu_fetch_vtime(struct kernel_cpustat *dst,
+ +				    const struct kernel_cpustat *src,
+ +				    struct task_struct *tsk, int cpu)
+ +{
+ +	struct vtime *vtime = &tsk->vtime;
+ +	unsigned int seq;
+ +
+ +	do {
+ +		u64 *cpustat;
+ +		u64 delta;
+ +		int state;
+ +
+ +		seq = read_seqcount_begin(&vtime->seqcount);
+ +
+ +		state = vtime_state_fetch(vtime, cpu,
+ +					  tsk->task_struct_rh->vtime_cpu);
+ +		if (state < 0)
+ +			return state;
+ +
+ +		*dst = *src;
+ +		cpustat = dst->cpustat;
+ +
+ +		/* Task is sleeping, dead or idle, nothing to add */
+ +		if (state < VTIME_SYS)
+ +			continue;
+ +
+ +		delta = vtime_delta(vtime);
+ +
+ +		/*
+ +		 * Task runs either in user (including guest) or kernel space,
+ +		 * add pending nohz time to the right place.
+ +		 */
+ +		if (state == VTIME_SYS) {
+ +			cpustat[CPUTIME_SYSTEM] += vtime->stime + delta;
+ +		} else if (state == VTIME_USER) {
+ +			if (task_nice(tsk) > 0)
+ +				cpustat[CPUTIME_NICE] += vtime->utime + delta;
+ +			else
+ +				cpustat[CPUTIME_USER] += vtime->utime + delta;
+ +		} /* RHEL has not implemented VTIME_GUEST
+ +		     else {
+ +			WARN_ON_ONCE(state != VTIME_GUEST);
+ +			if (task_nice(tsk) > 0) {
+ +				cpustat[CPUTIME_GUEST_NICE] += vtime->gtime + delta;
+ +				cpustat[CPUTIME_NICE] += vtime->gtime + delta;
+ +			} else {
+ +				cpustat[CPUTIME_GUEST] += vtime->gtime + delta;
+ +				cpustat[CPUTIME_USER] += vtime->gtime + delta;
+ +			}
+ +		} */
+ +	} while (read_seqcount_retry(&vtime->seqcount, seq));
+ +
+ +	return 0;
+ +}
+ +
+ +void kcpustat_cpu_fetch(struct kernel_cpustat *dst, int cpu)
+ +{
+ +	const struct kernel_cpustat *src = &kcpustat_cpu(cpu);
+ +	struct rq *rq;
+ +	int err;
+ +
+ +	if (!vtime_accounting_enabled_cpu(cpu)) {
+ +		*dst = *src;
+ +		return;
+ +	}
+ +
+ +	rq = cpu_rq(cpu);
+ +
+ +	for (;;) {
+ +		struct task_struct *curr;
+ +
+ +		rcu_read_lock();
+ +		curr = rcu_dereference(rq->curr);
+ +		if (WARN_ON_ONCE(!curr)) {
+ +			rcu_read_unlock();
+ +			*dst = *src;
+ +			return;
+ +		}
+ +
+ +		err = kcpustat_cpu_fetch_vtime(dst, src, curr, cpu);
+ +		rcu_read_unlock();
+ +
+ +		if (!err)
+ +			return;
+ +
+ +		cpu_relax();
+ +	}
+  }
+ +EXPORT_SYMBOL_GPL(kcpustat_cpu_fetch);
+ +
+  #endif /* CONFIG_VIRT_CPU_ACCOUNTING_GEN */
+* Unmerged path include/linux/sched.h
+* Unmerged path kernel/sched/cputime.c
