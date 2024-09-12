@@ -1,0 +1,215 @@
+iomap: Add __iomap_put_folio helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-483.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 7a70a5085ed028b4fd132447cbaea9b73113bca9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-483.el8/7a70a508.failed
+
+Add an __iomap_put_folio() helper to encapsulate unlocking the folio,
+calling ->page_done(), and putting the folio.  Use the new helper in
+iomap_write_begin() and iomap_write_end().
+
+This effectively doesn't change the way the code works, but prepares for
+successive improvements.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 7a70a5085ed028b4fd132447cbaea9b73113bca9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/iomap/buffered-io.c
+diff --cc fs/iomap/buffered-io.c
+index fa25b9a66020,c045689b6af8..000000000000
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@@ -629,25 -575,42 +629,43 @@@ __iomap_write_begin(struct inode *inode
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int iomap_write_begin_inline(struct inode *inode,
+ +		struct page *page, struct iomap *srcmap)
+++=======
++ static void __iomap_put_folio(struct iomap_iter *iter, loff_t pos, size_t ret,
++ 		struct folio *folio)
++ {
++ 	const struct iomap_page_ops *page_ops = iter->iomap.page_ops;
++ 
++ 	if (folio)
++ 		folio_unlock(folio);
++ 	if (page_ops && page_ops->page_done)
++ 		page_ops->page_done(iter->inode, pos, ret, &folio->page);
++ 	if (folio)
++ 		folio_put(folio);
++ }
++ 
++ static int iomap_write_begin_inline(const struct iomap_iter *iter,
++ 		struct folio *folio)
+++>>>>>>> 7a70a5085ed0 (iomap: Add __iomap_put_folio helper)
+  {
+  	/* needs more work for the tailpacking case; disable for now */
+ -	if (WARN_ON_ONCE(iomap_iter_srcmap(iter)->offset != 0))
+ +	if (WARN_ON_ONCE(srcmap->offset != 0))
+  		return -EIO;
+ -	return iomap_read_inline_data(iter, folio);
+ +	return iomap_read_inline_data(inode, page, srcmap);
+  }
+  
+ -static int iomap_write_begin(struct iomap_iter *iter, loff_t pos,
+ -		size_t len, struct folio **foliop)
+ +static int
+ +iomap_write_begin(struct inode *inode, loff_t pos, unsigned len, unsigned flags,
+ +		struct page **pagep, struct iomap *iomap, struct iomap *srcmap)
+  {
+ -	const struct iomap_page_ops *page_ops = iter->iomap.page_ops;
+ -	const struct iomap *srcmap = iomap_iter_srcmap(iter);
+ -	struct folio *folio;
+ -	unsigned fgp = FGP_LOCK | FGP_WRITE | FGP_CREAT | FGP_STABLE | FGP_NOFS;
+ +	const struct iomap_page_ops *page_ops = iomap->page_ops;
+ +	struct page *page;
+  	int status = 0;
+  
+ -	if (iter->flags & IOMAP_NOWAIT)
+ -		fgp |= FGP_NOWAIT;
+ -
+ -	BUG_ON(pos + len > iter->iomap.offset + iter->iomap.length);
+ -	if (srcmap != &iter->iomap)
+ +	BUG_ON(pos + len > iomap->offset + iomap->length);
+ +	if (srcmap != iomap)
+  		BUG_ON(pos + len > srcmap->offset + srcmap->length);
+  
+  	if (fatal_signal_pending(current))
+@@@ -659,20 -625,43 +677,29 @@@
+  			return status;
+  	}
+  
+++<<<<<<< HEAD
+ +	page = grab_cache_page_write_begin(inode->i_mapping, pos >> PAGE_SHIFT,
+ +			AOP_FLAG_NOFS);
+ +	if (!page) {
+ +		status = -ENOMEM;
+ +		goto out_no_page;
+++=======
++ 	folio = __filemap_get_folio(iter->inode->i_mapping, pos >> PAGE_SHIFT,
++ 			fgp, mapping_gfp_mask(iter->inode->i_mapping));
++ 	if (!folio) {
++ 		status = (iter->flags & IOMAP_NOWAIT) ? -EAGAIN : -ENOMEM;
++ 		__iomap_put_folio(iter, pos, 0, NULL);
++ 		return status;
+++>>>>>>> 7a70a5085ed0 (iomap: Add __iomap_put_folio helper)
+  	}
+  
+ -	/*
+ -	 * Now we have a locked folio, before we do anything with it we need to
+ -	 * check that the iomap we have cached is not stale. The inode extent
+ -	 * mapping can change due to concurrent IO in flight (e.g.
+ -	 * IOMAP_UNWRITTEN state can change and memory reclaim could have
+ -	 * reclaimed a previously partially written page at this index after IO
+ -	 * completion before this write reaches this file offset) and hence we
+ -	 * could do the wrong thing here (zero a page range incorrectly or fail
+ -	 * to zero) and corrupt data.
+ -	 */
+ -	if (page_ops && page_ops->iomap_valid) {
+ -		bool iomap_valid = page_ops->iomap_valid(iter->inode,
+ -							&iter->iomap);
+ -		if (!iomap_valid) {
+ -			iter->iomap.flags |= IOMAP_F_STALE;
+ -			status = 0;
+ -			goto out_unlock;
+ -		}
+ -	}
+ -
+ -	if (pos + len > folio_pos(folio) + folio_size(folio))
+ -		len = folio_pos(folio) + folio_size(folio) - pos;
+ -
+  	if (srcmap->type == IOMAP_INLINE)
+ -		status = iomap_write_begin_inline(iter, folio);
+ -	else if (srcmap->flags & IOMAP_F_BUFFER_HEAD)
+ -		status = __block_write_begin_int(folio, pos, len, NULL, srcmap);
+ +		status = iomap_write_begin_inline(inode, page, srcmap);
+ +	else if (iomap->flags & IOMAP_F_BUFFER_HEAD)
+ +		status = __block_write_begin_int(page, pos, len, NULL, srcmap);
+  	else
+ -		status = __iomap_write_begin(iter, pos, len, folio);
+ +		status = __iomap_write_begin(inode, pos, len, flags, page,
+ +				srcmap);
+  
+  	if (unlikely(status))
+  		goto out_unlock;
+@@@ -681,13 -670,9 +708,19 @@@
+  	return 0;
+  
+  out_unlock:
+++<<<<<<< HEAD
+ +	unlock_page(page);
+ +	put_page(page);
+ +	iomap_write_failed(inode, pos, len);
+ +
+ +out_no_page:
+ +	if (page_ops && page_ops->page_done)
+ +		page_ops->page_done(inode, pos, 0, NULL);
+++=======
++ 	__iomap_put_folio(iter, pos, 0, folio);
++ 	iomap_write_failed(iter->inode, pos, len);
++ 
+++>>>>>>> 7a70a5085ed0 (iomap: Add __iomap_put_folio helper)
+  	return status;
+  }
+  
+@@@ -757,12 -719,11 +790,17 @@@ static size_t iomap_write_end_inline(st
+  }
+  
+  /* Returns the number of bytes copied.  May be 0.  Cannot be an errno. */
+ -static size_t iomap_write_end(struct iomap_iter *iter, loff_t pos, size_t len,
+ -		size_t copied, struct folio *folio)
+ +static size_t iomap_write_end(struct inode *inode, loff_t pos, size_t len,
+ +		size_t copied, struct page *page, struct iomap *iomap,
+ +		struct iomap *srcmap)
+  {
+++<<<<<<< HEAD
+ +	const struct iomap_page_ops *page_ops = iomap->page_ops;
+ +	loff_t old_size = inode->i_size;
+++=======
++ 	const struct iomap *srcmap = iomap_iter_srcmap(iter);
++ 	loff_t old_size = iter->inode->i_size;
+++>>>>>>> 7a70a5085ed0 (iomap: Add __iomap_put_folio helper)
+  	size_t ret;
+  
+  	if (srcmap->type == IOMAP_INLINE) {
+@@@ -780,19 -741,15 +818,26 @@@
+  	 * preferably after I/O completion so that no stale data is exposed.
+  	 */
+  	if (pos + ret > old_size) {
+ -		i_size_write(iter->inode, pos + ret);
+ -		iter->iomap.flags |= IOMAP_F_SIZE_CHANGED;
+ +		i_size_write(inode, pos + ret);
+ +		iomap->flags |= IOMAP_F_SIZE_CHANGED;
+  	}
+++<<<<<<< HEAD
+ +	unlock_page(page);
+ +
+ +	if (old_size < pos)
+ +		pagecache_isize_extended(inode, old_size, pos);
+ +	if (page_ops && page_ops->page_done)
+ +		page_ops->page_done(inode, pos, ret, page);
+ +	put_page(page);
+ +
+++=======
++ 	__iomap_put_folio(iter, pos, ret, folio);
++ 
++ 	if (old_size < pos)
++ 		pagecache_isize_extended(iter->inode, old_size, pos);
+++>>>>>>> 7a70a5085ed0 (iomap: Add __iomap_put_folio helper)
+  	if (ret < len)
+ -		iomap_write_failed(iter->inode, pos + ret, len - ret);
+ +		iomap_write_failed(inode, pos + ret, len - ret);
+  	return ret;
+  }
+  
+* Unmerged path fs/iomap/buffered-io.c
