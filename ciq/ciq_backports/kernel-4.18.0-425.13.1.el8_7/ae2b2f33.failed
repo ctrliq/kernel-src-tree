@@ -1,0 +1,132 @@
+arm64: kvm: use kvm_exception_table_entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.13.1.el8_7
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit ae2b2f3384c69a7e4b3ee6fdbc7e1eeaaad3e634
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.13.1.el8_7/ae2b2f33.failed
+
+In subsequent patches we'll alter `struct exception_table_entry`, adding
+fields that are not needed for KVM exception fixups.
+
+In preparation for this, migrate KVM to its own `struct
+kvm_exception_table_entry`, which is identical to the current format of
+`struct exception_table_entry`. Comments are updated accordingly.
+
+There should be no functional change as a result of this patch.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Reviewed-by: Ard Biesheuvel <ardb@kernel.org>
+	Cc: Alexandru Elisei <alexandru.elisei@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: Marc Zyngier <maz@kernel.org>
+	Cc: Robin Murphy <robin.murphy@arm.com>
+	Cc: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Cc: Will Deacon <will@kernel.org>
+	Acked-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/20211019160219.5202-5-mark.rutland@arm.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit ae2b2f3384c69a7e4b3ee6fdbc7e1eeaaad3e634)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kvm/hyp/include/hyp/switch.h
+diff --cc arch/arm64/kvm/hyp/include/hyp/switch.h
+index 99a693039e28,d5a47b93ef9b..000000000000
+--- a/arch/arm64/kvm/hyp/include/hyp/switch.h
++++ b/arch/arm64/kvm/hyp/include/hyp/switch.h
+@@@ -28,10 -30,12 +28,19 @@@
+  #include <asm/processor.h>
+  #include <asm/thread_info.h>
+  
+++<<<<<<< HEAD
+ +extern const char __hyp_panic_string[];
+ +
+ +extern struct exception_table_entry __start___kvm_ex_table;
+ +extern struct exception_table_entry __stop___kvm_ex_table;
+++=======
++ struct kvm_exception_table_entry {
++ 	int insn, fixup;
++ };
++ 
++ extern struct kvm_exception_table_entry __start___kvm_ex_table;
++ extern struct kvm_exception_table_entry __stop___kvm_ex_table;
+++>>>>>>> ae2b2f3384c6 (arm64: kvm: use kvm_exception_table_entry)
+  
+  /* Check whether the FP regs were dirtied while in the host-side run loop: */
+  static inline bool update_fp_enabled(struct kvm_vcpu *vcpu)
+@@@ -484,45 -510,15 +493,49 @@@ guest
+  	return true;
+  }
+  
+ +static inline bool __needs_ssbd_off(struct kvm_vcpu *vcpu)
+ +{
+ +	if (!cpus_have_final_cap(ARM64_SSBD))
+ +		return false;
+ +
+ +	return !(vcpu->arch.workaround_flags & VCPU_WORKAROUND_2_FLAG);
+ +}
+ +
+ +static inline void __set_guest_arch_workaround_state(struct kvm_vcpu *vcpu)
+ +{
+ +	/*
+ +	 * The host runs with the workaround always present. If the
+ +	 * guest wants it disabled, so be it...
+ +	 */
+ +	if (__needs_ssbd_off(vcpu) &&
+ +	    __hyp_this_cpu_read(arm64_ssbd_callback_required))
+ +		arm_smccc_1_1_smc(ARM_SMCCC_ARCH_WORKAROUND_2, 0, NULL);
+ +}
+ +
+ +static inline void __set_host_arch_workaround_state(struct kvm_vcpu *vcpu)
+ +{
+ +	/*
+ +	 * If the guest has disabled the workaround, bring it back on.
+ +	 */
+ +	if (__needs_ssbd_off(vcpu) &&
+ +	    __hyp_this_cpu_read(arm64_ssbd_callback_required))
+ +		arm_smccc_1_1_smc(ARM_SMCCC_ARCH_WORKAROUND_2, 1, NULL);
+ +}
+ +
+  static inline void __kvm_unexpected_el2_exception(void)
+  {
+ -	extern char __guest_exit_panic[];
+  	unsigned long addr, fixup;
+++<<<<<<< HEAD
+ +	struct kvm_cpu_context *host_ctxt;
+ +	struct exception_table_entry *entry, *end;
+++=======
++ 	struct kvm_exception_table_entry *entry, *end;
+++>>>>>>> ae2b2f3384c6 (arm64: kvm: use kvm_exception_table_entry)
+  	unsigned long elr_el2 = read_sysreg(elr_el2);
+  
+ -	entry = &__start___kvm_ex_table;
+ -	end = &__stop___kvm_ex_table;
+ +	entry = hyp_symbol_addr(__start___kvm_ex_table);
+ +	end = hyp_symbol_addr(__stop___kvm_ex_table);
+ +	host_ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
+  
+  	while (entry < end) {
+  		addr = (unsigned long)&entry->insn + entry->insn;
+diff --git a/arch/arm64/include/asm/kvm_asm.h b/arch/arm64/include/asm/kvm_asm.h
+index 15f6d3523280..3a4cac2db943 100644
+--- a/arch/arm64/include/asm/kvm_asm.h
++++ b/arch/arm64/include/asm/kvm_asm.h
+@@ -232,9 +232,10 @@ extern char __smccc_workaround_1_smc[__SMCCC_WORKAROUND_1_SMC_SZ];
+ 
+ /*
+  * KVM extable for unexpected exceptions.
+- * In the same format _asm_extable, but output to a different section so that
+- * it can be mapped to EL2. The KVM version is not sorted. The caller must
+- * ensure:
++ * Create a struct kvm_exception_table_entry output to a section that can be
++ * mapped by EL2. The table is not sorted.
++ *
++ * The caller must ensure:
+  * x18 has the hypervisor value to allow any Shadow-Call-Stack instrumented
+  * code to write to it, and that SPSR_EL2 and ELR_EL2 are restored by the fixup.
+  */
+* Unmerged path arch/arm64/kvm/hyp/include/hyp/switch.h
