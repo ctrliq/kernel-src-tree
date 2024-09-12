@@ -212,6 +212,14 @@ static void parse_mem_opt(void)
 
 		if (!strcmp(param, "nokaslr"))
 			kaslr_enabled = 0;
+
+#if IS_ENABLED(CONFIG_KVM)
+		if (!strcmp(param, "prot_virt")) {
+			rc = kstrtobool(val, &enabled);
+			if (!rc && enabled)
+				prot_virt_host = 1;
+		}
+#endif
 	}
 }
 
