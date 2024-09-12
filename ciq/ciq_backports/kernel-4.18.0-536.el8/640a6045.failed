@@ -1,0 +1,159 @@
+bpf, cpumap: Make sure kthread is running before map update returns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-536.el8
+commit-author Hou Tao <houtao1@huawei.com>
+commit 640a604585aa30f93e39b17d4d6ba69fcb1e66c9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-536.el8/640a6045.failed
+
+The following warning was reported when running stress-mode enabled
+xdp_redirect_cpu with some RT threads:
+
+  ------------[ cut here ]------------
+  WARNING: CPU: 4 PID: 65 at kernel/bpf/cpumap.c:135
+  CPU: 4 PID: 65 Comm: kworker/4:1 Not tainted 6.5.0-rc2+ #1
+  Hardware name: QEMU Standard PC (i440FX + PIIX, 1996)
+  Workqueue: events cpu_map_kthread_stop
+  RIP: 0010:put_cpu_map_entry+0xda/0x220
+  ......
+  Call Trace:
+   <TASK>
+   ? show_regs+0x65/0x70
+   ? __warn+0xa5/0x240
+   ......
+   ? put_cpu_map_entry+0xda/0x220
+   cpu_map_kthread_stop+0x41/0x60
+   process_one_work+0x6b0/0xb80
+   worker_thread+0x96/0x720
+   kthread+0x1a5/0x1f0
+   ret_from_fork+0x3a/0x70
+   ret_from_fork_asm+0x1b/0x30
+   </TASK>
+
+The root cause is the same as commit 436901649731 ("bpf: cpumap: Fix memory
+leak in cpu_map_update_elem"). The kthread is stopped prematurely by
+kthread_stop() in cpu_map_kthread_stop(), and kthread() doesn't call
+cpu_map_kthread_run() at all but XDP program has already queued some
+frames or skbs into ptr_ring. So when __cpu_map_ring_cleanup() checks
+the ptr_ring, it will find it was not emptied and report a warning.
+
+An alternative fix is to use __cpu_map_ring_cleanup() to drop these
+pending frames or skbs when kthread_stop() returns -EINTR, but it may
+confuse the user, because these frames or skbs have been handled
+correctly by XDP program. So instead of dropping these frames or skbs,
+just make sure the per-cpu kthread is running before
+__cpu_map_entry_alloc() returns.
+
+After apply the fix, the error handle for kthread_stop() will be
+unnecessary because it will always return 0, so just remove it.
+
+Fixes: 6710e1126934 ("bpf: introduce new bpf cpu map type BPF_MAP_TYPE_CPUMAP")
+	Signed-off-by: Hou Tao <houtao1@huawei.com>
+	Reviewed-by: Pu Lehui <pulehui@huawei.com>
+	Acked-by: Jesper Dangaard Brouer <hawk@kernel.org>
+Link: https://lore.kernel.org/r/20230729095107.1722450-2-houtao@huaweicloud.com
+	Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+(cherry picked from commit 640a604585aa30f93e39b17d4d6ba69fcb1e66c9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/cpumap.c
+diff --cc kernel/bpf/cpumap.c
+index 1d67dd9be144,7eeb20025164..000000000000
+--- a/kernel/bpf/cpumap.c
++++ b/kernel/bpf/cpumap.c
+@@@ -24,8 -28,9 +24,12 @@@
+  #include <linux/sched.h>
+  #include <linux/workqueue.h>
+  #include <linux/kthread.h>
+++<<<<<<< HEAD
+ +#include <linux/capability.h>
+++=======
++ #include <linux/completion.h>
+++>>>>>>> 640a604585aa (bpf, cpumap: Make sure kthread is running before map update returns)
+  #include <trace/events/xdp.h>
+ -#include <linux/btf_ids.h>
+  
+  #include <linux/netdevice.h>   /* netif_receive_skb_list */
+  #include <linux/etherdevice.h> /* eth_type_trans */
+@@@ -168,6 -151,62 +173,65 @@@ static void put_cpu_map_entry(struct bp
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* called from workqueue, to workaround syscall using preempt_disable */
++ static void cpu_map_kthread_stop(struct work_struct *work)
++ {
++ 	struct bpf_cpu_map_entry *rcpu;
++ 
++ 	rcpu = container_of(work, struct bpf_cpu_map_entry, kthread_stop_wq);
++ 
++ 	/* Wait for flush in __cpu_map_entry_free(), via full RCU barrier,
++ 	 * as it waits until all in-flight call_rcu() callbacks complete.
++ 	 */
++ 	rcu_barrier();
++ 
++ 	/* kthread_stop will wake_up_process and wait for it to complete */
++ 	kthread_stop(rcpu->kthread);
++ }
++ 
++ static void cpu_map_bpf_prog_run_skb(struct bpf_cpu_map_entry *rcpu,
++ 				     struct list_head *listp,
++ 				     struct xdp_cpumap_stats *stats)
++ {
++ 	struct sk_buff *skb, *tmp;
++ 	struct xdp_buff xdp;
++ 	u32 act;
++ 	int err;
++ 
++ 	list_for_each_entry_safe(skb, tmp, listp, list) {
++ 		act = bpf_prog_run_generic_xdp(skb, &xdp, rcpu->prog);
++ 		switch (act) {
++ 		case XDP_PASS:
++ 			break;
++ 		case XDP_REDIRECT:
++ 			skb_list_del_init(skb);
++ 			err = xdp_do_generic_redirect(skb->dev, skb, &xdp,
++ 						      rcpu->prog);
++ 			if (unlikely(err)) {
++ 				kfree_skb(skb);
++ 				stats->drop++;
++ 			} else {
++ 				stats->redirect++;
++ 			}
++ 			return;
++ 		default:
++ 			bpf_warn_invalid_xdp_action(NULL, rcpu->prog, act);
++ 			fallthrough;
++ 		case XDP_ABORTED:
++ 			trace_xdp_exception(skb->dev, rcpu->prog, act);
++ 			fallthrough;
++ 		case XDP_DROP:
++ 			skb_list_del_init(skb);
++ 			kfree_skb(skb);
++ 			stats->drop++;
++ 			return;
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 640a604585aa (bpf, cpumap: Make sure kthread is running before map update returns)
+  static int cpu_map_bpf_prog_run_xdp(struct bpf_cpu_map_entry *rcpu,
+  				    void **frames, int n,
+  				    struct xdp_cpumap_stats *stats)
+@@@ -237,8 -292,6 +301,11 @@@
+  	return nframes;
+  }
+  
+++<<<<<<< HEAD
+ +#define CPUMAP_BATCH 8
+ +
+++=======
+++>>>>>>> 640a604585aa (bpf, cpumap: Make sure kthread is running before map update returns)
+  static int cpu_map_kthread_run(void *data)
+  {
+  	struct bpf_cpu_map_entry *rcpu = data;
+* Unmerged path kernel/bpf/cpumap.c
