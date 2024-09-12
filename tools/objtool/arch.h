@@ -30,6 +30,7 @@ enum insn_type {
 	INSN_CALL,
 	INSN_CALL_DYNAMIC,
 	INSN_RETURN,
+	INSN_EXCEPTION_RETURN,
 	INSN_CONTEXT_SWITCH,
 	INSN_STACK,
 	INSN_BUG,
@@ -87,5 +88,7 @@ int arch_decode_instruction(struct elf *elf, struct section *sec,
 			    struct list_head *ops_list);
 
 bool arch_callee_saved_reg(unsigned char reg);
+
+bool arch_is_rethunk(struct symbol *sym);
 
 #endif /* _ARCH_H */

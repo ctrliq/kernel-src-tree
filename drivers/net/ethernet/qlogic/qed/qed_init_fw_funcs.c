@@ -13,6 +13,7 @@
 #include "qed_hsi.h"
 #include "qed_hw.h"
 #include "qed_init_ops.h"
+#include "qed_iro_hsi.h"
 #include "qed_reg_addr.h"
 
 #define CDU_VALIDATION_DEFAULT_CFG CDU_CONTEXT_VALIDATION_DEFAULT_CFG
@@ -208,6 +209,82 @@ static u16 task_region_offsets[1][NUM_OF_CONNECTION_TYPES] = {
 #define PQ_INFO_RAM_GRC_ADDRESS(pq_id) \
 	(XSEM_REG_FAST_MEMORY + SEM_FAST_REG_INT_RAM + \
 	XSTORM_PQ_INFO_OFFSET(pq_id))
+
+static const char * const s_protocol_types[] = {
+	"PROTOCOLID_ISCSI", "PROTOCOLID_FCOE", "PROTOCOLID_ROCE",
+	"PROTOCOLID_CORE", "PROTOCOLID_ETH", "PROTOCOLID_IWARP",
+	"PROTOCOLID_TOE", "PROTOCOLID_PREROCE", "PROTOCOLID_COMMON",
+	"PROTOCOLID_TCP", "PROTOCOLID_RDMA", "PROTOCOLID_SCSI",
+};
+
+static const char *s_ramrod_cmd_ids[][28] = {
+	{
+	"ISCSI_RAMROD_CMD_ID_UNUSED", "ISCSI_RAMROD_CMD_ID_INIT_FUNC",
+	 "ISCSI_RAMROD_CMD_ID_DESTROY_FUNC",
+	 "ISCSI_RAMROD_CMD_ID_OFFLOAD_CONN",
+	 "ISCSI_RAMROD_CMD_ID_UPDATE_CONN",
+	 "ISCSI_RAMROD_CMD_ID_TERMINATION_CONN",
+	 "ISCSI_RAMROD_CMD_ID_CLEAR_SQ", "ISCSI_RAMROD_CMD_ID_MAC_UPDATE",
+	 "ISCSI_RAMROD_CMD_ID_CONN_STATS", },
+	{ "FCOE_RAMROD_CMD_ID_INIT_FUNC", "FCOE_RAMROD_CMD_ID_DESTROY_FUNC",
+	 "FCOE_RAMROD_CMD_ID_STAT_FUNC",
+	 "FCOE_RAMROD_CMD_ID_OFFLOAD_CONN",
+	 "FCOE_RAMROD_CMD_ID_TERMINATE_CONN", },
+	{ "RDMA_RAMROD_UNUSED", "RDMA_RAMROD_FUNC_INIT",
+	 "RDMA_RAMROD_FUNC_CLOSE", "RDMA_RAMROD_REGISTER_MR",
+	 "RDMA_RAMROD_DEREGISTER_MR", "RDMA_RAMROD_CREATE_CQ",
+	 "RDMA_RAMROD_RESIZE_CQ", "RDMA_RAMROD_DESTROY_CQ",
+	 "RDMA_RAMROD_CREATE_SRQ", "RDMA_RAMROD_MODIFY_SRQ",
+	 "RDMA_RAMROD_DESTROY_SRQ", "RDMA_RAMROD_START_NS_TRACKING",
+	 "RDMA_RAMROD_STOP_NS_TRACKING", "ROCE_RAMROD_CREATE_QP",
+	 "ROCE_RAMROD_MODIFY_QP", "ROCE_RAMROD_QUERY_QP",
+	 "ROCE_RAMROD_DESTROY_QP", "ROCE_RAMROD_CREATE_UD_QP",
+	 "ROCE_RAMROD_DESTROY_UD_QP", "ROCE_RAMROD_FUNC_UPDATE",
+	 "ROCE_RAMROD_SUSPEND_QP", "ROCE_RAMROD_QUERY_SUSPENDED_QP",
+	 "ROCE_RAMROD_CREATE_SUSPENDED_QP", "ROCE_RAMROD_RESUME_QP",
+	 "ROCE_RAMROD_SUSPEND_UD_QP", "ROCE_RAMROD_RESUME_UD_QP",
+	 "ROCE_RAMROD_CREATE_SUSPENDED_UD_QP", "ROCE_RAMROD_FLUSH_DPT_QP", },
+	{ "CORE_RAMROD_UNUSED", "CORE_RAMROD_RX_QUEUE_START",
+	 "CORE_RAMROD_TX_QUEUE_START", "CORE_RAMROD_RX_QUEUE_STOP",
+	 "CORE_RAMROD_TX_QUEUE_STOP",
+	 "CORE_RAMROD_RX_QUEUE_FLUSH",
+	 "CORE_RAMROD_TX_QUEUE_UPDATE", "CORE_RAMROD_QUEUE_STATS_QUERY", },
+	{ "ETH_RAMROD_UNUSED", "ETH_RAMROD_VPORT_START",
+	 "ETH_RAMROD_VPORT_UPDATE", "ETH_RAMROD_VPORT_STOP",
+	 "ETH_RAMROD_RX_QUEUE_START", "ETH_RAMROD_RX_QUEUE_STOP",
+	 "ETH_RAMROD_TX_QUEUE_START", "ETH_RAMROD_TX_QUEUE_STOP",
+	 "ETH_RAMROD_FILTERS_UPDATE", "ETH_RAMROD_RX_QUEUE_UPDATE",
+	 "ETH_RAMROD_RX_CREATE_OPENFLOW_ACTION",
+	 "ETH_RAMROD_RX_ADD_OPENFLOW_FILTER",
+	 "ETH_RAMROD_RX_DELETE_OPENFLOW_FILTER",
+	 "ETH_RAMROD_RX_ADD_UDP_FILTER",
+	 "ETH_RAMROD_RX_DELETE_UDP_FILTER",
+	 "ETH_RAMROD_RX_CREATE_GFT_ACTION",
+	 "ETH_RAMROD_RX_UPDATE_GFT_FILTER", "ETH_RAMROD_TX_QUEUE_UPDATE",
+	 "ETH_RAMROD_RGFS_FILTER_ADD", "ETH_RAMROD_RGFS_FILTER_DEL",
+	 "ETH_RAMROD_TGFS_FILTER_ADD", "ETH_RAMROD_TGFS_FILTER_DEL",
+	 "ETH_RAMROD_GFS_COUNTERS_REPORT_REQUEST", },
+	{ "RDMA_RAMROD_UNUSED", "RDMA_RAMROD_FUNC_INIT",
+	 "RDMA_RAMROD_FUNC_CLOSE", "RDMA_RAMROD_REGISTER_MR",
+	 "RDMA_RAMROD_DEREGISTER_MR", "RDMA_RAMROD_CREATE_CQ",
+	 "RDMA_RAMROD_RESIZE_CQ", "RDMA_RAMROD_DESTROY_CQ",
+	 "RDMA_RAMROD_CREATE_SRQ", "RDMA_RAMROD_MODIFY_SRQ",
+	 "RDMA_RAMROD_DESTROY_SRQ", "RDMA_RAMROD_START_NS_TRACKING",
+	 "RDMA_RAMROD_STOP_NS_TRACKING",
+	 "IWARP_RAMROD_CMD_ID_TCP_OFFLOAD",
+	 "IWARP_RAMROD_CMD_ID_MPA_OFFLOAD",
+	 "IWARP_RAMROD_CMD_ID_MPA_OFFLOAD_SEND_RTR",
+	 "IWARP_RAMROD_CMD_ID_CREATE_QP", "IWARP_RAMROD_CMD_ID_QUERY_QP",
+	 "IWARP_RAMROD_CMD_ID_MODIFY_QP",
+	 "IWARP_RAMROD_CMD_ID_DESTROY_QP",
+	 "IWARP_RAMROD_CMD_ID_ABORT_TCP_OFFLOAD", },
+	{ NULL }, /*TOE*/
+	{ NULL }, /*PREROCE*/
+	{ "COMMON_RAMROD_UNUSED", "COMMON_RAMROD_PF_START",
+	     "COMMON_RAMROD_PF_STOP", "COMMON_RAMROD_VF_START",
+	     "COMMON_RAMROD_VF_STOP", "COMMON_RAMROD_PF_UPDATE",
+	     "COMMON_RAMROD_RL_UPDATE", "COMMON_RAMROD_EMPTY", }
+};
 
 /******************** INTERNAL IMPLEMENTATION *********************/
 
@@ -1033,7 +1110,8 @@ int qed_init_vport_tc_wfq(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt,
 }
 
 int qed_init_global_rl(struct qed_hwfn *p_hwfn,
-		       struct qed_ptt *p_ptt, u16 rl_id, u32 rate_limit)
+		       struct qed_ptt *p_ptt, u16 rl_id, u32 rate_limit,
+		       enum init_qm_rl_type vport_rl_type)
 {
 	u32 inc_val, upper_bound;
 
@@ -1645,6 +1723,32 @@ void qed_enable_context_validation(struct qed_hwfn *p_hwfn,
 	qed_wr(p_hwfn, p_ptt, CDU_REG_TCFC_CTX_VALID0, ctx_validation);
 }
 
+const char *qed_get_protocol_type_str(u32 protocol_type)
+{
+	if (protocol_type >= ARRAY_SIZE(s_protocol_types))
+		return "Invalid protocol type";
+
+	return s_protocol_types[protocol_type];
+}
+
+const char *qed_get_ramrod_cmd_id_str(u32 protocol_type, u32 ramrod_cmd_id)
+{
+	const char *ramrod_cmd_id_str;
+
+	if (protocol_type >= ARRAY_SIZE(s_ramrod_cmd_ids))
+		return "Invalid protocol type";
+
+	if (ramrod_cmd_id >= ARRAY_SIZE(s_ramrod_cmd_ids[0]))
+		return "Invalid Ramrod command ID";
+
+	ramrod_cmd_id_str = s_ramrod_cmd_ids[protocol_type][ramrod_cmd_id];
+
+	if (!ramrod_cmd_id_str)
+		return "Invalid Ramrod command ID";
+
+	return ramrod_cmd_id_str;
+}
+
 static u32 qed_get_rdma_assert_ram_addr(struct qed_hwfn *p_hwfn, u8 storm_id)
 {
 	switch (storm_id) {
@@ -1769,7 +1873,7 @@ struct phys_mem_desc *qed_fw_overlay_mem_alloc(struct qed_hwfn *p_hwfn,
 
 	/* If memory allocation has failed, free all allocated memory */
 	if (buf_offset < buf_size) {
-		qed_fw_overlay_mem_free(p_hwfn, allocated_mem);
+		qed_fw_overlay_mem_free(p_hwfn, &allocated_mem);
 		return NULL;
 	}
 
@@ -1803,16 +1907,16 @@ void qed_fw_overlay_init_ram(struct qed_hwfn *p_hwfn,
 }
 
 void qed_fw_overlay_mem_free(struct qed_hwfn *p_hwfn,
-			     struct phys_mem_desc *fw_overlay_mem)
+			     struct phys_mem_desc **fw_overlay_mem)
 {
 	u8 storm_id;
 
-	if (!fw_overlay_mem)
+	if (!fw_overlay_mem || !(*fw_overlay_mem))
 		return;
 
 	for (storm_id = 0; storm_id < NUM_STORMS; storm_id++) {
 		struct phys_mem_desc *storm_mem_desc =
-		    (struct phys_mem_desc *)fw_overlay_mem + storm_id;
+		    (struct phys_mem_desc *)*fw_overlay_mem + storm_id;
 
 		/* Free Storm's physical memory */
 		if (storm_mem_desc->virt_addr)
@@ -1823,5 +1927,6 @@ void qed_fw_overlay_mem_free(struct qed_hwfn *p_hwfn,
 	}
 
 	/* Free allocated virtual memory */
-	kfree(fw_overlay_mem);
+	kfree(*fw_overlay_mem);
+	*fw_overlay_mem = NULL;
 }

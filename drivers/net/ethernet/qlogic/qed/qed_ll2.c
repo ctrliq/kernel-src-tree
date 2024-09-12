@@ -28,6 +28,7 @@
 #include "qed_cxt.h"
 #include "qed_dev_api.h"
 #include "qed_hsi.h"
+#include "qed_iro_hsi.h"
 #include "qed_hw.h"
 #include "qed_int.h"
 #include "qed_ll2.h"
@@ -131,7 +132,7 @@ static int qed_ll2_alloc_buffer(struct qed_dev *cdev,
 }
 
 static int qed_ll2_dealloc_buffer(struct qed_dev *cdev,
-				 struct qed_ll2_buffer *buffer)
+				  struct qed_ll2_buffer *buffer)
 {
 	spin_lock_bh(&cdev->ll2->lock);
 
@@ -1147,6 +1148,7 @@ static int qed_sp_ll2_tx_queue_stop(struct qed_hwfn *p_hwfn,
 	struct qed_spq_entry *p_ent = NULL;
 	struct qed_sp_init_data init_data;
 	int rc = -EINVAL;
+
 	qed_db_recovery_del(p_hwfn->cdev, p_tx->doorbell_addr, &p_tx->db_msg);
 
 	/* Get SPQ entry */
@@ -1655,8 +1657,10 @@ int qed_ll2_establish_connection(void *cxt, u8 connection_handle)
 		   p_ll2_conn->input.rx_conn_type, qid, stats_id);
 
 	if (p_ll2_conn->input.rx_conn_type == QED_LL2_RX_TYPE_LEGACY) {
-		p_rx->set_prod_addr = p_hwfn->regview +
-		    GTT_BAR0_MAP_REG_TSDM_RAM + TSTORM_LL2_RX_PRODS_OFFSET(qid);
+		p_rx->set_prod_addr =
+		    (u8 __iomem *)p_hwfn->regview +
+		    GET_GTT_REG_ADDR(GTT_BAR0_MAP_REG_TSDM_RAM,
+				     TSTORM_LL2_RX_PRODS, qid);
 	} else {
 		/* QED_LL2_RX_TYPE_CTX - using doorbell */
 		p_rx->ctx_based = 1;
@@ -1799,7 +1803,7 @@ int qed_ll2_post_rx_buffer(void *cxt,
 		}
 	}
 
-	/* If we're lacking entires, let's try to flush buffers to FW */
+	/* If we're lacking entries, let's try to flush buffers to FW */
 	if (!p_curp || !p_curb) {
 		rc = -EBUSY;
 		p_curp = NULL;
@@ -2647,7 +2651,6 @@ static int qed_ll2_start(struct qed_dev *cdev, struct qed_ll2_params *params)
 			DP_NOTICE(cdev, "Failed to add an LLH filter\n");
 			goto err3;
 		}
-
 	}
 
 	ether_addr_copy(cdev->ll2_mac_address, params->ll2_mac_address);

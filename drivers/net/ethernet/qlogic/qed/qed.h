@@ -23,6 +23,8 @@
 #include <linux/qed/qed_if.h>
 #include "qed_debug.h"
 #include "qed_hsi.h"
+#include "qed_dbg_hsi.h"
+#include "qed_mfw_hsi.h"
 
 extern const struct qed_common_ops qed_common_ops_pass;
 
@@ -889,12 +891,13 @@ u32 qed_get_hsi_def_val(struct qed_dev *cdev, enum qed_hsi_def_type type);
 	qed_get_hsi_def_val(dev, QED_HSI_DEF_MAX_BTB_BLOCKS)
 
 /**
- * @brief qed_concrete_to_sw_fid - get the sw function id from
- *        the concrete value.
+ * qed_concrete_to_sw_fid(): Get the sw function id from
+ *                           the concrete value.
  *
- * @param concrete_fid
+ * @cdev: Qed dev pointer.
+ * @concrete_fid: Concrete fid.
  *
- * @return inline u8
+ * Return: inline u8.
  */
 static inline u8 qed_concrete_to_sw_fid(struct qed_dev *cdev,
 					u32 concrete_fid)
@@ -958,6 +961,12 @@ void qed_db_recovery_dp(struct qed_hwfn *p_hwfn);
 void qed_db_recovery_execute(struct qed_hwfn *p_hwfn);
 bool qed_edpm_enabled(struct qed_hwfn *p_hwfn);
 
+#define GET_GTT_REG_ADDR(__base, __offset, __idx) \
+	((__base) + __offset ## _GTT_OFFSET((__idx)))
+
+#define GET_GTT_BDQ_REG_ADDR(__base, __offset, __idx, __bdq_idx) \
+	((__base) + __offset ## _GTT_OFFSET((__idx), (__bdq_idx)))
+
 /* Other Linux specific common definitions */
 #define DP_NAME(cdev) ((cdev)->name)
 
@@ -1009,4 +1018,5 @@ int qed_llh_add_dst_tcp_port_filter(struct qed_dev *cdev, u16 dest_port);
 void qed_llh_remove_src_tcp_port_filter(struct qed_dev *cdev, u16 src_port);
 void qed_llh_remove_dst_tcp_port_filter(struct qed_dev *cdev, u16 src_port);
 void qed_llh_clear_all_filters(struct qed_dev *cdev);
+unsigned long qed_get_epoch_time(void);
 #endif /* _QED_H */
