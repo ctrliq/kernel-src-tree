@@ -3358,7 +3358,7 @@ static int next_dfs_prepath(struct cifs_sb_info *cifs_sb, struct smb3_fs_context
 	if (rc == -EREMOTE) {
 		struct smb3_fs_context v = {NULL};
 		/* if @path contains a tree name, skip it in the prefix path */
-		if (added_treename) {
+		if (added_treename && *path) {
 			rc = smb3_parse_devname(path, &v);
 			if (rc)
 				goto out;
@@ -3367,7 +3367,7 @@ static int next_dfs_prepath(struct cifs_sb_info *cifs_sb, struct smb3_fs_context
 		} else {
 			v.UNC = ctx->UNC;
 			v.prepath = path + 1;
-			npath = build_unc_path_to_root(&v, cifs_sb, true);
+			npath = build_unc_path_to_root(&v, cifs_sb, false);
 		}
 
 		if (IS_ERR(npath)) {
