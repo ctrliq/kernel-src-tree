@@ -1,0 +1,144 @@
+xfs: increase the default parallelism levels of pwork clients
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Darrick J. Wong <djwong@kernel.org>
+commit f83d436aef5def77b318effc14809fdc57092588
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/f83d436a.failed
+
+Increase the parallelism level for pwork clients to the workqueue
+defaults so that we can take advantage of computers with a lot of CPUs
+and a lot of hardware.  On fast systems this will speed up quotacheck by
+a large factor, and the following posteof/cowblocks cleanup series will
+use the functionality presented in this patch to run garbage collection
+as quickly as possible.
+
+We do this by switching the pwork workqueue to unbounded, since the
+current user (quotacheck) runs lengthy scans for each work item and we
+don't care about dispatching the work on a warm cpu cache or anything
+like that.  Also set WQ_SYSFS so that we can monitor where the wq is
+running.
+
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+(cherry picked from commit f83d436aef5def77b318effc14809fdc57092588)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_pwork.c
+diff --cc fs/xfs/xfs_pwork.c
+index 4bcc3e61056c,c283b801cc5d..000000000000
+--- a/fs/xfs/xfs_pwork.c
++++ b/fs/xfs/xfs_pwork.c
+@@@ -117,20 -119,3 +119,23 @@@ xfs_pwork_poll
+  				atomic_read(&pctl->nr_work) == 0, HZ) == 0)
+  		touch_softlockup_watchdog();
+  }
+++<<<<<<< HEAD
+ +
+ +/*
+ + * Return the amount of parallelism that the data device can handle, or 0 for
+ + * no limit.
+ + */
+ +unsigned int
+ +xfs_pwork_guess_datadev_parallelism(
+ +	struct xfs_mount	*mp)
+ +{
+ +	struct xfs_buftarg	*btp = mp->m_ddev_targp;
+ +
+ +	/*
+ +	 * For now we'll go with the most conservative setting possible,
+ +	 * which is two threads for an SSD and 1 thread everywhere else.
+ +	 */
+ +	return blk_queue_nonrot(btp->bt_bdev->bd_queue) ? 2 : 1;
+ +}
+++=======
+++>>>>>>> f83d436aef5d (xfs: increase the default parallelism levels of pwork clients)
+diff --git a/Documentation/filesystems/xfs.txt b/Documentation/filesystems/xfs.txt
+index 20c6aa2c7752..5c38803e2413 100644
+--- a/Documentation/filesystems/xfs.txt
++++ b/Documentation/filesystems/xfs.txt
+@@ -468,3 +468,41 @@ the class and error context. For example, the default values for
+ "metadata/ENODEV" are "0" rather than "-1" so that this error handler defaults
+ to "fail immediately" behaviour. This is done because ENODEV is a fatal,
+ unrecoverable error no matter how many times the metadata IO is retried.
++
++Workqueue Concurrency
++=====================
++
++XFS uses kernel workqueues to parallelize metadata update processes.  This
++enables it to take advantage of storage hardware that can service many IO
++operations simultaneously.  This interface exposes internal implementation
++details of XFS, and as such is explicitly not part of any userspace API/ABI
++guarantee the kernel may give userspace.  These are undocumented features of
++the generic workqueue implementation XFS uses for concurrency, and they are
++provided here purely for diagnostic and tuning purposes and may change at any
++time in the future.
++
++The control knobs for a filesystem's workqueues are organized by task at hand
++and the short name of the data device.  They all can be found in:
++
++  /sys/bus/workqueue/devices/${task}!${device}
++
++================  ===========
++  Task            Description
++================  ===========
++  xfs_iwalk-$pid  Inode scans of the entire filesystem. Currently limited to
++                  mount time quotacheck.
++================  ===========
++
++For example, the knobs for the quotacheck workqueue for /dev/nvme0n1 would be
++found in /sys/bus/workqueue/devices/xfs_iwalk-1111!nvme0n1/.
++
++The interesting knobs for XFS workqueues are as follows:
++
++============     ===========
++  Knob           Description
++============     ===========
++  max_active     Maximum number of background threads that can be started to
++                 run the work.
++  cpumask        CPUs upon which the threads are allowed to run.
++  nice           Relative priority of scheduling the threads.  These are the
++                 same nice levels that can be applied to userspace processes.
+diff --git a/fs/xfs/xfs_iwalk.c b/fs/xfs/xfs_iwalk.c
+index eae3aff9bc97..c4a340f1f1e1 100644
+--- a/fs/xfs/xfs_iwalk.c
++++ b/fs/xfs/xfs_iwalk.c
+@@ -618,15 +618,12 @@ xfs_iwalk_threaded(
+ {
+ 	struct xfs_pwork_ctl	pctl;
+ 	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, startino);
+-	unsigned int		nr_threads;
+ 	int			error;
+ 
+ 	ASSERT(agno < mp->m_sb.sb_agcount);
+ 	ASSERT(!(flags & ~XFS_IWALK_FLAGS_ALL));
+ 
+-	nr_threads = xfs_pwork_guess_datadev_parallelism(mp);
+-	error = xfs_pwork_init(mp, &pctl, xfs_iwalk_ag_work, "xfs_iwalk",
+-			nr_threads);
++	error = xfs_pwork_init(mp, &pctl, xfs_iwalk_ag_work, "xfs_iwalk");
+ 	if (error)
+ 		return error;
+ 
+* Unmerged path fs/xfs/xfs_pwork.c
+diff --git a/fs/xfs/xfs_pwork.h b/fs/xfs/xfs_pwork.h
+index 8133124cf3bb..c0ef81fc85dd 100644
+--- a/fs/xfs/xfs_pwork.h
++++ b/fs/xfs/xfs_pwork.h
+@@ -51,11 +51,9 @@ xfs_pwork_want_abort(
+ }
+ 
+ int xfs_pwork_init(struct xfs_mount *mp, struct xfs_pwork_ctl *pctl,
+-		xfs_pwork_work_fn work_fn, const char *tag,
+-		unsigned int nr_threads);
++		xfs_pwork_work_fn work_fn, const char *tag);
+ void xfs_pwork_queue(struct xfs_pwork_ctl *pctl, struct xfs_pwork *pwork);
+ int xfs_pwork_destroy(struct xfs_pwork_ctl *pctl);
+ void xfs_pwork_poll(struct xfs_pwork_ctl *pctl);
+-unsigned int xfs_pwork_guess_datadev_parallelism(struct xfs_mount *mp);
+ 
+ #endif /* __XFS_PWORK_H__ */
