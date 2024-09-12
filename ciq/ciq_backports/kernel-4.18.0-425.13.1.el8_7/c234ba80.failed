@@ -1,0 +1,174 @@
+PCI: hv: Only reuse existing IRTE allocation for Multi-MSI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.13.1.el8_7
+commit-author Dexuan Cui <decui@microsoft.com>
+commit c234ba8042920fa83635808dc5673f36869ca280
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.13.1.el8_7/c234ba80.failed
+
+Jeffrey added Multi-MSI support to the pci-hyperv driver by the 4 patches:
+08e61e861a0e ("PCI: hv: Fix multi-MSI to allow more than one MSI vector")
+455880dfe292 ("PCI: hv: Fix hv_arch_irq_unmask() for multi-MSI")
+b4b77778ecc5 ("PCI: hv: Reuse existing IRTE allocation in compose_msi_msg()")
+a2bad844a67b ("PCI: hv: Fix interrupt mapping for multi-MSI")
+
+It turns out that the third patch (b4b77778ecc5) causes a performance
+regression because all the interrupts now happen on 1 physical CPU (or two
+pCPUs, if one pCPU doesn't have enough vectors). When a guest has many PCI
+devices, it may suffer from soft lockups if the workload is heavy, e.g.,
+see https://lwn.net/ml/linux-kernel/20220804025104.15673-1-decui@microsoft.com/
+
+Commit b4b77778ecc5 itself is good. The real issue is that the hypercall in
+hv_irq_unmask() -> hv_arch_irq_unmask() ->
+hv_do_hypercall(HVCALL_RETARGET_INTERRUPT...) only changes the target
+virtual CPU rather than physical CPU; with b4b77778ecc5, the pCPU is
+determined only once in hv_compose_msi_msg() where only vCPU0 is specified;
+consequently the hypervisor only uses 1 target pCPU for all the interrupts.
+
+Note: before b4b77778ecc5, the pCPU is determined twice, and when the pCPU
+is determined the second time, the vCPU in the effective affinity mask is
+used (i.e., it isn't always vCPU0), so the hypervisor chooses different
+pCPU for each interrupt.
+
+The hypercall will be fixed in future to update the pCPU as well, but
+that will take quite a while, so let's restore the old behavior in
+hv_compose_msi_msg(), i.e., don't reuse the existing IRTE allocation for
+single-MSI and MSI-X; for multi-MSI, we choose the vCPU in a round-robin
+manner for each PCI device, so the interrupts of different devices can
+happen on different pCPUs, though the interrupts of each device happen on
+some single pCPU.
+
+The hypercall fix may not be backported to all old versions of Hyper-V, so
+we want to have this guest side change forever (or at least till we're sure
+the old affected versions of Hyper-V are no longer supported).
+
+Fixes: b4b77778ecc5 ("PCI: hv: Reuse existing IRTE allocation in compose_msi_msg()")
+Co-developed-by: Jeffrey Hugo <quic_jhugo@quicinc.com>
+	Signed-off-by: Jeffrey Hugo <quic_jhugo@quicinc.com>
+Co-developed-by: Carl Vanderlip <quic_carlv@quicinc.com>
+	Signed-off-by: Carl Vanderlip <quic_carlv@quicinc.com>
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+Link: https://lore.kernel.org/r/20221104222953.11356-1-decui@microsoft.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit c234ba8042920fa83635808dc5673f36869ca280)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/controller/pci-hyperv.c
+diff --cc drivers/pci/controller/pci-hyperv.c
+index e492e486f75b,f1ec8931dfbc..000000000000
+--- a/drivers/pci/controller/pci-hyperv.c
++++ b/drivers/pci/controller/pci-hyperv.c
+@@@ -1612,8 -1613,8 +1612,13 @@@ static void hv_pci_compose_compl(void *
+  }
+  
+  static u32 hv_compose_msi_req_v1(
+++<<<<<<< HEAD
+ +	struct pci_create_interrupt *int_pkt, struct cpumask *affinity,
+ +	u32 slot, u8 vector, u8 vector_count)
+++=======
++ 	struct pci_create_interrupt *int_pkt,
++ 	u32 slot, u8 vector, u16 vector_count)
+++>>>>>>> c234ba804292 (PCI: hv: Only reuse existing IRTE allocation for Multi-MSI)
+  {
+  	int_pkt->message_type.type = PCI_CREATE_INTERRUPT_MESSAGE;
+  	int_pkt->wslot.slot = slot;
+@@@ -1639,12 -1669,34 +1673,40 @@@ static int hv_compose_msi_req_get_cpu(s
+  	return cpumask_first_and(affinity, cpu_online_mask);
+  }
+  
+++<<<<<<< HEAD
+ +static u32 hv_compose_msi_req_v2(
+ +	struct pci_create_interrupt2 *int_pkt, struct cpumask *affinity,
+ +	u32 slot, u8 vector, u8 vector_count)
+++=======
++ /*
++  * Make sure the dummy vCPU values for multi-MSI don't all point to vCPU0.
++  */
++ static int hv_compose_multi_msi_req_get_cpu(void)
+++>>>>>>> c234ba804292 (PCI: hv: Only reuse existing IRTE allocation for Multi-MSI)
+  {
++ 	static DEFINE_SPINLOCK(multi_msi_cpu_lock);
++ 
++ 	/* -1 means starting with CPU 0 */
++ 	static int cpu_next = -1;
++ 
++ 	unsigned long flags;
+  	int cpu;
+  
++ 	spin_lock_irqsave(&multi_msi_cpu_lock, flags);
++ 
++ 	cpu_next = cpumask_next_wrap(cpu_next, cpu_online_mask, nr_cpu_ids,
++ 				     false);
++ 	cpu = cpu_next;
++ 
++ 	spin_unlock_irqrestore(&multi_msi_cpu_lock, flags);
++ 
++ 	return cpu;
++ }
++ 
++ static u32 hv_compose_msi_req_v2(
++ 	struct pci_create_interrupt2 *int_pkt, int cpu,
++ 	u32 slot, u8 vector, u16 vector_count)
++ {
+  	int_pkt->message_type.type = PCI_CREATE_INTERRUPT_MESSAGE2;
+  	int_pkt->wslot.slot = slot;
+  	int_pkt->int_desc.vector = vector;
+@@@ -1659,11 -1710,9 +1720,14 @@@
+  }
+  
+  static u32 hv_compose_msi_req_v3(
+++<<<<<<< HEAD
+ +	struct pci_create_interrupt3 *int_pkt, struct cpumask *affinity,
+ +	u32 slot, u32 vector, u8 vector_count)
+++=======
++ 	struct pci_create_interrupt3 *int_pkt, int cpu,
++ 	u32 slot, u32 vector, u16 vector_count)
+++>>>>>>> c234ba804292 (PCI: hv: Only reuse existing IRTE allocation for Multi-MSI)
+  {
+- 	int cpu;
+- 
+  	int_pkt->message_type.type = PCI_CREATE_INTERRUPT_MESSAGE3;
+  	int_pkt->wslot.slot = slot;
+  	int_pkt->int_desc.vector = vector;
+@@@ -1764,8 -1830,14 +1840,9 @@@ static void hv_compose_msi_msg(struct i
+  	} else {
+  		vector = hv_msi_get_int_vector(data);
+  		vector_count = 1;
++ 		cpu = hv_compose_msi_req_get_cpu(dest);
+  	}
+  
+ -	/*
+ -	 * hv_compose_msi_req_v1 and v2 are for x86 only, meaning 'vector'
+ -	 * can't exceed u8. Cast 'vector' down to u8 for v1/v2 explicitly
+ -	 * for better readability.
+ -	 */
+  	memset(&ctxt, 0, sizeof(ctxt));
+  	init_completion(&comp.comp_pkt.host_event);
+  	ctxt.pci_pkt.completion_func = hv_pci_compose_compl;
+@@@ -1774,18 -1846,17 +1851,17 @@@
+  	switch (hbus->protocol_version) {
+  	case PCI_PROTOCOL_VERSION_1_1:
+  		size = hv_compose_msi_req_v1(&ctxt.int_pkts.v1,
+- 					dest,
+  					hpdev->desc.win_slot.slot,
+ -					(u8)vector,
+ +					vector,
+  					vector_count);
+  		break;
+  
+  	case PCI_PROTOCOL_VERSION_1_2:
+  	case PCI_PROTOCOL_VERSION_1_3:
+  		size = hv_compose_msi_req_v2(&ctxt.int_pkts.v2,
+- 					dest,
++ 					cpu,
+  					hpdev->desc.win_slot.slot,
+ -					(u8)vector,
+ +					vector,
+  					vector_count);
+  		break;
+  
+* Unmerged path drivers/pci/controller/pci-hyperv.c
