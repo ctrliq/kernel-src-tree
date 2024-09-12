@@ -47,14 +47,21 @@ int hda_ctrl_dai_widget_setup(struct snd_soc_dapm_widget *w)
 	struct snd_soc_component *component = swidget->scomp;
 	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(component);
 	struct sof_ipc_dai_config *config;
+	struct sof_dai_private_data *private;
 	struct snd_sof_dai *sof_dai;
 	struct sof_ipc_reply reply;
 	int ret;
 
 	sof_dai = swidget->private;
 
-	if (!sof_dai || !sof_dai->dai_config) {
-		dev_err(sdev->dev, "No config for DAI %s\n", w->name);
+	if (!sof_dai || !sof_dai->private) {
+		dev_err(sdev->dev, "%s: No private data for DAI %s\n", __func__, w->name);
+		return -EINVAL;
+	}
+
+	private = sof_dai->private;
+	if (!private->dai_config) {
+		dev_err(sdev->dev, "%s: No config for DAI %s\n", __func__, w->name);
 		return -EINVAL;
 	}
 
@@ -65,7 +72,7 @@ int hda_ctrl_dai_widget_setup(struct snd_soc_dapm_widget *w)
 			return ret;
 	}
 
-	config = &sof_dai->dai_config[sof_dai->current_config];
+	config = &private->dai_config[sof_dai->current_config];
 
 	/*
 	 * For static pipelines, the DAI widget would already be set up and calling
@@ -99,6 +106,7 @@ int hda_ctrl_dai_widget_free(struct snd_soc_dapm_widget *w)
 	struct snd_sof_widget *swidget = w->dobj.private;
 	struct snd_soc_component *component = swidget->scomp;
 	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(component);
+	struct sof_dai_private_data *private;
 	struct sof_ipc_dai_config *config;
 	struct snd_sof_dai *sof_dai;
 	struct sof_ipc_reply reply;
@@ -106,8 +114,14 @@ int hda_ctrl_dai_widget_free(struct snd_soc_dapm_widget *w)
 
 	sof_dai = swidget->private;
 
-	if (!sof_dai || !sof_dai->dai_config) {
-		dev_err(sdev->dev, "error: No config to free DAI %s\n", w->name);
+	if (!sof_dai || !sof_dai->private) {
+		dev_err(sdev->dev, "%s: No private data for DAI %s\n", __func__, w->name);
+		return -EINVAL;
+	}
+
+	private = sof_dai->private;
+	if (!private->dai_config) {
+		dev_err(sdev->dev, "%s: No config for DAI %s\n", __func__, w->name);
 		return -EINVAL;
 	}
 
@@ -115,7 +129,7 @@ int hda_ctrl_dai_widget_free(struct snd_soc_dapm_widget *w)
 	if (!sof_dai->configured)
 		return 0;
 
-	config = &sof_dai->dai_config[sof_dai->current_config];
+	config = &private->dai_config[sof_dai->current_config];
 
 	/* set HW_FREE flag */
 	config->flags = FIELD_PREP(SOF_DAI_CONFIG_FLAGS_MASK, SOF_DAI_CONFIG_FLAGS_HW_FREE);
@@ -151,6 +165,7 @@ static int sdw_dai_config_ipc(struct snd_sof_dev *sdev,
 			      int link_id, int alh_stream_id, int dai_id, bool setup)
 {
 	struct snd_sof_widget *swidget = w->dobj.private;
+	struct sof_dai_private_data *private;
 	struct sof_ipc_dai_config *config;
 	struct snd_sof_dai *sof_dai;
 
@@ -161,12 +176,18 @@ static int sdw_dai_config_ipc(struct snd_sof_dev *sdev,
 
 	sof_dai = swidget->private;
 
-	if (!sof_dai || !sof_dai->dai_config) {
-		dev_err(sdev->dev, "error: No config for DAI %s\n", w->name);
+	if (!sof_dai || !sof_dai->private) {
+		dev_err(sdev->dev, "%s: No private data for DAI %s\n", __func__, w->name);
 		return -EINVAL;
 	}
 
-	config = &sof_dai->dai_config[sof_dai->current_config];
+	private = sof_dai->private;
+	if (!private->dai_config) {
+		dev_err(sdev->dev, "%s: No config for DAI %s\n", __func__, w->name);
+		return -EINVAL;
+	}
+
+	config = &private->dai_config[sof_dai->current_config];
 
 	/* update config with link and stream ID */
 	config->dai_index = (link_id << 8) | dai_id;
