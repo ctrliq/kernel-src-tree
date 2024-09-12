@@ -588,7 +588,7 @@ void kunit_do_failed_assertion(struct kunit *test,
  */
 #define KUNIT_BASE_BINARY_ASSERTION(test,				       \
 				    assert_class,			       \
-				    ASSERT_CLASS_INIT,			       \
+				    format_func,			       \
 				    assert_type,			       \
 				    left,				       \
 				    op,					       \
@@ -603,11 +603,12 @@ do {									       \
 			assert_type,					       \
 			__left op __right,				       \
 			assert_class,					       \
-			ASSERT_CLASS_INIT(#op,				       \
-					  #left,			       \
-					  __left,			       \
-					  #right,			       \
-					  __right),			       \
+			KUNIT_INIT_BINARY_ASSERT_STRUCT(format_func,	       \
+							#op,		       \
+							#left,		       \
+							__left,		       \
+							#right,		       \
+							__right),	       \
 			fmt,						       \
 			##__VA_ARGS__);					       \
 } while (0)
@@ -621,7 +622,7 @@ do {									       \
 				    ...)				       \
 	KUNIT_BASE_BINARY_ASSERTION(test,				       \
 				    kunit_binary_assert,		       \
-				    KUNIT_INIT_BINARY_ASSERT_STRUCT,	       \
+				    kunit_binary_assert_format,		       \
 				    assert_type,			       \
 				    left, op, right,			       \
 				    fmt,				       \
@@ -636,7 +637,7 @@ do {									       \
 				    ...)				       \
 	KUNIT_BASE_BINARY_ASSERTION(test,				       \
 				    kunit_binary_ptr_assert,		       \
-				    KUNIT_INIT_BINARY_PTR_ASSERT_STRUCT,       \
+				    kunit_binary_ptr_assert_format,	       \
 				    assert_type,			       \
 				    left, op, right,			       \
 				    fmt,				       \
@@ -657,7 +658,8 @@ do {									       \
 			assert_type,					       \
 			strcmp(__left, __right) op 0,			       \
 			kunit_binary_str_assert,			       \
-			KUNIT_INIT_BINARY_STR_ASSERT_STRUCT(#op,	       \
+			KUNIT_INIT_BINARY_ASSERT_STRUCT(kunit_binary_str_assert_format,\
+							#op,		       \
 							#left,		       \
 							__left,		       \
 							#right,		       \
