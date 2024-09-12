@@ -1,0 +1,78 @@
+tcx: Fix splat during dev unregister
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-427.18.1.el9_4
+commit-author Martin KaFai Lau <martin.lau@kernel.org>
+commit 079082c60affefeb9d2bd4176a4f2b390a9ccfda
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.18.1.el9_4/079082c6.failed
+
+During unregister_netdevice_many_notify(), the ordering of our concerned
+function calls is like this:
+
+  unregister_netdevice_many_notify
+    dev_shutdown
+	qdisc_put
+            clsact_destroy
+    tcx_uninstall
+
+The syzbot reproducer triggered a case that the qdisc refcnt is not
+zero during dev_shutdown().
+
+tcx_uninstall() will then WARN_ON_ONCE(tcx_entry(entry)->miniq_active)
+because the miniq is still active and the entry should not be freed.
+The latter assumed that qdisc destruction happens before tcx teardown.
+
+This fix is to avoid tcx_uninstall() doing tcx_entry_free() when the
+miniq is still alive and let the clsact_destroy() do the free later, so
+that we do not assume any specific ordering for either of them.
+
+If still active, tcx_uninstall() does clear the entry when flushing out
+the prog/link. clsact_destroy() will then notice the "!tcx_entry_is_active()"
+and then does the tcx_entry_free() eventually.
+
+Fixes: e420bed02507 ("bpf: Add fd-based tcx multi-prog infra with link support")
+	Reported-by: syzbot+376a289e86a0fd02b9ba@syzkaller.appspotmail.com
+	Reported-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Co-developed-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Tested-by: syzbot+376a289e86a0fd02b9ba@syzkaller.appspotmail.com
+	Tested-by: Leon Romanovsky <leonro@nvidia.com>
+Link: https://lore.kernel.org/r/222255fe07cb58f15ee662e7ee78328af5b438e4.1690549248.git.daniel@iogearbox.net
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 079082c60affefeb9d2bd4176a4f2b390a9ccfda)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/tcx.c
+* Unmerged path kernel/bpf/tcx.c
+diff --git a/include/linux/bpf_mprog.h b/include/linux/bpf_mprog.h
+index 6feefec43422..0301b983ed43 100644
+--- a/include/linux/bpf_mprog.h
++++ b/include/linux/bpf_mprog.h
+@@ -256,6 +256,22 @@ static inline void bpf_mprog_entry_copy(struct bpf_mprog_entry *dst,
+ 	memcpy(dst->fp_items, src->fp_items, sizeof(src->fp_items));
+ }
+ 
++static inline void bpf_mprog_entry_clear(struct bpf_mprog_entry *dst)
++{
++	memset(dst->fp_items, 0, sizeof(dst->fp_items));
++}
++
++static inline void bpf_mprog_clear_all(struct bpf_mprog_entry *entry,
++				       struct bpf_mprog_entry **entry_new)
++{
++	struct bpf_mprog_entry *peer;
++
++	peer = bpf_mprog_peer(entry);
++	bpf_mprog_entry_clear(peer);
++	peer->parent->count = 0;
++	*entry_new = peer;
++}
++
+ static inline void bpf_mprog_entry_grow(struct bpf_mprog_entry *entry, int idx)
+ {
+ 	int total = bpf_mprog_total(entry);
+* Unmerged path kernel/bpf/tcx.c
