@@ -1,0 +1,275 @@
+x86/compressed/acpi: Move EFI vendor table lookup to helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Michael Roth <michael.roth@amd.com>
+commit dee602dd5d1489b5aa4651c561dfbe90eaee1589
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/dee602dd.failed
+
+Future patches for SEV-SNP-validated CPUID will also require early
+parsing of the EFI configuration. Incrementally move the related code
+into a set of helpers that can be re-used for that purpose.
+
+  [ bp: Unbreak unnecessarily broken lines. ]
+
+	Signed-off-by: Michael Roth <michael.roth@amd.com>
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20220307213356.2797205-28-brijesh.singh@amd.com
+(cherry picked from commit dee602dd5d1489b5aa4651c561dfbe90eaee1589)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/acpi.c
+#	arch/x86/boot/compressed/efi.c
+#	arch/x86/boot/compressed/misc.h
+diff --cc arch/x86/boot/compressed/acpi.c
+index 15255f388a85,b0c1dffc5510..000000000000
+--- a/arch/x86/boot/compressed/acpi.c
++++ b/arch/x86/boot/compressed/acpi.c
+@@@ -20,72 -20,31 +20,62 @@@
+   */
+  struct mem_vector immovable_mem[MAX_NUMNODES*2];
+  
+++<<<<<<< HEAD
+ +/*
+ + * Max length of 64-bit hex address string is 19, prefix "0x" + 16 hex
+ + * digits, and '\0' for termination.
+ + */
+ +#define MAX_ADDR_LEN 19
+ +
+ +static acpi_physical_address get_acpi_rsdp(void)
+ +{
+ +	acpi_physical_address addr = 0;
+ +
+ +#ifdef CONFIG_KEXEC
+ +	char val[MAX_ADDR_LEN] = { };
+ +	int ret;
+ +
+ +	ret = cmdline_find_option("acpi_rsdp", val, MAX_ADDR_LEN);
+ +	if (ret < 0)
+ +		return 0;
+ +
+ +	if (kstrtoull(val, 16, &addr))
+ +		return 0;
+ +#endif
+ +	return addr;
+ +}
+ +
+ +/*
+ + * Search EFI system tables for RSDP.  If both ACPI_20_TABLE_GUID and
+ + * ACPI_TABLE_GUID are found, take the former, which has more features.
+ + */
+++=======
+++>>>>>>> dee602dd5d14 (x86/compressed/acpi: Move EFI vendor table lookup to helper)
+  static acpi_physical_address
+- __efi_get_rsdp_addr(unsigned long config_tables, unsigned int nr_tables,
+- 		    bool efi_64)
++ __efi_get_rsdp_addr(unsigned long cfg_tbl_pa, unsigned int cfg_tbl_len)
+  {
+- 	acpi_physical_address rsdp_addr = 0;
+- 
+  #ifdef CONFIG_EFI
+- 	int i;
+- 
+- 	/* Get EFI tables from systab. */
+- 	for (i = 0; i < nr_tables; i++) {
+- 		acpi_physical_address table;
+- 		efi_guid_t guid;
+- 
+- 		if (efi_64) {
+- 			efi_config_table_64_t *tbl = (efi_config_table_64_t *)config_tables + i;
+- 
+- 			guid  = tbl->guid;
+- 			table = tbl->table;
+- 
+- 			if (!IS_ENABLED(CONFIG_X86_64) && table >> 32) {
+- 				debug_putstr("Error getting RSDP address: EFI config table located above 4GB.\n");
+- 				return 0;
+- 			}
+- 		} else {
+- 			efi_config_table_32_t *tbl = (efi_config_table_32_t *)config_tables + i;
+- 
+- 			guid  = tbl->guid;
+- 			table = tbl->table;
+- 		}
+- 
+- 		if (!(efi_guidcmp(guid, ACPI_TABLE_GUID)))
+- 			rsdp_addr = table;
+- 		else if (!(efi_guidcmp(guid, ACPI_20_TABLE_GUID)))
+- 			return table;
+- 	}
++ 	unsigned long rsdp_addr;
++ 	int ret;
++ 
++ 	/*
++ 	 * Search EFI system tables for RSDP. Preferred is ACPI_20_TABLE_GUID to
++ 	 * ACPI_TABLE_GUID because it has more features.
++ 	 */
++ 	rsdp_addr = efi_find_vendor_table(boot_params, cfg_tbl_pa, cfg_tbl_len,
++ 					  ACPI_20_TABLE_GUID);
++ 	if (rsdp_addr)
++ 		return (acpi_physical_address)rsdp_addr;
++ 
++ 	/* No ACPI_20_TABLE_GUID found, fallback to ACPI_TABLE_GUID. */
++ 	rsdp_addr = efi_find_vendor_table(boot_params, cfg_tbl_pa, cfg_tbl_len,
++ 					  ACPI_TABLE_GUID);
++ 	if (rsdp_addr)
++ 		return (acpi_physical_address)rsdp_addr;
++ 
++ 	debug_putstr("Error getting RSDP address.\n");
+  #endif
+- 	return rsdp_addr;
++ 	return 0;
+  }
+  
+  /* EFI/kexec support is 64-bit only. */
+@@@ -143,54 -101,26 +133,66 @@@ static acpi_physical_address kexec_get_
+  static acpi_physical_address efi_get_rsdp_addr(void)
+  {
+  #ifdef CONFIG_EFI
+ -	unsigned long cfg_tbl_pa = 0;
+ -	unsigned int cfg_tbl_len;
+ -	unsigned long systab_pa;
+ +	unsigned long systab, config_tables;
+  	unsigned int nr_tables;
+++<<<<<<< HEAD
+ +	struct efi_info *ei;
+ +	bool efi_64;
+ +	char *sig;
+ +
+ +	ei = &boot_params->efi_info;
+ +	sig = (char *)&ei->efi_loader_signature;
+ +
+ +	if (!strncmp(sig, EFI64_LOADER_SIGNATURE, 4)) {
+ +		efi_64 = true;
+ +	} else if (!strncmp(sig, EFI32_LOADER_SIGNATURE, 4)) {
+ +		efi_64 = false;
+ +	} else {
+ +		debug_putstr("Wrong EFI loader signature.\n");
+++=======
++ 	enum efi_type et;
++ 	int ret;
++ 
++ 	et = efi_get_type(boot_params);
++ 	if (et == EFI_TYPE_NONE)
+++>>>>>>> dee602dd5d14 (x86/compressed/acpi: Move EFI vendor table lookup to helper)
+  		return 0;
+ +	}
+ +
+ +	/* Get systab from boot params. */
+ +#ifdef CONFIG_X86_64
+ +	systab = ei->efi_systab | ((__u64)ei->efi_systab_hi << 32);
+ +#else
+ +	if (ei->efi_systab_hi || ei->efi_memmap_hi) {
+ +		debug_putstr("Error getting RSDP address: EFI system table located above 4GB.\n");
+ +		return 0;
+ +	}
+ +	systab = ei->efi_systab;
+ +#endif
+ +	if (!systab)
+ +		error("EFI system table not found.");
+  
+ -	systab_pa = efi_get_system_table(boot_params);
+ -	if (!systab_pa)
+ -		error("EFI support advertised, but unable to locate system table.");
+ +	/* Handle EFI bitness properly */
+ +	if (efi_64) {
+ +		efi_system_table_64_t *stbl = (efi_system_table_64_t *)systab;
+  
+ -	ret = efi_get_conf_table(boot_params, &cfg_tbl_pa, &cfg_tbl_len);
+ -	if (ret || !cfg_tbl_pa)
+ -		error("EFI config table not found.");
+++<<<<<<< HEAD
+ +		config_tables	= stbl->tables;
+ +		nr_tables	= stbl->nr_tables;
+ +	} else {
+ +		efi_system_table_32_t *stbl = (efi_system_table_32_t *)systab;
+ +
+ +		config_tables	= stbl->tables;
+ +		nr_tables	= stbl->nr_tables;
+ +	}
+  
+ +	if (!config_tables)
+ +		error("EFI config tables not found.");
+ +
+ +	return __efi_get_rsdp_addr(config_tables, nr_tables, efi_64);
+++=======
++ 	return __efi_get_rsdp_addr(cfg_tbl_pa, cfg_tbl_len);
+++>>>>>>> dee602dd5d14 (x86/compressed/acpi: Move EFI vendor table lookup to helper)
+  #else
+  	return 0;
+  #endif
+diff --cc arch/x86/boot/compressed/misc.h
+index 5bf08eb0ecdc,ba538af37e90..000000000000
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@@ -19,6 -22,8 +19,11 @@@
+  #include <linux/linkage.h>
+  #include <linux/screen_info.h>
+  #include <linux/elf.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/io.h>
++ #include <linux/efi.h>
+++>>>>>>> dee602dd5d14 (x86/compressed/acpi: Move EFI vendor table lookup to helper)
+  #include <asm/page.h>
+  #include <asm/boot.h>
+  #include <asm/bootparam.h>
+@@@ -168,4 -177,47 +173,50 @@@ void boot_stage2_vc(void)
+  
+  unsigned long sev_verify_cbit(unsigned long cr3);
+  
+++<<<<<<< HEAD
+++=======
++ enum efi_type {
++ 	EFI_TYPE_64,
++ 	EFI_TYPE_32,
++ 	EFI_TYPE_NONE,
++ };
++ 
++ #ifdef CONFIG_EFI
++ /* helpers for early EFI config table access */
++ enum efi_type efi_get_type(struct boot_params *bp);
++ unsigned long efi_get_system_table(struct boot_params *bp);
++ int efi_get_conf_table(struct boot_params *bp, unsigned long *cfg_tbl_pa,
++ 		       unsigned int *cfg_tbl_len);
++ unsigned long efi_find_vendor_table(struct boot_params *bp,
++ 				    unsigned long cfg_tbl_pa,
++ 				    unsigned int cfg_tbl_len,
++ 				    efi_guid_t guid);
++ #else
++ static inline enum efi_type efi_get_type(struct boot_params *bp)
++ {
++ 	return EFI_TYPE_NONE;
++ }
++ 
++ static inline unsigned long efi_get_system_table(struct boot_params *bp)
++ {
++ 	return 0;
++ }
++ 
++ static inline int efi_get_conf_table(struct boot_params *bp,
++ 				     unsigned long *cfg_tbl_pa,
++ 				     unsigned int *cfg_tbl_len)
++ {
++ 	return -ENOENT;
++ }
++ 
++ static inline unsigned long efi_find_vendor_table(struct boot_params *bp,
++ 						  unsigned long cfg_tbl_pa,
++ 						  unsigned int cfg_tbl_len,
++ 						  efi_guid_t guid)
++ {
++ 	return 0;
++ }
++ #endif /* CONFIG_EFI */
++ 
+++>>>>>>> dee602dd5d14 (x86/compressed/acpi: Move EFI vendor table lookup to helper)
+  #endif /* BOOT_COMPRESSED_MISC_H */
+* Unmerged path arch/x86/boot/compressed/efi.c
+* Unmerged path arch/x86/boot/compressed/acpi.c
+* Unmerged path arch/x86/boot/compressed/efi.c
+* Unmerged path arch/x86/boot/compressed/misc.h
