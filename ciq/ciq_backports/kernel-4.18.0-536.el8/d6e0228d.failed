@@ -1,0 +1,216 @@
+x86/hyperv: Support hypercalls for fully enlightened TDX guests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-536.el8
+commit-author Dexuan Cui <decui@microsoft.com>
+commit d6e0228d265f29348a01780ff306321c399d8b95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-536.el8/d6e0228d.failed
+
+A fully enlightened TDX guest on Hyper-V (i.e. without the paravisor) only
+uses the GHCI call rather than hv_hypercall_pg. Do not initialize
+hypercall_pg for such a guest.
+
+In hv_common_cpu_init(), the hyperv_pcpu_input_arg page needs to be
+decrypted in such a guest.
+
+	Reviewed-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+	Reviewed-by: Tianyu Lan <tiala@microsoft.com>
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+Link: https://lore.kernel.org/r/20230824080712.30327-3-decui@microsoft.com
+(cherry picked from commit d6e0228d265f29348a01780ff306321c399d8b95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/ivm.c
+#	arch/x86/include/asm/mshyperv.h
+#	drivers/hv/hv_common.c
+diff --cc arch/x86/hyperv/ivm.c
+index 5648efb6c73e,6c7598d9e68a..000000000000
+--- a/arch/x86/hyperv/ivm.c
++++ b/arch/x86/hyperv/ivm.c
+@@@ -387,3 -551,40 +387,43 @@@ bool hv_isolation_type_snp(void
+  {
+  	return static_branch_unlikely(&isolation_type_snp);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ DEFINE_STATIC_KEY_FALSE(isolation_type_en_snp);
++ /*
++  * hv_isolation_type_en_snp - Check system runs in the AMD SEV-SNP based
++  * isolation enlightened VM.
++  */
++ bool hv_isolation_type_en_snp(void)
++ {
++ 	return static_branch_unlikely(&isolation_type_en_snp);
++ }
++ 
++ DEFINE_STATIC_KEY_FALSE(isolation_type_tdx);
++ /*
++  * hv_isolation_type_tdx - Check if the system runs in an Intel TDX based
++  * isolated VM.
++  */
++ bool hv_isolation_type_tdx(void)
++ {
++ 	return static_branch_unlikely(&isolation_type_tdx);
++ }
++ 
++ #ifdef CONFIG_INTEL_TDX_GUEST
++ 
++ u64 hv_tdx_hypercall(u64 control, u64 param1, u64 param2)
++ {
++ 	struct tdx_hypercall_args args = { };
++ 
++ 	args.r10 = control;
++ 	args.rdx = param1;
++ 	args.r8  = param2;
++ 
++ 	(void)__tdx_hypercall_ret(&args);
++ 
++ 	return args.r11;
++ }
++ 
++ #endif
+++>>>>>>> d6e0228d265f (x86/hyperv: Support hypercalls for fully enlightened TDX guests)
+diff --cc arch/x86/include/asm/mshyperv.h
+index a56488c7d1a0,6a9e00c4730b..000000000000
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@@ -46,6 -50,15 +46,18 @@@ extern u64 hv_current_partition_id
+  extern union hv_ghcb * __percpu *hv_ghcb_pg;
+  
+  extern bool hv_isolation_type_en_snp(void);
+++<<<<<<< HEAD
+++=======
++ bool hv_isolation_type_tdx(void);
++ u64 hv_tdx_hypercall(u64 control, u64 param1, u64 param2);
++ 
++ /*
++  * DEFAULT INIT GPAT and SEGMENT LIMIT value in struct VMSA
++  * to start AP in enlightened SEV guest.
++  */
++ #define HV_AP_INIT_GPAT_DEFAULT		0x0007040600070406ULL
++ #define HV_AP_SEGMENT_LIMIT		0xffffffff
+++>>>>>>> d6e0228d265f (x86/hyperv: Support hypercalls for fully enlightened TDX guests)
+  
+  int hv_call_deposit_pages(int node, u64 partition_id, u32 num_pages);
+  int hv_call_add_logical_proc(int node, u32 lp_index, u32 acpi_id);
+diff --cc drivers/hv/hv_common.c
+index c00e1e18c2ea,897bbb96f411..000000000000
+--- a/drivers/hv/hv_common.c
++++ b/drivers/hv/hv_common.c
+@@@ -132,13 -366,31 +132,40 @@@ int hv_common_cpu_init(unsigned int cpu
+  	flags = irqs_disabled() ? GFP_ATOMIC : GFP_KERNEL;
+  
+  	inputarg = (void **)this_cpu_ptr(hyperv_pcpu_input_arg);
+ +	*inputarg = kmalloc(pgcount * HV_HYP_PAGE_SIZE, flags);
+ +	if (!(*inputarg))
+ +		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	if (hv_root_partition) {
+ +		outputarg = (void **)this_cpu_ptr(hyperv_pcpu_output_arg);
+ +		*outputarg = (char *)(*inputarg) + HV_HYP_PAGE_SIZE;
+++=======
++ 	/*
++ 	 * hyperv_pcpu_input_arg and hyperv_pcpu_output_arg memory is already
++ 	 * allocated if this CPU was previously online and then taken offline
++ 	 */
++ 	if (!*inputarg) {
++ 		*inputarg = kmalloc(pgcount * HV_HYP_PAGE_SIZE, flags);
++ 		if (!(*inputarg))
++ 			return -ENOMEM;
++ 
++ 		if (hv_root_partition) {
++ 			outputarg = (void **)this_cpu_ptr(hyperv_pcpu_output_arg);
++ 			*outputarg = (char *)(*inputarg) + HV_HYP_PAGE_SIZE;
++ 		}
++ 
++ 		if (hv_isolation_type_en_snp() || hv_isolation_type_tdx()) {
++ 			ret = set_memory_decrypted((unsigned long)*inputarg, pgcount);
++ 			if (ret) {
++ 				/* It may be unsafe to free *inputarg */
++ 				*inputarg = NULL;
++ 				return ret;
++ 			}
++ 
++ 			memset(*inputarg, 0x00, pgcount * PAGE_SIZE);
++ 		}
+++>>>>>>> d6e0228d265f (x86/hyperv: Support hypercalls for fully enlightened TDX guests)
+  	}
+  
+  	msr_vp_index = hv_get_register(HV_REGISTER_VP_INDEX);
+@@@ -311,13 -568,8 +338,21 @@@ u64 __weak hv_ghcb_hypercall(u64 contro
+  }
+  EXPORT_SYMBOL_GPL(hv_ghcb_hypercall);
+  
+++<<<<<<< HEAD
+ +void __weak *hv_map_memory(void *addr, unsigned long size)
+ +{
+ +	return NULL;
+ +}
+ +EXPORT_SYMBOL_GPL(hv_map_memory);
+ +
+ +void __weak hv_unmap_memory(void *addr)
+ +{
+ +}
+ +EXPORT_SYMBOL_GPL(hv_unmap_memory);
+++=======
++ u64 __weak hv_tdx_hypercall(u64 control, u64 param1, u64 param2)
++ {
++ 	return HV_STATUS_INVALID_PARAMETER;
++ }
++ EXPORT_SYMBOL_GPL(hv_tdx_hypercall);
+++>>>>>>> d6e0228d265f (x86/hyperv: Support hypercalls for fully enlightened TDX guests)
+diff --git a/arch/x86/hyperv/hv_init.c b/arch/x86/hyperv/hv_init.c
+index 1d0a26104d0f..53a91f734fbe 100644
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@ -446,6 +446,10 @@ void __init hyperv_init(void)
+ 	/* Hyper-V requires to write guest os id via ghcb in SNP IVM. */
+ 	hv_ghcb_msr_write(HV_X64_MSR_GUEST_OS_ID, guest_id);
+ 
++	/* A TDX guest uses the GHCI call rather than hv_hypercall_pg. */
++	if (hv_isolation_type_tdx())
++		goto skip_hypercall_pg_init;
++
+ 	hv_hypercall_pg = __vmalloc_node_range(PAGE_SIZE, 1, VMALLOC_START,
+ 			VMALLOC_END, GFP_KERNEL, PAGE_KERNEL_ROX,
+ 			VM_FLUSH_RESET_PERMS, NUMA_NO_NODE,
+@@ -485,6 +489,7 @@ void __init hyperv_init(void)
+ 		wrmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
+ 	}
+ 
++skip_hypercall_pg_init:
+ 	/*
+ 	 * hyperv_init() is called before LAPIC is initialized: see
+ 	 * apic_intr_mode_init() -> x86_platform.apic_post_init() and
+@@ -618,6 +623,9 @@ bool hv_is_hyperv_initialized(void)
+ 	if (x86_hyper_type != X86_HYPER_MS_HYPERV)
+ 		return false;
+ 
++	/* A TDX guest uses the GHCI call rather than hv_hypercall_pg. */
++	if (hv_isolation_type_tdx())
++		return true;
+ 	/*
+ 	 * Verify that earlier initialization succeeded by checking
+ 	 * that the hypercall page is setup
+* Unmerged path arch/x86/hyperv/ivm.c
+* Unmerged path arch/x86/include/asm/mshyperv.h
+* Unmerged path drivers/hv/hv_common.c
+diff --git a/include/asm-generic/mshyperv.h b/include/asm-generic/mshyperv.h
+index 8845a2eca339..69dc09ba0f25 100644
+--- a/include/asm-generic/mshyperv.h
++++ b/include/asm-generic/mshyperv.h
+@@ -266,6 +266,7 @@ enum hv_isolation_type hv_get_isolation_type(void);
+ bool hv_is_isolation_supported(void);
+ bool hv_isolation_type_snp(void);
+ u64 hv_ghcb_hypercall(u64 control, void *input, void *output, u32 input_size);
++u64 hv_tdx_hypercall(u64 control, u64 param1, u64 param2);
+ void hyperv_cleanup(void);
+ bool hv_query_ext_cap(u64 cap_query);
+ void hv_setup_dma_ops(struct device *dev, bool coherent);
