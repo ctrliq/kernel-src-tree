@@ -104,7 +104,7 @@ static void _cifs_mid_q_entry_release(struct kref *refcount)
 	    (midEntry->mid_state == MID_RESPONSE_RECEIVED ||
 	     midEntry->mid_state == MID_RESPONSE_READY) &&
 	    server->ops->handle_cancelled_mid)
-		server->ops->handle_cancelled_mid(midEntry->resp_buf, server);
+		server->ops->handle_cancelled_mid(midEntry, server);
 
 	midEntry->mid_state = MID_FREE;
 	atomic_dec(&midCount);
