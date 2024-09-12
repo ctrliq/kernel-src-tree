@@ -1,0 +1,365 @@
+gfs2: fix GL_SKIP node_scope problems
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.16.1.el8_6
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit f2e70d8f2fdff0707b3f4de4ef87f93e4396320c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.16.1.el8_6/f2e70d8f.failed
+
+Before this patch, when a glock was locked, the very first holder on the
+queue would unlock the lockref and call the go_instantiate glops function
+(if one existed), unless GL_SKIP was specified. When we introduced the new
+node-scope concept, we allowed multiple holders to lock glocks in EX mode
+and share the lock.
+
+But node-scope introduced a new problem: if the first holder has GL_SKIP
+and the next one does NOT, since it is not the first holder on the queue,
+the go_instantiate op was not called. Eventually the GL_SKIP holder may
+call the instantiate sub-function (e.g. gfs2_rgrp_bh_get) but there was
+still a window of time in which another non-GL_SKIP holder assumes the
+instantiate function had been called by the first holder. In the case of
+rgrp glocks, this led to a NULL pointer dereference on the buffer_heads.
+
+This patch tries to fix the problem by introducing two new glock flags:
+
+GLF_INSTANTIATE_NEEDED, which keeps track of when the instantiate function
+needs to be called to "fill in" or "read in" the object before it is
+referenced.
+
+GLF_INSTANTIATE_IN_PROG which is used to determine when a process is
+in the process of reading in the object. Whenever a function needs to
+reference the object, it checks the GLF_INSTANTIATE_NEEDED flag, and if
+set, it sets GLF_INSTANTIATE_IN_PROG and calls the glops "go_instantiate"
+function.
+
+As before, the gl_lockref spin_lock is unlocked during the IO operation,
+which may take a relatively long amount of time to complete. While
+unlocked, if another process determines go_instantiate is still needed,
+it sees GLF_INSTANTIATE_IN_PROG is set, and waits for the go_instantiate
+glop operation to be completed. Once GLF_INSTANTIATE_IN_PROG is cleared,
+it needs to check GLF_INSTANTIATE_NEEDED again because the other process's
+go_instantiate operation may not have been successful.
+
+Functions that previously called the instantiate sub-functions now call
+directly into gfs2_instantiate so the new bits are managed properly.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit f2e70d8f2fdff0707b3f4de4ef87f93e4396320c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index 8bbfd5bab589,08073dcaf30e..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -476,6 -472,51 +476,54 @@@ find_first_strong_holder(struct gfs2_gl
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * gfs2_instantiate - Call the glops instantiate function
++  * @gl: The glock
++  *
++  * Returns: 0 if instantiate was successful, 2 if type specific operation is
++  * underway, or error.
++  */
++ int gfs2_instantiate(struct gfs2_holder *gh)
++ {
++ 	struct gfs2_glock *gl = gh->gh_gl;
++ 	const struct gfs2_glock_operations *glops = gl->gl_ops;
++ 	int ret;
++ 
++ again:
++ 	if (!test_bit(GLF_INSTANTIATE_NEEDED, &gl->gl_flags))
++ 		return 0;
++ 
++ 	/*
++ 	 * Since we unlock the lockref lock, we set a flag to indicate
++ 	 * instantiate is in progress.
++ 	 */
++ 	if (test_bit(GLF_INSTANTIATE_IN_PROG, &gl->gl_flags)) {
++ 		wait_on_bit(&gl->gl_flags, GLF_INSTANTIATE_IN_PROG,
++ 			    TASK_UNINTERRUPTIBLE);
++ 		/*
++ 		 * Here we just waited for a different instantiate to finish.
++ 		 * But that may not have been successful, as when a process
++ 		 * locks an inode glock _before_ it has an actual inode to
++ 		 * instantiate into. So we check again. This process might
++ 		 * have an inode to instantiate, so might be successful.
++ 		 */
++ 		goto again;
++ 	}
++ 
++ 	set_bit(GLF_INSTANTIATE_IN_PROG, &gl->gl_flags);
++ 
++ 	ret = glops->go_instantiate(gh);
++ 	if (!ret)
++ 		clear_bit(GLF_INSTANTIATE_NEEDED, &gl->gl_flags);
++ 	clear_bit(GLF_INSTANTIATE_IN_PROG, &gl->gl_flags);
++ 	smp_mb__after_atomic();
++ 	wake_up_bit(&gl->gl_flags, GLF_INSTANTIATE_IN_PROG);
++ 	return ret;
++ }
++ 
+++>>>>>>> f2e70d8f2fdf (gfs2: fix GL_SKIP node_scope problems)
+  /**
+   * do_promote - promote as many requests as possible on the current queue
+   * @gl: The glock
+@@@ -496,33 -537,37 +544,64 @@@ __acquires(&gl->gl_lockref.lock
+  restart:
+  	first_gh = find_first_strong_holder(gl);
+  	list_for_each_entry_safe(gh, tmp, &gl->gl_holders, gh_list) {
+ -		lock_released = false;
+ -		if (test_bit(HIF_HOLDER, &gh->gh_iflags))
+ +		if (!test_bit(HIF_WAIT, &gh->gh_iflags))
+  			continue;
+++<<<<<<< HEAD
+ +		if (may_grant(gl, first_gh, gh)) {
+ +			if (!incompat_holders_demoted) {
+ +				demote_incompat_holders(gl, first_gh);
+ +				incompat_holders_demoted = true;
+ +				first_gh = gh;
+ +			}
+ +			if (gh->gh_list.prev == &gl->gl_holders &&
+ +			    glops->go_lock) {
+ +				if (!(gh->gh_flags & GL_SKIP)) {
+ +					spin_unlock(&gl->gl_lockref.lock);
+ +					/* FIXME: eliminate this eventually */
+ +					ret = glops->go_lock(gh);
+ +					spin_lock(&gl->gl_lockref.lock);
+ +					if (ret) {
+ +						if (ret == 1)
+ +							return 2;
+ +						gh->gh_error = ret;
+ +						list_del_init(&gh->gh_list);
+ +						trace_gfs2_glock_queue(gh, 0);
+ +						gfs2_holder_wake(gh);
+ +						goto restart;
+ +					}
+ +				}
+ +				set_bit(HIF_HOLDER, &gh->gh_iflags);
+ +				trace_gfs2_promote(gh);
+++=======
++ 		if (!may_grant(gl, first_gh, gh)) {
++ 			/*
++ 			 * If we get here, it means we may not grant this holder for
++ 			 * some reason. If this holder is the head of the list, it
++ 			 * means we have a blocked holder at the head, so return 1.
++ 			 */
++ 			if (gh->gh_list.prev == &gl->gl_holders)
++ 				return 1;
++ 			do_error(gl, 0);
++ 			break;
++ 		}
++ 		if (!incompat_holders_demoted) {
++ 			demote_incompat_holders(gl, first_gh);
++ 			incompat_holders_demoted = true;
++ 			first_gh = gh;
++ 		}
++ 		if (test_bit(GLF_INSTANTIATE_NEEDED, &gl->gl_flags) &&
++ 		    !(gh->gh_flags & GL_SKIP) && gl->gl_ops->go_instantiate) {
++ 			lock_released = true;
++ 			spin_unlock(&gl->gl_lockref.lock);
++ 			ret = gfs2_instantiate(gh);
++ 			spin_lock(&gl->gl_lockref.lock);
++ 			if (ret) {
++ 				if (ret == 1)
++ 					return 2;
++ 				gh->gh_error = ret;
++ 				list_del_init(&gh->gh_list);
++ 				trace_gfs2_glock_queue(gh, 0);
+++>>>>>>> f2e70d8f2fdf (gfs2: fix GL_SKIP node_scope problems)
+  				gfs2_holder_wake(gh);
+  				goto restart;
+  			}
+* Unmerged path fs/gfs2/glock.c
+diff --git a/fs/gfs2/glock.h b/fs/gfs2/glock.h
+index c273ec3118dd..fbbe87b37b3b 100644
+--- a/fs/gfs2/glock.h
++++ b/fs/gfs2/glock.h
+@@ -200,6 +200,7 @@ extern void gfs2_holder_reinit(unsigned int state, u16 flags,
+ extern void gfs2_holder_uninit(struct gfs2_holder *gh);
+ extern int gfs2_glock_nq(struct gfs2_holder *gh);
+ extern int gfs2_glock_poll(struct gfs2_holder *gh);
++extern int gfs2_instantiate(struct gfs2_holder *gh);
+ extern int gfs2_glock_wait(struct gfs2_holder *gh);
+ extern int gfs2_glock_async_wait(unsigned int num_gh, struct gfs2_holder *ghs);
+ extern void gfs2_glock_dq(struct gfs2_holder *gh);
+diff --git a/fs/gfs2/glops.c b/fs/gfs2/glops.c
+index 2e08b899f53d..06194a21359c 100644
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@ -357,6 +357,7 @@ static void inode_go_inval(struct gfs2_glock *gl, int flags)
+ 		truncate_inode_pages(mapping, 0);
+ 		if (ip) {
+ 			set_bit(GIF_INVALID, &ip->i_flags);
++			set_bit(GLF_INSTANTIATE_NEEDED, &gl->gl_flags);
+ 			forget_all_cached_acls(&ip->i_inode);
+ 			security_inode_invalidate_secctx(&ip->i_inode);
+ 			gfs2_dir_hash_inval(ip);
+@@ -490,13 +491,13 @@ static int inode_go_lock(struct gfs2_holder *gh)
+ 	struct gfs2_inode *ip = gl->gl_object;
+ 	int error = 0;
+ 
+-	if (!ip)
+-		return 0;
++	if (!ip) /* no inode to populate - read it in later */
++		goto out;
+ 
+ 	if (test_bit(GIF_INVALID, &ip->i_flags)) {
+ 		error = gfs2_inode_refresh(ip);
+ 		if (error)
+-			return error;
++			goto out;
+ 	}
+ 
+ 	if (gh->gh_state != LM_ST_DEFERRED)
+@@ -510,9 +511,10 @@ static int inode_go_lock(struct gfs2_holder *gh)
+ 			list_add(&ip->i_trunc_list, &sdp->sd_trunc_list);
+ 		spin_unlock(&sdp->sd_trunc_lock);
+ 		wake_up(&sdp->sd_quota_wait);
+-		return 1;
++		error = 1;
+ 	}
+ 
++out:
+ 	return error;
+ }
+ 
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 105717b0019c..d75ae6b0419f 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -319,6 +319,7 @@ struct gfs2_alloc_parms {
+ 
+ enum {
+ 	GLF_LOCK			= 1,
++	GLF_INSTANTIATE_NEEDED		= 2, /* needs instantiate */
+ 	GLF_DEMOTE			= 3,
+ 	GLF_PENDING_DEMOTE		= 4,
+ 	GLF_DEMOTE_IN_PROGRESS		= 5,
+@@ -328,6 +329,7 @@ enum {
+ 	GLF_REPLY_PENDING		= 9,
+ 	GLF_INITIAL			= 10,
+ 	GLF_FROZEN			= 11,
++	GLF_INSTANTIATE_IN_PROG		= 12, /* instantiate happening now */
+ 	GLF_LRU				= 13,
+ 	GLF_OBJECT			= 14, /* Used only for tracing */
+ 	GLF_BLOCKING			= 15,
+diff --git a/fs/gfs2/inode.c b/fs/gfs2/inode.c
+index e3dbddf2ae05..ea7e225a4bd5 100644
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@ -185,6 +185,7 @@ struct inode *gfs2_inode_lookup(struct super_block *sb, unsigned int type,
+ 
+ 		glock_set_object(ip->i_gl, ip);
+ 		set_bit(GIF_INVALID, &ip->i_flags);
++		set_bit(GLF_INSTANTIATE_NEEDED, &ip->i_gl->gl_flags);
+ 		error = gfs2_glock_nq_init(io_gl, LM_ST_SHARED, GL_EXACT, &ip->i_iopen_gh);
+ 		if (unlikely(error))
+ 			goto fail;
+@@ -198,7 +199,7 @@ struct inode *gfs2_inode_lookup(struct super_block *sb, unsigned int type,
+ 
+ 		if (type == DT_UNKNOWN) {
+ 			/* Inode glock must be locked already */
+-			error = gfs2_inode_refresh(GFS2_I(inode));
++			error = gfs2_instantiate(&i_gh);
+ 			if (error)
+ 				goto fail;
+ 		} else {
+diff --git a/fs/gfs2/rgrp.c b/fs/gfs2/rgrp.c
+index 7e8aeb333719..a9b2b6fac969 100644
+--- a/fs/gfs2/rgrp.c
++++ b/fs/gfs2/rgrp.c
+@@ -1241,8 +1241,7 @@ static int gfs2_rgrp_bh_get(struct gfs2_rgrpd *rgd)
+ 		rgd->rd_rgl->rl_unlinked = cpu_to_be32(count_unlinked(rgd));
+ 		gfs2_rgrp_ondisk2lvb(rgd->rd_rgl,
+ 				     rgd->rd_bits[0].bi_bh->b_data);
+-	}
+-	else if (sdp->sd_args.ar_rgrplvb) {
++	} else if (sdp->sd_args.ar_rgrplvb) {
+ 		if (!gfs2_rgrp_lvb_valid(rgd)){
+ 			gfs2_consist_rgrpd(rgd);
+ 			error = -EIO;
+@@ -1260,11 +1259,10 @@ static int gfs2_rgrp_bh_get(struct gfs2_rgrpd *rgd)
+ 		bi->bi_bh = NULL;
+ 		gfs2_assert_warn(sdp, !bi->bi_clone);
+ 	}
+-
+ 	return error;
+ }
+ 
+-static int update_rgrp_lvb(struct gfs2_rgrpd *rgd)
++static int update_rgrp_lvb(struct gfs2_rgrpd *rgd, struct gfs2_holder *gh)
+ {
+ 	u32 rl_flags;
+ 
+@@ -1272,7 +1270,7 @@ static int update_rgrp_lvb(struct gfs2_rgrpd *rgd)
+ 		return 0;
+ 
+ 	if (cpu_to_be32(GFS2_MAGIC) != rgd->rd_rgl->rl_magic)
+-		return gfs2_rgrp_bh_get(rgd);
++		return gfs2_instantiate(gh);
+ 
+ 	rl_flags = be32_to_cpu(rgd->rd_rgl->rl_flags);
+ 	rl_flags &= ~GFS2_RDF_MASK;
+@@ -1315,6 +1313,7 @@ void gfs2_rgrp_brelse(struct gfs2_rgrpd *rgd)
+ 			bi->bi_bh = NULL;
+ 		}
+ 	}
++	set_bit(GLF_INSTANTIATE_NEEDED, &rgd->rd_gl->gl_flags);
+ }
+ 
+ int gfs2_rgrp_send_discards(struct gfs2_sbd *sdp, u64 offset,
+@@ -2111,7 +2110,8 @@ int gfs2_inplace_reserve(struct gfs2_inode *ip, struct gfs2_alloc_parms *ap)
+ 			    gfs2_rgrp_congested(rs->rs_rgd, loops))
+ 				goto skip_rgrp;
+ 			if (sdp->sd_args.ar_rgrplvb) {
+-				error = update_rgrp_lvb(rs->rs_rgd);
++				error = update_rgrp_lvb(rs->rs_rgd,
++							&ip->i_rgd_gh);
+ 				if (unlikely(error)) {
+ 					rgrp_unlock_local(rs->rs_rgd);
+ 					gfs2_glock_dq_uninit(&ip->i_rgd_gh);
+@@ -2126,8 +2126,11 @@ int gfs2_inplace_reserve(struct gfs2_inode *ip, struct gfs2_alloc_parms *ap)
+ 		    (loops == 0 && target > rs->rs_rgd->rd_extfail_pt))
+ 			goto skip_rgrp;
+ 
+-		if (sdp->sd_args.ar_rgrplvb)
+-			gfs2_rgrp_bh_get(rs->rs_rgd);
++		if (sdp->sd_args.ar_rgrplvb) {
++			error = gfs2_instantiate(&ip->i_rgd_gh);
++			if (error)
++				goto skip_rgrp;
++		}
+ 
+ 		/* Get a reservation if we don't already have one */
+ 		if (!gfs2_rs_active(rs))
+@@ -2763,8 +2766,6 @@ void gfs2_rlist_free(struct gfs2_rgrp_list *rlist)
+ 
+ void rgrp_lock_local(struct gfs2_rgrpd *rgd)
+ {
+-	GLOCK_BUG_ON(rgd->rd_gl, !gfs2_glock_is_held_excl(rgd->rd_gl) &&
+-		     !test_bit(SDF_NORECOVERY, &rgd->rd_sbd->sd_flags));
+ 	mutex_lock(&rgd->rd_mutex);
+ }
+ 
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index f0126d658b8c..2ca35a154914 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -1318,7 +1318,7 @@ static enum dinode_demise evict_should_delete(struct inode *inode,
+ 		return SHOULD_NOT_DELETE_DINODE;
+ 
+ 	if (test_bit(GIF_INVALID, &ip->i_flags)) {
+-		ret = gfs2_inode_refresh(ip);
++		ret = gfs2_instantiate(gh);
+ 		if (ret)
+ 			return SHOULD_NOT_DELETE_DINODE;
+ 	}
