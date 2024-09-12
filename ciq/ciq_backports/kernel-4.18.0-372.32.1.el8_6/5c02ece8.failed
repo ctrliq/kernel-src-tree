@@ -1,0 +1,187 @@
+x86/kprobes: Fix ordering while text-patching
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 5c02ece81848db29b411139cc923d66050a6a40c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/5c02ece8.failed
+
+Kprobes does something like:
+
+register:
+	arch_arm_kprobe()
+	  text_poke(INT3)
+          /* guarantees nothing, INT3 will become visible at some point, maybe */
+
+        kprobe_optimizer()
+	  /* guarantees the bytes after INT3 are unused */
+	  synchronize_rcu_tasks();
+	  text_poke_bp(JMP32);
+	  /* implies IPI-sync, kprobe really is enabled */
+
+unregister:
+	__disarm_kprobe()
+	  unoptimize_kprobe()
+	    text_poke_bp(INT3 + tail);
+	    /* implies IPI-sync, so tail is guaranteed visible */
+          arch_disarm_kprobe()
+            text_poke(old);
+	    /* guarantees nothing, old will maybe become visible */
+
+	synchronize_rcu()
+
+        free-stuff
+
+Now the problem is that on register, the synchronize_rcu_tasks() does
+not imply sufficient to guarantee all CPUs have already observed INT3
+(although in practice this is exceedingly unlikely not to have
+happened) (similar to how MEMBARRIER_CMD_PRIVATE_EXPEDITED does not
+imply MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE).
+
+Worse, even if it did, we'd have to do 2 synchronize calls to provide
+the guarantee we're looking for, the first to ensure INT3 is visible,
+the second to guarantee nobody is then still using the instruction
+bytes after INT3.
+
+Similar on unregister; the synchronize_rcu() between
+__unregister_kprobe_top() and __unregister_kprobe_bottom() does not
+guarantee all CPUs are free of the INT3 (and observe the old text).
+
+Therefore, sprinkle some IPI-sync love around. This guarantees that
+all CPUs agree on the text and RCU once again provides the required
+guaranteed.
+
+	Tested-by: Alexei Starovoitov <ast@kernel.org>
+	Tested-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Acked-by: Masami Hiramatsu <mhiramat@kernel.org>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Paul E. McKenney <paulmck@kernel.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/20191111132458.162172862@infradead.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 5c02ece81848db29b411139cc923d66050a6a40c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/kprobes/core.c
+#	arch/x86/kernel/kprobes/opt.c
+diff --cc arch/x86/kernel/kprobes/core.c
+index 914c7d77ba21,579d30e91a36..000000000000
+--- a/arch/x86/kernel/kprobes/core.c
++++ b/arch/x86/kernel/kprobes/core.c
+@@@ -522,7 -501,8 +522,12 @@@ int arch_prepare_kprobe(struct kprobe *
+  
+  void arch_arm_kprobe(struct kprobe *p)
+  {
+++<<<<<<< HEAD
+ +	text_poke(p->addr, ((unsigned char []){BREAKPOINT_INSTRUCTION}), 1);
+++=======
++ 	text_poke(p->addr, ((unsigned char []){INT3_INSN_OPCODE}), 1);
++ 	text_poke_sync();
+++>>>>>>> 5c02ece81848 (x86/kprobes: Fix ordering while text-patching)
+  }
+  
+  void arch_disarm_kprobe(struct kprobe *p)
+diff --cc arch/x86/kernel/kprobes/opt.c
+index 0448efa0d2f1,26e0d6c4d8d6..000000000000
+--- a/arch/x86/kernel/kprobes/opt.c
++++ b/arch/x86/kernel/kprobes/opt.c
+@@@ -459,19 -444,10 +459,26 @@@ void arch_optimize_kprobes(struct list_
+  /* Replace a relative jump with a breakpoint (int3).  */
+  void arch_unoptimize_kprobe(struct optimized_kprobe *op)
+  {
+++<<<<<<< HEAD
+ +	u8 insn_buff[RELATIVEJUMP_SIZE];
+ +	u8 emulate_buff[RELATIVEJUMP_SIZE];
+ +
+ +	/* Set int3 to first byte for kprobes */
+ +	insn_buff[0] = BREAKPOINT_INSTRUCTION;
+ +	memcpy(insn_buff + 1, op->optinsn.copied_insn, RELATIVE_ADDR_SIZE);
+ +
+ +	emulate_buff[0] = RELATIVEJUMP_OPCODE;
+ +	*(s32 *)(&emulate_buff[1]) = (s32)((long)op->optinsn.insn -
+ +			((long)op->kp.addr + RELATIVEJUMP_SIZE));
+ +
+ +	text_poke_bp(op->kp.addr, insn_buff, RELATIVEJUMP_SIZE,
+ +		     emulate_buff);
+++=======
++ 	arch_arm_kprobe(&op->kp);
++ 	text_poke(op->kp.addr + INT3_INSN_SIZE,
++ 		  op->optinsn.copied_insn, DISP32_SIZE);
++ 	text_poke_sync();
+++>>>>>>> 5c02ece81848 (x86/kprobes: Fix ordering while text-patching)
+  }
+  
+  /*
+diff --git a/arch/x86/include/asm/text-patching.h b/arch/x86/include/asm/text-patching.h
+index 47a8c6185e2b..fbee71b1954e 100644
+--- a/arch/x86/include/asm/text-patching.h
++++ b/arch/x86/include/asm/text-patching.h
+@@ -42,6 +42,7 @@ extern void text_poke_early(void *addr, const void *opcode, size_t len);
+  * an inconsistent instruction while you patch.
+  */
+ extern void *text_poke(void *addr, const void *opcode, size_t len);
++extern void text_poke_sync(void);
+ extern void *text_poke_kgdb(void *addr, const void *opcode, size_t len);
+ extern int poke_int3_handler(struct pt_regs *regs);
+ extern void text_poke_bp(void *addr, const void *opcode, size_t len, const void *emulate);
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 4fce58044a3f..e0019f0f598b 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -777,6 +777,11 @@ static void do_sync_core(void *info)
+ 	sync_core();
+ }
+ 
++void text_poke_sync(void)
++{
++	on_each_cpu(do_sync_core, NULL, 1);
++}
++
+ struct text_poke_loc {
+ 	void *addr;
+ 	s32 rel32;
+@@ -921,7 +926,7 @@ static void text_poke_bp_batch(struct text_poke_loc *tp, unsigned int nr_entries
+ 	for (i = 0; i < nr_entries; i++)
+ 		text_poke(tp[i].addr, &int3, sizeof(int3));
+ 
+-	on_each_cpu(do_sync_core, NULL, 1);
++	text_poke_sync();
+ 
+ 	/*
+ 	 * Second step: update all but the first byte of the patched range.
+@@ -943,7 +948,7 @@ static void text_poke_bp_batch(struct text_poke_loc *tp, unsigned int nr_entries
+ 		 * not necessary and we'd be safe even without it. But
+ 		 * better safe than sorry (plus there's not only Intel).
+ 		 */
+-		on_each_cpu(do_sync_core, NULL, 1);
++		text_poke_sync();
+ 	}
+ 
+ 	/*
+@@ -959,7 +964,7 @@ static void text_poke_bp_batch(struct text_poke_loc *tp, unsigned int nr_entries
+ 	}
+ 
+ 	if (do_sync)
+-		on_each_cpu(do_sync_core, NULL, 1);
++		text_poke_sync();
+ 
+ 	/*
+ 	 * sync_core() implies an smp_mb() and orders this store against
+* Unmerged path arch/x86/kernel/kprobes/core.c
+* Unmerged path arch/x86/kernel/kprobes/opt.c
