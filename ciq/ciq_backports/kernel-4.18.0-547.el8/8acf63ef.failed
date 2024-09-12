@@ -1,0 +1,412 @@
+efi/x86: Avoid using code32_start
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Arvind Sankar <nivedita@alum.mit.edu>
+commit 8acf63efa1712fa5495425a4224378bb3e1231e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/8acf63ef.failed
+
+code32_start is meant for 16-bit real-mode bootloaders to inform the
+kernel where the 32-bit protected mode code starts. Nothing in the
+protected mode kernel except the EFI stub uses it.
+
+efi_main() currently returns boot_params, with code32_start set inside it
+to tell efi_stub_entry() where startup_32 is located. Since it was invoked
+by efi_stub_entry() in the first place, boot_params is already known.
+Return the address of startup_32 instead.
+
+This will allow a 64-bit kernel to live above 4Gb, for example, and it's
+cleaner as well.
+
+	Signed-off-by: Arvind Sankar <nivedita@alum.mit.edu>
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20200301230436.2246909-5-nivedita@alum.mit.edu
+Link: https://lore.kernel.org/r/20200308080859.21568-13-ardb@kernel.org
+(cherry picked from commit 8acf63efa1712fa5495425a4224378bb3e1231e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/eboot.c
+#	arch/x86/boot/compressed/head_32.S
+#	arch/x86/boot/compressed/head_64.S
+diff --cc arch/x86/boot/compressed/eboot.c
+index 19db743a88f9,7f3e97c2aad3..000000000000
+--- a/arch/x86/boot/compressed/eboot.c
++++ b/arch/x86/boot/compressed/eboot.c
+@@@ -842,30 -703,20 +842,37 @@@ static efi_status_t exit_boot(struct bo
+  }
+  
+  /*
+-  * On success we return a pointer to a boot_params structure, and NULL
+-  * on failure.
++  * On success, we return the address of startup_32, which has potentially been
++  * relocated by efi_relocate_kernel.
++  * On failure, we exit to the firmware via efi_exit instead of returning.
+   */
+++<<<<<<< HEAD:arch/x86/boot/compressed/eboot.c
+ +struct boot_params *
+ +efi_main(struct efi_config *c, struct boot_params *boot_params)
+++=======
++ unsigned long efi_main(efi_handle_t handle,
++ 			     efi_system_table_t *sys_table_arg,
++ 			     struct boot_params *boot_params)
+++>>>>>>> 8acf63efa171 (efi/x86: Avoid using code32_start):drivers/firmware/efi/libstub/x86-stub.c
+  {
+  	unsigned long bzimage_addr = (unsigned long)startup_32;
+ +	struct desc_ptr *gdt = NULL;
+ +	efi_loaded_image_t *image;
+  	struct setup_header *hdr = &boot_params->hdr;
+  	efi_status_t status;
+ +	struct desc_struct *desc;
+ +	void *handle;
+ +	efi_system_table_t *_table;
+ +	bool is64;
+  	unsigned long cmdline_paddr;
+  
+ -	sys_table = sys_table_arg;
+ +	efi_early = c;
+ +
+ +	_table = (efi_system_table_t *)(unsigned long)efi_early->table;
+ +	handle = (void *)(unsigned long)efi_early->image_handle;
+ +	is64 = efi_early->is64;
+ +
+ +	sys_table = _table;
+  
+  	/* Check if we were booted by the EFI firmware */
+  	if (sys_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+@@@ -894,15 -733,13 +901,14 @@@
+  					     hdr->kernel_alignment,
+  					     LOAD_PHYSICAL_ADDR);
+  		if (status != EFI_SUCCESS) {
+ -			efi_printk("efi_relocate_kernel() failed!\n");
+ +			efi_printk(sys_table, "efi_relocate_kernel() failed!\n");
+  			goto fail;
+  		}
+ +		hdr->pref_address = hdr->code32_start;
+  	}
+- 	hdr->code32_start = (u32)bzimage_addr;
+  
+  	/*
+ -	 * efi_pe_entry() may have been called before efi_main(), in which
+ +	 * make_boot_params() may have been called before efi_main(), in which
+  	 * case this is the second time we parse the cmdline. This is ok,
+  	 * parsing the cmdline multiple times does not have side-effects.
+  	 */
+@@@ -928,119 -791,17 +934,123 @@@
+  
+  	setup_efi_pci(boot_params);
+  
+ -	setup_quirks(boot_params);
+ +	setup_quirks(boot_params, bzimage_addr, hdr->init_size);
+ +
+ +	status = efi_call_early(allocate_pool, EFI_LOADER_DATA,
+ +				sizeof(*gdt), (void **)&gdt);
+ +	if (status != EFI_SUCCESS) {
+ +		efi_printk(sys_table, "Failed to allocate memory for 'gdt' structure\n");
+ +		goto fail;
+ +	}
+ +
+++<<<<<<< HEAD:arch/x86/boot/compressed/eboot.c
+ +	gdt->size = 0x800;
+ +	status = efi_low_alloc(sys_table, gdt->size, 8,
+ +			   (unsigned long *)&gdt->address);
+ +	if (status != EFI_SUCCESS) {
+ +		efi_printk(sys_table, "Failed to allocate memory for 'gdt'\n");
+ +		goto fail;
+ +	}
+  
+ -	status = exit_boot(boot_params, handle);
+ +	status = exit_boot(boot_params, handle, is64);
+  	if (status != EFI_SUCCESS) {
+ -		efi_printk("exit_boot() failed!\n");
+ +		efi_printk(sys_table, "exit_boot() failed!\n");
+  		goto fail;
+  	}
+  
+ +	memset((char *)gdt->address, 0x0, gdt->size);
+ +	desc = (struct desc_struct *)gdt->address;
+ +
+ +	/* The first GDT is a dummy. */
+ +	desc++;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		/* __KERNEL32_CS */
+ +		desc->limit0	= 0xffff;
+ +		desc->base0	= 0x0000;
+ +		desc->base1	= 0x0000;
+ +		desc->type	= SEG_TYPE_CODE | SEG_TYPE_EXEC_READ;
+ +		desc->s		= DESC_TYPE_CODE_DATA;
+ +		desc->dpl	= 0;
+ +		desc->p		= 1;
+ +		desc->limit1	= 0xf;
+ +		desc->avl	= 0;
+ +		desc->l		= 0;
+ +		desc->d		= SEG_OP_SIZE_32BIT;
+ +		desc->g		= SEG_GRANULARITY_4KB;
+ +		desc->base2	= 0x00;
+ +
+ +		desc++;
+ +	} else {
+ +		/* Second entry is unused on 32-bit */
+ +		desc++;
+ +	}
+ +
+ +	/* __KERNEL_CS */
+ +	desc->limit0	= 0xffff;
+ +	desc->base0	= 0x0000;
+ +	desc->base1	= 0x0000;
+ +	desc->type	= SEG_TYPE_CODE | SEG_TYPE_EXEC_READ;
+ +	desc->s		= DESC_TYPE_CODE_DATA;
+ +	desc->dpl	= 0;
+ +	desc->p		= 1;
+ +	desc->limit1	= 0xf;
+ +	desc->avl	= 0;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		desc->l = 1;
+ +		desc->d = 0;
+ +	} else {
+ +		desc->l = 0;
+ +		desc->d = SEG_OP_SIZE_32BIT;
+ +	}
+ +	desc->g		= SEG_GRANULARITY_4KB;
+ +	desc->base2	= 0x00;
+ +	desc++;
+ +
+ +	/* __KERNEL_DS */
+ +	desc->limit0	= 0xffff;
+ +	desc->base0	= 0x0000;
+ +	desc->base1	= 0x0000;
+ +	desc->type	= SEG_TYPE_DATA | SEG_TYPE_READ_WRITE;
+ +	desc->s		= DESC_TYPE_CODE_DATA;
+ +	desc->dpl	= 0;
+ +	desc->p		= 1;
+ +	desc->limit1	= 0xf;
+ +	desc->avl	= 0;
+ +	desc->l		= 0;
+ +	desc->d		= SEG_OP_SIZE_32BIT;
+ +	desc->g		= SEG_GRANULARITY_4KB;
+ +	desc->base2	= 0x00;
+ +	desc++;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		/* Task segment value */
+ +		desc->limit0	= 0x0000;
+ +		desc->base0	= 0x0000;
+ +		desc->base1	= 0x0000;
+ +		desc->type	= SEG_TYPE_TSS;
+ +		desc->s		= 0;
+ +		desc->dpl	= 0;
+ +		desc->p		= 1;
+ +		desc->limit1	= 0x0;
+ +		desc->avl	= 0;
+ +		desc->l		= 0;
+ +		desc->d		= 0;
+ +		desc->g		= SEG_GRANULARITY_4KB;
+ +		desc->base2	= 0x00;
+ +		desc++;
+ +	}
+ +
+ +	asm volatile("cli");
+ +	asm volatile ("lgdt %0" : : "m" (*gdt));
+ +
+ +	return boot_params;
+++=======
++ 	return bzimage_addr;
+++>>>>>>> 8acf63efa171 (efi/x86: Avoid using code32_start):drivers/firmware/efi/libstub/x86-stub.c
+  fail:
+ -	efi_printk("efi_main() failed!\n");
+ +	efi_printk(sys_table, "efi_main() failed!\n");
+  
+ -	efi_exit(handle, status);
+ +	return NULL;
+  }
+diff --cc arch/x86/boot/compressed/head_32.S
+index 0411ad3c848c,e013bdc1237b..000000000000
+--- a/arch/x86/boot/compressed/head_32.S
++++ b/arch/x86/boot/compressed/head_32.S
+@@@ -140,70 -150,18 +140,75 @@@ ENTRY(startup_32
+   */
+  	leal	.Lrelocated(%ebx), %eax
+  	jmp	*%eax
+ -SYM_FUNC_END(startup_32)
+ +ENDPROC(startup_32)
+  
+  #ifdef CONFIG_EFI_STUB
+ -SYM_FUNC_START(efi32_stub_entry)
+ -SYM_FUNC_START_ALIAS(efi_stub_entry)
+ +/*
+ + * We don't need the return address, so set up the stack so efi_main() can find
+ + * its arguments.
+ + */
+ +ENTRY(efi_pe_entry)
+  	add	$0x4, %esp
+++<<<<<<< HEAD
+ +
+ +	call	1f
+ +1:	popl	%esi
+ +	subl	$1b, %esi
+ +
+ +	popl	%ecx
+ +	movl	%ecx, efi32_config(%esi)	/* Handle */
+ +	popl	%ecx
+ +	movl	%ecx, efi32_config+8(%esi)	/* EFI System table pointer */
+ +
+ +	/* Relocate efi_config->call() */
+ +	leal	efi32_config(%esi), %eax
+ +	add	%esi, 40(%eax)
+ +	pushl	%eax
+ +
+ +	call	make_boot_params
+ +	cmpl	$0, %eax
+ +	je	fail
+ +	movl	%esi, BP_code32_start(%eax)
+ +	popl	%ecx
+ +	pushl	%eax
+ +	pushl	%ecx
+ +	jmp	2f		/* Skip efi_config initialization */
+ +ENDPROC(efi_pe_entry)
+ +
+ +ENTRY(efi32_stub_entry)
+ +	add	$0x4, %esp
+ +	popl	%ecx
+ +	popl	%edx
+ +
+ +	call	1f
+ +1:	popl	%esi
+ +	subl	$1b, %esi
+ +
+ +	movl	%ecx, efi32_config(%esi)	/* Handle */
+ +	movl	%edx, efi32_config+8(%esi)	/* EFI System table pointer */
+ +
+ +	/* Relocate efi_config->call() */
+ +	leal	efi32_config(%esi), %eax
+ +	add	%esi, 40(%eax)
+ +	pushl	%eax
+ +2:
+ +	call	efi_main
+ +	cmpl	$0, %eax
+ +	movl	%eax, %esi
+ +	jne	2f
+ +fail:
+ +	/* EFI init failed, so hang. */
+ +	hlt
+ +	jmp	fail
+ +2:
+ +	movl	BP_code32_start(%esi), %eax
+++=======
++ 	movl	8(%esp), %esi	/* save boot_params pointer */
++ 	call	efi_main
+++>>>>>>> 8acf63efa171 (efi/x86: Avoid using code32_start)
+  	leal	startup_32(%eax), %eax
+  	jmp	*%eax
+ -SYM_FUNC_END(efi32_stub_entry)
+ -SYM_FUNC_END_ALIAS(efi_stub_entry)
+ +ENDPROC(efi32_stub_entry)
+  #endif
+  
+  	.text
+diff --cc arch/x86/boot/compressed/head_64.S
+index 6cee4cfafe11,6a4ff919008c..000000000000
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@@ -457,70 -468,17 +457,80 @@@ trampoline_return
+  SYM_CODE_END(startup_64)
+  
+  #ifdef CONFIG_EFI_STUB
+++<<<<<<< HEAD
+ +
+ +/* The entry point for the PE/COFF executable is efi_pe_entry. */
+ +SYM_FUNC_START(efi_pe_entry)
+ +	movq	%rcx, efi64_config(%rip)	/* Handle */
+ +	movq	%rdx, efi64_config+8(%rip) /* EFI System table pointer */
+ +
+ +	leaq	efi64_config(%rip), %rax
+ +	movq	%rax, efi_config(%rip)
+ +
+ +	call	1f
+ +1:	popq	%rbp
+ +	subq	$1b, %rbp
+ +
+ +	/*
+ +	 * Relocate efi_config->call().
+ +	 */
+ +	addq	%rbp, efi64_config+40(%rip)
+ +
+ +	movq	%rax, %rdi
+ +	call	make_boot_params
+ +	cmpq	$0,%rax
+ +	je	fail
+ +	mov	%rax, %rsi
+ +	leaq	startup_32(%rip), %rax
+ +	movl	%eax, BP_code32_start(%rsi)
+ +	jmp	2f		/* Skip the relocation */
+ +
+ +handover_entry:
+ +	call	1f
+ +1:	popq	%rbp
+ +	subq	$1b, %rbp
+ +
+ +	/*
+ +	 * Relocate efi_config->call().
+ +	 */
+ +	movq	efi_config(%rip), %rax
+ +	addq	%rbp, 40(%rax)
+ +2:
+ +	movq	efi_config(%rip), %rdi
+ +	call	efi_main
+ +	movq	%rax,%rsi
+ +	cmpq	$0,%rax
+ +	jne	2f
+ +fail:
+ +	/* EFI init failed, so hang. */
+ +	hlt
+ +	jmp	fail
+ +2:
+ +	movl	BP_code32_start(%esi), %eax
+++=======
++ 	.org 0x390
++ SYM_FUNC_START(efi64_stub_entry)
++ SYM_FUNC_START_ALIAS(efi_stub_entry)
++ 	and	$~0xf, %rsp			/* realign the stack */
++ 	movq	%rdx, %rbx			/* save boot_params pointer */
++ 	call	efi_main
++ 	movq	%rbx,%rsi
+++>>>>>>> 8acf63efa171 (efi/x86: Avoid using code32_start)
+  	leaq	startup_64(%rax), %rax
+  	jmp	*%rax
+ +SYM_FUNC_END(efi_pe_entry)
+ +
+ +	.org 0x390
+ +SYM_FUNC_START(efi64_stub_entry)
+ +	movq	%rdi, efi64_config(%rip)	/* Handle */
+ +	movq	%rsi, efi64_config+8(%rip) /* EFI System table pointer */
+ +
+ +	leaq	efi64_config(%rip), %rax
+ +	movq	%rax, efi_config(%rip)
+ +
+ +	movq	%rdx, %rsi
+ +	jmp	handover_entry
+  SYM_FUNC_END(efi64_stub_entry)
+ -SYM_FUNC_END_ALIAS(efi_stub_entry)
+  #endif
+  
+  	.text
+* Unmerged path arch/x86/boot/compressed/eboot.c
+* Unmerged path arch/x86/boot/compressed/head_32.S
+* Unmerged path arch/x86/boot/compressed/head_64.S
+diff --git a/arch/x86/kernel/asm-offsets.c b/arch/x86/kernel/asm-offsets.c
+index 39c0a8d6cd66..a340880b8ad2 100644
+--- a/arch/x86/kernel/asm-offsets.c
++++ b/arch/x86/kernel/asm-offsets.c
+@@ -113,7 +113,6 @@ void common(void) {
+ 	OFFSET(BP_kernel_alignment, boot_params, hdr.kernel_alignment);
+ 	OFFSET(BP_init_size, boot_params, hdr.init_size);
+ 	OFFSET(BP_pref_address, boot_params, hdr.pref_address);
+-	OFFSET(BP_code32_start, boot_params, hdr.code32_start);
+ 
+ 	BLANK();
+ 	DEFINE(PTREGS_SIZE, sizeof(struct pt_regs));
