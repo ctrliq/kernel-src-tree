@@ -1,0 +1,161 @@
+KVM: x86: SVM: allow AVIC to co-exist with a nested guest running
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-499.el8
+commit-author Maxim Levitsky <mlevitsk@redhat.com>
+commit f44509f849fe55bbd81bd3f099b9aecd19002243
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-499.el8/f44509f8.failed
+
+Inhibit the AVIC of the vCPU that is running nested for the duration of the
+nested run, so that all interrupts arriving from both its vCPU siblings
+and from KVM are delivered using normal IPIs and cause that vCPU to vmexit.
+
+Note that unlike normal AVIC inhibition, there is no need to
+update the AVIC mmio memslot, because the nested guest uses its
+own set of paging tables.
+That also means that AVIC doesn't need to be inhibited VM wide.
+
+	Signed-off-by: Maxim Levitsky <mlevitsk@redhat.com>
+Message-Id: <20220322174050.241850-7-mlevitsk@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit f44509f849fe55bbd81bd3f099b9aecd19002243)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/nested.c
+diff --cc arch/x86/kvm/svm/nested.c
+index 5291a9372a90,73b545278f5f..000000000000
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
+@@@ -619,11 -620,10 +619,18 @@@ static void nested_vmcb02_prepare_contr
+  	 * exit_int_info, exit_int_info_err, next_rip, insn_len, insn_bytes.
+  	 */
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Also covers avic_vapic_bar, avic_backing_page, avic_logical_id,
+ +	 * avic_physical_id.
+ +	 */
+ +	WARN_ON(kvm_apicv_activated(svm->vcpu.kvm));
+++=======
++ 	if (svm->vgif_enabled && (svm->nested.ctl.int_ctl & V_GIF_ENABLE_MASK))
++ 		int_ctl_vmcb12_bits |= (V_GIF_MASK | V_GIF_ENABLE_MASK);
++ 	else
++ 		int_ctl_vmcb01_bits |= (V_GIF_MASK | V_GIF_ENABLE_MASK);
+++>>>>>>> f44509f849fe (KVM: x86: SVM: allow AVIC to co-exist with a nested guest running)
+  
+  	/* Copied from vmcb01.  msrpm_base can be overwritten later.  */
+  	vmcb02->control.nested_ctl = vmcb01->control.nested_ctl;
+diff --git a/arch/x86/kvm/svm/avic.c b/arch/x86/kvm/svm/avic.c
+index 68587688575a..5353e7a8b7f7 100644
+--- a/arch/x86/kvm/svm/avic.c
++++ b/arch/x86/kvm/svm/avic.c
+@@ -357,6 +357,13 @@ int avic_incomplete_ipi_interception(struct kvm_vcpu *vcpu)
+ 	return 1;
+ }
+ 
++unsigned long avic_vcpu_get_apicv_inhibit_reasons(struct kvm_vcpu *vcpu)
++{
++	if (is_guest_mode(vcpu))
++		return APICV_INHIBIT_REASON_NESTED;
++	return 0;
++}
++
+ static u32 *avic_get_logical_id_entry(struct kvm_vcpu *vcpu, u32 ldr, bool flat)
+ {
+ 	struct kvm_svm *kvm_svm = to_kvm_svm(vcpu->kvm);
+* Unmerged path arch/x86/kvm/svm/nested.c
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 86b0118040ba..cd0a6016abec 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -1461,7 +1461,7 @@ static void svm_set_vintr(struct vcpu_svm *svm)
+ 	/*
+ 	 * The following fields are ignored when AVIC is enabled
+ 	 */
+-	WARN_ON(kvm_apicv_activated(svm->vcpu.kvm));
++	WARN_ON(kvm_vcpu_apicv_activated(&svm->vcpu));
+ 
+ 	svm_set_intercept(svm, INTERCEPT_VINTR);
+ 
+@@ -2970,9 +2970,16 @@ static int interrupt_window_interception(struct kvm_vcpu *vcpu)
+ 	svm_clear_vintr(to_svm(vcpu));
+ 
+ 	/*
+-	 * For AVIC, the only reason to end up here is ExtINTs.
++	 * If not running nested, for AVIC, the only reason to end up here is ExtINTs.
+ 	 * In this case AVIC was temporarily disabled for
+ 	 * requesting the IRQ window and we have to re-enable it.
++	 *
++	 * If running nested, still remove the VM wide AVIC inhibit to
++	 * support case in which the interrupt window was requested when the
++	 * vCPU was not running nested.
++
++	 * All vCPUs which run still run nested, will remain to have their
++	 * AVIC still inhibited due to per-cpu AVIC inhibition.
+ 	 */
+ 	kvm_clear_apicv_inhibit(vcpu->kvm, APICV_INHIBIT_REASON_IRQWIN);
+ 
+@@ -3569,10 +3576,16 @@ static void svm_enable_irq_window(struct kvm_vcpu *vcpu)
+ 		/*
+ 		 * IRQ window is not needed when AVIC is enabled,
+ 		 * unless we have pending ExtINT since it cannot be injected
+-		 * via AVIC. In such case, we need to temporarily disable AVIC,
++		 * via AVIC. In such case, KVM needs to temporarily disable AVIC,
+ 		 * and fallback to injecting IRQ via V_IRQ.
++		 *
++		 * If running nested, AVIC is already locally inhibited
++		 * on this vCPU, therefore there is no need to request
++		 * the VM wide AVIC inhibition.
+ 		 */
+-		kvm_set_apicv_inhibit(vcpu->kvm, APICV_INHIBIT_REASON_IRQWIN);
++		if (!is_guest_mode(vcpu))
++			kvm_set_apicv_inhibit(vcpu->kvm, APICV_INHIBIT_REASON_IRQWIN);
++
+ 		svm_set_vintr(svm);
+ 	}
+ }
+@@ -4045,13 +4058,6 @@ static void svm_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
+ 		 */
+ 		if (guest_cpuid_has(vcpu, X86_FEATURE_X2APIC))
+ 			kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_X2APIC);
+-
+-		/*
+-		 * Currently, AVIC does not work with nested virtualization.
+-		 * So, we disable AVIC when cpuid for SVM is set in the L1 guest.
+-		 */
+-		if (nested && guest_cpuid_has(vcpu, X86_FEATURE_SVM))
+-			kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_NESTED);
+ 	}
+ 	init_vmcb_after_set_cpuid(vcpu);
+ }
+@@ -4725,6 +4731,7 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
+ 	.complete_emulated_msr = svm_complete_emulated_msr,
+ 
+ 	.vcpu_deliver_sipi_vector = svm_vcpu_deliver_sipi_vector,
++	.vcpu_get_apicv_inhibit_reasons = avic_vcpu_get_apicv_inhibit_reasons,
+ };
+ 
+ /*
+@@ -4920,6 +4927,7 @@ static __init int svm_hardware_setup(void)
+ 	} else {
+ 		svm_x86_ops.vcpu_blocking = NULL;
+ 		svm_x86_ops.vcpu_unblocking = NULL;
++		svm_x86_ops.vcpu_get_apicv_inhibit_reasons = NULL;
+ 	}
+ 
+ 	if (vls) {
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index e0f5b312125e..cfbec7764786 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -603,6 +603,7 @@ int avic_pi_update_irte(struct kvm *kvm, unsigned int host_irq,
+ void avic_vcpu_blocking(struct kvm_vcpu *vcpu);
+ void avic_vcpu_unblocking(struct kvm_vcpu *vcpu);
+ void avic_ring_doorbell(struct kvm_vcpu *vcpu);
++unsigned long avic_vcpu_get_apicv_inhibit_reasons(struct kvm_vcpu *vcpu);
+ 
+ /* sev.c */
+ 
