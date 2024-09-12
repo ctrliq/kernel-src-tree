@@ -1020,7 +1020,7 @@ struct mdio_xpcs_args *xpcs_create(struct mdio_device *mdiodev,
 
 	xpcs = kzalloc(sizeof(*xpcs), GFP_KERNEL);
 	if (!xpcs)
-		return NULL;
+		return ERR_PTR(-ENOMEM);
 
 	xpcs->mdiodev = mdiodev;
 
