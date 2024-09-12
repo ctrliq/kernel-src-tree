@@ -1,0 +1,108 @@
+igc: Do not enable taprio offload for invalid arguments
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-532.el8
+commit-author Florian Kauer <florian.kauer@linutronix.de>
+commit 82ff5f29b7377d614f0c01fd74b5d0cb225f0adc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-532.el8/82ff5f29.failed
+
+Only set adapter->taprio_offload_enable after validating the arguments.
+Otherwise, it stays set even if the offload was not enabled.
+Since the subsequent code does not get executed in case of invalid
+arguments, it will not be read at first.
+However, by activating and then deactivating another offload
+(e.g. ETF/TX launchtime offload), taprio_offload_enable is read
+and erroneously keeps the offload feature of the NIC enabled.
+
+This can be reproduced as follows:
+
+    # TAPRIO offload (flags == 0x2) and negative base-time leading to expected -ERANGE
+    sudo tc qdisc replace dev enp1s0 parent root handle 100 stab overhead 24 taprio \
+	    num_tc 1 \
+	    map 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 \
+	    queues 1@0 \
+	    base-time -1000 \
+	    sched-entry S 01 300000 \
+	    flags 0x2
+
+    # IGC_TQAVCTRL is 0x0 as expected (iomem=relaxed for reading register)
+    sudo pcimem /sys/bus/pci/devices/0000:01:00.0/resource0 0x3570 w*1
+
+    # Activate ETF offload
+    sudo tc qdisc replace dev enp1s0 parent root handle 6666 mqprio \
+	    num_tc 3 \
+	    map 2 2 1 0 2 2 2 2 2 2 2 2 2 2 2 2 \
+	    queues 1@0 1@1 2@2 \
+	    hw 0
+    sudo tc qdisc add dev enp1s0 parent 6666:1 etf \
+	    clockid CLOCK_TAI \
+	    delta 500000 \
+	    offload
+
+    # IGC_TQAVCTRL is 0x9 as expected
+    sudo pcimem /sys/bus/pci/devices/0000:01:00.0/resource0 0x3570 w*1
+
+    # Deactivate ETF offload again
+    sudo tc qdisc delete dev enp1s0 parent 6666:1
+
+    # IGC_TQAVCTRL should now be 0x0 again, but is observed as 0x9
+    sudo pcimem /sys/bus/pci/devices/0000:01:00.0/resource0 0x3570 w*1
+
+Fixes: e17090eb2494 ("igc: allow BaseTime 0 enrollment for Qbv")
+	Signed-off-by: Florian Kauer <florian.kauer@linutronix.de>
+	Reviewed-by: Kurt Kanzenbach <kurt@linutronix.de>
+	Tested-by: Naama Meir <naamax.meir@linux.intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 82ff5f29b7377d614f0c01fd74b5d0cb225f0adc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/igc/igc_main.c
+diff --cc drivers/net/ethernet/intel/igc/igc_main.c
+index 80cce6f30899,fb8e55c7c402..000000000000
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@@ -6054,7 -6097,10 +6054,8 @@@ static int igc_tsn_clear_schedule(struc
+  
+  	adapter->base_time = 0;
+  	adapter->cycle_time = NSEC_PER_SEC;
++ 	adapter->taprio_offload_enable = false;
+  	adapter->qbv_config_change_errors = 0;
+ -	adapter->qbv_transition = false;
+ -	adapter->qbv_count = 0;
+  
+  	for (i = 0; i < adapter->num_tx_queues; i++) {
+  		struct igc_ring *ring = adapter->tx_ring[i];
+@@@ -6076,11 -6124,13 +6077,18 @@@ static int igc_save_qbv_schedule(struc
+  	size_t n;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	adapter->qbv_enable = qopt->enable;
+ +
+ +	if (!qopt->enable)
+++=======
++ 	if (qopt->cmd == TAPRIO_CMD_DESTROY)
+++>>>>>>> 82ff5f29b737 (igc: Do not enable taprio offload for invalid arguments)
+  		return igc_tsn_clear_schedule(adapter);
+  
++ 	if (qopt->cmd != TAPRIO_CMD_REPLACE)
++ 		return -EOPNOTSUPP;
++ 
+  	if (qopt->base_time < 0)
+  		return -ERANGE;
+  
+@@@ -6092,7 -6142,10 +6100,8 @@@
+  
+  	adapter->cycle_time = qopt->cycle_time;
+  	adapter->base_time = qopt->base_time;
++ 	adapter->taprio_offload_enable = true;
+  
+ -	igc_ptp_read(adapter, &now);
+ -
+  	for (n = 0; n < qopt->num_entries; n++) {
+  		struct tc_taprio_sched_entry *e = &qopt->entries[n];
+  
+* Unmerged path drivers/net/ethernet/intel/igc/igc_main.c
