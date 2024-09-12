@@ -1,0 +1,411 @@
+cifs: list_for_each() -> list_for_each_entry()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Enzo Matsumiya <ematsumiya@suse.de>
+commit 9543c8ab3016cefa6abb265234a7ef0ca2b3f89f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/9543c8ab.failed
+
+Replace list_for_each() by list_for_each_entr() where appropriate.
+Remove no longer used list_head stack variables.
+
+	Signed-off-by: Enzo Matsumiya <ematsumiya@suse.de>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 9543c8ab3016cefa6abb265234a7ef0ca2b3f89f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/misc.c
+#	fs/cifs/smb2ops.c
+diff --cc fs/cifs/misc.c
+index 6786c1311d74,a825cc09a53e..000000000000
+--- a/fs/cifs/misc.c
++++ b/fs/cifs/misc.c
+@@@ -679,6 -663,161 +674,164 @@@ cifs_add_pending_open(struct cifs_fid *
+  	spin_unlock(&tlink_tcon(open->tlink)->open_file_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Critical section which runs after acquiring deferred_lock.
++  * As there is no reference count on cifs_deferred_close, pdclose
++  * should not be used outside deferred_lock.
++  */
++ bool
++ cifs_is_deferred_close(struct cifsFileInfo *cfile, struct cifs_deferred_close **pdclose)
++ {
++ 	struct cifs_deferred_close *dclose;
++ 
++ 	list_for_each_entry(dclose, &CIFS_I(d_inode(cfile->dentry))->deferred_closes, dlist) {
++ 		if ((dclose->netfid == cfile->fid.netfid) &&
++ 			(dclose->persistent_fid == cfile->fid.persistent_fid) &&
++ 			(dclose->volatile_fid == cfile->fid.volatile_fid)) {
++ 			*pdclose = dclose;
++ 			return true;
++ 		}
++ 	}
++ 	return false;
++ }
++ 
++ /*
++  * Critical section which runs after acquiring deferred_lock.
++  */
++ void
++ cifs_add_deferred_close(struct cifsFileInfo *cfile, struct cifs_deferred_close *dclose)
++ {
++ 	bool is_deferred = false;
++ 	struct cifs_deferred_close *pdclose;
++ 
++ 	is_deferred = cifs_is_deferred_close(cfile, &pdclose);
++ 	if (is_deferred) {
++ 		kfree(dclose);
++ 		return;
++ 	}
++ 
++ 	dclose->tlink = cfile->tlink;
++ 	dclose->netfid = cfile->fid.netfid;
++ 	dclose->persistent_fid = cfile->fid.persistent_fid;
++ 	dclose->volatile_fid = cfile->fid.volatile_fid;
++ 	list_add_tail(&dclose->dlist, &CIFS_I(d_inode(cfile->dentry))->deferred_closes);
++ }
++ 
++ /*
++  * Critical section which runs after acquiring deferred_lock.
++  */
++ void
++ cifs_del_deferred_close(struct cifsFileInfo *cfile)
++ {
++ 	bool is_deferred = false;
++ 	struct cifs_deferred_close *dclose;
++ 
++ 	is_deferred = cifs_is_deferred_close(cfile, &dclose);
++ 	if (!is_deferred)
++ 		return;
++ 	list_del(&dclose->dlist);
++ 	kfree(dclose);
++ }
++ 
++ void
++ cifs_close_deferred_file(struct cifsInodeInfo *cifs_inode)
++ {
++ 	struct cifsFileInfo *cfile = NULL;
++ 	struct file_list *tmp_list, *tmp_next_list;
++ 	struct list_head file_head;
++ 
++ 	if (cifs_inode == NULL)
++ 		return;
++ 
++ 	INIT_LIST_HEAD(&file_head);
++ 	spin_lock(&cifs_inode->open_file_lock);
++ 	list_for_each_entry(cfile, &cifs_inode->openFileList, flist) {
++ 		if (delayed_work_pending(&cfile->deferred)) {
++ 			if (cancel_delayed_work(&cfile->deferred)) {
++ 				tmp_list = kmalloc(sizeof(struct file_list), GFP_ATOMIC);
++ 				if (tmp_list == NULL)
++ 					break;
++ 				tmp_list->cfile = cfile;
++ 				list_add_tail(&tmp_list->list, &file_head);
++ 			}
++ 		}
++ 	}
++ 	spin_unlock(&cifs_inode->open_file_lock);
++ 
++ 	list_for_each_entry_safe(tmp_list, tmp_next_list, &file_head, list) {
++ 		_cifsFileInfo_put(tmp_list->cfile, true, false);
++ 		list_del(&tmp_list->list);
++ 		kfree(tmp_list);
++ 	}
++ }
++ 
++ void
++ cifs_close_all_deferred_files(struct cifs_tcon *tcon)
++ {
++ 	struct cifsFileInfo *cfile;
++ 	struct file_list *tmp_list, *tmp_next_list;
++ 	struct list_head file_head;
++ 
++ 	INIT_LIST_HEAD(&file_head);
++ 	spin_lock(&tcon->open_file_lock);
++ 	list_for_each_entry(cfile, &tcon->openFileList, tlist) {
++ 		if (delayed_work_pending(&cfile->deferred)) {
++ 			if (cancel_delayed_work(&cfile->deferred)) {
++ 				tmp_list = kmalloc(sizeof(struct file_list), GFP_ATOMIC);
++ 				if (tmp_list == NULL)
++ 					break;
++ 				tmp_list->cfile = cfile;
++ 				list_add_tail(&tmp_list->list, &file_head);
++ 			}
++ 		}
++ 	}
++ 	spin_unlock(&tcon->open_file_lock);
++ 
++ 	list_for_each_entry_safe(tmp_list, tmp_next_list, &file_head, list) {
++ 		_cifsFileInfo_put(tmp_list->cfile, true, false);
++ 		list_del(&tmp_list->list);
++ 		kfree(tmp_list);
++ 	}
++ }
++ void
++ cifs_close_deferred_file_under_dentry(struct cifs_tcon *tcon, const char *path)
++ {
++ 	struct cifsFileInfo *cfile;
++ 	struct file_list *tmp_list, *tmp_next_list;
++ 	struct list_head file_head;
++ 	void *page;
++ 	const char *full_path;
++ 
++ 	INIT_LIST_HEAD(&file_head);
++ 	page = alloc_dentry_path();
++ 	spin_lock(&tcon->open_file_lock);
++ 	list_for_each_entry(cfile, &tcon->openFileList, tlist) {
++ 		full_path = build_path_from_dentry(cfile->dentry, page);
++ 		if (strstr(full_path, path)) {
++ 			if (delayed_work_pending(&cfile->deferred)) {
++ 				if (cancel_delayed_work(&cfile->deferred)) {
++ 					tmp_list = kmalloc(sizeof(struct file_list), GFP_ATOMIC);
++ 					if (tmp_list == NULL)
++ 						break;
++ 					tmp_list->cfile = cfile;
++ 					list_add_tail(&tmp_list->list, &file_head);
++ 				}
++ 			}
++ 		}
++ 	}
++ 	spin_unlock(&tcon->open_file_lock);
++ 
++ 	list_for_each_entry_safe(tmp_list, tmp_next_list, &file_head, list) {
++ 		_cifsFileInfo_put(tmp_list->cfile, true, false);
++ 		list_del(&tmp_list->list);
++ 		kfree(tmp_list);
++ 	}
++ 	free_dentry_path(page);
++ }
++ 
+++>>>>>>> 9543c8ab3016 (cifs: list_for_each() -> list_for_each_entry())
+  /* parses DFS refferal V3 structure
+   * caller is responsible for freeing target_nodes
+   * returns:
+diff --cc fs/cifs/smb2ops.c
+index 2fb9ed3f434e,5bed8b584086..000000000000
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@@ -2462,8 -2574,7 +2462,12 @@@ smb2_is_status_io_timeout(char *buf
+  static void
+  smb2_is_network_name_deleted(char *buf, struct TCP_Server_Info *server)
+  {
+++<<<<<<< HEAD
+ +	struct smb2_sync_hdr *shdr = (struct smb2_sync_hdr *)buf;
+ +	struct list_head *tmp, *tmp1;
+++=======
++ 	struct smb2_hdr *shdr = (struct smb2_hdr *)buf;
+++>>>>>>> 9543c8ab3016 (cifs: list_for_each() -> list_for_each_entry())
+  	struct cifs_ses *ses;
+  	struct cifs_tcon *tcon;
+  
+@@@ -2471,11 -2582,9 +2475,17 @@@
+  		return;
+  
+  	spin_lock(&cifs_tcp_ses_lock);
+++<<<<<<< HEAD
+ +	list_for_each(tmp, &server->smb_ses_list) {
+ +		ses = list_entry(tmp, struct cifs_ses, smb_ses_list);
+ +		list_for_each(tmp1, &ses->tcon_list) {
+ +			tcon = list_entry(tmp1, struct cifs_tcon, tcon_list);
+ +			if (tcon->tid == shdr->TreeId) {
+++=======
++ 	list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
++ 		list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
++ 			if (tcon->tid == le32_to_cpu(shdr->Id.SyncId.TreeId)) {
+++>>>>>>> 9543c8ab3016 (cifs: list_for_each() -> list_for_each_entry())
+  				tcon->need_reconnect = true;
+  				spin_unlock(&cifs_tcp_ses_lock);
+  				pr_warn_once("Server share %s deleted.\n",
+diff --git a/fs/cifs/cifs_debug.c b/fs/cifs/cifs_debug.c
+index c18333741daf..77734a427a22 100644
+--- a/fs/cifs/cifs_debug.c
++++ b/fs/cifs/cifs_debug.c
+@@ -179,7 +179,6 @@ cifs_dump_iface(struct seq_file *m, struct cifs_server_iface *iface)
+ 
+ static int cifs_debug_files_proc_show(struct seq_file *m, void *v)
+ {
+-	struct list_head *tmp, *tmp1, *tmp2;
+ 	struct TCP_Server_Info *server;
+ 	struct cifs_ses *ses;
+ 	struct cifs_tcon *tcon;
+@@ -195,14 +194,10 @@ static int cifs_debug_files_proc_show(struct seq_file *m, void *v)
+ #endif /* CIFS_DEBUG2 */
+ 	spin_lock(&cifs_tcp_ses_lock);
+ 	list_for_each_entry(server, &cifs_tcp_ses_list, tcp_ses_list) {
+-		list_for_each(tmp, &server->smb_ses_list) {
+-			ses = list_entry(tmp, struct cifs_ses, smb_ses_list);
+-			list_for_each(tmp1, &ses->tcon_list) {
+-				tcon = list_entry(tmp1, struct cifs_tcon, tcon_list);
++		list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
++			list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
+ 				spin_lock(&tcon->open_file_lock);
+-				list_for_each(tmp2, &tcon->openFileList) {
+-					cfile = list_entry(tmp2, struct cifsFileInfo,
+-						     tlist);
++				list_for_each_entry(cfile, &tcon->openFileList, tlist) {
+ 					seq_printf(m,
+ 						"0x%x 0x%llx 0x%x %d %d %d %s",
+ 						tcon->tid,
+@@ -229,7 +224,6 @@ static int cifs_debug_files_proc_show(struct seq_file *m, void *v)
+ 
+ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
+ {
+-	struct list_head *tmp2, *tmp3;
+ 	struct mid_q_entry *mid_entry;
+ 	struct TCP_Server_Info *server;
+ 	struct cifs_ses *ses;
+@@ -393,9 +387,7 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
+ 
+ 		seq_printf(m, "\n\n\tSessions: ");
+ 		i = 0;
+-		list_for_each(tmp2, &server->smb_ses_list) {
+-			ses = list_entry(tmp2, struct cifs_ses,
+-					 smb_ses_list);
++		list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
+ 			i++;
+ 			if ((ses->serverDomain == NULL) ||
+ 				(ses->serverOS == NULL) ||
+@@ -449,9 +441,7 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
+ 			else
+ 				seq_puts(m, "none\n");
+ 
+-			list_for_each(tmp3, &ses->tcon_list) {
+-				tcon = list_entry(tmp3, struct cifs_tcon,
+-						  tcon_list);
++			list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
+ 				++j;
+ 				seq_printf(m, "\n\t%d) ", j);
+ 				cifs_debug_tcon(m, tcon);
+@@ -477,9 +467,7 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
+ 
+ 		seq_puts(m, "\n\n\tMIDs: ");
+ 		spin_lock(&GlobalMid_Lock);
+-		list_for_each(tmp3, &server->pending_mid_q) {
+-			mid_entry = list_entry(tmp3, struct mid_q_entry,
+-					qhead);
++		list_for_each_entry(mid_entry, &server->pending_mid_q, qhead) {
+ 			seq_printf(m, "\n\tState: %d com: %d pid:"
+ 					" %d cbdata: %p mid %llu\n",
+ 					mid_entry->mid_state,
+@@ -507,7 +495,6 @@ static ssize_t cifs_stats_proc_write(struct file *file,
+ {
+ 	bool bv;
+ 	int rc;
+-	struct list_head *tmp1, *tmp2, *tmp3;
+ 	struct TCP_Server_Info *server;
+ 	struct cifs_ses *ses;
+ 	struct cifs_tcon *tcon;
+@@ -528,9 +515,7 @@ static ssize_t cifs_stats_proc_write(struct file *file,
+ 		GlobalCurrentXid = 0;
+ 		spin_unlock(&GlobalMid_Lock);
+ 		spin_lock(&cifs_tcp_ses_lock);
+-		list_for_each(tmp1, &cifs_tcp_ses_list) {
+-			server = list_entry(tmp1, struct TCP_Server_Info,
+-					    tcp_ses_list);
++		list_for_each_entry(server, &cifs_tcp_ses_list, tcp_ses_list) {
+ 			server->max_in_flight = 0;
+ #ifdef CONFIG_CIFS_STATS2
+ 			for (i = 0; i < NUMBER_OF_SMB2_COMMANDS; i++) {
+@@ -541,13 +526,8 @@ static ssize_t cifs_stats_proc_write(struct file *file,
+ 				server->fastest_cmd[0] = 0;
+ 			}
+ #endif /* CONFIG_CIFS_STATS2 */
+-			list_for_each(tmp2, &server->smb_ses_list) {
+-				ses = list_entry(tmp2, struct cifs_ses,
+-						 smb_ses_list);
+-				list_for_each(tmp3, &ses->tcon_list) {
+-					tcon = list_entry(tmp3,
+-							  struct cifs_tcon,
+-							  tcon_list);
++			list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
++				list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
+ 					atomic_set(&tcon->num_smbs_sent, 0);
+ 					spin_lock(&tcon->stat_lock);
+ 					tcon->bytes_read = 0;
+@@ -572,7 +552,6 @@ static int cifs_stats_proc_show(struct seq_file *m, void *v)
+ #ifdef CONFIG_CIFS_STATS2
+ 	int j;
+ #endif /* STATS2 */
+-	struct list_head *tmp2, *tmp3;
+ 	struct TCP_Server_Info *server;
+ 	struct cifs_ses *ses;
+ 	struct cifs_tcon *tcon;
+@@ -622,13 +601,8 @@ static int cifs_stats_proc_show(struct seq_file *m, void *v)
+ 					atomic_read(&server->smb2slowcmd[j]),
+ 					server->hostname, j);
+ #endif /* STATS2 */
+-		list_for_each(tmp2, &server->smb_ses_list) {
+-			ses = list_entry(tmp2, struct cifs_ses,
+-					 smb_ses_list);
+-			list_for_each(tmp3, &ses->tcon_list) {
+-				tcon = list_entry(tmp3,
+-						  struct cifs_tcon,
+-						  tcon_list);
++		list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
++			list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
+ 				i++;
+ 				seq_printf(m, "\n%d) %s", i, tcon->treeName);
+ 				if (tcon->need_reconnect)
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index 6e27e4672066..c6c59beba1e6 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -2073,13 +2073,10 @@ static int match_tcon(struct cifs_tcon *tcon, struct smb3_fs_context *ctx)
+ static struct cifs_tcon *
+ cifs_find_tcon(struct cifs_ses *ses, struct smb3_fs_context *ctx)
+ {
+-	struct list_head *tmp;
+ 	struct cifs_tcon *tcon;
+ 
+ 	spin_lock(&cifs_tcp_ses_lock);
+-	list_for_each(tmp, &ses->tcon_list) {
+-		tcon = list_entry(tmp, struct cifs_tcon, tcon_list);
+-
++	list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
+ 		if (!match_tcon(tcon, ctx))
+ 			continue;
+ 		++tcon->tc_count;
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+index ba956a12e31e..31fd8f4b47f7 100644
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -850,9 +850,7 @@ int cifs_close(struct inode *inode, struct file *file)
+ void
+ cifs_reopen_persistent_handles(struct cifs_tcon *tcon)
+ {
+-	struct cifsFileInfo *open_file;
+-	struct list_head *tmp;
+-	struct list_head *tmp1;
++	struct cifsFileInfo *open_file, *tmp;
+ 	struct list_head tmp_list;
+ 
+ 	if (!tcon->use_persistent || !tcon->need_reopen_files)
+@@ -865,8 +863,7 @@ cifs_reopen_persistent_handles(struct cifs_tcon *tcon)
+ 
+ 	/* list all files open on tree connection, reopen resilient handles  */
+ 	spin_lock(&tcon->open_file_lock);
+-	list_for_each(tmp, &tcon->openFileList) {
+-		open_file = list_entry(tmp, struct cifsFileInfo, tlist);
++	list_for_each_entry(open_file, &tcon->openFileList, tlist) {
+ 		if (!open_file->invalidHandle)
+ 			continue;
+ 		cifsFileInfo_get(open_file);
+@@ -874,8 +871,7 @@ cifs_reopen_persistent_handles(struct cifs_tcon *tcon)
+ 	}
+ 	spin_unlock(&tcon->open_file_lock);
+ 
+-	list_for_each_safe(tmp, tmp1, &tmp_list) {
+-		open_file = list_entry(tmp, struct cifsFileInfo, rlist);
++	list_for_each_entry_safe(open_file, tmp, &tmp_list, rlist) {
+ 		if (cifs_reopen_file(open_file, false /* do not flush */))
+ 			tcon->need_reopen_files = true;
+ 		list_del_init(&open_file->rlist);
+* Unmerged path fs/cifs/misc.c
+* Unmerged path fs/cifs/smb2ops.c
