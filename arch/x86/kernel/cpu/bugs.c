@@ -1074,13 +1074,14 @@ static inline bool spectre_v2_in_eibrs_mode(enum spectre_v2_mitigation mode)
 {
 	return mode == SPECTRE_V2_EIBRS ||
 	       mode == SPECTRE_V2_EIBRS_RETPOLINE ||
-	       mode == SPECTRE_V2_EIBRS_LFENCE ||
-	       mode == SPECTRE_V2_IBRS_ALWAYS;
+	       mode == SPECTRE_V2_EIBRS_LFENCE;
 }
 
 static inline bool spectre_v2_in_ibrs_mode(enum spectre_v2_mitigation mode)
 {
-	return spectre_v2_in_eibrs_mode(mode) || mode == SPECTRE_V2_IBRS;
+	return spectre_v2_in_eibrs_mode(mode) ||
+	       mode == SPECTRE_V2_IBRS ||
+	       mode == SPECTRE_V2_IBRS_ALWAYS;
 }
 
 static void __init

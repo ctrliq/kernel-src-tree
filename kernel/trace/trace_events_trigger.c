@@ -1169,10 +1169,14 @@ stacktrace_trigger(struct event_trigger_data *data, void *rec,
 		   struct ring_buffer_event *event)
 {
 	struct trace_event_file *file = data->private_data;
+	unsigned long flags;
+	int pc;
 
-	if (file)
-		__trace_stack(file->tr, tracing_gen_ctx(), STACK_SKIP);
-	else
+	if (file) {
+		local_save_flags(flags);
+		pc = preempt_count();
+		__trace_stack(file->tr, flags, STACK_SKIP, pc);
+	} else
 		trace_dump_stack(STACK_SKIP);
 }
 
