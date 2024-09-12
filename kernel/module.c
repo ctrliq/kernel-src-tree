@@ -3000,6 +3000,11 @@ static struct module *setup_load_info(struct load_info *info, int flags)
 	info->secstrings = (void *)info->hdr
 		+ info->sechdrs[info->hdr->e_shstrndx].sh_offset;
 
+#ifdef CONFIG_RHEL_DIFFERENCES
+	if (get_modinfo(info, "intree"))
+		module_rh_check_status(info->name);
+#endif
+
 	err = rewrite_section_headers(info, flags);
 	if (err)
 		return ERR_PTR(err);

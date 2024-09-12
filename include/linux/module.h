@@ -855,4 +855,8 @@ static inline bool module_sig_ok(struct module *module)
 }
 #endif	/* CONFIG_MODULE_SIG */
 
+#ifdef CONFIG_RHEL_DIFFERENCES
+void module_rh_check_status(const char *module_name);
+#endif
+
 #endif /* _LINUX_MODULE_H */
