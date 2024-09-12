@@ -1,0 +1,149 @@
+driver core: bus: move bus notifier logic into bus.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-504.el8
+commit-author Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+commit ed9f918174cb35ba51d2fc86a613305dd8bc4cfe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-504.el8/ed9f9181.failed
+
+The logic to touch the bus notifier was open-coded in numberous places
+in the driver core.  Clean that up by creating a local bus_notify()
+function and have everyone call this function instead, making the
+reading of the caller code simpler and easier to maintain over time.
+
+	Reviewed-by: Rafael J. Wysocki <rafael@kernel.org>
+Link: https://lore.kernel.org/r/20230111092331.3946745-2-gregkh@linuxfoundation.org
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit ed9f918174cb35ba51d2fc86a613305dd8bc4cfe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/core.c
+diff --cc drivers/base/core.c
+index f7571ac84ec6,110dbd4fb570..000000000000
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@@ -3550,9 -3633,8 +3547,14 @@@ void device_del(struct device *dev
+  	/* Notify clients of device removal.  This call must come
+  	 * before dpm_sysfs_remove().
+  	 */
+++<<<<<<< HEAD
+ +	if (dev->bus)
+ +		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
+ +					     BUS_NOTIFY_DEL_DEVICE, dev);
+++=======
++ 	noio_flag = memalloc_noio_save();
++ 	bus_notify(dev, BUS_NOTIFY_DEL_DEVICE);
+++>>>>>>> ed9f918174cb (driver core: bus: move bus notifier logic into bus.c)
+  
+  	dpm_sysfs_remove(dev);
+  	if (parent)
+diff --git a/drivers/base/base.h b/drivers/base/base.h
+index 68753d592f4c..82402d3d61ba 100644
+--- a/drivers/base/base.h
++++ b/drivers/base/base.h
+@@ -118,6 +118,7 @@ struct kobject *virtual_device_parent(struct device *dev);
+ extern int bus_add_device(struct device *dev);
+ extern void bus_probe_device(struct device *dev);
+ extern void bus_remove_device(struct device *dev);
++void bus_notify(struct device *dev, enum bus_notifier_event value);
+ 
+ extern int bus_add_driver(struct device_driver *drv);
+ extern void bus_remove_driver(struct device_driver *drv);
+diff --git a/drivers/base/bus.c b/drivers/base/bus.c
+index d73eb139ffde..5bf816aea33f 100644
+--- a/drivers/base/bus.c
++++ b/drivers/base/bus.c
+@@ -890,6 +890,14 @@ int bus_unregister_notifier(struct bus_type *bus, struct notifier_block *nb)
+ }
+ EXPORT_SYMBOL_GPL(bus_unregister_notifier);
+ 
++void bus_notify(struct device *dev, enum bus_notifier_event value)
++{
++	struct bus_type *bus = dev->bus;
++
++	if (bus)
++		blocking_notifier_call_chain(&bus->p->bus_notifier, value, dev);
++}
++
+ struct kset *bus_get_kset(struct bus_type *bus)
+ {
+ 	return &bus->p->subsys;
+* Unmerged path drivers/base/core.c
+diff --git a/drivers/base/dd.c b/drivers/base/dd.c
+index 887b1b397ce9..b34c3d70c52a 100644
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -444,10 +444,7 @@ static void driver_bound(struct device *dev)
+ 	driver_deferred_probe_del(dev);
+ 	driver_deferred_probe_trigger();
+ 
+-	if (dev->bus)
+-		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
+-					     BUS_NOTIFY_BOUND_DRIVER, dev);
+-
++	bus_notify(dev, BUS_NOTIFY_BOUND_DRIVER);
+ 	kobject_uevent(&dev->kobj, KOBJ_BIND);
+ }
+ 
+@@ -466,9 +463,7 @@ static int driver_sysfs_add(struct device *dev)
+ {
+ 	int ret;
+ 
+-	if (dev->bus)
+-		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
+-					     BUS_NOTIFY_BIND_DRIVER, dev);
++	bus_notify(dev, BUS_NOTIFY_BIND_DRIVER);
+ 
+ 	ret = sysfs_create_link(&dev->driver->p->kobj, &dev->kobj,
+ 				kobject_name(&dev->kobj));
+@@ -534,9 +529,8 @@ int device_bind_driver(struct device *dev)
+ 		device_links_force_bind(dev);
+ 		driver_bound(dev);
+ 	}
+-	else if (dev->bus)
+-		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
+-					     BUS_NOTIFY_DRIVER_NOT_BOUND, dev);
++	else
++		bus_notify(dev, BUS_NOTIFY_DRIVER_NOT_BOUND);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(device_bind_driver);
+@@ -714,9 +708,7 @@ static int really_probe(struct device *dev, struct device_driver *drv)
+ probe_failed:
+ 	driver_sysfs_remove(dev);
+ sysfs_failed:
+-	if (dev->bus)
+-		blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
+-					     BUS_NOTIFY_DRIVER_NOT_BOUND, dev);
++	bus_notify(dev, BUS_NOTIFY_DRIVER_NOT_BOUND);
+ 	if (dev->bus && dev->bus->dma_cleanup)
+ 		dev->bus->dma_cleanup(dev);
+ pinctrl_bind_failed:
+@@ -1210,10 +1202,7 @@ static void __device_release_driver(struct device *dev, struct device *parent)
+ 
+ 		driver_sysfs_remove(dev);
+ 
+-		if (dev->bus)
+-			blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
+-						     BUS_NOTIFY_UNBIND_DRIVER,
+-						     dev);
++		bus_notify(dev, BUS_NOTIFY_UNBIND_DRIVER);
+ 
+ 		pm_runtime_put_sync(dev);
+ 
+@@ -1227,11 +1216,8 @@ static void __device_release_driver(struct device *dev, struct device *parent)
+ 
+ 		klist_remove(&dev->p->knode_driver);
+ 		device_pm_check_callbacks(dev);
+-		if (dev->bus)
+-			blocking_notifier_call_chain(&dev->bus->p->bus_notifier,
+-						     BUS_NOTIFY_UNBOUND_DRIVER,
+-						     dev);
+ 
++		bus_notify(dev, BUS_NOTIFY_UNBOUND_DRIVER);
+ 		kobject_uevent(&dev->kobj, KOBJ_UNBIND);
+ 	}
+ }
