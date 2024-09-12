@@ -2440,6 +2440,7 @@ static void dm_wq_work(struct work_struct *work)
 			break;
 
 		generic_make_request(bio);
+		cond_resched();
 	}
 }
 
@@ -2847,23 +2848,25 @@ EXPORT_SYMBOL_GPL(dm_internal_resume_fast);
  * Event notification.
  *---------------------------------------------------------------*/
 int dm_kobject_uevent(struct mapped_device *md, enum kobject_action action,
-		       unsigned cookie)
+		      unsigned cookie, bool need_resize_uevent)
 {
 	int r;
 	unsigned noio_flag;
 	char udev_cookie[DM_COOKIE_LENGTH];
-	char *envp[] = { udev_cookie, NULL };
+	char *envp[3] = { NULL, NULL, NULL };
+	char **envpp = envp;
+	if (cookie) {
+		snprintf(udev_cookie, DM_COOKIE_LENGTH, "%s=%u",
+			 DM_COOKIE_ENV_VAR_NAME, cookie);
+		*envpp++ = udev_cookie;
+	}
+	if (need_resize_uevent) {
+		*envpp++ = "RESIZE=1";
+	}
 
 	noio_flag = memalloc_noio_save();
 
-	if (!cookie)
-		r = kobject_uevent(&disk_to_dev(md->disk)->kobj, action);
-	else {
-		snprintf(udev_cookie, DM_COOKIE_LENGTH, "%s=%u",
-			 DM_COOKIE_ENV_VAR_NAME, cookie);
-		r = kobject_uevent_env(&disk_to_dev(md->disk)->kobj,
-				       action, envp);
-	}
+	r = kobject_uevent_env(&disk_to_dev(md->disk)->kobj, action, envp);
 
 	memalloc_noio_restore(noio_flag);
 

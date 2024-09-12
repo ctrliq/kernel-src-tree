@@ -303,7 +303,7 @@ static void corrupt_bio_data(struct bio *bio, struct flakey_c *fc)
 			struct page *page = bio_iter_page(bio, iter);
 			if (unlikely(page == ZERO_PAGE(0)))
 				break;
-			segment = bvec_kmap_local(&bvec);
+			segment = kmap_local_page(bvec.bv_page) + bvec.bv_offset;
 			segment[corrupt_bio_byte] = fc->corrupt_bio_value;
 			kunmap_local(segment);
 			DMDEBUG("Corrupting data bio=%p by writing %u to byte %u "

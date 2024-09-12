@@ -697,6 +697,7 @@ static inline void nvme_init_request(struct request *req,
 	if (req->mq_hctx->type == HCTX_TYPE_POLL)
 		req->cmd_flags |= REQ_HIPRI;
 	nvme_clear_nvme_request(req);
+	req->rq_flags |= RQF_QUIET;
 	memcpy(nvme_req(req)->cmd, cmd, sizeof(*cmd));
 }
 
@@ -1153,7 +1154,6 @@ int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
 			goto out;
 	}
 
-	req->rq_flags |= RQF_QUIET;
 	ret = nvme_execute_rq(NULL, req, at_head);
 	if (result && ret >= 0)
 		*result = nvme_req(req)->result;
