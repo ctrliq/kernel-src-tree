@@ -1,0 +1,208 @@
+wifi: mac80211: use only channel width in ieee80211_parse_bitrates()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 3dc05935ead81ffafa6d937552cfae1f1463b4a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/3dc05935.failed
+
+For MLO, we may not have a full chandef here later, so change
+the API to pass only the width.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 3dc05935ead81ffafa6d937552cfae1f1463b4a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/cfg.c
+diff --cc net/mac80211/cfg.c
+index f176465a1e43,a9f8042be36d..000000000000
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@@ -1548,36 -1596,83 +1548,91 @@@ static void sta_apply_mesh_params(struc
+  #endif
+  }
+  
+ -static int sta_link_apply_parameters(struct ieee80211_local *local,
+ +static void sta_apply_airtime_params(struct ieee80211_local *local,
+  				     struct sta_info *sta,
+ -				     struct link_station_parameters *params)
+ +				     struct station_parameters *params)
+  {
+ -	int ret = 0;
+ -	struct ieee80211_supported_band *sband;
+ -	struct ieee80211_sub_if_data *sdata = sta->sdata;
+ -	u32 link_id = params->link_id < 0 ? 0 : params->link_id;
+ -	struct ieee80211_link_data *link =
+ -		sdata_dereference(sdata->link[link_id], sdata);
+ -	struct link_sta_info *link_sta =
+ -		rcu_dereference_protected(sta->link[link_id],
+ -					  lockdep_is_held(&local->sta_mtx));
+ -
+ -	if (!link || !link_sta)
+ -		return -EINVAL;
+ +	u8 ac;
+  
+ -	sband = ieee80211_get_link_sband(link);
+ -	if (!sband)
+ -		return -EINVAL;
+ +	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+ +		struct airtime_sched_info *air_sched = &local->airtime[ac];
+ +		struct airtime_info *air_info = &sta->airtime[ac];
+ +		struct txq_info *txqi;
+ +		u8 tid;
+ +
+ +		spin_lock_bh(&air_sched->lock);
+ +		for (tid = 0; tid < IEEE80211_NUM_TIDS + 1; tid++) {
+ +			if (air_info->weight == params->airtime_weight ||
+ +			    !sta->sta.txq[tid] ||
+ +			    ac != ieee80211_ac_from_tid(tid))
+ +				continue;
+ +
+ +			airtime_weight_set(air_info, params->airtime_weight);
+  
+ -	if (params->link_mac) {
+ -		memcpy(link_sta->addr, params->link_mac, ETH_ALEN);
+ -		memcpy(link_sta->pub->addr, params->link_mac, ETH_ALEN);
+ +			txqi = to_txq_info(sta->sta.txq[tid]);
+ +			if (RB_EMPTY_NODE(&txqi->schedule_order))
+ +				continue;
+ +
+ +			ieee80211_update_airtime_weight(local, air_sched,
+ +							0, true);
+ +		}
+ +		spin_unlock_bh(&air_sched->lock);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (params->txpwr_set) {
++ 		link_sta->pub->txpwr.type = params->txpwr.type;
++ 		if (params->txpwr.type == NL80211_TX_POWER_LIMITED)
++ 			link_sta->pub->txpwr.power = params->txpwr.power;
++ 		ret = drv_sta_set_txpwr(local, sdata, sta);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	if (params->supported_rates &&
++ 	    params->supported_rates_len) {
++ 		ieee80211_parse_bitrates(link->conf->chandef.width,
++ 					 sband, params->supported_rates,
++ 					 params->supported_rates_len,
++ 					 &link_sta->pub->supp_rates[sband->band]);
++ 	}
++ 
++ 	if (params->ht_capa)
++ 		ieee80211_ht_cap_ie_to_sta_ht_cap(sdata, sband,
++ 						  params->ht_capa, link_sta);
++ 
++ 	/* VHT can override some HT caps such as the A-MSDU max length */
++ 	if (params->vht_capa)
++ 		ieee80211_vht_cap_ie_to_sta_vht_cap(sdata, sband,
++ 						    params->vht_capa, link_sta);
++ 
++ 	if (params->he_capa)
++ 		ieee80211_he_cap_ie_to_sta_he_cap(sdata, sband,
++ 						  (void *)params->he_capa,
++ 						  params->he_capa_len,
++ 						  (void *)params->he_6ghz_capa,
++ 						  link_sta);
++ 
++ 	if (params->eht_capa)
++ 		ieee80211_eht_cap_ie_to_sta_eht_cap(sdata, sband,
++ 						    (u8 *)params->he_capa,
++ 						    params->he_capa_len,
++ 						    params->eht_capa,
++ 						    params->eht_capa_len,
++ 						    link_sta);
++ 
++ 	if (params->opmode_notif_used) {
++ 		/* returned value is only needed for rc update, but the
++ 		 * rc isn't initialized here yet, so ignore it
++ 		 */
++ 		__ieee80211_vht_handle_opmode(sdata, link_sta,
++ 					      params->opmode_notif,
++ 					      sband->band);
++ 	}
++ 
++ 	return ret;
+++>>>>>>> 3dc05935ead8 (wifi: mac80211: use only channel width in ieee80211_parse_bitrates())
+  }
+  
+  static int sta_apply_parameters(struct ieee80211_local *local,
+* Unmerged path net/mac80211/cfg.c
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 18ae34ce6077..933dab412433 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1059,9 +1059,9 @@ sdata_assert_lock(struct ieee80211_sub_if_data *sdata)
+ }
+ 
+ static inline int
+-ieee80211_chandef_get_shift(struct cfg80211_chan_def *chandef)
++ieee80211_chanwidth_get_shift(enum nl80211_chan_width width)
+ {
+-	switch (chandef->width) {
++	switch (width) {
+ 	case NL80211_CHAN_WIDTH_5:
+ 		return 2;
+ 	case NL80211_CHAN_WIDTH_10:
+@@ -1071,6 +1071,12 @@ ieee80211_chandef_get_shift(struct cfg80211_chan_def *chandef)
+ 	}
+ }
+ 
++static inline int
++ieee80211_chandef_get_shift(struct cfg80211_chan_def *chandef)
++{
++	return ieee80211_chanwidth_get_shift(chandef->width);
++}
++
+ static inline int
+ ieee80211_vif_get_shift(struct ieee80211_vif *vif)
+ {
+@@ -2452,7 +2458,7 @@ u8 *ieee80211_ie_build_he_cap(u32 disable_flags, u8 *pos,
+ void ieee80211_ie_build_he_6ghz_cap(struct ieee80211_sub_if_data *sdata,
+ 				    struct sk_buff *skb);
+ u8 *ieee80211_ie_build_he_oper(u8 *pos, struct cfg80211_chan_def *chandef);
+-int ieee80211_parse_bitrates(struct cfg80211_chan_def *chandef,
++int ieee80211_parse_bitrates(enum nl80211_chan_width width,
+ 			     const struct ieee80211_supported_band *sband,
+ 			     const u8 *srates, int srates_len, u32 *rates);
+ int ieee80211_add_srates_ie(struct ieee80211_sub_if_data *sdata,
+diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
+index 38beaaa3d3f9..449e84fae617 100644
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@ -815,7 +815,8 @@ static int ieee80211_send_assoc(struct ieee80211_sub_if_data *sdata)
+ 		 * in the association request (e.g. D-Link DAP 1353 in
+ 		 * b-only mode)...
+ 		 */
+-		rates_len = ieee80211_parse_bitrates(&chanctx_conf->def, sband,
++		rates_len = ieee80211_parse_bitrates(chanctx_conf->def.width,
++						     sband,
+ 						     assoc_data->supp_rates,
+ 						     assoc_data->supp_rates_len,
+ 						     &rates);
+diff --git a/net/mac80211/util.c b/net/mac80211/util.c
+index 44fc8fca1c96..93c200f328fc 100644
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -3673,12 +3673,12 @@ bool ieee80211_chandef_s1g_oper(const struct ieee80211_s1g_oper_ie *oper,
+ 	return true;
+ }
+ 
+-int ieee80211_parse_bitrates(struct cfg80211_chan_def *chandef,
++int ieee80211_parse_bitrates(enum nl80211_chan_width width,
+ 			     const struct ieee80211_supported_band *sband,
+ 			     const u8 *srates, int srates_len, u32 *rates)
+ {
+-	u32 rate_flags = ieee80211_chandef_rate_flags(chandef);
+-	int shift = ieee80211_chandef_get_shift(chandef);
++	u32 rate_flags = ieee80211_chanwidth_rate_flags(width);
++	int shift = ieee80211_chanwidth_get_shift(width);
+ 	struct ieee80211_rate *br;
+ 	int brate, rate, i, j, count = 0;
+ 
