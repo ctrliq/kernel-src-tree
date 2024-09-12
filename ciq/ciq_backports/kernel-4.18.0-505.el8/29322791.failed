@@ -1,0 +1,329 @@
+ice: xsk: change batched Tx descriptor cleaning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-505.el8
+commit-author Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+commit 29322791bc8b4f42fc65734840826e3ddc30921e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-505.el8/29322791.failed
+
+AF_XDP Tx descriptor cleaning in ice driver currently works in a "lazy"
+way - descriptors are not cleaned immediately after send. We rather hold
+on with cleaning until we see that free space in ring drops below
+particular threshold. This was supposed to reduce the amount of
+unnecessary work related to cleaning and instead of keeping the ring
+empty, ring was rather saturated.
+
+In AF_XDP realm cleaning Tx descriptors implies producing them to CQ.
+This is a way of letting know user space that particular descriptor has
+been sent, as John points out in [0].
+
+We tried to implement serial descriptor cleaning which would be used in
+conjunction with batched cleaning but it made code base more convoluted
+and probably harder to maintain in future. Therefore we step away from
+batched cleaning in a current form in favor of an approach where we set
+RS bit on every last descriptor from a batch and clean always at the
+beginning of ice_xmit_zc().
+
+This means that we give up a bit of Tx performance, but this doesn't
+hurt l2fwd scenario which is way more meaningful than txonly as this can
+be treaten as AF_XDP based packet generator. l2fwd is not hurt due to
+the fact that Tx side is much faster than Rx and Rx is the one that has
+to catch Tx up.
+
+FWIW Tx descriptors are still produced in a batched way.
+
+[0]: https://lore.kernel.org/bpf/62b0a20232920_3573208ab@john.notmuch/
+
+Fixes: 126cdfe1007a ("ice: xsk: Improve AF_XDP ZC Tx and use batching API")
+	Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Tested-by: George Kuruvinakunnel <george.kuruvinakunnel@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 29322791bc8b4f42fc65734840826e3ddc30921e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_txrx.c
+#	drivers/net/ethernet/intel/ice/ice_xsk.c
+#	drivers/net/ethernet/intel/ice/ice_xsk.h
+diff --cc drivers/net/ethernet/intel/ice/ice_txrx.c
+index a884f9004392,dd2285d4bef4..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@@ -1467,7 -1467,7 +1467,11 @@@ int ice_napi_poll(struct napi_struct *n
+  		bool wd;
+  
+  		if (tx_ring->xsk_pool)
+++<<<<<<< HEAD
+ +			wd = ice_clean_tx_irq_zc(tx_ring, budget);
+++=======
++ 			wd = ice_xmit_zc(tx_ring);
+++>>>>>>> 29322791bc8b (ice: xsk: change batched Tx descriptor cleaning)
+  		else if (ice_ring_is_xdp(tx_ring))
+  			wd = true;
+  		else
+diff --cc drivers/net/ethernet/intel/ice/ice_xsk.c
+index 97259fed7f51,8833b66b4e54..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_xsk.c
++++ b/drivers/net/ethernet/intel/ice/ice_xsk.c
+@@@ -785,32 -788,38 +785,67 @@@ ice_clean_xdp_tx_buf(struct ice_tx_rin
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * ice_clean_tx_irq_zc - Completes AF_XDP entries, and cleans XDP entries
+ + * @xdp_ring: XDP Tx ring
+ + * @budget: NAPI budget
+ + *
+ + * Returns true if cleanup/tranmission is done.
+ + */
+ +bool ice_clean_tx_irq_zc(struct ice_tx_ring *xdp_ring, int budget)
+ +{
+ +	int total_packets = 0, total_bytes = 0;
+ +	s16 ntc = xdp_ring->next_to_clean;
+ +	struct ice_tx_desc *tx_desc;
+ +	struct ice_tx_buf *tx_buf;
+ +	u32 xsk_frames = 0;
+ +	bool xmit_done;
+ +
+ +	tx_desc = ICE_TX_DESC(xdp_ring, ntc);
+ +	tx_buf = &xdp_ring->tx_buf[ntc];
+ +	ntc -= xdp_ring->count;
+ +
+ +	do {
+ +		if (!(tx_desc->cmd_type_offset_bsz &
+ +		      cpu_to_le64(ICE_TX_DESC_DTYPE_DESC_DONE)))
+ +			break;
+ +
+ +		total_bytes += tx_buf->bytecount;
+ +		total_packets++;
+++=======
++  * ice_clean_xdp_irq_zc - produce AF_XDP descriptors to CQ
++  * @xdp_ring: XDP Tx ring
++  */
++ static void ice_clean_xdp_irq_zc(struct ice_tx_ring *xdp_ring)
++ {
++ 	u16 ntc = xdp_ring->next_to_clean;
++ 	struct ice_tx_desc *tx_desc;
++ 	u16 cnt = xdp_ring->count;
++ 	struct ice_tx_buf *tx_buf;
++ 	u16 xsk_frames = 0;
++ 	u16 last_rs;
++ 	int i;
++ 
++ 	last_rs = xdp_ring->next_to_use ? xdp_ring->next_to_use - 1 : cnt - 1;
++ 	tx_desc = ICE_TX_DESC(xdp_ring, last_rs);
++ 	if ((tx_desc->cmd_type_offset_bsz &
++ 	    cpu_to_le64(ICE_TX_DESC_DTYPE_DESC_DONE))) {
++ 		if (last_rs >= ntc)
++ 			xsk_frames = last_rs - ntc + 1;
++ 		else
++ 			xsk_frames = last_rs + cnt - ntc + 1;
++ 	}
++ 
++ 	if (!xsk_frames)
++ 		return;
++ 
++ 	if (likely(!xdp_ring->xdp_tx_active))
++ 		goto skip;
++ 
++ 	ntc = xdp_ring->next_to_clean;
++ 	for (i = 0; i < xsk_frames; i++) {
++ 		tx_buf = &xdp_ring->tx_buf[ntc];
+++>>>>>>> 29322791bc8b (ice: xsk: change batched Tx descriptor cleaning)
+  
+  		if (tx_buf->raw_buf) {
+  			ice_clean_xdp_tx_buf(xdp_ring, tx_buf);
+@@@ -819,26 -828,140 +854,153 @@@
+  			xsk_frames++;
+  		}
+  
+++<<<<<<< HEAD
+ +		tx_desc->cmd_type_offset_bsz = 0;
+ +		tx_buf++;
+ +		tx_desc++;
+ +		ntc++;
+ +
+ +		if (unlikely(!ntc)) {
+ +			ntc -= xdp_ring->count;
+ +			tx_buf = xdp_ring->tx_buf;
+ +			tx_desc = ICE_TX_DESC(xdp_ring, 0);
+ +		}
+ +
+ +		prefetch(tx_desc);
+ +
+ +	} while (likely(--budget));
+++=======
++ 		ntc++;
++ 		if (ntc >= xdp_ring->count)
++ 			ntc = 0;
++ 	}
++ skip:
++ 	tx_desc->cmd_type_offset_bsz = 0;
++ 	xdp_ring->next_to_clean += xsk_frames;
++ 	if (xdp_ring->next_to_clean >= cnt)
++ 		xdp_ring->next_to_clean -= cnt;
++ 	if (xsk_frames)
++ 		xsk_tx_completed(xdp_ring->xsk_pool, xsk_frames);
++ }
+++>>>>>>> 29322791bc8b (ice: xsk: change batched Tx descriptor cleaning)
+  
+ -/**
+ - * ice_xmit_pkt - produce a single HW Tx descriptor out of AF_XDP descriptor
+ - * @xdp_ring: XDP ring to produce the HW Tx descriptor on
+ - * @desc: AF_XDP descriptor to pull the DMA address and length from
+ - * @total_bytes: bytes accumulator that will be used for stats update
+ - */
+ -static void ice_xmit_pkt(struct ice_tx_ring *xdp_ring, struct xdp_desc *desc,
+ -			 unsigned int *total_bytes)
+ -{
+ -	struct ice_tx_desc *tx_desc;
+ -	dma_addr_t dma;
+ +	ntc += xdp_ring->count;
+ +	xdp_ring->next_to_clean = ntc;
+  
+++<<<<<<< HEAD
+ +	if (xsk_frames)
+ +		xsk_tx_completed(xdp_ring->xsk_pool, xsk_frames);
+++=======
++ 	dma = xsk_buff_raw_get_dma(xdp_ring->xsk_pool, desc->addr);
++ 	xsk_buff_raw_dma_sync_for_device(xdp_ring->xsk_pool, dma, desc->len);
++ 
++ 	tx_desc = ICE_TX_DESC(xdp_ring, xdp_ring->next_to_use++);
++ 	tx_desc->buf_addr = cpu_to_le64(dma);
++ 	tx_desc->cmd_type_offset_bsz = ice_build_ctob(ICE_TX_DESC_CMD_EOP,
++ 						      0, desc->len, 0);
++ 
++ 	*total_bytes += desc->len;
++ }
++ 
++ /**
++  * ice_xmit_pkt_batch - produce a batch of HW Tx descriptors out of AF_XDP descriptors
++  * @xdp_ring: XDP ring to produce the HW Tx descriptors on
++  * @descs: AF_XDP descriptors to pull the DMA addresses and lengths from
++  * @total_bytes: bytes accumulator that will be used for stats update
++  */
++ static void ice_xmit_pkt_batch(struct ice_tx_ring *xdp_ring, struct xdp_desc *descs,
++ 			       unsigned int *total_bytes)
++ {
++ 	u16 ntu = xdp_ring->next_to_use;
++ 	struct ice_tx_desc *tx_desc;
++ 	u32 i;
++ 
++ 	loop_unrolled_for(i = 0; i < PKTS_PER_BATCH; i++) {
++ 		dma_addr_t dma;
++ 
++ 		dma = xsk_buff_raw_get_dma(xdp_ring->xsk_pool, descs[i].addr);
++ 		xsk_buff_raw_dma_sync_for_device(xdp_ring->xsk_pool, dma, descs[i].len);
++ 
++ 		tx_desc = ICE_TX_DESC(xdp_ring, ntu++);
++ 		tx_desc->buf_addr = cpu_to_le64(dma);
++ 		tx_desc->cmd_type_offset_bsz = ice_build_ctob(ICE_TX_DESC_CMD_EOP,
++ 							      0, descs[i].len, 0);
++ 
++ 		*total_bytes += descs[i].len;
++ 	}
++ 
++ 	xdp_ring->next_to_use = ntu;
++ }
++ 
++ /**
++  * ice_fill_tx_hw_ring - produce the number of Tx descriptors onto ring
++  * @xdp_ring: XDP ring to produce the HW Tx descriptors on
++  * @descs: AF_XDP descriptors to pull the DMA addresses and lengths from
++  * @nb_pkts: count of packets to be send
++  * @total_bytes: bytes accumulator that will be used for stats update
++  */
++ static void ice_fill_tx_hw_ring(struct ice_tx_ring *xdp_ring, struct xdp_desc *descs,
++ 				u32 nb_pkts, unsigned int *total_bytes)
++ {
++ 	u32 batched, leftover, i;
++ 
++ 	batched = ALIGN_DOWN(nb_pkts, PKTS_PER_BATCH);
++ 	leftover = nb_pkts & (PKTS_PER_BATCH - 1);
++ 	for (i = 0; i < batched; i += PKTS_PER_BATCH)
++ 		ice_xmit_pkt_batch(xdp_ring, &descs[i], total_bytes);
++ 	for (; i < batched + leftover; i++)
++ 		ice_xmit_pkt(xdp_ring, &descs[i], total_bytes);
++ }
++ 
++ /**
++  * ice_set_rs_bit - set RS bit on last produced descriptor (one behind current NTU)
++  * @xdp_ring: XDP ring to produce the HW Tx descriptors on
++  */
++ static void ice_set_rs_bit(struct ice_tx_ring *xdp_ring)
++ {
++ 	u16 ntu = xdp_ring->next_to_use ? xdp_ring->next_to_use - 1 : xdp_ring->count - 1;
++ 	struct ice_tx_desc *tx_desc;
++ 
++ 	tx_desc = ICE_TX_DESC(xdp_ring, ntu);
++ 	tx_desc->cmd_type_offset_bsz |=
++ 		cpu_to_le64(ICE_TX_DESC_CMD_RS << ICE_TXD_QW1_CMD_S);
++ }
++ 
++ /**
++  * ice_xmit_zc - take entries from XSK Tx ring and place them onto HW Tx ring
++  * @xdp_ring: XDP ring to produce the HW Tx descriptors on
++  *
++  * Returns true if there is no more work that needs to be done, false otherwise
++  */
++ bool ice_xmit_zc(struct ice_tx_ring *xdp_ring)
++ {
++ 	struct xdp_desc *descs = xdp_ring->xsk_pool->tx_descs;
++ 	u32 nb_pkts, nb_processed = 0;
++ 	unsigned int total_bytes = 0;
++ 	int budget;
++ 
++ 	ice_clean_xdp_irq_zc(xdp_ring);
++ 
++ 	budget = ICE_DESC_UNUSED(xdp_ring);
++ 	budget = min_t(u16, budget, ICE_RING_QUARTER(xdp_ring));
++ 
++ 	nb_pkts = xsk_tx_peek_release_desc_batch(xdp_ring->xsk_pool, budget);
++ 	if (!nb_pkts)
++ 		return true;
++ 
++ 	if (xdp_ring->next_to_use + nb_pkts >= xdp_ring->count) {
++ 		nb_processed = xdp_ring->count - xdp_ring->next_to_use;
++ 		ice_fill_tx_hw_ring(xdp_ring, descs, nb_processed, &total_bytes);
++ 		xdp_ring->next_to_use = 0;
++ 	}
++ 
++ 	ice_fill_tx_hw_ring(xdp_ring, &descs[nb_processed], nb_pkts - nb_processed,
++ 			    &total_bytes);
++ 
++ 	ice_set_rs_bit(xdp_ring);
++ 	ice_xdp_ring_update_tail(xdp_ring);
++ 	ice_update_tx_ring_stats(xdp_ring, nb_pkts, total_bytes);
+++>>>>>>> 29322791bc8b (ice: xsk: change batched Tx descriptor cleaning)
+  
+  	if (xsk_uses_need_wakeup(xdp_ring->xsk_pool))
+  		xsk_set_tx_need_wakeup(xdp_ring->xsk_pool);
+diff --cc drivers/net/ethernet/intel/ice/ice_xsk.h
+index b3ac44b46c90,6fa181f080ef..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_xsk.h
++++ b/drivers/net/ethernet/intel/ice/ice_xsk.h
+@@@ -17,8 -26,14 +17,19 @@@ bool ice_alloc_rx_bufs_zc(struct ice_rx
+  bool ice_xsk_any_rx_ring_ena(struct ice_vsi *vsi);
+  void ice_xsk_clean_rx_ring(struct ice_rx_ring *rx_ring);
+  void ice_xsk_clean_xdp_ring(struct ice_tx_ring *xdp_ring);
+++<<<<<<< HEAD
+ +int ice_realloc_zc_buf(struct ice_vsi *vsi, bool zc);
+ +#else
+++=======
++ bool ice_xmit_zc(struct ice_tx_ring *xdp_ring);
++ int ice_realloc_zc_buf(struct ice_vsi *vsi, bool zc);
++ #else
++ static inline bool ice_xmit_zc(struct ice_tx_ring __always_unused *xdp_ring)
++ {
++ 	return false;
++ }
++ 
+++>>>>>>> 29322791bc8b (ice: xsk: change batched Tx descriptor cleaning)
+  static inline int
+  ice_xsk_pool_setup(struct ice_vsi __always_unused *vsi,
+  		   struct xsk_buff_pool __always_unused *pool,
+* Unmerged path drivers/net/ethernet/intel/ice/ice_txrx.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_xsk.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_xsk.h
