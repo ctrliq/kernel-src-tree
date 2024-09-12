@@ -1,0 +1,160 @@
+console: consume APC, DM, DCS
+
+jira LE-1907
+cve CVE-2021-3753
+Rebuild_History Non-Buildable kernel-4.18.0-524.el8
+commit-author nick black <dankamongmen@gmail.com>
+commit 3a2b2eb55681158d3e3ef464fbf47574cf0c517c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-524.el8/3a2b2eb5.failed
+
+The Linux console's VT102 implementation already consumes OSC
+("Operating System Command") sequences, probably because that's how
+palette changes are transmitted.
+
+In addition to OSC, there are three other major clases of ANSI control
+strings: APC ("Application Program Command"), PM ("Privacy Message"),
+and DCS ("Device Control String").  They are handled similarly to OSC in
+terms of termination.
+
+Source: vt100.net
+
+Add three new enumerated states, one for each of these types.  All three
+are handled the same way right now--they simply consume input until
+terminated.  I hope to expand upon this firmament in the future.  Add
+new predicate ansi_control_string(), returning true for any of these
+states.  Replace explicit checks against ESosc with calls to this
+function.  Transition to these states appropriately from the escape
+initiation (ESesc) state.
+
+This was motivated by the following Notcurses bugs:
+
+ https://github.com/dankamongmen/notcurses/issues/2050
+ https://github.com/dankamongmen/notcurses/issues/1828
+ https://github.com/dankamongmen/notcurses/issues/2069
+
+where standard VT sequences are not consumed by the Linux console.  It's
+not necessary that the Linux console *support* these sequences, but it
+ought *consume* these well-specified classes of sequences.
+
+Tested by sending a variety of escape sequences to the console, and
+verifying that they still worked, or were now properly consumed.
+Verified that the escapes were properly terminated at a generic level.
+Verified that the Notcurses tools continued to show expected output on
+the Linux console, except now without escape bleedthrough.
+
+Link: https://lore.kernel.org/lkml/YSydL0q8iaUfkphg@schwarzgerat.orthanc/
+	Signed-off-by: nick black <dankamongmen@gmail.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Jiri Slaby <jirislaby@kernel.org>
+	Cc: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
+	Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3a2b2eb55681158d3e3ef464fbf47574cf0c517c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/vt/vt.c
+diff --cc drivers/tty/vt/vt.c
+index a1e786760faa,cb72393f92d3..000000000000
+--- a/drivers/tty/vt/vt.c
++++ b/drivers/tty/vt/vt.c
+@@@ -1908,8 -2058,8 +1908,13 @@@ static void restore_cur(struct vc_data 
+  }
+  
+  enum { ESnormal, ESesc, ESsquare, ESgetpars, ESfunckey,
+++<<<<<<< HEAD
+ +	EShash, ESsetG0, ESsetG1, ESpercent, ESignore, ESnonstd,
+ +	ESpalette, ESosc };
+++=======
++ 	EShash, ESsetG0, ESsetG1, ESpercent, EScsiignore, ESnonstd,
++ 	ESpalette, ESosc, ESapc, ESpm, ESdcs };
+++>>>>>>> 3a2b2eb55681 (console: consume APC, DM, DCS)
+  
+  /* console_lock is held (except via vc_init()) */
+  static void reset_terminal(struct vc_data *vc, int do_clear)
+@@@ -1963,6 -2110,37 +1968,40 @@@
+  	    csi_J(vc, 2);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void vc_setGx(struct vc_data *vc, unsigned int which, int c)
++ {
++ 	unsigned char *charset = &vc->state.Gx_charset[which];
++ 
++ 	switch (c) {
++ 	case '0':
++ 		*charset = GRAF_MAP;
++ 		break;
++ 	case 'B':
++ 		*charset = LAT1_MAP;
++ 		break;
++ 	case 'U':
++ 		*charset = IBMPC_MAP;
++ 		break;
++ 	case 'K':
++ 		*charset = USER_MAP;
++ 		break;
++ 	}
++ 
++ 	if (vc->state.charset == which)
++ 		vc->vc_translate = set_translate(*charset, vc);
++ }
++ 
++ /* is this state an ANSI control string? */
++ static bool ansi_control_string(unsigned int state)
++ {
++ 	if (state == ESosc || state == ESapc || state == ESpm || state == ESdcs)
++ 		return true;
++ 	return false;
++ }
++ 
+++>>>>>>> 3a2b2eb55681 (console: consume APC, DM, DCS)
+  /* console_lock is held */
+  static void do_con_trol(struct tty_struct *tty, struct vc_data *vc, int c)
+  {
+@@@ -2048,8 -2235,12 +2093,11 @@@
+  			lf(vc);
+  			return;
+  		case 'H':
+ -			if (vc->state.x < VC_TABSTOPS_COUNT)
+ -				set_bit(vc->state.x, vc->vc_tab_stop);
+ +			vc->vc_tab_stop[7 & (vc->vc_x >> 5)] |= (1 << (vc->vc_x & 31));
+  			return;
++ 		case 'P':
++ 			vc->vc_state = ESdcs;
++ 			return;
+  		case 'Z':
+  			respond_ID(tty);
+  			return;
+@@@ -2333,20 -2534,17 +2381,26 @@@
+  		vc->vc_state = ESnormal;
+  		return;
+  	case ESsetG1:
+ -		vc_setGx(vc, 1, c);
+ +		if (c == '0')
+ +			vc->vc_G1_charset = GRAF_MAP;
+ +		else if (c == 'B')
+ +			vc->vc_G1_charset = LAT1_MAP;
+ +		else if (c == 'U')
+ +			vc->vc_G1_charset = IBMPC_MAP;
+ +		else if (c == 'K')
+ +			vc->vc_G1_charset = USER_MAP;
+ +		if (vc->vc_charset == 1)
+ +			vc->vc_translate = set_translate(vc->vc_G1_charset, vc);
+  		vc->vc_state = ESnormal;
+  		return;
++ 	case ESapc:
++ 		return;
+  	case ESosc:
+  		return;
++ 	case ESpm:
++ 		return;
++ 	case ESdcs:
++ 		return;
+  	default:
+  		vc->vc_state = ESnormal;
+  	}
+* Unmerged path drivers/tty/vt/vt.c
