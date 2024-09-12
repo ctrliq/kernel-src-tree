@@ -367,8 +367,11 @@ SYM_CODE_START(startup_64)
 	 * paging_prepare() sets up the trampoline and checks if we need to
 	 * enable 5-level paging.
 	 *
-	 * Address of the trampoline is returned in RAX.
-	 * Non zero RDX on return means we need to enable 5-level paging.
+	 * paging_prepare() returns a two-quadword structure which lands
+	 * into RDX:RAX:
+	 *   - Address of the trampoline is returned in RAX.
+	 *   - Non zero RDX means trampoline needs to enable 5-level
+	 *     paging.
 	 *
 	 * RSI holds real mode data and needs to be preserved across
 	 * this function call.
@@ -558,7 +561,7 @@ SYM_FUNC_END(efi64_stub_entry)
  *
  * RDI contains the return address (might be above 4G).
  * ECX contains the base address of the trampoline memory.
- * Non zero RDX on return means we need to enable 5-level paging.
+ * Non zero RDX means trampoline needs to enable 5-level paging.
  */
 SYM_CODE_START(trampoline_32bit_src)
 	/* Set up data and stack segments */
