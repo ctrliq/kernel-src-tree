@@ -75,7 +75,7 @@ static ssize_t cca_serialnr_show(struct device *dev,
 	if (ap_domain_index >= 0)
 		cca_get_info(ac->id, ap_domain_index, &ci, zc->online);
 
-	return scnprintf(buf, PAGE_SIZE, "%s\n", ci.serial);
+	return sysfs_emit(buf, "%s\n", ci.serial);
 }
 
 static struct device_attribute dev_attr_cca_serialnr =
@@ -110,51 +110,46 @@ static ssize_t cca_mkvps_show(struct device *dev,
 		     &ci, zq->online);
 
 	if (ci.new_aes_mk_state >= '1' && ci.new_aes_mk_state <= '3')
-		n = scnprintf(buf, PAGE_SIZE, "AES NEW: %s 0x%016llx\n",
-			      new_state[ci.new_aes_mk_state - '1'],
-			      ci.new_aes_mkvp);
+		n = sysfs_emit(buf, "AES NEW: %s 0x%016llx\n",
+			       new_state[ci.new_aes_mk_state - '1'],
+			       ci.new_aes_mkvp);
 	else
-		n = scnprintf(buf, PAGE_SIZE, "AES NEW: - -\n");
+		n = sysfs_emit(buf, "AES NEW: - -\n");
 
 	if (ci.cur_aes_mk_state >= '1' && ci.cur_aes_mk_state <= '2')
-		n += scnprintf(buf + n, PAGE_SIZE - n,
-			       "AES CUR: %s 0x%016llx\n",
-			       cao_state[ci.cur_aes_mk_state - '1'],
-			       ci.cur_aes_mkvp);
+		n += sysfs_emit_at(buf, n, "AES CUR: %s 0x%016llx\n",
+				   cao_state[ci.cur_aes_mk_state - '1'],
+				   ci.cur_aes_mkvp);
 	else
-		n += scnprintf(buf + n, PAGE_SIZE - n, "AES CUR: - -\n");
+		n += sysfs_emit_at(buf, n, "AES CUR: - -\n");
 
 	if (ci.old_aes_mk_state >= '1' && ci.old_aes_mk_state <= '2')
-		n += scnprintf(buf + n, PAGE_SIZE - n,
-			       "AES OLD: %s 0x%016llx\n",
-			       cao_state[ci.old_aes_mk_state - '1'],
-			       ci.old_aes_mkvp);
+		n += sysfs_emit_at(buf, n, "AES OLD: %s 0x%016llx\n",
+				   cao_state[ci.old_aes_mk_state - '1'],
+				   ci.old_aes_mkvp);
 	else
-		n += scnprintf(buf + n, PAGE_SIZE - n, "AES OLD: - -\n");
+		n += sysfs_emit_at(buf, n, "AES OLD: - -\n");
 
 	if (ci.new_apka_mk_state >= '1' && ci.new_apka_mk_state <= '3')
-		n += scnprintf(buf + n, PAGE_SIZE - n,
-			       "APKA NEW: %s 0x%016llx\n",
-			       new_state[ci.new_apka_mk_state - '1'],
-			       ci.new_apka_mkvp);
+		n += sysfs_emit_at(buf, n, "APKA NEW: %s 0x%016llx\n",
+				   new_state[ci.new_apka_mk_state - '1'],
+				   ci.new_apka_mkvp);
 	else
-		n += scnprintf(buf + n, PAGE_SIZE - n, "APKA NEW: - -\n");
+		n += sysfs_emit_at(buf, n, "APKA NEW: - -\n");
 
 	if (ci.cur_apka_mk_state >= '1' && ci.cur_apka_mk_state <= '2')
-		n += scnprintf(buf + n, PAGE_SIZE - n,
-			       "APKA CUR: %s 0x%016llx\n",
-			       cao_state[ci.cur_apka_mk_state - '1'],
-			       ci.cur_apka_mkvp);
+		n += sysfs_emit_at(buf, n, "APKA CUR: %s 0x%016llx\n",
+				   cao_state[ci.cur_apka_mk_state - '1'],
+				   ci.cur_apka_mkvp);
 	else
-		n += scnprintf(buf + n, PAGE_SIZE - n, "APKA CUR: - -\n");
+		n += sysfs_emit_at(buf, n, "APKA CUR: - -\n");
 
 	if (ci.old_apka_mk_state >= '1' && ci.old_apka_mk_state <= '2')
-		n += scnprintf(buf + n, PAGE_SIZE - n,
-			       "APKA OLD: %s 0x%016llx\n",
-			       cao_state[ci.old_apka_mk_state - '1'],
-			       ci.old_apka_mkvp);
+		n += sysfs_emit_at(buf, n, "APKA OLD: %s 0x%016llx\n",
+				   cao_state[ci.old_apka_mk_state - '1'],
+				   ci.old_apka_mkvp);
 	else
-		n += scnprintf(buf + n, PAGE_SIZE - n, "APKA OLD: - -\n");
+		n += sysfs_emit_at(buf, n, "APKA OLD: - -\n");
 
 	return n;
 }
@@ -203,6 +198,7 @@ static int zcrypt_cex2c_rng_supported(struct ap_queue *aq)
 	ap_msg.msg = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!ap_msg.msg)
 		return -ENOMEM;
+	ap_msg.bufsize = PAGE_SIZE;
 
 	rng_type6cprb_msgx(&ap_msg, 4, &domain);
 
@@ -216,7 +212,7 @@ static int zcrypt_cex2c_rng_supported(struct ap_queue *aq)
 	/* Wait for the test message to complete. */
 	for (i = 0; i < 2 * HZ; i++) {
 		msleep(1000 / HZ);
-		rc = ap_recv(aq->qid, &psmid, ap_msg.msg, 4096);
+		rc = ap_recv(aq->qid, &psmid, ap_msg.msg, ap_msg.bufsize);
 		if (rc == 0 && psmid == 0x0102030405060708UL)
 			break;
 	}
