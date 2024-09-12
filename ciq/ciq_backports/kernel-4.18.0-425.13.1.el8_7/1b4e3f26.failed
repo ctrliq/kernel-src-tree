@@ -1,0 +1,312 @@
+mm: vmscan: Reduce throttling due to a failure to make progress
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.13.1.el8_7
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit 1b4e3f26f9f7553b260b8aed43967500961448a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.13.1.el8_7/1b4e3f26.failed
+
+Mike Galbraith, Alexey Avramov and Darrick Wong all reported similar
+problems due to reclaim throttling for excessive lengths of time.  In
+Alexey's case, a memory hog that should go OOM quickly stalls for
+several minutes before stalling.  In Mike and Darrick's cases, a small
+memcg environment stalled excessively even though the system had enough
+memory overall.
+
+Commit 69392a403f49 ("mm/vmscan: throttle reclaim when no progress is
+being made") introduced the problem although commit a19594ca4a8b
+("mm/vmscan: increase the timeout if page reclaim is not making
+progress") made it worse.  Systems at or near an OOM state that cannot
+be recovered must reach OOM quickly and memcg should kill tasks if a
+memcg is near OOM.
+
+To address this, only stall for the first zone in the zonelist, reduce
+the timeout to 1 tick for VMSCAN_THROTTLE_NOPROGRESS and only stall if
+the scan control nr_reclaimed is 0, kswapd is still active and there
+were excessive pages pending for writeback.  If kswapd has stopped
+reclaiming due to excessive failures, do not stall at all so that OOM
+triggers relatively quickly.  Similarly, if an LRU is simply congested,
+only lightly throttle similar to NOPROGRESS.
+
+Alexey's original case was the most straight forward
+
+	for i in {1..3}; do tail /dev/zero; done
+
+On vanilla 5.16-rc1, this test stalled heavily, after the patch the test
+completes in a few seconds similar to 5.15.
+
+Alexey's second test case added watching a youtube video while tail runs
+10 times.  On 5.15, playback only jitters slightly, 5.16-rc1 stalls a
+lot with lots of frames missing and numerous audio glitches.  With this
+patch applies, the video plays similarly to 5.15.
+
+[lkp@intel.com: Fix W=1 build warning]
+
+Link: https://lore.kernel.org/r/99e779783d6c7fce96448a3402061b9dc1b3b602.camel@gmx.de
+Link: https://lore.kernel.org/r/20211124011954.7cab9bb4@mail.inbox.lv
+Link: https://lore.kernel.org/r/20211022144651.19914-1-mgorman@techsingularity.net
+Link: https://lore.kernel.org/r/20211202150614.22440-1-mgorman@techsingularity.net
+Link: https://linux-regtracking.leemhuis.info/regzbot/regression/20211124011954.7cab9bb4@mail.inbox.lv/
+Reported-and-tested-by: Alexey Avramov <hakavlad@inbox.lv>
+Reported-and-tested-by: Mike Galbraith <efault@gmx.de>
+Reported-and-tested-by: Darrick J. Wong <djwong@kernel.org>
+	Reported-by: kernel test robot <lkp@intel.com>
+	Acked-by: Hugh Dickins <hughd@google.com>
+Tracked-by: Thorsten Leemhuis <regressions@leemhuis.info>
+Fixes: 69392a403f49 ("mm/vmscan: throttle reclaim when no progress is being made")
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1b4e3f26f9f7553b260b8aed43967500961448a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmzone.h
+#	include/trace/events/vmscan.h
+#	mm/vmscan.c
+diff --cc include/linux/mmzone.h
+index e1c35e06ef35,936dc0b6c226..000000000000
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@@ -280,6 -273,14 +280,17 @@@ enum lru_list 
+  	NR_LRU_LISTS
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum vmscan_throttle_state {
++ 	VMSCAN_THROTTLE_WRITEBACK,
++ 	VMSCAN_THROTTLE_ISOLATED,
++ 	VMSCAN_THROTTLE_NOPROGRESS,
++ 	VMSCAN_THROTTLE_CONGESTED,
++ 	NR_VMSCAN_THROTTLE,
++ };
++ 
+++>>>>>>> 1b4e3f26f9f7 (mm: vmscan: Reduce throttling due to a failure to make progress)
+  #define for_each_lru(lru) for (lru = 0; lru < NR_LRU_LISTS; lru++)
+  
+  #define for_each_evictable_lru(lru) for (lru = 0; lru <= LRU_ACTIVE_FILE; lru++)
+diff --cc include/trace/events/vmscan.h
+index f9612ac9e0e4,ca2e9009a651..000000000000
+--- a/include/trace/events/vmscan.h
++++ b/include/trace/events/vmscan.h
+@@@ -27,6 -27,20 +27,23 @@@
+  		{RECLAIM_WB_ASYNC,	"RECLAIM_WB_ASYNC"}	\
+  		) : "RECLAIM_WB_NONE"
+  
+++<<<<<<< HEAD
+++=======
++ #define _VMSCAN_THROTTLE_WRITEBACK	(1 << VMSCAN_THROTTLE_WRITEBACK)
++ #define _VMSCAN_THROTTLE_ISOLATED	(1 << VMSCAN_THROTTLE_ISOLATED)
++ #define _VMSCAN_THROTTLE_NOPROGRESS	(1 << VMSCAN_THROTTLE_NOPROGRESS)
++ #define _VMSCAN_THROTTLE_CONGESTED	(1 << VMSCAN_THROTTLE_CONGESTED)
++ 
++ #define show_throttle_flags(flags)						\
++ 	(flags) ? __print_flags(flags, "|",					\
++ 		{_VMSCAN_THROTTLE_WRITEBACK,	"VMSCAN_THROTTLE_WRITEBACK"},	\
++ 		{_VMSCAN_THROTTLE_ISOLATED,	"VMSCAN_THROTTLE_ISOLATED"},	\
++ 		{_VMSCAN_THROTTLE_NOPROGRESS,	"VMSCAN_THROTTLE_NOPROGRESS"},	\
++ 		{_VMSCAN_THROTTLE_CONGESTED,	"VMSCAN_THROTTLE_CONGESTED"}	\
++ 		) : "VMSCAN_THROTTLE_NONE"
++ 
++ 
+++>>>>>>> 1b4e3f26f9f7 (mm: vmscan: Reduce throttling due to a failure to make progress)
+  #define trace_reclaim_flags(file) ( \
+  	(file ? RECLAIM_WB_FILE : RECLAIM_WB_ANON) | \
+  	(RECLAIM_WB_ASYNC) \
+diff --cc mm/vmscan.c
+index e3ffc3c3d8d7,4c4d5f6cd8a3..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -991,6 -1021,132 +991,135 @@@ static void handle_write_error(struct a
+  	unlock_page(page);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool skip_throttle_noprogress(pg_data_t *pgdat)
++ {
++ 	int reclaimable = 0, write_pending = 0;
++ 	int i;
++ 
++ 	/*
++ 	 * If kswapd is disabled, reschedule if necessary but do not
++ 	 * throttle as the system is likely near OOM.
++ 	 */
++ 	if (pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES)
++ 		return true;
++ 
++ 	/*
++ 	 * If there are a lot of dirty/writeback pages then do not
++ 	 * throttle as throttling will occur when the pages cycle
++ 	 * towards the end of the LRU if still under writeback.
++ 	 */
++ 	for (i = 0; i < MAX_NR_ZONES; i++) {
++ 		struct zone *zone = pgdat->node_zones + i;
++ 
++ 		if (!populated_zone(zone))
++ 			continue;
++ 
++ 		reclaimable += zone_reclaimable_pages(zone);
++ 		write_pending += zone_page_state_snapshot(zone,
++ 						  NR_ZONE_WRITE_PENDING);
++ 	}
++ 	if (2 * write_pending <= reclaimable)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ void reclaim_throttle(pg_data_t *pgdat, enum vmscan_throttle_state reason)
++ {
++ 	wait_queue_head_t *wqh = &pgdat->reclaim_wait[reason];
++ 	long timeout, ret;
++ 	DEFINE_WAIT(wait);
++ 
++ 	/*
++ 	 * Do not throttle IO workers, kthreads other than kswapd or
++ 	 * workqueues. They may be required for reclaim to make
++ 	 * forward progress (e.g. journalling workqueues or kthreads).
++ 	 */
++ 	if (!current_is_kswapd() &&
++ 	    current->flags & (PF_IO_WORKER|PF_KTHREAD))
++ 		return;
++ 
++ 	/*
++ 	 * These figures are pulled out of thin air.
++ 	 * VMSCAN_THROTTLE_ISOLATED is a transient condition based on too many
++ 	 * parallel reclaimers which is a short-lived event so the timeout is
++ 	 * short. Failing to make progress or waiting on writeback are
++ 	 * potentially long-lived events so use a longer timeout. This is shaky
++ 	 * logic as a failure to make progress could be due to anything from
++ 	 * writeback to a slow device to excessive references pages at the tail
++ 	 * of the inactive LRU.
++ 	 */
++ 	switch(reason) {
++ 	case VMSCAN_THROTTLE_WRITEBACK:
++ 		timeout = HZ/10;
++ 
++ 		if (atomic_inc_return(&pgdat->nr_writeback_throttled) == 1) {
++ 			WRITE_ONCE(pgdat->nr_reclaim_start,
++ 				node_page_state(pgdat, NR_THROTTLED_WRITTEN));
++ 		}
++ 
++ 		break;
++ 	case VMSCAN_THROTTLE_CONGESTED:
++ 		fallthrough;
++ 	case VMSCAN_THROTTLE_NOPROGRESS:
++ 		if (skip_throttle_noprogress(pgdat)) {
++ 			cond_resched();
++ 			return;
++ 		}
++ 
++ 		timeout = 1;
++ 
++ 		break;
++ 	case VMSCAN_THROTTLE_ISOLATED:
++ 		timeout = HZ/50;
++ 		break;
++ 	default:
++ 		WARN_ON_ONCE(1);
++ 		timeout = HZ;
++ 		break;
++ 	}
++ 
++ 	prepare_to_wait(wqh, &wait, TASK_UNINTERRUPTIBLE);
++ 	ret = schedule_timeout(timeout);
++ 	finish_wait(wqh, &wait);
++ 
++ 	if (reason == VMSCAN_THROTTLE_WRITEBACK)
++ 		atomic_dec(&pgdat->nr_writeback_throttled);
++ 
++ 	trace_mm_vmscan_throttled(pgdat->node_id, jiffies_to_usecs(timeout),
++ 				jiffies_to_usecs(timeout - ret),
++ 				reason);
++ }
++ 
++ /*
++  * Account for pages written if tasks are throttled waiting on dirty
++  * pages to clean. If enough pages have been cleaned since throttling
++  * started then wakeup the throttled tasks.
++  */
++ void __acct_reclaim_writeback(pg_data_t *pgdat, struct folio *folio,
++ 							int nr_throttled)
++ {
++ 	unsigned long nr_written;
++ 
++ 	node_stat_add_folio(folio, NR_THROTTLED_WRITTEN);
++ 
++ 	/*
++ 	 * This is an inaccurate read as the per-cpu deltas may not
++ 	 * be synchronised. However, given that the system is
++ 	 * writeback throttled, it is not worth taking the penalty
++ 	 * of getting an accurate count. At worst, the throttle
++ 	 * timeout guarantees forward progress.
++ 	 */
++ 	nr_written = node_page_state(pgdat, NR_THROTTLED_WRITTEN) -
++ 		READ_ONCE(pgdat->nr_reclaim_start);
++ 
++ 	if (nr_written > SWAP_CLUSTER_MAX * nr_throttled)
++ 		wake_up(&pgdat->reclaim_wait[VMSCAN_THROTTLE_WRITEBACK]);
++ }
++ 
+++>>>>>>> 1b4e3f26f9f7 (mm: vmscan: Reduce throttling due to a failure to make progress)
+  /* possible outcome of pageout() */
+  typedef enum {
+  	/* failed to write page out, page is locked */
+@@@ -3073,7 -3362,7 +3202,11 @@@ again
+  	if (!current_is_kswapd() && current_may_throttle() &&
+  	    !sc->hibernation_mode &&
+  	    test_bit(LRUVEC_CONGESTED, &target_lruvec->flags))
+++<<<<<<< HEAD
+ +		wait_iff_congested(BLK_RW_ASYNC, HZ/10);
+++=======
++ 		reclaim_throttle(pgdat, VMSCAN_THROTTLE_CONGESTED);
+++>>>>>>> 1b4e3f26f9f7 (mm: vmscan: Reduce throttling due to a failure to make progress)
+  
+  	if (should_continue_reclaim(pgdat, sc->nr_reclaimed - nr_reclaimed,
+  				    sc))
+@@@ -3121,6 -3410,36 +3254,39 @@@ static inline bool compaction_ready(str
+  	return zone_watermark_ok_safe(zone, 0, watermark, sc->reclaim_idx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void consider_reclaim_throttle(pg_data_t *pgdat, struct scan_control *sc)
++ {
++ 	/*
++ 	 * If reclaim is making progress greater than 12% efficiency then
++ 	 * wake all the NOPROGRESS throttled tasks.
++ 	 */
++ 	if (sc->nr_reclaimed > (sc->nr_scanned >> 3)) {
++ 		wait_queue_head_t *wqh;
++ 
++ 		wqh = &pgdat->reclaim_wait[VMSCAN_THROTTLE_NOPROGRESS];
++ 		if (waitqueue_active(wqh))
++ 			wake_up(wqh);
++ 
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Do not throttle kswapd or cgroup reclaim on NOPROGRESS as it will
++ 	 * throttle on VMSCAN_THROTTLE_WRITEBACK if there are too many pages
++ 	 * under writeback and marked for immediate reclaim at the tail of the
++ 	 * LRU.
++ 	 */
++ 	if (current_is_kswapd() || cgroup_reclaim(sc))
++ 		return;
++ 
++ 	/* Throttle if making no progress at high prioities. */
++ 	if (sc->priority == 1 && !sc->nr_reclaimed)
++ 		reclaim_throttle(pgdat, VMSCAN_THROTTLE_NOPROGRESS);
++ }
++ 
+++>>>>>>> 1b4e3f26f9f7 (mm: vmscan: Reduce throttling due to a failure to make progress)
+  /*
+   * This is the direct reclaim path, for page-allocating processes.  We only
+   * try to reclaim pages from zones which will satisfy the caller's allocation
+* Unmerged path include/linux/mmzone.h
+* Unmerged path include/trace/events/vmscan.h
+* Unmerged path mm/vmscan.c
