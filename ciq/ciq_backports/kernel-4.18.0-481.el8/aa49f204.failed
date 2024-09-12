@@ -1,0 +1,161 @@
+x86/dumpstack: Introduce die_addr() for die() with #GP fault address
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Jann Horn <jannh@google.com>
+commit aa49f20462c90df4150f33d245cbcfe0d9c80350
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/aa49f204.failed
+
+Split __die() into __die_header() and __die_body(). This allows inserting
+extra information below the header line that initiates the bug report.
+
+Introduce a new function die_addr() that behaves like die(), but is for
+faults only and uses __die_header() and __die_body() so that a future
+commit can print extra information after the header line.
+
+ [ bp: Comment the KASAN-specific usage of gp_addr. ]
+
+	Signed-off-by: Jann Horn <jannh@google.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Konovalov <andreyknvl@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: kasan-dev@googlegroups.com
+	Cc: Masami Hiramatsu <mhiramat@kernel.org>
+	Cc: "Peter Zijlstra (Intel)" <peterz@infradead.org>
+	Cc: Sean Christopherson <sean.j.christopherson@intel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: x86-ml <x86@kernel.org>
+Link: https://lkml.kernel.org/r/20191218231150.12139-3-jannh@google.com
+(cherry picked from commit aa49f20462c90df4150f33d245cbcfe0d9c80350)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/traps.c
+diff --cc arch/x86/kernel/traps.c
+index 462aa0afd7cd,2afd7d8d4007..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -557,9 -593,40 +557,35 @@@ do_general_protection(struct pt_regs *r
+  
+  		tsk->thread.error_code = error_code;
+  		tsk->thread.trap_nr = X86_TRAP_GP;
+ -
+ -		/*
+ -		 * To be potentially processing a kprobe fault and to
+ -		 * trust the result from kprobe_running(), we have to
+ -		 * be non-preemptible.
+ -		 */
+ -		if (!preemptible() && kprobe_running() &&
+ -		    kprobe_fault_handler(regs, X86_TRAP_GP))
+ -			return;
+ -
+  		if (notify_die(DIE_GPF, desc, regs, error_code,
+++<<<<<<< HEAD
+ +			       X86_TRAP_GP, SIGSEGV) != NOTIFY_STOP)
+ +			die(desc, regs, error_code);
+++=======
++ 			       X86_TRAP_GP, SIGSEGV) == NOTIFY_STOP)
++ 			return;
++ 
++ 		if (error_code)
++ 			snprintf(desc, sizeof(desc), "segment-related " GPFSTR);
++ 		else
++ 			hint = get_kernel_gp_address(regs, &gp_addr);
++ 
++ 		if (hint != GP_NO_HINT)
++ 			snprintf(desc, sizeof(desc), GPFSTR ", %s 0x%lx",
++ 				 (hint == GP_NON_CANONICAL) ?
++ 				 "probably for non-canonical address" :
++ 				 "maybe for address",
++ 				 gp_addr);
++ 
++ 		/*
++ 		 * KASAN is interested only in the non-canonical case, clear it
++ 		 * otherwise.
++ 		 */
++ 		if (hint != GP_NON_CANONICAL)
++ 			gp_addr = 0;
++ 
++ 		die_addr(desc, regs, error_code, gp_addr);
+++>>>>>>> aa49f20462c9 (x86/dumpstack: Introduce die_addr() for die() with #GP fault address)
+  		return;
+  	}
+  
+diff --git a/arch/x86/include/asm/kdebug.h b/arch/x86/include/asm/kdebug.h
+index 75f1e35e7c15..247ab14c6309 100644
+--- a/arch/x86/include/asm/kdebug.h
++++ b/arch/x86/include/asm/kdebug.h
+@@ -33,6 +33,7 @@ enum show_regs_mode {
+ };
+ 
+ extern void die(const char *, struct pt_regs *,long);
++void die_addr(const char *str, struct pt_regs *regs, long err, long gp_addr);
+ extern int __must_check __die(const char *, struct pt_regs *, long);
+ extern void show_stack_regs(struct pt_regs *regs);
+ extern void __show_regs(struct pt_regs *regs, enum show_regs_mode);
+diff --git a/arch/x86/kernel/dumpstack.c b/arch/x86/kernel/dumpstack.c
+index f1149c89553f..a13f4523c815 100644
+--- a/arch/x86/kernel/dumpstack.c
++++ b/arch/x86/kernel/dumpstack.c
+@@ -367,7 +367,7 @@ void oops_end(unsigned long flags, struct pt_regs *regs, int signr)
+ }
+ NOKPROBE_SYMBOL(oops_end);
+ 
+-int __die(const char *str, struct pt_regs *regs, long err)
++static void __die_header(const char *str, struct pt_regs *regs, long err)
+ {
+ 	const char *pr = "";
+ 
+@@ -386,7 +386,11 @@ int __die(const char *str, struct pt_regs *regs, long err)
+ 	       IS_ENABLED(CONFIG_KASAN)   ? " KASAN"           : "",
+ 	       IS_ENABLED(CONFIG_PAGE_TABLE_ISOLATION) ?
+ 	       (boot_cpu_has(X86_FEATURE_PTI) ? " PTI" : " NOPTI") : "");
++}
++NOKPROBE_SYMBOL(__die_header);
+ 
++static int __die_body(const char *str, struct pt_regs *regs, long err)
++{
+ 	show_regs(regs);
+ 	print_modules();
+ 
+@@ -396,6 +400,13 @@ int __die(const char *str, struct pt_regs *regs, long err)
+ 
+ 	return 0;
+ }
++NOKPROBE_SYMBOL(__die_body);
++
++int __die(const char *str, struct pt_regs *regs, long err)
++{
++	__die_header(str, regs, err);
++	return __die_body(str, regs, err);
++}
+ NOKPROBE_SYMBOL(__die);
+ 
+ /*
+@@ -412,6 +423,17 @@ void die(const char *str, struct pt_regs *regs, long err)
+ 	oops_end(flags, regs, sig);
+ }
+ 
++void die_addr(const char *str, struct pt_regs *regs, long err, long gp_addr)
++{
++	unsigned long flags = oops_begin();
++	int sig = SIGSEGV;
++
++	__die_header(str, regs, err);
++	if (__die_body(str, regs, err))
++		sig = 0;
++	oops_end(flags, regs, sig);
++}
++
+ void show_regs(struct pt_regs *regs)
+ {
+ 	show_regs_print_info(KERN_DEFAULT);
+* Unmerged path arch/x86/kernel/traps.c
