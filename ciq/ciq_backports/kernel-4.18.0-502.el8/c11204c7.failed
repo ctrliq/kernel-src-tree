@@ -1,0 +1,108 @@
+txhash: fix sk->sk_txrehash default
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Kevin Yang <yyd@google.com>
+commit c11204c78d6966c5bda6dd05c3ac5cbb193f93e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/c11204c7.failed
+
+This code fix a bug that sk->sk_txrehash gets its default enable
+value from sysctl_txrehash only when the socket is a TCP listener.
+
+We should have sysctl_txrehash to set the default sk->sk_txrehash,
+no matter TCP, nor listerner/connector.
+
+Tested by following packetdrill:
+  0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
+  +0 socket(..., SOCK_DGRAM, IPPROTO_UDP) = 4
+  // SO_TXREHASH == 74, default to sysctl_txrehash == 1
+  +0 getsockopt(3, SOL_SOCKET, 74, [1], [4]) = 0
+  +0 getsockopt(4, SOL_SOCKET, 74, [1], [4]) = 0
+
+Fixes: 26859240e4ee ("txhash: Add socket option to control TX hash rethink behavior")
+	Signed-off-by: Kevin Yang <yyd@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c11204c78d6966c5bda6dd05c3ac5cbb193f93e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/sock.c
+diff --cc net/core/sock.c
+index 84ad6223e38b,6f27c24016fe..000000000000
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@@ -1273,6 -1500,43 +1273,46 @@@ set_rcvbuf
+  		ret = sock_bindtoindex_locked(sk, val);
+  		break;
+  
+++<<<<<<< HEAD
+++=======
++ 	case SO_BUF_LOCK:
++ 		if (val & ~SOCK_BUF_LOCK_MASK) {
++ 			ret = -EINVAL;
++ 			break;
++ 		}
++ 		sk->sk_userlocks = val | (sk->sk_userlocks &
++ 					  ~SOCK_BUF_LOCK_MASK);
++ 		break;
++ 
++ 	case SO_RESERVE_MEM:
++ 	{
++ 		int delta;
++ 
++ 		if (val < 0) {
++ 			ret = -EINVAL;
++ 			break;
++ 		}
++ 
++ 		delta = val - sk->sk_reserved_mem;
++ 		if (delta < 0)
++ 			sock_release_reserved_memory(sk, -delta);
++ 		else
++ 			ret = sock_reserve_memory(sk, delta);
++ 		break;
++ 	}
++ 
++ 	case SO_TXREHASH:
++ 		if (val < -1 || val > 1) {
++ 			ret = -EINVAL;
++ 			break;
++ 		}
++ 		if ((u8)val == SOCK_TXREHASH_DEFAULT)
++ 			val = READ_ONCE(sock_net(sk)->core.sysctl_txrehash);
++ 		/* Paired with READ_ONCE() in tcp_rtx_synack() */
++ 		WRITE_ONCE(sk->sk_txrehash, (u8)val);
++ 		break;
++ 
+++>>>>>>> c11204c78d69 (txhash: fix sk->sk_txrehash default)
+  	default:
+  		ret = -ENOPROTOOPT;
+  		break;
+* Unmerged path net/core/sock.c
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index aeb9c53ed577..ca2427a8192b 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -354,6 +354,7 @@ static int inet_create(struct net *net, struct socket *sock, int protocol,
+ 	sk->sk_destruct	   = inet_sock_destruct;
+ 	sk->sk_protocol	   = protocol;
+ 	sk->sk_backlog_rcv = sk->sk_prot->backlog_rcv;
++	sk->sk_txrehash = READ_ONCE(net->core.sysctl_txrehash);
+ 
+ 	inet->uc_ttl	= -1;
+ 	inet->mc_loop	= 1;
+diff --git a/net/ipv6/af_inet6.c b/net/ipv6/af_inet6.c
+index 8bcd961b0f07..e325c1e0322d 100644
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -226,6 +226,7 @@ static int inet6_create(struct net *net, struct socket *sock, int protocol,
+ 	np->pmtudisc	= IPV6_PMTUDISC_WANT;
+ 	np->repflow	= net->ipv6.sysctl.flowlabel_reflect;
+ 	sk->sk_ipv6only	= net->ipv6.sysctl.bindv6only;
++	sk->sk_txrehash = READ_ONCE(net->core.sysctl_txrehash);
+ 
+ 	/* Init the ipv4 part of the socket since we can have sockets
+ 	 * using v6 API for ipv4.
