@@ -1,0 +1,175 @@
+r8152: replace return with break for ram code speedup mode timeout
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Hayes Wang <hayeswang@realtek.com>
+commit f49c35b89b784c20a8868bb6f57f3e25277268c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/f49c35b8.failed
+
+When the timeout occurs, we still have to run the following process
+for releasing patch request. Otherwise, the PHY would keep no link.
+Therefore, use break to stop the loop of loading firmware and
+release the patch request rather than return the function directly.
+
+Fixes: 4a51b0e8a014 ("r8152: support PHY firmware for RTL8156 series")
+	Signed-off-by: Hayes Wang <hayeswang@realtek.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f49c35b89b784c20a8868bb6f57f3e25277268c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/r8152.c
+diff --cc drivers/net/usb/r8152.c
+index e84ea7c904d3,5b4ed69df64f..000000000000
+--- a/drivers/net/usb/r8152.c
++++ b/drivers/net/usb/r8152.c
+@@@ -3950,6 -4757,143 +3950,146 @@@ fail
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void rtl_ram_code_speed_up(struct r8152 *tp, struct fw_phy_speed_up *phy, bool wait)
++ {
++ 	u32 len;
++ 	u8 *data;
++ 
++ 	if (sram_read(tp, SRAM_GPHY_FW_VER) >= __le16_to_cpu(phy->version)) {
++ 		dev_dbg(&tp->intf->dev, "PHY firmware has been the newest\n");
++ 		return;
++ 	}
++ 
++ 	len = __le32_to_cpu(phy->blk_hdr.length);
++ 	len -= __le16_to_cpu(phy->fw_offset);
++ 	data = (u8 *)phy + __le16_to_cpu(phy->fw_offset);
++ 
++ 	if (rtl_phy_patch_request(tp, true, wait))
++ 		return;
++ 
++ 	while (len) {
++ 		u32 ocp_data, size;
++ 		int i;
++ 
++ 		if (len < 2048)
++ 			size = len;
++ 		else
++ 			size = 2048;
++ 
++ 		ocp_data = ocp_read_word(tp, MCU_TYPE_USB, USB_GPHY_CTRL);
++ 		ocp_data |= GPHY_PATCH_DONE | BACKUP_RESTRORE;
++ 		ocp_write_word(tp, MCU_TYPE_USB, USB_GPHY_CTRL, ocp_data);
++ 
++ 		generic_ocp_write(tp, __le16_to_cpu(phy->fw_reg), 0xff, size, data, MCU_TYPE_USB);
++ 
++ 		data += size;
++ 		len -= size;
++ 
++ 		ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_POL_GPIO_CTRL);
++ 		ocp_data |= POL_GPHY_PATCH;
++ 		ocp_write_word(tp, MCU_TYPE_PLA, PLA_POL_GPIO_CTRL, ocp_data);
++ 
++ 		for (i = 0; i < 1000; i++) {
++ 			if (!(ocp_read_word(tp, MCU_TYPE_PLA, PLA_POL_GPIO_CTRL) & POL_GPHY_PATCH))
++ 				break;
++ 		}
++ 
++ 		if (i == 1000) {
++ 			dev_err(&tp->intf->dev, "ram code speedup mode timeout\n");
++ 			break;
++ 		}
++ 	}
++ 
++ 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_OCP_GPHY_BASE, tp->ocp_base);
++ 	rtl_phy_patch_request(tp, false, wait);
++ 
++ 	if (sram_read(tp, SRAM_GPHY_FW_VER) == __le16_to_cpu(phy->version))
++ 		dev_dbg(&tp->intf->dev, "successfully applied %s\n", phy->info);
++ 	else
++ 		dev_err(&tp->intf->dev, "ram code speedup mode fail\n");
++ }
++ 
++ static int rtl8152_fw_phy_ver(struct r8152 *tp, struct fw_phy_ver *phy_ver)
++ {
++ 	u16 ver_addr, ver;
++ 
++ 	ver_addr = __le16_to_cpu(phy_ver->ver.addr);
++ 	ver = __le16_to_cpu(phy_ver->ver.data);
++ 
++ 	if (sram_read(tp, ver_addr) >= ver) {
++ 		dev_dbg(&tp->intf->dev, "PHY firmware has been the newest\n");
++ 		return 0;
++ 	}
++ 
++ 	sram_write(tp, ver_addr, ver);
++ 
++ 	dev_dbg(&tp->intf->dev, "PHY firmware version %x\n", ver);
++ 
++ 	return ver;
++ }
++ 
++ static void rtl8152_fw_phy_fixup(struct r8152 *tp, struct fw_phy_fixup *fix)
++ {
++ 	u16 addr, data;
++ 
++ 	addr = __le16_to_cpu(fix->setting.addr);
++ 	data = ocp_reg_read(tp, addr);
++ 
++ 	switch (__le16_to_cpu(fix->bit_cmd)) {
++ 	case FW_FIXUP_AND:
++ 		data &= __le16_to_cpu(fix->setting.data);
++ 		break;
++ 	case FW_FIXUP_OR:
++ 		data |= __le16_to_cpu(fix->setting.data);
++ 		break;
++ 	case FW_FIXUP_NOT:
++ 		data &= ~__le16_to_cpu(fix->setting.data);
++ 		break;
++ 	case FW_FIXUP_XOR:
++ 		data ^= __le16_to_cpu(fix->setting.data);
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ 
++ 	ocp_reg_write(tp, addr, data);
++ 
++ 	dev_dbg(&tp->intf->dev, "applied ocp %x %x\n", addr, data);
++ }
++ 
++ static void rtl8152_fw_phy_union_apply(struct r8152 *tp, struct fw_phy_union *phy)
++ {
++ 	__le16 *data;
++ 	u32 length;
++ 	int i, num;
++ 
++ 	num = phy->pre_num;
++ 	for (i = 0; i < num; i++)
++ 		sram_write(tp, __le16_to_cpu(phy->pre_set[i].addr),
++ 			   __le16_to_cpu(phy->pre_set[i].data));
++ 
++ 	length = __le32_to_cpu(phy->blk_hdr.length);
++ 	length -= __le16_to_cpu(phy->fw_offset);
++ 	num = length / 2;
++ 	data = (__le16 *)((u8 *)phy + __le16_to_cpu(phy->fw_offset));
++ 
++ 	ocp_reg_write(tp, OCP_SRAM_ADDR, __le16_to_cpu(phy->fw_reg));
++ 	for (i = 0; i < num; i++)
++ 		ocp_reg_write(tp, OCP_SRAM_DATA, __le16_to_cpu(data[i]));
++ 
++ 	num = phy->bp_num;
++ 	for (i = 0; i < num; i++)
++ 		sram_write(tp, __le16_to_cpu(phy->bp[i].addr), __le16_to_cpu(phy->bp[i].data));
++ 
++ 	if (phy->bp_num && phy->bp_en.addr)
++ 		sram_write(tp, __le16_to_cpu(phy->bp_en.addr), __le16_to_cpu(phy->bp_en.data));
++ 
++ 	dev_dbg(&tp->intf->dev, "successfully applied %s\n", phy->info);
++ }
++ 
+++>>>>>>> f49c35b89b78 (r8152: replace return with break for ram code speedup mode timeout)
+  static void rtl8152_fw_phy_nc_apply(struct r8152 *tp, struct fw_phy_nc *phy)
+  {
+  	u16 mode_reg, bp_index;
+* Unmerged path drivers/net/usb/r8152.c
