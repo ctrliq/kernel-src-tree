@@ -1,0 +1,162 @@
+KVM: x86: add system attribute to retrieve full set of supported xsave states
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.26.1.el8_6
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit dd6e631220181162478984d2d46dd979e04d8e75
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.26.1.el8_6/dd6e6312.failed
+
+Because KVM_GET_SUPPORTED_CPUID is meant to be passed (by simple-minded
+VMMs) to KVM_SET_CPUID2, it cannot include any dynamic xsave states that
+have not been enabled.  Probing those, for example so that they can be
+passed to ARCH_REQ_XCOMP_GUEST_PERM, requires a new ioctl or arch_prctl.
+The latter is in fact worse, even though that is what the rest of the
+API uses, because it would require supported_xcr0 to be moved from the
+KVM module to the kernel just for this use.  In addition, the value
+would be nonsensical (or an error would have to be returned) until
+the KVM module is loaded in.
+
+Therefore, to limit the growth of system ioctls, add a /dev/kvm
+variant of KVM_{GET,HAS}_DEVICE_ATTR, and implement it in x86
+with just one group (0) and attribute (KVM_X86_XCOMP_GUEST_SUPP).
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit dd6e631220181162478984d2d46dd979e04d8e75)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+#	include/uapi/linux/kvm.h
+diff --cc arch/x86/kvm/x86.c
+index 3e40344015c8,c25a6ef0ff06..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -4117,8 -4226,11 +4117,13 @@@ int kvm_vm_ioctl_check_extension(struc
+  	case KVM_CAP_SGX_ATTRIBUTE:
+  #endif
+  	case KVM_CAP_VM_COPY_ENC_CONTEXT_FROM:
+ -	case KVM_CAP_VM_MOVE_ENC_CONTEXT_FROM:
+  	case KVM_CAP_SREGS2:
+  	case KVM_CAP_EXIT_ON_EMULATION_FAILURE:
+++<<<<<<< HEAD
+++=======
++ 	case KVM_CAP_VCPU_ATTRIBUTES:
++ 	case KVM_CAP_SYS_ATTRIBUTES:
+++>>>>>>> dd6e63122018 (KVM: x86: add system attribute to retrieve full set of supported xsave states)
+  		r = 1;
+  		break;
+  	case KVM_CAP_EXIT_HYPERCALL:
+@@@ -4212,9 -4333,51 +4217,43 @@@
+  		break;
+  	}
+  	return r;
+ -}
+ -
+ -static inline void __user *kvm_get_attr_addr(struct kvm_device_attr *attr)
+ -{
+ -	void __user *uaddr = (void __user*)(unsigned long)attr->addr;
+  
+ -	if ((u64)(unsigned long)uaddr != attr->addr)
+ -		return ERR_PTR(-EFAULT);
+ -	return uaddr;
+  }
+  
++ static int kvm_x86_dev_get_attr(struct kvm_device_attr *attr)
++ {
++ 	u64 __user *uaddr = kvm_get_attr_addr(attr);
++ 
++ 	if (attr->group)
++ 		return -ENXIO;
++ 
++ 	if (IS_ERR(uaddr))
++ 		return PTR_ERR(uaddr);
++ 
++ 	switch (attr->attr) {
++ 	case KVM_X86_XCOMP_GUEST_SUPP:
++ 		if (put_user(supported_xcr0, uaddr))
++ 			return -EFAULT;
++ 		return 0;
++ 	default:
++ 		return -ENXIO;
++ 		break;
++ 	}
++ }
++ 
++ static int kvm_x86_dev_has_attr(struct kvm_device_attr *attr)
++ {
++ 	if (attr->group)
++ 		return -ENXIO;
++ 
++ 	switch (attr->attr) {
++ 	case KVM_X86_XCOMP_GUEST_SUPP:
++ 		return 0;
++ 	default:
++ 		return -ENXIO;
++ 	}
++ }
++ 
+  long kvm_arch_dev_ioctl(struct file *filp,
+  			unsigned int ioctl, unsigned long arg)
+  {
+diff --cc include/uapi/linux/kvm.h
+index 632d71ecf433,b46bcdb0cab1..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -1105,8 -1125,15 +1105,16 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_HYPERV_ENFORCE_CPUID 199
+  #define KVM_CAP_SREGS2 200
+  #define KVM_CAP_EXIT_HYPERCALL 201
+ -#define KVM_CAP_PPC_RPT_INVALIDATE 202
+  #define KVM_CAP_BINARY_STATS_FD 203
+  #define KVM_CAP_EXIT_ON_EMULATION_FAILURE 204
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_ARM_MTE 205
++ #define KVM_CAP_VM_MOVE_ENC_CONTEXT_FROM 206
++ #define KVM_CAP_VM_GPA_BITS 207
++ #define KVM_CAP_XSAVE2 208
++ #define KVM_CAP_SYS_ATTRIBUTES 209
+++>>>>>>> dd6e63122018 (KVM: x86: add system attribute to retrieve full set of supported xsave states)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index 7bf72aa3fe4d..9824dc3cb01e 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -3053,6 +3053,7 @@ number.
+ 
+ :Capability: KVM_CAP_DEVICE_CTRL, KVM_CAP_VM_ATTRIBUTES for vm device,
+              KVM_CAP_VCPU_ATTRIBUTES for vcpu device
++             KVM_CAP_SYS_ATTRIBUTES for system (/dev/kvm) device (no set)
+ :Type: device ioctl, vm ioctl, vcpu ioctl
+ :Parameters: struct kvm_device_attr
+ :Returns: 0 on success, -1 on error
+@@ -3087,7 +3088,8 @@ transferred is defined by the particular attribute.
+ ------------------------
+ 
+ :Capability: KVM_CAP_DEVICE_CTRL, KVM_CAP_VM_ATTRIBUTES for vm device,
+-	     KVM_CAP_VCPU_ATTRIBUTES for vcpu device
++             KVM_CAP_VCPU_ATTRIBUTES for vcpu device
++             KVM_CAP_SYS_ATTRIBUTES for system (/dev/kvm) device
+ :Type: device ioctl, vm ioctl, vcpu ioctl
+ :Parameters: struct kvm_device_attr
+ :Returns: 0 on success, -1 on error
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index 2ef1f6513c68..9d86fcdaed79 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -438,6 +438,9 @@ struct kvm_sync_regs {
+ 
+ #define KVM_STATE_VMX_PREEMPTION_TIMER_DEADLINE	0x00000001
+ 
++/* attributes for system fd (group 0) */
++#define KVM_X86_XCOMP_GUEST_SUPP	0
++
+ struct kvm_vmx_nested_state_data {
+ 	__u8 vmcs12[KVM_STATE_NESTED_VMX_VMCS_SIZE];
+ 	__u8 shadow_vmcs12[KVM_STATE_NESTED_VMX_VMCS_SIZE];
+* Unmerged path arch/x86/kvm/x86.c
+* Unmerged path include/uapi/linux/kvm.h
