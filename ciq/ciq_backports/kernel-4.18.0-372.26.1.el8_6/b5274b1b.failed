@@ -1,0 +1,140 @@
+kvm: x86: Disable interception for IA32_XFD on demand
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.26.1.el8_6
+commit-author Kevin Tian <kevin.tian@intel.com>
+commit b5274b1b7ba89fe8ed38cc470041cd6ba0dfb79b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.26.1.el8_6/b5274b1b.failed
+
+Always intercepting IA32_XFD causes non-negligible overhead when this
+register is updated frequently in the guest.
+
+Disable r/w emulation after intercepting the first WRMSR(IA32_XFD)
+with a non-zero value.
+
+Disable WRMSR emulation implies that IA32_XFD becomes out-of-sync
+with the software states in fpstate and the per-cpu xfd cache. This
+leads to two additional changes accordingly:
+
+  - Call fpu_sync_guest_vmexit_xfd_state() after vm-exit to bring
+    software states back in-sync with the MSR, before handle_exit_irqoff()
+    is called.
+
+  - Always trap #NM once write interception is disabled for IA32_XFD.
+    The #NM exception is rare if the guest doesn't use dynamic
+    features. Otherwise, there is at most one exception per guest
+    task given a dynamic feature.
+
+p.s. We have confirmed that SDM is being revised to say that
+when setting IA32_XFD[18] the AMX register state is not guaranteed
+to be preserved. This clarification avoids adding mess for a creative
+guest which sets IA32_XFD[18]=1 before saving active AMX state to
+its own storage.
+
+	Signed-off-by: Kevin Tian <kevin.tian@intel.com>
+	Signed-off-by: Jing Liu <jing2.liu@intel.com>
+	Signed-off-by: Yang Zhong <yang.zhong@intel.com>
+Message-Id: <20220105123532.12586-22-yang.zhong@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b5274b1b7ba89fe8ed38cc470041cd6ba0dfb79b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index f2ea88608626,15e30602782b..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -763,6 -764,14 +764,17 @@@ void vmx_update_exception_bitmap(struc
+  		vmcs_write32(PAGE_FAULT_ERROR_CODE_MATCH, match);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Disabling xfd interception indicates that dynamic xfeatures
++ 	 * might be used in the guest. Always trap #NM in this case
++ 	 * to save guest xfd_err timely.
++ 	 */
++ 	if (vcpu->arch.xfd_no_write_intercept)
++ 		eb |= (1u << NM_VECTOR);
++ 
+++>>>>>>> b5274b1b7ba8 (kvm: x86: Disable interception for IA32_XFD on demand)
+  	vmcs_write32(EXCEPTION_BITMAP, eb);
+  }
+  
+@@@ -1963,6 -1978,24 +1975,27 @@@ static int vmx_set_msr(struct kvm_vcpu 
+  	case MSR_KERNEL_GS_BASE:
+  		vmx_write_guest_kernel_gs_base(vmx, data);
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case MSR_IA32_XFD:
++ 		ret = kvm_set_msr_common(vcpu, msr_info);
++ 		/*
++ 		 * Always intercepting WRMSR could incur non-negligible
++ 		 * overhead given xfd might be changed frequently in
++ 		 * guest context switch. Disable write interception
++ 		 * upon the first write with a non-zero value (indicating
++ 		 * potential usage on dynamic xfeatures). Also update
++ 		 * exception bitmap to trap #NM for proper virtualization
++ 		 * of guest xfd_err.
++ 		 */
++ 		if (!ret && data) {
++ 			vmx_disable_intercept_for_msr(vcpu, MSR_IA32_XFD,
++ 						      MSR_TYPE_RW);
++ 			vcpu->arch.xfd_no_write_intercept = true;
++ 			vmx_update_exception_bitmap(vcpu);
++ 		}
++ 		break;
+++>>>>>>> b5274b1b7ba8 (kvm: x86: Disable interception for IA32_XFD on demand)
+  #endif
+  	case MSR_IA32_SYSENTER_CS:
+  		if (is_guest_mode(vcpu))
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 36f6b99fe4b0..85abf9591bc5 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -641,6 +641,7 @@ struct kvm_vcpu_arch {
+ 	u64 smi_count;
+ 	bool tpr_access_reporting;
+ 	bool xsaves_enabled;
++	bool xfd_no_write_intercept;
+ 	u64 ia32_xss;
+ 	u64 microcode_version;
+ 	u64 arch_capabilities;
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index f064df2316dd..28eab558205d 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -330,7 +330,7 @@ struct vcpu_vmx {
+ 	struct lbr_desc lbr_desc;
+ 
+ 	/* Save desired MSR intercept (read: pass-through) state */
+-#define MAX_POSSIBLE_PASSTHROUGH_MSRS	14
++#define MAX_POSSIBLE_PASSTHROUGH_MSRS	15
+ 	struct {
+ 		DECLARE_BITMAP(read, MAX_POSSIBLE_PASSTHROUGH_MSRS);
+ 		DECLARE_BITMAP(write, MAX_POSSIBLE_PASSTHROUGH_MSRS);
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index ba37cb8934ad..831089607a74 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -9669,6 +9669,14 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	vcpu->mode = OUTSIDE_GUEST_MODE;
+ 	smp_wmb();
+ 
++	/*
++	 * Sync xfd before calling handle_exit_irqoff() which may
++	 * rely on the fact that guest_fpu::xfd is up-to-date (e.g.
++	 * in #NM irqoff handler).
++	 */
++	if (vcpu->arch.xfd_no_write_intercept)
++		fpu_sync_guest_vmexit_xfd_state();
++
+ 	static_call(kvm_x86_handle_exit_irqoff)(vcpu);
+ 
+ 	/*
