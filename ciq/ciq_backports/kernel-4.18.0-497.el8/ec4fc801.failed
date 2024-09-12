@@ -1,0 +1,153 @@
+sched/fair: Rename select_idle_mask to select_rq_mask
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-497.el8
+commit-author Dietmar Eggemann <dietmar.eggemann@arm.com>
+commit ec4fc801a02d96180c597238fe87141471b70971
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-497.el8/ec4fc801.failed
+
+On 21/06/2022 11:04, Vincent Donnefort wrote:
+> From: Dietmar Eggemann <dietmar.eggemann@arm.com>
+
+https://lkml.kernel.org/r/202206221253.ZVyGQvPX-lkp@intel.com discovered
+that this patch doesn't build anymore (on tip sched/core or linux-next)
+because of commit f5b2eeb499910 ("sched/fair: Consider CPU affinity when
+allowing NUMA imbalance in find_idlest_group()").
+
+New version of [PATCH v11 4/7] sched/fair: Rename select_idle_mask to
+select_rq_mask below.
+
+-- >8 --
+
+Decouple the name of the per-cpu cpumask select_idle_mask from its usage
+in select_idle_[cpu/capacity]() of the CFS run-queue selection
+(select_task_rq_fair()).
+
+This is to support the reuse of this cpumask in the Energy Aware
+Scheduling (EAS) path (find_energy_efficient_cpu()) of the CFS run-queue
+selection.
+
+	Signed-off-by: Dietmar Eggemann <dietmar.eggemann@arm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Vincent Guittot <vincent.guittot@linaro.org>
+	Tested-by: Lukasz Luba <lukasz.luba@arm.com>
+Link: https://lkml.kernel.org/r/250691c7-0e2b-05ab-bedf-b245c11d9400@arm.com
+(cherry picked from commit ec4fc801a02d96180c597238fe87141471b70971)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index e2a86c009bfe,e3f750135f78..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -6348,20 -6471,73 +6348,81 @@@ static int select_idle_cpu(struct task_
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Scan the asym_capacity domain for idle CPUs; pick the first idle one on which
++  * the task fits. If no CPU is big enough, but there are idle ones, try to
++  * maximize capacity.
++  */
++ static int
++ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
++ {
++ 	unsigned long task_util, best_cap = 0;
++ 	int cpu, best_cpu = -1;
++ 	struct cpumask *cpus;
++ 
++ 	cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
++ 	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
++ 
++ 	task_util = uclamp_task_util(p);
++ 
++ 	for_each_cpu_wrap(cpu, cpus, target) {
++ 		unsigned long cpu_cap = capacity_of(cpu);
++ 
++ 		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
++ 			continue;
++ 		if (fits_capacity(task_util, cpu_cap))
++ 			return cpu;
++ 
++ 		if (cpu_cap > best_cap) {
++ 			best_cap = cpu_cap;
++ 			best_cpu = cpu;
++ 		}
++ 	}
++ 
++ 	return best_cpu;
++ }
++ 
++ static inline bool asym_fits_capacity(unsigned long task_util, int cpu)
++ {
++ 	if (static_branch_unlikely(&sched_asym_cpucapacity))
++ 		return fits_capacity(task_util, capacity_of(cpu));
++ 
++ 	return true;
++ }
++ 
++ /*
+++>>>>>>> ec4fc801a02d (sched/fair: Rename select_idle_mask to select_rq_mask)
+   * Try and locate an idle core/thread in the LLC cache domain.
+   */
+  static int select_idle_sibling(struct task_struct *p, int prev, int target)
+  {
+  	bool has_idle_core = false;
+  	struct sched_domain *sd;
+ -	unsigned long task_util;
+  	int i, recent_used_cpu;
+  
+++<<<<<<< HEAD
+ +        /*
+ +	 * per-cpu select_idle_mask usage
+ +	*/
+ +        lockdep_assert_irqs_disabled();
+++=======
++ 	/*
++ 	 * On asymmetric system, update task utilization because we will check
++ 	 * that the task fits with cpu's capacity.
++ 	 */
++ 	if (static_branch_unlikely(&sched_asym_cpucapacity)) {
++ 		sync_entity_load_avg(&p->se);
++ 		task_util = uclamp_task_util(p);
++ 	}
++ 
++ 	/*
++ 	 * per-cpu select_rq_mask usage
++ 	 */
++ 	lockdep_assert_irqs_disabled();
+++>>>>>>> ec4fc801a02d (sched/fair: Rename select_idle_mask to select_rq_mask)
+  
+ -	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
+ -	    asym_fits_capacity(task_util, target))
+ +	if (available_idle_cpu(target) || sched_idle_cpu(target))
+  		return target;
+  
+  	/*
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index dd25d2369100..4fea93563ef1 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -7244,7 +7244,7 @@ static struct kmem_cache *task_group_cache __read_mostly;
+ #endif
+ 
+ DECLARE_PER_CPU(cpumask_var_t, load_balance_mask);
+-DECLARE_PER_CPU(cpumask_var_t, select_idle_mask);
++DECLARE_PER_CPU(cpumask_var_t, select_rq_mask);
+ 
+ void __init sched_init(void)
+ {
+@@ -7285,7 +7285,7 @@ void __init sched_init(void)
+ 	for_each_possible_cpu(i) {
+ 		per_cpu(load_balance_mask, i) = (cpumask_var_t)kzalloc_node(
+ 			cpumask_size(), GFP_KERNEL, cpu_to_node(i));
+-		per_cpu(select_idle_mask, i) = (cpumask_var_t)kzalloc_node(
++		per_cpu(select_rq_mask, i) = (cpumask_var_t)kzalloc_node(
+ 			cpumask_size(), GFP_KERNEL, cpu_to_node(i));
+ 	}
+ #endif /* CONFIG_CPUMASK_OFFSTACK */
+* Unmerged path kernel/sched/fair.c
