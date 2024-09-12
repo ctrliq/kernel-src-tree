@@ -1,0 +1,91 @@
+tee: optee: Fix dynamic shm pool allocations
+
+jira LE-1907
+cve CVE-2021-44733
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Sumit Garg <sumit.garg@linaro.org>
+commit a249dd200d03791cab23e47571f3e13d9c72af6c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/a249dd20.failed
+
+In case of dynamic shared memory pool, kernel memory allocated using
+dmabuf_mgr pool needs to be registered with OP-TEE prior to its usage
+during optee_open_session() or optee_invoke_func().
+
+So fix dmabuf_mgr pool allocations via an additional call to
+optee_shm_register().
+
+Also, allow kernel pages to be registered as shared memory with OP-TEE.
+
+Fixes: 9733b072a12a ("optee: allow to work without static shared memory")
+	Signed-off-by: Sumit Garg <sumit.garg@linaro.org>
+	Signed-off-by: Jens Wiklander <jens.wiklander@linaro.org>
+(cherry picked from commit a249dd200d03791cab23e47571f3e13d9c72af6c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tee/optee/call.c
+diff --cc drivers/tee/optee/call.c
+index 227287091f90,cf2367ba08d6..000000000000
+--- a/drivers/tee/optee/call.c
++++ b/drivers/tee/optee/call.c
+@@@ -563,10 -554,17 +563,21 @@@ static int check_mem_type(unsigned lon
+  	struct mm_struct *mm = current->mm;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	mmap_read_lock(mm);
+++=======
++ 	/*
++ 	 * Allow kernel address to register with OP-TEE as kernel
++ 	 * pages are configured as normal memory only.
++ 	 */
++ 	if (virt_addr_valid(start))
++ 		return 0;
++ 
++ 	down_read(&mm->mmap_sem);
+++>>>>>>> a249dd200d03 (tee: optee: Fix dynamic shm pool allocations)
+  	rc = __check_mem_type(find_vma(mm, start),
+  			      start + num_pages * PAGE_SIZE);
+ -	up_read(&mm->mmap_sem);
+ +	mmap_read_unlock(mm);
+  
+  	return rc;
+  }
+* Unmerged path drivers/tee/optee/call.c
+diff --git a/drivers/tee/optee/shm_pool.c b/drivers/tee/optee/shm_pool.c
+index 49397813fff1..b7fbd7a1f981 100644
+--- a/drivers/tee/optee/shm_pool.c
++++ b/drivers/tee/optee/shm_pool.c
+@@ -26,6 +26,7 @@ static int pool_op_alloc(struct tee_shm_pool_mgr *poolm,
+ {
+ 	unsigned int order = get_order(size);
+ 	struct page *page;
++	int rc = 0;
+ 
+ 	page = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
+ 	if (!page)
+@@ -35,12 +36,21 @@ static int pool_op_alloc(struct tee_shm_pool_mgr *poolm,
+ 	shm->paddr = page_to_phys(page);
+ 	shm->size = PAGE_SIZE << order;
+ 
+-	return 0;
++	if (shm->flags & TEE_SHM_DMA_BUF) {
++		shm->flags |= TEE_SHM_REGISTER;
++		rc = optee_shm_register(shm->ctx, shm, &page, 1 << order,
++					(unsigned long)shm->kaddr);
++	}
++
++	return rc;
+ }
+ 
+ static void pool_op_free(struct tee_shm_pool_mgr *poolm,
+ 			 struct tee_shm *shm)
+ {
++	if (shm->flags & TEE_SHM_DMA_BUF)
++		optee_shm_unregister(shm->ctx, shm);
++
+ 	free_pages((unsigned long)shm->kaddr, get_order(shm->size));
+ 	shm->kaddr = NULL;
+ }
