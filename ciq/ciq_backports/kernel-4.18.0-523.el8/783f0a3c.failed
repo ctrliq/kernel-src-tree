@@ -1,0 +1,136 @@
+s390/vfio-ap: add s390dbf logging to the vfio_ap_irq_enable function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-523.el8
+commit-author Tony Krowiak <akrowiak@linux.ibm.com>
+commit 783f0a3ccd79477b159c6ef2104f9cff765215d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-523.el8/783f0a3c.failed
+
+This patch adds s390dbf logging to the function that executes the
+PQAP(AQIC) instruction on behalf of the guest to which the queue for which
+interrupts are being enabled or disabled is attached.
+
+Currently, the vfio_ap_irq_enable function sets status response code 06
+(notification indicator byte address (nib) invalid) in the status word
+when the vfio_pin_pages function - called to pin the page containing the
+nib - returns an error or a different number of pages pinned than
+requested.
+
+Setting the response code returned to userspace without also logging a
+message in the kernel makes it impossible to determine whether the response
+was due to an error detected by the vfio_ap device driver or because the
+response code was returned by the firmware in response to the PQAP(AQIC)
+instruction.
+
+In addition to logging a warning for the situation above, this patch adds
+the following:
+
+* A function to validate the nib address invoked prior to calling the
+  vfio_pin_pages function. This allows for logging a message informing
+  the reader of the reason the page containing the nib can not be pinned
+  if the nib address is not valid. Response code 06 (invalid nib address)
+  will be set in the status word returned to the guest from the
+  instruction.
+
+* Checks the return value from the kvm_s390_gisc_register and logs a
+  message informing the reader of the failure. Status response code 08
+  (invalid gisa) will be set in the status word returned to the guest from
+  the PQAP(AQIC) instruction.
+
+* Checks the status response code returned from execution of the PQAP(AQIC)
+  instruction and if it indicates an error, logs a message informing the
+  reader.
+
+	Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Acked-by: Heiko Carstens <hca@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 783f0a3ccd79477b159c6ef2104f9cff765215d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.h
+#	drivers/s390/crypto/vfio_ap_ops.c
+diff --cc drivers/s390/crypto/ap_bus.h
+index b06bf7777d5e,714c7583af5e..000000000000
+--- a/drivers/s390/crypto/ap_bus.h
++++ b/drivers/s390/crypto/ap_bus.h
+@@@ -39,32 -39,22 +39,51 @@@ static inline int ap_test_bit(unsigned 
+  	return (*ptr & (0x80000000u >> nr)) != 0;
+  }
+  
+++<<<<<<< HEAD
+ +#define AP_RESPONSE_NORMAL		     0x00
+ +#define AP_RESPONSE_Q_NOT_AVAIL		     0x01
+ +#define AP_RESPONSE_RESET_IN_PROGRESS	     0x02
+ +#define AP_RESPONSE_DECONFIGURED	     0x03
+ +#define AP_RESPONSE_CHECKSTOPPED	     0x04
+ +#define AP_RESPONSE_BUSY		     0x05
+ +#define AP_RESPONSE_INVALID_ADDRESS	     0x06
+ +#define AP_RESPONSE_OTHERWISE_CHANGED	     0x07
+ +#define AP_RESPONSE_INVALID_GISA	     0x08
+ +#define AP_RESPONSE_Q_BOUND_TO_ANOTHER	     0x09
+ +#define AP_RESPONSE_STATE_CHANGE_IN_PROGRESS 0x0A
+ +#define AP_RESPONSE_Q_NOT_BOUND		     0x0B
+ +#define AP_RESPONSE_Q_FULL		     0x10
+ +#define AP_RESPONSE_NO_PENDING_REPLY	     0x10
+ +#define AP_RESPONSE_INDEX_TOO_BIG	     0x11
+ +#define AP_RESPONSE_NO_FIRST_PART	     0x13
+ +#define AP_RESPONSE_MESSAGE_TOO_BIG	     0x15
+ +#define AP_RESPONSE_REQ_FAC_NOT_INST	     0x16
+ +#define AP_RESPONSE_Q_BIND_ERROR	     0x30
+ +#define AP_RESPONSE_Q_NOT_AVAIL_FOR_ASSOC    0x31
+ +#define AP_RESPONSE_Q_NOT_EMPTY		     0x32
+ +#define AP_RESPONSE_BIND_LIMIT_EXCEEDED	     0x33
+ +#define AP_RESPONSE_INVALID_ASSOC_SECRET     0x34
+ +#define AP_RESPONSE_ASSOC_SECRET_NOT_UNIQUE  0x35
+ +#define AP_RESPONSE_ASSOC_FAILED	     0x36
+ +#define AP_RESPONSE_INVALID_DOMAIN	     0x42
+++=======
++ #define AP_RESPONSE_NORMAL		0x00
++ #define AP_RESPONSE_Q_NOT_AVAIL		0x01
++ #define AP_RESPONSE_RESET_IN_PROGRESS	0x02
++ #define AP_RESPONSE_DECONFIGURED	0x03
++ #define AP_RESPONSE_CHECKSTOPPED	0x04
++ #define AP_RESPONSE_BUSY		0x05
++ #define AP_RESPONSE_INVALID_ADDRESS	0x06
++ #define AP_RESPONSE_OTHERWISE_CHANGED	0x07
++ #define AP_RESPONSE_INVALID_GISA	0x08
++ #define AP_RESPONSE_Q_FULL		0x10
++ #define AP_RESPONSE_NO_PENDING_REPLY	0x10
++ #define AP_RESPONSE_INDEX_TOO_BIG	0x11
++ #define AP_RESPONSE_NO_FIRST_PART	0x13
++ #define AP_RESPONSE_MESSAGE_TOO_BIG	0x15
++ #define AP_RESPONSE_REQ_FAC_NOT_INST	0x16
++ #define AP_RESPONSE_INVALID_DOMAIN	0x42
+++>>>>>>> 783f0a3ccd79 (s390/vfio-ap: add s390dbf logging to the vfio_ap_irq_enable function)
+  
+  /*
+   * Known device types
+diff --cc drivers/s390/crypto/vfio_ap_ops.c
+index b68c9fe078f1,7dc26365e29a..000000000000
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@@ -351,11 -238,13 +383,17 @@@ static int vfio_ap_validate_nib(struct 
+   */
+  static struct ap_queue_status vfio_ap_irq_enable(struct vfio_ap_queue *q,
+  						 int isc,
+- 						 unsigned long nib)
++ 						 struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	union ap_qirq_ctrl aqic_gisa = { .value = 0 };
+++=======
++ 	unsigned long nib;
++ 	struct ap_qirq_ctrl aqic_gisa = {};
+++>>>>>>> 783f0a3ccd79 (s390/vfio-ap: add s390dbf logging to the vfio_ap_irq_enable function)
+  	struct ap_queue_status status = {};
+  	struct kvm_s390_gisa *gisa;
++ 	int nisc;
+  	struct kvm *kvm;
+  	unsigned long h_nib, g_pfn, h_pfn;
+  	int ret;
+* Unmerged path drivers/s390/crypto/ap_bus.h
+* Unmerged path drivers/s390/crypto/vfio_ap_ops.c
