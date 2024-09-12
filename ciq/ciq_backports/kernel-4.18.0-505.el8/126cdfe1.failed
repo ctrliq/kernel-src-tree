@@ -1,0 +1,416 @@
+ice: xsk: Improve AF_XDP ZC Tx and use batching API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-505.el8
+commit-author Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+commit 126cdfe1007acb3632d054a4a68a0174bd47f17d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-505.el8/126cdfe1.failed
+
+Apply the logic that was done for regular XDP from commit 9610bd988df9
+("ice: optimize XDP_TX workloads") to the ZC side of the driver. On top
+of that, introduce batching to Tx that is inspired by i40e's
+implementation with adjustments to the cleaning logic - take into the
+account NAPI budget in ice_clean_xdp_irq_zc().
+
+Separating the stats structs onto separate cache lines seemed to improve
+the performance.
+
+	Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Reviewed-by: Alexander Lobakin <alexandr.lobakin@intel.com>
+Link: https://lore.kernel.org/bpf/20220125160446.78976-8-maciej.fijalkowski@intel.com
+(cherry picked from commit 126cdfe1007acb3632d054a4a68a0174bd47f17d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_xsk.h
+diff --cc drivers/net/ethernet/intel/ice/ice_xsk.h
+index b3ac44b46c90,0cbb5793b5b8..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_xsk.h
++++ b/drivers/net/ethernet/intel/ice/ice_xsk.h
+@@@ -4,7 -4,18 +4,17 @@@
+  #ifndef _ICE_XSK_H_
+  #define _ICE_XSK_H_
+  #include "ice_txrx.h"
+ -#include "ice.h"
+  
++ #define PKTS_PER_BATCH 8
++ 
++ #ifdef __clang__
++ #define loop_unrolled_for _Pragma("clang loop unroll_count(8)") for
++ #elif __GNUC__ >= 4
++ #define loop_unrolled_for _Pragma("GCC unroll 8") for
++ #else
++ #define loop_unrolled_for for
++ #endif
++ 
+  struct ice_vsi;
+  
+  #ifdef CONFIG_XDP_SOCKETS
+@@@ -17,8 -27,16 +26,20 @@@ bool ice_alloc_rx_bufs_zc(struct ice_rx
+  bool ice_xsk_any_rx_ring_ena(struct ice_vsi *vsi);
+  void ice_xsk_clean_rx_ring(struct ice_rx_ring *rx_ring);
+  void ice_xsk_clean_xdp_ring(struct ice_tx_ring *xdp_ring);
+++<<<<<<< HEAD
+ +int ice_realloc_zc_buf(struct ice_vsi *vsi, bool zc);
+++=======
++ bool ice_xmit_zc(struct ice_tx_ring *xdp_ring, u32 budget, int napi_budget);
+++>>>>>>> 126cdfe1007a (ice: xsk: Improve AF_XDP ZC Tx and use batching API)
+  #else
++ static inline bool
++ ice_xmit_zc(struct ice_tx_ring __always_unused *xdp_ring,
++ 	    u32 __always_unused budget,
++ 	    int __always_unused napi_budget)
++ {
++ 	return false;
++ }
++ 
+  static inline int
+  ice_xsk_pool_setup(struct ice_vsi __always_unused *vsi,
+  		   struct xsk_buff_pool __always_unused *pool,
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.c b/drivers/net/ethernet/intel/ice/ice_txrx.c
+index a884f9004392..4437db111041 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@ -1467,7 +1467,7 @@ int ice_napi_poll(struct napi_struct *napi, int budget)
+ 		bool wd;
+ 
+ 		if (tx_ring->xsk_pool)
+-			wd = ice_clean_tx_irq_zc(tx_ring, budget);
++			wd = ice_xmit_zc(tx_ring, ICE_DESC_UNUSED(tx_ring), budget);
+ 		else if (ice_ring_is_xdp(tx_ring))
+ 			wd = true;
+ 		else
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.h b/drivers/net/ethernet/intel/ice/ice_txrx.h
+index 63b85c59bf08..be66ce2b517d 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.h
+@@ -321,17 +321,17 @@ struct ice_tx_ring {
+ 	u16 count;			/* Number of descriptors */
+ 	u16 q_index;			/* Queue number of ring */
+ 	/* stats structs */
+-	struct ice_q_stats	stats;
+-	struct u64_stats_sync syncp;
+ 	struct ice_txq_stats tx_stats;
+-
+ 	/* CL3 - 3rd cacheline starts here */
++	struct ice_q_stats	stats;
++	struct u64_stats_sync syncp;
+ 	struct rcu_head rcu;		/* to avoid race on free */
+ 	DECLARE_BITMAP(xps_state, ICE_TX_NBITS);	/* XPS Config State */
+ 	struct ice_channel *ch;
+ 	struct ice_ptp_tx *tx_tstamps;
+ 	spinlock_t tx_lock;
+ 	u32 txq_teid;			/* Added Tx queue TEID */
++	/* CL4 - 4th cacheline starts here */
+ #define ICE_TX_FLAGS_RING_XDP		BIT(0)
+ #define ICE_TX_FLAGS_RING_VLAN_L2TAG1	BIT(1)
+ #define ICE_TX_FLAGS_RING_VLAN_L2TAG2	BIT(2)
+diff --git a/drivers/net/ethernet/intel/ice/ice_xsk.c b/drivers/net/ethernet/intel/ice/ice_xsk.c
+index 66f1901798d7..a8fbe67ebbe7 100644
+--- a/drivers/net/ethernet/intel/ice/ice_xsk.c
++++ b/drivers/net/ethernet/intel/ice/ice_xsk.c
+@@ -700,134 +700,212 @@ int ice_clean_rx_irq_zc(struct ice_rx_ring *rx_ring, int budget)
+ }
+ 
+ /**
+- * ice_xmit_zc - Completes AF_XDP entries, and cleans XDP entries
++ * ice_clean_xdp_tx_buf - Free and unmap XDP Tx buffer
+  * @xdp_ring: XDP Tx ring
+- * @budget: max number of frames to xmit
++ * @tx_buf: Tx buffer to clean
++ */
++static void
++ice_clean_xdp_tx_buf(struct ice_tx_ring *xdp_ring, struct ice_tx_buf *tx_buf)
++{
++	xdp_return_frame((struct xdp_frame *)tx_buf->raw_buf);
++	dma_unmap_single(xdp_ring->dev, dma_unmap_addr(tx_buf, dma),
++			 dma_unmap_len(tx_buf, len), DMA_TO_DEVICE);
++	dma_unmap_len_set(tx_buf, len, 0);
++}
++
++/**
++ * ice_clean_xdp_irq_zc - Reclaim resources after transmit completes on XDP ring
++ * @xdp_ring: XDP ring to clean
++ * @napi_budget: amount of descriptors that NAPI allows us to clean
+  *
+- * Returns true if cleanup/transmission is done.
++ * Returns count of cleaned descriptors
+  */
+-static bool ice_xmit_zc(struct ice_tx_ring *xdp_ring, int budget)
++static u16 ice_clean_xdp_irq_zc(struct ice_tx_ring *xdp_ring, int napi_budget)
+ {
+-	struct ice_tx_desc *tx_desc = NULL;
+-	bool work_done = true;
+-	struct xdp_desc desc;
+-	dma_addr_t dma;
++	u16 tx_thresh = ICE_RING_QUARTER(xdp_ring);
++	int budget = napi_budget / tx_thresh;
++	u16 ntc = xdp_ring->next_to_clean;
++	u16 next_dd = xdp_ring->next_dd;
++	u16 cleared_dds = 0;
+ 
+-	while (likely(budget-- > 0)) {
++	do {
++		struct ice_tx_desc *next_dd_desc;
++		u16 desc_cnt = xdp_ring->count;
+ 		struct ice_tx_buf *tx_buf;
++		u32 xsk_frames;
++		u16 i;
+ 
+-		if (unlikely(!ICE_DESC_UNUSED(xdp_ring))) {
+-			xdp_ring->tx_stats.tx_busy++;
+-			work_done = false;
++		next_dd_desc = ICE_TX_DESC(xdp_ring, next_dd);
++		if (!(next_dd_desc->cmd_type_offset_bsz &
++		    cpu_to_le64(ICE_TX_DESC_DTYPE_DESC_DONE)))
+ 			break;
++
++		cleared_dds++;
++		xsk_frames = 0;
++
++		for (i = 0; i < tx_thresh; i++) {
++			tx_buf = &xdp_ring->tx_buf[ntc];
++
++			if (tx_buf->raw_buf) {
++				ice_clean_xdp_tx_buf(xdp_ring, tx_buf);
++				tx_buf->raw_buf = NULL;
++			} else {
++				xsk_frames++;
++			}
++
++			ntc++;
++			if (ntc >= xdp_ring->count)
++				ntc = 0;
+ 		}
++		if (xsk_frames)
++			xsk_tx_completed(xdp_ring->xsk_pool, xsk_frames);
++		next_dd_desc->cmd_type_offset_bsz = 0;
++		next_dd = next_dd + tx_thresh;
++		if (next_dd >= desc_cnt)
++			next_dd = tx_thresh - 1;
++	} while (budget--);
+ 
+-		tx_buf = &xdp_ring->tx_buf[xdp_ring->next_to_use];
++	xdp_ring->next_to_clean = ntc;
++	xdp_ring->next_dd = next_dd;
+ 
+-		if (!xsk_tx_peek_desc(xdp_ring->xsk_pool, &desc))
+-			break;
++	return cleared_dds * tx_thresh;
++}
++
++/**
++ * ice_xmit_pkt - produce a single HW Tx descriptor out of AF_XDP descriptor
++ * @xdp_ring: XDP ring to produce the HW Tx descriptor on
++ * @desc: AF_XDP descriptor to pull the DMA address and length from
++ * @total_bytes: bytes accumulator that will be used for stats update
++ */
++static void ice_xmit_pkt(struct ice_tx_ring *xdp_ring, struct xdp_desc *desc,
++			 unsigned int *total_bytes)
++{
++	struct ice_tx_desc *tx_desc;
++	dma_addr_t dma;
++
++	dma = xsk_buff_raw_get_dma(xdp_ring->xsk_pool, desc->addr);
++	xsk_buff_raw_dma_sync_for_device(xdp_ring->xsk_pool, dma, desc->len);
++
++	tx_desc = ICE_TX_DESC(xdp_ring, xdp_ring->next_to_use++);
++	tx_desc->buf_addr = cpu_to_le64(dma);
++	tx_desc->cmd_type_offset_bsz = ice_build_ctob(ICE_TX_DESC_CMD_EOP,
++						      0, desc->len, 0);
++
++	*total_bytes += desc->len;
++}
++
++/**
++ * ice_xmit_pkt_batch - produce a batch of HW Tx descriptors out of AF_XDP descriptors
++ * @xdp_ring: XDP ring to produce the HW Tx descriptors on
++ * @descs: AF_XDP descriptors to pull the DMA addresses and lengths from
++ * @total_bytes: bytes accumulator that will be used for stats update
++ */
++static void ice_xmit_pkt_batch(struct ice_tx_ring *xdp_ring, struct xdp_desc *descs,
++			       unsigned int *total_bytes)
++{
++	u16 tx_thresh = ICE_RING_QUARTER(xdp_ring);
++	u16 ntu = xdp_ring->next_to_use;
++	struct ice_tx_desc *tx_desc;
++	u32 i;
+ 
+-		dma = xsk_buff_raw_get_dma(xdp_ring->xsk_pool, desc.addr);
+-		xsk_buff_raw_dma_sync_for_device(xdp_ring->xsk_pool, dma,
+-						 desc.len);
++	loop_unrolled_for(i = 0; i < PKTS_PER_BATCH; i++) {
++		dma_addr_t dma;
+ 
+-		tx_buf->bytecount = desc.len;
++		dma = xsk_buff_raw_get_dma(xdp_ring->xsk_pool, descs[i].addr);
++		xsk_buff_raw_dma_sync_for_device(xdp_ring->xsk_pool, dma, descs[i].len);
+ 
+-		tx_desc = ICE_TX_DESC(xdp_ring, xdp_ring->next_to_use);
++		tx_desc = ICE_TX_DESC(xdp_ring, ntu++);
+ 		tx_desc->buf_addr = cpu_to_le64(dma);
+-		tx_desc->cmd_type_offset_bsz =
+-			ice_build_ctob(ICE_TXD_LAST_DESC_CMD, 0, desc.len, 0);
++		tx_desc->cmd_type_offset_bsz = ice_build_ctob(ICE_TX_DESC_CMD_EOP,
++							      0, descs[i].len, 0);
+ 
+-		xdp_ring->next_to_use++;
+-		if (xdp_ring->next_to_use == xdp_ring->count)
+-			xdp_ring->next_to_use = 0;
++		*total_bytes += descs[i].len;
+ 	}
+ 
+-	if (tx_desc) {
+-		ice_xdp_ring_update_tail(xdp_ring);
+-		xsk_tx_release(xdp_ring->xsk_pool);
+-	}
++	xdp_ring->next_to_use = ntu;
+ 
+-	return budget > 0 && work_done;
++	if (xdp_ring->next_to_use > xdp_ring->next_rs) {
++		tx_desc = ICE_TX_DESC(xdp_ring, xdp_ring->next_rs);
++		tx_desc->cmd_type_offset_bsz |=
++			cpu_to_le64(ICE_TX_DESC_CMD_RS << ICE_TXD_QW1_CMD_S);
++		xdp_ring->next_rs += tx_thresh;
++	}
+ }
+ 
+ /**
+- * ice_clean_xdp_tx_buf - Free and unmap XDP Tx buffer
+- * @xdp_ring: XDP Tx ring
+- * @tx_buf: Tx buffer to clean
++ * ice_fill_tx_hw_ring - produce the number of Tx descriptors onto ring
++ * @xdp_ring: XDP ring to produce the HW Tx descriptors on
++ * @descs: AF_XDP descriptors to pull the DMA addresses and lengths from
++ * @nb_pkts: count of packets to be send
++ * @total_bytes: bytes accumulator that will be used for stats update
+  */
+-static void
+-ice_clean_xdp_tx_buf(struct ice_tx_ring *xdp_ring, struct ice_tx_buf *tx_buf)
++static void ice_fill_tx_hw_ring(struct ice_tx_ring *xdp_ring, struct xdp_desc *descs,
++				u32 nb_pkts, unsigned int *total_bytes)
+ {
+-	xdp_return_frame((struct xdp_frame *)tx_buf->raw_buf);
+-	dma_unmap_single(xdp_ring->dev, dma_unmap_addr(tx_buf, dma),
+-			 dma_unmap_len(tx_buf, len), DMA_TO_DEVICE);
+-	dma_unmap_len_set(tx_buf, len, 0);
++	u16 tx_thresh = ICE_RING_QUARTER(xdp_ring);
++	u32 batched, leftover, i;
++
++	batched = ALIGN_DOWN(nb_pkts, PKTS_PER_BATCH);
++	leftover = nb_pkts & (PKTS_PER_BATCH - 1);
++	for (i = 0; i < batched; i += PKTS_PER_BATCH)
++		ice_xmit_pkt_batch(xdp_ring, &descs[i], total_bytes);
++	for (; i < batched + leftover; i++)
++		ice_xmit_pkt(xdp_ring, &descs[i], total_bytes);
++
++	if (xdp_ring->next_to_use > xdp_ring->next_rs) {
++		struct ice_tx_desc *tx_desc;
++
++		tx_desc = ICE_TX_DESC(xdp_ring, xdp_ring->next_rs);
++		tx_desc->cmd_type_offset_bsz |=
++			cpu_to_le64(ICE_TX_DESC_CMD_RS << ICE_TXD_QW1_CMD_S);
++		xdp_ring->next_rs += tx_thresh;
++	}
+ }
+ 
+ /**
+- * ice_clean_tx_irq_zc - Completes AF_XDP entries, and cleans XDP entries
+- * @xdp_ring: XDP Tx ring
+- * @budget: NAPI budget
++ * ice_xmit_zc - take entries from XSK Tx ring and place them onto HW Tx ring
++ * @xdp_ring: XDP ring to produce the HW Tx descriptors on
++ * @budget: number of free descriptors on HW Tx ring that can be used
++ * @napi_budget: amount of descriptors that NAPI allows us to clean
+  *
+- * Returns true if cleanup/tranmission is done.
++ * Returns true if there is no more work that needs to be done, false otherwise
+  */
+-bool ice_clean_tx_irq_zc(struct ice_tx_ring *xdp_ring, int budget)
++bool ice_xmit_zc(struct ice_tx_ring *xdp_ring, u32 budget, int napi_budget)
+ {
+-	int total_packets = 0, total_bytes = 0;
+-	s16 ntc = xdp_ring->next_to_clean;
+-	struct ice_tx_desc *tx_desc;
+-	struct ice_tx_buf *tx_buf;
+-	u32 xsk_frames = 0;
+-	bool xmit_done;
++	struct xdp_desc *descs = xdp_ring->xsk_pool->tx_descs;
++	u16 tx_thresh = ICE_RING_QUARTER(xdp_ring);
++	u32 nb_pkts, nb_processed = 0;
++	unsigned int total_bytes = 0;
+ 
+-	tx_desc = ICE_TX_DESC(xdp_ring, ntc);
+-	tx_buf = &xdp_ring->tx_buf[ntc];
+-	ntc -= xdp_ring->count;
++	if (budget < tx_thresh)
++		budget += ice_clean_xdp_irq_zc(xdp_ring, napi_budget);
+ 
+-	do {
+-		if (!(tx_desc->cmd_type_offset_bsz &
+-		      cpu_to_le64(ICE_TX_DESC_DTYPE_DESC_DONE)))
+-			break;
+-
+-		total_bytes += tx_buf->bytecount;
+-		total_packets++;
+-
+-		if (tx_buf->raw_buf) {
+-			ice_clean_xdp_tx_buf(xdp_ring, tx_buf);
+-			tx_buf->raw_buf = NULL;
+-		} else {
+-			xsk_frames++;
+-		}
+-
+-		tx_desc->cmd_type_offset_bsz = 0;
+-		tx_buf++;
+-		tx_desc++;
+-		ntc++;
+-
+-		if (unlikely(!ntc)) {
+-			ntc -= xdp_ring->count;
+-			tx_buf = xdp_ring->tx_buf;
+-			tx_desc = ICE_TX_DESC(xdp_ring, 0);
+-		}
++	nb_pkts = xsk_tx_peek_release_desc_batch(xdp_ring->xsk_pool, budget);
++	if (!nb_pkts)
++		return true;
+ 
+-		prefetch(tx_desc);
++	if (xdp_ring->next_to_use + nb_pkts >= xdp_ring->count) {
++		struct ice_tx_desc *tx_desc;
+ 
+-	} while (likely(--budget));
++		nb_processed = xdp_ring->count - xdp_ring->next_to_use;
++		ice_fill_tx_hw_ring(xdp_ring, descs, nb_processed, &total_bytes);
++		tx_desc = ICE_TX_DESC(xdp_ring, xdp_ring->next_rs);
++		tx_desc->cmd_type_offset_bsz |=
++			cpu_to_le64(ICE_TX_DESC_CMD_RS << ICE_TXD_QW1_CMD_S);
++		xdp_ring->next_rs = tx_thresh - 1;
++		xdp_ring->next_to_use = 0;
++	}
+ 
+-	ntc += xdp_ring->count;
+-	xdp_ring->next_to_clean = ntc;
++	ice_fill_tx_hw_ring(xdp_ring, &descs[nb_processed], nb_pkts - nb_processed,
++			    &total_bytes);
+ 
+-	if (xsk_frames)
+-		xsk_tx_completed(xdp_ring->xsk_pool, xsk_frames);
++	ice_xdp_ring_update_tail(xdp_ring);
++	ice_update_tx_ring_stats(xdp_ring, nb_pkts, total_bytes);
+ 
+ 	if (xsk_uses_need_wakeup(xdp_ring->xsk_pool))
+ 		xsk_set_tx_need_wakeup(xdp_ring->xsk_pool);
+ 
+-	ice_update_tx_ring_stats(xdp_ring, total_packets, total_bytes);
+-	xmit_done = ice_xmit_zc(xdp_ring, ICE_DFLT_IRQ_WORK);
+-
+-	return budget > 0 && xmit_done;
++	return nb_pkts < budget;
+ }
+ 
+ /**
+* Unmerged path drivers/net/ethernet/intel/ice/ice_xsk.h
