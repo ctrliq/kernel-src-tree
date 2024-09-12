@@ -1,0 +1,519 @@
+wifi: mac80211: move ps setting to vif config
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit a3b8008dc1421a6f1d0d92cfc1352d729f6756c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/a3b8008d.failed
+
+This really shouldn't be in a per-link config, we don't want
+to let anyone control it that way (if anything, link powersave
+could be forced through APIs to activate/deactivate a link),
+and we don't support powersave in software with devices that
+can do MLO.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit a3b8008dc1421a6f1d0d92cfc1352d729f6756c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/ath/wcn36xx/main.c
+#	drivers/net/wireless/silabs/wfx/sta.c
+#	include/net/mac80211.h
+#	net/mac80211/main.c
+#	net/mac80211/mlme.c
+#	net/mac80211/trace.h
+diff --cc drivers/net/wireless/ath/wcn36xx/main.c
+index 86140fa9320f,dc59cafd29e3..000000000000
+--- a/drivers/net/wireless/ath/wcn36xx/main.c
++++ b/drivers/net/wireless/ath/wcn36xx/main.c
+@@@ -374,8 -375,63 +374,66 @@@ static void wcn36xx_stop(struct ieee802
+  
+  	wcn36xx_dxe_free_mem_pools(wcn);
+  	wcn36xx_dxe_free_ctl_blks(wcn);
+ -}
+  
+++<<<<<<< HEAD
+ +	kfree(wcn->hal_buf);
+++=======
++ static void wcn36xx_change_ps(struct wcn36xx *wcn, bool enable)
++ {
++ 	struct ieee80211_vif *vif = NULL;
++ 	struct wcn36xx_vif *tmp;
++ 
++ 	list_for_each_entry(tmp, &wcn->vif_list, list) {
++ 		vif = wcn36xx_priv_to_vif(tmp);
++ 		if (enable && !wcn->sw_scan) {
++ 			if (vif->cfg.ps) /* ps allowed ? */
++ 				wcn36xx_pmc_enter_bmps_state(wcn, vif);
++ 		} else {
++ 			wcn36xx_pmc_exit_bmps_state(wcn, vif);
++ 		}
++ 	}
++ }
++ 
++ static void wcn36xx_change_opchannel(struct wcn36xx *wcn, int ch)
++ {
++ 	struct ieee80211_vif *vif = NULL;
++ 	struct wcn36xx_vif *tmp;
++ 	struct ieee80211_supported_band *band;
++ 	struct ieee80211_channel *channel = NULL;
++ 	unsigned long flags;
++ 	int i, j;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(wcn->hw->wiphy->bands); i++) {
++ 		band = wcn->hw->wiphy->bands[i];
++ 		if (!band)
++ 			break;
++ 		for (j = 0; j < band->n_channels; j++) {
++ 			if (HW_VALUE_CHANNEL(band->channels[j].hw_value) == ch) {
++ 				channel = &band->channels[j];
++ 				break;
++ 			}
++ 		}
++ 		if (channel)
++ 			break;
++ 	}
++ 
++ 	if (!channel) {
++ 		wcn36xx_err("Cannot tune to channel %d\n", ch);
++ 		return;
++ 	}
++ 
++ 	spin_lock_irqsave(&wcn->survey_lock, flags);
++ 	wcn->band = band;
++ 	wcn->channel = channel;
++ 	spin_unlock_irqrestore(&wcn->survey_lock, flags);
++ 
++ 	list_for_each_entry(tmp, &wcn->vif_list, list) {
++ 		vif = wcn36xx_priv_to_vif(tmp);
++ 		wcn36xx_smd_switch_channel(wcn, vif, ch);
++ 	}
++ 
++ 	return;
+++>>>>>>> a3b8008dc142 (wifi: mac80211: move ps setting to vif config)
+  }
+  
+  static int wcn36xx_config(struct ieee80211_hw *hw, u32 changed)
+diff --cc include/net/mac80211.h
+index f38672457468,fba06d7bc7eb..000000000000
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@@ -576,21 -577,7 +576,24 @@@ struct ieee80211_fils_discovery 
+   *	threshold event and can't be enabled simultaneously with it.
+   * @cqm_rssi_high: Connection quality monitor RSSI upper threshold.
+   * @cqm_rssi_hyst: Connection quality monitor RSSI hysteresis
+ + * @arp_addr_list: List of IPv4 addresses for hardware ARP filtering. The
+ + *	may filter ARP queries targeted for other addresses than listed here.
+ + *	The driver must allow ARP queries targeted for all address listed here
+ + *	to pass through. An empty list implies no ARP queries need to pass.
+ + * @arp_addr_cnt: Number of addresses currently on the list. Note that this
+ + *	may be larger than %IEEE80211_BSS_ARP_ADDR_LIST_LEN (the arp_addr_list
+ + *	array size), it's up to the driver what to do in that case.
+   * @qos: This is a QoS-enabled BSS.
+++<<<<<<< HEAD
+ + * @idle: This interface is idle. There's also a global idle flag in the
+ + *	hardware config which may be more appropriate depending on what
+ + *	your driver/device needs to do.
+ + * @ps: power-save mode (STA only). This flag is NOT affected by
+ + *	offchannel/dynamic_ps operations.
+ + * @ssid: The SSID of the current vif. Valid in AP and IBSS mode.
+ + * @ssid_len: Length of SSID given in @ssid.
+++=======
+++>>>>>>> a3b8008dc142 (wifi: mac80211: move ps setting to vif config)
+   * @hidden_ssid: The SSID of the current vif is hidden. Only valid in AP-mode.
+   * @txpower: TX power in dBm.  INT_MIN means not configured.
+   * @txpower_type: TX power adjustment used to control per packet Transmit
+@@@ -686,13 -670,7 +689,16 @@@ struct ieee80211_bss_conf 
+  	s32 cqm_rssi_high;
+  	struct cfg80211_chan_def chandef;
+  	struct ieee80211_mu_group_data mu_group;
+ +	__be32 arp_addr_list[IEEE80211_BSS_ARP_ADDR_LIST_LEN];
+ +	int arp_addr_cnt;
+  	bool qos;
+++<<<<<<< HEAD
+ +	bool idle;
+ +	bool ps;
+ +	u8 ssid[IEEE80211_MAX_SSID_LEN];
+ +	size_t ssid_len;
+++=======
+++>>>>>>> a3b8008dc142 (wifi: mac80211: move ps setting to vif config)
+  	bool hidden_ssid;
+  	int txpower;
+  	enum nl80211_tx_power_setting txpower_type;
+@@@ -1710,6 -1708,43 +1716,46 @@@ enum ieee80211_offload_flags 
+  };
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * struct ieee80211_vif_cfg - interface configuration
++  * @assoc: association status
++  * @ibss_joined: indicates whether this station is part of an IBSS or not
++  * @ibss_creator: indicates if a new IBSS network is being created
++  * @ps: power-save mode (STA only). This flag is NOT affected by
++  *	offchannel/dynamic_ps operations.
++  * @aid: association ID number, valid only when @assoc is true
++  * @arp_addr_list: List of IPv4 addresses for hardware ARP filtering. The
++  *	may filter ARP queries targeted for other addresses than listed here.
++  *	The driver must allow ARP queries targeted for all address listed here
++  *	to pass through. An empty list implies no ARP queries need to pass.
++  * @arp_addr_cnt: Number of addresses currently on the list. Note that this
++  *	may be larger than %IEEE80211_BSS_ARP_ADDR_LIST_LEN (the arp_addr_list
++  *	array size), it's up to the driver what to do in that case.
++  * @ssid: The SSID of the current vif. Valid in AP and IBSS mode.
++  * @ssid_len: Length of SSID given in @ssid.
++  * @s1g: BSS is S1G BSS (affects Association Request format).
++  * @idle: This interface is idle. There's also a global idle flag in the
++  *	hardware config which may be more appropriate depending on what
++  *	your driver/device needs to do.
++  */
++ struct ieee80211_vif_cfg {
++ 	/* association related data */
++ 	bool assoc, ibss_joined;
++ 	bool ibss_creator;
++ 	bool ps;
++ 	u16 aid;
++ 
++ 	__be32 arp_addr_list[IEEE80211_BSS_ARP_ADDR_LIST_LEN];
++ 	int arp_addr_cnt;
++ 	u8 ssid[IEEE80211_MAX_SSID_LEN];
++ 	size_t ssid_len;
++ 	bool s1g;
++ 	bool idle;
++ };
++ 
++ /**
+++>>>>>>> a3b8008dc142 (wifi: mac80211: move ps setting to vif config)
+   * struct ieee80211_vif - per-interface data
+   *
+   * Data in this structure is continually present for driver
+diff --cc net/mac80211/main.c
+index ae06e4025b16,1258e506377e..000000000000
+--- a/net/mac80211/main.c
++++ b/net/mac80211/main.c
+@@@ -200,8 -200,15 +200,18 @@@ int ieee80211_hw_config(struct ieee8021
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define BSS_CHANGED_VIF_CFG_FLAGS (BSS_CHANGED_ASSOC |\
++ 				   BSS_CHANGED_IDLE |\
++ 				   BSS_CHANGED_PS |\
++ 				   BSS_CHANGED_IBSS |\
++ 				   BSS_CHANGED_ARP_FILTER |\
++ 				   BSS_CHANGED_SSID)
++ 
+++>>>>>>> a3b8008dc142 (wifi: mac80211: move ps setting to vif config)
+  void ieee80211_bss_info_change_notify(struct ieee80211_sub_if_data *sdata,
+ -				      u64 changed)
+ +				      u32 changed)
+  {
+  	struct ieee80211_local *local = sdata->local;
+  
+diff --cc net/mac80211/mlme.c
+index 6cd411ed25d6,f8be05804e59..000000000000
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@@ -1868,9 -1869,9 +1868,15 @@@ void ieee80211_recalc_ps_vif(struct iee
+  {
+  	bool ps_allowed = ieee80211_powersave_allowed(sdata);
+  
+++<<<<<<< HEAD
+ +	if (sdata->vif.bss_conf.ps != ps_allowed) {
+ +		sdata->vif.bss_conf.ps = ps_allowed;
+ +		ieee80211_bss_info_change_notify(sdata, BSS_CHANGED_PS);
+++=======
++ 	if (sdata->vif.cfg.ps != ps_allowed) {
++ 		sdata->vif.cfg.ps = ps_allowed;
++ 		ieee80211_vif_cfg_change_notify(sdata, BSS_CHANGED_PS);
+++>>>>>>> a3b8008dc142 (wifi: mac80211: move ps setting to vif config)
+  	}
+  }
+  
+diff --cc net/mac80211/trace.h
+index 17e7760d8348,751f08b47d0c..000000000000
+--- a/net/mac80211/trace.h
++++ b/net/mac80211/trace.h
+@@@ -406,6 -405,59 +406,62 @@@ TRACE_EVENT(drv_bss_info_changed
+  		__field(bool, ibss_joined)
+  		__field(bool, ibss_creator)
+  		__field(u16, aid)
+++<<<<<<< HEAD
+++=======
++ 		__dynamic_array(u32, arp_addr_list,
++ 				sdata->vif.cfg.arp_addr_cnt > IEEE80211_BSS_ARP_ADDR_LIST_LEN ?
++ 					IEEE80211_BSS_ARP_ADDR_LIST_LEN :
++ 					sdata->vif.cfg.arp_addr_cnt)
++ 		__field(int, arp_addr_cnt)
++ 		__dynamic_array(u8, ssid, sdata->vif.cfg.ssid_len)
++ 		__field(int, s1g)
++ 		__field(bool, idle)
++ 		__field(bool, ps)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		LOCAL_ASSIGN;
++ 		VIF_ASSIGN;
++ 		__entry->changed = changed;
++ 		__entry->aid = sdata->vif.cfg.aid;
++ 		__entry->assoc = sdata->vif.cfg.assoc;
++ 		__entry->ibss_joined = sdata->vif.cfg.ibss_joined;
++ 		__entry->ibss_creator = sdata->vif.cfg.ibss_creator;
++ 		__entry->ps = sdata->vif.cfg.ps;
++ 
++ 		__entry->arp_addr_cnt = sdata->vif.cfg.arp_addr_cnt;
++ 		memcpy(__get_dynamic_array(arp_addr_list),
++ 		       sdata->vif.cfg.arp_addr_list,
++ 		       sizeof(u32) * (sdata->vif.cfg.arp_addr_cnt > IEEE80211_BSS_ARP_ADDR_LIST_LEN ?
++ 					IEEE80211_BSS_ARP_ADDR_LIST_LEN :
++ 					sdata->vif.cfg.arp_addr_cnt));
++ 		memcpy(__get_dynamic_array(ssid),
++ 		       sdata->vif.cfg.ssid,
++ 		       sdata->vif.cfg.ssid_len);
++ 		__entry->s1g = sdata->vif.cfg.s1g;
++ 		__entry->idle = sdata->vif.cfg.idle;
++ 	),
++ 
++ 	TP_printk(
++ 		LOCAL_PR_FMT  VIF_PR_FMT " changed:%#llx",
++ 		LOCAL_PR_ARG, VIF_PR_ARG, __entry->changed
++ 	)
++ );
++ 
++ TRACE_EVENT(drv_link_info_changed,
++ 	TP_PROTO(struct ieee80211_local *local,
++ 		 struct ieee80211_sub_if_data *sdata,
++ 		 struct ieee80211_bss_conf *link_conf,
++ 		 int link_id, u64 changed),
++ 
++ 	TP_ARGS(local, sdata, link_conf, link_id, changed),
++ 
++ 	TP_STRUCT__entry(
++ 		LOCAL_ENTRY
++ 		VIF_ENTRY
++ 		__field(u64, changed)
++ 		__field(int, link_id)
+++>>>>>>> a3b8008dc142 (wifi: mac80211: move ps setting to vif config)
+  		__field(bool, cts)
+  		__field(bool, shortpre)
+  		__field(bool, shortslot)
+@@@ -419,21 -471,13 +475,31 @@@
+  		__field(u32, basic_rates)
+  		__array(int, mcast_rate, NUM_NL80211_BANDS)
+  		__field(u16, ht_operation_mode)
+++<<<<<<< HEAD
+ +		__field(s32, cqm_rssi_thold);
+ +		__field(s32, cqm_rssi_hyst);
+ +		__field(u32, channel_width);
+ +		__field(u32, channel_cfreq1);
+ +		__field(u32, channel_cfreq1_offset);
+ +		__dynamic_array(u32, arp_addr_list,
+ +				info->arp_addr_cnt > IEEE80211_BSS_ARP_ADDR_LIST_LEN ?
+ +					IEEE80211_BSS_ARP_ADDR_LIST_LEN :
+ +					info->arp_addr_cnt);
+ +		__field(int, arp_addr_cnt);
+ +		__field(bool, qos);
+ +		__field(bool, idle);
+ +		__field(bool, ps);
+ +		__dynamic_array(u8, ssid, info->ssid_len);
+ +		__field(bool, hidden_ssid);
+++=======
++ 		__field(s32, cqm_rssi_thold)
++ 		__field(s32, cqm_rssi_hyst)
++ 		__field(u32, channel_width)
++ 		__field(u32, channel_cfreq1)
++ 		__field(u32, channel_cfreq1_offset)
++ 		__field(bool, qos)
++ 		__field(bool, hidden_ssid)
+++>>>>>>> a3b8008dc142 (wifi: mac80211: move ps setting to vif config)
+  		__field(int, txpower)
+  		__field(u8, p2p_oppps_ctwindow)
+  	),
+@@@ -442,41 -486,30 +508,54 @@@
+  		LOCAL_ASSIGN;
+  		VIF_ASSIGN;
+  		__entry->changed = changed;
+ -		__entry->link_id = link_id;
+ -		__entry->shortpre = link_conf->use_short_preamble;
+ -		__entry->cts = link_conf->use_cts_prot;
+ -		__entry->shortslot = link_conf->use_short_slot;
+ -		__entry->enable_beacon = link_conf->enable_beacon;
+ -		__entry->dtimper = link_conf->dtim_period;
+ -		__entry->bcnint = link_conf->beacon_int;
+ -		__entry->assoc_cap = link_conf->assoc_capability;
+ -		__entry->sync_tsf = link_conf->sync_tsf;
+ -		__entry->sync_device_ts = link_conf->sync_device_ts;
+ -		__entry->sync_dtim_count = link_conf->sync_dtim_count;
+ -		__entry->basic_rates = link_conf->basic_rates;
+ -		memcpy(__entry->mcast_rate, link_conf->mcast_rate,
+ +		__entry->aid = info->aid;
+ +		__entry->assoc = info->assoc;
+ +		__entry->ibss_joined = info->ibss_joined;
+ +		__entry->ibss_creator = info->ibss_creator;
+ +		__entry->shortpre = info->use_short_preamble;
+ +		__entry->cts = info->use_cts_prot;
+ +		__entry->shortslot = info->use_short_slot;
+ +		__entry->enable_beacon = info->enable_beacon;
+ +		__entry->dtimper = info->dtim_period;
+ +		__entry->bcnint = info->beacon_int;
+ +		__entry->assoc_cap = info->assoc_capability;
+ +		__entry->sync_tsf = info->sync_tsf;
+ +		__entry->sync_device_ts = info->sync_device_ts;
+ +		__entry->sync_dtim_count = info->sync_dtim_count;
+ +		__entry->basic_rates = info->basic_rates;
+ +		memcpy(__entry->mcast_rate, info->mcast_rate,
+  		       sizeof(__entry->mcast_rate));
+++<<<<<<< HEAD
+ +		__entry->ht_operation_mode = info->ht_operation_mode;
+ +		__entry->cqm_rssi_thold = info->cqm_rssi_thold;
+ +		__entry->cqm_rssi_hyst = info->cqm_rssi_hyst;
+ +		__entry->channel_width = info->chandef.width;
+ +		__entry->channel_cfreq1 = info->chandef.center_freq1;
+ +		__entry->channel_cfreq1_offset = info->chandef.freq1_offset;
+ +		__entry->arp_addr_cnt = info->arp_addr_cnt;
+ +		memcpy(__get_dynamic_array(arp_addr_list), info->arp_addr_list,
+ +		       sizeof(u32) * (info->arp_addr_cnt > IEEE80211_BSS_ARP_ADDR_LIST_LEN ?
+ +					IEEE80211_BSS_ARP_ADDR_LIST_LEN :
+ +					info->arp_addr_cnt));
+ +		__entry->qos = info->qos;
+ +		__entry->idle = info->idle;
+ +		__entry->ps = info->ps;
+ +		memcpy(__get_dynamic_array(ssid), info->ssid, info->ssid_len);
+ +		__entry->hidden_ssid = info->hidden_ssid;
+ +		__entry->txpower = info->txpower;
+ +		__entry->p2p_oppps_ctwindow = info->p2p_noa_attr.oppps_ctwindow;
+++=======
++ 		__entry->ht_operation_mode = link_conf->ht_operation_mode;
++ 		__entry->cqm_rssi_thold = link_conf->cqm_rssi_thold;
++ 		__entry->cqm_rssi_hyst = link_conf->cqm_rssi_hyst;
++ 		__entry->channel_width = link_conf->chandef.width;
++ 		__entry->channel_cfreq1 = link_conf->chandef.center_freq1;
++ 		__entry->channel_cfreq1_offset = link_conf->chandef.freq1_offset;
++ 		__entry->qos = link_conf->qos;
++ 		__entry->hidden_ssid = link_conf->hidden_ssid;
++ 		__entry->txpower = link_conf->txpower;
++ 		__entry->p2p_oppps_ctwindow = link_conf->p2p_noa_attr.oppps_ctwindow;
+++>>>>>>> a3b8008dc142 (wifi: mac80211: move ps setting to vif config)
+  	),
+  
+  	TP_printk(
+* Unmerged path drivers/net/wireless/silabs/wfx/sta.c
+diff --git a/drivers/net/wireless/ath/ath10k/mac.c b/drivers/net/wireless/ath/ath10k/mac.c
+index f0f1ea0cb75e..9625818fc429 100644
+--- a/drivers/net/wireless/ath/ath10k/mac.c
++++ b/drivers/net/wireless/ath/ath10k/mac.c
+@@ -6248,7 +6248,7 @@ static void ath10k_bss_info_changed(struct ieee80211_hw *hw,
+ 	}
+ 
+ 	if (changed & BSS_CHANGED_PS) {
+-		arvif->ps = vif->bss_conf.ps;
++		arvif->ps = vif->cfg.ps;
+ 
+ 		ret = ath10k_config_ps(ar);
+ 		if (ret)
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 5ba7709f4e71..04fc1d0de3f6 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -3288,7 +3288,7 @@ static void ath11k_mac_op_bss_info_changed(struct ieee80211_hw *hw,
+ 
+ 	if (changed & BSS_CHANGED_PS &&
+ 	    ar->ab->hw_params.supports_sta_ps) {
+-		arvif->ps = vif->bss_conf.ps;
++		arvif->ps = vif->cfg.ps;
+ 
+ 		ret = ath11k_mac_config_ps(ar);
+ 		if (ret)
+* Unmerged path drivers/net/wireless/ath/wcn36xx/main.c
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/power.c b/drivers/net/wireless/intel/iwlwifi/mvm/power.c
+index afdf3bb523e9..c1d3433f3f98 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/power.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/power.c
+@@ -359,7 +359,7 @@ static void iwl_mvm_power_build_cmd(struct iwl_mvm *mvm,
+ 
+ 	cmd->flags |= cpu_to_le16(POWER_FLAGS_POWER_SAVE_ENA_MSK);
+ 
+-	if (!vif->bss_conf.ps || !mvmvif->pm_enabled)
++	if (!vif->cfg.ps || !mvmvif->pm_enabled)
+ 		return;
+ 
+ 	if (iwl_mvm_vif_low_latency(mvmvif) && vif->p2p &&
+@@ -890,7 +890,7 @@ static int iwl_mvm_power_set_ba(struct iwl_mvm *mvm,
+ 
+ 	mvmvif->bf_data.ba_enabled = !(!mvmvif->pm_enabled ||
+ 				       mvm->ps_disabled ||
+-				       !vif->bss_conf.ps ||
++				       !vif->cfg.ps ||
+ 				       iwl_mvm_vif_low_latency(mvmvif));
+ 
+ 	return _iwl_mvm_enable_beacon_filter(mvm, vif, &cmd, 0);
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/rs.c b/drivers/net/wireless/intel/iwlwifi/mvm/rs.c
+index 4fb267245d96..aadce9f773b2 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/rs.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/rs.c
+@@ -1861,7 +1861,7 @@ static bool rs_tpc_allowed(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
+ 	int index = rate->index;
+ 	bool cam = (iwlmvm_mod_params.power_scheme == IWL_POWER_SCHEME_CAM);
+ 	bool sta_ps_disabled = (vif->type == NL80211_IFTYPE_STATION &&
+-				!vif->bss_conf.ps);
++				!vif->cfg.ps);
+ 
+ 	IWL_DEBUG_RATE(mvm, "cam: %d sta_ps_disabled %d\n",
+ 		       cam, sta_ps_disabled);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c b/drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c
+index 261181dc810d..6099e1f9720d 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c
++++ b/drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c
+@@ -195,7 +195,7 @@ int mt76_connac_mcu_set_vif_ps(struct mt76_dev *dev, struct ieee80211_vif *vif)
+ 			      */
+ 	} req = {
+ 		.bss_idx = mvif->idx,
+-		.ps_state = vif->bss_conf.ps ? 2 : 0,
++		.ps_state = vif->cfg.ps ? 2 : 0,
+ 	};
+ 
+ 	if (vif->type != NL80211_IFTYPE_STATION)
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7921/mcu.c b/drivers/net/wireless/mediatek/mt76/mt7921/mcu.c
+index 6e00c7011da0..1ad14363862d 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/mcu.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/mcu.c
+@@ -622,7 +622,7 @@ int mt7921_mcu_uni_bss_ps(struct mt7921_dev *dev, struct ieee80211_vif *vif)
+ 		.ps = {
+ 			.tag = cpu_to_le16(UNI_BSS_INFO_PS),
+ 			.len = cpu_to_le16(sizeof(struct ps_tlv)),
+-			.ps_state = vif->bss_conf.ps ? 2 : 0,
++			.ps_state = vif->cfg.ps ? 2 : 0,
+ 		},
+ 	};
+ 
+* Unmerged path drivers/net/wireless/silabs/wfx/sta.c
+diff --git a/drivers/net/wireless/ti/wlcore/main.c b/drivers/net/wireless/ti/wlcore/main.c
+index f7f0a4367259..960f93d79e0e 100644
+--- a/drivers/net/wireless/ti/wlcore/main.c
++++ b/drivers/net/wireless/ti/wlcore/main.c
+@@ -4478,7 +4478,7 @@ static void wl1271_bss_info_changed_sta(struct wl1271 *wl,
+ 	}
+ 
+ 	if (changed & BSS_CHANGED_PS) {
+-		if ((bss_conf->ps) &&
++		if (vif->cfg.ps &&
+ 		    test_bit(WLVIF_FLAG_STA_ASSOCIATED, &wlvif->flags) &&
+ 		    !test_bit(WLVIF_FLAG_IN_PS, &wlvif->flags)) {
+ 			int ps_mode;
+@@ -4498,7 +4498,7 @@ static void wl1271_bss_info_changed_sta(struct wl1271 *wl,
+ 			if (ret < 0)
+ 				wl1271_warning("enter %s ps failed %d",
+ 					       ps_mode_str, ret);
+-		} else if (!bss_conf->ps &&
++		} else if (!vif->cfg.ps &&
+ 			   test_bit(WLVIF_FLAG_IN_PS, &wlvif->flags)) {
+ 			wl1271_debug(DEBUG_PSM, "auto ps disabled");
+ 
+* Unmerged path include/net/mac80211.h
+* Unmerged path net/mac80211/main.c
+* Unmerged path net/mac80211/mlme.c
+* Unmerged path net/mac80211/trace.h
