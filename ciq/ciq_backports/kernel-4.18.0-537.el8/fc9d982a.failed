@@ -1,0 +1,131 @@
+net/mlx5e: Expose SQ SW state as part of SQ health diagnostics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-537.el8
+commit-author Adham Faris <afaris@nvidia.com>
+commit fc9d982a2512b294607b2922de3809e7c92810da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-537.el8/fc9d982a.failed
+
+Add SQ SW state textual representation to devlink health diagnostics
+for tx reporter.
+
+SQ SW state can be retrieved by issuing the devlink command below:
+
+$ devlink health diagnose auxiliary/mlx5_core.eth.0/65535 reporter tx
+
+Output
+=======================================================================
+ Common Config:
+    SQ:
+      stride size: 64 size: 1024 ts_format: FRC
+      CQ:
+        stride size: 64 size: 1024
+  SQs:
+      channel ix: 0 tc: 0 txq ix: 0 sqn: 4170 HW state: 1 stopped: false cc: 0 pc: 0
+        SW State:
+          enabled: 1 mpwqe: 1 recovering: 0 ipsec: 0 am: 1 vlan_need_l2_inline: 1 pending_xsk_tx: 0 pending_tls_rx_resync: 0 xdp_multibuf: 0
+      CQ:
+        cqn: 1031 HW status: 0 ci: 0 size: 1024
+      EQ:
+        eqn: 7 irqn: 32 vecidx: 0 ci: 2 size: 2048
+
+	Signed-off-by: Adham Faris <afaris@nvidia.com>
+	Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+Link: https://lore.kernel.org/r/20230314054234.267365-9-saeed@kernel.org
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit fc9d982a2512b294607b2922de3809e7c92810da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index efa5a710092d,67f7e24d1f36..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -412,6 -401,8 +415,11 @@@ enum 
+  	MLX5E_SQ_STATE_VLAN_NEED_L2_INLINE,
+  	MLX5E_SQ_STATE_PENDING_XSK_TX,
+  	MLX5E_SQ_STATE_PENDING_TLS_RX_RESYNC,
+++<<<<<<< HEAD
+++=======
++ 	MLX5E_SQ_STATE_XDP_MULTIBUF,
++ 	MLX5E_NUM_SQ_STATES, /* Must be kept last */
+++>>>>>>> fc9d982a2512 (net/mlx5e: Expose SQ SW state as part of SQ health diagnostics)
+  };
+  
+  struct mlx5e_tx_mpwqe {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c b/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
+index a3826c6a29a2..732e2f2cb1ae 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
+@@ -5,6 +5,19 @@
+ #include "en/ptp.h"
+ #include "lib/tout.h"
+ 
++/* Keep this string array consistent with the MLX5E_SQ_STATE_* enums in en.h */
++static const char * const sq_sw_state_type_name[] = {
++	[MLX5E_SQ_STATE_ENABLED] = "enabled",
++	[MLX5E_SQ_STATE_MPWQE] = "mpwqe",
++	[MLX5E_SQ_STATE_RECOVERING] = "recovering",
++	[MLX5E_SQ_STATE_IPSEC] = "ipsec",
++	[MLX5E_SQ_STATE_DIM] = "dim",
++	[MLX5E_SQ_STATE_VLAN_NEED_L2_INLINE] = "vlan_need_l2_inline",
++	[MLX5E_SQ_STATE_PENDING_XSK_TX] = "pending_xsk_tx",
++	[MLX5E_SQ_STATE_PENDING_TLS_RX_RESYNC] = "pending_tls_rx_resync",
++	[MLX5E_SQ_STATE_XDP_MULTIBUF] = "xdp_multibuf",
++};
++
+ static int mlx5e_wait_for_sq_flush(struct mlx5e_txqsq *sq)
+ {
+ 	struct mlx5_core_dev *dev = sq->mdev;
+@@ -36,6 +49,35 @@ static void mlx5e_reset_txqsq_cc_pc(struct mlx5e_txqsq *sq)
+ 	sq->pc = 0;
+ }
+ 
++static int mlx5e_health_sq_put_sw_state(struct devlink_fmsg *fmsg, struct mlx5e_txqsq *sq)
++{
++	int err;
++	int i;
++
++	BUILD_BUG_ON_MSG(ARRAY_SIZE(sq_sw_state_type_name) != MLX5E_NUM_SQ_STATES,
++			 "sq_sw_state_type_name string array must be consistent with MLX5E_SQ_STATE_* enum in en.h");
++	err = devlink_fmsg_obj_nest_start(fmsg);
++	if (err)
++		return err;
++
++	err = mlx5e_health_fmsg_named_obj_nest_start(fmsg, "SW State");
++	if (err)
++		return err;
++
++	for (i = 0; i < ARRAY_SIZE(sq_sw_state_type_name); ++i) {
++		err = devlink_fmsg_u32_pair_put(fmsg, sq_sw_state_type_name[i],
++						test_bit(i, &sq->state));
++		if (err)
++			return err;
++	}
++
++	err = mlx5e_health_fmsg_named_obj_nest_end(fmsg);
++	if (err)
++		return err;
++
++	return devlink_fmsg_obj_nest_end(fmsg);
++}
++
+ static int mlx5e_tx_reporter_err_cqe_recover(void *ctx)
+ {
+ 	struct mlx5_core_dev *mdev;
+@@ -189,6 +231,10 @@ mlx5e_tx_reporter_build_diagnose_output_sq_common(struct devlink_fmsg *fmsg,
+ 	if (err)
+ 		return err;
+ 
++	err = mlx5e_health_sq_put_sw_state(fmsg, sq);
++	if (err)
++		return err;
++
+ 	err = mlx5e_health_cq_diag_fmsg(&sq->cq, fmsg);
+ 	if (err)
+ 		return err;
