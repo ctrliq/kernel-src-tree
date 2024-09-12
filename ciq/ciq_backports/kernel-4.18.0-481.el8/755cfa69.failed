@@ -1,0 +1,303 @@
+net: devlink: add unlocked variants of devlink_sb*() functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Jiri Pirko <jiri@nvidia.com>
+commit 755cfa69c4ece770c5a15dd51a9da2a7aafafa7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/755cfa69.failed
+
+Add unlocked variants of devlink_sb*() functions to be used
+in drivers called-in with devlink->lock held.
+
+	Signed-off-by: Jiri Pirko <jiri@nvidia.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 755cfa69c4ece770c5a15dd51a9da2a7aafafa7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/devlink.h
+#	net/core/devlink.c
+diff --cc include/net/devlink.h
+index 74b48ca06ba8,0057809a13b0..000000000000
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@@ -1533,9 -1564,25 +1533,31 @@@ void devlink_port_attrs_pci_vf_set(stru
+  void devlink_port_attrs_pci_sf_set(struct devlink_port *devlink_port,
+  				   u32 controller, u16 pf, u32 sf,
+  				   bool external);
+++<<<<<<< HEAD
+ +int devlink_rate_leaf_create(struct devlink_port *port, void *priv);
+ +void devlink_rate_leaf_destroy(struct devlink_port *devlink_port);
+ +void devlink_rate_nodes_destroy(struct devlink *devlink);
+++=======
++ int devl_rate_leaf_create(struct devlink_port *port, void *priv);
++ void devl_rate_leaf_destroy(struct devlink_port *devlink_port);
++ void devl_rate_nodes_destroy(struct devlink *devlink);
++ void devlink_port_linecard_set(struct devlink_port *devlink_port,
++ 			       struct devlink_linecard *linecard);
++ struct devlink_linecard *
++ devlink_linecard_create(struct devlink *devlink, unsigned int linecard_index,
++ 			const struct devlink_linecard_ops *ops, void *priv);
++ void devlink_linecard_destroy(struct devlink_linecard *linecard);
++ void devlink_linecard_provision_set(struct devlink_linecard *linecard,
++ 				    const char *type);
++ void devlink_linecard_provision_clear(struct devlink_linecard *linecard);
++ void devlink_linecard_provision_fail(struct devlink_linecard *linecard);
++ void devlink_linecard_activate(struct devlink_linecard *linecard);
++ void devlink_linecard_deactivate(struct devlink_linecard *linecard);
++ int devl_sb_register(struct devlink *devlink, unsigned int sb_index,
++ 		     u32 size, u16 ingress_pools_count,
++ 		     u16 egress_pools_count, u16 ingress_tc_count,
++ 		     u16 egress_tc_count);
+++>>>>>>> 755cfa69c4ec (net: devlink: add unlocked variants of devlink_sb*() functions)
+  int devlink_sb_register(struct devlink *devlink, unsigned int sb_index,
+  			u32 size, u16 ingress_pools_count,
+  			u16 egress_pools_count, u16 ingress_tc_count,
+diff --cc net/core/devlink.c
+index bba583b2500a,64dab4024d11..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -9781,25 -10174,222 +9781,229 @@@ static int __devlink_port_phys_port_nam
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int devlink_sb_register(struct devlink *devlink, unsigned int sb_index,
+ +			u32 size, u16 ingress_pools_count,
+ +			u16 egress_pools_count, u16 ingress_tc_count,
+ +			u16 egress_tc_count)
+++=======
++ static int devlink_linecard_types_init(struct devlink_linecard *linecard)
+  {
+- 	struct devlink_sb *devlink_sb;
+- 	int err = 0;
++ 	struct devlink_linecard_type *linecard_type;
++ 	unsigned int count;
++ 	int i;
+  
+- 	devl_lock(devlink);
+- 	if (devlink_sb_index_exists(devlink, sb_index)) {
+- 		err = -EEXIST;
+- 		goto unlock;
++ 	count = linecard->ops->types_count(linecard, linecard->priv);
++ 	linecard->types = kmalloc_array(count, sizeof(*linecard_type),
++ 					GFP_KERNEL);
++ 	if (!linecard->types)
++ 		return -ENOMEM;
++ 	linecard->types_count = count;
++ 
++ 	for (i = 0; i < count; i++) {
++ 		linecard_type = &linecard->types[i];
++ 		linecard->ops->types_get(linecard, linecard->priv, i,
++ 					 &linecard_type->type,
++ 					 &linecard_type->priv);
+  	}
++ 	return 0;
++ }
+  
+- 	devlink_sb = kzalloc(sizeof(*devlink_sb), GFP_KERNEL);
+- 	if (!devlink_sb) {
+- 		err = -ENOMEM;
+- 		goto unlock;
++ static void devlink_linecard_types_fini(struct devlink_linecard *linecard)
++ {
++ 	kfree(linecard->types);
++ }
++ 
++ /**
++  *	devlink_linecard_create - Create devlink linecard
++  *
++  *	@devlink: devlink
++  *	@linecard_index: driver-specific numerical identifier of the linecard
++  *	@ops: linecards ops
++  *	@priv: user priv pointer
++  *
++  *	Create devlink linecard instance with provided linecard index.
++  *	Caller can use any indexing, even hw-related one.
++  *
++  *	Return: Line card structure or an ERR_PTR() encoded error code.
++  */
++ struct devlink_linecard *
++ devlink_linecard_create(struct devlink *devlink, unsigned int linecard_index,
++ 			const struct devlink_linecard_ops *ops, void *priv)
++ {
++ 	struct devlink_linecard *linecard;
++ 	int err;
++ 
++ 	if (WARN_ON(!ops || !ops->provision || !ops->unprovision ||
++ 		    !ops->types_count || !ops->types_get))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	mutex_lock(&devlink->linecards_lock);
++ 	if (devlink_linecard_index_exists(devlink, linecard_index)) {
++ 		mutex_unlock(&devlink->linecards_lock);
++ 		return ERR_PTR(-EEXIST);
++ 	}
++ 
++ 	linecard = kzalloc(sizeof(*linecard), GFP_KERNEL);
++ 	if (!linecard) {
++ 		mutex_unlock(&devlink->linecards_lock);
++ 		return ERR_PTR(-ENOMEM);
+  	}
++ 
++ 	linecard->devlink = devlink;
++ 	linecard->index = linecard_index;
++ 	linecard->ops = ops;
++ 	linecard->priv = priv;
++ 	linecard->state = DEVLINK_LINECARD_STATE_UNPROVISIONED;
++ 	mutex_init(&linecard->state_lock);
++ 
++ 	err = devlink_linecard_types_init(linecard);
++ 	if (err) {
++ 		mutex_destroy(&linecard->state_lock);
++ 		kfree(linecard);
++ 		mutex_unlock(&devlink->linecards_lock);
++ 		return ERR_PTR(err);
++ 	}
++ 
++ 	list_add_tail(&linecard->list, &devlink->linecard_list);
++ 	refcount_set(&linecard->refcount, 1);
++ 	mutex_unlock(&devlink->linecards_lock);
++ 	devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 	return linecard;
++ }
++ EXPORT_SYMBOL_GPL(devlink_linecard_create);
++ 
++ /**
++  *	devlink_linecard_destroy - Destroy devlink linecard
++  *
++  *	@linecard: devlink linecard
++  */
++ void devlink_linecard_destroy(struct devlink_linecard *linecard)
++ {
++ 	struct devlink *devlink = linecard->devlink;
++ 
++ 	devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_DEL);
++ 	mutex_lock(&devlink->linecards_lock);
++ 	list_del(&linecard->list);
++ 	devlink_linecard_types_fini(linecard);
++ 	mutex_unlock(&devlink->linecards_lock);
++ 	devlink_linecard_put(linecard);
++ }
++ EXPORT_SYMBOL_GPL(devlink_linecard_destroy);
++ 
++ /**
++  *	devlink_linecard_provision_set - Set provisioning on linecard
++  *
++  *	@linecard: devlink linecard
++  *	@type: linecard type
++  *
++  *	This is either called directly from the provision() op call or
++  *	as a result of the provision() op call asynchronously.
++  */
++ void devlink_linecard_provision_set(struct devlink_linecard *linecard,
++ 				    const char *type)
++ {
++ 	mutex_lock(&linecard->state_lock);
++ 	WARN_ON(linecard->type && strcmp(linecard->type, type));
++ 	linecard->state = DEVLINK_LINECARD_STATE_PROVISIONED;
++ 	linecard->type = type;
++ 	devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 	mutex_unlock(&linecard->state_lock);
++ }
++ EXPORT_SYMBOL_GPL(devlink_linecard_provision_set);
++ 
++ /**
++  *	devlink_linecard_provision_clear - Clear provisioning on linecard
++  *
++  *	@linecard: devlink linecard
++  *
++  *	This is either called directly from the unprovision() op call or
++  *	as a result of the unprovision() op call asynchronously.
++  */
++ void devlink_linecard_provision_clear(struct devlink_linecard *linecard)
++ {
++ 	mutex_lock(&linecard->state_lock);
++ 	linecard->state = DEVLINK_LINECARD_STATE_UNPROVISIONED;
++ 	linecard->type = NULL;
++ 	devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 	mutex_unlock(&linecard->state_lock);
++ }
++ EXPORT_SYMBOL_GPL(devlink_linecard_provision_clear);
++ 
++ /**
++  *	devlink_linecard_provision_fail - Fail provisioning on linecard
++  *
++  *	@linecard: devlink linecard
++  *
++  *	This is either called directly from the provision() op call or
++  *	as a result of the provision() op call asynchronously.
++  */
++ void devlink_linecard_provision_fail(struct devlink_linecard *linecard)
++ {
++ 	mutex_lock(&linecard->state_lock);
++ 	linecard->state = DEVLINK_LINECARD_STATE_PROVISIONING_FAILED;
++ 	devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 	mutex_unlock(&linecard->state_lock);
++ }
++ EXPORT_SYMBOL_GPL(devlink_linecard_provision_fail);
++ 
++ /**
++  *	devlink_linecard_activate - Set linecard active
++  *
++  *	@linecard: devlink linecard
++  */
++ void devlink_linecard_activate(struct devlink_linecard *linecard)
++ {
++ 	mutex_lock(&linecard->state_lock);
++ 	WARN_ON(linecard->state != DEVLINK_LINECARD_STATE_PROVISIONED);
++ 	linecard->state = DEVLINK_LINECARD_STATE_ACTIVE;
++ 	devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 	mutex_unlock(&linecard->state_lock);
++ }
++ EXPORT_SYMBOL_GPL(devlink_linecard_activate);
++ 
++ /**
++  *	devlink_linecard_deactivate - Set linecard inactive
++  *
++  *	@linecard: devlink linecard
++  */
++ void devlink_linecard_deactivate(struct devlink_linecard *linecard)
++ {
++ 	mutex_lock(&linecard->state_lock);
++ 	switch (linecard->state) {
++ 	case DEVLINK_LINECARD_STATE_ACTIVE:
++ 		linecard->state = DEVLINK_LINECARD_STATE_PROVISIONED;
++ 		devlink_linecard_notify(linecard, DEVLINK_CMD_LINECARD_NEW);
++ 		break;
++ 	case DEVLINK_LINECARD_STATE_UNPROVISIONING:
++ 		/* Line card is being deactivated as part
++ 		 * of unprovisioning flow.
++ 		 */
++ 		break;
++ 	default:
++ 		WARN_ON(1);
++ 		break;
++ 	}
++ 	mutex_unlock(&linecard->state_lock);
++ }
++ EXPORT_SYMBOL_GPL(devlink_linecard_deactivate);
++ 
++ int devl_sb_register(struct devlink *devlink, unsigned int sb_index,
++ 		     u32 size, u16 ingress_pools_count,
++ 		     u16 egress_pools_count, u16 ingress_tc_count,
++ 		     u16 egress_tc_count)
+++>>>>>>> 755cfa69c4ec (net: devlink: add unlocked variants of devlink_sb*() functions)
++ {
++ 	struct devlink_sb *devlink_sb;
++ 
++ 	lockdep_assert_held(&devlink->lock);
++ 
++ 	if (devlink_sb_index_exists(devlink, sb_index))
++ 		return -EEXIST;
++ 
++ 	devlink_sb = kzalloc(sizeof(*devlink_sb), GFP_KERNEL);
++ 	if (!devlink_sb)
++ 		return -ENOMEM;
+  	devlink_sb->index = sb_index;
+  	devlink_sb->size = size;
+  	devlink_sb->ingress_pools_count = ingress_pools_count;
+* Unmerged path include/net/devlink.h
+* Unmerged path net/core/devlink.c
