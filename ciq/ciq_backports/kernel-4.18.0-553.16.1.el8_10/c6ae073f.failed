@@ -1,0 +1,127 @@
+geneve: Fix incorrect inner network header offset when innerprotoinherit is set
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Gal Pressman <gal@nvidia.com>
+commit c6ae073f5903f6c6439d0ac855836a4da5c0a701
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/c6ae073f.failed
+
+When innerprotoinherit is set, the tunneled packets do not have an inner
+Ethernet header.
+Change 'maclen' to not always assume the header length is ETH_HLEN, as
+there might not be a MAC header.
+
+This resolves issues with drivers (e.g. mlx5, in
+mlx5e_tx_tunnel_accel()) who rely on the skb inner network header offset
+to be correct, and use it for TX offloads.
+
+Fixes: d8a6213d70ac ("geneve: fix header validation in geneve[6]_xmit_skb")
+	Signed-off-by: Gal Pressman <gal@nvidia.com>
+	Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+	Reviewed-by: Wojciech Drewek <wojciech.drewek@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c6ae073f5903f6c6439d0ac855836a4da5c0a701)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/geneve.c
+diff --cc drivers/net/geneve.c
+index 36cf8b65f649,838e85ddec67..000000000000
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@@ -909,12 -826,22 +910,12 @@@ static int geneve_xmit_skb(struct sk_bu
+  	__be16 sport;
+  	int err;
+  
+- 	if (!skb_vlan_inet_prepare(skb))
++ 	if (!skb_vlan_inet_prepare(skb, inner_proto_inherit))
+  		return -EINVAL;
+  
+ -	if (!gs4)
+ -		return -EIO;
+ -
+ -	use_cache = ip_tunnel_dst_cache_usable(skb, info);
+ -	tos = geneve_get_dsfield(skb, dev, info, &use_cache);
+  	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
+ -
+ -	rt = udp_tunnel_dst_lookup(skb, dev, geneve->net, 0, &saddr,
+ -				   &info->key,
+ -				   sport, geneve->cfg.info.key.tp_dst, tos,
+ -				   use_cache ?
+ -				   (struct dst_cache *)&info->dst_cache : NULL);
+ +	rt = geneve_get_v4_rt(skb, dev, gs4, &fl4, info,
+ +			      geneve->info.key.tp_dst, sport);
+  	if (IS_ERR(rt))
+  		return PTR_ERR(rt);
+  
+@@@ -981,7 -908,8 +982,12 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	err = geneve_build_skb(&rt->dst, skb, info, xnet, sizeof(struct iphdr));
+++=======
++ 	err = geneve_build_skb(&rt->dst, skb, info, xnet, sizeof(struct iphdr),
++ 			       inner_proto_inherit);
+++>>>>>>> c6ae073f5903 (geneve: Fix incorrect inner network header offset when innerprotoinherit is set)
+  	if (unlikely(err))
+  		return err;
+  
+@@@ -1006,12 -937,21 +1013,12 @@@ static int geneve6_xmit_skb(struct sk_b
+  	__be16 sport;
+  	int err;
+  
+- 	if (!skb_vlan_inet_prepare(skb))
++ 	if (!skb_vlan_inet_prepare(skb, inner_proto_inherit))
+  		return -EINVAL;
+  
+ -	if (!gs6)
+ -		return -EIO;
+ -
+ -	use_cache = ip_tunnel_dst_cache_usable(skb, info);
+ -	prio = geneve_get_dsfield(skb, dev, info, &use_cache);
+  	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
+ -
+ -	dst = udp_tunnel6_dst_lookup(skb, dev, geneve->net, gs6->sock, 0,
+ -				     &saddr, key, sport,
+ -				     geneve->cfg.info.key.tp_dst, prio,
+ -				     use_cache ?
+ -				     (struct dst_cache *)&info->dst_cache : NULL);
+ +	dst = geneve_get_v6_dst(skb, dev, gs6, &fl6, info,
+ +				geneve->info.key.tp_dst, sport);
+  	if (IS_ERR(dst))
+  		return PTR_ERR(dst);
+  
+@@@ -1060,7 -998,8 +1067,12 @@@
+  			ttl = key->ttl;
+  		ttl = ttl ? : ip6_dst_hoplimit(dst);
+  	}
+++<<<<<<< HEAD
+ +	err = geneve_build_skb(dst, skb, info, xnet, sizeof(struct ipv6hdr));
+++=======
++ 	err = geneve_build_skb(dst, skb, info, xnet, sizeof(struct ipv6hdr),
++ 			       inner_proto_inherit);
+++>>>>>>> c6ae073f5903 (geneve: Fix incorrect inner network header offset when innerprotoinherit is set)
+  	if (unlikely(err))
+  		return err;
+  
+* Unmerged path drivers/net/geneve.c
+diff --git a/include/net/ip_tunnels.h b/include/net/ip_tunnels.h
+index 0b228ca79cff..b46157d96e03 100644
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@ -344,9 +344,10 @@ static inline bool pskb_inet_may_pull(struct sk_buff *skb)
+ 
+ /* Variant of pskb_inet_may_pull().
+  */
+-static inline bool skb_vlan_inet_prepare(struct sk_buff *skb)
++static inline bool skb_vlan_inet_prepare(struct sk_buff *skb,
++					 bool inner_proto_inherit)
+ {
+-	int nhlen = 0, maclen = ETH_HLEN;
++	int nhlen = 0, maclen = inner_proto_inherit ? 0 : ETH_HLEN;
+ 	__be16 type = skb->protocol;
+ 
+ 	/* Essentially this is skb_protocol(skb, true)
