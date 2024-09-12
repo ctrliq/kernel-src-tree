@@ -1,0 +1,87 @@
+rxrpc: Fix wrong error return in rxrpc_connect_call()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 01644a1f98ff45a4044395ce2bbfd534747e0676
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/01644a1f.failed
+
+Fix rxrpc_connect_call() to return -ENOMEM rather than 0 if it fails to
+look up a peer.
+
+This generated a smatch warning:
+        net/rxrpc/call_object.c:303 rxrpc_connect_call() warn: missing error code 'ret'
+
+I think this also fixes a syzbot-found bug:
+
+        rxrpc: Assertion failed - 1(0x1) == 11(0xb) is false
+        ------------[ cut here ]------------
+        kernel BUG at net/rxrpc/call_object.c:645!
+
+where the call being put is in the wrong state - as would be the case if we
+failed to clear up correctly after the error in rxrpc_connect_call().
+
+Fixes: 9d35d880e0e4 ("rxrpc: Move client call connection to the I/O thread")
+	Reported-by: kernel test robot <lkp@intel.com>
+	Reported-by: Dan Carpenter <error27@gmail.com>
+Reported-and-tested-by: syzbot+4bb6356bb29d6299360e@syzkaller.appspotmail.com
+	Signed-off-by: David Howells <dhowells@redhat.com>
+Link: https://lore.kernel.org/r/202301111153.9eZRYLf1-lkp@intel.com/
+	Reviewed-by: Alexander Duyck <alexanderduyck@fb.com>
+Link: https://lore.kernel.org/r/2438405.1673460435@warthog.procyon.org.uk
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 01644a1f98ff45a4044395ce2bbfd534747e0676)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/call_object.c
+diff --cc net/rxrpc/call_object.c
+index ad495d0d21a8,f3c9f0201c15..000000000000
+--- a/net/rxrpc/call_object.c
++++ b/net/rxrpc/call_object.c
+@@@ -253,6 -287,39 +253,42 @@@ static void rxrpc_put_call_slot(struct 
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Start the process of connecting a call.  We obtain a peer and a connection
++  * bundle, but the actual association of a call with a connection is offloaded
++  * to the I/O thread to simplify locking.
++  */
++ static int rxrpc_connect_call(struct rxrpc_call *call, gfp_t gfp)
++ {
++ 	struct rxrpc_local *local = call->local;
++ 	int ret = -ENOMEM;
++ 
++ 	_enter("{%d,%lx},", call->debug_id, call->user_call_ID);
++ 
++ 	call->peer = rxrpc_lookup_peer(local, &call->dest_srx, gfp);
++ 	if (!call->peer)
++ 		goto error;
++ 
++ 	ret = rxrpc_look_up_bundle(call, gfp);
++ 	if (ret < 0)
++ 		goto error;
++ 
++ 	trace_rxrpc_client(NULL, -1, rxrpc_client_queue_new_call);
++ 	rxrpc_get_call(call, rxrpc_call_get_io_thread);
++ 	spin_lock(&local->client_call_lock);
++ 	list_add_tail(&call->wait_link, &local->new_client_calls);
++ 	spin_unlock(&local->client_call_lock);
++ 	rxrpc_wake_up_io_thread(local);
++ 	return 0;
++ 
++ error:
++ 	__set_bit(RXRPC_CALL_DISCONNECTED, &call->flags);
++ 	return ret;
++ }
++ 
++ /*
+++>>>>>>> 01644a1f98ff (rxrpc: Fix wrong error return in rxrpc_connect_call())
+   * Set up a call for the given parameters.
+   * - Called with the socket lock held, which it must release.
+   * - If it returns a call, the call's lock will need releasing by the caller.
+* Unmerged path net/rxrpc/call_object.c
