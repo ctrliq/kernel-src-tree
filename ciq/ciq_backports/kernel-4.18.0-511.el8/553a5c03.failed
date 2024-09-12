@@ -1,0 +1,261 @@
+x86/speculation: Add force option to GDS mitigation
+
+jira LE-1907
+cve CVE-2022-40982
+Rebuild_History Non-Buildable kernel-4.18.0-511.el8
+commit-author Daniel Sneddon <daniel.sneddon@linux.intel.com>
+commit 553a5c03e90a6087e88f8ff878335ef0621536fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-511.el8/553a5c03.failed
+
+The Gather Data Sampling (GDS) vulnerability allows malicious software
+to infer stale data previously stored in vector registers. This may
+include sensitive data such as cryptographic keys. GDS is mitigated in
+microcode, and systems with up-to-date microcode are protected by
+default. However, any affected system that is running with older
+microcode will still be vulnerable to GDS attacks.
+
+Since the gather instructions used by the attacker are part of the
+AVX2 and AVX512 extensions, disabling these extensions prevents gather
+instructions from being executed, thereby mitigating the system from
+GDS. Disabling AVX2 is sufficient, but we don't have the granularity
+to do this. The XCR0[2] disables AVX, with no option to just disable
+AVX2.
+
+Add a kernel parameter gather_data_sampling=force that will enable the
+microcode mitigation if available, otherwise it will disable AVX on
+affected systems.
+
+This option will be ignored if cmdline mitigations=off.
+
+This is a *big* hammer.  It is known to break buggy userspace that
+uses incomplete, buggy AVX enumeration.  Unfortunately, such userspace
+does exist in the wild:
+
+	https://www.mail-archive.com/bug-coreutils@gnu.org/msg33046.html
+
+[ dhansen: add some more ominous warnings about disabling AVX ]
+
+	Signed-off-by: Daniel Sneddon <daniel.sneddon@linux.intel.com>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Acked-by: Josh Poimboeuf <jpoimboe@kernel.org>
+(cherry picked from commit 553a5c03e90a6087e88f8ff878335ef0621536fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/hw-vuln/gather_data_sampling.rst
+#	Documentation/admin-guide/kernel-parameters.txt
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc Documentation/admin-guide/kernel-parameters.txt
+index 945610d379d6,816b966bed0f..000000000000
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@@ -1375,6 -1623,26 +1375,29 @@@
+  			Format: off | on
+  			default: on
+  
+++<<<<<<< HEAD
+++=======
++ 	gather_data_sampling=
++ 			[X86,INTEL] Control the Gather Data Sampling (GDS)
++ 			mitigation.
++ 
++ 			Gather Data Sampling is a hardware vulnerability which
++ 			allows unprivileged speculative access to data which was
++ 			previously stored in vector registers.
++ 
++ 			This issue is mitigated by default in updated microcode.
++ 			The mitigation may have a performance impact but can be
++ 			disabled. On systems without the microcode mitigation
++ 			disabling AVX serves as a mitigation.
++ 
++ 			force:	Disable AVX to mitigate systems without
++ 				microcode mitigation. No effect if the microcode
++ 				mitigation is present. Known to cause crashes in
++ 				userspace with buggy AVX enumeration.
++ 
++ 			off:	Disable GDS mitigation.
++ 
+++>>>>>>> 553a5c03e90a (x86/speculation: Add force option to GDS mitigation)
+  	gcov_persist=	[GCOV] When non-zero (default), profiling data for
+  			kernel modules is saved and remains accessible via
+  			debugfs, even when the module is unloaded/reloaded.
+diff --cc arch/x86/kernel/cpu/bugs.c
+index aee8d5227bc4,155e8d1c325e..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -658,6 -620,166 +658,169 @@@ static int __init srbds_parse_cmdline(c
+  early_param("srbds", srbds_parse_cmdline);
+  
+  #undef pr_fmt
+++<<<<<<< HEAD
+++=======
++ #define pr_fmt(fmt)     "L1D Flush : " fmt
++ 
++ enum l1d_flush_mitigations {
++ 	L1D_FLUSH_OFF = 0,
++ 	L1D_FLUSH_ON,
++ };
++ 
++ static enum l1d_flush_mitigations l1d_flush_mitigation __initdata = L1D_FLUSH_OFF;
++ 
++ static void __init l1d_flush_select_mitigation(void)
++ {
++ 	if (!l1d_flush_mitigation || !boot_cpu_has(X86_FEATURE_FLUSH_L1D))
++ 		return;
++ 
++ 	static_branch_enable(&switch_mm_cond_l1d_flush);
++ 	pr_info("Conditional flush on switch_mm() enabled\n");
++ }
++ 
++ static int __init l1d_flush_parse_cmdline(char *str)
++ {
++ 	if (!strcmp(str, "on"))
++ 		l1d_flush_mitigation = L1D_FLUSH_ON;
++ 
++ 	return 0;
++ }
++ early_param("l1d_flush", l1d_flush_parse_cmdline);
++ 
++ #undef pr_fmt
++ #define pr_fmt(fmt)	"GDS: " fmt
++ 
++ enum gds_mitigations {
++ 	GDS_MITIGATION_OFF,
++ 	GDS_MITIGATION_UCODE_NEEDED,
++ 	GDS_MITIGATION_FORCE,
++ 	GDS_MITIGATION_FULL,
++ 	GDS_MITIGATION_FULL_LOCKED,
++ 	GDS_MITIGATION_HYPERVISOR,
++ };
++ 
++ static enum gds_mitigations gds_mitigation __ro_after_init = GDS_MITIGATION_FULL;
++ 
++ static const char * const gds_strings[] = {
++ 	[GDS_MITIGATION_OFF]		= "Vulnerable",
++ 	[GDS_MITIGATION_UCODE_NEEDED]	= "Vulnerable: No microcode",
++ 	[GDS_MITIGATION_FORCE]		= "Mitigation: AVX disabled, no microcode",
++ 	[GDS_MITIGATION_FULL]		= "Mitigation: Microcode",
++ 	[GDS_MITIGATION_FULL_LOCKED]	= "Mitigation: Microcode (locked)",
++ 	[GDS_MITIGATION_HYPERVISOR]	= "Unknown: Dependent on hypervisor status",
++ };
++ 
++ void update_gds_msr(void)
++ {
++ 	u64 mcu_ctrl_after;
++ 	u64 mcu_ctrl;
++ 
++ 	switch (gds_mitigation) {
++ 	case GDS_MITIGATION_OFF:
++ 		rdmsrl(MSR_IA32_MCU_OPT_CTRL, mcu_ctrl);
++ 		mcu_ctrl |= GDS_MITG_DIS;
++ 		break;
++ 	case GDS_MITIGATION_FULL_LOCKED:
++ 		/*
++ 		 * The LOCKED state comes from the boot CPU. APs might not have
++ 		 * the same state. Make sure the mitigation is enabled on all
++ 		 * CPUs.
++ 		 */
++ 	case GDS_MITIGATION_FULL:
++ 		rdmsrl(MSR_IA32_MCU_OPT_CTRL, mcu_ctrl);
++ 		mcu_ctrl &= ~GDS_MITG_DIS;
++ 		break;
++ 	case GDS_MITIGATION_FORCE:
++ 	case GDS_MITIGATION_UCODE_NEEDED:
++ 	case GDS_MITIGATION_HYPERVISOR:
++ 		return;
++ 	};
++ 
++ 	wrmsrl(MSR_IA32_MCU_OPT_CTRL, mcu_ctrl);
++ 
++ 	/*
++ 	 * Check to make sure that the WRMSR value was not ignored. Writes to
++ 	 * GDS_MITG_DIS will be ignored if this processor is locked but the boot
++ 	 * processor was not.
++ 	 */
++ 	rdmsrl(MSR_IA32_MCU_OPT_CTRL, mcu_ctrl_after);
++ 	WARN_ON_ONCE(mcu_ctrl != mcu_ctrl_after);
++ }
++ 
++ static void __init gds_select_mitigation(void)
++ {
++ 	u64 mcu_ctrl;
++ 
++ 	if (!boot_cpu_has_bug(X86_BUG_GDS))
++ 		return;
++ 
++ 	if (boot_cpu_has(X86_FEATURE_HYPERVISOR)) {
++ 		gds_mitigation = GDS_MITIGATION_HYPERVISOR;
++ 		goto out;
++ 	}
++ 
++ 	if (cpu_mitigations_off())
++ 		gds_mitigation = GDS_MITIGATION_OFF;
++ 	/* Will verify below that mitigation _can_ be disabled */
++ 
++ 	/* No microcode */
++ 	if (!(x86_read_arch_cap_msr() & ARCH_CAP_GDS_CTRL)) {
++ 		if (gds_mitigation == GDS_MITIGATION_FORCE) {
++ 			/*
++ 			 * This only needs to be done on the boot CPU so do it
++ 			 * here rather than in update_gds_msr()
++ 			 */
++ 			setup_clear_cpu_cap(X86_FEATURE_AVX);
++ 			pr_warn("Microcode update needed! Disabling AVX as mitigation.\n");
++ 		} else {
++ 			gds_mitigation = GDS_MITIGATION_UCODE_NEEDED;
++ 		}
++ 		goto out;
++ 	}
++ 
++ 	/* Microcode has mitigation, use it */
++ 	if (gds_mitigation == GDS_MITIGATION_FORCE)
++ 		gds_mitigation = GDS_MITIGATION_FULL;
++ 
++ 	rdmsrl(MSR_IA32_MCU_OPT_CTRL, mcu_ctrl);
++ 	if (mcu_ctrl & GDS_MITG_LOCKED) {
++ 		if (gds_mitigation == GDS_MITIGATION_OFF)
++ 			pr_warn("Mitigation locked. Disable failed.\n");
++ 
++ 		/*
++ 		 * The mitigation is selected from the boot CPU. All other CPUs
++ 		 * _should_ have the same state. If the boot CPU isn't locked
++ 		 * but others are then update_gds_msr() will WARN() of the state
++ 		 * mismatch. If the boot CPU is locked update_gds_msr() will
++ 		 * ensure the other CPUs have the mitigation enabled.
++ 		 */
++ 		gds_mitigation = GDS_MITIGATION_FULL_LOCKED;
++ 	}
++ 
++ 	update_gds_msr();
++ out:
++ 	pr_info("%s\n", gds_strings[gds_mitigation]);
++ }
++ 
++ static int __init gds_parse_cmdline(char *str)
++ {
++ 	if (!str)
++ 		return -EINVAL;
++ 
++ 	if (!boot_cpu_has_bug(X86_BUG_GDS))
++ 		return 0;
++ 
++ 	if (!strcmp(str, "off"))
++ 		gds_mitigation = GDS_MITIGATION_OFF;
++ 	else if (!strcmp(str, "force"))
++ 		gds_mitigation = GDS_MITIGATION_FORCE;
++ 
++ 	return 0;
++ }
++ early_param("gather_data_sampling", gds_parse_cmdline);
++ 
++ #undef pr_fmt
+++>>>>>>> 553a5c03e90a (x86/speculation: Add force option to GDS mitigation)
+  #define pr_fmt(fmt)     "Spectre V1 : " fmt
+  
+  enum spectre_v1_mitigation {
+* Unmerged path Documentation/admin-guide/hw-vuln/gather_data_sampling.rst
+* Unmerged path Documentation/admin-guide/hw-vuln/gather_data_sampling.rst
+* Unmerged path Documentation/admin-guide/kernel-parameters.txt
+* Unmerged path arch/x86/kernel/cpu/bugs.c
