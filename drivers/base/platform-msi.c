@@ -197,6 +197,7 @@ struct irq_domain *platform_msi_create_irq_domain(struct fwnode_handle *fwnode,
 
 	return domain;
 }
+EXPORT_SYMBOL_GPL(platform_msi_create_irq_domain);
 
 static struct platform_msi_priv_data *
 platform_msi_alloc_priv_data(struct device *dev, unsigned int nvec,
