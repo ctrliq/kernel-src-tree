@@ -1,0 +1,118 @@
+ice: Fix improper extts handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-427.33.1.el9_4
+commit-author Milena Olech <milena.olech@intel.com>
+commit 00d3b4f54582d4e4a02cda5886bb336eeab268cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.33.1.el9_4/00d3b4f5.failed
+
+Extts events are disabled and enabled by the application ts2phc.
+However, in case where the driver is removed when the application is
+running, a specific extts event remains enabled and can cause a kernel
+crash.
+As a side effect, when the driver is reloaded and application is started
+again, remaining extts event for the channel from a previous run will
+keep firing and the message "extts on unexpected channel" might be
+printed to the user.
+
+To avoid that, extts events shall be disabled when PTP is released.
+
+Fixes: 172db5f91d5f ("ice: add support for auxiliary input/output pins")
+	Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+Co-developed-by: Jacob Keller <jacob.e.keller@intel.com>
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Signed-off-by: Milena Olech <milena.olech@intel.com>
+	Signed-off-by: Karol Kolacinski <karol.kolacinski@intel.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+	Tested-by: Pucha Himasekhar Reddy <himasekharx.reddy.pucha@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Link: https://patch.msgid.link/20240702171459.2606611-2-anthony.l.nguyen@intel.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 00d3b4f54582d4e4a02cda5886bb336eeab268cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_ptp.c
+diff --cc drivers/net/ethernet/intel/ice/ice_ptp.c
+index c75040fefb27,4d6555fadd83..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@@ -2591,6 -2770,39 +2646,42 @@@ void ice_ptp_reset(struct ice_pf *pf
+  		/* Enable quad interrupts */
+  		err = ice_ptp_cfg_phy_interrupt(pf, true, 1);
+  		if (err)
+++<<<<<<< HEAD
+++=======
++ 			return err;
++ 
++ 		ice_ptp_restart_all_phy(pf);
++ 	}
++ 
++ 	/* Re-enable all periodic outputs and external timestamp events */
++ 	ice_ptp_enable_all_clkout(pf);
++ 	ice_ptp_enable_all_extts(pf);
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * ice_ptp_rebuild - Initialize PTP hardware clock support after reset
++  * @pf: Board private structure
++  * @reset_type: the reset type being performed
++  */
++ void ice_ptp_rebuild(struct ice_pf *pf, enum ice_reset_req reset_type)
++ {
++ 	struct ice_ptp *ptp = &pf->ptp;
++ 	int err;
++ 
++ 	if (ptp->state == ICE_PTP_READY) {
++ 		ice_ptp_prepare_for_reset(pf, reset_type);
++ 	} else if (ptp->state != ICE_PTP_RESETTING) {
++ 		err = -EINVAL;
++ 		dev_err(ice_pf_to_dev(pf), "PTP was not initialized\n");
++ 		goto err;
++ 	}
++ 
++ 	if (ice_pf_src_tmr_owned(pf) && reset_type != ICE_RESET_PFR) {
++ 		err = ice_ptp_rebuild_owner(pf);
++ 		if (err)
+++>>>>>>> 00d3b4f54582 (ice: Fix improper extts handling)
+  			goto err;
+  	}
+  
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp.h b/drivers/net/ethernet/intel/ice/ice_ptp.h
+index 7012808e4497..f012d8b14aa1 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.h
+@@ -33,6 +33,12 @@ struct ice_perout_channel {
+ 	u64 start_time;
+ };
+ 
++struct ice_extts_channel {
++	bool ena;
++	u32 gpio_pin;
++	u32 flags;
++};
++
+ /* The ice hardware captures Tx hardware timestamps in the PHY. The timestamp
+  * is stored in a buffer of registers. Depending on the specific hardware,
+  * this buffer might be shared across multiple PHY ports.
+@@ -222,6 +228,7 @@ enum ice_ptp_state {
+  * @ext_ts_irq: the external timestamp IRQ in use
+  * @kworker: kwork thread for handling periodic work
+  * @perout_channels: periodic output data
++ * @extts_channels: channels for external timestamps
+  * @info: structure defining PTP hardware capabilities
+  * @clock: pointer to registered PTP clock device
+  * @tstamp_config: hardware timestamping configuration
+@@ -245,6 +252,7 @@ struct ice_ptp {
+ 	u8 ext_ts_irq;
+ 	struct kthread_worker *kworker;
+ 	struct ice_perout_channel perout_channels[GLTSYN_TGT_H_IDX_MAX];
++	struct ice_extts_channel extts_channels[GLTSYN_TGT_H_IDX_MAX];
+ 	struct ptp_clock_info info;
+ 	struct ptp_clock *clock;
+ 	struct hwtstamp_config tstamp_config;
