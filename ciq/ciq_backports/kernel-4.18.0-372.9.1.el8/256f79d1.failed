@@ -1,0 +1,179 @@
+net/mlx5e: Fix HW TS with CQE compression according to profile
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Aya Levin <ayal@nvidia.com>
+commit 256f79d13c1d1fe53b2b31ab2089b615bbfcd361
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/256f79d1.failed
+
+When the driver's profile doesn't support a dedicated PTP-RQ, the PTP
+accuracy of HW TS is affected by the CQE compression. In this case,
+turn off CQE compression. Otherwise, the driver crashes:
+
+BUG: kernel NULL pointer dereference, address:0000000000000018
+...
+...
+RIP: 0010:mlx5e_ptp_rx_set_fs+0x25/0x1a0 [mlx5_core]
+...
+...
+Call Trace:
+ mlx5e_ptp_activate_channel+0xb2/0xf0 [mlx5_core]
+ mlx5e_activate_priv_channels+0x3b9/0x8c0 [mlx5_core]
+ ? __mutex_unlock_slowpath+0x45/0x2a0
+ ? mlx5e_refresh_tirs+0x151/0x1e0 [mlx5_core]
+ mlx5e_switch_priv_channels+0x1cd/0x2d0 [mlx5_core]
+ ? mlx5e_xdp_allowed+0x150/0x150 [mlx5_core]
+ mlx5e_safe_switch_params+0x118/0x3c0 [mlx5_core]
+ ? __mutex_lock+0x6e/0x8e0
+ ? mlx5e_hwstamp_set+0xa9/0x300 [mlx5_core]
+ mlx5e_hwstamp_set+0x194/0x300 [mlx5_core]
+ ? dev_ioctl+0x9b/0x3d0
+ mlx5i_ioctl+0x37/0x60 [mlx5_core]
+ mlx5i_pkey_ioctl+0x12/0x20 [mlx5_core]
+ dev_ioctl+0xa9/0x3d0
+ sock_ioctl+0x268/0x420
+ __x64_sys_ioctl+0x3d8/0x790
+ ? lockdep_hardirqs_on_prepare+0xe4/0x190
+ do_syscall_64+0x2d/0x40
+entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+Fixes: 960fbfe222a4 ("net/mlx5e: Allow coexistence of CQE compression and HW TS PTP")
+	Signed-off-by: Aya Levin <ayal@nvidia.com>
+	Reviewed-by: Moshe Shemesh <moshe@nvidia.com>
+	Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 256f79d13c1d1fe53b2b31ab2089b615bbfcd361)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index adeb5da458eb,ec6bafe7a2e5..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -3977,9 -3977,52 +3977,58 @@@ static int mlx5e_change_nic_mtu(struct 
+  	return mlx5e_change_mtu(netdev, new_mtu, mlx5e_set_dev_port_mtu_ctx);
+  }
+  
+++<<<<<<< HEAD
+ +int mlx5e_hwstamp_set(struct mlx5e_priv *priv, struct ifreq *ifr)
+ +{
+ +	struct hwtstamp_config config;
+++=======
++ int mlx5e_ptp_rx_manage_fs_ctx(struct mlx5e_priv *priv, void *ctx)
++ {
++ 	bool set  = *(bool *)ctx;
++ 
++ 	return mlx5e_ptp_rx_manage_fs(priv, set);
++ }
++ 
++ static int mlx5e_hwstamp_config_no_ptp_rx(struct mlx5e_priv *priv, bool rx_filter)
++ {
++ 	bool rx_cqe_compress_def = priv->channels.params.rx_cqe_compress_def;
++ 	int err;
++ 
++ 	if (!rx_filter)
++ 		/* Reset CQE compression to Admin default */
++ 		return mlx5e_modify_rx_cqe_compression_locked(priv, rx_cqe_compress_def);
++ 
++ 	if (!MLX5E_GET_PFLAG(&priv->channels.params, MLX5E_PFLAG_RX_CQE_COMPRESS))
++ 		return 0;
++ 
++ 	/* Disable CQE compression */
++ 	netdev_warn(priv->netdev, "Disabling RX cqe compression\n");
++ 	err = mlx5e_modify_rx_cqe_compression_locked(priv, false);
++ 	if (err)
++ 		netdev_err(priv->netdev, "Failed disabling cqe compression err=%d\n", err);
++ 
++ 	return err;
++ }
++ 
++ static int mlx5e_hwstamp_config_ptp_rx(struct mlx5e_priv *priv, bool ptp_rx)
++ {
++ 	struct mlx5e_params new_params;
++ 
++ 	if (ptp_rx == priv->channels.params.ptp_rx)
++ 		return 0;
++ 
++ 	new_params = priv->channels.params;
++ 	new_params.ptp_rx = ptp_rx;
++ 	return mlx5e_safe_switch_params(priv, &new_params, mlx5e_ptp_rx_manage_fs_ctx,
++ 					&new_params.ptp_rx, true);
++ }
++ 
++ int mlx5e_hwstamp_set(struct mlx5e_priv *priv, struct ifreq *ifr)
++ {
++ 	struct hwtstamp_config config;
++ 	bool rx_cqe_compress_def;
++ 	bool ptp_rx;
+++>>>>>>> 256f79d13c1d (net/mlx5e: Fix HW TS with CQE compression according to profile)
+  	int err;
+  
+  	if (!MLX5_CAP_GEN(priv->mdev, device_frequency_khz) ||
+@@@ -3999,11 -4042,12 +4048,20 @@@
+  	}
+  
+  	mutex_lock(&priv->state_lock);
+++<<<<<<< HEAD
+ +	/* RX HW timestamp */
+ +	switch (config.rx_filter) {
+ +	case HWTSTAMP_FILTER_NONE:
+ +		/* Reset CQE compression to Admin default */
+ +		mlx5e_modify_rx_cqe_compression_locked(priv, priv->channels.params.rx_cqe_compress_def);
+++=======
++ 	rx_cqe_compress_def = priv->channels.params.rx_cqe_compress_def;
++ 
++ 	/* RX HW timestamp */
++ 	switch (config.rx_filter) {
++ 	case HWTSTAMP_FILTER_NONE:
++ 		ptp_rx = false;
+++>>>>>>> 256f79d13c1d (net/mlx5e: Fix HW TS with CQE compression according to profile)
+  		break;
+  	case HWTSTAMP_FILTER_ALL:
+  	case HWTSTAMP_FILTER_SOME:
+@@@ -4020,22 -4064,25 +4078,40 @@@
+  	case HWTSTAMP_FILTER_PTP_V2_SYNC:
+  	case HWTSTAMP_FILTER_PTP_V2_DELAY_REQ:
+  	case HWTSTAMP_FILTER_NTP_ALL:
+++<<<<<<< HEAD
+ +		/* Disable CQE compression */
+ +		if (MLX5E_GET_PFLAG(&priv->channels.params, MLX5E_PFLAG_RX_CQE_COMPRESS))
+ +			netdev_warn(priv->netdev, "Disabling RX cqe compression\n");
+ +		err = mlx5e_modify_rx_cqe_compression_locked(priv, false);
+ +		if (err) {
+ +			netdev_err(priv->netdev, "Failed disabling cqe compression err=%d\n", err);
+ +			mutex_unlock(&priv->state_lock);
+ +			return err;
+ +		}
+++=======
+++>>>>>>> 256f79d13c1d (net/mlx5e: Fix HW TS with CQE compression according to profile)
+  		config.rx_filter = HWTSTAMP_FILTER_ALL;
++ 		/* ptp_rx is set if both HW TS is set and CQE
++ 		 * compression is set
++ 		 */
++ 		ptp_rx = rx_cqe_compress_def;
+  		break;
+  	default:
+- 		mutex_unlock(&priv->state_lock);
+- 		return -ERANGE;
++ 		err = -ERANGE;
++ 		goto err_unlock;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!priv->profile->rx_ptp_support)
++ 		err = mlx5e_hwstamp_config_no_ptp_rx(priv,
++ 						     config.rx_filter != HWTSTAMP_FILTER_NONE);
++ 	else
++ 		err = mlx5e_hwstamp_config_ptp_rx(priv, ptp_rx);
++ 	if (err)
++ 		goto err_unlock;
++ 
+++>>>>>>> 256f79d13c1d (net/mlx5e: Fix HW TS with CQE compression according to profile)
+  	memcpy(&priv->tstamp, &config, sizeof(config));
+  	mutex_unlock(&priv->state_lock);
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
