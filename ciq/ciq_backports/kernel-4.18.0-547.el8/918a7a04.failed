@@ -1,0 +1,145 @@
+x86/decompressor: Use standard calling convention for trampoline
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit 918a7a04e71745e99a0efc6753e587439b794b29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/918a7a04.failed
+
+Update the trampoline code so its arguments are passed via RDI and RSI,
+which matches the ordinary SysV calling convention for x86_64. This will
+allow this code to be called directly from C.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Link: https://lore.kernel.org/r/20230807162720.545787-11-ardb@kernel.org
+(cherry picked from commit 918a7a04e71745e99a0efc6753e587439b794b29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/head_64.S
+diff --cc arch/x86/boot/compressed/head_64.S
+index c4f3be19a58f,c47504208105..000000000000
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@@ -381,31 -439,16 +381,37 @@@ SYM_CODE_START(startup_64
+  	 *   - Non zero RDX means trampoline needs to enable 5-level
+  	 *     paging.
+  	 *
+ -	 * Pass the boot_params pointer as the first argument.
+ +	 * RSI holds real mode data and needs to be preserved across
+ +	 * this function call.
+  	 */
+ -	movq	%r15, %rdi
+ +	pushq	%rsi
+ +	movq	%rsi, %rdi		/* real mode address */
+  	call	paging_prepare
+ +	popq	%rsi
+ +
+++<<<<<<< HEAD
+ +	/* Save the trampoline address in RCX */
+ +	movq	%rax, %rcx
+  
+ +	/*
+ +	 * Load the address of trampoline_return() into RDI.
+ +	 * It will be used by the trampoline to return to the main code.
+ +	 */
+ +	leaq	trampoline_return(%rip), %rdi
+ +
+ +	/* Switch to compatibility mode (CS.L = 0 CS.D = 1) via far return */
+ +	pushq	$__KERNEL32_CS
+++=======
++ 	/* Pass the trampoline address and boolean flag as args #1 and #2 */
++ 	movq	%rax, %rdi
++ 	movq	%rdx, %rsi
+++>>>>>>> 918a7a04e717 (x86/decompressor: Use standard calling convention for trampoline)
+  	leaq	TRAMPOLINE_32BIT_CODE_OFFSET(%rax), %rax
+ -	call	*%rax
+ +	pushq	%rax
+ +	lretq
+ +trampoline_return:
+ +	/* Restore the stack, the 32-bit trampoline uses its own stack */
+ +	leaq	boot_stack_end(%rbx), %rsp
+  
+  	/*
+  	 * cleanup_trampoline() would restore trampoline memory.
+@@@ -561,17 -526,54 +567,26 @@@ SYM_FUNC_END(efi64_stub_entry
+  /*
+   * Jump to the decompressed kernel.
+   */
+ -	movq	%r15, %rsi
+  	jmp	*%rax
+ -SYM_FUNC_END(.Lrelocated)
+  
+ +	.code32
+  /*
+-  * This is the 32-bit trampoline that will be copied over to low memory.
++  * This is the 32-bit trampoline that will be copied over to low memory. It
++  * will be called using the ordinary 64-bit calling convention from code
++  * running in 64-bit mode.
+   *
+++<<<<<<< HEAD
+ + * RDI contains the return address (might be above 4G).
+ + * ECX contains the base address of the trampoline memory.
+ + * Non zero RDX means trampoline needs to enable 5-level paging.
+++=======
++  * Return address is at the top of the stack (might be above 4G).
++  * The first argument (EDI) contains the 32-bit addressable base of the
++  * trampoline memory. A non-zero second argument (ESI) means that the
++  * trampoline needs to enable 5-level paging.
+++>>>>>>> 918a7a04e717 (x86/decompressor: Use standard calling convention for trampoline)
+   */
+  SYM_CODE_START(trampoline_32bit_src)
+ -	/*
+ -	 * Preserve live 64-bit registers on the stack: this is necessary
+ -	 * because the architecture does not guarantee that GPRs will retain
+ -	 * their full 64-bit values across a 32-bit mode switch.
+ -	 */
+ -	pushq	%r15
+ -	pushq	%rbp
+ -	pushq	%rbx
+ -
+ -	/* Set up 32-bit addressable stack and push the old RSP value */
+ -	leaq	(TRAMPOLINE_32BIT_STACK_END - 8)(%rcx), %rbx
+ -	movq	%rsp, (%rbx)
+ -	movq	%rbx, %rsp
+ -
+ -	/* Take the address of the trampoline exit code */
+ -	leaq	.Lret(%rip), %rbx
+ -
+ -	/* Switch to compatibility mode (CS.L = 0 CS.D = 1) via far return */
+ -	pushq	$__KERNEL32_CS
+ -	leaq	0f(%rip), %rax
+ -	pushq	%rax
+ -	lretq
+ -
+ -.Lret:
+ -	/* Restore the preserved 64-bit registers */
+ -	movq	(%rsp), %rsp
+ -	popq	%rbx
+ -	popq	%rbp
+ -	popq	%r15
+ -	retq
+ -
+ -	.code32
+ -0:
+  	/* Set up data and stack segments */
+  	movl	$__KERNEL_DS, %eax
+  	movl	%eax, %ds
+* Unmerged path arch/x86/boot/compressed/head_64.S
+diff --git a/arch/x86/boot/compressed/pgtable.h b/arch/x86/boot/compressed/pgtable.h
+index cc9b2529a086..46856008de13 100644
+--- a/arch/x86/boot/compressed/pgtable.h
++++ b/arch/x86/boot/compressed/pgtable.h
+@@ -14,7 +14,7 @@
+ 
+ extern unsigned long *trampoline_32bit;
+ 
+-extern void trampoline_32bit_src(void *return_ptr);
++extern void trampoline_32bit_src(void *trampoline, bool enable_5lvl);
+ 
+ #endif /* __ASSEMBLER__ */
+ #endif /* BOOT_COMPRESSED_PAGETABLE_H */
