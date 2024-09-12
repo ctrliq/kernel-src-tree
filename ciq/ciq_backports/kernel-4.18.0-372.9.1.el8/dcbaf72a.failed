@@ -1,0 +1,98 @@
+ice: xsk: fix cleaned_count setting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+commit dcbaf72aa4232a7aa5db5e483972a6fe4ba2b41c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/dcbaf72a.failed
+
+Currently cleaned_count is initialized to ICE_DESC_UNUSED(rx_ring) and
+later on during the Rx processing it is incremented per each frame that
+driver consumed. This can result in excessive buffers requested from xsk
+pool based on that value.
+
+To address this, just drop cleaned_count and pass
+ICE_DESC_UNUSED(rx_ring) directly as a function argument to
+ice_alloc_rx_bufs_zc(). Idea is to ask for buffers as many as consumed.
+
+Let us also call ice_alloc_rx_bufs_zc unconditionally at the end of
+ice_clean_rx_irq_zc. This has been changed in that way for corresponding
+ice_clean_rx_irq, but not here.
+
+Fixes: 2d4238f55697 ("ice: Add support for AF_XDP")
+	Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Tested-by: Kiran Bhandare <kiranx.bhandare@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit dcbaf72aa4232a7aa5db5e483972a6fe4ba2b41c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_xsk.c
+diff --cc drivers/net/ethernet/intel/ice/ice_xsk.c
+index 295bfdac4d32,c895351b25e0..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_xsk.c
++++ b/drivers/net/ethernet/intel/ice/ice_xsk.c
+@@@ -520,10 -505,17 +520,14 @@@ out_failure
+  int ice_clean_rx_irq_zc(struct ice_rx_ring *rx_ring, int budget)
+  {
+  	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
+++<<<<<<< HEAD
+ +	u16 cleaned_count = ICE_DESC_UNUSED(rx_ring);
+++=======
++ 	struct ice_tx_ring *xdp_ring;
+++>>>>>>> dcbaf72aa423 (ice: xsk: fix cleaned_count setting)
+  	unsigned int xdp_xmit = 0;
+ -	struct bpf_prog *xdp_prog;
+  	bool failure = false;
+  
+ -	/* ZC patch is enabled only when XDP program is set,
+ -	 * so here it can not be NULL
+ -	 */
+ -	xdp_prog = READ_ONCE(rx_ring->xdp_prog);
+ -	xdp_ring = rx_ring->xdp_ring;
+ -
+  	while (likely(total_rx_packets < (unsigned int)budget)) {
+  		union ice_32b_rx_flex_desc *rx_desc;
+  		unsigned int size, xdp_res = 0;
+@@@ -559,12 -557,10 +563,11 @@@
+  			if (xdp_res & (ICE_XDP_TX | ICE_XDP_REDIR))
+  				xdp_xmit |= xdp_res;
+  			else
+ -				xsk_buff_free(xdp);
+ +				xsk_buff_free(rx_buf->xdp);
+  
+ +			rx_buf->xdp = NULL;
+  			total_rx_bytes += size;
+  			total_rx_packets++;
+- 			cleaned_count++;
+  
+  			ice_bump_ntc(rx_ring);
+  			continue;
+@@@ -599,10 -594,9 +601,9 @@@
+  		ice_receive_skb(rx_ring, skb, vlan_tag);
+  	}
+  
+- 	if (cleaned_count >= ICE_RX_BUF_WRITE)
+- 		failure = !ice_alloc_rx_bufs_zc(rx_ring, cleaned_count);
++ 	failure = !ice_alloc_rx_bufs_zc(rx_ring, ICE_DESC_UNUSED(rx_ring));
+  
+ -	ice_finalize_xdp_rx(xdp_ring, xdp_xmit);
+ +	ice_finalize_xdp_rx(rx_ring, xdp_xmit);
+  	ice_update_rx_ring_stats(rx_ring, total_rx_packets, total_rx_bytes);
+  
+  	if (xsk_uses_need_wakeup(rx_ring->xsk_pool)) {
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.h b/drivers/net/ethernet/intel/ice/ice_txrx.h
+index 65020bffafd4..123594c2c417 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.h
+@@ -23,7 +23,6 @@
+ #define ICE_MAX_DATA_PER_TXD_ALIGNED \
+ 	(~(ICE_MAX_READ_REQ_SIZE - 1) & ICE_MAX_DATA_PER_TXD)
+ 
+-#define ICE_RX_BUF_WRITE	16	/* Must be power of 2 */
+ #define ICE_MAX_TXQ_PER_TXQG	128
+ 
+ /* Attempt to maximize the headroom available for incoming frames. We use a 2K
+* Unmerged path drivers/net/ethernet/intel/ice/ice_xsk.c
