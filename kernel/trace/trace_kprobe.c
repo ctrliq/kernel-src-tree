@@ -87,6 +87,7 @@ static nokprobe_inline unsigned long trace_kprobe_nhit(struct trace_kprobe *tk)
 	return nhit;
 }
 
+/* Return 0 if it fails to find the symbol address */
 static nokprobe_inline
 unsigned long trace_kprobe_address(struct trace_kprobe *tk)
 {
@@ -95,7 +96,8 @@ unsigned long trace_kprobe_address(struct trace_kprobe *tk)
 	if (tk->symbol) {
 		addr = (unsigned long)
 			kallsyms_lookup_name(trace_kprobe_symbol(tk));
-		addr += tk->rp.kp.offset;
+		if (addr)
+			addr += tk->rp.kp.offset;
 	} else {
 		addr = (unsigned long)tk->rp.kp.addr;
 	}
@@ -512,8 +514,8 @@ static bool within_notrace_func(struct trace_kprobe *tk)
 	unsigned long offset, size, addr;
 
 	addr = trace_kprobe_address(tk);
-	if (!kallsyms_lookup_size_offset(addr, &size, &offset))
-		return true;	/* Out of range. */
+	if (!addr || !kallsyms_lookup_size_offset(addr, &size, &offset))
+		return false;
 
 	return !ftrace_location_range(addr - offset, addr - offset + size);
 }
