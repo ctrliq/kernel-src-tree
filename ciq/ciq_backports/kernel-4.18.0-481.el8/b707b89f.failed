@@ -1,0 +1,662 @@
+eth: switch to netif_napi_add_weight()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit b707b89f7be36147187ebc52d91c085040c26de9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/b707b89f.failed
+
+Switch all Ethernet drivers which use custom napi weights
+to the new API.
+
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b707b89f7be36147187ebc52d91c085040c26de9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/atheros/ag71xx.c
+#	drivers/net/ethernet/huawei/hinic/hinic_tx.c
+#	drivers/net/ethernet/lantiq_etop.c
+#	drivers/net/ethernet/microchip/sparx5/sparx5_fdma.c
+#	drivers/net/ethernet/mscc/ocelot_fdma.c
+#	drivers/net/ethernet/sfc/efx_channels.c
+#	drivers/net/ethernet/xscale/ixp4xx_eth.c
+diff --cc drivers/net/ethernet/huawei/hinic/hinic_tx.c
+index 0fbe8046824b,87408e7bb809..000000000000
+--- a/drivers/net/ethernet/huawei/hinic/hinic_tx.c
++++ b/drivers/net/ethernet/huawei/hinic/hinic_tx.c
+@@@ -701,9 -804,13 +701,16 @@@ static int tx_request_irq(struct hinic_
+  	struct hinic_hwif *hwif = hwdev->hwif;
+  	struct pci_dev *pdev = hwif->pdev;
+  	struct hinic_sq *sq = txq->sq;
+ -	struct hinic_qp *qp;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	tx_napi_add(txq, nic_dev->tx_weight);
+++=======
++ 	qp = container_of(sq, struct hinic_qp, sq);
++ 
++ 	netif_napi_add_weight(txq->netdev, &txq->napi, free_tx_poll,
++ 			      nic_dev->tx_weight);
+++>>>>>>> b707b89f7be3 (eth: switch to netif_napi_add_weight())
+  
+  	hinic_hwdev_msix_set(nic_dev->hwdev, sq->msix_entry,
+  			     TX_IRQ_NO_PENDING, TX_IRQ_NO_COALESC,
+diff --cc drivers/net/ethernet/lantiq_etop.c
+index cfb32bd488b8,7cedbe1fdfd7..000000000000
+--- a/drivers/net/ethernet/lantiq_etop.c
++++ b/drivers/net/ethernet/lantiq_etop.c
+@@@ -680,13 -687,25 +680,21 @@@ ltq_etop_probe(struct platform_device *
+  	spin_lock_init(&priv->lock);
+  	SET_NETDEV_DEV(dev, &pdev->dev);
+  
+ -	err = device_property_read_u32(&pdev->dev, "lantiq,tx-burst-length", &priv->tx_burst_len);
+ -	if (err < 0) {
+ -		dev_err(&pdev->dev, "unable to read tx-burst-length property\n");
+ -		goto err_free;
+ -	}
+ -
+ -	err = device_property_read_u32(&pdev->dev, "lantiq,rx-burst-length", &priv->rx_burst_len);
+ -	if (err < 0) {
+ -		dev_err(&pdev->dev, "unable to read rx-burst-length property\n");
+ -		goto err_free;
+ -	}
+ -
+  	for (i = 0; i < MAX_DMA_CHAN; i++) {
+  		if (IS_TX(i))
+++<<<<<<< HEAD
+ +			netif_napi_add(dev, &priv->ch[i].napi,
+ +				ltq_etop_poll_tx, 8);
+ +		else if (IS_RX(i))
+ +			netif_napi_add(dev, &priv->ch[i].napi,
+ +				ltq_etop_poll_rx, 32);
+++=======
++ 			netif_napi_add_weight(dev, &priv->ch[i].napi,
++ 					      ltq_etop_poll_tx, 8);
++ 		else if (IS_RX(i))
++ 			netif_napi_add_weight(dev, &priv->ch[i].napi,
++ 					      ltq_etop_poll_rx, 32);
+++>>>>>>> b707b89f7be3 (eth: switch to netif_napi_add_weight())
+  		priv->ch[i].netdev = dev;
+  	}
+  
+diff --cc drivers/net/ethernet/sfc/efx_channels.c
+index af8241f0d491,3f28f9861dfa..000000000000
+--- a/drivers/net/ethernet/sfc/efx_channels.c
++++ b/drivers/net/ethernet/sfc/efx_channels.c
+@@@ -1312,7 -1316,8 +1312,12 @@@ void efx_init_napi_channel(struct efx_c
+  	struct efx_nic *efx = channel->efx;
+  
+  	channel->napi_dev = efx->net_dev;
+++<<<<<<< HEAD
+ +	netif_napi_add(channel->napi_dev, &channel->napi_str, efx_poll, 64);
+++=======
++ 	netif_napi_add_weight(channel->napi_dev, &channel->napi_str, efx_poll,
++ 			      napi_weight);
+++>>>>>>> b707b89f7be3 (eth: switch to netif_napi_add_weight())
+  }
+  
+  void efx_init_napi(struct efx_nic *efx)
+diff --cc drivers/net/ethernet/xscale/ixp4xx_eth.c
+index 51b61ffc478f,89770c2e0ffb..000000000000
+--- a/drivers/net/ethernet/xscale/ixp4xx_eth.c
++++ b/drivers/net/ethernet/xscale/ixp4xx_eth.c
+@@@ -1374,58 -1380,110 +1374,62 @@@ static const struct net_device_ops ixp4
+  	.ndo_validate_addr = eth_validate_addr,
+  };
+  
+ -static struct eth_plat_info *ixp4xx_of_get_platdata(struct device *dev)
+ +static int eth_init_one(struct platform_device *pdev)
+  {
+ -	struct device_node *np = dev->of_node;
+ -	struct of_phandle_args queue_spec;
+ -	struct of_phandle_args npe_spec;
+ -	struct device_node *mdio_np;
+ -	struct eth_plat_info *plat;
+ -	int ret;
+ -
+ -	plat = devm_kzalloc(dev, sizeof(*plat), GFP_KERNEL);
+ -	if (!plat)
+ -		return NULL;
+ -
+ -	ret = of_parse_phandle_with_fixed_args(np, "intel,npe-handle", 1, 0,
+ -					       &npe_spec);
+ -	if (ret) {
+ -		dev_err(dev, "no NPE engine specified\n");
+ -		return NULL;
+ -	}
+ -	/* NPE ID 0x00, 0x10, 0x20... */
+ -	plat->npe = (npe_spec.args[0] << 4);
+ -
+ -	/* Check if this device has an MDIO bus */
+ -	mdio_np = of_get_child_by_name(np, "mdio");
+ -	if (mdio_np) {
+ -		plat->has_mdio = true;
+ -		mdio_bus_np = mdio_np;
+ -		/* DO NOT put the mdio_np, it will be used */
+ -	}
+ -
+ -	/* Get the rx queue as a resource from queue manager */
+ -	ret = of_parse_phandle_with_fixed_args(np, "queue-rx", 1, 0,
+ -					       &queue_spec);
+ -	if (ret) {
+ -		dev_err(dev, "no rx queue phandle\n");
+ -		return NULL;
+ -	}
+ -	plat->rxq = queue_spec.args[0];
+ -
+ -	/* Get the txready queue as resource from queue manager */
+ -	ret = of_parse_phandle_with_fixed_args(np, "queue-txready", 1, 0,
+ -					       &queue_spec);
+ -	if (ret) {
+ -		dev_err(dev, "no txready queue phandle\n");
+ -		return NULL;
+ -	}
+ -	plat->txreadyq = queue_spec.args[0];
+ -
+ -	return plat;
+ -}
+ -
+ -static int ixp4xx_eth_probe(struct platform_device *pdev)
+ -{
+ -	struct phy_device *phydev = NULL;
+ -	struct device *dev = &pdev->dev;
+ -	struct device_node *np = dev->of_node;
+ -	struct eth_plat_info *plat;
+ -	struct net_device *ndev;
+  	struct port *port;
+ +	struct net_device *dev;
+ +	struct eth_plat_info *plat = dev_get_platdata(&pdev->dev);
+ +	struct phy_device *phydev = NULL;
+ +	u32 regs_phys;
+ +	char phy_id[MII_BUS_ID_SIZE + 3];
+  	int err;
+  
+ -	plat = ixp4xx_of_get_platdata(dev);
+ -	if (!plat)
+ -		return -ENODEV;
+ -
+ -	if (!(ndev = devm_alloc_etherdev(dev, sizeof(struct port))))
+ +	if (!(dev = alloc_etherdev(sizeof(struct port))))
+  		return -ENOMEM;
+  
+ -	SET_NETDEV_DEV(ndev, dev);
+ -	port = netdev_priv(ndev);
+ -	port->netdev = ndev;
+ -	port->id = plat->npe;
+ -	port->phc_index = -1;
+ -
+ -	/* Get the port resource and remap */
+ -	port->regs = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
+ -	if (IS_ERR(port->regs))
+ -		return PTR_ERR(port->regs);
+ -
+ -	/* Register the MDIO bus if we have it */
+ -	if (plat->has_mdio) {
+ -		err = ixp4xx_mdio_register(port->regs);
+ -		if (err) {
+ -			dev_err(dev, "failed to register MDIO bus\n");
+ -			return err;
+ -		}
+ +	SET_NETDEV_DEV(dev, &pdev->dev);
+ +	port = netdev_priv(dev);
+ +	port->netdev = dev;
+ +	port->id = pdev->id;
+ +
+ +	switch (port->id) {
+ +	case IXP4XX_ETH_NPEA:
+ +		port->regs = (struct eth_regs __iomem *)IXP4XX_EthA_BASE_VIRT;
+ +		regs_phys  = IXP4XX_EthA_BASE_PHYS;
+ +		break;
+ +	case IXP4XX_ETH_NPEB:
+ +		port->regs = (struct eth_regs __iomem *)IXP4XX_EthB_BASE_VIRT;
+ +		regs_phys  = IXP4XX_EthB_BASE_PHYS;
+ +		break;
+ +	case IXP4XX_ETH_NPEC:
+ +		port->regs = (struct eth_regs __iomem *)IXP4XX_EthC_BASE_VIRT;
+ +		regs_phys  = IXP4XX_EthC_BASE_PHYS;
+ +		break;
+ +	default:
+ +		err = -ENODEV;
+ +		goto err_free;
+  	}
+ -	/* If the instance with the MDIO bus has not yet appeared,
+ -	 * defer probing until it gets probed.
+ -	 */
+ -	if (!mdio_bus)
+ -		return -EPROBE_DEFER;
+  
+ -	ndev->netdev_ops = &ixp4xx_netdev_ops;
+ -	ndev->ethtool_ops = &ixp4xx_ethtool_ops;
+ -	ndev->tx_queue_len = 100;
+ -	/* Inherit the DMA masks from the platform device */
+ -	ndev->dev.dma_mask = dev->dma_mask;
+ -	ndev->dev.coherent_dma_mask = dev->coherent_dma_mask;
+ +	dev->netdev_ops = &ixp4xx_netdev_ops;
+ +	dev->ethtool_ops = &ixp4xx_ethtool_ops;
+ +	dev->tx_queue_len = 100;
+  
+++<<<<<<< HEAD
+ +	netif_napi_add(dev, &port->napi, eth_poll, NAPI_WEIGHT);
+++=======
++ 	netif_napi_add_weight(ndev, &port->napi, eth_poll, NAPI_WEIGHT);
+++>>>>>>> b707b89f7be3 (eth: switch to netif_napi_add_weight())
+  
+ -	if (!(port->npe = npe_request(NPE_ID(port->id))))
+ -		return -EIO;
+ +	if (!(port->npe = npe_request(NPE_ID(port->id)))) {
+ +		err = -EIO;
+ +		goto err_free;
+ +	}
+ +
+ +	port->mem_res = request_mem_region(regs_phys, REGS_SIZE, dev->name);
+ +	if (!port->mem_res) {
+ +		err = -EBUSY;
+ +		goto err_npe_rel;
+ +	}
+  
+  	port->plat = plat;
+  	npe_port_tab[NPE_ID(port->id)] = port;
+* Unmerged path drivers/net/ethernet/atheros/ag71xx.c
+* Unmerged path drivers/net/ethernet/microchip/sparx5/sparx5_fdma.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_fdma.c
+diff --git a/drivers/net/ethernet/3com/typhoon.c b/drivers/net/ethernet/3com/typhoon.c
+index 1d43c1d7ab9a..a5be2bc13a98 100644
+--- a/drivers/net/ethernet/3com/typhoon.c
++++ b/drivers/net/ethernet/3com/typhoon.c
+@@ -2439,7 +2439,7 @@ typhoon_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 
+ 	/* The chip-specific entries in the device structure. */
+ 	dev->netdev_ops		= &typhoon_netdev_ops;
+-	netif_napi_add(dev, &tp->napi, typhoon_poll, 16);
++	netif_napi_add_weight(dev, &tp->napi, typhoon_poll, 16);
+ 	dev->watchdog_timeo	= TX_TIMEOUT;
+ 
+ 	dev->ethtool_ops = &typhoon_ethtool_ops;
+diff --git a/drivers/net/ethernet/adaptec/starfire.c b/drivers/net/ethernet/adaptec/starfire.c
+index 265400c7061b..77dc48e7a917 100644
+--- a/drivers/net/ethernet/adaptec/starfire.c
++++ b/drivers/net/ethernet/adaptec/starfire.c
+@@ -785,7 +785,7 @@ static int starfire_init_one(struct pci_dev *pdev,
+ 	dev->watchdog_timeo = TX_TIMEOUT;
+ 	dev->ethtool_ops = &ethtool_ops;
+ 
+-	netif_napi_add(dev, &np->napi, netdev_poll, max_interrupt_work);
++	netif_napi_add_weight(dev, &np->napi, netdev_poll, max_interrupt_work);
+ 
+ 	if (mtu)
+ 		dev->mtu = mtu;
+diff --git a/drivers/net/ethernet/amd/amd8111e.c b/drivers/net/ethernet/amd/amd8111e.c
+index 28a8629efeed..07eb9bccc67a 100644
+--- a/drivers/net/ethernet/amd/amd8111e.c
++++ b/drivers/net/ethernet/amd/amd8111e.c
+@@ -1851,7 +1851,7 @@ static int amd8111e_probe_one(struct pci_dev *pdev,
+ 	dev->watchdog_timeo = AMD8111E_TX_TIMEOUT;
+ 	dev->min_mtu = AMD8111E_MIN_MTU;
+ 	dev->max_mtu = AMD8111E_MAX_MTU;
+-	netif_napi_add(dev, &lp->napi, amd8111e_rx_poll, 32);
++	netif_napi_add_weight(dev, &lp->napi, amd8111e_rx_poll, 32);
+ 
+ #if AMD8111E_VLAN_TAG_USED
+ 	dev->features |= NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX;
+diff --git a/drivers/net/ethernet/amd/pcnet32.c b/drivers/net/ethernet/amd/pcnet32.c
+index 555ce8df6a1e..08341b007393 100644
+--- a/drivers/net/ethernet/amd/pcnet32.c
++++ b/drivers/net/ethernet/amd/pcnet32.c
+@@ -1888,7 +1888,8 @@ pcnet32_probe1(unsigned long ioaddr, int shared, struct pci_dev *pdev)
+ 	/* napi.weight is used in both the napi and non-napi cases */
+ 	lp->napi.weight = lp->rx_ring_size / 2;
+ 
+-	netif_napi_add(dev, &lp->napi, pcnet32_poll, lp->rx_ring_size / 2);
++	netif_napi_add_weight(dev, &lp->napi, pcnet32_poll,
++			      lp->rx_ring_size / 2);
+ 
+ 	if (fdx && !(lp->options & PCNET32_PORT_ASEL) &&
+ 	    ((cards_found >= MAX_UNITS) || full_duplex[cards_found]))
+diff --git a/drivers/net/ethernet/arc/emac_main.c b/drivers/net/ethernet/arc/emac_main.c
+index 7e94b28aef7b..8ac80c251a0b 100644
+--- a/drivers/net/ethernet/arc/emac_main.c
++++ b/drivers/net/ethernet/arc/emac_main.c
+@@ -997,7 +997,8 @@ int arc_emac_probe(struct net_device *ndev, int interface)
+ 	dev_info(dev, "connected to %s phy with id 0x%x\n",
+ 		 phydev->drv->name, phydev->phy_id);
+ 
+-	netif_napi_add(ndev, &priv->napi, arc_emac_poll, ARC_EMAC_NAPI_WEIGHT);
++	netif_napi_add_weight(ndev, &priv->napi, arc_emac_poll,
++			      ARC_EMAC_NAPI_WEIGHT);
+ 
+ 	err = register_netdev(ndev);
+ 	if (err) {
+* Unmerged path drivers/net/ethernet/atheros/ag71xx.c
+diff --git a/drivers/net/ethernet/broadcom/bcm63xx_enet.c b/drivers/net/ethernet/broadcom/bcm63xx_enet.c
+index b8f8bf9794da..9a7795362975 100644
+--- a/drivers/net/ethernet/broadcom/bcm63xx_enet.c
++++ b/drivers/net/ethernet/broadcom/bcm63xx_enet.c
+@@ -1851,7 +1851,7 @@ static int bcm_enet_probe(struct platform_device *pdev)
+ 
+ 	/* register netdevice */
+ 	dev->netdev_ops = &bcm_enet_ops;
+-	netif_napi_add(dev, &priv->napi, bcm_enet_poll, 16);
++	netif_napi_add_weight(dev, &priv->napi, bcm_enet_poll, 16);
+ 
+ 	dev->ethtool_ops = &bcm_enet_ethtool_ops;
+ 	/* MTU range: 46 - 2028 */
+@@ -2728,7 +2728,7 @@ static int bcm_enetsw_probe(struct platform_device *pdev)
+ 
+ 	/* register netdevice */
+ 	dev->netdev_ops = &bcm_enetsw_ops;
+-	netif_napi_add(dev, &priv->napi, bcm_enet_poll, 16);
++	netif_napi_add_weight(dev, &priv->napi, bcm_enet_poll, 16);
+ 	dev->ethtool_ops = &bcm_enetsw_ethtool_ops;
+ 	SET_NETDEV_DEV(dev, &pdev->dev);
+ 
+diff --git a/drivers/net/ethernet/broadcom/sb1250-mac.c b/drivers/net/ethernet/broadcom/sb1250-mac.c
+index bc2693bf4138..36d6f60d6de4 100644
+--- a/drivers/net/ethernet/broadcom/sb1250-mac.c
++++ b/drivers/net/ethernet/broadcom/sb1250-mac.c
+@@ -2218,7 +2218,7 @@ static int sbmac_init(struct platform_device *pldev, long long base)
+ 	dev->min_mtu = 0;
+ 	dev->max_mtu = ENET_PACKET_SIZE;
+ 
+-	netif_napi_add(dev, &sc->napi, sbmac_poll, 16);
++	netif_napi_add_weight(dev, &sc->napi, sbmac_poll, 16);
+ 
+ 	dev->irq		= UNIT_INT(idx);
+ 
+diff --git a/drivers/net/ethernet/dec/tulip/tulip_core.c b/drivers/net/ethernet/dec/tulip/tulip_core.c
+index 6dc60eec09ae..20848d68feeb 100644
+--- a/drivers/net/ethernet/dec/tulip/tulip_core.c
++++ b/drivers/net/ethernet/dec/tulip/tulip_core.c
+@@ -1691,7 +1691,7 @@ static int tulip_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	dev->netdev_ops = &tulip_netdev_ops;
+ 	dev->watchdog_timeo = TX_TIMEOUT;
+ #ifdef CONFIG_TULIP_NAPI
+-	netif_napi_add(dev, &tp->napi, tulip_poll, 16);
++	netif_napi_add_weight(dev, &tp->napi, tulip_poll, 16);
+ #endif
+ 	dev->ethtool_ops = &ops;
+ 
+diff --git a/drivers/net/ethernet/ezchip/nps_enet.c b/drivers/net/ethernet/ezchip/nps_enet.c
+index 6c79112c1643..4ab919949f77 100644
+--- a/drivers/net/ethernet/ezchip/nps_enet.c
++++ b/drivers/net/ethernet/ezchip/nps_enet.c
+@@ -626,8 +626,8 @@ static s32 nps_enet_probe(struct platform_device *pdev)
+ 		goto out_netdev;
+ 	}
+ 
+-	netif_napi_add(ndev, &priv->napi, nps_enet_poll,
+-		       NPS_ENET_NAPI_POLL_WEIGHT);
++	netif_napi_add_weight(ndev, &priv->napi, nps_enet_poll,
++			      NPS_ENET_NAPI_POLL_WEIGHT);
+ 
+ 	/* Register the driver. Should be the last thing in probe */
+ 	err = register_netdev(ndev);
+diff --git a/drivers/net/ethernet/freescale/fs_enet/fs_enet-main.c b/drivers/net/ethernet/freescale/fs_enet/fs_enet-main.c
+index 9583642db084..7e0a3c0fe8fc 100644
+--- a/drivers/net/ethernet/freescale/fs_enet/fs_enet-main.c
++++ b/drivers/net/ethernet/freescale/fs_enet/fs_enet-main.c
+@@ -1026,7 +1026,8 @@ static int fs_enet_probe(struct platform_device *ofdev)
+ 	ndev->netdev_ops = &fs_enet_netdev_ops;
+ 	ndev->watchdog_timeo = 2 * HZ;
+ 	INIT_WORK(&fep->timeout_work, fs_timeout_work);
+-	netif_napi_add(ndev, &fep->napi, fs_enet_napi, fpi->napi_weight);
++	netif_napi_add_weight(ndev, &fep->napi, fs_enet_napi,
++			      fpi->napi_weight);
+ 
+ 	ndev->ethtool_ops = &fs_ethtool_ops;
+ 
+diff --git a/drivers/net/ethernet/hisilicon/hisi_femac.c b/drivers/net/ethernet/hisilicon/hisi_femac.c
+index 841f029cbffc..e2bc205cb9f8 100644
+--- a/drivers/net/ethernet/hisilicon/hisi_femac.c
++++ b/drivers/net/ethernet/hisilicon/hisi_femac.c
+@@ -879,7 +879,8 @@ static int hisi_femac_drv_probe(struct platform_device *pdev)
+ 	ndev->priv_flags |= IFF_UNICAST_FLT;
+ 	ndev->netdev_ops = &hisi_femac_netdev_ops;
+ 	ndev->ethtool_ops = &hisi_femac_ethtools_ops;
+-	netif_napi_add(ndev, &priv->napi, hisi_femac_poll, FEMAC_POLL_WEIGHT);
++	netif_napi_add_weight(ndev, &priv->napi, hisi_femac_poll,
++			      FEMAC_POLL_WEIGHT);
+ 
+ 	hisi_femac_port_init(priv);
+ 
+diff --git a/drivers/net/ethernet/huawei/hinic/hinic_rx.c b/drivers/net/ethernet/huawei/hinic/hinic_rx.c
+index b6d218768ec1..1366f32b0e0a 100644
+--- a/drivers/net/ethernet/huawei/hinic/hinic_rx.c
++++ b/drivers/net/ethernet/huawei/hinic/hinic_rx.c
+@@ -401,7 +401,8 @@ static void rx_add_napi(struct hinic_rxq *rxq)
+ {
+ 	struct hinic_dev *nic_dev = netdev_priv(rxq->netdev);
+ 
+-	netif_napi_add(rxq->netdev, &rxq->napi, rx_poll, nic_dev->rx_weight);
++	netif_napi_add_weight(rxq->netdev, &rxq->napi, rx_poll,
++			      nic_dev->rx_weight);
+ 	napi_enable(&rxq->napi);
+ }
+ 
+* Unmerged path drivers/net/ethernet/huawei/hinic/hinic_tx.c
+diff --git a/drivers/net/ethernet/ibm/emac/mal.c b/drivers/net/ethernet/ibm/emac/mal.c
+index fff09dcf9e34..9326454093b8 100644
+--- a/drivers/net/ethernet/ibm/emac/mal.c
++++ b/drivers/net/ethernet/ibm/emac/mal.c
+@@ -610,8 +610,8 @@ static int mal_probe(struct platform_device *ofdev)
+ 
+ 	init_dummy_netdev(&mal->dummy_dev);
+ 
+-	netif_napi_add(&mal->dummy_dev, &mal->napi, mal_poll,
+-		       CONFIG_IBM_EMAC_POLL_WEIGHT);
++	netif_napi_add_weight(&mal->dummy_dev, &mal->napi, mal_poll,
++			      CONFIG_IBM_EMAC_POLL_WEIGHT);
+ 
+ 	/* Load power-on reset defaults */
+ 	mal_reset(mal);
+diff --git a/drivers/net/ethernet/ibm/ibmveth.c b/drivers/net/ethernet/ibm/ibmveth.c
+index e59ed768b792..2020d7314d07 100644
+--- a/drivers/net/ethernet/ibm/ibmveth.c
++++ b/drivers/net/ethernet/ibm/ibmveth.c
+@@ -1697,7 +1697,7 @@ static int ibmveth_probe(struct vio_dev *dev, const struct vio_device_id *id)
+ 	adapter->mcastFilterSize = *mcastFilterSize_p;
+ 	adapter->pool_config = 0;
+ 
+-	netif_napi_add(netdev, &adapter->napi, ibmveth_poll, 16);
++	netif_napi_add_weight(netdev, &adapter->napi, ibmveth_poll, 16);
+ 
+ 	netdev->irq = dev->irq;
+ 	netdev->netdev_ops = &ibmveth_netdev_ops;
+diff --git a/drivers/net/ethernet/intel/e100.c b/drivers/net/ethernet/intel/e100.c
+index 49a6522f3df1..81d142d9fe8c 100644
+--- a/drivers/net/ethernet/intel/e100.c
++++ b/drivers/net/ethernet/intel/e100.c
+@@ -2836,7 +2836,7 @@ static int e100_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	strncpy(netdev->name, pci_name(pdev), sizeof(netdev->name) - 1);
+ 
+ 	nic = netdev_priv(netdev);
+-	netif_napi_add(netdev, &nic->napi, e100_poll, E100_NAPI_WEIGHT);
++	netif_napi_add_weight(netdev, &nic->napi, e100_poll, E100_NAPI_WEIGHT);
+ 	nic->netdev = netdev;
+ 	nic->pdev = pdev;
+ 	nic->msg_enable = (1 << debug) - 1;
+* Unmerged path drivers/net/ethernet/lantiq_etop.c
+diff --git a/drivers/net/ethernet/marvell/pxa168_eth.c b/drivers/net/ethernet/marvell/pxa168_eth.c
+index a61f0b6c374b..78d01a1c6811 100644
+--- a/drivers/net/ethernet/marvell/pxa168_eth.c
++++ b/drivers/net/ethernet/marvell/pxa168_eth.c
+@@ -1500,7 +1500,8 @@ static int pxa168_eth_probe(struct platform_device *pdev)
+ 
+ 	/* Hardware supports only 3 ports */
+ 	BUG_ON(pep->port_num > 2);
+-	netif_napi_add(dev, &pep->napi, pxa168_rx_poll, pep->rx_ring_size);
++	netif_napi_add_weight(dev, &pep->napi, pxa168_rx_poll,
++			      pep->rx_ring_size);
+ 
+ 	memset(&pep->timeout, 0, sizeof(struct timer_list));
+ 	timer_setup(&pep->timeout, rxq_refill_timer_wrapper, 0);
+* Unmerged path drivers/net/ethernet/microchip/sparx5/sparx5_fdma.c
+diff --git a/drivers/net/ethernet/microsoft/mana/mana_en.c b/drivers/net/ethernet/microsoft/mana/mana_en.c
+index 0bdbcbe67966..f5326a89814d 100644
+--- a/drivers/net/ethernet/microsoft/mana/mana_en.c
++++ b/drivers/net/ethernet/microsoft/mana/mana_en.c
+@@ -1730,7 +1730,7 @@ static struct mana_rxq *mana_create_rxq(struct mana_port_context *apc,
+ 
+ 	gc->cq_table[cq->gdma_id] = cq->gdma_cq;
+ 
+-	netif_napi_add(ndev, &cq->napi, mana_poll, 1);
++	netif_napi_add_weight(ndev, &cq->napi, mana_poll, 1);
+ 
+ 	WARN_ON(xdp_rxq_info_reg(&rxq->xdp_rxq, ndev, rxq_idx,
+ 				 cq->napi.napi_id));
+diff --git a/drivers/net/ethernet/moxa/moxart_ether.c b/drivers/net/ethernet/moxa/moxart_ether.c
+index b34055ac476f..d3a40d1dd362 100644
+--- a/drivers/net/ethernet/moxa/moxart_ether.c
++++ b/drivers/net/ethernet/moxa/moxart_ether.c
+@@ -531,7 +531,7 @@ static int moxart_mac_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	ndev->netdev_ops = &moxart_netdev_ops;
+-	netif_napi_add(ndev, &priv->napi, moxart_rx_poll, RX_DESC_NUM);
++	netif_napi_add_weight(ndev, &priv->napi, moxart_rx_poll, RX_DESC_NUM);
+ 	ndev->priv_flags |= IFF_UNICAST_FLT;
+ 	ndev->irq = irq;
+ 
+* Unmerged path drivers/net/ethernet/mscc/ocelot_fdma.c
+diff --git a/drivers/net/ethernet/myricom/myri10ge/myri10ge.c b/drivers/net/ethernet/myricom/myri10ge/myri10ge.c
+index ca7cc4957860..ce17d1665a8c 100644
+--- a/drivers/net/ethernet/myricom/myri10ge/myri10ge.c
++++ b/drivers/net/ethernet/myricom/myri10ge/myri10ge.c
+@@ -3621,8 +3621,8 @@ static int myri10ge_alloc_slices(struct myri10ge_priv *mgp)
+ 			goto abort;
+ 		ss->mgp = mgp;
+ 		ss->dev = mgp->dev;
+-		netif_napi_add(ss->dev, &ss->napi, myri10ge_poll,
+-			       myri10ge_napi_weight);
++		netif_napi_add_weight(ss->dev, &ss->napi, myri10ge_poll,
++				      myri10ge_napi_weight);
+ 	}
+ 	return 0;
+ abort:
+diff --git a/drivers/net/ethernet/neterion/vxge/vxge-main.c b/drivers/net/ethernet/neterion/vxge/vxge-main.c
+index fb6410f7fe50..f63ddddd1eae 100644
+--- a/drivers/net/ethernet/neterion/vxge/vxge-main.c
++++ b/drivers/net/ethernet/neterion/vxge/vxge-main.c
+@@ -2733,8 +2733,8 @@ static int vxge_open(struct net_device *dev)
+ 	}
+ 
+ 	if (vdev->config.intr_type != MSI_X) {
+-		netif_napi_add(dev, &vdev->napi, vxge_poll_inta,
+-			vdev->config.napi_weight);
++		netif_napi_add_weight(dev, &vdev->napi, vxge_poll_inta,
++				      vdev->config.napi_weight);
+ 		napi_enable(&vdev->napi);
+ 		for (i = 0; i < vdev->no_of_vpath; i++) {
+ 			vpath = &vdev->vpaths[i];
+@@ -2743,8 +2743,9 @@ static int vxge_open(struct net_device *dev)
+ 	} else {
+ 		for (i = 0; i < vdev->no_of_vpath; i++) {
+ 			vpath = &vdev->vpaths[i];
+-			netif_napi_add(dev, &vpath->ring.napi,
+-			    vxge_poll_msix, vdev->config.napi_weight);
++			netif_napi_add_weight(dev, &vpath->ring.napi,
++					      vxge_poll_msix,
++					      vdev->config.napi_weight);
+ 			napi_enable(&vpath->ring.napi);
+ 			vpath->ring.napi_p = &vpath->ring.napi;
+ 		}
+diff --git a/drivers/net/ethernet/nxp/lpc_eth.c b/drivers/net/ethernet/nxp/lpc_eth.c
+index fb319591e119..16aebfd91697 100644
+--- a/drivers/net/ethernet/nxp/lpc_eth.c
++++ b/drivers/net/ethernet/nxp/lpc_eth.c
+@@ -1406,7 +1406,7 @@ static int lpc_eth_drv_probe(struct platform_device *pdev)
+ 	pldat->duplex = DUPLEX_FULL;
+ 	__lpc_params_setup(pldat);
+ 
+-	netif_napi_add(ndev, &pldat->napi, lpc_eth_poll, NAPI_WEIGHT);
++	netif_napi_add_weight(ndev, &pldat->napi, lpc_eth_poll, NAPI_WEIGHT);
+ 
+ 	ret = register_netdev(ndev);
+ 	if (ret) {
+diff --git a/drivers/net/ethernet/realtek/8139cp.c b/drivers/net/ethernet/realtek/8139cp.c
+index 3a49f41d811c..2376496626a8 100644
+--- a/drivers/net/ethernet/realtek/8139cp.c
++++ b/drivers/net/ethernet/realtek/8139cp.c
+@@ -1987,7 +1987,7 @@ static int cp_init_one (struct pci_dev *pdev, const struct pci_device_id *ent)
+ 		    cpu_to_le16(read_eeprom (regs, i + 7, addr_len));
+ 
+ 	dev->netdev_ops = &cp_netdev_ops;
+-	netif_napi_add(dev, &cp->napi, cp_rx_poll, 16);
++	netif_napi_add_weight(dev, &cp->napi, cp_rx_poll, 16);
+ 	dev->ethtool_ops = &cp_ethtool_ops;
+ 	dev->watchdog_timeo = TX_TIMEOUT;
+ 
+* Unmerged path drivers/net/ethernet/sfc/efx_channels.c
+diff --git a/drivers/net/ethernet/sfc/falcon/efx.c b/drivers/net/ethernet/sfc/falcon/efx.c
+index 24822d21fe03..f6607adfde38 100644
+--- a/drivers/net/ethernet/sfc/falcon/efx.c
++++ b/drivers/net/ethernet/sfc/falcon/efx.c
+@@ -2021,8 +2021,8 @@ static void ef4_init_napi_channel(struct ef4_channel *channel)
+ 	struct ef4_nic *efx = channel->efx;
+ 
+ 	channel->napi_dev = efx->net_dev;
+-	netif_napi_add(channel->napi_dev, &channel->napi_str,
+-		       ef4_poll, napi_weight);
++	netif_napi_add_weight(channel->napi_dev, &channel->napi_str, ef4_poll,
++			      napi_weight);
+ }
+ 
+ static void ef4_init_napi(struct ef4_nic *efx)
+diff --git a/drivers/net/ethernet/smsc/smsc911x.c b/drivers/net/ethernet/smsc/smsc911x.c
+index 98a1e6be8571..67e675eac443 100644
+--- a/drivers/net/ethernet/smsc/smsc911x.c
++++ b/drivers/net/ethernet/smsc/smsc911x.c
+@@ -2317,7 +2317,8 @@ static int smsc911x_init(struct net_device *dev)
+ 		return -ENODEV;
+ 
+ 	dev->flags |= IFF_MULTICAST;
+-	netif_napi_add(dev, &pdata->napi, smsc911x_poll, SMSC_NAPI_WEIGHT);
++	netif_napi_add_weight(dev, &pdata->napi, smsc911x_poll,
++			      SMSC_NAPI_WEIGHT);
+ 	dev->netdev_ops = &smsc911x_netdev_ops;
+ 	dev->ethtool_ops = &smsc911x_ethtool_ops;
+ 
+diff --git a/drivers/net/ethernet/toshiba/tc35815.c b/drivers/net/ethernet/toshiba/tc35815.c
+index b802ba8746ae..94fd7b1261aa 100644
+--- a/drivers/net/ethernet/toshiba/tc35815.c
++++ b/drivers/net/ethernet/toshiba/tc35815.c
+@@ -802,7 +802,7 @@ static int tc35815_init_one(struct pci_dev *pdev,
+ 	dev->netdev_ops = &tc35815_netdev_ops;
+ 	dev->ethtool_ops = &tc35815_ethtool_ops;
+ 	dev->watchdog_timeo = TC35815_TX_TIMEOUT;
+-	netif_napi_add(dev, &lp->napi, tc35815_poll, NAPI_WEIGHT);
++	netif_napi_add_weight(dev, &lp->napi, tc35815_poll, NAPI_WEIGHT);
+ 
+ 	dev->irq = pdev->irq;
+ 	dev->base_addr = (unsigned long)ioaddr;
+diff --git a/drivers/net/ethernet/wiznet/w5100.c b/drivers/net/ethernet/wiznet/w5100.c
+index ca2d4c1abe1e..c5712380e829 100644
+--- a/drivers/net/ethernet/wiznet/w5100.c
++++ b/drivers/net/ethernet/wiznet/w5100.c
+@@ -1135,7 +1135,7 @@ int w5100_probe(struct device *dev, const struct w5100_ops *ops,
+ 
+ 	ndev->netdev_ops = &w5100_netdev_ops;
+ 	ndev->ethtool_ops = &w5100_ethtool_ops;
+-	netif_napi_add(ndev, &priv->napi, w5100_napi_poll, 16);
++	netif_napi_add_weight(ndev, &priv->napi, w5100_napi_poll, 16);
+ 
+ 	/* This chip doesn't support VLAN packets with normal MTU,
+ 	 * so disable VLAN for this device.
+diff --git a/drivers/net/ethernet/wiznet/w5300.c b/drivers/net/ethernet/wiznet/w5300.c
+index 0d13299cc2c8..4e8353483698 100644
+--- a/drivers/net/ethernet/wiznet/w5300.c
++++ b/drivers/net/ethernet/wiznet/w5300.c
+@@ -604,7 +604,7 @@ static int w5300_probe(struct platform_device *pdev)
+ 	ndev->netdev_ops = &w5300_netdev_ops;
+ 	ndev->ethtool_ops = &w5300_ethtool_ops;
+ 	ndev->watchdog_timeo = HZ;
+-	netif_napi_add(ndev, &priv->napi, w5300_napi_poll, 16);
++	netif_napi_add_weight(ndev, &priv->napi, w5300_napi_poll, 16);
+ 
+ 	/* This chip doesn't support VLAN packets with normal MTU,
+ 	 * so disable VLAN for this device.
+* Unmerged path drivers/net/ethernet/xscale/ixp4xx_eth.c
