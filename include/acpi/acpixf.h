@@ -3,7 +3,7 @@
  *
  * Name: acpixf.h - External interfaces to the ACPI subsystem
  *
- * Copyright (C) 2000 - 2022, Intel Corp.
+ * Copyright (C) 2000 - 2023, Intel Corp.
  *
  *****************************************************************************/
 
@@ -652,6 +652,16 @@ ACPI_EXTERNAL_RETURN_STATUS(acpi_status
 								acpi_adr_space_setup
 								setup,
 								void *context))
+ACPI_EXTERNAL_RETURN_STATUS(acpi_status
+			    acpi_install_address_space_handler_no_reg
+			    (acpi_handle device, acpi_adr_space_type space_id,
+			     acpi_adr_space_handler handler,
+			     acpi_adr_space_setup setup,
+			     void *context))
+ACPI_EXTERNAL_RETURN_STATUS(acpi_status
+			    acpi_execute_reg_methods(acpi_handle device,
+						     acpi_adr_space_type
+						     space_id))
 ACPI_EXTERNAL_RETURN_STATUS(acpi_status
 			     acpi_remove_address_space_handler(acpi_handle
 							       device,

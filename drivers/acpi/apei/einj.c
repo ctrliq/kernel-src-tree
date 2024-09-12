@@ -603,12 +603,13 @@ static const char * const einj_error_type_string[] = {
 static int available_error_type_show(struct seq_file *m, void *v)
 {
 	int rc;
+	int pos;
 	u32 available_error_type = 0;
 
 	rc = einj_get_available_error_type(&available_error_type);
 	if (rc)
 		return rc;
-	for (int pos = 0; pos < ARRAY_SIZE(einj_error_type_string); pos++)
+	for (pos = 0; pos < ARRAY_SIZE(einj_error_type_string); pos++)
 		if (available_error_type & BIT(pos))
 			seq_puts(m, einj_error_type_string[pos]);
 

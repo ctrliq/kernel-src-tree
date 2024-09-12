@@ -365,27 +365,15 @@ out:
 }
 
 struct amd_lps0_hid_device_data {
-	const unsigned int rev_id;
 	const bool check_off_by_one;
-	const bool prefer_amd_guid;
 };
 
 static const struct amd_lps0_hid_device_data amd_picasso = {
-	.rev_id = 0,
 	.check_off_by_one = true,
-	.prefer_amd_guid = false,
 };
 
 static const struct amd_lps0_hid_device_data amd_cezanne = {
-	.rev_id = 0,
 	.check_off_by_one = false,
-	.prefer_amd_guid = false,
-};
-
-static const struct amd_lps0_hid_device_data amd_rembrandt = {
-	.rev_id = 2,
-	.check_off_by_one = false,
-	.prefer_amd_guid = true,
 };
 
 static const struct acpi_device_id amd_hid_ids[] = {
@@ -393,35 +381,28 @@ static const struct acpi_device_id amd_hid_ids[] = {
 	{"AMD0005",	(kernel_ulong_t)&amd_picasso,	},
 	{"AMDI0005",	(kernel_ulong_t)&amd_picasso,	},
 	{"AMDI0006",	(kernel_ulong_t)&amd_cezanne,	},
-	{"AMDI0007",	(kernel_ulong_t)&amd_rembrandt,	},
 	{}
 };
 
-static int lps0_prefer_microsoft(const struct dmi_system_id *id)
+static int lps0_prefer_amd(const struct dmi_system_id *id)
 {
-	pr_debug("Preferring Microsoft GUID.\n");
-	prefer_microsoft_dsm_guid = true;
+	pr_debug("Using AMD GUID w/ _REV 2.\n");
+	rev_id = 2;
 	return 0;
 }
 
 static const struct dmi_system_id s2idle_dmi_table[] __initconst = {
 	{
 		/*
-		 * ASUS TUF Gaming A17 FA707RE
-		 * https://bugzilla.kernel.org/show_bug.cgi?id=216101
+		 * AMD Rembrandt based HP EliteBook 835/845/865 G9
+		 * Contains specialized AML in AMD/_REV 2 path to avoid
+		 * triggering a bug in Qualcomm WLAN firmware. This may be
+		 * removed in the future if that firmware is fixed.
 		 */
-		.callback = lps0_prefer_microsoft,
+		.callback = lps0_prefer_amd,
 		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
-			DMI_MATCH(DMI_PRODUCT_NAME, "ASUS TUF Gaming A17"),
-		},
-	},
-	{
-		/* ASUS ROG Zephyrus G14 (2022) */
-		.callback = lps0_prefer_microsoft,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
-			DMI_MATCH(DMI_PRODUCT_NAME, "ROG Zephyrus G14 GA402"),
+			DMI_MATCH(DMI_BOARD_VENDOR, "HP"),
+			DMI_MATCH(DMI_BOARD_NAME, "8990"),
 		},
 	},
 	{}
@@ -433,6 +414,9 @@ static int lps0_device_attach(struct acpi_device *adev,
 	if (lps0_device_handle)
 		return 0;
 
+	lps0_dsm_func_mask_microsoft = validate_dsm(adev->handle,
+						    ACPI_LPS0_DSM_UUID_MICROSOFT, 0,
+						    &lps0_dsm_guid_microsoft);
 	if (acpi_s2idle_vendor_amd()) {
 		static const struct acpi_device_id *dev_id;
 		const struct amd_lps0_hid_device_data *data;
@@ -443,20 +427,15 @@ static int lps0_device_attach(struct acpi_device *adev,
 		if (dev_id->id[0])
 			data = (const struct amd_lps0_hid_device_data *) dev_id->driver_data;
 		else
-			data = &amd_rembrandt;
-		rev_id = data->rev_id;
+			data = &amd_cezanne;
+
 		lps0_dsm_func_mask = validate_dsm(adev->handle,
 					ACPI_LPS0_DSM_UUID_AMD, rev_id, &lps0_dsm_guid);
-		lps0_dsm_func_mask_microsoft = validate_dsm(adev->handle,
-					ACPI_LPS0_DSM_UUID_MICROSOFT, 0,
-					&lps0_dsm_guid_microsoft);
 		if (lps0_dsm_func_mask > 0x3 && data->check_off_by_one) {
 			lps0_dsm_func_mask = (lps0_dsm_func_mask << 1) | 0x1;
 			acpi_handle_debug(adev->handle, "_DSM UUID %s: Adjusted function mask: 0x%x\n",
 					  ACPI_LPS0_DSM_UUID_AMD, lps0_dsm_func_mask);
-		} else if (lps0_dsm_func_mask_microsoft > 0 && data->prefer_amd_guid &&
-				(!strcmp(hid, "AMDI0007") ||
-				 !strcmp(hid, "AMDI0008"))) {
+		} else if (lps0_dsm_func_mask_microsoft > 0 && rev_id) {
 			lps0_dsm_func_mask_microsoft = -EINVAL;
 			acpi_handle_debug(adev->handle, "_DSM Using AMD method\n");
 		}

@@ -41,7 +41,7 @@ static acpi_status tb_acpi_add_link(acpi_handle handle, u32 level, void *data,
 		if (dev)
 			break;
 
-		adev = adev->parent;
+		adev = acpi_dev_parent(adev);
 	} while (adev);
 
 	/*
