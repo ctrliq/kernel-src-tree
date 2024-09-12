@@ -1,0 +1,700 @@
+RDMA/mlx5: Use mlx5_umr_post_send_wait() to rereg pd access
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Aharon Landau <aharonl@nvidia.com>
+commit 483196764091621b8dd45d7af29e7a9c874a9f19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/48319676.failed
+
+Move rereg_pd_access logic to umr.c, and use mlx5_umr_post_send_wait()
+instead of mlx5_ib_post_send_wait().
+
+Link: https://lore.kernel.org/r/18da4f47edbc2561f652b7ee4e7a5269e866af77.1649747695.git.leonro@nvidia.com
+	Signed-off-by: Aharon Landau <aharonl@nvidia.com>
+	Reviewed-by: Michael Guralnik <michaelgur@nvidia.com>
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 483196764091621b8dd45d7af29e7a9c874a9f19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mr.c
+#	drivers/infiniband/hw/mlx5/umr.c
+#	drivers/infiniband/hw/mlx5/umr.h
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index 1faf0a4d0186,50b4ccd38fe2..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -1561,52 -1532,187 +1561,122 @@@ error
+  	return ERR_PTR(err);
+  }
+  
+ -struct ib_mr *mlx5_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ -				  u64 iova, int access_flags,
+ -				  struct ib_udata *udata)
+ -{
+ -	struct mlx5_ib_dev *dev = to_mdev(pd->device);
+ -	struct ib_umem *umem;
+ -
+ -	if (!IS_ENABLED(CONFIG_INFINIBAND_USER_MEM))
+ -		return ERR_PTR(-EOPNOTSUPP);
+ -
+ -	mlx5_ib_dbg(dev, "start 0x%llx, iova 0x%llx, length 0x%llx, access_flags 0x%x\n",
+ -		    start, iova, length, access_flags);
+ -
+ -	if (access_flags & IB_ACCESS_ON_DEMAND)
+ -		return create_user_odp_mr(pd, start, length, iova, access_flags,
+ -					  udata);
+ -	umem = ib_umem_get(&dev->ib_dev, start, length, access_flags);
+ -	if (IS_ERR(umem))
+ -		return ERR_CAST(umem);
+ -	return create_real_mr(pd, umem, iova, access_flags);
+ -}
+ -
+ -static void mlx5_ib_dmabuf_invalidate_cb(struct dma_buf_attachment *attach)
+ +/**
+ + * revoke_mr - Fence all DMA on the MR
+ + * @mr: The MR to fence
+ + *
+ + * Upon return the NIC will not be doing any DMA to the pages under the MR,
+ + * and any DMA in progress will be completed. Failure of this function
+ + * indicates the HW has failed catastrophically.
+ + */
+ +static int revoke_mr(struct mlx5_ib_mr *mr)
+  {
+ -	struct ib_umem_dmabuf *umem_dmabuf = attach->importer_priv;
+ -	struct mlx5_ib_mr *mr = umem_dmabuf->private;
+ +	struct mlx5_umr_wr umrwr = {};
+  
+ -	dma_resv_assert_held(umem_dmabuf->attach->dmabuf->resv);
+ +	if (mr_to_mdev(mr)->mdev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR)
+ +		return 0;
+  
+ -	if (!umem_dmabuf->sgt)
+ -		return;
+ +	umrwr.wr.send_flags = MLX5_IB_SEND_UMR_DISABLE_MR |
+ +			      MLX5_IB_SEND_UMR_UPDATE_PD_ACCESS;
+ +	umrwr.wr.opcode = MLX5_IB_WR_UMR;
+ +	umrwr.pd = mr_to_mdev(mr)->umrc.pd;
+ +	umrwr.mkey = mr->mmkey.key;
+ +	umrwr.ignore_free_state = 1;
+  
+ -	mlx5_ib_update_mr_pas(mr, MLX5_IB_UPD_XLT_ZAP);
+ -	ib_umem_dmabuf_unmap_pages(umem_dmabuf);
+ +	return mlx5_ib_post_send_wait(mr_to_mdev(mr), &umrwr);
+  }
+  
+ -static struct dma_buf_attach_ops mlx5_ib_dmabuf_attach_ops = {
+ -	.allow_peer2peer = 1,
+ -	.move_notify = mlx5_ib_dmabuf_invalidate_cb,
+ -};
+ -
+ -struct ib_mr *mlx5_ib_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset,
+ -					 u64 length, u64 virt_addr,
+ -					 int fd, int access_flags,
+ -					 struct ib_udata *udata)
+++<<<<<<< HEAD
+ +static int rereg_umr(struct ib_pd *pd, struct mlx5_ib_mr *mr,
+ +		     int access_flags, int flags)
+  {
+  	struct mlx5_ib_dev *dev = to_mdev(pd->device);
+ -	struct mlx5_ib_mr *mr = NULL;
+ -	struct ib_umem_dmabuf *umem_dmabuf;
+ +	struct mlx5_umr_wr umrwr = {};
+  	int err;
+  
+ -	if (!IS_ENABLED(CONFIG_INFINIBAND_USER_MEM) ||
+ -	    !IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING))
+ -		return ERR_PTR(-EOPNOTSUPP);
+ -
+ -	mlx5_ib_dbg(dev,
+ -		    "offset 0x%llx, virt_addr 0x%llx, length 0x%llx, fd %d, access_flags 0x%x\n",
+ -		    offset, virt_addr, length, fd, access_flags);
+ +	umrwr.wr.send_flags = MLX5_IB_SEND_UMR_FAIL_IF_FREE;
+  
+ -	/* dmabuf requires xlt update via umr to work. */
+ -	if (!mlx5r_umr_can_load_pas(dev, length))
+ -		return ERR_PTR(-EINVAL);
+ +	umrwr.wr.opcode = MLX5_IB_WR_UMR;
+ +	umrwr.mkey = mr->mmkey.key;
+  
+ -	umem_dmabuf = ib_umem_dmabuf_get(&dev->ib_dev, offset, length, fd,
+ -					 access_flags,
+ -					 &mlx5_ib_dmabuf_attach_ops);
+ -	if (IS_ERR(umem_dmabuf)) {
+ -		mlx5_ib_dbg(dev, "umem_dmabuf get failed (%ld)\n",
+ -			    PTR_ERR(umem_dmabuf));
+ -		return ERR_CAST(umem_dmabuf);
+ +	if (flags & IB_MR_REREG_PD || flags & IB_MR_REREG_ACCESS) {
+ +		umrwr.pd = pd;
+ +		umrwr.access_flags = access_flags;
+ +		umrwr.wr.send_flags |= MLX5_IB_SEND_UMR_UPDATE_PD_ACCESS;
+  	}
+  
+ -	mr = alloc_cacheable_mr(pd, &umem_dmabuf->umem, virt_addr,
+ -				access_flags);
+ -	if (IS_ERR(mr)) {
+ -		ib_umem_release(&umem_dmabuf->umem);
+ -		return ERR_CAST(mr);
+ -	}
+ -
+ -	mlx5_ib_dbg(dev, "mkey 0x%x\n", mr->mmkey.key);
+ -
+ -	atomic_add(ib_umem_num_pages(mr->umem), &dev->mdev->priv.reg_pages);
+ -	umem_dmabuf->private = mr;
+ -	err = mlx5r_store_odp_mkey(dev, &mr->mmkey);
+ -	if (err)
+ -		goto err_dereg_mr;
+ -
+ -	err = mlx5_ib_init_dmabuf_mr(mr);
+ -	if (err)
+ -		goto err_dereg_mr;
+ -	return &mr->ibmr;
+ -
+ -err_dereg_mr:
+ -	mlx5_ib_dereg_mr(&mr->ibmr, NULL);
+ -	return ERR_PTR(err);
+ -}
+ -
+ -/*
+ - * True if the change in access flags can be done via UMR, only some access
+ - * flags can be updated.
+ - */
+ -static bool can_use_umr_rereg_access(struct mlx5_ib_dev *dev,
+ -				     unsigned int current_access_flags,
+ -				     unsigned int target_access_flags)
+ -{
+ -	unsigned int diffs = current_access_flags ^ target_access_flags;
+ -
+ -	if (diffs & ~(IB_ACCESS_LOCAL_WRITE | IB_ACCESS_REMOTE_WRITE |
+ -		      IB_ACCESS_REMOTE_READ | IB_ACCESS_RELAXED_ORDERING))
+ -		return false;
+ -	return mlx5r_umr_can_reconfig(dev, current_access_flags,
+ -				      target_access_flags);
+ -}
+ +	err = mlx5_ib_post_send_wait(dev, &umrwr);
+  
+ +	return err;
+++=======
++ static bool can_use_umr_rereg_pas(struct mlx5_ib_mr *mr,
++ 				  struct ib_umem *new_umem,
++ 				  int new_access_flags, u64 iova,
++ 				  unsigned long *page_size)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(mr->ibmr.device);
++ 
++ 	/* We only track the allocated sizes of MRs from the cache */
++ 	if (!mr->cache_ent)
++ 		return false;
++ 	if (!mlx5r_umr_can_load_pas(dev, new_umem->length))
++ 		return false;
++ 
++ 	*page_size =
++ 		mlx5_umem_find_best_pgsz(new_umem, mkc, log_page_size, 0, iova);
++ 	if (WARN_ON(!*page_size))
++ 		return false;
++ 	return (1ULL << mr->cache_ent->order) >=
++ 	       ib_umem_num_dma_blocks(new_umem, *page_size);
++ }
++ 
++ static int umr_rereg_pas(struct mlx5_ib_mr *mr, struct ib_pd *pd,
++ 			 int access_flags, int flags, struct ib_umem *new_umem,
++ 			 u64 iova, unsigned long page_size)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(mr->ibmr.device);
++ 	int upd_flags = MLX5_IB_UPD_XLT_ADDR | MLX5_IB_UPD_XLT_ENABLE;
++ 	struct ib_umem *old_umem = mr->umem;
++ 	int err;
++ 
++ 	/*
++ 	 * To keep everything simple the MR is revoked before we start to mess
++ 	 * with it. This ensure the change is atomic relative to any use of the
++ 	 * MR.
++ 	 */
++ 	err = mlx5r_umr_revoke_mr(mr);
++ 	if (err)
++ 		return err;
++ 
++ 	if (flags & IB_MR_REREG_PD) {
++ 		mr->ibmr.pd = pd;
++ 		upd_flags |= MLX5_IB_UPD_XLT_PD;
++ 	}
++ 	if (flags & IB_MR_REREG_ACCESS) {
++ 		mr->access_flags = access_flags;
++ 		upd_flags |= MLX5_IB_UPD_XLT_ACCESS;
++ 	}
++ 
++ 	mr->ibmr.length = new_umem->length;
++ 	mr->ibmr.iova = iova;
++ 	mr->ibmr.length = new_umem->length;
++ 	mr->page_shift = order_base_2(page_size);
++ 	mr->umem = new_umem;
++ 	err = mlx5_ib_update_mr_pas(mr, upd_flags);
++ 	if (err) {
++ 		/*
++ 		 * The MR is revoked at this point so there is no issue to free
++ 		 * new_umem.
++ 		 */
++ 		mr->umem = old_umem;
++ 		return err;
++ 	}
++ 
++ 	atomic_sub(ib_umem_num_pages(old_umem), &dev->mdev->priv.reg_pages);
++ 	ib_umem_release(old_umem);
++ 	atomic_add(ib_umem_num_pages(new_umem), &dev->mdev->priv.reg_pages);
++ 	return 0;
+++>>>>>>> 483196764091 (RDMA/mlx5: Use mlx5_umr_post_send_wait() to rereg pd access)
+  }
+  
+  struct ib_mr *mlx5_ib_rereg_user_mr(struct ib_mr *ib_mr, int flags, u64 start,
+@@@ -1616,104 -1722,93 +1686,135 @@@
+  {
+  	struct mlx5_ib_dev *dev = to_mdev(ib_mr->device);
+  	struct mlx5_ib_mr *mr = to_mmr(ib_mr);
+ +	struct ib_pd *pd = (flags & IB_MR_REREG_PD) ? new_pd : ib_mr->pd;
+ +	int access_flags = flags & IB_MR_REREG_ACCESS ?
+ +			    new_access_flags :
+ +			    mr->access_flags;
+ +	int upd_flags = 0;
+ +	u64 addr, len;
+  	int err;
+  
+ -	if (!IS_ENABLED(CONFIG_INFINIBAND_USER_MEM))
+ +	mlx5_ib_dbg(dev, "start 0x%llx, virt_addr 0x%llx, length 0x%llx, access_flags 0x%x\n",
+ +		    start, virt_addr, length, access_flags);
+ +
+ +	if (!mr->umem)
+ +		return ERR_PTR(-EINVAL);
+ +
+ +	if (is_odp_mr(mr))
+  		return ERR_PTR(-EOPNOTSUPP);
+  
+++<<<<<<< HEAD
+ +	if (flags & IB_MR_REREG_TRANS) {
+ +		addr = virt_addr;
+ +		len = length;
+ +	} else {
+ +		addr = mr->umem->address;
+ +		len = mr->umem->length;
+ +	}
+++=======
++ 	mlx5_ib_dbg(
++ 		dev,
++ 		"start 0x%llx, iova 0x%llx, length 0x%llx, access_flags 0x%x\n",
++ 		start, iova, length, new_access_flags);
++ 
++ 	if (flags & ~(IB_MR_REREG_TRANS | IB_MR_REREG_PD | IB_MR_REREG_ACCESS))
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	if (!(flags & IB_MR_REREG_ACCESS))
++ 		new_access_flags = mr->access_flags;
++ 	if (!(flags & IB_MR_REREG_PD))
++ 		new_pd = ib_mr->pd;
++ 
++ 	if (!(flags & IB_MR_REREG_TRANS)) {
++ 		struct ib_umem *umem;
++ 
++ 		/* Fast path for PD/access change */
++ 		if (can_use_umr_rereg_access(dev, mr->access_flags,
++ 					     new_access_flags)) {
++ 			err = mlx5r_umr_rereg_pd_access(mr, new_pd,
++ 							new_access_flags);
++ 			if (err)
++ 				return ERR_PTR(err);
++ 			return NULL;
++ 		}
++ 		/* DM or ODP MR's don't have a normal umem so we can't re-use it */
++ 		if (!mr->umem || is_odp_mr(mr) || is_dmabuf_mr(mr))
++ 			goto recreate;
+++>>>>>>> 483196764091 (RDMA/mlx5: Use mlx5_umr_post_send_wait() to rereg pd access)
+  
+ +	if (flags != IB_MR_REREG_PD) {
+  		/*
+ -		 * Only one active MR can refer to a umem at one time, revoke
+ -		 * the old MR before assigning the umem to the new one.
+ +		 * Replace umem. This needs to be done whether or not UMR is
+ +		 * used.
+  		 */
+ -		err = mlx5r_umr_revoke_mr(mr);
+ -		if (err)
+ -			return ERR_PTR(err);
+ -		umem = mr->umem;
+ -		mr->umem = NULL;
+ -		atomic_sub(ib_umem_num_pages(umem), &dev->mdev->priv.reg_pages);
+ -
+ -		return create_real_mr(new_pd, umem, mr->ibmr.iova,
+ -				      new_access_flags);
+ +		flags |= IB_MR_REREG_TRANS;
+ +		atomic_sub(ib_umem_num_pages(mr->umem),
+ +			   &dev->mdev->priv.reg_pages);
+ +		ib_umem_release(mr->umem);
+ +		mr->umem = mr_umem_get(dev, udata, addr, len, access_flags);
+ +		if (IS_ERR(mr->umem)) {
+ +			err = PTR_ERR(mr->umem);
+ +			mr->umem = NULL;
+ +			goto err;
+ +		}
+ +		atomic_add(ib_umem_num_pages(mr->umem),
+ +			   &dev->mdev->priv.reg_pages);
+  	}
+  
+ -	/*
+ -	 * DM doesn't have a PAS list so we can't re-use it, odp/dmabuf does
+ -	 * but the logic around releasing the umem is different
+ -	 */
+ -	if (!mr->umem || is_odp_mr(mr) || is_dmabuf_mr(mr))
+ -		goto recreate;
+ -
+ -	if (!(new_access_flags & IB_ACCESS_ON_DEMAND) &&
+ -	    can_use_umr_rereg_access(dev, mr->access_flags, new_access_flags)) {
+ -		struct ib_umem *new_umem;
+ -		unsigned long page_size;
+ -
+ -		new_umem = ib_umem_get(&dev->ib_dev, start, length,
+ -				       new_access_flags);
+ -		if (IS_ERR(new_umem))
+ -			return ERR_CAST(new_umem);
+ -
+ -		/* Fast path for PAS change */
+ -		if (can_use_umr_rereg_pas(mr, new_umem, new_access_flags, iova,
+ -					  &page_size)) {
+ -			err = umr_rereg_pas(mr, new_pd, new_access_flags, flags,
+ -					    new_umem, iova, page_size);
+ -			if (err) {
+ -				ib_umem_release(new_umem);
+ -				return ERR_PTR(err);
+ -			}
+ -			return NULL;
+ +	if (!mlx5_ib_can_reconfig_with_umr(dev, mr->access_flags,
+ +					   access_flags) ||
+ +	    !mlx5_ib_can_load_pas_with_umr(dev, len) ||
+ +	    (flags & IB_MR_REREG_TRANS &&
+ +	     !mlx5_ib_pas_fits_in_mr(mr, addr, len))) {
+ +		/*
+ +		 * UMR can't be used - MKey needs to be replaced.
+ +		 */
+ +		if (mr->cache_ent)
+ +			detach_mr_from_cache(mr);
+ +		err = destroy_mkey(dev, mr);
+ +		if (err)
+ +			goto err;
+ +
+ +		mr = reg_create(ib_mr, pd, mr->umem, addr, access_flags, true);
+ +		if (IS_ERR(mr)) {
+ +			err = PTR_ERR(mr);
+ +			mr = to_mmr(ib_mr);
+ +			goto err;
+ +		}
+ +	} else {
+ +		/*
+ +		 * Send a UMR WQE
+ +		 */
+ +		mr->ibmr.pd = pd;
+ +		mr->access_flags = access_flags;
+ +		mr->ibmr.iova = addr;
+ +		mr->ibmr.length = len;
+ +
+ +		if (flags & IB_MR_REREG_TRANS) {
+ +			upd_flags = MLX5_IB_UPD_XLT_ADDR;
+ +			if (flags & IB_MR_REREG_PD)
+ +				upd_flags |= MLX5_IB_UPD_XLT_PD;
+ +			if (flags & IB_MR_REREG_ACCESS)
+ +				upd_flags |= MLX5_IB_UPD_XLT_ACCESS;
+ +			err = mlx5_ib_update_mr_pas(mr, upd_flags);
+ +		} else {
+ +			err = rereg_umr(pd, mr, access_flags, flags);
+  		}
+ -		return create_real_mr(new_pd, new_umem, iova, new_access_flags);
+ +
+ +		if (err)
+ +			goto err;
+  	}
+  
+ -	/*
+ -	 * Everything else has no state we can preserve, just create a new MR
+ -	 * from scratch
+ -	 */
+ -recreate:
+ -	return mlx5_ib_reg_user_mr(new_pd, start, length, iova,
+ -				   new_access_flags, udata);
+ +	set_mr_fields(dev, mr, len, access_flags, addr);
+ +
+ +	return NULL;
+ +
+ +err:
+ +	ib_umem_release(mr->umem);
+ +	mr->umem = NULL;
+ +
+ +	mlx5_ib_dereg_mr(&mr->ibmr, NULL);
+ +	return ERR_PTR(err);
+  }
+  
+  static int
+diff --cc drivers/infiniband/hw/mlx5/umr.c
+index 46eaf919eb49,716c35258e33..000000000000
+--- a/drivers/infiniband/hw/mlx5/umr.c
++++ b/drivers/infiniband/hw/mlx5/umr.c
+@@@ -104,3 -229,164 +104,167 @@@ void mlx5r_umr_resource_cleanup(struct 
+  	ib_free_cq(dev->umrc.cq);
+  	ib_dealloc_pd(dev->umrc.pd);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int mlx5r_umr_post_send(struct ib_qp *ibqp, u32 mkey, struct ib_cqe *cqe,
++ 			       struct mlx5r_umr_wqe *wqe, bool with_data)
++ {
++ 	unsigned int wqe_size =
++ 		with_data ? sizeof(struct mlx5r_umr_wqe) :
++ 			    sizeof(struct mlx5r_umr_wqe) -
++ 				    sizeof(struct mlx5_wqe_data_seg);
++ 	struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
++ 	struct mlx5_core_dev *mdev = dev->mdev;
++ 	struct mlx5_ib_qp *qp = to_mqp(ibqp);
++ 	struct mlx5_wqe_ctrl_seg *ctrl;
++ 	union {
++ 		struct ib_cqe *ib_cqe;
++ 		u64 wr_id;
++ 	} id;
++ 	void *cur_edge, *seg;
++ 	unsigned long flags;
++ 	unsigned int idx;
++ 	int size, err;
++ 
++ 	if (unlikely(mdev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR))
++ 		return -EIO;
++ 
++ 	spin_lock_irqsave(&qp->sq.lock, flags);
++ 
++ 	err = mlx5r_begin_wqe(qp, &seg, &ctrl, &idx, &size, &cur_edge, 0,
++ 			      cpu_to_be32(mkey), false, false);
++ 	if (WARN_ON(err))
++ 		goto out;
++ 
++ 	qp->sq.wr_data[idx] = MLX5_IB_WR_UMR;
++ 
++ 	mlx5r_memcpy_send_wqe(&qp->sq, &cur_edge, &seg, &size, wqe, wqe_size);
++ 
++ 	id.ib_cqe = cqe;
++ 	mlx5r_finish_wqe(qp, ctrl, seg, size, cur_edge, idx, id.wr_id, 0,
++ 			 MLX5_FENCE_MODE_NONE, MLX5_OPCODE_UMR);
++ 
++ 	mlx5r_ring_db(qp, 1, ctrl);
++ 
++ out:
++ 	spin_unlock_irqrestore(&qp->sq.lock, flags);
++ 
++ 	return err;
++ }
++ 
++ static void mlx5r_umr_done(struct ib_cq *cq, struct ib_wc *wc)
++ {
++ 	struct mlx5_ib_umr_context *context =
++ 		container_of(wc->wr_cqe, struct mlx5_ib_umr_context, cqe);
++ 
++ 	context->status = wc->status;
++ 	complete(&context->done);
++ }
++ 
++ static inline void mlx5r_umr_init_context(struct mlx5r_umr_context *context)
++ {
++ 	context->cqe.done = mlx5r_umr_done;
++ 	init_completion(&context->done);
++ }
++ 
++ static int mlx5r_umr_post_send_wait(struct mlx5_ib_dev *dev, u32 mkey,
++ 				   struct mlx5r_umr_wqe *wqe, bool with_data)
++ {
++ 	struct umr_common *umrc = &dev->umrc;
++ 	struct mlx5r_umr_context umr_context;
++ 	int err;
++ 
++ 	err = umr_check_mkey_mask(dev, be64_to_cpu(wqe->ctrl_seg.mkey_mask));
++ 	if (WARN_ON(err))
++ 		return err;
++ 
++ 	mlx5r_umr_init_context(&umr_context);
++ 
++ 	down(&umrc->sem);
++ 	err = mlx5r_umr_post_send(umrc->qp, mkey, &umr_context.cqe, wqe,
++ 				  with_data);
++ 	if (err)
++ 		mlx5_ib_warn(dev, "UMR post send failed, err %d\n", err);
++ 	else {
++ 		wait_for_completion(&umr_context.done);
++ 		if (umr_context.status != IB_WC_SUCCESS) {
++ 			mlx5_ib_warn(dev, "reg umr failed (%u)\n",
++ 				     umr_context.status);
++ 			err = -EFAULT;
++ 		}
++ 	}
++ 	up(&umrc->sem);
++ 	return err;
++ }
++ 
++ /**
++  * mlx5r_umr_revoke_mr - Fence all DMA on the MR
++  * @mr: The MR to fence
++  *
++  * Upon return the NIC will not be doing any DMA to the pages under the MR,
++  * and any DMA in progress will be completed. Failure of this function
++  * indicates the HW has failed catastrophically.
++  */
++ int mlx5r_umr_revoke_mr(struct mlx5_ib_mr *mr)
++ {
++ 	struct mlx5_ib_dev *dev = mr_to_mdev(mr);
++ 	struct mlx5r_umr_wqe wqe = {};
++ 
++ 	if (dev->mdev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR)
++ 		return 0;
++ 
++ 	wqe.ctrl_seg.mkey_mask |= get_umr_update_pd_mask();
++ 	wqe.ctrl_seg.mkey_mask |= get_umr_disable_mr_mask();
++ 	wqe.ctrl_seg.flags |= MLX5_UMR_INLINE;
++ 
++ 	MLX5_SET(mkc, &wqe.mkey_seg, free, 1);
++ 	MLX5_SET(mkc, &wqe.mkey_seg, pd, to_mpd(dev->umrc.pd)->pdn);
++ 	MLX5_SET(mkc, &wqe.mkey_seg, qpn, 0xffffff);
++ 	MLX5_SET(mkc, &wqe.mkey_seg, mkey_7_0,
++ 		 mlx5_mkey_variant(mr->mmkey.key));
++ 
++ 	return mlx5r_umr_post_send_wait(dev, mr->mmkey.key, &wqe, false);
++ }
++ 
++ static void mlx5r_umr_set_access_flags(struct mlx5_ib_dev *dev,
++ 				       struct mlx5_mkey_seg *seg,
++ 				       unsigned int access_flags)
++ {
++ 	MLX5_SET(mkc, seg, a, !!(access_flags & IB_ACCESS_REMOTE_ATOMIC));
++ 	MLX5_SET(mkc, seg, rw, !!(access_flags & IB_ACCESS_REMOTE_WRITE));
++ 	MLX5_SET(mkc, seg, rr, !!(access_flags & IB_ACCESS_REMOTE_READ));
++ 	MLX5_SET(mkc, seg, lw, !!(access_flags & IB_ACCESS_LOCAL_WRITE));
++ 	MLX5_SET(mkc, seg, lr, 1);
++ 	MLX5_SET(mkc, seg, relaxed_ordering_write,
++ 		 !!(access_flags & IB_ACCESS_RELAXED_ORDERING));
++ 	MLX5_SET(mkc, seg, relaxed_ordering_read,
++ 		 !!(access_flags & IB_ACCESS_RELAXED_ORDERING));
++ }
++ 
++ int mlx5r_umr_rereg_pd_access(struct mlx5_ib_mr *mr, struct ib_pd *pd,
++ 			      int access_flags)
++ {
++ 	struct mlx5_ib_dev *dev = mr_to_mdev(mr);
++ 	struct mlx5r_umr_wqe wqe = {};
++ 	int err;
++ 
++ 	wqe.ctrl_seg.mkey_mask = get_umr_update_access_mask(dev);
++ 	wqe.ctrl_seg.mkey_mask |= get_umr_update_pd_mask();
++ 	wqe.ctrl_seg.flags = MLX5_UMR_CHECK_FREE;
++ 	wqe.ctrl_seg.flags |= MLX5_UMR_INLINE;
++ 
++ 	mlx5r_umr_set_access_flags(dev, &wqe.mkey_seg, access_flags);
++ 	MLX5_SET(mkc, &wqe.mkey_seg, pd, to_mpd(pd)->pdn);
++ 	MLX5_SET(mkc, &wqe.mkey_seg, qpn, 0xffffff);
++ 	MLX5_SET(mkc, &wqe.mkey_seg, mkey_7_0,
++ 		 mlx5_mkey_variant(mr->mmkey.key));
++ 
++ 	err = mlx5r_umr_post_send_wait(dev, mr->mmkey.key, &wqe, false);
++ 	if (err)
++ 		return err;
++ 
++ 	mr->access_flags = access_flags;
++ 	return 0;
++ }
+++>>>>>>> 483196764091 (RDMA/mlx5: Use mlx5_umr_post_send_wait() to rereg pd access)
+diff --cc drivers/infiniband/hw/mlx5/umr.h
+index cb1a2c95aac2,53816316cb1f..000000000000
+--- a/drivers/infiniband/hw/mlx5/umr.h
++++ b/drivers/infiniband/hw/mlx5/umr.h
+@@@ -9,4 -9,90 +9,86 @@@
+  int mlx5r_umr_resource_init(struct mlx5_ib_dev *dev);
+  void mlx5r_umr_resource_cleanup(struct mlx5_ib_dev *dev);
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool mlx5r_umr_can_load_pas(struct mlx5_ib_dev *dev,
++ 					  size_t length)
++ {
++ 	/*
++ 	 * umr_check_mkey_mask() rejects MLX5_MKEY_MASK_PAGE_SIZE which is
++ 	 * always set if MLX5_IB_SEND_UMR_UPDATE_TRANSLATION (aka
++ 	 * MLX5_IB_UPD_XLT_ADDR and MLX5_IB_UPD_XLT_ENABLE) is set. Thus, a mkey
++ 	 * can never be enabled without this capability. Simplify this weird
++ 	 * quirky hardware by just saying it can't use PAS lists with UMR at
++ 	 * all.
++ 	 */
++ 	if (MLX5_CAP_GEN(dev->mdev, umr_modify_entity_size_disabled))
++ 		return false;
++ 
++ 	/*
++ 	 * length is the size of the MR in bytes when mlx5_ib_update_xlt() is
++ 	 * used.
++ 	 */
++ 	if (!MLX5_CAP_GEN(dev->mdev, umr_extended_translation_offset) &&
++ 	    length >= MLX5_MAX_UMR_PAGES * PAGE_SIZE)
++ 		return false;
++ 	return true;
++ }
++ 
++ /*
++  * true if an existing MR can be reconfigured to new access_flags using UMR.
++  * Older HW cannot use UMR to update certain elements of the MKC. See
++  * get_umr_update_access_mask() and umr_check_mkey_mask()
++  */
++ static inline bool mlx5r_umr_can_reconfig(struct mlx5_ib_dev *dev,
++ 					  unsigned int current_access_flags,
++ 					  unsigned int target_access_flags)
++ {
++ 	unsigned int diffs = current_access_flags ^ target_access_flags;
++ 
++ 	if ((diffs & IB_ACCESS_REMOTE_ATOMIC) &&
++ 	    MLX5_CAP_GEN(dev->mdev, atomic) &&
++ 	    MLX5_CAP_GEN(dev->mdev, umr_modify_atomic_disabled))
++ 		return false;
++ 
++ 	if ((diffs & IB_ACCESS_RELAXED_ORDERING) &&
++ 	    MLX5_CAP_GEN(dev->mdev, relaxed_ordering_write) &&
++ 	    !MLX5_CAP_GEN(dev->mdev, relaxed_ordering_write_umr))
++ 		return false;
++ 
++ 	if ((diffs & IB_ACCESS_RELAXED_ORDERING) &&
++ 	    MLX5_CAP_GEN(dev->mdev, relaxed_ordering_read) &&
++ 	    !MLX5_CAP_GEN(dev->mdev, relaxed_ordering_read_umr))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static inline u64 mlx5r_umr_get_xlt_octo(u64 bytes)
++ {
++ 	return ALIGN(bytes, MLX5_IB_UMR_XLT_ALIGNMENT) /
++ 	       MLX5_IB_UMR_OCTOWORD;
++ }
++ 
++ int mlx5r_umr_set_umr_ctrl_seg(struct mlx5_ib_dev *dev,
++ 			       struct mlx5_wqe_umr_ctrl_seg *umr,
++ 			       const struct ib_send_wr *wr);
++ 
++ struct mlx5r_umr_context {
++ 	struct ib_cqe cqe;
++ 	enum ib_wc_status status;
++ 	struct completion done;
++ };
++ 
++ struct mlx5r_umr_wqe {
++ 	struct mlx5_wqe_umr_ctrl_seg ctrl_seg;
++ 	struct mlx5_mkey_seg mkey_seg;
++ 	struct mlx5_wqe_data_seg data_seg;
++ };
++ 
++ int mlx5r_umr_revoke_mr(struct mlx5_ib_mr *mr);
++ int mlx5r_umr_rereg_pd_access(struct mlx5_ib_mr *mr, struct ib_pd *pd,
++ 			      int access_flags);
++ 
+++>>>>>>> 483196764091 (RDMA/mlx5: Use mlx5_umr_post_send_wait() to rereg pd access)
+  #endif /* _MLX5_IB_UMR_H */
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
+* Unmerged path drivers/infiniband/hw/mlx5/umr.c
+* Unmerged path drivers/infiniband/hw/mlx5/umr.h
