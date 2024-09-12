@@ -1,0 +1,644 @@
+x86/boot: Remove run-time relocations from .head.text code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Arvind Sankar <nivedita@alum.mit.edu>
+commit a2c4fc4d4e2c40b07534094810d915c7354d84a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/a2c4fc4d.failed
+
+The assembly code in head_{32,64}.S, while meant to be
+position-independent, generates run-time relocations because it uses
+instructions such as:
+
+	leal	gdt(%edx), %eax
+
+which make the assembler and linker think that the code is using %edx as
+an index into gdt, and hence gdt needs to be relocated to its run-time
+address.
+
+On 32-bit, with lld Dmitry Golovin reports that this results in a
+link-time error with default options (i.e. unless -z notext is
+explicitly passed):
+
+  LD      arch/x86/boot/compressed/vmlinux
+  ld.lld: error: can't create dynamic relocation R_386_32 against local
+  symbol in readonly segment; recompile object files with -fPIC or pass
+  '-Wl,-z,notext' to allow text relocations in the output
+
+With the BFD linker, this generates a warning during the build, if
+--warn-shared-textrel is enabled, which at least Gentoo enables by
+default:
+
+  LD      arch/x86/boot/compressed/vmlinux
+  ld: arch/x86/boot/compressed/head_32.o: warning: relocation in read-only section `.head.text'
+  ld: warning: creating a DT_TEXTREL in object
+
+On 64-bit, it is not possible to link the kernel as -pie with lld, and
+it is only possible with a BFD linker that supports -z noreloc-overflow,
+i.e. versions >2.26. This is because these instructions cannot really be
+relocated: the displacement field is only 32-bits wide, and thus cannot
+be relocated for a 64-bit load address. The -z noreloc-overflow option
+simply overrides the linker error, and results in R_X86_64_RELATIVE
+relocations that apply a 64-bit relocation to a 32-bit field anyway.
+This happens to work because nothing will process these run-time
+relocations.
+
+Start fixing this by removing relocations from .head.text:
+
+- On 32-bit, use a base register that holds the address of the GOT and
+  reference symbol addresses using @GOTOFF, i.e.
+	leal	gdt@GOTOFF(%edx), %eax
+
+- On 64-bit, most of the code can (and already does) use %rip-relative
+  addressing, however the .code32 bits can't, and the 64-bit code also
+  needs to reference symbol addresses as they will be after moving the
+  compressed kernel to the end of the decompression buffer.
+  For these cases, reference the symbols as an offset to startup_32 to
+  avoid creating relocations, i.e.:
+
+	leal	(gdt-startup_32)(%bp), %eax
+
+  This only works in .head.text as the subtraction cannot be represented
+  as a PC-relative relocation unless startup_32 is in the same section
+  as the code. Move efi32_pe_entry into .head.text so that it can use
+  the same method to avoid relocations.
+
+	Reported-by: Dmitry Golovin <dima@golovin.in>
+	Signed-off-by: Arvind Sankar <nivedita@alum.mit.edu>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+	Tested-by: Nick Desaulniers <ndesaulniers@google.com>
+	Tested-by: Sedat Dilek <sedat.dilek@gmail.com>
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: Ard Biesheuvel <ardb@kernel.org>
+	Reviewed-by: Fangrui Song <maskray@google.com>
+Link: https://lore.kernel.org/r/20200731230820.1742553-6-keescook@chromium.org
+(cherry picked from commit a2c4fc4d4e2c40b07534094810d915c7354d84a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/head_32.S
+#	arch/x86/boot/compressed/head_64.S
+diff --cc arch/x86/boot/compressed/head_32.S
+index 0411ad3c848c,8c1a4f5610f5..000000000000
+--- a/arch/x86/boot/compressed/head_32.S
++++ b/arch/x86/boot/compressed/head_32.S
+@@@ -87,17 -57,46 +71,60 @@@ ENTRY(startup_32
+   */
+  	leal	(BP_scratch+4)(%esi), %esp
+  	call	1f
+++<<<<<<< HEAD
+ +1:	popl	%ebp
+ +	subl	$1b, %ebp
+ +
+ +/*
+ + * %ebp contains the address we are loaded at by the boot loader and %ebx
+ + * contains the address where we should move the kernel image temporarily
+ + * for safe in-place decompression.
+ + */
+ +
+ +#ifdef CONFIG_RELOCATABLE
+ +	movl	%ebp, %ebx
+++=======
++ 1:	popl	%edx
++ 	addl	$_GLOBAL_OFFSET_TABLE_+(.-1b), %edx
++ 
++ 	/* Load new GDT */
++ 	leal	gdt@GOTOFF(%edx), %eax
++ 	movl	%eax, 2(%eax)
++ 	lgdt	(%eax)
++ 
++ 	/* Load segment registers with our descriptors */
++ 	movl	$__BOOT_DS, %eax
++ 	movl	%eax, %ds
++ 	movl	%eax, %es
++ 	movl	%eax, %fs
++ 	movl	%eax, %gs
++ 	movl	%eax, %ss
++ 
++ /*
++  * %edx contains the address we are loaded at by the boot loader (plus the
++  * offset to the GOT).  The below code calculates %ebx to be the address where
++  * we should move the kernel image temporarily for safe in-place decompression
++  * (again, plus the offset to the GOT).
++  *
++  * %ebp is calculated to be the address that the kernel will be decompressed to.
++  */
++ 
++ #ifdef CONFIG_RELOCATABLE
++ 	leal	startup_32@GOTOFF(%edx), %ebx
++ 
++ #ifdef CONFIG_EFI_STUB
++ /*
++  * If we were loaded via the EFI LoadImage service, startup_32() will be at an
++  * offset to the start of the space allocated for the image. efi_pe_entry() will
++  * set up image_offset to tell us where the image actually starts, so that we
++  * can use the full available buffer.
++  *	image_offset = startup_32 - image_base
++  * Otherwise image_offset will be zero and has no effect on the calculations.
++  */
++ 	subl    image_offset@GOTOFF(%edx), %ebx
++ #endif
++ 
+++>>>>>>> a2c4fc4d4e2c (x86/boot: Remove run-time relocations from .head.text code)
+  	movl	BP_kernel_alignment(%esi), %eax
+  	decl	%eax
+  	addl    %eax, %ebx
+@@@ -109,13 -108,13 +136,18 @@@
+  	movl	$LOAD_PHYSICAL_ADDR, %ebx
+  1:
+  
+ -	movl	%ebx, %ebp	// Save the output address for later
+  	/* Target address to relocate to for decompression */
+++<<<<<<< HEAD
+ +	movl    BP_init_size(%esi), %eax
+ +	subl    $_end, %eax
+ +	addl    %eax, %ebx
+++=======
++ 	addl    BP_init_size(%esi), %ebx
++ 	subl    $_end@GOTOFF, %ebx
+++>>>>>>> a2c4fc4d4e2c (x86/boot: Remove run-time relocations from .head.text code)
+  
+  	/* Set up the stack */
+- 	leal	boot_stack_end(%ebx), %esp
++ 	leal	boot_stack_end@GOTOFF(%ebx), %esp
+  
+  	/* Zero EFLAGS */
+  	pushl	$0
+@@@ -126,8 -125,8 +158,13 @@@
+   * where decompression in place becomes safe.
+   */
+  	pushl	%esi
+++<<<<<<< HEAD
+ +	leal	(_bss-4)(%ebp), %esi
+ +	leal	(_bss-4)(%ebx), %edi
+++=======
++ 	leal	(_bss@GOTOFF-4)(%edx), %esi
++ 	leal	(_bss@GOTOFF-4)(%ebx), %edi
+++>>>>>>> a2c4fc4d4e2c (x86/boot: Remove run-time relocations from .head.text code)
+  	movl	$(_bss - startup_32), %ecx
+  	shrl	$2, %ecx
+  	std
+@@@ -135,75 -134,32 +172,91 @@@
+  	cld
+  	popl	%esi
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * The GDT may get overwritten either during the copy we just did or
++ 	 * during extract_kernel below. To avoid any issues, repoint the GDTR
++ 	 * to the new copy of the GDT.
++ 	 */
++ 	leal	gdt@GOTOFF(%ebx), %eax
++ 	movl	%eax, 2(%eax)
++ 	lgdt	(%eax)
++ 
+++>>>>>>> a2c4fc4d4e2c (x86/boot: Remove run-time relocations from .head.text code)
+  /*
+   * Jump to the relocated address.
+   */
+- 	leal	.Lrelocated(%ebx), %eax
++ 	leal	.Lrelocated@GOTOFF(%ebx), %eax
+  	jmp	*%eax
+ -SYM_FUNC_END(startup_32)
+ +ENDPROC(startup_32)
+  
+  #ifdef CONFIG_EFI_STUB
+ -SYM_FUNC_START(efi32_stub_entry)
+ -SYM_FUNC_START_ALIAS(efi_stub_entry)
+ +/*
+ + * We don't need the return address, so set up the stack so efi_main() can find
+ + * its arguments.
+ + */
+ +ENTRY(efi_pe_entry)
+ +	add	$0x4, %esp
+ +
+ +	call	1f
+ +1:	popl	%esi
+ +	subl	$1b, %esi
+ +
+ +	popl	%ecx
+ +	movl	%ecx, efi32_config(%esi)	/* Handle */
+ +	popl	%ecx
+ +	movl	%ecx, efi32_config+8(%esi)	/* EFI System table pointer */
+ +
+ +	/* Relocate efi_config->call() */
+ +	leal	efi32_config(%esi), %eax
+ +	add	%esi, 40(%eax)
+ +	pushl	%eax
+ +
+ +	call	make_boot_params
+ +	cmpl	$0, %eax
+ +	je	fail
+ +	movl	%esi, BP_code32_start(%eax)
+ +	popl	%ecx
+ +	pushl	%eax
+ +	pushl	%ecx
+ +	jmp	2f		/* Skip efi_config initialization */
+ +ENDPROC(efi_pe_entry)
+ +
+ +ENTRY(efi32_stub_entry)
+  	add	$0x4, %esp
+ -	movl	8(%esp), %esi	/* save boot_params pointer */
+ +	popl	%ecx
+ +	popl	%edx
+ +
+ +	call	1f
+ +1:	popl	%esi
+ +	subl	$1b, %esi
+ +
+ +	movl	%ecx, efi32_config(%esi)	/* Handle */
+ +	movl	%edx, efi32_config+8(%esi)	/* EFI System table pointer */
+ +
+ +	/* Relocate efi_config->call() */
+ +	leal	efi32_config(%esi), %eax
+ +	add	%esi, 40(%eax)
+ +	pushl	%eax
+ +2:
+  	call	efi_main
+++<<<<<<< HEAD
+ +	cmpl	$0, %eax
+ +	movl	%eax, %esi
+ +	jne	2f
+ +fail:
+ +	/* EFI init failed, so hang. */
+ +	hlt
+ +	jmp	fail
+ +2:
+ +	movl	BP_code32_start(%esi), %eax
+ +	leal	startup_32(%eax), %eax
+++=======
++ 	/* efi_main returns the possibly relocated address of startup_32 */
+++>>>>>>> a2c4fc4d4e2c (x86/boot: Remove run-time relocations from .head.text code)
+  	jmp	*%eax
+ -SYM_FUNC_END(efi32_stub_entry)
+ -SYM_FUNC_END_ALIAS(efi_stub_entry)
+ +ENDPROC(efi32_stub_entry)
+  #endif
+  
+  	.text
+diff --cc arch/x86/boot/compressed/head_64.S
+index 6cee4cfafe11,11429092c224..000000000000
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@@ -78,12 -91,23 +104,30 @@@ SYM_FUNC_START(startup_32
+  	leal	(BP_scratch+4)(%esi), %esp
+  	call	1f
+  1:	popl	%ebp
+- 	subl	$1b, %ebp
++ 	subl	$ rva(1b), %ebp
+  
+++<<<<<<< HEAD
+ +/* setup a stack and make sure cpu supports long mode. */
+ +	movl	$boot_stack_end, %eax
+ +	addl	%ebp, %eax
+ +	movl	%eax, %esp
+++=======
++ 	/* Load new GDT with the 64bit segments using 32bit descriptor */
++ 	leal	rva(gdt)(%ebp), %eax
++ 	movl	%eax, 2(%eax)
++ 	lgdt	(%eax)
++ 
++ 	/* Load segment registers with our descriptors */
++ 	movl	$__BOOT_DS, %eax
++ 	movl	%eax, %ds
++ 	movl	%eax, %es
++ 	movl	%eax, %fs
++ 	movl	%eax, %gs
++ 	movl	%eax, %ss
++ 
++ /* setup a stack and make sure cpu supports long mode. */
++ 	leal	rva(boot_stack_end)(%ebp), %esp
+++>>>>>>> a2c4fc4d4e2c (x86/boot: Remove run-time relocations from .head.text code)
+  
+  	call	verify_cpu
+  	testl	%eax, %eax
+@@@ -100,6 -124,19 +144,22 @@@
+  
+  #ifdef CONFIG_RELOCATABLE
+  	movl	%ebp, %ebx
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_EFI_STUB
++ /*
++  * If we were loaded via the EFI LoadImage service, startup_32 will be at an
++  * offset to the start of the space allocated for the image. efi_pe_entry will
++  * set up image_offset to tell us where the image actually starts, so that we
++  * can use the full available buffer.
++  *	image_offset = startup_32 - image_base
++  * Otherwise image_offset will be zero and has no effect on the calculations.
++  */
++ 	subl    rva(image_offset)(%ebp), %ebx
++ #endif
++ 
+++>>>>>>> a2c4fc4d4e2c (x86/boot: Remove run-time relocations from .head.text code)
+  	movl	BP_kernel_alignment(%esi), %eax
+  	decl	%eax
+  	addl	%eax, %ebx
+@@@ -112,9 -149,8 +172,14 @@@
+  1:
+  
+  	/* Target address to relocate to for decompression */
+++<<<<<<< HEAD
+ +	movl	BP_init_size(%esi), %eax
+ +	subl	$_end, %eax
+ +	addl	%eax, %ebx
+++=======
++ 	addl	BP_init_size(%esi), %ebx
++ 	subl	$ rva(_end), %ebx
+++>>>>>>> a2c4fc4d4e2c (x86/boot: Remove run-time relocations from .head.text code)
+  
+  /*
+   * Prepare for entering 64 bit mode
+@@@ -205,14 -237,30 +270,38 @@@
+  	 * We place all of the values on our mini stack so lret can
+  	 * used to perform that far jump.
+  	 */
+++<<<<<<< HEAD
+ +	pushl	$__KERNEL_CS
+ +	leal	startup_64(%ebp), %eax
+ +#ifdef CONFIG_EFI_MIXED
+ +	movl	efi32_config(%ebp), %ebx
+ +	testl	%ebx, %ebx
+ +	jz	1f
+++=======
++ 	leal	rva(startup_64)(%ebp), %eax
++ #ifdef CONFIG_EFI_MIXED
++ 	movl	rva(efi32_boot_args)(%ebp), %edi
++ 	cmp	$0, %edi
++ 	jz	1f
++ 	leal	rva(efi64_stub_entry)(%ebp), %eax
++ 	movl	rva(efi32_boot_args+4)(%ebp), %esi
++ 	movl	rva(efi32_boot_args+8)(%ebp), %edx	// saved bootparams pointer
++ 	cmpl	$0, %edx
++ 	jnz	1f
++ 	/*
++ 	 * efi_pe_entry uses MS calling convention, which requires 32 bytes of
++ 	 * shadow space on the stack even if all arguments are passed in
++ 	 * registers. We also need an additional 8 bytes for the space that
++ 	 * would be occupied by the return address, and this also results in
++ 	 * the correct stack alignment for entry.
++ 	 */
++ 	subl	$40, %esp
++ 	leal	rva(efi_pe_entry)(%ebp), %eax
++ 	movl	%edi, %ecx			// MS calling convention
++ 	movl	%esi, %edx
+++>>>>>>> a2c4fc4d4e2c (x86/boot: Remove run-time relocations from .head.text code)
+  1:
+  #endif
+ -	pushl	$__KERNEL_CS
+  	pushl	%eax
+  
+  	/* Enter paged protected Mode, activating Long Mode */
+@@@ -231,17 -279,20 +320,30 @@@ SYM_FUNC_START(efi32_stub_entry
+  	popl	%edx
+  	popl	%esi
+  
+ +	leal	(BP_scratch+4)(%esi), %esp
+  	call	1f
+  1:	pop	%ebp
+- 	subl	$1b, %ebp
++ 	subl	$ rva(1b), %ebp
+  
+++<<<<<<< HEAD
+ +	movl	%ecx, efi32_config(%ebp)
+ +	movl	%edx, efi32_config+8(%ebp)
+ +	sgdtl	efi32_boot_gdt(%ebp)
+ +
+ +	leal	efi32_config(%ebp), %eax
+ +	movl	%eax, efi_config(%ebp)
+++=======
++ 	movl	%esi, rva(efi32_boot_args+8)(%ebp)
++ SYM_INNER_LABEL(efi32_pe_stub_entry, SYM_L_LOCAL)
++ 	movl	%ecx, rva(efi32_boot_args)(%ebp)
++ 	movl	%edx, rva(efi32_boot_args+4)(%ebp)
++ 	movb	$0, rva(efi_is64)(%ebp)
++ 
++ 	/* Save firmware GDTR and code/data selectors */
++ 	sgdtl	rva(efi32_boot_gdt)(%ebp)
++ 	movw	%cs, rva(efi32_boot_cs)(%ebp)
++ 	movw	%ds, rva(efi32_boot_ds)(%ebp)
+++>>>>>>> a2c4fc4d4e2c (x86/boot: Remove run-time relocations from .head.text code)
+  
+  	/* Disable paging */
+  	movl	%cr0, %eax
+@@@ -457,70 -501,17 +559,75 @@@ trampoline_return
+  SYM_CODE_END(startup_64)
+  
+  #ifdef CONFIG_EFI_STUB
+ -	.org 0x390
+ -SYM_FUNC_START(efi64_stub_entry)
+ -SYM_FUNC_START_ALIAS(efi_stub_entry)
+ -	and	$~0xf, %rsp			/* realign the stack */
+ -	movq	%rdx, %rbx			/* save boot_params pointer */
+ +
+ +/* The entry point for the PE/COFF executable is efi_pe_entry. */
+ +SYM_FUNC_START(efi_pe_entry)
+ +	movq	%rcx, efi64_config(%rip)	/* Handle */
+ +	movq	%rdx, efi64_config+8(%rip) /* EFI System table pointer */
+ +
+ +	leaq	efi64_config(%rip), %rax
+ +	movq	%rax, efi_config(%rip)
+ +
+ +	call	1f
+ +1:	popq	%rbp
+ +	subq	$1b, %rbp
+ +
+ +	/*
+ +	 * Relocate efi_config->call().
+ +	 */
+ +	addq	%rbp, efi64_config+40(%rip)
+ +
+ +	movq	%rax, %rdi
+ +	call	make_boot_params
+ +	cmpq	$0,%rax
+ +	je	fail
+ +	mov	%rax, %rsi
+ +	leaq	startup_32(%rip), %rax
+ +	movl	%eax, BP_code32_start(%rsi)
+ +	jmp	2f		/* Skip the relocation */
+ +
+ +handover_entry:
+ +	call	1f
+ +1:	popq	%rbp
+ +	subq	$1b, %rbp
+ +
+ +	/*
+ +	 * Relocate efi_config->call().
+ +	 */
+ +	movq	efi_config(%rip), %rax
+ +	addq	%rbp, 40(%rax)
+ +2:
+ +	movq	efi_config(%rip), %rdi
+  	call	efi_main
+++<<<<<<< HEAD
+ +	movq	%rax,%rsi
+ +	cmpq	$0,%rax
+ +	jne	2f
+ +fail:
+ +	/* EFI init failed, so hang. */
+ +	hlt
+ +	jmp	fail
+ +2:
+ +	movl	BP_code32_start(%esi), %eax
+ +	leaq	startup_64(%rax), %rax
+++=======
++ 	movq	%rbx,%rsi
++ 	leaq	rva(startup_64)(%rax), %rax
+++>>>>>>> a2c4fc4d4e2c (x86/boot: Remove run-time relocations from .head.text code)
+  	jmp	*%rax
+ +SYM_FUNC_END(efi_pe_entry)
+ +
+ +	.org 0x390
+ +SYM_FUNC_START(efi64_stub_entry)
+ +	movq	%rdi, efi64_config(%rip)	/* Handle */
+ +	movq	%rsi, efi64_config+8(%rip) /* EFI System table pointer */
+ +
+ +	leaq	efi64_config(%rip), %rax
+ +	movq	%rax, efi_config(%rip)
+ +
+ +	movq	%rdx, %rsi
+ +	jmp	handover_entry
+  SYM_FUNC_END(efi64_stub_entry)
+ -SYM_FUNC_END_ALIAS(efi_stub_entry)
+  #endif
+  
+  	.text
+@@@ -688,39 -657,101 +795,128 @@@ gdt
+  	.quad	0x00cf92000000ffff	/* __KERNEL_DS */
+  	.quad	0x0080890000000000	/* TS descriptor */
+  	.quad   0x0000000000000000	/* TS continued */
+ -SYM_DATA_END_LABEL(gdt, SYM_L_LOCAL, gdt_end)
+ +gdt_end:
+ +
+ +SYM_DATA_START(boot_idt_desc)
+ +	.word	boot_idt_end - boot_idt - 1
+ +	.quad	0
+ +SYM_DATA_END(boot_idt_desc)
+ +	.balign 8
+ +SYM_DATA_START(boot_idt)
+ +	.rept	BOOT_IDT_ENTRIES
+ +	.quad	0
+ +	.quad	0
+ +	.endr
+ +SYM_DATA_END_LABEL(boot_idt, SYM_L_GLOBAL, boot_idt_end)
+  
+  #ifdef CONFIG_EFI_STUB
+ -SYM_DATA(image_offset, .long 0)
+ -#endif
+ +efi_config:
+ +	.quad	0
+  
+  #ifdef CONFIG_EFI_MIXED
+++<<<<<<< HEAD
+ +	.global efi32_config
+ +efi32_config:
+ +	.fill	5,8,0
+ +	.quad	efi64_thunk
+ +	.byte	0
+++=======
++ SYM_DATA_LOCAL(efi32_boot_args, .long 0, 0, 0)
++ SYM_DATA(efi_is64, .byte 1)
++ 
++ #define ST32_boottime		60 // offsetof(efi_system_table_32_t, boottime)
++ #define BS32_handle_protocol	88 // offsetof(efi_boot_services_32_t, handle_protocol)
++ #define LI32_image_base		32 // offsetof(efi_loaded_image_32_t, image_base)
++ 
++ 	__HEAD
++ 	.code32
++ SYM_FUNC_START(efi32_pe_entry)
++ /*
++  * efi_status_t efi32_pe_entry(efi_handle_t image_handle,
++  *			       efi_system_table_32_t *sys_table)
++  */
++ 
++ 	pushl	%ebp
++ 	movl	%esp, %ebp
++ 	pushl	%eax				// dummy push to allocate loaded_image
++ 
++ 	pushl	%ebx				// save callee-save registers
++ 	pushl	%edi
++ 
++ 	call	verify_cpu			// check for long mode support
++ 	testl	%eax, %eax
++ 	movl	$0x80000003, %eax		// EFI_UNSUPPORTED
++ 	jnz	2f
++ 
++ 	call	1f
++ 1:	pop	%ebx
++ 	subl	$ rva(1b), %ebx
++ 
++ 	/* Get the loaded image protocol pointer from the image handle */
++ 	leal	-4(%ebp), %eax
++ 	pushl	%eax				// &loaded_image
++ 	leal	rva(loaded_image_proto)(%ebx), %eax
++ 	pushl	%eax				// pass the GUID address
++ 	pushl	8(%ebp)				// pass the image handle
++ 
++ 	/*
++ 	 * Note the alignment of the stack frame.
++ 	 *   sys_table
++ 	 *   handle             <-- 16-byte aligned on entry by ABI
++ 	 *   return address
++ 	 *   frame pointer
++ 	 *   loaded_image       <-- local variable
++ 	 *   saved %ebx		<-- 16-byte aligned here
++ 	 *   saved %edi
++ 	 *   &loaded_image
++ 	 *   &loaded_image_proto
++ 	 *   handle             <-- 16-byte aligned for call to handle_protocol
++ 	 */
++ 
++ 	movl	12(%ebp), %eax			// sys_table
++ 	movl	ST32_boottime(%eax), %eax	// sys_table->boottime
++ 	call	*BS32_handle_protocol(%eax)	// sys_table->boottime->handle_protocol
++ 	addl	$12, %esp			// restore argument space
++ 	testl	%eax, %eax
++ 	jnz	2f
++ 
++ 	movl	8(%ebp), %ecx			// image_handle
++ 	movl	12(%ebp), %edx			// sys_table
++ 	movl	-4(%ebp), %esi			// loaded_image
++ 	movl	LI32_image_base(%esi), %esi	// loaded_image->image_base
++ 	movl	%ebx, %ebp			// startup_32 for efi32_pe_stub_entry
++ 	/*
++ 	 * We need to set the image_offset variable here since startup_32() will
++ 	 * use it before we get to the 64-bit efi_pe_entry() in C code.
++ 	 */
++ 	subl	%esi, %ebx
++ 	movl	%ebx, rva(image_offset)(%ebp)	// save image_offset
++ 	jmp	efi32_pe_stub_entry
++ 
++ 2:	popl	%edi				// restore callee-save registers
++ 	popl	%ebx
++ 	leave
++ 	ret
++ SYM_FUNC_END(efi32_pe_entry)
++ 
++ 	.section ".rodata"
++ 	/* EFI loaded image protocol GUID */
++ 	.balign 4
++ SYM_DATA_START_LOCAL(loaded_image_proto)
++ 	.long	0x5b1b31a1
++ 	.word	0x9562, 0x11d2
++ 	.byte	0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b
++ SYM_DATA_END(loaded_image_proto)
+++>>>>>>> a2c4fc4d4e2c (x86/boot: Remove run-time relocations from .head.text code)
+  #endif
+  
+ +	.global efi64_config
+ +efi64_config:
+ +	.fill	5,8,0
+ +	.quad	efi_call
+ +	.byte	1
+ +#endif /* CONFIG_EFI_STUB */
+ +
+  /*
+   * Stack and heap for uncompression
+   */
+* Unmerged path arch/x86/boot/compressed/head_32.S
+* Unmerged path arch/x86/boot/compressed/head_64.S
