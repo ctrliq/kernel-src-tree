@@ -1743,7 +1743,7 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 	 * acquiring kvm->mmu_lock.
 	 *
 	 * Rely on mmap_read_unlock() for an implicit smp_rmb(), which pairs
-	 * with the smp_wmb() in kvm_mmu_invalidate_end().
+	 * with the smp_wmb() in kvm_dec_notifier_count().
 	 */
 	mmu_seq = vcpu->kvm->mmu_notifier_seq;
 	mmap_read_unlock(current->mm);

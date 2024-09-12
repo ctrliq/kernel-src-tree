@@ -12,6 +12,7 @@
 #include "kvm_util.h"
 #include "../kvm_util_internal.h"
 #include "processor.h"
+#include <linux/bitfield.h>
 
 #define DEFAULT_ARM64_GUEST_STACK_VADDR_MIN	0xac0000
 
@@ -499,9 +500,9 @@ void aarch64_get_supported_page_sizes(uint32_t ipa,
 	err = ioctl(vcpu_fd, KVM_GET_ONE_REG, &reg);
 	TEST_ASSERT(err == 0, "Can't get MMFR0");
 
-	*ps4k = ((val >> 28) & 0xf) != 0xf;
-	*ps64k = ((val >> 24) & 0xf) == 0;
-	*ps16k = ((val >> 20) & 0xf) != 0;
+	*ps4k = FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR0_TGRAN4), val) != 0xf;
+	*ps64k = FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR0_TGRAN64), val) == 0;
+	*ps16k = FIELD_GET(ARM64_FEATURE_MASK(ID_AA64MMFR0_TGRAN16), val) != 0;
 
 	close(vcpu_fd);
 	close(vm_fd);
