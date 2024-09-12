@@ -3313,8 +3313,8 @@ size_check:
 	return 0;
 
 bad_unlock:
-	mddev_unlock(&rs->md);
 	md_stop(&rs->md);
+	mddev_unlock(&rs->md);
 bad:
 	raid_set_free(rs);
 
@@ -3326,7 +3326,9 @@ static void raid_dtr(struct dm_target *ti)
 	struct raid_set *rs = ti->private;
 
 	list_del_init(&rs->callbacks.list);
+	mddev_lock_nointr(&rs->md);
 	md_stop(&rs->md);
+	mddev_unlock(&rs->md);
 	raid_set_free(rs);
 }
 
