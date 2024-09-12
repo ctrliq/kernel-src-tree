@@ -1,0 +1,146 @@
+powerpc64/bpf elfv1: Do not load TOC before calling functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+commit 43d636f8b4fd2ee668e75e835fae2fcf4bc0f699
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/43d636f8.failed
+
+BPF helpers always reside in core kernel and all BPF programs use the
+kernel TOC. As such, there is no need to load the TOC before calling
+helpers or other BPF functions. Drop code to do the same.
+
+Add a check to ensure we don't proceed if this assumption ever changes
+in future.
+
+	Signed-off-by: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/a3cd3da4d24d95d845cd10382b1af083600c9074.1644834730.git.naveen.n.rao@linux.vnet.ibm.com
+
+(cherry picked from commit 43d636f8b4fd2ee668e75e835fae2fcf4bc0f699)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/net/bpf_jit_comp32.c
+* Unmerged path arch/powerpc/net/bpf_jit_comp32.c
+diff --git a/arch/powerpc/net/bpf_jit.h b/arch/powerpc/net/bpf_jit.h
+index d22140878361..d05ed8ba77b9 100644
+--- a/arch/powerpc/net/bpf_jit.h
++++ b/arch/powerpc/net/bpf_jit.h
+@@ -164,7 +164,7 @@ static inline void bpf_clear_seen_register(struct codegen_context *ctx, int i)
+ 	ctx->seen &= ~(1 << (31 - i));
+ }
+ 
+-void bpf_jit_emit_func_call_rel(u32 *image, struct codegen_context *ctx, u64 func);
++int bpf_jit_emit_func_call_rel(u32 *image, struct codegen_context *ctx, u64 func);
+ int bpf_jit_build_body(struct bpf_prog *fp, u32 *image, struct codegen_context *ctx,
+ 		       u32 *addrs, bool extra_pass);
+ void bpf_jit_build_prologue(u32 *image, struct codegen_context *ctx);
+diff --git a/arch/powerpc/net/bpf_jit_comp.c b/arch/powerpc/net/bpf_jit_comp.c
+index 16ef5fa3992f..d52c8043da18 100644
+--- a/arch/powerpc/net/bpf_jit_comp.c
++++ b/arch/powerpc/net/bpf_jit_comp.c
+@@ -59,7 +59,9 @@ static int bpf_jit_fixup_addresses(struct bpf_prog *fp, u32 *image,
+ 			 */
+ 			tmp_idx = ctx->idx;
+ 			ctx->idx = addrs[i] / 4;
+-			bpf_jit_emit_func_call_rel(image, ctx, func_addr);
++			ret = bpf_jit_emit_func_call_rel(image, ctx, func_addr);
++			if (ret)
++				return ret;
+ 
+ 			/*
+ 			 * Restore ctx->idx here. This is safe as the length
+* Unmerged path arch/powerpc/net/bpf_jit_comp32.c
+diff --git a/arch/powerpc/net/bpf_jit_comp64.c b/arch/powerpc/net/bpf_jit_comp64.c
+index 3361fea2cdf5..0f3810c1df2b 100644
+--- a/arch/powerpc/net/bpf_jit_comp64.c
++++ b/arch/powerpc/net/bpf_jit_comp64.c
+@@ -150,9 +150,13 @@ void bpf_jit_build_epilogue(u32 *image, struct codegen_context *ctx)
+ 	EMIT(PPC_RAW_BLR());
+ }
+ 
+-static void bpf_jit_emit_func_call_hlp(u32 *image, struct codegen_context *ctx,
+-				       u64 func)
++static int bpf_jit_emit_func_call_hlp(u32 *image, struct codegen_context *ctx, u64 func)
+ {
++	unsigned long func_addr = func ? ppc_function_entry((void *)func) : 0;
++
++	if (WARN_ON_ONCE(!core_kernel_text(func_addr)))
++		return -EINVAL;
++
+ #ifdef PPC64_ELF_ABI_v1
+ 	/* func points to the function descriptor */
+ 	PPC_LI64(b2p[TMP_REG_2], func);
+@@ -160,25 +164,23 @@ static void bpf_jit_emit_func_call_hlp(u32 *image, struct codegen_context *ctx,
+ 	PPC_BPF_LL(b2p[TMP_REG_1], b2p[TMP_REG_2], 0);
+ 	/* ... and move it to CTR */
+ 	EMIT(PPC_RAW_MTCTR(b2p[TMP_REG_1]));
+-	/*
+-	 * Load TOC from function descriptor at offset 8.
+-	 * We can clobber r2 since we get called through a
+-	 * function pointer (so caller will save/restore r2)
+-	 * and since we don't use a TOC ourself.
+-	 */
+-	PPC_BPF_LL(2, b2p[TMP_REG_2], 8);
+ #else
+ 	/* We can clobber r12 */
+ 	PPC_FUNC_ADDR(12, func);
+ 	EMIT(PPC_RAW_MTCTR(12));
+ #endif
+ 	EMIT(PPC_RAW_BCTRL());
++
++	return 0;
+ }
+ 
+-void bpf_jit_emit_func_call_rel(u32 *image, struct codegen_context *ctx, u64 func)
++int bpf_jit_emit_func_call_rel(u32 *image, struct codegen_context *ctx, u64 func)
+ {
+ 	unsigned int i, ctx_idx = ctx->idx;
+ 
++	if (WARN_ON_ONCE(func && is_module_text_address(func)))
++		return -EINVAL;
++
+ 	/* Load function address into r12 */
+ 	PPC_LI64(12, func);
+ 
+@@ -196,19 +198,14 @@ void bpf_jit_emit_func_call_rel(u32 *image, struct codegen_context *ctx, u64 fun
+ 		EMIT(PPC_RAW_NOP());
+ 
+ #ifdef PPC64_ELF_ABI_v1
+-	/*
+-	 * Load TOC from function descriptor at offset 8.
+-	 * We can clobber r2 since we get called through a
+-	 * function pointer (so caller will save/restore r2)
+-	 * and since we don't use a TOC ourself.
+-	 */
+-	PPC_BPF_LL(2, 12, 8);
+ 	/* Load actual entry point from function descriptor */
+ 	PPC_BPF_LL(12, 12, 0);
+ #endif
+ 
+ 	EMIT(PPC_RAW_MTCTR(12));
+ 	EMIT(PPC_RAW_BCTRL());
++
++	return 0;
+ }
+ 
+ static void bpf_jit_emit_tail_call(u32 *image, struct codegen_context *ctx, u32 out)
+@@ -842,9 +839,13 @@ int bpf_jit_build_body(struct bpf_prog *fp, u32 *image, struct codegen_context *
+ 				return ret;
+ 
+ 			if (func_addr_fixed)
+-				bpf_jit_emit_func_call_hlp(image, ctx, func_addr);
++				ret = bpf_jit_emit_func_call_hlp(image, ctx, func_addr);
+ 			else
+-				bpf_jit_emit_func_call_rel(image, ctx, func_addr);
++				ret = bpf_jit_emit_func_call_rel(image, ctx, func_addr);
++
++			if (ret)
++				return ret;
++
+ 			/* move return value from r3 to BPF_REG_0 */
+ 			EMIT(PPC_RAW_MR(b2p[BPF_REG_0], 3));
+ 			break;
