@@ -1,0 +1,199 @@
+irqchip/gic: Configure SGIs as standard interrupts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit 64a267e9a41c5a91efdfa5bf55bd2509cb4f7170
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/64a267e9.failed
+
+Change the way we deal with GIC SGIs by turning them into proper
+IRQs, and calling into the arch code to register the interrupt range
+instead of a callback.
+
+	Reviewed-by: Valentin Schneider <valentin.schneider@arm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit 64a267e9a41c5a91efdfa5bf55bd2509cb4f7170)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/irqchip/irq-gic.c
+diff --cc drivers/irqchip/irq-gic.c
+index 28a271f8e993,66671e1a6106..000000000000
+--- a/drivers/irqchip/irq-gic.c
++++ b/drivers/irqchip/irq-gic.c
+@@@ -122,26 -122,36 +122,28 @@@ static DEFINE_STATIC_KEY_TRUE(supports_
+  
+  static struct gic_chip_data gic_data[CONFIG_ARM_GIC_MAX_NR] __read_mostly;
+  
+ -static struct gic_kvm_info gic_v2_kvm_info;
+ +static struct gic_kvm_info gic_v2_kvm_info __initdata;
+  
++ static DEFINE_PER_CPU(u32, sgi_intid);
++ 
+  #ifdef CONFIG_GIC_NON_BANKED
+ -static void __iomem *gic_get_percpu_base(union gic_base *base)
+ -{
+ -	return raw_cpu_read(*base->percpu_base);
+ -}
+ +static DEFINE_STATIC_KEY_FALSE(frankengic_key);
+  
+ -static void __iomem *gic_get_common_base(union gic_base *base)
+ +static void enable_frankengic(void)
+  {
+ -	return base->common_base;
+ +	static_branch_enable(&frankengic_key);
+  }
+  
+ -static inline void __iomem *gic_data_dist_base(struct gic_chip_data *data)
+ +static inline void __iomem *__get_base(union gic_base *base)
+  {
+ -	return data->get_base(&data->dist_base);
+ -}
+ +	if (static_branch_unlikely(&frankengic_key))
+ +		return raw_cpu_read(*base->percpu_base);
+  
+ -static inline void __iomem *gic_data_cpu_base(struct gic_chip_data *data)
+ -{
+ -	return data->get_base(&data->cpu_base);
+ +	return base->common_base;
+  }
+  
+ -static inline void gic_set_base_accessor(struct gic_chip_data *data,
+ -					 void __iomem *(*f)(union gic_base *))
+ -{
+ -	data->get_base = f;
+ -}
+ +#define gic_data_dist_base(d)	__get_base(&(d)->dist_base)
+ +#define gic_data_cpu_base(d)	__get_base(&(d)->cpu_base)
+  #else
+  #define gic_data_dist_base(d)	((d)->dist_base.common_base)
+  #define gic_data_cpu_base(d)	((d)->cpu_base.common_base)
+@@@ -788,7 -787,27 +802,31 @@@ static int gic_pm_init(struct gic_chip_
+  #endif
+  
+  #ifdef CONFIG_SMP
+++<<<<<<< HEAD
+ +static void gic_raise_softirq(const struct cpumask *mask, unsigned int irq)
+++=======
++ static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
++ 			    bool force)
++ {
++ 	void __iomem *reg = gic_dist_base(d) + GIC_DIST_TARGET + gic_irq(d);
++ 	unsigned int cpu;
++ 
++ 	if (!force)
++ 		cpu = cpumask_any_and(mask_val, cpu_online_mask);
++ 	else
++ 		cpu = cpumask_first(mask_val);
++ 
++ 	if (cpu >= NR_GIC_CPU_IF || cpu >= nr_cpu_ids)
++ 		return -EINVAL;
++ 
++ 	writeb_relaxed(gic_cpu_map[cpu], reg);
++ 	irq_data_update_effective_affinity(d, cpumask_of(cpu));
++ 
++ 	return IRQ_SET_MASK_OK_DONE;
++ }
++ 
++ static void gic_ipi_send_mask(struct irq_data *d, const struct cpumask *mask)
+++>>>>>>> 64a267e9a41c (irqchip/gic: Configure SGIs as standard interrupts)
+  {
+  	int cpu;
+  	unsigned long flags, map = 0;
+@@@ -817,6 -836,37 +855,40 @@@
+  
+  	gic_unlock_irqrestore(flags);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int gic_starting_cpu(unsigned int cpu)
++ {
++ 	gic_cpu_init(&gic_data[0]);
++ 	return 0;
++ }
++ 
++ static __init void gic_smp_init(void)
++ {
++ 	struct irq_fwspec sgi_fwspec = {
++ 		.fwnode		= gic_data[0].domain->fwnode,
++ 		.param_count	= 1,
++ 	};
++ 	int base_sgi;
++ 
++ 	cpuhp_setup_state_nocalls(CPUHP_AP_IRQ_GIC_STARTING,
++ 				  "irqchip/arm/gic:starting",
++ 				  gic_starting_cpu, NULL);
++ 
++ 	base_sgi = __irq_domain_alloc_irqs(gic_data[0].domain, -1, 8,
++ 					   NUMA_NO_NODE, &sgi_fwspec,
++ 					   false, NULL);
++ 	if (WARN_ON(base_sgi <= 0))
++ 		return;
++ 
++ 	set_smp_ipi_range(base_sgi, 8);
++ }
++ #else
++ #define gic_smp_init()		do { } while(0)
++ #define gic_set_affinity	NULL
++ #define gic_ipi_send_mask	NULL
+++>>>>>>> 64a267e9a41c (irqchip/gic: Configure SGIs as standard interrupts)
+  #endif
+  
+  #ifdef CONFIG_BL_SWITCHER
+@@@ -962,9 -1012,15 +1034,16 @@@ static int gic_irq_domain_map(struct ir
+  				irq_hw_number_t hw)
+  {
+  	struct gic_chip_data *gic = d->host_data;
+ +	struct irq_data *irqd = irq_desc_get_irq_data(irq_to_desc(irq));
+  
+- 	if (hw < 32) {
++ 	switch (hw) {
++ 	case 0 ... 15:
++ 		irq_set_percpu_devid(irq);
++ 		irq_domain_set_info(d, irq, hw, &gic->chip, d->host_data,
++ 				    handle_percpu_devid_fasteoi_ipi,
++ 				    NULL, NULL);
++ 		break;
++ 	case 16 ... 31:
+  		irq_set_percpu_devid(irq);
+  		irq_domain_set_info(d, irq, hw, &gic->chip, d->host_data,
+  				    handle_percpu_devid_irq, NULL, NULL);
+@@@ -972,11 -1029,9 +1052,16 @@@
+  		irq_domain_set_info(d, irq, hw, &gic->chip, d->host_data,
+  				    handle_fasteoi_irq, NULL, NULL);
+  		irq_set_probe(irq);
+++<<<<<<< HEAD
+ +		irqd_set_single_target(irqd);
+++=======
++ 		irqd_set_single_target(irq_desc_get_irq_data(irq_to_desc(irq)));
++ 		break;
+++>>>>>>> 64a267e9a41c (irqchip/gic: Configure SGIs as standard interrupts)
+  	}
+ +
+ +	/* Prevents SW retriggers which mess up the ACK/EOI ordering */
+ +	irqd_set_handle_enforce_irqctx(irqd);
+  	return 0;
+  }
+  
+@@@ -1082,10 -1132,10 +1174,17 @@@ static void gic_init_chip(struct gic_ch
+  		gic->chip.irq_set_vcpu_affinity = gic_irq_set_vcpu_affinity;
+  	}
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_SMP
+ +	if (gic == &gic_data[0])
+ +		gic->chip.irq_set_affinity = gic_set_affinity;
+ +#endif
+++=======
++ 	if (gic == &gic_data[0]) {
++ 		gic->chip.irq_set_affinity = gic_set_affinity;
++ 		gic->chip.ipi_send_mask = gic_ipi_send_mask;
++ 	}
+++>>>>>>> 64a267e9a41c (irqchip/gic: Configure SGIs as standard interrupts)
+  }
+  
+  static int gic_init_bases(struct gic_chip_data *gic,
+* Unmerged path drivers/irqchip/irq-gic.c
