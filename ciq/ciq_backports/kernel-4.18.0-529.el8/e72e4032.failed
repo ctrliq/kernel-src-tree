@@ -1,0 +1,102 @@
+mptcp: set msk local address earlier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-529.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit e72e4032637f4646554794ac28a3abecc6c2416d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-529.el8/e72e4032.failed
+
+The mptcp_pm_nl_get_local_id() code assumes that the msk local address
+is available at that point. For passive sockets, we initialize such
+address at accept() time.
+
+Depending on the running configuration and the user-space timing, a
+passive MPJ subflow can join the msk socket before accept() completes.
+
+In such case, the PM assigns a wrong local id to the MPJ subflow
+and later PM netlink operations will end-up touching the wrong/unexpected
+subflow.
+
+All the above causes sporadic self-tests failures, especially when
+the host is heavy loaded.
+
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/308
+Fixes: 01cacb00b35c ("mptcp: add netlink-based PM")
+Fixes: d045b9eb95a9 ("mptcp: introduce implicit endpoints")
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit e72e4032637f4646554794ac28a3abecc6c2416d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.h
+diff --cc net/mptcp/protocol.h
+index c1c84a9105a7,be19592441df..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -540,7 -595,11 +540,12 @@@ static inline void mptcp_subflow_delega
+  
+  int mptcp_is_enabled(const struct net *net);
+  unsigned int mptcp_get_add_addr_timeout(const struct net *net);
+ -int mptcp_is_checksum_enabled(const struct net *net);
+ -int mptcp_allow_join_id0(const struct net *net);
+  unsigned int mptcp_stale_loss_cnt(const struct net *net);
+++<<<<<<< HEAD
+++=======
++ int mptcp_get_pm_type(const struct net *net);
++ void mptcp_copy_inaddrs(struct sock *msk, const struct sock *ssk);
+++>>>>>>> e72e4032637f (mptcp: set msk local address earlier)
+  void mptcp_subflow_fully_established(struct mptcp_subflow_context *subflow,
+  				     struct mptcp_options_received *mp_opt);
+  bool __mptcp_retransmit_pending_data(struct sock *sk);
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 235f6c6f03b1..ea5c28375f68 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -2757,7 +2757,7 @@ static void mptcp_close(struct sock *sk, long timeout)
+ 	sock_put(sk);
+ }
+ 
+-static void mptcp_copy_inaddrs(struct sock *msk, const struct sock *ssk)
++void mptcp_copy_inaddrs(struct sock *msk, const struct sock *ssk)
+ {
+ #if IS_ENABLED(CONFIG_MPTCP_IPV6)
+ 	const struct ipv6_pinfo *ssk6 = inet6_sk(ssk);
+@@ -3394,7 +3394,6 @@ static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
+ 		if (mptcp_is_fully_established(newsk))
+ 			mptcp_pm_fully_established(msk, msk->first, GFP_KERNEL);
+ 
+-		mptcp_copy_inaddrs(newsk, msk->first);
+ 		mptcp_rcv_space_init(msk, msk->first);
+ 		mptcp_propagate_sndbuf(newsk, msk->first);
+ 
+* Unmerged path net/mptcp/protocol.h
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index f7dbf4057ccc..62935b12cbce 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -671,6 +671,8 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+ 				goto dispose_child;
+ 			}
+ 
++			if (new_msk)
++				mptcp_copy_inaddrs(new_msk, child);
+ 			subflow_drop_ctx(child);
+ 			goto out;
+ 		}
+@@ -698,6 +700,11 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+ 			ctx->conn = new_msk;
+ 			new_msk = NULL;
+ 
++			/* set msk addresses early to ensure mptcp_pm_get_local_id()
++			 * uses the correct data
++			 */
++			mptcp_copy_inaddrs(ctx->conn, child);
++
+ 			/* with OoO packets we can reach here without ingress
+ 			 * mpc option
+ 			 */
