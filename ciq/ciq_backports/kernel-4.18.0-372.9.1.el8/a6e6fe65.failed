@@ -1,0 +1,137 @@
+PCI/P2PDMA: Introduce private pagemap structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Logan Gunthorpe <logang@deltatee.com>
+commit a6e6fe6549f609f5c00c91e988da9d25f8ae8604
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/a6e6fe65.failed
+
+Move the PCI bus offset from the generic dev_pagemap structure to a
+specific pci_p2pdma_pagemap structure.
+
+This structure will grow in subsequent patches.
+
+Link: https://lore.kernel.org/r/20190730163545.4915-2-logang@deltatee.com
+Link: https://lore.kernel.org/r/20190812173048.9186-2-logang@deltatee.com
+	Signed-off-by: Logan Gunthorpe <logang@deltatee.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit a6e6fe6549f609f5c00c91e988da9d25f8ae8604)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memremap.h
+diff --cc include/linux/memremap.h
+index ecd38ce53a36,b459518ce475..000000000000
+--- a/include/linux/memremap.h
++++ b/include/linux/memremap.h
+@@@ -118,26 -100,19 +118,31 @@@ struct dev_pagemap_ops 
+   * @type: memory type: see MEMORY_* in memory_hotplug.h
+   * @flags: PGMAP_* flags to specify defailed behavior
+   * @ops: method table
+ + * @owner: an opaque pointer identifying the entity that manages this
+ + *	instance.  Used by various helpers to make sure that no
+ + *	foreign ZONE_DEVICE memory is accessed.
+   */
+  struct dev_pagemap {
+ +	RH_KABI_DEPRECATE(dev_page_fault_t, page_fault)
+ +	RH_KABI_DEPRECATE(dev_page_free_t, page_free)
+  	struct vmem_altmap altmap;
+ +	RH_KABI_DEPRECATE(bool, altmap_valid)
+  	struct resource res;
+  	struct percpu_ref *ref;
+ -	struct percpu_ref internal_ref;
+ -	struct completion done;
+ -	struct device *dev;
+ +	RH_KABI_DEPRECATE(struct device *, dev)
+ +	RH_KABI_DEPRECATE(void *, data)
+  	enum memory_type type;
+++<<<<<<< HEAD
+ +	u64 pci_p2pdma_bus_offset;
+ +	RH_KABI_EXTEND(const struct dev_pagemap_ops *ops)
+ +	RH_KABI_EXTEND(unsigned int flags)
+ +	RH_KABI_EXTEND(struct percpu_ref internal_ref)
+ +	RH_KABI_EXTEND(struct completion done)
+ +	RH_KABI_EXTEND(void *owner)
+++=======
++ 	unsigned int flags;
++ 	const struct dev_pagemap_ops *ops;
+++>>>>>>> a6e6fe6549f6 (PCI/P2PDMA: Introduce private pagemap structure)
+  };
+  
+  static inline struct vmem_altmap *pgmap_altmap(struct dev_pagemap *pgmap)
+diff --git a/drivers/pci/p2pdma.c b/drivers/pci/p2pdma.c
+index 9736ba71ccbf..f75f8becc32c 100644
+--- a/drivers/pci/p2pdma.c
++++ b/drivers/pci/p2pdma.c
+@@ -25,6 +25,16 @@ struct pci_p2pdma {
+ 	bool p2pmem_published;
+ };
+ 
++struct pci_p2pdma_pagemap {
++	struct dev_pagemap pgmap;
++	u64 bus_offset;
++};
++
++static struct pci_p2pdma_pagemap *to_p2p_pgmap(struct dev_pagemap *pgmap)
++{
++	return container_of(pgmap, struct pci_p2pdma_pagemap, pgmap);
++}
++
+ static ssize_t size_show(struct device *dev, struct device_attribute *attr,
+ 			 char *buf)
+ {
+@@ -135,6 +145,7 @@ static int pci_p2pdma_setup(struct pci_dev *pdev)
+ int pci_p2pdma_add_resource(struct pci_dev *pdev, int bar, size_t size,
+ 			    u64 offset)
+ {
++	struct pci_p2pdma_pagemap *p2p_pgmap;
+ 	struct dev_pagemap *pgmap;
+ 	void *addr;
+ 	int error;
+@@ -157,14 +168,17 @@ int pci_p2pdma_add_resource(struct pci_dev *pdev, int bar, size_t size,
+ 			return error;
+ 	}
+ 
+-	pgmap = devm_kzalloc(&pdev->dev, sizeof(*pgmap), GFP_KERNEL);
+-	if (!pgmap)
++	p2p_pgmap = devm_kzalloc(&pdev->dev, sizeof(*p2p_pgmap), GFP_KERNEL);
++	if (!p2p_pgmap)
+ 		return -ENOMEM;
++
++	pgmap = &p2p_pgmap->pgmap;
+ 	pgmap->res.start = pci_resource_start(pdev, bar) + offset;
+ 	pgmap->res.end = pgmap->res.start + size - 1;
+ 	pgmap->res.flags = pci_resource_flags(pdev, bar);
+ 	pgmap->type = MEMORY_DEVICE_PCI_P2PDMA;
+-	pgmap->pci_p2pdma_bus_offset = pci_bus_address(pdev, bar) -
++
++	p2p_pgmap->bus_offset = pci_bus_address(pdev, bar) -
+ 		pci_resource_start(pdev, bar);
+ 
+ 	addr = devm_memremap_pages(&pdev->dev, pgmap);
+@@ -722,7 +736,7 @@ EXPORT_SYMBOL_GPL(pci_p2pmem_publish);
+ int pci_p2pdma_map_sg_attrs(struct device *dev, struct scatterlist *sg,
+ 		int nents, enum dma_data_direction dir, unsigned long attrs)
+ {
+-	struct dev_pagemap *pgmap;
++	struct pci_p2pdma_pagemap *p2p_pgmap;
+ 	struct scatterlist *s;
+ 	phys_addr_t paddr;
+ 	int i;
+@@ -738,10 +752,10 @@ int pci_p2pdma_map_sg_attrs(struct device *dev, struct scatterlist *sg,
+ 		return 0;
+ 
+ 	for_each_sg(sg, s, nents, i) {
+-		pgmap = sg_page(s)->pgmap;
++		p2p_pgmap = to_p2p_pgmap(sg_page(s)->pgmap);
+ 		paddr = sg_phys(s);
+ 
+-		s->dma_address = paddr - pgmap->pci_p2pdma_bus_offset;
++		s->dma_address = paddr - p2p_pgmap->bus_offset;
+ 		sg_dma_len(s) = s->length;
+ 	}
+ 
+* Unmerged path include/linux/memremap.h
