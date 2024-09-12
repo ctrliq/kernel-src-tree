@@ -68,7 +68,6 @@
 #define MOXA_ASPP_MON		(MOXA + 73)
 #define MOXA_ASPP_LSTATUS	(MOXA + 74)
 #define MOXA_ASPP_MON_EXT	(MOXA + 75)
-#define MOXA_SET_BAUD_METHOD	(MOXA + 76)
 
 /* --------------------------------------------------- */
 
@@ -405,7 +404,6 @@ struct mxser_mstatus {
 static struct mxser_board mxser_boards[MXSER_BOARDS];
 static struct tty_driver *mxvar_sdriver;
 static struct mxser_log mxvar_log;
-static int mxser_set_baud_method[MXSER_PORTS + 1];
 
 static void mxser_enable_must_enchance_mode(unsigned long baseio)
 {
@@ -769,8 +767,7 @@ static int mxser_change_speed(struct tty_struct *tty)
 	if (!info->ioaddr)
 		return ret;
 
-	if (mxser_set_baud_method[tty->index] == 0)
-		mxser_set_baud(tty, tty_get_baud_rate(tty));
+	mxser_set_baud(tty, tty_get_baud_rate(tty));
 
 	/* byte size and parity */
 	switch (cflag & CSIZE) {
@@ -1922,14 +1919,6 @@ static int mxser_ioctl(struct tty_struct *tty,
 
 		info->err_shadow = 0;
 		return 0;
-	}
-	case MOXA_SET_BAUD_METHOD: {
-		int method;
-
-		if (get_user(method, (int __user *)argp))
-			return -EFAULT;
-		mxser_set_baud_method[tty->index] = method;
-		return put_user(method, (int __user *)argp);
 	}
 	default:
 		return -ENOIOCTLCMD;
