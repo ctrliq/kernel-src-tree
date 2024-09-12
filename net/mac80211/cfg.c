@@ -4905,6 +4905,22 @@ ieee80211_del_link_station(struct wiphy *wiphy, struct net_device *dev,
 	return ret;
 }
 
+static int ieee80211_set_hw_timestamp(struct wiphy *wiphy,
+				      struct net_device *dev,
+				      struct cfg80211_set_hw_timestamp *hwts)
+{
+	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+	struct ieee80211_local *local = sdata->local;
+
+	if (!local->ops->set_hw_timestamp)
+		return -EOPNOTSUPP;
+
+	if (!check_sdata_in_driver(sdata))
+		return -EIO;
+
+	return local->ops->set_hw_timestamp(&local->hw, &sdata->vif, hwts);
+}
+
 const struct cfg80211_ops mac80211_config_ops = {
 	.add_virtual_intf = ieee80211_add_iface,
 	.del_virtual_intf = ieee80211_del_iface,
@@ -5015,4 +5031,5 @@ const struct cfg80211_ops mac80211_config_ops = {
 	.add_link_station = ieee80211_add_link_station,
 	.mod_link_station = ieee80211_mod_link_station,
 	.del_link_station = ieee80211_del_link_station,
+	.set_hw_timestamp = ieee80211_set_hw_timestamp,
 };
