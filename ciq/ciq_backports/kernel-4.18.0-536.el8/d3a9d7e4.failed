@@ -1,0 +1,572 @@
+x86/hyperv: Introduce a global variable hyperv_paravisor_present
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-536.el8
+commit-author Dexuan Cui <decui@microsoft.com>
+commit d3a9d7e49d15316f68f4347f48adcd1665834980
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-536.el8/d3a9d7e4.failed
+
+The new variable hyperv_paravisor_present is set only when the VM
+is a SNP/TDX VM with the paravisor running: see ms_hyperv_init_platform().
+
+We introduce hyperv_paravisor_present because we can not use
+ms_hyperv.paravisor_present in arch/x86/include/asm/mshyperv.h:
+
+struct ms_hyperv_info is defined in include/asm-generic/mshyperv.h, which
+is included at the end of arch/x86/include/asm/mshyperv.h, but at the
+beginning of arch/x86/include/asm/mshyperv.h, we would already need to use
+struct ms_hyperv_info in hv_do_hypercall().
+
+We use hyperv_paravisor_present only in include/asm-generic/mshyperv.h,
+and use ms_hyperv.paravisor_present elsewhere. In the future, we'll
+introduce a hypercall function structure for different VM types, and
+at boot time, the right function pointers would be written into the
+structure so that runtime testing of TDX vs. SNP vs. normal will be
+avoided and hyperv_paravisor_present will no longer be needed.
+
+Call hv_vtom_init() when it's a VBS VM or when ms_hyperv.paravisor_present
+is true, i.e. the VM is a SNP VM or TDX VM with the paravisor.
+
+Enhance hv_vtom_init() for a TDX VM with the paravisor.
+
+In hv_common_cpu_init(), don't decrypt the hyperv_pcpu_input_arg
+for a TDX VM with the paravisor, just like we don't decrypt the page
+for a SNP VM with the paravisor.
+
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Reviewed-by: Tianyu Lan <tiala@microsoft.com>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+Link: https://lore.kernel.org/r/20230824080712.30327-7-decui@microsoft.com
+(cherry picked from commit d3a9d7e49d15316f68f4347f48adcd1665834980)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/hv_init.c
+#	arch/x86/hyperv/ivm.c
+#	arch/x86/include/asm/mshyperv.h
+#	arch/x86/kernel/cpu/mshyperv.c
+#	drivers/hv/hv_common.c
+diff --cc arch/x86/hyperv/hv_init.c
+index 1d0a26104d0f,eca5c4b7e3b5..000000000000
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@@ -618,6 -658,9 +618,12 @@@ bool hv_is_hyperv_initialized(void
+  	if (x86_hyper_type != X86_HYPER_MS_HYPERV)
+  		return false;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* A TDX VM with no paravisor uses TDX GHCI call rather than hv_hypercall_pg */
++ 	if (hv_isolation_type_tdx() && !ms_hyperv.paravisor_present)
++ 		return true;
+++>>>>>>> d3a9d7e49d15 (x86/hyperv: Introduce a global variable hyperv_paravisor_present)
+  	/*
+  	 * Verify that earlier initialization succeeded by checking
+  	 * that the hypercall page is setup
+diff --cc arch/x86/hyperv/ivm.c
+index 5648efb6c73e,7bd0359d5e38..000000000000
+--- a/arch/x86/hyperv/ivm.c
++++ b/arch/x86/hyperv/ivm.c
+@@@ -233,8 -247,10 +233,11 @@@ void hv_ghcb_msr_read(u64 msr, u64 *val
+  	local_irq_restore(flags);
+  }
+  EXPORT_SYMBOL_GPL(hv_ghcb_msr_read);
+ +#endif
+  
++ #endif /* CONFIG_AMD_MEM_ENCRYPT */
++ 
++ #if defined(CONFIG_AMD_MEM_ENCRYPT) || defined(CONFIG_INTEL_TDX_GUEST)
+  /*
+   * hv_mark_gpa_visibility - Set pages visible to host via hvcall.
+   *
+@@@ -323,36 -339,216 +326,242 @@@ int hv_set_mem_host_visibility(unsigne
+  
+   err_free_pfn_array:
+  	kfree(pfn_array);
+++<<<<<<< HEAD
+ +	return ret;
+ +}
+ +
+ +/*
+ + * hv_map_memory - map memory to extra space in the AMD SEV-SNP Isolation VM.
+ + */
+ +void *hv_map_memory(void *addr, unsigned long size)
+ +{
+ +	unsigned long *pfns = kcalloc(size / PAGE_SIZE,
+ +				      sizeof(unsigned long), GFP_KERNEL);
+ +	void *vaddr;
+ +	int i;
+++=======
++ 	return result;
++ }
++ 
++ static bool hv_vtom_tlb_flush_required(bool private)
++ {
++ 	return true;
++ }
++ 
++ static bool hv_vtom_cache_flush_required(void)
++ {
++ 	return false;
++ }
++ 
++ static bool hv_is_private_mmio(u64 addr)
++ {
++ 	/*
++ 	 * Hyper-V always provides a single IO-APIC in a guest VM.
++ 	 * When a paravisor is used, it is emulated by the paravisor
++ 	 * in the guest context and must be mapped private.
++ 	 */
++ 	if (addr >= HV_IOAPIC_BASE_ADDRESS &&
++ 	    addr < (HV_IOAPIC_BASE_ADDRESS + PAGE_SIZE))
++ 		return true;
++ 
++ 	/* Same with a vTPM */
++ 	if (addr >= VTPM_BASE_ADDRESS &&
++ 	    addr < (VTPM_BASE_ADDRESS + PAGE_SIZE))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ #endif /* defined(CONFIG_AMD_MEM_ENCRYPT) || defined(CONFIG_INTEL_TDX_GUEST) */
++ 
++ #ifdef CONFIG_AMD_MEM_ENCRYPT
++ 
++ #define hv_populate_vmcb_seg(seg, gdtr_base)			\
++ do {								\
++ 	if (seg.selector) {					\
++ 		seg.base = 0;					\
++ 		seg.limit = HV_AP_SEGMENT_LIMIT;		\
++ 		seg.attrib = *(u16 *)(gdtr_base + seg.selector + 5);	\
++ 		seg.attrib = (seg.attrib & 0xFF) | ((seg.attrib >> 4) & 0xF00); \
++ 	}							\
++ } while (0)							\
++ 
++ static int snp_set_vmsa(void *va, bool vmsa)
++ {
++ 	u64 attrs;
++ 
++ 	/*
++ 	 * Running at VMPL0 allows the kernel to change the VMSA bit for a page
++ 	 * using the RMPADJUST instruction. However, for the instruction to
++ 	 * succeed it must target the permissions of a lesser privileged
++ 	 * (higher numbered) VMPL level, so use VMPL1 (refer to the RMPADJUST
++ 	 * instruction in the AMD64 APM Volume 3).
++ 	 */
++ 	attrs = 1;
++ 	if (vmsa)
++ 		attrs |= RMPADJUST_VMSA_PAGE_BIT;
++ 
++ 	return rmpadjust((unsigned long)va, RMP_PG_SIZE_4K, attrs);
++ }
++ 
++ static void snp_cleanup_vmsa(struct sev_es_save_area *vmsa)
++ {
++ 	int err;
++ 
++ 	err = snp_set_vmsa(vmsa, false);
++ 	if (err)
++ 		pr_err("clear VMSA page failed (%u), leaking page\n", err);
++ 	else
++ 		free_page((unsigned long)vmsa);
++ }
++ 
++ int hv_snp_boot_ap(int cpu, unsigned long start_ip)
++ {
++ 	struct sev_es_save_area *vmsa = (struct sev_es_save_area *)
++ 		__get_free_page(GFP_KERNEL | __GFP_ZERO);
++ 	struct sev_es_save_area *cur_vmsa;
++ 	struct desc_ptr gdtr;
++ 	u64 ret, retry = 5;
++ 	struct hv_enable_vp_vtl *start_vp_input;
++ 	unsigned long flags;
++ 
++ 	if (!vmsa)
++ 		return -ENOMEM;
++ 
++ 	native_store_gdt(&gdtr);
++ 
++ 	vmsa->gdtr.base = gdtr.address;
++ 	vmsa->gdtr.limit = gdtr.size;
++ 
++ 	asm volatile("movl %%es, %%eax;" : "=a" (vmsa->es.selector));
++ 	hv_populate_vmcb_seg(vmsa->es, vmsa->gdtr.base);
++ 
++ 	asm volatile("movl %%cs, %%eax;" : "=a" (vmsa->cs.selector));
++ 	hv_populate_vmcb_seg(vmsa->cs, vmsa->gdtr.base);
++ 
++ 	asm volatile("movl %%ss, %%eax;" : "=a" (vmsa->ss.selector));
++ 	hv_populate_vmcb_seg(vmsa->ss, vmsa->gdtr.base);
++ 
++ 	asm volatile("movl %%ds, %%eax;" : "=a" (vmsa->ds.selector));
++ 	hv_populate_vmcb_seg(vmsa->ds, vmsa->gdtr.base);
++ 
++ 	vmsa->efer = native_read_msr(MSR_EFER);
++ 
++ 	asm volatile("movq %%cr4, %%rax;" : "=a" (vmsa->cr4));
++ 	asm volatile("movq %%cr3, %%rax;" : "=a" (vmsa->cr3));
++ 	asm volatile("movq %%cr0, %%rax;" : "=a" (vmsa->cr0));
++ 
++ 	vmsa->xcr0 = 1;
++ 	vmsa->g_pat = HV_AP_INIT_GPAT_DEFAULT;
++ 	vmsa->rip = (u64)secondary_startup_64_no_verify;
++ 	vmsa->rsp = (u64)&ap_start_stack[PAGE_SIZE];
++ 
++ 	/*
++ 	 * Set the SNP-specific fields for this VMSA:
++ 	 *   VMPL level
++ 	 *   SEV_FEATURES (matches the SEV STATUS MSR right shifted 2 bits)
++ 	 */
++ 	vmsa->vmpl = 0;
++ 	vmsa->sev_features = sev_status >> 2;
++ 
++ 	ret = snp_set_vmsa(vmsa, true);
++ 	if (!ret) {
++ 		pr_err("RMPADJUST(%llx) failed: %llx\n", (u64)vmsa, ret);
++ 		free_page((u64)vmsa);
++ 		return ret;
++ 	}
++ 
++ 	local_irq_save(flags);
++ 	start_vp_input = (struct hv_enable_vp_vtl *)ap_start_input_arg;
++ 	memset(start_vp_input, 0, sizeof(*start_vp_input));
++ 	start_vp_input->partition_id = -1;
++ 	start_vp_input->vp_index = cpu;
++ 	start_vp_input->target_vtl.target_vtl = ms_hyperv.vtl;
++ 	*(u64 *)&start_vp_input->vp_context = __pa(vmsa) | 1;
++ 
++ 	do {
++ 		ret = hv_do_hypercall(HVCALL_START_VP,
++ 				      start_vp_input, NULL);
++ 	} while (hv_result(ret) == HV_STATUS_TIME_OUT && retry--);
++ 
++ 	local_irq_restore(flags);
++ 
++ 	if (!hv_result_success(ret)) {
++ 		pr_err("HvCallStartVirtualProcessor failed: %llx\n", ret);
++ 		snp_cleanup_vmsa(vmsa);
++ 		vmsa = NULL;
++ 	}
++ 
++ 	cur_vmsa = per_cpu(hv_sev_vmsa, cpu);
++ 	/* Free up any previous VMSA page */
++ 	if (cur_vmsa)
++ 		snp_cleanup_vmsa(cur_vmsa);
++ 
++ 	/* Record the current VMSA page */
++ 	per_cpu(hv_sev_vmsa, cpu) = vmsa;
++ 
++ 	return ret;
++ }
++ 
++ #endif /* CONFIG_AMD_MEM_ENCRYPT */
++ 
++ #if defined(CONFIG_AMD_MEM_ENCRYPT) || defined(CONFIG_INTEL_TDX_GUEST)
++ 
++ void __init hv_vtom_init(void)
++ {
++ 	enum hv_isolation_type type = hv_get_isolation_type();
++ 
++ 	switch (type) {
++ 	case HV_ISOLATION_TYPE_VBS:
++ 		fallthrough;
++ 	/*
++ 	 * By design, a VM using vTOM doesn't see the SEV setting,
++ 	 * so SEV initialization is bypassed and sev_status isn't set.
++ 	 * Set it here to indicate a vTOM VM.
++ 	 *
++ 	 * Note: if CONFIG_AMD_MEM_ENCRYPT is not set, sev_status is
++ 	 * defined as 0ULL, to which we can't assigned a value.
++ 	 */
++ #ifdef CONFIG_AMD_MEM_ENCRYPT
++ 	case HV_ISOLATION_TYPE_SNP:
++ 		sev_status = MSR_AMD64_SNP_VTOM;
++ 		cc_vendor = CC_VENDOR_AMD;
++ 		break;
++ #endif
++ 
++ 	case HV_ISOLATION_TYPE_TDX:
++ 		cc_vendor = CC_VENDOR_INTEL;
++ 		break;
++ 
++ 	default:
++ 		panic("hv_vtom_init: unsupported isolation type %d\n", type);
++ 	}
++ 
++ 	cc_set_mask(ms_hyperv.shared_gpa_boundary);
++ 	physical_mask &= ms_hyperv.shared_gpa_boundary - 1;
+++>>>>>>> d3a9d7e49d15 (x86/hyperv: Introduce a global variable hyperv_paravisor_present)
+ +
+ +	if (!pfns)
+ +		return NULL;
+  
+ -	x86_platform.hyper.is_private_mmio = hv_is_private_mmio;
+ -	x86_platform.guest.enc_cache_flush_required = hv_vtom_cache_flush_required;
+ -	x86_platform.guest.enc_tlb_flush_required = hv_vtom_tlb_flush_required;
+ -	x86_platform.guest.enc_status_change_finish = hv_vtom_set_host_visibility;
+ +	for (i = 0; i < size / PAGE_SIZE; i++)
+ +		pfns[i] = vmalloc_to_pfn(addr + i * PAGE_SIZE) +
+ +			(ms_hyperv.shared_gpa_boundary >> PAGE_SHIFT);
+  
+ -	/* Set WB as the default cache mode. */
+ -	mtrr_overwrite_state(NULL, 0, MTRR_TYPE_WRBACK);
+ +	vaddr = vmap_pfn(pfns, size / PAGE_SIZE, pgprot_decrypted(PAGE_KERNEL));
+ +	kfree(pfns);
+ +
+ +	return vaddr;
+  }
+  
+++<<<<<<< HEAD
+ +void hv_unmap_memory(void *addr)
+ +{
+ +	vunmap(addr);
+ +}
+++=======
++ #endif /* defined(CONFIG_AMD_MEM_ENCRYPT) || defined(CONFIG_INTEL_TDX_GUEST) */
+++>>>>>>> d3a9d7e49d15 (x86/hyperv: Introduce a global variable hyperv_paravisor_present)
+  
+  enum hv_isolation_type hv_get_isolation_type(void)
+  {
+diff --cc arch/x86/include/asm/mshyperv.h
+index a56488c7d1a0,a9f453c39371..000000000000
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@@ -58,6 -76,9 +59,12 @@@ static inline u64 hv_do_hypercall(u64 c
+  	u64 hv_status;
+  
+  #ifdef CONFIG_X86_64
+++<<<<<<< HEAD
+++=======
++ 	if (hv_isolation_type_tdx() && !hyperv_paravisor_present)
++ 		return hv_tdx_hypercall(control, input_address, output_address);
++ 
+++>>>>>>> d3a9d7e49d15 (x86/hyperv: Introduce a global variable hyperv_paravisor_present)
+  	if (hv_isolation_type_en_snp()) {
+  		__asm__ __volatile__("mov %4, %%r8\n"
+  				     "vmmcall"
+@@@ -111,6 -132,9 +118,12 @@@ static inline u64 _hv_do_fast_hypercall
+  	u64 hv_status;
+  
+  #ifdef CONFIG_X86_64
+++<<<<<<< HEAD
+++=======
++ 	if (hv_isolation_type_tdx() && !hyperv_paravisor_present)
++ 		return hv_tdx_hypercall(control, input1, 0);
++ 
+++>>>>>>> d3a9d7e49d15 (x86/hyperv: Introduce a global variable hyperv_paravisor_present)
+  	if (hv_isolation_type_en_snp()) {
+  		__asm__ __volatile__(
+  				"vmmcall"
+@@@ -162,6 -186,9 +175,12 @@@ static inline u64 _hv_do_fast_hypercall
+  	u64 hv_status;
+  
+  #ifdef CONFIG_X86_64
+++<<<<<<< HEAD
+++=======
++ 	if (hv_isolation_type_tdx() && !hyperv_paravisor_present)
++ 		return hv_tdx_hypercall(control, input1, input2);
++ 
+++>>>>>>> d3a9d7e49d15 (x86/hyperv: Introduce a global variable hyperv_paravisor_present)
+  	if (hv_isolation_type_en_snp()) {
+  		__asm__ __volatile__("mov %4, %%r8\n"
+  				     "vmmcall"
+@@@ -248,12 -278,14 +267,21 @@@ int hv_set_mem_host_visibility(unsigne
+  void hv_ghcb_msr_write(u64 msr, u64 value);
+  void hv_ghcb_msr_read(u64 msr, u64 *value);
+  bool hv_ghcb_negotiate_protocol(void);
+++<<<<<<< HEAD
+ +void hv_ghcb_terminate(unsigned int set, unsigned int reason);
+++=======
++ void __noreturn hv_ghcb_terminate(unsigned int set, unsigned int reason);
++ int hv_snp_boot_ap(int cpu, unsigned long start_ip);
+++>>>>>>> d3a9d7e49d15 (x86/hyperv: Introduce a global variable hyperv_paravisor_present)
+  #else
+  static inline void hv_ghcb_msr_write(u64 msr, u64 value) {}
+  static inline void hv_ghcb_msr_read(u64 msr, u64 *value) {}
+  static inline bool hv_ghcb_negotiate_protocol(void) { return false; }
+  static inline void hv_ghcb_terminate(unsigned int set, unsigned int reason) {}
+++<<<<<<< HEAD
+++=======
++ static inline int hv_snp_boot_ap(int cpu, unsigned long start_ip) { return 0; }
+++>>>>>>> d3a9d7e49d15 (x86/hyperv: Introduce a global variable hyperv_paravisor_present)
+  #endif
+  
+  extern bool hv_isolation_type_snp(void);
+diff --cc arch/x86/kernel/cpu/mshyperv.c
+index 1189865ffc68,4c5a174935ca..000000000000
+--- a/arch/x86/kernel/cpu/mshyperv.c
++++ b/arch/x86/kernel/cpu/mshyperv.c
+@@@ -379,9 -428,13 +383,11 @@@ static void __init ms_hyperv_init_platf
+  	if (ms_hyperv.priv_high & HV_ISOLATION) {
+  		ms_hyperv.isolation_config_a = cpuid_eax(HYPERV_CPUID_ISOLATION_CONFIG);
+  		ms_hyperv.isolation_config_b = cpuid_ebx(HYPERV_CPUID_ISOLATION_CONFIG);
+ -
+ -		if (ms_hyperv.shared_gpa_boundary_active)
+ -			ms_hyperv.shared_gpa_boundary =
+ -				BIT_ULL(ms_hyperv.shared_gpa_boundary_bits);
+ +		ms_hyperv.shared_gpa_boundary =
+ +			BIT_ULL(ms_hyperv.shared_gpa_boundary_bits);
+  
++ 		hyperv_paravisor_present = !!ms_hyperv.paravisor_present;
++ 
+  		pr_info("Hyper-V: Isolation Config: Group A 0x%x, Group B 0x%x\n",
+  			ms_hyperv.isolation_config_a, ms_hyperv.isolation_config_b);
+  
+@@@ -464,6 -531,9 +470,12 @@@
+  	i8253_clear_counter_on_shutdown = false;
+  
+  #if IS_ENABLED(CONFIG_HYPERV)
+++<<<<<<< HEAD
+++=======
++ 	if ((hv_get_isolation_type() == HV_ISOLATION_TYPE_VBS) ||
++ 	    ms_hyperv.paravisor_present)
++ 		hv_vtom_init();
+++>>>>>>> d3a9d7e49d15 (x86/hyperv: Introduce a global variable hyperv_paravisor_present)
+  	/*
+  	 * Setup the hook to get control post apic initialization.
+  	 */
+diff --cc drivers/hv/hv_common.c
+index c00e1e18c2ea,e62d64753902..000000000000
+--- a/drivers/hv/hv_common.c
++++ b/drivers/hv/hv_common.c
+@@@ -132,13 -367,47 +132,56 @@@ int hv_common_cpu_init(unsigned int cpu
+  	flags = irqs_disabled() ? GFP_ATOMIC : GFP_KERNEL;
+  
+  	inputarg = (void **)this_cpu_ptr(hyperv_pcpu_input_arg);
+ +	*inputarg = kmalloc(pgcount * HV_HYP_PAGE_SIZE, flags);
+ +	if (!(*inputarg))
+ +		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	if (hv_root_partition) {
+ +		outputarg = (void **)this_cpu_ptr(hyperv_pcpu_output_arg);
+ +		*outputarg = (char *)(*inputarg) + HV_HYP_PAGE_SIZE;
+++=======
++ 	/*
++ 	 * hyperv_pcpu_input_arg and hyperv_pcpu_output_arg memory is already
++ 	 * allocated if this CPU was previously online and then taken offline
++ 	 */
++ 	if (!*inputarg) {
++ 		mem = kmalloc(pgcount * HV_HYP_PAGE_SIZE, flags);
++ 		if (!mem)
++ 			return -ENOMEM;
++ 
++ 		if (hv_root_partition) {
++ 			outputarg = (void **)this_cpu_ptr(hyperv_pcpu_output_arg);
++ 			*outputarg = (char *)mem + HV_HYP_PAGE_SIZE;
++ 		}
++ 
++ 		if (!ms_hyperv.paravisor_present &&
++ 		    (hv_isolation_type_en_snp() || hv_isolation_type_tdx())) {
++ 			ret = set_memory_decrypted((unsigned long)mem, pgcount);
++ 			if (ret) {
++ 				/* It may be unsafe to free 'mem' */
++ 				return ret;
++ 			}
++ 
++ 			memset(mem, 0x00, pgcount * HV_HYP_PAGE_SIZE);
++ 		}
++ 
++ 		/*
++ 		 * In a fully enlightened TDX/SNP VM with more than 64 VPs, if
++ 		 * hyperv_pcpu_input_arg is not NULL, set_memory_decrypted() ->
++ 		 * ... -> cpa_flush()-> ... -> __send_ipi_mask_ex() tries to
++ 		 * use hyperv_pcpu_input_arg as the hypercall input page, which
++ 		 * must be a decrypted page in such a VM, but the page is still
++ 		 * encrypted before set_memory_decrypted() returns. Fix this by
++ 		 * setting *inputarg after the above set_memory_decrypted(): if
++ 		 * hyperv_pcpu_input_arg is NULL, __send_ipi_mask_ex() returns
++ 		 * HV_STATUS_INVALID_PARAMETER immediately, and the function
++ 		 * hv_send_ipi_mask() falls back to orig_apic.send_IPI_mask(),
++ 		 * which may be slightly slower than the hypercall, but still
++ 		 * works correctly in such a VM.
++ 		 */
++ 		*inputarg = mem;
+++>>>>>>> d3a9d7e49d15 (x86/hyperv: Introduce a global variable hyperv_paravisor_present)
+  	}
+  
+  	msr_vp_index = hv_get_register(HV_REGISTER_VP_INDEX);
+* Unmerged path arch/x86/hyperv/hv_init.c
+* Unmerged path arch/x86/hyperv/ivm.c
+* Unmerged path arch/x86/include/asm/mshyperv.h
+* Unmerged path arch/x86/kernel/cpu/mshyperv.c
+diff --git a/drivers/hv/connection.c b/drivers/hv/connection.c
+index 6535a1d15ba1..eecfdc47041d 100644
+--- a/drivers/hv/connection.c
++++ b/drivers/hv/connection.c
+@@ -496,10 +496,17 @@ void vmbus_set_event(struct vmbus_channel *channel)
+ 
+ 	++channel->sig_events;
+ 
+-	if (hv_isolation_type_snp())
+-		hv_ghcb_hypercall(HVCALL_SIGNAL_EVENT, &channel->sig_event,
+-				NULL, sizeof(channel->sig_event));
+-	else
++	if (ms_hyperv.paravisor_present) {
++		if (hv_isolation_type_snp())
++			hv_ghcb_hypercall(HVCALL_SIGNAL_EVENT, &channel->sig_event,
++					  NULL, sizeof(channel->sig_event));
++		else if (hv_isolation_type_tdx())
++			hv_tdx_hypercall(HVCALL_SIGNAL_EVENT | HV_HYPERCALL_FAST_BIT,
++					 channel->sig_event, 0);
++		else
++			WARN_ON_ONCE(1);
++	} else {
+ 		hv_do_fast_hypercall8(HVCALL_SIGNAL_EVENT, channel->sig_event);
++	}
+ }
+ EXPORT_SYMBOL_GPL(vmbus_set_event);
+diff --git a/drivers/hv/hv.c b/drivers/hv/hv.c
+index 54db91ae3c0d..b53daffdbb82 100644
+--- a/drivers/hv/hv.c
++++ b/drivers/hv/hv.c
+@@ -157,7 +157,7 @@ int hv_synic_alloc(void)
+ 		 * Synic message and event pages are allocated by paravisor.
+ 		 * Skip these pages allocation here.
+ 		 */
+-		if (!hv_isolation_type_snp() && !hv_root_partition) {
++		if (!ms_hyperv.paravisor_present && !hv_root_partition) {
+ 			hv_cpu->synic_message_page =
+ 				(void *)get_zeroed_page(GFP_ATOMIC);
+ 			if (hv_cpu->synic_message_page == NULL) {
+@@ -219,7 +219,7 @@ void hv_synic_enable_regs(unsigned int cpu)
+ 	simp.as_uint64 = hv_get_register(HV_REGISTER_SIMP);
+ 	simp.simp_enabled = 1;
+ 
+-	if (hv_isolation_type_snp() || hv_root_partition) {
++	if (ms_hyperv.paravisor_present || hv_root_partition) {
+ 		/* Mask out vTOM bit. ioremap_cache() maps decrypted */
+ 		u64 base = (simp.base_simp_gpa << HV_HYP_PAGE_SHIFT) &
+ 				~ms_hyperv.shared_gpa_boundary;
+@@ -238,7 +238,7 @@ void hv_synic_enable_regs(unsigned int cpu)
+ 	siefp.as_uint64 = hv_get_register(HV_REGISTER_SIEFP);
+ 	siefp.siefp_enabled = 1;
+ 
+-	if (hv_isolation_type_snp() || hv_root_partition) {
++	if (ms_hyperv.paravisor_present || hv_root_partition) {
+ 		/* Mask out vTOM bit. ioremap_cache() maps decrypted */
+ 		u64 base = (siefp.base_siefp_gpa << HV_HYP_PAGE_SHIFT) &
+ 				~ms_hyperv.shared_gpa_boundary;
+@@ -321,7 +321,7 @@ void hv_synic_disable_regs(unsigned int cpu)
+ 	 * addresses.
+ 	 */
+ 	simp.simp_enabled = 0;
+-	if (hv_isolation_type_snp() || hv_root_partition) {
++	if (ms_hyperv.paravisor_present || hv_root_partition) {
+ 		iounmap(hv_cpu->synic_message_page);
+ 		hv_cpu->synic_message_page = NULL;
+ 	} else {
+@@ -333,7 +333,7 @@ void hv_synic_disable_regs(unsigned int cpu)
+ 	siefp.as_uint64 = hv_get_register(HV_REGISTER_SIEFP);
+ 	siefp.siefp_enabled = 0;
+ 
+-	if (hv_isolation_type_snp() || hv_root_partition) {
++	if (ms_hyperv.paravisor_present || hv_root_partition) {
+ 		iounmap(hv_cpu->synic_event_page);
+ 		hv_cpu->synic_event_page = NULL;
+ 	} else {
+* Unmerged path drivers/hv/hv_common.c
