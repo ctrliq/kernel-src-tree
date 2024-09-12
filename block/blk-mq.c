@@ -29,7 +29,7 @@
 #include <linux/prefetch.h>
 #include <linux/blk-crypto.h>
 #include <linux/part_stat.h>
-#include <linux/sched/isolation.h>
+#include RH_KABI_HIDE_INCLUDE(<linux/sched/isolation.h>)
 
 #include <trace/events/block.h>
 

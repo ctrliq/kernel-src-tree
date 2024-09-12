@@ -88,8 +88,8 @@ except in the case when the removed engineer is no longer with Red Hat.  While r
 do not require the approve of the maintainer, MR authors are encouraged to add the maintainer for
 an approve.
 
-4.  Any MR adding or modifying a devel-sst field requires the approval from
-the subsystem maintainer.
+4.  Any MR adding or modifying other fields (devel-sst, status, jira, etc.) requires the approval
+from the subsystem maintainer.
 
 MR authors, reviewers, and maintainers should discuss disagreements about ownership or role changes
 with their management.

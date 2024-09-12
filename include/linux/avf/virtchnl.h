@@ -5,7 +5,6 @@
 #define _VIRTCHNL_H_
 
 #include <linux/bitops.h>
-#include <linux/bits.h>
 #include <linux/overflow.h>
 #include <uapi/linux/if_ether.h>
 

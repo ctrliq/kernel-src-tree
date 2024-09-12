@@ -826,8 +826,7 @@ ice_add_xsk_frag(struct ice_rx_ring *rx_ring, struct xdp_buff *first,
 	}
 
 	__skb_fill_page_desc_noacc(sinfo, sinfo->nr_frags++,
-				   virt_to_page(xdp->data_hard_start),
-				   XDP_PACKET_HEADROOM, size);
+				   virt_to_page(xdp->data_hard_start), 0, size);
 	sinfo->xdp_frags_size += size;
 	xsk_buff_add_frag(xdp);
 

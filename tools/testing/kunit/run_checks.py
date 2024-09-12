@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#! /usr/bin/python3 -s
 # SPDX-License-Identifier: GPL-2.0
 #
 # This file runs some basic checks to verify kunit works.

@@ -27,6 +27,7 @@ type SubSystem struct {
 		EmailLabel string `emailLabel`
 	}
 	Status string `status`
+	JiraComponent string `jiraComponent`
 	DevelSst []string `devel-sst`
 	Maintainers []NameAndEmail `maintainers`
 	Reviewers []NameAndEmail `reviewers`
@@ -104,6 +105,10 @@ func main() {
 				       "Kconfig",
 				      }
 	for _, s := range subSystems.SubSys {
+		// check that jiraComponent is set
+		if s.JiraComponent == "" {
+			log.Fatalf("error: '%s' is missing a jiraComponent entry", s.Subsystem)
+		}
 		// check that devel-sst is set
 		if s.DevelSst == nil {
 			log.Fatalf("error: '%s' is missing a devel-sst entry", s.Subsystem)
