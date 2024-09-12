@@ -1,0 +1,125 @@
+x86/ftrace: Do not call function graph from dynamic trampolines
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Steven Rostedt (VMware) <rostedt@goodmis.org>
+commit d2a68c4effd821f0871d20368f76b609349c8a3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/d2a68c4e.failed
+
+Since commit 79922b8009c07 ("ftrace: Optimize function graph to be
+called directly"), dynamic trampolines should not be calling the
+function graph tracer at the end. If they do, it could cause the function
+graph tracer to trace functions that it filtered out.
+
+Right now it does not cause a problem because there's a test to check if
+the function graph tracer is attached to the same function as the
+function tracer, which for now is true. But the function graph tracer is
+undergoing changes that can make this no longer true which will cause
+the function graph tracer to trace other functions.
+
+ For example:
+
+ # cd /sys/kernel/tracing/
+ # echo do_IRQ > set_ftrace_filter
+ # mkdir instances/foo
+ # echo ip_rcv > instances/foo/set_ftrace_filter
+ # echo function_graph > current_tracer
+ # echo function > instances/foo/current_tracer
+
+Would cause the function graph tracer to trace both do_IRQ and ip_rcv,
+if the current tests change.
+
+As the current tests prevent this from being a problem, this code does
+not need to be backported. But it does make the code cleaner.
+
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: x86@kernel.org
+	Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+(cherry picked from commit d2a68c4effd821f0871d20368f76b609349c8a3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/ftrace.c
+diff --cc arch/x86/kernel/ftrace.c
+index 2556c875d567,8257a59704ae..000000000000
+--- a/arch/x86/kernel/ftrace.c
++++ b/arch/x86/kernel/ftrace.c
+@@@ -760,11 -742,11 +761,12 @@@ create_trampoline(struct ftrace_ops *op
+  	unsigned long end_offset;
+  	unsigned long op_offset;
+  	unsigned long offset;
+ +	unsigned long npages;
+  	unsigned long size;
+- 	unsigned long ip;
++ 	unsigned long retq;
+  	unsigned long *ptr;
+  	void *trampoline;
++ 	void *ip;
+  	/* 48 8b 15 <offset> is movq <offset>(%rip), %rdx */
+  	unsigned const char op_ref[] = { 0x48, 0x8b, 0x15 };
+  	union ftrace_op_code_union op_ptr;
+@@@ -791,8 -773,7 +793,12 @@@
+  	if (!trampoline)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	*tramp_size = size + MCOUNT_INSN_SIZE + sizeof(void *);
+ +	npages = DIV_ROUND_UP(*tramp_size, PAGE_SIZE);
+++=======
++ 	*tramp_size = size + RET_SIZE + sizeof(void *);
+++>>>>>>> d2a68c4effd8 (x86/ftrace: Do not call function graph from dynamic trampolines)
+  
+  	/* Copy ftrace_caller onto the trampoline memory */
+  	ret = probe_kernel_read(trampoline, (void *)start_offset, size);
+@@@ -839,13 -818,10 +843,16 @@@
+  	/* ALLOC_TRAMP flags lets us know we created it */
+  	ops->flags |= FTRACE_OPS_FL_ALLOC_TRAMP;
+  
+ +	/*
+ +	 * Module allocation needs to be completed by making the page
+ +	 * executable. The page is still writable, which is a security hazard,
+ +	 * but anyhow ftrace breaks W^X completely.
+ +	 */
+ +	set_memory_x((unsigned long)trampoline, npages);
+  	return (unsigned long)trampoline;
++ fail:
++ 	tramp_free(trampoline, *tramp_size);
++ 	return 0;
+  }
+  
+  static unsigned long calc_trampoline_call_offset(bool save_regs)
+* Unmerged path arch/x86/kernel/ftrace.c
+diff --git a/arch/x86/kernel/ftrace_64.S b/arch/x86/kernel/ftrace_64.S
+index 8144bb7316a4..cbeea26beac8 100644
+--- a/arch/x86/kernel/ftrace_64.S
++++ b/arch/x86/kernel/ftrace_64.S
+@@ -155,9 +155,6 @@ SYM_INNER_LABEL(ftrace_call, SYM_L_GLOBAL)
+ 	restore_mcount_regs
+ 
+ 	/*
+-	 * The copied trampoline must call ftrace_epilogue as it
+-	 * still may need to call the function graph tracer.
+-	 *
+ 	 * The code up to this label is copied into trampolines so
+ 	 * think twice before adding any new code or changing the
+ 	 * layout here.
+@@ -169,7 +166,10 @@ SYM_INNER_LABEL(ftrace_graph_call, SYM_L_GLOBAL)
+ 	jmp ftrace_stub
+ #endif
+ 
+-/* This is weak to keep gas from relaxing the jumps */
++/*
++ * This is weak to keep gas from relaxing the jumps.
++ * It is also used to copy the retq for trampolines.
++ */
+ WEAK(ftrace_stub)
+ 	retq
+ SYM_FUNC_END(ftrace_caller)
