@@ -1,0 +1,627 @@
+vt: drop old FONT ioctls
+
+jira LE-1907
+cve CVE-2021-33656
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Jiri Slaby <jslaby@suse.cz>
+commit ff2047fb755d4415ec3c70ac799889371151796d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/ff2047fb.failed
+
+Drop support for these ioctls:
+* PIO_FONT, PIO_FONTX
+* GIO_FONT, GIO_FONTX
+* PIO_FONTRESET
+
+As was demonstrated by commit 90bfdeef83f1 (tty: make FONTX ioctl use
+the tty pointer they were actually passed), these ioctls are not used
+from userspace, as:
+1) they used to be broken (set up font on current console, not the open
+   one) and racy (before the commit above)
+2) KDFONTOP ioctl is used for years instead
+
+Note that PIO_FONTRESET is defunct on most systems as VGA_CONSOLE is set
+on them for ages. That turns on BROKEN_GRAPHICS_PROGRAMS which makes
+PIO_FONTRESET just return an error.
+
+We are removing KD_FONT_FLAG_OLD here as it was used only by these
+removed ioctls. kd.h header exists both in kernel and uapi headers, so
+we can remove the kernel one completely. Everyone includeing kd.h will
+now automatically get the uapi one.
+
+There are now unused definitions of the ioctl numbers and "struct
+consolefontdesc" in kd.h, but as it is a uapi header, I am not touching
+these.
+
+	Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+Link: https://lore.kernel.org/r/20210105120239.28031-8-jslaby@suse.cz
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit ff2047fb755d4415ec3c70ac799889371151796d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/vt/vt_ioctl.c
+diff --cc drivers/tty/vt/vt_ioctl.c
+index c648b550d2cf,4a4cbd4a5f37..000000000000
+--- a/drivers/tty/vt/vt_ioctl.c
++++ b/drivers/tty/vt/vt_ioctl.c
+@@@ -241,50 -240,252 +241,273 @@@ int vt_waitactive(int n
+  #define GPLAST 0x3df
+  #define GPNUM (GPLAST - GPFIRST + 1)
+  
+ -/*
+ - * currently, setting the mode from KD_TEXT to KD_GRAPHICS doesn't do a whole
+ - * lot. i'm not sure if it should do any restoration of modes or what...
+ - *
+ - * XXX It should at least call into the driver, fbdev's definitely need to
+ - * restore their engine state. --BenH
+ - */
+ -static int vt_kdsetmode(struct vc_data *vc, unsigned long mode)
+ +
+ +
+++<<<<<<< HEAD
+ +static inline int 
+ +do_fontx_ioctl(int cmd, struct consolefontdesc __user *user_cfd, int perm, struct console_font_op *op)
+  {
+ -	switch (mode) {
+ -	case KD_GRAPHICS:
+ -		break;
+ -	case KD_TEXT0:
+ -	case KD_TEXT1:
+ -		mode = KD_TEXT;
+ -		fallthrough;
+ -	case KD_TEXT:
+ -		break;
+ -	default:
+ -		return -EINVAL;
+ -	}
+ +	struct consolefontdesc cfdarg;
+ +	int i;
+  
+ -	/* FIXME: this needs the console lock extending */
+ -	if (vc->vc_mode == mode)
+ +	if (copy_from_user(&cfdarg, user_cfd, sizeof(struct consolefontdesc))) 
+ +		return -EFAULT;
+ + 	
+ +	switch (cmd) {
+ +	case PIO_FONTX:
+ +		if (!perm)
+ +			return -EPERM;
+ +		op->op = KD_FONT_OP_SET;
+ +		op->flags = KD_FONT_FLAG_OLD;
+ +		op->width = 8;
+ +		op->height = cfdarg.charheight;
+ +		op->charcount = cfdarg.charcount;
+ +		op->data = cfdarg.chardata;
+ +		return con_font_op(vc_cons[fg_console].d, op);
+ +	case GIO_FONTX: {
+ +		op->op = KD_FONT_OP_GET;
+ +		op->flags = KD_FONT_FLAG_OLD;
+ +		op->width = 8;
+ +		op->height = cfdarg.charheight;
+ +		op->charcount = cfdarg.charcount;
+ +		op->data = cfdarg.chardata;
+ +		i = con_font_op(vc_cons[fg_console].d, op);
+ +		if (i)
+ +			return i;
+ +		cfdarg.charheight = op->height;
+ +		cfdarg.charcount = op->charcount;
+ +		if (copy_to_user(user_cfd, &cfdarg, sizeof(struct consolefontdesc)))
+ +			return -EFAULT;
+  		return 0;
+ +		}
+ +	}
+ +	return -EINVAL;
+ +}
+  
+ +static inline int 
+ +do_unimap_ioctl(int cmd, struct unimapdesc __user *user_ud, int perm, struct vc_data *vc)
+++=======
++ 	vc->vc_mode = mode;
++ 	if (vc->vc_num != fg_console)
++ 		return 0;
++ 
++ 	/* explicitly blank/unblank the screen if switching modes */
++ 	console_lock();
++ 	if (mode == KD_TEXT)
++ 		do_unblank_screen(1);
++ 	else
++ 		do_blank_screen(1);
++ 	console_unlock();
++ 
++ 	return 0;
++ }
++ 
++ static int vt_k_ioctl(struct tty_struct *tty, unsigned int cmd,
++ 		unsigned long arg, bool perm)
++ {
++ 	struct vc_data *vc = tty->driver_data;
++ 	void __user *up = (void __user *)arg;
++ 	unsigned int console = vc->vc_num;
++ 	int ret;
++ 
++ 	switch (cmd) {
++ 	case KIOCSOUND:
++ 		if (!perm)
++ 			return -EPERM;
++ 		/*
++ 		 * The use of PIT_TICK_RATE is historic, it used to be
++ 		 * the platform-dependent CLOCK_TICK_RATE between 2.6.12
++ 		 * and 2.6.36, which was a minor but unfortunate ABI
++ 		 * change. kd_mksound is locked by the input layer.
++ 		 */
++ 		if (arg)
++ 			arg = PIT_TICK_RATE / arg;
++ 		kd_mksound(arg, 0);
++ 		break;
++ 
++ 	case KDMKTONE:
++ 		if (!perm)
++ 			return -EPERM;
++ 	{
++ 		unsigned int ticks, count;
++ 
++ 		/*
++ 		 * Generate the tone for the appropriate number of ticks.
++ 		 * If the time is zero, turn off sound ourselves.
++ 		 */
++ 		ticks = msecs_to_jiffies((arg >> 16) & 0xffff);
++ 		count = ticks ? (arg & 0xffff) : 0;
++ 		if (count)
++ 			count = PIT_TICK_RATE / count;
++ 		kd_mksound(count, ticks);
++ 		break;
++ 	}
++ 
++ 	case KDGKBTYPE:
++ 		/*
++ 		 * this is naïve.
++ 		 */
++ 		return put_user(KB_101, (char __user *)arg);
++ 
++ 		/*
++ 		 * These cannot be implemented on any machine that implements
++ 		 * ioperm() in user level (such as Alpha PCs) or not at all.
++ 		 *
++ 		 * XXX: you should never use these, just call ioperm directly..
++ 		 */
++ #ifdef CONFIG_X86
++ 	case KDADDIO:
++ 	case KDDELIO:
++ 		/*
++ 		 * KDADDIO and KDDELIO may be able to add ports beyond what
++ 		 * we reject here, but to be safe...
++ 		 *
++ 		 * These are locked internally via sys_ioperm
++ 		 */
++ 		if (arg < GPFIRST || arg > GPLAST)
++ 			return -EINVAL;
++ 
++ 		return ksys_ioperm(arg, 1, (cmd == KDADDIO)) ? -ENXIO : 0;
++ 
++ 	case KDENABIO:
++ 	case KDDISABIO:
++ 		return ksys_ioperm(GPFIRST, GPNUM,
++ 				  (cmd == KDENABIO)) ? -ENXIO : 0;
++ #endif
++ 
++ 	/* Linux m68k/i386 interface for setting the keyboard delay/repeat rate */
++ 
++ 	case KDKBDREP:
++ 	{
++ 		struct kbd_repeat kbrep;
++ 
++ 		if (!capable(CAP_SYS_TTY_CONFIG))
++ 			return -EPERM;
++ 
++ 		if (copy_from_user(&kbrep, up, sizeof(struct kbd_repeat)))
++ 			return -EFAULT;
++ 
++ 		ret = kbd_rate(&kbrep);
++ 		if (ret)
++ 			return ret;
++ 		if (copy_to_user(up, &kbrep, sizeof(struct kbd_repeat)))
++ 			return -EFAULT;
++ 		break;
++ 	}
++ 
++ 	case KDSETMODE:
++ 		if (!perm)
++ 			return -EPERM;
++ 
++ 		return vt_kdsetmode(vc, arg);
++ 
++ 	case KDGETMODE:
++ 		return put_user(vc->vc_mode, (int __user *)arg);
++ 
++ 	case KDMAPDISP:
++ 	case KDUNMAPDISP:
++ 		/*
++ 		 * these work like a combination of mmap and KDENABIO.
++ 		 * this could be easily finished.
++ 		 */
++ 		return -EINVAL;
++ 
++ 	case KDSKBMODE:
++ 		if (!perm)
++ 			return -EPERM;
++ 		ret = vt_do_kdskbmode(console, arg);
++ 		if (ret)
++ 			return ret;
++ 		tty_ldisc_flush(tty);
++ 		break;
++ 
++ 	case KDGKBMODE:
++ 		return put_user(vt_do_kdgkbmode(console), (int __user *)arg);
++ 
++ 	/* this could be folded into KDSKBMODE, but for compatibility
++ 	   reasons it is not so easy to fold KDGKBMETA into KDGKBMODE */
++ 	case KDSKBMETA:
++ 		return vt_do_kdskbmeta(console, arg);
++ 
++ 	case KDGKBMETA:
++ 		/* FIXME: should review whether this is worth locking */
++ 		return put_user(vt_do_kdgkbmeta(console), (int __user *)arg);
++ 
++ 	case KDGETKEYCODE:
++ 	case KDSETKEYCODE:
++ 		if(!capable(CAP_SYS_TTY_CONFIG))
++ 			perm = 0;
++ 		return vt_do_kbkeycode_ioctl(cmd, up, perm);
++ 
++ 	case KDGKBENT:
++ 	case KDSKBENT:
++ 		return vt_do_kdsk_ioctl(cmd, up, perm, console);
++ 
++ 	case KDGKBSENT:
++ 	case KDSKBSENT:
++ 		return vt_do_kdgkb_ioctl(cmd, up, perm);
++ 
++ 	/* Diacritical processing. Handled in keyboard.c as it has
++ 	   to operate on the keyboard locks and structures */
++ 	case KDGKBDIACR:
++ 	case KDGKBDIACRUC:
++ 	case KDSKBDIACR:
++ 	case KDSKBDIACRUC:
++ 		return vt_do_diacrit(cmd, up, perm);
++ 
++ 	/* the ioctls below read/set the flags usually shown in the leds */
++ 	/* don't use them - they will go away without warning */
++ 	case KDGKBLED:
++ 	case KDSKBLED:
++ 	case KDGETLED:
++ 	case KDSETLED:
++ 		return vt_do_kdskled(console, cmd, arg, perm);
++ 
++ 	/*
++ 	 * A process can indicate its willingness to accept signals
++ 	 * generated by pressing an appropriate key combination.
++ 	 * Thus, one can have a daemon that e.g. spawns a new console
++ 	 * upon a keypress and then changes to it.
++ 	 * See also the kbrequest field of inittab(5).
++ 	 */
++ 	case KDSIGACCEPT:
++ 		if (!perm || !capable(CAP_KILL))
++ 			return -EPERM;
++ 		if (!valid_signal(arg) || arg < 1 || arg == SIGKILL)
++ 			return -EINVAL;
++ 
++ 		spin_lock_irq(&vt_spawn_con.lock);
++ 		put_pid(vt_spawn_con.pid);
++ 		vt_spawn_con.pid = get_pid(task_pid(current));
++ 		vt_spawn_con.sig = arg;
++ 		spin_unlock_irq(&vt_spawn_con.lock);
++ 		break;
++ 
++ 	case KDFONTOP: {
++ 		struct console_font_op op;
++ 
++ 		if (copy_from_user(&op, up, sizeof(op)))
++ 			return -EFAULT;
++ 		if (!perm && op.op != KD_FONT_OP_GET)
++ 			return -EPERM;
++ 		ret = con_font_op(vc, &op);
++ 		if (ret)
++ 			return ret;
++ 		if (copy_to_user(up, &op, sizeof(op)))
++ 			return -EFAULT;
++ 		break;
++ 	}
++ 
++ 	default:
++ 		return -ENOIOCTLCMD;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static inline int do_unimap_ioctl(int cmd, struct unimapdesc __user *user_ud,
++ 		bool perm, struct vc_data *vc)
+++>>>>>>> ff2047fb755d (vt: drop old FONT ioctls)
+  {
+  	struct unimapdesc tmp;
+  
+@@@ -303,6 -505,125 +526,128 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vt_io_ioctl(struct vc_data *vc, unsigned int cmd, void __user *up,
++ 		bool perm)
++ {
++ 	switch (cmd) {
++ 	case PIO_CMAP:
++ 		if (!perm)
++ 			return -EPERM;
++ 		return con_set_cmap(up);
++ 
++ 	case GIO_CMAP:
++ 		return con_get_cmap(up);
++ 
++ 	case PIO_SCRNMAP:
++ 		if (!perm)
++ 			return -EPERM;
++ 		return con_set_trans_old(up);
++ 
++ 	case GIO_SCRNMAP:
++ 		return con_get_trans_old(up);
++ 
++ 	case PIO_UNISCRNMAP:
++ 		if (!perm)
++ 			return -EPERM;
++ 		return con_set_trans_new(up);
++ 
++ 	case GIO_UNISCRNMAP:
++ 		return con_get_trans_new(up);
++ 
++ 	case PIO_UNIMAPCLR:
++ 		if (!perm)
++ 			return -EPERM;
++ 		con_clear_unimap(vc);
++ 		break;
++ 
++ 	case PIO_UNIMAP:
++ 	case GIO_UNIMAP:
++ 		return do_unimap_ioctl(cmd, up, perm, vc);
++ 
++ 	default:
++ 		return -ENOIOCTLCMD;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int vt_reldisp(struct vc_data *vc, unsigned int swtch)
++ {
++ 	int newvt, ret;
++ 
++ 	if (vc->vt_mode.mode != VT_PROCESS)
++ 		return -EINVAL;
++ 
++ 	/* Switched-to response */
++ 	if (vc->vt_newvt < 0) {
++ 		 /* If it's just an ACK, ignore it */
++ 		return swtch == VT_ACKACQ ? 0 : -EINVAL;
++ 	}
++ 
++ 	/* Switching-from response */
++ 	if (swtch == 0) {
++ 		/* Switch disallowed, so forget we were trying to do it. */
++ 		vc->vt_newvt = -1;
++ 		return 0;
++ 	}
++ 
++ 	/* The current vt has been released, so complete the switch. */
++ 	newvt = vc->vt_newvt;
++ 	vc->vt_newvt = -1;
++ 	ret = vc_allocate(newvt);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/*
++ 	 * When we actually do the console switch, make sure we are atomic with
++ 	 * respect to other console switches..
++ 	 */
++ 	complete_change_console(vc_cons[newvt].d);
++ 
++ 	return 0;
++ }
++ 
++ static int vt_setactivate(struct vt_setactivate __user *sa)
++ {
++ 	struct vt_setactivate vsa;
++ 	struct vc_data *nvc;
++ 	int ret;
++ 
++ 	if (copy_from_user(&vsa, sa, sizeof(vsa)))
++ 		return -EFAULT;
++ 	if (vsa.console == 0 || vsa.console > MAX_NR_CONSOLES)
++ 		return -ENXIO;
++ 
++ 	vsa.console = array_index_nospec(vsa.console, MAX_NR_CONSOLES + 1);
++ 	vsa.console--;
++ 	console_lock();
++ 	ret = vc_allocate(vsa.console);
++ 	if (ret) {
++ 		console_unlock();
++ 		return ret;
++ 	}
++ 
++ 	/*
++ 	 * This is safe providing we don't drop the console sem between
++ 	 * vc_allocate and finishing referencing nvc.
++ 	 */
++ 	nvc = vc_cons[vsa.console].d;
++ 	nvc->vt_mode = vsa.mode;
++ 	nvc->vt_mode.frsig = 0;
++ 	put_pid(nvc->vt_pid);
++ 	nvc->vt_pid = get_pid(task_pid(current));
++ 	console_unlock();
++ 
++ 	/* Commence switch and lock */
++ 	/* Review set_console locks */
++ 	set_console(vsa.console);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> ff2047fb755d (vt: drop old FONT ioctls)
+  /* deallocate a single console, if possible (leave 0) */
+  static int vt_disallocate(unsigned int vc_num)
+  {
+@@@ -1092,52 -959,6 +1437,55 @@@ void vc_SAK(struct work_struct *work
+  
+  #ifdef CONFIG_COMPAT
+  
+++<<<<<<< HEAD
+ +struct compat_consolefontdesc {
+ +	unsigned short charcount;       /* characters in font (256 or 512) */
+ +	unsigned short charheight;      /* scan lines per character (1-32) */
+ +	compat_caddr_t chardata;	/* font data in expanded form */
+ +};
+ +
+ +static inline int
+ +compat_fontx_ioctl(int cmd, struct compat_consolefontdesc __user *user_cfd,
+ +			 int perm, struct console_font_op *op)
+ +{
+ +	struct compat_consolefontdesc cfdarg;
+ +	int i;
+ +
+ +	if (copy_from_user(&cfdarg, user_cfd, sizeof(struct compat_consolefontdesc)))
+ +		return -EFAULT;
+ +
+ +	switch (cmd) {
+ +	case PIO_FONTX:
+ +		if (!perm)
+ +			return -EPERM;
+ +		op->op = KD_FONT_OP_SET;
+ +		op->flags = KD_FONT_FLAG_OLD;
+ +		op->width = 8;
+ +		op->height = cfdarg.charheight;
+ +		op->charcount = cfdarg.charcount;
+ +		op->data = compat_ptr(cfdarg.chardata);
+ +		return con_font_op(vc_cons[fg_console].d, op);
+ +	case GIO_FONTX:
+ +		op->op = KD_FONT_OP_GET;
+ +		op->flags = KD_FONT_FLAG_OLD;
+ +		op->width = 8;
+ +		op->height = cfdarg.charheight;
+ +		op->charcount = cfdarg.charcount;
+ +		op->data = compat_ptr(cfdarg.chardata);
+ +		i = con_font_op(vc_cons[fg_console].d, op);
+ +		if (i)
+ +			return i;
+ +		cfdarg.charheight = op->height;
+ +		cfdarg.charcount = op->charcount;
+ +		if (copy_to_user(user_cfd, &cfdarg, sizeof(struct compat_consolefontdesc)))
+ +			return -EFAULT;
+ +		return 0;
+ +	}
+ +	return -EINVAL;
+ +}
+ +
+++=======
+++>>>>>>> ff2047fb755d (vt: drop old FONT ioctls)
+  struct compat_console_font_op {
+  	compat_uint_t op;        /* operation code KD_FONT_OP_* */
+  	compat_uint_t flags;     /* KD_FONT_FLAG_* */
+@@@ -1223,14 -1035,9 +1571,17 @@@ long vt_compat_ioctl(struct tty_struct 
+  	/*
+  	 * these need special handlers for incompatible data structures
+  	 */
+++<<<<<<< HEAD
+ +	case PIO_FONTX:
+ +	case GIO_FONTX:
+ +		ret = compat_fontx_ioctl(cmd, up, perm, &op);
+ +		break;
+++=======
+++>>>>>>> ff2047fb755d (vt: drop old FONT ioctls)
+  
+  	case KDFONTOP:
+ -		return compat_kdfontop_ioctl(up, perm, &op, vc);
+ +		ret = compat_kdfontop_ioctl(up, perm, &op, vc);
+ +		break;
+  
+  	case PIO_UNIMAP:
+  	case GIO_UNIMAP:
+diff --git a/drivers/tty/vt/vt.c b/drivers/tty/vt/vt.c
+index e02f07c2ed9b..28a872952d81 100644
+--- a/drivers/tty/vt/vt.c
++++ b/drivers/tty/vt/vt.c
+@@ -4307,16 +4307,8 @@ static int con_font_get(struct vc_data *vc, struct console_font_op *op)
+ 
+ 	if (op->data && font.charcount > op->charcount)
+ 		rc = -ENOSPC;
+-	if (!(op->flags & KD_FONT_FLAG_OLD)) {
+-		if (font.width > op->width || font.height > op->height) 
+-			rc = -ENOSPC;
+-	} else {
+-		if (font.width != 8)
+-			rc = -EIO;
+-		else if ((op->height && font.height > op->height) ||
+-			 font.height > 32)
+-			rc = -ENOSPC;
+-	}
++	if (font.width > op->width || font.height > op->height)
++		rc = -ENOSPC;
+ 	if (rc)
+ 		goto out;
+ 
+@@ -4344,7 +4336,7 @@ static int con_font_set(struct vc_data *vc, struct console_font_op *op)
+ 		return -EINVAL;
+ 	if (op->charcount > 512)
+ 		return -EINVAL;
+-	if (op->width <= 0 || op->width > 32 || op->height > 32)
++	if (op->width <= 0 || op->width > 32 || !op->height || op->height > 32)
+ 		return -EINVAL;
+ 	size = (op->width+7)/8 * 32 * op->charcount;
+ 	if (size > max_font_size)
+@@ -4354,31 +4346,6 @@ static int con_font_set(struct vc_data *vc, struct console_font_op *op)
+ 	if (IS_ERR(font.data))
+ 		return PTR_ERR(font.data);
+ 
+-	if (!op->height) {		/* Need to guess font height [compat] */
+-		int h, i;
+-		u8 *charmap = font.data;
+-
+-		/*
+-		 * If from KDFONTOP ioctl, don't allow things which can be done
+-		 * in userland,so that we can get rid of this soon
+-		 */
+-		if (!(op->flags & KD_FONT_FLAG_OLD)) {
+-			kfree(font.data);
+-			return -EINVAL;
+-		}
+-
+-		for (h = 32; h > 0; h--)
+-			for (i = 0; i < op->charcount; i++)
+-				if (charmap[32*i+h-1])
+-					goto nonzero;
+-
+-		kfree(font.data);
+-		return -EINVAL;
+-
+-	nonzero:
+-		op->height = h;
+-	}
+-
+ 	font.charcount = op->charcount;
+ 	font.width = op->width;
+ 	font.height = op->height;
+* Unmerged path drivers/tty/vt/vt_ioctl.c
+diff --git a/include/linux/kd.h b/include/linux/kd.h
+deleted file mode 100644
+index b130a18f860f..000000000000
+--- a/include/linux/kd.h
++++ /dev/null
+@@ -1,8 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0 */
+-#ifndef _LINUX_KD_H
+-#define _LINUX_KD_H
+-
+-#include <uapi/linux/kd.h>
+-
+-#define KD_FONT_FLAG_OLD		0x80000000	/* Invoked via old interface [compat] */
+-#endif /* _LINUX_KD_H */
