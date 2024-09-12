@@ -1,0 +1,216 @@
+iommu/vt-d: Support Enhanced Command Interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-492.el8
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit dc57875866ab9f6e0c366a6fd342217f71847b8b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-492.el8/dc578758.failed
+
+The Enhanced Command Register is to submit command and operand of
+enhanced commands to DMA Remapping hardware. It can supports up to 256
+enhanced commands.
+
+There is a HW register to indicate the availability of all 256 enhanced
+commands. Each bit stands for each command. But there isn't an existing
+interface to read/write all 256 bits. Introduce the u64 ecmdcap[4] to
+store the existence of each enhanced command. Read 4 times to get all of
+them in map_iommu().
+
+Add a helper to facilitate an enhanced command launch. Make sure hardware
+complete the command. Also add a helper to facilitate the check of PMU
+essentials. These helpers will be used later.
+
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+Link: https://lore.kernel.org/r/20230128200428.1459118-4-kan.liang@linux.intel.com
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit dc57875866ab9f6e0c366a6fd342217f71847b8b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel/iommu.c
+#	include/linux/intel-iommu.h
+diff --cc drivers/iommu/intel/iommu.c
+index 7fcf30fe421f,e314c30d371a..000000000000
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@@ -5888,3 -4977,104 +5888,107 @@@ static void __init check_tylersburg_iso
+  	pr_warn("Recommended TLB entries for ISOCH unit is 16; your BIOS set %d\n",
+  	       vtisochctrl);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Here we deal with a device TLB defect where device may inadvertently issue ATS
++  * invalidation completion before posted writes initiated with translated address
++  * that utilized translations matching the invalidation address range, violating
++  * the invalidation completion ordering.
++  * Therefore, any use cases that cannot guarantee DMA is stopped before unmap is
++  * vulnerable to this defect. In other words, any dTLB invalidation initiated not
++  * under the control of the trusted/privileged host device driver must use this
++  * quirk.
++  * Device TLBs are invalidated under the following six conditions:
++  * 1. Device driver does DMA API unmap IOVA
++  * 2. Device driver unbind a PASID from a process, sva_unbind_device()
++  * 3. PASID is torn down, after PASID cache is flushed. e.g. process
++  *    exit_mmap() due to crash
++  * 4. Under SVA usage, called by mmu_notifier.invalidate_range() where
++  *    VM has to free pages that were unmapped
++  * 5. Userspace driver unmaps a DMA buffer
++  * 6. Cache invalidation in vSVA usage (upcoming)
++  *
++  * For #1 and #2, device drivers are responsible for stopping DMA traffic
++  * before unmap/unbind. For #3, iommu driver gets mmu_notifier to
++  * invalidate TLB the same way as normal user unmap which will use this quirk.
++  * The dTLB invalidation after PASID cache flush does not need this quirk.
++  *
++  * As a reminder, #6 will *NEED* this quirk as we enable nested translation.
++  */
++ void quirk_extra_dev_tlb_flush(struct device_domain_info *info,
++ 			       unsigned long address, unsigned long mask,
++ 			       u32 pasid, u16 qdep)
++ {
++ 	u16 sid;
++ 
++ 	if (likely(!info->dtlb_extra_inval))
++ 		return;
++ 
++ 	sid = PCI_DEVID(info->bus, info->devfn);
++ 	if (pasid == PASID_RID2PASID) {
++ 		qi_flush_dev_iotlb(info->iommu, sid, info->pfsid,
++ 				   qdep, address, mask);
++ 	} else {
++ 		qi_flush_dev_iotlb_pasid(info->iommu, sid, info->pfsid,
++ 					 pasid, qdep, address, mask);
++ 	}
++ }
++ 
++ #define ecmd_get_status_code(res)	(((res) & 0xff) >> 1)
++ 
++ /*
++  * Function to submit a command to the enhanced command interface. The
++  * valid enhanced command descriptions are defined in Table 47 of the
++  * VT-d spec. The VT-d hardware implementation may support some but not
++  * all commands, which can be determined by checking the Enhanced
++  * Command Capability Register.
++  *
++  * Return values:
++  *  - 0: Command successful without any error;
++  *  - Negative: software error value;
++  *  - Nonzero positive: failure status code defined in Table 48.
++  */
++ int ecmd_submit_sync(struct intel_iommu *iommu, u8 ecmd, u64 oa, u64 ob)
++ {
++ 	unsigned long flags;
++ 	u64 res;
++ 	int ret;
++ 
++ 	if (!cap_ecmds(iommu->cap))
++ 		return -ENODEV;
++ 
++ 	raw_spin_lock_irqsave(&iommu->register_lock, flags);
++ 
++ 	res = dmar_readq(iommu->reg + DMAR_ECRSP_REG);
++ 	if (res & DMA_ECMD_ECRSP_IP) {
++ 		ret = -EBUSY;
++ 		goto err;
++ 	}
++ 
++ 	/*
++ 	 * Unconditionally write the operand B, because
++ 	 * - There is no side effect if an ecmd doesn't require an
++ 	 *   operand B, but we set the register to some value.
++ 	 * - It's not invoked in any critical path. The extra MMIO
++ 	 *   write doesn't bring any performance concerns.
++ 	 */
++ 	dmar_writeq(iommu->reg + DMAR_ECEO_REG, ob);
++ 	dmar_writeq(iommu->reg + DMAR_ECMD_REG, ecmd | (oa << DMA_ECMD_OA_SHIFT));
++ 
++ 	IOMMU_WAIT_OP(iommu, DMAR_ECRSP_REG, dmar_readq,
++ 		      !(res & DMA_ECMD_ECRSP_IP), res);
++ 
++ 	if (res & DMA_ECMD_ECRSP_IP) {
++ 		ret = -ETIMEDOUT;
++ 		goto err;
++ 	}
++ 
++ 	ret = ecmd_get_status_code(res);
++ err:
++ 	raw_spin_unlock_irqrestore(&iommu->register_lock, flags);
++ 
++ 	return ret;
++ }
+++>>>>>>> dc57875866ab (iommu/vt-d: Support Enhanced Command Interface)
+diff --cc include/linux/intel-iommu.h
+index b9494fd422a2,f918e83bf91c..000000000000
+--- a/include/linux/intel-iommu.h
++++ b/include/linux/intel-iommu.h
+@@@ -136,6 -125,15 +136,18 @@@
+  #define DMAR_MTRR_PHYSMASK8_REG 0x208
+  #define DMAR_MTRR_PHYSBASE9_REG 0x210
+  #define DMAR_MTRR_PHYSMASK9_REG 0x218
+++<<<<<<< HEAD:include/linux/intel-iommu.h
+++=======
++ #define DMAR_PERFCAP_REG	0x300
++ #define DMAR_PERFCFGOFF_REG	0x310
++ #define DMAR_PERFOVFOFF_REG	0x318
++ #define DMAR_PERFCNTROFF_REG	0x31c
++ #define DMAR_PERFEVNTCAP_REG	0x380
++ #define DMAR_ECMD_REG		0x400
++ #define DMAR_ECEO_REG		0x408
++ #define DMAR_ECRSP_REG		0x410
++ #define DMAR_ECCAP_REG		0x430
+++>>>>>>> dc57875866ab (iommu/vt-d: Support Enhanced Command Interface):drivers/iommu/intel/iommu.h
+  #define DMAR_VCCAP_REG		0xe30 /* Virtual command capability register */
+  #define DMAR_VCMD_REG		0xe00 /* Virtual command register */
+  #define DMAR_VCRSP_REG		0xe10 /* Virtual command response register */
+@@@ -824,12 -859,22 +857,20 @@@ extern const struct attribute_group *in
+  struct context_entry *iommu_context_addr(struct intel_iommu *iommu, u8 bus,
+  					 u8 devfn, int alloc);
+  
+ -extern const struct iommu_ops intel_iommu_ops;
+ -
+  #ifdef CONFIG_INTEL_IOMMU
+ -extern int intel_iommu_sm;
+  extern int iommu_calculate_agaw(struct intel_iommu *iommu);
+  extern int iommu_calculate_max_sagaw(struct intel_iommu *iommu);
++ int ecmd_submit_sync(struct intel_iommu *iommu, u8 ecmd, u64 oa, u64 ob);
++ 
++ static inline bool ecmd_has_pmu_essential(struct intel_iommu *iommu)
++ {
++ 	return (iommu->ecmdcap[DMA_ECMD_ECCAP3] & DMA_ECMD_ECCAP3_ESSENTIAL) ==
++ 		DMA_ECMD_ECCAP3_ESSENTIAL;
++ }
++ 
+  extern int dmar_disabled;
+  extern int intel_iommu_enabled;
+ +extern int intel_iommu_gfx_mapped;
+  #else
+  static inline int iommu_calculate_agaw(struct intel_iommu *iommu)
+  {
+diff --git a/drivers/iommu/intel/dmar.c b/drivers/iommu/intel/dmar.c
+index 62429652d772..8546cfb29f86 100644
+--- a/drivers/iommu/intel/dmar.c
++++ b/drivers/iommu/intel/dmar.c
+@@ -1030,6 +1030,16 @@ static int map_iommu(struct intel_iommu *iommu, struct dmar_drhd_unit *drhd)
+ 			goto release;
+ 		}
+ 	}
++
++	if (cap_ecmds(iommu->cap)) {
++		int i;
++
++		for (i = 0; i < DMA_MAX_NUM_ECMDCAP; i++) {
++			iommu->ecmdcap[i] = dmar_readq(iommu->reg + DMAR_ECCAP_REG +
++						       i * DMA_ECMD_REG_STEP);
++		}
++	}
++
+ 	err = 0;
+ 	goto out;
+ 
+* Unmerged path drivers/iommu/intel/iommu.c
+* Unmerged path include/linux/intel-iommu.h
