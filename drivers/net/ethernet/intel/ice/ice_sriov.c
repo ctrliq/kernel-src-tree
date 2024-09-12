@@ -1022,8 +1022,6 @@ int ice_sriov_configure(struct pci_dev *pdev, int num_vfs)
 		return -EBUSY;
 	}
 
-	ice_mbx_init_snapshot(&pf->hw);
-
 	err = ice_pci_sriov_ena(pf, num_vfs);
 	if (err) {
 		ice_mbx_deinit_snapshot(&pf->hw);

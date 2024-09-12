@@ -3885,6 +3885,7 @@ static int ice_init_pf(struct ice_pf *pf)
 
 	mutex_init(&pf->vfs.table_lock);
 	hash_init(pf->vfs.table);
+	ice_mbx_init_snapshot(&pf->hw);
 
 	return 0;
 }
