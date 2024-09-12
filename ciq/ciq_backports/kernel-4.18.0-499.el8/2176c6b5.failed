@@ -1,0 +1,151 @@
+ALSA: hda/cs_dsp_ctl: Fix mutex inversion when creating controls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-499.el8
+commit-author Richard Fitzgerald <rf@opensource.cirrus.com>
+commit 2176c6b599dba55a640cffec0182c0b6bab680d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-499.el8/2176c6b5.failed
+
+Redesign the creation of ALSA controls so that the cs_dsp
+pwr_lock is not held when calling snd_ctl_add(). Instead of
+creating the ALSA control from the cs_dsp control_add callback,
+do it after cs_dsp_power_up() has completed. The existing
+functions are changed to return void instead of passing errors
+back - this duplicates the original behaviour, as cs_dsp does
+not abort firmware load if creation of a control fails.
+
+It is safe to walk the control list without taking any mutex
+provided that the caller is not trying to load a new firmware
+or remove the driver in parallel. There is no other situation
+that the list can change. So the caller can trigger creation
+of ALSA controls after cs_dsp_power_up() has returned. A cs_dsp
+control will have a non-NULL priv pointer if we have created
+an ALSA control.
+
+With the previous code the ALSA controls were created from
+the cs_dsp control_add callback. But this is called with
+pwr_lock held (as it is part of the DSP power-up sequence).
+The kernel lock checking will show a mutex inversion between
+this and the control creation path:
+
+control_add
+  pwr_lock held, takes controls_rwsem (in snd_ctl_add)
+
+get/put
+  controls_rwsem held, takes pwr_lock to call cs_dsp.
+
+This is not completely theoretical. Although the time window
+is very small, it is possible for these to run in parallel
+and deadlock the old implementation.
+
+	Signed-off-by: Richard Fitzgerald <rf@opensource.cirrus.com>
+	Signed-off-by: Stefan Binding <sbinding@opensource.cirrus.com>
+Link: https://lore.kernel.org/r/20221011143552.621792-4-sbinding@opensource.cirrus.com
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 2176c6b599dba55a640cffec0182c0b6bab680d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/hda_cs_dsp_ctl.c
+diff --cc sound/pci/hda/hda_cs_dsp_ctl.c
+index 4fa0c249f73f,1622a22f96f6..000000000000
+--- a/sound/pci/hda/hda_cs_dsp_ctl.c
++++ b/sound/pci/hda/hda_cs_dsp_ctl.c
+@@@ -177,16 -171,33 +171,37 @@@ static void hda_cs_dsp_control_add(stru
+  	ctl->card = info->card;
+  	cs_ctl->priv = ctl;
+  
+- 	ret = hda_cs_dsp_add_kcontrol(ctl, name);
+- 	if (ret) {
+- 		dev_err(cs_dsp->dev, "Error (%d) adding control %s\n", ret, name);
+- 		kfree(ctl);
+- 		return ret;
+- 	}
+- 
+- 	return 0;
++ 	hda_cs_dsp_add_kcontrol(ctl, name);
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(hda_cs_dsp_control_add);
+++=======
++ 
++ void hda_cs_dsp_add_controls(struct cs_dsp *dsp, const struct hda_cs_dsp_ctl_info *info)
++ {
++ 	struct cs_dsp_coeff_ctl *cs_ctl;
++ 
++ 	/*
++ 	 * pwr_lock would cause mutex inversion with ALSA control lock compared
++ 	 * to the get/put functions.
++ 	 * It is safe to walk the list without holding a mutex because entries
++ 	 * are persistent and only cs_dsp_power_up() or cs_dsp_remove() can
++ 	 * change the list.
++ 	 */
++ 	lockdep_assert_not_held(&dsp->pwr_lock);
++ 
++ 	list_for_each_entry(cs_ctl, &dsp->ctl_list, list) {
++ 		if (cs_ctl->flags & WMFW_CTL_FLAG_SYS)
++ 			continue;
++ 
++ 		if (cs_ctl->priv)
++ 			continue;
++ 
++ 		hda_cs_dsp_control_add(cs_ctl, info);
++ 	}
++ }
++ EXPORT_SYMBOL_NS_GPL(hda_cs_dsp_add_controls, SND_HDA_CS_DSP_CONTROLS);
+++>>>>>>> 2176c6b599db (ALSA: hda/cs_dsp_ctl: Fix mutex inversion when creating controls)
+  
+  void hda_cs_dsp_control_remove(struct cs_dsp_coeff_ctl *cs_ctl)
+  {
+diff --git a/sound/pci/hda/cs35l41_hda.c b/sound/pci/hda/cs35l41_hda.c
+index 33bb1ea4da7b..757fa5e87717 100644
+--- a/sound/pci/hda/cs35l41_hda.c
++++ b/sound/pci/hda/cs35l41_hda.c
+@@ -92,20 +92,18 @@ static const struct reg_sequence cs35l41_hda_mute[] = {
+ 	{ CS35L41_AMP_DIG_VOL_CTRL,	0x0000A678 }, // AMP_VOL_PCM Mute
+ };
+ 
+-static int cs35l41_control_add(struct cs_dsp_coeff_ctl *cs_ctl)
++static void cs35l41_add_controls(struct cs35l41_hda *cs35l41)
+ {
+-	struct cs35l41_hda *cs35l41 = container_of(cs_ctl->dsp, struct cs35l41_hda, cs_dsp);
+ 	struct hda_cs_dsp_ctl_info info;
+ 
+ 	info.device_name = cs35l41->amp_name;
+ 	info.fw_type = cs35l41->firmware_type;
+ 	info.card = cs35l41->codec->card;
+ 
+-	return hda_cs_dsp_control_add(cs_ctl, &info);
++	hda_cs_dsp_add_controls(&cs35l41->cs_dsp, &info);
+ }
+ 
+ static const struct cs_dsp_client_ops client_ops = {
+-	.control_add = cs35l41_control_add,
+ 	.control_remove = hda_cs_dsp_control_remove,
+ };
+ 
+@@ -436,6 +434,8 @@ static int cs35l41_init_dsp(struct cs35l41_hda *cs35l41)
+ 	if (ret)
+ 		goto err_release;
+ 
++	cs35l41_add_controls(cs35l41);
++
+ 	ret = cs35l41_save_calibration(cs35l41);
+ 
+ err_release:
+* Unmerged path sound/pci/hda/hda_cs_dsp_ctl.c
+diff --git a/sound/pci/hda/hda_cs_dsp_ctl.h b/sound/pci/hda/hda_cs_dsp_ctl.h
+index 4babc69cf2f0..2cf93359c4f2 100644
+--- a/sound/pci/hda/hda_cs_dsp_ctl.h
++++ b/sound/pci/hda/hda_cs_dsp_ctl.h
+@@ -29,7 +29,7 @@ struct hda_cs_dsp_ctl_info {
+ 
+ extern const char * const hda_cs_dsp_fw_ids[HDA_CS_DSP_NUM_FW];
+ 
+-int hda_cs_dsp_control_add(struct cs_dsp_coeff_ctl *cs_ctl, struct hda_cs_dsp_ctl_info *info);
++void hda_cs_dsp_add_controls(struct cs_dsp *dsp, const struct hda_cs_dsp_ctl_info *info);
+ void hda_cs_dsp_control_remove(struct cs_dsp_coeff_ctl *cs_ctl);
+ int hda_cs_dsp_write_ctl(struct cs_dsp *dsp, const char *name, int type,
+ 			 unsigned int alg, const void *buf, size_t len);
