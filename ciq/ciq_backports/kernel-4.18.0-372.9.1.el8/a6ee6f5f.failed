@@ -1,0 +1,123 @@
+net/mlx5e: Fix select queue to consider SKBTX_HW_TSTAMP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Aya Levin <ayal@nvidia.com>
+commit a6ee6f5f1082c416f9bfffbae1a87feff8a6ab3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/a6ee6f5f.failed
+
+Steering packets to PTP-SQ should be done only if the SKB has
+SKBTX_HW_TSTAMP set in the tx_flags. While here, take the function into
+a header and inline it.
+Set the whole condition to select the PTP-SQ to unlikely.
+
+Fixes: 24c22dd0918b ("net/mlx5e: Add states to PTP channel")
+	Signed-off-by: Aya Levin <ayal@nvidia.com>
+	Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+	Reviewed-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit a6ee6f5f1082c416f9bfffbae1a87feff8a6ab3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+index 28aa5ae118f4,c96668bd701c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+@@@ -5,8 -5,8 +5,9 @@@
+  #define __MLX5_EN_PTP_H__
+  
+  #include "en.h"
+ +#include "en/params.h"
+  #include "en_stats.h"
++ #include <linux/ptp_classify.h>
+  
+  struct mlx5e_ptpsq {
+  	struct mlx5e_txqsq       txqsq;
+@@@ -35,20 -41,39 +36,53 @@@ struct mlx5e_port_ptp 
+  	struct mlx5e_priv         *priv;
+  	struct mlx5_core_dev      *mdev;
+  	struct hwtstamp_config    *tstamp;
+ -	DECLARE_BITMAP(state, MLX5E_PTP_STATE_NUM_STATES);
+ +	DECLARE_BITMAP(state, MLX5E_CHANNEL_NUM_STATES);
+ +	int                        ix;
+ +};
+ +
+++<<<<<<< HEAD
+ +struct mlx5e_ptp_params {
+ +	struct mlx5e_params        params;
+ +	struct mlx5e_sq_param      txq_sq_param;
+  };
+  
+ +int mlx5e_port_ptp_open(struct mlx5e_priv *priv, struct mlx5e_params *params,
+ +			u8 lag_port, struct mlx5e_port_ptp **cp);
+ +void mlx5e_port_ptp_close(struct mlx5e_port_ptp *c);
+ +void mlx5e_ptp_activate_channel(struct mlx5e_port_ptp *c);
+ +void mlx5e_ptp_deactivate_channel(struct mlx5e_port_ptp *c);
+++=======
++ static inline bool mlx5e_use_ptpsq(struct sk_buff *skb)
++ {
++ 	struct flow_keys fk;
++ 
++ 	if (!(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP))
++ 		return false;
++ 
++ 	if (!skb_flow_dissect_flow_keys(skb, &fk, 0))
++ 		return false;
++ 
++ 	if (fk.basic.n_proto == htons(ETH_P_1588))
++ 		return true;
++ 
++ 	if (fk.basic.n_proto != htons(ETH_P_IP) &&
++ 	    fk.basic.n_proto != htons(ETH_P_IPV6))
++ 		return false;
++ 
++ 	return (fk.basic.ip_proto == IPPROTO_UDP &&
++ 		fk.ports.dst == htons(PTP_EV_PORT));
++ }
++ 
++ int mlx5e_ptp_open(struct mlx5e_priv *priv, struct mlx5e_params *params,
++ 		   u8 lag_port, struct mlx5e_ptp **cp);
++ void mlx5e_ptp_close(struct mlx5e_ptp *c);
++ void mlx5e_ptp_activate_channel(struct mlx5e_ptp *c);
++ void mlx5e_ptp_deactivate_channel(struct mlx5e_ptp *c);
++ int mlx5e_ptp_get_rqn(struct mlx5e_ptp *c, u32 *rqn);
++ int mlx5e_ptp_alloc_rx_fs(struct mlx5e_priv *priv);
++ void mlx5e_ptp_free_rx_fs(struct mlx5e_priv *priv);
++ int mlx5e_ptp_rx_manage_fs(struct mlx5e_priv *priv, bool set);
+++>>>>>>> a6ee6f5f1082 (net/mlx5e: Fix select queue to consider SKBTX_HW_TSTAMP)
+  
+  enum {
+  	MLX5E_SKB_CB_CQE_HWTSTAMP  = BIT(0),
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 98c6c818aa51,320fe0cda917..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@@ -143,12 -125,13 +124,20 @@@ u16 mlx5e_select_queue(struct net_devic
+  				return txq_ix;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (unlikely(priv->channels.port_ptp))
+ +			if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) &&
+ +			    mlx5e_use_ptpsq(skb))
+ +				return mlx5e_select_ptpsq(dev, skb);
+++=======
++ 		ptp_channel = READ_ONCE(priv->channels.ptp);
++ 		if (unlikely(ptp_channel &&
++ 			     test_bit(MLX5E_PTP_STATE_TX, ptp_channel->state) &&
++ 			     mlx5e_use_ptpsq(skb)))
++ 			return mlx5e_select_ptpsq(dev, skb);
+++>>>>>>> a6ee6f5f1082 (net/mlx5e: Fix select queue to consider SKBTX_HW_TSTAMP)
+  
+ -		txq_ix = netdev_pick_tx(dev, skb, NULL);
+ +		txq_ix = fallback(dev, skb, NULL);
+  		/* Fix netdev_pick_tx() not to choose ptp_channel and HTB txqs.
+  		 * If they are selected, switch to regular queues.
+  		 * Driver to select these queues only at mlx5e_select_ptpsq()
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
