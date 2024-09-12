@@ -1,0 +1,92 @@
+xfs: fix NULL pointer dereference in xfs_getbmap()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-492.el8
+commit-author ChenXiaoSong <chenxiaosong2@huawei.com>
+commit 001c179c4e26d04db8c9f5e3fef9558b58356be6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-492.el8/001c179c.failed
+
+Reproducer:
+ 1. fallocate -l 100M image
+ 2. mkfs.xfs -f image
+ 3. mount image /mnt
+ 4. setxattr("/mnt", "trusted.overlay.upper", NULL, 0, XATTR_CREATE)
+ 5. char arg[32] = "\x01\xff\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00"
+                   "\x00\x00\x00\x00\x00\x08\x00\x00\x00\xc6\x2a\xf7";
+    fd = open("/mnt", O_RDONLY|O_DIRECTORY);
+    ioctl(fd, _IOC(_IOC_READ|_IOC_WRITE, 0x58, 0x2c, 0x20), arg);
+
+NULL pointer dereference will occur when race happens between xfs_getbmap()
+and xfs_bmap_set_attrforkoff():
+
+         ioctl               |       setxattr
+ ----------------------------|---------------------------
+ xfs_getbmap                 |
+   xfs_ifork_ptr             |
+     xfs_inode_has_attr_fork |
+       ip->i_forkoff == 0    |
+     return NULL             |
+   ifp == NULL               |
+                             | xfs_bmap_set_attrforkoff
+                             |   ip->i_forkoff > 0
+   xfs_inode_has_attr_fork   |
+     ip->i_forkoff > 0       |
+   ifp == NULL               |
+   ifp->if_format            |
+
+Fix this by locking i_lock before xfs_ifork_ptr().
+
+Fixes: abbf9e8a4507 ("xfs: rewrite getbmap using the xfs_iext_* helpers")
+	Signed-off-by: ChenXiaoSong <chenxiaosong2@huawei.com>
+	Signed-off-by: Guo Xuenan <guoxuenan@huawei.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+[djwong: added fixes tag]
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 001c179c4e26d04db8c9f5e3fef9558b58356be6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_bmap_util.c
+diff --cc fs/xfs/xfs_bmap_util.c
+index 1636c08bf4aa,04d0c2bff67c..000000000000
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@@ -439,21 -439,23 +439,32 @@@ xfs_getbmap
+  		whichfork = XFS_COW_FORK;
+  	else
+  		whichfork = XFS_DATA_FORK;
+++<<<<<<< HEAD
+ +	ifp = XFS_IFORK_PTR(ip, whichfork);
+++=======
+++>>>>>>> 001c179c4e26 (xfs: fix NULL pointer dereference in xfs_getbmap())
+  
+  	xfs_ilock(ip, XFS_IOLOCK_SHARED);
+  	switch (whichfork) {
+  	case XFS_ATTR_FORK:
+++<<<<<<< HEAD
+ +		if (!XFS_IFORK_Q(ip))
+ +			goto out_unlock_iolock;
+++=======
++ 		lock = xfs_ilock_attr_map_shared(ip);
++ 		if (!xfs_inode_has_attr_fork(ip))
++ 			goto out_unlock_ilock;
+++>>>>>>> 001c179c4e26 (xfs: fix NULL pointer dereference in xfs_getbmap())
+  
+  		max_len = 1LL << 32;
+- 		lock = xfs_ilock_attr_map_shared(ip);
+  		break;
+  	case XFS_COW_FORK:
++ 		lock = XFS_ILOCK_SHARED;
++ 		xfs_ilock(ip, lock);
++ 
+  		/* No CoW fork? Just return */
+- 		if (!ifp)
+- 			goto out_unlock_iolock;
++ 		if (!xfs_ifork_ptr(ip, whichfork))
++ 			goto out_unlock_ilock;
+  
+  		if (xfs_get_cowextsz_hint(ip))
+  			max_len = mp->m_super->s_maxbytes;
+* Unmerged path fs/xfs/xfs_bmap_util.c
