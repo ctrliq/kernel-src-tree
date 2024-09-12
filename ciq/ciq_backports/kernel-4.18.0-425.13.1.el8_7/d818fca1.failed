@@ -1,0 +1,238 @@
+mm/vmscan: throttle reclaim and compaction when too may pages are isolated
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.13.1.el8_7
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit d818fca1cac31b1fc9301bda83e195a46fb4ebaa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.13.1.el8_7/d818fca1.failed
+
+Page reclaim throttles on congestion if too many parallel reclaim
+instances have isolated too many pages.  This makes no sense, excessive
+parallelisation has nothing to do with writeback or congestion.
+
+This patch creates an additional workqueue to sleep on when too many
+pages are isolated.  The throttled tasks are woken when the number of
+isolated pages is reduced or a timeout occurs.  There may be some false
+positive wakeups for GFP_NOIO/GFP_NOFS callers but the tasks will
+throttle again if necessary.
+
+[shy828301@gmail.com: Wake up from compaction context]
+[vbabka@suse.cz: Account number of throttled tasks only for writeback]
+
+Link: https://lkml.kernel.org/r/20211022144651.19914-3-mgorman@techsingularity.net
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+	Cc: "Darrick J . Wong" <djwong@kernel.org>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: NeilBrown <neilb@suse.de>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: "Theodore Ts'o" <tytso@mit.edu>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d818fca1cac31b1fc9301bda83e195a46fb4ebaa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmzone.h
+#	include/trace/events/vmscan.h
+#	mm/internal.h
+#	mm/vmscan.c
+diff --cc include/linux/mmzone.h
+index e1c35e06ef35,312c1ea9aafa..000000000000
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@@ -280,6 -273,12 +280,15 @@@ enum lru_list 
+  	NR_LRU_LISTS
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum vmscan_throttle_state {
++ 	VMSCAN_THROTTLE_WRITEBACK,
++ 	VMSCAN_THROTTLE_ISOLATED,
++ 	NR_VMSCAN_THROTTLE,
++ };
++ 
+++>>>>>>> d818fca1cac3 (mm/vmscan: throttle reclaim and compaction when too may pages are isolated)
+  #define for_each_lru(lru) for (lru = 0; lru < NR_LRU_LISTS; lru++)
+  
+  #define for_each_evictable_lru(lru) for (lru = 0; lru <= LRU_ACTIVE_FILE; lru++)
+diff --cc include/trace/events/vmscan.h
+index f9612ac9e0e4,d4905bd9e9c4..000000000000
+--- a/include/trace/events/vmscan.h
++++ b/include/trace/events/vmscan.h
+@@@ -27,6 -27,16 +27,19 @@@
+  		{RECLAIM_WB_ASYNC,	"RECLAIM_WB_ASYNC"}	\
+  		) : "RECLAIM_WB_NONE"
+  
+++<<<<<<< HEAD
+++=======
++ #define _VMSCAN_THROTTLE_WRITEBACK	(1 << VMSCAN_THROTTLE_WRITEBACK)
++ #define _VMSCAN_THROTTLE_ISOLATED	(1 << VMSCAN_THROTTLE_ISOLATED)
++ 
++ #define show_throttle_flags(flags)						\
++ 	(flags) ? __print_flags(flags, "|",					\
++ 		{_VMSCAN_THROTTLE_WRITEBACK,	"VMSCAN_THROTTLE_WRITEBACK"},	\
++ 		{_VMSCAN_THROTTLE_ISOLATED,	"VMSCAN_THROTTLE_ISOLATED"}	\
++ 		) : "VMSCAN_THROTTLE_NONE"
++ 
++ 
+++>>>>>>> d818fca1cac3 (mm/vmscan: throttle reclaim and compaction when too may pages are isolated)
+  #define trace_reclaim_flags(file) ( \
+  	(file ? RECLAIM_WB_FILE : RECLAIM_WB_ANON) | \
+  	(RECLAIM_WB_ASYNC) \
+diff --cc mm/internal.h
+index 544ab31e6706,7dfe74f827bf..000000000000
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@@ -38,6 -34,26 +38,29 @@@
+  
+  void page_writeback_init(void);
+  
+++<<<<<<< HEAD
+++=======
++ void __acct_reclaim_writeback(pg_data_t *pgdat, struct page *page,
++ 						int nr_throttled);
++ static inline void acct_reclaim_writeback(struct page *page)
++ {
++ 	pg_data_t *pgdat = page_pgdat(page);
++ 	int nr_throttled = atomic_read(&pgdat->nr_writeback_throttled);
++ 
++ 	if (nr_throttled)
++ 		__acct_reclaim_writeback(pgdat, page, nr_throttled);
++ }
++ 
++ static inline void wake_throttle_isolated(pg_data_t *pgdat)
++ {
++ 	wait_queue_head_t *wqh;
++ 
++ 	wqh = &pgdat->reclaim_wait[VMSCAN_THROTTLE_ISOLATED];
++ 	if (waitqueue_active(wqh))
++ 		wake_up(wqh);
++ }
++ 
+++>>>>>>> d818fca1cac3 (mm/vmscan: throttle reclaim and compaction when too may pages are isolated)
+  vm_fault_t do_swap_page(struct vm_fault *vmf);
+  
+  void free_pgtables(struct mmu_gather *tlb, struct vm_area_struct *start_vma,
+diff --cc mm/vmscan.c
+index e3ffc3c3d8d7,7bfd62f81e16..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -991,6 -1006,67 +991,70 @@@ static void handle_write_error(struct a
+  	unlock_page(page);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void reclaim_throttle(pg_data_t *pgdat, enum vmscan_throttle_state reason,
++ 							long timeout)
++ {
++ 	wait_queue_head_t *wqh = &pgdat->reclaim_wait[reason];
++ 	long ret;
++ 	bool acct_writeback = (reason == VMSCAN_THROTTLE_WRITEBACK);
++ 	DEFINE_WAIT(wait);
++ 
++ 	/*
++ 	 * Do not throttle IO workers, kthreads other than kswapd or
++ 	 * workqueues. They may be required for reclaim to make
++ 	 * forward progress (e.g. journalling workqueues or kthreads).
++ 	 */
++ 	if (!current_is_kswapd() &&
++ 	    current->flags & (PF_IO_WORKER|PF_KTHREAD))
++ 		return;
++ 
++ 	if (acct_writeback &&
++ 	    atomic_inc_return(&pgdat->nr_writeback_throttled) == 1) {
++ 		WRITE_ONCE(pgdat->nr_reclaim_start,
++ 			node_page_state(pgdat, NR_THROTTLED_WRITTEN));
++ 	}
++ 
++ 	prepare_to_wait(wqh, &wait, TASK_UNINTERRUPTIBLE);
++ 	ret = schedule_timeout(timeout);
++ 	finish_wait(wqh, &wait);
++ 
++ 	if (acct_writeback)
++ 		atomic_dec(&pgdat->nr_writeback_throttled);
++ 
++ 	trace_mm_vmscan_throttled(pgdat->node_id, jiffies_to_usecs(timeout),
++ 				jiffies_to_usecs(timeout - ret),
++ 				reason);
++ }
++ 
++ /*
++  * Account for pages written if tasks are throttled waiting on dirty
++  * pages to clean. If enough pages have been cleaned since throttling
++  * started then wakeup the throttled tasks.
++  */
++ void __acct_reclaim_writeback(pg_data_t *pgdat, struct page *page,
++ 							int nr_throttled)
++ {
++ 	unsigned long nr_written;
++ 
++ 	inc_node_page_state(page, NR_THROTTLED_WRITTEN);
++ 
++ 	/*
++ 	 * This is an inaccurate read as the per-cpu deltas may not
++ 	 * be synchronised. However, given that the system is
++ 	 * writeback throttled, it is not worth taking the penalty
++ 	 * of getting an accurate count. At worst, the throttle
++ 	 * timeout guarantees forward progress.
++ 	 */
++ 	nr_written = node_page_state(pgdat, NR_THROTTLED_WRITTEN) -
++ 		READ_ONCE(pgdat->nr_reclaim_start);
++ 
++ 	if (nr_written > SWAP_CLUSTER_MAX * nr_throttled)
++ 		wake_up(&pgdat->reclaim_wait[VMSCAN_THROTTLE_WRITEBACK]);
++ }
++ 
+++>>>>>>> d818fca1cac3 (mm/vmscan: throttle reclaim and compaction when too may pages are isolated)
+  /* possible outcome of pageout() */
+  typedef enum {
+  	/* failed to write page out, page is locked */
+* Unmerged path include/linux/mmzone.h
+* Unmerged path include/trace/events/vmscan.h
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 2c3b74d50487..ac5c490dab29 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -767,6 +767,8 @@ isolate_freepages_range(struct compact_control *cc,
+ /* Similar to reclaim, but different enough that they don't share logic */
+ static bool too_many_isolated(pg_data_t *pgdat)
+ {
++	bool too_many;
++
+ 	unsigned long active, inactive, isolated;
+ 
+ 	inactive = node_page_state(pgdat, NR_INACTIVE_FILE) +
+@@ -776,7 +778,11 @@ static bool too_many_isolated(pg_data_t *pgdat)
+ 	isolated = node_page_state(pgdat, NR_ISOLATED_FILE) +
+ 			node_page_state(pgdat, NR_ISOLATED_ANON);
+ 
+-	return isolated > (inactive + active) / 2;
++	too_many = isolated > (inactive + active) / 2;
++	if (!too_many)
++		wake_throttle_isolated(pgdat);
++
++	return too_many;
+ }
+ 
+ /**
+@@ -826,7 +832,7 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
+ 		if (cc->mode == MIGRATE_ASYNC)
+ 			return 0;
+ 
+-		congestion_wait(BLK_RW_ASYNC, HZ/10);
++		reclaim_throttle(pgdat, VMSCAN_THROTTLE_ISOLATED, HZ/10);
+ 
+ 		if (fatal_signal_pending(current))
+ 			return 0;
+* Unmerged path mm/internal.h
+* Unmerged path mm/vmscan.c
