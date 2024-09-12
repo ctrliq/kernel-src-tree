@@ -7,6 +7,7 @@
  */
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
+#include <trace/events/ipi.h>
 #undef CREATE_TRACE_POINTS
 
 #include "sched.h"
@@ -25,6 +26,9 @@
 
 #include "pelt.h"
 #include "smp.h"
+
+EXPORT_TRACEPOINT_SYMBOL_GPL(ipi_send_cpu);
+EXPORT_TRACEPOINT_SYMBOL_GPL(ipi_send_cpumask);
 
 /*
  * Export tracepoints that act as a bare tracehook (ie: have no trace event
@@ -2441,14 +2445,20 @@ void sched_ttwu_pending(void *arg)
 	rq_unlock_irqrestore(rq, &rf);
 }
 
-void send_call_function_single_ipi(int cpu)
+/*
+ * Prepare the scene for sending an IPI for a remote smp_call
+ *
+ * Returns true if the caller can proceed with sending the IPI.
+ * Returns false otherwise.
+ */
+bool call_function_single_prep_ipi(int cpu)
 {
-	struct rq *rq = cpu_rq(cpu);
-
-	if (!set_nr_if_polling(rq->idle))
-		arch_send_call_function_single_ipi(cpu);
-	else
+	if (set_nr_if_polling(cpu_rq(cpu)->idle)) {
 		trace_sched_wake_idle_without_ipi(cpu);
+		return false;
+	}
+
+	return true;
 }
 
 /*
