@@ -1,0 +1,568 @@
+arm64: entry: convert IRQ+FIQ handlers to C
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit 064dbfb4169141943ec7d9dbfd02974dd008f2ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/064dbfb4.failed
+
+For various reasons we'd like to convert the bulk of arm64's exception
+triage logic to C. As a step towards that, this patch converts the EL1
+and EL0 IRQ+FIQ triage logic to C.
+
+Separate C functions are added for the native and compat cases so that
+in subsequent patches we can handle native/compat differences in C.
+
+Since the triage functions can now call arm64_apply_bp_hardening()
+directly, the do_el0_irq_bp_hardening() wrapper function is removed.
+
+Since the user_exit_irqoff macro is now unused, it is removed. The
+user_enter_irqoff macro is still used by the ret_to_user code, and
+cannot be removed at this time.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+	Acked-by: Marc Zyngier <maz@kernel.org>
+	Reviewed-by: Joey Gouly <joey.gouly@arm.com>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20210607094624.34689-8-mark.rutland@arm.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 064dbfb4169141943ec7d9dbfd02974dd008f2ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/exception.h
+#	arch/arm64/kernel/entry-common.c
+#	arch/arm64/kernel/entry.S
+diff --cc arch/arm64/include/asm/exception.h
+index acd3d9be4846,4284ee57a9a5..000000000000
+--- a/arch/arm64/include/asm/exception.h
++++ b/arch/arm64/include/asm/exception.h
+@@@ -43,11 -32,18 +43,23 @@@ static inline u32 disr_to_esr(u64 disr
+  }
+  
+  asmlinkage void el1_sync_handler(struct pt_regs *regs);
+++<<<<<<< HEAD
+ +asmlinkage void el0_sync_handler(struct pt_regs *regs);
+ +asmlinkage void el0_sync_compat_handler(struct pt_regs *regs);
+++=======
++ asmlinkage void el1_irq_handler(struct pt_regs *regs);
++ asmlinkage void el1_fiq_handler(struct pt_regs *regs);
++ asmlinkage void el1_error_handler(struct pt_regs *regs);
++ asmlinkage void el0_sync_handler(struct pt_regs *regs);
++ asmlinkage void el0_irq_handler(struct pt_regs *regs);
++ asmlinkage void el0_fiq_handler(struct pt_regs *regs);
++ asmlinkage void el0_error_handler(struct pt_regs *regs);
++ asmlinkage void el0_sync_compat_handler(struct pt_regs *regs);
++ asmlinkage void el0_irq_compat_handler(struct pt_regs *regs);
++ asmlinkage void el0_fiq_compat_handler(struct pt_regs *regs);
++ asmlinkage void el0_error_compat_handler(struct pt_regs *regs);
+++>>>>>>> 064dbfb41691 (arm64: entry: convert IRQ+FIQ handlers to C)
+  
+- asmlinkage void noinstr enter_el1_irq_or_nmi(struct pt_regs *regs);
+- asmlinkage void noinstr exit_el1_irq_or_nmi(struct pt_regs *regs);
+  asmlinkage void call_on_irq_stack(struct pt_regs *regs,
+  				  void (*func)(struct pt_regs *));
+  asmlinkage void enter_from_user_mode(void);
+diff --cc arch/arm64/kernel/entry-common.c
+index c764ba2d11d7,ae1b6d7c00e1..000000000000
+--- a/arch/arm64/kernel/entry-common.c
++++ b/arch/arm64/kernel/entry-common.c
+@@@ -63,22 -73,138 +65,145 @@@ static void noinstr exit_to_kernel_mode
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +asmlinkage void noinstr enter_el1_irq_or_nmi(struct pt_regs *regs)
+++=======
++ void noinstr arm64_enter_nmi(struct pt_regs *regs)
++ {
++ 	regs->lockdep_hardirqs = lockdep_hardirqs_enabled();
++ 
++ 	__nmi_enter();
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	lockdep_hardirq_enter();
++ 	rcu_nmi_enter();
++ 
++ 	trace_hardirqs_off_finish();
++ 	ftrace_nmi_enter();
++ }
++ 
++ void noinstr arm64_exit_nmi(struct pt_regs *regs)
++ {
++ 	bool restore = regs->lockdep_hardirqs;
++ 
++ 	ftrace_nmi_exit();
++ 	if (restore) {
++ 		trace_hardirqs_on_prepare();
++ 		lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++ 	}
++ 
++ 	rcu_nmi_exit();
++ 	lockdep_hardirq_exit();
++ 	if (restore)
++ 		lockdep_hardirqs_on(CALLER_ADDR0);
++ 	__nmi_exit();
++ }
++ 
++ static void noinstr enter_el1_irq_or_nmi(struct pt_regs *regs)
+++>>>>>>> 064dbfb41691 (arm64: entry: convert IRQ+FIQ handlers to C)
+  {
+  	if (IS_ENABLED(CONFIG_ARM64_PSEUDO_NMI) && !interrupts_enabled(regs))
+ -		arm64_enter_nmi(regs);
+ +		nmi_enter();
+  	else
+  		enter_from_kernel_mode(regs);
+  }
+  
+- asmlinkage void noinstr exit_el1_irq_or_nmi(struct pt_regs *regs)
++ static void noinstr exit_el1_irq_or_nmi(struct pt_regs *regs)
+  {
+  	if (IS_ENABLED(CONFIG_ARM64_PSEUDO_NMI) && !interrupts_enabled(regs))
+ -		arm64_exit_nmi(regs);
+ +		nmi_exit();
+  	else
+  		exit_to_kernel_mode(regs);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __sched arm64_preempt_schedule_irq(void)
++ {
++ 	lockdep_assert_irqs_disabled();
++ 
++ 	/*
++ 	 * DAIF.DA are cleared at the start of IRQ/FIQ handling, and when GIC
++ 	 * priority masking is used the GIC irqchip driver will clear DAIF.IF
++ 	 * using gic_arch_enable_irqs() for normal IRQs. If anything is set in
++ 	 * DAIF we must have handled an NMI, so skip preemption.
++ 	 */
++ 	if (system_uses_irq_prio_masking() && read_sysreg(daif))
++ 		return;
++ 
++ 	/*
++ 	 * Preempting a task from an IRQ means we leave copies of PSTATE
++ 	 * on the stack. cpufeature's enable calls may modify PSTATE, but
++ 	 * resuming one of these preempted tasks would undo those changes.
++ 	 *
++ 	 * Only allow a task to be preempted once cpufeatures have been
++ 	 * enabled.
++ 	 */
++ 	if (system_capabilities_finalized())
++ 		preempt_schedule_irq();
++ }
++ 
++ static void do_interrupt_handler(struct pt_regs *regs,
++ 				 void (*handler)(struct pt_regs *))
++ {
++ 	if (on_thread_stack())
++ 		call_on_irq_stack(regs, handler);
++ 	else
++ 		handler(regs);
++ }
++ 
++ extern void (*handle_arch_irq)(struct pt_regs *);
++ extern void (*handle_arch_fiq)(struct pt_regs *);
++ 
++ #ifdef CONFIG_ARM64_ERRATUM_1463225
++ static DEFINE_PER_CPU(int, __in_cortex_a76_erratum_1463225_wa);
++ 
++ static void cortex_a76_erratum_1463225_svc_handler(void)
++ {
++ 	u32 reg, val;
++ 
++ 	if (!unlikely(test_thread_flag(TIF_SINGLESTEP)))
++ 		return;
++ 
++ 	if (!unlikely(this_cpu_has_cap(ARM64_WORKAROUND_1463225)))
++ 		return;
++ 
++ 	__this_cpu_write(__in_cortex_a76_erratum_1463225_wa, 1);
++ 	reg = read_sysreg(mdscr_el1);
++ 	val = reg | DBG_MDSCR_SS | DBG_MDSCR_KDE;
++ 	write_sysreg(val, mdscr_el1);
++ 	asm volatile("msr daifclr, #8");
++ 	isb();
++ 
++ 	/* We will have taken a single-step exception by this point */
++ 
++ 	write_sysreg(reg, mdscr_el1);
++ 	__this_cpu_write(__in_cortex_a76_erratum_1463225_wa, 0);
++ }
++ 
++ static bool cortex_a76_erratum_1463225_debug_handler(struct pt_regs *regs)
++ {
++ 	if (!__this_cpu_read(__in_cortex_a76_erratum_1463225_wa))
++ 		return false;
++ 
++ 	/*
++ 	 * We've taken a dummy step exception from the kernel to ensure
++ 	 * that interrupts are re-enabled on the syscall path. Return back
++ 	 * to cortex_a76_erratum_1463225_svc_handler() with debug exceptions
++ 	 * masked so that we can safely restore the mdscr and get on with
++ 	 * handling the syscall.
++ 	 */
++ 	regs->pstate |= PSR_D_BIT;
++ 	return true;
++ }
++ #else /* CONFIG_ARM64_ERRATUM_1463225 */
++ static void cortex_a76_erratum_1463225_svc_handler(void) { }
++ static bool cortex_a76_erratum_1463225_debug_handler(struct pt_regs *regs)
++ {
++ 	return false;
++ }
++ #endif /* CONFIG_ARM64_ERRATUM_1463225 */
++ 
+++>>>>>>> 064dbfb41691 (arm64: entry: convert IRQ+FIQ handlers to C)
+  static void noinstr el1_abort(struct pt_regs *regs, unsigned long esr)
+  {
+  	unsigned long far = read_sysreg(far_el1);
+@@@ -178,6 -322,64 +303,67 @@@ asmlinkage void noinstr el1_sync_handle
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void noinstr el1_interrupt(struct pt_regs *regs,
++ 				  void (*handler)(struct pt_regs *))
++ {
++ 	write_sysreg(DAIF_PROCCTX_NOIRQ, daif);
++ 
++ 	enter_el1_irq_or_nmi(regs);
++ 	do_interrupt_handler(regs, handler);
++ 
++ 	/*
++ 	 * Note: thread_info::preempt_count includes both thread_info::count
++ 	 * and thread_info::need_resched, and is not equivalent to
++ 	 * preempt_count().
++ 	 */
++ 	if (IS_ENABLED(CONFIG_PREEMPTION) &&
++ 	    READ_ONCE(current_thread_info()->preempt_count) == 0)
++ 		arm64_preempt_schedule_irq();
++ 
++ 	exit_el1_irq_or_nmi(regs);
++ }
++ 
++ asmlinkage void noinstr el1_irq_handler(struct pt_regs *regs)
++ {
++ 	el1_interrupt(regs, handle_arch_irq);
++ }
++ 
++ asmlinkage void noinstr el1_fiq_handler(struct pt_regs *regs)
++ {
++ 	el1_interrupt(regs, handle_arch_fiq);
++ }
++ 
++ asmlinkage void noinstr el1_error_handler(struct pt_regs *regs)
++ {
++ 	unsigned long esr = read_sysreg(esr_el1);
++ 
++ 	local_daif_restore(DAIF_ERRCTX);
++ 	arm64_enter_nmi(regs);
++ 	do_serror(regs, esr);
++ 	arm64_exit_nmi(regs);
++ }
++ 
++ asmlinkage void noinstr enter_from_user_mode(void)
++ {
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	CT_WARN_ON(ct_state() != CONTEXT_USER);
++ 	user_exit_irqoff();
++ 	trace_hardirqs_off_finish();
++ }
++ 
++ asmlinkage void noinstr exit_to_user_mode(void)
++ {
++ 	mte_check_tfsr_exit();
++ 
++ 	trace_hardirqs_on_prepare();
++ 	lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++ 	user_enter_irqoff();
++ 	lockdep_hardirqs_on(CALLER_ADDR0);
++ }
++ 
+++>>>>>>> 064dbfb41691 (arm64: entry: convert IRQ+FIQ handlers to C)
+  static void noinstr el0_da(struct pt_regs *regs, unsigned long esr)
+  {
+  	unsigned long far = read_sysreg(far_el1);
+@@@ -354,6 -551,56 +540,59 @@@ asmlinkage void noinstr el0_sync_handle
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void noinstr el0_interrupt(struct pt_regs *regs,
++ 				  void (*handler)(struct pt_regs *))
++ {
++ 	enter_from_user_mode();
++ 
++ 	write_sysreg(DAIF_PROCCTX_NOIRQ, daif);
++ 
++ 	if (regs->pc & BIT(55))
++ 		arm64_apply_bp_hardening();
++ 
++ 	do_interrupt_handler(regs, handler);
++ }
++ 
++ static void noinstr __el0_irq_handler_common(struct pt_regs *regs)
++ {
++ 	el0_interrupt(regs, handle_arch_irq);
++ }
++ 
++ asmlinkage void noinstr el0_irq_handler(struct pt_regs *regs)
++ {
++ 	__el0_irq_handler_common(regs);
++ }
++ 
++ static void noinstr __el0_fiq_handler_common(struct pt_regs *regs)
++ {
++ 	el0_interrupt(regs, handle_arch_fiq);
++ }
++ 
++ asmlinkage void noinstr el0_fiq_handler(struct pt_regs *regs)
++ {
++ 	__el0_fiq_handler_common(regs);
++ }
++ 
++ static void __el0_error_handler_common(struct pt_regs *regs)
++ {
++ 	unsigned long esr = read_sysreg(esr_el1);
++ 
++ 	enter_from_user_mode();
++ 	local_daif_restore(DAIF_ERRCTX);
++ 	arm64_enter_nmi(regs);
++ 	do_serror(regs, esr);
++ 	arm64_exit_nmi(regs);
++ 	local_daif_restore(DAIF_PROCCTX);
++ }
++ 
++ asmlinkage void noinstr el0_error_handler(struct pt_regs *regs)
++ {
++ 	__el0_error_handler_common(regs);
++ }
++ 
+++>>>>>>> 064dbfb41691 (arm64: entry: convert IRQ+FIQ handlers to C)
+  #ifdef CONFIG_COMPAT
+  static void noinstr el0_cp15(struct pt_regs *regs, unsigned long esr)
+  {
+@@@ -413,4 -659,19 +652,22 @@@ asmlinkage void noinstr el0_sync_compat
+  		el0_inv(regs, esr);
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ asmlinkage void noinstr el0_irq_compat_handler(struct pt_regs *regs)
++ {
++ 	__el0_irq_handler_common(regs);
++ }
++ 
++ asmlinkage void noinstr el0_fiq_compat_handler(struct pt_regs *regs)
++ {
++ 	__el0_fiq_handler_common(regs);
++ }
++ 
++ asmlinkage void noinstr el0_error_compat_handler(struct pt_regs *regs)
++ {
++ 	__el0_error_handler_common(regs);
++ }
+++>>>>>>> 064dbfb41691 (arm64: entry: convert IRQ+FIQ handlers to C)
+  #endif /* CONFIG_COMPAT */
+diff --cc arch/arm64/kernel/entry.S
+index 346ef18f2448,8eb3a0a51413..000000000000
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@@ -39,18 -30,12 +39,24 @@@
+  #include <asm/unistd.h>
+  
+  /*
+ - * Context tracking and irqflag tracing need to instrument transitions between
+ - * user and kernel mode.
+ + * Context tracking subsystem.  Used to instrument transitions
+ + * between user and kernel mode.
+   */
+++<<<<<<< HEAD
+ +	.macro ct_user_exit_irqoff
+ +#ifdef CONFIG_CONTEXT_TRACKING
+ +	bl	enter_from_user_mode
+ +#endif
+ +	.endm
+ +
+ +	.macro ct_user_enter
+ +#ifdef CONFIG_CONTEXT_TRACKING
+ +	bl	context_tracking_user_enter
+++=======
++ 	.macro user_enter_irqoff
++ #if defined(CONFIG_CONTEXT_TRACKING) || defined(CONFIG_TRACE_IRQFLAGS)
++ 	bl	exit_to_user_mode
+++>>>>>>> 064dbfb41691 (arm64: entry: convert IRQ+FIQ handlers to C)
+  #endif
+  	.endm
+  
+@@@ -398,50 -480,12 +404,56 @@@ SYM_CODE_START_LOCAL(__swpan_exit_el0
+  SYM_CODE_END(__swpan_exit_el0)
+  #endif
+  
+++<<<<<<< HEAD
+ +	.macro	irq_stack_entry
+ +	mov	x19, sp			// preserve the original sp
+ +
+ +	/*
+ +	 * Compare sp with the base of the task stack.
+ +	 * If the top ~(THREAD_SIZE - 1) bits match, we are on a task stack,
+ +	 * and should switch to the irq stack.
+ +	 */
+ +	ldr	x25, [tsk, TSK_STACK]
+ +	eor	x25, x25, x19
+ +	and	x25, x25, #~(THREAD_SIZE - 1)
+ +	cbnz	x25, 9998f
+ +
+ +	ldr_this_cpu x25, irq_stack_ptr, x26
+ +	mov	x26, #IRQ_STACK_SIZE
+ +	add	x26, x25, x26
+ +
+ +	/* switch to the irq stack */
+ +	mov	sp, x26
+ +9998:
+ +	.endm
+ +
+ +	/*
+ +	 * x19 should be preserved between irq_stack_entry and
+ +	 * irq_stack_exit.
+ +	 */
+ +	.macro	irq_stack_exit
+ +	mov	sp, x19
+ +	.endm
+ +
+++=======
+++>>>>>>> 064dbfb41691 (arm64: entry: convert IRQ+FIQ handlers to C)
+  /* GPRs used by entry code */
+  tsk	.req	x28		// current thread_info
+  
+  /*
+   * Interrupt handling.
+   */
+++<<<<<<< HEAD
+ +	.macro	irq_handler
+ +	ldr_l	x1, handle_arch_irq
+ +	mov	x0, sp
+ +	irq_stack_entry
+ +	blr	x1
+ +	irq_stack_exit
+ +	.endm
+ +
+++=======
+++>>>>>>> 064dbfb41691 (arm64: entry: convert IRQ+FIQ handlers to C)
+  	.macro	gic_prio_kentry_setup, tmp:req
+  #ifdef CONFIG_ARM64_PSEUDO_NMI
+  	alternative_if ARM64_HAS_IRQ_PRIO_MASKING
+@@@ -451,15 -495,6 +463,18 @@@
+  #endif
+  	.endm
+  
+++<<<<<<< HEAD
+ +	.macro	gic_prio_irq_setup, pmr:req, tmp:req
+ +#ifdef CONFIG_ARM64_PSEUDO_NMI
+ +	alternative_if ARM64_HAS_IRQ_PRIO_MASKING
+ +	orr	\tmp, \pmr, #GIC_PRIO_PSR_I_SET
+ +	msr_s	SYS_ICC_PMR_EL1, \tmp
+ +	alternative_else_nop_endif
+ +#endif
+ +	.endm
+ +
+++=======
+++>>>>>>> 064dbfb41691 (arm64: entry: convert IRQ+FIQ handlers to C)
+  	.text
+  
+  /*
+@@@ -583,32 -618,8 +598,37 @@@ SYM_CODE_END(el1_sync
+  	.align	6
+  SYM_CODE_START_LOCAL_NOALIGN(el1_irq)
+  	kernel_entry 1
+++<<<<<<< HEAD
+ +	gic_prio_irq_setup pmr=x20, tmp=x1
+ +	enable_da_f
+ +
+ +	mov	x0, sp
+ +	bl	enter_el1_irq_or_nmi
+ +
+ +	irq_handler
+ +
+ +#ifdef CONFIG_PREEMPT
+ +	ldr	x24, [tsk, #TSK_TI_PREEMPT]	// get preempt count
+ +alternative_if ARM64_HAS_IRQ_PRIO_MASKING
+ +	/*
+ +	 * DA_F were cleared at start of handling. If anything is set in DAIF,
+ +	 * we come back from an NMI, so skip preemption
+ +	 */
+ +	mrs	x0, daif
+ +	orr	x24, x24, x0
+ +alternative_else_nop_endif
+ +	cbnz	x24, 1f				// preempt count != 0 || NMI return path
+ +	bl	arm64_preempt_schedule_irq	// irq en/disable is done inside
+ +1:
+ +#endif
+ +
+ +	mov	x0, sp
+ +	bl	exit_el1_irq_or_nmi
+ +
+++=======
++ 	mov	x0, sp
++ 	bl	el1_irq_handler
+++>>>>>>> 064dbfb41691 (arm64: entry: convert IRQ+FIQ handlers to C)
+  	kernel_exit 1
+  SYM_CODE_END(el1_irq)
+  
+@@@ -658,23 -676,8 +683,28 @@@ SYM_CODE_END(el0_error_compat
+  	.align	6
+  SYM_CODE_START_LOCAL_NOALIGN(el0_irq)
+  	kernel_entry 0
+++<<<<<<< HEAD
+ +el0_irq_naked:
+ +	gic_prio_irq_setup pmr=x20, tmp=x0
+ +	ct_user_exit_irqoff
+ +	enable_da_f
+ +
+ +#ifdef CONFIG_TRACE_IRQFLAGS
+ +	bl	trace_hardirqs_off
+ +#endif
+ +
+ +	tbz	x22, #55, 1f
+ +	bl	do_el0_irq_bp_hardening
+ +1:
+ +	irq_handler
+ +
+ +#ifdef CONFIG_TRACE_IRQFLAGS
+ +	bl	trace_hardirqs_on
+ +#endif
+++=======
++ 	mov	x0, sp
++ 	bl	el0_irq_handler
+++>>>>>>> 064dbfb41691 (arm64: entry: convert IRQ+FIQ handlers to C)
+  	b	ret_to_user
+  SYM_CODE_END(el0_irq)
+  
+* Unmerged path arch/arm64/include/asm/exception.h
+* Unmerged path arch/arm64/kernel/entry-common.c
+* Unmerged path arch/arm64/kernel/entry.S
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 464083ad510b..6ed8541efd33 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -755,13 +755,6 @@ void do_mem_abort(unsigned long addr, unsigned int esr, struct pt_regs *regs)
+ }
+ NOKPROBE_SYMBOL(do_mem_abort);
+ 
+-void do_el0_irq_bp_hardening(void)
+-{
+-	/* PC has already been checked in entry.S */
+-	arm64_apply_bp_hardening();
+-}
+-NOKPROBE_SYMBOL(do_el0_irq_bp_hardening);
+-
+ void do_sp_pc_abort(unsigned long addr, unsigned int esr, struct pt_regs *regs)
+ {
+ 	arm64_notify_die("SP/PC alignment exception", regs,
