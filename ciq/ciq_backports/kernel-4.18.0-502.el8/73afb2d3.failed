@@ -1,0 +1,209 @@
+x86/resctrl: Add interface to read mbm_local_bytes_config
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Babu Moger <babu.moger@amd.com>
+commit 73afb2d3ce2d7e0f9eee14e3f2b53d2bbfefd9c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/73afb2d3.failed
+
+The event configuration can be viewed by the user by reading the configuration
+file /sys/fs/resctrl/info/L3_MON/mbm_local_bytes_config.  The event
+configuration settings are domain specific and will affect all the CPUs in the
+domain.
+
+Following are the types of events supported:
+
+  ====  ===========================================================
+  Bits   Description
+  ====  ===========================================================
+  6      Dirty Victims from the QOS domain to all types of memory
+  5      Reads to slow memory in the non-local NUMA domain
+  4      Reads to slow memory in the local NUMA domain
+  3      Non-temporal writes to non-local NUMA domain
+  2      Non-temporal writes to local NUMA domain
+  1      Reads to memory in the non-local NUMA domain
+  0      Reads to memory in the local NUMA domain
+  ====  ===========================================================
+
+By default, the mbm_local_bytes_config is set to 0x15 to count all the local
+event types.
+
+For example:
+
+  $cat /sys/fs/resctrl/info/L3_MON/mbm_local_bytes_config
+  0=0x15;1=0x15;2=0x15;3=0x15
+
+In this case, the event mbm_local_bytes is configured with 0x15 on
+domains 0 to 3.
+
+	Signed-off-by: Babu Moger <babu.moger@amd.com>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lore.kernel.org/r/20230113152039.770054-11-babu.moger@amd.com
+(cherry picked from commit 73afb2d3ce2d7e0f9eee14e3f2b53d2bbfefd9c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/monitor.c
+#	arch/x86/kernel/cpu/resctrl/rdtgroup.c
+diff --cc arch/x86/kernel/cpu/resctrl/monitor.c
+index 3b6b1365b5d9,28c65008fce1..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/monitor.c
++++ b/arch/x86/kernel/cpu/resctrl/monitor.c
+@@@ -716,10 -801,14 +716,18 @@@ int __init rdt_get_mon_l3_config(struc
+  		return ret;
+  
+  	if (rdt_cpu_has(X86_FEATURE_BMEC)) {
+ -		if (rdt_cpu_has(X86_FEATURE_CQM_MBM_TOTAL)) {
+ +		if (rdt_cpu_has(X86_FEATURE_CQM_MBM_TOTAL))
+  			mbm_total_event.configurable = true;
+++<<<<<<< HEAD
+ +		if (rdt_cpu_has(X86_FEATURE_CQM_MBM_LOCAL))
+++=======
++ 			mbm_config_rftype_init("mbm_total_bytes_config");
++ 		}
++ 		if (rdt_cpu_has(X86_FEATURE_CQM_MBM_LOCAL)) {
+++>>>>>>> 73afb2d3ce2d (x86/resctrl: Add interface to read mbm_local_bytes_config)
+  			mbm_local_event.configurable = true;
++ 			mbm_config_rftype_init("mbm_local_bytes_config");
++ 		}
+  	}
+  
+  	l3_mon_evt_init(r);
+diff --cc arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index 2b966c66b88f,ad3c7014adf6..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@@ -1486,6 -1420,103 +1486,106 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct mon_config_info {
++ 	u32 evtid;
++ 	u32 mon_config;
++ };
++ 
++ #define INVALID_CONFIG_INDEX   UINT_MAX
++ 
++ /**
++  * mon_event_config_index_get - get the hardware index for the
++  *                              configurable event
++  * @evtid: event id.
++  *
++  * Return: 0 for evtid == QOS_L3_MBM_TOTAL_EVENT_ID
++  *         1 for evtid == QOS_L3_MBM_LOCAL_EVENT_ID
++  *         INVALID_CONFIG_INDEX for invalid evtid
++  */
++ static inline unsigned int mon_event_config_index_get(u32 evtid)
++ {
++ 	switch (evtid) {
++ 	case QOS_L3_MBM_TOTAL_EVENT_ID:
++ 		return 0;
++ 	case QOS_L3_MBM_LOCAL_EVENT_ID:
++ 		return 1;
++ 	default:
++ 		/* Should never reach here */
++ 		return INVALID_CONFIG_INDEX;
++ 	}
++ }
++ 
++ static void mon_event_config_read(void *info)
++ {
++ 	struct mon_config_info *mon_info = info;
++ 	unsigned int index;
++ 	u32 h;
++ 
++ 	index = mon_event_config_index_get(mon_info->evtid);
++ 	if (index == INVALID_CONFIG_INDEX) {
++ 		pr_warn_once("Invalid event id %d\n", mon_info->evtid);
++ 		return;
++ 	}
++ 	rdmsr(MSR_IA32_EVT_CFG_BASE + index, mon_info->mon_config, h);
++ 
++ 	/* Report only the valid event configuration bits */
++ 	mon_info->mon_config &= MAX_EVT_CONFIG_BITS;
++ }
++ 
++ static void mondata_config_read(struct rdt_domain *d, struct mon_config_info *mon_info)
++ {
++ 	smp_call_function_any(&d->cpu_mask, mon_event_config_read, mon_info, 1);
++ }
++ 
++ static int mbm_config_show(struct seq_file *s, struct rdt_resource *r, u32 evtid)
++ {
++ 	struct mon_config_info mon_info = {0};
++ 	struct rdt_domain *dom;
++ 	bool sep = false;
++ 
++ 	mutex_lock(&rdtgroup_mutex);
++ 
++ 	list_for_each_entry(dom, &r->domains, list) {
++ 		if (sep)
++ 			seq_puts(s, ";");
++ 
++ 		memset(&mon_info, 0, sizeof(struct mon_config_info));
++ 		mon_info.evtid = evtid;
++ 		mondata_config_read(dom, &mon_info);
++ 
++ 		seq_printf(s, "%d=0x%02x", dom->id, mon_info.mon_config);
++ 		sep = true;
++ 	}
++ 	seq_puts(s, "\n");
++ 
++ 	mutex_unlock(&rdtgroup_mutex);
++ 
++ 	return 0;
++ }
++ 
++ static int mbm_total_bytes_config_show(struct kernfs_open_file *of,
++ 				       struct seq_file *seq, void *v)
++ {
++ 	struct rdt_resource *r = of->kn->parent->priv;
++ 
++ 	mbm_config_show(seq, r, QOS_L3_MBM_TOTAL_EVENT_ID);
++ 
++ 	return 0;
++ }
++ 
++ static int mbm_local_bytes_config_show(struct kernfs_open_file *of,
++ 				       struct seq_file *seq, void *v)
++ {
++ 	struct rdt_resource *r = of->kn->parent->priv;
++ 
++ 	mbm_config_show(seq, r, QOS_L3_MBM_LOCAL_EVENT_ID);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 73afb2d3ce2d (x86/resctrl: Add interface to read mbm_local_bytes_config)
+  /* rdtgroup information files for one cache resource. */
+  static struct rftype res_common_files[] = {
+  	{
+@@@ -1585,6 -1616,18 +1685,21 @@@
+  		.fflags		= RF_MON_INFO | RFTYPE_RES_CACHE,
+  	},
+  	{
+++<<<<<<< HEAD
+++=======
++ 		.name		= "mbm_total_bytes_config",
++ 		.mode		= 0444,
++ 		.kf_ops		= &rdtgroup_kf_single_ops,
++ 		.seq_show	= mbm_total_bytes_config_show,
++ 	},
++ 	{
++ 		.name		= "mbm_local_bytes_config",
++ 		.mode		= 0444,
++ 		.kf_ops		= &rdtgroup_kf_single_ops,
++ 		.seq_show	= mbm_local_bytes_config_show,
++ 	},
++ 	{
+++>>>>>>> 73afb2d3ce2d (x86/resctrl: Add interface to read mbm_local_bytes_config)
+  		.name		= "cpus",
+  		.mode		= 0644,
+  		.kf_ops		= &rdtgroup_kf_single_ops,
+* Unmerged path arch/x86/kernel/cpu/resctrl/monitor.c
+* Unmerged path arch/x86/kernel/cpu/resctrl/rdtgroup.c
