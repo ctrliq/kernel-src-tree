@@ -1,0 +1,109 @@
+dm: send just one event on resize, not two
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-489.el8
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 7533afa1d27ba1234146d31d2402c195cf195962
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-489.el8/7533afa1.failed
+
+Device mapper sends an uevent when the device is suspended, using the
+function set_capacity_and_notify. However, this causes a race condition
+with udev.
+
+Udev skips scanning dm devices that are suspended. If we send an uevent
+while we are suspended, udev will be racing with device mapper resume
+code. If the device mapper resume code wins the race, udev will process
+the uevent after the device is resumed and it will properly scan the
+device.
+
+However, if udev wins the race, it will receive the uevent, find out that
+the dm device is suspended and skip scanning the device. This causes bugs
+such as systemd unmounting the device - see
+https://bugzilla.redhat.com/show_bug.cgi?id=2158628
+
+This commit fixes this race.
+
+We replace the function set_capacity_and_notify with set_capacity, so that
+the uevent is not sent at this point. In do_resume, we detect if the
+capacity has changed and we pass a boolean variable need_resize_uevent to
+dm_kobject_uevent. dm_kobject_uevent adds "RESIZE=1" to the uevent if
+need_resize_uevent is set.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Tested-by: Peter Rajnoha <prajnoha@redhat.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 7533afa1d27ba1234146d31d2402c195cf195962)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-ioctl.c
+#	drivers/md/dm.c
+diff --cc drivers/md/dm-ioctl.c
+index 4bda13e0800d,a3b86716f606..000000000000
+--- a/drivers/md/dm-ioctl.c
++++ b/drivers/md/dm-ioctl.c
+@@@ -960,7 -993,9 +960,13 @@@ static int dev_remove(struct file *filp
+  
+  	param->flags &= ~DM_DEFERRED_REMOVE;
+  
+++<<<<<<< HEAD
+ +	if (!dm_kobject_uevent(md, KOBJ_REMOVE, param->event_nr))
+++=======
++ 	dm_ima_measure_on_device_remove(md, false);
++ 
++ 	if (!dm_kobject_uevent(md, KOBJ_REMOVE, param->event_nr, false))
+++>>>>>>> 7533afa1d27b (dm: send just one event on resize, not two)
+  		param->flags |= DM_UEVENT_GENERATED_FLAG;
+  
+  	dm_put(md);
+@@@ -1137,8 -1179,12 +1150,17 @@@ static int do_resume(struct dm_ioctl *p
+  
+  	if (dm_suspended_md(md)) {
+  		r = dm_resume(md);
+++<<<<<<< HEAD
+ +		if (!r && !dm_kobject_uevent(md, KOBJ_CHANGE, param->event_nr))
+ +			param->flags |= DM_UEVENT_GENERATED_FLAG;
+++=======
++ 		if (!r) {
++ 			dm_ima_measure_on_device_resume(md, new_map ? true : false);
++ 
++ 			if (!dm_kobject_uevent(md, KOBJ_CHANGE, param->event_nr, need_resize_uevent))
++ 				param->flags |= DM_UEVENT_GENERATED_FLAG;
++ 		}
+++>>>>>>> 7533afa1d27b (dm: send just one event on resize, not two)
+  	}
+  
+  	/*
+diff --cc drivers/md/dm.c
+index 11e079fcd57b,c391a618fb71..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -2074,7 -2173,6 +2074,10 @@@ static struct dm_table *__bind(struct m
+  		memset(&md->geometry, 0, sizeof(md->geometry));
+  
+  	set_capacity(md->disk, size);
+++<<<<<<< HEAD
+ +	bd_set_nr_sectors(md->bdev, size);
+++=======
+++>>>>>>> 7533afa1d27b (dm: send just one event on resize, not two)
+  
+  	dm_table_event_callback(t, event_callback, md);
+  
+* Unmerged path drivers/md/dm-ioctl.c
+* Unmerged path drivers/md/dm.c
+diff --git a/drivers/md/dm.h b/drivers/md/dm.h
+index c7c2ed48f77a..eeb1e6368a0b 100644
+--- a/drivers/md/dm.h
++++ b/drivers/md/dm.h
+@@ -182,7 +182,7 @@ int dm_get_table_device(struct mapped_device *md, dev_t dev, fmode_t mode,
+ void dm_put_table_device(struct mapped_device *md, struct dm_dev *d);
+ 
+ int dm_kobject_uevent(struct mapped_device *md, enum kobject_action action,
+-		      unsigned cookie);
++		      unsigned cookie, bool need_resize_uevent);
+ 
+ void dm_internal_suspend(struct mapped_device *md);
+ void dm_internal_resume(struct mapped_device *md);
