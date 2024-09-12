@@ -1,0 +1,191 @@
+scsi: libiscsi: Teardown iscsi_cls_conn gracefully
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Wenchao Hao <haowenchao@huawei.com>
+commit 8709c323091be019f76a49cf783052a5636aca85
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/8709c323.failed
+
+Commit 1b8d0300a3e9 ("scsi: libiscsi: Fix UAF in
+iscsi_conn_get_param()/iscsi_conn_teardown()") fixed an UAF in
+iscsi_conn_get_param() and introduced 2 tmp_xxx varibles.
+
+We can gracefully fix this UAF with the help of device_del(). Calling
+iscsi_remove_conn() at the beginning of iscsi_conn_teardown would make
+userspace unable to see iscsi_cls_conn. This way we we can free memory
+safely.
+
+Remove iscsi_destroy_conn() since it is no longer used.
+
+Link: https://lore.kernel.org/r/20220310015759.3296841-4-haowenchao@huawei.com
+	Reviewed-by: Mike Christie <michael.christie@oracle.com>
+	Signed-off-by: Wenchao Hao <haowenchao@huawei.com>
+	Signed-off-by: Wu Bo <wubo40@huawei.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 8709c323091be019f76a49cf783052a5636aca85)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_transport_iscsi.c
+diff --cc drivers/scsi/scsi_transport_iscsi.c
+index 783f3da9bafd,27951ea05dd4..000000000000
+--- a/drivers/scsi/scsi_transport_iscsi.c
++++ b/drivers/scsi/scsi_transport_iscsi.c
+@@@ -2445,104 -2418,6 +2449,107 @@@ void iscsi_remove_conn(struct iscsi_cls
+  }
+  EXPORT_SYMBOL_GPL(iscsi_remove_conn);
+  
+++<<<<<<< HEAD
+ +/**
+ + * iscsi_create_conn - create iscsi class connection
+ + * @session: iscsi cls session
+ + * @dd_size: private driver data size
+ + * @cid: connection id
+ + *
+ + * This can be called from a LLD or iscsi_transport. The connection
+ + * is child of the session so cid must be unique for all connections
+ + * on the session.
+ + *
+ + * Since we do not support MCS, cid will normally be zero. In some cases
+ + * for software iscsi we could be trying to preallocate a connection struct
+ + * in which case there could be two connection structs and cid would be
+ + * non-zero.
+ + */
+ +struct iscsi_cls_conn *
+ +iscsi_create_conn(struct iscsi_cls_session *session, int dd_size, uint32_t cid)
+ +{
+ +	struct iscsi_transport *transport = session->transport;
+ +	struct iscsi_cls_conn *conn;
+ +	unsigned long flags;
+ +	int err;
+ +
+ +	conn = kzalloc(sizeof(*conn) + dd_size, GFP_KERNEL);
+ +	if (!conn)
+ +		return NULL;
+ +	if (dd_size)
+ +		conn->dd_data = &conn[1];
+ +
+ +	mutex_init(&conn->ep_mutex);
+ +	spin_lock_init(&conn->lock);
+ +	INIT_LIST_HEAD(&conn->conn_list);
+ +	INIT_WORK(&conn->cleanup_work, iscsi_cleanup_conn_work_fn);
+ +	conn->transport = transport;
+ +	conn->cid = cid;
+ +	WRITE_ONCE(conn->state, ISCSI_CONN_DOWN);
+ +
+ +	/* this is released in the dev's release function */
+ +	if (!get_device(&session->dev))
+ +		goto free_conn;
+ +
+ +	dev_set_name(&conn->dev, "connection%d:%u", session->sid, cid);
+ +	conn->dev.parent = &session->dev;
+ +	conn->dev.release = iscsi_conn_release;
+ +	err = device_register(&conn->dev);
+ +	if (err) {
+ +		iscsi_cls_session_printk(KERN_ERR, session, "could not "
+ +					 "register connection's dev\n");
+ +		goto release_parent_ref;
+ +	}
+ +	err = transport_register_device(&conn->dev);
+ +	if (err) {
+ +		iscsi_cls_session_printk(KERN_ERR, session, "could not "
+ +					 "register transport's dev\n");
+ +		goto release_conn_ref;
+ +	}
+ +
+ +	spin_lock_irqsave(&connlock, flags);
+ +	list_add(&conn->conn_list, &connlist);
+ +	spin_unlock_irqrestore(&connlock, flags);
+ +
+ +	ISCSI_DBG_TRANS_CONN(conn, "Completed conn creation\n");
+ +	return conn;
+ +
+ +release_conn_ref:
+ +	device_unregister(&conn->dev);
+ +	put_device(&session->dev);
+ +	return NULL;
+ +release_parent_ref:
+ +	put_device(&session->dev);
+ +free_conn:
+ +	kfree(conn);
+ +	return NULL;
+ +}
+ +
+ +EXPORT_SYMBOL_GPL(iscsi_create_conn);
+ +
+ +/**
+ + * iscsi_destroy_conn - destroy iscsi class connection
+ + * @conn: iscsi cls session
+ + *
+ + * This can be called from a LLD or iscsi_transport.
+ + */
+ +int iscsi_destroy_conn(struct iscsi_cls_conn *conn)
+ +{
+ +	unsigned long flags;
+ +
+ +	spin_lock_irqsave(&connlock, flags);
+ +	list_del(&conn->conn_list);
+ +	spin_unlock_irqrestore(&connlock, flags);
+ +
+ +	transport_unregister_device(&conn->dev);
+ +	ISCSI_DBG_TRANS_CONN(conn, "Completing conn destruction\n");
+ +	device_unregister(&conn->dev);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL_GPL(iscsi_destroy_conn);
+ +
+++=======
+++>>>>>>> 8709c323091b (scsi: libiscsi: Teardown iscsi_cls_conn gracefully)
+  void iscsi_put_conn(struct iscsi_cls_conn *conn)
+  {
+  	put_device(&conn->dev);
+diff --git a/drivers/scsi/libiscsi.c b/drivers/scsi/libiscsi.c
+index 30d302e88ff8..fbb2cddc238f 100644
+--- a/drivers/scsi/libiscsi.c
++++ b/drivers/scsi/libiscsi.c
+@@ -3104,8 +3104,8 @@ void iscsi_conn_teardown(struct iscsi_cls_conn *cls_conn)
+ {
+ 	struct iscsi_conn *conn = cls_conn->dd_data;
+ 	struct iscsi_session *session = conn->session;
+-	char *tmp_persistent_address = conn->persistent_address;
+-	char *tmp_local_ipaddr = conn->local_ipaddr;
++
++	iscsi_remove_conn(cls_conn);
+ 
+ 	del_timer_sync(&conn->transport_timer);
+ 
+@@ -3127,6 +3127,8 @@ void iscsi_conn_teardown(struct iscsi_cls_conn *cls_conn)
+ 	spin_lock_bh(&session->frwd_lock);
+ 	free_pages((unsigned long) conn->data,
+ 		   get_order(ISCSI_DEF_MAX_RECV_SEG_LEN));
++	kfree(conn->persistent_address);
++	kfree(conn->local_ipaddr);
+ 	/* regular RX path uses back_lock */
+ 	spin_lock_bh(&session->back_lock);
+ 	kfifo_in(&session->cmdpool.queue, (void*)&conn->login_task,
+@@ -3137,9 +3139,7 @@ void iscsi_conn_teardown(struct iscsi_cls_conn *cls_conn)
+ 	spin_unlock_bh(&session->frwd_lock);
+ 	mutex_unlock(&session->eh_mutex);
+ 
+-	iscsi_destroy_conn(cls_conn);
+-	kfree(tmp_persistent_address);
+-	kfree(tmp_local_ipaddr);
++	iscsi_put_conn(cls_conn);
+ }
+ EXPORT_SYMBOL_GPL(iscsi_conn_teardown);
+ 
+* Unmerged path drivers/scsi/scsi_transport_iscsi.c
+diff --git a/include/scsi/scsi_transport_iscsi.h b/include/scsi/scsi_transport_iscsi.h
+index f98967f94f82..792a342c02a5 100644
+--- a/include/scsi/scsi_transport_iscsi.h
++++ b/include/scsi/scsi_transport_iscsi.h
+@@ -452,7 +452,6 @@ extern struct iscsi_cls_conn *iscsi_create_conn(struct iscsi_cls_session *sess,
+ 						int dd_size, uint32_t cid);
+ extern void iscsi_put_conn(struct iscsi_cls_conn *conn);
+ extern void iscsi_get_conn(struct iscsi_cls_conn *conn);
+-extern int iscsi_destroy_conn(struct iscsi_cls_conn *conn);
+ extern void iscsi_unblock_session(struct iscsi_cls_session *session);
+ extern void iscsi_block_session(struct iscsi_cls_session *session);
+ extern struct iscsi_endpoint *iscsi_create_endpoint(int dd_size);
