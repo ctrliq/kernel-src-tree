@@ -1,0 +1,155 @@
+sched,rcu: Rework try_invoke_on_locked_down_task()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 9b3c4ab3045e953670c7de9c1165fae5358a7237
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/9b3c4ab3.failed
+
+Give try_invoke_on_locked_down_task() a saner name and have it return
+an int so that the caller might distinguish between different reasons
+of failure.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Paul E. McKenney <paulmck@kernel.org>
+	Acked-by: Vasily Gorbik <gor@linux.ibm.com>
+	Tested-by: Vasily Gorbik <gor@linux.ibm.com> # on s390
+Link: https://lkml.kernel.org/r/20210929152428.649944917@infradead.org
+(cherry picked from commit 9b3c4ab3045e953670c7de9c1165fae5358a7237)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/tasks.h
+diff --cc kernel/rcu/tasks.h
+index 098fe97060f9,171bc848e8e3..000000000000
+--- a/kernel/rcu/tasks.h
++++ b/kernel/rcu/tasks.h
+@@@ -891,9 -928,8 +891,9 @@@ reset_ipi
+  }
+  
+  /* Callback function for scheduler to check locked-down task.  */
+- static bool trc_inspect_reader(struct task_struct *t, void *arg)
++ static int trc_inspect_reader(struct task_struct *t, void *arg)
+  {
+ +	struct task_struct_rh *t_rh = t->task_struct_rh;
+  	int cpu = task_cpu(t);
+  	bool in_qs = false;
+  	bool ofl = cpu_is_offline(cpu);
+@@@ -910,8 -946,8 +910,13 @@@
+  		// However, we cannot safely change its state.
+  		n_heavy_reader_attempts++;
+  		if (!ofl && // Check for "running" idle tasks on offline CPUs.
+++<<<<<<< HEAD
+ +		    !rcu_dynticks_zero_in_eqs(cpu, &t_rh->trc_reader_nesting))
+ +			return false; // No quiescent state, do it the hard way.
+++=======
++ 		    !rcu_dynticks_zero_in_eqs(cpu, &t->trc_reader_nesting))
++ 			return -EINVAL; // No quiescent state, do it the hard way.
+++>>>>>>> 9b3c4ab3045e (sched,rcu: Rework try_invoke_on_locked_down_task())
+  		n_heavy_reader_updates++;
+  		if (ofl)
+  			n_heavy_reader_ofl_updates++;
+@@@ -922,18 -959,18 +927,24 @@@
+  
+  	// Mark as checked so that the grace-period kthread will
+  	// remove it from the holdout list.
+ -	t->trc_reader_checked = true;
+ +	t_rh->trc_reader_checked = true;
+  
+  	if (in_qs)
+- 		return true;  // Already in quiescent state, done!!!
++ 		return 0;  // Already in quiescent state, done!!!
+  
+  	// The task is in a read-side critical section, so set up its
+  	// state so that it will awaken the grace-period kthread upon exit
+  	// from that critical section.
+  	atomic_inc(&trc_n_readers_need_end); // One more to wait on.
+++<<<<<<< HEAD
+ +	WARN_ON_ONCE(t_rh->trc_reader_special.b.need_qs);
+ +	WRITE_ONCE(t_rh->trc_reader_special.b.need_qs, true);
+ +	return true;
+++=======
++ 	WARN_ON_ONCE(READ_ONCE(t->trc_reader_special.b.need_qs));
++ 	WRITE_ONCE(t->trc_reader_special.b.need_qs, true);
++ 	return 0;
+++>>>>>>> 9b3c4ab3045e (sched,rcu: Rework try_invoke_on_locked_down_task())
+  }
+  
+  /* Attempt to extract the state for the specified task. */
+diff --git a/include/linux/wait.h b/include/linux/wait.h
+index 01d559739175..a4ee38e0fc5f 100644
+--- a/include/linux/wait.h
++++ b/include/linux/wait.h
+@@ -1151,6 +1151,7 @@ int autoremove_wake_function(struct wait_queue_entry *wq_entry, unsigned mode, i
+ 		(wait)->flags = 0;						\
+ 	} while (0)
+ 
+-bool try_invoke_on_locked_down_task(struct task_struct *p, bool (*func)(struct task_struct *t, void *arg), void *arg);
++typedef int (*task_call_f)(struct task_struct *p, void *arg);
++extern int task_call_func(struct task_struct *p, task_call_f func, void *arg);
+ 
+ #endif /* _LINUX_WAIT_H */
+* Unmerged path kernel/rcu/tasks.h
+diff --git a/kernel/rcu/tree_stall.h b/kernel/rcu/tree_stall.h
+index 8f26a501653e..d525a76202d0 100644
+--- a/kernel/rcu/tree_stall.h
++++ b/kernel/rcu/tree_stall.h
+@@ -241,16 +241,16 @@ struct rcu_stall_chk_rdr {
+  * Report out the state of a not-running task that is stalling the
+  * current RCU grace period.
+  */
+-static bool check_slow_task(struct task_struct *t, void *arg)
++static int check_slow_task(struct task_struct *t, void *arg)
+ {
+ 	struct rcu_stall_chk_rdr *rscrp = arg;
+ 
+ 	if (task_curr(t))
+-		return false; // It is running, so decline to inspect it.
++		return -EBUSY; // It is running, so decline to inspect it.
+ 	rscrp->nesting = t->rcu_read_lock_nesting;
+ 	rscrp->rs = t->rcu_read_unlock_special;
+ 	rscrp->on_blkd_list = !list_empty(&t->rcu_node_entry);
+-	return true;
++	return 0;
+ }
+ 
+ /*
+@@ -284,7 +284,7 @@ static int rcu_print_task_stall(struct rcu_node *rnp, unsigned long flags)
+ 	raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
+ 	while (i) {
+ 		t = ts[--i];
+-		if (!try_invoke_on_locked_down_task(t, check_slow_task, &rscr))
++		if (task_call_func(t, check_slow_task, &rscr))
+ 			pr_cont(" P%d", t->pid);
+ 		else
+ 			pr_cont(" P%d/%d:%c%c%c%c",
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 731c609cdd0b..790fcc263781 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2865,7 +2865,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ }
+ 
+ /**
+- * try_invoke_on_locked_down_task - Invoke a function on task in fixed state
++ * task_call_func - Invoke a function on task in fixed state
+  * @p: Process for which the function is to be invoked, can be @current.
+  * @func: Function to invoke.
+  * @arg: Argument to function.
+@@ -2878,12 +2878,12 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+  * Returns:
+  *   Whatever @func returns
+  */
+-bool try_invoke_on_locked_down_task(struct task_struct *p, bool (*func)(struct task_struct *t, void *arg), void *arg)
++int task_call_func(struct task_struct *p, task_call_f func, void *arg)
+ {
+ 	struct rq *rq = NULL;
+ 	unsigned int state;
+ 	struct rq_flags rf;
+-	bool ret = false;
++	int ret;
+ 
+ 	raw_spin_lock_irqsave(&p->pi_lock, rf.flags);
+ 
