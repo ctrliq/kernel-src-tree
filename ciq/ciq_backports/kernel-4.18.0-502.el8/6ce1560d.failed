@@ -1,0 +1,368 @@
+x86/resctrl: Switch over to the resctrl mbps_val list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author James Morse <james.morse@arm.com>
+commit 6ce1560d35f63a458fead11ac865bc39cea9bc46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/6ce1560d.failed
+
+Updates to resctrl's software controller follow the same path as
+other configuration updates, but they don't modify the hardware state.
+rdtgroup_schemata_write() uses parse_line() and the resource's
+parse_ctrlval() function to stage the configuration.
+resctrl_arch_update_domains() then updates the mbps_val[] array
+instead, and resctrl_arch_update_domains() skips the rdt_ctrl_update()
+call that would update hardware.
+
+This complicates the interface between resctrl's filesystem parts
+and architecture specific code. It should be possible for mba_sc
+to be completely implemented by the filesystem parts of resctrl. This
+would allow it to work on a second architecture with no additional code.
+resctrl_arch_update_domains() using the mbps_val[] array prevents this.
+
+Change parse_bw() to write the configuration value directly to the
+mbps_val[] array in the domain structure. Change rdtgroup_schemata_write()
+to skip the call to resctrl_arch_update_domains(), meaning all the
+mba_sc specific code in resctrl_arch_update_domains() can be removed.
+On the read-side, show_doms() and update_mba_bw() are changed to read
+the mbps_val[] array from the domain structure. With this,
+resctrl_arch_get_config() no longer needs to consider mba_sc resources.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Jamie Iles <quic_jiles@quicinc.com>
+	Reviewed-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Tested-by: Xin Hao <xhao@linux.alibaba.com>
+	Tested-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Tested-by: Cristian Marussi <cristian.marussi@arm.com>
+Link: https://lore.kernel.org/r/20220902154829.30399-10-james.morse@arm.com
+(cherry picked from commit 6ce1560d35f63a458fead11ac865bc39cea9bc46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+#	arch/x86/kernel/cpu/resctrl/monitor.c
+#	arch/x86/kernel/cpu/resctrl/rdtgroup.c
+diff --cc arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+index 9a768d89de37,bf9d73c5be14..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/ctrlmondata.c
++++ b/arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+@@@ -65,20 -57,30 +65,37 @@@ static bool bw_validate(char *buf, unsi
+  	return true;
+  }
+  
+ -int parse_bw(struct rdt_parse_data *data, struct resctrl_schema *s,
+ +int parse_bw(struct rdt_parse_data *data, struct rdt_resource *r,
+  	     struct rdt_domain *d)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct resctrl_staged_config *cfg;
++ 	u32 closid = data->rdtgrp->closid;
++ 	struct rdt_resource *r = s->res;
+++>>>>>>> 6ce1560d35f6 (x86/resctrl: Switch over to the resctrl mbps_val list)
+  	unsigned long bw_val;
+  
+ -	cfg = &d->staged_config[s->conf_type];
+ -	if (cfg->have_new_ctrl) {
+ +	if (d->have_new_ctrl) {
+  		rdt_last_cmd_printf("Duplicate domain %d\n", d->id);
+  		return -EINVAL;
+  	}
+  
+  	if (!bw_validate(data->buf, &bw_val, r))
+  		return -EINVAL;
+++<<<<<<< HEAD
+ +	d->new_ctrl = bw_val;
+ +	d->have_new_ctrl = true;
+++=======
++ 
++ 	if (is_mba_sc(r)) {
++ 		d->mbps_val[closid] = bw_val;
++ 		return 0;
++ 	}
++ 
++ 	cfg->new_ctrl = bw_val;
++ 	cfg->have_new_ctrl = true;
+++>>>>>>> 6ce1560d35f6 (x86/resctrl: Switch over to the resctrl mbps_val list)
+  
+  	return 0;
+  }
+@@@ -244,28 -253,69 +261,88 @@@ next
+  	return -EINVAL;
+  }
+  
+ -static u32 get_config_index(u32 closid, enum resctrl_conf_type type)
+ +int update_domains(struct rdt_resource *r, int closid)
+  {
+++<<<<<<< HEAD
+++=======
++ 	switch (type) {
++ 	default:
++ 	case CDP_NONE:
++ 		return closid;
++ 	case CDP_CODE:
++ 		return closid * 2 + 1;
++ 	case CDP_DATA:
++ 		return closid * 2;
++ 	}
++ }
++ 
++ static bool apply_config(struct rdt_hw_domain *hw_dom,
++ 			 struct resctrl_staged_config *cfg, u32 idx,
++ 			 cpumask_var_t cpu_mask)
++ {
++ 	struct rdt_domain *dom = &hw_dom->d_resctrl;
++ 
++ 	if (cfg->new_ctrl != hw_dom->ctrl_val[idx]) {
++ 		cpumask_set_cpu(cpumask_any(&dom->cpu_mask), cpu_mask);
++ 		hw_dom->ctrl_val[idx] = cfg->new_ctrl;
++ 
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ int resctrl_arch_update_domains(struct rdt_resource *r, u32 closid)
++ {
++ 	struct resctrl_staged_config *cfg;
++ 	struct rdt_hw_domain *hw_dom;
+++>>>>>>> 6ce1560d35f6 (x86/resctrl: Switch over to the resctrl mbps_val list)
+  	struct msr_param msr_param;
+ -	enum resctrl_conf_type t;
+  	cpumask_var_t cpu_mask;
+  	struct rdt_domain *d;
+++<<<<<<< HEAD
+ +	bool mba_sc;
+ +	u32 *dc;
+++=======
+++>>>>>>> 6ce1560d35f6 (x86/resctrl: Switch over to the resctrl mbps_val list)
+  	int cpu;
+ -	u32 idx;
+  
+  	if (!zalloc_cpumask_var(&cpu_mask, GFP_KERNEL))
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	msr_param.low = closid;
+ +	msr_param.high = msr_param.low + 1;
+ +	msr_param.res = r;
+ +
+ +	mba_sc = is_mba_sc(r);
+ +	list_for_each_entry(d, &r->domains, list) {
+ +		dc = !mba_sc ? d->ctrl_val : d->mbps_val;
+ +		if (d->have_new_ctrl && d->new_ctrl != dc[closid]) {
+ +			cpumask_set_cpu(cpumask_any(&d->cpu_mask), cpu_mask);
+ +			dc[closid] = d->new_ctrl;
+++=======
++ 	msr_param.res = NULL;
++ 	list_for_each_entry(d, &r->domains, list) {
++ 		hw_dom = resctrl_to_arch_dom(d);
++ 		for (t = 0; t < CDP_NUM_TYPES; t++) {
++ 			cfg = &hw_dom->d_resctrl.staged_config[t];
++ 			if (!cfg->have_new_ctrl)
++ 				continue;
++ 
++ 			idx = get_config_index(closid, t);
++ 			if (!apply_config(hw_dom, cfg, idx, cpu_mask))
++ 				continue;
++ 
++ 			if (!msr_param.res) {
++ 				msr_param.low = idx;
++ 				msr_param.high = msr_param.low + 1;
++ 				msr_param.res = r;
++ 			} else {
++ 				msr_param.low = min(msr_param.low, idx);
++ 				msr_param.high = max(msr_param.high, idx + 1);
++ 			}
+++>>>>>>> 6ce1560d35f6 (x86/resctrl: Switch over to the resctrl mbps_val list)
+  		}
+  	}
+  
+@@@ -357,8 -404,17 +430,22 @@@ ssize_t rdtgroup_schemata_write(struct 
+  			goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	for_each_alloc_enabled_rdt_resource(r) {
+ +		ret = update_domains(r, rdtgrp->closid);
+++=======
++ 	list_for_each_entry(s, &resctrl_schema_all, list) {
++ 		r = s->res;
++ 
++ 		/*
++ 		 * Writes to mba_sc resources update the software controller,
++ 		 * not the control MSR.
++ 		 */
++ 		if (is_mba_sc(r))
++ 			continue;
++ 
++ 		ret = resctrl_arch_update_domains(r, rdtgrp->closid);
+++>>>>>>> 6ce1560d35f6 (x86/resctrl: Switch over to the resctrl mbps_val list)
+  		if (ret)
+  			goto out;
+  	}
+@@@ -379,8 -435,18 +466,20 @@@ out
+  	return ret ?: nbytes;
+  }
+  
+ -u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_domain *d,
+ -			    u32 closid, enum resctrl_conf_type type)
+ +static void show_doms(struct seq_file *s, struct rdt_resource *r, int closid)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct rdt_hw_domain *hw_dom = resctrl_to_arch_dom(d);
++ 	u32 idx = get_config_index(closid, type);
++ 
++ 	return hw_dom->ctrl_val[idx];
++ }
++ 
++ static void show_doms(struct seq_file *s, struct resctrl_schema *schema, int closid)
++ {
++ 	struct rdt_resource *r = schema->res;
+++>>>>>>> 6ce1560d35f6 (x86/resctrl: Switch over to the resctrl mbps_val list)
+  	struct rdt_domain *dom;
+  	bool sep = false;
+  	u32 ctrl_val;
+@@@ -390,8 -456,12 +489,17 @@@
+  		if (sep)
+  			seq_puts(s, ";");
+  
+++<<<<<<< HEAD
+ +		ctrl_val = (!is_mba_sc(r) ? dom->ctrl_val[closid] :
+ +			    dom->mbps_val[closid]);
+++=======
++ 		if (is_mba_sc(r))
++ 			ctrl_val = dom->mbps_val[closid];
++ 		else
++ 			ctrl_val = resctrl_arch_get_config(r, dom, closid,
++ 							   schema->conf_type);
++ 
+++>>>>>>> 6ce1560d35f6 (x86/resctrl: Switch over to the resctrl mbps_val list)
+  		seq_printf(s, r->format_str, dom->id, max_data_width,
+  			   ctrl_val);
+  		sep = true;
+diff --cc arch/x86/kernel/cpu/resctrl/monitor.c
+index 810114991b5b,16028b2f756a..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/monitor.c
++++ b/arch/x86/kernel/cpu/resctrl/monitor.c
+@@@ -453,7 -449,9 +453,13 @@@ static void update_mba_bw(struct rdtgro
+  	cur_bw = pmbm_data->prev_bw;
+  	user_bw = dom_mba->mbps_val[closid];
+  	delta_bw = pmbm_data->delta_bw;
+++<<<<<<< HEAD
+ +	cur_msr_val = dom_mba->ctrl_val[closid];
+++=======
++ 
++ 	/* MBA resource doesn't support CDP */
++ 	cur_msr_val = resctrl_arch_get_config(r_mba, dom_mba, closid, CDP_NONE);
+++>>>>>>> 6ce1560d35f6 (x86/resctrl: Switch over to the resctrl mbps_val list)
+  
+  	/*
+  	 * For Ctrl groups read data from child monitor groups.
+diff --cc arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index e5f7b979a288,55d8a12287c3..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@@ -1424,6 -1355,8 +1424,11 @@@ unsigned int rdtgroup_cbm_to_size(struc
+  static int rdtgroup_size_show(struct kernfs_open_file *of,
+  			      struct seq_file *s, void *v)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct resctrl_schema *schema;
++ 	enum resctrl_conf_type type;
+++>>>>>>> 6ce1560d35f6 (x86/resctrl: Switch over to the resctrl mbps_val list)
+  	struct rdtgroup *rdtgrp;
+  	struct rdt_resource *r;
+  	struct rdt_domain *d;
+@@@ -1454,18 -1388,25 +1460,35 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	for_each_alloc_enabled_rdt_resource(r) {
+++=======
++ 	closid = rdtgrp->closid;
++ 
++ 	list_for_each_entry(schema, &resctrl_schema_all, list) {
++ 		r = schema->res;
++ 		type = schema->conf_type;
+++>>>>>>> 6ce1560d35f6 (x86/resctrl: Switch over to the resctrl mbps_val list)
+  		sep = false;
+ -		seq_printf(s, "%*s:", max_name_width, schema->name);
+ +		seq_printf(s, "%*s:", max_name_width, r->name);
+  		list_for_each_entry(d, &r->domains, list) {
+  			if (sep)
+  				seq_putc(s, ';');
+  			if (rdtgrp->mode == RDT_MODE_PSEUDO_LOCKSETUP) {
+  				size = 0;
+  			} else {
+++<<<<<<< HEAD
+ +				ctrl = (!is_mba_sc(r) ?
+ +						d->ctrl_val[rdtgrp->closid] :
+ +						d->mbps_val[rdtgrp->closid]);
+++=======
++ 				if (is_mba_sc(r))
++ 					ctrl = d->mbps_val[closid];
++ 				else
++ 					ctrl = resctrl_arch_get_config(r, d,
++ 								       closid,
++ 								       type);
+++>>>>>>> 6ce1560d35f6 (x86/resctrl: Switch over to the resctrl mbps_val list)
+  				if (r->rid == RDT_RESOURCE_MBA)
+  					size = ctrl;
+  				else
+@@@ -2767,13 -2826,20 +2790,24 @@@ static int rdtgroup_init_cat(struct rdt
+  }
+  
+  /* Initialize MBA resource with default values. */
+- static void rdtgroup_init_mba(struct rdt_resource *r)
++ static void rdtgroup_init_mba(struct rdt_resource *r, u32 closid)
+  {
+ -	struct resctrl_staged_config *cfg;
+  	struct rdt_domain *d;
+  
+  	list_for_each_entry(d, &r->domains, list) {
+++<<<<<<< HEAD
+ +		d->new_ctrl = is_mba_sc(r) ? MBA_MAX_MBPS : r->default_ctrl;
+ +		d->have_new_ctrl = true;
+++=======
++ 		if (is_mba_sc(r)) {
++ 			d->mbps_val[closid] = MBA_MAX_MBPS;
++ 			continue;
++ 		}
++ 
++ 		cfg = &d->staged_config[CDP_NONE];
++ 		cfg->new_ctrl = r->default_ctrl;
++ 		cfg->have_new_ctrl = true;
+++>>>>>>> 6ce1560d35f6 (x86/resctrl: Switch over to the resctrl mbps_val list)
+  	}
+  }
+  
+@@@ -2783,11 -2849,15 +2817,13 @@@ static int rdtgroup_init_alloc(struct r
+  	struct rdt_resource *r;
+  	int ret;
+  
+ -	list_for_each_entry(s, &resctrl_schema_all, list) {
+ -		r = s->res;
+ +	for_each_alloc_enabled_rdt_resource(r) {
+  		if (r->rid == RDT_RESOURCE_MBA) {
+- 			rdtgroup_init_mba(r);
++ 			rdtgroup_init_mba(r, rdtgrp->closid);
++ 			if (is_mba_sc(r))
++ 				continue;
+  		} else {
+ -			ret = rdtgroup_init_cat(s, rdtgrp->closid);
+ +			ret = rdtgroup_init_cat(r, rdtgrp->closid);
+  			if (ret < 0)
+  				return ret;
+  		}
+* Unmerged path arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+* Unmerged path arch/x86/kernel/cpu/resctrl/monitor.c
+* Unmerged path arch/x86/kernel/cpu/resctrl/rdtgroup.c
