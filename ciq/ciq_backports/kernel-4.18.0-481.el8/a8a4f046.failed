@@ -1,0 +1,208 @@
+drm/i915: Fix CFI violations in gt_sysfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Nathan Chancellor <nathan@kernel.org>
+commit a8a4f0467d706fc22d286dfa973946e5944b793c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/a8a4f046.failed
+
+When booting with CONFIG_CFI_CLANG, there are numerous violations when
+accessing the files under
+/sys/devices/pci0000:00/0000:00:02.0/drm/card0/gt/gt0:
+
+  $ cd /sys/devices/pci0000:00/0000:00:02.0/drm/card0/gt/gt0
+
+  $ grep . *
+  id:0
+  punit_req_freq_mhz:350
+  rc6_enable:1
+  rc6_residency_ms:214934
+  rps_act_freq_mhz:1300
+  rps_boost_freq_mhz:1300
+  rps_cur_freq_mhz:350
+  rps_max_freq_mhz:1300
+  rps_min_freq_mhz:350
+  rps_RP0_freq_mhz:1300
+  rps_RP1_freq_mhz:350
+  rps_RPn_freq_mhz:350
+  throttle_reason_pl1:0
+  throttle_reason_pl2:0
+  throttle_reason_pl4:0
+  throttle_reason_prochot:0
+  throttle_reason_ratl:0
+  throttle_reason_status:0
+  throttle_reason_thermal:0
+  throttle_reason_vr_tdc:0
+  throttle_reason_vr_thermalert:0
+
+  $ sudo dmesg &| grep "CFI failure at"
+  [  214.595903] CFI failure at kobj_attr_show+0x19/0x30 (target: id_show+0x0/0x70 [i915]; expected type: 0xc527b809)
+  [  214.596064] CFI failure at kobj_attr_show+0x19/0x30 (target: punit_req_freq_mhz_show+0x0/0x40 [i915]; expected type: 0xc527b809)
+  [  214.596407] CFI failure at kobj_attr_show+0x19/0x30 (target: rc6_enable_show+0x0/0x40 [i915]; expected type: 0xc527b809)
+  [  214.596528] CFI failure at kobj_attr_show+0x19/0x30 (target: rc6_residency_ms_show+0x0/0x270 [i915]; expected type: 0xc527b809)
+  [  214.596682] CFI failure at kobj_attr_show+0x19/0x30 (target: act_freq_mhz_show+0x0/0xe0 [i915]; expected type: 0xc527b809)
+  [  214.596792] CFI failure at kobj_attr_show+0x19/0x30 (target: boost_freq_mhz_show+0x0/0xe0 [i915]; expected type: 0xc527b809)
+  [  214.596893] CFI failure at kobj_attr_show+0x19/0x30 (target: cur_freq_mhz_show+0x0/0xe0 [i915]; expected type: 0xc527b809)
+  [  214.596996] CFI failure at kobj_attr_show+0x19/0x30 (target: max_freq_mhz_show+0x0/0xe0 [i915]; expected type: 0xc527b809)
+  [  214.597099] CFI failure at kobj_attr_show+0x19/0x30 (target: min_freq_mhz_show+0x0/0xe0 [i915]; expected type: 0xc527b809)
+  [  214.597198] CFI failure at kobj_attr_show+0x19/0x30 (target: RP0_freq_mhz_show+0x0/0xe0 [i915]; expected type: 0xc527b809)
+  [  214.597301] CFI failure at kobj_attr_show+0x19/0x30 (target: RP1_freq_mhz_show+0x0/0xe0 [i915]; expected type: 0xc527b809)
+  [  214.597405] CFI failure at kobj_attr_show+0x19/0x30 (target: RPn_freq_mhz_show+0x0/0xe0 [i915]; expected type: 0xc527b809)
+  [  214.597538] CFI failure at kobj_attr_show+0x19/0x30 (target: throttle_reason_bool_show+0x0/0x50 [i915]; expected type: 0xc527b809)
+  [  214.597701] CFI failure at kobj_attr_show+0x19/0x30 (target: throttle_reason_bool_show+0x0/0x50 [i915]; expected type: 0xc527b809)
+  [  214.597836] CFI failure at kobj_attr_show+0x19/0x30 (target: throttle_reason_bool_show+0x0/0x50 [i915]; expected type: 0xc527b809)
+  [  214.597952] CFI failure at kobj_attr_show+0x19/0x30 (target: throttle_reason_bool_show+0x0/0x50 [i915]; expected type: 0xc527b809)
+  [  214.598071] CFI failure at kobj_attr_show+0x19/0x30 (target: throttle_reason_bool_show+0x0/0x50 [i915]; expected type: 0xc527b809)
+  [  214.598177] CFI failure at kobj_attr_show+0x19/0x30 (target: throttle_reason_bool_show+0x0/0x50 [i915]; expected type: 0xc527b809)
+  [  214.598307] CFI failure at kobj_attr_show+0x19/0x30 (target: throttle_reason_bool_show+0x0/0x50 [i915]; expected type: 0xc527b809)
+  [  214.598439] CFI failure at kobj_attr_show+0x19/0x30 (target: throttle_reason_bool_show+0x0/0x50 [i915]; expected type: 0xc527b809)
+  [  214.598542] CFI failure at kobj_attr_show+0x19/0x30 (target: throttle_reason_bool_show+0x0/0x50 [i915]; expected type: 0xc527b809)
+
+With kCFI, indirect calls are validated against their expected type
+versus actual type and failures occur when the two types do not match.
+The ultimate issue is that these sysfs functions are expecting to be
+called via dev_attr_show() but they may also be called via
+kobj_attr_show(), as certain files are created under two different
+kobjects that have two different sysfs_ops in intel_gt_sysfs_register(),
+hence the warnings above. When accessing the gt_ files under
+/sys/devices/pci0000:00/0000:00:02.0/drm/card0, which are using the same
+sysfs functions, there are no violations, meaning the functions are
+being called with the proper type.
+
+To make everything work properly, adjust certain functions to match the
+type of the ->show() and ->store() members in 'struct kobj_attribute'.
+Add a macro to generate functions for that can be called via both
+dev_attr_{show,store}() or kobj_attr_{show,store}() so that they can be
+called through both kobject locations without violating kCFI and adjust
+the attribute groups to account for this.
+
+Link: https://github.com/ClangBuiltLinux/linux/issues/1716
+	Reviewed-by: Andi Shyti <andi.shyti@linux.intel.com>
+	Reviewed-by: Andrzej Hajda <andrzej.hajda@intel.com>
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Nathan Chancellor <nathan@kernel.org>
+	Signed-off-by: Andi Shyti <andi.shyti@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20221013205909.1282545-1-nathan@kernel.org
+(cherry picked from commit a8a4f0467d706fc22d286dfa973946e5944b793c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gt/intel_gt_sysfs.c
+#	drivers/gpu/drm/i915/gt/intel_gt_sysfs_pm.c
+diff --cc drivers/gpu/drm/i915/gt/intel_gt_sysfs.c
+index 9e4ebf53379b,9486dd3bed99..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_gt_sysfs.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt_sysfs.c
+@@@ -22,16 -22,9 +22,18 @@@ bool is_object_gt(struct kobject *kobj
+  	return !strncmp(kobj->name, "gt", 2);
+  }
+  
+++<<<<<<< HEAD
+ +static struct intel_gt *kobj_to_gt(struct kobject *kobj)
+ +{
+ +	return container_of(kobj, struct intel_gt, sysfs_gt);
+ +}
+ +
+ +struct intel_gt *intel_gt_sysfs_get_drvdata(struct device *dev,
+++=======
++ struct intel_gt *intel_gt_sysfs_get_drvdata(struct kobject *kobj,
+++>>>>>>> a8a4f0467d70 (drm/i915: Fix CFI violations in gt_sysfs)
+  					    const char *name)
+  {
+- 	struct kobject *kobj = &dev->kobj;
+- 
+  	/*
+  	 * We are interested at knowing from where the interface
+  	 * has been called, whether it's called from gt/ or from
+diff --cc drivers/gpu/drm/i915/gt/intel_gt_sysfs_pm.c
+index d09a0e845d09,2b5f05b31187..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_gt_sysfs_pm.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt_sysfs_pm.c
+@@@ -508,20 -464,20 +464,20 @@@ static ssize_t punit_req_freq_mhz_show(
+  
+  struct intel_gt_bool_throttle_attr {
+  	struct attribute attr;
+- 	ssize_t (*show)(struct device *dev, struct device_attribute *attr,
++ 	ssize_t (*show)(struct kobject *kobj, struct kobj_attribute *attr,
+  			char *buf);
+ -	i915_reg_t (*reg32)(struct intel_gt *gt);
+ +	i915_reg_t reg32;
+  	u32 mask;
+  };
+  
+- static ssize_t throttle_reason_bool_show(struct device *dev,
+- 					 struct device_attribute *attr,
++ static ssize_t throttle_reason_bool_show(struct kobject *kobj,
++ 					 struct kobj_attribute *attr,
+  					 char *buff)
+  {
+- 	struct intel_gt *gt = intel_gt_sysfs_get_drvdata(dev, attr->attr.name);
++ 	struct intel_gt *gt = intel_gt_sysfs_get_drvdata(kobj, attr->attr.name);
+  	struct intel_gt_bool_throttle_attr *t_attr =
+  				(struct intel_gt_bool_throttle_attr *) attr;
+ -	bool val = rps_read_mask_mmio(&gt->rps, t_attr->reg32(gt), t_attr->mask);
+ +	bool val = rps_read_mask_mmio(&gt->rps, t_attr->reg32, t_attr->mask);
+  
+  	return sysfs_emit(buff, "%u\n", val);
+  }
+@@@ -726,9 -682,38 +682,43 @@@ static const struct attribute *media_pe
+  	NULL
+  };
+  
+++<<<<<<< HEAD
+ +static int intel_sysfs_rps_init(struct intel_gt *gt, struct kobject *kobj,
+ +				const struct attribute * const *attrs)
+++=======
++ static ssize_t
++ default_min_freq_mhz_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+  {
++ 	struct intel_gt *gt = kobj_to_gt(kobj->parent);
++ 
++ 	return sysfs_emit(buf, "%u\n", gt->defaults.min_freq);
++ }
++ 
++ static struct kobj_attribute default_min_freq_mhz =
++ __ATTR(rps_min_freq_mhz, 0444, default_min_freq_mhz_show, NULL);
++ 
++ static ssize_t
++ default_max_freq_mhz_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
++ {
++ 	struct intel_gt *gt = kobj_to_gt(kobj->parent);
++ 
++ 	return sysfs_emit(buf, "%u\n", gt->defaults.max_freq);
++ }
++ 
++ static struct kobj_attribute default_max_freq_mhz =
++ __ATTR(rps_max_freq_mhz, 0444, default_max_freq_mhz_show, NULL);
++ 
++ static const struct attribute * const rps_defaults_attrs[] = {
++ 	&default_min_freq_mhz.attr,
++ 	&default_max_freq_mhz.attr,
++ 	NULL
++ };
++ 
++ static int intel_sysfs_rps_init(struct intel_gt *gt, struct kobject *kobj)
+++>>>>>>> a8a4f0467d70 (drm/i915: Fix CFI violations in gt_sysfs)
++ {
++ 	const struct attribute * const *attrs;
++ 	struct attribute *vlv_attr;
+  	int ret;
+  
+  	if (GRAPHICS_VER(gt->i915) < 6)
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt_sysfs.c
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_sysfs.h b/drivers/gpu/drm/i915/gt/intel_gt_sysfs.h
+index a99aa7e8b01a..6bee2c6a894d 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_sysfs.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_sysfs.h
+@@ -24,7 +24,7 @@ intel_gt_create_kobj(struct intel_gt *gt,
+ 
+ void intel_gt_sysfs_register(struct intel_gt *gt);
+ void intel_gt_sysfs_unregister(struct intel_gt *gt);
+-struct intel_gt *intel_gt_sysfs_get_drvdata(struct device *dev,
++struct intel_gt *intel_gt_sysfs_get_drvdata(struct kobject *kobj,
+ 					    const char *name);
+ 
+ #endif /* SYSFS_GT_H */
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt_sysfs_pm.c
