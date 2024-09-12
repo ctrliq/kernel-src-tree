@@ -1,0 +1,85 @@
+ceph: trigger to flush the buffer when making snapshot
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-534.el8
+commit-author Xiubo Li <xiubli@redhat.com>
+commit 2d12ad950b0c2a89d82f5d258309ad23aa70fc38
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-534.el8/2d12ad95.failed
+
+The 'i_wr_ref' is used to track the 'Fb' caps, while whenever the 'Fb'
+caps is took the kclient will always take the 'Fw' caps at the same
+time. That means it will always be a false check in __ceph_finish_cap_snap().
+
+When writing to buffer the kclient will take both 'Fb|Fw' caps and then
+write the contents to the buffer pages by increasing the 'i_wrbuffer_ref'
+and then just release both 'Fb|Fw'. This is different with the user
+space libcephfs, which will keep the 'Fb' being took and use 'i_wr_ref'
+instead of 'i_wrbuffer_ref' to track this until the buffer is flushed
+to Rados.
+
+We need to defer flushing the capsnap until the corresponding buffer
+pages are all flushed to Rados, and at the same time just trigger to
+flush the buffer pages immediately.
+
+Link: https://tracker.ceph.com/issues/48640
+Link: https://tracker.ceph.com/issues/59343
+	Signed-off-by: Xiubo Li <xiubli@redhat.com>
+	Reviewed-by: Milind Changire <mchangir@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 2d12ad950b0c2a89d82f5d258309ad23aa70fc38)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/snap.c
+diff --cc fs/ceph/snap.c
+index 3bc94be79e21,343d738448dc..000000000000
+--- a/fs/ceph/snap.c
++++ b/fs/ceph/snap.c
+@@@ -641,13 -675,17 +641,27 @@@ int __ceph_finish_cap_snap(struct ceph_
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Fb cap still in use, delay it */
+ +	if (ci->i_wb_ref) {
+ +		dout("finish_cap_snap %p cap_snap %p snapc %p %llu %s s=%llu "
+ +		     "used WRBUFFER, delaying\n", inode, capsnap,
+ +		     capsnap->context, capsnap->context->seq,
+ +		     ceph_cap_string(capsnap->dirty), capsnap->size);
+ +		capsnap->writing = 1;
+++=======
++ 	/*
++ 	 * Defer flushing the capsnap if the dirty buffer not flushed yet.
++ 	 * And trigger to flush the buffer immediately.
++ 	 */
++ 	if (ci->i_wrbuffer_ref) {
++ 		dout("%s %p %llx.%llx cap_snap %p snapc %p %llu %s s=%llu "
++ 		     "used WRBUFFER, delaying\n", __func__, inode,
++ 		     ceph_vinop(inode), capsnap, capsnap->context,
++ 		     capsnap->context->seq, ceph_cap_string(capsnap->dirty),
++ 		     capsnap->size);
++ 		ceph_queue_writeback(inode);
+++>>>>>>> 2d12ad950b0c (ceph: trigger to flush the buffer when making snapshot)
+  		return 0;
+  	}
+  
+diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
+index 1cb2b19e9e97..79903bb5d648 100644
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -3096,6 +3096,12 @@ static void __ceph_put_cap_refs(struct ceph_inode_info *ci, int had,
+ 	}
+ 	if (had & CEPH_CAP_FILE_WR) {
+ 		if (--ci->i_wr_ref == 0) {
++			/*
++			 * The Fb caps will always be took and released
++			 * together with the Fw caps.
++			 */
++			WARN_ON_ONCE(ci->i_wb_ref);
++
+ 			last++;
+ 			check_flushsnaps = true;
+ 			if (ci->i_wrbuffer_ref_head == 0 &&
+* Unmerged path fs/ceph/snap.c
