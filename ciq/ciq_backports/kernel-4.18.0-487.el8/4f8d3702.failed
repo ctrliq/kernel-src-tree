@@ -1,0 +1,159 @@
+fuse: add "expire only" mode to FUSE_NOTIFY_INVAL_ENTRY
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-487.el8
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 4f8d37020e1fd0bf6ee9381ba918135ef3712efd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-487.el8/4f8d3702.failed
+
+Add a flag to entry expiration that lets the filesystem expire a dentry
+without kicking it out from the cache immediately.
+
+This makes a difference for overmounted dentries, where plain invalidation
+would detach all submounts before dropping the dentry from the cache.  If
+only expiry is set on the dentry, then any overmounts are left alone and
+until ->d_revalidate() is called.
+
+Note: ->d_revalidate() is not called for the case of following a submount,
+so invalidation will only be triggered for the non-overmounted case.  The
+dentry could also be mounted in a different mount instance, in which case
+any submounts will still be detached.
+
+	Suggested-by: Jakob Blomer <jblomer@cern.ch>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 4f8d37020e1fd0bf6ee9381ba918135ef3712efd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/fuse.h
+diff --cc include/uapi/linux/fuse.h
+index 0365282961e0,39cfb343faa8..000000000000
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@@ -179,6 -179,27 +179,30 @@@
+   *  7.33
+   *  - add FUSE_HANDLE_KILLPRIV_V2, FUSE_WRITE_KILL_SUIDGID, FATTR_KILL_SUIDGID
+   *  - add FUSE_OPEN_KILL_SUIDGID
+++<<<<<<< HEAD
+++=======
++  *  - extend fuse_setxattr_in, add FUSE_SETXATTR_EXT
++  *  - add FUSE_SETXATTR_ACL_KILL_SGID
++  *
++  *  7.34
++  *  - add FUSE_SYNCFS
++  *
++  *  7.35
++  *  - add FOPEN_NOFLUSH
++  *
++  *  7.36
++  *  - extend fuse_init_in with reserved fields, add FUSE_INIT_EXT init flag
++  *  - add flags2 to fuse_init_in and fuse_init_out
++  *  - add FUSE_SECURITY_CTX init flag
++  *  - add security context to create, mkdir, symlink, and mknod requests
++  *  - add FUSE_HAS_INODE_DAX, FUSE_ATTR_DAX
++  *
++  *  7.37
++  *  - add FUSE_TMPFILE
++  *
++  *  7.38
++  *  - add FUSE_EXPIRE_ONLY flag to fuse_notify_inval_entry
+++>>>>>>> 4f8d37020e1f (fuse: add "expire only" mode to FUSE_NOTIFY_INVAL_ENTRY)
+   */
+  
+  #ifndef _LINUX_FUSE_H
+@@@ -214,7 -235,7 +238,11 @@@
+  #define FUSE_KERNEL_VERSION 7
+  
+  /** Minor version number of this interface */
+++<<<<<<< HEAD
+ +#define FUSE_KERNEL_MINOR_VERSION 33
+++=======
++ #define FUSE_KERNEL_MINOR_VERSION 38
+++>>>>>>> 4f8d37020e1f (fuse: add "expire only" mode to FUSE_NOTIFY_INVAL_ENTRY)
+  
+  /** The node ID of the root inode */
+  #define FUSE_ROOT_ID 1
+@@@ -449,6 -488,18 +477,21 @@@ struct fuse_file_lock 
+   */
+  #define FUSE_OPEN_KILL_SUIDGID	(1 << 0)
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * setxattr flags
++  * FUSE_SETXATTR_ACL_KILL_SGID: Clear SGID when system.posix_acl_access is set
++  */
++ #define FUSE_SETXATTR_ACL_KILL_SGID	(1 << 0)
++ 
++ /**
++  * notify_inval_entry flags
++  * FUSE_EXPIRE_ONLY
++  */
++ #define FUSE_EXPIRE_ONLY		(1 << 0)
++ 
+++>>>>>>> 4f8d37020e1f (fuse: add "expire only" mode to FUSE_NOTIFY_INVAL_ENTRY)
+  enum fuse_opcode {
+  	FUSE_LOOKUP		= 1,
+  	FUSE_FORGET		= 2,  /* no reply */
+diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
+index df00e84f1240..3ff292b12690 100644
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@ -1491,7 +1491,7 @@ static int fuse_notify_inval_entry(struct fuse_conn *fc, unsigned int size,
+ 	buf[outarg.namelen] = 0;
+ 
+ 	down_read(&fc->killsb);
+-	err = fuse_reverse_inval_entry(fc, outarg.parent, 0, &name);
++	err = fuse_reverse_inval_entry(fc, outarg.parent, 0, &name, outarg.flags);
+ 	up_read(&fc->killsb);
+ 	kfree(buf);
+ 	return err;
+@@ -1539,7 +1539,7 @@ static int fuse_notify_delete(struct fuse_conn *fc, unsigned int size,
+ 	buf[outarg.namelen] = 0;
+ 
+ 	down_read(&fc->killsb);
+-	err = fuse_reverse_inval_entry(fc, outarg.parent, outarg.child, &name);
++	err = fuse_reverse_inval_entry(fc, outarg.parent, outarg.child, &name, 0);
+ 	up_read(&fc->killsb);
+ 	kfree(buf);
+ 	return err;
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index fdb15708f91e..2524a112bb0a 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -1096,7 +1096,7 @@ int fuse_update_attributes(struct inode *inode, struct file *file)
+ }
+ 
+ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
+-			     u64 child_nodeid, struct qstr *name)
++			     u64 child_nodeid, struct qstr *name, u32 flags)
+ {
+ 	int err = -ENOTDIR;
+ 	struct inode *parent;
+@@ -1123,7 +1123,9 @@ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
+ 		goto unlock;
+ 
+ 	fuse_dir_changed(parent);
+-	fuse_invalidate_entry(entry);
++	if (!(flags & FUSE_EXPIRE_ONLY))
++		d_invalidate(entry);
++	fuse_invalidate_entry_cache(entry);
+ 
+ 	if (child_nodeid != 0 && d_really_is_positive(entry)) {
+ 		inode_lock(d_inode(entry));
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 7fd10c7d11ed..32392766d4a5 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -1134,7 +1134,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
+  * then the dentry is unhashed (d_delete()).
+  */
+ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
+-			     u64 child_nodeid, struct qstr *name);
++			     u64 child_nodeid, struct qstr *name, u32 flags);
+ 
+ int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
+ 		 bool isdir);
+* Unmerged path include/uapi/linux/fuse.h
