@@ -1,0 +1,199 @@
+x86/resctrl: Fix task CLOSID/RMID update race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Peter Newman <peternewman@google.com>
+commit fe1f0714385fbcf76b0cbceb02b7277d842014fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/fe1f0714.failed
+
+When the user moves a running task to a new rdtgroup using the task's
+file interface or by deleting its rdtgroup, the resulting change in
+CLOSID/RMID must be immediately propagated to the PQR_ASSOC MSR on the
+task(s) CPUs.
+
+x86 allows reordering loads with prior stores, so if the task starts
+running between a task_curr() check that the CPU hoisted before the
+stores in the CLOSID/RMID update then it can start running with the old
+CLOSID/RMID until it is switched again because __rdtgroup_move_task()
+failed to determine that it needs to be interrupted to obtain the new
+CLOSID/RMID.
+
+Refer to the diagram below:
+
+CPU 0                                   CPU 1
+-----                                   -----
+__rdtgroup_move_task():
+  curr <- t1->cpu->rq->curr
+                                        __schedule():
+                                          rq->curr <- t1
+                                        resctrl_sched_in():
+                                          t1->{closid,rmid} -> {1,1}
+  t1->{closid,rmid} <- {2,2}
+  if (curr == t1) // false
+   IPI(t1->cpu)
+
+A similar race impacts rdt_move_group_tasks(), which updates tasks in a
+deleted rdtgroup.
+
+In both cases, use smp_mb() to order the task_struct::{closid,rmid}
+stores before the loads in task_curr().  In particular, in the
+rdt_move_group_tasks() case, simply execute an smp_mb() on every
+iteration with a matching task.
+
+It is possible to use a single smp_mb() in rdt_move_group_tasks(), but
+this would require two passes and a means of remembering which
+task_structs were updated in the first loop. However, benchmarking
+results below showed too little performance impact in the simple
+approach to justify implementing the two-pass approach.
+
+Times below were collected using `perf stat` to measure the time to
+remove a group containing a 1600-task, parallel workload.
+
+CPU: Intel(R) Xeon(R) Platinum P-8136 CPU @ 2.00GHz (112 threads)
+
+  # mkdir /sys/fs/resctrl/test
+  # echo $$ > /sys/fs/resctrl/test/tasks
+  # perf bench sched messaging -g 40 -l 100000
+
+task-clock time ranges collected using:
+
+  # perf stat rmdir /sys/fs/resctrl/test
+
+Baseline:                     1.54 - 1.60 ms
+smp_mb() every matching task: 1.57 - 1.67 ms
+
+  [ bp: Massage commit message. ]
+
+Fixes: ae28d1aae48a ("x86/resctrl: Use an IPI instead of task_work_add() to update PQR_ASSOC MSR")
+Fixes: 0efc89be9471 ("x86/intel_rdt: Update task closid immediately on CPU in rmdir and unmount")
+	Signed-off-by: Peter Newman <peternewman@google.com>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Reviewed-by: Babu Moger <babu.moger@amd.com>
+	Cc: <stable@kernel.org>
+Link: https://lore.kernel.org/r/20221220161123.432120-1-peternewman@google.com
+(cherry picked from commit fe1f0714385fbcf76b0cbceb02b7277d842014fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/rdtgroup.c
+diff --cc arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index e5f7b979a288,5993da21d822..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@@ -573,49 -549,51 +573,70 @@@ out
+  static int __rdtgroup_move_task(struct task_struct *tsk,
+  				struct rdtgroup *rdtgrp)
+  {
+ -	/* If the task is already in rdtgrp, no need to move the task. */
+ -	if ((rdtgrp->type == RDTCTRL_GROUP && tsk->closid == rdtgrp->closid &&
+ -	     tsk->rmid == rdtgrp->mon.rmid) ||
+ -	    (rdtgrp->type == RDTMON_GROUP && tsk->rmid == rdtgrp->mon.rmid &&
+ -	     tsk->closid == rdtgrp->mon.parent->closid))
+ -		return 0;
+ +	struct task_move_callback *callback;
+ +	int ret;
+ +
+ +	callback = kzalloc(sizeof(*callback), GFP_KERNEL);
+ +	if (!callback)
+ +		return -ENOMEM;
+ +	callback->work.func = move_myself;
+ +	callback->rdtgrp = rdtgrp;
+  
+  	/*
+ -	 * Set the task's closid/rmid before the PQR_ASSOC MSR can be
+ -	 * updated by them.
+ -	 *
+ -	 * For ctrl_mon groups, move both closid and rmid.
+ -	 * For monitor groups, can move the tasks only from
+ -	 * their parent CTRL group.
+ +	 * Take a refcount, so rdtgrp cannot be freed before the
+ +	 * callback has been invoked.
+  	 */
+ -
+ -	if (rdtgrp->type == RDTCTRL_GROUP) {
+ -		WRITE_ONCE(tsk->closid, rdtgrp->closid);
+ -		WRITE_ONCE(tsk->rmid, rdtgrp->mon.rmid);
+ -	} else if (rdtgrp->type == RDTMON_GROUP) {
+ -		if (rdtgrp->mon.parent->closid == tsk->closid) {
+ -			WRITE_ONCE(tsk->rmid, rdtgrp->mon.rmid);
+ -		} else {
+ -			rdt_last_cmd_puts("Can't move task to different control group\n");
+ -			return -EINVAL;
+ +	atomic_inc(&rdtgrp->waitcount);
+ +	ret = task_work_add(tsk, &callback->work, true);
+ +	if (ret) {
+ +		/*
+ +		 * Task is exiting. Drop the refcount and free the callback.
+ +		 * No need to check the refcount as the group cannot be
+ +		 * deleted before the write function unlocks rdtgroup_mutex.
+ +		 */
+ +		atomic_dec(&rdtgrp->waitcount);
+ +		kfree(callback);
+ +		rdt_last_cmd_puts("Task exited\n");
+ +	} else {
+ +		/*
+ +		 * For ctrl_mon groups move both closid and rmid.
+ +		 * For monitor groups, can move the tasks only from
+ +		 * their parent CTRL group.
+ +		 */
+ +		if (rdtgrp->type == RDTCTRL_GROUP) {
+ +			tsk->closid = rdtgrp->closid;
+ +			tsk->rmid = rdtgrp->mon.rmid;
+ +		} else if (rdtgrp->type == RDTMON_GROUP) {
+ +			if (rdtgrp->mon.parent->closid == tsk->closid) {
+ +				tsk->rmid = rdtgrp->mon.rmid;
+ +			} else {
+ +				rdt_last_cmd_puts("Can't move task to different control group\n");
+ +				ret = -EINVAL;
+ +			}
+  		}
+  	}
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ 
++ 	/*
++ 	 * Ensure the task's closid and rmid are written before determining if
++ 	 * the task is current that will decide if it will be interrupted.
++ 	 * This pairs with the full barrier between the rq->curr update and
++ 	 * resctrl_sched_in() during context switch.
++ 	 */
++ 	smp_mb();
++ 
++ 	/*
++ 	 * By now, the task's closid and rmid are set. If the task is current
++ 	 * on a CPU, the PQR_ASSOC MSR needs to be updated to make the resource
++ 	 * group go into effect. If the task is not current, the MSR will be
++ 	 * updated when the task is scheduled in.
++ 	 */
++ 	update_task_closid_rmid(tsk);
++ 
++ 	return 0;
+++>>>>>>> fe1f0714385f (x86/resctrl: Fix task CLOSID/RMID update race)
+  }
+  
+  static bool is_closid_match(struct task_struct *t, struct rdtgroup *r)
+@@@ -2346,9 -2400,17 +2367,17 @@@ static void rdt_move_group_tasks(struc
+  	for_each_process_thread(p, t) {
+  		if (!from || is_closid_match(t, from) ||
+  		    is_rmid_match(t, from)) {
+ -			WRITE_ONCE(t->closid, to->closid);
+ -			WRITE_ONCE(t->rmid, to->mon.rmid);
+ +			t->closid = to->closid;
+ +			t->rmid = to->mon.rmid;
+  
++ 			/*
++ 			 * Order the closid/rmid stores above before the loads
++ 			 * in task_curr(). This pairs with the full barrier
++ 			 * between the rq->curr update and resctrl_sched_in()
++ 			 * during context switch.
++ 			 */
++ 			smp_mb();
++ 
+  			/*
+  			 * If the task is on a CPU, set the CPU in the mask.
+  			 * The detection is inaccurate as tasks might move or
+* Unmerged path arch/x86/kernel/cpu/resctrl/rdtgroup.c
