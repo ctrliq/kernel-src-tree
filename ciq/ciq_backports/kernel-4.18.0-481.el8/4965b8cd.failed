@@ -1,0 +1,143 @@
+firmware_loader: fix memory leak for paged buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Prateek Sood <prsood@codeaurora.org>
+commit 4965b8cd1bc1ffb017e5c58e622da82b55e49414
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/4965b8cd.failed
+
+vfree() is being called on paged buffer allocated
+using alloc_page() and mapped using vmap().
+
+Freeing of pages in vfree() relies on nr_pages of
+struct vm_struct. vmap() does not update nr_pages.
+It can lead to memory leaks.
+
+Fixes: ddaf29fd9bb6 ("firmware: Free temporary page table after vmapping")
+	Signed-off-by: Prateek Sood <prsood@codeaurora.org>
+	Reviewed-by: Takashi Iwai <tiwai@suse.de>
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/1597957070-27185-1-git-send-email-prsood@codeaurora.org
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 4965b8cd1bc1ffb017e5c58e622da82b55e49414)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/firmware_loader/firmware.h
+#	drivers/base/firmware_loader/main.c
+diff --cc drivers/base/firmware_loader/firmware.h
+index b0f0b5426f02,d08efc77cf16..000000000000
+--- a/drivers/base/firmware_loader/firmware.h
++++ b/drivers/base/firmware_loader/firmware.h
+@@@ -138,13 -136,18 +138,24 @@@ static inline void fw_state_done(struc
+  	__fw_state_set(fw_priv, FW_STATUS_DONE);
+  }
+  
+ -int assign_fw(struct firmware *fw, struct device *device, u32 opt_flags);
+ +int assign_fw(struct firmware *fw, struct device *device,
+ +	      enum fw_opt opt_flags);
+  
+ -#ifdef CONFIG_FW_LOADER_PAGED_BUF
+ +#ifdef CONFIG_FW_LOADER_USER_HELPER
+  void fw_free_paged_buf(struct fw_priv *fw_priv);
+++<<<<<<< HEAD
+ +#else
+ +static inline void fw_free_paged_buf(struct fw_priv *fw_priv) {}
+++=======
++ int fw_grow_paged_buf(struct fw_priv *fw_priv, int pages_needed);
++ int fw_map_paged_buf(struct fw_priv *fw_priv);
++ bool fw_is_paged_buf(struct fw_priv *fw_priv);
++ #else
++ static inline void fw_free_paged_buf(struct fw_priv *fw_priv) {}
++ static inline int fw_grow_paged_buf(struct fw_priv *fw_priv, int pages_needed) { return -ENXIO; }
++ static inline int fw_map_paged_buf(struct fw_priv *fw_priv) { return -ENXIO; }
++ static inline bool fw_is_paged_buf(struct fw_priv *fw_priv) { return false; }
+++>>>>>>> 4965b8cd1bc1 (firmware_loader: fix memory leak for paged buffer)
+  #endif
+  
+  #endif /* __FIRMWARE_LOADER_H */
+diff --cc drivers/base/firmware_loader/main.c
+index faedc89d3df3,63b9714a0154..000000000000
+--- a/drivers/base/firmware_loader/main.c
++++ b/drivers/base/firmware_loader/main.c
+@@@ -283,7 -269,12 +285,16 @@@ static void free_fw_priv(struct fw_pri
+  		spin_unlock(&fwc->lock);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_FW_LOADER_USER_HELPER
+++=======
++ #ifdef CONFIG_FW_LOADER_PAGED_BUF
++ bool fw_is_paged_buf(struct fw_priv *fw_priv)
++ {
++ 	return fw_priv->is_paged_buf;
++ }
++ 
+++>>>>>>> 4965b8cd1bc1 (firmware_loader: fix memory leak for paged buffer)
+  void fw_free_paged_buf(struct fw_priv *fw_priv)
+  {
+  	int i;
+@@@ -297,8 -290,54 +310,59 @@@
+  	fw_priv->pages = NULL;
+  	fw_priv->page_array_size = 0;
+  	fw_priv->nr_pages = 0;
+++<<<<<<< HEAD
+ +	fw_priv->data = NULL;
+ +	fw_priv->size = 0;
+++=======
++ }
++ 
++ int fw_grow_paged_buf(struct fw_priv *fw_priv, int pages_needed)
++ {
++ 	/* If the array of pages is too small, grow it */
++ 	if (fw_priv->page_array_size < pages_needed) {
++ 		int new_array_size = max(pages_needed,
++ 					 fw_priv->page_array_size * 2);
++ 		struct page **new_pages;
++ 
++ 		new_pages = kvmalloc_array(new_array_size, sizeof(void *),
++ 					   GFP_KERNEL);
++ 		if (!new_pages)
++ 			return -ENOMEM;
++ 		memcpy(new_pages, fw_priv->pages,
++ 		       fw_priv->page_array_size * sizeof(void *));
++ 		memset(&new_pages[fw_priv->page_array_size], 0, sizeof(void *) *
++ 		       (new_array_size - fw_priv->page_array_size));
++ 		kvfree(fw_priv->pages);
++ 		fw_priv->pages = new_pages;
++ 		fw_priv->page_array_size = new_array_size;
++ 	}
++ 
++ 	while (fw_priv->nr_pages < pages_needed) {
++ 		fw_priv->pages[fw_priv->nr_pages] =
++ 			alloc_page(GFP_KERNEL | __GFP_HIGHMEM);
++ 
++ 		if (!fw_priv->pages[fw_priv->nr_pages])
++ 			return -ENOMEM;
++ 		fw_priv->nr_pages++;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int fw_map_paged_buf(struct fw_priv *fw_priv)
++ {
++ 	/* one pages buffer should be mapped/unmapped only once */
++ 	if (!fw_priv->pages)
++ 		return 0;
++ 
++ 	vunmap(fw_priv->data);
++ 	fw_priv->data = vmap(fw_priv->pages, fw_priv->nr_pages, 0,
++ 			     PAGE_KERNEL_RO);
++ 	if (!fw_priv->data)
++ 		return -ENOMEM;
++ 
++ 	return 0;
+++>>>>>>> 4965b8cd1bc1 (firmware_loader: fix memory leak for paged buffer)
+  }
+  #endif
+  
+* Unmerged path drivers/base/firmware_loader/firmware.h
+* Unmerged path drivers/base/firmware_loader/main.c
