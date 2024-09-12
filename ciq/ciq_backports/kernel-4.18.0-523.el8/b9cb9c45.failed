@@ -1,0 +1,109 @@
+x86/sev: Check IOBM for IOIO exceptions from user-space
+
+jira LE-1907
+cve CVE-2023-46813
+Rebuild_History Non-Buildable kernel-4.18.0-523.el8
+commit-author Joerg Roedel <jroedel@suse.de>
+commit b9cb9c45583b911e0db71d09caa6b56469eb2bdf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-523.el8/b9cb9c45.failed
+
+Check the IO permission bitmap (if present) before emulating IOIO #VC
+exceptions for user-space. These permissions are checked by hardware
+already before the #VC is raised, but due to the VC-handler decoding
+race it needs to be checked again in software.
+
+Fixes: 25189d08e516 ("x86/sev-es: Add support for handling IOIO exceptions")
+	Reported-by: Tom Dohrmann <erbse.13@gmx.de>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Tested-by: Tom Dohrmann <erbse.13@gmx.de>
+	Cc: <stable@kernel.org>
+(cherry picked from commit b9cb9c45583b911e0db71d09caa6b56469eb2bdf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/sev-shared.c
+diff --cc arch/x86/kernel/sev-shared.c
+index 48e45bc05d1c,bcd77c48be0a..000000000000
+--- a/arch/x86/kernel/sev-shared.c
++++ b/arch/x86/kernel/sev-shared.c
+@@@ -682,14 -682,14 +685,22 @@@ static enum es_result vc_ioio_exitinfo(
+  	case 0xe4:
+  	case 0xe5:
+  		*exitinfo |= IOIO_TYPE_IN;
+++<<<<<<< HEAD
+ +		*exitinfo |= (u64)insn->immediate.value << 16;
+++=======
++ 		port	   = (u8)insn->immediate.value & 0xffff;
+++>>>>>>> b9cb9c45583b (x86/sev: Check IOBM for IOIO exceptions from user-space)
+  		break;
+  
+  	/* OUT immediate opcodes */
+  	case 0xe6:
+  	case 0xe7:
+  		*exitinfo |= IOIO_TYPE_OUT;
+++<<<<<<< HEAD
+ +		*exitinfo |= (u64)insn->immediate.value << 16;
+++=======
++ 		port	   = (u8)insn->immediate.value & 0xffff;
+++>>>>>>> b9cb9c45583b (x86/sev: Check IOBM for IOIO exceptions from user-space)
+  		break;
+  
+  	/* IN register opcodes */
+diff --git a/arch/x86/boot/compressed/sev.c b/arch/x86/boot/compressed/sev.c
+index 7a0819f371c9..7aba1de63188 100644
+--- a/arch/x86/boot/compressed/sev.c
++++ b/arch/x86/boot/compressed/sev.c
+@@ -104,6 +104,11 @@ static enum es_result vc_read_mem(struct es_em_ctxt *ctxt,
+ 	return ES_OK;
+ }
+ 
++static enum es_result vc_ioio_check(struct es_em_ctxt *ctxt, u16 port, size_t size)
++{
++	return ES_OK;
++}
++
+ #undef __init
+ #undef __pa
+ #define __init
+* Unmerged path arch/x86/kernel/sev-shared.c
+diff --git a/arch/x86/kernel/sev.c b/arch/x86/kernel/sev.c
+index 9604d66c2cb8..0acd41208d4f 100644
+--- a/arch/x86/kernel/sev.c
++++ b/arch/x86/kernel/sev.c
+@@ -511,6 +511,33 @@ static enum es_result vc_slow_virt_to_phys(struct ghcb *ghcb, struct es_em_ctxt
+ 	return ES_OK;
+ }
+ 
++static enum es_result vc_ioio_check(struct es_em_ctxt *ctxt, u16 port, size_t size)
++{
++	BUG_ON(size > 4);
++
++	if (user_mode(ctxt->regs)) {
++		struct thread_struct *t = &current->thread;
++		struct io_bitmap *iobm = t->io_bitmap;
++		size_t idx;
++
++		if (!iobm)
++			goto fault;
++
++		for (idx = port; idx < port + size; ++idx) {
++			if (test_bit(idx, iobm->bitmap))
++				goto fault;
++		}
++	}
++
++	return ES_OK;
++
++fault:
++	ctxt->fi.vector = X86_TRAP_GP;
++	ctxt->fi.error_code = 0;
++
++	return ES_EXCEPTION;
++}
++
+ /* Include code shared with pre-decompression boot stage */
+ #include "sev-shared.c"
+ 
