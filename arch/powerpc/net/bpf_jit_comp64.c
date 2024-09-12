@@ -76,6 +76,9 @@ void bpf_jit_build_prologue(u32 *image, struct codegen_context *ctx)
 {
 	int i;
 
+	if (__is_defined(PPC64_ELF_ABI_v2))
+		PPC_BPF_LL(_R2, _R13, offsetof(struct paca_struct, kernel_toc));
+
 	/*
 	 * Initialize tail_call_cnt if we do tail calls.
 	 * Otherwise, put in NOPs so that it can be skipped when we are
@@ -89,8 +92,6 @@ void bpf_jit_build_prologue(u32 *image, struct codegen_context *ctx)
 		EMIT(PPC_RAW_NOP());
 		EMIT(PPC_RAW_NOP());
 	}
-
-#define BPF_TAILCALL_PROLOGUE_SIZE	8
 
 	if (bpf_has_stack_frame(ctx)) {
 		/*
@@ -220,6 +221,10 @@ static void bpf_jit_emit_tail_call(u32 *image, struct codegen_context *ctx, u32 
 	 */
 	int b2p_bpf_array = b2p[BPF_REG_2];
 	int b2p_index = b2p[BPF_REG_3];
+	int bpf_tailcall_prologue_size = 8;
+
+	if (__is_defined(PPC64_ELF_ABI_v2))
+		bpf_tailcall_prologue_size += 4; /* skip past the toc load */
 
 	/*
 	 * if (index >= array->map.max_entries)
@@ -258,13 +263,8 @@ static void bpf_jit_emit_tail_call(u32 *image, struct codegen_context *ctx, u32 
 
 	/* goto *(prog->bpf_func + prologue_size); */
 	PPC_BPF_LL(b2p[TMP_REG_1], b2p[TMP_REG_1], offsetof(struct bpf_prog, bpf_func));
-#ifdef PPC64_ELF_ABI_v1
-	/* skip past the function descriptor */
 	EMIT(PPC_RAW_ADDI(b2p[TMP_REG_1], b2p[TMP_REG_1],
-			FUNCTION_DESCR_SIZE + BPF_TAILCALL_PROLOGUE_SIZE));
-#else
-	EMIT(PPC_RAW_ADDI(b2p[TMP_REG_1], b2p[TMP_REG_1], BPF_TAILCALL_PROLOGUE_SIZE));
-#endif
+			FUNCTION_DESCR_SIZE + bpf_tailcall_prologue_size));
 	EMIT(PPC_RAW_MTCTR(b2p[TMP_REG_1]));
 
 	/* tear down stack, restore NVRs, ... */
