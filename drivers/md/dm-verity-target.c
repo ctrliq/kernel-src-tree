@@ -482,8 +482,8 @@ static int verity_recheck_copy(struct dm_verity *v, struct dm_verity_io *io,
 	return 0;
 }
 
-static int verity_recheck(struct dm_verity *v, struct dm_verity_io *io,
-			  struct bvec_iter start, sector_t cur_block)
+static noinline int verity_recheck(struct dm_verity *v, struct dm_verity_io *io,
+				   struct bvec_iter start, sector_t cur_block)
 {
 	struct page *page;
 	void *buffer;
@@ -494,7 +494,8 @@ static int verity_recheck(struct dm_verity *v, struct dm_verity_io *io,
 	page = mempool_alloc(&v->recheck_pool, GFP_NOIO);
 	buffer = page_to_virt(page);
 
-	io_req.bi_opf = REQ_OP_READ;
+	io_req.bi_op = REQ_OP_READ;
+	io_req.bi_op_flags = 0;
 	io_req.mem.type = DM_IO_KMEM;
 	io_req.mem.ptr.addr = buffer;
 	io_req.notify.fn = NULL;
