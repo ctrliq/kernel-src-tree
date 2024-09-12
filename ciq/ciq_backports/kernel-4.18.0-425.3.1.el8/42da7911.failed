@@ -1,0 +1,212 @@
+PCI: vmd: Assign a number to each VMD controller
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Chunguang Xu <brookxu@tencent.com>
+commit 42da7911b83a462373c2d093a587d052f02211b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/42da7911.failed
+
+If the system has multiple VMD controllers, the driver does not assign
+a number to each controller, so when analyzing the interrupt through
+/proc/interrupts, the names of all controllers are the same, which is
+not very convenient for problem analysis. Here, try to assign a number
+to each VMD controller.
+
+Link: https://lore.kernel.org/r/1631884404-24141-1-git-send-email-brookxu.cn@gmail.com
+	Signed-off-by: Chunguang Xu <brookxu@tencent.com>
+	Signed-off-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+	Reviewed-by: Jon Derrick <jonathan.derrick@intel.com>
+	Reviewed-by: Krzysztof Wilczyński <kw@linux.com>
+(cherry picked from commit 42da7911b83a462373c2d093a587d052f02211b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/controller/vmd.c
+diff --cc drivers/pci/controller/vmd.c
+index b16dbfce2e2e,1b3e94a96414..000000000000
+--- a/drivers/pci/controller/vmd.c
++++ b/drivers/pci/controller/vmd.c
+@@@ -55,8 -55,23 +55,10 @@@ enum vmd_features 
+  	 * vendor-specific capability space
+  	 */
+  	VMD_FEAT_HAS_MEMBAR_SHADOW_VSCAP	= (1 << 2),
+ -
+ -	/*
+ -	 * Device may use MSI-X vector 0 for software triggering and will not
+ -	 * be used for MSI remapping
+ -	 */
+ -	VMD_FEAT_OFFSET_FIRST_VECTOR		= (1 << 3),
+ -
+ -	/*
+ -	 * Device can bypass remapping MSI-X transactions into its MSI-X table,
+ -	 * avoiding the requirement of a VMD MSI domain for child device
+ -	 * interrupt handling.
+ -	 */
+ -	VMD_FEAT_CAN_BYPASS_MSI_REMAP		= (1 << 4),
+  };
+  
++ static DEFINE_IDA(vmd_instance_ida);
++ 
+  /*
+   * Lock for manipulating VMD IRQ lists.
+   */
+@@@ -107,6 -121,9 +109,12 @@@ struct vmd_dev 
+  	struct irq_domain	*irq_domain;
+  	struct pci_bus		*bus;
+  	u8			busn_start;
+++<<<<<<< HEAD
+++=======
++ 	u8			first_vec;
++ 	char			*name;
++ 	int			instance;
+++>>>>>>> 42da7911b83a (PCI: vmd: Assign a number to each VMD controller)
+  };
+  
+  static inline struct vmd_dev *vmd_from_bus(struct pci_bus *bus)
+@@@ -543,6 -613,55 +551,58 @@@ static int vmd_get_bus_number_start(str
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static irqreturn_t vmd_irq(int irq, void *data)
++ {
++ 	struct vmd_irq_list *irqs = data;
++ 	struct vmd_irq *vmdirq;
++ 	int idx;
++ 
++ 	idx = srcu_read_lock(&irqs->srcu);
++ 	list_for_each_entry_rcu(vmdirq, &irqs->irq_list, node)
++ 		generic_handle_irq(vmdirq->virq);
++ 	srcu_read_unlock(&irqs->srcu, idx);
++ 
++ 	return IRQ_HANDLED;
++ }
++ 
++ static int vmd_alloc_irqs(struct vmd_dev *vmd)
++ {
++ 	struct pci_dev *dev = vmd->dev;
++ 	int i, err;
++ 
++ 	vmd->msix_count = pci_msix_vec_count(dev);
++ 	if (vmd->msix_count < 0)
++ 		return -ENODEV;
++ 
++ 	vmd->msix_count = pci_alloc_irq_vectors(dev, vmd->first_vec + 1,
++ 						vmd->msix_count, PCI_IRQ_MSIX);
++ 	if (vmd->msix_count < 0)
++ 		return vmd->msix_count;
++ 
++ 	vmd->irqs = devm_kcalloc(&dev->dev, vmd->msix_count, sizeof(*vmd->irqs),
++ 				 GFP_KERNEL);
++ 	if (!vmd->irqs)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < vmd->msix_count; i++) {
++ 		err = init_srcu_struct(&vmd->irqs[i].srcu);
++ 		if (err)
++ 			return err;
++ 
++ 		INIT_LIST_HEAD(&vmd->irqs[i].irq_list);
++ 		err = devm_request_irq(&dev->dev, pci_irq_vector(dev, i),
++ 				       vmd_irq, IRQF_NO_THREAD,
++ 				       vmd->name, &vmd->irqs[i]);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 42da7911b83a (PCI: vmd: Assign a number to each VMD controller)
+  static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
+  {
+  	struct pci_sysdata *sd = &vmd->sysdata;
+@@@ -734,49 -860,19 +806,51 @@@ static int vmd_probe(struct pci_dev *de
+  
+  	pci_set_master(dev);
+  	if (dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(64)) &&
+- 	    dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(32)))
+- 		return -ENODEV;
++ 	    dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(32))) {
++ 		err = -ENODEV;
++ 		goto out_release_instance;
++ 	}
+  
+ -	if (features & VMD_FEAT_OFFSET_FIRST_VECTOR)
+ -		vmd->first_vec = 1;
+ +	vmd->msix_count = pci_msix_vec_count(dev);
+ +	if (vmd->msix_count < 0)
+ +		return -ENODEV;
+ +
+ +	vmd->msix_count = pci_alloc_irq_vectors(dev, 1, vmd->msix_count,
+ +					PCI_IRQ_MSIX);
+ +	if (vmd->msix_count < 0)
+ +		return vmd->msix_count;
+ +
+ +	vmd->irqs = devm_kcalloc(&dev->dev, vmd->msix_count, sizeof(*vmd->irqs),
+ +				 GFP_KERNEL);
+ +	if (!vmd->irqs)
+ +		return -ENOMEM;
+ +
+ +	for (i = 0; i < vmd->msix_count; i++) {
+ +		vmd->irqs[i] = devm_kzalloc(&dev->dev, sizeof(**vmd->irqs),
+ +					    GFP_KERNEL);
+ +		if (!vmd->irqs[i])
+ +			return -ENOMEM;
+ +	}
+ +
+ +	for (i = 0; i < vmd->msix_count; i++) {
+ +		err = init_srcu_struct(&vmd->irqs[i]->srcu);
+ +		if (err)
+ +			return err;
+ +
+ +		INIT_LIST_HEAD(&vmd->irqs[i]->irq_list);
+ +		vmd->irqs[i]->index = i;
+ +		err = devm_request_irq(&dev->dev, pci_irq_vector(dev, i),
+ +				       vmd_irq, IRQF_NO_THREAD,
+ +				       "vmd", vmd->irqs[i]);
+ +		if (err)
+ +			return err;
+ +	}
+  
+  	spin_lock_init(&vmd->cfg_lock);
+  	pci_set_drvdata(dev, vmd);
+ -	err = vmd_enable_domain(vmd, features);
+ +	err = vmd_enable_domain(vmd, (unsigned long) id->driver_data);
+  	if (err)
+- 		return err;
++ 		goto out_release_instance;
+  
+  	dev_info(&vmd->dev->dev, "Bound to PCI domain %04x\n",
+  		 vmd->sysdata.domain);
+@@@ -801,8 -901,9 +880,14 @@@ static void vmd_remove(struct pci_dev *
+  	pci_remove_root_bus(vmd->bus);
+  	vmd_cleanup_srcu(vmd);
+  	vmd_detach_resources(vmd);
+++<<<<<<< HEAD
+ +	irq_domain_remove(vmd->irq_domain);
+ +	irq_domain_free_fwnode(fn);
+++=======
++ 	vmd_remove_irq_domain(vmd);
++ 	ida_simple_remove(&vmd_instance_ida, vmd->instance);
++ 	kfree(vmd->name);
+++>>>>>>> 42da7911b83a (PCI: vmd: Assign a number to each VMD controller)
+  }
+  
+  #ifdef CONFIG_PM_SLEEP
+@@@ -827,7 -928,7 +912,11 @@@ static int vmd_resume(struct device *de
+  	for (i = 0; i < vmd->msix_count; i++) {
+  		err = devm_request_irq(dev, pci_irq_vector(pdev, i),
+  				       vmd_irq, IRQF_NO_THREAD,
+++<<<<<<< HEAD
+ +				       "vmd", vmd->irqs[i]);
+++=======
++ 				       vmd->name, &vmd->irqs[i]);
+++>>>>>>> 42da7911b83a (PCI: vmd: Assign a number to each VMD controller)
+  		if (err)
+  			return err;
+  	}
+* Unmerged path drivers/pci/controller/vmd.c
