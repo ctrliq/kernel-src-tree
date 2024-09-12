@@ -1,0 +1,698 @@
+ice: use ice_is_vf_trusted helper function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.26.1.el8_6
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 1261691dda6b7c229a01cbcb5ea9070d62435722
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.26.1.el8_6/1261691d.failed
+
+The ice_vc_cfg_promiscuous_mode_msg function directly checks
+ICE_VIRTCHNL_VF_CAP_PRIVILEGE, instead of using the existing helper
+function ice_is_vf_trusted. Switch this to use the helper function so
+that all trusted checks are consistent. This aids in any potential
+future refactor by ensuring consistent code.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Konrad Jankowski <konrad0.jankowski@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 1261691dda6b7c229a01cbcb5ea9070d62435722)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_sriov.c
+diff --cc drivers/net/ethernet/intel/ice/ice_sriov.c
+index 52c6bac41bf7,432841ab4352..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_sriov.c
++++ b/drivers/net/ethernet/intel/ice/ice_sriov.c
+@@@ -40,181 -6025,374 +40,360 @@@ ice_aq_send_msg_to_vf(struct ice_hw *hw
+  }
+  
+  /**
+ - * ice_unicast_mac_exists - check if the unicast MAC exists on the PF's switch
+ - * @pf: PF used to reference the switch's rules
+ - * @umac: unicast MAC to compare against existing switch rules
+ + * ice_conv_link_speed_to_virtchnl
+ + * @adv_link_support: determines the format of the returned link speed
+ + * @link_speed: variable containing the link_speed to be converted
+   *
+ - * Return true on the first/any match, else return false
+ + * Convert link speed supported by HW to link speed supported by virtchnl.
+ + * If adv_link_support is true, then return link speed in Mbps. Else return
+ + * link speed as a VIRTCHNL_LINK_SPEED_* casted to a u32. Note that the caller
+ + * needs to cast back to an enum virtchnl_link_speed in the case where
+ + * adv_link_support is false, but when adv_link_support is true the caller can
+ + * expect the speed in Mbps.
+   */
+ -static bool ice_unicast_mac_exists(struct ice_pf *pf, u8 *umac)
+ +u32 ice_conv_link_speed_to_virtchnl(bool adv_link_support, u16 link_speed)
+  {
+ -	struct ice_sw_recipe *mac_recipe_list =
+ -		&pf->hw.switch_info->recp_list[ICE_SW_LKUP_MAC];
+ -	struct ice_fltr_mgmt_list_entry *list_itr;
+ -	struct list_head *rule_head;
+ -	struct mutex *rule_lock; /* protect MAC filter list access */
+ -
+ -	rule_head = &mac_recipe_list->filt_rules;
+ -	rule_lock = &mac_recipe_list->filt_rule_lock;
+ -
+ -	mutex_lock(rule_lock);
+ -	list_for_each_entry(list_itr, rule_head, list_entry) {
+ -		u8 *existing_mac = &list_itr->fltr_info.l_data.mac.mac_addr[0];
+ +	u32 speed;
+  
+ -		if (ether_addr_equal(existing_mac, umac)) {
+ -			mutex_unlock(rule_lock);
+ -			return true;
+ +	if (adv_link_support)
+ +		switch (link_speed) {
+ +		case ICE_AQ_LINK_SPEED_10MB:
+ +			speed = ICE_LINK_SPEED_10MBPS;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_100MB:
+ +			speed = ICE_LINK_SPEED_100MBPS;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_1000MB:
+ +			speed = ICE_LINK_SPEED_1000MBPS;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_2500MB:
+ +			speed = ICE_LINK_SPEED_2500MBPS;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_5GB:
+ +			speed = ICE_LINK_SPEED_5000MBPS;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_10GB:
+ +			speed = ICE_LINK_SPEED_10000MBPS;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_20GB:
+ +			speed = ICE_LINK_SPEED_20000MBPS;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_25GB:
+ +			speed = ICE_LINK_SPEED_25000MBPS;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_40GB:
+ +			speed = ICE_LINK_SPEED_40000MBPS;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_50GB:
+ +			speed = ICE_LINK_SPEED_50000MBPS;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_100GB:
+ +			speed = ICE_LINK_SPEED_100000MBPS;
+ +			break;
+ +		default:
+ +			speed = ICE_LINK_SPEED_UNKNOWN;
+ +			break;
+  		}
+ -	}
+ -
+ -	mutex_unlock(rule_lock);
+ -
+ -	return false;
+ -}
+ -
+ -/**
+ - * ice_set_vf_mac
+ - * @netdev: network interface device structure
+ - * @vf_id: VF identifier
+ - * @mac: MAC address
+ - *
+ - * program VF MAC address
+ - */
+ -int ice_set_vf_mac(struct net_device *netdev, int vf_id, u8 *mac)
+ -{
+ -	struct ice_pf *pf = ice_netdev_to_pf(netdev);
+ -	struct ice_vf *vf;
+ -	int ret;
+ -
+ -	if (is_multicast_ether_addr(mac)) {
+ -		netdev_err(netdev, "%pM not a valid unicast address\n", mac);
+ -		return -EINVAL;
+ -	}
+ -
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ -		return -EINVAL;
+ -
+ -	/* nothing left to do, unicast MAC already set */
+ -	if (ether_addr_equal(vf->dev_lan_addr.addr, mac) &&
+ -	    ether_addr_equal(vf->hw_lan_addr.addr, mac)) {
+ -		ret = 0;
+ -		goto out_put_vf;
+ -	}
+ -
+ -	ret = ice_check_vf_ready_for_cfg(vf);
+ -	if (ret)
+ -		goto out_put_vf;
+ -
+ -	if (ice_unicast_mac_exists(pf, mac)) {
+ -		netdev_err(netdev, "Unicast MAC %pM already exists on this PF. Preventing setting VF %u unicast MAC address to %pM\n",
+ -			   mac, vf_id, mac);
+ -		ret = -EINVAL;
+ -		goto out_put_vf;
+ -	}
+ -
+ -	mutex_lock(&vf->cfg_lock);
+ -
+ -	/* VF is notified of its new MAC via the PF's response to the
+ -	 * VIRTCHNL_OP_GET_VF_RESOURCES message after the VF has been reset
+ -	 */
+ -	ether_addr_copy(vf->dev_lan_addr.addr, mac);
+ -	ether_addr_copy(vf->hw_lan_addr.addr, mac);
+ -	if (is_zero_ether_addr(mac)) {
+ -		/* VF will send VIRTCHNL_OP_ADD_ETH_ADDR message with its MAC */
+ -		vf->pf_set_mac = false;
+ -		netdev_info(netdev, "Removing MAC on VF %d. VF driver will be reinitialized\n",
+ -			    vf->vf_id);
+ -	} else {
+ -		/* PF will add MAC rule for the VF */
+ -		vf->pf_set_mac = true;
+ -		netdev_info(netdev, "Setting MAC %pM on VF %d. VF driver will be reinitialized\n",
+ -			    mac, vf_id);
+ -	}
+ -
+ -	ice_vc_reset_vf(vf);
+ -	mutex_unlock(&vf->cfg_lock);
+ +	else
+++<<<<<<< HEAD
+ +		/* Virtchnl speeds are not defined for every speed supported in
+ +		 * the hardware. To maintain compatibility with older AVF
+ +		 * drivers, while reporting the speed the new speed values are
+ +		 * resolved to the closest known virtchnl speeds
+ +		 */
+ +		switch (link_speed) {
+ +		case ICE_AQ_LINK_SPEED_10MB:
+ +		case ICE_AQ_LINK_SPEED_100MB:
+ +			speed = (u32)VIRTCHNL_LINK_SPEED_100MB;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_1000MB:
+ +		case ICE_AQ_LINK_SPEED_2500MB:
+ +		case ICE_AQ_LINK_SPEED_5GB:
+ +			speed = (u32)VIRTCHNL_LINK_SPEED_1GB;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_10GB:
+ +			speed = (u32)VIRTCHNL_LINK_SPEED_10GB;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_20GB:
+ +			speed = (u32)VIRTCHNL_LINK_SPEED_20GB;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_25GB:
+ +			speed = (u32)VIRTCHNL_LINK_SPEED_25GB;
+ +			break;
+ +		case ICE_AQ_LINK_SPEED_40GB:
+ +		case ICE_AQ_LINK_SPEED_50GB:
+ +		case ICE_AQ_LINK_SPEED_100GB:
+ +			speed = (u32)VIRTCHNL_LINK_SPEED_40GB;
+ +			break;
+ +		default:
+ +			speed = (u32)VIRTCHNL_LINK_SPEED_UNKNOWN;
+++=======
+++		vf->spoofchk = ena;
++ 
++ out_put_vf:
++ 	ice_put_vf(vf);
++ 	return ret;
++ }
++ 
++ /**
+ - * ice_set_vf_trust
+ - * @netdev: network interface device structure
+ - * @vf_id: VF identifier
+ - * @trusted: Boolean value to enable/disable trusted VF
+ - *
+ - * Enable or disable a given VF as trusted
+++ * ice_is_vf_trusted
+++ * @vf: pointer to the VF info
++  */
+ -int ice_set_vf_trust(struct net_device *netdev, int vf_id, bool trusted)
+++static bool ice_is_vf_trusted(struct ice_vf *vf)
++ {
+ -	struct ice_pf *pf = ice_netdev_to_pf(netdev);
+ -	struct ice_vf *vf;
+ -	int ret;
+ -
+ -	if (ice_is_eswitch_mode_switchdev(pf)) {
+ -		dev_info(ice_pf_to_dev(pf), "Trusted VF is forbidden in switchdev mode\n");
+ -		return -EOPNOTSUPP;
+ -	}
+ -
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ -		return -EINVAL;
+ -
+ -	ret = ice_check_vf_ready_for_cfg(vf);
+ -	if (ret)
+ -		goto out_put_vf;
+ -
+ -	/* Check if already trusted */
+ -	if (trusted == vf->trusted) {
+ -		ret = 0;
+ -		goto out_put_vf;
+ -	}
+ -
+ -	mutex_lock(&vf->cfg_lock);
+ -
+ -	vf->trusted = trusted;
+ -	ice_vc_reset_vf(vf);
+ -	dev_info(ice_pf_to_dev(pf), "VF %u is now %strusted\n",
+ -		 vf_id, trusted ? "" : "un");
+ -
+ -	mutex_unlock(&vf->cfg_lock);
+ -
+ -out_put_vf:
+ -	ice_put_vf(vf);
+ -	return ret;
+++	return test_bit(ICE_VIRTCHNL_VF_CAP_PRIVILEGE, &vf->vf_caps);
++ }
++ 
++ /**
+ - * ice_set_vf_link_state
+ - * @netdev: network interface device structure
+ - * @vf_id: VF identifier
+ - * @link_state: required link state
+++ * ice_is_any_vf_in_promisc - check if any VF(s) are in promiscuous mode
+++ * @pf: PF structure for accessing VF(s)
++  *
+ - * Set VF's link state, irrespective of physical link state status
+ - */
+ -int ice_set_vf_link_state(struct net_device *netdev, int vf_id, int link_state)
+ -{
+ -	struct ice_pf *pf = ice_netdev_to_pf(netdev);
+ -	struct ice_vf *vf;
+ -	int ret;
+ -
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ -		return -EINVAL;
+ -
+ -	ret = ice_check_vf_ready_for_cfg(vf);
+ -	if (ret)
+ -		goto out_put_vf;
+ -
+ -	switch (link_state) {
+ -	case IFLA_VF_LINK_STATE_AUTO:
+ -		vf->link_forced = false;
+ -		break;
+ -	case IFLA_VF_LINK_STATE_ENABLE:
+ -		vf->link_forced = true;
+ -		vf->link_up = true;
+ -		break;
+ -	case IFLA_VF_LINK_STATE_DISABLE:
+ -		vf->link_forced = true;
+ -		vf->link_up = false;
+ -		break;
+ -	default:
+ -		ret = -EINVAL;
+ -		goto out_put_vf;
+ -	}
+ -
+ -	ice_vc_notify_vf_link_state(vf);
+ -
+ -out_put_vf:
+ -	ice_put_vf(vf);
+ -	return ret;
+ -}
+ -
+ -/**
+ - * ice_calc_all_vfs_min_tx_rate - calculate cumulative min Tx rate on all VFs
+ - * @pf: PF associated with VFs
+++ * Return false if no VF(s) are in unicast and/or multicast promiscuous mode,
+++ * else return true
++  */
+ -static int ice_calc_all_vfs_min_tx_rate(struct ice_pf *pf)
+++bool ice_is_any_vf_in_promisc(struct ice_pf *pf)
++ {
+++	bool is_vf_promisc = false;
++ 	struct ice_vf *vf;
++ 	unsigned int bkt;
+ -	int rate = 0;
++ 
++ 	rcu_read_lock();
+ -	ice_for_each_vf_rcu(pf, bkt, vf)
+ -		rate += vf->min_tx_rate;
+ -	rcu_read_unlock();
+++	ice_for_each_vf_rcu(pf, bkt, vf) {
+++		/* found a VF that has promiscuous mode configured */
+++		if (test_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states) ||
+++		    test_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states)) {
+++			is_vf_promisc = true;
+++>>>>>>> 1261691dda6b (ice: use ice_is_vf_trusted helper function)
+ +			break;
+ +		}
+  
+ -	return rate;
+ +	return speed;
+  }
+  
+ -/**
+ - * ice_min_tx_rate_oversubscribed - check if min Tx rate causes oversubscription
+ - * @vf: VF trying to configure min_tx_rate
+ - * @min_tx_rate: min Tx rate in Mbps
+ - *
+ - * Check if the min_tx_rate being passed in will cause oversubscription of total
+ - * min_tx_rate based on the current link speed and all other VFs configured
+ - * min_tx_rate
+ +/* The mailbox overflow detection algorithm helps to check if there
+ + * is a possibility of a malicious VF transmitting too many MBX messages to the
+ + * PF.
+ + * 1. The mailbox snapshot structure, ice_mbx_snapshot, is initialized during
+ + * driver initialization in ice_init_hw() using ice_mbx_init_snapshot().
+ + * The struct ice_mbx_snapshot helps to track and traverse a static window of
+ + * messages within the mailbox queue while looking for a malicious VF.
+   *
+ - * Return true if the passed min_tx_rate would cause oversubscription, else
+ - * return false
+++<<<<<<< HEAD
+ + * 2. When the caller starts processing its mailbox queue in response to an
+ + * interrupt, the structure ice_mbx_snapshot is expected to be cleared before
+ + * the algorithm can be run for the first time for that interrupt. This can be
+ + * done via ice_mbx_reset_snapshot().
+++=======
+++ * called from the VF to configure VF VSIs promiscuous mode
++  */
+ -static bool
+ -ice_min_tx_rate_oversubscribed(struct ice_vf *vf, int min_tx_rate)
+++static int ice_vc_cfg_promiscuous_mode_msg(struct ice_vf *vf, u8 *msg)
++ {
+ -	int link_speed_mbps = ice_get_link_speed_mbps(ice_get_vf_vsi(vf));
+ -	int all_vfs_min_tx_rate = ice_calc_all_vfs_min_tx_rate(vf->pf);
+ -
+ -	/* this VF's previous rate is being overwritten */
+ -	all_vfs_min_tx_rate -= vf->min_tx_rate;
+++	enum virtchnl_status_code v_ret = VIRTCHNL_STATUS_SUCCESS;
+++	bool rm_promisc, alluni = false, allmulti = false;
+++	struct virtchnl_promisc_info *info =
+++	    (struct virtchnl_promisc_info *)msg;
+++	struct ice_vsi_vlan_ops *vlan_ops;
+++	int mcast_err = 0, ucast_err = 0;
+++	struct ice_pf *pf = vf->pf;
+++	struct ice_vsi *vsi;
+++	struct device *dev;
+++	int ret = 0;
++ 
+ -	if (all_vfs_min_tx_rate + min_tx_rate > link_speed_mbps) {
+ -		dev_err(ice_pf_to_dev(vf->pf), "min_tx_rate of %d Mbps on VF %u would cause oversubscription of %d Mbps based on the current link speed %d Mbps\n",
+ -			min_tx_rate, vf->vf_id,
+ -			all_vfs_min_tx_rate + min_tx_rate - link_speed_mbps,
+ -			link_speed_mbps);
+ -		return true;
+++	if (!test_bit(ICE_VF_STATE_ACTIVE, vf->vf_states)) {
+++		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+++		goto error_param;
++ 	}
++ 
+ -	return false;
+ -}
+++	if (!ice_vc_isvalid_vsi_id(vf, info->vsi_id)) {
+++		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+++		goto error_param;
+++	}
++ 
+ -/**
+ - * ice_set_vf_bw - set min/max VF bandwidth
+ - * @netdev: network interface device structure
+ - * @vf_id: VF identifier
+ - * @min_tx_rate: Minimum Tx rate in Mbps
+ - * @max_tx_rate: Maximum Tx rate in Mbps
+ - */
+ -int
+ -ice_set_vf_bw(struct net_device *netdev, int vf_id, int min_tx_rate,
+ -	      int max_tx_rate)
+ -{
+ -	struct ice_pf *pf = ice_netdev_to_pf(netdev);
+ -	struct ice_vsi *vsi;
+ -	struct device *dev;
+ -	struct ice_vf *vf;
+ -	int ret;
+++	vsi = ice_get_vf_vsi(vf);
+++	if (!vsi) {
+++		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+++		goto error_param;
+++	}
++ 
++ 	dev = ice_pf_to_dev(pf);
+++	if (!ice_is_vf_trusted(vf)) {
+++		dev_err(dev, "Unprivileged VF %d is attempting to configure promiscuous mode\n",
+++			vf->vf_id);
+++		/* Leave v_ret alone, lie to the VF on purpose. */
+++		goto error_param;
+++	}
++ 
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ -		return -EINVAL;
+++	if (info->flags & FLAG_VF_UNICAST_PROMISC)
+++		alluni = true;
++ 
+ -	ret = ice_check_vf_ready_for_cfg(vf);
+ -	if (ret)
+ -		goto out_put_vf;
+++	if (info->flags & FLAG_VF_MULTICAST_PROMISC)
+++		allmulti = true;
++ 
+ -	vsi = ice_get_vf_vsi(vf);
+++	rm_promisc = !allmulti && !alluni;
++ 
+ -	/* when max_tx_rate is zero that means no max Tx rate limiting, so only
+ -	 * check if max_tx_rate is non-zero
+ -	 */
+ -	if (max_tx_rate && min_tx_rate > max_tx_rate) {
+ -		dev_err(dev, "Cannot set min Tx rate %d Mbps greater than max Tx rate %d Mbps\n",
+ -			min_tx_rate, max_tx_rate);
+ -		ret = -EINVAL;
+ -		goto out_put_vf;
+++	vlan_ops = ice_get_compat_vsi_vlan_ops(vsi);
+++	if (rm_promisc)
+++		ret = vlan_ops->ena_rx_filtering(vsi);
+++	else
+++		ret = vlan_ops->dis_rx_filtering(vsi);
+++	if (ret) {
+++		dev_err(dev, "Failed to configure VLAN pruning in promiscuous mode\n");
+++		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+++		goto error_param;
++ 	}
++ 
+ -	if (min_tx_rate && ice_is_dcb_active(pf)) {
+ -		dev_err(dev, "DCB on PF is currently enabled. VF min Tx rate limiting not allowed on this PF.\n");
+ -		ret = -EOPNOTSUPP;
+ -		goto out_put_vf;
+ -	}
+++	if (!test_bit(ICE_FLAG_VF_TRUE_PROMISC_ENA, pf->flags)) {
+++		bool set_dflt_vsi = alluni || allmulti;
++ 
+ -	if (ice_min_tx_rate_oversubscribed(vf, min_tx_rate)) {
+ -		ret = -EINVAL;
+ -		goto out_put_vf;
+ -	}
+++		if (set_dflt_vsi && !ice_is_dflt_vsi_in_use(pf->first_sw))
+++			/* only attempt to set the default forwarding VSI if
+++			 * it's not currently set
+++			 */
+++			ret = ice_set_dflt_vsi(pf->first_sw, vsi);
+++		else if (!set_dflt_vsi &&
+++			 ice_is_vsi_dflt_vsi(pf->first_sw, vsi))
+++			/* only attempt to free the default forwarding VSI if we
+++			 * are the owner
+++			 */
+++			ret = ice_clear_dflt_vsi(pf->first_sw);
++ 
+ -	if (vf->min_tx_rate != (unsigned int)min_tx_rate) {
+ -		ret = ice_set_min_bw_limit(vsi, (u64)min_tx_rate * 1000);
++ 		if (ret) {
+ -			dev_err(dev, "Unable to set min-tx-rate for VF %d\n",
+ -				vf->vf_id);
+ -			goto out_put_vf;
+++			dev_err(dev, "%sable VF %d as the default VSI failed, error %d\n",
+++				set_dflt_vsi ? "en" : "dis", vf->vf_id, ret);
+++			v_ret = VIRTCHNL_STATUS_ERR_ADMIN_QUEUE_ERROR;
+++			goto error_param;
+++		}
+++	} else {
+++		u8 mcast_m, ucast_m;
+++
+++		if (ice_vf_is_port_vlan_ena(vf) ||
+++		    ice_vsi_has_non_zero_vlans(vsi)) {
+++			mcast_m = ICE_MCAST_VLAN_PROMISC_BITS;
+++			ucast_m = ICE_UCAST_VLAN_PROMISC_BITS;
+++		} else {
+++			mcast_m = ICE_MCAST_PROMISC_BITS;
+++			ucast_m = ICE_UCAST_PROMISC_BITS;
++ 		}
++ 
+ -		vf->min_tx_rate = min_tx_rate;
+++		if (alluni)
+++			ucast_err = ice_vf_set_vsi_promisc(vf, vsi, ucast_m);
+++		else
+++			ucast_err = ice_vf_clear_vsi_promisc(vf, vsi, ucast_m);
+++
+++		if (allmulti)
+++			mcast_err = ice_vf_set_vsi_promisc(vf, vsi, mcast_m);
+++		else
+++			mcast_err = ice_vf_clear_vsi_promisc(vf, vsi, mcast_m);
+++
+++		if (ucast_err || mcast_err)
+++			v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 	}
++ 
+ -	if (vf->max_tx_rate != (unsigned int)max_tx_rate) {
+ -		ret = ice_set_max_bw_limit(vsi, (u64)max_tx_rate * 1000);
+ -		if (ret) {
+ -			dev_err(dev, "Unable to set max-tx-rate for VF %d\n",
+ -				vf->vf_id);
+ -			goto out_put_vf;
+ -		}
+++	if (!mcast_err) {
+++		if (allmulti &&
+++		    !test_and_set_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states))
+++			dev_info(dev, "VF %u successfully set multicast promiscuous mode\n",
+++				 vf->vf_id);
+++		else if (!allmulti && test_and_clear_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states))
+++			dev_info(dev, "VF %u successfully unset multicast promiscuous mode\n",
+++				 vf->vf_id);
+++	}
++ 
+ -		vf->max_tx_rate = max_tx_rate;
+++	if (!ucast_err) {
+++		if (alluni && !test_and_set_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states))
+++			dev_info(dev, "VF %u successfully set unicast promiscuous mode\n",
+++				 vf->vf_id);
+++		else if (!alluni && test_and_clear_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states))
+++			dev_info(dev, "VF %u successfully unset unicast promiscuous mode\n",
+++				 vf->vf_id);
++ 	}
++ 
+ -out_put_vf:
+ -	ice_put_vf(vf);
+ -	return ret;
+++error_param:
+++	return ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_CONFIG_PROMISCUOUS_MODE,
+++				     v_ret, NULL, 0);
++ }
++ 
++ /**
+ - * ice_get_vf_stats - populate some stats for the VF
+ - * @netdev: the netdev of the PF
+ - * @vf_id: the host OS identifier (0-255)
+ - * @vf_stats: pointer to the OS memory to be initialized
+++ * ice_vc_get_stats_msg
+++ * @vf: pointer to the VF info
+++ * @msg: pointer to the msg buffer
+++>>>>>>> 1261691dda6b (ice: use ice_is_vf_trusted helper function)
+ + *
+ + * 3. For every message read by the caller from the MBX Queue, the caller must
+ + * call the detection algorithm's entry function ice_mbx_vf_state_handler().
+ + * Before every call to ice_mbx_vf_state_handler() the struct ice_mbx_data is
+ + * filled as it is required to be passed to the algorithm.
+ + *
+ + * 4. Every time a message is read from the MBX queue, a VFId is received which
+ + * is passed to the state handler. The boolean output is_malvf of the state
+ + * handler ice_mbx_vf_state_handler() serves as an indicator to the caller
+ + * whether this VF is malicious or not.
+ + *
+ + * 5. When a VF is identified to be malicious, the caller can send a message
+ + * to the system administrator. The caller can invoke ice_mbx_report_malvf()
+ + * to help determine if a malicious VF is to be reported or not. This function
+ + * requires the caller to maintain a global bitmap to track all malicious VFs
+ + * and pass that to ice_mbx_report_malvf() along with the VFID which was identified
+ + * to be malicious by ice_mbx_vf_state_handler().
+ + *
+ + * 6. The global bitmap maintained by PF can be cleared completely if PF is in
+ + * reset or the bit corresponding to a VF can be cleared if that VF is in reset.
+ + * When a VF is shut down and brought back up, we assume that the new VF
+ + * brought up is not malicious and hence report it if found malicious.
+ + *
+ + * 7. The function ice_mbx_reset_snapshot() is called to reset the information
+ + * in ice_mbx_snapshot for every new mailbox interrupt handled.
+ + *
+ + * 8. The memory allocated for variables in ice_mbx_snapshot is de-allocated
+ + * when driver is unloaded.
+   */
+ -int ice_get_vf_stats(struct net_device *netdev, int vf_id,
+ -		     struct ifla_vf_stats *vf_stats)
+ -{
+ -	struct ice_pf *pf = ice_netdev_to_pf(netdev);
+ -	struct ice_eth_stats *stats;
+ -	struct ice_vsi *vsi;
+ -	struct ice_vf *vf;
+ -	int ret;
+ -
+ -	vf = ice_get_vf_by_id(pf, vf_id);
+ -	if (!vf)
+ -		return -EINVAL;
+ -
+ -	ret = ice_check_vf_ready_for_cfg(vf);
+ -	if (ret)
+ -		goto out_put_vf;
+ -
+ -	vsi = ice_get_vf_vsi(vf);
+ -	if (!vsi) {
+ -		ret = -EINVAL;
+ -		goto out_put_vf;
+ -	}
+ +#define ICE_RQ_DATA_MASK(rq_data) ((rq_data) & PF_MBX_ARQH_ARQH_M)
+ +/* Using the highest value for an unsigned 16-bit value 0xFFFF to indicate that
+ + * the max messages check must be ignored in the algorithm
+ + */
+ +#define ICE_IGNORE_MAX_MSG_CNT	0xFFFF
+  
+ -	ice_update_eth_stats(vsi);
+ -	stats = &vsi->eth_stats;
+ +/**
+++<<<<<<< HEAD
+ + * ice_mbx_traverse - Pass through mailbox snapshot
+ + * @hw: pointer to the HW struct
+ + * @new_state: new algorithm state
+++=======
+++ * ice_can_vf_change_mac
+++ * @vf: pointer to the VF info
+++>>>>>>> 1261691dda6b (ice: use ice_is_vf_trusted helper function)
+ + *
+ + * Traversing the mailbox static snapshot without checking
+ + * for malicious VFs.
+ + */
+ +static void
+ +ice_mbx_traverse(struct ice_hw *hw,
+ +		 enum ice_mbx_snapshot_state *new_state)
+ +{
+ +	struct ice_mbx_snap_buffer_data *snap_buf;
+ +	u32 num_iterations;
+  
+ -	memset(vf_stats, 0, sizeof(*vf_stats));
+ +	snap_buf = &hw->mbx_snapshot.mbx_buf;
+  
+ -	vf_stats->rx_packets = stats->rx_unicast + stats->rx_broadcast +
+ -		stats->rx_multicast;
+ -	vf_stats->tx_packets = stats->tx_unicast + stats->tx_broadcast +
+ -		stats->tx_multicast;
+ -	vf_stats->rx_bytes   = stats->rx_bytes;
+ -	vf_stats->tx_bytes   = stats->tx_bytes;
+ -	vf_stats->broadcast  = stats->rx_broadcast;
+ -	vf_stats->multicast  = stats->rx_multicast;
+ -	vf_stats->rx_dropped = stats->rx_discards;
+ -	vf_stats->tx_dropped = stats->tx_discards;
+ +	/* As mailbox buffer is circular, applying a mask
+ +	 * on the incremented iteration count.
+ +	 */
+ +	num_iterations = ICE_RQ_DATA_MASK(++snap_buf->num_iterations);
+  
+ -out_put_vf:
+ -	ice_put_vf(vf);
+ -	return ret;
+ +	/* Checking either of the below conditions to exit snapshot traversal:
+ +	 * Condition-1: If the number of iterations in the mailbox is equal to
+ +	 * the mailbox head which would indicate that we have reached the end
+ +	 * of the static snapshot.
+ +	 * Condition-2: If the maximum messages serviced in the mailbox for a
+ +	 * given interrupt is the highest possible value then there is no need
+ +	 * to check if the number of messages processed is equal to it. If not
+ +	 * check if the number of messages processed is greater than or equal
+ +	 * to the maximum number of mailbox entries serviced in current work item.
+ +	 */
+ +	if (num_iterations == snap_buf->head ||
+ +	    (snap_buf->max_num_msgs_mbx < ICE_IGNORE_MAX_MSG_CNT &&
+ +	     ++snap_buf->num_msg_proc >= snap_buf->max_num_msgs_mbx))
+ +		*new_state = ICE_MAL_VF_DETECT_STATE_NEW_SNAPSHOT;
+  }
+  
+  /**
+* Unmerged path drivers/net/ethernet/intel/ice/ice_sriov.c
