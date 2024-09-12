@@ -37,6 +37,8 @@
 #include <asm/unistd.h>
 #include <stdbool.h>
 
+#define UNUSED(x) (void)(x)
+
 /*
  * This list matches the column headers, except
  * 1. built-in only, the sysfs counters are not here -- we learn of those at run-time
@@ -70,60 +72,60 @@ struct msr_counter {
 };
 
 struct msr_counter bic[] = {
-	{ 0x0, "usec" },
-	{ 0x0, "Time_Of_Day_Seconds" },
-	{ 0x0, "Package" },
-	{ 0x0, "Node" },
-	{ 0x0, "Avg_MHz" },
-	{ 0x0, "Busy%" },
-	{ 0x0, "Bzy_MHz" },
-	{ 0x0, "TSC_MHz" },
-	{ 0x0, "IRQ" },
-	{ 0x0, "SMI", "", 32, 0, FORMAT_DELTA, NULL },
-	{ 0x0, "sysfs" },
-	{ 0x0, "CPU%c1" },
-	{ 0x0, "CPU%c3" },
-	{ 0x0, "CPU%c6" },
-	{ 0x0, "CPU%c7" },
-	{ 0x0, "ThreadC" },
-	{ 0x0, "CoreTmp" },
-	{ 0x0, "CoreCnt" },
-	{ 0x0, "PkgTmp" },
-	{ 0x0, "GFX%rc6" },
-	{ 0x0, "GFXMHz" },
-	{ 0x0, "Pkg%pc2" },
-	{ 0x0, "Pkg%pc3" },
-	{ 0x0, "Pkg%pc6" },
-	{ 0x0, "Pkg%pc7" },
-	{ 0x0, "Pkg%pc8" },
-	{ 0x0, "Pkg%pc9" },
-	{ 0x0, "Pk%pc10" },
-	{ 0x0, "CPU%LPI" },
-	{ 0x0, "SYS%LPI" },
-	{ 0x0, "PkgWatt" },
-	{ 0x0, "CorWatt" },
-	{ 0x0, "GFXWatt" },
-	{ 0x0, "PkgCnt" },
-	{ 0x0, "RAMWatt" },
-	{ 0x0, "PKG_%" },
-	{ 0x0, "RAM_%" },
-	{ 0x0, "Pkg_J" },
-	{ 0x0, "Cor_J" },
-	{ 0x0, "GFX_J" },
-	{ 0x0, "RAM_J" },
-	{ 0x0, "Mod%c6" },
-	{ 0x0, "Totl%C0" },
-	{ 0x0, "Any%C0" },
-	{ 0x0, "GFX%C0" },
-	{ 0x0, "CPUGFX%" },
-	{ 0x0, "Core" },
-	{ 0x0, "CPU" },
-	{ 0x0, "APIC" },
-	{ 0x0, "X2APIC" },
-	{ 0x0, "Die" },
-	{ 0x0, "GFXAMHz" },
-	{ 0x0, "IPC" },
-	{ 0x0, "CoreThr" },
+	{ 0x0, "usec", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Time_Of_Day_Seconds", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Package", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Node", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Avg_MHz", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Busy%", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Bzy_MHz", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "TSC_MHz", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "IRQ", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "SMI", "", 32, 0, FORMAT_DELTA, NULL, 0 },
+	{ 0x0, "sysfs", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "CPU%c1", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "CPU%c3", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "CPU%c6", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "CPU%c7", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "ThreadC", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "CoreTmp", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "CoreCnt", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "PkgTmp", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "GFX%rc6", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "GFXMHz", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Pkg%pc2", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Pkg%pc3", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Pkg%pc6", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Pkg%pc7", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Pkg%pc8", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Pkg%pc9", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Pk%pc10", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "CPU%LPI", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "SYS%LPI", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "PkgWatt", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "CorWatt", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "GFXWatt", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "PkgCnt", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "RAMWatt", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "PKG_%", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "RAM_%", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Pkg_J", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Cor_J", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "GFX_J", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "RAM_J", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Mod%c6", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Totl%C0", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Any%C0", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "GFX%C0", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "CPUGFX%", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Core", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "CPU", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "APIC", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "X2APIC", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "Die", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "GFXAMHz", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "IPC", "", 0, 0, 0, NULL, 0 },
+	{ 0x0, "CoreThr", "", 0, 0, 0, NULL, 0 },
 };
 
 #define MAX_BIC (sizeof(bic) / sizeof(struct msr_counter))
@@ -752,7 +754,7 @@ void help(void)
  */
 unsigned long long bic_lookup(char *name_list, enum show_hide_mode mode)
 {
-	int i;
+	unsigned int i;
 	unsigned long long retval = 0;
 
 	while (name_list) {
@@ -2492,6 +2494,9 @@ int has_turbo_ratio_group_limits(int family, int model)
 	if (!genuine_intel)
 		return 0;
 
+	if (family != 6)
+		return 0;
+
 	switch (model) {
 	case INTEL_FAM6_ATOM_GOLDMONT:
 	case INTEL_FAM6_SKYLAKE_X:
@@ -2499,8 +2504,9 @@ int has_turbo_ratio_group_limits(int family, int model)
 	case INTEL_FAM6_ATOM_GOLDMONT_D:
 	case INTEL_FAM6_ATOM_TREMONT_D:
 		return 1;
+	default:
+		return 0;
 	}
-	return 0;
 }
 
 static void dump_turbo_ratio_limits(int family, int model)
@@ -3091,6 +3097,8 @@ void set_max_cpu_num(void)
  */
 int count_cpus(int cpu)
 {
+	UNUSED(cpu);
+
 	topo.num_cpus++;
 	return 0;
 }
@@ -3425,6 +3433,9 @@ static int update_msr_sum(struct thread_data *t, struct core_data *c, struct pkg
 	int i, ret;
 	int cpu = t->cpu_id;
 
+	UNUSED(c);
+	UNUSED(p);
+
 	for (i = IDX_PKG_ENERGY; i < IDX_COUNT; i++) {
 		unsigned long long msr_cur, msr_last;
 		off_t offset;
@@ -3451,6 +3462,8 @@ static int update_msr_sum(struct thread_data *t, struct core_data *c, struct pkg
 
 static void msr_record_handler(union sigval v)
 {
+	UNUSED(v);
+
 	for_all_cpus(update_msr_sum, EVEN_COUNTERS);
 }
 
@@ -3533,7 +3546,7 @@ void turbostat_loop()
 {
 	int retval;
 	int restarted = 0;
-	int done_iters = 0;
+	unsigned int done_iters = 0;
 
 	setup_signal_handler();
 
@@ -3745,6 +3758,7 @@ int probe_nhm_msrs(unsigned int family, unsigned int model)
 		break;
 	case INTEL_FAM6_ATOM_SILVERMONT:	/* BYT */
 		no_MSR_MISC_PWR_MGMT = 1;
+		/* FALLTHRU */
 	case INTEL_FAM6_ATOM_SILVERMONT_D:	/* AVN */
 		pkg_cstate_limits = slv_pkg_cstate_limits;
 		break;
@@ -3788,6 +3802,9 @@ int has_slv_msrs(unsigned int family, unsigned int model)
 	if (!genuine_intel)
 		return 0;
 
+	if (family != 6)
+		return 0;
+
 	switch (model) {
 	case INTEL_FAM6_ATOM_SILVERMONT:
 	case INTEL_FAM6_ATOM_SILVERMONT_MID:
@@ -3803,6 +3820,9 @@ int is_dnv(unsigned int family, unsigned int model)
 	if (!genuine_intel)
 		return 0;
 
+	if (family != 6)
+		return 0;
+
 	switch (model) {
 	case INTEL_FAM6_ATOM_GOLDMONT_D:
 		return 1;
@@ -3814,6 +3834,9 @@ int is_bdx(unsigned int family, unsigned int model)
 {
 
 	if (!genuine_intel)
+		return 0;
+
+	if (family != 6)
 		return 0;
 
 	switch (model) {
@@ -3829,6 +3852,9 @@ int is_skx(unsigned int family, unsigned int model)
 	if (!genuine_intel)
 		return 0;
 
+	if (family != 6)
+		return 0;
+
 	switch (model) {
 	case INTEL_FAM6_SKYLAKE_X:
 		return 1;
@@ -3840,6 +3866,9 @@ int is_icx(unsigned int family, unsigned int model)
 {
 
 	if (!genuine_intel)
+		return 0;
+
+	if (family != 6)
 		return 0;
 
 	switch (model) {
@@ -3854,6 +3883,9 @@ int is_ehl(unsigned int family, unsigned int model)
 	if (!genuine_intel)
 		return 0;
 
+	if (family != 6)
+		return 0;
+
 	switch (model) {
 	case INTEL_FAM6_ATOM_TREMONT:
 		return 1;
@@ -3866,6 +3898,9 @@ int is_jvl(unsigned int family, unsigned int model)
 	if (!genuine_intel)
 		return 0;
 
+	if (family != 6)
+		return 0;
+
 	switch (model) {
 	case INTEL_FAM6_ATOM_TREMONT_D:
 		return 1;
@@ -3876,6 +3911,9 @@ int is_jvl(unsigned int family, unsigned int model)
 int has_turbo_ratio_limit(unsigned int family, unsigned int model)
 {
 	if (has_slv_msrs(family, model))
+		return 0;
+
+	if (family != 6)
 		return 0;
 
 	switch (model) {
@@ -4192,6 +4230,9 @@ int print_epb(struct thread_data *t, struct core_data *c, struct pkg_data *p)
 	char *epb_string;
 	int cpu, epb;
 
+	UNUSED(c);
+	UNUSED(p);
+
 	if (!has_epb)
 		return 0;
 
@@ -4237,6 +4278,9 @@ int print_hwp(struct thread_data *t, struct core_data *c, struct pkg_data *p)
 {
 	unsigned long long msr;
 	int cpu;
+
+	UNUSED(c);
+	UNUSED(p);
 
 	if (!has_hwp)
 		return 0;
@@ -4320,6 +4364,9 @@ int print_perf_limit(struct thread_data *t, struct core_data *c, struct pkg_data
 {
 	unsigned long long msr;
 	int cpu;
+
+	UNUSED(c);
+	UNUSED(p);
 
 	cpu = t->cpu_id;
 
@@ -4426,6 +4473,8 @@ double get_tdp_intel(unsigned int model)
 
 double get_tdp_amd(unsigned int family)
 {
+	UNUSED(family);
+
 	/* This is the max stock TDP of HEDT/Server Fam17h+ chips */
 	return 280.0;
 }
@@ -4627,6 +4676,8 @@ void rapl_probe_amd(unsigned int family, unsigned int model)
 	unsigned int has_rapl = 0;
 	double tdp;
 
+	UNUSED(model);
+
 	if (max_extended_level >= 0x80000007) {
 		__cpuid(0x80000007, eax, ebx, ecx, edx);
 		/* RAPL (Fam 17h+) */
@@ -4685,6 +4736,7 @@ void perf_limit_reasons_probe(unsigned int family, unsigned int model)
 	case INTEL_FAM6_HASWELL_L:	/* HSW */
 	case INTEL_FAM6_HASWELL_G:	/* HSW */
 		do_gfx_perf_limit_reasons = 1;
+		/* FALLTHRU */
 	case INTEL_FAM6_HASWELL_X:	/* HSX */
 		do_core_perf_limit_reasons = 1;
 		do_ring_perf_limit_reasons = 1;
@@ -4710,6 +4762,9 @@ int print_thermal(struct thread_data *t, struct core_data *c, struct pkg_data *p
 	unsigned long long msr;
 	unsigned int dts, dts2;
 	int cpu;
+
+	UNUSED(c);
+	UNUSED(p);
 
 	if (!(do_dts || do_ptm))
 		return 0;
@@ -4781,6 +4836,9 @@ int print_rapl(struct thread_data *t, struct core_data *c, struct pkg_data *p)
 	unsigned long long msr;
 	const char *msr_name;
 	int cpu;
+
+	UNUSED(c);
+	UNUSED(p);
 
 	if (!do_rapl)
 		return 0;
@@ -4905,6 +4963,9 @@ int has_snb_msrs(unsigned int family, unsigned int model)
 	if (!genuine_intel)
 		return 0;
 
+	if (family != 6)
+		return 0;
+
 	switch (model) {
 	case INTEL_FAM6_SANDYBRIDGE:
 	case INTEL_FAM6_SANDYBRIDGE_X:
@@ -4948,6 +5009,9 @@ int has_c8910_msrs(unsigned int family, unsigned int model)
 	if (!genuine_intel)
 		return 0;
 
+	if (family != 6)
+		return 0;
+
 	switch (model) {
 	case INTEL_FAM6_HASWELL_L:	/* HSW */
 	case INTEL_FAM6_BROADWELL:	/* BDW */
@@ -4974,6 +5038,9 @@ int has_skl_msrs(unsigned int family, unsigned int model)
 	if (!genuine_intel)
 		return 0;
 
+	if (family != 6)
+		return 0;
+
 	switch (model) {
 	case INTEL_FAM6_SKYLAKE_L:	/* SKL */
 	case INTEL_FAM6_CANNONLAKE_L:	/* CNL */
@@ -4986,6 +5053,10 @@ int is_slm(unsigned int family, unsigned int model)
 {
 	if (!genuine_intel)
 		return 0;
+
+	if (family != 6)
+		return 0;
+
 	switch (model) {
 	case INTEL_FAM6_ATOM_SILVERMONT:	/* BYT */
 	case INTEL_FAM6_ATOM_SILVERMONT_D:	/* AVN */
@@ -4998,6 +5069,10 @@ int is_knl(unsigned int family, unsigned int model)
 {
 	if (!genuine_intel)
 		return 0;
+
+	if (family != 6)
+		return 0;
+
 	switch (model) {
 	case INTEL_FAM6_XEON_PHI_KNL:	/* KNL */
 		return 1;
@@ -5008,6 +5083,9 @@ int is_knl(unsigned int family, unsigned int model)
 int is_cnl(unsigned int family, unsigned int model)
 {
 	if (!genuine_intel)
+		return 0;
+
+	if (family != 6)
 		return 0;
 
 	switch (model) {
@@ -5064,6 +5142,9 @@ int get_cpu_type(struct thread_data *t, struct core_data *c, struct pkg_data *p)
 {
 	unsigned int eax, ebx, ecx, edx;
 
+	UNUSED(c);
+	UNUSED(p);
+
 	if (!genuine_intel)
 		return 0;
 
@@ -5099,6 +5180,9 @@ int set_temperature_target(struct thread_data *t, struct core_data *c, struct pk
 	unsigned long long msr;
 	unsigned int tcc_default, tcc_offset;
 	int cpu;
+
+	UNUSED(c);
+	UNUSED(p);
 
 	/* tj_max is used only for dts or ptm */
 	if (!(do_dts || do_ptm))
@@ -5679,11 +5763,6 @@ int dir_filter(const struct dirent *dirp)
 		return 1;
 	else
 		return 0;
-}
-
-int open_dev_cpu_msr(int dummy1)
-{
-	return 0;
 }
 
 void topology_probe()
