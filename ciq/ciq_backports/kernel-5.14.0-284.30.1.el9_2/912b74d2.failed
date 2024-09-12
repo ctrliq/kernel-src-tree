@@ -1,0 +1,168 @@
+vfio: Remove the vfio_group->users and users_comp
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 912b74d26c7df2da1e261f3dac8942c8cbb76a49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/912b74d2.failed
+
+Kevin points out that the users is really just tracking if
+group->opened_file is set, so we can simplify this code to a wait_queue
+that looks for !opened_file under the group_rwsem.
+
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+	Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Link: https://lore.kernel.org/r/1-v1-917e3647f123+b1a-vfio_group_users_jgg@nvidia.com
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 912b74d26c7df2da1e261f3dac8942c8cbb76a49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/vfio.h
+#	drivers/vfio/vfio_main.c
+diff --cc drivers/vfio/vfio.h
+index 503bea6c843d,78b362a92501..000000000000
+--- a/drivers/vfio/vfio.h
++++ b/drivers/vfio/vfio.h
+@@@ -28,6 -38,31 +28,34 @@@ enum vfio_group_type 
+  	VFIO_NO_IOMMU,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct vfio_group {
++ 	struct device 			dev;
++ 	struct cdev			cdev;
++ 	/*
++ 	 * When drivers is non-zero a driver is attached to the struct device
++ 	 * that provided the iommu_group and thus the iommu_group is a valid
++ 	 * pointer. When drivers is 0 the driver is being detached. Once users
++ 	 * reaches 0 then the iommu_group is invalid.
++ 	 */
++ 	refcount_t			drivers;
++ 	unsigned int			container_users;
++ 	struct iommu_group		*iommu_group;
++ 	struct vfio_container		*container;
++ 	struct list_head		device_list;
++ 	struct mutex			device_lock;
++ 	struct list_head		vfio_next;
++ 	struct list_head		container_next;
++ 	enum vfio_group_type		type;
++ 	struct rw_semaphore		group_rwsem;
++ 	struct kvm			*kvm;
++ 	struct file			*opened_file;
++ 	struct swait_queue_head		opened_file_wait;
++ 	struct blocking_notifier_head	notifier;
++ };
++ 
+++>>>>>>> 912b74d26c7d (vfio: Remove the vfio_group->users and users_comp)
+  /* events for the backend driver notify callback */
+  enum vfio_iommu_notify_type {
+  	VFIO_IOMMU_CONTAINER_CLOSE = 0,
+diff --cc drivers/vfio/vfio_main.c
+index eb849d5b81b0,57a7576a96a6..000000000000
+--- a/drivers/vfio/vfio_main.c
++++ b/drivers/vfio/vfio_main.c
+@@@ -378,8 -186,9 +378,13 @@@ static struct vfio_group *vfio_group_al
+  	cdev_init(&group->cdev, &vfio_group_fops);
+  	group->cdev.owner = THIS_MODULE;
+  
+++<<<<<<< HEAD
+ +	refcount_set(&group->users, 1);
+++=======
++ 	refcount_set(&group->drivers, 1);
+++>>>>>>> 912b74d26c7d (vfio: Remove the vfio_group->users and users_comp)
+  	init_rwsem(&group->group_rwsem);
++ 	init_swait_queue_head(&group->opened_file_wait);
+  	INIT_LIST_HEAD(&group->device_list);
+  	mutex_init(&group->device_lock);
+  	group->iommu_group = iommu_group;
+@@@ -435,10 -244,39 +440,46 @@@ err_put
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static void vfio_group_put(struct vfio_group *group)
+ +{
+ +	if (!refcount_dec_and_mutex_lock(&group->users, &vfio.group_lock))
+ +		return;
+++=======
++ static void vfio_device_remove_group(struct vfio_device *device)
++ {
++ 	struct vfio_group *group = device->group;
++ 
++ 	if (group->type == VFIO_NO_IOMMU || group->type == VFIO_EMULATED_IOMMU)
++ 		iommu_group_remove_device(device->dev);
++ 
++ 	/* Pairs with vfio_create_group() / vfio_group_get_from_iommu() */
++ 	if (!refcount_dec_and_mutex_lock(&group->drivers, &vfio.group_lock))
++ 		return;
++ 	list_del(&group->vfio_next);
++ 
++ 	/*
++ 	 * We could concurrently probe another driver in the group that might
++ 	 * race vfio_device_remove_group() with vfio_get_group(), so we have to
++ 	 * ensure that the sysfs is all cleaned up under lock otherwise the
++ 	 * cdev_device_add() will fail due to the name aready existing.
++ 	 */
++ 	cdev_device_del(&group->cdev, &group->dev);
++ 
++ 	/*
++ 	 * Before we allow the last driver in the group to be unplugged the
++ 	 * group must be sanitized so nothing else is or can reference it. This
++ 	 * is because the group->iommu_group pointer should only be used so long
++ 	 * as a device driver is attached to a device in the group.
++ 	 */
++ 	while (group->opened_file) {
++ 		mutex_unlock(&vfio.group_lock);
++ 		swait_event_idle_exclusive(group->opened_file_wait,
++ 					   !group->opened_file);
++ 		mutex_lock(&vfio.group_lock);
++ 	}
++ 	mutex_unlock(&vfio.group_lock);
+++>>>>>>> 912b74d26c7d (vfio: Remove the vfio_group->users and users_comp)
+  
+  	/*
+  	 * These data structures all have paired operations that can only be
+@@@ -1319,10 -901,13 +1360,18 @@@ static int vfio_group_fops_open(struct 
+  
+  	down_write(&group->group_rwsem);
+  
+++<<<<<<< HEAD
+ +	/* users can be zero if this races with vfio_group_put() */
+ +	if (!refcount_inc_not_zero(&group->users)) {
+++=======
++ 	/*
++ 	 * drivers can be zero if this races with vfio_device_remove_group(), it
++ 	 * will be stable at 0 under the group rwsem
++ 	 */
++ 	if (refcount_read(&group->drivers) == 0) {
+++>>>>>>> 912b74d26c7d (vfio: Remove the vfio_group->users and users_comp)
+  		ret = -ENODEV;
+- 		goto err_unlock;
++ 		goto out_unlock;
+  	}
+  
+  	if (group->type == VFIO_NO_IOMMU && !capable(CAP_SYS_RAWIO)) {
+@@@ -1361,14 -942,11 +1406,13 @@@ static int vfio_group_fops_release(stru
+  	 * is only called when there are no open devices.
+  	 */
+  	WARN_ON(group->notifier.head);
+ -	if (group->container)
+ -		vfio_group_detach_container(group);
+ +	if (group->container) {
+ +		WARN_ON(group->container_users != 1);
+ +		__vfio_group_unset_container(group);
+ +	}
+  	group->opened_file = NULL;
+  	up_write(&group->group_rwsem);
+- 
+- 	vfio_group_put(group);
++ 	swake_up_one(&group->opened_file_wait);
+  
+  	return 0;
+  }
+* Unmerged path drivers/vfio/vfio.h
+* Unmerged path drivers/vfio/vfio_main.c
