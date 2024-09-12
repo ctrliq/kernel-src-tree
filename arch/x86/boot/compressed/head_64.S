@@ -735,7 +735,7 @@ boot_stack_end:
 /*
  * Space for page tables (not in .bss so not zeroed)
  */
-	.section ".pgtable","a",@nobits
+	.section ".pgtable","aw",@nobits
 	.balign 4096
 pgtable:
 	.fill BOOT_PGT_SIZE, 1, 0
