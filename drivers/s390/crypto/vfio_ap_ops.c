@@ -1599,6 +1599,9 @@ retry_zapq:
 	switch (status.response_code) {
 	case AP_RESPONSE_NORMAL:
 		ret = 0;
+		/* if the reset has not completed, wait for it to take effect */
+		if (!status.queue_empty || status.irq_enabled)
+			ret = apq_reset_check(q);
 		break;
 	case AP_RESPONSE_RESET_IN_PROGRESS:
 		if (retry--) {
@@ -1624,10 +1627,6 @@ retry_zapq:
 		     status.response_code);
 		return -EIO;
 	}
-
-	/* wait for the reset to take effect */
-	if (!(status.queue_empty && !status.irq_enabled))
-		ret = apq_reset_check(q);
 
 free_resources:
 	vfio_ap_free_aqic_resources(q);
