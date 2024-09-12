@@ -1255,8 +1255,7 @@ ieee80211_mesh_rx_probe_req(struct ieee80211_sub_if_data *sdata,
 	if (baselen > len)
 		return;
 
-	elems = ieee802_11_parse_elems(pos, len - baselen, false, mgmt->bssid,
-				       NULL);
+	elems = ieee802_11_parse_elems(pos, len - baselen, false, NULL);
 	if (!elems)
 		return;
 
@@ -1325,7 +1324,7 @@ static void ieee80211_mesh_rx_bcn_presp(struct ieee80211_sub_if_data *sdata,
 
 	elems = ieee802_11_parse_elems(mgmt->u.probe_resp.variable,
 				       len - baselen,
-				       false, mgmt->bssid, NULL);
+				       false, NULL);
 	if (!elems)
 		return;
 
@@ -1467,8 +1466,7 @@ static void mesh_rx_csa_frame(struct ieee80211_sub_if_data *sdata,
 	pos = mgmt->u.action.u.chan_switch.variable;
 	baselen = offsetof(struct ieee80211_mgmt,
 			   u.action.u.chan_switch.variable);
-	elems = ieee802_11_parse_elems(pos, len - baselen, true,
-				       mgmt->bssid, NULL);
+	elems = ieee802_11_parse_elems(pos, len - baselen, true, NULL);
 	if (!elems)
 		return;
 
