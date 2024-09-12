@@ -973,6 +973,16 @@ void kvm_load_host_xsave_state(struct kvm_vcpu *vcpu)
 }
 EXPORT_SYMBOL_GPL(kvm_load_host_xsave_state);
 
+static inline u64 kvm_guest_supported_xcr0(struct kvm_vcpu *vcpu)
+{
+	return vcpu->arch.guest_fpu.fpstate->user_xfeatures;
+}
+
+static inline u64 kvm_guest_supported_xfd(struct kvm_vcpu *vcpu)
+{
+	return kvm_guest_supported_xcr0(vcpu) & XFEATURE_MASK_USER_DYNAMIC;
+}
+
 static int __kvm_set_xcr(struct kvm_vcpu *vcpu, u32 index, u64 xcr)
 {
 	u64 xcr0 = xcr;
@@ -992,7 +1002,7 @@ static int __kvm_set_xcr(struct kvm_vcpu *vcpu, u32 index, u64 xcr)
 	 * saving.  However, xcr0 bit 0 is always set, even if the
 	 * emulated CPU does not support XSAVE (see fx_init).
 	 */
-	valid_bits = vcpu->arch.guest_supported_xcr0 | XFEATURE_MASK_FP;
+	valid_bits = kvm_guest_supported_xcr0(vcpu) | XFEATURE_MASK_FP;
 	if (xcr0 & ~valid_bits)
 		return 1;
 
@@ -3587,8 +3597,7 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		    !guest_cpuid_has(vcpu, X86_FEATURE_XFD))
 			return 1;
 
-		if (data & ~(XFEATURE_MASK_USER_DYNAMIC &
-			     vcpu->arch.guest_supported_xcr0))
+		if (data & ~kvm_guest_supported_xfd(vcpu))
 			return 1;
 
 		fpu_update_guest_xfd(&vcpu->arch.guest_fpu, data);
@@ -3598,8 +3607,7 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		    !guest_cpuid_has(vcpu, X86_FEATURE_XFD))
 			return 1;
 
-		if (data & ~(XFEATURE_MASK_USER_DYNAMIC &
-			     vcpu->arch.guest_supported_xcr0))
+		if (data & ~kvm_guest_supported_xfd(vcpu))
 			return 1;
 
 		vcpu->arch.guest_fpu.xfd_err = data;
