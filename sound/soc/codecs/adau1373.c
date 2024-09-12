@@ -1472,8 +1472,7 @@ static const struct snd_soc_component_driver adau1373_component_driver = {
 	.endianness		= 1,
 };
 
-static int adau1373_i2c_probe(struct i2c_client *client,
-			      const struct i2c_device_id *id)
+static int adau1373_i2c_probe(struct i2c_client *client)
 {
 	struct adau1373 *adau1373;
 	int ret;
@@ -1507,7 +1506,7 @@ static struct i2c_driver adau1373_i2c_driver = {
 	.driver = {
 		.name = "adau1373",
 	},
-	.probe = adau1373_i2c_probe,
+	.probe_new = adau1373_i2c_probe,
 	.id_table = adau1373_i2c_id,
 };
 
