@@ -1,0 +1,420 @@
+sched/fair: Cleanup loop_max and loop_break
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-497.el8
+commit-author Vincent Guittot <vincent.guittot@linaro.org>
+commit c59862f8265f8060b6650ee1dc12159fe5c89779
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-497.el8/c59862f8.failed
+
+sched_nr_migrate_break is set to a fix value and never changes so we can
+replace it by a define SCHED_NR_MIGRATE_BREAK.
+
+Also, we adjust SCHED_NR_MIGRATE_BREAK to be aligned with the init value
+of sysctl_sched_nr_migrate which can be init to different values.
+
+Then, use SCHED_NR_MIGRATE_BREAK to init sysctl_sched_nr_migrate.
+
+The behavior stays unchanged unless you modify sysctl_sched_nr_migrate
+trough debugfs.
+
+	Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20220825122726.20819-3-vincent.guittot@linaro.org
+(cherry picked from commit c59862f8265f8060b6650ee1dc12159fe5c89779)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index ae048de81060,4fa4a3ddb4f4..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -63,22 -142,300 +63,26 @@@ const_debug unsigned int sysctl_sched_f
+   * Number of tasks to iterate in a single balance run.
+   * Limited because this is done with IRQs disabled.
+   */
+ -const_debug unsigned int sysctl_sched_nr_migrate = SCHED_NR_MIGRATE_BREAK;
+ -
+ -__read_mostly int scheduler_running;
+ -
+ -#ifdef CONFIG_SCHED_CORE
+ -
+ -DEFINE_STATIC_KEY_FALSE(__sched_core_enabled);
+ -
+ -/* kernel prio, less is more */
+ -static inline int __task_prio(struct task_struct *p)
+ -{
+ -	if (p->sched_class == &stop_sched_class) /* trumps deadline */
+ -		return -2;
+ -
+ -	if (rt_prio(p->prio)) /* includes deadline */
+ -		return p->prio; /* [-1, 99] */
+ -
+ -	if (p->sched_class == &idle_sched_class)
+ -		return MAX_RT_PRIO + NICE_WIDTH; /* 140 */
+ -
+ -	return MAX_RT_PRIO + MAX_NICE; /* 120, squash fair */
+ -}
+ -
+ -/*
+ - * l(a,b)
+ - * le(a,b) := !l(b,a)
+ - * g(a,b)  := l(b,a)
+ - * ge(a,b) := !l(a,b)
+ - */
+ -
+ -/* real prio, less is less */
+ -static inline bool prio_less(struct task_struct *a, struct task_struct *b, bool in_fi)
+ -{
+ -
+ -	int pa = __task_prio(a), pb = __task_prio(b);
+ -
+ -	if (-pa < -pb)
+ -		return true;
+ -
+ -	if (-pb < -pa)
+ -		return false;
+ -
+ -	if (pa == -1) /* dl_prio() doesn't work because of stop_class above */
+ -		return !dl_time_before(a->dl.deadline, b->dl.deadline);
+ -
+ -	if (pa == MAX_RT_PRIO + MAX_NICE)	/* fair */
+ -		return cfs_prio_less(a, b, in_fi);
+ -
+ -	return false;
+ -}
+ -
+ -static inline bool __sched_core_less(struct task_struct *a, struct task_struct *b)
+ -{
+ -	if (a->core_cookie < b->core_cookie)
+ -		return true;
+ -
+ -	if (a->core_cookie > b->core_cookie)
+ -		return false;
+ -
+ -	/* flip prio, so high prio is leftmost */
+ -	if (prio_less(b, a, !!task_rq(a)->core->core_forceidle_count))
+ -		return true;
+ -
+ -	return false;
+ -}
+ -
+ -#define __node_2_sc(node) rb_entry((node), struct task_struct, core_node)
+ -
+ -static inline bool rb_sched_core_less(struct rb_node *a, const struct rb_node *b)
+ -{
+ -	return __sched_core_less(__node_2_sc(a), __node_2_sc(b));
+ -}
+ -
+ -static inline int rb_sched_core_cmp(const void *key, const struct rb_node *node)
+ -{
+ -	const struct task_struct *p = __node_2_sc(node);
+ -	unsigned long cookie = (unsigned long)key;
+ -
+ -	if (cookie < p->core_cookie)
+ -		return -1;
+ -
+ -	if (cookie > p->core_cookie)
+ -		return 1;
+ -
+ -	return 0;
+ -}
+ -
+ -void sched_core_enqueue(struct rq *rq, struct task_struct *p)
+ -{
+ -	rq->core->core_task_seq++;
+ -
+ -	if (!p->core_cookie)
+ -		return;
+ -
+ -	rb_add(&p->core_node, &rq->core_tree, rb_sched_core_less);
+ -}
+ -
+ -void sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags)
+ -{
+ -	rq->core->core_task_seq++;
+ -
+ -	if (sched_core_enqueued(p)) {
+ -		rb_erase(&p->core_node, &rq->core_tree);
+ -		RB_CLEAR_NODE(&p->core_node);
+ -	}
+ -
+ -	/*
+ -	 * Migrating the last task off the cpu, with the cpu in forced idle
+ -	 * state. Reschedule to create an accounting edge for forced idle,
+ -	 * and re-examine whether the core is still in forced idle state.
+ -	 */
+ -	if (!(flags & DEQUEUE_SAVE) && rq->nr_running == 1 &&
+ -	    rq->core->core_forceidle_count && rq->curr == rq->idle)
+ -		resched_curr(rq);
+ -}
+++<<<<<<< HEAD
+ +const_debug unsigned int sysctl_sched_nr_migrate = 32;
+  
+  /*
+ - * Find left-most (aka, highest priority) task matching @cookie.
+ + * period over which we measure -rt task CPU usage in us.
+ + * default: 1s
+   */
+ -static struct task_struct *sched_core_find(struct rq *rq, unsigned long cookie)
+ -{
+ -	struct rb_node *node;
+ -
+ -	node = rb_find_first((void *)cookie, &rq->core_tree, rb_sched_core_cmp);
+ -	/*
+ -	 * The idle task always matches any cookie!
+ -	 */
+ -	if (!node)
+ -		return idle_sched_class.pick_task(rq);
+ -
+ -	return __node_2_sc(node);
+ -}
+ -
+ -static struct task_struct *sched_core_next(struct task_struct *p, unsigned long cookie)
+ -{
+ -	struct rb_node *node = &p->core_node;
+ -
+ -	node = rb_next(node);
+ -	if (!node)
+ -		return NULL;
+ -
+ -	p = container_of(node, struct task_struct, core_node);
+ -	if (p->core_cookie != cookie)
+ -		return NULL;
+ +unsigned int sysctl_sched_rt_period = 1000000;
+++=======
+++const_debug unsigned int sysctl_sched_nr_migrate = SCHED_NR_MIGRATE_BREAK;
+++>>>>>>> c59862f8265f (sched/fair: Cleanup loop_max and loop_break)
+  
+ -	return p;
+ -}
+ +__read_mostly int scheduler_running;
+  
+  /*
+ - * Magic required such that:
+ - *
+ - *	raw_spin_rq_lock(rq);
+ - *	...
+ - *	raw_spin_rq_unlock(rq);
+ - *
+ - * ends up locking and unlocking the _same_ lock, and all CPUs
+ - * always agree on what rq has what lock.
+ - *
+ - * XXX entirely possible to selectively enable cores, don't bother for now.
+ + * part of the period that we allow rt tasks to run in us.
+ + * default: 0.95s
+   */
+ +int sysctl_sched_rt_runtime = 950000;
+  
+ -static DEFINE_MUTEX(sched_core_mutex);
+ -static atomic_t sched_core_count;
+ -static struct cpumask sched_core_mask;
+ -
+ -static void sched_core_lock(int cpu, unsigned long *flags)
+ -{
+ -	const struct cpumask *smt_mask = cpu_smt_mask(cpu);
+ -	int t, i = 0;
+ -
+ -	local_irq_save(*flags);
+ -	for_each_cpu(t, smt_mask)
+ -		raw_spin_lock_nested(&cpu_rq(t)->__lock, i++);
+ -}
+ -
+ -static void sched_core_unlock(int cpu, unsigned long *flags)
+ -{
+ -	const struct cpumask *smt_mask = cpu_smt_mask(cpu);
+ -	int t;
+ -
+ -	for_each_cpu(t, smt_mask)
+ -		raw_spin_unlock(&cpu_rq(t)->__lock);
+ -	local_irq_restore(*flags);
+ -}
+ -
+ -static void __sched_core_flip(bool enabled)
+ -{
+ -	unsigned long flags;
+ -	int cpu, t;
+ -
+ -	cpus_read_lock();
+ -
+ -	/*
+ -	 * Toggle the online cores, one by one.
+ -	 */
+ -	cpumask_copy(&sched_core_mask, cpu_online_mask);
+ -	for_each_cpu(cpu, &sched_core_mask) {
+ -		const struct cpumask *smt_mask = cpu_smt_mask(cpu);
+ -
+ -		sched_core_lock(cpu, &flags);
+ -
+ -		for_each_cpu(t, smt_mask)
+ -			cpu_rq(t)->core_enabled = enabled;
+ -
+ -		cpu_rq(cpu)->core->core_forceidle_start = 0;
+ -
+ -		sched_core_unlock(cpu, &flags);
+ -
+ -		cpumask_andnot(&sched_core_mask, &sched_core_mask, smt_mask);
+ -	}
+ -
+ -	/*
+ -	 * Toggle the offline CPUs.
+ -	 */
+ -	cpumask_copy(&sched_core_mask, cpu_possible_mask);
+ -	cpumask_andnot(&sched_core_mask, &sched_core_mask, cpu_online_mask);
+ -
+ -	for_each_cpu(cpu, &sched_core_mask)
+ -		cpu_rq(cpu)->core_enabled = enabled;
+ -
+ -	cpus_read_unlock();
+ -}
+ -
+ -static void sched_core_assert_empty(void)
+ -{
+ -	int cpu;
+ -
+ -	for_each_possible_cpu(cpu)
+ -		WARN_ON_ONCE(!RB_EMPTY_ROOT(&cpu_rq(cpu)->core_tree));
+ -}
+ -
+ -static void __sched_core_enable(void)
+ -{
+ -	static_branch_enable(&__sched_core_enabled);
+ -	/*
+ -	 * Ensure all previous instances of raw_spin_rq_*lock() have finished
+ -	 * and future ones will observe !sched_core_disabled().
+ -	 */
+ -	synchronize_rcu();
+ -	__sched_core_flip(true);
+ -	sched_core_assert_empty();
+ -}
+ -
+ -static void __sched_core_disable(void)
+ -{
+ -	sched_core_assert_empty();
+ -	__sched_core_flip(false);
+ -	static_branch_disable(&__sched_core_enabled);
+ -}
+ -
+ -void sched_core_get(void)
+ -{
+ -	if (atomic_inc_not_zero(&sched_core_count))
+ -		return;
+ -
+ -	mutex_lock(&sched_core_mutex);
+ -	if (!atomic_read(&sched_core_count))
+ -		__sched_core_enable();
+ -
+ -	smp_mb__before_atomic();
+ -	atomic_inc(&sched_core_count);
+ -	mutex_unlock(&sched_core_mutex);
+ -}
+ -
+ -static void __sched_core_put(struct work_struct *work)
+ -{
+ -	if (atomic_dec_and_mutex_lock(&sched_core_count, &sched_core_mutex)) {
+ -		__sched_core_disable();
+ -		mutex_unlock(&sched_core_mutex);
+ -	}
+ -}
+ -
+ -void sched_core_put(void)
+ -{
+ -	static DECLARE_WORK(_work, __sched_core_put);
+ -
+ -	/*
+ -	 * "There can be only one"
+ -	 *
+ -	 * Either this is the last one, or we don't actually need to do any
+ -	 * 'work'. If it is the last *again*, we rely on
+ -	 * WORK_STRUCT_PENDING_BIT.
+ -	 */
+ -	if (!atomic_add_unless(&sched_core_count, -1, 1))
+ -		schedule_work(&_work);
+ -}
+ -
+ -#else /* !CONFIG_SCHED_CORE */
+ -
+ -static inline void sched_core_enqueue(struct rq *rq, struct task_struct *p) { }
+ -static inline void
+ -sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags) { }
+ -
+ -#endif /* CONFIG_SCHED_CORE */
+  
+  /*
+   * Serialization rules:
+* Unmerged path kernel/sched/core.c
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 6d54e9a73d90..d285bdc5dedf 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -7762,8 +7762,6 @@ static struct task_struct *detach_one_task(struct lb_env *env)
+ 	return NULL;
+ }
+ 
+-static const unsigned int sched_nr_migrate_break = 32;
+-
+ /*
+  * detach_tasks() -- tries to detach up to imbalance load/util/tasks from
+  * busiest_rq, as part of a balancing operation within domain "sd".
+@@ -7812,7 +7810,7 @@ static int detach_tasks(struct lb_env *env)
+ 
+ 		/* take a breather every nr_migrate tasks */
+ 		if (env->loop > env->loop_break) {
+-			env->loop_break += sched_nr_migrate_break;
++			env->loop_break += SCHED_NR_MIGRATE_BREAK;
+ 			env->flags |= LBF_NEED_BREAK;
+ 			break;
+ 		}
+@@ -9831,14 +9829,13 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 	struct rq *busiest;
+ 	struct rq_flags rf;
+ 	struct cpumask *cpus = this_cpu_cpumask_var_ptr(load_balance_mask);
+-
+ 	struct lb_env env = {
+ 		.sd		= sd,
+ 		.dst_cpu	= this_cpu,
+ 		.dst_rq		= this_rq,
+ 		.dst_grpmask    = sched_group_span(sd->groups),
+ 		.idle		= idle,
+-		.loop_break	= sched_nr_migrate_break,
++		.loop_break	= SCHED_NR_MIGRATE_BREAK,
+ 		.cpus		= cpus,
+ 		.fbq_type	= all,
+ 		.tasks		= LIST_HEAD_INIT(env.tasks),
+@@ -9947,7 +9944,7 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 			env.dst_cpu	 = env.new_dst_cpu;
+ 			env.flags	&= ~LBF_DST_PINNED;
+ 			env.loop	 = 0;
+-			env.loop_break	 = sched_nr_migrate_break;
++			env.loop_break	 = SCHED_NR_MIGRATE_BREAK;
+ 
+ 			/*
+ 			 * Go back to "more_balance" rather than "redo" since we
+@@ -9979,7 +9976,7 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 			 */
+ 			if (!cpumask_subset(cpus, env.dst_grpmask)) {
+ 				env.loop = 0;
+-				env.loop_break = sched_nr_migrate_break;
++				env.loop_break = SCHED_NR_MIGRATE_BREAK;
+ 				goto redo;
+ 			}
+ 			goto out_all_pinned;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 73b3a9a64bda..6a24da3889c1 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2112,6 +2112,12 @@ extern void deactivate_task(struct rq *rq, struct task_struct *p, int flags);
+ 
+ extern void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags);
+ 
++#ifdef CONFIG_PREEMPT_RT
++#define SCHED_NR_MIGRATE_BREAK 8
++#else
++#define SCHED_NR_MIGRATE_BREAK 32
++#endif
++
+ extern const_debug unsigned int sysctl_sched_nr_migrate;
+ extern const_debug unsigned int sysctl_sched_migration_cost;
+ 
