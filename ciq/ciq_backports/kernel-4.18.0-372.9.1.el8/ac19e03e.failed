@@ -1,0 +1,186 @@
+ice: allow process VF opcodes in different ways
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+commit ac19e03ef7809a4e42062da476bd16320262a1de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/ac19e03e.failed
+
+In switchdev driver shouldn't add MAC, VLAN and promisc
+filters on iavf demand but should return success to not
+break normal iavf flow.
+
+Achieve that by creating table of functions pointer with
+default functions used to parse iavf command. While parse
+iavf command, call correct function from table instead of
+calling function direct.
+
+When port representors are being created change functions
+in table to new one that behaves correctly for switchdev
+puprose (ignoring new filters).
+
+Change back to default ops when representors are being
+removed.
+
+Co-developed-by: Wojciech Drewek <wojciech.drewek@intel.com>
+	Signed-off-by: Wojciech Drewek <wojciech.drewek@intel.com>
+	Signed-off-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+	Tested-by: Sandeep Penigalapati <sandeep.penigalapati@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit ac19e03ef7809a4e42062da476bd16320262a1de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+index d3bf2016c3ba,0b80b5a52e8a..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+@@@ -1937,7 -1895,7 +1937,11 @@@ static void ice_set_dflt_settings_vfs(s
+  		ice_vf_ctrl_invalidate_vsi(vf);
+  		ice_vf_fdir_init(vf);
+  
+++<<<<<<< HEAD
+ +		mutex_init(&vf->cfg_lock);
+++=======
++ 		ice_vc_set_dflt_vf_ops(&vf->vc_ops);
+++>>>>>>> ac19e03ef780 (ice: allow process VF opcodes in different ways)
+  	}
+  }
+  
+@@@ -4498,21 -4604,12 +4643,21 @@@ error_handler
+  		return;
+  	}
+  
+ +	/* VF is being configured in another context that triggers a VFR, so no
+ +	 * need to process this message
+ +	 */
+ +	if (!mutex_trylock(&vf->cfg_lock)) {
+ +		dev_info(dev, "VF %u is being configured in another context that will trigger a VFR, so there is no need to handle this message\n",
+ +			 vf->vf_id);
+ +		return;
+ +	}
+ +
+  	switch (v_opcode) {
+  	case VIRTCHNL_OP_VERSION:
+- 		err = ice_vc_get_ver_msg(vf, msg);
++ 		err = ops->get_ver_msg(vf, msg);
+  		break;
+  	case VIRTCHNL_OP_GET_VF_RESOURCES:
+- 		err = ice_vc_get_vf_res_msg(vf, msg);
++ 		err = ops->get_vf_res_msg(vf, msg);
+  		if (ice_vf_init_vlan_stripping(vf))
+  			dev_err(dev, "Failed to initialize VLAN stripping for VF %d\n",
+  				vf->vf_id);
+diff --git a/drivers/net/ethernet/intel/ice/ice_repr.c b/drivers/net/ethernet/intel/ice/ice_repr.c
+index 479da3d020a7..d7fa1ff487a5 100644
+--- a/drivers/net/ethernet/intel/ice/ice_repr.c
++++ b/drivers/net/ethernet/intel/ice/ice_repr.c
+@@ -228,15 +228,24 @@ int ice_repr_add_for_all_vfs(struct ice_pf *pf)
+ 	int i;
+ 
+ 	ice_for_each_vf(pf, i) {
+-		err = ice_repr_add(&pf->vf[i]);
++		struct ice_vf *vf = &pf->vf[i];
++
++		err = ice_repr_add(vf);
+ 		if (err)
+ 			goto err;
++
++		ice_vc_change_ops_to_repr(&vf->vc_ops);
+ 	}
++
+ 	return 0;
+ 
+ err:
+-	for (i = i - 1; i >= 0; i--)
+-		ice_repr_rem(&pf->vf[i]);
++	for (i = i - 1; i >= 0; i--) {
++		struct ice_vf *vf = &pf->vf[i];
++
++		ice_repr_rem(vf);
++		ice_vc_set_dflt_vf_ops(&vf->vc_ops);
++	}
+ 
+ 	return err;
+ }
+@@ -249,6 +258,10 @@ void ice_repr_rem_from_all_vfs(struct ice_pf *pf)
+ {
+ 	int i;
+ 
+-	ice_for_each_vf(pf, i)
+-		ice_repr_rem(&pf->vf[i]);
++	ice_for_each_vf(pf, i) {
++		struct ice_vf *vf = &pf->vf[i];
++
++		ice_repr_rem(vf);
++		ice_vc_set_dflt_vf_ops(&vf->vc_ops);
++	}
+ }
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+index abaffb3b28a7..8968a63178e1 100644
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+@@ -70,6 +70,32 @@ struct ice_mdd_vf_events {
+ 	u16 last_printed;
+ };
+ 
++struct ice_vf;
++
++struct ice_vc_vf_ops {
++	int (*get_ver_msg)(struct ice_vf *vf, u8 *msg);
++	int (*get_vf_res_msg)(struct ice_vf *vf, u8 *msg);
++	void (*reset_vf)(struct ice_vf *vf);
++	int (*add_mac_addr_msg)(struct ice_vf *vf, u8 *msg);
++	int (*del_mac_addr_msg)(struct ice_vf *vf, u8 *msg);
++	int (*cfg_qs_msg)(struct ice_vf *vf, u8 *msg);
++	int (*ena_qs_msg)(struct ice_vf *vf, u8 *msg);
++	int (*dis_qs_msg)(struct ice_vf *vf, u8 *msg);
++	int (*request_qs_msg)(struct ice_vf *vf, u8 *msg);
++	int (*cfg_irq_map_msg)(struct ice_vf *vf, u8 *msg);
++	int (*config_rss_key)(struct ice_vf *vf, u8 *msg);
++	int (*config_rss_lut)(struct ice_vf *vf, u8 *msg);
++	int (*get_stats_msg)(struct ice_vf *vf, u8 *msg);
++	int (*cfg_promiscuous_mode_msg)(struct ice_vf *vf, u8 *msg);
++	int (*add_vlan_msg)(struct ice_vf *vf, u8 *msg);
++	int (*remove_vlan_msg)(struct ice_vf *vf, u8 *msg);
++	int (*ena_vlan_stripping)(struct ice_vf *vf);
++	int (*dis_vlan_stripping)(struct ice_vf *vf);
++	int (*handle_rss_cfg_msg)(struct ice_vf *vf, u8 *msg, bool add);
++	int (*add_fdir_fltr_msg)(struct ice_vf *vf, u8 *msg);
++	int (*del_fdir_fltr_msg)(struct ice_vf *vf, u8 *msg);
++};
++
+ /* VF information structure */
+ struct ice_vf {
+ 	struct ice_pf *pf;
+@@ -120,6 +146,8 @@ struct ice_vf {
+ 
+ 	struct ice_repr *repr;
+ 
++	struct ice_vc_vf_ops vc_ops;
++
+ 	/* devlink port data */
+ 	struct devlink_port devlink_port;
+ };
+@@ -137,6 +165,8 @@ void ice_vc_process_vf_msg(struct ice_pf *pf, struct ice_rq_event_info *event);
+ void ice_vc_notify_link_state(struct ice_pf *pf);
+ void ice_vc_notify_reset(struct ice_pf *pf);
+ void ice_vc_notify_vf_link_state(struct ice_vf *vf);
++void ice_vc_change_ops_to_repr(struct ice_vc_vf_ops *ops);
++void ice_vc_set_dflt_vf_ops(struct ice_vc_vf_ops *ops);
+ bool ice_reset_all_vfs(struct ice_pf *pf, bool is_vflr);
+ bool ice_reset_vf(struct ice_vf *vf, bool is_vflr);
+ void ice_restore_all_vfs_msi_state(struct pci_dev *pdev);
+@@ -182,6 +212,8 @@ void ice_vc_process_vf_msg(struct ice_pf *pf, struct ice_rq_event_info *event) {
+ static inline void ice_vc_notify_link_state(struct ice_pf *pf) { }
+ static inline void ice_vc_notify_reset(struct ice_pf *pf) { }
+ static inline void ice_vc_notify_vf_link_state(struct ice_vf *vf) { }
++static inline void ice_vc_change_ops_to_repr(struct ice_vc_vf_ops *ops) { }
++static inline void ice_vc_set_dflt_vf_ops(struct ice_vc_vf_ops *ops) { }
+ static inline void ice_set_vf_state_qs_dis(struct ice_vf *vf) { }
+ static inline
+ void ice_vf_lan_overflow_event(struct ice_pf *pf, struct ice_rq_event_info *event) { }
