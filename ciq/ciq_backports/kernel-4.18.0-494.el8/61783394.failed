@@ -1,0 +1,188 @@
+vfio/ccw: populate page_array struct inline
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-494.el8
+commit-author Eric Farman <farman@linux.ibm.com>
+commit 61783394f4eb3a8a0944005ea2761c011788a9c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-494.el8/61783394.failed
+
+There are two possible ways the list of addresses that get passed
+to vfio are calculated. One is from a guest IDAL, which would be
+an array of (probably) non-contiguous addresses. The other is
+built from contiguous pages that follow the starting address
+provided by ccw->cda.
+
+page_array_alloc() attempts to simplify things by pre-populating
+this array from the starting address, but that's not needed for
+a CCW with an IDAL anyway so doesn't need to be in the allocator.
+Move it to the caller in the non-IDAL case, since it will be
+overwritten when reading the guest IDAL.
+
+Remove the initialization of the pa_page output pointers,
+since it won't be explicitly needed for either case.
+
+	Signed-off-by: Eric Farman <farman@linux.ibm.com>
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 61783394f4eb3a8a0944005ea2761c011788a9c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/cio/vfio_ccw_cp.c
+diff --cc drivers/s390/cio/vfio_ccw_cp.c
+index 3054373c1ee5,f448aa93007f..000000000000
+--- a/drivers/s390/cio/vfio_ccw_cp.c
++++ b/drivers/s390/cio/vfio_ccw_cp.c
+@@@ -40,53 -40,74 +40,68 @@@ struct ccwchain 
+  };
+  
+  /*
+++<<<<<<< HEAD
+ + * pfn_array_alloc() - alloc memory for PFNs
+ + * @pa: pfn_array on which to perform the operation
+ + * @iova: target guest physical address
+ + * @len: number of bytes that should be pinned from @iova
+++=======
++  * page_array_alloc() - alloc memory for page array
++  * @pa: page_array on which to perform the operation
++  * @len: number of pages that should be pinned from @iova
+++>>>>>>> 61783394f4eb (vfio/ccw: populate page_array struct inline)
+   *
+ - * Attempt to allocate memory for page array.
+ + * Attempt to allocate memory for PFNs.
+   *
+ - * Usage of page_array:
+ - * We expect (pa_nr == 0) and (pa_iova == NULL), any field in
+ + * Usage of pfn_array:
+ + * We expect (pa_nr == 0) and (pa_iova_pfn == NULL), any field in
+   * this structure will be filled in by this function.
+   *
+   * Returns:
+ - *         0 if page array is allocated
+ - *   -EINVAL if pa->pa_nr is not initially zero, or pa->pa_iova is not NULL
+ + *         0 if PFNs are allocated
+ + *   -EINVAL if pa->pa_nr is not initially zero, or pa->pa_iova_pfn is not NULL
+   *   -ENOMEM if alloc failed
+   */
+++<<<<<<< HEAD
+ +static int pfn_array_alloc(struct pfn_array *pa, u64 iova, unsigned int len)
+ +{
+ +	int i;
+ +
+ +	if (pa->pa_nr || pa->pa_iova_pfn)
+++=======
++ static int page_array_alloc(struct page_array *pa, unsigned int len)
++ {
++ 	if (pa->pa_nr || pa->pa_iova)
+++>>>>>>> 61783394f4eb (vfio/ccw: populate page_array struct inline)
+  		return -EINVAL;
+  
+ -	if (len == 0)
+ -		return -EINVAL;
+ -
+ -	pa->pa_nr = len;
+ +	pa->pa_iova = iova;
+  
+ -	pa->pa_iova = kcalloc(len, sizeof(*pa->pa_iova), GFP_KERNEL);
+ -	if (!pa->pa_iova)
+ -		return -ENOMEM;
+ +	pa->pa_nr = ((iova & ~PAGE_MASK) + len + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
+ +	if (!pa->pa_nr)
+ +		return -EINVAL;
+  
+ -	pa->pa_page = kcalloc(len, sizeof(*pa->pa_page), GFP_KERNEL);
+ -	if (!pa->pa_page) {
+ -		kfree(pa->pa_iova);
+ +	pa->pa_iova_pfn = kcalloc(pa->pa_nr,
+ +				  sizeof(*pa->pa_iova_pfn) +
+ +				  sizeof(*pa->pa_pfn),
+ +				  GFP_KERNEL);
+ +	if (unlikely(!pa->pa_iova_pfn)) {
+ +		pa->pa_nr = 0;
+  		return -ENOMEM;
+  	}
+ -
+ -	return 0;
+ -}
+ -
+ -/*
+ - * page_array_unpin() - Unpin user pages in memory
+ - * @pa: page_array on which to perform the operation
+ - * @vdev: the vfio device to perform the operation
+ - * @pa_nr: number of user pages to unpin
+ - *
+ - * Only unpin if any pages were pinned to begin with, i.e. pa_nr > 0,
+ - * otherwise only clear pa->pa_nr
+ - */
+ -static void page_array_unpin(struct page_array *pa,
+ -			     struct vfio_device *vdev, int pa_nr)
+ -{
+ -	int unpinned = 0, npage = 1;
+ -
+ -	while (unpinned < pa_nr) {
+ -		dma_addr_t *first = &pa->pa_iova[unpinned];
+ -		dma_addr_t *last = &first[npage];
+ -
+ -		if (unpinned + npage < pa_nr &&
+ -		    *first + npage * PAGE_SIZE == *last) {
+ -			npage++;
+ -			continue;
+ -		}
+ -
+ -		vfio_unpin_pages(vdev, *first, npage);
+ -		unpinned += npage;
+ -		npage = 1;
+ +	pa->pa_pfn = pa->pa_iova_pfn + pa->pa_nr;
+ +
+++<<<<<<< HEAD
+ +	pa->pa_iova_pfn[0] = pa->pa_iova >> PAGE_SHIFT;
+ +	pa->pa_pfn[0] = -1ULL;
+ +	for (i = 1; i < pa->pa_nr; i++) {
+ +		pa->pa_iova_pfn[i] = pa->pa_iova_pfn[i - 1] + 1;
+ +		pa->pa_pfn[i] = -1ULL;
+  	}
+  
+ -	pa->pa_nr = 0;
+++=======
+++>>>>>>> 61783394f4eb (vfio/ccw: populate page_array struct inline)
+ +	return 0;
+  }
+  
+  /*
+@@@ -548,8 -538,7 +563,12 @@@ static int ccwchain_fetch_direct(struc
+  	 * required for the data transfer, since we only only support
+  	 * 4K IDAWs today.
+  	 */
+++<<<<<<< HEAD
+ +	pa = chain->ch_pa + idx;
+ +	ret = pfn_array_alloc(pa, iova, bytes);
+++=======
++ 	ret = page_array_alloc(pa, idaw_nr);
+++>>>>>>> 61783394f4eb (vfio/ccw: populate page_array struct inline)
+  	if (ret < 0)
+  		goto out_free_idaws;
+  
+@@@ -564,13 -553,11 +583,19 @@@
+  		 * occupy is not contiguous.
+  		 */
+  		for (i = 0; i < idaw_nr; i++)
+ -			pa->pa_iova[i] = idaws[i];
+ +			pa->pa_iova_pfn[i] = idaws[i] >> PAGE_SHIFT;
+  	} else {
+++<<<<<<< HEAD
+ +		/*
+ +		 * No action is required here; the iova addresses in pfn_array
+ +		 * were initialized sequentially in pfn_array_alloc() beginning
+ +		 * with the contents of ccw->cda.
+ +		 */
+++=======
++ 		pa->pa_iova[0] = iova;
++ 		for (i = 1; i < pa->pa_nr; i++)
++ 			pa->pa_iova[i] = pa->pa_iova[i - 1] + PAGE_SIZE;
+++>>>>>>> 61783394f4eb (vfio/ccw: populate page_array struct inline)
+  	}
+  
+  	if (ccw_does_data_transfer(ccw)) {
+* Unmerged path drivers/s390/cio/vfio_ccw_cp.c
