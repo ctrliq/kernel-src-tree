@@ -1,0 +1,246 @@
+mm: gup: make fault_in_safe_writeable() use fixup_user_fault()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.16.1.el8_6
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit fe673d3f5bf1fc50cdc4b754831db91a2ec10126
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.16.1.el8_6/fe673d3f.failed
+
+Instead of using GUP, make fault_in_safe_writeable() actually force a
+'handle_mm_fault()' using the same fixup_user_fault() machinery that
+futexes already use.
+
+Using the GUP machinery meant that fault_in_safe_writeable() did not do
+everything that a real fault would do, ranging from not auto-expanding
+the stack segment, to not updating accessed or dirty flags in the page
+tables (GUP sets those flags on the pages themselves).
+
+The latter causes problems on architectures (like s390) that do accessed
+bit handling in software, which meant that fault_in_safe_writeable()
+didn't actually do all the fault handling it needed to, and trying to
+access the user address afterwards would still cause faults.
+
+Reported-and-tested-by: Andreas Gruenbacher <agruenba@redhat.com>
+Fixes: cdd591fc86e3 ("iov_iter: Introduce fault_in_iov_iter_writeable")
+Link: https://lore.kernel.org/all/CAHc6FU5nP+nziNGG0JAF1FUx-GV7kKFvM7aZuU_XD2_1v4vnvg@mail.gmail.com/
+	Acked-by: David Hildenbrand <david@redhat.com>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit fe673d3f5bf1fc50cdc4b754831db91a2ec10126)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/gup.c
+diff --cc mm/gup.c
+index 992475088545,7bc1ba9ce440..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -1652,40 -1688,174 +1652,92 @@@ finish_or_fault
+  }
+  #endif /* !CONFIG_MMU */
+  
+ -/**
+ - * fault_in_writeable - fault in userspace address range for writing
+ - * @uaddr: start of address range
+ - * @size: size of address range
+ - *
+ - * Returns the number of bytes not faulted in (like copy_to_user() and
+ - * copy_from_user()).
+ - */
+ -size_t fault_in_writeable(char __user *uaddr, size_t size)
+ +#if defined(CONFIG_FS_DAX) || defined (CONFIG_CMA)
+ +static bool check_dax_vmas(struct vm_area_struct **vmas, long nr_pages)
+  {
+ -	char __user *start = uaddr, *end;
+ +	long i;
+ +	struct vm_area_struct *vma_prev = NULL;
+  
+ -	if (unlikely(size == 0))
+ -		return 0;
+ -	if (!user_write_access_begin(uaddr, size))
+ -		return size;
+ -	if (!PAGE_ALIGNED(uaddr)) {
+ -		unsafe_put_user(0, uaddr, out);
+ -		uaddr = (char __user *)PAGE_ALIGN((unsigned long)uaddr);
+ -	}
+ -	end = (char __user *)PAGE_ALIGN((unsigned long)start + size);
+ -	if (unlikely(end < start))
+ -		end = NULL;
+ -	while (uaddr != end) {
+ -		unsafe_put_user(0, uaddr, out);
+ -		uaddr += PAGE_SIZE;
+ -	}
+ +	for (i = 0; i < nr_pages; i++) {
+ +		struct vm_area_struct *vma = vmas[i];
+  
+++<<<<<<< HEAD
+ +		if (vma == vma_prev)
+ +			continue;
+ +
+ +		vma_prev = vma;
+ +
+ +		if (vma_is_fsdax(vma))
+ +			return true;
+ +	}
+ +	return false;
+++=======
++ out:
++ 	user_write_access_end();
++ 	if (size > uaddr - start)
++ 		return size - (uaddr - start);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(fault_in_writeable);
++ 
++ /*
++  * fault_in_safe_writeable - fault in an address range for writing
++  * @uaddr: start of address range
++  * @size: length of address range
++  *
++  * Faults in an address range for writing.  This is primarily useful when we
++  * already know that some or all of the pages in the address range aren't in
++  * memory.
++  *
++  * Unlike fault_in_writeable(), this function is non-destructive.
++  *
++  * Note that we don't pin or otherwise hold the pages referenced that we fault
++  * in.  There's no guarantee that they'll stay in memory for any duration of
++  * time.
++  *
++  * Returns the number of bytes not faulted in, like copy_to_user() and
++  * copy_from_user().
++  */
++ size_t fault_in_safe_writeable(const char __user *uaddr, size_t size)
++ {
++ 	unsigned long start = (unsigned long)uaddr, end;
++ 	struct mm_struct *mm = current->mm;
++ 	bool unlocked = false;
++ 
++ 	if (unlikely(size == 0))
++ 		return 0;
++ 	end = PAGE_ALIGN(start + size);
++ 	if (end < start)
++ 		end = 0;
++ 
++ 	mmap_read_lock(mm);
++ 	do {
++ 		if (fixup_user_fault(mm, start, FAULT_FLAG_WRITE, &unlocked))
++ 			break;
++ 		start = (start + PAGE_SIZE) & PAGE_MASK;
++ 	} while (start != end);
++ 	mmap_read_unlock(mm);
++ 
++ 	if (size > (unsigned long)uaddr - start)
++ 		return size - ((unsigned long)uaddr - start);
++ 	return 0;
+++>>>>>>> fe673d3f5bf1 (mm: gup: make fault_in_safe_writeable() use fixup_user_fault())
+  }
+ -EXPORT_SYMBOL(fault_in_safe_writeable);
+ -
+ -/**
+ - * fault_in_readable - fault in userspace address range for reading
+ - * @uaddr: start of user address range
+ - * @size: size of user address range
+ - *
+ - * Returns the number of bytes not faulted in (like copy_to_user() and
+ - * copy_from_user()).
+ - */
+ -size_t fault_in_readable(const char __user *uaddr, size_t size)
+ -{
+ -	const char __user *start = uaddr, *end;
+ -	volatile char c;
+ -
+ -	if (unlikely(size == 0))
+ -		return 0;
+ -	if (!user_read_access_begin(uaddr, size))
+ -		return size;
+ -	if (!PAGE_ALIGNED(uaddr)) {
+ -		unsafe_get_user(c, uaddr, out);
+ -		uaddr = (const char __user *)PAGE_ALIGN((unsigned long)uaddr);
+ -	}
+ -	end = (const char __user *)PAGE_ALIGN((unsigned long)start + size);
+ -	if (unlikely(end < start))
+ -		end = NULL;
+ -	while (uaddr != end) {
+ -		unsafe_get_user(c, uaddr, out);
+ -		uaddr += PAGE_SIZE;
+ -	}
+ -
+ -out:
+ -	user_read_access_end();
+ -	(void)c;
+ -	if (size > uaddr - start)
+ -		return size - (uaddr - start);
+ -	return 0;
+ -}
+ -EXPORT_SYMBOL(fault_in_readable);
+ -
+ -/**
+ - * get_dump_page() - pin user page in memory while writing it to core dump
+ - * @addr: user address
+ - *
+ - * Returns struct page pointer of user page pinned for dump,
+ - * to be freed afterwards by put_page().
+ - *
+ - * Returns NULL on any kind of failure - a hole must then be inserted into
+ - * the corefile, to preserve alignment with its headers; and also returns
+ - * NULL wherever the ZERO_PAGE, or an anonymous pte_none, has been found -
+ - * allowing a hole to be left in the corefile to save disk space.
+ - *
+ - * Called without mmap_lock (takes and releases the mmap_lock by itself).
+ - */
+ -#ifdef CONFIG_ELF_CORE
+ -struct page *get_dump_page(unsigned long addr)
+ -{
+ -	struct mm_struct *mm = current->mm;
+ -	struct page *page;
+ -	int locked = 1;
+ -	int ret;
+ -
+ -	if (mmap_read_lock_killable(mm))
+ -		return NULL;
+ -	ret = __get_user_pages_locked(mm, addr, 1, &page, NULL, &locked,
+ -				      FOLL_FORCE | FOLL_DUMP | FOLL_GET);
+ -	if (locked)
+ -		mmap_read_unlock(mm);
+ -	return (ret == 1) ? page : NULL;
+ -}
+ -#endif /* CONFIG_ELF_CORE */
+  
+ -#ifdef CONFIG_MIGRATION
+ -/*
+ - * Check whether all pages are pinnable, if so return number of pages.  If some
+ - * pages are not pinnable, migrate them, and unpin all pages. Return zero if
+ - * pages were migrated, or if some pages were not successfully isolated.
+ - * Return negative error if migration fails.
+ - */
+ -static long check_and_migrate_movable_pages(unsigned long nr_pages,
+ -					    struct page **pages,
+ -					    unsigned int gup_flags)
+ -{
+ -	unsigned long i;
+ -	unsigned long isolation_error_count = 0;
+ -	bool drain_allow = true;
+ -	LIST_HEAD(movable_page_list);
+ -	long ret = 0;
+ -	struct page *prev_head = NULL;
+ -	struct page *head;
+ +#ifdef CONFIG_CMA
+ +static long check_and_migrate_cma_pages(struct task_struct *tsk,
+ +					struct mm_struct *mm,
+ +					unsigned long start,
+ +					unsigned long nr_pages,
+ +					struct page **pages,
+ +					struct vm_area_struct **vmas,
+ +					unsigned int gup_flags)
+ +{
+ +	unsigned long i, isolation_error_count;
+ +	bool drain_allow;
+ +	LIST_HEAD(cma_page_list);
+ +	long ret = nr_pages;
+ +	struct page *prev_head, *head;
+  	struct migration_target_control mtc = {
+  		.nid = NUMA_NO_NODE,
+  		.gfp_mask = GFP_USER | __GFP_NOWARN,
+* Unmerged path mm/gup.c
