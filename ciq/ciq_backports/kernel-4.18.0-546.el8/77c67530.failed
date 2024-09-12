@@ -1,0 +1,275 @@
+nfsd: use locks_inode_context helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-546.el8
+commit-author Jeff Layton <jlayton@kernel.org>
+commit 77c67530e1f95ac25c7075635f32f04367380894
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-546.el8/77c67530.failed
+
+nfsd currently doesn't access i_flctx safely everywhere. This requires a
+smp_load_acquire, as the pointer is set via cmpxchg (a release
+operation).
+
+	Acked-by: Chuck Lever <chuck.lever@oracle.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jeff Layton <jlayton@kernel.org>
+(cherry picked from commit 77c67530e1f95ac25c7075635f32f04367380894)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4state.c
+diff --cc fs/nfsd/nfs4state.c
+index 24186004eecf,da8d0ea66229..000000000000
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@@ -4524,6 -4756,35 +4524,38 @@@ nfs4_share_conflict(struct svc_fh *curr
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool nfsd4_deleg_present(const struct inode *inode)
++ {
++ 	struct file_lock_context *ctx = locks_inode_context(inode);
++ 
++ 	return ctx && !list_empty_careful(&ctx->flc_lease);
++ }
++ 
++ /**
++  * nfsd_wait_for_delegreturn - wait for delegations to be returned
++  * @rqstp: the RPC transaction being executed
++  * @inode: in-core inode of the file being waited for
++  *
++  * The timeout prevents deadlock if all nfsd threads happen to be
++  * tied up waiting for returning delegations.
++  *
++  * Return values:
++  *   %true: delegation was returned
++  *   %false: timed out waiting for delegreturn
++  */
++ bool nfsd_wait_for_delegreturn(struct svc_rqst *rqstp, struct inode *inode)
++ {
++ 	long __maybe_unused timeo;
++ 
++ 	timeo = wait_var_event_timeout(inode, !nfsd4_deleg_present(inode),
++ 				       NFSD_DELEGRETURN_TIMEOUT);
++ 	trace_nfsd_delegret_wakeup(rqstp, inode, timeo);
++ 	return timeo > 0;
++ }
++ 
+++>>>>>>> 77c67530e1f9 (nfsd: use locks_inode_context helper)
+  static void nfsd4_cb_recall_prepare(struct nfsd4_callback *cb)
+  {
+  	struct nfs4_delegation *dp = cb_to_delegation(cb);
+@@@ -5397,6 -5824,191 +5429,194 @@@ static bool state_expired(struct laundr
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NFSD_V4_2_INTER_SSC
++ void nfsd4_ssc_init_umount_work(struct nfsd_net *nn)
++ {
++ 	spin_lock_init(&nn->nfsd_ssc_lock);
++ 	INIT_LIST_HEAD(&nn->nfsd_ssc_mount_list);
++ 	init_waitqueue_head(&nn->nfsd_ssc_waitq);
++ }
++ EXPORT_SYMBOL_GPL(nfsd4_ssc_init_umount_work);
++ 
++ /*
++  * This is called when nfsd is being shutdown, after all inter_ssc
++  * cleanup were done, to destroy the ssc delayed unmount list.
++  */
++ static void nfsd4_ssc_shutdown_umount(struct nfsd_net *nn)
++ {
++ 	struct nfsd4_ssc_umount_item *ni = NULL;
++ 	struct nfsd4_ssc_umount_item *tmp;
++ 
++ 	spin_lock(&nn->nfsd_ssc_lock);
++ 	list_for_each_entry_safe(ni, tmp, &nn->nfsd_ssc_mount_list, nsui_list) {
++ 		list_del(&ni->nsui_list);
++ 		spin_unlock(&nn->nfsd_ssc_lock);
++ 		mntput(ni->nsui_vfsmount);
++ 		kfree(ni);
++ 		spin_lock(&nn->nfsd_ssc_lock);
++ 	}
++ 	spin_unlock(&nn->nfsd_ssc_lock);
++ }
++ 
++ static void nfsd4_ssc_expire_umount(struct nfsd_net *nn)
++ {
++ 	bool do_wakeup = false;
++ 	struct nfsd4_ssc_umount_item *ni = NULL;
++ 	struct nfsd4_ssc_umount_item *tmp;
++ 
++ 	spin_lock(&nn->nfsd_ssc_lock);
++ 	list_for_each_entry_safe(ni, tmp, &nn->nfsd_ssc_mount_list, nsui_list) {
++ 		if (time_after(jiffies, ni->nsui_expire)) {
++ 			if (refcount_read(&ni->nsui_refcnt) > 1)
++ 				continue;
++ 
++ 			/* mark being unmount */
++ 			ni->nsui_busy = true;
++ 			spin_unlock(&nn->nfsd_ssc_lock);
++ 			mntput(ni->nsui_vfsmount);
++ 			spin_lock(&nn->nfsd_ssc_lock);
++ 
++ 			/* waiters need to start from begin of list */
++ 			list_del(&ni->nsui_list);
++ 			kfree(ni);
++ 
++ 			/* wakeup ssc_connect waiters */
++ 			do_wakeup = true;
++ 			continue;
++ 		}
++ 		break;
++ 	}
++ 	if (do_wakeup)
++ 		wake_up_all(&nn->nfsd_ssc_waitq);
++ 	spin_unlock(&nn->nfsd_ssc_lock);
++ }
++ #endif
++ 
++ /* Check if any lock belonging to this lockowner has any blockers */
++ static bool
++ nfs4_lockowner_has_blockers(struct nfs4_lockowner *lo)
++ {
++ 	struct file_lock_context *ctx;
++ 	struct nfs4_ol_stateid *stp;
++ 	struct nfs4_file *nf;
++ 
++ 	list_for_each_entry(stp, &lo->lo_owner.so_stateids, st_perstateowner) {
++ 		nf = stp->st_stid.sc_file;
++ 		ctx = locks_inode_context(nf->fi_inode);
++ 		if (!ctx)
++ 			continue;
++ 		if (locks_owner_has_blockers(ctx, lo))
++ 			return true;
++ 	}
++ 	return false;
++ }
++ 
++ static bool
++ nfs4_anylock_blockers(struct nfs4_client *clp)
++ {
++ 	int i;
++ 	struct nfs4_stateowner *so;
++ 	struct nfs4_lockowner *lo;
++ 
++ 	if (atomic_read(&clp->cl_delegs_in_recall))
++ 		return true;
++ 	spin_lock(&clp->cl_lock);
++ 	for (i = 0; i < OWNER_HASH_SIZE; i++) {
++ 		list_for_each_entry(so, &clp->cl_ownerstr_hashtbl[i],
++ 				so_strhash) {
++ 			if (so->so_is_open_owner)
++ 				continue;
++ 			lo = lockowner(so);
++ 			if (nfs4_lockowner_has_blockers(lo)) {
++ 				spin_unlock(&clp->cl_lock);
++ 				return true;
++ 			}
++ 		}
++ 	}
++ 	spin_unlock(&clp->cl_lock);
++ 	return false;
++ }
++ 
++ static void
++ nfs4_get_client_reaplist(struct nfsd_net *nn, struct list_head *reaplist,
++ 				struct laundry_time *lt)
++ {
++ 	unsigned int maxreap, reapcnt = 0;
++ 	struct list_head *pos, *next;
++ 	struct nfs4_client *clp;
++ 
++ 	maxreap = (atomic_read(&nn->nfs4_client_count) >= nn->nfs4_max_clients) ?
++ 			NFSD_CLIENT_MAX_TRIM_PER_RUN : 0;
++ 	INIT_LIST_HEAD(reaplist);
++ 	spin_lock(&nn->client_lock);
++ 	list_for_each_safe(pos, next, &nn->client_lru) {
++ 		clp = list_entry(pos, struct nfs4_client, cl_lru);
++ 		if (clp->cl_state == NFSD4_EXPIRABLE)
++ 			goto exp_client;
++ 		if (!state_expired(lt, clp->cl_time))
++ 			break;
++ 		if (!atomic_read(&clp->cl_rpc_users)) {
++ 			if (clp->cl_state == NFSD4_ACTIVE)
++ 				atomic_inc(&nn->nfsd_courtesy_clients);
++ 			clp->cl_state = NFSD4_COURTESY;
++ 		}
++ 		if (!client_has_state(clp))
++ 			goto exp_client;
++ 		if (!nfs4_anylock_blockers(clp))
++ 			if (reapcnt >= maxreap)
++ 				continue;
++ exp_client:
++ 		if (!mark_client_expired_locked(clp)) {
++ 			list_add(&clp->cl_lru, reaplist);
++ 			reapcnt++;
++ 		}
++ 	}
++ 	spin_unlock(&nn->client_lock);
++ }
++ 
++ static void
++ nfs4_get_courtesy_client_reaplist(struct nfsd_net *nn,
++ 				struct list_head *reaplist)
++ {
++ 	unsigned int maxreap = 0, reapcnt = 0;
++ 	struct list_head *pos, *next;
++ 	struct nfs4_client *clp;
++ 
++ 	maxreap = NFSD_CLIENT_MAX_TRIM_PER_RUN;
++ 	INIT_LIST_HEAD(reaplist);
++ 
++ 	spin_lock(&nn->client_lock);
++ 	list_for_each_safe(pos, next, &nn->client_lru) {
++ 		clp = list_entry(pos, struct nfs4_client, cl_lru);
++ 		if (clp->cl_state == NFSD4_ACTIVE)
++ 			break;
++ 		if (reapcnt >= maxreap)
++ 			break;
++ 		if (!mark_client_expired_locked(clp)) {
++ 			list_add(&clp->cl_lru, reaplist);
++ 			reapcnt++;
++ 		}
++ 	}
++ 	spin_unlock(&nn->client_lock);
++ }
++ 
++ static void
++ nfs4_process_client_reaplist(struct list_head *reaplist)
++ {
++ 	struct list_head *pos, *next;
++ 	struct nfs4_client *clp;
++ 
++ 	list_for_each_safe(pos, next, reaplist) {
++ 		clp = list_entry(pos, struct nfs4_client, cl_lru);
++ 		trace_nfsd_clid_purged(&clp->cl_clientid);
++ 		list_del_init(&clp->cl_lru);
++ 		expire_client(clp);
++ 	}
++ }
++ 
+++>>>>>>> 77c67530e1f9 (nfsd: use locks_inode_context helper)
+  static time64_t
+  nfs4_laundromat(struct nfsd_net *nn)
+  {
+@@@ -6959,8 -7712,8 +7179,13 @@@ check_for_locks(struct nfs4_file *fp, s
+  		return status;
+  	}
+  
+++<<<<<<< HEAD
+ +	inode = locks_inode(filp);
+ +	flctx = inode->i_flctx;
+++=======
++ 	inode = locks_inode(nf->nf_file);
++ 	flctx = locks_inode_context(inode);
+++>>>>>>> 77c67530e1f9 (nfsd: use locks_inode_context helper)
+  
+  	if (flctx && !list_empty_careful(&flctx->flc_posix)) {
+  		spin_lock(&flctx->flc_lock);
+* Unmerged path fs/nfsd/nfs4state.c
