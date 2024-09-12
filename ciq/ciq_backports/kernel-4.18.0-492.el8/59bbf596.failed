@@ -1,0 +1,239 @@
+iommu/s390: Make attach succeed even if the device is in error state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-492.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 59bbf596791b89c7f88fdcac29dfc39c1221d25d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-492.el8/59bbf596.failed
+
+If a zPCI device is in the error state while switching IOMMU domains
+zpci_register_ioat() will fail and we would end up with the device not
+attached to any domain. In this state since zdev->dma_table == NULL
+a reset via zpci_hot_reset_device() would wrongfully re-initialize the
+device for DMA API usage using zpci_dma_init_device(). As automatic
+recovery is currently disabled while attached to an IOMMU domain this
+only affects slot resets triggered through other means but will affect
+automatic recovery once we switch to using dma-iommu.
+
+Additionally with that switch common code expects attaching to the
+default domain to always work so zpci_register_ioat() should only fail
+if there is no chance to recover anyway, e.g. if the device has been
+unplugged.
+
+Improve the robustness of attach by specifically looking at the status
+returned by zpci_mod_fc() to determine if the device is unavailable and
+in this case simply ignore the error. Once the device is reset
+zpci_hot_reset_device() will then correctly set the domain's DMA
+translation tables.
+
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+Link: https://lore.kernel.org/r/20221109142903.4080275-2-schnelle@linux.ibm.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 59bbf596791b89c7f88fdcac29dfc39c1221d25d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/s390-iommu.c
+diff --cc drivers/iommu/s390-iommu.c
+index 16b29cc4d923,e2c886bc4376..000000000000
+--- a/drivers/iommu/s390-iommu.c
++++ b/drivers/iommu/s390-iommu.c
+@@@ -88,49 -97,37 +88,68 @@@ static int s390_iommu_attach_device(str
+  {
+  	struct s390_domain *s390_domain = to_s390_domain(domain);
+  	struct zpci_dev *zdev = to_zpci_dev(dev);
+ +	struct s390_domain_device *domain_device;
+  	unsigned long flags;
+++<<<<<<< HEAD
+ +	int cc, rc;
+++=======
++ 	u8 status;
++ 	int cc;
+++>>>>>>> 59bbf596791b (iommu/s390: Make attach succeed even if the device is in error state)
+  
+  	if (!zdev)
+  		return -ENODEV;
+  
+ -	if (WARN_ON(domain->geometry.aperture_start > zdev->end_dma ||
+ -		domain->geometry.aperture_end < zdev->start_dma))
+ -		return -EINVAL;
+ +	domain_device = kzalloc(sizeof(*domain_device), GFP_KERNEL);
+ +	if (!domain_device)
+ +		return -ENOMEM;
+  
+ -	if (zdev->s390_domain)
+ -		__s390_iommu_detach_device(zdev);
+ -	else if (zdev->dma_table)
+ -		zpci_dma_exit_device(zdev);
+ +	if (zdev->dma_table) {
+ +		cc = zpci_dma_exit_device(zdev);
+ +		if (cc) {
+ +			rc = -EIO;
+ +			goto out_free;
+ +		}
+ +	}
+  
+ +	zdev->dma_table = s390_domain->dma_table;
+  	cc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+++<<<<<<< HEAD
+ +				virt_to_phys(zdev->dma_table));
+ +	if (cc) {
+ +		rc = -EIO;
+ +		goto out_restore;
+ +	}
+++=======
++ 				virt_to_phys(s390_domain->dma_table), &status);
++ 	/*
++ 	 * If the device is undergoing error recovery the reset code
++ 	 * will re-establish the new domain.
++ 	 */
++ 	if (cc && status != ZPCI_PCI_ST_FUNC_NOT_AVAIL)
++ 		return -EIO;
++ 	zdev->dma_table = s390_domain->dma_table;
++ 
++ 	zdev->dma_table = s390_domain->dma_table;
++ 	zdev->s390_domain = s390_domain;
+++>>>>>>> 59bbf596791b (iommu/s390: Make attach succeed even if the device is in error state)
+  
+  	spin_lock_irqsave(&s390_domain->list_lock, flags);
+ -	list_add(&zdev->iommu_list, &s390_domain->devices);
+ +	/* First device defines the DMA range limits */
+ +	if (list_empty(&s390_domain->devices)) {
+ +		domain->geometry.aperture_start = zdev->start_dma;
+ +		domain->geometry.aperture_end = zdev->end_dma;
+ +		domain->geometry.force_aperture = true;
+ +	/* Allow only devices with identical DMA range limits */
+ +	} else if (domain->geometry.aperture_start != zdev->start_dma ||
+ +		   domain->geometry.aperture_end != zdev->end_dma) {
+ +		rc = -EINVAL;
+ +		spin_unlock_irqrestore(&s390_domain->list_lock, flags);
+ +		goto out_restore;
+ +	}
+ +	domain_device->zdev = zdev;
+ +	zdev->s390_domain = s390_domain;
+ +	list_add(&domain_device->list, &s390_domain->devices);
+  	spin_unlock_irqrestore(&s390_domain->list_lock, flags);
+  
+  	return 0;
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index 8a9c06df3934..15948089980a 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -223,7 +223,7 @@ void zpci_device_reserved(struct zpci_dev *zdev);
+ bool zpci_is_device_configured(struct zpci_dev *zdev);
+ 
+ int zpci_hot_reset_device(struct zpci_dev *zdev);
+-int zpci_register_ioat(struct zpci_dev *, u8, u64, u64, u64);
++int zpci_register_ioat(struct zpci_dev *, u8, u64, u64, u64, u8 *);
+ int zpci_unregister_ioat(struct zpci_dev *, u8);
+ void zpci_remove_reserved_devices(void);
+ void zpci_update_fh(struct zpci_dev *zdev, u32 fh);
+diff --git a/arch/s390/kvm/pci.c b/arch/s390/kvm/pci.c
+index 636a4c030998..e13c7bb35dfb 100644
+--- a/arch/s390/kvm/pci.c
++++ b/arch/s390/kvm/pci.c
+@@ -434,6 +434,7 @@ static void kvm_s390_pci_dev_release(struct zpci_dev *zdev)
+ static int kvm_s390_pci_register_kvm(void *opaque, struct kvm *kvm)
+ {
+ 	struct zpci_dev *zdev = opaque;
++	u8 status;
+ 	int rc;
+ 
+ 	if (!zdev)
+@@ -486,7 +487,7 @@ static int kvm_s390_pci_register_kvm(void *opaque, struct kvm *kvm)
+ 
+ 	/* Re-register the IOMMU that was already created */
+ 	rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+-				virt_to_phys(zdev->dma_table));
++				virt_to_phys(zdev->dma_table), &status);
+ 	if (rc)
+ 		goto clear_gisa;
+ 
+@@ -516,6 +517,7 @@ static void kvm_s390_pci_unregister_kvm(void *opaque)
+ {
+ 	struct zpci_dev *zdev = opaque;
+ 	struct kvm *kvm;
++	u8 status;
+ 
+ 	if (!zdev)
+ 		return;
+@@ -561,7 +563,7 @@ static void kvm_s390_pci_unregister_kvm(void *opaque)
+ 
+ 	/* Re-register the IOMMU that was already created */
+ 	zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+-			   virt_to_phys(zdev->dma_table));
++			   virt_to_phys(zdev->dma_table), &status);
+ 
+ out:
+ 	spin_lock(&kvm->arch.kzdev_list_lock);
+diff --git a/arch/s390/pci/pci.c b/arch/s390/pci/pci.c
+index 460487743ef4..7ef924a4e996 100644
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@ -115,20 +115,20 @@ EXPORT_SYMBOL_GPL(pci_proc_domain);
+ 
+ /* Modify PCI: Register I/O address translation parameters */
+ int zpci_register_ioat(struct zpci_dev *zdev, u8 dmaas,
+-		       u64 base, u64 limit, u64 iota)
++		       u64 base, u64 limit, u64 iota, u8 *status)
+ {
+ 	u64 req = ZPCI_CREATE_REQ(zdev->fh, dmaas, ZPCI_MOD_FC_REG_IOAT);
+ 	struct zpci_fib fib = {0};
+-	u8 cc, status;
++	u8 cc;
+ 
+ 	WARN_ON_ONCE(iota & 0x3fff);
+ 	fib.pba = base;
+ 	fib.pal = limit;
+ 	fib.iota = iota | ZPCI_IOTA_RTTO_FLAG;
+ 	fib.gd = zdev->gisa;
+-	cc = zpci_mod_fc(req, &fib, &status);
++	cc = zpci_mod_fc(req, &fib, status);
+ 	if (cc)
+-		zpci_dbg(3, "reg ioat fid:%x, cc:%d, status:%d\n", zdev->fid, cc, status);
++		zpci_dbg(3, "reg ioat fid:%x, cc:%d, status:%d\n", zdev->fid, cc, *status);
+ 	return cc;
+ }
+ EXPORT_SYMBOL_GPL(zpci_register_ioat);
+@@ -813,6 +813,7 @@ EXPORT_SYMBOL_GPL(zpci_disable_device);
+  */
+ int zpci_hot_reset_device(struct zpci_dev *zdev)
+ {
++	u8 status;
+ 	int rc;
+ 
+ 	zpci_dbg(3, "rst fid:%x, fh:%x\n", zdev->fid, zdev->fh);
+@@ -836,7 +837,7 @@ int zpci_hot_reset_device(struct zpci_dev *zdev)
+ 
+ 	if (zdev->dma_table)
+ 		rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+-					virt_to_phys(zdev->dma_table));
++					virt_to_phys(zdev->dma_table), &status);
+ 	else
+ 		rc = zpci_dma_init_device(zdev);
+ 	if (rc) {
+diff --git a/arch/s390/pci/pci_dma.c b/arch/s390/pci/pci_dma.c
+index d0ce0bf0d404..cbf2793e4a10 100644
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@ -546,6 +546,7 @@ static void s390_dma_unmap_sg(struct device *dev, struct scatterlist *sg,
+ 	
+ int zpci_dma_init_device(struct zpci_dev *zdev)
+ {
++	u8 status;
+ 	int rc;
+ 
+ 	/*
+@@ -597,7 +598,7 @@ int zpci_dma_init_device(struct zpci_dev *zdev)
+ 
+ 	}
+ 	if (zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+-			       virt_to_phys(zdev->dma_table))) {
++			       virt_to_phys(zdev->dma_table), &status)) {
+ 		rc = -EIO;
+ 		goto free_bitmap;
+ 	}
+* Unmerged path drivers/iommu/s390-iommu.c
