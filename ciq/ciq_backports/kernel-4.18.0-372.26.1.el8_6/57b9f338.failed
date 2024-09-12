@@ -1,0 +1,331 @@
+drm/amd/display: Ignore First MST Sideband Message Return Error
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.26.1.el8_6
+commit-author Fangzhi Zuo <Jerry.Zuo@amd.com>
+commit 57b9f3384c64e37bbdad7f127625ac3733d11e5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.26.1.el8_6/57b9f338.failed
+
+[why]
+First MST sideband message returns AUX_RET_ERROR_HPD_DISCON
+on certain intel platform. Aux transaction considered failure
+if HPD unexpected pulled low. The actual aux transaction success
+in such case, hence do not return error.
+
+[how]
+Not returning error when AUX_RET_ERROR_HPD_DISCON detected
+on the first sideband message.
+
+v2: squash in additional DMI entries
+v3: squash in static fix
+
+	Signed-off-by: Fangzhi Zuo <Jerry.Zuo@amd.com>
+	Acked-by: Solomon Chiu <solomon.chiu@amd.com>
+	Tested-by: Daniel Wheeler <daniel.wheeler@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 57b9f3384c64e37bbdad7f127625ac3733d11e5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+#	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+diff --cc drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 085a5ad87ab0,ea22bdae7a6e..000000000000
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@@ -70,7 -72,10 +70,8 @@@
+  #include <linux/pci.h>
+  #include <linux/firmware.h>
+  #include <linux/component.h>
++ #include <linux/dmi.h>
+  
+ -#include <drm/display/drm_dp_mst_helper.h>
+ -#include <drm/display/drm_hdmi_helper.h>
+  #include <drm/drm_atomic.h>
+  #include <drm/drm_atomic_uapi.h>
+  #include <drm/drm_atomic_helper.h>
+@@@ -1089,28 -1266,177 +1090,98 @@@ static void event_mall_stutter(struct w
+  
+  	DRM_DEBUG_KMS("Allow idle optimizations (MALL): %d\n", dm->active_vblank_irq_count == 0);
+  
+ -	/*
+ -	 * Control PSR based on vblank requirements from OS
+ -	 *
+ -	 * If panel supports PSR SU, there's no need to disable PSR when OS is
+ -	 * submitting fast atomic commits (we infer this by whether the OS
+ -	 * requests vblank events). Fast atomic commits will simply trigger a
+ -	 * full-frame-update (FFU); a specific case of selective-update (SU)
+ -	 * where the SU region is the full hactive*vactive region. See
+ -	 * fill_dc_dirty_rects().
+ -	 */
+ -	if (vblank_work->stream && vblank_work->stream->link) {
+ -		if (vblank_work->enable) {
+ -			if (vblank_work->stream->link->psr_settings.psr_version < DC_PSR_VERSION_SU_1 &&
+ -			    vblank_work->stream->link->psr_settings.psr_allow_active)
+ -				amdgpu_dm_psr_disable(vblank_work->stream);
+ -		} else if (vblank_work->stream->link->psr_settings.psr_feature_enabled &&
+ -			   !vblank_work->stream->link->psr_settings.psr_allow_active &&
+ -			   vblank_work->acrtc->dm_irq_params.allow_psr_entry) {
+ -			amdgpu_dm_psr_enable(vblank_work->stream);
+ -		}
+ -	}
+ -
+  	mutex_unlock(&dm->dc_lock);
+ -
+ -	dc_stream_release(vblank_work->stream);
+ -
+ -	kfree(vblank_work);
+  }
+  
+ -static void dm_handle_hpd_rx_offload_work(struct work_struct *work)
+ +static struct vblank_workqueue *vblank_create_workqueue(struct amdgpu_device *adev, struct dc *dc)
+  {
+ -	struct hpd_rx_irq_offload_work *offload_work;
+ -	struct amdgpu_dm_connector *aconnector;
+ -	struct dc_link *dc_link;
+ -	struct amdgpu_device *adev;
+ -	enum dc_connection_type new_connection_type = dc_connection_none;
+ -	unsigned long flags;
+ -
+ -	offload_work = container_of(work, struct hpd_rx_irq_offload_work, work);
+ -	aconnector = offload_work->offload_wq->aconnector;
+ -
+ -	if (!aconnector) {
+ -		DRM_ERROR("Can't retrieve aconnector in hpd_rx_irq_offload_work");
+ -		goto skip;
+ -	}
+ -
+ -	adev = drm_to_adev(aconnector->base.dev);
+ -	dc_link = aconnector->dc_link;
+ -
+ -	mutex_lock(&aconnector->hpd_lock);
+ -	if (!dc_link_detect_sink(dc_link, &new_connection_type))
+ -		DRM_ERROR("KMS: Failed to detect connector\n");
+ -	mutex_unlock(&aconnector->hpd_lock);
+ -
+ -	if (new_connection_type == dc_connection_none)
+ -		goto skip;
+ -
+ -	if (amdgpu_in_reset(adev))
+ -		goto skip;
+  
+ -	mutex_lock(&adev->dm.dc_lock);
+ -	if (offload_work->data.bytes.device_service_irq.bits.AUTOMATED_TEST)
+ -		dc_link_dp_handle_automated_test(dc_link);
+ -	else if ((dc_link->connector_signal != SIGNAL_TYPE_EDP) &&
+ -			hpd_rx_irq_check_link_loss_status(dc_link, &offload_work->data) &&
+ -			dc_link_dp_allow_hpd_rx_irq(dc_link)) {
+ -		dc_link_dp_handle_link_loss(dc_link);
+ -		spin_lock_irqsave(&offload_work->offload_wq->offload_lock, flags);
+ -		offload_work->offload_wq->is_handling_link_loss = false;
+ -		spin_unlock_irqrestore(&offload_work->offload_wq->offload_lock, flags);
+ -	}
+ -	mutex_unlock(&adev->dm.dc_lock);
+ -
+ -skip:
+ -	kfree(offload_work);
+ -
+ -}
+ -
+ -static struct hpd_rx_irq_offload_work_queue *hpd_rx_irq_create_workqueue(struct dc *dc)
+ -{
+  	int max_caps = dc->caps.max_links;
+ +	struct vblank_workqueue *vblank_work;
+  	int i = 0;
+ -	struct hpd_rx_irq_offload_work_queue *hpd_rx_offload_wq = NULL;
+  
+ -	hpd_rx_offload_wq = kcalloc(max_caps, sizeof(*hpd_rx_offload_wq), GFP_KERNEL);
+ -
+ -	if (!hpd_rx_offload_wq)
+ +	vblank_work = kcalloc(max_caps, sizeof(*vblank_work), GFP_KERNEL);
+ +	if (ZERO_OR_NULL_PTR(vblank_work)) {
+ +		kfree(vblank_work);
+  		return NULL;
+ -
+ -
+ -	for (i = 0; i < max_caps; i++) {
+ -		hpd_rx_offload_wq[i].wq =
+ -				    create_singlethread_workqueue("amdgpu_dm_hpd_rx_offload_wq");
+ -
+ -		if (hpd_rx_offload_wq[i].wq == NULL) {
+ -			DRM_ERROR("create amdgpu_dm_hpd_rx_offload_wq fail!");
+ -			return NULL;
+ -		}
+ -
+ -		spin_lock_init(&hpd_rx_offload_wq[i].offload_lock);
+  	}
+  
+ -	return hpd_rx_offload_wq;
+ +	for (i = 0; i < max_caps; i++)
+ +		INIT_WORK(&vblank_work[i].mall_work, event_mall_stutter);
+ +
+ +	return vblank_work;
+  }
+++<<<<<<< HEAD
+ +#endif
+++=======
++ 
++ struct amdgpu_stutter_quirk {
++ 	u16 chip_vendor;
++ 	u16 chip_device;
++ 	u16 subsys_vendor;
++ 	u16 subsys_device;
++ 	u8 revision;
++ };
++ 
++ static const struct amdgpu_stutter_quirk amdgpu_stutter_quirk_list[] = {
++ 	/* https://bugzilla.kernel.org/show_bug.cgi?id=214417 */
++ 	{ 0x1002, 0x15dd, 0x1002, 0x15dd, 0xc8 },
++ 	{ 0, 0, 0, 0, 0 },
++ };
++ 
++ static bool dm_should_disable_stutter(struct pci_dev *pdev)
++ {
++ 	const struct amdgpu_stutter_quirk *p = amdgpu_stutter_quirk_list;
++ 
++ 	while (p && p->chip_device != 0) {
++ 		if (pdev->vendor == p->chip_vendor &&
++ 		    pdev->device == p->chip_device &&
++ 		    pdev->subsystem_vendor == p->subsys_vendor &&
++ 		    pdev->subsystem_device == p->subsys_device &&
++ 		    pdev->revision == p->revision) {
++ 			return true;
++ 		}
++ 		++p;
++ 	}
++ 	return false;
++ }
++ 
++ static const struct dmi_system_id hpd_disconnect_quirk_table[] = {
++ 	{
++ 		.matches = {
++ 			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
++ 			DMI_MATCH(DMI_PRODUCT_NAME, "Precision 3660"),
++ 		},
++ 	},
++ 	{
++ 		.matches = {
++ 			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
++ 			DMI_MATCH(DMI_PRODUCT_NAME, "Precision 3260"),
++ 		},
++ 	},
++ 	{
++ 		.matches = {
++ 			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
++ 			DMI_MATCH(DMI_PRODUCT_NAME, "Precision 3460"),
++ 		},
++ 	},
++ 	{}
++ };
++ 
++ static void retrieve_dmi_info(struct amdgpu_display_manager *dm)
++ {
++ 	const struct dmi_system_id *dmi_id;
++ 
++ 	dm->aux_hpd_discon_quirk = false;
++ 
++ 	dmi_id = dmi_first_match(hpd_disconnect_quirk_table);
++ 	if (dmi_id) {
++ 		dm->aux_hpd_discon_quirk = true;
++ 		DRM_INFO("aux_hpd_discon_quirk attached\n");
++ 	}
++ }
++ 
+++>>>>>>> 57b9f3384c64 (drm/amd/display: Ignore First MST Sideband Message Return Error)
+  static int amdgpu_dm_init(struct amdgpu_device *adev)
+  {
+  	struct dc_init_data init_data;
+@@@ -1199,9 -1549,25 +1270,12 @@@
+  	if (amdgpu_dc_feature_mask & DC_EDP_NO_POWER_SEQUENCING)
+  		init_data.flags.edp_no_power_sequencing = true;
+  
+ -	if (amdgpu_dc_feature_mask & DC_DISABLE_LTTPR_DP1_4A)
+ -		init_data.flags.allow_lttpr_non_transparent_mode.bits.DP1_4A = true;
+ -	if (amdgpu_dc_feature_mask & DC_DISABLE_LTTPR_DP2_0)
+ -		init_data.flags.allow_lttpr_non_transparent_mode.bits.DP2_0 = true;
+ -
+ -	init_data.flags.seamless_boot_edp_requested = false;
+ -
+ -	if (check_seamless_boot_capability(adev)) {
+ -		init_data.flags.seamless_boot_edp_requested = true;
+ -		init_data.flags.allow_seamless_boot_optimization = true;
+ -		DRM_INFO("Seamless boot condition check passed\n");
+ -	}
+ -
+ -	init_data.flags.enable_mipi_converter_optimization = true;
+ +	init_data.flags.power_down_display_on_boot = true;
+  
+  	INIT_LIST_HEAD(&adev->dm.da_list);
++ 
++ 	retrieve_dmi_info(&adev->dm);
++ 
+  	/* Display Core create. */
+  	adev->dm.dc = dc_create(&init_data);
+  
+diff --cc drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index 9522d4ca299e,7bd750e9f891..000000000000
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@@ -443,6 -541,20 +443,23 @@@ struct amdgpu_display_manager 
+  	 * cached backlight values.
+  	 */
+  	u32 brightness[AMDGPU_DM_MAX_NUM_EDP];
+++<<<<<<< HEAD
+++=======
++ 	/**
++ 	 * @actual_brightness:
++ 	 *
++ 	 * last successfully applied backlight values.
++ 	 */
++ 	u32 actual_brightness[AMDGPU_DM_MAX_NUM_EDP];
++ 
++ 	/**
++ 	 * @aux_hpd_discon_quirk:
++ 	 *
++ 	 * quirk for hpd discon while aux is on-going.
++ 	 * occurred on certain intel platform
++ 	 */
++ 	bool aux_hpd_discon_quirk;
+++>>>>>>> 57b9f3384c64 (drm/amd/display: Ignore First MST Sideband Message Return Error)
+  };
+  
+  enum dsc_clock_force_state {
+* Unmerged path drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+* Unmerged path drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
+index e8b195de5de5..b086c741543c 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -55,6 +55,8 @@ static ssize_t dm_dp_aux_transfer(struct drm_dp_aux *aux,
+ 	ssize_t result = 0;
+ 	struct aux_payload payload;
+ 	enum aux_return_code_type operation_result;
++	struct amdgpu_device *adev;
++	struct ddc_service *ddc;
+ 
+ 	if (WARN_ON(msg->size > 16))
+ 		return -E2BIG;
+@@ -71,6 +73,21 @@ static ssize_t dm_dp_aux_transfer(struct drm_dp_aux *aux,
+ 	result = dc_link_aux_transfer_raw(TO_DM_AUX(aux)->ddc_service, &payload,
+ 				      &operation_result);
+ 
++	/*
++	 * w/a on certain intel platform where hpd is unexpected to pull low during
++	 * 1st sideband message transaction by return AUX_RET_ERROR_HPD_DISCON
++	 * aux transaction is succuess in such case, therefore bypass the error
++	 */
++	ddc = TO_DM_AUX(aux)->ddc_service;
++	adev = ddc->ctx->driver_context;
++	if (adev->dm.aux_hpd_discon_quirk) {
++		if (msg->address == DP_SIDEBAND_MSG_DOWN_REQ_BASE &&
++			operation_result == AUX_RET_ERROR_HPD_DISCON) {
++			result = 0;
++			operation_result = AUX_RET_SUCCESS;
++		}
++	}
++
+ 	if (payload.write && result >= 0)
+ 		result = msg->size;
+ 
