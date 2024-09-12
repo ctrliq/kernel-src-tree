@@ -269,6 +269,8 @@ typedef struct xfs_fsop_resblks {
 #define XFS_MIN_AG_BYTES	(1ULL << 24)	/* 16 MB */
 #define XFS_MAX_AG_BYTES	(1ULL << 40)	/* 1 TB */
 
+#define XFS_MAX_AGNUMBER	((xfs_agnumber_t)(NULLAGNUMBER - 1))
+
 /* keep the maximum size under 2^31 by a small amount */
 #define XFS_MAX_LOG_BYTES \
 	((2 * 1024 * 1024 * 1024ULL) - XFS_MIN_LOG_BYTES)
