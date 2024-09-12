@@ -1,0 +1,494 @@
+x86/asm: Make some functions local
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Jiri Slaby <jslaby@suse.cz>
+commit ef1e03152cb027d5925646d4d1772ced7595292f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/ef1e0315.failed
+
+There are a couple of assembly functions which are invoked only locally
+in the file they are defined. In C, they are marked "static". In
+assembly, annotate them using SYM_{FUNC,CODE}_START_LOCAL (and switch
+their ENDPROC to SYM_{FUNC,CODE}_END too). Whether FUNC or CODE is used,
+depends on whether ENDPROC or END was used for a particular function
+before.
+
+	Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Andy Shevchenko <andy@infradead.org>
+	Cc: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Darren Hart <dvhart@infradead.org>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Juergen Gross <jgross@suse.com>
+	Cc: linux-arch@vger.kernel.org
+	Cc: linux-efi <linux-efi@vger.kernel.org>
+	Cc: linux-efi@vger.kernel.org
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: platform-driver-x86@vger.kernel.org
+	Cc: Stefano Stabellini <sstabellini@kernel.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: x86-ml <x86@kernel.org>
+	Cc: xen-devel@lists.xenproject.org
+Link: https://lkml.kernel.org/r/20191011115108.12392-21-jslaby@suse.cz
+(cherry picked from commit ef1e03152cb027d5925646d4d1772ced7595292f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/entry_64.S
+#	arch/x86/lib/copy_page_64.S
+#	arch/x86/lib/memcpy_64.S
+#	arch/x86/lib/memset_64.S
+#	arch/x86/platform/efi/efi_thunk_64.S
+diff --cc arch/x86/entry/entry_64.S
+index 3e0c33312eae,1568da63bf16..000000000000
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@@ -1271,55 -1242,13 +1271,59 @@@ SYM_CODE_START_LOCAL(paranoid_entry
+  	SAVE_AND_SWITCH_TO_KERNEL_CR3 scratch_reg=%rax save_reg=%r14
+  
+  	/*
+ -	 * The above SAVE_AND_SWITCH_TO_KERNEL_CR3 macro doesn't do an
+ -	 * unconditional CR3 write, even in the PTI case.  So do an lfence
+ -	 * to prevent GS speculation, regardless of whether PTI is enabled.
+ +	 * Handling GSBASE depends on the availability of FSGSBASE.
+ +	 *
+ +	 * Without FSGSBASE the kernel enforces that negative GSBASE
+ +	 * values indicate kernel GSBASE. With FSGSBASE no assumptions
+ +	 * can be made about the GSBASE value when entering from user
+ +	 * space.
+  	 */
+ +	ALTERNATIVE "jmp .Lparanoid_entry_checkgs", "", X86_FEATURE_FSGSBASE
+ +
+++<<<<<<< HEAD
+ +	/*
+ +	 * Read the current GSBASE and store it in %rbx unconditionally,
+ +	 * retrieve and set the current CPUs kernel GSBASE. The stored value
+ +	 * has to be restored in paranoid_exit unconditionally.
+ +	 *
+ +	 * The unconditional write to GS base below ensures that no subsequent
+ +	 * loads based on a mispredicted GS base can happen, therefore no LFENCE
+ +	 * is needed here.
+ +	 */
+ +	SAVE_AND_SET_GSBASE scratch_reg=%rax save_reg=%rbx
+ +	jmp .Lparanoid_gsbase_done
+ +
+ +.Lparanoid_entry_checkgs:
+ +	/* EBX = 1 -> kernel GSBASE active, no restore required */
+ +	movl	$1, %ebx
+ +
+ +	/*
+ +	 * The kernel-enforced convention is a negative GSBASE indicates
+ +	 * a kernel value. No SWAPGS needed on entry and exit.
+ +	 */
+ +	movl	$MSR_GS_BASE, %ecx
+ +	rdmsr
+ +	testl	%edx, %edx
+ +	js	.Lparanoid_kernel_gsbase
+ +
+ +	/* EBX = 0 -> SWAPGS required on exit */
+ +	xorl	%ebx, %ebx
+ +	SWAPGS
+ +.Lparanoid_kernel_gsbase:
+  	FENCE_SWAPGS_KERNEL_ENTRY
+ +.Lparanoid_gsbase_done:
+ +
+ +	/*
+ +	 * Once we have CR3 and %GS setup save and set SPEC_CTRL. Just like
+ +	 * CR3 above, keep the old value in a callee saved register.
+ +	 */
+ +	IBRS_ENTER save_reg=%r15
+ +	UNTRAIN_RET
+  
+ +	RET
+++=======
++ 	ret
+++>>>>>>> ef1e03152cb0 (x86/asm: Make some functions local)
+  SYM_CODE_END(paranoid_entry)
+  
+  /*
+@@@ -1347,40 -1266,20 +1351,50 @@@
+  SYM_CODE_START_LOCAL(paranoid_exit)
+  	UNWIND_HINT_REGS
+  	DISABLE_INTERRUPTS(CLBR_ANY)
+ -	TRACE_IRQS_OFF_DEBUG
+ -	testl	%ebx, %ebx			/* swapgs needed? */
+ -	jnz	.Lparanoid_exit_no_swapgs
+ +	TRACE_IRQS_OFF
+  	TRACE_IRQS_IRETQ
+ -	/* Always restore stashed CR3 value (see paranoid_entry) */
+ -	RESTORE_CR3	scratch_reg=%rbx save_reg=%r14
+ +
+ +	/*
+ +	 * Must restore IBRS state before both CR3 and %GS since we need access
+ +	 * to the per-CPU x86_spec_ctrl_shadow variable.
+ +	 */
+ +	IBRS_EXIT save_reg=%r15
+ +
+ +	/*
+ +	 * The order of operations is important. RESTORE_CR3 requires
+ +	 * kernel GSBASE.
+ +	 *
+ +	 * NB to anyone to try to optimize this code: this code does
+ +	 * not execute at all for exceptions from user mode. Those
+ +	 * exceptions go through error_exit instead.
+ +	 */
+ +	RESTORE_CR3	scratch_reg=%rax save_reg=%r14
+ +
+ +	/* Handle the three GSBASE cases */
+ +	ALTERNATIVE "jmp .Lparanoid_exit_checkgs", "", X86_FEATURE_FSGSBASE
+ +
+ +	/* With FSGSBASE enabled, unconditionally restore GSBASE */
+ +	wrgsbase	%rbx
+ +	jmp		restore_regs_and_return_to_kernel
+ +
+ +.Lparanoid_exit_checkgs:
+ +	/* On non-FSGSBASE systems, conditionally do SWAPGS */
+ +	testl		%ebx, %ebx
+ +	jnz		restore_regs_and_return_to_kernel
+ +
+ +	/* We are returning to a context with user GSBASE */
+  	SWAPGS_UNSAFE_STACK
+++<<<<<<< HEAD
+ +	jmp		restore_regs_and_return_to_kernel
+++=======
++ 	jmp	.Lparanoid_exit_restore
++ .Lparanoid_exit_no_swapgs:
++ 	TRACE_IRQS_IRETQ_DEBUG
++ 	/* Always restore stashed CR3 value (see paranoid_entry) */
++ 	RESTORE_CR3	scratch_reg=%rbx save_reg=%r14
++ .Lparanoid_exit_restore:
++ 	jmp restore_regs_and_return_to_kernel
+++>>>>>>> ef1e03152cb0 (x86/asm: Make some functions local)
+  SYM_CODE_END(paranoid_exit)
+  
+  /*
+@@@ -1488,7 -1373,7 +1502,11 @@@ SYM_CODE_START_LOCAL(error_exit
+  	TRACE_IRQS_OFF
+  	testb	$3, CS(%rsp)
+  	jz	retint_kernel
+++<<<<<<< HEAD
+ +	jmp	retint_user
+++=======
++ 	jmp	.Lretint_user
+++>>>>>>> ef1e03152cb0 (x86/asm: Make some functions local)
+  SYM_CODE_END(error_exit)
+  
+  /*
+diff --cc arch/x86/lib/copy_page_64.S
+index fe83f1d8164a,f505870bd93b..000000000000
+--- a/arch/x86/lib/copy_page_64.S
++++ b/arch/x86/lib/copy_page_64.S
+@@@ -17,11 -17,11 +17,11 @@@ SYM_FUNC_START(copy_page
+  	ALTERNATIVE "jmp copy_page_regs", "", X86_FEATURE_REP_GOOD
+  	movl	$4096/8, %ecx
+  	rep	movsq
+ -	ret
+ -ENDPROC(copy_page)
+ +	RET
+ +SYM_FUNC_END(copy_page)
+  EXPORT_SYMBOL(copy_page)
+  
+- ENTRY(copy_page_regs)
++ SYM_FUNC_START_LOCAL(copy_page_regs)
+  	subq	$2*8,	%rsp
+  	movq	%rbx,	(%rsp)
+  	movq	%r12,	1*8(%rsp)
+@@@ -85,5 -85,5 +85,10 @@@
+  	movq	(%rsp), %rbx
+  	movq	1*8(%rsp), %r12
+  	addq	$2*8, %rsp
+++<<<<<<< HEAD
+ +	RET
+ +ENDPROC(copy_page_regs)
+++=======
++ 	ret
++ SYM_FUNC_END(copy_page_regs)
+++>>>>>>> ef1e03152cb0 (x86/asm: Make some functions local)
+diff --cc arch/x86/lib/memcpy_64.S
+index 257719baa2b3,3265b21e86c0..000000000000
+--- a/arch/x86/lib/memcpy_64.S
++++ b/arch/x86/lib/memcpy_64.S
+@@@ -41,8 -40,8 +41,13 @@@ SYM_FUNC_START_LOCAL(memcpy
+  	rep movsq
+  	movl %edx, %ecx
+  	rep movsb
+++<<<<<<< HEAD
+ +	RET
+ +ENDPROC(memcpy)
+++=======
++ 	ret
++ SYM_FUNC_END(memcpy)
+++>>>>>>> ef1e03152cb0 (x86/asm: Make some functions local)
+  SYM_FUNC_END_ALIAS(__memcpy)
+  EXPORT_SYMBOL(memcpy)
+  EXPORT_SYMBOL(__memcpy)
+@@@ -55,10 -54,10 +60,15 @@@ SYM_FUNC_START_LOCAL(memcpy_erms
+  	movq %rdi, %rax
+  	movq %rdx, %rcx
+  	rep movsb
+++<<<<<<< HEAD
+ +	RET
+ +ENDPROC(memcpy_erms)
+++=======
++ 	ret
++ SYM_FUNC_END(memcpy_erms)
+++>>>>>>> ef1e03152cb0 (x86/asm: Make some functions local)
+  
+- ENTRY(memcpy_orig)
++ SYM_FUNC_START_LOCAL(memcpy_orig)
+  	movq %rdi, %rax
+  
+  	cmpq $0x20, %rdx
+@@@ -182,10 -181,8 +192,15 @@@
+  	movb %cl, (%rdi)
+  
+  .Lend:
+++<<<<<<< HEAD
+ +	RET
+ +ENDPROC(memcpy_orig)
+++=======
++ 	retq
++ SYM_FUNC_END(memcpy_orig)
+++>>>>>>> ef1e03152cb0 (x86/asm: Make some functions local)
+ +
+ +.popsection
+  
+  #ifndef CONFIG_UML
+  
+diff --cc arch/x86/lib/memset_64.S
+index f3f244a30130,564abf9ecedb..000000000000
+--- a/arch/x86/lib/memset_64.S
++++ b/arch/x86/lib/memset_64.S
+@@@ -65,10 -65,10 +65,15 @@@ SYM_FUNC_START_LOCAL(memset_erms
+  	movq %rdx,%rcx
+  	rep stosb
+  	movq %r9,%rax
+++<<<<<<< HEAD
+ +	RET
+ +ENDPROC(memset_erms)
+++=======
++ 	ret
++ SYM_FUNC_END(memset_erms)
+++>>>>>>> ef1e03152cb0 (x86/asm: Make some functions local)
+  
+- ENTRY(memset_orig)
++ SYM_FUNC_START_LOCAL(memset_orig)
+  	movq %rdi,%r10
+  
+  	/* expand byte value  */
+diff --cc arch/x86/platform/efi/efi_thunk_64.S
+index 3b216843c059,d677a7eb2d0a..000000000000
+--- a/arch/x86/platform/efi/efi_thunk_64.S
++++ b/arch/x86/platform/efi/efi_thunk_64.S
+@@@ -43,33 -41,113 +43,110 @@@ SYM_FUNC_START(efi64_thunk
+  	movq	$__START_KERNEL_map, %rax
+  	subq	phys_base(%rip), %rax
+  
+ -	/*
+ -	 * Push some physical addresses onto the stack. This is easier
+ -	 * to do now in a code64 section while the assembler can address
+ -	 * 64-bit values. Note that all the addresses on the stack are
+ -	 * 32-bit.
+ -	 */
+ -	subq	$16, %rsp
+ -	leaq	efi_exit32(%rip), %rbx
+ +	leaq	1f(%rip), %rbp
+ +	leaq	2f(%rip), %rbx
+ +	subq	%rax, %rbp
+  	subq	%rax, %rbx
+ -	movl	%ebx, 8(%rsp)
+  
+++<<<<<<< HEAD
+ +	subq	$28, %rsp
+ +	movl	%ebx, 0x0(%rsp)		/* return address */
+ +	movl	%esi, 0x4(%rsp)
+ +	movl	%edx, 0x8(%rsp)
+ +	movl	%ecx, 0xc(%rsp)
+ +	movl	%r8d, 0x10(%rsp)
+ +	movl	%r9d, 0x14(%rsp)
+++=======
++ 	leaq	__efi64_thunk(%rip), %rbx
++ 	subq	%rax, %rbx
++ 	call	*%rbx
++ 
++ 	movq	efi_saved_sp(%rip), %rsp
++ 	pop	%rbx
++ 	pop	%rbp
++ 	retq
++ ENDPROC(efi64_thunk)
++ 
++ /*
++  * We run this function from the 1:1 mapping.
++  *
++  * This function must be invoked with a 1:1 mapped stack.
++  */
++ SYM_FUNC_START_LOCAL(__efi64_thunk)
++ 	movl	%ds, %eax
++ 	push	%rax
++ 	movl	%es, %eax
++ 	push	%rax
++ 	movl	%ss, %eax
++ 	push	%rax
++ 
++ 	subq	$32, %rsp
++ 	movl	%esi, 0x0(%rsp)
++ 	movl	%edx, 0x4(%rsp)
++ 	movl	%ecx, 0x8(%rsp)
++ 	movq	%r8, %rsi
++ 	movl	%esi, 0xc(%rsp)
++ 	movq	%r9, %rsi
++ 	movl	%esi,  0x10(%rsp)
++ 
++ 	leaq	1f(%rip), %rbx
++ 	movq	%rbx, func_rt_ptr(%rip)
+++>>>>>>> ef1e03152cb0 (x86/asm: Make some functions local)
+  
+  	/* Switch to 32-bit descriptor */
+  	pushq	$__KERNEL32_CS
+ -	leaq	efi_enter32(%rip), %rax
+ -	pushq	%rax
+ +	pushq	%rdi			/* EFI runtime service address */
+  	lretq
+  
+ -1:	addq	$32, %rsp
+ -
+ +1:	movq	24(%rsp), %rsp
+  	pop	%rbx
+ -	movl	%ebx, %ss
+ -	pop	%rbx
+ -	movl	%ebx, %es
+ -	pop	%rbx
+ -	movl	%ebx, %ds
+ -
+ -	/*
+ -	 * Convert 32-bit status code into 64-bit.
+ -	 */
+ -	test	%rax, %rax
+ -	jz	1f
+ -	movl	%eax, %ecx
+ -	andl	$0x0fffffff, %ecx
+ -	andl	$0xf0000000, %eax
+ -	shl	$32, %rax
+ -	or	%rcx, %rax
+ -1:
+ +	pop	%rbp
+ +	ANNOTATE_UNRET_SAFE
+  	ret
+++<<<<<<< HEAD
+ +	int3
+ +
+ +	.code32
+ +2:	pushl	$__KERNEL_CS
+ +	pushl	%ebp
+ +	lret
+ +SYM_FUNC_END(efi64_thunk)
+++=======
++ SYM_FUNC_END(__efi64_thunk)
++ 
++ SYM_FUNC_START_LOCAL(efi_exit32)
++ 	movq	func_rt_ptr(%rip), %rax
++ 	push	%rax
++ 	mov	%rdi, %rax
++ 	ret
++ SYM_FUNC_END(efi_exit32)
++ 
++ 	.code32
++ /*
++  * EFI service pointer must be in %edi.
++  *
++  * The stack should represent the 32-bit calling convention.
++  */
++ SYM_FUNC_START_LOCAL(efi_enter32)
++ 	movl	$__KERNEL_DS, %eax
++ 	movl	%eax, %ds
++ 	movl	%eax, %es
++ 	movl	%eax, %ss
++ 
++ 	call	*%edi
++ 
++ 	/* We must preserve return value */
++ 	movl	%eax, %edi
++ 
++ 	movl	72(%esp), %eax
++ 	pushl	$__KERNEL_CS
++ 	pushl	%eax
++ 
++ 	lret
++ SYM_FUNC_END(efi_enter32)
++ 
++ 	.data
++ 	.balign	8
++ func_rt_ptr:		.quad 0
++ efi_saved_sp:		.quad 0
+++>>>>>>> ef1e03152cb0 (x86/asm: Make some functions local)
+diff --git a/arch/x86/boot/compressed/efi_thunk_64.S b/arch/x86/boot/compressed/efi_thunk_64.S
+index 5af41b130925..e5a9455fb605 100644
+--- a/arch/x86/boot/compressed/efi_thunk_64.S
++++ b/arch/x86/boot/compressed/efi_thunk_64.S
+@@ -99,12 +99,12 @@ SYM_FUNC_START(efi64_thunk)
+ 	ret
+ SYM_FUNC_END(efi64_thunk)
+ 
+-ENTRY(efi_exit32)
++SYM_FUNC_START_LOCAL(efi_exit32)
+ 	movq	func_rt_ptr(%rip), %rax
+ 	push	%rax
+ 	mov	%rdi, %rax
+ 	ret
+-ENDPROC(efi_exit32)
++SYM_FUNC_END(efi_exit32)
+ 
+ 	.code32
+ /*
+@@ -112,7 +112,7 @@ ENDPROC(efi_exit32)
+  *
+  * The stack should represent the 32-bit calling convention.
+  */
+-ENTRY(efi_enter32)
++SYM_FUNC_START_LOCAL(efi_enter32)
+ 	movl	$__KERNEL_DS, %eax
+ 	movl	%eax, %ds
+ 	movl	%eax, %es
+@@ -172,7 +172,7 @@ ENTRY(efi_enter32)
+ 	btsl	$X86_CR0_PG_BIT, %eax
+ 	movl	%eax, %cr0
+ 	lret
+-ENDPROC(efi_enter32)
++SYM_FUNC_END(efi_enter32)
+ 
+ 	.data
+ 	.balign	8
+* Unmerged path arch/x86/entry/entry_64.S
+* Unmerged path arch/x86/lib/copy_page_64.S
+* Unmerged path arch/x86/lib/memcpy_64.S
+* Unmerged path arch/x86/lib/memset_64.S
+* Unmerged path arch/x86/platform/efi/efi_thunk_64.S
+diff --git a/arch/x86/xen/xen-pvh.S b/arch/x86/xen/xen-pvh.S
+index ca2d3b2bf2af..4beb0b3ecb3f 100644
+--- a/arch/x86/xen/xen-pvh.S
++++ b/arch/x86/xen/xen-pvh.S
+@@ -61,7 +61,7 @@
+ #define PVH_DS_SEL		(PVH_GDT_ENTRY_DS * 8)
+ #define PVH_CANARY_SEL		(PVH_GDT_ENTRY_CANARY * 8)
+ 
+-ENTRY(pvh_start_xen)
++SYM_CODE_START_LOCAL(pvh_start_xen)
+ 	cld
+ 
+ 	lgdt (_pa(gdt))
+@@ -157,7 +157,7 @@ ENTRY(pvh_start_xen)
+ 
+ 	ljmp $PVH_CS_SEL, $_pa(startup_32)
+ #endif
+-END(pvh_start_xen)
++SYM_CODE_END(pvh_start_xen)
+ 
+ 	.section ".init.data","aw"
+ 	.balign 8
