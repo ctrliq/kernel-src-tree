@@ -1,0 +1,505 @@
+fs/exec: switch timens when a task gets a new mm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Andrei Vagin <avagin@gmail.com>
+commit 2b5f9dad32ed19e8db3b0f10a84aa824a219803b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/2b5f9dad.failed
+
+Changing a time namespace requires remapping a vvar page, so we don't want
+to allow doing that if any other tasks can use the same mm.
+
+Currently, we install a time namespace when a task is created with a new
+vm. exec() is another case when a task gets a new mm and so it can switch
+a time namespace safely, but it isn't handled now.
+
+One more issue of the current interface is that clone() with CLONE_VM isn't
+allowed if the current task has unshared a time namespace
+(timens_for_children doesn't match the current timens).
+
+Both these issues make some inconvenience for users. For example, Alexey
+and Florian reported that posix_spawn() uses vfork+exec and this pattern
+doesn't work with time namespaces due to the both described issues.
+LXC needed to workaround the exec() issue by calling setns.
+
+In the commit 133e2d3e81de5 ("fs/exec: allow to unshare a time namespace on
+vfork+exec"), we tried to fix these issues with minimal impact on UAPI. But
+it adds extra complexity and some undesirable side effects. Eric suggested
+fixing the issues properly because here are all the reasons to suppose that
+there are no users that depend on the old behavior.
+
+	Cc: Alexey Izbyshev <izbyshev@ispras.ru>
+	Cc: Christian Brauner <brauner@kernel.org>
+	Cc: Dmitry Safonov <0x7f454c46@gmail.com>
+	Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+	Cc: Florian Weimer <fweimer@redhat.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Suggested-by: "Eric W. Biederman" <ebiederm@xmission.com>
+Origin-author: "Eric W. Biederman" <ebiederm@xmission.com>
+	Signed-off-by: Andrei Vagin <avagin@gmail.com>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+Link: https://lore.kernel.org/r/20220921003120.209637-1-avagin@google.com
+(cherry picked from commit 2b5f9dad32ed19e8db3b0f10a84aa824a219803b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/exec.c
+#	kernel/nsproxy.c
+diff --cc fs/exec.c
+index 737fba4c7230,34e6a2e53268..000000000000
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@@ -62,6 -61,10 +62,13 @@@
+  #include <linux/oom.h>
+  #include <linux/compat.h>
+  #include <linux/vmalloc.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/io_uring.h>
++ #include <linux/syscall_user_dispatch.h>
++ #include <linux/coredump.h>
++ #include <linux/time_namespace.h>
+++>>>>>>> 2b5f9dad32ed (fs/exec: switch timens when a task gets a new mm)
+  
+  #include <linux/uaccess.h>
+  #include <asm/mmu_context.h>
+@@@ -1308,17 -1296,17 +1315,21 @@@ int begin_new_exec(struct linux_binprm 
+  	if (retval)
+  		goto out;
+  
+ +	/*
+ +	 * With the new mm installed it is completely impossible to
+ +	 * fail and return to the original process.  If anything from
+ +	 * here on returns an error, the check in
+ +	 * search_binary_handler() will SEGV current.
+ +	 */
+ +	bprm->point_of_no_return = true;
+  	bprm->mm = NULL;
+  
++ 	retval = exec_task_namespaces();
++ 	if (retval)
++ 		goto out_unlock;
++ 
+  #ifdef CONFIG_POSIX_TIMERS
+ -	spin_lock_irq(&me->sighand->siglock);
+ -	posix_cpu_timers_exit(me);
+ -	spin_unlock_irq(&me->sighand->siglock);
+ -	exit_itimers(me);
+ +	exit_itimers(me->signal);
+  	flush_itimer_signals();
+  #endif
+  
+diff --cc kernel/nsproxy.c
+index 586c9e2017dc,a487ff24129b..000000000000
+--- a/kernel/nsproxy.c
++++ b/kernel/nsproxy.c
+@@@ -182,11 -180,8 +183,16 @@@ int copy_namespaces(unsigned long flags
+  	if (IS_ERR(new_ns))
+  		return  PTR_ERR(new_ns);
+  
+++<<<<<<< HEAD
+ +	ret = timens_on_fork(new_ns, tsk);
+ +	if (ret) {
+ +		free_nsproxy(new_ns);
+ +		return ret;
+ +	}
+++=======
++ 	if ((flags & CLONE_VM) == 0)
++ 		timens_on_fork(new_ns, tsk);
+++>>>>>>> 2b5f9dad32ed (fs/exec: switch timens when a task gets a new mm)
+  
+  	tsk->nsproxy = new_ns;
+  	return 0;
+@@@ -261,37 -256,330 +267,328 @@@ void exit_task_namespaces(struct task_s
+  	switch_task_namespaces(p, NULL);
+  }
+  
+++<<<<<<< HEAD
+ +SYSCALL_DEFINE2(setns, int, fd, int, nstype)
+++=======
++ int exec_task_namespaces(void)
++ {
++ 	struct task_struct *tsk = current;
++ 	struct nsproxy *new;
++ 
++ 	if (tsk->nsproxy->time_ns_for_children == tsk->nsproxy->time_ns)
++ 		return 0;
++ 
++ 	new = create_new_namespaces(0, tsk, current_user_ns(), tsk->fs);
++ 	if (IS_ERR(new))
++ 		return PTR_ERR(new);
++ 
++ 	timens_on_fork(new, tsk);
++ 	switch_task_namespaces(tsk, new);
++ 	return 0;
++ }
++ 
++ static int check_setns_flags(unsigned long flags)
++ {
++ 	if (!flags || (flags & ~(CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC |
++ 				 CLONE_NEWNET | CLONE_NEWTIME | CLONE_NEWUSER |
++ 				 CLONE_NEWPID | CLONE_NEWCGROUP)))
++ 		return -EINVAL;
++ 
++ #ifndef CONFIG_USER_NS
++ 	if (flags & CLONE_NEWUSER)
++ 		return -EINVAL;
++ #endif
++ #ifndef CONFIG_PID_NS
++ 	if (flags & CLONE_NEWPID)
++ 		return -EINVAL;
++ #endif
++ #ifndef CONFIG_UTS_NS
++ 	if (flags & CLONE_NEWUTS)
++ 		return -EINVAL;
++ #endif
++ #ifndef CONFIG_IPC_NS
++ 	if (flags & CLONE_NEWIPC)
++ 		return -EINVAL;
++ #endif
++ #ifndef CONFIG_CGROUPS
++ 	if (flags & CLONE_NEWCGROUP)
++ 		return -EINVAL;
++ #endif
++ #ifndef CONFIG_NET_NS
++ 	if (flags & CLONE_NEWNET)
++ 		return -EINVAL;
++ #endif
++ #ifndef CONFIG_TIME_NS
++ 	if (flags & CLONE_NEWTIME)
++ 		return -EINVAL;
++ #endif
++ 
++ 	return 0;
++ }
++ 
++ static void put_nsset(struct nsset *nsset)
++ {
++ 	unsigned flags = nsset->flags;
++ 
++ 	if (flags & CLONE_NEWUSER)
++ 		put_cred(nsset_cred(nsset));
++ 	/*
++ 	 * We only created a temporary copy if we attached to more than just
++ 	 * the mount namespace.
++ 	 */
++ 	if (nsset->fs && (flags & CLONE_NEWNS) && (flags & ~CLONE_NEWNS))
++ 		free_fs_struct(nsset->fs);
++ 	if (nsset->nsproxy)
++ 		free_nsproxy(nsset->nsproxy);
++ }
++ 
++ static int prepare_nsset(unsigned flags, struct nsset *nsset)
++ {
++ 	struct task_struct *me = current;
++ 
++ 	nsset->nsproxy = create_new_namespaces(0, me, current_user_ns(), me->fs);
++ 	if (IS_ERR(nsset->nsproxy))
++ 		return PTR_ERR(nsset->nsproxy);
++ 
++ 	if (flags & CLONE_NEWUSER)
++ 		nsset->cred = prepare_creds();
++ 	else
++ 		nsset->cred = current_cred();
++ 	if (!nsset->cred)
++ 		goto out;
++ 
++ 	/* Only create a temporary copy of fs_struct if we really need to. */
++ 	if (flags == CLONE_NEWNS) {
++ 		nsset->fs = me->fs;
++ 	} else if (flags & CLONE_NEWNS) {
++ 		nsset->fs = copy_fs_struct(me->fs);
++ 		if (!nsset->fs)
++ 			goto out;
++ 	}
++ 
++ 	nsset->flags = flags;
++ 	return 0;
++ 
++ out:
++ 	put_nsset(nsset);
++ 	return -ENOMEM;
++ }
++ 
++ static inline int validate_ns(struct nsset *nsset, struct ns_common *ns)
++ {
++ 	return ns->ops->install(nsset, ns);
++ }
++ 
++ /*
++  * This is the inverse operation to unshare().
++  * Ordering is equivalent to the standard ordering used everywhere else
++  * during unshare and process creation. The switch to the new set of
++  * namespaces occurs at the point of no return after installation of
++  * all requested namespaces was successful in commit_nsset().
++  */
++ static int validate_nsset(struct nsset *nsset, struct pid *pid)
++ {
++ 	int ret = 0;
++ 	unsigned flags = nsset->flags;
++ 	struct user_namespace *user_ns = NULL;
++ 	struct pid_namespace *pid_ns = NULL;
++ 	struct nsproxy *nsp;
++ 	struct task_struct *tsk;
++ 
++ 	/* Take a "snapshot" of the target task's namespaces. */
++ 	rcu_read_lock();
++ 	tsk = pid_task(pid, PIDTYPE_PID);
++ 	if (!tsk) {
++ 		rcu_read_unlock();
++ 		return -ESRCH;
++ 	}
++ 
++ 	if (!ptrace_may_access(tsk, PTRACE_MODE_READ_REALCREDS)) {
++ 		rcu_read_unlock();
++ 		return -EPERM;
++ 	}
++ 
++ 	task_lock(tsk);
++ 	nsp = tsk->nsproxy;
++ 	if (nsp)
++ 		get_nsproxy(nsp);
++ 	task_unlock(tsk);
++ 	if (!nsp) {
++ 		rcu_read_unlock();
++ 		return -ESRCH;
++ 	}
++ 
++ #ifdef CONFIG_PID_NS
++ 	if (flags & CLONE_NEWPID) {
++ 		pid_ns = task_active_pid_ns(tsk);
++ 		if (unlikely(!pid_ns)) {
++ 			rcu_read_unlock();
++ 			ret = -ESRCH;
++ 			goto out;
++ 		}
++ 		get_pid_ns(pid_ns);
++ 	}
++ #endif
++ 
++ #ifdef CONFIG_USER_NS
++ 	if (flags & CLONE_NEWUSER)
++ 		user_ns = get_user_ns(__task_cred(tsk)->user_ns);
++ #endif
++ 	rcu_read_unlock();
++ 
++ 	/*
++ 	 * Install requested namespaces. The caller will have
++ 	 * verified earlier that the requested namespaces are
++ 	 * supported on this kernel. We don't report errors here
++ 	 * if a namespace is requested that isn't supported.
++ 	 */
++ #ifdef CONFIG_USER_NS
++ 	if (flags & CLONE_NEWUSER) {
++ 		ret = validate_ns(nsset, &user_ns->ns);
++ 		if (ret)
++ 			goto out;
++ 	}
++ #endif
++ 
++ 	if (flags & CLONE_NEWNS) {
++ 		ret = validate_ns(nsset, from_mnt_ns(nsp->mnt_ns));
++ 		if (ret)
++ 			goto out;
++ 	}
++ 
++ #ifdef CONFIG_UTS_NS
++ 	if (flags & CLONE_NEWUTS) {
++ 		ret = validate_ns(nsset, &nsp->uts_ns->ns);
++ 		if (ret)
++ 			goto out;
++ 	}
++ #endif
++ 
++ #ifdef CONFIG_IPC_NS
++ 	if (flags & CLONE_NEWIPC) {
++ 		ret = validate_ns(nsset, &nsp->ipc_ns->ns);
++ 		if (ret)
++ 			goto out;
++ 	}
++ #endif
++ 
++ #ifdef CONFIG_PID_NS
++ 	if (flags & CLONE_NEWPID) {
++ 		ret = validate_ns(nsset, &pid_ns->ns);
++ 		if (ret)
++ 			goto out;
++ 	}
++ #endif
++ 
++ #ifdef CONFIG_CGROUPS
++ 	if (flags & CLONE_NEWCGROUP) {
++ 		ret = validate_ns(nsset, &nsp->cgroup_ns->ns);
++ 		if (ret)
++ 			goto out;
++ 	}
++ #endif
++ 
++ #ifdef CONFIG_NET_NS
++ 	if (flags & CLONE_NEWNET) {
++ 		ret = validate_ns(nsset, &nsp->net_ns->ns);
++ 		if (ret)
++ 			goto out;
++ 	}
++ #endif
++ 
++ #ifdef CONFIG_TIME_NS
++ 	if (flags & CLONE_NEWTIME) {
++ 		ret = validate_ns(nsset, &nsp->time_ns->ns);
++ 		if (ret)
++ 			goto out;
++ 	}
++ #endif
++ 
++ out:
++ 	if (pid_ns)
++ 		put_pid_ns(pid_ns);
++ 	if (nsp)
++ 		put_nsproxy(nsp);
++ 	put_user_ns(user_ns);
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * This is the point of no return. There are just a few namespaces
++  * that do some actual work here and it's sufficiently minimal that
++  * a separate ns_common operation seems unnecessary for now.
++  * Unshare is doing the same thing. If we'll end up needing to do
++  * more in a given namespace or a helper here is ultimately not
++  * exported anymore a simple commit handler for each namespace
++  * should be added to ns_common.
++  */
++ static void commit_nsset(struct nsset *nsset)
++ {
++ 	unsigned flags = nsset->flags;
++ 	struct task_struct *me = current;
++ 
++ #ifdef CONFIG_USER_NS
++ 	if (flags & CLONE_NEWUSER) {
++ 		/* transfer ownership */
++ 		commit_creds(nsset_cred(nsset));
++ 		nsset->cred = NULL;
++ 	}
++ #endif
++ 
++ 	/* We only need to commit if we have used a temporary fs_struct. */
++ 	if ((flags & CLONE_NEWNS) && (flags & ~CLONE_NEWNS)) {
++ 		set_fs_root(me->fs, &nsset->fs->root);
++ 		set_fs_pwd(me->fs, &nsset->fs->pwd);
++ 	}
++ 
++ #ifdef CONFIG_IPC_NS
++ 	if (flags & CLONE_NEWIPC)
++ 		exit_sem(me);
++ #endif
++ 
++ #ifdef CONFIG_TIME_NS
++ 	if (flags & CLONE_NEWTIME)
++ 		timens_commit(me, nsset->nsproxy->time_ns);
++ #endif
++ 
++ 	/* transfer ownership */
++ 	switch_task_namespaces(me, nsset->nsproxy);
++ 	nsset->nsproxy = NULL;
++ }
++ 
++ SYSCALL_DEFINE2(setns, int, fd, int, flags)
+++>>>>>>> 2b5f9dad32ed (fs/exec: switch timens when a task gets a new mm)
+  {
+ +	struct task_struct *tsk = current;
+ +	struct nsproxy *new_nsproxy;
+  	struct file *file;
+ -	struct ns_common *ns = NULL;
+ -	struct nsset nsset = {};
+ -	int err = 0;
+ +	struct ns_common *ns;
+ +	int err;
+  
+ -	file = fget(fd);
+ -	if (!file)
+ -		return -EBADF;
+ -
+ -	if (proc_ns_file(file)) {
+ -		ns = get_proc_ns(file_inode(file));
+ -		if (flags && (ns->ops->type != flags))
+ -			err = -EINVAL;
+ -		flags = ns->ops->type;
+ -	} else if (!IS_ERR(pidfd_pid(file))) {
+ -		err = check_setns_flags(flags);
+ -	} else {
+ -		err = -EINVAL;
+ -	}
+ -	if (err)
+ +	file = proc_ns_fget(fd);
+ +	if (IS_ERR(file))
+ +		return PTR_ERR(file);
+ +
+ +	err = -EINVAL;
+ +	ns = get_proc_ns(file_inode(file));
+ +	if (nstype && (ns->ops->type != nstype))
+  		goto out;
+  
+ -	err = prepare_nsset(flags, &nsset);
+ -	if (err)
+ +	new_nsproxy = create_new_namespaces(0, tsk, current_user_ns(), tsk->fs);
+ +	if (IS_ERR(new_nsproxy)) {
+ +		err = PTR_ERR(new_nsproxy);
+  		goto out;
+ +	}
+  
+ -	if (proc_ns_file(file))
+ -		err = validate_ns(&nsset, ns);
+ -	else
+ -		err = validate_nsset(&nsset, file->private_data);
+ -	if (!err) {
+ -		commit_nsset(&nsset);
+ -		perf_event_namespaces(current);
+ +	err = ns->ops->install(new_nsproxy, ns);
+ +	if (err) {
+ +		free_nsproxy(new_nsproxy);
+ +		goto out;
+  	}
+ -	put_nsset(&nsset);
+ +	switch_task_namespaces(tsk, new_nsproxy);
+ +
+ +	perf_event_namespaces(tsk);
+  out:
+  	fput(file);
+  	return err;
+* Unmerged path fs/exec.c
+diff --git a/include/linux/nsproxy.h b/include/linux/nsproxy.h
+index 8c856a9be101..a8c2ea8a26b9 100644
+--- a/include/linux/nsproxy.h
++++ b/include/linux/nsproxy.h
+@@ -70,6 +70,7 @@ extern struct nsproxy init_nsproxy;
+ int copy_namespaces(unsigned long flags, struct task_struct *tsk);
+ void exit_task_namespaces(struct task_struct *tsk);
+ void switch_task_namespaces(struct task_struct *tsk, struct nsproxy *new);
++int exec_task_namespaces(void);
+ void free_nsproxy(struct nsproxy *ns);
+ int unshare_nsproxy_namespaces(unsigned long, struct nsproxy **,
+ 	struct cred *, struct fs_struct *);
+diff --git a/kernel/fork.c b/kernel/fork.c
+index c77f9f5e5629..70e3efbfb0bf 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1901,15 +1901,6 @@ static __latent_entropy struct task_struct *copy_process(
+ 			return ERR_PTR(-EINVAL);
+ 	}
+ 
+-	/*
+-	 * If the new process will be in a different time namespace
+-	 * do not allow it to share VM or a thread group with the forking task.
+-	 */
+-	if (clone_flags & (CLONE_THREAD | CLONE_VM)) {
+-		if (nsp->time_ns != nsp->time_ns_for_children)
+-			return ERR_PTR(-EINVAL);
+-	}
+-
+ 	if (clone_flags & CLONE_PIDFD) {
+ 		/*
+ 		 * - CLONE_PARENT_SETTID is useless for pidfds and also
+* Unmerged path kernel/nsproxy.c
