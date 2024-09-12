@@ -1,0 +1,149 @@
+x86/alternatives: Implement a better poke_int3_handler() completion scheme
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 1f676247f36a4bdea134de5e8bc5041db9678c4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/1f676247.failed
+
+Commit:
+
+  285a54efe386 ("x86/alternatives: Sync bp_patching update for avoiding NULL pointer exception")
+
+added an additional text_poke_sync() IPI to text_poke_bp_batch() to
+handle the rare case where another CPU is still inside an INT3 handler
+while we clear the global state.
+
+Instead of spraying IPIs around, count the active INT3 handlers and
+wait for them to go away before proceeding to clear/reuse the data.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Masami Hiramatsu <mhiramat@kernel.org>
+	Reviewed-by: Daniel Bristot de Oliveira <bristot@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 1f676247f36a4bdea134de5e8bc5041db9678c4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/alternative.c
+diff --cc arch/x86/kernel/alternative.c
+index 4fce58044a3f,34360ca301a2..000000000000
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@@ -784,12 -948,36 +784,31 @@@ struct text_poke_loc 
+  	const u8 text[POKE_MAX_OPCODE_SIZE];
+  };
+  
+- static struct bp_patching_desc {
++ struct bp_patching_desc {
+  	struct text_poke_loc *vec;
+  	int nr_entries;
+- } bp_patching;
++ 	atomic_t refs;
++ };
++ 
++ static struct bp_patching_desc *bp_desc;
++ 
++ static inline struct bp_patching_desc *try_get_desc(struct bp_patching_desc **descp)
++ {
++ 	struct bp_patching_desc *desc = READ_ONCE(*descp); /* rcu_dereference */
++ 
++ 	if (!desc || !atomic_inc_not_zero(&desc->refs))
++ 		return NULL;
++ 
++ 	return desc;
++ }
++ 
++ static inline void put_desc(struct bp_patching_desc *desc)
++ {
++ 	smp_mb__before_atomic();
++ 	atomic_dec(&desc->refs);
++ }
+  
+ -static inline void *text_poke_addr(struct text_poke_loc *tp)
+ -{
+ -	return _stext + tp->rel_addr;
+ -}
+ -
+ -static int notrace patch_cmp(const void *key, const void *elt)
+ +static int patch_cmp(const void *key, const void *elt)
+  {
+  	struct text_poke_loc *tp = (struct text_poke_loc *) elt;
+  
+@@@ -801,11 -989,15 +820,15 @@@
+  }
+  NOKPROBE_SYMBOL(patch_cmp);
+  
+ -int notrace poke_int3_handler(struct pt_regs *regs)
+ +int poke_int3_handler(struct pt_regs *regs)
+  {
++ 	struct bp_patching_desc *desc;
+  	struct text_poke_loc *tp;
++ 	int len, ret = 0;
+  	void *ip;
+- 	int len;
++ 
++ 	if (user_mode(regs))
++ 		return 0;
+  
+  	/*
+  	 * Having observed our INT3 instruction, we now must observe
+@@@ -838,11 -1026,11 +857,17 @@@
+  			     sizeof(struct text_poke_loc),
+  			     patch_cmp);
+  		if (!tp)
+- 			return 0;
++ 			goto out_put;
+  	} else {
+++<<<<<<< HEAD
+ +		tp = bp_patching.vec;
+ +		if (tp->addr != ip)
+ +			return 0;
+++=======
++ 		tp = desc->vec;
++ 		if (text_poke_addr(tp) != ip)
++ 			goto out_put;
+++>>>>>>> 1f676247f36a (x86/alternatives: Implement a better poke_int3_handler() completion scheme)
+  	}
+  
+  	len = text_opcode_size(tp->opcode);
+@@@ -959,20 -1155,15 +992,26 @@@ static void text_poke_bp_batch(struct t
+  	}
+  
+  	if (do_sync)
+ -		text_poke_sync();
+ +		on_each_cpu(do_sync_core, NULL, 1);
+  
+  	/*
+- 	 * sync_core() implies an smp_mb() and orders this store against
+- 	 * the writing of the new instruction.
++ 	 * Remove and synchronize_rcu(), except we have a very primitive
++ 	 * refcount based completion.
+  	 */
+++<<<<<<< HEAD
+ +	bp_patching.nr_entries = 0;
+ +	/*
+ +	 * This sync_core () call ensures that all INT3 handlers in progress
+ +	 * have finished. This allows poke_int3_handler() after this to
+ +	 * avoid touching bp_paching.vec by checking nr_entries == 0.
+ +	 */
+ +	on_each_cpu(do_sync_core, NULL, 1);
+ +	bp_patching.vec = NULL;
+++=======
++ 	WRITE_ONCE(bp_desc, NULL); /* RCU_INIT_POINTER */
++ 	if (!atomic_dec_and_test(&desc.refs))
++ 		atomic_cond_read_acquire(&desc.refs, !VAL);
+++>>>>>>> 1f676247f36a (x86/alternatives: Implement a better poke_int3_handler() completion scheme)
+  }
+  
+  void text_poke_loc_init(struct text_poke_loc *tp, void *addr,
+* Unmerged path arch/x86/kernel/alternative.c
