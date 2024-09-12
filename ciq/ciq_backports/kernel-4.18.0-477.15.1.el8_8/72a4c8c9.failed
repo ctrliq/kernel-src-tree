@@ -1,0 +1,1078 @@
+mlxsw: convert driver to use unlocked devlink API during init/fini
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-477.15.1.el8_8
+commit-author Jiri Pirko <jiri@nvidia.com>
+commit 72a4c8c94efa5ce2b46c3f921b8830d7704121fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-477.15.1.el8_8/72a4c8c9.failed
+
+Prepare for devlink reload being called with devlink->lock held and
+convert the mlxsw driver to use unlocked devlink API during init and
+fini flows. Take devl_lock() in reload_down() and reload_up() ops in the
+meantime before reload cmd is converted to take the lock itself.
+
+	Signed-off-by: Jiri Pirko <jiri@nvidia.com>
+	Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+	Tested-by: Ido Schimmel <idosch@nvidia.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 72a4c8c94efa5ce2b46c3f921b8830d7704121fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_cnt.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index 37cbb364c522,209587cf7529..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@@ -1828,13 -1894,119 +1828,25 @@@ static bool mlxsw_sp_port_created(struc
+  	return mlxsw_sp->ports[local_port] != NULL;
+  }
+  
+ -static int mlxsw_sp_port_mapping_event_set(struct mlxsw_sp *mlxsw_sp,
+ -					   u16 local_port, bool enable)
+ -{
+ -	char pmecr_pl[MLXSW_REG_PMECR_LEN];
+ -
+ -	mlxsw_reg_pmecr_pack(pmecr_pl, local_port,
+ -			     enable ? MLXSW_REG_PMECR_E_GENERATE_EVENT :
+ -				      MLXSW_REG_PMECR_E_DO_NOT_GENERATE_EVENT);
+ -	return mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(pmecr), pmecr_pl);
+ -}
+ -
+ -struct mlxsw_sp_port_mapping_event {
+ -	struct list_head list;
+ -	char pmlp_pl[MLXSW_REG_PMLP_LEN];
+ -};
+ -
+ -static void mlxsw_sp_port_mapping_events_work(struct work_struct *work)
+ -{
+ -	struct mlxsw_sp_port_mapping_event *event, *next_event;
+ -	struct mlxsw_sp_port_mapping_events *events;
+ -	struct mlxsw_sp_port_mapping port_mapping;
+ -	struct mlxsw_sp *mlxsw_sp;
+ -	struct devlink *devlink;
+ -	LIST_HEAD(event_queue);
+ -	u16 local_port;
+ -	int err;
+ -
+ -	events = container_of(work, struct mlxsw_sp_port_mapping_events, work);
+ -	mlxsw_sp = container_of(events, struct mlxsw_sp, port_mapping_events);
+ -	devlink = priv_to_devlink(mlxsw_sp->core);
+ -
+ -	spin_lock_bh(&events->queue_lock);
+ -	list_splice_init(&events->queue, &event_queue);
+ -	spin_unlock_bh(&events->queue_lock);
+ -
+ -	list_for_each_entry_safe(event, next_event, &event_queue, list) {
+ -		local_port = mlxsw_reg_pmlp_local_port_get(event->pmlp_pl);
+ -		err = mlxsw_sp_port_module_info_parse(mlxsw_sp, local_port,
+ -						      event->pmlp_pl, &port_mapping);
+ -		if (err)
+ -			goto out;
+ -
+ -		if (WARN_ON_ONCE(!port_mapping.width))
+ -			goto out;
+ -
+ -		devl_lock(devlink);
+ -
+ -		if (!mlxsw_sp_port_created(mlxsw_sp, local_port))
+ -			mlxsw_sp_port_create(mlxsw_sp, local_port,
+ -					     false, &port_mapping);
+ -		else
+ -			WARN_ON_ONCE(1);
+ -
+ -		devl_unlock(devlink);
+ -
+ -		mlxsw_sp->port_mapping[local_port] = port_mapping;
+ -
+ -out:
+ -		kfree(event);
+ -	}
+ -}
+ -
+ -static void
+ -mlxsw_sp_port_mapping_listener_func(const struct mlxsw_reg_info *reg,
+ -				    char *pmlp_pl, void *priv)
+ -{
+ -	struct mlxsw_sp_port_mapping_events *events;
+ -	struct mlxsw_sp_port_mapping_event *event;
+ -	struct mlxsw_sp *mlxsw_sp = priv;
+ -	u16 local_port;
+ -
+ -	local_port = mlxsw_reg_pmlp_local_port_get(pmlp_pl);
+ -	if (WARN_ON_ONCE(!mlxsw_sp_local_port_is_valid(mlxsw_sp, local_port)))
+ -		return;
+ -
+ -	events = &mlxsw_sp->port_mapping_events;
+ -	event = kmalloc(sizeof(*event), GFP_ATOMIC);
+ -	if (!event)
+ -		return;
+ -	memcpy(event->pmlp_pl, pmlp_pl, sizeof(event->pmlp_pl));
+ -	spin_lock(&events->queue_lock);
+ -	list_add_tail(&event->list, &events->queue);
+ -	spin_unlock(&events->queue_lock);
+ -	mlxsw_core_schedule_work(&events->work);
+ -}
+ -
+ -static void
+ -__mlxsw_sp_port_mapping_events_cancel(struct mlxsw_sp *mlxsw_sp)
+ -{
+ -	struct mlxsw_sp_port_mapping_event *event, *next_event;
+ -	struct mlxsw_sp_port_mapping_events *events;
+ -
+ -	events = &mlxsw_sp->port_mapping_events;
+ -
+ -	/* Caller needs to make sure that no new event is going to appear. */
+ -	cancel_work_sync(&events->work);
+ -	list_for_each_entry_safe(event, next_event, &events->queue, list) {
+ -		list_del(&event->list);
+ -		kfree(event);
+ -	}
+ -}
+ -
+  static void mlxsw_sp_ports_remove(struct mlxsw_sp *mlxsw_sp)
+  {
+++<<<<<<< HEAD
+ +	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+ +	int i;
+ +
+ +	devl_lock(devlink);
+ +	for (i = 1; i < mlxsw_core_max_ports(mlxsw_sp->core); i++)
+++=======
++ 	unsigned int max_ports = mlxsw_core_max_ports(mlxsw_sp->core);
++ 	int i;
++ 
++ 	for (i = 1; i < max_ports; i++)
++ 		mlxsw_sp_port_mapping_event_set(mlxsw_sp, i, false);
++ 	/* Make sure all scheduled events are processed */
++ 	__mlxsw_sp_port_mapping_events_cancel(mlxsw_sp);
++ 
++ 	for (i = 1; i < max_ports; i++)
+++>>>>>>> 72a4c8c94efa (mlxsw: convert driver to use unlocked devlink API during init/fini)
+  		if (mlxsw_sp_port_created(mlxsw_sp, i))
+  			mlxsw_sp_port_remove(mlxsw_sp, i);
+  	mlxsw_sp_cpu_port_remove(mlxsw_sp);
+@@@ -1846,7 -2017,21 +1857,11 @@@
+  static int mlxsw_sp_ports_create(struct mlxsw_sp *mlxsw_sp)
+  {
+  	unsigned int max_ports = mlxsw_core_max_ports(mlxsw_sp->core);
+++<<<<<<< HEAD
+ +	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+++=======
++ 	struct mlxsw_sp_port_mapping_events *events;
+++>>>>>>> 72a4c8c94efa (mlxsw: convert driver to use unlocked devlink API during init/fini)
+  	struct mlxsw_sp_port_mapping *port_mapping;
+  	size_t alloc_size;
+  	int i;
+@@@ -1857,7 -2042,17 +1872,21 @@@
+  	if (!mlxsw_sp->ports)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	devl_lock(devlink);
+++=======
++ 	events = &mlxsw_sp->port_mapping_events;
++ 	INIT_LIST_HEAD(&events->queue);
++ 	spin_lock_init(&events->queue_lock);
++ 	INIT_WORK(&events->work, mlxsw_sp_port_mapping_events_work);
++ 
++ 	for (i = 1; i < max_ports; i++) {
++ 		err = mlxsw_sp_port_mapping_event_set(mlxsw_sp, i, true);
++ 		if (err)
++ 			goto err_event_enable;
++ 	}
++ 
+++>>>>>>> 72a4c8c94efa (mlxsw: convert driver to use unlocked devlink API during init/fini)
+  	err = mlxsw_sp_cpu_port_create(mlxsw_sp);
+  	if (err)
+  		goto err_cpu_port_create;
+@@@ -1877,9 -2071,14 +1905,17 @@@ err_port_create
+  	for (i--; i >= 1; i--)
+  		if (mlxsw_sp_port_created(mlxsw_sp, i))
+  			mlxsw_sp_port_remove(mlxsw_sp, i);
+ -	i = max_ports;
+  	mlxsw_sp_cpu_port_remove(mlxsw_sp);
+  err_cpu_port_create:
+++<<<<<<< HEAD
+ +	devl_unlock(devlink);
+++=======
++ err_event_enable:
++ 	for (i--; i >= 1; i--)
++ 		mlxsw_sp_port_mapping_event_set(mlxsw_sp, i, false);
++ 	/* Make sure all scheduled events are processed */
++ 	__mlxsw_sp_port_mapping_events_cancel(mlxsw_sp);
+++>>>>>>> 72a4c8c94efa (mlxsw: convert driver to use unlocked devlink API during init/fini)
+  	kfree(mlxsw_sp->ports);
+  	mlxsw_sp->ports = NULL;
+  	return err;
+@@@ -3227,12 -3548,55 +3263,58 @@@ static int mlxsw_sp_resources_span_regi
+  	devlink_resource_size_params_init(&span_size_params, max_span, max_span,
+  					  1, DEVLINK_RESOURCE_UNIT_ENTRY);
+  
+- 	return devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_SPAN,
+- 					 max_span, MLXSW_SP_RESOURCE_SPAN,
+- 					 DEVLINK_RESOURCE_ID_PARENT_TOP,
+- 					 &span_size_params);
++ 	return devl_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_SPAN,
++ 				      max_span, MLXSW_SP_RESOURCE_SPAN,
++ 				      DEVLINK_RESOURCE_ID_PARENT_TOP,
++ 				      &span_size_params);
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ static int
++ mlxsw_sp_resources_rif_mac_profile_register(struct mlxsw_core *mlxsw_core)
++ {
++ 	struct devlink *devlink = priv_to_devlink(mlxsw_core);
++ 	struct devlink_resource_size_params size_params;
++ 	u8 max_rif_mac_profiles;
++ 
++ 	if (!MLXSW_CORE_RES_VALID(mlxsw_core, MAX_RIF_MAC_PROFILES))
++ 		max_rif_mac_profiles = 1;
++ 	else
++ 		max_rif_mac_profiles = MLXSW_CORE_RES_GET(mlxsw_core,
++ 							  MAX_RIF_MAC_PROFILES);
++ 	devlink_resource_size_params_init(&size_params, max_rif_mac_profiles,
++ 					  max_rif_mac_profiles, 1,
++ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
++ 
++ 	return devl_resource_register(devlink,
++ 				      "rif_mac_profiles",
++ 				      max_rif_mac_profiles,
++ 				      MLXSW_SP_RESOURCE_RIF_MAC_PROFILES,
++ 				      DEVLINK_RESOURCE_ID_PARENT_TOP,
++ 				      &size_params);
++ }
++ 
++ static int mlxsw_sp_resources_rifs_register(struct mlxsw_core *mlxsw_core)
++ {
++ 	struct devlink *devlink = priv_to_devlink(mlxsw_core);
++ 	struct devlink_resource_size_params size_params;
++ 	u64 max_rifs;
++ 
++ 	if (!MLXSW_CORE_RES_VALID(mlxsw_core, MAX_RIFS))
++ 		return -EIO;
++ 
++ 	max_rifs = MLXSW_CORE_RES_GET(mlxsw_core, MAX_RIFS);
++ 	devlink_resource_size_params_init(&size_params, max_rifs, max_rifs,
++ 					  1, DEVLINK_RESOURCE_UNIT_ENTRY);
++ 
++ 	return devl_resource_register(devlink, "rifs", max_rifs,
++ 				      MLXSW_SP_RESOURCE_RIFS,
++ 				      DEVLINK_RESOURCE_ID_PARENT_TOP,
++ 				      &size_params);
+  }
+  
+++>>>>>>> 72a4c8c94efa (mlxsw: convert driver to use unlocked devlink API during init/fini)
+  static int mlxsw_sp1_resources_register(struct mlxsw_core *mlxsw_core)
+  {
+  	int err;
+@@@ -3255,9 -3627,12 +3337,9 @@@
+  
+  	return 0;
+  
+ -err_resources_rifs_register:
+ -err_resources_rif_mac_profile_register:
+ -err_policer_resources_register:
+  err_resources_counter_register:
+  err_resources_span_register:
+- 	devlink_resources_unregister(priv_to_devlink(mlxsw_core));
++ 	devl_resources_unregister(priv_to_devlink(mlxsw_core));
+  	return err;
+  }
+  
+@@@ -3283,9 -3666,12 +3365,9 @@@ static int mlxsw_sp2_resources_register
+  
+  	return 0;
+  
+ -err_resources_rifs_register:
+ -err_resources_rif_mac_profile_register:
+ -err_policer_resources_register:
+  err_resources_counter_register:
+  err_resources_span_register:
+- 	devlink_resources_unregister(priv_to_devlink(mlxsw_core));
++ 	devl_resources_unregister(priv_to_devlink(mlxsw_core));
+  	return err;
+  }
+  
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_cnt.c
+index b65b93a2b9bc,ee59c79156e4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_cnt.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_cnt.c
+@@@ -136,16 -135,14 +136,16 @@@ int mlxsw_sp_counter_pool_init(struct m
+  	spin_lock_init(&pool->counter_pool_lock);
+  	atomic_set(&pool->active_entries_count, 0);
+  
+- 	err = devlink_resource_size_get(devlink, MLXSW_SP_RESOURCE_COUNTERS,
+- 					&pool->pool_size);
++ 	err = devl_resource_size_get(devlink, MLXSW_SP_RESOURCE_COUNTERS,
++ 				     &pool->pool_size);
+  	if (err)
+  		goto err_pool_resource_size_get;
+- 	devlink_resource_occ_get_register(devlink, MLXSW_SP_RESOURCE_COUNTERS,
+- 					  mlxsw_sp_counter_pool_occ_get, pool);
++ 	devl_resource_occ_get_register(devlink, MLXSW_SP_RESOURCE_COUNTERS,
++ 				       mlxsw_sp_counter_pool_occ_get, pool);
+  
+ -	pool->usage = bitmap_zalloc(pool->pool_size, GFP_KERNEL);
+ +	map_size = BITS_TO_LONGS(pool->pool_size) * sizeof(unsigned long);
+ +
+ +	pool->usage = kzalloc(map_size, GFP_KERNEL);
+  	if (!pool->usage) {
+  		err = -ENOMEM;
+  		goto err_usage_alloc;
+@@@ -158,10 -155,10 +158,10 @@@
+  	return 0;
+  
+  err_sub_pools_init:
+ -	bitmap_free(pool->usage);
+ +	kfree(pool->usage);
+  err_usage_alloc:
+- 	devlink_resource_occ_get_unregister(devlink,
+- 					    MLXSW_SP_RESOURCE_COUNTERS);
++ 	devl_resource_occ_get_unregister(devlink,
++ 					 MLXSW_SP_RESOURCE_COUNTERS);
+  err_pool_resource_size_get:
+  	kfree(pool);
+  	return err;
+@@@ -176,9 -173,9 +176,15 @@@ void mlxsw_sp_counter_pool_fini(struct 
+  	WARN_ON(find_first_bit(pool->usage, pool->pool_size) !=
+  			       pool->pool_size);
+  	WARN_ON(atomic_read(&pool->active_entries_count));
+++<<<<<<< HEAD
+ +	kfree(pool->usage);
+ +	devlink_resource_occ_get_unregister(devlink,
+ +					    MLXSW_SP_RESOURCE_COUNTERS);
+++=======
++ 	bitmap_free(pool->usage);
++ 	devl_resource_occ_get_unregister(devlink,
++ 					 MLXSW_SP_RESOURCE_COUNTERS);
+++>>>>>>> 72a4c8c94efa (mlxsw: convert driver to use unlocked devlink API during init/fini)
+  	kfree(pool);
+  }
+  
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index c39544dd56e6,23d526f13f1c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -8434,6 -9959,18 +8434,21 @@@ static int mlxsw_sp_rifs_init(struct ml
+  	if (!mlxsw_sp->router->rifs)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	idr_init(&mlxsw_sp->router->rif_mac_profiles_idr);
++ 	atomic_set(&mlxsw_sp->router->rif_mac_profiles_count, 0);
++ 	atomic_set(&mlxsw_sp->router->rifs_count, 0);
++ 	devl_resource_occ_get_register(devlink,
++ 				       MLXSW_SP_RESOURCE_RIF_MAC_PROFILES,
++ 				       mlxsw_sp_rif_mac_profiles_occ_get,
++ 				       mlxsw_sp);
++ 	devl_resource_occ_get_register(devlink,
++ 				       MLXSW_SP_RESOURCE_RIFS,
++ 				       mlxsw_sp_rifs_occ_get,
++ 				       mlxsw_sp);
++ 
+++>>>>>>> 72a4c8c94efa (mlxsw: convert driver to use unlocked devlink API during init/fini)
+  	return 0;
+  }
+  
+@@@ -8444,6 -9982,12 +8459,14 @@@ static void mlxsw_sp_rifs_fini(struct m
+  	for (i = 0; i < MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS); i++)
+  		WARN_ON_ONCE(mlxsw_sp->router->rifs[i]);
+  
+++<<<<<<< HEAD
+++=======
++ 	devl_resource_occ_get_unregister(devlink, MLXSW_SP_RESOURCE_RIFS);
++ 	devl_resource_occ_get_unregister(devlink,
++ 					 MLXSW_SP_RESOURCE_RIF_MAC_PROFILES);
++ 	WARN_ON(!idr_is_empty(&mlxsw_sp->router->rif_mac_profiles_idr));
++ 	idr_destroy(&mlxsw_sp->router->rif_mac_profiles_idr);
+++>>>>>>> 72a4c8c94efa (mlxsw: convert driver to use unlocked devlink API during init/fini)
+  	kfree(mlxsw_sp->router->rifs);
+  }
+  
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/core.c b/drivers/net/ethernet/mellanox/mlxsw/core.c
+index 49fab4a59db8..38cef5a22b51 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/core.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/core.c
+@@ -115,11 +115,11 @@ static int mlxsw_core_resources_ports_register(struct mlxsw_core *mlxsw_core)
+ 					  max_ports, 1,
+ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
+ 
+-	return devlink_resource_register(devlink,
+-					 DEVLINK_RESOURCE_GENERIC_NAME_PORTS,
+-					 max_ports, MLXSW_CORE_RESOURCE_PORTS,
+-					 DEVLINK_RESOURCE_ID_PARENT_TOP,
+-					 &ports_num_params);
++	return devl_resource_register(devlink,
++				      DEVLINK_RESOURCE_GENERIC_NAME_PORTS,
++				      max_ports, MLXSW_CORE_RESOURCE_PORTS,
++				      DEVLINK_RESOURCE_ID_PARENT_TOP,
++				      &ports_num_params);
+ }
+ 
+ static int mlxsw_ports_init(struct mlxsw_core *mlxsw_core, bool reload)
+@@ -145,8 +145,8 @@ static int mlxsw_ports_init(struct mlxsw_core *mlxsw_core, bool reload)
+ 			goto err_resources_ports_register;
+ 	}
+ 	atomic_set(&mlxsw_core->active_ports_count, 0);
+-	devlink_resource_occ_get_register(devlink, MLXSW_CORE_RESOURCE_PORTS,
+-					  mlxsw_ports_occ_get, mlxsw_core);
++	devl_resource_occ_get_register(devlink, MLXSW_CORE_RESOURCE_PORTS,
++				       mlxsw_ports_occ_get, mlxsw_core);
+ 
+ 	return 0;
+ 
+@@ -159,9 +159,9 @@ static void mlxsw_ports_fini(struct mlxsw_core *mlxsw_core, bool reload)
+ {
+ 	struct devlink *devlink = priv_to_devlink(mlxsw_core);
+ 
+-	devlink_resource_occ_get_unregister(devlink, MLXSW_CORE_RESOURCE_PORTS);
++	devl_resource_occ_get_unregister(devlink, MLXSW_CORE_RESOURCE_PORTS);
+ 	if (!reload)
+-		devlink_resources_unregister(priv_to_devlink(mlxsw_core));
++		devl_resources_unregister(priv_to_devlink(mlxsw_core));
+ 
+ 	kfree(mlxsw_core->ports);
+ }
+@@ -1463,7 +1463,9 @@ mlxsw_devlink_core_bus_device_reload_down(struct devlink *devlink,
+ 	if (!(mlxsw_core->bus->features & MLXSW_BUS_F_RESET))
+ 		return -EOPNOTSUPP;
+ 
++	devl_lock(devlink);
+ 	mlxsw_core_bus_device_unregister(mlxsw_core, true);
++	devl_unlock(devlink);
+ 	return 0;
+ }
+ 
+@@ -1473,13 +1475,17 @@ mlxsw_devlink_core_bus_device_reload_up(struct devlink *devlink, enum devlink_re
+ 					struct netlink_ext_ack *extack)
+ {
+ 	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
++	int err;
+ 
+ 	*actions_performed = BIT(DEVLINK_RELOAD_ACTION_DRIVER_REINIT) |
+ 			     BIT(DEVLINK_RELOAD_ACTION_FW_ACTIVATE);
+-	return mlxsw_core_bus_device_register(mlxsw_core->bus_info,
+-					      mlxsw_core->bus,
+-					      mlxsw_core->bus_priv, true,
+-					      devlink, extack);
++	devl_lock(devlink);
++	err = mlxsw_core_bus_device_register(mlxsw_core->bus_info,
++					     mlxsw_core->bus,
++					     mlxsw_core->bus_priv, true,
++					     devlink, extack);
++	devl_unlock(devlink);
++	return err;
+ }
+ 
+ static int mlxsw_devlink_flash_update(struct devlink *devlink,
+@@ -1925,6 +1931,7 @@ __mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
+ 			err = -ENOMEM;
+ 			goto err_devlink_alloc;
+ 		}
++		devl_lock(devlink);
+ 	}
+ 
+ 	mlxsw_core = devlink_priv(devlink);
+@@ -2004,6 +2011,7 @@ __mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
+ 
+ 	if (!reload) {
+ 		devlink_set_features(devlink, DEVLINK_F_RELOAD);
++		devl_unlock(devlink);
+ 		devlink_register(devlink);
+ 	}
+ 	return 0;
+@@ -2029,12 +2037,14 @@ __mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
+ 	mlxsw_ports_fini(mlxsw_core, reload);
+ err_ports_init:
+ 	if (!reload)
+-		devlink_resources_unregister(devlink);
++		devl_resources_unregister(devlink);
+ err_register_resources:
+ 	mlxsw_bus->fini(bus_priv);
+ err_bus_init:
+-	if (!reload)
++	if (!reload) {
++		devl_unlock(devlink);
+ 		devlink_free(devlink);
++	}
+ err_devlink_alloc:
+ 	return err;
+ }
+@@ -2070,8 +2080,10 @@ void mlxsw_core_bus_device_unregister(struct mlxsw_core *mlxsw_core,
+ {
+ 	struct devlink *devlink = priv_to_devlink(mlxsw_core);
+ 
+-	if (!reload)
++	if (!reload) {
+ 		devlink_unregister(devlink);
++		devl_lock(devlink);
++	}
+ 
+ 	if (devlink_is_reload_failed(devlink)) {
+ 		if (!reload)
+@@ -2096,17 +2108,20 @@ void mlxsw_core_bus_device_unregister(struct mlxsw_core *mlxsw_core,
+ 	kfree(mlxsw_core->lag.mapping);
+ 	mlxsw_ports_fini(mlxsw_core, reload);
+ 	if (!reload)
+-		devlink_resources_unregister(devlink);
++		devl_resources_unregister(devlink);
+ 	mlxsw_core->bus->fini(mlxsw_core->bus_priv);
+-	if (!reload)
++	if (!reload) {
+ 		devlink_free(devlink);
++		devl_unlock(devlink);
++	}
+ 
+ 	return;
+ 
+ reload_fail_deinit:
+ 	mlxsw_core_params_unregister(mlxsw_core);
+-	devlink_resources_unregister(devlink);
++	devl_resources_unregister(devlink);
+ 	devlink_free(devlink);
++	devl_unlock(devlink);
+ }
+ EXPORT_SYMBOL(mlxsw_core_bus_device_unregister);
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum1_kvdl.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum1_kvdl.c
+index a9fff8adc75e..e5455cbbee97 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum1_kvdl.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum1_kvdl.c
+@@ -217,8 +217,8 @@ mlxsw_sp1_kvdl_part_init(struct mlxsw_sp *mlxsw_sp,
+ 	u64 resource_size;
+ 	int err;
+ 
+-	err = devlink_resource_size_get(devlink, info->resource_id,
+-					&resource_size);
++	err = devl_resource_size_get(devlink, info->resource_id,
++				     &resource_size);
+ 	if (err) {
+ 		need_update = false;
+ 		resource_size = info->end_index - info->start_index + 1;
+@@ -339,22 +339,22 @@ static int mlxsw_sp1_kvdl_init(struct mlxsw_sp *mlxsw_sp, void *priv)
+ 	err = mlxsw_sp1_kvdl_parts_init(mlxsw_sp, kvdl);
+ 	if (err)
+ 		return err;
+-	devlink_resource_occ_get_register(devlink,
+-					  MLXSW_SP_RESOURCE_KVD_LINEAR,
+-					  mlxsw_sp1_kvdl_occ_get,
+-					  kvdl);
+-	devlink_resource_occ_get_register(devlink,
+-					  MLXSW_SP_RESOURCE_KVD_LINEAR_SINGLE,
+-					  mlxsw_sp1_kvdl_single_occ_get,
+-					  kvdl);
+-	devlink_resource_occ_get_register(devlink,
+-					  MLXSW_SP_RESOURCE_KVD_LINEAR_CHUNKS,
+-					  mlxsw_sp1_kvdl_chunks_occ_get,
+-					  kvdl);
+-	devlink_resource_occ_get_register(devlink,
+-					  MLXSW_SP_RESOURCE_KVD_LINEAR_LARGE_CHUNKS,
+-					  mlxsw_sp1_kvdl_large_chunks_occ_get,
+-					  kvdl);
++	devl_resource_occ_get_register(devlink,
++				       MLXSW_SP_RESOURCE_KVD_LINEAR,
++				       mlxsw_sp1_kvdl_occ_get,
++				       kvdl);
++	devl_resource_occ_get_register(devlink,
++				       MLXSW_SP_RESOURCE_KVD_LINEAR_SINGLE,
++				       mlxsw_sp1_kvdl_single_occ_get,
++				       kvdl);
++	devl_resource_occ_get_register(devlink,
++				       MLXSW_SP_RESOURCE_KVD_LINEAR_CHUNKS,
++				       mlxsw_sp1_kvdl_chunks_occ_get,
++				       kvdl);
++	devl_resource_occ_get_register(devlink,
++				       MLXSW_SP_RESOURCE_KVD_LINEAR_LARGE_CHUNKS,
++				       mlxsw_sp1_kvdl_large_chunks_occ_get,
++				       kvdl);
+ 	return 0;
+ }
+ 
+@@ -363,14 +363,14 @@ static void mlxsw_sp1_kvdl_fini(struct mlxsw_sp *mlxsw_sp, void *priv)
+ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+ 	struct mlxsw_sp1_kvdl *kvdl = priv;
+ 
+-	devlink_resource_occ_get_unregister(devlink,
+-					    MLXSW_SP_RESOURCE_KVD_LINEAR_LARGE_CHUNKS);
+-	devlink_resource_occ_get_unregister(devlink,
+-					    MLXSW_SP_RESOURCE_KVD_LINEAR_CHUNKS);
+-	devlink_resource_occ_get_unregister(devlink,
+-					    MLXSW_SP_RESOURCE_KVD_LINEAR_SINGLE);
+-	devlink_resource_occ_get_unregister(devlink,
+-					    MLXSW_SP_RESOURCE_KVD_LINEAR);
++	devl_resource_occ_get_unregister(devlink,
++					 MLXSW_SP_RESOURCE_KVD_LINEAR_LARGE_CHUNKS);
++	devl_resource_occ_get_unregister(devlink,
++					 MLXSW_SP_RESOURCE_KVD_LINEAR_CHUNKS);
++	devl_resource_occ_get_unregister(devlink,
++					 MLXSW_SP_RESOURCE_KVD_LINEAR_SINGLE);
++	devl_resource_occ_get_unregister(devlink,
++					 MLXSW_SP_RESOURCE_KVD_LINEAR);
+ 	mlxsw_sp1_kvdl_parts_fini(kvdl);
+ }
+ 
+@@ -397,32 +397,32 @@ int mlxsw_sp1_kvdl_resources_register(struct mlxsw_core *mlxsw_core)
+ 	devlink_resource_size_params_init(&size_params, 0, kvdl_max_size,
+ 					  MLXSW_SP1_KVDL_SINGLE_ALLOC_SIZE,
+ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
+-	err = devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_LINEAR_SINGLES,
+-					MLXSW_SP1_KVDL_SINGLE_SIZE,
+-					MLXSW_SP_RESOURCE_KVD_LINEAR_SINGLE,
+-					MLXSW_SP_RESOURCE_KVD_LINEAR,
+-					&size_params);
++	err = devl_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_LINEAR_SINGLES,
++				     MLXSW_SP1_KVDL_SINGLE_SIZE,
++				     MLXSW_SP_RESOURCE_KVD_LINEAR_SINGLE,
++				     MLXSW_SP_RESOURCE_KVD_LINEAR,
++				     &size_params);
+ 	if (err)
+ 		return err;
+ 
+ 	devlink_resource_size_params_init(&size_params, 0, kvdl_max_size,
+ 					  MLXSW_SP1_KVDL_CHUNKS_ALLOC_SIZE,
+ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
+-	err = devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_LINEAR_CHUNKS,
+-					MLXSW_SP1_KVDL_CHUNKS_SIZE,
+-					MLXSW_SP_RESOURCE_KVD_LINEAR_CHUNKS,
+-					MLXSW_SP_RESOURCE_KVD_LINEAR,
+-					&size_params);
++	err = devl_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_LINEAR_CHUNKS,
++				     MLXSW_SP1_KVDL_CHUNKS_SIZE,
++				     MLXSW_SP_RESOURCE_KVD_LINEAR_CHUNKS,
++				     MLXSW_SP_RESOURCE_KVD_LINEAR,
++				     &size_params);
+ 	if (err)
+ 		return err;
+ 
+ 	devlink_resource_size_params_init(&size_params, 0, kvdl_max_size,
+ 					  MLXSW_SP1_KVDL_LARGE_CHUNKS_ALLOC_SIZE,
+ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
+-	err = devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_LINEAR_LARGE_CHUNKS,
+-					MLXSW_SP1_KVDL_LARGE_CHUNKS_SIZE,
+-					MLXSW_SP_RESOURCE_KVD_LINEAR_LARGE_CHUNKS,
+-					MLXSW_SP_RESOURCE_KVD_LINEAR,
+-					&size_params);
++	err = devl_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_LINEAR_LARGE_CHUNKS,
++				     MLXSW_SP1_KVDL_LARGE_CHUNKS_SIZE,
++				     MLXSW_SP_RESOURCE_KVD_LINEAR_LARGE_CHUNKS,
++				     MLXSW_SP_RESOURCE_KVD_LINEAR,
++				     &size_params);
+ 	return err;
+ }
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_buffers.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_buffers.c
+index 37ff29a1686e..8f088c7548eb 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_buffers.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_buffers.c
+@@ -1264,12 +1264,12 @@ int mlxsw_sp_buffers_init(struct mlxsw_sp *mlxsw_sp)
+ 	if (err)
+ 		goto err_sb_mms_init;
+ 	mlxsw_sp_pool_count(mlxsw_sp, &ing_pool_count, &eg_pool_count);
+-	err = devlink_sb_register(priv_to_devlink(mlxsw_sp->core), 0,
+-				  mlxsw_sp->sb->sb_size,
+-				  ing_pool_count,
+-				  eg_pool_count,
+-				  MLXSW_SP_SB_ING_TC_COUNT,
+-				  MLXSW_SP_SB_EG_TC_COUNT);
++	err = devl_sb_register(priv_to_devlink(mlxsw_sp->core), 0,
++			       mlxsw_sp->sb->sb_size,
++			       ing_pool_count,
++			       eg_pool_count,
++			       MLXSW_SP_SB_ING_TC_COUNT,
++			       MLXSW_SP_SB_EG_TC_COUNT);
+ 	if (err)
+ 		goto err_devlink_sb_register;
+ 
+@@ -1288,7 +1288,7 @@ int mlxsw_sp_buffers_init(struct mlxsw_sp *mlxsw_sp)
+ 
+ void mlxsw_sp_buffers_fini(struct mlxsw_sp *mlxsw_sp)
+ {
+-	devlink_sb_unregister(priv_to_devlink(mlxsw_sp->core), 0);
++	devl_sb_unregister(priv_to_devlink(mlxsw_sp->core), 0);
+ 	mlxsw_sp_sb_ports_fini(mlxsw_sp);
+ 	kfree(mlxsw_sp->sb);
+ }
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_cnt.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_dpipe.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_dpipe.c
+index 72dabe6d3eba..7f05af4bafc1 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_dpipe.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_dpipe.c
+@@ -295,17 +295,17 @@ static int mlxsw_sp_dpipe_erif_table_init(struct mlxsw_sp *mlxsw_sp)
+ {
+ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+ 
+-	return devlink_dpipe_table_register(devlink,
+-					    MLXSW_SP_DPIPE_TABLE_NAME_ERIF,
+-					    &mlxsw_sp_erif_ops,
+-					    mlxsw_sp, false);
++	return devl_dpipe_table_register(devlink,
++					 MLXSW_SP_DPIPE_TABLE_NAME_ERIF,
++					 &mlxsw_sp_erif_ops,
++					 mlxsw_sp, false);
+ }
+ 
+ static void mlxsw_sp_dpipe_erif_table_fini(struct mlxsw_sp *mlxsw_sp)
+ {
+ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+ 
+-	devlink_dpipe_table_unregister(devlink, MLXSW_SP_DPIPE_TABLE_NAME_ERIF);
++	devl_dpipe_table_unregister(devlink, MLXSW_SP_DPIPE_TABLE_NAME_ERIF);
+ }
+ 
+ static int mlxsw_sp_dpipe_table_host_matches_dump(struct sk_buff *skb, int type)
+@@ -749,25 +749,25 @@ static int mlxsw_sp_dpipe_host4_table_init(struct mlxsw_sp *mlxsw_sp)
+ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+ 	int err;
+ 
+-	err = devlink_dpipe_table_register(devlink,
+-					   MLXSW_SP_DPIPE_TABLE_NAME_HOST4,
+-					   &mlxsw_sp_host4_ops,
+-					   mlxsw_sp, false);
++	err = devl_dpipe_table_register(devlink,
++					MLXSW_SP_DPIPE_TABLE_NAME_HOST4,
++					&mlxsw_sp_host4_ops,
++					mlxsw_sp, false);
+ 	if (err)
+ 		return err;
+ 
+-	err = devlink_dpipe_table_resource_set(devlink,
+-					       MLXSW_SP_DPIPE_TABLE_NAME_HOST4,
+-					       MLXSW_SP_RESOURCE_KVD_HASH_SINGLE,
+-					       MLXSW_SP_DPIPE_TABLE_RESOURCE_UNIT_HOST4);
++	err = devl_dpipe_table_resource_set(devlink,
++					    MLXSW_SP_DPIPE_TABLE_NAME_HOST4,
++					    MLXSW_SP_RESOURCE_KVD_HASH_SINGLE,
++					    MLXSW_SP_DPIPE_TABLE_RESOURCE_UNIT_HOST4);
+ 	if (err)
+ 		goto err_resource_set;
+ 
+ 	return 0;
+ 
+ err_resource_set:
+-	devlink_dpipe_table_unregister(devlink,
+-				       MLXSW_SP_DPIPE_TABLE_NAME_HOST4);
++	devl_dpipe_table_unregister(devlink,
++				    MLXSW_SP_DPIPE_TABLE_NAME_HOST4);
+ 	return err;
+ }
+ 
+@@ -775,8 +775,8 @@ static void mlxsw_sp_dpipe_host4_table_fini(struct mlxsw_sp *mlxsw_sp)
+ {
+ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+ 
+-	devlink_dpipe_table_unregister(devlink,
+-				       MLXSW_SP_DPIPE_TABLE_NAME_HOST4);
++	devl_dpipe_table_unregister(devlink,
++				    MLXSW_SP_DPIPE_TABLE_NAME_HOST4);
+ }
+ 
+ static int
+@@ -826,25 +826,25 @@ static int mlxsw_sp_dpipe_host6_table_init(struct mlxsw_sp *mlxsw_sp)
+ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+ 	int err;
+ 
+-	err = devlink_dpipe_table_register(devlink,
+-					   MLXSW_SP_DPIPE_TABLE_NAME_HOST6,
+-					   &mlxsw_sp_host6_ops,
+-					   mlxsw_sp, false);
++	err = devl_dpipe_table_register(devlink,
++					MLXSW_SP_DPIPE_TABLE_NAME_HOST6,
++					&mlxsw_sp_host6_ops,
++					mlxsw_sp, false);
+ 	if (err)
+ 		return err;
+ 
+-	err = devlink_dpipe_table_resource_set(devlink,
+-					       MLXSW_SP_DPIPE_TABLE_NAME_HOST6,
+-					       MLXSW_SP_RESOURCE_KVD_HASH_DOUBLE,
+-					       MLXSW_SP_DPIPE_TABLE_RESOURCE_UNIT_HOST6);
++	err = devl_dpipe_table_resource_set(devlink,
++					    MLXSW_SP_DPIPE_TABLE_NAME_HOST6,
++					    MLXSW_SP_RESOURCE_KVD_HASH_DOUBLE,
++					    MLXSW_SP_DPIPE_TABLE_RESOURCE_UNIT_HOST6);
+ 	if (err)
+ 		goto err_resource_set;
+ 
+ 	return 0;
+ 
+ err_resource_set:
+-	devlink_dpipe_table_unregister(devlink,
+-				       MLXSW_SP_DPIPE_TABLE_NAME_HOST6);
++	devl_dpipe_table_unregister(devlink,
++				    MLXSW_SP_DPIPE_TABLE_NAME_HOST6);
+ 	return err;
+ }
+ 
+@@ -852,8 +852,8 @@ static void mlxsw_sp_dpipe_host6_table_fini(struct mlxsw_sp *mlxsw_sp)
+ {
+ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+ 
+-	devlink_dpipe_table_unregister(devlink,
+-				       MLXSW_SP_DPIPE_TABLE_NAME_HOST6);
++	devl_dpipe_table_unregister(devlink,
++				    MLXSW_SP_DPIPE_TABLE_NAME_HOST6);
+ }
+ 
+ static int mlxsw_sp_dpipe_table_adj_matches_dump(void *priv,
+@@ -1229,25 +1229,25 @@ static int mlxsw_sp_dpipe_adj_table_init(struct mlxsw_sp *mlxsw_sp)
+ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+ 	int err;
+ 
+-	err = devlink_dpipe_table_register(devlink,
+-					   MLXSW_SP_DPIPE_TABLE_NAME_ADJ,
+-					   &mlxsw_sp_dpipe_table_adj_ops,
+-					   mlxsw_sp, false);
++	err = devl_dpipe_table_register(devlink,
++					MLXSW_SP_DPIPE_TABLE_NAME_ADJ,
++					&mlxsw_sp_dpipe_table_adj_ops,
++					mlxsw_sp, false);
+ 	if (err)
+ 		return err;
+ 
+-	err = devlink_dpipe_table_resource_set(devlink,
+-					       MLXSW_SP_DPIPE_TABLE_NAME_ADJ,
+-					       MLXSW_SP_RESOURCE_KVD_LINEAR,
+-					       MLXSW_SP_DPIPE_TABLE_RESOURCE_UNIT_ADJ);
++	err = devl_dpipe_table_resource_set(devlink,
++					    MLXSW_SP_DPIPE_TABLE_NAME_ADJ,
++					    MLXSW_SP_RESOURCE_KVD_LINEAR,
++					    MLXSW_SP_DPIPE_TABLE_RESOURCE_UNIT_ADJ);
+ 	if (err)
+ 		goto err_resource_set;
+ 
+ 	return 0;
+ 
+ err_resource_set:
+-	devlink_dpipe_table_unregister(devlink,
+-				       MLXSW_SP_DPIPE_TABLE_NAME_ADJ);
++	devl_dpipe_table_unregister(devlink,
++				    MLXSW_SP_DPIPE_TABLE_NAME_ADJ);
+ 	return err;
+ }
+ 
+@@ -1255,8 +1255,8 @@ static void mlxsw_sp_dpipe_adj_table_fini(struct mlxsw_sp *mlxsw_sp)
+ {
+ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+ 
+-	devlink_dpipe_table_unregister(devlink,
+-				       MLXSW_SP_DPIPE_TABLE_NAME_ADJ);
++	devl_dpipe_table_unregister(devlink,
++				    MLXSW_SP_DPIPE_TABLE_NAME_ADJ);
+ }
+ 
+ int mlxsw_sp_dpipe_init(struct mlxsw_sp *mlxsw_sp)
+@@ -1264,7 +1264,7 @@ int mlxsw_sp_dpipe_init(struct mlxsw_sp *mlxsw_sp)
+ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+ 	int err;
+ 
+-	devlink_dpipe_headers_register(devlink, &mlxsw_sp_dpipe_headers);
++	devl_dpipe_headers_register(devlink, &mlxsw_sp_dpipe_headers);
+ 
+ 	err = mlxsw_sp_dpipe_erif_table_init(mlxsw_sp);
+ 	if (err)
+@@ -1290,7 +1290,7 @@ int mlxsw_sp_dpipe_init(struct mlxsw_sp *mlxsw_sp)
+ err_host4_table_init:
+ 	mlxsw_sp_dpipe_erif_table_fini(mlxsw_sp);
+ err_erif_table_init:
+-	devlink_dpipe_headers_unregister(priv_to_devlink(mlxsw_sp->core));
++	devl_dpipe_headers_unregister(priv_to_devlink(mlxsw_sp->core));
+ 	return err;
+ }
+ 
+@@ -1302,5 +1302,5 @@ void mlxsw_sp_dpipe_fini(struct mlxsw_sp *mlxsw_sp)
+ 	mlxsw_sp_dpipe_host6_table_fini(mlxsw_sp);
+ 	mlxsw_sp_dpipe_host4_table_fini(mlxsw_sp);
+ 	mlxsw_sp_dpipe_erif_table_fini(mlxsw_sp);
+-	devlink_dpipe_headers_unregister(devlink);
++	devl_dpipe_headers_unregister(devlink);
+ }
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_policer.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_policer.c
+index 39052e5c12fd..22ebb207ce4d 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_policer.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_policer.c
+@@ -94,10 +94,10 @@ mlxsw_sp_policer_single_rate_family_init(struct mlxsw_sp_policer_family *family)
+ 
+ 	atomic_set(&family->policers_count, 0);
+ 	devlink = priv_to_devlink(core);
+-	devlink_resource_occ_get_register(devlink,
+-					  MLXSW_SP_RESOURCE_SINGLE_RATE_POLICERS,
+-					  mlxsw_sp_policer_single_rate_occ_get,
+-					  family);
++	devl_resource_occ_get_register(devlink,
++				       MLXSW_SP_RESOURCE_SINGLE_RATE_POLICERS,
++				       mlxsw_sp_policer_single_rate_occ_get,
++				       family);
+ 
+ 	return 0;
+ }
+@@ -107,8 +107,8 @@ mlxsw_sp_policer_single_rate_family_fini(struct mlxsw_sp_policer_family *family)
+ {
+ 	struct devlink *devlink = priv_to_devlink(family->mlxsw_sp->core);
+ 
+-	devlink_resource_occ_get_unregister(devlink,
+-					    MLXSW_SP_RESOURCE_SINGLE_RATE_POLICERS);
++	devl_resource_occ_get_unregister(devlink,
++					 MLXSW_SP_RESOURCE_SINGLE_RATE_POLICERS);
+ 	WARN_ON(atomic_read(&family->policers_count) != 0);
+ }
+ 
+@@ -419,22 +419,22 @@ int mlxsw_sp_policer_resources_register(struct mlxsw_core *mlxsw_core)
+ 	devlink_resource_size_params_init(&size_params, global_policers,
+ 					  global_policers, 1,
+ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
+-	err = devlink_resource_register(devlink, "global_policers",
+-					global_policers,
+-					MLXSW_SP_RESOURCE_GLOBAL_POLICERS,
+-					DEVLINK_RESOURCE_ID_PARENT_TOP,
+-					&size_params);
++	err = devl_resource_register(devlink, "global_policers",
++				     global_policers,
++				     MLXSW_SP_RESOURCE_GLOBAL_POLICERS,
++				     DEVLINK_RESOURCE_ID_PARENT_TOP,
++				     &size_params);
+ 	if (err)
+ 		return err;
+ 
+ 	devlink_resource_size_params_init(&size_params, single_rate_policers,
+ 					  single_rate_policers, 1,
+ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
+-	err = devlink_resource_register(devlink, "single_rate_policers",
+-					single_rate_policers,
+-					MLXSW_SP_RESOURCE_SINGLE_RATE_POLICERS,
+-					MLXSW_SP_RESOURCE_GLOBAL_POLICERS,
+-					&size_params);
++	err = devl_resource_register(devlink, "single_rate_policers",
++				     single_rate_policers,
++				     MLXSW_SP_RESOURCE_SINGLE_RATE_POLICERS,
++				     MLXSW_SP_RESOURCE_GLOBAL_POLICERS,
++				     &size_params);
+ 	if (err)
+ 		return err;
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_span.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_span.c
+index a2c0595f15a6..124952c1cba4 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_span.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_span.c
+@@ -106,8 +106,8 @@ int mlxsw_sp_span_init(struct mlxsw_sp *mlxsw_sp)
+ 	if (err)
+ 		goto err_init;
+ 
+-	devlink_resource_occ_get_register(devlink, MLXSW_SP_RESOURCE_SPAN,
+-					  mlxsw_sp_span_occ_get, mlxsw_sp);
++	devl_resource_occ_get_register(devlink, MLXSW_SP_RESOURCE_SPAN,
++				       mlxsw_sp_span_occ_get, mlxsw_sp);
+ 	INIT_WORK(&span->work, mlxsw_sp_span_respin_work);
+ 
+ 	return 0;
+@@ -123,7 +123,7 @@ void mlxsw_sp_span_fini(struct mlxsw_sp *mlxsw_sp)
+ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+ 
+ 	cancel_work_sync(&mlxsw_sp->span->work);
+-	devlink_resource_occ_get_unregister(devlink, MLXSW_SP_RESOURCE_SPAN);
++	devl_resource_occ_get_unregister(devlink, MLXSW_SP_RESOURCE_SPAN);
+ 
+ 	WARN_ON_ONCE(!list_empty(&mlxsw_sp->span->trigger_entries_list));
+ 	WARN_ON_ONCE(!list_empty(&mlxsw_sp->span->analyzed_ports_list));
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_trap.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_trap.c
+index 27992bd15f72..29e342ca70dc 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_trap.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_trap.c
+@@ -1292,8 +1292,8 @@ static int mlxsw_sp_trap_policers_init(struct mlxsw_sp *mlxsw_sp)
+ 
+ 	for (i = 0; i < trap->policers_count; i++) {
+ 		policer_item = &trap->policer_items_arr[i];
+-		err = devlink_trap_policers_register(devlink,
+-						     &policer_item->policer, 1);
++		err = devl_trap_policers_register(devlink,
++						  &policer_item->policer, 1);
+ 		if (err)
+ 			goto err_trap_policer_register;
+ 	}
+@@ -1303,8 +1303,8 @@ static int mlxsw_sp_trap_policers_init(struct mlxsw_sp *mlxsw_sp)
+ err_trap_policer_register:
+ 	for (i--; i >= 0; i--) {
+ 		policer_item = &trap->policer_items_arr[i];
+-		devlink_trap_policers_unregister(devlink,
+-						 &policer_item->policer, 1);
++		devl_trap_policers_unregister(devlink,
++					      &policer_item->policer, 1);
+ 	}
+ 	mlxsw_sp_trap_policer_items_arr_fini(mlxsw_sp);
+ 	return err;
+@@ -1319,8 +1319,8 @@ static void mlxsw_sp_trap_policers_fini(struct mlxsw_sp *mlxsw_sp)
+ 
+ 	for (i = trap->policers_count - 1; i >= 0; i--) {
+ 		policer_item = &trap->policer_items_arr[i];
+-		devlink_trap_policers_unregister(devlink,
+-						 &policer_item->policer, 1);
++		devl_trap_policers_unregister(devlink,
++					      &policer_item->policer, 1);
+ 	}
+ 	mlxsw_sp_trap_policer_items_arr_fini(mlxsw_sp);
+ }
+@@ -1375,8 +1375,7 @@ static int mlxsw_sp_trap_groups_init(struct mlxsw_sp *mlxsw_sp)
+ 
+ 	for (i = 0; i < trap->groups_count; i++) {
+ 		group_item = &trap->group_items_arr[i];
+-		err = devlink_trap_groups_register(devlink, &group_item->group,
+-						   1);
++		err = devl_trap_groups_register(devlink, &group_item->group, 1);
+ 		if (err)
+ 			goto err_trap_group_register;
+ 	}
+@@ -1386,7 +1385,7 @@ static int mlxsw_sp_trap_groups_init(struct mlxsw_sp *mlxsw_sp)
+ err_trap_group_register:
+ 	for (i--; i >= 0; i--) {
+ 		group_item = &trap->group_items_arr[i];
+-		devlink_trap_groups_unregister(devlink, &group_item->group, 1);
++		devl_trap_groups_unregister(devlink, &group_item->group, 1);
+ 	}
+ 	mlxsw_sp_trap_group_items_arr_fini(mlxsw_sp);
+ 	return err;
+@@ -1402,7 +1401,7 @@ static void mlxsw_sp_trap_groups_fini(struct mlxsw_sp *mlxsw_sp)
+ 		const struct mlxsw_sp_trap_group_item *group_item;
+ 
+ 		group_item = &trap->group_items_arr[i];
+-		devlink_trap_groups_unregister(devlink, &group_item->group, 1);
++		devl_trap_groups_unregister(devlink, &group_item->group, 1);
+ 	}
+ 	mlxsw_sp_trap_group_items_arr_fini(mlxsw_sp);
+ }
+@@ -1463,8 +1462,8 @@ static int mlxsw_sp_traps_init(struct mlxsw_sp *mlxsw_sp)
+ 
+ 	for (i = 0; i < trap->traps_count; i++) {
+ 		trap_item = &trap->trap_items_arr[i];
+-		err = devlink_traps_register(devlink, &trap_item->trap, 1,
+-					     mlxsw_sp);
++		err = devl_traps_register(devlink, &trap_item->trap, 1,
++					  mlxsw_sp);
+ 		if (err)
+ 			goto err_trap_register;
+ 	}
+@@ -1474,7 +1473,7 @@ static int mlxsw_sp_traps_init(struct mlxsw_sp *mlxsw_sp)
+ err_trap_register:
+ 	for (i--; i >= 0; i--) {
+ 		trap_item = &trap->trap_items_arr[i];
+-		devlink_traps_unregister(devlink, &trap_item->trap, 1);
++		devl_traps_unregister(devlink, &trap_item->trap, 1);
+ 	}
+ 	mlxsw_sp_trap_items_arr_fini(mlxsw_sp);
+ 	return err;
+@@ -1490,7 +1489,7 @@ static void mlxsw_sp_traps_fini(struct mlxsw_sp *mlxsw_sp)
+ 		const struct mlxsw_sp_trap_item *trap_item;
+ 
+ 		trap_item = &trap->trap_items_arr[i];
+-		devlink_traps_unregister(devlink, &trap_item->trap, 1);
++		devl_traps_unregister(devlink, &trap_item->trap, 1);
+ 	}
+ 	mlxsw_sp_trap_items_arr_fini(mlxsw_sp);
+ }
