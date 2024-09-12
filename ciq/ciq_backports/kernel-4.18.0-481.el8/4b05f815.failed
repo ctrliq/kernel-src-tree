@@ -1,0 +1,169 @@
+x86/tdx: Detect TDX at early kernel decompression time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+commit 4b05f81504bfcaab51083d3a271fada75e6b8904
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/4b05f815.failed
+
+The early decompression code does port I/O for its console output. But,
+handling the decompression-time port I/O demands a different approach
+from normal runtime because the IDT required to support #VE based port
+I/O emulation is not yet set up. Paravirtualizing I/O calls during
+the decompression step is acceptable because the decompression code
+doesn't have a lot of call sites to IO instruction.
+
+To support port I/O in decompression code, TDX must be detected before
+the decompression code might do port I/O. Detect whether the kernel runs
+in a TDX guest.
+
+Add an early_is_tdx_guest() interface to query the cached TDX guest
+status in the decompression code.
+
+TDX is detected with CPUID. Make cpuid_count() accessible outside
+boot/cpuflags.c.
+
+TDX detection in the main kernel is very similar. Move common bits
+into <asm/shared/tdx.h>.
+
+The actual port I/O paravirtualization will come later in the series.
+
+	Signed-off-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Tony Luck <tony.luck@intel.com>
+	Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+Link: https://lkml.kernel.org/r/20220405232939.73860-13-kirill.shutemov@linux.intel.com
+(cherry picked from commit 4b05f81504bfcaab51083d3a271fada75e6b8904)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/tdx.h
+* Unmerged path arch/x86/include/asm/tdx.h
+diff --git a/arch/x86/boot/compressed/Makefile b/arch/x86/boot/compressed/Makefile
+index 3ffaacf049db..19bf32c2263d 100644
+--- a/arch/x86/boot/compressed/Makefile
++++ b/arch/x86/boot/compressed/Makefile
+@@ -95,6 +95,7 @@ ifdef CONFIG_X86_64
+ endif
+ 
+ vmlinux-objs-$(CONFIG_ACPI) += $(obj)/acpi.o
++vmlinux-objs-$(CONFIG_INTEL_TDX_GUEST) += $(obj)/tdx.o
+ 
+ $(obj)/eboot.o: KBUILD_CFLAGS += -fshort-wchar -mno-red-zone
+ 
+diff --git a/arch/x86/boot/compressed/misc.c b/arch/x86/boot/compressed/misc.c
+index 246873efe6af..7d8610f9c94e 100644
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@ -365,6 +365,14 @@ asmlinkage __visible void *extract_kernel(void *rmode, memptr heap,
+ 	lines = boot_params->screen_info.orig_video_lines;
+ 	cols = boot_params->screen_info.orig_video_cols;
+ 
++	/*
++	 * Detect TDX guest environment.
++	 *
++	 * It has to be done before console_init() in order to use
++	 * paravirtualized port I/O operations if needed.
++	 */
++	early_tdx_detect();
++
+ 	console_init();
+ 
+ 	/*
+diff --git a/arch/x86/boot/compressed/misc.h b/arch/x86/boot/compressed/misc.h
+index 4e153d610d96..11e137aaea96 100644
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@ -26,6 +26,8 @@
+ #include <asm/bootparam_utils.h>
+ #include <asm/desc_defs.h>
+ 
++#include "tdx.h"
++
+ #define BOOT_CTYPE_H
+ #include <linux/acpi.h>
+ 
+diff --git a/arch/x86/boot/compressed/tdx.c b/arch/x86/boot/compressed/tdx.c
+new file mode 100644
+index 000000000000..5f6d01a2f1f4
+--- /dev/null
++++ b/arch/x86/boot/compressed/tdx.c
+@@ -0,0 +1,16 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include "../cpuflags.h"
++#include "../string.h"
++
++#include <asm/shared/tdx.h>
++
++void early_tdx_detect(void)
++{
++	u32 eax, sig[3];
++
++	cpuid_count(TDX_CPUID_LEAF_ID, 0, &eax, &sig[0], &sig[2],  &sig[1]);
++
++	if (memcmp(TDX_IDENT, sig, sizeof(sig)))
++		return;
++}
+diff --git a/arch/x86/boot/compressed/tdx.h b/arch/x86/boot/compressed/tdx.h
+new file mode 100644
+index 000000000000..9055482cd35c
+--- /dev/null
++++ b/arch/x86/boot/compressed/tdx.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef BOOT_COMPRESSED_TDX_H
++#define BOOT_COMPRESSED_TDX_H
++
++#include <linux/types.h>
++
++#ifdef CONFIG_INTEL_TDX_GUEST
++void early_tdx_detect(void);
++#else
++static inline void early_tdx_detect(void) { };
++#endif
++
++#endif /* BOOT_COMPRESSED_TDX_H */
+diff --git a/arch/x86/boot/cpuflags.c b/arch/x86/boot/cpuflags.c
+index a0b75f73dc63..a83d67ec627d 100644
+--- a/arch/x86/boot/cpuflags.c
++++ b/arch/x86/boot/cpuflags.c
+@@ -71,8 +71,7 @@ int has_eflag(unsigned long mask)
+ # define EBX_REG "=b"
+ #endif
+ 
+-static inline void cpuid_count(u32 id, u32 count,
+-		u32 *a, u32 *b, u32 *c, u32 *d)
++void cpuid_count(u32 id, u32 count, u32 *a, u32 *b, u32 *c, u32 *d)
+ {
+ 	asm volatile(".ifnc %%ebx,%3 ; movl  %%ebx,%3 ; .endif	\n\t"
+ 		     "cpuid					\n\t"
+diff --git a/arch/x86/boot/cpuflags.h b/arch/x86/boot/cpuflags.h
+index 2e20814d3ce3..475b8fde90f7 100644
+--- a/arch/x86/boot/cpuflags.h
++++ b/arch/x86/boot/cpuflags.h
+@@ -17,5 +17,6 @@ extern u32 cpu_vendor[3];
+ 
+ int has_eflag(unsigned long mask);
+ void get_cpuflags(void);
++void cpuid_count(u32 id, u32 count, u32 *a, u32 *b, u32 *c, u32 *d);
+ 
+ #endif
+diff --git a/arch/x86/include/asm/shared/tdx.h b/arch/x86/include/asm/shared/tdx.h
+new file mode 100644
+index 000000000000..8209ba9ffe1a
+--- /dev/null
++++ b/arch/x86/include/asm/shared/tdx.h
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_X86_SHARED_TDX_H
++#define _ASM_X86_SHARED_TDX_H
++
++#define TDX_CPUID_LEAF_ID	0x21
++#define TDX_IDENT		"IntelTDX    "
++
++#endif /* _ASM_X86_SHARED_TDX_H */
+* Unmerged path arch/x86/include/asm/tdx.h
