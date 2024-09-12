@@ -1322,8 +1322,6 @@ struct cifs_readdata {
 	struct page			**pages;
 };
 
-struct cifs_writedata;
-
 /* asynchronous write support */
 struct cifs_writedata {
 	struct kref			refcount;
