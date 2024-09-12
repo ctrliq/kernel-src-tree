@@ -1,0 +1,160 @@
+drm/i915: disable sampler indirect state in bindless heap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Lionel Landwerlin <lionel.g.landwerlin@intel.com>
+commit 16fc9c08f0ec7b1c95f1ea4a16097acdb3fc943d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/16fc9c08.failed
+
+By default the indirect state sampler data (border colors) are stored
+in the same heap as the SAMPLER_STATE structure. For userspace drivers
+that can be 2 different heaps (dynamic state heap & bindless sampler
+state heap). This means that border colors have to copied in 2
+different places so that the same SAMPLER_STATE structure find the
+right data.
+
+This change is forcing the indirect state sampler data to only be in
+the dynamic state pool (more convenient for userspace drivers, they
+only have to have one copy of the border colors). This is reproducing
+the behavior of the Windows drivers.
+
+BSpec: 46052
+
+	Signed-off-by: Lionel Landwerlin <lionel.g.landwerlin@intel.com>
+	Cc: stable@vger.kernel.org
+	Reviewed-by: Haridhar Kalvala <haridhar.kalvala@intel.com>
+	Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230407093237.3296286-1-lionel.g.landwerlin@intel.com
+(cherry picked from commit 16fc9c08f0ec7b1c95f1ea4a16097acdb3fc943d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gt/intel_gt_regs.h
+#	drivers/gpu/drm/i915/gt/intel_workarounds.c
+diff --cc drivers/gpu/drm/i915/gt/intel_gt_regs.h
+index 94f9ddcfb3a5,6903c66a4ed7..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_gt_regs.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_regs.h
+@@@ -1088,8 -1146,10 +1088,13 @@@
+  #define   ENABLE_SMALLPL			REG_BIT(15)
+  #define   SC_DISABLE_POWER_OPTIMIZATION_EBB	REG_BIT(9)
+  #define   GEN11_SAMPLER_ENABLE_HEADLESS_MSG	REG_BIT(5)
+++<<<<<<< HEAD
+++=======
++ #define   MTL_DISABLE_SAMPLER_SC_OOO		REG_BIT(3)
++ #define   GEN11_INDIRECT_STATE_BASE_ADDR_OVERRIDE	REG_BIT(0)
+++>>>>>>> 16fc9c08f0ec (drm/i915: disable sampler indirect state in bindless heap)
+  
+ -#define GEN9_HALF_SLICE_CHICKEN7		MCR_REG(0xe194)
+ +#define GEN9_HALF_SLICE_CHICKEN7		_MMIO(0xe194)
+  #define   DG2_DISABLE_ROUND_ENABLE_ALLOW_FOR_SSLA	REG_BIT(15)
+  #define   GEN9_SAMPLER_HASH_COMPRESSED_READ_ADDR	REG_BIT(8)
+  #define   GEN9_ENABLE_YV12_BUGFIX		REG_BIT(4)
+diff --cc drivers/gpu/drm/i915/gt/intel_workarounds.c
+index 1b6479b5bd32,4e3cbeca9eec..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_workarounds.c
++++ b/drivers/gpu/drm/i915/gt/intel_workarounds.c
+@@@ -2715,9 -3051,93 +2715,99 @@@ general_render_compute_wa_init(struct i
+  
+  	add_render_compute_tuning_settings(i915, wal);
+  
+++<<<<<<< HEAD
+ +	if (IS_PONTEVECCHIO(i915)) {
+ +		/* Wa_16016694945 */
+ +		wa_masked_en(wal, XEHPC_LNCFMISCCFGREG0, XEHPC_OVRLSCCC);
+++=======
++ 	if (GRAPHICS_VER(i915) >= 11) {
++ 		/* This is not a Wa (although referred to as
++ 		 * WaSetInidrectStateOverride in places), this allows
++ 		 * applications that reference sampler states through
++ 		 * the BindlessSamplerStateBaseAddress to have their
++ 		 * border color relative to DynamicStateBaseAddress
++ 		 * rather than BindlessSamplerStateBaseAddress.
++ 		 *
++ 		 * Otherwise SAMPLER_STATE border colors have to be
++ 		 * copied in multiple heaps (DynamicStateBaseAddress &
++ 		 * BindlessSamplerStateBaseAddress)
++ 		 *
++ 		 * BSpec: 46052
++ 		 */
++ 		wa_mcr_masked_en(wal,
++ 				 GEN10_SAMPLER_MODE,
++ 				 GEN11_INDIRECT_STATE_BASE_ADDR_OVERRIDE);
++ 	}
++ 
++ 	if (IS_MTL_GRAPHICS_STEP(i915, M, STEP_B0, STEP_FOREVER) ||
++ 	    IS_MTL_GRAPHICS_STEP(i915, P, STEP_B0, STEP_FOREVER))
++ 		/* Wa_14017856879 */
++ 		wa_mcr_masked_en(wal, GEN9_ROW_CHICKEN3, MTL_DISABLE_FIX_FOR_EOT_FLUSH);
++ 
++ 	if (IS_MTL_GRAPHICS_STEP(i915, M, STEP_A0, STEP_B0) ||
++ 	    IS_MTL_GRAPHICS_STEP(i915, P, STEP_A0, STEP_B0))
++ 		/*
++ 		 * Wa_14017066071
++ 		 * Wa_14017654203
++ 		 */
++ 		wa_mcr_masked_en(wal, GEN10_SAMPLER_MODE,
++ 				 MTL_DISABLE_SAMPLER_SC_OOO);
++ 
++ 	if (IS_MTL_GRAPHICS_STEP(i915, P, STEP_A0, STEP_B0))
++ 		/* Wa_22015279794 */
++ 		wa_mcr_masked_en(wal, GEN10_CACHE_MODE_SS,
++ 				 DISABLE_PREFETCH_INTO_IC);
++ 
++ 	if (IS_MTL_GRAPHICS_STEP(i915, M, STEP_A0, STEP_B0) ||
++ 	    IS_MTL_GRAPHICS_STEP(i915, P, STEP_A0, STEP_B0) ||
++ 	    IS_DG2_GRAPHICS_STEP(i915, G10, STEP_B0, STEP_FOREVER) ||
++ 	    IS_DG2_G11(i915) || IS_DG2_G12(i915)) {
++ 		/* Wa_22013037850 */
++ 		wa_mcr_write_or(wal, LSC_CHICKEN_BIT_0_UDW,
++ 				DISABLE_128B_EVICTION_COMMAND_UDW);
++ 	}
++ 
++ 	if (IS_MTL_GRAPHICS_STEP(i915, M, STEP_A0, STEP_B0) ||
++ 	    IS_MTL_GRAPHICS_STEP(i915, P, STEP_A0, STEP_B0) ||
++ 	    IS_PONTEVECCHIO(i915) ||
++ 	    IS_DG2(i915)) {
++ 		/* Wa_22014226127 */
++ 		wa_mcr_write_or(wal, LSC_CHICKEN_BIT_0, DISABLE_D8_D16_COASLESCE);
++ 	}
++ 
++ 	if (IS_MTL_GRAPHICS_STEP(i915, M, STEP_A0, STEP_B0) ||
++ 	    IS_MTL_GRAPHICS_STEP(i915, P, STEP_A0, STEP_B0) ||
++ 	    IS_DG2(i915)) {
++ 		/* Wa_18017747507 */
++ 		wa_masked_en(wal, VFG_PREEMPTION_CHICKEN, POLYGON_TRIFAN_LINELOOP_DISABLE);
++ 	}
++ 
++ 	if (IS_DG2_GRAPHICS_STEP(i915, G10, STEP_B0, STEP_C0) ||
++ 	    IS_DG2_G11(i915)) {
++ 		/*
++ 		 * Wa_22012826095:dg2
++ 		 * Wa_22013059131:dg2
++ 		 */
++ 		wa_mcr_write_clr_set(wal, LSC_CHICKEN_BIT_0_UDW,
++ 				     MAXREQS_PER_BANK,
++ 				     REG_FIELD_PREP(MAXREQS_PER_BANK, 2));
++ 
++ 		/* Wa_22013059131:dg2 */
++ 		wa_mcr_write_or(wal, LSC_CHICKEN_BIT_0,
++ 				FORCE_1_SUB_MESSAGE_PER_FRAGMENT);
++ 	}
++ 
++ 	if (IS_DG2_GRAPHICS_STEP(i915, G10, STEP_A0, STEP_B0)) {
++ 		/*
++ 		 * Wa_14010918519:dg2_g10
++ 		 *
++ 		 * LSC_CHICKEN_BIT_0 always reads back as 0 is this stepping,
++ 		 * so ignoring verification.
++ 		 */
++ 		wa_mcr_add(wal, LSC_CHICKEN_BIT_0_UDW, 0,
++ 			   FORCE_SLM_FENCE_SCOPE_TO_TILE | FORCE_UGM_FENCE_SCOPE_TO_TILE,
++ 			   0, false);
+++>>>>>>> 16fc9c08f0ec (drm/i915: disable sampler indirect state in bindless heap)
+  	}
+  
+  	if (IS_XEHPSDV(i915)) {
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt_regs.h
+* Unmerged path drivers/gpu/drm/i915/gt/intel_workarounds.c
