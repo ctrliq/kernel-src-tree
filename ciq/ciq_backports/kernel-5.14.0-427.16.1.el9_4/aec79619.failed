@@ -1,0 +1,158 @@
+tls: fix race between async notify and socket close
+
+jira LE-1907
+cve CVE-2024-26583
+Rebuild_History Non-Buildable kernel-5.14.0-427.16.1.el9_4
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit aec7961916f3f9e88766e2688992da6980f11b8d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.16.1.el9_4/aec79619.failed
+
+The submitting thread (one which called recvmsg/sendmsg)
+may exit as soon as the async crypto handler calls complete()
+so any code past that point risks touching already freed data.
+
+Try to avoid the locking and extra flags altogether.
+Have the main thread hold an extra reference, this way
+we can depend solely on the atomic ref counter for
+synchronization.
+
+Don't futz with reiniting the completion, either, we are now
+tightly controlling when completion fires.
+
+	Reported-by: valis <sec@valis.email>
+Fixes: 0cada33241d9 ("net/tls: fix race condition causing kernel panic")
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+	Reviewed-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit aec7961916f3f9e88766e2688992da6980f11b8d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tls/tls_sw.c
+diff --cc net/tls/tls_sw.c
+index 4c918094226a,635305bebfef..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -215,12 -224,19 +215,22 @@@ static void tls_decrypt_done(struct cry
+  
+  	kfree(aead_req);
+  
+- 	spin_lock_bh(&ctx->decrypt_compl_lock);
+- 	if (!atomic_dec_return(&ctx->decrypt_pending))
++ 	if (atomic_dec_and_test(&ctx->decrypt_pending))
+  		complete(&ctx->async_wait.completion);
+- 	spin_unlock_bh(&ctx->decrypt_compl_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tls_decrypt_async_wait(struct tls_sw_context_rx *ctx)
++ {
++ 	if (!atomic_dec_and_test(&ctx->decrypt_pending))
++ 		crypto_wait_req(-EINPROGRESS, &ctx->async_wait);
++ 	atomic_inc(&ctx->decrypt_pending);
++ 
++ 	return ctx->async_wait.err;
++ }
++ 
+++>>>>>>> aec7961916f3 (tls: fix race between async notify and socket close)
+  static int tls_do_decryption(struct sock *sk,
+  			     struct scatterlist *sgin,
+  			     struct scatterlist *sgout,
+@@@ -243,7 -259,8 +253,12 @@@
+  	if (darg->async) {
+  		aead_request_set_callback(aead_req,
+  					  CRYPTO_TFM_REQ_MAY_BACKLOG,
+++<<<<<<< HEAD
+ +					  tls_decrypt_done, sk);
+++=======
++ 					  tls_decrypt_done, aead_req);
++ 		DEBUG_NET_WARN_ON_ONCE(atomic_read(&ctx->decrypt_pending) < 1);
+++>>>>>>> aec7961916f3 (tls: fix race between async notify and socket close)
+  		atomic_inc(&ctx->decrypt_pending);
+  	} else {
+  		aead_request_set_callback(aead_req,
+@@@ -420,22 -439,24 +435,26 @@@ tx_err
+  	return rc;
+  }
+  
+ -static void tls_encrypt_done(void *data, int err)
+ +static void tls_encrypt_done(struct crypto_async_request *req, int err)
+  {
+ -	struct tls_sw_context_tx *ctx;
+ -	struct tls_context *tls_ctx;
+ -	struct tls_prot_info *prot;
+ -	struct tls_rec *rec = data;
+ +	struct aead_request *aead_req = (struct aead_request *)req;
+ +	struct sock *sk = req->data;
+ +	struct tls_context *tls_ctx = tls_get_ctx(sk);
+ +	struct tls_prot_info *prot = &tls_ctx->prot_info;
+ +	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+  	struct scatterlist *sge;
+  	struct sk_msg *msg_en;
+ +	struct tls_rec *rec;
+  	bool ready = false;
+++<<<<<<< HEAD
+ +	int pending;
+++=======
++ 	struct sock *sk;
+++>>>>>>> aec7961916f3 (tls: fix race between async notify and socket close)
+  
+ +	rec = container_of(aead_req, struct tls_rec, aead_req);
+  	msg_en = &rec->msg_encrypted;
+  
+ -	sk = rec->sk;
+ -	tls_ctx = tls_get_ctx(sk);
+ -	prot = &tls_ctx->prot_info;
+ -	ctx = tls_sw_ctx_tx(tls_ctx);
+ -
+  	sge = sk_msg_elem(msg_en, msg_en->sg.curr);
+  	sge->offset -= prot->prepend_size;
+  	sge->length += prot->prepend_size;
+@@@ -481,6 -498,15 +496,18 @@@
+  		schedule_delayed_work(&ctx->tx_work.work, 1);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tls_encrypt_async_wait(struct tls_sw_context_tx *ctx)
++ {
++ 	if (!atomic_dec_and_test(&ctx->encrypt_pending))
++ 		crypto_wait_req(-EINPROGRESS, &ctx->async_wait);
++ 	atomic_inc(&ctx->encrypt_pending);
++ 
++ 	return ctx->async_wait.err;
++ }
++ 
+++>>>>>>> aec7961916f3 (tls: fix race between async notify and socket close)
+  static int tls_do_encryption(struct sock *sk,
+  			     struct tls_context *tls_ctx,
+  			     struct tls_sw_context_tx *ctx,
+diff --git a/include/net/tls.h b/include/net/tls.h
+index 37e68c947b04..4cc3dc8afc77 100644
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -99,9 +99,6 @@ struct tls_sw_context_tx {
+ 	struct tls_rec *open_rec;
+ 	struct list_head tx_list;
+ 	atomic_t encrypt_pending;
+-	/* protect crypto_wait with encrypt_pending */
+-	spinlock_t encrypt_compl_lock;
+-	int async_notify;
+ 	u8 async_capable:1;
+ 
+ #define BIT_TX_SCHEDULED	0
+@@ -138,8 +135,6 @@ struct tls_sw_context_rx {
+ 	struct tls_strparser strp;
+ 
+ 	atomic_t decrypt_pending;
+-	/* protect crypto_wait with decrypt_pending*/
+-	spinlock_t decrypt_compl_lock;
+ 	struct sk_buff_head async_hold;
+ 	struct wait_queue_head wq;
+ };
+* Unmerged path net/tls/tls_sw.c
