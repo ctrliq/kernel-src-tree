@@ -1,0 +1,324 @@
+iommu: Optimise PCI SAC address trick
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-537.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit 791c2b17fb4023f21c3cbf5f268af01d9b8cb7cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-537.el8/791c2b17.failed
+
+Per the reasoning in commit 4bf7fda4dce2 ("iommu/dma: Add config for
+PCI SAC address trick") and its subsequent revert, this mechanism no
+longer serves its original purpose, but now only works around broken
+hardware/drivers in a way that is unfortunately too impactful to remove.
+
+This does not, however, prevent us from solving the performance impact
+which that workaround has on large-scale systems that don't need it.
+Once the 32-bit IOVA space fills up and a workload starts allocating and
+freeing on both sides of the boundary, the opportunistic SAC allocation
+can then end up spending significant time hunting down scattered
+fragments of free 32-bit space, or just reestablishing max32_alloc_size.
+This can easily be exacerbated by a change in allocation pattern, such
+as by changing the network MTU, which can increase pressure on the
+32-bit space by leaving a large quantity of cached IOVAs which are now
+the wrong size to be recycled, but also won't be freed since the
+non-opportunistic allocations can still be satisfied from the whole
+64-bit space without triggering the reclaim path.
+
+However, in the context of a workaround where smaller DMA addresses
+aren't simply a preference but a necessity, if we get to that point at
+all then in fact it's already the endgame. The nature of the allocator
+is currently such that the first IOVA we give to a device after the
+32-bit space runs out will be the highest possible address for that
+device, ever. If that works, then great, we know we can optimise for
+speed by always allocating from the full range. And if it doesn't, then
+the worst has already happened and any brokenness is now showing, so
+there's little point in continuing to try to hide it.
+
+To that end, implement a flag to refine the SAC business into a
+per-device policy that can automatically get itself out of the way if
+and when it stops being useful.
+
+CC: Linus Torvalds <torvalds@linux-foundation.org>
+CC: Jakub Kicinski <kuba@kernel.org>
+	Reviewed-by: John Garry <john.g.garry@oracle.com>
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Tested-by: Vasant Hegde <vasant.hegde@amd.com>
+	Tested-by: Jakub Kicinski <kuba@kernel.org>
+Link: https://lore.kernel.org/r/b8502b115b915d2a3fabde367e099e39106686c8.1681392791.git.robin.murphy@arm.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 791c2b17fb4023f21c3cbf5f268af01d9b8cb7cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dma-iommu.h
+#	drivers/iommu/iommu.c
+#	include/linux/iommu.h
+diff --cc drivers/iommu/iommu.c
+index 1992820791d9,e67f6562da73..000000000000
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@@ -252,33 -357,162 +252,161 @@@ static int __iommu_probe_device(struct 
+  	iommu_dev = ops->probe_device(dev);
+  	if (IS_ERR(iommu_dev)) {
+  		ret = PTR_ERR(iommu_dev);
+ -		goto err_module_put;
+ +		goto out_module_put;
+  	}
+  
+ -	ret = iommu_device_link(iommu_dev, dev);
+ -	if (ret)
+ -		goto err_release;
+ +	dev->iommu->iommu_dev = iommu_dev;
+  
+ -	group = ops->device_group(dev);
+ -	if (WARN_ON_ONCE(group == NULL))
+ -		group = ERR_PTR(-EINVAL);
+ +	group = iommu_group_get_for_dev(dev);
+  	if (IS_ERR(group)) {
+  		ret = PTR_ERR(group);
+ -		goto err_unlink;
+ +		goto out_release;
+  	}
+ -	dev->iommu_group = group;
+ +	iommu_group_put(group);
+ +
+ +	if (group_list && !group->default_domain && list_empty(&group->entry))
+ +		list_add_tail(&group->entry, group_list);
+ +
+ +	iommu_device_link(iommu_dev, dev);
+  
+ -	dev->iommu->iommu_dev = iommu_dev;
+ -	dev->iommu->max_pasids = dev_iommu_get_max_pasids(dev);
+ -	if (ops->is_attach_deferred)
+ -		dev->iommu->attach_deferred = ops->is_attach_deferred(dev);
+  	return 0;
+  
+ -err_unlink:
+ -	iommu_device_unlink(iommu_dev, dev);
+ -err_release:
+ -	if (ops->release_device)
+ -		ops->release_device(dev);
+ -err_module_put:
+ +out_release:
+ +	ops->release_device(dev);
+ +
+ +out_module_put:
+  	module_put(ops->owner);
+ +
+  err_free:
+  	dev_iommu_free(dev);
+++<<<<<<< HEAD
+++=======
++ 	return ret;
++ }
++ 
++ static void iommu_deinit_device(struct device *dev)
++ {
++ 	struct iommu_group *group = dev->iommu_group;
++ 	const struct iommu_ops *ops = dev_iommu_ops(dev);
++ 
++ 	lockdep_assert_held(&group->mutex);
++ 
++ 	iommu_device_unlink(dev->iommu->iommu_dev, dev);
++ 
++ 	/*
++ 	 * release_device() must stop using any attached domain on the device.
++ 	 * If there are still other devices in the group they are not effected
++ 	 * by this callback.
++ 	 *
++ 	 * The IOMMU driver must set the device to either an identity or
++ 	 * blocking translation and stop using any domain pointer, as it is
++ 	 * going to be freed.
++ 	 */
++ 	if (ops->release_device)
++ 		ops->release_device(dev);
++ 
++ 	/*
++ 	 * If this is the last driver to use the group then we must free the
++ 	 * domains before we do the module_put().
++ 	 */
++ 	if (list_empty(&group->devices)) {
++ 		if (group->default_domain) {
++ 			iommu_domain_free(group->default_domain);
++ 			group->default_domain = NULL;
++ 		}
++ 		if (group->blocking_domain) {
++ 			iommu_domain_free(group->blocking_domain);
++ 			group->blocking_domain = NULL;
++ 		}
++ 		group->domain = NULL;
++ 	}
++ 
++ 	/* Caller must put iommu_group */
++ 	dev->iommu_group = NULL;
++ 	module_put(ops->owner);
++ 	dev_iommu_free(dev);
++ }
++ 
++ static int __iommu_probe_device(struct device *dev, struct list_head *group_list)
++ {
++ 	const struct iommu_ops *ops = dev->bus->iommu_ops;
++ 	struct iommu_group *group;
++ 	static DEFINE_MUTEX(iommu_probe_device_lock);
++ 	struct group_device *gdev;
++ 	int ret;
++ 
++ 	if (!ops)
++ 		return -ENODEV;
++ 	/*
++ 	 * Serialise to avoid races between IOMMU drivers registering in
++ 	 * parallel and/or the "replay" calls from ACPI/OF code via client
++ 	 * driver probe. Once the latter have been cleaned up we should
++ 	 * probably be able to use device_lock() here to minimise the scope,
++ 	 * but for now enforcing a simple global ordering is fine.
++ 	 */
++ 	mutex_lock(&iommu_probe_device_lock);
++ 
++ 	/* Device is probed already if in a group */
++ 	if (dev->iommu_group) {
++ 		ret = 0;
++ 		goto out_unlock;
++ 	}
++ 
++ 	ret = iommu_init_device(dev, ops);
++ 	if (ret)
++ 		goto out_unlock;
++ 
++ 	group = dev->iommu_group;
++ 	gdev = iommu_group_alloc_device(group, dev);
++ 	mutex_lock(&group->mutex);
++ 	if (IS_ERR(gdev)) {
++ 		ret = PTR_ERR(gdev);
++ 		goto err_put_group;
++ 	}
++ 
++ 	/*
++ 	 * The gdev must be in the list before calling
++ 	 * iommu_setup_default_domain()
++ 	 */
++ 	list_add_tail(&gdev->list, &group->devices);
++ 	WARN_ON(group->default_domain && !group->domain);
++ 	if (group->default_domain)
++ 		iommu_create_device_direct_mappings(group->default_domain, dev);
++ 	if (group->domain) {
++ 		ret = __iommu_device_set_domain(group, dev, group->domain, 0);
++ 		if (ret)
++ 			goto err_remove_gdev;
++ 	} else if (!group->default_domain && !group_list) {
++ 		ret = iommu_setup_default_domain(group, 0);
++ 		if (ret)
++ 			goto err_remove_gdev;
++ 	} else if (!group->default_domain) {
++ 		/*
++ 		 * With a group_list argument we defer the default_domain setup
++ 		 * to the caller by providing a de-duplicated list of groups
++ 		 * that need further setup.
++ 		 */
++ 		if (list_empty(&group->entry))
++ 			list_add_tail(&group->entry, group_list);
++ 	}
++ 	mutex_unlock(&group->mutex);
++ 	mutex_unlock(&iommu_probe_device_lock);
++ 
++ 	if (dev_is_pci(dev))
++ 		iommu_dma_set_pci_32bit_workaround(dev);
++ 
++ 	return 0;
++ 
++ err_remove_gdev:
++ 	list_del(&gdev->list);
++ 	__iommu_group_free_device(group, gdev);
++ err_put_group:
++ 	iommu_deinit_device(dev);
++ 	mutex_unlock(&group->mutex);
++ 	iommu_group_put(group);
++ out_unlock:
++ 	mutex_unlock(&iommu_probe_device_lock);
+++>>>>>>> 791c2b17fb40 (iommu: Optimise PCI SAC address trick)
+  
+  	return ret;
+  }
+diff --cc include/linux/iommu.h
+index 9c34b6d5e021,b1dcb1b9b170..000000000000
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@@ -422,6 -407,9 +422,12 @@@ struct iommu_fault_param 
+   * @fwspec:	 IOMMU fwspec data
+   * @iommu_dev:	 IOMMU device this device is linked to
+   * @priv:	 IOMMU Driver private data
+++<<<<<<< HEAD
+++=======
++  * @max_pasids:  number of PASIDs this device can consume
++  * @attach_deferred: the dma domain attachment is deferred
++  * @pci_32bit_workaround: Limit DMA allocations to 32-bit IOVAs
+++>>>>>>> 791c2b17fb40 (iommu: Optimise PCI SAC address trick)
+   *
+   * TODO: migrate other per device data pointers under iommu_dev_data, e.g.
+   *	struct iommu_group	*iommu_group;
+@@@ -433,6 -421,9 +439,12 @@@ struct dev_iommu 
+  	struct iommu_fwspec		*fwspec;
+  	struct iommu_device		*iommu_dev;
+  	void				*priv;
+++<<<<<<< HEAD
+++=======
++ 	u32				max_pasids;
++ 	u32				attach_deferred:1;
++ 	u32				pci_32bit_workaround:1;
+++>>>>>>> 791c2b17fb40 (iommu: Optimise PCI SAC address trick)
+  };
+  
+  int iommu_device_register(struct iommu_device *iommu,
+* Unmerged path drivers/iommu/dma-iommu.h
+diff --git a/drivers/iommu/dma-iommu.c b/drivers/iommu/dma-iommu.c
+index eddbab0add32..e531d2c4ba52 100644
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -637,7 +637,7 @@ static dma_addr_t iommu_dma_alloc_iova(struct iommu_domain *domain,
+ {
+ 	struct iommu_dma_cookie *cookie = domain->iova_cookie;
+ 	struct iova_domain *iovad = &cookie->iovad;
+-	unsigned long shift, iova_len, iova = 0;
++	unsigned long shift, iova_len, iova;
+ 
+ 	if (cookie->type == IOMMU_DMA_MSI_COOKIE) {
+ 		cookie->msi_iova += size;
+@@ -652,15 +652,29 @@ static dma_addr_t iommu_dma_alloc_iova(struct iommu_domain *domain,
+ 	if (domain->geometry.force_aperture)
+ 		dma_limit = min(dma_limit, (u64)domain->geometry.aperture_end);
+ 
+-	/* Try to get PCI devices a SAC address */
+-	if (dma_limit > DMA_BIT_MASK(32) && !iommu_dma_forcedac && dev_is_pci(dev))
++	/*
++	 * Try to use all the 32-bit PCI addresses first. The original SAC vs.
++	 * DAC reasoning loses relevance with PCIe, but enough hardware and
++	 * firmware bugs are still lurking out there that it's safest not to
++	 * venture into the 64-bit space until necessary.
++	 *
++	 * If your device goes wrong after seeing the notice then likely either
++	 * its driver is not setting DMA masks accurately, the hardware has
++	 * some inherent bug in handling >32-bit addresses, or not all the
++	 * expected address bits are wired up between the device and the IOMMU.
++	 */
++	if (dma_limit > DMA_BIT_MASK(32) && dev->iommu->pci_32bit_workaround) {
+ 		iova = alloc_iova_fast(iovad, iova_len,
+ 				       DMA_BIT_MASK(32) >> shift, false);
++		if (iova)
++			goto done;
+ 
+-	if (!iova)
+-		iova = alloc_iova_fast(iovad, iova_len, dma_limit >> shift,
+-				       true);
++		dev->iommu->pci_32bit_workaround = false;
++		dev_notice(dev, "Using %d-bit DMA addresses\n", bits_per(dma_limit));
++	}
+ 
++	iova = alloc_iova_fast(iovad, iova_len, dma_limit >> shift, true);
++done:
+ 	return (dma_addr_t)iova << shift;
+ }
+ 
+* Unmerged path drivers/iommu/dma-iommu.h
+* Unmerged path drivers/iommu/iommu.c
+* Unmerged path include/linux/iommu.h
