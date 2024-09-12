@@ -298,8 +298,7 @@ static const struct snd_soc_component_driver soc_component_dev_max9850 = {
 	.endianness		= 1,
 };
 
-static int max9850_i2c_probe(struct i2c_client *i2c,
-			     const struct i2c_device_id *id)
+static int max9850_i2c_probe(struct i2c_client *i2c)
 {
 	struct max9850_priv *max9850;
 	int ret;
@@ -330,7 +329,7 @@ static struct i2c_driver max9850_i2c_driver = {
 	.driver = {
 		.name = "max9850",
 	},
-	.probe = max9850_i2c_probe,
+	.probe_new = max9850_i2c_probe,
 	.id_table = max9850_i2c_id,
 };
 
