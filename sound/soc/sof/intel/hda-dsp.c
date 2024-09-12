@@ -791,7 +791,7 @@ int hda_dsp_resume(struct snd_sof_dev *sdev)
 		}
 
 		/* restore L1SEN bit */
-		if (hda->l1_support_changed)
+		if (hda->l1_disabled)
 			snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR,
 						HDA_VS_INTEL_EM2,
 						HDA_VS_INTEL_EM2_L1SEN, 0);
@@ -883,11 +883,9 @@ int hda_dsp_suspend(struct snd_sof_dev *sdev, u32 target_state)
 		}
 
 		/* enable L1SEN to make sure the system can enter S0Ix */
-		hda->l1_support_changed =
-			snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR,
-						HDA_VS_INTEL_EM2,
-						HDA_VS_INTEL_EM2_L1SEN,
-						HDA_VS_INTEL_EM2_L1SEN);
+		if (hda->l1_disabled)
+			snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR, HDA_VS_INTEL_EM2,
+						HDA_VS_INTEL_EM2_L1SEN, HDA_VS_INTEL_EM2_L1SEN);
 
 #if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
 		/* stop the CORB/RIRB DMA if it is On */
