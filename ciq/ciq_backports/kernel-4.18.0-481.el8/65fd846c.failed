@@ -1,0 +1,92 @@
+wifi: mac80211: add vif/sta link RCU dereference macros
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 65fd846cb3f94ae63134fbd0f32564cf82539eaa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/65fd846c.failed
+
+Add macros (and an exported function) to allow checking some
+link RCU protected accesses that are happening in callbacks
+from mac80211 and are thus under the correct lock.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 65fd846cb3f94ae63134fbd0f32564cf82539eaa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/mac80211.h
+diff --cc include/net/mac80211.h
+index 0b8af45abb87,d9e7f62cc972..000000000000
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@@ -2262,13 -2280,24 +2276,34 @@@ struct ieee80211_sta 
+  	u8 drv_priv[] __aligned(sizeof(void *));
+  };
+  
+++<<<<<<< HEAD
+ +/* FIXME: need to loop only over links which are active and check the actual
+ + * lock
+ + */
+ +#define for_each_sta_active_link(sta, link_sta, link_id)		         \
+ +	for (link_id = 0; link_id < ARRAY_SIZE((sta)->link); link_id++)	         \
+ +		if (((link_sta) = rcu_dereference_protected((sta)->link[link_id],\
+ +							    1)))	         \
+++=======
++ #ifdef CONFIG_LOCKDEP
++ bool lockdep_sta_mutex_held(struct ieee80211_sta *pubsta);
++ #else
++ static inline bool lockdep_sta_mutex_held(struct ieee80211_sta *pubsta)
++ {
++ 	return true;
++ }
++ #endif
++ 
++ #define link_sta_dereference_protected(sta, link_id)		\
++ 	rcu_dereference_protected((sta)->link[link_id],		\
++ 				  lockdep_sta_mutex_held(sta))
++ 
++ #define for_each_sta_active_link(vif, sta, link_sta, link_id)			\
++ 	for (link_id = 0; link_id < ARRAY_SIZE((sta)->link); link_id++)		\
++ 		if ((!(vif)->active_links ||					\
++ 		     (vif)->active_links & BIT(link_id)) &&			\
++ 		    ((link_sta) = link_sta_dereference_protected(sta, link_id)))
+++>>>>>>> 65fd846cb3f9 (wifi: mac80211: add vif/sta link RCU dereference macros)
+  
+  /**
+   * enum sta_notify_cmd - sta notify command
+diff --git a/drivers/net/wireless/mac80211_hwsim.c b/drivers/net/wireless/mac80211_hwsim.c
+index a32b0108df3c..500e19decbd0 100644
+--- a/drivers/net/wireless/mac80211_hwsim.c
++++ b/drivers/net/wireless/mac80211_hwsim.c
+@@ -3069,8 +3069,7 @@ static int mac80211_hwsim_change_vif_links(struct ieee80211_hw *hw,
+ 	for_each_set_bit(i, &add, IEEE80211_MLD_MAX_NUM_LINKS) {
+ 		struct ieee80211_bss_conf *link_conf;
+ 
+-		/* FIXME: figure out how to get the locking here */
+-		link_conf = rcu_dereference_protected(vif->link_conf[i], 1);
++		link_conf = link_conf_dereference_protected(vif, i);
+ 		if (WARN_ON(!link_conf))
+ 			continue;
+ 
+* Unmerged path include/net/mac80211.h
+diff --git a/net/mac80211/sta_info.c b/net/mac80211/sta_info.c
+index bbf582a5702d..4875bd8af67c 100644
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -2871,3 +2871,13 @@ void ieee80211_sta_set_max_amsdu_subframes(struct sta_info *sta,
+ 	if (val)
+ 		sta->sta.max_amsdu_subframes = 4 << val;
+ }
++
++#ifdef CONFIG_LOCKDEP
++bool lockdep_sta_mutex_held(struct ieee80211_sta *pubsta)
++{
++	struct sta_info *sta = container_of(pubsta, struct sta_info, sta);
++
++	return lockdep_is_held(&sta->local->sta_mtx);
++}
++EXPORT_SYMBOL(lockdep_sta_mutex_held);
++#endif
