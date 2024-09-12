@@ -1,0 +1,189 @@
+gfs2: Variable rename
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.16.1.el8_6
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 42e4c3bdcae7833eeeaed7bf0c000c2de17dd291
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.16.1.el8_6/42e4c3bd.failed
+
+Instead of counting the number of bytes read from the filesystem,
+functions gfs2_file_direct_read and gfs2_file_read_iter count the number
+of bytes written into the user buffer.  Conversely, functions
+gfs2_file_direct_write and gfs2_file_buffered_write count the number of
+bytes read from the user buffer.  This is nothing but confusing, so
+change the read functions to count how many bytes they have read, and
+the write functions to count how many bytes they have written.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 42e4c3bdcae7833eeeaed7bf0c000c2de17dd291)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/file.c
+diff --cc fs/gfs2/file.c
+index 37f4489b53a0,4d36c01727ad..000000000000
+--- a/fs/gfs2/file.c
++++ b/fs/gfs2/file.c
+@@@ -800,22 -806,64 +800,45 @@@ static ssize_t gfs2_file_direct_read(st
+  {
+  	struct file *file = iocb->ki_filp;
+  	struct gfs2_inode *ip = GFS2_I(file->f_mapping->host);
+++<<<<<<< HEAD
+ +	size_t count = iov_iter_count(to);
+++=======
++ 	size_t prev_count = 0, window_size = 0;
++ 	size_t read = 0;
+++>>>>>>> 42e4c3bdcae7 (gfs2: Variable rename)
+  	ssize_t ret;
+  
+ -	/*
+ -	 * In this function, we disable page faults when we're holding the
+ -	 * inode glock while doing I/O.  If a page fault occurs, we indicate
+ -	 * that the inode glock may be dropped, fault in the pages manually,
+ -	 * and retry.
+ -	 *
+ -	 * Unlike generic_file_read_iter, for reads, iomap_dio_rw can trigger
+ -	 * physical as well as manual page faults, and we need to disable both
+ -	 * kinds.
+ -	 *
+ -	 * For direct I/O, gfs2 takes the inode glock in deferred mode.  This
+ -	 * locking mode is compatible with other deferred holders, so multiple
+ -	 * processes and nodes can do direct I/O to a file at the same time.
+ -	 * There's no guarantee that reads or writes will be atomic.  Any
+ -	 * coordination among readers and writers needs to happen externally.
+ -	 */
+ -
+ -	if (!iov_iter_count(to))
+ +	if (!count)
+  		return 0; /* skip atime */
+  
+  	gfs2_holder_init(ip->i_gl, LM_ST_DEFERRED, 0, gh);
+  	ret = gfs2_glock_nq(gh);
+  	if (ret)
+  		goto out_uninit;
+++<<<<<<< HEAD
+++=======
++ retry_under_glock:
++ 	pagefault_disable();
++ 	to->nofault = true;
++ 	ret = iomap_dio_rw(iocb, to, &gfs2_iomap_ops, NULL,
++ 			   IOMAP_DIO_PARTIAL, read);
++ 	to->nofault = false;
++ 	pagefault_enable();
++ 	if (ret > 0)
++ 		read = ret;
+++>>>>>>> 42e4c3bdcae7 (gfs2: Variable rename)
+  
+ -	if (should_fault_in_pages(ret, to, &prev_count, &window_size)) {
+ -		size_t leftover;
+ -
+ -		gfs2_holder_allow_demote(gh);
+ -		leftover = fault_in_iov_iter_writeable(to, window_size);
+ -		gfs2_holder_disallow_demote(gh);
+ -		if (leftover != window_size) {
+ -			if (gfs2_holder_queued(gh))
+ -				goto retry_under_glock;
+ -			goto retry;
+ -		}
+ -	}
+ -	if (gfs2_holder_queued(gh))
+ -		gfs2_glock_dq(gh);
+ +	ret = iomap_dio_rw(iocb, to, &gfs2_iomap_ops, NULL, 0);
+ +	gfs2_glock_dq(gh);
+  out_uninit:
+  	gfs2_holder_uninit(gh);
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ 	if (ret < 0)
++ 		return ret;
++ 	return read;
+++>>>>>>> 42e4c3bdcae7 (gfs2: Variable rename)
+  }
+  
+  static ssize_t gfs2_file_direct_write(struct kiocb *iocb, struct iov_iter *from,
+@@@ -824,10 -872,20 +847,15 @@@
+  	struct file *file = iocb->ki_filp;
+  	struct inode *inode = file->f_mapping->host;
+  	struct gfs2_inode *ip = GFS2_I(inode);
+++<<<<<<< HEAD
+ +	size_t len = iov_iter_count(from);
+ +	loff_t offset = iocb->ki_pos;
+++=======
++ 	size_t prev_count = 0, window_size = 0;
++ 	size_t written = 0;
+++>>>>>>> 42e4c3bdcae7 (gfs2: Variable rename)
+  	ssize_t ret;
+  
+ -	/*
+ -	 * In this function, we disable page faults when we're holding the
+ -	 * inode glock while doing I/O.  If a page fault occurs, we indicate
+ -	 * that the inode glock may be dropped, fault in the pages manually,
+ -	 * and retry.
+ -	 *
+ -	 * For writes, iomap_dio_rw only triggers manual page faults, so we
+ -	 * don't need to disable physical ones.
+ -	 */
+ -
+  	/*
+  	 * Deferred lock, even if its a write, since we do no allocation on
+  	 * this path. All we need to change is the atime, and this lock mode
+@@@ -840,19 -898,42 +868,52 @@@
+  	ret = gfs2_glock_nq(gh);
+  	if (ret)
+  		goto out_uninit;
+ +
+  	/* Silently fall back to buffered I/O when writing beyond EOF */
+ -	if (iocb->ki_pos + iov_iter_count(from) > i_size_read(&ip->i_inode))
+ +	if (offset + len > i_size_read(&ip->i_inode))
+  		goto out;
+++<<<<<<< HEAD
+++=======
++ retry_under_glock:
++ 
++ 	from->nofault = true;
++ 	ret = iomap_dio_rw(iocb, from, &gfs2_iomap_ops, NULL,
++ 			   IOMAP_DIO_PARTIAL, written);
++ 	from->nofault = false;
+++>>>>>>> 42e4c3bdcae7 (gfs2: Variable rename)
+  
+ +	ret = iomap_dio_rw(iocb, from, &gfs2_iomap_ops, NULL, 0);
+  	if (ret == -ENOTBLK)
+  		ret = 0;
+++<<<<<<< HEAD
+++=======
++ 	if (ret > 0)
++ 		written = ret;
++ 
++ 	if (should_fault_in_pages(ret, from, &prev_count, &window_size)) {
++ 		size_t leftover;
++ 
++ 		gfs2_holder_allow_demote(gh);
++ 		leftover = fault_in_iov_iter_readable(from, window_size);
++ 		gfs2_holder_disallow_demote(gh);
++ 		if (leftover != window_size) {
++ 			if (gfs2_holder_queued(gh))
++ 				goto retry_under_glock;
++ 			goto retry;
++ 		}
++ 	}
+++>>>>>>> 42e4c3bdcae7 (gfs2: Variable rename)
+  out:
+ -	if (gfs2_holder_queued(gh))
+ -		gfs2_glock_dq(gh);
+ +	gfs2_glock_dq(gh);
+  out_uninit:
+  	gfs2_holder_uninit(gh);
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ 	if (ret < 0)
++ 		return ret;
++ 	return written;
+++>>>>>>> 42e4c3bdcae7 (gfs2: Variable rename)
+  }
+  
+  static ssize_t gfs2_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+* Unmerged path fs/gfs2/file.c
