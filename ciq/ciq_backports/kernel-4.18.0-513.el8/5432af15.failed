@@ -1,0 +1,351 @@
+gfs2: Replace sd_freeze_state with SDF_FROZEN flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-513.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 5432af15f8772d5e1a44d59d6ffcd513da8436b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-513.el8/5432af15.failed
+
+Replace sd_freeze_state with a new SDF_FROZEN flag.
+
+There no longer is a need for indicating that a freeze is in progress
+(SDF_STARTING_FREEZE); we are now protecting the critical sections with
+the sd_freeze_mutex.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 5432af15f8772d5e1a44d59d6ffcd513da8436b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+#	fs/gfs2/recovery.c
+#	fs/gfs2/super.c
+#	fs/gfs2/sys.c
+diff --cc fs/gfs2/log.c
+index aded98844110,aa568796207c..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -875,10 -913,9 +875,14 @@@ void gfs2_write_log_header(struct gfs2_
+  
+  static void log_write_header(struct gfs2_sbd *sdp, u32 flags)
+  {
+++<<<<<<< HEAD
+ +	int op_flags = REQ_PREFLUSH | REQ_FUA | REQ_META | REQ_SYNC;
+ +	enum gfs2_freeze_state state = atomic_read(&sdp->sd_freeze_state);
+++=======
++ 	blk_opf_t op_flags = REQ_PREFLUSH | REQ_FUA | REQ_META | REQ_SYNC;
+++>>>>>>> 5432af15f877 (gfs2: Replace sd_freeze_state with SDF_FROZEN flag)
+  
+- 	gfs2_assert_withdraw(sdp, (state != SFS_FROZEN));
++ 	gfs2_assert_withdraw(sdp, !test_bit(SDF_FROZEN, &sdp->sd_flags));
+  
+  	if (test_bit(SDF_NOBARRIERS, &sdp->sd_flags)) {
+  		gfs2_ordered_wait(sdp);
+diff --cc fs/gfs2/recovery.c
+index 121d7855a3af,9c7a9f640bad..000000000000
+--- a/fs/gfs2/recovery.c
++++ b/fs/gfs2/recovery.c
+@@@ -469,14 -465,14 +469,21 @@@ void gfs2_recover_func(struct work_stru
+  		ktime_ms_delta(t_jhd, t_jlck));
+  
+  	if (!(head.lh_flags & GFS2_LOG_HEAD_UNMOUNT)) {
+ -		mutex_lock(&sdp->sd_freeze_mutex);
+ +		fs_info(sdp, "jid=%u: Acquiring the freeze glock...\n",
+ +			jd->jd_jid);
+ +
+++<<<<<<< HEAD
+ +		/* Acquire a shared hold on the freeze glock */
+  
+ +		error = gfs2_freeze_lock_shared(sdp, &thaw_gh, LM_FLAG_PRIORITY);
+ +		if (error)
+++=======
++ 		if (test_bit(SDF_FROZEN, &sdp->sd_flags)) {
++ 			mutex_unlock(&sdp->sd_freeze_mutex);
++ 			fs_warn(sdp, "jid=%u: Can't replay: filesystem "
++ 				"is frozen\n", jd->jd_jid);
+++>>>>>>> 5432af15f877 (gfs2: Replace sd_freeze_state with SDF_FROZEN flag)
+  			goto fail_gunlock_ji;
+ -		}
+  
+  		if (test_bit(SDF_RORECOVERY, &sdp->sd_flags)) {
+  			ro = 1;
+diff --cc fs/gfs2/super.c
+index 62f48d6e172b,6dcbfb9b9306..000000000000
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@@ -679,31 -684,75 +679,99 @@@ static int gfs2_sync_fs(struct super_bl
+  	return sdp->sd_log_error;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int gfs2_freeze_locally(struct gfs2_sbd *sdp)
++ {
++ 	struct super_block *sb = sdp->sd_vfs;
++ 	int error;
++ 
++ 	error = freeze_super(sb);
++ 	if (error)
++ 		return error;
++ 
++ 	if (test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags)) {
++ 		gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_FREEZE |
++ 			       GFS2_LFC_FREEZE_GO_SYNC);
++ 		if (gfs2_withdrawn(sdp)) {
++ 			thaw_super(sb);
++ 			return -EIO;
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ static int gfs2_do_thaw(struct gfs2_sbd *sdp)
++ {
++ 	struct super_block *sb = sdp->sd_vfs;
++ 	int error;
++ 
++ 	error = gfs2_freeze_lock_shared(sdp, &sdp->sd_freeze_gh, 0);
++ 	if (error)
++ 		goto fail;
++ 	error = thaw_super(sb);
++ 	if (!error)
++ 		return 0;
++ 
++ fail:
++ 	fs_info(sdp, "GFS2: couldn't thaw filesystem: %d\n", error);
++ 	gfs2_assert_withdraw(sdp, 0);
++ 	return error;
++ }
++ 
+++>>>>>>> 5432af15f877 (gfs2: Replace sd_freeze_state with SDF_FROZEN flag)
+  void gfs2_freeze_func(struct work_struct *work)
+  {
+ +	int error;
+ +	struct gfs2_holder freeze_gh;
+  	struct gfs2_sbd *sdp = container_of(work, struct gfs2_sbd, sd_freeze_work);
+  	struct super_block *sb = sdp->sd_vfs;
+ -	int error;
+  
+++<<<<<<< HEAD
+ +	atomic_inc(&sb->s_active);
+ +	error = gfs2_freeze_lock_shared(sdp, &freeze_gh, 0);
+ +	if (error) {
+ +		gfs2_assert_withdraw(sdp, 0);
+ +	} else {
+ +		atomic_set(&sdp->sd_freeze_state, SFS_UNFROZEN);
+ +		error = thaw_super(sb);
+ +		if (error) {
+ +			fs_info(sdp, "GFS2: couldn't thaw filesystem: %d\n",
+ +				error);
+ +			gfs2_assert_withdraw(sdp, 0);
+ +		}
+ +		gfs2_freeze_unlock(&freeze_gh);
+ +	}
+++=======
++ 	mutex_lock(&sdp->sd_freeze_mutex);
++ 	error = -EBUSY;
++ 	if (test_bit(SDF_FROZEN, &sdp->sd_flags))
++ 		goto freeze_failed;
++ 
++ 	error = gfs2_freeze_locally(sdp);
++ 	if (error)
++ 		goto freeze_failed;
++ 
++ 	gfs2_freeze_unlock(&sdp->sd_freeze_gh);
++ 	set_bit(SDF_FROZEN, &sdp->sd_flags);
++ 
++ 	error = gfs2_do_thaw(sdp);
++ 	if (error)
++ 		goto out;
++ 
++ 	clear_bit(SDF_FROZEN, &sdp->sd_flags);
++ 	goto out;
++ 
++ freeze_failed:
++ 	fs_info(sdp, "GFS2: couldn't freeze filesystem: %d\n", error);
++ 
++ out:
++ 	mutex_unlock(&sdp->sd_freeze_mutex);
+++>>>>>>> 5432af15f877 (gfs2: Replace sd_freeze_state with SDF_FROZEN flag)
+  	deactivate_super(sb);
+ +	clear_bit(SDF_FS_FROZEN, &sdp->sd_flags);
+ +	wake_up_bit(&sdp->sd_flags, SDF_FS_FROZEN);
+ +	return;
+  }
+  
+  /**
+@@@ -717,15 -766,17 +785,22 @@@ static int gfs2_freeze_super(struct sup
+  	struct gfs2_sbd *sdp = sb->s_fs_info;
+  	int error;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&sdp->sd_freeze_mutex);
+ +	if (atomic_read(&sdp->sd_freeze_state) != SFS_UNFROZEN) {
+ +		error = -EBUSY;
+++=======
++ 	if (!mutex_trylock(&sdp->sd_freeze_mutex))
++ 		return -EBUSY;
++ 	error = -EBUSY;
++ 	if (test_bit(SDF_FROZEN, &sdp->sd_flags))
+++>>>>>>> 5432af15f877 (gfs2: Replace sd_freeze_state with SDF_FROZEN flag)
+  		goto out;
+ +	}
+  
+  	for (;;) {
+ -		error = gfs2_freeze_locally(sdp);
+ -		if (error) {
+ -			fs_info(sdp, "GFS2: couldn't freeze filesystem: %d\n",
+ -				error);
+ +		if (gfs2_withdrawn(sdp)) {
+ +			error = -EINVAL;
+  			goto out;
+  		}
+  
+@@@ -745,8 -800,12 +820,15 @@@
+  		fs_err(sdp, "retrying...\n");
+  		msleep(1000);
+  	}
+ -
+ +	set_bit(SDF_FS_FROZEN, &sdp->sd_flags);
+  out:
+++<<<<<<< HEAD
+++=======
++ 	if (!error) {
++ 		set_bit(SDF_FREEZE_INITIATOR, &sdp->sd_flags);
++ 		set_bit(SDF_FROZEN, &sdp->sd_flags);
++ 	}
+++>>>>>>> 5432af15f877 (gfs2: Replace sd_freeze_state with SDF_FROZEN flag)
+  	mutex_unlock(&sdp->sd_freeze_mutex);
+  	return error;
+  }
+@@@ -760,17 -819,39 +842,44 @@@
+  static int gfs2_thaw_super(struct super_block *sb)
+  {
+  	struct gfs2_sbd *sdp = sb->s_fs_info;
+++<<<<<<< HEAD
+++=======
++ 	int error;
++ 
++ 	if (!mutex_trylock(&sdp->sd_freeze_mutex))
++ 		return -EBUSY;
++ 	error = -EINVAL;
++ 	if (!test_bit(SDF_FREEZE_INITIATOR, &sdp->sd_flags))
++ 		goto out;
++ 
++ 	gfs2_freeze_unlock(&sdp->sd_freeze_gh);
++ 
++ 	error = gfs2_do_thaw(sdp);
++ 
++ 	if (!error) {
++ 		clear_bit(SDF_FREEZE_INITIATOR, &sdp->sd_flags);
++ 		clear_bit(SDF_FROZEN, &sdp->sd_flags);
++ 	}
++ out:
++ 	mutex_unlock(&sdp->sd_freeze_mutex);
++ 	return error;
++ }
++ 
++ void gfs2_thaw_freeze_initiator(struct super_block *sb)
++ {
++ 	struct gfs2_sbd *sdp = sb->s_fs_info;
+++>>>>>>> 5432af15f877 (gfs2: Replace sd_freeze_state with SDF_FROZEN flag)
+  
+  	mutex_lock(&sdp->sd_freeze_mutex);
+ -	if (!test_bit(SDF_FREEZE_INITIATOR, &sdp->sd_flags))
+ -		goto out;
+ +	if (atomic_read(&sdp->sd_freeze_state) != SFS_FROZEN ||
+ +	    !gfs2_holder_initialized(&sdp->sd_freeze_gh)) {
+ +		mutex_unlock(&sdp->sd_freeze_mutex);
+ +		return -EINVAL;
+ +	}
+  
+  	gfs2_freeze_unlock(&sdp->sd_freeze_gh);
+ -
+ -out:
+  	mutex_unlock(&sdp->sd_freeze_mutex);
+ +	return wait_on_bit(&sdp->sd_flags, SDF_FS_FROZEN, TASK_INTERRUPTIBLE);
+  }
+  
+  /**
+diff --cc fs/gfs2/sys.c
+index 72a071f12c50,2dfbe2f188dd..000000000000
+--- a/fs/gfs2/sys.c
++++ b/fs/gfs2/sys.c
+@@@ -114,7 -112,8 +115,12 @@@ static ssize_t status_show(struct gfs2_
+  		     test_bit(SDF_RORECOVERY, &f),
+  		     test_bit(SDF_SKIP_DLM_UNLOCK, &f),
+  		     test_bit(SDF_FORCE_AIL_FLUSH, &f),
+++<<<<<<< HEAD
+ +		     test_bit(SDF_FS_FROZEN, &f),
+++=======
++ 		     test_bit(SDF_FREEZE_INITIATOR, &f),
++ 		     test_bit(SDF_FROZEN, &f),
+++>>>>>>> 5432af15f877 (gfs2: Replace sd_freeze_state with SDF_FROZEN flag)
+  		     test_bit(SDF_WITHDRAWING, &f),
+  		     test_bit(SDF_WITHDRAW_IN_PROG, &f),
+  		     test_bit(SDF_REMOTE_WITHDRAW, &f),
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index a5f7b8007a85..377e51027c17 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -613,12 +613,7 @@ enum {
+ 					 withdrawing */
+ 	SDF_DEACTIVATING	= 15,
+ 	SDF_EVICTING		= 16,
+-};
+-
+-enum gfs2_freeze_state {
+-	SFS_UNFROZEN		= 0,
+-	SFS_STARTING_FREEZE	= 1,
+-	SFS_FROZEN		= 2,
++	SDF_FROZEN		= 17,
+ };
+ 
+ #define GFS2_FSNAME_LEN		256
+@@ -845,7 +840,6 @@ struct gfs2_sbd {
+ 
+ 	/* For quiescing the filesystem */
+ 	struct gfs2_holder sd_freeze_gh;
+-	atomic_t sd_freeze_state;
+ 	struct mutex sd_freeze_mutex;
+ 
+ 	char sd_fsname[GFS2_FSNAME_LEN + 3 * sizeof(int) + 2];
+* Unmerged path fs/gfs2/log.c
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index 698fc2257f73..411d715452fb 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -137,7 +137,6 @@ static struct gfs2_sbd *init_sbd(struct super_block *sb)
+ 	init_rwsem(&sdp->sd_log_flush_lock);
+ 	atomic_set(&sdp->sd_log_in_flight, 0);
+ 	init_waitqueue_head(&sdp->sd_log_flush_wait);
+-	atomic_set(&sdp->sd_freeze_state, SFS_UNFROZEN);
+ 	mutex_init(&sdp->sd_freeze_mutex);
+ 
+ 	return sdp;
+* Unmerged path fs/gfs2/recovery.c
+* Unmerged path fs/gfs2/super.c
+* Unmerged path fs/gfs2/sys.c
+diff --git a/fs/gfs2/trans.c b/fs/gfs2/trans.c
+index d4cda4f24672..2b56da538007 100644
+--- a/fs/gfs2/trans.c
++++ b/fs/gfs2/trans.c
+@@ -236,7 +236,6 @@ void gfs2_trans_add_meta(struct gfs2_glock *gl, struct buffer_head *bh)
+ 	struct gfs2_bufdata *bd;
+ 	struct gfs2_meta_header *mh;
+ 	struct gfs2_trans *tr = current->journal_info;
+-	enum gfs2_freeze_state state = atomic_read(&sdp->sd_freeze_state);
+ 
+ 	lock_buffer(bh);
+ 	if (buffer_pinned(bh)) {
+@@ -270,7 +269,7 @@ void gfs2_trans_add_meta(struct gfs2_glock *gl, struct buffer_head *bh)
+ 		       (unsigned long long)bd->bd_bh->b_blocknr);
+ 		BUG();
+ 	}
+-	if (unlikely(state == SFS_FROZEN)) {
++	if (unlikely(test_bit(SDF_FROZEN, &sdp->sd_flags))) {
+ 		fs_info(sdp, "GFS2:adding buf while frozen\n");
+ 		gfs2_assert_withdraw(sdp, 0);
+ 	}
