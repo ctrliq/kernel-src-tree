@@ -6,6 +6,7 @@
 #include <asm/errno.h>
 #include <linux/clocksource.h>
 #include <linux/init.h>
+#include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/types.h>
 
 #include <clocksource/arm_arch_timer.h>
