@@ -1,0 +1,112 @@
+blk-cgroup: Optimize blkcg_rstat_flush()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Waiman Long <longman@redhat.com>
+commit 3b8cc6298724021da845f2f9fd7dd4b6829a6817
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/3b8cc629.failed
+
+For a system with many CPUs and block devices, the time to do
+blkcg_rstat_flush() from cgroup_rstat_flush() can be rather long. It
+can be especially problematic as interrupt is disabled during the flush.
+It was reported that it might take seconds to complete in some extreme
+cases leading to hard lockup messages.
+
+As it is likely that not all the percpu blkg_iostat_set's has been
+updated since the last flush, those stale blkg_iostat_set's don't need
+to be flushed in this case. This patch optimizes blkcg_rstat_flush()
+by keeping a lockless list of recently updated blkg_iostat_set's in a
+newly added percpu blkcg->lhead pointer.
+
+The blkg_iostat_set is added to a lockless list on the update side
+in blk_cgroup_bio_start(). It is removed from the lockless list when
+flushed in blkcg_rstat_flush(). Due to racing, it is possible that
+blk_iostat_set's in the lockless list may have no new IO stats to be
+flushed, but that is OK.
+
+To protect against destruction of blkg, a percpu reference is gotten
+when putting into the lockless list and put back when removed.
+
+When booting up an instrumented test kernel with this patch on a
+2-socket 96-thread system with cgroup v2, out of the 2051 calls to
+cgroup_rstat_flush() after bootup, 1788 of the calls were exited
+immediately because of empty lockless list. After an all-cpu kernel
+build, the ratio became 6295424/6340513. That was more than 99%.
+
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Acked-by: Tejun Heo <tj@kernel.org>
+Link: https://lore.kernel.org/r/20221105005902.407297-3-longman@redhat.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 3b8cc6298724021da845f2f9fd7dd4b6829a6817)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-cgroup.c
+#	block/blk-cgroup.h
+diff --cc block/blk-cgroup.c
+index c38e6018c39e,3e03c0d13253..000000000000
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@@ -57,6 -59,54 +57,57 @@@ static struct workqueue_struct *blkcg_p
+  
+  #define BLKG_DESTROY_BATCH_SIZE  64
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Lockless lists for tracking IO stats update
++  *
++  * New IO stats are stored in the percpu iostat_cpu within blkcg_gq (blkg).
++  * There are multiple blkg's (one for each block device) attached to each
++  * blkcg. The rstat code keeps track of which cpu has IO stats updated,
++  * but it doesn't know which blkg has the updated stats. If there are many
++  * block devices in a system, the cost of iterating all the blkg's to flush
++  * out the IO stats can be high. To reduce such overhead, a set of percpu
++  * lockless lists (lhead) per blkcg are used to track the set of recently
++  * updated iostat_cpu's since the last flush. An iostat_cpu will be put
++  * onto the lockless list on the update side [blk_cgroup_bio_start()] if
++  * not there yet and then removed when being flushed [blkcg_rstat_flush()].
++  * References to blkg are gotten and then put back in the process to
++  * protect against blkg removal.
++  *
++  * Return: 0 if successful or -ENOMEM if allocation fails.
++  */
++ static int init_blkcg_llists(struct blkcg *blkcg)
++ {
++ 	int cpu;
++ 
++ 	blkcg->lhead = alloc_percpu_gfp(struct llist_head, GFP_KERNEL);
++ 	if (!blkcg->lhead)
++ 		return -ENOMEM;
++ 
++ 	for_each_possible_cpu(cpu)
++ 		init_llist_head(per_cpu_ptr(blkcg->lhead, cpu));
++ 	return 0;
++ }
++ 
++ /**
++  * blkcg_css - find the current css
++  *
++  * Find the css associated with either the kthread or the current task.
++  * This may return a dying css, so it is up to the caller to use tryget logic
++  * to confirm it is alive and well.
++  */
++ static struct cgroup_subsys_state *blkcg_css(void)
++ {
++ 	struct cgroup_subsys_state *css;
++ 
++ 	css = kthread_blkcg();
++ 	if (css)
++ 		return css;
++ 	return task_css(current, io_cgrp_id);
++ }
++ 
+++>>>>>>> 3b8cc6298724 (blk-cgroup: Optimize blkcg_rstat_flush())
+  static bool blkcg_policy_enabled(struct request_queue *q,
+  				 const struct blkcg_policy *pol)
+  {
+* Unmerged path block/blk-cgroup.h
+* Unmerged path block/blk-cgroup.c
+* Unmerged path block/blk-cgroup.h
