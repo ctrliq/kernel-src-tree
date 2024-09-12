@@ -1,0 +1,231 @@
+x86/speculation: Include unprivileged eBPF status in Spectre v2 mitigation reporting
+
+jira LE-1907
+cve CVE-2022-0002
+cve CVE-2022-0001
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Josh Poimboeuf <jpoimboe@redhat.com>
+commit 44a3918c8245ab10c6c9719dd12e7a8d291980d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/44a3918c.failed
+
+With unprivileged eBPF enabled, eIBRS (without retpoline) is vulnerable
+to Spectre v2 BHB-based attacks.
+
+When both are enabled, print a warning message and report it in the
+'spectre_v2' sysfs vulnerabilities file.
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 44a3918c8245ab10c6c9719dd12e7a8d291980d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/bugs.c
+#	include/linux/bpf.h
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 7357f251348a,0a4267c63d3b..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -15,6 -15,8 +15,11 @@@
+  #include <linux/nospec.h>
+  #include <linux/prctl.h>
+  #include <linux/sched/smt.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/pgtable.h>
++ #include <linux/bpf.h>
+++>>>>>>> 44a3918c8245 (x86/speculation: Include unprivileged eBPF status in Spectre v2 mitigation reporting)
+  
+  #include <asm/spec-ctrl.h>
+  #include <asm/cmdline.h>
+@@@ -890,86 -973,63 +905,110 @@@ static void __init spectre_v2_select_mi
+  	case SPECTRE_V2_CMD_FORCE:
+  	case SPECTRE_V2_CMD_AUTO:
+  		if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED)) {
+ -			mode = SPECTRE_V2_EIBRS;
+ -			break;
+ +set_ibrs_enhanced:
+ +			mode = SPECTRE_V2_IBRS_ENHANCED;
+ +			/* Force it so VMEXIT will restore correctly */
+ +			x86_spec_ctrl_base |= SPEC_CTRL_IBRS;
+ +			wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
+ +			goto specv2_set_mode;
+  		}
+  
+ -		mode = spectre_v2_select_retpoline();
+ -		break;
+ -
+ -	case SPECTRE_V2_CMD_RETPOLINE_LFENCE:
+ -		mode = SPECTRE_V2_LFENCE;
+ -		break;
+ +		/*
+ +		 * For Skylake, we print a warning if IBRS isn't chosen.
+ +		 */
+ +		if (is_skylake_era() && boot_cpu_has(X86_FEATURE_IBRS)) {
+ +			pr_warn("Using retpoline on Skylake-generation processors may not fully mitigate the vulnerability.\n");
+ +			pr_warn("Add the \"spectre_v2=ibrs\" kernel boot flag to enable IBRS on Skylake systems that need full mitigation.\n");
+ +		}
+  
+ -	case SPECTRE_V2_CMD_RETPOLINE_GENERIC:
+ -		mode = SPECTRE_V2_RETPOLINE;
+ -		break;
+ +		/* Fall through */
+  
+ -	case SPECTRE_V2_CMD_RETPOLINE:
+ -		mode = spectre_v2_select_retpoline();
+ +		if (IS_ENABLED(CONFIG_RETPOLINE))
+ +			goto retpoline_auto;
+  		break;
+ -
+ -	case SPECTRE_V2_CMD_EIBRS:
+ -		mode = SPECTRE_V2_EIBRS;
+ +	case SPECTRE_V2_CMD_RETPOLINE_AMD:
+ +		if (IS_ENABLED(CONFIG_RETPOLINE))
+ +			goto retpoline_amd;
+  		break;
+ -
+ -	case SPECTRE_V2_CMD_EIBRS_LFENCE:
+ -		mode = SPECTRE_V2_EIBRS_LFENCE;
+ +	case SPECTRE_V2_CMD_RETPOLINE_GENERIC:
+ +		if (IS_ENABLED(CONFIG_RETPOLINE))
+ +			goto retpoline_generic;
+  		break;
+ -
+ -	case SPECTRE_V2_CMD_EIBRS_RETPOLINE:
+ -		mode = SPECTRE_V2_EIBRS_RETPOLINE;
+ +	case SPECTRE_V2_CMD_RETPOLINE:
+ +		if (IS_ENABLED(CONFIG_RETPOLINE))
+ +			goto retpoline_auto;
+  		break;
+ +	case SPECTRE_V2_CMD_IBRS:
+ +		if (spec_ctrl_enable_ibrs()) {
+ +			mode = SPECTRE_V2_IBRS;
+ +			goto specv2_set_mode;
+ +		}
+ +		goto retpoline_auto;
+ +	case SPECTRE_V2_CMD_IBRS_ALWAYS:
+ +		/* Fall back to IBRS_ENHANCED if feature present */
+ +		if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED))
+ +			goto set_ibrs_enhanced;
+ +
+ +		if (spec_ctrl_enable_ibrs_always()) {
+ +			mode = SPECTRE_V2_IBRS_ALWAYS;
+ +			goto specv2_set_mode;
+ +		}
+ +		goto retpoline_auto;
+ +	case SPECTRE_V2_CMD_RETPOLINE_IBRS_USER:
+ +		goto retpoline_auto;
+  	}
+ +	pr_err("Spectre mitigation: kernel not compiled with retpoline; no mitigation available!");
+ +	return;
+  
+++<<<<<<< HEAD
+ +retpoline_auto:
+ +	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) {
+ +	retpoline_amd:
+ +		if (!boot_cpu_has(X86_FEATURE_LFENCE_RDTSC)) {
+ +			pr_err("Spectre mitigation: LFENCE not serializing, switching to generic retpoline\n");
+ +			goto retpoline_generic;
+ +		}
+ +		mode = SPECTRE_V2_RETPOLINE_AMD;
+ +		setup_force_cpu_cap(X86_FEATURE_RETPOLINE_AMD);
+ +		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
+ +	} else {
+ +	retpoline_generic:
+ +		mode = SPECTRE_V2_RETPOLINE_GENERIC;
+++=======
++ 	if (mode == SPECTRE_V2_EIBRS && unprivileged_ebpf_enabled())
++ 		pr_err(SPECTRE_V2_EIBRS_EBPF_MSG);
++ 
++ 	if (spectre_v2_in_eibrs_mode(mode)) {
++ 		/* Force it so VMEXIT will restore correctly */
++ 		x86_spec_ctrl_base |= SPEC_CTRL_IBRS;
++ 		wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
++ 	}
++ 
++ 	switch (mode) {
++ 	case SPECTRE_V2_NONE:
++ 	case SPECTRE_V2_EIBRS:
++ 		break;
++ 
++ 	case SPECTRE_V2_LFENCE:
++ 	case SPECTRE_V2_EIBRS_LFENCE:
++ 		setup_force_cpu_cap(X86_FEATURE_RETPOLINE_LFENCE);
++ 		fallthrough;
++ 
++ 	case SPECTRE_V2_RETPOLINE:
++ 	case SPECTRE_V2_EIBRS_RETPOLINE:
+++>>>>>>> 44a3918c8245 (x86/speculation: Include unprivileged eBPF status in Spectre v2 mitigation reporting)
+  		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
+ -		break;
+  	}
+  
+ +	/*
+ +	 * Check SPECTRE_V2_CMD_RETPOLINE_IBRS_USER mode.
+ +	 */
+ +	if ((cmd == SPECTRE_V2_CMD_RETPOLINE_IBRS_USER) &&
+ +	    boot_cpu_has(X86_FEATURE_RETPOLINE) &&
+ +	    spec_ctrl_enable_retpoline_ibrs_user())
+ +		mode = SPECTRE_V2_RETPOLINE_IBRS_USER;
+ +
+ +specv2_set_mode:
+  	spectre_v2_enabled = mode;
+  	pr_info("%s\n", spectre_v2_strings[mode]);
+  
+diff --cc include/linux/bpf.h
+index 03b6e29e91cf,1f56806d8eb9..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -1599,6 -1785,19 +1599,22 @@@ bool bpf_prog_has_kfunc_call(const stru
+  const struct btf_func_model *
+  bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
+  			 const struct bpf_insn *insn);
+++<<<<<<< HEAD
+++=======
++ struct bpf_core_ctx {
++ 	struct bpf_verifier_log *log;
++ 	const struct btf *btf;
++ };
++ 
++ int bpf_core_apply(struct bpf_core_ctx *ctx, const struct bpf_core_relo *relo,
++ 		   int relo_idx, void *insn);
++ 
++ static inline bool unprivileged_ebpf_enabled(void)
++ {
++ 	return !sysctl_unprivileged_bpf_disabled;
++ }
++ 
+++>>>>>>> 44a3918c8245 (x86/speculation: Include unprivileged eBPF status in Spectre v2 mitigation reporting)
+  #else /* !CONFIG_BPF_SYSCALL */
+  static inline struct bpf_prog *bpf_prog_get(u32 ufd)
+  {
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+* Unmerged path include/linux/bpf.h
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 29d688e23396..d9abe69809e6 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -2023,6 +2023,10 @@ static int bpf_stats_handler(struct ctl_table *table, int write,
+ 	return ret;
+ }
+ 
++void __weak unpriv_ebpf_notify(int new_state)
++{
++}
++
+ static int bpf_unpriv_handler(struct ctl_table *table, int write,
+ 			      void *buffer, size_t *lenp, loff_t *ppos)
+ {
+@@ -2040,6 +2044,9 @@ static int bpf_unpriv_handler(struct ctl_table *table, int write,
+ 			return -EPERM;
+ 		*(int *)table->data = unpriv_enable;
+ 	}
++
++	unpriv_ebpf_notify(unpriv_enable);
++
+ 	return ret;
+ }
+ #endif /* CONFIG_BPF_SYSCALL && CONFIG_SYSCTL */
