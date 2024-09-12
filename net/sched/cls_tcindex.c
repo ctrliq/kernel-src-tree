@@ -254,10 +254,10 @@ static void tcindex_destroy_work(struct work_struct *work)
 	tcindex_data_put(p);
 }
 
-static inline int
+static inline bool
 valid_perfect_hash(struct tcindex_data *p)
 {
-	return  p->hash > (p->mask >> p->shift);
+	return false;
 }
 
 static const struct nla_policy tcindex_policy[TCA_TCINDEX_MAX + 1] = {
