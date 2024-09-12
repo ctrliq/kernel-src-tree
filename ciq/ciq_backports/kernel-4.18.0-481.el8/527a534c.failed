@@ -1,0 +1,190 @@
+x86/tdx: Provide common base for SEAMCALL and TDCALL C wrappers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+commit 527a534c732604931959e73e9c3a8952d8c1a994
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/527a534c.failed
+
+Secure Arbitration Mode (SEAM) is an extension of VMX architecture.  It
+defines a new VMX root operation (SEAM VMX root) and a new VMX non-root
+operation (SEAM VMX non-root) which are both isolated from the legacy
+VMX operation where the host kernel runs.
+
+A CPU-attested software module (called 'TDX module') runs in SEAM VMX
+root to manage and protect VMs running in SEAM VMX non-root.  SEAM VMX
+root is also used to host another CPU-attested software module (called
+'P-SEAMLDR') to load and update the TDX module.
+
+Host kernel transits to either P-SEAMLDR or TDX module via the new
+SEAMCALL instruction, which is essentially a VMExit from VMX root mode
+to SEAM VMX root mode.  SEAMCALLs are leaf functions defined by
+P-SEAMLDR and TDX module around the new SEAMCALL instruction.
+
+A guest kernel can also communicate with TDX module via TDCALL
+instruction.
+
+TDCALLs and SEAMCALLs use an ABI different from the x86-64 system-v ABI.
+RAX is used to carry both the SEAMCALL leaf function number (input) and
+the completion status (output).  Additional GPRs (RCX, RDX, R8-R11) may
+be further used as both input and output operands in individual leaf.
+
+TDCALL and SEAMCALL share the same ABI and require the largely same
+code to pass down arguments and retrieve results.
+
+Define an assembly macro that can be used to implement C wrapper for
+both TDCALL and SEAMCALL.
+
+	Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/20220405232939.73860-3-kirill.shutemov@linux.intel.com
+(cherry picked from commit 527a534c732604931959e73e9c3a8952d8c1a994)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/tdx.h
+#	arch/x86/kernel/asm-offsets.c
+diff --cc arch/x86/kernel/asm-offsets.c
+index 3e49c09ab344,7dca52f5cfc6..000000000000
+--- a/arch/x86/kernel/asm-offsets.c
++++ b/arch/x86/kernel/asm-offsets.c
+@@@ -18,7 -18,7 +18,11 @@@
+  #include <asm/bootparam.h>
+  #include <asm/suspend.h>
+  #include <asm/tlbflush.h>
+++<<<<<<< HEAD
+ +#include "../kvm/vmx/vmx.h"
+++=======
++ #include <asm/tdx.h>
+++>>>>>>> 527a534c7326 (x86/tdx: Provide common base for SEAMCALL and TDCALL C wrappers)
+  
+  #ifdef CONFIG_XEN
+  #include <xen/interface/xen.h>
+@@@ -79,8 -63,17 +83,16 @@@ void common(void) 
+  	BLANK();
+  	OFFSET(XEN_vcpu_info_mask, vcpu_info, evtchn_upcall_mask);
+  	OFFSET(XEN_vcpu_info_pending, vcpu_info, evtchn_upcall_pending);
+ -	OFFSET(XEN_vcpu_info_arch_cr2, vcpu_info, arch.cr2);
+  #endif
+  
++ 	BLANK();
++ 	OFFSET(TDX_MODULE_rcx, tdx_module_output, rcx);
++ 	OFFSET(TDX_MODULE_rdx, tdx_module_output, rdx);
++ 	OFFSET(TDX_MODULE_r8,  tdx_module_output, r8);
++ 	OFFSET(TDX_MODULE_r9,  tdx_module_output, r9);
++ 	OFFSET(TDX_MODULE_r10, tdx_module_output, r10);
++ 	OFFSET(TDX_MODULE_r11, tdx_module_output, r11);
++ 
+  	BLANK();
+  	OFFSET(BP_scratch, boot_params, scratch);
+  	OFFSET(BP_secure_boot, boot_params, secure_boot);
+* Unmerged path arch/x86/include/asm/tdx.h
+* Unmerged path arch/x86/include/asm/tdx.h
+* Unmerged path arch/x86/kernel/asm-offsets.c
+diff --git a/arch/x86/virt/vmx/tdx/tdxcall.S b/arch/x86/virt/vmx/tdx/tdxcall.S
+new file mode 100644
+index 000000000000..49a54356ae99
+--- /dev/null
++++ b/arch/x86/virt/vmx/tdx/tdxcall.S
+@@ -0,0 +1,96 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#include <asm/asm-offsets.h>
++#include <asm/tdx.h>
++
++/*
++ * TDCALL and SEAMCALL are supported in Binutils >= 2.36.
++ */
++#define tdcall		.byte 0x66,0x0f,0x01,0xcc
++#define seamcall	.byte 0x66,0x0f,0x01,0xcf
++
++/*
++ * TDX_MODULE_CALL - common helper macro for both
++ *                 TDCALL and SEAMCALL instructions.
++ *
++ * TDCALL   - used by TDX guests to make requests to the
++ *            TDX module and hypercalls to the VMM.
++ * SEAMCALL - used by TDX hosts to make requests to the
++ *            TDX module.
++ */
++.macro TDX_MODULE_CALL host:req
++	/*
++	 * R12 will be used as temporary storage for struct tdx_module_output
++	 * pointer. Since R12-R15 registers are not used by TDCALL/SEAMCALL
++	 * services supported by this function, it can be reused.
++	 */
++
++	/* Callee saved, so preserve it */
++	push %r12
++
++	/*
++	 * Push output pointer to stack.
++	 * After the operation, it will be fetched into R12 register.
++	 */
++	push %r9
++
++	/* Mangle function call ABI into TDCALL/SEAMCALL ABI: */
++	/* Move Leaf ID to RAX */
++	mov %rdi, %rax
++	/* Move input 4 to R9 */
++	mov %r8,  %r9
++	/* Move input 3 to R8 */
++	mov %rcx, %r8
++	/* Move input 1 to RCX */
++	mov %rsi, %rcx
++	/* Leave input param 2 in RDX */
++
++	.if \host
++	seamcall
++	/*
++	 * SEAMCALL instruction is essentially a VMExit from VMX root
++	 * mode to SEAM VMX root mode.  VMfailInvalid (CF=1) indicates
++	 * that the targeted SEAM firmware is not loaded or disabled,
++	 * or P-SEAMLDR is busy with another SEAMCALL.  %rax is not
++	 * changed in this case.
++	 *
++	 * Set %rax to TDX_SEAMCALL_VMFAILINVALID for VMfailInvalid.
++	 * This value will never be used as actual SEAMCALL error code as
++	 * it is from the Reserved status code class.
++	 */
++	jnc .Lno_vmfailinvalid
++	mov $TDX_SEAMCALL_VMFAILINVALID, %rax
++.Lno_vmfailinvalid:
++
++	.else
++	tdcall
++	.endif
++
++	/*
++	 * Fetch output pointer from stack to R12 (It is used
++	 * as temporary storage)
++	 */
++	pop %r12
++
++	/*
++	 * Since this macro can be invoked with NULL as an output pointer,
++	 * check if caller provided an output struct before storing output
++	 * registers.
++	 *
++	 * Update output registers, even if the call failed (RAX != 0).
++	 * Other registers may contain details of the failure.
++	 */
++	test %r12, %r12
++	jz .Lno_output_struct
++
++	/* Copy result registers to output struct: */
++	movq %rcx, TDX_MODULE_rcx(%r12)
++	movq %rdx, TDX_MODULE_rdx(%r12)
++	movq %r8,  TDX_MODULE_r8(%r12)
++	movq %r9,  TDX_MODULE_r9(%r12)
++	movq %r10, TDX_MODULE_r10(%r12)
++	movq %r11, TDX_MODULE_r11(%r12)
++
++.Lno_output_struct:
++	/* Restore the state of R12 register */
++	pop %r12
++.endm
