@@ -3252,7 +3252,7 @@ retry:
 		 * Success, we're done! No tricky corner cases.
 		 */
 		if (!ret)
-			goto out_putkey;
+			return ret;
 		/*
 		 * The atomic access to the futex value generated a
 		 * pagefault, so retry the user-access and the wakeup:
@@ -3269,7 +3269,7 @@ retry:
 		 * wake_futex_pi has detected invalid state. Tell user
 		 * space.
 		 */
-		goto out_putkey;
+		return ret;
 	}
 
 	/*
@@ -3290,7 +3290,7 @@ retry:
 
 		default:
 			WARN_ON_ONCE(1);
-			goto out_putkey;
+			return ret;
 		}
 	}
 
@@ -3301,7 +3301,6 @@ retry:
 
 out_unlock:
 	spin_unlock(&hb->lock);
-out_putkey:
 	return ret;
 
 pi_retry:
