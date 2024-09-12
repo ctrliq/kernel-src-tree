@@ -1,0 +1,113 @@
+mm/thp: fix NR_FILE_MAPPED accounting in page_*_file_rmap()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-525.el8
+commit-author Hugh Dickins <hughd@google.com>
+commit 5d543f13e2f5580828de885c751d68a35b6a493d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-525.el8/5d543f13.failed
+
+NR_FILE_MAPPED accounting in mm/rmap.c (for /proc/meminfo "Mapped" and
+/proc/vmstat "nr_mapped" and the memcg's memory.stat "mapped_file") is
+slightly flawed for file or shmem huge pages.
+
+It is well thought out, and looks convincing, but there's a racy case when
+the careful counting in page_remove_file_rmap() (without page lock) gets
+discarded.  So that in a workload like two "make -j20" kernel builds under
+memory pressure, with cc1 on hugepage text, "Mapped" can easily grow by a
+spurious 5MB or more on each iteration, ending up implausibly bigger than
+most other numbers in /proc/meminfo.  And, hypothetically, might grow to
+the point of seriously interfering in mm/vmscan.c's heuristics, which do
+take NR_FILE_MAPPED into some consideration.
+
+Fixed by moving the __mod_lruvec_page_state() down to where it will not be
+missed before return (and I've grown a bit tired of that oft-repeated
+but-not-everywhere comment on the __ness: it gets lost in the move here).
+
+Does page_add_file_rmap() need the same change?  I suspect not, because
+page lock is held in all relevant cases, and its skipping case looks safe;
+but it's much easier to be sure, if we do make the same change.
+
+Link: https://lkml.kernel.org/r/e02e52a1-8550-a57c-ed29-f51191ea2375@google.com
+Fixes: dd78fedde4b9 ("rmap: support file thp")
+	Signed-off-by: Hugh Dickins <hughd@google.com>
+	Reviewed-by: Yang Shi <shy828301@gmail.com>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 5d543f13e2f5580828de885c751d68a35b6a493d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/rmap.c
+diff --cc mm/rmap.c
+index 6959d8553d0d,ee1f10df984d..000000000000
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@@ -1210,9 -1233,10 +1210,9 @@@ void page_add_new_anon_rmap(struct pag
+   *
+   * The caller needs to hold the pte lock.
+   */
+ -void page_add_file_rmap(struct page *page,
+ -	struct vm_area_struct *vma, bool compound)
+ +void page_add_file_rmap(struct page *page, bool compound)
+  {
+- 	int i, nr = 1;
++ 	int i, nr = 0;
+  
+  	VM_BUG_ON_PAGE(compound && !PageTransHuge(page), page);
+  	lock_page_memcg(page);
+@@@ -1245,17 -1269,17 +1245,18 @@@
+  	} else {
+  		if (PageTransCompound(page) && page_mapping(page)) {
+  			VM_WARN_ON_ONCE(!PageLocked(page));
+ +
+  			SetPageDoubleMap(compound_head(page));
+ +			if (PageMlocked(page))
+ +				clear_page_mlock(compound_head(page));
+  		}
+- 		if (!atomic_inc_and_test(&page->_mapcount))
+- 			goto out;
++ 		if (atomic_inc_and_test(&page->_mapcount))
++ 			nr++;
+  	}
+- 	__mod_lruvec_page_state(page, NR_FILE_MAPPED, nr);
+  out:
++ 	if (nr)
++ 		__mod_lruvec_page_state(page, NR_FILE_MAPPED, nr);
+  	unlock_page_memcg(page);
+ -
+ -	mlock_vma_page(page, vma, compound);
+  }
+  
+  static void page_remove_file_rmap(struct page *page, bool compound)
+@@@ -1288,19 -1312,12 +1289,25 @@@
+  			__mod_lruvec_page_state(page, NR_FILE_PMDMAPPED,
+  						-nr_pages);
+  	} else {
+- 		if (!atomic_add_negative(-1, &page->_mapcount))
+- 			return;
++ 		if (atomic_add_negative(-1, &page->_mapcount))
++ 			nr++;
+  	}
+++<<<<<<< HEAD
+ +
+ +	/*
+ +	 * We use the irq-unsafe __{inc|mod}_lruvec_page_state because
+ +	 * these counters are not modified in interrupt context, and
+ +	 * pte lock(a spinlock) is held, which implies preemption disabled.
+ +	 */
+ +	__mod_lruvec_page_state(page, NR_FILE_MAPPED, -nr);
+ +
+ +	if (unlikely(PageMlocked(page)))
+ +		clear_page_mlock(page);
+++=======
++ out:
++ 	if (nr)
++ 		__mod_lruvec_page_state(page, NR_FILE_MAPPED, -nr);
+++>>>>>>> 5d543f13e2f5 (mm/thp: fix NR_FILE_MAPPED accounting in page_*_file_rmap())
+  }
+  
+  static void page_remove_anon_compound_rmap(struct page *page)
+* Unmerged path mm/rmap.c
