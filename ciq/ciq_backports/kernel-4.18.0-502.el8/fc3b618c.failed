@@ -1,0 +1,188 @@
+x86/resctrl: Replace smp_call_function_many() with on_each_cpu_mask()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Babu Moger <babu.moger@amd.com>
+commit fc3b618c87833e4d258b66acfca3557c49c4fe97
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/fc3b618c.failed
+
+on_each_cpu_mask() runs the function on each CPU specified by cpumask,
+which may include the local processor.
+
+Replace smp_call_function_many() with on_each_cpu_mask() to simplify
+the code.
+
+	Signed-off-by: Babu Moger <babu.moger@amd.com>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lore.kernel.org/r/20230113152039.770054-2-babu.moger@amd.com
+(cherry picked from commit fc3b618c87833e4d258b66acfca3557c49c4fe97)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+diff --cc arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+index 9a768d89de37,7eece3d2d0c3..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/ctrlmondata.c
++++ b/arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+@@@ -244,14 -252,65 +244,18 @@@ next
+  	return -EINVAL;
+  }
+  
+ -static u32 get_config_index(u32 closid, enum resctrl_conf_type type)
+ -{
+ -	switch (type) {
+ -	default:
+ -	case CDP_NONE:
+ -		return closid;
+ -	case CDP_CODE:
+ -		return closid * 2 + 1;
+ -	case CDP_DATA:
+ -		return closid * 2;
+ -	}
+ -}
+ -
+ -static bool apply_config(struct rdt_hw_domain *hw_dom,
+ -			 struct resctrl_staged_config *cfg, u32 idx,
+ -			 cpumask_var_t cpu_mask)
+ -{
+ -	struct rdt_domain *dom = &hw_dom->d_resctrl;
+ -
+ -	if (cfg->new_ctrl != hw_dom->ctrl_val[idx]) {
+ -		cpumask_set_cpu(cpumask_any(&dom->cpu_mask), cpu_mask);
+ -		hw_dom->ctrl_val[idx] = cfg->new_ctrl;
+ -
+ -		return true;
+ -	}
+ -
+ -	return false;
+ -}
+ -
+ -int resctrl_arch_update_one(struct rdt_resource *r, struct rdt_domain *d,
+ -			    u32 closid, enum resctrl_conf_type t, u32 cfg_val)
+ -{
+ -	struct rdt_hw_resource *hw_res = resctrl_to_arch_res(r);
+ -	struct rdt_hw_domain *hw_dom = resctrl_to_arch_dom(d);
+ -	u32 idx = get_config_index(closid, t);
+ -	struct msr_param msr_param;
+ -
+ -	if (!cpumask_test_cpu(smp_processor_id(), &d->cpu_mask))
+ -		return -EINVAL;
+ -
+ -	hw_dom->ctrl_val[idx] = cfg_val;
+ -
+ -	msr_param.res = r;
+ -	msr_param.low = idx;
+ -	msr_param.high = idx + 1;
+ -	hw_res->msr_update(d, &msr_param, r);
+ -
+ -	return 0;
+ -}
+ -
+ -int resctrl_arch_update_domains(struct rdt_resource *r, u32 closid)
+ +int update_domains(struct rdt_resource *r, int closid)
+  {
+ -	struct resctrl_staged_config *cfg;
+ -	struct rdt_hw_domain *hw_dom;
+  	struct msr_param msr_param;
+ -	enum resctrl_conf_type t;
+  	cpumask_var_t cpu_mask;
+  	struct rdt_domain *d;
+++<<<<<<< HEAD
+ +	bool mba_sc;
+ +	u32 *dc;
+ +	int cpu;
+++=======
++ 	u32 idx;
+++>>>>>>> fc3b618c8783 (x86/resctrl: Replace smp_call_function_many() with on_each_cpu_mask())
+  
+  	if (!zalloc_cpumask_var(&cpu_mask, GFP_KERNEL))
+  		return -ENOMEM;
+@@@ -269,19 -338,11 +273,15 @@@
+  		}
+  	}
+  
+ -	if (cpumask_empty(cpu_mask))
+ +	/*
+ +	 * Avoid writing the control msr with control values when
+ +	 * MBA software controller is enabled
+ +	 */
+ +	if (cpumask_empty(cpu_mask) || mba_sc)
+  		goto done;
+- 	cpu = get_cpu();
+- 	/* Update resource control msr on this CPU if it's in cpu_mask. */
+- 	if (cpumask_test_cpu(cpu, cpu_mask))
+- 		rdt_ctrl_update(&msr_param);
+- 	/* Update resource control msr on other CPUs. */
+- 	smp_call_function_many(cpu_mask, rdt_ctrl_update, &msr_param, 1);
+- 	put_cpu();
++ 
++ 	/* Update resource control msr on all the CPUs. */
++ 	on_each_cpu_mask(cpu_mask, rdt_ctrl_update, &msr_param, 1);
+  
+  done:
+  	free_cpumask_var(cpu_mask);
+* Unmerged path arch/x86/kernel/cpu/resctrl/ctrlmondata.c
+diff --git a/arch/x86/kernel/cpu/resctrl/rdtgroup.c b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index e5f7b979a288..a93ae81a759a 100644
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@ -330,12 +330,7 @@ static void update_cpu_closid_rmid(void *info)
+ static void
+ update_closid_rmid(const struct cpumask *cpu_mask, struct rdtgroup *r)
+ {
+-	int cpu = get_cpu();
+-
+-	if (cpumask_test_cpu(cpu, cpu_mask))
+-		update_cpu_closid_rmid(r);
+-	smp_call_function_many(cpu_mask, update_cpu_closid_rmid, r, 1);
+-	put_cpu();
++	on_each_cpu_mask(cpu_mask, update_cpu_closid_rmid, r, 1);
+ }
+ 
+ static int cpus_mon_write(struct rdtgroup *rdtgrp, cpumask_var_t newmask,
+@@ -1925,13 +1920,9 @@ static int set_cache_qos_cfg(int level, bool enable)
+ 			/* Pick one CPU from each domain instance to update MSR */
+ 			cpumask_set_cpu(cpumask_any(&d->cpu_mask), cpu_mask);
+ 	}
+-	cpu = get_cpu();
+-	/* Update QOS_CFG MSR on this cpu if it's in cpu_mask. */
+-	if (cpumask_test_cpu(cpu, cpu_mask))
+-		update(&enable);
+-	/* Update QOS_CFG MSR on all other cpus in cpu_mask. */
+-	smp_call_function_many(cpu_mask, update, &enable, 1);
+-	put_cpu();
++
++	/* Update QOS_CFG MSR on all the CPUs in cpu_mask */
++	on_each_cpu_mask(cpu_mask, update, &enable, 1);
+ 
+ 	free_cpumask_var(cpu_mask);
+ 
+@@ -2296,7 +2287,7 @@ static int reset_all_ctrls(struct rdt_resource *r)
+ 	struct msr_param msr_param;
+ 	cpumask_var_t cpu_mask;
+ 	struct rdt_domain *d;
+-	int i, cpu;
++	int i;
+ 
+ 	if (!zalloc_cpumask_var(&cpu_mask, GFP_KERNEL))
+ 		return -ENOMEM;
+@@ -2316,13 +2307,9 @@ static int reset_all_ctrls(struct rdt_resource *r)
+ 		for (i = 0; i < r->num_closid; i++)
+ 			d->ctrl_val[i] = r->default_ctrl;
+ 	}
+-	cpu = get_cpu();
+-	/* Update CBM on this cpu if it's in cpu_mask. */
+-	if (cpumask_test_cpu(cpu, cpu_mask))
+-		rdt_ctrl_update(&msr_param);
+-	/* Update CBM on all other cpus in cpu_mask. */
+-	smp_call_function_many(cpu_mask, rdt_ctrl_update, &msr_param, 1);
+-	put_cpu();
++
++	/* Update CBM on all the CPUs in cpu_mask */
++	on_each_cpu_mask(cpu_mask, rdt_ctrl_update, &msr_param, 1);
+ 
+ 	free_cpumask_var(cpu_mask);
+ 
