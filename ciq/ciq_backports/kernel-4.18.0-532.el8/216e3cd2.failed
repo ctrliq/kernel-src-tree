@@ -1,0 +1,320 @@
+bpf: Add MEM_RDONLY for helper args that are pointers to rdonly mem.
+
+jira LE-1907
+cve CVE-2022-0500
+Rebuild_History Non-Buildable kernel-4.18.0-532.el8
+commit-author Hao Luo <haoluo@google.com>
+commit 216e3cd2f28dbbf1fe86848e0e29e6693b9f0a20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-532.el8/216e3cd2.failed
+
+Some helper functions may modify its arguments, for example,
+bpf_d_path, bpf_get_stack etc. Previously, their argument types
+were marked as ARG_PTR_TO_MEM, which is compatible with read-only
+mem types, such as PTR_TO_RDONLY_BUF. Therefore it's legitimate,
+but technically incorrect, to modify a read-only memory by passing
+it into one of such helper functions.
+
+This patch tags the bpf_args compatible with immutable memory with
+MEM_RDONLY flag. The arguments that don't have this flag will be
+only compatible with mutable memory types, preventing the helper
+from modifying a read-only memory. The bpf_args that have
+MEM_RDONLY are compatible with both mutable memory and immutable
+memory.
+
+	Signed-off-by: Hao Luo <haoluo@google.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20211217003152.48334-9-haoluo@google.com
+(cherry picked from commit 216e3cd2f28dbbf1fe86848e0e29e6693b9f0a20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/verifier.c
+#	kernel/trace/bpf_trace.c
+#	net/core/filter.c
+diff --cc include/linux/bpf.h
+index 83377e4c1c34,26753139d5b4..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -279,6 -297,34 +279,37 @@@ bool bpf_map_meta_equal(const struct bp
+  
+  extern const struct bpf_map_ops bpf_map_offload_ops;
+  
+++<<<<<<< HEAD
+++=======
++ /* bpf_type_flag contains a set of flags that are applicable to the values of
++  * arg_type, ret_type and reg_type. For example, a pointer value may be null,
++  * or a memory is read-only. We classify types into two categories: base types
++  * and extended types. Extended types are base types combined with a type flag.
++  *
++  * Currently there are no more than 32 base types in arg_type, ret_type and
++  * reg_types.
++  */
++ #define BPF_BASE_TYPE_BITS	8
++ 
++ enum bpf_type_flag {
++ 	/* PTR may be NULL. */
++ 	PTR_MAYBE_NULL		= BIT(0 + BPF_BASE_TYPE_BITS),
++ 
++ 	/* MEM is read-only. When applied on bpf_arg, it indicates the arg is
++ 	 * compatible with both mutable and immutable memory.
++ 	 */
++ 	MEM_RDONLY		= BIT(1 + BPF_BASE_TYPE_BITS),
++ 
++ 	__BPF_TYPE_LAST_FLAG	= MEM_RDONLY,
++ };
++ 
++ /* Max number of base types. */
++ #define BPF_BASE_TYPE_LIMIT	(1UL << BPF_BASE_TYPE_BITS)
++ 
++ /* Max number of all types. */
++ #define BPF_TYPE_LIMIT		(__BPF_TYPE_LAST_FLAG | (__BPF_TYPE_LAST_FLAG - 1))
++ 
+++>>>>>>> 216e3cd2f28d (bpf: Add MEM_RDONLY for helper args that are pointers to rdonly mem.)
+  /* function argument constraints */
+  enum bpf_arg_type {
+  	ARG_DONTCARE = 0,	/* unused argument in helper function */
+diff --cc kernel/bpf/verifier.c
+index 627d7910d79e,ca5cd0de804c..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -4751,8 -5112,7 +4751,12 @@@ static const struct bpf_reg_types mem_t
+  		PTR_TO_MAP_KEY,
+  		PTR_TO_MAP_VALUE,
+  		PTR_TO_MEM,
+++<<<<<<< HEAD
+ +		PTR_TO_RDONLY_BUF,
+ +		PTR_TO_RDWR_BUF,
+++=======
++ 		PTR_TO_BUF,
+++>>>>>>> 216e3cd2f28d (bpf: Add MEM_RDONLY for helper args that are pointers to rdonly mem.)
+  	},
+  };
+  
+@@@ -4834,10 -5206,10 +4853,14 @@@ static int check_reg_type(struct bpf_ve
+  			goto found;
+  	}
+  
+++<<<<<<< HEAD
+ +	verbose(env, "R%d type=%s expected=", regno, reg_type_str[type]);
+++=======
++ 	verbose(env, "R%d type=%s expected=", regno, reg_type_str(env, reg->type));
+++>>>>>>> 216e3cd2f28d (bpf: Add MEM_RDONLY for helper args that are pointers to rdonly mem.)
+  	for (j = 0; j + 1 < i; j++)
+ -		verbose(env, "%s, ", reg_type_str(env, compatible->types[j]));
+ -	verbose(env, "%s\n", reg_type_str(env, compatible->types[j]));
+ +		verbose(env, "%s, ", reg_type_str[compatible->types[j]]);
+ +	verbose(env, "%s\n", reg_type_str[compatible->types[j]]);
+  	return -EACCES;
+  
+  found:
+diff --cc kernel/trace/bpf_trace.c
+index 51645202bc5d,21aa30644219..000000000000
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@@ -416,7 -415,52 +416,53 @@@ const struct bpf_func_proto *bpf_get_tr
+  	return &bpf_trace_printk_proto;
+  }
+  
+++<<<<<<< HEAD
+ +#define MAX_SEQ_PRINTF_VARARGS		12
+++=======
++ BPF_CALL_4(bpf_trace_vprintk, char *, fmt, u32, fmt_size, const void *, data,
++ 	   u32, data_len)
++ {
++ 	static char buf[BPF_TRACE_PRINTK_SIZE];
++ 	unsigned long flags;
++ 	int ret, num_args;
++ 	u32 *bin_args;
++ 
++ 	if (data_len & 7 || data_len > MAX_BPRINTF_VARARGS * 8 ||
++ 	    (data_len && !data))
++ 		return -EINVAL;
++ 	num_args = data_len / 8;
++ 
++ 	ret = bpf_bprintf_prepare(fmt, fmt_size, data, &bin_args, num_args);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	raw_spin_lock_irqsave(&trace_printk_lock, flags);
++ 	ret = bstr_printf(buf, sizeof(buf), fmt, bin_args);
++ 
++ 	trace_bpf_trace_printk(buf);
++ 	raw_spin_unlock_irqrestore(&trace_printk_lock, flags);
++ 
++ 	bpf_bprintf_cleanup();
++ 
++ 	return ret;
++ }
++ 
++ static const struct bpf_func_proto bpf_trace_vprintk_proto = {
++ 	.func		= bpf_trace_vprintk,
++ 	.gpl_only	= true,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
++ 	.arg2_type	= ARG_CONST_SIZE,
++ 	.arg3_type	= ARG_PTR_TO_MEM | PTR_MAYBE_NULL | MEM_RDONLY,
++ 	.arg4_type	= ARG_CONST_SIZE_OR_ZERO,
++ };
++ 
++ const struct bpf_func_proto *bpf_get_trace_vprintk_proto(void)
++ {
++ 	__set_printk_clr_event();
++ 	return &bpf_trace_vprintk_proto;
++ }
+++>>>>>>> 216e3cd2f28d (bpf: Add MEM_RDONLY for helper args that are pointers to rdonly mem.)
+  
+  BPF_CALL_5(bpf_seq_printf, struct seq_file *, m, char *, fmt, u32, fmt_size,
+  	   const void *, data, u32, data_len)
+diff --cc net/core/filter.c
+index baa1744058f8,606ab5a98a1a..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -5023,6 -5047,46 +5023,49 @@@ err_clear
+  	return -EINVAL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ BPF_CALL_5(bpf_sk_setsockopt, struct sock *, sk, int, level,
++ 	   int, optname, char *, optval, int, optlen)
++ {
++ 	if (level == SOL_TCP && optname == TCP_CONGESTION) {
++ 		if (optlen >= sizeof("cdg") - 1 &&
++ 		    !strncmp("cdg", optval, optlen))
++ 			return -ENOTSUPP;
++ 	}
++ 
++ 	return _bpf_setsockopt(sk, level, optname, optval, optlen);
++ }
++ 
++ const struct bpf_func_proto bpf_sk_setsockopt_proto = {
++ 	.func		= bpf_sk_setsockopt,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_BTF_ID_SOCK_COMMON,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
++ 	.arg5_type	= ARG_CONST_SIZE,
++ };
++ 
++ BPF_CALL_5(bpf_sk_getsockopt, struct sock *, sk, int, level,
++ 	   int, optname, char *, optval, int, optlen)
++ {
++ 	return _bpf_getsockopt(sk, level, optname, optval, optlen);
++ }
++ 
++ const struct bpf_func_proto bpf_sk_getsockopt_proto = {
++ 	.func		= bpf_sk_getsockopt,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_BTF_ID_SOCK_COMMON,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_PTR_TO_UNINIT_MEM,
++ 	.arg5_type	= ARG_CONST_SIZE,
++ };
++ 
+++>>>>>>> 216e3cd2f28d (bpf: Add MEM_RDONLY for helper args that are pointers to rdonly mem.)
+  BPF_CALL_5(bpf_sock_addr_setsockopt, struct bpf_sock_addr_kern *, ctx,
+  	   int, level, int, optname, char *, optval, int, optlen)
+  {
+* Unmerged path include/linux/bpf.h
+diff --git a/kernel/bpf/btf.c b/kernel/bpf/btf.c
+index 89da4652c9ca..81664cedf5a2 100644
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -6155,7 +6155,7 @@ const struct bpf_func_proto bpf_btf_find_by_name_kind_proto = {
+ 	.func		= bpf_btf_find_by_name_kind,
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+-	.arg1_type	= ARG_PTR_TO_MEM,
++	.arg1_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg2_type	= ARG_CONST_SIZE,
+ 	.arg3_type	= ARG_ANYTHING,
+ 	.arg4_type	= ARG_ANYTHING,
+diff --git a/kernel/bpf/cgroup.c b/kernel/bpf/cgroup.c
+index f0f35eacbbdb..ea4d231a1ef2 100644
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@ -1738,7 +1738,7 @@ static const struct bpf_func_proto bpf_sysctl_set_new_value_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ };
+ 
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index e4217825e297..7fefadb527f5 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -533,7 +533,7 @@ const struct bpf_func_proto bpf_strtol_proto = {
+ 	.func		= bpf_strtol,
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+-	.arg1_type	= ARG_PTR_TO_MEM,
++	.arg1_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg2_type	= ARG_CONST_SIZE,
+ 	.arg3_type	= ARG_ANYTHING,
+ 	.arg4_type	= ARG_PTR_TO_LONG,
+@@ -561,7 +561,7 @@ const struct bpf_func_proto bpf_strtoul_proto = {
+ 	.func		= bpf_strtoul,
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+-	.arg1_type	= ARG_PTR_TO_MEM,
++	.arg1_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg2_type	= ARG_CONST_SIZE,
+ 	.arg3_type	= ARG_ANYTHING,
+ 	.arg4_type	= ARG_PTR_TO_LONG,
+@@ -633,7 +633,7 @@ const struct bpf_func_proto bpf_event_output_data_proto =  {
+ 	.arg1_type      = ARG_PTR_TO_CTX,
+ 	.arg2_type      = ARG_CONST_MAP_PTR,
+ 	.arg3_type      = ARG_ANYTHING,
+-	.arg4_type      = ARG_PTR_TO_MEM,
++	.arg4_type      = ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg5_type      = ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
+@@ -1002,7 +1002,7 @@ const struct bpf_func_proto bpf_snprintf_proto = {
+ 	.arg1_type	= ARG_PTR_TO_MEM_OR_NULL,
+ 	.arg2_type	= ARG_CONST_SIZE_OR_ZERO,
+ 	.arg3_type	= ARG_PTR_TO_CONST_STR,
+-	.arg4_type	= ARG_PTR_TO_MEM_OR_NULL,
++	.arg4_type	= ARG_PTR_TO_MEM | PTR_MAYBE_NULL | MEM_RDONLY,
+ 	.arg5_type	= ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
+diff --git a/kernel/bpf/ringbuf.c b/kernel/bpf/ringbuf.c
+index 9e0c10c6892a..638d7fd7b375 100644
+--- a/kernel/bpf/ringbuf.c
++++ b/kernel/bpf/ringbuf.c
+@@ -444,7 +444,7 @@ const struct bpf_func_proto bpf_ringbuf_output_proto = {
+ 	.func		= bpf_ringbuf_output,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_CONST_MAP_PTR,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE_OR_ZERO,
+ 	.arg4_type	= ARG_ANYTHING,
+ };
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 566aa4b2e25c..bcb1bfb2cabc 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -4632,7 +4632,7 @@ static const struct bpf_func_proto bpf_sys_bpf_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_ANYTHING,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ };
+ 
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path kernel/trace/bpf_trace.c
+* Unmerged path net/core/filter.c
