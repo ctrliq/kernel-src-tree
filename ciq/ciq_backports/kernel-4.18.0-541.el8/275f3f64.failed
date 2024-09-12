@@ -1,0 +1,202 @@
+Bluetooth: Fix not checking MGMT cmd pending queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-541.el8
+commit-author Brian Gix <brian.gix@intel.com>
+commit 275f3f64870245b06188f24bdf917e55a813d294
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-541.el8/275f3f64.failed
+
+A number of places in the MGMT handlers we examine the command queue for
+other commands (in progress but not yet complete) that will interact
+with the process being performed. However, not all commands go into the
+queue if one of:
+
+1. There is no negative side effect of consecutive or redundent commands
+2. The command is entirely perform "inline".
+
+This change examines each "pending command" check, and if it is not
+needed, deletes the check. Of the remaining pending command checks, we
+make sure that the command is in the pending queue by using the
+mgmt_pending_add/mgmt_pending_remove pair rather than the
+mgmt_pending_new/mgmt_pending_free pair.
+
+Link: https://lore.kernel.org/linux-bluetooth/f648f2e11bb3c2974c32e605a85ac3a9fac944f1.camel@redhat.com/T/
+	Tested-by: Maxim Levitsky <mlevitsk@redhat.com>
+	Signed-off-by: Brian Gix <brian.gix@intel.com>
+	Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+(cherry picked from commit 275f3f64870245b06188f24bdf917e55a813d294)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/mgmt.c
+diff --cc net/bluetooth/mgmt.c
+index 20135c1a1973,533cf60673a3..000000000000
+--- a/net/bluetooth/mgmt.c
++++ b/net/bluetooth/mgmt.c
+@@@ -1376,23 -1385,24 +1385,27 @@@ static u8 mgmt_le_support(struct hci_de
+  		return MGMT_STATUS_SUCCESS;
+  }
+  
+ -static void mgmt_set_discoverable_complete(struct hci_dev *hdev, void *data,
+ -					   int err)
+ +void mgmt_set_discoverable_complete(struct hci_dev *hdev, u8 status)
+  {
+ -	struct mgmt_pending_cmd *cmd = data;
+ +	struct mgmt_pending_cmd *cmd;
+  
+ -	bt_dev_dbg(hdev, "err %d", err);
+ +	bt_dev_dbg(hdev, "status 0x%02x", status);
+  
++ 	/* Make sure cmd still outstanding. */
++ 	if (cmd != pending_find(MGMT_OP_SET_DISCOVERABLE, hdev))
++ 		return;
++ 
+  	hci_dev_lock(hdev);
+  
+ -	if (err) {
+ -		u8 mgmt_err = mgmt_status(err);
+ +	cmd = pending_find(MGMT_OP_SET_DISCOVERABLE, hdev);
+ +	if (!cmd)
+ +		goto unlock;
+ +
+ +	if (status) {
+ +		u8 mgmt_err = mgmt_status(status);
+  		mgmt_cmd_status(cmd->sk, cmd->index, cmd->opcode, mgmt_err);
+  		hci_dev_clear_flag(hdev, HCI_LIMITED_DISCOVERABLE);
+ -		goto done;
+ +		goto remove_cmd;
+  	}
+  
+  	if (hci_dev_test_flag(hdev, HCI_DISCOVERABLE) &&
+@@@ -1404,10 -1414,8 +1417,15 @@@
+  	send_settings_rsp(cmd->sk, MGMT_OP_SET_DISCOVERABLE, hdev);
+  	new_settings(hdev, cmd->sk);
+  
+++<<<<<<< HEAD
+ +remove_cmd:
+ +	mgmt_pending_remove(cmd);
+ +
+ +unlock:
+++=======
++ done:
++ 	mgmt_pending_remove(cmd);
+++>>>>>>> 275f3f648702 (Bluetooth: Fix not checking MGMT cmd pending queue)
+  	hci_dev_unlock(hdev);
+  }
+  
+@@@ -1533,39 -1548,43 +1551,53 @@@ static int set_discoverable(struct soc
+  	else
+  		hci_dev_clear_flag(hdev, HCI_LIMITED_DISCOVERABLE);
+  
+ -	err = hci_cmd_sync_queue(hdev, set_discoverable_sync, cmd,
+ -				 mgmt_set_discoverable_complete);
+ +	queue_work(hdev->req_workqueue, &hdev->discoverable_update);
+ +	err = 0;
+  
++ 	if (err < 0)
++ 		mgmt_pending_remove(cmd);
++ 
+  failed:
+  	hci_dev_unlock(hdev);
+  	return err;
+  }
+  
+ -static void mgmt_set_connectable_complete(struct hci_dev *hdev, void *data,
+ -					  int err)
+ +void mgmt_set_connectable_complete(struct hci_dev *hdev, u8 status)
+  {
+ -	struct mgmt_pending_cmd *cmd = data;
+ +	struct mgmt_pending_cmd *cmd;
+  
+ -	bt_dev_dbg(hdev, "err %d", err);
+ +	bt_dev_dbg(hdev, "status 0x%02x", status);
+  
++ 	/* Make sure cmd still outstanding. */
++ 	if (cmd != pending_find(MGMT_OP_SET_CONNECTABLE, hdev))
++ 		return;
++ 
+  	hci_dev_lock(hdev);
+  
+ -	if (err) {
+ -		u8 mgmt_err = mgmt_status(err);
+ +	cmd = pending_find(MGMT_OP_SET_CONNECTABLE, hdev);
+ +	if (!cmd)
+ +		goto unlock;
+ +
+ +	if (status) {
+ +		u8 mgmt_err = mgmt_status(status);
+  		mgmt_cmd_status(cmd->sk, cmd->index, cmd->opcode, mgmt_err);
+ -		goto done;
+ +		goto remove_cmd;
+  	}
+  
+  	send_settings_rsp(cmd->sk, MGMT_OP_SET_CONNECTABLE, hdev);
+  	new_settings(hdev, cmd->sk);
+  
+++<<<<<<< HEAD
+ +remove_cmd:
+ +	mgmt_pending_remove(cmd);
+ +
+ +unlock:
+++=======
++ done:
++ 	if (cmd)
++ 		mgmt_pending_remove(cmd);
++ 
+++>>>>>>> 275f3f648702 (Bluetooth: Fix not checking MGMT cmd pending queue)
+  	hci_dev_unlock(hdev);
+  }
+  
+@@@ -1647,9 -1673,12 +1679,12 @@@ static int set_connectable(struct sock 
+  		hci_dev_clear_flag(hdev, HCI_CONNECTABLE);
+  	}
+  
+ -	err = hci_cmd_sync_queue(hdev, set_connectable_sync, cmd,
+ -				 mgmt_set_connectable_complete);
+ +	queue_work(hdev->req_workqueue, &hdev->connectable_update);
+ +	err = 0;
+  
++ 	if (err < 0)
++ 		mgmt_pending_remove(cmd);
++ 
+  failed:
+  	hci_dev_unlock(hdev);
+  	return err;
+@@@ -5228,16 -5292,9 +5265,16 @@@ static void start_discovery_complete(st
+  
+  	mgmt_cmd_complete(cmd->sk, cmd->index, cmd->opcode, mgmt_status(err),
+  			  cmd->param, 1);
+- 	mgmt_pending_free(cmd);
++ 	mgmt_pending_remove(cmd);
+  
+ -	hci_discovery_set_state(hdev, err ? DISCOVERY_STOPPED:
+ +	/* Handle suspend notifier */
+ +	if (test_and_clear_bit(SUSPEND_UNPAUSE_DISCOVERY,
+ +			       hdev->suspend_tasks)) {
+ +		bt_dev_dbg(hdev, "Unpaused discovery");
+ +		wake_up(&hdev->suspend_wait_q);
+ +	}
+ +
+ +	hci_discovery_set_state(hdev, err ? DISCOVERY_STOPPED :
+  				DISCOVERY_FINDING);
+  }
+  
+@@@ -5475,14 -5529,8 +5515,14 @@@ static void stop_discovery_complete(str
+  
+  	mgmt_cmd_complete(cmd->sk, cmd->index, cmd->opcode, mgmt_status(err),
+  			  cmd->param, 1);
+- 	mgmt_pending_free(cmd);
++ 	mgmt_pending_remove(cmd);
+  
+ +	/* Handle suspend notifier */
+ +	if (test_and_clear_bit(SUSPEND_PAUSE_DISCOVERY, hdev->suspend_tasks)) {
+ +		bt_dev_dbg(hdev, "Paused discovery");
+ +		wake_up(&hdev->suspend_wait_q);
+ +	}
+ +
+  	if (!err)
+  		hci_discovery_set_state(hdev, DISCOVERY_STOPPED);
+  }
+* Unmerged path net/bluetooth/mgmt.c
