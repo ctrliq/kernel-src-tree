@@ -1,0 +1,180 @@
+mm/hugetlb: take src_mm->write_protect_seq in copy_hugetlb_page_range()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-485.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit 623a1ddfeb232526275ddd0c8378771e6712aad4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-485.el8/623a1ddf.failed
+
+Let's do it just like copy_page_range(), taking the seqlock and making
+sure the mmap_lock is held in write mode.
+
+This allows for add a VM_BUG_ON to page_needs_cow_for_dma() and properly
+synchronizes concurrent fork() with GUP-fast of hugetlb pages, which will
+be relevant for further changes.
+
+Link: https://lkml.kernel.org/r/20220428083441.37290-3-david@redhat.com
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Don Dutile <ddutile@redhat.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Jason Gunthorpe <jgg@nvidia.com>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Khalid Aziz <khalid.aziz@oracle.com>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Liang Zhang <zhangliang5@huawei.com>
+	Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Mike Rapoport <rppt@linux.ibm.com>
+	Cc: Nadav Amit <namit@vmware.com>
+	Cc: Oded Gabbay <oded.gabbay@gmail.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Pedro Demarchi Gomes <pedrodemargomes@gmail.com>
+	Cc: Peter Xu <peterx@redhat.com>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: Yang Shi <shy828301@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 623a1ddfeb232526275ddd0c8378771e6712aad4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm.h
+diff --cc include/linux/mm.h
+index abaf48b06f5b,a02812178562..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -1421,6 -1507,92 +1421,95 @@@ static inline unsigned long page_to_sec
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * folio_pfn - Return the Page Frame Number of a folio.
++  * @folio: The folio.
++  *
++  * A folio may contain multiple pages.  The pages have consecutive
++  * Page Frame Numbers.
++  *
++  * Return: The Page Frame Number of the first page in the folio.
++  */
++ static inline unsigned long folio_pfn(struct folio *folio)
++ {
++ 	return page_to_pfn(&folio->page);
++ }
++ 
++ static inline atomic_t *folio_pincount_ptr(struct folio *folio)
++ {
++ 	return &folio_page(folio, 1)->compound_pincount;
++ }
++ 
++ /**
++  * folio_maybe_dma_pinned - Report if a folio may be pinned for DMA.
++  * @folio: The folio.
++  *
++  * This function checks if a folio has been pinned via a call to
++  * a function in the pin_user_pages() family.
++  *
++  * For small folios, the return value is partially fuzzy: false is not fuzzy,
++  * because it means "definitely not pinned for DMA", but true means "probably
++  * pinned for DMA, but possibly a false positive due to having at least
++  * GUP_PIN_COUNTING_BIAS worth of normal folio references".
++  *
++  * False positives are OK, because: a) it's unlikely for a folio to
++  * get that many refcounts, and b) all the callers of this routine are
++  * expected to be able to deal gracefully with a false positive.
++  *
++  * For large folios, the result will be exactly correct. That's because
++  * we have more tracking data available: the compound_pincount is used
++  * instead of the GUP_PIN_COUNTING_BIAS scheme.
++  *
++  * For more information, please see Documentation/core-api/pin_user_pages.rst.
++  *
++  * Return: True, if it is likely that the page has been "dma-pinned".
++  * False, if the page is definitely not dma-pinned.
++  */
++ static inline bool folio_maybe_dma_pinned(struct folio *folio)
++ {
++ 	if (folio_test_large(folio))
++ 		return atomic_read(folio_pincount_ptr(folio)) > 0;
++ 
++ 	/*
++ 	 * folio_ref_count() is signed. If that refcount overflows, then
++ 	 * folio_ref_count() returns a negative value, and callers will avoid
++ 	 * further incrementing the refcount.
++ 	 *
++ 	 * Here, for that overflow case, use the sign bit to count a little
++ 	 * bit higher via unsigned math, and thus still get an accurate result.
++ 	 */
++ 	return ((unsigned int)folio_ref_count(folio)) >=
++ 		GUP_PIN_COUNTING_BIAS;
++ }
++ 
++ static inline bool page_maybe_dma_pinned(struct page *page)
++ {
++ 	return folio_maybe_dma_pinned(page_folio(page));
++ }
++ 
++ /*
++  * This should most likely only be called during fork() to see whether we
++  * should break the cow immediately for a page on the src mm.
++  *
++  * The caller has to hold the PT lock and the vma->vm_mm->->write_protect_seq.
++  */
++ static inline bool page_needs_cow_for_dma(struct vm_area_struct *vma,
++ 					  struct page *page)
++ {
++ 	if (!is_cow_mapping(vma->vm_flags))
++ 		return false;
++ 
++ 	VM_BUG_ON(!(raw_read_seqcount(&vma->vm_mm->write_protect_seq) & 1));
++ 
++ 	if (!test_bit(MMF_HAS_PINNED, &vma->vm_mm->flags))
++ 		return false;
++ 
++ 	return page_maybe_dma_pinned(page);
++ }
++ 
+++>>>>>>> 623a1ddfeb23 (mm/hugetlb: take src_mm->write_protect_seq in copy_hugetlb_page_range())
+  /* MIGRATE_CMA and ZONE_MOVABLE do not allow pin pages */
+  #ifdef CONFIG_MIGRATION
+  static inline bool is_pinnable_page(struct page *page)
+* Unmerged path include/linux/mm.h
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 8e22626586ab..accc511ba6bb 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -3842,6 +3842,8 @@ int copy_hugetlb_page_range(struct mm_struct *dst, struct mm_struct *src,
+ 					vma->vm_start,
+ 					vma->vm_end);
+ 		mmu_notifier_invalidate_range_start(&range);
++		mmap_assert_write_locked(src);
++		raw_write_seqcount_begin(&src->write_protect_seq);
+ 	} else {
+ 		/*
+ 		 * For shared mappings i_mmap_rwsem must be held to call
+@@ -3971,10 +3973,12 @@ int copy_hugetlb_page_range(struct mm_struct *dst, struct mm_struct *src,
+ 		spin_unlock(dst_ptl);
+ 	}
+ 
+-	if (cow)
++	if (cow) {
++		raw_write_seqcount_end(&src->write_protect_seq);
+ 		mmu_notifier_invalidate_range_end(&range);
+-	else
++	} else {
+ 		i_mmap_unlock_read(mapping);
++	}
+ 
+ 	return ret;
+ }
