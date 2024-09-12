@@ -3437,7 +3437,6 @@ static int __init dm_cache_init(void)
 
 	r = dm_register_target(&cache_target);
 	if (r) {
-		DMERR("cache target registration failed: %d", r);
 		kmem_cache_destroy(migration_cache);
 		return r;
 	}

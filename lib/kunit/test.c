@@ -179,6 +179,9 @@ enum kunit_status kunit_suite_has_succeeded(struct kunit_suite *suite)
 	const struct kunit_case *test_case;
 	enum kunit_status status = KUNIT_SKIPPED;
 
+	if (suite->suite_init_err)
+		return KUNIT_FAILURE;
+
 	kunit_suite_for_each_test_case(suite, test_case) {
 		if (test_case->status == KUNIT_FAILURE)
 			return KUNIT_FAILURE;
@@ -240,7 +243,8 @@ static void kunit_print_string_stream(struct kunit *test,
 	}
 }
 
-static void kunit_fail(struct kunit *test, struct kunit_assert *assert)
+static void kunit_fail(struct kunit *test, const struct kunit_loc *loc,
+		       enum kunit_assert_type type, struct kunit_assert *assert)
 {
 	struct string_stream *stream;
 
@@ -250,12 +254,12 @@ static void kunit_fail(struct kunit *test, struct kunit_assert *assert)
 	if (!stream) {
 		WARN(true,
 		     "Could not allocate stream to print failed assertion in %s:%d\n",
-		     assert->file,
-		     assert->line);
+		     loc->file,
+		     loc->line);
 		return;
 	}
 
-	kunit_base_assert_format(assert, stream);
+	kunit_assert_prologue(loc, type, stream);
 	assert->format(assert, stream);
 
 	kunit_print_string_stream(test, stream);
@@ -276,29 +280,26 @@ static void __noreturn kunit_abort(struct kunit *test)
 	WARN_ONCE(true, "Throw could not abort from test!\n");
 }
 
-void kunit_do_assertion(struct kunit *test,
-			struct kunit_assert *assert,
-			bool pass,
-			const char *fmt, ...)
+void kunit_do_failed_assertion(struct kunit *test,
+			       const struct kunit_loc *loc,
+			       enum kunit_assert_type type,
+			       struct kunit_assert *assert,
+			       const char *fmt, ...)
 {
 	va_list args;
-
-	if (pass)
-		return;
-
 	va_start(args, fmt);
 
 	assert->message.fmt = fmt;
 	assert->message.va = &args;
 
-	kunit_fail(test, assert);
+	kunit_fail(test, loc, type, assert);
 
 	va_end(args);
 
-	if (assert->type == KUNIT_ASSERTION)
+	if (type == KUNIT_ASSERTION)
 		kunit_abort(test);
 }
-EXPORT_SYMBOL_GPL(kunit_do_assertion);
+EXPORT_SYMBOL_GPL(kunit_do_failed_assertion);
 
 void kunit_init_test(struct kunit *test, const char *name, char *log)
 {
@@ -498,6 +499,15 @@ int kunit_run_tests(struct kunit_suite *suite)
 	struct kunit_result_stats suite_stats = { 0 };
 	struct kunit_result_stats total_stats = { 0 };
 
+	if (suite->suite_init) {
+		suite->suite_init_err = suite->suite_init(suite);
+		if (suite->suite_init_err) {
+			kunit_err(suite, KUNIT_SUBTEST_INDENT
+				  "# failed to initialize (%d)", suite->suite_init_err);
+			goto suite_end;
+		}
+	}
+
 	kunit_print_suite_start(suite);
 
 	kunit_suite_for_each_test_case(suite, test_case) {
@@ -551,7 +561,11 @@ int kunit_run_tests(struct kunit_suite *suite)
 		kunit_accumulate_stats(&total_stats, param_stats);
 	}
 
+	if (suite->suite_exit)
+		suite->suite_exit(suite);
+
 	kunit_print_suite_stats(suite, suite_stats, total_stats);
+suite_end:
 	kunit_print_suite_end(suite);
 
 	return 0;
@@ -562,6 +576,7 @@ static void kunit_init_suite(struct kunit_suite *suite)
 {
 	kunit_debugfs_create_suite(suite);
 	suite->status_comment[0] = '\0';
+	suite->suite_init_err = 0;
 }
 
 int __kunit_test_suites_init(struct kunit_suite * const * const suites)

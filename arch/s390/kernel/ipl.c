@@ -221,14 +221,14 @@ IPL_ATTR_SHOW_FN(_prefix, _name, "0.%x.%04x\n",				\
 		 _ipl_blk.ssid, _ipl_blk.devno);			\
 IPL_ATTR_CCW_STORE_FN(_prefix, _name, _ipl_blk);			\
 static struct kobj_attribute sys_##_prefix##_##_name##_attr =		\
-	__ATTR(_name, (S_IRUGO | S_IWUSR),				\
+	__ATTR(_name, 0644,						\
 	       sys_##_prefix##_##_name##_show,				\
 	       sys_##_prefix##_##_name##_store)				\
 
 #define DEFINE_IPL_ATTR_RO(_prefix, _name, _format, _value)		\
 IPL_ATTR_SHOW_FN(_prefix, _name, _format, _value)			\
 static struct kobj_attribute sys_##_prefix##_##_name##_attr =		\
-	__ATTR(_name, S_IRUGO, sys_##_prefix##_##_name##_show, NULL)
+	__ATTR(_name, 0444, sys_##_prefix##_##_name##_show, NULL)
 
 #define DEFINE_IPL_ATTR_RW(_prefix, _name, _fmt_out, _fmt_in, _value)	\
 IPL_ATTR_SHOW_FN(_prefix, _name, _fmt_out, (unsigned long long) _value)	\
@@ -243,7 +243,7 @@ static ssize_t sys_##_prefix##_##_name##_store(struct kobject *kobj,	\
 	return len;							\
 }									\
 static struct kobj_attribute sys_##_prefix##_##_name##_attr =		\
-	__ATTR(_name,(S_IRUGO | S_IWUSR),				\
+	__ATTR(_name, 0644,						\
 			sys_##_prefix##_##_name##_show,			\
 			sys_##_prefix##_##_name##_store)
 
@@ -258,7 +258,7 @@ static ssize_t sys_##_prefix##_##_name##_store(struct kobject *kobj,	\
 	return len;							\
 }									\
 static struct kobj_attribute sys_##_prefix##_##_name##_attr =		\
-	__ATTR(_name,(S_IRUGO | S_IWUSR),				\
+	__ATTR(_name, 0644,						\
 			sys_##_prefix##_##_name##_show,			\
 			sys_##_prefix##_##_name##_store)
 
@@ -330,7 +330,7 @@ static ssize_t ipl_vm_parm_show(struct kobject *kobj,
 }
 
 static struct kobj_attribute sys_ipl_vm_parm_attr =
-	__ATTR(parm, S_IRUGO, ipl_vm_parm_show, NULL);
+	__ATTR(parm, 0444, ipl_vm_parm_show, NULL);
 
 static ssize_t sys_ipl_device_show(struct kobject *kobj,
 				   struct kobj_attribute *attr, char *page)
@@ -354,7 +354,7 @@ static ssize_t sys_ipl_device_show(struct kobject *kobj,
 }
 
 static struct kobj_attribute sys_ipl_device_attr =
-	__ATTR(device, S_IRUGO, sys_ipl_device_show, NULL);
+	__ATTR(device, 0444, sys_ipl_device_show, NULL);
 
 static ssize_t ipl_parameter_read(struct file *filp, struct kobject *kobj,
 				  struct bin_attribute *attr, char *buf,
@@ -364,7 +364,7 @@ static ssize_t ipl_parameter_read(struct file *filp, struct kobject *kobj,
 				       ipl_block.hdr.len);
 }
 static struct bin_attribute ipl_parameter_attr =
-	__BIN_ATTR(binary_parameter, S_IRUGO, ipl_parameter_read, NULL,
+	__BIN_ATTR(binary_parameter, 0444, ipl_parameter_read, NULL,
 		   PAGE_SIZE);
 
 static ssize_t ipl_scp_data_read(struct file *filp, struct kobject *kobj,
@@ -398,13 +398,13 @@ static ssize_t ipl_eckd_scp_data_read(struct file *filp, struct kobject *kobj,
 }
 
 static struct bin_attribute ipl_scp_data_attr =
-	__BIN_ATTR(scp_data, S_IRUGO, ipl_scp_data_read, NULL, PAGE_SIZE);
+	__BIN_ATTR(scp_data, 0444, ipl_scp_data_read, NULL, PAGE_SIZE);
 
 static struct bin_attribute ipl_nvme_scp_data_attr =
-	__BIN_ATTR(scp_data, S_IRUGO, ipl_nvme_scp_data_read, NULL, PAGE_SIZE);
+	__BIN_ATTR(scp_data, 0444, ipl_nvme_scp_data_read, NULL, PAGE_SIZE);
 
 static struct bin_attribute ipl_eckd_scp_data_attr =
-	__BIN_ATTR(scp_data, S_IRUGO, ipl_eckd_scp_data_read, NULL, PAGE_SIZE);
+	__BIN_ATTR(scp_data, 0444, ipl_eckd_scp_data_read, NULL, PAGE_SIZE);
 
 static struct bin_attribute *ipl_fcp_bin_attrs[] = {
 	&ipl_parameter_attr,
@@ -515,17 +515,13 @@ err:									\
 
 IPL_ATTR_BR_CHR_SHOW_FN(ipl, ipl_block.eckd);
 static struct kobj_attribute sys_ipl_eckd_br_chr_attr =
-	__ATTR(br_chr, (S_IRUGO | S_IWUSR),
-	       eckd_ipl_br_chr_show,
-	       NULL);
+	__ATTR(br_chr, 0644, eckd_ipl_br_chr_show, NULL);
 
 IPL_ATTR_BR_CHR_SHOW_FN(reipl, reipl_block_eckd->eckd);
 IPL_ATTR_BR_CHR_STORE_FN(reipl, reipl_block_eckd->eckd);
 
 static struct kobj_attribute sys_reipl_eckd_br_chr_attr =
-	__ATTR(br_chr, (S_IRUGO | S_IWUSR),
-	       eckd_reipl_br_chr_show,
-	       eckd_reipl_br_chr_store);
+	__ATTR(br_chr, 0644, eckd_reipl_br_chr_show, eckd_reipl_br_chr_store);
 
 static ssize_t ipl_ccw_loadparm_show(struct kobject *kobj,
 				     struct kobj_attribute *attr, char *page)
@@ -582,6 +578,7 @@ static struct attribute *ipl_eckd_attrs[] = {
 	&sys_ipl_type_attr.attr,
 	&sys_ipl_eckd_bootprog_attr.attr,
 	&sys_ipl_eckd_br_chr_attr.attr,
+	&sys_ipl_ccw_loadparm_attr.attr,
 	&sys_ipl_device_attr.attr,
 	&sys_ipl_secure_attr.attr,
 	&sys_ipl_has_secure_attr.attr,
@@ -768,11 +765,11 @@ static ssize_t reipl_ccw_vmparm_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute sys_reipl_nss_vmparm_attr =
-	__ATTR(parm, S_IRUGO | S_IWUSR, reipl_nss_vmparm_show,
-					reipl_nss_vmparm_store);
+	__ATTR(parm, 0644, reipl_nss_vmparm_show,
+	       reipl_nss_vmparm_store);
 static struct kobj_attribute sys_reipl_ccw_vmparm_attr =
-	__ATTR(parm, S_IRUGO | S_IWUSR, reipl_ccw_vmparm_show,
-					reipl_ccw_vmparm_store);
+	__ATTR(parm, 0644, reipl_ccw_vmparm_show,
+	       reipl_ccw_vmparm_store);
 
 /* FCP reipl device attributes */
 
@@ -812,7 +809,7 @@ static ssize_t reipl_fcp_scpdata_write(struct file *filp, struct kobject *kobj,
 	return count;
 }
 static struct bin_attribute sys_reipl_fcp_scp_data_attr =
-	__BIN_ATTR(scp_data, (S_IRUGO | S_IWUSR), reipl_fcp_scpdata_read,
+	__BIN_ATTR(scp_data, 0644, reipl_fcp_scpdata_read,
 		   reipl_fcp_scpdata_write, DIAG308_SCPDATA_SIZE);
 
 static struct bin_attribute *reipl_fcp_bin_attrs[] = {
@@ -877,23 +874,27 @@ static ssize_t reipl_generic_loadparm_store(struct ipl_parameter_block *ipb,
 	return len;
 }
 
-/* FCP wrapper */
-static ssize_t reipl_fcp_loadparm_show(struct kobject *kobj,
-				       struct kobj_attribute *attr, char *page)
-{
-	return reipl_generic_loadparm_show(reipl_block_fcp, page);
-}
+#define DEFINE_GENERIC_LOADPARM(name)							\
+static ssize_t reipl_##name##_loadparm_show(struct kobject *kobj,			\
+					    struct kobj_attribute *attr, char *page)	\
+{											\
+	return reipl_generic_loadparm_show(reipl_block_##name, page);			\
+}											\
+static ssize_t reipl_##name##_loadparm_store(struct kobject *kobj,			\
+					     struct kobj_attribute *attr,		\
+					     const char *buf, size_t len)		\
+{											\
+	return reipl_generic_loadparm_store(reipl_block_##name, buf, len);		\
+}											\
+static struct kobj_attribute sys_reipl_##name##_loadparm_attr =				\
+	__ATTR(loadparm, 0644, reipl_##name##_loadparm_show,				\
+	       reipl_##name##_loadparm_store)
 
-static ssize_t reipl_fcp_loadparm_store(struct kobject *kobj,
-					struct kobj_attribute *attr,
-					const char *buf, size_t len)
-{
-	return reipl_generic_loadparm_store(reipl_block_fcp, buf, len);
-}
-
-static struct kobj_attribute sys_reipl_fcp_loadparm_attr =
-	__ATTR(loadparm, S_IRUGO | S_IWUSR, reipl_fcp_loadparm_show,
-					    reipl_fcp_loadparm_store);
+DEFINE_GENERIC_LOADPARM(fcp);
+DEFINE_GENERIC_LOADPARM(nvme);
+DEFINE_GENERIC_LOADPARM(ccw);
+DEFINE_GENERIC_LOADPARM(nss);
+DEFINE_GENERIC_LOADPARM(eckd);
 
 static ssize_t reipl_fcp_clear_show(struct kobject *kobj,
 				    struct kobj_attribute *attr, char *page)
@@ -966,7 +967,7 @@ static ssize_t reipl_nvme_scpdata_write(struct file *filp, struct kobject *kobj,
 }
 
 static struct bin_attribute sys_reipl_nvme_scp_data_attr =
-	__BIN_ATTR(scp_data, (S_IRUGO | S_IWUSR), reipl_nvme_scpdata_read,
+	__BIN_ATTR(scp_data, 0644, reipl_nvme_scpdata_read,
 		   reipl_nvme_scpdata_write, DIAG308_SCPDATA_SIZE);
 
 static struct bin_attribute *reipl_nvme_bin_attrs[] = {
@@ -982,24 +983,6 @@ DEFINE_IPL_ATTR_RW(reipl_nvme, bootprog, "%lld\n", "%lld\n",
 		   reipl_block_nvme->nvme.bootprog);
 DEFINE_IPL_ATTR_RW(reipl_nvme, br_lba, "%lld\n", "%lld\n",
 		   reipl_block_nvme->nvme.br_lba);
-
-/* nvme wrapper */
-static ssize_t reipl_nvme_loadparm_show(struct kobject *kobj,
-				       struct kobj_attribute *attr, char *page)
-{
-	return reipl_generic_loadparm_show(reipl_block_nvme, page);
-}
-
-static ssize_t reipl_nvme_loadparm_store(struct kobject *kobj,
-					struct kobj_attribute *attr,
-					const char *buf, size_t len)
-{
-	return reipl_generic_loadparm_store(reipl_block_nvme, buf, len);
-}
-
-static struct kobj_attribute sys_reipl_nvme_loadparm_attr =
-	__ATTR(loadparm, S_IRUGO | S_IWUSR, reipl_nvme_loadparm_show,
-					    reipl_nvme_loadparm_store);
 
 static struct attribute *reipl_nvme_attrs[] = {
 	&sys_reipl_nvme_fid_attr.attr,
@@ -1035,38 +1018,6 @@ static struct kobj_attribute sys_reipl_nvme_clear_attr =
 
 /* CCW reipl device attributes */
 DEFINE_IPL_CCW_ATTR_RW(reipl_ccw, device, reipl_block_ccw->ccw);
-
-/* NSS wrapper */
-static ssize_t reipl_nss_loadparm_show(struct kobject *kobj,
-				       struct kobj_attribute *attr, char *page)
-{
-	return reipl_generic_loadparm_show(reipl_block_nss, page);
-}
-
-static ssize_t reipl_nss_loadparm_store(struct kobject *kobj,
-					struct kobj_attribute *attr,
-					const char *buf, size_t len)
-{
-	return reipl_generic_loadparm_store(reipl_block_nss, buf, len);
-}
-
-/* CCW wrapper */
-static ssize_t reipl_ccw_loadparm_show(struct kobject *kobj,
-				       struct kobj_attribute *attr, char *page)
-{
-	return reipl_generic_loadparm_show(reipl_block_ccw, page);
-}
-
-static ssize_t reipl_ccw_loadparm_store(struct kobject *kobj,
-					struct kobj_attribute *attr,
-					const char *buf, size_t len)
-{
-	return reipl_generic_loadparm_store(reipl_block_ccw, buf, len);
-}
-
-static struct kobj_attribute sys_reipl_ccw_loadparm_attr =
-	__ATTR(loadparm, S_IRUGO | S_IWUSR, reipl_ccw_loadparm_show,
-					    reipl_ccw_loadparm_store);
 
 static ssize_t reipl_ccw_clear_show(struct kobject *kobj,
 				    struct kobj_attribute *attr, char *page)
@@ -1149,7 +1100,7 @@ static ssize_t reipl_eckd_scpdata_write(struct file *filp, struct kobject *kobj,
 }
 
 static struct bin_attribute sys_reipl_eckd_scp_data_attr =
-	__BIN_ATTR(scp_data, (S_IRUGO | S_IWUSR), reipl_eckd_scpdata_read,
+	__BIN_ATTR(scp_data, 0644, reipl_eckd_scpdata_read,
 		   reipl_eckd_scpdata_write, DIAG308_SCPDATA_SIZE);
 
 static struct bin_attribute *reipl_eckd_bin_attrs[] = {
@@ -1165,6 +1116,7 @@ static struct attribute *reipl_eckd_attrs[] = {
 	&sys_reipl_eckd_device_attr.attr,
 	&sys_reipl_eckd_bootprog_attr.attr,
 	&sys_reipl_eckd_br_chr_attr.attr,
+	&sys_reipl_eckd_loadparm_attr.attr,
 	NULL,
 };
 
@@ -1237,12 +1189,8 @@ static ssize_t reipl_nss_name_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute sys_reipl_nss_name_attr =
-	__ATTR(name, S_IRUGO | S_IWUSR, reipl_nss_name_show,
-					reipl_nss_name_store);
-
-static struct kobj_attribute sys_reipl_nss_loadparm_attr =
-	__ATTR(loadparm, S_IRUGO | S_IWUSR, reipl_nss_loadparm_show,
-					    reipl_nss_loadparm_store);
+	__ATTR(name, 0644, reipl_nss_name_show,
+	       reipl_nss_name_store);
 
 static struct attribute *reipl_nss_attrs[] = {
 	&sys_reipl_nss_name_attr.attr,

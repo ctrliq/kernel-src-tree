@@ -43,7 +43,7 @@ static char *chap_get_digest_name(const int digest_type)
 }
 
 static int chap_gen_challenge(
-	struct iscsi_conn *conn,
+	struct iscsit_conn *conn,
 	int caller,
 	char *c_str,
 	unsigned int *c_len)
@@ -136,14 +136,14 @@ out:
 	return r;
 }
 
-static void chap_close(struct iscsi_conn *conn)
+static void chap_close(struct iscsit_conn *conn)
 {
 	kfree(conn->auth_protocol);
 	conn->auth_protocol = NULL;
 }
 
 static struct iscsi_chap *chap_server_open(
-	struct iscsi_conn *conn,
+	struct iscsit_conn *conn,
 	struct iscsi_node_auth *auth,
 	const char *a_str,
 	char *aic_str,
@@ -246,7 +246,7 @@ static int chap_base64_decode(u8 *dst, const char *src, size_t len)
 }
 
 static int chap_server_compute_hash(
-	struct iscsi_conn *conn,
+	struct iscsit_conn *conn,
 	struct iscsi_node_auth *auth,
 	char *nr_in_ptr,
 	char *nr_out_ptr,
@@ -578,7 +578,7 @@ out:
 }
 
 u32 chap_main_loop(
-	struct iscsi_conn *conn,
+	struct iscsit_conn *conn,
 	struct iscsi_node_auth *auth,
 	char *in_text,
 	char *out_text,

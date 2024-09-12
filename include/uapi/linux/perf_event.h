@@ -1367,8 +1367,12 @@ struct perf_branch_entry {
 		abort:1,    /* transaction abort */
 		cycles:16,  /* cycle count to last branch */
 		type:4,     /* branch type */
+#ifndef __GENKSYMS__
 		spec:2,     /* branch speculation info */
 		reserved:38;
+#else
+		reserved:40;
+#endif /* __GENKSYMS__ */
 };
 
 #ifndef __GENKSYMS__

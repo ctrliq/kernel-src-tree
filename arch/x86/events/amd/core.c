@@ -329,7 +329,7 @@ static inline bool amd_is_pair_event_code(struct hw_perf_event *hwc)
 	}
 }
 
-DEFINE_STATIC_CALL_RET0(amd_pmu_branch_hw_config, *x86_pmu.hw_config);
+DEFINE_STATIC_CALL_NULL(amd_pmu_branch_hw_config, *x86_pmu.hw_config);
 
 static int amd_core_hw_config(struct perf_event *event)
 {
@@ -525,7 +525,7 @@ DEFINE_STATIC_CALL_NULL(amd_pmu_branch_reset, amd_pmu_branch_reset_t);
 static void amd_pmu_cpu_reset(int cpu)
 {
 	if (x86_pmu.lbr_nr)
-		static_call(amd_pmu_branch_reset)();
+		static_call_cond(amd_pmu_branch_reset)();
 
 	if (x86_pmu.version < 2)
 		return;
@@ -541,16 +541,24 @@ static int amd_pmu_cpu_prepare(int cpu)
 {
 	struct cpu_hw_events *cpuc = &per_cpu(cpu_hw_events, cpu);
 
+	cpuc->lbr_sel = kzalloc_node(sizeof(struct er_account), GFP_KERNEL,
+				     cpu_to_node(cpu));
+	if (!cpuc->lbr_sel)
+		return -ENOMEM;
+
 	WARN_ON_ONCE(cpuc->amd_nb);
 
 	if (!x86_pmu.amd_nb_constraints)
 		return 0;
 
 	cpuc->amd_nb = amd_alloc_nb(cpu);
-	if (!cpuc->amd_nb)
-		return -ENOMEM;
+	if (cpuc->amd_nb)
+		return 0;
 
-	return 0;
+	kfree(cpuc->lbr_sel);
+	cpuc->lbr_sel = NULL;
+
+	return -ENOMEM;
 }
 
 static void amd_pmu_cpu_starting(int cpu)
@@ -588,12 +596,13 @@ static void amd_pmu_cpu_starting(int cpu)
 
 static void amd_pmu_cpu_dead(int cpu)
 {
-	struct cpu_hw_events *cpuhw;
+	struct cpu_hw_events *cpuhw = &per_cpu(cpu_hw_events, cpu);
+
+	kfree(cpuhw->lbr_sel);
+	cpuhw->lbr_sel = NULL;
 
 	if (!x86_pmu.amd_nb_constraints)
 		return;
-
-	cpuhw = &per_cpu(cpu_hw_events, cpu);
 
 	if (cpuhw->amd_nb) {
 		struct amd_nb *nb = cpuhw->amd_nb;
@@ -619,7 +628,7 @@ static inline u64 amd_pmu_get_global_status(void)
 	/* PerfCntrGlobalStatus is read-only */
 	rdmsrl(MSR_AMD64_PERF_CNTR_GLOBAL_STATUS, status);
 
-	return status & amd_pmu_global_cntr_mask;
+	return status;
 }
 
 static inline void amd_pmu_ack_global_status(u64 status)
@@ -630,8 +639,6 @@ static inline void amd_pmu_ack_global_status(u64 status)
 	 * clears the same bit in PerfCntrGlobalStatus
 	 */
 
-	/* Only allow modifications to PerfCntrGlobalStatus.PerfCntrOvfl */
-	status &= amd_pmu_global_cntr_mask;
 	wrmsrl(MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_CLR, status);
 }
 
@@ -741,9 +748,15 @@ static void amd_pmu_v2_enable_event(struct perf_event *event)
 	__x86_pmu_enable_event(hwc, ARCH_PERFMON_EVENTSEL_ENABLE);
 }
 
-static void amd_pmu_v2_enable_all(int added)
+static __always_inline void amd_pmu_core_enable_all(void)
 {
 	amd_pmu_set_global_ctl(amd_pmu_global_cntr_mask);
+}
+
+static void amd_pmu_v2_enable_all(int added)
+{
+	amd_pmu_lbr_enable_all();
+	amd_pmu_core_enable_all();
 }
 
 static void amd_pmu_disable_event(struct perf_event *event)
@@ -770,10 +783,15 @@ static void amd_pmu_disable_all(void)
 	amd_pmu_check_overflow();
 }
 
+static __always_inline void amd_pmu_core_disable_all(void)
+{
+	amd_pmu_set_global_ctl(0);
+}
+
 static void amd_pmu_v2_disable_all(void)
 {
-	/* Disable all PMCs */
-	amd_pmu_set_global_ctl(0);
+	amd_pmu_core_disable_all();
+	amd_pmu_lbr_disable_all();
 	amd_pmu_check_overflow();
 }
 
@@ -782,7 +800,7 @@ DEFINE_STATIC_CALL_NULL(amd_pmu_branch_add, *x86_pmu.add);
 static void amd_pmu_add_event(struct perf_event *event)
 {
 	if (needs_branch_stack(event))
-		static_call(amd_pmu_branch_add)(event);
+		static_call_cond(amd_pmu_branch_add)(event);
 }
 
 DEFINE_STATIC_CALL_NULL(amd_pmu_branch_del, *x86_pmu.del);
@@ -790,7 +808,7 @@ DEFINE_STATIC_CALL_NULL(amd_pmu_branch_del, *x86_pmu.del);
 static void amd_pmu_del_event(struct perf_event *event)
 {
 	if (needs_branch_stack(event))
-		static_call(amd_pmu_branch_del)(event);
+		static_call_cond(amd_pmu_branch_del)(event);
 }
 
 /*
@@ -875,14 +893,20 @@ static int amd_pmu_v2_handle_irq(struct pt_regs *regs)
 	pmu_enabled = cpuc->enabled;
 	cpuc->enabled = 0;
 
-	/* Stop counting */
-	amd_pmu_v2_disable_all();
+	/* Stop counting but do not disable LBR */
+	amd_pmu_core_disable_all();
 
 	status = amd_pmu_get_global_status();
 
 	/* Check if any overflows are pending */
 	if (!status)
 		goto done;
+
+	/* Read branch records before unfreezing */
+	if (status & GLOBAL_STATUS_LBRS_FROZEN) {
+		amd_pmu_lbr_read();
+		status &= ~GLOBAL_STATUS_LBRS_FROZEN;
+	}
 
 	for (idx = 0; idx < x86_pmu.num_counters; idx++) {
 		if (!test_bit(idx, cpuc->active_mask))
@@ -903,6 +927,9 @@ static int amd_pmu_v2_handle_irq(struct pt_regs *regs)
 		if (!x86_perf_event_set_period(event))
 			continue;
 
+		if (has_branch_stack(event))
+			data.br_stack = &cpuc->lbr_stack;
+
 		if (perf_event_overflow(event, &data, regs))
 			x86_pmu_stop(event, 0);
 
@@ -916,7 +943,7 @@ static int amd_pmu_v2_handle_irq(struct pt_regs *regs)
 	 */
 	WARN_ON(status > 0);
 
-	/* Clear overflow bits */
+	/* Clear overflow and freeze bits */
 	amd_pmu_ack_global_status(~status);
 
 	/*
@@ -930,7 +957,7 @@ done:
 
 	/* Resume counting only if PMU is active */
 	if (pmu_enabled)
-		amd_pmu_v2_enable_all(0);
+		amd_pmu_core_enable_all();
 
 	return amd_pmu_adjust_nmi_window(handled);
 }
@@ -1299,6 +1326,11 @@ static const struct attribute_group *amd_attr_update[] = {
 	NULL,
 };
 
+int amd_null_hw_config(struct perf_event *event)
+{
+	return 0;
+}
+
 static int __init amd_core_pmu_init(void)
 {
 	union cpuid_0x80000022_ebx ebx;
@@ -1372,10 +1404,18 @@ static int __init amd_core_pmu_init(void)
 		x86_pmu.flags |= PMU_FL_PAIR;
 	}
 
-	/*
-	 * BRS requires special event constraints and flushing on ctxsw.
-	 */
-	if (boot_cpu_data.x86 >= 0x19 && !amd_brs_init()) {
+	/* LBR and BRS are mutually exclusive features */
+	if (!amd_pmu_lbr_init()) {
+		/* LBR requires flushing on context switch */
+		x86_pmu.sched_task = amd_pmu_lbr_sched_task;
+		static_call_update(amd_pmu_branch_hw_config, amd_pmu_lbr_hw_config);
+		static_call_update(amd_pmu_branch_reset, amd_pmu_lbr_reset);
+		static_call_update(amd_pmu_branch_add, amd_pmu_lbr_add);
+		static_call_update(amd_pmu_branch_del, amd_pmu_lbr_del);
+	} else if (!amd_brs_init()) {
+		/*
+		 * BRS requires special event constraints and flushing on ctxsw.
+		 */
 		x86_pmu.get_event_constraints = amd_get_event_constraints_f19h;
 		x86_pmu.sched_task = amd_pmu_brs_sched_task;
 		x86_pmu.limit_period = amd_pmu_limit_period;
@@ -1391,6 +1431,9 @@ static int __init amd_core_pmu_init(void)
 
 		/* branch sampling must be stopped when entering low power */
 		amd_brs_lopwr_init();
+	} else {
+		/* make sure amd_pmu_branch_hw_config never points to NULL */
+		static_call_update(amd_pmu_branch_hw_config, amd_null_hw_config);
 	}
 
 	x86_pmu.attr_update = amd_attr_update;

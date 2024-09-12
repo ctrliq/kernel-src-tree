@@ -100,8 +100,7 @@ struct ftdi_private {
 #endif
 };
 
-/* struct ftdi_sio_quirk is used by devices requiring special attention. */
-struct ftdi_sio_quirk {
+struct ftdi_quirk {
 	int (*probe)(struct usb_serial *);
 	/* Special settings for probed ports. */
 	void (*port_probe)(struct ftdi_private *);
@@ -114,27 +113,27 @@ static int   ftdi_8u2232c_probe(struct usb_serial *serial);
 static void  ftdi_USB_UIRT_setup(struct ftdi_private *priv);
 static void  ftdi_HE_TIRA1_setup(struct ftdi_private *priv);
 
-static const struct ftdi_sio_quirk ftdi_jtag_quirk = {
+static const struct ftdi_quirk ftdi_jtag_quirk = {
 	.probe	= ftdi_jtag_probe,
 };
 
-static const struct ftdi_sio_quirk ftdi_NDI_device_quirk = {
+static const struct ftdi_quirk ftdi_NDI_device_quirk = {
 	.probe	= ftdi_NDI_device_setup,
 };
 
-static const struct ftdi_sio_quirk ftdi_USB_UIRT_quirk = {
+static const struct ftdi_quirk ftdi_USB_UIRT_quirk = {
 	.port_probe = ftdi_USB_UIRT_setup,
 };
 
-static const struct ftdi_sio_quirk ftdi_HE_TIRA1_quirk = {
+static const struct ftdi_quirk ftdi_HE_TIRA1_quirk = {
 	.port_probe = ftdi_HE_TIRA1_setup,
 };
 
-static const struct ftdi_sio_quirk ftdi_stmclite_quirk = {
+static const struct ftdi_quirk ftdi_stmclite_quirk = {
 	.probe	= ftdi_stmclite_probe,
 };
 
-static const struct ftdi_sio_quirk ftdi_8u2232c_quirk = {
+static const struct ftdi_quirk ftdi_8u2232c_quirk = {
 	.probe	= ftdi_8u2232c_probe,
 };
 
@@ -1105,76 +1104,10 @@ static const char *ftdi_chip_name[] = {
 #define FTDI_STATUS_B1_MASK	(FTDI_RS_BI)
 /* End TIOCMIWAIT */
 
-/* function prototypes for a FTDI serial converter */
-static int  ftdi_sio_probe(struct usb_serial *serial,
-					const struct usb_device_id *id);
-static int  ftdi_sio_port_probe(struct usb_serial_port *port);
-static int  ftdi_sio_port_remove(struct usb_serial_port *port);
-static int  ftdi_open(struct tty_struct *tty, struct usb_serial_port *port);
-static void ftdi_dtr_rts(struct usb_serial_port *port, int on);
-static void ftdi_process_read_urb(struct urb *urb);
-static int ftdi_prepare_write_buffer(struct usb_serial_port *port,
-						void *dest, size_t size);
 static void ftdi_set_termios(struct tty_struct *tty,
 			struct usb_serial_port *port, struct ktermios *old);
-static int  ftdi_tiocmget(struct tty_struct *tty);
-static int  ftdi_tiocmset(struct tty_struct *tty,
-			unsigned int set, unsigned int clear);
-static int  ftdi_ioctl(struct tty_struct *tty,
-			unsigned int cmd, unsigned long arg);
-static void get_serial_info(struct tty_struct *tty, struct serial_struct *ss);
-static int set_serial_info(struct tty_struct *tty,
-				struct serial_struct *ss);
-static void ftdi_break_ctl(struct tty_struct *tty, int break_state);
-static bool ftdi_tx_empty(struct usb_serial_port *port);
 static int ftdi_get_modem_status(struct usb_serial_port *port,
 						unsigned char status[2]);
-
-static unsigned short int ftdi_232am_baud_base_to_divisor(int baud, int base);
-static unsigned short int ftdi_232am_baud_to_divisor(int baud);
-static u32 ftdi_232bm_baud_base_to_divisor(int baud, int base);
-static u32 ftdi_232bm_baud_to_divisor(int baud);
-static u32 ftdi_2232h_baud_base_to_divisor(int baud, int base);
-static u32 ftdi_2232h_baud_to_divisor(int baud);
-
-static const struct attribute_group *ftdi_groups[];
-
-static struct usb_serial_driver ftdi_sio_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"ftdi_sio",
-		.dev_groups =	ftdi_groups,
-	},
-	.description =		"FTDI USB Serial Device",
-	.id_table =		id_table_combined,
-	.num_ports =		1,
-	.bulk_in_size =		512,
-	.bulk_out_size =	256,
-	.probe =		ftdi_sio_probe,
-	.port_probe =		ftdi_sio_port_probe,
-	.port_remove =		ftdi_sio_port_remove,
-	.open =			ftdi_open,
-	.dtr_rts =		ftdi_dtr_rts,
-	.throttle =		usb_serial_generic_throttle,
-	.unthrottle =		usb_serial_generic_unthrottle,
-	.process_read_urb =	ftdi_process_read_urb,
-	.prepare_write_buffer =	ftdi_prepare_write_buffer,
-	.tiocmget =		ftdi_tiocmget,
-	.tiocmset =		ftdi_tiocmset,
-	.tiocmiwait =		usb_serial_generic_tiocmiwait,
-	.get_icount =           usb_serial_generic_get_icount,
-	.ioctl =		ftdi_ioctl,
-	.get_serial =		get_serial_info,
-	.set_serial =		set_serial_info,
-	.set_termios =		ftdi_set_termios,
-	.break_ctl =		ftdi_break_ctl,
-	.tx_empty =		ftdi_tx_empty,
-};
-
-static struct usb_serial_driver * const serial_drivers[] = {
-	&ftdi_sio_device, NULL
-};
-
 
 #define WDR_TIMEOUT 5000 /* default urb timeout */
 #define WDR_SHORT_TIMEOUT 1000	/* shorter urb timeout */
@@ -2233,12 +2166,9 @@ static void ftdi_gpio_remove(struct usb_serial_port *port) { }
  * ***************************************************************************
  */
 
-/* Probe function to check for special devices */
-static int ftdi_sio_probe(struct usb_serial *serial,
-					const struct usb_device_id *id)
+static int ftdi_probe(struct usb_serial *serial, const struct usb_device_id *id)
 {
-	const struct ftdi_sio_quirk *quirk =
-				(struct ftdi_sio_quirk *)id->driver_info;
+	const struct ftdi_quirk *quirk = (struct ftdi_quirk *)id->driver_info;
 
 	if (quirk && quirk->probe) {
 		int ret = quirk->probe(serial);
@@ -2251,10 +2181,10 @@ static int ftdi_sio_probe(struct usb_serial *serial,
 	return 0;
 }
 
-static int ftdi_sio_port_probe(struct usb_serial_port *port)
+static int ftdi_port_probe(struct usb_serial_port *port)
 {
+	const struct ftdi_quirk *quirk = usb_get_serial_data(port->serial);
 	struct ftdi_private *priv;
-	const struct ftdi_sio_quirk *quirk = usb_get_serial_data(port->serial);
 	int result;
 
 	priv = kzalloc(sizeof(struct ftdi_private), GFP_KERNEL);
@@ -2400,15 +2330,13 @@ static int ftdi_stmclite_probe(struct usb_serial *serial)
 	return 0;
 }
 
-static int ftdi_sio_port_remove(struct usb_serial_port *port)
+static void ftdi_port_remove(struct usb_serial_port *port)
 {
 	struct ftdi_private *priv = usb_get_serial_port_data(port);
 
 	ftdi_gpio_remove(port);
 
 	kfree(priv);
-
-	return 0;
 }
 
 static int ftdi_open(struct tty_struct *tty, struct usb_serial_port *port)
@@ -2930,6 +2858,41 @@ static int ftdi_ioctl(struct tty_struct *tty,
 	return -ENOIOCTLCMD;
 }
 
+static struct usb_serial_driver ftdi_device = {
+	.driver = {
+		.owner =	THIS_MODULE,
+		.name =		"ftdi_sio",
+		.dev_groups =	ftdi_groups,
+	},
+	.description =		"FTDI USB Serial Device",
+	.id_table =		id_table_combined,
+	.num_ports =		1,
+	.bulk_in_size =		512,
+	.bulk_out_size =	256,
+	.probe =		ftdi_probe,
+	.port_probe =		ftdi_port_probe,
+	.port_remove =		ftdi_port_remove,
+	.open =			ftdi_open,
+	.dtr_rts =		ftdi_dtr_rts,
+	.throttle =		usb_serial_generic_throttle,
+	.unthrottle =		usb_serial_generic_unthrottle,
+	.process_read_urb =	ftdi_process_read_urb,
+	.prepare_write_buffer =	ftdi_prepare_write_buffer,
+	.tiocmget =		ftdi_tiocmget,
+	.tiocmset =		ftdi_tiocmset,
+	.tiocmiwait =		usb_serial_generic_tiocmiwait,
+	.get_icount =		usb_serial_generic_get_icount,
+	.ioctl =		ftdi_ioctl,
+	.get_serial =		get_serial_info,
+	.set_serial =		set_serial_info,
+	.set_termios =		ftdi_set_termios,
+	.break_ctl =		ftdi_break_ctl,
+	.tx_empty =		ftdi_tx_empty,
+};
+
+static struct usb_serial_driver * const serial_drivers[] = {
+	&ftdi_device, NULL
+};
 module_usb_serial_driver(serial_drivers, id_table_combined);
 
 MODULE_AUTHOR(DRIVER_AUTHOR);

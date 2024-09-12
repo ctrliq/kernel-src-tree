@@ -1138,7 +1138,7 @@ dma_buf_map_attachment_unlocked(struct dma_buf_attachment *attach,
 
 	return sg_table;
 }
-EXPORT_SYMBOL_NS_GPL(dma_buf_map_attachment_unlocked, DMA_BUF);
+EXPORT_SYMBOL_GPL(dma_buf_map_attachment_unlocked);
 
 /**
  * dma_buf_unmap_attachment - unmaps and decreases usecount of the buffer;might
@@ -1199,7 +1199,7 @@ void dma_buf_unmap_attachment_unlocked(struct dma_buf_attachment *attach,
 	dma_buf_unmap_attachment(attach, sg_table, direction);
 	dma_resv_unlock(attach->dmabuf->resv);
 }
-EXPORT_SYMBOL_NS_GPL(dma_buf_unmap_attachment_unlocked, DMA_BUF);
+EXPORT_SYMBOL_GPL(dma_buf_unmap_attachment_unlocked);
 
 /**
  * dma_buf_move_notify - notify attachments that DMA-buf is moving
@@ -1515,7 +1515,7 @@ int dma_buf_vmap_unlocked(struct dma_buf *dmabuf, struct iosys_map *map)
 
 	return ret;
 }
-EXPORT_SYMBOL_NS_GPL(dma_buf_vmap_unlocked, DMA_BUF);
+EXPORT_SYMBOL_GPL(dma_buf_vmap_unlocked);
 
 /**
  * dma_buf_vunmap - Unmap a vmap obtained by dma_buf_vmap.
@@ -1555,7 +1555,7 @@ void dma_buf_vunmap_unlocked(struct dma_buf *dmabuf, struct iosys_map *map)
 	dma_buf_vunmap(dmabuf, map);
 	dma_resv_unlock(dmabuf->resv);
 }
-EXPORT_SYMBOL_NS_GPL(dma_buf_vunmap_unlocked, DMA_BUF);
+EXPORT_SYMBOL_GPL(dma_buf_vunmap_unlocked);
 
 #ifdef CONFIG_DEBUG_FS
 static int dma_buf_debug_show(struct seq_file *s, void *unused)

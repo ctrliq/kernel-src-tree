@@ -27,7 +27,6 @@
 
 #define DRIVER_DESC "EHCI npcm7xx driver"
 
-static const char hcd_name[] = "npcm7xx-ehci";
 
 #define  USB2PHYCTL_OFFSET 0x144
 

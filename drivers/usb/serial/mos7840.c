@@ -1721,7 +1721,7 @@ error:
 	return status;
 }
 
-static int mos7840_port_remove(struct usb_serial_port *port)
+static void mos7840_port_remove(struct usb_serial_port *port)
 {
 	struct moschip_port *mos7840_port = usb_get_serial_port_data(port);
 
@@ -1738,8 +1738,6 @@ static int mos7840_port_remove(struct usb_serial_port *port)
 	}
 
 	kfree(mos7840_port);
-
-	return 0;
 }
 
 static struct usb_serial_driver moschip7840_4port_device = {

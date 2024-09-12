@@ -23,7 +23,7 @@
 #include "iscsi_target_parameters.h"
 
 int iscsi_login_rx_data(
-	struct iscsi_conn *conn,
+	struct iscsit_conn *conn,
 	char *buf,
 	int length)
 {
@@ -45,7 +45,7 @@ int iscsi_login_rx_data(
 }
 
 int iscsi_login_tx_data(
-	struct iscsi_conn *conn,
+	struct iscsit_conn *conn,
 	char *pdu_buf,
 	char *text_buf,
 	int text_length)
@@ -963,7 +963,7 @@ out:
 }
 
 static int iscsi_check_acceptor_state(struct iscsi_param *param, char *value,
-				struct iscsi_conn *conn)
+				struct iscsit_conn *conn)
 {
 	u8 acceptor_boolean_value = 0, proposer_boolean_value = 0;
 	char *negotiated_value = NULL;
@@ -1362,7 +1362,7 @@ int iscsi_decode_text_input(
 	u8 sender,
 	char *textbuf,
 	u32 length,
-	struct iscsi_conn *conn)
+	struct iscsit_conn *conn)
 {
 	struct iscsi_param_list *param_list = conn->param_list;
 	char *tmpbuf, *start = NULL, *end = NULL;

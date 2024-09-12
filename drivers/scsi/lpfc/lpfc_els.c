@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017-2021 Broadcom. All Rights Reserved. The term *
+ * Copyright (C) 2017-2023 Broadcom. All Rights Reserved. The term *
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.     *
  * Copyright (C) 2004-2016 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
@@ -1000,6 +1000,7 @@ lpfc_cmpl_els_flogi(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	struct serv_parm *sp;
 	uint16_t fcf_index;
 	int rc;
+	bool flogi_in_retry = false;
 
 	/* Check to see if link went down during discovery */
 	if (lpfc_els_chk_latt(vport)) {
@@ -1062,8 +1063,23 @@ stop_rr_fcf_flogi:
 					 phba->fcf.fcf_flag);
 
 		/* Check for retry */
-		if (lpfc_els_retry(phba, cmdiocb, rspiocb))
+		if (lpfc_els_retry(phba, cmdiocb, rspiocb)) {
+			/* Address a timing race with dev_loss.  If dev_loss
+			 * is active on this FPort node, put the initial ref
+			 * count back to stop premature node release actions.
+			 */
+			lpfc_check_nlp_post_devloss(vport, ndlp);
+			flogi_in_retry = true;
 			goto out;
+		}
+
+		/* The FLOGI will not be retried.  If the FPort node is not
+		 * registered with the SCSI transport, remove the initial
+		 * reference to trigger node release.
+		 */
+		if (!(ndlp->nlp_flag & NLP_IN_DEV_LOSS) &&
+		    !(ndlp->fc4_xpt_flags & SCSI_XPT_REGD))
+			lpfc_nlp_put(ndlp);
 
 		lpfc_printf_vlog(vport, KERN_WARNING, LOG_TRACE_EVENT,
 				 "0150 FLOGI failure Status:x%x/x%x "
@@ -1121,7 +1137,7 @@ stop_rr_fcf_flogi:
 	spin_unlock_irq(shost->host_lock);
 
 	/*
-	 * The FLogI succeeded.  Sync the data for the CPU before
+	 * The FLOGI succeeded.  Sync the data for the CPU before
 	 * accessing it.
 	 */
 	prsp = list_get_first(&pcmd->list, struct lpfc_dmabuf, list);
@@ -1142,6 +1158,12 @@ stop_rr_fcf_flogi:
 	if (sp->cmn.priority_tagging)
 		vport->vmid_flag |= LPFC_VMID_ISSUE_QFPA;
 
+	/*
+	 * Address a timing race with dev_loss.  If dev_loss is active on
+	 * this FPort node, put the initial ref count back to stop premature
+	 * node release actions.
+	 */
+	lpfc_check_nlp_post_devloss(vport, ndlp);
 	if (vport->port_state == LPFC_FLOGI) {
 		/*
 		 * If Common Service Parameters indicate Nport
@@ -1231,7 +1253,9 @@ flogifail:
 		lpfc_issue_clear_la(phba, vport);
 	}
 out:
-	phba->hba_flag &= ~HBA_FLOGI_OUTSTANDING;
+	if (!flogi_in_retry)
+		phba->hba_flag &= ~HBA_FLOGI_OUTSTANDING;
+
 	lpfc_els_free_iocb(phba, cmdiocb);
 	lpfc_nlp_put(ndlp);
 }
@@ -1390,14 +1414,16 @@ lpfc_issue_els_flogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		return 1;
 	}
 
+	/* Avoid race with FLOGI completion and hba_flags. */
+	phba->hba_flag |= (HBA_FLOGI_ISSUED | HBA_FLOGI_OUTSTANDING);
+
 	rc = lpfc_issue_fabric_iocb(phba, elsiocb);
 	if (rc == IOCB_ERROR) {
+		phba->hba_flag &= ~(HBA_FLOGI_ISSUED | HBA_FLOGI_OUTSTANDING);
 		lpfc_els_free_iocb(phba, elsiocb);
 		lpfc_nlp_put(ndlp);
 		return 1;
 	}
-
-	phba->hba_flag |= (HBA_FLOGI_ISSUED | HBA_FLOGI_OUTSTANDING);
 
 	/* Check for a deferred FLOGI ACC condition */
 	if (phba->defer_flogi_acc_flag) {
@@ -2349,14 +2375,29 @@ lpfc_cmpl_els_prli(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		/* PRLI failed */
 		lpfc_printf_vlog(vport, mode, loglevel,
 				 "2754 PRLI failure DID:%06X Status:x%x/x%x, "
-				 "data: x%x\n",
+				 "data: x%x x%x\n",
 				 ndlp->nlp_DID, irsp->ulpStatus,
-				 irsp->un.ulpWord[4], ndlp->fc4_prli_sent);
+				 irsp->un.ulpWord[4],
+				 ndlp->nlp_state, ndlp->fc4_prli_sent);
 
 		/* Do not call DSM for lpfc_els_abort'ed ELS cmds */
 		if (!lpfc_error_lost_link(irsp))
 			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
 						NLP_EVT_CMPL_PRLI);
+
+		/* The following condition catches an inflight transition
+		 * mismatch typically caused by an RSCN. Skip any
+		 * processing to allow recovery.
+		*/
+		if (ndlp->nlp_state >= NLP_STE_PLOGI_ISSUE &&
+		    ndlp->nlp_state <= NLP_STE_REG_LOGIN_ISSUE) {
+			lpfc_printf_vlog(vport, KERN_WARNING, LOG_NODE,
+					 "2784 PRLI cmpl: state mismatch "
+					 "DID x%06x nstate x%x nflag x%x\n",
+					 ndlp->nlp_DID, ndlp->nlp_state,
+					 ndlp->nlp_flag);
+			goto out;
+		}
 
 		/*
 		 * For P2P topology, retain the node so that PLOGI can be
@@ -2971,14 +3012,15 @@ lpfc_cmpl_els_logo(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 				 "2756 LOGO failure, No Retry DID:%06X Status:x%x/x%x\n",
 				 ndlp->nlp_DID, irsp->ulpStatus,
 				 irsp->un.ulpWord[4]);
-		if (lpfc_error_lost_link(irsp)) {
+		if (lpfc_error_lost_link(irsp))
 			skip_recovery = 1;
-			goto out;
-		}
 	}
 
 	/* Call state machine. This will unregister the rpi if needed. */
 	lpfc_disc_state_machine(vport, ndlp, cmdiocb, NLP_EVT_CMPL_LOGO);
+
+	if (skip_recovery)
+		goto out;
 
 	/* The driver sets this flag for an NPIV instance that doesn't want to
 	 * log into the remote port.
@@ -4600,6 +4642,15 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 				/* the nameserver fails */
 				maxretry = 0;
 				delay = 100;
+			} else if (cmd == ELS_CMD_PRLI &&
+				   ndlp->nlp_state != NLP_STE_PRLI_ISSUE) {
+				/* State-command disagreement.  The PRLI was
+				 * failed with an invalid rpi meaning there
+				 * some unexpected state change.  Don't retry.
+				 */
+				maxretry = 0;
+				retry = 0;
+				break;
 			}
 			retry = 1;
 			break;

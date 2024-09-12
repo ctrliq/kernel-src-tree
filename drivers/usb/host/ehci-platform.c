@@ -46,8 +46,6 @@ struct ehci_platform_priv {
 	bool reset_on_resume;
 };
 
-static const char hcd_name[] = "ehci-platform";
-
 static int ehci_platform_reset(struct usb_hcd *hcd)
 {
 	struct platform_device *pdev = to_platform_device(hcd->self.controller);

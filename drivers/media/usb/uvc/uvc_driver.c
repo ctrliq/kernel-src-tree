@@ -125,90 +125,6 @@ static enum v4l2_ycbcr_encoding uvc_ycbcr_enc(const u8 matrix_coefficients)
 	return V4L2_YCBCR_ENC_DEFAULT;  /* Reserved */
 }
 
-/*
- * Simplify a fraction using a simple continued fraction decomposition. The
- * idea here is to convert fractions such as 333333/10000000 to 1/30 using
- * 32 bit arithmetic only. The algorithm is not perfect and relies upon two
- * arbitrary parameters to remove non-significative terms from the simple
- * continued fraction decomposition. Using 8 and 333 for n_terms and threshold
- * respectively seems to give nice results.
- */
-void uvc_simplify_fraction(u32 *numerator, u32 *denominator,
-		unsigned int n_terms, unsigned int threshold)
-{
-	u32 *an;
-	u32 x, y, r;
-	unsigned int i, n;
-
-	an = kmalloc_array(n_terms, sizeof(*an), GFP_KERNEL);
-	if (an == NULL)
-		return;
-
-	/*
-	 * Convert the fraction to a simple continued fraction. See
-	 * https://en.wikipedia.org/wiki/Continued_fraction
-	 * Stop if the current term is bigger than or equal to the given
-	 * threshold.
-	 */
-	x = *numerator;
-	y = *denominator;
-
-	for (n = 0; n < n_terms && y != 0; ++n) {
-		an[n] = x / y;
-		if (an[n] >= threshold) {
-			if (n < 2)
-				n++;
-			break;
-		}
-
-		r = x - an[n] * y;
-		x = y;
-		y = r;
-	}
-
-	/* Expand the simple continued fraction back to an integer fraction. */
-	x = 0;
-	y = 1;
-
-	for (i = n; i > 0; --i) {
-		r = y;
-		y = an[i-1] * y + x;
-		x = r;
-	}
-
-	*numerator = y;
-	*denominator = x;
-	kfree(an);
-}
-
-/*
- * Convert a fraction to a frame interval in 100ns multiples. The idea here is
- * to compute numerator / denominator * 10000000 using 32 bit fixed point
- * arithmetic only.
- */
-u32 uvc_fraction_to_interval(u32 numerator, u32 denominator)
-{
-	u32 multiplier;
-
-	/* Saturate the result if the operation would overflow. */
-	if (denominator == 0 ||
-	    numerator/denominator >= ((u32)-1)/10000000)
-		return (u32)-1;
-
-	/*
-	 * Divide both the denominator and the multiplier by two until
-	 * numerator * multiplier doesn't overflow. If anyone knows a better
-	 * algorithm please let me know.
-	 */
-	multiplier = 10000000;
-	while (numerator > ((u32)-1)/multiplier) {
-		multiplier /= 2;
-		denominator /= 2;
-	}
-
-	return denominator ? numerator * multiplier / denominator : 0;
-}
-
 /* ------------------------------------------------------------------------
  * Terminal and unit management
  */
@@ -2256,12 +2172,12 @@ static int uvc_probe(struct usb_interface *intf,
 	if (v4l2_device_register(&intf->dev, &dev->vdev) < 0)
 		goto error;
 
-	/* Initialize controls. */
-	if (uvc_ctrl_init_device(dev) < 0)
-		goto error;
-
 	/* Scan the device for video chains. */
 	if (uvc_scan_device(dev) < 0)
+		goto error;
+
+	/* Initialize controls. */
+	if (uvc_ctrl_init_device(dev) < 0)
 		goto error;
 
 	/* Register video device nodes. */
@@ -2633,6 +2549,15 @@ static const struct usb_device_id uvc_ids[] = {
 	  .bInterfaceSubClass	= 1,
 	  .bInterfaceProtocol	= 0,
 	  .driver_info		= UVC_INFO_QUIRK(UVC_QUIRK_RESTRICT_FRAME_RATE) },
+	/* Chicony EasyCamera */
+	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+				| USB_DEVICE_ID_MATCH_INT_INFO,
+	  .idVendor		= 0x04f2,
+	  .idProduct		= 0xb5eb,
+	  .bInterfaceClass	= USB_CLASS_VIDEO,
+	  .bInterfaceSubClass	= 1,
+	  .bInterfaceProtocol	= 0,
+	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_limited },
 	/* Chicony EasyCamera */
 	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
 				| USB_DEVICE_ID_MATCH_INT_INFO,
@@ -3017,6 +2942,24 @@ static const struct usb_device_id uvc_ids[] = {
 	  .bInterfaceSubClass	= 1,
 	  .bInterfaceProtocol	= 0,
 	  .driver_info		= (kernel_ulong_t)&uvc_quirk_force_y8 },
+	/* Sonix Technology USB 2.0 Camera */
+	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+				| USB_DEVICE_ID_MATCH_INT_INFO,
+	  .idVendor		= 0x3277,
+	  .idProduct		= 0x0072,
+	  .bInterfaceClass	= USB_CLASS_VIDEO,
+	  .bInterfaceSubClass	= 1,
+	  .bInterfaceProtocol	= 0,
+	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_limited },
+	/* Acer EasyCamera */
+	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
+				| USB_DEVICE_ID_MATCH_INT_INFO,
+	  .idVendor		= 0x5986,
+	  .idProduct		= 0x1172,
+	  .bInterfaceClass	= USB_CLASS_VIDEO,
+	  .bInterfaceSubClass	= 1,
+	  .bInterfaceProtocol	= 0,
+	  .driver_info		= (kernel_ulong_t)&uvc_ctrl_power_line_limited },
 	/* Intel RealSense D4M */
 	{ .match_flags		= USB_DEVICE_ID_MATCH_DEVICE
 				| USB_DEVICE_ID_MATCH_INT_INFO,
