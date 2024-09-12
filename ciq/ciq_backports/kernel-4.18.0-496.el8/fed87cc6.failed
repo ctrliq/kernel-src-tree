@@ -1,0 +1,141 @@
+net/sched: taprio: automatically calculate queueMaxSDU based on TC gate durations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit fed87cc6718ad5f80aa739fee3c5979a8b09d3a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/fed87cc6.failed
+
+taprio today has a huge problem with small TC gate durations, because it
+might accept packets in taprio_enqueue() which will never be sent by
+taprio_dequeue().
+
+Since not much infrastructure was available, a kludge was added in
+commit 497cc00224cf ("taprio: Handle short intervals and large
+packets"), which segmented large TCP segments, but the fact of the
+matter is that the issue isn't specific to large TCP segments (and even
+worse, the performance penalty in segmenting those is absolutely huge).
+
+In commit a54fc09e4cba ("net/sched: taprio: allow user input of per-tc
+max SDU"), taprio gained support for queueMaxSDU, which is precisely the
+mechanism through which packets should be dropped at qdisc_enqueue() if
+they cannot be sent.
+
+After that patch, it was necessary for the user to manually limit the
+maximum MTU per TC. This change adds the necessary logic for taprio to
+further limit the values specified (or not specified) by the user to
+some minimum values which never allow oversized packets to be sent.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Reviewed-by: Kurt Kanzenbach <kurt@linutronix.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fed87cc6718ad5f80aa739fee3c5979a8b09d3a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_taprio.c
+diff --cc net/sched/sch_taprio.c
+index dbfb1f4e9bfd,e7163d6fab77..000000000000
+--- a/net/sched/sch_taprio.c
++++ b/net/sched/sch_taprio.c
+@@@ -57,6 -63,8 +57,11 @@@ struct sched_gate_list 
+  	 * or 0 if a traffic class gate never opens during the schedule.
+  	 */
+  	u64 max_open_gate_duration[TC_MAX_QUEUE];
+++<<<<<<< HEAD
+++=======
++ 	u32 max_frm_len[TC_MAX_QUEUE]; /* for the fast path */
++ 	u32 max_sdu[TC_MAX_QUEUE]; /* for dump */
+++>>>>>>> fed87cc6718a (net/sched: taprio: automatically calculate queueMaxSDU based on TC gate durations)
+  	struct rcu_head rcu;
+  	struct list_head entries;
+  	size_t num_entries;
+@@@ -84,8 -94,8 +89,13 @@@ struct taprio_sched 
+  	struct sched_gate_list __rcu *admin_sched;
+  	struct hrtimer advance_timer;
+  	struct list_head taprio_list;
+++<<<<<<< HEAD
+ +	u32 max_frm_len[TC_MAX_QUEUE]; /* for the fast path */
+ +	u32 max_sdu[TC_MAX_QUEUE]; /* for dump and offloading */
+++=======
++ 	int cur_txq[TC_MAX_QUEUE];
++ 	u32 max_sdu[TC_MAX_QUEUE]; /* save info from the user */
+++>>>>>>> fed87cc6718a (net/sched: taprio: automatically calculate queueMaxSDU based on TC gate durations)
+  	u32 txtime_delay;
+  };
+  
+@@@ -228,7 -244,56 +238,60 @@@ static ktime_t get_interval_end_time(st
+  
+  static int length_to_duration(struct taprio_sched *q, int len)
+  {
+++<<<<<<< HEAD
+ +	return div_u64(len * atomic64_read(&q->picos_per_byte), 1000);
+++=======
++ 	return div_u64(len * atomic64_read(&q->picos_per_byte), PSEC_PER_NSEC);
++ }
++ 
++ static int duration_to_length(struct taprio_sched *q, u64 duration)
++ {
++ 	return div_u64(duration * PSEC_PER_NSEC, atomic64_read(&q->picos_per_byte));
++ }
++ 
++ /* Sets sched->max_sdu[] and sched->max_frm_len[] to the minimum between the
++  * q->max_sdu[] requested by the user and the max_sdu dynamically determined by
++  * the maximum open gate durations at the given link speed.
++  */
++ static void taprio_update_queue_max_sdu(struct taprio_sched *q,
++ 					struct sched_gate_list *sched,
++ 					struct qdisc_size_table *stab)
++ {
++ 	struct net_device *dev = qdisc_dev(q->root);
++ 	int num_tc = netdev_get_num_tc(dev);
++ 	u32 max_sdu_from_user;
++ 	u32 max_sdu_dynamic;
++ 	u32 max_sdu;
++ 	int tc;
++ 
++ 	for (tc = 0; tc < num_tc; tc++) {
++ 		max_sdu_from_user = q->max_sdu[tc] ?: U32_MAX;
++ 
++ 		/* TC gate never closes => keep the queueMaxSDU
++ 		 * selected by the user
++ 		 */
++ 		if (sched->max_open_gate_duration[tc] == sched->cycle_time) {
++ 			max_sdu_dynamic = U32_MAX;
++ 		} else {
++ 			u32 max_frm_len;
++ 
++ 			max_frm_len = duration_to_length(q, sched->max_open_gate_duration[tc]);
++ 			if (stab)
++ 				max_frm_len -= stab->szopts.overhead;
++ 			max_sdu_dynamic = max_frm_len - dev->hard_header_len;
++ 		}
++ 
++ 		max_sdu = min(max_sdu_dynamic, max_sdu_from_user);
++ 
++ 		if (max_sdu != U32_MAX) {
++ 			sched->max_frm_len[tc] = max_sdu + dev->hard_header_len;
++ 			sched->max_sdu[tc] = max_sdu;
++ 		} else {
++ 			sched->max_frm_len[tc] = U32_MAX; /* never oversized */
++ 			sched->max_sdu[tc] = 0;
++ 		}
++ 	}
+++>>>>>>> fed87cc6718a (net/sched: taprio: automatically calculate queueMaxSDU based on TC gate durations)
+  }
+  
+  /* Returns the entry corresponding to next available interval. If
+@@@ -1615,6 -1833,7 +1692,10 @@@ static int taprio_change(struct Qdisc *
+  		goto free_sched;
+  
+  	taprio_set_picos_per_byte(dev, q);
+++<<<<<<< HEAD
+++=======
++ 	taprio_update_queue_max_sdu(q, new_admin, stab);
+++>>>>>>> fed87cc6718a (net/sched: taprio: automatically calculate queueMaxSDU based on TC gate durations)
+  
+  	if (mqprio) {
+  		err = netdev_set_num_tc(dev, mqprio->num_tc);
+* Unmerged path net/sched/sch_taprio.c
