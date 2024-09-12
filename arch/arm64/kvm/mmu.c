@@ -2089,46 +2089,64 @@ bool kvm_set_spte_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
 
 bool kvm_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
 {
-	u64 size = (range->end - range->start) << PAGE_SHIFT;
 	pud_t *pud;
 	pmd_t *pmd;
 	pte_t *pte;
+	bool young = false;
 
 	if (!kvm->arch.pgd)
 		return false;
 
-	WARN_ON(size != PAGE_SIZE && size != PMD_SIZE && size != PUD_SIZE);
-	if (!stage2_get_leaf_entry(kvm, range->start << PAGE_SHIFT, &pud, &pmd, &pte))
-		return 0;
+	while (range->start < range->end) {
+		if (!stage2_get_leaf_entry(kvm, range->start << PAGE_SHIFT, &pud, &pmd, &pte)) {
+			range->start += PAGE_SIZE;
+			continue;
+		}
 
-	if (pud)
-		return stage2_pudp_test_and_clear_young(pud);
-	else if (pmd)
-		return stage2_pmdp_test_and_clear_young(pmd);
-	else
-		return stage2_ptep_test_and_clear_young(pte);
+		if (pud) {
+			young |= stage2_pudp_test_and_clear_young(pud);
+			range->start += PUD_SIZE;
+		} else if (pmd) {
+			young |= stage2_pmdp_test_and_clear_young(pmd);
+			range->start += PMD_SIZE;
+		} else {
+			young |= stage2_ptep_test_and_clear_young(pte);
+			range->start += PAGE_SIZE;
+		}
+	}
+
+	return young;
 }
 
 bool kvm_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
 {
-	u64 size = (range->end - range->start) << PAGE_SHIFT;
 	pud_t *pud;
 	pmd_t *pmd;
 	pte_t *pte;
+	bool young = false;
 
 	if (!kvm->arch.pgd)
 		return false;
 
-	WARN_ON(size != PAGE_SIZE && size != PMD_SIZE && size != PUD_SIZE);
-	if (!stage2_get_leaf_entry(kvm, range->start << PAGE_SHIFT, &pud, &pmd, &pte))
-		return 0;
+	while (range->start < range->end) {
+		if (!stage2_get_leaf_entry(kvm, range->start << PAGE_SHIFT, &pud, &pmd, &pte)) {
+			range->start += PAGE_SIZE;
+			continue;
+		}
 
-	if (pud)
-		return kvm_s2pud_young(*pud);
-	else if (pmd)
-		return pmd_young(*pmd);
-	else
-		return pte_young(*pte);
+		if (pud) {
+			young |= kvm_s2pud_young(*pud);
+			range->start += PUD_SIZE;
+		} else if (pmd) {
+			young |= pmd_young(*pmd);
+			range->start += PMD_SIZE;
+		} else {
+			young |= pte_young(*pte);
+			range->start += PAGE_SIZE;
+		}
+	}
+
+	return young;
 }
 
 void kvm_mmu_free_memory_caches(struct kvm_vcpu *vcpu)

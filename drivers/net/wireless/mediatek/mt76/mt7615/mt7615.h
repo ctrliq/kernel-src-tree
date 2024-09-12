@@ -246,8 +246,6 @@ struct mt7615_dev {
 	};
 
 	const struct mt76_bus_ops *bus_ops;
-	struct tasklet_struct irq_tasklet;
-
 	struct mt7615_phy phy;
 	u64 omac_mask;
 
@@ -412,13 +410,6 @@ int mt7615_mcu_set_wmm(struct mt7615_dev *dev, u8 queue,
 void mt7615_mcu_rx_event(struct mt7615_dev *dev, struct sk_buff *skb);
 int mt7615_mcu_rdd_send_pattern(struct mt7615_dev *dev);
 int mt7615_mcu_fw_log_2_host(struct mt7615_dev *dev, u8 ctrl);
-
-static inline void mt7615_irq_enable(struct mt7615_dev *dev, u32 mask)
-{
-	mt76_set_irq_mask(&dev->mt76, 0, 0, mask);
-
-	tasklet_schedule(&dev->irq_tasklet);
-}
 
 static inline bool mt7615_firmware_offload(struct mt7615_dev *dev)
 {
