@@ -1,0 +1,177 @@
+mm/page_alloc: fix incorrect PGFREE and PGALLOC for high-order page
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-507.el8
+commit-author Yafang Shao <laoar.shao@gmail.com>
+commit 15cd90049d595e592d8860ee15a3f23491d54d17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-507.el8/15cd9004.failed
+
+PGFREE and PGALLOC represent the number of freed and allocated pages.  So
+the page order must be considered.
+
+Link: https://lkml.kernel.org/r/20221006101540.40686-1-laoar.shao@gmail.com
+Fixes: 44042b449872 ("mm/page_alloc: allow high-order pages to be stored on the per-cpu lists")
+	Signed-off-by: Yafang Shao <laoar.shao@gmail.com>
+	Acked-by: Mel Gorman <mgorman@techsingularity.net>
+	Reviewed-by: Miaohe Lin <linmiaohe@huawei.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 15cd90049d595e592d8860ee15a3f23491d54d17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_alloc.c
+diff --cc mm/page_alloc.c
+index c5bf723f114f,8e9b7f08a32c..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -3205,14 -3391,96 +3205,97 @@@ static bool free_unref_page_prepare(str
+  	return true;
+  }
+  
+ -static int nr_pcp_free(struct per_cpu_pages *pcp, int high, int batch,
+ -		       bool free_high)
+ +static void free_unref_page_commit(struct page *page, unsigned long pfn)
+  {
+++<<<<<<< HEAD
+ +	struct zone *zone = page_zone(page);
+++=======
++ 	int min_nr_free, max_nr_free;
++ 
++ 	/* Free everything if batch freeing high-order pages. */
++ 	if (unlikely(free_high))
++ 		return pcp->count;
++ 
++ 	/* Check for PCP disabled or boot pageset */
++ 	if (unlikely(high < batch))
++ 		return 1;
++ 
++ 	/* Leave at least pcp->batch pages on the list */
++ 	min_nr_free = batch;
++ 	max_nr_free = high - batch;
++ 
++ 	/*
++ 	 * Double the number of pages freed each time there is subsequent
++ 	 * freeing of pages without any allocation.
++ 	 */
++ 	batch <<= pcp->free_factor;
++ 	if (batch < max_nr_free)
++ 		pcp->free_factor++;
++ 	batch = clamp(batch, min_nr_free, max_nr_free);
++ 
++ 	return batch;
++ }
++ 
++ static int nr_pcp_high(struct per_cpu_pages *pcp, struct zone *zone,
++ 		       bool free_high)
++ {
++ 	int high = READ_ONCE(pcp->high);
++ 
++ 	if (unlikely(!high || free_high))
++ 		return 0;
++ 
++ 	if (!test_bit(ZONE_RECLAIM_ACTIVE, &zone->flags))
++ 		return high;
++ 
++ 	/*
++ 	 * If reclaim is active, limit the number of pages that can be
++ 	 * stored on pcp lists
++ 	 */
++ 	return min(READ_ONCE(pcp->batch) << 2, high);
++ }
++ 
++ static void free_unref_page_commit(struct zone *zone, struct per_cpu_pages *pcp,
++ 				   struct page *page, int migratetype,
++ 				   unsigned int order)
++ {
++ 	int high;
++ 	int pindex;
++ 	bool free_high;
++ 
++ 	__count_vm_events(PGFREE, 1 << order);
++ 	pindex = order_to_pindex(migratetype, order);
++ 	list_add(&page->pcp_list, &pcp->lists[pindex]);
++ 	pcp->count += 1 << order;
++ 
++ 	/*
++ 	 * As high-order pages other than THP's stored on PCP can contribute
++ 	 * to fragmentation, limit the number stored when PCP is heavily
++ 	 * freeing without allocation. The remainder after bulk freeing
++ 	 * stops will be drained from vmstat refresh context.
++ 	 */
++ 	free_high = (pcp->free_factor && order && order <= PAGE_ALLOC_COSTLY_ORDER);
++ 
++ 	high = nr_pcp_high(pcp, zone, free_high);
++ 	if (pcp->count >= high) {
++ 		int batch = READ_ONCE(pcp->batch);
++ 
++ 		free_pcppages_bulk(zone, nr_pcp_free(pcp, high, batch, free_high), pcp, pindex);
++ 	}
++ }
++ 
++ /*
++  * Free a pcp page
++  */
++ void free_unref_page(struct page *page, unsigned int order)
++ {
++ 	unsigned long flags;
++ 	unsigned long __maybe_unused UP_flags;
+++>>>>>>> 15cd90049d59 (mm/page_alloc: fix incorrect PGFREE and PGALLOC for high-order page)
+  	struct per_cpu_pages *pcp;
+ -	struct zone *zone;
+ -	unsigned long pfn = page_to_pfn(page);
+  	int migratetype;
+  
+ -	if (!free_unref_page_prepare(page, pfn, order))
+ -		return;
+ +	migratetype = get_pcppage_migratetype(page);
+ +	__count_vm_event(PGFREE);
+  
+  	/*
+  	 * We only track unmovable, reclaimable and movable on pcp lists.
+@@@ -3442,16 -3779,33 +3525,21 @@@ static struct page *rmqueue_pcplist(str
+  	struct list_head *list;
+  	struct page *page;
+  	unsigned long flags;
+ -	unsigned long __maybe_unused UP_flags;
+ -
+ -	/*
+ -	 * spin_trylock may fail due to a parallel drain. In the future, the
+ -	 * trylock will also protect against IRQ reentrancy.
+ -	 */
+ -	pcp_trylock_prepare(UP_flags);
+ -	pcp = pcp_spin_trylock_irqsave(zone->per_cpu_pageset, flags);
+ -	if (!pcp) {
+ -		pcp_trylock_finish(UP_flags);
+ -		return NULL;
+ -	}
+  
+ -	/*
+ -	 * On allocation, reduce the number of pages that are batch freed.
+ -	 * See nr_pcp_free() where free_factor is increased for subsequent
+ -	 * frees.
+ -	 */
+ -	pcp->free_factor >>= 1;
+ -	list = &pcp->lists[order_to_pindex(migratetype, order)];
+ -	page = __rmqueue_pcplist(zone, order, migratetype, alloc_flags, pcp, list);
+ -	pcp_spin_unlock_irqrestore(pcp, flags);
+ -	pcp_trylock_finish(UP_flags);
+ +	local_irq_save(flags);
+ +	pcp = &this_cpu_ptr(zone->pageset)->pcp;
+ +	list = &pcp->lists[migratetype];
+ +	page = __rmqueue_pcplist(zone,  migratetype, alloc_flags, pcp, list);
+  	if (page) {
+++<<<<<<< HEAD
+ +		__count_zid_vm_events(PGALLOC, page_zonenum(page), 1);
+ +		zone_statistics(preferred_zone, zone);
+++=======
++ 		__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 << order);
++ 		zone_statistics(preferred_zone, zone, 1);
+++>>>>>>> 15cd90049d59 (mm/page_alloc: fix incorrect PGFREE and PGALLOC for high-order page)
+  	}
+ +	local_irq_restore(flags);
+  	return page;
+  }
+  
+* Unmerged path mm/page_alloc.c
