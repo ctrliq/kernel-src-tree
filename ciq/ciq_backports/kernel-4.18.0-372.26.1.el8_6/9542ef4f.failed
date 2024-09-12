@@ -1,0 +1,243 @@
+ice: Sync VLAN filtering features for DVM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.26.1.el8_6
+commit-author Roman Storozhenko <roman.storozhenko@intel.com>
+commit 9542ef4fba8c73e176b8aa18a8adf04aecb889e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.26.1.el8_6/9542ef4f.failed
+
+VLAN filtering features, that is C-Tag and S-Tag, in DVM mode must be
+both enabled or disabled.
+In case of turning off/on only one of the features, another feature must
+be turned off/on automatically with issuing an appropriate message to
+the kernel log.
+
+Fixes: 1babaf77f49d ("ice: Advertise 802.1ad VLAN filtering and offloads for PF netdev")
+	Signed-off-by: Roman Storozhenko <roman.storozhenko@intel.com>
+Co-developed-by: Anatolii Gerasymenko <anatolii.gerasymenko@intel.com>
+	Signed-off-by: Anatolii Gerasymenko <anatolii.gerasymenko@intel.com>
+	Tested-by: Gurucharan <gurucharanx.g@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 9542ef4fba8c73e176b8aa18a8adf04aecb889e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_main.c
+diff --cc drivers/net/ethernet/intel/ice/ice_main.c
+index 04d981257bfc,c1ac2f746714..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@@ -5660,6 -5714,207 +5660,210 @@@ ice_fdb_del(struct ndmsg *ndm, __always
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define NETIF_VLAN_OFFLOAD_FEATURES	(NETIF_F_HW_VLAN_CTAG_RX | \
++ 					 NETIF_F_HW_VLAN_CTAG_TX | \
++ 					 NETIF_F_HW_VLAN_STAG_RX | \
++ 					 NETIF_F_HW_VLAN_STAG_TX)
++ 
++ #define NETIF_VLAN_FILTERING_FEATURES	(NETIF_F_HW_VLAN_CTAG_FILTER | \
++ 					 NETIF_F_HW_VLAN_STAG_FILTER)
++ 
++ /**
++  * ice_fix_features - fix the netdev features flags based on device limitations
++  * @netdev: ptr to the netdev that flags are being fixed on
++  * @features: features that need to be checked and possibly fixed
++  *
++  * Make sure any fixups are made to features in this callback. This enables the
++  * driver to not have to check unsupported configurations throughout the driver
++  * because that's the responsiblity of this callback.
++  *
++  * Single VLAN Mode (SVM) Supported Features:
++  *	NETIF_F_HW_VLAN_CTAG_FILTER
++  *	NETIF_F_HW_VLAN_CTAG_RX
++  *	NETIF_F_HW_VLAN_CTAG_TX
++  *
++  * Double VLAN Mode (DVM) Supported Features:
++  *	NETIF_F_HW_VLAN_CTAG_FILTER
++  *	NETIF_F_HW_VLAN_CTAG_RX
++  *	NETIF_F_HW_VLAN_CTAG_TX
++  *
++  *	NETIF_F_HW_VLAN_STAG_FILTER
++  *	NETIF_HW_VLAN_STAG_RX
++  *	NETIF_HW_VLAN_STAG_TX
++  *
++  * Features that need fixing:
++  *	Cannot simultaneously enable CTAG and STAG stripping and/or insertion.
++  *	These are mutually exlusive as the VSI context cannot support multiple
++  *	VLAN ethertypes simultaneously for stripping and/or insertion. If this
++  *	is not done, then default to clearing the requested STAG offload
++  *	settings.
++  *
++  *	All supported filtering has to be enabled or disabled together. For
++  *	example, in DVM, CTAG and STAG filtering have to be enabled and disabled
++  *	together. If this is not done, then default to VLAN filtering disabled.
++  *	These are mutually exclusive as there is currently no way to
++  *	enable/disable VLAN filtering based on VLAN ethertype when using VLAN
++  *	prune rules.
++  */
++ static netdev_features_t
++ ice_fix_features(struct net_device *netdev, netdev_features_t features)
++ {
++ 	struct ice_netdev_priv *np = netdev_priv(netdev);
++ 	netdev_features_t req_vlan_fltr, cur_vlan_fltr;
++ 	bool cur_ctag, cur_stag, req_ctag, req_stag;
++ 
++ 	cur_vlan_fltr = netdev->features & NETIF_VLAN_FILTERING_FEATURES;
++ 	cur_ctag = cur_vlan_fltr & NETIF_F_HW_VLAN_CTAG_FILTER;
++ 	cur_stag = cur_vlan_fltr & NETIF_F_HW_VLAN_STAG_FILTER;
++ 
++ 	req_vlan_fltr = features & NETIF_VLAN_FILTERING_FEATURES;
++ 	req_ctag = req_vlan_fltr & NETIF_F_HW_VLAN_CTAG_FILTER;
++ 	req_stag = req_vlan_fltr & NETIF_F_HW_VLAN_STAG_FILTER;
++ 
++ 	if (req_vlan_fltr != cur_vlan_fltr) {
++ 		if (ice_is_dvm_ena(&np->vsi->back->hw)) {
++ 			if (req_ctag && req_stag) {
++ 				features |= NETIF_VLAN_FILTERING_FEATURES;
++ 			} else if (!req_ctag && !req_stag) {
++ 				features &= ~NETIF_VLAN_FILTERING_FEATURES;
++ 			} else if ((!cur_ctag && req_ctag && !cur_stag) ||
++ 				   (!cur_stag && req_stag && !cur_ctag)) {
++ 				features |= NETIF_VLAN_FILTERING_FEATURES;
++ 				netdev_warn(netdev,  "802.1Q and 802.1ad VLAN filtering must be either both on or both off. VLAN filtering has been enabled for both types.\n");
++ 			} else if ((cur_ctag && !req_ctag && cur_stag) ||
++ 				   (cur_stag && !req_stag && cur_ctag)) {
++ 				features &= ~NETIF_VLAN_FILTERING_FEATURES;
++ 				netdev_warn(netdev,  "802.1Q and 802.1ad VLAN filtering must be either both on or both off. VLAN filtering has been disabled for both types.\n");
++ 			}
++ 		} else {
++ 			if (req_vlan_fltr & NETIF_F_HW_VLAN_STAG_FILTER)
++ 				netdev_warn(netdev, "cannot support requested 802.1ad filtering setting in SVM mode\n");
++ 
++ 			if (req_vlan_fltr & NETIF_F_HW_VLAN_CTAG_FILTER)
++ 				features |= NETIF_F_HW_VLAN_CTAG_FILTER;
++ 		}
++ 	}
++ 
++ 	if ((features & (NETIF_F_HW_VLAN_CTAG_RX | NETIF_F_HW_VLAN_CTAG_TX)) &&
++ 	    (features & (NETIF_F_HW_VLAN_STAG_RX | NETIF_F_HW_VLAN_STAG_TX))) {
++ 		netdev_warn(netdev, "cannot support CTAG and STAG VLAN stripping and/or insertion simultaneously since CTAG and STAG offloads are mutually exclusive, clearing STAG offload settings\n");
++ 		features &= ~(NETIF_F_HW_VLAN_STAG_RX |
++ 			      NETIF_F_HW_VLAN_STAG_TX);
++ 	}
++ 
++ 	return features;
++ }
++ 
++ /**
++  * ice_set_vlan_offload_features - set VLAN offload features for the PF VSI
++  * @vsi: PF's VSI
++  * @features: features used to determine VLAN offload settings
++  *
++  * First, determine the vlan_ethertype based on the VLAN offload bits in
++  * features. Then determine if stripping and insertion should be enabled or
++  * disabled. Finally enable or disable VLAN stripping and insertion.
++  */
++ static int
++ ice_set_vlan_offload_features(struct ice_vsi *vsi, netdev_features_t features)
++ {
++ 	bool enable_stripping = true, enable_insertion = true;
++ 	struct ice_vsi_vlan_ops *vlan_ops;
++ 	int strip_err = 0, insert_err = 0;
++ 	u16 vlan_ethertype = 0;
++ 
++ 	vlan_ops = ice_get_compat_vsi_vlan_ops(vsi);
++ 
++ 	if (features & (NETIF_F_HW_VLAN_STAG_RX | NETIF_F_HW_VLAN_STAG_TX))
++ 		vlan_ethertype = ETH_P_8021AD;
++ 	else if (features & (NETIF_F_HW_VLAN_CTAG_RX | NETIF_F_HW_VLAN_CTAG_TX))
++ 		vlan_ethertype = ETH_P_8021Q;
++ 
++ 	if (!(features & (NETIF_F_HW_VLAN_STAG_RX | NETIF_F_HW_VLAN_CTAG_RX)))
++ 		enable_stripping = false;
++ 	if (!(features & (NETIF_F_HW_VLAN_STAG_TX | NETIF_F_HW_VLAN_CTAG_TX)))
++ 		enable_insertion = false;
++ 
++ 	if (enable_stripping)
++ 		strip_err = vlan_ops->ena_stripping(vsi, vlan_ethertype);
++ 	else
++ 		strip_err = vlan_ops->dis_stripping(vsi);
++ 
++ 	if (enable_insertion)
++ 		insert_err = vlan_ops->ena_insertion(vsi, vlan_ethertype);
++ 	else
++ 		insert_err = vlan_ops->dis_insertion(vsi);
++ 
++ 	if (strip_err || insert_err)
++ 		return -EIO;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * ice_set_vlan_filtering_features - set VLAN filtering features for the PF VSI
++  * @vsi: PF's VSI
++  * @features: features used to determine VLAN filtering settings
++  *
++  * Enable or disable Rx VLAN filtering based on the VLAN filtering bits in the
++  * features.
++  */
++ static int
++ ice_set_vlan_filtering_features(struct ice_vsi *vsi, netdev_features_t features)
++ {
++ 	struct ice_vsi_vlan_ops *vlan_ops = ice_get_compat_vsi_vlan_ops(vsi);
++ 	int err = 0;
++ 
++ 	/* support Single VLAN Mode (SVM) and Double VLAN Mode (DVM) by checking
++ 	 * if either bit is set
++ 	 */
++ 	if (features &
++ 	    (NETIF_F_HW_VLAN_CTAG_FILTER | NETIF_F_HW_VLAN_STAG_FILTER))
++ 		err = vlan_ops->ena_rx_filtering(vsi);
++ 	else
++ 		err = vlan_ops->dis_rx_filtering(vsi);
++ 
++ 	return err;
++ }
++ 
++ /**
++  * ice_set_vlan_features - set VLAN settings based on suggested feature set
++  * @netdev: ptr to the netdev being adjusted
++  * @features: the feature set that the stack is suggesting
++  *
++  * Only update VLAN settings if the requested_vlan_features are different than
++  * the current_vlan_features.
++  */
++ static int
++ ice_set_vlan_features(struct net_device *netdev, netdev_features_t features)
++ {
++ 	netdev_features_t current_vlan_features, requested_vlan_features;
++ 	struct ice_netdev_priv *np = netdev_priv(netdev);
++ 	struct ice_vsi *vsi = np->vsi;
++ 	int err;
++ 
++ 	current_vlan_features = netdev->features & NETIF_VLAN_OFFLOAD_FEATURES;
++ 	requested_vlan_features = features & NETIF_VLAN_OFFLOAD_FEATURES;
++ 	if (current_vlan_features ^ requested_vlan_features) {
++ 		err = ice_set_vlan_offload_features(vsi, features);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	current_vlan_features = netdev->features &
++ 		NETIF_VLAN_FILTERING_FEATURES;
++ 	requested_vlan_features = features & NETIF_VLAN_FILTERING_FEATURES;
++ 	if (current_vlan_features ^ requested_vlan_features) {
++ 		err = ice_set_vlan_filtering_features(vsi, features);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 9542ef4fba8c (ice: Sync VLAN filtering features for DVM)
+  /**
+   * ice_set_features - set the netdev feature flags
+   * @netdev: ptr to the netdev being adjusted
+* Unmerged path drivers/net/ethernet/intel/ice/ice_main.c
