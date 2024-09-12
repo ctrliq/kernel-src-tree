@@ -1,0 +1,248 @@
+ice: add port representor ethtool ops and stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Wojciech Drewek <wojciech.drewek@intel.com>
+commit 7aae80cef7ba4b5245d392e62de1ebf1fc035f49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/7aae80ce.failed
+
+Introduce the following ethtool operations for VF's representor:
+	-get_drvinfo
+	-get_strings
+	-get_ethtool_stats
+	-get_sset_count
+	-get_link
+
+In all cases, existing operations were used with minor
+changes which allow us to detect if ethtool op was called for
+representor. Only VF VSI stats will be available for representor.
+
+Implement ndo_get_stats64 for port representor. This will update
+VF VSI stats and read them.
+
+	Signed-off-by: Wojciech Drewek <wojciech.drewek@intel.com>
+	Tested-by: Sandeep Penigalapati <sandeep.penigalapati@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 7aae80cef7ba4b5245d392e62de1ebf1fc035f49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_ethtool.c
+diff --cc drivers/net/ethernet/intel/ice/ice_ethtool.c
+index ddf868828876,201979cc47fb..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@@ -870,24 -888,22 +889,31 @@@ skip_ol_tests
+  static void ice_get_strings(struct net_device *netdev, u32 stringset, u8 *data)
+  {
+  	struct ice_netdev_priv *np = netdev_priv(netdev);
+++<<<<<<< HEAD
+ +	struct ice_vsi *vsi = np->vsi;
+ +	char *p = (char *)data;
+++=======
++ 	struct ice_vsi *vsi = ice_get_netdev_priv_vsi(np);
+++>>>>>>> 7aae80cef7ba (ice: add port representor ethtool ops and stats)
+  	unsigned int i;
+ -	u8 *p = data;
+  
+  	switch (stringset) {
+  	case ETH_SS_STATS:
+ -		for (i = 0; i < ICE_VSI_STATS_LEN; i++)
+ -			ethtool_sprintf(&p,
+ -					ice_gstrings_vsi_stats[i].stat_string);
+ +		for (i = 0; i < ICE_VSI_STATS_LEN; i++) {
+ +			snprintf(p, ETH_GSTRING_LEN, "%s",
+ +				 ice_gstrings_vsi_stats[i].stat_string);
+ +			p += ETH_GSTRING_LEN;
+ +		}
+  
++ 		if (ice_is_port_repr_netdev(netdev))
++ 			return;
++ 
+  		ice_for_each_alloc_txq(vsi, i) {
+ -			ethtool_sprintf(&p, "tx_queue_%u_packets", i);
+ -			ethtool_sprintf(&p, "tx_queue_%u_bytes", i);
+ +			snprintf(p, ETH_GSTRING_LEN,
+ +				 "tx_queue_%u_packets", i);
+ +			p += ETH_GSTRING_LEN;
+ +			snprintf(p, ETH_GSTRING_LEN, "tx_queue_%u_bytes", i);
+ +			p += ETH_GSTRING_LEN;
+  		}
+  
+  		ice_for_each_alloc_rxq(vsi, i) {
+@@@ -1345,10 -1348,9 +1374,10 @@@ ice_get_ethtool_stats(struct net_devic
+  		      struct ethtool_stats __always_unused *stats, u64 *data)
+  {
+  	struct ice_netdev_priv *np = netdev_priv(netdev);
+- 	struct ice_vsi *vsi = np->vsi;
++ 	struct ice_vsi *vsi = ice_get_netdev_priv_vsi(np);
+  	struct ice_pf *pf = vsi->back;
+ -	struct ice_ring *ring;
+ +	struct ice_tx_ring *tx_ring;
+ +	struct ice_rx_ring *rx_ring;
+  	unsigned int j;
+  	int i = 0;
+  	char *p;
+diff --git a/drivers/net/ethernet/intel/ice/ice.h b/drivers/net/ethernet/intel/ice/ice.h
+index ffdeecf46b8e..8f1414ce0756 100644
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -632,6 +632,19 @@ static inline struct ice_vsi *ice_get_main_vsi(struct ice_pf *pf)
+ 	return NULL;
+ }
+ 
++/**
++ * ice_get_netdev_priv_vsi - return VSI associated with netdev priv.
++ * @np: private netdev structure
++ */
++static inline struct ice_vsi *ice_get_netdev_priv_vsi(struct ice_netdev_priv *np)
++{
++	/* In case of port representor return source port VSI. */
++	if (np->repr)
++		return np->repr->src_vsi;
++	else
++		return np->vsi;
++}
++
+ /**
+  * ice_get_ctrl_vsi - Get the control VSI
+  * @pf: PF instance
+@@ -687,6 +700,7 @@ int ice_vsi_setup_rx_rings(struct ice_vsi *vsi);
+ int ice_vsi_open_ctrl(struct ice_vsi *vsi);
+ int ice_vsi_open(struct ice_vsi *vsi);
+ void ice_set_ethtool_ops(struct net_device *netdev);
++void ice_set_ethtool_repr_ops(struct net_device *netdev);
+ void ice_set_ethtool_safe_mode_ops(struct net_device *netdev);
+ u16 ice_get_avail_txq_count(struct ice_pf *pf);
+ u16 ice_get_avail_rxq_count(struct ice_pf *pf);
+diff --git a/drivers/net/ethernet/intel/ice/ice_dcb_lib.c b/drivers/net/ethernet/intel/ice/ice_dcb_lib.c
+index 67535fb7c4b5..4284526e9e24 100644
+--- a/drivers/net/ethernet/intel/ice/ice_dcb_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_dcb_lib.c
+@@ -684,6 +684,11 @@ void ice_pf_dcb_recfg(struct ice_pf *pf)
+ 				vsi->idx);
+ 			continue;
+ 		}
++		/* no need to proceed with remaining cfg if it is switchdev
++		 * VSI
++		 */
++		if (vsi->type == ICE_VSI_SWITCHDEV_CTRL)
++			continue;
+ 
+ 		ice_vsi_map_rings_to_vectors(vsi);
+ 		if (vsi->type == ICE_VSI_PF)
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ethtool.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_repr.c b/drivers/net/ethernet/intel/ice/ice_repr.c
+index afdceea6d22a..3d6d7376fced 100644
+--- a/drivers/net/ethernet/intel/ice/ice_repr.c
++++ b/drivers/net/ethernet/intel/ice/ice_repr.c
+@@ -39,6 +39,37 @@ ice_repr_get_phys_port_name(struct net_device *netdev, char *buf, size_t len)
+ 	return 0;
+ }
+ 
++/**
++ * ice_repr_get_stats64 - get VF stats for VFPR use
++ * @netdev: pointer to port representor netdev
++ * @stats: pointer to struct where stats can be stored
++ */
++static void
++ice_repr_get_stats64(struct net_device *netdev, struct rtnl_link_stats64 *stats)
++{
++	struct ice_netdev_priv *np = netdev_priv(netdev);
++	struct ice_eth_stats *eth_stats;
++	struct ice_vsi *vsi;
++
++	if (ice_is_vf_disabled(np->repr->vf))
++		return;
++	vsi = np->repr->src_vsi;
++
++	ice_update_vsi_stats(vsi);
++	eth_stats = &vsi->eth_stats;
++
++	stats->tx_packets = eth_stats->tx_unicast + eth_stats->tx_broadcast +
++			    eth_stats->tx_multicast;
++	stats->rx_packets = eth_stats->rx_unicast + eth_stats->rx_broadcast +
++			    eth_stats->rx_multicast;
++	stats->tx_bytes = eth_stats->tx_bytes;
++	stats->rx_bytes = eth_stats->rx_bytes;
++	stats->multicast = eth_stats->rx_multicast;
++	stats->tx_errors = eth_stats->tx_errors;
++	stats->tx_dropped = eth_stats->tx_discards;
++	stats->rx_dropped = eth_stats->rx_discards;
++}
++
+ /**
+  * ice_netdev_to_repr - Get port representor for given netdevice
+  * @netdev: pointer to port representor netdev
+@@ -112,6 +143,7 @@ ice_repr_get_devlink_port(struct net_device *netdev)
+ 
+ static const struct net_device_ops ice_repr_netdev_ops = {
+ 	.ndo_get_phys_port_name = ice_repr_get_phys_port_name,
++	.ndo_get_stats64 = ice_repr_get_stats64,
+ 	.ndo_open = ice_repr_open,
+ 	.ndo_stop = ice_repr_stop,
+ 	.ndo_get_devlink_port = ice_repr_get_devlink_port,
+@@ -135,6 +167,7 @@ ice_repr_reg_netdev(struct net_device *netdev)
+ {
+ 	eth_hw_addr_random(netdev);
+ 	netdev->netdev_ops = &ice_repr_netdev_ops;
++	ice_set_ethtool_repr_ops(netdev);
+ 
+ 	netif_carrier_off(netdev);
+ 	netif_tx_stop_all_queues(netdev);
+diff --git a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+index 2869c94123eb..8655b368a958 100644
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+@@ -1641,7 +1641,7 @@ bool ice_reset_all_vfs(struct ice_pf *pf, bool is_vflr)
+  *
+  * Returns true if the PF or VF is disabled, false otherwise.
+  */
+-static bool ice_is_vf_disabled(struct ice_vf *vf)
++bool ice_is_vf_disabled(struct ice_vf *vf)
+ {
+ 	struct ice_pf *pf = vf->pf;
+ 
+@@ -2879,7 +2879,7 @@ static void ice_wait_on_vf_reset(struct ice_vf *vf)
+  * disabled, and initialized so it can be configured and/or queried by a host
+  * administrator.
+  */
+-static int ice_check_vf_ready_for_cfg(struct ice_vf *vf)
++int ice_check_vf_ready_for_cfg(struct ice_vf *vf)
+ {
+ 	struct ice_pf *pf;
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+index abaffb3b28a7..dcfb7834e40d 100644
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+@@ -156,6 +156,10 @@ int ice_set_vf_trust(struct net_device *netdev, int vf_id, bool trusted);
+ 
+ int ice_set_vf_link_state(struct net_device *netdev, int vf_id, int link_state);
+ 
++int ice_check_vf_ready_for_cfg(struct ice_vf *vf);
++
++bool ice_is_vf_disabled(struct ice_vf *vf);
++
+ int ice_set_vf_spoofchk(struct net_device *netdev, int vf_id, bool ena);
+ 
+ int ice_calc_vf_reg_idx(struct ice_vf *vf, struct ice_q_vector *q_vector);
+@@ -189,6 +193,16 @@ static inline void ice_print_vfs_mdd_events(struct ice_pf *pf) { }
+ static inline void ice_print_vf_rx_mdd_event(struct ice_vf *vf) { }
+ static inline void ice_restore_all_vfs_msi_state(struct pci_dev *pdev) { }
+ 
++static inline int ice_check_vf_ready_for_cfg(struct ice_vf *vf)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline bool ice_is_vf_disabled(struct ice_vf *vf)
++{
++	return true;
++}
++
+ static inline struct ice_vsi *ice_get_vf_vsi(struct ice_vf *vf)
+ {
+ 	return NULL;
