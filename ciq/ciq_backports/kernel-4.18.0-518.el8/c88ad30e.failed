@@ -1,0 +1,400 @@
+cpufreq: amd-pstate: Add a kernel config option to set default mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-518.el8
+commit-author Mario Limonciello <mario.limonciello@amd.com>
+commit c88ad30e3f861c7be4e3b4995554e2b0754059b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-518.el8/c88ad30e.failed
+
+Users are having more success with amd-pstate since the introduction
+of EPP and Guided modes.  To expose the driver to more users by default
+introduce a kernel configuration option for setting the default mode.
+
+Users can use an integer to map out which default mode they want to use
+in lieu of a kernel command line option.
+
+This will default to EPP, but only if:
+ 1) The CPU supports an MSR.
+ 2) The system profile is identified
+ 3) The system profile is identified as a non-server by the FADT.
+
+Link: https://gitlab.freedesktop.org/hadess/power-profiles-daemon/-/merge_requests/121
+	Acked-by: Huang Rui <ray.huang@amd.com>
+	Reviewed-by: Gautham R. Shenoy <gautham.shenoy@amd.com>
+Co-developed-by: Perry Yuan <perry.yuan@amd.com>
+	Signed-off-by: Perry Yuan <perry.yuan@amd.com>
+	Signed-off-by: Mario Limonciello <mario.limonciello@amd.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit c88ad30e3f861c7be4e3b4995554e2b0754059b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/Kconfig.x86
+#	drivers/cpufreq/amd-pstate.c
+#	include/linux/amd-pstate.h
+diff --cc drivers/cpufreq/Kconfig.x86
+index 3f9244536601,438c9e75a04d..000000000000
+--- a/drivers/cpufreq/Kconfig.x86
++++ b/drivers/cpufreq/Kconfig.x86
+@@@ -48,6 -51,38 +48,41 @@@ config X86_AMD_PSTAT
+  
+  	  If in doubt, say N.
+  
+++<<<<<<< HEAD
+++=======
++ config X86_AMD_PSTATE_DEFAULT_MODE
++ 	int "AMD Processor P-State default mode"
++ 	depends on X86_AMD_PSTATE
++ 	default 3 if X86_AMD_PSTATE
++ 	range 1 4
++ 	help
++ 	  Select the default mode the amd-pstate driver will use on
++ 	  supported hardware.
++ 	  The value set has the following meanings:
++ 		1 -> Disabled
++ 		2 -> Passive
++ 		3 -> Active (EPP)
++ 		4 -> Guided
++ 
++ 	  For details, take a look at:
++ 	  <file:Documentation/admin-guide/pm/amd-pstate.rst>.
++ 
++ config X86_AMD_PSTATE_UT
++ 	tristate "selftest for AMD Processor P-State driver"
++ 	depends on X86 && ACPI_PROCESSOR
++ 	default n
++ 	help
++ 	  This kernel module is used for testing. It's safe to say M here.
++ 
++ 	  It can also be built-in without X86_AMD_PSTATE enabled.
++ 	  Currently, only tests for amd-pstate are supported. If X86_AMD_PSTATE
++ 	  is set disabled, it can tell the users test can only run on amd-pstate
++ 	  driver, please set X86_AMD_PSTATE enabled.
++ 	  In the future, comparison tests will be added. It can set amd-pstate
++ 	  disabled and set acpi-cpufreq enabled to run test cases, then compare
++ 	  the test results.
++ 
+++>>>>>>> c88ad30e3f86 (cpufreq: amd-pstate: Add a kernel config option to set default mode)
+  config X86_ACPI_CPUFREQ
+  	tristate "ACPI Processor P-States driver"
+  	depends on ACPI_PROCESSOR
+diff --cc drivers/cpufreq/amd-pstate.c
+index 2c71ef90154d,81fba0dcbee9..000000000000
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@@ -58,67 -59,173 +58,73 @@@
+   * we disable it by default to go acpi-cpufreq on these processors and add a
+   * module parameter to be able to enable it manually for debugging.
+   */
+ -static struct cpufreq_driver *current_pstate_driver;
+  static struct cpufreq_driver amd_pstate_driver;
+++<<<<<<< HEAD
+ +static int cppc_load __initdata;
+++=======
++ static struct cpufreq_driver amd_pstate_epp_driver;
++ static int cppc_state = AMD_PSTATE_UNDEFINED;
++ static bool cppc_enabled;
+++>>>>>>> c88ad30e3f86 (cpufreq: amd-pstate: Add a kernel config option to set default mode)
+  
+ -/*
+ - * AMD Energy Preference Performance (EPP)
+ - * The EPP is used in the CCLK DPM controller to drive
+ - * the frequency that a core is going to operate during
+ - * short periods of activity. EPP values will be utilized for
+ - * different OS profiles (balanced, performance, power savings)
+ - * display strings corresponding to EPP index in the
+ - * energy_perf_strings[]
+ - *	index		String
+ - *-------------------------------------
+ - *	0		default
+ - *	1		performance
+ - *	2		balance_performance
+ - *	3		balance_power
+ - *	4		power
+ +/**
+ + * struct  amd_aperf_mperf
+ + * @aperf: actual performance frequency clock count
+ + * @mperf: maximum performance frequency clock count
+ + * @tsc:   time stamp counter
+   */
+ -enum energy_perf_value_index {
+ -	EPP_INDEX_DEFAULT = 0,
+ -	EPP_INDEX_PERFORMANCE,
+ -	EPP_INDEX_BALANCE_PERFORMANCE,
+ -	EPP_INDEX_BALANCE_POWERSAVE,
+ -	EPP_INDEX_POWERSAVE,
+ -};
+ -
+ -static const char * const energy_perf_strings[] = {
+ -	[EPP_INDEX_DEFAULT] = "default",
+ -	[EPP_INDEX_PERFORMANCE] = "performance",
+ -	[EPP_INDEX_BALANCE_PERFORMANCE] = "balance_performance",
+ -	[EPP_INDEX_BALANCE_POWERSAVE] = "balance_power",
+ -	[EPP_INDEX_POWERSAVE] = "power",
+ -	NULL
+ +struct amd_aperf_mperf {
+ +	u64 aperf;
+ +	u64 mperf;
+ +	u64 tsc;
+  };
+  
+ -static unsigned int epp_values[] = {
+ -	[EPP_INDEX_DEFAULT] = 0,
+ -	[EPP_INDEX_PERFORMANCE] = AMD_CPPC_EPP_PERFORMANCE,
+ -	[EPP_INDEX_BALANCE_PERFORMANCE] = AMD_CPPC_EPP_BALANCE_PERFORMANCE,
+ -	[EPP_INDEX_BALANCE_POWERSAVE] = AMD_CPPC_EPP_BALANCE_POWERSAVE,
+ -	[EPP_INDEX_POWERSAVE] = AMD_CPPC_EPP_POWERSAVE,
+ - };
+ -
+ -typedef int (*cppc_mode_transition_fn)(int);
+ -
+ -static inline int get_mode_idx_from_str(const char *str, size_t size)
+ -{
+ -	int i;
+ -
+ -	for (i=0; i < AMD_PSTATE_MAX; i++) {
+ -		if (!strncmp(str, amd_pstate_mode_string[i], size))
+ -			return i;
+ -	}
+ -	return -EINVAL;
+ -}
+ -
+ -static DEFINE_MUTEX(amd_pstate_limits_lock);
+ -static DEFINE_MUTEX(amd_pstate_driver_lock);
+ -
+ -static s16 amd_pstate_get_epp(struct amd_cpudata *cpudata, u64 cppc_req_cached)
+ -{
+ -	u64 epp;
+ -	int ret;
+ -
+ -	if (boot_cpu_has(X86_FEATURE_CPPC)) {
+ -		if (!cppc_req_cached) {
+ -			epp = rdmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ,
+ -					&cppc_req_cached);
+ -			if (epp)
+ -				return epp;
+ -		}
+ -		epp = (cppc_req_cached >> 24) & 0xFF;
+ -	} else {
+ -		ret = cppc_get_epp_perf(cpudata->cpu, &epp);
+ -		if (ret < 0) {
+ -			pr_debug("Could not retrieve energy perf value (%d)\n", ret);
+ -			return -EIO;
+ -		}
+ -	}
+ -
+ -	return (s16)(epp & 0xff);
+ -}
+ -
+ -static int amd_pstate_get_energy_pref_index(struct amd_cpudata *cpudata)
+ -{
+ -	s16 epp;
+ -	int index = -EINVAL;
+ -
+ -	epp = amd_pstate_get_epp(cpudata, 0);
+ -	if (epp < 0)
+ -		return epp;
+ -
+ -	switch (epp) {
+ -	case AMD_CPPC_EPP_PERFORMANCE:
+ -		index = EPP_INDEX_PERFORMANCE;
+ -		break;
+ -	case AMD_CPPC_EPP_BALANCE_PERFORMANCE:
+ -		index = EPP_INDEX_BALANCE_PERFORMANCE;
+ -		break;
+ -	case AMD_CPPC_EPP_BALANCE_POWERSAVE:
+ -		index = EPP_INDEX_BALANCE_POWERSAVE;
+ -		break;
+ -	case AMD_CPPC_EPP_POWERSAVE:
+ -		index = EPP_INDEX_POWERSAVE;
+ -		break;
+ -	default:
+ -		break;
+ -	}
+ -
+ -	return index;
+ -}
+ -
+ -static int amd_pstate_set_epp(struct amd_cpudata *cpudata, u32 epp)
+ -{
+ -	int ret;
+ -	struct cppc_perf_ctrls perf_ctrls;
+ -
+ -	if (boot_cpu_has(X86_FEATURE_CPPC)) {
+ -		u64 value = READ_ONCE(cpudata->cppc_req_cached);
+ -
+ -		value &= ~GENMASK_ULL(31, 24);
+ -		value |= (u64)epp << 24;
+ -		WRITE_ONCE(cpudata->cppc_req_cached, value);
+ -
+ -		ret = wrmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ, value);
+ -		if (!ret)
+ -			cpudata->epp_cached = epp;
+ -	} else {
+ -		perf_ctrls.energy_perf = epp;
+ -		ret = cppc_set_epp_perf(cpudata->cpu, &perf_ctrls, 1);
+ -		if (ret) {
+ -			pr_debug("failed to set energy perf value (%d)\n", ret);
+ -			return ret;
+ -		}
+ -		cpudata->epp_cached = epp;
+ -	}
+ -
+ -	return ret;
+ -}
+ -
+ -static int amd_pstate_set_energy_pref_index(struct amd_cpudata *cpudata,
+ -		int pref_index)
+ -{
+ -	int epp = -EINVAL;
+ -	int ret;
+ +/**
+ + * struct amd_cpudata - private CPU data for AMD P-State
+ + * @cpu: CPU number
+ + * @req: constraint request to apply
+ + * @cppc_req_cached: cached performance request hints
+ + * @highest_perf: the maximum performance an individual processor may reach,
+ + *		  assuming ideal conditions
+ + * @nominal_perf: the maximum sustained performance level of the processor,
+ + *		  assuming ideal operating conditions
+ + * @lowest_nonlinear_perf: the lowest performance level at which nonlinear power
+ + *			   savings are achieved
+ + * @lowest_perf: the absolute lowest performance level of the processor
+ + * @max_freq: the frequency that mapped to highest_perf
+ + * @min_freq: the frequency that mapped to lowest_perf
+ + * @nominal_freq: the frequency that mapped to nominal_perf
+ + * @lowest_nonlinear_freq: the frequency that mapped to lowest_nonlinear_perf
+ + * @cur: Difference of Aperf/Mperf/tsc count between last and current sample
+ + * @prev: Last Aperf/Mperf/tsc count value read from register
+ + * @freq: current cpu frequency value
+ + * @boost_supported: check whether the Processor or SBIOS supports boost mode
+ + *
+ + * The amd_cpudata is key private data for each CPU thread in AMD P-State, and
+ + * represents all the attributes and goals that AMD P-State requests at runtime.
+ + */
+ +struct amd_cpudata {
+ +	int	cpu;
+  
+ -	if (!pref_index) {
+ -		pr_debug("EPP pref_index is invalid\n");
+ -		return -EINVAL;
+ -	}
+ +	struct	freq_qos_request req[2];
+ +	u64	cppc_req_cached;
+  
+ -	if (epp == -EINVAL)
+ -		epp = epp_values[pref_index];
+ +	u32	highest_perf;
+ +	u32	nominal_perf;
+ +	u32	lowest_nonlinear_perf;
+ +	u32	lowest_perf;
+  
+ -	if (epp > 0 && cpudata->policy == CPUFREQ_POLICY_PERFORMANCE) {
+ -		pr_debug("EPP cannot be set under performance policy\n");
+ -		return -EBUSY;
+ -	}
+ +	u32	max_freq;
+ +	u32	min_freq;
+ +	u32	nominal_freq;
+ +	u32	lowest_nonlinear_freq;
+  
+ -	ret = amd_pstate_set_epp(cpudata, epp);
+ +	struct amd_aperf_mperf cur;
+ +	struct amd_aperf_mperf prev;
+  
+ -	return ret;
+ -}
+ +	u64 	freq;
+ +	bool	boost_supported;
+ +};
+  
+  static inline int pstate_enable(bool enable)
+  {
+@@@ -675,21 -1396,46 +681,60 @@@ static struct cpufreq_driver amd_pstate
+  	.attr		= amd_pstate_attr,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static struct cpufreq_driver amd_pstate_epp_driver = {
++ 	.flags		= CPUFREQ_CONST_LOOPS,
++ 	.verify		= amd_pstate_epp_verify_policy,
++ 	.setpolicy	= amd_pstate_epp_set_policy,
++ 	.init		= amd_pstate_epp_cpu_init,
++ 	.exit		= amd_pstate_epp_cpu_exit,
++ 	.offline	= amd_pstate_epp_cpu_offline,
++ 	.online		= amd_pstate_epp_cpu_online,
++ 	.suspend	= amd_pstate_epp_suspend,
++ 	.resume		= amd_pstate_epp_resume,
++ 	.name		= "amd-pstate-epp",
++ 	.attr		= amd_pstate_epp_attr,
++ };
++ 
++ static int __init amd_pstate_set_driver(int mode_idx)
++ {
++ 	if (mode_idx >= AMD_PSTATE_DISABLE && mode_idx < AMD_PSTATE_MAX) {
++ 		cppc_state = mode_idx;
++ 		if (cppc_state == AMD_PSTATE_DISABLE)
++ 			pr_info("driver is explicitly disabled\n");
++ 
++ 		if (cppc_state == AMD_PSTATE_ACTIVE)
++ 			current_pstate_driver = &amd_pstate_epp_driver;
++ 
++ 		if (cppc_state == AMD_PSTATE_PASSIVE || cppc_state == AMD_PSTATE_GUIDED)
++ 			current_pstate_driver = &amd_pstate_driver;
++ 
++ 		return 0;
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ 
+++>>>>>>> c88ad30e3f86 (cpufreq: amd-pstate: Add a kernel config option to set default mode)
+  static int __init amd_pstate_init(void)
+  {
+ -	struct device *dev_root;
+  	int ret;
+  
+  	if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD)
+  		return -ENODEV;
+++<<<<<<< HEAD
+ +	/*
+ +	 * by default the pstate driver is disabled to load
+ +	 * enable the amd_pstate passive mode driver explicitly
+ +	 * with amd_pstate=passive in kernel command line
+ +	 */
+ +	if (!cppc_load) {
+ +		pr_debug("driver load is disabled, boot with amd_pstate=passive to enable this\n");
+ +		return -ENODEV;
+ +	}
+++=======
+++>>>>>>> c88ad30e3f86 (cpufreq: amd-pstate: Add a kernel config option to set default mode)
+  
+  	if (!acpi_cpc_valid()) {
+  		pr_warn_once("the _CPC object is not present in SBIOS or ACPI disabled\n");
+@@@ -732,13 -1519,13 +804,17 @@@ static int __init amd_pstate_param(cha
+  	if (!str)
+  		return -EINVAL;
+  
+ -	size = strlen(str);
+ -	mode_idx = get_mode_idx_from_str(str, size);
+ +	if (!strcmp(str, "disable")) {
+ +		cppc_load = 0;
+ +		pr_info("driver is explicitly disabled\n");
+ +	} else if (!strcmp(str, "passive"))
+ +		cppc_load = 1;
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	return amd_pstate_set_driver(mode_idx);
+++>>>>>>> c88ad30e3f86 (cpufreq: amd-pstate: Add a kernel config option to set default mode)
+  }
+  early_param("amd_pstate", amd_pstate_param);
+  
+* Unmerged path include/linux/amd-pstate.h
+* Unmerged path drivers/cpufreq/Kconfig.x86
+* Unmerged path drivers/cpufreq/amd-pstate.c
+* Unmerged path include/linux/amd-pstate.h
