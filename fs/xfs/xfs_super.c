@@ -1690,6 +1690,11 @@ xfs_remount_ro(
 	};
 	int			error;
 
+	/* Flush all the dirty data to disk. */
+	error = sync_filesystem(mp->m_super);
+	if (error)
+		return error;
+
 	/*
 	 * Cancel background eofb scanning so it cannot race with the final
 	 * log force+buftarg wait and deadlock the remount.
@@ -1759,8 +1764,6 @@ xfs_fs_reconfigure(
 	error = xfs_fs_validate_params(new_mp);
 	if (error)
 		return error;
-
-	sync_filesystem(mp->m_super);
 
 	/* inode32 -> inode64 */
 	if ((mp->m_flags & XFS_MOUNT_SMALL_INUMS) &&
