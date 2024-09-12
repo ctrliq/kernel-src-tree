@@ -1,0 +1,235 @@
+rxrpc: Make the set of connection IDs per local endpoint
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit f06cb29189361353e9ed12df936c8e1d7f69b730
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/f06cb291.failed
+
+Make the set of connection IDs per local endpoint so that endpoints don't
+cause each other's connections to get dismissed.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit f06cb29189361353e9ed12df936c8e1d7f69b730)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/conn_client.c
+#	net/rxrpc/conn_object.c
+#	net/rxrpc/local_object.c
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,e9ab06100a21..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -860,11 -889,10 +862,16 @@@ static inline bool rxrpc_is_client_call
+  extern unsigned int rxrpc_reap_client_connections;
+  extern unsigned long rxrpc_conn_idle_client_expiry;
+  extern unsigned long rxrpc_conn_idle_client_fast_expiry;
+- extern struct idr rxrpc_client_conn_ids;
+  
+++<<<<<<< HEAD
+ +void rxrpc_destroy_client_conn_ids(void);
+ +struct rxrpc_bundle *rxrpc_get_bundle(struct rxrpc_bundle *);
+ +void rxrpc_put_bundle(struct rxrpc_bundle *);
+++=======
++ void rxrpc_destroy_client_conn_ids(struct rxrpc_local *local);
++ struct rxrpc_bundle *rxrpc_get_bundle(struct rxrpc_bundle *, enum rxrpc_bundle_trace);
++ void rxrpc_put_bundle(struct rxrpc_bundle *, enum rxrpc_bundle_trace);
+++>>>>>>> f06cb2918936 (rxrpc: Make the set of connection IDs per local endpoint)
+  int rxrpc_connect_call(struct rxrpc_sock *, struct rxrpc_call *,
+  		       struct rxrpc_conn_parameters *, struct sockaddr_rxrpc *,
+  		       gfp_t);
+diff --cc net/rxrpc/conn_client.c
+index 827c1308297c,59ce5c08cf57..000000000000
+--- a/net/rxrpc/conn_client.c
++++ b/net/rxrpc/conn_client.c
+@@@ -51,7 -45,7 +45,11 @@@ static void rxrpc_deactivate_bundle(str
+  static int rxrpc_get_client_connection_id(struct rxrpc_connection *conn,
+  					  gfp_t gfp)
+  {
+++<<<<<<< HEAD
+ +	struct rxrpc_net *rxnet = conn->params.local->rxnet;
+++=======
++ 	struct rxrpc_local *local = conn->local;
+++>>>>>>> f06cb2918936 (rxrpc: Make the set of connection IDs per local endpoint)
+  	int id;
+  
+  	_enter("");
+@@@ -967,24 -976,7 +965,28 @@@ static void rxrpc_kill_client_conn(stru
+  	trace_rxrpc_client(conn, -1, rxrpc_client_cleanup);
+  	atomic_dec(&rxnet->nr_client_conns);
+  
+++<<<<<<< HEAD
+ +	rxrpc_put_client_connection_id(conn);
+ +	rxrpc_kill_connection(conn);
+ +}
+ +
+ +/*
+ + * Clean up a dead client connections.
+ + */
+ +void rxrpc_put_client_conn(struct rxrpc_connection *conn)
+ +{
+ +	const void *here = __builtin_return_address(0);
+ +	unsigned int debug_id = conn->debug_id;
+ +	bool dead;
+ +	int r;
+ +
+ +	dead = __refcount_dec_and_test(&conn->ref, &r);
+ +	trace_rxrpc_conn(debug_id, rxrpc_conn_put_client, r - 1, here);
+ +	if (dead)
+ +		rxrpc_kill_client_conn(conn);
+++=======
++ 	rxrpc_put_client_connection_id(local, conn);
+++>>>>>>> f06cb2918936 (rxrpc: Make the set of connection IDs per local endpoint)
+  }
+  
+  /*
+diff --cc net/rxrpc/conn_object.c
+index 156bd26daf74,2e3f0a222e1b..000000000000
+--- a/net/rxrpc/conn_object.c
++++ b/net/rxrpc/conn_object.c
+@@@ -79,15 -100,12 +79,24 @@@ struct rxrpc_connection *rxrpc_find_con
+  
+  	_enter(",%x", sp->hdr.cid & RXRPC_CIDMASK);
+  
+++<<<<<<< HEAD
+ +	if (rxrpc_extract_addr_from_skb(&srx, skb) < 0)
+ +		goto not_found;
+ +
+ +	if (srx.transport.family != local->srx.transport.family &&
+ +	    (srx.transport.family == AF_INET &&
+ +	     local->srx.transport.family != AF_INET6)) {
+ +		pr_warn_ratelimited("AF_RXRPC: Protocol mismatch %u not %u\n",
+ +				    srx.transport.family,
+ +				    local->srx.transport.family);
+++=======
++ 	/* Look up client connections by connection ID alone as their
++ 	 * IDs are unique for this machine.
++ 	 */
++ 	conn = idr_find(&local->conn_ids, sp->hdr.cid >> RXRPC_CIDSHIFT);
++ 	if (!conn || refcount_read(&conn->ref) == 0) {
++ 		_debug("no conn");
+++>>>>>>> f06cb2918936 (rxrpc: Make the set of connection IDs per local endpoint)
+  		goto not_found;
+  	}
+  
+diff --cc net/rxrpc/local_object.c
+index 846558613c7f,ca8b3ee68b59..000000000000
+--- a/net/rxrpc/local_object.c
++++ b/net/rxrpc/local_object.c
+@@@ -96,7 -110,15 +97,19 @@@ static struct rxrpc_local *rxrpc_alloc_
+  		local->debug_id = atomic_inc_return(&rxrpc_debug_id);
+  		memcpy(&local->srx, srx, sizeof(*srx));
+  		local->srx.srx_service = 0;
+++<<<<<<< HEAD
+ +		trace_rxrpc_local(local->debug_id, rxrpc_local_new, 1, NULL);
+++=======
++ 		idr_init(&local->conn_ids);
++ 		get_random_bytes(&tmp, sizeof(tmp));
++ 		tmp &= 0x3fffffff;
++ 		if (tmp == 0)
++ 			tmp = 1;
++ 		idr_set_cursor(&local->conn_ids, tmp);
++ 		spin_lock_init(&local->conn_lock);
++ 
++ 		trace_rxrpc_local(local->debug_id, rxrpc_local_new, 1, 1);
+++>>>>>>> f06cb2918936 (rxrpc: Make the set of connection IDs per local endpoint)
+  	}
+  
+  	_leave(" = %p", local);
+@@@ -393,52 -417,8 +406,57 @@@ static void rxrpc_local_destroyer(struc
+  	/* At this point, there should be no more packets coming in to the
+  	 * local endpoint.
+  	 */
+++<<<<<<< HEAD
+ +	rxrpc_purge_queue(&local->reject_queue);
+ +	rxrpc_purge_queue(&local->event_queue);
+ +}
+ +
+ +/*
+ + * Process events on an endpoint.  The work item carries a ref which
+ + * we must release.
+ + */
+ +static void rxrpc_local_processor(struct work_struct *work)
+ +{
+ +	struct rxrpc_local *local =
+ +		container_of(work, struct rxrpc_local, processor);
+ +	bool again;
+ +
+ +	if (local->dead)
+ +		return;
+ +
+ +	trace_rxrpc_local(local->debug_id, rxrpc_local_processing,
+ +			  refcount_read(&local->ref), NULL);
+ +
+ +	do {
+ +		again = false;
+ +		if (!__rxrpc_use_local(local)) {
+ +			rxrpc_local_destroyer(local);
+ +			break;
+ +		}
+ +
+ +		if (!list_empty(&local->ack_tx_queue)) {
+ +			rxrpc_transmit_ack_packets(local);
+ +			again = true;
+ +		}
+ +
+ +		if (!skb_queue_empty(&local->reject_queue)) {
+ +			rxrpc_reject_packets(local);
+ +			again = true;
+ +		}
+ +
+ +		if (!skb_queue_empty(&local->event_queue)) {
+ +			rxrpc_process_local_events(local);
+ +			again = true;
+ +		}
+ +
+ +		__rxrpc_unuse_local(local);
+ +	} while (again);
+ +
+ +	rxrpc_put_local(local);
+++=======
++ 	rxrpc_purge_queue(&local->rx_queue);
++ 	rxrpc_destroy_client_conn_ids(local);
+++>>>>>>> f06cb2918936 (rxrpc: Make the set of connection IDs per local endpoint)
+  }
+  
+  /*
+diff --git a/net/rxrpc/af_rxrpc.c b/net/rxrpc/af_rxrpc.c
+index 0f4d34f420f0..ef95d96ca2b1 100644
+--- a/net/rxrpc/af_rxrpc.c
++++ b/net/rxrpc/af_rxrpc.c
+@@ -957,16 +957,9 @@ static const struct net_proto_family rxrpc_family_ops = {
+ static int __init af_rxrpc_init(void)
+ {
+ 	int ret = -1;
+-	unsigned int tmp;
+ 
+ 	BUILD_BUG_ON(sizeof(struct rxrpc_skb_priv) > sizeof_field(struct sk_buff, cb));
+ 
+-	get_random_bytes(&tmp, sizeof(tmp));
+-	tmp &= 0x3fffffff;
+-	if (tmp == 0)
+-		tmp = 1;
+-	idr_set_cursor(&rxrpc_client_conn_ids, tmp);
+-
+ 	ret = -ENOMEM;
+ 	rxrpc_call_jar = kmem_cache_create(
+ 		"rxrpc_call_jar", sizeof(struct rxrpc_call), 0,
+@@ -1062,7 +1055,6 @@ static void __exit af_rxrpc_exit(void)
+ 	 * are released.
+ 	 */
+ 	rcu_barrier();
+-	rxrpc_destroy_client_conn_ids();
+ 
+ 	destroy_workqueue(rxrpc_workqueue);
+ 	rxrpc_exit_security();
+* Unmerged path net/rxrpc/ar-internal.h
+* Unmerged path net/rxrpc/conn_client.c
+* Unmerged path net/rxrpc/conn_object.c
+* Unmerged path net/rxrpc/local_object.c
