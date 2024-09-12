@@ -1,0 +1,243 @@
+arm64: Always keep DAIF.[IF] in sync
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+Rebuild_CHGLOG: - arm64: Always keep DAIF.[IF] in sync (Charles Mirabile) [2047817]
+Rebuild_FUZZ: 92.54%
+commit-author Hector Martin <marcan@marcan.st>
+commit f0098155d337cab638cf18e37a3e9257d653d481
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/f0098155.failed
+
+Apple SoCs (A11 and newer) have some interrupt sources hardwired to the
+FIQ line. We implement support for this by simply treating IRQs and FIQs
+the same way in the interrupt vectors.
+
+To support these systems, the FIQ mask bit needs to be kept in sync with
+the IRQ mask bit, so both kinds of exceptions are masked together. No
+other platforms should be delivering FIQ exceptions right now, and we
+already unmask FIQ in normal process context, so this should not have an
+effect on other systems - if spurious FIQs were arriving, they would
+already panic the kernel.
+
+	Signed-off-by: Hector Martin <marcan@marcan.st>
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Tested-by: Hector Martin <marcan@marcan.st>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: Marc Zyngier <maz@kernel.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Will Deacon <will@kernel.org>
+	Acked-by: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20210315115629.57191-6-mark.rutland@arm.com
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit f0098155d337cab638cf18e37a3e9257d653d481)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/entry.S
+diff --cc arch/arm64/kernel/entry.S
+index 7a54fd267d61,ce8d4dc416fb..000000000000
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@@ -474,6 -531,47 +474,50 @@@ alternative_endi
+  #endif
+  	.endm
+  
+++<<<<<<< HEAD
+++=======
++ 	.macro el1_interrupt_handler, handler:req
++ 	gic_prio_irq_setup pmr=x20, tmp=x1
++ 	enable_da
++ 
++ 	mov	x0, sp
++ 	bl	enter_el1_irq_or_nmi
++ 
++ 	irq_handler	\handler
++ 
++ #ifdef CONFIG_PREEMPTION
++ 	ldr	x24, [tsk, #TSK_TI_PREEMPT]	// get preempt count
++ alternative_if ARM64_HAS_IRQ_PRIO_MASKING
++ 	/*
++ 	 * DA were cleared at start of handling, and IF are cleared by
++ 	 * the GIC irqchip driver using gic_arch_enable_irqs() for
++ 	 * normal IRQs. If anything is set, it means we come back from
++ 	 * an NMI instead of a normal IRQ, so skip preemption
++ 	 */
++ 	mrs	x0, daif
++ 	orr	x24, x24, x0
++ alternative_else_nop_endif
++ 	cbnz	x24, 1f				// preempt count != 0 || NMI return path
++ 	bl	arm64_preempt_schedule_irq	// irq en/disable is done inside
++ 1:
++ #endif
++ 
++ 	mov	x0, sp
++ 	bl	exit_el1_irq_or_nmi
++ 	.endm
++ 
++ 	.macro el0_interrupt_handler, handler:req
++ 	gic_prio_irq_setup pmr=x20, tmp=x0
++ 	user_exit_irqoff
++ 	enable_da
++ 
++ 	tbz	x22, #55, 1f
++ 	bl	do_el0_irq_bp_hardening
++ 1:
++ 	irq_handler	\handler
++ 	.endm
++ 
+++>>>>>>> f0098155d337 (arm64: Always keep DAIF.[IF] in sync)
+  	.text
+  
+  /*
+diff --git a/arch/arm64/include/asm/arch_gicv3.h b/arch/arm64/include/asm/arch_gicv3.h
+index 7c7e6c21bfe8..98ac2083a3aa 100644
+--- a/arch/arm64/include/asm/arch_gicv3.h
++++ b/arch/arm64/include/asm/arch_gicv3.h
+@@ -184,7 +184,7 @@ static inline void gic_pmr_mask_irqs(void)
+ 
+ static inline void gic_arch_enable_irqs(void)
+ {
+-	asm volatile ("msr daifclr, #2" : : : "memory");
++	asm volatile ("msr daifclr, #3" : : : "memory");
+ }
+ 
+ #endif /* __ASSEMBLY__ */
+diff --git a/arch/arm64/include/asm/assembler.h b/arch/arm64/include/asm/assembler.h
+index 32748883ceaa..021b9f415df5 100644
+--- a/arch/arm64/include/asm/assembler.h
++++ b/arch/arm64/include/asm/assembler.h
+@@ -51,9 +51,9 @@
+ 	msr	daif, \flags
+ 	.endm
+ 
+-	/* IRQ is the lowest priority flag, unconditionally unmask the rest. */
+-	.macro enable_da_f
+-	msr	daifclr, #(8 | 4 | 1)
++	/* IRQ/FIQ are the lowest priority flags, unconditionally unmask the rest. */
++	.macro enable_da
++	msr	daifclr, #(8 | 4)
+ 	.endm
+ 
+ /*
+@@ -61,7 +61,7 @@
+  */
+ 	.macro	save_and_disable_irq, flags
+ 	mrs	\flags, daif
+-	msr	daifset, #2
++	msr	daifset, #3
+ 	.endm
+ 
+ 	.macro	restore_irq, flags
+diff --git a/arch/arm64/include/asm/daifflags.h b/arch/arm64/include/asm/daifflags.h
+index 9693d33e8720..4fa267b9c083 100644
+--- a/arch/arm64/include/asm/daifflags.h
++++ b/arch/arm64/include/asm/daifflags.h
+@@ -24,8 +24,8 @@
+ #include <asm/ptrace.h>
+ 
+ #define DAIF_PROCCTX		0
+-#define DAIF_PROCCTX_NOIRQ	PSR_I_BIT
+-#define DAIF_ERRCTX		(PSR_I_BIT | PSR_A_BIT)
++#define DAIF_PROCCTX_NOIRQ	(PSR_I_BIT | PSR_F_BIT)
++#define DAIF_ERRCTX		(PSR_A_BIT | PSR_I_BIT | PSR_F_BIT)
+ #define DAIF_MASK		(PSR_D_BIT | PSR_A_BIT | PSR_I_BIT | PSR_F_BIT)
+ 
+ 
+@@ -58,7 +58,7 @@ static inline unsigned long local_daif_save_flags(void)
+ 	if (system_uses_irq_prio_masking()) {
+ 		/* If IRQs are masked with PMR, reflect it in the flags */
+ 		if (read_sysreg_s(SYS_ICC_PMR_EL1) != GIC_PRIO_IRQON)
+-			flags |= PSR_I_BIT;
++			flags |= PSR_I_BIT | PSR_F_BIT;
+ 	}
+ 
+ 	return flags;
+@@ -80,7 +80,7 @@ static inline void local_daif_restore(unsigned long flags)
+ 	bool irq_disabled = flags & PSR_I_BIT;
+ 
+ 	WARN_ON(system_has_prio_mask_debugging() &&
+-		!(read_sysreg(daif) & PSR_I_BIT));
++		(read_sysreg(daif) & (PSR_I_BIT | PSR_F_BIT)) != (PSR_I_BIT | PSR_F_BIT));
+ 
+ 	if (!irq_disabled) {
+ 		trace_hardirqs_on();
+@@ -97,7 +97,7 @@ static inline void local_daif_restore(unsigned long flags)
+ 			 * If interrupts are disabled but we can take
+ 			 * asynchronous errors, we can take NMIs
+ 			 */
+-			flags &= ~PSR_I_BIT;
++			flags &= ~(PSR_I_BIT | PSR_F_BIT);
+ 			pmr = GIC_PRIO_IRQOFF;
+ 		} else {
+ 			pmr = GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET;
+diff --git a/arch/arm64/include/asm/irqflags.h b/arch/arm64/include/asm/irqflags.h
+index d03dee4d8fd1..0008007ff0b4 100644
+--- a/arch/arm64/include/asm/irqflags.h
++++ b/arch/arm64/include/asm/irqflags.h
+@@ -23,15 +23,13 @@
+ 
+ /*
+  * Aarch64 has flags for masking: Debug, Asynchronous (serror), Interrupts and
+- * FIQ exceptions, in the 'daif' register. We mask and unmask them in 'dai'
++ * FIQ exceptions, in the 'daif' register. We mask and unmask them in 'daif'
+  * order:
+  * Masking debug exceptions causes all other exceptions to be masked too/
+- * Masking SError masks irq, but not debug exceptions. Masking irqs has no
+- * side effects for other flags. Keeping to this order makes it easier for
+- * entry.S to know which exceptions should be unmasked.
+- *
+- * FIQ is never expected, but we mask it when we disable debug exceptions, and
+- * unmask it at all other times.
++ * Masking SError masks IRQ/FIQ, but not debug exceptions. IRQ and FIQ are
++ * always masked and unmasked together, and have no side effects for other
++ * flags. Keeping to this order makes it easier for entry.S to know which
++ * exceptions should be unmasked.
+  */
+ 
+ /*
+@@ -46,7 +44,7 @@ static inline void arch_local_irq_enable(void)
+ 	}
+ 
+ 	asm volatile(ALTERNATIVE(
+-		"msr	daifclr, #2		// arch_local_irq_enable",
++		"msr	daifclr, #3		// arch_local_irq_enable",
+ 		__msr_s(SYS_ICC_PMR_EL1, "%0"),
+ 		ARM64_HAS_IRQ_PRIO_MASKING)
+ 		:
+@@ -65,7 +63,7 @@ static inline void arch_local_irq_disable(void)
+ 	}
+ 
+ 	asm volatile(ALTERNATIVE(
+-		"msr	daifset, #2		// arch_local_irq_disable",
++		"msr	daifset, #3		// arch_local_irq_disable",
+ 		__msr_s(SYS_ICC_PMR_EL1, "%0"),
+ 		ARM64_HAS_IRQ_PRIO_MASKING)
+ 		:
+* Unmerged path arch/arm64/kernel/entry.S
+diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
+index e5d7925d7a3a..f8a285da2d5e 100644
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -91,7 +91,7 @@ static void noinstr __cpu_do_idle_irqprio(void)
+ 	unsigned long daif_bits;
+ 
+ 	daif_bits = read_sysreg(daif);
+-	write_sysreg(daif_bits | PSR_I_BIT, daif);
++	write_sysreg(daif_bits | PSR_I_BIT | PSR_F_BIT, daif);
+ 
+ 	/*
+ 	 * Unmask PMR before going idle to make sure interrupts can
+diff --git a/arch/arm64/kernel/smp.c b/arch/arm64/kernel/smp.c
+index 5a62ee829434..42d733d78987 100644
+--- a/arch/arm64/kernel/smp.c
++++ b/arch/arm64/kernel/smp.c
+@@ -199,6 +199,7 @@ static void init_gic_priority_masking(void)
+ 	cpuflags = read_sysreg(daif);
+ 
+ 	WARN_ON(!(cpuflags & PSR_I_BIT));
++	WARN_ON(!(cpuflags & PSR_F_BIT));
+ 
+ 	gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
+ }
