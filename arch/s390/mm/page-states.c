@@ -137,7 +137,7 @@ static void mark_kernel_pud(p4d_t *p4d, unsigned long addr, unsigned long end)
 			continue;
 		if (!pud_folded(*pud)) {
 			page = virt_to_page(pud_val(*pud));
-			for (i = 0; i < 3; i++)
+			for (i = 0; i < 4; i++)
 				set_bit(PG_arch_1, &page[i].flags);
 		}
 		mark_kernel_pmd(pud, addr, next);
@@ -158,7 +158,7 @@ static void mark_kernel_p4d(pgd_t *pgd, unsigned long addr, unsigned long end)
 			continue;
 		if (!p4d_folded(*p4d)) {
 			page = virt_to_page(p4d_val(*p4d));
-			for (i = 0; i < 3; i++)
+			for (i = 0; i < 4; i++)
 				set_bit(PG_arch_1, &page[i].flags);
 		}
 		mark_kernel_pud(p4d, addr, next);
@@ -178,7 +178,7 @@ static void mark_kernel_pgd(void)
 	 * kernel ASCE. This is required to keep the page table walker
 	 * from accessing non-existent entries.
 	 */
-	max_addr = (S390_lowcore.kernel_asce.val & _ASCE_TYPE_MASK) >> 2;
+	max_addr = (S390_lowcore.kernel_asce & _ASCE_TYPE_MASK) >> 2;
 	max_addr = 1UL << (max_addr * 11 + 31);
 	pgd = pgd_offset_k(addr);
 	do {
@@ -187,7 +187,7 @@ static void mark_kernel_pgd(void)
 			continue;
 		if (!pgd_folded(*pgd)) {
 			page = virt_to_page(pgd_val(*pgd));
-			for (i = 0; i < 3; i++)
+			for (i = 0; i < 4; i++)
 				set_bit(PG_arch_1, &page[i].flags);
 		}
 		mark_kernel_p4d(pgd, addr, next);
@@ -199,15 +199,13 @@ void __init cmma_init_nodat(void)
 	struct memblock_region *reg;
 	struct page *page;
 	unsigned long start, end, ix;
+	int i;
 
 	if (cmma_flag < 2)
 		return;
 	/* Mark pages used in kernel page tables */
 	mark_kernel_pgd();
 	page = virt_to_page(&swapper_pg_dir);
-	for (i = 0; i < 4; i++)
-		set_bit(PG_arch_1, &page[i].flags);
-	page = virt_to_page(&invalid_pg_dir);
 	for (i = 0; i < 4; i++)
 		set_bit(PG_arch_1, &page[i].flags);
 

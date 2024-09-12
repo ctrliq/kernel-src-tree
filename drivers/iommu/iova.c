@@ -937,8 +937,9 @@ static void free_iova_rcaches(struct iova_domain *iovad)
 	struct iova_rcache *rcache;
 	struct iova_cpu_rcache *cpu_rcache;
 	unsigned int cpu;
+	int i;
 
-	for (int i = 0; i < IOVA_RANGE_CACHE_MAX_SIZE; ++i) {
+	for (i = 0; i < IOVA_RANGE_CACHE_MAX_SIZE; ++i) {
 		rcache = &iovad->rcaches[i];
 		if (!rcache->cpu_rcaches)
 			break;
@@ -984,8 +985,9 @@ static void free_global_cached_iovas(struct iova_domain *iovad)
 {
 	struct iova_rcache *rcache;
 	unsigned long flags;
+	int i;
 
-	for (int i = 0; i < IOVA_RANGE_CACHE_MAX_SIZE; ++i) {
+	for (i = 0; i < IOVA_RANGE_CACHE_MAX_SIZE; ++i) {
 		rcache = &iovad->rcaches[i];
 		spin_lock_irqsave(&rcache->lock, flags);
 		while (rcache->depot) {
