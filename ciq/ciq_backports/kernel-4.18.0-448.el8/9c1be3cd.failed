@@ -1,0 +1,209 @@
+wifi: mac80211: consider aql_tx_pending when checking airtime deficit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Felix Fietkau <nbd@nbd.name>
+commit 9c1be3cde0046c7b06e69238a7af94039b3bed85
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/9c1be3cd.failed
+
+When queueing packets for a station, deficit only gets added once the packets
+have been transmitted, which could be much later. During that time, a lot of
+temporary unfairness could happen, which could lead to bursty behavior.
+Fix this by subtracting the aql_tx_pending when checking the deficit in tx
+scheduling.
+
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+	Acked-by: Toke Høiland-Jørgensen <toke@toke.dk>
+Link: https://lore.kernel.org/r/20220625212411.36675-3-nbd@nbd.name
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 9c1be3cde0046c7b06e69238a7af94039b3bed85)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/tx.c
+diff --cc net/mac80211/tx.c
+index 59b212870021,0509486ac40a..000000000000
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@@ -3787,47 -3810,59 +3794,75 @@@ static inline s32 ieee80211_sta_deficit
+  struct ieee80211_txq *ieee80211_next_txq(struct ieee80211_hw *hw, u8 ac)
+  {
+  	struct ieee80211_local *local = hw_to_local(hw);
+ +	struct airtime_sched_info *air_sched;
+ +	u64 now = ktime_get_coarse_boottime_ns();
+  	struct ieee80211_txq *ret = NULL;
+ -	struct txq_info *txqi = NULL, *head = NULL;
+ -	bool found_eligible_txq = false;
+ +	struct airtime_info *air_info;
+ +	struct txq_info *txqi = NULL;
+ +	struct rb_node *node;
+ +	bool first = false;
+  
+ -	spin_lock_bh(&local->active_txq_lock[ac]);
+ +	air_sched = &local->airtime[ac];
+ +	spin_lock_bh(&air_sched->lock);
+  
+ - begin:
+ -	txqi = list_first_entry_or_null(&local->active_txqs[ac],
+ -					struct txq_info,
+ -					schedule_order);
+ -	if (!txqi)
+ -		goto out;
+ +	node = air_sched->schedule_pos;
+  
+ -	if (txqi == head) {
+ -		if (!found_eligible_txq)
+ -			goto out;
+ -		else
+ -			found_eligible_txq = false;
+ +begin:
+ +	if (!node) {
+ +		node = rb_first_cached(&air_sched->active_txqs);
+ +		first = true;
+ +	} else {
+ +		node = rb_next(node);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!node)
+++=======
++ 	if (!head)
++ 		head = txqi;
++ 
++ 	if (txqi->txq.sta) {
++ 		struct sta_info *sta = container_of(txqi->txq.sta,
++ 						    struct sta_info, sta);
++ 		bool aql_check = ieee80211_txq_airtime_check(hw, &txqi->txq);
++ 		s32 deficit = ieee80211_sta_deficit(sta, txqi->txq.ac);
++ 
++ 		if (aql_check)
++ 			found_eligible_txq = true;
++ 
++ 		if (deficit < 0)
++ 			sta->airtime[txqi->txq.ac].deficit +=
++ 				sta->airtime_weight;
++ 
++ 		if (deficit < 0 || !aql_check) {
++ 			list_move_tail(&txqi->schedule_order,
++ 				       &local->active_txqs[txqi->txq.ac]);
++ 			goto begin;
++ 		}
++ 	}
++ 
++ 
++ 	if (txqi->schedule_round == local->schedule_round[ac])
+++>>>>>>> 9c1be3cde004 (wifi: mac80211: consider aql_tx_pending when checking airtime deficit)
+  		goto out;
+  
+ -	list_del_init(&txqi->schedule_order);
+ -	txqi->schedule_round = local->schedule_round[ac];
+ -	ret = &txqi->txq;
+ +	txqi = container_of(node, struct txq_info, schedule_order);
+ +	air_info = to_airtime_info(&txqi->txq);
+ +
+ +	if (air_info->v_t > air_sched->v_t &&
+ +	    (!first || !airtime_catchup_v_t(air_sched, air_info->v_t, now)))
+ +		goto out;
+ +
+ +	if (!ieee80211_txq_airtime_check(hw, &txqi->txq)) {
+ +		first = false;
+ +		goto begin;
+ +	}
+  
+ +	air_sched->schedule_pos = node;
+ +	air_sched->last_schedule_activity = now;
+ +	ret = &txqi->txq;
+  out:
+ -	spin_unlock_bh(&local->active_txq_lock[ac]);
+ +	spin_unlock_bh(&air_sched->lock);
+  	return ret;
+  }
+  EXPORT_SYMBOL(ieee80211_next_txq);
+@@@ -4069,48 -3938,50 +4104,60 @@@ EXPORT_SYMBOL(ieee80211_txq_airtime_che
+  bool ieee80211_txq_may_transmit(struct ieee80211_hw *hw,
+  				struct ieee80211_txq *txq)
+  {
+ +	struct txq_info *first_txqi = NULL, *txqi = to_txq_info(txq);
+  	struct ieee80211_local *local = hw_to_local(hw);
+ -	struct txq_info *iter, *tmp, *txqi = to_txq_info(txq);
+ -	struct sta_info *sta;
+ -	u8 ac = txq->ac;
+ +	struct airtime_sched_info *air_sched;
+ +	struct airtime_info *air_info;
+ +	struct rb_node *node = NULL;
+ +	bool ret = false;
+ +	u64 now;
+  
+ -	spin_lock_bh(&local->active_txq_lock[ac]);
+  
+ -	if (!txqi->txq.sta)
+ -		goto out;
+ +	if (!ieee80211_txq_airtime_check(hw, txq))
+ +		return false;
+  
+ -	if (list_empty(&txqi->schedule_order))
+ +	air_sched = &local->airtime[txq->ac];
+ +	spin_lock_bh(&air_sched->lock);
+ +
+ +	if (RB_EMPTY_NODE(&txqi->schedule_order))
+  		goto out;
+  
+ -	list_for_each_entry_safe(iter, tmp, &local->active_txqs[ac],
+ -				 schedule_order) {
+ -		if (iter == txqi)
+ -			break;
+ +	now = ktime_get_coarse_boottime_ns();
+  
+ +	/* Like in ieee80211_next_txq(), make sure the first station in the
+ +	 * scheduling order is eligible for transmission to avoid starvation.
+ +	 */
+ +	node = rb_first_cached(&air_sched->active_txqs);
+ +	if (node) {
+ +		first_txqi = container_of(node, struct txq_info,
+ +					  schedule_order);
+ +		air_info = to_airtime_info(&first_txqi->txq);
+ +
+++<<<<<<< HEAD
+ +		if (air_sched->v_t < air_info->v_t)
+ +			airtime_catchup_v_t(air_sched, air_info->v_t, now);
+++=======
++ 		if (!iter->txq.sta) {
++ 			list_move_tail(&iter->schedule_order,
++ 				       &local->active_txqs[ac]);
++ 			continue;
++ 		}
++ 		sta = container_of(iter->txq.sta, struct sta_info, sta);
++ 		if (ieee80211_sta_deficit(sta, ac) < 0)
++ 			sta->airtime[ac].deficit += sta->airtime_weight;
++ 		list_move_tail(&iter->schedule_order, &local->active_txqs[ac]);
+++>>>>>>> 9c1be3cde004 (wifi: mac80211: consider aql_tx_pending when checking airtime deficit)
+  	}
+  
+ -	sta = container_of(txqi->txq.sta, struct sta_info, sta);
+ -	if (sta->airtime[ac].deficit >= 0)
+ -		goto out;
+ -
+ -	sta->airtime[ac].deficit += sta->airtime_weight;
+ -	list_move_tail(&txqi->schedule_order, &local->active_txqs[ac]);
+ -	spin_unlock_bh(&local->active_txq_lock[ac]);
+ +	air_info = to_airtime_info(&txqi->txq);
+ +	if (air_info->v_t <= air_sched->v_t) {
+ +		air_sched->last_schedule_activity = now;
+ +		ret = true;
+ +	}
+  
+ -	return false;
+  out:
+ -	if (!list_empty(&txqi->schedule_order))
+ -		list_del_init(&txqi->schedule_order);
+ -	spin_unlock_bh(&local->active_txq_lock[ac]);
+ -
+ -	return true;
+ +	spin_unlock_bh(&air_sched->lock);
+ +	return ret;
+  }
+  EXPORT_SYMBOL(ieee80211_txq_may_transmit);
+  
+* Unmerged path net/mac80211/tx.c
