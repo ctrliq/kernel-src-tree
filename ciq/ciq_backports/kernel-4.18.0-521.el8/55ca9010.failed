@@ -1,0 +1,211 @@
+x86/srso: Remove 'pred_cmd' label
+
+jira LE-1907
+cve CVE-2023-20569
+Rebuild_History Non-Buildable kernel-4.18.0-521.el8
+commit-author Josh Poimboeuf <jpoimboe@kernel.org>
+commit 55ca9010c4a988b48278f81ae4129deea52d2488
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-521.el8/55ca9010.failed
+
+SBPB is only enabled in two distinct cases:
+
+1) when SRSO has been disabled with srso=off
+
+2) when SRSO has been fixed (in future HW)
+
+Simplify the control flow by getting rid of the 'pred_cmd' label and
+moving the SBPB enablement check to the two corresponding code sites.
+This makes it more clear when exactly SBPB gets enabled.
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@kernel.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Acked-by: Borislav Petkov (AMD) <bp@alien8.de>
+Link: https://lore.kernel.org/r/bb20e8569cfa144def5e6f25e610804bc4974de2.1693889988.git.jpoimboe@kernel.org
+(cherry picked from commit 55ca9010c4a988b48278f81ae4129deea52d2488)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/kernel/cpu/bugs.c
+index adea0002a1a8,4f1ad2350f49..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -2309,6 -2349,171 +2309,174 @@@ static int __init l1tf_cmdline(char *st
+  early_param("l1tf", l1tf_cmdline);
+  
+  #undef pr_fmt
+++<<<<<<< HEAD
+++=======
++ #define pr_fmt(fmt)	"Speculative Return Stack Overflow: " fmt
++ 
++ enum srso_mitigation {
++ 	SRSO_MITIGATION_NONE,
++ 	SRSO_MITIGATION_UCODE_NEEDED,
++ 	SRSO_MITIGATION_SAFE_RET_UCODE_NEEDED,
++ 	SRSO_MITIGATION_MICROCODE,
++ 	SRSO_MITIGATION_SAFE_RET,
++ 	SRSO_MITIGATION_IBPB,
++ 	SRSO_MITIGATION_IBPB_ON_VMEXIT,
++ };
++ 
++ enum srso_mitigation_cmd {
++ 	SRSO_CMD_OFF,
++ 	SRSO_CMD_MICROCODE,
++ 	SRSO_CMD_SAFE_RET,
++ 	SRSO_CMD_IBPB,
++ 	SRSO_CMD_IBPB_ON_VMEXIT,
++ };
++ 
++ static const char * const srso_strings[] = {
++ 	[SRSO_MITIGATION_NONE]			= "Vulnerable",
++ 	[SRSO_MITIGATION_UCODE_NEEDED]		= "Vulnerable: No microcode",
++ 	[SRSO_MITIGATION_SAFE_RET_UCODE_NEEDED]	= "Vulnerable: Safe RET, no microcode",
++ 	[SRSO_MITIGATION_MICROCODE]		= "Vulnerable: Microcode, no safe RET",
++ 	[SRSO_MITIGATION_SAFE_RET]		= "Mitigation: Safe RET",
++ 	[SRSO_MITIGATION_IBPB]			= "Mitigation: IBPB",
++ 	[SRSO_MITIGATION_IBPB_ON_VMEXIT]	= "Mitigation: IBPB on VMEXIT only"
++ };
++ 
++ static enum srso_mitigation srso_mitigation __ro_after_init = SRSO_MITIGATION_NONE;
++ static enum srso_mitigation_cmd srso_cmd __ro_after_init = SRSO_CMD_SAFE_RET;
++ 
++ static int __init srso_parse_cmdline(char *str)
++ {
++ 	if (!str)
++ 		return -EINVAL;
++ 
++ 	if (!strcmp(str, "off"))
++ 		srso_cmd = SRSO_CMD_OFF;
++ 	else if (!strcmp(str, "microcode"))
++ 		srso_cmd = SRSO_CMD_MICROCODE;
++ 	else if (!strcmp(str, "safe-ret"))
++ 		srso_cmd = SRSO_CMD_SAFE_RET;
++ 	else if (!strcmp(str, "ibpb"))
++ 		srso_cmd = SRSO_CMD_IBPB;
++ 	else if (!strcmp(str, "ibpb-vmexit"))
++ 		srso_cmd = SRSO_CMD_IBPB_ON_VMEXIT;
++ 	else
++ 		pr_err("Ignoring unknown SRSO option (%s).", str);
++ 
++ 	return 0;
++ }
++ early_param("spec_rstack_overflow", srso_parse_cmdline);
++ 
++ #define SRSO_NOTICE "WARNING: See https://kernel.org/doc/html/latest/admin-guide/hw-vuln/srso.html for mitigation options."
++ 
++ static void __init srso_select_mitigation(void)
++ {
++ 	bool has_microcode = boot_cpu_has(X86_FEATURE_IBPB_BRTYPE);
++ 
++ 	if (cpu_mitigations_off())
++ 		return;
++ 
++ 	if (!boot_cpu_has_bug(X86_BUG_SRSO)) {
++ 		if (boot_cpu_has(X86_FEATURE_SBPB))
++ 			x86_pred_cmd = PRED_CMD_SBPB;
++ 		return;
++ 	}
++ 
++ 	if (has_microcode) {
++ 		/*
++ 		 * Zen1/2 with SMT off aren't vulnerable after the right
++ 		 * IBPB microcode has been applied.
++ 		 *
++ 		 * Zen1/2 don't have SBPB, no need to try to enable it here.
++ 		 */
++ 		if (boot_cpu_data.x86 < 0x19 && !cpu_smt_possible()) {
++ 			setup_force_cpu_cap(X86_FEATURE_SRSO_NO);
++ 			return;
++ 		}
++ 	}
++ 
++ 	if (retbleed_mitigation == RETBLEED_MITIGATION_IBPB) {
++ 		if (has_microcode) {
++ 			srso_mitigation = SRSO_MITIGATION_IBPB;
++ 			goto out;
++ 		}
++ 	} else {
++ 		pr_warn("IBPB-extending microcode not applied!\n");
++ 		pr_warn(SRSO_NOTICE);
++ 
++ 		/* may be overwritten by SRSO_CMD_SAFE_RET below */
++ 		srso_mitigation = SRSO_MITIGATION_UCODE_NEEDED;
++ 	}
++ 
++ 	switch (srso_cmd) {
++ 	case SRSO_CMD_OFF:
++ 		if (boot_cpu_has(X86_FEATURE_SBPB))
++ 			x86_pred_cmd = PRED_CMD_SBPB;
++ 		return;
++ 
++ 	case SRSO_CMD_MICROCODE:
++ 		if (has_microcode) {
++ 			srso_mitigation = SRSO_MITIGATION_MICROCODE;
++ 			pr_warn(SRSO_NOTICE);
++ 		}
++ 		break;
++ 
++ 	case SRSO_CMD_SAFE_RET:
++ 		if (IS_ENABLED(CONFIG_CPU_SRSO)) {
++ 			/*
++ 			 * Enable the return thunk for generated code
++ 			 * like ftrace, static_call, etc.
++ 			 */
++ 			setup_force_cpu_cap(X86_FEATURE_RETHUNK);
++ 			setup_force_cpu_cap(X86_FEATURE_UNRET);
++ 
++ 			if (boot_cpu_data.x86 == 0x19) {
++ 				setup_force_cpu_cap(X86_FEATURE_SRSO_ALIAS);
++ 				x86_return_thunk = srso_alias_return_thunk;
++ 			} else {
++ 				setup_force_cpu_cap(X86_FEATURE_SRSO);
++ 				x86_return_thunk = srso_return_thunk;
++ 			}
++ 			if (has_microcode)
++ 				srso_mitigation = SRSO_MITIGATION_SAFE_RET;
++ 			else
++ 				srso_mitigation = SRSO_MITIGATION_SAFE_RET_UCODE_NEEDED;
++ 		} else {
++ 			pr_err("WARNING: kernel not compiled with CPU_SRSO.\n");
++ 		}
++ 		break;
++ 
++ 	case SRSO_CMD_IBPB:
++ 		if (IS_ENABLED(CONFIG_CPU_IBPB_ENTRY)) {
++ 			if (has_microcode) {
++ 				setup_force_cpu_cap(X86_FEATURE_ENTRY_IBPB);
++ 				srso_mitigation = SRSO_MITIGATION_IBPB;
++ 			}
++ 		} else {
++ 			pr_err("WARNING: kernel not compiled with CPU_IBPB_ENTRY.\n");
++ 		}
++ 		break;
++ 
++ 	case SRSO_CMD_IBPB_ON_VMEXIT:
++ 		if (IS_ENABLED(CONFIG_CPU_SRSO)) {
++ 			if (!boot_cpu_has(X86_FEATURE_ENTRY_IBPB) && has_microcode) {
++ 				setup_force_cpu_cap(X86_FEATURE_IBPB_ON_VMEXIT);
++ 				srso_mitigation = SRSO_MITIGATION_IBPB_ON_VMEXIT;
++ 			}
++ 		} else {
++ 			pr_err("WARNING: kernel not compiled with CPU_SRSO.\n");
++                 }
++ 		break;
++ 
++ 	default:
++ 		break;
++ 	}
++ 
++ out:
++ 	pr_info("%s\n", srso_strings[srso_mitigation]);
++ }
++ 
++ #undef pr_fmt
+++>>>>>>> 55ca9010c4a9 (x86/srso: Remove 'pred_cmd' label)
+  #define pr_fmt(fmt) fmt
+  
+  #ifdef CONFIG_SYSFS
+* Unmerged path arch/x86/kernel/cpu/bugs.c
