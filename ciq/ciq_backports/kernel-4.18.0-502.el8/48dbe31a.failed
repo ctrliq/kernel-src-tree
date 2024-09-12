@@ -1,0 +1,180 @@
+x86/resctrl: Add per-rmid arch private storage for overflow and chunks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author James Morse <james.morse@arm.com>
+commit 48dbe31a243d5fc7c07b7f03b48e95ec4696b118
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/48dbe31a.failed
+
+A renamed __rmid_read() is intended as the function that an
+architecture agnostic resctrl filesystem driver can use to
+read a value in bytes from a counter. Currently the function returns
+the MBM values in chunks directly from hardware. For bandwidth
+counters the resctrl filesystem uses this to calculate the number of
+bytes ever seen.
+
+MPAM's scaling of counters can be changed at runtime, reducing the
+resolution but increasing the range. When this is changed the prev_msr
+values need to be converted by the architecture code.
+
+Add an array for per-rmid private storage. The prev_msr and chunks
+values will move here to allow resctrl_arch_rmid_read() to always
+return the number of bytes read by this counter without assistance
+from the filesystem. The values are moved in later patches when
+the overflow and correction calls are moved into __rmid_read().
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Jamie Iles <quic_jiles@quicinc.com>
+	Reviewed-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Tested-by: Xin Hao <xhao@linux.alibaba.com>
+	Tested-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Tested-by: Cristian Marussi <cristian.marussi@arm.com>
+Link: https://lore.kernel.org/r/20220902154829.30399-14-james.morse@arm.com
+(cherry picked from commit 48dbe31a243d5fc7c07b7f03b48e95ec4696b118)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/core.c
+#	arch/x86/kernel/cpu/resctrl/internal.h
+diff --cc arch/x86/kernel/cpu/resctrl/core.c
+index 296d8b9fc18a,de62b0b87ced..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/core.c
++++ b/arch/x86/kernel/cpu/resctrl/core.c
+@@@ -482,12 -406,17 +482,23 @@@ void setup_default_ctrlval(struct rdt_r
+  	 * Initialize the Control MSRs to having no control.
+  	 * For Cache Allocation: Set all bits in cbm
+  	 * For Memory Allocation: Set b/w requested to 100%
+ +	 * and the bandwidth in MBps to U32_MAX
+  	 */
+ -	for (i = 0; i < hw_res->num_closid; i++, dc++)
+ +	for (i = 0; i < r->num_closid; i++, dc++, dm++) {
+  		*dc = r->default_ctrl;
+++<<<<<<< HEAD
+ +		*dm = MBA_MAX_MBPS;
+ +	}
+++=======
++ }
++ 
++ static void domain_free(struct rdt_hw_domain *hw_dom)
++ {
++ 	kfree(hw_dom->arch_mbm_total);
++ 	kfree(hw_dom->arch_mbm_local);
++ 	kfree(hw_dom->ctrl_val);
++ 	kfree(hw_dom);
+++>>>>>>> 48dbe31a243d (x86/resctrl: Add per-rmid arch private storage for overflow and chunks)
+  }
+  
+  static int domain_setup_ctrlval(struct rdt_resource *r, struct rdt_domain *d)
+@@@ -604,14 -517,18 +643,19 @@@ static void domain_add_cpu(int cpu, str
+  		return;
+  	}
+  
++ 	if (r->mon_capable && arch_domain_mbm_alloc(r->num_rmid, hw_dom)) {
++ 		domain_free(hw_dom);
++ 		return;
++ 	}
++ 
+  	list_add_tail(&d->list, add_pos);
+  
+ -	err = resctrl_online_domain(r, d);
+ -	if (err) {
+ -		list_del(&d->list);
+ -		domain_free(hw_dom);
+ -	}
+ +	/*
+ +	 * If resctrl is mounted, add
+ +	 * per domain monitor data directories.
+ +	 */
+ +	if (static_branch_unlikely(&rdt_mon_enable_key))
+ +		mkdir_mondata_subdir_allrdtgrp(r, d);
+  }
+  
+  static void domain_remove_cpu(int cpu, struct rdt_resource *r)
+diff --cc arch/x86/kernel/cpu/resctrl/internal.h
+index 9780c2d2c637,4de8e5bb93e1..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/internal.h
++++ b/arch/x86/kernel/cpu/resctrl/internal.h
+@@@ -303,44 -304,37 +303,70 @@@ struct mbm_state 
+  };
+  
+  /**
+++<<<<<<< HEAD
+ + * struct rdt_domain - group of cpus sharing an RDT resource
+ + * @list:	all instances of this resource
+ + * @id:		unique id for this instance
+ + * @cpu_mask:	which cpus share this resource
+ + * @rmid_busy_llc:
+ + *		bitmap of which limbo RMIDs are above threshold
+ + * @mbm_total:	saved state for MBM total bandwidth
+ + * @mbm_local:	saved state for MBM local bandwidth
+ + * @mbm_over:	worker to periodically read MBM h/w counters
+ + * @cqm_limbo:	worker to periodically read CQM h/w counters
+ + * @mbm_work_cpu:
+ + *		worker cpu for MBM h/w counters
+ + * @cqm_work_cpu:
+ + *		worker cpu for CQM h/w counters
+ + * @ctrl_val:	array of cache or mem ctrl values (indexed by CLOSID)
+ + * @mbps_val:	When mba_sc is enabled, this holds the bandwidth in MBps
+ + * @new_ctrl:	new ctrl value to be loaded
+ + * @have_new_ctrl: did user provide new_ctrl for this domain
+ + * @plr:	pseudo-locked region (if any) associated with domain
+++=======
++  * struct arch_mbm_state - values used to compute resctrl_arch_rmid_read()s
++  *			   return value.
++  * @prev_msr:	Value of IA32_QM_CTR last time it was read for the RMID used to
++  *		find this struct.
++  */
++ struct arch_mbm_state {
++ 	u64	prev_msr;
++ };
++ 
++ /**
++  * struct rdt_hw_domain - Arch private attributes of a set of CPUs that share
++  *			  a resource
++  * @d_resctrl:	Properties exposed to the resctrl file system
++  * @ctrl_val:	array of cache or mem ctrl values (indexed by CLOSID)
++  * @arch_mbm_total:	arch private state for MBM total bandwidth
++  * @arch_mbm_local:	arch private state for MBM local bandwidth
++  *
++  * Members of this structure are accessed via helpers that provide abstraction.
+++>>>>>>> 48dbe31a243d (x86/resctrl: Add per-rmid arch private storage for overflow and chunks)
+   */
+ -struct rdt_hw_domain {
+ -	struct rdt_domain		d_resctrl;
+ +struct rdt_domain {
+ +	struct list_head		list;
+ +	int				id;
+ +	struct cpumask			cpu_mask;
+ +	unsigned long			*rmid_busy_llc;
+ +	struct mbm_state		*mbm_total;
+ +	struct mbm_state		*mbm_local;
+ +	struct delayed_work		mbm_over;
+ +	struct delayed_work		cqm_limbo;
+ +	int				mbm_work_cpu;
+ +	int				cqm_work_cpu;
+  	u32				*ctrl_val;
+++<<<<<<< HEAD
+ +	u32				*mbps_val;
+ +	u32				new_ctrl;
+ +	bool				have_new_ctrl;
+ +	struct pseudo_lock_region	*plr;
+++=======
++ 	struct arch_mbm_state		*arch_mbm_total;
++ 	struct arch_mbm_state		*arch_mbm_local;
+++>>>>>>> 48dbe31a243d (x86/resctrl: Add per-rmid arch private storage for overflow and chunks)
+  };
+  
+ -static inline struct rdt_hw_domain *resctrl_to_arch_dom(struct rdt_domain *r)
+ -{
+ -	return container_of(r, struct rdt_hw_domain, d_resctrl);
+ -}
+ -
+  /**
+   * struct msr_param - set a range of MSRs from a domain
+   * @res:       The resource to use
+* Unmerged path arch/x86/kernel/cpu/resctrl/core.c
+* Unmerged path arch/x86/kernel/cpu/resctrl/internal.h
