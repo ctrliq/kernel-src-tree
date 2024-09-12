@@ -1,0 +1,108 @@
+gfs2: Add some missing quota locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit d5563f42f59ed2cddf1021a34c9cdd8f4a89021c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/d5563f42.failed
+
+The quota code is missing some locking between local quota changes and
+syncing those quota changes to the global quota file (gfs2_quota_sync);
+in particular, qd->qd_change needs to be kept in sync with the
+QDF_CHANGE change flag and the number of references held.  Use the
+qd->qd_lockref.lock spinlock for that.
+
+With the qd->qd_lockref.lock spinlock held, we can no longer call
+lockref_get(), so turn qd_hold() into a variant that assumes that the
+lock is held.  This function is really supposed to take an additional
+reference when one or more references are already held, so check for
+that instead of checking if the lockref is dead.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit d5563f42f59ed2cddf1021a34c9cdd8f4a89021c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/quota.c
+diff --cc fs/gfs2/quota.c
+index a5ead0a8fccb,283c6ff21911..000000000000
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@@ -304,11 -316,11 +304,17 @@@ static int qd_get(struct gfs2_sbd *sdp
+  }
+  
+  
+- static void qd_hold(struct gfs2_quota_data *qd)
++ static void __qd_hold(struct gfs2_quota_data *qd)
+  {
+++<<<<<<< HEAD
+ +	struct gfs2_sbd *sdp = qd->qd_gl->gl_name.ln_sbd;
+ +	gfs2_assert(sdp, !__lockref_is_dead(&qd->qd_lockref));
+ +	lockref_get(&qd->qd_lockref);
+++=======
++ 	struct gfs2_sbd *sdp = qd->qd_sbd;
++ 	gfs2_assert(sdp, qd->qd_lockref.count > 0);
++ 	qd->qd_lockref.count++;
+++>>>>>>> d5563f42f59e (gfs2: Add some missing quota locking)
+  }
+  
+  static void qd_put(struct gfs2_quota_data *qd)
+@@@ -508,9 -501,10 +522,15 @@@ static void qdsb_put(struct gfs2_quota_
+  
+  static void qd_unlock(struct gfs2_quota_data *qd)
+  {
+++<<<<<<< HEAD
+ +	gfs2_assert_warn(qd->qd_gl->gl_name.ln_sbd,
+ +			 test_bit(QDF_LOCKED, &qd->qd_flags));
+++=======
++ 	spin_lock(&qd->qd_lockref.lock);
++ 	gfs2_assert_warn(qd->qd_sbd, test_bit(QDF_LOCKED, &qd->qd_flags));
+++>>>>>>> d5563f42f59e (gfs2: Add some missing quota locking)
+  	clear_bit(QDF_LOCKED, &qd->qd_flags);
++ 	spin_unlock(&qd->qd_lockref.lock);
+  	qdsb_put(qd);
+  }
+  
+@@@ -668,9 -670,10 +688,10 @@@ static int sort_qd(const void *a, cons
+  
+  static void do_qc(struct gfs2_quota_data *qd, s64 change)
+  {
+ -	struct gfs2_sbd *sdp = qd->qd_sbd;
+ +	struct gfs2_sbd *sdp = qd->qd_gl->gl_name.ln_sbd;
+  	struct gfs2_inode *ip = GFS2_I(sdp->sd_qc_inode);
+  	struct gfs2_quota_change *qc = qd->qd_bh_qc;
++ 	bool needs_put = false;
+  	s64 x;
+  
+  	mutex_lock(&sdp->sd_quota_mutex);
+@@@ -1291,6 -1299,24 +1325,27 @@@ void gfs2_quota_change(struct gfs2_inod
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool qd_changed(struct gfs2_sbd *sdp)
++ {
++ 	struct gfs2_quota_data *qd;
++ 	bool changed = false;
++ 
++ 	spin_lock(&qd_lock);
++ 	list_for_each_entry(qd, &sdp->sd_quota_list, qd_list) {
++ 		spin_lock(&qd->qd_lockref.lock);
++ 		changed = !test_bit(QDF_LOCKED, &qd->qd_flags) &&
++ 			  test_bit(QDF_CHANGE, &qd->qd_flags);
++ 		spin_unlock(&qd->qd_lockref.lock);
++ 		if (changed)
++ 			break;
++ 	}
++ 	spin_unlock(&qd_lock);
++ 	return changed;
++ }
++ 
+++>>>>>>> d5563f42f59e (gfs2: Add some missing quota locking)
+  int gfs2_quota_sync(struct super_block *sb, int type)
+  {
+  	struct gfs2_sbd *sdp = sb->s_fs_info;
+* Unmerged path fs/gfs2/quota.c
