@@ -1,0 +1,386 @@
+gfs2: Remove support for glock holder auto-demotion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-483.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit ba3e77a4a22af018d2fe4d745902b2531ca82aba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-483.el8/ba3e77a4.failed
+
+Remove the support for glock holder auto-demotion (commit dc732906c245
+and folow-ups) as we are not planning to use this feature, and the
+additional code therefore only adds unnecessary complexity.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit ba3e77a4a22af018d2fe4d745902b2531ca82aba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.h
+diff --cc fs/gfs2/glock.h
+index 885d044e536c,f37ac087e2c1..000000000000
+--- a/fs/gfs2/glock.h
++++ b/fs/gfs2/glock.h
+@@@ -285,64 -306,6 +283,67 @@@ static inline bool gfs2_holder_queued(s
+  	return !list_empty(&gh->gh_list);
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * glock_set_object - set the gl_object field of a glock
+ + * @gl: the glock
+ + * @object: the object
+ + */
+ +static inline void glock_set_object(struct gfs2_glock *gl, void *object)
+ +{
+ +	spin_lock(&gl->gl_lockref.lock);
+ +	if (gfs2_assert_warn(gl->gl_name.ln_sbd, gl->gl_object == NULL))
+ +		gfs2_dump_glock(NULL, gl, true);
+ +	gl->gl_object = object;
+ +	spin_unlock(&gl->gl_lockref.lock);
+ +}
+ +
+ +/**
+ + * glock_clear_object - clear the gl_object field of a glock
+ + * @gl: the glock
+ + * @object: the object
+ + *
+ + * I'd love to similarly add this:
+ + *	else if (gfs2_assert_warn(gl->gl_sbd, gl->gl_object == object))
+ + *		gfs2_dump_glock(NULL, gl, true);
+ + * Unfortunately, that's not possible because as soon as gfs2_delete_inode
+ + * frees the block in the rgrp, another process can reassign it for an I_NEW
+ + * inode in gfs2_create_inode because that calls new_inode, not gfs2_iget.
+ + * That means gfs2_delete_inode may subsequently try to call this function
+ + * for a glock that's already pointing to a brand new inode. If we clear the
+ + * new inode's gl_object, we'll introduce metadata corruption. Function
+ + * gfs2_delete_inode calls clear_inode which calls gfs2_clear_inode which also
+ + * tries to clear gl_object, so it's more than just gfs2_delete_inode.
+ + *
+ + */
+ +static inline void glock_clear_object(struct gfs2_glock *gl, void *object)
+ +{
+ +	spin_lock(&gl->gl_lockref.lock);
+ +	if (gl->gl_object == object)
+ +		gl->gl_object = NULL;
+ +	spin_unlock(&gl->gl_lockref.lock);
+ +}
+ +
+ +static inline void gfs2_holder_allow_demote(struct gfs2_holder *gh)
+ +{
+ +	struct gfs2_glock *gl = gh->gh_gl;
+ +
+ +	spin_lock(&gl->gl_lockref.lock);
+ +	set_bit(HIF_MAY_DEMOTE, &gh->gh_iflags);
+ +	spin_unlock(&gl->gl_lockref.lock);
+ +}
+ +
+ +static inline void gfs2_holder_disallow_demote(struct gfs2_holder *gh)
+ +{
+ +	struct gfs2_glock *gl = gh->gh_gl;
+ +
+ +	spin_lock(&gl->gl_lockref.lock);
+ +	clear_bit(HIF_MAY_DEMOTE, &gh->gh_iflags);
+ +	spin_unlock(&gl->gl_lockref.lock);
+ +}
+ +
+++=======
+++>>>>>>> ba3e77a4a22a (gfs2: Remove support for glock holder auto-demotion)
+  extern void gfs2_inode_remember_delete(struct gfs2_glock *gl, u64 generation);
+  extern bool gfs2_inode_already_deleted(struct gfs2_glock *gl, u64 generation);
+  
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index e05d4ce9aac6..3c7e55602e90 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -201,12 +201,6 @@ static int demote_ok(const struct gfs2_glock *gl)
+ 
+ 	if (gl->gl_state == LM_ST_UNLOCKED)
+ 		return 0;
+-	/*
+-	 * Note that demote_ok is used for the lru process of disposing of
+-	 * glocks. For this purpose, we don't care if the glock's holders
+-	 * have the HIF_MAY_DEMOTE flag set or not. If someone is using
+-	 * them, don't demote.
+-	 */
+ 	if (!list_empty(&gl->gl_holders))
+ 		return 0;
+ 	if (glops->go_demote_ok)
+@@ -390,7 +384,7 @@ static void do_error(struct gfs2_glock *gl, const int ret)
+ 	struct gfs2_holder *gh, *tmp;
+ 
+ 	list_for_each_entry_safe(gh, tmp, &gl->gl_holders, gh_list) {
+-		if (!test_bit(HIF_WAIT, &gh->gh_iflags))
++		if (test_bit(HIF_HOLDER, &gh->gh_iflags))
+ 			continue;
+ 		if (ret & LM_OUT_ERROR)
+ 			gh->gh_error = -EIO;
+@@ -404,45 +398,6 @@ static void do_error(struct gfs2_glock *gl, const int ret)
+ 	}
+ }
+ 
+-/**
+- * demote_incompat_holders - demote incompatible demoteable holders
+- * @gl: the glock we want to promote
+- * @current_gh: the newly promoted holder
+- *
+- * We're passing the newly promoted holder in @current_gh, but actually, any of
+- * the strong holders would do.
+- */
+-static void demote_incompat_holders(struct gfs2_glock *gl,
+-				    struct gfs2_holder *current_gh)
+-{
+-	struct gfs2_holder *gh, *tmp;
+-
+-	/*
+-	 * Demote incompatible holders before we make ourselves eligible.
+-	 * (This holder may or may not allow auto-demoting, but we don't want
+-	 * to demote the new holder before it's even granted.)
+-	 */
+-	list_for_each_entry_safe(gh, tmp, &gl->gl_holders, gh_list) {
+-		/*
+-		 * Since holders are at the front of the list, we stop when we
+-		 * find the first non-holder.
+-		 */
+-		if (!test_bit(HIF_HOLDER, &gh->gh_iflags))
+-			return;
+-		if (gh == current_gh)
+-			continue;
+-		if (test_bit(HIF_MAY_DEMOTE, &gh->gh_iflags) &&
+-		    !may_grant(gl, current_gh, gh)) {
+-			/*
+-			 * We should not recurse into do_promote because
+-			 * __gfs2_glock_dq only calls handle_callback,
+-			 * gfs2_glock_add_to_lru and __gfs2_glock_queue_work.
+-			 */
+-			__gfs2_glock_dq(gh);
+-		}
+-	}
+-}
+-
+ /**
+  * find_first_holder - find the first "holder" gh
+  * @gl: the glock
+@@ -461,26 +416,6 @@ static inline struct gfs2_holder *find_first_holder(const struct gfs2_glock *gl)
+ 	return NULL;
+ }
+ 
+-/**
+- * find_first_strong_holder - find the first non-demoteable holder
+- * @gl: the glock
+- *
+- * Find the first holder that doesn't have the HIF_MAY_DEMOTE flag set.
+- */
+-static inline struct gfs2_holder *
+-find_first_strong_holder(struct gfs2_glock *gl)
+-{
+-	struct gfs2_holder *gh;
+-
+-	list_for_each_entry(gh, &gl->gl_holders, gh_list) {
+-		if (!test_bit(HIF_HOLDER, &gh->gh_iflags))
+-			return NULL;
+-		if (!test_bit(HIF_MAY_DEMOTE, &gh->gh_iflags))
+-			return gh;
+-	}
+-	return NULL;
+-}
+-
+ /*
+  * gfs2_instantiate - Call the glops instantiate function
+  * @gl: The glock
+@@ -538,9 +473,8 @@ int gfs2_instantiate(struct gfs2_holder *gh)
+ static int do_promote(struct gfs2_glock *gl)
+ {
+ 	struct gfs2_holder *gh, *current_gh;
+-	bool incompat_holders_demoted = false;
+ 
+-	current_gh = find_first_strong_holder(gl);
++	current_gh = find_first_holder(gl);
+ 	list_for_each_entry(gh, &gl->gl_holders, gh_list) {
+ 		if (test_bit(HIF_HOLDER, &gh->gh_iflags))
+ 			continue;
+@@ -558,11 +492,8 @@ static int do_promote(struct gfs2_glock *gl)
+ 		set_bit(HIF_HOLDER, &gh->gh_iflags);
+ 		trace_gfs2_promote(gh);
+ 		gfs2_holder_wake(gh);
+-		if (!incompat_holders_demoted) {
++		if (!current_gh)
+ 			current_gh = gh;
+-			demote_incompat_holders(gl, current_gh);
+-			incompat_holders_demoted = true;
+-		}
+ 	}
+ 	return 0;
+ }
+@@ -1463,7 +1394,7 @@ __acquires(&gl->gl_lockref.lock)
+ 		if (test_bit(GLF_LOCK, &gl->gl_flags)) {
+ 			struct gfs2_holder *current_gh;
+ 
+-			current_gh = find_first_strong_holder(gl);
++			current_gh = find_first_holder(gl);
+ 			try_futile = !may_grant(gl, current_gh, gh);
+ 		}
+ 		if (test_bit(GLF_INVALIDATE_IN_PROGRESS, &gl->gl_flags))
+@@ -1475,8 +1406,6 @@ __acquires(&gl->gl_lockref.lock)
+ 			continue;
+ 		if (gh->gh_gl->gl_ops->go_type == LM_TYPE_FLOCK)
+ 			continue;
+-		if (test_bit(HIF_MAY_DEMOTE, &gh2->gh_iflags))
+-			continue;
+ 		if (!pid_is_meaningful(gh2))
+ 			continue;
+ 		goto trap_recursive;
+@@ -1591,64 +1520,42 @@ static void __gfs2_glock_dq(struct gfs2_holder *gh)
+ 	int fast_path = 0;
+ 
+ 	/*
+-	 * This while loop is similar to function demote_incompat_holders:
+-	 * If the glock is due to be demoted (which may be from another node
+-	 * or even if this holder is GL_NOCACHE), the weak holders are
+-	 * demoted as well, allowing the glock to be demoted.
++	 * If we're in the process of file system withdraw, we cannot just
++	 * dequeue any glocks until our journal is recovered, lest we introduce
++	 * file system corruption. We need two exceptions to this rule: We need
++	 * to allow unlocking of nondisk glocks and the glock for our own
++	 * journal that needs recovery.
+ 	 */
+-	while (gh) {
+-		/*
+-		 * If we're in the process of file system withdraw, we cannot
+-		 * just dequeue any glocks until our journal is recovered, lest
+-		 * we introduce file system corruption. We need two exceptions
+-		 * to this rule: We need to allow unlocking of nondisk glocks
+-		 * and the glock for our own journal that needs recovery.
+-		 */
+-		if (test_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags) &&
+-		    glock_blocked_by_withdraw(gl) &&
+-		    gh->gh_gl != sdp->sd_jinode_gl) {
+-			sdp->sd_glock_dqs_held++;
+-			spin_unlock(&gl->gl_lockref.lock);
+-			might_sleep();
+-			wait_on_bit(&sdp->sd_flags, SDF_WITHDRAW_RECOVERY,
+-				    TASK_UNINTERRUPTIBLE);
+-			spin_lock(&gl->gl_lockref.lock);
+-		}
++	if (test_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags) &&
++	    glock_blocked_by_withdraw(gl) &&
++	    gh->gh_gl != sdp->sd_jinode_gl) {
++		sdp->sd_glock_dqs_held++;
++		spin_unlock(&gl->gl_lockref.lock);
++		might_sleep();
++		wait_on_bit(&sdp->sd_flags, SDF_WITHDRAW_RECOVERY,
++			    TASK_UNINTERRUPTIBLE);
++		spin_lock(&gl->gl_lockref.lock);
++	}
+ 
+-		/*
+-		 * This holder should not be cached, so mark it for demote.
+-		 * Note: this should be done before the check for needs_demote
+-		 * below.
+-		 */
+-		if (gh->gh_flags & GL_NOCACHE)
+-			handle_callback(gl, LM_ST_UNLOCKED, 0, false);
++	/*
++	 * This holder should not be cached, so mark it for demote.
++	 * Note: this should be done before the check for needs_demote
++	 * below.
++	 */
++	if (gh->gh_flags & GL_NOCACHE)
++		handle_callback(gl, LM_ST_UNLOCKED, 0, false);
+ 
+-		list_del_init(&gh->gh_list);
+-		clear_bit(HIF_HOLDER, &gh->gh_iflags);
+-		trace_gfs2_glock_queue(gh, 0);
++	list_del_init(&gh->gh_list);
++	clear_bit(HIF_HOLDER, &gh->gh_iflags);
++	trace_gfs2_glock_queue(gh, 0);
+ 
+-		/*
+-		 * If there hasn't been a demote request we are done.
+-		 * (Let the remaining holders, if any, keep holding it.)
+-		 */
+-		if (!needs_demote(gl)) {
+-			if (list_empty(&gl->gl_holders))
+-				fast_path = 1;
+-			break;
+-		}
+-		/*
+-		 * If we have another strong holder (we cannot auto-demote)
+-		 * we are done. It keeps holding it until it is done.
+-		 */
+-		if (find_first_strong_holder(gl))
+-			break;
+-
+-		/*
+-		 * If we have a weak holder at the head of the list, it
+-		 * (and all others like it) must be auto-demoted. If there
+-		 * are no more weak holders, we exit the while loop.
+-		 */
+-		gh = find_first_holder(gl);
++	/*
++	 * If there hasn't been a demote request we are done.
++	 * (Let the remaining holders, if any, keep holding it.)
++	 */
++	if (!needs_demote(gl)) {
++		if (list_empty(&gl->gl_holders))
++			fast_path = 1;
+ 	}
+ 
+ 	if (!test_bit(GLF_LFLUSH, &gl->gl_flags) && demote_ok(gl))
+@@ -1866,33 +1773,6 @@ void gfs2_glock_cb(struct gfs2_glock *gl, unsigned int state)
+ 		if (test_bit(GLF_REPLY_PENDING, &gl->gl_flags))
+ 			delay = gl->gl_hold_time;
+ 	}
+-	/*
+-	 * Note 1: We cannot call demote_incompat_holders from handle_callback
+-	 * or gfs2_set_demote due to recursion problems like: gfs2_glock_dq ->
+-	 * handle_callback -> demote_incompat_holders -> gfs2_glock_dq
+-	 * Plus, we only want to demote the holders if the request comes from
+-	 * a remote cluster node because local holder conflicts are resolved
+-	 * elsewhere.
+-	 *
+-	 * Note 2: if a remote node wants this glock in EX mode, lock_dlm will
+-	 * request that we set our state to UNLOCKED. Here we mock up a holder
+-	 * to make it look like someone wants the lock EX locally. Any SH
+-	 * and DF requests should be able to share the lock without demoting.
+-	 *
+-	 * Note 3: We only want to demote the demoteable holders when there
+-	 * are no more strong holders. The demoteable holders might as well
+-	 * keep the glock until the last strong holder is done with it.
+-	 */
+-	if (!find_first_strong_holder(gl)) {
+-		struct gfs2_holder mock_gh = {
+-			.gh_gl = gl,
+-			.gh_state = (state == LM_ST_UNLOCKED) ?
+-				    LM_ST_EXCLUSIVE : state,
+-			.gh_iflags = BIT(HIF_HOLDER)
+-		};
+-
+-		demote_incompat_holders(gl, &mock_gh);
+-	}
+ 	handle_callback(gl, state, delay, true);
+ 	__gfs2_glock_queue_work(gl, delay);
+ 	spin_unlock(&gl->gl_lockref.lock);
+@@ -2293,8 +2173,6 @@ static const char *hflags2str(char *buf, u16 flags, unsigned long iflags)
+ 		*p++ = 'H';
+ 	if (test_bit(HIF_WAIT, &iflags))
+ 		*p++ = 'W';
+-	if (test_bit(HIF_MAY_DEMOTE, &iflags))
+-		*p++ = 'D';
+ 	if (flags & GL_SKIP)
+ 		*p++ = 's';
+ 	*p = 0;
+* Unmerged path fs/gfs2/glock.h
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 9b819ad2be13..86cf62d9ec25 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -255,7 +255,6 @@ struct gfs2_lkstats {
+ 
+ enum {
+ 	/* States */
+-	HIF_MAY_DEMOTE		= 1,
+ 	HIF_HOLDER		= 6,  /* Set for gh that "holds" the glock */
+ 	HIF_WAIT		= 10,
+ };
