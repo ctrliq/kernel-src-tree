@@ -1,0 +1,182 @@
+mm: shmem: don't truncate page if memory failure happens
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-477.15.1.el8_8
+commit-author Yang Shi <shy828301@gmail.com>
+commit b9d02f1bdd98f38e6e5ecacc9786a8f58f3f8b2c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-477.15.1.el8_8/b9d02f1b.failed
+
+The current behavior of memory failure is to truncate the page cache
+regardless of dirty or clean.  If the page is dirty the later access
+will get the obsolete data from disk without any notification to the
+users.  This may cause silent data loss.  It is even worse for shmem
+since shmem is in-memory filesystem, truncating page cache means
+discarding data blocks.  The later read would return all zero.
+
+The right approach is to keep the corrupted page in page cache, any
+later access would return error for syscalls or SIGBUS for page fault,
+until the file is truncated, hole punched or removed.  The regular
+storage backed filesystems would be more complicated so this patch is
+focused on shmem.  This also unblock the support for soft offlining
+shmem THP.
+
+[arnd@arndb.de: fix uninitialized variable use in me_pagecache_clean()]
+  Link: https://lkml.kernel.org/r/20211022064748.4173718-1-arnd@kernel.org
+
+Link: https://lkml.kernel.org/r/20211020210755.23964-6-shy828301@gmail.com
+	Signed-off-by: Yang Shi <shy828301@gmail.com>
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: Peter Xu <peterx@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b9d02f1bdd98f38e6e5ecacc9786a8f58f3f8b2c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory-failure.c
+#	mm/shmem.c
+#	mm/userfaultfd.c
+diff --cc mm/memory-failure.c
+index cfa7d206adc4,952a41d568c4..000000000000
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@@ -59,6 -57,8 +59,11 @@@
+  #include <linux/kfifo.h>
+  #include <linux/ratelimit.h>
+  #include <linux/page-isolation.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/pagewalk.h>
++ #include <linux/shmem_fs.h>
+++>>>>>>> b9d02f1bdd98 (mm: shmem: don't truncate page if memory failure happens)
+  #include "internal.h"
+  #include "ras/ras_event.h"
+  
+@@@ -740,9 -906,12 +752,12 @@@ static int me_pagecache_clean(struct pa
+  	/*
+  	 * Truncation is a bit tricky. Enable it per file system for now.
+  	 *
+ -	 * Open: to take i_rwsem or not for this? Right now we don't.
+ +	 * Open: to take i_mutex or not for this? Right now we don't.
+  	 */
+  	ret = truncate_error_page(p, page_to_pfn(p), mapping);
++ 	if (has_extra_refcount(ps, p, extra_pins))
++ 		ret = MF_FAILED;
++ 
+  out:
+  	unlock_page(p);
+  
+diff --cc mm/shmem.c
+index c53a4c0338e8,6a7bb46019e2..000000000000
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@@ -2450,10 -2454,12 +2450,11 @@@ shmem_write_begin(struct file *file, st
+  	struct inode *inode = mapping->host;
+  	struct shmem_inode_info *info = SHMEM_I(inode);
+  	pgoff_t index = pos >> PAGE_SHIFT;
++ 	int ret = 0;
+  
+ -	/* i_rwsem is held by caller */
+ -	if (unlikely(info->seals & (F_SEAL_GROW |
+ -				   F_SEAL_WRITE | F_SEAL_FUTURE_WRITE))) {
+ -		if (info->seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE))
+ +	/* i_mutex is held by caller */
+ +	if (unlikely(info->seals & (F_SEAL_WRITE | F_SEAL_GROW))) {
+ +		if (info->seals & F_SEAL_WRITE)
+  			return -EPERM;
+  		if ((info->seals & F_SEAL_GROW) && pos + len > inode->i_size)
+  			return -EPERM;
+@@@ -3768,7 -3791,14 +3789,18 @@@ static void shmem_destroy_inodecache(vo
+  	kmem_cache_destroy(shmem_inode_cachep);
+  }
+  
+++<<<<<<< HEAD
+ +static const struct address_space_operations shmem_aops = {
+++=======
++ /* Keep the page in page cache instead of truncating it */
++ static int shmem_error_remove_page(struct address_space *mapping,
++ 				   struct page *page)
++ {
++ 	return 0;
++ }
++ 
++ const struct address_space_operations shmem_aops = {
+++>>>>>>> b9d02f1bdd98 (mm: shmem: don't truncate page if memory failure happens)
+  	.writepage	= shmem_writepage,
+  	.set_page_dirty	= __set_page_dirty_no_writeback,
+  #ifdef CONFIG_TMPFS
+@@@ -3778,8 -3808,9 +3810,8 @@@
+  #ifdef CONFIG_MIGRATION
+  	.migratepage	= migrate_page,
+  #endif
+- 	.error_remove_page = generic_error_remove_page,
++ 	.error_remove_page = shmem_error_remove_page,
+  };
+ -EXPORT_SYMBOL(shmem_aops);
+  
+  static const struct file_operations shmem_file_operations = {
+  	.mmap		= shmem_mmap,
+diff --cc mm/userfaultfd.c
+index 8ae1813784e9,77fce86371a9..000000000000
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@@ -178,6 -212,46 +178,49 @@@ out_unlock
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Handles UFFDIO_CONTINUE for all shmem VMAs (shared or private). */
++ static int mcontinue_atomic_pte(struct mm_struct *dst_mm,
++ 				pmd_t *dst_pmd,
++ 				struct vm_area_struct *dst_vma,
++ 				unsigned long dst_addr,
++ 				bool wp_copy)
++ {
++ 	struct inode *inode = file_inode(dst_vma->vm_file);
++ 	pgoff_t pgoff = linear_page_index(dst_vma, dst_addr);
++ 	struct page *page;
++ 	int ret;
++ 
++ 	ret = shmem_getpage(inode, pgoff, &page, SGP_READ);
++ 	if (ret)
++ 		goto out;
++ 	if (!page) {
++ 		ret = -EFAULT;
++ 		goto out;
++ 	}
++ 
++ 	if (PageHWPoison(page)) {
++ 		ret = -EIO;
++ 		goto out_release;
++ 	}
++ 
++ 	ret = mfill_atomic_install_pte(dst_mm, dst_pmd, dst_vma, dst_addr,
++ 				       page, false, wp_copy);
++ 	if (ret)
++ 		goto out_release;
++ 
++ 	unlock_page(page);
++ 	ret = 0;
++ out:
++ 	return ret;
++ out_release:
++ 	unlock_page(page);
++ 	put_page(page);
++ 	goto out;
++ }
++ 
+++>>>>>>> b9d02f1bdd98 (mm: shmem: don't truncate page if memory failure happens)
+  static pmd_t *mm_alloc_pmd(struct mm_struct *mm, unsigned long address)
+  {
+  	pgd_t *pgd;
+* Unmerged path mm/memory-failure.c
+* Unmerged path mm/shmem.c
+* Unmerged path mm/userfaultfd.c
