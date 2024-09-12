@@ -1,0 +1,197 @@
+x86/CPU/AMD: Clear RDRAND CPUID bit on AMD family 15h/16h
+
+jira LE-1907
+cve CVE-2023-1637
+Rebuild_History Non-Buildable kernel-4.18.0-504.el8
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit c49a0a80137c7ca7d6ced4c812c9e07a949f6f24
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-504.el8/c49a0a80.failed
+
+There have been reports of RDRAND issues after resuming from suspend on
+some AMD family 15h and family 16h systems. This issue stems from a BIOS
+not performing the proper steps during resume to ensure RDRAND continues
+to function properly.
+
+RDRAND support is indicated by CPUID Fn00000001_ECX[30]. This bit can be
+reset by clearing MSR C001_1004[62]. Any software that checks for RDRAND
+support using CPUID, including the kernel, will believe that RDRAND is
+not supported.
+
+Update the CPU initialization to clear the RDRAND CPUID bit for any family
+15h and 16h processor that supports RDRAND. If it is known that the family
+15h or family 16h system does not have an RDRAND resume issue or that the
+system will not be placed in suspend, the "rdrand=force" kernel parameter
+can be used to stop the clearing of the RDRAND CPUID bit.
+
+Additionally, update the suspend and resume path to save and restore the
+MSR C001_1004 value to ensure that the RDRAND CPUID setting remains in
+place after resuming from suspend.
+
+Note, that clearing the RDRAND CPUID bit does not prevent a processor
+that normally supports the RDRAND instruction from executing it. So any
+code that determined the support based on family and model won't #UD.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Andrew Cooper <andrew.cooper3@citrix.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Chen Yu <yu.c.chen@intel.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Juergen Gross <jgross@suse.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: "linux-doc@vger.kernel.org" <linux-doc@vger.kernel.org>
+	Cc: "linux-pm@vger.kernel.org" <linux-pm@vger.kernel.org>
+	Cc: Nathan Chancellor <natechancellor@gmail.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Pavel Machek <pavel@ucw.cz>
+	Cc: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+	Cc: <stable@vger.kernel.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: "x86@kernel.org" <x86@kernel.org>
+Link: https://lkml.kernel.org/r/7543af91666f491547bd86cebb1e17c66824ab9f.1566229943.git.thomas.lendacky@amd.com
+(cherry picked from commit c49a0a80137c7ca7d6ced4c812c9e07a949f6f24)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/amd.c
+#	arch/x86/power/cpu.c
+diff --cc arch/x86/kernel/cpu/amd.c
+index cd94c9a6c2d8,68c363c341bf..000000000000
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@@ -846,53 -876,25 +904,60 @@@ static void init_amd_bd(struct cpuinfo_
+  			wrmsrl_safe(MSR_F15H_IC_CFG, value);
+  		}
+  	}
++ 
++ 	/*
++ 	 * Some BIOS implementations do not restore proper RDRAND support
++ 	 * across suspend and resume. Check on whether to hide the RDRAND
++ 	 * instruction support via CPUID.
++ 	 */
++ 	clear_rdrand_cpuid_bit(c);
+  }
+  
+ -static void init_amd_zn(struct cpuinfo_x86 *c)
+ +void init_spectral_chicken(struct cpuinfo_x86 *c)
+  {
+ -	set_cpu_cap(c, X86_FEATURE_ZEN);
+ +#ifdef CONFIG_CPU_UNRET_ENTRY
+ +	u64 value;
+  
+  	/*
+ -	 * Fix erratum 1076: CPB feature bit not being set in CPUID.
+ -	 * Always set it, except when running under a hypervisor.
+ +	 * On Zen2 we offer this chicken (bit) on the altar of Speculation.
+ +	 *
+ +	 * This suppresses speculation from the middle of a basic block, i.e. it
+ +	 * suppresses non-branch predictions.
+ +	 *
+ +	 * We use STIBP as a heuristic to filter out Zen2 from the rest of F17H
+  	 */
+ -	if (!cpu_has(c, X86_FEATURE_HYPERVISOR) && !cpu_has(c, X86_FEATURE_CPB))
+ -		set_cpu_cap(c, X86_FEATURE_CPB);
+ +	if (!cpu_has(c, X86_FEATURE_HYPERVISOR) && cpu_has(c, X86_FEATURE_AMD_STIBP)) {
+ +		if (!rdmsrl_safe(MSR_ZEN2_SPECTRAL_CHICKEN, &value)) {
+ +			value |= MSR_ZEN2_SPECTRAL_CHICKEN_BIT;
+ +			wrmsrl_safe(MSR_ZEN2_SPECTRAL_CHICKEN, value);
+ +		}
+ +	}
+ +#endif
+ +}
+ +
+ +static void init_amd_zn(struct cpuinfo_x86 *c)
+ +{
+ +	set_cpu_cap(c, X86_FEATURE_ZEN);
+ +
+ +#ifdef CONFIG_NUMA
+ +	node_reclaim_distance = 32;
+ +#endif
+ +
+ +	/* Fix up CPUID bits, but only if not virtualised. */
+ +	if (!cpu_has(c, X86_FEATURE_HYPERVISOR)) {
+ +
+ +		/* Erratum 1076: CPB feature bit not being set in CPUID. */
+ +		if (!cpu_has(c, X86_FEATURE_CPB))
+ +			set_cpu_cap(c, X86_FEATURE_CPB);
+ +
+ +		/*
+ +		 * Zen3 (Fam19 model < 0x10) parts are not susceptible to
+ +		 * Branch Type Confusion, but predate the allocation of the
+ +		 * BTC_NO bit.
+ +		 */
+ +		if (c->x86 == 0x19 && !cpu_has(c, X86_FEATURE_BTC_NO))
+ +			set_cpu_cap(c, X86_FEATURE_BTC_NO);
+ +	}
+  }
+  
+  static void init_amd(struct cpuinfo_x86 *c)
+@@@ -923,9 -925,8 +988,14 @@@
+  	case 0x10: init_amd_gh(c); break;
+  	case 0x12: init_amd_ln(c); break;
+  	case 0x15: init_amd_bd(c); break;
+++<<<<<<< HEAD
+ +	case 0x17: init_spectral_chicken(c);
+ +		   fallthrough;
+ +	case 0x19: init_amd_zn(c); break;
+++=======
++ 	case 0x16: init_amd_jg(c); break;
++ 	case 0x17: init_amd_zn(c); break;
+++>>>>>>> c49a0a80137c (x86/CPU/AMD: Clear RDRAND CPUID bit on AMD family 15h/16h)
+  	}
+  
+  	/*
+diff --cc arch/x86/power/cpu.c
+index dd5a29553697,c9ef6a7a4a1a..000000000000
+--- a/arch/x86/power/cpu.c
++++ b/arch/x86/power/cpu.c
+@@@ -24,8 -24,7 +25,12 @@@
+  #include <asm/debugreg.h>
+  #include <asm/cpu.h>
+  #include <asm/mmu_context.h>
+++<<<<<<< HEAD
+ +#include <linux/dmi.h>
+ +#include <asm/microcode.h>
+++=======
++ #include <asm/cpu_device_id.h>
+++>>>>>>> c49a0a80137c (x86/CPU/AMD: Clear RDRAND CPUID bit on AMD family 15h/16h)
+  
+  #ifdef CONFIG_X86_32
+  __visible unsigned long saved_context_ebx;
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index f39186449b18..28754126c6dd 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -4510,6 +4510,13 @@
+ 			Run specified binary instead of /init from the ramdisk,
+ 			used for early userspace startup. See initrd.
+ 
++	rdrand=		[X86]
++			force - Override the decision by the kernel to hide the
++				advertisement of RDRAND support (this affects
++				certain AMD processors because of buggy BIOS
++				support, specifically around the suspend/resume
++				path).
++
+ 	rdt=		[HW,X86,RDT]
+ 			Turn on/off individual RDT features. List is:
+ 			cmt, mbmtotal, mbmlocal, l3cat, l3cdp, l2cat, l2cdp,
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index 50dd4cd84661..bc0f2eb02f5a 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -495,6 +495,7 @@
+ #define MSR_AMD64_PATCH_LEVEL		0x0000008b
+ #define MSR_AMD64_TSC_RATIO		0xc0000104
+ #define MSR_AMD64_NB_CFG		0xc001001f
++#define MSR_AMD64_CPUID_FN_1		0xc0011004
+ #define MSR_AMD64_PATCH_LOADER		0xc0010020
+ #define MSR_AMD64_OSVW_ID_LENGTH	0xc0010140
+ #define MSR_AMD64_OSVW_STATUS		0xc0010141
+* Unmerged path arch/x86/kernel/cpu/amd.c
+* Unmerged path arch/x86/power/cpu.c
