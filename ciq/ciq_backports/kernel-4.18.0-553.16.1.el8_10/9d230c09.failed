@@ -1,0 +1,95 @@
+blk-cgroup: Properly propagate the iostat update up the hierarchy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Waiman Long <longman@redhat.com>
+commit 9d230c09964e6e18c8f6e4f0d41ee90eef45ec1c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/9d230c09.failed
+
+During a cgroup_rstat_flush() call, the lowest level of nodes are flushed
+first before their parents. Since commit 3b8cc6298724 ("blk-cgroup:
+Optimize blkcg_rstat_flush()"), iostat propagation was still done to
+the parent. Grandparent, however, may not get the iostat update if the
+parent has no blkg_iostat_set queued in its lhead lockless list.
+
+Fix this iostat propagation problem by queuing the parent's global
+blkg->iostat into one of its percpu lockless lists to make sure that
+the delta will always be propagated up to the grandparent and so on
+toward the root blkcg.
+
+Note that successive calls to __blkcg_rstat_flush() are serialized by
+the cgroup_rstat_lock. So no special barrier is used in the reading
+and writing of blkg->iostat.lqueued.
+
+Fixes: 3b8cc6298724 ("blk-cgroup: Optimize blkcg_rstat_flush()")
+	Reported-by: Dan Schatzberg <schatzberg.dan@gmail.com>
+Closes: https://lore.kernel.org/lkml/ZkO6l%2FODzadSgdhC@dschatzberg-fedora-PF3DHTBV/
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Acked-by: Tejun Heo <tj@kernel.org>
+Link: https://lore.kernel.org/r/20240515143059.276677-1-longman@redhat.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 9d230c09964e6e18c8f6e4f0d41ee90eef45ec1c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-cgroup.c
+diff --cc block/blk-cgroup.c
+index 663ab4b76385,37e6cc91d576..000000000000
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@@ -199,19 -308,22 +199,25 @@@ static struct blkcg_gq *blkg_alloc(stru
+  	int i, cpu;
+  
+  	/* alloc and init base part */
+ -	blkg = kzalloc_node(sizeof(*blkg), gfp_mask, disk->queue->node);
+ +	blkg = kzalloc_node(sizeof(*blkg), gfp_mask, q->node);
+  	if (!blkg)
+  		return NULL;
+ +
+  	if (percpu_ref_init(&blkg->refcnt, blkg_release, 0, gfp_mask))
+ -		goto out_free_blkg;
+ +		goto err_free;
+ +
+  	blkg->iostat_cpu = alloc_percpu_gfp(struct blkg_iostat_set, gfp_mask);
+  	if (!blkg->iostat_cpu)
+ -		goto out_exit_refcnt;
+ -	if (!blk_get_queue(disk->queue))
+ -		goto out_free_iostat;
+ +		goto err_free;
+  
+ -	blkg->q = disk->queue;
+ +	blkg->q = q;
+  	INIT_LIST_HEAD(&blkg->q_node);
+++<<<<<<< HEAD
+++=======
++ 	blkg->blkcg = blkcg;
++ 	blkg->iostat.blkg = blkg;
++ #ifdef CONFIG_BLK_CGROUP_PUNT_BIO
+++>>>>>>> 9d230c09964e (blk-cgroup: Properly propagate the iostat update up the hierarchy)
+  	spin_lock_init(&blkg->async_bio_lock);
+  	bio_list_init(&blkg->async_bios);
+  	INIT_WORK(&blkg->async_bio_work, blkg_async_bio_workfn);
+@@@ -882,7 -1036,19 +888,9 @@@ static void __blkcg_rstat_flush(struct 
+  		struct blkg_iostat cur;
+  		unsigned int seq;
+  
+ -		/*
+ -		 * Order assignment of `next_bisc` from `bisc->lnode.next` in
+ -		 * llist_for_each_entry_safe and clearing `bisc->lqueued` for
+ -		 * avoiding to assign `next_bisc` with new next pointer added
+ -		 * in blk_cgroup_bio_start() in case of re-ordering.
+ -		 *
+ -		 * The pair barrier is implied in llist_add() in blk_cgroup_bio_start().
+ -		 */
+ -		smp_mb();
+ -
+  		WRITE_ONCE(bisc->lqueued, false);
++ 		if (bisc == &blkg->iostat)
++ 			goto propagate_up; /* propagate up to parent only */
+  
+  		/* fetch the current per-cpu values */
+  		do {
+* Unmerged path block/blk-cgroup.c
