@@ -1,0 +1,163 @@
+rxrpc: Move error processing into the local endpoint I/O thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit ff7348254e704b6d0121970e311a6b699268e1ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/ff734825.failed
+
+Move the processing of error packets into the local endpoint I/O thread,
+leaving the handover from UDP to merely transfer them into the local
+endpoint queue.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit ff7348254e704b6d0121970e311a6b699268e1ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/io_thread.c
+#	net/rxrpc/peer_event.c
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,566377c64184..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -36,6 -36,8 +36,11 @@@ struct rxrpc_txbuf
+   * to pass supplementary information.
+   */
+  enum rxrpc_skb_mark {
+++<<<<<<< HEAD
+++=======
++ 	RXRPC_SKB_MARK_PACKET,		/* Received packet */
++ 	RXRPC_SKB_MARK_ERROR,		/* Error notification */
+++>>>>>>> ff7348254e70 (rxrpc: Move error processing into the local endpoint I/O thread)
+  	RXRPC_SKB_MARK_REJECT_BUSY,	/* Reject with BUSY */
+  	RXRPC_SKB_MARK_REJECT_ABORT,	/* Reject with ABORT (code in skb->priority) */
+  };
+@@@ -942,7 -952,20 +947,24 @@@ void rxrpc_unpublish_service_conn(struc
+  /*
+   * input.c
+   */
+++<<<<<<< HEAD
+ +int rxrpc_input_packet(struct sock *, struct sk_buff *);
+++=======
++ void rxrpc_input_call_packet(struct rxrpc_call *, struct sk_buff *);
++ void rxrpc_input_implicit_end_call(struct rxrpc_sock *, struct rxrpc_connection *,
++ 				   struct rxrpc_call *);
++ 
++ /*
++  * io_thread.c
++  */
++ int rxrpc_encap_rcv(struct sock *, struct sk_buff *);
++ void rxrpc_error_report(struct sock *);
++ int rxrpc_io_thread(void *data);
++ static inline void rxrpc_wake_up_io_thread(struct rxrpc_local *local)
++ {
++ 	wake_up_process(local->io_thread);
++ }
+++>>>>>>> ff7348254e70 (rxrpc: Move error processing into the local endpoint I/O thread)
+  
+  /*
+   * insecure.c
+diff --cc net/rxrpc/peer_event.c
+index b5160a878fe1,94f63fb1bd67..000000000000
+--- a/net/rxrpc/peer_event.c
++++ b/net/rxrpc/peer_event.c
+@@@ -143,52 -131,27 +143,63 @@@ static void rxrpc_adjust_mtu(struct rxr
+  /*
+   * Handle an error received on the local endpoint.
+   */
+- void rxrpc_error_report(struct sock *sk)
++ void rxrpc_input_error(struct rxrpc_local *local, struct sk_buff *skb)
+  {
+- 	struct sock_exterr_skb *serr;
++ 	struct sock_exterr_skb *serr = SKB_EXT_ERR(skb);
+  	struct sockaddr_rxrpc srx;
+++<<<<<<< HEAD
+ +	struct rxrpc_local *local;
+ +	struct rxrpc_peer *peer;
+ +	struct sk_buff *skb;
+++=======
++ 	struct rxrpc_peer *peer = NULL;
+++>>>>>>> ff7348254e70 (rxrpc: Move error processing into the local endpoint I/O thread)
+  
+- 	rcu_read_lock();
+- 	local = rcu_dereference_sk_user_data(sk);
+- 	if (unlikely(!local)) {
+- 		rcu_read_unlock();
+- 		return;
+- 	}
+- 	_enter("%p{%d}", sk, local->debug_id);
++ 	_enter("L=%x", local->debug_id);
+  
+++<<<<<<< HEAD
+ +	/* Clear the outstanding error value on the socket so that it doesn't
+ +	 * cause kernel_sendmsg() to return it later.
+ +	 */
+ +	sock_error(sk);
+ +
+ +	skb = sock_dequeue_err_skb(sk);
+ +	if (!skb) {
+ +		rcu_read_unlock();
+ +		_leave("UDP socket errqueue empty");
+ +		return;
+ +	}
+ +	rxrpc_new_skb(skb, rxrpc_skb_received);
+ +	serr = SKB_EXT_ERR(skb);
+ +	if (!skb->len && serr->ee.ee_origin == SO_EE_ORIGIN_TIMESTAMPING) {
+ +		_leave("UDP empty message");
+ +		rcu_read_unlock();
+ +		rxrpc_free_skb(skb, rxrpc_skb_freed);
+ +		return;
+ +	}
+ +
+ +	peer = rxrpc_lookup_peer_icmp_rcu(local, skb, &srx);
+ +	if (peer && !rxrpc_get_peer_maybe(peer))
+ +		peer = NULL;
+ +	if (!peer) {
+ +		rcu_read_unlock();
+ +		rxrpc_free_skb(skb, rxrpc_skb_freed);
+ +		_leave(" [no peer]");
+++=======
++ 	if (!skb->len && serr->ee.ee_origin == SO_EE_ORIGIN_TIMESTAMPING) {
++ 		_leave("UDP empty message");
+  		return;
+  	}
+  
++ 	rcu_read_lock();
++ 	peer = rxrpc_lookup_peer_local_rcu(local, skb, &srx);
++ 	if (peer && !rxrpc_get_peer_maybe(peer, rxrpc_peer_get_input_error))
++ 		peer = NULL;
++ 	rcu_read_unlock();
++ 	if (!peer)
+++>>>>>>> ff7348254e70 (rxrpc: Move error processing into the local endpoint I/O thread)
++ 		return;
++ 
+  	trace_rxrpc_rx_icmp(peer, &serr->ee, &srx);
+  
+  	if ((serr->ee.ee_origin == SO_EE_ORIGIN_ICMP &&
+@@@ -203,11 -162,8 +214,16 @@@
+  	}
+  
+  	rxrpc_store_error(peer, serr);
+++<<<<<<< HEAD
+ +	rcu_read_unlock();
+ +	rxrpc_free_skb(skb, rxrpc_skb_freed);
+ +	rxrpc_put_peer(peer);
+ +
+ +	_leave("");
+++=======
++ out:
++ 	rxrpc_put_peer(peer, rxrpc_peer_put_input_error);
+++>>>>>>> ff7348254e70 (rxrpc: Move error processing into the local endpoint I/O thread)
+  }
+  
+  /*
+* Unmerged path net/rxrpc/io_thread.c
+* Unmerged path net/rxrpc/ar-internal.h
+* Unmerged path net/rxrpc/io_thread.c
+* Unmerged path net/rxrpc/peer_event.c
