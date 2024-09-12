@@ -1,0 +1,195 @@
+rxrpc: Make the local endpoint hold a ref on a connected call
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 5040011d073d3acdeb58af2b64f84e33bb03abd2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/5040011d.failed
+
+Make the local endpoint and it's I/O thread hold a reference on a connected
+call until that call is disconnected.  Without this, we're reliant on
+either the AF_RXRPC socket to hold a ref (which is dropped when the call is
+released) or a queued work item to hold a ref (the work item is being
+replaced with the I/O thread).
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit 5040011d073d3acdeb58af2b64f84e33bb03abd2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/trace/events/rxrpc.h
+#	net/rxrpc/call_object.c
+#	net/rxrpc/conn_object.c
+diff --cc include/trace/events/rxrpc.h
+index 2a52121d73a0,b526d982da7e..000000000000
+--- a/include/trace/events/rxrpc.h
++++ b/include/trace/events/rxrpc.h
+@@@ -82,10 -159,12 +83,15 @@@
+  	EM(rxrpc_call_get_userid,		"GET user-id ") \
+  	EM(rxrpc_call_new_client,		"NEW client  ") \
+  	EM(rxrpc_call_new_prealloc_service,	"NEW prealloc") \
+ +	EM(rxrpc_call_put_already_queued,	"PUT alreadyq") \
+  	EM(rxrpc_call_put_discard_prealloc,	"PUT disc-pre") \
+++<<<<<<< HEAD
+++=======
++ 	EM(rxrpc_call_put_discard_error,	"PUT disc-err") \
++ 	EM(rxrpc_call_put_io_thread,		"PUT iothread") \
+++>>>>>>> 5040011d073d (rxrpc: Make the local endpoint hold a ref on a connected call)
+  	EM(rxrpc_call_put_input,		"PUT input   ") \
+  	EM(rxrpc_call_put_kernel,		"PUT kernel  ") \
+ -	EM(rxrpc_call_put_poke,			"PUT poke    ") \
+  	EM(rxrpc_call_put_recvmsg,		"PUT recvmsg ") \
+  	EM(rxrpc_call_put_release_sock,		"PUT rls-sock") \
+  	EM(rxrpc_call_put_release_sock_tba,	"PUT rls-sk-a") \
+diff --cc net/rxrpc/call_object.c
+index ad495d0d21a8,239fc3c75079..000000000000
+--- a/net/rxrpc/call_object.c
++++ b/net/rxrpc/call_object.c
+@@@ -405,6 -430,31 +405,34 @@@ void rxrpc_incoming_call(struct rxrpc_s
+  	call->state		= RXRPC_CALL_SERVER_SECURING;
+  	call->cong_tstamp	= skb->tstamp;
+  
+++<<<<<<< HEAD
+++=======
++ 	spin_lock(&conn->state_lock);
++ 
++ 	switch (conn->state) {
++ 	case RXRPC_CONN_SERVICE_UNSECURED:
++ 	case RXRPC_CONN_SERVICE_CHALLENGING:
++ 		call->state = RXRPC_CALL_SERVER_SECURING;
++ 		break;
++ 	case RXRPC_CONN_SERVICE:
++ 		call->state = RXRPC_CALL_SERVER_RECV_REQUEST;
++ 		break;
++ 
++ 	case RXRPC_CONN_REMOTELY_ABORTED:
++ 		__rxrpc_set_call_completion(call, RXRPC_CALL_REMOTELY_ABORTED,
++ 					    conn->abort_code, conn->error);
++ 		break;
++ 	case RXRPC_CONN_LOCALLY_ABORTED:
++ 		__rxrpc_abort_call("CON", call, 1,
++ 				   conn->abort_code, conn->error);
++ 		break;
++ 	default:
++ 		BUG();
++ 	}
++ 
++ 	rxrpc_get_call(call, rxrpc_call_get_io_thread);
++ 
+++>>>>>>> 5040011d073d (rxrpc: Make the local endpoint hold a ref on a connected call)
+  	/* Set the channel for this call.  We don't get channel_lock as we're
+  	 * only defending against the data_ready handler (which we're called
+  	 * from) and the RESPONSE packet parser (which is only really
+diff --cc net/rxrpc/conn_object.c
+index 156bd26daf74,2bd3f6288895..000000000000
+--- a/net/rxrpc/conn_object.c
++++ b/net/rxrpc/conn_object.c
+@@@ -210,50 -184,25 +213,60 @@@ void rxrpc_disconnect_call(struct rxrpc
+  	call->peer->cong_ssthresh = call->cong_ssthresh;
+  
+  	if (!hlist_unhashed(&call->error_link)) {
+ -		spin_lock(&call->peer->lock);
+ -		hlist_del_init(&call->error_link);
+ -		spin_unlock(&call->peer->lock);
+ +		spin_lock_bh(&call->peer->lock);
+ +		hlist_del_rcu(&call->error_link);
+ +		spin_unlock_bh(&call->peer->lock);
+  	}
+  
+- 	if (rxrpc_is_client_call(call))
+- 		return rxrpc_disconnect_client_call(conn->bundle, call);
++ 	if (rxrpc_is_client_call(call)) {
++ 		rxrpc_disconnect_client_call(conn->bundle, call);
++ 	} else {
++ 		spin_lock(&conn->bundle->channel_lock);
++ 		__rxrpc_disconnect_call(conn, call);
++ 		spin_unlock(&conn->bundle->channel_lock);
+  
+- 	spin_lock(&conn->bundle->channel_lock);
+- 	__rxrpc_disconnect_call(conn, call);
+- 	spin_unlock(&conn->bundle->channel_lock);
++ 		conn->idle_timestamp = jiffies;
++ 		if (atomic_dec_and_test(&conn->active))
++ 			rxrpc_set_service_reap_timer(conn->rxnet,
++ 						     jiffies + rxrpc_connection_expiry);
++ 	}
+  
+++<<<<<<< HEAD
+ +	set_bit(RXRPC_CALL_DISCONNECTED, &call->flags);
+ +	conn->idle_timestamp = jiffies;
+ +}
+ +
+ +/*
+ + * Kill off a connection.
+ + */
+ +void rxrpc_kill_connection(struct rxrpc_connection *conn)
+ +{
+ +	struct rxrpc_net *rxnet = conn->params.local->rxnet;
+ +
+ +	ASSERT(!rcu_access_pointer(conn->channels[0].call) &&
+ +	       !rcu_access_pointer(conn->channels[1].call) &&
+ +	       !rcu_access_pointer(conn->channels[2].call) &&
+ +	       !rcu_access_pointer(conn->channels[3].call));
+ +	ASSERT(list_empty(&conn->cache_link));
+ +
+ +	write_lock(&rxnet->conn_lock);
+ +	list_del_init(&conn->proc_link);
+ +	write_unlock(&rxnet->conn_lock);
+ +
+ +	/* Drain the Rx queue.  Note that even though we've unpublished, an
+ +	 * incoming packet could still be being added to our Rx queue, so we
+ +	 * will need to drain it again in the RCU cleanup handler.
+ +	 */
+ +	rxrpc_purge_queue(&conn->rx_queue);
+ +
+ +	/* Leave final destruction to RCU.  The connection processor work item
+ +	 * must carry a ref on the connection to prevent us getting here whilst
+ +	 * it is queued or running.
+ +	 */
+ +	call_rcu(&conn->rcu, rxrpc_destroy_connection);
+++=======
++ 	rxrpc_put_call(call, rxrpc_call_put_io_thread);
+++>>>>>>> 5040011d073d (rxrpc: Make the local endpoint hold a ref on a connected call)
+  }
+  
+  /*
+* Unmerged path include/trace/events/rxrpc.h
+* Unmerged path net/rxrpc/call_object.c
+diff --git a/net/rxrpc/conn_client.c b/net/rxrpc/conn_client.c
+index 827c1308297c..0576723401c8 100644
+--- a/net/rxrpc/conn_client.c
++++ b/net/rxrpc/conn_client.c
+@@ -714,8 +714,11 @@ int rxrpc_connect_call(struct rxrpc_sock *rx,
+ 
+ 	rxrpc_discard_expired_client_conns(&rxnet->client_conn_reaper);
+ 
++	rxrpc_get_call(call, rxrpc_call_get_io_thread);
++
+ 	bundle = rxrpc_prep_call(rx, call, cp, srx, gfp);
+ 	if (IS_ERR(bundle)) {
++		rxrpc_put_call(call, rxrpc_call_get_io_thread);
+ 		ret = PTR_ERR(bundle);
+ 		goto out;
+ 	}
+@@ -805,7 +808,6 @@ void rxrpc_disconnect_client_call(struct rxrpc_bundle *bundle, struct rxrpc_call
+ 	_enter("c=%x", call->debug_id);
+ 
+ 	spin_lock(&bundle->channel_lock);
+-	set_bit(RXRPC_CALL_DISCONNECTED, &call->flags);
+ 
+ 	/* Calls that have never actually been assigned a channel can simply be
+ 	 * discarded.
+@@ -897,8 +899,6 @@ void rxrpc_disconnect_client_call(struct rxrpc_bundle *bundle, struct rxrpc_call
+ 
+ out:
+ 	spin_unlock(&bundle->channel_lock);
+-	_leave("");
+-	return;
+ }
+ 
+ /*
+* Unmerged path net/rxrpc/conn_object.c
