@@ -1,0 +1,256 @@
+ice: Advertise 802.1ad VLAN filtering and offloads for PF netdev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.26.1.el8_6
+commit-author Brett Creeley <brett.creeley@intel.com>
+commit 1babaf77f49d7d8b6991ac948ef24899aa15eca4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.26.1.el8_6/1babaf77.failed
+
+In order for the driver to support 802.1ad VLAN filtering and offloads,
+it needs to advertise those VLAN features and also support modifying
+those VLAN features, so make the necessary changes to
+ice_set_netdev_features(). By default, enable CTAG insertion/stripping
+and CTAG filtering for both Single and Double VLAN Modes (SVM/DVM).
+Also, in DVM, enable STAG filtering by default. This is done by
+setting the feature bits in netdev->features. Also, in DVM, support
+toggling of STAG insertion/stripping, but don't enable them by
+default. This is done by setting the feature bits in
+netdev->hw_features.
+
+Since 802.1ad VLAN filtering and offloads are only supported in DVM, make
+sure they are not enabled by default and that they cannot be enabled
+during runtime, when the device is in SVM.
+
+Add an implementation for the ndo_fix_features() callback. This is
+needed since the hardware cannot support multiple VLAN ethertypes for
+VLAN insertion/stripping simultaneously and all supported VLAN filtering
+must either be enabled or disabled together.
+
+Disable inner VLAN stripping by default when DVM is enabled. If a VSI
+supports stripping the inner VLAN in DVM, then it will have to configure
+that during runtime. For example if a VF is configured in a port VLAN
+while DVM is enabled it will be allowed to offload inner VLANs.
+
+	Signed-off-by: Brett Creeley <brett.creeley@intel.com>
+	Tested-by: Gurucharan G <gurucharanx.g@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 1babaf77f49d7d8b6991ac948ef24899aa15eca4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_lib.c
+#	drivers/net/ethernet/intel/ice/ice_main.c
+diff --cc drivers/net/ethernet/intel/ice/ice_lib.c
+index 737ccd2dacf6,f23917d6a495..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@@ -853,13 -855,27 +854,37 @@@ static void ice_set_dflt_vsi_ctx(struc
+  	ctxt->info.sw_flags = ICE_AQ_VSI_SW_FLAG_SRC_PRUNE;
+  	/* Traffic from VSI can be sent to LAN */
+  	ctxt->info.sw_flags2 = ICE_AQ_VSI_SW_FLAG_LAN_ENA;
+++<<<<<<< HEAD
+ +	/* By default bits 3 and 4 in vlan_flags are 0's which results in legacy
+ +	 * behavior (show VLAN, DEI, and UP) in descriptor. Also, allow all
+ +	 * packets untagged/tagged.
+ +	 */
+ +	ctxt->info.vlan_flags = ((ICE_AQ_VSI_VLAN_MODE_ALL &
+ +				  ICE_AQ_VSI_VLAN_MODE_M) >>
+ +				 ICE_AQ_VSI_VLAN_MODE_S);
+++=======
++ 	/* allow all untagged/tagged packets by default on Tx */
++ 	ctxt->info.inner_vlan_flags = ((ICE_AQ_VSI_INNER_VLAN_TX_MODE_ALL &
++ 				  ICE_AQ_VSI_INNER_VLAN_TX_MODE_M) >>
++ 				 ICE_AQ_VSI_INNER_VLAN_TX_MODE_S);
++ 	/* SVM - by default bits 3 and 4 in inner_vlan_flags are 0's which
++ 	 * results in legacy behavior (show VLAN, DEI, and UP) in descriptor.
++ 	 *
++ 	 * DVM - leave inner VLAN in packet by default
++ 	 */
++ 	if (ice_is_dvm_ena(hw)) {
++ 		ctxt->info.inner_vlan_flags |=
++ 			ICE_AQ_VSI_INNER_VLAN_EMODE_NOTHING;
++ 		ctxt->info.outer_vlan_flags =
++ 			(ICE_AQ_VSI_OUTER_VLAN_TX_MODE_ALL <<
++ 			 ICE_AQ_VSI_OUTER_VLAN_TX_MODE_S) &
++ 			ICE_AQ_VSI_OUTER_VLAN_TX_MODE_M;
++ 		ctxt->info.outer_vlan_flags |=
++ 			(ICE_AQ_VSI_OUTER_TAG_VLAN_8100 <<
++ 			 ICE_AQ_VSI_OUTER_TAG_TYPE_S) &
++ 			ICE_AQ_VSI_OUTER_TAG_TYPE_M;
++ 	}
+++>>>>>>> 1babaf77f49d (ice: Advertise 802.1ad VLAN filtering and offloads for PF netdev)
+  	/* Have 1:1 UP mapping for both ingress/egress tables */
+  	table |= ICE_UP_TABLE_TRANSLATE(0, 0);
+  	table |= ICE_UP_TABLE_TRANSLATE(1, 1);
+diff --cc drivers/net/ethernet/intel/ice/ice_main.c
+index c72c372436a2,45989925e08c..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@@ -410,8 -411,9 +410,14 @@@ static int ice_vsi_sync_fltr(struct ice
+  						IFF_PROMISC;
+  					goto out_promisc;
+  				}
+++<<<<<<< HEAD
+ +				if (vsi->num_vlan > 1)
+ +					ice_cfg_vlan_pruning(vsi, true);
+++=======
++ 				if (vsi->current_netdev_flags &
++ 				    NETIF_F_HW_VLAN_CTAG_FILTER)
++ 					vlan_ops->ena_rx_filtering(vsi);
+++>>>>>>> 1babaf77f49d (ice: Advertise 802.1ad VLAN filtering and offloads for PF netdev)
+  			}
+  		}
+  	}
+@@@ -3460,27 -3437,8 +3480,30 @@@ ice_vlan_rx_add_vid(struct net_device *
+  	if (!vid)
+  		return 0;
+  
+ -	vlan_ops = ice_get_compat_vsi_vlan_ops(vsi);
+ +	while (test_and_set_bit(ICE_CFG_BUSY, vsi->state))
+ +		usleep_range(1000, 2000);
+ +
+++<<<<<<< HEAD
+ +	/* Enable VLAN pruning when a VLAN other than 0 is added */
+ +	if (!ice_vsi_is_vlan_pruning_ena(vsi)) {
+ +		ret = ice_cfg_vlan_pruning(vsi, true);
+ +		if (ret)
+ +			goto finish;
+ +	}
+  
+ +	/* Add multicast promisc rule for the VLAN ID to be added if
+ +	 * all-multicast is currently enabled.
+ +	 */
+ +	if (vsi->current_netdev_flags & IFF_ALLMULTI) {
+ +		ret = ice_fltr_set_vsi_promisc(&vsi->back->hw, vsi->idx,
+ +					       ICE_MCAST_VLAN_PROMISC_BITS,
+ +					       vid);
+ +		if (ret)
+ +			goto finish;
+ +	}
+ +
+++=======
+++>>>>>>> 1babaf77f49d (ice: Advertise 802.1ad VLAN filtering and offloads for PF netdev)
+  	/* Add a switch rule for this VLAN ID so its corresponding VLAN tagged
+  	 * packets aren't pruned by the device's internal switch on Rx
+  	 */
+@@@ -3525,45 -3471,18 +3548,50 @@@ ice_vlan_rx_kill_vid(struct net_device 
+  	if (!vid)
+  		return 0;
+  
+ -	vlan_ops = ice_get_compat_vsi_vlan_ops(vsi);
+ +	while (test_and_set_bit(ICE_CFG_BUSY, vsi->state))
+ +		usleep_range(1000, 2000);
+  
+ -	/* Make sure VLAN delete is successful before updating VLAN
+ +	/* Make sure ice_vsi_kill_vlan is successful before updating VLAN
+  	 * information
+  	 */
+ -	vlan = ICE_VLAN(be16_to_cpu(proto), vid, 0);
+ -	ret = vlan_ops->del_vlan(vsi, &vlan);
+ +	ret = ice_vsi_kill_vlan(vsi, vid);
+  	if (ret)
+ -		return ret;
+ +		goto finish;
+ +
+++<<<<<<< HEAD
+ +	/* Remove multicast promisc rule for the removed VLAN ID if
+ +	 * all-multicast is enabled.
+ +	 */
+ +	if (vsi->current_netdev_flags & IFF_ALLMULTI)
+ +		ice_fltr_clear_vsi_promisc(&vsi->back->hw, vsi->idx,
+ +					   ICE_MCAST_VLAN_PROMISC_BITS, vid);
+ +
+ +	if (vsi->num_vlan == 1) {
+ +		/* Disable pruning when VLAN 0 is the only VLAN rule */
+ +		if (ice_vsi_is_vlan_pruning_ena(vsi))
+ +			ice_cfg_vlan_pruning(vsi, false);
+ +
+ +		/* Update look-up type of multicast promisc rule for VLAN 0
+ +		 * from ICE_SW_LKUP_PROMISC_VLAN to ICE_SW_LKUP_PROMISC when
+ +		 * all-multicast is enabled and VLAN 0 is the only VLAN rule.
+ +		 */
+ +		if (vsi->current_netdev_flags & IFF_ALLMULTI) {
+ +			ice_fltr_clear_vsi_promisc(&vsi->back->hw, vsi->idx,
+ +						   ICE_MCAST_VLAN_PROMISC_BITS,
+ +						   0);
+ +			ice_fltr_set_vsi_promisc(&vsi->back->hw, vsi->idx,
+ +						 ICE_MCAST_PROMISC_BITS, 0);
+ +		}
+ +	}
+ +
+ +finish:
+ +	clear_bit(ICE_CFG_BUSY, vsi->state);
+  
+ +	return ret;
+++=======
++ 	set_bit(ICE_VSI_VLAN_FLTR_CHANGED, vsi->state);
++ 	return 0;
+++>>>>>>> 1babaf77f49d (ice: Advertise 802.1ad VLAN filtering and offloads for PF netdev)
+  }
+  
+  /**
+@@@ -5697,26 -5809,9 +5913,32 @@@ ice_set_features(struct net_device *net
+  		 netdev->features & NETIF_F_RXHASH)
+  		ice_vsi_manage_rss_lut(vsi, false);
+  
+++<<<<<<< HEAD
+ +	if ((features & NETIF_F_HW_VLAN_CTAG_RX) &&
+ +	    !(netdev->features & NETIF_F_HW_VLAN_CTAG_RX))
+ +		ret = ice_vsi_manage_vlan_stripping(vsi, true);
+ +	else if (!(features & NETIF_F_HW_VLAN_CTAG_RX) &&
+ +		 (netdev->features & NETIF_F_HW_VLAN_CTAG_RX))
+ +		ret = ice_vsi_manage_vlan_stripping(vsi, false);
+ +
+ +	if ((features & NETIF_F_HW_VLAN_CTAG_TX) &&
+ +	    !(netdev->features & NETIF_F_HW_VLAN_CTAG_TX))
+ +		ret = ice_vsi_manage_vlan_insertion(vsi);
+ +	else if (!(features & NETIF_F_HW_VLAN_CTAG_TX) &&
+ +		 (netdev->features & NETIF_F_HW_VLAN_CTAG_TX))
+ +		ret = ice_vsi_manage_vlan_insertion(vsi);
+ +
+ +	if ((features & NETIF_F_HW_VLAN_CTAG_FILTER) &&
+ +	    !(netdev->features & NETIF_F_HW_VLAN_CTAG_FILTER))
+ +		ret = ice_cfg_vlan_pruning(vsi, true);
+ +	else if (!(features & NETIF_F_HW_VLAN_CTAG_FILTER) &&
+ +		 (netdev->features & NETIF_F_HW_VLAN_CTAG_FILTER))
+ +		ret = ice_cfg_vlan_pruning(vsi, false);
+++=======
++ 	ret = ice_set_vlan_features(netdev, features);
++ 	if (ret)
++ 		return ret;
+++>>>>>>> 1babaf77f49d (ice: Advertise 802.1ad VLAN filtering and offloads for PF netdev)
+  
+  	if ((features & NETIF_F_NTUPLE) &&
+  	    !(netdev->features & NETIF_F_NTUPLE)) {
+@@@ -5749,14 -5844,17 +5971,26 @@@
+   */
+  static int ice_vsi_vlan_setup(struct ice_vsi *vsi)
+  {
+++<<<<<<< HEAD
+ +	int ret = 0;
+ +
+ +	if (vsi->netdev->features & NETIF_F_HW_VLAN_CTAG_RX)
+ +		ret = ice_vsi_manage_vlan_stripping(vsi, true);
+ +	if (vsi->netdev->features & NETIF_F_HW_VLAN_CTAG_TX)
+ +		ret = ice_vsi_manage_vlan_insertion(vsi);
+++=======
++ 	int err;
++ 
++ 	err = ice_set_vlan_offload_features(vsi, vsi->netdev->features);
++ 	if (err)
++ 		return err;
++ 
++ 	err = ice_set_vlan_filtering_features(vsi, vsi->netdev->features);
++ 	if (err)
++ 		return err;
+++>>>>>>> 1babaf77f49d (ice: Advertise 802.1ad VLAN filtering and offloads for PF netdev)
+  
+ -	return ice_vsi_add_vlan_zero(vsi);
+ +	return ret;
+  }
+  
+  /**
+* Unmerged path drivers/net/ethernet/intel/ice/ice_lib.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_main.c
