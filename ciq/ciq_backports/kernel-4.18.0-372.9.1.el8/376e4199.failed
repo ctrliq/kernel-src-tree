@@ -1,0 +1,174 @@
+tee: Correct inappropriate usage of TEE_SHM_DMA_BUF flag
+
+jira LE-1907
+cve CVE-2021-44733
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Sumit Garg <sumit.garg@linaro.org>
+commit 376e4199e327a5cf29b8ec8fb0f64f3d8b429819
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/376e4199.failed
+
+Currently TEE_SHM_DMA_BUF flag has been inappropriately used to not
+register shared memory allocated for private usage by underlying TEE
+driver: OP-TEE in this case. So rather add a new flag as TEE_SHM_PRIV
+that can be utilized by underlying TEE drivers for private allocation
+and usage of shared memory.
+
+With this corrected, allow tee_shm_alloc_kernel_buf() to allocate a
+shared memory region without the backing of dma-buf.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Sumit Garg <sumit.garg@linaro.org>
+Co-developed-by: Tyler Hicks <tyhicks@linux.microsoft.com>
+	Signed-off-by: Tyler Hicks <tyhicks@linux.microsoft.com>
+	Reviewed-by: Jens Wiklander <jens.wiklander@linaro.org>
+	Reviewed-by: Sumit Garg <sumit.garg@linaro.org>
+	Signed-off-by: Jens Wiklander <jens.wiklander@linaro.org>
+(cherry picked from commit 376e4199e327a5cf29b8ec8fb0f64f3d8b429819)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tee/optee/shm_pool.c
+diff --cc drivers/tee/optee/shm_pool.c
+index 49397813fff1,c41a9a501a6e..000000000000
+--- a/drivers/tee/optee/shm_pool.c
++++ b/drivers/tee/optee/shm_pool.c
+@@@ -35,12 -27,46 +35,48 @@@ static int pool_op_alloc(struct tee_shm
+  	shm->paddr = page_to_phys(page);
+  	shm->size = PAGE_SIZE << order;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Shared memory private to the OP-TEE driver doesn't need
++ 	 * to be registered with OP-TEE.
++ 	 */
++ 	if (!(shm->flags & TEE_SHM_PRIV)) {
++ 		unsigned int nr_pages = 1 << order, i;
++ 		struct page **pages;
++ 
++ 		pages = kcalloc(nr_pages, sizeof(pages), GFP_KERNEL);
++ 		if (!pages) {
++ 			rc = -ENOMEM;
++ 			goto err;
++ 		}
++ 
++ 		for (i = 0; i < nr_pages; i++) {
++ 			pages[i] = page;
++ 			page++;
++ 		}
++ 
++ 		shm->flags |= TEE_SHM_REGISTER;
++ 		rc = optee_shm_register(shm->ctx, shm, pages, nr_pages,
++ 					(unsigned long)shm->kaddr);
++ 		kfree(pages);
++ 		if (rc)
++ 			goto err;
++ 	}
++ 
+++>>>>>>> 376e4199e327 (tee: Correct inappropriate usage of TEE_SHM_DMA_BUF flag)
+  	return 0;
+ -
+ -err:
+ -	__free_pages(page, order);
+ -	return rc;
+  }
+  
+  static void pool_op_free(struct tee_shm_pool_mgr *poolm,
+  			 struct tee_shm *shm)
+  {
+++<<<<<<< HEAD
+++=======
++ 	if (!(shm->flags & TEE_SHM_PRIV))
++ 		optee_shm_unregister(shm->ctx, shm);
++ 
+++>>>>>>> 376e4199e327 (tee: Correct inappropriate usage of TEE_SHM_DMA_BUF flag)
+  	free_pages((unsigned long)shm->kaddr, get_order(shm->size));
+  	shm->kaddr = NULL;
+  }
+diff --git a/drivers/tee/optee/call.c b/drivers/tee/optee/call.c
+index 437500004448..b4aa11c2cc29 100644
+--- a/drivers/tee/optee/call.c
++++ b/drivers/tee/optee/call.c
+@@ -193,7 +193,7 @@ static struct tee_shm *get_msg_arg(struct tee_context *ctx, size_t num_params,
+ 	struct optee_msg_arg *ma;
+ 
+ 	shm = tee_shm_alloc(ctx, OPTEE_MSG_GET_ARG_SIZE(num_params),
+-			    TEE_SHM_MAPPED);
++			    TEE_SHM_MAPPED | TEE_SHM_PRIV);
+ 	if (IS_ERR(shm))
+ 		return shm;
+ 
+diff --git a/drivers/tee/optee/core.c b/drivers/tee/optee/core.c
+index ac1c2d728a04..3b5965a71032 100644
+--- a/drivers/tee/optee/core.c
++++ b/drivers/tee/optee/core.c
+@@ -287,7 +287,8 @@ static void optee_release(struct tee_context *ctx)
+ 	if (!ctxdata)
+ 		return;
+ 
+-	shm = tee_shm_alloc(ctx, sizeof(struct optee_msg_arg), TEE_SHM_MAPPED);
++	shm = tee_shm_alloc(ctx, sizeof(struct optee_msg_arg),
++			    TEE_SHM_MAPPED | TEE_SHM_PRIV);
+ 	if (!IS_ERR(shm)) {
+ 		arg = tee_shm_get_va(shm, 0);
+ 		/*
+diff --git a/drivers/tee/optee/rpc.c b/drivers/tee/optee/rpc.c
+index 5b6a6edf488f..2ef5517598ee 100644
+--- a/drivers/tee/optee/rpc.c
++++ b/drivers/tee/optee/rpc.c
+@@ -322,7 +322,7 @@ static void handle_rpc_func_cmd_shm_alloc(struct tee_context *ctx,
+ 		shm = cmd_alloc_suppl(ctx, sz);
+ 		break;
+ 	case OPTEE_RPC_SHM_TYPE_KERNEL:
+-		shm = tee_shm_alloc(ctx, sz, TEE_SHM_MAPPED);
++		shm = tee_shm_alloc(ctx, sz, TEE_SHM_MAPPED | TEE_SHM_PRIV);
+ 		break;
+ 	default:
+ 		arg->ret = TEEC_ERROR_BAD_PARAMETERS;
+@@ -510,7 +510,8 @@ void optee_handle_rpc(struct tee_context *ctx, struct optee_rpc_param *param,
+ 
+ 	switch (OPTEE_SMC_RETURN_GET_RPC_FUNC(param->a0)) {
+ 	case OPTEE_SMC_RPC_FUNC_ALLOC:
+-		shm = tee_shm_alloc(ctx, param->a1, TEE_SHM_MAPPED);
++		shm = tee_shm_alloc(ctx, param->a1,
++				    TEE_SHM_MAPPED | TEE_SHM_PRIV);
+ 		if (!IS_ERR(shm) && !tee_shm_get_pa(shm, 0, &pa)) {
+ 			reg_pair_from_64(&param->a1, &param->a2, pa);
+ 			reg_pair_from_64(&param->a4, &param->a5,
+* Unmerged path drivers/tee/optee/shm_pool.c
+diff --git a/drivers/tee/tee_shm.c b/drivers/tee/tee_shm.c
+index 7d8c08bd1780..71d3733d89ee 100644
+--- a/drivers/tee/tee_shm.c
++++ b/drivers/tee/tee_shm.c
+@@ -126,7 +126,7 @@ struct tee_shm *tee_shm_alloc(struct tee_context *ctx, size_t size, u32 flags)
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+-	if ((flags & ~(TEE_SHM_MAPPED | TEE_SHM_DMA_BUF))) {
++	if ((flags & ~(TEE_SHM_MAPPED | TEE_SHM_DMA_BUF | TEE_SHM_PRIV))) {
+ 		dev_err(teedev->dev.parent, "invalid shm flags 0x%x", flags);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+@@ -216,7 +216,7 @@ EXPORT_SYMBOL_GPL(tee_shm_alloc);
+  */
+ struct tee_shm *tee_shm_alloc_kernel_buf(struct tee_context *ctx, size_t size)
+ {
+-	return tee_shm_alloc(ctx, size, TEE_SHM_MAPPED | TEE_SHM_DMA_BUF);
++	return tee_shm_alloc(ctx, size, TEE_SHM_MAPPED);
+ }
+ EXPORT_SYMBOL_GPL(tee_shm_alloc_kernel_buf);
+ 
+diff --git a/include/linux/tee_drv.h b/include/linux/tee_drv.h
+index 2b1a5d968703..f9bca79e4983 100644
+--- a/include/linux/tee_drv.h
++++ b/include/linux/tee_drv.h
+@@ -33,6 +33,7 @@
+ #define TEE_SHM_USER_MAPPED	BIT(4)  /* Memory mapped in user space */
+ #define TEE_SHM_POOL		BIT(5)  /* Memory allocated from pool */
+ #define TEE_SHM_KERNEL_MAPPED	BIT(6)  /* Memory mapped in kernel space */
++#define TEE_SHM_PRIV		BIT(7)  /* Memory private to TEE driver */
+ 
+ struct device;
+ struct tee_device;
