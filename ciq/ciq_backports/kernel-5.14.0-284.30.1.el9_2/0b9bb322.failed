@@ -1,0 +1,248 @@
+rxrpc: Split out the call state changing functions into their own file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit 0b9bb322f13d486d5b8630264ccbfb4794bb43a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/0b9bb322.failed
+
+Split out the functions that change the state of an rxrpc call into their
+own file.  The idea being to remove anything to do with changing the state
+of a call directly from the rxrpc sendmsg() and recvmsg() paths and have
+all that done in the I/O thread only, with the ultimate aim of removing the
+state lock entirely.  Moving the code out of sendmsg.c and recvmsg.c makes
+that easier to manage.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit 0b9bb322f13d486d5b8630264ccbfb4794bb43a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/ar-internal.h
+#	net/rxrpc/recvmsg.c
+diff --cc net/rxrpc/ar-internal.h
+index 46ce41afb431,203e0354d86b..000000000000
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@@ -1049,12 -1134,6 +1067,15 @@@ extern const struct seq_operations rxrp
+   * recvmsg.c
+   */
+  void rxrpc_notify_socket(struct rxrpc_call *);
+++<<<<<<< HEAD
+ +bool __rxrpc_set_call_completion(struct rxrpc_call *, enum rxrpc_call_completion, u32, int);
+ +bool rxrpc_set_call_completion(struct rxrpc_call *, enum rxrpc_call_completion, u32, int);
+ +bool __rxrpc_call_completed(struct rxrpc_call *);
+ +bool rxrpc_call_completed(struct rxrpc_call *);
+ +bool __rxrpc_abort_call(const char *, struct rxrpc_call *, rxrpc_seq_t, u32, int);
+ +bool rxrpc_abort_call(const char *, struct rxrpc_call *, rxrpc_seq_t, u32, int);
+++=======
+++>>>>>>> 0b9bb322f13d (rxrpc: Split out the call state changing functions into their own file)
+  int rxrpc_recvmsg(struct socket *, struct msghdr *, size_t, int);
+  
+  /*
+diff --cc net/rxrpc/recvmsg.c
+index c84d2b620396,ff08f917ecda..000000000000
+--- a/net/rxrpc/recvmsg.c
++++ b/net/rxrpc/recvmsg.c
+@@@ -59,85 -59,6 +59,88 @@@ void rxrpc_notify_socket(struct rxrpc_c
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Transition a call to the complete state.
+ + */
+ +bool __rxrpc_set_call_completion(struct rxrpc_call *call,
+ +				 enum rxrpc_call_completion compl,
+ +				 u32 abort_code,
+ +				 int error)
+ +{
+ +	if (call->state < RXRPC_CALL_COMPLETE) {
+ +		call->abort_code = abort_code;
+ +		call->error = error;
+ +		call->completion = compl;
+ +		call->state = RXRPC_CALL_COMPLETE;
+ +		trace_rxrpc_call_complete(call);
+ +		wake_up(&call->waitq);
+ +		rxrpc_notify_socket(call);
+ +		return true;
+ +	}
+ +	return false;
+ +}
+ +
+ +bool rxrpc_set_call_completion(struct rxrpc_call *call,
+ +			       enum rxrpc_call_completion compl,
+ +			       u32 abort_code,
+ +			       int error)
+ +{
+ +	bool ret = false;
+ +
+ +	if (call->state < RXRPC_CALL_COMPLETE) {
+ +		write_lock_bh(&call->state_lock);
+ +		ret = __rxrpc_set_call_completion(call, compl, abort_code, error);
+ +		write_unlock_bh(&call->state_lock);
+ +	}
+ +	return ret;
+ +}
+ +
+ +/*
+ + * Record that a call successfully completed.
+ + */
+ +bool __rxrpc_call_completed(struct rxrpc_call *call)
+ +{
+ +	return __rxrpc_set_call_completion(call, RXRPC_CALL_SUCCEEDED, 0, 0);
+ +}
+ +
+ +bool rxrpc_call_completed(struct rxrpc_call *call)
+ +{
+ +	bool ret = false;
+ +
+ +	if (call->state < RXRPC_CALL_COMPLETE) {
+ +		write_lock_bh(&call->state_lock);
+ +		ret = __rxrpc_call_completed(call);
+ +		write_unlock_bh(&call->state_lock);
+ +	}
+ +	return ret;
+ +}
+ +
+ +/*
+ + * Record that a call is locally aborted.
+ + */
+ +bool __rxrpc_abort_call(const char *why, struct rxrpc_call *call,
+ +			rxrpc_seq_t seq, u32 abort_code, int error)
+ +{
+ +	trace_rxrpc_abort(call->debug_id, why, call->cid, call->call_id, seq,
+ +			  abort_code, error);
+ +	return __rxrpc_set_call_completion(call, RXRPC_CALL_LOCALLY_ABORTED,
+ +					   abort_code, error);
+ +}
+ +
+ +bool rxrpc_abort_call(const char *why, struct rxrpc_call *call,
+ +		      rxrpc_seq_t seq, u32 abort_code, int error)
+ +{
+ +	bool ret;
+ +
+ +	write_lock_bh(&call->state_lock);
+ +	ret = __rxrpc_abort_call(why, call, seq, abort_code, error);
+ +	write_unlock_bh(&call->state_lock);
+ +	return ret;
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 0b9bb322f13d (rxrpc: Split out the call state changing functions into their own file)
+   * Pass a call terminating message to userspace.
+   */
+  static int rxrpc_recvmsg_term(struct rxrpc_call *call, struct msghdr *msg)
+diff --git a/net/rxrpc/Makefile b/net/rxrpc/Makefile
+index 79687477d93c..6ed499fa2e5d 100644
+--- a/net/rxrpc/Makefile
++++ b/net/rxrpc/Makefile
+@@ -10,6 +10,7 @@ rxrpc-y := \
+ 	call_accept.o \
+ 	call_event.o \
+ 	call_object.o \
++	call_state.o \
+ 	conn_client.o \
+ 	conn_event.o \
+ 	conn_object.o \
+* Unmerged path net/rxrpc/ar-internal.h
+diff --git a/net/rxrpc/call_state.c b/net/rxrpc/call_state.c
+new file mode 100644
+index 000000000000..8fbb2112ed7e
+--- /dev/null
++++ b/net/rxrpc/call_state.c
+@@ -0,0 +1,89 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/* Call state changing functions.
++ *
++ * Copyright (C) 2022 Red Hat, Inc. All Rights Reserved.
++ * Written by David Howells (dhowells@redhat.com)
++ */
++
++#include "ar-internal.h"
++
++/*
++ * Transition a call to the complete state.
++ */
++bool __rxrpc_set_call_completion(struct rxrpc_call *call,
++				 enum rxrpc_call_completion compl,
++				 u32 abort_code,
++				 int error)
++{
++	if (call->state < RXRPC_CALL_COMPLETE) {
++		call->abort_code = abort_code;
++		call->error = error;
++		call->completion = compl;
++		call->state = RXRPC_CALL_COMPLETE;
++		trace_rxrpc_call_complete(call);
++		wake_up(&call->waitq);
++		rxrpc_notify_socket(call);
++		return true;
++	}
++	return false;
++}
++
++bool rxrpc_set_call_completion(struct rxrpc_call *call,
++			       enum rxrpc_call_completion compl,
++			       u32 abort_code,
++			       int error)
++{
++	bool ret = false;
++
++	if (call->state < RXRPC_CALL_COMPLETE) {
++		write_lock(&call->state_lock);
++		ret = __rxrpc_set_call_completion(call, compl, abort_code, error);
++		write_unlock(&call->state_lock);
++	}
++	return ret;
++}
++
++/*
++ * Record that a call successfully completed.
++ */
++bool __rxrpc_call_completed(struct rxrpc_call *call)
++{
++	return __rxrpc_set_call_completion(call, RXRPC_CALL_SUCCEEDED, 0, 0);
++}
++
++bool rxrpc_call_completed(struct rxrpc_call *call)
++{
++	bool ret = false;
++
++	if (call->state < RXRPC_CALL_COMPLETE) {
++		write_lock(&call->state_lock);
++		ret = __rxrpc_call_completed(call);
++		write_unlock(&call->state_lock);
++	}
++	return ret;
++}
++
++/*
++ * Record that a call is locally aborted.
++ */
++bool __rxrpc_abort_call(struct rxrpc_call *call, rxrpc_seq_t seq,
++			u32 abort_code, int error, enum rxrpc_abort_reason why)
++{
++	trace_rxrpc_abort(call->debug_id, why, call->cid, call->call_id, seq,
++			  abort_code, error);
++	return __rxrpc_set_call_completion(call, RXRPC_CALL_LOCALLY_ABORTED,
++					   abort_code, error);
++}
++
++bool rxrpc_abort_call(struct rxrpc_call *call, rxrpc_seq_t seq,
++		      u32 abort_code, int error, enum rxrpc_abort_reason why)
++{
++	bool ret;
++
++	write_lock(&call->state_lock);
++	ret = __rxrpc_abort_call(call, seq, abort_code, error, why);
++	write_unlock(&call->state_lock);
++	if (ret && test_bit(RXRPC_CALL_EXPOSED, &call->flags))
++		rxrpc_send_abort_packet(call);
++	return ret;
++}
+* Unmerged path net/rxrpc/recvmsg.c
