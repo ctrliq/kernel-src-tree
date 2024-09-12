@@ -1,0 +1,133 @@
+selftests: line buffer test program's stdout
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-542.el8
+commit-author Ryan Roberts <ryan.roberts@arm.com>
+commit 58e2847ad2e6322a25dedf8b4549ff924baf8395
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-542.el8/58e2847a.failed
+
+Patch series "selftests/mm fixes for arm64", v3.
+
+Given my on-going work on large anon folios and contpte mappings, I
+decided it would be a good idea to start running mm selftests to help
+guard against regressions.  However, it soon became clear that I
+couldn't get the suite to run cleanly on arm64 with a vanilla v6.5-rc1
+kernel (perhaps I'm just doing it wrong??), so got stuck in a rabbit
+hole trying to debug and fix all the issues.  Some were down to
+misconfigurations, but I also found a number of issues with the tests
+and even a couple of issues with the kernel.
+
+
+This patch (of 8):
+
+The selftests runner pipes the test program's stdout to tap_prefix.  The
+presence of the pipe means that the test program sets its stdout to be
+fully buffered (as aposed to line buffered when directly connected to the
+terminal).  The block buffering means that there is often content in the
+buffer at fork() time, which causes the output to end up duplicated.  This
+was causing problems for mm:cow where test results were duplicated 20-30x.
+
+Solve this by using `stdbuf`, when available to force the test program to
+use line buffered mode.  This means previously printf'ed results are
+flushed out of the program before any fork().
+
+Additionally, explicitly set line buffer mode in ksft_print_header(),
+which means that all test programs that use the ksft framework will
+benefit even if stdbuf is not present on the system.
+
+[ryan.roberts@arm.com: add setvbuf() to set buffering mode]
+  Link: https://lkml.kernel.org/r/20230726070655.2713530-1-ryan.roberts@arm.com
+Link: https://lkml.kernel.org/r/20230724082522.1202616-1-ryan.roberts@arm.com
+Link: https://lkml.kernel.org/r/20230724082522.1202616-2-ryan.roberts@arm.com
+	Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+	Reviewed-by: Mark Brown <broonie@kernel.org>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Florent Revest <revest@chromium.org>
+	Cc: Jérôme Glisse <jglisse@redhat.com>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Peter Xu <peterx@redhat.com>
+	Cc: Shuah Khan <shuah@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 58e2847ad2e6322a25dedf8b4549ff924baf8395)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/include/nolibc/stdio.h
+#	tools/testing/selftests/kselftest/runner.sh
+diff --cc tools/testing/selftests/kselftest/runner.sh
+index e6812f7157f4,261c73cab41b..000000000000
+--- a/tools/testing/selftests/kselftest/runner.sh
++++ b/tools/testing/selftests/kselftest/runner.sh
+@@@ -74,24 -101,29 +74,44 @@@ run_one(
+  
+  	TEST_HDR_MSG="selftests: $DIR: $BASENAME_TEST"
+  	echo "# $TEST_HDR_MSG"
+ -	if [ ! -e "$TEST" ]; then
+ -		echo "# Warning: file $TEST is missing!"
+ +	rharch=$(uname -m)
+ +	for rhskipped in $kselftest_rhskip; do
+ +		if [ $rhskipped = $BASENAME_TEST -o $rhskipped = $BASENAME_TEST:$rharch ]; then
+ +			echo "ok $test_num $TEST_HDR_MSG # skipped in RHEL"
+ +			return 0
+ +		fi
+ +	done
+ +	if [ ! -x "$TEST" ]; then
+ +		echo -n "# Warning: file $TEST is "
+ +		if [ ! -e "$TEST" ]; then
+ +			echo "missing!"
+ +		else
+ +			echo "not executable, correct this."
+ +		fi
+  		echo "not ok $test_num $TEST_HDR_MSG"
+  	else
+++<<<<<<< HEAD
+++=======
++ 		if [ -x /usr/bin/stdbuf ]; then
++ 			stdbuf="/usr/bin/stdbuf --output=L "
++ 		fi
++ 		eval kselftest_cmd_args="\$${kselftest_cmd_args_ref:-}"
++ 		cmd="$stdbuf ./$BASENAME_TEST $kselftest_cmd_args"
++ 		if [ ! -x "$TEST" ]; then
++ 			echo "# Warning: file $TEST is not executable"
++ 
++ 			if [ $(head -n 1 "$TEST" | cut -c -2) = "#!" ]
++ 			then
++ 				interpreter=$(head -n 1 "$TEST" | cut -c 3-)
++ 				cmd="$stdbuf $interpreter ./$BASENAME_TEST"
++ 			else
++ 				echo "not ok $test_num $TEST_HDR_MSG"
++ 				return
++ 			fi
++ 		fi
+++>>>>>>> 58e2847ad2e6 (selftests: line buffer test program's stdout)
+  		cd `dirname $TEST` > /dev/null
+ -		((((( tap_timeout "$cmd" 2>&1; echo $? >&3) |
+ +		((((( tap_timeout ./$BASENAME_TEST 2>&1; echo $? >&3) |
+  			tap_prefix >&4) 3>&1) |
+  			(read xs; exit $xs)) 4>>"$logfile" &&
+  		echo "ok $test_num $TEST_HDR_MSG") ||
+* Unmerged path tools/include/nolibc/stdio.h
+* Unmerged path tools/include/nolibc/stdio.h
+diff --git a/tools/testing/selftests/kselftest.h b/tools/testing/selftests/kselftest.h
+index f1180987492c..ed61f8074717 100644
+--- a/tools/testing/selftests/kselftest.h
++++ b/tools/testing/selftests/kselftest.h
+@@ -95,6 +95,15 @@ static inline int ksft_get_error_cnt(void) { return ksft_cnt.ksft_error; }
+ 
+ static inline void ksft_print_header(void)
+ {
++	/*
++	 * Force line buffering; If stdout is not connected to a terminal, it
++	 * will otherwise default to fully buffered, which can cause output
++	 * duplication if there is content in the buffer when fork()ing. If
++	 * there is a crash, line buffering also means the most recent output
++	 * line will be visible.
++	 */
++	setvbuf(stdout, NULL, _IOLBF, 0);
++
+ 	if (!(getenv("KSFT_TAP_LEVEL")))
+ 		printf("TAP version 13\n");
+ }
+* Unmerged path tools/testing/selftests/kselftest/runner.sh
