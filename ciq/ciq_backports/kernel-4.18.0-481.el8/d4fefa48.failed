@@ -1,0 +1,143 @@
+audit: move audit_return_fixup before the filters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Richard Guy Briggs <rgb@redhat.com>
+commit d4fefa4801a1c2f9c0c7a48fbb0fdf384e89a4ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/d4fefa48.failed
+
+The success and return_code are needed by the filters.  Move
+audit_return_fixup() before the filters.  This was causing syscall
+auditing events to be missed.
+
+Link: https://github.com/linux-audit/audit-kernel/issues/138
+	Cc: stable@vger.kernel.org
+Fixes: 12c5e81d3fd0 ("audit: prepare audit_context for use in calling contexts beyond syscalls")
+	Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+[PM: manual merge required]
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit d4fefa4801a1c2f9c0c7a48fbb0fdf384e89a4ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/auditsc.c
+diff --cc kernel/auditsc.c
+index ea69a6cfd09b,79a5da1bc5bb..000000000000
+--- a/kernel/auditsc.c
++++ b/kernel/auditsc.c
+@@@ -1801,6 -1886,109 +1801,112 @@@ static void audit_return_fixup(struct a
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * __audit_uring_entry - prepare the kernel task's audit context for io_uring
++  * @op: the io_uring opcode
++  *
++  * This is similar to audit_syscall_entry() but is intended for use by io_uring
++  * operations.  This function should only ever be called from
++  * audit_uring_entry() as we rely on the audit context checking present in that
++  * function.
++  */
++ void __audit_uring_entry(u8 op)
++ {
++ 	struct audit_context *ctx = audit_context();
++ 
++ 	if (ctx->state == AUDIT_STATE_DISABLED)
++ 		return;
++ 
++ 	/*
++ 	 * NOTE: It's possible that we can be called from the process' context
++ 	 *       before it returns to userspace, and before audit_syscall_exit()
++ 	 *       is called.  In this case there is not much to do, just record
++ 	 *       the io_uring details and return.
++ 	 */
++ 	ctx->uring_op = op;
++ 	if (ctx->context == AUDIT_CTX_SYSCALL)
++ 		return;
++ 
++ 	ctx->dummy = !audit_n_rules;
++ 	if (!ctx->dummy && ctx->state == AUDIT_STATE_BUILD)
++ 		ctx->prio = 0;
++ 
++ 	ctx->context = AUDIT_CTX_URING;
++ 	ctx->current_state = ctx->state;
++ 	ktime_get_coarse_real_ts64(&ctx->ctime);
++ }
++ 
++ /**
++  * __audit_uring_exit - wrap up the kernel task's audit context after io_uring
++  * @success: true/false value to indicate if the operation succeeded or not
++  * @code: operation return code
++  *
++  * This is similar to audit_syscall_exit() but is intended for use by io_uring
++  * operations.  This function should only ever be called from
++  * audit_uring_exit() as we rely on the audit context checking present in that
++  * function.
++  */
++ void __audit_uring_exit(int success, long code)
++ {
++ 	struct audit_context *ctx = audit_context();
++ 
++ 	if (ctx->dummy) {
++ 		if (ctx->context != AUDIT_CTX_URING)
++ 			return;
++ 		goto out;
++ 	}
++ 
++ 	audit_return_fixup(ctx, success, code);
++ 	if (ctx->context == AUDIT_CTX_SYSCALL) {
++ 		/*
++ 		 * NOTE: See the note in __audit_uring_entry() about the case
++ 		 *       where we may be called from process context before we
++ 		 *       return to userspace via audit_syscall_exit().  In this
++ 		 *       case we simply emit a URINGOP record and bail, the
++ 		 *       normal syscall exit handling will take care of
++ 		 *       everything else.
++ 		 *       It is also worth mentioning that when we are called,
++ 		 *       the current process creds may differ from the creds
++ 		 *       used during the normal syscall processing; keep that
++ 		 *       in mind if/when we move the record generation code.
++ 		 */
++ 
++ 		/*
++ 		 * We need to filter on the syscall info here to decide if we
++ 		 * should emit a URINGOP record.  I know it seems odd but this
++ 		 * solves the problem where users have a filter to block *all*
++ 		 * syscall records in the "exit" filter; we want to preserve
++ 		 * the behavior here.
++ 		 */
++ 		audit_filter_syscall(current, ctx);
++ 		if (ctx->current_state != AUDIT_STATE_RECORD)
++ 			audit_filter_uring(current, ctx);
++ 		audit_filter_inodes(current, ctx);
++ 		if (ctx->current_state != AUDIT_STATE_RECORD)
++ 			return;
++ 
++ 		audit_log_uring(ctx);
++ 		return;
++ 	}
++ 
++ 	/* this may generate CONFIG_CHANGE records */
++ 	if (!list_empty(&ctx->killed_trees))
++ 		audit_kill_trees(ctx);
++ 
++ 	/* run through both filters to ensure we set the filterkey properly */
++ 	audit_filter_uring(current, ctx);
++ 	audit_filter_inodes(current, ctx);
++ 	if (ctx->current_state != AUDIT_STATE_RECORD)
++ 		goto out;
++ 	audit_log_exit();
++ 
++ out:
++ 	audit_reset_context(ctx);
++ }
++ 
++ /**
+++>>>>>>> d4fefa4801a1 (audit: move audit_return_fixup before the filters)
+   * __audit_syscall_entry - fill in an audit record at syscall entry
+   * @major: major syscall type (function)
+   * @a1: additional syscall register 1
+* Unmerged path kernel/auditsc.c
