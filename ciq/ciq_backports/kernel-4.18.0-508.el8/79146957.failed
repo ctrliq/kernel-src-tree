@@ -1,0 +1,168 @@
+x86/amd: Cache debug register values in percpu variables
+
+jira LE-1907
+cve CVE-2023-20593
+Rebuild_History Non-Buildable kernel-4.18.0-508.el8
+commit-author Alexey Kardashevskiy <aik@amd.com>
+commit 7914695743d598b189d549f2f57af24aa5633705
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-508.el8/79146957.failed
+
+Reading DR[0-3]_ADDR_MASK MSRs takes about 250 cycles which is going to
+be noticeable with the AMD KVM SEV-ES DebugSwap feature enabled.  KVM is
+going to store host's DR[0-3] and DR[0-3]_ADDR_MASK before switching to
+a guest; the hardware is going to swap these on VMRUN and VMEXIT.
+
+Store MSR values passed to set_dr_addr_mask() in percpu variables
+(when changed) and return them via new amd_get_dr_addr_mask().
+The gain here is about 10x.
+
+As set_dr_addr_mask() uses the array too, change the @dr type to
+unsigned to avoid checking for <0. And give it the amd_ prefix to match
+the new helper as the whole DR_ADDR_MASK feature is AMD-specific anyway.
+
+While at it, replace deprecated boot_cpu_has() with cpu_feature_enabled()
+in set_dr_addr_mask().
+
+	Signed-off-by: Alexey Kardashevskiy <aik@amd.com>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Link: https://lore.kernel.org/r/20230120031047.628097-2-aik@amd.com
+(cherry picked from commit 7914695743d598b189d549f2f57af24aa5633705)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/hw_breakpoint.c
+diff --cc arch/x86/kernel/hw_breakpoint.c
+index 3871950432d6,b01644c949b2..000000000000
+--- a/arch/x86/kernel/hw_breakpoint.c
++++ b/arch/x86/kernel/hw_breakpoint.c
+@@@ -127,9 -119,15 +127,9 @@@ int arch_install_hw_breakpoint(struct p
+  	dr7 = this_cpu_ptr(&cpu_dr7);
+  	*dr7 |= encode_dr7(i, info->len, info->type);
+  
+ -	/*
+ -	 * Ensure we first write cpu_dr7 before we set the DR7 register.
+ -	 * This ensures an NMI never see cpu_dr7 0 when DR7 is not.
+ -	 */
+ -	barrier();
+ -
+  	set_debugreg(*dr7, 7);
+  	if (info->mask)
+- 		set_dr_addr_mask(info->mask, i);
++ 		amd_set_dr_addr_mask(info->mask, i);
+  
+  	return 0;
+  }
+@@@ -161,12 -161,20 +161,24 @@@ void arch_uninstall_hw_breakpoint(struc
+  	if (WARN_ONCE(i == HBP_NUM, "Can't find any breakpoint slot"))
+  		return;
+  
+ -	dr7 = this_cpu_read(cpu_dr7);
+ -	dr7 &= ~__encode_dr7(i, info->len, info->type);
+ +	dr7 = this_cpu_ptr(&cpu_dr7);
+ +	*dr7 &= ~__encode_dr7(i, info->len, info->type);
+  
+ -	set_debugreg(dr7, 7);
+ +	set_debugreg(*dr7, 7);
+  	if (info->mask)
+++<<<<<<< HEAD
+ +		set_dr_addr_mask(0, i);
+++=======
++ 		amd_set_dr_addr_mask(0, i);
++ 
++ 	/*
++ 	 * Ensure the write to cpu_dr7 is after we've set the DR7 register.
++ 	 * This ensures an NMI never see cpu_dr7 0 when DR7 is not.
++ 	 */
++ 	barrier();
++ 
++ 	this_cpu_write(cpu_dr7, dr7);
+++>>>>>>> 7914695743d5 (x86/amd: Cache debug register values in percpu variables)
+  }
+  
+  static int arch_bp_generic_len(int x86_len)
+diff --git a/arch/x86/include/asm/debugreg.h b/arch/x86/include/asm/debugreg.h
+index 1c964123f2dd..ccf6639c8df9 100644
+--- a/arch/x86/include/asm/debugreg.h
++++ b/arch/x86/include/asm/debugreg.h
+@@ -144,9 +144,14 @@ static __always_inline void local_db_restore(unsigned long dr7)
+ }
+ 
+ #ifdef CONFIG_CPU_SUP_AMD
+-extern void set_dr_addr_mask(unsigned long mask, int dr);
++extern void amd_set_dr_addr_mask(unsigned long mask, unsigned int dr);
++extern unsigned long amd_get_dr_addr_mask(unsigned int dr);
+ #else
+-static inline void set_dr_addr_mask(unsigned long mask, int dr) { }
++static inline void amd_set_dr_addr_mask(unsigned long mask, unsigned int dr) { }
++static inline unsigned long amd_get_dr_addr_mask(unsigned int dr)
++{
++	return 0;
++}
+ #endif
+ 
+ #endif /* _ASM_X86_DEBUGREG_H */
+diff --git a/arch/x86/kernel/cpu/amd.c b/arch/x86/kernel/cpu/amd.c
+index 717c38189e3a..68f41fbe76e2 100644
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -1212,24 +1212,43 @@ static bool cpu_has_amd_erratum(struct cpuinfo_x86 *cpu, const int *erratum)
+ 	return false;
+ }
+ 
+-void set_dr_addr_mask(unsigned long mask, int dr)
++static DEFINE_PER_CPU_READ_MOSTLY(unsigned long[4], amd_dr_addr_mask);
++
++static unsigned int amd_msr_dr_addr_masks[] = {
++	MSR_F16H_DR0_ADDR_MASK,
++	MSR_F16H_DR1_ADDR_MASK,
++	MSR_F16H_DR1_ADDR_MASK + 1,
++	MSR_F16H_DR1_ADDR_MASK + 2
++};
++
++void amd_set_dr_addr_mask(unsigned long mask, unsigned int dr)
+ {
+-	if (!boot_cpu_has(X86_FEATURE_BPEXT))
++	int cpu = smp_processor_id();
++
++	if (!cpu_feature_enabled(X86_FEATURE_BPEXT))
+ 		return;
+ 
+-	switch (dr) {
+-	case 0:
+-		wrmsr(MSR_F16H_DR0_ADDR_MASK, mask, 0);
+-		break;
+-	case 1:
+-	case 2:
+-	case 3:
+-		wrmsr(MSR_F16H_DR1_ADDR_MASK - 1 + dr, mask, 0);
+-		break;
+-	default:
+-		break;
+-	}
++	if (WARN_ON_ONCE(dr >= ARRAY_SIZE(amd_msr_dr_addr_masks)))
++		return;
++
++	if (per_cpu(amd_dr_addr_mask, cpu)[dr] == mask)
++		return;
++
++	wrmsr(amd_msr_dr_addr_masks[dr], mask, 0);
++	per_cpu(amd_dr_addr_mask, cpu)[dr] = mask;
++}
++
++unsigned long amd_get_dr_addr_mask(unsigned int dr)
++{
++	if (!cpu_feature_enabled(X86_FEATURE_BPEXT))
++		return 0;
++
++	if (WARN_ON_ONCE(dr >= ARRAY_SIZE(amd_msr_dr_addr_masks)))
++		return 0;
++
++	return per_cpu(amd_dr_addr_mask[dr], smp_processor_id());
+ }
++EXPORT_SYMBOL_GPL(amd_get_dr_addr_mask);
+ 
+ u32 amd_get_highest_perf(void)
+ {
+* Unmerged path arch/x86/kernel/hw_breakpoint.c
