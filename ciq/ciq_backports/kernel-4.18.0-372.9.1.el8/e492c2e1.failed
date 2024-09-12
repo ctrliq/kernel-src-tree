@@ -1,0 +1,213 @@
+ice: send correct vc status in switchdev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+commit e492c2e12d7bb2cf3f10abd8038431e7de565058
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/e492c2e1.failed
+
+Part of virtchannel messages are treated in different way in switchdev
+mode to block configuring VFs from iavf driver side. This blocking was
+done by doing nothing and returning success, event without sending
+response.
+
+Not sending response for opcodes that aren't supported in switchdev mode
+leads to block iavf driver message handling. This happens for example
+when vlan is configured at VF config time (VLAN module is already
+loaded).
+
+To get rid of it ice driver should answer for each VF message. In
+switchdev mode:
+- for adding/deleting VLAN driver should answer success without doing
+  anything to allow creating vlan device on VFs
+- for enabling/disabling VLAN stripping  and promiscuous mode driver
+  should answer not supported, this feature in switchdev can be only
+  set from host side
+
+	Signed-off-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+	Tested-by: Sandeep Penigalapati <sandeep.penigalapati@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit e492c2e12d7bb2cf3f10abd8038431e7de565058)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+index 5d0d713c9e34,6a74344a3c21..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+@@@ -4450,6 -4470,168 +4450,171 @@@ static int ice_vf_init_vlan_stripping(s
+  		return ice_vsi_manage_vlan_stripping(vsi, false);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct ice_vc_vf_ops ice_vc_vf_dflt_ops = {
++ 	.get_ver_msg = ice_vc_get_ver_msg,
++ 	.get_vf_res_msg = ice_vc_get_vf_res_msg,
++ 	.reset_vf = ice_vc_reset_vf_msg,
++ 	.add_mac_addr_msg = ice_vc_add_mac_addr_msg,
++ 	.del_mac_addr_msg = ice_vc_del_mac_addr_msg,
++ 	.cfg_qs_msg = ice_vc_cfg_qs_msg,
++ 	.ena_qs_msg = ice_vc_ena_qs_msg,
++ 	.dis_qs_msg = ice_vc_dis_qs_msg,
++ 	.request_qs_msg = ice_vc_request_qs_msg,
++ 	.cfg_irq_map_msg = ice_vc_cfg_irq_map_msg,
++ 	.config_rss_key = ice_vc_config_rss_key,
++ 	.config_rss_lut = ice_vc_config_rss_lut,
++ 	.get_stats_msg = ice_vc_get_stats_msg,
++ 	.cfg_promiscuous_mode_msg = ice_vc_cfg_promiscuous_mode_msg,
++ 	.add_vlan_msg = ice_vc_add_vlan_msg,
++ 	.remove_vlan_msg = ice_vc_remove_vlan_msg,
++ 	.ena_vlan_stripping = ice_vc_ena_vlan_stripping,
++ 	.dis_vlan_stripping = ice_vc_dis_vlan_stripping,
++ 	.handle_rss_cfg_msg = ice_vc_handle_rss_cfg,
++ 	.add_fdir_fltr_msg = ice_vc_add_fdir_fltr,
++ 	.del_fdir_fltr_msg = ice_vc_del_fdir_fltr,
++ };
++ 
++ void ice_vc_set_dflt_vf_ops(struct ice_vc_vf_ops *ops)
++ {
++ 	*ops = ice_vc_vf_dflt_ops;
++ }
++ 
++ /**
++  * ice_vc_repr_add_mac
++  * @vf: pointer to VF
++  * @msg: virtchannel message
++  *
++  * When port representors are created, we do not add MAC rule
++  * to firmware, we store it so that PF could report same
++  * MAC as VF.
++  */
++ static int ice_vc_repr_add_mac(struct ice_vf *vf, u8 *msg)
++ {
++ 	enum virtchnl_status_code v_ret = VIRTCHNL_STATUS_SUCCESS;
++ 	struct virtchnl_ether_addr_list *al =
++ 	    (struct virtchnl_ether_addr_list *)msg;
++ 	struct ice_vsi *vsi;
++ 	struct ice_pf *pf;
++ 	int i;
++ 
++ 	if (!test_bit(ICE_VF_STATE_ACTIVE, vf->vf_states) ||
++ 	    !ice_vc_isvalid_vsi_id(vf, al->vsi_id)) {
++ 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		goto handle_mac_exit;
++ 	}
++ 
++ 	pf = vf->pf;
++ 
++ 	vsi = ice_get_vf_vsi(vf);
++ 	if (!vsi) {
++ 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
++ 		goto handle_mac_exit;
++ 	}
++ 
++ 	for (i = 0; i < al->num_elements; i++) {
++ 		u8 *mac_addr = al->list[i].addr;
++ 
++ 		if (!is_unicast_ether_addr(mac_addr) ||
++ 		    ether_addr_equal(mac_addr, vf->hw_lan_addr.addr))
++ 			continue;
++ 
++ 		if (vf->pf_set_mac) {
++ 			dev_err(ice_pf_to_dev(pf), "VF attempting to override administratively set MAC address\n");
++ 			v_ret = VIRTCHNL_STATUS_ERR_NOT_SUPPORTED;
++ 			goto handle_mac_exit;
++ 		}
++ 
++ 		ice_vfhw_mac_add(vf, &al->list[i]);
++ 		vf->num_mac++;
++ 		break;
++ 	}
++ 
++ handle_mac_exit:
++ 	return ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_ADD_ETH_ADDR,
++ 				     v_ret, NULL, 0);
++ }
++ 
++ /**
++  * ice_vc_repr_del_mac - response with success for deleting MAC
++  * @vf: pointer to VF
++  * @msg: virtchannel message
++  *
++  * Respond with success to not break normal VF flow.
++  * For legacy VF driver try to update cached MAC address.
++  */
++ static int
++ ice_vc_repr_del_mac(struct ice_vf __always_unused *vf, u8 __always_unused *msg)
++ {
++ 	struct virtchnl_ether_addr_list *al =
++ 		(struct virtchnl_ether_addr_list *)msg;
++ 
++ 	ice_update_legacy_cached_mac(vf, &al->list[0]);
++ 
++ 	return ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_DEL_ETH_ADDR,
++ 				     VIRTCHNL_STATUS_SUCCESS, NULL, 0);
++ }
++ 
++ static int ice_vc_repr_add_vlan(struct ice_vf *vf, u8 __always_unused *msg)
++ {
++ 	dev_dbg(ice_pf_to_dev(vf->pf),
++ 		"Can't add VLAN in switchdev mode for VF %d\n", vf->vf_id);
++ 	return ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_ADD_VLAN,
++ 				     VIRTCHNL_STATUS_SUCCESS, NULL, 0);
++ }
++ 
++ static int ice_vc_repr_del_vlan(struct ice_vf *vf, u8 __always_unused *msg)
++ {
++ 	dev_dbg(ice_pf_to_dev(vf->pf),
++ 		"Can't delete VLAN in switchdev mode for VF %d\n", vf->vf_id);
++ 	return ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_DEL_VLAN,
++ 				     VIRTCHNL_STATUS_SUCCESS, NULL, 0);
++ }
++ 
++ static int ice_vc_repr_ena_vlan_stripping(struct ice_vf *vf)
++ {
++ 	dev_dbg(ice_pf_to_dev(vf->pf),
++ 		"Can't enable VLAN stripping in switchdev mode for VF %d\n",
++ 		vf->vf_id);
++ 	return ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_ENABLE_VLAN_STRIPPING,
++ 				     VIRTCHNL_STATUS_ERR_NOT_SUPPORTED,
++ 				     NULL, 0);
++ }
++ 
++ static int ice_vc_repr_dis_vlan_stripping(struct ice_vf *vf)
++ {
++ 	dev_dbg(ice_pf_to_dev(vf->pf),
++ 		"Can't disable VLAN stripping in switchdev mode for VF %d\n",
++ 		vf->vf_id);
++ 	return ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_DISABLE_VLAN_STRIPPING,
++ 				     VIRTCHNL_STATUS_ERR_NOT_SUPPORTED,
++ 				     NULL, 0);
++ }
++ 
++ static int
++ ice_vc_repr_cfg_promiscuous_mode(struct ice_vf *vf, u8 __always_unused *msg)
++ {
++ 	dev_dbg(ice_pf_to_dev(vf->pf),
++ 		"Can't config promiscuous mode in switchdev mode for VF %d\n",
++ 		vf->vf_id);
++ 	return ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_CONFIG_PROMISCUOUS_MODE,
++ 				     VIRTCHNL_STATUS_ERR_NOT_SUPPORTED,
++ 				     NULL, 0);
++ }
++ 
++ void ice_vc_change_ops_to_repr(struct ice_vc_vf_ops *ops)
++ {
++ 	ops->add_mac_addr_msg = ice_vc_repr_add_mac;
++ 	ops->del_mac_addr_msg = ice_vc_repr_del_mac;
++ 	ops->add_vlan_msg = ice_vc_repr_add_vlan;
++ 	ops->remove_vlan_msg = ice_vc_repr_del_vlan;
++ 	ops->ena_vlan_stripping = ice_vc_repr_ena_vlan_stripping;
++ 	ops->dis_vlan_stripping = ice_vc_repr_dis_vlan_stripping;
++ 	ops->cfg_promiscuous_mode_msg = ice_vc_repr_cfg_promiscuous_mode;
++ }
++ 
+++>>>>>>> e492c2e12d7b (ice: send correct vc status in switchdev)
+  /**
+   * ice_vc_process_vf_msg - Process request from VF
+   * @pf: pointer to the PF structure
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
