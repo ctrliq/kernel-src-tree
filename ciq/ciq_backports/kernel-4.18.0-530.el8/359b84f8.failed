@@ -1,0 +1,419 @@
+crypto: qat - add heartbeat feature
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-530.el8
+commit-author Damian Muszynski <damian.muszynski@intel.com>
+commit 359b84f8db942ef46d24de8aa397790c3fae22e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-530.el8/359b84f8.failed
+
+Under some circumstances, firmware in the QAT devices could become
+unresponsive. The Heartbeat feature provides a mechanism to detect
+unresponsive devices.
+
+The QAT FW periodically writes to memory a set of counters that allow
+to detect the liveness of a device. This patch adds logic to enable
+the reporting of those counters, analyze them and report if a device
+is alive or not.
+
+In particular this adds
+  (1) heartbeat enabling, reading and detection logic
+  (2) reporting of heartbeat status and configuration via debugfs
+  (3) documentation for the newly created sysfs entries
+  (4) configuration of FW settings related to heartbeat, e.g. tick period
+  (5) logic to convert time in ms (provided by the user) to clock ticks
+
+This patch introduces a new folder in debugfs called heartbeat with the
+following attributes:
+ - status
+ - queries_sent
+ - queries_failed
+ - config
+
+All attributes except config are reading only. In particular:
+ - `status` file returns 0 when device is operational and -1 otherwise.
+ - `queries_sent` returns the total number of heartbeat queries sent.
+ - `queries_failed` returns the total number of heartbeat queries failed.
+ - `config` allows to adjust the frequency at which the firmware writes
+   counters to memory. This period is given in milliseconds and it is
+   fixed for GEN4 devices.
+
+	Signed-off-by: Damian Muszynski <damian.muszynski@intel.com>
+	Reviewed-by: Giovanni Cabiddu <giovanni.cabiddu@intel.com>
+	Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 359b84f8db942ef46d24de8aa397790c3fae22e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/ABI/testing/debugfs-driver-qat
+#	drivers/crypto/intel/qat/qat_common/adf_dbgfs.c
+#	drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
+#	drivers/crypto/qat/qat_4xxx/adf_drv.c
+#	drivers/crypto/qat/qat_c3xxx/adf_c3xxx_hw_data.c
+#	drivers/crypto/qat/qat_c62x/adf_c62x_hw_data.c
+#	drivers/crypto/qat/qat_common/Makefile
+#	drivers/crypto/qat/qat_common/adf_accel_devices.h
+#	drivers/crypto/qat/qat_common/adf_admin.c
+#	drivers/crypto/qat/qat_common/adf_common_drv.h
+#	drivers/crypto/qat/qat_common/adf_heartbeat.c
+#	drivers/crypto/qat/qat_common/adf_heartbeat.h
+#	drivers/crypto/qat/qat_common/adf_heartbeat_dbgfs.c
+#	drivers/crypto/qat/qat_common/adf_heartbeat_dbgfs.h
+#	drivers/crypto/qat/qat_common/adf_init.c
+#	drivers/crypto/qat/qat_common/icp_qat_fw_init_admin.h
+#	drivers/crypto/qat/qat_dh895xcc/adf_dh895xcc_hw_data.c
+diff --cc drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
+index e543a9e24a06,268a1f7694fc..000000000000
+--- a/drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
++++ b/drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
+@@@ -508,6 -518,10 +508,13 @@@ void adf_init_hw_data_4xxx(struct adf_h
+  	hw_data->enable_pm = adf_gen4_enable_pm;
+  	hw_data->handle_pm_interrupt = adf_gen4_handle_pm_interrupt;
+  	hw_data->dev_config = adf_gen4_dev_config;
+++<<<<<<< HEAD:drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
+++=======
++ 	hw_data->start_timer = adf_gen4_timer_start;
++ 	hw_data->stop_timer = adf_gen4_timer_stop;
++ 	hw_data->get_hb_clock = get_heartbeat_clock;
++ 	hw_data->num_hb_ctrs = ADF_NUM_HB_CNT_PER_AE;
+++>>>>>>> 359b84f8db94 (crypto: qat - add heartbeat feature):drivers/crypto/intel/qat/qat_4xxx/adf_4xxx_hw_data.c
+  
+  	adf_gen4_init_hw_csr_ops(&hw_data->csr_ops);
+  	adf_gen4_init_pf_pfvf_ops(&hw_data->pfvf_ops);
+diff --cc drivers/crypto/qat/qat_4xxx/adf_drv.c
+index 3f92d9e7e814,6d4e2e139ffa..000000000000
+--- a/drivers/crypto/qat/qat_4xxx/adf_drv.c
++++ b/drivers/crypto/qat/qat_4xxx/adf_drv.c
+@@@ -7,6 -7,8 +7,11 @@@
+  #include <adf_accel_devices.h>
+  #include <adf_cfg.h>
+  #include <adf_common_drv.h>
+++<<<<<<< HEAD:drivers/crypto/qat/qat_4xxx/adf_drv.c
+++=======
++ #include <adf_dbgfs.h>
++ #include <adf_heartbeat.h>
+++>>>>>>> 359b84f8db94 (crypto: qat - add heartbeat feature):drivers/crypto/intel/qat/qat_4xxx/adf_drv.c
+  
+  #include "adf_4xxx_hw_data.h"
+  #include "qat_compression.h"
+diff --cc drivers/crypto/qat/qat_c3xxx/adf_c3xxx_hw_data.c
+index 475643654e64,e81d11409426..000000000000
+--- a/drivers/crypto/qat/qat_c3xxx/adf_c3xxx_hw_data.c
++++ b/drivers/crypto/qat/qat_c3xxx/adf_c3xxx_hw_data.c
+@@@ -127,6 -150,9 +127,12 @@@ void adf_init_hw_data_c3xxx(struct adf_
+  	hw_data->set_ssm_wdtimer = adf_gen2_set_ssm_wdtimer;
+  	hw_data->disable_iov = adf_disable_sriov;
+  	hw_data->dev_config = adf_gen2_dev_config;
+++<<<<<<< HEAD:drivers/crypto/qat/qat_c3xxx/adf_c3xxx_hw_data.c
+++=======
++ 	hw_data->measure_clock = measure_clock;
++ 	hw_data->get_hb_clock = get_ts_clock;
++ 	hw_data->num_hb_ctrs = ADF_NUM_HB_CNT_PER_AE;
+++>>>>>>> 359b84f8db94 (crypto: qat - add heartbeat feature):drivers/crypto/intel/qat/qat_c3xxx/adf_c3xxx_hw_data.c
+  
+  	adf_gen2_init_pf_pfvf_ops(&hw_data->pfvf_ops);
+  	adf_gen2_init_hw_csr_ops(&hw_data->csr_ops);
+diff --cc drivers/crypto/qat/qat_c62x/adf_c62x_hw_data.c
+index e14270703670,1a8c8e3a48e9..000000000000
+--- a/drivers/crypto/qat/qat_c62x/adf_c62x_hw_data.c
++++ b/drivers/crypto/qat/qat_c62x/adf_c62x_hw_data.c
+@@@ -129,6 -152,9 +129,12 @@@ void adf_init_hw_data_c62x(struct adf_h
+  	hw_data->set_ssm_wdtimer = adf_gen2_set_ssm_wdtimer;
+  	hw_data->disable_iov = adf_disable_sriov;
+  	hw_data->dev_config = adf_gen2_dev_config;
+++<<<<<<< HEAD:drivers/crypto/qat/qat_c62x/adf_c62x_hw_data.c
+++=======
++ 	hw_data->measure_clock = measure_clock;
++ 	hw_data->get_hb_clock = get_ts_clock;
++ 	hw_data->num_hb_ctrs = ADF_NUM_HB_CNT_PER_AE;
+++>>>>>>> 359b84f8db94 (crypto: qat - add heartbeat feature):drivers/crypto/intel/qat/qat_c62x/adf_c62x_hw_data.c
+  
+  	adf_gen2_init_pf_pfvf_ops(&hw_data->pfvf_ops);
+  	adf_gen2_init_hw_csr_ops(&hw_data->csr_ops);
+diff --cc drivers/crypto/qat/qat_common/Makefile
+index 1fb8d50f509f,43622c7fca71..000000000000
+--- a/drivers/crypto/qat/qat_common/Makefile
++++ b/drivers/crypto/qat/qat_common/Makefile
+@@@ -27,7 -29,12 +27,16 @@@ intel_qat-objs := adf_cfg.o 
+  	qat_hal.o \
+  	qat_bl.o
+  
+++<<<<<<< HEAD:drivers/crypto/qat/qat_common/Makefile
+ +intel_qat-$(CONFIG_DEBUG_FS) += adf_transport_debug.o
+++=======
++ intel_qat-$(CONFIG_DEBUG_FS) += adf_transport_debug.o \
++ 				adf_fw_counters.o \
++ 				adf_heartbeat.o \
++ 				adf_heartbeat_dbgfs.o \
++ 				adf_dbgfs.o
++ 
+++>>>>>>> 359b84f8db94 (crypto: qat - add heartbeat feature):drivers/crypto/intel/qat/qat_common/Makefile
+  intel_qat-$(CONFIG_PCI_IOV) += adf_sriov.o adf_vf_isr.o adf_pfvf_utils.o \
+  			       adf_pfvf_pf_msg.o adf_pfvf_pf_proto.o \
+  			       adf_pfvf_vf_msg.o adf_pfvf_vf_proto.o \
+diff --cc drivers/crypto/qat/qat_common/adf_accel_devices.h
+index 0399417b91fc,ab897e1717e0..000000000000
+--- a/drivers/crypto/qat/qat_common/adf_accel_devices.h
++++ b/drivers/crypto/qat/qat_common/adf_accel_devices.h
+@@@ -295,6 -305,9 +301,11 @@@ struct adf_accel_dev 
+  	struct list_head list;
+  	struct module *owner;
+  	struct adf_accel_pci accel_pci_dev;
+++<<<<<<< HEAD:drivers/crypto/qat/qat_common/adf_accel_devices.h
+++=======
++ 	struct adf_timer *timer;
++ 	struct adf_heartbeat *heartbeat;
+++>>>>>>> 359b84f8db94 (crypto: qat - add heartbeat feature):drivers/crypto/intel/qat/qat_common/adf_accel_devices.h
+  	union {
+  		struct {
+  			/* protects VF2PF interrupts access */
+diff --cc drivers/crypto/qat/qat_common/adf_admin.c
+index 118775ee02f2,ff790823b868..000000000000
+--- a/drivers/crypto/qat/qat_common/adf_admin.c
++++ b/drivers/crypto/qat/qat_common/adf_admin.c
+@@@ -223,6 -241,49 +224,52 @@@ static int adf_get_dc_capabilities(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:drivers/crypto/qat/qat_common/adf_admin.c
+++=======
++ int adf_get_ae_fw_counters(struct adf_accel_dev *accel_dev, u16 ae, u64 *reqs, u64 *resps)
++ {
++ 	struct icp_qat_fw_init_admin_resp resp = { };
++ 	struct icp_qat_fw_init_admin_req req = { };
++ 	int ret;
++ 
++ 	req.cmd_id = ICP_QAT_FW_COUNTERS_GET;
++ 
++ 	ret = adf_put_admin_msg_sync(accel_dev, ae, &req, &resp);
++ 	if (ret || resp.status)
++ 		return -EFAULT;
++ 
++ 	*reqs = resp.req_rec_count;
++ 	*resps = resp.resp_sent_count;
++ 
++ 	return 0;
++ }
++ 
++ int adf_send_admin_tim_sync(struct adf_accel_dev *accel_dev, u32 cnt)
++ {
++ 	u32 ae_mask = accel_dev->hw_device->ae_mask;
++ 	struct icp_qat_fw_init_admin_req req = { };
++ 	struct icp_qat_fw_init_admin_resp resp = { };
++ 
++ 	req.cmd_id = ICP_QAT_FW_SYNC;
++ 	req.int_timer_ticks = cnt;
++ 
++ 	return adf_send_admin(accel_dev, &req, &resp, ae_mask);
++ }
++ 
++ int adf_send_admin_hb_timer(struct adf_accel_dev *accel_dev, uint32_t ticks)
++ {
++ 	u32 ae_mask = accel_dev->hw_device->ae_mask;
++ 	struct icp_qat_fw_init_admin_req req = { };
++ 	struct icp_qat_fw_init_admin_resp resp;
++ 
++ 	req.cmd_id = ICP_QAT_FW_HEARTBEAT_TIMER_SET;
++ 	req.init_cfg_ptr = accel_dev->heartbeat->dma.phy_addr;
++ 	req.heartbeat_ticks = ticks;
++ 
++ 	return adf_send_admin(accel_dev, &req, &resp, ae_mask);
++ }
++ 
+++>>>>>>> 359b84f8db94 (crypto: qat - add heartbeat feature):drivers/crypto/intel/qat/qat_common/adf_admin.c
+  /**
+   * adf_send_admin_init() - Function sends init message to FW
+   * @accel_dev: Pointer to acceleration device.
+diff --cc drivers/crypto/qat/qat_common/adf_common_drv.h
+index b8132eb9bc2a,799a2193d3e5..000000000000
+--- a/drivers/crypto/qat/qat_common/adf_common_drv.h
++++ b/drivers/crypto/qat/qat_common/adf_common_drv.h
+@@@ -94,7 -94,11 +94,13 @@@ void adf_exit_aer(void)
+  int adf_init_admin_comms(struct adf_accel_dev *accel_dev);
+  void adf_exit_admin_comms(struct adf_accel_dev *accel_dev);
+  int adf_send_admin_init(struct adf_accel_dev *accel_dev);
+ -int adf_get_ae_fw_counters(struct adf_accel_dev *accel_dev, u16 ae, u64 *reqs, u64 *resps);
+  int adf_init_admin_pm(struct adf_accel_dev *accel_dev, u32 idle_delay);
+++<<<<<<< HEAD:drivers/crypto/qat/qat_common/adf_common_drv.h
+++=======
++ int adf_send_admin_tim_sync(struct adf_accel_dev *accel_dev, u32 cnt);
++ int adf_send_admin_hb_timer(struct adf_accel_dev *accel_dev, uint32_t ticks);
++ int adf_get_fw_timestamp(struct adf_accel_dev *accel_dev, u64 *timestamp);
+++>>>>>>> 359b84f8db94 (crypto: qat - add heartbeat feature):drivers/crypto/intel/qat/qat_common/adf_common_drv.h
+  int adf_init_arb(struct adf_accel_dev *accel_dev);
+  void adf_exit_arb(struct adf_accel_dev *accel_dev);
+  void adf_update_ring_arb(struct adf_etr_ring_data *ring);
+diff --cc drivers/crypto/qat/qat_common/adf_init.c
+index 0985f64ab11a,89001fe92e76..000000000000
+--- a/drivers/crypto/qat/qat_common/adf_init.c
++++ b/drivers/crypto/qat/qat_common/adf_init.c
+@@@ -7,6 -7,8 +7,11 @@@
+  #include "adf_accel_devices.h"
+  #include "adf_cfg.h"
+  #include "adf_common_drv.h"
+++<<<<<<< HEAD:drivers/crypto/qat/qat_common/adf_init.c
+++=======
++ #include "adf_dbgfs.h"
++ #include "adf_heartbeat.h"
+++>>>>>>> 359b84f8db94 (crypto: qat - add heartbeat feature):drivers/crypto/intel/qat/qat_common/adf_init.c
+  
+  static LIST_HEAD(service_table);
+  static DEFINE_MUTEX(service_lock);
+@@@ -186,6 -199,16 +193,19 @@@ static int adf_dev_start(struct adf_acc
+  		return -EFAULT;
+  	}
+  
+++<<<<<<< HEAD:drivers/crypto/qat/qat_common/adf_init.c
+++=======
++ 	if (hw_data->start_timer) {
++ 		ret = hw_data->start_timer(accel_dev);
++ 		if (ret) {
++ 			dev_err(&GET_DEV(accel_dev), "Failed to start internal sync timer\n");
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	adf_heartbeat_start(accel_dev);
++ 
+++>>>>>>> 359b84f8db94 (crypto: qat - add heartbeat feature):drivers/crypto/intel/qat/qat_common/adf_init.c
+  	list_for_each(list_itr, &service_table) {
+  		service = list_entry(list_itr, struct service_hndl, list);
+  		if (service->event_hld(accel_dev, ADF_EVENT_START)) {
+diff --cc drivers/crypto/qat/qat_common/icp_qat_fw_init_admin.h
+index 56cb827f93ea,3e968a4bcc9c..000000000000
+--- a/drivers/crypto/qat/qat_common/icp_qat_fw_init_admin.h
++++ b/drivers/crypto/qat/qat_common/icp_qat_fw_init_admin.h
+@@@ -16,6 -16,8 +16,11 @@@ enum icp_qat_fw_init_admin_cmd_id 
+  	ICP_QAT_FW_HEARTBEAT_SYNC = 7,
+  	ICP_QAT_FW_HEARTBEAT_GET = 8,
+  	ICP_QAT_FW_COMP_CAPABILITY_GET = 9,
+++<<<<<<< HEAD:drivers/crypto/qat/qat_common/icp_qat_fw_init_admin.h
+++=======
++ 	ICP_QAT_FW_HEARTBEAT_TIMER_SET = 13,
++ 	ICP_QAT_FW_TIMER_GET = 19,
+++>>>>>>> 359b84f8db94 (crypto: qat - add heartbeat feature):drivers/crypto/intel/qat/qat_common/icp_qat_fw_init_admin.h
+  	ICP_QAT_FW_PM_STATE_CONFIG = 128,
+  };
+  
+@@@ -37,6 -39,12 +42,15 @@@ struct icp_qat_fw_init_admin_req 
+  			__u16 ibuf_size_in_kb;
+  			__u16 resrvd3;
+  		};
+++<<<<<<< HEAD:drivers/crypto/qat/qat_common/icp_qat_fw_init_admin.h
+++=======
++ 		struct {
++ 			__u32 int_timer_ticks;
++ 		};
++ 		struct {
++ 			__u32 heartbeat_ticks;
++ 		};
+++>>>>>>> 359b84f8db94 (crypto: qat - add heartbeat feature):drivers/crypto/intel/qat/qat_common/icp_qat_fw_init_admin.h
+  		__u32 idle_filter;
+  	};
+  
+diff --cc drivers/crypto/qat/qat_dh895xcc/adf_dh895xcc_hw_data.c
+index 1ebe0b351fae,8fbab905c5cc..000000000000
+--- a/drivers/crypto/qat/qat_dh895xcc/adf_dh895xcc_hw_data.c
++++ b/drivers/crypto/qat/qat_dh895xcc/adf_dh895xcc_hw_data.c
+@@@ -237,6 -245,9 +237,12 @@@ void adf_init_hw_data_dh895xcc(struct a
+  	hw_data->reset_device = adf_reset_sbr;
+  	hw_data->disable_iov = adf_disable_sriov;
+  	hw_data->dev_config = adf_gen2_dev_config;
+++<<<<<<< HEAD:drivers/crypto/qat/qat_dh895xcc/adf_dh895xcc_hw_data.c
+++=======
++ 	hw_data->clock_frequency = ADF_DH895X_AE_FREQ;
++ 	hw_data->get_hb_clock = get_ts_clock;
++ 	hw_data->num_hb_ctrs = ADF_NUM_HB_CNT_PER_AE;
+++>>>>>>> 359b84f8db94 (crypto: qat - add heartbeat feature):drivers/crypto/intel/qat/qat_dh895xcc/adf_dh895xcc_hw_data.c
+  
+  	adf_gen2_init_pf_pfvf_ops(&hw_data->pfvf_ops);
+  	hw_data->pfvf_ops.enable_vf2pf_interrupts = enable_vf2pf_interrupts;
+* Unmerged path Documentation/ABI/testing/debugfs-driver-qat
+* Unmerged path drivers/crypto/intel/qat/qat_common/adf_dbgfs.c
+* Unmerged path drivers/crypto/qat/qat_common/adf_heartbeat.c
+* Unmerged path drivers/crypto/qat/qat_common/adf_heartbeat.h
+* Unmerged path drivers/crypto/qat/qat_common/adf_heartbeat_dbgfs.c
+* Unmerged path drivers/crypto/qat/qat_common/adf_heartbeat_dbgfs.h
+* Unmerged path Documentation/ABI/testing/debugfs-driver-qat
+* Unmerged path drivers/crypto/intel/qat/qat_common/adf_dbgfs.c
+* Unmerged path drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
+* Unmerged path drivers/crypto/qat/qat_4xxx/adf_drv.c
+* Unmerged path drivers/crypto/qat/qat_c3xxx/adf_c3xxx_hw_data.c
+* Unmerged path drivers/crypto/qat/qat_c62x/adf_c62x_hw_data.c
+* Unmerged path drivers/crypto/qat/qat_common/Makefile
+* Unmerged path drivers/crypto/qat/qat_common/adf_accel_devices.h
+* Unmerged path drivers/crypto/qat/qat_common/adf_admin.c
+diff --git a/drivers/crypto/qat/qat_common/adf_cfg_strings.h b/drivers/crypto/qat/qat_common/adf_cfg_strings.h
+index 3ae1e5caee0e..6066dc637352 100644
+--- a/drivers/crypto/qat/qat_common/adf_cfg_strings.h
++++ b/drivers/crypto/qat/qat_common/adf_cfg_strings.h
+@@ -47,4 +47,6 @@
+ #define ADF_ETRMGR_CORE_AFFINITY_FORMAT \
+ 	ADF_ETRMGR_BANK "%d" ADF_ETRMGR_CORE_AFFINITY
+ #define ADF_ACCEL_STR "Accelerator%d"
++#define ADF_HEARTBEAT_TIMER  "HeartbeatTimer"
++
+ #endif
+* Unmerged path drivers/crypto/qat/qat_common/adf_common_drv.h
+diff --git a/drivers/crypto/qat/qat_common/adf_gen2_config.c b/drivers/crypto/qat/qat_common/adf_gen2_config.c
+index eeb30da7587a..c27ff6d18e11 100644
+--- a/drivers/crypto/qat/qat_common/adf_gen2_config.c
++++ b/drivers/crypto/qat/qat_common/adf_gen2_config.c
+@@ -7,6 +7,7 @@
+ #include "adf_common_drv.h"
+ #include "qat_crypto.h"
+ #include "qat_compression.h"
++#include "adf_heartbeat.h"
+ #include "adf_transport_access_macros.h"
+ 
+ static int adf_gen2_crypto_dev_config(struct adf_accel_dev *accel_dev)
+@@ -195,6 +196,12 @@ int adf_gen2_dev_config(struct adf_accel_dev *accel_dev)
+ 	if (ret)
+ 		goto err;
+ 
++	ret = adf_cfg_section_add(accel_dev, ADF_GENERAL_SEC);
++	if (ret)
++		goto err;
++
++	adf_heartbeat_save_cfg_param(accel_dev, ADF_CFG_HB_TIMER_DEFAULT_MS);
++
+ 	set_bit(ADF_STATUS_CONFIGURED, &accel_dev->status);
+ 
+ 	return ret;
+diff --git a/drivers/crypto/qat/qat_common/adf_gen2_hw_data.h b/drivers/crypto/qat/qat_common/adf_gen2_hw_data.h
+index e4bc07529be4..6bd341061de4 100644
+--- a/drivers/crypto/qat/qat_common/adf_gen2_hw_data.h
++++ b/drivers/crypto/qat/qat_common/adf_gen2_hw_data.h
+@@ -145,6 +145,9 @@ do { \
+ #define ADF_GEN2_CERRSSMSH(i)		((i) * 0x4000 + 0x10)
+ #define ADF_GEN2_ERRSSMSH_EN		BIT(3)
+ 
++/* Number of heartbeat counter pairs */
++#define ADF_NUM_HB_CNT_PER_AE ADF_NUM_THREADS_PER_AE
++
+ /* Interrupts */
+ #define ADF_GEN2_SMIAPF0_MASK_OFFSET    (0x3A000 + 0x28)
+ #define ADF_GEN2_SMIAPF1_MASK_OFFSET    (0x3A000 + 0x30)
+diff --git a/drivers/crypto/qat/qat_common/adf_gen4_hw_data.h b/drivers/crypto/qat/qat_common/adf_gen4_hw_data.h
+index 4fb4b3df5a18..02d7a019ebf8 100644
+--- a/drivers/crypto/qat/qat_common/adf_gen4_hw_data.h
++++ b/drivers/crypto/qat/qat_common/adf_gen4_hw_data.h
+@@ -136,6 +136,9 @@ do { \
+ 
+ #define ADF_GEN4_VFLNOTIFY	BIT(7)
+ 
++/* Number of heartbeat counter pairs */
++#define ADF_NUM_HB_CNT_PER_AE ADF_NUM_THREADS_PER_AE
++
+ void adf_gen4_set_ssm_wdtimer(struct adf_accel_dev *accel_dev);
+ void adf_gen4_init_hw_csr_ops(struct adf_hw_csr_ops *csr_ops);
+ int adf_gen4_ring_pair_reset(struct adf_accel_dev *accel_dev, u32 bank_number);
+* Unmerged path drivers/crypto/qat/qat_common/adf_heartbeat.c
+* Unmerged path drivers/crypto/qat/qat_common/adf_heartbeat.h
+* Unmerged path drivers/crypto/qat/qat_common/adf_heartbeat_dbgfs.c
+* Unmerged path drivers/crypto/qat/qat_common/adf_heartbeat_dbgfs.h
+* Unmerged path drivers/crypto/qat/qat_common/adf_init.c
+* Unmerged path drivers/crypto/qat/qat_common/icp_qat_fw_init_admin.h
+* Unmerged path drivers/crypto/qat/qat_dh895xcc/adf_dh895xcc_hw_data.c
