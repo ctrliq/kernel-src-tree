@@ -1,0 +1,152 @@
+x86/alternatives: Teach text_poke_bp() to emulate RET
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit c43a43e439e00ad2a4d98716895d961ade6bbbfc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/c43a43e4.failed
+
+Future patches will need to poke a RET instruction, provide the
+infrastructure required for this.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+	Reviewed-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Link: https://lore.kernel.org/r/20200818135804.982214828@infradead.org
+(cherry picked from commit c43a43e439e00ad2a4d98716895d961ade6bbbfc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/text-patching.h
+diff --cc arch/x86/include/asm/text-patching.h
+index 47a8c6185e2b,b7421780e4e9..000000000000
+--- a/arch/x86/include/asm/text-patching.h
++++ b/arch/x86/include/asm/text-patching.h
+@@@ -71,7 -65,71 +74,75 @@@ static inline void int3_emulate_jmp(str
+  #define JMP8_INSN_SIZE		2
+  #define JMP8_INSN_OPCODE	0xEB
+  
+++<<<<<<< HEAD
+ +static inline void int3_emulate_push(struct pt_regs *regs, unsigned long val)
+++=======
++ #define DISP32_SIZE		4
++ 
++ static __always_inline int text_opcode_size(u8 opcode)
++ {
++ 	int size = 0;
++ 
++ #define __CASE(insn)	\
++ 	case insn##_INSN_OPCODE: size = insn##_INSN_SIZE; break
++ 
++ 	switch(opcode) {
++ 	__CASE(INT3);
++ 	__CASE(RET);
++ 	__CASE(CALL);
++ 	__CASE(JMP32);
++ 	__CASE(JMP8);
++ 	}
++ 
++ #undef __CASE
++ 
++ 	return size;
++ }
++ 
++ union text_poke_insn {
++ 	u8 text[POKE_MAX_OPCODE_SIZE];
++ 	struct {
++ 		u8 opcode;
++ 		s32 disp;
++ 	} __attribute__((packed));
++ };
++ 
++ static __always_inline
++ void *text_gen_insn(u8 opcode, const void *addr, const void *dest)
++ {
++ 	static union text_poke_insn insn; /* per instance */
++ 	int size = text_opcode_size(opcode);
++ 
++ 	insn.opcode = opcode;
++ 
++ 	if (size > 1) {
++ 		insn.disp = (long)dest - (long)(addr + size);
++ 		if (size == 2) {
++ 			/*
++ 			 * Ensure that for JMP9 the displacement
++ 			 * actually fits the signed byte.
++ 			 */
++ 			BUG_ON((insn.disp >> 31) != (insn.disp >> 7));
++ 		}
++ 	}
++ 
++ 	return &insn.text;
++ }
++ 
++ extern int after_bootmem;
++ extern __ro_after_init struct mm_struct *poking_mm;
++ extern __ro_after_init unsigned long poking_addr;
++ 
++ #ifndef CONFIG_UML_X86
++ static __always_inline
++ void int3_emulate_jmp(struct pt_regs *regs, unsigned long ip)
++ {
++ 	regs->ip = ip;
++ }
++ 
++ static __always_inline
++ void int3_emulate_push(struct pt_regs *regs, unsigned long val)
+++>>>>>>> c43a43e439e0 (x86/alternatives: Teach text_poke_bp() to emulate RET)
+  {
+  	/*
+  	 * The int3 handler in entry_64.S adds a gap between the
+@@@ -83,7 -144,16 +154,20 @@@
+  	*(unsigned long *)regs->sp = val;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void int3_emulate_call(struct pt_regs *regs, unsigned long func)
+++=======
++ static __always_inline
++ unsigned long int3_emulate_pop(struct pt_regs *regs)
++ {
++ 	unsigned long val = *(unsigned long *)regs->sp;
++ 	regs->sp += sizeof(unsigned long);
++ 	return val;
++ }
++ 
++ static __always_inline
++ void int3_emulate_call(struct pt_regs *regs, unsigned long func)
+++>>>>>>> c43a43e439e0 (x86/alternatives: Teach text_poke_bp() to emulate RET)
+  {
+  	int3_emulate_push(regs, regs->ip - INT3_INSN_SIZE + CALL_INSN_SIZE);
+  	int3_emulate_jmp(regs, func);
+* Unmerged path arch/x86/include/asm/text-patching.h
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 4fce58044a3f..8fc2a6477bb2 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -856,6 +856,10 @@ int poke_int3_handler(struct pt_regs *regs)
+ 		 */
+ 		return 0;
+ 
++	case RET_INSN_OPCODE:
++		int3_emulate_ret(regs);
++		break;
++
+ 	case CALL_INSN_OPCODE:
+ 		int3_emulate_call(regs, (long)ip + tp->rel32);
+ 		break;
+@@ -995,6 +999,7 @@ void text_poke_loc_init(struct text_poke_loc *tp, void *addr,
+ 
+ 	switch (tp->opcode) {
+ 	case INT3_INSN_OPCODE:
++	case RET_INSN_OPCODE:
+ 		break;
+ 
+ 	case CALL_INSN_OPCODE:
