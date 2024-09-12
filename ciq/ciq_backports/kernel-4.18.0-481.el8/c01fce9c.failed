@@ -1,0 +1,278 @@
+x86/compressed: Add SEV-SNP feature detection/setup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Michael Roth <michael.roth@amd.com>
+commit c01fce9cef8491974f7f007f90281f1608400768
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/c01fce9c.failed
+
+Initial/preliminary detection of SEV-SNP is done via the Confidential
+Computing blob. Check for it prior to the normal SEV/SME feature
+initialization, and add some sanity checks to confirm it agrees with
+SEV-SNP CPUID/MSR bits.
+
+	Signed-off-by: Michael Roth <michael.roth@amd.com>
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20220307213356.2797205-35-brijesh.singh@amd.com
+(cherry picked from commit c01fce9cef8491974f7f007f90281f1608400768)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/sev.c
+#	arch/x86/include/asm/sev.h
+diff --cc arch/x86/boot/compressed/sev.c
+index 213b126ba7e3,2a94bb7879ae..000000000000
+--- a/arch/x86/boot/compressed/sev.c
++++ b/arch/x86/boot/compressed/sev.c
+@@@ -202,3 -249,186 +202,189 @@@ finish
+  	else if (result != ES_RETRY)
+  		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_GEN_REQ);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void enforce_vmpl0(void)
++ {
++ 	u64 attrs;
++ 	int err;
++ 
++ 	/*
++ 	 * RMPADJUST modifies RMP permissions of a lesser-privileged (numerically
++ 	 * higher) privilege level. Here, clear the VMPL1 permission mask of the
++ 	 * GHCB page. If the guest is not running at VMPL0, this will fail.
++ 	 *
++ 	 * If the guest is running at VMPL0, it will succeed. Even if that operation
++ 	 * modifies permission bits, it is still ok to do so currently because Linux
++ 	 * SNP guests are supported only on VMPL0 so VMPL1 or higher permission masks
++ 	 * changing is a don't-care.
++ 	 */
++ 	attrs = 1;
++ 	if (rmpadjust((unsigned long)&boot_ghcb_page, RMP_PG_SIZE_4K, attrs))
++ 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_NOT_VMPL0);
++ }
++ 
++ void sev_enable(struct boot_params *bp)
++ {
++ 	unsigned int eax, ebx, ecx, edx;
++ 	struct msr m;
++ 	bool snp;
++ 
++ 	/*
++ 	 * Setup/preliminary detection of SNP. This will be sanity-checked
++ 	 * against CPUID/MSR values later.
++ 	 */
++ 	snp = snp_init(bp);
++ 
++ 	/* Check for the SME/SEV support leaf */
++ 	eax = 0x80000000;
++ 	ecx = 0;
++ 	native_cpuid(&eax, &ebx, &ecx, &edx);
++ 	if (eax < 0x8000001f)
++ 		return;
++ 
++ 	/*
++ 	 * Check for the SME/SEV feature:
++ 	 *   CPUID Fn8000_001F[EAX]
++ 	 *   - Bit 0 - Secure Memory Encryption support
++ 	 *   - Bit 1 - Secure Encrypted Virtualization support
++ 	 *   CPUID Fn8000_001F[EBX]
++ 	 *   - Bits 5:0 - Pagetable bit position used to indicate encryption
++ 	 */
++ 	eax = 0x8000001f;
++ 	ecx = 0;
++ 	native_cpuid(&eax, &ebx, &ecx, &edx);
++ 	/* Check whether SEV is supported */
++ 	if (!(eax & BIT(1))) {
++ 		if (snp)
++ 			error("SEV-SNP support indicated by CC blob, but not CPUID.");
++ 		return;
++ 	}
++ 
++ 	/* Set the SME mask if this is an SEV guest. */
++ 	boot_rdmsr(MSR_AMD64_SEV, &m);
++ 	sev_status = m.q;
++ 	if (!(sev_status & MSR_AMD64_SEV_ENABLED))
++ 		return;
++ 
++ 	/* Negotiate the GHCB protocol version. */
++ 	if (sev_status & MSR_AMD64_SEV_ES_ENABLED) {
++ 		if (!sev_es_negotiate_protocol())
++ 			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_PROT_UNSUPPORTED);
++ 	}
++ 
++ 	/*
++ 	 * SNP is supported in v2 of the GHCB spec which mandates support for HV
++ 	 * features.
++ 	 */
++ 	if (sev_status & MSR_AMD64_SEV_SNP_ENABLED) {
++ 		if (!(get_hv_features() & GHCB_HV_FT_SNP))
++ 			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
++ 
++ 		enforce_vmpl0();
++ 	}
++ 
++ 	if (snp && !(sev_status & MSR_AMD64_SEV_SNP_ENABLED))
++ 		error("SEV-SNP supported indicated by CC blob, but not SEV status MSR.");
++ 
++ 	sme_me_mask = BIT_ULL(ebx & 0x3f);
++ }
++ 
++ /* Search for Confidential Computing blob in the EFI config table. */
++ static struct cc_blob_sev_info *find_cc_blob_efi(struct boot_params *bp)
++ {
++ 	unsigned long cfg_table_pa;
++ 	unsigned int cfg_table_len;
++ 	int ret;
++ 
++ 	ret = efi_get_conf_table(bp, &cfg_table_pa, &cfg_table_len);
++ 	if (ret)
++ 		return NULL;
++ 
++ 	return (struct cc_blob_sev_info *)efi_find_vendor_table(bp, cfg_table_pa,
++ 								cfg_table_len,
++ 								EFI_CC_BLOB_GUID);
++ }
++ 
++ struct cc_setup_data {
++ 	struct setup_data header;
++ 	u32 cc_blob_address;
++ };
++ 
++ /*
++  * Search for a Confidential Computing blob passed in as a setup_data entry
++  * via the Linux Boot Protocol.
++  */
++ static struct cc_blob_sev_info *find_cc_blob_setup_data(struct boot_params *bp)
++ {
++ 	struct cc_setup_data *sd = NULL;
++ 	struct setup_data *hdr;
++ 
++ 	hdr = (struct setup_data *)bp->hdr.setup_data;
++ 
++ 	while (hdr) {
++ 		if (hdr->type == SETUP_CC_BLOB) {
++ 			sd = (struct cc_setup_data *)hdr;
++ 			return (struct cc_blob_sev_info *)(unsigned long)sd->cc_blob_address;
++ 		}
++ 		hdr = (struct setup_data *)hdr->next;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ /*
++  * Initial set up of SNP relies on information provided by the
++  * Confidential Computing blob, which can be passed to the boot kernel
++  * by firmware/bootloader in the following ways:
++  *
++  * - via an entry in the EFI config table
++  * - via a setup_data structure, as defined by the Linux Boot Protocol
++  *
++  * Scan for the blob in that order.
++  */
++ static struct cc_blob_sev_info *find_cc_blob(struct boot_params *bp)
++ {
++ 	struct cc_blob_sev_info *cc_info;
++ 
++ 	cc_info = find_cc_blob_efi(bp);
++ 	if (cc_info)
++ 		goto found_cc_info;
++ 
++ 	cc_info = find_cc_blob_setup_data(bp);
++ 	if (!cc_info)
++ 		return NULL;
++ 
++ found_cc_info:
++ 	if (cc_info->magic != CC_BLOB_SEV_HDR_MAGIC)
++ 		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
++ 
++ 	return cc_info;
++ }
++ 
++ /*
++  * Indicate SNP based on presence of SNP-specific CC blob. Subsequent checks
++  * will verify the SNP CPUID/MSR bits.
++  */
++ bool snp_init(struct boot_params *bp)
++ {
++ 	struct cc_blob_sev_info *cc_info;
++ 
++ 	if (!bp)
++ 		return false;
++ 
++ 	cc_info = find_cc_blob(bp);
++ 	if (!cc_info)
++ 		return false;
++ 
++ 	/*
++ 	 * Pass run-time kernel a pointer to CC info via boot_params so EFI
++ 	 * config table doesn't need to be searched again during early startup
++ 	 * phase.
++ 	 */
++ 	bp->cc_blob_address = (u32)(unsigned long)cc_info;
++ 
++ 	return true;
++ }
+++>>>>>>> c01fce9cef84 (x86/compressed: Add SEV-SNP feature detection/setup)
+diff --cc arch/x86/include/asm/sev.h
+index 904ff9242b92,31b3b10323b6..000000000000
+--- a/arch/x86/include/asm/sev.h
++++ b/arch/x86/include/asm/sev.h
+@@@ -11,9 -11,10 +11,10 @@@
+  #include <linux/types.h>
+  #include <asm/insn.h>
+  #include <asm/sev-common.h>
++ #include <asm/bootparam.h>
+  
+  #define GHCB_PROTOCOL_MIN	1ULL
+ -#define GHCB_PROTOCOL_MAX	2ULL
+ +#define GHCB_PROTOCOL_MAX	1ULL
+  #define GHCB_DEFAULT_USAGE	0ULL
+  
+  #define	VMGEXIT()			{ asm volatile("rep; vmmcall\n\r"); }
+@@@ -125,6 -143,16 +126,19 @@@ static inline int pvalidate(unsigned lo
+  
+  	return rc;
+  }
+++<<<<<<< HEAD
+++=======
++ void setup_ghcb(void);
++ void __init early_snp_set_memory_private(unsigned long vaddr, unsigned long paddr,
++ 					 unsigned int npages);
++ void __init early_snp_set_memory_shared(unsigned long vaddr, unsigned long paddr,
++ 					unsigned int npages);
++ void __init snp_prep_memory(unsigned long paddr, unsigned int sz, enum psc_op op);
++ void snp_set_memory_shared(unsigned long vaddr, unsigned int npages);
++ void snp_set_memory_private(unsigned long vaddr, unsigned int npages);
++ void snp_set_wakeup_secondary_cpu(void);
++ bool snp_init(struct boot_params *bp);
+++>>>>>>> c01fce9cef84 (x86/compressed: Add SEV-SNP feature detection/setup)
+  #else
+  static inline void sev_es_ist_enter(struct pt_regs *regs) { }
+  static inline void sev_es_ist_exit(void) { }
+@@@ -132,6 -160,17 +146,20 @@@ static inline int sev_es_setup_ap_jump_
+  static inline void sev_es_nmi_complete(void) { }
+  static inline int sev_es_efi_map_ghcbs(pgd_t *pgd) { return 0; }
+  static inline int pvalidate(unsigned long vaddr, bool rmp_psize, bool validate) { return 0; }
+++<<<<<<< HEAD
+++=======
++ static inline int rmpadjust(unsigned long vaddr, bool rmp_psize, unsigned long attrs) { return 0; }
++ static inline void setup_ghcb(void) { }
++ static inline void __init
++ early_snp_set_memory_private(unsigned long vaddr, unsigned long paddr, unsigned int npages) { }
++ static inline void __init
++ early_snp_set_memory_shared(unsigned long vaddr, unsigned long paddr, unsigned int npages) { }
++ static inline void __init snp_prep_memory(unsigned long paddr, unsigned int sz, enum psc_op op) { }
++ static inline void snp_set_memory_shared(unsigned long vaddr, unsigned int npages) { }
++ static inline void snp_set_memory_private(unsigned long vaddr, unsigned int npages) { }
++ static inline void snp_set_wakeup_secondary_cpu(void) { }
++ static inline bool snp_init(struct boot_params *bp) { return false; }
+++>>>>>>> c01fce9cef84 (x86/compressed: Add SEV-SNP feature detection/setup)
+  #endif
+  
+  #endif
+* Unmerged path arch/x86/boot/compressed/sev.c
+* Unmerged path arch/x86/include/asm/sev.h
