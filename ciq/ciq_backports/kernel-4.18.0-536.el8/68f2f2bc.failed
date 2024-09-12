@@ -1,0 +1,233 @@
+Drivers: hv: vmbus: Support fully enlightened TDX guests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-536.el8
+commit-author Dexuan Cui <decui@microsoft.com>
+commit 68f2f2bc163d4427b04f0fb6421f091f948175fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-536.el8/68f2f2bc.failed
+
+Add Hyper-V specific code so that a fully enlightened TDX guest (i.e.
+without the paravisor) can run on Hyper-V:
+  Don't use hv_vp_assist_page. Use GHCI instead.
+  Don't try to use the unsupported HV_REGISTER_CRASH_CTL.
+  Don't trust (use) Hyper-V's TLB-flushing hypercalls.
+  Don't use lazy EOI.
+  Share the SynIC Event/Message pages with the hypervisor.
+  Don't use the Hyper-V TSC page for now, because non-trivial work is
+    required to share the page with the hypervisor.
+
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+Link: https://lore.kernel.org/r/20230824080712.30327-4-decui@microsoft.com
+(cherry picked from commit 68f2f2bc163d4427b04f0fb6421f091f948175fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mshyperv.c
+#	drivers/hv/hv.c
+diff --cc arch/x86/kernel/cpu/mshyperv.c
+index 1189865ffc68,ff3d9c5de19c..000000000000
+--- a/arch/x86/kernel/cpu/mshyperv.c
++++ b/arch/x86/kernel/cpu/mshyperv.c
+@@@ -385,16 -412,28 +385,39 @@@ static void __init ms_hyperv_init_platf
+  		pr_info("Hyper-V: Isolation Config: Group A 0x%x, Group B 0x%x\n",
+  			ms_hyperv.isolation_config_a, ms_hyperv.isolation_config_b);
+  
+ -
+  		if (hv_get_isolation_type() == HV_ISOLATION_TYPE_SNP) {
+++<<<<<<< HEAD
+ +			static_branch_enable(&isolation_type_snp);
+ +#ifdef CONFIG_SWIOTLB
+ +			swiotlb_unencrypted_base = ms_hyperv.shared_gpa_boundary;
+ +#endif
+ +		}
+ +		/* Isolation VMs are unenlightened SEV-based VMs, thus this check: */
+ +		if (IS_ENABLED(CONFIG_AMD_MEM_ENCRYPT)) {
+ +			if (hv_get_isolation_type() != HV_ISOLATION_TYPE_NONE)
+ +				cc_set_vendor(CC_VENDOR_HYPERV);
+++=======
++ 			if (ms_hyperv.paravisor_present)
++ 				static_branch_enable(&isolation_type_snp);
++ 			else
++ 				static_branch_enable(&isolation_type_en_snp);
++ 		} else if (hv_get_isolation_type() == HV_ISOLATION_TYPE_TDX) {
++ 			static_branch_enable(&isolation_type_tdx);
++ 
++ 			/* A TDX VM must use x2APIC and doesn't use lazy EOI. */
++ 			ms_hyperv.hints &= ~HV_X64_APIC_ACCESS_RECOMMENDED;
++ 
++ 			if (!ms_hyperv.paravisor_present) {
++ 				/* To be supported: more work is required.  */
++ 				ms_hyperv.features &= ~HV_MSR_REFERENCE_TSC_AVAILABLE;
++ 
++ 				/* HV_REGISTER_CRASH_CTL is unsupported. */
++ 				ms_hyperv.misc_features &= ~HV_FEATURE_GUEST_CRASH_MSR_AVAILABLE;
++ 
++ 				/* Don't trust Hyper-V's TLB-flushing hypercalls. */
++ 				ms_hyperv.hints &= ~HV_X64_REMOTE_TLB_FLUSH_RECOMMENDED;
++ 			}
+++>>>>>>> 68f2f2bc163d (Drivers: hv: vmbus: Support fully enlightened TDX guests)
+  		}
+  	}
+  
+diff --cc drivers/hv/hv.c
+index 54db91ae3c0d,d1064118a72f..000000000000
+--- a/drivers/hv/hv.c
++++ b/drivers/hv/hv.c
+@@@ -172,6 -127,35 +175,38 @@@ int hv_synic_alloc(void
+  				goto err;
+  			}
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		if (!ms_hyperv.paravisor_present &&
++ 		    (hv_isolation_type_en_snp() || hv_isolation_type_tdx())) {
++ 			ret = set_memory_decrypted((unsigned long)
++ 				hv_cpu->synic_message_page, 1);
++ 			if (ret) {
++ 				pr_err("Failed to decrypt SYNIC msg page: %d\n", ret);
++ 				hv_cpu->synic_message_page = NULL;
++ 
++ 				/*
++ 				 * Free the event page here so that hv_synic_free()
++ 				 * won't later try to re-encrypt it.
++ 				 */
++ 				free_page((unsigned long)hv_cpu->synic_event_page);
++ 				hv_cpu->synic_event_page = NULL;
++ 				goto err;
++ 			}
++ 
++ 			ret = set_memory_decrypted((unsigned long)
++ 				hv_cpu->synic_event_page, 1);
++ 			if (ret) {
++ 				pr_err("Failed to decrypt SYNIC event page: %d\n", ret);
++ 				hv_cpu->synic_event_page = NULL;
++ 				goto err;
++ 			}
++ 
++ 			memset(hv_cpu->synic_message_page, 0, PAGE_SIZE);
++ 			memset(hv_cpu->synic_event_page, 0, PAGE_SIZE);
++ 		}
+++>>>>>>> 68f2f2bc163d (Drivers: hv: vmbus: Support fully enlightened TDX guests)
+  	}
+  
+  	return 0;
+@@@ -192,6 -177,28 +227,31 @@@ void hv_synic_free(void
+  		struct hv_per_cpu_context *hv_cpu
+  			= per_cpu_ptr(hv_context.cpu_context, cpu);
+  
+++<<<<<<< HEAD
+++=======
++ 		/* It's better to leak the page if the encryption fails. */
++ 		if (!ms_hyperv.paravisor_present &&
++ 		    (hv_isolation_type_en_snp() || hv_isolation_type_tdx())) {
++ 			if (hv_cpu->synic_message_page) {
++ 				ret = set_memory_encrypted((unsigned long)
++ 					hv_cpu->synic_message_page, 1);
++ 				if (ret) {
++ 					pr_err("Failed to encrypt SYNIC msg page: %d\n", ret);
++ 					hv_cpu->synic_message_page = NULL;
++ 				}
++ 			}
++ 
++ 			if (hv_cpu->synic_event_page) {
++ 				ret = set_memory_encrypted((unsigned long)
++ 					hv_cpu->synic_event_page, 1);
++ 				if (ret) {
++ 					pr_err("Failed to encrypt SYNIC event page: %d\n", ret);
++ 					hv_cpu->synic_event_page = NULL;
++ 				}
++ 			}
++ 		}
++ 
+++>>>>>>> 68f2f2bc163d (Drivers: hv: vmbus: Support fully enlightened TDX guests)
+  		free_page((unsigned long)hv_cpu->synic_event_page);
+  		free_page((unsigned long)hv_cpu->synic_message_page);
+  	}
+diff --git a/arch/x86/hyperv/hv_apic.c b/arch/x86/hyperv/hv_apic.c
+index fb8b2c088681..b1a374187eeb 100644
+--- a/arch/x86/hyperv/hv_apic.c
++++ b/arch/x86/hyperv/hv_apic.c
+@@ -173,8 +173,11 @@ static bool __send_ipi_mask(const struct cpumask *mask, int vector,
+ 	    (exclude_self && weight == 1 && cpumask_test_cpu(this_cpu, mask)))
+ 		return true;
+ 
+-	if (!hv_hypercall_pg)
+-		return false;
++	/* A fully enlightened TDX VM uses GHCI rather than hv_hypercall_pg. */
++	if (!hv_hypercall_pg) {
++		if (ms_hyperv.paravisor_present || !hv_isolation_type_tdx())
++			return false;
++	}
+ 
+ 	if ((vector < HV_IPI_LOW_VECTOR) || (vector > HV_IPI_HIGH_VECTOR))
+ 		return false;
+@@ -227,9 +230,15 @@ static bool __send_ipi_one(int cpu, int vector)
+ 
+ 	trace_hyperv_send_ipi_one(cpu, vector);
+ 
+-	if (!hv_hypercall_pg || (vp == VP_INVAL))
++	if (vp == VP_INVAL)
+ 		return false;
+ 
++	/* A fully enlightened TDX VM uses GHCI rather than hv_hypercall_pg. */
++	if (!hv_hypercall_pg) {
++		if (ms_hyperv.paravisor_present || !hv_isolation_type_tdx())
++			return false;
++	}
++
+ 	if ((vector < HV_IPI_LOW_VECTOR) || (vector > HV_IPI_HIGH_VECTOR))
+ 		return false;
+ 
+diff --git a/arch/x86/hyperv/hv_init.c b/arch/x86/hyperv/hv_init.c
+index 1d0a26104d0f..4152af40840d 100644
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@ -89,7 +89,7 @@ static int hyperv_init_ghcb(void)
+ static int hv_cpu_init(unsigned int cpu)
+ {
+ 	union hv_vp_assist_msr_contents msr = { 0 };
+-	struct hv_vp_assist_page **hvp = &hv_vp_assist_page[cpu];
++	struct hv_vp_assist_page **hvp;
+ 	int ret;
+ 
+ 	ret = hv_common_cpu_init(cpu);
+@@ -99,6 +99,7 @@ static int hv_cpu_init(unsigned int cpu)
+ 	if (!hv_vp_assist_page)
+ 		return 0;
+ 
++	hvp = &hv_vp_assist_page[cpu];
+ 	if (hv_root_partition) {
+ 		/*
+ 		 * For root partition we get the hypervisor provided VP assist
+@@ -412,11 +413,21 @@ void __init hyperv_init(void)
+ 	if (hv_common_init())
+ 		return;
+ 
+-	hv_vp_assist_page = kcalloc(num_possible_cpus(),
+-				    sizeof(*hv_vp_assist_page), GFP_KERNEL);
++	/*
++	 * The VP assist page is useless to a TDX guest: the only use we
++	 * would have for it is lazy EOI, which can not be used with TDX.
++	 */
++	if (hv_isolation_type_tdx())
++		hv_vp_assist_page = NULL;
++	else
++		hv_vp_assist_page = kcalloc(num_possible_cpus(),
++					    sizeof(*hv_vp_assist_page),
++					    GFP_KERNEL);
+ 	if (!hv_vp_assist_page) {
+ 		ms_hyperv.hints &= ~HV_X64_ENLIGHTENED_VMCS_RECOMMENDED;
+-		goto common_free;
++
++		if (!hv_isolation_type_tdx())
++			goto common_free;
+ 	}
+ 
+ 	if (hv_isolation_type_snp()) {
+* Unmerged path arch/x86/kernel/cpu/mshyperv.c
+* Unmerged path drivers/hv/hv.c
