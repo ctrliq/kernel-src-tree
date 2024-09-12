@@ -1,0 +1,158 @@
+md: fix regression for null-ptr-deference in __md_stop()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-486.el8
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit 433279beba1d4872da10b7b60a539e0cb828b32b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-486.el8/433279be.failed
+
+Commit 3e453522593d ("md: Free resources in __md_stop") tried to fix
+null-ptr-deference for 'active_io' by moving percpu_ref_exit() to
+__md_stop(), however, the commit also moving 'writes_pending' to
+__md_stop(), and this will cause mdadm tests broken:
+
+BUG: kernel NULL pointer dereference, address: 0000000000000038
+Oops: 0000 [#1] PREEMPT SMP
+CPU: 15 PID: 17830 Comm: mdadm Not tainted 6.3.0-rc3-next-20230324-00009-g520d37
+RIP: 0010:free_percpu+0x465/0x670
+Call Trace:
+ <TASK>
+ __percpu_ref_exit+0x48/0x70
+ percpu_ref_exit+0x1a/0x90
+ __md_stop+0xe9/0x170
+ do_md_stop+0x1e1/0x7b0
+ md_ioctl+0x90c/0x1aa0
+ blkdev_ioctl+0x19b/0x400
+ vfs_ioctl+0x20/0x50
+ __x64_sys_ioctl+0xba/0xe0
+ do_syscall_64+0x6c/0xe0
+ entry_SYSCALL_64_after_hwframe+0x63/0xcd
+
+And the problem can be reporduced 100% by following test:
+
+mdadm -CR /dev/md0 -l1 -n1 /dev/sda --force
+echo inactive > /sys/block/md0/md/array_state
+echo read-auto  > /sys/block/md0/md/array_state
+echo inactive > /sys/block/md0/md/array_state
+
+Root cause:
+
+// start raid
+raid1_run
+ mddev_init_writes_pending
+  percpu_ref_init
+
+// inactive raid
+array_state_store
+ do_md_stop
+  __md_stop
+   percpu_ref_exit
+
+// start raid again
+array_state_store
+ do_md_run
+  raid1_run
+   mddev_init_writes_pending
+    if (mddev->writes_pending.percpu_count_ptr)
+    // won't reinit
+
+// inactive raid again
+...
+percpu_ref_exit
+-> null-ptr-deference
+
+Before the commit, 'writes_pending' is exited when mddev is freed, and
+it's safe to restart raid because mddev_init_writes_pending() already make
+sure that 'writes_pending' will only be initialized once.
+
+Fix the prblem by moving 'writes_pending' back, it's a litter hard to find
+the relationship between alloc memory and free memory, however, code
+changes is much less and we lived with this for a long time already.
+
+Fixes: 3e453522593d ("md: Free resources in __md_stop")
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+	Reviewed-by: Xiao Ni <xni@redhat.com>
+	Signed-off-by: Song Liu <song@kernel.org>
+Link: https://lore.kernel.org/r/20230328094400.1448955-1-yukuai1@huaweicloud.com
+(cherry picked from commit 433279beba1d4872da10b7b60a539e0cb828b32b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index dbb31f773d19,13321dbb5fbc..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -6351,6 -6259,10 +6351,13 @@@ static void __md_stop(struct mddev *mdd
+  		mddev->to_remove = &md_redundancy_group;
+  	module_put(pers->owner);
+  	clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+++<<<<<<< HEAD
+++=======
++ 
++ 	percpu_ref_exit(&mddev->active_io);
++ 	bioset_exit(&mddev->bio_set);
++ 	bioset_exit(&mddev->sync_set);
+++>>>>>>> 433279beba1d (md: fix regression for null-ptr-deference in __md_stop())
+  }
+  
+  void md_stop(struct mddev *mddev)
+@@@ -6360,8 -6272,7 +6367,12 @@@
+  	 */
+  	__md_stop_writes(mddev);
+  	__md_stop(mddev);
+++<<<<<<< HEAD
+ +	bioset_exit(&mddev->bio_set);
+ +	bioset_exit(&mddev->sync_set);
+++=======
++ 	percpu_ref_exit(&mddev->writes_pending);
+++>>>>>>> 433279beba1d (md: fix regression for null-ptr-deference in __md_stop())
+  }
+  
+  EXPORT_SYMBOL_GPL(md_stop);
+@@@ -7942,23 -7828,29 +7953,36 @@@ static void md_release(struct gendisk *
+  	mddev_put(mddev);
+  }
+  
+ -static unsigned int md_check_events(struct gendisk *disk, unsigned int clearing)
+ +static int md_media_changed(struct gendisk *disk)
+ +{
+ +	struct mddev *mddev = disk->private_data;
+ +
+ +	return mddev->changed;
+ +}
+ +
+ +static int md_revalidate(struct gendisk *disk)
+  {
+  	struct mddev *mddev = disk->private_data;
+ -	unsigned int ret = 0;
+  
+ -	if (mddev->changed)
+ -		ret = DISK_EVENT_MEDIA_CHANGE;
+  	mddev->changed = 0;
+ -	return ret;
+ +	return 0;
+  }
+++<<<<<<< HEAD
+ +static const struct block_device_operations md_fops =
+++=======
++ 
++ static void md_free_disk(struct gendisk *disk)
++ {
++ 	struct mddev *mddev = disk->private_data;
++ 
++ 	percpu_ref_exit(&mddev->writes_pending);
++ 	mddev_free(mddev);
++ }
++ 
++ const struct block_device_operations md_fops =
+++>>>>>>> 433279beba1d (md: fix regression for null-ptr-deference in __md_stop())
+  {
+  	.owner		= THIS_MODULE,
+ -	.submit_bio	= md_submit_bio,
+  	.open		= md_open,
+  	.release	= md_release,
+  	.ioctl		= md_ioctl,
+* Unmerged path drivers/md/md.c
