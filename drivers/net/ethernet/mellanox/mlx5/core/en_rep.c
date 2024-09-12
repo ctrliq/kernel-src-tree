@@ -190,7 +190,7 @@ static MLX5E_DECLARE_STATS_GRP_OP_UPDATE_STATS(vport_rep)
 	if (err) {
 		netdev_warn(priv->netdev, "vport %d error %d reading stats\n",
 			    rep->vport, err);
-		return;
+		goto out;
 	}
 
 	#define MLX5_GET_CTR(p, x) \
@@ -240,6 +240,7 @@ static MLX5E_DECLARE_STATS_GRP_OP_UPDATE_STATS(vport_rep)
 	rep_stats->tx_vport_rdma_multicast_bytes =
 		MLX5_GET_CTR(out, received_ib_multicast.octets);
 
+out:
 	kvfree(out);
 }
 
