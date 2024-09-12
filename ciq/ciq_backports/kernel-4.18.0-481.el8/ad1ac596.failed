@@ -1,0 +1,152 @@
+mm/migration: fix potential pte_unmap on an not mapped pte
+
+jira LE-1907
+cve CVE-2022-3623
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Miaohe Lin <linmiaohe@huawei.com>
+commit ad1ac596e8a8c4b06715dfbd89853eb73c9886b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/ad1ac596.failed
+
+__migration_entry_wait and migration_entry_wait_on_locked assume pte is
+always mapped from caller.  But this is not the case when it's called from
+migration_entry_wait_huge and follow_huge_pmd.  Add a hugetlbfs variant
+that calls hugetlb_migration_entry_wait(ptep == NULL) to fix this issue.
+
+Link: https://lkml.kernel.org/r/20220530113016.16663-5-linmiaohe@huawei.com
+Fixes: 30dad30922cc ("mm: migration: add migrate_entry_wait_huge()")
+	Signed-off-by: Miaohe Lin <linmiaohe@huawei.com>
+	Suggested-by: David Hildenbrand <david@redhat.com>
+	Reviewed-by: David Hildenbrand <david@redhat.com>
+	Cc: Alistair Popple <apopple@nvidia.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: David Howells <dhowells@redhat.com>
+	Cc: Huang Ying <ying.huang@intel.com>
+	Cc: kernel test robot <lkp@intel.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Muchun Song <songmuchun@bytedance.com>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: Peter Xu <peterx@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit ad1ac596e8a8c4b06715dfbd89853eb73c9886b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/swapops.h
+diff --cc include/linux/swapops.h
+index fdddb68033e4,bb7afd03a324..000000000000
+--- a/include/linux/swapops.h
++++ b/include/linux/swapops.h
+@@@ -178,11 -244,26 +178,13 @@@ extern void __migration_entry_wait(stru
+  					spinlock_t *ptl);
+  extern void migration_entry_wait(struct mm_struct *mm, pmd_t *pmd,
+  					unsigned long address);
+- extern void migration_entry_wait_huge(struct vm_area_struct *vma,
+- 		struct mm_struct *mm, pte_t *pte);
++ #ifdef CONFIG_HUGETLB_PAGE
++ extern void __migration_entry_wait_huge(pte_t *ptep, spinlock_t *ptl);
++ extern void migration_entry_wait_huge(struct vm_area_struct *vma, pte_t *pte);
++ #endif
+  #else
+ -static inline swp_entry_t make_readable_migration_entry(pgoff_t offset)
+ -{
+ -	return swp_entry(0, 0);
+ -}
+ -
+ -static inline swp_entry_t make_readable_exclusive_migration_entry(pgoff_t offset)
+ -{
+ -	return swp_entry(0, 0);
+ -}
+ -
+ -static inline swp_entry_t make_writable_migration_entry(pgoff_t offset)
+ -{
+ -	return swp_entry(0, 0);
+ -}
+  
+ +#define make_migration_entry(page, write) swp_entry(0, 0)
+  static inline int is_migration_entry(swp_entry_t swp)
+  {
+  	return 0;
+@@@ -193,9 -273,15 +195,21 @@@ static inline void __migration_entry_wa
+  					spinlock_t *ptl) { }
+  static inline void migration_entry_wait(struct mm_struct *mm, pmd_t *pmd,
+  					 unsigned long address) { }
+++<<<<<<< HEAD
+ +static inline void migration_entry_wait_huge(struct vm_area_struct *vma,
+ +		struct mm_struct *mm, pte_t *pte) { }
+ +static inline int is_write_migration_entry(swp_entry_t entry)
+++=======
++ #ifdef CONFIG_HUGETLB_PAGE
++ static inline void __migration_entry_wait_huge(pte_t *ptep, spinlock_t *ptl) { }
++ static inline void migration_entry_wait_huge(struct vm_area_struct *vma, pte_t *pte) { }
++ #endif
++ static inline int is_writable_migration_entry(swp_entry_t entry)
++ {
++ 	return 0;
++ }
++ static inline int is_readable_migration_entry(swp_entry_t entry)
+++>>>>>>> ad1ac596e8a8 (mm/migration: fix potential pte_unmap on an not mapped pte)
+  {
+  	return 0;
+  }
+* Unmerged path include/linux/swapops.h
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 8ea00c3bd45c..f0ebbcded3e5 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -4637,7 +4637,7 @@ vm_fault_t hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		 */
+ 		entry = huge_ptep_get(ptep);
+ 		if (unlikely(is_hugetlb_entry_migration(entry))) {
+-			migration_entry_wait_huge(vma, mm, ptep);
++			migration_entry_wait_huge(vma, ptep);
+ 			return 0;
+ 		} else if (unlikely(is_hugetlb_entry_hwpoisoned(entry)))
+ 			return VM_FAULT_HWPOISON_LARGE |
+@@ -5720,7 +5720,7 @@ follow_huge_pmd(struct mm_struct *mm, unsigned long address,
+ 	} else {
+ 		if (is_hugetlb_entry_migration(pte)) {
+ 			spin_unlock(ptl);
+-			__migration_entry_wait(mm, (pte_t *)pmd, ptl);
++			__migration_entry_wait_huge((pte_t *)pmd, ptl);
+ 			goto retry;
+ 		}
+ 		/*
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 2523c4bf4b93..8c79ec81209b 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -350,12 +350,27 @@ void migration_entry_wait(struct mm_struct *mm, pmd_t *pmd,
+ 	__migration_entry_wait(mm, ptep, ptl);
+ }
+ 
+-void migration_entry_wait_huge(struct vm_area_struct *vma,
+-		struct mm_struct *mm, pte_t *pte)
++#ifdef CONFIG_HUGETLB_PAGE
++void __migration_entry_wait_huge(pte_t *ptep, spinlock_t *ptl)
++{
++	pte_t pte;
++
++	spin_lock(ptl);
++	pte = huge_ptep_get(ptep);
++
++	if (unlikely(!is_hugetlb_entry_migration(pte)))
++		spin_unlock(ptl);
++	else
++		migration_entry_wait_on_locked(pte_to_swp_entry(pte), NULL, ptl);
++}
++
++void migration_entry_wait_huge(struct vm_area_struct *vma, pte_t *pte)
+ {
+-	spinlock_t *ptl = huge_pte_lockptr(hstate_vma(vma), mm, pte);
+-	__migration_entry_wait(mm, pte, ptl);
++	spinlock_t *ptl = huge_pte_lockptr(hstate_vma(vma), vma->vm_mm, pte);
++
++	__migration_entry_wait_huge(pte, ptl);
+ }
++#endif
+ 
+ #ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
+ void pmd_migration_entry_wait(struct mm_struct *mm, pmd_t *pmd)
