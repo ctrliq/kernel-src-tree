@@ -1,0 +1,482 @@
+net/ism: Add new API for client registration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Stefan Raspl <raspl@linux.ibm.com>
+commit 89e7d2ba61b742a7525ff06ea4d4378c4a5560d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/89e7d2ba.failed
+
+Add a new API that allows other drivers to concurrently access ISM devices.
+To do so, we introduce a new API that allows other modules to register for
+ISM device usage. Furthermore, we move the GID to struct ism, where it
+belongs conceptually, and rename and relocate struct smcd_event to struct
+ism_event.
+This is the first part of a bigger overhaul of the interfaces between SMC
+and ISM.
+
+	Signed-off-by: Stefan Raspl <raspl@linux.ibm.com>
+	Signed-off-by: Jan Karcher <jaka@linux.ibm.com>
+	Signed-off-by: Wenjia Zhang <wenjia@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 89e7d2ba61b742a7525ff06ea4d4378c4a5560d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/smc.h
+diff --cc include/net/smc.h
+index 421a7197b475,98689b16b841..000000000000
+--- a/include/net/smc.h
++++ b/include/net/smc.h
+@@@ -11,6 -11,14 +11,17 @@@
+  #ifndef _SMC_H
+  #define _SMC_H
+  
+++<<<<<<< HEAD
+++=======
++ #include <linux/device.h>
++ #include <linux/spinlock.h>
++ #include <linux/types.h>
++ #include <linux/wait.h>
++ #include "linux/ism.h"
++ 
++ struct sock;
++ 
+++>>>>>>> 89e7d2ba61b7 (net/ism: Add new API for client registration)
+  #define SMC_MAX_PNETID_LEN	16	/* Max. length of PNET id */
+  
+  struct smc_hashinfo {
+diff --git a/drivers/s390/net/ism.h b/drivers/s390/net/ism.h
+index 90af51370183..70c5bbda0fea 100644
+--- a/drivers/s390/net/ism.h
++++ b/drivers/s390/net/ism.h
+@@ -16,7 +16,6 @@
+  */
+ #define ISM_DMB_WORD_OFFSET	1
+ #define ISM_DMB_BIT_OFFSET	(ISM_DMB_WORD_OFFSET * 32)
+-#define ISM_NR_DMBS		1920
+ #define ISM_IDENT_MASK		0x00FFFF
+ 
+ #define ISM_REG_SBA	0x1
+@@ -178,7 +177,7 @@ struct ism_eq_header {
+ 
+ struct ism_eq {
+ 	struct ism_eq_header header;
+-	struct smcd_event entry[15];
++	struct ism_event entry[15];
+ };
+ 
+ struct ism_sba {
+@@ -190,21 +189,6 @@ struct ism_sba {
+ 	u16 dmbe_mask[ISM_NR_DMBS];
+ };
+ 
+-struct ism_dev {
+-	spinlock_t lock;
+-	struct pci_dev *pdev;
+-	struct smcd_dev *smcd;
+-
+-	struct ism_sba *sba;
+-	dma_addr_t sba_dma_addr;
+-	DECLARE_BITMAP(sba_bitmap, ISM_NR_DMBS);
+-
+-	struct ism_eq *ieq;
+-	dma_addr_t ieq_dma_addr;
+-
+-	int ieq_idx;
+-};
+-
+ #define ISM_CREATE_REQ(dmb, idx, sf, offset)		\
+ 	((dmb) | (idx) << 24 | (sf) << 23 | (offset))
+ 
+diff --git a/drivers/s390/net/ism_drv.c b/drivers/s390/net/ism_drv.c
+index f8a04d468283..068fb9533f94 100644
+--- a/drivers/s390/net/ism_drv.c
++++ b/drivers/s390/net/ism_drv.c
+@@ -15,9 +15,6 @@
+ #include <linux/err.h>
+ #include <linux/ctype.h>
+ #include <linux/processor.h>
+-#include <net/smc.h>
+-
+-#include <asm/debug.h>
+ 
+ #include "ism.h"
+ 
+@@ -34,6 +31,84 @@ static const struct pci_device_id ism_device_table[] = {
+ MODULE_DEVICE_TABLE(pci, ism_device_table);
+ 
+ static debug_info_t *ism_debug_info;
++static const struct smcd_ops ism_ops;
++
++#define NO_CLIENT		0xff		/* must be >= MAX_CLIENTS */
++static struct ism_client *clients[MAX_CLIENTS];	/* use an array rather than */
++						/* a list for fast mapping  */
++static u8 max_client;
++static DEFINE_SPINLOCK(clients_lock);
++struct ism_dev_list {
++	struct list_head list;
++	struct mutex mutex; /* protects ism device list */
++};
++
++static struct ism_dev_list ism_dev_list = {
++	.list = LIST_HEAD_INIT(ism_dev_list.list),
++	.mutex = __MUTEX_INITIALIZER(ism_dev_list.mutex),
++};
++
++int ism_register_client(struct ism_client *client)
++{
++	struct ism_dev *ism;
++	unsigned long flags;
++	int i, rc = -ENOSPC;
++
++	mutex_lock(&ism_dev_list.mutex);
++	spin_lock_irqsave(&clients_lock, flags);
++	for (i = 0; i < MAX_CLIENTS; ++i) {
++		if (!clients[i]) {
++			clients[i] = client;
++			client->id = i;
++			if (i == max_client)
++				max_client++;
++			rc = 0;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&clients_lock, flags);
++	if (i < MAX_CLIENTS) {
++		/* initialize with all devices that we got so far */
++		list_for_each_entry(ism, &ism_dev_list.list, list) {
++			ism->priv[i] = NULL;
++			client->add(ism);
++		}
++	}
++	mutex_unlock(&ism_dev_list.mutex);
++
++	return rc;
++}
++EXPORT_SYMBOL_GPL(ism_register_client);
++
++int ism_unregister_client(struct ism_client *client)
++{
++	struct ism_dev *ism;
++	unsigned long flags;
++	int rc = 0;
++
++	mutex_lock(&ism_dev_list.mutex);
++	spin_lock_irqsave(&clients_lock, flags);
++	clients[client->id] = NULL;
++	if (client->id + 1 == max_client)
++		max_client--;
++	spin_unlock_irqrestore(&clients_lock, flags);
++	list_for_each_entry(ism, &ism_dev_list.list, list) {
++		for (int i = 0; i < ISM_NR_DMBS; ++i) {
++			if (ism->sba_client_arr[i] == client->id) {
++				pr_err("%s: attempt to unregister client '%s'"
++				       "with registered dmb(s)\n", __func__,
++				       client->name);
++				rc = -EBUSY;
++				goto out;
++			}
++		}
++	}
++out:
++	mutex_unlock(&ism_dev_list.mutex);
++
++	return rc;
++}
++EXPORT_SYMBOL_GPL(ism_unregister_client);
+ 
+ static int ism_cmd(struct ism_dev *ism, void *cmd)
+ {
+@@ -193,7 +268,7 @@ static int ism_read_local_gid(struct ism_dev *ism)
+ 	if (ret)
+ 		goto out;
+ 
+-	ism->smcd->local_gid = cmd.response.gid;
++	ism->local_gid = cmd.response.gid;
+ out:
+ 	return ret;
+ }
+@@ -437,7 +512,8 @@ static u16 ism_get_chid(struct smcd_dev *smcd)
+ 
+ static void ism_handle_event(struct ism_dev *ism)
+ {
+-	struct smcd_event *entry;
++	struct ism_event *entry;
++	int i;
+ 
+ 	while ((ism->ieq_idx + 1) != READ_ONCE(ism->ieq->header.idx)) {
+ 		if (++(ism->ieq_idx) == ARRAY_SIZE(ism->ieq->entry))
+@@ -445,13 +521,18 @@ static void ism_handle_event(struct ism_dev *ism)
+ 
+ 		entry = &ism->ieq->entry[ism->ieq_idx];
+ 		debug_event(ism_debug_info, 2, entry, sizeof(*entry));
+-		smcd_handle_event(ism->smcd, entry);
++		spin_lock(&clients_lock);
++		for (i = 0; i < max_client; ++i)
++			if (clients[i])
++				clients[i]->handle_event(ism, entry);
++		spin_unlock(&clients_lock);
+ 	}
+ }
+ 
+ static irqreturn_t ism_handle_irq(int irq, void *data)
+ {
+ 	struct ism_dev *ism = data;
++	struct ism_client *clt;
+ 	unsigned long bit, end;
+ 	unsigned long *bv;
+ 	u16 dmbemask;
+@@ -471,7 +552,8 @@ static irqreturn_t ism_handle_irq(int irq, void *data)
+ 		dmbemask = ism->sba->dmbe_mask[bit + ISM_DMB_BIT_OFFSET];
+ 		ism->sba->dmbe_mask[bit + ISM_DMB_BIT_OFFSET] = 0;
+ 		barrier();
+-		smcd_handle_irq(ism->smcd, bit + ISM_DMB_BIT_OFFSET, dmbemask);
++		clt = clients[ism->sba_client_arr[bit]];
++		clt->handle_irq(ism, bit + ISM_DMB_BIT_OFFSET, dmbemask);
+ 	}
+ 
+ 	if (ism->sba->e) {
+@@ -497,10 +579,21 @@ static const struct smcd_ops ism_ops = {
+ 	.get_chid = ism_get_chid,
+ };
+ 
++static void ism_dev_add_work_func(struct work_struct *work)
++{
++	struct ism_client *client = container_of(work, struct ism_client,
++						 add_work);
++
++	client->add(client->tgt_ism);
++	atomic_dec(&client->tgt_ism->add_dev_cnt);
++	wake_up(&client->tgt_ism->waitq);
++}
++
+ static int ism_dev_init(struct ism_dev *ism)
+ {
+ 	struct pci_dev *pdev = ism->pdev;
+-	int ret;
++	unsigned long flags;
++	int i, ret;
+ 
+ 	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
+ 	if (ret <= 0)
+@@ -527,6 +620,28 @@ static int ism_dev_init(struct ism_dev *ism)
+ 		/* hardware is V2 capable */
+ 		ism_create_system_eid();
+ 
++	init_waitqueue_head(&ism->waitq);
++	atomic_set(&ism->free_clients_cnt, 0);
++	atomic_set(&ism->add_dev_cnt, 0);
++
++	wait_event(ism->waitq, !atomic_read(&ism->add_dev_cnt));
++	spin_lock_irqsave(&clients_lock, flags);
++	for (i = 0; i < max_client; ++i)
++		if (clients[i]) {
++			INIT_WORK(&clients[i]->add_work,
++				  ism_dev_add_work_func);
++			clients[i]->tgt_ism = ism;
++			atomic_inc(&ism->add_dev_cnt);
++			schedule_work(&clients[i]->add_work);
++		}
++	spin_unlock_irqrestore(&clients_lock, flags);
++
++	wait_event(ism->waitq, !atomic_read(&ism->add_dev_cnt));
++
++	mutex_lock(&ism_dev_list.mutex);
++	list_add(&ism->list, &ism_dev_list.list);
++	mutex_unlock(&ism_dev_list.mutex);
++
+ 	ret = smcd_register_dev(ism->smcd);
+ 	if (ret)
+ 		goto unreg_ieq;
+@@ -602,9 +717,36 @@ static int ism_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	return ret;
+ }
+ 
++static void ism_dev_remove_work_func(struct work_struct *work)
++{
++	struct ism_client *client = container_of(work, struct ism_client,
++						 remove_work);
++
++	client->remove(client->tgt_ism);
++	atomic_dec(&client->tgt_ism->free_clients_cnt);
++	wake_up(&client->tgt_ism->waitq);
++}
++
++/* Callers must hold ism_dev_list.mutex */
+ static void ism_dev_exit(struct ism_dev *ism)
+ {
+ 	struct pci_dev *pdev = ism->pdev;
++	unsigned long flags;
++	int i;
++
++	wait_event(ism->waitq, !atomic_read(&ism->free_clients_cnt));
++	spin_lock_irqsave(&clients_lock, flags);
++	for (i = 0; i < max_client; ++i)
++		if (clients[i]) {
++			INIT_WORK(&clients[i]->remove_work,
++				  ism_dev_remove_work_func);
++			clients[i]->tgt_ism = ism;
++			atomic_inc(&ism->free_clients_cnt);
++			schedule_work(&clients[i]->remove_work);
++		}
++	spin_unlock_irqrestore(&clients_lock, flags);
++
++	wait_event(ism->waitq, !atomic_read(&ism->free_clients_cnt));
+ 
+ 	smcd_unregister_dev(ism->smcd);
+ 	if (SYSTEM_EID.serial_number[0] != '0' ||
+@@ -614,18 +756,22 @@ static void ism_dev_exit(struct ism_dev *ism)
+ 	unregister_sba(ism);
+ 	free_irq(pci_irq_vector(pdev, 0), ism);
+ 	pci_free_irq_vectors(pdev);
++	list_del_init(&ism->list);
+ }
+ 
+ static void ism_remove(struct pci_dev *pdev)
+ {
+ 	struct ism_dev *ism = dev_get_drvdata(&pdev->dev);
+ 
++	mutex_lock(&ism_dev_list.mutex);
+ 	ism_dev_exit(ism);
++	mutex_unlock(&ism_dev_list.mutex);
+ 
+ 	smcd_free_dev(ism->smcd);
+ 	pci_clear_master(pdev);
+ 	pci_release_mem_regions(pdev);
+ 	pci_disable_device(pdev);
++	device_del(&ism->dev);
+ 	dev_set_drvdata(&pdev->dev, NULL);
+ 	kfree(ism);
+ }
+@@ -665,6 +811,8 @@ static int __init ism_init(void)
+ 	if (!ism_debug_info)
+ 		return -ENODEV;
+ 
++	memset(clients, 0, sizeof(clients));
++	max_client = 0;
+ 	debug_register_view(ism_debug_info, &debug_hex_ascii_view);
+ 	ret = pci_register_driver(&ism_driver);
+ 	if (ret)
+@@ -675,6 +823,14 @@ static int __init ism_init(void)
+ 
+ static void __exit ism_exit(void)
+ {
++	struct ism_dev *ism;
++
++	mutex_lock(&ism_dev_list.mutex);
++	list_for_each_entry(ism, &ism_dev_list.list, list) {
++		ism_dev_exit(ism);
++	}
++	mutex_unlock(&ism_dev_list.mutex);
++
+ 	pci_unregister_driver(&ism_driver);
+ 	debug_unregister(ism_debug_info);
+ }
+diff --git a/include/linux/ism.h b/include/linux/ism.h
+index 69bfbf0faaa1..55c8ad306928 100644
+--- a/include/linux/ism.h
++++ b/include/linux/ism.h
+@@ -9,6 +9,8 @@
+ #ifndef _ISM_H
+ #define _ISM_H
+ 
++#include <linux/workqueue.h>
++
+ struct ism_dmb {
+ 	u64 dmb_tok;
+ 	u64 rgid;
+@@ -20,4 +22,69 @@ struct ism_dmb {
+ 	dma_addr_t dma_addr;
+ };
+ 
++/* Unless we gain unexpected popularity, this limit should hold for a while */
++#define MAX_CLIENTS		8
++#define ISM_NR_DMBS		1920
++
++struct ism_dev {
++	spinlock_t lock; /* protects the ism device */
++	struct list_head list;
++	struct pci_dev *pdev;
++	struct smcd_dev *smcd;
++
++	struct ism_sba *sba;
++	dma_addr_t sba_dma_addr;
++	DECLARE_BITMAP(sba_bitmap, ISM_NR_DMBS);
++	u8 *sba_client_arr;	/* entries are indices into 'clients' array */
++	void *priv[MAX_CLIENTS];
++
++	struct ism_eq *ieq;
++	dma_addr_t ieq_dma_addr;
++
++	struct device dev;
++	u64 local_gid;
++	int ieq_idx;
++
++	atomic_t free_clients_cnt;
++	atomic_t add_dev_cnt;
++	wait_queue_head_t waitq;
++};
++
++struct ism_event {
++	u32 type;
++	u32 code;
++	u64 tok;
++	u64 time;
++	u64 info;
++};
++
++struct ism_client {
++	const char *name;
++	void (*add)(struct ism_dev *dev);
++	void (*remove)(struct ism_dev *dev);
++	void (*handle_event)(struct ism_dev *dev, struct ism_event *event);
++	/* Parameter dmbemask contains a bit vector with updated DMBEs, if sent
++	 * via ism_move_data(). Callback function must handle all active bits
++	 * indicated by dmbemask.
++	 */
++	void (*handle_irq)(struct ism_dev *dev, unsigned int bit, u16 dmbemask);
++	/* Private area - don't touch! */
++	struct work_struct remove_work;
++	struct work_struct add_work;
++	struct ism_dev *tgt_ism;
++	u8 id;
++};
++
++int ism_register_client(struct ism_client *client);
++int  ism_unregister_client(struct ism_client *client);
++static inline void *ism_get_priv(struct ism_dev *dev,
++				 struct ism_client *client) {
++	return dev->priv[client->id];
++}
++
++static inline void ism_set_priv(struct ism_dev *dev, struct ism_client *client,
++				void *priv) {
++	dev->priv[client->id] = priv;
++}
++
+ #endif	/* _ISM_H */
+* Unmerged path include/net/smc.h
+diff --git a/net/smc/smc_ism.c b/net/smc/smc_ism.c
+index 71e38768fea2..39d3cf8cb221 100644
+--- a/net/smc/smc_ism.c
++++ b/net/smc/smc_ism.c
+@@ -295,7 +295,7 @@ int smcd_nl_get_device(struct sk_buff *skb, struct netlink_callback *cb)
+ struct smc_ism_event_work {
+ 	struct work_struct work;
+ 	struct smcd_dev *smcd;
+-	struct smcd_event event;
++	struct ism_event event;
+ };
+ 
+ #define ISM_EVENT_REQUEST		0x0001
+@@ -489,7 +489,7 @@ EXPORT_SYMBOL_GPL(smcd_free_dev);
+  * Context:
+  * - Function called in IRQ context from ISM device driver event handler.
+  */
+-void smcd_handle_event(struct smcd_dev *smcd, struct smcd_event *event)
++void smcd_handle_event(struct smcd_dev *smcd, struct ism_event *event)
+ {
+ 	struct smc_ism_event_work *wrk;
+ 
