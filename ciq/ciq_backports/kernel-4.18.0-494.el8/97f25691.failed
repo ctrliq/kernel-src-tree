@@ -1,0 +1,186 @@
+scsi: lpfc: Fix crash involving race between FLOGI timeout and devloss handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-494.el8
+commit-author Justin Tee <justin.tee@broadcom.com>
+commit 97f256913c5d8a633efe4f11d4ed2d6a3ea42635
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-494.el8/97f25691.failed
+
+When a FLOGI completes with a sequence timeout error, a freed kref ptr
+dereference crash can occur due to a timing race involving ndlp referencing
+in lpfc_dev_loss_tmo_callbk.
+
+Fix by ensuring the driver accounts for an outstanding FLOGI when dev_loss
+is active.  Also, don't remove the HBA_FLOGI_OUTSTANDING flag when the
+FLOGI is retried to allow the driver to handle the reference counts
+correctly in lpfc_dev_loss_tmo_handler.
+
+	Reported-by: Dietmar Hahn <dietmar.hahn@fujitsu.com>
+	Tested-by: Dietmar Hahn <dietmar.hahn@fujitsu.com>
+	Signed-off-by: Justin Tee <justin.tee@broadcom.com>
+Link: https://lore.kernel.org/r/20221116011921.105995-5-justintee8345@gmail.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 97f256913c5d8a633efe4f11d4ed2d6a3ea42635)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_els.c
+diff --cc drivers/scsi/lpfc/lpfc_els.c
+index 0d1a14a3209e,919741bbe267..000000000000
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@@ -1000,6 -951,8 +1000,11 @@@ lpfc_cmpl_els_flogi(struct lpfc_hba *ph
+  	struct serv_parm *sp;
+  	uint16_t fcf_index;
+  	int rc;
+++<<<<<<< HEAD
+++=======
++ 	u32 ulp_status, ulp_word4, tmo;
++ 	bool flogi_in_retry = false;
+++>>>>>>> 97f256913c5d (scsi: lpfc: Fix crash involving race between FLOGI timeout and devloss handler)
+  
+  	/* Check to see if link went down during discovery */
+  	if (lpfc_els_chk_latt(vport)) {
+@@@ -1057,13 -1019,27 +1062,28 @@@ stop_rr_fcf_flogi
+  			lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
+  					 "2858 FLOGI failure Status:x%x/x%x TMO"
+  					 ":x%x Data x%x x%x\n",
+ -					 ulp_status, ulp_word4, tmo,
+ -					 phba->hba_flag, phba->fcf.fcf_flag);
+ +					 irsp->ulpStatus, irsp->un.ulpWord[4],
+ +					 irsp->ulpTimeout, phba->hba_flag,
+ +					 phba->fcf.fcf_flag);
+  
+  		/* Check for retry */
+- 		if (lpfc_els_retry(phba, cmdiocb, rspiocb))
++ 		if (lpfc_els_retry(phba, cmdiocb, rspiocb)) {
++ 			/* Address a timing race with dev_loss.  If dev_loss
++ 			 * is active on this FPort node, put the initial ref
++ 			 * count back to stop premature node release actions.
++ 			 */
++ 			lpfc_check_nlp_post_devloss(vport, ndlp);
++ 			flogi_in_retry = true;
+  			goto out;
++ 		}
++ 
++ 		/* The FLOGI will not be retried.  If the FPort node is not
++ 		 * registered with the SCSI transport, remove the initial
++ 		 * reference to trigger node release.
++ 		 */
++ 		if (!(ndlp->nlp_flag & NLP_IN_DEV_LOSS) &&
++ 		    !(ndlp->fc4_xpt_flags & SCSI_XPT_REGD))
++ 			lpfc_nlp_put(ndlp);
+  
+  		lpfc_printf_vlog(vport, KERN_WARNING, LOG_TRACE_EVENT,
+  				 "0150 FLOGI failure Status:x%x/x%x "
+@@@ -1140,8 -1121,15 +1160,14 @@@
+  			 sp->cmn.priority_tagging, kref_read(&ndlp->kref));
+  
+  	if (sp->cmn.priority_tagging)
+ -		vport->phba->pport->vmid_flag |= (LPFC_VMID_ISSUE_QFPA |
+ -						  LPFC_VMID_TYPE_PRIO);
+ +		vport->vmid_flag |= LPFC_VMID_ISSUE_QFPA;
+  
++ 	/*
++ 	 * Address a timing race with dev_loss.  If dev_loss is active on
++ 	 * this FPort node, put the initial ref count back to stop premature
++ 	 * node release actions.
++ 	 */
++ 	lpfc_check_nlp_post_devloss(vport, ndlp);
+  	if (vport->port_state == LPFC_FLOGI) {
+  		/*
+  		 * If Common Service Parameters indicate Nport
+@@@ -1397,7 -1400,8 +1429,12 @@@ lpfc_issue_els_flogi(struct lpfc_vport 
+  		return 1;
+  	}
+  
+++<<<<<<< HEAD
+ +	phba->hba_flag |= (HBA_FLOGI_ISSUED | HBA_FLOGI_OUTSTANDING);
+++=======
++ 	/* Clear external loopback plug detected flag */
++ 	phba->link_flag &= ~LS_EXTERNAL_LOOPBACK;
+++>>>>>>> 97f256913c5d (scsi: lpfc: Fix crash involving race between FLOGI timeout and devloss handler)
+  
+  	/* Check for a deferred FLOGI ACC condition */
+  	if (phba->defer_flogi_acc_flag) {
+* Unmerged path drivers/scsi/lpfc/lpfc_els.c
+diff --git a/drivers/scsi/lpfc/lpfc_hbadisc.c b/drivers/scsi/lpfc/lpfc_hbadisc.c
+index f79f76706de4..e70e1edd5bee 100644
+--- a/drivers/scsi/lpfc/lpfc_hbadisc.c
++++ b/drivers/scsi/lpfc/lpfc_hbadisc.c
+@@ -426,10 +426,6 @@ lpfc_dev_loss_tmo_handler(struct lpfc_nodelist *ndlp)
+ 	name = (uint8_t *)&ndlp->nlp_portname;
+ 	phba = vport->phba;
+ 
+-	spin_lock_irqsave(&ndlp->lock, iflags);
+-	ndlp->nlp_flag &= ~NLP_IN_DEV_LOSS;
+-	spin_unlock_irqrestore(&ndlp->lock, iflags);
+-
+ 	if (phba->sli_rev == LPFC_SLI_REV4)
+ 		fcf_inuse = lpfc_fcf_inuse(phba);
+ 
+@@ -451,22 +447,36 @@ lpfc_dev_loss_tmo_handler(struct lpfc_nodelist *ndlp)
+ 				 *name, *(name+1), *(name+2), *(name+3),
+ 				 *(name+4), *(name+5), *(name+6), *(name+7),
+ 				 ndlp->nlp_DID);
++
++		spin_lock_irqsave(&ndlp->lock, iflags);
++		ndlp->nlp_flag &= ~NLP_IN_DEV_LOSS;
++		spin_unlock_irqrestore(&ndlp->lock, iflags);
+ 		return fcf_inuse;
+ 	}
+ 
+ 	/* Fabric nodes are done. */
+ 	if (ndlp->nlp_type & NLP_FABRIC) {
+ 		spin_lock_irqsave(&ndlp->lock, iflags);
+-		/* In massive vport configuration settings, it's possible
+-		 * dev_loss_tmo fired during node recovery.  So, check if
+-		 * fabric nodes are in discovery states outstanding.
++
++		/* In massive vport configuration settings or when the FLOGI
++		 * completes with a sequence timeout, it's possible
++		 * dev_loss_tmo fired during node recovery.  The driver has to
++		 * account for this race to allow for recovery and keep
++		 * the reference counting correct.
+ 		 */
+ 		switch (ndlp->nlp_DID) {
+ 		case Fabric_DID:
+ 			fc_vport = vport->fc_vport;
+-			if (fc_vport &&
+-			    fc_vport->vport_state == FC_VPORT_INITIALIZING)
+-				recovering = true;
++			if (fc_vport) {
++				/* NPIV path. */
++				if (fc_vport->vport_state ==
++				    FC_VPORT_INITIALIZING)
++					recovering = true;
++			} else {
++				/* Physical port path. */
++				if (phba->hba_flag & HBA_FLOGI_OUTSTANDING)
++					recovering = true;
++			}
+ 			break;
+ 		case Fabric_Cntl_DID:
+ 			if (ndlp->nlp_flag & NLP_REG_LOGIN_SEND)
+@@ -514,6 +524,9 @@ lpfc_dev_loss_tmo_handler(struct lpfc_nodelist *ndlp)
+ 			return fcf_inuse;
+ 		}
+ 
++		spin_lock_irqsave(&ndlp->lock, iflags);
++		ndlp->nlp_flag &= ~NLP_IN_DEV_LOSS;
++		spin_unlock_irqrestore(&ndlp->lock, iflags);
+ 		lpfc_nlp_put(ndlp);
+ 		return fcf_inuse;
+ 	}
+@@ -552,6 +565,9 @@ lpfc_dev_loss_tmo_handler(struct lpfc_nodelist *ndlp)
+ 		return fcf_inuse;
+ 	}
+ 
++	spin_lock_irqsave(&ndlp->lock, iflags);
++	ndlp->nlp_flag &= ~NLP_IN_DEV_LOSS;
++	spin_unlock_irqrestore(&ndlp->lock, iflags);
+ 	if (!(ndlp->fc4_xpt_flags & NVME_XPT_REGD))
+ 		lpfc_disc_state_machine(vport, ndlp, NULL, NLP_EVT_DEVICE_RM);
+ 
