@@ -2126,13 +2126,7 @@ ice_vc_send_msg_to_vf(struct ice_vf *vf, u32 v_opcode,
 	struct ice_pf *pf;
 	int aq_ret;
 
-	if (!vf)
-		return -EINVAL;
-
 	pf = vf->pf;
-	if (ice_validate_vf_id(pf, vf->vf_id))
-		return -EINVAL;
-
 	dev = ice_pf_to_dev(pf);
 
 	aq_ret = ice_aq_send_msg_to_vf(&pf->hw, vf->vf_id, v_opcode, v_retval,
