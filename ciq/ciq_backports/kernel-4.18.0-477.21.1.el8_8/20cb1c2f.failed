@@ -1,0 +1,117 @@
+blk-cgroup: Flush stats before releasing blkcg_gq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-477.21.1.el8_8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 20cb1c2fb7568a6054c55defe044311397e01ddb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-477.21.1.el8_8/20cb1c2f.failed
+
+As noted by Michal, the blkg_iostat_set's in the lockless list hold
+reference to blkg's to protect against their removal. Those blkg's
+hold reference to blkcg. When a cgroup is being destroyed,
+cgroup_rstat_flush() is only called at css_release_work_fn() which
+is called when the blkcg reference count reaches 0. This circular
+dependency will prevent blkcg and some blkgs from being freed after
+they are made offline.
+
+It is less a problem if the cgroup to be destroyed also has other
+controllers like memory that will call cgroup_rstat_flush() which will
+clean up the reference count. If block is the only controller that uses
+rstat, these offline blkcg and blkgs may never be freed leaking more
+and more memory over time.
+
+To prevent this potential memory leak:
+
+- flush blkcg per-cpu stats list in __blkg_release(), when no new stat
+can be added
+
+- add global blkg_stat_lock for covering concurrent parent blkg stat
+update
+
+- don't grab bio->bi_blkg reference when adding the stats into blkcg's
+per-cpu stat list since all stats are guaranteed to be consumed before
+releasing blkg instance, and grabbing blkg reference for stats was the
+most fragile part of original patch
+
+Based on Waiman's patch:
+
+https://lore.kernel.org/linux-block/20221215033132.230023-3-longman@redhat.com/
+
+Fixes: 3b8cc6298724 ("blk-cgroup: Optimize blkcg_rstat_flush()")
+	Cc: stable@vger.kernel.org
+	Reported-by: Jay Shin <jaeshin@redhat.com>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Cc: Waiman Long <longman@redhat.com>
+	Cc: mkoutny@suse.com
+	Cc: Yosry Ahmed <yosryahmed@google.com>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Link: https://lore.kernel.org/r/20230609234249.1412858-1-ming.lei@redhat.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 20cb1c2fb7568a6054c55defe044311397e01ddb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-cgroup.c
+diff --cc block/blk-cgroup.c
+index 36ee546380a3,f0b5c9c41cde..000000000000
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@@ -26,12 -26,16 +26,14 @@@
+  #include <linux/delay.h>
+  #include <linux/atomic.h>
+  #include <linux/ctype.h>
+ -#include <linux/resume_user_mode.h>
+ +#include <linux/blk-cgroup.h>
+ +#include <linux/tracehook.h>
+  #include <linux/psi.h>
+ -#include <linux/part_stat.h>
+  #include "blk.h"
+ -#include "blk-cgroup.h"
+  #include "blk-ioprio.h"
+ -#include "blk-throttle.h"
+  
++ static void __blkcg_rstat_flush(struct blkcg *blkcg, int cpu);
++ 
+  /*
+   * blkcg_pol_mutex protects blkcg_policy[] and policy [de]activation.
+   * blkcg_pol_register_mutex nests outside of it and synchronizes entire
+@@@ -52,9 -56,10 +54,11 @@@ static struct blkcg_policy *blkcg_polic
+  
+  static LIST_HEAD(all_blkcgs);		/* protected by blkcg_pol_mutex */
+  
+ -bool blkcg_debug_stats = false;
+ +static bool blkcg_debug_stats = false;
+ +static struct workqueue_struct *blkcg_punt_bio_wq;
+  
++ static DEFINE_RAW_SPINLOCK(blkg_stat_lock);
++ 
+  #define BLKG_DESTROY_BATCH_SIZE  64
+  
+  /*
+@@@ -119,8 -167,20 +123,22 @@@ static void blkg_free(struct blkcg_gq *
+  static void __blkg_release(struct rcu_head *rcu)
+  {
+  	struct blkcg_gq *blkg = container_of(rcu, struct blkcg_gq, rcu_head);
++ 	struct blkcg *blkcg = blkg->blkcg;
++ 	int cpu;
+  
+ -#ifdef CONFIG_BLK_CGROUP_PUNT_BIO
+  	WARN_ON(!bio_list_empty(&blkg->async_bios));
+++<<<<<<< HEAD
+++=======
++ #endif
++ 	/*
++ 	 * Flush all the non-empty percpu lockless lists before releasing
++ 	 * us, given these stat belongs to us.
++ 	 *
++ 	 * blkg_stat_lock is for serializing blkg stat update
++ 	 */
++ 	for_each_possible_cpu(cpu)
++ 		__blkcg_rstat_flush(blkcg, cpu);
+++>>>>>>> 20cb1c2fb756 (blk-cgroup: Flush stats before releasing blkcg_gq)
+  
+  	/* release the blkcg and parent blkg refs this blkg has been holding */
+  	css_put(&blkg->blkcg->css);
+* Unmerged path block/blk-cgroup.c
