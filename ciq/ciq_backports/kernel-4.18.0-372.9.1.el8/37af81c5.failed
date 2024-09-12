@@ -1,0 +1,464 @@
+ALSA: core: Abstract memory alloc helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 37af81c5998f4b0f23fb452cffa4b8a1c00ce95b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/37af81c5.failed
+
+This patch introduces the ops table to each memory allocation type
+(SNDRV_DMA_TYPE_XXX) and abstract the handling for the better code
+management.  Then we get separate the page allocation, release and
+other tasks for each type, especially for the SG buffer.
+
+Each buffer type has now callbacks in the struct snd_malloc_ops, and
+the common helper functions call those ops accordingly.  The former
+inline code that is specific to SG-buffer is moved into the local
+sgbuf.c, and we can simplify the PCM code without details of memory
+handling.
+
+Link: https://lore.kernel.org/r/20210609162551.7842-4-tiwai@suse.de
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 37af81c5998f4b0f23fb452cffa4b8a1c00ce95b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/core/memalloc.c
+diff --cc sound/core/memalloc.c
+index fb571e6ead5e,ad68bcdf82cf..000000000000
+--- a/sound/core/memalloc.c
++++ b/sound/core/memalloc.c
+@@@ -140,43 -68,10 +68,50 @@@ int snd_dma_alloc_pages(int type, struc
+  	dmab->area = NULL;
+  	dmab->addr = 0;
+  	dmab->private_data = NULL;
+++<<<<<<< HEAD
+ +	switch (type) {
+ +	case SNDRV_DMA_TYPE_CONTINUOUS:
+ +		gfp = snd_mem_get_gfp_flags(device, GFP_KERNEL);
+ +		dmab->area = alloc_pages_exact(size, gfp);
+ +		break;
+ +	case SNDRV_DMA_TYPE_VMALLOC:
+ +		gfp = snd_mem_get_gfp_flags(device, GFP_KERNEL | __GFP_HIGHMEM);
+ +		dmab->area = __vmalloc(size, gfp, PAGE_KERNEL);
+ +		break;
+ +#ifdef CONFIG_HAS_DMA
+ +#ifdef CONFIG_GENERIC_ALLOCATOR
+ +	case SNDRV_DMA_TYPE_DEV_IRAM:
+ +		snd_malloc_dev_iram(dmab, size);
+ +		if (dmab->area)
+ +			break;
+ +		/* Internal memory might have limited size and no enough space,
+ +		 * so if we fail to malloc, try to fetch memory traditionally.
+ +		 */
+ +		dmab->dev.type = SNDRV_DMA_TYPE_DEV;
+ +#endif /* CONFIG_GENERIC_ALLOCATOR */
+ +		/* fall through */
+ +	case SNDRV_DMA_TYPE_DEV:
+ +	case SNDRV_DMA_TYPE_DEV_UC:
+ +		snd_malloc_dev_pages(dmab, size);
+ +		break;
+ +#endif
+ +#ifdef CONFIG_SND_DMA_SGBUF
+ +	case SNDRV_DMA_TYPE_DEV_SG:
+ +	case SNDRV_DMA_TYPE_DEV_UC_SG:
+ +		snd_malloc_sgbuf_pages(device, size, dmab, NULL);
+ +		break;
+ +#endif
+ +	default:
+ +		pr_err("snd-malloc: invalid device type %d\n", type);
+ +		return -ENXIO;
+ +	}
+ +	if (! dmab->area)
+++=======
++ 	err = __snd_dma_alloc_pages(dmab, size);
++ 	if (err < 0)
++ 		return err;
++ 	if (!dmab->area)
+++>>>>>>> 37af81c5998f (ALSA: core: Abstract memory alloc helpers)
+  		return -ENOMEM;
+  	dmab->bytes = size;
+  	return 0;
+diff --git a/include/sound/memalloc.h b/include/sound/memalloc.h
+index 3ab084438fdc..6dc85a7f44ad 100644
+--- a/include/sound/memalloc.h
++++ b/include/sound/memalloc.h
+@@ -9,9 +9,8 @@
+ #ifndef __SOUND_MEMALLOC_H
+ #define __SOUND_MEMALLOC_H
+ 
+-#include <asm/page.h>
+-
+ struct device;
++struct page;
+ 
+ /*
+  * buffer device info
+@@ -64,59 +63,6 @@ static inline unsigned int snd_sgbuf_aligned_pages(size_t size)
+ 	return (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ }
+ 
+-#ifdef CONFIG_SND_DMA_SGBUF
+-/*
+- * Scatter-Gather generic device pages
+- */
+-void *snd_malloc_sgbuf_pages(struct device *device,
+-			     size_t size, struct snd_dma_buffer *dmab,
+-			     size_t *res_size);
+-int snd_free_sgbuf_pages(struct snd_dma_buffer *dmab);
+-
+-struct snd_sg_page {
+-	void *buf;
+-	dma_addr_t addr;
+-};
+-
+-struct snd_sg_buf {
+-	int size;	/* allocated byte size */
+-	int pages;	/* allocated pages */
+-	int tblsize;	/* allocated table size */
+-	struct snd_sg_page *table;	/* address table */
+-	struct page **page_table;	/* page table (for vmap/vunmap) */
+-	struct device *dev;
+-};
+-
+-/*
+- * return the physical address at the corresponding offset
+- */
+-static inline dma_addr_t snd_sgbuf_get_addr(struct snd_dma_buffer *dmab,
+-					   size_t offset)
+-{
+-	struct snd_sg_buf *sgbuf = dmab->private_data;
+-	dma_addr_t addr;
+-
+-	if (!sgbuf)
+-		return dmab->addr + offset;
+-	addr = sgbuf->table[offset >> PAGE_SHIFT].addr;
+-	addr &= ~((dma_addr_t)PAGE_SIZE - 1);
+-	return addr + offset % PAGE_SIZE;
+-}
+-
+-unsigned int snd_sgbuf_get_chunk_size(struct snd_dma_buffer *dmab,
+-				      unsigned int ofs, unsigned int size);
+-#else
+-/* non-SG versions */
+-static inline dma_addr_t snd_sgbuf_get_addr(struct snd_dma_buffer *dmab,
+-					    size_t offset)
+-{
+-	return dmab->addr + offset;
+-}
+-
+-#define snd_sgbuf_get_chunk_size(dmab, ofs, size)	(size)
+-
+-#endif /* CONFIG_SND_DMA_SGBUF */
+-
+ /* allocate/release a buffer */
+ int snd_dma_alloc_pages(int type, struct device *dev, size_t size,
+ 			struct snd_dma_buffer *dmab);
+@@ -124,5 +70,10 @@ int snd_dma_alloc_pages_fallback(int type, struct device *dev, size_t size,
+                                  struct snd_dma_buffer *dmab);
+ void snd_dma_free_pages(struct snd_dma_buffer *dmab);
+ 
++dma_addr_t snd_sgbuf_get_addr(struct snd_dma_buffer *dmab, size_t offset);
++struct page *snd_sgbuf_get_page(struct snd_dma_buffer *dmab, size_t offset);
++unsigned int snd_sgbuf_get_chunk_size(struct snd_dma_buffer *dmab,
++				      unsigned int ofs, unsigned int size);
++
+ #endif /* __SOUND_MEMALLOC_H */
+ 
+diff --git a/include/sound/pcm.h b/include/sound/pcm.h
+index c4f418c511e5..938f36050a5e 100644
+--- a/include/sound/pcm.h
++++ b/include/sound/pcm.h
+@@ -1254,14 +1254,6 @@ static inline int snd_pcm_lib_alloc_vmalloc_32_buffer
+ 
+ #define snd_pcm_get_dma_buf(substream) ((substream)->runtime->dma_buffer_p)
+ 
+-#ifdef CONFIG_SND_DMA_SGBUF
+-/*
+- * SG-buffer handling
+- */
+-#define snd_pcm_substream_sgbuf(substream) \
+-	snd_pcm_get_dma_buf(substream)->private_data
+-#endif /* SND_DMA_SGBUF */
+-
+ /**
+  * snd_pcm_sgbuf_get_addr - Get the DMA address at the corresponding offset
+  * @substream: PCM substream
+* Unmerged path sound/core/memalloc.c
+diff --git a/sound/core/memalloc_local.h b/sound/core/memalloc_local.h
+new file mode 100644
+index 000000000000..fe55416253bf
+--- /dev/null
++++ b/sound/core/memalloc_local.h
+@@ -0,0 +1,18 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#ifndef __MEMALLOC_LOCAL_H
++#define __MEMALLOC_LOCAL_H
++
++struct snd_malloc_ops {
++	int (*alloc)(struct snd_dma_buffer *dmab, size_t size);
++	void (*free)(struct snd_dma_buffer *dmab);
++	dma_addr_t (*get_addr)(struct snd_dma_buffer *dmab, size_t offset);
++	struct page *(*get_page)(struct snd_dma_buffer *dmab, size_t offset);
++	unsigned int (*get_chunk_size)(struct snd_dma_buffer *dmab,
++				       unsigned int ofs, unsigned int size);
++};
++
++#ifdef CONFIG_SND_DMA_SGBUF
++extern const struct snd_malloc_ops snd_dma_sg_ops;
++#endif
++
++#endif /* __MEMALLOC_LOCAL_H */
+diff --git a/sound/core/pcm_local.h b/sound/core/pcm_local.h
+index e3b3558aeab6..fe9689b8a6a6 100644
+--- a/sound/core/pcm_local.h
++++ b/sound/core/pcm_local.h
+@@ -65,11 +65,6 @@ void __snd_pcm_xrun(struct snd_pcm_substream *substream);
+ void snd_pcm_group_init(struct snd_pcm_group *group);
+ void snd_pcm_sync_stop(struct snd_pcm_substream *substream, bool sync_irq);
+ 
+-#ifdef CONFIG_SND_DMA_SGBUF
+-struct page *snd_pcm_sgbuf_ops_page(struct snd_pcm_substream *substream,
+-				    unsigned long offset);
+-#endif
+-
+ #define PCM_RUNTIME_CHECK(sub) snd_BUG_ON(!(sub) || !(sub)->runtime)
+ 
+ /* loop over all PCM substreams */
+diff --git a/sound/core/pcm_memory.c b/sound/core/pcm_memory.c
+index a9d04d31c1ed..7213ed49544b 100644
+--- a/sound/core/pcm_memory.c
++++ b/sound/core/pcm_memory.c
+@@ -337,27 +337,6 @@ void snd_pcm_set_managed_buffer_all(struct snd_pcm *pcm, int type,
+ }
+ EXPORT_SYMBOL(snd_pcm_set_managed_buffer_all);
+ 
+-#ifdef CONFIG_SND_DMA_SGBUF
+-/*
+- * snd_pcm_sgbuf_ops_page - get the page struct at the given offset
+- * @substream: the pcm substream instance
+- * @offset: the buffer offset
+- *
+- * Used as the page callback of PCM ops.
+- *
+- * Return: The page struct at the given buffer offset. %NULL on failure.
+- */
+-struct page *snd_pcm_sgbuf_ops_page(struct snd_pcm_substream *substream, unsigned long offset)
+-{
+-	struct snd_sg_buf *sgbuf = snd_pcm_substream_sgbuf(substream);
+-
+-	unsigned int idx = offset >> PAGE_SHIFT;
+-	if (idx >= (unsigned int)sgbuf->pages)
+-		return NULL;
+-	return sgbuf->page_table[idx];
+-}
+-#endif /* CONFIG_SND_DMA_SGBUF */
+-
+ /**
+  * snd_pcm_lib_malloc_pages - allocate the DMA buffer
+  * @substream: the substream to allocate the DMA buffer to
+diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
+index 57f05317826e..29b0c5382a3a 100644
+--- a/sound/core/pcm_native.c
++++ b/sound/core/pcm_native.c
+@@ -3644,24 +3644,6 @@ static int snd_pcm_mmap_control(struct snd_pcm_substream *substream, struct file
+ }
+ #endif /* coherent mmap */
+ 
+-static inline struct page *
+-snd_pcm_default_page_ops(struct snd_pcm_substream *substream, unsigned long ofs)
+-{
+-	void *vaddr = substream->runtime->dma_area + ofs;
+-
+-	switch (substream->dma_buffer.dev.type) {
+-#ifdef CONFIG_SND_DMA_SGBUF
+-	case SNDRV_DMA_TYPE_DEV_SG:
+-	case SNDRV_DMA_TYPE_DEV_UC_SG:
+-		return snd_pcm_sgbuf_ops_page(substream, ofs);
+-#endif /* CONFIG_SND_DMA_SGBUF */
+-	case SNDRV_DMA_TYPE_VMALLOC:
+-		return vmalloc_to_page(vaddr);
+-	default:
+-		return virt_to_page(vaddr);
+-	}
+-}
+-
+ /*
+  * fault callback for mmapping a RAM page
+  */
+@@ -3683,7 +3665,7 @@ static vm_fault_t snd_pcm_mmap_data_fault(struct vm_fault *vmf)
+ 	if (substream->ops->page)
+ 		page = substream->ops->page(substream, offset);
+ 	else
+-		page = snd_pcm_default_page_ops(substream, offset);
++		page = snd_sgbuf_get_page(snd_pcm_get_dma_buf(substream), offset);
+ 	if (!page)
+ 		return VM_FAULT_SIGBUS;
+ 	get_page(page);
+diff --git a/sound/core/sgbuf.c b/sound/core/sgbuf.c
+index dbb612239270..6ac3bf6c0002 100644
+--- a/sound/core/sgbuf.c
++++ b/sound/core/sgbuf.c
+@@ -11,20 +11,34 @@
+ #include <linux/export.h>
+ #include <asm/pgtable.h>
+ #include <sound/memalloc.h>
+-
++#include "memalloc_local.h"
++
++struct snd_sg_page {
++	void *buf;
++	dma_addr_t addr;
++};
++
++struct snd_sg_buf {
++	int size;	/* allocated byte size */
++	int pages;	/* allocated pages */
++	int tblsize;	/* allocated table size */
++	struct snd_sg_page *table;	/* address table */
++	struct page **page_table;	/* page table (for vmap/vunmap) */
++	struct device *dev;
++};
+ 
+ /* table entries are align to 32 */
+ #define SGBUF_TBL_ALIGN		32
+ #define sgbuf_align_table(tbl)	ALIGN((tbl), SGBUF_TBL_ALIGN)
+ 
+-int snd_free_sgbuf_pages(struct snd_dma_buffer *dmab)
++static void snd_dma_sg_free(struct snd_dma_buffer *dmab)
+ {
+ 	struct snd_sg_buf *sgbuf = dmab->private_data;
+ 	struct snd_dma_buffer tmpb;
+ 	int i;
+ 
+-	if (! sgbuf)
+-		return -EINVAL;
++	if (!sgbuf)
++		return;
+ 
+ 	vunmap(dmab->area);
+ 	dmab->area = NULL;
+@@ -46,15 +60,11 @@ int snd_free_sgbuf_pages(struct snd_dma_buffer *dmab)
+ 	kfree(sgbuf->page_table);
+ 	kfree(sgbuf);
+ 	dmab->private_data = NULL;
+-	
+-	return 0;
+ }
+ 
+ #define MAX_ALLOC_PAGES		32
+ 
+-void *snd_malloc_sgbuf_pages(struct device *device,
+-			     size_t size, struct snd_dma_buffer *dmab,
+-			     size_t *res_size)
++static int snd_dma_sg_alloc(struct snd_dma_buffer *dmab, size_t size)
+ {
+ 	struct snd_sg_buf *sgbuf;
+ 	unsigned int i, pages, chunk, maxpages;
+@@ -64,18 +74,16 @@ void *snd_malloc_sgbuf_pages(struct device *device,
+ 	int type = SNDRV_DMA_TYPE_DEV;
+ 	pgprot_t prot = PAGE_KERNEL;
+ 
+-	dmab->area = NULL;
+-	dmab->addr = 0;
+ 	dmab->private_data = sgbuf = kzalloc(sizeof(*sgbuf), GFP_KERNEL);
+-	if (! sgbuf)
+-		return NULL;
++	if (!sgbuf)
++		return -ENOMEM;
+ 	if (dmab->dev.type == SNDRV_DMA_TYPE_DEV_UC_SG) {
+ 		type = SNDRV_DMA_TYPE_DEV_UC;
+ #ifdef pgprot_noncached
+ 		prot = pgprot_noncached(PAGE_KERNEL);
+ #endif
+ 	}
+-	sgbuf->dev = device;
++	sgbuf->dev = dmab->dev.dev;
+ 	pages = snd_sgbuf_aligned_pages(size);
+ 	sgbuf->tblsize = sgbuf_align_table(pages);
+ 	table = kcalloc(sgbuf->tblsize, sizeof(*table), GFP_KERNEL);
+@@ -95,12 +103,10 @@ void *snd_malloc_sgbuf_pages(struct device *device,
+ 		if (chunk > maxpages)
+ 			chunk = maxpages;
+ 		chunk <<= PAGE_SHIFT;
+-		if (snd_dma_alloc_pages_fallback(type, device,
++		if (snd_dma_alloc_pages_fallback(type, dmab->dev.dev,
+ 						 chunk, &tmpb) < 0) {
+ 			if (!sgbuf->pages)
+ 				goto _failed;
+-			if (!res_size)
+-				goto _failed;
+ 			size = sgbuf->pages * PAGE_SIZE;
+ 			break;
+ 		}
+@@ -125,27 +131,42 @@ void *snd_malloc_sgbuf_pages(struct device *device,
+ 	dmab->area = vmap(sgbuf->page_table, sgbuf->pages, VM_MAP, prot);
+ 	if (! dmab->area)
+ 		goto _failed;
+-	if (res_size)
+-		*res_size = sgbuf->size;
+-	return dmab->area;
++	return 0;
+ 
+  _failed:
+-	snd_free_sgbuf_pages(dmab); /* free the table */
+-	return NULL;
++	snd_dma_sg_free(dmab); /* free the table */
++	return -ENOMEM;
+ }
+ 
+-/*
+- * compute the max chunk size with continuous pages on sg-buffer
+- */
+-unsigned int snd_sgbuf_get_chunk_size(struct snd_dma_buffer *dmab,
+-				      unsigned int ofs, unsigned int size)
++static dma_addr_t snd_dma_sg_get_addr(struct snd_dma_buffer *dmab,
++				      size_t offset)
++{
++	struct snd_sg_buf *sgbuf = dmab->private_data;
++	dma_addr_t addr;
++
++	addr = sgbuf->table[offset >> PAGE_SHIFT].addr;
++	addr &= ~((dma_addr_t)PAGE_SIZE - 1);
++	return addr + offset % PAGE_SIZE;
++}
++
++static struct page *snd_dma_sg_get_page(struct snd_dma_buffer *dmab,
++					size_t offset)
++{
++	struct snd_sg_buf *sgbuf = dmab->private_data;
++	unsigned int idx = offset >> PAGE_SHIFT;
++
++	if (idx >= (unsigned int)sgbuf->pages)
++		return NULL;
++	return sgbuf->page_table[idx];
++}
++
++static unsigned int snd_dma_sg_get_chunk_size(struct snd_dma_buffer *dmab,
++					      unsigned int ofs,
++					      unsigned int size)
+ {
+ 	struct snd_sg_buf *sg = dmab->private_data;
+ 	unsigned int start, end, pg;
+ 
+-	if (!sg)
+-		return size;
+-
+ 	start = ofs >> PAGE_SHIFT;
+ 	end = (ofs + size - 1) >> PAGE_SHIFT;
+ 	/* check page continuity */
+@@ -161,4 +182,11 @@ unsigned int snd_sgbuf_get_chunk_size(struct snd_dma_buffer *dmab,
+ 	/* ok, all on continuous pages */
+ 	return size;
+ }
+-EXPORT_SYMBOL(snd_sgbuf_get_chunk_size);
++
++const struct snd_malloc_ops snd_dma_sg_ops = {
++	.alloc = snd_dma_sg_alloc,
++	.free = snd_dma_sg_free,
++	.get_addr = snd_dma_sg_get_addr,
++	.get_page = snd_dma_sg_get_page,
++	.get_chunk_size = snd_dma_sg_get_chunk_size,
++};
