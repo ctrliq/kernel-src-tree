@@ -1,0 +1,135 @@
+s390/ap: make tapq gr2 response a struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-514.el8
+commit-author Harald Freudenberger <freude@linux.ibm.com>
+commit 211c06d845a7a5d856e2a99276ceb02aaa11c618
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-514.el8/211c06d8.failed
+
+This patch introduces a new struct ap_tapq_gr2 which covers
+the response in GR2 on TAPQ invocation. This makes it much
+easier and less error-prone for the calling functions to
+access the right field without shifting and masking.
+
+	Signed-off-by: Harald Freudenberger <freude@linux.ibm.com>
+	Reviewed-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Reviewed-by: Holger Dengler <dengler@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 211c06d845a7a5d856e2a99276ceb02aaa11c618)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/ap.h
+diff --cc arch/s390/include/asm/ap.h
+index 0343f83e72a0,ba8da3f02f35..000000000000
+--- a/arch/s390/include/asm/ap.h
++++ b/arch/s390/include/asm/ap.h
+@@@ -79,9 -121,9 +107,9 @@@ struct ap_tapq_gr2 
+   *
+   * Returns AP queue status structure.
+   */
+- static inline struct ap_queue_status ap_tapq(ap_qid_t qid, unsigned long *info)
++ static inline struct ap_queue_status ap_tapq(ap_qid_t qid, struct ap_tapq_gr2 *info)
+  {
+ -	union ap_queue_status_reg reg1;
+ +	struct ap_queue_status reg1;
+  	unsigned long reg2;
+  
+  	asm volatile(
+@@@ -94,8 -136,8 +122,13 @@@
+  		: [qid] "d" (qid)
+  		: "cc", "0", "1", "2");
+  	if (info)
+++<<<<<<< HEAD
+ +		*info = reg2;
+ +	return reg1;
+++=======
++ 		info->value = reg2;
++ 	return reg1.status;
+++>>>>>>> 211c06d845a7 (s390/ap: make tapq gr2 response a struct)
+  }
+  
+  /**
+* Unmerged path arch/s390/include/asm/ap.h
+diff --git a/drivers/s390/crypto/ap_bus.c b/drivers/s390/crypto/ap_bus.c
+index fa9838d65c2c..c9d45af297cc 100644
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@ -347,18 +347,7 @@ static bool ap_queue_info(ap_qid_t qid, int *q_type, unsigned int *q_fac,
+ 			  int *q_depth, int *q_ml, bool *q_decfg, bool *q_cstop)
+ {
+ 	struct ap_queue_status status;
+-	union {
+-		unsigned long value;
+-		struct {
+-			unsigned int fac   : 32; /* facility bits */
+-			unsigned int at	   :  8; /* ap type */
+-			unsigned int _res1 :  8;
+-			unsigned int _res2 :  4;
+-			unsigned int ml	   :  4; /* apxl ml */
+-			unsigned int _res3 :  4;
+-			unsigned int qd	   :  4; /* queue depth */
+-		} tapq_gr2;
+-	} tapq_info;
++	struct ap_tapq_gr2 tapq_info;
+ 
+ 	tapq_info.value = 0;
+ 
+@@ -368,7 +357,7 @@ static bool ap_queue_info(ap_qid_t qid, int *q_type, unsigned int *q_fac,
+ 		return false;
+ 
+ 	/* call TAPQ on this APQN */
+-	status = ap_test_queue(qid, ap_apft_available(), &tapq_info.value);
++	status = ap_test_queue(qid, ap_apft_available(), &tapq_info);
+ 	switch (status.response_code) {
+ 	case AP_RESPONSE_NORMAL:
+ 	case AP_RESPONSE_RESET_IN_PROGRESS:
+@@ -382,10 +371,10 @@ static bool ap_queue_info(ap_qid_t qid, int *q_type, unsigned int *q_fac,
+ 		 */
+ 		if (WARN_ON_ONCE(!tapq_info.value))
+ 			return false;
+-		*q_type = tapq_info.tapq_gr2.at;
+-		*q_fac = tapq_info.tapq_gr2.fac;
+-		*q_depth = tapq_info.tapq_gr2.qd;
+-		*q_ml = tapq_info.tapq_gr2.ml;
++		*q_type = tapq_info.at;
++		*q_fac = tapq_info.fac;
++		*q_depth = tapq_info.qd;
++		*q_ml = tapq_info.ml;
+ 		*q_decfg = status.response_code == AP_RESPONSE_DECONFIGURED;
+ 		*q_cstop = status.response_code == AP_RESPONSE_CHECKSTOPPED;
+ 		switch (*q_type) {
+diff --git a/drivers/s390/crypto/vfio_ap_ops.c b/drivers/s390/crypto/vfio_ap_ops.c
+index 01b104b187cf..8458453ac179 100644
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@ -2010,8 +2010,8 @@ static void vfio_ap_filter_apid_by_qtype(unsigned long *apm, unsigned long *aqm)
+ {
+ 	bool apid_cleared;
+ 	struct ap_queue_status status;
+-	unsigned long apid, apqi, info;
+-	int qtype, qtype_mask = 0xff000000;
++	unsigned long apid, apqi;
++	struct ap_tapq_gr2 info;
+ 
+ 	for_each_set_bit_inv(apid, apm, AP_DEVICES) {
+ 		apid_cleared = false;
+@@ -2028,15 +2028,13 @@ static void vfio_ap_filter_apid_by_qtype(unsigned long *apm, unsigned long *aqm)
+ 			case AP_RESPONSE_DECONFIGURED:
+ 			case AP_RESPONSE_CHECKSTOPPED:
+ 			case AP_RESPONSE_BUSY:
+-				qtype = info & qtype_mask;
+-
+ 				/*
+ 				 * The vfio_ap device driver only
+ 				 * supports CEX4 and newer adapters, so
+ 				 * remove the APID if the adapter is
+ 				 * older than a CEX4.
+ 				 */
+-				if (qtype < AP_DEVICE_TYPE_CEX4) {
++				if (info.at < AP_DEVICE_TYPE_CEX4) {
+ 					clear_bit_inv(apid, apm);
+ 					apid_cleared = true;
+ 				}
