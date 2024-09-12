@@ -1,0 +1,140 @@
+powerpc/bpf: Emit a single branch instruction for known short branch ranges
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+commit bafb5898de5d2f15133774cb049fe55720b9c92f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/bafb5898.failed
+
+PPC_BCC() emits two instructions to accommodate scenarios where we need
+to branch outside the range of a conditional branch. PPC_BCC_SHORT()
+emits a single branch instruction and can be used when the branch is
+known to be within a conditional branch range.
+
+Convert some of the uses of PPC_BCC() in the powerpc BPF JIT over to
+PPC_BCC_SHORT() where we know the branch range.
+
+	Signed-off-by: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/edbca01377d1d5f472868bf6d8962b0a0d85b96f.1644834730.git.naveen.n.rao@linux.vnet.ibm.com
+
+(cherry picked from commit bafb5898de5d2f15133774cb049fe55720b9c92f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/net/bpf_jit_comp32.c
+#	arch/powerpc/net/bpf_jit_comp64.c
+diff --cc arch/powerpc/net/bpf_jit_comp64.c
+index cbb5838adebc,b1ed8611091d..000000000000
+--- a/arch/powerpc/net/bpf_jit_comp64.c
++++ b/arch/powerpc/net/bpf_jit_comp64.c
+@@@ -228,15 -225,15 +228,19 @@@ static void bpf_jit_emit_tail_call(u32 
+  	EMIT(PPC_RAW_LWZ(b2p[TMP_REG_1], b2p_bpf_array, offsetof(struct bpf_array, map.max_entries)));
+  	EMIT(PPC_RAW_RLWINM(b2p_index, b2p_index, 0, 0, 31));
+  	EMIT(PPC_RAW_CMPLW(b2p_index, b2p[TMP_REG_1]));
+- 	PPC_BCC(COND_GE, out);
++ 	PPC_BCC_SHORT(COND_GE, out);
+  
+  	/*
+ -	 * if (tail_call_cnt >= MAX_TAIL_CALL_CNT)
+ +	 * if (tail_call_cnt > MAX_TAIL_CALL_CNT)
+  	 *   goto out;
+  	 */
+  	PPC_BPF_LL(b2p[TMP_REG_1], 1, bpf_jit_stack_tailcallcnt(ctx));
+  	EMIT(PPC_RAW_CMPLWI(b2p[TMP_REG_1], MAX_TAIL_CALL_CNT));
+++<<<<<<< HEAD
+ +	PPC_BCC(COND_GT, out);
+++=======
++ 	PPC_BCC_SHORT(COND_GE, out);
+++>>>>>>> bafb5898de5d (powerpc/bpf: Emit a single branch instruction for known short branch ranges)
+  
+  	/*
+  	 * tail_call_cnt++;
+@@@ -780,25 -784,66 +784,79 @@@ emit_clear
+  		 */
+  		/* dst = *(u8 *)(ul) (src + off) */
+  		case BPF_LDX | BPF_MEM | BPF_B:
+ -		case BPF_LDX | BPF_PROBE_MEM | BPF_B:
+ +			EMIT(PPC_RAW_LBZ(dst_reg, src_reg, off));
+ +			if (insn_is_zext(&insn[i + 1]))
+ +				addrs[++i] = ctx->idx * 4;
+ +			break;
+  		/* dst = *(u16 *)(ul) (src + off) */
+  		case BPF_LDX | BPF_MEM | BPF_H:
+ -		case BPF_LDX | BPF_PROBE_MEM | BPF_H:
+ +			EMIT(PPC_RAW_LHZ(dst_reg, src_reg, off));
+ +			if (insn_is_zext(&insn[i + 1]))
+ +				addrs[++i] = ctx->idx * 4;
+ +			break;
+  		/* dst = *(u32 *)(ul) (src + off) */
+  		case BPF_LDX | BPF_MEM | BPF_W:
+ -		case BPF_LDX | BPF_PROBE_MEM | BPF_W:
+ +			EMIT(PPC_RAW_LWZ(dst_reg, src_reg, off));
+ +			if (insn_is_zext(&insn[i + 1]))
+ +				addrs[++i] = ctx->idx * 4;
+ +			break;
+  		/* dst = *(u64 *)(ul) (src + off) */
+  		case BPF_LDX | BPF_MEM | BPF_DW:
+++<<<<<<< HEAD
+ +			PPC_BPF_LL(dst_reg, src_reg, off);
+++=======
++ 		case BPF_LDX | BPF_PROBE_MEM | BPF_DW:
++ 			/*
++ 			 * As PTR_TO_BTF_ID that uses BPF_PROBE_MEM mode could either be a valid
++ 			 * kernel pointer or NULL but not a userspace address, execute BPF_PROBE_MEM
++ 			 * load only if addr is kernel address (see is_kernel_addr()), otherwise
++ 			 * set dst_reg=0 and move on.
++ 			 */
++ 			if (BPF_MODE(code) == BPF_PROBE_MEM) {
++ 				EMIT(PPC_RAW_ADDI(b2p[TMP_REG_1], src_reg, off));
++ 				if (IS_ENABLED(CONFIG_PPC_BOOK3E_64))
++ 					PPC_LI64(b2p[TMP_REG_2], 0x8000000000000000ul);
++ 				else /* BOOK3S_64 */
++ 					PPC_LI64(b2p[TMP_REG_2], PAGE_OFFSET);
++ 				EMIT(PPC_RAW_CMPLD(b2p[TMP_REG_1], b2p[TMP_REG_2]));
++ 				PPC_BCC_SHORT(COND_GT, (ctx->idx + 3) * 4);
++ 				EMIT(PPC_RAW_LI(dst_reg, 0));
++ 				/*
++ 				 * Check if 'off' is word aligned because PPC_BPF_LL()
++ 				 * (BPF_DW case) generates two instructions if 'off' is not
++ 				 * word-aligned and one instruction otherwise.
++ 				 */
++ 				if (BPF_SIZE(code) == BPF_DW && (off & 3))
++ 					PPC_JMP((ctx->idx + 3) * 4);
++ 				else
++ 					PPC_JMP((ctx->idx + 2) * 4);
++ 			}
++ 
++ 			switch (size) {
++ 			case BPF_B:
++ 				EMIT(PPC_RAW_LBZ(dst_reg, src_reg, off));
++ 				break;
++ 			case BPF_H:
++ 				EMIT(PPC_RAW_LHZ(dst_reg, src_reg, off));
++ 				break;
++ 			case BPF_W:
++ 				EMIT(PPC_RAW_LWZ(dst_reg, src_reg, off));
++ 				break;
++ 			case BPF_DW:
++ 				PPC_BPF_LL(dst_reg, src_reg, off);
++ 				break;
++ 			}
++ 
++ 			if (size != BPF_DW && insn_is_zext(&insn[i + 1]))
++ 				addrs[++i] = ctx->idx * 4;
++ 
++ 			if (BPF_MODE(code) == BPF_PROBE_MEM) {
++ 				ret = bpf_add_extable_entry(fp, image, pass, ctx, ctx->idx - 1,
++ 							    4, dst_reg);
++ 				if (ret)
++ 					return ret;
++ 			}
+++>>>>>>> bafb5898de5d (powerpc/bpf: Emit a single branch instruction for known short branch ranges)
+  			break;
+  
+  		/*
+* Unmerged path arch/powerpc/net/bpf_jit_comp32.c
+* Unmerged path arch/powerpc/net/bpf_jit_comp32.c
+* Unmerged path arch/powerpc/net/bpf_jit_comp64.c
