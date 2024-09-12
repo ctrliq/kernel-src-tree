@@ -1,0 +1,539 @@
+mm/memory.c: fix race when faulting a device private page
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+Rebuild_CHGLOG: - Revert "mm/memory.c: fix race when faulting a device private page" (Jocelyn Falempe) [2160452]
+Rebuild_FUZZ: 92.68%
+commit-author Alistair Popple <apopple@nvidia.com>
+commit 16ce101db85db694a91380aa4c89b25530871d33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/16ce101d.failed
+
+Patch series "Fix several device private page reference counting issues",
+v2
+
+This series aims to fix a number of page reference counting issues in
+drivers dealing with device private ZONE_DEVICE pages.  These result in
+use-after-free type bugs, either from accessing a struct page which no
+longer exists because it has been removed or accessing fields within the
+struct page which are no longer valid because the page has been freed.
+
+During normal usage it is unlikely these will cause any problems.  However
+without these fixes it is possible to crash the kernel from userspace. 
+These crashes can be triggered either by unloading the kernel module or
+unbinding the device from the driver prior to a userspace task exiting. 
+In modules such as Nouveau it is also possible to trigger some of these
+issues by explicitly closing the device file-descriptor prior to the task
+exiting and then accessing device private memory.
+
+This involves some minor changes to both PowerPC and AMD GPU code. 
+Unfortunately I lack hardware to test either of those so any help there
+would be appreciated.  The changes mimic what is done in for both Nouveau
+and hmm-tests though so I doubt they will cause problems.
+
+
+This patch (of 8):
+
+When the CPU tries to access a device private page the migrate_to_ram()
+callback associated with the pgmap for the page is called.  However no
+reference is taken on the faulting page.  Therefore a concurrent migration
+of the device private page can free the page and possibly the underlying
+pgmap.  This results in a race which can crash the kernel due to the
+migrate_to_ram() function pointer becoming invalid.  It also means drivers
+can't reliably read the zone_device_data field because the page may have
+been freed with memunmap_pages().
+
+Close the race by getting a reference on the page while holding the ptl to
+ensure it has not been freed.  Unfortunately the elevated reference count
+will cause the migration required to handle the fault to fail.  To avoid
+this failure pass the faulting page into the migrate_vma functions so that
+if an elevated reference count is found it can be checked to see if it's
+expected or not.
+
+[mpe@ellerman.id.au: fix build]
+  Link: https://lkml.kernel.org/r/87fsgbf3gh.fsf@mpe.ellerman.id.au
+Link: https://lkml.kernel.org/r/cover.60659b549d8509ddecafad4f498ee7f03bb23c69.1664366292.git-series.apopple@nvidia.com
+Link: https://lkml.kernel.org/r/d3e813178a59e565e8d78d9b9a4e2562f6494f90.1664366292.git-series.apopple@nvidia.com
+	Signed-off-by: Alistair Popple <apopple@nvidia.com>
+	Acked-by: Felix Kuehling <Felix.Kuehling@amd.com>
+	Cc: Jason Gunthorpe <jgg@nvidia.com>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Ralph Campbell <rcampbell@nvidia.com>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Lyude Paul <lyude@redhat.com>
+	Cc: Alex Deucher <alexander.deucher@amd.com>
+	Cc: Alex Sierra <alex.sierra@amd.com>
+	Cc: Ben Skeggs <bskeggs@redhat.com>
+	Cc: Christian König <christian.koenig@amd.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: "Huang, Ying" <ying.huang@intel.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Yang Shi <shy828301@gmail.com>
+	Cc: Zi Yan <ziy@nvidia.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 16ce101db85db694a91380aa4c89b25530871d33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
+#	include/linux/migrate.h
+#	lib/test_hmm.c
+#	mm/migrate.c
+#	mm/migrate_device.c
+diff --cc drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
+index 95aafe4abe52,776448bd9fe4..000000000000
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
+@@@ -949,11 -940,11 +951,16 @@@ static vm_fault_t svm_migrate_to_ram(st
+  		goto out_unlock_prange;
+  	}
+  
+++<<<<<<< HEAD
+ +	r = svm_migrate_vram_to_ram(prange, vmf->vma->vm_mm,
+ +				    KFD_MIGRATE_TRIGGER_PAGEFAULT_CPU);
+++=======
++ 	r = svm_migrate_vram_to_ram(prange, mm, KFD_MIGRATE_TRIGGER_PAGEFAULT_CPU,
++ 				vmf->page);
+++>>>>>>> 16ce101db85d (mm/memory.c: fix race when faulting a device private page)
+  	if (r)
+ -		pr_debug("failed %d migrate 0x%p [0x%lx 0x%lx] to ram\n", r,
+ -			 prange, prange->start, prange->last);
+ +		pr_debug("failed %d migrate svms 0x%p range 0x%p [0x%lx 0x%lx]\n",
+ +			 r, prange->svms, prange, prange->start, prange->last);
+  
+  	/* xnack on, update mapping on GPUs with ACCESS_IN_PLACE */
+  	if (p->xnack_enabled && parent == prange)
+diff --cc include/linux/migrate.h
+index 683fccdf6a1c,52090d1f9230..000000000000
+--- a/include/linux/migrate.h
++++ b/include/linux/migrate.h
+@@@ -37,25 -62,25 +37,32 @@@ extern const char *migrate_reason_names
+  #ifdef CONFIG_MIGRATION
+  
+  extern void putback_movable_pages(struct list_head *l);
+++<<<<<<< HEAD
+ +extern int migrate_page(struct address_space *mapping,
+ +			struct page *newpage, struct page *page,
+ +			enum migrate_mode mode);
+++=======
++ int migrate_folio_extra(struct address_space *mapping, struct folio *dst,
++ 		struct folio *src, enum migrate_mode mode, int extra_count);
++ int migrate_folio(struct address_space *mapping, struct folio *dst,
++ 		struct folio *src, enum migrate_mode mode);
+++>>>>>>> 16ce101db85d (mm/memory.c: fix race when faulting a device private page)
+  extern int migrate_pages(struct list_head *l, new_page_t new, free_page_t free,
+ -		unsigned long private, enum migrate_mode mode, int reason,
+ -		unsigned int *ret_succeeded);
+ +		unsigned long private, enum migrate_mode mode, int reason);
+  extern struct page *alloc_migration_target(struct page *page, unsigned long private);
+  extern int isolate_movable_page(struct page *page, isolate_mode_t mode);
+ -
+ -int migrate_huge_page_move_mapping(struct address_space *mapping,
+ -		struct folio *dst, struct folio *src);
+ +extern void putback_movable_page(struct page *page);
+ +
+ +extern int migrate_prep(void);
+ +extern int migrate_prep_local(void);
+ +extern void migrate_page_states(struct page *newpage, struct page *page);
+ +extern void migrate_page_copy(struct page *newpage, struct page *page);
+ +extern int migrate_huge_page_move_mapping(struct address_space *mapping,
+ +				  struct page *newpage, struct page *page);
+ +extern int migrate_page_move_mapping(struct address_space *mapping,
+ +		struct page *newpage, struct page *page, int extra_count);
+  void migration_entry_wait_on_locked(swp_entry_t entry, pte_t *ptep,
+  				spinlock_t *ptl);
+ -void folio_migrate_flags(struct folio *newfolio, struct folio *folio);
+ -void folio_migrate_copy(struct folio *newfolio, struct folio *folio);
+ -int folio_migrate_mapping(struct address_space *mapping,
+ -		struct folio *newfolio, struct folio *folio, int extra_count);
+ -
+  #else
+  
+  static inline void putback_movable_pages(struct list_head *l) {}
+diff --cc lib/test_hmm.c
+index 084d536df474,e566166b5571..000000000000
+--- a/lib/test_hmm.c
++++ b/lib/test_hmm.c
+@@@ -667,10 -905,70 +667,75 @@@ static int dmirror_migrate(struct dmirr
+  	unsigned long size = cmd->npages << PAGE_SHIFT;
+  	struct mm_struct *mm = dmirror->notifier.mm;
+  	struct vm_area_struct *vma;
+++<<<<<<< HEAD
+ +	unsigned long src_pfns[64];
+ +	unsigned long dst_pfns[64];
+++=======
++ 	unsigned long src_pfns[64] = { 0 };
++ 	unsigned long dst_pfns[64] = { 0 };
++ 	struct migrate_vma args = { 0 };
++ 	unsigned long next;
++ 	int ret;
++ 
++ 	start = cmd->addr;
++ 	end = start + size;
++ 	if (end < start)
++ 		return -EINVAL;
++ 
++ 	/* Since the mm is for the mirrored process, get a reference first. */
++ 	if (!mmget_not_zero(mm))
++ 		return -EINVAL;
++ 
++ 	cmd->cpages = 0;
++ 	mmap_read_lock(mm);
++ 	for (addr = start; addr < end; addr = next) {
++ 		vma = vma_lookup(mm, addr);
++ 		if (!vma || !(vma->vm_flags & VM_READ)) {
++ 			ret = -EINVAL;
++ 			goto out;
++ 		}
++ 		next = min(end, addr + (ARRAY_SIZE(src_pfns) << PAGE_SHIFT));
++ 		if (next > vma->vm_end)
++ 			next = vma->vm_end;
++ 
++ 		args.vma = vma;
++ 		args.src = src_pfns;
++ 		args.dst = dst_pfns;
++ 		args.start = addr;
++ 		args.end = next;
++ 		args.pgmap_owner = dmirror->mdevice;
++ 		args.flags = dmirror_select_device(dmirror);
++ 
++ 		ret = migrate_vma_setup(&args);
++ 		if (ret)
++ 			goto out;
++ 
++ 		pr_debug("Migrating from device mem to sys mem\n");
++ 		dmirror_devmem_fault_alloc_and_copy(&args, dmirror);
++ 
++ 		migrate_vma_pages(&args);
++ 		cmd->cpages += dmirror_successful_migrated_pages(&args);
++ 		migrate_vma_finalize(&args);
++ 	}
++ out:
++ 	mmap_read_unlock(mm);
++ 	mmput(mm);
++ 
++ 	return ret;
++ }
++ 
++ static int dmirror_migrate_to_device(struct dmirror *dmirror,
++ 				struct hmm_dmirror_cmd *cmd)
++ {
++ 	unsigned long start, end, addr;
++ 	unsigned long size = cmd->npages << PAGE_SHIFT;
++ 	struct mm_struct *mm = dmirror->notifier.mm;
++ 	struct vm_area_struct *vma;
++ 	unsigned long src_pfns[64] = { 0 };
++ 	unsigned long dst_pfns[64] = { 0 };
+++>>>>>>> 16ce101db85d (mm/memory.c: fix race when faulting a device private page)
+  	struct dmirror_bounce bounce;
+- 	struct migrate_vma args;
++ 	struct migrate_vma args = { 0 };
+  	unsigned long next;
+  	int ret;
+  
+@@@ -1012,43 -1332,11 +1077,49 @@@ static void dmirror_devmem_free(struct 
+  	spin_unlock(&mdevice->lock);
+  }
+  
+ +static vm_fault_t dmirror_devmem_fault_alloc_and_copy(struct migrate_vma *args,
+ +						      struct dmirror *dmirror)
+ +{
+ +	const unsigned long *src = args->src;
+ +	unsigned long *dst = args->dst;
+ +	unsigned long start = args->start;
+ +	unsigned long end = args->end;
+ +	unsigned long addr;
+ +
+ +	for (addr = start; addr < end; addr += PAGE_SIZE,
+ +				       src++, dst++) {
+ +		struct page *dpage, *spage;
+ +
+ +		spage = migrate_pfn_to_page(*src);
+ +		if (!spage || !(*src & MIGRATE_PFN_MIGRATE))
+ +			continue;
+ +		spage = spage->zone_device_data;
+ +
+ +		dpage = alloc_page_vma(GFP_HIGHUSER_MOVABLE, args->vma, addr);
+ +		if (!dpage)
+ +			continue;
+ +
+ +		lock_page(dpage);
+ +		xa_erase(&dmirror->pt, addr >> PAGE_SHIFT);
+ +		copy_highpage(dpage, spage);
+ +		*dst = migrate_pfn(page_to_pfn(dpage)) | MIGRATE_PFN_LOCKED;
+ +		if (*src & MIGRATE_PFN_WRITE)
+ +			*dst |= MIGRATE_PFN_WRITE;
+ +	}
+ +	return 0;
+ +}
+ +
+  static vm_fault_t dmirror_devmem_fault(struct vm_fault *vmf)
+  {
+++<<<<<<< HEAD
+ +	struct migrate_vma args;
+ +	unsigned long src_pfns;
+ +	unsigned long dst_pfns;
+++=======
++ 	struct migrate_vma args = { 0 };
++ 	unsigned long src_pfns = 0;
++ 	unsigned long dst_pfns = 0;
+++>>>>>>> 16ce101db85d (mm/memory.c: fix race when faulting a device private page)
+  	struct page *rpage;
+  	struct dmirror *dmirror;
+  	vm_fault_t ret;
+@@@ -1068,7 -1356,8 +1139,12 @@@
+  	args.src = &src_pfns;
+  	args.dst = &dst_pfns;
+  	args.pgmap_owner = dmirror->mdevice;
+++<<<<<<< HEAD
+ +	args.flags = MIGRATE_VMA_SELECT_DEVICE_PRIVATE;
+++=======
++ 	args.flags = dmirror_select_device(dmirror);
++ 	args.fault_page = vmf->page;
+++>>>>>>> 16ce101db85d (mm/memory.c: fix race when faulting a device private page)
+  
+  	if (migrate_vma_setup(&args))
+  		return VM_FAULT_SIGBUS;
+diff --cc mm/migrate.c
+index fd5d8ac0bb45,1379e1912772..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -682,32 -625,43 +682,64 @@@ EXPORT_SYMBOL(migrate_page_copy)
+   *                    Migration functions
+   ***********************************************************/
+  
+++<<<<<<< HEAD
+ +/*
+ + * Common logic to directly migrate a single LRU page suitable for
+ + * pages that do not use PagePrivate/PagePrivate2.
+++=======
++ int migrate_folio_extra(struct address_space *mapping, struct folio *dst,
++ 		struct folio *src, enum migrate_mode mode, int extra_count)
++ {
++ 	int rc;
++ 
++ 	BUG_ON(folio_test_writeback(src));	/* Writeback must be complete */
++ 
++ 	rc = folio_migrate_mapping(mapping, dst, src, extra_count);
++ 
++ 	if (rc != MIGRATEPAGE_SUCCESS)
++ 		return rc;
++ 
++ 	if (mode != MIGRATE_SYNC_NO_COPY)
++ 		folio_migrate_copy(dst, src);
++ 	else
++ 		folio_migrate_flags(dst, src);
++ 	return MIGRATEPAGE_SUCCESS;
++ }
++ 
++ /**
++  * migrate_folio() - Simple folio migration.
++  * @mapping: The address_space containing the folio.
++  * @dst: The folio to migrate the data to.
++  * @src: The folio containing the current data.
++  * @mode: How to migrate the page.
+++>>>>>>> 16ce101db85d (mm/memory.c: fix race when faulting a device private page)
+   *
+ - * Common logic to directly migrate a single LRU folio suitable for
+ - * folios that do not use PagePrivate/PagePrivate2.
+ - *
+ - * Folios are locked upon entry and exit.
+ + * Pages are locked upon entry and exit.
+   */
+ -int migrate_folio(struct address_space *mapping, struct folio *dst,
+ -		struct folio *src, enum migrate_mode mode)
+ +int migrate_page(struct address_space *mapping,
+ +		struct page *newpage, struct page *page,
+ +		enum migrate_mode mode)
+  {
+++<<<<<<< HEAD
+ +	int rc;
+ +
+ +	BUG_ON(PageWriteback(page));	/* Writeback must be complete */
+ +
+ +	rc = migrate_page_move_mapping(mapping, newpage, page, 0);
+ +
+ +	if (rc != MIGRATEPAGE_SUCCESS)
+ +		return rc;
+ +
+ +	if (mode != MIGRATE_SYNC_NO_COPY)
+ +		migrate_page_copy(newpage, page);
+ +	else
+ +		migrate_page_states(newpage, page);
+ +	return MIGRATEPAGE_SUCCESS;
+++=======
++ 	return migrate_folio_extra(mapping, dst, src, mode, 0);
+++>>>>>>> 16ce101db85d (mm/memory.c: fix race when faulting a device private page)
+  }
+ -EXPORT_SYMBOL(migrate_folio);
+ +EXPORT_SYMBOL(migrate_page);
+  
+  #ifdef CONFIG_BLOCK
+  /* Returns true if all buffers are successfully locked */
+* Unmerged path mm/migrate_device.c
+diff --git a/arch/powerpc/kvm/book3s_hv_uvmem.c b/arch/powerpc/kvm/book3s_hv_uvmem.c
+index 695c4998ea81..fcc021d12e1f 100644
+--- a/arch/powerpc/kvm/book3s_hv_uvmem.c
++++ b/arch/powerpc/kvm/book3s_hv_uvmem.c
+@@ -504,10 +504,10 @@ unsigned long kvmppc_h_svm_init_start(struct kvm *kvm)
+ static int __kvmppc_svm_page_out(struct vm_area_struct *vma,
+ 		unsigned long start,
+ 		unsigned long end, unsigned long page_shift,
+-		struct kvm *kvm, unsigned long gpa)
++		struct kvm *kvm, unsigned long gpa, struct page *fault_page)
+ {
+ 	unsigned long src_pfn, dst_pfn = 0;
+-	struct migrate_vma mig;
++	struct migrate_vma mig = { 0 };
+ 	struct page *dpage, *spage;
+ 	struct kvmppc_uvmem_page_pvt *pvt;
+ 	unsigned long pfn;
+@@ -521,6 +521,7 @@ static int __kvmppc_svm_page_out(struct vm_area_struct *vma,
+ 	mig.dst = &dst_pfn;
+ 	mig.pgmap_owner = &kvmppc_uvmem_pgmap;
+ 	mig.flags = MIGRATE_VMA_SELECT_DEVICE_PRIVATE;
++	mig.fault_page = fault_page;
+ 
+ 	/* The requested page is already paged-out, nothing to do */
+ 	if (!kvmppc_gfn_is_uvmem_pfn(gpa >> page_shift, kvm, NULL))
+@@ -576,12 +577,14 @@ static int __kvmppc_svm_page_out(struct vm_area_struct *vma,
+ static inline int kvmppc_svm_page_out(struct vm_area_struct *vma,
+ 				      unsigned long start, unsigned long end,
+ 				      unsigned long page_shift,
+-				      struct kvm *kvm, unsigned long gpa)
++				      struct kvm *kvm, unsigned long gpa,
++				      struct page *fault_page)
+ {
+ 	int ret;
+ 
+ 	mutex_lock(&kvm->arch.uvmem_lock);
+-	ret = __kvmppc_svm_page_out(vma, start, end, page_shift, kvm, gpa);
++	ret = __kvmppc_svm_page_out(vma, start, end, page_shift, kvm, gpa,
++				fault_page);
+ 	mutex_unlock(&kvm->arch.uvmem_lock);
+ 
+ 	return ret;
+@@ -630,7 +633,7 @@ void kvmppc_uvmem_drop_pages(const struct kvm_memory_slot *slot,
+ 			pvt->remove_gfn = true;
+ 
+ 			if (__kvmppc_svm_page_out(vma, addr, addr + PAGE_SIZE,
+-						  PAGE_SHIFT, kvm, pvt->gpa))
++						  PAGE_SHIFT, kvm, pvt->gpa, NULL))
+ 				pr_err("Can't page out gpa:0x%lx addr:0x%lx\n",
+ 				       pvt->gpa, addr);
+ 		} else {
+@@ -732,7 +735,7 @@ static int kvmppc_svm_page_in(struct vm_area_struct *vma,
+ 		bool pagein)
+ {
+ 	unsigned long src_pfn, dst_pfn = 0;
+-	struct migrate_vma mig;
++	struct migrate_vma mig = { 0 };
+ 	struct page *spage;
+ 	unsigned long pfn;
+ 	struct page *dpage;
+@@ -990,7 +993,7 @@ static vm_fault_t kvmppc_uvmem_migrate_to_ram(struct vm_fault *vmf)
+ 
+ 	if (kvmppc_svm_page_out(vmf->vma, vmf->address,
+ 				vmf->address + PAGE_SIZE, PAGE_SHIFT,
+-				pvt->kvm, pvt->gpa))
++				pvt->kvm, pvt->gpa, vmf->page))
+ 		return VM_FAULT_SIGBUS;
+ 	else
+ 		return 0;
+@@ -1061,7 +1064,7 @@ kvmppc_h_svm_page_out(struct kvm *kvm, unsigned long gpa,
+ 	if (!vma || vma->vm_start > start || vma->vm_end < end)
+ 		goto out;
+ 
+-	if (!kvmppc_svm_page_out(vma, start, end, page_shift, kvm, gpa))
++	if (!kvmppc_svm_page_out(vma, start, end, page_shift, kvm, gpa, NULL))
+ 		ret = H_SUCCESS;
+ out:
+ 	mmap_read_unlock(kvm->mm);
+* Unmerged path drivers/gpu/drm/amd/amdkfd/kfd_migrate.c
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_migrate.h b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.h
+index b3f0754b32fa..a5d7e6d22264 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_migrate.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_migrate.h
+@@ -43,7 +43,7 @@ enum MIGRATION_COPY_DIR {
+ int svm_migrate_to_vram(struct svm_range *prange,  uint32_t best_loc,
+ 			struct mm_struct *mm, uint32_t trigger);
+ int svm_migrate_vram_to_ram(struct svm_range *prange, struct mm_struct *mm,
+-			    uint32_t trigger);
++			    uint32_t trigger, struct page *fault_page);
+ unsigned long
+ svm_migrate_addr_to_pfn(struct amdgpu_device *adev, unsigned long addr);
+ 
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+index 11074cc8c333..9139e5a0b2a0 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+@@ -2913,13 +2913,15 @@ svm_range_restore_pages(struct amdgpu_device *adev, unsigned int pasid,
+ 				 */
+ 				if (prange->actual_loc)
+ 					r = svm_migrate_vram_to_ram(prange, mm,
+-					   KFD_MIGRATE_TRIGGER_PAGEFAULT_GPU);
++					   KFD_MIGRATE_TRIGGER_PAGEFAULT_GPU,
++					   NULL);
+ 				else
+ 					r = 0;
+ 			}
+ 		} else {
+ 			r = svm_migrate_vram_to_ram(prange, mm,
+-					KFD_MIGRATE_TRIGGER_PAGEFAULT_GPU);
++					KFD_MIGRATE_TRIGGER_PAGEFAULT_GPU,
++					NULL);
+ 		}
+ 		if (r) {
+ 			pr_debug("failed %d to migrate svms %p [0x%lx 0x%lx]\n",
+@@ -3242,7 +3244,8 @@ svm_range_trigger_migration(struct mm_struct *mm, struct svm_range *prange,
+ 		return 0;
+ 
+ 	if (!best_loc) {
+-		r = svm_migrate_vram_to_ram(prange, mm, KFD_MIGRATE_TRIGGER_PREFETCH);
++		r = svm_migrate_vram_to_ram(prange, mm,
++					KFD_MIGRATE_TRIGGER_PREFETCH, NULL);
+ 		*migrated = !r;
+ 		return r;
+ 	}
+@@ -3303,7 +3306,7 @@ static void svm_range_evict_svm_bo_worker(struct work_struct *work)
+ 		mutex_lock(&prange->migrate_mutex);
+ 		do {
+ 			r = svm_migrate_vram_to_ram(prange, mm,
+-						KFD_MIGRATE_TRIGGER_TTM_EVICTION);
++					KFD_MIGRATE_TRIGGER_TTM_EVICTION, NULL);
+ 		} while (!r && prange->actual_loc && --retries);
+ 
+ 		if (!r && prange->actual_loc)
+* Unmerged path include/linux/migrate.h
+* Unmerged path lib/test_hmm.c
+diff --git a/mm/memory.c b/mm/memory.c
+index 1ab44f5e0706..005f9c8a5356 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3154,7 +3154,21 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 					     vmf->address);
+ 		} else if (is_device_private_entry(entry)) {
+ 			vmf->page = pfn_swap_entry_to_page(entry);
+-			ret = vmf->page->pgmap->ops->migrate_to_ram(vmf);
++			vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
++					vmf->address, &vmf->ptl);
++			if (unlikely(!pte_same(*vmf->pte, vmf->orig_pte))) {
++				spin_unlock(vmf->ptl);
++				goto out;
++			}
++
++			/*
++			 * Get a page reference while we know the page can't be
++			 * freed.
++			 */
++			get_page(vmf->page);
++			pte_unmap_unlock(vmf->pte, vmf->ptl);
++			vmf->page->pgmap->ops->migrate_to_ram(vmf);
++			put_page(vmf->page);
+ 		} else if (is_hwpoison_entry(entry)) {
+ 			ret = VM_FAULT_HWPOISON;
+ 		} else {
+* Unmerged path mm/migrate.c
+* Unmerged path mm/migrate_device.c
