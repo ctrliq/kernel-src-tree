@@ -1,0 +1,160 @@
+KVM: arm64: Drop vcpu->arch.has_run_once for vcpu->pid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit cc5705fb1bf119ebb693d594f0157e0dd418590e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/cc5705fb.failed
+
+With the transition to kvm_arch_vcpu_run_pid_change() to handle
+the "run once" activities, it becomes obvious that has_run_once
+is now an exact shadow of vcpu->pid.
+
+Replace vcpu->arch.has_run_once with a new vcpu_has_run_once()
+helper that directly checks for vcpu->pid, and get rid of the
+now unused field.
+
+	Reviewed-by: Andrew Jones <drjones@redhat.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit cc5705fb1bf119ebb693d594f0157e0dd418590e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_host.h
+#	arch/arm64/kvm/arm.c
+diff --cc arch/arm64/include/asm/kvm_host.h
+index a469c4a7a671,cbb5ff81919b..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -465,18 -603,18 +462,25 @@@ int __kvm_arm_vcpu_set_events(struct kv
+  void kvm_arm_halt_guest(struct kvm *kvm);
+  void kvm_arm_resume_guest(struct kvm *kvm);
+  
+++<<<<<<< HEAD
+ +u64 __kvm_call_hyp(void *hypfn, ...);
+ +
+ +#define kvm_call_hyp_nvhe(f, ...)					\
+ +	do {								\
+ +		DECLARE_KVM_NVHE_SYM(f);				\
+ +		__kvm_call_hyp(kvm_ksym_ref_nvhe(f), ##__VA_ARGS__);	\
+ +	} while(0)
+ +
+ +#define kvm_call_hyp_nvhe_ret(f, ...)					\
+++=======
++ #define vcpu_has_run_once(vcpu)	!!rcu_access_pointer((vcpu)->pid)
++ 
++ #ifndef __KVM_NVHE_HYPERVISOR__
++ #define kvm_call_hyp_nvhe(f, ...)						\
+++>>>>>>> cc5705fb1bf1 (KVM: arm64: Drop vcpu->arch.has_run_once for vcpu->pid)
+  	({								\
+ -		struct arm_smccc_res res;				\
+ -									\
+ -		arm_smccc_1_1_hvc(KVM_HOST_SMCCC_FUNC(f),		\
+ -				  ##__VA_ARGS__, &res);			\
+ -		WARN_ON(res.a0 != SMCCC_RET_SUCCESS);			\
+ -									\
+ -		res.a1;							\
+ +		DECLARE_KVM_NVHE_SYM(f);				\
+ +		__kvm_call_hyp(kvm_ksym_ref_nvhe(f), ##__VA_ARGS__);	\
+  	})
+  
+  /*
+diff --cc arch/arm64/kvm/arm.c
+index 60a64e83f8da,c79d8e5230bc..000000000000
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@@ -293,10 -351,10 +293,10 @@@ void kvm_arch_vcpu_postcreate(struct kv
+  
+  void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
+  {
+- 	if (vcpu->arch.has_run_once && unlikely(!irqchip_in_kernel(vcpu->kvm)))
++ 	if (vcpu_has_run_once(vcpu) && unlikely(!irqchip_in_kernel(vcpu->kvm)))
+  		static_branch_dec(&userspace_irqchip_in_use);
+  
+ -	kvm_mmu_free_memory_cache(&vcpu->arch.mmu_page_cache);
+ +	kvm_mmu_free_memory_caches(vcpu);
+  	kvm_timer_vcpu_terminate(vcpu);
+  	kvm_pmu_vcpu_destroy(vcpu);
+  
+@@@ -527,13 -584,23 +527,13 @@@ static void update_vmid(struct kvm_vmi
+  	spin_unlock(&kvm_vmid_lock);
+  }
+  
+ -static int kvm_vcpu_initialized(struct kvm_vcpu *vcpu)
+ -{
+ -	return vcpu->arch.target >= 0;
+ -}
+ -
+ -/*
+ - * Handle both the initialisation that is being done when the vcpu is
+ - * run for the first time, as well as the updates that must be
+ - * performed each time we get a new thread dealing with this vcpu.
+ - */
+ -int kvm_arch_vcpu_run_pid_change(struct kvm_vcpu *vcpu)
+ +static int kvm_vcpu_first_run_init(struct kvm_vcpu *vcpu)
+  {
+  	struct kvm *kvm = vcpu->kvm;
+ -	int ret;
+ +	int ret = 0;
+  
+- 	if (likely(vcpu->arch.has_run_once))
+ -	if (!kvm_vcpu_initialized(vcpu))
+ -		return -ENOEXEC;
+++	if (likely(vcpu_has_run_once(vcpu)))
+ +		return 0;
+  
+  	if (!kvm_arm_vcpu_is_finalized(vcpu))
+  		return -EPERM;
+@@@ -566,7 -640,13 +566,17 @@@
+  		static_branch_inc(&userspace_irqchip_in_use);
+  	}
+  
+++<<<<<<< HEAD
+ +	vcpu->arch.has_run_once = true;
+++=======
++ 	/*
++ 	 * Initialize traps for protected VMs.
++ 	 * NOTE: Move to run in EL2 directly, rather than via a hypercall, once
++ 	 * the code is in place for first run initialization at EL2.
++ 	 */
++ 	if (kvm_vm_is_protected(kvm))
++ 		kvm_call_hyp_nvhe(__pkvm_vcpu_init_traps, vcpu);
+++>>>>>>> cc5705fb1bf1 (KVM: arm64: Drop vcpu->arch.has_run_once for vcpu->pid)
+  
+  	return ret;
+  }
+@@@ -1004,11 -1130,11 +1014,16 @@@ static int kvm_arch_vcpu_ioctl_vcpu_ini
+  	 * need to invalidate the I-cache though, as FWB does *not*
+  	 * imply CTR_EL0.DIC.
+  	 */
+++<<<<<<< HEAD
+ +	if (vcpu->arch.has_run_once) {
+ +		if (!cpus_have_const_cap(ARM64_HAS_STAGE2_FWB))
+++=======
++ 	if (vcpu_has_run_once(vcpu)) {
++ 		if (!cpus_have_final_cap(ARM64_HAS_STAGE2_FWB))
+++>>>>>>> cc5705fb1bf1 (KVM: arm64: Drop vcpu->arch.has_run_once for vcpu->pid)
+  			stage2_unmap_vm(vcpu->kvm);
+  		else
+ -			icache_inval_all_pou();
+ +			__flush_icache_all();
+  	}
+  
+  	vcpu_reset_hcr(vcpu);
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+* Unmerged path arch/arm64/kvm/arm.c
+diff --git a/arch/arm64/kvm/vgic/vgic-init.c b/arch/arm64/kvm/vgic/vgic-init.c
+index 0ca733db4ca0..4bdc8ec1d973 100644
+--- a/arch/arm64/kvm/vgic/vgic-init.c
++++ b/arch/arm64/kvm/vgic/vgic-init.c
+@@ -103,7 +103,7 @@ int kvm_vgic_create(struct kvm *kvm, u32 type)
+ 		return ret;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+-		if (vcpu->arch.has_run_once)
++		if (vcpu_has_run_once(vcpu))
+ 			goto out_unlock;
+ 	}
+ 	ret = 0;
