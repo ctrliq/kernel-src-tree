@@ -1,0 +1,163 @@
+x86/decompressor: Move global symbol references to C code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit 24388292e2d7fae79a0d4183cc91716b851299cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/24388292.failed
+
+It is no longer necessary to be cautious when referring to global
+variables in the position independent decompressor code, now that it is
+built using PIE codegen and makes an assertion in the linker script that
+no GOT entries exist (which would require adjustment for the actual
+runtime load address of the decompressor binary).
+
+This means global variables can be referenced directly from C code,
+instead of having to pass their runtime addresses into C routines from
+asm code, which needs to happen at each call site. Do so for the code
+that will be called directly from the EFI stub after a subsequent patch,
+and avoid the need to duplicate this logic a third time.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Link: https://lore.kernel.org/r/20230807162720.545787-20-ardb@kernel.org
+(cherry picked from commit 24388292e2d7fae79a0d4183cc91716b851299cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/head_32.S
+#	arch/x86/boot/compressed/head_64.S
+diff --cc arch/x86/boot/compressed/head_32.S
+index 0411ad3c848c,3af4a383615b..000000000000
+--- a/arch/x86/boot/compressed/head_32.S
++++ b/arch/x86/boot/compressed/head_32.S
+@@@ -222,22 -166,11 +222,28 @@@ ENDPROC(efi32_stub_entry
+  /*
+   * Do the extraction, and jump to the new kernel..
+   */
+ -	/* push arguments for extract_kernel: */
+ +				/* push arguments for extract_kernel: */
+ +	pushl	$z_output_len	/* decompressed length, end of relocs */
+  
+++<<<<<<< HEAD
+ +	movl    BP_init_size(%esi), %eax
+ +	subl    $_end, %eax
+ +	movl    %ebx, %ebp
+ +	subl    %eax, %ebp
+ +	pushl	%ebp		/* output address */
+ +
+ +	pushl	$z_input_len	/* input_len */
+ +	leal	input_data(%ebx), %eax
+ +	pushl	%eax		/* input_data */
+ +	leal	boot_heap(%ebx), %eax
+ +	pushl	%eax		/* heap area */
+ +	pushl	%esi		/* real mode pointer */
+ +	call	extract_kernel	/* returns kernel location in %eax */
+++=======
++ 	pushl	%ebp			/* output address */
++ 	pushl	%esi			/* real mode pointer */
++ 	call	extract_kernel		/* returns kernel entry point in %eax */
+++>>>>>>> 24388292e2d7 (x86/decompressor: Move global symbol references to C code)
+  	addl	$24, %esp
+  
+  /*
+diff --cc arch/x86/boot/compressed/head_64.S
+index c4f3be19a58f,28f46051c706..000000000000
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@@ -548,15 -493,10 +548,22 @@@ SYM_FUNC_END(efi64_stub_entry
+  /*
+   * Do the extraction, and jump to the new kernel..
+   */
+++<<<<<<< HEAD
+ +	pushq	%rsi			/* Save the real mode argument */
+ +	movq	%rsi, %rdi		/* real mode address */
+ +	leaq	boot_heap(%rip), %rsi	/* malloc area for uncompression */
+ +	leaq	input_data(%rip), %rdx  /* input_data */
+ +	movl	$z_input_len, %ecx	/* input_len */
+ +	movq	%rbp, %r8		/* output target address */
+ +	movl	$z_output_len, %r9d	/* decompressed length, end of relocs */
+ +	call	extract_kernel		/* returns kernel location in %rax */
+ +	popq	%rsi
+++=======
++ 	/* pass struct boot_params pointer and output target address */
++ 	movq	%r15, %rdi
++ 	movq	%rbp, %rsi
++ 	call	extract_kernel		/* returns kernel entry point in %rax */
+++>>>>>>> 24388292e2d7 (x86/decompressor: Move global symbol references to C code)
+  
+  /*
+   * Jump to the decompressed kernel.
+@@@ -726,11 -653,10 +733,15 @@@ efi64_config
+   */
+  	.bss
+  	.balign 4
+++<<<<<<< HEAD
+ +boot_heap:
+ +	.fill BOOT_HEAP_SIZE, 1, 0
+ +boot_stack:
+++=======
++ SYM_DATA_START_LOCAL(boot_stack)
+++>>>>>>> 24388292e2d7 (x86/decompressor: Move global symbol references to C code)
+  	.fill BOOT_STACK_SIZE, 1, 0
+ -	.balign 16
+ -SYM_DATA_END_LABEL(boot_stack, SYM_L_LOCAL, boot_stack_end)
+ +boot_stack_end:
+  
+  /*
+   * Space for page tables (not in .bss so not zeroed)
+* Unmerged path arch/x86/boot/compressed/head_32.S
+* Unmerged path arch/x86/boot/compressed/head_64.S
+diff --git a/arch/x86/boot/compressed/misc.c b/arch/x86/boot/compressed/misc.c
+index 013afaeba37d..3df0bdceae4e 100644
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@ -325,6 +325,11 @@ static void parse_elf(void *output)
+ 	free(phdrs);
+ }
+ 
++static u8 boot_heap[BOOT_HEAP_SIZE] __aligned(4);
++
++extern unsigned char input_data[];
++extern unsigned int input_len, output_len;
++
+ /*
+  * The compressed kernel image (ZO), has been moved so that its position
+  * is against the end of the buffer used to hold the uncompressed kernel
+@@ -342,14 +347,11 @@ static void parse_elf(void *output)
+  *             |-------uncompressed kernel image---------|
+  *
+  */
+-asmlinkage __visible void *extract_kernel(void *rmode, memptr heap,
+-				  unsigned char *input_data,
+-				  unsigned long input_len,
+-				  unsigned char *output,
+-				  unsigned long output_len)
++asmlinkage __visible void *extract_kernel(void *rmode, unsigned char *output)
+ {
+ 	const unsigned long kernel_total_size = VO__end - VO__text;
+ 	unsigned long virt_addr = LOAD_PHYSICAL_ADDR;
++	memptr heap = (memptr)boot_heap;
+ 	unsigned long needed_size;
+ 
+ 	/* Retain x86 boot parameters pointer passed from startup_32/64. */
+@@ -406,7 +408,7 @@ asmlinkage __visible void *extract_kernel(void *rmode, memptr heap,
+ 	 * entries. This ensures the full mapped area is usable RAM
+ 	 * and doesn't include any reserved areas.
+ 	 */
+-	needed_size = max(output_len, kernel_total_size);
++	needed_size = max_t(unsigned long, output_len, kernel_total_size);
+ #ifdef CONFIG_X86_64
+ 	needed_size = ALIGN(needed_size, MIN_KERNEL_ALIGN);
+ #endif
+@@ -437,7 +439,7 @@ asmlinkage __visible void *extract_kernel(void *rmode, memptr heap,
+ #ifdef CONFIG_X86_64
+ 	if (heap > 0x3fffffffffffUL)
+ 		error("Destination address too large");
+-	if (virt_addr + max(output_len, kernel_total_size) > KERNEL_IMAGE_SIZE)
++	if (virt_addr + needed_size > KERNEL_IMAGE_SIZE)
+ 		error("Destination virtual address is beyond the kernel mapping area");
+ #else
+ 	if (heap > ((-__PAGE_OFFSET-(128<<20)-1) & 0x7fffffff))
