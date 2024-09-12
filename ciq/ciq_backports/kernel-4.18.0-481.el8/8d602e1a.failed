@@ -1,0 +1,488 @@
+net: move snowflake callers to netif_napi_add_tx_weight()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit 8d602e1a132e91eb7bc1a2cbe96019371eb8da64
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/8d602e1a.failed
+
+Make the drivers with custom tx napi weight call netif_napi_add_tx_weight().
+
+	Reviewed-by: Xuan Zhuo <xuanzhuo@linux.alibaba.com>
+Link: https://lore.kernel.org/r/20220504163725.550782-2-kuba@kernel.org
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 8d602e1a132e91eb7bc1a2cbe96019371eb8da64)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/freescale/gianfar.c
+#	drivers/net/ethernet/microchip/lan743x_main.c
+diff --cc drivers/net/ethernet/freescale/gianfar.c
+index 64db01f0bdf9,3dc9369a33f7..000000000000
+--- a/drivers/net/ethernet/freescale/gianfar.c
++++ b/drivers/net/ethernet/freescale/gianfar.c
+@@@ -1299,278 -984,194 +1299,285 @@@ static void gfar_init_addr_hash_table(s
+  	}
+  }
+  
+ -static int __gfar_is_rx_idle(struct gfar_private *priv)
+ +/* Set up the ethernet device structure, private data,
+ + * and anything else we need before we start
+ + */
+ +static int gfar_probe(struct platform_device *ofdev)
+  {
+ -	u32 res;
+ +	struct device_node *np = ofdev->dev.of_node;
+ +	struct net_device *dev = NULL;
+ +	struct gfar_private *priv = NULL;
+ +	int err = 0, i;
+  
+ -	/* Normaly TSEC should not hang on GRS commands, so we should
+ -	 * actually wait for IEVENT_GRSC flag.
+ -	 */
+ -	if (!gfar_has_errata(priv, GFAR_ERRATA_A002))
+ -		return 0;
+ +	err = gfar_of_init(ofdev, &dev);
+  
+ -	/* Read the eTSEC register at offset 0xD1C. If bits 7-14 are
+ -	 * the same as bits 23-30, the eTSEC Rx is assumed to be idle
+ -	 * and the Rx can be safely reset.
+ -	 */
+ -	res = gfar_read((void __iomem *)priv->gfargrp[0].regs + 0xd1c);
+ -	res &= 0x7f807f80;
+ -	if ((res & 0xffff) == (res >> 16))
+ -		return 1;
+ +	if (err)
+ +		return err;
+  
+ -	return 0;
+ -}
+ +	priv = netdev_priv(dev);
+ +	priv->ndev = dev;
+ +	priv->ofdev = ofdev;
+ +	priv->dev = &ofdev->dev;
+ +	SET_NETDEV_DEV(dev, &ofdev->dev);
+  
+ -/* Halt the receive and transmit queues */
+ -static void gfar_halt_nodisable(struct gfar_private *priv)
+ -{
+ -	struct gfar __iomem *regs = priv->gfargrp[0].regs;
+ -	u32 tempval;
+ -	unsigned int timeout;
+ -	int stopped;
+ +	INIT_WORK(&priv->reset_task, gfar_reset_task);
+  
+ -	gfar_ints_disable(priv);
+ +	platform_set_drvdata(ofdev, priv);
+  
+ -	if (gfar_is_dma_stopped(priv))
+ -		return;
+ +	gfar_detect_errata(priv);
+  
+ -	/* Stop the DMA, and wait for it to stop */
+ -	tempval = gfar_read(&regs->dmactrl);
+ -	tempval |= (DMACTRL_GRS | DMACTRL_GTS);
+ -	gfar_write(&regs->dmactrl, tempval);
+ +	/* Set the dev->base_addr to the gfar reg region */
+ +	dev->base_addr = (unsigned long) priv->gfargrp[0].regs;
+  
+ -retry:
+ -	timeout = 1000;
+ -	while (!(stopped = gfar_is_dma_stopped(priv)) && timeout) {
+ -		cpu_relax();
+ -		timeout--;
+ +	/* Fill in the dev structure */
+ +	dev->watchdog_timeo = TX_TIMEOUT;
+ +	/* MTU range: 50 - 9586 */
+ +	dev->mtu = 1500;
+ +	dev->min_mtu = 50;
+ +	dev->max_mtu = GFAR_JUMBO_FRAME_SIZE - ETH_HLEN;
+ +	dev->netdev_ops = &gfar_netdev_ops;
+ +	dev->ethtool_ops = &gfar_ethtool_ops;
+ +
+ +	/* Register for napi ...We are registering NAPI for each grp */
+ +	for (i = 0; i < priv->num_grps; i++) {
+++<<<<<<< HEAD
+ +		if (priv->poll_mode == GFAR_SQ_POLLING) {
+ +			netif_napi_add(dev, &priv->gfargrp[i].napi_rx,
+ +				       gfar_poll_rx_sq, GFAR_DEV_WEIGHT);
+ +			netif_tx_napi_add(dev, &priv->gfargrp[i].napi_tx,
+ +				       gfar_poll_tx_sq, 2);
+ +		} else {
+ +			netif_napi_add(dev, &priv->gfargrp[i].napi_rx,
+ +				       gfar_poll_rx, GFAR_DEV_WEIGHT);
+ +			netif_tx_napi_add(dev, &priv->gfargrp[i].napi_tx,
+ +				       gfar_poll_tx, 2);
+ +		}
+++=======
+++		netif_napi_add(dev, &priv->gfargrp[i].napi_rx,
+++			       gfar_poll_rx_sq, NAPI_POLL_WEIGHT);
+++		netif_napi_add_tx_weight(dev, &priv->gfargrp[i].napi_tx,
+++					 gfar_poll_tx_sq, 2);
+++>>>>>>> 8d602e1a132e (net: move snowflake callers to netif_napi_add_tx_weight())
+  	}
+  
+ -	if (!timeout)
+ -		stopped = gfar_is_dma_stopped(priv);
+ +	if (priv->device_flags & FSL_GIANFAR_DEV_HAS_CSUM) {
+ +		dev->hw_features = NETIF_F_IP_CSUM | NETIF_F_SG |
+ +				   NETIF_F_RXCSUM;
+ +		dev->features |= NETIF_F_IP_CSUM | NETIF_F_SG |
+ +				 NETIF_F_RXCSUM | NETIF_F_HIGHDMA;
+ +	}
+  
+ -	if (!stopped && !gfar_is_rx_dma_stopped(priv) &&
+ -	    !__gfar_is_rx_idle(priv))
+ -		goto retry;
+ -}
+ +	if (priv->device_flags & FSL_GIANFAR_DEV_HAS_VLAN) {
+ +		dev->hw_features |= NETIF_F_HW_VLAN_CTAG_TX |
+ +				    NETIF_F_HW_VLAN_CTAG_RX;
+ +		dev->features |= NETIF_F_HW_VLAN_CTAG_RX;
+ +	}
+  
+ -/* Halt the receive and transmit queues */
+ -static void gfar_halt(struct gfar_private *priv)
+ -{
+ -	struct gfar __iomem *regs = priv->gfargrp[0].regs;
+ -	u32 tempval;
+ +	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
+  
+ -	/* Dissable the Rx/Tx hw queues */
+ -	gfar_write(&regs->rqueue, 0);
+ -	gfar_write(&regs->tqueue, 0);
+ +	gfar_init_addr_hash_table(priv);
+  
+ -	mdelay(10);
+ +	/* Insert receive time stamps into padding alignment bytes, and
+ +	 * plus 2 bytes padding to ensure the cpu alignment.
+ +	 */
+ +	if (priv->device_flags & FSL_GIANFAR_DEV_HAS_TIMER)
+ +		priv->padding = 8 + DEFAULT_PADDING;
+  
+ -	gfar_halt_nodisable(priv);
+ +	if (dev->features & NETIF_F_IP_CSUM ||
+ +	    priv->device_flags & FSL_GIANFAR_DEV_HAS_TIMER)
+ +		dev->needed_headroom = GMAC_FCB_LEN;
+  
+ -	/* Disable Rx/Tx DMA */
+ -	tempval = gfar_read(&regs->maccfg1);
+ -	tempval &= ~(MACCFG1_RX_EN | MACCFG1_TX_EN);
+ -	gfar_write(&regs->maccfg1, tempval);
+ -}
+ +	/* Initializing some of the rx/tx queue level parameters */
+ +	for (i = 0; i < priv->num_tx_queues; i++) {
+ +		priv->tx_queue[i]->tx_ring_size = DEFAULT_TX_RING_SIZE;
+ +		priv->tx_queue[i]->num_txbdfree = DEFAULT_TX_RING_SIZE;
+ +		priv->tx_queue[i]->txcoalescing = DEFAULT_TX_COALESCE;
+ +		priv->tx_queue[i]->txic = DEFAULT_TXIC;
+ +	}
+  
+ -static void free_skb_tx_queue(struct gfar_priv_tx_q *tx_queue)
+ -{
+ -	struct txbd8 *txbdp;
+ -	struct gfar_private *priv = netdev_priv(tx_queue->dev);
+ -	int i, j;
+ +	for (i = 0; i < priv->num_rx_queues; i++) {
+ +		priv->rx_queue[i]->rx_ring_size = DEFAULT_RX_RING_SIZE;
+ +		priv->rx_queue[i]->rxcoalescing = DEFAULT_RX_COALESCE;
+ +		priv->rx_queue[i]->rxic = DEFAULT_RXIC;
+ +	}
+  
+ -	txbdp = tx_queue->tx_bd_base;
+ +	/* Always enable rx filer if available */
+ +	priv->rx_filer_enable =
+ +	    (priv->device_flags & FSL_GIANFAR_DEV_HAS_RX_FILER) ? 1 : 0;
+ +	/* Enable most messages by default */
+ +	priv->msg_enable = (NETIF_MSG_IFUP << 1 ) - 1;
+ +	/* use pritority h/w tx queue scheduling for single queue devices */
+ +	if (priv->num_tx_queues == 1)
+ +		priv->prio_sched_en = 1;
+  
+ -	for (i = 0; i < tx_queue->tx_ring_size; i++) {
+ -		if (!tx_queue->tx_skbuff[i])
+ -			continue;
+ +	set_bit(GFAR_DOWN, &priv->state);
+  
+ -		dma_unmap_single(priv->dev, be32_to_cpu(txbdp->bufPtr),
+ -				 be16_to_cpu(txbdp->length), DMA_TO_DEVICE);
+ -		txbdp->lstatus = 0;
+ -		for (j = 0; j < skb_shinfo(tx_queue->tx_skbuff[i])->nr_frags;
+ -		     j++) {
+ -			txbdp++;
+ -			dma_unmap_page(priv->dev, be32_to_cpu(txbdp->bufPtr),
+ -				       be16_to_cpu(txbdp->length),
+ -				       DMA_TO_DEVICE);
+ -		}
+ -		txbdp++;
+ -		dev_kfree_skb_any(tx_queue->tx_skbuff[i]);
+ -		tx_queue->tx_skbuff[i] = NULL;
+ +	gfar_hw_init(priv);
+ +
+ +	/* Carrier starts down, phylib will bring it up */
+ +	netif_carrier_off(dev);
+ +
+ +	err = register_netdev(dev);
+ +
+ +	if (err) {
+ +		pr_err("%s: Cannot register net device, aborting\n", dev->name);
+ +		goto register_fail;
+  	}
+ -	kfree(tx_queue->tx_skbuff);
+ -	tx_queue->tx_skbuff = NULL;
+ -}
+  
+ -static void free_skb_rx_queue(struct gfar_priv_rx_q *rx_queue)
+ -{
+ -	int i;
+ +	if (priv->device_flags & FSL_GIANFAR_DEV_HAS_MAGIC_PACKET)
+ +		priv->wol_supported |= GFAR_WOL_MAGIC;
+  
+ -	struct rxbd8 *rxbdp = rx_queue->rx_bd_base;
+ +	if ((priv->device_flags & FSL_GIANFAR_DEV_HAS_WAKE_ON_FILER) &&
+ +	    priv->rx_filer_enable)
+ +		priv->wol_supported |= GFAR_WOL_FILER_UCAST;
+  
+ -	dev_kfree_skb(rx_queue->skb);
+ +	device_set_wakeup_capable(&ofdev->dev, priv->wol_supported);
+  
+ -	for (i = 0; i < rx_queue->rx_ring_size; i++) {
+ -		struct	gfar_rx_buff *rxb = &rx_queue->rx_buff[i];
+ +	/* fill out IRQ number and name fields */
+ +	for (i = 0; i < priv->num_grps; i++) {
+ +		struct gfar_priv_grp *grp = &priv->gfargrp[i];
+ +		if (priv->device_flags & FSL_GIANFAR_DEV_HAS_MULTI_INTR) {
+ +			sprintf(gfar_irq(grp, TX)->name, "%s%s%c%s",
+ +				dev->name, "_g", '0' + i, "_tx");
+ +			sprintf(gfar_irq(grp, RX)->name, "%s%s%c%s",
+ +				dev->name, "_g", '0' + i, "_rx");
+ +			sprintf(gfar_irq(grp, ER)->name, "%s%s%c%s",
+ +				dev->name, "_g", '0' + i, "_er");
+ +		} else
+ +			strcpy(gfar_irq(grp, TX)->name, dev->name);
+ +	}
+  
+ -		rxbdp->lstatus = 0;
+ -		rxbdp->bufPtr = 0;
+ -		rxbdp++;
+ +	/* Initialize the filer table */
+ +	gfar_init_filer_table(priv);
+  
+ -		if (!rxb->page)
+ -			continue;
+ +	/* Print out the device info */
+ +	netdev_info(dev, "mac: %pM\n", dev->dev_addr);
+  
+ -		dma_unmap_page(rx_queue->dev, rxb->dma,
+ -			       PAGE_SIZE, DMA_FROM_DEVICE);
+ -		__free_page(rxb->page);
+ +	/* Even more device info helps when determining which kernel
+ +	 * provided which set of benchmarks.
+ +	 */
+ +	netdev_info(dev, "Running with NAPI enabled\n");
+ +	for (i = 0; i < priv->num_rx_queues; i++)
+ +		netdev_info(dev, "RX BD ring size for Q[%d]: %d\n",
+ +			    i, priv->rx_queue[i]->rx_ring_size);
+ +	for (i = 0; i < priv->num_tx_queues; i++)
+ +		netdev_info(dev, "TX BD ring size for Q[%d]: %d\n",
+ +			    i, priv->tx_queue[i]->tx_ring_size);
+  
+ -		rxb->page = NULL;
+ -	}
+ +	return 0;
+  
+ -	kfree(rx_queue->rx_buff);
+ -	rx_queue->rx_buff = NULL;
+ +register_fail:
+ +	if (of_phy_is_fixed_link(np))
+ +		of_phy_deregister_fixed_link(np);
+ +	unmap_group_regs(priv);
+ +	gfar_free_rx_queues(priv);
+ +	gfar_free_tx_queues(priv);
+ +	of_node_put(priv->phy_node);
+ +	of_node_put(priv->tbi_node);
+ +	free_gfar_dev(priv);
+ +	return err;
+  }
+  
+ -/* If there are any tx skbs or rx skbs still around, free them.
+ - * Then free tx_skbuff and rx_skbuff
+ - */
+ -static void free_skb_resources(struct gfar_private *priv)
+ +static int gfar_remove(struct platform_device *ofdev)
+  {
+ -	struct gfar_priv_tx_q *tx_queue = NULL;
+ -	struct gfar_priv_rx_q *rx_queue = NULL;
+ -	int i;
+ +	struct gfar_private *priv = platform_get_drvdata(ofdev);
+ +	struct device_node *np = ofdev->dev.of_node;
+  
+ -	/* Go through all the buffer descriptors and free their data buffers */
+ -	for (i = 0; i < priv->num_tx_queues; i++) {
+ -		struct netdev_queue *txq;
+ +	of_node_put(priv->phy_node);
+ +	of_node_put(priv->tbi_node);
+  
+ -		tx_queue = priv->tx_queue[i];
+ -		txq = netdev_get_tx_queue(tx_queue->dev, tx_queue->qindex);
+ -		if (tx_queue->tx_skbuff)
+ -			free_skb_tx_queue(tx_queue);
+ -		netdev_tx_reset_queue(txq);
+ -	}
+ +	unregister_netdev(priv->ndev);
+  
+ -	for (i = 0; i < priv->num_rx_queues; i++) {
+ -		rx_queue = priv->rx_queue[i];
+ -		if (rx_queue->rx_buff)
+ -			free_skb_rx_queue(rx_queue);
+ -	}
+ +	if (of_phy_is_fixed_link(np))
+ +		of_phy_deregister_fixed_link(np);
+  
+ -	dma_free_coherent(priv->dev,
+ -			  sizeof(struct txbd8) * priv->total_tx_ring_size +
+ -			  sizeof(struct rxbd8) * priv->total_rx_ring_size,
+ -			  priv->tx_queue[0]->tx_bd_base,
+ -			  priv->tx_queue[0]->tx_bd_dma_base);
+ +	unmap_group_regs(priv);
+ +	gfar_free_rx_queues(priv);
+ +	gfar_free_tx_queues(priv);
+ +	free_gfar_dev(priv);
+ +
+ +	return 0;
+  }
+  
+ -void stop_gfar(struct net_device *dev)
+ +#ifdef CONFIG_PM
+ +
+ +static void __gfar_filer_disable(struct gfar_private *priv)
+  {
+ -	struct gfar_private *priv = netdev_priv(dev);
+ +	struct gfar __iomem *regs = priv->gfargrp[0].regs;
+ +	u32 temp;
+  
+ -	netif_tx_stop_all_queues(dev);
+ +	temp = gfar_read(&regs->rctrl);
+ +	temp &= ~(RCTRL_FILREN | RCTRL_PRSDEP_INIT);
+ +	gfar_write(&regs->rctrl, temp);
+ +}
+  
+ -	smp_mb__before_atomic();
+ -	set_bit(GFAR_DOWN, &priv->state);
+ -	smp_mb__after_atomic();
+ +static void __gfar_filer_enable(struct gfar_private *priv)
+ +{
+ +	struct gfar __iomem *regs = priv->gfargrp[0].regs;
+ +	u32 temp;
+  
+ -	disable_napi(priv);
+ +	temp = gfar_read(&regs->rctrl);
+ +	temp |= RCTRL_FILREN | RCTRL_PRSDEP_INIT;
+ +	gfar_write(&regs->rctrl, temp);
+ +}
+  
+ -	/* disable ints and gracefully shut down Rx/Tx DMA */
+ -	gfar_halt(priv);
+ +/* Filer rules implementing wol capabilities */
+ +static void gfar_filer_config_wol(struct gfar_private *priv)
+ +{
+ +	unsigned int i;
+ +	u32 rqfcr;
+  
+ -	phy_stop(dev->phydev);
+ +	__gfar_filer_disable(priv);
+  
+ -	free_skb_resources(priv);
+ +	/* clear the filer table, reject any packet by default */
+ +	rqfcr = RQFCR_RJE | RQFCR_CMP_MATCH;
+ +	for (i = 0; i <= MAX_FILER_IDX; i++)
+ +		gfar_write_filer(priv, i, rqfcr, 0);
+ +
+ +	i = 0;
+ +	if (priv->wol_opts & GFAR_WOL_FILER_UCAST) {
+ +		/* unicast packet, accept it */
+ +		struct net_device *ndev = priv->ndev;
+ +		/* get the default rx queue index */
+ +		u8 qindex = (u8)priv->gfargrp[0].rx_queue->qindex;
+ +		u32 dest_mac_addr = (ndev->dev_addr[0] << 16) |
+ +				    (ndev->dev_addr[1] << 8) |
+ +				     ndev->dev_addr[2];
+ +
+ +		rqfcr = (qindex << 10) | RQFCR_AND |
+ +			RQFCR_CMP_EXACT | RQFCR_PID_DAH;
+ +
+ +		gfar_write_filer(priv, i++, rqfcr, dest_mac_addr);
+ +
+ +		dest_mac_addr = (ndev->dev_addr[3] << 16) |
+ +				(ndev->dev_addr[4] << 8) |
+ +				 ndev->dev_addr[5];
+ +		rqfcr = (qindex << 10) | RQFCR_GPI |
+ +			RQFCR_CMP_EXACT | RQFCR_PID_DAL;
+ +		gfar_write_filer(priv, i++, rqfcr, dest_mac_addr);
+ +	}
+ +
+ +	__gfar_filer_enable(priv);
+ +}
+ +
+ +static void gfar_filer_restore_table(struct gfar_private *priv)
+ +{
+ +	u32 rqfcr, rqfpr;
+ +	unsigned int i;
+ +
+ +	__gfar_filer_disable(priv);
+ +
+ +	for (i = 0; i <= MAX_FILER_IDX; i++) {
+ +		rqfcr = priv->ftp_rqfcr[i];
+ +		rqfpr = priv->ftp_rqfpr[i];
+ +		gfar_write_filer(priv, i, rqfcr, rqfpr);
+ +	}
+ +
+ +	__gfar_filer_enable(priv);
+  }
+  
+ -static void gfar_start(struct gfar_private *priv)
+ +/* gfar_start() for Rx only and with the FGPI filer interrupt enabled */
+ +static void gfar_start_wol_filer(struct gfar_private *priv)
+  {
+  	struct gfar __iomem *regs = priv->gfargrp[0].regs;
+  	u32 tempval;
+diff --cc drivers/net/ethernet/microchip/lan743x_main.c
+index ccc1e25df20b,efbddf24ba31..000000000000
+--- a/drivers/net/ethernet/microchip/lan743x_main.c
++++ b/drivers/net/ethernet/microchip/lan743x_main.c
+@@@ -1798,9 -2044,9 +1798,15 @@@ static int lan743x_tx_open(struct lan74
+  	tx->vector_flags = lan743x_intr_get_vector_flags(adapter,
+  							 INT_BIT_DMA_TX_
+  							 (tx->channel_number));
+++<<<<<<< HEAD
+ +	netif_napi_add(adapter->netdev,
+ +		       &tx->napi, lan743x_tx_napi_poll,
+ +		       tx->ring_size - 1);
+++=======
++ 	netif_napi_add_tx_weight(adapter->netdev,
++ 				 &tx->napi, lan743x_tx_napi_poll,
++ 				 tx->ring_size - 1);
+++>>>>>>> 8d602e1a132e (net: move snowflake callers to netif_napi_add_tx_weight())
+  	napi_enable(&tx->napi);
+  
+  	data = 0;
+* Unmerged path drivers/net/ethernet/freescale/gianfar.c
+* Unmerged path drivers/net/ethernet/microchip/lan743x_main.c
+diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
+index 21f7c211dc16..7c3236eceb50 100644
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -2902,8 +2902,9 @@ static int virtnet_alloc_queues(struct virtnet_info *vi)
+ 		vi->rq[i].pages = NULL;
+ 		netif_napi_add(vi->dev, &vi->rq[i].napi, virtnet_poll,
+ 			       napi_weight);
+-		netif_tx_napi_add(vi->dev, &vi->sq[i].napi, virtnet_poll_tx,
+-				  napi_tx ? napi_weight : 0);
++		netif_napi_add_tx_weight(vi->dev, &vi->sq[i].napi,
++					 virtnet_poll_tx,
++					 napi_tx ? napi_weight : 0);
+ 
+ 		sg_init_table(vi->rq[i].sg, ARRAY_SIZE(vi->rq[i].sg));
+ 		ewma_pkt_len_init(&vi->rq[i].mrg_avg_pkt_len);
