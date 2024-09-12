@@ -1,0 +1,126 @@
+x86/alternative: Fix race in try_get_desc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-539.el8
+commit-author Nadav Amit <namit@vmware.com>
+commit efd608fa7403ba106412b437f873929e2c862e28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-539.el8/efd608fa.failed
+
+I encountered some occasional crashes of poke_int3_handler() when
+kprobes are set, while accessing desc->vec.
+
+The text poke mechanism claims to have an RCU-like behavior, but it
+does not appear that there is any quiescent state to ensure that
+nobody holds reference to desc. As a result, the following race
+appears to be possible, which can lead to memory corruption.
+
+  CPU0					CPU1
+  ----					----
+  text_poke_bp_batch()
+  -> smp_store_release(&bp_desc, &desc)
+
+  [ notice that desc is on
+    the stack			]
+
+					poke_int3_handler()
+
+					[ int3 might be kprobe's
+					  so sync events are do not
+					  help ]
+
+					-> try_get_desc(descp=&bp_desc)
+					   desc = __READ_ONCE(bp_desc)
+
+					   if (!desc) [false, success]
+  WRITE_ONCE(bp_desc, NULL);
+  atomic_dec_and_test(&desc.refs)
+
+  [ success, desc space on the stack
+    is being reused and might have
+    non-zero value. ]
+					arch_atomic_inc_not_zero(&desc->refs)
+
+					[ might succeed since desc points to
+					  stack memory that was freed and might
+					  be reused. ]
+
+Fix this issue with small backportable patch. Instead of trying to
+make RCU-like behavior for bp_desc, just eliminate the unnecessary
+level of indirection of bp_desc, and hold the whole descriptor as a
+global.  Anyhow, there is only a single descriptor at any given
+moment.
+
+Fixes: 1f676247f36a4 ("x86/alternatives: Implement a better poke_int3_handler() completion scheme")
+	Signed-off-by: Nadav Amit <namit@vmware.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: stable@kernel.org
+Link: https://lkml.kernel.org/r/20220920224743.3089-1-namit@vmware.com
+(cherry picked from commit efd608fa7403ba106412b437f873929e2c862e28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/alternative.c
+diff --cc arch/x86/kernel/alternative.c
+index 4e8d290a38f0,4f3204364caa..000000000000
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@@ -904,26 -1319,28 +904,41 @@@ struct bp_patching_desc 
+  	atomic_t refs;
+  };
+  
+- static struct bp_patching_desc *bp_desc;
++ static struct bp_patching_desc bp_desc;
+  
+++<<<<<<< HEAD
+ +static inline struct bp_patching_desc *try_get_desc(struct bp_patching_desc **descp)
+ +{
+ +	/* rcu_dereference */
+ +	struct bp_patching_desc *desc = READ_ONCE(*descp);
+ +
+ +	if (!desc || !atomic_inc_not_zero(&desc->refs))
+++=======
++ static __always_inline
++ struct bp_patching_desc *try_get_desc(void)
++ {
++ 	struct bp_patching_desc *desc = &bp_desc;
++ 
++ 	if (!arch_atomic_inc_not_zero(&desc->refs))
+++>>>>>>> efd608fa7403 (x86/alternative: Fix race in try_get_desc())
+  		return NULL;
+  
+  	return desc;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void put_desc(struct bp_patching_desc *desc)
+++=======
++ static __always_inline void put_desc(void)
+++>>>>>>> efd608fa7403 (x86/alternative: Fix race in try_get_desc())
+  {
++ 	struct bp_patching_desc *desc = &bp_desc;
++ 
+  	smp_mb__before_atomic();
+ -	arch_atomic_dec(&desc->refs);
+ +	atomic_dec(&desc->refs);
+  }
+  
+ -static __always_inline void *text_poke_addr(struct text_poke_loc *tp)
+ +static inline void *text_poke_addr(struct text_poke_loc *tp)
+  {
+  	return _stext + tp->rel_addr;
+  }
+@@@ -1014,10 -1430,9 +1029,10 @@@ int notrace poke_int3_handler(struct pt
+  	ret = 1;
+  
+  out_put:
+- 	put_desc(desc);
++ 	put_desc();
+  	return ret;
+  }
+ +NOKPROBE_SYMBOL(poke_int3_handler);
+  
+  #define TP_VEC_MAX (PAGE_SIZE / sizeof(struct text_poke_loc))
+  static struct text_poke_loc tp_vec[TP_VEC_MAX];
+* Unmerged path arch/x86/kernel/alternative.c
