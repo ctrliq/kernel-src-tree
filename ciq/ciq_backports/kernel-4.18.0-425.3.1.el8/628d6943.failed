@@ -1,0 +1,126 @@
+netfilter: conntrack: reduce timeout when receiving out-of-window fin or rst
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 628d694344a02a428846643791e8b26071b76328
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/628d6943.failed
+
+In case the endpoints and conntrack go out-of-sync, i.e. there is
+disagreement wrt. validy of sequence/ack numbers between conntracks
+internal state and those of the endpoints, connections can hang for a
+long time (until ESTABLISHED timeout).
+
+This adds a check to detect a fin/fin exchange even if those are
+invalid.  The timeout is then lowered to UNACKED (default 300s).
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 628d694344a02a428846643791e8b26071b76328)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_proto_tcp.c
+diff --cc net/netfilter/nf_conntrack_proto_tcp.c
+index f9bb6bbd54e2,656631083177..000000000000
+--- a/net/netfilter/nf_conntrack_proto_tcp.c
++++ b/net/netfilter/nf_conntrack_proto_tcp.c
+@@@ -714,14 -714,66 +714,71 @@@ static bool tcp_in_window(const struct 
+  		}
+  	}
+  
+ -	return NFCT_TCP_ACCEPT;
+ +	pr_debug("tcp_in_window: res=%u sender end=%u maxend=%u maxwin=%u "
+ +		 "receiver end=%u maxend=%u maxwin=%u\n",
+ +		 res, sender->td_end, sender->td_maxend, sender->td_maxwin,
+ +		 receiver->td_end, receiver->td_maxend, receiver->td_maxwin);
+ +
+ +	return res;
+  }
+  
++ static void __cold nf_tcp_handle_invalid(struct nf_conn *ct,
++ 					 enum ip_conntrack_dir dir,
++ 					 int index,
++ 					 const struct sk_buff *skb,
++ 					 const struct nf_hook_state *hook_state)
++ {
++ 	const unsigned int *timeouts;
++ 	const struct nf_tcp_net *tn;
++ 	unsigned int timeout;
++ 	u32 expires;
++ 
++ 	if (!test_bit(IPS_ASSURED_BIT, &ct->status) ||
++ 	    test_bit(IPS_FIXED_TIMEOUT_BIT, &ct->status))
++ 		return;
++ 
++ 	/* We don't want to have connections hanging around in ESTABLISHED
++ 	 * state for long time 'just because' conntrack deemed a FIN/RST
++ 	 * out-of-window.
++ 	 *
++ 	 * Shrink the timeout just like when there is unacked data.
++ 	 * This speeds up eviction of 'dead' connections where the
++ 	 * connection and conntracks internal state are out of sync.
++ 	 */
++ 	switch (index) {
++ 	case TCP_RST_SET:
++ 	case TCP_FIN_SET:
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ 
++ 	if (ct->proto.tcp.last_dir != dir &&
++ 	    (ct->proto.tcp.last_index == TCP_FIN_SET ||
++ 	     ct->proto.tcp.last_index == TCP_RST_SET)) {
++ 		expires = nf_ct_expires(ct);
++ 		if (expires < 120 * HZ)
++ 			return;
++ 
++ 		tn = nf_tcp_pernet(nf_ct_net(ct));
++ 		timeouts = nf_ct_timeout_lookup(ct);
++ 		if (!timeouts)
++ 			timeouts = tn->timeouts;
++ 
++ 		timeout = READ_ONCE(timeouts[TCP_CONNTRACK_UNACK]);
++ 		if (expires > timeout) {
++ 			nf_ct_l4proto_log_invalid(skb, ct, hook_state,
++ 					  "packet (index %d, dir %d) response for index %d lower timeout to %u",
++ 					  index, dir, ct->proto.tcp.last_index, timeout);
++ 
++ 			WRITE_ONCE(ct->timeout, timeout + nfct_time_stamp);
++ 		}
++ 	} else {
++ 		ct->proto.tcp.last_index = index;
++ 		ct->proto.tcp.last_dir = dir;
++ 	}
++ }
++ 
+  /* table of valid flag combinations - PUSH, ECE and CWR are always valid */
+  static const u8 tcp_valid_flags[(TCPHDR_FIN|TCPHDR_SYN|TCPHDR_RST|TCPHDR_ACK|
+  				 TCPHDR_URG) + 1] =
+@@@ -1119,10 -1199,18 +1176,21 @@@ int nf_conntrack_tcp_packet(struct nf_c
+  		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!tcp_in_window(ct, &ct->proto.tcp, dir, index,
+ +			   skb, dataoff, th)) {
+++=======
++ 	res = tcp_in_window(ct, dir, index,
++ 			    skb, dataoff, th, state);
++ 	switch (res) {
++ 	case NFCT_TCP_IGNORE:
++ 		spin_unlock_bh(&ct->lock);
++ 		return NF_ACCEPT;
++ 	case NFCT_TCP_INVALID:
++ 		nf_tcp_handle_invalid(ct, dir, index, skb, state);
+++>>>>>>> 628d694344a0 (netfilter: conntrack: reduce timeout when receiving out-of-window fin or rst)
+  		spin_unlock_bh(&ct->lock);
+  		return -NF_ACCEPT;
+ -	case NFCT_TCP_ACCEPT:
+ -		break;
+  	}
+       in_window:
+  	/* From now on we have got in-window packets */
+* Unmerged path net/netfilter/nf_conntrack_proto_tcp.c
