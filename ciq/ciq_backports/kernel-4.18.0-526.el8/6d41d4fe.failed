@@ -1,0 +1,130 @@
+net: xfrm: skip policies marked as dead while reinserting policies
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-526.el8
+commit-author Dong Chenchen <dongchenchen2@huawei.com>
+commit 6d41d4fe28724db16ca1016df0713a07e0cc7448
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-526.el8/6d41d4fe.failed
+
+BUG: KASAN: slab-use-after-free in xfrm_policy_inexact_list_reinsert+0xb6/0x430
+Read of size 1 at addr ffff8881051f3bf8 by task ip/668
+
+CPU: 2 PID: 668 Comm: ip Not tainted 6.5.0-rc5-00182-g25aa0bebba72-dirty #64
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.13 04/01/2014
+Call Trace:
+ <TASK>
+ dump_stack_lvl+0x72/0xa0
+ print_report+0xd0/0x620
+ kasan_report+0xb6/0xf0
+ xfrm_policy_inexact_list_reinsert+0xb6/0x430
+ xfrm_policy_inexact_insert_node.constprop.0+0x537/0x800
+ xfrm_policy_inexact_alloc_chain+0x23f/0x320
+ xfrm_policy_inexact_insert+0x6b/0x590
+ xfrm_policy_insert+0x3b1/0x480
+ xfrm_add_policy+0x23c/0x3c0
+ xfrm_user_rcv_msg+0x2d0/0x510
+ netlink_rcv_skb+0x10d/0x2d0
+ xfrm_netlink_rcv+0x49/0x60
+ netlink_unicast+0x3fe/0x540
+ netlink_sendmsg+0x528/0x970
+ sock_sendmsg+0x14a/0x160
+ ____sys_sendmsg+0x4fc/0x580
+ ___sys_sendmsg+0xef/0x160
+ __sys_sendmsg+0xf7/0x1b0
+ do_syscall_64+0x3f/0x90
+ entry_SYSCALL_64_after_hwframe+0x73/0xdd
+
+The root cause is:
+
+cpu 0			cpu1
+xfrm_dump_policy
+xfrm_policy_walk
+list_move_tail
+			xfrm_add_policy
+			... ...
+			xfrm_policy_inexact_list_reinsert
+			list_for_each_entry_reverse
+				if (!policy->bydst_reinsert)
+				//read non-existent policy
+xfrm_dump_policy_done
+xfrm_policy_walk_done
+list_del(&walk->walk.all);
+
+If dump_one_policy() returns err (triggered by netlink socket),
+xfrm_policy_walk() will move walk initialized by socket to list
+net->xfrm.policy_all. so this socket becomes visible in the global
+policy list. The head *walk can be traversed when users add policies
+with different prefixlen and trigger xfrm_policy node merge.
+
+The issue can also be triggered by policy list traversal while rehashing
+and flushing policies.
+
+It can be fixed by skip such "policies" with walk.dead set to 1.
+
+Fixes: 9cf545ebd591 ("xfrm: policy: store inexact policies in a tree ordered by destination address")
+Fixes: 12a169e7d8f4 ("ipsec: Put dumpers on the dump list")
+	Signed-off-by: Dong Chenchen <dongchenchen2@huawei.com>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 6d41d4fe28724db16ca1016df0713a07e0cc7448)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xfrm/xfrm_policy.c
+diff --cc net/xfrm/xfrm_policy.c
+index 5cee3d8061aa,113fb7e9cdaf..000000000000
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@@ -1807,6 -1853,47 +1812,50 @@@ out
+  }
+  EXPORT_SYMBOL(xfrm_policy_flush);
+  
+++<<<<<<< HEAD
+++=======
++ int xfrm_dev_policy_flush(struct net *net, struct net_device *dev,
++ 			  bool task_valid)
++ {
++ 	int dir, err = 0, cnt = 0;
++ 	struct xfrm_policy *pol;
++ 
++ 	spin_lock_bh(&net->xfrm.xfrm_policy_lock);
++ 
++ 	err = xfrm_dev_policy_flush_secctx_check(net, dev, task_valid);
++ 	if (err)
++ 		goto out;
++ 
++ again:
++ 	list_for_each_entry(pol, &net->xfrm.policy_all, walk.all) {
++ 		if (pol->walk.dead)
++ 			continue;
++ 
++ 		dir = xfrm_policy_id2dir(pol->index);
++ 		if (dir >= XFRM_POLICY_MAX ||
++ 		    pol->xdo.dev != dev)
++ 			continue;
++ 
++ 		__xfrm_policy_unlink(pol, dir);
++ 		spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
++ 		xfrm_dev_policy_delete(pol);
++ 		cnt++;
++ 		xfrm_audit_policy_delete(pol, 1, task_valid);
++ 		xfrm_policy_kill(pol);
++ 		spin_lock_bh(&net->xfrm.xfrm_policy_lock);
++ 		goto again;
++ 	}
++ 	if (cnt)
++ 		__xfrm_policy_inexact_flush(net);
++ 	else
++ 		err = -ESRCH;
++ out:
++ 	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
++ 	return err;
++ }
++ EXPORT_SYMBOL(xfrm_dev_policy_flush);
++ 
+++>>>>>>> 6d41d4fe2872 (net: xfrm: skip policies marked as dead while reinserting policies)
+  int xfrm_policy_walk(struct net *net, struct xfrm_policy_walk *walk,
+  		     int (*func)(struct xfrm_policy *, int, int, void*),
+  		     void *data)
+* Unmerged path net/xfrm/xfrm_policy.c
