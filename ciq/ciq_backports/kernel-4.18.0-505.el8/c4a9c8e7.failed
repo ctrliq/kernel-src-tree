@@ -1,0 +1,300 @@
+ice: don't ignore return codes in VSI related code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-505.el8
+commit-author Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+commit c4a9c8e78aad0fd9b79c9b1e83bab3288a15ce3c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-505.el8/c4a9c8e7.failed
+
+There were few smatch warnings reported by Dan:
+- ice_vsi_cfg_xdp_txqs can return 0 instead of ret, which is cleaner
+- return values in ice_vsi_cfg_def were ignored
+- in ice_vsi_rebuild return value was ignored in case rebuild failed,
+  it was a never reached code, however, rewrite it for clarity.
+- ice_vsi_cfg_tc can return 0 instead of ret
+
+Fixes: 6624e780a577 ("ice: split ice_vsi_setup into smaller functions")
+	Reported-by: Dan Carpenter <error27@gmail.com>
+	Signed-off-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+	Tested-by: Gurucharan G <gurucharanx.g@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit c4a9c8e78aad0fd9b79c9b1e83bab3288a15ce3c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_lib.c
+diff --cc drivers/net/ethernet/intel/ice/ice_lib.c
+index dc99c12b0643,0f52ea38b6f3..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@@ -2517,34 -2645,65 +2517,54 @@@ ice_vsi_setup(struct ice_pf *pf, struc
+  {
+  	u16 max_txqs[ICE_MAX_TRAFFIC_CLASS] = { 0 };
+  	struct device *dev = ice_pf_to_dev(pf);
+ +	struct ice_vsi *vsi;
+  	int ret, i;
+  
+ -	/* configure VSI nodes based on number of queues and TC's */
+ -	ice_for_each_traffic_class(i) {
+ -		if (!(vsi->tc_cfg.ena_tc & BIT(i)))
+ -			continue;
+ -
+ -		if (vsi->type == ICE_VSI_CHNL) {
+ -			if (!vsi->alloc_txq && vsi->num_txq)
+ -				max_txqs[i] = vsi->num_txq;
+ -			else
+ -				max_txqs[i] = pf->num_lan_tx;
+ -		} else {
+ -			max_txqs[i] = vsi->alloc_txq;
+ -		}
+ -	}
+ +	if (vsi_type == ICE_VSI_CHNL)
+ +		vsi = ice_vsi_alloc(pf, vsi_type, ch, NULL);
+ +	else if (vsi_type == ICE_VSI_VF || vsi_type == ICE_VSI_CTRL)
+ +		vsi = ice_vsi_alloc(pf, vsi_type, NULL, vf);
+ +	else
+ +		vsi = ice_vsi_alloc(pf, vsi_type, NULL, NULL);
+  
+ -	dev_dbg(dev, "vsi->tc_cfg.ena_tc = %d\n", vsi->tc_cfg.ena_tc);
+ -	ret = ice_cfg_vsi_lan(vsi->port_info, vsi->idx, vsi->tc_cfg.ena_tc,
+ -			      max_txqs);
+ -	if (ret) {
+ -		dev_err(dev, "VSI %d failed lan queue config, error %d\n",
+ -			vsi->vsi_num, ret);
+ -		return ret;
+ +	if (!vsi) {
+ +		dev_err(dev, "could not allocate VSI\n");
+ +		return NULL;
+  	}
+  
+ -	return 0;
+ -}
+ +	vsi->port_info = pi;
+ +	vsi->vsw = pf->first_sw;
+++<<<<<<< HEAD
+ +	if (vsi->type == ICE_VSI_PF)
+ +		vsi->ethtype = ETH_P_PAUSE;
+  
+ -/**
+ - * ice_vsi_cfg_def - configure default VSI based on the type
+ - * @vsi: pointer to VSI
+ - * @params: the parameters to configure this VSI with
+ - */
+ -static int
+ -ice_vsi_cfg_def(struct ice_vsi *vsi, struct ice_vsi_cfg_params *params)
+ -{
+ -	struct device *dev = ice_pf_to_dev(vsi->back);
+ -	struct ice_pf *pf = vsi->back;
+ -	int ret;
+ +	ice_alloc_fd_res(vsi);
+  
+ -	vsi->vsw = pf->first_sw;
+ +	if (vsi_type != ICE_VSI_CHNL) {
+ +		if (ice_vsi_get_qs(vsi)) {
+ +			dev_err(dev, "Failed to allocate queues. vsi->idx = %d\n",
+ +				vsi->idx);
+ +			goto unroll_vsi_alloc;
+ +		}
+++=======
++ 
++ 	ret = ice_vsi_alloc_def(vsi, params->ch);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* allocate memory for Tx/Rx ring stat pointers */
++ 	ret = ice_vsi_alloc_stat_arrays(vsi);
++ 	if (ret)
++ 		goto unroll_vsi_alloc;
++ 
++ 	ice_alloc_fd_res(vsi);
++ 
++ 	ret = ice_vsi_get_qs(vsi);
++ 	if (ret) {
++ 		dev_err(dev, "Failed to allocate queues. vsi->idx = %d\n",
++ 			vsi->idx);
++ 		goto unroll_vsi_alloc_stat;
+++>>>>>>> c4a9c8e78aad (ice: don't ignore return codes in VSI related code)
+  	}
+  
+  	/* set RSS capabilities */
+@@@ -3239,159 -3498,27 +3260,166 @@@ int ice_vsi_rebuild(struct ice_vsi *vsi
+  
+  	prev_num_q_vectors = ice_vsi_rebuild_get_coalesce(vsi, coalesce);
+  
+ -	prev_txq = vsi->num_txq;
+ -	prev_rxq = vsi->num_rxq;
+ -
+ -	ice_vsi_decfg(vsi);
+ -	ret = ice_vsi_cfg_def(vsi, &params);
+ +	ice_rm_vsi_lan_cfg(vsi->port_info, vsi->idx);
+ +	ret = ice_rm_vsi_rdma_cfg(vsi->port_info, vsi->idx);
+  	if (ret)
+ -		goto err_vsi_cfg;
+ +		dev_err(ice_pf_to_dev(vsi->back), "Failed to remove RDMA scheduler config for VSI %u, err %d\n",
+ +			vsi->vsi_num, ret);
+ +	ice_vsi_free_q_vectors(vsi);
+ +
+ +	/* SR-IOV determines needed MSIX resources all at once instead of per
+ +	 * VSI since when VFs are spawned we know how many VFs there are and how
+ +	 * many interrupts each VF needs. SR-IOV MSIX resources are also
+ +	 * cleared in the same manner.
+ +	 */
+ +	if (vtype != ICE_VSI_VF) {
+ +		/* reclaim SW interrupts back to the common pool */
+ +		ice_free_res(pf->irq_tracker, vsi->base_vector, vsi->idx);
+ +		pf->num_avail_sw_msix += vsi->num_q_vectors;
+ +		vsi->base_vector = 0;
+ +	}
+ +
+ +	if (ice_is_xdp_ena_vsi(vsi))
+ +		/* return value check can be skipped here, it always returns
+ +		 * 0 if reset is in progress
+ +		 */
+ +		ice_destroy_xdp_rings(vsi);
+ +	ice_vsi_put_qs(vsi);
+ +	ice_vsi_clear_rings(vsi);
+ +	ice_vsi_free_arrays(vsi);
+ +	if (vtype == ICE_VSI_VF)
+ +		ice_vsi_set_num_qs(vsi, vsi->vf);
+ +	else
+ +		ice_vsi_set_num_qs(vsi, NULL);
+ +
+ +	ret = ice_vsi_alloc_arrays(vsi);
+ +	if (ret < 0)
+ +		goto err_vsi;
+ +
+ +	ice_vsi_get_qs(vsi);
+ +
+ +	ice_alloc_fd_res(vsi);
+ +	ice_vsi_set_tc_cfg(vsi);
+ +
+ +	/* Initialize VSI struct elements and create VSI in FW */
+ +	ret = ice_vsi_init(vsi, init_vsi);
+ +	if (ret < 0)
+ +		goto err_vsi;
+ +
+ +	switch (vtype) {
+ +	case ICE_VSI_CTRL:
+ +	case ICE_VSI_SWITCHDEV_CTRL:
+ +	case ICE_VSI_PF:
+ +		ret = ice_vsi_alloc_q_vectors(vsi);
+ +		if (ret)
+ +			goto err_rings;
+ +
+ +		ret = ice_vsi_setup_vector_base(vsi);
+ +		if (ret)
+ +			goto err_vectors;
+ +
+ +		ret = ice_vsi_set_q_vectors_reg_idx(vsi);
+ +		if (ret)
+ +			goto err_vectors;
+ +
+ +		ret = ice_vsi_alloc_rings(vsi);
+ +		if (ret)
+ +			goto err_vectors;
+ +
+ +		ice_vsi_map_rings_to_vectors(vsi);
+ +
+ +		vsi->stat_offsets_loaded = false;
+ +		if (ice_is_xdp_ena_vsi(vsi)) {
+ +			ret = ice_vsi_determine_xdp_res(vsi);
+ +			if (ret)
+ +				goto err_vectors;
+ +			ret = ice_prepare_xdp_rings(vsi, vsi->xdp_prog);
+ +			if (ret)
+ +				goto err_vectors;
+ +		}
+ +		/* ICE_VSI_CTRL does not need RSS so skip RSS processing */
+ +		if (vtype != ICE_VSI_CTRL)
+ +			/* Do not exit if configuring RSS had an issue, at
+ +			 * least receive traffic on first queue. Hence no
+ +			 * need to capture return value
+ +			 */
+ +			if (test_bit(ICE_FLAG_RSS_ENA, pf->flags))
+ +				ice_vsi_cfg_rss_lut_key(vsi);
+ +
+ +		/* disable or enable CRC stripping */
+ +		if (vsi->netdev)
+ +			ice_vsi_cfg_crc_strip(vsi, !!(vsi->netdev->features &
+ +					      NETIF_F_RXFCS));
+ +
+ +		break;
+ +	case ICE_VSI_VF:
+ +		ret = ice_vsi_alloc_q_vectors(vsi);
+ +		if (ret)
+ +			goto err_rings;
+ +
+ +		ret = ice_vsi_set_q_vectors_reg_idx(vsi);
+ +		if (ret)
+ +			goto err_vectors;
+ +
+ +		ret = ice_vsi_alloc_rings(vsi);
+ +		if (ret)
+ +			goto err_vectors;
+ +
+ +		vsi->stat_offsets_loaded = false;
+ +		break;
+ +	case ICE_VSI_CHNL:
+ +		if (test_bit(ICE_FLAG_RSS_ENA, pf->flags)) {
+ +			ice_vsi_cfg_rss_lut_key(vsi);
+ +			ice_vsi_set_rss_flow_fld(vsi);
+ +		}
+ +		break;
+ +	default:
+ +		break;
+ +	}
+ +
+ +	/* configure VSI nodes based on number of queues and TC's */
+ +	for (i = 0; i < vsi->tc_cfg.numtc; i++) {
+ +		/* configure VSI nodes based on number of queues and TC's.
+ +		 * ADQ creates VSIs for each TC/Channel but doesn't
+ +		 * allocate queues instead it reconfigures the PF queues
+ +		 * as per the TC command. So max_txqs should point to the
+ +		 * PF Tx queues.
+ +		 */
+ +		if (vtype == ICE_VSI_CHNL)
+ +			max_txqs[i] = pf->num_lan_tx;
+ +		else
+ +			max_txqs[i] = vsi->alloc_txq;
+ +
+ +		if (ice_is_xdp_ena_vsi(vsi))
+ +			max_txqs[i] += vsi->num_xdp_txq;
+ +	}
+ +
+ +	if (test_bit(ICE_FLAG_TC_MQPRIO, pf->flags))
+ +		/* If MQPRIO is set, means channel code path, hence for main
+ +		 * VSI's, use TC as 1
+ +		 */
+ +		ret = ice_cfg_vsi_lan(vsi->port_info, vsi->idx, 1, max_txqs);
+ +	else
+ +		ret = ice_cfg_vsi_lan(vsi->port_info, vsi->idx,
+ +				      vsi->tc_cfg.ena_tc, max_txqs);
+  
+ -	ret = ice_vsi_cfg_tc_lan(pf, vsi);
+  	if (ret) {
+ -		if (vsi_flags & ICE_VSI_FLAG_INIT) {
+ +		dev_err(ice_pf_to_dev(pf), "VSI %d failed lan queue config, error %d\n",
+ +			vsi->vsi_num, ret);
+ +		if (init_vsi) {
+  			ret = -EIO;
+++<<<<<<< HEAD
+ +			goto err_vectors;
+ +		} else {
+ +			return ice_schedule_reset(pf, ICE_RESET_PFR);
+++=======
++ 			goto err_vsi_cfg_tc_lan;
+++>>>>>>> c4a9c8e78aad (ice: don't ignore return codes in VSI related code)
+  		}
++ 
++ 		kfree(coalesce);
++ 		return ice_schedule_reset(pf, ICE_RESET_PFR);
+  	}
+ -
+ -	ice_vsi_realloc_stat_arrays(vsi, prev_txq, prev_rxq);
+ -
+  	ice_vsi_rebuild_set_coalesce(vsi, coalesce, prev_num_q_vectors);
+  	kfree(coalesce);
+  
+* Unmerged path drivers/net/ethernet/intel/ice/ice_lib.c
