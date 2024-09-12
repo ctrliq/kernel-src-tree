@@ -107,6 +107,8 @@ void arch_timer_reg_write(int access, enum arch_timer_reg reg, u32 val,
 		case ARCH_TIMER_REG_TVAL:
 			writel_relaxed(val, timer->base + CNTP_TVAL);
 			break;
+		default:
+			BUILD_BUG();
 		}
 	} else if (access == ARCH_TIMER_MEM_VIRT_ACCESS) {
 		struct arch_timer *timer = to_arch_timer(clk);
@@ -117,6 +119,8 @@ void arch_timer_reg_write(int access, enum arch_timer_reg reg, u32 val,
 		case ARCH_TIMER_REG_TVAL:
 			writel_relaxed(val, timer->base + CNTV_TVAL);
 			break;
+		default:
+			BUILD_BUG();
 		}
 	} else {
 		arch_timer_reg_write_cp15(access, reg, val);
@@ -138,6 +142,8 @@ u32 arch_timer_reg_read(int access, enum arch_timer_reg reg,
 		case ARCH_TIMER_REG_TVAL:
 			val = readl_relaxed(timer->base + CNTP_TVAL);
 			break;
+		default:
+			BUILD_BUG();
 		}
 	} else if (access == ARCH_TIMER_MEM_VIRT_ACCESS) {
 		struct arch_timer *timer = to_arch_timer(clk);
@@ -148,6 +154,8 @@ u32 arch_timer_reg_read(int access, enum arch_timer_reg reg,
 		case ARCH_TIMER_REG_TVAL:
 			val = readl_relaxed(timer->base + CNTV_TVAL);
 			break;
+		default:
+			BUILD_BUG();
 		}
 	} else {
 		val = arch_timer_reg_read_cp15(access, reg);
