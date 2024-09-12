@@ -1,0 +1,161 @@
+x86/decompressor: Merge trampoline cleanup with switching code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit 03dda95137d3247564854ad9032c0354273a159d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/03dda951.failed
+
+Now that the trampoline setup code and the actual invocation of it are
+all done from the C routine, the trampoline cleanup can be merged into
+it as well, instead of returning to asm just to call another C function.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Link: https://lore.kernel.org/r/20230807162720.545787-16-ardb@kernel.org
+(cherry picked from commit 03dda95137d3247564854ad9032c0354273a159d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/head_64.S
+#	arch/x86/boot/compressed/pgtable_64.c
+diff --cc arch/x86/boot/compressed/head_64.S
+index c4f3be19a58f,fb0e562c26f6..000000000000
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@@ -372,55 -426,18 +372,66 @@@ SYM_CODE_START(startup_64
+  #endif
+  
+  	/*
+ -	 * configure_5level_paging() updates the number of paging levels using
+ -	 * a trampoline in 32-bit addressable memory if the current number does
+ -	 * not match the desired number.
+ +	 * paging_prepare() sets up the trampoline and checks if we need to
+ +	 * enable 5-level paging.
+  	 *
+++<<<<<<< HEAD
+ +	 * paging_prepare() returns a two-quadword structure which lands
+ +	 * into RDX:RAX:
+ +	 *   - Address of the trampoline is returned in RAX.
+ +	 *   - Non zero RDX means trampoline needs to enable 5-level
+ +	 *     paging.
+ +	 *
+ +	 * RSI holds real mode data and needs to be preserved across
+ +	 * this function call.
+ +	 */
+ +	pushq	%rsi
+ +	movq	%rsi, %rdi		/* real mode address */
+ +	call	paging_prepare
+ +	popq	%rsi
+ +
+ +	/* Save the trampoline address in RCX */
+ +	movq	%rax, %rcx
+ +
+ +	/*
+ +	 * Load the address of trampoline_return() into RDI.
+ +	 * It will be used by the trampoline to return to the main code.
+ +	 */
+ +	leaq	trampoline_return(%rip), %rdi
+ +
+ +	/* Switch to compatibility mode (CS.L = 0 CS.D = 1) via far return */
+ +	pushq	$__KERNEL32_CS
+ +	leaq	TRAMPOLINE_32BIT_CODE_OFFSET(%rax), %rax
+ +	pushq	%rax
+ +	lretq
+ +trampoline_return:
+ +	/* Restore the stack, the 32-bit trampoline uses its own stack */
+ +	leaq	boot_stack_end(%rbx), %rsp
+ +
+ +	/*
+ +	 * cleanup_trampoline() would restore trampoline memory.
+ +	 *
+ +	 * RDI is address of the page table to use instead of page table
+ +	 * in trampoline memory (if required).
+ +	 *
+ +	 * RSI holds real mode data and needs to be preserved across
+ +	 * this function call.
+ +	 */
+ +	pushq	%rsi
+ +	leaq	top_pgtable(%rbx), %rdi
+ +	call	cleanup_trampoline
+ +	popq	%rsi
+ +
+++=======
++ 	 * Pass the boot_params pointer as the first argument. The second
++ 	 * argument is the relocated address of the page table to use instead
++ 	 * of the page table in trampoline memory (if required).
++ 	 */
++ 	movq	%r15, %rdi
++ 	leaq	rva(top_pgtable)(%rbx), %rsi
++ 	call	configure_5level_paging
++ 
+++>>>>>>> 03dda95137d3 (x86/decompressor: Merge trampoline cleanup with switching code)
+  	/* Zero EFLAGS */
+  	pushq	$0
+  	popfq
+diff --cc arch/x86/boot/compressed/pgtable_64.c
+index af8b429eafb0,7939eb6e6ce9..000000000000
+--- a/arch/x86/boot/compressed/pgtable_64.c
++++ b/arch/x86/boot/compressed/pgtable_64.c
+@@@ -105,12 -101,13 +105,16 @@@ static unsigned long find_trampoline_pl
+  	return bios_start - TRAMPOLINE_32BIT_SIZE;
+  }
+  
+++<<<<<<< HEAD
+ +struct paging_config paging_prepare(void *rmode)
+++=======
++ asmlinkage void configure_5level_paging(struct boot_params *bp, void *pgtable)
+++>>>>>>> 03dda95137d3 (x86/decompressor: Merge trampoline cleanup with switching code)
+  {
+ -	void (*toggle_la57)(void *cr3);
+ -	bool l5_required = false;
+ +	struct paging_config paging_config = {};
+  
+  	/* Initialize boot_params. Required for cmdline_find_option_bool(). */
+ -	boot_params = bp;
+ +	boot_params = rmode;
+  
+  	/*
+  	 * Check if LA57 is desired and supported.
+@@@ -185,28 -187,16 +189,29 @@@
+  		 * may be above 4G.
+  		 */
+  		src = *(unsigned long *)__native_read_cr3() & PAGE_MASK;
+ -		memcpy(trampoline_32bit, (void *)src, PAGE_SIZE);
+ +		memcpy(trampoline_32bit + TRAMPOLINE_32BIT_PGTABLE_OFFSET / sizeof(unsigned long),
+ +		       (void *)src, PAGE_SIZE);
+  	}
+  
+++<<<<<<< HEAD
+ +out:
+ +	return paging_config;
+ +}
+ +
+ +void cleanup_trampoline(void *pgtable)
+ +{
+ +	void *trampoline_pgtable;
+ +
+ +	trampoline_pgtable = trampoline_32bit + TRAMPOLINE_32BIT_PGTABLE_OFFSET / sizeof(unsigned long);
+++=======
++ 	toggle_la57(trampoline_32bit);
+++>>>>>>> 03dda95137d3 (x86/decompressor: Merge trampoline cleanup with switching code)
+  
+  	/*
+- 	 * Move the top level page table out of trampoline memory,
+- 	 * if it's there.
++ 	 * Move the top level page table out of trampoline memory.
+  	 */
+- 	if ((void *)__native_read_cr3() == trampoline_pgtable) {
+- 		memcpy(pgtable, trampoline_pgtable, PAGE_SIZE);
+- 		native_write_cr3((unsigned long)pgtable);
+- 	}
++ 	memcpy(pgtable, trampoline_32bit, PAGE_SIZE);
++ 	native_write_cr3((unsigned long)pgtable);
+  
+  	/* Restore trampoline memory */
+  	memcpy(trampoline_32bit, trampoline_save, TRAMPOLINE_32BIT_SIZE);
+* Unmerged path arch/x86/boot/compressed/head_64.S
+* Unmerged path arch/x86/boot/compressed/pgtable_64.c
