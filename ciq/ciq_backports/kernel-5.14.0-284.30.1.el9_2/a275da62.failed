@@ -1,0 +1,162 @@
+rxrpc: Create a per-local endpoint receive queue and I/O thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-284.30.1.el9_2
+commit-author David Howells <dhowells@redhat.com>
+commit a275da62e8c111b897b9cb73eb91df2f4e475ca5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-284.30.1.el9_2/a275da62.failed
+
+Create a per-local receive queue to which, in a future patch, all incoming
+packets will be directed and an I/O thread that will process those packets
+and perform all transmission of packets.
+
+Destruction of the local endpoint is also moved from the local processor
+work item (which will be absorbed) to the thread.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+(cherry picked from commit a275da62e8c111b897b9cb73eb91df2f4e475ca5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rxrpc/io_thread.c
+#	net/rxrpc/local_object.c
+diff --cc net/rxrpc/local_object.c
+index 846558613c7f,7c61349984e3..000000000000
+--- a/net/rxrpc/local_object.c
++++ b/net/rxrpc/local_object.c
+@@@ -349,14 -375,10 +366,19 @@@ struct rxrpc_local *rxrpc_use_local(str
+   * Cease using a local endpoint.  Once the number of active users reaches 0, we
+   * start the closure of the transport in the work processor.
+   */
+ -void rxrpc_unuse_local(struct rxrpc_local *local, enum rxrpc_local_trace why)
+ +void rxrpc_unuse_local(struct rxrpc_local *local)
+  {
+++<<<<<<< HEAD
+ +	if (local) {
+ +		if (__rxrpc_unuse_local(local)) {
+ +			rxrpc_get_local(local);
+ +			rxrpc_queue_local(local);
+ +		}
+ +	}
+++=======
++ 	if (local && __rxrpc_unuse_local(local, why))
++ 		kthread_stop(local->io_thread);
+++>>>>>>> a275da62e8c1 (rxrpc: Create a per-local endpoint receive queue and I/O thread)
+  }
+  
+  /*
+@@@ -415,10 -437,8 +438,13 @@@ static void rxrpc_local_processor(struc
+  
+  	do {
+  		again = false;
+++<<<<<<< HEAD
+ +		if (!__rxrpc_use_local(local)) {
+ +			rxrpc_local_destroyer(local);
+++=======
++ 		if (!__rxrpc_use_local(local, rxrpc_local_use_work))
+++>>>>>>> a275da62e8c1 (rxrpc: Create a per-local endpoint receive queue and I/O thread)
+  			break;
+- 		}
+  
+  		if (!list_empty(&local->ack_tx_queue)) {
+  			rxrpc_transmit_ack_packets(local);
+* Unmerged path net/rxrpc/io_thread.c
+diff --git a/net/rxrpc/ar-internal.h b/net/rxrpc/ar-internal.h
+index 46ce41afb431..c1985be965f6 100644
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@ -110,6 +110,8 @@ struct rxrpc_net {
+ 	atomic_t		stat_rx_acks[256];
+ 
+ 	atomic_t		stat_why_req_ack[8];
++
++	atomic_t		stat_io_loop;
+ };
+ 
+ /*
+@@ -280,12 +282,14 @@ struct rxrpc_local {
+ 	struct hlist_node	link;
+ 	struct socket		*socket;	/* my UDP socket */
+ 	struct work_struct	processor;
++	struct task_struct	*io_thread;
+ 	struct list_head	ack_tx_queue;	/* List of ACKs that need sending */
+ 	spinlock_t		ack_tx_lock;	/* ACK list lock */
+ 	struct rxrpc_sock __rcu	*service;	/* Service(s) listening on this endpoint */
+ 	struct rw_semaphore	defrag_sem;	/* control re-enablement of IP DF bit */
+ 	struct sk_buff_head	reject_queue;	/* packets awaiting rejection */
+ 	struct sk_buff_head	event_queue;	/* endpoint event packets awaiting processing */
++	struct sk_buff_head	rx_queue;	/* Received packets */
+ 	struct rb_root		client_bundles;	/* Client connection bundles by socket params */
+ 	spinlock_t		client_bundles_lock; /* Lock for client_bundles */
+ 	spinlock_t		lock;		/* access lock */
+@@ -943,6 +947,11 @@ void rxrpc_unpublish_service_conn(struct rxrpc_connection *);
+  * input.c
+  */
+ int rxrpc_input_packet(struct sock *, struct sk_buff *);
++int rxrpc_io_thread(void *data);
++static inline void rxrpc_wake_up_io_thread(struct rxrpc_local *local)
++{
++	wake_up_process(local->io_thread);
++}
+ 
+ /*
+  * insecure.c
+@@ -973,6 +982,7 @@ void rxrpc_put_local(struct rxrpc_local *);
+ struct rxrpc_local *rxrpc_use_local(struct rxrpc_local *);
+ void rxrpc_unuse_local(struct rxrpc_local *);
+ void rxrpc_queue_local(struct rxrpc_local *);
++void rxrpc_destroy_local(struct rxrpc_local *local);
+ void rxrpc_destroy_all_locals(struct rxrpc_net *);
+ 
+ static inline bool __rxrpc_unuse_local(struct rxrpc_local *local)
+* Unmerged path net/rxrpc/io_thread.c
+* Unmerged path net/rxrpc/local_object.c
+diff --git a/net/rxrpc/proc.c b/net/rxrpc/proc.c
+index fae22a8b38d6..558136bc8ae6 100644
+--- a/net/rxrpc/proc.c
++++ b/net/rxrpc/proc.c
+@@ -341,7 +341,7 @@ static int rxrpc_local_seq_show(struct seq_file *seq, void *v)
+ 	if (v == SEQ_START_TOKEN) {
+ 		seq_puts(seq,
+ 			 "Proto Local                                          "
+-			 " Use Act\n");
++			 " Use Act RxQ\n");
+ 		return 0;
+ 	}
+ 
+@@ -350,10 +350,11 @@ static int rxrpc_local_seq_show(struct seq_file *seq, void *v)
+ 	sprintf(lbuff, "%pISpc", &local->srx.transport);
+ 
+ 	seq_printf(seq,
+-		   "UDP   %-47.47s %3u %3u\n",
++		   "UDP   %-47.47s %3u %3u %3u\n",
+ 		   lbuff,
+ 		   refcount_read(&local->ref),
+-		   atomic_read(&local->active_users));
++		   atomic_read(&local->active_users),
++		   local->rx_queue.qlen);
+ 
+ 	return 0;
+ }
+@@ -462,6 +463,9 @@ int rxrpc_stats_show(struct seq_file *seq, void *v)
+ 		   "Buffers  : txb=%u rxb=%u\n",
+ 		   atomic_read(&rxrpc_nr_txbuf),
+ 		   atomic_read(&rxrpc_n_rx_skbs));
++	seq_printf(seq,
++		   "IO-thread: loops=%u\n",
++		   atomic_read(&rxnet->stat_io_loop));
+ 	return 0;
+ }
+ 
+@@ -491,5 +495,7 @@ int rxrpc_stats_clear(struct file *file, char *buf, size_t size)
+ 	memset(&rxnet->stat_rx_acks, 0, sizeof(rxnet->stat_rx_acks));
+ 
+ 	memset(&rxnet->stat_why_req_ack, 0, sizeof(rxnet->stat_why_req_ack));
++
++	atomic_set(&rxnet->stat_io_loop, 0);
+ 	return size;
+ }
