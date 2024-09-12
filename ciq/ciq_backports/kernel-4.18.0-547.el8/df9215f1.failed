@@ -1,0 +1,413 @@
+x86/efistub: Simplify and clean up handover entry code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit df9215f15206c2a81909ccf60f21d170801dce38
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/df9215f1.failed
+
+Now that the EFI entry code in assembler is only used by the optional
+and deprecated EFI handover protocol, and given that the EFI stub C code
+no longer returns to it, most of it can simply be dropped.
+
+While at it, clarify the symbol naming, by merging efi_main() and
+efi_stub_entry(), making the latter the shared entry point for all
+different boot modes that enter via the EFI stub.
+
+The efi32_stub_entry() and efi64_stub_entry() names are referenced
+explicitly by the tooling that populates the setup header, so these must
+be retained, but can be emitted as aliases of efi_stub_entry() where
+appropriate.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Link: https://lore.kernel.org/r/20230807162720.545787-5-ardb@kernel.org
+(cherry picked from commit df9215f15206c2a81909ccf60f21d170801dce38)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/eboot.c
+#	arch/x86/boot/compressed/efi_mixed.S
+#	arch/x86/boot/compressed/head_32.S
+#	arch/x86/boot/compressed/head_64.S
+diff --cc arch/x86/boot/compressed/eboot.c
+index 19db743a88f9,3f3b3edf7a38..000000000000
+--- a/arch/x86/boot/compressed/eboot.c
++++ b/arch/x86/boot/compressed/eboot.c
+@@@ -841,45 -803,39 +841,51 @@@ static efi_status_t exit_boot(struct bo
+  	return EFI_SUCCESS;
+  }
+  
+ -static void __noreturn enter_kernel(unsigned long kernel_addr,
+ -				    struct boot_params *boot_params)
+ -{
+ -	/* enter decompressed kernel with boot_params pointer in RSI/ESI */
+ -	asm("jmp *%0"::"r"(kernel_addr), "S"(boot_params));
+ -
+ -	unreachable();
+ -}
+ -
+  /*
+ - * On success, this routine will jump to the relocated image directly and never
+ - * return.  On failure, it will exit to the firmware via efi_exit() instead of
+ - * returning.
+ + * On success we return a pointer to a boot_params structure, and NULL
+ + * on failure.
+   */
+++<<<<<<< HEAD:arch/x86/boot/compressed/eboot.c
+ +struct boot_params *
+ +efi_main(struct efi_config *c, struct boot_params *boot_params)
+++=======
++ void __noreturn efi_stub_entry(efi_handle_t handle,
++ 			       efi_system_table_t *sys_table_arg,
++ 			       struct boot_params *boot_params)
+++>>>>>>> df9215f15206 (x86/efistub: Simplify and clean up handover entry code):drivers/firmware/efi/libstub/x86-stub.c
+  {
+  	unsigned long bzimage_addr = (unsigned long)startup_32;
+ -	unsigned long buffer_start, buffer_end;
+ +	struct desc_ptr *gdt = NULL;
+ +	efi_loaded_image_t *image;
+  	struct setup_header *hdr = &boot_params->hdr;
+ -	const struct linux_efi_initrd *initrd = NULL;
+  	efi_status_t status;
+ +	struct desc_struct *desc;
+ +	void *handle;
+ +	efi_system_table_t *_table;
+ +	bool is64;
+ +	unsigned long cmdline_paddr;
+ +
+ +	efi_early = c;
+ +
+ +	_table = (efi_system_table_t *)(unsigned long)efi_early->table;
+ +	handle = (void *)(unsigned long)efi_early->image_handle;
+ +	is64 = efi_early->is64;
+ +
+ +	sys_table = _table;
+  
+ -	efi_system_table = sys_table_arg;
+  	/* Check if we were booted by the EFI firmware */
+ -	if (efi_system_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+ -		efi_exit(handle, EFI_INVALID_PARAMETER);
+ +	if (sys_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+ +		goto fail;
+  
+ -	efi_dxe_table = get_efi_config_table(EFI_DXE_SERVICES_TABLE_GUID);
+ +	if (is64)
+ +		setup_boot_services64(efi_early);
+ +	else
+ +		setup_boot_services32(efi_early);
+ +
+ +	efi_dxe_table = get_efi_config_table(sys_table, EFI_DXE_SERVICES_TABLE_GUID);
+  	if (efi_dxe_table &&
+  	    efi_dxe_table->hdr.signature != EFI_DXE_SERVICES_TABLE_SIGNATURE) {
+ -		efi_warn("Ignoring DXE services table: invalid signature\n");
+ +		efi_printk(sys_table, "Ignoring DXE services table: invalid signature\n");
+  		efi_dxe_table = NULL;
+  	}
+  
+@@@ -951,96 -959,24 +957,112 @@@
+  		goto fail;
+  	}
+  
+ -	if (IS_ENABLED(CONFIG_X86_64))
+ -		bzimage_addr += startup_64 - startup_32;
+ +	memset((char *)gdt->address, 0x0, gdt->size);
+ +	desc = (struct desc_struct *)gdt->address;
+ +
+ +	/* The first GDT is a dummy. */
+ +	desc++;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		/* __KERNEL32_CS */
+ +		desc->limit0	= 0xffff;
+ +		desc->base0	= 0x0000;
+ +		desc->base1	= 0x0000;
+ +		desc->type	= SEG_TYPE_CODE | SEG_TYPE_EXEC_READ;
+ +		desc->s		= DESC_TYPE_CODE_DATA;
+ +		desc->dpl	= 0;
+ +		desc->p		= 1;
+ +		desc->limit1	= 0xf;
+ +		desc->avl	= 0;
+ +		desc->l		= 0;
+ +		desc->d		= SEG_OP_SIZE_32BIT;
+ +		desc->g		= SEG_GRANULARITY_4KB;
+ +		desc->base2	= 0x00;
+ +
+ +		desc++;
+ +	} else {
+ +		/* Second entry is unused on 32-bit */
+ +		desc++;
+ +	}
+ +
+ +	/* __KERNEL_CS */
+ +	desc->limit0	= 0xffff;
+ +	desc->base0	= 0x0000;
+ +	desc->base1	= 0x0000;
+ +	desc->type	= SEG_TYPE_CODE | SEG_TYPE_EXEC_READ;
+ +	desc->s		= DESC_TYPE_CODE_DATA;
+ +	desc->dpl	= 0;
+ +	desc->p		= 1;
+ +	desc->limit1	= 0xf;
+ +	desc->avl	= 0;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		desc->l = 1;
+ +		desc->d = 0;
+ +	} else {
+ +		desc->l = 0;
+ +		desc->d = SEG_OP_SIZE_32BIT;
+ +	}
+ +	desc->g		= SEG_GRANULARITY_4KB;
+ +	desc->base2	= 0x00;
+ +	desc++;
+ +
+ +	/* __KERNEL_DS */
+ +	desc->limit0	= 0xffff;
+ +	desc->base0	= 0x0000;
+ +	desc->base1	= 0x0000;
+ +	desc->type	= SEG_TYPE_DATA | SEG_TYPE_READ_WRITE;
+ +	desc->s		= DESC_TYPE_CODE_DATA;
+ +	desc->dpl	= 0;
+ +	desc->p		= 1;
+ +	desc->limit1	= 0xf;
+ +	desc->avl	= 0;
+ +	desc->l		= 0;
+ +	desc->d		= SEG_OP_SIZE_32BIT;
+ +	desc->g		= SEG_GRANULARITY_4KB;
+ +	desc->base2	= 0x00;
+ +	desc++;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		/* Task segment value */
+ +		desc->limit0	= 0x0000;
+ +		desc->base0	= 0x0000;
+ +		desc->base1	= 0x0000;
+ +		desc->type	= SEG_TYPE_TSS;
+ +		desc->s		= 0;
+ +		desc->dpl	= 0;
+ +		desc->p		= 1;
+ +		desc->limit1	= 0x0;
+ +		desc->avl	= 0;
+ +		desc->l		= 0;
+ +		desc->d		= 0;
+ +		desc->g		= SEG_GRANULARITY_4KB;
+ +		desc->base2	= 0x00;
+ +		desc++;
+ +	}
+ +
+ +	asm volatile("cli");
+ +	asm volatile ("lgdt %0" : : "m" (*gdt));
+  
+ -	enter_kernel(bzimage_addr, boot_params);
+ +	return boot_params;
+  fail:
+++<<<<<<< HEAD:arch/x86/boot/compressed/eboot.c
+ +	efi_printk(sys_table, "efi_main() failed!\n");
+++=======
++ 	efi_err("efi_stub_entry() failed!\n");
+++>>>>>>> df9215f15206 (x86/efistub: Simplify and clean up handover entry code):drivers/firmware/efi/libstub/x86-stub.c
+  
+ -	efi_exit(handle, status);
+ +	return NULL;
+  }
++ 
++ #ifdef CONFIG_EFI_HANDOVER_PROTOCOL
++ #ifndef CONFIG_EFI_MIXED
++ extern __alias(efi_stub_entry)
++ void efi32_stub_entry(efi_handle_t handle, efi_system_table_t *sys_table_arg,
++ 		      struct boot_params *boot_params);
++ 
++ extern __alias(efi_stub_entry)
++ void efi64_stub_entry(efi_handle_t handle, efi_system_table_t *sys_table_arg,
++ 		      struct boot_params *boot_params);
++ #endif
++ #endif
+diff --cc arch/x86/boot/compressed/head_32.S
+index 0411ad3c848c,8876ffe30e9a..000000000000
+--- a/arch/x86/boot/compressed/head_32.S
++++ b/arch/x86/boot/compressed/head_32.S
+@@@ -138,76 -137,21 +138,79 @@@ ENTRY(startup_32
+  /*
+   * Jump to the relocated address.
+   */
+ -	leal	.Lrelocated@GOTOFF(%ebx), %eax
+ +	leal	.Lrelocated(%ebx), %eax
+ +	jmp	*%eax
+ +ENDPROC(startup_32)
+ +
+++<<<<<<< HEAD
+ +#ifdef CONFIG_EFI_STUB
+ +/*
+ + * We don't need the return address, so set up the stack so efi_main() can find
+ + * its arguments.
+ + */
+ +ENTRY(efi_pe_entry)
+ +	add	$0x4, %esp
+ +
+ +	call	1f
+ +1:	popl	%esi
+ +	subl	$1b, %esi
+ +
+ +	popl	%ecx
+ +	movl	%ecx, efi32_config(%esi)	/* Handle */
+ +	popl	%ecx
+ +	movl	%ecx, efi32_config+8(%esi)	/* EFI System table pointer */
+ +
+ +	/* Relocate efi_config->call() */
+ +	leal	efi32_config(%esi), %eax
+ +	add	%esi, 40(%eax)
+ +	pushl	%eax
+ +
+ +	call	make_boot_params
+ +	cmpl	$0, %eax
+ +	je	fail
+ +	movl	%esi, BP_code32_start(%eax)
+ +	popl	%ecx
+ +	pushl	%eax
+ +	pushl	%ecx
+ +	jmp	2f		/* Skip efi_config initialization */
+ +ENDPROC(efi_pe_entry)
+ +
+ +ENTRY(efi32_stub_entry)
+ +	add	$0x4, %esp
+ +	popl	%ecx
+ +	popl	%edx
+ +
+ +	call	1f
+ +1:	popl	%esi
+ +	subl	$1b, %esi
+ +
+ +	movl	%ecx, efi32_config(%esi)	/* Handle */
+ +	movl	%edx, efi32_config+8(%esi)	/* EFI System table pointer */
+ +
+ +	/* Relocate efi_config->call() */
+ +	leal	efi32_config(%esi), %eax
+ +	add	%esi, 40(%eax)
+ +	pushl	%eax
+ +2:
+ +	call	efi_main
+ +	cmpl	$0, %eax
+ +	movl	%eax, %esi
+ +	jne	2f
+ +fail:
+ +	/* EFI init failed, so hang. */
+ +	hlt
+ +	jmp	fail
+ +2:
+ +	movl	BP_code32_start(%esi), %eax
+ +	leal	startup_32(%eax), %eax
+  	jmp	*%eax
+ -SYM_FUNC_END(startup_32)
+ +ENDPROC(efi32_stub_entry)
+ +#endif
+  
+++=======
+++>>>>>>> df9215f15206 (x86/efistub: Simplify and clean up handover entry code)
+  	.text
+ -SYM_FUNC_START_LOCAL_NOALIGN(.Lrelocated)
+ +.Lrelocated:
+  
+  /*
+   * Clear BSS (stack is currently empty)
+diff --cc arch/x86/boot/compressed/head_64.S
+index 6cee4cfafe11,e6880208b9a1..000000000000
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@@ -456,70 -542,10 +456,77 @@@ trampoline_return
+  	jmp	*%rax
+  SYM_CODE_END(startup_64)
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_EFI_STUB
+ +
+ +/* The entry point for the PE/COFF executable is efi_pe_entry. */
+ +SYM_FUNC_START(efi_pe_entry)
+ +	movq	%rcx, efi64_config(%rip)	/* Handle */
+ +	movq	%rdx, efi64_config+8(%rip) /* EFI System table pointer */
+ +
+ +	leaq	efi64_config(%rip), %rax
+ +	movq	%rax, efi_config(%rip)
+ +
+ +	call	1f
+ +1:	popq	%rbp
+ +	subq	$1b, %rbp
+ +
+ +	/*
+ +	 * Relocate efi_config->call().
+ +	 */
+ +	addq	%rbp, efi64_config+40(%rip)
+ +
+ +	movq	%rax, %rdi
+ +	call	make_boot_params
+ +	cmpq	$0,%rax
+ +	je	fail
+ +	mov	%rax, %rsi
+ +	leaq	startup_32(%rip), %rax
+ +	movl	%eax, BP_code32_start(%rsi)
+ +	jmp	2f		/* Skip the relocation */
+ +
+ +handover_entry:
+ +	call	1f
+ +1:	popq	%rbp
+ +	subq	$1b, %rbp
+ +
+ +	/*
+ +	 * Relocate efi_config->call().
+ +	 */
+ +	movq	efi_config(%rip), %rax
+ +	addq	%rbp, 40(%rax)
+ +2:
+ +	movq	efi_config(%rip), %rdi
+ +	call	efi_main
+ +	movq	%rax,%rsi
+ +	cmpq	$0,%rax
+ +	jne	2f
+ +fail:
+ +	/* EFI init failed, so hang. */
+ +	hlt
+ +	jmp	fail
+ +2:
+ +	movl	BP_code32_start(%esi), %eax
+ +	leaq	startup_64(%rax), %rax
+ +	jmp	*%rax
+ +SYM_FUNC_END(efi_pe_entry)
+ +
+ +	.org 0x390
+ +SYM_FUNC_START(efi64_stub_entry)
+ +	movq	%rdi, efi64_config(%rip)	/* Handle */
+ +	movq	%rsi, efi64_config+8(%rip) /* EFI System table pointer */
+ +
+ +	leaq	efi64_config(%rip), %rax
+ +	movq	%rax, efi_config(%rip)
+ +
+ +	movq	%rdx, %rsi
+ +	jmp	handover_entry
+++=======
++ #if IS_ENABLED(CONFIG_EFI_MIXED) && IS_ENABLED(CONFIG_EFI_HANDOVER_PROTOCOL)
++ 	.org 0x390
++ SYM_FUNC_START(efi64_stub_entry)
++ 	jmp	efi_stub_entry
+++>>>>>>> df9215f15206 (x86/efistub: Simplify and clean up handover entry code)
+  SYM_FUNC_END(efi64_stub_entry)
+  #endif
+  
+* Unmerged path arch/x86/boot/compressed/efi_mixed.S
+diff --git a/Documentation/x86/boot.txt b/Documentation/x86/boot.txt
+index 5e9b826b5f62..9860aaf0bd92 100644
+--- a/Documentation/x86/boot.txt
++++ b/Documentation/x86/boot.txt
+@@ -1113,7 +1113,7 @@ startup_{32,64}.
+ 
+ The function prototype for the handover entry point looks like this,
+ 
+-    efi_main(void *handle, efi_system_table_t *table, struct boot_params *bp)
++    efi_stub_entry(void *handle, efi_system_table_t *table, struct boot_params *bp)
+ 
+ 'handle' is the EFI image handle passed to the boot loader by the EFI
+ firmware, 'table' is the EFI system table - these are the first two
+* Unmerged path arch/x86/boot/compressed/eboot.c
+* Unmerged path arch/x86/boot/compressed/efi_mixed.S
+* Unmerged path arch/x86/boot/compressed/head_32.S
+* Unmerged path arch/x86/boot/compressed/head_64.S
