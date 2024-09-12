@@ -1,0 +1,198 @@
+netfilter: nf_tables: add NFT_TRANS_PREPARE_ERROR to deal with bound set/chain
+
+jira LE-1907
+cve CVE-2023-3390
+Rebuild_History Non-Buildable kernel-4.18.0-505.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 26b5a5712eb85e253724e56a54c17f8519bd8e4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-505.el8/26b5a571.failed
+
+Add a new state to deal with rule expressions deactivation from the
+newrule error path, otherwise the anonymous set remains in the list in
+inactive state for the next generation. Mark the set/chain transaction
+as unbound so the abort path releases this object, set it as inactive in
+the next generation so it is not reachable anymore from this transaction
+and reference counter is dropped.
+
+Fixes: 1240eb93f061 ("netfilter: nf_tables: incorrect error path handling with NFT_MSG_NEWRULE")
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 26b5a5712eb85e253724e56a54c17f8519bd8e4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nft_immediate.c
+diff --cc include/net/netfilter/nf_tables.h
+index 6c8e93a3cf77,de2b0130c151..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -991,6 -1104,12 +992,15 @@@ struct nft_chain 
+  };
+  
+  int nft_chain_validate(const struct nft_ctx *ctx, const struct nft_chain *chain);
+++<<<<<<< HEAD
+++=======
++ int nft_setelem_validate(const struct nft_ctx *ctx, struct nft_set *set,
++ 			 const struct nft_set_iter *iter,
++ 			 struct nft_set_elem *elem);
++ int nft_set_catchall_validate(const struct nft_ctx *ctx, struct nft_set *set);
++ int nf_tables_bind_chain(const struct nft_ctx *ctx, struct nft_chain *chain);
++ void nf_tables_unbind_chain(const struct nft_ctx *ctx, struct nft_chain *chain);
+++>>>>>>> 26b5a5712eb8 (netfilter: nf_tables: add NFT_TRANS_PREPARE_ERROR to deal with bound set/chain)
+  
+  enum nft_chain_types {
+  	NFT_CHAIN_T_DEFAULT = 0,
+diff --cc net/netfilter/nf_tables_api.c
+index fbdd72e364e0,f8afefc8294f..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -171,8 -169,10 +171,9 @@@ static void nft_trans_destroy(struct nf
+  	kfree(trans);
+  }
+  
+- static void nft_set_trans_bind(const struct nft_ctx *ctx, struct nft_set *set)
++ static void __nft_set_trans_bind(const struct nft_ctx *ctx, struct nft_set *set,
++ 				 bool bind)
+  {
+ -	struct nftables_pernet *nft_net;
+  	struct net *net = ctx->net;
+  	struct nft_trans *trans;
+  
+@@@ -187,12 -188,76 +188,79 @@@
+  			break;
+  		case NFT_MSG_NEWSETELEM:
+  			if (nft_trans_elem_set(trans) == set)
+- 				nft_trans_elem_set_bound(trans) = true;
++ 				nft_trans_elem_set_bound(trans) = bind;
++ 			break;
++ 		}
++ 	}
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ static void nft_set_trans_bind(const struct nft_ctx *ctx, struct nft_set *set)
++ {
++ 	return __nft_set_trans_bind(ctx, set, true);
++ }
++ 
++ static void nft_set_trans_unbind(const struct nft_ctx *ctx, struct nft_set *set)
++ {
++ 	return __nft_set_trans_bind(ctx, set, false);
++ }
++ 
++ static void __nft_chain_trans_bind(const struct nft_ctx *ctx,
++ 				   struct nft_chain *chain, bool bind)
++ {
++ 	struct nftables_pernet *nft_net;
++ 	struct net *net = ctx->net;
++ 	struct nft_trans *trans;
++ 
++ 	if (!nft_chain_binding(chain))
++ 		return;
++ 
++ 	nft_net = nft_pernet(net);
++ 	list_for_each_entry_reverse(trans, &nft_net->commit_list, list) {
++ 		switch (trans->msg_type) {
++ 		case NFT_MSG_NEWCHAIN:
++ 			if (nft_trans_chain(trans) == chain)
++ 				nft_trans_chain_bound(trans) = bind;
++ 			break;
++ 		case NFT_MSG_NEWRULE:
++ 			if (trans->ctx.chain == chain)
++ 				nft_trans_rule_bound(trans) = bind;
+  			break;
+  		}
+  	}
+  }
+  
++ static void nft_chain_trans_bind(const struct nft_ctx *ctx,
++ 				 struct nft_chain *chain)
++ {
++ 	__nft_chain_trans_bind(ctx, chain, true);
++ }
++ 
++ int nf_tables_bind_chain(const struct nft_ctx *ctx, struct nft_chain *chain)
++ {
++ 	if (!nft_chain_binding(chain))
++ 		return 0;
++ 
++ 	if (nft_chain_binding(ctx->chain))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (chain->bound)
++ 		return -EBUSY;
++ 
++ 	chain->bound = true;
++ 	chain->use++;
++ 	nft_chain_trans_bind(ctx, chain);
++ 
++ 	return 0;
++ }
++ 
++ void nf_tables_unbind_chain(const struct nft_ctx *ctx, struct nft_chain *chain)
++ {
++ 	__nft_chain_trans_bind(ctx, chain, false);
++ }
++ 
+++>>>>>>> 26b5a5712eb8 (netfilter: nf_tables: add NFT_TRANS_PREPARE_ERROR to deal with bound set/chain)
+  static int nft_netdev_register_hooks(struct net *net,
+  				     struct list_head *hook_list)
+  {
+diff --cc net/netfilter/nft_immediate.c
+index 0e14b4367e37,3d76ebfe8939..000000000000
+--- a/net/netfilter/nft_immediate.c
++++ b/net/netfilter/nft_immediate.c
+@@@ -77,6 -130,43 +77,46 @@@ static void nft_immediate_deactivate(co
+  				     enum nft_trans_phase phase)
+  {
+  	const struct nft_immediate_expr *priv = nft_expr_priv(expr);
+++<<<<<<< HEAD
+++=======
++ 	const struct nft_data *data = &priv->data;
++ 	struct nft_ctx chain_ctx;
++ 	struct nft_chain *chain;
++ 	struct nft_rule *rule;
++ 
++ 	if (priv->dreg == NFT_REG_VERDICT) {
++ 		switch (data->verdict.code) {
++ 		case NFT_JUMP:
++ 		case NFT_GOTO:
++ 			chain = data->verdict.chain;
++ 			if (!nft_chain_binding(chain))
++ 				break;
++ 
++ 			chain_ctx = *ctx;
++ 			chain_ctx.chain = chain;
++ 
++ 			list_for_each_entry(rule, &chain->rules, list)
++ 				nft_rule_expr_deactivate(&chain_ctx, rule, phase);
++ 
++ 			switch (phase) {
++ 			case NFT_TRANS_PREPARE_ERROR:
++ 				nf_tables_unbind_chain(ctx, chain);
++ 				fallthrough;
++ 			case NFT_TRANS_PREPARE:
++ 				nft_deactivate_next(ctx->net, chain);
++ 				break;
++ 			default:
++ 				nft_chain_del(chain);
++ 				chain->bound = false;
++ 				chain->table->use--;
++ 				break;
++ 			}
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 	}
+++>>>>>>> 26b5a5712eb8 (netfilter: nf_tables: add NFT_TRANS_PREPARE_ERROR to deal with bound set/chain)
+  
+  	if (phase == NFT_TRANS_COMMIT)
+  		return;
+* Unmerged path include/net/netfilter/nf_tables.h
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nft_immediate.c
