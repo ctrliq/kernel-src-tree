@@ -1,0 +1,309 @@
+efi: Use more granular check for availability for variable services
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-504.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit bf67fad19e493bd3f7267b35b97b860280f87acc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-504.el8/bf67fad1.failed
+
+The UEFI spec rev 2.8 permits firmware implementations to support only
+a subset of EFI runtime services at OS runtime (i.e., after the call to
+ExitBootServices()), so let's take this into account in the drivers that
+rely specifically on the availability of the EFI variable services.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+(cherry picked from commit bf67fad19e493bd3f7267b35b97b860280f87acc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/firmware/efi/efi.c
+diff --cc drivers/firmware/efi/efi.c
+index 1cb06f13fccd,abf4c02e0201..000000000000
+--- a/drivers/firmware/efi/efi.c
++++ b/drivers/firmware/efi/efi.c
+@@@ -641,184 -579,79 +643,218 @@@ int __init efi_config_parse_tables(voi
+  		}
+  	}
+  
+ -	if (rt_prop != EFI_INVALID_TABLE_ADDR) {
+ -		efi_rt_properties_table_t *tbl;
+ +	return 0;
+ +}
+  
+ -		tbl = early_memremap(rt_prop, sizeof(*tbl));
+ -		if (tbl) {
+ -			efi.runtime_supported_mask &= tbl->runtime_services_supported;
+ -			early_memunmap(tbl, sizeof(*tbl));
+ -		}
+ +int __init efi_config_init(efi_config_table_type_t *arch_tables)
+ +{
+ +	void *config_tables;
+ +	int sz, ret;
+ +
+ +	if (efi_enabled(EFI_64BIT))
+ +		sz = sizeof(efi_config_table_64_t);
+ +	else
+ +		sz = sizeof(efi_config_table_32_t);
+ +
+ +	/*
+ +	 * Let's see what config tables the firmware passed to us.
+ +	 */
+ +	config_tables = early_memremap(efi.systab->tables,
+ +				       efi.systab->nr_tables * sz);
+ +	if (config_tables == NULL) {
+ +		pr_err("Could not map Configuration table!\n");
+ +		return -ENOMEM;
+  	}
+  
+ -	return 0;
+ +	ret = efi_config_parse_tables(config_tables, efi.systab->nr_tables, sz,
+ +				      arch_tables);
+ +
+ +	early_memunmap(config_tables, efi.systab->nr_tables * sz);
+ +	return ret;
+  }
+  
+ -int __init efi_systab_check_header(const efi_table_hdr_t *systab_hdr,
+ -				   int min_major_version)
+++<<<<<<< HEAD
+ +#ifdef CONFIG_EFI_VARS_MODULE
+ +static int __init efi_load_efivars(void)
+  {
+ -	if (systab_hdr->signature != EFI_SYSTEM_TABLE_SIGNATURE) {
+ -		pr_err("System table signature incorrect!\n");
+ -		return -EINVAL;
+ +	struct platform_device *pdev;
+ +
+ +	if (!efi_enabled(EFI_RUNTIME_SERVICES))
+ +		return 0;
+ +
+ +	pdev = platform_device_register_simple("efivars", 0, NULL, 0);
+ +	return PTR_ERR_OR_ZERO(pdev);
+ +}
+ +device_initcall(efi_load_efivars);
+ +#endif
+ +
+ +#ifdef CONFIG_EFI_PARAMS_FROM_FDT
+ +
+ +#define UEFI_PARAM(name, prop, field)			   \
+ +	{						   \
+ +		{ name },				   \
+ +		{ prop },				   \
+ +		offsetof(struct efi_fdt_params, field),    \
+ +		FIELD_SIZEOF(struct efi_fdt_params, field) \
+  	}
+  
+ -	if ((systab_hdr->revision >> 16) < min_major_version)
+ -		pr_err("Warning: System table version %d.%02d, expected %d.00 or greater!\n",
+ -		       systab_hdr->revision >> 16,
+ -		       systab_hdr->revision & 0xffff,
+ -		       min_major_version);
+ +struct params {
+ +	const char name[32];
+ +	const char propname[32];
+ +	int offset;
+ +	int size;
+ +};
+ +
+ +static __initdata struct params fdt_params[] = {
+ +	UEFI_PARAM("System Table", "linux,uefi-system-table", system_table),
+ +	UEFI_PARAM("MemMap Address", "linux,uefi-mmap-start", mmap),
+ +	UEFI_PARAM("MemMap Size", "linux,uefi-mmap-size", mmap_size),
+ +	UEFI_PARAM("MemMap Desc. Size", "linux,uefi-mmap-desc-size", desc_size),
+ +	UEFI_PARAM("MemMap Desc. Version", "linux,uefi-mmap-desc-ver", desc_ver)
+ +};
+ +
+ +static __initdata struct params xen_fdt_params[] = {
+ +	UEFI_PARAM("System Table", "xen,uefi-system-table", system_table),
+ +	UEFI_PARAM("MemMap Address", "xen,uefi-mmap-start", mmap),
+ +	UEFI_PARAM("MemMap Size", "xen,uefi-mmap-size", mmap_size),
+ +	UEFI_PARAM("MemMap Desc. Size", "xen,uefi-mmap-desc-size", desc_size),
+ +	UEFI_PARAM("MemMap Desc. Version", "xen,uefi-mmap-desc-ver", desc_ver)
+ +};
+ +
+ +#define EFI_FDT_PARAMS_SIZE	ARRAY_SIZE(fdt_params)
+ +
+ +static __initdata struct {
+ +	const char *uname;
+ +	const char *subnode;
+ +	struct params *params;
+ +} dt_params[] = {
+ +	{ "hypervisor", "uefi", xen_fdt_params },
+ +	{ "chosen", NULL, fdt_params },
+ +};
+ +
+ +struct param_info {
+ +	int found;
+ +	void *params;
+ +	const char *missing;
+ +};
+ +
+ +static int __init __find_uefi_params(unsigned long node,
+ +				     struct param_info *info,
+ +				     struct params *params)
+ +{
+ +	const void *prop;
+ +	void *dest;
+ +	u64 val;
+ +	int i, len;
+ +
+ +	for (i = 0; i < EFI_FDT_PARAMS_SIZE; i++) {
+ +		prop = of_get_flat_dt_prop(node, params[i].propname, &len);
+ +		if (!prop) {
+ +			info->missing = params[i].name;
+ +			return 0;
+ +		}
+ +
+ +		dest = info->params + params[i].offset;
+ +		info->found++;
+ +
+ +		val = of_read_number(prop, len / sizeof(u32));
+ +
+ +		if (params[i].size == sizeof(u32))
+ +			*(u32 *)dest = val;
+ +		else
+ +			*(u64 *)dest = val;
+ +
+ +		if (efi_enabled(EFI_DBG))
+ +			pr_info("  %s: 0x%0*llx\n", params[i].name,
+ +				params[i].size * 2, val);
+ +	}
+ +
+ +	return 1;
+ +}
+ +
+ +static int __init fdt_find_uefi_params(unsigned long node, const char *uname,
+ +				       int depth, void *data)
+ +{
+ +	struct param_info *info = data;
+ +	int i;
+ +
+ +	for (i = 0; i < ARRAY_SIZE(dt_params); i++) {
+ +		const char *subnode = dt_params[i].subnode;
+ +
+ +		if (depth != 1 || strcmp(uname, dt_params[i].uname) != 0) {
+ +			info->missing = dt_params[i].params[0].name;
+ +			continue;
+ +		}
+ +
+ +		if (subnode) {
+ +			int err = of_get_flat_dt_subnode_by_name(node, subnode);
+ +
+ +			if (err < 0)
+ +				return 0;
+ +
+ +			node = err;
+ +		}
+ +
+ +		return __find_uefi_params(node, info, dt_params[i].params);
+ +	}
+  
+  	return 0;
+  }
+  
+ -#ifndef CONFIG_IA64
+ -static const efi_char16_t *__init map_fw_vendor(unsigned long fw_vendor,
+ -						size_t size)
+ +int __init efi_get_fdt_params(struct efi_fdt_params *params)
+  {
+ -	const efi_char16_t *ret;
+ +	struct param_info info;
+ +	int ret;
+ +
+ +	pr_info("Getting EFI parameters from FDT:\n");
+ +
+ +	info.found = 0;
+ +	info.params = params;
+ +
+ +	ret = of_scan_flat_dt(fdt_find_uefi_params, &info);
+ +	if (!info.found)
+ +		pr_info("UEFI not found.\n");
+ +	else if (!ret)
+ +		pr_err("Can't find '%s' in device tree!\n",
+ +		       info.missing);
+  
+ -	ret = early_memremap_ro(fw_vendor, size);
+ -	if (!ret)
+ -		pr_err("Could not map the firmware vendor!\n");
+  	return ret;
+  }
+ +#endif /* CONFIG_EFI_PARAMS_FROM_FDT */
+  
+++=======
++ static void __init unmap_fw_vendor(const void *fw_vendor, size_t size)
++ {
++ 	early_memunmap((void *)fw_vendor, size);
++ }
++ #else
++ #define map_fw_vendor(p, s)	__va(p)
++ #define unmap_fw_vendor(v, s)
++ #endif
++ 
++ void __init efi_systab_report_header(const efi_table_hdr_t *systab_hdr,
++ 				     unsigned long fw_vendor)
++ {
++ 	char vendor[100] = "unknown";
++ 	const efi_char16_t *c16;
++ 	size_t i;
++ 
++ 	c16 = map_fw_vendor(fw_vendor, sizeof(vendor) * sizeof(efi_char16_t));
++ 	if (c16) {
++ 		for (i = 0; i < sizeof(vendor) - 1 && c16[i]; ++i)
++ 			vendor[i] = c16[i];
++ 		vendor[i] = '\0';
++ 
++ 		unmap_fw_vendor(c16, sizeof(vendor) * sizeof(efi_char16_t));
++ 	}
++ 
++ 	pr_info("EFI v%u.%.02u by %s\n",
++ 		systab_hdr->revision >> 16,
++ 		systab_hdr->revision & 0xffff,
++ 		vendor);
++ }
++ 
+++>>>>>>> bf67fad19e49 (efi: Use more granular check for availability for variable services)
+  static __initdata char memory_type_name[][20] = {
+  	"Reserved",
+  	"Loader Code",
+diff --git a/drivers/firmware/efi/efi-pstore.c b/drivers/firmware/efi/efi-pstore.c
+index 5e53e74f3dd7..6feb1b428c08 100644
+--- a/drivers/firmware/efi/efi-pstore.c
++++ b/drivers/firmware/efi/efi-pstore.c
+@@ -354,7 +354,7 @@ static struct pstore_info efi_pstore_info = {
+ 
+ static __init int efivars_pstore_init(void)
+ {
+-	if (!efi_enabled(EFI_RUNTIME_SERVICES))
++	if (!efi_rt_services_supported(EFI_RT_SUPPORTED_VARIABLE_SERVICES))
+ 		return 0;
+ 
+ 	if (!efivars_kobject())
+* Unmerged path drivers/firmware/efi/efi.c
+diff --git a/drivers/firmware/efi/efivars.c b/drivers/firmware/efi/efivars.c
+index 1c65f5ac4368..3552d4c9c7a0 100644
+--- a/drivers/firmware/efi/efivars.c
++++ b/drivers/firmware/efi/efivars.c
+@@ -742,7 +742,7 @@ int efivars_sysfs_init(void)
+ 	struct kobject *parent_kobj = efivars_kobject();
+ 	int error = 0;
+ 
+-	if (!efi_enabled(EFI_RUNTIME_SERVICES))
++	if (!efi_rt_services_supported(EFI_RT_SUPPORTED_VARIABLE_SERVICES))
+ 		return -ENODEV;
+ 
+ 	/* No efivars has been registered yet */
+diff --git a/fs/efivarfs/super.c b/fs/efivarfs/super.c
+index 124f1aa9ab03..df048480239d 100644
+--- a/fs/efivarfs/super.c
++++ b/fs/efivarfs/super.c
+@@ -255,7 +255,7 @@ static struct file_system_type efivarfs_type = {
+ 
+ static __init int efivarfs_init(void)
+ {
+-	if (!efi_enabled(EFI_RUNTIME_SERVICES))
++	if (!efi_rt_services_supported(EFI_RT_SUPPORTED_VARIABLE_SERVICES))
+ 		return -ENODEV;
+ 
+ 	if (!efivars_kobject())
