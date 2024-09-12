@@ -1,0 +1,695 @@
+netfilter: nf_tables: use timestamp to check for set element timeout
+
+jira LE-1907
+cve CVE-2024-27397
+Rebuild_History Non-Buildable kernel-4.18.0-553.8.1.el8_10
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 7395dfacfff65e9938ac0889dafa1ab01e987d15
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.8.1.el8_10/7395dfac.failed
+
+Add a timestamp field at the beginning of the transaction, store it
+in the nftables per-netns area.
+
+Update set backend .insert, .deactivate and sync gc path to use the
+timestamp, this avoids that an element expires while control plane
+transaction is still unfinished.
+
+.lookup and .update, which are used from packet path, still use the
+current time to check if the element has expired. And .get path and dump
+also since this runs lockless under rcu read size lock. Then, there is
+async gc which also needs to check the current time since it runs
+asynchronously from a workqueue.
+
+Fixes: c3e1b005ed1c ("netfilter: nf_tables: add set element timeout support")
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 7395dfacfff65e9938ac0889dafa1ab01e987d15)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nft_set_pipapo.c
+#	net/netfilter/nft_set_rbtree.c
+diff --cc include/net/netfilter/nf_tables.h
+index 9cd3b46bd77b,510244cc0f8f..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -1533,7 -1778,17 +1539,19 @@@ static inline int nft_request_module(st
+  #endif
+  
+  struct nftables_pernet {
+++<<<<<<< HEAD
+++=======
++ 	struct list_head	tables;
++ 	struct list_head	commit_list;
++ 	struct list_head	binding_list;
++ 	struct list_head	module_list;
++ 	struct list_head	notify_list;
++ 	struct mutex		commit_mutex;
++ 	u64			table_handle;
++ 	u64			tstamp;
++ 	unsigned int		base_seq;
+++>>>>>>> 7395dfacfff6 (netfilter: nf_tables: use timestamp to check for set element timeout)
+  	unsigned int		gc_seq;
+ -	u8			validate_state;
+  };
+  
+  extern unsigned int nf_tables_net_id;
+@@@ -1543,4 -1798,30 +1561,33 @@@ static inline struct nftables_pernet *n
+  	return net_generic(net, nf_tables_net_id);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u64 nft_net_tstamp(const struct net *net)
++ {
++ 	return nft_pernet(net)->tstamp;
++ }
++ 
++ #define __NFT_REDUCE_READONLY	1UL
++ #define NFT_REDUCE_READONLY	(void *)__NFT_REDUCE_READONLY
++ 
++ static inline bool nft_reduce_is_readonly(const struct nft_expr *expr)
++ {
++ 	return expr->ops->reduce == NFT_REDUCE_READONLY;
++ }
++ 
++ void nft_reg_track_update(struct nft_regs_track *track,
++ 			  const struct nft_expr *expr, u8 dreg, u8 len);
++ void nft_reg_track_cancel(struct nft_regs_track *track, u8 dreg, u8 len);
++ void __nft_reg_track_cancel(struct nft_regs_track *track, u8 dreg);
++ 
++ static inline bool nft_reg_track_cmp(struct nft_regs_track *track,
++ 				     const struct nft_expr *expr, u8 dreg)
++ {
++ 	return track->regs[dreg].selector &&
++ 	       track->regs[dreg].selector->ops == expr->ops &&
++ 	       track->regs[dreg].num_reg == 0;
++ }
++ 
+++>>>>>>> 7395dfacfff6 (netfilter: nf_tables: use timestamp to check for set element timeout)
+  #endif /* _NET_NF_TABLES_H */
+diff --cc net/netfilter/nf_tables_api.c
+index 8e7547925ef4,f8e3f70c35bd..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -8001,7 -9796,62 +8001,66 @@@ void nft_trans_gc_queue_sync_done(struc
+  
+  	call_rcu(&trans->rcu, nft_trans_gc_trans_free);
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(nft_trans_gc_queue_sync_done);
+++=======
++ 
++ struct nft_trans_gc *nft_trans_gc_catchall_async(struct nft_trans_gc *gc,
++ 						 unsigned int gc_seq)
++ {
++ 	struct nft_set_elem_catchall *catchall;
++ 	const struct nft_set *set = gc->set;
++ 	struct nft_set_ext *ext;
++ 
++ 	list_for_each_entry_rcu(catchall, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 
++ 		if (!nft_set_elem_expired(ext))
++ 			continue;
++ 		if (nft_set_elem_is_dead(ext))
++ 			goto dead_elem;
++ 
++ 		nft_set_elem_dead(ext);
++ dead_elem:
++ 		gc = nft_trans_gc_queue_async(gc, gc_seq, GFP_ATOMIC);
++ 		if (!gc)
++ 			return NULL;
++ 
++ 		nft_trans_gc_elem_add(gc, catchall->elem);
++ 	}
++ 
++ 	return gc;
++ }
++ 
++ struct nft_trans_gc *nft_trans_gc_catchall_sync(struct nft_trans_gc *gc)
++ {
++ 	struct nft_set_elem_catchall *catchall, *next;
++ 	u64 tstamp = nft_net_tstamp(gc->net);
++ 	const struct nft_set *set = gc->set;
++ 	struct nft_elem_priv *elem_priv;
++ 	struct nft_set_ext *ext;
++ 
++ 	WARN_ON_ONCE(!lockdep_commit_lock_is_held(gc->net));
++ 
++ 	list_for_each_entry_safe(catchall, next, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 
++ 		if (!__nft_set_elem_expired(ext, tstamp))
++ 			continue;
++ 
++ 		gc = nft_trans_gc_queue_sync(gc, GFP_KERNEL);
++ 		if (!gc)
++ 			return NULL;
++ 
++ 		elem_priv = catchall->elem;
++ 		nft_setelem_data_deactivate(gc->net, gc->set, elem_priv);
++ 		nft_setelem_catchall_destroy(catchall);
++ 		nft_trans_gc_elem_add(gc, elem_priv);
++ 	}
++ 
++ 	return gc;
++ }
+++>>>>>>> 7395dfacfff6 (netfilter: nf_tables: use timestamp to check for set element timeout)
+  
+  static void nf_tables_module_autoload_cleanup(struct net *net)
+  {
+@@@ -8639,13 -10619,15 +8698,18 @@@ static int nf_tables_abort(struct net *
+  
+  static bool nf_tables_valid_genid(struct net *net, u32 genid)
+  {
+ -	struct nftables_pernet *nft_net = nft_pernet(net);
+  	bool genid_ok;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&net->nft_commit_mutex);
+++=======
++ 	mutex_lock(&nft_net->commit_mutex);
++ 	nft_net->tstamp = get_jiffies_64();
+++>>>>>>> 7395dfacfff6 (netfilter: nf_tables: use timestamp to check for set element timeout)
+  
+ -	genid_ok = genid == 0 || nft_net->base_seq == genid;
+ +	genid_ok = genid == 0 || net->nft.base_seq == genid;
+  	if (!genid_ok)
+ -		mutex_unlock(&nft_net->commit_mutex);
+ +		mutex_unlock(&net->nft_commit_mutex);
+  
+  	/* else, commit mutex has to be released by commit or abort function */
+  	return genid_ok;
+diff --cc net/netfilter/nft_set_pipapo.c
+index 70375ac112ca,b17c18203416..000000000000
+--- a/net/netfilter/nft_set_pipapo.c
++++ b/net/netfilter/nft_set_pipapo.c
+@@@ -737,11 -601,18 +739,22 @@@ out
+   * @elem:	nftables API element representation containing key data
+   * @flags:	Unused
+   */
+ -static struct nft_elem_priv *
+ -nft_pipapo_get(const struct net *net, const struct nft_set *set,
+ -	       const struct nft_set_elem *elem, unsigned int flags)
+ +void *nft_pipapo_get(const struct net *net, const struct nft_set *set,
+ +		     const struct nft_set_elem *elem, unsigned int flags)
+  {
+++<<<<<<< HEAD
+ +	return pipapo_get(net, set, (const u8 *)elem->key.val.data,
+ +			 nft_genmask_cur(net));
+++=======
++ 	struct nft_pipapo_elem *e;
++ 
++ 	e = pipapo_get(net, set, (const u8 *)elem->key.val.data,
++ 		       nft_genmask_cur(net), get_jiffies_64());
++ 	if (IS_ERR(e))
++ 		return ERR_CAST(e);
++ 
++ 	return &e->priv;
+++>>>>>>> 7395dfacfff6 (netfilter: nf_tables: use timestamp to check for set element timeout)
+  }
+  
+  /**
+@@@ -1100,18 -1174,40 +1113,54 @@@ static int nft_pipapo_insert(const stru
+  	struct nft_pipapo *priv = nft_set_priv(set);
+  	struct nft_pipapo_match *m = priv->clone;
+  	u8 genmask = nft_genmask_next(net);
+++<<<<<<< HEAD
+++=======
++ 	struct nft_pipapo_elem *e, *dup;
++ 	u64 tstamp = nft_net_tstamp(net);
+++>>>>>>> 7395dfacfff6 (netfilter: nf_tables: use timestamp to check for set element timeout)
+  	struct nft_pipapo_field *f;
+  	const u8 *start_p, *end_p;
+  	int i, bsize_max, err = 0;
+  
+++<<<<<<< HEAD
+ +	dup = pipapo_get(net, set, start, genmask);
+ +	if (PTR_ERR(dup) == -ENOENT) {
+ +		if (nft_set_ext_exists(ext, NFT_SET_EXT_KEY_END)) {
+ +			end = (const u8 *)nft_set_ext_key_end(ext)->data;
+ +			dup = pipapo_get(net, set, end, nft_genmask_next(net));
+ +		} else {
+ +			end = start;
+ +		}
+++=======
++ 	if (nft_set_ext_exists(ext, NFT_SET_EXT_KEY_END))
++ 		end = (const u8 *)nft_set_ext_key_end(ext)->data;
++ 	else
++ 		end = start;
++ 
++ 	dup = pipapo_get(net, set, start, genmask, tstamp);
++ 	if (!IS_ERR(dup)) {
++ 		/* Check if we already have the same exact entry */
++ 		const struct nft_data *dup_key, *dup_end;
++ 
++ 		dup_key = nft_set_ext_key(&dup->ext);
++ 		if (nft_set_ext_exists(&dup->ext, NFT_SET_EXT_KEY_END))
++ 			dup_end = nft_set_ext_key_end(&dup->ext);
++ 		else
++ 			dup_end = dup_key;
++ 
++ 		if (!memcmp(start, dup_key->data, sizeof(*dup_key->data)) &&
++ 		    !memcmp(end, dup_end->data, sizeof(*dup_end->data))) {
++ 			*elem_priv = &dup->priv;
++ 			return -EEXIST;
++ 		}
++ 
++ 		return -ENOTEMPTY;
++ 	}
++ 
++ 	if (PTR_ERR(dup) == -ENOENT) {
++ 		/* Look for partially overlapping entries */
++ 		dup = pipapo_get(net, set, end, nft_genmask_next(net), tstamp);
+++>>>>>>> 7395dfacfff6 (netfilter: nf_tables: use timestamp to check for set element timeout)
+  	}
+  
+  	if (PTR_ERR(dup) != -ENOENT) {
+@@@ -1450,14 -1556,14 +1499,15 @@@ static void nft_pipapo_gc_deactivate(st
+  
+  /**
+   * pipapo_gc() - Drop expired entries from set, destroy start and end elements
+ - * @set:	nftables API set representation
+ + * @_set:	nftables API set representation
+   * @m:		Matching data
+   */
+ -static void pipapo_gc(struct nft_set *set, struct nft_pipapo_match *m)
+ +static void pipapo_gc(const struct nft_set *_set, struct nft_pipapo_match *m)
+  {
+ +	struct nft_set *set = (struct nft_set *) _set;
+  	struct nft_pipapo *priv = nft_set_priv(set);
+  	struct net *net = read_pnet(&set->net);
++ 	u64 tstamp = nft_net_tstamp(net);
+  	int rules_f0, first_rule = 0;
+  	struct nft_pipapo_elem *e;
+  	struct nft_trans_gc *gc;
+@@@ -1492,10 -1598,10 +1542,10 @@@
+  		/* synchronous gc never fails, there is no need to set on
+  		 * NFT_SET_ELEM_DEAD_BIT.
+  		 */
+- 		if (nft_set_elem_expired(&e->ext)) {
++ 		if (__nft_set_elem_expired(&e->ext, tstamp)) {
+  			priv->dirty = true;
+  
+ -			gc = nft_trans_gc_queue_sync(gc, GFP_KERNEL);
+ +			gc = nft_trans_gc_queue_sync(gc, GFP_ATOMIC);
+  			if (!gc)
+  				return;
+  
+diff --cc net/netfilter/nft_set_rbtree.c
+index 47a028450e72,5fd74f993988..000000000000
+--- a/net/netfilter/nft_set_rbtree.c
++++ b/net/netfilter/nft_set_rbtree.c
+@@@ -225,52 -306,19 +225,56 @@@ static void *nft_rbtree_get(const struc
+  
+  static int __nft_rbtree_insert(const struct net *net, const struct nft_set *set,
+  			       struct nft_rbtree_elem *new,
+ -			       struct nft_elem_priv **elem_priv)
+ +			       struct nft_set_ext **ext)
+  {
+ -	struct nft_rbtree_elem *rbe, *rbe_le = NULL, *rbe_ge = NULL;
+ -	struct rb_node *node, *next, *parent, **p, *first = NULL;
+  	struct nft_rbtree *priv = nft_set_priv(set);
+ -	u8 cur_genmask = nft_genmask_cur(net);
+  	u8 genmask = nft_genmask_next(net);
+++<<<<<<< HEAD
+ +	struct nft_rbtree_elem *rbe;
+ +	struct rb_node *parent, **p;
+ +	bool overlap = false;
+++=======
++ 	u64 tstamp = nft_net_tstamp(net);
+++>>>>>>> 7395dfacfff6 (netfilter: nf_tables: use timestamp to check for set element timeout)
+  	int d;
+  
+ -	/* Descend the tree to search for an existing element greater than the
+ -	 * key value to insert that is greater than the new element. This is the
+ -	 * first element to walk the ordered elements to find possible overlap.
+ +	/* Detect overlaps as we descend the tree. Set the flag in these cases:
+ +	 *
+ +	 * a1. _ _ __>|  ?_ _ __|  (insert end before existing end)
+ +	 * a2. _ _ ___|  ?_ _ _>|  (insert end after existing end)
+ +	 * a3. _ _ ___? >|_ _ __|  (insert start before existing end)
+ +	 *
+ +	 * and clear it later on, as we eventually reach the points indicated by
+ +	 * '?' above, in the cases described below. We'll always meet these
+ +	 * later, locally, due to tree ordering, and overlaps for the intervals
+ +	 * that are the closest together are always evaluated last.
+ +	 *
+ +	 * b1. _ _ __>|  !_ _ __|  (insert end before existing start)
+ +	 * b2. _ _ ___|  !_ _ _>|  (insert end after existing start)
+ +	 * b3. _ _ ___! >|_ _ __|  (insert start after existing end, as a leaf)
+ +	 *            '--' no nodes falling in this range
+ +	 * b4.          >|_ _   !  (insert start before existing start)
+ +	 *
+ +	 * Case a3. resolves to b3.:
+ +	 * - if the inserted start element is the leftmost, because the '0'
+ +	 *   element in the tree serves as end element
+ +	 * - otherwise, if an existing end is found immediately to the left. If
+ +	 *   there are existing nodes in between, we need to further descend the
+ +	 *   tree before we can conclude the new start isn't causing an overlap
+ +	 *
+ +	 * or to b4., which, preceded by a3., means we already traversed one or
+ +	 * more existing intervals entirely, from the right.
+ +	 *
+ +	 * For a new, rightmost pair of elements, we'll hit cases b3. and b2.,
+ +	 * in that order.
+ +	 *
+ +	 * The flag is also cleared in two special cases:
+ +	 *
+ +	 * b5. |__ _ _!|<_ _ _   (insert start right before existing end)
+ +	 * b6. |__ _ >|!__ _ _   (insert end right after existing start)
+ +	 *
+ +	 * which always happen as last step and imply that no further
+ +	 * overlapping is possible.
+  	 */
+  	parent = NULL;
+  	p = &priv->root.rb_node;
+@@@ -335,9 -343,141 +339,113 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (overlap)
+++=======
++ 	if (!first)
++ 		first = rb_first(&priv->root);
++ 
++ 	/* Detect overlap by going through the list of valid tree nodes.
++ 	 * Values stored in the tree are in reversed order, starting from
++ 	 * highest to lowest value.
++ 	 */
++ 	for (node = first; node != NULL; node = next) {
++ 		next = rb_next(node);
++ 
++ 		rbe = rb_entry(node, struct nft_rbtree_elem, node);
++ 
++ 		if (!nft_set_elem_active(&rbe->ext, genmask))
++ 			continue;
++ 
++ 		/* perform garbage collection to avoid bogus overlap reports
++ 		 * but skip new elements in this transaction.
++ 		 */
++ 		if (__nft_set_elem_expired(&rbe->ext, tstamp) &&
++ 		    nft_set_elem_active(&rbe->ext, cur_genmask)) {
++ 			const struct nft_rbtree_elem *removed_end;
++ 
++ 			removed_end = nft_rbtree_gc_elem(set, priv, rbe, genmask);
++ 			if (IS_ERR(removed_end))
++ 				return PTR_ERR(removed_end);
++ 
++ 			if (removed_end == rbe_le || removed_end == rbe_ge)
++ 				return -EAGAIN;
++ 
++ 			continue;
++ 		}
++ 
++ 		d = nft_rbtree_cmp(set, rbe, new);
++ 		if (d == 0) {
++ 			/* Matching end element: no need to look for an
++ 			 * overlapping greater or equal element.
++ 			 */
++ 			if (nft_rbtree_interval_end(rbe)) {
++ 				rbe_le = rbe;
++ 				break;
++ 			}
++ 
++ 			/* first element that is greater or equal to key value. */
++ 			if (!rbe_ge) {
++ 				rbe_ge = rbe;
++ 				continue;
++ 			}
++ 
++ 			/* this is a closer more or equal element, update it. */
++ 			if (nft_rbtree_cmp(set, rbe_ge, new) != 0) {
++ 				rbe_ge = rbe;
++ 				continue;
++ 			}
++ 
++ 			/* element is equal to key value, make sure flags are
++ 			 * the same, an existing more or equal start element
++ 			 * must not be replaced by more or equal end element.
++ 			 */
++ 			if ((nft_rbtree_interval_start(new) &&
++ 			     nft_rbtree_interval_start(rbe_ge)) ||
++ 			    (nft_rbtree_interval_end(new) &&
++ 			     nft_rbtree_interval_end(rbe_ge))) {
++ 				rbe_ge = rbe;
++ 				continue;
++ 			}
++ 		} else if (d > 0) {
++ 			/* annotate element greater than the new element. */
++ 			rbe_ge = rbe;
++ 			continue;
++ 		} else if (d < 0) {
++ 			/* annotate element less than the new element. */
++ 			rbe_le = rbe;
++ 			break;
++ 		}
++ 	}
++ 
++ 	/* - new start element matching existing start element: full overlap
++ 	 *   reported as -EEXIST, cleared by caller if NLM_F_EXCL is not given.
++ 	 */
++ 	if (rbe_ge && !nft_rbtree_cmp(set, new, rbe_ge) &&
++ 	    nft_rbtree_interval_start(rbe_ge) == nft_rbtree_interval_start(new)) {
++ 		*elem_priv = &rbe_ge->priv;
++ 		return -EEXIST;
++ 	}
++ 
++ 	/* - new end element matching existing end element: full overlap
++ 	 *   reported as -EEXIST, cleared by caller if NLM_F_EXCL is not given.
++ 	 */
++ 	if (rbe_le && !nft_rbtree_cmp(set, new, rbe_le) &&
++ 	    nft_rbtree_interval_end(rbe_le) == nft_rbtree_interval_end(new)) {
++ 		*elem_priv = &rbe_le->priv;
++ 		return -EEXIST;
++ 	}
++ 
++ 	/* - new start element with existing closest, less or equal key value
++ 	 *   being a start element: partial overlap, reported as -ENOTEMPTY.
++ 	 *   Anonymous sets allow for two consecutive start element since they
++ 	 *   are constant, skip them to avoid bogus overlap reports.
++ 	 */
++ 	if (!nft_set_is_anonymous(set) && rbe_le &&
++ 	    nft_rbtree_interval_start(rbe_le) && nft_rbtree_interval_start(new))
+++>>>>>>> 7395dfacfff6 (netfilter: nf_tables: use timestamp to check for set element timeout)
+  		return -ENOTEMPTY;
+  
+ -	/* - new end element with existing closest, less or equal key value
+ -	 *   being a end element: partial overlap, reported as -ENOTEMPTY.
+ -	 */
+ -	if (rbe_le &&
+ -	    nft_rbtree_interval_end(rbe_le) && nft_rbtree_interval_end(new))
+ -		return -ENOTEMPTY;
+ -
+ -	/* - new end element with existing closest, greater or equal key value
+ -	 *   being an end element: partial overlap, reported as -ENOTEMPTY
+ -	 */
+ -	if (rbe_ge &&
+ -	    nft_rbtree_interval_end(rbe_ge) && nft_rbtree_interval_end(new))
+ -		return -ENOTEMPTY;
+ -
+ -	/* Accepted element: pick insertion point depending on key value */
+ -	parent = NULL;
+ -	p = &priv->root.rb_node;
+ -	while (*p != NULL) {
+ -		parent = *p;
+ -		rbe = rb_entry(parent, struct nft_rbtree_elem, node);
+ -		d = nft_rbtree_cmp(set, rbe, new);
+ -
+ -		if (d < 0)
+ -			p = &parent->rb_left;
+ -		else if (d > 0)
+ -			p = &parent->rb_right;
+ -		else if (nft_rbtree_interval_end(rbe))
+ -			p = &parent->rb_left;
+ -		else
+ -			p = &parent->rb_right;
+ -	}
+ -
+  	rb_link_node_rcu(&new->node, parent, p);
+  	rb_insert_color(&new->node, &priv->root);
+  	return 0;
+@@@ -391,14 -544,15 +499,15 @@@ static void nft_rbtree_flush(const stru
+  	nft_set_elem_change_active(net, set, &rbe->ext);
+  }
+  
+ -static struct nft_elem_priv *
+ -nft_rbtree_deactivate(const struct net *net, const struct nft_set *set,
+ -		      const struct nft_set_elem *elem)
+ +static void *nft_rbtree_deactivate(const struct net *net,
+ +				   const struct nft_set *set,
+ +				   const struct nft_set_elem *elem)
+  {
+ -	struct nft_rbtree_elem *rbe, *this = nft_elem_priv_cast(elem->priv);
+  	const struct nft_rbtree *priv = nft_set_priv(set);
+  	const struct rb_node *parent = priv->root.rb_node;
+ +	struct nft_rbtree_elem *rbe, *this = elem->priv;
+  	u8 genmask = nft_genmask_next(net);
++ 	u64 tstamp = nft_net_tstamp(net);
+  	int d;
+  
+  	while (parent != NULL) {
+@@@ -419,6 -573,8 +528,11 @@@
+  				   nft_rbtree_interval_end(this)) {
+  				parent = parent->rb_right;
+  				continue;
+++<<<<<<< HEAD
+++=======
++ 			} else if (__nft_set_elem_expired(&rbe->ext, tstamp)) {
++ 				break;
+++>>>>>>> 7395dfacfff6 (netfilter: nf_tables: use timestamp to check for set element timeout)
+  			} else if (!nft_set_elem_active(&rbe->ext, genmask)) {
+  				parent = parent->rb_left;
+  				continue;
+@@@ -461,40 -614,32 +575,47 @@@ cont
+  	read_unlock_bh(&priv->lock);
+  }
+  
+ -static void nft_rbtree_gc_remove(struct net *net, struct nft_set *set,
+ -				 struct nft_rbtree *priv,
+ -				 struct nft_rbtree_elem *rbe)
+ -{
+ -	nft_setelem_data_deactivate(net, set, &rbe->priv);
+ -	nft_rbtree_erase(priv, rbe);
+ -}
+ -
+ -static void nft_rbtree_gc(struct nft_set *set)
+ +static void nft_rbtree_gc(struct work_struct *work)
+  {
+ -	struct nft_rbtree *priv = nft_set_priv(set);
+  	struct nft_rbtree_elem *rbe, *rbe_end = NULL;
+++<<<<<<< HEAD
+ +	struct nftables_pernet *nft_net;
+ +	struct nft_rbtree *priv;
+ +	struct nft_trans_gc *gc;
+ +	struct rb_node *node;
+ +	struct nft_set *set;
+ +	unsigned int gc_seq;
+ +	struct net *net;
+++=======
++ 	struct net *net = read_pnet(&set->net);
++ 	u64 tstamp = nft_net_tstamp(net);
++ 	struct rb_node *node, *next;
++ 	struct nft_trans_gc *gc;
+++>>>>>>> 7395dfacfff6 (netfilter: nf_tables: use timestamp to check for set element timeout)
+  
+ +	priv = container_of(work, struct nft_rbtree, gc_work.work);
+  	set  = nft_set_container_of(priv);
+  	net  = read_pnet(&set->net);
+ +	nft_net = nft_pernet(net);
+ +	gc_seq  = READ_ONCE(nft_net->gc_seq);
+ +
+ +	if (nft_set_gc_is_pending(set))
+ +		goto done;
+  
+ -	gc = nft_trans_gc_alloc(set, 0, GFP_KERNEL);
+ +	gc = nft_trans_gc_alloc(set, gc_seq, GFP_KERNEL);
+  	if (!gc)
+ -		return;
+ +		goto done;
+  
+ -	for (node = rb_first(&priv->root); node ; node = next) {
+ -		next = rb_next(node);
+ +	write_lock_bh(&priv->lock);
+ +	write_seqcount_begin(&priv->count);
+ +	for (node = rb_first(&priv->root); node != NULL; node = rb_next(node)) {
+ +
+ +		/* Ruleset has been updated, try later. */
+ +		if (READ_ONCE(nft_net->gc_seq) != gc_seq) {
+ +			nft_trans_gc_destroy(gc);
+ +			gc = NULL;
+ +			goto try_later;
+ +		}
+  
+  		rbe = rb_entry(node, struct nft_rbtree_elem, node);
+  
+@@@ -509,17 -651,10 +630,17 @@@
+  			rbe_end = rbe;
+  			continue;
+  		}
+- 		if (!nft_set_elem_expired(&rbe->ext))
++ 		if (!__nft_set_elem_expired(&rbe->ext, tstamp))
+  			continue;
+  
+ -		gc = nft_trans_gc_queue_sync(gc, GFP_KERNEL);
+ +		nft_set_elem_dead(&rbe->ext);
+ +
+ +		if (!rbe_end)
+ +			continue;
+ +
+ +		nft_set_elem_dead(&rbe_end->ext);
+ +
+ +		gc = nft_trans_gc_queue_async(gc, gc_seq, GFP_ATOMIC);
+  		if (!gc)
+  			goto try_later;
+  
+* Unmerged path include/net/netfilter/nf_tables.h
+* Unmerged path net/netfilter/nf_tables_api.c
+diff --git a/net/netfilter/nft_set_hash.c b/net/netfilter/nft_set_hash.c
+index 4223e8cb52ef..2bf9ef0736bf 100644
+--- a/net/netfilter/nft_set_hash.c
++++ b/net/netfilter/nft_set_hash.c
+@@ -38,6 +38,7 @@ struct nft_rhash_cmp_arg {
+ 	const struct nft_set		*set;
+ 	const u32			*key;
+ 	u8				genmask;
++	u64				tstamp;
+ };
+ 
+ static inline u32 nft_rhash_key(const void *data, u32 len, u32 seed)
+@@ -64,7 +65,7 @@ static inline int nft_rhash_cmp(struct rhashtable_compare_arg *arg,
+ 		return 1;
+ 	if (nft_set_elem_is_dead(&he->ext))
+ 		return 1;
+-	if (nft_set_elem_expired(&he->ext))
++	if (__nft_set_elem_expired(&he->ext, x->tstamp))
+ 		return 1;
+ 	if (!nft_set_elem_active(&he->ext, x->genmask))
+ 		return 1;
+@@ -88,6 +89,7 @@ static bool nft_rhash_lookup(const struct net *net, const struct nft_set *set,
+ 		.genmask = nft_genmask_cur(net),
+ 		.set	 = set,
+ 		.key	 = key,
++		.tstamp  = get_jiffies_64(),
+ 	};
+ 
+ 	he = rhashtable_lookup(&priv->ht, &arg, nft_rhash_params);
+@@ -106,6 +108,7 @@ static void *nft_rhash_get(const struct net *net, const struct nft_set *set,
+ 		.genmask = nft_genmask_cur(net),
+ 		.set	 = set,
+ 		.key	 = elem->key.val.data,
++		.tstamp  = get_jiffies_64(),
+ 	};
+ 
+ 	he = rhashtable_lookup(&priv->ht, &arg, nft_rhash_params);
+@@ -129,6 +132,7 @@ static bool nft_rhash_update(struct nft_set *set, const u32 *key,
+ 		.genmask = NFT_GENMASK_ANY,
+ 		.set	 = set,
+ 		.key	 = key,
++		.tstamp  = get_jiffies_64(),
+ 	};
+ 
+ 	he = rhashtable_lookup(&priv->ht, &arg, nft_rhash_params);
+@@ -172,6 +176,7 @@ static int nft_rhash_insert(const struct net *net, const struct nft_set *set,
+ 		.genmask = nft_genmask_next(net),
+ 		.set	 = set,
+ 		.key	 = elem->key.val.data,
++		.tstamp	 = nft_net_tstamp(net),
+ 	};
+ 	struct nft_rhash_elem *prev;
+ 
+@@ -212,6 +217,7 @@ static void *nft_rhash_deactivate(const struct net *net,
+ 		.genmask = nft_genmask_next(net),
+ 		.set	 = set,
+ 		.key	 = elem->key.val.data,
++		.tstamp	 = nft_net_tstamp(net),
+ 	};
+ 
+ 	rcu_read_lock();
+* Unmerged path net/netfilter/nft_set_pipapo.c
+* Unmerged path net/netfilter/nft_set_rbtree.c
