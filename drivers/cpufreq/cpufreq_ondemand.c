@@ -329,7 +329,7 @@ gov_attr_rw(sampling_down_factor);
 gov_attr_rw(ignore_nice_load);
 gov_attr_rw(powersave_bias);
 
-static struct attribute *od_attributes[] = {
+static struct attribute *od_attrs[] = {
 	&sampling_rate.attr,
 	&up_threshold.attr,
 	&sampling_down_factor.attr,
@@ -338,6 +338,7 @@ static struct attribute *od_attributes[] = {
 	&io_is_busy.attr,
 	NULL
 };
+ATTRIBUTE_GROUPS(od);
 
 /************************** sysfs end ************************/
 
@@ -402,7 +403,7 @@ static struct od_ops od_ops = {
 
 static struct dbs_governor od_dbs_gov = {
 	.gov = CPUFREQ_DBS_GOVERNOR_INITIALIZER("ondemand"),
-	.kobj_type = { .default_attrs = od_attributes },
+	.kobj_type = { .default_groups = od_groups },
 	.gov_dbs_update = od_dbs_update,
 	.alloc = od_alloc,
 	.free = od_free,
