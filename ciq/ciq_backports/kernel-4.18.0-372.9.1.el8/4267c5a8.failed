@@ -1,0 +1,106 @@
+ALSA: usb-audio: Work around for XRUN with low latency playback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 4267c5a8f3133db0572cd9abee059b42cafbbdad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/4267c5a8.failed
+
+The recent change for low latency playback works in most of test cases
+but it turned out still to hit errors on some use cases, most notably
+with JACK with small buffer sizes.  This is because USB-audio driver
+fills up and submits full URBs at the beginning, while the URBs would
+return immediately and try to fill more -- that can easily trigger
+XRUN.  It was more or less expected, but in the small buffer size, the
+problem became pretty obvious.
+
+Fixing this behavior properly would require the change of the
+fundamental driver design, so it's no trivial task, unfortunately.
+Instead, here we work around the problem just by switching back to the
+old method when the given configuration is too fragile with the low
+latency stream handling.  As a threshold, we calculate the total
+buffer bytes in all plus one URBs, and check whether it's beyond the
+PCM buffer bytes.  The one extra URB is needed because XRUN happens at
+the next submission after the first round.
+
+Fixes: 307cc9baac5c ("ALSA: usb-audio: Reduce latency at playback start, take#2")
+	Cc: <stable@vger.kernel.org>
+Link: https://lore.kernel.org/r/20210827203311.5987-1-tiwai@suse.de
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 4267c5a8f3133db0572cd9abee059b42cafbbdad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/usb/card.h
+diff --cc sound/usb/card.h
+index 2b33db1f3b2a,5b19901f305a..000000000000
+--- a/sound/usb/card.h
++++ b/sound/usb/card.h
+@@@ -185,6 -188,8 +186,11 @@@ struct snd_usb_substream 
+  	} dsd_dop;
+  
+  	bool trigger_tstamp_pending_update; /* trigger timestamp being updated from initial estimate */
+++<<<<<<< HEAD
+++=======
++ 	bool early_playback_start;	/* early start needed for playback? */
++ 	struct media_ctl *media_ctl;
+++>>>>>>> 4267c5a8f313 (ALSA: usb-audio: Work around for XRUN with low latency playback)
+  };
+  
+  struct snd_usb_stream {
+* Unmerged path sound/usb/card.h
+diff --git a/sound/usb/endpoint.c b/sound/usb/endpoint.c
+index 41bc6cb295ac..a3ffd65695a3 100644
+--- a/sound/usb/endpoint.c
++++ b/sound/usb/endpoint.c
+@@ -1126,6 +1126,10 @@ static int data_ep_set_params(struct snd_usb_endpoint *ep)
+ 		INIT_LIST_HEAD(&u->ready_list);
+ 	}
+ 
++	/* total buffer bytes of all URBs plus the next queue;
++	 * referred in pcm.c
++	 */
++	ep->nominal_queue_size = maxsize * urb_packs * (ep->nurbs + 1);
+ 	return 0;
+ 
+ out_of_memory:
+diff --git a/sound/usb/pcm.c b/sound/usb/pcm.c
+index 8432926ab61b..cc7260d5ac8a 100644
+--- a/sound/usb/pcm.c
++++ b/sound/usb/pcm.c
+@@ -605,6 +605,14 @@ static int snd_usb_pcm_prepare(struct snd_pcm_substream *substream)
+ 	subs->period_elapsed_pending = 0;
+ 	runtime->delay = 0;
+ 
++	/* check whether early start is needed for playback stream */
++	subs->early_playback_start =
++		subs->direction == SNDRV_PCM_STREAM_PLAYBACK &&
++		subs->data_endpoint->nominal_queue_size >= subs->buffer_bytes;
++
++	if (subs->early_playback_start)
++		ret = start_endpoints(subs);
++
+  unlock:
+ 	snd_usb_unlock_shutdown(chip);
+ 	return ret;
+@@ -1377,7 +1385,7 @@ static void prepare_playback_urb(struct snd_usb_substream *subs,
+ 		subs->trigger_tstamp_pending_update = false;
+ 	}
+ 
+-	if (period_elapsed && !subs->running) {
++	if (period_elapsed && !subs->running && !subs->early_playback_start) {
+ 		subs->period_elapsed_pending = 1;
+ 		period_elapsed = 0;
+ 	}
+@@ -1431,7 +1439,8 @@ static int snd_usb_substream_playback_trigger(struct snd_pcm_substream *substrea
+ 					      prepare_playback_urb,
+ 					      retire_playback_urb,
+ 					      subs);
+-		if (cmd == SNDRV_PCM_TRIGGER_START) {
++		if (!subs->early_playback_start &&
++		    cmd == SNDRV_PCM_TRIGGER_START) {
+ 			err = start_endpoints(subs);
+ 			if (err < 0) {
+ 				snd_usb_endpoint_set_callback(subs->data_endpoint,
