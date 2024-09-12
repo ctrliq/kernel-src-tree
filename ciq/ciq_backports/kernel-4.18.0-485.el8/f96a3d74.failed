@@ -1,0 +1,437 @@
+ipv4: Fix incorrect route flushing when source address is deleted
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-485.el8
+commit-author Ido Schimmel <idosch@nvidia.com>
+commit f96a3d74554df537b6db5c99c27c80e7afadc8d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-485.el8/f96a3d74.failed
+
+Cited commit added the table ID to the FIB info structure, but did not
+prevent structures with different table IDs from being consolidated.
+This can lead to routes being flushed from a VRF when an address is
+deleted from a different VRF.
+
+Fix by taking the table ID into account when looking for a matching FIB
+info. This is already done for FIB info structures backed by a nexthop
+object in fib_find_info_nh().
+
+Add test cases that fail before the fix:
+
+ # ./fib_tests.sh -t ipv4_del_addr
+
+ IPv4 delete address route tests
+     Regular FIB info
+     TEST: Route removed from VRF when source address deleted            [ OK ]
+     TEST: Route in default VRF not removed                              [ OK ]
+     TEST: Route removed in default VRF when source address deleted      [ OK ]
+     TEST: Route in VRF is not removed by address delete                 [ OK ]
+     Identical FIB info with different table ID
+     TEST: Route removed from VRF when source address deleted            [FAIL]
+     TEST: Route in default VRF not removed                              [ OK ]
+ RTNETLINK answers: File exists
+     TEST: Route removed in default VRF when source address deleted      [ OK ]
+     TEST: Route in VRF is not removed by address delete                 [FAIL]
+
+ Tests passed:   6
+ Tests failed:   2
+
+And pass after:
+
+ # ./fib_tests.sh -t ipv4_del_addr
+
+ IPv4 delete address route tests
+     Regular FIB info
+     TEST: Route removed from VRF when source address deleted            [ OK ]
+     TEST: Route in default VRF not removed                              [ OK ]
+     TEST: Route removed in default VRF when source address deleted      [ OK ]
+     TEST: Route in VRF is not removed by address delete                 [ OK ]
+     Identical FIB info with different table ID
+     TEST: Route removed from VRF when source address deleted            [ OK ]
+     TEST: Route in default VRF not removed                              [ OK ]
+     TEST: Route removed in default VRF when source address deleted      [ OK ]
+     TEST: Route in VRF is not removed by address delete                 [ OK ]
+
+ Tests passed:   8
+ Tests failed:   0
+
+Fixes: 5a56a0b3a45d ("net: Don't delete routes in different VRFs")
+	Signed-off-by: Ido Schimmel <idosch@nvidia.com>
+	Reviewed-by: David Ahern <dsahern@kernel.org>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit f96a3d74554df537b6db5c99c27c80e7afadc8d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/net/fib_tests.sh
+diff --cc tools/testing/selftests/net/fib_tests.sh
+index c85734602cdf,11c89148b19f..000000000000
+--- a/tools/testing/selftests/net/fib_tests.sh
++++ b/tools/testing/selftests/net/fib_tests.sh
+@@@ -1509,6 -1692,349 +1509,352 @@@ ipv4_route_metrics_test(
+  	route_cleanup
+  }
+  
+++<<<<<<< HEAD
+++=======
++ ipv4_del_addr_test()
++ {
++ 	echo
++ 	echo "IPv4 delete address route tests"
++ 
++ 	setup
++ 
++ 	set -e
++ 	$IP li add dummy1 type dummy
++ 	$IP li set dummy1 up
++ 	$IP li add dummy2 type dummy
++ 	$IP li set dummy2 up
++ 	$IP li add red type vrf table 1111
++ 	$IP li set red up
++ 	$IP ro add vrf red unreachable default
++ 	$IP li set dummy2 vrf red
++ 
++ 	$IP addr add dev dummy1 172.16.104.1/24
++ 	$IP addr add dev dummy1 172.16.104.11/24
++ 	$IP addr add dev dummy1 172.16.104.12/24
++ 	$IP addr add dev dummy2 172.16.104.1/24
++ 	$IP addr add dev dummy2 172.16.104.11/24
++ 	$IP addr add dev dummy2 172.16.104.12/24
++ 	$IP route add 172.16.105.0/24 via 172.16.104.2 src 172.16.104.11
++ 	$IP route add 172.16.106.0/24 dev lo src 172.16.104.12
++ 	$IP route add vrf red 172.16.105.0/24 via 172.16.104.2 src 172.16.104.11
++ 	$IP route add vrf red 172.16.106.0/24 dev lo src 172.16.104.12
++ 	set +e
++ 
++ 	# removing address from device in vrf should only remove route from vrf table
++ 	echo "    Regular FIB info"
++ 
++ 	$IP addr del dev dummy2 172.16.104.11/24
++ 	$IP ro ls vrf red | grep -q 172.16.105.0/24
++ 	log_test $? 1 "Route removed from VRF when source address deleted"
++ 
++ 	$IP ro ls | grep -q 172.16.105.0/24
++ 	log_test $? 0 "Route in default VRF not removed"
++ 
++ 	$IP addr add dev dummy2 172.16.104.11/24
++ 	$IP route add vrf red 172.16.105.0/24 via 172.16.104.2 src 172.16.104.11
++ 
++ 	$IP addr del dev dummy1 172.16.104.11/24
++ 	$IP ro ls | grep -q 172.16.105.0/24
++ 	log_test $? 1 "Route removed in default VRF when source address deleted"
++ 
++ 	$IP ro ls vrf red | grep -q 172.16.105.0/24
++ 	log_test $? 0 "Route in VRF is not removed by address delete"
++ 
++ 	# removing address from device in vrf should only remove route from vrf
++ 	# table even when the associated fib info only differs in table ID
++ 	echo "    Identical FIB info with different table ID"
++ 
++ 	$IP addr del dev dummy2 172.16.104.12/24
++ 	$IP ro ls vrf red | grep -q 172.16.106.0/24
++ 	log_test $? 1 "Route removed from VRF when source address deleted"
++ 
++ 	$IP ro ls | grep -q 172.16.106.0/24
++ 	log_test $? 0 "Route in default VRF not removed"
++ 
++ 	$IP addr add dev dummy2 172.16.104.12/24
++ 	$IP route add vrf red 172.16.106.0/24 dev lo src 172.16.104.12
++ 
++ 	$IP addr del dev dummy1 172.16.104.12/24
++ 	$IP ro ls | grep -q 172.16.106.0/24
++ 	log_test $? 1 "Route removed in default VRF when source address deleted"
++ 
++ 	$IP ro ls vrf red | grep -q 172.16.106.0/24
++ 	log_test $? 0 "Route in VRF is not removed by address delete"
++ 
++ 	$IP li del dummy1
++ 	$IP li del dummy2
++ 	cleanup
++ }
++ 
++ 
++ ipv4_route_v6_gw_test()
++ {
++ 	local rc
++ 
++ 	echo
++ 	echo "IPv4 route with IPv6 gateway tests"
++ 
++ 	route_setup
++ 	sleep 2
++ 
++ 	#
++ 	# single path route
++ 	#
++ 	run_cmd "$IP ro add 172.16.104.0/24 via inet6 2001:db8:101::2"
++ 	rc=$?
++ 	log_test $rc 0 "Single path route with IPv6 gateway"
++ 	if [ $rc -eq 0 ]; then
++ 		check_route "172.16.104.0/24 via inet6 2001:db8:101::2 dev veth1"
++ 	fi
++ 
++ 	run_cmd "ip netns exec ns1 ping -w1 -c1 172.16.104.1"
++ 	log_test $rc 0 "Single path route with IPv6 gateway - ping"
++ 
++ 	run_cmd "$IP ro del 172.16.104.0/24 via inet6 2001:db8:101::2"
++ 	rc=$?
++ 	log_test $rc 0 "Single path route delete"
++ 	if [ $rc -eq 0 ]; then
++ 		check_route "172.16.112.0/24"
++ 	fi
++ 
++ 	#
++ 	# multipath - v6 then v4
++ 	#
++ 	run_cmd "$IP ro add 172.16.104.0/24 nexthop via inet6 2001:db8:101::2 dev veth1 nexthop via 172.16.103.2 dev veth3"
++ 	rc=$?
++ 	log_test $rc 0 "Multipath route add - v6 nexthop then v4"
++ 	if [ $rc -eq 0 ]; then
++ 		check_route "172.16.104.0/24 nexthop via inet6 2001:db8:101::2 dev veth1 weight 1 nexthop via 172.16.103.2 dev veth3 weight 1"
++ 	fi
++ 
++ 	run_cmd "$IP ro del 172.16.104.0/24 nexthop via 172.16.103.2 dev veth3 nexthop via inet6 2001:db8:101::2 dev veth1"
++ 	log_test $? 2 "    Multipath route delete - nexthops in wrong order"
++ 
++ 	run_cmd "$IP ro del 172.16.104.0/24 nexthop via inet6 2001:db8:101::2 dev veth1 nexthop via 172.16.103.2 dev veth3"
++ 	log_test $? 0 "    Multipath route delete exact match"
++ 
++ 	#
++ 	# multipath - v4 then v6
++ 	#
++ 	run_cmd "$IP ro add 172.16.104.0/24 nexthop via 172.16.103.2 dev veth3 nexthop via inet6 2001:db8:101::2 dev veth1"
++ 	rc=$?
++ 	log_test $rc 0 "Multipath route add - v4 nexthop then v6"
++ 	if [ $rc -eq 0 ]; then
++ 		check_route "172.16.104.0/24 nexthop via 172.16.103.2 dev veth3 weight 1 nexthop via inet6 2001:db8:101::2 dev veth1 weight 1"
++ 	fi
++ 
++ 	run_cmd "$IP ro del 172.16.104.0/24 nexthop via inet6 2001:db8:101::2 dev veth1 nexthop via 172.16.103.2 dev veth3"
++ 	log_test $? 2 "    Multipath route delete - nexthops in wrong order"
++ 
++ 	run_cmd "$IP ro del 172.16.104.0/24 nexthop via 172.16.103.2 dev veth3 nexthop via inet6 2001:db8:101::2 dev veth1"
++ 	log_test $? 0 "    Multipath route delete exact match"
++ 
++ 	route_cleanup
++ }
++ 
++ socat_check()
++ {
++ 	if [ ! -x "$(command -v socat)" ]; then
++ 		echo "socat command not found. Skipping test"
++ 		return 1
++ 	fi
++ 
++ 	return 0
++ }
++ 
++ iptables_check()
++ {
++ 	iptables -t mangle -L OUTPUT &> /dev/null
++ 	if [ $? -ne 0 ]; then
++ 		echo "iptables configuration not supported. Skipping test"
++ 		return 1
++ 	fi
++ 
++ 	return 0
++ }
++ 
++ ip6tables_check()
++ {
++ 	ip6tables -t mangle -L OUTPUT &> /dev/null
++ 	if [ $? -ne 0 ]; then
++ 		echo "ip6tables configuration not supported. Skipping test"
++ 		return 1
++ 	fi
++ 
++ 	return 0
++ }
++ 
++ ipv4_mangle_test()
++ {
++ 	local rc
++ 
++ 	echo
++ 	echo "IPv4 mangling tests"
++ 
++ 	socat_check || return 1
++ 	iptables_check || return 1
++ 
++ 	route_setup
++ 	sleep 2
++ 
++ 	local tmp_file=$(mktemp)
++ 	ip netns exec ns2 socat UDP4-LISTEN:54321,fork $tmp_file &
++ 
++ 	# Add a FIB rule and a route that will direct our connection to the
++ 	# listening server.
++ 	$IP rule add pref 100 ipproto udp sport 12345 dport 54321 table 123
++ 	$IP route add table 123 172.16.101.0/24 dev veth1
++ 
++ 	# Add an unreachable route to the main table that will block our
++ 	# connection in case the FIB rule is not hit.
++ 	$IP route add unreachable 172.16.101.2/32
++ 
++ 	run_cmd "echo a | $NS_EXEC socat STDIN UDP4:172.16.101.2:54321,sourceport=12345"
++ 	log_test $? 0 "    Connection with correct parameters"
++ 
++ 	run_cmd "echo a | $NS_EXEC socat STDIN UDP4:172.16.101.2:54321,sourceport=11111"
++ 	log_test $? 1 "    Connection with incorrect parameters"
++ 
++ 	# Add a mangling rule and make sure connection is still successful.
++ 	$NS_EXEC iptables -t mangle -A OUTPUT -j MARK --set-mark 1
++ 
++ 	run_cmd "echo a | $NS_EXEC socat STDIN UDP4:172.16.101.2:54321,sourceport=12345"
++ 	log_test $? 0 "    Connection with correct parameters - mangling"
++ 
++ 	# Delete the mangling rule and make sure connection is still
++ 	# successful.
++ 	$NS_EXEC iptables -t mangle -D OUTPUT -j MARK --set-mark 1
++ 
++ 	run_cmd "echo a | $NS_EXEC socat STDIN UDP4:172.16.101.2:54321,sourceport=12345"
++ 	log_test $? 0 "    Connection with correct parameters - no mangling"
++ 
++ 	# Verify connections were indeed successful on server side.
++ 	[[ $(cat $tmp_file | wc -l) -eq 3 ]]
++ 	log_test $? 0 "    Connection check - server side"
++ 
++ 	$IP route del unreachable 172.16.101.2/32
++ 	$IP route del table 123 172.16.101.0/24 dev veth1
++ 	$IP rule del pref 100
++ 
++ 	{ kill %% && wait %%; } 2>/dev/null
++ 	rm $tmp_file
++ 
++ 	route_cleanup
++ }
++ 
++ ipv6_mangle_test()
++ {
++ 	local rc
++ 
++ 	echo
++ 	echo "IPv6 mangling tests"
++ 
++ 	socat_check || return 1
++ 	ip6tables_check || return 1
++ 
++ 	route_setup
++ 	sleep 2
++ 
++ 	local tmp_file=$(mktemp)
++ 	ip netns exec ns2 socat UDP6-LISTEN:54321,fork $tmp_file &
++ 
++ 	# Add a FIB rule and a route that will direct our connection to the
++ 	# listening server.
++ 	$IP -6 rule add pref 100 ipproto udp sport 12345 dport 54321 table 123
++ 	$IP -6 route add table 123 2001:db8:101::/64 dev veth1
++ 
++ 	# Add an unreachable route to the main table that will block our
++ 	# connection in case the FIB rule is not hit.
++ 	$IP -6 route add unreachable 2001:db8:101::2/128
++ 
++ 	run_cmd "echo a | $NS_EXEC socat STDIN UDP6:[2001:db8:101::2]:54321,sourceport=12345"
++ 	log_test $? 0 "    Connection with correct parameters"
++ 
++ 	run_cmd "echo a | $NS_EXEC socat STDIN UDP6:[2001:db8:101::2]:54321,sourceport=11111"
++ 	log_test $? 1 "    Connection with incorrect parameters"
++ 
++ 	# Add a mangling rule and make sure connection is still successful.
++ 	$NS_EXEC ip6tables -t mangle -A OUTPUT -j MARK --set-mark 1
++ 
++ 	run_cmd "echo a | $NS_EXEC socat STDIN UDP6:[2001:db8:101::2]:54321,sourceport=12345"
++ 	log_test $? 0 "    Connection with correct parameters - mangling"
++ 
++ 	# Delete the mangling rule and make sure connection is still
++ 	# successful.
++ 	$NS_EXEC ip6tables -t mangle -D OUTPUT -j MARK --set-mark 1
++ 
++ 	run_cmd "echo a | $NS_EXEC socat STDIN UDP6:[2001:db8:101::2]:54321,sourceport=12345"
++ 	log_test $? 0 "    Connection with correct parameters - no mangling"
++ 
++ 	# Verify connections were indeed successful on server side.
++ 	[[ $(cat $tmp_file | wc -l) -eq 3 ]]
++ 	log_test $? 0 "    Connection check - server side"
++ 
++ 	$IP -6 route del unreachable 2001:db8:101::2/128
++ 	$IP -6 route del table 123 2001:db8:101::/64 dev veth1
++ 	$IP -6 rule del pref 100
++ 
++ 	{ kill %% && wait %%; } 2>/dev/null
++ 	rm $tmp_file
++ 
++ 	route_cleanup
++ }
++ 
++ ip_neigh_get_check()
++ {
++ 	ip neigh help 2>&1 | grep -q 'ip neigh get'
++ 	if [ $? -ne 0 ]; then
++ 		echo "iproute2 command does not support neigh get. Skipping test"
++ 		return 1
++ 	fi
++ 
++ 	return 0
++ }
++ 
++ ipv4_bcast_neigh_test()
++ {
++ 	local rc
++ 
++ 	echo
++ 	echo "IPv4 broadcast neighbour tests"
++ 
++ 	ip_neigh_get_check || return 1
++ 
++ 	setup
++ 
++ 	set -e
++ 	run_cmd "$IP neigh add 192.0.2.111 lladdr 00:11:22:33:44:55 nud perm dev dummy0"
++ 	run_cmd "$IP neigh add 192.0.2.255 lladdr 00:11:22:33:44:55 nud perm dev dummy0"
++ 
++ 	run_cmd "$IP neigh get 192.0.2.111 dev dummy0"
++ 	run_cmd "$IP neigh get 192.0.2.255 dev dummy0"
++ 
++ 	run_cmd "$IP address add 192.0.2.1/24 broadcast 192.0.2.111 dev dummy0"
++ 
++ 	run_cmd "$IP neigh add 203.0.113.111 nud failed dev dummy0"
++ 	run_cmd "$IP neigh add 203.0.113.255 nud failed dev dummy0"
++ 
++ 	run_cmd "$IP neigh get 203.0.113.111 dev dummy0"
++ 	run_cmd "$IP neigh get 203.0.113.255 dev dummy0"
++ 
++ 	run_cmd "$IP address add 203.0.113.1/24 broadcast 203.0.113.111 dev dummy0"
++ 	set +e
++ 
++ 	run_cmd "$IP neigh get 192.0.2.111 dev dummy0"
++ 	log_test $? 0 "Resolved neighbour for broadcast address"
++ 
++ 	run_cmd "$IP neigh get 192.0.2.255 dev dummy0"
++ 	log_test $? 0 "Resolved neighbour for network broadcast address"
++ 
++ 	run_cmd "$IP neigh get 203.0.113.111 dev dummy0"
++ 	log_test $? 2 "Unresolved neighbour for broadcast address"
++ 
++ 	run_cmd "$IP neigh get 203.0.113.255 dev dummy0"
++ 	log_test $? 2 "Unresolved neighbour for network broadcast address"
++ 
++ 	cleanup
++ }
+++>>>>>>> f96a3d74554d (ipv4: Fix incorrect route flushing when source address is deleted)
+  
+  ################################################################################
+  # usage
+diff --git a/net/ipv4/fib_semantics.c b/net/ipv4/fib_semantics.c
+index 7ec3da5f404c..1600f4cbbd6c 100644
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@ -322,6 +322,7 @@ static struct fib_info *fib_find_info(const struct fib_info *nfi)
+ 		    nfi->fib_prefsrc == fi->fib_prefsrc &&
+ 		    nfi->fib_priority == fi->fib_priority &&
+ 		    nfi->fib_type == fi->fib_type &&
++		    nfi->fib_tb_id == fi->fib_tb_id &&
+ 		    memcmp(nfi->fib_metrics, fi->fib_metrics,
+ 			   sizeof(u32) * RTAX_MAX) == 0 &&
+ 		    !((nfi->fib_flags ^ fi->fib_flags) & ~RTNH_COMPARE_MASK) &&
+* Unmerged path tools/testing/selftests/net/fib_tests.sh
