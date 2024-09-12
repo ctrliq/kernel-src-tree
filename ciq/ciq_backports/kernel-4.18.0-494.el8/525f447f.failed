@@ -1,0 +1,156 @@
+scsi: target: Fix incorrect use of cpumask_t
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-494.el8
+commit-author Mingzhe Zou <mingzhe.zou@easystack.cn>
+commit 525f447f88b14a64424642de670f77424e067d5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-494.el8/525f447f.failed
+
+In commit d72d827f2f26, I used 'cpumask_t' incorrectly:
+
+    void iscsit_thread_get_cpumask(struct iscsi_conn *conn)
+    {
+            int ord, cpu;
+            cpumask_t conn_allowed_cpumask;
+            ......
+    }
+
+    static ssize_t lio_target_wwn_cpus_allowed_list_store(
+                   struct config_item *item, const char *page, size_t count)
+    {
+            int ret;
+            char *orig;
+            cpumask_t new_allowed_cpumask;
+            ......
+    }
+
+The correct pattern should be as follows:
+
+    cpumask_var_t mask;
+
+    if (!zalloc_cpumask_var(&mask, GFP_KERNEL))
+            return -ENOMEM;
+    ... use 'mask' here ...
+    free_cpumask_var(mask);
+
+Link: https://lore.kernel.org/r/20220516054721.1548-1-mingzhe.zou@easystack.cn
+Fixes: d72d827f2f26 ("scsi: target: Add iscsi/cpus_allowed_list in configfs")
+	Reported-by: Test Bot <zgrieee@gmail.com>
+	Reviewed-by: Mike Christie <michael.christie@oracle.com>
+	Signed-off-by: Mingzhe Zou <mingzhe.zou@easystack.cn>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 525f447f88b14a64424642de670f77424e067d5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/iscsi/iscsi_target.c
+#	drivers/target/iscsi/iscsi_target_configfs.c
+diff --cc drivers/target/iscsi/iscsi_target.c
+index e18864143503,ddf6c2a7212b..000000000000
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@@ -3595,6 -3596,8 +3595,11 @@@ static int iscsit_send_reject
+  void iscsit_thread_get_cpumask(struct iscsi_conn *conn)
+  {
+  	int ord, cpu;
+++<<<<<<< HEAD
+++=======
++ 	cpumask_var_t conn_allowed_cpumask;
++ 
+++>>>>>>> 525f447f88b1 (scsi: target: Fix incorrect use of cpumask_t)
+  	/*
+  	 * bitmap_id is assigned from iscsit_global->ts_bitmap from
+  	 * within iscsit_start_kthreads()
+@@@ -3603,12 -3606,28 +3608,36 @@@
+  	 * iSCSI connection's RX/TX threads will be scheduled to
+  	 * execute upon.
+  	 */
+++<<<<<<< HEAD
+ +	ord = conn->bitmap_id % cpumask_weight(cpu_online_mask);
+ +	for_each_online_cpu(cpu) {
+ +		if (ord-- == 0) {
+ +			cpumask_set_cpu(cpu, conn->conn_cpumask);
+ +			return;
+++=======
++ 	if (!zalloc_cpumask_var(&conn_allowed_cpumask, GFP_KERNEL)) {
++ 		ord = conn->bitmap_id % cpumask_weight(cpu_online_mask);
++ 		for_each_online_cpu(cpu) {
++ 			if (ord-- == 0) {
++ 				cpumask_set_cpu(cpu, conn->conn_cpumask);
++ 				return;
++ 			}
+++>>>>>>> 525f447f88b1 (scsi: target: Fix incorrect use of cpumask_t)
++ 		}
++ 	} else {
++ 		cpumask_and(conn_allowed_cpumask, iscsit_global->allowed_cpumask,
++ 			cpu_online_mask);
++ 
++ 		cpumask_clear(conn->conn_cpumask);
++ 		ord = conn->bitmap_id % cpumask_weight(conn_allowed_cpumask);
++ 		for_each_cpu(cpu, conn_allowed_cpumask) {
++ 			if (ord-- == 0) {
++ 				cpumask_set_cpu(cpu, conn->conn_cpumask);
++ 				free_cpumask_var(conn_allowed_cpumask);
++ 				return;
++ 			}
+  		}
++ 		free_cpumask_var(conn_allowed_cpumask);
+  	}
+  	/*
+  	 * This should never be reached..
+diff --cc drivers/target/iscsi/iscsi_target_configfs.c
+index 5591019ea505,57b4fd56d92a..000000000000
+--- a/drivers/target/iscsi/iscsi_target_configfs.c
++++ b/drivers/target/iscsi/iscsi_target_configfs.c
+@@@ -1135,8 -1127,44 +1135,46 @@@ static ssize_t lio_target_wwn_lio_versi
+  
+  CONFIGFS_ATTR_RO(lio_target_wwn_, lio_version);
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t lio_target_wwn_cpus_allowed_list_show(
++ 		struct config_item *item, char *page)
++ {
++ 	return sprintf(page, "%*pbl\n",
++ 		       cpumask_pr_args(iscsit_global->allowed_cpumask));
++ }
++ 
++ static ssize_t lio_target_wwn_cpus_allowed_list_store(
++ 		struct config_item *item, const char *page, size_t count)
++ {
++ 	int ret = -ENOMEM;
++ 	char *orig;
++ 	cpumask_var_t new_allowed_cpumask;
++ 
++ 	if (!zalloc_cpumask_var(&new_allowed_cpumask, GFP_KERNEL))
++ 		goto out;
++ 
++ 	orig = kstrdup(page, GFP_KERNEL);
++ 	if (!orig)
++ 		goto out_free_cpumask;
++ 
++ 	ret = cpulist_parse(orig, new_allowed_cpumask);
++ 	if (!ret)
++ 		cpumask_copy(iscsit_global->allowed_cpumask,
++ 			     new_allowed_cpumask);
++ 
++ 	kfree(orig);
++ out_free_cpumask:
++ 	free_cpumask_var(new_allowed_cpumask);
++ out:
++ 	return ret ? ret : count;
++ }
++ 
++ CONFIGFS_ATTR(lio_target_wwn_, cpus_allowed_list);
++ 
+++>>>>>>> 525f447f88b1 (scsi: target: Fix incorrect use of cpumask_t)
+  static struct configfs_attribute *lio_target_wwn_attrs[] = {
+  	&lio_target_wwn_attr_lio_version,
+ -	&lio_target_wwn_attr_cpus_allowed_list,
+  	NULL,
+  };
+  
+* Unmerged path drivers/target/iscsi/iscsi_target.c
+* Unmerged path drivers/target/iscsi/iscsi_target_configfs.c
