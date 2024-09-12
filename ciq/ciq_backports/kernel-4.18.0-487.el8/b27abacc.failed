@@ -1,0 +1,384 @@
+mm/mempolicy: add MPOL_PREFERRED_MANY for multiple preferred nodes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-487.el8
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit b27abaccf8e8b012f126da0c2a1ab32723ec8b9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-487.el8/b27abacc.failed
+
+Patch series "Introduce multi-preference mempolicy", v7.
+
+This patch series introduces the concept of the MPOL_PREFERRED_MANY
+mempolicy.  This mempolicy mode can be used with either the
+set_mempolicy(2) or mbind(2) interfaces.  Like the MPOL_PREFERRED
+interface, it allows an application to set a preference for nodes which
+will fulfil memory allocation requests.  Unlike the MPOL_PREFERRED mode,
+it takes a set of nodes.  Like the MPOL_BIND interface, it works over a
+set of nodes.  Unlike MPOL_BIND, it will not cause a SIGSEGV or invoke the
+OOM killer if those preferred nodes are not available.
+
+Along with these patches are patches for libnuma, numactl, numademo, and
+memhog.  They still need some polish, but can be found here:
+https://gitlab.com/bwidawsk/numactl/-/tree/prefer-many It allows new
+usage: `numactl -P 0,3,4`
+
+The goal of the new mode is to enable some use-cases when using tiered memory
+usage models which I've lovingly named.
+
+1a. The Hare - The interconnect is fast enough to meet bandwidth and
+    latency requirements allowing preference to be given to all nodes with
+    "fast" memory.
+1b. The Indiscriminate Hare - An application knows it wants fast
+    memory (or perhaps slow memory), but doesn't care which node it runs
+    on.  The application can prefer a set of nodes and then xpu bind to
+    the local node (cpu, accelerator, etc).  This reverses the nodes are
+    chosen today where the kernel attempts to use local memory to the CPU
+    whenever possible.  This will attempt to use the local accelerator to
+    the memory.
+2.  The Tortoise - The administrator (or the application itself) is
+    aware it only needs slow memory, and so can prefer that.
+
+Much of this is almost achievable with the bind interface, but the bind
+interface suffers from an inability to fallback to another set of nodes if
+binding fails to all nodes in the nodemask.
+
+Like MPOL_BIND a nodemask is given. Inherently this removes ordering from the
+preference.
+
+> /* Set first two nodes as preferred in an 8 node system. */
+> const unsigned long nodes = 0x3
+> set_mempolicy(MPOL_PREFER_MANY, &nodes, 8);
+
+> /* Mimic interleave policy, but have fallback *.
+> const unsigned long nodes = 0xaa
+> set_mempolicy(MPOL_PREFER_MANY, &nodes, 8);
+
+Some internal discussion took place around the interface. There are two
+alternatives which we have discussed, plus one I stuck in:
+
+1. Ordered list of nodes.  Currently it's believed that the added
+   complexity is nod needed for expected usecases.
+2. A flag for bind to allow falling back to other nodes.  This
+   confuses the notion of binding and is less flexible than the current
+   solution.
+3. Create flags or new modes that helps with some ordering.  This
+   offers both a friendlier API as well as a solution for more customized
+   usage.  It's unknown if it's worth the complexity to support this.
+   Here is sample code for how this might work:
+
+> // Prefer specific nodes for some something wacky
+> set_mempolicy(MPOL_PREFER_MANY, 0x17c, 1024);
+>
+> // Default
+> set_mempolicy(MPOL_PREFER_MANY | MPOL_F_PREFER_ORDER_SOCKET, NULL, 0);
+> // which is the same as
+> set_mempolicy(MPOL_DEFAULT, NULL, 0);
+>
+> // The Hare
+> set_mempolicy(MPOL_PREFER_MANY | MPOL_F_PREFER_ORDER_TYPE, NULL, 0);
+>
+> // The Tortoise
+> set_mempolicy(MPOL_PREFER_MANY | MPOL_F_PREFER_ORDER_TYPE_REV, NULL, 0);
+>
+> // Prefer the fast memory of the first two sockets
+> set_mempolicy(MPOL_PREFER_MANY | MPOL_F_PREFER_ORDER_TYPE, -1, 2);
+>
+
+This patch (of 5):
+
+The NUMA APIs currently allow passing in a "preferred node" as a single
+bit set in a nodemask.  If more than one bit it set, bits after the first
+are ignored.
+
+This single node is generally OK for location-based NUMA where memory
+being allocated will eventually be operated on by a single CPU.  However,
+in systems with multiple memory types, folks want to target a *type* of
+memory instead of a location.  For instance, someone might want some
+high-bandwidth memory but do not care about the CPU next to which it is
+allocated.  Or, they want a cheap, high capacity allocation and want to
+target all NUMA nodes which have persistent memory in volatile mode.  In
+both of these cases, the application wants to target a *set* of nodes, but
+does not want strict MPOL_BIND behavior as that could lead to OOM killer
+or SIGSEGV.
+
+So add MPOL_PREFERRED_MANY policy to support the multiple preferred nodes
+requirement.  This is not a pie-in-the-sky dream for an API.  This was a
+response to a specific ask of more than one group at Intel.  Specifically:
+
+1. There are existing libraries that target memory types such as
+   https://github.com/memkind/memkind.  These are known to suffer from
+   SIGSEGV's when memory is low on targeted memory "kinds" that span more
+   than one node.  The MCDRAM on a Xeon Phi in "Cluster on Die" mode is an
+   example of this.
+
+2. Volatile-use persistent memory users want to have a memory policy
+   which is targeted at either "cheap and slow" (PMEM) or "expensive and
+   fast" (DRAM).  However, they do not want to experience allocation
+   failures when the targeted type is unavailable.
+
+3. Allocate-then-run.  Generally, we let the process scheduler decide
+   on which physical CPU to run a task.  That location provides a default
+   allocation policy, and memory availability is not generally considered
+   when placing tasks.  For situations where memory is valuable and
+   constrained, some users want to allocate memory first, *then* allocate
+   close compute resources to the allocation.  This is the reverse of the
+   normal (CPU) model.  Accelerators such as GPUs that operate on
+   core-mm-managed memory are interested in this model.
+
+A check is added in sanitize_mpol_flags() to not permit 'prefer_many'
+policy to be used for now, and will be removed in later patch after all
+implementations for 'prefer_many' are ready, as suggested by Michal Hocko.
+
+[mhocko@kernel.org: suggest to refine policy_node/policy_nodemask handling]
+
+Link: https://lkml.kernel.org/r/1627970362-61305-1-git-send-email-feng.tang@intel.com
+Link: https://lore.kernel.org/r/20200630212517.308045-4-ben.widawsky@intel.com
+Link: https://lkml.kernel.org/r/1627970362-61305-2-git-send-email-feng.tang@intel.com
+Co-developed-by: Ben Widawsky <ben.widawsky@intel.com>
+	Signed-off-by: Ben Widawsky <ben.widawsky@intel.com>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Feng Tang <feng.tang@intel.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Huang Ying <ying.huang@intel.com>b
+	Cc: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b27abaccf8e8b012f126da0c2a1ab32723ec8b9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mempolicy.c
+diff --cc mm/mempolicy.c
+index e66b60fa3a96,f8f2c18e61cb..000000000000
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@@ -431,6 -416,13 +442,16 @@@ static const struct mempolicy_operation
+  		.create = mpol_new_bind,
+  		.rebind = mpol_rebind_nodemask,
+  	},
+++<<<<<<< HEAD
+++=======
++ 	[MPOL_LOCAL] = {
++ 		.rebind = mpol_rebind_default,
++ 	},
++ 	[MPOL_PREFERRED_MANY] = {
++ 		.create = mpol_new_preferred_many,
++ 		.rebind = mpol_rebind_preferred,
++ 	},
+++>>>>>>> b27abaccf8e8 (mm/mempolicy: add MPOL_PREFERRED_MANY for multiple preferred nodes)
+  };
+  
+  static int migrate_page_add(struct page *page, struct list_head *pagelist,
+@@@ -884,14 -913,13 +905,20 @@@ static void get_policy_nodemask(struct 
+  
+  	switch (p->mode) {
+  	case MPOL_BIND:
+ +		/* Fall through */
+  	case MPOL_INTERLEAVE:
+++<<<<<<< HEAD
+ +		*nodes = p->v.nodes;
+++=======
++ 	case MPOL_PREFERRED:
++ 	case MPOL_PREFERRED_MANY:
++ 		*nodes = p->nodes;
+++>>>>>>> b27abaccf8e8 (mm/mempolicy: add MPOL_PREFERRED_MANY for multiple preferred nodes)
+  		break;
+ -	case MPOL_LOCAL:
+ -		/* return empty node mask for local allocation */
+ +	case MPOL_PREFERRED:
+ +		if (!(p->flags & MPOL_F_LOCAL))
+ +			node_set(p->v.preferred_node, *nodes);
+ +		/* else return empty node mask for local allocation */
+  		break;
+  	default:
+  		BUG();
+@@@ -1836,21 -1897,32 +1869,39 @@@ static int apply_policy_zone(struct mem
+   */
+  nodemask_t *policy_nodemask(gfp_t gfp, struct mempolicy *policy)
+  {
++ 	int mode = policy->mode;
++ 
+  	/* Lower zones don't get a nodemask applied for MPOL_BIND */
+++<<<<<<< HEAD
+ +	if (unlikely(policy->mode == MPOL_BIND) &&
+ +			apply_policy_zone(policy, gfp_zone(gfp)) &&
+ +			cpuset_nodemask_valid_mems_allowed(&policy->v.nodes))
+ +		return &policy->v.nodes;
+++=======
++ 	if (unlikely(mode == MPOL_BIND) &&
++ 		apply_policy_zone(policy, gfp_zone(gfp)) &&
++ 		cpuset_nodemask_valid_mems_allowed(&policy->nodes))
++ 		return &policy->nodes;
++ 
++ 	if (mode == MPOL_PREFERRED_MANY)
++ 		return &policy->nodes;
+++>>>>>>> b27abaccf8e8 (mm/mempolicy: add MPOL_PREFERRED_MANY for multiple preferred nodes)
+  
+  	return NULL;
+  }
+  
+- /* Return the node id preferred by the given mempolicy, or the given id */
++ /*
++  * Return the  preferred node id for 'prefer' mempolicy, and return
++  * the given id for all other policies.
++  *
++  * policy_node() is always coupled with policy_nodemask(), which
++  * secures the nodemask limit for 'bind' and 'prefer-many' policy.
++  */
+  static int policy_node(gfp_t gfp, struct mempolicy *policy, int nd)
+  {
+ -	if (policy->mode == MPOL_PREFERRED) {
+ -		nd = first_node(policy->nodes);
+ -	} else {
+ +	if (policy->mode == MPOL_PREFERRED && !(policy->flags & MPOL_F_LOCAL))
+ +		nd = policy->v.preferred_node;
+ +	else {
+  		/*
+  		 * __GFP_THISNODE shouldn't even be used with the bind policy
+  		 * because we might easily break the expectation to stay on the
+@@@ -1992,8 -2067,8 +2047,13 @@@ int huge_node(struct vm_area_struct *vm
+  					huge_page_shift(hstate_vma(vma)));
+  	} else {
+  		nid = policy_node(gfp_flags, *mpol, numa_node_id());
+++<<<<<<< HEAD
+ +		if ((*mpol)->mode == MPOL_BIND)
+ +			*nodemask = &(*mpol)->v.nodes;
+++=======
++ 		if (mode == MPOL_BIND || mode == MPOL_PREFERRED_MANY)
++ 			*nodemask = &(*mpol)->nodes;
+++>>>>>>> b27abaccf8e8 (mm/mempolicy: add MPOL_PREFERRED_MANY for multiple preferred nodes)
+  	}
+  	return nid;
+  }
+@@@ -2026,17 -2100,14 +2086,24 @@@ bool init_nodemask_of_mempolicy(nodemas
+  	mempolicy = current->mempolicy;
+  	switch (mempolicy->mode) {
+  	case MPOL_PREFERRED:
+++<<<<<<< HEAD
+ +		if (mempolicy->flags & MPOL_F_LOCAL)
+ +			nid = numa_node_id();
+ +		else
+ +			nid = mempolicy->v.preferred_node;
+ +		init_nodemask_of_node(mask, nid);
+++=======
++ 	case MPOL_PREFERRED_MANY:
++ 	case MPOL_BIND:
++ 	case MPOL_INTERLEAVE:
++ 		*mask = mempolicy->nodes;
+++>>>>>>> b27abaccf8e8 (mm/mempolicy: add MPOL_PREFERRED_MANY for multiple preferred nodes)
+  		break;
+  
+ -	case MPOL_LOCAL:
+ -		init_nodemask_of_node(mask, numa_node_id());
+ +	case MPOL_BIND:
+ +		/* Fall through */
+ +	case MPOL_INTERLEAVE:
+ +		*mask =  mempolicy->v.nodes;
+  		break;
+  
+  	default:
+@@@ -2164,12 -2211,11 +2231,12 @@@ alloc_pages_vma(gfp_t gfp, int order, s
+  		 * node and don't fall back to other nodes, as the cost of
+  		 * remote accesses would likely offset THP benefits.
+  		 *
+- 		 * If the policy is interleave, or does not allow the current
++ 		 * If the policy is interleave or does not allow the current
+  		 * node in its nodemask, we allocate the standard way.
+  		 */
+ -		if (pol->mode == MPOL_PREFERRED)
+ -			hpage_node = first_node(pol->nodes);
+ +		if (pol->mode == MPOL_PREFERRED &&
+ +						!(pol->flags & MPOL_F_LOCAL))
+ +			hpage_node = pol->v.preferred_node;
+  
+  		nmask = policy_nodemask(gfp, pol);
+  		if (!nmask || node_isset(hpage_node, *nmask)) {
+@@@ -2315,14 -2347,12 +2382,21 @@@ bool __mpol_equal(struct mempolicy *a, 
+  
+  	switch (a->mode) {
+  	case MPOL_BIND:
+ +		/* Fall through */
+  	case MPOL_INTERLEAVE:
+ +		return !!nodes_equal(a->v.nodes, b->v.nodes);
+  	case MPOL_PREFERRED:
+++<<<<<<< HEAD
+ +		/* a's ->flags is the same as b's */
+ +		if (a->flags & MPOL_F_LOCAL)
+ +			return true;
+ +		return a->v.preferred_node == b->v.preferred_node;
+++=======
++ 	case MPOL_PREFERRED_MANY:
++ 		return !!nodes_equal(a->nodes, b->nodes);
++ 	case MPOL_LOCAL:
++ 		return true;
+++>>>>>>> b27abaccf8e8 (mm/mempolicy: add MPOL_PREFERRED_MANY for multiple preferred nodes)
+  	default:
+  		BUG();
+  		return false;
+@@@ -2463,10 -2490,13 +2537,20 @@@ int mpol_misplaced(struct page *page, s
+  		break;
+  
+  	case MPOL_PREFERRED:
+++<<<<<<< HEAD
+ +		if (pol->flags & MPOL_F_LOCAL)
+ +			polnid = numa_node_id();
+ +		else
+ +			polnid = pol->v.preferred_node;
+++=======
++ 		if (node_isset(curnid, pol->nodes))
++ 			goto out;
++ 		polnid = first_node(pol->nodes);
++ 		break;
++ 
++ 	case MPOL_LOCAL:
++ 		polnid = numa_node_id();
+++>>>>>>> b27abaccf8e8 (mm/mempolicy: add MPOL_PREFERRED_MANY for multiple preferred nodes)
+  		break;
+  
+  	case MPOL_BIND:
+@@@ -3010,16 -3034,13 +3097,20 @@@ void mpol_to_str(char *buffer, int maxl
+  
+  	switch (mode) {
+  	case MPOL_DEFAULT:
+ -	case MPOL_LOCAL:
+  		break;
+  	case MPOL_PREFERRED:
+++<<<<<<< HEAD
+ +		if (flags & MPOL_F_LOCAL)
+ +			mode = MPOL_LOCAL;
+ +		else
+ +			node_set(pol->v.preferred_node, nodes);
+ +		break;
+++=======
++ 	case MPOL_PREFERRED_MANY:
+++>>>>>>> b27abaccf8e8 (mm/mempolicy: add MPOL_PREFERRED_MANY for multiple preferred nodes)
+  	case MPOL_BIND:
+  	case MPOL_INTERLEAVE:
+ -		nodes = pol->nodes;
+ +		nodes = pol->v.nodes;
+  		break;
+  	default:
+  		WARN_ON_ONCE(1);
+diff --git a/include/uapi/linux/mempolicy.h b/include/uapi/linux/mempolicy.h
+index 8948467b3992..fe3a8d819ebc 100644
+--- a/include/uapi/linux/mempolicy.h
++++ b/include/uapi/linux/mempolicy.h
+@@ -22,6 +22,7 @@ enum {
+ 	MPOL_BIND,
+ 	MPOL_INTERLEAVE,
+ 	MPOL_LOCAL,
++	MPOL_PREFERRED_MANY,
+ 	MPOL_MAX,	/* always last member of enum */
+ };
+ 
+* Unmerged path mm/mempolicy.c
