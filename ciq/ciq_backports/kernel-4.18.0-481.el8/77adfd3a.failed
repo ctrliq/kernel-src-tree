@@ -1,0 +1,222 @@
+net: dropreason: add SKB_DROP_REASON_FRAG_REASM_TIMEOUT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Eric Dumazet <edumazet@google.com>
+commit 77adfd3a1d44c4730fd2af99b497e04ddc2b5837
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/77adfd3a.failed
+
+Used to track skbs freed after a timeout happened
+in a reassmbly unit.
+
+Passing a @reason argument to inet_frag_rbtree_purge()
+allows to use correct consumed status for frags
+that have been successfully re-assembled.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 77adfd3a1d44c4730fd2af99b497e04ddc2b5837)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/inet_frag.h
+#	net/ipv4/inet_fragment.c
+#	net/ipv4/ip_fragment.c
+diff --cc include/net/inet_frag.h
+index 7d373beb70e6,b23ddec3cd5c..000000000000
+--- a/include/net/inet_frag.h
++++ b/include/net/inet_frag.h
+@@@ -3,8 -3,14 +3,16 @@@
+  #define __NET_FRAG_H__
+  
+  #include <linux/rhashtable-types.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/completion.h>
++ #include <linux/in6.h>
++ #include <linux/rbtree_types.h>
++ #include <linux/refcount.h>
++ #include <net/dropreason.h>
+++>>>>>>> 77adfd3a1d44 (net: dropreason: add SKB_DROP_REASON_FRAG_REASM_TIMEOUT)
+  
+ -/* Per netns frag queues directory */
+ -struct fqdir {
+ +struct netns_frags {
+  	/* sysctls */
+  	long			high_thresh;
+  	long			low_thresh;
+@@@ -24,11 -34,15 +32,21 @@@
+   * @INET_FRAG_FIRST_IN: first fragment has arrived
+   * @INET_FRAG_LAST_IN: final fragment has arrived
+   * @INET_FRAG_COMPLETE: frag queue has been processed and is due for destruction
+++<<<<<<< HEAD
+++=======
++  * @INET_FRAG_HASH_DEAD: inet_frag_kill() has not removed fq from rhashtable
++  * @INET_FRAG_DROP: if skbs must be dropped (instead of being consumed)
+++>>>>>>> 77adfd3a1d44 (net: dropreason: add SKB_DROP_REASON_FRAG_REASM_TIMEOUT)
+   */
+  enum {
+  	INET_FRAG_FIRST_IN	= BIT(0),
+  	INET_FRAG_LAST_IN	= BIT(1),
+  	INET_FRAG_COMPLETE	= BIT(2),
+++<<<<<<< HEAD
+++=======
++ 	INET_FRAG_HASH_DEAD	= BIT(3),
++ 	INET_FRAG_DROP		= BIT(4),
+++>>>>>>> 77adfd3a1d44 (net: dropreason: add SKB_DROP_REASON_FRAG_REASM_TIMEOUT)
+  };
+  
+  struct frag_v4_compare_key {
+@@@ -114,10 -139,11 +132,11 @@@ void inet_frags_exit_net(struct netns_f
+  
+  void inet_frag_kill(struct inet_frag_queue *q);
+  void inet_frag_destroy(struct inet_frag_queue *q);
+ -struct inet_frag_queue *inet_frag_find(struct fqdir *fqdir, void *key);
+ +struct inet_frag_queue *inet_frag_find(struct netns_frags *nf, void *key);
+  
+  /* Free all skbs in the queue; return the sum of their truesizes. */
+- unsigned int inet_frag_rbtree_purge(struct rb_root *root);
++ unsigned int inet_frag_rbtree_purge(struct rb_root *root,
++ 				    enum skb_drop_reason reason);
+  
+  static inline void inet_frag_put(struct inet_frag_queue *q)
+  {
+diff --cc net/ipv4/inet_fragment.c
+index 9b75fafda5fc,7072fc0783ef..000000000000
+--- a/net/ipv4/inet_fragment.c
++++ b/net/ipv4/inet_fragment.c
+@@@ -127,18 -127,18 +127,19 @@@ EXPORT_SYMBOL(inet_frags_fini)
+  static void inet_frags_free_cb(void *ptr, void *arg)
+  {
+  	struct inet_frag_queue *fq = ptr;
+ -	int count;
+  
+ -	count = del_timer_sync(&fq->timer) ? 1 : 0;
+ +	/* If we can not cancel the timer, it means this frag_queue
+ +	 * is already disappearing, we have nothing to do.
+ +	 * Otherwise, we own a refcount until the end of this function.
+ +	 */
+ +	if (!del_timer(&fq->timer))
+ +		return;
+  
+  	spin_lock_bh(&fq->lock);
++ 	fq->flags |= INET_FRAG_DROP;
+  	if (!(fq->flags & INET_FRAG_COMPLETE)) {
+  		fq->flags |= INET_FRAG_COMPLETE;
+ -		count++;
+ -	} else if (fq->flags & INET_FRAG_HASH_DEAD) {
+ -		count++;
+ +		refcount_dec(&fq->refcnt);
+  	}
+  	spin_unlock_bh(&fq->lock);
+  
+@@@ -203,29 -286,21 +205,43 @@@ EXPORT_SYMBOL(inet_frag_rbtree_purge)
+  
+  void inet_frag_destroy(struct inet_frag_queue *q)
+  {
+++<<<<<<< HEAD
+ +	struct sk_buff *fp;
+ +	struct netns_frags *nf;
+++=======
+++>>>>>>> 77adfd3a1d44 (net: dropreason: add SKB_DROP_REASON_FRAG_REASM_TIMEOUT)
+  	unsigned int sum, sum_truesize = 0;
++ 	enum skb_drop_reason reason;
+  	struct inet_frags *f;
++ 	struct fqdir *fqdir;
+  
+  	WARN_ON(!(q->flags & INET_FRAG_COMPLETE));
++ 	reason = (q->flags & INET_FRAG_DROP) ?
++ 			SKB_DROP_REASON_FRAG_REASM_TIMEOUT :
++ 			SKB_CONSUMED;
+  	WARN_ON(del_timer(&q->timer) != 0);
+  
+  	/* Release all fragment data. */
+++<<<<<<< HEAD
+ +	fp = q->fragments;
+ +	nf = q->net;
+ +	f = nf->f;
+ +	if (fp) {
+ +		do {
+ +			struct sk_buff *xp = fp->next;
+ +
+ +			sum_truesize += fp->truesize;
+ +			kfree_skb(fp);
+ +			fp = xp;
+ +		} while (fp);
+ +	} else {
+ +		sum_truesize = inet_frag_rbtree_purge(&q->rb_fragments);
+ +	}
+++=======
++ 	fqdir = q->fqdir;
++ 	f = fqdir->f;
++ 	sum_truesize = inet_frag_rbtree_purge(&q->rb_fragments, reason);
+++>>>>>>> 77adfd3a1d44 (net: dropreason: add SKB_DROP_REASON_FRAG_REASM_TIMEOUT)
+  	sum = sum_truesize + f->qsize;
+  
+  	call_rcu(&q->rcu, inet_frag_destroy_rcu);
+diff --cc net/ipv4/ip_fragment.c
+index 6753750b346d,85e8113259c3..000000000000
+--- a/net/ipv4/ip_fragment.c
++++ b/net/ipv4/ip_fragment.c
+@@@ -255,8 -255,9 +256,14 @@@ static int ip_frag_reinit(struct ipq *q
+  		return -ETIMEDOUT;
+  	}
+  
+++<<<<<<< HEAD
+ +	sum_truesize = inet_frag_rbtree_purge(&qp->q.rb_fragments);
+ +	sub_frag_mem_limit(qp->q.net, sum_truesize);
+++=======
++ 	sum_truesize = inet_frag_rbtree_purge(&qp->q.rb_fragments,
++ 					      SKB_DROP_REASON_NOT_SPECIFIED);
++ 	sub_frag_mem_limit(qp->q.fqdir, sum_truesize);
+++>>>>>>> 77adfd3a1d44 (net: dropreason: add SKB_DROP_REASON_FRAG_REASM_TIMEOUT)
+  
+  	qp->q.flags = 0;
+  	qp->q.len = 0;
+diff --git a/include/net/dropreason.h b/include/net/dropreason.h
+index 602d555a5f83..1d45a74148c3 100644
+--- a/include/net/dropreason.h
++++ b/include/net/dropreason.h
+@@ -69,6 +69,7 @@
+ 	FN(IP_INNOROUTES)		\
+ 	FN(PKT_TOO_BIG)			\
+ 	FN(DUP_FRAG)			\
++	FN(FRAG_REASM_TIMEOUT)		\
+ 	FNe(MAX)
+ 
+ /**
+@@ -303,6 +304,8 @@ enum skb_drop_reason {
+ 	SKB_DROP_REASON_PKT_TOO_BIG,
+ 	/** @SKB_DROP_REASON_DUP_FRAG: duplicate fragment */
+ 	SKB_DROP_REASON_DUP_FRAG,
++	/** @SKB_DROP_REASON_FRAG_REASM_TIMEOUT: fragment reassembly timeout */
++	SKB_DROP_REASON_FRAG_REASM_TIMEOUT,
+ 	/**
+ 	 * @SKB_DROP_REASON_MAX: the maximum of drop reason, which shouldn't be
+ 	 * used as a real 'reason'
+* Unmerged path include/net/inet_frag.h
+diff --git a/include/net/ipv6_frag.h b/include/net/ipv6_frag.h
+index 1f77fb4dc79d..3a87f57f44b8 100644
+--- a/include/net/ipv6_frag.h
++++ b/include/net/ipv6_frag.h
+@@ -72,6 +72,7 @@ ip6frag_expire_frag_queue(struct net *net, struct frag_queue *fq)
+ 	if (fq->q.flags & INET_FRAG_COMPLETE)
+ 		goto out;
+ 
++	fq->q.flags |= INET_FRAG_DROP;
+ 	inet_frag_kill(&fq->q);
+ 
+ 	dev = dev_get_by_index_rcu(net, fq->iif);
+@@ -97,7 +98,7 @@ ip6frag_expire_frag_queue(struct net *net, struct frag_queue *fq)
+ 	spin_unlock(&fq->q.lock);
+ 
+ 	icmpv6_send(head, ICMPV6_TIME_EXCEED, ICMPV6_EXC_FRAGTIME, 0);
+-	kfree_skb(head);
++	kfree_skb_reason(head, SKB_DROP_REASON_FRAG_REASM_TIMEOUT);
+ 	goto out_rcu_unlock;
+ 
+ out:
+* Unmerged path net/ipv4/inet_fragment.c
+* Unmerged path net/ipv4/ip_fragment.c
