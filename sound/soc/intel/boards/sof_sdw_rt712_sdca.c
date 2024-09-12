@@ -80,7 +80,7 @@ int sof_sdw_rt712_spk_init(struct snd_soc_card *card,
 static int rt712_sdca_dmic_rtd_init(struct snd_soc_pcm_runtime *rtd)
 {
 	struct snd_soc_card *card = rtd->card;
-	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+	struct snd_soc_dai *codec_dai = asoc_rtd_to_codec(rtd, 0);
 	struct snd_soc_component *component = codec_dai->component;
 
 	card->components = devm_kasprintf(card->dev, GFP_KERNEL,
