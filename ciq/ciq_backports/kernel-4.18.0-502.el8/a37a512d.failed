@@ -1,0 +1,140 @@
+drm/vmwgfx: Fix Legacy Display Unit atomic drm support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Martin Krastev <krastevm@vmware.com>
+commit a37a512db3fa1b65fe9087003e5b2072cefb3667
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/a37a512d.failed
+
+Legacy Display Unit (LDU) fb dirty support used a custom fb dirty callback. Latter
+handled only the DIRTYFB IOCTL presentation path but not the ADDFB2/PAGE_FLIP/RMFB
+IOCTL path, common for Wayland compositors.
+
+Get rid of the custom callback in favor of drm_atomic_helper_dirtyfb and unify the
+handling of the presentation paths inside of vmw_ldu_primary_plane_atomic_update.
+This also homogenizes the fb dirty callbacks across all DUs: LDU, SOU and STDU.
+
+	Signed-off-by: Martin Krastev <krastevm@vmware.com>
+	Reviewed-by: Maaz Mombasawala <mombasawalam@vmware.com>
+Fixes: 2f5544ff0300 ("drm/vmwgfx: Use atomic helper function for dirty fb IOCTL")
+	Cc: <stable@vger.kernel.org> # v5.0+
+	Signed-off-by: Zack Rusin <zackr@vmware.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230321020949.335012-3-zack@kde.org
+(cherry picked from commit a37a512db3fa1b65fe9087003e5b2072cefb3667)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c
+diff --cc drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c
+index e4347faccee0,a82fa9700370..000000000000
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c
+@@@ -236,9 -275,7 +236,13 @@@ static const struct drm_crtc_funcs vmw_
+  	.atomic_duplicate_state = vmw_du_crtc_duplicate_state,
+  	.atomic_destroy_state = vmw_du_crtc_destroy_state,
+  	.set_config = drm_atomic_helper_set_config,
+++<<<<<<< HEAD
+ +	.get_vblank_counter = vmw_get_vblank_counter,
+ +	.enable_vblank = vmw_enable_vblank,
+ +	.disable_vblank = vmw_disable_vblank,
+++=======
++ 	.page_flip = drm_atomic_helper_page_flip,
+++>>>>>>> a37a512db3fa (drm/vmwgfx: Fix Legacy Display Unit atomic drm support)
+  };
+  
+  
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+index 5c7dc411b180..9c1abc5a1326 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -1275,70 +1275,10 @@ static void vmw_framebuffer_bo_destroy(struct drm_framebuffer *framebuffer)
+ 	kfree(vfbd);
+ }
+ 
+-static int vmw_framebuffer_bo_dirty(struct drm_framebuffer *framebuffer,
+-				    struct drm_file *file_priv,
+-				    unsigned int flags, unsigned int color,
+-				    struct drm_clip_rect *clips,
+-				    unsigned int num_clips)
+-{
+-	struct vmw_private *dev_priv = vmw_priv(framebuffer->dev);
+-	struct vmw_framebuffer_bo *vfbd =
+-		vmw_framebuffer_to_vfbd(framebuffer);
+-	struct drm_clip_rect norect;
+-	int ret, increment = 1;
+-
+-	drm_modeset_lock_all(&dev_priv->drm);
+-
+-	if (!num_clips) {
+-		num_clips = 1;
+-		clips = &norect;
+-		norect.x1 = norect.y1 = 0;
+-		norect.x2 = framebuffer->width;
+-		norect.y2 = framebuffer->height;
+-	} else if (flags & DRM_MODE_FB_DIRTY_ANNOTATE_COPY) {
+-		num_clips /= 2;
+-		increment = 2;
+-	}
+-
+-	switch (dev_priv->active_display_unit) {
+-	case vmw_du_legacy:
+-		ret = vmw_kms_ldu_do_bo_dirty(dev_priv, &vfbd->base, 0, 0,
+-					      clips, num_clips, increment);
+-		break;
+-	default:
+-		ret = -EINVAL;
+-		WARN_ONCE(true, "Dirty called with invalid display system.\n");
+-		break;
+-	}
+-
+-	vmw_cmd_flush(dev_priv, false);
+-
+-	drm_modeset_unlock_all(&dev_priv->drm);
+-
+-	return ret;
+-}
+-
+-static int vmw_framebuffer_bo_dirty_ext(struct drm_framebuffer *framebuffer,
+-					struct drm_file *file_priv,
+-					unsigned int flags, unsigned int color,
+-					struct drm_clip_rect *clips,
+-					unsigned int num_clips)
+-{
+-	struct vmw_private *dev_priv = vmw_priv(framebuffer->dev);
+-
+-	if (dev_priv->active_display_unit == vmw_du_legacy &&
+-	    vmw_cmd_supported(dev_priv))
+-		return vmw_framebuffer_bo_dirty(framebuffer, file_priv, flags,
+-						color, clips, num_clips);
+-
+-	return drm_atomic_helper_dirtyfb(framebuffer, file_priv, flags, color,
+-					 clips, num_clips);
+-}
+-
+ static const struct drm_framebuffer_funcs vmw_framebuffer_bo_funcs = {
+ 	.create_handle = vmw_framebuffer_bo_create_handle,
+ 	.destroy = vmw_framebuffer_bo_destroy,
+-	.dirty = vmw_framebuffer_bo_dirty_ext,
++	.dirty = drm_atomic_helper_dirtyfb,
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h
+index 7046dfd0d1c6..2d020e4993c2 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h
+@@ -517,11 +517,6 @@ void vmw_du_connector_destroy_state(struct drm_connector *connector,
+  */
+ int vmw_kms_ldu_init_display(struct vmw_private *dev_priv);
+ int vmw_kms_ldu_close_display(struct vmw_private *dev_priv);
+-int vmw_kms_ldu_do_bo_dirty(struct vmw_private *dev_priv,
+-			    struct vmw_framebuffer *framebuffer,
+-			    unsigned int flags, unsigned int color,
+-			    struct drm_clip_rect *clips,
+-			    unsigned int num_clips, int increment);
+ int vmw_kms_update_proxy(struct vmw_resource *res,
+ 			 const struct drm_clip_rect *clips,
+ 			 unsigned num_clips,
+* Unmerged path drivers/gpu/drm/vmwgfx/vmwgfx_ldu.c
