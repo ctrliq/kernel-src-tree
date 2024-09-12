@@ -1,0 +1,267 @@
+ice: introduce ice_ptp_init_phc function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit b2ee72565cd0ee24d2067e3de9094a14644493a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/b2ee7256.failed
+
+When we enable support for E822 devices, there are some additional
+steps required to initialize the PTP hardware clock. To make this easier
+to implement as device-specific behavior, refactor the register setups
+in ice_ptp_init_owner to a new ice_ptp_init_phc function defined in
+ice_ptp_hw.c
+
+This function will have a common section, and an e810 specific
+sub-implementation.
+
+This will enable easily extending the functionality to cover the E822
+specific setup required to initialize the hardware clock generation
+unit. It also makes it clear which steps are E810 specific vs which ones
+are necessary for all ice devices.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Paul Menzel <pmenzel@molgen.mpg.de>
+	Tested-by: Gurucharan G <gurucharanx.g@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit b2ee72565cd0ee24d2067e3de9094a14644493a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_ptp.c
+#	drivers/net/ethernet/intel/ice/ice_ptp_hw.c
+diff --cc drivers/net/ethernet/intel/ice/ice_ptp.c
+index d8979dfd7d47,bec330842696..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@@ -2007,22 -1984,16 +1988,30 @@@ static int ice_ptp_init_work(struct ice
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * ice_ptp_init_port - Initialize PTP port structure
+ + * @pf: Board private structure
+ + * @ptp_port: PTP port structure
+ + */
+ +static int ice_ptp_init_port(struct ice_pf *pf, struct ice_ptp_port *ptp_port)
+ +{
+ +	return ice_ptp_init_tx_e810(pf, &ptp_port->tx);
+ +}
+ +
+ +/**
+ + * ice_ptp_init - Initialize the PTP support after device probe or reset
+++=======
++  * ice_ptp_init - Initialize PTP hardware clock support
+++>>>>>>> b2ee72565cd0 (ice: introduce ice_ptp_init_phc function)
+   * @pf: Board private structure
+   *
+-  * This function sets device up for PTP support. The first time it is run, it
+-  * will create a clock device. It does not create a clock device if one
+-  * already exists. It also reconfigures the device after a reset.
++  * Set up the device for interacting with the PTP hardware clock for all
++  * functions, both the function that owns the clock hardware, and the
++  * functions connected to the clock hardware.
++  *
++  * The clock owner will allocate and register a ptp_clock with the
++  * PTP_1588_CLOCK infrastructure. All functions allocate a kthread and work
++  * items used for asynchronous work such as Tx timestamps and periodic work.
+   */
+  void ice_ptp_init(struct ice_pf *pf)
+  {
+diff --cc drivers/net/ethernet/intel/ice/ice_ptp_hw.c
+index 5dbd4d91dba1,bcc280094f7f..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
+@@@ -649,3 -664,173 +664,176 @@@ int ice_clear_phy_tstamp(struct ice_hw 
+  {
+  	return ice_clear_phy_tstamp_e810(hw, block, idx);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /* E810T SMA functions
++  *
++  * The following functions operate specifically on E810T hardware and are used
++  * to access the extended GPIOs available.
++  */
++ 
++ /**
++  * ice_get_pca9575_handle
++  * @hw: pointer to the hw struct
++  * @pca9575_handle: GPIO controller's handle
++  *
++  * Find and return the GPIO controller's handle in the netlist.
++  * When found - the value will be cached in the hw structure and following calls
++  * will return cached value
++  */
++ static int
++ ice_get_pca9575_handle(struct ice_hw *hw, u16 *pca9575_handle)
++ {
++ 	struct ice_aqc_get_link_topo *cmd;
++ 	struct ice_aq_desc desc;
++ 	int status;
++ 	u8 idx;
++ 
++ 	/* If handle was read previously return cached value */
++ 	if (hw->io_expander_handle) {
++ 		*pca9575_handle = hw->io_expander_handle;
++ 		return 0;
++ 	}
++ 
++ 	/* If handle was not detected read it from the netlist */
++ 	cmd = &desc.params.get_link_topo;
++ 	ice_fill_dflt_direct_cmd_desc(&desc, ice_aqc_opc_get_link_topo);
++ 
++ 	/* Set node type to GPIO controller */
++ 	cmd->addr.topo_params.node_type_ctx =
++ 		(ICE_AQC_LINK_TOPO_NODE_TYPE_M &
++ 		 ICE_AQC_LINK_TOPO_NODE_TYPE_GPIO_CTRL);
++ 
++ #define SW_PCA9575_SFP_TOPO_IDX		2
++ #define SW_PCA9575_QSFP_TOPO_IDX	1
++ 
++ 	/* Check if the SW IO expander controlling SMA exists in the netlist. */
++ 	if (hw->device_id == ICE_DEV_ID_E810C_SFP)
++ 		idx = SW_PCA9575_SFP_TOPO_IDX;
++ 	else if (hw->device_id == ICE_DEV_ID_E810C_QSFP)
++ 		idx = SW_PCA9575_QSFP_TOPO_IDX;
++ 	else
++ 		return -EOPNOTSUPP;
++ 
++ 	cmd->addr.topo_params.index = idx;
++ 
++ 	status = ice_aq_send_cmd(hw, &desc, NULL, 0, NULL);
++ 	if (status)
++ 		return -EOPNOTSUPP;
++ 
++ 	/* Verify if we found the right IO expander type */
++ 	if (desc.params.get_link_topo.node_part_num !=
++ 		ICE_AQC_GET_LINK_TOPO_NODE_NR_PCA9575)
++ 		return -EOPNOTSUPP;
++ 
++ 	/* If present save the handle and return it */
++ 	hw->io_expander_handle =
++ 		le16_to_cpu(desc.params.get_link_topo.addr.handle);
++ 	*pca9575_handle = hw->io_expander_handle;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * ice_read_sma_ctrl_e810t
++  * @hw: pointer to the hw struct
++  * @data: pointer to data to be read from the GPIO controller
++  *
++  * Read the SMA controller state. It is connected to pins 3-7 of Port 1 of the
++  * PCA9575 expander, so only bits 3-7 in data are valid.
++  */
++ int ice_read_sma_ctrl_e810t(struct ice_hw *hw, u8 *data)
++ {
++ 	int status;
++ 	u16 handle;
++ 	u8 i;
++ 
++ 	status = ice_get_pca9575_handle(hw, &handle);
++ 	if (status)
++ 		return status;
++ 
++ 	*data = 0;
++ 
++ 	for (i = ICE_SMA_MIN_BIT_E810T; i <= ICE_SMA_MAX_BIT_E810T; i++) {
++ 		bool pin;
++ 
++ 		status = ice_aq_get_gpio(hw, handle, i + ICE_PCA9575_P1_OFFSET,
++ 					 &pin, NULL);
++ 		if (status)
++ 			break;
++ 		*data |= (u8)(!pin) << i;
++ 	}
++ 
++ 	return status;
++ }
++ 
++ /**
++  * ice_write_sma_ctrl_e810t
++  * @hw: pointer to the hw struct
++  * @data: data to be written to the GPIO controller
++  *
++  * Write the data to the SMA controller. It is connected to pins 3-7 of Port 1
++  * of the PCA9575 expander, so only bits 3-7 in data are valid.
++  */
++ int ice_write_sma_ctrl_e810t(struct ice_hw *hw, u8 data)
++ {
++ 	int status;
++ 	u16 handle;
++ 	u8 i;
++ 
++ 	status = ice_get_pca9575_handle(hw, &handle);
++ 	if (status)
++ 		return status;
++ 
++ 	for (i = ICE_SMA_MIN_BIT_E810T; i <= ICE_SMA_MAX_BIT_E810T; i++) {
++ 		bool pin;
++ 
++ 		pin = !(data & (1 << i));
++ 		status = ice_aq_set_gpio(hw, handle, i + ICE_PCA9575_P1_OFFSET,
++ 					 pin, NULL);
++ 		if (status)
++ 			break;
++ 	}
++ 
++ 	return status;
++ }
++ 
++ /**
++  * ice_is_pca9575_present
++  * @hw: pointer to the hw struct
++  *
++  * Check if the SW IO expander is present in the netlist
++  */
++ bool ice_is_pca9575_present(struct ice_hw *hw)
++ {
++ 	u16 handle = 0;
++ 	int status;
++ 
++ 	if (!ice_is_e810t(hw))
++ 		return false;
++ 
++ 	status = ice_get_pca9575_handle(hw, &handle);
++ 
++ 	return !status && handle;
++ }
++ 
++ /**
++  * ice_ptp_init_phc - Initialize PTP hardware clock
++  * @hw: pointer to the HW struct
++  *
++  * Perform the steps required to initialize the PTP hardware clock.
++  */
++ int ice_ptp_init_phc(struct ice_hw *hw)
++ {
++ 	u8 src_idx = hw->func_caps.ts_func_info.tmr_index_owned;
++ 
++ 	/* Enable source clocks */
++ 	wr32(hw, GLTSYN_ENA(src_idx), GLTSYN_ENA_TSYN_ENA_M);
++ 
++ 	/* Clear event err indications for auxiliary pins */
++ 	(void)rd32(hw, GLTSYN_STAT(src_idx));
++ 
++ 	return ice_ptp_init_phc_e810(hw);
++ }
+++>>>>>>> b2ee72565cd0 (ice: introduce ice_ptp_init_phc function)
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp_hw.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp_hw.h b/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
+index 55a414e87018..821abec0f8dc 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
+@@ -27,6 +27,7 @@ int ice_ptp_write_incval_locked(struct ice_hw *hw, u64 incval);
+ int ice_ptp_adj_clock(struct ice_hw *hw, s32 adj);
+ int ice_read_phy_tstamp(struct ice_hw *hw, u8 block, u8 idx, u64 *tstamp);
+ int ice_clear_phy_tstamp(struct ice_hw *hw, u8 block, u8 idx);
++int ice_ptp_init_phc(struct ice_hw *hw);
+ 
+ /* E810 family functions */
+ int ice_ptp_init_phy_e810(struct ice_hw *hw);
