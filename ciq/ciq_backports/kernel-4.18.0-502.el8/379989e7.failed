@@ -1,0 +1,167 @@
+drm/ttm/pool: Fix ttm_pool_alloc error path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Thomas Hellström <thomas.hellstrom@linux.intel.com>
+commit 379989e7cbdc7aa7496a00ee286ec146c7599cf0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/379989e7.failed
+
+When hitting an error, the error path forgot to unmap dma mappings and
+could call set_pages_wb() on already uncached pages.
+
+Fix this by introducing a common ttm_pool_free_range() function that
+does the right thing.
+
+v2:
+- Simplify that common function (Christian König)
+v3:
+- Rename that common function to ttm_pool_free_range() (Christian König)
+
+Fixes: d099fc8f540a ("drm/ttm: new TT backend allocation pool v3")
+	Cc: Christian König <christian.koenig@amd.com>
+	Cc: Dave Airlie <airlied@redhat.com>
+	Cc: Christian Koenig <christian.koenig@amd.com>
+	Cc: Huang Rui <ray.huang@amd.com>
+	Cc: dri-devel@lists.freedesktop.org
+	Signed-off-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+	Reviewed-by: Christian König <christian.koenig@amd.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230404200650.11043-2-thomas.hellstrom@linux.intel.com
+(cherry picked from commit 379989e7cbdc7aa7496a00ee286ec146c7599cf0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/ttm/ttm_pool.c
+diff --cc drivers/gpu/drm/ttm/ttm_pool.c
+index 1bba0a0ed3f9,dfce896c4bae..000000000000
+--- a/drivers/gpu/drm/ttm/ttm_pool.c
++++ b/drivers/gpu/drm/ttm/ttm_pool.c
+@@@ -344,6 -345,65 +344,43 @@@ static unsigned int ttm_pool_page_order
+  	return p->private;
+  }
+  
+ -/* Called when we got a page, either from a pool or newly allocated */
+ -static int ttm_pool_page_allocated(struct ttm_pool *pool, unsigned int order,
+ -				   struct page *p, dma_addr_t **dma_addr,
+ -				   unsigned long *num_pages,
+ -				   struct page ***pages)
+ -{
+ -	unsigned int i;
+ -	int r;
+ -
+ -	if (*dma_addr) {
+ -		r = ttm_pool_map(pool, order, p, dma_addr);
+ -		if (r)
+ -			return r;
+ -	}
+ -
+ -	*num_pages -= 1 << order;
+ -	for (i = 1 << order; i; --i, ++(*pages), ++p)
+ -		**pages = p;
+ -
+ -	return 0;
+ -}
+ -
++ /**
++  * ttm_pool_free_range() - Free a range of TTM pages
++  * @pool: The pool used for allocating.
++  * @tt: The struct ttm_tt holding the page pointers.
++  * @caching: The page caching mode used by the range.
++  * @start_page: index for first page to free.
++  * @end_page: index for last page to free + 1.
++  *
++  * During allocation the ttm_tt page-vector may be populated with ranges of
++  * pages with different attributes if allocation hit an error without being
++  * able to completely fulfill the allocation. This function can be used
++  * to free these individual ranges.
++  */
++ static void ttm_pool_free_range(struct ttm_pool *pool, struct ttm_tt *tt,
++ 				enum ttm_caching caching,
++ 				pgoff_t start_page, pgoff_t end_page)
++ {
++ 	struct page **pages = tt->pages;
++ 	unsigned int order;
++ 	pgoff_t i, nr;
++ 
++ 	for (i = start_page; i < end_page; i += nr, pages += nr) {
++ 		struct ttm_pool_type *pt = NULL;
++ 
++ 		order = ttm_pool_page_order(pool, *pages);
++ 		nr = (1UL << order);
++ 		if (tt->dma_address)
++ 			ttm_pool_unmap(pool, tt->dma_address[i], nr);
++ 
++ 		pt = ttm_pool_select_type(pool, caching, order);
++ 		if (pt)
++ 			ttm_pool_type_give(pt, *pages);
++ 		else
++ 			ttm_pool_free_page(pool, caching, order, *pages);
++ 	}
++ }
++ 
+  /**
+   * ttm_pool_alloc - Fill a ttm_tt object
+   *
+@@@ -385,17 -447,51 +424,60 @@@ int ttm_pool_alloc(struct ttm_pool *poo
+  	for (order = min_t(unsigned int, MAX_ORDER - 1, __fls(num_pages));
+  	     num_pages;
+  	     order = min_t(unsigned int, order, __fls(num_pages))) {
+ +		bool apply_caching = false;
+  		struct ttm_pool_type *pt;
+  
++ 		page_caching = tt->caching;
+  		pt = ttm_pool_select_type(pool, tt->caching, order);
+  		p = pt ? ttm_pool_type_take(pt) : NULL;
+  		if (p) {
+++<<<<<<< HEAD
+ +			apply_caching = true;
+ +		} else {
+ +			p = ttm_pool_alloc_page(pool, gfp_flags, order);
+ +			if (p && PageHighMem(p))
+ +				apply_caching = true;
+++=======
++ 			r = ttm_pool_apply_caching(caching, pages,
++ 						   tt->caching);
++ 			if (r)
++ 				goto error_free_page;
++ 
++ 			caching = pages;
++ 			do {
++ 				r = ttm_pool_page_allocated(pool, order, p,
++ 							    &dma_addr,
++ 							    &num_pages,
++ 							    &pages);
++ 				if (r)
++ 					goto error_free_page;
++ 
++ 				caching = pages;
++ 				if (num_pages < (1 << order))
++ 					break;
++ 
++ 				p = ttm_pool_type_take(pt);
++ 			} while (p);
++ 		}
++ 
++ 		page_caching = ttm_cached;
++ 		while (num_pages >= (1 << order) &&
++ 		       (p = ttm_pool_alloc_page(pool, gfp_flags, order))) {
++ 
++ 			if (PageHighMem(p)) {
++ 				r = ttm_pool_apply_caching(caching, pages,
++ 							   tt->caching);
++ 				if (r)
++ 					goto error_free_page;
++ 				caching = pages;
++ 			}
++ 			r = ttm_pool_page_allocated(pool, order, p, &dma_addr,
++ 						    &num_pages, &pages);
++ 			if (r)
++ 				goto error_free_page;
++ 			if (PageHighMem(p))
++ 				caching = pages;
+++>>>>>>> 379989e7cbdc (drm/ttm/pool: Fix ttm_pool_alloc error path)
+  		}
+  
+  		if (!p) {
+* Unmerged path drivers/gpu/drm/ttm/ttm_pool.c
