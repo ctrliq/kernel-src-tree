@@ -1,0 +1,143 @@
+media: videobuf2: Prepare to dynamic dma-buf locking specification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-494.el8
+commit-author Dmitry Osipenko <dmitry.osipenko@collabora.com>
+commit a26ee3b71896d4e0d52d866fd16cc42da7106e6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-494.el8/a26ee3b7.failed
+
+Prepare V4L2 memory allocators to the common dynamic dma-buf locking
+convention by starting to use the unlocked versions of dma-buf API
+functions.
+
+	Acked-by: Tomasz Figa <tfiga@chromium.org>
+	Acked-by: Christian König <christian.koenig@amd.com>
+	Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20221017172229.42269-14-dmitry.osipenko@collabora.com
+(cherry picked from commit a26ee3b71896d4e0d52d866fd16cc42da7106e6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/media/common/videobuf2/videobuf2-dma-contig.c
+diff --cc drivers/media/common/videobuf2/videobuf2-dma-contig.c
+index 65099b9a1f06,79f4d8301fbb..000000000000
+--- a/drivers/media/common/videobuf2/videobuf2-dma-contig.c
++++ b/drivers/media/common/videobuf2/videobuf2-dma-contig.c
+@@@ -73,17 -77,39 +73,30 @@@ static void *vb2_dc_cookie(void *buf_pr
+  	return &buf->dma_addr;
+  }
+  
+ -/*
+ - * This function may fail if:
+ - *
+ - * - dma_buf_vmap() fails
+ - *   E.g. due to lack of virtual mapping address space, or due to
+ - *   dmabuf->ops misconfiguration.
+ - *
+ - * - dma_vmap_noncontiguous() fails
+ - *   For instance, when requested buffer size is larger than totalram_pages().
+ - *   Relevant for buffers that use non-coherent memory.
+ - *
+ - * - Queue DMA attrs have DMA_ATTR_NO_KERNEL_MAPPING set
+ - *   Relevant for buffers that use coherent memory.
+ - */
+ -static void *vb2_dc_vaddr(struct vb2_buffer *vb, void *buf_priv)
+ +static void *vb2_dc_vaddr(void *buf_priv)
+  {
+  	struct vb2_dc_buf *buf = buf_priv;
+ +	struct iosys_map map;
+ +	int ret;
+  
+++<<<<<<< HEAD
+ +	if (!buf->vaddr && buf->db_attach) {
+ +		ret = dma_buf_vmap(buf->db_attach->dmabuf, &map);
+ +		buf->vaddr = ret ? NULL : map.vaddr;
+++=======
++ 	if (buf->vaddr)
++ 		return buf->vaddr;
++ 
++ 	if (buf->db_attach) {
++ 		struct iosys_map map;
++ 
++ 		if (!dma_buf_vmap_unlocked(buf->db_attach->dmabuf, &map))
++ 			buf->vaddr = map.vaddr;
++ 
++ 		return buf->vaddr;
+++>>>>>>> a26ee3b71896 (media: videobuf2: Prepare to dynamic dma-buf locking specification)
+  	}
+  
+ -	if (buf->non_coherent_mem)
+ -		buf->vaddr = dma_vmap_noncontiguous(buf->dev, buf->size,
+ -						    buf->dma_sgt);
+  	return buf->vaddr;
+  }
+  
+* Unmerged path drivers/media/common/videobuf2/videobuf2-dma-contig.c
+diff --git a/drivers/media/common/videobuf2/videobuf2-dma-sg.c b/drivers/media/common/videobuf2/videobuf2-dma-sg.c
+index 587bfee1c1fd..c61d3fe328f0 100644
+--- a/drivers/media/common/videobuf2/videobuf2-dma-sg.c
++++ b/drivers/media/common/videobuf2/videobuf2-dma-sg.c
+@@ -309,7 +309,7 @@ static void *vb2_dma_sg_vaddr(void *buf_priv)
+ 
+ 	if (!buf->vaddr) {
+ 		if (buf->db_attach) {
+-			ret = dma_buf_vmap(buf->db_attach->dmabuf, &map);
++			ret = dma_buf_vmap_unlocked(buf->db_attach->dmabuf, &map);
+ 			buf->vaddr = ret ? NULL : map.vaddr;
+ 		} else {
+ 			buf->vaddr = vm_map_ram(buf->pages, buf->num_pages, -1);
+@@ -553,7 +553,7 @@ static int vb2_dma_sg_map_dmabuf(void *mem_priv)
+ 	}
+ 
+ 	/* get the associated scatterlist for this buffer */
+-	sgt = dma_buf_map_attachment(buf->db_attach, buf->dma_dir);
++	sgt = dma_buf_map_attachment_unlocked(buf->db_attach, buf->dma_dir);
+ 	if (IS_ERR(sgt)) {
+ 		pr_err("Error getting dmabuf scatterlist\n");
+ 		return -EINVAL;
+@@ -582,10 +582,10 @@ static void vb2_dma_sg_unmap_dmabuf(void *mem_priv)
+ 	}
+ 
+ 	if (buf->vaddr) {
+-		dma_buf_vunmap(buf->db_attach->dmabuf, &map);
++		dma_buf_vunmap_unlocked(buf->db_attach->dmabuf, &map);
+ 		buf->vaddr = NULL;
+ 	}
+-	dma_buf_unmap_attachment(buf->db_attach, sgt, buf->dma_dir);
++	dma_buf_unmap_attachment_unlocked(buf->db_attach, sgt, buf->dma_dir);
+ 
+ 	buf->dma_sgt = NULL;
+ }
+diff --git a/drivers/media/common/videobuf2/videobuf2-vmalloc.c b/drivers/media/common/videobuf2/videobuf2-vmalloc.c
+index 4ee35e9f180d..08f8a806bb64 100644
+--- a/drivers/media/common/videobuf2/videobuf2-vmalloc.c
++++ b/drivers/media/common/videobuf2/videobuf2-vmalloc.c
+@@ -380,7 +380,7 @@ static int vb2_vmalloc_map_dmabuf(void *mem_priv)
+ 	struct iosys_map map;
+ 	int ret;
+ 
+-	ret = dma_buf_vmap(buf->dbuf, &map);
++	ret = dma_buf_vmap_unlocked(buf->dbuf, &map);
+ 	if (ret)
+ 		return -EFAULT;
+ 	buf->vaddr = map.vaddr;
+@@ -393,7 +393,7 @@ static void vb2_vmalloc_unmap_dmabuf(void *mem_priv)
+ 	struct vb2_vmalloc_buf *buf = mem_priv;
+ 	struct iosys_map map = IOSYS_MAP_INIT_VADDR(buf->vaddr);
+ 
+-	dma_buf_vunmap(buf->dbuf, &map);
++	dma_buf_vunmap_unlocked(buf->dbuf, &map);
+ 	buf->vaddr = NULL;
+ }
+ 
+@@ -403,7 +403,7 @@ static void vb2_vmalloc_detach_dmabuf(void *mem_priv)
+ 	struct iosys_map map = IOSYS_MAP_INIT_VADDR(buf->vaddr);
+ 
+ 	if (buf->vaddr)
+-		dma_buf_vunmap(buf->dbuf, &map);
++		dma_buf_vunmap_unlocked(buf->dbuf, &map);
+ 
+ 	kfree(buf);
+ }
