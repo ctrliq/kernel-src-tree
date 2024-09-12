@@ -1,0 +1,276 @@
+smp: Trace IPIs sent via arch_send_call_function_ipi_mask()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-518.el8
+commit-author Valentin Schneider <vschneid@redhat.com>
+commit 08407b5f61c1bbd4ebb26a76474df4354fd76fb7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-518.el8/08407b5f.failed
+
+This simply wraps around the arch function and prepends it with a
+tracepoint, similar to send_call_function_single_ipi().
+
+	Signed-off-by: Valentin Schneider <vschneid@redhat.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Link: https://lore.kernel.org/r/20230307143558.294354-4-vschneid@redhat.com
+(cherry picked from commit 08407b5f61c1bbd4ebb26a76474df4354fd76fb7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/smp.c
+diff --cc kernel/smp.c
+index ff38bf8f2556,03e6d576295d..000000000000
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@@ -96,6 -103,146 +96,149 @@@ void __init call_function_init(void
+  	smpcfd_prepare_cpu(smp_processor_id());
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static __always_inline void
++ send_call_function_ipi_mask(struct cpumask *mask)
++ {
++ 	trace_ipi_send_cpumask(mask, _RET_IP_, NULL);
++ 	arch_send_call_function_ipi_mask(mask);
++ }
++ 
++ #ifdef CONFIG_CSD_LOCK_WAIT_DEBUG
++ 
++ static DEFINE_STATIC_KEY_MAYBE(CONFIG_CSD_LOCK_WAIT_DEBUG_DEFAULT, csdlock_debug_enabled);
++ 
++ /*
++  * Parse the csdlock_debug= kernel boot parameter.
++  *
++  * If you need to restore the old "ext" value that once provided
++  * additional debugging information, reapply the following commits:
++  *
++  * de7b09ef658d ("locking/csd_lock: Prepare more CSD lock debugging")
++  * a5aabace5fb8 ("locking/csd_lock: Add more data to CSD lock debugging")
++  */
++ static int __init csdlock_debug(char *str)
++ {
++ 	int ret;
++ 	unsigned int val = 0;
++ 
++ 	ret = get_option(&str, &val);
++ 	if (ret) {
++ 		if (val)
++ 			static_branch_enable(&csdlock_debug_enabled);
++ 		else
++ 			static_branch_disable(&csdlock_debug_enabled);
++ 	}
++ 
++ 	return 1;
++ }
++ __setup("csdlock_debug=", csdlock_debug);
++ 
++ static DEFINE_PER_CPU(call_single_data_t *, cur_csd);
++ static DEFINE_PER_CPU(smp_call_func_t, cur_csd_func);
++ static DEFINE_PER_CPU(void *, cur_csd_info);
++ 
++ static ulong csd_lock_timeout = 5000;  /* CSD lock timeout in milliseconds. */
++ module_param(csd_lock_timeout, ulong, 0444);
++ 
++ static atomic_t csd_bug_count = ATOMIC_INIT(0);
++ 
++ /* Record current CSD work for current CPU, NULL to erase. */
++ static void __csd_lock_record(struct __call_single_data *csd)
++ {
++ 	if (!csd) {
++ 		smp_mb(); /* NULL cur_csd after unlock. */
++ 		__this_cpu_write(cur_csd, NULL);
++ 		return;
++ 	}
++ 	__this_cpu_write(cur_csd_func, csd->func);
++ 	__this_cpu_write(cur_csd_info, csd->info);
++ 	smp_wmb(); /* func and info before csd. */
++ 	__this_cpu_write(cur_csd, csd);
++ 	smp_mb(); /* Update cur_csd before function call. */
++ 		  /* Or before unlock, as the case may be. */
++ }
++ 
++ static __always_inline void csd_lock_record(struct __call_single_data *csd)
++ {
++ 	if (static_branch_unlikely(&csdlock_debug_enabled))
++ 		__csd_lock_record(csd);
++ }
++ 
++ static int csd_lock_wait_getcpu(struct __call_single_data *csd)
++ {
++ 	unsigned int csd_type;
++ 
++ 	csd_type = CSD_TYPE(csd);
++ 	if (csd_type == CSD_TYPE_ASYNC || csd_type == CSD_TYPE_SYNC)
++ 		return csd->node.dst; /* Other CSD_TYPE_ values might not have ->dst. */
++ 	return -1;
++ }
++ 
++ /*
++  * Complain if too much time spent waiting.  Note that only
++  * the CSD_TYPE_SYNC/ASYNC types provide the destination CPU,
++  * so waiting on other types gets much less information.
++  */
++ static bool csd_lock_wait_toolong(struct __call_single_data *csd, u64 ts0, u64 *ts1, int *bug_id)
++ {
++ 	int cpu = -1;
++ 	int cpux;
++ 	bool firsttime;
++ 	u64 ts2, ts_delta;
++ 	call_single_data_t *cpu_cur_csd;
++ 	unsigned int flags = READ_ONCE(csd->node.u_flags);
++ 	unsigned long long csd_lock_timeout_ns = csd_lock_timeout * NSEC_PER_MSEC;
++ 
++ 	if (!(flags & CSD_FLAG_LOCK)) {
++ 		if (!unlikely(*bug_id))
++ 			return true;
++ 		cpu = csd_lock_wait_getcpu(csd);
++ 		pr_alert("csd: CSD lock (#%d) got unstuck on CPU#%02d, CPU#%02d released the lock.\n",
++ 			 *bug_id, raw_smp_processor_id(), cpu);
++ 		return true;
++ 	}
++ 
++ 	ts2 = sched_clock();
++ 	ts_delta = ts2 - *ts1;
++ 	if (likely(ts_delta <= csd_lock_timeout_ns || csd_lock_timeout_ns == 0))
++ 		return false;
++ 
++ 	firsttime = !*bug_id;
++ 	if (firsttime)
++ 		*bug_id = atomic_inc_return(&csd_bug_count);
++ 	cpu = csd_lock_wait_getcpu(csd);
++ 	if (WARN_ONCE(cpu < 0 || cpu >= nr_cpu_ids, "%s: cpu = %d\n", __func__, cpu))
++ 		cpux = 0;
++ 	else
++ 		cpux = cpu;
++ 	cpu_cur_csd = smp_load_acquire(&per_cpu(cur_csd, cpux)); /* Before func and info. */
++ 	pr_alert("csd: %s non-responsive CSD lock (#%d) on CPU#%d, waiting %llu ns for CPU#%02d %pS(%ps).\n",
++ 		 firsttime ? "Detected" : "Continued", *bug_id, raw_smp_processor_id(), ts2 - ts0,
++ 		 cpu, csd->func, csd->info);
++ 	if (cpu_cur_csd && csd != cpu_cur_csd) {
++ 		pr_alert("\tcsd: CSD lock (#%d) handling prior %pS(%ps) request.\n",
++ 			 *bug_id, READ_ONCE(per_cpu(cur_csd_func, cpux)),
++ 			 READ_ONCE(per_cpu(cur_csd_info, cpux)));
++ 	} else {
++ 		pr_alert("\tcsd: CSD lock (#%d) %s.\n",
++ 			 *bug_id, !cpu_cur_csd ? "unresponsive" : "handling this request");
++ 	}
++ 	if (cpu >= 0) {
++ 		dump_cpu_task(cpu);
++ 		if (!cpu_cur_csd) {
++ 			pr_alert("csd: Re-sending CSD lock (#%d) IPI from CPU#%02d to CPU#%02d\n", *bug_id, raw_smp_processor_id(), cpu);
++ 			arch_send_call_function_single_ipi(cpu);
++ 		}
++ 	}
++ 	dump_stack();
++ 	*ts1 = ts2;
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 08407b5f61c1 (smp: Trace IPIs sent via arch_send_call_function_ipi_mask())
+  /*
+   * csd_lock/csd_unlock used to serialize access to per-cpu csd resources
+   *
+@@@ -505,52 -730,57 +648,83 @@@ static void smp_call_function_many_cond
+  	cpu = cpumask_first_and(mask, cpu_online_mask);
+  	if (cpu == this_cpu)
+  		cpu = cpumask_next_and(cpu, mask, cpu_online_mask);
+ -	if (cpu < nr_cpu_ids)
+ -		run_remote = true;
+  
+ -	if (run_remote) {
+ -		cfd = this_cpu_ptr(&cfd_data);
+ -		cpumask_and(cfd->cpumask, mask, cpu_online_mask);
+ -		__cpumask_clear_cpu(this_cpu, cfd->cpumask);
+ +	/* No online cpus?  We're done. */
+ +	if (cpu >= nr_cpu_ids)
+ +		return;
+  
+ -		cpumask_clear(cfd->cpumask_ipi);
+ -		for_each_cpu(cpu, cfd->cpumask) {
+ -			call_single_data_t *csd = per_cpu_ptr(cfd->csd, cpu);
+ +	/* Do we have another CPU which isn't us? */
+ +	next_cpu = cpumask_next_and(cpu, mask, cpu_online_mask);
+ +	if (next_cpu == this_cpu)
+ +		next_cpu = cpumask_next_and(next_cpu, mask, cpu_online_mask);
+  
+++<<<<<<< HEAD
+ +	/* Fastpath: do that cpu by itself. */
+ +	if (next_cpu >= nr_cpu_ids) {
+ +		if (!cond_func || cond_func(cpu, info))
+ +			smp_call_function_single(cpu, func, info, wait);
+ +		return;
+++=======
++ 			if (cond_func && !cond_func(cpu, info))
++ 				continue;
++ 
++ 			csd_lock(csd);
++ 			if (wait)
++ 				csd->node.u_flags |= CSD_TYPE_SYNC;
++ 			csd->func = func;
++ 			csd->info = info;
++ #ifdef CONFIG_CSD_LOCK_WAIT_DEBUG
++ 			csd->node.src = smp_processor_id();
++ 			csd->node.dst = cpu;
++ #endif
++ 			if (llist_add(&csd->node.llist, &per_cpu(call_single_queue, cpu))) {
++ 				__cpumask_set_cpu(cpu, cfd->cpumask_ipi);
++ 				nr_cpus++;
++ 				last_cpu = cpu;
++ 			}
++ 		}
++ 
++ 		/*
++ 		 * Choose the most efficient way to send an IPI. Note that the
++ 		 * number of CPUs might be zero due to concurrent changes to the
++ 		 * provided mask.
++ 		 */
++ 		if (nr_cpus == 1)
++ 			send_call_function_single_ipi(last_cpu);
++ 		else if (likely(nr_cpus > 1))
++ 			send_call_function_ipi_mask(cfd->cpumask_ipi);
+++>>>>>>> 08407b5f61c1 (smp: Trace IPIs sent via arch_send_call_function_ipi_mask())
+  	}
+  
+ -	if (run_local && (!cond_func || cond_func(this_cpu, info))) {
+ -		unsigned long flags;
+ +	cfd = this_cpu_ptr(&cfd_data);
+  
+ -		local_irq_save(flags);
+ -		func(info);
+ -		local_irq_restore(flags);
+ +	cpumask_and(cfd->cpumask, mask, cpu_online_mask);
+ +	__cpumask_clear_cpu(this_cpu, cfd->cpumask);
+ +
+ +	/* Some callers race with other cpus changing the passed mask */
+ +	if (unlikely(!cpumask_weight(cfd->cpumask)))
+ +		return;
+ +
+ +	cpumask_clear(cfd->cpumask_ipi);
+ +	for_each_cpu(cpu, cfd->cpumask) {
+ +		call_single_data_t *csd = per_cpu_ptr(cfd->csd, cpu);
+ +
+ +		if (cond_func && !cond_func(cpu, info))
+ +			continue;
+ +
+ +		csd_lock(csd);
+ +		if (wait)
+ +			csd->flags |= CSD_TYPE_SYNC;
+ +		csd->func = func;
+ +		csd->info = info;
+ +		if (llist_add(&csd->llist, &per_cpu(call_single_queue, cpu)))
+ +			__cpumask_set_cpu(cpu, cfd->cpumask_ipi);
+  	}
+  
+ -	if (run_remote && wait) {
+ +	/* Send a message to all CPUs in the map */
+ +	arch_send_call_function_ipi_mask(cfd->cpumask_ipi);
+ +
+ +	if (wait) {
+  		for_each_cpu(cpu, cfd->cpumask) {
+  			call_single_data_t *csd;
+  
+* Unmerged path kernel/smp.c
