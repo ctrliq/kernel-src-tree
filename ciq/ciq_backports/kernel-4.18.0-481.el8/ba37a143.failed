@@ -1,0 +1,199 @@
+x86/sev: Add a sev= cmdline option
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Michael Roth <michael.roth@amd.com>
+commit ba37a1438aeb540cc48722d629f4b2e7e4398466
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/ba37a143.failed
+
+For debugging purposes it is very useful to have a way to see the full
+contents of the SNP CPUID table provided to a guest. Add an sev=debug
+kernel command-line option to do so.
+
+Also introduce some infrastructure so that additional options can be
+specified via sev=option1[,option2] over time in a consistent manner.
+
+  [ bp: Massage, simplify string parsing. ]
+
+	Suggested-by: Borislav Petkov <bp@alien8.de>
+	Signed-off-by: Michael Roth <michael.roth@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20220307213356.2797205-41-brijesh.singh@amd.com
+(cherry picked from commit ba37a1438aeb540cc48722d629f4b2e7e4398466)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/x86/x86_64/boot-options.rst
+#	arch/x86/kernel/sev.c
+diff --cc arch/x86/kernel/sev.c
+index 9f3a4a57b1e6,70ecc6e2f251..000000000000
+--- a/arch/x86/kernel/sev.c
++++ b/arch/x86/kernel/sev.c
+@@@ -88,6 -110,15 +88,18 @@@ struct ghcb_state 
+  static DEFINE_PER_CPU(struct sev_es_runtime_data*, runtime_data);
+  DEFINE_STATIC_KEY_FALSE(sev_es_enable_key);
+  
+++<<<<<<< HEAD
+++=======
++ static DEFINE_PER_CPU(struct sev_es_save_area *, sev_vmsa);
++ 
++ struct sev_config {
++ 	__u64 debug		: 1,
++ 	      __reserved	: 63;
++ };
++ 
++ static struct sev_config sev_cfg __read_mostly;
++ 
+++>>>>>>> ba37a1438aeb (x86/sev: Add a sev= cmdline option)
+  static __always_inline bool on_vc_stack(struct pt_regs *regs)
+  {
+  	unsigned long sp = regs->sp;
+@@@ -1492,3 -1982,127 +1504,130 @@@ fail
+  	while (true)
+  		halt();
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Initial set up of SNP relies on information provided by the
++  * Confidential Computing blob, which can be passed to the kernel
++  * in the following ways, depending on how it is booted:
++  *
++  * - when booted via the boot/decompress kernel:
++  *   - via boot_params
++  *
++  * - when booted directly by firmware/bootloader (e.g. CONFIG_PVH):
++  *   - via a setup_data entry, as defined by the Linux Boot Protocol
++  *
++  * Scan for the blob in that order.
++  */
++ static __init struct cc_blob_sev_info *find_cc_blob(struct boot_params *bp)
++ {
++ 	struct cc_blob_sev_info *cc_info;
++ 
++ 	/* Boot kernel would have passed the CC blob via boot_params. */
++ 	if (bp->cc_blob_address) {
++ 		cc_info = (struct cc_blob_sev_info *)(unsigned long)bp->cc_blob_address;
++ 		goto found_cc_info;
++ 	}
++ 
++ 	/*
++ 	 * If kernel was booted directly, without the use of the
++ 	 * boot/decompression kernel, the CC blob may have been passed via
++ 	 * setup_data instead.
++ 	 */
++ 	cc_info = find_cc_blob_setup_data(bp);
++ 	if (!cc_info)
++ 		return NULL;
++ 
++ found_cc_info:
++ 	if (cc_info->magic != CC_BLOB_SEV_HDR_MAGIC)
++ 		snp_abort();
++ 
++ 	return cc_info;
++ }
++ 
++ bool __init snp_init(struct boot_params *bp)
++ {
++ 	struct cc_blob_sev_info *cc_info;
++ 
++ 	if (!bp)
++ 		return false;
++ 
++ 	cc_info = find_cc_blob(bp);
++ 	if (!cc_info)
++ 		return false;
++ 
++ 	setup_cpuid_table(cc_info);
++ 
++ 	/*
++ 	 * The CC blob will be used later to access the secrets page. Cache
++ 	 * it here like the boot kernel does.
++ 	 */
++ 	bp->cc_blob_address = (u32)(unsigned long)cc_info;
++ 
++ 	return true;
++ }
++ 
++ void __init snp_abort(void)
++ {
++ 	sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
++ }
++ 
++ static void dump_cpuid_table(void)
++ {
++ 	const struct snp_cpuid_table *cpuid_table = snp_cpuid_get_table();
++ 	int i = 0;
++ 
++ 	pr_info("count=%d reserved=0x%x reserved2=0x%llx\n",
++ 		cpuid_table->count, cpuid_table->__reserved1, cpuid_table->__reserved2);
++ 
++ 	for (i = 0; i < SNP_CPUID_COUNT_MAX; i++) {
++ 		const struct snp_cpuid_fn *fn = &cpuid_table->fn[i];
++ 
++ 		pr_info("index=%3d fn=0x%08x subfn=0x%08x: eax=0x%08x ebx=0x%08x ecx=0x%08x edx=0x%08x xcr0_in=0x%016llx xss_in=0x%016llx reserved=0x%016llx\n",
++ 			i, fn->eax_in, fn->ecx_in, fn->eax, fn->ebx, fn->ecx,
++ 			fn->edx, fn->xcr0_in, fn->xss_in, fn->__reserved);
++ 	}
++ }
++ 
++ /*
++  * It is useful from an auditing/testing perspective to provide an easy way
++  * for the guest owner to know that the CPUID table has been initialized as
++  * expected, but that initialization happens too early in boot to print any
++  * sort of indicator, and there's not really any other good place to do it,
++  * so do it here.
++  */
++ static int __init report_cpuid_table(void)
++ {
++ 	const struct snp_cpuid_table *cpuid_table = snp_cpuid_get_table();
++ 
++ 	if (!cpuid_table->count)
++ 		return 0;
++ 
++ 	pr_info("Using SNP CPUID table, %d entries present.\n",
++ 		cpuid_table->count);
++ 
++ 	if (sev_cfg.debug)
++ 		dump_cpuid_table();
++ 
++ 	return 0;
++ }
++ arch_initcall(report_cpuid_table);
++ 
++ static int __init init_sev_config(char *str)
++ {
++ 	char *s;
++ 
++ 	while ((s = strsep(&str, ","))) {
++ 		if (!strcmp(s, "debug")) {
++ 			sev_cfg.debug = true;
++ 			continue;
++ 		}
++ 
++ 		pr_info("SEV command-line option '%s' was not recognized\n", s);
++ 	}
++ 
++ 	return 1;
++ }
++ __setup("sev=", init_sev_config);
+++>>>>>>> ba37a1438aeb (x86/sev: Add a sev= cmdline option)
+* Unmerged path Documentation/x86/x86_64/boot-options.rst
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index f1cd78b7b989..e9edd4744a63 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -4831,6 +4831,8 @@
+ 
+ 	serialnumber	[BUGS=X86-32]
+ 
++	sev=option[,option...] [X86-64] See Documentation/x86/x86_64/boot-options.rst
++
+ 	shapers=	[NET]
+ 			Maximal number of shapers.
+ 
+* Unmerged path Documentation/x86/x86_64/boot-options.rst
+* Unmerged path arch/x86/kernel/sev.c
