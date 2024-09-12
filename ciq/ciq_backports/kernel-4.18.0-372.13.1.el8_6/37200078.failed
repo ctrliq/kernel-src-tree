@@ -1,0 +1,138 @@
+Drivers: hv: vmbus: Propagate VMbus coherence to each VMbus device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.13.1.el8_6
+commit-author Michael Kelley <mikelley@microsoft.com>
+commit 37200078ed6aa2ac3c88a01a64996133dccfdd34
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.13.1.el8_6/37200078.failed
+
+VMbus synthetic devices are not represented in the ACPI DSDT -- only
+the top level VMbus device is represented. As a result, on ARM64
+coherence information in the _CCA method is not specified for
+synthetic devices, so they default to not hardware coherent.
+Drivers for some of these synthetic devices have been recently
+updated to use the standard DMA APIs, and they are incurring extra
+overhead of unneeded software coherence management.
+
+Fix this by propagating coherence information from the VMbus node
+in ACPI to the individual synthetic devices. There's no effect on
+x86/x64 where devices are always hardware coherent.
+
+	Signed-off-by: Michael Kelley <mikelley@microsoft.com>
+	Acked-by: Robin Murphy <robin.murphy@arm.com>
+Link: https://lore.kernel.org/r/1648138492-2191-2-git-send-email-mikelley@microsoft.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 37200078ed6aa2ac3c88a01a64996133dccfdd34)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/asm-generic/mshyperv.h
+diff --cc include/asm-generic/mshyperv.h
+index d3eae6cdbacb,c05d2ce9b6cd..000000000000
+--- a/include/asm-generic/mshyperv.h
++++ b/include/asm-generic/mshyperv.h
+@@@ -254,8 -265,13 +254,14 @@@ bool hv_is_hyperv_initialized(void)
+  bool hv_is_hibernation_supported(void);
+  enum hv_isolation_type hv_get_isolation_type(void);
+  bool hv_is_isolation_supported(void);
+ -bool hv_isolation_type_snp(void);
+ -u64 hv_ghcb_hypercall(u64 control, void *input, void *output, u32 input_size);
+  void hyperv_cleanup(void);
+  bool hv_query_ext_cap(u64 cap_query);
+++<<<<<<< HEAD
+++=======
++ void hv_setup_dma_ops(struct device *dev, bool coherent);
++ void *hv_map_memory(void *addr, unsigned long size);
++ void hv_unmap_memory(void *addr);
+++>>>>>>> 37200078ed6a (Drivers: hv: vmbus: Propagate VMbus coherence to each VMbus device)
+  #else /* CONFIG_HYPERV */
+  static inline bool hv_is_hyperv_initialized(void) { return false; }
+  static inline bool hv_is_hibernation_supported(void) { return false; }
+diff --git a/drivers/hv/hv_common.c b/drivers/hv/hv_common.c
+index bfe7cbac12c2..171ccfcf81f1 100644
+--- a/drivers/hv/hv_common.c
++++ b/drivers/hv/hv_common.c
+@@ -19,6 +19,7 @@
+ #include <linux/cpumask.h>
+ #include <linux/ptrace.h>
+ #include <linux/slab.h>
++#include <linux/dma-map-ops.h>
+ #include <asm/hyperv-tlfs.h>
+ #include <asm/mshyperv.h>
+ 
+@@ -215,6 +216,16 @@ bool hv_query_ext_cap(u64 cap_query)
+ }
+ EXPORT_SYMBOL_GPL(hv_query_ext_cap);
+ 
++void hv_setup_dma_ops(struct device *dev, bool coherent)
++{
++	/*
++	 * Hyper-V does not offer a vIOMMU in the guest
++	 * VM, so pass 0/NULL for the IOMMU settings
++	 */
++	arch_setup_dma_ops(dev, 0, 0, NULL, coherent);
++}
++EXPORT_SYMBOL_GPL(hv_setup_dma_ops);
++
+ bool hv_is_hibernation_supported(void)
+ {
+ 	return !hv_root_partition && acpi_sleep_state_supported(ACPI_STATE_S4);
+diff --git a/drivers/hv/vmbus_drv.c b/drivers/hv/vmbus_drv.c
+index 47e4f15512f3..bdfac3c7f424 100644
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@ -931,6 +931,21 @@ static int vmbus_probe(struct device *child_device)
+ 	return ret;
+ }
+ 
++/*
++ * vmbus_dma_configure -- Configure DMA coherence for VMbus device
++ */
++static int vmbus_dma_configure(struct device *child_device)
++{
++	/*
++	 * On ARM64, propagate the DMA coherence setting from the top level
++	 * VMbus ACPI device to the child VMbus device being added here.
++	 * On x86/x64 coherence is assumed and these calls have no effect.
++	 */
++	hv_setup_dma_ops(child_device,
++		device_get_dma_attr(&hv_acpi_dev->dev) == DEV_DMA_COHERENT);
++	return 0;
++}
++
+ /*
+  * vmbus_remove - Remove a vmbus device
+  */
+@@ -1054,6 +1069,7 @@ static struct bus_type  hv_bus = {
+ 	.remove =		vmbus_remove,
+ 	.probe =		vmbus_probe,
+ 	.uevent =		vmbus_uevent,
++	.dma_configure =	vmbus_dma_configure,
+ 	.dev_groups =		vmbus_dev_groups,
+ 	.drv_groups =		vmbus_drv_groups,
+ 	.bus_groups =		vmbus_bus_groups,
+@@ -2436,6 +2452,21 @@ static int vmbus_acpi_add(struct acpi_device *device)
+ 
+ 	hv_acpi_dev = device;
+ 
++	/*
++	 * Older versions of Hyper-V for ARM64 fail to include the _CCA
++	 * method on the top level VMbus device in the DSDT. But devices
++	 * are hardware coherent in all current Hyper-V use cases, so fix
++	 * up the ACPI device to behave as if _CCA is present and indicates
++	 * hardware coherence.
++	 */
++	ACPI_COMPANION_SET(&device->dev, device);
++	if (IS_ENABLED(CONFIG_ACPI_CCA_REQUIRED) &&
++	    device_get_dma_attr(&device->dev) == DEV_DMA_NOT_SUPPORTED) {
++		pr_info("No ACPI _CCA found; assuming coherent device I/O\n");
++		device->flags.cca_seen = true;
++		device->flags.coherent_dma = true;
++	}
++
+ 	result = acpi_walk_resources(device->handle, METHOD_NAME__CRS,
+ 					vmbus_walk_resources, NULL);
+ 
+* Unmerged path include/asm-generic/mshyperv.h
