@@ -1,0 +1,126 @@
+net: openvswitch: store sampling probability in cb.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-427.33.1.el9_4
+commit-author Adrian Moreno <amorenoz@redhat.com>
+commit 71763d8a8203c28178d7be7f18af73d4dddb36ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.33.1.el9_4/71763d8a.failed
+
+When a packet sample is observed, the sampling rate that was used is
+important to estimate the real frequency of such event.
+
+Store the probability of the parent sample action in the skb's cb area
+and use it in psample action to pass it down to psample module.
+
+	Reviewed-by: Aaron Conole <aconole@redhat.com>
+	Acked-by: Eelco Chaudron <echaudro@redhat.com>
+	Reviewed-by: Ilya Maximets <i.maximets@ovn.org>
+	Signed-off-by: Adrian Moreno <amorenoz@redhat.com>
+Link: https://patch.msgid.link/20240704085710.353845-7-amorenoz@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 71763d8a8203c28178d7be7f18af73d4dddb36ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/actions.c
+diff --cc net/openvswitch/actions.c
+index dcb106173917,101f9a23792c..000000000000
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@@ -1293,6 -1314,44 +1303,47 @@@ static int execute_dec_ttl(struct sk_bu
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_PSAMPLE)
++ static void execute_psample(struct datapath *dp, struct sk_buff *skb,
++ 			    const struct nlattr *attr)
++ {
++ 	struct psample_group psample_group = {};
++ 	struct psample_metadata md = {};
++ 	const struct nlattr *a;
++ 	u32 rate;
++ 	int rem;
++ 
++ 	nla_for_each_attr(a, nla_data(attr), nla_len(attr), rem) {
++ 		switch (nla_type(a)) {
++ 		case OVS_PSAMPLE_ATTR_GROUP:
++ 			psample_group.group_num = nla_get_u32(a);
++ 			break;
++ 
++ 		case OVS_PSAMPLE_ATTR_COOKIE:
++ 			md.user_cookie = nla_data(a);
++ 			md.user_cookie_len = nla_len(a);
++ 			break;
++ 		}
++ 	}
++ 
++ 	psample_group.net = ovs_dp_get_net(dp);
++ 	md.in_ifindex = OVS_CB(skb)->input_vport->dev->ifindex;
++ 	md.trunc_size = skb->len - OVS_CB(skb)->cutlen;
++ 	md.rate_as_probability = 1;
++ 
++ 	rate = OVS_CB(skb)->probability ? OVS_CB(skb)->probability : U32_MAX;
++ 
++ 	psample_sample_packet(&psample_group, skb, rate, &md);
++ }
++ #else
++ static void execute_psample(struct datapath *dp, struct sk_buff *skb,
++ 			    const struct nlattr *attr)
++ {}
++ #endif
++ 
+++>>>>>>> 71763d8a8203 (net: openvswitch: store sampling probability in cb.)
+  /* Execute a list of actions against 'skb'. */
+  static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+  			      struct sw_flow_key *key,
+diff --git a/include/uapi/linux/openvswitch.h b/include/uapi/linux/openvswitch.h
+index 56973ce0e91e..1027f8419e88 100644
+--- a/include/uapi/linux/openvswitch.h
++++ b/include/uapi/linux/openvswitch.h
+@@ -633,7 +633,8 @@ enum ovs_flow_attr {
+  * Actions are passed as nested attributes.
+  *
+  * Executes the specified actions with the given probability on a per-packet
+- * basis.
++ * basis. Nested actions will be able to access the probability value of the
++ * parent @OVS_ACTION_ATTR_SAMPLE.
+  */
+ enum ovs_sample_attr {
+ 	OVS_SAMPLE_ATTR_UNSPEC,
+* Unmerged path net/openvswitch/actions.c
+diff --git a/net/openvswitch/datapath.h b/net/openvswitch/datapath.h
+index 0cd29971a907..9ca6231ea647 100644
+--- a/net/openvswitch/datapath.h
++++ b/net/openvswitch/datapath.h
+@@ -115,12 +115,15 @@ struct datapath {
+  * fragmented.
+  * @acts_origlen: The netlink size of the flow actions applied to this skb.
+  * @cutlen: The number of bytes from the packet end to be removed.
++ * @probability: The sampling probability that was applied to this skb; 0 means
++ * no sampling has occurred; U32_MAX means 100% probability.
+  */
+ struct ovs_skb_cb {
+ 	struct vport		*input_vport;
+ 	u16			mru;
+ 	u16			acts_origlen;
+ 	u32			cutlen;
++	u32			probability;
+ };
+ #define OVS_CB(skb) ((struct ovs_skb_cb *)(skb)->cb)
+ 
+diff --git a/net/openvswitch/vport.c b/net/openvswitch/vport.c
+index 972ae01a70f7..8732f6e51ae5 100644
+--- a/net/openvswitch/vport.c
++++ b/net/openvswitch/vport.c
+@@ -500,6 +500,7 @@ int ovs_vport_receive(struct vport *vport, struct sk_buff *skb,
+ 	OVS_CB(skb)->input_vport = vport;
+ 	OVS_CB(skb)->mru = 0;
+ 	OVS_CB(skb)->cutlen = 0;
++	OVS_CB(skb)->probability = 0;
+ 	if (unlikely(dev_net(skb->dev) != ovs_dp_get_net(vport->dp))) {
+ 		u32 mark;
+ 
