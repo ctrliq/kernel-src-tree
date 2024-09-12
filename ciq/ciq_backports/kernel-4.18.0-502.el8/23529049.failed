@@ -1,0 +1,261 @@
+arm64: entry: fix non-NMI user<->kernel transitions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit 23529049c68423820487304f244144e0d576e85a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/23529049.failed
+
+When built with PROVE_LOCKING, NO_HZ_FULL, and CONTEXT_TRACKING_FORCE
+will WARN() at boot time that interrupts are enabled when we call
+context_tracking_user_enter(), despite the DAIF flags indicating that
+IRQs are masked.
+
+The problem is that we're not tracking IRQ flag changes accurately, and
+so lockdep believes interrupts are enabled when they are not (and
+vice-versa). We can shuffle things so to make this more accurate. For
+kernel->user transitions there are a number of constraints we need to
+consider:
+
+1) When we call __context_tracking_user_enter() HW IRQs must be disabled
+   and lockdep must be up-to-date with this.
+
+2) Userspace should be treated as having IRQs enabled from the PoV of
+   both lockdep and tracing.
+
+3) As context_tracking_user_enter() stops RCU from watching, we cannot
+   use RCU after calling it.
+
+4) IRQ flag tracing and lockdep have state that must be manipulated
+   before RCU is disabled.
+
+... with similar constraints applying for user->kernel transitions, with
+the ordering reversed.
+
+The generic entry code has enter_from_user_mode() and
+exit_to_user_mode() helpers to handle this. We can't use those directly,
+so we add arm64 copies for now (without the instrumentation markers
+which aren't used on arm64). These replace the existing user_exit() and
+user_exit_irqoff() calls spread throughout handlers, and the exception
+unmasking is left as-is.
+
+Note that:
+
+* The accounting for debug exceptions from userspace now happens in
+  el0_dbg() and ret_to_user(), so this is removed from
+  debug_exception_enter() and debug_exception_exit(). As
+  user_exit_irqoff() wakes RCU, the userspace-specific check is removed.
+
+* The accounting for syscalls now happens in el0_svc(),
+  el0_svc_compat(), and ret_to_user(), so this is removed from
+  el0_svc_common(). This does not adversely affect the workaround for
+  erratum 1463225, as this does not depend on any of the state tracking.
+
+* In ret_to_user() we mask interrupts with local_daif_mask(), and so we
+  need to inform lockdep and tracing. Here a trace_hardirqs_off() is
+  sufficient and safe as we have not yet exited kernel context and RCU
+  is usable.
+
+* As PROVE_LOCKING selects TRACE_IRQFLAGS, the ifdeferry in entry.S only
+  needs to check for the latter.
+
+* EL0 SError handling will be dealt with in a subsequent patch, as this
+  needs to be treated as an NMI.
+
+Prior to this patch, booting an appropriately-configured kernel would
+result in spats as below:
+
+| DEBUG_LOCKS_WARN_ON(lockdep_hardirqs_enabled())
+| WARNING: CPU: 2 PID: 1 at kernel/locking/lockdep.c:5280 check_flags.part.54+0x1dc/0x1f0
+| Modules linked in:
+| CPU: 2 PID: 1 Comm: init Not tainted 5.10.0-rc3 #3
+| Hardware name: linux,dummy-virt (DT)
+| pstate: 804003c5 (Nzcv DAIF +PAN -UAO -TCO BTYPE=--)
+| pc : check_flags.part.54+0x1dc/0x1f0
+| lr : check_flags.part.54+0x1dc/0x1f0
+| sp : ffff80001003bd80
+| x29: ffff80001003bd80 x28: ffff66ce801e0000
+| x27: 00000000ffffffff x26: 00000000000003c0
+| x25: 0000000000000000 x24: ffffc31842527258
+| x23: ffffc31842491368 x22: ffffc3184282d000
+| x21: 0000000000000000 x20: 0000000000000001
+| x19: ffffc318432ce000 x18: 0080000000000000
+| x17: 0000000000000000 x16: ffffc31840f18a78
+| x15: 0000000000000001 x14: ffffc3184285c810
+| x13: 0000000000000001 x12: 0000000000000000
+| x11: ffffc318415857a0 x10: ffffc318406614c0
+| x9 : ffffc318415857a0 x8 : ffffc31841f1d000
+| x7 : 647261685f706564 x6 : ffffc3183ff7c66c
+| x5 : ffff66ce801e0000 x4 : 0000000000000000
+| x3 : ffffc3183fe00000 x2 : ffffc31841500000
+| x1 : e956dc24146b3500 x0 : 0000000000000000
+| Call trace:
+|  check_flags.part.54+0x1dc/0x1f0
+|  lock_is_held_type+0x10c/0x188
+|  rcu_read_lock_sched_held+0x70/0x98
+|  __context_tracking_enter+0x310/0x350
+|  context_tracking_enter.part.3+0x5c/0xc8
+|  context_tracking_user_enter+0x6c/0x80
+|  finish_ret_to_user+0x2c/0x13cr
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20201130115950.22492-8-mark.rutland@arm.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 23529049c68423820487304f244144e0d576e85a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/entry-common.c
+#	arch/arm64/kernel/entry.S
+diff --cc arch/arm64/kernel/entry-common.c
+index 274cd617c8d9,49d1c1dd9baf..000000000000
+--- a/arch/arm64/kernel/entry-common.c
++++ b/arch/arm64/kernel/entry-common.c
+@@@ -117,6 -117,22 +117,25 @@@ asmlinkage void noinstr el1_sync_handle
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ asmlinkage void noinstr enter_from_user_mode(void)
++ {
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	CT_WARN_ON(ct_state() != CONTEXT_USER);
++ 	user_exit_irqoff();
++ 	trace_hardirqs_off_finish();
++ }
++ 
++ asmlinkage void noinstr exit_to_user_mode(void)
++ {
++ 	trace_hardirqs_on_prepare();
++ 	lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++ 	user_enter_irqoff();
++ 	lockdep_hardirqs_on(CALLER_ADDR0);
++ }
++ 
+++>>>>>>> 23529049c684 (arm64: entry: fix non-NMI user<->kernel transitions)
+  static void noinstr el0_da(struct pt_regs *regs, unsigned long esr)
+  {
+  	unsigned long far = read_sysreg(far_el1);
+diff --cc arch/arm64/kernel/entry.S
+index 7a54fd267d61,d72c818b019c..000000000000
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@@ -717,11 -738,20 +707,28 @@@ SYM_CODE_END(el0_error
+  SYM_CODE_START_LOCAL(ret_to_user)
+  	disable_daif
+  	gic_prio_kentry_setup tmp=x3
+++<<<<<<< HEAD
+ +	ldr	x1, [tsk, #TSK_TI_FLAGS]
+ +	and	x2, x1, #_TIF_WORK_MASK
+ +	cbnz	x2, work_pending
+ +finish_ret_to_user:
+ +	enable_step_tsk x1, x2
+++=======
++ #ifdef CONFIG_TRACE_IRQFLAGS
++ 	bl	trace_hardirqs_off
++ #endif
++ 	ldr	x19, [tsk, #TSK_TI_FLAGS]
++ 	and	x2, x19, #_TIF_WORK_MASK
++ 	cbnz	x2, work_pending
++ finish_ret_to_user:
++ 	user_enter_irqoff
++ 	/* Ignore asynchronous tag check faults in the uaccess routines */
++ 	clear_mte_async_tcf
++ 	enable_step_tsk x19, x2
++ #ifdef CONFIG_GCC_PLUGIN_STACKLEAK
++ 	bl	stackleak_erase
++ #endif
+++>>>>>>> 23529049c684 (arm64: entry: fix non-NMI user<->kernel transitions)
+  	kernel_exit 0
+  
+  /*
+@@@ -729,11 -759,9 +736,15 @@@
+   */
+  work_pending:
+  	mov	x0, sp				// 'regs'
+ -	mov	x1, x19
+  	bl	do_notify_resume
+++<<<<<<< HEAD
+ +#ifdef CONFIG_TRACE_IRQFLAGS
+ +	bl	trace_hardirqs_on		// enabled while in userspace
+ +#endif
+ +	ldr	x1, [tsk, #TSK_TI_FLAGS]	// re-check for single-step
+++=======
++ 	ldr	x19, [tsk, #TSK_TI_FLAGS]	// re-check for single-step
+++>>>>>>> 23529049c684 (arm64: entry: fix non-NMI user<->kernel transitions)
+  	b	finish_ret_to_user
+  SYM_CODE_END(ret_to_user)
+  
+diff --git a/arch/arm64/include/asm/exception.h b/arch/arm64/include/asm/exception.h
+index 3b6f98ffe307..27b1896d85c8 100644
+--- a/arch/arm64/include/asm/exception.h
++++ b/arch/arm64/include/asm/exception.h
+@@ -45,6 +45,7 @@ static inline u32 disr_to_esr(u64 disr)
+ asmlinkage void noinstr enter_el1_irq_or_nmi(struct pt_regs *regs);
+ asmlinkage void noinstr exit_el1_irq_or_nmi(struct pt_regs *regs);
+ asmlinkage void enter_from_user_mode(void);
++asmlinkage void exit_to_user_mode(void);
+ void do_mem_abort(unsigned long addr, unsigned int esr, struct pt_regs *regs);
+ void do_undefinstr(struct pt_regs *regs);
+ void do_bti(struct pt_regs *regs);
+* Unmerged path arch/arm64/kernel/entry-common.c
+* Unmerged path arch/arm64/kernel/entry.S
+diff --git a/arch/arm64/kernel/syscall.c b/arch/arm64/kernel/syscall.c
+index 9df123b25072..2cbeba9d7087 100644
+--- a/arch/arm64/kernel/syscall.c
++++ b/arch/arm64/kernel/syscall.c
+@@ -117,7 +117,6 @@ static void el0_svc_common(struct pt_regs *regs, int scno, int sc_nr,
+ 	 */
+ 
+ 	cortex_a76_erratum_1463225_svc_handler();
+-	user_exit_irqoff();
+ 	local_daif_restore(DAIF_PROCCTX);
+ 
+ 	if (has_syscall_work(flags)) {
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 464083ad510b..4df5957c692b 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -809,16 +809,14 @@ void __init hook_debug_fault_code(int nr,
+  */
+ static void debug_exception_enter(struct pt_regs *regs)
+ {
+-	/*
+-	 * Tell lockdep we disabled irqs in entry.S. Do nothing if they were
+-	 * already disabled to preserve the last enabled/disabled addresses.
+-	 */
+-	if (interrupts_enabled(regs))
+-		trace_hardirqs_off();
++	if (!user_mode(regs)) {
++		/*
++		 * Tell lockdep we disabled irqs in entry.S. Do nothing if they were
++		 * already disabled to preserve the last enabled/disabled addresses.
++		 */
++		if (interrupts_enabled(regs))
++			trace_hardirqs_off();
+ 
+-	if (user_mode(regs)) {
+-		RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+-	} else {
+ 		/*
+ 		 * We might have interrupted pretty much anything.  In
+ 		 * fact, if we're a debug exception, we can even interrupt
+@@ -839,8 +837,10 @@ static void debug_exception_exit(struct pt_regs *regs)
+ {
+ 	preempt_enable_no_resched();
+ 
+-	if (!user_mode(regs))
+-		rcu_nmi_exit();
++	if (user_mode(regs))
++		return;
++
++	rcu_nmi_exit();
+ 
+ 	if (interrupts_enabled(regs))
+ 		trace_hardirqs_on();
