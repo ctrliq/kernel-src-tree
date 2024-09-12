@@ -1,0 +1,146 @@
+tracing: Add linear buckets to histogram logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Steven Rostedt (VMware) <rostedt@goodmis.org>
+commit de9a48a360b70d5318061cf1237431d1869555e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/de9a48a3.failed
+
+There's been several times I wished the histogram logic had a "grouping"
+feature for the buckets. Currently, each bucket has a size of one. That
+is, if you trace the amount of requested allocations, each allocation is
+its own bucket, even if you are interested in what allocates 100 bytes or
+less, 100 to 200, 200 to 300, etc.
+
+Also, without grouping, it fills up the allocated histogram buckets
+quickly. If you are tracking latency, and don't care if something is 200
+microseconds off, or 201 microseconds off, but want to track them by say
+10 microseconds each. This can not currently be done.
+
+There is a log2 but that grouping get's too big too fast for a lot of
+cases.
+
+Introduce a "buckets=SIZE" command to each field where it will record in a
+rounded number. For example:
+
+ ># echo 'hist:keys=bytes_req.buckets=100:sort=bytes_req' > events/kmem/kmalloc/trigger
+ ># cat events/kmem/kmalloc/hist
+ # event histogram
+ #
+ # trigger info:
+ hist:keys=bytes_req.buckets=100:vals=hitcount:sort=bytes_req.buckets=100:size=2048
+ [active]
+ #
+
+ { bytes_req: ~ 0-99 } hitcount:       3149
+ { bytes_req: ~ 100-199 } hitcount:       1468
+ { bytes_req: ~ 200-299 } hitcount:         39
+ { bytes_req: ~ 300-399 } hitcount:        306
+ { bytes_req: ~ 400-499 } hitcount:        364
+ { bytes_req: ~ 500-599 } hitcount:         32
+ { bytes_req: ~ 600-699 } hitcount:         69
+ { bytes_req: ~ 700-799 } hitcount:         37
+ { bytes_req: ~ 1200-1299 } hitcount:         16
+ { bytes_req: ~ 1400-1499 } hitcount:         30
+ { bytes_req: ~ 2000-2099 } hitcount:          6
+ { bytes_req: ~ 4000-4099 } hitcount:       2168
+ { bytes_req: ~ 5000-5099 } hitcount:          6
+
+ Totals:
+     Hits: 7690
+     Entries: 13
+     Dropped: 0
+
+Link: https://lkml.kernel.org/r/20210707213921.980359719@goodmis.org
+
+	Acked-by: Namhyung Kim <namhyung@kernel.org>
+	Reviewed-by: Tom Zanussi <zanussi@kernel.org>
+	Reviewed-by: Masami Hiramatsu <mhiramat@kernel.org>
+	Tested-by: Daniel Bristot de Oliveira <bristot@kernel.org>
+	Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+(cherry picked from commit de9a48a360b70d5318061cf1237431d1869555e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_events_hist.c
+diff --cc kernel/trace/trace_events_hist.c
+index 46eb1dbf82be,8e87c4a429fd..000000000000
+--- a/kernel/trace/trace_events_hist.c
++++ b/kernel/trace/trace_events_hist.c
+@@@ -134,8 -220,30 +135,29 @@@ static u64 hist_field_log2(struct hist_
+  	return (u64) ilog2(roundup_pow_of_two(val));
+  }
+  
++ static u64 hist_field_bucket(struct hist_field *hist_field,
++ 			     struct tracing_map_elt *elt,
++ 			     struct trace_buffer *buffer,
++ 			     struct ring_buffer_event *rbe,
++ 			     void *event)
++ {
++ 	struct hist_field *operand = hist_field->operands[0];
++ 	unsigned long buckets = hist_field->buckets;
++ 
++ 	u64 val = operand->fn(operand, elt, buffer, rbe, event);
++ 
++ 	if (WARN_ON_ONCE(!buckets))
++ 		return val;
++ 
++ 	if (val >= LONG_MAX)
++ 		val = div64_ul(val, buckets);
++ 	else
++ 		val = (u64)((unsigned long)val / buckets);
++ 	return val * buckets;
++ }
++ 
+  static u64 hist_field_plus(struct hist_field *hist_field,
+  			   struct tracing_map_elt *elt,
+ -			   struct trace_buffer *buffer,
+  			   struct ring_buffer_event *rbe,
+  			   void *event)
+  {
+@@@ -1684,10 -1132,11 +1707,11 @@@ static const char *hist_field_name(stru
+  	if (field->field)
+  		field_name = field->field->name;
+  	else if (field->flags & HIST_FIELD_FL_LOG2 ||
+- 		 field->flags & HIST_FIELD_FL_ALIAS)
++ 		 field->flags & HIST_FIELD_FL_ALIAS ||
++ 		 field->flags & HIST_FIELD_FL_BUCKET)
+  		field_name = hist_field_name(field->operands[0], ++level);
+  	else if (field->flags & HIST_FIELD_FL_CPU)
+ -		field_name = "common_cpu";
+ +		field_name = "cpu";
+  	else if (field->flags & HIST_FIELD_FL_EXPR ||
+  		 field->flags & HIST_FIELD_FL_VAR_REF) {
+  		if (field->system) {
+@@@ -2465,8 -2007,23 +2492,28 @@@ parse_field(struct hist_trigger_data *h
+  			*flags |= HIST_FIELD_FL_LOG2;
+  		else if (strcmp(modifier, "usecs") == 0)
+  			*flags |= HIST_FIELD_FL_TIMESTAMP_USECS;
+++<<<<<<< HEAD
+ +		else {
+ +			hist_err("Invalid field modifier: ", modifier);
+++=======
++ 		else if (strncmp(modifier, "bucket", 6) == 0) {
++ 			int ret;
++ 
++ 			modifier += 6;
++ 
++ 			if (*modifier == 's')
++ 				modifier++;
++ 			if (*modifier != '=')
++ 				goto error;
++ 			modifier++;
++ 			ret = kstrtoul(modifier, 0, buckets);
++ 			if (ret || !(*buckets))
++ 				goto error;
++ 			*flags |= HIST_FIELD_FL_BUCKET;
++ 		} else {
++  error:
++ 			hist_err(tr, HIST_ERR_BAD_FIELD_MODIFIER, errpos(modifier));
+++>>>>>>> de9a48a360b7 (tracing: Add linear buckets to histogram logic)
+  			field = ERR_PTR(-EINVAL);
+  			goto out;
+  		}
+* Unmerged path kernel/trace/trace_events_hist.c
