@@ -1,0 +1,66 @@
+netfilter: nf_tables: skip netdev events generated on netns removal
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 68a3765c659f809dcaac20030853a054646eb739
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/68a3765c.failed
+
+syzbot reported following (harmless) WARN:
+
+ WARNING: CPU: 1 PID: 2648 at net/netfilter/core.c:468
+  nft_netdev_unregister_hooks net/netfilter/nf_tables_api.c:230 [inline]
+  nf_tables_unregister_hook include/net/netfilter/nf_tables.h:1090 [inline]
+  __nft_release_basechain+0x138/0x640 net/netfilter/nf_tables_api.c:9524
+  nft_netdev_event net/netfilter/nft_chain_filter.c:351 [inline]
+  nf_tables_netdev_event+0x521/0x8a0 net/netfilter/nft_chain_filter.c:382
+
+reproducer:
+unshare -n bash -c 'ip link add br0 type bridge; nft add table netdev t ; \
+ nft add chain netdev t ingress \{ type filter hook ingress device "br0" \
+ priority 0\; policy drop\; \}'
+
+Problem is that when netns device exit hooks create the UNREGISTER
+event, the .pre_exit hook for nf_tables core has already removed the
+base hook.  Notifier attempts to do this again.
+
+The need to do base hook unregister unconditionally was needed in the past,
+because notifier was last stage where reg->dev dereference was safe.
+
+Now that nf_tables does the hook removal in .pre_exit, this isn't
+needed anymore.
+
+Reported-and-tested-by: syzbot+154bd5be532a63aa778b@syzkaller.appspotmail.com
+Fixes: 767d1216bff825 ("netfilter: nftables: fix possible UAF over chains from packet path in netns")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 68a3765c659f809dcaac20030853a054646eb739)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nft_chain_filter.c
+diff --cc net/netfilter/nft_chain_filter.c
+index 6f7caef1f6ce,3ced0eb6b7c3..000000000000
+--- a/net/netfilter/nft_chain_filter.c
++++ b/net/netfilter/nft_chain_filter.c
+@@@ -332,8 -360,12 +326,17 @@@ static int nf_tables_netdev_event(struc
+  	    event != NETDEV_CHANGENAME)
+  		return NOTIFY_DONE;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&ctx.net->nft_commit_mutex);
+ +	list_for_each_entry(table, &ctx.net->nft.tables, list) {
+++=======
++ 	if (!check_net(ctx.net))
++ 		return NOTIFY_DONE;
++ 
++ 	nft_net = nft_pernet(ctx.net);
++ 	mutex_lock(&nft_net->commit_mutex);
++ 	list_for_each_entry(table, &nft_net->tables, list) {
+++>>>>>>> 68a3765c659f (netfilter: nf_tables: skip netdev events generated on netns removal)
+  		if (table->family != NFPROTO_NETDEV)
+  			continue;
+  
+* Unmerged path net/netfilter/nft_chain_filter.c
