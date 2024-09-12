@@ -1,0 +1,823 @@
+Bluetooth: btusb: Support Bluetooth Reset for Mediatek Chip(MT7921)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-509.el8
+commit-author mark-yw.chen <mark-yw.chen@mediatek.com>
+commit e947802657cb6f540ba04f498dfd4938ed6c569e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-509.el8/e9478026.failed
+
+When the firmware hang or command no response, driver can reset the
+bluetooth mcu via USB to recovery it. The reset steps as follows.
+
+1. Cancel USB transfer requests before reset.
+2. It use speicific USB HW Register to reset Bluetooth MCU, at the
+   same time, the USB Endpoint0 still keep alive.
+3. Poll the USB HW register until reset is completed by Endpoint0.
+4. To recovery unexpected USB state and behavior during resetting the
+   Bluetooth MCU, the driver need to reset the USB device for MT7921.
+5. After the reset is completed, the Bluetooth MCU need to re-setup,
+   such as download patch, power-on sequence and etc.
+
+	Signed-off-by: mark-yw.chen <mark-yw.chen@mediatek.com>
+	Reviewed-by: Michael Sun <michaelfsun@google.com>
+	Reviewed-by: Archie Pusaka <apusaka@chromium.org>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit e947802657cb6f540ba04f498dfd4938ed6c569e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/bluetooth/btusb.c
+diff --cc drivers/bluetooth/btusb.c
+index 857e45a21441,a4cee8327295..000000000000
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@@ -2108,6 -2440,687 +2108,690 @@@ static int btusb_send_frame_intel(struc
+  	return -EILSEQ;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int btusb_setup_intel_new_get_fw_name(struct intel_version *ver,
++ 					     struct intel_boot_params *params,
++ 					     char *fw_name, size_t len,
++ 					     const char *suffix)
++ {
++ 	switch (ver->hw_variant) {
++ 	case 0x0b:	/* SfP */
++ 	case 0x0c:	/* WsP */
++ 		snprintf(fw_name, len, "intel/ibt-%u-%u.%s",
++ 			le16_to_cpu(ver->hw_variant),
++ 			le16_to_cpu(params->dev_revid),
++ 			suffix);
++ 		break;
++ 	case 0x11:	/* JfP */
++ 	case 0x12:	/* ThP */
++ 	case 0x13:	/* HrP */
++ 	case 0x14:	/* CcP */
++ 		snprintf(fw_name, len, "intel/ibt-%u-%u-%u.%s",
++ 			le16_to_cpu(ver->hw_variant),
++ 			le16_to_cpu(ver->hw_revision),
++ 			le16_to_cpu(ver->fw_revision),
++ 			suffix);
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void btusb_setup_intel_newgen_get_fw_name(const struct intel_version_tlv *ver_tlv,
++ 						 char *fw_name, size_t len,
++ 						 const char *suffix)
++ {
++ 	/* The firmware file name for new generation controllers will be
++ 	 * ibt-<cnvi_top type+cnvi_top step>-<cnvr_top type+cnvr_top step>
++ 	 */
++ 	snprintf(fw_name, len, "intel/ibt-%04x-%04x.%s",
++ 		 INTEL_CNVX_TOP_PACK_SWAB(INTEL_CNVX_TOP_TYPE(ver_tlv->cnvi_top),
++ 					  INTEL_CNVX_TOP_STEP(ver_tlv->cnvi_top)),
++ 		 INTEL_CNVX_TOP_PACK_SWAB(INTEL_CNVX_TOP_TYPE(ver_tlv->cnvr_top),
++ 					  INTEL_CNVX_TOP_STEP(ver_tlv->cnvr_top)),
++ 		 suffix);
++ }
++ 
++ static int btusb_download_wait(struct hci_dev *hdev, ktime_t calltime, int msec)
++ {
++ 	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	ktime_t delta, rettime;
++ 	unsigned long long duration;
++ 	int err;
++ 
++ 	set_bit(BTUSB_FIRMWARE_LOADED, &data->flags);
++ 
++ 	bt_dev_info(hdev, "Waiting for firmware download to complete");
++ 
++ 	err = wait_on_bit_timeout(&data->flags, BTUSB_DOWNLOADING,
++ 				  TASK_INTERRUPTIBLE,
++ 				  msecs_to_jiffies(msec));
++ 	if (err == -EINTR) {
++ 		bt_dev_err(hdev, "Firmware loading interrupted");
++ 		return err;
++ 	}
++ 
++ 	if (err) {
++ 		bt_dev_err(hdev, "Firmware loading timeout");
++ 		return -ETIMEDOUT;
++ 	}
++ 
++ 	if (test_bit(BTUSB_FIRMWARE_FAILED, &data->flags)) {
++ 		bt_dev_err(hdev, "Firmware loading failed");
++ 		return -ENOEXEC;
++ 	}
++ 
++ 	rettime = ktime_get();
++ 	delta = ktime_sub(rettime, calltime);
++ 	duration = (unsigned long long)ktime_to_ns(delta) >> 10;
++ 
++ 	bt_dev_info(hdev, "Firmware loaded in %llu usecs", duration);
++ 
++ 	return 0;
++ }
++ 
++ static int btusb_intel_download_firmware_newgen(struct hci_dev *hdev,
++ 						struct intel_version_tlv *ver,
++ 						u32 *boot_param)
++ {
++ 	const struct firmware *fw;
++ 	char fwname[64];
++ 	int err;
++ 	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	ktime_t calltime;
++ 
++ 	if (!ver || !boot_param)
++ 		return -EINVAL;
++ 
++ 	/* The firmware variant determines if the device is in bootloader
++ 	 * mode or is running operational firmware. The value 0x03 identifies
++ 	 * the bootloader and the value 0x23 identifies the operational
++ 	 * firmware.
++ 	 *
++ 	 * When the operational firmware is already present, then only
++ 	 * the check for valid Bluetooth device address is needed. This
++ 	 * determines if the device will be added as configured or
++ 	 * unconfigured controller.
++ 	 *
++ 	 * It is not possible to use the Secure Boot Parameters in this
++ 	 * case since that command is only available in bootloader mode.
++ 	 */
++ 	if (ver->img_type == 0x03) {
++ 		clear_bit(BTUSB_BOOTLOADER, &data->flags);
++ 		btintel_check_bdaddr(hdev);
++ 	}
++ 
++ 	/* If the OTP has no valid Bluetooth device address, then there will
++ 	 * also be no valid address for the operational firmware.
++ 	 */
++ 	if (!bacmp(&ver->otp_bd_addr, BDADDR_ANY)) {
++ 		bt_dev_info(hdev, "No device address configured");
++ 		set_bit(HCI_QUIRK_INVALID_BDADDR, &hdev->quirks);
++ 	}
++ 
++ 	btusb_setup_intel_newgen_get_fw_name(ver, fwname, sizeof(fwname), "sfi");
++ 	err = firmware_request_nowarn(&fw, fwname, &hdev->dev);
++ 	if (err < 0) {
++ 		if (!test_bit(BTUSB_BOOTLOADER, &data->flags)) {
++ 			/* Firmware has already been loaded */
++ 			set_bit(BTUSB_FIRMWARE_LOADED, &data->flags);
++ 			return 0;
++ 		}
++ 
++ 		bt_dev_err(hdev, "Failed to load Intel firmware file %s (%d)",
++ 			   fwname, err);
++ 
++ 		return err;
++ 	}
++ 
++ 	bt_dev_info(hdev, "Found device firmware: %s", fwname);
++ 
++ 	if (fw->size < 644) {
++ 		bt_dev_err(hdev, "Invalid size of firmware file (%zu)",
++ 			   fw->size);
++ 		err = -EBADF;
++ 		goto done;
++ 	}
++ 
++ 	calltime = ktime_get();
++ 
++ 	set_bit(BTUSB_DOWNLOADING, &data->flags);
++ 
++ 	/* Start firmware downloading and get boot parameter */
++ 	err = btintel_download_firmware_newgen(hdev, ver, fw, boot_param,
++ 					       INTEL_HW_VARIANT(ver->cnvi_bt),
++ 					       ver->sbe_type);
++ 	if (err < 0) {
++ 		if (err == -EALREADY) {
++ 			/* Firmware has already been loaded */
++ 			set_bit(BTUSB_FIRMWARE_LOADED, &data->flags);
++ 			err = 0;
++ 			goto done;
++ 		}
++ 
++ 		/* When FW download fails, send Intel Reset to retry
++ 		 * FW download.
++ 		 */
++ 		btintel_reset_to_bootloader(hdev);
++ 		goto done;
++ 	}
++ 
++ 	/* Before switching the device into operational mode and with that
++ 	 * booting the loaded firmware, wait for the bootloader notification
++ 	 * that all fragments have been successfully received.
++ 	 *
++ 	 * When the event processing receives the notification, then the
++ 	 * BTUSB_DOWNLOADING flag will be cleared.
++ 	 *
++ 	 * The firmware loading should not take longer than 5 seconds
++ 	 * and thus just timeout if that happens and fail the setup
++ 	 * of this device.
++ 	 */
++ 	err = btusb_download_wait(hdev, calltime, 5000);
++ 	if (err == -ETIMEDOUT)
++ 		btintel_reset_to_bootloader(hdev);
++ 
++ done:
++ 	release_firmware(fw);
++ 	return err;
++ }
++ 
++ static int btusb_intel_download_firmware(struct hci_dev *hdev,
++ 					 struct intel_version *ver,
++ 					 struct intel_boot_params *params,
++ 					 u32 *boot_param)
++ {
++ 	const struct firmware *fw;
++ 	char fwname[64];
++ 	int err;
++ 	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	ktime_t calltime;
++ 
++ 	if (!ver || !params)
++ 		return -EINVAL;
++ 
++ 	/* The firmware variant determines if the device is in bootloader
++ 	 * mode or is running operational firmware. The value 0x06 identifies
++ 	 * the bootloader and the value 0x23 identifies the operational
++ 	 * firmware.
++ 	 *
++ 	 * When the operational firmware is already present, then only
++ 	 * the check for valid Bluetooth device address is needed. This
++ 	 * determines if the device will be added as configured or
++ 	 * unconfigured controller.
++ 	 *
++ 	 * It is not possible to use the Secure Boot Parameters in this
++ 	 * case since that command is only available in bootloader mode.
++ 	 */
++ 	if (ver->fw_variant == 0x23) {
++ 		clear_bit(BTUSB_BOOTLOADER, &data->flags);
++ 		btintel_check_bdaddr(hdev);
++ 
++ 		/* SfP and WsP don't seem to update the firmware version on file
++ 		 * so version checking is currently possible.
++ 		 */
++ 		switch (ver->hw_variant) {
++ 		case 0x0b:	/* SfP */
++ 		case 0x0c:	/* WsP */
++ 			return 0;
++ 		}
++ 
++ 		/* Proceed to download to check if the version matches */
++ 		goto download;
++ 	}
++ 
++ 	/* Read the secure boot parameters to identify the operating
++ 	 * details of the bootloader.
++ 	 */
++ 	err = btintel_read_boot_params(hdev, params);
++ 	if (err)
++ 		return err;
++ 
++ 	/* It is required that every single firmware fragment is acknowledged
++ 	 * with a command complete event. If the boot parameters indicate
++ 	 * that this bootloader does not send them, then abort the setup.
++ 	 */
++ 	if (params->limited_cce != 0x00) {
++ 		bt_dev_err(hdev, "Unsupported Intel firmware loading method (%u)",
++ 			   params->limited_cce);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* If the OTP has no valid Bluetooth device address, then there will
++ 	 * also be no valid address for the operational firmware.
++ 	 */
++ 	if (!bacmp(&params->otp_bdaddr, BDADDR_ANY)) {
++ 		bt_dev_info(hdev, "No device address configured");
++ 		set_bit(HCI_QUIRK_INVALID_BDADDR, &hdev->quirks);
++ 	}
++ 
++ download:
++ 	/* With this Intel bootloader only the hardware variant and device
++ 	 * revision information are used to select the right firmware for SfP
++ 	 * and WsP.
++ 	 *
++ 	 * The firmware filename is ibt-<hw_variant>-<dev_revid>.sfi.
++ 	 *
++ 	 * Currently the supported hardware variants are:
++ 	 *   11 (0x0b) for iBT3.0 (LnP/SfP)
++ 	 *   12 (0x0c) for iBT3.5 (WsP)
++ 	 *
++ 	 * For ThP/JfP and for future SKU's, the FW name varies based on HW
++ 	 * variant, HW revision and FW revision, as these are dependent on CNVi
++ 	 * and RF Combination.
++ 	 *
++ 	 *   17 (0x11) for iBT3.5 (JfP)
++ 	 *   18 (0x12) for iBT3.5 (ThP)
++ 	 *
++ 	 * The firmware file name for these will be
++ 	 * ibt-<hw_variant>-<hw_revision>-<fw_revision>.sfi.
++ 	 *
++ 	 */
++ 	err = btusb_setup_intel_new_get_fw_name(ver, params, fwname,
++ 						sizeof(fwname), "sfi");
++ 	if (err < 0) {
++ 		if (!test_bit(BTUSB_BOOTLOADER, &data->flags)) {
++ 			/* Firmware has already been loaded */
++ 			set_bit(BTUSB_FIRMWARE_LOADED, &data->flags);
++ 			return 0;
++ 		}
++ 
++ 		bt_dev_err(hdev, "Unsupported Intel firmware naming");
++ 		return -EINVAL;
++ 	}
++ 
++ 	err = firmware_request_nowarn(&fw, fwname, &hdev->dev);
++ 	if (err < 0) {
++ 		if (!test_bit(BTUSB_BOOTLOADER, &data->flags)) {
++ 			/* Firmware has already been loaded */
++ 			set_bit(BTUSB_FIRMWARE_LOADED, &data->flags);
++ 			return 0;
++ 		}
++ 
++ 		bt_dev_err(hdev, "Failed to load Intel firmware file %s (%d)",
++ 			   fwname, err);
++ 		return err;
++ 	}
++ 
++ 	bt_dev_info(hdev, "Found device firmware: %s", fwname);
++ 
++ 	if (fw->size < 644) {
++ 		bt_dev_err(hdev, "Invalid size of firmware file (%zu)",
++ 			   fw->size);
++ 		err = -EBADF;
++ 		goto done;
++ 	}
++ 
++ 	calltime = ktime_get();
++ 
++ 	set_bit(BTUSB_DOWNLOADING, &data->flags);
++ 
++ 	/* Start firmware downloading and get boot parameter */
++ 	err = btintel_download_firmware(hdev, ver, fw, boot_param);
++ 	if (err < 0) {
++ 		if (err == -EALREADY) {
++ 			/* Firmware has already been loaded */
++ 			set_bit(BTUSB_FIRMWARE_LOADED, &data->flags);
++ 			err = 0;
++ 			goto done;
++ 		}
++ 
++ 		/* When FW download fails, send Intel Reset to retry
++ 		 * FW download.
++ 		 */
++ 		btintel_reset_to_bootloader(hdev);
++ 		goto done;
++ 	}
++ 
++ 	/* Before switching the device into operational mode and with that
++ 	 * booting the loaded firmware, wait for the bootloader notification
++ 	 * that all fragments have been successfully received.
++ 	 *
++ 	 * When the event processing receives the notification, then the
++ 	 * BTUSB_DOWNLOADING flag will be cleared.
++ 	 *
++ 	 * The firmware loading should not take longer than 5 seconds
++ 	 * and thus just timeout if that happens and fail the setup
++ 	 * of this device.
++ 	 */
++ 	err = btusb_download_wait(hdev, calltime, 5000);
++ 	if (err == -ETIMEDOUT)
++ 		btintel_reset_to_bootloader(hdev);
++ 
++ done:
++ 	release_firmware(fw);
++ 	return err;
++ }
++ 
++ static int btusb_boot_wait(struct hci_dev *hdev, ktime_t calltime, int msec)
++ {
++ 	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	ktime_t delta, rettime;
++ 	unsigned long long duration;
++ 	int err;
++ 
++ 	bt_dev_info(hdev, "Waiting for device to boot");
++ 
++ 	err = wait_on_bit_timeout(&data->flags, BTUSB_BOOTING,
++ 				  TASK_INTERRUPTIBLE,
++ 				  msecs_to_jiffies(msec));
++ 	if (err == -EINTR) {
++ 		bt_dev_err(hdev, "Device boot interrupted");
++ 		return -EINTR;
++ 	}
++ 
++ 	if (err) {
++ 		bt_dev_err(hdev, "Device boot timeout");
++ 		return -ETIMEDOUT;
++ 	}
++ 
++ 	rettime = ktime_get();
++ 	delta = ktime_sub(rettime, calltime);
++ 	duration = (unsigned long long) ktime_to_ns(delta) >> 10;
++ 
++ 	bt_dev_info(hdev, "Device booted in %llu usecs", duration);
++ 
++ 	return 0;
++ }
++ 
++ static int btusb_intel_boot(struct hci_dev *hdev, u32 boot_addr)
++ {
++ 	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	ktime_t calltime;
++ 	int err;
++ 
++ 	calltime = ktime_get();
++ 
++ 	set_bit(BTUSB_BOOTING, &data->flags);
++ 
++ 	err = btintel_send_intel_reset(hdev, boot_addr);
++ 	if (err) {
++ 		bt_dev_err(hdev, "Intel Soft Reset failed (%d)", err);
++ 		btintel_reset_to_bootloader(hdev);
++ 		return err;
++ 	}
++ 
++ 	/* The bootloader will not indicate when the device is ready. This
++ 	 * is done by the operational firmware sending bootup notification.
++ 	 *
++ 	 * Booting into operational firmware should not take longer than
++ 	 * 1 second. However if that happens, then just fail the setup
++ 	 * since something went wrong.
++ 	 */
++ 	err = btusb_boot_wait(hdev, calltime, 1000);
++ 	if (err == -ETIMEDOUT)
++ 		btintel_reset_to_bootloader(hdev);
++ 
++ 	return err;
++ }
++ 
++ static int btusb_setup_intel_new(struct hci_dev *hdev)
++ {
++ 	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	struct intel_version ver;
++ 	struct intel_boot_params params;
++ 	u32 boot_param;
++ 	char ddcname[64];
++ 	int err;
++ 	struct intel_debug_features features;
++ 
++ 	BT_DBG("%s", hdev->name);
++ 
++ 	/* Set the default boot parameter to 0x0 and it is updated to
++ 	 * SKU specific boot parameter after reading Intel_Write_Boot_Params
++ 	 * command while downloading the firmware.
++ 	 */
++ 	boot_param = 0x00000000;
++ 
++ 	/* Read the Intel version information to determine if the device
++ 	 * is in bootloader mode or if it already has operational firmware
++ 	 * loaded.
++ 	 */
++ 	err = btintel_read_version(hdev, &ver);
++ 	if (err) {
++ 		bt_dev_err(hdev, "Intel Read version failed (%d)", err);
++ 		btintel_reset_to_bootloader(hdev);
++ 		return err;
++ 	}
++ 
++ 	err = btintel_version_info(hdev, &ver);
++ 	if (err)
++ 		return err;
++ 
++ 	err = btusb_intel_download_firmware(hdev, &ver, &params, &boot_param);
++ 	if (err)
++ 		return err;
++ 
++ 	/* controller is already having an operational firmware */
++ 	if (ver.fw_variant == 0x23)
++ 		goto finish;
++ 
++ 	err = btusb_intel_boot(hdev, boot_param);
++ 	if (err)
++ 		return err;
++ 
++ 	clear_bit(BTUSB_BOOTLOADER, &data->flags);
++ 
++ 	err = btusb_setup_intel_new_get_fw_name(&ver, &params, ddcname,
++ 						sizeof(ddcname), "ddc");
++ 
++ 	if (err < 0) {
++ 		bt_dev_err(hdev, "Unsupported Intel firmware naming");
++ 	} else {
++ 		/* Once the device is running in operational mode, it needs to
++ 		 * apply the device configuration (DDC) parameters.
++ 		 *
++ 		 * The device can work without DDC parameters, so even if it
++ 		 * fails to load the file, no need to fail the setup.
++ 		 */
++ 		btintel_load_ddc_config(hdev, ddcname);
++ 	}
++ 
++ 	/* Read the Intel supported features and if new exception formats
++ 	 * supported, need to load the additional DDC config to enable.
++ 	 */
++ 	err = btintel_read_debug_features(hdev, &features);
++ 	if (!err) {
++ 		/* Set DDC mask for available debug features */
++ 		btintel_set_debug_features(hdev, &features);
++ 	}
++ 
++ 	/* Read the Intel version information after loading the FW  */
++ 	err = btintel_read_version(hdev, &ver);
++ 	if (err)
++ 		return err;
++ 
++ 	btintel_version_info(hdev, &ver);
++ 
++ finish:
++ 	/* All Intel controllers that support the Microsoft vendor
++ 	 * extension are using 0xFC1E for VsMsftOpCode.
++ 	 */
++ 	switch (ver.hw_variant) {
++ 	case 0x11:	/* JfP */
++ 	case 0x12:	/* ThP */
++ 	case 0x13:	/* HrP */
++ 	case 0x14:	/* CcP */
++ 		hci_set_msft_opcode(hdev, 0xFC1E);
++ 		break;
++ 	}
++ 
++ 	/* Set the event mask for Intel specific vendor events. This enables
++ 	 * a few extra events that are useful during general operation. It
++ 	 * does not enable any debugging related events.
++ 	 *
++ 	 * The device will function correctly without these events enabled
++ 	 * and thus no need to fail the setup.
++ 	 */
++ 	btintel_set_event_mask(hdev, false);
++ 
++ 	return 0;
++ }
++ 
++ static int btusb_setup_intel_newgen(struct hci_dev *hdev)
++ {
++ 	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	u32 boot_param;
++ 	char ddcname[64];
++ 	int err;
++ 	struct intel_debug_features features;
++ 	struct intel_version_tlv version;
++ 
++ 	bt_dev_dbg(hdev, "");
++ 
++ 	/* Set the default boot parameter to 0x0 and it is updated to
++ 	 * SKU specific boot parameter after reading Intel_Write_Boot_Params
++ 	 * command while downloading the firmware.
++ 	 */
++ 	boot_param = 0x00000000;
++ 
++ 	/* Read the Intel version information to determine if the device
++ 	 * is in bootloader mode or if it already has operational firmware
++ 	 * loaded.
++ 	 */
++ 	err = btintel_read_version_tlv(hdev, &version);
++ 	if (err) {
++ 		bt_dev_err(hdev, "Intel Read version failed (%d)", err);
++ 		btintel_reset_to_bootloader(hdev);
++ 		return err;
++ 	}
++ 
++ 	err = btintel_version_info_tlv(hdev, &version);
++ 	if (err)
++ 		return err;
++ 
++ 	err = btusb_intel_download_firmware_newgen(hdev, &version, &boot_param);
++ 	if (err)
++ 		return err;
++ 
++ 	/* check if controller is already having an operational firmware */
++ 	if (version.img_type == 0x03)
++ 		goto finish;
++ 
++ 	err = btusb_intel_boot(hdev, boot_param);
++ 	if (err)
++ 		return err;
++ 
++ 	clear_bit(BTUSB_BOOTLOADER, &data->flags);
++ 
++ 	btusb_setup_intel_newgen_get_fw_name(&version, ddcname, sizeof(ddcname),
++ 					     "ddc");
++ 	/* Once the device is running in operational mode, it needs to
++ 	 * apply the device configuration (DDC) parameters.
++ 	 *
++ 	 * The device can work without DDC parameters, so even if it
++ 	 * fails to load the file, no need to fail the setup.
++ 	 */
++ 	btintel_load_ddc_config(hdev, ddcname);
++ 
++ 	/* Read the Intel supported features and if new exception formats
++ 	 * supported, need to load the additional DDC config to enable.
++ 	 */
++ 	err = btintel_read_debug_features(hdev, &features);
++ 	if (!err) {
++ 		/* Set DDC mask for available debug features */
++ 		btintel_set_debug_features(hdev, &features);
++ 	}
++ 
++ 	/* Read the Intel version information after loading the FW  */
++ 	err = btintel_read_version_tlv(hdev, &version);
++ 	if (err)
++ 		return err;
++ 
++ 	btintel_version_info_tlv(hdev, &version);
++ 
++ finish:
++ 	/* All Intel new genration controllers support the Microsoft vendor
++ 	 * extension are using 0xFC1E for VsMsftOpCode.
++ 	 */
++ 	switch (INTEL_HW_VARIANT(version.cnvi_bt)) {
++ 	case 0x17:
++ 	case 0x18:
++ 	case 0x19:
++ 		hci_set_msft_opcode(hdev, 0xFC1E);
++ 		break;
++ 	}
++ 
++ 	/* Set the event mask for Intel specific vendor events. This enables
++ 	 * a few extra events that are useful during general operation. It
++ 	 * does not enable any debugging related events.
++ 	 *
++ 	 * The device will function correctly without these events enabled
++ 	 * and thus no need to fail the setup.
++ 	 */
++ 	btintel_set_event_mask(hdev, false);
++ 
++ 	return 0;
++ }
++ static int btusb_shutdown_intel(struct hci_dev *hdev)
++ {
++ 	struct sk_buff *skb;
++ 	long ret;
++ 
++ 	/* In the shutdown sequence where Bluetooth is turned off followed
++ 	 * by WiFi being turned off, turning WiFi back on causes issue with
++ 	 * the RF calibration.
++ 	 *
++ 	 * To ensure that any RF activity has been stopped, issue HCI Reset
++ 	 * command to clear all ongoing activity including advertising,
++ 	 * scanning etc.
++ 	 */
++ 	skb = __hci_cmd_sync(hdev, HCI_OP_RESET, 0, NULL, HCI_INIT_TIMEOUT);
++ 	if (IS_ERR(skb)) {
++ 		ret = PTR_ERR(skb);
++ 		bt_dev_err(hdev, "HCI reset during shutdown failed");
++ 		return ret;
++ 	}
++ 	kfree_skb(skb);
++ 
++ 	/* Some platforms have an issue with BT LED when the interface is
++ 	 * down or BT radio is turned off, which takes 5 seconds to BT LED
++ 	 * goes off. This command turns off the BT LED immediately.
++ 	 */
++ 	skb = __hci_cmd_sync(hdev, 0xfc3f, 0, NULL, HCI_INIT_TIMEOUT);
++ 	if (IS_ERR(skb)) {
++ 		ret = PTR_ERR(skb);
++ 		bt_dev_err(hdev, "turning off Intel device LED failed");
++ 		return ret;
++ 	}
++ 	kfree_skb(skb);
++ 
++ 	return 0;
++ }
++ 
++ static int btusb_shutdown_intel_new(struct hci_dev *hdev)
++ {
++ 	struct sk_buff *skb;
++ 
++ 	/* Send HCI Reset to the controller to stop any BT activity which
++ 	 * were triggered. This will help to save power and maintain the
++ 	 * sync b/w Host and controller
++ 	 */
++ 	skb = __hci_cmd_sync(hdev, HCI_OP_RESET, 0, NULL, HCI_INIT_TIMEOUT);
++ 	if (IS_ERR(skb)) {
++ 		bt_dev_err(hdev, "HCI reset during shutdown failed");
++ 		return PTR_ERR(skb);
++ 	}
++ 	kfree_skb(skb);
++ 
++ 	return 0;
++ }
++ 
++ /* UHW CR mapping */
++ #define MTK_BT_MISC		0x70002510
++ #define MTK_BT_SUBSYS_RST	0x70002610
++ #define MTK_UDMA_INT_STA_BT	0x74000024
++ #define MTK_UDMA_INT_STA_BT1	0x74000308
++ #define MTK_BT_WDT_STATUS	0x740003A0
++ #define MTK_EP_RST_OPT		0x74011890
++ #define MTK_EP_RST_IN_OUT_OPT	0x00010001
++ #define MTK_BT_RST_DONE		0x00000100
++ #define MTK_BT_RESET_WAIT_MS	100
++ #define MTK_BT_RESET_NUM_TRIES	10
+++>>>>>>> e947802657cb (Bluetooth: btusb: Support Bluetooth Reset for Mediatek Chip(MT7921))
+  #define FIRMWARE_MT7663		"mediatek/mt7663pr2h.bin"
+  #define FIRMWARE_MT7668		"mediatek/mt7668pr2h.bin"
+  
+@@@ -2884,6 -3959,82 +3628,85 @@@ static int btusb_mtk_shutdown(struct hc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void btusb_mtk_cmd_timeout(struct hci_dev *hdev)
++ {
++ 	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	u32 val;
++ 	int err, retry = 0;
++ 
++ 	/* It's MediaTek specific bluetooth reset mechanism via USB */
++ 	if (test_and_set_bit(BTUSB_HW_RESET_ACTIVE, &data->flags)) {
++ 		bt_dev_err(hdev, "last reset failed? Not resetting again");
++ 		return;
++ 	}
++ 
++ 	err = usb_autopm_get_interface(data->intf);
++ 	if (err < 0)
++ 		return;
++ 
++ 	btusb_stop_traffic(data);
++ 	usb_kill_anchored_urbs(&data->tx_anchor);
++ 
++ 	/* It's Device EndPoint Reset Option Register */
++ 	bt_dev_dbg(hdev, "Initiating reset mechanism via uhw");
++ 	btusb_mtk_uhw_reg_write(data, MTK_EP_RST_OPT, MTK_EP_RST_IN_OUT_OPT);
++ 	btusb_mtk_uhw_reg_read(data, MTK_BT_WDT_STATUS, &val);
++ 
++ 	/* Reset the bluetooth chip via USB interface. */
++ 	btusb_mtk_uhw_reg_write(data, MTK_BT_SUBSYS_RST, 1);
++ 	btusb_mtk_uhw_reg_write(data, MTK_UDMA_INT_STA_BT, 0x000000FF);
++ 	btusb_mtk_uhw_reg_read(data, MTK_UDMA_INT_STA_BT, &val);
++ 	btusb_mtk_uhw_reg_write(data, MTK_UDMA_INT_STA_BT1, 0x000000FF);
++ 	btusb_mtk_uhw_reg_read(data, MTK_UDMA_INT_STA_BT1, &val);
++ 	/* MT7921 need to delay 20ms between toggle reset bit */
++ 	msleep(20);
++ 	btusb_mtk_uhw_reg_write(data, MTK_BT_SUBSYS_RST, 0);
++ 	btusb_mtk_uhw_reg_read(data, MTK_BT_SUBSYS_RST, &val);
++ 
++ 	/* Poll the register until reset is completed */
++ 	do {
++ 		btusb_mtk_uhw_reg_read(data, MTK_BT_MISC, &val);
++ 		if (val & MTK_BT_RST_DONE) {
++ 			bt_dev_dbg(hdev, "Bluetooth Reset Successfully");
++ 			break;
++ 		}
++ 
++ 		bt_dev_dbg(hdev, "Polling Bluetooth Reset CR");
++ 		retry++;
++ 		msleep(MTK_BT_RESET_WAIT_MS);
++ 	} while (retry < MTK_BT_RESET_NUM_TRIES);
++ 
++ 	btusb_mtk_id_get(data, 0x70010200, &val);
++ 	if (!val)
++ 		bt_dev_err(hdev, "Can't get device id, subsys reset fail.");
++ 
++ 	usb_queue_reset_device(data->intf);
++ 
++ 	clear_bit(BTUSB_HW_RESET_ACTIVE, &data->flags);
++ }
++ 
++ static int btusb_recv_acl_mtk(struct hci_dev *hdev, struct sk_buff *skb)
++ {
++ 	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	u16 handle = le16_to_cpu(hci_acl_hdr(skb)->handle);
++ 
++ 	switch (handle) {
++ 	case 0xfc6f:		/* Firmware dump from device */
++ 		/* When the firmware hangs, the device can no longer
++ 		 * suspend and thus disable auto-suspend.
++ 		 */
++ 		usb_disable_autosuspend(data->udev);
++ 	case 0x05ff:		/* Firmware debug logging 1 */
++ 	case 0x05fe:		/* Firmware debug logging 2 */
++ 		return hci_recv_diag(hdev, skb);
++ 	}
++ 
++ 	return hci_recv_frame(hdev, skb);
++ }
++ 
+++>>>>>>> e947802657cb (Bluetooth: btusb: Support Bluetooth Reset for Mediatek Chip(MT7921))
+  MODULE_FIRMWARE(FIRMWARE_MT7663);
+  MODULE_FIRMWARE(FIRMWARE_MT7668);
+  
+@@@ -3730,7 -4866,9 +4553,8 @@@ static int btusb_probe(struct usb_inter
+  		hdev->setup = btusb_mtk_setup;
+  		hdev->shutdown = btusb_mtk_shutdown;
+  		hdev->manufacturer = 70;
++ 		hdev->cmd_timeout = btusb_mtk_cmd_timeout;
+  		set_bit(HCI_QUIRK_NON_PERSISTENT_SETUP, &hdev->quirks);
+ -		data->recv_acl = btusb_recv_acl_mtk;
+  	}
+  
+  	if (id->driver_info & BTUSB_SWAVE) {
+* Unmerged path drivers/bluetooth/btusb.c
