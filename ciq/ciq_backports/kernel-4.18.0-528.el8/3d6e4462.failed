@@ -1,0 +1,259 @@
+kunit: unify module and builtin suite definitions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-528.el8
+commit-author Jeremy Kerr <jk@codeconstruct.com.au>
+commit 3d6e44623841c8b82c2157f2f749019803fb238a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-528.el8/3d6e4462.failed
+
+Currently, KUnit runs built-in tests and tests loaded from modules
+differently. For built-in tests, the kunit_test_suite{,s}() macro adds a
+list of suites in the .kunit_test_suites linker section. However, for
+kernel modules, a module_init() function is used to run the test suites.
+
+This causes problems if tests are included in a module which already
+defines module_init/exit_module functions, as they'll conflict with the
+kunit-provided ones.
+
+This change removes the kunit-defined module inits, and instead parses
+the kunit tests from their own section in the module. After module init,
+we call __kunit_test_suites_init() on the contents of that section,
+which prepares and runs the suite.
+
+This essentially unifies the module- and non-module kunit init formats.
+
+	Tested-by: Maíra Canal <maira.canal@usp.br>
+	Reviewed-by: Brendan Higgins <brendanhiggins@google.com>
+	Signed-off-by: Jeremy Kerr <jk@codeconstruct.com.au>
+	Signed-off-by: Daniel Latypov <dlatypov@google.com>
+	Signed-off-by: David Gow <davidgow@google.com>
+	Signed-off-by: Shuah Khan <skhan@linuxfoundation.org>
+(cherry picked from commit 3d6e44623841c8b82c2157f2f749019803fb238a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/module.h
+#	kernel/module.c
+diff --cc include/linux/module.h
+index b829b1e7366e,2490223c975d..000000000000
+--- a/include/linux/module.h
++++ b/include/linux/module.h
+@@@ -452,6 -495,21 +452,24 @@@ struct module 
+  	unsigned int num_ftrace_callsites;
+  	unsigned long *ftrace_callsites;
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KPROBES
++ 	void *kprobes_text_start;
++ 	unsigned int kprobes_text_size;
++ 	unsigned long *kprobe_blacklist;
++ 	unsigned int num_kprobe_blacklist;
++ #endif
++ #ifdef CONFIG_HAVE_STATIC_CALL_INLINE
++ 	int num_static_call_sites;
++ 	struct static_call_site *static_call_sites;
++ #endif
++ #if IS_ENABLED(CONFIG_KUNIT)
++ 	int num_kunit_suites;
++ 	struct kunit_suite ***kunit_suites;
++ #endif
++ 
+++>>>>>>> 3d6e44623841 (kunit: unify module and builtin suite definitions)
+  
+  #ifdef CONFIG_LIVEPATCH
+  	bool klp; /* Is this a livepatch module? */
+diff --cc kernel/module.c
+index e06acf01f809,324a770f789c..000000000000
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@@ -3180,6 -2077,29 +3180,32 @@@ static int find_module_sections(struct 
+  					    sizeof(*mod->ei_funcs),
+  					    &mod->num_ei_funcs);
+  #endif
+++<<<<<<< HEAD:kernel/module.c
+++=======
++ #ifdef CONFIG_KPROBES
++ 	mod->kprobes_text_start = section_objs(info, ".kprobes.text", 1,
++ 						&mod->kprobes_text_size);
++ 	mod->kprobe_blacklist = section_objs(info, "_kprobe_blacklist",
++ 						sizeof(unsigned long),
++ 						&mod->num_kprobe_blacklist);
++ #endif
++ #ifdef CONFIG_PRINTK_INDEX
++ 	mod->printk_index_start = section_objs(info, ".printk_index",
++ 					       sizeof(*mod->printk_index_start),
++ 					       &mod->printk_index_size);
++ #endif
++ #ifdef CONFIG_HAVE_STATIC_CALL_INLINE
++ 	mod->static_call_sites = section_objs(info, ".static_call_sites",
++ 					      sizeof(*mod->static_call_sites),
++ 					      &mod->num_static_call_sites);
++ #endif
++ #ifdef CONFIG_KUNIT
++ 	mod->kunit_suites = section_objs(info, ".kunit_test_suites",
++ 					      sizeof(*mod->kunit_suites),
++ 					      &mod->num_kunit_suites);
++ #endif
++ 
+++>>>>>>> 3d6e44623841 (kunit: unify module and builtin suite definitions):kernel/module/main.c
+  	mod->extable = section_objs(info, "__ex_table",
+  				    sizeof(*mod->extable), &mod->num_exentries);
+  
+diff --git a/include/kunit/test.h b/include/kunit/test.h
+index 4ee4bb73f10e..dd915a3d2c97 100644
+--- a/include/kunit/test.h
++++ b/include/kunit/test.h
+@@ -240,42 +240,9 @@ static inline int kunit_run_all_tests(void)
+ }
+ #endif /* IS_BUILTIN(CONFIG_KUNIT) */
+ 
+-#ifdef MODULE
+-/**
+- * kunit_test_suites_for_module() - used to register one or more
+- *			 &struct kunit_suite with KUnit.
+- *
+- * @__suites: a statically allocated list of &struct kunit_suite.
+- *
+- * Registers @__suites with the test framework. See &struct kunit_suite for
+- * more information.
+- *
+- * If a test suite is built-in, module_init() gets translated into
+- * an initcall which we don't want as the idea is that for builtins
+- * the executor will manage execution.  So ensure we do not define
+- * module_{init|exit} functions for the builtin case when registering
+- * suites via kunit_test_suites() below.
+- */
+-#define kunit_test_suites_for_module(__suites)				\
+-	static int __init kunit_test_suites_init(void)			\
+-	{								\
+-		return __kunit_test_suites_init(__suites);		\
+-	}								\
+-	module_init(kunit_test_suites_init);				\
+-									\
+-	static void __exit kunit_test_suites_exit(void)			\
+-	{								\
+-		return __kunit_test_suites_exit(__suites);		\
+-	}								\
+-	module_exit(kunit_test_suites_exit)				\
+-	MODULE_INFO(test, "Y");
+-#else
+-#define kunit_test_suites_for_module(__suites)
+-#endif /* MODULE */
+-
+ #define __kunit_test_suites(unique_array, unique_suites, ...)		       \
++	MODULE_INFO(test, "Y");						       \
+ 	static struct kunit_suite *unique_array[] = { __VA_ARGS__, NULL };     \
+-	kunit_test_suites_for_module(unique_array);			       \
+ 	static struct kunit_suite **unique_suites			       \
+ 	__used __section(.kunit_test_suites) = unique_array
+ 
+@@ -285,16 +252,12 @@ static inline int kunit_run_all_tests(void)
+  *
+  * @__suites: a statically allocated list of &struct kunit_suite.
+  *
+- * Registers @suites with the test framework. See &struct kunit_suite for
+- * more information.
+- *
+- * When builtin,  KUnit tests are all run via executor; this is done
+- * by placing the array of struct kunit_suite * in the .kunit_test_suites
+- * ELF section.
++ * Registers @suites with the test framework.
++ * This is done by placing the array of struct kunit_suite * in the
++ * .kunit_test_suites ELF section.
+  *
+- * An alternative is to build the tests as a module.  Because modules do not
+- * support multiple initcall()s, we need to initialize an array of suites for a
+- * module.
++ * When builtin, KUnit tests are all run via the executor at boot, and when
++ * built as a module, they run on module load.
+  *
+  */
+ #define kunit_test_suites(__suites...)						\
+* Unmerged path include/linux/module.h
+* Unmerged path kernel/module.c
+diff --git a/lib/kunit/test.c b/lib/kunit/test.c
+index ee37631c8bdf..0f9aaa7ba5c0 100644
+--- a/lib/kunit/test.c
++++ b/lib/kunit/test.c
+@@ -10,6 +10,7 @@
+ #include <kunit/test.h>
+ #include <kunit/test-bug.h>
+ #include <linux/kernel.h>
++#include <linux/module.h>
+ #include <linux/moduleparam.h>
+ #include <linux/panic.h>
+ #include <linux/sched/debug.h>
+@@ -613,6 +614,49 @@ void __kunit_test_suites_exit(struct kunit_suite **suites)
+ }
+ EXPORT_SYMBOL_GPL(__kunit_test_suites_exit);
+ 
++#ifdef CONFIG_MODULES
++static void kunit_module_init(struct module *mod)
++{
++	unsigned int i;
++
++	for (i = 0; i < mod->num_kunit_suites; i++)
++		__kunit_test_suites_init(mod->kunit_suites[i]);
++}
++
++static void kunit_module_exit(struct module *mod)
++{
++	unsigned int i;
++
++	for (i = 0; i < mod->num_kunit_suites; i++)
++		__kunit_test_suites_exit(mod->kunit_suites[i]);
++}
++
++static int kunit_module_notify(struct notifier_block *nb, unsigned long val,
++			       void *data)
++{
++	struct module *mod = data;
++
++	switch (val) {
++	case MODULE_STATE_LIVE:
++		kunit_module_init(mod);
++		break;
++	case MODULE_STATE_GOING:
++		kunit_module_exit(mod);
++		break;
++	case MODULE_STATE_COMING:
++	case MODULE_STATE_UNFORMED:
++		break;
++	}
++
++	return 0;
++}
++
++static struct notifier_block kunit_mod_nb = {
++	.notifier_call = kunit_module_notify,
++	.priority = 0,
++};
++#endif
++
+ struct kunit_kmalloc_array_params {
+ 	size_t n;
+ 	size_t size;
+@@ -707,13 +751,19 @@ EXPORT_SYMBOL_GPL(kunit_cleanup);
+ static int __init kunit_init(void)
+ {
+ 	kunit_debugfs_init();
+-
++#ifdef CONFIG_MODULES
++	return register_module_notifier(&kunit_mod_nb);
++#else
+ 	return 0;
++#endif
+ }
+ late_initcall(kunit_init);
+ 
+ static void __exit kunit_exit(void)
+ {
++#ifdef CONFIG_MODULES
++	unregister_module_notifier(&kunit_mod_nb);
++#endif
+ 	kunit_debugfs_cleanup();
+ }
+ module_exit(kunit_exit);
