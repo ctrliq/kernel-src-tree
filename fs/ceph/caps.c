@@ -430,7 +430,7 @@ void ceph_reservation_status(struct ceph_fs_client *fsc,
  *
  * Called with i_ceph_lock held.
  */
-static struct ceph_cap *__get_cap_for_mds(struct ceph_inode_info *ci, int mds)
+struct ceph_cap *__get_cap_for_mds(struct ceph_inode_info *ci, int mds)
 {
 	struct ceph_cap *cap;
 	struct rb_node *n = ci->i_caps.rb_node;
@@ -3096,6 +3096,12 @@ static void __ceph_put_cap_refs(struct ceph_inode_info *ci, int had,
 	}
 	if (had & CEPH_CAP_FILE_WR) {
 		if (--ci->i_wr_ref == 0) {
+			/*
+			 * The Fb caps will always be took and released
+			 * together with the Fw caps.
+			 */
+			WARN_ON_ONCE(ci->i_wb_ref);
+
 			last++;
 			check_flushsnaps = true;
 			if (ci->i_wrbuffer_ref_head == 0 &&

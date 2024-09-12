@@ -1459,6 +1459,11 @@ struct super_block {
 	char			s_id[32];	/* Informational name */
 	uuid_t			s_uuid;		/* UUID */
 
+	/*
+	 * Keep s_fs_info, s_time_gran, s_fsnotify_mask, and
+	 * s_fsnotify_marks together for cache efficiency. They are frequently
+	 * accessed and rarely modified.
+	 */
 	void 			*s_fs_info;	/* Filesystem private info */
 	unsigned int		s_max_links;
 	fmode_t			s_mode;
@@ -1467,11 +1472,19 @@ struct super_block {
 	   Cannot be worse than a second */
 	u32		   s_time_gran;
 
+#ifdef CONFIG_FSNOTIFY
+	RH_KABI_REPLACE(struct mutex s_vfs_rename_mutex,
+		struct {
+			__u32 s_fsnotify_mask;
+			struct fsnotify_mark_connector __rcu *s_fsnotify_marks;
+		})
+#else
 	/*
 	 * The next field is for VFS *only*. No filesystems have any business
 	 * even looking at it. You had been warned.
 	 */
 	struct mutex s_vfs_rename_mutex;	/* Kludge */
+#endif
 
 	/*
 	 * Filesystem subtype.  If non-empty the filesystem type field
@@ -1549,6 +1562,9 @@ struct super_block {
 	/* Time limits for c/m/atime in seconds */
 	RH_KABI_EXTEND(time64_t	s_time_min)
 	RH_KABI_EXTEND(time64_t	s_time_max)
+#ifdef CONFIG_FSNOTIFY
+	RH_KABI_EXTEND(struct mutex s_vfs_rename_mutex)
+#endif
 } __randomize_layout;
 
 /* Helper functions so that in most cases filesystems will
