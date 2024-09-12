@@ -1,0 +1,101 @@
+iomap: Support partial direct I/O on user copy failures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.16.1.el8_6
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 97308f8b0d867e9ef59528cd97f0db55ffdf5651
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.16.1.el8_6/97308f8b.failed
+
+In iomap_dio_rw, when iomap_apply returns an -EFAULT error and the
+IOMAP_DIO_PARTIAL flag is set, complete the request synchronously and
+return a partial result.  This allows the caller to deal with the page
+fault and retry the remainder of the request.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 97308f8b0d867e9ef59528cd97f0db55ffdf5651)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/iomap/direct-io.c
+diff --cc fs/iomap/direct-io.c
+index 3fa253649e1f,a434fb7887b2..000000000000
+--- a/fs/iomap/direct-io.c
++++ b/fs/iomap/direct-io.c
+@@@ -526,31 -569,29 +526,53 @@@ __iomap_dio_rw(struct kiocb *iocb, stru
+  	inode_dio_begin(inode);
+  
+  	blk_start_plug(&plug);
+ -	while ((ret = iomap_iter(&iomi, ops)) > 0)
+ -		iomi.processed = iomap_dio_iter(&iomi, dio);
+ +	do {
+ +		ret = iomap_apply(inode, pos, count, iomap_flags, ops, dio,
+ +				iomap_dio_actor);
+ +		if (ret <= 0) {
+ +			/* magic error code to fall back to buffered I/O */
+ +			if (ret == -ENOTBLK) {
+ +				wait_for_completion = true;
+ +				ret = 0;
+ +			}
+ +			break;
+ +		}
+ +		pos += ret;
+ +
+ +		if (iov_iter_rw(iter) == READ && pos >= dio->i_size) {
+ +			/*
+ +			 * We only report that we've read data up to i_size.
+ +			 * Revert iter to a state corresponding to that as
+ +			 * some callers (such as splice code) rely on it.
+ +			 */
+ +			iov_iter_revert(iter, pos - dio->i_size);
+ +			break;
+ +		}
+ +	} while ((count = iov_iter_count(iter)) > 0);
+  	blk_finish_plug(&plug);
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * We only report that we've read data up to i_size.
++ 	 * Revert iter to a state corresponding to that as some callers (such
++ 	 * as the splice code) rely on it.
++ 	 */
++ 	if (iov_iter_rw(iter) == READ && iomi.pos >= dio->i_size)
++ 		iov_iter_revert(iter, iomi.pos - dio->i_size);
++ 
++ 	if (ret == -EFAULT && dio->size && (dio_flags & IOMAP_DIO_PARTIAL)) {
++ 		if (!(iocb->ki_flags & IOCB_NOWAIT))
++ 			wait_for_completion = true;
++ 		ret = 0;
++ 	}
++ 
++ 	/* magic error code to fall back to buffered I/O */
++ 	if (ret == -ENOTBLK) {
++ 		wait_for_completion = true;
++ 		ret = 0;
++ 	}
+++>>>>>>> 97308f8b0d86 (iomap: Support partial direct I/O on user copy failures)
+  	if (ret < 0)
+  		iomap_dio_set_error(dio, ret);
+  
+* Unmerged path fs/iomap/direct-io.c
+diff --git a/include/linux/iomap.h b/include/linux/iomap.h
+index 772636bbbed8..2b302a608d53 100644
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@ -292,6 +292,13 @@ struct iomap_dio_ops {
+   */
+ #define IOMAP_DIO_OVERWRITE_ONLY	(1 << 1)
+ 
++/*
++ * When a page fault occurs, return a partial synchronous result and allow
++ * the caller to retry the rest of the operation after dealing with the page
++ * fault.
++ */
++#define IOMAP_DIO_PARTIAL		(1 << 2)
++
+ ssize_t iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
+ 		const struct iomap_ops *ops, const struct iomap_dio_ops *dops,
+ 		unsigned int dio_flags);
