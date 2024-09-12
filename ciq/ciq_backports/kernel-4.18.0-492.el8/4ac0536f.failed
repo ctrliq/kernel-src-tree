@@ -1,0 +1,136 @@
+cifs: set a minimum of 120s for next dns resolution
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-492.el8
+commit-author Paulo Alcantara <pc@cjr.nz>
+commit 4ac0536f8874a903a72bddc57eb88db774261e3a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-492.el8/4ac0536f.failed
+
+With commit 506c1da44fee ("cifs: use the expiry output of dns_query to
+schedule next resolution") and after triggering the first reconnect,
+the next async dns resolution of tcp server's hostname would be
+scheduled based on dns_resolver's key expiry default, which happens to
+default to 5s on most systems that use key.dns_resolver for upcall.
+
+As per key.dns_resolver.conf(5):
+
+       default_ttl=<number>
+              The  number  of  seconds  to  set  as the expiration on a cached
+              record.  This will be overridden if the program manages  to  re-
+              trieve  TTL  information along with the addresses (if, for exam-
+              ple, it accesses the DNS directly).  The default is  5  seconds.
+              The value must be in the range 1 to INT_MAX.
+
+Make the next async dns resolution no shorter than 120s as we do not
+want to be upcalling too often.
+
+	Cc: stable@vger.kernel.org
+Fixes: 506c1da44fee ("cifs: use the expiry output of dns_query to schedule next resolution")
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@cjr.nz>
+	Reviewed-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 4ac0536f8874a903a72bddc57eb88db774261e3a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsglob.h
+#	fs/cifs/connect.c
+diff --cc fs/cifs/cifsglob.h
+index b66b0561a1f4,102a4a2b734d..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -83,6 -76,10 +83,13 @@@
+  #define SMB_ECHO_INTERVAL_MAX 600
+  #define SMB_ECHO_INTERVAL_DEFAULT 60
+  
+++<<<<<<< HEAD
+++=======
++ /* dns resolution intervals in seconds */
++ #define SMB_DNS_RESOLVE_INTERVAL_MIN     120
++ #define SMB_DNS_RESOLVE_INTERVAL_DEFAULT 600
++ 
+++>>>>>>> 4ac0536f8874 (cifs: set a minimum of 120s for next dns resolution)
+  /* maximum number of PDUs in one compound */
+  #define MAX_COMPOUND 5
+  
+diff --cc fs/cifs/connect.c
+index 98c5e4ffa45a,6278a90cb027..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -119,43 -107,38 +119,64 @@@ static int reconn_set_ipaddr_from_hostn
+  	spin_unlock(&cifs_tcp_ses_lock);
+  	kfree(ipaddr);
+  
+++<<<<<<< HEAD
+ +	return !rc ? -1 : 0;
+++=======
++ 	/* rc == 1 means success here */
++ 	if (rc) {
++ 		now = ktime_get_real_seconds();
++ 		if (expiry && expiry > now)
++ 			/*
++ 			 * To make sure we don't use the cached entry, retry 1s
++ 			 * after expiry.
++ 			 */
++ 			ttl = max_t(unsigned long, expiry - now, SMB_DNS_RESOLVE_INTERVAL_MIN) + 1;
++ 	}
++ 	rc = !rc ? -1 : 0;
++ 
++ requeue_resolve:
++ 	cifs_dbg(FYI, "%s: next dns resolution scheduled for %lu seconds in the future\n",
++ 		 __func__, ttl);
++ 	mod_delayed_work(cifsiod_wq, &server->resolve, (ttl * HZ));
++ 
++ 	return rc;
+++>>>>>>> 4ac0536f8874 (cifs: set a minimum of 120s for next dns resolution)
+  }
+  
+ -
+ -static void cifs_resolve_server(struct work_struct *work)
+ +#ifdef CONFIG_CIFS_DFS_UPCALL
+ +/* These functions must be called with server->srv_mutex held */
+ +static void reconn_set_next_dfs_target(struct TCP_Server_Info *server,
+ +				       struct cifs_sb_info *cifs_sb,
+ +				       struct dfs_cache_tgt_list *tgt_list,
+ +				       struct dfs_cache_tgt_iterator **tgt_it)
+  {
+ +	const char *name;
+  	int rc;
+ -	struct TCP_Server_Info *server = container_of(work,
+ -					struct TCP_Server_Info, resolve.work);
+  
+ -	mutex_lock(&server->srv_mutex);
+ +	if (!cifs_sb || !cifs_sb->origin_fullpath)
+ +		return;
+ +
+ +	if (!*tgt_it) {
+ +		*tgt_it = dfs_cache_get_tgt_iterator(tgt_list);
+ +	} else {
+ +		*tgt_it = dfs_cache_get_next_tgt(tgt_list, *tgt_it);
+ +		if (!*tgt_it)
+ +			*tgt_it = dfs_cache_get_tgt_iterator(tgt_list);
+ +	}
+ +
+ +	cifs_dbg(FYI, "%s: UNC: %s\n", __func__, cifs_sb->origin_fullpath);
+ +
+ +	name = dfs_cache_get_tgt_name(*tgt_it);
+ +
+ +	kfree(server->hostname);
+ +
+ +	server->hostname = extract_hostname(name);
+ +	if (IS_ERR(server->hostname)) {
+ +		cifs_dbg(FYI,
+ +			 "%s: failed to extract hostname from target: %ld\n",
+ +			 __func__, PTR_ERR(server->hostname));
+ +	}
+  
+ -	/*
+ -	 * Resolve the hostname again to make sure that IP address is up-to-date.
+ -	 */
+  	rc = reconn_set_ipaddr_from_hostname(server);
+  	if (rc) {
+  		cifs_dbg(FYI, "%s: failed to resolve hostname: %d\n",
+* Unmerged path fs/cifs/cifsglob.h
+* Unmerged path fs/cifs/connect.c
