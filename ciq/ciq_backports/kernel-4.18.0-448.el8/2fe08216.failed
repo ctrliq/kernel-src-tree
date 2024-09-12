@@ -1,0 +1,262 @@
+ASoC: SOF: Fix potential NULL pointer dereference
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Amadeusz Sławiński <amadeuszx.slawinski@linux.intel.com>
+commit 2fe08216fda33bbc1f80133b8fd560ffd094b987
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/2fe08216.failed
+
+Cleanup path for sof_prepare_widgets_in_path() should check if unprepare
+callback exists before calling it, instead it checks if it does not
+exist. Fix the check.
+
+	Signed-off-by: Amadeusz Sławiński <amadeuszx.slawinski@linux.intel.com>
+	Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Link: https://lore.kernel.org/r/20220602135757.3335351-1-amadeuszx.slawinski@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 2fe08216fda33bbc1f80133b8fd560ffd094b987)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/sof-audio.c
+diff --cc sound/soc/sof/sof-audio.c
+index 7c3fc31d8912,28976098a89e..000000000000
+--- a/sound/soc/sof/sof-audio.c
++++ b/sound/soc/sof/sof-audio.c
+@@@ -419,11 -257,228 +419,230 @@@ static int sof_setup_pipeline_connectio
+  	return 0;
+  }
+  
+ -static void
+ -sof_unprepare_widgets_in_path(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget *widget)
+ +int sof_widget_list_setup(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm, int dir)
+  {
+++<<<<<<< HEAD
+++=======
++ 	const struct sof_ipc_tplg_ops *ipc_tplg_ops = sdev->ipc->ops->tplg;
++ 	const struct sof_ipc_tplg_widget_ops *widget_ops = ipc_tplg_ops->widget;
++ 	struct snd_sof_widget *swidget = widget->dobj.private;
++ 	struct snd_soc_dapm_path *p;
++ 
++ 	if (!widget_ops[widget->id].ipc_unprepare || !swidget->prepared)
++ 		goto sink_unprepare;
++ 
++ 	/* unprepare the source widget */
++ 	widget_ops[widget->id].ipc_unprepare(swidget);
++ 	swidget->prepared = false;
++ 
++ sink_unprepare:
++ 	/* unprepare all widgets in the sink paths */
++ 	snd_soc_dapm_widget_for_each_sink_path(widget, p) {
++ 		if (!p->walking && p->sink->dobj.private) {
++ 			p->walking = true;
++ 			sof_unprepare_widgets_in_path(sdev, p->sink);
++ 			p->walking = false;
++ 		}
++ 	}
++ }
++ 
++ static int
++ sof_prepare_widgets_in_path(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget *widget,
++ 			    struct snd_pcm_hw_params *fe_params,
++ 			    struct snd_sof_platform_stream_params *platform_params,
++ 			    struct snd_pcm_hw_params *pipeline_params, int dir)
++ {
++ 	const struct sof_ipc_tplg_ops *ipc_tplg_ops = sdev->ipc->ops->tplg;
++ 	const struct sof_ipc_tplg_widget_ops *widget_ops = ipc_tplg_ops->widget;
++ 	struct snd_sof_widget *swidget = widget->dobj.private;
++ 	struct snd_soc_dapm_path *p;
++ 	int ret;
++ 
++ 	if (!widget_ops[widget->id].ipc_prepare || swidget->prepared)
++ 		goto sink_prepare;
++ 
++ 	/* prepare the source widget */
++ 	ret = widget_ops[widget->id].ipc_prepare(swidget, fe_params, platform_params,
++ 					     pipeline_params, dir);
++ 	if (ret < 0) {
++ 		dev_err(sdev->dev, "failed to prepare widget %s\n", widget->name);
++ 		return ret;
++ 	}
++ 
++ 	swidget->prepared = true;
++ 
++ sink_prepare:
++ 	/* prepare all widgets in the sink paths */
++ 	snd_soc_dapm_widget_for_each_sink_path(widget, p) {
++ 		if (!p->walking && p->sink->dobj.private) {
++ 			p->walking = true;
++ 			ret = sof_prepare_widgets_in_path(sdev, p->sink,  fe_params,
++ 							  platform_params, pipeline_params, dir);
++ 			p->walking = false;
++ 			if (ret < 0) {
++ 				/* unprepare the source widget */
++ 				if (widget_ops[widget->id].ipc_unprepare && swidget->prepared) {
++ 					widget_ops[widget->id].ipc_unprepare(swidget);
++ 					swidget->prepared = false;
++ 				}
++ 				return ret;
++ 			}
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * free all widgets in the sink path starting from the source widget
++  * (DAI type for capture, AIF type for playback)
++  */
++ static int sof_free_widgets_in_path(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget *widget,
++ 				    int dir)
++ {
++ 	struct snd_soc_dapm_path *p;
++ 	int err;
++ 	int ret = 0;
++ 
++ 	/* free all widgets even in case of error to keep use counts balanced */
++ 	snd_soc_dapm_widget_for_each_sink_path(widget, p) {
++ 		if (!p->walking && p->sink->dobj.private && widget->dobj.private) {
++ 			p->walking = true;
++ 			if (WIDGET_IS_AIF_OR_DAI(widget->id)) {
++ 				err = sof_widget_free(sdev, widget->dobj.private);
++ 				if (err < 0)
++ 					ret = err;
++ 			}
++ 
++ 			err = sof_widget_free(sdev, p->sink->dobj.private);
++ 			if (err < 0)
++ 				ret = err;
++ 
++ 			err = sof_free_widgets_in_path(sdev, p->sink, dir);
++ 			if (err < 0)
++ 				ret = err;
++ 			p->walking = false;
++ 		}
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * set up all widgets in the sink path starting from the source widget
++  * (DAI type for capture, AIF type for playback).
++  * The error path in this function ensures that all successfully set up widgets getting freed.
++  */
++ static int sof_set_up_widgets_in_path(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget *widget,
++ 				      int dir)
++ {
++ 	struct snd_soc_dapm_path *p;
++ 	int ret;
++ 
++ 	snd_soc_dapm_widget_for_each_sink_path(widget, p) {
++ 		if (!p->walking && p->sink->dobj.private && widget->dobj.private) {
++ 			p->walking = true;
++ 			if (WIDGET_IS_AIF_OR_DAI(widget->id)) {
++ 				ret = sof_widget_setup(sdev, widget->dobj.private);
++ 				if (ret < 0)
++ 					goto out;
++ 			}
++ 
++ 			ret = sof_widget_setup(sdev, p->sink->dobj.private);
++ 			if (ret < 0) {
++ 				if (WIDGET_IS_AIF_OR_DAI(widget->id))
++ 					sof_widget_free(sdev, widget->dobj.private);
++ 				goto out;
++ 			}
++ 
++ 			ret = sof_set_up_widgets_in_path(sdev, p->sink, dir);
++ 			if (ret < 0) {
++ 				if (WIDGET_IS_AIF_OR_DAI(widget->id))
++ 					sof_widget_free(sdev, widget->dobj.private);
++ 				sof_widget_free(sdev, p->sink->dobj.private);
++ 			}
++ out:
++ 			p->walking = false;
++ 			if (ret < 0)
++ 				return ret;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int
++ sof_walk_widgets_in_order(struct snd_sof_dev *sdev, struct snd_soc_dapm_widget_list *list,
++ 			  struct snd_pcm_hw_params *fe_params,
++ 			  struct snd_sof_platform_stream_params *platform_params, int dir,
++ 			  enum sof_widget_op op)
++ {
++ 	struct snd_soc_dapm_widget *widget;
++ 	char *str;
++ 	int ret = 0;
++ 	int i;
++ 
++ 	for_each_dapm_widgets(list, i, widget) {
++ 		/* starting widget for playback is AIF type */
++ 		if (dir == SNDRV_PCM_STREAM_PLAYBACK && !WIDGET_IS_AIF(widget->id))
++ 			continue;
++ 
++ 		/* starting widget for capture is DAI type */
++ 		if (dir == SNDRV_PCM_STREAM_CAPTURE && !WIDGET_IS_DAI(widget->id))
++ 			continue;
++ 
++ 		switch (op) {
++ 		case SOF_WIDGET_SETUP:
++ 			ret = sof_set_up_widgets_in_path(sdev, widget, dir);
++ 			str = "set up";
++ 			break;
++ 		case SOF_WIDGET_FREE:
++ 			ret = sof_free_widgets_in_path(sdev, widget, dir);
++ 			str = "free";
++ 			break;
++ 		case SOF_WIDGET_PREPARE:
++ 		{
++ 			struct snd_pcm_hw_params pipeline_params;
++ 
++ 			str = "prepare";
++ 			/*
++ 			 * When walking the list of connected widgets, the pipeline_params for each
++ 			 * widget is modified by the source widget in the path. Use a local
++ 			 * copy of the runtime params as the pipeline_params so that the runtime
++ 			 * params does not get overwritten.
++ 			 */
++ 			memcpy(&pipeline_params, fe_params, sizeof(*fe_params));
++ 
++ 			ret = sof_prepare_widgets_in_path(sdev, widget, fe_params,
++ 							  platform_params, &pipeline_params, dir);
++ 			break;
++ 		}
++ 		case SOF_WIDGET_UNPREPARE:
++ 			sof_unprepare_widgets_in_path(sdev, widget);
++ 			break;
++ 		default:
++ 			dev_err(sdev->dev, "Invalid widget op %d\n", op);
++ 			return -EINVAL;
++ 		}
++ 		if (ret < 0) {
++ 			dev_err(sdev->dev, "Failed to %s connected widgets\n", str);
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int sof_widget_list_setup(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm,
++ 			  struct snd_pcm_hw_params *fe_params,
++ 			  struct snd_sof_platform_stream_params *platform_params,
++ 			  int dir)
++ {
++ 	const struct sof_ipc_tplg_ops *ipc_tplg_ops = sdev->ipc->ops->tplg;
+++>>>>>>> 2fe08216fda3 (ASoC: SOF: Fix potential NULL pointer dereference)
+  	struct snd_soc_dapm_widget_list *list = spcm->stream[dir].list;
+  	struct snd_soc_dapm_widget *widget;
+ -	int i, ret;
+ +	int i, ret, num_widgets;
+  
+  	/* nothing to set up */
+  	if (!list)
+* Unmerged path sound/soc/sof/sof-audio.c
