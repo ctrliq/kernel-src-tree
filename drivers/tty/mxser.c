@@ -355,7 +355,7 @@ struct mxser_port {
 	int IER;		/* Interrupt Enable Register */
 	int MCR;		/* Modem control register */
 
-	unsigned char ldisc_stop_rx;
+	bool ldisc_stop_rx;
 
 	int custom_divisor;
 	unsigned char err_shadow;
@@ -1954,7 +1954,7 @@ static void mxser_stoprx(struct tty_struct *tty)
 {
 	struct mxser_port *info = tty->driver_data;
 
-	info->ldisc_stop_rx = 1;
+	info->ldisc_stop_rx = true;
 	if (I_IXOFF(tty)) {
 		if (info->board->chip_flag) {
 			info->IER &= ~MOXA_MUST_RECV_ISR;
@@ -1987,7 +1987,7 @@ static void mxser_unthrottle(struct tty_struct *tty)
 	struct mxser_port *info = tty->driver_data;
 
 	/* startrx */
-	info->ldisc_stop_rx = 0;
+	info->ldisc_stop_rx = false;
 	if (I_IXOFF(tty)) {
 		if (info->x_char)
 			info->x_char = 0;
@@ -2475,7 +2475,7 @@ static int mxser_initbrd(struct mxser_board *brd)
 		tty_port_init(&info->port);
 		info->port.ops = &mxser_port_ops;
 		info->board = brd;
-		info->ldisc_stop_rx = 0;
+		info->ldisc_stop_rx = false;
 
 		/* Enhance mode enabled here */
 		if (brd->chip_flag != MOXA_OTHER_UART)
