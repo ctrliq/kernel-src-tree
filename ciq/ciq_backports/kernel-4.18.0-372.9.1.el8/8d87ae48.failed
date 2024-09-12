@@ -1,0 +1,192 @@
+PM: domains: Fix up terminology with parent/child
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Kees Cook <keescook@chromium.org>
+commit 8d87ae48ced2dffd5e7247d19eb4c88be6f1c6f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/8d87ae48.failed
+
+The genpd infrastructure uses the terms master/slave, but such uses have
+no external exposures (not even in Documentation/driver-api/pm/*) and are
+not mandated by nor associated with any external specifications. Change
+the language used through-out to parent/child.
+
+There was one possible exception in the debugfs node
+"pm_genpd/pm_genpd_summary" but its path has no hits outside of the
+kernel itself when performing a code search[1], and it seems even this
+single usage has been non-functional since it was introduced due to a
+typo in the Python ("apend" instead of correct "append"). Fix the typo
+while we're at it.
+
+Link: https://codesearch.debian.net/ # [1]
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Reviewed-by: Kieran Bingham <kieran.bingham@ideasonboard.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 8d87ae48ced2dffd5e7247d19eb4c88be6f1c6f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/power/domain.c
+#	scripts/gdb/linux/genpd.py
+diff --cc drivers/base/power/domain.c
+index daa5f167cfc7,2cb5e04cf86c..000000000000
+--- a/drivers/base/power/domain.c
++++ b/drivers/base/power/domain.c
+@@@ -603,25 -544,33 +603,42 @@@ static int genpd_power_off(struct gener
+  	if (!genpd->gov)
+  		genpd->state_idx = 0;
+  
+ -	if (genpd->power_off) {
+ -		int ret;
+ +	/* Don't power off, if a child domain is waiting to power on. */
+ +	if (atomic_read(&genpd->sd_count) > 0)
+ +		return -EBUSY;
+  
+++<<<<<<< HEAD
+ +	ret = _genpd_power_off(genpd, true);
+ +	if (ret) {
+ +		genpd->states[genpd->state_idx].rejected++;
+ +		return ret;
+++=======
++ 		if (atomic_read(&genpd->sd_count) > 0)
++ 			return -EBUSY;
++ 
++ 		/*
++ 		 * If sd_count > 0 at this point, one of the subdomains hasn't
++ 		 * managed to call genpd_power_on() for the parent yet after
++ 		 * incrementing it.  In that case genpd_power_on() will wait
++ 		 * for us to drop the lock, so we can call .power_off() and let
++ 		 * the genpd_power_on() restore power for us (this shouldn't
++ 		 * happen very often).
++ 		 */
++ 		ret = _genpd_power_off(genpd, true);
++ 		if (ret)
++ 			return ret;
+++>>>>>>> 8d87ae48ced2 (PM: domains: Fix up terminology with parent/child)
+  	}
+  
+ -	genpd->status = GPD_STATE_POWER_OFF;
+ +	genpd->status = GENPD_STATE_OFF;
+  	genpd_update_accounting(genpd);
+ +	genpd->states[genpd->state_idx].usage++;
+  
+- 	list_for_each_entry(link, &genpd->slave_links, slave_node) {
+- 		genpd_sd_counter_dec(link->master);
+- 		genpd_lock_nested(link->master, depth + 1);
+- 		genpd_power_off(link->master, false, depth + 1);
+- 		genpd_unlock(link->master);
++ 	list_for_each_entry(link, &genpd->child_links, child_node) {
++ 		genpd_sd_counter_dec(link->parent);
++ 		genpd_lock_nested(link->parent, depth + 1);
++ 		genpd_power_off(link->parent, false, depth + 1);
++ 		genpd_unlock(link->parent);
+  	}
+  
+  	return 0;
+@@@ -1023,18 -961,18 +1040,18 @@@ static void genpd_sync_power_off(struc
+  	if (_genpd_power_off(genpd, false))
+  		return;
+  
+ -	genpd->status = GPD_STATE_POWER_OFF;
+ +	genpd->status = GENPD_STATE_OFF;
+  
+- 	list_for_each_entry(link, &genpd->slave_links, slave_node) {
+- 		genpd_sd_counter_dec(link->master);
++ 	list_for_each_entry(link, &genpd->child_links, child_node) {
++ 		genpd_sd_counter_dec(link->parent);
+  
+  		if (use_lock)
+- 			genpd_lock_nested(link->master, depth + 1);
++ 			genpd_lock_nested(link->parent, depth + 1);
+  
+- 		genpd_sync_power_off(link->master, use_lock, depth + 1);
++ 		genpd_sync_power_off(link->parent, use_lock, depth + 1);
+  
+  		if (use_lock)
+- 			genpd_unlock(link->master);
++ 			genpd_unlock(link->parent);
+  	}
+  }
+  
+@@@ -1946,10 -1770,9 +1963,10 @@@ int pm_genpd_init(struct generic_pm_dom
+  	if (IS_ERR_OR_NULL(genpd))
+  		return -EINVAL;
+  
+- 	INIT_LIST_HEAD(&genpd->master_links);
+- 	INIT_LIST_HEAD(&genpd->slave_links);
++ 	INIT_LIST_HEAD(&genpd->parent_links);
++ 	INIT_LIST_HEAD(&genpd->child_links);
+  	INIT_LIST_HEAD(&genpd->dev_list);
+ +	RAW_INIT_NOTIFIER_HEAD(&genpd->power_notifiers);
+  	genpd_lock_init(genpd);
+  	genpd->gov = gov;
+  	INIT_WORK(&genpd->power_off_work, genpd_power_off_work_fn);
+* Unmerged path scripts/gdb/linux/genpd.py
+* Unmerged path drivers/base/power/domain.c
+diff --git a/drivers/base/power/domain_governor.c b/drivers/base/power/domain_governor.c
+index a6638621c44c..e1bae1b4bb8d 100644
+--- a/drivers/base/power/domain_governor.c
++++ b/drivers/base/power/domain_governor.c
+@@ -137,8 +137,8 @@ static bool __default_power_down_ok(struct dev_pm_domain *pd,
+ 	 *
+ 	 * All subdomains have been powered off already at this point.
+ 	 */
+-	list_for_each_entry(link, &genpd->master_links, master_node) {
+-		struct generic_pm_domain *sd = link->slave;
++	list_for_each_entry(link, &genpd->parent_links, parent_node) {
++		struct generic_pm_domain *sd = link->child;
+ 		s64 sd_max_off_ns = sd->max_off_time_ns;
+ 
+ 		if (sd_max_off_ns < 0)
+@@ -219,13 +219,13 @@ static bool default_power_down_ok(struct dev_pm_domain *pd)
+ 	}
+ 
+ 	/*
+-	 * We have to invalidate the cached results for the masters, so
++	 * We have to invalidate the cached results for the parents, so
+ 	 * use the observation that default_power_down_ok() is not
+-	 * going to be called for any master until this instance
++	 * going to be called for any parent until this instance
+ 	 * returns.
+ 	 */
+-	list_for_each_entry(link, &genpd->slave_links, slave_node)
+-		link->master->max_off_time_changed = true;
++	list_for_each_entry(link, &genpd->child_links, child_node)
++		link->parent->max_off_time_changed = true;
+ 
+ 	genpd->max_off_time_ns = -1;
+ 	genpd->max_off_time_changed = false;
+diff --git a/include/linux/pm_domain.h b/include/linux/pm_domain.h
+index c1860d44ab2a..6874bbc90fc9 100644
+--- a/include/linux/pm_domain.h
++++ b/include/linux/pm_domain.h
+@@ -105,8 +105,8 @@ struct generic_pm_domain {
+ 	struct device dev;
+ 	struct dev_pm_domain domain;	/* PM domain operations */
+ 	struct list_head gpd_list_node;	/* Node in the global PM domains list */
+-	struct list_head master_links;	/* Links with PM domain as a master */
+-	struct list_head slave_links;	/* Links with PM domain as a slave */
++	struct list_head parent_links;	/* Links with PM domain as a parent */
++	struct list_head child_links;/* Links with PM domain as a child */
+ 	struct list_head dev_list;	/* List of devices */
+ 	struct dev_power_governor *gov;
+ 	struct work_struct power_off_work;
+@@ -162,10 +162,10 @@ static inline struct generic_pm_domain *pd_to_genpd(struct dev_pm_domain *pd)
+ }
+ 
+ struct gpd_link {
+-	struct generic_pm_domain *master;
+-	struct list_head master_node;
+-	struct generic_pm_domain *slave;
+-	struct list_head slave_node;
++	struct generic_pm_domain *parent;
++	struct list_head parent_node;
++	struct generic_pm_domain *child;
++	struct list_head child_node;
+ 
+ 	/* Sub-domain's per-master domain performance state */
+ 	unsigned int performance_state;
+* Unmerged path scripts/gdb/linux/genpd.py
