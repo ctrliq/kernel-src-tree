@@ -404,8 +404,7 @@ static const struct snd_soc_component_driver soc_component_dev_ak4535 = {
 	.endianness		= 1,
 };
 
-static int ak4535_i2c_probe(struct i2c_client *i2c,
-			    const struct i2c_device_id *id)
+static int ak4535_i2c_probe(struct i2c_client *i2c)
 {
 	struct ak4535_priv *ak4535;
 	int ret;
@@ -440,7 +439,7 @@ static struct i2c_driver ak4535_i2c_driver = {
 	.driver = {
 		.name = "ak4535",
 	},
-	.probe =    ak4535_i2c_probe,
+	.probe_new = ak4535_i2c_probe,
 	.id_table = ak4535_i2c_id,
 };
 
