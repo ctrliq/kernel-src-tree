@@ -1,0 +1,355 @@
+net/mlx5e: Add PTP Flow Steering support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Aya Levin <ayal@nvidia.com>
+commit e5fe49465d463ca6c029869e42e9ba5e895cce02
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/e5fe4946.failed
+
+When opening PTP channel with MLX5E_PTP_STATE_RX set, add the
+corresponding flow steering rules. Capture UDP packets with destination
+port 319 and L2 packets with ethertype 0x88F7 and steer them into the RQ
+of the PTP channel.
+Add API that manages the flow steering rules to be used in the following
+patches via safe_reopen_channels mechanism.
+
+	Signed-off-by: Aya Levin <ayal@nvidia.com>
+	Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit e5fe49465d463ca6c029869e42e9ba5e895cce02)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+index f9afbdefded5,995a0947b2d5..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+@@@ -1,8 -1,26 +1,29 @@@
+  // SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
+  // Copyright (c) 2020 Mellanox Technologies
+  
++ #include <linux/ptp_classify.h>
+  #include "en/ptp.h"
+  #include "en/txrx.h"
+++<<<<<<< HEAD
+++=======
++ #include "en/params.h"
++ #include "en/fs_tt_redirect.h"
++ 
++ struct mlx5e_ptp_fs {
++ 	struct mlx5_flow_handle *l2_rule;
++ 	struct mlx5_flow_handle *udp_v4_rule;
++ 	struct mlx5_flow_handle *udp_v6_rule;
++ 	bool valid;
++ };
++ 
++ #define MLX5E_PTP_CHANNEL_IX 0
++ 
++ struct mlx5e_ptp_params {
++ 	struct mlx5e_params params;
++ 	struct mlx5e_sq_param txq_sq_param;
++ 	struct mlx5e_rq_param rq_param;
++ };
+++>>>>>>> e5fe49465d46 (net/mlx5e: Add PTP Flow Steering support)
+  
+  struct mlx5e_skb_cb_hwtstamp {
+  	ktime_t cqe_hwtstamp;
+@@@ -441,14 -562,100 +462,99 @@@ close_cqs
+  	return err;
+  }
+  
+ -static void mlx5e_ptp_close_queues(struct mlx5e_ptp *c)
+ +static void mlx5e_ptp_close_queues(struct mlx5e_port_ptp *c)
+  {
+ -	if (test_bit(MLX5E_PTP_STATE_RX, c->state)) {
+ -		mlx5e_close_rq(&c->rq);
+ -		mlx5e_close_cq(&c->rq.cq);
+ -	}
+ -	if (test_bit(MLX5E_PTP_STATE_TX, c->state)) {
+ -		mlx5e_ptp_close_txqsqs(c);
+ -		mlx5e_ptp_close_tx_cqs(c);
+ -	}
+ +	mlx5e_ptp_close_txqsqs(c);
+ +	mlx5e_ptp_close_cqs(c);
+  }
+  
+++<<<<<<< HEAD
+ +int mlx5e_port_ptp_open(struct mlx5e_priv *priv, struct mlx5e_params *params,
+ +			u8 lag_port, struct mlx5e_port_ptp **cp)
+++=======
++ static int mlx5e_ptp_set_state(struct mlx5e_ptp *c, struct mlx5e_params *params)
++ {
++ 	if (MLX5E_GET_PFLAG(params, MLX5E_PFLAG_TX_PORT_TS))
++ 		__set_bit(MLX5E_PTP_STATE_TX, c->state);
++ 
++ 	return bitmap_empty(c->state, MLX5E_PTP_STATE_NUM_STATES) ? -EINVAL : 0;
++ }
++ 
++ static void mlx5e_ptp_rx_unset_fs(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_ptp_fs *ptp_fs = priv->fs.ptp_fs;
++ 
++ 	if (!ptp_fs->valid)
++ 		return;
++ 
++ 	mlx5e_fs_tt_redirect_del_rule(ptp_fs->l2_rule);
++ 	mlx5e_fs_tt_redirect_any_destroy(priv);
++ 
++ 	mlx5e_fs_tt_redirect_del_rule(ptp_fs->udp_v6_rule);
++ 	mlx5e_fs_tt_redirect_del_rule(ptp_fs->udp_v4_rule);
++ 	mlx5e_fs_tt_redirect_udp_destroy(priv);
++ 	ptp_fs->valid = false;
++ }
++ 
++ static int mlx5e_ptp_rx_set_fs(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_ptp_fs *ptp_fs = priv->fs.ptp_fs;
++ 	struct mlx5_flow_handle *rule;
++ 	u32 tirn = priv->ptp_tir.tirn;
++ 	int err;
++ 
++ 	if (ptp_fs->valid)
++ 		return 0;
++ 
++ 	err = mlx5e_fs_tt_redirect_udp_create(priv);
++ 	if (err)
++ 		goto out_free;
++ 
++ 	rule = mlx5e_fs_tt_redirect_udp_add_rule(priv, MLX5E_TT_IPV4_UDP,
++ 						 tirn, PTP_EV_PORT);
++ 	if (IS_ERR(rule)) {
++ 		err = PTR_ERR(rule);
++ 		goto out_destroy_fs_udp;
++ 	}
++ 	ptp_fs->udp_v4_rule = rule;
++ 
++ 	rule = mlx5e_fs_tt_redirect_udp_add_rule(priv, MLX5E_TT_IPV6_UDP,
++ 						 tirn, PTP_EV_PORT);
++ 	if (IS_ERR(rule)) {
++ 		err = PTR_ERR(rule);
++ 		goto out_destroy_udp_v4_rule;
++ 	}
++ 	ptp_fs->udp_v6_rule = rule;
++ 
++ 	err = mlx5e_fs_tt_redirect_any_create(priv);
++ 	if (err)
++ 		goto out_destroy_udp_v6_rule;
++ 
++ 	rule = mlx5e_fs_tt_redirect_any_add_rule(priv, tirn, ETH_P_1588);
++ 	if (IS_ERR(rule)) {
++ 		err = PTR_ERR(rule);
++ 		goto out_destroy_fs_any;
++ 	}
++ 	ptp_fs->l2_rule = rule;
++ 	ptp_fs->valid = true;
++ 
++ 	return 0;
++ 
++ out_destroy_fs_any:
++ 	mlx5e_fs_tt_redirect_any_destroy(priv);
++ out_destroy_udp_v6_rule:
++ 	mlx5e_fs_tt_redirect_del_rule(ptp_fs->udp_v6_rule);
++ out_destroy_udp_v4_rule:
++ 	mlx5e_fs_tt_redirect_del_rule(ptp_fs->udp_v4_rule);
++ out_destroy_fs_udp:
++ 	mlx5e_fs_tt_redirect_udp_destroy(priv);
++ out_free:
++ 	return err;
++ }
++ 
++ int mlx5e_ptp_open(struct mlx5e_priv *priv, struct mlx5e_params *params,
++ 		   u8 lag_port, struct mlx5e_ptp **cp)
+++>>>>>>> e5fe49465d46 (net/mlx5e: Add PTP Flow Steering support)
+  {
+  	struct net_device *netdev = priv->netdev;
+  	struct mlx5_core_dev *mdev = priv->mdev;
+@@@ -515,11 -722,17 +621,22 @@@ void mlx5e_ptp_activate_channel(struct 
+  
+  	napi_enable(&c->napi);
+  
+++<<<<<<< HEAD
+ +	for (tc = 0; tc < c->num_tc; tc++)
+ +		mlx5e_activate_txqsq(&c->ptpsq[tc].txqsq);
+++=======
++ 	if (test_bit(MLX5E_PTP_STATE_TX, c->state)) {
++ 		for (tc = 0; tc < c->num_tc; tc++)
++ 			mlx5e_activate_txqsq(&c->ptpsq[tc].txqsq);
++ 	}
++ 	if (test_bit(MLX5E_PTP_STATE_RX, c->state)) {
++ 		mlx5e_ptp_rx_set_fs(c->priv);
++ 		mlx5e_activate_rq(&c->rq);
++ 	}
+++>>>>>>> e5fe49465d46 (net/mlx5e: Add PTP Flow Steering support)
+  }
+  
+ -void mlx5e_ptp_deactivate_channel(struct mlx5e_ptp *c)
+ +void mlx5e_ptp_deactivate_channel(struct mlx5e_port_ptp *c)
+  {
+  	int tc;
+  
+@@@ -528,3 -746,61 +645,64 @@@
+  
+  	napi_disable(&c->napi);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int mlx5e_ptp_get_rqn(struct mlx5e_ptp *c, u32 *rqn)
++ {
++ 	if (!c || !test_bit(MLX5E_PTP_STATE_RX, c->state))
++ 		return -EINVAL;
++ 
++ 	*rqn = c->rq.rqn;
++ 	return 0;
++ }
++ 
++ int mlx5e_ptp_alloc_rx_fs(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_ptp_fs *ptp_fs;
++ 
++ 	if (!priv->profile->rx_ptp_support)
++ 		return 0;
++ 
++ 	ptp_fs = kzalloc(sizeof(*ptp_fs), GFP_KERNEL);
++ 	if (!ptp_fs)
++ 		return -ENOMEM;
++ 
++ 	priv->fs.ptp_fs = ptp_fs;
++ 	return 0;
++ }
++ 
++ void mlx5e_ptp_free_rx_fs(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_ptp_fs *ptp_fs = priv->fs.ptp_fs;
++ 
++ 	if (!priv->profile->rx_ptp_support)
++ 		return;
++ 
++ 	mlx5e_ptp_rx_unset_fs(priv);
++ 	kfree(ptp_fs);
++ }
++ 
++ int mlx5e_ptp_rx_manage_fs(struct mlx5e_priv *priv, bool set)
++ {
++ 	struct mlx5e_ptp *c = priv->channels.ptp;
++ 
++ 	if (!priv->profile->rx_ptp_support)
++ 		return 0;
++ 
++ 	if (set) {
++ 		if (!c || !test_bit(MLX5E_PTP_STATE_RX, c->state)) {
++ 			netdev_WARN_ONCE(priv->netdev, "Don't try to add PTP RX-FS rules");
++ 			return -EINVAL;
++ 		}
++ 		return mlx5e_ptp_rx_set_fs(priv);
++ 	}
++ 	/* set == false */
++ 	if (c && test_bit(MLX5E_PTP_STATE_RX, c->state)) {
++ 		netdev_WARN_ONCE(priv->netdev, "Don't try to remove PTP RX-FS rules");
++ 		return -EINVAL;
++ 	}
++ 	mlx5e_ptp_rx_unset_fs(priv);
++ 	return 0;
++ }
+++>>>>>>> e5fe49465d46 (net/mlx5e: Add PTP Flow Steering support)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+index 28aa5ae118f4,ab935cce952b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+@@@ -35,20 -40,18 +35,32 @@@ struct mlx5e_port_ptp 
+  	struct mlx5e_priv         *priv;
+  	struct mlx5_core_dev      *mdev;
+  	struct hwtstamp_config    *tstamp;
+ -	DECLARE_BITMAP(state, MLX5E_PTP_STATE_NUM_STATES);
+ +	DECLARE_BITMAP(state, MLX5E_CHANNEL_NUM_STATES);
+ +	int                        ix;
+ +};
+ +
+++<<<<<<< HEAD
+ +struct mlx5e_ptp_params {
+ +	struct mlx5e_params        params;
+ +	struct mlx5e_sq_param      txq_sq_param;
+  };
+  
+ +int mlx5e_port_ptp_open(struct mlx5e_priv *priv, struct mlx5e_params *params,
+ +			u8 lag_port, struct mlx5e_port_ptp **cp);
+ +void mlx5e_port_ptp_close(struct mlx5e_port_ptp *c);
+ +void mlx5e_ptp_activate_channel(struct mlx5e_port_ptp *c);
+ +void mlx5e_ptp_deactivate_channel(struct mlx5e_port_ptp *c);
+++=======
++ int mlx5e_ptp_open(struct mlx5e_priv *priv, struct mlx5e_params *params,
++ 		   u8 lag_port, struct mlx5e_ptp **cp);
++ void mlx5e_ptp_close(struct mlx5e_ptp *c);
++ void mlx5e_ptp_activate_channel(struct mlx5e_ptp *c);
++ void mlx5e_ptp_deactivate_channel(struct mlx5e_ptp *c);
++ int mlx5e_ptp_get_rqn(struct mlx5e_ptp *c, u32 *rqn);
++ int mlx5e_ptp_alloc_rx_fs(struct mlx5e_priv *priv);
++ void mlx5e_ptp_free_rx_fs(struct mlx5e_priv *priv);
++ int mlx5e_ptp_rx_manage_fs(struct mlx5e_priv *priv, bool set);
+++>>>>>>> e5fe49465d46 (net/mlx5e: Add PTP Flow Steering support)
+  
+  enum {
+  	MLX5E_SKB_CB_CQE_HWTSTAMP  = BIT(0),
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/fs.h b/drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
+index 88aae71c2d3f..5b6ed87df2a6 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
+@@ -246,6 +246,7 @@ struct mlx5e_accel_fs_tcp;
+ 
+ struct mlx5e_fs_udp;
+ struct mlx5e_fs_any;
++struct mlx5e_ptp_fs;
+ 
+ struct mlx5e_flow_steering {
+ 	struct mlx5_flow_namespace      *ns;
+@@ -267,6 +268,7 @@ struct mlx5e_flow_steering {
+ #endif
+ 	struct mlx5e_fs_udp            *udp;
+ 	struct mlx5e_fs_any            *any;
++	struct mlx5e_ptp_fs            *ptp_fs;
+ };
+ 
+ struct ttc_params {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c b/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+index 8f87ddcc4d61..d0ef03d02de3 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+@@ -39,6 +39,7 @@
+ #include "en.h"
+ #include "en_rep.h"
+ #include "lib/mpfs.h"
++#include "en/ptp.h"
+ 
+ static int mlx5e_add_l2_flow_rule(struct mlx5e_priv *priv,
+ 				  struct mlx5e_l2_rule *ai, int type);
+@@ -1793,10 +1794,16 @@ int mlx5e_create_flow_steering(struct mlx5e_priv *priv)
+ 		goto err_destroy_l2_table;
+ 	}
+ 
++	err = mlx5e_ptp_alloc_rx_fs(priv);
++	if (err)
++		goto err_destory_vlan_table;
++
+ 	mlx5e_ethtool_init_steering(priv);
+ 
+ 	return 0;
+ 
++err_destory_vlan_table:
++	mlx5e_destroy_vlan_table(priv);
+ err_destroy_l2_table:
+ 	mlx5e_destroy_l2_table(priv);
+ err_destroy_ttc_table:
+@@ -1811,6 +1818,7 @@ int mlx5e_create_flow_steering(struct mlx5e_priv *priv)
+ 
+ void mlx5e_destroy_flow_steering(struct mlx5e_priv *priv)
+ {
++	mlx5e_ptp_free_rx_fs(priv);
+ 	mlx5e_destroy_vlan_table(priv);
+ 	mlx5e_destroy_l2_table(priv);
+ 	mlx5e_destroy_ttc_table(priv, &priv->fs.ttc);
