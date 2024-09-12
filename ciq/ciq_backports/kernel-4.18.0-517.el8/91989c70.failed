@@ -1,0 +1,900 @@
+task_work: cleanup notification modes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-517.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 91989c707884ecc7cd537281ab1a4b8fb7219da3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-517.el8/91989c70.failed
+
+A previous commit changed the notification mode from true/false to an
+int, allowing notify-no, notify-yes, or signal-notify. This was
+backwards compatible in the sense that any existing true/false user
+would translate to either 0 (on notification sent) or 1, the latter
+which mapped to TWA_RESUME. TWA_SIGNAL was assigned a value of 2.
+
+Clean this up properly, and define a proper enum for the notification
+mode. Now we have:
+
+- TWA_NONE. This is 0, same as before the original change, meaning no
+  notification requested.
+- TWA_RESUME. This is 1, same as before the original change, meaning
+  that we use TIF_NOTIFY_RESUME.
+- TWA_SIGNAL. This uses TIF_SIGPENDING/JOBCTL_TASK_WORK for the
+  notification.
+
+Clean up all the callers, switching their 0/1/false/true to using the
+appropriate TWA_* mode for notifications.
+
+Fixes: e91b48162332 ("task_work: teach task_work_add() to do signal_wake_up()")
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 91989c707884ecc7cd537281ab1a4b8fb7219da3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mce/core.c
+#	arch/x86/kernel/cpu/resctrl/rdtgroup.c
+#	drivers/android/binder.c
+#	fs/io_uring.c
+diff --cc arch/x86/kernel/cpu/mce/core.c
+index 49f429d7a682,4102b866e7c0..000000000000
+--- a/arch/x86/kernel/cpu/mce/core.c
++++ b/arch/x86/kernel/cpu/mce/core.c
+@@@ -1211,40 -1257,27 +1211,44 @@@ static void kill_me_maybe(struct callba
+  		return;
+  	}
+  
+ -	if (p->mce_vaddr != (void __user *)-1l) {
+ -		force_sig_mceerr(BUS_MCEERR_AR, p->mce_vaddr, PAGE_SHIFT);
+ -	} else {
+ -		pr_err("Memory error not recovered");
+ -		kill_me_now(cb);
+ -	}
+ +	pr_err("Memory error not recovered");
+ +	kill_me_now(cb);
+  }
+  
+ -static void queue_task_work(struct mce *m, int kill_it)
+ +static void queue_task_work(struct mce *m, char *msg, int kill_current_task)
+  {
+ -	current->mce_addr = m->addr;
+ -	current->mce_kflags = m->kflags;
+ -	current->mce_ripv = !!(m->mcgstatus & MCG_STATUS_RIPV);
+ -	current->mce_whole_page = whole_page(m);
+ +	struct task_struct_rh *current_rh = current->task_struct_rh;
+ +	int count = ++current_rh->mce_count;
+  
+ -	if (kill_it)
+ -		current->mce_kill_me.func = kill_me_now;
+ -	else
+ -		current->mce_kill_me.func = kill_me_maybe;
+ +	/* First call, save all the details */
+ +	if (count == 1) {
+ +		current_rh->mce_addr = m->addr;
+ +		current_rh->mce_ripv = !!(m->mcgstatus & MCG_STATUS_RIPV);
+ +		current_rh->mce_whole_page = whole_page(m);
+ +
+++<<<<<<< HEAD
+ +		if (kill_current_task)
+ +			current_rh->mce_kill_me.func = kill_me_now;
+ +		else
+ +			current_rh->mce_kill_me.func = kill_me_maybe;
+ +	}
+ +
+ +	/* Ten is likely overkill. Don't expect more than two faults before task_work() */
+ +	if (count > 10)
+ +		mce_panic("Too many consecutive machine checks while accessing user data", m, msg);
+ +
+ +	/* Second or later call, make sure page address matches the one from first call */
+ +	if (count > 1 && (current_rh->mce_addr >> PAGE_SHIFT) != (m->addr >> PAGE_SHIFT))
+ +		mce_panic("Consecutive machine checks to different user pages", m, msg);
+ +
+ +	/* Do not call task_work_add() more than once */
+ +	if (count > 1)
+ +		return;
+  
+ +	task_work_add(current, &current_rh->mce_kill_me, true);
+++=======
++ 	task_work_add(current, &current->mce_kill_me, TWA_RESUME);
+++>>>>>>> 91989c707884 (task_work: cleanup notification modes)
+  }
+  
+  /*
+diff --cc arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index 533786ebb2e7,af323e2e3100..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@@ -565,50 -547,49 +565,80 @@@ static void update_task_closid_rmid(str
+  static int __rdtgroup_move_task(struct task_struct *tsk,
+  				struct rdtgroup *rdtgrp)
+  {
+ -	struct task_move_callback *callback;
+ -	int ret;
+ -
+ -	callback = kzalloc(sizeof(*callback), GFP_KERNEL);
+ -	if (!callback)
+ -		return -ENOMEM;
+ -	callback->work.func = move_myself;
+ -	callback->rdtgrp = rdtgrp;
+ +	/* If the task is already in rdtgrp, no need to move the task. */
+ +	if ((rdtgrp->type == RDTCTRL_GROUP && tsk->closid == rdtgrp->closid &&
+ +	     tsk->rmid == rdtgrp->mon.rmid) ||
+ +	    (rdtgrp->type == RDTMON_GROUP && tsk->rmid == rdtgrp->mon.rmid &&
+ +	     tsk->closid == rdtgrp->mon.parent->closid))
+ +		return 0;
+  
+  	/*
+ -	 * Take a refcount, so rdtgrp cannot be freed before the
+ -	 * callback has been invoked.
+ +	 * Set the task's closid/rmid before the PQR_ASSOC MSR can be
+ +	 * updated by them.
+ +	 *
+ +	 * For ctrl_mon groups, move both closid and rmid.
+ +	 * For monitor groups, can move the tasks only from
+ +	 * their parent CTRL group.
+  	 */
+++<<<<<<< HEAD
+ +	if (rdtgrp->type == RDTCTRL_GROUP) {
+ +		WRITE_ONCE(tsk->closid, rdtgrp->closid);
+ +		WRITE_ONCE(tsk->rmid, rdtgrp->mon.rmid);
+ +	} else if (rdtgrp->type == RDTMON_GROUP) {
+ +		if (rdtgrp->mon.parent->closid == tsk->closid) {
+ +			WRITE_ONCE(tsk->rmid, rdtgrp->mon.rmid);
+ +		} else {
+ +			rdt_last_cmd_puts("Can't move task to different control group\n");
+ +			return -EINVAL;
+++=======
++ 	atomic_inc(&rdtgrp->waitcount);
++ 	ret = task_work_add(tsk, &callback->work, TWA_RESUME);
++ 	if (ret) {
++ 		/*
++ 		 * Task is exiting. Drop the refcount and free the callback.
++ 		 * No need to check the refcount as the group cannot be
++ 		 * deleted before the write function unlocks rdtgroup_mutex.
++ 		 */
++ 		atomic_dec(&rdtgrp->waitcount);
++ 		kfree(callback);
++ 		rdt_last_cmd_puts("Task exited\n");
++ 	} else {
++ 		/*
++ 		 * For ctrl_mon groups move both closid and rmid.
++ 		 * For monitor groups, can move the tasks only from
++ 		 * their parent CTRL group.
++ 		 */
++ 		if (rdtgrp->type == RDTCTRL_GROUP) {
++ 			tsk->closid = rdtgrp->closid;
++ 			tsk->rmid = rdtgrp->mon.rmid;
++ 		} else if (rdtgrp->type == RDTMON_GROUP) {
++ 			if (rdtgrp->mon.parent->closid == tsk->closid) {
++ 				tsk->rmid = rdtgrp->mon.rmid;
++ 			} else {
++ 				rdt_last_cmd_puts("Can't move task to different control group\n");
++ 				ret = -EINVAL;
++ 			}
+++>>>>>>> 91989c707884 (task_work: cleanup notification modes)
+  		}
+  	}
+ -	return ret;
+ +
+ +	/*
+ +	 * Ensure the task's closid and rmid are written before determining if
+ +	 * the task is current that will decide if it will be interrupted.
+ +	 * This pairs with the full barrier between the rq->curr update and
+ +	 * resctrl_sched_in() during context switch.
+ +	 */
+ +	smp_mb();
+ +
+ +	/*
+ +	 * By now, the task's closid and rmid are set. If the task is current
+ +	 * on a CPU, the PQR_ASSOC MSR needs to be updated to make the resource
+ +	 * group go into effect. If the task is not current, the MSR will be
+ +	 * updated when the task is scheduled in.
+ +	 */
+ +	update_task_closid_rmid(tsk);
+ +
+ +	return 0;
+  }
+  
+  static bool is_closid_match(struct task_struct *t, struct rdtgroup *r)
+diff --cc drivers/android/binder.c
+index 7fe31c671fce,b5117576792b..000000000000
+--- a/drivers/android/binder.c
++++ b/drivers/android/binder.c
+@@@ -2187,17 -2175,79 +2187,80 @@@ static bool binder_validate_fixup(struc
+  	return (fixup_offset >= last_min_offset);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct binder_task_work_cb - for deferred close
++  *
++  * @twork:                callback_head for task work
++  * @fd:                   fd to close
++  *
++  * Structure to pass task work to be handled after
++  * returning from binder_ioctl() via task_work_add().
++  */
++ struct binder_task_work_cb {
++ 	struct callback_head twork;
++ 	struct file *file;
++ };
++ 
++ /**
++  * binder_do_fd_close() - close list of file descriptors
++  * @twork:	callback head for task work
++  *
++  * It is not safe to call ksys_close() during the binder_ioctl()
++  * function if there is a chance that binder's own file descriptor
++  * might be closed. This is to meet the requirements for using
++  * fdget() (see comments for __fget_light()). Therefore use
++  * task_work_add() to schedule the close operation once we have
++  * returned from binder_ioctl(). This function is a callback
++  * for that mechanism and does the actual ksys_close() on the
++  * given file descriptor.
++  */
++ static void binder_do_fd_close(struct callback_head *twork)
++ {
++ 	struct binder_task_work_cb *twcb = container_of(twork,
++ 			struct binder_task_work_cb, twork);
++ 
++ 	fput(twcb->file);
++ 	kfree(twcb);
++ }
++ 
++ /**
++  * binder_deferred_fd_close() - schedule a close for the given file-descriptor
++  * @fd:		file-descriptor to close
++  *
++  * See comments in binder_do_fd_close(). This function is used to schedule
++  * a file-descriptor to be closed after returning from binder_ioctl().
++  */
++ static void binder_deferred_fd_close(int fd)
++ {
++ 	struct binder_task_work_cb *twcb;
++ 
++ 	twcb = kzalloc(sizeof(*twcb), GFP_KERNEL);
++ 	if (!twcb)
++ 		return;
++ 	init_task_work(&twcb->twork, binder_do_fd_close);
++ 	__close_fd_get_file(fd, &twcb->file);
++ 	if (twcb->file) {
++ 		filp_close(twcb->file, current->files);
++ 		task_work_add(current, &twcb->twork, TWA_RESUME);
++ 	} else {
++ 		kfree(twcb);
++ 	}
++ }
++ 
+++>>>>>>> 91989c707884 (task_work: cleanup notification modes)
+  static void binder_transaction_buffer_release(struct binder_proc *proc,
+  					      struct binder_buffer *buffer,
+ -					      binder_size_t failed_at,
+ -					      bool is_failure)
+ +					      binder_size_t *failed_at)
+  {
+ +	binder_size_t *offp, *off_start, *off_end;
+  	int debug_id = buffer->debug_id;
+ -	binder_size_t off_start_offset, buffer_offset, off_end_offset;
+  
+  	binder_debug(BINDER_DEBUG_TRANSACTION,
+ -		     "%d buffer release %d, size %zd-%zd, failed at %llx\n",
+ +		     "%d buffer release %d, size %zd-%zd, failed at %pK\n",
+  		     proc->pid, buffer->debug_id,
+ -		     buffer->data_size, buffer->offsets_size,
+ -		     (unsigned long long)failed_at);
+ +		     buffer->data_size, buffer->offsets_size, failed_at);
+  
+  	if (buffer->target_node)
+  		binder_dec_node(buffer->target_node, 1, 0);
+diff --cc fs/io_uring.c
+index 80ef444c3f3d,6b502885684a..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1530,59 -1959,185 +1530,165 @@@ static void io_req_find_next(struct io_
+  	 * dependencies to the next request. In case of failure, fail the rest
+  	 * of the chain.
+  	 */
+ -	if (likely(!(req->flags & REQ_F_FAIL_LINK)))
+ -		return io_req_link_next(req);
+ -	io_fail_links(req);
+ -	return NULL;
+ -}
+ +	if (req->flags & REQ_F_FAIL_LINK) {
+ +		io_fail_links(req);
+ +	} else if ((req->flags & (REQ_F_LINK_TIMEOUT | REQ_F_COMP_LOCKED)) ==
+ +			REQ_F_LINK_TIMEOUT) {
+ +		struct io_ring_ctx *ctx = req->ctx;
+ +		unsigned long flags;
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * If this is a timeout link, we could be racing with the
+ +		 * timeout timer. Grab the completion lock for this case to
+ +		 * protect against that.
+ +		 */
+ +		spin_lock_irqsave(&ctx->completion_lock, flags);
+ +		io_req_link_next(req, nxt);
+ +		spin_unlock_irqrestore(&ctx->completion_lock, flags);
+++=======
++ static struct io_kiocb *io_req_find_next(struct io_kiocb *req)
++ {
++ 	if (likely(!(req->flags & REQ_F_LINK_HEAD)))
++ 		return NULL;
++ 	return __io_req_find_next(req);
++ }
++ 
++ static int io_req_task_work_add(struct io_kiocb *req, bool twa_signal_ok)
++ {
++ 	struct task_struct *tsk = req->task;
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	enum task_work_notify_mode notify;
++ 	int ret;
++ 
++ 	if (tsk->flags & PF_EXITING)
++ 		return -ESRCH;
++ 
++ 	/*
++ 	 * SQPOLL kernel thread doesn't need notification, just a wakeup. For
++ 	 * all other cases, use TWA_SIGNAL unconditionally to ensure we're
++ 	 * processing task_work. There's no reliable way to tell if TWA_RESUME
++ 	 * will do the job.
++ 	 */
++ 	notify = TWA_NONE;
++ 	if (!(ctx->flags & IORING_SETUP_SQPOLL) && twa_signal_ok)
++ 		notify = TWA_SIGNAL;
++ 
++ 	ret = task_work_add(tsk, &req->task_work, notify);
++ 	if (!ret)
++ 		wake_up_process(tsk);
++ 
++ 	return ret;
++ }
++ 
++ static void __io_req_task_cancel(struct io_kiocb *req, int error)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	io_cqring_fill_event(req, error);
++ 	io_commit_cqring(ctx);
++ 	spin_unlock_irq(&ctx->completion_lock);
++ 
++ 	io_cqring_ev_posted(ctx);
++ 	req_set_fail_links(req);
++ 	io_double_put_req(req);
++ }
++ 
++ static void io_req_task_cancel(struct callback_head *cb)
++ {
++ 	struct io_kiocb *req = container_of(cb, struct io_kiocb, task_work);
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 
++ 	__io_req_task_cancel(req, -ECANCELED);
++ 	percpu_ref_put(&ctx->refs);
++ }
++ 
++ static void __io_req_task_submit(struct io_kiocb *req)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 
++ 	if (!__io_sq_thread_acquire_mm(ctx)) {
++ 		mutex_lock(&ctx->uring_lock);
++ 		__io_queue_sqe(req, NULL);
++ 		mutex_unlock(&ctx->uring_lock);
+++>>>>>>> 91989c707884 (task_work: cleanup notification modes)
+  	} else {
+ -		__io_req_task_cancel(req, -EFAULT);
+ +		io_req_link_next(req, nxt);
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void io_req_task_submit(struct callback_head *cb)
++ {
++ 	struct io_kiocb *req = container_of(cb, struct io_kiocb, task_work);
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 
++ 	__io_req_task_submit(req);
++ 	percpu_ref_put(&ctx->refs);
++ }
++ 
++ static void io_req_task_queue(struct io_kiocb *req)
++ {
++ 	int ret;
++ 
++ 	init_task_work(&req->task_work, io_req_task_submit);
++ 	percpu_ref_get(&req->ctx->refs);
++ 
++ 	ret = io_req_task_work_add(req, true);
++ 	if (unlikely(ret)) {
++ 		struct task_struct *tsk;
++ 
++ 		init_task_work(&req->task_work, io_req_task_cancel);
++ 		tsk = io_wq_get_task(req->ctx->io_wq);
++ 		task_work_add(tsk, &req->task_work, TWA_NONE);
++ 		wake_up_process(tsk);
++ 	}
++ }
++ 
++ static void io_queue_next(struct io_kiocb *req)
++ {
++ 	struct io_kiocb *nxt = io_req_find_next(req);
++ 
++ 	if (nxt)
++ 		io_req_task_queue(nxt);
++ }
++ 
+++>>>>>>> 91989c707884 (task_work: cleanup notification modes)
+  static void io_free_req(struct io_kiocb *req)
+  {
+ -	io_queue_next(req);
+ -	__io_free_req(req);
+ -}
+ -
+ -struct req_batch {
+ -	void *reqs[IO_IOPOLL_BATCH];
+ -	int to_free;
+ -
+ -	struct task_struct	*task;
+ -	int			task_refs;
+ -};
+ +	struct io_kiocb *nxt = NULL;
+  
+ -static inline void io_init_req_batch(struct req_batch *rb)
+ -{
+ -	rb->to_free = 0;
+ -	rb->task_refs = 0;
+ -	rb->task = NULL;
+ -}
+ +	io_req_find_next(req, &nxt);
+ +	__io_free_req(req);
+  
+ -static void __io_req_free_batch_flush(struct io_ring_ctx *ctx,
+ -				      struct req_batch *rb)
+ -{
+ -	kmem_cache_free_bulk(req_cachep, rb->to_free, rb->reqs);
+ -	percpu_ref_put_many(&ctx->refs, rb->to_free);
+ -	rb->to_free = 0;
+ +	if (nxt)
+ +		io_queue_async_work(nxt);
+  }
+  
+ -static void io_req_free_batch_finish(struct io_ring_ctx *ctx,
+ -				     struct req_batch *rb)
+ +static void io_link_work_cb(struct io_wq_work **workptr)
+  {
+ -	if (rb->to_free)
+ -		__io_req_free_batch_flush(ctx, rb);
+ -	if (rb->task) {
+ -		struct io_uring_task *tctx = rb->task->io_uring;
+ +	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
+ +	struct io_kiocb *link;
+  
+ -		percpu_counter_sub(&tctx->inflight, rb->task_refs);
+ -		put_task_struct_many(rb->task, rb->task_refs);
+ -		rb->task = NULL;
+ -	}
+ +	link = list_first_entry(&req->link_list, struct io_kiocb, link_list);
+ +	io_queue_linked_timeout(link);
+ +	io_wq_submit_work(workptr);
+  }
+  
+ -static void io_req_free_batch(struct req_batch *rb, struct io_kiocb *req)
+ +static void io_wq_assign_next(struct io_wq_work **workptr, struct io_kiocb *nxt)
+  {
+ -	if (unlikely(io_is_fallback_req(req))) {
+ -		io_free_req(req);
+ -		return;
+ -	}
+ -	if (req->flags & REQ_F_LINK_HEAD)
+ -		io_queue_next(req);
+ -
+ -	if (req->task != rb->task) {
+ -		if (rb->task) {
+ -			struct io_uring_task *tctx = rb->task->io_uring;
+ +	struct io_kiocb *link;
+ +	const struct io_op_def *def = &io_op_defs[nxt->opcode];
+  
+ -			percpu_counter_sub(&tctx->inflight, rb->task_refs);
+ -			put_task_struct_many(rb->task, rb->task_refs);
+ -		}
+ -		rb->task = req->task;
+ -		rb->task_refs = 0;
+ -	}
+ -	rb->task_refs++;
+ +	if ((nxt->flags & REQ_F_ISREG) && def->hash_reg_file)
+ +		io_wq_hash_work(&nxt->work, file_inode(nxt->file));
+  
+ -	io_dismantle_req(req);
+ -	rb->reqs[rb->to_free++] = req;
+ -	if (unlikely(rb->to_free == ARRAY_SIZE(rb->reqs)))
+ -		__io_req_free_batch_flush(req->ctx, rb);
+ +	*workptr = &nxt->work;
+ +	link = io_prep_linked_timeout(nxt);
+ +	if (link)
+ +		nxt->work.func = io_link_work_cb;
+  }
+  
+  /*
+@@@ -1604,23 -2161,25 +1710,41 @@@ static void io_put_req(struct io_kiocb 
+  		io_free_req(req);
+  }
+  
+ -static void io_put_req_deferred_cb(struct callback_head *cb)
+ +static void io_steal_work(struct io_kiocb *req,
+ +			  struct io_wq_work **workptr)
+  {
+ -	struct io_kiocb *req = container_of(cb, struct io_kiocb, task_work);
+ -
+ +	/*
+ +	 * It's in an io-wq worker, so there always should be at least
+ +	 * one reference, which will be dropped in io_put_work() just
+ +	 * after the current handler returns.
+ +	 *
+ +	 * It also means, that if the counter dropped to 1, then there is
+ +	 * no asynchronous users left, so it's safe to steal the next work.
+ +	 */
+ +	if (refcount_read(&req->refs) == 1) {
+ +		struct io_kiocb *nxt = NULL;
+ +
+++<<<<<<< HEAD
+ +		io_req_find_next(req, &nxt);
+ +		if (nxt)
+ +			io_wq_assign_next(workptr, nxt);
+++=======
++ 	io_free_req(req);
++ }
++ 
++ static void io_free_req_deferred(struct io_kiocb *req)
++ {
++ 	int ret;
++ 
++ 	init_task_work(&req->task_work, io_put_req_deferred_cb);
++ 	ret = io_req_task_work_add(req, true);
++ 	if (unlikely(ret)) {
++ 		struct task_struct *tsk;
++ 
++ 		tsk = io_wq_get_task(req->ctx->io_wq);
++ 		task_work_add(tsk, &req->task_work, TWA_NONE);
++ 		wake_up_process(tsk);
+++>>>>>>> 91989c707884 (task_work: cleanup notification modes)
+  	}
+  }
+  
+@@@ -2559,22 -3249,110 +2683,41 @@@ static int io_read_prep(struct io_kioc
+  		return -EBADF;
+  
+  	/* either don't need iovec imported or already have it */
+ -	if (!req->async_data)
+ -		return 0;
+ -	return io_rw_prep_async(req, READ);
+ -}
+ -
+ -/*
+ - * This is our waitqueue callback handler, registered through lock_page_async()
+ - * when we initially tried to do the IO with the iocb armed our waitqueue.
+ - * This gets called when the page is unlocked, and we generally expect that to
+ - * happen when the page IO is completed and the page is now uptodate. This will
+ - * queue a task_work based retry of the operation, attempting to copy the data
+ - * again. If the latter fails because the page was NOT uptodate, then we will
+ - * do a thread based blocking retry of the operation. That's the unexpected
+ - * slow path.
+ - */
+ -static int io_async_buf_func(struct wait_queue_entry *wait, unsigned mode,
+ -			     int sync, void *arg)
+ -{
+ -	struct wait_page_queue *wpq;
+ -	struct io_kiocb *req = wait->private;
+ -	struct wait_page_key *key = arg;
+ -	int ret;
+ -
+ -	wpq = container_of(wait, struct wait_page_queue, wait);
+ -
+ -	if (!wake_page_match(wpq, key))
+ +	if (!req->io || req->flags & REQ_F_NEED_CLEANUP)
+  		return 0;
+  
+ -	req->rw.kiocb.ki_flags &= ~IOCB_WAITQ;
+ -	list_del_init(&wait->entry);
+ +	io = req->io;
+ +	io->rw.iov = io->rw.fast_iov;
+ +	req->io = NULL;
+ +	ret = io_import_iovec(READ, req, &io->rw.iov, &iter, !force_nonblock);
+ +	req->io = io;
+ +	if (ret < 0)
+ +		return ret;
+  
+++<<<<<<< HEAD
+ +	io_req_map_rw(req, ret, io->rw.iov, io->rw.fast_iov, &iter);
+ +	return 0;
+++=======
++ 	init_task_work(&req->task_work, io_req_task_submit);
++ 	percpu_ref_get(&req->ctx->refs);
++ 
++ 	/* submit ref gets dropped, acquire a new one */
++ 	refcount_inc(&req->refs);
++ 	ret = io_req_task_work_add(req, true);
++ 	if (unlikely(ret)) {
++ 		struct task_struct *tsk;
++ 
++ 		/* queue just for cancelation */
++ 		init_task_work(&req->task_work, io_req_task_cancel);
++ 		tsk = io_wq_get_task(req->ctx->io_wq);
++ 		task_work_add(tsk, &req->task_work, TWA_NONE);
++ 		wake_up_process(tsk);
++ 	}
++ 	return 1;
+++>>>>>>> 91989c707884 (task_work: cleanup notification modes)
+  }
+  
+ -/*
+ - * This controls whether a given IO request should be armed for async page
+ - * based retry. If we return false here, the request is handed to the async
+ - * worker threads for retry. If we're doing buffered reads on a regular file,
+ - * we prepare a private wait_page_queue entry and retry the operation. This
+ - * will either succeed because the page is now uptodate and unlocked, or it
+ - * will register a callback when the page is unlocked at IO completion. Through
+ - * that callback, io_uring uses task_work to setup a retry of the operation.
+ - * That retry will attempt the buffered read again. The retry will generally
+ - * succeed, or in rare cases where it fails, we then fall back to using the
+ - * async worker threads for a blocking retry.
+ - */
+ -static bool io_rw_should_retry(struct io_kiocb *req)
+ -{
+ -	struct io_async_rw *rw = req->async_data;
+ -	struct wait_page_queue *wait = &rw->wpq;
+ -	struct kiocb *kiocb = &req->rw.kiocb;
+ -
+ -	/* never retry for NOWAIT, we just complete with -EAGAIN */
+ -	if (req->flags & REQ_F_NOWAIT)
+ -		return false;
+ -
+ -	/* Only for buffered IO */
+ -	if (kiocb->ki_flags & (IOCB_DIRECT | IOCB_HIPRI))
+ -		return false;
+ -
+ -	/*
+ -	 * just use poll if we can, and don't attempt if the fs doesn't
+ -	 * support callback based unlocks
+ -	 */
+ -	if (file_can_poll(req->file) || !(req->file->f_mode & FMODE_BUF_RASYNC))
+ -		return false;
+ -
+ -	wait->wait.func = io_async_buf_func;
+ -	wait->wait.private = req;
+ -	wait->wait.flags = 0;
+ -	INIT_LIST_HEAD(&wait->wait.entry);
+ -	kiocb->ki_flags |= IOCB_WAITQ;
+ -	kiocb->ki_flags &= ~IOCB_NOWAIT;
+ -	kiocb->ki_waitq = wait;
+ -	return true;
+ -}
+ -
+ -static int io_iter_do_read(struct io_kiocb *req, struct iov_iter *iter)
+ -{
+ -	if (req->file->f_op->read_iter)
+ -		return call_read_iter(req->file, &req->rw.kiocb, iter);
+ -	else if (req->file->f_op->read)
+ -		return loop_rw_iter(READ, req->file, &req->rw.kiocb, iter);
+ -	else
+ -		return -EINVAL;
+ -}
+ -
+ -static int io_read(struct io_kiocb *req, bool force_nonblock,
+ -		   struct io_comp_state *cs)
+ +static int io_read(struct io_kiocb *req, bool force_nonblock)
+  {
+  	struct iovec inline_vecs[UIO_FASTIOV], *iovec = inline_vecs;
+  	struct kiocb *kiocb = &req->rw.kiocb;
+@@@ -4156,11 -4852,13 +4299,11 @@@ static int __io_async_wake(struct io_ki
+  	 * of executing it. We can't safely execute it anyway, as we may not
+  	 * have the needed state needed for it anyway.
+  	 */
+ -	ret = io_req_task_work_add(req, twa_signal_ok);
+ +	ret = io_req_task_work_add(req, &req->task_work);
+  	if (unlikely(ret)) {
+ -		struct task_struct *tsk;
+ -
+  		WRITE_ONCE(poll->canceled, true);
+  		tsk = io_wq_get_task(req->ctx->io_wq);
+- 		task_work_add(tsk, &req->task_work, 0);
++ 		task_work_add(tsk, &req->task_work, TWA_NONE);
+  		wake_up_process(tsk);
+  	}
+  	return 1;
+* Unmerged path arch/x86/kernel/cpu/mce/core.c
+* Unmerged path arch/x86/kernel/cpu/resctrl/rdtgroup.c
+diff --git a/drivers/acpi/apei/ghes.c b/drivers/acpi/apei/ghes.c
+index c8d24589a579..4a53a7e58b26 100644
+--- a/drivers/acpi/apei/ghes.c
++++ b/drivers/acpi/apei/ghes.c
+@@ -1003,7 +1003,7 @@ static void ghes_proc_in_irq(struct irq_work *irq_work)
+ 			estatus_node->task_work.func = ghes_kick_task_work;
+ 			estatus_node->task_work_cpu = smp_processor_id();
+ 			ret = task_work_add(current, &estatus_node->task_work,
+-					    true);
++					    TWA_RESUME);
+ 			if (ret)
+ 				estatus_node->task_work.func = NULL;
+ 		}
+* Unmerged path drivers/android/binder.c
+diff --git a/fs/file_table.c b/fs/file_table.c
+index d8f581ac452d..d7c5762cb8ff 100644
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@ -321,7 +321,7 @@ void fput_many(struct file *file, unsigned int refs)
+ 
+ 		if (likely(!in_interrupt() && !(task->flags & PF_KTHREAD))) {
+ 			init_task_work(&file->f_u.fu_rcuhead, ____fput);
+-			if (!task_work_add(task, &file->f_u.fu_rcuhead, true))
++			if (!task_work_add(task, &file->f_u.fu_rcuhead, TWA_RESUME))
+ 				return;
+ 			/*
+ 			 * After this task has run exit_task_work(),
+* Unmerged path fs/io_uring.c
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 35fa33e108c8..487417f606c9 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1209,7 +1209,7 @@ static void mntput_no_expire(struct mount *mnt)
+ 		struct task_struct *task = current;
+ 		if (likely(!(task->flags & PF_KTHREAD))) {
+ 			init_task_work(&mnt->mnt_rcu, __cleanup_mnt);
+-			if (!task_work_add(task, &mnt->mnt_rcu, true))
++			if (!task_work_add(task, &mnt->mnt_rcu, TWA_RESUME))
+ 				return;
+ 		}
+ 		if (llist_add(&mnt->mnt_llist, &delayed_mntput_list))
+diff --git a/include/linux/task_work.h b/include/linux/task_work.h
+index 0fb93aafa478..0d848a1e9e62 100644
+--- a/include/linux/task_work.h
++++ b/include/linux/task_work.h
+@@ -13,9 +13,14 @@ init_task_work(struct callback_head *twork, task_work_func_t func)
+ 	twork->func = func;
+ }
+ 
+-#define TWA_RESUME	1
+-#define TWA_SIGNAL	2
+-int task_work_add(struct task_struct *task, struct callback_head *twork, int);
++enum task_work_notify_mode {
++	TWA_NONE,
++	TWA_RESUME,
++	TWA_SIGNAL,
++};
++
++int task_work_add(struct task_struct *task, struct callback_head *twork,
++			enum task_work_notify_mode mode);
+ 
+ struct callback_head *task_work_cancel(struct task_struct *, task_work_func_t);
+ void task_work_run(void);
+diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+index 14009e8600f0..5e656d7e635e 100644
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -1824,7 +1824,7 @@ void uprobe_copy_process(struct task_struct *t, unsigned long flags)
+ 
+ 	t->utask->dup_xol_addr = area->vaddr;
+ 	init_task_work(&t->utask->dup_xol_work, dup_xol_work);
+-	task_work_add(t, &t->utask->dup_xol_work, true);
++	task_work_add(t, &t->utask->dup_xol_work, TWA_RESUME);
+ }
+ 
+ /*
+diff --git a/kernel/irq/manage.c b/kernel/irq/manage.c
+index 2e1187d75e53..a66de0ff3c54 100644
+--- a/kernel/irq/manage.c
++++ b/kernel/irq/manage.c
+@@ -1263,7 +1263,7 @@ static int irq_thread(void *data)
+ 		handler_fn = irq_thread_fn;
+ 
+ 	init_task_work(&on_exit_work, irq_thread_dtor);
+-	task_work_add(current, &on_exit_work, false);
++	task_work_add(current, &on_exit_work, TWA_NONE);
+ 
+ 	irq_thread_check_affinity(desc, action);
+ 
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 90d22f28f7b4..255373a4d0fc 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -2968,7 +2968,7 @@ static void task_tick_numa(struct rq *rq, struct task_struct *curr)
+ 		curr->node_stamp += period;
+ 
+ 		if (!time_before(jiffies, curr->mm->numa_next_scan))
+-			task_work_add(curr, work, true);
++			task_work_add(curr, work, TWA_RESUME);
+ 	}
+ }
+ 
+diff --git a/kernel/task_work.c b/kernel/task_work.c
+index ba9a7f0a735b..53a1076e5d28 100644
+--- a/kernel/task_work.c
++++ b/kernel/task_work.c
+@@ -9,23 +9,28 @@ static struct callback_head work_exited; /* all we need is ->next == NULL */
+  * task_work_add - ask the @task to execute @work->func()
+  * @task: the task which should run the callback
+  * @work: the callback to run
+- * @notify: send the notification if true
++ * @notify: how to notify the targeted task
+  *
+- * Queue @work for task_work_run() below and notify the @task if @notify.
+- * Fails if the @task is exiting/exited and thus it can't process this @work.
+- * Otherwise @work->func() will be called when the @task returns from kernel
+- * mode or exits.
++ * Queue @work for task_work_run() below and notify the @task if @notify
++ * is @TWA_RESUME or @TWA_SIGNAL. @TWA_SIGNAL works like signals, in that the
++ * it will interrupt the targeted task and run the task_work. @TWA_RESUME
++ * work is run only when the task exits the kernel and returns to user mode,
++ * or before entering guest mode. Fails if the @task is exiting/exited and thus
++ * it can't process this @work. Otherwise @work->func() will be called when the
++ * @task goes through one of the aforementioned transitions, or exits.
+  *
+- * This is like the signal handler which runs in kernel mode, but it doesn't
+- * try to wake up the @task.
++ * If the targeted task is exiting, then an error is returned and the work item
++ * is not queued. It's up to the caller to arrange for an alternative mechanism
++ * in that case.
+  *
+- * Note: there is no ordering guarantee on works queued here.
++ * Note: there is no ordering guarantee on works queued here. The task_work
++ * list is LIFO.
+  *
+  * RETURNS:
+  * 0 if succeeds or -ESRCH.
+  */
+-int
+-task_work_add(struct task_struct *task, struct callback_head *work, int notify)
++int task_work_add(struct task_struct *task, struct callback_head *work,
++		  enum task_work_notify_mode notify)
+ {
+ 	struct callback_head *head;
+ 	unsigned long flags;
+@@ -38,6 +43,8 @@ task_work_add(struct task_struct *task, struct callback_head *work, int notify)
+ 	} while (cmpxchg(&task->task_works, head, work) != head);
+ 
+ 	switch (notify) {
++	case TWA_NONE:
++		break;
+ 	case TWA_RESUME:
+ 		set_notify_resume(task);
+ 		break;
+@@ -48,6 +55,9 @@ task_work_add(struct task_struct *task, struct callback_head *work, int notify)
+ 			unlock_task_sighand(task, &flags);
+ 		}
+ 		break;
++	default:
++		WARN_ON_ONCE(1);
++		break;
+ 	}
+ 
+ 	return 0;
+diff --git a/security/keys/keyctl.c b/security/keys/keyctl.c
+index 07ee71568220..1dd9e3a949bb 100644
+--- a/security/keys/keyctl.c
++++ b/security/keys/keyctl.c
+@@ -1629,7 +1629,7 @@ long keyctl_session_to_parent(void)
+ 
+ 	/* the replacement session keyring is applied just prior to userspace
+ 	 * restarting */
+-	ret = task_work_add(parent, newwork, true);
++	ret = task_work_add(parent, newwork, TWA_RESUME);
+ 	if (!ret)
+ 		newwork = NULL;
+ unlock:
+diff --git a/security/yama/yama_lsm.c b/security/yama/yama_lsm.c
+index f10d1e0f9237..393fb07fae4d 100644
+--- a/security/yama/yama_lsm.c
++++ b/security/yama/yama_lsm.c
+@@ -103,7 +103,7 @@ static void report_access(const char *access, struct task_struct *target,
+ 	info->access = access;
+ 	info->target = target;
+ 	info->agent = agent;
+-	if (task_work_add(current, &info->work, true) == 0)
++	if (task_work_add(current, &info->work, TWA_RESUME) == 0)
+ 		return; /* success */
+ 
+ 	WARN(1, "report_access called from exiting task");
