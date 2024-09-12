@@ -1,0 +1,197 @@
+mac80211: extend current rate control tx status API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Jonas Jelonek <jelonek.jonas@gmail.com>
+commit 44fa75f207d8a106bc75e6230db61e961fdbf8a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/44fa75f2.failed
+
+This patch adds the new struct ieee80211_rate_status and replaces
+'struct rate_info *rate' in ieee80211_tx_status with pointer and length
+annotation.
+
+The struct ieee80211_rate_status allows to:
+(1)	receive tx power status feedback for transmit power control (TPC)
+	per packet or packet retry
+(2)	dynamic mapping of wifi chip specific multi-rate retry (mrr)
+	chains with different lengths
+(3)	increase the limit of annotatable rate indices to support
+	IEEE802.11ac rate sets and beyond
+
+ieee80211_tx_info, control and status buffer, and ieee80211_tx_rate
+cannot be used to achieve these goals due to fixed size limitations.
+
+Our new struct contains a struct rate_info to annotate the rate that was
+used, retry count of the rate and tx power. It is intended for all
+information related to RC and TPC that needs to be passed from driver to
+mac80211 and its RC/TPC algorithms like Minstrel_HT. It corresponds to
+one stage in an mrr. Multiple subsequent instances of this struct can be
+included in struct ieee80211_tx_status via a pointer and a length variable.
+Those instances can be allocated on-stack. The former reference to a single
+instance of struct rate_info is replaced with our new annotation.
+
+An extension is introduced to struct ieee80211_hw. There are two new
+members called 'tx_power_levels' and 'max_txpwr_levels_idx' acting as a
+tx power level table. When a wifi device is registered, the driver shall
+supply all supported power levels in this list. This allows to support
+several quirks like differing power steps in power level ranges or
+alike. TPC can use this for algorithm and thus be designed more abstract
+instead of handling all possible step widths individually.
+
+Further mandatory changes in status.c, mt76 and ath11k drivers due to the
+removal of 'struct rate_info *rate' are also included.
+status.c already uses the information in ieee80211_tx_status->rate in
+radiotap, this is now changed to use ieee80211_rate_status->rate_idx.
+mt76 driver already uses struct rate_info to pass the tx rate to status
+path. The new members of the ieee80211_tx_status are set to NULL and 0
+because the previously passed rate is not relevant to rate control and
+accurate information is passed via tx_info->status.rates.
+For ath11k, the txrate can be passed via this struct because ath11k uses
+firmware RC and thus the information does not interfere with software RC.
+
+Compile-Tested: current wireless-next tree with all flags on
+Tested-on: Xiaomi 4A Gigabit (MediaTek MT7603E, MT7612E) with OpenWrt
+		Linux 5.10.113
+
+	Signed-off-by: Jonas Jelonek <jelonek.jonas@gmail.com>
+Link: https://lore.kernel.org/r/20220509173958.1398201-2-jelonek.jonas@gmail.com
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 44fa75f207d8a106bc75e6230db61e961fdbf8a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/status.c
+diff --cc net/mac80211/status.c
+index e81e8a5bb774,e69272139437..000000000000
+--- a/net/mac80211/status.c
++++ b/net/mac80211/status.c
+@@@ -1110,8 -1123,9 +1122,14 @@@ void ieee80211_tx_status_ext(struct iee
+  	if (pubsta) {
+  		sta = container_of(pubsta, struct sta_info, sta);
+  
+++<<<<<<< HEAD
+ +		if (status->rate)
+ +			sta->tx_stats.last_rate_info = *status->rate;
+++=======
++ 		if (status->n_rates)
++ 			sta->deflink.tx_stats.last_rate_info =
++ 				status->rates[status->n_rates - 1].rate_idx;
+++>>>>>>> 44fa75f207d8 (mac80211: extend current rate control tx status API)
+  	}
+  
+  	if (skb && (tx_time_est =
+diff --git a/drivers/net/wireless/ath/ath11k/dp_tx.c b/drivers/net/wireless/ath/ath11k/dp_tx.c
+index 00a45819907e..c17a2620aad7 100644
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -520,6 +520,7 @@ static void ath11k_dp_tx_complete_msdu(struct ath11k *ar,
+ 				       struct hal_tx_status *ts)
+ {
+ 	struct ieee80211_tx_status status = { 0 };
++	struct ieee80211_rate_status status_rate = { 0 };
+ 	struct ath11k_base *ab = ar->ab;
+ 	struct ieee80211_tx_info *info;
+ 	struct ath11k_skb_cb *skb_cb;
+@@ -603,7 +604,12 @@ static void ath11k_dp_tx_complete_msdu(struct ath11k *ar,
+ 	status.skb = msdu;
+ 	status.info = info;
+ 	rate = arsta->last_txrate;
+-	status.rate = &rate;
++
++	status_rate.rate_idx = rate;
++	status_rate.try_count = 1;
++
++	status.rates = &status_rate;
++	status.n_rates = 1;
+ 
+ 	spin_unlock_bh(&ab->base_lock);
+ 
+diff --git a/drivers/net/wireless/mediatek/mt76/tx.c b/drivers/net/wireless/mediatek/mt76/tx.c
+index 02067edca95e..1d08d99e298c 100644
+--- a/drivers/net/wireless/mediatek/mt76/tx.c
++++ b/drivers/net/wireless/mediatek/mt76/tx.c
+@@ -66,9 +66,8 @@ mt76_tx_status_unlock(struct mt76_dev *dev, struct sk_buff_head *list)
+ 		wcid = rcu_dereference(dev->wcid[cb->wcid]);
+ 		if (wcid) {
+ 			status.sta = wcid_to_sta(wcid);
+-
+-			if (status.sta)
+-				status.rate = &wcid->rate;
++			status.rates = NULL;
++			status.n_rates = 0;
+ 		}
+ 
+ 		hw = mt76_tx_status_get_hw(dev, skb);
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index e7907a4b7f6a..91d44022faad 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -1143,20 +1143,41 @@ ieee80211_info_get_tx_time_est(struct ieee80211_tx_info *info)
+ 	return info->tx_time_est << 2;
+ }
+ 
++/***
++ * struct ieee80211_rate_status - mrr stage for status path
++ *
++ * This struct is used in struct ieee80211_tx_status to provide drivers a
++ * dynamic way to report about used rates and power levels per packet.
++ *
++ * @rate_idx The actual used rate.
++ * @try_count How often the rate was tried.
++ * @tx_power_idx An idx into the ieee80211_hw->tx_power_levels list of the
++ * 	corresponding wifi hardware. The idx shall point to the power level
++ * 	that was used when sending the packet.
++ */
++struct ieee80211_rate_status {
++	struct rate_info rate_idx;
++	u8 try_count;
++	u8 tx_power_idx;
++};
++
+ /**
+  * struct ieee80211_tx_status - extended tx staus info for rate control
+  *
+  * @sta: Station that the packet was transmitted for
+  * @info: Basic tx status information
+  * @skb: Packet skb (can be NULL if not provided by the driver)
+- * @rate: The TX rate that was used when sending the packet
++ * @rates: Mrr stages that were used when sending the packet
++ * @n_rates: Number of mrr stages (count of instances for @rates)
+  * @free_list: list where processed skbs are stored to be free'd by the driver
+  */
+ struct ieee80211_tx_status {
+ 	struct ieee80211_sta *sta;
+ 	struct ieee80211_tx_info *info;
+ 	struct sk_buff *skb;
+-	struct rate_info *rate;
++	struct ieee80211_rate_status *rates;
++	u8 n_rates;
++
+ 	struct list_head *free_list;
+ };
+ 
+@@ -2621,6 +2642,12 @@ enum ieee80211_hw_flags {
+  *	refilling deficit of each TXQ.
+  *
+  * @max_mtu: the max mtu could be set.
++ *
++ * @tx_power_levels: a list of power levels supported by the wifi hardware.
++ * 	The power levels can be specified either as integer or fractions.
++ * 	The power level at idx 0 shall be the maximum positive power level.
++ *
++ * @max_txpwr_levels_idx: the maximum valid idx of 'tx_power_levels' list.
+  */
+ struct ieee80211_hw {
+ 	struct ieee80211_conf conf;
+@@ -2659,6 +2686,8 @@ struct ieee80211_hw {
+ 	u8 tx_sk_pacing_shift;
+ 	u8 weight_multiplier;
+ 	u32 max_mtu;
++	const s8 *tx_power_levels;
++	u8 max_txpwr_levels_idx;
+ };
+ 
+ static inline bool _ieee80211_hw_check(struct ieee80211_hw *hw,
+* Unmerged path net/mac80211/status.c
