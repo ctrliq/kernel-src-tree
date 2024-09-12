@@ -1,0 +1,322 @@
+memcg: switch lruvec stats to rstat
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Shakeel Butt <shakeelb@google.com>
+commit 7e1c0d6f58207e7e60674647d3935f446f05613c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/7e1c0d6f.failed
+
+The commit 2d146aa3aa84 ("mm: memcontrol: switch to rstat") switched memcg
+stats to rstat infrastructure but skipped the conversion of the lruvec
+stats as such stats are read in the performance critical code paths and
+flushing stats may have impacted the performances of the applications.
+This patch converts the lruvec stats to rstat and later patches add
+mechanisms to keep the performance impact to minimum.
+
+The rstat conversion comes with the price i.e.  memory cost.  Effectively
+this patch reverts the savings done by the commit f3344adf38bd ("mm:
+memcontrol: optimize per-lruvec stats counter memory usage").  However
+this cost is justified due to negative impact of the inaccurate lruvec
+stats on many heuristics.  One such case is reported in [1].
+
+The memory reclaim code is filled with plethora of heuristics and many of
+those heuristics reads the lruvec stats.  So, inaccurate stats can make
+such heuristics ineffective.  [1] reports the impact of inaccurate lruvec
+stats on the "cache trim mode" heuristic.  Inaccurate lruvec stats can
+impact the deactivation and aging anon heuristics as well.
+
+[1] https://lore.kernel.org/linux-mm/20210311004449.1170308-1-ying.huang@intel.com/
+
+Link: https://lkml.kernel.org/r/20210716212137.1391164-1-shakeelb@google.com
+Link: https://lkml.kernel.org/r/20210714013948.270662-1-shakeelb@google.com
+	Signed-off-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Muchun Song <songmuchun@bytedance.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Huang Ying <ying.huang@intel.com>
+	Cc: Hillf Danton <hdanton@sina.com>
+	Cc: Michal Koutný <mkoutny@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7e1c0d6f58207e7e60674647d3935f446f05613c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+#	mm/memcontrol.c
+diff --cc include/linux/memcontrol.h
+index 99cbfe3d87a3,47d35bef9f6e..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -129,23 -137,14 +137,34 @@@ struct lruvec_stats 
+  struct mem_cgroup_per_node {
+  	struct lruvec		lruvec;
+  
+++<<<<<<< HEAD
+ +	/* Subtree VM stats (batched updates) */
+ +	RH_KABI_REPLACE(struct lruvec_stat __percpu *lruvec_stat_cpu,
+ +			struct batched_lruvec_stat __percpu *lruvec_stat_cpu)
+ +	atomic_long_t		lruvec_stat[NR_VM_NODE_STAT_ITEMS];
+ +
+ +	unsigned long		lru_zone_size[MAX_NR_ZONES][NR_LRU_LISTS];
+ +
+ +	RH_KABI_REPLACE_SPLIT(struct mem_cgroup_reclaim_iter iter[DEF_PRIORITY + 1],
+ +			      struct mem_cgroup_reclaim_iter iter,
+ +	/*
+ +	 * Legacy local VM stats. This should be struct lruvec_stat and
+ +	 * cannot be optimized to struct batched_lruvec_stat. Because
+ +	 * the threshold of the lruvec_stat_cpu can be as big as
+ +	 * MEMCG_CHARGE_BATCH * PAGE_SIZE. It can fit into s32. But this
+ +	 * filed has no upper limit.
+ +	 */
+ +			      struct lruvec_stat __percpu *lruvec_stat_local)
+++=======
++ 	struct lruvec_stats_percpu __percpu	*lruvec_stats_percpu;
++ 	struct lruvec_stats			lruvec_stats;
++ 
++ 	unsigned long		lru_zone_size[MAX_NR_ZONES][NR_LRU_LISTS];
++ 
++ 	struct mem_cgroup_reclaim_iter	iter;
++ 
++ 	struct shrinker_info __rcu	*shrinker_info;
+++>>>>>>> 7e1c0d6f5820 (memcg: switch lruvec stats to rstat)
+  
+  	struct rb_node		tree_node;	/* RB tree node */
+  	unsigned long		usage_in_excess;/* Set to the value by which */
+@@@ -1016,11 -1014,8 +1035,11 @@@ static inline unsigned long lruvec_page
+  		return node_page_state(lruvec_pgdat(lruvec), idx);
+  
+  	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
+ +	if (pn->memcg->percpu_stats_disabled)
+ +		return 0;
+ +
+  	for_each_possible_cpu(cpu)
+- 		x += per_cpu(pn->lruvec_stat_local->count[idx], cpu);
++ 		x += per_cpu(pn->lruvec_stats_percpu->state[idx], cpu);
+  #ifdef CONFIG_SMP
+  	if (x < 0)
+  		x = 0;
+diff --cc mm/memcontrol.c
+index 6bc1413fddb1,400d210e030a..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -797,80 -660,20 +797,87 @@@ static unsigned long memcg_page_state_l
+  	return x;
+  }
+  
+++<<<<<<< HEAD
+ +static struct mem_cgroup_per_node *
+ +parent_nodeinfo(struct mem_cgroup_per_node *pn, int nid)
+ +{
+ +	struct mem_cgroup *parent;
+ +
+ +	parent = parent_mem_cgroup(pn->memcg);
+ +	if (!parent)
+ +		return NULL;
+ +	return parent->nodeinfo[nid];
+ +}
+ +
+ +static inline bool memcg_percpu_vmstats_flushed(struct mem_cgroup *memcg)
+ +{
+ +	return memcg->percpu_stats_disabled >= MEMCG_PERCPU_VMSTATS_FLUSHED;
+ +}
+ +
+ +static inline bool memcg_percpu_stats_flushed(struct mem_cgroup *memcg)
+ +{
+ +	return memcg->percpu_stats_disabled >= MEMCG_PERCPU_STATS_FLUSHED;
+ +}
+ +
+++=======
+++>>>>>>> 7e1c0d6f5820 (memcg: switch lruvec stats to rstat)
+  void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
+  			      int val)
+  {
+  	struct mem_cgroup_per_node *pn;
+  	struct mem_cgroup *memcg;
+- 	long x, threshold = MEMCG_CHARGE_BATCH;
+  
+  	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
+ -	memcg = pn->memcg;
+ +
+ +	__memcg_stats_lock();
+ +	/* Update lruvec */
+ +	if (!pn->memcg->percpu_stats_disabled)
+ +		__this_cpu_add(pn->lruvec_stat_local->count[idx], val);
+ +
+ +	memcg = percpu_stats_memcg(pn->memcg, &pn);
+ +
+ +	/*
+ +	 * The caller from rmap relay on disabled preemption becase they never
+ +	 * update their counter from in-interrupt context. For these two
+ +	 * counters we check that the update is never performed from an
+ +	 * interrupt context while other caller need to have disabled interrupt.
+ +	 */
+ +	if (IS_ENABLED(CONFIG_DEBUG_VM) && !IS_ENABLED(CONFIG_PREEMPT_RT)) {
+ +		switch (idx) {
+ +		case NR_ANON_MAPPED:
+ +		case NR_FILE_MAPPED:
+ +		case NR_ANON_THPS:
+ +		case NR_SHMEM_PMDMAPPED:
+ +		case NR_FILE_PMDMAPPED:
+ +			WARN_ON_ONCE(!in_task());
+ +			break;
+ +		default:
+ +			WARN_ON_ONCE(!irqs_disabled());
+ +		}
+ +	}
+  
+  	/* Update memcg */
+  	__mod_memcg_state(memcg, idx, val);
+  
+++<<<<<<< HEAD
+ +	if (vmstat_item_in_bytes(idx))
+ +		threshold <<= PAGE_SHIFT;
+ +
+ +	x = val + __this_cpu_read(pn->lruvec_stat_cpu->count[idx]);
+ +	if (unlikely(abs(x) > threshold)) {
+ +		pg_data_t *pgdat = lruvec_pgdat(lruvec);
+ +		struct mem_cgroup_per_node *pi;
+ +
+ +		for (pi = pn; pi; pi = parent_nodeinfo(pi, pgdat->node_id))
+ +			atomic_long_add(x, &pi->lruvec_stat[idx]);
+ +		x = 0;
+ +	}
+ +	__this_cpu_write(pn->lruvec_stat_cpu->count[idx], x);
+ +	memcg_stats_unlock();
+++=======
++ 	/* Update lruvec */
++ 	__this_cpu_add(pn->lruvec_stats_percpu->state[idx], val);
+++>>>>>>> 7e1c0d6f5820 (memcg: switch lruvec stats to rstat)
+  }
+  
+  /**
+@@@ -2386,47 -2252,13 +2393,56 @@@ static void drain_all_stock(struct mem_
+  	mutex_unlock(&percpu_charge_mutex);
+  }
+  
+++<<<<<<< HEAD
+ +static void memcg_flush_lruvec_page_state(struct mem_cgroup *memcg, int cpu)
+ +{
+ +	int nid;
+ +
+ +	if (memcg_percpu_stats_flushed(memcg))
+ +		return;
+ +
+ +	for_each_node(nid) {
+ +		struct mem_cgroup_per_node *pn = memcg->nodeinfo[nid];
+ +		unsigned long stat[NR_VM_NODE_STAT_ITEMS];
+ +		struct batched_lruvec_stat *lstatc;
+ +		int i;
+ +
+ +		lstatc = per_cpu_ptr(pn->lruvec_stat_cpu, cpu);
+ +		for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++) {
+ +			stat[i] = lstatc->count[i];
+ +			lstatc->count[i] = 0;
+ +		}
+ +
+ +		do {
+ +			for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++)
+ +				atomic_long_add(stat[i], &pn->lruvec_stat[i]);
+ +		} while ((pn = parent_nodeinfo(pn, nid)));
+ +	}
+ +}
+ +
+ +static int memcg_hotplug_cpu_dead(unsigned int cpu)
+ +{
+ +	struct memcg_stock_pcp *stock;
+ +	struct mem_cgroup *memcg;
+ +	unsigned long flags;
+++=======
++ static int memcg_hotplug_cpu_dead(unsigned int cpu)
++ {
++ 	struct memcg_stock_pcp *stock;
+++>>>>>>> 7e1c0d6f5820 (memcg: switch lruvec stats to rstat)
+  
+  	stock = &per_cpu(memcg_stock, cpu);
+  	drain_stock(stock);
+  
+++<<<<<<< HEAD
+ +	for_each_mem_cgroup(memcg) {
+ +		spin_lock_irqsave(&lruvec_stats_flush_lock, flags);
+ +		memcg_flush_lruvec_page_state(memcg, cpu);
+ +		spin_unlock_irqrestore(&lruvec_stats_flush_lock, flags);
+ +	}
+ +
+++=======
+++>>>>>>> 7e1c0d6f5820 (memcg: switch lruvec stats to rstat)
+  	return 0;
+  }
+  
+@@@ -5298,6 -5088,7 +5306,10 @@@ static void free_mem_cgroup_per_node_in
+  	if (!pn)
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	free_percpu(pn->lruvec_stats_percpu);
+++>>>>>>> 7e1c0d6f5820 (memcg: switch lruvec stats to rstat)
+  	kfree(pn);
+  }
+  
+@@@ -5595,11 -5337,8 +5607,11 @@@ static void mem_cgroup_css_rstat_flush(
+  	struct mem_cgroup *parent = parent_mem_cgroup(memcg);
+  	struct memcg_vmstats_percpu *statc;
+  	long delta, v;
+- 	int i;
++ 	int i, nid;
+  
+ +	if (memcg_percpu_vmstats_flushed(memcg))
+ +		return;
+ +
+  	statc = per_cpu_ptr(memcg->vmstats_percpu, cpu);
+  
+  	for (i = 0; i < MEMCG_NR_STAT; i++) {
+@@@ -5642,10 -5381,40 +5654,40 @@@
+  		if (!delta)
+  			continue;
+  
+ -		memcg->vmstats.events[i] += delta;
+ +		memcg->vmstats->events[i] += delta;
+  		if (parent)
+ -			parent->vmstats.events_pending[i] += delta;
+ +			parent->vmstats->events_pending[i] += delta;
+  	}
++ 
++ 	for_each_node_state(nid, N_MEMORY) {
++ 		struct mem_cgroup_per_node *pn = memcg->nodeinfo[nid];
++ 		struct mem_cgroup_per_node *ppn = NULL;
++ 		struct lruvec_stats_percpu *lstatc;
++ 
++ 		if (parent)
++ 			ppn = parent->nodeinfo[nid];
++ 
++ 		lstatc = per_cpu_ptr(pn->lruvec_stats_percpu, cpu);
++ 
++ 		for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++) {
++ 			delta = pn->lruvec_stats.state_pending[i];
++ 			if (delta)
++ 				pn->lruvec_stats.state_pending[i] = 0;
++ 
++ 			v = READ_ONCE(lstatc->state[i]);
++ 			if (v != lstatc->state_prev[i]) {
++ 				delta += v - lstatc->state_prev[i];
++ 				lstatc->state_prev[i] = v;
++ 			}
++ 
++ 			if (!delta)
++ 				continue;
++ 
++ 			pn->lruvec_stats.state[i] += delta;
++ 			if (ppn)
++ 				ppn->lruvec_stats.state_pending[i] += delta;
++ 		}
++ 	}
+  }
+  
+  #ifdef CONFIG_MMU
+* Unmerged path include/linux/memcontrol.h
+* Unmerged path mm/memcontrol.c
