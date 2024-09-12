@@ -1,0 +1,346 @@
+cifs: connect individual channel servers to primary channel server
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.16.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit 0f2b305af944973d6fa4acdb97151efe5b64aa55
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.16.1.el8_10/0f2b305a.failed
+
+Today, we don't have any way to get the smb session for any
+of the secondary channels. Introducing a pointer to the primary
+server from server struct of any secondary channel. The value will
+be NULL for the server of the primary channel. This will enable us
+to get the smb session for any channel.
+
+This will be needed for some of the changes that I'm planning
+to make soon.
+
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 0f2b305af944973d6fa4acdb97151efe5b64aa55)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsproto.h
+#	fs/cifs/connect.c
+diff --cc fs/cifs/cifsproto.h
+index 8c76792c0d0f,f3073a62ce57..000000000000
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@@ -255,7 -254,24 +255,28 @@@ extern void cifs_add_pending_open_locke
+  					 struct tcon_link *tlink,
+  					 struct cifs_pending_open *open);
+  extern void cifs_del_pending_open(struct cifs_pending_open *open);
+++<<<<<<< HEAD
+ +extern struct TCP_Server_Info *cifs_get_tcp_session(struct smb3_fs_context *ctx);
+++=======
++ 
++ extern bool cifs_is_deferred_close(struct cifsFileInfo *cfile,
++ 				struct cifs_deferred_close **dclose);
++ 
++ extern void cifs_add_deferred_close(struct cifsFileInfo *cfile,
++ 				struct cifs_deferred_close *dclose);
++ 
++ extern void cifs_del_deferred_close(struct cifsFileInfo *cfile);
++ 
++ extern void cifs_close_deferred_file(struct cifsInodeInfo *cifs_inode);
++ 
++ extern void cifs_close_all_deferred_files(struct cifs_tcon *cifs_tcon);
++ 
++ extern void cifs_close_deferred_file_under_dentry(struct cifs_tcon *cifs_tcon,
++ 				const char *path);
++ extern struct TCP_Server_Info *
++ cifs_get_tcp_session(struct smb3_fs_context *ctx,
++ 		     struct TCP_Server_Info *primary_server);
+++>>>>>>> 0f2b305af944 (cifs: connect individual channel servers to primary channel server)
+  extern void cifs_put_tcp_session(struct TCP_Server_Info *server,
+  				 int from_reconnect);
+  extern void cifs_put_tcon(struct cifs_tcon *tcon);
+diff --cc fs/cifs/connect.c
+index 742ea65b9f77,f80b73f2d0a0..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -159,139 -162,38 +159,158 @@@ static void cifs_resolve_server(struct 
+  	mutex_unlock(&server->srv_mutex);
+  }
+  
+ -/**
+ - * Mark all sessions and tcons for reconnect.
+ +#ifdef CONFIG_CIFS_DFS_UPCALL
+ +/* These functions must be called with server->srv_mutex held */
+ +static void reconn_set_next_dfs_target(struct TCP_Server_Info *server,
+ +				       struct cifs_sb_info *cifs_sb,
+ +				       struct dfs_cache_tgt_list *tgt_list,
+ +				       struct dfs_cache_tgt_iterator **tgt_it)
+ +{
+ +	const char *name;
+ +	int rc;
+ +
+ +	if (!cifs_sb || !cifs_sb->origin_fullpath)
+ +		return;
+ +
+ +	if (!*tgt_it) {
+ +		*tgt_it = dfs_cache_get_tgt_iterator(tgt_list);
+ +	} else {
+ +		*tgt_it = dfs_cache_get_next_tgt(tgt_list, *tgt_it);
+ +		if (!*tgt_it)
+ +			*tgt_it = dfs_cache_get_tgt_iterator(tgt_list);
+ +	}
+ +
+ +	cifs_dbg(FYI, "%s: UNC: %s\n", __func__, cifs_sb->origin_fullpath);
+ +
+ +	name = dfs_cache_get_tgt_name(*tgt_it);
+ +
+ +	kfree(server->hostname);
+ +
+ +	server->hostname = extract_hostname(name);
+ +	if (IS_ERR(server->hostname)) {
+ +		cifs_dbg(FYI,
+ +			 "%s: failed to extract hostname from target: %ld\n",
+ +			 __func__, PTR_ERR(server->hostname));
+ +		return;
+ +	}
+ +
+ +	rc = reconn_set_ipaddr_from_hostname(server);
+ +	if (rc) {
+ +		cifs_dbg(FYI, "%s: failed to resolve hostname: %d\n",
+ +			 __func__, rc);
+ +	}
+ +}
+ +
+ +static inline int reconn_setup_dfs_targets(struct cifs_sb_info *cifs_sb,
+ +					   struct dfs_cache_tgt_list *tl)
+ +{
+ +	if (!cifs_sb->origin_fullpath)
+ +		return -EOPNOTSUPP;
+ +	return dfs_cache_noreq_find(cifs_sb->origin_fullpath + 1, NULL, tl);
+ +}
+ +#endif
+ +
+ +/*
+ + * cifs tcp session reconnection
+   *
+ - * @server needs to be previously set to CifsNeedReconnect.
+ + * mark tcp session as reconnecting so temporarily locked
+ + * mark all smb sessions as reconnecting for tcp session
+ + * reconnect tcp session
+ + * wake up waiters on reconnection? - (not needed currently)
+   */
+ -static void cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server)
+ +int
+ +cifs_reconnect(struct TCP_Server_Info *server)
+  {
+ +	int rc = 0;
+ +	struct list_head *tmp, *tmp2;
+  	struct cifs_ses *ses;
+  	struct cifs_tcon *tcon;
+ -	struct mid_q_entry *mid, *nmid;
+ +	struct mid_q_entry *mid_entry;
+  	struct list_head retry_list;
+++<<<<<<< HEAD
+ +#ifdef CONFIG_CIFS_DFS_UPCALL
+ +	struct super_block *sb = NULL;
+ +	struct cifs_sb_info *cifs_sb = NULL;
+ +	struct dfs_cache_tgt_list tgt_list = DFS_CACHE_TGT_LIST_INIT(tgt_list);
+ +	struct dfs_cache_tgt_iterator *tgt_it = NULL;
+ +#endif
+++=======
++ 	struct TCP_Server_Info *pserver;
+++>>>>>>> 0f2b305af944 (cifs: connect individual channel servers to primary channel server)
+  
+ +	spin_lock(&GlobalMid_Lock);
+ +	server->nr_targets = 1;
+ +#ifdef CONFIG_CIFS_DFS_UPCALL
+ +	spin_unlock(&GlobalMid_Lock);
+ +	sb = cifs_get_tcp_super(server);
+ +	if (IS_ERR(sb)) {
+ +		rc = PTR_ERR(sb);
+ +		cifs_dbg(FYI, "%s: will not do DFS failover: rc = %d\n",
+ +			 __func__, rc);
+ +		sb = NULL;
+ +	} else {
+ +		cifs_sb = CIFS_SB(sb);
+ +		rc = reconn_setup_dfs_targets(cifs_sb, &tgt_list);
+ +		if (rc) {
+ +			cifs_sb = NULL;
+ +			if (rc != -EOPNOTSUPP) {
+ +				cifs_server_dbg(VFS, "%s: no target servers for DFS failover\n",
+ +						__func__);
+ +			}
+ +		} else {
+ +			server->nr_targets = dfs_cache_get_nr_tgts(&tgt_list);
+ +		}
+ +	}
+ +	cifs_dbg(FYI, "%s: will retry %d target(s)\n", __func__,
+ +		 server->nr_targets);
+ +	spin_lock(&GlobalMid_Lock);
+ +#endif
+ +	if (server->tcpStatus == CifsExiting) {
+ +		/* the demux thread will exit normally
+ +		next time through the loop */
+ +		spin_unlock(&GlobalMid_Lock);
+ +#ifdef CONFIG_CIFS_DFS_UPCALL
+ +		dfs_cache_free_tgts(&tgt_list);
+ +		cifs_put_tcp_super(sb);
+ +#endif
+ +		wake_up(&server->response_q);
+ +		return rc;
+ +	} else
+ +		server->tcpStatus = CifsNeedReconnect;
+ +	spin_unlock(&GlobalMid_Lock);
+  	server->maxBuf = 0;
+  	server->max_read = 0;
+  
+  	cifs_dbg(FYI, "Mark tcp session as need reconnect\n");
+++<<<<<<< HEAD
+ +	trace_smb3_reconnect(server->CurrentMid, server->hostname);
+ +
+ +	/* before reconnecting the tcp session, mark the smb session (uid)
+ +		and the tid bad so they are not used until reconnected */
+ +	cifs_dbg(FYI, "%s: marking sessions and tcons for reconnect\n",
+ +		 __func__);
+ +	spin_lock(&cifs_tcp_ses_lock);
+ +	list_for_each(tmp, &server->smb_ses_list) {
+ +		ses = list_entry(tmp, struct cifs_ses, smb_ses_list);
+++=======
++ 	trace_smb3_reconnect(server->CurrentMid, server->conn_id, server->hostname);
++ 	/*
++ 	 * before reconnecting the tcp session, mark the smb session (uid) and the tid bad so they
++ 	 * are not used until reconnected.
++ 	 */
++ 	cifs_dbg(FYI, "%s: marking sessions and tcons for reconnect\n", __func__);
++ 
++ 	/* If server is a channel, select the primary channel */
++ 	pserver = CIFS_SERVER_IS_CHAN(server) ? server->primary_server : server;
++ 
++ 	spin_lock(&cifs_tcp_ses_lock);
++ 	list_for_each_entry(ses, &pserver->smb_ses_list, smb_ses_list) {
+++>>>>>>> 0f2b305af944 (cifs: connect individual channel servers to primary channel server)
+  		ses->need_reconnect = true;
+ -		list_for_each_entry(tcon, &ses->tcon_list, tcon_list)
+ +		list_for_each(tmp2, &ses->tcon_list) {
+ +			tcon = list_entry(tmp2, struct cifs_tcon, tcon_list);
+  			tcon->need_reconnect = true;
+ +		}
+  		if (ses->tcon_ipc)
+  			ses->tcon_ipc->need_reconnect = true;
+  	}
+@@@ -2908,31 -2963,26 +2938,31 @@@ static inline void mount_put_conns(stru
+  }
+  
+  /* Get connections for tcp, ses and tcon */
+ -static int mount_get_conns(struct mount_ctx *mnt_ctx)
+ +static int mount_get_conns(struct smb3_fs_context *ctx, struct cifs_sb_info *cifs_sb,
+ +			   unsigned int *xid,
+ +			   struct TCP_Server_Info **nserver,
+ +			   struct cifs_ses **nses, struct cifs_tcon **ntcon)
+  {
+  	int rc = 0;
+ -	struct TCP_Server_Info *server = NULL;
+ -	struct cifs_ses *ses = NULL;
+ -	struct cifs_tcon *tcon = NULL;
+ -	struct smb3_fs_context *ctx = mnt_ctx->fs_ctx;
+ -	struct cifs_sb_info *cifs_sb = mnt_ctx->cifs_sb;
+ -	unsigned int xid;
+ +	struct TCP_Server_Info *server;
+ +	struct cifs_ses *ses;
+ +	struct cifs_tcon *tcon;
+  
+ -	xid = get_xid();
+ +	*nserver = NULL;
+ +	*nses = NULL;
+ +	*ntcon = NULL;
+ +
+ +	*xid = get_xid();
+  
+  	/* get a reference to a tcp session */
+- 	server = cifs_get_tcp_session(ctx);
++ 	server = cifs_get_tcp_session(ctx, NULL);
+  	if (IS_ERR(server)) {
+  		rc = PTR_ERR(server);
+ -		server = NULL;
+ -		goto out;
+ +		return rc;
+  	}
+  
+ +	*nserver = server;
+ +
+  	/* get a reference to a SMB session */
+  	ses = cifs_get_smb_ses(server, ctx);
+  	if (IS_ERR(ses)) {
+diff --git a/fs/cifs/cifs_debug.c b/fs/cifs/cifs_debug.c
+index c18333741daf..2a6fd258d9ff 100644
+--- a/fs/cifs/cifs_debug.c
++++ b/fs/cifs/cifs_debug.c
+@@ -288,7 +288,8 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
+ 	c = 0;
+ 	spin_lock(&cifs_tcp_ses_lock);
+ 	list_for_each_entry(server, &cifs_tcp_ses_list, tcp_ses_list) {
+-		if (server->is_channel)
++		/* channel info will be printed as a part of sessions below */
++		if (CIFS_SERVER_IS_CHAN(server))
+ 			continue;
+ 
+ 		c++;
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index 644510986a8e..5ac048b99c2b 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -698,7 +698,15 @@ struct TCP_Server_Info {
+ 	 */
+ 	int nr_targets;
+ 	bool noblockcnt; /* use non-blocking connect() */
+-	bool is_channel; /* if a session channel */
++
++	/*
++	 * If this is a session channel,
++	 * primary_server holds the ref-counted
++	 * pointer to primary channel connection for the session.
++	 */
++#define CIFS_SERVER_IS_CHAN(server)	(!!(server)->primary_server)
++	struct TCP_Server_Info *primary_server;
++
+ #ifdef CONFIG_CIFS_SWN_UPCALL
+ 	bool use_swn_dstaddr;
+ 	struct sockaddr_storage swn_dstaddr;
+* Unmerged path fs/cifs/cifsproto.h
+* Unmerged path fs/cifs/connect.c
+diff --git a/fs/cifs/sess.c b/fs/cifs/sess.c
+index 91661788d05c..55d85014d320 100644
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@ -270,7 +270,7 @@ cifs_ses_add_channel(struct cifs_sb_info *cifs_sb, struct cifs_ses *ses,
+ 	       SMB2_CLIENT_GUID_SIZE);
+ 	ctx.use_client_guid = true;
+ 
+-	chan_server = cifs_get_tcp_session(&ctx);
++	chan_server = cifs_get_tcp_session(&ctx, ses->server);
+ 
+ 	mutex_lock(&ses->session_mutex);
+ 	spin_lock(&ses->chan_lock);
+@@ -284,10 +284,6 @@ cifs_ses_add_channel(struct cifs_sb_info *cifs_sb, struct cifs_ses *ses,
+ 	}
+ 	spin_unlock(&ses->chan_lock);
+ 
+-	spin_lock(&cifs_tcp_ses_lock);
+-	chan->server->is_channel = true;
+-	spin_unlock(&cifs_tcp_ses_lock);
+-
+ 	/*
+ 	 * We need to allocate the server crypto now as we will need
+ 	 * to sign packets before we generate the channel signing key
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index cbf14ad2ba8d..cd32a68b37ba 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -266,7 +266,7 @@ smb2_reconnect(__le16 smb2_command, struct cifs_tcon *tcon,
+ 	/*
+ 	 * If we are reconnecting an extra channel, bind
+ 	 */
+-	if (server->is_channel) {
++	if (CIFS_SERVER_IS_CHAN(server)) {
+ 		ses->binding = true;
+ 		ses->binding_chan = cifs_ses_find_chan(ses, server);
+ 	}
