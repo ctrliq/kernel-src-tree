@@ -114,7 +114,7 @@ static int check_cpu_topology(char *path, struct perf_cpu_map *map)
 	 * test if physical_package_id returns -1 for cpu from perf_cpu_map.
 	 */
 	if (!strncmp(session->header.env.arch, "ppc64le", 7)) {
-		if (cpu__get_socket_id(perf_cpu_map__cpu(map, 0)) == -1)
+		if (cpu_map__get_socket_id(perf_cpu_map__cpu(map, 0)) == -1)
 			return TEST_SKIP;
 	}
 
