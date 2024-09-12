@@ -1,0 +1,589 @@
+ice: use src VSI instead of src MAC in slow-path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-535.el8
+commit-author Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+commit 0ef4479d13af4c5516920520d9cf7bcfe801b353
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-535.el8/0ef4479d.failed
+
+The use of a source MAC to direct packets from the VF to the corresponding
+port representor is only ok if there is only one MAC on a VF. To support
+this functionality when the number of MACs on a VF is greater, it is
+necessary to match a source VSI instead of a source MAC.
+
+Let's use the new switch API that allows matching on metadata.
+
+If MAC isn't used in match criteria there is no need to handle adding
+rule after virtchnl command. Instead add new rule while port representor
+is being configured.
+
+Remove rule_added field, checking for sp_rule can be used instead.
+Remove also checking for switchdev running in deleting rule as it can be
+called from unroll context when running flag isn't set. Checking for
+sp_rule covers both context (with and without running flag).
+
+Rules are added in eswitch configuration flow, so there is no need to
+have replay function.
+
+	Signed-off-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+	Reviewed-by: Piotr Raczynski <piotr.raczynski@intel.com>
+	Reviewed-by: Simon Horman <simon.horman@corigine.com>
+	Reviewed-by: Leon Romanovsky <leonro@nvidia.com>
+	Tested-by: Sujai Buvaneswaran <sujai.buvaneswaran@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 0ef4479d13af4c5516920520d9cf7bcfe801b353)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_protocol_type.h
+#	drivers/net/ethernet/intel/ice/ice_switch.c
+#	drivers/net/ethernet/intel/ice/ice_switch.h
+diff --cc drivers/net/ethernet/intel/ice/ice_protocol_type.h
+index 454ed0bc710f,6a9364761165..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_protocol_type.h
++++ b/drivers/net/ethernet/intel/ice/ice_protocol_type.h
+@@@ -212,6 -221,191 +212,194 @@@ struct ice_nvgre_hdr 
+  	__be32 tni_flow;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Metadata information
++  *
++  * Not all MDIDs can be used by switch block. It depends on package version.
++  *
++  * MDID 16 (Rx offset)
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |  A  |   B     |   Reserved    |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * A = Source port where the transaction came from (3b).
++  *
++  * B = Destination TC of the packet. The TC is relative to a port (5b).
++  *
++  * MDID 17
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |      PTYPE        | Reserved  |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * PTYPE = Encodes the packet type (10b).
++  *
++  * MDID 18
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * | Packet length             | R |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * Packet length = Length of the packet in bytes
++  *		   (packet always carriers CRC) (14b).
++  * R = Reserved (2b).
++  *
++  * MDID 19
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |   Source VSI      | Reserved  |
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * Source VSI = Source VSI of packet loopbacked in switch (for egress) (10b).
++  */
++ #define ICE_MDID_SOURCE_VSI_MASK GENMASK(9, 0)
++ 
++ /*
++  * MDID 20
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |A|B|C|D|E|F|R|R|G|H|I|J|K|L|M|N|
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * A = DSI - set for DSI RX pkts.
++  * B = ipsec_decrypted - invalid on NIC.
++  * C = marker - this is a marker packet.
++  * D = from_network - for TX sets to 0
++  *		      for RX:
++  *		        * 1 - packet is from external link
++  *		        * 0 - packet source is from internal
++  * E = source_interface_is_rx - reflect the physical interface from where the
++  *				packet was received:
++  *				* 1 - Rx
++  *				* 0 - Tx
++  * F = from_mng - The bit signals that the packet's origin is the management.
++  * G = ucast - Outer L2 MAC address is unicast.
++  * H = mcast - Outer L2 MAC address is multicast.
++  * I = bcast - Outer L2 MAC address is broadcast.
++  * J = second_outer_mac_present - 2 outer MAC headers are present in the packet.
++  * K = STAG or BVLAN - Outer L2 header has STAG (ethernet type 0x88a8) or
++  *		       BVLAN (ethernet type 0x88a8).
++  * L = ITAG - Outer L2 header has ITAG *ethernet type 0x88e7)
++  * M = EVLAN (0x8100) - Outer L2 header has EVLAN (ethernet type 0x8100)
++  * N = EVLAN (0x9100) - Outer L2 header has EVLAN (ethernet type 0x9100)
++  */
++ #define ICE_PKT_VLAN_STAG	BIT(12)
++ #define ICE_PKT_VLAN_ITAG	BIT(13)
++ #define ICE_PKT_VLAN_EVLAN	(BIT(14) | BIT(15))
++ #define ICE_PKT_VLAN_MASK	(ICE_PKT_VLAN_STAG | ICE_PKT_VLAN_ITAG | \
++ 				ICE_PKT_VLAN_EVLAN)
++ /* MDID 21
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |A|B|C|D|E|F|G|H|I|J|R|R|K|L|M|N|
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * A = VLAN (0x8100) - Outer L2 header has VLAN (ethernet type 0x8100)
++  * B = NSHoE - Outer L2 header has NSH (ethernet type 0x894f)
++  * C = MPLS (0x8847) - There is at least 1 MPLS tag in the outer header
++  *		       (ethernet type 0x8847)
++  * D = MPLS (0x8848) - There is at least 1 MPLS tag in the outer header
++  *		       (ethernet type 0x8848)
++  * E = multi MPLS - There is more than a single MPLS tag in the outer header
++  * F = inner MPLS - There is inner MPLS tag in the packet
++  * G = tunneled MAC - Set if the packet includes a tunneled MAC
++  * H = tunneled VLAN - Same as VLAN, but for a tunneled header
++  * I = pkt_is_frag - Packet is fragmented (ipv4 or ipv6)
++  * J = ipv6_ext - The packet has routing or destination ipv6 extension in inner
++  *		  or outer ipv6 headers
++  * K = RoCE - UDP packet detected as RoCEv2
++  * L = UDP_XSUM_0 - Set to 1 if L4 checksum is 0 in a UDP packet
++  * M = ESP - This is a ESP packet
++  * N = NAT_ESP - This is a ESP packet encapsulated in UDP NAT
++  */
++ #define ICE_PKT_TUNNEL_MAC	BIT(6)
++ #define ICE_PKT_TUNNEL_VLAN	BIT(7)
++ #define ICE_PKT_TUNNEL_MASK	(ICE_PKT_TUNNEL_MAC | ICE_PKT_TUNNEL_VLAN)
++ 
++ /* MDID 22
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |A|B|C|D|E|F|  G  |H|I|J| K |L|M|
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * A = fin - fin flag in tcp header
++  * B = sync - sync flag in tcp header
++  * C = rst - rst flag in tcp header
++  * D = psh - psh flag in tcp header
++  * E = ack - ack flag in tcp header
++  * F = urg - urg flag in tcp header
++  * G = tunnel type (3b) - Flags used to decode tunnel type:
++  *			  * b000 - not a VXLAN/Geneve/GRE tunnel
++  *			  * b001 - VXLAN-GPE
++  *			  * b010 - VXLAN (non-GPE)
++  *			  * b011 - Geneve
++  *			  * b100 - GRE (no key, no xsum)
++  *			  * b101 - GREK (key, no xsum)
++  *			  * b110 - GREC (no key, xsum)
++  *			  * b111 - GREKC (key, xsum)
++  * H = UDP_GRE - Packet is UDP (VXLAN or VLAN_GPE or Geneve or MPLSoUDP or GRE)
++  *		 tunnel
++  * I = OAM - VXLAN/Geneve/tunneled NSH packet with the OAM bit set
++  * J = tunneled NSH - Packet has NSHoGRE or NSHoUDP
++  * K = switch (2b) - Direction on switch
++  *		     * b00 - normal
++  *		     * b01 - TX force only LAN
++  *		     * b10 - TX disable LAN
++  *		     * b11 - direct to VSI
++  * L = swpe - Represents SWPE bit in TX command
++  * M = sw_cmd - Switch command
++  *
++  * MDID 23
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  * |A|B|C|D|        R        |E|F|R|
++  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++  *
++  * A = MAC error - Produced by MAC according to L2 error conditions
++  * B = PPRS no offload - FIFO overflow in PPRS or any problematic condition in
++  *			 PPRS ANA
++  * C = abort - Set when malicious packet is detected
++  * D = partial analysis - ANA's analysing got cut in the middle
++  *			 (header > 504B etc.)
++  * E = FLM - Flow director hit indication
++  * F = FDLONG - Flow direector long bucket indication
++  *
++  */
++ #define ICE_MDID_SIZE 2
++ #define ICE_META_DATA_ID_HW 255
++ 
++ enum ice_hw_metadata_id {
++ 	ICE_SOURCE_PORT_MDID = 16,
++ 	ICE_PTYPE_MDID = 17,
++ 	ICE_PACKET_LENGTH_MDID = 18,
++ 	ICE_SOURCE_VSI_MDID = 19,
++ 	ICE_PKT_VLAN_MDID = 20,
++ 	ICE_PKT_TUNNEL_MDID = 21,
++ 	ICE_PKT_TCP_MDID = 22,
++ 	ICE_PKT_ERROR_MDID = 23,
++ };
++ 
++ enum ice_hw_metadata_offset {
++ 	ICE_SOURCE_PORT_MDID_OFFSET = ICE_MDID_SIZE * ICE_SOURCE_PORT_MDID,
++ 	ICE_PTYPE_MDID_OFFSET = ICE_MDID_SIZE * ICE_PTYPE_MDID,
++ 	ICE_PACKET_LENGTH_MDID_OFFSET = ICE_MDID_SIZE * ICE_PACKET_LENGTH_MDID,
++ 	ICE_SOURCE_VSI_MDID_OFFSET = ICE_MDID_SIZE * ICE_SOURCE_VSI_MDID,
++ 	ICE_PKT_VLAN_MDID_OFFSET = ICE_MDID_SIZE * ICE_PKT_VLAN_MDID,
++ 	ICE_PKT_TUNNEL_MDID_OFFSET = ICE_MDID_SIZE * ICE_PKT_TUNNEL_MDID,
++ 	ICE_PKT_TCP_MDID_OFFSET = ICE_MDID_SIZE * ICE_PKT_TCP_MDID,
++ 	ICE_PKT_ERROR_MDID_OFFSET = ICE_MDID_SIZE * ICE_PKT_ERROR_MDID,
++ };
++ 
++ enum ice_pkt_flags {
++ 	ICE_PKT_FLAGS_VLAN = 0,
++ 	ICE_PKT_FLAGS_TUNNEL = 1,
++ 	ICE_PKT_FLAGS_TCP = 2,
++ 	ICE_PKT_FLAGS_ERROR = 3,
++ };
++ 
++ struct ice_hw_metadata {
++ 	__be16 source_port;
++ 	__be16 ptype;
++ 	__be16 packet_length;
++ 	__be16 source_vsi;
++ 	__be16 flags[4];
++ };
++ 
+++>>>>>>> 0ef4479d13af (ice: use src VSI instead of src MAC in slow-path)
+  union ice_prot_hdr {
+  	struct ice_ether_hdr eth_hdr;
+  	struct ice_ethtype_hdr ethertype;
+diff --cc drivers/net/ethernet/intel/ice/ice_switch.c
+index a296d74d4420,2ea9e1ae5517..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_switch.c
++++ b/drivers/net/ethernet/intel/ice/ice_switch.c
+@@@ -5511,6 -5998,26 +5511,29 @@@ ice_adv_add_update_vsi_list(struct ice_
+  	return status;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void ice_rule_add_tunnel_metadata(struct ice_adv_lkup_elem *lkup)
++ {
++ 	lkup->type = ICE_HW_METADATA;
++ 	lkup->m_u.metadata.flags[ICE_PKT_FLAGS_TUNNEL] =
++ 		cpu_to_be16(ICE_PKT_TUNNEL_MASK);
++ }
++ 
++ void ice_rule_add_vlan_metadata(struct ice_adv_lkup_elem *lkup)
++ {
++ 	lkup->type = ICE_HW_METADATA;
++ 	lkup->m_u.metadata.flags[ICE_PKT_FLAGS_VLAN] =
++ 		cpu_to_be16(ICE_PKT_VLAN_MASK);
++ }
++ 
++ void ice_rule_add_src_vsi_metadata(struct ice_adv_lkup_elem *lkup)
++ {
++ 	lkup->type = ICE_HW_METADATA;
++ 	lkup->m_u.metadata.source_vsi = cpu_to_be16(ICE_MDID_SOURCE_VSI_MASK);
++ }
++ 
+++>>>>>>> 0ef4479d13af (ice: use src VSI instead of src MAC in slow-path)
+  /**
+   * ice_add_adv_rule - helper function to create an advanced switch rule
+   * @hw: pointer to the hardware structure
+diff --cc drivers/net/ethernet/intel/ice/ice_switch.h
+index d3caaa5116c8,c84b56fe84a5..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_switch.h
++++ b/drivers/net/ethernet/intel/ice/ice_switch.h
+@@@ -331,6 -342,9 +331,12 @@@ ice_free_res_cntr(struct ice_hw *hw, u
+  		  u16 counter_id);
+  
+  /* Switch/bridge related commands */
+++<<<<<<< HEAD
+++=======
++ void ice_rule_add_tunnel_metadata(struct ice_adv_lkup_elem *lkup);
++ void ice_rule_add_vlan_metadata(struct ice_adv_lkup_elem *lkup);
++ void ice_rule_add_src_vsi_metadata(struct ice_adv_lkup_elem *lkup);
+++>>>>>>> 0ef4479d13af (ice: use src VSI instead of src MAC in slow-path)
+  int
+  ice_add_adv_rule(struct ice_hw *hw, struct ice_adv_lkup_elem *lkups,
+  		 u16 lkups_cnt, struct ice_adv_rule_info *rinfo,
+diff --git a/drivers/net/ethernet/intel/ice/ice_eswitch.c b/drivers/net/ethernet/intel/ice/ice_eswitch.c
+index 8fbe7f8311cf..c735aa7f6f33 100644
+--- a/drivers/net/ethernet/intel/ice/ice_eswitch.c
++++ b/drivers/net/ethernet/intel/ice/ice_eswitch.c
+@@ -10,16 +10,15 @@
+ #include "ice_tc_lib.h"
+ 
+ /**
+- * ice_eswitch_add_vf_mac_rule - add adv rule with VF's MAC
++ * ice_eswitch_add_vf_sp_rule - add adv rule with VF's VSI index
+  * @pf: pointer to PF struct
+  * @vf: pointer to VF struct
+- * @mac: VF's MAC address
+  *
+  * This function adds advanced rule that forwards packets with
+- * VF's MAC address (src MAC) to the corresponding switchdev ctrl VSI queue.
++ * VF's VSI index to the corresponding switchdev ctrl VSI queue.
+  */
+-int
+-ice_eswitch_add_vf_mac_rule(struct ice_pf *pf, struct ice_vf *vf, const u8 *mac)
++static int
++ice_eswitch_add_vf_sp_rule(struct ice_pf *pf, struct ice_vf *vf)
+ {
+ 	struct ice_vsi *ctrl_vsi = pf->switchdev.control_vsi;
+ 	struct ice_adv_rule_info rule_info = { 0 };
+@@ -32,11 +31,9 @@ ice_eswitch_add_vf_mac_rule(struct ice_pf *pf, struct ice_vf *vf, const u8 *mac)
+ 	if (!list)
+ 		return -ENOMEM;
+ 
+-	list[0].type = ICE_MAC_OFOS;
+-	ether_addr_copy(list[0].h_u.eth_hdr.src_addr, mac);
+-	eth_broadcast_addr(list[0].m_u.eth_hdr.src_addr);
++	ice_rule_add_src_vsi_metadata(list);
+ 
+-	rule_info.sw_act.flag |= ICE_FLTR_TX;
++	rule_info.sw_act.flag = ICE_FLTR_TX;
+ 	rule_info.sw_act.vsi_handle = ctrl_vsi->idx;
+ 	rule_info.sw_act.fltr_act = ICE_FWD_TO_Q;
+ 	rule_info.sw_act.fwd_id.q_id = hw->func_caps.common_cap.rxq_first_id +
+@@ -44,63 +41,31 @@ ice_eswitch_add_vf_mac_rule(struct ice_pf *pf, struct ice_vf *vf, const u8 *mac)
+ 	rule_info.flags_info.act |= ICE_SINGLE_ACT_LB_ENABLE;
+ 	rule_info.flags_info.act_valid = true;
+ 	rule_info.tun_type = ICE_SW_TUN_AND_NON_TUN;
++	rule_info.src_vsi = vf->lan_vsi_idx;
+ 
+ 	err = ice_add_adv_rule(hw, list, lkups_cnt, &rule_info,
+-			       vf->repr->mac_rule);
++			       &vf->repr->sp_rule);
+ 	if (err)
+-		dev_err(ice_pf_to_dev(pf), "Unable to add VF mac rule in switchdev mode for VF %d",
++		dev_err(ice_pf_to_dev(pf), "Unable to add VF slow-path rule in switchdev mode for VF %d",
+ 			vf->vf_id);
+-	else
+-		vf->repr->rule_added = true;
+ 
+ 	kfree(list);
+ 	return err;
+ }
+ 
+ /**
+- * ice_eswitch_replay_vf_mac_rule - replay adv rule with VF's MAC
+- * @vf: pointer to vF struct
+- *
+- * This function replays VF's MAC rule after reset.
+- */
+-void ice_eswitch_replay_vf_mac_rule(struct ice_vf *vf)
+-{
+-	int err;
+-
+-	if (!ice_is_switchdev_running(vf->pf))
+-		return;
+-
+-	if (is_valid_ether_addr(vf->hw_lan_addr)) {
+-		err = ice_eswitch_add_vf_mac_rule(vf->pf, vf,
+-						  vf->hw_lan_addr);
+-		if (err) {
+-			dev_err(ice_pf_to_dev(vf->pf), "Failed to add MAC %pM for VF %d\n, error %d\n",
+-				vf->hw_lan_addr, vf->vf_id, err);
+-			return;
+-		}
+-		vf->num_mac++;
+-
+-		ether_addr_copy(vf->dev_lan_addr, vf->hw_lan_addr);
+-	}
+-}
+-
+-/**
+- * ice_eswitch_del_vf_mac_rule - delete adv rule with VF's MAC
++ * ice_eswitch_del_vf_sp_rule - delete adv rule with VF's VSI index
+  * @vf: pointer to the VF struct
+  *
+- * Delete the advanced rule that was used to forward packets with the VF's MAC
+- * address (src MAC) to the corresponding switchdev ctrl VSI queue.
++ * Delete the advanced rule that was used to forward packets with the VF's VSI
++ * index to the corresponding switchdev ctrl VSI queue.
+  */
+-void ice_eswitch_del_vf_mac_rule(struct ice_vf *vf)
++static void ice_eswitch_del_vf_sp_rule(struct ice_vf *vf)
+ {
+-	if (!ice_is_switchdev_running(vf->pf))
+-		return;
+-
+-	if (!vf->repr->rule_added)
++	if (!vf->repr)
+ 		return;
+ 
+-	ice_rem_adv_rule_by_id(&vf->pf->hw, vf->repr->mac_rule);
+-	vf->repr->rule_added = false;
++	ice_rem_adv_rule_by_id(&vf->pf->hw, &vf->repr->sp_rule);
+ }
+ 
+ /**
+@@ -236,6 +201,7 @@ ice_eswitch_release_reprs(struct ice_pf *pf, struct ice_vsi *ctrl_vsi)
+ 		ice_vsi_update_security(vsi, ice_vsi_ctx_set_antispoof);
+ 		metadata_dst_free(vf->repr->dst);
+ 		vf->repr->dst = NULL;
++		ice_eswitch_del_vf_sp_rule(vf);
+ 		ice_fltr_add_mac_and_broadcast(vsi, vf->hw_lan_addr,
+ 					       ICE_FWD_TO_VSI);
+ 
+@@ -263,25 +229,30 @@ static int ice_eswitch_setup_reprs(struct ice_pf *pf)
+ 		vf->repr->dst = metadata_dst_alloc(0, METADATA_HW_PORT_MUX,
+ 						   GFP_KERNEL);
+ 		if (!vf->repr->dst) {
+-			ice_fltr_add_mac_and_broadcast(vsi,
+-						       vf->hw_lan_addr,
++			ice_fltr_add_mac_and_broadcast(vsi, vf->hw_lan_addr,
++						       ICE_FWD_TO_VSI);
++			goto err;
++		}
++
++		if (ice_eswitch_add_vf_sp_rule(pf, vf)) {
++			ice_fltr_add_mac_and_broadcast(vsi, vf->hw_lan_addr,
+ 						       ICE_FWD_TO_VSI);
+ 			goto err;
+ 		}
+ 
+ 		if (ice_vsi_update_security(vsi, ice_vsi_ctx_clear_antispoof)) {
+-			ice_fltr_add_mac_and_broadcast(vsi,
+-						       vf->hw_lan_addr,
++			ice_fltr_add_mac_and_broadcast(vsi, vf->hw_lan_addr,
+ 						       ICE_FWD_TO_VSI);
++			ice_eswitch_del_vf_sp_rule(vf);
+ 			metadata_dst_free(vf->repr->dst);
+ 			vf->repr->dst = NULL;
+ 			goto err;
+ 		}
+ 
+ 		if (ice_vsi_add_vlan_zero(vsi)) {
+-			ice_fltr_add_mac_and_broadcast(vsi,
+-						       vf->hw_lan_addr,
++			ice_fltr_add_mac_and_broadcast(vsi, vf->hw_lan_addr,
+ 						       ICE_FWD_TO_VSI);
++			ice_eswitch_del_vf_sp_rule(vf);
+ 			metadata_dst_free(vf->repr->dst);
+ 			vf->repr->dst = NULL;
+ 			ice_vsi_update_security(vsi, ice_vsi_ctx_set_antispoof);
+diff --git a/drivers/net/ethernet/intel/ice/ice_eswitch.h b/drivers/net/ethernet/intel/ice/ice_eswitch.h
+index 6a413331572b..b18bf83a2f5b 100644
+--- a/drivers/net/ethernet/intel/ice/ice_eswitch.h
++++ b/drivers/net/ethernet/intel/ice/ice_eswitch.h
+@@ -20,11 +20,6 @@ bool ice_is_eswitch_mode_switchdev(struct ice_pf *pf);
+ void ice_eswitch_update_repr(struct ice_vsi *vsi);
+ 
+ void ice_eswitch_stop_all_tx_queues(struct ice_pf *pf);
+-int
+-ice_eswitch_add_vf_mac_rule(struct ice_pf *pf, struct ice_vf *vf,
+-			    const u8 *mac);
+-void ice_eswitch_replay_vf_mac_rule(struct ice_vf *vf);
+-void ice_eswitch_del_vf_mac_rule(struct ice_vf *vf);
+ 
+ void ice_eswitch_set_target_vsi(struct sk_buff *skb,
+ 				struct ice_tx_offload_params *off);
+@@ -34,15 +29,6 @@ ice_eswitch_port_start_xmit(struct sk_buff *skb, struct net_device *netdev);
+ static inline void ice_eswitch_release(struct ice_pf *pf) { }
+ 
+ static inline void ice_eswitch_stop_all_tx_queues(struct ice_pf *pf) { }
+-static inline void ice_eswitch_replay_vf_mac_rule(struct ice_vf *vf) { }
+-static inline void ice_eswitch_del_vf_mac_rule(struct ice_vf *vf) { }
+-
+-static inline int
+-ice_eswitch_add_vf_mac_rule(struct ice_pf *pf, struct ice_vf *vf,
+-			    const u8 *mac)
+-{
+-	return -EOPNOTSUPP;
+-}
+ 
+ static inline void
+ ice_eswitch_set_target_vsi(struct sk_buff *skb,
+* Unmerged path drivers/net/ethernet/intel/ice/ice_protocol_type.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_repr.c b/drivers/net/ethernet/intel/ice/ice_repr.c
+index 05f1c2276b48..3c4f86c10e57 100644
+--- a/drivers/net/ethernet/intel/ice/ice_repr.c
++++ b/drivers/net/ethernet/intel/ice/ice_repr.c
+@@ -306,14 +306,6 @@ static int ice_repr_add(struct ice_vf *vf)
+ 	if (!repr)
+ 		return -ENOMEM;
+ 
+-#ifdef CONFIG_ICE_SWITCHDEV
+-	repr->mac_rule = kzalloc(sizeof(*repr->mac_rule), GFP_KERNEL);
+-	if (!repr->mac_rule) {
+-		err = -ENOMEM;
+-		goto err_alloc_rule;
+-	}
+-#endif
+-
+ 	repr->netdev = alloc_etherdev(sizeof(struct ice_netdev_priv));
+ 	if (!repr->netdev) {
+ 		err =  -ENOMEM;
+@@ -360,11 +352,6 @@ static int ice_repr_add(struct ice_vf *vf)
+ 	free_netdev(repr->netdev);
+ 	repr->netdev = NULL;
+ err_alloc:
+-#ifdef CONFIG_ICE_SWITCHDEV
+-	kfree(repr->mac_rule);
+-	repr->mac_rule = NULL;
+-err_alloc_rule:
+-#endif
+ 	kfree(repr);
+ 	vf->repr = NULL;
+ 	return err;
+@@ -385,10 +372,6 @@ static void ice_repr_rem(struct ice_vf *vf)
+ 	ice_devlink_destroy_vf_port(vf);
+ 	free_netdev(vf->repr->netdev);
+ 	vf->repr->netdev = NULL;
+-#ifdef CONFIG_ICE_SWITCHDEV
+-	kfree(vf->repr->mac_rule);
+-	vf->repr->mac_rule = NULL;
+-#endif
+ 	kfree(vf->repr);
+ 	vf->repr = NULL;
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_repr.h b/drivers/net/ethernet/intel/ice/ice_repr.h
+index 378a45bfa256..9c2a6f496b3b 100644
+--- a/drivers/net/ethernet/intel/ice/ice_repr.h
++++ b/drivers/net/ethernet/intel/ice/ice_repr.h
+@@ -13,9 +13,8 @@ struct ice_repr {
+ 	struct net_device *netdev;
+ 	struct metadata_dst *dst;
+ #ifdef CONFIG_ICE_SWITCHDEV
+-	/* info about slow path MAC rule  */
+-	struct ice_rule_query_data *mac_rule;
+-	u8 rule_added;
++	/* info about slow path rule */
++	struct ice_rule_query_data sp_rule;
+ #endif
+ };
+ 
+* Unmerged path drivers/net/ethernet/intel/ice/ice_switch.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_switch.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_vf_lib.c b/drivers/net/ethernet/intel/ice/ice_vf_lib.c
+index 14da7ebaaead..d3a1d3dacfce 100644
+--- a/drivers/net/ethernet/intel/ice/ice_vf_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_vf_lib.c
+@@ -671,8 +671,6 @@ int ice_reset_vf(struct ice_vf *vf, u32 flags)
+ 	 */
+ 	ice_vf_clear_all_promisc_modes(vf, vsi);
+ 
+-	ice_eswitch_del_vf_mac_rule(vf);
+-
+ 	ice_vf_fdir_exit(vf);
+ 	ice_vf_fdir_init(vf);
+ 	/* clean VF control VSI when resetting VF since it should be setup
+@@ -698,7 +696,6 @@ int ice_reset_vf(struct ice_vf *vf, u32 flags)
+ 	}
+ 
+ 	ice_eswitch_update_repr(vsi);
+-	ice_eswitch_replay_vf_mac_rule(vf);
+ 
+ 	/* if the VF has been reset allow it to come up again */
+ 	ice_mbx_clear_malvf(&vf->mbx_info);
+diff --git a/drivers/net/ethernet/intel/ice/ice_virtchnl.c b/drivers/net/ethernet/intel/ice/ice_virtchnl.c
+index 87267cca97b2..59bf632120bd 100644
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl.c
+@@ -3732,7 +3732,6 @@ static int ice_vc_repr_add_mac(struct ice_vf *vf, u8 *msg)
+ 
+ 	for (i = 0; i < al->num_elements; i++) {
+ 		u8 *mac_addr = al->list[i].addr;
+-		int result;
+ 
+ 		if (!is_unicast_ether_addr(mac_addr) ||
+ 		    ether_addr_equal(mac_addr, vf->hw_lan_addr))
+@@ -3744,13 +3743,6 @@ static int ice_vc_repr_add_mac(struct ice_vf *vf, u8 *msg)
+ 			goto handle_mac_exit;
+ 		}
+ 
+-		result = ice_eswitch_add_vf_mac_rule(pf, vf, mac_addr);
+-		if (result) {
+-			dev_err(ice_pf_to_dev(pf), "Failed to add MAC %pM for VF %d\n, error %d\n",
+-				mac_addr, vf->vf_id, result);
+-			goto handle_mac_exit;
+-		}
+-
+ 		ice_vfhw_mac_add(vf, &al->list[i]);
+ 		vf->num_mac++;
+ 		break;
