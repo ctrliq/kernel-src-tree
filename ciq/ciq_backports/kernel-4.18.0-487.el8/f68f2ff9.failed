@@ -1,0 +1,664 @@
+fortify: Detect struct member overflows in memcpy() at compile-time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-487.el8
+commit-author Kees Cook <keescook@chromium.org>
+commit f68f2ff91512c199ec24883001245912afc17873
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-487.el8/f68f2ff9.failed
+
+memcpy() is dead; long live memcpy()
+
+tl;dr: In order to eliminate a large class of common buffer overflow
+flaws that continue to persist in the kernel, have memcpy() (under
+CONFIG_FORTIFY_SOURCE) perform bounds checking of the destination struct
+member when they have a known size. This would have caught all of the
+memcpy()-related buffer write overflow flaws identified in at least the
+last three years.
+
+Background and analysis:
+
+While stack-based buffer overflow flaws are largely mitigated by stack
+canaries (and similar) features, heap-based buffer overflow flaws continue
+to regularly appear in the kernel. Many classes of heap buffer overflows
+are mitigated by FORTIFY_SOURCE when using the strcpy() family of
+functions, but a significant number remain exposed through the memcpy()
+family of functions.
+
+At its core, FORTIFY_SOURCE uses the compiler's __builtin_object_size()
+internal[0] to determine the available size at a target address based on
+the compile-time known structure layout details. It operates in two
+modes: outer bounds (0) and inner bounds (1). In mode 0, the size of the
+enclosing structure is used. In mode 1, the size of the specific field
+is used. For example:
+
+	struct object {
+		u16 scalar1;	/* 2 bytes */
+		char array[6];	/* 6 bytes */
+		u64 scalar2;	/* 8 bytes */
+		u32 scalar3;	/* 4 bytes */
+		u32 scalar4;	/* 4 bytes */
+	} instance;
+
+__builtin_object_size(instance.array, 0) == 22, since the remaining size
+of the enclosing structure starting from "array" is 22 bytes (6 + 8 +
+4 + 4).
+
+__builtin_object_size(instance.array, 1) == 6, since the remaining size
+of the specific field "array" is 6 bytes.
+
+The initial implementation of FORTIFY_SOURCE used mode 0 because there
+were many cases of both strcpy() and memcpy() functions being used to
+write (or read) across multiple fields in a structure. For example,
+it would catch this, which is writing 2 bytes beyond the end of
+"instance":
+
+	memcpy(&instance.array, data, 25);
+
+While this didn't protect against overwriting adjacent fields in a given
+structure, it would at least stop overflows from reaching beyond the
+end of the structure into neighboring memory, and provided a meaningful
+mitigation of a subset of buffer overflow flaws. However, many desirable
+targets remain within the enclosing structure (for example function
+pointers).
+
+As it happened, there were very few cases of strcpy() family functions
+intentionally writing beyond the end of a string buffer. Once all known
+cases were removed from the kernel, the strcpy() family was tightened[1]
+to use mode 1, providing greater mitigation coverage.
+
+What remains is switching memcpy() to mode 1 as well, but making the
+switch is much more difficult because of how frustrating it can be to
+find existing "normal" uses of memcpy() that expect to write (or read)
+across multiple fields. The root cause of the problem is that the C
+language lacks a common pattern to indicate the intent of an author's
+use of memcpy(), and is further complicated by the available compile-time
+and run-time mitigation behaviors.
+
+The FORTIFY_SOURCE mitigation comes in two halves: the compile-time half,
+when both the buffer size _and_ the length of the copy is known, and the
+run-time half, when only the buffer size is known. If neither size is
+known, there is no bounds checking possible. At compile-time when the
+compiler sees that a length will always exceed a known buffer size,
+a warning can be deterministically emitted. For the run-time half,
+the length is tested against the known size of the buffer, and the
+overflowing operation is detected. (The performance overhead for these
+tests is virtually zero.)
+
+It is relatively easy to find compile-time false-positives since a warning
+is always generated. Fixing the false positives, however, can be very
+time-consuming as there are hundreds of instances. While it's possible
+some over-read conditions could lead to kernel memory exposures, the bulk
+of the risk comes from the run-time flaws where the length of a write
+may end up being attacker-controlled and lead to an overflow.
+
+Many of the compile-time false-positives take a form similar to this:
+
+	memcpy(&instance.scalar2, data, sizeof(instance.scalar2) +
+					sizeof(instance.scalar3));
+
+and the run-time ones are similar, but lack a constant expression for the
+size of the copy:
+
+	memcpy(instance.array, data, length);
+
+The former is meant to cover multiple fields (though its style has been
+frowned upon more recently), but has been technically legal. Both lack
+any expressivity in the C language about the author's _intent_ in a way
+that a compiler can check when the length isn't known at compile time.
+A comment doesn't work well because what's needed is something a compiler
+can directly reason about. Is a given memcpy() call expected to overflow
+into neighbors? Is it not? By using the new struct_group() macro, this
+intent can be much more easily encoded.
+
+It is not as easy to find the run-time false-positives since the code path
+to exercise a seemingly out-of-bounds condition that is actually expected
+may not be trivially reachable. Tightening the restrictions to block an
+operation for a false positive will either potentially create a greater
+flaw (if a copy is truncated by the mitigation), or destabilize the kernel
+(e.g. with a BUG()), making things completely useless for the end user.
+
+As a result, tightening the memcpy() restriction (when there is a
+reasonable level of uncertainty of the number of false positives), needs
+to first WARN() with no truncation. (Though any sufficiently paranoid
+end-user can always opt to set the panic_on_warn=1 sysctl.) Once enough
+development time has passed, the mitigation can be further intensified.
+(Note that this patch is only the compile-time checking step, which is
+a prerequisite to doing run-time checking, which will come in future
+patches.)
+
+Given the potential frustrations of weeding out all the false positives
+when tightening the run-time checks, it is reasonable to wonder if these
+changes would actually add meaningful protection. Looking at just the
+last three years, there are 23 identified flaws with a CVE that mention
+"buffer overflow", and 11 are memcpy()-related buffer overflows.
+
+(For the remaining 12: 7 are array index overflows that would be
+mitigated by systems built with CONFIG_UBSAN_BOUNDS=y: CVE-2019-0145,
+CVE-2019-14835, CVE-2019-14896, CVE-2019-14897, CVE-2019-14901,
+CVE-2019-17666, CVE-2021-28952. 2 are miscalculated allocation
+sizes which could be mitigated with memory tagging: CVE-2019-16746,
+CVE-2019-2181. 1 is an iovec buffer bug maybe mitigated by memory tagging:
+CVE-2020-10742. 1 is a type confusion bug mitigated by stack canaries:
+CVE-2020-10942. 1 is a string handling logic bug with no mitigation I'm
+aware of: CVE-2021-28972.)
+
+At my last count on an x86_64 allmodconfig build, there are 35,294
+calls to memcpy(). With callers instrumented to report all places
+where the buffer size is known but the length remains unknown (i.e. a
+run-time bounds check is added), we can count how many new run-time
+bounds checks are added when the destination and source arguments of
+memcpy() are changed to use "mode 1" bounds checking: 1,276. This means
+for the future run-time checking, there is a worst-case upper bounds
+of 3.6% false positives to fix. In addition, there were around 150 new
+compile-time warnings to evaluate and fix (which have now been fixed).
+
+With this instrumentation it's also possible to compare the places where
+the known 11 memcpy() flaw overflows manifested against the resulting
+list of potential new run-time bounds checks, as a measure of potential
+efficacy of the tightened mitigation. Much to my surprise, horror, and
+delight, all 11 flaws would have been detected by the newly added run-time
+bounds checks, making this a distinctly clear mitigation improvement: 100%
+coverage for known memcpy() flaws, with a possible 2 orders of magnitude
+gain in coverage over existing but undiscovered run-time dynamic length
+flaws (i.e. 1265 newly covered sites in addition to the 11 known), against
+only <4% of all memcpy() callers maybe gaining a false positive run-time
+check, with only about 150 new compile-time instances needing evaluation.
+
+Specifically these would have been mitigated:
+CVE-2020-24490 https://git.kernel.org/linus/a2ec905d1e160a33b2e210e45ad30445ef26ce0e
+CVE-2020-12654 https://git.kernel.org/linus/3a9b153c5591548612c3955c9600a98150c81875
+CVE-2020-12653 https://git.kernel.org/linus/b70261a288ea4d2f4ac7cd04be08a9f0f2de4f4d
+CVE-2019-14895 https://git.kernel.org/linus/3d94a4a8373bf5f45cf5f939e88b8354dbf2311b
+CVE-2019-14816 https://git.kernel.org/linus/7caac62ed598a196d6ddf8d9c121e12e082cac3a
+CVE-2019-14815 https://git.kernel.org/linus/7caac62ed598a196d6ddf8d9c121e12e082cac3a
+CVE-2019-14814 https://git.kernel.org/linus/7caac62ed598a196d6ddf8d9c121e12e082cac3a
+CVE-2019-10126 https://git.kernel.org/linus/69ae4f6aac1578575126319d3f55550e7e440449
+CVE-2019-9500  https://git.kernel.org/linus/1b5e2423164b3670e8bc9174e4762d297990deff
+no-CVE-yet     https://git.kernel.org/linus/130f634da1af649205f4a3dd86cbe5c126b57914
+no-CVE-yet     https://git.kernel.org/linus/d10a87a3535cce2b890897914f5d0d83df669c63
+
+To accelerate the review of potential run-time false positives, it's
+also worth noting that it is possible to partially automate checking
+by examining the memcpy() buffer argument to check for the destination
+struct member having a neighboring array member. It is reasonable to
+expect that the vast majority of run-time false positives would look like
+the already evaluated and fixed compile-time false positives, where the
+most common pattern is neighboring arrays. (And, FWIW, many of the
+compile-time fixes were actual bugs, so it is reasonable to assume we'll
+have similar cases of actual bugs getting fixed for run-time checks.)
+
+Implementation:
+
+Tighten the memcpy() destination buffer size checking to use the actual
+("mode 1") target buffer size as the bounds check instead of their
+enclosing structure's ("mode 0") size. Use a common inline for memcpy()
+(and memmove() in a following patch), since all the tests are the
+same. All new cross-field memcpy() uses must use the struct_group() macro
+or similar to target a specific range of fields, so that FORTIFY_SOURCE
+can reason about the size and safety of the copy.
+
+For now, cross-member "mode 1" _read_ detection at compile-time will be
+limited to W=1 builds, since it is, unfortunately, very common. As the
+priority is solving write overflows, read overflows will be part of a
+future phase (and can be fixed in parallel, for anyone wanting to look
+at W=1 build output).
+
+For run-time, the "mode 0" size checking and mitigation is left unchanged,
+with "mode 1" to be added in stages. In this patch, no new run-time
+checks are added. Future patches will first bounds-check writes,
+and only perform a WARN() for now. This way any missed run-time false
+positives can be flushed out over the coming several development cycles,
+but system builders who have tested their workloads to be WARN()-free
+can enable the panic_on_warn=1 sysctl to immediately gain a mitigation
+against this class of buffer overflows. Once that is under way, run-time
+bounds-checking of reads can be similarly enabled.
+
+Related classes of flaws that will remain unmitigated:
+
+- memcpy() with flexible array structures, as the compiler does not
+  currently have visibility into the size of the trailing flexible
+  array. These can be fixed in the future by refactoring such cases
+  to use a new set of flexible array structure helpers to perform the
+  common serialization/deserialization code patterns doing allocation
+  and/or copying.
+
+- memcpy() with raw pointers (e.g. void *, char *, etc), or otherwise
+  having their buffer size unknown at compile time, have no good
+  mitigation beyond memory tagging (and even that would only protect
+  against inter-object overflow, not intra-object neighboring field
+  overflows), or refactoring. Some kind of "fat pointer" solution is
+  likely needed to gain proper size-of-buffer awareness. (e.g. see
+  struct membuf)
+
+- type confusion where a higher level type's allocation size does
+  not match the resulting cast type eventually passed to a deeper
+  memcpy() call where the compiler cannot see the true type. In
+  theory, greater static analysis could catch these, and the use
+  of -Warray-bounds will help find some of these.
+
+[0] https://gcc.gnu.org/onlinedocs/gcc/Object-Size-Checking.html
+[1] https://git.kernel.org/linus/6a39e62abbafd1d58d1722f40c7d26ef379c6a2f
+
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+(cherry picked from commit f68f2ff91512c199ec24883001245912afc17873)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/fortify-string.h
+#	lib/Makefile
+#	lib/string_helpers.c
+diff --cc include/linux/fortify-string.h
+index 4d86485f5be8,f578d00403ad..000000000000
+--- a/include/linux/fortify-string.h
++++ b/include/linux/fortify-string.h
+@@@ -2,6 -2,15 +2,18 @@@
+  #ifndef _LINUX_FORTIFY_STRING_H_
+  #define _LINUX_FORTIFY_STRING_H_
+  
+++<<<<<<< HEAD
+++=======
++ #define __FORTIFY_INLINE extern __always_inline __attribute__((gnu_inline))
++ #define __RENAME(x) __asm__(#x)
++ 
++ void fortify_panic(const char *name) __noreturn __cold;
++ void __read_overflow(void) __compiletime_error("detected read beyond size of object (1st parameter)");
++ void __read_overflow2(void) __compiletime_error("detected read beyond size of object (2nd parameter)");
++ void __read_overflow2_field(size_t avail, size_t wanted) __compiletime_warning("detected read beyond size of field (2nd parameter); maybe use struct_group()?");
++ void __write_overflow(void) __compiletime_error("detected write beyond size of object (1st parameter)");
++ void __write_overflow_field(size_t avail, size_t wanted) __compiletime_warning("detected write beyond size of field (1st parameter); maybe use struct_group()?");
+++>>>>>>> f68f2ff91512 (fortify: Detect struct member overflows in memcpy() at compile-time)
+  
+  #define __compiletime_strlen(p)					\
+  ({								\
+diff --cc lib/Makefile
+index e682f1b4f3b0,a99ce004812a..000000000000
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@@ -329,3 -363,39 +329,42 @@@ obj-$(CONFIG_BITS_KUNIT_TEST) += test_b
+  obj-$(CONFIG_CMDLINE_KUNIT_TEST) += cmdline_kunit.o
+  obj-$(CONFIG_SLUB_KUNIT_TEST) += slub_kunit.o
+  obj-$(CONFIG_MEMCPY_KUNIT_TEST) += memcpy_kunit.o
+++<<<<<<< HEAD
+++=======
++ 
++ obj-$(CONFIG_GENERIC_LIB_DEVMEM_IS_ALLOWED) += devmem_is_allowed.o
++ 
++ # FORTIFY_SOURCE compile-time behavior tests
++ TEST_FORTIFY_SRCS = $(wildcard $(srctree)/$(src)/test_fortify/*-*.c)
++ TEST_FORTIFY_LOGS = $(patsubst $(srctree)/$(src)/%.c, %.log, $(TEST_FORTIFY_SRCS))
++ TEST_FORTIFY_LOG = test_fortify.log
++ 
++ quiet_cmd_test_fortify = TEST    $@
++       cmd_test_fortify = $(CONFIG_SHELL) $(srctree)/scripts/test_fortify.sh \
++ 			$< $@ "$(NM)" $(CC) $(c_flags) \
++ 			$(call cc-disable-warning,fortify-source) \
++ 			-DKBUILD_EXTRA_WARN1
++ 
++ targets += $(TEST_FORTIFY_LOGS)
++ clean-files += $(TEST_FORTIFY_LOGS)
++ clean-files += $(addsuffix .o, $(TEST_FORTIFY_LOGS))
++ $(obj)/test_fortify/%.log: $(src)/test_fortify/%.c \
++ 			   $(src)/test_fortify/test_fortify.h \
++ 			   $(srctree)/include/linux/fortify-string.h \
++ 			   $(srctree)/scripts/test_fortify.sh \
++ 			   FORCE
++ 	$(call if_changed,test_fortify)
++ 
++ quiet_cmd_gen_fortify_log = GEN     $@
++       cmd_gen_fortify_log = cat </dev/null $(filter-out FORCE,$^) 2>/dev/null > $@ || true
++ 
++ targets += $(TEST_FORTIFY_LOG)
++ clean-files += $(TEST_FORTIFY_LOG)
++ $(obj)/$(TEST_FORTIFY_LOG): $(addprefix $(obj)/, $(TEST_FORTIFY_LOGS)) FORCE
++ 	$(call if_changed,gen_fortify_log)
++ 
++ # Fake dependency to trigger the fortify tests.
++ ifeq ($(CONFIG_FORTIFY_SOURCE),y)
++ $(obj)/string.o: $(obj)/$(TEST_FORTIFY_LOG)
++ endif
+++>>>>>>> f68f2ff91512 (fortify: Detect struct member overflows in memcpy() at compile-time)
+diff --cc lib/string_helpers.c
+index 9ca19918ca26,4f877e9551d5..000000000000
+--- a/lib/string_helpers.c
++++ b/lib/string_helpers.c
+@@@ -645,3 -674,310 +645,313 @@@ char *kstrdup_quotable_file(struct fil
+  	return pathname;
+  }
+  EXPORT_SYMBOL_GPL(kstrdup_quotable_file);
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * kasprintf_strarray - allocate and fill array of sequential strings
++  * @gfp: flags for the slab allocator
++  * @prefix: prefix to be used
++  * @n: amount of lines to be allocated and filled
++  *
++  * Allocates and fills @n strings using pattern "%s-%zu", where prefix
++  * is provided by caller. The caller is responsible to free them with
++  * kfree_strarray() after use.
++  *
++  * Returns array of strings or NULL when memory can't be allocated.
++  */
++ char **kasprintf_strarray(gfp_t gfp, const char *prefix, size_t n)
++ {
++ 	char **names;
++ 	size_t i;
++ 
++ 	names = kcalloc(n + 1, sizeof(char *), gfp);
++ 	if (!names)
++ 		return NULL;
++ 
++ 	for (i = 0; i < n; i++) {
++ 		names[i] = kasprintf(gfp, "%s-%zu", prefix, i);
++ 		if (!names[i]) {
++ 			kfree_strarray(names, i);
++ 			return NULL;
++ 		}
++ 	}
++ 
++ 	return names;
++ }
++ EXPORT_SYMBOL_GPL(kasprintf_strarray);
++ 
++ /**
++  * kfree_strarray - free a number of dynamically allocated strings contained
++  *                  in an array and the array itself
++  *
++  * @array: Dynamically allocated array of strings to free.
++  * @n: Number of strings (starting from the beginning of the array) to free.
++  *
++  * Passing a non-NULL @array and @n == 0 as well as NULL @array are valid
++  * use-cases. If @array is NULL, the function does nothing.
++  */
++ void kfree_strarray(char **array, size_t n)
++ {
++ 	unsigned int i;
++ 
++ 	if (!array)
++ 		return;
++ 
++ 	for (i = 0; i < n; i++)
++ 		kfree(array[i]);
++ 	kfree(array);
++ }
++ EXPORT_SYMBOL_GPL(kfree_strarray);
++ 
++ struct strarray {
++ 	char **array;
++ 	size_t n;
++ };
++ 
++ static void devm_kfree_strarray(struct device *dev, void *res)
++ {
++ 	struct strarray *array = res;
++ 
++ 	kfree_strarray(array->array, array->n);
++ }
++ 
++ char **devm_kasprintf_strarray(struct device *dev, const char *prefix, size_t n)
++ {
++ 	struct strarray *ptr;
++ 
++ 	ptr = devres_alloc(devm_kfree_strarray, sizeof(*ptr), GFP_KERNEL);
++ 	if (!ptr)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	ptr->array = kasprintf_strarray(GFP_KERNEL, prefix, n);
++ 	if (!ptr->array) {
++ 		devres_free(ptr);
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 
++ 	return ptr->array;
++ }
++ EXPORT_SYMBOL_GPL(devm_kasprintf_strarray);
++ 
++ /**
++  * strscpy_pad() - Copy a C-string into a sized buffer
++  * @dest: Where to copy the string to
++  * @src: Where to copy the string from
++  * @count: Size of destination buffer
++  *
++  * Copy the string, or as much of it as fits, into the dest buffer.  The
++  * behavior is undefined if the string buffers overlap.  The destination
++  * buffer is always %NUL terminated, unless it's zero-sized.
++  *
++  * If the source string is shorter than the destination buffer, zeros
++  * the tail of the destination buffer.
++  *
++  * For full explanation of why you may want to consider using the
++  * 'strscpy' functions please see the function docstring for strscpy().
++  *
++  * Returns:
++  * * The number of characters copied (not including the trailing %NUL)
++  * * -E2BIG if count is 0 or @src was truncated.
++  */
++ ssize_t strscpy_pad(char *dest, const char *src, size_t count)
++ {
++ 	ssize_t written;
++ 
++ 	written = strscpy(dest, src, count);
++ 	if (written < 0 || written == count - 1)
++ 		return written;
++ 
++ 	memset(dest + written + 1, 0, count - written - 1);
++ 
++ 	return written;
++ }
++ EXPORT_SYMBOL(strscpy_pad);
++ 
++ /**
++  * skip_spaces - Removes leading whitespace from @str.
++  * @str: The string to be stripped.
++  *
++  * Returns a pointer to the first non-whitespace character in @str.
++  */
++ char *skip_spaces(const char *str)
++ {
++ 	while (isspace(*str))
++ 		++str;
++ 	return (char *)str;
++ }
++ EXPORT_SYMBOL(skip_spaces);
++ 
++ /**
++  * strim - Removes leading and trailing whitespace from @s.
++  * @s: The string to be stripped.
++  *
++  * Note that the first trailing whitespace is replaced with a %NUL-terminator
++  * in the given string @s. Returns a pointer to the first non-whitespace
++  * character in @s.
++  */
++ char *strim(char *s)
++ {
++ 	size_t size;
++ 	char *end;
++ 
++ 	size = strlen(s);
++ 	if (!size)
++ 		return s;
++ 
++ 	end = s + size - 1;
++ 	while (end >= s && isspace(*end))
++ 		end--;
++ 	*(end + 1) = '\0';
++ 
++ 	return skip_spaces(s);
++ }
++ EXPORT_SYMBOL(strim);
++ 
++ /**
++  * sysfs_streq - return true if strings are equal, modulo trailing newline
++  * @s1: one string
++  * @s2: another string
++  *
++  * This routine returns true iff two strings are equal, treating both
++  * NUL and newline-then-NUL as equivalent string terminations.  It's
++  * geared for use with sysfs input strings, which generally terminate
++  * with newlines but are compared against values without newlines.
++  */
++ bool sysfs_streq(const char *s1, const char *s2)
++ {
++ 	while (*s1 && *s1 == *s2) {
++ 		s1++;
++ 		s2++;
++ 	}
++ 
++ 	if (*s1 == *s2)
++ 		return true;
++ 	if (!*s1 && *s2 == '\n' && !s2[1])
++ 		return true;
++ 	if (*s1 == '\n' && !s1[1] && !*s2)
++ 		return true;
++ 	return false;
++ }
++ EXPORT_SYMBOL(sysfs_streq);
++ 
++ /**
++  * match_string - matches given string in an array
++  * @array:	array of strings
++  * @n:		number of strings in the array or -1 for NULL terminated arrays
++  * @string:	string to match with
++  *
++  * This routine will look for a string in an array of strings up to the
++  * n-th element in the array or until the first NULL element.
++  *
++  * Historically the value of -1 for @n, was used to search in arrays that
++  * are NULL terminated. However, the function does not make a distinction
++  * when finishing the search: either @n elements have been compared OR
++  * the first NULL element was found.
++  *
++  * Return:
++  * index of a @string in the @array if matches, or %-EINVAL otherwise.
++  */
++ int match_string(const char * const *array, size_t n, const char *string)
++ {
++ 	int index;
++ 	const char *item;
++ 
++ 	for (index = 0; index < n; index++) {
++ 		item = array[index];
++ 		if (!item)
++ 			break;
++ 		if (!strcmp(item, string))
++ 			return index;
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ EXPORT_SYMBOL(match_string);
++ 
++ /**
++  * __sysfs_match_string - matches given string in an array
++  * @array: array of strings
++  * @n: number of strings in the array or -1 for NULL terminated arrays
++  * @str: string to match with
++  *
++  * Returns index of @str in the @array or -EINVAL, just like match_string().
++  * Uses sysfs_streq instead of strcmp for matching.
++  *
++  * This routine will look for a string in an array of strings up to the
++  * n-th element in the array or until the first NULL element.
++  *
++  * Historically the value of -1 for @n, was used to search in arrays that
++  * are NULL terminated. However, the function does not make a distinction
++  * when finishing the search: either @n elements have been compared OR
++  * the first NULL element was found.
++  */
++ int __sysfs_match_string(const char * const *array, size_t n, const char *str)
++ {
++ 	const char *item;
++ 	int index;
++ 
++ 	for (index = 0; index < n; index++) {
++ 		item = array[index];
++ 		if (!item)
++ 			break;
++ 		if (sysfs_streq(item, str))
++ 			return index;
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ EXPORT_SYMBOL(__sysfs_match_string);
++ 
++ /**
++  * strreplace - Replace all occurrences of character in string.
++  * @s: The string to operate on.
++  * @old: The character being replaced.
++  * @new: The character @old is replaced with.
++  *
++  * Returns pointer to the nul byte at the end of @s.
++  */
++ char *strreplace(char *s, char old, char new)
++ {
++ 	for (; *s; ++s)
++ 		if (*s == old)
++ 			*s = new;
++ 	return s;
++ }
++ EXPORT_SYMBOL(strreplace);
++ 
++ /**
++  * memcpy_and_pad - Copy one buffer to another with padding
++  * @dest: Where to copy to
++  * @dest_len: The destination buffer size
++  * @src: Where to copy from
++  * @count: The number of bytes to copy
++  * @pad: Character to use for padding if space is left in destination.
++  */
++ void memcpy_and_pad(void *dest, size_t dest_len, const void *src, size_t count,
++ 		    int pad)
++ {
++ 	if (dest_len > count) {
++ 		memcpy(dest, src, count);
++ 		memset(dest + count, pad,  dest_len - count);
++ 	} else {
++ 		memcpy(dest, src, dest_len);
++ 	}
++ }
++ EXPORT_SYMBOL(memcpy_and_pad);
++ 
++ #ifdef CONFIG_FORTIFY_SOURCE
++ /* These are placeholders for fortify compile-time warnings. */
++ void __read_overflow2_field(size_t avail, size_t wanted) { }
++ EXPORT_SYMBOL(__read_overflow2_field);
++ void __write_overflow_field(size_t avail, size_t wanted) { }
++ EXPORT_SYMBOL(__write_overflow_field);
++ 
++ void fortify_panic(const char *name)
++ {
++ 	pr_emerg("detected buffer overflow in %s\n", name);
++ 	BUG();
++ }
++ EXPORT_SYMBOL(fortify_panic);
++ #endif /* CONFIG_FORTIFY_SOURCE */
+++>>>>>>> f68f2ff91512 (fortify: Detect struct member overflows in memcpy() at compile-time)
+* Unmerged path include/linux/fortify-string.h
+* Unmerged path lib/Makefile
+* Unmerged path lib/string_helpers.c
+diff --git a/lib/test_fortify/read_overflow2_field-memcpy.c b/lib/test_fortify/read_overflow2_field-memcpy.c
+new file mode 100644
+index 000000000000..de9569266223
+--- /dev/null
++++ b/lib/test_fortify/read_overflow2_field-memcpy.c
+@@ -0,0 +1,5 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#define TEST	\
++	memcpy(large, instance.buf, sizeof(instance.buf) + 1)
++
++#include "test_fortify.h"
+diff --git a/lib/test_fortify/write_overflow_field-memcpy.c b/lib/test_fortify/write_overflow_field-memcpy.c
+new file mode 100644
+index 000000000000..28cc81058dd3
+--- /dev/null
++++ b/lib/test_fortify/write_overflow_field-memcpy.c
+@@ -0,0 +1,5 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#define TEST	\
++	memcpy(instance.buf, large, sizeof(instance.buf) + 1)
++
++#include "test_fortify.h"
