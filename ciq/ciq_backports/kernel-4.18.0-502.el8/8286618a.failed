@@ -1,0 +1,429 @@
+x86/resctrl: Pass the required parameters into resctrl_arch_rmid_read()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author James Morse <james.morse@arm.com>
+commit 8286618aca331bf17323ff3023ca831ac6e4b86f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/8286618a.failed
+
+resctrl_arch_rmid_read() is intended as the function that an
+architecture agnostic resctrl filesystem driver can use to
+read a value in bytes from a hardware register. Currently the function
+returns the MBM values in chunks directly from hardware.
+
+To convert this to bytes, some correction and overflow calculations
+are needed. These depend on the resource and domain structures.
+Overflow detection requires the old chunks value. None of this
+is available to resctrl_arch_rmid_read(). MPAM requires the
+resource and domain structures to find the MMIO device that holds
+the registers.
+
+Pass the resource and domain to resctrl_arch_rmid_read(). This makes
+rmid_dirty() too big. Instead merge it with its only caller, and the
+name is kept as a local variable.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Jamie Iles <quic_jiles@quicinc.com>
+	Reviewed-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Tested-by: Xin Hao <xhao@linux.alibaba.com>
+	Tested-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Tested-by: Cristian Marussi <cristian.marussi@arm.com>
+Link: https://lore.kernel.org/r/20220902154829.30399-17-james.morse@arm.com
+(cherry picked from commit 8286618aca331bf17323ff3023ca831ac6e4b86f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/monitor.c
+#	include/linux/resctrl.h
+diff --cc arch/x86/kernel/cpu/resctrl/monitor.c
+index 810114991b5b,262141bf4264..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/monitor.c
++++ b/arch/x86/kernel/cpu/resctrl/monitor.c
+@@@ -145,9 -137,43 +145,45 @@@ static inline struct rmid_entry *__rmid
+  	return entry;
+  }
+  
+ -static struct arch_mbm_state *get_arch_mbm_state(struct rdt_hw_domain *hw_dom,
+ -						 u32 rmid,
+ -						 enum resctrl_event_id eventid)
+ +static u64 __rmid_read(u32 rmid, u32 eventid)
+  {
+++<<<<<<< HEAD
+ +	u64 val;
+++=======
++ 	switch (eventid) {
++ 	case QOS_L3_OCCUP_EVENT_ID:
++ 		return NULL;
++ 	case QOS_L3_MBM_TOTAL_EVENT_ID:
++ 		return &hw_dom->arch_mbm_total[rmid];
++ 	case QOS_L3_MBM_LOCAL_EVENT_ID:
++ 		return &hw_dom->arch_mbm_local[rmid];
++ 	}
++ 
++ 	/* Never expect to get here */
++ 	WARN_ON_ONCE(1);
++ 
++ 	return NULL;
++ }
++ 
++ void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_domain *d,
++ 			     u32 rmid, enum resctrl_event_id eventid)
++ {
++ 	struct rdt_hw_domain *hw_dom = resctrl_to_arch_dom(d);
++ 	struct arch_mbm_state *am;
++ 
++ 	am = get_arch_mbm_state(hw_dom, rmid, eventid);
++ 	if (am)
++ 		memset(am, 0, sizeof(*am));
++ }
++ 
++ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain *d,
++ 			   u32 rmid, enum resctrl_event_id eventid, u64 *val)
++ {
++ 	u64 msr_val;
+++>>>>>>> 8286618aca33 (x86/resctrl: Pass the required parameters into resctrl_arch_rmid_read())
++ 
++ 	if (!cpumask_test_cpu(smp_processor_id(), &d->cpu_mask))
++ 		return -EINVAL;
+  
+  	/*
+  	 * As per the SDM, when IA32_QM_EVTSEL.EvtID (bits 7:0) is configured
+@@@ -158,18 -184,18 +194,21 @@@
+  	 * are error bits.
+  	 */
+  	wrmsr(MSR_IA32_QM_EVTSEL, eventid, rmid);
+ -	rdmsrl(MSR_IA32_QM_CTR, msr_val);
+ +	rdmsrl(MSR_IA32_QM_CTR, val);
+  
+ -	if (msr_val & RMID_VAL_ERROR)
+ -		return -EIO;
+ -	if (msr_val & RMID_VAL_UNAVAIL)
+ -		return -EINVAL;
+ +	return val;
+ +}
+  
+ -	*val = msr_val;
+++<<<<<<< HEAD
+ +static bool rmid_dirty(struct rmid_entry *entry)
+ +{
+ +	u64 val = __rmid_read(entry->rmid, QOS_L3_OCCUP_EVENT_ID);
+  
+ -	return 0;
+ +	return val >= resctrl_cqm_threshold;
+  }
+  
+++=======
+++>>>>>>> 8286618aca33 (x86/resctrl: Pass the required parameters into resctrl_arch_rmid_read())
+  /*
+   * Check the RMIDs that are marked as busy for this domain. If the
+   * reported LLC occupancy is below the threshold clear the busy bit and
+@@@ -181,8 -207,10 +220,10 @@@ void __check_limbo(struct rdt_domain *d
+  	struct rmid_entry *entry;
+  	struct rdt_resource *r;
+  	u32 crmid = 1, nrmid;
++ 	bool rmid_dirty;
++ 	u64 val = 0;
+  
+ -	r = &rdt_resources_all[RDT_RESOURCE_L3].r_resctrl;
+ +	r = &rdt_resources_all[RDT_RESOURCE_L3];
+  
+  	/*
+  	 * Skip RMID 0 and start from RMID 1 and check all the RMIDs that
+@@@ -246,8 -281,10 +294,15 @@@ static void add_rmid_to_limbo(struct rm
+  	cpu = get_cpu();
+  	list_for_each_entry(d, &r->domains, list) {
+  		if (cpumask_test_cpu(cpu, &d->cpu_mask)) {
+++<<<<<<< HEAD
+ +			val = __rmid_read(entry->rmid, QOS_L3_OCCUP_EVENT_ID);
+ +			if (val <= resctrl_cqm_threshold)
+++=======
++ 			err = resctrl_arch_rmid_read(r, d, entry->rmid,
++ 						     QOS_L3_OCCUP_EVENT_ID,
++ 						     &val);
++ 			if (err || val <= resctrl_cqm_threshold)
+++>>>>>>> 8286618aca33 (x86/resctrl: Pass the required parameters into resctrl_arch_rmid_read())
+  				continue;
+  		}
+  
+@@@ -293,15 -330,19 +348,26 @@@ static u64 mbm_overflow_count(u64 prev_
+  	return chunks >> shift;
+  }
+  
+ -static int __mon_event_count(u32 rmid, struct rmid_read *rr)
+ +static u64 __mon_event_count(u32 rmid, struct rmid_read *rr)
+  {
+ -	struct rdt_hw_resource *hw_res = resctrl_to_arch_res(rr->r);
+  	struct mbm_state *m;
+++<<<<<<< HEAD
+ +	u64 chunks, tval;
+++=======
++ 	u64 chunks, tval = 0;
++ 
++ 	if (rr->first)
++ 		resctrl_arch_reset_rmid(rr->r, rr->d, rmid, rr->evtid);
++ 
++ 	rr->err = resctrl_arch_rmid_read(rr->r, rr->d, rmid, rr->evtid, &tval);
++ 	if (rr->err)
++ 		return rr->err;
+++>>>>>>> 8286618aca33 (x86/resctrl: Pass the required parameters into resctrl_arch_rmid_read())
+  
+ +	tval = __rmid_read(rmid, rr->evtid);
+ +	if (tval & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL)) {
+ +		return tval;
+ +	}
+  	switch (rr->evtid) {
+  	case QOS_L3_OCCUP_EVENT_ID:
+  		rr->val += tval;
+diff --cc include/linux/resctrl.h
+index 9b05af9b3e28,7ccfa0d1bb34..000000000000
+--- a/include/linux/resctrl.h
++++ b/include/linux/resctrl.h
+@@@ -13,4 -15,239 +13,242 @@@ int proc_resctrl_show(struct seq_file *
+  
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /* max value for struct rdt_domain's mbps_val */
++ #define MBA_MAX_MBPS   U32_MAX
++ 
++ /**
++  * enum resctrl_conf_type - The type of configuration.
++  * @CDP_NONE:	No prioritisation, both code and data are controlled or monitored.
++  * @CDP_CODE:	Configuration applies to instruction fetches.
++  * @CDP_DATA:	Configuration applies to reads and writes.
++  */
++ enum resctrl_conf_type {
++ 	CDP_NONE,
++ 	CDP_CODE,
++ 	CDP_DATA,
++ };
++ 
++ #define CDP_NUM_TYPES	(CDP_DATA + 1)
++ 
++ /*
++  * Event IDs, the values match those used to program IA32_QM_EVTSEL before
++  * reading IA32_QM_CTR on RDT systems.
++  */
++ enum resctrl_event_id {
++ 	QOS_L3_OCCUP_EVENT_ID		= 0x01,
++ 	QOS_L3_MBM_TOTAL_EVENT_ID	= 0x02,
++ 	QOS_L3_MBM_LOCAL_EVENT_ID	= 0x03,
++ };
++ 
++ /**
++  * struct resctrl_staged_config - parsed configuration to be applied
++  * @new_ctrl:		new ctrl value to be loaded
++  * @have_new_ctrl:	whether the user provided new_ctrl is valid
++  */
++ struct resctrl_staged_config {
++ 	u32			new_ctrl;
++ 	bool			have_new_ctrl;
++ };
++ 
++ /**
++  * struct rdt_domain - group of CPUs sharing a resctrl resource
++  * @list:		all instances of this resource
++  * @id:			unique id for this instance
++  * @cpu_mask:		which CPUs share this resource
++  * @rmid_busy_llc:	bitmap of which limbo RMIDs are above threshold
++  * @mbm_total:		saved state for MBM total bandwidth
++  * @mbm_local:		saved state for MBM local bandwidth
++  * @mbm_over:		worker to periodically read MBM h/w counters
++  * @cqm_limbo:		worker to periodically read CQM h/w counters
++  * @mbm_work_cpu:	worker CPU for MBM h/w counters
++  * @cqm_work_cpu:	worker CPU for CQM h/w counters
++  * @plr:		pseudo-locked region (if any) associated with domain
++  * @staged_config:	parsed configuration to be applied
++  * @mbps_val:		When mba_sc is enabled, this holds the array of user
++  *			specified control values for mba_sc in MBps, indexed
++  *			by closid
++  */
++ struct rdt_domain {
++ 	struct list_head		list;
++ 	int				id;
++ 	struct cpumask			cpu_mask;
++ 	unsigned long			*rmid_busy_llc;
++ 	struct mbm_state		*mbm_total;
++ 	struct mbm_state		*mbm_local;
++ 	struct delayed_work		mbm_over;
++ 	struct delayed_work		cqm_limbo;
++ 	int				mbm_work_cpu;
++ 	int				cqm_work_cpu;
++ 	struct pseudo_lock_region	*plr;
++ 	struct resctrl_staged_config	staged_config[CDP_NUM_TYPES];
++ 	u32				*mbps_val;
++ };
++ 
++ /**
++  * struct resctrl_cache - Cache allocation related data
++  * @cbm_len:		Length of the cache bit mask
++  * @min_cbm_bits:	Minimum number of consecutive bits to be set
++  * @shareable_bits:	Bitmask of shareable resource with other
++  *			executing entities
++  * @arch_has_sparse_bitmaps:	True if a bitmap like f00f is valid.
++  * @arch_has_empty_bitmaps:	True if the '0' bitmap is valid.
++  * @arch_has_per_cpu_cfg:	True if QOS_CFG register for this cache
++  *				level has CPU scope.
++  */
++ struct resctrl_cache {
++ 	unsigned int	cbm_len;
++ 	unsigned int	min_cbm_bits;
++ 	unsigned int	shareable_bits;
++ 	bool		arch_has_sparse_bitmaps;
++ 	bool		arch_has_empty_bitmaps;
++ 	bool		arch_has_per_cpu_cfg;
++ };
++ 
++ /**
++  * enum membw_throttle_mode - System's memory bandwidth throttling mode
++  * @THREAD_THROTTLE_UNDEFINED:	Not relevant to the system
++  * @THREAD_THROTTLE_MAX:	Memory bandwidth is throttled at the core
++  *				always using smallest bandwidth percentage
++  *				assigned to threads, aka "max throttling"
++  * @THREAD_THROTTLE_PER_THREAD:	Memory bandwidth is throttled at the thread
++  */
++ enum membw_throttle_mode {
++ 	THREAD_THROTTLE_UNDEFINED = 0,
++ 	THREAD_THROTTLE_MAX,
++ 	THREAD_THROTTLE_PER_THREAD,
++ };
++ 
++ /**
++  * struct resctrl_membw - Memory bandwidth allocation related data
++  * @min_bw:		Minimum memory bandwidth percentage user can request
++  * @bw_gran:		Granularity at which the memory bandwidth is allocated
++  * @delay_linear:	True if memory B/W delay is in linear scale
++  * @arch_needs_linear:	True if we can't configure non-linear resources
++  * @throttle_mode:	Bandwidth throttling mode when threads request
++  *			different memory bandwidths
++  * @mba_sc:		True if MBA software controller(mba_sc) is enabled
++  * @mb_map:		Mapping of memory B/W percentage to memory B/W delay
++  */
++ struct resctrl_membw {
++ 	u32				min_bw;
++ 	u32				bw_gran;
++ 	u32				delay_linear;
++ 	bool				arch_needs_linear;
++ 	enum membw_throttle_mode	throttle_mode;
++ 	bool				mba_sc;
++ 	u32				*mb_map;
++ };
++ 
++ struct rdt_parse_data;
++ struct resctrl_schema;
++ 
++ /**
++  * struct rdt_resource - attributes of a resctrl resource
++  * @rid:		The index of the resource
++  * @alloc_capable:	Is allocation available on this machine
++  * @mon_capable:	Is monitor feature available on this machine
++  * @num_rmid:		Number of RMIDs available
++  * @cache_level:	Which cache level defines scope of this resource
++  * @cache:		Cache allocation related data
++  * @membw:		If the component has bandwidth controls, their properties.
++  * @domains:		All domains for this resource
++  * @name:		Name to use in "schemata" file.
++  * @data_width:		Character width of data when displaying
++  * @default_ctrl:	Specifies default cache cbm or memory B/W percent.
++  * @format_str:		Per resource format string to show domain value
++  * @parse_ctrlval:	Per resource function pointer to parse control values
++  * @evt_list:		List of monitoring events
++  * @fflags:		flags to choose base and info files
++  * @cdp_capable:	Is the CDP feature available on this resource
++  */
++ struct rdt_resource {
++ 	int			rid;
++ 	bool			alloc_capable;
++ 	bool			mon_capable;
++ 	int			num_rmid;
++ 	int			cache_level;
++ 	struct resctrl_cache	cache;
++ 	struct resctrl_membw	membw;
++ 	struct list_head	domains;
++ 	char			*name;
++ 	int			data_width;
++ 	u32			default_ctrl;
++ 	const char		*format_str;
++ 	int			(*parse_ctrlval)(struct rdt_parse_data *data,
++ 						 struct resctrl_schema *s,
++ 						 struct rdt_domain *d);
++ 	struct list_head	evt_list;
++ 	unsigned long		fflags;
++ 	bool			cdp_capable;
++ };
++ 
++ /**
++  * struct resctrl_schema - configuration abilities of a resource presented to
++  *			   user-space
++  * @list:	Member of resctrl_schema_all.
++  * @name:	The name to use in the "schemata" file.
++  * @conf_type:	Whether this schema is specific to code/data.
++  * @res:	The resource structure exported by the architecture to describe
++  *		the hardware that is configured by this schema.
++  * @num_closid:	The number of closid that can be used with this schema. When
++  *		features like CDP are enabled, this will be lower than the
++  *		hardware supports for the resource.
++  */
++ struct resctrl_schema {
++ 	struct list_head		list;
++ 	char				name[8];
++ 	enum resctrl_conf_type		conf_type;
++ 	struct rdt_resource		*res;
++ 	u32				num_closid;
++ };
++ 
++ /* The number of closid supported by this resource regardless of CDP */
++ u32 resctrl_arch_get_num_closid(struct rdt_resource *r);
++ int resctrl_arch_update_domains(struct rdt_resource *r, u32 closid);
++ 
++ /*
++  * Update the ctrl_val and apply this config right now.
++  * Must be called on one of the domain's CPUs.
++  */
++ int resctrl_arch_update_one(struct rdt_resource *r, struct rdt_domain *d,
++ 			    u32 closid, enum resctrl_conf_type t, u32 cfg_val);
++ 
++ u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_domain *d,
++ 			    u32 closid, enum resctrl_conf_type type);
++ int resctrl_online_domain(struct rdt_resource *r, struct rdt_domain *d);
++ void resctrl_offline_domain(struct rdt_resource *r, struct rdt_domain *d);
++ 
++ /**
++  * resctrl_arch_rmid_read() - Read the eventid counter corresponding to rmid
++  *			      for this resource and domain.
++  * @r:			resource that the counter should be read from.
++  * @d:			domain that the counter should be read from.
++  * @rmid:		rmid of the counter to read.
++  * @eventid:		eventid to read, e.g. L3 occupancy.
++  * @val:		result of the counter read in chunks.
++  *
++  * Call from process context on a CPU that belongs to domain @d.
++  *
++  * Return:
++  * 0 on success, or -EIO, -EINVAL etc on error.
++  */
++ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain *d,
++ 			   u32 rmid, enum resctrl_event_id eventid, u64 *val);
++ 
++ /**
++  * resctrl_arch_reset_rmid() - Reset any private state associated with rmid
++  *			       and eventid.
++  * @r:		The domain's resource.
++  * @d:		The rmid's domain.
++  * @rmid:	The rmid whose counter values should be reset.
++  * @eventid:	The eventid whose counter values should be reset.
++  *
++  * This can be called from any CPU.
++  */
++ void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_domain *d,
++ 			     u32 rmid, enum resctrl_event_id eventid);
++ 
+++>>>>>>> 8286618aca33 (x86/resctrl: Pass the required parameters into resctrl_arch_rmid_read())
+  #endif /* _RESCTRL_H */
+* Unmerged path arch/x86/kernel/cpu/resctrl/monitor.c
+* Unmerged path include/linux/resctrl.h
