@@ -1,0 +1,182 @@
+ALSA: usb-audio: Improved lowlatency playback support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Takashi Iwai <tiwai@suse.de>
+commit d5f871f89e21bb71827ea57bd484eedea85839a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/d5f871f8.failed
+
+This is another attempt to improve further the handling of playback
+stream in the low latency mode.  The latest workaround in commit
+4267c5a8f313 ("ALSA: usb-audio: Work around for XRUN with low latency
+playback") revealed that submitting URBs forcibly in advance may
+trigger XRUN easily.  In the classical mode, this problem was avoided
+by practically delaying the submission of the actual data with the
+pre-submissions of silent data before triggering the stream start.
+But that is exactly what we want to avoid.
+
+Now, in this patch, instead of the previous workaround, we take a
+similar approach as used in the implicit feedback mode.  The URBs are
+queued at the PCM trigger start like before, but we check whether the
+buffer has been already filled enough before each submission, and
+stop queuing if the data overcomes the threshold.  The remaining URBs
+are kept in the ready list, and they will be retrieved in the URB
+complete callback of other (already queued) URBs.  In the complete
+callback, we try to fill the data and submit as much as possible
+again.  When there is no more available in-flight URBs that may handle
+the pending data, we'll check in PCM ack callback and submit and
+process URBs there in addition.  In this way, the amount of in-flight
+URBs may vary dynamically and flexibly depending on the available data
+without hitting XRUN.
+
+The following things are changed to achieve the behavior above:
+
+* The endpoint prepare callback is changed to return an error code;
+  when there is no enough data available, it may return -EAGAIN.
+  Currently only prepare_playback_urb() returns the error.
+
+  The evaluation of the available data is a bit messy here; we can't
+  check with snd_pcm_avail() at the point of prepare callback (as
+  runtime->status->hwptr hasn't been updated yet), hence we manually
+  estimate the appl_ptr and compare with the internal hwptr_done to
+  calculate the available frames.
+
+* snd_usb_endpoint_start() doesn't submit full URBs if the prepare
+  callback returns -EAGAIN, and puts the remaining URBs to the ready
+  list for the later submission.
+
+* snd_complete_urb() treats the URBs in the low-latency mode similarly
+  like the implicit feedback mode, and submissions are done in
+  (now exported) snd_usb_queue_pending_output_urbs().
+
+* snd_usb_queue_pending_output_urbs() again checks the error value
+  from the prepare callback.  If it's -EAGAIN for the normal stream
+  (i.e. not implicit feedback mode), we push it back to the ready list
+  again.
+
+* PCM ack callback is introduced for the playback stream, and it calls
+  snd_usb_queue_pending_output_urbs() if there is no in-flight URB
+  while the stream is running.  This corresponds to the case where the
+  system needs the appl_ptr update for re-submitting a new URB.
+
+* snd_usb_queue_pending_output_urbs() and the prepare EP callback
+  receive in_stream_lock argument, which is a bool flag indicating the
+  call path from PCM ack.  It's needed for avoiding the deadlock of
+  snd_pcm_period_elapsed() calls.
+
+* Set the new SNDRV_PCM_INFO_EXPLICIT_SYNC flag when the new
+  low-latency mode is deployed.  This assures catching each applptr
+  update even in the mmap mode.
+
+Fixes: 4267c5a8f313 ("ALSA: usb-audio: Work around for XRUN with low latency playback")
+Link: https://lore.kernel.org/r/20210929080844.11583-9-tiwai@suse.de
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit d5f871f89e21bb71827ea57bd484eedea85839a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/usb/endpoint.c
+#	sound/usb/pcm.c
+diff --cc sound/usb/endpoint.c
+index b26cfd4f5483,0b336876e36d..000000000000
+--- a/sound/usb/endpoint.c
++++ b/sound/usb/endpoint.c
+@@@ -1431,14 -1471,10 +1463,19 @@@ int snd_usb_endpoint_start(struct snd_u
+  		goto __error;
+  
+  	if (snd_usb_endpoint_implicit_feedback_sink(ep) &&
+++<<<<<<< HEAD
+ +	    !ep->chip->playback_first) {
+ +		for (i = 0; i < ep->nurbs; i++) {
+ +			struct snd_urb_ctx *ctx = ep->urb + i;
+ +			list_add_tail(&ctx->ready_list, &ep->ready_playback_urbs);
+ +		}
+ +
+++=======
++ 	    !(ep->chip->quirk_flags & QUIRK_FLAG_PLAYBACK_FIRST)) {
+++>>>>>>> d5f871f89e21 (ALSA: usb-audio: Improved lowlatency playback support)
+  		usb_audio_dbg(ep->chip, "No URB submission due to implicit fb sync\n");
+- 		return 0;
++ 		i = 0;
++ 		goto fill_rest;
+  	}
+  
+  	for (i = 0; i < ep->nurbs; i++) {
+diff --cc sound/usb/pcm.c
+index 4a8756bf1413,d5a14e5b9ad3..000000000000
+--- a/sound/usb/pcm.c
++++ b/sound/usb/pcm.c
+@@@ -572,6 -581,26 +572,29 @@@ static int snd_usb_hw_free(struct snd_p
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* check whether early start is needed for playback stream */
++ static int lowlatency_playback_available(struct snd_pcm_runtime *runtime,
++ 					 struct snd_usb_substream *subs)
++ {
++ 	struct snd_usb_audio *chip = subs->stream->chip;
++ 
++ 	if (subs->direction == SNDRV_PCM_STREAM_CAPTURE)
++ 		return false;
++ 	/* disabled via module option? */
++ 	if (!chip->lowlatency)
++ 		return false;
++ 	/* free-wheeling mode? (e.g. dmix) */
++ 	if (runtime->stop_threshold > runtime->buffer_size)
++ 		return false;
++ 	/* implicit feedback mode has own operation mode */
++ 	if (snd_usb_endpoint_implicit_feedback_sink(subs->data_endpoint))
++ 		return false;
++ 	return true;
++ }
++ 
+++>>>>>>> d5f871f89e21 (ALSA: usb-audio: Improved lowlatency playback support)
+  /*
+   * prepare callback
+   *
+diff --git a/sound/usb/card.h b/sound/usb/card.h
+index 8a43985b6c68..f2116fbf99f3 100644
+--- a/sound/usb/card.h
++++ b/sound/usb/card.h
+@@ -74,8 +74,9 @@ struct snd_usb_endpoint {
+ 
+ 	atomic_t state;		/* running state */
+ 
+-	void (*prepare_data_urb) (struct snd_usb_substream *subs,
+-				  struct urb *urb);
++	int (*prepare_data_urb) (struct snd_usb_substream *subs,
++				 struct urb *urb,
++				 bool in_stream_lock);
+ 	void (*retire_data_urb) (struct snd_usb_substream *subs,
+ 				 struct urb *urb);
+ 
+* Unmerged path sound/usb/endpoint.c
+diff --git a/sound/usb/endpoint.h b/sound/usb/endpoint.h
+index 1f1a72535a64..6895d50d14d1 100644
+--- a/sound/usb/endpoint.h
++++ b/sound/usb/endpoint.h
+@@ -30,8 +30,9 @@ void snd_usb_endpoint_set_sync(struct snd_usb_audio *chip,
+ 			       struct snd_usb_endpoint *data_ep,
+ 			       struct snd_usb_endpoint *sync_ep);
+ void snd_usb_endpoint_set_callback(struct snd_usb_endpoint *ep,
+-				   void (*prepare)(struct snd_usb_substream *subs,
+-						   struct urb *urb),
++				   int (*prepare)(struct snd_usb_substream *subs,
++						  struct urb *urb,
++						  bool in_stream_lock),
+ 				   void (*retire)(struct snd_usb_substream *subs,
+ 						  struct urb *urb),
+ 				   struct snd_usb_substream *data_subs);
+@@ -48,5 +49,7 @@ int snd_usb_endpoint_implicit_feedback_sink(struct snd_usb_endpoint *ep);
+ int snd_usb_endpoint_next_packet_size(struct snd_usb_endpoint *ep,
+ 				      struct snd_urb_ctx *ctx, int idx,
+ 				      unsigned int avail);
++void snd_usb_queue_pending_output_urbs(struct snd_usb_endpoint *ep,
++				       bool in_stream_lock);
+ 
+ #endif /* __USBAUDIO_ENDPOINT_H */
+* Unmerged path sound/usb/pcm.c
