@@ -1,0 +1,100 @@
+x86/mm/vsyscall: Consider vsyscall page part of user address space
+
+jira LE-1907
+cve CVE-2024-26906
+Rebuild_History Non-Buildable kernel-4.18.0-553.8.1.el8_10
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 3ae0ad92f53e0f05cf6ab781230b7902b88f73cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.8.1.el8_10/3ae0ad92.failed
+
+The vsyscall page is weird.  It is in what is traditionally part of
+the kernel address space.  But, it has user permissions and we handle
+faults on it like we would on a user page: interrupts on.
+
+Right now, we handle vsyscall emulation in the "bad_area" code, which
+is used for both user-address-space and kernel-address-space faults.
+Move the handling to the user-address-space code *only* and ensure we
+get there by "excluding" the vsyscall page from the kernel address
+space via a check in fault_in_kernel_space().
+
+Since the fault_in_kernel_space() check is used on 32-bit, also add a
+64-bit check to make it clear we only use this path on 64-bit.  Also
+move the unlikely() to be in is_vsyscall_vaddr() itself.
+
+This helps clean up the kernel fault handling path by removing a case
+that can happen in normal[1] operation.  (Yeah, yeah, we can argue
+about the vsyscall page being "normal" or not.)  This also makes
+sanity checks easier, like the "we never take pkey faults in the
+kernel address space" check in the next patch.
+
+	Cc: x86@kernel.org
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Sean Christopherson <sean.j.christopherson@intel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20180928160230.6E9336EE@viggo.jf.intel.com
+(cherry picked from commit 3ae0ad92f53e0f05cf6ab781230b7902b88f73cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/fault.c
+diff --cc arch/x86/mm/fault.c
+index 929bfb03e31a,7e0fa7e24168..000000000000
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@@ -855,22 -872,13 +855,32 @@@ __bad_area_nosemaphore(struct pt_regs *
+  		if (is_errata100(regs, address))
+  			return;
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_X86_64
+ +		/*
+ +		 * Instruction fetch faults in the vsyscall page might need
+ +		 * emulation.
+ +		 */
+ +		if (unlikely((error_code & X86_PF_INSTR) &&
+ +			     is_vsyscall_vaddr(address))) {
+ +			if (emulate_vsyscall(regs, address))
+ +				return;
+ +		}
+ +#endif
+ +
+ +		sanitize_error_code(address, &error_code);
+ +
+ +		if (fixup_vdso_exception(regs, X86_TRAP_PF, error_code, address))
+ +			return;
+++=======
++ 		/*
++ 		 * To avoid leaking information about the kernel page table
++ 		 * layout, pretend that user-mode accesses to kernel addresses
++ 		 * are always protection faults.
++ 		 */
++ 		if (address >= TASK_SIZE_MAX)
++ 			error_code |= X86_PF_PROT;
+++>>>>>>> 3ae0ad92f53e (x86/mm/vsyscall: Consider vsyscall page part of user address space)
+  
+  		if (likely(show_unhandled_signals))
+  			show_signal_msg(regs, error_code, address, tsk);
+@@@ -1208,8 -1178,16 +1218,16 @@@ access_error(unsigned long error_code, 
+  	return 0;
+  }
+  
+ -static int fault_in_kernel_space(unsigned long address)
+ +bool fault_in_kernel_space(unsigned long address)
+  {
++ 	/*
++ 	 * On 64-bit systems, the vsyscall page is at an address above
++ 	 * TASK_SIZE_MAX, but is not considered part of the kernel
++ 	 * address space.
++ 	 */
++ 	if (IS_ENABLED(CONFIG_X86_64) && is_vsyscall_vaddr(address))
++ 		return false;
++ 
+  	return address >= TASK_SIZE_MAX;
+  }
+  
+* Unmerged path arch/x86/mm/fault.c
