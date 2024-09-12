@@ -1,0 +1,191 @@
+KVM: x86: Expose TSC offset controls to userspace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.26.1.el8_6
+commit-author Oliver Upton <oupton@google.com>
+commit 828ca89628bfcb1b8f27535025f69dd00eb55207
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.26.1.el8_6/828ca896.failed
+
+To date, VMM-directed TSC synchronization and migration has been a bit
+messy. KVM has some baked-in heuristics around TSC writes to infer if
+the VMM is attempting to synchronize. This is problematic, as it depends
+on host userspace writing to the guest's TSC within 1 second of the last
+write.
+
+A much cleaner approach to configuring the guest's views of the TSC is to
+simply migrate the TSC offset for every vCPU. Offsets are idempotent,
+and thus not subject to change depending on when the VMM actually
+reads/writes values from/to KVM. The VMM can then read the TSC once with
+KVM_GET_CLOCK to capture a (realtime, host_tsc) pair at the instant when
+the guest is paused.
+
+	Cc: David Matlack <dmatlack@google.com>
+	Cc: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Oliver Upton <oupton@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Message-Id: <20210916181538.968978-8-oupton@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 828ca89628bfcb1b8f27535025f69dd00eb55207)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 3e40344015c8,afdc5d186c50..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -2508,6 -2435,58 +2508,61 @@@ static inline bool kvm_check_tsc_unstab
+  	return check_tsc_unstable();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Infers attempts to synchronize the guest's tsc from host writes. Sets the
++  * offset for the vcpu and tracks the TSC matching generation that the vcpu
++  * participates in.
++  */
++ static void __kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 offset, u64 tsc,
++ 				  u64 ns, bool matched)
++ {
++ 	struct kvm *kvm = vcpu->kvm;
++ 
++ 	lockdep_assert_held(&kvm->arch.tsc_write_lock);
++ 
++ 	/*
++ 	 * We also track th most recent recorded KHZ, write and time to
++ 	 * allow the matching interval to be extended at each write.
++ 	 */
++ 	kvm->arch.last_tsc_nsec = ns;
++ 	kvm->arch.last_tsc_write = tsc;
++ 	kvm->arch.last_tsc_khz = vcpu->arch.virtual_tsc_khz;
++ 	kvm->arch.last_tsc_offset = offset;
++ 
++ 	vcpu->arch.last_guest_tsc = tsc;
++ 
++ 	kvm_vcpu_write_tsc_offset(vcpu, offset);
++ 
++ 	if (!matched) {
++ 		/*
++ 		 * We split periods of matched TSC writes into generations.
++ 		 * For each generation, we track the original measured
++ 		 * nanosecond time, offset, and write, so if TSCs are in
++ 		 * sync, we can match exact offset, and if not, we can match
++ 		 * exact software computation in compute_guest_tsc()
++ 		 *
++ 		 * These values are tracked in kvm->arch.cur_xxx variables.
++ 		 */
++ 		kvm->arch.cur_tsc_generation++;
++ 		kvm->arch.cur_tsc_nsec = ns;
++ 		kvm->arch.cur_tsc_write = tsc;
++ 		kvm->arch.cur_tsc_offset = offset;
++ 		kvm->arch.nr_vcpus_matched_tsc = 0;
++ 	} else if (vcpu->arch.this_tsc_generation != kvm->arch.cur_tsc_generation) {
++ 		kvm->arch.nr_vcpus_matched_tsc++;
++ 	}
++ 
++ 	/* Keep track of which generation this VCPU has synchronized to */
++ 	vcpu->arch.this_tsc_generation = kvm->arch.cur_tsc_generation;
++ 	vcpu->arch.this_tsc_nsec = kvm->arch.cur_tsc_nsec;
++ 	vcpu->arch.this_tsc_write = kvm->arch.cur_tsc_write;
++ 
++ 	kvm_track_tsc_matching(vcpu);
++ }
++ 
+++>>>>>>> 828ca89628bf (KVM: x86: Expose TSC offset controls to userspace)
+  static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 data)
+  {
+  	struct kvm *kvm = vcpu->kvm;
+diff --git a/Documentation/virt/kvm/devices/vcpu.rst b/Documentation/virt/kvm/devices/vcpu.rst
+index ca374d3fe085..310cebe28af4 100644
+--- a/Documentation/virt/kvm/devices/vcpu.rst
++++ b/Documentation/virt/kvm/devices/vcpu.rst
+@@ -112,3 +112,60 @@ Specifies the base address of the stolen time structure for this VCPU. The
+ base address must be 64 byte aligned and exist within a valid guest memory
+ region. See Documentation/virt/kvm/arm/pvtime.rst for more information
+ including the layout of the stolen time structure.
++
++4. GROUP: KVM_VCPU_TSC_CTRL
++===========================
++
++:Architectures: x86
++
++4.1 ATTRIBUTE: KVM_VCPU_TSC_OFFSET
++
++:Parameters: 64-bit unsigned TSC offset
++
++Returns:
++
++	 ======= ======================================
++	 -EFAULT Error reading/writing the provided
++		 parameter address.
++	 -ENXIO  Attribute not supported
++	 ======= ======================================
++
++Specifies the guest's TSC offset relative to the host's TSC. The guest's
++TSC is then derived by the following equation:
++
++  guest_tsc = host_tsc + KVM_VCPU_TSC_OFFSET
++
++This attribute is useful for the precise migration of a guest's TSC. The
++following describes a possible algorithm to use for the migration of a
++guest's TSC:
++
++From the source VMM process:
++
++1. Invoke the KVM_GET_CLOCK ioctl to record the host TSC (t_0),
++   kvmclock nanoseconds (k_0), and realtime nanoseconds (r_0).
++
++2. Read the KVM_VCPU_TSC_OFFSET attribute for every vCPU to record the
++   guest TSC offset (off_n).
++
++3. Invoke the KVM_GET_TSC_KHZ ioctl to record the frequency of the
++   guest's TSC (freq).
++
++From the destination VMM process:
++
++4. Invoke the KVM_SET_CLOCK ioctl, providing the kvmclock nanoseconds
++   (k_0) and realtime nanoseconds (r_0) in their respective fields.
++   Ensure that the KVM_CLOCK_REALTIME flag is set in the provided
++   structure. KVM will advance the VM's kvmclock to account for elapsed
++   time since recording the clock values.
++
++5. Invoke the KVM_GET_CLOCK ioctl to record the host TSC (t_1) and
++   kvmclock nanoseconds (k_1).
++
++6. Adjust the guest TSC offsets for every vCPU to account for (1) time
++   elapsed since recording state and (2) difference in TSCs between the
++   source and destination machine:
++
++   new_off_n = t_0 + off_n + (k_1 - k_0) * freq - t_1
++
++7. Write the KVM_VCPU_TSC_OFFSET attribute for every vCPU with the
++   respective value derived in the previous step.
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index b3adc166d7f0..952a15522b2c 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1084,6 +1084,7 @@ struct kvm_arch {
+ 	u64 last_tsc_nsec;
+ 	u64 last_tsc_write;
+ 	u32 last_tsc_khz;
++	u64 last_tsc_offset;
+ 	u64 cur_tsc_nsec;
+ 	u64 cur_tsc_write;
+ 	u64 cur_tsc_offset;
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index 2ef1f6513c68..5a776a08f78c 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -504,4 +504,8 @@ struct kvm_pmu_event_filter {
+ #define KVM_PMU_EVENT_ALLOW 0
+ #define KVM_PMU_EVENT_DENY 1
+ 
++/* for KVM_{GET,SET,HAS}_DEVICE_ATTR */
++#define KVM_VCPU_TSC_CTRL 0 /* control group for the timestamp counter (TSC) */
++#define   KVM_VCPU_TSC_OFFSET 0 /* attribute for the TSC offset */
++
+ #endif /* _ASM_X86_KVM_H */
+* Unmerged path arch/x86/kvm/x86.c
