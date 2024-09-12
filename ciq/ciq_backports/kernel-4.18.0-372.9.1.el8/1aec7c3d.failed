@@ -1,0 +1,305 @@
+xfs: remove obsolete AGF counter debugging
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Darrick J. Wong <djwong@kernel.org>
+commit 1aec7c3d05670b92b7339b19999009a93808efb9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/1aec7c3d.failed
+
+In commit f8f2835a9cf3 we changed the behavior of XFS to use EFIs to
+remove blocks from an overfilled AGFL because there were complaints
+about transaction overruns that stemmed from trying to free multiple
+blocks in a single transaction.
+
+Unfortunately, that commit missed a subtlety in the debug-mode
+transaction accounting when a realtime volume is attached.  If a
+realtime file undergoes a data fork mapping change such that realtime
+extents are allocated (or freed) in the same transaction that a data
+device block is also allocated (or freed), we can trip a debugging
+assertion.  This can happen (for example) if a realtime extent is
+allocated and it is necessary to reshape the bmbt to hold the new
+mapping.
+
+When we go to allocate a bmbt block from an AG, the first thing the data
+device block allocator does is ensure that the freelist is the proper
+length.  If the freelist is too long, it will trim the freelist to the
+proper length.
+
+In debug mode, trimming the freelist calls xfs_trans_agflist_delta() to
+record the decrement in the AG free list count.  Prior to f8f28 we would
+put the free block back in the free space btrees in the same
+transaction, which calls xfs_trans_agblocks_delta() to record the
+increment in the AG free block count.  Since AGFL blocks are included in
+the global free block count (fdblocks), there is no corresponding
+fdblocks update, so the AGFL free satisfies the following condition in
+xfs_trans_apply_sb_deltas:
+
+	/*
+	 * Check that superblock mods match the mods made to AGF counters.
+	 */
+	ASSERT((tp->t_fdblocks_delta + tp->t_res_fdblocks_delta) ==
+	       (tp->t_ag_freeblks_delta + tp->t_ag_flist_delta +
+		tp->t_ag_btree_delta));
+
+The comparison here used to be: (X + 0) == ((X+1) + -1 + 0), where X is
+the number blocks that were allocated.
+
+After commit f8f28 we defer the block freeing to the next chained
+transaction, which means that the calls to xfs_trans_agflist_delta and
+xfs_trans_agblocks_delta occur in separate transactions.  The (first)
+transaction that shortens the free list trips on the comparison, which
+has now become:
+
+(X + 0) == ((X) + -1 + 0)
+
+because we haven't freed the AGFL block yet; we've only logged an
+intention to free it.  When the second transaction (the deferred free)
+commits, it will evaluate the expression as:
+
+(0 + 0) == (1 + 0 + 0)
+
+and trip over that in turn.
+
+At this point, the astute reader may note that the two commits tagged by
+this patch have been in the kernel for a long time but haven't generated
+any bug reports.  How is it that the author became aware of this bug?
+
+This originally surfaced as an intermittent failure when I was testing
+realtime rmap, but a different bug report by Zorro Lang reveals the same
+assertion occuring on !lazysbcount filesystems.
+
+The common factor to both reports (and why this problem wasn't
+previously reported) becomes apparent if we consider when
+xfs_trans_apply_sb_deltas is called by __xfs_trans_commit():
+
+	if (tp->t_flags & XFS_TRANS_SB_DIRTY)
+		xfs_trans_apply_sb_deltas(tp);
+
+With a modern lazysbcount filesystem, transactions update only the
+percpu counters, so they don't need to set XFS_TRANS_SB_DIRTY, hence
+xfs_trans_apply_sb_deltas is rarely called.
+
+However, updates to the count of free realtime extents are not part of
+lazysbcount, so XFS_TRANS_SB_DIRTY will be set on transactions adding or
+removing data fork mappings to realtime files; similarly,
+XFS_TRANS_SB_DIRTY is always set on !lazysbcount filesystems.
+
+Dave mentioned in response to an earlier version of this patch:
+
+"IIUC, what you are saying is that this debug code is simply not
+exercised in normal testing and hasn't been for the past decade?  And it
+still won't be exercised on anything other than realtime device testing?
+
+"...it was debugging code from 1994 that was largely turned into dead
+code when lazysbcounters were introduced in 2007. Hence I'm not sure it
+holds any value anymore."
+
+This debugging code isn't especially helpful - you can modify the
+flcount on one AG and the freeblks of another AG, and it won't trigger.
+Add the fact that nobody noticed for a decade, and let's just get rid of
+it (and start testing realtime :P).
+
+This bug was found by running generic/051 on either a V4 filesystem
+lacking lazysbcount; or a V5 filesystem with a realtime volume.
+
+	Cc: bfoster@redhat.com, zlang@redhat.com
+Fixes: f8f2835a9cf3 ("xfs: defer agfl block frees when dfops is available")
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+(cherry picked from commit 1aec7c3d05670b92b7339b19999009a93808efb9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_fsops.c
+diff --cc fs/xfs/xfs_fsops.c
+index 0bc9c5ebd199,be9cf88d2ad7..000000000000
+--- a/fs/xfs/xfs_fsops.c
++++ b/fs/xfs/xfs_fsops.c
+@@@ -21,6 -21,62 +21,65 @@@
+  #include "xfs_ag_resv.h"
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Write new AG headers to disk. Non-transactional, but need to be
++  * written and completed prior to the growfs transaction being logged.
++  * To do this, we use a delayed write buffer list and wait for
++  * submission and IO completion of the list as a whole. This allows the
++  * IO subsystem to merge all the AG headers in a single AG into a single
++  * IO and hide most of the latency of the IO from us.
++  *
++  * This also means that if we get an error whilst building the buffer
++  * list to write, we can cancel the entire list without having written
++  * anything.
++  */
++ static int
++ xfs_resizefs_init_new_ags(
++ 	struct xfs_trans	*tp,
++ 	struct aghdr_init_data	*id,
++ 	xfs_agnumber_t		oagcount,
++ 	xfs_agnumber_t		nagcount,
++ 	xfs_rfsblock_t		delta,
++ 	bool			*lastag_extended)
++ {
++ 	struct xfs_mount	*mp = tp->t_mountp;
++ 	xfs_rfsblock_t		nb = mp->m_sb.sb_dblocks + delta;
++ 	int			error;
++ 
++ 	*lastag_extended = false;
++ 
++ 	INIT_LIST_HEAD(&id->buffer_list);
++ 	for (id->agno = nagcount - 1;
++ 	     id->agno >= oagcount;
++ 	     id->agno--, delta -= id->agsize) {
++ 
++ 		if (id->agno == nagcount - 1)
++ 			id->agsize = nb - (id->agno *
++ 					(xfs_rfsblock_t)mp->m_sb.sb_agblocks);
++ 		else
++ 			id->agsize = mp->m_sb.sb_agblocks;
++ 
++ 		error = xfs_ag_init_headers(mp, id);
++ 		if (error) {
++ 			xfs_buf_delwri_cancel(&id->buffer_list);
++ 			return error;
++ 		}
++ 	}
++ 
++ 	error = xfs_buf_delwri_submit(&id->buffer_list);
++ 	if (error)
++ 		return error;
++ 
++ 	if (delta) {
++ 		*lastag_extended = true;
++ 		error = xfs_ag_extend_space(mp, tp, id, delta);
++ 	}
++ 	return error;
++ }
++ 
++ /*
+++>>>>>>> 1aec7c3d0567 (xfs: remove obsolete AGF counter debugging)
+   * growfs operations
+   */
+  static int
+diff --git a/fs/xfs/libxfs/xfs_alloc.c b/fs/xfs/libxfs/xfs_alloc.c
+index f9241c0dd42f..c64e0dfa47e1 100644
+--- a/fs/xfs/libxfs/xfs_alloc.c
++++ b/fs/xfs/libxfs/xfs_alloc.c
+@@ -718,7 +718,6 @@ xfs_alloc_update_counters(
+ 	agbp->b_pag->pagf_freeblks += len;
+ 	be32_add_cpu(&agf->agf_freeblks, len);
+ 
+-	xfs_trans_agblocks_delta(tp, len);
+ 	if (unlikely(be32_to_cpu(agf->agf_freeblks) >
+ 		     be32_to_cpu(agf->agf_length))) {
+ 		xfs_buf_mark_corrupt(agbp);
+@@ -2739,7 +2738,6 @@ xfs_alloc_get_freelist(
+ 	pag = agbp->b_pag;
+ 	ASSERT(!pag->pagf_agflreset);
+ 	be32_add_cpu(&agf->agf_flcount, -1);
+-	xfs_trans_agflist_delta(tp, -1);
+ 	pag->pagf_flcount--;
+ 
+ 	logflags = XFS_AGF_FLFIRST | XFS_AGF_FLCOUNT;
+@@ -2846,7 +2844,6 @@ xfs_alloc_put_freelist(
+ 	pag = agbp->b_pag;
+ 	ASSERT(!pag->pagf_agflreset);
+ 	be32_add_cpu(&agf->agf_flcount, 1);
+-	xfs_trans_agflist_delta(tp, 1);
+ 	pag->pagf_flcount++;
+ 
+ 	logflags = XFS_AGF_FLLAST | XFS_AGF_FLCOUNT;
+diff --git a/fs/xfs/libxfs/xfs_alloc_btree.c b/fs/xfs/libxfs/xfs_alloc_btree.c
+index 9f5a45f7baed..a43e4c50e69b 100644
+--- a/fs/xfs/libxfs/xfs_alloc_btree.c
++++ b/fs/xfs/libxfs/xfs_alloc_btree.c
+@@ -74,7 +74,6 @@ xfs_allocbt_alloc_block(
+ 	atomic64_inc(&cur->bc_mp->m_allocbt_blks);
+ 	xfs_extent_busy_reuse(cur->bc_mp, cur->bc_ag.agno, bno, 1, false);
+ 
+-	xfs_trans_agbtree_delta(cur->bc_tp, 1);
+ 	new->s = cpu_to_be32(bno);
+ 
+ 	*stat = 1;
+@@ -99,7 +98,6 @@ xfs_allocbt_free_block(
+ 	atomic64_dec(&cur->bc_mp->m_allocbt_blks);
+ 	xfs_extent_busy_insert(cur->bc_tp, be32_to_cpu(agf->agf_seqno), bno, 1,
+ 			      XFS_EXTENT_BUSY_SKIP_DISCARD);
+-	xfs_trans_agbtree_delta(cur->bc_tp, -1);
+ 	return 0;
+ }
+ 
+diff --git a/fs/xfs/libxfs/xfs_rmap_btree.c b/fs/xfs/libxfs/xfs_rmap_btree.c
+index beb81c84a937..9f5bcbd834c3 100644
+--- a/fs/xfs/libxfs/xfs_rmap_btree.c
++++ b/fs/xfs/libxfs/xfs_rmap_btree.c
+@@ -103,7 +103,6 @@ xfs_rmapbt_alloc_block(
+ 	xfs_extent_busy_reuse(cur->bc_mp, cur->bc_ag.agno, bno, 1,
+ 			false);
+ 
+-	xfs_trans_agbtree_delta(cur->bc_tp, 1);
+ 	new->s = cpu_to_be32(bno);
+ 	be32_add_cpu(&agf->agf_rmap_blocks, 1);
+ 	xfs_alloc_log_agf(cur->bc_tp, agbp, XFS_AGF_RMAP_BLOCKS);
+@@ -136,7 +135,6 @@ xfs_rmapbt_free_block(
+ 
+ 	xfs_extent_busy_insert(cur->bc_tp, be32_to_cpu(agf->agf_seqno), bno, 1,
+ 			      XFS_EXTENT_BUSY_SKIP_DISCARD);
+-	xfs_trans_agbtree_delta(cur->bc_tp, -1);
+ 
+ 	pag = cur->bc_ag.agbp->b_pag;
+ 	xfs_ag_resv_free_extent(pag, XFS_AG_RESV_RMAPBT, NULL, 1);
+* Unmerged path fs/xfs/xfs_fsops.c
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index 377f3961d7ed..65b5f495f09b 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -493,13 +493,6 @@ xfs_trans_apply_sb_deltas(
+ 	bp = xfs_trans_getsb(tp);
+ 	sbp = bp->b_addr;
+ 
+-	/*
+-	 * Check that superblock mods match the mods made to AGF counters.
+-	 */
+-	ASSERT((tp->t_fdblocks_delta + tp->t_res_fdblocks_delta) ==
+-	       (tp->t_ag_freeblks_delta + tp->t_ag_flist_delta +
+-		tp->t_ag_btree_delta));
+-
+ 	/*
+ 	 * Only update the superblock counters if we are logging them
+ 	 */
+diff --git a/fs/xfs/xfs_trans.h b/fs/xfs/xfs_trans.h
+index 8b03fbfe9a1b..b390aa1e18a4 100644
+--- a/fs/xfs/xfs_trans.h
++++ b/fs/xfs/xfs_trans.h
+@@ -140,11 +140,6 @@ typedef struct xfs_trans {
+ 	int64_t			t_res_fdblocks_delta; /* on-disk only chg */
+ 	int64_t			t_frextents_delta;/* superblock freextents chg*/
+ 	int64_t			t_res_frextents_delta; /* on-disk only chg */
+-#if defined(DEBUG) || defined(XFS_WARN)
+-	int64_t			t_ag_freeblks_delta; /* debugging counter */
+-	int64_t			t_ag_flist_delta; /* debugging counter */
+-	int64_t			t_ag_btree_delta; /* debugging counter */
+-#endif
+ 	int64_t			t_dblocks_delta;/* superblock dblocks change */
+ 	int64_t			t_agcount_delta;/* superblock agcount change */
+ 	int64_t			t_imaxpct_delta;/* superblock imaxpct change */
+@@ -165,16 +160,6 @@ typedef struct xfs_trans {
+  */
+ #define	xfs_trans_set_sync(tp)		((tp)->t_flags |= XFS_TRANS_SYNC)
+ 
+-#if defined(DEBUG) || defined(XFS_WARN)
+-#define	xfs_trans_agblocks_delta(tp, d)	((tp)->t_ag_freeblks_delta += (int64_t)d)
+-#define	xfs_trans_agflist_delta(tp, d)	((tp)->t_ag_flist_delta += (int64_t)d)
+-#define	xfs_trans_agbtree_delta(tp, d)	((tp)->t_ag_btree_delta += (int64_t)d)
+-#else
+-#define	xfs_trans_agblocks_delta(tp, d)
+-#define	xfs_trans_agflist_delta(tp, d)
+-#define	xfs_trans_agbtree_delta(tp, d)
+-#endif
+-
+ /*
+  * XFS transaction mechanism exported interfaces.
+  */
