@@ -1,0 +1,172 @@
+x86/sev: Move MSR-based VMGEXITs for CPUID to helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Michael Roth <michael.roth@amd.com>
+commit 801baa693c1f6d7327475c39100c456db340cd3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/801baa69.failed
+
+This code will also be used later for SEV-SNP-validated CPUID code in
+some cases, so move it to a common helper.
+
+While here, also add a check to terminate in cases where the CPUID
+function/subfunction is indexed and the subfunction is non-zero, since
+the GHCB MSR protocol does not support non-zero subfunctions.
+
+	Suggested-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Michael Roth <michael.roth@amd.com>
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20220307213356.2797205-32-brijesh.singh@amd.com
+(cherry picked from commit 801baa693c1f6d7327475c39100c456db340cd3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/sev.c
+diff --cc arch/x86/kernel/sev.c
+index 9f3a4a57b1e6,0c2bf39c4a8f..000000000000
+--- a/arch/x86/kernel/sev.c
++++ b/arch/x86/kernel/sev.c
+@@@ -32,6 -32,8 +32,11 @@@
+  #include <asm/svm.h>
+  #include <asm/smp.h>
+  #include <asm/cpu.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/apic.h>
++ #include <asm/cpuid.h>
+++>>>>>>> 801baa693c1f (x86/sev: Move MSR-based VMGEXITs for CPUID to helper)
+  
+  #define DR7_RESET_VALUE        0x400
+  
+diff --git a/arch/x86/boot/compressed/sev.c b/arch/x86/boot/compressed/sev.c
+index 213b126ba7e3..ad967780583d 100644
+--- a/arch/x86/boot/compressed/sev.c
++++ b/arch/x86/boot/compressed/sev.c
+@@ -20,6 +20,7 @@
+ #include <asm/fpu/xcr.h>
+ #include <asm/ptrace.h>
+ #include <asm/svm.h>
++#include <asm/cpuid.h>
+ 
+ #include "error.h"
+ #include "../msr.h"
+diff --git a/arch/x86/kernel/sev-shared.c b/arch/x86/kernel/sev-shared.c
+index 91ece8db542a..7e7a1fd3b46d 100644
+--- a/arch/x86/kernel/sev-shared.c
++++ b/arch/x86/kernel/sev-shared.c
+@@ -14,6 +14,16 @@
+ #define has_cpuflag(f)	boot_cpu_has(f)
+ #endif
+ 
++/* I/O parameters for CPUID-related helpers */
++struct cpuid_leaf {
++	u32 fn;
++	u32 subfn;
++	u32 eax;
++	u32 ebx;
++	u32 ecx;
++	u32 edx;
++};
++
+ /*
+  * Since feature negotiation related variables are set early in the boot
+  * process they must reside in the .data section so as not to be zeroed
+@@ -158,6 +168,44 @@ enum es_result sev_es_ghcb_hv_call(struct ghcb *ghcb, bool set_ghcb_msr,
+ 	return verify_exception_info(ghcb, ctxt);
+ }
+ 
++static int __sev_cpuid_hv(u32 fn, int reg_idx, u32 *reg)
++{
++	u64 val;
++
++	sev_es_wr_ghcb_msr(GHCB_CPUID_REQ(fn, reg_idx));
++	VMGEXIT();
++	val = sev_es_rd_ghcb_msr();
++	if (GHCB_RESP_CODE(val) != GHCB_MSR_CPUID_RESP)
++		return -EIO;
++
++	*reg = (val >> 32);
++
++	return 0;
++}
++
++static int sev_cpuid_hv(struct cpuid_leaf *leaf)
++{
++	int ret;
++
++	/*
++	 * MSR protocol does not support fetching non-zero subfunctions, but is
++	 * sufficient to handle current early-boot cases. Should that change,
++	 * make sure to report an error rather than ignoring the index and
++	 * grabbing random values. If this issue arises in the future, handling
++	 * can be added here to use GHCB-page protocol for cases that occur late
++	 * enough in boot that GHCB page is available.
++	 */
++	if (cpuid_function_is_indexed(leaf->fn) && leaf->subfn)
++		return -EINVAL;
++
++	ret =         __sev_cpuid_hv(leaf->fn, GHCB_CPUID_REQ_EAX, &leaf->eax);
++	ret = ret ? : __sev_cpuid_hv(leaf->fn, GHCB_CPUID_REQ_EBX, &leaf->ebx);
++	ret = ret ? : __sev_cpuid_hv(leaf->fn, GHCB_CPUID_REQ_ECX, &leaf->ecx);
++	ret = ret ? : __sev_cpuid_hv(leaf->fn, GHCB_CPUID_REQ_EDX, &leaf->edx);
++
++	return ret;
++}
++
+ /*
+  * Boot VC Handler - This is the first VC handler during boot, there is no GHCB
+  * page yet, so it only supports the MSR based communication with the
+@@ -165,40 +213,23 @@ enum es_result sev_es_ghcb_hv_call(struct ghcb *ghcb, bool set_ghcb_msr,
+  */
+ void __init do_vc_no_ghcb(struct pt_regs *regs, unsigned long exit_code)
+ {
++	unsigned int subfn = lower_bits(regs->cx, 32);
+ 	unsigned int fn = lower_bits(regs->ax, 32);
+-	unsigned long val;
++	struct cpuid_leaf leaf;
+ 
+ 	/* Only CPUID is supported via MSR protocol */
+ 	if (exit_code != SVM_EXIT_CPUID)
+ 		goto fail;
+ 
+-	sev_es_wr_ghcb_msr(GHCB_CPUID_REQ(fn, GHCB_CPUID_REQ_EAX));
+-	VMGEXIT();
+-	val = sev_es_rd_ghcb_msr();
+-	if (GHCB_RESP_CODE(val) != GHCB_MSR_CPUID_RESP)
+-		goto fail;
+-	regs->ax = val >> 32;
+-
+-	sev_es_wr_ghcb_msr(GHCB_CPUID_REQ(fn, GHCB_CPUID_REQ_EBX));
+-	VMGEXIT();
+-	val = sev_es_rd_ghcb_msr();
+-	if (GHCB_RESP_CODE(val) != GHCB_MSR_CPUID_RESP)
+-		goto fail;
+-	regs->bx = val >> 32;
+-
+-	sev_es_wr_ghcb_msr(GHCB_CPUID_REQ(fn, GHCB_CPUID_REQ_ECX));
+-	VMGEXIT();
+-	val = sev_es_rd_ghcb_msr();
+-	if (GHCB_RESP_CODE(val) != GHCB_MSR_CPUID_RESP)
++	leaf.fn = fn;
++	leaf.subfn = subfn;
++	if (sev_cpuid_hv(&leaf))
+ 		goto fail;
+-	regs->cx = val >> 32;
+ 
+-	sev_es_wr_ghcb_msr(GHCB_CPUID_REQ(fn, GHCB_CPUID_REQ_EDX));
+-	VMGEXIT();
+-	val = sev_es_rd_ghcb_msr();
+-	if (GHCB_RESP_CODE(val) != GHCB_MSR_CPUID_RESP)
+-		goto fail;
+-	regs->dx = val >> 32;
++	regs->ax = leaf.eax;
++	regs->bx = leaf.ebx;
++	regs->cx = leaf.ecx;
++	regs->dx = leaf.edx;
+ 
+ 	/*
+ 	 * This is a VC handler and the #VC is only raised when SEV-ES is
+* Unmerged path arch/x86/kernel/sev.c
