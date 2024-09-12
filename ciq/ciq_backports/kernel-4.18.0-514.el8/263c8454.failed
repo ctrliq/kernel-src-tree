@@ -1,0 +1,183 @@
+s390/ap: introduce low frequency polling possibility
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-514.el8
+commit-author Harald Freudenberger <freude@linux.ibm.com>
+commit 263c8454dbffd4b878ea9bb403e157a56de98aca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-514.el8/263c8454.failed
+
+For some events the ap bus needs to poll. For example
+when an AP queue is reset until the reset is through.
+Also when no interrupt support is available (e.g. zVM)
+there is a need to poll until all requests have been
+processed and all replies have been delivered.
+
+Polling is done with a high resolution timer by default
+run with a rate of 4kHz (LPAR) or 666Hz (zVM guest).
+
+For some events (wait for reset complete, wait for irq
+enabled complete) this is a much too high poll rate
+which triggers a lot of TAPQ invocations.
+
+This patch introduces the possibility for the state
+machine functions to return a new wait enum
+AP_SM_WAIT_LOW_TIMEOUT which gives a hint to the
+ap_wait() function to eventually set up the timer
+with a more relaxed timeout value of 25Hz.
+
+This patch also includes a slight rework of the sysfs
+functions parsing the timer related stuff: Use of
+kstrtobool and kstrtoul instead of sscanf.
+
+	Signed-off-by: Harald Freudenberger <freude@linux.ibm.com>
+	Reviewed-by: Holger Dengler <dengler@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 263c8454dbffd4b878ea9bb403e157a56de98aca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index bf45474cbab8,35250fd3fa91..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -122,10 -122,14 +122,16 @@@ static struct hrtimer ap_poll_timer
+   * In LPAR poll with 4kHz frequency. Poll every 250000 nanoseconds.
+   * If z/VM change to 1500000 nanoseconds to adjust to z/VM polling.
+   */
+- static unsigned long long poll_timeout = 250000;
++ static unsigned long poll_high_timeout = 250000UL;
++ 
++ /*
++  * Some state machine states only require a low frequency polling.
++  * We use 25 Hz frequency for these.
++  */
++ static unsigned long poll_low_timeout = 40000000UL;
+  
+ +/* Suspend flag */
+ +static int ap_suspend_flag;
+  /* Maximum domain id, if not given via qci */
+  static int ap_max_domain_id = 15;
+  /* Maximum adapter id, if not given via qci */
+@@@ -427,11 -418,14 +433,19 @@@ void ap_wait(enum ap_sm_wait wait
+  			wake_up(&ap_poll_wait);
+  			break;
+  		}
+++<<<<<<< HEAD
+ +		/* Fall through */
+ +	case AP_SM_WAIT_TIMEOUT:
+++=======
++ 		fallthrough;
++ 	case AP_SM_WAIT_LOW_TIMEOUT:
++ 	case AP_SM_WAIT_HIGH_TIMEOUT:
+++>>>>>>> 263c8454dbff (s390/ap: introduce low frequency polling possibility)
+  		spin_lock_bh(&ap_poll_timer_lock);
+  		if (!hrtimer_is_queued(&ap_poll_timer)) {
+- 			hr_time = poll_timeout;
++ 			hr_time =
++ 				wait == AP_SM_WAIT_LOW_TIMEOUT ?
++ 				poll_low_timeout : poll_high_timeout;
+  			hrtimer_forward_now(&ap_poll_timer, hr_time);
+  			hrtimer_restart(&ap_poll_timer);
+  		}
+@@@ -1427,7 -1300,7 +1444,11 @@@ static BUS_ATTR_RW(poll_thread)
+  
+  static ssize_t poll_timeout_show(struct bus_type *bus, char *buf)
+  {
+++<<<<<<< HEAD
+ +	return scnprintf(buf, PAGE_SIZE, "%llu\n", poll_timeout);
+++=======
++ 	return sysfs_emit(buf, "%lu\n", poll_high_timeout);
+++>>>>>>> 263c8454dbff (s390/ap: introduce low frequency polling possibility)
+  }
+  
+  static ssize_t poll_timeout_store(struct bus_type *bus, const char *buf,
+@@@ -2383,8 -2281,7 +2408,12 @@@ static int __init ap_module_init(void
+  	 * If we are running under z/VM adjust polling to z/VM polling rate.
+  	 */
+  	if (MACHINE_IS_VM)
+++<<<<<<< HEAD
+ +		poll_timeout = 1500000;
+ +	spin_lock_init(&ap_poll_timer_lock);
+++=======
++ 		poll_high_timeout = 1500000;
+++>>>>>>> 263c8454dbff (s390/ap: introduce low frequency polling possibility)
+  	hrtimer_init(&ap_poll_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+  	ap_poll_timer.function = ap_poll_timeout;
+  
+* Unmerged path drivers/s390/crypto/ap_bus.c
+diff --git a/drivers/s390/crypto/ap_bus.h b/drivers/s390/crypto/ap_bus.h
+index 05e7475f8f8f..1b8fd891c373 100644
+--- a/drivers/s390/crypto/ap_bus.h
++++ b/drivers/s390/crypto/ap_bus.h
+@@ -108,10 +108,11 @@ enum ap_sm_event {
+  * AP queue state wait behaviour
+  */
+ enum ap_sm_wait {
+-	AP_SM_WAIT_AGAIN = 0,	/* retry immediately */
+-	AP_SM_WAIT_TIMEOUT,	/* wait for timeout */
+-	AP_SM_WAIT_INTERRUPT,	/* wait for thin interrupt (if available) */
+-	AP_SM_WAIT_NONE,	/* no wait */
++	AP_SM_WAIT_AGAIN = 0,	 /* retry immediately */
++	AP_SM_WAIT_HIGH_TIMEOUT, /* poll high freq, wait for timeout */
++	AP_SM_WAIT_LOW_TIMEOUT,	 /* poll low freq, wait for timeout */
++	AP_SM_WAIT_INTERRUPT,	 /* wait for thin interrupt (if available) */
++	AP_SM_WAIT_NONE,	 /* no wait */
+ 	NR_AP_SM_WAIT
+ };
+ 
+diff --git a/drivers/s390/crypto/ap_queue.c b/drivers/s390/crypto/ap_queue.c
+index 5cff09d72b96..c872911d3d52 100644
+--- a/drivers/s390/crypto/ap_queue.c
++++ b/drivers/s390/crypto/ap_queue.c
+@@ -221,7 +221,7 @@ static enum ap_sm_wait ap_sm_read(struct ap_queue *aq)
+ 	case AP_RESPONSE_NO_PENDING_REPLY:
+ 		if (aq->queue_count > 0)
+ 			return aq->interrupt ?
+-				AP_SM_WAIT_INTERRUPT : AP_SM_WAIT_TIMEOUT;
++				AP_SM_WAIT_INTERRUPT : AP_SM_WAIT_HIGH_TIMEOUT;
+ 		aq->sm_state = AP_SM_STATE_IDLE;
+ 		return AP_SM_WAIT_NONE;
+ 	default:
+@@ -302,10 +302,10 @@ static enum ap_sm_wait ap_sm_write(struct ap_queue *aq)
+ 	case AP_RESPONSE_Q_FULL:
+ 		aq->sm_state = AP_SM_STATE_QUEUE_FULL;
+ 		return aq->interrupt ?
+-			AP_SM_WAIT_INTERRUPT : AP_SM_WAIT_TIMEOUT;
++			AP_SM_WAIT_INTERRUPT : AP_SM_WAIT_HIGH_TIMEOUT;
+ 	case AP_RESPONSE_RESET_IN_PROGRESS:
+ 		aq->sm_state = AP_SM_STATE_RESET_WAIT;
+-		return AP_SM_WAIT_TIMEOUT;
++		return AP_SM_WAIT_LOW_TIMEOUT;
+ 	case AP_RESPONSE_INVALID_DOMAIN:
+ 		AP_DBF_WARN("%s RESPONSE_INVALID_DOMAIN on NQAP\n", __func__);
+ 		/* fall through */
+@@ -353,7 +353,7 @@ static enum ap_sm_wait ap_sm_reset(struct ap_queue *aq)
+ 	case AP_RESPONSE_RESET_IN_PROGRESS:
+ 		aq->sm_state = AP_SM_STATE_RESET_WAIT;
+ 		aq->interrupt = false;
+-		return AP_SM_WAIT_TIMEOUT;
++		return AP_SM_WAIT_LOW_TIMEOUT;
+ 	default:
+ 		aq->dev_state = AP_DEV_STATE_ERROR;
+ 		aq->last_err_rc = status.response_code;
+@@ -393,7 +393,7 @@ static enum ap_sm_wait ap_sm_reset_wait(struct ap_queue *aq)
+ 		return AP_SM_WAIT_AGAIN;
+ 	case AP_RESPONSE_BUSY:
+ 	case AP_RESPONSE_RESET_IN_PROGRESS:
+-		return AP_SM_WAIT_TIMEOUT;
++		return AP_SM_WAIT_LOW_TIMEOUT;
+ 	case AP_RESPONSE_Q_NOT_AVAIL:
+ 	case AP_RESPONSE_DECONFIGURED:
+ 	case AP_RESPONSE_CHECKSTOPPED:
+@@ -437,7 +437,7 @@ static enum ap_sm_wait ap_sm_setirq_wait(struct ap_queue *aq)
+ 			return AP_SM_WAIT_AGAIN;
+ 		/* fallthrough */
+ 	case AP_RESPONSE_NO_PENDING_REPLY:
+-		return AP_SM_WAIT_TIMEOUT;
++		return AP_SM_WAIT_LOW_TIMEOUT;
+ 	default:
+ 		aq->dev_state = AP_DEV_STATE_ERROR;
+ 		aq->last_err_rc = status.response_code;
