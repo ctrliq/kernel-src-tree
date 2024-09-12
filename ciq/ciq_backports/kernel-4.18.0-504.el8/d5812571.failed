@@ -1,0 +1,187 @@
+crypto: ccp - Add support for ringing a platform doorbell
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-504.el8
+commit-author Mario Limonciello <mario.limonciello@amd.com>
+commit d5812571f594b03438d0d7acd0dc044f73c1719e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-504.el8/d5812571.failed
+
+Some platforms support using a doorbell to communicate. Export
+this feature for other drivers to utilize as well.
+
+Link: https://lore.kernel.org/linux-i2c/20220916131854.687371-3-jsd@semihalf.com/
+	Suggested-by: Jan Dabros <jsd@semihalf.com>
+	Signed-off-by: Mario Limonciello <mario.limonciello@amd.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit d5812571f594b03438d0d7acd0dc044f73c1719e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/psp.h
+* Unmerged path include/linux/psp.h
+diff --git a/drivers/crypto/ccp/platform-access.c b/drivers/crypto/ccp/platform-access.c
+index 9cc0c60bbf7b..b51fb1196932 100644
+--- a/drivers/crypto/ccp/platform-access.c
++++ b/drivers/crypto/ccp/platform-access.c
+@@ -20,6 +20,14 @@
+ 
+ #define PSP_CMD_TIMEOUT_US	(500 * USEC_PER_MSEC)
+ 
++/* Doorbell shouldn't be ringing */
++static int check_doorbell(u32 __iomem *doorbell)
++{
++	u32 tmp;
++
++	return readl_poll_timeout(doorbell, tmp, tmp != 0, 0, PSP_CMD_TIMEOUT_US);
++}
++
+ /* Recovery field should be equal 0 to start sending commands */
+ static int check_recovery(u32 __iomem *cmd)
+ {
+@@ -132,6 +140,62 @@ int psp_send_platform_access_msg(enum psp_platform_access_msg msg,
+ }
+ EXPORT_SYMBOL_GPL(psp_send_platform_access_msg);
+ 
++int psp_ring_platform_doorbell(int msg)
++{
++	struct psp_device *psp = psp_get_master_device();
++	struct psp_platform_access_device *pa_dev;
++	u32 __iomem *button, *cmd;
++	int ret, val;
++
++	if (!psp || !psp->platform_access_data)
++		return -ENODEV;
++
++	pa_dev = psp->platform_access_data;
++	button = psp->io_regs + pa_dev->vdata->doorbell_button_reg;
++	cmd = psp->io_regs + pa_dev->vdata->doorbell_cmd_reg;
++
++	mutex_lock(&pa_dev->doorbell_mutex);
++
++	if (check_doorbell(button)) {
++		dev_dbg(psp->dev, "doorbell is not ready\n");
++		ret = -EBUSY;
++		goto unlock;
++	}
++
++	if (check_recovery(cmd)) {
++		dev_dbg(psp->dev, "doorbell command in recovery\n");
++		ret = -EBUSY;
++		goto unlock;
++	}
++
++	if (wait_cmd(cmd)) {
++		dev_dbg(psp->dev, "doorbell command not done processing\n");
++		ret = -EBUSY;
++		goto unlock;
++	}
++
++	iowrite32(FIELD_PREP(PSP_DRBL_MSG, msg), cmd);
++	iowrite32(PSP_DRBL_RING, button);
++
++	if (wait_cmd(cmd)) {
++		ret = -ETIMEDOUT;
++		goto unlock;
++	}
++
++	val = FIELD_GET(PSP_CMDRESP_STS, ioread32(cmd));
++	if (val) {
++		ret = -EIO;
++		goto unlock;
++	}
++
++	ret = 0;
++unlock:
++	mutex_unlock(&pa_dev->doorbell_mutex);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(psp_ring_platform_doorbell);
++
+ void platform_access_dev_destroy(struct psp_device *psp)
+ {
+ 	struct psp_platform_access_device *pa_dev = psp->platform_access_data;
+@@ -140,6 +204,7 @@ void platform_access_dev_destroy(struct psp_device *psp)
+ 		return;
+ 
+ 	mutex_destroy(&pa_dev->mailbox_mutex);
++	mutex_destroy(&pa_dev->doorbell_mutex);
+ 	psp->platform_access_data = NULL;
+ }
+ 
+@@ -159,6 +224,7 @@ int platform_access_dev_init(struct psp_device *psp)
+ 	pa_dev->vdata = (struct platform_access_vdata *)psp->vdata->platform_access;
+ 
+ 	mutex_init(&pa_dev->mailbox_mutex);
++	mutex_init(&pa_dev->doorbell_mutex);
+ 
+ 	dev_dbg(dev, "platform access enabled\n");
+ 
+diff --git a/drivers/crypto/ccp/platform-access.h b/drivers/crypto/ccp/platform-access.h
+index c3a97893320d..a83f03beb869 100644
+--- a/drivers/crypto/ccp/platform-access.h
++++ b/drivers/crypto/ccp/platform-access.h
+@@ -24,6 +24,7 @@ struct psp_platform_access_device {
+ 	struct platform_access_vdata *vdata;
+ 
+ 	struct mutex mailbox_mutex;
++	struct mutex doorbell_mutex;
+ 
+ 	void *platform_access_data;
+ };
+diff --git a/drivers/crypto/ccp/sp-dev.h b/drivers/crypto/ccp/sp-dev.h
+index 31dee0966b22..e9aee7d0bf07 100644
+--- a/drivers/crypto/ccp/sp-dev.h
++++ b/drivers/crypto/ccp/sp-dev.h
+@@ -57,6 +57,9 @@ struct platform_access_vdata {
+ 	const unsigned int cmdresp_reg;
+ 	const unsigned int cmdbuff_addr_lo_reg;
+ 	const unsigned int cmdbuff_addr_hi_reg;
++	const unsigned int doorbell_button_reg;
++	const unsigned int doorbell_cmd_reg;
++
+ };
+ 
+ struct psp_vdata {
+diff --git a/drivers/crypto/ccp/sp-pci.c b/drivers/crypto/ccp/sp-pci.c
+index 25c96f7c93c1..44328619fcaf 100644
+--- a/drivers/crypto/ccp/sp-pci.c
++++ b/drivers/crypto/ccp/sp-pci.c
+@@ -365,6 +365,8 @@ static const struct platform_access_vdata pa_v1 = {
+ 	.cmdresp_reg		= 0x10570,	/* C2PMSG_28 */
+ 	.cmdbuff_addr_lo_reg	= 0x10574,	/* C2PMSG_29 */
+ 	.cmdbuff_addr_hi_reg	= 0x10578,	/* C2PMSG_30 */
++	.doorbell_button_reg	= 0x10a24,	/* C2PMSG_73 */
++	.doorbell_cmd_reg	= 0x10a40,	/* C2PMSG_80 */
+ };
+ 
+ static const struct psp_vdata pspv1 = {
+diff --git a/include/linux/psp-platform-access.h b/include/linux/psp-platform-access.h
+index 977df5cfd494..89df4549fada 100644
+--- a/include/linux/psp-platform-access.h
++++ b/include/linux/psp-platform-access.h
+@@ -34,6 +34,21 @@ struct psp_request {
+  */
+ int psp_send_platform_access_msg(enum psp_platform_access_msg, struct psp_request *req);
+ 
++/**
++ * psp_ring_platform_doorbell() - Ring platform doorbell
++ *
++ * This function is intended to be used by drivers outside of ccp to ring the
++ * platform doorbell with a message.
++ *
++ * Returns:
++ *  0:           success
++ *  -%EBUSY:     mailbox in recovery or in use
++ *  -%ENODEV:    driver not bound with PSP device
++ *  -%ETIMEDOUT: request timed out
++ *  -%EIO:       unknown error (see kernel log)
++ */
++int psp_ring_platform_doorbell(int msg);
++
+ /**
+  * psp_check_platform_access_status() - Checks whether platform features is ready
+  *
+* Unmerged path include/linux/psp.h
