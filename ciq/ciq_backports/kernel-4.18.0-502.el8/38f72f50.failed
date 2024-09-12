@@ -1,0 +1,200 @@
+x86/resctrl: Move get_corrected_mbm_count() into resctrl_arch_rmid_read()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+commit-author James Morse <james.morse@arm.com>
+commit 38f72f50d6498ee60ac89deff3686e34ce0c2a32
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/38f72f50.failed
+
+resctrl_arch_rmid_read() is intended as the function that an
+architecture agnostic resctrl filesystem driver can use to
+read a value in bytes from a counter. Currently the function returns
+the MBM values in chunks directly from hardware. When reading a bandwidth
+counter, get_corrected_mbm_count() must be used to correct the
+value read.
+
+get_corrected_mbm_count() is architecture specific, this work should be
+done in resctrl_arch_rmid_read().
+
+Move the function calls. This allows the resctrl filesystems's chunks
+value to be removed in favour of the architecture private version.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Jamie Iles <quic_jiles@quicinc.com>
+	Reviewed-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Reviewed-by: Reinette Chatre <reinette.chatre@intel.com>
+	Tested-by: Xin Hao <xhao@linux.alibaba.com>
+	Tested-by: Shaopeng Tan <tan.shaopeng@fujitsu.com>
+	Tested-by: Cristian Marussi <cristian.marussi@arm.com>
+Link: https://lore.kernel.org/r/20220902154829.30399-19-james.morse@arm.com
+(cherry picked from commit 38f72f50d6498ee60ac89deff3686e34ce0c2a32)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/internal.h
+#	arch/x86/kernel/cpu/resctrl/monitor.c
+diff --cc arch/x86/kernel/cpu/resctrl/internal.h
+index 9780c2d2c637,bdb55c2fbdd3..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/internal.h
++++ b/arch/x86/kernel/cpu/resctrl/internal.h
+@@@ -286,61 -280,52 +286,87 @@@ struct rftype 
+  
+  /**
+   * struct mbm_state - status for each MBM counter in each domain
+++<<<<<<< HEAD
+ + * @chunks:	Total data moved (multiply by rdt_group.mon_scale to get bytes)
+ + * @prev_msr:	Value of IA32_QM_CTR for this RMID last time we read it
+ + * @prev_bw_msr:Value of previous IA32_QM_CTR for bandwidth counting
+++=======
++  * @prev_bw_chunks: Previous chunks value read for bandwidth calculation
+++>>>>>>> 38f72f50d649 (x86/resctrl: Move get_corrected_mbm_count() into resctrl_arch_rmid_read())
+   * @prev_bw:	The most recent bandwidth in MBps
+   * @delta_bw:	Difference between the current and previous bandwidth
+   * @delta_comp:	Indicates whether to compute the delta_bw
+   */
+  struct mbm_state {
+++<<<<<<< HEAD
+ +	u64	chunks;
+ +	u64	prev_msr;
+ +	u64	prev_bw_msr;
+++=======
++ 	u64	prev_bw_chunks;
+++>>>>>>> 38f72f50d649 (x86/resctrl: Move get_corrected_mbm_count() into resctrl_arch_rmid_read())
+  	u32	prev_bw;
+  	u32	delta_bw;
+  	bool	delta_comp;
+  };
+  
+  /**
+++<<<<<<< HEAD
+ + * struct rdt_domain - group of cpus sharing an RDT resource
+ + * @list:	all instances of this resource
+ + * @id:		unique id for this instance
+ + * @cpu_mask:	which cpus share this resource
+ + * @rmid_busy_llc:
+ + *		bitmap of which limbo RMIDs are above threshold
+ + * @mbm_total:	saved state for MBM total bandwidth
+ + * @mbm_local:	saved state for MBM local bandwidth
+ + * @mbm_over:	worker to periodically read MBM h/w counters
+ + * @cqm_limbo:	worker to periodically read CQM h/w counters
+ + * @mbm_work_cpu:
+ + *		worker cpu for MBM h/w counters
+ + * @cqm_work_cpu:
+ + *		worker cpu for CQM h/w counters
+++=======
++  * struct arch_mbm_state - values used to compute resctrl_arch_rmid_read()s
++  *			   return value.
++  * @chunks:	Total data moved (multiply by rdt_group.mon_scale to get bytes)
++  * @prev_msr:	Value of IA32_QM_CTR last time it was read for the RMID used to
++  *		find this struct.
++  */
++ struct arch_mbm_state {
++ 	u64	chunks;
++ 	u64	prev_msr;
++ };
++ 
++ /**
++  * struct rdt_hw_domain - Arch private attributes of a set of CPUs that share
++  *			  a resource
++  * @d_resctrl:	Properties exposed to the resctrl file system
+++>>>>>>> 38f72f50d649 (x86/resctrl: Move get_corrected_mbm_count() into resctrl_arch_rmid_read())
+   * @ctrl_val:	array of cache or mem ctrl values (indexed by CLOSID)
+ - * @arch_mbm_total:	arch private state for MBM total bandwidth
+ - * @arch_mbm_local:	arch private state for MBM local bandwidth
+ - *
+ - * Members of this structure are accessed via helpers that provide abstraction.
+ + * @mbps_val:	When mba_sc is enabled, this holds the bandwidth in MBps
+ + * @new_ctrl:	new ctrl value to be loaded
+ + * @have_new_ctrl: did user provide new_ctrl for this domain
+ + * @plr:	pseudo-locked region (if any) associated with domain
+   */
+ -struct rdt_hw_domain {
+ -	struct rdt_domain		d_resctrl;
+ +struct rdt_domain {
+ +	struct list_head		list;
+ +	int				id;
+ +	struct cpumask			cpu_mask;
+ +	unsigned long			*rmid_busy_llc;
+ +	struct mbm_state		*mbm_total;
+ +	struct mbm_state		*mbm_local;
+ +	struct delayed_work		mbm_over;
+ +	struct delayed_work		cqm_limbo;
+ +	int				mbm_work_cpu;
+ +	int				cqm_work_cpu;
+  	u32				*ctrl_val;
+ -	struct arch_mbm_state		*arch_mbm_total;
+ -	struct arch_mbm_state		*arch_mbm_local;
+ +	u32				*mbps_val;
+ +	u32				new_ctrl;
+ +	bool				have_new_ctrl;
+ +	struct pseudo_lock_region	*plr;
+  };
+  
+ -static inline struct rdt_hw_domain *resctrl_to_arch_dom(struct rdt_domain *r)
+ -{
+ -	return container_of(r, struct rdt_hw_domain, d_resctrl);
+ -}
+ -
+  /**
+   * struct msr_param - set a range of MSRs from a domain
+   * @res:       The resource to use
+diff --cc arch/x86/kernel/cpu/resctrl/monitor.c
+index 810114991b5b,27bb4947a176..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/monitor.c
++++ b/arch/x86/kernel/cpu/resctrl/monitor.c
+@@@ -158,16 -195,24 +158,28 @@@ static u64 __rmid_read(u32 rmid, u32 ev
+  	 * are error bits.
+  	 */
+  	wrmsr(MSR_IA32_QM_EVTSEL, eventid, rmid);
+ -	rdmsrl(MSR_IA32_QM_CTR, msr_val);
+ +	rdmsrl(MSR_IA32_QM_CTR, val);
+  
+ -	if (msr_val & RMID_VAL_ERROR)
+ -		return -EIO;
+ -	if (msr_val & RMID_VAL_UNAVAIL)
+ -		return -EINVAL;
+ +	return val;
+ +}
+  
+++<<<<<<< HEAD
+ +static bool rmid_dirty(struct rmid_entry *entry)
+ +{
+ +	u64 val = __rmid_read(entry->rmid, QOS_L3_OCCUP_EVENT_ID);
+++=======
++ 	am = get_arch_mbm_state(hw_dom, rmid, eventid);
++ 	if (am) {
++ 		am->chunks += mbm_overflow_count(am->prev_msr, msr_val,
++ 						 hw_res->mbm_width);
++ 		*val = get_corrected_mbm_count(rmid, am->chunks);
++ 		am->prev_msr = msr_val;
++ 	} else {
++ 		*val = msr_val;
++ 	}
+++>>>>>>> 38f72f50d649 (x86/resctrl: Move get_corrected_mbm_count() into resctrl_arch_rmid_read())
+  
+ -	return 0;
+ +	return val >= resctrl_cqm_threshold;
+  }
+  
+  /*
+@@@ -326,11 -376,7 +338,15 @@@ static u64 __mon_event_count(u32 rmid, 
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	chunks = mbm_overflow_count(m->prev_msr, tval, rr->r->mbm_width);
+ +	m->chunks += chunks;
+ +	m->prev_msr = tval;
+ +
+ +	rr->val += get_corrected_mbm_count(rmid, m->chunks);
+++=======
++ 	rr->val += tval;
+++>>>>>>> 38f72f50d649 (x86/resctrl: Move get_corrected_mbm_count() into resctrl_arch_rmid_read())
+  
+  	return 0;
+  }
+* Unmerged path arch/x86/kernel/cpu/resctrl/internal.h
+* Unmerged path arch/x86/kernel/cpu/resctrl/monitor.c
