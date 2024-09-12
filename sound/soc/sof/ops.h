@@ -27,6 +27,12 @@ static inline void sof_ops_init(struct snd_sof_dev *sdev)
 		sdev->pdata->desc->ops_init(sdev);
 }
 
+static inline void sof_ops_free(struct snd_sof_dev *sdev)
+{
+	if (sdev->pdata->desc->ops_free)
+		sdev->pdata->desc->ops_free(sdev);
+}
+
 /* Mandatory operations are verified during probing */
 
 /* init */
