@@ -1,0 +1,1068 @@
+Bluetooth: btintel: Fix broken LED quirk for legacy ROM devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+Rebuild_CHGLOG: - Bluetooth: btintel: Fix broken LED quirk for legacy ROM  devices (Gopal Tiwari) [2129295]
+Rebuild_FUZZ: 99.21%
+commit-author Tedd Ho-Jeong An <tedd.an@intel.com>
+commit 95655456e7cee858a23793f67025765b4c4c227b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/95655456.failed
+
+This patch fixes the broken LED quirk for Intel legacy ROM devices.
+To fix the LED issue that doesn't turn off immediately, the host sends
+the SW RFKILL command while shutting down the interface and it puts the
+devices in SW RFKILL state.
+
+Once the device is in SW RFKILL state, it can only accept HCI_Reset to
+exit from the SW RFKILL state. This patch checks the quirk for broken
+LED and sends the HCI_Reset before sending the HCI_Intel_Read_Version
+command.
+
+The affected legacy ROM devices are
+ - 8087:07dc
+ - 8087:0a2a
+ - 8087:0aa7
+
+Fixes: ffcba827c0a1d ("Bluetooth: btintel: Fix the LED is not turning off immediately")
+	Signed-off-by: Tedd Ho-Jeong An <tedd.an@intel.com>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 95655456e7cee858a23793f67025765b4c4c227b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/bluetooth/btintel.c
+#	drivers/bluetooth/btintel.h
+#	drivers/bluetooth/btusb.c
+diff --cc drivers/bluetooth/btintel.c
+index 949020fa0142,1a4f8b227eac..000000000000
+--- a/drivers/bluetooth/btintel.c
++++ b/drivers/bluetooth/btintel.c
+@@@ -1681,42 -1676,739 +1681,72 @@@ complete
+  	return 0;
+  }
+  
+ -static int btintel_download_wait(struct hci_dev *hdev, ktime_t calltime, int msec)
+ +static int btintel_setup_combined(struct hci_dev *hdev)
+  {
+ -	ktime_t delta, rettime;
+ -	unsigned long long duration;
+ +	const u8 param[1] = { 0xFF };
+ +	struct intel_version ver;
+ +	struct intel_version_tlv ver_tlv;
+ +	struct sk_buff *skb;
+  	int err;
+  
+ -	btintel_set_flag(hdev, INTEL_FIRMWARE_LOADED);
+ -
+ -	bt_dev_info(hdev, "Waiting for firmware download to complete");
+ +	BT_DBG("%s", hdev->name);
+  
+ -	err = btintel_wait_on_flag_timeout(hdev, INTEL_DOWNLOADING,
+ -					   TASK_INTERRUPTIBLE,
+ -					   msecs_to_jiffies(msec));
+ -	if (err == -EINTR) {
+ -		bt_dev_err(hdev, "Firmware loading interrupted");
+ -		return err;
+++<<<<<<< HEAD
+++=======
+++	/* The some controllers have a bug with the first HCI command sent to it
+++	 * returning number of completed commands as zero. This would stall the
+++	 * command processing in the Bluetooth core.
+++	 *
+++	 * As a workaround, send HCI Reset command first which will reset the
+++	 * number of completed commands and allow normal command processing
+++	 * from now on.
+++	 *
+++	 * Regarding the INTEL_BROKEN_SHUTDOWN_LED flag, these devices maybe
+++	 * in the SW_RFKILL ON state as a workaround of fixing LED issue during
+++	 * the shutdown() procedure, and once the device is in SW_RFKILL ON
+++	 * state, the only way to exit out of it is sending the HCI_Reset
+++	 * command.
+++	 */
+++	if (btintel_test_flag(hdev, INTEL_BROKEN_INITIAL_NCMD) ||
+++	    btintel_test_flag(hdev, INTEL_BROKEN_SHUTDOWN_LED)) {
+++		skb = __hci_cmd_sync(hdev, HCI_OP_RESET, 0, NULL,
+++				     HCI_INIT_TIMEOUT);
+++		if (IS_ERR(skb)) {
+++			bt_dev_err(hdev,
+++				   "sending initial HCI reset failed (%ld)",
+++				   PTR_ERR(skb));
+++			return PTR_ERR(skb);
+++		}
+++		kfree_skb(skb);
++ 	}
++ 
+ -	if (err) {
+ -		bt_dev_err(hdev, "Firmware loading timeout");
+ -		return -ETIMEDOUT;
+++>>>>>>> 95655456e7ce (Bluetooth: btintel: Fix broken LED quirk for legacy ROM devices)
+ +	/* Starting from TyP device, the command parameter and response are
+ +	 * changed even though the OCF for HCI_Intel_Read_Version command
+ +	 * remains same. The legacy devices can handle even if the
+ +	 * command has a parameter and returns a correct version information.
+ +	 * So, it uses new format to support both legacy and new format.
+ +	 */
+ +	skb = __hci_cmd_sync(hdev, 0xfc05, 1, param, HCI_CMD_TIMEOUT);
+ +	if (IS_ERR(skb)) {
+ +		bt_dev_err(hdev, "Reading Intel version command failed (%ld)",
+ +			   PTR_ERR(skb));
+ +		return PTR_ERR(skb);
+  	}
+  
+ -	if (btintel_test_flag(hdev, INTEL_FIRMWARE_FAILED)) {
+ -		bt_dev_err(hdev, "Firmware loading failed");
+ -		return -ENOEXEC;
+ +	/* Check the status */
+ +	if (skb->data[0]) {
+ +		bt_dev_err(hdev, "Intel Read Version command failed (%02x)",
+ +			   skb->data[0]);
+ +		err = -EIO;
+ +		goto exit_error;
+  	}
+  
+ -	rettime = ktime_get();
+ -	delta = ktime_sub(rettime, calltime);
+ -	duration = (unsigned long long)ktime_to_ns(delta) >> 10;
+ +	/* For Legacy device, check the HW platform value and size */
+ +	if (skb->len == sizeof(ver) && skb->data[1] == 0x37) {
+ +		bt_dev_dbg(hdev, "Read the legacy Intel version information");
+  
+ -	bt_dev_info(hdev, "Firmware loaded in %llu usecs", duration);
+ -
+ -	return 0;
+ -}
+ -
+ -static int btintel_boot_wait(struct hci_dev *hdev, ktime_t calltime, int msec)
+ -{
+ -	ktime_t delta, rettime;
+ -	unsigned long long duration;
+ -	int err;
+ -
+ -	bt_dev_info(hdev, "Waiting for device to boot");
+ -
+ -	err = btintel_wait_on_flag_timeout(hdev, INTEL_BOOTING,
+ -					   TASK_INTERRUPTIBLE,
+ -					   msecs_to_jiffies(msec));
+ -	if (err == -EINTR) {
+ -		bt_dev_err(hdev, "Device boot interrupted");
+ -		return -EINTR;
+ -	}
+ -
+ -	if (err) {
+ -		bt_dev_err(hdev, "Device boot timeout");
+ -		return -ETIMEDOUT;
+ -	}
+ -
+ -	rettime = ktime_get();
+ -	delta = ktime_sub(rettime, calltime);
+ -	duration = (unsigned long long) ktime_to_ns(delta) >> 10;
+ -
+ -	bt_dev_info(hdev, "Device booted in %llu usecs", duration);
+ -
+ -	return 0;
+ -}
+ -
+ -static int btintel_boot(struct hci_dev *hdev, u32 boot_addr)
+ -{
+ -	ktime_t calltime;
+ -	int err;
+ -
+ -	calltime = ktime_get();
+ -
+ -	btintel_set_flag(hdev, INTEL_BOOTING);
+ -
+ -	err = btintel_send_intel_reset(hdev, boot_addr);
+ -	if (err) {
+ -		bt_dev_err(hdev, "Intel Soft Reset failed (%d)", err);
+ -		btintel_reset_to_bootloader(hdev);
+ -		return err;
+ -	}
+ -
+ -	/* The bootloader will not indicate when the device is ready. This
+ -	 * is done by the operational firmware sending bootup notification.
+ -	 *
+ -	 * Booting into operational firmware should not take longer than
+ -	 * 1 second. However if that happens, then just fail the setup
+ -	 * since something went wrong.
+ -	 */
+ -	err = btintel_boot_wait(hdev, calltime, 1000);
+ -	if (err == -ETIMEDOUT)
+ -		btintel_reset_to_bootloader(hdev);
+ -
+ -	return err;
+ -}
+ -
+ -static int btintel_get_fw_name(struct intel_version *ver,
+ -					     struct intel_boot_params *params,
+ -					     char *fw_name, size_t len,
+ -					     const char *suffix)
+ -{
+ -	switch (ver->hw_variant) {
+ -	case 0x0b:	/* SfP */
+ -	case 0x0c:	/* WsP */
+ -		snprintf(fw_name, len, "intel/ibt-%u-%u.%s",
+ -			le16_to_cpu(ver->hw_variant),
+ -			le16_to_cpu(params->dev_revid),
+ -			suffix);
+ -		break;
+ -	case 0x11:	/* JfP */
+ -	case 0x12:	/* ThP */
+ -	case 0x13:	/* HrP */
+ -	case 0x14:	/* CcP */
+ -		snprintf(fw_name, len, "intel/ibt-%u-%u-%u.%s",
+ -			le16_to_cpu(ver->hw_variant),
+ -			le16_to_cpu(ver->hw_revision),
+ -			le16_to_cpu(ver->fw_revision),
+ -			suffix);
+ -		break;
+ -	default:
+ -		return -EINVAL;
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -static int btintel_download_fw(struct hci_dev *hdev,
+ -					 struct intel_version *ver,
+ -					 struct intel_boot_params *params,
+ -					 u32 *boot_param)
+ -{
+ -	const struct firmware *fw;
+ -	char fwname[64];
+ -	int err;
+ -	ktime_t calltime;
+ -
+ -	if (!ver || !params)
+ -		return -EINVAL;
+ -
+ -	/* The firmware variant determines if the device is in bootloader
+ -	 * mode or is running operational firmware. The value 0x06 identifies
+ -	 * the bootloader and the value 0x23 identifies the operational
+ -	 * firmware.
+ -	 *
+ -	 * When the operational firmware is already present, then only
+ -	 * the check for valid Bluetooth device address is needed. This
+ -	 * determines if the device will be added as configured or
+ -	 * unconfigured controller.
+ -	 *
+ -	 * It is not possible to use the Secure Boot Parameters in this
+ -	 * case since that command is only available in bootloader mode.
+ -	 */
+ -	if (ver->fw_variant == 0x23) {
+ -		btintel_clear_flag(hdev, INTEL_BOOTLOADER);
+ -		btintel_check_bdaddr(hdev);
+ -
+ -		/* SfP and WsP don't seem to update the firmware version on file
+ -		 * so version checking is currently possible.
+ -		 */
+ -		switch (ver->hw_variant) {
+ -		case 0x0b:	/* SfP */
+ -		case 0x0c:	/* WsP */
+ -			return 0;
+ -		}
+ -
+ -		/* Proceed to download to check if the version matches */
+ -		goto download;
+ -	}
+ -
+ -	/* Read the secure boot parameters to identify the operating
+ -	 * details of the bootloader.
+ -	 */
+ -	err = btintel_read_boot_params(hdev, params);
+ -	if (err)
+ -		return err;
+ -
+ -	/* It is required that every single firmware fragment is acknowledged
+ -	 * with a command complete event. If the boot parameters indicate
+ -	 * that this bootloader does not send them, then abort the setup.
+ -	 */
+ -	if (params->limited_cce != 0x00) {
+ -		bt_dev_err(hdev, "Unsupported Intel firmware loading method (%u)",
+ -			   params->limited_cce);
+ -		return -EINVAL;
+ -	}
+ -
+ -	/* If the OTP has no valid Bluetooth device address, then there will
+ -	 * also be no valid address for the operational firmware.
+ -	 */
+ -	if (!bacmp(&params->otp_bdaddr, BDADDR_ANY)) {
+ -		bt_dev_info(hdev, "No device address configured");
+ -		set_bit(HCI_QUIRK_INVALID_BDADDR, &hdev->quirks);
+ -	}
+ -
+ -download:
+ -	/* With this Intel bootloader only the hardware variant and device
+ -	 * revision information are used to select the right firmware for SfP
+ -	 * and WsP.
+ -	 *
+ -	 * The firmware filename is ibt-<hw_variant>-<dev_revid>.sfi.
+ -	 *
+ -	 * Currently the supported hardware variants are:
+ -	 *   11 (0x0b) for iBT3.0 (LnP/SfP)
+ -	 *   12 (0x0c) for iBT3.5 (WsP)
+ -	 *
+ -	 * For ThP/JfP and for future SKU's, the FW name varies based on HW
+ -	 * variant, HW revision and FW revision, as these are dependent on CNVi
+ -	 * and RF Combination.
+ -	 *
+ -	 *   17 (0x11) for iBT3.5 (JfP)
+ -	 *   18 (0x12) for iBT3.5 (ThP)
+ -	 *
+ -	 * The firmware file name for these will be
+ -	 * ibt-<hw_variant>-<hw_revision>-<fw_revision>.sfi.
+ -	 *
+ -	 */
+ -	err = btintel_get_fw_name(ver, params, fwname, sizeof(fwname), "sfi");
+ -	if (err < 0) {
+ -		if (!btintel_test_flag(hdev, INTEL_BOOTLOADER)) {
+ -			/* Firmware has already been loaded */
+ -			btintel_set_flag(hdev, INTEL_FIRMWARE_LOADED);
+ -			return 0;
+ -		}
+ -
+ -		bt_dev_err(hdev, "Unsupported Intel firmware naming");
+ -		return -EINVAL;
+ -	}
+ -
+ -	err = firmware_request_nowarn(&fw, fwname, &hdev->dev);
+ -	if (err < 0) {
+ -		if (!btintel_test_flag(hdev, INTEL_BOOTLOADER)) {
+ -			/* Firmware has already been loaded */
+ -			btintel_set_flag(hdev, INTEL_FIRMWARE_LOADED);
+ -			return 0;
+ -		}
+ -
+ -		bt_dev_err(hdev, "Failed to load Intel firmware file %s (%d)",
+ -			   fwname, err);
+ -		return err;
+ -	}
+ -
+ -	bt_dev_info(hdev, "Found device firmware: %s", fwname);
+ -
+ -	if (fw->size < 644) {
+ -		bt_dev_err(hdev, "Invalid size of firmware file (%zu)",
+ -			   fw->size);
+ -		err = -EBADF;
+ -		goto done;
+ -	}
+ -
+ -	calltime = ktime_get();
+ -
+ -	btintel_set_flag(hdev, INTEL_DOWNLOADING);
+ -
+ -	/* Start firmware downloading and get boot parameter */
+ -	err = btintel_download_firmware(hdev, ver, fw, boot_param);
+ -	if (err < 0) {
+ -		if (err == -EALREADY) {
+ -			/* Firmware has already been loaded */
+ -			btintel_set_flag(hdev, INTEL_FIRMWARE_LOADED);
+ -			err = 0;
+ -			goto done;
+ -		}
+ -
+ -		/* When FW download fails, send Intel Reset to retry
+ -		 * FW download.
+ -		 */
+ -		btintel_reset_to_bootloader(hdev);
+ -		goto done;
+ -	}
+ -
+ -	/* Before switching the device into operational mode and with that
+ -	 * booting the loaded firmware, wait for the bootloader notification
+ -	 * that all fragments have been successfully received.
+ -	 *
+ -	 * When the event processing receives the notification, then the
+ -	 * INTEL_DOWNLOADING flag will be cleared.
+ -	 *
+ -	 * The firmware loading should not take longer than 5 seconds
+ -	 * and thus just timeout if that happens and fail the setup
+ -	 * of this device.
+ -	 */
+ -	err = btintel_download_wait(hdev, calltime, 5000);
+ -	if (err == -ETIMEDOUT)
+ -		btintel_reset_to_bootloader(hdev);
+ -
+ -done:
+ -	release_firmware(fw);
+ -	return err;
+ -}
+ -
+ -static int btintel_bootloader_setup(struct hci_dev *hdev,
+ -				    struct intel_version *ver)
+ -{
+ -	struct intel_version new_ver;
+ -	struct intel_boot_params params;
+ -	u32 boot_param;
+ -	char ddcname[64];
+ -	int err;
+ -
+ -	BT_DBG("%s", hdev->name);
+ -
+ -	/* Set the default boot parameter to 0x0 and it is updated to
+ -	 * SKU specific boot parameter after reading Intel_Write_Boot_Params
+ -	 * command while downloading the firmware.
+ -	 */
+ -	boot_param = 0x00000000;
+ -
+ -	btintel_set_flag(hdev, INTEL_BOOTLOADER);
+ -
+ -	err = btintel_download_fw(hdev, ver, &params, &boot_param);
+ -	if (err)
+ -		return err;
+ -
+ -	/* controller is already having an operational firmware */
+ -	if (ver->fw_variant == 0x23)
+ -		goto finish;
+ -
+ -	err = btintel_boot(hdev, boot_param);
+ -	if (err)
+ -		return err;
+ -
+ -	btintel_clear_flag(hdev, INTEL_BOOTLOADER);
+ -
+ -	err = btintel_get_fw_name(ver, &params, ddcname,
+ -						sizeof(ddcname), "ddc");
+ -
+ -	if (err < 0) {
+ -		bt_dev_err(hdev, "Unsupported Intel firmware naming");
+ -	} else {
+ -		/* Once the device is running in operational mode, it needs to
+ -		 * apply the device configuration (DDC) parameters.
+ -		 *
+ -		 * The device can work without DDC parameters, so even if it
+ -		 * fails to load the file, no need to fail the setup.
+ -		 */
+ -		btintel_load_ddc_config(hdev, ddcname);
+ -	}
+ -
+ -	hci_dev_clear_flag(hdev, HCI_QUALITY_REPORT);
+ -
+ -	/* Read the Intel version information after loading the FW  */
+ -	err = btintel_read_version(hdev, &new_ver);
+ -	if (err)
+ -		return err;
+ -
+ -	btintel_version_info(hdev, &new_ver);
+ -
+ -finish:
+ -	/* Set the event mask for Intel specific vendor events. This enables
+ -	 * a few extra events that are useful during general operation. It
+ -	 * does not enable any debugging related events.
+ -	 *
+ -	 * The device will function correctly without these events enabled
+ -	 * and thus no need to fail the setup.
+ -	 */
+ -	btintel_set_event_mask(hdev, false);
+ -
+ -	return 0;
+ -}
+ -
+ -static void btintel_get_fw_name_tlv(const struct intel_version_tlv *ver,
+ -				    char *fw_name, size_t len,
+ -				    const char *suffix)
+ -{
+ -	/* The firmware file name for new generation controllers will be
+ -	 * ibt-<cnvi_top type+cnvi_top step>-<cnvr_top type+cnvr_top step>
+ -	 */
+ -	snprintf(fw_name, len, "intel/ibt-%04x-%04x.%s",
+ -		 INTEL_CNVX_TOP_PACK_SWAB(INTEL_CNVX_TOP_TYPE(ver->cnvi_top),
+ -					  INTEL_CNVX_TOP_STEP(ver->cnvi_top)),
+ -		 INTEL_CNVX_TOP_PACK_SWAB(INTEL_CNVX_TOP_TYPE(ver->cnvr_top),
+ -					  INTEL_CNVX_TOP_STEP(ver->cnvr_top)),
+ -		 suffix);
+ -}
+ -
+ -static int btintel_prepare_fw_download_tlv(struct hci_dev *hdev,
+ -					   struct intel_version_tlv *ver,
+ -					   u32 *boot_param)
+ -{
+ -	const struct firmware *fw;
+ -	char fwname[64];
+ -	int err;
+ -	ktime_t calltime;
+ -
+ -	if (!ver || !boot_param)
+ -		return -EINVAL;
+ -
+ -	/* The firmware variant determines if the device is in bootloader
+ -	 * mode or is running operational firmware. The value 0x03 identifies
+ -	 * the bootloader and the value 0x23 identifies the operational
+ -	 * firmware.
+ -	 *
+ -	 * When the operational firmware is already present, then only
+ -	 * the check for valid Bluetooth device address is needed. This
+ -	 * determines if the device will be added as configured or
+ -	 * unconfigured controller.
+ -	 *
+ -	 * It is not possible to use the Secure Boot Parameters in this
+ -	 * case since that command is only available in bootloader mode.
+ -	 */
+ -	if (ver->img_type == 0x03) {
+ -		btintel_clear_flag(hdev, INTEL_BOOTLOADER);
+ -		btintel_check_bdaddr(hdev);
+ -	} else {
+ -		/*
+ -		 * Check for valid bd address in boot loader mode. Device
+ -		 * will be marked as unconfigured if empty bd address is
+ -		 * found.
+ -		 */
+ -		if (!bacmp(&ver->otp_bd_addr, BDADDR_ANY)) {
+ -			bt_dev_info(hdev, "No device address configured");
+ -			set_bit(HCI_QUIRK_INVALID_BDADDR, &hdev->quirks);
+ -		}
+ -	}
+ -
+ -	btintel_get_fw_name_tlv(ver, fwname, sizeof(fwname), "sfi");
+ -	err = firmware_request_nowarn(&fw, fwname, &hdev->dev);
+ -	if (err < 0) {
+ -		if (!btintel_test_flag(hdev, INTEL_BOOTLOADER)) {
+ -			/* Firmware has already been loaded */
+ -			btintel_set_flag(hdev, INTEL_FIRMWARE_LOADED);
+ -			return 0;
+ -		}
+ -
+ -		bt_dev_err(hdev, "Failed to load Intel firmware file %s (%d)",
+ -			   fwname, err);
+ -
+ -		return err;
+ -	}
+ -
+ -	bt_dev_info(hdev, "Found device firmware: %s", fwname);
+ -
+ -	if (fw->size < 644) {
+ -		bt_dev_err(hdev, "Invalid size of firmware file (%zu)",
+ -			   fw->size);
+ -		err = -EBADF;
+ -		goto done;
+ -	}
+ -
+ -	calltime = ktime_get();
+ -
+ -	btintel_set_flag(hdev, INTEL_DOWNLOADING);
+ -
+ -	/* Start firmware downloading and get boot parameter */
+ -	err = btintel_download_fw_tlv(hdev, ver, fw, boot_param,
+ -					       INTEL_HW_VARIANT(ver->cnvi_bt),
+ -					       ver->sbe_type);
+ -	if (err < 0) {
+ -		if (err == -EALREADY) {
+ -			/* Firmware has already been loaded */
+ -			btintel_set_flag(hdev, INTEL_FIRMWARE_LOADED);
+ -			err = 0;
+ -			goto done;
+ -		}
+ -
+ -		/* When FW download fails, send Intel Reset to retry
+ -		 * FW download.
+ -		 */
+ -		btintel_reset_to_bootloader(hdev);
+ -		goto done;
+ -	}
+ -
+ -	/* Before switching the device into operational mode and with that
+ -	 * booting the loaded firmware, wait for the bootloader notification
+ -	 * that all fragments have been successfully received.
+ -	 *
+ -	 * When the event processing receives the notification, then the
+ -	 * BTUSB_DOWNLOADING flag will be cleared.
+ -	 *
+ -	 * The firmware loading should not take longer than 5 seconds
+ -	 * and thus just timeout if that happens and fail the setup
+ -	 * of this device.
+ -	 */
+ -	err = btintel_download_wait(hdev, calltime, 5000);
+ -	if (err == -ETIMEDOUT)
+ -		btintel_reset_to_bootloader(hdev);
+ -
+ -done:
+ -	release_firmware(fw);
+ -	return err;
+ -}
+ -
+ -static int btintel_get_codec_config_data(struct hci_dev *hdev,
+ -					 __u8 link, struct bt_codec *codec,
+ -					 __u8 *ven_len, __u8 **ven_data)
+ -{
+ -	int err = 0;
+ -
+ -	if (!ven_data || !ven_len)
+ -		return -EINVAL;
+ -
+ -	*ven_len = 0;
+ -	*ven_data = NULL;
+ -
+ -	if (link != ESCO_LINK) {
+ -		bt_dev_err(hdev, "Invalid link type(%u)", link);
+ -		return -EINVAL;
+ -	}
+ -
+ -	*ven_data = kmalloc(sizeof(__u8), GFP_KERNEL);
+ -	if (!*ven_data) {
+ -		err = -ENOMEM;
+ -		goto error;
+ -	}
+ -
+ -	/* supports only CVSD and mSBC offload codecs */
+ -	switch (codec->id) {
+ -	case 0x02:
+ -		**ven_data = 0x00;
+ -		break;
+ -	case 0x05:
+ -		**ven_data = 0x01;
+ -		break;
+ -	default:
+ -		err = -EINVAL;
+ -		bt_dev_err(hdev, "Invalid codec id(%u)", codec->id);
+ -		goto error;
+ -	}
+ -	/* codec and its capabilities are pre-defined to ids
+ -	 * preset id = 0x00 represents CVSD codec with sampling rate 8K
+ -	 * preset id = 0x01 represents mSBC codec with sampling rate 16K
+ -	 */
+ -	*ven_len = sizeof(__u8);
+ -	return err;
+ -
+ -error:
+ -	kfree(*ven_data);
+ -	*ven_data = NULL;
+ -	return err;
+ -}
+ -
+ -static int btintel_get_data_path_id(struct hci_dev *hdev, __u8 *data_path_id)
+ -{
+ -	/* Intel uses 1 as data path id for all the usecases */
+ -	*data_path_id = 1;
+ -	return 0;
+ -}
+ -
+ -static int btintel_configure_offload(struct hci_dev *hdev)
+ -{
+ -	struct sk_buff *skb;
+ -	int err = 0;
+ -	struct intel_offload_use_cases *use_cases;
+ -
+ -	skb = __hci_cmd_sync(hdev, 0xfc86, 0, NULL, HCI_INIT_TIMEOUT);
+ -	if (IS_ERR(skb)) {
+ -		bt_dev_err(hdev, "Reading offload use cases failed (%ld)",
+ -			   PTR_ERR(skb));
+ -		return PTR_ERR(skb);
+ -	}
+ -
+ -	if (skb->len < sizeof(*use_cases)) {
+ -		err = -EIO;
+ -		goto error;
+ -	}
+ -
+ -	use_cases = (void *)skb->data;
+ -
+ -	if (use_cases->status) {
+ -		err = -bt_to_errno(skb->data[0]);
+ -		goto error;
+ -	}
+ -
+ -	if (use_cases->preset[0] & 0x03) {
+ -		hdev->get_data_path_id = btintel_get_data_path_id;
+ -		hdev->get_codec_config_data = btintel_get_codec_config_data;
+ -	}
+ -error:
+ -	kfree_skb(skb);
+ -	return err;
+ -}
+ -
+ -static int btintel_bootloader_setup_tlv(struct hci_dev *hdev,
+ -					struct intel_version_tlv *ver)
+ -{
+ -	u32 boot_param;
+ -	char ddcname[64];
+ -	int err;
+ -	struct intel_version_tlv new_ver;
+ -
+ -	bt_dev_dbg(hdev, "");
+ -
+ -	/* Set the default boot parameter to 0x0 and it is updated to
+ -	 * SKU specific boot parameter after reading Intel_Write_Boot_Params
+ -	 * command while downloading the firmware.
+ -	 */
+ -	boot_param = 0x00000000;
+ -
+ -	btintel_set_flag(hdev, INTEL_BOOTLOADER);
+ -
+ -	err = btintel_prepare_fw_download_tlv(hdev, ver, &boot_param);
+ -	if (err)
+ -		return err;
+ -
+ -	/* check if controller is already having an operational firmware */
+ -	if (ver->img_type == 0x03)
+ -		goto finish;
+ -
+ -	err = btintel_boot(hdev, boot_param);
+ -	if (err)
+ -		return err;
+ -
+ -	btintel_clear_flag(hdev, INTEL_BOOTLOADER);
+ -
+ -	btintel_get_fw_name_tlv(ver, ddcname, sizeof(ddcname), "ddc");
+ -	/* Once the device is running in operational mode, it needs to
+ -	 * apply the device configuration (DDC) parameters.
+ -	 *
+ -	 * The device can work without DDC parameters, so even if it
+ -	 * fails to load the file, no need to fail the setup.
+ -	 */
+ -	btintel_load_ddc_config(hdev, ddcname);
+ -
+ -	/* Read supported use cases and set callbacks to fetch datapath id */
+ -	btintel_configure_offload(hdev);
+ -
+ -	hci_dev_clear_flag(hdev, HCI_QUALITY_REPORT);
+ -
+ -	/* Read the Intel version information after loading the FW  */
+ -	err = btintel_read_version_tlv(hdev, &new_ver);
+ -	if (err)
+ -		return err;
+ -
+ -	btintel_version_info_tlv(hdev, &new_ver);
+ -
+ -finish:
+ -	/* Set the event mask for Intel specific vendor events. This enables
+ -	 * a few extra events that are useful during general operation. It
+ -	 * does not enable any debugging related events.
+ -	 *
+ -	 * The device will function correctly without these events enabled
+ -	 * and thus no need to fail the setup.
+ -	 */
+ -	btintel_set_event_mask(hdev, false);
+ -
+ -	return 0;
+ -}
+ -
+ -static void btintel_set_msft_opcode(struct hci_dev *hdev, u8 hw_variant)
+ -{
+ -	switch (hw_variant) {
+ -	/* Legacy bootloader devices that supports MSFT Extension */
+ -	case 0x11:	/* JfP */
+ -	case 0x12:	/* ThP */
+ -	case 0x13:	/* HrP */
+ -	case 0x14:	/* CcP */
+ -	/* All Intel new genration controllers support the Microsoft vendor
+ -	 * extension are using 0xFC1E for VsMsftOpCode.
+ -	 */
+ -	case 0x17:
+ -	case 0x18:
+ -	case 0x19:
+ -		hci_set_msft_opcode(hdev, 0xFC1E);
+ -		break;
+ -	default:
+ -		/* Not supported */
+ -		break;
+ -	}
+ -}
+ -
+ -static int btintel_setup_combined(struct hci_dev *hdev)
+ -{
+ -	const u8 param[1] = { 0xFF };
+ -	struct intel_version ver;
+ -	struct intel_version_tlv ver_tlv;
+ -	struct sk_buff *skb;
+ -	int err;
+ -
+ -	BT_DBG("%s", hdev->name);
+ -
+ -	/* The some controllers have a bug with the first HCI command sent to it
+ -	 * returning number of completed commands as zero. This would stall the
+ -	 * command processing in the Bluetooth core.
+ -	 *
+ -	 * As a workaround, send HCI Reset command first which will reset the
+ -	 * number of completed commands and allow normal command processing
+ -	 * from now on.
+ -	 *
+ -	 * Regarding the INTEL_BROKEN_SHUTDOWN_LED flag, these devices maybe
+ -	 * in the SW_RFKILL ON state as a workaround of fixing LED issue during
+ -	 * the shutdown() procedure, and once the device is in SW_RFKILL ON
+ -	 * state, the only way to exit out of it is sending the HCI_Reset
+ -	 * command.
+ -	 */
+ -	if (btintel_test_flag(hdev, INTEL_BROKEN_INITIAL_NCMD) ||
+ -	    btintel_test_flag(hdev, INTEL_BROKEN_SHUTDOWN_LED)) {
+ -		skb = __hci_cmd_sync(hdev, HCI_OP_RESET, 0, NULL,
+ -				     HCI_INIT_TIMEOUT);
+ -		if (IS_ERR(skb)) {
+ -			bt_dev_err(hdev,
+ -				   "sending initial HCI reset failed (%ld)",
+ -				   PTR_ERR(skb));
+ -			return PTR_ERR(skb);
+ -		}
+ -		kfree_skb(skb);
+ -	}
+ -
+ -	/* Starting from TyP device, the command parameter and response are
+ -	 * changed even though the OCF for HCI_Intel_Read_Version command
+ -	 * remains same. The legacy devices can handle even if the
+ -	 * command has a parameter and returns a correct version information.
+ -	 * So, it uses new format to support both legacy and new format.
+ -	 */
+ -	skb = __hci_cmd_sync(hdev, 0xfc05, 1, param, HCI_CMD_TIMEOUT);
+ -	if (IS_ERR(skb)) {
+ -		bt_dev_err(hdev, "Reading Intel version command failed (%ld)",
+ -			   PTR_ERR(skb));
+ -		return PTR_ERR(skb);
+ -	}
+ -
+ -	/* Check the status */
+ -	if (skb->data[0]) {
+ -		bt_dev_err(hdev, "Intel Read Version command failed (%02x)",
+ -			   skb->data[0]);
+ -		err = -EIO;
+ -		goto exit_error;
+ -	}
+ -
+ -	/* Apply the common HCI quirks for Intel device */
+ -	set_bit(HCI_QUIRK_STRICT_DUPLICATE_FILTER, &hdev->quirks);
+ -	set_bit(HCI_QUIRK_SIMULTANEOUS_DISCOVERY, &hdev->quirks);
+ -	set_bit(HCI_QUIRK_NON_PERSISTENT_DIAG, &hdev->quirks);
+ -
+ -	/* Set up the quality report callback for Intel devices */
+ -	hdev->set_quality_report = btintel_set_quality_report;
+ -
+ -	/* For Legacy device, check the HW platform value and size */
+ -	if (skb->len == sizeof(ver) && skb->data[1] == 0x37) {
+ -		bt_dev_dbg(hdev, "Read the legacy Intel version information");
+ -
+ -		memcpy(&ver, skb->data, sizeof(ver));
+ +		memcpy(&ver, skb->data, sizeof(ver));
+  
+  		/* Display version information */
+  		btintel_version_info(hdev, &ver);
+@@@ -1732,6 -2424,17 +1762,20 @@@
+  		case 0x07:	/* WP */
+  		case 0x08:	/* StP */
+  			/* Legacy ROM product */
+++<<<<<<< HEAD
+++=======
++ 			btintel_set_flag(hdev, INTEL_ROM_LEGACY);
++ 
++ 			/* Apply the device specific HCI quirks
++ 			 *
++ 			 * WBS for SdP - SdP and Stp have a same hw_varaint but
++ 			 * different fw_variant
++ 			 */
++ 			if (ver.hw_variant == 0x08 && ver.fw_variant == 0x22)
++ 				set_bit(HCI_QUIRK_WIDEBAND_SPEECH_SUPPORTED,
++ 					&hdev->quirks);
++ 
+++>>>>>>> 95655456e7ce (Bluetooth: btintel: Fix broken LED quirk for legacy ROM devices)
+  			err = btintel_legacy_rom_setup(hdev, &ver);
+  			break;
+  		case 0x0b:      /* SfP */
+@@@ -1792,6 -2584,22 +1836,25 @@@ static int btintel_shutdown_combined(st
+  	}
+  	kfree_skb(skb);
+  
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Some platforms have an issue with BT LED when the interface is
++ 	 * down or BT radio is turned off, which takes 5 seconds to BT LED
++ 	 * goes off. As a workaround, sends HCI_Intel_SW_RFKILL to put the
++ 	 * device in the RFKILL ON state which turns off the BT LED immediately.
++ 	 */
++ 	if (btintel_test_flag(hdev, INTEL_BROKEN_SHUTDOWN_LED)) {
++ 		skb = __hci_cmd_sync(hdev, 0xfc3f, 0, NULL, HCI_INIT_TIMEOUT);
++ 		if (IS_ERR(skb)) {
++ 			ret = PTR_ERR(skb);
++ 			bt_dev_err(hdev, "turning off Intel device LED failed");
++ 			return ret;
++ 		}
++ 		kfree_skb(skb);
++ 	}
++ 
+++>>>>>>> 95655456e7ce (Bluetooth: btintel: Fix broken LED quirk for legacy ROM devices)
+  	return 0;
+  }
+  
+diff --cc drivers/bluetooth/btintel.h
+index 773241e9644f,c9b24e9299e2..000000000000
+--- a/drivers/bluetooth/btintel.h
++++ b/drivers/bluetooth/btintel.h
+@@@ -153,6 -143,49 +153,52 @@@ struct intel_debug_features 
+  #define INTEL_CNVX_TOP_STEP(cnvx_top)	(((cnvx_top) & 0x0f000000) >> 24)
+  #define INTEL_CNVX_TOP_PACK_SWAB(t, s)	__swab16(((__u16)(((t) << 4) | (s))))
+  
+++<<<<<<< HEAD
+++=======
++ enum {
++ 	INTEL_BOOTLOADER,
++ 	INTEL_DOWNLOADING,
++ 	INTEL_FIRMWARE_LOADED,
++ 	INTEL_FIRMWARE_FAILED,
++ 	INTEL_BOOTING,
++ 	INTEL_BROKEN_INITIAL_NCMD,
++ 	INTEL_BROKEN_SHUTDOWN_LED,
++ 	INTEL_ROM_LEGACY,
++ 
++ 	__INTEL_NUM_FLAGS,
++ };
++ 
++ struct btintel_data {
++ 	DECLARE_BITMAP(flags, __INTEL_NUM_FLAGS);
++ };
++ 
++ #define btintel_set_flag(hdev, nr)					\
++ 	do {								\
++ 		struct btintel_data *intel = hci_get_priv((hdev));	\
++ 		set_bit((nr), intel->flags);				\
++ 	} while (0)
++ 
++ #define btintel_clear_flag(hdev, nr)					\
++ 	do {								\
++ 		struct btintel_data *intel = hci_get_priv((hdev));	\
++ 		clear_bit((nr), intel->flags);				\
++ 	} while (0)
++ 
++ #define btintel_wake_up_flag(hdev, nr)					\
++ 	do {								\
++ 		struct btintel_data *intel = hci_get_priv((hdev));	\
++ 		wake_up_bit(intel->flags, (nr));			\
++ 	} while (0)
++ 
++ #define btintel_get_flag(hdev)						\
++ 	(((struct btintel_data *)hci_get_priv(hdev))->flags)
++ 
++ #define btintel_test_flag(hdev, nr)	test_bit((nr), btintel_get_flag(hdev))
++ #define btintel_test_and_clear_flag(hdev, nr) test_and_clear_bit((nr), btintel_get_flag(hdev))
++ #define btintel_wait_on_flag_timeout(hdev, nr, m, to)			\
++ 		wait_on_bit_timeout(btintel_get_flag(hdev), (nr), m, to)
++ 
+++>>>>>>> 95655456e7ce (Bluetooth: btintel: Fix broken LED quirk for legacy ROM devices)
+  #if IS_ENABLED(CONFIG_BT_INTEL)
+  
+  int btintel_check_bdaddr(struct hci_dev *hdev);
+diff --cc drivers/bluetooth/btusb.c
+index 26b67f0b060b,d0619a07b069..000000000000
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@@ -75,7 -60,8 +75,12 @@@ static struct usb_driver btusb_driver
+  #define BTUSB_WIDEBAND_SPEECH	0x400000
+  #define BTUSB_VALID_LE_STATES   0x800000
+  #define BTUSB_QCA_WCN6855	0x1000000
+++<<<<<<< HEAD
+ +#define BTUSB_INTEL_NEWGEN	0x2000000
+++=======
++ #define BTUSB_INTEL_BROKEN_SHUTDOWN_LED	0x2000000
++ #define BTUSB_INTEL_BROKEN_INITIAL_NCMD 0x4000000
+++>>>>>>> 95655456e7ce (Bluetooth: btintel: Fix broken LED quirk for legacy ROM devices)
+  
+  static const struct usb_device_id btusb_table[] = {
+  	/* Generic Bluetooth USB device */
+@@@ -376,38 -375,21 +381,50 @@@ static const struct usb_device_id black
+  	{ USB_DEVICE(0x1286, 0x204e), .driver_info = BTUSB_MARVELL },
+  
+  	/* Intel Bluetooth devices */
+ -	{ USB_DEVICE(0x8087, 0x0025), .driver_info = BTUSB_INTEL_COMBINED },
+ -	{ USB_DEVICE(0x8087, 0x0026), .driver_info = BTUSB_INTEL_COMBINED },
+ -	{ USB_DEVICE(0x8087, 0x0029), .driver_info = BTUSB_INTEL_COMBINED },
+ -	{ USB_DEVICE(0x8087, 0x0032), .driver_info = BTUSB_INTEL_COMBINED },
+ -	{ USB_DEVICE(0x8087, 0x0033), .driver_info = BTUSB_INTEL_COMBINED },
+ +	{ USB_DEVICE(0x8087, 0x0025), .driver_info = BTUSB_INTEL_NEW |
+ +						     BTUSB_WIDEBAND_SPEECH |
+ +						     BTUSB_VALID_LE_STATES },
+ +	{ USB_DEVICE(0x8087, 0x0026), .driver_info = BTUSB_INTEL_NEW |
+ +						     BTUSB_WIDEBAND_SPEECH },
+ +	{ USB_DEVICE(0x8087, 0x0029), .driver_info = BTUSB_INTEL_NEW |
+ +						     BTUSB_WIDEBAND_SPEECH },
+ +	{ USB_DEVICE(0x8087, 0x0032), .driver_info = BTUSB_INTEL_NEWGEN |
+ +						     BTUSB_WIDEBAND_SPEECH},
+ +	{ USB_DEVICE(0x8087, 0x0033), .driver_info = BTUSB_INTEL_NEWGEN |
+ +						     BTUSB_WIDEBAND_SPEECH},
+ +	{ USB_DEVICE(0x8087, 0x0033), .driver_info = BTUSB_INTEL_NEWGEN |
+ +						     BTUSB_WIDEBAND_SPEECH},
+  	{ USB_DEVICE(0x8087, 0x07da), .driver_info = BTUSB_CSR },
+++<<<<<<< HEAD
+ +	{ USB_DEVICE(0x8087, 0x07dc), .driver_info = BTUSB_INTEL_COMBINED },
+ +	{ USB_DEVICE(0x8087, 0x0a2a), .driver_info = BTUSB_INTEL_COMBINED },
+ +	{ USB_DEVICE(0x8087, 0x0a2b), .driver_info = BTUSB_INTEL_NEW |
+ +						     BTUSB_WIDEBAND_SPEECH },
+ +	{ USB_DEVICE(0x8087, 0x0aa7), .driver_info = BTUSB_INTEL_COMBINED |
+ +						     BTUSB_WIDEBAND_SPEECH },
+ +	{ USB_DEVICE(0x8087, 0x0aaa), .driver_info = BTUSB_INTEL_NEW |
+ +						     BTUSB_WIDEBAND_SPEECH |
+ +						     BTUSB_VALID_LE_STATES },
+ +	{ USB_DEVICE(0x0489, 0xe0cc), .driver_info = BTUSB_QCA_WCN6855 |
+ +						     BTUSB_WIDEBAND_SPEECH |
+ +						     BTUSB_VALID_LE_STATES },
+ +	{ USB_DEVICE(0x0489, 0xe0d6), .driver_info = BTUSB_QCA_WCN6855 |
+ +						     BTUSB_WIDEBAND_SPEECH |
+ +						     BTUSB_VALID_LE_STATES },
+ +	{ USB_DEVICE(0x0489, 0xe0e3), .driver_info = BTUSB_QCA_WCN6855 |
+ +						     BTUSB_WIDEBAND_SPEECH |
+ +						     BTUSB_VALID_LE_STATES },
+++=======
++ 	{ USB_DEVICE(0x8087, 0x07dc), .driver_info = BTUSB_INTEL_COMBINED |
++ 						     BTUSB_INTEL_BROKEN_INITIAL_NCMD |
++ 						     BTUSB_INTEL_BROKEN_SHUTDOWN_LED },
++ 	{ USB_DEVICE(0x8087, 0x0a2a), .driver_info = BTUSB_INTEL_COMBINED |
++ 						     BTUSB_INTEL_BROKEN_SHUTDOWN_LED },
++ 	{ USB_DEVICE(0x8087, 0x0a2b), .driver_info = BTUSB_INTEL_COMBINED },
++ 	{ USB_DEVICE(0x8087, 0x0aa7), .driver_info = BTUSB_INTEL_COMBINED |
++ 						     BTUSB_INTEL_BROKEN_SHUTDOWN_LED },
++ 	{ USB_DEVICE(0x8087, 0x0aaa), .driver_info = BTUSB_INTEL_COMBINED },
+++>>>>>>> 95655456e7ce (Bluetooth: btintel: Fix broken LED quirk for legacy ROM devices)
+  
+  	/* Other Intel Bluetooth devices */
+  	{ USB_VENDOR_AND_INTERFACE_INFO(0x8087, 0xe0, 0x01, 0x01),
+@@@ -4348,43 -3731,14 +4365,51 @@@ static int btusb_probe(struct usb_inter
+  			goto out_free_dev;
+  
+  		/* Transport specific configuration */
+ +		hdev->cmd_timeout = btusb_intel_cmd_timeout;
+ +
+++<<<<<<< HEAD
+ +		set_bit(HCI_QUIRK_STRICT_DUPLICATE_FILTER, &hdev->quirks);
+ +		set_bit(HCI_QUIRK_SIMULTANEOUS_DISCOVERY, &hdev->quirks);
+ +		set_bit(HCI_QUIRK_NON_PERSISTENT_DIAG, &hdev->quirks);
+ +	}
+ +
+ +	if (id->driver_info & BTUSB_INTEL_NEW) {
+ +		hdev->manufacturer = 2;
+ +		hdev->send = btusb_send_frame_intel;
+ +		hdev->setup = btusb_setup_intel_new;
+ +		hdev->shutdown = btusb_shutdown_intel_new;
+ +		hdev->hw_error = btintel_hw_error;
+ +		hdev->set_diag = btintel_set_diag;
+ +		hdev->set_bdaddr = btintel_set_bdaddr;
+ +		hdev->cmd_timeout = btusb_intel_cmd_timeout;
+ +		set_bit(HCI_QUIRK_STRICT_DUPLICATE_FILTER, &hdev->quirks);
+ +		set_bit(HCI_QUIRK_SIMULTANEOUS_DISCOVERY, &hdev->quirks);
+ +		set_bit(HCI_QUIRK_NON_PERSISTENT_DIAG, &hdev->quirks);
+ +	}
+ +
+ +	if (id->driver_info & BTUSB_INTEL_NEWGEN) {
+ +		hdev->manufacturer = 2;
+  		hdev->send = btusb_send_frame_intel;
+ +		hdev->setup = btusb_setup_intel_newgen;
+ +		hdev->shutdown = btusb_shutdown_intel_new;
+ +		hdev->hw_error = btintel_hw_error;
+ +		hdev->set_diag = btintel_set_diag;
+ +		hdev->set_bdaddr = btintel_set_bdaddr;
+  		hdev->cmd_timeout = btusb_intel_cmd_timeout;
+ +		set_bit(HCI_QUIRK_STRICT_DUPLICATE_FILTER, &hdev->quirks);
+ +		set_bit(HCI_QUIRK_SIMULTANEOUS_DISCOVERY, &hdev->quirks);
+ +		set_bit(HCI_QUIRK_NON_PERSISTENT_DIAG, &hdev->quirks);
+  
+ +		data->recv_event = btusb_recv_event_intel;
+ +		data->recv_bulk = btusb_recv_bulk_intel;
+ +		set_bit(BTUSB_BOOTLOADER, &data->flags);
+++=======
++ 		if (id->driver_info & BTUSB_INTEL_BROKEN_INITIAL_NCMD)
++ 			btintel_set_flag(hdev, INTEL_BROKEN_INITIAL_NCMD);
++ 
++ 		if (id->driver_info & BTUSB_INTEL_BROKEN_SHUTDOWN_LED)
++ 			btintel_set_flag(hdev, INTEL_BROKEN_SHUTDOWN_LED);
+++>>>>>>> 95655456e7ce (Bluetooth: btintel: Fix broken LED quirk for legacy ROM devices)
+  	}
+  
+  	if (id->driver_info & BTUSB_MARVELL)
+* Unmerged path drivers/bluetooth/btintel.c
+* Unmerged path drivers/bluetooth/btintel.h
+* Unmerged path drivers/bluetooth/btusb.c
