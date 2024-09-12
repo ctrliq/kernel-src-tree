@@ -1,0 +1,102 @@
+media: dvb-core: Enhance shared multi-frontend support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-500.el8
+commit-author Robert Schlabbach <robert_s@gmx.net>
+commit e704b44b550fbc9a4af15bc848fdbac5ff2eec47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-500.el8/e704b44b.failed
+
+Drivers for devices with multiple frontends which cannot be used
+concurrently due to hardware limitations which enforce that restriction
+by setting the mfe_shared field to 1 exhibit rather unfriendly behavior
+towards applications: The unavailable frontend devices cannot be opened
+at all, not even for read-only access to query information. Even worse,
+any open call is blocked for 5 seconds by default.
+
+Allow drivers for such devices to behave like regular busy frontend
+devices instead, i.e. still allowing concurrent read access to the
+unavailable frontend and denying concurrent write access with -EBUSY
+without delay.
+
+This patch does not alter the behavior of any existing driver to avoid
+regressions. Driver developers who wish to take advantage of this must
+ensure their driver can handle all read-only accesses to the unavailable
+frontend, and indicate the capability by setting the mfe_shared field to
+2 instead of 1.
+
+Add a check to dvb-usb-init.c when automatically setting the mfe_shared
+field that when a driver has already set the field to 2, it is not
+overwritten.
+
+Document the additional capability in the code comment about mfe_shared.
+
+Link: https://lore.kernel.org/linux-media/trinity-22c77578-26b0-4867-9ff7-2668e5d22c64-1642799929896@3c-app-gmx-bap04
+	Signed-off-by: Robert Schlabbach <robert_s@gmx.net>
+	Tested-by: Robert Schlabbach <robert_s@gmx.net>
+	Signed-off-by: Mauro Carvalho Chehab <mchehab@kernel.org>
+(cherry picked from commit e704b44b550fbc9a4af15bc848fdbac5ff2eec47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/media/dvbdev.h
+diff --cc include/media/dvbdev.h
+index 881ca461b7bb,6ccff7c6fa6b..000000000000
+--- a/include/media/dvbdev.h
++++ b/include/media/dvbdev.h
+@@@ -86,8 -86,12 +86,17 @@@ struct dvb_frontend
+   * @priv:		private data
+   * @device:		pointer to struct device
+   * @module:		pointer to struct module
+++<<<<<<< HEAD
+ + * @mfe_shared:		mfe shared: indicates mutually exclusive frontends
+ + *			Thie usage of this flag is currently deprecated
+++=======
++  * @mfe_shared:		indicates mutually exclusive frontends.
++  *			1 = legacy exclusion behavior: blocking any open() call
++  *			2 = enhanced exclusion behavior, emulating the standard
++  *			behavior of busy frontends: allowing read-only sharing
++  *			and otherwise returning immediately with -EBUSY when any
++  *			of the frontends is already opened with write access.
+++>>>>>>> e704b44b550f (media: dvb-core: Enhance shared multi-frontend support)
+   * @mfe_dvbdev:		Frontend device in use, in the case of MFE
+   * @mfe_lock:		Lock to prevent using the other frontends when MFE is
+   *			used.
+diff --git a/drivers/media/dvb-core/dvb_frontend.c b/drivers/media/dvb-core/dvb_frontend.c
+index ce25aef39008..8eb0ceb2012c 100644
+--- a/drivers/media/dvb-core/dvb_frontend.c
++++ b/drivers/media/dvb-core/dvb_frontend.c
+@@ -2671,7 +2671,17 @@ static int dvb_frontend_open(struct inode *inode, struct file *file)
+ 	if (fe->exit == DVB_FE_DEVICE_REMOVED)
+ 		return -ENODEV;
+ 
+-	if (adapter->mfe_shared) {
++	if (adapter->mfe_shared == 2) {
++		mutex_lock(&adapter->mfe_lock);
++		if ((file->f_flags & O_ACCMODE) != O_RDONLY) {
++			if (adapter->mfe_dvbdev &&
++			    !adapter->mfe_dvbdev->writers) {
++				mutex_unlock(&adapter->mfe_lock);
++				return -EBUSY;
++			}
++			adapter->mfe_dvbdev = dvbdev;
++		}
++	} else if (adapter->mfe_shared) {
+ 		mutex_lock(&adapter->mfe_lock);
+ 
+ 		if (!adapter->mfe_dvbdev)
+diff --git a/drivers/media/usb/dvb-usb/dvb-usb-init.c b/drivers/media/usb/dvb-usb/dvb-usb-init.c
+index f7147745d210..390ef00b4330 100644
+--- a/drivers/media/usb/dvb-usb/dvb-usb-init.c
++++ b/drivers/media/usb/dvb-usb/dvb-usb-init.c
+@@ -95,7 +95,7 @@ static int dvb_usb_adapter_init(struct dvb_usb_device *d, short *adapter_nrs)
+ 			goto frontend_init_err;
+ 
+ 		/* use exclusive FE lock if there is multiple shared FEs */
+-		if (adap->fe_adap[1].fe)
++		if (adap->fe_adap[1].fe && adap->dvb_adap.mfe_shared < 1)
+ 			adap->dvb_adap.mfe_shared = 1;
+ 
+ 		d->num_adapters_initialized++;
+* Unmerged path include/media/dvbdev.h
