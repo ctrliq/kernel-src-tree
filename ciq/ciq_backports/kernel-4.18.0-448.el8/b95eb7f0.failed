@@ -1,0 +1,451 @@
+wifi: cfg80211/mac80211: separate link params from station params
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Shaul Triebitz <shaul.triebitz@intel.com>
+commit b95eb7f0eee479478eb1a7c0a42a80167708c1df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/b95eb7f0.failed
+
+Put the link_station_parameters structure in the station_parameters
+structure (and remove the station_parameters fields already existing
+in link_station_parameters).
+Now, for an MLD station, the default link is added together with
+the station.
+
+	Signed-off-by: Shaul Triebitz <shaul.triebitz@intel.com>
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit b95eb7f0eee479478eb1a7c0a42a80167708c1df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/microchip/wilc1000/hif.c
+#	net/mac80211/cfg.c
+#	net/wireless/nl80211.c
+diff --cc net/mac80211/cfg.c
+index f176465a1e43,3eacf72279c2..000000000000
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@@ -1548,36 -1581,81 +1548,114 @@@ static void sta_apply_mesh_params(struc
+  #endif
+  }
+  
+++<<<<<<< HEAD
+ +static void sta_apply_airtime_params(struct ieee80211_local *local,
+ +				     struct sta_info *sta,
+ +				     struct station_parameters *params)
+ +{
+ +	u8 ac;
+ +
+ +	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+ +		struct airtime_sched_info *air_sched = &local->airtime[ac];
+ +		struct airtime_info *air_info = &sta->airtime[ac];
+ +		struct txq_info *txqi;
+ +		u8 tid;
+ +
+ +		spin_lock_bh(&air_sched->lock);
+ +		for (tid = 0; tid < IEEE80211_NUM_TIDS + 1; tid++) {
+ +			if (air_info->weight == params->airtime_weight ||
+ +			    !sta->sta.txq[tid] ||
+ +			    ac != ieee80211_ac_from_tid(tid))
+ +				continue;
+ +
+ +			airtime_weight_set(air_info, params->airtime_weight);
+ +
+ +			txqi = to_txq_info(sta->sta.txq[tid]);
+ +			if (RB_EMPTY_NODE(&txqi->schedule_order))
+ +				continue;
+ +
+ +			ieee80211_update_airtime_weight(local, air_sched,
+ +							0, true);
+ +		}
+ +		spin_unlock_bh(&air_sched->lock);
+ +	}
+++=======
++ static int sta_link_apply_parameters(struct ieee80211_local *local,
++ 				     struct sta_info *sta,
++ 				     struct link_station_parameters *params)
++ {
++ 	int ret = 0;
++ 	struct ieee80211_supported_band *sband;
++ 	struct ieee80211_sub_if_data *sdata = sta->sdata;
++ 	u32 link_id = params->link_id < 0 ? 0 : params->link_id;
++ 	struct link_sta_info *link_sta =
++ 		rcu_dereference_protected(sta->link[link_id],
++ 					  lockdep_is_held(&local->sta_mtx));
++ 
++ 	if (!link_sta)
++ 		return -EINVAL;
++ 
++ 	sband = ieee80211_get_link_sband(sdata, link_id);
++ 	if (!sband)
++ 		return -EINVAL;
++ 
++ 	if (params->link_mac) {
++ 		memcpy(link_sta->addr, params->link_mac, ETH_ALEN);
++ 		memcpy(link_sta->pub->addr, params->link_mac, ETH_ALEN);
++ 	}
++ 
++ 	if (params->txpwr_set) {
++ 		link_sta->pub->txpwr.type = params->txpwr.type;
++ 		if (params->txpwr.type == NL80211_TX_POWER_LIMITED)
++ 			link_sta->pub->txpwr.power = params->txpwr.power;
++ 		ret = drv_sta_set_txpwr(local, sdata, sta);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	if (params->supported_rates &&
++ 	    params->supported_rates_len) {
++ 		ieee80211_parse_bitrates(&sdata->vif.link_conf[link_id]->chandef,
++ 					 sband, params->supported_rates,
++ 					 params->supported_rates_len,
++ 					 &link_sta->pub->supp_rates[sband->band]);
++ 	}
++ 
++ 	if (params->ht_capa)
++ 		ieee80211_ht_cap_ie_to_sta_ht_cap(sdata, sband,
++ 						  params->ht_capa, link_sta);
++ 
++ 	/* VHT can override some HT caps such as the A-MSDU max length */
++ 	if (params->vht_capa)
++ 		ieee80211_vht_cap_ie_to_sta_vht_cap(sdata, sband,
++ 						    params->vht_capa, link_sta);
++ 
++ 	if (params->he_capa)
++ 		ieee80211_he_cap_ie_to_sta_he_cap(sdata, sband,
++ 						  (void *)params->he_capa,
++ 						  params->he_capa_len,
++ 						  (void *)params->he_6ghz_capa,
++ 						  link_sta);
++ 
++ 	if (params->eht_capa)
++ 		ieee80211_eht_cap_ie_to_sta_eht_cap(sdata, sband,
++ 						    (u8 *)params->he_capa,
++ 						    params->he_capa_len,
++ 						    params->eht_capa,
++ 						    params->eht_capa_len,
++ 						    link_sta);
++ 
++ 	if (params->opmode_notif_used) {
++ 		/* returned value is only needed for rc update, but the
++ 		 * rc isn't initialized here yet, so ignore it
++ 		 */
++ 		__ieee80211_vht_handle_opmode(sdata, link_sta,
++ 					      params->opmode_notif,
++ 					      sband->band);
++ 	}
++ 
++ 	return ret;
+++>>>>>>> b95eb7f0eee4 (wifi: cfg80211/mac80211: separate link params from station params)
+  }
+  
+  static int sta_apply_parameters(struct ieee80211_local *local,
+@@@ -1720,53 -1800,9 +1800,59 @@@
+  	if (params->listen_interval >= 0)
+  		sta->listen_interval = params->listen_interval;
+  
+++<<<<<<< HEAD
+ +	if (params->sta_modify_mask & STATION_PARAM_APPLY_STA_TXPOWER) {
+ +		sta->sta.txpwr.type = params->txpwr.type;
+ +		if (params->txpwr.type == NL80211_TX_POWER_LIMITED)
+ +			sta->sta.txpwr.power = params->txpwr.power;
+ +		ret = drv_sta_set_txpwr(local, sdata, sta);
+ +		if (ret)
+ +			return ret;
+ +	}
+ +
+ +	if (params->supported_rates && params->supported_rates_len) {
+ +		ieee80211_parse_bitrates(&sdata->vif.bss_conf.chandef,
+ +					 sband, params->supported_rates,
+ +					 params->supported_rates_len,
+ +					 &sta->sta.supp_rates[sband->band]);
+ +	}
+ +
+ +	if (params->ht_capa)
+ +		ieee80211_ht_cap_ie_to_sta_ht_cap(sdata, sband,
+ +						  params->ht_capa, sta);
+ +
+ +	/* VHT can override some HT caps such as the A-MSDU max length */
+ +	if (params->vht_capa)
+ +		ieee80211_vht_cap_ie_to_sta_vht_cap(sdata, sband,
+ +						    params->vht_capa, sta);
+ +
+ +	if (params->he_capa)
+ +		ieee80211_he_cap_ie_to_sta_he_cap(sdata, sband,
+ +						  (void *)params->he_capa,
+ +						  params->he_capa_len,
+ +						  (void *)params->he_6ghz_capa,
+ +						  sta);
+ +
+ +	if (params->eht_capa)
+ +		ieee80211_eht_cap_ie_to_sta_eht_cap(sdata, sband,
+ +						    (u8 *)params->he_capa,
+ +						    params->he_capa_len,
+ +						    params->eht_capa,
+ +						    params->eht_capa_len,
+ +						    sta);
+ +
+ +	if (params->opmode_notif_used) {
+ +		/* returned value is only needed for rc update, but the
+ +		 * rc isn't initialized here yet, so ignore it
+ +		 */
+ +		__ieee80211_vht_handle_opmode(sdata, sta, params->opmode_notif,
+ +					      sband->band);
+ +	}
+++=======
++ 	ret = sta_link_apply_parameters(local, sta, &params->link_sta_params);
++ 	if (ret)
++ 		return ret;
+++>>>>>>> b95eb7f0eee4 (wifi: cfg80211/mac80211: separate link params from station params)
+  
+  	if (params->support_p2p_ps >= 0)
+  		sta->sta.support_p2p_ps = params->support_p2p_ps;
+@@@ -1818,7 -1853,8 +1904,12 @@@ static int ieee80211_add_station(struc
+  	    !sdata->u.mgd.associated)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	sta = sta_info_alloc(sdata, mac, GFP_KERNEL);
+++=======
++ 	sta = sta_info_alloc(sdata, mac, params->link_sta_params.link_id,
++ 			     GFP_KERNEL);
+++>>>>>>> b95eb7f0eee4 (wifi: cfg80211/mac80211: separate link params from station params)
+  	if (!sta)
+  		return -ENOMEM;
+  
+diff --cc net/wireless/nl80211.c
+index 1ee5ef214b30,5f6cbc2d73b4..000000000000
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@@ -6839,7 -6935,9 +6841,13 @@@ static int nl80211_set_station(struct s
+  				     NL80211_EXT_FEATURE_AIRTIME_FAIRNESS))
+  		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	err = nl80211_parse_sta_txpower_setting(info, &params);
+++=======
++ 	err = nl80211_parse_sta_txpower_setting(info,
++ 						&params.link_sta_params.txpwr,
++ 						&params.link_sta_params.txpwr_set);
+++>>>>>>> b95eb7f0eee4 (wifi: cfg80211/mac80211: separate link params from station params)
+  	if (err)
+  		return err;
+  
+@@@ -6994,7 -7095,9 +7005,13 @@@ static int nl80211_new_station(struct s
+  				     NL80211_EXT_FEATURE_AIRTIME_FAIRNESS))
+  		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	err = nl80211_parse_sta_txpower_setting(info, &params);
+++=======
++ 	err = nl80211_parse_sta_txpower_setting(info,
++ 						&params.link_sta_params.txpwr,
++ 						&params.link_sta_params.txpwr_set);
+++>>>>>>> b95eb7f0eee4 (wifi: cfg80211/mac80211: separate link params from station params)
+  	if (err)
+  		return err;
+  
+* Unmerged path drivers/net/wireless/microchip/wilc1000/hif.c
+diff --git a/drivers/net/wireless/marvell/mwifiex/sta_cmd.c b/drivers/net/wireless/marvell/mwifiex/sta_cmd.c
+index 9380d809bb44..512b5bb9cf6f 100644
+--- a/drivers/net/wireless/marvell/mwifiex/sta_cmd.c
++++ b/drivers/net/wireless/marvell/mwifiex/sta_cmd.c
+@@ -1778,29 +1778,31 @@ mwifiex_cmd_tdls_oper(struct mwifiex_private *priv,
+ 		wmm_qos_info->qos_info = 0;
+ 		config_len += sizeof(struct mwifiex_ie_types_qos_info);
+ 
+-		if (params->ht_capa) {
++		if (params->link_sta_params.ht_capa) {
+ 			ht_capab = (struct mwifiex_ie_types_htcap *)(pos +
+ 								    config_len);
+ 			ht_capab->header.type =
+ 					    cpu_to_le16(WLAN_EID_HT_CAPABILITY);
+ 			ht_capab->header.len =
+ 				   cpu_to_le16(sizeof(struct ieee80211_ht_cap));
+-			memcpy(&ht_capab->ht_cap, params->ht_capa,
++			memcpy(&ht_capab->ht_cap, params->link_sta_params.ht_capa,
+ 			       sizeof(struct ieee80211_ht_cap));
+ 			config_len += sizeof(struct mwifiex_ie_types_htcap);
+ 		}
+ 
+-		if (params->supported_rates && params->supported_rates_len) {
++		if (params->link_sta_params.supported_rates &&
++		    params->link_sta_params.supported_rates_len) {
+ 			tlv_rates = (struct host_cmd_tlv_rates *)(pos +
+ 								  config_len);
+ 			tlv_rates->header.type =
+ 					       cpu_to_le16(WLAN_EID_SUPP_RATES);
+ 			tlv_rates->header.len =
+-				       cpu_to_le16(params->supported_rates_len);
+-			memcpy(tlv_rates->rates, params->supported_rates,
+-			       params->supported_rates_len);
++				       cpu_to_le16(params->link_sta_params.supported_rates_len);
++			memcpy(tlv_rates->rates,
++			       params->link_sta_params.supported_rates,
++			       params->link_sta_params.supported_rates_len);
+ 			config_len += sizeof(struct host_cmd_tlv_rates) +
+-				      params->supported_rates_len;
++				      params->link_sta_params.supported_rates_len;
+ 		}
+ 
+ 		if (params->ext_capab && params->ext_capab_len) {
+@@ -1814,14 +1816,14 @@ mwifiex_cmd_tdls_oper(struct mwifiex_private *priv,
+ 			config_len += sizeof(struct mwifiex_ie_types_extcap) +
+ 				      params->ext_capab_len;
+ 		}
+-		if (params->vht_capa) {
++		if (params->link_sta_params.vht_capa) {
+ 			vht_capab = (struct mwifiex_ie_types_vhtcap *)(pos +
+ 								    config_len);
+ 			vht_capab->header.type =
+ 					   cpu_to_le16(WLAN_EID_VHT_CAPABILITY);
+ 			vht_capab->header.len =
+ 				  cpu_to_le16(sizeof(struct ieee80211_vht_cap));
+-			memcpy(&vht_capab->vht_cap, params->vht_capa,
++			memcpy(&vht_capab->vht_cap, params->link_sta_params.vht_capa,
+ 			       sizeof(struct ieee80211_vht_cap));
+ 			config_len += sizeof(struct mwifiex_ie_types_vhtcap);
+ 		}
+* Unmerged path drivers/net/wireless/microchip/wilc1000/hif.c
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index 3df52e5a2ba5..f13f01947790 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -1425,7 +1425,6 @@ enum station_parameters_apply_mask {
+ 	STATION_PARAM_APPLY_UAPSD = BIT(0),
+ 	STATION_PARAM_APPLY_CAPABILITY = BIT(1),
+ 	STATION_PARAM_APPLY_PLINK_STATE = BIT(2),
+-	STATION_PARAM_APPLY_STA_TXPOWER = BIT(3),
+ };
+ 
+ /**
+@@ -1454,9 +1453,6 @@ struct sta_txpwr {
+  * Used to change and create a new station.
+  *
+  * @vlan: vlan interface station should belong to
+- * @supported_rates: supported rates in IEEE 802.11 format
+- *	(or NULL for no change)
+- * @supported_rates_len: number of supported rates
+  * @sta_flags_mask: station flags that changed
+  *	(bitmask of BIT(%NL80211_STA_FLAG_...))
+  * @sta_flags_set: station flags values
+@@ -1467,8 +1463,6 @@ struct sta_txpwr {
+  * @peer_aid: mesh peer AID or zero for no change
+  * @plink_action: plink action to take
+  * @plink_state: set the peer link state for a station
+- * @ht_capa: HT capabilities of station
+- * @vht_capa: VHT capabilities of station
+  * @uapsd_queues: bitmap of queues configured for uapsd. same format
+  *	as the AC bitmap in the QoS info field
+  * @max_sp: max Service Period. same format as the MAX_SP in the
+@@ -1485,19 +1479,11 @@ struct sta_txpwr {
+  * @supported_channels_len: number of supported channels
+  * @supported_oper_classes: supported oper classes in IEEE 802.11 format
+  * @supported_oper_classes_len: number of supported operating classes
+- * @opmode_notif: operating mode field from Operating Mode Notification
+- * @opmode_notif_used: information if operating mode field is used
+  * @support_p2p_ps: information if station supports P2P PS mechanism
+- * @he_capa: HE capabilities of station
+- * @he_capa_len: the length of the HE capabilities
+  * @airtime_weight: airtime scheduler weight for this station
+- * @txpwr: transmit power for an associated station
+- * @he_6ghz_capa: HE 6 GHz Band capabilities of station
+- * @eht_capa: EHT capabilities of station
+- * @eht_capa_len: the length of the EHT capabilities
++ * @link_sta_params: link related params.
+  */
+ struct station_parameters {
+-	const u8 *supported_rates;
+ 	struct net_device *vlan;
+ 	u32 sta_flags_mask, sta_flags_set;
+ 	u32 sta_modify_mask;
+@@ -1505,11 +1491,8 @@ struct station_parameters {
+ 	u16 aid;
+ 	u16 vlan_id;
+ 	u16 peer_aid;
+-	u8 supported_rates_len;
+ 	u8 plink_action;
+ 	u8 plink_state;
+-	const struct ieee80211_ht_cap *ht_capa;
+-	const struct ieee80211_vht_cap *vht_capa;
+ 	u8 uapsd_queues;
+ 	u8 max_sp;
+ 	enum nl80211_mesh_power_mode local_pm;
+@@ -1520,16 +1503,9 @@ struct station_parameters {
+ 	u8 supported_channels_len;
+ 	const u8 *supported_oper_classes;
+ 	u8 supported_oper_classes_len;
+-	u8 opmode_notif;
+-	bool opmode_notif_used;
+ 	int support_p2p_ps;
+-	const struct ieee80211_he_cap_elem *he_capa;
+-	u8 he_capa_len;
+ 	u16 airtime_weight;
+-	struct sta_txpwr txpwr;
+-	const struct ieee80211_he_6ghz_capa *he_6ghz_capa;
+-	const struct ieee80211_eht_cap_elem *eht_capa;
+-	u8 eht_capa_len;
++	struct link_station_parameters link_sta_params;
+ };
+ 
+ /**
+* Unmerged path net/mac80211/cfg.c
+* Unmerged path net/wireless/nl80211.c
+diff --git a/net/wireless/trace.h b/net/wireless/trace.h
+index 02987ad8e876..f32b6fe6e51b 100644
+--- a/net/wireless/trace.h
++++ b/net/wireless/trace.h
+@@ -718,7 +718,7 @@ DECLARE_EVENT_CLASS(station_add_change,
+ 		__array(u8, vht_capa, (int)sizeof(struct ieee80211_vht_cap))
+ 		__array(char, vlan, IFNAMSIZ)
+ 		__dynamic_array(u8, supported_rates,
+-				params->supported_rates_len)
++				params->link_sta_params.supported_rates_len)
+ 		__dynamic_array(u8, ext_capab, params->ext_capab_len)
+ 		__dynamic_array(u8, supported_channels,
+ 				params->supported_channels_len)
+@@ -738,20 +738,23 @@ DECLARE_EVENT_CLASS(station_add_change,
+ 		__entry->plink_state = params->plink_state;
+ 		__entry->uapsd_queues = params->uapsd_queues;
+ 		memset(__entry->ht_capa, 0, sizeof(struct ieee80211_ht_cap));
+-		if (params->ht_capa)
+-			memcpy(__entry->ht_capa, params->ht_capa,
++		if (params->link_sta_params.ht_capa)
++			memcpy(__entry->ht_capa,
++			       params->link_sta_params.ht_capa,
+ 			       sizeof(struct ieee80211_ht_cap));
+ 		memset(__entry->vht_capa, 0, sizeof(struct ieee80211_vht_cap));
+-		if (params->vht_capa)
+-			memcpy(__entry->vht_capa, params->vht_capa,
++		if (params->link_sta_params.vht_capa)
++			memcpy(__entry->vht_capa,
++			       params->link_sta_params.vht_capa,
+ 			       sizeof(struct ieee80211_vht_cap));
+ 		memset(__entry->vlan, 0, sizeof(__entry->vlan));
+ 		if (params->vlan)
+ 			memcpy(__entry->vlan, params->vlan->name, IFNAMSIZ);
+-		if (params->supported_rates && params->supported_rates_len)
++		if (params->link_sta_params.supported_rates &&
++		    params->link_sta_params.supported_rates_len)
+ 			memcpy(__get_dynamic_array(supported_rates),
+-			       params->supported_rates,
+-			       params->supported_rates_len);
++			       params->link_sta_params.supported_rates,
++			       params->link_sta_params.supported_rates_len);
+ 		if (params->ext_capab && params->ext_capab_len)
+ 			memcpy(__get_dynamic_array(ext_capab),
+ 			       params->ext_capab,
+@@ -768,8 +771,9 @@ DECLARE_EVENT_CLASS(station_add_change,
+ 			       params->supported_oper_classes_len);
+ 		__entry->max_sp = params->max_sp;
+ 		__entry->capability = params->capability;
+-		__entry->opmode_notif = params->opmode_notif;
+-		__entry->opmode_notif_used = params->opmode_notif_used;
++		__entry->opmode_notif = params->link_sta_params.opmode_notif;
++		__entry->opmode_notif_used =
++			params->link_sta_params.opmode_notif_used;
+ 	),
+ 	TP_printk(WIPHY_PR_FMT ", " NETDEV_PR_FMT ", station mac: " MAC_PR_FMT
+ 		  ", station flags mask: %u, station flags set: %u, "
