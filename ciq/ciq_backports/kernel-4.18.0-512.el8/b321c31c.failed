@@ -1,0 +1,373 @@
+KVM: arm64: vgic-v4: Make the doorbell request robust w.r.t preemption
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-512.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit b321c31c9b7b309dcde5e8854b741c8e6a9a05f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-512.el8/b321c31c.failed
+
+Xiang reports that VMs occasionally fail to boot on GICv4.1 systems when
+running a preemptible kernel, as it is possible that a vCPU is blocked
+without requesting a doorbell interrupt.
+
+The issue is that any preemption that occurs between vgic_v4_put() and
+schedule() on the block path will mark the vPE as nonresident and *not*
+request a doorbell irq. This occurs because when the vcpu thread is
+resumed on its way to block, vcpu_load() will make the vPE resident
+again. Once the vcpu actually blocks, we don't request a doorbell
+anymore, and the vcpu won't be woken up on interrupt delivery.
+
+Fix it by tracking that we're entering WFI, and key the doorbell
+request on that flag. This allows us not to make the vPE resident
+when going through a preempt/schedule cycle, meaning we don't lose
+any state.
+
+	Cc: stable@vger.kernel.org
+Fixes: 8e01d9a396e6 ("KVM: arm64: vgic-v4: Move the GICv4 residency flow to be driven by vcpu_load/put")
+	Reported-by: Xiang Chen <chenxiang66@hisilicon.com>
+	Suggested-by: Zenghui Yu <yuzenghui@huawei.com>
+	Tested-by: Xiang Chen <chenxiang66@hisilicon.com>
+Co-developed-by: Oliver Upton <oliver.upton@linux.dev>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+	Acked-by: Zenghui Yu <yuzenghui@huawei.com>
+Link: https://lore.kernel.org/r/20230713070657.3873244-1-maz@kernel.org
+	Signed-off-by: Oliver Upton <oliver.upton@linux.dev>
+(cherry picked from commit b321c31c9b7b309dcde5e8854b741c8e6a9a05f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_host.h
+#	arch/arm64/kvm/arm.c
+#	include/kvm/arm_vgic.h
+diff --cc arch/arm64/include/asm/kvm_host.h
+index 7f58bd229b69,d3dd05bbfe23..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -377,11 -582,160 +377,158 @@@ struct kvm_vcpu_arch 
+  		u64 last_steal;
+  		gpa_t base;
+  	} steal;
+ -
+ -	/* Per-vcpu CCSIDR override or NULL */
+ -	u32 *ccsidr;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Each 'flag' is composed of a comma-separated triplet:
++  *
++  * - the flag-set it belongs to in the vcpu->arch structure
++  * - the value for that flag
++  * - the mask for that flag
++  *
++  *  __vcpu_single_flag() builds such a triplet for a single-bit flag.
++  * unpack_vcpu_flag() extract the flag value from the triplet for
++  * direct use outside of the flag accessors.
++  */
++ #define __vcpu_single_flag(_set, _f)	_set, (_f), (_f)
++ 
++ #define __unpack_flag(_set, _f, _m)	_f
++ #define unpack_vcpu_flag(...)		__unpack_flag(__VA_ARGS__)
++ 
++ #define __build_check_flag(v, flagset, f, m)			\
++ 	do {							\
++ 		typeof(v->arch.flagset) *_fset;			\
++ 								\
++ 		/* Check that the flags fit in the mask */	\
++ 		BUILD_BUG_ON(HWEIGHT(m) != HWEIGHT((f) | (m)));	\
++ 		/* Check that the flags fit in the type */	\
++ 		BUILD_BUG_ON((sizeof(*_fset) * 8) <= __fls(m));	\
++ 	} while (0)
++ 
++ #define __vcpu_get_flag(v, flagset, f, m)			\
++ 	({							\
++ 		__build_check_flag(v, flagset, f, m);		\
++ 								\
++ 		READ_ONCE(v->arch.flagset) & (m);		\
++ 	})
++ 
++ /*
++  * Note that the set/clear accessors must be preempt-safe in order to
++  * avoid nesting them with load/put which also manipulate flags...
++  */
++ #ifdef __KVM_NVHE_HYPERVISOR__
++ /* the nVHE hypervisor is always non-preemptible */
++ #define __vcpu_flags_preempt_disable()
++ #define __vcpu_flags_preempt_enable()
++ #else
++ #define __vcpu_flags_preempt_disable()	preempt_disable()
++ #define __vcpu_flags_preempt_enable()	preempt_enable()
++ #endif
++ 
++ #define __vcpu_set_flag(v, flagset, f, m)			\
++ 	do {							\
++ 		typeof(v->arch.flagset) *fset;			\
++ 								\
++ 		__build_check_flag(v, flagset, f, m);		\
++ 								\
++ 		fset = &v->arch.flagset;			\
++ 		__vcpu_flags_preempt_disable();			\
++ 		if (HWEIGHT(m) > 1)				\
++ 			*fset &= ~(m);				\
++ 		*fset |= (f);					\
++ 		__vcpu_flags_preempt_enable();			\
++ 	} while (0)
++ 
++ #define __vcpu_clear_flag(v, flagset, f, m)			\
++ 	do {							\
++ 		typeof(v->arch.flagset) *fset;			\
++ 								\
++ 		__build_check_flag(v, flagset, f, m);		\
++ 								\
++ 		fset = &v->arch.flagset;			\
++ 		__vcpu_flags_preempt_disable();			\
++ 		*fset &= ~(m);					\
++ 		__vcpu_flags_preempt_enable();			\
++ 	} while (0)
++ 
++ #define vcpu_get_flag(v, ...)	__vcpu_get_flag((v), __VA_ARGS__)
++ #define vcpu_set_flag(v, ...)	__vcpu_set_flag((v), __VA_ARGS__)
++ #define vcpu_clear_flag(v, ...)	__vcpu_clear_flag((v), __VA_ARGS__)
++ 
++ /* SVE exposed to guest */
++ #define GUEST_HAS_SVE		__vcpu_single_flag(cflags, BIT(0))
++ /* SVE config completed */
++ #define VCPU_SVE_FINALIZED	__vcpu_single_flag(cflags, BIT(1))
++ /* PTRAUTH exposed to guest */
++ #define GUEST_HAS_PTRAUTH	__vcpu_single_flag(cflags, BIT(2))
++ 
++ /* Exception pending */
++ #define PENDING_EXCEPTION	__vcpu_single_flag(iflags, BIT(0))
++ /*
++  * PC increment. Overlaps with EXCEPT_MASK on purpose so that it can't
++  * be set together with an exception...
++  */
++ #define INCREMENT_PC		__vcpu_single_flag(iflags, BIT(1))
++ /* Target EL/MODE (not a single flag, but let's abuse the macro) */
++ #define EXCEPT_MASK		__vcpu_single_flag(iflags, GENMASK(3, 1))
++ 
++ /* Helpers to encode exceptions with minimum fuss */
++ #define __EXCEPT_MASK_VAL	unpack_vcpu_flag(EXCEPT_MASK)
++ #define __EXCEPT_SHIFT		__builtin_ctzl(__EXCEPT_MASK_VAL)
++ #define __vcpu_except_flags(_f)	iflags, (_f << __EXCEPT_SHIFT), __EXCEPT_MASK_VAL
++ 
++ /*
++  * When PENDING_EXCEPTION is set, EXCEPT_MASK can take the following
++  * values:
++  *
++  * For AArch32 EL1:
++  */
++ #define EXCEPT_AA32_UND		__vcpu_except_flags(0)
++ #define EXCEPT_AA32_IABT	__vcpu_except_flags(1)
++ #define EXCEPT_AA32_DABT	__vcpu_except_flags(2)
++ /* For AArch64: */
++ #define EXCEPT_AA64_EL1_SYNC	__vcpu_except_flags(0)
++ #define EXCEPT_AA64_EL1_IRQ	__vcpu_except_flags(1)
++ #define EXCEPT_AA64_EL1_FIQ	__vcpu_except_flags(2)
++ #define EXCEPT_AA64_EL1_SERR	__vcpu_except_flags(3)
++ /* For AArch64 with NV: */
++ #define EXCEPT_AA64_EL2_SYNC	__vcpu_except_flags(4)
++ #define EXCEPT_AA64_EL2_IRQ	__vcpu_except_flags(5)
++ #define EXCEPT_AA64_EL2_FIQ	__vcpu_except_flags(6)
++ #define EXCEPT_AA64_EL2_SERR	__vcpu_except_flags(7)
++ /* Guest debug is live */
++ #define DEBUG_DIRTY		__vcpu_single_flag(iflags, BIT(4))
++ /* Save SPE context if active  */
++ #define DEBUG_STATE_SAVE_SPE	__vcpu_single_flag(iflags, BIT(5))
++ /* Save TRBE context if active  */
++ #define DEBUG_STATE_SAVE_TRBE	__vcpu_single_flag(iflags, BIT(6))
++ /* vcpu running in HYP context */
++ #define VCPU_HYP_CONTEXT	__vcpu_single_flag(iflags, BIT(7))
++ 
++ /* SVE enabled for host EL0 */
++ #define HOST_SVE_ENABLED	__vcpu_single_flag(sflags, BIT(0))
++ /* SME enabled for EL0 */
++ #define HOST_SME_ENABLED	__vcpu_single_flag(sflags, BIT(1))
++ /* Physical CPU not in supported_cpus */
++ #define ON_UNSUPPORTED_CPU	__vcpu_single_flag(sflags, BIT(2))
++ /* WFIT instruction trapped */
++ #define IN_WFIT			__vcpu_single_flag(sflags, BIT(3))
++ /* vcpu system registers loaded on physical CPU */
++ #define SYSREGS_ON_CPU		__vcpu_single_flag(sflags, BIT(4))
++ /* Software step state is Active-pending */
++ #define DBG_SS_ACTIVE_PENDING	__vcpu_single_flag(sflags, BIT(5))
++ /* PMUSERENR for the guest EL0 is on physical CPU */
++ #define PMUSERENR_ON_CPU	__vcpu_single_flag(sflags, BIT(6))
++ /* WFI instruction trapped */
++ #define IN_WFI			__vcpu_single_flag(sflags, BIT(7))
++ 
++ 
+++>>>>>>> b321c31c9b7b (KVM: arm64: vgic-v4: Make the doorbell request robust w.r.t preemption)
+  /* Pointer to the vcpu's SVE FFR for sve_{save,load}_state() */
+ -#define vcpu_sve_pffr(vcpu) (kern_hyp_va((vcpu)->arch.sve_state) +	\
+ -			     sve_ffr_offset((vcpu)->arch.sve_max_vl))
+ -
+ -#define vcpu_sve_max_vq(vcpu)	sve_vq_from_vl((vcpu)->arch.sve_max_vl)
+ +#define vcpu_sve_pffr(vcpu) ((void *)((char *)((vcpu)->arch.sve_state) + \
+ +				      sve_ffr_offset((vcpu)->arch.sve_max_vl)))
+  
+  #define vcpu_sve_state_size(vcpu) ({					\
+  	size_t __size_ret;						\
+diff --cc arch/arm64/kvm/arm.c
+index ec388a03f14c,72dc53a75d1c..000000000000
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@@ -638,7 -696,84 +638,88 @@@ static void vcpu_req_sleep(struct kvm_v
+  	smp_rmb();
+  }
+  
+++<<<<<<< HEAD
+ +static void check_vcpu_requests(struct kvm_vcpu *vcpu)
+++=======
++ /**
++  * kvm_vcpu_wfi - emulate Wait-For-Interrupt behavior
++  * @vcpu:	The VCPU pointer
++  *
++  * Suspend execution of a vCPU until a valid wake event is detected, i.e. until
++  * the vCPU is runnable.  The vCPU may or may not be scheduled out, depending
++  * on when a wake event arrives, e.g. there may already be a pending wake event.
++  */
++ void kvm_vcpu_wfi(struct kvm_vcpu *vcpu)
++ {
++ 	/*
++ 	 * Sync back the state of the GIC CPU interface so that we have
++ 	 * the latest PMR and group enables. This ensures that
++ 	 * kvm_arch_vcpu_runnable has up-to-date data to decide whether
++ 	 * we have pending interrupts, e.g. when determining if the
++ 	 * vCPU should block.
++ 	 *
++ 	 * For the same reason, we want to tell GICv4 that we need
++ 	 * doorbells to be signalled, should an interrupt become pending.
++ 	 */
++ 	preempt_disable();
++ 	kvm_vgic_vmcr_sync(vcpu);
++ 	vcpu_set_flag(vcpu, IN_WFI);
++ 	vgic_v4_put(vcpu);
++ 	preempt_enable();
++ 
++ 	kvm_vcpu_halt(vcpu);
++ 	vcpu_clear_flag(vcpu, IN_WFIT);
++ 
++ 	preempt_disable();
++ 	vcpu_clear_flag(vcpu, IN_WFI);
++ 	vgic_v4_load(vcpu);
++ 	preempt_enable();
++ }
++ 
++ static int kvm_vcpu_suspend(struct kvm_vcpu *vcpu)
++ {
++ 	if (!kvm_arm_vcpu_suspended(vcpu))
++ 		return 1;
++ 
++ 	kvm_vcpu_wfi(vcpu);
++ 
++ 	/*
++ 	 * The suspend state is sticky; we do not leave it until userspace
++ 	 * explicitly marks the vCPU as runnable. Request that we suspend again
++ 	 * later.
++ 	 */
++ 	kvm_make_request(KVM_REQ_SUSPEND, vcpu);
++ 
++ 	/*
++ 	 * Check to make sure the vCPU is actually runnable. If so, exit to
++ 	 * userspace informing it of the wakeup condition.
++ 	 */
++ 	if (kvm_arch_vcpu_runnable(vcpu)) {
++ 		memset(&vcpu->run->system_event, 0, sizeof(vcpu->run->system_event));
++ 		vcpu->run->system_event.type = KVM_SYSTEM_EVENT_WAKEUP;
++ 		vcpu->run->exit_reason = KVM_EXIT_SYSTEM_EVENT;
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * Otherwise, we were unblocked to process a different event, such as a
++ 	 * pending signal. Return 1 and allow kvm_arch_vcpu_ioctl_run() to
++ 	 * process the event.
++ 	 */
++ 	return 1;
++ }
++ 
++ /**
++  * check_vcpu_requests - check and handle pending vCPU requests
++  * @vcpu:	the VCPU pointer
++  *
++  * Return: 1 if we should enter the guest
++  *	   0 if we should exit to userspace
++  *	   < 0 if we should exit to userspace, where the return value indicates
++  *	   an error
++  */
++ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
+++>>>>>>> b321c31c9b7b (KVM: arm64: vgic-v4: Make the doorbell request robust w.r.t preemption)
+  {
+  	if (kvm_request_pending(vcpu)) {
+  		if (kvm_check_request(KVM_REQ_SLEEP, vcpu))
+diff --cc include/kvm/arm_vgic.h
+index ec33a91f9907,5b27f94d4fad..000000000000
+--- a/include/kvm/arm_vgic.h
++++ b/include/kvm/arm_vgic.h
+@@@ -416,6 -430,11 +416,11 @@@ int kvm_vgic_v4_unset_forwarding(struc
+  				 struct kvm_kernel_irq_routing_entry *irq_entry);
+  
+  int vgic_v4_load(struct kvm_vcpu *vcpu);
+++<<<<<<< HEAD
+ +int vgic_v4_put(struct kvm_vcpu *vcpu, bool need_db);
+++=======
++ void vgic_v4_commit(struct kvm_vcpu *vcpu);
++ int vgic_v4_put(struct kvm_vcpu *vcpu);
+ -
+ -/* CPU HP callbacks */
+ -void kvm_vgic_cpu_up(void);
+ -void kvm_vgic_cpu_down(void);
+++>>>>>>> b321c31c9b7b (KVM: arm64: vgic-v4: Make the doorbell request robust w.r.t preemption)
+  
+  #endif /* __KVM_ARM_VGIC_H */
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+* Unmerged path arch/arm64/kvm/arm.c
+diff --git a/arch/arm64/kvm/vgic/vgic-v3.c b/arch/arm64/kvm/vgic/vgic-v3.c
+index cf5c3c77acb1..0f34af33c37b 100644
+--- a/arch/arm64/kvm/vgic/vgic-v3.c
++++ b/arch/arm64/kvm/vgic/vgic-v3.c
+@@ -693,7 +693,7 @@ void vgic_v3_put(struct kvm_vcpu *vcpu)
+ {
+ 	struct vgic_v3_cpu_if *cpu_if = &vcpu->arch.vgic_cpu.vgic_v3;
+ 
+-	WARN_ON(vgic_v4_put(vcpu, false));
++	WARN_ON(vgic_v4_put(vcpu));
+ 
+ 	vgic_v3_vmcr_sync(vcpu);
+ 
+diff --git a/arch/arm64/kvm/vgic/vgic-v4.c b/arch/arm64/kvm/vgic/vgic-v4.c
+index a9f8067d7f1d..309c0b694375 100644
+--- a/arch/arm64/kvm/vgic/vgic-v4.c
++++ b/arch/arm64/kvm/vgic/vgic-v4.c
+@@ -322,14 +322,14 @@ void vgic_v4_teardown(struct kvm *kvm)
+ 	its_vm->vpes = NULL;
+ }
+ 
+-int vgic_v4_put(struct kvm_vcpu *vcpu, bool need_db)
++int vgic_v4_put(struct kvm_vcpu *vcpu)
+ {
+ 	struct its_vpe *vpe = &vcpu->arch.vgic_cpu.vgic_v3.its_vpe;
+ 
+ 	if (!vgic_supports_direct_msis(vcpu->kvm) || !vpe->resident)
+ 		return 0;
+ 
+-	return its_make_vpe_non_resident(vpe, need_db);
++	return its_make_vpe_non_resident(vpe, !!vcpu_get_flag(vcpu, IN_WFI));
+ }
+ 
+ int vgic_v4_load(struct kvm_vcpu *vcpu)
+@@ -340,6 +340,9 @@ int vgic_v4_load(struct kvm_vcpu *vcpu)
+ 	if (!vgic_supports_direct_msis(vcpu->kvm) || vpe->resident)
+ 		return 0;
+ 
++	if (vcpu_get_flag(vcpu, IN_WFI))
++		return 0;
++
+ 	/*
+ 	 * Before making the VPE resident, make sure the redistributor
+ 	 * corresponding to our current CPU expects us here. See the
+* Unmerged path include/kvm/arm_vgic.h
