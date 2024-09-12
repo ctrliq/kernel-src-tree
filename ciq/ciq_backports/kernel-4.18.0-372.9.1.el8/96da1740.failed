@@ -1,0 +1,188 @@
+ASoC: SOF: handle paused streams during system suspend
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+commit 96da174024b9c63bd5d3358668d0bc12677be877
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/96da1740.failed
+
+During system suspend, paused streams do not get suspended.
+Therefore, we need to explicitly free these PCMs in the DSP
+and free the associated DAPM widgets so that they can be set
+up again during resume.
+
+Fixes: 5fcdbb2d45df ("ASoC: SOF: Add support for dynamic pipelines")
+	Signed-off-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+	Reviewed-by: Paul Olaru <paul.olaru@oss.nxp.com>
+	Reviewed-by: Bard Liao <bard.liao@intel.com>
+	Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Signed-off-by: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+Link: https://lore.kernel.org/r/20211123171606.129350-3-kai.vehmanen@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 96da174024b9c63bd5d3358668d0bc12677be877)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/sof-audio.c
+#	sound/soc/sof/sof-audio.h
+diff --cc sound/soc/sof/sof-audio.c
+index f17b0b574e42,e00ce275052f..000000000000
+--- a/sound/soc/sof/sof-audio.c
++++ b/sound/soc/sof/sof-audio.c
+@@@ -389,24 -729,105 +397,98 @@@ int sof_set_up_pipelines(struct device 
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * This function doesn't free widgets. It only resets the set up status for all routes and
+ + * use_count for all widgets.
+++=======
++  * Free the PCM, its associated widgets and set the prepared flag to false for all PCMs that
++  * did not get suspended(ex: paused streams) so the widgets can be set up again during resume.
++  */
++ static int sof_tear_down_left_over_pipelines(struct snd_sof_dev *sdev)
++ {
++ 	struct snd_sof_widget *swidget;
++ 	struct snd_sof_pcm *spcm;
++ 	int dir, ret;
++ 
++ 	/*
++ 	 * free all PCMs and their associated DAPM widgets if their connected DAPM widget
++ 	 * list is not NULL. This should only be true for paused streams at this point.
++ 	 * This is equivalent to the handling of FE DAI suspend trigger for running streams.
++ 	 */
++ 	list_for_each_entry(spcm, &sdev->pcm_list, list)
++ 		for_each_pcm_streams(dir) {
++ 			struct snd_pcm_substream *substream = spcm->stream[dir].substream;
++ 
++ 			if (!substream || !substream->runtime)
++ 				continue;
++ 
++ 			if (spcm->stream[dir].list) {
++ 				ret = sof_pcm_dsp_pcm_free(substream, sdev, spcm);
++ 				if (ret < 0)
++ 					return ret;
++ 
++ 				ret = sof_widget_list_free(sdev, spcm, dir);
++ 				if (ret < 0) {
++ 					dev_err(sdev->dev, "failed to free widgets during suspend\n");
++ 					return ret;
++ 				}
++ 			}
++ 		}
++ 
++ 	/*
++ 	 * free any left over DAI widgets. This is equivalent to the handling of suspend trigger
++ 	 * for the BE DAI for running streams.
++ 	 */
++ 	list_for_each_entry(swidget, &sdev->widget_list, list)
++ 		if (WIDGET_IS_DAI(swidget->id) && swidget->use_count == 1) {
++ 			ret = sof_widget_free(sdev, swidget);
++ 			if (ret < 0)
++ 				return ret;
++ 		}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * For older firmware, this function doesn't free widgets for static pipelines during suspend.
++  * It only resets use_count for all widgets.
+++>>>>>>> 96da174024b9 (ASoC: SOF: handle paused streams during system suspend)
+   */
+ -int sof_tear_down_pipelines(struct snd_sof_dev *sdev, bool verify)
+ +void sof_tear_down_pipelines(struct device *dev)
+  {
+ -	struct sof_ipc_fw_version *v = &sdev->fw_ready.version;
+ +	struct snd_sof_dev *sdev = dev_get_drvdata(dev);
+  	struct snd_sof_widget *swidget;
+  	struct snd_sof_route *sroute;
+ -	int ret;
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * No need to protect swidget->use_count and sroute->setup as this function is called only
+ +	 * during the suspend callback and all streams should be suspended by then
+++=======
++ 	 * This function is called during suspend and for one-time topology verification during
++ 	 * first boot. In both cases, there is no need to protect swidget->use_count and
++ 	 * sroute->setup because during suspend all running streams are suspended and during
++ 	 * topology loading the sound card unavailable to open PCMs.
+++>>>>>>> 96da174024b9 (ASoC: SOF: handle paused streams during system suspend)
+  	 */
+ -	list_for_each_entry(swidget, &sdev->widget_list, list) {
+ -		if (swidget->dynamic_pipeline_widget)
+ -			continue;
+ -
+ -		/* Do not free widgets for static pipelines with FW ABI older than 3.19 */
+ -		if (!verify && !swidget->dynamic_pipeline_widget &&
+ -		    v->abi_version < SOF_ABI_VER(3, 19, 0)) {
+ -			swidget->use_count = 0;
+ -			swidget->complete = 0;
+ -			continue;
+ -		}
+ -
+ -		ret = sof_widget_free(sdev, swidget);
+ -		if (ret < 0)
+ -			return ret;
+ -	}
+ +	list_for_each_entry(swidget, &sdev->widget_list, list)
+ +		swidget->use_count = 0;
+  
++ 	/*
++ 	 * Tear down all pipelines associated with PCMs that did not get suspended
++ 	 * and unset the prepare flag so that they can be set up again during resume.
++ 	 * Skip this step for older firmware.
++ 	 */
++ 	if (!verify && v->abi_version >= SOF_ABI_VER(3, 19, 0)) {
++ 		ret = sof_tear_down_left_over_pipelines(sdev);
++ 		if (ret < 0) {
++ 			dev_err(sdev->dev, "failed to tear down paused pipelines\n");
++ 			return ret;
++ 		}
++ 	}
++ 
+  	list_for_each_entry(sroute, &sdev->route_list, list)
+  		sroute->setup = false;
+ -
+ -	return 0;
+  }
+  
+  /*
+diff --cc sound/soc/sof/sof-audio.h
+index d32accca7b5e,1c4f59d34717..000000000000
+--- a/sound/soc/sof/sof-audio.h
++++ b/sound/soc/sof/sof-audio.h
+@@@ -265,4 -262,9 +265,12 @@@ void sof_machine_unregister(struct snd_
+  int sof_widget_setup(struct snd_sof_dev *sdev, struct snd_sof_widget *swidget);
+  int sof_widget_free(struct snd_sof_dev *sdev, struct snd_sof_widget *swidget);
+  
+++<<<<<<< HEAD
+++=======
++ /* PCM */
++ int sof_widget_list_setup(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm, int dir);
++ int sof_widget_list_free(struct snd_sof_dev *sdev, struct snd_sof_pcm *spcm, int dir);
++ int sof_pcm_dsp_pcm_free(struct snd_pcm_substream *substream, struct snd_sof_dev *sdev,
++ 			 struct snd_sof_pcm *spcm);
+++>>>>>>> 96da174024b9 (ASoC: SOF: handle paused streams during system suspend)
+  #endif
+diff --git a/sound/soc/sof/pcm.c b/sound/soc/sof/pcm.c
+index 15ca4ff34303..b1c173daaa9a 100644
+--- a/sound/soc/sof/pcm.c
++++ b/sound/soc/sof/pcm.c
+@@ -100,9 +100,8 @@ void snd_sof_pcm_period_elapsed(struct snd_pcm_substream *substream)
+ }
+ EXPORT_SYMBOL(snd_sof_pcm_period_elapsed);
+ 
+-static int sof_pcm_dsp_pcm_free(struct snd_pcm_substream *substream,
+-				struct snd_sof_dev *sdev,
+-				struct snd_sof_pcm *spcm)
++int sof_pcm_dsp_pcm_free(struct snd_pcm_substream *substream, struct snd_sof_dev *sdev,
++			 struct snd_sof_pcm *spcm)
+ {
+ 	struct sof_ipc_stream stream;
+ 	struct sof_ipc_reply reply;
+* Unmerged path sound/soc/sof/sof-audio.c
+* Unmerged path sound/soc/sof/sof-audio.h
