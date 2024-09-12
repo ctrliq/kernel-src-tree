@@ -1,0 +1,631 @@
+s390/cpum_cf: make crypto counters upward compatible across machine types
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-553.8.1.el8_10
+commit-author Thomas Richter <tmricht@linux.ibm.com>
+commit f10933cbd2dfddf6273698a45f76db9bafd8150f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.8.1.el8_10/f10933cb.failed
+
+The CPU Measurement facility crypto counter set functionality
+is defined by the Second Counter Version Number. This number
+varies between machine types, but is upward compatible.
+Lessen the checks to reflect this behavior.
+
+	Signed-off-by: Thomas Richter <tmricht@linux.ibm.com>
+	Acked-by: Sumanth Korikkar <sumanthk@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit f10933cbd2dfddf6273698a45f76db9bafd8150f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/perf_cpum_cf.c
+diff --cc arch/s390/kernel/perf_cpum_cf.c
+index 0eb1d1cc53a8,1434642e9cba..000000000000
+--- a/arch/s390/kernel/perf_cpum_cf.c
++++ b/arch/s390/kernel/perf_cpum_cf.c
+@@@ -14,7 -15,574 +14,578 @@@
+  #include <linux/notifier.h>
+  #include <linux/init.h>
+  #include <linux/export.h>
+++<<<<<<< HEAD
+ +#include <asm/cpu_mcf.h>
+++=======
++ #include <linux/miscdevice.h>
++ #include <linux/perf_event.h>
++ 
++ #include <asm/cpu_mf.h>
++ #include <asm/hwctrset.h>
++ #include <asm/debug.h>
++ 
++ enum cpumf_ctr_set {
++ 	CPUMF_CTR_SET_BASIC   = 0,    /* Basic Counter Set */
++ 	CPUMF_CTR_SET_USER    = 1,    /* Problem-State Counter Set */
++ 	CPUMF_CTR_SET_CRYPTO  = 2,    /* Crypto-Activity Counter Set */
++ 	CPUMF_CTR_SET_EXT     = 3,    /* Extended Counter Set */
++ 	CPUMF_CTR_SET_MT_DIAG = 4,    /* MT-diagnostic Counter Set */
++ 
++ 	/* Maximum number of counter sets */
++ 	CPUMF_CTR_SET_MAX,
++ };
++ 
++ #define CPUMF_LCCTL_ENABLE_SHIFT    16
++ #define CPUMF_LCCTL_ACTCTL_SHIFT     0
++ 
++ static inline void ctr_set_enable(u64 *state, u64 ctrsets)
++ {
++ 	*state |= ctrsets << CPUMF_LCCTL_ENABLE_SHIFT;
++ }
++ 
++ static inline void ctr_set_disable(u64 *state, u64 ctrsets)
++ {
++ 	*state &= ~(ctrsets << CPUMF_LCCTL_ENABLE_SHIFT);
++ }
++ 
++ static inline void ctr_set_start(u64 *state, u64 ctrsets)
++ {
++ 	*state |= ctrsets << CPUMF_LCCTL_ACTCTL_SHIFT;
++ }
++ 
++ static inline void ctr_set_stop(u64 *state, u64 ctrsets)
++ {
++ 	*state &= ~(ctrsets << CPUMF_LCCTL_ACTCTL_SHIFT);
++ }
++ 
++ static inline int ctr_stcctm(enum cpumf_ctr_set set, u64 range, u64 *dest)
++ {
++ 	switch (set) {
++ 	case CPUMF_CTR_SET_BASIC:
++ 		return stcctm(BASIC, range, dest);
++ 	case CPUMF_CTR_SET_USER:
++ 		return stcctm(PROBLEM_STATE, range, dest);
++ 	case CPUMF_CTR_SET_CRYPTO:
++ 		return stcctm(CRYPTO_ACTIVITY, range, dest);
++ 	case CPUMF_CTR_SET_EXT:
++ 		return stcctm(EXTENDED, range, dest);
++ 	case CPUMF_CTR_SET_MT_DIAG:
++ 		return stcctm(MT_DIAG_CLEARING, range, dest);
++ 	case CPUMF_CTR_SET_MAX:
++ 		return 3;
++ 	}
++ 	return 3;
++ }
++ 
++ struct cpu_cf_events {
++ 	refcount_t refcnt;		/* Reference count */
++ 	atomic_t		ctr_set[CPUMF_CTR_SET_MAX];
++ 	u64			state;		/* For perf_event_open SVC */
++ 	u64			dev_state;	/* For /dev/hwctr */
++ 	unsigned int		flags;
++ 	size_t used;			/* Bytes used in data */
++ 	size_t usedss;			/* Bytes used in start/stop */
++ 	unsigned char start[PAGE_SIZE];	/* Counter set at event add */
++ 	unsigned char stop[PAGE_SIZE];	/* Counter set at event delete */
++ 	unsigned char data[PAGE_SIZE];	/* Counter set at /dev/hwctr */
++ 	unsigned int sets;		/* # Counter set saved in memory */
++ };
++ 
++ static unsigned int cfdiag_cpu_speed;	/* CPU speed for CF_DIAG trailer */
++ static debug_info_t *cf_dbg;
++ 
++ /*
++  * The CPU Measurement query counter information instruction contains
++  * information which varies per machine generation, but is constant and
++  * does not change when running on a particular machine, such as counter
++  * first and second version number. This is needed to determine the size
++  * of counter sets. Extract this information at device driver initialization.
++  */
++ static struct cpumf_ctr_info	cpumf_ctr_info;
++ 
++ struct cpu_cf_ptr {
++ 	struct cpu_cf_events *cpucf;
++ };
++ 
++ static struct cpu_cf_root {		/* Anchor to per CPU data */
++ 	refcount_t refcnt;		/* Overall active events */
++ 	struct cpu_cf_ptr __percpu *cfptr;
++ } cpu_cf_root;
++ 
++ /*
++  * Serialize event initialization and event removal. Both are called from
++  * user space in task context with perf_event_open() and close()
++  * system calls.
++  *
++  * This mutex serializes functions cpum_cf_alloc_cpu() called at event
++  * initialization via cpumf_pmu_event_init() and function cpum_cf_free_cpu()
++  * called at event removal via call back function hw_perf_event_destroy()
++  * when the event is deleted. They are serialized to enforce correct
++  * bookkeeping of pointer and reference counts anchored by
++  * struct cpu_cf_root and the access to cpu_cf_root::refcnt and the
++  * per CPU pointers stored in cpu_cf_root::cfptr.
++  */
++ static DEFINE_MUTEX(pmc_reserve_mutex);
++ 
++ /*
++  * Get pointer to per-cpu structure.
++  *
++  * Function get_cpu_cfhw() is called from
++  * - cfset_copy_all(): This function is protected by cpus_read_lock(), so
++  *   CPU hot plug remove can not happen. Event removal requires a close()
++  *   first.
++  *
++  * Function this_cpu_cfhw() is called from perf common code functions:
++  * - pmu_{en|dis}able(), pmu_{add|del}()and pmu_{start|stop}():
++  *   All functions execute with interrupts disabled on that particular CPU.
++  * - cfset_ioctl_{on|off}, cfset_cpu_read(): see comment cfset_copy_all().
++  *
++  * Therefore it is safe to access the CPU specific pointer to the event.
++  */
++ static struct cpu_cf_events *get_cpu_cfhw(int cpu)
++ {
++ 	struct cpu_cf_ptr __percpu *p = cpu_cf_root.cfptr;
++ 
++ 	if (p) {
++ 		struct cpu_cf_ptr *q = per_cpu_ptr(p, cpu);
++ 
++ 		return q->cpucf;
++ 	}
++ 	return NULL;
++ }
++ 
++ static struct cpu_cf_events *this_cpu_cfhw(void)
++ {
++ 	return get_cpu_cfhw(smp_processor_id());
++ }
++ 
++ /* Disable counter sets on dedicated CPU */
++ static void cpum_cf_reset_cpu(void *flags)
++ {
++ 	lcctl(0);
++ }
++ 
++ /* Free per CPU data when the last event is removed. */
++ static void cpum_cf_free_root(void)
++ {
++ 	if (!refcount_dec_and_test(&cpu_cf_root.refcnt))
++ 		return;
++ 	free_percpu(cpu_cf_root.cfptr);
++ 	cpu_cf_root.cfptr = NULL;
++ 	irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
++ 	on_each_cpu(cpum_cf_reset_cpu, NULL, 1);
++ 	debug_sprintf_event(cf_dbg, 4, "%s root.refcnt %u cfptr %d\n",
++ 			    __func__, refcount_read(&cpu_cf_root.refcnt),
++ 			    !cpu_cf_root.cfptr);
++ }
++ 
++ /*
++  * On initialization of first event also allocate per CPU data dynamically.
++  * Start with an array of pointers, the array size is the maximum number of
++  * CPUs possible, which might be larger than the number of CPUs currently
++  * online.
++  */
++ static int cpum_cf_alloc_root(void)
++ {
++ 	int rc = 0;
++ 
++ 	if (refcount_inc_not_zero(&cpu_cf_root.refcnt))
++ 		return rc;
++ 
++ 	/* The memory is already zeroed. */
++ 	cpu_cf_root.cfptr = alloc_percpu(struct cpu_cf_ptr);
++ 	if (cpu_cf_root.cfptr) {
++ 		refcount_set(&cpu_cf_root.refcnt, 1);
++ 		on_each_cpu(cpum_cf_reset_cpu, NULL, 1);
++ 		irq_subclass_register(IRQ_SUBCLASS_MEASUREMENT_ALERT);
++ 	} else {
++ 		rc = -ENOMEM;
++ 	}
++ 
++ 	return rc;
++ }
++ 
++ /* Free CPU counter data structure for a PMU */
++ static void cpum_cf_free_cpu(int cpu)
++ {
++ 	struct cpu_cf_events *cpuhw;
++ 	struct cpu_cf_ptr *p;
++ 
++ 	mutex_lock(&pmc_reserve_mutex);
++ 	/*
++ 	 * When invoked via CPU hotplug handler, there might be no events
++ 	 * installed or that particular CPU might not have an
++ 	 * event installed. This anchor pointer can be NULL!
++ 	 */
++ 	if (!cpu_cf_root.cfptr)
++ 		goto out;
++ 	p = per_cpu_ptr(cpu_cf_root.cfptr, cpu);
++ 	cpuhw = p->cpucf;
++ 	/*
++ 	 * Might be zero when called from CPU hotplug handler and no event
++ 	 * installed on that CPU, but on different CPUs.
++ 	 */
++ 	if (!cpuhw)
++ 		goto out;
++ 
++ 	if (refcount_dec_and_test(&cpuhw->refcnt)) {
++ 		kfree(cpuhw);
++ 		p->cpucf = NULL;
++ 	}
++ 	cpum_cf_free_root();
++ out:
++ 	mutex_unlock(&pmc_reserve_mutex);
++ }
++ 
++ /* Allocate CPU counter data structure for a PMU. Called under mutex lock. */
++ static int cpum_cf_alloc_cpu(int cpu)
++ {
++ 	struct cpu_cf_events *cpuhw;
++ 	struct cpu_cf_ptr *p;
++ 	int rc;
++ 
++ 	mutex_lock(&pmc_reserve_mutex);
++ 	rc = cpum_cf_alloc_root();
++ 	if (rc)
++ 		goto unlock;
++ 	p = per_cpu_ptr(cpu_cf_root.cfptr, cpu);
++ 	cpuhw = p->cpucf;
++ 
++ 	if (!cpuhw) {
++ 		cpuhw = kzalloc(sizeof(*cpuhw), GFP_KERNEL);
++ 		if (cpuhw) {
++ 			p->cpucf = cpuhw;
++ 			refcount_set(&cpuhw->refcnt, 1);
++ 		} else {
++ 			rc = -ENOMEM;
++ 		}
++ 	} else {
++ 		refcount_inc(&cpuhw->refcnt);
++ 	}
++ 	if (rc) {
++ 		/*
++ 		 * Error in allocation of event, decrement anchor. Since
++ 		 * cpu_cf_event in not created, its destroy() function is not
++ 		 * invoked. Adjust the reference counter for the anchor.
++ 		 */
++ 		cpum_cf_free_root();
++ 	}
++ unlock:
++ 	mutex_unlock(&pmc_reserve_mutex);
++ 	return rc;
++ }
++ 
++ /*
++  * Create/delete per CPU data structures for /dev/hwctr interface and events
++  * created by perf_event_open().
++  * If cpu is -1, track task on all available CPUs. This requires
++  * allocation of hardware data structures for all CPUs. This setup handles
++  * perf_event_open() with task context and /dev/hwctr interface.
++  * If cpu is non-zero install event on this CPU only. This setup handles
++  * perf_event_open() with CPU context.
++  */
++ static int cpum_cf_alloc(int cpu)
++ {
++ 	cpumask_var_t mask;
++ 	int rc;
++ 
++ 	if (cpu == -1) {
++ 		if (!zalloc_cpumask_var(&mask, GFP_KERNEL))
++ 			return -ENOMEM;
++ 		for_each_online_cpu(cpu) {
++ 			rc = cpum_cf_alloc_cpu(cpu);
++ 			if (rc) {
++ 				for_each_cpu(cpu, mask)
++ 					cpum_cf_free_cpu(cpu);
++ 				break;
++ 			}
++ 			cpumask_set_cpu(cpu, mask);
++ 		}
++ 		free_cpumask_var(mask);
++ 	} else {
++ 		rc = cpum_cf_alloc_cpu(cpu);
++ 	}
++ 	return rc;
++ }
++ 
++ static void cpum_cf_free(int cpu)
++ {
++ 	if (cpu == -1) {
++ 		for_each_online_cpu(cpu)
++ 			cpum_cf_free_cpu(cpu);
++ 	} else {
++ 		cpum_cf_free_cpu(cpu);
++ 	}
++ }
++ 
++ #define	CF_DIAG_CTRSET_DEF		0xfeef	/* Counter set header mark */
++ 						/* interval in seconds */
++ 
++ /* Counter sets are stored as data stream in a page sized memory buffer and
++  * exported to user space via raw data attached to the event sample data.
++  * Each counter set starts with an eight byte header consisting of:
++  * - a two byte eye catcher (0xfeef)
++  * - a one byte counter set number
++  * - a two byte counter set size (indicates the number of counters in this set)
++  * - a three byte reserved value (must be zero) to make the header the same
++  *   size as a counter value.
++  * All counter values are eight byte in size.
++  *
++  * All counter sets are followed by a 64 byte trailer.
++  * The trailer consists of a:
++  * - flag field indicating valid fields when corresponding bit set
++  * - the counter facility first and second version number
++  * - the CPU speed if nonzero
++  * - the time stamp the counter sets have been collected
++  * - the time of day (TOD) base value
++  * - the machine type.
++  *
++  * The counter sets are saved when the process is prepared to be executed on a
++  * CPU and saved again when the process is going to be removed from a CPU.
++  * The difference of both counter sets are calculated and stored in the event
++  * sample data area.
++  */
++ struct cf_ctrset_entry {	/* CPU-M CF counter set entry (8 byte) */
++ 	unsigned int def:16;	/* 0-15  Data Entry Format */
++ 	unsigned int set:16;	/* 16-31 Counter set identifier */
++ 	unsigned int ctr:16;	/* 32-47 Number of stored counters */
++ 	unsigned int res1:16;	/* 48-63 Reserved */
++ };
++ 
++ struct cf_trailer_entry {	/* CPU-M CF_DIAG trailer (64 byte) */
++ 	/* 0 - 7 */
++ 	union {
++ 		struct {
++ 			unsigned int clock_base:1;	/* TOD clock base set */
++ 			unsigned int speed:1;		/* CPU speed set */
++ 			/* Measurement alerts */
++ 			unsigned int mtda:1;	/* Loss of MT ctr. data alert */
++ 			unsigned int caca:1;	/* Counter auth. change alert */
++ 			unsigned int lcda:1;	/* Loss of counter data alert */
++ 		};
++ 		unsigned long flags;	/* 0-63    All indicators */
++ 	};
++ 	/* 8 - 15 */
++ 	unsigned int cfvn:16;			/* 64-79   Ctr First Version */
++ 	unsigned int csvn:16;			/* 80-95   Ctr Second Version */
++ 	unsigned int cpu_speed:32;		/* 96-127  CPU speed */
++ 	/* 16 - 23 */
++ 	unsigned long timestamp;		/* 128-191 Timestamp (TOD) */
++ 	/* 24 - 55 */
++ 	union {
++ 		struct {
++ 			unsigned long progusage1;
++ 			unsigned long progusage2;
++ 			unsigned long progusage3;
++ 			unsigned long tod_base;
++ 		};
++ 		unsigned long progusage[4];
++ 	};
++ 	/* 56 - 63 */
++ 	unsigned int mach_type:16;		/* Machine type */
++ 	unsigned int res1:16;			/* Reserved */
++ 	unsigned int res2:32;			/* Reserved */
++ };
++ 
++ /* Create the trailer data at the end of a page. */
++ static void cfdiag_trailer(struct cf_trailer_entry *te)
++ {
++ 	struct cpuid cpuid;
++ 
++ 	te->cfvn = cpumf_ctr_info.cfvn;		/* Counter version numbers */
++ 	te->csvn = cpumf_ctr_info.csvn;
++ 
++ 	get_cpu_id(&cpuid);			/* Machine type */
++ 	te->mach_type = cpuid.machine;
++ 	te->cpu_speed = cfdiag_cpu_speed;
++ 	if (te->cpu_speed)
++ 		te->speed = 1;
++ 	te->clock_base = 1;			/* Save clock base */
++ 	te->tod_base = tod_clock_base.tod;
++ 	te->timestamp = get_tod_clock_fast();
++ }
++ 
++ /*
++  * The number of counters per counter set varies between machine generations,
++  * but is constant when running on a particular machine generation.
++  * Determine each counter set size at device driver initialization and
++  * retrieve it later.
++  */
++ static size_t cpumf_ctr_setsizes[CPUMF_CTR_SET_MAX];
++ static void cpum_cf_make_setsize(enum cpumf_ctr_set ctrset)
++ {
++ 	size_t ctrset_size = 0;
++ 
++ 	switch (ctrset) {
++ 	case CPUMF_CTR_SET_BASIC:
++ 		if (cpumf_ctr_info.cfvn >= 1)
++ 			ctrset_size = 6;
++ 		break;
++ 	case CPUMF_CTR_SET_USER:
++ 		if (cpumf_ctr_info.cfvn == 1)
++ 			ctrset_size = 6;
++ 		else if (cpumf_ctr_info.cfvn >= 3)
++ 			ctrset_size = 2;
++ 		break;
++ 	case CPUMF_CTR_SET_CRYPTO:
++ 		if (cpumf_ctr_info.csvn >= 1 && cpumf_ctr_info.csvn <= 5)
++ 			ctrset_size = 16;
++ 		else if (cpumf_ctr_info.csvn >= 6)
++ 			ctrset_size = 20;
++ 		break;
++ 	case CPUMF_CTR_SET_EXT:
++ 		if (cpumf_ctr_info.csvn == 1)
++ 			ctrset_size = 32;
++ 		else if (cpumf_ctr_info.csvn == 2)
++ 			ctrset_size = 48;
++ 		else if (cpumf_ctr_info.csvn >= 3 && cpumf_ctr_info.csvn <= 5)
++ 			ctrset_size = 128;
++ 		else if (cpumf_ctr_info.csvn == 6 || cpumf_ctr_info.csvn == 7)
++ 			ctrset_size = 160;
++ 		break;
++ 	case CPUMF_CTR_SET_MT_DIAG:
++ 		if (cpumf_ctr_info.csvn > 3)
++ 			ctrset_size = 48;
++ 		break;
++ 	case CPUMF_CTR_SET_MAX:
++ 		break;
++ 	}
++ 	cpumf_ctr_setsizes[ctrset] = ctrset_size;
++ }
++ 
++ /*
++  * Return the maximum possible counter set size (in number of 8 byte counters)
++  * depending on type and model number.
++  */
++ static size_t cpum_cf_read_setsize(enum cpumf_ctr_set ctrset)
++ {
++ 	return cpumf_ctr_setsizes[ctrset];
++ }
++ 
++ /* Read a counter set. The counter set number determines the counter set and
++  * the CPUM-CF first and second version number determine the number of
++  * available counters in each counter set.
++  * Each counter set starts with header containing the counter set number and
++  * the number of eight byte counters.
++  *
++  * The functions returns the number of bytes occupied by this counter set
++  * including the header.
++  * If there is no counter in the counter set, this counter set is useless and
++  * zero is returned on this case.
++  *
++  * Note that the counter sets may not be enabled or active and the stcctm
++  * instruction might return error 3. Depending on error_ok value this is ok,
++  * for example when called from cpumf_pmu_start() call back function.
++  */
++ static size_t cfdiag_getctrset(struct cf_ctrset_entry *ctrdata, int ctrset,
++ 			       size_t room, bool error_ok)
++ {
++ 	size_t ctrset_size, need = 0;
++ 	int rc = 3;				/* Assume write failure */
++ 
++ 	ctrdata->def = CF_DIAG_CTRSET_DEF;
++ 	ctrdata->set = ctrset;
++ 	ctrdata->res1 = 0;
++ 	ctrset_size = cpum_cf_read_setsize(ctrset);
++ 
++ 	if (ctrset_size) {			/* Save data */
++ 		need = ctrset_size * sizeof(u64) + sizeof(*ctrdata);
++ 		if (need <= room) {
++ 			rc = ctr_stcctm(ctrset, ctrset_size,
++ 					(u64 *)(ctrdata + 1));
++ 		}
++ 		if (rc != 3 || error_ok)
++ 			ctrdata->ctr = ctrset_size;
++ 		else
++ 			need = 0;
++ 	}
++ 
++ 	return need;
++ }
++ 
++ static const u64 cpumf_ctr_ctl[CPUMF_CTR_SET_MAX] = {
++ 	[CPUMF_CTR_SET_BASIC]	= 0x02,
++ 	[CPUMF_CTR_SET_USER]	= 0x04,
++ 	[CPUMF_CTR_SET_CRYPTO]	= 0x08,
++ 	[CPUMF_CTR_SET_EXT]	= 0x01,
++ 	[CPUMF_CTR_SET_MT_DIAG] = 0x20,
++ };
++ 
++ /* Read out all counter sets and save them in the provided data buffer.
++  * The last 64 byte host an artificial trailer entry.
++  */
++ static size_t cfdiag_getctr(void *data, size_t sz, unsigned long auth,
++ 			    bool error_ok)
++ {
++ 	struct cf_trailer_entry *trailer;
++ 	size_t offset = 0, done;
++ 	int i;
++ 
++ 	memset(data, 0, sz);
++ 	sz -= sizeof(*trailer);		/* Always room for trailer */
++ 	for (i = CPUMF_CTR_SET_BASIC; i < CPUMF_CTR_SET_MAX; ++i) {
++ 		struct cf_ctrset_entry *ctrdata = data + offset;
++ 
++ 		if (!(auth & cpumf_ctr_ctl[i]))
++ 			continue;	/* Counter set not authorized */
++ 
++ 		done = cfdiag_getctrset(ctrdata, i, sz - offset, error_ok);
++ 		offset += done;
++ 	}
++ 	trailer = data + offset;
++ 	cfdiag_trailer(trailer);
++ 	return offset + sizeof(*trailer);
++ }
++ 
++ /* Calculate the difference for each counter in a counter set. */
++ static void cfdiag_diffctrset(u64 *pstart, u64 *pstop, int counters)
++ {
++ 	for (; --counters >= 0; ++pstart, ++pstop)
++ 		if (*pstop >= *pstart)
++ 			*pstop -= *pstart;
++ 		else
++ 			*pstop = *pstart - *pstop + 1;
++ }
++ 
++ /* Scan the counter sets and calculate the difference of each counter
++  * in each set. The result is the increment of each counter during the
++  * period the counter set has been activated.
++  *
++  * Return true on success.
++  */
++ static int cfdiag_diffctr(struct cpu_cf_events *cpuhw, unsigned long auth)
++ {
++ 	struct cf_trailer_entry *trailer_start, *trailer_stop;
++ 	struct cf_ctrset_entry *ctrstart, *ctrstop;
++ 	size_t offset = 0;
++ 
++ 	auth &= (1 << CPUMF_LCCTL_ENABLE_SHIFT) - 1;
++ 	do {
++ 		ctrstart = (struct cf_ctrset_entry *)(cpuhw->start + offset);
++ 		ctrstop = (struct cf_ctrset_entry *)(cpuhw->stop + offset);
++ 
++ 		if (memcmp(ctrstop, ctrstart, sizeof(*ctrstop))) {
++ 			pr_err_once("cpum_cf_diag counter set compare error "
++ 				    "in set %i\n", ctrstart->set);
++ 			return 0;
++ 		}
++ 		auth &= ~cpumf_ctr_ctl[ctrstart->set];
++ 		if (ctrstart->def == CF_DIAG_CTRSET_DEF) {
++ 			cfdiag_diffctrset((u64 *)(ctrstart + 1),
++ 					  (u64 *)(ctrstop + 1), ctrstart->ctr);
++ 			offset += ctrstart->ctr * sizeof(u64) +
++ 							sizeof(*ctrstart);
++ 		}
++ 	} while (ctrstart->def && auth);
++ 
++ 	/* Save time_stamp from start of event in stop's trailer */
++ 	trailer_start = (struct cf_trailer_entry *)(cpuhw->start + offset);
++ 	trailer_stop = (struct cf_trailer_entry *)(cpuhw->stop + offset);
++ 	trailer_stop->progusage[0] = trailer_start->timestamp;
++ 
++ 	return 1;
++ }
+++>>>>>>> f10933cbd2df (s390/cpum_cf: make crypto counters upward compatible across machine types)
+  
+  static enum cpumf_ctr_set get_counter_set(u64 event)
+  {
+* Unmerged path arch/s390/kernel/perf_cpum_cf.c
+diff --git a/arch/s390/kernel/perf_cpum_cf_events.c b/arch/s390/kernel/perf_cpum_cf_events.c
+index 0d64aafd158f..e4a6bfc91080 100644
+--- a/arch/s390/kernel/perf_cpum_cf_events.c
++++ b/arch/s390/kernel/perf_cpum_cf_events.c
+@@ -855,16 +855,11 @@ __init const struct attribute_group **cpumf_cf_event_group(void)
+ 	}
+ 
+ 	/* Determine version specific crypto set */
+-	switch (ci.csvn) {
+-	case 1 ... 5:
++	csvn = none;
++	if (ci.csvn >= 1 && ci.csvn <= 5)
+ 		csvn = cpumcf_svn_12345_pmu_event_attr;
+-		break;
+-	case 6 ... 7:
++	else if (ci.csvn >= 6)
+ 		csvn = cpumcf_svn_67_pmu_event_attr;
+-		break;
+-	default:
+-		csvn = none;
+-	}
+ 
+ 	/* Determine model-specific counter set(s) */
+ 	get_cpu_id(&cpu_id);
