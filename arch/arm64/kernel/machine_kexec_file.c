@@ -297,6 +297,7 @@ int load_other_segments(struct kimage *image,
 	ret = create_dtb(image, initrd_load_addr, initrd_len, cmdline, &dtb);
 	if (ret) {
 		pr_err("Preparing for new dtb failed\n");
+		ret = -EINVAL;
 		goto out_err;
 	}
 
