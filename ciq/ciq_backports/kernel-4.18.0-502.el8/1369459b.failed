@@ -1,0 +1,610 @@
+iommu: Add a gfp parameter to iommu_map()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-502.el8
+Rebuild_CHGLOG: - Revert "iommu: Add a gfp parameter to iommu_map()" (Jocelyn Falempe) [2160452]
+Rebuild_FUZZ: 90.11%
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit 1369459b2e219a6f4c861404c4f195cd81dcbb40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-502.el8/1369459b.failed
+
+The internal mechanisms support this, but instead of exposting the gfp to
+the caller it wrappers it into iommu_map() and iommu_map_atomic()
+
+Fix this instead of adding more variants for GFP_KERNEL_ACCOUNT.
+
+	Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+	Reviewed-by: Mathieu Poirier <mathieu.poirier@linaro.org>
+Link: https://lore.kernel.org/r/1-v3-76b587fe28df+6e3-iommu_map_gfp_jgg@nvidia.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 1369459b2e219a6f4c861404c4f195cd81dcbb40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/mm/dma-mapping.c
+#	drivers/iommu/iommufd/pages.c
+#	drivers/media/platform/qcom/venus/firmware.c
+#	drivers/net/ipa/ipa_mem.c
+#	drivers/remoteproc/remoteproc_core.c
+#	drivers/vfio/vfio_iommu_type1.c
+diff --cc arch/arm/mm/dma-mapping.c
+index e5a585d6d58c,8bc01071474a..000000000000
+--- a/arch/arm/mm/dma-mapping.c
++++ b/arch/arm/mm/dma-mapping.c
+@@@ -1918,51 -1389,7 +1920,58 @@@ static dma_addr_t arm_coherent_iommu_ma
+  	return dma_addr + offset;
+  fail:
+  	__free_iova(mapping, dma_addr, len);
+ -	return DMA_MAPPING_ERROR;
+ +	return ARM_MAPPING_ERROR;
+ +}
+ +
+ +/**
+ + * arm_iommu_map_page
+ + * @dev: valid struct device pointer
+ + * @page: page that buffer resides in
+ + * @offset: offset into page for start of buffer
+ + * @size: size of buffer to map
+ + * @dir: DMA transfer direction
+ + *
+ + * IOMMU aware version of arm_dma_map_page()
+ + */
+ +static dma_addr_t arm_iommu_map_page(struct device *dev, struct page *page,
+ +	     unsigned long offset, size_t size, enum dma_data_direction dir,
+ +	     unsigned long attrs)
+ +{
+ +	if ((attrs & DMA_ATTR_SKIP_CPU_SYNC) == 0)
+ +		__dma_page_cpu_to_dev(page, offset, size, dir);
+ +
+ +	return arm_coherent_iommu_map_page(dev, page, offset, size, dir, attrs);
+ +}
+ +
+ +/**
+ + * arm_coherent_iommu_unmap_page
+ + * @dev: valid struct device pointer
+ + * @handle: DMA address of buffer
+ + * @size: size of buffer (same as passed to dma_map_page)
+ + * @dir: DMA transfer direction (same as passed to dma_map_page)
+ + *
+ + * Coherent IOMMU aware version of arm_dma_unmap_page()
+ + */
+ +static void arm_coherent_iommu_unmap_page(struct device *dev, dma_addr_t handle,
+ +		size_t size, enum dma_data_direction dir, unsigned long attrs)
+ +{
+ +	struct dma_iommu_mapping *mapping = to_dma_iommu_mapping(dev);
+ +	dma_addr_t iova = handle & PAGE_MASK;
+ +	int offset = handle & ~PAGE_MASK;
+ +	int len = PAGE_ALIGN(size + offset);
+ +
+++<<<<<<< HEAD
+ +	if (!iova)
+ +		return;
+++=======
+++	ret = iommu_map(mapping->domain, dma_addr, page_to_phys(page), len,
+++			prot, GFP_KERNEL);
+++	if (ret < 0)
+++		goto fail;
+++>>>>>>> 1369459b2e21 (iommu: Add a gfp parameter to iommu_map())
+ +
+ +	iommu_unmap(mapping->domain, iova, len);
+ +	__free_iova(mapping, iova, len);
+  }
+  
+  /**
+diff --cc drivers/media/platform/qcom/venus/firmware.c
+index c4a577848dd7,07d4dceb5e72..000000000000
+--- a/drivers/media/platform/qcom/venus/firmware.c
++++ b/drivers/media/platform/qcom/venus/firmware.c
+@@@ -71,24 -110,224 +71,125 @@@ int venus_boot(struct device *dev, cons
+  	fw_size = qcom_mdt_get_size(mdt);
+  	if (fw_size < 0) {
+  		ret = fw_size;
+ -		goto err_release_fw;
+ -	}
+ -
+ -	*mem_phys = r.start;
+ -	*mem_size = resource_size(&r);
+ -
+ -	if (*mem_size < fw_size || fw_size > VENUS_FW_MEM_SIZE) {
+ -		ret = -EINVAL;
+ -		goto err_release_fw;
+ +		release_firmware(mdt);
+ +		goto err_unmap;
+  	}
+  
+ -	mem_va = memremap(r.start, *mem_size, MEMREMAP_WC);
+ -	if (!mem_va) {
+ -		dev_err(dev, "unable to map memory region: %pR\n", &r);
+ -		ret = -ENOMEM;
+ -		goto err_release_fw;
+ -	}
+ +	ret = qcom_mdt_load(dev, mdt, fwname, VENUS_PAS_ID, mem_va, mem_phys,
+ +			    mem_size, NULL);
+  
+ -	if (core->use_tz)
+ -		ret = qcom_mdt_load(dev, mdt, fwname, VENUS_PAS_ID,
+ -				    mem_va, *mem_phys, *mem_size, NULL);
+ -	else
+ -		ret = qcom_mdt_load_no_init(dev, mdt, fwname, VENUS_PAS_ID,
+ -					    mem_va, *mem_phys, *mem_size, NULL);
+ -
+ -	memunmap(mem_va);
+ -err_release_fw:
+  	release_firmware(mdt);
+++<<<<<<< HEAD
+++=======
++ err_put_node:
++ 	of_node_put(node);
++ 	return ret;
++ }
++ 
++ static int venus_boot_no_tz(struct venus_core *core, phys_addr_t mem_phys,
++ 			    size_t mem_size)
++ {
++ 	struct iommu_domain *iommu;
++ 	struct device *dev;
++ 	int ret;
++ 
++ 	dev = core->fw.dev;
++ 	if (!dev)
++ 		return -EPROBE_DEFER;
++ 
++ 	iommu = core->fw.iommu_domain;
++ 	core->fw.mapped_mem_size = mem_size;
++ 
++ 	ret = iommu_map(iommu, VENUS_FW_START_ADDR, mem_phys, mem_size,
++ 			IOMMU_READ | IOMMU_WRITE | IOMMU_PRIV, GFP_KERNEL);
++ 	if (ret) {
++ 		dev_err(dev, "could not map video firmware region\n");
++ 		return ret;
++ 	}
++ 
++ 	venus_reset_cpu(core);
++ 
++ 	return 0;
++ }
++ 
++ static int venus_shutdown_no_tz(struct venus_core *core)
++ {
++ 	const size_t mapped = core->fw.mapped_mem_size;
++ 	struct iommu_domain *iommu;
++ 	size_t unmapped;
++ 	u32 reg;
++ 	struct device *dev = core->fw.dev;
++ 	void __iomem *wrapper_base = core->wrapper_base;
++ 	void __iomem *wrapper_tz_base = core->wrapper_tz_base;
++ 
++ 	if (IS_V6(core)) {
++ 		/* Assert the reset to XTSS */
++ 		reg = readl(wrapper_tz_base + WRAPPER_TZ_XTSS_SW_RESET);
++ 		reg |= WRAPPER_XTSS_SW_RESET_BIT;
++ 		writel(reg, wrapper_tz_base + WRAPPER_TZ_XTSS_SW_RESET);
++ 	} else {
++ 		/* Assert the reset to ARM9 */
++ 		reg = readl(wrapper_base + WRAPPER_A9SS_SW_RESET);
++ 		reg |= WRAPPER_A9SS_SW_RESET_BIT;
++ 		writel(reg, wrapper_base + WRAPPER_A9SS_SW_RESET);
++ 	}
++ 
++ 	iommu = core->fw.iommu_domain;
++ 
++ 	if (core->fw.mapped_mem_size && iommu) {
++ 		unmapped = iommu_unmap(iommu, VENUS_FW_START_ADDR, mapped);
++ 
++ 		if (unmapped != mapped)
++ 			dev_err(dev, "failed to unmap firmware\n");
++ 		else
++ 			core->fw.mapped_mem_size = 0;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int venus_boot(struct venus_core *core)
++ {
++ 	struct device *dev = core->dev;
++ 	const struct venus_resources *res = core->res;
++ 	const char *fwpath = NULL;
++ 	phys_addr_t mem_phys;
++ 	size_t mem_size;
++ 	int ret;
++ 
++ 	if (!IS_ENABLED(CONFIG_QCOM_MDT_LOADER) ||
++ 	    (core->use_tz && !qcom_scm_is_available()))
++ 		return -EPROBE_DEFER;
++ 
++ 	ret = of_property_read_string_index(dev->of_node, "firmware-name", 0,
++ 					    &fwpath);
++ 	if (ret)
++ 		fwpath = core->res->fwname;
++ 
++ 	ret = venus_load_fw(core, fwpath, &mem_phys, &mem_size);
++ 	if (ret) {
++ 		dev_err(dev, "fail to load video firmware\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	core->fw.mem_size = mem_size;
++ 	core->fw.mem_phys = mem_phys;
++ 
++ 	if (core->use_tz)
++ 		ret = qcom_scm_pas_auth_and_reset(VENUS_PAS_ID);
++ 	else
++ 		ret = venus_boot_no_tz(core, mem_phys, mem_size);
+++>>>>>>> 1369459b2e21 (iommu: Add a gfp parameter to iommu_map())
+  
+  	if (ret)
+ -		return ret;
+ +		goto err_unmap;
+  
+ -	if (core->use_tz && res->cp_size) {
+ -		ret = qcom_scm_mem_protect_video_var(res->cp_start,
+ -						     res->cp_size,
+ -						     res->cp_nonpixel_start,
+ -						     res->cp_nonpixel_size);
+ -		if (ret) {
+ -			qcom_scm_pas_shutdown(VENUS_PAS_ID);
+ -			dev_err(dev, "set virtual address ranges fail (%d)\n",
+ -				ret);
+ -			return ret;
+ -		}
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -int venus_shutdown(struct venus_core *core)
+ -{
+ -	int ret;
+ -
+ -	if (core->use_tz)
+ -		ret = qcom_scm_pas_shutdown(VENUS_PAS_ID);
+ -	else
+ -		ret = venus_shutdown_no_tz(core);
+ -
+ -	return ret;
+ -}
+ -
+ -int venus_firmware_init(struct venus_core *core)
+ -{
+ -	struct platform_device_info info;
+ -	struct iommu_domain *iommu_dom;
+ -	struct platform_device *pdev;
+ -	struct device_node *np;
+ -	int ret;
+ -
+ -	np = of_get_child_by_name(core->dev->of_node, "video-firmware");
+ -	if (!np) {
+ -		core->use_tz = true;
+ -		return 0;
+ -	}
+ -
+ -	memset(&info, 0, sizeof(info));
+ -	info.fwnode = &np->fwnode;
+ -	info.parent = core->dev;
+ -	info.name = np->name;
+ -	info.dma_mask = DMA_BIT_MASK(32);
+ -
+ -	pdev = platform_device_register_full(&info);
+ -	if (IS_ERR(pdev)) {
+ -		of_node_put(np);
+ -		return PTR_ERR(pdev);
+ -	}
+ -
+ -	pdev->dev.of_node = np;
+ -
+ -	ret = of_dma_configure(&pdev->dev, np, true);
+ -	if (ret) {
+ -		dev_err(core->dev, "dma configure fail\n");
+ -		goto err_unregister;
+ -	}
+ -
+ -	core->fw.dev = &pdev->dev;
+ -
+ -	iommu_dom = iommu_domain_alloc(&platform_bus_type);
+ -	if (!iommu_dom) {
+ -		dev_err(core->fw.dev, "Failed to allocate iommu domain\n");
+ -		ret = -ENOMEM;
+ -		goto err_unregister;
+ -	}
+ -
+ -	ret = iommu_attach_device(iommu_dom, core->fw.dev);
+ -	if (ret) {
+ -		dev_err(core->fw.dev, "could not attach device\n");
+ -		goto err_iommu_free;
+ -	}
+ -
+ -	core->fw.iommu_domain = iommu_dom;
+ -
+ -	of_node_put(np);
+ -
+ -	return 0;
+ +	ret = qcom_scm_pas_auth_and_reset(VENUS_PAS_ID);
+ +	if (ret)
+ +		goto err_unmap;
+  
+ -err_iommu_free:
+ -	iommu_domain_free(iommu_dom);
+ -err_unregister:
+ -	platform_device_unregister(pdev);
+ -	of_node_put(np);
+ +err_unmap:
+ +	memunmap(mem_va);
+  	return ret;
+  }
+  
+diff --cc drivers/remoteproc/remoteproc_core.c
+index a9609d971f7f,80072b6b6283..000000000000
+--- a/drivers/remoteproc/remoteproc_core.c
++++ b/drivers/remoteproc/remoteproc_core.c
+@@@ -662,8 -737,8 +663,13 @@@ static int rproc_handle_carveout(struc
+  			goto dma_free;
+  		}
+  
+++<<<<<<< HEAD
+ +		ret = iommu_map(rproc->domain, rsc->da, dma, rsc->len,
+ +				rsc->flags);
+++=======
++ 		ret = iommu_map(rproc->domain, mem->da, dma, mem->len,
++ 				mem->flags, GFP_KERNEL);
+++>>>>>>> 1369459b2e21 (iommu: Add a gfp parameter to iommu_map())
+  		if (ret) {
+  			dev_err(dev, "iommu_map failed: %d\n", ret);
+  			goto free_mapping;
+diff --cc drivers/vfio/vfio_iommu_type1.c
+index 11d0fb25527b,e14f86a8ef52..000000000000
+--- a/drivers/vfio/vfio_iommu_type1.c
++++ b/drivers/vfio/vfio_iommu_type1.c
+@@@ -1240,7 -1480,8 +1240,12 @@@ static int vfio_iommu_map(struct vfio_i
+  
+  	list_for_each_entry(d, &iommu->domain_list, next) {
+  		ret = iommu_map(d->domain, iova, (phys_addr_t)pfn << PAGE_SHIFT,
+++<<<<<<< HEAD
+ +				npage << PAGE_SHIFT, prot | d->prot);
+++=======
++ 				npage << PAGE_SHIFT, prot | IOMMU_CACHE,
++ 				GFP_KERNEL);
+++>>>>>>> 1369459b2e21 (iommu: Add a gfp parameter to iommu_map())
+  		if (ret)
+  			goto unwind;
+  
+@@@ -1517,10 -1778,10 +1522,15 @@@ static int vfio_iommu_replay(struct vfi
+  				size = npage << PAGE_SHIFT;
+  			}
+  
+++<<<<<<< HEAD
+ +			ret = iommu_map(domain->domain, iova, phys,
+ +					size, dma->prot | domain->prot);
+++=======
++ 			ret = iommu_map(domain->domain, iova, phys, size,
++ 					dma->prot | IOMMU_CACHE, GFP_KERNEL);
+++>>>>>>> 1369459b2e21 (iommu: Add a gfp parameter to iommu_map())
+  			if (ret) {
+ -				if (!dma->iommu_mapped) {
+ +				if (!dma->iommu_mapped)
+  					vfio_unpin_pages_remote(dma, iova,
+  							phys >> PAGE_SHIFT,
+  							size >> PAGE_SHIFT,
+@@@ -1602,7 -1867,7 +1612,11 @@@ static void vfio_test_domain_fgsp(struc
+  		return;
+  
+  	ret = iommu_map(domain->domain, 0, page_to_phys(pages), PAGE_SIZE * 2,
+++<<<<<<< HEAD
+ +			IOMMU_READ | IOMMU_WRITE | domain->prot);
+++=======
++ 			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, GFP_KERNEL);
+++>>>>>>> 1369459b2e21 (iommu: Add a gfp parameter to iommu_map())
+  	if (!ret) {
+  		size_t unmapped = iommu_unmap(domain->domain, 0, PAGE_SIZE);
+  
+* Unmerged path drivers/iommu/iommufd/pages.c
+* Unmerged path drivers/net/ipa/ipa_mem.c
+* Unmerged path arch/arm/mm/dma-mapping.c
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/gk20a.c b/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/gk20a.c
+index 648ecf5a8fbc..a4ac94a2ab57 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/gk20a.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/gk20a.c
+@@ -475,7 +475,8 @@ gk20a_instobj_ctor_iommu(struct gk20a_instmem *imem, u32 npages, u32 align,
+ 		u32 offset = (r->offset + i) << imem->iommu_pgshift;
+ 
+ 		ret = iommu_map(imem->domain, offset, node->dma_addrs[i],
+-				PAGE_SIZE, IOMMU_READ | IOMMU_WRITE);
++				PAGE_SIZE, IOMMU_READ | IOMMU_WRITE,
++				GFP_KERNEL);
+ 		if (ret < 0) {
+ 			nvkm_error(subdev, "IOMMU mapping failure: %d\n", ret);
+ 
+diff --git a/drivers/gpu/drm/tegra/drm.c b/drivers/gpu/drm/tegra/drm.c
+index 20c7544f1cfe..f1584153ff68 100644
+--- a/drivers/gpu/drm/tegra/drm.c
++++ b/drivers/gpu/drm/tegra/drm.c
+@@ -1144,7 +1144,7 @@ void *tegra_drm_alloc(struct tegra_drm *tegra, size_t size, dma_addr_t *dma)
+ 
+ 	*dma = iova_dma_addr(&tegra->carveout.domain, alloc);
+ 	err = iommu_map(tegra->domain, *dma, virt_to_phys(virt),
+-			size, IOMMU_READ | IOMMU_WRITE);
++			size, IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+ 	if (err < 0)
+ 		goto free_iova;
+ 
+diff --git a/drivers/gpu/host1x/cdma.c b/drivers/gpu/host1x/cdma.c
+index 91df51e631b2..0c62d78e3c4a 100644
+--- a/drivers/gpu/host1x/cdma.c
++++ b/drivers/gpu/host1x/cdma.c
+@@ -106,7 +106,7 @@ static int host1x_pushbuffer_init(struct push_buffer *pb)
+ 
+ 		pb->dma = iova_dma_addr(&host1x->iova, alloc);
+ 		err = iommu_map(host1x->domain, pb->dma, pb->phys, size,
+-				IOMMU_READ);
++				IOMMU_READ, GFP_KERNEL);
+ 		if (err)
+ 			goto iommu_free_iova;
+ 	} else {
+diff --git a/drivers/infiniband/hw/usnic/usnic_uiom.c b/drivers/infiniband/hw/usnic/usnic_uiom.c
+index 87295668c4a5..ffec4b05d2fb 100644
+--- a/drivers/infiniband/hw/usnic/usnic_uiom.c
++++ b/drivers/infiniband/hw/usnic/usnic_uiom.c
+@@ -278,7 +278,7 @@ static int usnic_uiom_map_sorted_intervals(struct list_head *intervals,
+ 				usnic_dbg("va 0x%lx pa %pa size 0x%zx flags 0x%x",
+ 					va_start, &pa_start, size, flags);
+ 				err = iommu_map(pd->domain, va_start, pa_start,
+-							size, flags);
++						size, flags, GFP_KERNEL);
+ 				if (err) {
+ 					usnic_err("Failed to map va 0x%lx pa %pa size 0x%zx with err %d\n",
+ 						va_start, &pa_start, size, err);
+@@ -295,7 +295,7 @@ static int usnic_uiom_map_sorted_intervals(struct list_head *intervals,
+ 				usnic_dbg("va 0x%lx pa %pa size 0x%zx flags 0x%x\n",
+ 					va_start, &pa_start, size, flags);
+ 				err = iommu_map(pd->domain, va_start, pa_start,
+-						size, flags);
++						size, flags, GFP_KERNEL);
+ 				if (err) {
+ 					usnic_err("Failed to map va 0x%lx pa %pa size 0x%zx with err %d\n",
+ 						va_start, &pa_start, size, err);
+diff --git a/drivers/iommu/dma-iommu.c b/drivers/iommu/dma-iommu.c
+index 4b1a634e5189..147c87814e6b 100644
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -1546,7 +1546,7 @@ static struct iommu_dma_msi_page *iommu_dma_get_msi_page(struct device *dev,
+ 	if (!iova)
+ 		goto out_free_page;
+ 
+-	if (iommu_map(domain, iova, msi_addr, size, prot))
++	if (iommu_map(domain, iova, msi_addr, size, prot, GFP_KERNEL))
+ 		goto out_free_iova;
+ 
+ 	INIT_LIST_HEAD(&msi_page->list);
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index faa612d0c64b..b7ac72343214 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -834,7 +834,7 @@ static int iommu_create_device_direct_mappings(struct iommu_group *group,
+ 			if (map_size) {
+ 				ret = iommu_map(domain, addr - map_size,
+ 						addr - map_size, map_size,
+-						entry->prot);
++						entry->prot, GFP_KERNEL);
+ 				if (ret)
+ 					goto out;
+ 				map_size = 0;
+@@ -2355,31 +2355,31 @@ static int __iommu_map(struct iommu_domain *domain, unsigned long iova,
+ 	return ret;
+ }
+ 
+-static int _iommu_map(struct iommu_domain *domain, unsigned long iova,
+-		      phys_addr_t paddr, size_t size, int prot, gfp_t gfp)
++int iommu_map(struct iommu_domain *domain, unsigned long iova,
++	      phys_addr_t paddr, size_t size, int prot, gfp_t gfp)
+ {
+ 	const struct iommu_ops *ops = domain->ops;
+ 	int ret;
+ 
++	might_sleep_if(gfpflags_allow_blocking(gfp));
++
++	/* Discourage passing strange GFP flags */
++	if (WARN_ON_ONCE(gfp & (__GFP_COMP | __GFP_DMA | __GFP_DMA32 |
++				__GFP_HIGHMEM)))
++		return -EINVAL;
++
+ 	ret = __iommu_map(domain, iova, paddr, size, prot, gfp);
+ 	if (ret == 0 && ops->iotlb_sync_map)
+ 		ops->iotlb_sync_map(domain, iova, size);
+ 
+ 	return ret;
+ }
+-
+-int iommu_map(struct iommu_domain *domain, unsigned long iova,
+-	      phys_addr_t paddr, size_t size, int prot)
+-{
+-	might_sleep();
+-	return _iommu_map(domain, iova, paddr, size, prot, GFP_KERNEL);
+-}
+ EXPORT_SYMBOL_GPL(iommu_map);
+ 
+ int iommu_map_atomic(struct iommu_domain *domain, unsigned long iova,
+ 	      phys_addr_t paddr, size_t size, int prot)
+ {
+-	return _iommu_map(domain, iova, paddr, size, prot, GFP_ATOMIC);
++	return iommu_map(domain, iova, paddr, size, prot, GFP_ATOMIC);
+ }
+ EXPORT_SYMBOL_GPL(iommu_map_atomic);
+ 
+* Unmerged path drivers/iommu/iommufd/pages.c
+* Unmerged path drivers/media/platform/qcom/venus/firmware.c
+* Unmerged path drivers/net/ipa/ipa_mem.c
+diff --git a/drivers/net/wireless/ath/ath10k/snoc.c b/drivers/net/wireless/ath/ath10k/snoc.c
+index cfcb759a87de..9a82f0336d95 100644
+--- a/drivers/net/wireless/ath/ath10k/snoc.c
++++ b/drivers/net/wireless/ath/ath10k/snoc.c
+@@ -1639,7 +1639,7 @@ static int ath10k_fw_init(struct ath10k *ar)
+ 
+ 	ret = iommu_map(iommu_dom, ar_snoc->fw.fw_start_addr,
+ 			ar->msa.paddr, ar->msa.mem_size,
+-			IOMMU_READ | IOMMU_WRITE);
++			IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+ 	if (ret) {
+ 		ath10k_err(ar, "failed to map firmware region: %d\n", ret);
+ 		goto err_iommu_detach;
+diff --git a/drivers/net/wireless/ath/ath11k/ahb.c b/drivers/net/wireless/ath/ath11k/ahb.c
+index 9683f1b68c3b..e15e61255dd0 100644
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -1037,7 +1037,7 @@ static int ath11k_ahb_fw_resources_init(struct ath11k_base *ab)
+ 
+ 	ret = iommu_map(iommu_dom, ab_ahb->fw.msa_paddr,
+ 			ab_ahb->fw.msa_paddr, ab_ahb->fw.msa_size,
+-			IOMMU_READ | IOMMU_WRITE);
++			IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+ 	if (ret) {
+ 		ath11k_err(ab, "failed to map firmware region: %d\n", ret);
+ 		goto err_iommu_detach;
+@@ -1045,7 +1045,7 @@ static int ath11k_ahb_fw_resources_init(struct ath11k_base *ab)
+ 
+ 	ret = iommu_map(iommu_dom, ab_ahb->fw.ce_paddr,
+ 			ab_ahb->fw.ce_paddr, ab_ahb->fw.ce_size,
+-			IOMMU_READ | IOMMU_WRITE);
++			IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+ 	if (ret) {
+ 		ath11k_err(ab, "failed to map firmware CE region: %d\n", ret);
+ 		goto err_iommu_unmap;
+* Unmerged path drivers/remoteproc/remoteproc_core.c
+* Unmerged path drivers/vfio/vfio_iommu_type1.c
+diff --git a/drivers/vhost/vdpa.c b/drivers/vhost/vdpa.c
+index 7ff67a1871bb..bae8dd6e2804 100644
+--- a/drivers/vhost/vdpa.c
++++ b/drivers/vhost/vdpa.c
+@@ -601,7 +601,7 @@ static int vhost_vdpa_map(struct vhost_vdpa *v, u64 iova,
+ 			r = ops->set_map(vdpa, dev->iotlb);
+ 	} else {
+ 		r = iommu_map(v->domain, iova, pa, size,
+-			      perm_to_iommu_flags(perm));
++			      perm_to_iommu_flags(perm), GFP_KERNEL);
+ 	}
+ 	if (r) {
+ 		vhost_iotlb_del_range(dev->iotlb, iova, iova + size - 1);
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index 9c34b6d5e021..96b308951d2d 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -496,7 +496,7 @@ extern int iommu_sva_unbind_gpasid(struct iommu_domain *domain,
+ extern struct iommu_domain *iommu_get_domain_for_dev(struct device *dev);
+ extern struct iommu_domain *iommu_get_dma_domain(struct device *dev);
+ extern int iommu_map(struct iommu_domain *domain, unsigned long iova,
+-		     phys_addr_t paddr, size_t size, int prot);
++		     phys_addr_t paddr, size_t size, int prot, gfp_t gfp);
+ extern int iommu_map_atomic(struct iommu_domain *domain, unsigned long iova,
+ 			    phys_addr_t paddr, size_t size, int prot);
+ extern size_t iommu_unmap(struct iommu_domain *domain, unsigned long iova,
+@@ -797,7 +797,7 @@ static inline struct iommu_domain *iommu_get_domain_for_dev(struct device *dev)
+ }
+ 
+ static inline int iommu_map(struct iommu_domain *domain, unsigned long iova,
+-			    phys_addr_t paddr, size_t size, int prot)
++			    phys_addr_t paddr, size_t size, int prot, gfp_t gfp)
+ {
+ 	return -ENODEV;
+ }
