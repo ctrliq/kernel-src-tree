@@ -1,0 +1,121 @@
+wifi: mac80211: set up/tear down client vif links properly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit b2e8434f1829bb500f79b1adb80ffed2316811cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/b2e8434f.failed
+
+In station/client mode, the link data needs a bit more
+initialization and destruction than just zero-init and
+kfree() respectively, implement that.
+
+This required some shuffling of the link data handling
+in general, as we should set it up in setup and do the
+teardown in teardown, otherwise we're asymmetric in
+case of interface type changes.
+
+Also stop using kfree_rcu(), we cannot guarantee that
+nothing is scheduling things that live within the link
+(e.g. the u.mgd.request_smps_work) until we're sure it
+cannot be referenced anymore, therefore synchronize
+instead. This isn't very efficient, but we can always
+optimize it later.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit b2e8434f1829bb500f79b1adb80ffed2316811cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/iface.c
+#	net/mac80211/mlme.c
+diff --cc net/mac80211/iface.c
+index 0a38d98d9882,fbb9c9c291b9..000000000000
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@@ -956,6 -1226,22 +1161,25 @@@ static void ieee80211_set_default_queue
+  	sdata->vif.cab_queue = IEEE80211_INVAL_HW_QUEUE;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void ieee80211_sdata_init(struct ieee80211_local *local,
++ 				 struct ieee80211_sub_if_data *sdata)
++ {
++ 	sdata->local = local;
++ 
++ 	/*
++ 	 * Initialize the default link, so we can use link_id 0 for non-MLD,
++ 	 * and that continues to work for non-MLD-aware drivers that use just
++ 	 * vif.bss_conf instead of vif.link_conf.
++ 	 *
++ 	 * Note that we never change this, so if link ID 0 isn't used in an
++ 	 * MLD connection, we get a separate allocation for it.
++ 	 */
++ 	ieee80211_link_init(sdata, -1, &sdata->deflink, &sdata->vif.bss_conf);
++ }
++ 
+++>>>>>>> b2e8434f1829 (wifi: mac80211: set up/tear down client vif links properly)
+  int ieee80211_add_virtual_monitor(struct ieee80211_local *local)
+  {
+  	struct ieee80211_sub_if_data *sdata;
+diff --cc net/mac80211/mlme.c
+index 6cd411ed25d6,299381d19760..000000000000
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@@ -5012,7 -5041,6 +5011,10 @@@ void ieee80211_sta_setup_sdata(struct i
+  		  ieee80211_beacon_connection_loss_work);
+  	INIT_WORK(&ifmgd->csa_connection_drop_work,
+  		  ieee80211_csa_connection_drop_work);
+++<<<<<<< HEAD
+ +	INIT_WORK(&ifmgd->request_smps_work, ieee80211_request_smps_mgd_work);
+++=======
+++>>>>>>> b2e8434f1829 (wifi: mac80211: set up/tear down client vif links properly)
+  	INIT_DELAYED_WORK(&ifmgd->tdls_peer_del_work,
+  			  ieee80211_tdls_peer_del_work);
+  	timer_setup(&ifmgd->timer, ieee80211_sta_timer, 0);
+@@@ -5026,13 -5054,6 +5028,16 @@@
+  	ifmgd->powersave = sdata->wdev.ps;
+  	ifmgd->uapsd_queues = sdata->local->hw.uapsd_queues;
+  	ifmgd->uapsd_max_sp_len = sdata->local->hw.uapsd_max_sp_len;
+++<<<<<<< HEAD
+ +	ifmgd->p2p_noa_index = -1;
+ +
+ +	if (sdata->local->hw.wiphy->features & NL80211_FEATURE_DYNAMIC_SMPS)
+ +		ifmgd->req_smps = IEEE80211_SMPS_AUTOMATIC;
+ +	else
+ +		ifmgd->req_smps = IEEE80211_SMPS_OFF;
+ +
+++=======
+++>>>>>>> b2e8434f1829 (wifi: mac80211: set up/tear down client vif links properly)
+  	/* Setup TDLS data */
+  	spin_lock_init(&ifmgd->teardown_lock);
+  	ifmgd->teardown_skb = NULL;
+@@@ -6357,7 -6404,6 +6383,10 @@@ void ieee80211_mgd_stop(struct ieee8021
+  	 */
+  	cancel_work_sync(&ifmgd->monitor_work);
+  	cancel_work_sync(&ifmgd->beacon_connection_loss_work);
+++<<<<<<< HEAD
+ +	cancel_work_sync(&ifmgd->request_smps_work);
+++=======
+++>>>>>>> b2e8434f1829 (wifi: mac80211: set up/tear down client vif links properly)
+  	cancel_work_sync(&ifmgd->csa_connection_drop_work);
+  	cancel_work_sync(&ifmgd->chswitch_work);
+  	cancel_delayed_work_sync(&ifmgd->tdls_peer_del_work);
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 9f2fe5f6d317..b5026e437876 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1878,6 +1878,8 @@ void ieee80211_sta_restart(struct ieee80211_sub_if_data *sdata);
+ void ieee80211_sta_handle_tspec_ac_params(struct ieee80211_sub_if_data *sdata);
+ void ieee80211_sta_connection_lost(struct ieee80211_sub_if_data *sdata,
+ 				   u8 reason, bool tx);
++void ieee80211_mgd_setup_link(struct ieee80211_link_data *link);
++void ieee80211_mgd_stop_link(struct ieee80211_link_data *link);
+ 
+ /* IBSS code */
+ void ieee80211_ibss_notify_scan_completed(struct ieee80211_local *local);
+* Unmerged path net/mac80211/iface.c
+* Unmerged path net/mac80211/mlme.c
