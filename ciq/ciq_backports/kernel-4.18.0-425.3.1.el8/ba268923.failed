@@ -1,0 +1,233 @@
+arm64: entry: Add vectors that have the bhb mitigation sequences
+
+jira LE-1907
+cve CVE-2022-23960
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author James Morse <james.morse@arm.com>
+commit ba2689234be92024e5635d30fe744f4853ad97db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/ba268923.failed
+
+Some CPUs affected by Spectre-BHB need a sequence of branches, or a
+firmware call to be run before any indirect branch. This needs to go
+in the vectors. No CPU needs both.
+
+While this can be patched in, it would run on all CPUs as there is a
+single set of vectors. If only one part of a big/little combination is
+affected, the unaffected CPUs have to run the mitigation too.
+
+Create extra vectors that include the sequence. Subsequent patches will
+allow affected CPUs to select this set of vectors. Later patches will
+modify the loop count to match what the CPU requires.
+
+	Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+	Signed-off-by: James Morse <james.morse@arm.com>
+(cherry picked from commit ba2689234be92024e5635d30fe744f4853ad97db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/entry.S
+#	arch/arm64/kernel/proton-pack.c
+#	include/linux/arm-smccc.h
+diff --cc arch/arm64/kernel/entry.S
+index af24e27e2389,2ceb0c3647b4..000000000000
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@@ -834,17 -693,32 +847,29 @@@ alternative_else_nop_endi
+  	ldr	x30, =vectors
+  	.endif // \kpti == 1
+  
++ 	.if	\bhb == BHB_MITIGATION_FW
++ 	/*
++ 	 * The firmware sequence must appear before the first indirect branch.
++ 	 * i.e. the ret out of tramp_ventry. But it also needs the stack to be
++ 	 * mapped to save/restore the registers the SMC clobbers.
++ 	 */
++ 	__mitigate_spectre_bhb_fw
++ 	.endif // \bhb == BHB_MITIGATION_FW
++ 
+  	add	x30, x30, #(1b - \vector_start + 4)
+  	ret
+ -.org 1b + 128	// Did we overflow the ventry slot?
+  	.endm
+  
+  	.macro tramp_exit, regsize = 64
+  	adr	x30, tramp_vectors
++ #ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
++ 	add	x30, x30, SZ_4K
++ #endif
+  	msr	vbar_el1, x30
+ -	ldr	lr, [sp, #S_LR]
+ -	tramp_unmap_kernel	x29
+ +	tramp_unmap_kernel	x30
+  	.if	\regsize == 64
+ -	mrs	x29, far_el1
+ +	mrs	x30, far_el1
+  	.endif
+ -	add	sp, sp, #PT_REGS_SIZE		// restore sp
+  	eret
+  	sb
+  	.endm
+@@@ -861,9 -735,20 +886,23 @@@
+  	.endr
+  	.endm
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
++ /*
++  * Exception vectors trampoline.
++  * The order must match __bp_harden_el1_vectors and the
++  * arm64_bp_harden_el1_vectors enum.
++  */
++ 	.pushsection ".entry.tramp.text", "ax"
+++>>>>>>> ba2689234be9 (arm64: entry: Add vectors that have the bhb mitigation sequences)
+  	.align	11
+  SYM_CODE_START_NOALIGN(tramp_vectors)
+- 	generate_tramp_vector	kpti=1
++ #ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
++ 	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_LOOP
++ 	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_FW
++ #endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
++ 	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_NONE
+  SYM_CODE_END(tramp_vectors)
+  
+  SYM_CODE_START(tramp_exit_native)
+diff --cc include/linux/arm-smccc.h
+index 413526e0315b,220c8c60e021..000000000000
+--- a/include/linux/arm-smccc.h
++++ b/include/linux/arm-smccc.h
+@@@ -96,8 -92,52 +96,40 @@@
+  			   ARM_SMCCC_SMC_32,				\
+  			   0, 0x7fff)
+  
+++<<<<<<< HEAD
+++=======
++ #define ARM_SMCCC_ARCH_WORKAROUND_3					\
++ 	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
++ 			   ARM_SMCCC_SMC_32,				\
++ 			   0, 0x3fff)
++ 
++ #define ARM_SMCCC_VENDOR_HYP_CALL_UID_FUNC_ID				\
++ 	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
++ 			   ARM_SMCCC_SMC_32,				\
++ 			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
++ 			   ARM_SMCCC_FUNC_QUERY_CALL_UID)
++ 
++ /* KVM UID value: 28b46fb6-2ec5-11e9-a9ca-4b564d003a74 */
++ #define ARM_SMCCC_VENDOR_HYP_UID_KVM_REG_0	0xb66fb428U
++ #define ARM_SMCCC_VENDOR_HYP_UID_KVM_REG_1	0xe911c52eU
++ #define ARM_SMCCC_VENDOR_HYP_UID_KVM_REG_2	0x564bcaa9U
++ #define ARM_SMCCC_VENDOR_HYP_UID_KVM_REG_3	0x743a004dU
++ 
++ /* KVM "vendor specific" services */
++ #define ARM_SMCCC_KVM_FUNC_FEATURES		0
++ #define ARM_SMCCC_KVM_FUNC_PTP			1
++ #define ARM_SMCCC_KVM_FUNC_FEATURES_2		127
++ #define ARM_SMCCC_KVM_NUM_FUNCS			128
++ 
++ #define ARM_SMCCC_VENDOR_HYP_KVM_FEATURES_FUNC_ID			\
++ 	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
++ 			   ARM_SMCCC_SMC_32,				\
++ 			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
++ 			   ARM_SMCCC_KVM_FUNC_FEATURES)
++ 
+++>>>>>>> ba2689234be9 (arm64: entry: Add vectors that have the bhb mitigation sequences)
+  #define SMCCC_ARCH_WORKAROUND_RET_UNAFFECTED	1
+  
+ -/*
+ - * ptp_kvm is a feature used for time sync between vm and host.
+ - * ptp_kvm module in guest kernel will get service from host using
+ - * this hypercall ID.
+ - */
+ -#define ARM_SMCCC_VENDOR_HYP_KVM_PTP_FUNC_ID				\
+ -	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
+ -			   ARM_SMCCC_SMC_32,				\
+ -			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
+ -			   ARM_SMCCC_KVM_FUNC_PTP)
+ -
+ -/* ptp_kvm counter type ID */
+ -#define KVM_PTP_VIRT_COUNTER			0
+ -#define KVM_PTP_PHYS_COUNTER			1
+ -
+  /* Paravirtualised time calls (defined by ARM DEN0057A) */
+  #define ARM_SMCCC_HV_PV_TIME_FEATURES				\
+  	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,			\
+* Unmerged path arch/arm64/kernel/proton-pack.c
+diff --git a/arch/arm64/include/asm/assembler.h b/arch/arm64/include/asm/assembler.h
+index 0e63a57c6a05..d14f7a41287a 100644
+--- a/arch/arm64/include/asm/assembler.h
++++ b/arch/arm64/include/asm/assembler.h
+@@ -747,4 +747,28 @@ USER(\label, ic	ivau, \tmp2)			// invalidate I line PoU
+ .Lyield_out_\@ :
+ 	.endm
+ 
++	.macro __mitigate_spectre_bhb_loop      tmp
++#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
++	mov	\tmp, #32
++.Lspectre_bhb_loop\@:
++	b	. + 4
++	subs	\tmp, \tmp, #1
++	b.ne	.Lspectre_bhb_loop\@
++	sb
++#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
++	.endm
++
++	/* Save/restores x0-x3 to the stack */
++	.macro __mitigate_spectre_bhb_fw
++#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
++	stp	x0, x1, [sp, #-16]!
++	stp	x2, x3, [sp, #-16]!
++	mov	w0, #ARM_SMCCC_ARCH_WORKAROUND_3
++alternative_cb	smccc_patch_fw_mitigation_conduit
++	nop					// Patched to SMC/HVC #0
++alternative_cb_end
++	ldp	x2, x3, [sp], #16
++	ldp	x0, x1, [sp], #16
++#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
++	.endm
+ #endif	/* __ASM_ASSEMBLER_H */
+diff --git a/arch/arm64/include/asm/vectors.h b/arch/arm64/include/asm/vectors.h
+new file mode 100644
+index 000000000000..bac53fad037d
+--- /dev/null
++++ b/arch/arm64/include/asm/vectors.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) 2022 ARM Ltd.
++ */
++#ifndef __ASM_VECTORS_H
++#define __ASM_VECTORS_H
++
++/*
++ * Note: the order of this enum corresponds to two arrays in entry.S:
++ * tramp_vecs and __bp_harden_el1_vectors. By default the canonical
++ * 'full fat' vectors are used directly.
++ */
++enum arm64_bp_harden_el1_vectors {
++#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
++	/*
++	 * Perform the BHB loop mitigation, before branching to the canonical
++	 * vectors.
++	 */
++	EL1_VECTOR_BHB_LOOP,
++
++	/*
++	 * Make the SMC call for firmware mitigation, before branching to the
++	 * canonical vectors.
++	 */
++	EL1_VECTOR_BHB_FW,
++#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
++
++	/*
++	 * Remap the kernel before branching to the canonical vectors.
++	 */
++	EL1_VECTOR_KPTI,
+++};
++
++#endif /* __ASM_VECTORS_H */
+* Unmerged path arch/arm64/kernel/entry.S
+* Unmerged path arch/arm64/kernel/proton-pack.c
+* Unmerged path include/linux/arm-smccc.h
