@@ -1,0 +1,266 @@
+net/mlx5: Remove indirection in TLS build
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Leon Romanovsky <leonro@nvidia.com>
+commit 691f17b980d028e74ae168ef9e5be7d6021dbf23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/691f17b9.failed
+
+The dream described in the commit 1ae173228489 ("net/mlx5: Accel, Add TLS
+tx offload interface") never came true, even an opposite happened when FPGA
+TLS support was dropped. Such removal revealed the problematic flow in the
+build process: build of unrelated files in case of TLS or IPsec are enabled.
+
+In both cases, the MLX5_ACCEL is enabled, which built both TLS and IPsec.
+As a solution, simply merge MLX5_TLS and MLX5_EN_TLS options and move TLS
+related files to the eth part of the mlx5_core.
+
+Link: https://lore.kernel.org/r/0d1ea8cdc3a15922640b8b764d2bdb8f587b52c2.1649073691.git.leonro@nvidia.com
+	Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+	Reviewed-by: Saeed Mahameed <saeedm@nvidia.com>
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+(cherry picked from commit 691f17b980d028e74ae168ef9e5be7d6021dbf23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/Kconfig
+#	drivers/net/ethernet/mellanox/mlx5/core/Makefile
+#	drivers/net/ethernet/mellanox/mlx5/core/accel/tls.c
+#	drivers/net/ethernet/mellanox/mlx5/core/accel/tls.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/Kconfig
+index ebe13db50593,0c82b376416b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Kconfig
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Kconfig
+@@@ -176,21 -177,7 +176,25 @@@ config MLX5_EN_IPSE
+  	  Note: Support for hardware with this capability needs to be selected
+  	  for this option to become available.
+  
+++<<<<<<< HEAD
+ +config MLX5_FPGA_TLS
+ +	bool "Mellanox Technologies TLS Innova support"
+ +	depends on TLS_DEVICE
+ +	depends on TLS=y || MLX5_CORE=m
+ +	depends on MLX5_CORE_EN
+ +	depends on MLX5_FPGA
+ +	select MLX5_EN_TLS
+ +	help
+ +	Build TLS support for the Innova family of network cards by Mellanox
+ +	Technologies. Innova network cards are comprised of a ConnectX chip
+ +	and an FPGA chip on one board. If you select this option, the
+ +	mlx5_core driver will include the Innova FPGA core and allow building
+ +	sandbox-specific client drivers.
+ +
+ +config MLX5_TLS
+++=======
++ config MLX5_EN_TLS
+++>>>>>>> 691f17b980d0 (net/mlx5: Remove indirection in TLS build)
+  	bool "Mellanox Technologies TLS Connect-X support"
+  	depends on TLS_DEVICE
+  	depends on TLS=y || MLX5_CORE=m
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/Makefile
+index 4bc666714a35,b7e3bcb5e6c7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Makefile
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Makefile
+@@@ -90,8 -90,7 +90,12 @@@ mlx5_core-$(CONFIG_MLX5_CORE_IPOIB) += 
+  #
+  mlx5_core-$(CONFIG_MLX5_IPSEC) += accel/ipsec_offload.o
+  mlx5_core-$(CONFIG_MLX5_FPGA_IPSEC) += fpga/ipsec.o
+++<<<<<<< HEAD
+ +mlx5_core-$(CONFIG_MLX5_FPGA_TLS)   += fpga/tls.o
+ +mlx5_core-$(CONFIG_MLX5_ACCEL)      += lib/crypto.o accel/tls.o accel/ipsec.o
+++=======
++ mlx5_core-$(CONFIG_MLX5_ACCEL)      += lib/crypto.o accel/ipsec.o
+++>>>>>>> 691f17b980d0 (net/mlx5: Remove indirection in TLS build)
+  
+  mlx5_core-$(CONFIG_MLX5_FPGA) += fpga/cmd.o fpga/core.o fpga/conn.o fpga/sdk.o
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/accel/tls.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/accel/tls.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/Kconfig
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/Makefile
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/accel/tls.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/accel/tls.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.c b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.c
+index d93aadbf10da..160aa44bcece 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.c
+@@ -2,11 +2,50 @@
+ // Copyright (c) 2019 Mellanox Technologies.
+ 
+ #include "en.h"
++#include "lib/mlx5.h"
+ #include "en_accel/tls.h"
+ #include "en_accel/ktls.h"
+ #include "en_accel/ktls_utils.h"
+ #include "en_accel/fs_tcp.h"
+ 
++int mlx5_ktls_create_key(struct mlx5_core_dev *mdev,
++			 struct tls_crypto_info *crypto_info,
++			 u32 *p_key_id)
++{
++	u32 sz_bytes;
++	void *key;
++
++	switch (crypto_info->cipher_type) {
++	case TLS_CIPHER_AES_GCM_128: {
++		struct tls12_crypto_info_aes_gcm_128 *info =
++			(struct tls12_crypto_info_aes_gcm_128 *)crypto_info;
++
++		key      = info->key;
++		sz_bytes = sizeof(info->key);
++		break;
++	}
++	case TLS_CIPHER_AES_GCM_256: {
++		struct tls12_crypto_info_aes_gcm_256 *info =
++			(struct tls12_crypto_info_aes_gcm_256 *)crypto_info;
++
++		key      = info->key;
++		sz_bytes = sizeof(info->key);
++		break;
++	}
++	default:
++		return -EINVAL;
++	}
++
++	return mlx5_create_encryption_key(mdev, key, sz_bytes,
++					  MLX5_ACCEL_OBJ_TLS_KEY,
++					  p_key_id);
++}
++
++void mlx5_ktls_destroy_key(struct mlx5_core_dev *mdev, u32 key_id)
++{
++	mlx5_destroy_encryption_key(mdev, key_id);
++}
++
+ static int mlx5e_ktls_add(struct net_device *netdev, struct sock *sk,
+ 			  enum tls_offload_ctx_dir direction,
+ 			  struct tls_crypto_info *crypto_info,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.h b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.h
+index 5833deb2354c..82259d25a516 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls.h
+@@ -4,9 +4,38 @@
+ #ifndef __MLX5E_KTLS_H__
+ #define __MLX5E_KTLS_H__
+ 
++#include <linux/tls.h>
+ #include "en.h"
+ 
+ #ifdef CONFIG_MLX5_EN_TLS
++int mlx5_ktls_create_key(struct mlx5_core_dev *mdev,
++			 struct tls_crypto_info *crypto_info,
++			 u32 *p_key_id);
++void mlx5_ktls_destroy_key(struct mlx5_core_dev *mdev, u32 key_id);
++
++static inline bool mlx5_accel_is_ktls_device(struct mlx5_core_dev *mdev)
++{
++	if (!MLX5_CAP_GEN(mdev, tls_tx) && !MLX5_CAP_GEN(mdev, tls_rx))
++		return false;
++
++	if (!MLX5_CAP_GEN(mdev, log_max_dek))
++		return false;
++
++	return MLX5_CAP_TLS(mdev, tls_1_2_aes_gcm_128);
++}
++
++static inline bool mlx5e_ktls_type_check(struct mlx5_core_dev *mdev,
++					 struct tls_crypto_info *crypto_info)
++{
++	switch (crypto_info->cipher_type) {
++	case TLS_CIPHER_AES_GCM_128:
++		if (crypto_info->version == TLS_1_2_VERSION)
++			return MLX5_CAP_TLS(mdev,  tls_1_2_aes_gcm_128);
++		break;
++	}
++
++	return false;
++}
+ 
+ void mlx5e_ktls_build_netdev(struct mlx5e_priv *priv);
+ int mlx5e_ktls_init_rx(struct mlx5e_priv *priv);
+@@ -18,14 +47,12 @@ void mlx5e_ktls_rx_resync_destroy_resp_list(struct mlx5e_ktls_resync_resp *resp_
+ 
+ static inline bool mlx5e_accel_is_ktls_tx(struct mlx5_core_dev *mdev)
+ {
+-	return !is_kdump_kernel() &&
+-		mlx5_accel_is_ktls_tx(mdev);
++	return !is_kdump_kernel() && MLX5_CAP_GEN(mdev, tls_tx);
+ }
+ 
+ static inline bool mlx5e_accel_is_ktls_rx(struct mlx5_core_dev *mdev)
+ {
+-	return !is_kdump_kernel() &&
+-		mlx5_accel_is_ktls_rx(mdev);
++	return !is_kdump_kernel() && MLX5_CAP_GEN(mdev, tls_rx);
+ }
+ 
+ static inline bool mlx5e_accel_is_ktls_device(struct mlx5_core_dev *mdev)
+@@ -35,6 +62,18 @@ static inline bool mlx5e_accel_is_ktls_device(struct mlx5_core_dev *mdev)
+ }
+ 
+ #else
++static inline int
++mlx5_ktls_create_key(struct mlx5_core_dev *mdev,
++		     struct tls_crypto_info *crypto_info,
++		     u32 *p_key_id) { return -EOPNOTSUPP; }
++static inline void
++mlx5_ktls_destroy_key(struct mlx5_core_dev *mdev, u32 key_id) {}
++
++static inline bool
++mlx5_accel_is_ktls_device(struct mlx5_core_dev *mdev) { return false; }
++static inline bool
++mlx5e_ktls_type_check(struct mlx5_core_dev *mdev,
++		      struct tls_crypto_info *crypto_info) { return false; }
+ 
+ static inline void mlx5e_ktls_build_netdev(struct mlx5e_priv *priv)
+ {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_utils.h b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_utils.h
+index e5c180f2403b..0dc715c4c10d 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_utils.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_utils.h
+@@ -6,7 +6,6 @@
+ 
+ #include <net/tls.h>
+ #include "en.h"
+-#include "accel/tls.h"
+ 
+ enum {
+ 	MLX5E_TLS_PROGRESS_PARAMS_AUTH_STATE_NO_OFFLOAD     = 0,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.c b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.c
+index b8fc863aa68d..7d2f45500269 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.c
+@@ -34,7 +34,6 @@
+ #include <linux/netdevice.h>
+ #include <net/ipv6.h>
+ #include "en_accel/tls.h"
+-#include "accel/tls.h"
+ 
+ static void mlx5e_tls_set_ipv4_flow(void *flow, struct sock *sk)
+ {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.h b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.h
+index 62ecf14bf86a..e1dc55910175 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.h
+@@ -33,7 +33,6 @@
+ #ifndef __MLX5E_TLS_H__
+ #define __MLX5E_TLS_H__
+ 
+-#include "accel/tls.h"
+ #include "en_accel/ktls.h"
+ 
+ #ifdef CONFIG_MLX5_EN_TLS
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 22f111312bee..4b9a893f176e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -49,7 +49,6 @@
+ #include "en_accel/en_accel.h"
+ #include "en_accel/tls.h"
+ #include "accel/ipsec.h"
+-#include "accel/tls.h"
+ #include "lib/vxlan.h"
+ #include "lib/clock.h"
+ #include "en/port.h"
