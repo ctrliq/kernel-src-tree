@@ -1,0 +1,228 @@
+objtool: Better handle IRET
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit b746046238bb99b8f703c79f6d95357428fb6476
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/b7460462.failed
+
+Teach objtool a little more about IRET so that we can avoid using the
+SAVE/RESTORE annotation. In particular, make the weird corner case in
+insn->restore go away.
+
+The purpose of that corner case is to deal with the fact that
+UNWIND_HINT_RESTORE lands on the instruction after IRET, but that
+instruction can end up being outside the basic block, consider:
+
+	if (cond)
+		sync_core()
+	foo();
+
+Then the hint will land on foo(), and we'll encounter the restore
+hint without ever having seen the save hint.
+
+By teaching objtool about the arch specific exception frame size, and
+assuming that any IRET in an STT_FUNC symbol is an exception frame
+sized POP, we can remove the use of save/restore hints for this code.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Miroslav Benes <mbenes@suse.cz>
+	Reviewed-by: Alexandre Chartre <alexandre.chartre@oracle.com>
+	Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Link: https://lkml.kernel.org/r/20200416115118.631224674@infradead.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit b746046238bb99b8f703c79f6d95357428fb6476)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/processor.h
+diff --cc arch/x86/include/asm/processor.h
+index 190ba9825ba1,3eeaaeb75638..000000000000
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@@ -663,6 -677,70 +663,73 @@@ static inline unsigned int cpuid_edx(un
+  	return edx;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * This function forces the icache and prefetched instruction stream to
++  * catch up with reality in two very specific cases:
++  *
++  *  a) Text was modified using one virtual address and is about to be executed
++  *     from the same physical page at a different virtual address.
++  *
++  *  b) Text was modified on a different CPU, may subsequently be
++  *     executed on this CPU, and you want to make sure the new version
++  *     gets executed.  This generally means you're calling this in a IPI.
++  *
++  * If you're calling this for a different reason, you're probably doing
++  * it wrong.
++  */
++ static inline void sync_core(void)
++ {
++ 	/*
++ 	 * There are quite a few ways to do this.  IRET-to-self is nice
++ 	 * because it works on every CPU, at any CPL (so it's compatible
++ 	 * with paravirtualization), and it never exits to a hypervisor.
++ 	 * The only down sides are that it's a bit slow (it seems to be
++ 	 * a bit more than 2x slower than the fastest options) and that
++ 	 * it unmasks NMIs.  The "push %cs" is needed because, in
++ 	 * paravirtual environments, __KERNEL_CS may not be a valid CS
++ 	 * value when we do IRET directly.
++ 	 *
++ 	 * In case NMI unmasking or performance ever becomes a problem,
++ 	 * the next best option appears to be MOV-to-CR2 and an
++ 	 * unconditional jump.  That sequence also works on all CPUs,
++ 	 * but it will fault at CPL3 (i.e. Xen PV).
++ 	 *
++ 	 * CPUID is the conventional way, but it's nasty: it doesn't
++ 	 * exist on some 486-like CPUs, and it usually exits to a
++ 	 * hypervisor.
++ 	 *
++ 	 * Like all of Linux's memory ordering operations, this is a
++ 	 * compiler barrier as well.
++ 	 */
++ #ifdef CONFIG_X86_32
++ 	asm volatile (
++ 		"pushfl\n\t"
++ 		"pushl %%cs\n\t"
++ 		"pushl $1f\n\t"
++ 		"iret\n\t"
++ 		"1:"
++ 		: ASM_CALL_CONSTRAINT : : "memory");
++ #else
++ 	unsigned int tmp;
++ 
++ 	asm volatile (
++ 		"mov %%ss, %0\n\t"
++ 		"pushq %q0\n\t"
++ 		"pushq %%rsp\n\t"
++ 		"addq $8, (%%rsp)\n\t"
++ 		"pushfq\n\t"
++ 		"mov %%cs, %0\n\t"
++ 		"pushq %q0\n\t"
++ 		"pushq $1f\n\t"
++ 		"iretq\n\t"
++ 		"1:"
++ 		: "=&r" (tmp), ASM_CALL_CONSTRAINT : : "cc", "memory");
++ #endif
++ }
++ 
+++>>>>>>> b746046238bb (objtool: Better handle IRET)
+  extern void select_idle_routine(const struct cpuinfo_x86 *c);
+  extern void amd_e400_c1e_apic_setup(void);
+  
+* Unmerged path arch/x86/include/asm/processor.h
+diff --git a/tools/objtool/arch.h b/tools/objtool/arch.h
+index 4e1337045c9f..f0bfbfd225e4 100644
+--- a/tools/objtool/arch.h
++++ b/tools/objtool/arch.h
+@@ -30,6 +30,7 @@ enum insn_type {
+ 	INSN_CALL,
+ 	INSN_CALL_DYNAMIC,
+ 	INSN_RETURN,
++	INSN_EXCEPTION_RETURN,
+ 	INSN_CONTEXT_SWITCH,
+ 	INSN_STACK,
+ 	INSN_BUG,
+diff --git a/tools/objtool/arch/x86/decode.c b/tools/objtool/arch/x86/decode.c
+index 5a300ab584c8..520c98629b3c 100644
+--- a/tools/objtool/arch/x86/decode.c
++++ b/tools/objtool/arch/x86/decode.c
+@@ -447,9 +447,19 @@ int arch_decode_instruction(struct elf *elf, struct section *sec,
+ 		*type = INSN_RETURN;
+ 		break;
+ 
++	case 0xcf: /* iret */
++		*type = INSN_EXCEPTION_RETURN;
++
++		/* add $40, %rsp */
++		op->src.type = OP_SRC_ADD;
++		op->src.reg = CFI_SP;
++		op->src.offset = 5*8;
++		op->dest.type = OP_DEST_REG;
++		op->dest.reg = CFI_SP;
++		break;
++
+ 	case 0xca: /* retf */
+ 	case 0xcb: /* retf */
+-	case 0xcf: /* iret */
+ 		*type = INSN_CONTEXT_SWITCH;
+ 		break;
+ 
+@@ -495,7 +505,7 @@ int arch_decode_instruction(struct elf *elf, struct section *sec,
+ 
+ 	*immediate = insn.immediate.nbytes ? insn.immediate.value : 0;
+ 
+-	if (*type == INSN_STACK)
++	if (*type == INSN_STACK || *type == INSN_EXCEPTION_RETURN)
+ 		list_add_tail(&op->list, ops_list);
+ 	else
+ 		free(op);
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 0030956ed555..25ea9cbc01e4 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -2031,14 +2031,13 @@ static int validate_return(struct symbol *func, struct instruction *insn, struct
+  * tools/objtool/Documentation/stack-validation.txt.
+  */
+ static int validate_branch(struct objtool_file *file, struct symbol *func,
+-			   struct instruction *first, struct insn_state state)
++			   struct instruction *insn, struct insn_state state)
+ {
+ 	struct alternative *alt;
+-	struct instruction *insn, *next_insn;
++	struct instruction *next_insn;
+ 	struct section *sec;
+ 	int ret;
+ 
+-	insn = first;
+ 	sec = insn->sec;
+ 
+ 	if (insn->alt_group && list_empty(&insn->alts)) {
+@@ -2091,16 +2090,6 @@ static int validate_branch(struct objtool_file *file, struct symbol *func,
+ 				}
+ 
+ 				if (!save_insn->visited) {
+-					/*
+-					 * Oops, no state to copy yet.
+-					 * Hopefully we can reach this
+-					 * instruction from another branch
+-					 * after the save insn has been
+-					 * visited.
+-					 */
+-					if (insn == first)
+-						return 0;
+-
+ 					WARN_FUNC("objtool isn't smart enough to handle this CFI save/restore combo",
+ 						  sec, insn->offset);
+ 					return 1;
+@@ -2197,6 +2186,20 @@ static int validate_branch(struct objtool_file *file, struct symbol *func,
+ 
+ 			return 0;
+ 
++		case INSN_EXCEPTION_RETURN:
++			if (handle_insn_ops(insn, &state))
++				return 1;
++
++			/*
++			 * This handles x86's sync_core() case, where we use an
++			 * IRET to self. All 'normal' IRET instructions are in
++			 * STT_NOTYPE entry symbols.
++			 */
++			if (func)
++				break;
++
++			return 0;
++
+ 		case INSN_CONTEXT_SWITCH:
+ 			if (func && (!next_insn || !next_insn->hint)) {
+ 				WARN_FUNC("unsupported instruction in callable function",
