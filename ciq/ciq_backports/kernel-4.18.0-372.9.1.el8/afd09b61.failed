@@ -1,0 +1,78 @@
+ext4: fix memory leak in ext4_fill_super
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Alexey Makhalov <amakhalov@vmware.com>
+commit afd09b617db3786b6ef3dc43e28fe728cfea84df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/afd09b61.failed
+
+Buffer head references must be released before calling kill_bdev();
+otherwise the buffer head (and its page referenced by b_data) will not
+be freed by kill_bdev, and subsequently that bh will be leaked.
+
+If blocksizes differ, sb_set_blocksize() will kill current buffers and
+page cache by using kill_bdev(). And then super block will be reread
+again but using correct blocksize this time. sb_set_blocksize() didn't
+fully free superblock page and buffer head, and being busy, they were
+not freed and instead leaked.
+
+This can easily be reproduced by calling an infinite loop of:
+
+  systemctl start <ext4_on_lvm>.mount, and
+  systemctl stop <ext4_on_lvm>.mount
+
+... since systemd creates a cgroup for each slice which it mounts, and
+the bh leak get amplified by a dying memory cgroup that also never
+gets freed, and memory consumption is much more easily noticed.
+
+Fixes: ce40733ce93d ("ext4: Check for return value from sb_set_blocksize")
+Fixes: ac27a0ec112a ("ext4: initial copy of files from ext3")
+Link: https://lore.kernel.org/r/20210521075533.95732-1-amakhalov@vmware.com
+	Signed-off-by: Alexey Makhalov <amakhalov@vmware.com>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+	Cc: stable@kernel.org
+(cherry picked from commit afd09b617db3786b6ef3dc43e28fe728cfea84df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/super.c
+diff --cc fs/ext4/super.c
+index 338507562b31,f66c7301b53a..000000000000
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@@ -4116,13 -4476,14 +4123,12 @@@ static int ext4_fill_super(struct super
+  			goto failed_mount;
+  		}
+  
+- 		brelse(bh);
+  		logical_sb_block = sb_block * EXT4_MIN_BLOCK_SIZE;
+  		offset = do_div(logical_sb_block, blocksize);
+ -		bh = ext4_sb_bread_unmovable(sb, logical_sb_block);
+ -		if (IS_ERR(bh)) {
+ +		bh = sb_bread_unmovable(sb, logical_sb_block);
+ +		if (!bh) {
+  			ext4_msg(sb, KERN_ERR,
+  			       "Can't read superblock on 2nd try");
+ -			ret = PTR_ERR(bh);
+ -			bh = NULL;
+  			goto failed_mount;
+  		}
+  		es = (struct ext4_super_block *)(bh->b_data + offset);
+@@@ -4777,8 -5207,10 +4783,14 @@@ failed_mount
+  	for (i = 0; i < EXT4_MAXQUOTAS; i++)
+  		kfree(get_qf_name(sb, sbi, i));
+  #endif
+++<<<<<<< HEAD
+ +	ext4_blkdev_remove(sbi);
+++=======
++ 	fscrypt_free_dummy_policy(&sbi->s_dummy_enc_policy);
++ 	/* ext4_blkdev_remove() calls kill_bdev(), release bh before it. */
+++>>>>>>> afd09b617db3 (ext4: fix memory leak in ext4_fill_super)
+  	brelse(bh);
++ 	ext4_blkdev_remove(sbi);
+  out_fail:
+  	sb->s_fs_info = NULL;
+  	kfree(sbi->s_blockgroup_lock);
+* Unmerged path fs/ext4/super.c
