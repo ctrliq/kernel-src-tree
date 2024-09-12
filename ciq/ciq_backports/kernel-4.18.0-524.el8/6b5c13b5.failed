@@ -1,0 +1,75 @@
+s390/ism: Fix locking for forwarding of IRQs and events to clients
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-524.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 6b5c13b591d753c6022fbd12f8c0c0a9a07fc065
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-524.el8/6b5c13b5.failed
+
+The clients array references all registered clients and is protected by
+the clients_lock. Besides its use as general list of clients the clients
+array is accessed in ism_handle_irq() to forward ISM device events to
+clients.
+
+While the clients_lock is taken in the IRQ handler when calling
+handle_event() it is however incorrectly not held during the
+client->handle_irq() call and for the preceding clients[] access leaving
+it unprotected against concurrent client (un-)registration.
+
+Furthermore the accesses to ism->sba_client_arr[] in ism_register_dmb()
+and ism_unregister_dmb() are not protected by any lock. This is
+especially problematic as the client ID from the ism->sba_client_arr[]
+is not checked against NO_CLIENT and neither is the client pointer
+checked.
+
+Instead of expanding the use of the clients_lock further add a separate
+array in struct ism_dev which references clients subscribed to the
+device's events and IRQs. This array is protected by ism->lock which is
+already taken in ism_handle_irq() and can be taken outside the IRQ
+handler when adding/removing subscribers or the accessing
+ism->sba_client_arr[]. This also means that the clients_lock is no
+longer taken in IRQ context.
+
+Fixes: 89e7d2ba61b7 ("net/ism: Add new API for client registration")
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Reviewed-by: Alexandra Winter <wintera@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6b5c13b591d753c6022fbd12f8c0c0a9a07fc065)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/ism_drv.c
+diff --cc drivers/s390/net/ism_drv.c
+index f5bfc50915ca,b664e4a08645..000000000000
+--- a/drivers/s390/net/ism_drv.c
++++ b/drivers/s390/net/ism_drv.c
+@@@ -93,7 -102,10 +103,14 @@@ int ism_unregister_client(struct ism_cl
+  		max_client--;
+  	spin_unlock_irqrestore(&clients_lock, flags);
+  	list_for_each_entry(ism, &ism_dev_list.list, list) {
+++<<<<<<< HEAD
+ +		for (i = 0; i < ISM_NR_DMBS; ++i) {
+++=======
++ 		spin_lock_irqsave(&ism->lock, flags);
++ 		/* Stop forwarding IRQs and events */
++ 		ism->subs[client->id] = NULL;
++ 		for (int i = 0; i < ISM_NR_DMBS; ++i) {
+++>>>>>>> 6b5c13b591d7 (s390/ism: Fix locking for forwarding of IRQs and events to clients)
+  			if (ism->sba_client_arr[i] == client->id) {
+  				pr_err("%s: attempt to unregister client '%s'"
+  				       "with registered dmb(s)\n", __func__,
+* Unmerged path drivers/s390/net/ism_drv.c
+diff --git a/include/linux/ism.h b/include/linux/ism.h
+index ea2bcdae7401..5160d47e5ea9 100644
+--- a/include/linux/ism.h
++++ b/include/linux/ism.h
+@@ -44,6 +44,7 @@ struct ism_dev {
+ 	u64 local_gid;
+ 	int ieq_idx;
+ 
++	struct ism_client *subs[MAX_CLIENTS];
+ 	atomic_t free_clients_cnt;
+ 	atomic_t add_dev_cnt;
+ 	wait_queue_head_t waitq;
