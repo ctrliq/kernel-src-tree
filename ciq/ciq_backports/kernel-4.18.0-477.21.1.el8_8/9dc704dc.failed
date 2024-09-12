@@ -1,0 +1,143 @@
+scsi: aacraid: Reply queue mapping to CPUs based on IRQ affinity
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-477.21.1.el8_8
+commit-author Sagar Biradar <sagar.biradar@microchip.com>
+commit 9dc704dcc09eae7d21b5da0615eb2ed79278f63e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-477.21.1.el8_8/9dc704dc.failed
+
+Fix the I/O hang that arises because of the MSIx vector not having a mapped
+online CPU upon receiving completion.
+
+SCSI cmds take the blk_mq route, which is setup during init. Reserved cmds
+fetch the vector_no from mq_map after init is complete. Before init, they
+have to use 0 - as per the norm.
+
+	Reviewed-by: Gilbert Wu <gilbert.wu@microchip.com>
+	Signed-off-by: Sagar Biradar <Sagar.Biradar@microchip.com>
+	Reviewed-by: John Garry <john.g.garry@oracle.com>
+Link: https://lore.kernel.org/r/20230519230834.27436-1-sagar.biradar@microchip.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 9dc704dcc09eae7d21b5da0615eb2ed79278f63e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/aacraid/aacraid.h
+#	drivers/scsi/aacraid/commsup.c
+#	drivers/scsi/aacraid/linit.c
+diff --cc drivers/scsi/aacraid/aacraid.h
+index 29bf1e60f542,7c6efde75da6..000000000000
+--- a/drivers/scsi/aacraid/aacraid.h
++++ b/drivers/scsi/aacraid/aacraid.h
+@@@ -1686,6 -1677,8 +1686,11 @@@ struct aac_de
+  	u8			adapter_shutdown;
+  	u32			handle_pci_error;
+  	bool			init_reset;
+++<<<<<<< HEAD
+++=======
++ 	u8			soft_reset_support;
++ 	u8			use_map_queue;
+++>>>>>>> 9dc704dcc09e (scsi: aacraid: Reply queue mapping to CPUs based on IRQ affinity)
+  };
+  
+  #define aac_adapter_interrupt(dev) \
+diff --cc drivers/scsi/aacraid/commsup.c
+index d62ddd63f4fe,3f062e4013ab..000000000000
+--- a/drivers/scsi/aacraid/commsup.c
++++ b/drivers/scsi/aacraid/commsup.c
+@@@ -237,8 -223,12 +237,16 @@@ int aac_fib_setup(struct aac_dev * dev
+  struct fib *aac_fib_alloc_tag(struct aac_dev *dev, struct scsi_cmnd *scmd)
+  {
+  	struct fib *fibptr;
++ 	u32 blk_tag;
++ 	int i;
+  
+++<<<<<<< HEAD
+ +	fibptr = &dev->fibs[scmd->request->tag];
+++=======
++ 	blk_tag = blk_mq_unique_tag(scsi_cmd_to_rq(scmd));
++ 	i = blk_mq_unique_tag_to_tag(blk_tag);
++ 	fibptr = &dev->fibs[i];
+++>>>>>>> 9dc704dcc09e (scsi: aacraid: Reply queue mapping to CPUs based on IRQ affinity)
+  	/*
+  	 *	Null out fields that depend on being zero at the start of
+  	 *	each I/O
+diff --cc drivers/scsi/aacraid/linit.c
+index e898f8ee874d,c4a36c0be527..000000000000
+--- a/drivers/scsi/aacraid/linit.c
++++ b/drivers/scsi/aacraid/linit.c
+@@@ -1679,10 -1496,11 +1689,11 @@@ static struct scsi_host_template aac_dr
+  #endif
+  	.queuecommand			= aac_queuecommand,
+  	.bios_param			= aac_biosparm,
+ -	.shost_groups			= aac_host_groups,
+ +	.shost_attrs			= aac_attrs,
+  	.slave_configure		= aac_slave_configure,
++ 	.map_queues			= aac_map_queues,
+  	.change_queue_depth		= aac_change_queue_depth,
+ -	.sdev_groups			= aac_dev_groups,
+ +	.sdev_attrs			= aac_dev_attrs,
+  	.eh_abort_handler		= aac_eh_abort,
+  	.eh_device_reset_handler	= aac_eh_dev_reset,
+  	.eh_target_reset_handler	= aac_eh_target_reset,
+@@@ -2108,7 -1918,8 +2121,12 @@@ static void aac_remove_one(struct pci_d
+  	struct Scsi_Host *shost = pci_get_drvdata(pdev);
+  	struct aac_dev *aac = (struct aac_dev *)shost->hostdata;
+  
+++<<<<<<< HEAD
+ +	aac_cancel_safw_rescan_worker(aac);
+++=======
++ 	aac_cancel_rescan_worker(aac);
++ 	aac->use_map_queue = false;
+++>>>>>>> 9dc704dcc09e (scsi: aacraid: Reply queue mapping to CPUs based on IRQ affinity)
+  	scsi_remove_host(shost);
+  
+  	__aac_shutdown(aac);
+* Unmerged path drivers/scsi/aacraid/aacraid.h
+* Unmerged path drivers/scsi/aacraid/commsup.c
+* Unmerged path drivers/scsi/aacraid/linit.c
+diff --git a/drivers/scsi/aacraid/src.c b/drivers/scsi/aacraid/src.c
+index 4ebb35a29caa..c83228d78de9 100644
+--- a/drivers/scsi/aacraid/src.c
++++ b/drivers/scsi/aacraid/src.c
+@@ -496,6 +496,10 @@ static int aac_src_deliver_message(struct fib *fib)
+ #endif
+ 
+ 	u16 vector_no;
++	struct scsi_cmnd *scmd;
++	u32 blk_tag;
++	struct Scsi_Host *shost = dev->scsi_host_ptr;
++	struct blk_mq_queue_map *qmap;
+ 
+ 	atomic_inc(&q->numpending);
+ 
+@@ -508,8 +512,25 @@ static int aac_src_deliver_message(struct fib *fib)
+ 		if ((dev->comm_interface == AAC_COMM_MESSAGE_TYPE3)
+ 			&& dev->sa_firmware)
+ 			vector_no = aac_get_vector(dev);
+-		else
+-			vector_no = fib->vector_no;
++		else {
++			if (!fib->vector_no || !fib->callback_data) {
++				if (shost && dev->use_map_queue) {
++					qmap = &shost->tag_set.map[HCTX_TYPE_DEFAULT];
++					vector_no = qmap->mq_map[raw_smp_processor_id()];
++				}
++				/*
++				 *	We hardcode the vector_no for
++				 *	reserved commands as a valid shost is
++				 *	absent during the init
++				 */
++				else
++					vector_no = 0;
++			} else {
++				scmd = (struct scsi_cmnd *)fib->callback_data;
++				blk_tag = blk_mq_unique_tag(scsi_cmd_to_rq(scmd));
++				vector_no = blk_mq_unique_tag_to_hwq(blk_tag);
++			}
++		}
+ 
+ 		if (native_hba) {
+ 			if (fib->flags & FIB_CONTEXT_FLAG_NATIVE_HBA_TMF) {
