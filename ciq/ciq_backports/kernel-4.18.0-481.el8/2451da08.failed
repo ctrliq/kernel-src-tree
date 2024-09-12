@@ -1,0 +1,364 @@
+net/mlx5: Unify device IPsec capabilities check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Leon Romanovsky <leonro@nvidia.com>
+commit 2451da081a343e079d9f5a7b063fcdf0bc439aa8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/2451da08.failed
+
+Merge two different function to one in order to provide coherent
+picture if the device is IPsec capable or not.
+
+Link: https://lore.kernel.org/r/8f10ea06ad19c6f651e9fb33921009658f01e1d5.1649232994.git.leonro@nvidia.com
+	Reviewed-by: Raed Salem <raeds@nvidia.com>
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+(cherry picked from commit 2451da081a343e079d9f5a7b063fcdf0bc439aa8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/accel/ipsec_offload.c
+#	drivers/net/ethernet/mellanox/mlx5/core/accel/ipsec_offload.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/accel/ipsec_offload.c
+index d6667d38e1de,9dbebef19ff0..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/accel/ipsec_offload.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/accel/ipsec_offload.c
+@@@ -376,10 -387,138 +387,140 @@@ static const struct mlx5_accel_ipsec_op
+  	.esp_modify_xfrm = mlx5_ipsec_offload_esp_modify_xfrm,
+  };
+  
+ -static const struct mlx5_accel_ipsec_ops *
+ -mlx5_ipsec_offload_ops(struct mlx5_core_dev *mdev)
+ +const struct mlx5_accel_ipsec_ops *mlx5_ipsec_offload_ops(struct mlx5_core_dev *mdev)
+  {
+- 	if (!mlx5_ipsec_offload_device_caps(mdev))
++ 	if (!mlx5_ipsec_device_caps(mdev))
+  		return NULL;
+  
+  	return &ipsec_offload_ops;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ void mlx5_accel_ipsec_init(struct mlx5_core_dev *mdev)
++ {
++ 	const struct mlx5_accel_ipsec_ops *ipsec_ops;
++ 	int err = 0;
++ 
++ 	ipsec_ops = mlx5_ipsec_offload_ops(mdev);
++ 	if (!ipsec_ops || !ipsec_ops->init) {
++ 		mlx5_core_dbg(mdev, "IPsec ops is not supported\n");
++ 		return;
++ 	}
++ 
++ 	err = ipsec_ops->init(mdev);
++ 	if (err) {
++ 		mlx5_core_warn_once(
++ 			mdev, "Failed to start IPsec device, err = %d\n", err);
++ 		return;
++ 	}
++ 
++ 	mdev->ipsec_ops = ipsec_ops;
++ }
++ 
++ void mlx5_accel_ipsec_cleanup(struct mlx5_core_dev *mdev)
++ {
++ 	const struct mlx5_accel_ipsec_ops *ipsec_ops = mdev->ipsec_ops;
++ 
++ 	if (!ipsec_ops || !ipsec_ops->cleanup)
++ 		return;
++ 
++ 	ipsec_ops->cleanup(mdev);
++ }
++ 
++ unsigned int mlx5_accel_ipsec_counters_count(struct mlx5_core_dev *mdev)
++ {
++ 	const struct mlx5_accel_ipsec_ops *ipsec_ops = mdev->ipsec_ops;
++ 
++ 	if (!ipsec_ops || !ipsec_ops->counters_count)
++ 		return -EOPNOTSUPP;
++ 
++ 	return ipsec_ops->counters_count(mdev);
++ }
++ 
++ int mlx5_accel_ipsec_counters_read(struct mlx5_core_dev *mdev, u64 *counters,
++ 				   unsigned int count)
++ {
++ 	const struct mlx5_accel_ipsec_ops *ipsec_ops = mdev->ipsec_ops;
++ 
++ 	if (!ipsec_ops || !ipsec_ops->counters_read)
++ 		return -EOPNOTSUPP;
++ 
++ 	return ipsec_ops->counters_read(mdev, counters, count);
++ }
++ 
++ void *mlx5_accel_esp_create_hw_context(struct mlx5_core_dev *mdev,
++ 				       struct mlx5_accel_esp_xfrm *xfrm,
++ 				       u32 *sa_handle)
++ {
++ 	const struct mlx5_accel_ipsec_ops *ipsec_ops = mdev->ipsec_ops;
++ 	__be32 saddr[4] = {}, daddr[4] = {};
++ 
++ 	if (!ipsec_ops || !ipsec_ops->create_hw_context)
++ 		return  ERR_PTR(-EOPNOTSUPP);
++ 
++ 	if (!xfrm->attrs.is_ipv6) {
++ 		saddr[3] = xfrm->attrs.saddr.a4;
++ 		daddr[3] = xfrm->attrs.daddr.a4;
++ 	} else {
++ 		memcpy(saddr, xfrm->attrs.saddr.a6, sizeof(saddr));
++ 		memcpy(daddr, xfrm->attrs.daddr.a6, sizeof(daddr));
++ 	}
++ 
++ 	return ipsec_ops->create_hw_context(mdev, xfrm, saddr, daddr,
++ 					    xfrm->attrs.spi,
++ 					    xfrm->attrs.is_ipv6, sa_handle);
++ }
++ 
++ void mlx5_accel_esp_free_hw_context(struct mlx5_core_dev *mdev, void *context)
++ {
++ 	const struct mlx5_accel_ipsec_ops *ipsec_ops = mdev->ipsec_ops;
++ 
++ 	if (!ipsec_ops || !ipsec_ops->free_hw_context)
++ 		return;
++ 
++ 	ipsec_ops->free_hw_context(context);
++ }
++ 
++ struct mlx5_accel_esp_xfrm *
++ mlx5_accel_esp_create_xfrm(struct mlx5_core_dev *mdev,
++ 			   const struct mlx5_accel_esp_xfrm_attrs *attrs)
++ {
++ 	const struct mlx5_accel_ipsec_ops *ipsec_ops = mdev->ipsec_ops;
++ 	struct mlx5_accel_esp_xfrm *xfrm;
++ 
++ 	if (!ipsec_ops || !ipsec_ops->esp_create_xfrm)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	xfrm = ipsec_ops->esp_create_xfrm(mdev, attrs, 0);
++ 	if (IS_ERR(xfrm))
++ 		return xfrm;
++ 
++ 	xfrm->mdev = mdev;
++ 	return xfrm;
++ }
++ EXPORT_SYMBOL_GPL(mlx5_accel_esp_create_xfrm);
++ 
++ void mlx5_accel_esp_destroy_xfrm(struct mlx5_accel_esp_xfrm *xfrm)
++ {
++ 	const struct mlx5_accel_ipsec_ops *ipsec_ops = xfrm->mdev->ipsec_ops;
++ 
++ 	if (!ipsec_ops || !ipsec_ops->esp_destroy_xfrm)
++ 		return;
++ 
++ 	ipsec_ops->esp_destroy_xfrm(xfrm);
++ }
++ EXPORT_SYMBOL_GPL(mlx5_accel_esp_destroy_xfrm);
++ 
++ int mlx5_accel_esp_modify_xfrm(struct mlx5_accel_esp_xfrm *xfrm,
++ 			       const struct mlx5_accel_esp_xfrm_attrs *attrs)
++ {
++ 	const struct mlx5_accel_ipsec_ops *ipsec_ops = xfrm->mdev->ipsec_ops;
++ 
++ 	if (!ipsec_ops || !ipsec_ops->esp_modify_xfrm)
++ 		return -EOPNOTSUPP;
++ 
++ 	return ipsec_ops->esp_modify_xfrm(xfrm, attrs);
++ }
++ EXPORT_SYMBOL_GPL(mlx5_accel_esp_modify_xfrm);
+++>>>>>>> 2451da081a34 (net/mlx5: Unify device IPsec capabilities check)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/accel/ipsec_offload.h
+index 970c66d19c1d,3d13e2c136b1..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/accel/ipsec_offload.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/accel/ipsec_offload.h
+@@@ -9,30 -9,55 +9,83 @@@
+  
+  #ifdef CONFIG_MLX5_IPSEC
+  
+++<<<<<<< HEAD
+ +const struct mlx5_accel_ipsec_ops *mlx5_ipsec_offload_ops(struct mlx5_core_dev *mdev);
+ +static inline bool mlx5_is_ipsec_device(struct mlx5_core_dev *mdev)
+ +{
+ +	if (!MLX5_CAP_GEN(mdev, ipsec_offload))
+ +		return false;
+ +
+ +	if (!MLX5_CAP_GEN(mdev, log_max_dek))
+ +		return false;
+ +
+ +	if (!(MLX5_CAP_GEN_64(mdev, general_obj_types) &
+ +	    MLX5_HCA_CAP_GENERAL_OBJECT_TYPES_IPSEC))
+ +		return false;
+ +
+ +	return MLX5_CAP_IPSEC(mdev, ipsec_crypto_offload) &&
+ +		MLX5_CAP_ETH(mdev, insert_trailer);
+ +}
+ +
+ +#else
+ +static inline const struct mlx5_accel_ipsec_ops *
+ +mlx5_ipsec_offload_ops(struct mlx5_core_dev *mdev) { return NULL; }
+ +static inline bool mlx5_is_ipsec_device(struct mlx5_core_dev *mdev)
+ +{
+ +	return false;
+ +}
+ +
+++=======
++ unsigned int mlx5_accel_ipsec_counters_count(struct mlx5_core_dev *mdev);
++ int mlx5_accel_ipsec_counters_read(struct mlx5_core_dev *mdev, u64 *counters,
++ 				   unsigned int count);
++ 
++ void *mlx5_accel_esp_create_hw_context(struct mlx5_core_dev *mdev,
++ 				       struct mlx5_accel_esp_xfrm *xfrm,
++ 				       u32 *sa_handle);
++ void mlx5_accel_esp_free_hw_context(struct mlx5_core_dev *mdev, void *context);
++ 
++ void mlx5_accel_ipsec_init(struct mlx5_core_dev *mdev);
++ void mlx5_accel_ipsec_cleanup(struct mlx5_core_dev *mdev);
++ 
++ struct mlx5_accel_ipsec_ops {
++ 	unsigned int (*counters_count)(struct mlx5_core_dev *mdev);
++ 	int (*counters_read)(struct mlx5_core_dev *mdev, u64 *counters,
++ 			     unsigned int count);
++ 	void *(*create_hw_context)(struct mlx5_core_dev *mdev,
++ 				   struct mlx5_accel_esp_xfrm *xfrm,
++ 				   const __be32 saddr[4], const __be32 daddr[4],
++ 				   const __be32 spi, bool is_ipv6,
++ 				   u32 *sa_handle);
++ 	void (*free_hw_context)(void *context);
++ 	int (*init)(struct mlx5_core_dev *mdev);
++ 	void (*cleanup)(struct mlx5_core_dev *mdev);
++ 	struct mlx5_accel_esp_xfrm *(*esp_create_xfrm)(
++ 		struct mlx5_core_dev *mdev,
++ 		const struct mlx5_accel_esp_xfrm_attrs *attrs, u32 flags);
++ 	int (*esp_modify_xfrm)(struct mlx5_accel_esp_xfrm *xfrm,
++ 			       const struct mlx5_accel_esp_xfrm_attrs *attrs);
++ 	void (*esp_destroy_xfrm)(struct mlx5_accel_esp_xfrm *xfrm);
++ };
++ 
++ #else
++ 
++ static inline void *
++ mlx5_accel_esp_create_hw_context(struct mlx5_core_dev *mdev,
++ 				 struct mlx5_accel_esp_xfrm *xfrm,
++ 				 u32 *sa_handle)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void mlx5_accel_esp_free_hw_context(struct mlx5_core_dev *mdev,
++ 						  void *context)
++ {
++ }
++ 
++ static inline void mlx5_accel_ipsec_init(struct mlx5_core_dev *mdev) {}
++ 
++ static inline void mlx5_accel_ipsec_cleanup(struct mlx5_core_dev *mdev) {}
+++>>>>>>> 2451da081a34 (net/mlx5: Unify device IPsec capabilities check)
+  #endif /* CONFIG_MLX5_IPSEC */
+  #endif /* __MLX5_IPSEC_OFFLOAD_H__ */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/accel/ipsec_offload.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/accel/ipsec_offload.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/params.c b/drivers/net/ethernet/mellanox/mlx5/core/en/params.c
+index 5c4711be6fae..a932b1e88a29 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/params.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/params.c
+@@ -686,8 +686,8 @@ void mlx5e_build_sq_param(struct mlx5_core_dev *mdev,
+ 	void *wq = MLX5_ADDR_OF(sqc, sqc, wq);
+ 	bool allow_swp;
+ 
+-	allow_swp = mlx5_geneve_tx_allowed(mdev) ||
+-		    !!MLX5_IPSEC_DEV(mdev);
++	allow_swp =
++		mlx5_geneve_tx_allowed(mdev) || !!mlx5_ipsec_device_caps(mdev);
+ 	mlx5e_build_sq_param_common(mdev, param);
+ 	MLX5_SET(wq, wq, log_wq_sz, params->log_sq_size);
+ 	MLX5_SET(sqc, sqc, allow_swp, allow_swp);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+index 1391a0c84f16..c280a18ff002 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+@@ -226,8 +226,7 @@ static inline int mlx5e_xfrm_validate_state(struct xfrm_state *x)
+ 		return -EINVAL;
+ 	}
+ 	if (x->props.flags & XFRM_STATE_ESN &&
+-	    !(mlx5_accel_ipsec_device_caps(priv->mdev) &
+-	    MLX5_ACCEL_IPSEC_CAP_ESN)) {
++	    !(mlx5_ipsec_device_caps(priv->mdev) & MLX5_ACCEL_IPSEC_CAP_ESN)) {
+ 		netdev_info(netdev, "Cannot offload ESN xfrm states\n");
+ 		return -EINVAL;
+ 	}
+@@ -275,8 +274,7 @@ static inline int mlx5e_xfrm_validate_state(struct xfrm_state *x)
+ 		return -EINVAL;
+ 	}
+ 	if (x->props.family == AF_INET6 &&
+-	    !(mlx5_accel_ipsec_device_caps(priv->mdev) &
+-	     MLX5_ACCEL_IPSEC_CAP_IPV6)) {
++	    !(mlx5_ipsec_device_caps(priv->mdev) & MLX5_ACCEL_IPSEC_CAP_IPV6)) {
+ 		netdev_info(netdev, "IPv6 xfrm state offload is not supported by this device\n");
+ 		return -EINVAL;
+ 	}
+@@ -406,7 +404,7 @@ int mlx5e_ipsec_init(struct mlx5e_priv *priv)
+ {
+ 	struct mlx5e_ipsec *ipsec = NULL;
+ 
+-	if (!MLX5_IPSEC_DEV(priv->mdev)) {
++	if (!mlx5_ipsec_device_caps(priv->mdev)) {
+ 		netdev_dbg(priv->netdev, "Not an IPSec offload device\n");
+ 		return 0;
+ 	}
+@@ -519,7 +517,7 @@ void mlx5e_ipsec_build_netdev(struct mlx5e_priv *priv)
+ 	struct mlx5_core_dev *mdev = priv->mdev;
+ 	struct net_device *netdev = priv->netdev;
+ 
+-	if (!(mlx5_accel_ipsec_device_caps(mdev) & MLX5_ACCEL_IPSEC_CAP_ESP) ||
++	if (!(mlx5_ipsec_device_caps(mdev) & MLX5_ACCEL_IPSEC_CAP_ESP) ||
+ 	    !MLX5_CAP_ETH(mdev, swp)) {
+ 		mlx5_core_dbg(mdev, "mlx5e: ESP and SWP offload not supported\n");
+ 		return;
+@@ -538,7 +536,7 @@ void mlx5e_ipsec_build_netdev(struct mlx5e_priv *priv)
+ 	netdev->features |= NETIF_F_HW_ESP_TX_CSUM;
+ 	netdev->hw_enc_features |= NETIF_F_HW_ESP_TX_CSUM;
+ 
+-	if (!(mlx5_accel_ipsec_device_caps(mdev) & MLX5_ACCEL_IPSEC_CAP_LSO) ||
++	if (!(mlx5_ipsec_device_caps(mdev) & MLX5_ACCEL_IPSEC_CAP_LSO) ||
+ 	    !MLX5_CAP_ETH(mdev, swp_lso)) {
+ 		mlx5_core_dbg(mdev, "mlx5e: ESP LSO not supported\n");
+ 		return;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 22f111312bee..eab6e3c2692c 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -1328,7 +1328,7 @@ static int mlx5e_alloc_txqsq(struct mlx5e_channel *c,
+ 	INIT_WORK(&sq->recover_work, mlx5e_tx_err_cqe_work);
+ 	if (!MLX5_CAP_ETH(mdev, wqe_vlan_insert))
+ 		set_bit(MLX5E_SQ_STATE_VLAN_NEED_L2_INLINE, &sq->state);
+-	if (MLX5_IPSEC_DEV(c->priv->mdev))
++	if (mlx5_ipsec_device_caps(c->priv->mdev))
+ 		set_bit(MLX5E_SQ_STATE_IPSEC, &sq->state);
+ 	if (param->is_mpw)
+ 		set_bit(MLX5E_SQ_STATE_MPWQE, &sq->state);
+diff --git a/include/linux/mlx5/accel.h b/include/linux/mlx5/accel.h
+index af67d51308cf..9145e2d37c0e 100644
+--- a/include/linux/mlx5/accel.h
++++ b/include/linux/mlx5/accel.h
+@@ -124,7 +124,7 @@ enum mlx5_accel_ipsec_cap {
+ 
+ #ifdef CONFIG_MLX5_ACCEL
+ 
+-u32 mlx5_accel_ipsec_device_caps(struct mlx5_core_dev *mdev);
++u32 mlx5_ipsec_device_caps(struct mlx5_core_dev *mdev);
+ 
+ struct mlx5_accel_esp_xfrm *
+ mlx5_accel_esp_create_xfrm(struct mlx5_core_dev *mdev,
+@@ -135,7 +135,10 @@ int mlx5_accel_esp_modify_xfrm(struct mlx5_accel_esp_xfrm *xfrm,
+ 
+ #else
+ 
+-static inline u32 mlx5_accel_ipsec_device_caps(struct mlx5_core_dev *mdev) { return 0; }
++static inline u32 mlx5_ipsec_device_caps(struct mlx5_core_dev *mdev)
++{
++	return 0;
++}
+ 
+ static inline struct mlx5_accel_esp_xfrm *
+ mlx5_accel_esp_create_xfrm(struct mlx5_core_dev *mdev,
