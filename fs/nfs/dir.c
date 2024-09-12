@@ -418,6 +418,18 @@ bool nfs_readdir_use_cookie(const struct file *filp)
 	return true;
 }
 
+static void nfs_readdir_seek_next_array(struct nfs_cache_array *array,
+					struct nfs_readdir_descriptor *desc)
+{
+	if (array->page_full) {
+		desc->last_cookie = array->last_cookie;
+		desc->current_index += array->size;
+		desc->cache_entry_index = 0;
+		desc->page_index++;
+	} else
+		desc->last_cookie = array->array[0].cookie;
+}
+
 static int nfs_readdir_search_for_pos(struct nfs_cache_array *array,
 				      struct nfs_readdir_descriptor *desc)
 {
@@ -429,6 +441,7 @@ static int nfs_readdir_search_for_pos(struct nfs_cache_array *array,
 	if (diff >= array->size) {
 		if (array->page_is_eof)
 			goto out_eof;
+		nfs_readdir_seek_next_array(array, desc);
 		return -EAGAIN;
 	}
 
@@ -501,7 +514,8 @@ check_eof:
 		status = -EBADCOOKIE;
 		if (desc->dir_cookie == array->last_cookie)
 			desc->eof = true;
-	}
+	} else
+		nfs_readdir_seek_next_array(array, desc);
 out:
 	return status;
 }
@@ -518,11 +532,6 @@ static int nfs_readdir_search_array(struct nfs_readdir_descriptor *desc)
 	else
 		status = nfs_readdir_search_for_cookie(array, desc);
 
-	if (status == -EAGAIN) {
-		desc->last_cookie = array->last_cookie;
-		desc->current_index += array->size;
-		desc->page_index++;
-	}
 	kunmap_atomic(array);
 	return status;
 }
@@ -999,7 +1008,7 @@ static void nfs_do_filldir(struct nfs_readdir_descriptor *desc,
 {
 	struct file	*file = desc->file;
 	struct nfs_cache_array *array;
-	unsigned int i = 0;
+	unsigned int i;
 
 	array = kmap(desc->page);
 	for (i = desc->cache_entry_index; i < array->size; i++) {
@@ -1012,10 +1021,13 @@ static void nfs_do_filldir(struct nfs_readdir_descriptor *desc,
 			break;
 		}
 		memcpy(desc->verf, verf, sizeof(desc->verf));
-		if (i < (array->size-1))
-			desc->dir_cookie = array->array[i+1].cookie;
-		else
+		if (i == array->size - 1) {
 			desc->dir_cookie = array->last_cookie;
+			nfs_readdir_seek_next_array(array, desc);
+		} else {
+			desc->dir_cookie = array->array[i + 1].cookie;
+			desc->last_cookie = array->array[0].cookie;
+		}
 		if (nfs_readdir_use_cookie(file))
 			desc->ctx->pos = desc->dir_cookie;
 		else
