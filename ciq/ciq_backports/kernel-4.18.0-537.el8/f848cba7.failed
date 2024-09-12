@@ -1,0 +1,331 @@
+s390/vfio-ap: reset queues filtered from the guest's AP config
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-537.el8
+commit-author Tony Krowiak <akrowiak@linux.ibm.com>
+commit f848cba767e59f8d5c54984b1d45451aae040d50
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-537.el8/f848cba7.failed
+
+When filtering the adapters from the configuration profile for a guest to
+create or update a guest's AP configuration, if the APID of an adapter and
+the APQI of a domain identify a queue device that is not bound to the
+vfio_ap device driver, the APID of the adapter will be filtered because an
+individual APQN can not be filtered due to the fact the APQNs are assigned
+to an AP configuration as a matrix of APIDs and APQIs. Consequently, a
+guest will not have access to all of the queues associated with the
+filtered adapter. If the queues are subsequently made available again to
+the guest, they should re-appear in a reset state; so, let's make sure all
+queues associated with an adapter unplugged from the guest are reset.
+
+In order to identify the set of queues that need to be reset, let's allow a
+vfio_ap_queue object to be simultaneously stored in both a hashtable and a
+list: A hashtable used to store all of the queues assigned
+to a matrix mdev; and/or, a list used to store a subset of the queues that
+need to be reset. For example, when an adapter is hot unplugged from a
+guest, all guest queues associated with that adapter must be reset. Since
+that may be a subset of those assigned to the matrix mdev, they can be
+stored in a list that can be passed to the vfio_ap_mdev_reset_queues
+function.
+
+	Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Acked-by: Halil Pasic <pasic@linux.ibm.com>
+Fixes: 48cae940c31d ("s390/vfio-ap: refresh guest's APCB by filtering AP resources assigned to mdev")
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/20240115185441.31526-5-akrowiak@linux.ibm.com
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit f848cba767e59f8d5c54984b1d45451aae040d50)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/vfio_ap_ops.c
+diff --cc drivers/s390/crypto/vfio_ap_ops.c
+index cc0a2dfafc79,44cd29aace8e..000000000000
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@@ -31,8 -32,10 +31,9 @@@
+  
+  #define AP_RESET_INTERVAL		20	/* Reset sleep interval (20ms)		*/
+  
+- static int vfio_ap_mdev_reset_queues(struct ap_queue_table *qtable);
++ static int vfio_ap_mdev_reset_queues(struct ap_matrix_mdev *matrix_mdev);
++ static int vfio_ap_mdev_reset_qlist(struct list_head *qlist);
+  static struct vfio_ap_queue *vfio_ap_find_queue(int apqn);
+ -static const struct vfio_device_ops vfio_ap_matrix_dev_ops;
+  static void vfio_ap_mdev_reset_queue(struct vfio_ap_queue *q);
+  
+  /**
+@@@ -616,8 -681,8 +623,13 @@@ static bool vfio_ap_mdev_filter_cdoms(s
+   * Return: a boolean value indicating whether the KVM guest's APCB was changed
+   *	   by the filtering or not.
+   */
+++<<<<<<< HEAD
+ +static bool vfio_ap_mdev_filter_matrix(unsigned long *apm, unsigned long *aqm,
+ +				       struct ap_matrix_mdev *matrix_mdev)
+++=======
++ static bool vfio_ap_mdev_filter_matrix(struct ap_matrix_mdev *matrix_mdev,
++ 				       unsigned long *apm_filtered)
+++>>>>>>> f848cba767e5 (s390/vfio-ap: reset queues filtered from the guest's AP config)
+  {
+  	unsigned long apid, apqi, apqn;
+  	DECLARE_BITMAP(prev_shadow_apm, AP_DEVICES);
+@@@ -739,59 -829,14 +760,59 @@@ static int vfio_ap_mdev_remove(struct m
+  
+  	mutex_lock(&matrix_dev->guests_lock);
+  	mutex_lock(&matrix_dev->mdevs_lock);
+- 	vfio_ap_mdev_reset_queues(&matrix_mdev->qtable);
++ 	vfio_ap_mdev_reset_queues(matrix_mdev);
+  	vfio_ap_mdev_unlink_fr_queues(matrix_mdev);
+  	list_del(&matrix_mdev->node);
+ +	kfree(matrix_mdev);
+ +	mdev_set_drvdata(mdev, NULL);
+ +	atomic_inc(&matrix_dev->available_instances);
+  	mutex_unlock(&matrix_dev->mdevs_lock);
+  	mutex_unlock(&matrix_dev->guests_lock);
+ -	vfio_put_device(&matrix_mdev->vdev);
+ +
+ +	return 0;
+ +}
+ +
+ +static ssize_t name_show(struct kobject *kobj, struct device *dev, char *buf)
+ +{
+ +	return sprintf(buf, "%s\n", VFIO_AP_MDEV_NAME_HWVIRT);
+ +}
+ +
+ +static MDEV_TYPE_ATTR_RO(name);
+ +
+ +static ssize_t available_instances_show(struct kobject *kobj,
+ +					struct device *dev, char *buf)
+ +{
+ +	return sprintf(buf, "%d\n",
+ +		       atomic_read(&matrix_dev->available_instances));
+ +}
+ +
+ +static MDEV_TYPE_ATTR_RO(available_instances);
+ +
+ +static ssize_t device_api_show(struct kobject *kobj, struct device *dev,
+ +			       char *buf)
+ +{
+ +	return sprintf(buf, "%s\n", VFIO_DEVICE_API_AP_STRING);
+  }
+  
+ +static MDEV_TYPE_ATTR_RO(device_api);
+ +
+ +static struct attribute *vfio_ap_mdev_type_attrs[] = {
+ +	&mdev_type_attr_name.attr,
+ +	&mdev_type_attr_device_api.attr,
+ +	&mdev_type_attr_available_instances.attr,
+ +	NULL,
+ +};
+ +
+ +static struct attribute_group vfio_ap_mdev_hwvirt_type_group = {
+ +	.name = VFIO_AP_MDEV_TYPE_HWVIRT,
+ +	.attrs = vfio_ap_mdev_type_attrs,
+ +};
+ +
+ +static struct attribute_group *vfio_ap_mdev_type_groups[] = {
+ +	&vfio_ap_mdev_hwvirt_type_group,
+ +	NULL,
+ +};
+ +
+  #define MDEV_SHARING_ERR "Userspace may not re-assign queue %02lx.%04lx " \
+  			 "already assigned to %s"
+  
+@@@ -934,9 -1020,8 +996,14 @@@ static ssize_t assign_adapter_store(str
+  {
+  	int ret;
+  	unsigned long apid;
+++<<<<<<< HEAD
+ +	DECLARE_BITMAP(apm_delta, AP_DEVICES);
+ +	struct mdev_device *mdev = mdev_from_dev(dev);
+ +	struct ap_matrix_mdev *matrix_mdev = mdev_get_drvdata(mdev);
+++=======
++ 	DECLARE_BITMAP(apm_filtered, AP_DEVICES);
++ 	struct ap_matrix_mdev *matrix_mdev = dev_get_drvdata(dev);
+++>>>>>>> f848cba767e5 (s390/vfio-ap: reset queues filtered from the guest's AP config)
+  
+  	mutex_lock(&ap_perms_mutex);
+  	get_update_locks_for_mdev(matrix_mdev);
+@@@ -964,12 -1049,11 +1031,18 @@@
+  	}
+  
+  	vfio_ap_mdev_link_adapter(matrix_mdev, apid);
+ +	memset(apm_delta, 0, sizeof(apm_delta));
+ +	set_bit_inv(apid, apm_delta);
+  
+++<<<<<<< HEAD
+ +	if (vfio_ap_mdev_filter_matrix(apm_delta,
+ +				       matrix_mdev->matrix.aqm, matrix_mdev))
+++=======
++ 	if (vfio_ap_mdev_filter_matrix(matrix_mdev, apm_filtered)) {
+++>>>>>>> f848cba767e5 (s390/vfio-ap: reset queues filtered from the guest's AP config)
+  		vfio_ap_mdev_update_guest_apcb(matrix_mdev);
++ 		reset_queues_for_apids(matrix_mdev, apm_filtered);
++ 	}
+  
+  	ret = count;
+  done:
+@@@ -1145,9 -1225,8 +1215,14 @@@ static ssize_t assign_domain_store(stru
+  {
+  	int ret;
+  	unsigned long apqi;
+++<<<<<<< HEAD
+ +	DECLARE_BITMAP(aqm_delta, AP_DOMAINS);
+ +	struct mdev_device *mdev = mdev_from_dev(dev);
+ +	struct ap_matrix_mdev *matrix_mdev = mdev_get_drvdata(mdev);
+++=======
++ 	DECLARE_BITMAP(apm_filtered, AP_DEVICES);
++ 	struct ap_matrix_mdev *matrix_mdev = dev_get_drvdata(dev);
+++>>>>>>> f848cba767e5 (s390/vfio-ap: reset queues filtered from the guest's AP config)
+  
+  	mutex_lock(&ap_perms_mutex);
+  	get_update_locks_for_mdev(matrix_mdev);
+@@@ -1175,12 -1254,11 +1250,18 @@@
+  	}
+  
+  	vfio_ap_mdev_link_domain(matrix_mdev, apqi);
+ +	memset(aqm_delta, 0, sizeof(aqm_delta));
+ +	set_bit_inv(apqi, aqm_delta);
+  
+++<<<<<<< HEAD
+ +	if (vfio_ap_mdev_filter_matrix(matrix_mdev->matrix.apm, aqm_delta,
+ +				       matrix_mdev))
+++=======
++ 	if (vfio_ap_mdev_filter_matrix(matrix_mdev, apm_filtered)) {
+++>>>>>>> f848cba767e5 (s390/vfio-ap: reset queues filtered from the guest's AP config)
+  		vfio_ap_mdev_update_guest_apcb(matrix_mdev);
++ 		reset_queues_for_apids(matrix_mdev, apm_filtered);
++ 	}
+  
+  	ret = count;
+  done:
+@@@ -1848,13 -2009,13 +1943,20 @@@ static ssize_t vfio_ap_mdev_ioctl(struc
+  		ret = vfio_ap_mdev_get_device_info(arg);
+  		break;
+  	case VFIO_DEVICE_RESET:
+++<<<<<<< HEAD
+ +		matrix_mdev = mdev_get_drvdata(mdev);
+ +		if (WARN(!matrix_mdev, "Driver data missing from mdev!!")) {
+ +			ret = -EINVAL;
+++=======
++ 		ret = vfio_ap_mdev_reset_queues(matrix_mdev);
++ 		break;
++ 	case VFIO_DEVICE_GET_IRQ_INFO:
++ 			ret = vfio_ap_get_irq_info(arg);
+++>>>>>>> f848cba767e5 (s390/vfio-ap: reset queues filtered from the guest's AP config)
+  			break;
+ -	case VFIO_DEVICE_SET_IRQS:
+ -		ret = vfio_ap_set_irqs(matrix_mdev, arg);
+ +		}
+ +
+ +		ret = vfio_ap_mdev_reset_queues(&matrix_mdev->qtable);
+  		break;
+  	default:
+  		ret = -EOPNOTSUPP;
+@@@ -1983,11 -2177,24 +2086,28 @@@ int vfio_ap_mdev_probe_queue(struct ap_
+  	if (matrix_mdev) {
+  		vfio_ap_mdev_link_queue(matrix_mdev, q);
+  
+++<<<<<<< HEAD
+ +		if (vfio_ap_mdev_filter_matrix(matrix_mdev->matrix.apm,
+ +					       matrix_mdev->matrix.aqm,
+ +					       matrix_mdev))
+++=======
++ 		/*
++ 		 * If we're in the process of handling the adding of adapters or
++ 		 * domains to the host's AP configuration, then let the
++ 		 * vfio_ap device driver's on_scan_complete callback filter the
++ 		 * matrix and update the guest's AP configuration after all of
++ 		 * the new queue devices are probed.
++ 		 */
++ 		if (!bitmap_empty(matrix_mdev->apm_add, AP_DEVICES) ||
++ 		    !bitmap_empty(matrix_mdev->aqm_add, AP_DOMAINS))
++ 			goto done;
++ 
++ 		if (vfio_ap_mdev_filter_matrix(matrix_mdev, apm_filtered)) {
+++>>>>>>> f848cba767e5 (s390/vfio-ap: reset queues filtered from the guest's AP config)
+  			vfio_ap_mdev_update_guest_apcb(matrix_mdev);
++ 			reset_queues_for_apids(matrix_mdev, apm_filtered);
++ 		}
+  	}
+ -
+ -done:
+  	dev_set_drvdata(&apdev->device, q);
+  	release_update_locks_for_mdev(matrix_mdev);
+  
+@@@ -2335,34 -2542,23 +2455,44 @@@ void vfio_ap_on_cfg_changed(struct ap_c
+  
+  static void vfio_ap_mdev_hot_plug_cfg(struct ap_matrix_mdev *matrix_mdev)
+  {
+++<<<<<<< HEAD
+ +	bool do_hotplug = false;
+ +	int filter_domains = 0;
+ +	int filter_adapters = 0;
+ +	DECLARE_BITMAP(apm, AP_DEVICES);
+ +	DECLARE_BITMAP(aqm, AP_DOMAINS);
+++=======
++ 	DECLARE_BITMAP(apm_filtered, AP_DEVICES);
++ 	bool filter_domains, filter_adapters, filter_cdoms, do_hotplug = false;
+++>>>>>>> f848cba767e5 (s390/vfio-ap: reset queues filtered from the guest's AP config)
+  
+  	mutex_lock(&matrix_mdev->kvm->lock);
+  	mutex_lock(&matrix_dev->mdevs_lock);
+  
+ -	filter_adapters = bitmap_intersects(matrix_mdev->matrix.apm,
+ -					    matrix_mdev->apm_add, AP_DEVICES);
+ -	filter_domains = bitmap_intersects(matrix_mdev->matrix.aqm,
+ -					   matrix_mdev->aqm_add, AP_DOMAINS);
+ -	filter_cdoms = bitmap_intersects(matrix_mdev->matrix.adm,
+ -					 matrix_mdev->adm_add, AP_DOMAINS);
+ -
+ +	filter_adapters = bitmap_and(apm, matrix_mdev->matrix.apm,
+ +				     matrix_mdev->apm_add, AP_DEVICES);
+ +	filter_domains = bitmap_and(aqm, matrix_mdev->matrix.aqm,
+ +				    matrix_mdev->aqm_add, AP_DOMAINS);
+ +
+++<<<<<<< HEAD
+ +	if (filter_adapters && filter_domains)
+ +		do_hotplug |= vfio_ap_mdev_filter_matrix(apm, aqm, matrix_mdev);
+ +	else if (filter_adapters)
+ +		do_hotplug |=
+ +			vfio_ap_mdev_filter_matrix(apm,
+ +						   matrix_mdev->shadow_apcb.aqm,
+ +						   matrix_mdev);
+ +	else
+ +		do_hotplug |=
+ +			vfio_ap_mdev_filter_matrix(matrix_mdev->shadow_apcb.apm,
+ +						   aqm, matrix_mdev);
+++=======
++ 	if (filter_adapters || filter_domains)
++ 		do_hotplug = vfio_ap_mdev_filter_matrix(matrix_mdev, apm_filtered);
+++>>>>>>> f848cba767e5 (s390/vfio-ap: reset queues filtered from the guest's AP config)
+  
+ -	if (filter_cdoms)
+ +	if (bitmap_intersects(matrix_mdev->matrix.adm, matrix_mdev->adm_add,
+ +			      AP_DOMAINS))
+  		do_hotplug |= vfio_ap_mdev_filter_cdoms(matrix_mdev);
+  
+  	if (do_hotplug)
+* Unmerged path drivers/s390/crypto/vfio_ap_ops.c
+diff --git a/drivers/s390/crypto/vfio_ap_private.h b/drivers/s390/crypto/vfio_ap_private.h
+index 169c0041d4f8..ea52b8157e41 100644
+--- a/drivers/s390/crypto/vfio_ap_private.h
++++ b/drivers/s390/crypto/vfio_ap_private.h
+@@ -134,6 +134,8 @@ struct ap_matrix_mdev {
+  * @apqn: the APQN of the AP queue device
+  * @saved_isc: the guest ISC registered with the GIB interface
+  * @mdev_qnode: allows the vfio_ap_queue struct to be added to a hashtable
++ * @reset_qnode: allows the vfio_ap_queue struct to be added to a list of queues
++ *		 that need to be reset
+  * @reset_status: the status from the last reset of the queue
+  * @reset_work: work to wait for queue reset to complete
+  */
+@@ -144,6 +146,7 @@ struct vfio_ap_queue {
+ #define VFIO_AP_ISC_INVALID 0xff
+ 	unsigned char saved_isc;
+ 	struct hlist_node mdev_qnode;
++	struct list_head reset_qnode;
+ 	struct ap_queue_status reset_status;
+ 	struct work_struct reset_work;
+ };
