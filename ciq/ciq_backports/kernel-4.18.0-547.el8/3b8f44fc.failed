@@ -1,0 +1,1026 @@
+efi/libstub/x86: Use Exit() boot service to exit the stub on errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-547.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit 3b8f44fc0810d51b58837cf7fdba3f72f8cffcdc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-547.el8/3b8f44fc.failed
+
+Currently, we either return with an error [from efi_pe_entry()] or
+enter a deadloop [in efi_main()] if any fatal errors occur during
+execution of the EFI stub. Let's switch to calling the Exit() EFI boot
+service instead in both cases, so that we
+a) can get rid of the deadloop, and simply return to the boot manager
+   if any errors occur during execution of the stub, including during
+   the call to ExitBootServices(),
+b) can also return cleanly from efi_pe_entry() or efi_main() in mixed
+   mode, once we introduce support for LoadImage/StartImage based mixed
+   mode in the next patch.
+
+Note that on systems running downstream GRUBs [which do not use LoadImage
+or StartImage to boot the kernel, and instead, pass their own image
+handle as the loaded image handle], calling Exit() will exit from GRUB
+rather than from the kernel, but this is a tolerable side effect.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+(cherry picked from commit 3b8f44fc0810d51b58837cf7fdba3f72f8cffcdc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/eboot.c
+#	arch/x86/include/asm/efi.h
+#	drivers/firmware/efi/libstub/efistub.h
+diff --cc arch/x86/boot/compressed/eboot.c
+index 19db743a88f9,cec6baa14d5c..000000000000
+--- a/arch/x86/boot/compressed/eboot.c
++++ b/arch/x86/boot/compressed/eboot.c
+@@@ -466,6 -340,19 +466,22 @@@ void setup_graphics(struct boot_params 
+  	}
+  }
+  
+++<<<<<<< HEAD:arch/x86/boot/compressed/eboot.c
+++=======
++ 
++ static void __noreturn efi_exit(efi_handle_t handle, efi_status_t status)
++ {
++ 	efi_bs_call(exit, handle, status, 0, NULL);
++ 	unreachable();
++ }
++ 
++ void startup_32(struct boot_params *boot_params);
++ 
++ void __noreturn efi_stub_entry(efi_handle_t handle,
++ 			       efi_system_table_t *sys_table_arg,
++ 			       struct boot_params *boot_params);
++ 
+++>>>>>>> 3b8f44fc0810 (efi/libstub/x86: Use Exit() boot service to exit the stub on errors):drivers/firmware/efi/libstub/x86-stub.c
+  /*
+   * Because the x86 boot code expects to be passed a boot_params we
+   * need to create one ourselves (usually the bootloader would create
+@@@ -497,25 -376,22 +513,39 @@@ struct boot_params *make_boot_params(st
+  
+  	/* Check if we were booted by the EFI firmware */
+  	if (sys_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+++<<<<<<< HEAD:arch/x86/boot/compressed/eboot.c
+ +		return NULL;
+++=======
++ 		efi_exit(handle, EFI_INVALID_PARAMETER);
+++>>>>>>> 3b8f44fc0810 (efi/libstub/x86: Use Exit() boot service to exit the stub on errors):drivers/firmware/efi/libstub/x86-stub.c
+  
+ -	status = efi_bs_call(handle_protocol, handle, &proto, (void *)&image);
+ +	if (efi_early->is64)
+ +		setup_boot_services64(efi_early);
+ +	else
+ +		setup_boot_services32(efi_early);
+ +
+ +	status = efi_call_early(handle_protocol, handle,
+ +				&proto, (void *)&image);
+  	if (status != EFI_SUCCESS) {
+++<<<<<<< HEAD:arch/x86/boot/compressed/eboot.c
+ +		efi_printk(sys_table, "Failed to get handle for LOADED_IMAGE_PROTOCOL\n");
+ +		return NULL;
+++=======
++ 		efi_printk("Failed to get handle for LOADED_IMAGE_PROTOCOL\n");
++ 		efi_exit(handle, status);
+++>>>>>>> 3b8f44fc0810 (efi/libstub/x86: Use Exit() boot service to exit the stub on errors):drivers/firmware/efi/libstub/x86-stub.c
+  	}
+  
+ -	hdr = &((struct boot_params *)efi_table_attr(image, image_base))->hdr;
+ -	above4g = hdr->xloadflags & XLF_CAN_BE_LOADED_ABOVE_4G;
+ -
+ -	status = efi_allocate_pages(0x4000, (unsigned long *)&boot_params,
+ -				    above4g ? ULONG_MAX : UINT_MAX);
+ +	status = efi_low_alloc(sys_table, 0x4000, 1,
+ +			       (unsigned long *)&boot_params);
+  	if (status != EFI_SUCCESS) {
+++<<<<<<< HEAD:arch/x86/boot/compressed/eboot.c
+ +		efi_printk(sys_table, "Failed to allocate lowmem for boot params\n");
+ +		return NULL;
+++=======
++ 		efi_printk("Failed to allocate lowmem for boot params\n");
++ 		efi_exit(handle, status);
+++>>>>>>> 3b8f44fc0810 (efi/libstub/x86: Use Exit() boot service to exit the stub on errors):drivers/firmware/efi/libstub/x86-stub.c
+  	}
+  
+  	memset(boot_params, 0x0, 0x4000);
+@@@ -555,35 -428,28 +585,39 @@@
+  	if (status != EFI_SUCCESS)
+  		goto fail2;
+  
+ -	if (!noinitrd()) {
+ -		status = efi_load_initrd(image, &ramdisk_addr, &ramdisk_size,
+ -					 hdr->initrd_addr_max,
+ -					 above4g ? ULONG_MAX
+ -						 : hdr->initrd_addr_max);
+ -		if (status != EFI_SUCCESS)
+ -			goto fail2;
+ -		hdr->ramdisk_image = ramdisk_addr & 0xffffffff;
+ -		hdr->ramdisk_size  = ramdisk_size & 0xffffffff;
+ -		boot_params->ext_ramdisk_image = (u64)ramdisk_addr >> 32;
+ -		boot_params->ext_ramdisk_size  = (u64)ramdisk_size >> 32;
+ +	status = handle_cmdline_files(sys_table, image,
+ +				      (char *)(unsigned long)hdr->cmd_line_ptr,
+ +				      "initrd=", hdr->initrd_addr_max,
+ +				      &ramdisk_addr, &ramdisk_size);
+ +
+ +	if (status != EFI_SUCCESS &&
+ +	    hdr->xloadflags & XLF_CAN_BE_LOADED_ABOVE_4G) {
+ +		efi_printk(sys_table, "Trying to load files to higher address\n");
+ +		status = handle_cmdline_files(sys_table, image,
+ +				      (char *)(unsigned long)hdr->cmd_line_ptr,
+ +				      "initrd=", -1UL,
+ +				      &ramdisk_addr, &ramdisk_size);
+  	}
+  
+ -	efi_stub_entry(handle, sys_table, boot_params);
+ -	/* not reached */
+ +	if (status != EFI_SUCCESS)
+ +		goto fail2;
+ +	hdr->ramdisk_image = ramdisk_addr & 0xffffffff;
+ +	hdr->ramdisk_size  = ramdisk_size & 0xffffffff;
+ +	boot_params->ext_ramdisk_image = (u64)ramdisk_addr >> 32;
+ +	boot_params->ext_ramdisk_size  = (u64)ramdisk_size >> 32;
+ +
+ +	return boot_params;
+  
+  fail2:
+ -	efi_free(options_size, (unsigned long)cmdline_ptr);
+ +	efi_free(sys_table, options_size, hdr->cmd_line_ptr);
+  fail:
+ -	efi_free(0x4000, (unsigned long)boot_params);
+ +	efi_free(sys_table, 0x4000, (unsigned long)boot_params);
+  
+++<<<<<<< HEAD:arch/x86/boot/compressed/eboot.c
+ +	return NULL;
+++=======
++ 	efi_exit(handle, status);
+++>>>>>>> 3b8f44fc0810 (efi/libstub/x86: Use Exit() boot service to exit the stub on errors):drivers/firmware/efi/libstub/x86-stub.c
+  }
+  
+  static void add_e820ext(struct boot_params *params,
+@@@ -869,20 -716,8 +903,20 @@@ efi_main(struct efi_config *c, struct b
+  
+  	/* Check if we were booted by the EFI firmware */
+  	if (sys_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+- 		goto fail;
++ 		efi_exit(handle, EFI_INVALID_PARAMETER);
+  
+ +	if (is64)
+ +		setup_boot_services64(efi_early);
+ +	else
+ +		setup_boot_services32(efi_early);
+ +
+ +	efi_dxe_table = get_efi_config_table(sys_table, EFI_DXE_SERVICES_TABLE_GUID);
+ +	if (efi_dxe_table &&
+ +	    efi_dxe_table->hdr.signature != EFI_DXE_SERVICES_TABLE_SIGNATURE) {
+ +		efi_printk(sys_table, "Ignoring DXE services table: invalid signature\n");
+ +		efi_dxe_table = NULL;
+ +	}
+ +
+  	/*
+  	 * If the kernel isn't already loaded at the preferred load
+  	 * address, relocate it.
+@@@ -951,96 -796,9 +985,100 @@@
+  		goto fail;
+  	}
+  
+ +	memset((char *)gdt->address, 0x0, gdt->size);
+ +	desc = (struct desc_struct *)gdt->address;
+ +
+ +	/* The first GDT is a dummy. */
+ +	desc++;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		/* __KERNEL32_CS */
+ +		desc->limit0	= 0xffff;
+ +		desc->base0	= 0x0000;
+ +		desc->base1	= 0x0000;
+ +		desc->type	= SEG_TYPE_CODE | SEG_TYPE_EXEC_READ;
+ +		desc->s		= DESC_TYPE_CODE_DATA;
+ +		desc->dpl	= 0;
+ +		desc->p		= 1;
+ +		desc->limit1	= 0xf;
+ +		desc->avl	= 0;
+ +		desc->l		= 0;
+ +		desc->d		= SEG_OP_SIZE_32BIT;
+ +		desc->g		= SEG_GRANULARITY_4KB;
+ +		desc->base2	= 0x00;
+ +
+ +		desc++;
+ +	} else {
+ +		/* Second entry is unused on 32-bit */
+ +		desc++;
+ +	}
+ +
+ +	/* __KERNEL_CS */
+ +	desc->limit0	= 0xffff;
+ +	desc->base0	= 0x0000;
+ +	desc->base1	= 0x0000;
+ +	desc->type	= SEG_TYPE_CODE | SEG_TYPE_EXEC_READ;
+ +	desc->s		= DESC_TYPE_CODE_DATA;
+ +	desc->dpl	= 0;
+ +	desc->p		= 1;
+ +	desc->limit1	= 0xf;
+ +	desc->avl	= 0;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		desc->l = 1;
+ +		desc->d = 0;
+ +	} else {
+ +		desc->l = 0;
+ +		desc->d = SEG_OP_SIZE_32BIT;
+ +	}
+ +	desc->g		= SEG_GRANULARITY_4KB;
+ +	desc->base2	= 0x00;
+ +	desc++;
+ +
+ +	/* __KERNEL_DS */
+ +	desc->limit0	= 0xffff;
+ +	desc->base0	= 0x0000;
+ +	desc->base1	= 0x0000;
+ +	desc->type	= SEG_TYPE_DATA | SEG_TYPE_READ_WRITE;
+ +	desc->s		= DESC_TYPE_CODE_DATA;
+ +	desc->dpl	= 0;
+ +	desc->p		= 1;
+ +	desc->limit1	= 0xf;
+ +	desc->avl	= 0;
+ +	desc->l		= 0;
+ +	desc->d		= SEG_OP_SIZE_32BIT;
+ +	desc->g		= SEG_GRANULARITY_4KB;
+ +	desc->base2	= 0x00;
+ +	desc++;
+ +
+ +	if (IS_ENABLED(CONFIG_X86_64)) {
+ +		/* Task segment value */
+ +		desc->limit0	= 0x0000;
+ +		desc->base0	= 0x0000;
+ +		desc->base1	= 0x0000;
+ +		desc->type	= SEG_TYPE_TSS;
+ +		desc->s		= 0;
+ +		desc->dpl	= 0;
+ +		desc->p		= 1;
+ +		desc->limit1	= 0x0;
+ +		desc->avl	= 0;
+ +		desc->l		= 0;
+ +		desc->d		= 0;
+ +		desc->g		= SEG_GRANULARITY_4KB;
+ +		desc->base2	= 0x00;
+ +		desc++;
+ +	}
+ +
+ +	asm volatile("cli");
+ +	asm volatile ("lgdt %0" : : "m" (*gdt));
+ +
+  	return boot_params;
+  fail:
+ -	efi_printk("efi_main() failed!\n");
+ +	efi_printk(sys_table, "efi_main() failed!\n");
+  
+++<<<<<<< HEAD:arch/x86/boot/compressed/eboot.c
+ +	return NULL;
+++=======
++ 	efi_exit(handle, status);
+++>>>>>>> 3b8f44fc0810 (efi/libstub/x86: Use Exit() boot service to exit the stub on errors):drivers/firmware/efi/libstub/x86-stub.c
+  }
+diff --cc arch/x86/include/asm/efi.h
+index fe461b858f74,cdcf48d52a12..000000000000
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@@ -209,38 -239,109 +209,113 @@@ static inline bool efi_is_native(void
+  		__builtin_types_compatible_p(u32, __typeof__(attr)),	\
+  			(unsigned long)(attr), (attr))
+  
+ -#define efi_table_attr(inst, attr)					\
+ -	(efi_is_native()						\
+ -		? inst->attr						\
+ -		: (__typeof__(inst->attr))				\
+ -			efi_mixed_mode_cast(inst->mixed_mode.attr))
+ -
+ -/*
+ - * The following macros allow translating arguments if necessary from native to
+ - * mixed mode. The use case for this is to initialize the upper 32 bits of
+ - * output parameters, and where the 32-bit method requires a 64-bit argument,
+ - * which must be split up into two arguments to be thunked properly.
+ - *
+ - * As examples, the AllocatePool boot service returns the address of the
+ - * allocation, but it will not set the high 32 bits of the address. To ensure
+ - * that the full 64-bit address is initialized, we zero-init the address before
+ - * calling the thunk.
+ - *
+ - * The FreePages boot service takes a 64-bit physical address even in 32-bit
+ - * mode. For the thunk to work correctly, a native 64-bit call of
+ - * 	free_pages(addr, size)
+ - * must be translated to
+ - * 	efi64_thunk(free_pages, addr & U32_MAX, addr >> 32, size)
+ - * so that the two 32-bit halves of addr get pushed onto the stack separately.
+ - */
+ -
+ -static inline void *efi64_zero_upper(void *p)
+ -{
+ -	((u32 *)p)[1] = 0;
+ -	return p;
+ -}
+ +#define efi_table_attr(table, attr, instance) ({			\
+ +	__typeof__(((table##_t *)0)->attr) __ret;			\
+ +	if (efi_is_native()) {						\
+ +		__ret = ((table##_t *)(unsigned long)instance)->attr;	\
+ +	} else {							\
+ +		__ret = (__typeof__(__ret))efi_mixed_mode_cast(		\
+ +		((table##_t *)(unsigned long)instance)->mixed_mode.attr);\
+ +	}								\
+ +	__ret;								\
+ +})
+  
+ +#define efi_call_proto(protocol, f, instance, ...)			\
+ +	__efi_early()->call((unsigned long)				\
+ +				efi_table_attr(protocol, f, instance),	\
+ +		instance, ##__VA_ARGS__)
+ +
+ +#define efi_dxe_call(f, ...)						\
+ +	__efi_early()->call((unsigned long)				\
+ +				efi_table_attr(efi_dxe_services_table,	\
+ +					       f,			\
+ +					       efi_dxe_table),		\
+ +				##__VA_ARGS__)
+ +
+++<<<<<<< HEAD
+ +#define efi_call_early(f, ...)						\
+ +	__efi_early()->call((unsigned long)				\
+ +				efi_table_attr(efi_boot_services, f,	\
+ +		__efi_early()->boot_services), __VA_ARGS__)
+ +
+ +#define efi_call_runtime(f, ...)					\
+ +	__efi_early()->call((unsigned long)				\
+ +				efi_table_attr(efi_runtime_services, f,	\
+ +		__efi_early()->runtime_services), __VA_ARGS__)
+++=======
++ static inline u32 efi64_convert_status(efi_status_t status)
++ {
++ 	return (u32)(status | (u64)status >> 32);
++ }
++ 
++ #define __efi64_argmap_free_pages(addr, size)				\
++ 	((addr), 0, (size))
++ 
++ #define __efi64_argmap_get_memory_map(mm_size, mm, key, size, ver)	\
++ 	((mm_size), (mm), efi64_zero_upper(key), efi64_zero_upper(size), (ver))
++ 
++ #define __efi64_argmap_allocate_pool(type, size, buffer)		\
++ 	((type), (size), efi64_zero_upper(buffer))
++ 
++ #define __efi64_argmap_handle_protocol(handle, protocol, interface)	\
++ 	((handle), (protocol), efi64_zero_upper(interface))
++ 
++ #define __efi64_argmap_locate_protocol(protocol, reg, interface)	\
++ 	((protocol), (reg), efi64_zero_upper(interface))
++ 
++ #define __efi64_argmap_locate_device_path(protocol, path, handle)	\
++ 	((protocol), (path), efi64_zero_upper(handle))
++ 
++ #define __efi64_argmap_exit(handle, status, size, data)			\
++ 	((handle), efi64_convert_status(status), (size), (data))
++ 
++ /* PCI I/O */
++ #define __efi64_argmap_get_location(protocol, seg, bus, dev, func)	\
++ 	((protocol), efi64_zero_upper(seg), efi64_zero_upper(bus),	\
++ 	 efi64_zero_upper(dev), efi64_zero_upper(func))
++ 
++ /* LoadFile */
++ #define __efi64_argmap_load_file(protocol, path, policy, bufsize, buf)	\
++ 	((protocol), (path), (policy), efi64_zero_upper(bufsize), (buf))
++ 
++ /*
++  * The macros below handle the plumbing for the argument mapping. To add a
++  * mapping for a specific EFI method, simply define a macro
++  * __efi64_argmap_<method name>, following the examples above.
++  */
++ 
++ #define __efi64_thunk_map(inst, func, ...)				\
++ 	efi64_thunk(inst->mixed_mode.func,				\
++ 		__efi64_argmap(__efi64_argmap_ ## func(__VA_ARGS__),	\
++ 			       (__VA_ARGS__)))
++ 
++ #define __efi64_argmap(mapped, args)					\
++ 	__PASTE(__efi64_argmap__, __efi_nargs(__efi_eat mapped))(mapped, args)
++ #define __efi64_argmap__0(mapped, args) __efi_eval mapped
++ #define __efi64_argmap__1(mapped, args) __efi_eval args
++ 
++ #define __efi_eat(...)
++ #define __efi_eval(...) __VA_ARGS__
++ 
++ /* The three macros below handle dispatching via the thunk if needed */
++ 
++ #define efi_call_proto(inst, func, ...)					\
++ 	(efi_is_native()						\
++ 		? inst->func(inst, ##__VA_ARGS__)			\
++ 		: __efi64_thunk_map(inst, func, inst, ##__VA_ARGS__))
++ 
++ #define efi_bs_call(func, ...)						\
++ 	(efi_is_native()						\
++ 		? efi_system_table()->boottime->func(__VA_ARGS__)	\
++ 		: __efi64_thunk_map(efi_table_attr(efi_system_table(),	\
++ 				boottime), func, __VA_ARGS__))
++ 
++ #define efi_rt_call(func, ...)						\
++ 	(efi_is_native()						\
++ 		? efi_system_table()->runtime->func(__VA_ARGS__)	\
++ 		: __efi64_thunk_map(efi_table_attr(efi_system_table(),	\
++ 				runtime), func, __VA_ARGS__))
+++>>>>>>> 3b8f44fc0810 (efi/libstub/x86: Use Exit() boot service to exit the stub on errors)
+  
+  extern bool efi_reboot_required(void);
+  extern bool efi_is_table_address(unsigned long phys_addr);
+diff --cc drivers/firmware/efi/libstub/efistub.h
+index 386522b5d9b5,cc90a748bcf0..000000000000
+--- a/drivers/firmware/efi/libstub/efistub.h
++++ b/drivers/firmware/efi/libstub/efistub.h
+@@@ -25,23 -25,571 +25,560 @@@
+  #define EFI_ALLOC_ALIGN		EFI_PAGE_SIZE
+  #endif
+  
+ -#ifdef CONFIG_ARM
+ -#define __efistub_global	__section(.data)
+ -#else
+ -#define __efistub_global
+ -#endif
+ -
+ -extern bool __pure nochunk(void);
+ -extern bool __pure nokaslr(void);
+ -extern bool __pure noinitrd(void);
+ -extern bool __pure is_quiet(void);
+ -extern bool __pure novamap(void);
+ +extern int __pure nokaslr(void);
+ +extern int __pure is_quiet(void);
+  
+ -extern __pure efi_system_table_t  *efi_system_table(void);
+ +extern void set_nokaslr(int val);
+  
+ -#define pr_efi(msg)		do {			\
+ -	if (!is_quiet()) efi_printk("EFI stub: "msg);	\
+ +#define pr_efi(sys_table, msg)		do {				\
+ +	if (!is_quiet()) efi_printk(sys_table, "EFI stub: "msg);	\
+  } while (0)
+  
+ -#define pr_efi_err(msg) efi_printk("EFI stub: ERROR: "msg)
+ +#define pr_efi_err(sys_table, msg) efi_printk(sys_table, "EFI stub: ERROR: "msg)
+  
+ -/* Helper macros for the usual case of using simple C variables: */
+ -#ifndef fdt_setprop_inplace_var
+ -#define fdt_setprop_inplace_var(fdt, node_offset, name, var) \
+ -	fdt_setprop_inplace((fdt), (node_offset), (name), &(var), sizeof(var))
+ -#endif
+ +void efi_char16_printk(efi_system_table_t *, efi_char16_t *);
+  
+ -#ifndef fdt_setprop_var
+ -#define fdt_setprop_var(fdt, node_offset, name, var) \
+ -	fdt_setprop((fdt), (node_offset), (name), &(var), sizeof(var))
+ -#endif
+ +unsigned long get_dram_base(efi_system_table_t *sys_table_arg);
+  
+++<<<<<<< HEAD
+ +efi_status_t allocate_new_fdt_and_exit_boot(efi_system_table_t *sys_table,
+ +					    void *handle,
+++=======
++ #define get_efi_var(name, vendor, ...)				\
++ 	efi_rt_call(get_variable, (efi_char16_t *)(name),	\
++ 		    (efi_guid_t *)(vendor), __VA_ARGS__)
++ 
++ #define set_efi_var(name, vendor, ...)				\
++ 	efi_rt_call(set_variable, (efi_char16_t *)(name),	\
++ 		    (efi_guid_t *)(vendor), __VA_ARGS__)
++ 
++ #define efi_get_handle_at(array, idx)					\
++ 	(efi_is_native() ? (array)[idx] 				\
++ 		: (efi_handle_t)(unsigned long)((u32 *)(array))[idx])
++ 
++ #define efi_get_handle_num(size)					\
++ 	((size) / (efi_is_native() ? sizeof(efi_handle_t) : sizeof(u32)))
++ 
++ #define for_each_efi_handle(handle, array, size, i)			\
++ 	for (i = 0;							\
++ 	     i < efi_get_handle_num(size) &&				\
++ 		((handle = efi_get_handle_at((array), i)) || true);	\
++ 	     i++)
++ 
++ /*
++  * Allocation types for calls to boottime->allocate_pages.
++  */
++ #define EFI_ALLOCATE_ANY_PAGES		0
++ #define EFI_ALLOCATE_MAX_ADDRESS	1
++ #define EFI_ALLOCATE_ADDRESS		2
++ #define EFI_MAX_ALLOCATE_TYPE		3
++ 
++ /*
++  * The type of search to perform when calling boottime->locate_handle
++  */
++ #define EFI_LOCATE_ALL_HANDLES			0
++ #define EFI_LOCATE_BY_REGISTER_NOTIFY		1
++ #define EFI_LOCATE_BY_PROTOCOL			2
++ 
++ struct efi_boot_memmap {
++ 	efi_memory_desc_t	**map;
++ 	unsigned long		*map_size;
++ 	unsigned long		*desc_size;
++ 	u32			*desc_ver;
++ 	unsigned long		*key_ptr;
++ 	unsigned long		*buff_size;
++ };
++ 
++ typedef struct efi_generic_dev_path efi_device_path_protocol_t;
++ 
++ /*
++  * EFI Boot Services table
++  */
++ union efi_boot_services {
++ 	struct {
++ 		efi_table_hdr_t hdr;
++ 		void *raise_tpl;
++ 		void *restore_tpl;
++ 		efi_status_t (__efiapi *allocate_pages)(int, int, unsigned long,
++ 							efi_physical_addr_t *);
++ 		efi_status_t (__efiapi *free_pages)(efi_physical_addr_t,
++ 						    unsigned long);
++ 		efi_status_t (__efiapi *get_memory_map)(unsigned long *, void *,
++ 							unsigned long *,
++ 							unsigned long *, u32 *);
++ 		efi_status_t (__efiapi *allocate_pool)(int, unsigned long,
++ 						       void **);
++ 		efi_status_t (__efiapi *free_pool)(void *);
++ 		void *create_event;
++ 		void *set_timer;
++ 		void *wait_for_event;
++ 		void *signal_event;
++ 		void *close_event;
++ 		void *check_event;
++ 		void *install_protocol_interface;
++ 		void *reinstall_protocol_interface;
++ 		void *uninstall_protocol_interface;
++ 		efi_status_t (__efiapi *handle_protocol)(efi_handle_t,
++ 							 efi_guid_t *, void **);
++ 		void *__reserved;
++ 		void *register_protocol_notify;
++ 		efi_status_t (__efiapi *locate_handle)(int, efi_guid_t *,
++ 						       void *, unsigned long *,
++ 						       efi_handle_t *);
++ 		efi_status_t (__efiapi *locate_device_path)(efi_guid_t *,
++ 							    efi_device_path_protocol_t **,
++ 							    efi_handle_t *);
++ 		efi_status_t (__efiapi *install_configuration_table)(efi_guid_t *,
++ 								     void *);
++ 		void *load_image;
++ 		void *start_image;
++ 		efi_status_t __noreturn (__efiapi *exit)(efi_handle_t,
++ 							 efi_status_t,
++ 							 unsigned long,
++ 							 efi_char16_t *);
++ 		void *unload_image;
++ 		efi_status_t (__efiapi *exit_boot_services)(efi_handle_t,
++ 							    unsigned long);
++ 		void *get_next_monotonic_count;
++ 		void *stall;
++ 		void *set_watchdog_timer;
++ 		void *connect_controller;
++ 		efi_status_t (__efiapi *disconnect_controller)(efi_handle_t,
++ 							       efi_handle_t,
++ 							       efi_handle_t);
++ 		void *open_protocol;
++ 		void *close_protocol;
++ 		void *open_protocol_information;
++ 		void *protocols_per_handle;
++ 		void *locate_handle_buffer;
++ 		efi_status_t (__efiapi *locate_protocol)(efi_guid_t *, void *,
++ 							 void **);
++ 		void *install_multiple_protocol_interfaces;
++ 		void *uninstall_multiple_protocol_interfaces;
++ 		void *calculate_crc32;
++ 		void *copy_mem;
++ 		void *set_mem;
++ 		void *create_event_ex;
++ 	};
++ 	struct {
++ 		efi_table_hdr_t hdr;
++ 		u32 raise_tpl;
++ 		u32 restore_tpl;
++ 		u32 allocate_pages;
++ 		u32 free_pages;
++ 		u32 get_memory_map;
++ 		u32 allocate_pool;
++ 		u32 free_pool;
++ 		u32 create_event;
++ 		u32 set_timer;
++ 		u32 wait_for_event;
++ 		u32 signal_event;
++ 		u32 close_event;
++ 		u32 check_event;
++ 		u32 install_protocol_interface;
++ 		u32 reinstall_protocol_interface;
++ 		u32 uninstall_protocol_interface;
++ 		u32 handle_protocol;
++ 		u32 __reserved;
++ 		u32 register_protocol_notify;
++ 		u32 locate_handle;
++ 		u32 locate_device_path;
++ 		u32 install_configuration_table;
++ 		u32 load_image;
++ 		u32 start_image;
++ 		u32 exit;
++ 		u32 unload_image;
++ 		u32 exit_boot_services;
++ 		u32 get_next_monotonic_count;
++ 		u32 stall;
++ 		u32 set_watchdog_timer;
++ 		u32 connect_controller;
++ 		u32 disconnect_controller;
++ 		u32 open_protocol;
++ 		u32 close_protocol;
++ 		u32 open_protocol_information;
++ 		u32 protocols_per_handle;
++ 		u32 locate_handle_buffer;
++ 		u32 locate_protocol;
++ 		u32 install_multiple_protocol_interfaces;
++ 		u32 uninstall_multiple_protocol_interfaces;
++ 		u32 calculate_crc32;
++ 		u32 copy_mem;
++ 		u32 set_mem;
++ 		u32 create_event_ex;
++ 	} mixed_mode;
++ };
++ 
++ typedef union efi_uga_draw_protocol efi_uga_draw_protocol_t;
++ 
++ union efi_uga_draw_protocol {
++ 	struct {
++ 		efi_status_t (__efiapi *get_mode)(efi_uga_draw_protocol_t *,
++ 						  u32*, u32*, u32*, u32*);
++ 		void *set_mode;
++ 		void *blt;
++ 	};
++ 	struct {
++ 		u32 get_mode;
++ 		u32 set_mode;
++ 		u32 blt;
++ 	} mixed_mode;
++ };
++ 
++ union efi_simple_text_output_protocol {
++ 	struct {
++ 		void *reset;
++ 		efi_status_t (__efiapi *output_string)(efi_simple_text_output_protocol_t *,
++ 						       efi_char16_t *);
++ 		void *test_string;
++ 	};
++ 	struct {
++ 		u32 reset;
++ 		u32 output_string;
++ 		u32 test_string;
++ 	} mixed_mode;
++ };
++ 
++ #define PIXEL_RGB_RESERVED_8BIT_PER_COLOR		0
++ #define PIXEL_BGR_RESERVED_8BIT_PER_COLOR		1
++ #define PIXEL_BIT_MASK					2
++ #define PIXEL_BLT_ONLY					3
++ #define PIXEL_FORMAT_MAX				4
++ 
++ typedef struct {
++ 	u32 red_mask;
++ 	u32 green_mask;
++ 	u32 blue_mask;
++ 	u32 reserved_mask;
++ } efi_pixel_bitmask_t;
++ 
++ typedef struct {
++ 	u32 version;
++ 	u32 horizontal_resolution;
++ 	u32 vertical_resolution;
++ 	int pixel_format;
++ 	efi_pixel_bitmask_t pixel_information;
++ 	u32 pixels_per_scan_line;
++ } efi_graphics_output_mode_info_t;
++ 
++ typedef union efi_graphics_output_protocol_mode efi_graphics_output_protocol_mode_t;
++ 
++ union efi_graphics_output_protocol_mode {
++ 	struct {
++ 		u32 max_mode;
++ 		u32 mode;
++ 		efi_graphics_output_mode_info_t *info;
++ 		unsigned long size_of_info;
++ 		efi_physical_addr_t frame_buffer_base;
++ 		unsigned long frame_buffer_size;
++ 	};
++ 	struct {
++ 		u32 max_mode;
++ 		u32 mode;
++ 		u32 info;
++ 		u32 size_of_info;
++ 		u64 frame_buffer_base;
++ 		u32 frame_buffer_size;
++ 	} mixed_mode;
++ };
++ 
++ typedef union efi_graphics_output_protocol efi_graphics_output_protocol_t;
++ 
++ union efi_graphics_output_protocol {
++ 	struct {
++ 		void *query_mode;
++ 		void *set_mode;
++ 		void *blt;
++ 		efi_graphics_output_protocol_mode_t *mode;
++ 	};
++ 	struct {
++ 		u32 query_mode;
++ 		u32 set_mode;
++ 		u32 blt;
++ 		u32 mode;
++ 	} mixed_mode;
++ };
++ 
++ typedef union {
++ 	struct {
++ 		u32			revision;
++ 		efi_handle_t		parent_handle;
++ 		efi_system_table_t	*system_table;
++ 		efi_handle_t		device_handle;
++ 		void			*file_path;
++ 		void			*reserved;
++ 		u32			load_options_size;
++ 		void			*load_options;
++ 		void			*image_base;
++ 		__aligned_u64		image_size;
++ 		unsigned int		image_code_type;
++ 		unsigned int		image_data_type;
++ 		efi_status_t		(__efiapi *unload)(efi_handle_t image_handle);
++ 	};
++ 	struct {
++ 		u32		revision;
++ 		u32		parent_handle;
++ 		u32		system_table;
++ 		u32		device_handle;
++ 		u32		file_path;
++ 		u32		reserved;
++ 		u32		load_options_size;
++ 		u32		load_options;
++ 		u32		image_base;
++ 		__aligned_u64	image_size;
++ 		u32		image_code_type;
++ 		u32		image_data_type;
++ 		u32		unload;
++ 	} mixed_mode;
++ } efi_loaded_image_t;
++ 
++ typedef struct {
++ 	u64			size;
++ 	u64			file_size;
++ 	u64			phys_size;
++ 	efi_time_t		create_time;
++ 	efi_time_t		last_access_time;
++ 	efi_time_t		modification_time;
++ 	__aligned_u64		attribute;
++ 	efi_char16_t		filename[];
++ } efi_file_info_t;
++ 
++ typedef struct efi_file_protocol efi_file_protocol_t;
++ 
++ struct efi_file_protocol {
++ 	u64		revision;
++ 	efi_status_t	(__efiapi *open)	(efi_file_protocol_t *,
++ 						 efi_file_protocol_t **,
++ 						 efi_char16_t *, u64, u64);
++ 	efi_status_t	(__efiapi *close)	(efi_file_protocol_t *);
++ 	efi_status_t	(__efiapi *delete)	(efi_file_protocol_t *);
++ 	efi_status_t	(__efiapi *read)	(efi_file_protocol_t *,
++ 						 unsigned long *, void *);
++ 	efi_status_t	(__efiapi *write)	(efi_file_protocol_t *,
++ 						 unsigned long, void *);
++ 	efi_status_t	(__efiapi *get_position)(efi_file_protocol_t *, u64 *);
++ 	efi_status_t	(__efiapi *set_position)(efi_file_protocol_t *, u64);
++ 	efi_status_t	(__efiapi *get_info)	(efi_file_protocol_t *,
++ 						 efi_guid_t *, unsigned long *,
++ 						 void *);
++ 	efi_status_t	(__efiapi *set_info)	(efi_file_protocol_t *,
++ 						 efi_guid_t *, unsigned long,
++ 						 void *);
++ 	efi_status_t	(__efiapi *flush)	(efi_file_protocol_t *);
++ };
++ 
++ typedef struct efi_simple_file_system_protocol efi_simple_file_system_protocol_t;
++ 
++ struct efi_simple_file_system_protocol {
++ 	u64	revision;
++ 	int	(__efiapi *open_volume)(efi_simple_file_system_protocol_t *,
++ 					efi_file_protocol_t **);
++ };
++ 
++ #define EFI_FILE_MODE_READ	0x0000000000000001
++ #define EFI_FILE_MODE_WRITE	0x0000000000000002
++ #define EFI_FILE_MODE_CREATE	0x8000000000000000
++ 
++ typedef enum {
++ 	EfiPciIoWidthUint8,
++ 	EfiPciIoWidthUint16,
++ 	EfiPciIoWidthUint32,
++ 	EfiPciIoWidthUint64,
++ 	EfiPciIoWidthFifoUint8,
++ 	EfiPciIoWidthFifoUint16,
++ 	EfiPciIoWidthFifoUint32,
++ 	EfiPciIoWidthFifoUint64,
++ 	EfiPciIoWidthFillUint8,
++ 	EfiPciIoWidthFillUint16,
++ 	EfiPciIoWidthFillUint32,
++ 	EfiPciIoWidthFillUint64,
++ 	EfiPciIoWidthMaximum
++ } EFI_PCI_IO_PROTOCOL_WIDTH;
++ 
++ typedef enum {
++ 	EfiPciIoAttributeOperationGet,
++ 	EfiPciIoAttributeOperationSet,
++ 	EfiPciIoAttributeOperationEnable,
++ 	EfiPciIoAttributeOperationDisable,
++ 	EfiPciIoAttributeOperationSupported,
++     EfiPciIoAttributeOperationMaximum
++ } EFI_PCI_IO_PROTOCOL_ATTRIBUTE_OPERATION;
++ 
++ typedef struct {
++ 	u32 read;
++ 	u32 write;
++ } efi_pci_io_protocol_access_32_t;
++ 
++ typedef union efi_pci_io_protocol efi_pci_io_protocol_t;
++ 
++ typedef
++ efi_status_t (__efiapi *efi_pci_io_protocol_cfg_t)(efi_pci_io_protocol_t *,
++ 						   EFI_PCI_IO_PROTOCOL_WIDTH,
++ 						   u32 offset,
++ 						   unsigned long count,
++ 						   void *buffer);
++ 
++ typedef struct {
++ 	void *read;
++ 	void *write;
++ } efi_pci_io_protocol_access_t;
++ 
++ typedef struct {
++ 	efi_pci_io_protocol_cfg_t read;
++ 	efi_pci_io_protocol_cfg_t write;
++ } efi_pci_io_protocol_config_access_t;
++ 
++ union efi_pci_io_protocol {
++ 	struct {
++ 		void *poll_mem;
++ 		void *poll_io;
++ 		efi_pci_io_protocol_access_t mem;
++ 		efi_pci_io_protocol_access_t io;
++ 		efi_pci_io_protocol_config_access_t pci;
++ 		void *copy_mem;
++ 		void *map;
++ 		void *unmap;
++ 		void *allocate_buffer;
++ 		void *free_buffer;
++ 		void *flush;
++ 		efi_status_t (__efiapi *get_location)(efi_pci_io_protocol_t *,
++ 						      unsigned long *segment_nr,
++ 						      unsigned long *bus_nr,
++ 						      unsigned long *device_nr,
++ 						      unsigned long *func_nr);
++ 		void *attributes;
++ 		void *get_bar_attributes;
++ 		void *set_bar_attributes;
++ 		uint64_t romsize;
++ 		void *romimage;
++ 	};
++ 	struct {
++ 		u32 poll_mem;
++ 		u32 poll_io;
++ 		efi_pci_io_protocol_access_32_t mem;
++ 		efi_pci_io_protocol_access_32_t io;
++ 		efi_pci_io_protocol_access_32_t pci;
++ 		u32 copy_mem;
++ 		u32 map;
++ 		u32 unmap;
++ 		u32 allocate_buffer;
++ 		u32 free_buffer;
++ 		u32 flush;
++ 		u32 get_location;
++ 		u32 attributes;
++ 		u32 get_bar_attributes;
++ 		u32 set_bar_attributes;
++ 		u64 romsize;
++ 		u32 romimage;
++ 	} mixed_mode;
++ };
++ 
++ #define EFI_PCI_IO_ATTRIBUTE_ISA_MOTHERBOARD_IO 0x0001
++ #define EFI_PCI_IO_ATTRIBUTE_ISA_IO 0x0002
++ #define EFI_PCI_IO_ATTRIBUTE_VGA_PALETTE_IO 0x0004
++ #define EFI_PCI_IO_ATTRIBUTE_VGA_MEMORY 0x0008
++ #define EFI_PCI_IO_ATTRIBUTE_VGA_IO 0x0010
++ #define EFI_PCI_IO_ATTRIBUTE_IDE_PRIMARY_IO 0x0020
++ #define EFI_PCI_IO_ATTRIBUTE_IDE_SECONDARY_IO 0x0040
++ #define EFI_PCI_IO_ATTRIBUTE_MEMORY_WRITE_COMBINE 0x0080
++ #define EFI_PCI_IO_ATTRIBUTE_IO 0x0100
++ #define EFI_PCI_IO_ATTRIBUTE_MEMORY 0x0200
++ #define EFI_PCI_IO_ATTRIBUTE_BUS_MASTER 0x0400
++ #define EFI_PCI_IO_ATTRIBUTE_MEMORY_CACHED 0x0800
++ #define EFI_PCI_IO_ATTRIBUTE_MEMORY_DISABLE 0x1000
++ #define EFI_PCI_IO_ATTRIBUTE_EMBEDDED_DEVICE 0x2000
++ #define EFI_PCI_IO_ATTRIBUTE_EMBEDDED_ROM 0x4000
++ #define EFI_PCI_IO_ATTRIBUTE_DUAL_ADDRESS_CYCLE 0x8000
++ #define EFI_PCI_IO_ATTRIBUTE_ISA_IO_16 0x10000
++ #define EFI_PCI_IO_ATTRIBUTE_VGA_PALETTE_IO_16 0x20000
++ #define EFI_PCI_IO_ATTRIBUTE_VGA_IO_16 0x40000
++ 
++ struct efi_dev_path;
++ 
++ typedef union apple_properties_protocol apple_properties_protocol_t;
++ 
++ union apple_properties_protocol {
++ 	struct {
++ 		unsigned long version;
++ 		efi_status_t (__efiapi *get)(apple_properties_protocol_t *,
++ 					     struct efi_dev_path *,
++ 					     efi_char16_t *, void *, u32 *);
++ 		efi_status_t (__efiapi *set)(apple_properties_protocol_t *,
++ 					     struct efi_dev_path *,
++ 					     efi_char16_t *, void *, u32);
++ 		efi_status_t (__efiapi *del)(apple_properties_protocol_t *,
++ 					     struct efi_dev_path *,
++ 					     efi_char16_t *);
++ 		efi_status_t (__efiapi *get_all)(apple_properties_protocol_t *,
++ 						 void *buffer, u32 *);
++ 	};
++ 	struct {
++ 		u32 version;
++ 		u32 get;
++ 		u32 set;
++ 		u32 del;
++ 		u32 get_all;
++ 	} mixed_mode;
++ };
++ 
++ typedef u32 efi_tcg2_event_log_format;
++ 
++ typedef union efi_tcg2_protocol efi_tcg2_protocol_t;
++ 
++ union efi_tcg2_protocol {
++ 	struct {
++ 		void *get_capability;
++ 		efi_status_t (__efiapi *get_event_log)(efi_handle_t,
++ 						       efi_tcg2_event_log_format,
++ 						       efi_physical_addr_t *,
++ 						       efi_physical_addr_t *,
++ 						       efi_bool_t *);
++ 		void *hash_log_extend_event;
++ 		void *submit_command;
++ 		void *get_active_pcr_banks;
++ 		void *set_active_pcr_banks;
++ 		void *get_result_of_set_active_pcr_banks;
++ 	};
++ 	struct {
++ 		u32 get_capability;
++ 		u32 get_event_log;
++ 		u32 hash_log_extend_event;
++ 		u32 submit_command;
++ 		u32 get_active_pcr_banks;
++ 		u32 set_active_pcr_banks;
++ 		u32 get_result_of_set_active_pcr_banks;
++ 	} mixed_mode;
++ };
++ 
++ typedef union efi_load_file_protocol efi_load_file_protocol_t;
++ typedef union efi_load_file_protocol efi_load_file2_protocol_t;
++ 
++ union efi_load_file_protocol {
++ 	struct {
++ 		efi_status_t (__efiapi *load_file)(efi_load_file_protocol_t *,
++ 						   efi_device_path_protocol_t *,
++ 						   bool, unsigned long *, void *);
++ 	};
++ 	struct {
++ 		u32 load_file;
++ 	} mixed_mode;
++ };
++ 
++ void efi_pci_disable_bridge_busmaster(void);
++ 
++ typedef efi_status_t (*efi_exit_boot_map_processing)(
++ 	struct efi_boot_memmap *map,
++ 	void *priv);
++ 
++ efi_status_t efi_exit_boot_services(void *handle,
++ 				    struct efi_boot_memmap *map,
++ 				    void *priv,
++ 				    efi_exit_boot_map_processing priv_func);
++ 
++ void efi_char16_printk(efi_char16_t *);
++ 
++ efi_status_t allocate_new_fdt_and_exit_boot(void *handle,
+++>>>>>>> 3b8f44fc0810 (efi/libstub/x86: Use Exit() boot service to exit the stub on errors)
+  					    unsigned long *new_fdt_addr,
+  					    unsigned long max_addr,
+  					    u64 initrd_addr, u64 initrd_size,
+* Unmerged path arch/x86/boot/compressed/eboot.c
+* Unmerged path arch/x86/include/asm/efi.h
+* Unmerged path drivers/firmware/efi/libstub/efistub.h
