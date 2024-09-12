@@ -1,0 +1,193 @@
+xfs: Fix false ENOSPC when performing direct write on a delalloc extent in cow fork
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-539.el8
+commit-author Chandan Babu R <chandan.babu@oracle.com>
+commit d62113303d691bcd8d0675ae4ac63e7769afc56c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-539.el8/d6211330.failed
+
+On a higly fragmented filesystem a Direct IO write can fail with -ENOSPC error
+even though the filesystem has sufficient number of free blocks.
+
+This occurs if the file offset range on which the write operation is being
+performed has a delalloc extent in the cow fork and this delalloc extent
+begins much before the Direct IO range.
+
+In such a scenario, xfs_reflink_allocate_cow() invokes xfs_bmapi_write() to
+allocate the blocks mapped by the delalloc extent. The extent thus allocated
+may not cover the beginning of file offset range on which the Direct IO write
+was issued. Hence xfs_reflink_allocate_cow() ends up returning -ENOSPC.
+
+The following script reliably recreates the bug described above.
+
+  #!/usr/bin/bash
+
+  device=/dev/loop0
+  shortdev=$(basename $device)
+
+  mntpnt=/mnt/
+  file1=${mntpnt}/file1
+  file2=${mntpnt}/file2
+  fragmentedfile=${mntpnt}/fragmentedfile
+  punchprog=/root/repos/xfstests-dev/src/punch-alternating
+
+  errortag=/sys/fs/xfs/${shortdev}/errortag/bmap_alloc_minlen_extent
+
+  umount $device > /dev/null 2>&1
+
+  echo "Create FS"
+  mkfs.xfs -f -m reflink=1 $device > /dev/null 2>&1
+  if [[ $? != 0 ]]; then
+  	echo "mkfs failed."
+  	exit 1
+  fi
+
+  echo "Mount FS"
+  mount $device $mntpnt > /dev/null 2>&1
+  if [[ $? != 0 ]]; then
+  	echo "mount failed."
+  	exit 1
+  fi
+
+  echo "Create source file"
+  xfs_io -f -c "pwrite 0 32M" $file1 > /dev/null 2>&1
+
+  sync
+
+  echo "Create Reflinked file"
+  xfs_io -f -c "reflink $file1" $file2 &>/dev/null
+
+  echo "Set cowextsize"
+  xfs_io -c "cowextsize 16M" $file1 > /dev/null 2>&1
+
+  echo "Fragment FS"
+  xfs_io -f -c "pwrite 0 64M" $fragmentedfile > /dev/null 2>&1
+  sync
+  $punchprog $fragmentedfile
+
+  echo "Allocate block sized extent from now onwards"
+  echo -n 1 > $errortag
+
+  echo "Create 16MiB delalloc extent in CoW fork"
+  xfs_io -c "pwrite 0 4k" $file1 > /dev/null 2>&1
+
+  sync
+
+  echo "Direct I/O write at offset 12k"
+  xfs_io -d -c "pwrite 12k 8k" $file1
+
+This commit fixes the bug by invoking xfs_bmapi_write() in a loop until disk
+blocks are allocated for atleast the starting file offset of the Direct IO
+write range.
+
+Fixes: 3c68d44a2b49 ("xfs: allocate direct I/O COW blocks in iomap_begin")
+Reported-and-Root-caused-by: Wengang Wang <wen.gang.wang@oracle.com>
+	Signed-off-by: Chandan Babu R <chandan.babu@oracle.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+[djwong: slight editing to make the locking less grody, and fix some style things]
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit d62113303d691bcd8d0675ae4ac63e7769afc56c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_reflink.c
+diff --cc fs/xfs/xfs_reflink.c
+index c256104772cb,0a32b54456eb..000000000000
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@@ -415,17 -435,79 +434,92 @@@ xfs_reflink_fill_cow_hole
+  	 */
+  	if (nimaps == 0)
+  		return -ENOSPC;
++ 
+  convert:
+++<<<<<<< HEAD
+ +	xfs_trim_extent(cmap, offset_fsb, count_fsb);
+ +	/*
+ +	 * COW fork extents are supposed to remain unwritten until we're ready
+ +	 * to initiate a disk write.  For direct I/O we are going to write the
+ +	 * data and need the conversion, but for buffered writes we're done.
+ +	 */
+ +	if (!convert_now || cmap->br_state == XFS_EXT_NORM)
+ +		return 0;
+ +	trace_xfs_reflink_convert_cow(ip, cmap);
+ +	return xfs_reflink_convert_cow_locked(ip, offset_fsb, count_fsb);
+++=======
++ 	return xfs_reflink_convert_unwritten(ip, imap, cmap, convert_now);
+++>>>>>>> d62113303d69 (xfs: Fix false ENOSPC when performing direct write on a delalloc extent in cow fork)
++ 
++ out_trans_cancel:
++ 	xfs_trans_cancel(tp);
++ 	return error;
++ }
++ 
++ static int
++ xfs_reflink_fill_delalloc(
++ 	struct xfs_inode	*ip,
++ 	struct xfs_bmbt_irec	*imap,
++ 	struct xfs_bmbt_irec	*cmap,
++ 	bool			*shared,
++ 	uint			*lockmode,
++ 	bool			convert_now)
++ {
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_trans	*tp;
++ 	int			nimaps;
++ 	int			error;
++ 	bool			found;
++ 
++ 	do {
++ 		xfs_iunlock(ip, *lockmode);
++ 		*lockmode = 0;
++ 
++ 		error = xfs_trans_alloc_inode(ip, &M_RES(mp)->tr_write, 0, 0,
++ 				false, &tp);
++ 		if (error)
++ 			return error;
++ 
++ 		*lockmode = XFS_ILOCK_EXCL;
++ 
++ 		error = xfs_find_trim_cow_extent(ip, imap, cmap, shared,
++ 				&found);
++ 		if (error || !*shared)
++ 			goto out_trans_cancel;
++ 
++ 		if (found) {
++ 			xfs_trans_cancel(tp);
++ 			break;
++ 		}
++ 
++ 		ASSERT(isnullstartblock(cmap->br_startblock) ||
++ 		       cmap->br_startblock == DELAYSTARTBLOCK);
++ 
++ 		/*
++ 		 * Replace delalloc reservation with an unwritten extent.
++ 		 */
++ 		nimaps = 1;
++ 		error = xfs_bmapi_write(tp, ip, cmap->br_startoff,
++ 				cmap->br_blockcount,
++ 				XFS_BMAPI_COWFORK | XFS_BMAPI_PREALLOC, 0,
++ 				cmap, &nimaps);
++ 		if (error)
++ 			goto out_trans_cancel;
++ 
++ 		xfs_inode_set_cowblocks_tag(ip);
++ 		error = xfs_trans_commit(tp);
++ 		if (error)
++ 			return error;
++ 
++ 		/*
++ 		 * Allocation succeeded but the requested range was not even
++ 		 * partially satisfied?  Bail out!
++ 		 */
++ 		if (nimaps == 0)
++ 			return -ENOSPC;
++ 	} while (cmap->br_startoff + cmap->br_blockcount <= imap->br_startoff);
++ 
++ 	return xfs_reflink_convert_unwritten(ip, imap, cmap, convert_now);
+  
+  out_trans_cancel:
+  	xfs_trans_cancel(tp);
+* Unmerged path fs/xfs/xfs_reflink.c
