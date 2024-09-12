@@ -1,0 +1,618 @@
+arm64: Use the clearbhb instruction in mitigations
+
+jira LE-1907
+cve CVE-2022-23960
+Rebuild_History Non-Buildable kernel-4.18.0-425.3.1.el8
+commit-author James Morse <james.morse@arm.com>
+commit 228a26b912287934789023b4132ba76065d9491c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-425.3.1.el8/228a26b9.failed
+
+Future CPUs may implement a clearbhb instruction that is sufficient
+to mitigate SpectreBHB. CPUs that implement this instruction, but
+not CSV2.3 must be affected by Spectre-BHB.
+
+Add support to use this instruction as the BHB mitigation on CPUs
+that support it. The instruction is in the hint space, so it will
+be treated by a NOP as older CPUs.
+
+	Reviewed-by: Russell King (Oracle) <rmk+kernel@armlinux.org.uk>
+	Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+	Signed-off-by: James Morse <james.morse@arm.com>
+(cherry picked from commit 228a26b912287934789023b4132ba76065d9491c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/assembler.h
+#	arch/arm64/include/asm/cpufeature.h
+#	arch/arm64/include/asm/sysreg.h
+#	arch/arm64/include/asm/vectors.h
+#	arch/arm64/kernel/cpufeature.c
+#	arch/arm64/kernel/entry.S
+#	arch/arm64/kernel/image-vars.h
+#	arch/arm64/kernel/proton-pack.c
+#	arch/arm64/kvm/hyp/hyp-entry.S
+diff --cc arch/arm64/include/asm/assembler.h
+index 0e63a57c6a05,6ebdc0f834a7..000000000000
+--- a/arch/arm64/include/asm/assembler.h
++++ b/arch/arm64/include/asm/assembler.h
+@@@ -678,73 -744,163 +685,85 @@@ USER(\label, ic	ivau, \tmp2)			// inval
+  	.endm
+  
+  /*
+ - * Set SCTLR_ELx to the @reg value, and invalidate the local icache
+ - * in the process. This is called when setting the MMU on.
+ + * Check whether to yield to another runnable task from kernel mode NEON code
+ + * (which runs with preemption disabled).
+ + *
+ + * if_will_cond_yield_neon
+ + *        // pre-yield patchup code
+ + * do_cond_yield_neon
+ + *        // post-yield patchup code
+ + * endif_yield_neon    <label>
+ + *
+ + * where <label> is optional, and marks the point where execution will resume
+ + * after a yield has been performed. If omitted, execution resumes right after
+ + * the endif_yield_neon invocation. Note that the entire sequence, including
+ + * the provided patchup code, will be omitted from the image if CONFIG_PREEMPT
+ + * is not defined.
+ + *
+ + * As a convenience, in the case where no patchup code is required, the above
+ + * sequence may be abbreviated to
+ + *
+ + * cond_yield_neon <label>
+ + *
+ + * Note that the patchup code does not support assembler directives that change
+ + * the output section, any use of such directives is undefined.
+ + *
+ + * The yield itself consists of the following:
+ + * - Check whether the preempt count is exactly 1 and a reschedule is also
+ + *   needed. If so, calling of preempt_enable() in kernel_neon_end() will
+ + *   trigger a reschedule. If it is not the case, yielding is pointless.
+ + * - Disable and re-enable kernel mode NEON, and branch to the yield fixup
+ + *   code.
+ + *
+ + * This macro sequence may clobber all CPU state that is not guaranteed by the
+ + * AAPCS to be preserved across an ordinary function call.
+   */
+ -.macro set_sctlr, sreg, reg
+ -	msr	\sreg, \reg
+ -	isb
+ -	/*
+ -	 * Invalidate the local I-cache so that any instructions fetched
+ -	 * speculatively from the PoC are discarded, since they may have
+ -	 * been dynamically patched at the PoU.
+ -	 */
+ -	ic	iallu
+ -	dsb	nsh
+ -	isb
+ -.endm
+  
+ -.macro set_sctlr_el1, reg
+ -	set_sctlr sctlr_el1, \reg
+ -.endm
+ -
+ -.macro set_sctlr_el2, reg
+ -	set_sctlr sctlr_el2, \reg
+ -.endm
+ -
+ -	/*
+ -	 * Check whether preempt/bh-disabled asm code should yield as soon as
+ -	 * it is able. This is the case if we are currently running in task
+ -	 * context, and either a softirq is pending, or the TIF_NEED_RESCHED
+ -	 * flag is set and re-enabling preemption a single time would result in
+ -	 * a preempt count of zero. (Note that the TIF_NEED_RESCHED flag is
+ -	 * stored negated in the top word of the thread_info::preempt_count
+ -	 * field)
+ -	 */
+ -	.macro		cond_yield, lbl:req, tmp:req, tmp2:req
+ -	get_current_task \tmp
+ -	ldr		\tmp, [\tmp, #TSK_TI_PREEMPT]
+ -	/*
+ -	 * If we are serving a softirq, there is no point in yielding: the
+ -	 * softirq will not be preempted no matter what we do, so we should
+ -	 * run to completion as quickly as we can.
+ -	 */
+ -	tbnz		\tmp, #SOFTIRQ_SHIFT, .Lnoyield_\@
+ -#ifdef CONFIG_PREEMPTION
+ -	sub		\tmp, \tmp, #PREEMPT_DISABLE_OFFSET
+ -	cbz		\tmp, \lbl
+ -#endif
+ -	adr_l		\tmp, irq_stat + IRQ_CPUSTAT_SOFTIRQ_PENDING
+ -	get_this_cpu_offset	\tmp2
+ -	ldr		w\tmp, [\tmp, \tmp2]
+ -	cbnz		w\tmp, \lbl	// yield on pending softirq in task context
+ -.Lnoyield_\@:
+ +	.macro		cond_yield_neon, lbl
+ +	if_will_cond_yield_neon
+ +	do_cond_yield_neon
+ +	endif_yield_neon	\lbl
+  	.endm
+  
+ -/*
+ - * Branch Target Identifier (BTI)
+ - */
+ -	.macro  bti, targets
+ -	.equ	.L__bti_targets_c, 34
+ -	.equ	.L__bti_targets_j, 36
+ -	.equ	.L__bti_targets_jc,38
+ -	hint	#.L__bti_targets_\targets
+ -	.endm
+ -
+ -/*
+ - * This macro emits a program property note section identifying
+ - * architecture features which require special handling, mainly for
+ - * use in assembly files included in the VDSO.
+ - */
+ -
+ -#define NT_GNU_PROPERTY_TYPE_0  5
+ -#define GNU_PROPERTY_AARCH64_FEATURE_1_AND      0xc0000000
+ -
+ -#define GNU_PROPERTY_AARCH64_FEATURE_1_BTI      (1U << 0)
+ -#define GNU_PROPERTY_AARCH64_FEATURE_1_PAC      (1U << 1)
+ -
+ -#ifdef CONFIG_ARM64_BTI_KERNEL
+ -#define GNU_PROPERTY_AARCH64_FEATURE_1_DEFAULT		\
+ -		((GNU_PROPERTY_AARCH64_FEATURE_1_BTI |	\
+ -		  GNU_PROPERTY_AARCH64_FEATURE_1_PAC))
+ -#endif
+ -
+ -#ifdef GNU_PROPERTY_AARCH64_FEATURE_1_DEFAULT
+ -.macro emit_aarch64_feature_1_and, feat=GNU_PROPERTY_AARCH64_FEATURE_1_DEFAULT
+ -	.pushsection .note.gnu.property, "a"
+ -	.align  3
+ -	.long   2f - 1f
+ -	.long   6f - 3f
+ -	.long   NT_GNU_PROPERTY_TYPE_0
+ -1:      .string "GNU"
+ -2:
+ -	.align  3
+ -3:      .long   GNU_PROPERTY_AARCH64_FEATURE_1_AND
+ -	.long   5f - 4f
+ -4:
+ -	/*
+ -	 * This is described with an array of char in the Linux API
+ -	 * spec but the text and all other usage (including binutils,
+ -	 * clang and GCC) treat this as a 32 bit value so no swizzling
+ -	 * is required for big endian.
+ -	 */
+ -	.long   \feat
+ -5:
+ -	.align  3
+ -6:
+ -	.popsection
+ -.endm
+ -
+ +	.macro		if_will_cond_yield_neon
+ +#ifdef CONFIG_PREEMPT
+ +	get_current_task	x0
+ +	ldr		x0, [x0, #TSK_TI_PREEMPT]
+ +	sub		x0, x0, #PREEMPT_DISABLE_OFFSET
+ +	cbz		x0, .Lyield_\@
+ +	/* fall through to endif_yield_neon */
+ +	.subsection	1
+ +.Lyield_\@ :
+  #else
+ -.macro emit_aarch64_feature_1_and, feat=0
+ -.endm
+ -
+ -#endif /* GNU_PROPERTY_AARCH64_FEATURE_1_DEFAULT */
+ -
+ -	.macro __mitigate_spectre_bhb_loop      tmp
+ -#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
+ -alternative_cb  spectre_bhb_patch_loop_iter
+ -	mov	\tmp, #32		// Patched to correct the immediate
+ -alternative_cb_end
+ -.Lspectre_bhb_loop\@:
+ -	b	. + 4
+ -	subs	\tmp, \tmp, #1
+ -	b.ne	.Lspectre_bhb_loop\@
+ -	sb
+ -#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
+ +	.section	".discard.cond_yield_neon", "ax"
+ +#endif
+  	.endm
+  
+ -	.macro mitigate_spectre_bhb_loop	tmp
+ -#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
+ -alternative_cb	spectre_bhb_patch_loop_mitigation_enable
+ -	b	.L_spectre_bhb_loop_done\@	// Patched to NOP
+ -alternative_cb_end
+ -	__mitigate_spectre_bhb_loop	\tmp
+ -.L_spectre_bhb_loop_done\@:
+ -#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
+ +	.macro		do_cond_yield_neon
+ +	bl		kernel_neon_end
+ +	bl		kernel_neon_begin
+  	.endm
+  
+ -	/* Save/restores x0-x3 to the stack */
+ -	.macro __mitigate_spectre_bhb_fw
+ -#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
+ -	stp	x0, x1, [sp, #-16]!
+ -	stp	x2, x3, [sp, #-16]!
+ -	mov	w0, #ARM_SMCCC_ARCH_WORKAROUND_3
+ -alternative_cb	smccc_patch_fw_mitigation_conduit
+ -	nop					// Patched to SMC/HVC #0
+ -alternative_cb_end
+ -	ldp	x2, x3, [sp], #16
+ -	ldp	x0, x1, [sp], #16
+ -#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
+ +	.macro		endif_yield_neon, lbl
+ +	.ifnb		\lbl
+ +	b		\lbl
+ +	.else
+ +	b		.Lyield_out_\@
+ +	.endif
+ +	.previous
+ +.Lyield_out_\@ :
+  	.endm
+  
+++<<<<<<< HEAD
+++=======
++ 	.macro mitigate_spectre_bhb_clear_insn
++ #ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
++ alternative_cb	spectre_bhb_patch_clearbhb
++ 	/* Patched to NOP when not supported */
++ 	clearbhb
++ 	isb
++ alternative_cb_end
++ #endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
++ 	.endm
+++>>>>>>> 228a26b91228 (arm64: Use the clearbhb instruction in mitigations)
+  #endif	/* __ASM_ASSEMBLER_H */
+diff --cc arch/arm64/include/asm/cpufeature.h
+index 9935e9521383,a77b5f49b3a6..000000000000
+--- a/arch/arm64/include/asm/cpufeature.h
++++ b/arch/arm64/include/asm/cpufeature.h
+@@@ -609,9 -637,44 +609,44 @@@ static inline bool cpu_supports_mixed_e
+  	return id_aa64mmfr0_mixed_endian_el0(read_cpuid(ID_AA64MMFR0_EL1));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ static inline bool supports_csv2p3(int scope)
++ {
++ 	u64 pfr0;
++ 	u8 csv2_val;
++ 
++ 	if (scope == SCOPE_LOCAL_CPU)
++ 		pfr0 = read_sysreg_s(SYS_ID_AA64PFR0_EL1);
++ 	else
++ 		pfr0 = read_sanitised_ftr_reg(SYS_ID_AA64PFR0_EL1);
++ 
++ 	csv2_val = cpuid_feature_extract_unsigned_field(pfr0,
++ 							ID_AA64PFR0_CSV2_SHIFT);
++ 	return csv2_val == 3;
++ }
++ 
++ static inline bool supports_clearbhb(int scope)
++ {
++ 	u64 isar2;
++ 
++ 	if (scope == SCOPE_LOCAL_CPU)
++ 		isar2 = read_sysreg_s(SYS_ID_AA64ISAR2_EL1);
++ 	else
++ 		isar2 = read_sanitised_ftr_reg(SYS_ID_AA64ISAR2_EL1);
++ 
++ 	return cpuid_feature_extract_unsigned_field(isar2,
++ 						    ID_AA64ISAR2_CLEARBHB_SHIFT);
++ }
++ 
++ const struct cpumask *system_32bit_el0_cpumask(void);
++ DECLARE_STATIC_KEY_FALSE(arm64_mismatched_32bit_el0);
++ 
+++>>>>>>> 228a26b91228 (arm64: Use the clearbhb instruction in mitigations)
+  static inline bool system_supports_32bit_el0(void)
+  {
+ -	u64 pfr0 = read_sanitised_ftr_reg(SYS_ID_AA64PFR0_EL1);
+ -
+ -	return static_branch_unlikely(&arm64_mismatched_32bit_el0) ||
+ -	       id_aa64pfr0_32bit_el0(pfr0);
+ +	return cpus_have_const_cap(ARM64_HAS_32BIT_EL0);
+  }
+  
+  static inline bool system_supports_4kb_granule(void)
+diff --cc arch/arm64/include/asm/sysreg.h
+index b1809fe256e9,932d45b17877..000000000000
+--- a/arch/arm64/include/asm/sysreg.h
++++ b/arch/arm64/include/asm/sysreg.h
+@@@ -711,6 -772,21 +711,24 @@@
+  #define ID_AA64ISAR1_GPI_NI			0x0
+  #define ID_AA64ISAR1_GPI_IMP_DEF		0x1
+  
+++<<<<<<< HEAD
+++=======
++ /* id_aa64isar2 */
++ #define ID_AA64ISAR2_CLEARBHB_SHIFT	28
++ #define ID_AA64ISAR2_RPRES_SHIFT	4
++ #define ID_AA64ISAR2_WFXT_SHIFT		0
++ 
++ #define ID_AA64ISAR2_RPRES_8BIT		0x0
++ #define ID_AA64ISAR2_RPRES_12BIT	0x1
++ /*
++  * Value 0x1 has been removed from the architecture, and is
++  * reserved, but has not yet been removed from the ARM ARM
++  * as of ARM DDI 0487G.b.
++  */
++ #define ID_AA64ISAR2_WFXT_NI		0x0
++ #define ID_AA64ISAR2_WFXT_SUPPORTED	0x2
++ 
+++>>>>>>> 228a26b91228 (arm64: Use the clearbhb instruction in mitigations)
+  /* id_aa64pfr0 */
+  #define ID_AA64PFR0_CSV3_SHIFT		60
+  #define ID_AA64PFR0_CSV2_SHIFT		56
+diff --cc arch/arm64/kernel/cpufeature.c
+index 0854c01dc6ba,d33687673f6b..000000000000
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@@ -228,6 -230,12 +228,15 @@@ static const struct arm64_ftr_bits ftr_
+  	ARM64_FTR_END,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct arm64_ftr_bits ftr_id_aa64isar2[] = {
++ 	ARM64_FTR_BITS(FTR_HIDDEN, FTR_STRICT, FTR_HIGHER_SAFE, ID_AA64ISAR2_CLEARBHB_SHIFT, 4, 0),
++ 	ARM64_FTR_BITS(FTR_VISIBLE, FTR_NONSTRICT, FTR_LOWER_SAFE, ID_AA64ISAR2_RPRES_SHIFT, 4, 0),
++ 	ARM64_FTR_END,
++ };
++ 
+++>>>>>>> 228a26b91228 (arm64: Use the clearbhb instruction in mitigations)
+  static const struct arm64_ftr_bits ftr_id_aa64pfr0[] = {
+  	ARM64_FTR_BITS(FTR_HIDDEN, FTR_NONSTRICT, FTR_LOWER_SAFE, ID_AA64PFR0_CSV3_SHIFT, 4, 0),
+  	ARM64_FTR_BITS(FTR_HIDDEN, FTR_NONSTRICT, FTR_LOWER_SAFE, ID_AA64PFR0_CSV2_SHIFT, 4, 0),
+diff --cc arch/arm64/kernel/entry.S
+index af24e27e2389,4a3a653df07e..000000000000
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@@ -800,13 -644,41 +800,48 @@@ alternative_else_nop_endi
+  	sub	\dst, \dst, PAGE_SIZE
+  	.endm
+  
+++<<<<<<< HEAD
+ +	.macro tramp_ventry, vector_start, regsize, kpti
+++=======
++ 	.macro tramp_data_read_var	dst, var
++ #ifdef CONFIG_RANDOMIZE_BASE
++ 	tramp_data_page		\dst
++ 	add	\dst, \dst, #:lo12:__entry_tramp_data_\var
++ 	ldr	\dst, [\dst]
++ #else
++ 	ldr	\dst, =\var
++ #endif
++ 	.endm
++ 
++ #define BHB_MITIGATION_NONE	0
++ #define BHB_MITIGATION_LOOP	1
++ #define BHB_MITIGATION_FW	2
++ #define BHB_MITIGATION_INSN	3
++ 
++ 	.macro tramp_ventry, vector_start, regsize, kpti, bhb
+++>>>>>>> 228a26b91228 (arm64: Use the clearbhb instruction in mitigations)
+  	.align	7
+  1:
+  	.if	\regsize == 64
+  	msr	tpidrro_el0, x30	// Restored in kernel_ventry
+  	.endif
+  
+++<<<<<<< HEAD
+++=======
++ 	.if	\bhb == BHB_MITIGATION_LOOP
++ 	/*
++ 	 * This sequence must appear before the first indirect branch. i.e. the
++ 	 * ret out of tramp_ventry. It appears here because x30 is free.
++ 	 */
++ 	__mitigate_spectre_bhb_loop	x30
++ 	.endif // \bhb == BHB_MITIGATION_LOOP
++ 
++ 	.if	\bhb == BHB_MITIGATION_INSN
++ 	clearbhb
++ 	isb
++ 	.endif // \bhb == BHB_MITIGATION_INSN
++ 
+++>>>>>>> 228a26b91228 (arm64: Use the clearbhb instruction in mitigations)
+  	.if	\kpti == 1
+  	/*
+  	 * Defend against branch aliasing attacks by pushing a dummy
+@@@ -861,9 -743,21 +896,18 @@@ alternative_else_nop_endi
+  	.endr
+  	.endm
+  
+ -#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+ -/*
+ - * Exception vectors trampoline.
+ - * The order must match __bp_harden_el1_vectors and the
+ - * arm64_bp_harden_el1_vectors enum.
+ - */
+ -	.pushsection ".entry.tramp.text", "ax"
+  	.align	11
+  SYM_CODE_START_NOALIGN(tramp_vectors)
+++<<<<<<< HEAD
+ +	generate_tramp_vector	kpti=1
+++=======
++ #ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
++ 	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_LOOP
++ 	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_FW
++ 	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_INSN
++ #endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
++ 	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_NONE
+++>>>>>>> 228a26b91228 (arm64: Use the clearbhb instruction in mitigations)
+  SYM_CODE_END(tramp_vectors)
+  
+  SYM_CODE_START(tramp_exit_native)
+@@@ -913,7 -814,12 +957,15 @@@ SYM_DATA_END(__entry_tramp_data_start
+  	.pushsection ".entry.text", "ax"
+  	.align	11
+  SYM_CODE_START(__bp_harden_el1_vectors)
+++<<<<<<< HEAD
+ +	generate_el1_vector
+++=======
++ #ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
++ 	generate_el1_vector	bhb=BHB_MITIGATION_LOOP
++ 	generate_el1_vector	bhb=BHB_MITIGATION_FW
++ 	generate_el1_vector	bhb=BHB_MITIGATION_INSN
++ #endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
+++>>>>>>> 228a26b91228 (arm64: Use the clearbhb instruction in mitigations)
+  SYM_CODE_END(__bp_harden_el1_vectors)
+  	.popsection
+  
+diff --cc arch/arm64/kernel/image-vars.h
+index 6b3f280bb1b2,55a1ced8eb77..000000000000
+--- a/arch/arm64/kernel/image-vars.h
++++ b/arch/arm64/kernel/image-vars.h
+@@@ -58,24 -61,21 +58,33 @@@ __efistub_screen_info		= screen_info
+   * memory mappings.
+   */
+  
+ +#define KVM_NVHE_ALIAS(sym) __kvm_nvhe_##sym = sym;
+ +
+  /* Alternative callbacks for init-time patching of nVHE hyp code. */
+ +KVM_NVHE_ALIAS(arm64_enable_wa2_handling);
+  KVM_NVHE_ALIAS(kvm_patch_vector_branch);
+  KVM_NVHE_ALIAS(kvm_update_va_mask);
+++<<<<<<< HEAD
+++=======
++ KVM_NVHE_ALIAS(kvm_get_kimage_voffset);
++ KVM_NVHE_ALIAS(kvm_compute_final_ctr_el0);
++ KVM_NVHE_ALIAS(spectre_bhb_patch_loop_iter);
++ KVM_NVHE_ALIAS(spectre_bhb_patch_loop_mitigation_enable);
++ KVM_NVHE_ALIAS(spectre_bhb_patch_wa3);
++ KVM_NVHE_ALIAS(spectre_bhb_patch_clearbhb);
+++>>>>>>> 228a26b91228 (arm64: Use the clearbhb instruction in mitigations)
+  
+  /* Global kernel state accessed by nVHE hyp code. */
+ +KVM_NVHE_ALIAS(arm64_ssbd_callback_required);
+ +KVM_NVHE_ALIAS(kvm_host_data);
+  KVM_NVHE_ALIAS(kvm_vgic_global_state);
+  
+ +/* Kernel constant needed to compute idmap addresses. */
+ +KVM_NVHE_ALIAS(kimage_voffset);
+ +
+  /* Kernel symbols used to call panic() from nVHE hyp code (via ERET). */
+ -KVM_NVHE_ALIAS(nvhe_hyp_panic_handler);
+ +KVM_NVHE_ALIAS(__hyp_panic_string);
+ +KVM_NVHE_ALIAS(panic);
+  
+  /* Vectors installed by hyp-init on reset HVC. */
+  KVM_NVHE_ALIAS(__hyp_stub_vectors);
+diff --cc arch/arm64/kvm/hyp/hyp-entry.S
+index 678b9b6d6a8f,7839d075729b..000000000000
+--- a/arch/arm64/kvm/hyp/hyp-entry.S
++++ b/arch/arm64/kvm/hyp/hyp-entry.S
+@@@ -297,44 -192,56 +297,70 @@@ SYM_CODE_START(__kvm_hyp_vector
+  	valid_vect	el1_error		// Error 32-bit EL1
+  SYM_CODE_END(__kvm_hyp_vector)
+  
+ -.macro spectrev2_smccc_wa1_smc
+ -	sub	sp, sp, #(8 * 4)
+ -	stp	x2, x3, [sp, #(8 * 0)]
+ -	stp	x0, x1, [sp, #(8 * 2)]
+ -	alternative_cb spectre_bhb_patch_wa3
+ -	/* Patched to mov WA3 when supported */
+ -	mov	w0, #ARM_SMCCC_ARCH_WORKAROUND_1
+ -	alternative_cb_end
+ -	smc	#0
+ -	ldp	x2, x3, [sp, #(8 * 0)]
+ -	add	sp, sp, #(8 * 2)
+ -.endm
+ -
+ -.macro hyp_ventry	indirect, spectrev2
+ -	.align	7
+ +#ifdef CONFIG_KVM_INDIRECT_VECTORS
+ +.macro hyp_ventry
+ +	.align 7
+  1:	esb
+ -	.if \spectrev2 != 0
+ -	spectrev2_smccc_wa1_smc
+ -	.else
+ +	.rept 26
+ +	nop
+ +	.endr
+ +/*
+ + * The default sequence is to directly branch to the KVM vectors,
+ + * using the computed offset. This applies for VHE as well as
+ + * !ARM64_HARDEN_EL2_VECTORS. The first vector must always run the preamble.
+ + *
+ + * For ARM64_HARDEN_EL2_VECTORS configurations, this gets replaced
+ + * with:
+ + *
+ + * stp	x0, x1, [sp, #-16]!
+ + * movz	x0, #(addr & 0xffff)
+ + * movk	x0, #((addr >> 16) & 0xffff), lsl #16
+ + * movk	x0, #((addr >> 32) & 0xffff), lsl #32
+ + * br	x0
+ + *
+ + * Where:
+ + * addr = kern_hyp_va(__kvm_hyp_vector) + vector-offset + KVM_VECTOR_PREAMBLE.
+ + * See kvm_patch_vector_branch for details.
+ + */
+ +alternative_cb	kvm_patch_vector_branch
+  	stp	x0, x1, [sp, #-16]!
+++<<<<<<< HEAD
+++=======
++ 	mitigate_spectre_bhb_loop	x0
++ 	mitigate_spectre_bhb_clear_insn
++ 	.endif
++ 	.if \indirect != 0
++ 	alternative_cb  kvm_patch_vector_branch
++ 	/*
++ 	 * For ARM64_SPECTRE_V3A configurations, these NOPs get replaced with:
++ 	 *
++ 	 * movz	x0, #(addr & 0xffff)
++ 	 * movk	x0, #((addr >> 16) & 0xffff), lsl #16
++ 	 * movk	x0, #((addr >> 32) & 0xffff), lsl #32
++ 	 * br	x0
++ 	 *
++ 	 * Where:
++ 	 * addr = kern_hyp_va(__kvm_hyp_vector) + vector-offset + KVM_VECTOR_PREAMBLE.
++ 	 * See kvm_patch_vector_branch for details.
++ 	 */
++ 	nop
++ 	nop
++ 	nop
++ 	nop
++ 	alternative_cb_end
++ 	.endif
+++>>>>>>> 228a26b91228 (arm64: Use the clearbhb instruction in mitigations)
+  	b	__kvm_hyp_vector + (1b - 0b + KVM_VECTOR_PREAMBLE)
+ +	nop
+ +	nop
+ +	nop
+ +alternative_cb_end
+  .endm
+  
+ -.macro generate_vectors	indirect, spectrev2
+ +.macro generate_vectors
+  0:
+  	.rept 16
+ -	hyp_ventry	\indirect, \spectrev2
+ +	hyp_ventry
+  	.endr
+  	.org 0b + SZ_2K		// Safety measure
+  .endm
+* Unmerged path arch/arm64/include/asm/vectors.h
+* Unmerged path arch/arm64/kernel/proton-pack.c
+* Unmerged path arch/arm64/include/asm/assembler.h
+* Unmerged path arch/arm64/include/asm/cpufeature.h
+diff --git a/arch/arm64/include/asm/insn.h b/arch/arm64/include/asm/insn.h
+index b9d4c07d8fc6..eecc931dcbe0 100644
+--- a/arch/arm64/include/asm/insn.h
++++ b/arch/arm64/include/asm/insn.h
+@@ -75,6 +75,7 @@ enum aarch64_insn_hint_cr_op {
+ 	AARCH64_INSN_HINT_PSB  = 0x11 << 5,
+ 	AARCH64_INSN_HINT_TSB  = 0x12 << 5,
+ 	AARCH64_INSN_HINT_CSDB = 0x14 << 5,
++	AARCH64_INSN_HINT_CLEARBHB = 0x16 << 5,
+ 
+ 	AARCH64_INSN_HINT_BTI   = 0x20 << 5,
+ 	AARCH64_INSN_HINT_BTIC  = 0x22 << 5,
+* Unmerged path arch/arm64/include/asm/sysreg.h
+* Unmerged path arch/arm64/include/asm/vectors.h
+* Unmerged path arch/arm64/kernel/cpufeature.c
+* Unmerged path arch/arm64/kernel/entry.S
+* Unmerged path arch/arm64/kernel/image-vars.h
+* Unmerged path arch/arm64/kernel/proton-pack.c
+* Unmerged path arch/arm64/kvm/hyp/hyp-entry.S
