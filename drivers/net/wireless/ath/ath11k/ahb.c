@@ -1158,11 +1158,15 @@ static int ath11k_ahb_probe(struct platform_device *pdev)
 		goto err_core_free;
 	}
 
-	ab->mem_ce = ab->mem;
-
 	ret = ath11k_core_pre_init(ab);
 	if (ret)
 		goto err_core_free;
+
+	ret = ath11k_ahb_setup_resources(ab);
+	if (ret)
+		goto err_core_free;
+
+	ab->mem_ce = ab->mem;
 
 	if (ab->hw_params.ce_remap) {
 		const struct ce_remap *ce_remap = ab->hw_params.ce_remap;
@@ -1177,10 +1181,6 @@ static int ath11k_ahb_probe(struct platform_device *pdev)
 			goto err_core_free;
 		}
 	}
-
-	ret = ath11k_ahb_setup_resources(ab);
-	if (ret)
-		goto err_core_free;
 
 	ret = ath11k_ahb_fw_resources_init(ab);
 	if (ret)
