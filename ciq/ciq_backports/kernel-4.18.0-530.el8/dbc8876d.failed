@@ -1,0 +1,209 @@
+crypto: qat - add rp2svc sysfs attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-530.el8
+commit-author Ciunas Bennett <ciunas.bennett@intel.com>
+commit dbc8876dd873a6ac5e3191b419d2de5ca613165f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-530.el8/dbc8876d.failed
+
+Add the attribute `rp2svc` to the `qat` attribute group. This provides a
+way for a user to query a specific ring pair for the type of service
+that is currently configured for.
+
+When read, the service will be returned for the defined ring pair.
+When written to this value will be stored as the ring pair to return
+the service of.
+
+	Signed-off-by: Ciunas Bennett <ciunas.bennett@intel.com>
+	Reviewed-by: Giovanni Cabiddu <giovanni.cabiddu@intel.com>
+	Reviewed-by: Damian Muszynski <damian.muszynski@intel.com>
+	Reviewed-by: Tero Kristo <tero.kristo@linux.intel.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit dbc8876dd873a6ac5e3191b419d2de5ca613165f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/qat/qat_common/adf_accel_devices.h
+diff --cc drivers/crypto/qat/qat_common/adf_accel_devices.h
+index c43e39c34d9b,4ff5729a3496..000000000000
+--- a/drivers/crypto/qat/qat_common/adf_accel_devices.h
++++ b/drivers/crypto/qat/qat_common/adf_accel_devices.h
+@@@ -280,6 -328,23 +280,26 @@@ struct adf_dc_data 
+  	dma_addr_t ovf_buff_p;
+  };
+  
+++<<<<<<< HEAD:drivers/crypto/qat/qat_common/adf_accel_devices.h
+++=======
++ struct adf_pm {
++ 	struct dentry *debugfs_pm_status;
++ 	bool present;
++ 	int idle_irq_counters;
++ 	int throttle_irq_counters;
++ 	int fw_irq_counters;
++ 	int host_ack_counter;
++ 	int host_nack_counter;
++ 	ssize_t (*print_pm_status)(struct adf_accel_dev *accel_dev,
++ 				   char __user *buf, size_t count, loff_t *pos);
++ };
++ 
++ struct adf_sysfs {
++ 	int ring_num;
++ 	struct rw_semaphore lock; /* protects access to the fields in this struct */
++ };
++ 
+++>>>>>>> dbc8876dd873 (crypto: qat - add rp2svc sysfs attribute):drivers/crypto/intel/qat/qat_common/adf_accel_devices.h
+  struct adf_accel_dev {
+  	struct adf_etr_data *transport;
+  	struct adf_hw_device_data *hw_device;
+@@@ -295,6 -361,12 +315,13 @@@
+  	struct list_head list;
+  	struct module *owner;
+  	struct adf_accel_pci accel_pci_dev;
+++<<<<<<< HEAD:drivers/crypto/qat/qat_common/adf_accel_devices.h
+++=======
++ 	struct adf_timer *timer;
++ 	struct adf_heartbeat *heartbeat;
++ 	struct adf_rl *rate_limiting;
++ 	struct adf_sysfs sysfs;
+++>>>>>>> dbc8876dd873 (crypto: qat - add rp2svc sysfs attribute):drivers/crypto/intel/qat/qat_common/adf_accel_devices.h
+  	union {
+  		struct {
+  			/* protects VF2PF interrupts access */
+diff --git a/Documentation/ABI/testing/sysfs-driver-qat b/Documentation/ABI/testing/sysfs-driver-qat
+index ef6d6c57105e..869a0d6139c7 100644
+--- a/Documentation/ABI/testing/sysfs-driver-qat
++++ b/Documentation/ABI/testing/sysfs-driver-qat
+@@ -93,3 +93,35 @@ Description:	(RW) This configuration option provides a way to force the device i
+ 			0
+ 
+ 		This attribute is only available for qat_4xxx devices.
++
++What:		/sys/bus/pci/devices/<BDF>/qat/rp2srv
++Date:		January 2024
++KernelVersion:	6.7
++Contact:	qat-linux@intel.com
++Description:
++		(RW) This attribute provides a way for a user to query a
++		specific ring pair for the type of service that it is currently
++		configured for.
++
++		When written to, the value is cached and used to perform the
++		read operation. Allowed values are in the range 0 to N-1, where
++		N is the max number of ring pairs supported by a device. This
++		can be queried using the attribute qat/num_rps.
++
++		A read returns the service associated to the ring pair queried.
++
++		The values are:
++
++		* dc: the ring pair is configured for running compression services
++		* sym: the ring pair is configured for running symmetric crypto
++		  services
++		* asym: the ring pair is configured for running asymmetric crypto
++		  services
++
++		Example usage::
++
++			# echo 1 > /sys/bus/pci/devices/<BDF>/qat/rp2srv
++			# cat /sys/bus/pci/devices/<BDF>/qat/rp2srv
++			sym
++
++		This attribute is only available for qat_4xxx devices.
+* Unmerged path drivers/crypto/qat/qat_common/adf_accel_devices.h
+diff --git a/drivers/crypto/qat/qat_common/adf_sysfs.c b/drivers/crypto/qat/qat_common/adf_sysfs.c
+index 8672cfa2800f..2259a8509b05 100644
+--- a/drivers/crypto/qat/qat_common/adf_sysfs.c
++++ b/drivers/crypto/qat/qat_common/adf_sysfs.c
+@@ -7,6 +7,8 @@
+ #include "adf_cfg.h"
+ #include "adf_common_drv.h"
+ 
++#define UNSET_RING_NUM -1
++
+ static const char * const state_operations[] = {
+ 	[DEV_DOWN] = "down",
+ 	[DEV_UP] = "up",
+@@ -216,10 +218,72 @@ static DEVICE_ATTR_RW(pm_idle_enabled);
+ static DEVICE_ATTR_RW(state);
+ static DEVICE_ATTR_RW(cfg_services);
+ 
++static ssize_t rp2srv_show(struct device *dev, struct device_attribute *attr,
++			   char *buf)
++{
++	struct adf_hw_device_data *hw_data;
++	struct adf_accel_dev *accel_dev;
++	enum adf_cfg_service_type svc;
++
++	accel_dev = adf_devmgr_pci_to_accel_dev(to_pci_dev(dev));
++	hw_data = GET_HW_DATA(accel_dev);
++
++	if (accel_dev->sysfs.ring_num == UNSET_RING_NUM)
++		return -EINVAL;
++
++	down_read(&accel_dev->sysfs.lock);
++	svc = GET_SRV_TYPE(accel_dev, accel_dev->sysfs.ring_num %
++					      hw_data->num_banks_per_vf);
++	up_read(&accel_dev->sysfs.lock);
++
++	switch (svc) {
++	case COMP:
++		return sysfs_emit(buf, "%s\n", ADF_CFG_DC);
++	case SYM:
++		return sysfs_emit(buf, "%s\n", ADF_CFG_SYM);
++	case ASYM:
++		return sysfs_emit(buf, "%s\n", ADF_CFG_ASYM);
++	default:
++		break;
++	}
++	return -EINVAL;
++}
++
++static ssize_t rp2srv_store(struct device *dev, struct device_attribute *attr,
++			    const char *buf, size_t count)
++{
++	struct adf_accel_dev *accel_dev;
++	int ring, num_rings, ret;
++
++	accel_dev = adf_devmgr_pci_to_accel_dev(to_pci_dev(dev));
++	if (!accel_dev)
++		return -EINVAL;
++
++	ret = kstrtouint(buf, 10, &ring);
++	if (ret)
++		return ret;
++
++	num_rings = GET_MAX_BANKS(accel_dev);
++	if (ring >= num_rings) {
++		dev_err(&GET_DEV(accel_dev),
++			"Device does not support more than %u ring pairs\n",
++			num_rings);
++		return -EINVAL;
++	}
++
++	down_write(&accel_dev->sysfs.lock);
++	accel_dev->sysfs.ring_num = ring;
++	up_write(&accel_dev->sysfs.lock);
++
++	return count;
++}
++static DEVICE_ATTR_RW(rp2srv);
++
+ static struct attribute *qat_attrs[] = {
+ 	&dev_attr_state.attr,
+ 	&dev_attr_cfg_services.attr,
+ 	&dev_attr_pm_idle_enabled.attr,
++	&dev_attr_rp2srv.attr,
+ 	NULL,
+ };
+ 
+@@ -238,6 +302,8 @@ int adf_sysfs_init(struct adf_accel_dev *accel_dev)
+ 			"Failed to create qat attribute group: %d\n", ret);
+ 	}
+ 
++	accel_dev->sysfs.ring_num = UNSET_RING_NUM;
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(adf_sysfs_init);
