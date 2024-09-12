@@ -1,0 +1,164 @@
+gve: Tx path for DQO-QPL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-540.el8
+commit-author Rushil Gupta <rushilg@google.com>
+commit a6fb8d5a8b6925f1e635818d3dd2d89531d4a058
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-540.el8/a6fb8d5a.failed
+
+Each QPL page is divided into GVE_TX_BUFS_PER_PAGE_DQO buffers.
+When a packet needs to be transmitted, we break the packet into max
+GVE_TX_BUF_SIZE_DQO sized chunks and transmit each chunk using a TX
+descriptor.
+We allocate the TX buffers from the free list in dqo_tx.
+We store these TX buffer indices in an array in the pending_packet
+structure.
+
+The TX buffers are returned to the free list in dqo_compl after
+receiving packet completion or when removing packets from miss
+completions list.
+
+	Signed-off-by: Rushil Gupta <rushilg@google.com>
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: Praveen Kaligineedi <pkaligineedi@google.com>
+	Signed-off-by: Bailey Forrest <bcf@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a6fb8d5a8b6925f1e635818d3dd2d89531d4a058)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve.h
+#	drivers/net/ethernet/google/gve/gve_tx_dqo.c
+diff --cc drivers/net/ethernet/google/gve/gve.h
+index 3455a6e1efde,2042f79cea1f..000000000000
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@@ -49,8 -50,28 +49,22 @@@
+  
+  #define GVE_XDP_ACTIONS 5
+  
+ -#define GVE_GQ_TX_MIN_PKT_DESC_BYTES 182
+ -
+ -#define DQO_QPL_DEFAULT_TX_PAGES 512
+ -#define DQO_QPL_DEFAULT_RX_PAGES 2048
+ -
+ -/* Maximum TSO size supported on DQO */
+ -#define GVE_DQO_TX_MAX	0x3FFFF
+ +#define GVE_TX_MAX_HEADER_SIZE 182
+  
++ #define GVE_TX_BUF_SHIFT_DQO 11
++ 
++ /* 2K buffers for DQO-QPL */
++ #define GVE_TX_BUF_SIZE_DQO BIT(GVE_TX_BUF_SHIFT_DQO)
++ #define GVE_TX_BUFS_PER_PAGE_DQO (PAGE_SIZE >> GVE_TX_BUF_SHIFT_DQO)
++ #define GVE_MAX_TX_BUFS_PER_PKT (DIV_ROUND_UP(GVE_DQO_TX_MAX, GVE_TX_BUF_SIZE_DQO))
++ 
++ /* If number of free/recyclable buffers are less than this threshold; driver
++  * allocs and uses a non-qpl page on the receive path of DQO QPL to free
++  * up buffers.
++  * Value is set big enough to post at least 3 64K LRO packet via 2K buffer to NIC.
++  */
++ #define GVE_DQO_QPL_ONDEMAND_ALLOC_THRESHOLD 96
++ 
+  /* Each slot in the desc ring has a 1:1 mapping to a slot in the data ring */
+  struct gve_rx_desc_queue {
+  	struct gve_rx_desc *desc_ring; /* the descriptor ring */
+@@@ -453,6 -527,21 +517,24 @@@ struct gve_tx_ring 
+  			s16 num_pending_packets;
+  
+  			u32 complq_mask; /* complq size is complq_mask + 1 */
+++<<<<<<< HEAD
+++=======
++ 
++ 			/* QPL fields */
++ 			struct {
++ 				/* qpl assigned to this queue */
++ 				struct gve_queue_page_list *qpl;
++ 
++ 				/* Each QPL page is divided into TX bounce buffers
++ 				 * of size GVE_TX_BUF_SIZE_DQO. tx_qpl_buf_next is
++ 				 * an array to manage linked lists of TX buffers.
++ 				 * An entry j at index i implies that j'th buffer
++ 				 * is next on the list after i
++ 				 */
++ 				s16 *tx_qpl_buf_next;
++ 				u32 num_tx_qpl_bufs;
++ 			};
+++>>>>>>> a6fb8d5a8b69 (gve: Tx path for DQO-QPL)
+  		} dqo;
+  	} ____cacheline_aligned;
+  	struct netdev_queue *netdev_txq;
+diff --cc drivers/net/ethernet/google/gve/gve_tx_dqo.c
+index b76143bfd594,1e19b834a613..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_tx_dqo.c
++++ b/drivers/net/ethernet/google/gve/gve_tx_dqo.c
+@@@ -635,26 -854,44 +853,64 @@@ static int gve_try_tx_skb(struct gve_pr
+  	int num_buffer_descs;
+  	int total_num_descs;
+  
+++<<<<<<< HEAD
+ +	if (skb_is_gso(skb)) {
+ +		/* If TSO doesn't meet HW requirements, attempt to linearize the
+ +		 * packet.
+ +		 */
+ +		if (unlikely(!gve_can_send_tso(skb) &&
+ +			     skb_linearize(skb) < 0)) {
+ +			net_err_ratelimited("%s: Failed to transmit TSO packet\n",
+ +					    priv->dev->name);
+ +			goto drop;
+ +		}
+ +
+ +		num_buffer_descs = gve_num_buffer_descs_needed(skb);
+ +	} else {
+ +		num_buffer_descs = gve_num_buffer_descs_needed(skb);
+ +
+ +		if (unlikely(num_buffer_descs > GVE_TX_MAX_DATA_DESCS)) {
+ +			if (unlikely(skb_linearize(skb) < 0))
+++=======
++ 	if (tx->dqo.qpl) {
++ 		if (skb_is_gso(skb))
++ 			if (unlikely(ipv6_hopopt_jumbo_remove(skb)))
+++>>>>>>> a6fb8d5a8b69 (gve: Tx path for DQO-QPL)
+  				goto drop;
+  
+- 			num_buffer_descs = 1;
++ 		/* We do not need to verify the number of buffers used per
++ 		 * packet or per segment in case of TSO as with 2K size buffers
++ 		 * none of the TX packet rules would be violated.
++ 		 *
++ 		 * gve_can_send_tso() checks that each TCP segment of gso_size is
++ 		 * not distributed over more than 9 SKB frags..
++ 		 */
++ 		num_buffer_descs = DIV_ROUND_UP(skb->len, GVE_TX_BUF_SIZE_DQO);
++ 	} else {
++ 		if (skb_is_gso(skb)) {
++ 			/* If TSO doesn't meet HW requirements, attempt to linearize the
++ 			 * packet.
++ 			 */
++ 			if (unlikely(!gve_can_send_tso(skb) &&
++ 				     skb_linearize(skb) < 0)) {
++ 				net_err_ratelimited("%s: Failed to transmit TSO packet\n",
++ 						    priv->dev->name);
++ 				goto drop;
++ 			}
++ 
++ 			if (unlikely(ipv6_hopopt_jumbo_remove(skb)))
++ 				goto drop;
++ 
++ 			num_buffer_descs = gve_num_buffer_descs_needed(skb);
++ 		} else {
++ 			num_buffer_descs = gve_num_buffer_descs_needed(skb);
++ 
++ 			if (unlikely(num_buffer_descs > GVE_TX_MAX_DATA_DESCS)) {
++ 				if (unlikely(skb_linearize(skb) < 0))
++ 					goto drop;
++ 
++ 				num_buffer_descs = 1;
++ 			}
+  		}
+  	}
+  
+* Unmerged path drivers/net/ethernet/google/gve/gve.h
+* Unmerged path drivers/net/ethernet/google/gve/gve_tx_dqo.c
