@@ -1,0 +1,206 @@
+ice: do not busy-wait to read GNSS data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-477.21.1.el8_8
+commit-author Michal Schmidt <mschmidt@redhat.com>
+commit 2f8fdcb0a73a1831cc4f205f23493a17c0e5536f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-477.21.1.el8_8/2f8fdcb0.failed
+
+The ice-gnss-<dev_name> kernel thread, which reads data from the u-blox
+GNSS module, keep a CPU core almost 100% busy. The main reason is that
+it busy-waits for data to become available.
+
+A simple improvement would be to replace the "mdelay(10);" in
+ice_gnss_read() with sleeping. A better fix is to not do any waiting
+directly in the function and just requeue this delayed work as needed.
+The advantage is that canceling the work from ice_gnss_exit() becomes
+immediate, rather than taking up to ~2.5 seconds (ICE_MAX_UBX_READ_TRIES
+* 10 ms).
+
+This lowers the CPU usage of the ice-gnss-<dev_name> thread on my system
+from ~90 % to ~8 %.
+
+I am not sure if the larger 0.1 s pause after inserting data into the
+gnss subsystem is really necessary, but I'm keeping that as it was.
+
+Of course, ideally the driver would not have to poll at all, but I don't
+know if the E810 can watch for GNSS data availability over the i2c bus
+by itself and notify the driver.
+
+	Signed-off-by: Michal Schmidt <mschmidt@redhat.com>
+	Reviewed-by: Arkadiusz Kubalewski <arkadiusz.kubalewski@intel.com>
+	Reviewed-by: Simon Horman <simon.horman@corigine.com>
+	Tested-by: Sunitha Mekala <sunithax.d.mekala@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 2f8fdcb0a73a1831cc4f205f23493a17c0e5536f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_gnss.c
+#	drivers/net/ethernet/intel/ice/ice_gnss.h
+diff --cc drivers/net/ethernet/intel/ice/ice_gnss.c
+index 77ced5641e4e,2ea8a2b11bcd..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_gnss.c
++++ b/drivers/net/ethernet/intel/ice/ice_gnss.c
+@@@ -16,9 -117,9 +16,14 @@@ static void ice_gnss_read(struct kthrea
+  {
+  	struct gnss_serial *gnss = container_of(work, struct gnss_serial,
+  						read_work.work);
+++<<<<<<< HEAD
+++=======
++ 	unsigned long delay = ICE_GNSS_POLL_DATA_DELAY_TIME;
++ 	unsigned int i, bytes_read, data_len, count;
+++>>>>>>> 2f8fdcb0a73a (ice: do not busy-wait to read GNSS data)
+  	struct ice_aqc_link_topo_addr link_topo;
+ +	unsigned int i, bytes_read, data_len;
+ +	struct tty_port *port;
+  	struct ice_pf *pf;
+  	struct ice_hw *hw;
+  	__be16 data_len_b;
+@@@ -32,14 -133,10 +37,17 @@@
+  		goto exit;
+  	}
+  
+ -	if (!test_bit(ICE_FLAG_GNSS, pf->flags))
+ -		return;
+ -
+  	hw = &pf->hw;
+++<<<<<<< HEAD
+ +	port = gnss->tty->port;
+ +
+ +	buf = (char *)get_zeroed_page(GFP_KERNEL);
+ +	if (!buf) {
+ +		err = -ENOMEM;
+ +		goto exit;
+ +	}
+++=======
+++>>>>>>> 2f8fdcb0a73a (ice: do not busy-wait to read GNSS data)
+  
+  	memset(&link_topo, 0, sizeof(struct ice_aqc_link_topo_addr));
+  	link_topo.topo_params.index = ICE_E810T_GNSS_I2C_BUS;
+@@@ -50,26 -147,24 +58,29 @@@
+  	i2c_params = ICE_GNSS_UBX_DATA_LEN_WIDTH |
+  		     ICE_AQC_I2C_USE_REPEATED_START;
+  
+- 	/* Read data length in a loop, when it's not 0 the data is ready */
+- 	for (i = 0; i < ICE_MAX_UBX_READ_TRIES; i++) {
+- 		err = ice_aq_read_i2c(hw, link_topo, ICE_GNSS_UBX_I2C_BUS_ADDR,
+- 				      cpu_to_le16(ICE_GNSS_UBX_DATA_LEN_H),
+- 				      i2c_params, (u8 *)&data_len_b, NULL);
+- 		if (err)
+- 			goto exit_buf;
++ 	err = ice_aq_read_i2c(hw, link_topo, ICE_GNSS_UBX_I2C_BUS_ADDR,
++ 			      cpu_to_le16(ICE_GNSS_UBX_DATA_LEN_H),
++ 			      i2c_params, (u8 *)&data_len_b, NULL);
++ 	if (err)
++ 		goto requeue;
+  
+- 		data_len = be16_to_cpu(data_len_b);
+- 		if (data_len != 0 && data_len != U16_MAX)
+- 			break;
++ 	data_len = be16_to_cpu(data_len_b);
++ 	if (data_len == 0 || data_len == U16_MAX)
++ 		goto requeue;
+  
+- 		mdelay(10);
+- 	}
++ 	/* The u-blox has data_len bytes for us to read */
+  
+  	data_len = min_t(typeof(data_len), data_len, PAGE_SIZE);
+++<<<<<<< HEAD
+ +	data_len = tty_buffer_request_room(port, data_len);
+ +	if (!data_len) {
+++=======
++ 
++ 	buf = (char *)get_zeroed_page(GFP_KERNEL);
++ 	if (!buf) {
+++>>>>>>> 2f8fdcb0a73a (ice: do not busy-wait to read GNSS data)
+  		err = -ENOMEM;
+- 		goto exit_buf;
++ 		goto requeue;
+  	}
+  
+  	/* Read received data */
+@@@ -83,19 -178,19 +94,29 @@@
+  				      cpu_to_le16(ICE_GNSS_UBX_EMPTY_DATA),
+  				      bytes_read, &buf[i], NULL);
+  		if (err)
+- 			goto exit_buf;
++ 			goto free_buf;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Send the data to the tty layer for users to read. This doesn't
+ +	 * actually push the data through unless tty->low_latency is set.
+ +	 */
+ +	tty_insert_flip_string(port, buf, i);
+ +	tty_flip_buffer_push(port);
+ +
+ +exit_buf:
+++=======
++ 	count = gnss_insert_raw(pf->gnss_dev, buf, i);
++ 	if (count != i)
++ 		dev_warn(ice_pf_to_dev(pf),
++ 			 "gnss_insert_raw ret=%d size=%d\n",
++ 			 count, i);
++ 	delay = ICE_GNSS_TIMER_DELAY_TIME;
++ free_buf:
+++>>>>>>> 2f8fdcb0a73a (ice: do not busy-wait to read GNSS data)
+  	free_page((unsigned long)buf);
+- 	kthread_queue_delayed_work(gnss->kworker, &gnss->read_work,
+- 				   ICE_GNSS_TIMER_DELAY_TIME);
++ requeue:
++ 	kthread_queue_delayed_work(gnss->kworker, &gnss->read_work, delay);
+  exit:
+  	if (err)
+  		dev_dbg(ice_pf_to_dev(pf), "GNSS failed to read err=%d\n", err);
+diff --cc drivers/net/ethernet/intel/ice/ice_gnss.h
+index 9211adb2372c,640df7411373..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_gnss.h
++++ b/drivers/net/ethernet/intel/ice/ice_gnss.h
+@@@ -4,18 -4,29 +4,40 @@@
+  #ifndef _ICE_GNSS_H_
+  #define _ICE_GNSS_H_
+  
+++<<<<<<< HEAD
+ +#include <linux/tty.h>
+ +#include <linux/tty_flip.h>
+++=======
++ #define ICE_E810T_GNSS_I2C_BUS		0x2
++ #define ICE_GNSS_POLL_DATA_DELAY_TIME	(HZ / 100) /* poll every 10 ms */
++ #define ICE_GNSS_TIMER_DELAY_TIME	(HZ / 10) /* 0.1 second per message */
++ #define ICE_GNSS_TTY_WRITE_BUF		250
++ #define ICE_MAX_I2C_DATA_SIZE		FIELD_MAX(ICE_AQC_I2C_DATA_SIZE_M)
++ #define ICE_MAX_I2C_WRITE_BYTES		4
+++>>>>>>> 2f8fdcb0a73a (ice: do not busy-wait to read GNSS data)
+  
+ -/* u-blox ZED-F9T specific definitions */
+ +#define ICE_E810T_GNSS_I2C_BUS		0x2
+  #define ICE_GNSS_UBX_I2C_BUS_ADDR	0x42
+  /* Data length register is big endian */
+  #define ICE_GNSS_UBX_DATA_LEN_H		0xFD
+  #define ICE_GNSS_UBX_DATA_LEN_WIDTH	2
+  #define ICE_GNSS_UBX_EMPTY_DATA		0xFF
+++<<<<<<< HEAD
+ +#define ICE_GNSS_TIMER_DELAY_TIME	(HZ / 10) /* 0.1 second per message */
+ +#define ICE_MAX_I2C_DATA_SIZE		FIELD_MAX(ICE_AQC_I2C_DATA_SIZE_M)
+ +#define ICE_MAX_UBX_READ_TRIES		255
+++=======
++ /* For u-blox writes are performed without address so the first byte to write is
++  * passed as I2C addr parameter.
++  */
++ #define ICE_GNSS_UBX_WRITE_BYTES	(ICE_MAX_I2C_WRITE_BYTES + 1)
++ 
++ struct gnss_write_buf {
++ 	struct list_head queue;
++ 	unsigned int size;
++ 	unsigned char *buf;
++ };
+++>>>>>>> 2f8fdcb0a73a (ice: do not busy-wait to read GNSS data)
+  
+  /**
+   * struct gnss_serial - data used to initialize GNSS TTY port
+* Unmerged path drivers/net/ethernet/intel/ice/ice_gnss.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_gnss.h
