@@ -1,0 +1,142 @@
+x86/cpu: Reinitialize IA32_FEAT_CTL MSR on BSP during wakeup
+
+jira LE-1907
+cve CVE-2023-1637
+Rebuild_History Non-Buildable kernel-4.18.0-504.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 5d5103595e9e53048bb7e70ee2673c897ab38300
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-504.el8/5d510359.failed
+
+Reinitialize IA32_FEAT_CTL on the BSP during wakeup to handle the case
+where firmware doesn't initialize or save/restore across S3.  This fixes
+a bug where IA32_FEAT_CTL is left uninitialized and results in VMXON
+taking a #GP due to VMX not being fully enabled, i.e. breaks KVM.
+
+Use init_ia32_feat_ctl() to "restore" IA32_FEAT_CTL as it already deals
+with the case where the MSR is locked, and because APs already redo
+init_ia32_feat_ctl() during suspend by virtue of the SMP boot flow being
+used to reinitialize APs upon wakeup.  Do the call in the early wakeup
+flow to avoid dependencies in the syscore_ops chain, e.g. simply adding
+a resume hook is not guaranteed to work, as KVM does VMXON in its own
+resume hook, kvm_resume(), when KVM has active guests.
+
+Fixes: 21bd3467a58e ("KVM: VMX: Drop initialization of IA32_FEAT_CTL MSR")
+	Reported-by: Brad Campbell <lists2009@fnarfbargle.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Liam Merwick <liam.merwick@oracle.com>
+	Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+	Tested-by: Brad Campbell <lists2009@fnarfbargle.com>
+	Cc: stable@vger.kernel.org # v5.6
+Link: https://lkml.kernel.org/r/20200608174134.11157-1-sean.j.christopherson@intel.com
+(cherry picked from commit 5d5103595e9e53048bb7e70ee2673c897ab38300)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpu.h
+#	arch/x86/kernel/cpu/zhaoxin.c
+diff --cc arch/x86/include/asm/cpu.h
+index 8e4491e3583a,da78ccbd493b..000000000000
+--- a/arch/x86/include/asm/cpu.h
++++ b/arch/x86/include/asm/cpu.h
+@@@ -60,38 -57,10 +60,46 @@@ static inline bool handle_guest_split_l
+  {
+  	return false;
+  }
+ +static inline void handle_kernel_split_lock(struct pt_regs *regs,
+ +					    long error_code)
+ +{
+ +	return;
+ +}
+ +
+ +static inline void handle_bus_lock(struct pt_regs *regs) {}
+ +
+ +static inline u8 get_this_hybrid_cpu_type(void)
+ +{
+ +	return 0;
+ +}
+  #endif
+++<<<<<<< HEAD
+ +
+ +struct ucode_cpu_info;
+ +
+ +int intel_cpu_collect_info(struct ucode_cpu_info *uci);
+ +
+ +static inline bool intel_cpu_signatures_match(unsigned int s1, unsigned int p1,
+ +					      unsigned int s2, unsigned int p2)
+ +{
+ +	if (s1 != s2)
+ +		return false;
+ +
+ +	/* Processor flags are either both 0 ... */
+ +	if (!p1 && !p2)
+ +		return true;
+ +
+ +	/* ... or they intersect. */
+ +	return p1 & p2;
+ +}
+ +
+ +int intel_find_matching_signature(void *mc, unsigned int csig, int cpf);
+ +int intel_microcode_sanity_check(void *mc, bool print_err, int hdr_type);
+++=======
++ #ifdef CONFIG_IA32_FEAT_CTL
++ void init_ia32_feat_ctl(struct cpuinfo_x86 *c);
++ #else
++ static inline void init_ia32_feat_ctl(struct cpuinfo_x86 *c) {}
++ #endif
+++>>>>>>> 5d5103595e9e (x86/cpu: Reinitialize IA32_FEAT_CTL MSR on BSP during wakeup)
+  #endif /* _ASM_X86_CPU_H */
+* Unmerged path arch/x86/kernel/cpu/zhaoxin.c
+* Unmerged path arch/x86/include/asm/cpu.h
+diff --git a/arch/x86/kernel/cpu/centaur.c b/arch/x86/kernel/cpu/centaur.c
+index 02d99feb333e..49d1ece67bad 100644
+--- a/arch/x86/kernel/cpu/centaur.c
++++ b/arch/x86/kernel/cpu/centaur.c
+@@ -3,6 +3,7 @@
+ #include <linux/sched.h>
+ #include <linux/sched/clock.h>
+ 
++#include <asm/cpu.h>
+ #include <asm/cpufeature.h>
+ #include <asm/e820/api.h>
+ #include <asm/mtrr.h>
+diff --git a/arch/x86/kernel/cpu/cpu.h b/arch/x86/kernel/cpu/cpu.h
+index 54afd004624b..deb893251f7c 100644
+--- a/arch/x86/kernel/cpu/cpu.h
++++ b/arch/x86/kernel/cpu/cpu.h
+@@ -86,8 +86,4 @@ extern void update_srbds_msr(void);
+ 
+ extern u64 x86_read_arch_cap_msr(void);
+ 
+-#ifdef CONFIG_IA32_FEAT_CTL
+-void init_ia32_feat_ctl(struct cpuinfo_x86 *c);
+-#endif
+-
+ #endif /* ARCH_X86_CPU_H */
+* Unmerged path arch/x86/kernel/cpu/zhaoxin.c
+diff --git a/arch/x86/power/cpu.c b/arch/x86/power/cpu.c
+index dd5a29553697..97357fafb1a5 100644
+--- a/arch/x86/power/cpu.c
++++ b/arch/x86/power/cpu.c
+@@ -197,6 +197,8 @@ static void fix_processor_context(void)
+  */
+ static void notrace __restore_processor_state(struct saved_context *ctxt)
+ {
++	struct cpuinfo_x86 *c;
++
+ 	if (ctxt->misc_enable_saved)
+ 		wrmsrl(MSR_IA32_MISC_ENABLE, ctxt->misc_enable);
+ 	/*
+@@ -275,6 +277,10 @@ static void notrace __restore_processor_state(struct saved_context *ctxt)
+ 	 * because some of the MSRs are "emulated" in microcode.
+ 	 */
+ 	msr_restore_context(ctxt);
++
++	c = &cpu_data(smp_processor_id());
++	if (cpu_has(c, X86_FEATURE_MSR_IA32_FEAT_CTL))
++		init_ia32_feat_ctl(c);
+ }
+ 
+ /* Needed by apm.c */
