@@ -483,10 +483,8 @@ int gfs2_inode_refresh(struct gfs2_inode *ip)
  * Returns: errno
  */
 
-static int inode_go_instantiate(struct gfs2_holder *gh)
+static int inode_go_instantiate(struct gfs2_glock *gl)
 {
-	struct gfs2_glock *gl = gh->gh_gl;
-	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
 	struct gfs2_inode *ip = gl->gl_object;
 
 	if (!ip) /* no inode to populate - read it in later */
@@ -509,14 +507,8 @@ static int inode_go_held(struct gfs2_holder *gh)
 
 	if ((ip->i_diskflags & GFS2_DIF_TRUNC_IN_PROG) &&
 	    (gl->gl_state == LM_ST_EXCLUSIVE) &&
-	    (gh->gh_state == LM_ST_EXCLUSIVE)) {
-		spin_lock(&sdp->sd_trunc_lock);
-		if (list_empty(&ip->i_trunc_list))
-			list_add(&ip->i_trunc_list, &sdp->sd_trunc_list);
-		spin_unlock(&sdp->sd_trunc_lock);
-		wake_up(&sdp->sd_quota_wait);
-		gfs2_wait_truncate(ip);
-	}
+	    (gh->gh_state == LM_ST_EXCLUSIVE))
+		error = gfs2_truncatei_resume(ip);
 
 	return error;
 }
