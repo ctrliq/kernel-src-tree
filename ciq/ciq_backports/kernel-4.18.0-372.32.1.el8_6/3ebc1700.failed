@@ -1,0 +1,412 @@
+x86/bugs: Add retbleed=ibpb
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 3ebc170068885b6fc7bedda6c667bb2c4d533159
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/3ebc1700.failed
+
+jmp2ret mitigates the easy-to-attack case at relatively low overhead.
+It mitigates the long speculation windows after a mispredicted RET, but
+it does not mitigate the short speculation window from arbitrary
+instruction boundaries.
+
+On Zen2, there is a chicken bit which needs setting, which mitigates
+"arbitrary instruction boundaries" down to just "basic block boundaries".
+
+But there is no fix for the short speculation window on basic block
+boundaries, other than to flush the entire BTB to evict all attacker
+predictions.
+
+On the spectrum of "fast & blurry" -> "safe", there is (on top of STIBP
+or no-SMT):
+
+  1) Nothing		System wide open
+  2) jmp2ret		May stop a script kiddy
+  3) jmp2ret+chickenbit  Raises the bar rather further
+  4) IBPB		Only thing which can count as "safe".
+
+Tentative numbers put IBPB-on-entry at a 2.5x hit on Zen2, and a 10x hit
+on Zen1 according to lmbench.
+
+  [ bp: Fixup feature bit comments, document option, 32-bit build fix. ]
+
+	Suggested-by: Andrew Cooper <Andrew.Cooper3@citrix.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@kernel.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit 3ebc170068885b6fc7bedda6c667bb2c4d533159)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/kernel-parameters.txt
+#	arch/x86/entry/Makefile
+#	arch/x86/include/asm/nospec-branch.h
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc Documentation/admin-guide/kernel-parameters.txt
+index 25c1d34da432,f2d26cb7e853..000000000000
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@@ -4511,17 -5195,32 +4511,44 @@@
+  			Useful for devices that are detected asynchronously
+  			(e.g. USB and MMC devices).
+  
+ +	hibernate=	[HIBERNATION]
+ +		noresume	Don't check if there's a hibernation image
+ +				present during boot.
+ +		nocompress	Don't compress/decompress hibernation images.
+ +		no		Disable hibernation and resume.
+ +		protect_image	Turn on image protection during restoration
+ +				(that will set all pages holding image data
+ +				during restoration read-only).
+ +
+  	retain_initrd	[RAM] Keep initrd memory after extraction
+  
+++<<<<<<< HEAD
+++=======
++ 	retbleed=	[X86] Control mitigation of RETBleed (Arbitrary
++ 			Speculative Code Execution with Return Instructions)
++ 			vulnerability.
++ 
++ 			off          - no mitigation
++ 			auto         - automatically select a migitation
++ 			auto,nosmt   - automatically select a mitigation,
++ 				       disabling SMT if necessary for
++ 				       the full mitigation (only on Zen1
++ 				       and older without STIBP).
++ 			ibpb	     - mitigate short speculation windows on
++ 				       basic block boundaries too. Safe, highest
++ 				       perf impact.
++ 			unret        - force enable untrained return thunks,
++ 				       only effective on AMD f15h-f17h
++ 				       based systems.
++ 			unret,nosmt  - like unret, will disable SMT when STIBP
++ 			               is not available.
++ 
++ 			Selecting 'auto' will choose a mitigation method at run
++ 			time according to the CPU.
++ 
++ 			Not specifying this option is equivalent to retbleed=auto.
++ 
+++>>>>>>> 3ebc17006888 (x86/bugs: Add retbleed=ibpb)
+  	rfkill.default_state=
+  		0	"airplane mode".  All wifi, bluetooth, wimax, gps, fm,
+  			etc. communication is blocked by default.
+diff --cc arch/x86/entry/Makefile
+index 06fc70cf5433,eeadbd7d92cc..000000000000
+--- a/arch/x86/entry/Makefile
++++ b/arch/x86/entry/Makefile
+@@@ -3,11 -3,15 +3,15 @@@
+  # Makefile for the x86 low level entry code
+  #
+  
+ -KASAN_SANITIZE := n
+ -UBSAN_SANITIZE := n
+ -KCOV_INSTRUMENT := n
+ -
+ -CFLAGS_REMOVE_common.o		= $(CC_FLAGS_FTRACE)
+ -
+ -CFLAGS_common.o			+= -fno-stack-protector
+ +OBJECT_FILES_NON_STANDARD_entry_64_compat.o := y
+  
+++<<<<<<< HEAD
+ +CFLAGS_syscall_64.o		+= $(call cc-option,-Wno-override-init,)
+ +CFLAGS_syscall_32.o		+= $(call cc-option,-Wno-override-init,)
+ +obj-y				:= entry_$(BITS).o thunk_$(BITS).o syscall_$(BITS).o
+++=======
++ obj-y				:= entry.o entry_$(BITS).o thunk_$(BITS).o syscall_$(BITS).o
+++>>>>>>> 3ebc17006888 (x86/bugs: Add retbleed=ibpb)
+  obj-y				+= common.o
+  
+  obj-y				+= vdso/
+diff --cc arch/x86/include/asm/nospec-branch.h
+index 12722d2e7709,05dd75478d7b..000000000000
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@@ -150,6 -118,25 +150,28 @@@
+  #endif
+  .endm
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Mitigate RETBleed for AMD/Hygon Zen uarch. Requires KERNEL CR3 because the
++  * return thunk isn't mapped into the userspace tables (then again, AMD
++  * typically has NO_MELTDOWN).
++  *
++  * While zen_untrain_ret() doesn't clobber anything but requires stack,
++  * entry_ibpb() will clobber AX, CX, DX.
++  *
++  * As such, this must be placed after every *SWITCH_TO_KERNEL_CR3 at a point
++  * where we have a stack but before any RET instruction.
++  */
++ .macro UNTRAIN_RET
++ #ifdef CONFIG_RETPOLINE
++ 	ALTERNATIVE_2 "",						\
++ 	              "call zen_untrain_ret", X86_FEATURE_UNRET,	\
++ 		      "call entry_ibpb", X86_FEATURE_ENTRY_IBPB
++ #endif
++ .endm
++ 
+++>>>>>>> 3ebc17006888 (x86/bugs: Add retbleed=ibpb)
+  #else /* __ASSEMBLY__ */
+  
+  #define ANNOTATE_RETPOLINE_SAFE					\
+@@@ -158,7 -145,20 +180,17 @@@
+  	_ASM_PTR " 999b\n\t"					\
+  	".popsection\n\t"
+  
+++<<<<<<< HEAD
+++=======
++ typedef u8 retpoline_thunk_t[RETPOLINE_THUNK_SIZE];
++ extern retpoline_thunk_t __x86_indirect_thunk_array[];
++ 
++ extern void __x86_return_thunk(void);
++ extern void zen_untrain_ret(void);
++ extern void entry_ibpb(void);
++ 
+++>>>>>>> 3ebc17006888 (x86/bugs: Add retbleed=ibpb)
+  #ifdef CONFIG_RETPOLINE
+ -
+ -#define GEN(reg) \
+ -	extern retpoline_thunk_t __x86_indirect_thunk_ ## reg;
+ -#include <asm/GEN-for-each-reg.h>
+ -#undef GEN
+ -
+  #ifdef CONFIG_X86_64
+  
+  /*
+diff --cc arch/x86/kernel/cpu/bugs.c
+index ff842ff87312,04077d13b3ae..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -720,6 -796,174 +720,177 @@@ static int __init nospectre_v1_cmdline(
+  }
+  early_param("nospectre_v1", nospectre_v1_cmdline);
+  
+++<<<<<<< HEAD
+++=======
++ static enum spectre_v2_mitigation spectre_v2_enabled __ro_after_init =
++ 	SPECTRE_V2_NONE;
++ 
++ #undef pr_fmt
++ #define pr_fmt(fmt)     "RETBleed: " fmt
++ 
++ enum retbleed_mitigation {
++ 	RETBLEED_MITIGATION_NONE,
++ 	RETBLEED_MITIGATION_UNRET,
++ 	RETBLEED_MITIGATION_IBPB,
++ 	RETBLEED_MITIGATION_IBRS,
++ 	RETBLEED_MITIGATION_EIBRS,
++ };
++ 
++ enum retbleed_mitigation_cmd {
++ 	RETBLEED_CMD_OFF,
++ 	RETBLEED_CMD_AUTO,
++ 	RETBLEED_CMD_UNRET,
++ 	RETBLEED_CMD_IBPB,
++ };
++ 
++ const char * const retbleed_strings[] = {
++ 	[RETBLEED_MITIGATION_NONE]	= "Vulnerable",
++ 	[RETBLEED_MITIGATION_UNRET]	= "Mitigation: untrained return thunk",
++ 	[RETBLEED_MITIGATION_IBPB]	= "Mitigation: IBPB",
++ 	[RETBLEED_MITIGATION_IBRS]	= "Mitigation: IBRS",
++ 	[RETBLEED_MITIGATION_EIBRS]	= "Mitigation: Enhanced IBRS",
++ };
++ 
++ static enum retbleed_mitigation retbleed_mitigation __ro_after_init =
++ 	RETBLEED_MITIGATION_NONE;
++ static enum retbleed_mitigation_cmd retbleed_cmd __ro_after_init =
++ 	RETBLEED_CMD_AUTO;
++ 
++ static int __ro_after_init retbleed_nosmt = false;
++ 
++ static int __init retbleed_parse_cmdline(char *str)
++ {
++ 	if (!str)
++ 		return -EINVAL;
++ 
++ 	while (str) {
++ 		char *next = strchr(str, ',');
++ 		if (next) {
++ 			*next = 0;
++ 			next++;
++ 		}
++ 
++ 		if (!strcmp(str, "off")) {
++ 			retbleed_cmd = RETBLEED_CMD_OFF;
++ 		} else if (!strcmp(str, "auto")) {
++ 			retbleed_cmd = RETBLEED_CMD_AUTO;
++ 		} else if (!strcmp(str, "unret")) {
++ 			retbleed_cmd = RETBLEED_CMD_UNRET;
++ 		} else if (!strcmp(str, "ibpb")) {
++ 			retbleed_cmd = RETBLEED_CMD_IBPB;
++ 		} else if (!strcmp(str, "nosmt")) {
++ 			retbleed_nosmt = true;
++ 		} else {
++ 			pr_err("Ignoring unknown retbleed option (%s).", str);
++ 		}
++ 
++ 		str = next;
++ 	}
++ 
++ 	return 0;
++ }
++ early_param("retbleed", retbleed_parse_cmdline);
++ 
++ #define RETBLEED_UNTRAIN_MSG "WARNING: BTB untrained return thunk mitigation is only effective on AMD/Hygon!\n"
++ #define RETBLEED_COMPILER_MSG "WARNING: kernel not compiled with RETPOLINE or -mfunction-return capable compiler; falling back to IBPB!\n"
++ #define RETBLEED_INTEL_MSG "WARNING: Spectre v2 mitigation leaves CPU vulnerable to RETBleed attacks, data leaks possible!\n"
++ 
++ static void __init retbleed_select_mitigation(void)
++ {
++ 	bool mitigate_smt = false;
++ 
++ 	if (!boot_cpu_has_bug(X86_BUG_RETBLEED) || cpu_mitigations_off())
++ 		return;
++ 
++ 	switch (retbleed_cmd) {
++ 	case RETBLEED_CMD_OFF:
++ 		return;
++ 
++ 	case RETBLEED_CMD_UNRET:
++ 		retbleed_mitigation = RETBLEED_MITIGATION_UNRET;
++ 		break;
++ 
++ 	case RETBLEED_CMD_IBPB:
++ 		retbleed_mitigation = RETBLEED_MITIGATION_IBPB;
++ 		break;
++ 
++ 	case RETBLEED_CMD_AUTO:
++ 	default:
++ 		if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD ||
++ 		    boot_cpu_data.x86_vendor == X86_VENDOR_HYGON) {
++ 
++ 			if (IS_ENABLED(CONFIG_RETPOLINE) &&
++ 			    IS_ENABLED(CONFIG_CC_HAS_RETURN_THUNK))
++ 				retbleed_mitigation = RETBLEED_MITIGATION_UNRET;
++ 			else
++ 				retbleed_mitigation = RETBLEED_MITIGATION_IBPB;
++ 		}
++ 
++ 		/*
++ 		 * The Intel mitigation (IBRS) was already selected in
++ 		 * spectre_v2_select_mitigation().
++ 		 */
++ 
++ 		break;
++ 	}
++ 
++ 	switch (retbleed_mitigation) {
++ 	case RETBLEED_MITIGATION_UNRET:
++ 
++ 		if (!IS_ENABLED(CONFIG_RETPOLINE) ||
++ 		    !IS_ENABLED(CONFIG_CC_HAS_RETURN_THUNK)) {
++ 			pr_err(RETBLEED_COMPILER_MSG);
++ 			retbleed_mitigation = RETBLEED_MITIGATION_IBPB;
++ 			goto retbleed_force_ibpb;
++ 		}
++ 
++ 		setup_force_cpu_cap(X86_FEATURE_RETHUNK);
++ 		setup_force_cpu_cap(X86_FEATURE_UNRET);
++ 
++ 		if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD &&
++ 		    boot_cpu_data.x86_vendor != X86_VENDOR_HYGON)
++ 			pr_err(RETBLEED_UNTRAIN_MSG);
++ 
++ 		mitigate_smt = true;
++ 		break;
++ 
++ 	case RETBLEED_MITIGATION_IBPB:
++ retbleed_force_ibpb:
++ 		setup_force_cpu_cap(X86_FEATURE_ENTRY_IBPB);
++ 		mitigate_smt = true;
++ 		break;
++ 
++ 	default:
++ 		break;
++ 	}
++ 
++ 	if (mitigate_smt && !boot_cpu_has(X86_FEATURE_STIBP) &&
++ 	    (retbleed_nosmt || cpu_mitigations_auto_nosmt()))
++ 		cpu_smt_disable(false);
++ 
++ 	/*
++ 	 * Let IBRS trump all on Intel without affecting the effects of the
++ 	 * retbleed= cmdline option.
++ 	 */
++ 	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) {
++ 		switch (spectre_v2_enabled) {
++ 		case SPECTRE_V2_IBRS:
++ 			retbleed_mitigation = RETBLEED_MITIGATION_IBRS;
++ 			break;
++ 		case SPECTRE_V2_EIBRS:
++ 		case SPECTRE_V2_EIBRS_RETPOLINE:
++ 		case SPECTRE_V2_EIBRS_LFENCE:
++ 			retbleed_mitigation = RETBLEED_MITIGATION_EIBRS;
++ 			break;
++ 		default:
++ 			pr_err(RETBLEED_INTEL_MSG);
++ 		}
++ 	}
++ 
++ 	pr_info("%s\n", retbleed_strings[retbleed_mitigation]);
++ }
++ 
+++>>>>>>> 3ebc17006888 (x86/bugs: Add retbleed=ibpb)
+  #undef pr_fmt
+  #define pr_fmt(fmt)     "Spectre V2 : " fmt
+  
+* Unmerged path Documentation/admin-guide/kernel-parameters.txt
+* Unmerged path arch/x86/entry/Makefile
+diff --git a/arch/x86/entry/entry.S b/arch/x86/entry/entry.S
+new file mode 100644
+index 000000000000..bfb7bcb362bc
+--- /dev/null
++++ b/arch/x86/entry/entry.S
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Common place for both 32- and 64-bit entry routines.
++ */
++
++#include <linux/linkage.h>
++#include <asm/export.h>
++#include <asm/msr-index.h>
++
++.pushsection .noinstr.text, "ax"
++
++SYM_FUNC_START(entry_ibpb)
++	movl	$MSR_IA32_PRED_CMD, %ecx
++	movl	$PRED_CMD_IBPB, %eax
++	xorl	%edx, %edx
++	wrmsr
++	RET
++SYM_FUNC_END(entry_ibpb)
++/* For KVM */
++EXPORT_SYMBOL_GPL(entry_ibpb);
++
++.popsection
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index 48e29f583729..4fe759bc79ee 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -290,7 +290,7 @@
+ #define X86_FEATURE_PER_THREAD_MBA	(11*32+ 7) /* "" Per-thread Memory Bandwidth Allocation */
+ #define X86_FEATURE_SGX1		(11*32+ 8) /* "" Basic SGX */
+ #define X86_FEATURE_SGX2		(11*32+ 9) /* "" SGX Enclave Dynamic Memory Management (EDMM) */
+-/* FREE!				(11*32+10) */
++#define X86_FEATURE_ENTRY_IBPB		(11*32+10) /* "" Issue an IBPB on kernel entry */
+ /* FREE!				(11*32+11) */
+ #define X86_FEATURE_RETPOLINE		(11*32+12) /* "" Generic Retpoline mitigation for Spectre variant 2 */
+ #define X86_FEATURE_RETPOLINE_LFENCE	(11*32+13) /* "" Use LFENCE for Spectre variant 2 */
+* Unmerged path arch/x86/include/asm/nospec-branch.h
+* Unmerged path arch/x86/kernel/cpu/bugs.c
