@@ -1,0 +1,293 @@
+cgroup/cpuset: Free DL BW in case can_attach() fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-537.el8
+commit-author Dietmar Eggemann <dietmar.eggemann@arm.com>
+commit 2ef269ef1ac006acf974793d975539244d77b28f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-537.el8/2ef269ef.failed
+
+cpuset_can_attach() can fail. Postpone DL BW allocation until all tasks
+have been checked. DL BW is not allocated per-task but as a sum over
+all DL tasks migrating.
+
+If multiple controllers are attached to the cgroup next to the cpuset
+controller a non-cpuset can_attach() can fail. In this case free DL BW
+in cpuset_cancel_attach().
+
+Finally, update cpuset DL task count (nr_deadline_tasks) only in
+cpuset_attach().
+
+	Suggested-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Dietmar Eggemann <dietmar.eggemann@arm.com>
+	Signed-off-by: Juri Lelli <juri.lelli@redhat.com>
+	Reviewed-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 2ef269ef1ac006acf974793d975539244d77b28f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cgroup/cpuset.c
+diff --cc kernel/cgroup/cpuset.c
+index 7fc8529cc993,2c76fcd9f0bc..000000000000
+--- a/kernel/cgroup/cpuset.c
++++ b/kernel/cgroup/cpuset.c
+@@@ -193,6 -193,14 +193,17 @@@ struct cpuset 
+  	int use_parent_ecpus;
+  	int child_ecpus_count;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * number of SCHED_DEADLINE tasks attached to this cpuset, so that we
++ 	 * know when to rebuild associated root domain bandwidth information.
++ 	 */
++ 	int nr_deadline_tasks;
++ 	int nr_migrate_dl_tasks;
++ 	u64 sum_migrate_dl_bw;
++ 
+++>>>>>>> 2ef269ef1ac0 (cgroup/cpuset: Free DL BW in case can_attach() fails)
+  	/* Invalid partition error code, not lock protected */
+  	enum prs_errcode prs_err;
+  
+@@@ -2430,7 -2484,27 +2441,31 @@@ static int fmeter_getrate(struct fmete
+  
+  static struct cpuset *cpuset_attach_old_cs;
+  
+++<<<<<<< HEAD
+ +/* Called by cgroups to determine if a cpuset is usable; cpuset_rwsem held */
+++=======
++ /*
++  * Check to see if a cpuset can accept a new task
++  * For v1, cpus_allowed and mems_allowed can't be empty.
++  * For v2, effective_cpus can't be empty.
++  * Note that in v1, effective_cpus = cpus_allowed.
++  */
++ static int cpuset_can_attach_check(struct cpuset *cs)
++ {
++ 	if (cpumask_empty(cs->effective_cpus) ||
++ 	   (!is_in_v2_mode() && nodes_empty(cs->mems_allowed)))
++ 		return -ENOSPC;
++ 	return 0;
++ }
++ 
++ static void reset_migrate_dl_data(struct cpuset *cs)
++ {
++ 	cs->nr_migrate_dl_tasks = 0;
++ 	cs->sum_migrate_dl_bw = 0;
++ }
++ 
++ /* Called by cgroups to determine if a cpuset is usable; cpuset_mutex held */
+++>>>>>>> 2ef269ef1ac0 (cgroup/cpuset: Free DL BW in case can_attach() fails)
+  static int cpuset_can_attach(struct cgroup_taskset *tset)
+  {
+  	struct cgroup_subsys_state *css;
+@@@ -2440,20 -2514,14 +2475,21 @@@
+  
+  	/* used later by cpuset_attach() */
+  	cpuset_attach_old_cs = task_cs(cgroup_taskset_first(tset, &css));
++ 	oldcs = cpuset_attach_old_cs;
+  	cs = css_cs(css);
+  
+ -	mutex_lock(&cpuset_mutex);
+ +	percpu_down_write(&cpuset_rwsem);
+  
+ -	/* Check to see if task is allowed in the cpuset */
+ -	ret = cpuset_can_attach_check(cs);
+ -	if (ret)
+ +	/* allow moving tasks into an empty cpuset if on default hierarchy */
+ +	ret = -ENOSPC;
+ +	if (!is_in_v2_mode() &&
+ +	    (cpumask_empty(cs->cpus_allowed) || nodes_empty(cs->mems_allowed)))
+ +		goto out_unlock;
+ +
+ +	/*
+ +	 * Task cannot be moved to a cpuset with empty effective cpus.
+ +	 */
+ +	if (cpumask_empty(cs->effective_cpus))
+  		goto out_unlock;
+  
+  	cgroup_taskset_for_each(task, css, tset) {
+@@@ -2463,8 -2531,33 +2499,36 @@@
+  		ret = security_task_setscheduler(task);
+  		if (ret)
+  			goto out_unlock;
+++<<<<<<< HEAD
+++=======
++ 
++ 		if (dl_task(task)) {
++ 			cs->nr_migrate_dl_tasks++;
++ 			cs->sum_migrate_dl_bw += task->dl.dl_bw;
++ 		}
+++>>>>>>> 2ef269ef1ac0 (cgroup/cpuset: Free DL BW in case can_attach() fails)
++ 	}
++ 
++ 	if (!cs->nr_migrate_dl_tasks)
++ 		goto out_success;
++ 
++ 	if (!cpumask_intersects(oldcs->effective_cpus, cs->effective_cpus)) {
++ 		int cpu = cpumask_any_and(cpu_active_mask, cs->effective_cpus);
++ 
++ 		if (unlikely(cpu >= nr_cpu_ids)) {
++ 			reset_migrate_dl_data(cs);
++ 			ret = -EINVAL;
++ 			goto out_unlock;
++ 		}
++ 
++ 		ret = dl_bw_alloc(cpu, cs->sum_migrate_dl_bw);
++ 		if (ret) {
++ 			reset_migrate_dl_data(cs);
++ 			goto out_unlock;
++ 		}
+  	}
+  
++ out_success:
+  	/*
+  	 * Mark attach is in progress.  This makes validate_change() fail
+  	 * changes which zero cpus/mems_allowed.
+@@@ -2488,7 -2580,15 +2552,19 @@@ static void cpuset_cancel_attach(struc
+  	cs->attach_in_progress--;
+  	if (!cs->attach_in_progress)
+  		wake_up(&cpuset_attach_wq);
+++<<<<<<< HEAD
+ +	percpu_up_write(&cpuset_rwsem);
+++=======
++ 
++ 	if (cs->nr_migrate_dl_tasks) {
++ 		int cpu = cpumask_any(cs->effective_cpus);
++ 
++ 		dl_bw_free(cpu, cs->sum_migrate_dl_bw);
++ 		reset_migrate_dl_data(cs);
++ 	}
++ 
++ 	mutex_unlock(&cpuset_mutex);
+++>>>>>>> 2ef269ef1ac0 (cgroup/cpuset: Free DL BW in case can_attach() fails)
+  }
+  
+  /*
+@@@ -3237,7 -3345,69 +3319,73 @@@ static void cpuset_bind(struct cgroup_s
+  	}
+  
+  	spin_unlock_irq(&callback_lock);
+++<<<<<<< HEAD
+ +	percpu_up_write(&cpuset_rwsem);
+++=======
++ 	mutex_unlock(&cpuset_mutex);
++ }
++ 
++ /*
++  * In case the child is cloned into a cpuset different from its parent,
++  * additional checks are done to see if the move is allowed.
++  */
++ static int cpuset_can_fork(struct task_struct *task, struct css_set *cset)
++ {
++ 	struct cpuset *cs = css_cs(cset->subsys[cpuset_cgrp_id]);
++ 	bool same_cs;
++ 	int ret;
++ 
++ 	rcu_read_lock();
++ 	same_cs = (cs == task_cs(current));
++ 	rcu_read_unlock();
++ 
++ 	if (same_cs)
++ 		return 0;
++ 
++ 	lockdep_assert_held(&cgroup_mutex);
++ 	mutex_lock(&cpuset_mutex);
++ 
++ 	/* Check to see if task is allowed in the cpuset */
++ 	ret = cpuset_can_attach_check(cs);
++ 	if (ret)
++ 		goto out_unlock;
++ 
++ 	ret = task_can_attach(task);
++ 	if (ret)
++ 		goto out_unlock;
++ 
++ 	ret = security_task_setscheduler(task);
++ 	if (ret)
++ 		goto out_unlock;
++ 
++ 	/*
++ 	 * Mark attach is in progress.  This makes validate_change() fail
++ 	 * changes which zero cpus/mems_allowed.
++ 	 */
++ 	cs->attach_in_progress++;
++ out_unlock:
++ 	mutex_unlock(&cpuset_mutex);
++ 	return ret;
++ }
++ 
++ static void cpuset_cancel_fork(struct task_struct *task, struct css_set *cset)
++ {
++ 	struct cpuset *cs = css_cs(cset->subsys[cpuset_cgrp_id]);
++ 	bool same_cs;
++ 
++ 	rcu_read_lock();
++ 	same_cs = (cs == task_cs(current));
++ 	rcu_read_unlock();
++ 
++ 	if (same_cs)
++ 		return;
++ 
++ 	mutex_lock(&cpuset_mutex);
++ 	cs->attach_in_progress--;
++ 	if (!cs->attach_in_progress)
++ 		wake_up(&cpuset_attach_wq);
++ 	mutex_unlock(&cpuset_mutex);
+++>>>>>>> 2ef269ef1ac0 (cgroup/cpuset: Free DL BW in case can_attach() fails)
+  }
+  
+  /*
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 9b35ec45f817..61e2c5796365 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1751,7 +1751,7 @@ current_restore_flags(unsigned long orig_flags, unsigned long flags)
+ }
+ 
+ extern int cpuset_cpumask_can_shrink(const struct cpumask *cur, const struct cpumask *trial);
+-extern int task_can_attach(struct task_struct *p, const struct cpumask *cs_effective_cpus);
++extern int task_can_attach(struct task_struct *p);
+ extern int dl_bw_alloc(int cpu, u64 dl_bw);
+ extern void dl_bw_free(int cpu, u64 dl_bw);
+ #ifdef CONFIG_SMP
+* Unmerged path kernel/cgroup/cpuset.c
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index cb88971bd84a..23831f27aca5 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -6719,8 +6719,7 @@ int cpuset_cpumask_can_shrink(const struct cpumask *cur,
+ 	return ret;
+ }
+ 
+-int task_can_attach(struct task_struct *p,
+-		    const struct cpumask *cs_effective_cpus)
++int task_can_attach(struct task_struct *p)
+ {
+ 	int ret = 0;
+ 
+@@ -6733,21 +6732,9 @@ int task_can_attach(struct task_struct *p,
+ 	 * success of set_cpus_allowed_ptr() on all attached tasks
+ 	 * before cpus_mask may be changed.
+ 	 */
+-	if (p->flags & PF_NO_SETAFFINITY) {
++	if (p->flags & PF_NO_SETAFFINITY)
+ 		ret = -EINVAL;
+-		goto out;
+-	}
+-
+-	if (dl_task(p) && !cpumask_intersects(task_rq(p)->rd->span,
+-					      cs_effective_cpus)) {
+-		int cpu = cpumask_any_and(cpu_active_mask, cs_effective_cpus);
+ 
+-		if (unlikely(cpu >= nr_cpu_ids))
+-			return -EINVAL;
+-		ret = dl_bw_alloc(cpu, p->dl.dl_bw);
+-	}
+-
+-out:
+ 	return ret;
+ }
+ 
