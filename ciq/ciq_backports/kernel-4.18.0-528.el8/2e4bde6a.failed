@@ -1,0 +1,112 @@
+kasan: add compiler barriers to KUNIT_EXPECT_KASAN_FAIL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-528.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit 2e4bde6a1e3a3feb8511685b8c97be668728eefb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-528.el8/2e4bde6a.failed
+
+It might not be obvious to the compiler that the expression must be
+executed between writing and reading to fail_data. In this case, the
+compiler might reorder or optimize away some of the accesses, and
+the tests will fail.
+
+Add compiler barriers around the expression in KUNIT_EXPECT_KASAN_FAIL
+and use READ/WRITE_ONCE() for accessing fail_data fields.
+
+Link: https://linux-review.googlesource.com/id/I046079f48641a1d36fe627fc8827a9249102fd50
+Link: https://lkml.kernel.org/r/6f11596f367d8ae8f71d800351e9a5d91eda19f6.1610733117.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Reviewed-by: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Cc: Peter Collingbourne <pcc@google.com>
+	Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2e4bde6a1e3a3feb8511685b8c97be668728eefb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/test_kasan.c
+diff --cc lib/test_kasan.c
+index 55ee210feb5b,603fd7937b94..000000000000
+--- a/lib/test_kasan.c
++++ b/lib/test_kasan.c
+@@@ -68,19 -63,38 +68,54 @@@ static void kasan_test_exit(struct kuni
+   * KASAN report; causes a test failure otherwise. This relies on a KUnit
+   * resource named "kasan_data". Do not use this name for KUnit resources
+   * outside of KASAN tests.
+++<<<<<<< HEAD
+ + */
+ +#define KUNIT_EXPECT_KASAN_FAIL(test, expression) do { \
+ +	fail_data.report_expected = true; \
+ +	fail_data.report_found = false; \
+ +	kunit_add_named_resource(test, \
+ +				NULL, \
+ +				NULL, \
+ +				&resource, \
+ +				"kasan_data", &fail_data); \
+ +	expression; \
+ +	KUNIT_EXPECT_EQ(test, \
+ +			fail_data.report_expected, \
+ +			fail_data.report_found); \
+++=======
++  *
++  * For hardware tag-based KASAN, when a tag fault happens, tag checking is
++  * normally auto-disabled. When this happens, this test handler reenables
++  * tag checking. As tag checking can be only disabled or enabled per CPU, this
++  * handler disables migration (preemption).
++  *
++  * Since the compiler doesn't see that the expression can change the fail_data
++  * fields, it can reorder or optimize away the accesses to those fields.
++  * Use READ/WRITE_ONCE() for the accesses and compiler barriers around the
++  * expression to prevent that.
++  */
++ #define KUNIT_EXPECT_KASAN_FAIL(test, expression) do {		\
++ 	if (IS_ENABLED(CONFIG_KASAN_HW_TAGS))			\
++ 		migrate_disable();				\
++ 	WRITE_ONCE(fail_data.report_expected, true);		\
++ 	WRITE_ONCE(fail_data.report_found, false);		\
++ 	kunit_add_named_resource(test,				\
++ 				NULL,				\
++ 				NULL,				\
++ 				&resource,			\
++ 				"kasan_data", &fail_data);	\
++ 	barrier();						\
++ 	expression;						\
++ 	barrier();						\
++ 	KUNIT_EXPECT_EQ(test,					\
++ 			READ_ONCE(fail_data.report_expected),	\
++ 			READ_ONCE(fail_data.report_found));	\
++ 	if (IS_ENABLED(CONFIG_KASAN_HW_TAGS)) {			\
++ 		if (READ_ONCE(fail_data.report_found))		\
++ 			kasan_enable_tagging();			\
++ 		migrate_enable();				\
++ 	}							\
+++>>>>>>> 2e4bde6a1e3a (kasan: add compiler barriers to KUNIT_EXPECT_KASAN_FAIL)
+  } while (0)
+  
+  #define KASAN_TEST_NEEDS_CONFIG_ON(test, config) do {			\
+* Unmerged path lib/test_kasan.c
+diff --git a/mm/kasan/report.c b/mm/kasan/report.c
+index 9beaa07ac909..bcf47523c1e6 100644
+--- a/mm/kasan/report.c
++++ b/mm/kasan/report.c
+@@ -322,7 +322,7 @@ static void kasan_update_kunit_status(struct kunit *cur_test)
+ 	}
+ 
+ 	kasan_data = (struct kunit_kasan_expectation *)resource->data;
+-	kasan_data->report_found = true;
++	WRITE_ONCE(kasan_data->report_found, true);
+ 	kunit_put_resource(resource);
+ }
+ #endif /* IS_ENABLED(CONFIG_KUNIT) */
