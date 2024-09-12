@@ -225,6 +225,13 @@ static inline bool efi_is_native(void)
 				efi_table_attr(protocol, f, instance),	\
 		instance, ##__VA_ARGS__)
 
+#define efi_dxe_call(f, ...)						\
+	__efi_early()->call((unsigned long)				\
+				efi_table_attr(efi_dxe_services_table,	\
+					       f,			\
+					       efi_dxe_table),		\
+				##__VA_ARGS__)
+
 #define efi_call_early(f, ...)						\
 	__efi_early()->call((unsigned long)				\
 				efi_table_attr(efi_boot_services, f,	\

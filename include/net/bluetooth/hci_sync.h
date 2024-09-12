@@ -85,11 +85,24 @@ int hci_remove_ext_adv_instance_sync(struct hci_dev *hdev, u8 instance,
 struct sk_buff *hci_read_local_oob_data_sync(struct hci_dev *hdev, bool ext,
 					     struct sock *sk);
 
+int hci_reset_sync(struct hci_dev *hdev);
 int hci_dev_open_sync(struct hci_dev *hdev);
 int hci_dev_close_sync(struct hci_dev *hdev);
 
 int hci_powered_update_sync(struct hci_dev *hdev);
 int hci_set_powered_sync(struct hci_dev *hdev, u8 val);
 
+int hci_update_discoverable_sync(struct hci_dev *hdev);
+int hci_update_discoverable(struct hci_dev *hdev);
+
+int hci_update_connectable_sync(struct hci_dev *hdev);
+
 int hci_start_discovery_sync(struct hci_dev *hdev);
 int hci_stop_discovery_sync(struct hci_dev *hdev);
+
+int hci_suspend_sync(struct hci_dev *hdev);
+int hci_resume_sync(struct hci_dev *hdev);
+
+struct hci_conn;
+
+int hci_le_create_conn_sync(struct hci_dev *hdev, struct hci_conn *conn);

@@ -24,8 +24,8 @@ int msft_remove_monitor(struct hci_dev *hdev, struct adv_monitor *monitor,
 			u16 handle);
 void msft_req_add_set_filter_enable(struct hci_request *req, bool enable);
 int msft_set_filter_enable(struct hci_dev *hdev, bool enable);
-void msft_suspend(struct hci_dev *hdev);
-void msft_resume(struct hci_dev *hdev);
+int msft_suspend_sync(struct hci_dev *hdev);
+int msft_resume_sync(struct hci_dev *hdev);
 bool msft_curve_validity(struct hci_dev *hdev);
 
 #else
@@ -48,8 +48,15 @@ static inline int msft_add_monitor_pattern(struct hci_dev *hdev,
 	return -EOPNOTSUPP;
 }
 
-static inline void msft_suspend(struct hci_dev *hdev) {}
-static inline void msft_resume(struct hci_dev *hdev) {}
+static inline int msft_suspend_sync(struct hci_dev *hdev)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int msft_resume_sync(struct hci_dev *hdev)
+{
+	return -EOPNOTSUPP;
+}
 
 static inline bool msft_curve_validity(struct hci_dev *hdev)
 {

@@ -1218,7 +1218,13 @@ static int new_settings(struct hci_dev *hdev, struct sock *skip)
 static void mgmt_set_powered_complete(struct hci_dev *hdev, void *data, int err)
 {
 	struct mgmt_pending_cmd *cmd = data;
-	struct mgmt_mode *cp = cmd->param;
+	struct mgmt_mode *cp;
+
+	/* Make sure cmd still outstanding. */
+	if (cmd != pending_find(MGMT_OP_SET_POWERED, hdev))
+		return;
+
+	cp = cmd->param;
 
 	bt_dev_dbg(hdev, "err %d", err);
 
@@ -1242,7 +1248,7 @@ static void mgmt_set_powered_complete(struct hci_dev *hdev, void *data, int err)
 				mgmt_status(err));
 	}
 
-	mgmt_pending_free(cmd);
+	mgmt_pending_remove(cmd);
 }
 
 static int set_powered_sync(struct hci_dev *hdev, void *data)
@@ -1281,7 +1287,7 @@ static int set_powered(struct sock *sk, struct hci_dev *hdev, void *data,
 		goto failed;
 	}
 
-	cmd = mgmt_pending_new(sk, MGMT_OP_SET_POWERED, hdev, data, len);
+	cmd = mgmt_pending_add(sk, MGMT_OP_SET_POWERED, hdev, data, len);
 	if (!cmd) {
 		err = -ENOMEM;
 		goto failed;
@@ -1289,6 +1295,9 @@ static int set_powered(struct sock *sk, struct hci_dev *hdev, void *data,
 
 	err = hci_cmd_sync_queue(hdev, set_powered_sync, cmd,
 				 mgmt_set_powered_complete);
+
+	if (err < 0)
+		mgmt_pending_remove(cmd);
 
 failed:
 	hci_dev_unlock(hdev);
@@ -1376,23 +1385,24 @@ static u8 mgmt_le_support(struct hci_dev *hdev)
 		return MGMT_STATUS_SUCCESS;
 }
 
-void mgmt_set_discoverable_complete(struct hci_dev *hdev, u8 status)
+static void mgmt_set_discoverable_complete(struct hci_dev *hdev, void *data,
+					   int err)
 {
-	struct mgmt_pending_cmd *cmd;
+	struct mgmt_pending_cmd *cmd = data;
 
-	bt_dev_dbg(hdev, "status 0x%02x", status);
+	bt_dev_dbg(hdev, "err %d", err);
+
+	/* Make sure cmd still outstanding. */
+	if (cmd != pending_find(MGMT_OP_SET_DISCOVERABLE, hdev))
+		return;
 
 	hci_dev_lock(hdev);
 
-	cmd = pending_find(MGMT_OP_SET_DISCOVERABLE, hdev);
-	if (!cmd)
-		goto unlock;
-
-	if (status) {
-		u8 mgmt_err = mgmt_status(status);
+	if (err) {
+		u8 mgmt_err = mgmt_status(err);
 		mgmt_cmd_status(cmd->sk, cmd->index, cmd->opcode, mgmt_err);
 		hci_dev_clear_flag(hdev, HCI_LIMITED_DISCOVERABLE);
-		goto remove_cmd;
+		goto done;
 	}
 
 	if (hci_dev_test_flag(hdev, HCI_DISCOVERABLE) &&
@@ -1404,11 +1414,16 @@ void mgmt_set_discoverable_complete(struct hci_dev *hdev, u8 status)
 	send_settings_rsp(cmd->sk, MGMT_OP_SET_DISCOVERABLE, hdev);
 	new_settings(hdev, cmd->sk);
 
-remove_cmd:
+done:
 	mgmt_pending_remove(cmd);
-
-unlock:
 	hci_dev_unlock(hdev);
+}
+
+static int set_discoverable_sync(struct hci_dev *hdev, void *data)
+{
+	BT_DBG("%s", hdev->name);
+
+	return hci_update_discoverable_sync(hdev);
 }
 
 static int set_discoverable(struct sock *sk, struct hci_dev *hdev, void *data,
@@ -1533,39 +1548,43 @@ static int set_discoverable(struct sock *sk, struct hci_dev *hdev, void *data,
 	else
 		hci_dev_clear_flag(hdev, HCI_LIMITED_DISCOVERABLE);
 
-	queue_work(hdev->req_workqueue, &hdev->discoverable_update);
-	err = 0;
+	err = hci_cmd_sync_queue(hdev, set_discoverable_sync, cmd,
+				 mgmt_set_discoverable_complete);
+
+	if (err < 0)
+		mgmt_pending_remove(cmd);
 
 failed:
 	hci_dev_unlock(hdev);
 	return err;
 }
 
-void mgmt_set_connectable_complete(struct hci_dev *hdev, u8 status)
+static void mgmt_set_connectable_complete(struct hci_dev *hdev, void *data,
+					  int err)
 {
-	struct mgmt_pending_cmd *cmd;
+	struct mgmt_pending_cmd *cmd = data;
 
-	bt_dev_dbg(hdev, "status 0x%02x", status);
+	bt_dev_dbg(hdev, "err %d", err);
+
+	/* Make sure cmd still outstanding. */
+	if (cmd != pending_find(MGMT_OP_SET_CONNECTABLE, hdev))
+		return;
 
 	hci_dev_lock(hdev);
 
-	cmd = pending_find(MGMT_OP_SET_CONNECTABLE, hdev);
-	if (!cmd)
-		goto unlock;
-
-	if (status) {
-		u8 mgmt_err = mgmt_status(status);
+	if (err) {
+		u8 mgmt_err = mgmt_status(err);
 		mgmt_cmd_status(cmd->sk, cmd->index, cmd->opcode, mgmt_err);
-		goto remove_cmd;
+		goto done;
 	}
 
 	send_settings_rsp(cmd->sk, MGMT_OP_SET_CONNECTABLE, hdev);
 	new_settings(hdev, cmd->sk);
 
-remove_cmd:
-	mgmt_pending_remove(cmd);
+done:
+	if (cmd)
+		mgmt_pending_remove(cmd);
 
-unlock:
 	hci_dev_unlock(hdev);
 }
 
@@ -1596,6 +1615,13 @@ static int set_connectable_update_settings(struct hci_dev *hdev,
 	}
 
 	return 0;
+}
+
+static int set_connectable_sync(struct hci_dev *hdev, void *data)
+{
+	BT_DBG("%s", hdev->name);
+
+	return hci_update_connectable_sync(hdev);
 }
 
 static int set_connectable(struct sock *sk, struct hci_dev *hdev, void *data,
@@ -1647,8 +1673,11 @@ static int set_connectable(struct sock *sk, struct hci_dev *hdev, void *data,
 		hci_dev_clear_flag(hdev, HCI_CONNECTABLE);
 	}
 
-	queue_work(hdev->req_workqueue, &hdev->connectable_update);
-	err = 0;
+	err = hci_cmd_sync_queue(hdev, set_connectable_sync, cmd,
+				 mgmt_set_connectable_complete);
+
+	if (err < 0)
+		mgmt_pending_remove(cmd);
 
 failed:
 	hci_dev_unlock(hdev);
@@ -1683,12 +1712,7 @@ static int set_bondable(struct sock *sk, struct hci_dev *hdev, void *data,
 		/* In limited privacy mode the change of bondable mode
 		 * may affect the local advertising address.
 		 */
-		if (hdev_is_powered(hdev) &&
-		    hci_dev_test_flag(hdev, HCI_ADVERTISING) &&
-		    hci_dev_test_flag(hdev, HCI_DISCOVERABLE) &&
-		    hci_dev_test_flag(hdev, HCI_LIMITED_PRIVACY))
-			queue_work(hdev->req_workqueue,
-				   &hdev->discoverable_update);
+		hci_update_discoverable(hdev);
 
 		err = new_settings(hdev, sk);
 	}
@@ -1774,6 +1798,10 @@ static void set_ssp_complete(struct hci_dev *hdev, void *data, int err)
 	struct mgmt_mode *cp = cmd->param;
 	u8 enable = cp->val;
 	bool changed;
+
+	/* Make sure cmd still outstanding. */
+	if (cmd != pending_find(MGMT_OP_SET_SSP, hdev))
+		return;
 
 	if (err) {
 		u8 mgmt_err = mgmt_status(err);
@@ -3322,6 +3350,9 @@ static void set_name_complete(struct hci_dev *hdev, void *data, int err)
 
 	bt_dev_dbg(hdev, "err %d", err);
 
+	if (cmd != pending_find(MGMT_OP_SET_LOCAL_NAME, hdev))
+		return;
+
 	if (status) {
 		mgmt_cmd_status(cmd->sk, hdev->id, MGMT_OP_SET_LOCAL_NAME,
 				status);
@@ -3472,6 +3503,9 @@ static void set_default_phy_complete(struct hci_dev *hdev, void *data, int err)
 	struct mgmt_pending_cmd *cmd = data;
 	struct sk_buff *skb = cmd->skb;
 	u8 status = mgmt_status(err);
+
+	if (cmd != pending_find(MGMT_OP_SET_PHY_CONFIGURATION, hdev))
+		return;
 
 	if (!status) {
 		if (!skb)
@@ -3711,13 +3745,6 @@ static int set_wideband_speech(struct sock *sk, struct hci_dev *hdev,
 
 	hci_dev_lock(hdev);
 
-	if (pending_find(MGMT_OP_SET_WIDEBAND_SPEECH, hdev)) {
-		err = mgmt_cmd_status(sk, hdev->id,
-				      MGMT_OP_SET_WIDEBAND_SPEECH,
-				      MGMT_STATUS_BUSY);
-		goto unlock;
-	}
-
 	if (hdev_is_powered(hdev) &&
 	    !!cp->val != hci_dev_test_flag(hdev,
 					   HCI_WIDEBAND_SPEECH_ENABLED)) {
@@ -3883,7 +3910,7 @@ static const u8 offload_codecs_uuid[16] = {
 };
 
 /* 671b10b5-42c0-4696-9227-eb28d1b049d6 */
-static const u8 simult_central_periph_uuid[16] = {
+static const u8 le_simultaneous_roles_uuid[16] = {
 	0xd6, 0x49, 0xb0, 0xd1, 0x28, 0xeb, 0x27, 0x92,
 	0x96, 0x46, 0xc0, 0x42, 0xb5, 0x10, 0x1b, 0x67,
 };
@@ -3916,16 +3943,13 @@ static int read_exp_features_info(struct sock *sk, struct hci_dev *hdev,
 	}
 #endif
 
-	if (hdev) {
-		if (test_bit(HCI_QUIRK_VALID_LE_STATES, &hdev->quirks) &&
-		    (hdev->le_states[4] & 0x08) &&	/* Central */
-		    (hdev->le_states[4] & 0x40) &&	/* Peripheral */
-		    (hdev->le_states[3] & 0x10))	/* Simultaneous */
+	if (hdev && hci_dev_le_state_simultaneous(hdev)) {
+		if (hci_dev_test_flag(hdev, HCI_LE_SIMULTANEOUS_ROLES))
 			flags = BIT(0);
 		else
 			flags = 0;
 
-		memcpy(rp->features[idx].uuid, simult_central_periph_uuid, 16);
+		memcpy(rp->features[idx].uuid, le_simultaneous_roles_uuid, 16);
 		rp->features[idx].flags = cpu_to_le32(flags);
 		idx++;
 	}
@@ -3985,35 +4009,24 @@ static int exp_ll_privacy_feature_changed(bool enabled, struct hci_dev *hdev,
 	memcpy(ev.uuid, rpa_resolution_uuid, 16);
 	ev.flags = cpu_to_le32((enabled ? BIT(0) : 0) | BIT(1));
 
+	if (enabled && privacy_mode_capable(hdev))
+		set_bit(HCI_CONN_FLAG_DEVICE_PRIVACY, hdev->conn_flags);
+	else
+		clear_bit(HCI_CONN_FLAG_DEVICE_PRIVACY, hdev->conn_flags);
+
 	return mgmt_limited_event(MGMT_EV_EXP_FEATURE_CHANGED, hdev,
 				  &ev, sizeof(ev),
 				  HCI_MGMT_EXP_FEATURE_EVENTS, skip);
 
 }
 
-#ifdef CONFIG_BT_FEATURE_DEBUG
-static int exp_debug_feature_changed(bool enabled, struct sock *skip)
+static int exp_feature_changed(struct hci_dev *hdev, const u8 *uuid,
+			       bool enabled, struct sock *skip)
 {
 	struct mgmt_ev_exp_feature_changed ev;
 
 	memset(&ev, 0, sizeof(ev));
-	memcpy(ev.uuid, debug_uuid, 16);
-	ev.flags = cpu_to_le32(enabled ? BIT(0) : 0);
-
-	return mgmt_limited_event(MGMT_EV_EXP_FEATURE_CHANGED, NULL,
-				  &ev, sizeof(ev),
-				  HCI_MGMT_EXP_FEATURE_EVENTS, skip);
-}
-#endif
-
-static int exp_quality_report_feature_changed(bool enabled,
-					      struct hci_dev *hdev,
-					      struct sock *skip)
-{
-	struct mgmt_ev_exp_feature_changed ev;
-
-	memset(&ev, 0, sizeof(ev));
-	memcpy(ev.uuid, quality_report_uuid, 16);
+	memcpy(ev.uuid, uuid, 16);
 	ev.flags = cpu_to_le32(enabled ? BIT(0) : 0);
 
 	return mgmt_limited_event(MGMT_EV_EXP_FEATURE_CHANGED, hdev,
@@ -4043,7 +4056,7 @@ static int set_zero_key_func(struct sock *sk, struct hci_dev *hdev,
 		bt_dbg_set(false);
 
 		if (changed)
-			exp_debug_feature_changed(false, sk);
+			exp_feature_changed(NULL, ZERO_KEY, false, sk);
 	}
 #endif
 
@@ -4053,7 +4066,8 @@ static int set_zero_key_func(struct sock *sk, struct hci_dev *hdev,
 		changed = hci_dev_test_and_clear_flag(hdev,
 						      HCI_ENABLE_LL_PRIVACY);
 		if (changed)
-			exp_ll_privacy_feature_changed(false, hdev, sk);
+			exp_feature_changed(hdev, rpa_resolution_uuid, false,
+					    sk);
 	}
 
 	hci_sock_set_flag(sk, HCI_MGMT_EXP_FEATURE_EVENTS);
@@ -4104,7 +4118,7 @@ static int set_debug_func(struct sock *sk, struct hci_dev *hdev,
 				&rp, sizeof(rp));
 
 	if (changed)
-		exp_debug_feature_changed(val, sk);
+		exp_feature_changed(hdev, debug_uuid, val, sk);
 
 	return err;
 }
@@ -4242,25 +4256,11 @@ static int set_quality_report_func(struct sock *sk, struct hci_dev *hdev,
 				&rp, sizeof(rp));
 
 	if (changed)
-		exp_quality_report_feature_changed(val, hdev, sk);
+		exp_feature_changed(hdev, quality_report_uuid, val, sk);
 
 unlock_quality_report:
 	hci_req_sync_unlock(hdev);
 	return err;
-}
-
-static int exp_offload_codec_feature_changed(bool enabled, struct hci_dev *hdev,
-					     struct sock *skip)
-{
-	struct mgmt_ev_exp_feature_changed ev;
-
-	memset(&ev, 0, sizeof(ev));
-	memcpy(ev.uuid, offload_codecs_uuid, 16);
-	ev.flags = cpu_to_le32(enabled ? BIT(0) : 0);
-
-	return mgmt_limited_event(MGMT_EV_EXP_FEATURE_CHANGED, hdev,
-				  &ev, sizeof(ev),
-				  HCI_MGMT_EXP_FEATURE_EVENTS, skip);
 }
 
 static int set_offload_codec_func(struct sock *sk, struct hci_dev *hdev,
@@ -4316,7 +4316,65 @@ static int set_offload_codec_func(struct sock *sk, struct hci_dev *hdev,
 				&rp, sizeof(rp));
 
 	if (changed)
-		exp_offload_codec_feature_changed(val, hdev, sk);
+		exp_feature_changed(hdev, offload_codecs_uuid, val, sk);
+
+	return err;
+}
+
+static int set_le_simultaneous_roles_func(struct sock *sk, struct hci_dev *hdev,
+					  struct mgmt_cp_set_exp_feature *cp,
+					  u16 data_len)
+{
+	bool val, changed;
+	int err;
+	struct mgmt_rp_set_exp_feature rp;
+
+	/* Command requires to use a valid controller index */
+	if (!hdev)
+		return mgmt_cmd_status(sk, MGMT_INDEX_NONE,
+				       MGMT_OP_SET_EXP_FEATURE,
+				       MGMT_STATUS_INVALID_INDEX);
+
+	/* Parameters are limited to a single octet */
+	if (data_len != MGMT_SET_EXP_FEATURE_SIZE + 1)
+		return mgmt_cmd_status(sk, hdev->id,
+				       MGMT_OP_SET_EXP_FEATURE,
+				       MGMT_STATUS_INVALID_PARAMS);
+
+	/* Only boolean on/off is supported */
+	if (cp->param[0] != 0x00 && cp->param[0] != 0x01)
+		return mgmt_cmd_status(sk, hdev->id,
+				       MGMT_OP_SET_EXP_FEATURE,
+				       MGMT_STATUS_INVALID_PARAMS);
+
+	val = !!cp->param[0];
+	changed = (val != hci_dev_test_flag(hdev, HCI_LE_SIMULTANEOUS_ROLES));
+
+	if (!hci_dev_le_state_simultaneous(hdev)) {
+		return mgmt_cmd_status(sk, hdev->id,
+				       MGMT_OP_SET_EXP_FEATURE,
+				       MGMT_STATUS_NOT_SUPPORTED);
+	}
+
+	if (changed) {
+		if (val)
+			hci_dev_set_flag(hdev, HCI_LE_SIMULTANEOUS_ROLES);
+		else
+			hci_dev_clear_flag(hdev, HCI_LE_SIMULTANEOUS_ROLES);
+	}
+
+	bt_dev_info(hdev, "LE simultaneous roles enable %d changed %d",
+		    val, changed);
+
+	memcpy(rp.uuid, le_simultaneous_roles_uuid, 16);
+	rp.flags = cpu_to_le32(val ? BIT(0) : 0);
+	hci_sock_set_flag(sk, HCI_MGMT_EXP_FEATURE_EVENTS);
+	err = mgmt_cmd_complete(sk, hdev->id,
+				MGMT_OP_SET_EXP_FEATURE, 0,
+				&rp, sizeof(rp));
+
+	if (changed)
+		exp_feature_changed(hdev, le_simultaneous_roles_uuid, val, sk);
 
 	return err;
 }
@@ -4333,6 +4391,7 @@ static const struct mgmt_exp_feature {
 	EXP_FEAT(rpa_resolution_uuid, set_rpa_resolution_func),
 	EXP_FEAT(quality_report_uuid, set_quality_report_func),
 	EXP_FEAT(offload_codecs_uuid, set_offload_codec_func),
+	EXP_FEAT(le_simultaneous_roles_uuid, set_le_simultaneous_roles_func),
 
 	/* end with a null feature */
 	EXP_FEAT(NULL, NULL)
@@ -4356,8 +4415,6 @@ static int set_exp_feature(struct sock *sk, struct hci_dev *hdev,
 			       MGMT_STATUS_NOT_SUPPORTED);
 }
 
-#define SUPPORTED_DEVICE_FLAGS() ((1U << HCI_CONN_FLAG_MAX) - 1)
-
 static int get_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
 			    u16 data_len)
 {
@@ -4365,7 +4422,7 @@ static int get_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
 	struct mgmt_rp_get_device_flags rp;
 	struct bdaddr_list_with_flags *br_params;
 	struct hci_conn_params *params;
-	u32 supported_flags = SUPPORTED_DEVICE_FLAGS();
+	u32 supported_flags;
 	u32 current_flags = 0;
 	u8 status = MGMT_STATUS_INVALID_PARAMS;
 
@@ -4373,6 +4430,9 @@ static int get_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
 		   &cp->addr.bdaddr, cp->addr.type);
 
 	hci_dev_lock(hdev);
+
+	bitmap_to_arr32(&supported_flags, hdev->conn_flags,
+			__HCI_CONN_NUM_FLAGS);
 
 	memset(&rp, 0, sizeof(rp));
 
@@ -4383,7 +4443,8 @@ static int get_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
 		if (!br_params)
 			goto done;
 
-		current_flags = br_params->current_flags;
+		bitmap_to_arr32(&current_flags, br_params->flags,
+				__HCI_CONN_NUM_FLAGS);
 	} else {
 		params = hci_conn_params_lookup(hdev, &cp->addr.bdaddr,
 						le_addr_type(cp->addr.type));
@@ -4391,7 +4452,8 @@ static int get_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
 		if (!params)
 			goto done;
 
-		current_flags = params->current_flags;
+		bitmap_to_arr32(&current_flags, params->flags,
+				__HCI_CONN_NUM_FLAGS);
 	}
 
 	bacpy(&rp.addr.bdaddr, &cp->addr.bdaddr);
@@ -4429,12 +4491,15 @@ static int set_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
 	struct bdaddr_list_with_flags *br_params;
 	struct hci_conn_params *params;
 	u8 status = MGMT_STATUS_INVALID_PARAMS;
-	u32 supported_flags = SUPPORTED_DEVICE_FLAGS();
+	u32 supported_flags;
 	u32 current_flags = __le32_to_cpu(cp->current_flags);
 
 	bt_dev_dbg(hdev, "Set device flags %pMR (type 0x%x) = 0x%x",
 		   &cp->addr.bdaddr, cp->addr.type,
 		   __le32_to_cpu(current_flags));
+
+	bitmap_to_arr32(&supported_flags, hdev->conn_flags,
+			__HCI_CONN_NUM_FLAGS);
 
 	if ((supported_flags | current_flags) != supported_flags) {
 		bt_dev_warn(hdev, "Bad flag given (0x%x) vs supported (0x%0x)",
@@ -4450,7 +4515,7 @@ static int set_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
 							      cp->addr.type);
 
 		if (br_params) {
-			br_params->current_flags = current_flags;
+			bitmap_from_u64(br_params->flags, current_flags);
 			status = MGMT_STATUS_SUCCESS;
 		} else {
 			bt_dev_warn(hdev, "No such BR/EDR device %pMR (0x%x)",
@@ -4460,8 +4525,15 @@ static int set_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
 		params = hci_conn_params_lookup(hdev, &cp->addr.bdaddr,
 						le_addr_type(cp->addr.type));
 		if (params) {
-			params->current_flags = current_flags;
+			bitmap_from_u64(params->flags, current_flags);
 			status = MGMT_STATUS_SUCCESS;
+
+			/* Update passive scan if HCI_CONN_FLAG_DEVICE_PRIVACY
+			 * has been set.
+			 */
+			if (test_bit(HCI_CONN_FLAG_DEVICE_PRIVACY,
+				     params->flags))
+				hci_update_passive_scan(hdev);
 		} else {
 			bt_dev_warn(hdev, "No such LE device %pMR (0x%x)",
 				    &cp->addr.bdaddr,
@@ -4992,12 +5064,6 @@ static int read_local_oob_data(struct sock *sk, struct hci_dev *hdev,
 		goto unlock;
 	}
 
-	if (pending_find(MGMT_OP_READ_LOCAL_OOB_DATA, hdev)) {
-		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_READ_LOCAL_OOB_DATA,
-				      MGMT_STATUS_BUSY);
-		goto unlock;
-	}
-
 	cmd = mgmt_pending_new(sk, MGMT_OP_READ_LOCAL_OOB_DATA, hdev, NULL, 0);
 	if (!cmd)
 		err = -ENOMEM;
@@ -5184,13 +5250,6 @@ void mgmt_start_discovery_complete(struct hci_dev *hdev, u8 status)
 	}
 
 	hci_dev_unlock(hdev);
-
-	/* Handle suspend notifier */
-	if (test_and_clear_bit(SUSPEND_UNPAUSE_DISCOVERY,
-			       hdev->suspend_tasks)) {
-		bt_dev_dbg(hdev, "Unpaused discovery");
-		wake_up(&hdev->suspend_wait_q);
-	}
 }
 
 static bool discovery_type_is_valid(struct hci_dev *hdev, uint8_t type,
@@ -5224,20 +5283,18 @@ static void start_discovery_complete(struct hci_dev *hdev, void *data, int err)
 {
 	struct mgmt_pending_cmd *cmd = data;
 
+	if (cmd != pending_find(MGMT_OP_START_DISCOVERY, hdev) &&
+	    cmd != pending_find(MGMT_OP_START_LIMITED_DISCOVERY, hdev) &&
+	    cmd != pending_find(MGMT_OP_START_SERVICE_DISCOVERY, hdev))
+		return;
+
 	bt_dev_dbg(hdev, "err %d", err);
 
 	mgmt_cmd_complete(cmd->sk, cmd->index, cmd->opcode, mgmt_status(err),
 			  cmd->param, 1);
-	mgmt_pending_free(cmd);
+	mgmt_pending_remove(cmd);
 
-	/* Handle suspend notifier */
-	if (test_and_clear_bit(SUSPEND_UNPAUSE_DISCOVERY,
-			       hdev->suspend_tasks)) {
-		bt_dev_dbg(hdev, "Unpaused discovery");
-		wake_up(&hdev->suspend_wait_q);
-	}
-
-	hci_discovery_set_state(hdev, err ? DISCOVERY_STOPPED :
+	hci_discovery_set_state(hdev, err ? DISCOVERY_STOPPED:
 				DISCOVERY_FINDING);
 }
 
@@ -5297,7 +5354,7 @@ static int start_discovery_internal(struct sock *sk, struct hci_dev *hdev,
 	else
 		hdev->discovery.limited = false;
 
-	cmd = mgmt_pending_new(sk, op, hdev, data, len);
+	cmd = mgmt_pending_add(sk, op, hdev, data, len);
 	if (!cmd) {
 		err = -ENOMEM;
 		goto failed;
@@ -5306,7 +5363,7 @@ static int start_discovery_internal(struct sock *sk, struct hci_dev *hdev,
 	err = hci_cmd_sync_queue(hdev, start_discovery_sync, cmd,
 				 start_discovery_complete);
 	if (err < 0) {
-		mgmt_pending_free(cmd);
+		mgmt_pending_remove(cmd);
 		goto failed;
 	}
 
@@ -5400,7 +5457,7 @@ static int start_service_discovery(struct sock *sk, struct hci_dev *hdev,
 		goto failed;
 	}
 
-	cmd = mgmt_pending_new(sk, MGMT_OP_START_SERVICE_DISCOVERY,
+	cmd = mgmt_pending_add(sk, MGMT_OP_START_SERVICE_DISCOVERY,
 			       hdev, data, len);
 	if (!cmd) {
 		err = -ENOMEM;
@@ -5433,7 +5490,7 @@ static int start_service_discovery(struct sock *sk, struct hci_dev *hdev,
 	err = hci_cmd_sync_queue(hdev, start_discovery_sync, cmd,
 				 start_discovery_complete);
 	if (err < 0) {
-		mgmt_pending_free(cmd);
+		mgmt_pending_remove(cmd);
 		goto failed;
 	}
 
@@ -5459,29 +5516,20 @@ void mgmt_stop_discovery_complete(struct hci_dev *hdev, u8 status)
 	}
 
 	hci_dev_unlock(hdev);
-
-	/* Handle suspend notifier */
-	if (test_and_clear_bit(SUSPEND_PAUSE_DISCOVERY, hdev->suspend_tasks)) {
-		bt_dev_dbg(hdev, "Paused discovery");
-		wake_up(&hdev->suspend_wait_q);
-	}
 }
 
 static void stop_discovery_complete(struct hci_dev *hdev, void *data, int err)
 {
 	struct mgmt_pending_cmd *cmd = data;
 
+	if (cmd != pending_find(MGMT_OP_STOP_DISCOVERY, hdev))
+		return;
+
 	bt_dev_dbg(hdev, "err %d", err);
 
 	mgmt_cmd_complete(cmd->sk, cmd->index, cmd->opcode, mgmt_status(err),
 			  cmd->param, 1);
-	mgmt_pending_free(cmd);
-
-	/* Handle suspend notifier */
-	if (test_and_clear_bit(SUSPEND_PAUSE_DISCOVERY, hdev->suspend_tasks)) {
-		bt_dev_dbg(hdev, "Paused discovery");
-		wake_up(&hdev->suspend_wait_q);
-	}
+	mgmt_pending_remove(cmd);
 
 	if (!err)
 		hci_discovery_set_state(hdev, DISCOVERY_STOPPED);
@@ -5517,7 +5565,7 @@ static int stop_discovery(struct sock *sk, struct hci_dev *hdev, void *data,
 		goto unlock;
 	}
 
-	cmd = mgmt_pending_new(sk, MGMT_OP_STOP_DISCOVERY, hdev, data, len);
+	cmd = mgmt_pending_add(sk, MGMT_OP_STOP_DISCOVERY, hdev, data, len);
 	if (!cmd) {
 		err = -ENOMEM;
 		goto unlock;
@@ -5526,7 +5574,7 @@ static int stop_discovery(struct sock *sk, struct hci_dev *hdev, void *data,
 	err = hci_cmd_sync_queue(hdev, stop_discovery_sync, cmd,
 				 stop_discovery_complete);
 	if (err < 0) {
-		mgmt_pending_free(cmd);
+		mgmt_pending_remove(cmd);
 		goto unlock;
 	}
 
@@ -5721,17 +5769,6 @@ static void set_advertising_complete(struct hci_dev *hdev, void *data, int err)
 
 	if (match.sk)
 		sock_put(match.sk);
-
-	/* Handle suspend notifier */
-	if (test_and_clear_bit(SUSPEND_PAUSE_ADVERTISING,
-			       hdev->suspend_tasks)) {
-		bt_dev_dbg(hdev, "Paused advertising");
-		wake_up(&hdev->suspend_wait_q);
-	} else if (test_and_clear_bit(SUSPEND_UNPAUSE_ADVERTISING,
-				      hdev->suspend_tasks)) {
-		bt_dev_dbg(hdev, "Unpaused advertising");
-		wake_up(&hdev->suspend_wait_q);
-	}
 
 	/* If "Set Advertising" was just disabled and instance advertising was
 	 * set up earlier, then re-enable multi-instance advertising.
@@ -7023,6 +7060,7 @@ static int add_device(struct sock *sk, struct hci_dev *hdev,
 	struct hci_conn_params *params;
 	int err;
 	u32 current_flags = 0;
+	u32 supported_flags;
 
 	bt_dev_dbg(hdev, "sock %p", sk);
 
@@ -7094,7 +7132,8 @@ static int add_device(struct sock *sk, struct hci_dev *hdev,
 		params = hci_conn_params_lookup(hdev, &cp->addr.bdaddr,
 						addr_type);
 		if (params)
-			current_flags = params->current_flags;
+			bitmap_to_arr32(&current_flags, params->flags,
+					__HCI_CONN_NUM_FLAGS);
 	}
 
 	err = hci_cmd_sync_queue(hdev, add_device_sync, NULL, NULL);
@@ -7103,8 +7142,10 @@ static int add_device(struct sock *sk, struct hci_dev *hdev,
 
 added:
 	device_added(sk, hdev, &cp->addr.bdaddr, cp->addr.type, cp->action);
+	bitmap_to_arr32(&supported_flags, hdev->conn_flags,
+			__HCI_CONN_NUM_FLAGS);
 	device_flags_changed(NULL, hdev, &cp->addr.bdaddr, cp->addr.type,
-			     SUPPORTED_DEVICE_FLAGS(), current_flags);
+			     supported_flags, current_flags);
 
 	err = mgmt_cmd_complete(sk, hdev->id, MGMT_OP_ADD_DEVICE,
 				MGMT_STATUS_SUCCESS, &cp->addr,
@@ -7462,6 +7503,9 @@ static void read_local_oob_ext_data_complete(struct hci_dev *hdev, void *data,
 	struct sk_buff *skb = cmd->skb;
 	u8 status = mgmt_status(err);
 	u16 eir_len;
+
+	if (cmd != pending_find(MGMT_OP_READ_LOCAL_OOB_EXT_DATA, hdev))
+		return;
 
 	if (!status) {
 		if (!skb)
@@ -7958,11 +8002,7 @@ static bool requested_adv_flags_are_valid(struct hci_dev *hdev, u32 adv_flags)
 
 static bool adv_busy(struct hci_dev *hdev)
 {
-	return (pending_find(MGMT_OP_ADD_ADVERTISING, hdev) ||
-		pending_find(MGMT_OP_REMOVE_ADVERTISING, hdev) ||
-		pending_find(MGMT_OP_SET_LE, hdev) ||
-		pending_find(MGMT_OP_ADD_EXT_ADV_PARAMS, hdev) ||
-		pending_find(MGMT_OP_ADD_EXT_ADV_DATA, hdev));
+	return pending_find(MGMT_OP_SET_LE, hdev);
 }
 
 static void add_adv_complete(struct hci_dev *hdev, struct sock *sk, u8 instance,
@@ -8552,9 +8592,7 @@ static int remove_advertising(struct sock *sk, struct hci_dev *hdev,
 		goto unlock;
 	}
 
-	if (pending_find(MGMT_OP_ADD_ADVERTISING, hdev) ||
-	    pending_find(MGMT_OP_REMOVE_ADVERTISING, hdev) ||
-	    pending_find(MGMT_OP_SET_LE, hdev)) {
+	if (pending_find(MGMT_OP_SET_LE, hdev)) {
 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_REMOVE_ADVERTISING,
 				      MGMT_STATUS_BUSY);
 		goto unlock;
