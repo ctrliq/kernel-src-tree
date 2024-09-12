@@ -1,0 +1,392 @@
+net: stmmac: only enable DMA interrupts when ready
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Vincent Whitchurch <vincent.whitchurch@axis.com>
+commit 087a7b944c5db409f7c1a68bf4896c56ba54eaff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/087a7b94.failed
+
+In this driver's ->ndo_open() callback, it enables DMA interrupts,
+starts the DMA channels, then requests interrupts with request_irq(),
+and then finally enables napi.
+
+If RX DMA interrupts are received before napi is enabled, no processing
+is done because napi_schedule_prep() will return false.  If the network
+has a lot of broadcast/multicast traffic, then the RX ring could fill up
+completely before napi is enabled.  When this happens, no further RX
+interrupts will be delivered, and the driver will fail to receive any
+packets.
+
+Fix this by only enabling DMA interrupts after all other initialization
+is complete.
+
+Fixes: 523f11b5d4fd72efb ("net: stmmac: move hardware setup for stmmac_open to new function")
+	Reported-by: Lars Persson <larper@axis.com>
+	Signed-off-by: Vincent Whitchurch <vincent.whitchurch@axis.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 087a7b944c5db409f7c1a68bf4896c56ba54eaff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+diff --cc drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 5089be818f57,cb9b6e08780c..000000000000
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@@ -5284,6 -6301,350 +5304,353 @@@ del_vlan_error
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int stmmac_bpf(struct net_device *dev, struct netdev_bpf *bpf)
++ {
++ 	struct stmmac_priv *priv = netdev_priv(dev);
++ 
++ 	switch (bpf->command) {
++ 	case XDP_SETUP_PROG:
++ 		return stmmac_xdp_set_prog(priv, bpf->prog, bpf->extack);
++ 	case XDP_SETUP_XSK_POOL:
++ 		return stmmac_xdp_setup_pool(priv, bpf->xsk.pool,
++ 					     bpf->xsk.queue_id);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int stmmac_xdp_xmit(struct net_device *dev, int num_frames,
++ 			   struct xdp_frame **frames, u32 flags)
++ {
++ 	struct stmmac_priv *priv = netdev_priv(dev);
++ 	int cpu = smp_processor_id();
++ 	struct netdev_queue *nq;
++ 	int i, nxmit = 0;
++ 	int queue;
++ 
++ 	if (unlikely(test_bit(STMMAC_DOWN, &priv->state)))
++ 		return -ENETDOWN;
++ 
++ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++ 		return -EINVAL;
++ 
++ 	queue = stmmac_xdp_get_tx_queue(priv, cpu);
++ 	nq = netdev_get_tx_queue(priv->dev, queue);
++ 
++ 	__netif_tx_lock(nq, cpu);
++ 	/* Avoids TX time-out as we are sharing with slow path */
++ 	txq_trans_cond_update(nq);
++ 
++ 	for (i = 0; i < num_frames; i++) {
++ 		int res;
++ 
++ 		res = stmmac_xdp_xmit_xdpf(priv, queue, frames[i], true);
++ 		if (res == STMMAC_XDP_CONSUMED)
++ 			break;
++ 
++ 		nxmit++;
++ 	}
++ 
++ 	if (flags & XDP_XMIT_FLUSH) {
++ 		stmmac_flush_tx_descriptors(priv, queue);
++ 		stmmac_tx_timer_arm(priv, queue);
++ 	}
++ 
++ 	__netif_tx_unlock(nq);
++ 
++ 	return nxmit;
++ }
++ 
++ void stmmac_disable_rx_queue(struct stmmac_priv *priv, u32 queue)
++ {
++ 	struct stmmac_channel *ch = &priv->channel[queue];
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&ch->lock, flags);
++ 	stmmac_disable_dma_irq(priv, priv->ioaddr, queue, 1, 0);
++ 	spin_unlock_irqrestore(&ch->lock, flags);
++ 
++ 	stmmac_stop_rx_dma(priv, queue);
++ 	__free_dma_rx_desc_resources(priv, queue);
++ }
++ 
++ void stmmac_enable_rx_queue(struct stmmac_priv *priv, u32 queue)
++ {
++ 	struct stmmac_rx_queue *rx_q = &priv->rx_queue[queue];
++ 	struct stmmac_channel *ch = &priv->channel[queue];
++ 	unsigned long flags;
++ 	u32 buf_size;
++ 	int ret;
++ 
++ 	ret = __alloc_dma_rx_desc_resources(priv, queue);
++ 	if (ret) {
++ 		netdev_err(priv->dev, "Failed to alloc RX desc.\n");
++ 		return;
++ 	}
++ 
++ 	ret = __init_dma_rx_desc_rings(priv, queue, GFP_KERNEL);
++ 	if (ret) {
++ 		__free_dma_rx_desc_resources(priv, queue);
++ 		netdev_err(priv->dev, "Failed to init RX desc.\n");
++ 		return;
++ 	}
++ 
++ 	stmmac_clear_rx_descriptors(priv, queue);
++ 
++ 	stmmac_init_rx_chan(priv, priv->ioaddr, priv->plat->dma_cfg,
++ 			    rx_q->dma_rx_phy, rx_q->queue_index);
++ 
++ 	rx_q->rx_tail_addr = rx_q->dma_rx_phy + (rx_q->buf_alloc_num *
++ 			     sizeof(struct dma_desc));
++ 	stmmac_set_rx_tail_ptr(priv, priv->ioaddr,
++ 			       rx_q->rx_tail_addr, rx_q->queue_index);
++ 
++ 	if (rx_q->xsk_pool && rx_q->buf_alloc_num) {
++ 		buf_size = xsk_pool_get_rx_frame_size(rx_q->xsk_pool);
++ 		stmmac_set_dma_bfsize(priv, priv->ioaddr,
++ 				      buf_size,
++ 				      rx_q->queue_index);
++ 	} else {
++ 		stmmac_set_dma_bfsize(priv, priv->ioaddr,
++ 				      priv->dma_buf_sz,
++ 				      rx_q->queue_index);
++ 	}
++ 
++ 	stmmac_start_rx_dma(priv, queue);
++ 
++ 	spin_lock_irqsave(&ch->lock, flags);
++ 	stmmac_enable_dma_irq(priv, priv->ioaddr, queue, 1, 0);
++ 	spin_unlock_irqrestore(&ch->lock, flags);
++ }
++ 
++ void stmmac_disable_tx_queue(struct stmmac_priv *priv, u32 queue)
++ {
++ 	struct stmmac_channel *ch = &priv->channel[queue];
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&ch->lock, flags);
++ 	stmmac_disable_dma_irq(priv, priv->ioaddr, queue, 0, 1);
++ 	spin_unlock_irqrestore(&ch->lock, flags);
++ 
++ 	stmmac_stop_tx_dma(priv, queue);
++ 	__free_dma_tx_desc_resources(priv, queue);
++ }
++ 
++ void stmmac_enable_tx_queue(struct stmmac_priv *priv, u32 queue)
++ {
++ 	struct stmmac_tx_queue *tx_q = &priv->tx_queue[queue];
++ 	struct stmmac_channel *ch = &priv->channel[queue];
++ 	unsigned long flags;
++ 	int ret;
++ 
++ 	ret = __alloc_dma_tx_desc_resources(priv, queue);
++ 	if (ret) {
++ 		netdev_err(priv->dev, "Failed to alloc TX desc.\n");
++ 		return;
++ 	}
++ 
++ 	ret = __init_dma_tx_desc_rings(priv, queue);
++ 	if (ret) {
++ 		__free_dma_tx_desc_resources(priv, queue);
++ 		netdev_err(priv->dev, "Failed to init TX desc.\n");
++ 		return;
++ 	}
++ 
++ 	stmmac_clear_tx_descriptors(priv, queue);
++ 
++ 	stmmac_init_tx_chan(priv, priv->ioaddr, priv->plat->dma_cfg,
++ 			    tx_q->dma_tx_phy, tx_q->queue_index);
++ 
++ 	if (tx_q->tbs & STMMAC_TBS_AVAIL)
++ 		stmmac_enable_tbs(priv, priv->ioaddr, 1, tx_q->queue_index);
++ 
++ 	tx_q->tx_tail_addr = tx_q->dma_tx_phy;
++ 	stmmac_set_tx_tail_ptr(priv, priv->ioaddr,
++ 			       tx_q->tx_tail_addr, tx_q->queue_index);
++ 
++ 	stmmac_start_tx_dma(priv, queue);
++ 
++ 	spin_lock_irqsave(&ch->lock, flags);
++ 	stmmac_enable_dma_irq(priv, priv->ioaddr, queue, 0, 1);
++ 	spin_unlock_irqrestore(&ch->lock, flags);
++ }
++ 
++ void stmmac_xdp_release(struct net_device *dev)
++ {
++ 	struct stmmac_priv *priv = netdev_priv(dev);
++ 	u32 chan;
++ 
++ 	/* Disable NAPI process */
++ 	stmmac_disable_all_queues(priv);
++ 
++ 	for (chan = 0; chan < priv->plat->tx_queues_to_use; chan++)
++ 		hrtimer_cancel(&priv->tx_queue[chan].txtimer);
++ 
++ 	/* Free the IRQ lines */
++ 	stmmac_free_irq(dev, REQ_IRQ_ERR_ALL, 0);
++ 
++ 	/* Stop TX/RX DMA channels */
++ 	stmmac_stop_all_dma(priv);
++ 
++ 	/* Release and free the Rx/Tx resources */
++ 	free_dma_desc_resources(priv);
++ 
++ 	/* Disable the MAC Rx/Tx */
++ 	stmmac_mac_set(priv, priv->ioaddr, false);
++ 
++ 	/* set trans_start so we don't get spurious
++ 	 * watchdogs during reset
++ 	 */
++ 	netif_trans_update(dev);
++ 	netif_carrier_off(dev);
++ }
++ 
++ int stmmac_xdp_open(struct net_device *dev)
++ {
++ 	struct stmmac_priv *priv = netdev_priv(dev);
++ 	u32 rx_cnt = priv->plat->rx_queues_to_use;
++ 	u32 tx_cnt = priv->plat->tx_queues_to_use;
++ 	u32 dma_csr_ch = max(rx_cnt, tx_cnt);
++ 	struct stmmac_rx_queue *rx_q;
++ 	struct stmmac_tx_queue *tx_q;
++ 	u32 buf_size;
++ 	bool sph_en;
++ 	u32 chan;
++ 	int ret;
++ 
++ 	ret = alloc_dma_desc_resources(priv);
++ 	if (ret < 0) {
++ 		netdev_err(dev, "%s: DMA descriptors allocation failed\n",
++ 			   __func__);
++ 		goto dma_desc_error;
++ 	}
++ 
++ 	ret = init_dma_desc_rings(dev, GFP_KERNEL);
++ 	if (ret < 0) {
++ 		netdev_err(dev, "%s: DMA descriptors initialization failed\n",
++ 			   __func__);
++ 		goto init_error;
++ 	}
++ 
++ 	/* DMA CSR Channel configuration */
++ 	for (chan = 0; chan < dma_csr_ch; chan++) {
++ 		stmmac_init_chan(priv, priv->ioaddr, priv->plat->dma_cfg, chan);
++ 		stmmac_disable_dma_irq(priv, priv->ioaddr, chan, 1, 1);
++ 	}
++ 
++ 	/* Adjust Split header */
++ 	sph_en = (priv->hw->rx_csum > 0) && priv->sph;
++ 
++ 	/* DMA RX Channel Configuration */
++ 	for (chan = 0; chan < rx_cnt; chan++) {
++ 		rx_q = &priv->rx_queue[chan];
++ 
++ 		stmmac_init_rx_chan(priv, priv->ioaddr, priv->plat->dma_cfg,
++ 				    rx_q->dma_rx_phy, chan);
++ 
++ 		rx_q->rx_tail_addr = rx_q->dma_rx_phy +
++ 				     (rx_q->buf_alloc_num *
++ 				      sizeof(struct dma_desc));
++ 		stmmac_set_rx_tail_ptr(priv, priv->ioaddr,
++ 				       rx_q->rx_tail_addr, chan);
++ 
++ 		if (rx_q->xsk_pool && rx_q->buf_alloc_num) {
++ 			buf_size = xsk_pool_get_rx_frame_size(rx_q->xsk_pool);
++ 			stmmac_set_dma_bfsize(priv, priv->ioaddr,
++ 					      buf_size,
++ 					      rx_q->queue_index);
++ 		} else {
++ 			stmmac_set_dma_bfsize(priv, priv->ioaddr,
++ 					      priv->dma_buf_sz,
++ 					      rx_q->queue_index);
++ 		}
++ 
++ 		stmmac_enable_sph(priv, priv->ioaddr, sph_en, chan);
++ 	}
++ 
++ 	/* DMA TX Channel Configuration */
++ 	for (chan = 0; chan < tx_cnt; chan++) {
++ 		tx_q = &priv->tx_queue[chan];
++ 
++ 		stmmac_init_tx_chan(priv, priv->ioaddr, priv->plat->dma_cfg,
++ 				    tx_q->dma_tx_phy, chan);
++ 
++ 		tx_q->tx_tail_addr = tx_q->dma_tx_phy;
++ 		stmmac_set_tx_tail_ptr(priv, priv->ioaddr,
++ 				       tx_q->tx_tail_addr, chan);
++ 
++ 		hrtimer_init(&tx_q->txtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++ 		tx_q->txtimer.function = stmmac_tx_timer;
++ 	}
++ 
++ 	/* Enable the MAC Rx/Tx */
++ 	stmmac_mac_set(priv, priv->ioaddr, true);
++ 
++ 	/* Start Rx & Tx DMA Channels */
++ 	stmmac_start_all_dma(priv);
++ 
++ 	ret = stmmac_request_irq(dev);
++ 	if (ret)
++ 		goto irq_error;
++ 
++ 	/* Enable NAPI process*/
++ 	stmmac_enable_all_queues(priv);
++ 	netif_carrier_on(dev);
++ 	netif_tx_start_all_queues(dev);
++ 	stmmac_enable_all_dma_irq(priv);
++ 
++ 	return 0;
++ 
++ irq_error:
++ 	for (chan = 0; chan < priv->plat->tx_queues_to_use; chan++)
++ 		hrtimer_cancel(&priv->tx_queue[chan].txtimer);
++ 
++ 	stmmac_hw_teardown(dev);
++ init_error:
++ 	free_dma_desc_resources(priv);
++ dma_desc_error:
++ 	return ret;
++ }
++ 
++ int stmmac_xsk_wakeup(struct net_device *dev, u32 queue, u32 flags)
++ {
++ 	struct stmmac_priv *priv = netdev_priv(dev);
++ 	struct stmmac_rx_queue *rx_q;
++ 	struct stmmac_tx_queue *tx_q;
++ 	struct stmmac_channel *ch;
++ 
++ 	if (test_bit(STMMAC_DOWN, &priv->state) ||
++ 	    !netif_carrier_ok(priv->dev))
++ 		return -ENETDOWN;
++ 
++ 	if (!stmmac_xdp_is_enabled(priv))
++ 		return -ENXIO;
++ 
++ 	if (queue >= priv->plat->rx_queues_to_use ||
++ 	    queue >= priv->plat->tx_queues_to_use)
++ 		return -EINVAL;
++ 
++ 	rx_q = &priv->rx_queue[queue];
++ 	tx_q = &priv->tx_queue[queue];
++ 	ch = &priv->channel[queue];
++ 
++ 	if (!rx_q->xsk_pool && !tx_q->xsk_pool)
++ 		return -ENXIO;
++ 
++ 	if (!napi_if_scheduled_mark_missed(&ch->rxtx_napi)) {
++ 		/* EQoS does not have per-DMA channel SW interrupt,
++ 		 * so we schedule RX Napi straight-away.
++ 		 */
++ 		if (likely(napi_schedule_prep(&ch->rxtx_napi)))
++ 			__napi_schedule(&ch->rxtx_napi);
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 087a7b944c5d (net: stmmac: only enable DMA interrupts when ready)
+  static const struct net_device_ops stmmac_netdev_ops = {
+  	.ndo_open = stmmac_open,
+  	.ndo_start_xmit = stmmac_xmit,
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
