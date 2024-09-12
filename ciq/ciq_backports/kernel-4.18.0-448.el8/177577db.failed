@@ -1,0 +1,187 @@
+wifi: mac80211: sta_info: fix link_sta insertion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 177577dbd2235a3a65f34a6cd618fe961a4dcaba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/177577db.failed
+
+When inserting a link STA, make sure it doesn't exist first
+and add lockdep assertions that we cannot modify the hash
+table without holding the sta_mtx, so this check is really
+correct.
+
+Also return without hashing if the driver failed, and warn
+if the hashing fails, which shouldn't happen due to the
+check described above.
+
+Fixes: cb71f1d136a6 ("wifi: mac80211: add sta link addition/removal")
+Fixes: ba6ddab94fc6 ("wifi: mac80211: maintain link-sta hash table")
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 177577dbd2235a3a65f34a6cd618fe961a4dcaba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/sta_info.c
+diff --cc net/mac80211/sta_info.c
+index d25b297851c4,cb23da9aff1e..000000000000
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@@ -81,6 -96,24 +81,27 @@@ static int sta_info_hash_del(struct iee
+  			       sta_rht_params);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int link_sta_info_hash_add(struct ieee80211_local *local,
++ 				  struct link_sta_info *link_sta)
++ {
++ 	lockdep_assert_held(&local->sta_mtx);
++ 	return rhltable_insert(&local->link_sta_hash,
++ 			       &link_sta->link_hash_node,
++ 			       link_sta_rht_params);
++ }
++ 
++ static int link_sta_info_hash_del(struct ieee80211_local *local,
++ 				  struct link_sta_info *link_sta)
++ {
++ 	lockdep_assert_held(&local->sta_mtx);
++ 	return rhltable_remove(&local->link_sta_hash,
++ 			       &link_sta->link_hash_node,
++ 			       link_sta_rht_params);
++ }
++ 
+++>>>>>>> 177577dbd223 (wifi: mac80211: sta_info: fix link_sta insertion)
+  static void __cleanup_single_sta(struct sta_info *sta)
+  {
+  	int ac, i;
+@@@ -2604,3 -2714,123 +2625,126 @@@ void ieee80211_sta_set_expected_through
+  
+  	sta_update_codel_params(sta, thr);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int ieee80211_sta_allocate_link(struct sta_info *sta, unsigned int link_id)
++ {
++ 	struct ieee80211_sub_if_data *sdata = sta->sdata;
++ 	struct sta_link_alloc *alloc;
++ 	int ret;
++ 
++ 	lockdep_assert_held(&sdata->local->sta_mtx);
++ 
++ 	/* must represent an MLD from the start */
++ 	if (WARN_ON(!sta->sta.valid_links))
++ 		return -EINVAL;
++ 
++ 	if (WARN_ON(sta->sta.valid_links & BIT(link_id) ||
++ 		    sta->link[link_id]))
++ 		return -EBUSY;
++ 
++ 	alloc = kzalloc(sizeof(*alloc), GFP_KERNEL);
++ 	if (!alloc)
++ 		return -ENOMEM;
++ 
++ 	ret = sta_info_alloc_link(sdata->local, &alloc->info, GFP_KERNEL);
++ 	if (ret) {
++ 		kfree(alloc);
++ 		return ret;
++ 	}
++ 
++ 	sta_info_add_link(sta, link_id, &alloc->info, &alloc->sta);
++ 
++ 	return 0;
++ }
++ 
++ void ieee80211_sta_free_link(struct sta_info *sta, unsigned int link_id)
++ {
++ 	lockdep_assert_held(&sta->sdata->local->sta_mtx);
++ 
++ 	sta_remove_link(sta, link_id, false);
++ }
++ 
++ int ieee80211_sta_activate_link(struct sta_info *sta, unsigned int link_id)
++ {
++ 	struct ieee80211_sub_if_data *sdata = sta->sdata;
++ 	struct link_sta_info *link_sta;
++ 	u16 old_links = sta->sta.valid_links;
++ 	u16 new_links = old_links | BIT(link_id);
++ 	int ret;
++ 
++ 	link_sta = rcu_dereference_protected(sta->link[link_id],
++ 					     lockdep_is_held(&sdata->local->sta_mtx));
++ 
++ 	if (WARN_ON(old_links == new_links || !link_sta))
++ 		return -EINVAL;
++ 
++ 	rcu_read_lock();
++ 	if (link_sta_info_hash_lookup(sdata->local, link_sta->addr)) {
++ 		rcu_read_unlock();
++ 		return -EALREADY;
++ 	}
++ 	/* we only modify under the mutex so this is fine */
++ 	rcu_read_unlock();
++ 
++ 	sta->sta.valid_links = new_links;
++ 
++ 	if (!test_sta_flag(sta, WLAN_STA_INSERTED)) {
++ 		ret = 0;
++ 		goto hash;
++ 	}
++ 
++ 	ret = drv_change_sta_links(sdata->local, sdata, &sta->sta,
++ 				   old_links, new_links);
++ 	if (ret) {
++ 		sta->sta.valid_links = old_links;
++ 		sta_remove_link(sta, link_id, false);
++ 		return ret;
++ 	}
++ 
++ hash:
++ 	ret = link_sta_info_hash_add(sdata->local, link_sta);
++ 	WARN_ON(ret);
++ 	return 0;
++ }
++ 
++ void ieee80211_sta_remove_link(struct sta_info *sta, unsigned int link_id)
++ {
++ 	struct ieee80211_sub_if_data *sdata = sta->sdata;
++ 
++ 	lockdep_assert_held(&sdata->local->sta_mtx);
++ 
++ 	sta->sta.valid_links &= ~BIT(link_id);
++ 
++ 	if (test_sta_flag(sta, WLAN_STA_INSERTED))
++ 		drv_change_sta_links(sdata->local, sdata, &sta->sta,
++ 				     sta->sta.valid_links,
++ 				     sta->sta.valid_links & ~BIT(link_id));
++ 
++ 	sta_remove_link(sta, link_id, true);
++ }
++ 
++ void ieee80211_sta_set_max_amsdu_subframes(struct sta_info *sta,
++ 					   const u8 *ext_capab,
++ 					   unsigned int ext_capab_len)
++ {
++ 	u8 val;
++ 
++ 	sta->sta.max_amsdu_subframes = 0;
++ 
++ 	if (ext_capab_len < 8)
++ 		return;
++ 
++ 	/* The sender might not have sent the last bit, consider it to be 0 */
++ 	val = u8_get_bits(ext_capab[7], WLAN_EXT_CAPA8_MAX_MSDU_IN_AMSDU_LSB);
++ 
++ 	/* we did get all the bits, take the MSB as well */
++ 	if (ext_capab_len >= 9)
++ 		val |= u8_get_bits(ext_capab[8],
++ 				   WLAN_EXT_CAPA9_MAX_MSDU_IN_AMSDU_MSB) << 1;
++ 
++ 	if (val)
++ 		sta->sta.max_amsdu_subframes = 4 << val;
++ }
+++>>>>>>> 177577dbd223 (wifi: mac80211: sta_info: fix link_sta insertion)
+* Unmerged path net/mac80211/sta_info.c
