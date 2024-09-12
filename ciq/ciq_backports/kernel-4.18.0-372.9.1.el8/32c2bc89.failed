@@ -1,0 +1,196 @@
+drm/i915: Fix type1 DVI DP dual mode adapter heuristic for modern platforms
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.9.1.el8
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit 32c2bc89c7420fad2959ee23ef5b6be8b05d2bde
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.9.1.el8/32c2bc89.failed
+
+Looks like we never updated intel_bios_is_port_dp_dual_mode() when
+the VBT port mapping became erratic on modern platforms. This
+is causing us to look up the wrong child device and thus throwing
+the heuristic off (ie. we might end looking at a child device for
+a genuine DP++ port when we were supposed to look at one for a
+native HDMI port).
+
+Fix it up by not using the outdated port_mapping[] in
+intel_bios_is_port_dp_dual_mode() and rely on
+intel_bios_encoder_data_lookup() instead.
+
+	Cc: stable@vger.kernel.org
+	Tested-by: Randy Dunlap <rdunlap@infradead.org>
+Closes: https://gitlab.freedesktop.org/drm/intel/-/issues/4138
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20211025142147.23897-1-ville.syrjala@linux.intel.com
+	Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+(cherry picked from commit 32c2bc89c7420fad2959ee23ef5b6be8b05d2bde)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_bios.c
+diff --cc drivers/gpu/drm/i915/display/intel_bios.c
+index 106f696e50a0,2b1423a43437..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_bios.c
++++ b/drivers/gpu/drm/i915/display/intel_bios.c
+@@@ -1692,6 -1591,155 +1692,158 @@@ static u8 map_ddc_pin(struct drm_i915_p
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static enum port get_port_by_ddc_pin(struct drm_i915_private *i915, u8 ddc_pin)
++ {
++ 	const struct intel_bios_encoder_data *devdata;
++ 	enum port port;
++ 
++ 	if (!ddc_pin)
++ 		return PORT_NONE;
++ 
++ 	for_each_port(port) {
++ 		devdata = i915->vbt.ports[port];
++ 
++ 		if (devdata && ddc_pin == devdata->child.ddc_pin)
++ 			return port;
++ 	}
++ 
++ 	return PORT_NONE;
++ }
++ 
++ static void sanitize_ddc_pin(struct intel_bios_encoder_data *devdata,
++ 			     enum port port)
++ {
++ 	struct drm_i915_private *i915 = devdata->i915;
++ 	struct child_device_config *child;
++ 	u8 mapped_ddc_pin;
++ 	enum port p;
++ 
++ 	if (!devdata->child.ddc_pin)
++ 		return;
++ 
++ 	mapped_ddc_pin = map_ddc_pin(i915, devdata->child.ddc_pin);
++ 	if (!intel_gmbus_is_valid_pin(i915, mapped_ddc_pin)) {
++ 		drm_dbg_kms(&i915->drm,
++ 			    "Port %c has invalid DDC pin %d, "
++ 			    "sticking to defaults\n",
++ 			    port_name(port), mapped_ddc_pin);
++ 		devdata->child.ddc_pin = 0;
++ 		return;
++ 	}
++ 
++ 	p = get_port_by_ddc_pin(i915, devdata->child.ddc_pin);
++ 	if (p == PORT_NONE)
++ 		return;
++ 
++ 	drm_dbg_kms(&i915->drm,
++ 		    "port %c trying to use the same DDC pin (0x%x) as port %c, "
++ 		    "disabling port %c DVI/HDMI support\n",
++ 		    port_name(port), mapped_ddc_pin,
++ 		    port_name(p), port_name(p));
++ 
++ 	/*
++ 	 * If we have multiple ports supposedly sharing the pin, then dvi/hdmi
++ 	 * couldn't exist on the shared port. Otherwise they share the same ddc
++ 	 * pin and system couldn't communicate with them separately.
++ 	 *
++ 	 * Give inverse child device order the priority, last one wins. Yes,
++ 	 * there are real machines (eg. Asrock B250M-HDV) where VBT has both
++ 	 * port A and port E with the same AUX ch and we must pick port E :(
++ 	 */
++ 	child = &i915->vbt.ports[p]->child;
++ 
++ 	child->device_type &= ~DEVICE_TYPE_TMDS_DVI_SIGNALING;
++ 	child->device_type |= DEVICE_TYPE_NOT_HDMI_OUTPUT;
++ 
++ 	child->ddc_pin = 0;
++ }
++ 
++ static enum port get_port_by_aux_ch(struct drm_i915_private *i915, u8 aux_ch)
++ {
++ 	const struct intel_bios_encoder_data *devdata;
++ 	enum port port;
++ 
++ 	if (!aux_ch)
++ 		return PORT_NONE;
++ 
++ 	for_each_port(port) {
++ 		devdata = i915->vbt.ports[port];
++ 
++ 		if (devdata && aux_ch == devdata->child.aux_channel)
++ 			return port;
++ 	}
++ 
++ 	return PORT_NONE;
++ }
++ 
++ static void sanitize_aux_ch(struct intel_bios_encoder_data *devdata,
++ 			    enum port port)
++ {
++ 	struct drm_i915_private *i915 = devdata->i915;
++ 	struct child_device_config *child;
++ 	enum port p;
++ 
++ 	p = get_port_by_aux_ch(i915, devdata->child.aux_channel);
++ 	if (p == PORT_NONE)
++ 		return;
++ 
++ 	drm_dbg_kms(&i915->drm,
++ 		    "port %c trying to use the same AUX CH (0x%x) as port %c, "
++ 		    "disabling port %c DP support\n",
++ 		    port_name(port), devdata->child.aux_channel,
++ 		    port_name(p), port_name(p));
++ 
++ 	/*
++ 	 * If we have multiple ports supposedly sharing the aux channel, then DP
++ 	 * couldn't exist on the shared port. Otherwise they share the same aux
++ 	 * channel and system couldn't communicate with them separately.
++ 	 *
++ 	 * Give inverse child device order the priority, last one wins. Yes,
++ 	 * there are real machines (eg. Asrock B250M-HDV) where VBT has both
++ 	 * port A and port E with the same AUX ch and we must pick port E :(
++ 	 */
++ 	child = &i915->vbt.ports[p]->child;
++ 
++ 	child->device_type &= ~DEVICE_TYPE_DISPLAYPORT_OUTPUT;
++ 	child->aux_channel = 0;
++ }
++ 
++ static u8 dvo_port_type(u8 dvo_port)
++ {
++ 	switch (dvo_port) {
++ 	case DVO_PORT_HDMIA:
++ 	case DVO_PORT_HDMIB:
++ 	case DVO_PORT_HDMIC:
++ 	case DVO_PORT_HDMID:
++ 	case DVO_PORT_HDMIE:
++ 	case DVO_PORT_HDMIF:
++ 	case DVO_PORT_HDMIG:
++ 	case DVO_PORT_HDMIH:
++ 	case DVO_PORT_HDMII:
++ 		return DVO_PORT_HDMIA;
++ 	case DVO_PORT_DPA:
++ 	case DVO_PORT_DPB:
++ 	case DVO_PORT_DPC:
++ 	case DVO_PORT_DPD:
++ 	case DVO_PORT_DPE:
++ 	case DVO_PORT_DPF:
++ 	case DVO_PORT_DPG:
++ 	case DVO_PORT_DPH:
++ 	case DVO_PORT_DPI:
++ 		return DVO_PORT_DPA;
++ 	case DVO_PORT_MIPIA:
++ 	case DVO_PORT_MIPIB:
++ 	case DVO_PORT_MIPIC:
++ 	case DVO_PORT_MIPID:
++ 		return DVO_PORT_MIPIA;
++ 	default:
++ 		return dvo_port;
++ 	}
++ }
++ 
+++>>>>>>> 32c2bc89c742 (drm/i915: Fix type1 DVI DP dual mode adapter heuristic for modern platforms)
+  static enum port __dvo_port_to_port(int n_ports, int n_dvo,
+  				    const int port_mapping[][3], u8 dvo_port)
+  {
+* Unmerged path drivers/gpu/drm/i915/display/intel_bios.c
