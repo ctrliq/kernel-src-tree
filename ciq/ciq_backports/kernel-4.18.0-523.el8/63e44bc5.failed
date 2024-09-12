@@ -1,0 +1,113 @@
+x86/sev: Check for user-space IOIO pointing to kernel space
+
+jira LE-1907
+cve CVE-2023-46813
+Rebuild_History Non-Buildable kernel-4.18.0-523.el8
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 63e44bc52047f182601e7817da969a105aa1f721
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-523.el8/63e44bc5.failed
+
+Check the memory operand of INS/OUTS before emulating the instruction.
+The #VC exception can get raised from user-space, but the memory operand
+can be manipulated to access kernel memory before the emulation actually
+begins and after the exception handler has run.
+
+  [ bp: Massage commit message. ]
+
+Fixes: 597cfe48212a ("x86/boot/compressed/64: Setup a GHCB-based VC Exception handler")
+	Reported-by: Tom Dohrmann <erbse.13@gmx.de>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Cc: <stable@kernel.org>
+(cherry picked from commit 63e44bc52047f182601e7817da969a105aa1f721)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/sev.c
+diff --cc arch/x86/boot/compressed/sev.c
+index 7a0819f371c9,80d76aea1f7b..000000000000
+--- a/arch/x86/boot/compressed/sev.c
++++ b/arch/x86/boot/compressed/sev.c
+@@@ -104,10 -103,18 +104,23 @@@ static enum es_result vc_read_mem(struc
+  	return ES_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static enum es_result vc_ioio_check(struct es_em_ctxt *ctxt, u16 port, size_t size)
++ {
++ 	return ES_OK;
++ }
++ 
++ static bool fault_in_kernel_space(unsigned long address)
++ {
++ 	return false;
++ }
++ 
+++>>>>>>> 63e44bc52047 (x86/sev: Check for user-space IOIO pointing to kernel space)
+  #undef __init
+ +#undef __pa
+  #define __init
+ +#define __pa(x)	((unsigned long)(x))
+  
+  #define __BOOT_COMPRESSED
+  
+* Unmerged path arch/x86/boot/compressed/sev.c
+diff --git a/arch/x86/kernel/sev-shared.c b/arch/x86/kernel/sev-shared.c
+index 48e45bc05d1c..577ce06a56cc 100644
+--- a/arch/x86/kernel/sev-shared.c
++++ b/arch/x86/kernel/sev-shared.c
+@@ -595,6 +595,23 @@ void __init do_vc_no_ghcb(struct pt_regs *regs, unsigned long exit_code)
+ 	sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_GEN_REQ);
+ }
+ 
++static enum es_result vc_insn_string_check(struct es_em_ctxt *ctxt,
++					   unsigned long address,
++					   bool write)
++{
++	if (user_mode(ctxt->regs) && fault_in_kernel_space(address)) {
++		ctxt->fi.vector     = X86_TRAP_PF;
++		ctxt->fi.error_code = X86_PF_USER;
++		ctxt->fi.cr2        = address;
++		if (write)
++			ctxt->fi.error_code |= X86_PF_WRITE;
++
++		return ES_EXCEPTION;
++	}
++
++	return ES_OK;
++}
++
+ static enum es_result vc_insn_string_read(struct es_em_ctxt *ctxt,
+ 					  void *src, char *buf,
+ 					  unsigned int data_size,
+@@ -602,7 +619,12 @@ static enum es_result vc_insn_string_read(struct es_em_ctxt *ctxt,
+ 					  bool backwards)
+ {
+ 	int i, b = backwards ? -1 : 1;
+-	enum es_result ret = ES_OK;
++	unsigned long address = (unsigned long)src;
++	enum es_result ret;
++
++	ret = vc_insn_string_check(ctxt, address, false);
++	if (ret != ES_OK)
++		return ret;
+ 
+ 	for (i = 0; i < count; i++) {
+ 		void *s = src + (i * data_size * b);
+@@ -623,7 +645,12 @@ static enum es_result vc_insn_string_write(struct es_em_ctxt *ctxt,
+ 					   bool backwards)
+ {
+ 	int i, s = backwards ? -1 : 1;
+-	enum es_result ret = ES_OK;
++	unsigned long address = (unsigned long)dst;
++	enum es_result ret;
++
++	ret = vc_insn_string_check(ctxt, address, true);
++	if (ret != ES_OK)
++		return ret;
+ 
+ 	for (i = 0; i < count; i++) {
+ 		void *d = dst + (i * data_size * s);
