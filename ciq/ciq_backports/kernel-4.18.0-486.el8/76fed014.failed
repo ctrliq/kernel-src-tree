@@ -1,0 +1,84 @@
+md: account io_acct_set usage with active_io
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-486.el8
+commit-author Xiao Ni <xni@redhat.com>
+commit 76fed01420bb8b0e282745a4945925b25751d42b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-486.el8/76fed014.failed
+
+io_acct_set was enabled for raid0/raid5 io accounting. bios that contain
+md_io_acct are allocated in the i/o path. There isn't a good method to
+monitor if these bios are all finished and freed. In the takeover process,
+io_acct_set (which is used for bios with md_io_acct) need to be freed.
+However, if some bios finish after io_acct_set is freed, it may trigger
+the following panic:
+
+[ 6973.767999] RIP: 0010:mempool_free+0x52/0x80
+[ 6973.786098] Call Trace:
+[ 6973.786549]  md_end_io_acct+0x31/0x40
+[ 6973.787227]  blk_update_request+0x224/0x380
+[ 6973.787994]  blk_mq_end_request+0x1a/0x130
+[ 6973.788739]  blk_complete_reqs+0x35/0x50
+[ 6973.789456]  __do_softirq+0xd7/0x2c8
+[ 6973.790114]  ? sort_range+0x20/0x20
+[ 6973.790763]  run_ksoftirqd+0x2a/0x40
+[ 6973.791400]  smpboot_thread_fn+0xb5/0x150
+[ 6973.792114]  kthread+0x10b/0x130
+[ 6973.792724]  ? set_kthread_struct+0x50/0x50
+[ 6973.793491]  ret_from_fork+0x1f/0x40
+
+Fix this by increasing and decreasing active_io for each bio with
+md_io_acct so that mddev_suspend() will wait until all bios from
+io_acct_set finish before freeing io_acct_set.
+
+	Reported-by: Fine Fan <ffan@redhat.com>
+	Signed-off-by: Xiao Ni <xni@redhat.com>
+	Signed-off-by: Song Liu <song@kernel.org>
+(cherry picked from commit 76fed01420bb8b0e282745a4945925b25751d42b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index 78214abe6fbe,927a43db5dfb..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -8742,10 -8648,13 +8745,16 @@@ void md_account_bio(struct mddev *mddev
+  	struct md_io_acct *md_io_acct;
+  	struct bio *clone;
+  
+ -	if (!blk_queue_io_stat(bdev->bd_disk->queue))
+ +	if (!blk_queue_io_stat((*bio)->bi_disk->queue))
+  		return;
+  
+++<<<<<<< HEAD
+ +	clone = bio_clone_fast(*bio, GFP_NOIO, &mddev->io_acct_set);
+++=======
++ 	percpu_ref_get(&mddev->active_io);
++ 
++ 	clone = bio_alloc_clone(bdev, *bio, GFP_NOIO, &mddev->io_acct_set);
+++>>>>>>> 76fed01420bb (md: account io_acct_set usage with active_io)
+  	md_io_acct = container_of(clone, struct md_io_acct, bio_clone);
+  	md_io_acct->orig_bio = *bio;
+  	md_io_acct->start_time = bio_start_io_acct(*bio);
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 9c4ff5dfcf62..c240fb625410 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -718,9 +718,10 @@ struct md_thread {
+ };
+ 
+ struct md_io_acct {
+-	struct bio *orig_bio;
+-	unsigned long start_time;
+-	struct bio bio_clone;
++	struct mddev	*mddev;
++	struct bio	*orig_bio;
++	unsigned long	start_time;
++	struct bio	bio_clone;
+ };
+ 
+ #define THREAD_WAKEUP  0
