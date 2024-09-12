@@ -1,0 +1,712 @@
+iomap: switch __iomap_dio_rw to use iomap_iter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-477.21.1.el8_8
+commit-author Christoph Hellwig <hch@lst.de>
+commit a6d3d49587d10d23189675fce11b332a915081ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-477.21.1.el8_8/a6d3d495.failed
+
+Switch __iomap_dio_rw to use iomap_iter.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit a6d3d49587d10d23189675fce11b332a915081ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/inode.c
+#	fs/iomap/direct-io.c
+diff --cc fs/btrfs/inode.c
+index eba61bcb9bb3,3b0595e8bdd9..000000000000
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@@ -8322,353 -8159,187 +8322,394 @@@ err
+  	return ret;
+  }
+  
+ -/*
+ - * If this succeeds, the btrfs_dio_private is responsible for cleaning up locked
+ - * or ordered extents whether or not we submit any bios.
+ - */
+ -static struct btrfs_dio_private *btrfs_create_dio_private(struct bio *dio_bio,
+ -							  struct inode *inode,
+ -							  loff_t file_offset)
+ +static int btrfs_submit_direct_hook(struct btrfs_dio_private *dip)
+  {
+++<<<<<<< HEAD
+ +	struct inode *inode = dip->inode;
+++=======
++ 	const bool write = (btrfs_op(dio_bio) == BTRFS_MAP_WRITE);
++ 	const bool csum = !(BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM);
++ 	size_t dip_size;
++ 	struct btrfs_dio_private *dip;
++ 
++ 	dip_size = sizeof(*dip);
++ 	if (!write && csum) {
++ 		struct btrfs_fs_info *fs_info = btrfs_sb(inode->i_sb);
++ 		size_t nblocks;
++ 
++ 		nblocks = dio_bio->bi_iter.bi_size >> fs_info->sectorsize_bits;
++ 		dip_size += fs_info->csum_size * nblocks;
++ 	}
++ 
++ 	dip = kzalloc(dip_size, GFP_NOFS);
++ 	if (!dip)
++ 		return NULL;
++ 
++ 	dip->inode = inode;
++ 	dip->logical_offset = file_offset;
++ 	dip->bytes = dio_bio->bi_iter.bi_size;
++ 	dip->disk_bytenr = dio_bio->bi_iter.bi_sector << 9;
++ 	dip->dio_bio = dio_bio;
++ 	refcount_set(&dip->refs, 1);
++ 	return dip;
++ }
++ 
++ static blk_qc_t btrfs_submit_direct(const struct iomap_iter *iter,
++ 		struct bio *dio_bio, loff_t file_offset)
++ {
++ 	struct inode *inode = iter->inode;
++ 	const bool write = (btrfs_op(dio_bio) == BTRFS_MAP_WRITE);
+++>>>>>>> a6d3d49587d1 (iomap: switch __iomap_dio_rw to use iomap_iter)
+  	struct btrfs_fs_info *fs_info = btrfs_sb(inode->i_sb);
+ -	const bool raid56 = (btrfs_data_alloc_profile(fs_info) &
+ -			     BTRFS_BLOCK_GROUP_RAID56_MASK);
+ -	struct btrfs_dio_private *dip;
+  	struct bio *bio;
+ -	u64 start_sector;
+ +	struct bio *orig_bio = dip->orig_bio;
+ +	u64 start_sector = orig_bio->bi_iter.bi_sector;
+ +	u64 file_offset = dip->logical_offset;
+ +	u64 map_length;
+  	int async_submit = 0;
+  	u64 submit_len;
+  	int clone_offset = 0;
+  	int clone_len;
+ -	u64 logical;
+  	int ret;
+  	blk_status_t status;
+++<<<<<<< HEAD
+++=======
++ 	struct btrfs_io_geometry geom;
++ 	struct btrfs_dio_data *dio_data = iter->iomap.private;
++ 	struct extent_map *em = NULL;
+++>>>>>>> a6d3d49587d1 (iomap: switch __iomap_dio_rw to use iomap_iter)
+  
+ -	dip = btrfs_create_dio_private(dio_bio, inode, file_offset);
+ -	if (!dip) {
+ -		if (!write) {
+ -			unlock_extent(&BTRFS_I(inode)->io_tree, file_offset,
+ -				file_offset + dio_bio->bi_iter.bi_size - 1);
+ -		}
+ -		dio_bio->bi_status = BLK_STS_RESOURCE;
+ -		bio_endio(dio_bio);
+ -		return BLK_QC_T_NONE;
+ +	map_length = orig_bio->bi_iter.bi_size;
+ +	submit_len = map_length;
+ +	ret = btrfs_map_block(fs_info, btrfs_op(orig_bio), start_sector << 9,
+ +			      &map_length, NULL, 0);
+ +	if (ret)
+ +		return -EIO;
+ +
+ +	if (map_length >= submit_len) {
+ +		bio = orig_bio;
+ +		dip->flags |= BTRFS_DIO_ORIG_BIO_SUBMITTED;
+ +		goto submit;
+  	}
+  
+ -	if (!write) {
+ +	/* async crcs make it difficult to collect full stripe writes. */
+ +	if (btrfs_data_alloc_profile(fs_info) & BTRFS_BLOCK_GROUP_RAID56_MASK)
+ +		async_submit = 0;
+ +	else
+ +		async_submit = 1;
+ +
+ +	/* bio split */
+ +	ASSERT(map_length <= INT_MAX);
+ +	atomic_inc(&dip->pending_bios);
+ +	do {
+ +		clone_len = min_t(int, submit_len, map_length);
+ +
+  		/*
+ -		 * Load the csums up front to reduce csum tree searches and
+ -		 * contention when submitting bios.
+ -		 *
+ -		 * If we have csums disabled this will do nothing.
+ +		 * This will never fail as it's passing GPF_NOFS and
+ +		 * the allocation is backed by btrfs_bioset.
+ +		 */
+ +		bio = btrfs_bio_clone_partial(orig_bio, clone_offset,
+ +					      clone_len);
+ +		bio->bi_private = dip;
+ +		bio->bi_end_io = btrfs_end_dio_bio;
+ +		btrfs_io_bio(bio)->logical = file_offset;
+ +
+ +		ASSERT(submit_len >= clone_len);
+ +		submit_len -= clone_len;
+ +		if (submit_len == 0)
+ +			break;
+ +
+ +		/*
+ +		 * Increase the count before we submit the bio so we know
+ +		 * the end IO handler won't happen before we increase the
+ +		 * count. Otherwise, the dip might get freed before we're
+ +		 * done setting it up.
+  		 */
+ -		status = btrfs_lookup_bio_sums(inode, dio_bio, dip->csums);
+ -		if (status != BLK_STS_OK)
+ +		atomic_inc(&dip->pending_bios);
+ +
+ +		status = btrfs_submit_dio_bio(bio, inode, file_offset,
+ +						async_submit);
+ +		if (status) {
+ +			bio_put(bio);
+ +			atomic_dec(&dip->pending_bios);
+ +			goto out_err;
+ +		}
+ +
+ +		clone_offset += clone_len;
+ +		start_sector += clone_len >> 9;
+ +		file_offset += clone_len;
+ +
+ +		map_length = submit_len;
+ +		ret = btrfs_map_block(fs_info, btrfs_op(orig_bio),
+ +				      start_sector << 9, &map_length, NULL, 0);
+ +		if (ret)
+  			goto out_err;
+ +	} while (submit_len > 0);
+ +
+ +submit:
+ +	status = btrfs_submit_dio_bio(bio, inode, file_offset, async_submit);
+ +	if (!status)
+ +		return 0;
+ +
+ +	bio_put(bio);
+ +out_err:
+ +	dip->errors = 1;
+ +	/*
+ +	 * Before atomic variable goto zero, we must  make sure dip->errors is
+ +	 * perceived to be set. This ordering is ensured by the fact that an
+ +	 * atomic operations with a return value are fully ordered as per
+ +	 * atomic_t.txt
+ +	 */
+ +	if (atomic_dec_and_test(&dip->pending_bios))
+ +		bio_io_error(dip->orig_bio);
+ +
+ +	/* bio_end_io() will handle error, so we needn't return it */
+ +	return 0;
+ +}
+ +
+ +static void btrfs_submit_direct(struct bio *dio_bio, struct inode *inode,
+ +				loff_t file_offset)
+ +{
+ +	struct btrfs_dio_private *dip = NULL;
+ +	struct bio *bio = NULL;
+ +	struct btrfs_io_bio *io_bio;
+ +	bool write = (bio_op(dio_bio) == REQ_OP_WRITE);
+ +	int ret = 0;
+ +
+ +	bio = btrfs_bio_clone(dio_bio);
+ +
+ +	dip = kzalloc(sizeof(*dip), GFP_NOFS);
+ +	if (!dip) {
+ +		ret = -ENOMEM;
+ +		goto free_ordered;
+ +	}
+ +
+ +	dip->private = dio_bio->bi_private;
+ +	dip->inode = inode;
+ +	dip->logical_offset = file_offset;
+ +	dip->bytes = dio_bio->bi_iter.bi_size;
+ +	dip->disk_bytenr = (u64)dio_bio->bi_iter.bi_sector << 9;
+ +	bio->bi_private = dip;
+ +	dip->orig_bio = bio;
+ +	dip->dio_bio = dio_bio;
+ +	atomic_set(&dip->pending_bios, 0);
+ +	io_bio = btrfs_io_bio(bio);
+ +	io_bio->logical = file_offset;
+ +
+ +	if (write) {
+ +		bio->bi_end_io = btrfs_endio_direct_write;
+ +	} else {
+ +		bio->bi_end_io = btrfs_endio_direct_read;
+ +		dip->subio_endio = btrfs_subio_endio_read;
+ +	}
+ +
+ +	/*
+ +	 * Reset the range for unsubmitted ordered extents (to a 0 length range)
+ +	 * even if we fail to submit a bio, because in such case we do the
+ +	 * corresponding error handling below and it must not be done a second
+ +	 * time by btrfs_direct_IO().
+ +	 */
+ +	if (write) {
+ +		struct btrfs_dio_data *dio_data = current->journal_info;
+ +
+ +		dio_data->unsubmitted_oe_range_end = dip->logical_offset +
+ +			dip->bytes;
+ +		dio_data->unsubmitted_oe_range_start =
+ +			dio_data->unsubmitted_oe_range_end;
+ +	}
+ +
+ +	ret = btrfs_submit_direct_hook(dip);
+ +	if (!ret)
+ +		return;
+ +
+ +	if (io_bio->end_io)
+ +		io_bio->end_io(io_bio, ret);
+ +
+ +free_ordered:
+ +	/*
+ +	 * If we arrived here it means either we failed to submit the dip
+ +	 * or we either failed to clone the dio_bio or failed to allocate the
+ +	 * dip. If we cloned the dio_bio and allocated the dip, we can just
+ +	 * call bio_endio against our io_bio so that we get proper resource
+ +	 * cleanup if we fail to submit the dip, otherwise, we must do the
+ +	 * same as btrfs_endio_direct_[write|read] because we can't call these
+ +	 * callbacks - they require an allocated dip and a clone of dio_bio.
+ +	 */
+ +	if (bio && dip) {
+ +		bio_io_error(bio);
+ +		/*
+ +		 * The end io callbacks free our dip, do the final put on bio
+ +		 * and all the cleanup and final put for dio_bio (through
+ +		 * dio_end_io()).
+ +		 */
+ +		dip = NULL;
+ +		bio = NULL;
+ +	} else {
+ +		if (write)
+ +			__endio_write_update_ordered(inode,
+ +						file_offset,
+ +						dio_bio->bi_iter.bi_size,
+ +						false);
+ +		else
+ +			unlock_extent(&BTRFS_I(inode)->io_tree, file_offset,
+ +			      file_offset + dio_bio->bi_iter.bi_size - 1);
+ +
+ +		dio_bio->bi_status = BLK_STS_IOERR;
+ +		/*
+ +		 * Releases and cleans up our dio_bio, no need to bio_put()
+ +		 * nor bio_endio()/bio_io_error() against dio_bio.
+ +		 */
+ +		dio_end_io(dio_bio);
+ +	}
+ +	if (bio)
+ +		bio_put(bio);
+ +	kfree(dip);
+ +}
+ +
+ +static ssize_t check_direct_IO(struct btrfs_fs_info *fs_info,
+ +			       const struct iov_iter *iter, loff_t offset)
+ +{
+ +	int seg;
+ +	int i;
+ +	unsigned int blocksize_mask = fs_info->sectorsize - 1;
+ +	ssize_t retval = -EINVAL;
+ +
+ +	if (offset & blocksize_mask)
+ +		goto out;
+ +
+ +	if (iov_iter_alignment(iter) & blocksize_mask)
+ +		goto out;
+ +
+ +	/* If this is a write we don't need to check anymore */
+ +	if (iov_iter_rw(iter) != READ || !iter_is_iovec(iter))
+ +		return 0;
+ +	/*
+ +	 * Check to make sure we don't have duplicate iov_base's in this
+ +	 * iovec, if so return EINVAL, otherwise we'll get csum errors
+ +	 * when reading back.
+ +	 */
+ +	for (seg = 0; seg < iter->nr_segs; seg++) {
+ +		for (i = seg + 1; i < iter->nr_segs; i++) {
+ +			if (iter->iov[seg].iov_base == iter->iov[i].iov_base)
+ +				goto out;
+ +		}
+  	}
+ +	retval = 0;
+ +out:
+ +	return retval;
+ +}
+  
+ -	start_sector = dio_bio->bi_iter.bi_sector;
+ -	submit_len = dio_bio->bi_iter.bi_size;
+ +static ssize_t btrfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
+ +{
+ +	struct file *file = iocb->ki_filp;
+ +	struct inode *inode = file->f_mapping->host;
+ +	struct btrfs_fs_info *fs_info = btrfs_sb(inode->i_sb);
+ +	struct btrfs_dio_data dio_data = { 0 };
+ +	struct extent_changeset *data_reserved = NULL;
+ +	loff_t offset = iocb->ki_pos;
+ +	size_t count = 0;
+ +	int flags = 0;
+ +	bool wakeup = true;
+ +	bool relock = false;
+ +	ssize_t ret;
+ +
+ +	if (check_direct_IO(fs_info, iter, offset))
+ +		return 0;
+  
+ -	do {
+ -		logical = start_sector << 9;
+ -		em = btrfs_get_chunk_map(fs_info, logical, submit_len);
+ -		if (IS_ERR(em)) {
+ -			status = errno_to_blk_status(PTR_ERR(em));
+ -			em = NULL;
+ -			goto out_err_em;
+ -		}
+ -		ret = btrfs_get_io_geometry(fs_info, em, btrfs_op(dio_bio),
+ -					    logical, &geom);
+ -		if (ret) {
+ -			status = errno_to_blk_status(ret);
+ -			goto out_err_em;
+ -		}
+ -		ASSERT(geom.len <= INT_MAX);
+ +	inode_dio_begin(inode);
+  
+ -		clone_len = min_t(int, submit_len, geom.len);
+ +	/*
+ +	 * The generic stuff only does filemap_write_and_wait_range, which
+ +	 * isn't enough if we've written compressed pages to this area, so
+ +	 * we need to flush the dirty pages again to make absolutely sure
+ +	 * that any outstanding dirty pages are on disk.
+ +	 */
+ +	count = iov_iter_count(iter);
+ +	if (test_bit(BTRFS_INODE_HAS_ASYNC_EXTENT,
+ +		     &BTRFS_I(inode)->runtime_flags))
+ +		filemap_fdatawrite_range(inode->i_mapping, offset,
+ +					 offset + count - 1);
+  
+ +	if (iov_iter_rw(iter) == WRITE) {
+  		/*
+ -		 * This will never fail as it's passing GPF_NOFS and
+ -		 * the allocation is backed by btrfs_bioset.
+ +		 * If the write DIO is beyond the EOF, we need update
+ +		 * the isize, but it is protected by i_mutex. So we can
+ +		 * not unlock the i_mutex at this case.
+  		 */
+ -		bio = btrfs_bio_clone_partial(dio_bio, clone_offset, clone_len);
+ -		bio->bi_private = dip;
+ -		bio->bi_end_io = btrfs_end_dio_bio;
+ -		btrfs_io_bio(bio)->logical = file_offset;
+ -
+ -		if (bio_op(bio) == REQ_OP_ZONE_APPEND) {
+ -			status = extract_ordered_extent(BTRFS_I(inode), bio,
+ -							file_offset);
+ -			if (status) {
+ -				bio_put(bio);
+ -				goto out_err;
+ -			}
+ +		if (offset + count <= inode->i_size) {
+ +			dio_data.overwrite = 1;
+ +			inode_unlock(inode);
+ +			relock = true;
+ +		} else if (iocb->ki_flags & IOCB_NOWAIT) {
+ +			ret = -EAGAIN;
+ +			goto out;
+  		}
+ -
+ -		ASSERT(submit_len >= clone_len);
+ -		submit_len -= clone_len;
+ +		ret = btrfs_delalloc_reserve_space(inode, &data_reserved,
+ +						   offset, count);
+ +		if (ret)
+ +			goto out;
+  
+  		/*
+ -		 * Increase the count before we submit the bio so we know
+ -		 * the end IO handler won't happen before we increase the
+ -		 * count. Otherwise, the dip might get freed before we're
+ -		 * done setting it up.
+ -		 *
+ -		 * We transfer the initial reference to the last bio, so we
+ -		 * don't need to increment the reference count for the last one.
+ +		 * We need to know how many extents we reserved so that we can
+ +		 * do the accounting properly if we go over the number we
+ +		 * originally calculated.  Abuse current->journal_info for this.
+  		 */
+ -		if (submit_len > 0) {
+ -			refcount_inc(&dip->refs);
+ +		dio_data.reserve = round_up(count,
+ +					    fs_info->sectorsize);
+ +		dio_data.unsubmitted_oe_range_start = (u64)offset;
+ +		dio_data.unsubmitted_oe_range_end = (u64)offset;
+ +		current->journal_info = &dio_data;
+ +		down_read(&BTRFS_I(inode)->dio_sem);
+ +	} else if (test_bit(BTRFS_INODE_READDIO_NEED_LOCK,
+ +				     &BTRFS_I(inode)->runtime_flags)) {
+ +		inode_dio_end(inode);
+ +		flags = DIO_LOCKING | DIO_SKIP_HOLES;
+ +		wakeup = false;
+ +	}
+ +
+ +	ret = __blockdev_direct_IO(iocb, inode,
+ +				   fs_info->fs_devices->latest_bdev,
+ +				   iter, btrfs_get_blocks_direct, NULL,
+ +				   btrfs_submit_direct, flags);
+ +	if (iov_iter_rw(iter) == WRITE) {
+ +		up_read(&BTRFS_I(inode)->dio_sem);
+ +		current->journal_info = NULL;
+ +		if (ret < 0 && ret != -EIOCBQUEUED) {
+ +			if (dio_data.reserve)
+ +				btrfs_delalloc_release_space(inode, data_reserved,
+ +					offset, dio_data.reserve, true);
+  			/*
+ -			 * If we are submitting more than one bio, submit them
+ -			 * all asynchronously. The exception is RAID 5 or 6, as
+ -			 * asynchronous checksums make it difficult to collect
+ -			 * full stripe writes.
+ +			 * On error we might have left some ordered extents
+ +			 * without submitting corresponding bios for them, so
+ +			 * cleanup them up to avoid other tasks getting them
+ +			 * and waiting for them to complete forever.
+  			 */
+ -			if (!raid56)
+ -				async_submit = 1;
+ -		}
+ -
+ -		status = btrfs_submit_dio_bio(bio, inode, file_offset,
+ -						async_submit);
+ -		if (status) {
+ -			bio_put(bio);
+ -			if (submit_len > 0)
+ -				refcount_dec(&dip->refs);
+ -			goto out_err_em;
+ -		}
+ -
+ -		dio_data->submitted += clone_len;
+ -		clone_offset += clone_len;
+ -		start_sector += clone_len >> 9;
+ -		file_offset += clone_len;
+ -
+ -		free_extent_map(em);
+ -	} while (submit_len > 0);
+ -	return BLK_QC_T_NONE;
+ -
+ -out_err_em:
+ -	free_extent_map(em);
+ -out_err:
+ -	dip->dio_bio->bi_status = status;
+ -	btrfs_dio_private_put(dip);
+ +			if (dio_data.unsubmitted_oe_range_start <
+ +			    dio_data.unsubmitted_oe_range_end)
+ +				__endio_write_update_ordered(inode,
+ +					dio_data.unsubmitted_oe_range_start,
+ +					dio_data.unsubmitted_oe_range_end -
+ +					dio_data.unsubmitted_oe_range_start,
+ +					false);
+ +		} else if (ret >= 0 && (size_t)ret < count)
+ +			btrfs_delalloc_release_space(inode, data_reserved,
+ +					offset, count - (size_t)ret, true);
+ +		btrfs_delalloc_release_extents(BTRFS_I(inode), count, false);
+ +	}
+ +out:
+ +	if (wakeup)
+ +		inode_dio_end(inode);
+ +	if (relock)
+ +		inode_lock(inode);
+  
+ -	return BLK_QC_T_NONE;
+ +	extent_changeset_free(data_reserved);
+ +	return ret;
+  }
+  
+ -const struct iomap_ops btrfs_dio_iomap_ops = {
+ -	.iomap_begin            = btrfs_dio_iomap_begin,
+ -	.iomap_end              = btrfs_dio_iomap_end,
+ -};
+ -
+ -const struct iomap_dio_ops btrfs_dio_ops = {
+ -	.submit_io		= btrfs_submit_direct,
+ -};
+ +#define BTRFS_FIEMAP_FLAGS	(FIEMAP_FLAG_SYNC)
+  
+  static int btrfs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+ -			u64 start, u64 len)
+ +		__u64 start, __u64 len)
+  {
+  	int	ret;
+  
+diff --cc fs/iomap/direct-io.c
+index d8530abe3137,4ecd255e0511..000000000000
+--- a/fs/iomap/direct-io.c
++++ b/fs/iomap/direct-io.c
+@@@ -350,8 -337,9 +350,14 @@@ static loff_t iomap_dio_bio_iter(const 
+  		dio->size += n;
+  		copied += n;
+  
+++<<<<<<< HEAD
+ +		nr_pages = iov_iter_npages(dio->submit.iter, BIO_MAX_PAGES);
+ +		iomap_dio_submit_bio(dio, iomap, bio, pos);
+++=======
++ 		nr_pages = bio_iov_vecs_to_alloc(dio->submit.iter,
++ 						 BIO_MAX_VECS);
++ 		iomap_dio_submit_bio(iter, dio, bio, pos);
+++>>>>>>> a6d3d49587d1 (iomap: switch __iomap_dio_rw to use iomap_iter)
+  		pos += n;
+  	} while (nr_pages);
+  
+@@@ -377,13 -365,12 +383,14 @@@ out
+  	return ret;
+  }
+  
+- static loff_t
+- iomap_dio_hole_actor(loff_t length, struct iomap_dio *dio)
++ static loff_t iomap_dio_hole_iter(const struct iomap_iter *iter,
++ 		struct iomap_dio *dio)
+  {
+- 	length = iov_iter_zero(length, dio->submit.iter);
++ 	loff_t length = iov_iter_zero(iomap_length(iter), dio->submit.iter);
++ 
+  	dio->size += length;
+ +	if (!length)
+ +		return -EFAULT;
+  	return length;
+  }
+  
+@@@ -511,15 -489,32 +520,38 @@@ __iomap_dio_rw(struct kiocb *iocb, stru
+  	dio->submit.last_queue = NULL;
+  
+  	if (iov_iter_rw(iter) == READ) {
+- 		if (pos >= dio->i_size)
++ 		if (iomi.pos >= dio->i_size)
+  			goto out_free_dio;
+  
+++<<<<<<< HEAD
+++=======
++ 		if (iocb->ki_flags & IOCB_NOWAIT) {
++ 			if (filemap_range_needs_writeback(mapping, iomi.pos,
++ 					end)) {
++ 				ret = -EAGAIN;
++ 				goto out_free_dio;
++ 			}
++ 			iomi.flags |= IOMAP_NOWAIT;
++ 		}
++ 
+++>>>>>>> a6d3d49587d1 (iomap: switch __iomap_dio_rw to use iomap_iter)
+  		if (iter_is_iovec(iter))
+  			dio->flags |= IOMAP_DIO_DIRTY;
+  	} else {
+- 		iomap_flags |= IOMAP_WRITE;
++ 		iomi.flags |= IOMAP_WRITE;
+  		dio->flags |= IOMAP_DIO_WRITE;
+  
+++<<<<<<< HEAD
+++=======
++ 		if (iocb->ki_flags & IOCB_NOWAIT) {
++ 			if (filemap_range_has_page(mapping, iomi.pos, end)) {
++ 				ret = -EAGAIN;
++ 				goto out_free_dio;
++ 			}
++ 			iomi.flags |= IOMAP_NOWAIT;
++ 		}
++ 
+++>>>>>>> a6d3d49587d1 (iomap: switch __iomap_dio_rw to use iomap_iter)
+  		/* for data sync or sync, we need sync completion processing */
+  		if (iocb->ki_flags & IOCB_DSYNC)
+  			dio->flags |= IOMAP_DIO_NEED_SYNC;
+@@@ -534,22 -529,15 +566,23 @@@
+  			dio->flags |= IOMAP_DIO_WRITE_FUA;
+  	}
+  
+ +	if (iocb->ki_flags & IOCB_NOWAIT) {
+ +		if (filemap_range_has_page(mapping, pos, end)) {
+ +			ret = -EAGAIN;
+ +			goto out_free_dio;
+ +		}
+ +		iomap_flags |= IOMAP_NOWAIT;
+ +	}
+ +
+  	if (dio_flags & IOMAP_DIO_OVERWRITE_ONLY) {
+  		ret = -EAGAIN;
+- 		if (pos >= dio->i_size || pos + count > dio->i_size)
++ 		if (iomi.pos >= dio->i_size ||
++ 		    iomi.pos + iomi.len > dio->i_size)
+  			goto out_free_dio;
+- 		iomap_flags |= IOMAP_OVERWRITE_ONLY;
++ 		iomi.flags |= IOMAP_OVERWRITE_ONLY;
+  	}
+  
+- 	ret = filemap_write_and_wait_range(mapping, pos, end);
++ 	ret = filemap_write_and_wait_range(mapping, iomi.pos, end);
+  	if (ret)
+  		goto out_free_dio;
+  
+@@@ -576,38 -565,23 +610,56 @@@
+  	inode_dio_begin(inode);
+  
+  	blk_start_plug(&plug);
+++<<<<<<< HEAD
+ +	do {
+ +		ret = iomap_apply(inode, pos, count, iomap_flags, ops, dio,
+ +				iomap_dio_actor);
+ +		if (ret <= 0) {
+ +			if (ret == -EFAULT && dio->size &&
+ +			    (dio_flags & IOMAP_DIO_PARTIAL)) {
+ +				if (!(iocb->ki_flags & IOCB_NOWAIT))
+ +					wait_for_completion = true;
+ +				ret = 0;
+ +			}
+ +
+ +			/* magic error code to fall back to buffered I/O */
+ +			if (ret == -ENOTBLK) {
+ +				wait_for_completion = true;
+ +				ret = 0;
+ +			}
+ +			break;
+ +		}
+ +		pos += ret;
+ +
+ +		if (iov_iter_rw(iter) == READ && pos >= dio->i_size) {
+ +			/*
+ +			 * We only report that we've read data up to i_size.
+ +			 * Revert iter to a state corresponding to that as
+ +			 * some callers (such as splice code) rely on it.
+ +			 */
+ +			iov_iter_revert(iter, pos - dio->i_size);
+ +			break;
+ +		}
+ +	} while ((count = iov_iter_count(iter)) > 0);
+++=======
++ 	while ((ret = iomap_iter(&iomi, ops)) > 0)
++ 		iomi.processed = iomap_dio_iter(&iomi, dio);
+++>>>>>>> a6d3d49587d1 (iomap: switch __iomap_dio_rw to use iomap_iter)
+  	blk_finish_plug(&plug);
+  
++ 	/*
++ 	 * We only report that we've read data up to i_size.
++ 	 * Revert iter to a state corresponding to that as some callers (such
++ 	 * as the splice code) rely on it.
++ 	 */
++ 	if (iov_iter_rw(iter) == READ && iomi.pos >= dio->i_size)
++ 		iov_iter_revert(iter, iomi.pos - dio->i_size);
++ 
++ 	/* magic error code to fall back to buffered I/O */
++ 	if (ret == -ENOTBLK) {
++ 		wait_for_completion = true;
++ 		ret = 0;
++ 	}
+  	if (ret < 0)
+  		iomap_dio_set_error(dio, ret);
+  
+* Unmerged path fs/btrfs/inode.c
+* Unmerged path fs/iomap/direct-io.c
+diff --git a/include/linux/iomap.h b/include/linux/iomap.h
+index da8217dba77f..093636fdf3d1 100644
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@ -330,8 +330,8 @@ int iomap_writepages(struct address_space *mapping,
+ struct iomap_dio_ops {
+ 	int (*end_io)(struct kiocb *iocb, ssize_t size, int error,
+ 		      unsigned flags);
+-	blk_qc_t (*submit_io)(struct inode *inode, struct iomap *iomap,
+-			struct bio *bio, loff_t file_offset);
++	blk_qc_t (*submit_io)(const struct iomap_iter *iter, struct bio *bio,
++			      loff_t file_offset);
+ };
+ 
+ /*
