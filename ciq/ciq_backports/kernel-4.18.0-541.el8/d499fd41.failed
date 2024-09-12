@@ -1,0 +1,234 @@
+cgroup/rstat: Optimize cgroup_rstat_updated_list()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-541.el8
+commit-author Waiman Long <longman@redhat.com>
+commit d499fd418fa15949d86d28bb5442ab88203fc513
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-541.el8/d499fd41.failed
+
+The current design of cgroup_rstat_cpu_pop_updated() is to traverse
+the updated tree in a way to pop out the leaf nodes first before
+their parents. This can cause traversal of multiple nodes before a
+leaf node can be found and popped out. IOW, a given node in the tree
+can be visited multiple times before the whole operation is done. So
+it is not very efficient and the code can be hard to read.
+
+With the introduction of cgroup_rstat_updated_list() to build a list
+of cgroups to be flushed first before any flushing operation is being
+done, we can optimize the way the updated tree nodes are being popped
+by pushing the parents first to the tail end of the list before their
+children. In this way, most updated tree nodes will be visited only
+once with the exception of the subtree root as we still need to go
+back to its parent and popped it out of its updated_children list.
+This also makes the code easier to read.
+
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit d499fd418fa15949d86d28bb5442ab88203fc513)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cgroup/rstat.c
+diff --cc kernel/cgroup/rstat.c
+index a4fd6b3c4097,4ec29e6b1d8d..000000000000
+--- a/kernel/cgroup/rstat.c
++++ b/kernel/cgroup/rstat.c
+@@@ -69,57 -74,102 +69,115 @@@ void cgroup_rstat_updated(struct cgrou
+  }
+  
+  /**
+-  * cgroup_rstat_cpu_pop_updated - iterate and dismantle rstat_cpu updated tree
+-  * @pos: current position
+-  * @root: root of the tree to traversal
++  * cgroup_rstat_push_children - push children cgroups into the given list
++  * @head: current head of the list (= subtree root)
++  * @child: first child of the root
+   * @cpu: target cpu
++  * Return: A new singly linked list of cgroups to be flush
+   *
+++<<<<<<< HEAD
+ + * Walks the udpated rstat_cpu tree on @cpu from @root.  %NULL @pos starts
+ + * the traversal and %NULL return indicates the end.  During traversal,
+ + * each returned cgroup is unlinked from the tree.  Must be called with the
+ + * matching cgroup_rstat_cpu_lock held.
+ + *
+ + * The only ordering guarantee is that, for a parent and a child pair
+ + * covered by a given traversal, if a child is visited, its parent is
+ + * guaranteed to be visited afterwards.
+++=======
++  * Iteratively traverse down the cgroup_rstat_cpu updated tree level by
++  * level and push all the parents first before their next level children
++  * into a singly linked list built from the tail backward like "pushing"
++  * cgroups into a stack. The root is pushed by the caller.
+++>>>>>>> d499fd418fa1 (cgroup/rstat: Optimize cgroup_rstat_updated_list())
+   */
+- static struct cgroup *cgroup_rstat_cpu_pop_updated(struct cgroup *pos,
+- 						   struct cgroup *root, int cpu)
++ static struct cgroup *cgroup_rstat_push_children(struct cgroup *head,
++ 						 struct cgroup *child, int cpu)
+  {
+- 	struct cgroup_rstat_cpu *rstatc;
+- 	struct cgroup *parent;
++ 	struct cgroup *chead = child;	/* Head of child cgroup level */
++ 	struct cgroup *ghead = NULL;	/* Head of grandchild cgroup level */
++ 	struct cgroup *parent, *grandchild;
++ 	struct cgroup_rstat_cpu *crstatc;
++ 
++ 	child->rstat_flush_next = NULL;
++ 
++ next_level:
++ 	while (chead) {
++ 		child = chead;
++ 		chead = child->rstat_flush_next;
++ 		parent = cgroup_parent(child);
++ 
++ 		/* updated_next is parent cgroup terminated */
++ 		while (child != parent) {
++ 			child->rstat_flush_next = head;
++ 			head = child;
++ 			crstatc = cgroup_rstat_cpu(child, cpu);
++ 			grandchild = crstatc->updated_children;
++ 			if (grandchild != child) {
++ 				/* Push the grand child to the next level */
++ 				crstatc->updated_children = child;
++ 				grandchild->rstat_flush_next = ghead;
++ 				ghead = grandchild;
++ 			}
++ 			child = crstatc->updated_next;
++ 			crstatc->updated_next = NULL;
++ 		}
++ 	}
++ 
++ 	if (ghead) {
++ 		chead = ghead;
++ 		ghead = NULL;
++ 		goto next_level;
++ 	}
++ 	return head;
++ }
+  
+- 	if (pos == root)
+- 		return NULL;
+++<<<<<<< HEAD
+++=======
++ /**
++  * cgroup_rstat_updated_list - return a list of updated cgroups to be flushed
++  * @root: root of the cgroup subtree to traverse
++  * @cpu: target cpu
++  * Return: A singly linked list of cgroups to be flushed
++  *
++  * Walks the updated rstat_cpu tree on @cpu from @root.  During traversal,
++  * each returned cgroup is unlinked from the updated tree.
++  *
++  * The only ordering guarantee is that, for a parent and a child pair
++  * covered by a given traversal, the child is before its parent in
++  * the list.
++  *
++  * Note that updated_children is self terminated and points to a list of
++  * child cgroups if not empty. Whereas updated_next is like a sibling link
++  * within the children list and terminated by the parent cgroup. An exception
++  * here is the cgroup root whose updated_next can be self terminated.
++  */
++ static struct cgroup *cgroup_rstat_updated_list(struct cgroup *root, int cpu)
++ {
++ 	raw_spinlock_t *cpu_lock = per_cpu_ptr(&cgroup_rstat_cpu_lock, cpu);
++ 	struct cgroup_rstat_cpu *rstatc = cgroup_rstat_cpu(root, cpu);
++ 	struct cgroup *head = NULL, *parent, *child;
++ 	unsigned long flags;
+  
+  	/*
+- 	 * We're gonna walk down to the first leaf and visit/remove it.  We
+- 	 * can pick whatever unvisited node as the starting point.
++ 	 * The _irqsave() is needed because cgroup_rstat_lock is
++ 	 * spinlock_t which is a sleeping lock on PREEMPT_RT. Acquiring
++ 	 * this lock with the _irq() suffix only disables interrupts on
++ 	 * a non-PREEMPT_RT kernel. The raw_spinlock_t below disables
++ 	 * interrupts on both configurations. The _irqsave() ensures
++ 	 * that interrupts are always disabled and later restored.
+  	 */
+- 	if (!pos) {
+- 		pos = root;
+- 		/* return NULL if this subtree is not on-list */
+- 		if (!cgroup_rstat_cpu(pos, cpu)->updated_next)
+- 			return NULL;
+- 	} else {
+- 		pos = cgroup_parent(pos);
+- 	}
++ 	raw_spin_lock_irqsave(cpu_lock, flags);
+  
+- 	/* walk down to the first leaf */
+- 	while (true) {
+- 		rstatc = cgroup_rstat_cpu(pos, cpu);
+- 		if (rstatc->updated_children == pos)
+- 			break;
+- 		pos = rstatc->updated_children;
+- 	}
++ 	/* Return NULL if this subtree is not on-list */
++ 	if (!rstatc->updated_next)
++ 		goto unlock_ret;
+  
+  	/*
+- 	 * Unlink @pos from the tree.  As the updated_children list is
++ 	 * Unlink @root from its parent. As the updated_children list is
+  	 * singly linked, we have to walk it to find the removal point.
+- 	 * However, due to the way we traverse, @pos will be the first
+- 	 * child in most cases. The only exception is @root.
+  	 */
+- 	parent = cgroup_parent(pos);
++ 	parent = cgroup_parent(root);
+  	if (parent) {
+  		struct cgroup_rstat_cpu *prstatc;
+  		struct cgroup **nextp;
+@@@ -137,11 -187,46 +195,47 @@@
+  	}
+  
+  	rstatc->updated_next = NULL;
+- 	return pos;
++ 
++ 	/* Push @root to the list first before pushing the children */
++ 	head = root;
++ 	root->rstat_flush_next = NULL;
++ 	child = rstatc->updated_children;
++ 	rstatc->updated_children = root;
++ 	if (child != root)
++ 		head = cgroup_rstat_push_children(head, child, cpu);
++ unlock_ret:
++ 	raw_spin_unlock_irqrestore(cpu_lock, flags);
++ 	return head;
+  }
+  
++ /*
++  * A hook for bpf stat collectors to attach to and flush their stats.
++  * Together with providing bpf kfuncs for cgroup_rstat_updated() and
++  * cgroup_rstat_flush(), this enables a complete workflow where bpf progs that
++  * collect cgroup stats can integrate with rstat for efficient flushing.
++  *
++  * A static noinline declaration here could cause the compiler to optimize away
++  * the function. A global noinline declaration will keep the definition, but may
++  * optimize away the callsite. Therefore, __weak is needed to ensure that the
++  * call is still emitted, by telling the compiler that we don't know what the
++  * function might eventually be.
++  *
++  * __diag_* below are needed to dismiss the missing prototype warning.
++  */
++ __diag_push();
++ __diag_ignore_all("-Wmissing-prototypes",
++ 		  "kfuncs which will be used in BPF programs");
++ 
++ __weak noinline void bpf_rstat_flush(struct cgroup *cgrp,
++ 				     struct cgroup *parent, int cpu)
++ {
++ }
++ 
++ __diag_pop();
++ 
+++>>>>>>> d499fd418fa1 (cgroup/rstat: Optimize cgroup_rstat_updated_list())
+  /* see cgroup_rstat_flush() */
+ -static void cgroup_rstat_flush_locked(struct cgroup *cgrp)
+ +static void cgroup_rstat_flush_locked(struct cgroup *cgrp, bool may_sleep)
+  	__releases(&cgroup_rstat_lock) __acquires(&cgroup_rstat_lock)
+  {
+  	int cpu;
+* Unmerged path kernel/cgroup/rstat.c
