@@ -1,0 +1,128 @@
+gfs2: Fix mmap + page fault deadlocks for direct I/O
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.16.1.el8_6
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit b01b2d72da25c000aeb124bc78daf3fb998be2b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.16.1.el8_6/b01b2d72.failed
+
+Also disable page faults during direct I/O requests and implement a
+similar kind of retry logic as in the buffered I/O case.
+
+The retry logic in the direct I/O case differs from the buffered I/O
+case in the following way: direct I/O doesn't provide the kinds of
+consistency guarantees between concurrent reads and writes that buffered
+I/O provides, so once we lose the inode glock while faulting in user
+pages, we always resume the operation.  We never need to return a
+partial read or write.
+
+This locking problem was originally reported by Jan Kara.  Linus came up
+with the idea of disabling page faults.  Many thanks to Al Viro and
+Matthew Wilcox for their feedback.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit b01b2d72da25c000aeb124bc78daf3fb998be2b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/file.c
+diff --cc fs/gfs2/file.c
+index a25b4f4854df,40e6501c02e5..000000000000
+--- a/fs/gfs2/file.c
++++ b/fs/gfs2/file.c
+@@@ -808,12 -840,35 +827,40 @@@ retry
+  	ret = gfs2_glock_nq(gh);
+  	if (ret)
+  		goto out_uninit;
+- 
++ retry_under_glock:
++ 	pagefault_disable();
++ 	to->nofault = true;
++ 	ret = iomap_dio_rw(iocb, to, &gfs2_iomap_ops, NULL,
++ 			   IOMAP_DIO_PARTIAL, written);
++ 	to->nofault = false;
++ 	pagefault_enable();
++ 	if (ret > 0)
++ 		written = ret;
++ 
+++<<<<<<< HEAD
+ +	ret = iomap_dio_rw(iocb, to, &gfs2_iomap_ops, NULL, 0);
+ +	gfs2_glock_dq(gh);
+++=======
++ 	if (should_fault_in_pages(ret, to, &prev_count, &window_size)) {
++ 		size_t leftover;
++ 
++ 		gfs2_holder_allow_demote(gh);
++ 		leftover = fault_in_iov_iter_writeable(to, window_size);
++ 		gfs2_holder_disallow_demote(gh);
++ 		if (leftover != window_size) {
++ 			if (!gfs2_holder_queued(gh))
++ 				goto retry;
++ 			goto retry_under_glock;
++ 		}
++ 	}
++ 	if (gfs2_holder_queued(gh))
++ 		gfs2_glock_dq(gh);
+++>>>>>>> b01b2d72da25 (gfs2: Fix mmap + page fault deadlocks for direct I/O)
+  out_uninit:
+  	gfs2_holder_uninit(gh);
+- 	return ret;
++ 	if (ret < 0)
++ 		return ret;
++ 	return written;
+  }
+  
+  static ssize_t gfs2_file_direct_write(struct kiocb *iocb, struct iov_iter *from,
+@@@ -838,19 -904,41 +896,45 @@@ retry
+  	ret = gfs2_glock_nq(gh);
+  	if (ret)
+  		goto out_uninit;
+- 
++ retry_under_glock:
+  	/* Silently fall back to buffered I/O when writing beyond EOF */
+- 	if (offset + len > i_size_read(&ip->i_inode))
++ 	if (iocb->ki_pos + iov_iter_count(from) > i_size_read(&ip->i_inode))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	ret = iomap_dio_rw(iocb, from, &gfs2_iomap_ops, NULL, 0);
+++=======
++ 	from->nofault = true;
++ 	ret = iomap_dio_rw(iocb, from, &gfs2_iomap_ops, NULL,
++ 			   IOMAP_DIO_PARTIAL, read);
++ 	from->nofault = false;
++ 
+++>>>>>>> b01b2d72da25 (gfs2: Fix mmap + page fault deadlocks for direct I/O)
+  	if (ret == -ENOTBLK)
+  		ret = 0;
++ 	if (ret > 0)
++ 		read = ret;
++ 
++ 	if (should_fault_in_pages(ret, from, &prev_count, &window_size)) {
++ 		size_t leftover;
++ 
++ 		gfs2_holder_allow_demote(gh);
++ 		leftover = fault_in_iov_iter_readable(from, window_size);
++ 		gfs2_holder_disallow_demote(gh);
++ 		if (leftover != window_size) {
++ 			if (!gfs2_holder_queued(gh))
++ 				goto retry;
++ 			goto retry_under_glock;
++ 		}
++ 	}
+  out:
+- 	gfs2_glock_dq(gh);
++ 	if (gfs2_holder_queued(gh))
++ 		gfs2_glock_dq(gh);
+  out_uninit:
+  	gfs2_holder_uninit(gh);
+- 	return ret;
++ 	if (ret < 0)
++ 		return ret;
++ 	return read;
+  }
+  
+  static ssize_t gfs2_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+* Unmerged path fs/gfs2/file.c
