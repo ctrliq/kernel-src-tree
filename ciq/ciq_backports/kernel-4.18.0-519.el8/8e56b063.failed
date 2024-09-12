@@ -1,0 +1,253 @@
+netfilter: handle the connecting collision properly in nf_conntrack_proto_sctp
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-519.el8
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 8e56b063c86569e51eed1c5681ce6361fa97fc7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-519.el8/8e56b063.failed
+
+In Scenario A and B below, as the delayed INIT_ACK always changes the peer
+vtag, SCTP ct with the incorrect vtag may cause packet loss.
+
+Scenario A: INIT_ACK is delayed until the peer receives its own INIT_ACK
+
+  192.168.1.2 > 192.168.1.1: [INIT] [init tag: 1328086772]
+    192.168.1.1 > 192.168.1.2: [INIT] [init tag: 1414468151]
+    192.168.1.2 > 192.168.1.1: [INIT ACK] [init tag: 1328086772]
+  192.168.1.1 > 192.168.1.2: [INIT ACK] [init tag: 1650211246] *
+  192.168.1.2 > 192.168.1.1: [COOKIE ECHO]
+    192.168.1.1 > 192.168.1.2: [COOKIE ECHO]
+    192.168.1.2 > 192.168.1.1: [COOKIE ACK]
+
+Scenario B: INIT_ACK is delayed until the peer completes its own handshake
+
+  192.168.1.2 > 192.168.1.1: sctp (1) [INIT] [init tag: 3922216408]
+    192.168.1.1 > 192.168.1.2: sctp (1) [INIT] [init tag: 144230885]
+    192.168.1.2 > 192.168.1.1: sctp (1) [INIT ACK] [init tag: 3922216408]
+    192.168.1.1 > 192.168.1.2: sctp (1) [COOKIE ECHO]
+    192.168.1.2 > 192.168.1.1: sctp (1) [COOKIE ACK]
+  192.168.1.1 > 192.168.1.2: sctp (1) [INIT ACK] [init tag: 3914796021] *
+
+This patch fixes it as below:
+
+In SCTP_CID_INIT processing:
+- clear ct->proto.sctp.init[!dir] if ct->proto.sctp.init[dir] &&
+  ct->proto.sctp.init[!dir]. (Scenario E)
+- set ct->proto.sctp.init[dir].
+
+In SCTP_CID_INIT_ACK processing:
+- drop it if !ct->proto.sctp.init[!dir] && ct->proto.sctp.vtag[!dir] &&
+  ct->proto.sctp.vtag[!dir] != ih->init_tag. (Scenario B, Scenario C)
+- drop it if ct->proto.sctp.init[dir] && ct->proto.sctp.init[!dir] &&
+  ct->proto.sctp.vtag[!dir] != ih->init_tag. (Scenario A)
+
+In SCTP_CID_COOKIE_ACK processing:
+- clear ct->proto.sctp.init[dir] and ct->proto.sctp.init[!dir].
+  (Scenario D)
+
+Also, it's important to allow the ct state to move forward with cookie_echo
+and cookie_ack from the opposite dir for the collision scenarios.
+
+There are also other Scenarios where it should allow the packet through,
+addressed by the processing above:
+
+Scenario C: new CT is created by INIT_ACK.
+
+Scenario D: start INIT on the existing ESTABLISHED ct.
+
+Scenario E: start INIT after the old collision on the existing ESTABLISHED
+ct.
+
+  192.168.1.2 > 192.168.1.1: sctp (1) [INIT] [init tag: 3922216408]
+  192.168.1.1 > 192.168.1.2: sctp (1) [INIT] [init tag: 144230885]
+  (both side are stopped, then start new connection again in hours)
+  192.168.1.2 > 192.168.1.1: sctp (1) [INIT] [init tag: 242308742]
+
+Fixes: 9fb9cbb1082d ("[NETFILTER]: Add nf_conntrack subsystem.")
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 8e56b063c86569e51eed1c5681ce6361fa97fc7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_proto_sctp.c
+diff --cc net/netfilter/nf_conntrack_proto_sctp.c
+index e346176ad15a,c6bd533983c1..000000000000
+--- a/net/netfilter/nf_conntrack_proto_sctp.c
++++ b/net/netfilter/nf_conntrack_proto_sctp.c
+@@@ -118,33 -104,33 +118,63 @@@ cookie echoed to closed
+  static const u8 sctp_conntracks[2][11][SCTP_CONNTRACK_MAX] = {
+  	{
+  /*	ORIGINAL	*/
+++<<<<<<< HEAD
+ +/*                  sNO, sCL, sCW, sCE, sES, sSS, sSR, sSA, sHS, sHA */
+ +/* init         */ {sCW, sCW, sCW, sCE, sES, sSS, sSR, sSA, sCW, sHA},
+ +/* init_ack     */ {sCL, sCL, sCW, sCE, sES, sSS, sSR, sSA, sCL, sHA},
+ +/* abort        */ {sCL, sCL, sCL, sCL, sCL, sCL, sCL, sCL, sCL, sCL},
+ +/* shutdown     */ {sCL, sCL, sCW, sCE, sSS, sSS, sSR, sSA, sCL, sSS},
+ +/* shutdown_ack */ {sSA, sCL, sCW, sCE, sES, sSA, sSA, sSA, sSA, sHA},
+ +/* error        */ {sCL, sCL, sCW, sCE, sES, sSS, sSR, sSA, sCL, sHA},/* Can't have Stale cookie*/
+ +/* cookie_echo  */ {sCL, sCL, sCE, sCE, sES, sSS, sSR, sSA, sCL, sHA},/* 5.2.4 - Big TODO */
+ +/* cookie_ack   */ {sCL, sCL, sCW, sCE, sES, sSS, sSR, sSA, sCL, sHA},/* Can't come in orig dir */
+ +/* shutdown_comp*/ {sCL, sCL, sCW, sCE, sES, sSS, sSR, sCL, sCL, sHA},
+ +/* heartbeat    */ {sHS, sCL, sCW, sCE, sES, sSS, sSR, sSA, sHS, sHA},
+ +/* heartbeat_ack*/ {sCL, sCL, sCW, sCE, sES, sSS, sSR, sSA, sHS, sHA}
+ +	},
+ +	{
+ +/*	REPLY	*/
+ +/*                  sNO, sCL, sCW, sCE, sES, sSS, sSR, sSA, sHS, sHA */
+ +/* init         */ {sIV, sCL, sCW, sCE, sES, sSS, sSR, sSA, sIV, sHA},/* INIT in sCL Big TODO */
+ +/* init_ack     */ {sIV, sCL, sCW, sCE, sES, sSS, sSR, sSA, sIV, sHA},
+ +/* abort        */ {sIV, sCL, sCL, sCL, sCL, sCL, sCL, sCL, sIV, sCL},
+ +/* shutdown     */ {sIV, sCL, sCW, sCE, sSR, sSS, sSR, sSA, sIV, sSR},
+ +/* shutdown_ack */ {sIV, sCL, sCW, sCE, sES, sSA, sSA, sSA, sIV, sHA},
+ +/* error        */ {sIV, sCL, sCW, sCL, sES, sSS, sSR, sSA, sIV, sHA},
+ +/* cookie_echo  */ {sIV, sCL, sCW, sCE, sES, sSS, sSR, sSA, sIV, sHA},/* Can't come in reply dir */
+ +/* cookie_ack   */ {sIV, sCL, sCW, sES, sES, sSS, sSR, sSA, sIV, sHA},
+ +/* shutdown_comp*/ {sIV, sCL, sCW, sCE, sES, sSS, sSR, sCL, sIV, sHA},
+ +/* heartbeat    */ {sIV, sCL, sCW, sCE, sES, sSS, sSR, sSA, sHS, sHA},
+ +/* heartbeat_ack*/ {sIV, sCL, sCW, sCE, sES, sSS, sSR, sSA, sHA, sHA}
+++=======
++ /*                  sNO, sCL, sCW, sCE, sES, sSS, sSR, sSA, sHS */
++ /* init         */ {sCL, sCL, sCW, sCE, sES, sCL, sCL, sSA, sCW},
++ /* init_ack     */ {sCL, sCL, sCW, sCE, sES, sSS, sSR, sSA, sCL},
++ /* abort        */ {sCL, sCL, sCL, sCL, sCL, sCL, sCL, sCL, sCL},
++ /* shutdown     */ {sCL, sCL, sCW, sCE, sSS, sSS, sSR, sSA, sCL},
++ /* shutdown_ack */ {sSA, sCL, sCW, sCE, sES, sSA, sSA, sSA, sSA},
++ /* error        */ {sCL, sCL, sCW, sCE, sES, sSS, sSR, sSA, sCL},/* Can't have Stale cookie*/
++ /* cookie_echo  */ {sCL, sCL, sCE, sCE, sES, sSS, sSR, sSA, sCL},/* 5.2.4 - Big TODO */
++ /* cookie_ack   */ {sCL, sCL, sCW, sES, sES, sSS, sSR, sSA, sCL},/* Can't come in orig dir */
++ /* shutdown_comp*/ {sCL, sCL, sCW, sCE, sES, sSS, sSR, sCL, sCL},
++ /* heartbeat    */ {sHS, sCL, sCW, sCE, sES, sSS, sSR, sSA, sHS},
++ /* heartbeat_ack*/ {sCL, sCL, sCW, sCE, sES, sSS, sSR, sSA, sHS},
++ 	},
++ 	{
++ /*	REPLY	*/
++ /*                  sNO, sCL, sCW, sCE, sES, sSS, sSR, sSA, sHS */
++ /* init         */ {sIV, sCL, sCW, sCE, sES, sSS, sSR, sSA, sIV},/* INIT in sCL Big TODO */
++ /* init_ack     */ {sIV, sCW, sCW, sCE, sES, sSS, sSR, sSA, sIV},
++ /* abort        */ {sIV, sCL, sCL, sCL, sCL, sCL, sCL, sCL, sIV},
++ /* shutdown     */ {sIV, sCL, sCW, sCE, sSR, sSS, sSR, sSA, sIV},
++ /* shutdown_ack */ {sIV, sCL, sCW, sCE, sES, sSA, sSA, sSA, sIV},
++ /* error        */ {sIV, sCL, sCW, sCL, sES, sSS, sSR, sSA, sIV},
++ /* cookie_echo  */ {sIV, sCL, sCE, sCE, sES, sSS, sSR, sSA, sIV},/* Can't come in reply dir */
++ /* cookie_ack   */ {sIV, sCL, sCW, sES, sES, sSS, sSR, sSA, sIV},
++ /* shutdown_comp*/ {sIV, sCL, sCW, sCE, sES, sSS, sSR, sCL, sIV},
++ /* heartbeat    */ {sIV, sCL, sCW, sCE, sES, sSS, sSR, sSA, sHS},
++ /* heartbeat_ack*/ {sIV, sCL, sCW, sCE, sES, sSS, sSR, sSA, sES},
+++>>>>>>> 8e56b063c865 (netfilter: handle the connecting collision properly in nf_conntrack_proto_sctp)
+  	}
+  };
+  
+@@@ -419,20 -391,30 +449,23 @@@ int nf_conntrack_sctp_packet(struct nf_
+  			if (sh->vtag != 0)
+  				goto out_unlock;
+  		} else if (sch->type == SCTP_CID_ABORT) {
+ -			/* (B) vtag MUST match own vtag if T flag is unset OR
+ -			 * MUST match peer's vtag if T flag is set
+ -			 */
+ -			if ((!(sch->flags & SCTP_CHUNK_FLAG_T) &&
+ -			     sh->vtag != ct->proto.sctp.vtag[dir]) ||
+ -			    ((sch->flags & SCTP_CHUNK_FLAG_T) &&
+ -			     sh->vtag != ct->proto.sctp.vtag[!dir]))
+ +			/* Sec 8.5.1 (B) */
+ +			if (sh->vtag != ct->proto.sctp.vtag[dir] &&
+ +			    sh->vtag != ct->proto.sctp.vtag[!dir])
+  				goto out_unlock;
+  		} else if (sch->type == SCTP_CID_SHUTDOWN_COMPLETE) {
+ -			/* (C) vtag MUST match own vtag if T flag is unset OR
+ -			 * MUST match peer's vtag if T flag is set
+ -			 */
+ -			if ((!(sch->flags & SCTP_CHUNK_FLAG_T) &&
+ -			     sh->vtag != ct->proto.sctp.vtag[dir]) ||
+ -			    ((sch->flags & SCTP_CHUNK_FLAG_T) &&
+ -			     sh->vtag != ct->proto.sctp.vtag[!dir]))
+ +			/* Sec 8.5.1 (C) */
+ +			if (sh->vtag != ct->proto.sctp.vtag[dir] &&
+ +			    sh->vtag != ct->proto.sctp.vtag[!dir] &&
+ +			    sch->flags & SCTP_CHUNK_FLAG_T)
+  				goto out_unlock;
+  		} else if (sch->type == SCTP_CID_COOKIE_ECHO) {
+ -			/* (D) vtag must be same as init_vtag as found in INIT_ACK */
+ +			/* Sec 8.5.1 (D) */
+  			if (sh->vtag != ct->proto.sctp.vtag[dir])
+  				goto out_unlock;
++ 		} else if (sch->type == SCTP_CID_COOKIE_ACK) {
++ 			ct->proto.sctp.init[dir] = 0;
++ 			ct->proto.sctp.init[!dir] = 0;
+  		} else if (sch->type == SCTP_CID_HEARTBEAT) {
+  			if (ct->proto.sctp.vtag[dir] == 0) {
+  				pr_debug("Setting %d vtag %x for dir %d\n", sch->type, sh->vtag, dir);
+@@@ -481,17 -464,46 +514,49 @@@
+  		}
+  
+  		/* If it is an INIT or an INIT ACK note down the vtag */
+- 		if (sch->type == SCTP_CID_INIT ||
+- 		    sch->type == SCTP_CID_INIT_ACK) {
+- 			struct sctp_inithdr _inithdr, *ih;
++ 		if (sch->type == SCTP_CID_INIT) {
++ 			struct sctp_inithdr _ih, *ih;
+  
+- 			ih = skb_header_pointer(skb, offset + sizeof(_sch),
+- 						sizeof(_inithdr), &_inithdr);
+- 			if (ih == NULL)
++ 			ih = skb_header_pointer(skb, offset + sizeof(_sch), sizeof(*ih), &_ih);
++ 			if (!ih)
++ 				goto out_unlock;
++ 
++ 			if (ct->proto.sctp.init[dir] && ct->proto.sctp.init[!dir])
++ 				ct->proto.sctp.init[!dir] = 0;
++ 			ct->proto.sctp.init[dir] = 1;
++ 
++ 			pr_debug("Setting vtag %x for dir %d\n", ih->init_tag, !dir);
++ 			ct->proto.sctp.vtag[!dir] = ih->init_tag;
+++<<<<<<< HEAD
+++=======
++ 
++ 			/* don't renew timeout on init retransmit so
++ 			 * port reuse by client or NAT middlebox cannot
++ 			 * keep entry alive indefinitely (incl. nat info).
++ 			 */
++ 			if (new_state == SCTP_CONNTRACK_CLOSED &&
++ 			    old_state == SCTP_CONNTRACK_CLOSED &&
++ 			    nf_ct_is_confirmed(ct))
++ 				ignore = true;
++ 		} else if (sch->type == SCTP_CID_INIT_ACK) {
++ 			struct sctp_inithdr _ih, *ih;
++ 			__be32 vtag;
++ 
++ 			ih = skb_header_pointer(skb, offset + sizeof(_sch), sizeof(*ih), &_ih);
++ 			if (!ih)
++ 				goto out_unlock;
++ 
++ 			vtag = ct->proto.sctp.vtag[!dir];
++ 			if (!ct->proto.sctp.init[!dir] && vtag && vtag != ih->init_tag)
+  				goto out_unlock;
+- 			pr_debug("Setting vtag %x for dir %d\n",
+- 				 ih->init_tag, !dir);
++ 			/* collision */
++ 			if (ct->proto.sctp.init[dir] && ct->proto.sctp.init[!dir] &&
++ 			    vtag != ih->init_tag)
++ 				goto out_unlock;
++ 
++ 			pr_debug("Setting vtag %x for dir %d\n", ih->init_tag, !dir);
+  			ct->proto.sctp.vtag[!dir] = ih->init_tag;
+++>>>>>>> 8e56b063c865 (netfilter: handle the connecting collision properly in nf_conntrack_proto_sctp)
+  		}
+  
+  		ct->proto.sctp.state = new_state;
+diff --git a/include/linux/netfilter/nf_conntrack_sctp.h b/include/linux/netfilter/nf_conntrack_sctp.h
+index 625f491b95de..fb31312825ae 100644
+--- a/include/linux/netfilter/nf_conntrack_sctp.h
++++ b/include/linux/netfilter/nf_conntrack_sctp.h
+@@ -9,6 +9,7 @@ struct ip_ct_sctp {
+ 	enum sctp_conntrack state;
+ 
+ 	__be32 vtag[IP_CT_DIR_MAX];
++	u8 init[IP_CT_DIR_MAX];
+ 	u8 last_dir;
+ 	u8 flags;
+ };
+* Unmerged path net/netfilter/nf_conntrack_proto_sctp.c
