@@ -486,6 +486,15 @@
 #define __PPC_PRFX_R(r)	(((r) & 0x1) << 20)
 
 /*
+ * Both low and high 16 bits are added as SIGNED additions, so if low 16 bits
+ * has high bit set, high 16 bits must be adjusted. These macros do that (stolen
+ * from binutils).
+ */
+#define PPC_LO(v)	((v) & 0xffff)
+#define PPC_HI(v)	(((v) >> 16) & 0xffff)
+#define PPC_HA(v)	PPC_HI((v) + 0x8000)
+
+/*
  * Only use the larx hint bit on 64bit CPUs. e500v1/v2 based CPUs will treat a
  * larx with EH set as an illegal instruction.
  */
