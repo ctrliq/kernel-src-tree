@@ -1,0 +1,228 @@
+x86/bugs: Enable STIBP for JMP2RET
+
+jira LE-1907
+cve CVE-2022-23825
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-4.18.0-372.32.1.el8_6
+commit-author Kim Phillips <kim.phillips@amd.com>
+commit e8ec1b6e08a2102d8755ccb06fa26d540f26a2fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.32.1.el8_6/e8ec1b6e.failed
+
+For untrained return thunks to be fully effective, STIBP must be enabled
+or SMT disabled.
+
+Co-developed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Signed-off-by: Kim Phillips <kim.phillips@amd.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit e8ec1b6e08a2102d8755ccb06fa26d540f26a2fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/kernel-parameters.txt
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc Documentation/admin-guide/kernel-parameters.txt
+index 25c1d34da432,168e164f09eb..000000000000
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@@ -4511,17 -5195,29 +4511,41 @@@
+  			Useful for devices that are detected asynchronously
+  			(e.g. USB and MMC devices).
+  
+ +	hibernate=	[HIBERNATION]
+ +		noresume	Don't check if there's a hibernation image
+ +				present during boot.
+ +		nocompress	Don't compress/decompress hibernation images.
+ +		no		Disable hibernation and resume.
+ +		protect_image	Turn on image protection during restoration
+ +				(that will set all pages holding image data
+ +				during restoration read-only).
+ +
+  	retain_initrd	[RAM] Keep initrd memory after extraction
+  
+++<<<<<<< HEAD
+++=======
++ 	retbleed=	[X86] Control mitigation of RETBleed (Arbitrary
++ 			Speculative Code Execution with Return Instructions)
++ 			vulnerability.
++ 
++ 			off          - no mitigation
++ 			auto         - automatically select a migitation
++ 			auto,nosmt   - automatically select a mitigation,
++ 				       disabling SMT if necessary for
++ 				       the full mitigation (only on Zen1
++ 				       and older without STIBP).
++ 			unret        - force enable untrained return thunks,
++ 				       only effective on AMD f15h-f17h
++ 				       based systems.
++ 			unret,nosmt  - like unret, will disable SMT when STIBP
++ 			               is not available.
++ 
++ 			Selecting 'auto' will choose a mitigation method at run
++ 			time according to the CPU.
++ 
++ 			Not specifying this option is equivalent to retbleed=auto.
++ 
+++>>>>>>> e8ec1b6e08a2 (x86/bugs: Enable STIBP for JMP2RET)
+  	rfkill.default_state=
+  		0	"airplane mode".  All wifi, bluetooth, wimax, gps, fm,
+  			etc. communication is blocked by default.
+diff --cc arch/x86/kernel/cpu/bugs.c
+index ff842ff87312,fb249b2c1eb0..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -721,6 -760,119 +721,122 @@@ static int __init nospectre_v1_cmdline(
+  early_param("nospectre_v1", nospectre_v1_cmdline);
+  
+  #undef pr_fmt
+++<<<<<<< HEAD
+++=======
++ #define pr_fmt(fmt)     "RETBleed: " fmt
++ 
++ enum retbleed_mitigation {
++ 	RETBLEED_MITIGATION_NONE,
++ 	RETBLEED_MITIGATION_UNRET,
++ };
++ 
++ enum retbleed_mitigation_cmd {
++ 	RETBLEED_CMD_OFF,
++ 	RETBLEED_CMD_AUTO,
++ 	RETBLEED_CMD_UNRET,
++ };
++ 
++ const char * const retbleed_strings[] = {
++ 	[RETBLEED_MITIGATION_NONE]	= "Vulnerable",
++ 	[RETBLEED_MITIGATION_UNRET]	= "Mitigation: untrained return thunk",
++ };
++ 
++ static enum retbleed_mitigation retbleed_mitigation __ro_after_init =
++ 	RETBLEED_MITIGATION_NONE;
++ static enum retbleed_mitigation_cmd retbleed_cmd __ro_after_init =
++ 	RETBLEED_CMD_AUTO;
++ 
++ static int __ro_after_init retbleed_nosmt = false;
++ 
++ static int __init retbleed_parse_cmdline(char *str)
++ {
++ 	if (!str)
++ 		return -EINVAL;
++ 
++ 	while (str) {
++ 		char *next = strchr(str, ',');
++ 		if (next) {
++ 			*next = 0;
++ 			next++;
++ 		}
++ 
++ 		if (!strcmp(str, "off")) {
++ 			retbleed_cmd = RETBLEED_CMD_OFF;
++ 		} else if (!strcmp(str, "auto")) {
++ 			retbleed_cmd = RETBLEED_CMD_AUTO;
++ 		} else if (!strcmp(str, "unret")) {
++ 			retbleed_cmd = RETBLEED_CMD_UNRET;
++ 		} else if (!strcmp(str, "nosmt")) {
++ 			retbleed_nosmt = true;
++ 		} else {
++ 			pr_err("Ignoring unknown retbleed option (%s).", str);
++ 		}
++ 
++ 		str = next;
++ 	}
++ 
++ 	return 0;
++ }
++ early_param("retbleed", retbleed_parse_cmdline);
++ 
++ #define RETBLEED_UNTRAIN_MSG "WARNING: BTB untrained return thunk mitigation is only effective on AMD/Hygon!\n"
++ #define RETBLEED_COMPILER_MSG "WARNING: kernel not compiled with RETPOLINE or -mfunction-return capable compiler!\n"
++ 
++ static void __init retbleed_select_mitigation(void)
++ {
++ 	if (!boot_cpu_has_bug(X86_BUG_RETBLEED) || cpu_mitigations_off())
++ 		return;
++ 
++ 	switch (retbleed_cmd) {
++ 	case RETBLEED_CMD_OFF:
++ 		return;
++ 
++ 	case RETBLEED_CMD_UNRET:
++ 		retbleed_mitigation = RETBLEED_MITIGATION_UNRET;
++ 		break;
++ 
++ 	case RETBLEED_CMD_AUTO:
++ 	default:
++ 		if (!boot_cpu_has_bug(X86_BUG_RETBLEED))
++ 			break;
++ 
++ 		if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD ||
++ 		    boot_cpu_data.x86_vendor == X86_VENDOR_HYGON)
++ 			retbleed_mitigation = RETBLEED_MITIGATION_UNRET;
++ 		break;
++ 	}
++ 
++ 	switch (retbleed_mitigation) {
++ 	case RETBLEED_MITIGATION_UNRET:
++ 
++ 		if (!IS_ENABLED(CONFIG_RETPOLINE) ||
++ 		    !IS_ENABLED(CONFIG_CC_HAS_RETURN_THUNK)) {
++ 			pr_err(RETBLEED_COMPILER_MSG);
++ 			retbleed_mitigation = RETBLEED_MITIGATION_NONE;
++ 			break;
++ 		}
++ 
++ 		setup_force_cpu_cap(X86_FEATURE_RETHUNK);
++ 		setup_force_cpu_cap(X86_FEATURE_UNRET);
++ 
++ 		if (!boot_cpu_has(X86_FEATURE_STIBP) &&
++ 		    (retbleed_nosmt || cpu_mitigations_auto_nosmt()))
++ 			cpu_smt_disable(false);
++ 
++ 		if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD &&
++ 		    boot_cpu_data.x86_vendor != X86_VENDOR_HYGON)
++ 			pr_err(RETBLEED_UNTRAIN_MSG);
++ 		break;
++ 
++ 	default:
++ 		break;
++ 	}
++ 
++ 	pr_info("%s\n", retbleed_strings[retbleed_mitigation]);
++ }
++ 
++ #undef pr_fmt
+++>>>>>>> e8ec1b6e08a2 (x86/bugs: Enable STIBP for JMP2RET)
+  #define pr_fmt(fmt)     "Spectre V2 : " fmt
+  
+  static enum spectre_v2_mitigation spectre_v2_enabled __ro_after_init =
+@@@ -1996,7 -2123,20 +2119,24 @@@ static ssize_t srbds_show_state(char *b
+  
+  static ssize_t retbleed_show_state(char *buf)
+  {
+++<<<<<<< HEAD
+ +	return sprintf(buf, "Vulnerable\n");
+++=======
++ 	if (retbleed_mitigation == RETBLEED_MITIGATION_UNRET) {
++ 	    if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD &&
++ 		boot_cpu_data.x86_vendor != X86_VENDOR_HYGON)
++ 		    return sprintf(buf, "Vulnerable: untrained return thunk on non-Zen uarch\n");
++ 
++ 	    return sprintf(buf, "%s; SMT %s\n",
++ 			   retbleed_strings[retbleed_mitigation],
++ 			   !sched_smt_active() ? "disabled" :
++ 			   spectre_v2_user_stibp == SPECTRE_V2_USER_STRICT ||
++ 			   spectre_v2_user_stibp == SPECTRE_V2_USER_STRICT_PREFERRED ?
++ 			   "enabled with STIBP protection" : "vulnerable");
++ 	}
++ 
++ 	return sprintf(buf, "%s\n", retbleed_strings[retbleed_mitigation]);
+++>>>>>>> e8ec1b6e08a2 (x86/bugs: Enable STIBP for JMP2RET)
+  }
+  
+  static ssize_t cpu_show_common(struct device *dev, struct device_attribute *attr,
+* Unmerged path Documentation/admin-guide/kernel-parameters.txt
+* Unmerged path arch/x86/kernel/cpu/bugs.c
