@@ -55,6 +55,15 @@ MODULE_SUPPORTED_DEVICE("Microsemi Smart Family Controllers");
 MODULE_VERSION(DRIVER_VERSION);
 MODULE_LICENSE("GPL");
 
+struct pqi_cmd_priv {
+	int this_residual;
+};
+
+static struct pqi_cmd_priv *pqi_cmd_priv(struct scsi_cmnd *cmd)
+{
+	return scsi_cmd_priv(cmd);
+}
+
 static void pqi_verify_structures(void);
 static void pqi_take_ctrl_offline(struct pqi_ctrl_info *ctrl_info,
 	enum pqi_ctrl_shutdown_reason ctrl_shutdown_reason);
@@ -1615,9 +1624,7 @@ static int pqi_get_physical_device_info(struct pqi_ctrl_info *ctrl_info,
 		&id_phys->alternate_paths_phys_connector,
 		sizeof(device->phys_connector));
 	device->bay = id_phys->phys_bay_in_box;
-	device->multi_lun_device_lun_count = id_phys->multi_lun_device_lun_count;
-	if (!device->multi_lun_device_lun_count)
-		device->multi_lun_device_lun_count = 1;
+	device->lun_count = id_phys->multi_lun_device_lun_count;
 	if ((id_phys->even_more_flags & PQI_DEVICE_PHY_MAP_SUPPORTED) &&
 		id_phys->phy_count)
 		device->phy_id =
@@ -1751,7 +1758,7 @@ out:
 	return offline;
 }
 
-static int pqi_get_device_info(struct pqi_ctrl_info *ctrl_info,
+static int pqi_get_device_info_phys_logical(struct pqi_ctrl_info *ctrl_info,
 	struct pqi_scsi_dev *device,
 	struct bmic_identify_physical_device *id_phys)
 {
@@ -1764,6 +1771,20 @@ static int pqi_get_device_info(struct pqi_ctrl_info *ctrl_info,
 		rc = pqi_get_logical_device_info(ctrl_info, device);
 	else
 		rc = pqi_get_physical_device_info(ctrl_info, device, id_phys);
+
+	return rc;
+}
+
+static int pqi_get_device_info(struct pqi_ctrl_info *ctrl_info,
+	struct pqi_scsi_dev *device,
+	struct bmic_identify_physical_device *id_phys)
+{
+	int rc;
+
+	rc = pqi_get_device_info_phys_logical(ctrl_info, device, id_phys);
+
+	if (rc == 0 && device->lun_count == 0)
+		device->lun_count = 1;
 
 	return rc;
 }
@@ -1902,7 +1923,7 @@ static inline void pqi_remove_device(struct pqi_ctrl_info *ctrl_info, struct pqi
 	int rc;
 	int lun;
 
-	for (lun = 0; lun < device->multi_lun_device_lun_count; lun++) {
+	for (lun = 0; lun < device->lun_count; lun++) {
 		rc = pqi_device_wait_for_pending_io(ctrl_info, device, lun,
 			PQI_REMOVE_DEVICE_PENDING_IO_TIMEOUT_MSECS);
 		if (rc)
@@ -2081,6 +2102,7 @@ static void pqi_scsi_update_device(struct pqi_ctrl_info *ctrl_info,
 	existing_device->sas_address = new_device->sas_address;
 	existing_device->queue_depth = new_device->queue_depth;
 	existing_device->device_offline = false;
+	existing_device->lun_count = new_device->lun_count;
 
 	if (pqi_is_logical_device(existing_device)) {
 		existing_device->is_external_raid_device = new_device->is_external_raid_device;
@@ -2113,10 +2135,6 @@ static void pqi_scsi_update_device(struct pqi_ctrl_info *ctrl_info,
 		existing_device->phy_connected_dev_type = new_device->phy_connected_dev_type;
 		memcpy(existing_device->box, new_device->box, sizeof(existing_device->box));
 		memcpy(existing_device->phys_connector, new_device->phys_connector, sizeof(existing_device->phys_connector));
-
-		existing_device->multi_lun_device_lun_count = new_device->multi_lun_device_lun_count;
-		if (existing_device->multi_lun_device_lun_count == 0)
-			existing_device->multi_lun_device_lun_count = 1;
 	}
 }
 
@@ -2545,23 +2563,6 @@ out:
 	kfree(id_phys);
 
 	return rc;
-}
-
-static void pqi_remove_all_scsi_devices(struct pqi_ctrl_info *ctrl_info)
-{
-	unsigned long flags;
-	struct pqi_scsi_dev *device;
-	struct pqi_scsi_dev *next;
-
-	list_for_each_entry_safe(device, next, &ctrl_info->scsi_device_list,
-		scsi_device_list_entry) {
-		if (pqi_is_device_added(device))
-			pqi_remove_device(ctrl_info, device);
-		spin_lock_irqsave(&ctrl_info->scsi_device_list_lock, flags);
-		list_del(&device->scsi_device_list_entry);
-		pqi_free_device(device);
-		spin_unlock_irqrestore(&ctrl_info->scsi_device_list_lock, flags);
-	}
 }
 
 static int pqi_scan_scsi_devices(struct pqi_ctrl_info *ctrl_info)
@@ -5632,7 +5633,7 @@ static void pqi_aio_io_complete(struct pqi_io_request *io_request,
 	scsi_dma_unmap(scmd);
 	if (io_request->status == -EAGAIN || pqi_raid_bypass_retry_needed(io_request)) {
 		set_host_byte(scmd, DID_IMM_RETRY);
-		scmd->SCp.this_residual++;
+		pqi_cmd_priv(scmd)->this_residual++;
 	}
 
 	pqi_free_io_request(io_request);
@@ -5649,7 +5650,7 @@ static inline bool pqi_is_io_high_priority(struct pqi_ctrl_info *ctrl_info,
 
 	if (device->ncq_prio_enable) {
 		priority_class =
-			IOPRIO_PRIO_CLASS(req_get_ioprio(scmd->request));
+			IOPRIO_PRIO_CLASS(req_get_ioprio(scsi_cmd_to_rq(scmd)));
 		if (priority_class == IOPRIO_CLASS_RT) {
 			/* Set NCQ priority for read/write commands. */
 			switch (scmd->cmnd[0]) {
@@ -5902,7 +5903,7 @@ static inline bool pqi_is_bypass_eligible_request(struct scsi_cmnd *scmd)
 	if (blk_rq_is_passthrough(scsi_cmd_to_rq(scmd)))
 		return false;
 
-	return scmd->SCp.this_residual == 0;
+	return pqi_cmd_priv(scmd)->this_residual == 0;
 }
 
 /*
@@ -6493,8 +6494,42 @@ static int pqi_slave_configure(struct scsi_device *sdev)
 	return rc;
 }
 
-static int pqi_getpciinfo_ioctl(struct pqi_ctrl_info *ctrl_info,
-	void __user *arg)
+static void pqi_slave_destroy(struct scsi_device *sdev)
+{
+	struct pqi_ctrl_info *ctrl_info;
+	struct pqi_scsi_dev *device;
+	int mutex_acquired;
+	unsigned long flags;
+
+	ctrl_info = shost_to_hba(sdev->host);
+
+	mutex_acquired = mutex_trylock(&ctrl_info->scan_mutex);
+	if (!mutex_acquired)
+		return;
+
+	device = sdev->hostdata;
+	if (!device) {
+		mutex_unlock(&ctrl_info->scan_mutex);
+		return;
+	}
+
+	device->lun_count--;
+	if (device->lun_count > 0) {
+		mutex_unlock(&ctrl_info->scan_mutex);
+		return;
+	}
+
+	spin_lock_irqsave(&ctrl_info->scsi_device_list_lock, flags);
+	list_del(&device->scsi_device_list_entry);
+	spin_unlock_irqrestore(&ctrl_info->scsi_device_list_lock, flags);
+
+	mutex_unlock(&ctrl_info->scan_mutex);
+
+	pqi_dev_info(ctrl_info, "removed", device);
+	pqi_free_device(device);
+}
+
+static int pqi_getpciinfo_ioctl(struct pqi_ctrl_info *ctrl_info, void __user *arg)
 {
 	struct pci_dev *pci_dev;
 	u32 subsystem_vendor;
@@ -7377,9 +7412,11 @@ static struct scsi_host_template pqi_driver_template = {
 	.ioctl = pqi_ioctl,
 	.slave_alloc = pqi_slave_alloc,
 	.slave_configure = pqi_slave_configure,
+	.slave_destroy = pqi_slave_destroy,
 	.map_queues = pqi_map_queues,
 	.sdev_attrs = pqi_sdev_attrs,
 	.shost_attrs = pqi_shost_attrs,
+	.cmd_size = sizeof(struct pqi_cmd_priv),
 };
 
 static int pqi_register_scsi(struct pqi_ctrl_info *ctrl_info)
@@ -8661,7 +8698,6 @@ static void pqi_remove_ctrl(struct pqi_ctrl_info *ctrl_info)
 		pqi_fail_all_outstanding_requests(ctrl_info);
 		ctrl_info->pqi_mode_enabled = false;
 	}
-	pqi_remove_all_scsi_devices(ctrl_info);
 	pqi_unregister_scsi(ctrl_info);
 	if (ctrl_info->pqi_mode_enabled)
 		pqi_revert_to_sis_mode(ctrl_info);

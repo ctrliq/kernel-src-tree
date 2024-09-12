@@ -492,7 +492,7 @@ void mt7921_tx_check_aggr(struct ieee80211_sta *sta, __le32 *txwi)
 	u16 fc, tid;
 	u32 val;
 
-	if (!sta || !(sta->ht_cap.ht_supported || sta->he_cap.has_he))
+	if (!sta || !(sta->deflink.ht_cap.ht_supported || sta->deflink.he_cap.has_he))
 		return;
 
 	tid = le32_get_bits(txwi[1], MT_TXD1_TID);
@@ -740,7 +740,7 @@ void mt7921_mac_reset_work(struct work_struct *work)
 	struct mt76_connac_pm *pm = &dev->pm;
 	int i, ret;
 
-	dev_err(dev->mt76.dev, "chip reset\n");
+	dev_dbg(dev->mt76.dev, "chip reset\n");
 	dev->hw_full_reset = true;
 	ieee80211_stop_queues(hw);
 

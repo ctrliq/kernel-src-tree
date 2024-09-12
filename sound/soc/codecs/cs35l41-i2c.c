@@ -16,8 +16,8 @@
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/interrupt.h>
 
-#include <sound/cs35l41.h>
 #include "cs35l41.h"
 
 static const struct i2c_device_id cs35l41_id_i2c[] = {
@@ -30,12 +30,11 @@ static const struct i2c_device_id cs35l41_id_i2c[] = {
 
 MODULE_DEVICE_TABLE(i2c, cs35l41_id_i2c);
 
-static int cs35l41_i2c_probe(struct i2c_client *client,
-			     const struct i2c_device_id *id)
+static int cs35l41_i2c_probe(struct i2c_client *client)
 {
 	struct cs35l41_private *cs35l41;
 	struct device *dev = &client->dev;
-	struct cs35l41_platform_data *pdata = dev_get_platdata(dev);
+	struct cs35l41_hw_cfg *hw_cfg = dev_get_platdata(dev);
 	const struct regmap_config *regmap_config = &cs35l41_regmap_i2c;
 	int ret;
 
@@ -55,7 +54,7 @@ static int cs35l41_i2c_probe(struct i2c_client *client,
 		return ret;
 	}
 
-	return cs35l41_probe(cs35l41, pdata);
+	return cs35l41_probe(cs35l41, hw_cfg);
 }
 
 static int cs35l41_i2c_remove(struct i2c_client *client)
@@ -87,11 +86,12 @@ MODULE_DEVICE_TABLE(acpi, cs35l41_acpi_match);
 static struct i2c_driver cs35l41_i2c_driver = {
 	.driver = {
 		.name		= "cs35l41",
+		.pm		= &cs35l41_pm_ops,
 		.of_match_table = of_match_ptr(cs35l41_of_match),
 		.acpi_match_table = ACPI_PTR(cs35l41_acpi_match),
 	},
 	.id_table	= cs35l41_id_i2c,
-	.probe		= cs35l41_i2c_probe,
+	.probe_new	= cs35l41_i2c_probe,
 	.remove		= cs35l41_i2c_remove,
 };
 

@@ -1239,6 +1239,8 @@ lpfc_linkdown(struct lpfc_hba *phba)
 			phba->trunk_link.link1.state = 0;
 			phba->trunk_link.link2.state = 0;
 			phba->trunk_link.link3.state = 0;
+			phba->trunk_link.phy_lnk_speed =
+						LPFC_LINK_SPEED_UNKNOWN;
 			phba->sli4_hba.link_state.logical_speed =
 						LPFC_LINK_SPEED_UNKNOWN;
 		}
@@ -2971,7 +2973,7 @@ lpfc_mbx_cmpl_fcf_rr_read_fcf_rec(struct lpfc_hba *phba, LPFC_MBOXQ_t *mboxq)
 	uint32_t boot_flag, addr_mode;
 	uint16_t next_fcf_index, fcf_index;
 	uint16_t current_fcf_index;
-	uint16_t vlan_id;
+	uint16_t vlan_id = LPFC_FCOE_NULL_VID;
 	int rc;
 
 	/* If link state is not up, stop the roundrobin failover process */
@@ -3076,7 +3078,7 @@ lpfc_mbx_cmpl_read_fcf_rec(struct lpfc_hba *phba, LPFC_MBOXQ_t *mboxq)
 	struct fcf_record *new_fcf_record;
 	uint32_t boot_flag, addr_mode;
 	uint16_t fcf_index, next_fcf_index;
-	uint16_t vlan_id;
+	uint16_t vlan_id =  LPFC_FCOE_NULL_VID;
 	int rc;
 
 	/* If link state is not up, no need to proceed */
@@ -3825,6 +3827,9 @@ lpfc_mbx_cmpl_read_topology(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 		if (phba->cmf_active_mode != LPFC_CFG_OFF)
 			lpfc_cmf_signal_init(phba);
 
+		if (phba->lmt & LMT_64Gb)
+			lpfc_read_lds_params(phba);
+
 	} else if (attn_type == LPFC_ATT_LINK_DOWN ||
 		   attn_type == LPFC_ATT_UNEXP_WWPN) {
 		phba->fc_stat.LinkDown++;
@@ -4473,8 +4478,11 @@ out:
 			rc = lpfc_issue_els_edc(vport, 0);
 			lpfc_printf_log(phba, KERN_INFO,
 					LOG_INIT | LOG_ELS | LOG_DISCOVERY,
-					"4220 EDC issue error x%x, Data: x%x\n",
+					"4220 Issue EDC status x%x Data x%x\n",
 					rc, phba->cgn_init_reg_signal);
+		} else if (phba->lmt & LMT_64Gb) {
+			/* may send link fault capability descriptor */
+			lpfc_issue_els_edc(vport, 0);
 		} else {
 			lpfc_issue_els_rdf(vport, 0);
 		}

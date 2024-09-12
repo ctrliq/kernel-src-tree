@@ -180,6 +180,7 @@ static struct pci_device_id megasas_pci_table[] = {
 
 MODULE_DEVICE_TABLE(pci, megasas_pci_table);
 
+#ifdef CONFIG_RHEL_DIFFERENCES
 static struct pci_device_id rh_unmaintained_pci_table[] = {
 
 	{PCI_DEVICE(PCI_VENDOR_ID_LSI_LOGIC, PCI_DEVICE_ID_LSI_SAS0079GEN2)},
@@ -197,6 +198,7 @@ static struct pci_device_id rh_deprecated_pci_table[] = {
 	/* Fusion */
 	{}
 };
+#endif
 
 static int megasas_mgmt_majorno;
 struct megasas_mgmt_info megasas_mgmt_info;
@@ -7402,8 +7404,10 @@ static int megasas_probe_one(struct pci_dev *pdev,
 	struct megasas_instance *instance;
 	u16 control = 0;
 
+#ifdef CONFIG_RHEL_DIFFERENCES
 	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
 	pci_hw_unmaintained(rh_unmaintained_pci_table, pdev);
+#endif
 
 	switch (pdev->device) {
 	case PCI_DEVICE_ID_LSI_AERO_10E0:

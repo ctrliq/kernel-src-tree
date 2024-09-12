@@ -766,18 +766,18 @@ write_retry:
 	 */
 	if (ret == -EDQUOT && !cleared_space) {
 		xfs_iunlock(ip, iolock);
-		xfs_blockgc_free_quota(ip, XFS_EOF_FLAGS_SYNC);
+		xfs_blockgc_free_quota(ip, XFS_ICWALK_FLAG_SYNC);
 		cleared_space = true;
 		goto write_retry;
 	} else if (ret == -ENOSPC && !cleared_space) {
-		struct xfs_eofblocks eofb = {0};
+		struct xfs_icwalk	icw = {0};
 
 		cleared_space = true;
 		xfs_flush_inodes(ip->i_mount);
 
 		xfs_iunlock(ip, iolock);
-		eofb.eof_flags = XFS_EOF_FLAGS_SYNC;
-		xfs_blockgc_free_space(ip->i_mount, &eofb);
+		icw.icw_flags = XFS_ICWALK_FLAG_SYNC;
+		xfs_blockgc_free_space(ip->i_mount, &icw);
 		goto write_retry;
 	}
 
@@ -891,6 +891,21 @@ xfs_break_layouts(
 	} while (error == 0 && retry);
 
 	return error;
+}
+
+/* Does this file, inode, or mount want synchronous writes? */
+static inline bool xfs_file_sync_writes(struct file *filp)
+{
+	struct xfs_inode	*ip = XFS_I(file_inode(filp));
+
+	if (ip->i_mount->m_flags & XFS_MOUNT_WSYNC)
+		return true;
+	if (filp->f_flags & (__O_SYNC | O_DSYNC))
+		return true;
+	if (IS_SYNC(file_inode(filp)))
+		return true;
+
+	return false;
 }
 
 #define	XFS_FALLOC_FL_SUPPORTED						\
@@ -1073,7 +1088,7 @@ xfs_file_fallocate(
 			goto out_unlock;
 	}
 
-	if (file->f_flags & O_DSYNC)
+	if (xfs_file_sync_writes(file))
 		error = xfs_log_force_inode(ip);
 
 out_unlock:
@@ -1104,21 +1119,6 @@ xfs_file_fadvise(
 	if (lockflags)
 		xfs_iunlock(ip, lockflags);
 	return ret;
-}
-
-/* Does this file, inode, or mount want synchronous writes? */
-static inline bool xfs_file_sync_writes(struct file *filp)
-{
-	struct xfs_inode	*ip = XFS_I(file_inode(filp));
-
-	if (ip->i_mount->m_flags & XFS_MOUNT_WSYNC)
-		return true;
-	if (filp->f_flags & (__O_SYNC | O_DSYNC))
-		return true;
-	if (IS_SYNC(file_inode(filp)))
-		return true;
-
-	return false;
 }
 
 STATIC loff_t

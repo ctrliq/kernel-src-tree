@@ -364,8 +364,9 @@ static struct dma_debug_entry *bucket_find_contain(struct hash_bucket **bucket,
 
 	struct dma_debug_entry *entry, index = *ref;
 	int limit = min(HASH_SIZE, (index.dev_addr >> HASH_FN_SHIFT) + 1);
+	int i;
 
-	for (int i = 0; i < limit; i++) {
+	for (i = 0; i < limit; i++) {
 		entry = __hash_bucket_find(*bucket, ref, containing_match);
 
 		if (entry)

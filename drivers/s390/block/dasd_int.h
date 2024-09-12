@@ -443,6 +443,8 @@ struct dasd_discipline {
 	int (*ese_read)(struct dasd_ccw_req *, struct irb *);
 	int (*pprc_status)(struct dasd_device *, struct	dasd_pprc_data_sc4 *);
 	bool (*pprc_enabled)(struct dasd_device *);
+	int (*copy_pair_swap)(struct dasd_device *, char *, char *);
+	int (*device_ping)(struct dasd_device *);
 };
 
 extern struct dasd_discipline *dasd_diag_discipline_pointer;
@@ -690,6 +692,7 @@ struct dasd_queue {
 #define DASD_STOPPED_PM      32        /* pm state transition */
 #define DASD_UNRESUMED_PM    64        /* pm resume failed state */
 #define DASD_STOPPED_NOSPC   128       /* no space left */
+#define DASD_STOPPED_PPRC    256       /* PPRC swap */
 
 /* per device flags */
 #define DASD_FLAG_OFFLINE	3	/* device is in offline processing */
@@ -712,6 +715,22 @@ struct dasd_queue {
 #define DASD_SLEEPON_END_TAG	((void *) 2)
 
 void dasd_put_device_wake(struct dasd_device *);
+
+/*
+ * return values to be returned from the copy pair swap function
+ * 0x00: swap successful
+ * 0x01: swap data invalid
+ * 0x02: no active device found
+ * 0x03: wrong primary specified
+ * 0x04: secondary device not found
+ * 0x05: swap already running
+ */
+#define DASD_COPYPAIRSWAP_SUCCESS	0
+#define DASD_COPYPAIRSWAP_INVALID	1
+#define DASD_COPYPAIRSWAP_NOACTIVE	2
+#define DASD_COPYPAIRSWAP_PRIMARY	3
+#define DASD_COPYPAIRSWAP_SECONDARY	4
+#define DASD_COPYPAIRSWAP_MULTIPLE	5
 
 /*
  * Reference count inliners
@@ -899,6 +918,8 @@ void dasd_generic_path_event(struct ccw_device *, int *);
 int dasd_generic_verify_path(struct dasd_device *, __u8);
 void dasd_generic_space_exhaust(struct dasd_device *, struct dasd_ccw_req *);
 void dasd_generic_space_avail(struct dasd_device *);
+
+int dasd_generic_requeue_all_requests(struct dasd_device *);
 
 int dasd_generic_read_dev_chars(struct dasd_device *, int, void *, int);
 char *dasd_get_sense(struct irb *);

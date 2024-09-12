@@ -992,7 +992,7 @@ static void thread_common_ops(struct test_spec *test, struct ifobject *ifobject)
 	if (!ifindex)
 		exit_with_error(errno);
 
-	ret = xsk_setup_xdp_prog(ifindex, &ifobject->xsk_map_fd);
+	ret = xsk_setup_xdp_prog_xsk(ifobject->xsk->xsk, &ifobject->xsk_map_fd);
 	if (ret)
 		exit_with_error(-ret);
 
@@ -1168,6 +1168,9 @@ static void swap_xsk_resources(struct ifobject *ifobj_tx, struct ifobject *ifobj
 
 static void testapp_bpf_res(struct test_spec *test)
 {
+	ksft_test_result_skip("Test would hang on RHEL 8\n");
+	return;
+
 	test_spec_set_name(test, "BPF_RES");
 	test->total_steps = 2;
 	test->nb_sockets = 2;

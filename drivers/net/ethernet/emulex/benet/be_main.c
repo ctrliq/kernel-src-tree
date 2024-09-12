@@ -280,7 +280,7 @@ void be_cq_notify(struct be_adapter *adapter, u16 qid, bool arm, u16 num_popped)
 	iowrite32(val, adapter->db + DB_CQ_OFFSET);
 }
 
-static int be_dev_mac_add(struct be_adapter *adapter, u8 *mac)
+static int be_dev_mac_add(struct be_adapter *adapter, const u8 *mac)
 {
 	int i;
 
@@ -377,7 +377,7 @@ static int be_mac_addr_set(struct net_device *netdev, void *p)
 	/* Remember currently programmed MAC */
 	ether_addr_copy(adapter->dev_mac, addr->sa_data);
 done:
-	ether_addr_copy(netdev->dev_addr, addr->sa_data);
+	eth_hw_addr_set(netdev, addr->sa_data);
 	dev_info(dev, "MAC address changed to %pM\n", addr->sa_data);
 	return 0;
 err:
@@ -745,9 +745,9 @@ void be_link_status_update(struct be_adapter *adapter, u8 link_status)
 static int be_gso_hdr_len(struct sk_buff *skb)
 {
 	if (skb->encapsulation)
-		return skb_inner_transport_offset(skb) +
-		       inner_tcp_hdrlen(skb);
-	return skb_transport_offset(skb) + tcp_hdrlen(skb);
+		return skb_inner_tcp_all_headers(skb);
+
+	return skb_tcp_all_headers(skb);
 }
 
 static void be_tx_stats_update(struct be_tx_obj *txo, struct sk_buff *skb)
@@ -4607,7 +4607,7 @@ static int be_mac_setup(struct be_adapter *adapter)
 		if (status)
 			return status;
 
-		memcpy(adapter->netdev->dev_addr, mac, ETH_ALEN);
+		eth_hw_addr_set(adapter->netdev, mac);
 		memcpy(adapter->netdev->perm_addr, mac, ETH_ALEN);
 
 		/* Initial MAC for BE3 VFs is already programmed by PF */
@@ -4629,7 +4629,6 @@ static void be_destroy_err_recovery_workq(void)
 	if (!be_err_recovery_workq)
 		return;
 
-	flush_workqueue(be_err_recovery_workq);
 	destroy_workqueue(be_err_recovery_workq);
 	be_err_recovery_workq = NULL;
 }
@@ -5215,7 +5214,7 @@ static void be_netdev_init(struct net_device *netdev)
 
 	netdev->flags |= IFF_MULTICAST;
 
-	netif_set_gso_max_size(netdev, BE_MAX_GSO_SIZE - ETH_HLEN);
+	netif_set_tso_max_size(netdev, BE_MAX_GSO_SIZE - ETH_HLEN);
 
 	netdev->netdev_ops = &be_netdev_ops;
 

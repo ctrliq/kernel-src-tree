@@ -12,6 +12,7 @@
 #include <linux/kernel.h>
 #include <linux/pci.h>
 #include <asm/pci_debug.h>
+#include <asm/pci_dma.h>
 #include <asm/sclp.h>
 
 #include "pci_bus.h"
@@ -268,7 +269,7 @@ static void __zpci_event_error(struct zpci_ccdf_err *ccdf)
 	       pdev ? pci_name(pdev) : "n/a", ccdf->pec, ccdf->fid);
 
 	if (!pdev)
-		return;
+		goto no_pdev;
 
 	switch (ccdf->pec) {
 	case 0x003a: /* Service Action or Error Recovery Successful */
@@ -285,6 +286,8 @@ static void __zpci_event_error(struct zpci_ccdf_err *ccdf)
 		break;
 	}
 	pci_dev_put(pdev);
+no_pdev:
+	zpci_zdev_put(zdev);
 }
 
 void zpci_event_error(void *data)
@@ -293,85 +296,74 @@ void zpci_event_error(void *data)
 		__zpci_event_error(data);
 }
 
+static void zpci_event_hard_deconfigured(struct zpci_dev *zdev, u32 fh)
+{
+	zpci_update_fh(zdev, fh);
+	/* Give the driver a hint that the function is
+	 * already unusable.
+	 */
+	zpci_bus_remove_device(zdev, true);
+	/* Even though the device is already gone we still
+	 * need to free zPCI resources as part of the disable.
+	 */
+	if (zdev->dma_table)
+		zpci_dma_exit_device(zdev);
+	if (zdev_enabled(zdev))
+		zpci_disable_device(zdev);
+	zdev->state = ZPCI_FN_STATE_STANDBY;
+}
+
 static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
 {
 	struct zpci_dev *zdev = get_zdev_by_fid(ccdf->fid);
-	struct pci_dev *pdev = NULL;
+	bool existing_zdev = !!zdev;
 	enum zpci_state state;
-	int ret;
-
-	if (zdev && zdev->zbus->bus)
-		pdev = pci_get_slot(zdev->zbus->bus, zdev->devfn);
 
 	zpci_dbg(3, "avl fid:%x, fh:%x, pec:%x\n",
 		 ccdf->fid, ccdf->fh, ccdf->pec);
 	switch (ccdf->pec) {
 	case 0x0301: /* Reserved|Standby -> Configured */
 		if (!zdev) {
-			ret = clp_add_pci_device(ccdf->fid, ccdf->fh, 1);
-			break;
+			zdev = zpci_create_device(ccdf->fid, ccdf->fh, ZPCI_FN_STATE_CONFIGURED);
+			if (IS_ERR(zdev))
+				break;
+		} else {
+			/* the configuration request may be stale */
+			if (zdev->state != ZPCI_FN_STATE_STANDBY)
+				break;
+			zdev->state = ZPCI_FN_STATE_CONFIGURED;
 		}
-		/* the configuration request may be stale */
-		if (zdev->state != ZPCI_FN_STATE_STANDBY)
-			break;
-		zdev->fh = ccdf->fh;
-		zdev->state = ZPCI_FN_STATE_CONFIGURED;
-		ret = zpci_enable_device(zdev);
-		if (ret)
-			break;
-
-		/* the PCI function will be scanned once function 0 appears */
-		if (!zdev->zbus->bus)
-			break;
-
-		pdev = pci_scan_single_device(zdev->zbus->bus, zdev->devfn);
-		if (!pdev)
-			break;
-
-		pci_bus_add_device(pdev);
-		pci_lock_rescan_remove();
-		pci_bus_add_devices(zdev->zbus->bus);
-		pci_unlock_rescan_remove();
+		zpci_scan_configured_device(zdev, ccdf->fh);
 		break;
 	case 0x0302: /* Reserved -> Standby */
-		if (!zdev) {
-			clp_add_pci_device(ccdf->fid, ccdf->fh, 0);
-			break;
-		}
-		zdev->fh = ccdf->fh;
+		if (!zdev)
+			zpci_create_device(ccdf->fid, ccdf->fh, ZPCI_FN_STATE_STANDBY);
+		else
+			zpci_update_fh(zdev, ccdf->fh);
 		break;
 	case 0x0303: /* Deconfiguration requested */
-		if (!zdev)
-			break;
-		if (pdev)
-			zpci_remove_device(zdev);
-
-		ret = zpci_disable_device(zdev);
-		if (ret)
-			break;
-
-		ret = sclp_pci_deconfigure(zdev->fid);
-		zpci_dbg(3, "deconf fid:%x, rc:%d\n", zdev->fid, ret);
-		if (!ret)
-			zdev->state = ZPCI_FN_STATE_STANDBY;
-
+		if (zdev) {
+			/* The event may have been queued before we confirgured
+			 * the device.
+			 */
+			if (zdev->state != ZPCI_FN_STATE_CONFIGURED)
+				break;
+			zpci_update_fh(zdev, ccdf->fh);
+			zpci_deconfigure_device(zdev);
+		}
 		break;
 	case 0x0304: /* Configured -> Standby|Reserved */
-		if (!zdev)
-			break;
-		if (pdev) {
-			/* Give the driver a hint that the function is
-			 * already unusable. */
-			pdev->error_state = pci_channel_io_perm_failure;
-			zpci_remove_device(zdev);
-		}
-
-		zdev->fh = ccdf->fh;
-		zpci_disable_device(zdev);
-		zdev->state = ZPCI_FN_STATE_STANDBY;
-		if (!clp_get_state(ccdf->fid, &state) &&
-		    state == ZPCI_FN_STATE_RESERVED) {
-			zpci_device_reserved(zdev);
+		if (zdev) {
+			/* The event may have been queued before we confirgured
+			 * the device.:
+			 */
+			if (zdev->state == ZPCI_FN_STATE_CONFIGURED)
+				zpci_event_hard_deconfigured(zdev, ccdf->fh);
+			/* The 0x0304 event may immediately reserve the device */
+			if (!clp_get_state(zdev->fid, &state) &&
+			    state == ZPCI_FN_STATE_RESERVED) {
+				zpci_device_reserved(zdev);
+			}
 		}
 		break;
 	case 0x0306: /* 0x308 or 0x302 for multiple devices */
@@ -386,6 +378,8 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
 	default:
 		break;
 	}
+	if (existing_zdev)
+		zpci_zdev_put(zdev);
 }
 
 void zpci_event_availability(void *data)

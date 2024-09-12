@@ -764,7 +764,8 @@ static void __make_buffer_clean(struct dm_buffer *b)
 {
 	BUG_ON(b->hold_count);
 
-	if (!b->state)	/* fast case */
+	/* smp_load_acquire() pairs with read_endio()'s smp_mb__before_atomic() */
+	if (!smp_load_acquire(&b->state))	/* fast case */
 		return;
 
 	wait_on_bit_io(&b->state, B_READING, TASK_UNINTERRUPTIBLE);
@@ -785,7 +786,7 @@ static struct dm_buffer *__get_unclaimed_buffer(struct dm_bufio_client *c)
 		BUG_ON(test_bit(B_DIRTY, &b->state));
 
 		if (static_branch_unlikely(&no_sleep_enabled) && c->no_sleep &&
-		    unlikely(test_bit(B_READING, &b->state)))
+		    unlikely(test_bit_acquire(B_READING, &b->state)))
 			continue;
 
 		if (!b->hold_count) {
@@ -1027,7 +1028,7 @@ found_buffer:
 	 * If the user called both dm_bufio_prefetch and dm_bufio_get on
 	 * the same buffer, it would deadlock if we waited.
 	 */
-	if (nf == NF_GET && unlikely(test_bit(B_READING, &b->state)))
+	if (nf == NF_GET && unlikely(test_bit_acquire(B_READING, &b->state)))
 		return NULL;
 
 	b->hold_count++;
@@ -1187,7 +1188,7 @@ void dm_bufio_release(struct dm_buffer *b)
 		 * invalid buffer.
 		 */
 		if ((b->read_error || b->write_error) &&
-		    !test_bit(B_READING, &b->state) &&
+		    !test_bit_acquire(B_READING, &b->state) &&
 		    !test_bit(B_WRITING, &b->state) &&
 		    !test_bit(B_DIRTY, &b->state)) {
 			__unlink_buffer(b);
@@ -1437,7 +1438,8 @@ void dm_bufio_forget(struct dm_bufio_client *c, sector_t block)
 	dm_bufio_lock(c);
 
 	b = __find(c, block);
-	if (b && likely(!b->hold_count) && likely(!b->state)) {
+	if (b && likely(!b->hold_count) &&
+	    likely(!smp_load_acquire(&b->state))) {
 		__unlink_buffer(b);
 		__free_buffer_wake(b);
 	}
@@ -1557,7 +1559,7 @@ static bool __try_evict_buffer(struct dm_buffer *b, gfp_t gfp)
 {
 	if (!(gfp & __GFP_FS) ||
 	    (static_branch_unlikely(&no_sleep_enabled) && b->c->no_sleep)) {
-		if (test_bit(B_READING, &b->state) ||
+		if (test_bit_acquire(B_READING, &b->state) ||
 		    test_bit(B_WRITING, &b->state) ||
 		    test_bit(B_DIRTY, &b->state))
 			return false;
@@ -1654,7 +1656,8 @@ static unsigned long dm_bufio_shrink_count(struct shrinker *shrink, struct shrin
 struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsigned block_size,
 					       unsigned reserved_buffers, unsigned aux_size,
 					       void (*alloc_callback)(struct dm_buffer *),
-					       void (*write_callback)(struct dm_buffer *))
+					       void (*write_callback)(struct dm_buffer *),
+					       unsigned int flags)
 {
 	int r;
 	struct dm_bufio_client *c;

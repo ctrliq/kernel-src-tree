@@ -749,7 +749,7 @@ static int iwl_mvm_d3_reprogram(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
 	/* add back the MAC */
 	mvmvif->uploaded = false;
 
-	if (WARN_ON(!vif->bss_conf.assoc))
+	if (WARN_ON(!vif->cfg.assoc))
 		return -EINVAL;
 
 	ret = iwl_mvm_mac_ctxt_add(mvm, vif);
@@ -915,7 +915,7 @@ iwl_mvm_get_wowlan_config(struct iwl_mvm *mvm,
 	/* TODO: wowlan_config_cmd->wowlan_ba_teardown_tids */
 
 	wowlan_config_cmd->is_11n_connection =
-					ap_sta->ht_cap.ht_supported;
+					ap_sta->deflink.ht_cap.ht_supported;
 	wowlan_config_cmd->flags = ENABLE_L3_FILTERING |
 		ENABLE_NBNS_FILTERING | ENABLE_DHCP_FILTERING;
 

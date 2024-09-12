@@ -11,10 +11,11 @@
 #include <asm/asm-offsets.h>
 #include <asm/thread_info.h>
 #include <asm/cpufeatures.h>
-#include <asm/alternative-asm.h>
+#include <asm/alternative.h>
 #include <asm/asm.h>
 #include <asm/smap.h>
 #include <asm/export.h>
+#include <asm/trapnr.h>
 
 .macro ALIGN_DESTINATION
 	/* check for bad alignment of destination */
@@ -104,7 +105,7 @@ SYM_FUNC_START(copy_user_generic_unrolled)
 	jnz 21b
 23:	xor %eax,%eax
 	ASM_CLAC
-	ret
+	RET
 
 	.section .fixup,"ax"
 30:	shll $6,%ecx
@@ -172,7 +173,7 @@ SYM_FUNC_START(copy_user_generic_string)
 	movsb
 	xorl %eax,%eax
 	ASM_CLAC
-	ret
+	RET
 
 	.section .fixup,"ax"
 11:	leal (%rdx,%rcx,8),%ecx
@@ -206,7 +207,7 @@ SYM_FUNC_START(copy_user_enhanced_fast_string)
 	movsb
 	xorl %eax,%eax
 	ASM_CLAC
-	ret
+	RET
 
 	.section .fixup,"ax"
 12:	movl %ecx,%edx		/* ecx is zerorest also */
@@ -223,6 +224,7 @@ EXPORT_SYMBOL(copy_user_enhanced_fast_string)
  * it is not necessary to optimize tail handling.
  *
  * Input:
+ * eax trap number written by ex_handler_copy()
  * rdi destination
  * rsi source
  * rdx count
@@ -232,11 +234,19 @@ EXPORT_SYMBOL(copy_user_enhanced_fast_string)
  */
 ALIGN;
 .Lcopy_user_handle_tail:
+	cmp $X86_TRAP_MC,%eax
+	je 3f
+
 	movl %edx,%ecx
 1:	rep movsb
 2:	mov %ecx,%eax
 	ASM_CLAC
-	ret
+	RET
+
+3:
+	movl %edx,%eax
+	ASM_CLAC
+	RET
 
 	_ASM_EXTABLE_UA(1b, 2b)
 END(.Lcopy_user_handle_tail)
@@ -347,7 +357,7 @@ SYM_FUNC_START(__copy_user_nocache)
 	xorl %eax,%eax
 	ASM_CLAC
 	sfence
-	ret
+	RET
 
 	.section .fixup,"ax"
 .L_fixup_4x8b_copy:

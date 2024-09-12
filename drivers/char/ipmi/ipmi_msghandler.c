@@ -2149,7 +2149,8 @@ static int i_ipmi_req_ipmb_direct(struct ipmi_smi        *intf,
 		return -EINVAL;
 	}
 
-	smi_msg->type = IPMI_SMI_MSG_TYPE_IPMB_DIRECT;
+	if (RH_KABI_AUX(smi_msg, ipmi_smi_msg, type))
+		smi_msg->_rh.type = IPMI_SMI_MSG_TYPE_IPMB_DIRECT;
 	smi_msg->msgid = msgid;
 
 	if (is_cmd) {
@@ -4561,7 +4562,9 @@ return_unspecified:
 		msg->rsp[1] = msg->data[1];
 		msg->rsp[2] = IPMI_ERR_UNSPECIFIED;
 		msg->rsp_size = 3;
-	} else if (msg->type == IPMI_SMI_MSG_TYPE_IPMB_DIRECT) {
+
+	} else if ((RH_KABI_AUX(msg, ipmi_smi_msg, type))
+	       && (msg->_rh.type == IPMI_SMI_MSG_TYPE_IPMB_DIRECT)) {
 		/* commands must have at least 4 bytes, responses 5. */
 		if (is_cmd && (msg->rsp_size < 4)) {
 			ipmi_inc_stat(intf, invalid_commands);
@@ -4637,7 +4640,8 @@ return_unspecified:
 		goto return_unspecified;
 	}
 
-	if (msg->type == IPMI_SMI_MSG_TYPE_IPMB_DIRECT) {
+	if ((RH_KABI_AUX(msg, ipmi_smi_msg, type))
+	&& (msg->_rh.type == IPMI_SMI_MSG_TYPE_IPMB_DIRECT)) {
 		if ((msg->data[0] >> 2) & 1) {
 			/* It's a response to a sent response. */
 			chan = 0;
@@ -5152,9 +5156,12 @@ struct ipmi_smi_msg *ipmi_alloc_smi_msg(void)
 	if (rv) {
 		rv->done = free_smi_msg;
 		rv->user_data = NULL;
-		rv->type = IPMI_SMI_MSG_TYPE_NORMAL;
+		if (RH_KABI_AUX(rv, ipmi_smi_msg, type))
+			rv->_rh.type = IPMI_SMI_MSG_TYPE_NORMAL;
 		atomic_inc(&smi_msg_inuse_count);
+		RH_KABI_AUX_SET_SIZE(rv, ipmi_smi_msg);
 	}
+
 	return rv;
 }
 EXPORT_SYMBOL(ipmi_alloc_smi_msg);

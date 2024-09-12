@@ -95,9 +95,6 @@ static void __blkg_release(struct rcu_head *rcu)
 	css_put(&blkg->blkcg->css);
 	if (blkg->parent)
 		blkg_put(blkg->parent);
-
-	wb_congested_put(blkg->wb_congested);
-
 	blkg_free(blkg);
 }
 
@@ -236,7 +233,6 @@ static struct blkcg_gq *blkg_create(struct blkcg *blkcg,
 				    struct blkcg_gq *new_blkg)
 {
 	struct blkcg_gq *blkg;
-	struct bdi_writeback_congested *wb_congested;
 	int i, ret;
 
 	WARN_ON_ONCE(!rcu_read_lock_held());
@@ -254,31 +250,22 @@ static struct blkcg_gq *blkg_create(struct blkcg *blkcg,
 		goto err_free_blkg;
 	}
 
-	wb_congested = wb_congested_get_create(q->backing_dev_info,
-					       blkcg->css.id,
-					       GFP_NOWAIT | __GFP_NOWARN);
-	if (!wb_congested) {
-		ret = -ENOMEM;
-		goto err_put_css;
-	}
-
 	/* allocate */
 	if (!new_blkg) {
 		new_blkg = blkg_alloc(blkcg, q, GFP_NOWAIT | __GFP_NOWARN);
 		if (unlikely(!new_blkg)) {
 			ret = -ENOMEM;
-			goto err_put_congested;
+			goto err_put_css;
 		}
 	}
 	blkg = new_blkg;
-	blkg->wb_congested = wb_congested;
 
 	/* link parent */
 	if (blkcg_parent(blkcg)) {
 		blkg->parent = __blkg_lookup(blkcg_parent(blkcg), q, false);
 		if (WARN_ON_ONCE(!blkg->parent)) {
 			ret = -ENODEV;
-			goto err_put_congested;
+			goto err_put_css;
 		}
 		blkg_get(blkg->parent);
 	}
@@ -315,8 +302,6 @@ static struct blkcg_gq *blkg_create(struct blkcg *blkcg,
 	blkg_put(blkg);
 	return ERR_PTR(ret);
 
-err_put_congested:
-	wb_congested_put(wb_congested);
 err_put_css:
 	css_put(&blkcg->css);
 err_free_blkg:
@@ -1872,7 +1857,7 @@ EXPORT_SYMBOL_GPL(bio_associate_blkg_from_css);
 void bio_clone_blkg_association(struct bio *dst, struct bio *src)
 {
 	if (src->bi_blkg)
-		bio_associate_blkg_from_css(dst, bio_blkcg_css(src));
+		bio_associate_blkg_from_css(dst, &bio_blkcg(src)->css);
 }
 EXPORT_SYMBOL_GPL(bio_clone_blkg_association);
 

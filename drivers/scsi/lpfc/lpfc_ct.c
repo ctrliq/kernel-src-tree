@@ -1534,7 +1534,7 @@ lpfc_cmpl_ct_cmd_gft_id(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	struct lpfc_sli_ct_request *CTrsp;
 	int did;
 	struct lpfc_nodelist *ndlp = NULL;
-	struct lpfc_nodelist *ns_ndlp = NULL;
+	struct lpfc_nodelist *ns_ndlp = cmdiocb->context_un.ndlp;
 	uint32_t fc4_data_0, fc4_data_1;
 
 	did = ((struct lpfc_sli_ct_request *)inp->virt)->un.gft.PortId;
@@ -1545,14 +1545,11 @@ lpfc_cmpl_ct_cmd_gft_id(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 			      irsp->ulpStatus, irsp->un.ulpWord[4], did);
 
 	/* Ignore response if link flipped after this request was made */
-	if ((uint32_t) cmdiocb->event_tag != phba->fc_eventTag) {
+	if ((uint32_t)cmdiocb->event_tag != phba->fc_eventTag) {
 		lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
 				 "9046 Event tag mismatch. Ignoring NS rsp\n");
 		goto out;
 	}
-
-	/* Preserve the nameserver node to release the reference. */
-	ns_ndlp = cmdiocb->context_un.ndlp;
 
 	if (irsp->ulpStatus == IOSTAT_SUCCESS) {
 		/* Good status, continue checking */
@@ -3245,7 +3242,7 @@ lpfc_fdmi_cmd(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	INIT_LIST_HEAD(&bmp->list);
 
 	/* mbuf buffers are 1K in length - aka LPFC_BPL_SIZE */
-	memset(rq->virt, 0, LPFC_BPL_SIZE);
+	memset(mp->virt, 0, LPFC_BPL_SIZE);
 	rsp_size = LPFC_BPL_SIZE;
 
 	/* FDMI request */
@@ -3596,7 +3593,7 @@ lpfc_cmpl_ct_cmd_vmid(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	struct lpfc_sli_ct_request *ctrsp = outp->virt;
 	u16 rsp = ctrsp->CommandResponse.bits.CmdRsp;
 	struct app_id_object *app;
-	struct lpfc_nodelist *ndlp = cmdiocb->ndlp;
+	struct lpfc_nodelist *ndlp = cmdiocb->context_un.ndlp;
 	u32 cmd, hash, bucket;
 	struct lpfc_vmid *vmp, *cur;
 	u8 *data = outp->virt;

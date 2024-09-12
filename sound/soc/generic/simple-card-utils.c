@@ -518,7 +518,7 @@ static inline int asoc_simple_component_is_codec(struct snd_soc_component *compo
 	return component->driver->endianness;
 }
 
-static int asoc_simple_init_dai_link_params(struct snd_soc_pcm_runtime *rtd,
+static int asoc_simple_init_for_codec2codec(struct snd_soc_pcm_runtime *rtd,
 					    struct simple_dai_props *dai_props)
 {
 	struct snd_soc_dai_link *dai_link = rtd->dai_link;
@@ -588,7 +588,7 @@ int asoc_simple_dai_init(struct snd_soc_pcm_runtime *rtd)
 			return ret;
 	}
 
-	ret = asoc_simple_init_dai_link_params(rtd, props);
+	ret = asoc_simple_init_for_codec2codec(rtd, props);
 	if (ret < 0)
 		return ret;
 
@@ -733,9 +733,8 @@ int asoc_simple_init_jack(struct snd_soc_card *card,
 		sjack->gpio.invert	= !!(flags & OF_GPIO_ACTIVE_LOW);
 		sjack->gpio.debounce_time = 150;
 
-		snd_soc_card_jack_new(card, pin_name, mask,
-				      &sjack->jack,
-				      &sjack->pin, 1);
+		snd_soc_card_jack_new_pins(card, pin_name, mask, &sjack->jack,
+					   &sjack->pin, 1);
 
 		snd_soc_jack_add_gpios(&sjack->jack, 1,
 				       &sjack->gpio);

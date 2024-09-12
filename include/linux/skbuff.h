@@ -40,6 +40,7 @@
 #include <linux/in6.h>
 #include <linux/if_packet.h>
 #include <net/flow.h>
+#include <net/dropreason.h>
 
 #include <linux/rh_kabi.h>
 
@@ -310,30 +311,6 @@ struct sk_buff_head {
 };
 
 struct sk_buff;
-
-/* The reason of skb drop, which is used in kfree_skb_reason().
- * en...maybe they should be splited by group?
- *
- * Each item here should also be in 'TRACE_SKB_DROP_REASON', which is
- * used to translate the reason to string.
- */
-enum skb_drop_reason {
-	SKB_DROP_REASON_NOT_SPECIFIED,
-	SKB_DROP_REASON_MAX,
-};
-
-#define SKB_DR_INIT(name, reason)				\
-	enum skb_drop_reason name = SKB_DROP_REASON_##reason
-#define SKB_DR(name)						\
-	SKB_DR_INIT(name, NOT_SPECIFIED)
-#define SKB_DR_SET(name, reason)				\
-	(name = SKB_DROP_REASON_##reason)
-#define SKB_DR_OR(name, reason)					\
-	do {							\
-		if (name == SKB_DROP_REASON_NOT_SPECIFIED ||	\
-		    name == SKB_NOT_DROPPED_YET)		\
-			SKB_DR_SET(name, reason);		\
-	} while (0)
 
 /* To allow 64K frame to be packed as single skb without frag_list we
  * require 64K/PAGE_SIZE pages plus 1 additional page to allow for
@@ -1116,21 +1093,17 @@ static inline bool skb_unref(struct sk_buff *skb)
 	return true;
 }
 
-void kfree_skb_reason(struct sk_buff *skb, enum skb_drop_reason reason);
-
-/**
- *	kfree_skb - free an sk_buff with 'NOT_SPECIFIED' reason
- *	@skb: buffer to free
- */
-static inline void kfree_skb(struct sk_buff *skb)
-{
-	kfree_skb_reason(skb, SKB_DROP_REASON_NOT_SPECIFIED);
-}
+void __fix_address
+kfree_skb_reason(struct sk_buff *skb, enum skb_drop_reason reason);
 
 void skb_release_head_state(struct sk_buff *skb);
+void kfree_skb(struct sk_buff *skb);
 void kfree_skb_list(struct sk_buff *segs);
+void kfree_skb_list_reason(struct sk_buff *segs,
+			   enum skb_drop_reason reason);
 void skb_dump(const char *level, const struct sk_buff *skb, bool full_pkt);
 void skb_tx_error(struct sk_buff *skb);
+
 void consume_skb(struct sk_buff *skb);
 void __consume_stateless_skb(struct sk_buff *skb);
 void  __kfree_skb(struct sk_buff *skb);
@@ -3649,8 +3622,7 @@ struct sk_buff *__skb_recv_datagram(struct sock *sk,
 				    void (*destructor)(struct sock *sk,
 						       struct sk_buff *skb),
 				    int *off, int *err);
-struct sk_buff *skb_recv_datagram(struct sock *sk, unsigned flags, int noblock,
-				  int *err);
+struct sk_buff *skb_recv_datagram(struct sock *sk, unsigned int flags, int *err);
 __poll_t datagram_poll(struct file *file, struct socket *sock,
 			   struct poll_table_struct *wait);
 int skb_copy_datagram_iter(const struct sk_buff *from, int offset,

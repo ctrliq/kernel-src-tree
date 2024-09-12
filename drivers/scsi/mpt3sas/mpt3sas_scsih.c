@@ -5179,8 +5179,9 @@ scsih_qcmd(struct Scsi_Host *shost, struct scsi_cmnd *scmd)
 	if (handle == MPT3SAS_INVALID_DEVICE_HANDLE || sas_device_priv_data->block) {
 		if (scmd->device->host->shost_state == SHOST_RECOVERY &&
 		    scmd->cmnd[0] == TEST_UNIT_READY) {
-			scsi_build_sense(scmd, 0, UNIT_ATTENTION, 0x29, 0x07);
-			scsi_done(scmd);
+			scsi_build_sense_buffer(0, scmd->sense_buffer, UNIT_ATTENTION, 0x29, 0x07);
+			scmd->result = SAM_STAT_CHECK_CONDITION;
+			scmd->scsi_done(scmd);
 			return 0;
 		}
 	}
@@ -11975,7 +11976,7 @@ static struct scsi_host_template mpt3sas_driver_template = {
 	.this_id			= -1,
 	.sg_tablesize			= MPT3SAS_SG_DEPTH,
 	.max_sectors			= 32767,
-	.cmd_per_lun			= 7,
+	.cmd_per_lun			= 128,
 	.use_clustering			= ENABLE_CLUSTERING,
 	.shost_attrs			= mpt3sas_host_attrs,
 	.sdev_attrs			= mpt3sas_dev_attrs,
@@ -12064,6 +12065,7 @@ _scsih_determine_hba_mpi_version(struct pci_dev *pdev)
 	return 0;
 }
 
+#ifdef CONFIG_RHEL_DIFFERENCES
 static const struct pci_device_id rh_deprecated_pci_table[] = {
 	/* Thunderbolt ~ 2208 */
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI2_MFGPAGE_DEVID_SAS2208_1,
@@ -12120,6 +12122,7 @@ static const struct pci_device_id rh_disabled_pci_table[] = {
 
 	{0}     /* Terminating entry */
 };
+#endif
 
 /**
  * _scsih_probe - attach and add scsi host
@@ -12136,11 +12139,13 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	int rv;
 	u16 hba_mpi_version;
 
+#ifdef CONFIG_RHEL_DIFFERENCES
 	if (pci_hw_disabled(rh_disabled_pci_table, pdev))
 		return -ENODEV;
 
 	pci_hw_deprecated(rh_deprecated_pci_table, pdev);
 	pci_hw_unmaintained(rh_unmaintained_pci_table, pdev);
+#endif
 
 	/* Determine in which MPI version class this pci device belongs */
 	hba_mpi_version = _scsih_determine_hba_mpi_version(pdev);

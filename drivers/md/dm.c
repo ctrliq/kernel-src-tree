@@ -477,7 +477,7 @@ out:
 static int dm_prepare_ioctl(struct mapped_device *md, int *srcu_idx,
 			    struct block_device **bdev)
 {
-	struct dm_target *tgt;
+	struct dm_target *ti;
 	struct dm_table *map;
 	int r;
 
@@ -488,17 +488,17 @@ retry:
 		return r;
 
 	/* We only support devices that have a single target */
-	if (dm_table_get_num_targets(map) != 1)
+	if (map->num_targets != 1)
 		return r;
 
-	tgt = dm_table_get_target(map, 0);
-	if (!tgt->type->prepare_ioctl)
+	ti = dm_table_get_target(map, 0);
+	if (!ti->type->prepare_ioctl)
 		return r;
 
 	if (dm_suspended_md(md))
 		return -EAGAIN;
 
-	r = tgt->type->prepare_ioctl(tgt, bdev);
+	r = ti->type->prepare_ioctl(ti, bdev);
 	if (r == -ENOTCONN && !fatal_signal_pending(current)) {
 		dm_put_live_table(md, *srcu_idx);
 		msleep(10);
@@ -903,7 +903,7 @@ int dm_set_geometry(struct mapped_device *md, struct hd_geometry *geo)
 	sector_t sz = (sector_t)geo->cylinders * geo->heads * geo->sectors;
 
 	if (geo->start > sz) {
-		DMWARN("Start sector is beyond the geometry limits.");
+		DMERR("Start sector is beyond the geometry limits.");
 		return -EINVAL;
 	}
 
@@ -1084,7 +1084,7 @@ static void clone_endio(struct bio *bio)
 			/* The target will handle the io */
 			return;
 		default:
-			DMWARN("unimplemented target endio return value: %d", r);
+			DMCRIT("unimplemented target endio return value: %d", r);
 			BUG();
 		}
 	}
@@ -1428,7 +1428,7 @@ static blk_qc_t __map_bio(struct bio *clone)
 			dm_io_dec_pending(io, BLK_STS_DM_REQUEUE);
 		break;
 	default:
-		DMWARN("unimplemented target map return value: %d", r);
+		DMCRIT("unimplemented target map return value: %d", r);
 		BUG();
 	}
 
@@ -1490,11 +1490,11 @@ static void alloc_multiple_bios(struct bio_list *blist, struct clone_info *ci,
 }
 
 static int __send_duplicate_bios(struct clone_info *ci, struct dm_target *ti,
-				  unsigned num_bios, unsigned *len)
+				 unsigned int num_bios, unsigned *len)
 {
 	struct bio_list blist = BIO_EMPTY_LIST;
 	struct bio *clone;
-	int ret = 0;
+	unsigned int ret = 0;
 
 	switch (num_bios) {
 	case 0:
@@ -1522,8 +1522,8 @@ static int __send_duplicate_bios(struct clone_info *ci, struct dm_target *ti,
 
 static void __send_empty_flush(struct clone_info *ci)
 {
-	unsigned target_nr = 0;
-	struct dm_target *ti;
+	unsigned int i;
+	struct dm_table *t = ci->map;
 	struct bio flush_bio;
 
 	/*
@@ -1546,8 +1546,9 @@ static void __send_empty_flush(struct clone_info *ci)
 	 */
 	bio_set_dev(ci->bio, ci->io->md->bdev);
 
-	while ((ti = dm_table_get_target(ci->map, target_nr++))) {
-		int bios;
+	for (i = 0; i < t->num_targets; i++) {
+		unsigned int bios;
+		struct dm_target *ti = dm_table_get_target(t, i);
 
 		atomic_add(ti->num_flush_bios, &ci->io->io_count);
 		bios = __send_duplicate_bios(ci, ti, ti->num_flush_bios, NULL);
@@ -1572,7 +1573,7 @@ static void __send_changing_extent_only(struct clone_info *ci, struct dm_target 
 					unsigned num_bios, bool is_split_required)
 {
 	unsigned len;
-	int bios;
+	unsigned int bios;
 
 	if (!is_split_required)
 		len = min_t(sector_t, ci->sector_count,
@@ -1782,7 +1783,7 @@ static int dm_any_congested(void *congested_data, int bdi_bits)
 			 * top-level queue for congestion.
 			 */
 			struct backing_dev_info *bdi = md->queue->backing_dev_info;
-			r = bdi->wb.congested->state & bdi_bits;
+			r = bdi->wb.congested & bdi_bits;
 		} else {
 			map = dm_get_live_table_fast(md);
 			if (map)
@@ -1902,7 +1903,7 @@ static struct mapped_device *alloc_dev(int minor)
 
 	md = kvzalloc_node(sizeof(*md), GFP_KERNEL, numa_node_id);
 	if (!md) {
-		DMWARN("unable to allocate device, out of memory.");
+		DMERR("unable to allocate device, out of memory.");
 		return NULL;
 	}
 
@@ -3045,7 +3046,7 @@ static int dm_call_pr(struct block_device *bdev, iterate_devices_callout_fn fn,
 		goto out;
 
 	/* We only support devices that have a single target */
-	if (dm_table_get_num_targets(table) != 1)
+	if (table->num_targets != 1)
 		goto out;
 	ti = dm_table_get_target(table, 0);
 

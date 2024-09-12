@@ -34,6 +34,9 @@
 #
 # server / client nomenclature relative to ns-A
 
+# Kselftest framework requirement - SKIP code is 4.
+ksft_skip=4
+
 VERBOSE=0
 
 NSA_DEV=eth1
@@ -645,7 +648,7 @@ ipv4_ping_vrf()
 		log_start
 		show_hint "Fails since address on vrf device is out of device scope"
 		run_cmd ping -c1 -w1 -I ${NSA_DEV} ${a}
-		log_test_addr ${a} $? 1 "ping local, device bind"
+		log_test_addr ${a} $? 2 "ping local, device bind"
 	done
 
 	#
@@ -3402,7 +3405,7 @@ fi
 which nettest >/dev/null
 if [ $? -ne 0 ]; then
 	echo "'nettest' command not found; skipping tests"
-	exit 0
+	exit $ksft_skip
 fi
 
 declare -i nfail=0

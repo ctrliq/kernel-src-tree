@@ -15,6 +15,7 @@
 #include <linux/gfp.h>
 #include <linux/pci.h>
 #include <linux/vmalloc.h>
+#include <linux/cc_platform.h>
 
 #include <asm/e820/api.h>
 #include <asm/processor.h>
@@ -1952,7 +1953,7 @@ static int __set_memory_enc_pgtable(unsigned long addr, int numpages, bool enc)
 	int ret;
 
 	/* Nothing to do if memory encryption is not active */
-	if (!mem_encrypt_active())
+	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT))
 		return 0;
 
 	/* Should not be working on unaligned addresses */
@@ -1986,6 +1987,12 @@ static int __set_memory_enc_pgtable(unsigned long addr, int numpages, bool enc)
 	 */
 	cpa_flush(&cpa, 0);
 
+	/*
+	 * Notify hypervisor that a given memory range is mapped encrypted
+	 * or decrypted.
+	 */
+	notify_range_enc_status_changed(addr, numpages, enc);
+
 	return ret;
 }
 
@@ -1994,7 +2001,7 @@ static int __set_memory_enc_dec(unsigned long addr, int numpages, bool enc)
 	if (hv_is_isolation_supported())
 		return hv_set_mem_host_visibility(addr, numpages, !enc);
 
-	if (mem_encrypt_active())
+	if (cc_platform_has(CC_ATTR_MEM_ENCRYPT))
 		return __set_memory_enc_pgtable(addr, numpages, enc);
 
 	return 0;

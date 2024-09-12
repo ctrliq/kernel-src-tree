@@ -52,7 +52,10 @@ SECTIONS
 		KEEP(*(.dma.ex_table))
 		_stop_dma_ex_table = .;
 	}
-	.dma.data : { *(.dma.data) }
+	.dma.data : {
+		*(.dma.data)
+	}
+
 	_edma = .;
 
 	BOOT_DATA
@@ -79,7 +82,18 @@ SECTIONS
 		*(.vmlinux.bin.compressed)
 		_compressed_end = .;
 	}
-	. = ALIGN(256);
+
+#define SB_TRAILER_SIZE 32
+	/* Trailer needed for Secure Boot */
+	. += SB_TRAILER_SIZE; /* make sure .sb.trailer does not overwrite the previous section */
+	. = ALIGN(4096) - SB_TRAILER_SIZE;
+	.sb.trailer : {
+		QUAD(0)
+		QUAD(0)
+		QUAD(0)
+		QUAD(0x000000207a49504c)
+	}
+
 	.bss : {
 		_bss = . ;
 		*(.bss)

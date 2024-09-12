@@ -150,6 +150,15 @@
 #define CRYPTO_ALG_ALLOCATES_MEMORY	0x00010000
 
 /*
+ * Mark an algorithm as a service implementation only usable by a
+ * template and never by a normal user of the kernel crypto API.
+ * This is intended to be used by algorithms that are themselves
+ * not FIPS-approved but may instead be used to implement parts of
+ * a FIPS-approved algorithm (e.g., dh vs. ffdhe2048(dh)).
+ */
+#define CRYPTO_ALG_FIPS_INTERNAL	0x00020000
+
+/*
  * Transform masks and values (for crt_flags).
  */
 #define CRYPTO_TFM_NEED_KEY		0x00000001
@@ -160,11 +169,14 @@
 #define CRYPTO_TFM_REQ_WEAK_KEY		0x00000100
 #define CRYPTO_TFM_REQ_MAY_SLEEP	0x00000200
 #define CRYPTO_TFM_REQ_MAY_BACKLOG	0x00000400
+#define CRYPTO_TFM_REQ_NEED_RESEED	0x00000800
 #define CRYPTO_TFM_RES_WEAK_KEY		0x00100000
 #define CRYPTO_TFM_RES_BAD_KEY_LEN   	0x00200000
 #define CRYPTO_TFM_RES_BAD_KEY_SCHED 	0x00400000
 #define CRYPTO_TFM_RES_BAD_BLOCK_LEN 	0x00800000
 #define CRYPTO_TFM_RES_BAD_FLAGS 	0x01000000
+
+#define CRYPTO_TFM_FIPS_COMPLIANCE	0x80000000
 
 /*
  * Miscellaneous stuff.

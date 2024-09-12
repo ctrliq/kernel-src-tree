@@ -168,7 +168,15 @@ struct iommu_resv_region {
 	size_t			length;
 	int			prot;
 	enum iommu_resv_type	type;
-	void (*free)(struct device *dev, struct iommu_resv_region *region);
+	RH_KABI_EXTEND(void (*free)(struct device *dev, struct iommu_resv_region *region))
+};
+
+struct iommu_iort_rmr_data {
+	struct iommu_resv_region rr;
+
+	/* Stream IDs associated with IORT RMR entry */
+	const u32 *sids;
+	u32 num_sids;
 };
 
 /**
@@ -215,7 +223,7 @@ struct iommu_iotlb_gather {
 	unsigned long		start;
 	unsigned long		end;
 	size_t			pgsize;
-	struct page		*freelist;
+	struct list_head	freelist;
 	bool			queued;
 };
 
@@ -292,15 +300,20 @@ struct iommu_ops {
 	RH_KABI_BROKEN_REPLACE(void (*iotlb_sync)(struct iommu_domain *domain),\
 			       void (*iotlb_sync)(struct iommu_domain *domain, \
 						  struct iommu_iotlb_gather *iotlb_gather))
+
 	phys_addr_t (*iova_to_phys)(struct iommu_domain *domain, dma_addr_t iova);
-	RH_KABI_BROKEN_REMOVE(int (*add_device)(struct device *dev))
-	RH_KABI_BROKEN_REMOVE(void (*remove_device)(struct device *dev))
+
+	RH_KABI_BROKEN_REMOVE_BLOCK(
+	int (*add_device)(struct device *dev);
+	void (*remove_device)(struct device *dev);
+	) /* RH_KABI_BROKEN_REMOVE_BLOCK */
+
 	struct iommu_group *(*device_group)(struct device *dev);
 
-	RH_KABI_BROKEN_REMOVE(int (*domain_get_attr)(struct iommu_domain *domain,\
-						     enum iommu_attr attr, void *data))
-	RH_KABI_BROKEN_REMOVE(int (*domain_set_attr)(struct iommu_domain *domain,\
-						     enum iommu_attr attr, void *data))
+	RH_KABI_BROKEN_REMOVE_BLOCK(
+        int (*domain_get_attr)(struct iommu_domain *domain, enum iommu_attr attr, void *data);
+	int (*domain_set_attr)(struct iommu_domain *domain, enum iommu_attr attr, void *data);
+	) /* RH_KABI_BROKEN_REMOVE_BLOCK */
 
 	/* Request/Free a list of reserved regions for a device */
 	void (*get_resv_regions)(struct device *dev, struct list_head *list);
@@ -309,12 +322,14 @@ struct iommu_ops {
 				  struct iommu_domain *domain,
 				  struct iommu_resv_region *region);
 
-	RH_KABI_BROKEN_REMOVE(int (*domain_window_enable)(struct iommu_domain *domain, u32 wnd_nr,\
-							  phys_addr_t paddr, u64 size, int prot))
+	RH_KABI_BROKEN_REMOVE_BLOCK(
+	int (*domain_window_enable)(struct iommu_domain *domain, u32 wnd_nr,
+				    phys_addr_t paddr, u64 size, int prot);
 
-	RH_KABI_BROKEN_REMOVE(void (*domain_window_disable)(struct iommu_domain *domain, u32 wnd_nr))
-	RH_KABI_BROKEN_REMOVE(int (*domain_set_windows)(struct iommu_domain *domain, u32 w_count))
-	RH_KABI_BROKEN_REMOVE(u32 (*domain_get_windows)(struct iommu_domain *domain))
+	void (*domain_window_disable)(struct iommu_domain *domain, u32 wnd_nr);
+	int (*domain_set_windows)(struct iommu_domain *domain, u32 w_count);
+	u32 (*domain_get_windows)(struct iommu_domain *domain);
+	) /* RH_KABI_BROKEN_REMOVE_BLOCK */
 
 	int (*of_xlate)(struct device *dev, struct of_phandle_args *args);
 	bool (*is_attach_deferred)(struct iommu_domain *domain, struct device *dev);
@@ -450,6 +465,7 @@ static inline void iommu_iotlb_gather_init(struct iommu_iotlb_gather *gather)
 {
 	*gather = (struct iommu_iotlb_gather) {
 		.start	= ULONG_MAX,
+		.freelist = LIST_HEAD_INIT(gather->freelist),
 	};
 }
 
@@ -554,8 +570,7 @@ int iommu_enable_nesting(struct iommu_domain *domain);
 int iommu_set_pgtable_quirks(struct iommu_domain *domain,
 		unsigned long quirks);
 
-void iommu_set_dma_strict(bool val);
-bool iommu_get_dma_strict(struct iommu_domain *domain);
+void iommu_set_dma_strict(void);
 
 extern int report_iommu_fault(struct iommu_domain *domain, struct device *dev,
 			      unsigned long iova, int flags);
@@ -644,6 +659,11 @@ static inline void iommu_iotlb_gather_add_page(struct iommu_domain *domain,
 
 	gather->pgsize = size;
 	iommu_iotlb_gather_add_range(gather, iova, size);
+}
+
+static inline bool iommu_iotlb_gather_queued(struct iommu_iotlb_gather *gather)
+{
+	return gather && gather->queued;
 }
 
 /* PCI device grouping function */
@@ -991,6 +1011,11 @@ static inline void iommu_iotlb_gather_add_page(struct iommu_domain *domain,
 					       struct iommu_iotlb_gather *gather,
 					       unsigned long iova, size_t size)
 {
+}
+
+static inline bool iommu_iotlb_gather_queued(struct iommu_iotlb_gather *gather)
+{
+	return false;
 }
 
 static inline void iommu_device_unregister(struct iommu_device *iommu)

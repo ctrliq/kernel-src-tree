@@ -17,6 +17,7 @@
 #include <linux/posix_acl.h>
 #include <linux/refcount.h>
 #include <linux/security.h>
+#include <linux/hashtable.h>
 
 #include <linux/ceph/libceph.h>
 
@@ -100,6 +101,8 @@ struct ceph_mount_options {
 	char *fscache_uniq;   /* default NULL */
 };
 
+#define CEPH_ASYNC_CREATE_CONFLICT_BITS 8
+
 struct ceph_fs_client {
 	struct super_block *sb;
 
@@ -123,6 +126,9 @@ struct ceph_fs_client {
 
 	struct workqueue_struct *inode_wq;
 	struct workqueue_struct *cap_wq;
+
+	DECLARE_HASHTABLE(async_unlink_conflict, CEPH_ASYNC_CREATE_CONFLICT_BITS);
+	spinlock_t async_unlink_conflict_lock;
 
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_dentry_lru, *debugfs_caps;
@@ -280,7 +286,8 @@ struct ceph_dentry_info {
 	struct dentry *dentry;
 	struct ceph_mds_session *lease_session;
 	struct list_head lease_list;
-	unsigned flags;
+	struct hlist_node hnode;
+	unsigned long flags;
 	int lease_shared_gen;
 	u32 lease_gen;
 	u32 lease_seq;
@@ -289,10 +296,14 @@ struct ceph_dentry_info {
 	u64 offset;
 };
 
-#define CEPH_DENTRY_REFERENCED		1
-#define CEPH_DENTRY_LEASE_LIST		2
-#define CEPH_DENTRY_SHRINK_LIST		4
-#define CEPH_DENTRY_PRIMARY_LINK	8
+#define CEPH_DENTRY_REFERENCED		(1 << 0)
+#define CEPH_DENTRY_LEASE_LIST		(1 << 1)
+#define CEPH_DENTRY_SHRINK_LIST		(1 << 2)
+#define CEPH_DENTRY_PRIMARY_LINK	(1 << 3)
+#define CEPH_DENTRY_ASYNC_UNLINK_BIT	(4)
+#define CEPH_DENTRY_ASYNC_UNLINK	(1 << CEPH_DENTRY_ASYNC_UNLINK_BIT)
+#define CEPH_DENTRY_ASYNC_CREATE_BIT	(5)
+#define CEPH_DENTRY_ASYNC_CREATE	(1 << CEPH_DENTRY_ASYNC_CREATE_BIT)
 
 struct ceph_inode_xattrs_info {
 	/*
@@ -1024,6 +1035,7 @@ static inline void ceph_queue_flush_snaps(struct inode *inode)
 	ceph_queue_inode_work(inode, CEPH_I_WORK_FLUSH_SNAPS);
 }
 
+extern int ceph_try_to_choose_auth_mds(struct inode *inode, int mask);
 extern int __ceph_do_getattr(struct inode *inode, struct page *locked_page,
 			     int mask, bool force);
 static inline int ceph_do_getattr(struct inode *inode, int mask, bool force)

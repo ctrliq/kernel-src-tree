@@ -3495,7 +3495,6 @@ static int sd_probe(struct device *dev)
  out_put:
 	put_disk(gd);
  out_free:
-	sd_zbc_release_disk(sdkp);
 	kfree(sdkp->aux);
 	kfree(sdkp);
  out:
@@ -3568,7 +3567,7 @@ static void scsi_disk_release(struct device *dev)
 	disk->private_data = NULL;
 	put_disk(disk);
 
-	sd_zbc_release_disk(sdkp);
+	sd_zbc_free_zone_info(sdkp);
 	put_device(&sdkp->device->sdev_gendev);
 
 	kfree(sdkp->aux);

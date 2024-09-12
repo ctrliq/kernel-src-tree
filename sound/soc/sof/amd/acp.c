@@ -433,7 +433,7 @@ int amd_sof_acp_suspend(struct snd_sof_dev *sdev, u32 target_state)
 
 	return 0;
 }
-EXPORT_SYMBOL_NS(amd_sof_acp_suspend, SND_SOC_SOF_AMD_COMMON);
+EXPORT_SYMBOL(amd_sof_acp_suspend);
 
 int amd_sof_acp_resume(struct snd_sof_dev *sdev)
 {
@@ -451,7 +451,7 @@ int amd_sof_acp_resume(struct snd_sof_dev *sdev)
 
 	return ret;
 }
-EXPORT_SYMBOL_NS(amd_sof_acp_resume, SND_SOC_SOF_AMD_COMMON);
+EXPORT_SYMBOL(amd_sof_acp_resume);
 
 int amd_sof_acp_probe(struct snd_sof_dev *sdev)
 {
@@ -513,7 +513,7 @@ int amd_sof_acp_probe(struct snd_sof_dev *sdev)
 
 	return 0;
 }
-EXPORT_SYMBOL_NS(amd_sof_acp_probe, SND_SOC_SOF_AMD_COMMON);
+EXPORT_SYMBOL(amd_sof_acp_probe);
 
 int amd_sof_acp_remove(struct snd_sof_dev *sdev)
 {
@@ -527,7 +527,7 @@ int amd_sof_acp_remove(struct snd_sof_dev *sdev)
 
 	return acp_reset(sdev);
 }
-EXPORT_SYMBOL_NS(amd_sof_acp_remove, SND_SOC_SOF_AMD_COMMON);
+EXPORT_SYMBOL(amd_sof_acp_remove);
 
 MODULE_DESCRIPTION("AMD ACP sof driver");
 MODULE_LICENSE("Dual BSD/GPL");

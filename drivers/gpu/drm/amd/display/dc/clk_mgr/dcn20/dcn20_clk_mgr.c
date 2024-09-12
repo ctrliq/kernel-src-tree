@@ -38,6 +38,7 @@
 #include "clk/clk_11_0_0_offset.h"
 #include "clk/clk_11_0_0_sh_mask.h"
 
+
 #undef FN
 #define FN(reg_name, field_name) \
 	clk_mgr->clk_mgr_shift->field_name, clk_mgr->clk_mgr_mask->field_name
@@ -125,15 +126,23 @@ void dcn20_update_clocks_update_dpp_dto(struct clk_mgr_internal *clk_mgr,
 
 void dcn20_update_clocks_update_dentist(struct clk_mgr_internal *clk_mgr, struct dc_state *context)
 {
-	int dpp_divider = DENTIST_DIVIDER_RANGE_SCALE_FACTOR
-			* clk_mgr->base.dentist_vco_freq_khz / clk_mgr->base.clks.dppclk_khz;
-	int disp_divider = DENTIST_DIVIDER_RANGE_SCALE_FACTOR
-			* clk_mgr->base.dentist_vco_freq_khz / clk_mgr->base.clks.dispclk_khz;
-
-	uint32_t dppclk_wdivider = dentist_get_did_from_divider(dpp_divider);
-	uint32_t dispclk_wdivider = dentist_get_did_from_divider(disp_divider);
+	int dpp_divider = 0;
+	int disp_divider = 0;
+	uint32_t dppclk_wdivider = 0;
+	uint32_t dispclk_wdivider = 0;
 	uint32_t current_dispclk_wdivider;
 	uint32_t i;
+
+	if (clk_mgr->base.clks.dppclk_khz == 0 || clk_mgr->base.clks.dispclk_khz == 0)
+		return;
+
+	dpp_divider = DENTIST_DIVIDER_RANGE_SCALE_FACTOR
+		* clk_mgr->base.dentist_vco_freq_khz / clk_mgr->base.clks.dppclk_khz;
+	disp_divider = DENTIST_DIVIDER_RANGE_SCALE_FACTOR
+		* clk_mgr->base.dentist_vco_freq_khz / clk_mgr->base.clks.dispclk_khz;
+
+	dppclk_wdivider = dentist_get_did_from_divider(dpp_divider);
+	dispclk_wdivider = dentist_get_did_from_divider(disp_divider);
 
 	REG_GET(DENTIST_DISPCLK_CNTL,
 			DENTIST_DISPCLK_WDIVIDER, &current_dispclk_wdivider);
@@ -253,20 +262,20 @@ void dcn2_update_clocks(struct clk_mgr *clk_mgr_base,
 	if (should_set_clock(safe_to_lower, new_clocks->dcfclk_khz, clk_mgr_base->clks.dcfclk_khz)) {
 		clk_mgr_base->clks.dcfclk_khz = new_clocks->dcfclk_khz;
 		if (pp_smu && pp_smu->set_hard_min_dcfclk_by_freq)
-			pp_smu->set_hard_min_dcfclk_by_freq(&pp_smu->pp_smu, clk_mgr_base->clks.dcfclk_khz / 1000);
+			pp_smu->set_hard_min_dcfclk_by_freq(&pp_smu->pp_smu, khz_to_mhz_ceil(clk_mgr_base->clks.dcfclk_khz));
 	}
 
 	if (should_set_clock(safe_to_lower,
 			new_clocks->dcfclk_deep_sleep_khz, clk_mgr_base->clks.dcfclk_deep_sleep_khz)) {
 		clk_mgr_base->clks.dcfclk_deep_sleep_khz = new_clocks->dcfclk_deep_sleep_khz;
 		if (pp_smu && pp_smu->set_min_deep_sleep_dcfclk)
-			pp_smu->set_min_deep_sleep_dcfclk(&pp_smu->pp_smu, clk_mgr_base->clks.dcfclk_deep_sleep_khz / 1000);
+			pp_smu->set_min_deep_sleep_dcfclk(&pp_smu->pp_smu, khz_to_mhz_ceil(clk_mgr_base->clks.dcfclk_deep_sleep_khz));
 	}
 
 	if (should_set_clock(safe_to_lower, new_clocks->socclk_khz, clk_mgr_base->clks.socclk_khz)) {
 		clk_mgr_base->clks.socclk_khz = new_clocks->socclk_khz;
 		if (pp_smu && pp_smu->set_hard_min_socclk_by_freq)
-			pp_smu->set_hard_min_socclk_by_freq(&pp_smu->pp_smu, clk_mgr_base->clks.socclk_khz / 1000);
+			pp_smu->set_hard_min_socclk_by_freq(&pp_smu->pp_smu, khz_to_mhz_ceil(clk_mgr_base->clks.socclk_khz));
 	}
 
 	total_plane_count = clk_mgr_helper_get_active_plane_cnt(dc, context);
@@ -281,7 +290,7 @@ void dcn2_update_clocks(struct clk_mgr *clk_mgr_base,
 	if (should_set_clock(safe_to_lower, new_clocks->dramclk_khz, clk_mgr_base->clks.dramclk_khz)) {
 		clk_mgr_base->clks.dramclk_khz = new_clocks->dramclk_khz;
 		if (pp_smu && pp_smu->set_hard_min_uclk_by_freq)
-			pp_smu->set_hard_min_uclk_by_freq(&pp_smu->pp_smu, clk_mgr_base->clks.dramclk_khz / 1000);
+			pp_smu->set_hard_min_uclk_by_freq(&pp_smu->pp_smu, khz_to_mhz_ceil(clk_mgr_base->clks.dramclk_khz));
 	}
 
 	if (should_set_clock(safe_to_lower, new_clocks->dppclk_khz, clk_mgr->base.clks.dppclk_khz)) {
@@ -306,7 +315,7 @@ void dcn2_update_clocks(struct clk_mgr *clk_mgr_base,
 
 		clk_mgr_base->clks.disp_dpp_voltage_level_khz = new_clocks->disp_dpp_voltage_level_khz;
 		if (pp_smu && pp_smu->set_voltage_by_freq)
-			pp_smu->set_voltage_by_freq(&pp_smu->pp_smu, PP_SMU_NV_DISPCLK, clk_mgr_base->clks.disp_dpp_voltage_level_khz / 1000);
+			pp_smu->set_voltage_by_freq(&pp_smu->pp_smu, PP_SMU_NV_DISPCLK, khz_to_mhz_ceil(clk_mgr_base->clks.disp_dpp_voltage_level_khz));
 	}
 
 	if (dc->config.forced_clocks == false || (force_reset && safe_to_lower)) {
@@ -399,7 +408,7 @@ void dcn2_init_clocks(struct clk_mgr *clk_mgr)
 	clk_mgr->clks.prev_p_state_change_support = true;
 }
 
-void dcn2_enable_pme_wa(struct clk_mgr *clk_mgr_base)
+static void dcn2_enable_pme_wa(struct clk_mgr *clk_mgr_base)
 {
 	struct clk_mgr_internal *clk_mgr = TO_CLK_MGR_INTERNAL(clk_mgr_base);
 	struct pp_smu_funcs_nv *pp_smu = NULL;
@@ -435,7 +444,6 @@ void dcn2_read_clocks_from_hw_dentist(struct clk_mgr *clk_mgr_base)
 		clk_mgr_base->clks.dppclk_khz = (DENTIST_DIVIDER_RANGE_SCALE_FACTOR
 				* clk_mgr->base.dentist_vco_freq_khz) / dpp_divider;
 	}
-
 }
 
 void dcn2_get_clock(struct clk_mgr *clk_mgr,
@@ -502,7 +510,7 @@ static void dcn2_notify_link_rate_change(struct clk_mgr *clk_mgr_base, struct dc
 
 	if (max_phyclk_req != clk_mgr_base->clks.phyclk_khz) {
 		clk_mgr_base->clks.phyclk_khz = max_phyclk_req;
-		pp_smu->set_voltage_by_freq(&pp_smu->pp_smu, PP_SMU_NV_PHYCLK, clk_mgr_base->clks.phyclk_khz / 1000);
+		pp_smu->set_voltage_by_freq(&pp_smu->pp_smu, PP_SMU_NV_PHYCLK, khz_to_mhz_ceil(clk_mgr_base->clks.phyclk_khz));
 	}
 }
 

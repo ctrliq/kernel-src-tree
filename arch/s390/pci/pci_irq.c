@@ -11,6 +11,7 @@
 
 #include <asm/isc.h>
 #include <asm/airq.h>
+#include <asm/tpi.h>
 
 static enum {FLOATING, DIRECTED} irq_delivery;
 
@@ -28,7 +29,7 @@ static struct airq_iv *zpci_sbv;
  */
 static struct airq_iv **zpci_ibv;
 
-/* Modify PCI: Register adapter interruptions */
+/* Modify PCI: Register floating adapter interruptions */
 static int zpci_set_airq(struct zpci_dev *zdev)
 {
 	u64 req = ZPCI_CREATE_REQ(zdev->fh, 0, ZPCI_MOD_FC_REG_INT);
@@ -42,16 +43,19 @@ static int zpci_set_airq(struct zpci_dev *zdev)
 	fib.fmt0.aibvo = 0;	/* each zdev has its own interrupt vector */
 	fib.fmt0.aisb = virt_to_phys(zpci_sbv->vector) + (zdev->aisb / 64) * 8;
 	fib.fmt0.aisbo = zdev->aisb & 63;
+	fib.gd = zdev->gisa;
 
 	return zpci_mod_fc(req, &fib, &status) ? -EIO : 0;
 }
 
-/* Modify PCI: Unregister adapter interruptions */
+/* Modify PCI: Unregister floating adapter interruptions */
 static int zpci_clear_airq(struct zpci_dev *zdev)
 {
 	u64 req = ZPCI_CREATE_REQ(zdev->fh, 0, ZPCI_MOD_FC_DEREG_INT);
 	struct zpci_fib fib = {0};
 	u8 cc, status;
+
+	fib.gd = zdev->gisa;
 
 	cc = zpci_mod_fc(req, &fib, &status);
 	if (cc == 3 || (cc == 1 && status == 24))
@@ -71,6 +75,7 @@ static int zpci_set_directed_irq(struct zpci_dev *zdev)
 	fib.fmt = 1;
 	fib.fmt1.noi = zdev->msi_nr_irqs;
 	fib.fmt1.dibvo = zdev->msi_first_bit;
+	fib.gd = zdev->gisa;
 
 	return zpci_mod_fc(req, &fib, &status) ? -EIO : 0;
 }
@@ -83,12 +88,45 @@ static int zpci_clear_directed_irq(struct zpci_dev *zdev)
 	u8 cc, status;
 
 	fib.fmt = 1;
+	fib.gd = zdev->gisa;
 	cc = zpci_mod_fc(req, &fib, &status);
 	if (cc == 3 || (cc == 1 && status == 24))
 		/* Function already gone or IRQs already deregistered. */
 		cc = 0;
 
 	return cc ? -EIO : 0;
+}
+
+/* Register adapter interruptions */
+static int zpci_set_irq(struct zpci_dev *zdev)
+{
+	int rc;
+
+	if (irq_delivery == DIRECTED)
+		rc = zpci_set_directed_irq(zdev);
+	else
+		rc = zpci_set_airq(zdev);
+
+	if (!rc)
+		zdev->irqs_registered = 1;
+
+	return rc;
+}
+
+/* Clear adapter interruptions */
+static int zpci_clear_irq(struct zpci_dev *zdev)
+{
+	int rc;
+
+	if (irq_delivery == DIRECTED)
+		rc = zpci_clear_directed_irq(zdev);
+	else
+		rc = zpci_clear_airq(zdev);
+
+	if (!rc)
+		zdev->irqs_registered = 0;
+
+	return rc;
 }
 
 static int zpci_set_irq_affinity(struct irq_data *data, const struct cpumask *dest,
@@ -180,8 +218,11 @@ static void zpci_handle_fallback_irq(void)
 	}
 }
 
-static void zpci_directed_irq_handler(struct airq_struct *airq, bool floating)
+static void zpci_directed_irq_handler(struct airq_struct *airq,
+				      struct tpi_info *tpi_info)
 {
+	bool floating = !tpi_info->directed_irq;
+
 	if (floating) {
 		inc_irq_stat(IRQIO_PCF);
 		zpci_handle_fallback_irq();
@@ -191,7 +232,8 @@ static void zpci_directed_irq_handler(struct airq_struct *airq, bool floating)
 	}
 }
 
-static void zpci_floating_irq_handler(struct airq_struct *airq, bool floating)
+static void zpci_floating_irq_handler(struct airq_struct *airq,
+				      struct tpi_info *tpi_info)
 {
 	union zpci_sic_iib iib = {{0}};
 	unsigned long si, ai;
@@ -301,10 +343,7 @@ int arch_setup_msi_irqs(struct pci_dev *pdev, int nvec, int type)
 	zdev->msi_first_bit = bit;
 	zdev->msi_nr_irqs = msi_vecs;
 
-	if (irq_delivery == DIRECTED)
-		rc = zpci_set_directed_irq(zdev);
-	else
-		rc = zpci_set_airq(zdev);
+	rc = zpci_set_irq(zdev);
 	if (rc)
 		return rc;
 
@@ -318,10 +357,7 @@ void arch_teardown_msi_irqs(struct pci_dev *pdev)
 	int rc;
 
 	/* Disable interrupts */
-	if (irq_delivery == DIRECTED)
-		rc = zpci_clear_directed_irq(zdev);
-	else
-		rc = zpci_clear_airq(zdev);
+	rc = zpci_clear_irq(zdev);
 	if (rc)
 		return;
 
@@ -353,6 +389,15 @@ void arch_teardown_msi_irqs(struct pci_dev *pdev)
 
 	if ((irq_delivery == DIRECTED) && zdev->msi_first_bit != -1U)
 		airq_iv_free(zpci_ibv[0], zdev->msi_first_bit, zdev->msi_nr_irqs);
+}
+
+void arch_restore_msi_irqs(struct pci_dev *pdev)
+{
+	struct zpci_dev *zdev = to_zpci(pdev);
+
+	if (!zdev->irqs_registered)
+		zpci_set_irq(zdev);
+	default_restore_msi_irqs(pdev);
 }
 
 static struct airq_struct zpci_airq = {

@@ -9,7 +9,6 @@
 #include "xfs_format.h"
 #include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
-#include "xfs_sb.h"
 #include "xfs_mount.h"
 #include "xfs_inode.h"
 #include "xfs_trans.h"
@@ -23,6 +22,7 @@
 #include "xfs_dquot.h"
 #include "xfs_reflink.h"
 #include "xfs_ialloc.h"
+#include "xfs_ag.h"
 
 #include <linux/iversion.h>
 
@@ -43,6 +43,7 @@ enum xfs_icwalk_goal {
 
 	/* Goals directly associated with tagged inodes. */
 	XFS_ICWALK_BLOCKGC	= XFS_ICI_BLOCKGC_TAG,
+	XFS_ICWALK_RECLAIM	= XFS_ICI_RECLAIM_TAG,
 };
 
 #define XFS_ICWALK_NULL_TAG	(-1U)
@@ -55,21 +56,30 @@ xfs_icwalk_tag(enum xfs_icwalk_goal goal)
 }
 
 static int xfs_icwalk(struct xfs_mount *mp,
-		enum xfs_icwalk_goal goal, struct xfs_eofblocks *eofb);
+		enum xfs_icwalk_goal goal, struct xfs_icwalk *icw);
 static int xfs_icwalk_ag(struct xfs_perag *pag,
-		enum xfs_icwalk_goal goal, struct xfs_eofblocks *eofb);
+		enum xfs_icwalk_goal goal, struct xfs_icwalk *icw);
 
 /*
- * Private inode cache walk flags for struct xfs_eofblocks.  Must not coincide
- * with XFS_EOF_FLAGS_*.
+ * Private inode cache walk flags for struct xfs_icwalk.  Must not
+ * coincide with XFS_ICWALK_FLAGS_VALID.
  */
 #define XFS_ICWALK_FLAG_DROP_UDQUOT	(1U << 31)
 #define XFS_ICWALK_FLAG_DROP_GDQUOT	(1U << 30)
 #define XFS_ICWALK_FLAG_DROP_PDQUOT	(1U << 29)
 
+/* Stop scanning after icw_scan_limit inodes. */
+#define XFS_ICWALK_FLAG_SCAN_LIMIT	(1U << 28)
+
+#define XFS_ICWALK_FLAG_RECLAIM_SICK	(1U << 27)
+#define XFS_ICWALK_FLAG_UNION		(1U << 26) /* union filter algorithm */
+
 #define XFS_ICWALK_PRIVATE_FLAGS	(XFS_ICWALK_FLAG_DROP_UDQUOT | \
 					 XFS_ICWALK_FLAG_DROP_GDQUOT | \
-					 XFS_ICWALK_FLAG_DROP_PDQUOT)
+					 XFS_ICWALK_FLAG_DROP_PDQUOT | \
+					 XFS_ICWALK_FLAG_SCAN_LIMIT | \
+					 XFS_ICWALK_FLAG_RECLAIM_SICK | \
+					 XFS_ICWALK_FLAG_UNION)
 
 /*
  * Allocate and initialise an xfs_inode.
@@ -808,17 +818,6 @@ xfs_icache_inode_is_allocated(
 	return 0;
 }
 
-/*
- * The inode lookup is done in batches to keep the amount of lock traffic and
- * radix tree lookups to a minimum. The batch size is a trade off between
- * lookup reduction and stack usage. This is in the reclaim path, so we can't
- * be too greedy.
- *
- * XXX: This will be moved closer to xfs_icwalk* once we get rid of the
- * separate reclaim walk functions.
- */
-#define XFS_LOOKUP_BATCH	32
-
 #ifdef CONFIG_XFS_QUOTA
 /* Decide if we want to grab this inode to drop its dquots. */
 static bool
@@ -862,21 +861,21 @@ out_unlock:
 static void
 xfs_dqrele_inode(
 	struct xfs_inode	*ip,
-	struct xfs_eofblocks	*eofb)
+	struct xfs_icwalk	*icw)
 {
 	if (xfs_iflags_test(ip, XFS_INEW))
 		xfs_inew_wait(ip);
 
 	xfs_ilock(ip, XFS_ILOCK_EXCL);
-	if (eofb->eof_flags & XFS_ICWALK_FLAG_DROP_UDQUOT) {
+	if (icw->icw_flags & XFS_ICWALK_FLAG_DROP_UDQUOT) {
 		xfs_qm_dqrele(ip->i_udquot);
 		ip->i_udquot = NULL;
 	}
-	if (eofb->eof_flags & XFS_ICWALK_FLAG_DROP_GDQUOT) {
+	if (icw->icw_flags & XFS_ICWALK_FLAG_DROP_GDQUOT) {
 		xfs_qm_dqrele(ip->i_gdquot);
 		ip->i_gdquot = NULL;
 	}
-	if (eofb->eof_flags & XFS_ICWALK_FLAG_DROP_PDQUOT) {
+	if (icw->icw_flags & XFS_ICWALK_FLAG_DROP_PDQUOT) {
 		xfs_qm_dqrele(ip->i_pdquot);
 		ip->i_pdquot = NULL;
 	}
@@ -894,16 +893,16 @@ xfs_dqrele_all_inodes(
 	struct xfs_mount	*mp,
 	unsigned int		qflags)
 {
-	struct xfs_eofblocks	eofb = { .eof_flags = 0 };
+	struct xfs_icwalk	icw = { .icw_flags = 0 };
 
 	if (qflags & XFS_UQUOTA_ACCT)
-		eofb.eof_flags |= XFS_ICWALK_FLAG_DROP_UDQUOT;
+		icw.icw_flags |= XFS_ICWALK_FLAG_DROP_UDQUOT;
 	if (qflags & XFS_GQUOTA_ACCT)
-		eofb.eof_flags |= XFS_ICWALK_FLAG_DROP_GDQUOT;
+		icw.icw_flags |= XFS_ICWALK_FLAG_DROP_GDQUOT;
 	if (qflags & XFS_PQUOTA_ACCT)
-		eofb.eof_flags |= XFS_ICWALK_FLAG_DROP_PDQUOT;
+		icw.icw_flags |= XFS_ICWALK_FLAG_DROP_PDQUOT;
 
-	return xfs_icwalk(mp, XFS_ICWALK_DQRELE, &eofb);
+	return xfs_icwalk(mp, XFS_ICWALK_DQRELE, &icw);
 }
 #else
 # define xfs_dqrele_igrab(ip)		(false)
@@ -928,8 +927,9 @@ xfs_dqrele_all_inodes(
  * Return true if we grabbed it, false otherwise.
  */
 static bool
-xfs_reclaim_inode_grab(
-	struct xfs_inode	*ip)
+xfs_reclaim_igrab(
+	struct xfs_inode	*ip,
+	struct xfs_icwalk	*icw)
 {
 	ASSERT(rcu_read_lock_held());
 
@@ -940,6 +940,14 @@ xfs_reclaim_inode_grab(
 		spin_unlock(&ip->i_flags_lock);
 		return false;
 	}
+
+	/* Don't reclaim a sick inode unless the caller asked for it. */
+	if (ip->i_sick &&
+	    (!icw || !(icw->icw_flags & XFS_ICWALK_FLAG_RECLAIM_SICK))) {
+		spin_unlock(&ip->i_flags_lock);
+		return false;
+	}
+
 	__xfs_iflags_set(ip, XFS_IRECLAIM);
 	spin_unlock(&ip->i_flags_lock);
 	return true;
@@ -1040,105 +1048,30 @@ out:
 	xfs_iflags_clear(ip, XFS_IRECLAIM);
 }
 
-/*
- * Walk the AGs and reclaim the inodes in them. Even if the filesystem is
- * corrupted, we still want to try to reclaim all the inodes. If we don't,
- * then a shut down during filesystem unmount reclaim walk leak all the
- * unreclaimed inodes.
- *
- * Returns non-zero if any AGs or inodes were skipped in the reclaim pass
- * so that callers that want to block until all dirty inodes are written back
- * and reclaimed can sanely loop.
- */
-static void
-xfs_reclaim_inodes_ag(
-	struct xfs_mount	*mp,
-	int			*nr_to_scan)
+/* Reclaim sick inodes if we're unmounting or the fs went down. */
+static inline bool
+xfs_want_reclaim_sick(
+	struct xfs_mount	*mp)
 {
-	struct xfs_perag	*pag;
-	xfs_agnumber_t		agno;
-
-	for_each_perag_tag(mp, agno, pag, XFS_ICI_RECLAIM_TAG) {
-		unsigned long	first_index = 0;
-		int		done = 0;
-		int		nr_found = 0;
-
-		first_index = READ_ONCE(pag->pag_ici_reclaim_cursor);
-		do {
-			struct xfs_inode *batch[XFS_LOOKUP_BATCH];
-			int	i;
-
-			rcu_read_lock();
-			nr_found = radix_tree_gang_lookup_tag(
-					&pag->pag_ici_root,
-					(void **)batch, first_index,
-					XFS_LOOKUP_BATCH,
-					XFS_ICI_RECLAIM_TAG);
-			if (!nr_found) {
-				done = 1;
-				rcu_read_unlock();
-				break;
-			}
-
-			/*
-			 * Grab the inodes before we drop the lock. if we found
-			 * nothing, nr == 0 and the loop will be skipped.
-			 */
-			for (i = 0; i < nr_found; i++) {
-				struct xfs_inode *ip = batch[i];
-
-				if (done || !xfs_reclaim_inode_grab(ip))
-					batch[i] = NULL;
-
-				/*
-				 * Update the index for the next lookup. Catch
-				 * overflows into the next AG range which can
-				 * occur if we have inodes in the last block of
-				 * the AG and we are currently pointing to the
-				 * last inode.
-				 *
-				 * Because we may see inodes that are from the
-				 * wrong AG due to RCU freeing and
-				 * reallocation, only update the index if it
-				 * lies in this AG. It was a race that lead us
-				 * to see this inode, so another lookup from
-				 * the same index will not find it again.
-				 */
-				if (XFS_INO_TO_AGNO(mp, ip->i_ino) !=
-								pag->pag_agno)
-					continue;
-				first_index = XFS_INO_TO_AGINO(mp, ip->i_ino + 1);
-				if (first_index < XFS_INO_TO_AGINO(mp, ip->i_ino))
-					done = 1;
-			}
-
-			/* unlock now we've grabbed the inodes. */
-			rcu_read_unlock();
-
-			for (i = 0; i < nr_found; i++) {
-				if (batch[i])
-					xfs_reclaim_inode(batch[i], pag);
-			}
-
-			*nr_to_scan -= XFS_LOOKUP_BATCH;
-			cond_resched();
-		} while (nr_found && !done && *nr_to_scan > 0);
-
-		if (done)
-			first_index = 0;
-		WRITE_ONCE(pag->pag_ici_reclaim_cursor, first_index);
-	}
+	return (mp->m_flags & XFS_MOUNT_UNMOUNTING) ||
+	       (mp->m_flags & XFS_MOUNT_NORECOVERY) ||
+	       XFS_FORCED_SHUTDOWN(mp);
 }
 
 void
 xfs_reclaim_inodes(
 	struct xfs_mount	*mp)
 {
-	int		nr_to_scan = INT_MAX;
+	struct xfs_icwalk	icw = {
+		.icw_flags	= 0,
+	};
+
+	if (xfs_want_reclaim_sick(mp))
+		icw.icw_flags |= XFS_ICWALK_FLAG_RECLAIM_SICK;
 
 	while (radix_tree_tagged(&mp->m_perag_tree, XFS_ICI_RECLAIM_TAG)) {
 		xfs_ail_push_all_sync(mp->m_ail);
-		xfs_reclaim_inodes_ag(mp, &nr_to_scan);
+		xfs_icwalk(mp, XFS_ICWALK_RECLAIM, &icw);
 	}
 }
 
@@ -1152,13 +1085,21 @@ xfs_reclaim_inodes(
 long
 xfs_reclaim_inodes_nr(
 	struct xfs_mount	*mp,
-	int			nr_to_scan)
+	unsigned long		nr_to_scan)
 {
+	struct xfs_icwalk	icw = {
+		.icw_flags	= XFS_ICWALK_FLAG_SCAN_LIMIT,
+		.icw_scan_limit	= min_t(unsigned long, LONG_MAX, nr_to_scan),
+	};
+
+	if (xfs_want_reclaim_sick(mp))
+		icw.icw_flags |= XFS_ICWALK_FLAG_RECLAIM_SICK;
+
 	/* kick background reclaimer and push the AIL */
 	xfs_reclaim_work_queue(mp);
 	xfs_ail_push_all(mp->m_ail);
 
-	xfs_reclaim_inodes_ag(mp, &nr_to_scan);
+	xfs_icwalk(mp, XFS_ICWALK_RECLAIM, &icw);
 	return 0;
 }
 
@@ -1166,13 +1107,13 @@ xfs_reclaim_inodes_nr(
  * Return the number of reclaimable inodes in the filesystem for
  * the shrinker to determine how much to reclaim.
  */
-int
+long
 xfs_reclaim_inodes_count(
 	struct xfs_mount	*mp)
 {
 	struct xfs_perag	*pag;
 	xfs_agnumber_t		ag = 0;
-	int			reclaimable = 0;
+	long			reclaimable = 0;
 
 	while ((pag = xfs_perag_get_tag(mp, ag, XFS_ICI_RECLAIM_TAG))) {
 		ag = pag->pag_agno + 1;
@@ -1183,20 +1124,20 @@ xfs_reclaim_inodes_count(
 }
 
 STATIC bool
-xfs_inode_match_id(
+xfs_icwalk_match_id(
 	struct xfs_inode	*ip,
-	struct xfs_eofblocks	*eofb)
+	struct xfs_icwalk	*icw)
 {
-	if ((eofb->eof_flags & XFS_EOF_FLAGS_UID) &&
-	    !uid_eq(VFS_I(ip)->i_uid, eofb->eof_uid))
+	if ((icw->icw_flags & XFS_ICWALK_FLAG_UID) &&
+	    !uid_eq(VFS_I(ip)->i_uid, icw->icw_uid))
 		return false;
 
-	if ((eofb->eof_flags & XFS_EOF_FLAGS_GID) &&
-	    !gid_eq(VFS_I(ip)->i_gid, eofb->eof_gid))
+	if ((icw->icw_flags & XFS_ICWALK_FLAG_GID) &&
+	    !gid_eq(VFS_I(ip)->i_gid, icw->icw_gid))
 		return false;
 
-	if ((eofb->eof_flags & XFS_EOF_FLAGS_PRID) &&
-	    ip->i_projid != eofb->eof_prid)
+	if ((icw->icw_flags & XFS_ICWALK_FLAG_PRID) &&
+	    ip->i_projid != icw->icw_prid)
 		return false;
 
 	return true;
@@ -1207,20 +1148,20 @@ xfs_inode_match_id(
  * criteria match. This is for global/internal scans only.
  */
 STATIC bool
-xfs_inode_match_id_union(
+xfs_icwalk_match_id_union(
 	struct xfs_inode	*ip,
-	struct xfs_eofblocks	*eofb)
+	struct xfs_icwalk	*icw)
 {
-	if ((eofb->eof_flags & XFS_EOF_FLAGS_UID) &&
-	    uid_eq(VFS_I(ip)->i_uid, eofb->eof_uid))
+	if ((icw->icw_flags & XFS_ICWALK_FLAG_UID) &&
+	    uid_eq(VFS_I(ip)->i_uid, icw->icw_uid))
 		return true;
 
-	if ((eofb->eof_flags & XFS_EOF_FLAGS_GID) &&
-	    gid_eq(VFS_I(ip)->i_gid, eofb->eof_gid))
+	if ((icw->icw_flags & XFS_ICWALK_FLAG_GID) &&
+	    gid_eq(VFS_I(ip)->i_gid, icw->icw_gid))
 		return true;
 
-	if ((eofb->eof_flags & XFS_EOF_FLAGS_PRID) &&
-	    ip->i_projid == eofb->eof_prid)
+	if ((icw->icw_flags & XFS_ICWALK_FLAG_PRID) &&
+	    ip->i_projid == icw->icw_prid)
 		return true;
 
 	return false;
@@ -1228,29 +1169,29 @@ xfs_inode_match_id_union(
 
 /*
  * Is this inode @ip eligible for eof/cow block reclamation, given some
- * filtering parameters @eofb?  The inode is eligible if @eofb is null or
+ * filtering parameters @icw?  The inode is eligible if @icw is null or
  * if the predicate functions match.
  */
 static bool
-xfs_inode_matches_eofb(
+xfs_icwalk_match(
 	struct xfs_inode	*ip,
-	struct xfs_eofblocks	*eofb)
+	struct xfs_icwalk	*icw)
 {
 	bool			match;
 
-	if (!eofb)
+	if (!icw)
 		return true;
 
-	if (eofb->eof_flags & XFS_EOF_FLAGS_UNION)
-		match = xfs_inode_match_id_union(ip, eofb);
+	if (icw->icw_flags & XFS_ICWALK_FLAG_UNION)
+		match = xfs_icwalk_match_id_union(ip, icw);
 	else
-		match = xfs_inode_match_id(ip, eofb);
+		match = xfs_icwalk_match_id(ip, icw);
 	if (!match)
 		return false;
 
 	/* skip the inode if the file size is too small */
-	if ((eofb->eof_flags & XFS_EOF_FLAGS_MINFILESIZE) &&
-	    XFS_ISIZE(ip) < eofb->eof_min_file_size)
+	if ((icw->icw_flags & XFS_ICWALK_FLAG_MINFILESIZE) &&
+	    XFS_ISIZE(ip) < icw->icw_min_file_size)
 		return false;
 
 	return true;
@@ -1268,21 +1209,20 @@ xfs_reclaim_worker(
 {
 	struct xfs_mount *mp = container_of(to_delayed_work(work),
 					struct xfs_mount, m_reclaim_work);
-	int		nr_to_scan = INT_MAX;
 
-	xfs_reclaim_inodes_ag(mp, &nr_to_scan);
+	xfs_icwalk(mp, XFS_ICWALK_RECLAIM, NULL);
 	xfs_reclaim_work_queue(mp);
 }
 
 STATIC int
 xfs_inode_free_eofblocks(
 	struct xfs_inode	*ip,
-	struct xfs_eofblocks	*eofb,
+	struct xfs_icwalk	*icw,
 	unsigned int		*lockflags)
 {
 	bool			wait;
 
-	wait = eofb && (eofb->eof_flags & XFS_EOF_FLAGS_SYNC);
+	wait = icw && (icw->icw_flags & XFS_ICWALK_FLAG_SYNC);
 
 	if (!xfs_iflags_test(ip, XFS_IEOFBLOCKS))
 		return 0;
@@ -1294,7 +1234,7 @@ xfs_inode_free_eofblocks(
 	if (!wait && mapping_tagged(VFS_I(ip)->i_mapping, PAGECACHE_TAG_DIRTY))
 		return 0;
 
-	if (!xfs_inode_matches_eofb(ip, eofb))
+	if (!xfs_icwalk_match(ip, icw))
 		return 0;
 
 	/*
@@ -1439,13 +1379,13 @@ xfs_prep_free_cowblocks(
 STATIC int
 xfs_inode_free_cowblocks(
 	struct xfs_inode	*ip,
-	struct xfs_eofblocks	*eofb,
+	struct xfs_icwalk	*icw,
 	unsigned int		*lockflags)
 {
 	bool			wait;
 	int			ret = 0;
 
-	wait = eofb && (eofb->eof_flags & XFS_EOF_FLAGS_SYNC);
+	wait = icw && (icw->icw_flags & XFS_ICWALK_FLAG_SYNC);
 
 	if (!xfs_iflags_test(ip, XFS_ICOWBLOCKS))
 		return 0;
@@ -1453,7 +1393,7 @@ xfs_inode_free_cowblocks(
 	if (!xfs_prep_free_cowblocks(ip))
 		return 0;
 
-	if (!xfs_inode_matches_eofb(ip, eofb))
+	if (!xfs_icwalk_match(ip, icw))
 		return 0;
 
 	/*
@@ -1570,16 +1510,16 @@ out_unlock_noent:
 static int
 xfs_blockgc_scan_inode(
 	struct xfs_inode	*ip,
-	struct xfs_eofblocks	*eofb)
+	struct xfs_icwalk	*icw)
 {
 	unsigned int		lockflags = 0;
 	int			error;
 
-	error = xfs_inode_free_eofblocks(ip, eofb, &lockflags);
+	error = xfs_inode_free_eofblocks(ip, icw, &lockflags);
 	if (error)
 		goto unlock;
 
-	error = xfs_inode_free_cowblocks(ip, eofb, &lockflags);
+	error = xfs_inode_free_cowblocks(ip, icw, &lockflags);
 unlock:
 	if (lockflags)
 		xfs_iunlock(ip, lockflags);
@@ -1613,11 +1553,11 @@ xfs_blockgc_worker(
 int
 xfs_blockgc_free_space(
 	struct xfs_mount	*mp,
-	struct xfs_eofblocks	*eofb)
+	struct xfs_icwalk	*icw)
 {
-	trace_xfs_blockgc_free_space(mp, eofb, _RET_IP_);
+	trace_xfs_blockgc_free_space(mp, icw, _RET_IP_);
 
-	return xfs_icwalk(mp, XFS_ICWALK_BLOCKGC, eofb);
+	return xfs_icwalk(mp, XFS_ICWALK_BLOCKGC, icw);
 }
 
 /*
@@ -1627,7 +1567,7 @@ xfs_blockgc_free_space(
  * scan.
  *
  * Callers must not hold any inode's ILOCK.  If requesting a synchronous scan
- * (XFS_EOF_FLAGS_SYNC), the caller also must not hold any inode's IOLOCK or
+ * (XFS_ICWALK_FLAG_SYNC), the caller also must not hold any inode's IOLOCK or
  * MMAPLOCK.
  */
 int
@@ -1636,9 +1576,9 @@ xfs_blockgc_free_dquots(
 	struct xfs_dquot	*udqp,
 	struct xfs_dquot	*gdqp,
 	struct xfs_dquot	*pdqp,
-	unsigned int		eof_flags)
+	unsigned int		iwalk_flags)
 {
-	struct xfs_eofblocks	eofb = {0};
+	struct xfs_icwalk	icw = {0};
 	bool			do_work = false;
 
 	if (!udqp && !gdqp && !pdqp)
@@ -1648,45 +1588,54 @@ xfs_blockgc_free_dquots(
 	 * Run a scan to free blocks using the union filter to cover all
 	 * applicable quotas in a single scan.
 	 */
-	eofb.eof_flags = XFS_EOF_FLAGS_UNION | eof_flags;
+	icw.icw_flags = XFS_ICWALK_FLAG_UNION | iwalk_flags;
 
 	if (XFS_IS_UQUOTA_ENFORCED(mp) && udqp && xfs_dquot_lowsp(udqp)) {
-		eofb.eof_uid = make_kuid(mp->m_super->s_user_ns, udqp->q_id);
-		eofb.eof_flags |= XFS_EOF_FLAGS_UID;
+		icw.icw_uid = make_kuid(mp->m_super->s_user_ns, udqp->q_id);
+		icw.icw_flags |= XFS_ICWALK_FLAG_UID;
 		do_work = true;
 	}
 
 	if (XFS_IS_UQUOTA_ENFORCED(mp) && gdqp && xfs_dquot_lowsp(gdqp)) {
-		eofb.eof_gid = make_kgid(mp->m_super->s_user_ns, gdqp->q_id);
-		eofb.eof_flags |= XFS_EOF_FLAGS_GID;
+		icw.icw_gid = make_kgid(mp->m_super->s_user_ns, gdqp->q_id);
+		icw.icw_flags |= XFS_ICWALK_FLAG_GID;
 		do_work = true;
 	}
 
 	if (XFS_IS_PQUOTA_ENFORCED(mp) && pdqp && xfs_dquot_lowsp(pdqp)) {
-		eofb.eof_prid = pdqp->q_id;
-		eofb.eof_flags |= XFS_EOF_FLAGS_PRID;
+		icw.icw_prid = pdqp->q_id;
+		icw.icw_flags |= XFS_ICWALK_FLAG_PRID;
 		do_work = true;
 	}
 
 	if (!do_work)
 		return 0;
 
-	return xfs_blockgc_free_space(mp, &eofb);
+	return xfs_blockgc_free_space(mp, &icw);
 }
 
 /* Run cow/eofblocks scans on the quotas attached to the inode. */
 int
 xfs_blockgc_free_quota(
 	struct xfs_inode	*ip,
-	unsigned int		eof_flags)
+	unsigned int		iwalk_flags)
 {
 	return xfs_blockgc_free_dquots(ip->i_mount,
 			xfs_inode_dquot(ip, XFS_DQTYPE_USER),
 			xfs_inode_dquot(ip, XFS_DQTYPE_GROUP),
-			xfs_inode_dquot(ip, XFS_DQTYPE_PROJ), eof_flags);
+			xfs_inode_dquot(ip, XFS_DQTYPE_PROJ), iwalk_flags);
 }
 
 /* XFS Inode Cache Walking Code */
+
+/*
+ * The inode lookup is done in batches to keep the amount of lock traffic and
+ * radix tree lookups to a minimum. The batch size is a trade off between
+ * lookup reduction and stack usage. This is in the reclaim path, so we can't
+ * be too greedy.
+ */
+#define XFS_LOOKUP_BATCH	32
+
 
 /*
  * Decide if we want to grab this inode in anticipation of doing work towards
@@ -1695,13 +1644,16 @@ xfs_blockgc_free_quota(
 static inline bool
 xfs_icwalk_igrab(
 	enum xfs_icwalk_goal	goal,
-	struct xfs_inode	*ip)
+	struct xfs_inode	*ip,
+	struct xfs_icwalk	*icw)
 {
 	switch (goal) {
 	case XFS_ICWALK_DQRELE:
 		return xfs_dqrele_igrab(ip);
 	case XFS_ICWALK_BLOCKGC:
 		return xfs_blockgc_igrab(ip);
+	case XFS_ICWALK_RECLAIM:
+		return xfs_reclaim_igrab(ip, icw);
 	default:
 		return false;
 	}
@@ -1715,16 +1667,20 @@ static inline int
 xfs_icwalk_process_inode(
 	enum xfs_icwalk_goal	goal,
 	struct xfs_inode	*ip,
-	struct xfs_eofblocks	*eofb)
+	struct xfs_perag	*pag,
+	struct xfs_icwalk	*icw)
 {
 	int			error = 0;
 
 	switch (goal) {
 	case XFS_ICWALK_DQRELE:
-		xfs_dqrele_inode(ip, eofb);
+		xfs_dqrele_inode(ip, icw);
 		break;
 	case XFS_ICWALK_BLOCKGC:
-		error = xfs_blockgc_scan_inode(ip, eofb);
+		error = xfs_blockgc_scan_inode(ip, icw);
+		break;
+	case XFS_ICWALK_RECLAIM:
+		xfs_reclaim_inode(ip, pag);
 		break;
 	}
 	return error;
@@ -1738,7 +1694,7 @@ static int
 xfs_icwalk_ag(
 	struct xfs_perag	*pag,
 	enum xfs_icwalk_goal	goal,
-	struct xfs_eofblocks	*eofb)
+	struct xfs_icwalk	*icw)
 {
 	struct xfs_mount	*mp = pag->pag_mount;
 	uint32_t		first_index;
@@ -1750,7 +1706,10 @@ xfs_icwalk_ag(
 restart:
 	done = false;
 	skipped = 0;
-	first_index = 0;
+	if (goal == XFS_ICWALK_RECLAIM)
+		first_index = READ_ONCE(pag->pag_ici_reclaim_cursor);
+	else
+		first_index = 0;
 	nr_found = 0;
 	do {
 		struct xfs_inode *batch[XFS_LOOKUP_BATCH];
@@ -1771,6 +1730,7 @@ restart:
 					XFS_LOOKUP_BATCH, tag);
 
 		if (!nr_found) {
+			done = true;
 			rcu_read_unlock();
 			break;
 		}
@@ -1782,7 +1742,7 @@ restart:
 		for (i = 0; i < nr_found; i++) {
 			struct xfs_inode *ip = batch[i];
 
-			if (done || !xfs_icwalk_igrab(goal, ip))
+			if (done || !xfs_icwalk_igrab(goal, ip, icw))
 				batch[i] = NULL;
 
 			/*
@@ -1810,7 +1770,8 @@ restart:
 		for (i = 0; i < nr_found; i++) {
 			if (!batch[i])
 				continue;
-			error = xfs_icwalk_process_inode(goal, batch[i], eofb);
+			error = xfs_icwalk_process_inode(goal, batch[i], pag,
+					icw);
 			if (error == -EAGAIN) {
 				skipped++;
 				continue;
@@ -1825,7 +1786,18 @@ restart:
 
 		cond_resched();
 
+		if (icw && (icw->icw_flags & XFS_ICWALK_FLAG_SCAN_LIMIT)) {
+			icw->icw_scan_limit -= XFS_LOOKUP_BATCH;
+			if (icw->icw_scan_limit <= 0)
+				break;
+		}
 	} while (nr_found && !done);
+
+	if (goal == XFS_ICWALK_RECLAIM) {
+		if (done)
+			first_index = 0;
+		WRITE_ONCE(pag->pag_ici_reclaim_cursor, first_index);
+	}
 
 	if (skipped) {
 		delay(1);
@@ -1853,7 +1825,7 @@ static int
 xfs_icwalk(
 	struct xfs_mount	*mp,
 	enum xfs_icwalk_goal	goal,
-	struct xfs_eofblocks	*eofb)
+	struct xfs_icwalk	*icw)
 {
 	struct xfs_perag	*pag;
 	int			error = 0;
@@ -1862,7 +1834,7 @@ xfs_icwalk(
 
 	while ((pag = xfs_icwalk_get_perag(mp, agno, goal))) {
 		agno = pag->pag_agno + 1;
-		error = xfs_icwalk_ag(pag, goal, eofb);
+		error = xfs_icwalk_ag(pag, goal, icw);
 		xfs_perag_put(pag);
 		if (error) {
 			last_error = error;
@@ -1871,5 +1843,5 @@ xfs_icwalk(
 		}
 	}
 	return last_error;
-	BUILD_BUG_ON(XFS_ICWALK_PRIVATE_FLAGS & XFS_EOF_FLAGS_VALID);
+	BUILD_BUG_ON(XFS_ICWALK_PRIVATE_FLAGS & XFS_ICWALK_FLAGS_VALID);
 }

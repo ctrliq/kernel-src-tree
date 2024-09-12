@@ -58,6 +58,8 @@
 #include <net/rtnetlink.h>
 #include <net/net_namespace.h>
 
+#include "dev.h"
+
 #define RTNL_MAX_TYPE		50
 #define RTNL_SLAVE_MAX_TYPE	40
 
@@ -1685,6 +1687,7 @@ static int rtnl_fill_ifinfo(struct sk_buff *skb,
 {
 	struct ifinfomsg *ifm;
 	struct nlmsghdr *nlh;
+	struct Qdisc *qdisc;
 
 	ASSERT_RTNL();
 	nlh = nlmsg_put(skb, pid, seq, type, sizeof(*ifm), flags);
@@ -1702,6 +1705,7 @@ static int rtnl_fill_ifinfo(struct sk_buff *skb,
 	if (tgt_netnsid >= 0 && nla_put_s32(skb, IFLA_TARGET_NETNSID, tgt_netnsid))
 		goto nla_put_failure;
 
+	qdisc = rtnl_dereference(dev->qdisc);
 	if (nla_put_string(skb, IFLA_IFNAME, dev->name) ||
 	    nla_put_u32(skb, IFLA_TXQLEN, dev->tx_queue_len) ||
 	    nla_put_u8(skb, IFLA_OPERSTATE,
@@ -1720,8 +1724,8 @@ static int rtnl_fill_ifinfo(struct sk_buff *skb,
 #endif
 	    put_master_ifindex(skb, dev) ||
 	    nla_put_u8(skb, IFLA_CARRIER, netif_carrier_ok(dev)) ||
-	    (dev->qdisc &&
-	     nla_put_string(skb, IFLA_QDISC, dev->qdisc->ops->id)) ||
+	    (qdisc &&
+	     nla_put_string(skb, IFLA_QDISC, qdisc->ops->id)) ||
 	    nla_put_ifalias(skb, dev) ||
 	    nla_put_u32(skb, IFLA_CARRIER_CHANGES,
 			atomic_read(&dev->carrier_up_count) +
@@ -1793,6 +1797,16 @@ static int rtnl_fill_ifinfo(struct sk_buff *skb,
 	rcu_read_unlock();
 
 	if (rtnl_fill_prop_list(skb, dev))
+		goto nla_put_failure;
+
+	if (dev->dev.parent &&
+	    nla_put_string(skb, IFLA_PARENT_DEV_NAME,
+			   dev_name(dev->dev.parent)))
+		goto nla_put_failure;
+
+	if (dev->dev.parent && dev->dev.parent->bus &&
+	    nla_put_string(skb, IFLA_PARENT_DEV_BUS_NAME,
+			   dev->dev.parent->bus->name))
 		goto nla_put_failure;
 
 	nlmsg_end(skb, nlh);
@@ -2669,7 +2683,7 @@ static int do_setlink(const struct sk_buff *skb,
 	if (tb[IFLA_GSO_MAX_SIZE]) {
 		u32 max_size = nla_get_u32(tb[IFLA_GSO_MAX_SIZE]);
 
-		if (max_size > GSO_MAX_SIZE) {
+		if (max_size > GSO_MAX_SIZE || max_size > dev->tso_max_size) {
 			err = -EINVAL;
 			goto errout;
 		}
@@ -2683,7 +2697,7 @@ static int do_setlink(const struct sk_buff *skb,
 	if (tb[IFLA_GSO_MAX_SEGS]) {
 		u32 max_segs = nla_get_u32(tb[IFLA_GSO_MAX_SEGS]);
 
-		if (max_segs > GSO_MAX_SEGS) {
+		if (max_segs > GSO_MAX_SEGS || max_segs > dev->tso_max_segs) {
 			err = -EINVAL;
 			goto errout;
 		}

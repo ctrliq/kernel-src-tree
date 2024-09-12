@@ -188,7 +188,7 @@ static struct file *open_file_as_root(const char *filename, int flags, umode_t m
 	cred->fsuid = GLOBAL_ROOT_UID;
 	old_cred = override_creds(cred);
 
-	fp = file_open_root(&root, filename, flags, mode);
+	fp = file_open_root(root.dentry, root.mnt, filename, flags, mode);
 	path_put(&root);
 
 	revert_creds(old_cred);

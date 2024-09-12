@@ -14,9 +14,6 @@
 #include <sound/sof.h>
 #include "sof-priv.h"
 #include "ops.h"
-#if IS_ENABLED(CONFIG_SND_SOC_SOF_DEBUG_PROBES)
-#include "sof-probes.h"
-#endif
 
 /* see SOF_DBG_ flags */
 static int sof_core_debug =  IS_ENABLED(CONFIG_SND_SOC_SOF_DEBUG_ENABLE_FIRMWARE_TRACE);
@@ -121,6 +118,27 @@ out:
 	sof_stack(sdev, level, oops, stack, stack_words);
 }
 EXPORT_SYMBOL(sof_print_oops_and_stack);
+
+/* Helper to manage DSP state */
+void sof_set_fw_state(struct snd_sof_dev *sdev, enum sof_fw_state new_state)
+{
+	if (sdev->fw_state == new_state)
+		return;
+
+	dev_dbg(sdev->dev, "fw_state change: %d -> %d\n", sdev->fw_state, new_state);
+	sdev->fw_state = new_state;
+
+	switch (new_state) {
+	case SOF_FW_BOOT_NOT_STARTED:
+	case SOF_FW_BOOT_COMPLETE:
+	case SOF_FW_CRASHED:
+		sof_client_fw_state_dispatcher(sdev);
+		fallthrough;
+	default:
+		break;
+	}
+}
+EXPORT_SYMBOL(sof_set_fw_state);
 
 /*
  *			FW Boot State Transition Diagram
@@ -232,14 +250,13 @@ static int sof_probe_continue(struct snd_sof_dev *sdev)
 	}
 
 	if (sof_debug_check_flag(SOF_DBG_ENABLE_TRACE)) {
-		sdev->dtrace_is_supported = true;
+		sdev->fw_trace_is_supported = true;
 
-		/* init DMA trace */
-		ret = snd_sof_init_trace(sdev);
+		/* init firmware tracing */
+		ret = sof_fw_trace_init(sdev);
 		if (ret < 0) {
 			/* non fatal */
-			dev_warn(sdev->dev,
-				 "warning: failed to initialize trace %d\n",
+			dev_warn(sdev->dev, "failed to initialize firmware tracing %d\n",
 				 ret);
 		}
 	} else {
@@ -266,6 +283,12 @@ static int sof_probe_continue(struct snd_sof_dev *sdev)
 		goto fw_trace_err;
 	}
 
+	ret = sof_register_clients(sdev);
+	if (ret < 0) {
+		dev_err(sdev->dev, "failed to register clients %d\n", ret);
+		goto sof_machine_err;
+	}
+
 	/*
 	 * Some platforms in SOF, ex: BYT, may not have their platform PM
 	 * callbacks set. Increment the usage count so as to
@@ -281,8 +304,10 @@ static int sof_probe_continue(struct snd_sof_dev *sdev)
 
 	return 0;
 
+sof_machine_err:
+	snd_sof_machine_unregister(sdev, plat_data);
 fw_trace_err:
-	snd_sof_free_trace(sdev);
+	sof_fw_trace_free(sdev);
 fw_run_err:
 	snd_sof_fw_unload(sdev);
 fw_load_err:
@@ -318,6 +343,7 @@ static void sof_probe_work(struct work_struct *work)
 int snd_sof_device_probe(struct device *dev, struct snd_sof_pdata *plat_data)
 {
 	struct snd_sof_dev *sdev;
+	int ret;
 
 	sdev = devm_kzalloc(dev, sizeof(*sdev), GFP_KERNEL);
 	if (!sdev)
@@ -331,10 +357,6 @@ int snd_sof_device_probe(struct device *dev, struct snd_sof_pdata *plat_data)
 
 	sdev->pdata = plat_data;
 	sdev->first_boot = true;
-	sof_set_fw_state(sdev, SOF_FW_BOOT_NOT_STARTED);
-#if IS_ENABLED(CONFIG_SND_SOC_SOF_DEBUG_PROBES)
-	sdev->extractor_stream_tag = SOF_PROBE_INVALID_NODE_ID;
-#endif
 	dev_set_drvdata(dev, sdev);
 
 	/* check IPC support */
@@ -345,7 +367,9 @@ int snd_sof_device_probe(struct device *dev, struct snd_sof_pdata *plat_data)
 	}
 
 	/* init ops, if necessary */
-	sof_ops_init(sdev);
+	ret = sof_ops_init(sdev);
+	if (ret < 0)
+		return ret;
 
 	/* check all mandatory ops */
 	if (!sof_ops(sdev) || !sof_ops(sdev)->probe || !sof_ops(sdev)->run ||
@@ -363,9 +387,14 @@ int snd_sof_device_probe(struct device *dev, struct snd_sof_pdata *plat_data)
 	INIT_LIST_HEAD(&sdev->dai_list);
 	INIT_LIST_HEAD(&sdev->dai_link_list);
 	INIT_LIST_HEAD(&sdev->route_list);
+	INIT_LIST_HEAD(&sdev->ipc_client_list);
+	INIT_LIST_HEAD(&sdev->ipc_rx_handler_list);
+	INIT_LIST_HEAD(&sdev->fw_state_handler_list);
 	spin_lock_init(&sdev->ipc_lock);
 	spin_lock_init(&sdev->hw_lock);
 	mutex_init(&sdev->power_state_access);
+	mutex_init(&sdev->ipc_client_mutex);
+	mutex_init(&sdev->client_event_handler_mutex);
 
 	/* set default timeouts if none provided */
 	if (plat_data->desc->ipc_timeout == 0)
@@ -376,6 +405,8 @@ int snd_sof_device_probe(struct device *dev, struct snd_sof_pdata *plat_data)
 		sdev->boot_timeout = TIMEOUT_DEFAULT_BOOT_MS;
 	else
 		sdev->boot_timeout = plat_data->desc->boot_timeout;
+
+	sof_set_fw_state(sdev, SOF_FW_BOOT_NOT_STARTED);
 
 	if (IS_ENABLED(CONFIG_SND_SOC_SOF_PROBE_WORK_QUEUE)) {
 		INIT_WORK(&sdev->probe_work, sof_probe_work);
@@ -405,6 +436,12 @@ int snd_sof_device_remove(struct device *dev)
 		cancel_work_sync(&sdev->probe_work);
 
 	/*
+	 * Unregister any registered client device first before IPC and debugfs
+	 * to allow client drivers to be removed cleanly
+	 */
+	sof_unregister_clients(sdev);
+
+	/*
 	 * Unregister machine driver. This will unbind the snd_card which
 	 * will remove the component driver and unload the topology
 	 * before freeing the snd_card.
@@ -412,7 +449,7 @@ int snd_sof_device_remove(struct device *dev)
 	snd_sof_machine_unregister(sdev, pdata);
 
 	if (sdev->fw_state > SOF_FW_BOOT_NOT_STARTED) {
-		snd_sof_free_trace(sdev);
+		sof_fw_trace_free(sdev);
 		ret = snd_sof_dsp_power_down_notify(sdev);
 		if (ret < 0)
 			dev_warn(dev, "error: %d failed to prepare DSP for device removal",

@@ -41,7 +41,8 @@ struct dce_hwseq_wa {
 	bool DEGVIDCN10_254;
 	bool DEGVIDCN21;
 	bool disallow_self_refresh_during_multi_plane_transition;
-	bool early_riommu_invalidation;
+	bool dp_hpo_and_otg_sequence;
+	bool wait_hubpret_read_start_during_mpo_transition;
 };
 
 struct hwseq_wa_state {
@@ -67,6 +68,7 @@ struct dce_hwseq;
 struct timing_generator;
 struct tg_color;
 struct output_pixel_processor;
+struct mpcc_blnd_cfg;
 
 struct hwseq_private_funcs {
 
@@ -139,8 +141,21 @@ struct hwseq_private_funcs {
 			const struct dc_plane_state *plane_state);
 	bool (*set_shaper_3dlut)(struct pipe_ctx *pipe_ctx,
 			const struct dc_plane_state *plane_state);
+	bool (*set_mcm_luts)(struct pipe_ctx *pipe_ctx,
+			const struct dc_plane_state *plane_state);
 	void (*PLAT_58856_wa)(struct dc_state *context,
 			struct pipe_ctx *pipe_ctx);
+	void (*setup_hpo_hw_control)(const struct dce_hwseq *hws, bool enable);
+#ifdef CONFIG_DRM_AMD_DC_DCN
+	void (*program_mall_pipe_config)(struct dc *dc, struct dc_state *context);
+	void (*subvp_update_force_pstate)(struct dc *dc, struct dc_state *context);
+	void (*update_mall_sel)(struct dc *dc, struct dc_state *context);
+	unsigned int (*calculate_dccg_k1_k2_values)(struct pipe_ctx *pipe_ctx,
+			unsigned int *k1_div,
+			unsigned int *k2_div);
+	void (*set_pixels_per_cycle)(struct pipe_ctx *pipe_ctx);
+	bool (*is_dp_dig_pixel_rate_div_policy)(struct pipe_ctx *pipe_ctx);
+#endif
 };
 
 struct dce_hwseq {
@@ -152,6 +167,10 @@ struct dce_hwseq {
 	struct hwseq_wa_state wa_state;
 	struct hwseq_private_funcs funcs;
 
+	PHYSICAL_ADDRESS_LOC fb_base;
+	PHYSICAL_ADDRESS_LOC fb_top;
+	PHYSICAL_ADDRESS_LOC fb_offset;
+	PHYSICAL_ADDRESS_LOC uma_top;
 };
 
 #endif /* __DC_HW_SEQUENCER_PRIVATE_H__ */

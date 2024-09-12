@@ -14,8 +14,8 @@
 #include <linux/moduleparam.h>
 #include <linux/platform_device.h>
 #include <linux/spi/spi.h>
+#include <linux/interrupt.h>
 
-#include <sound/cs35l41.h>
 #include "cs35l41.h"
 
 static const struct spi_device_id cs35l41_id_spi[] = {
@@ -31,7 +31,7 @@ MODULE_DEVICE_TABLE(spi, cs35l41_id_spi);
 static int cs35l41_spi_probe(struct spi_device *spi)
 {
 	const struct regmap_config *regmap_config = &cs35l41_regmap_spi;
-	struct cs35l41_platform_data *pdata = dev_get_platdata(&spi->dev);
+	struct cs35l41_hw_cfg *hw_cfg = dev_get_platdata(&spi->dev);
 	struct cs35l41_private *cs35l41;
 	int ret;
 
@@ -53,7 +53,7 @@ static int cs35l41_spi_probe(struct spi_device *spi)
 	cs35l41->dev = &spi->dev;
 	cs35l41->irq = spi->irq;
 
-	return cs35l41_probe(cs35l41, pdata);
+	return cs35l41_probe(cs35l41, hw_cfg);
 }
 
 static int cs35l41_spi_remove(struct spi_device *spi)
@@ -86,6 +86,7 @@ MODULE_DEVICE_TABLE(acpi, cs35l41_acpi_match);
 static struct spi_driver cs35l41_spi_driver = {
 	.driver = {
 		.name		= "cs35l41",
+		.pm		= &cs35l41_pm_ops,
 		.of_match_table = of_match_ptr(cs35l41_of_match),
 		.acpi_match_table = ACPI_PTR(cs35l41_acpi_match),
 	},

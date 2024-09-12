@@ -158,7 +158,7 @@ void gnet_stats_add_basic(struct gnet_stats_basic_sync *bstats,
 	u64 bytes = 0;
 	u64 packets = 0;
 
-	WARN_ON_ONCE((cpu || running) && in_hardirq());
+	WARN_ON_ONCE((cpu || running) && in_irq());
 
 	if (cpu) {
 		gnet_stats_add_basic_cpu(bstats, cpu);

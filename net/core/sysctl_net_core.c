@@ -22,6 +22,8 @@
 #include <net/busy_poll.h>
 #include <net/pkt_sched.h>
 
+#include "dev.h"
+
 static int two __maybe_unused = 2;
 static int min_sndbuf = SOCK_MIN_SNDBUF;
 static int min_rcvbuf = SOCK_MIN_RCVBUF;

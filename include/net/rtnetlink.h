@@ -71,11 +71,6 @@ struct rtnl_link_ops {
 	const char		*kind;
 
 	size_t			priv_size;
-	struct net_device	*(*alloc)(struct nlattr *tb[],
-					  const char *ifname,
-					  unsigned char name_assign_type,
-					  unsigned int num_tx_queues,
-					  unsigned int num_rx_queues);
 	void			(*setup)(struct net_device *dev);
 
 	unsigned int		maxtype;
@@ -126,7 +121,11 @@ struct rtnl_link_ops {
 						   int *prividx, int attr);
 
 	RH_KABI_USE(1, bool netns_refund)
-	RH_KABI_RESERVE(2)
+	RH_KABI_USE(2, struct net_device	*(*alloc)(struct nlattr *tb[],
+							  const char *ifname,
+							  unsigned char name_assign_type,
+							  unsigned int num_tx_queues,
+							  unsigned int num_rx_queues))
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)

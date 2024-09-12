@@ -1547,7 +1547,7 @@ static void raid1_write_request(struct mddev *mddev, struct bio *bio,
 	 */
 	if (write_behind && bitmap)
 		max_sectors = min_t(int, max_sectors,
-				    BIO_MAX_VECS * (PAGE_SIZE >> 9));
+				    BIO_MAX_PAGES * (PAGE_SIZE >> 9));
 	if (max_sectors < bio_sectors(bio)) {
 		struct bio *split = bio_split(bio, max_sectors,
 					      GFP_NOIO, &conf->bio_split);

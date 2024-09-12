@@ -437,10 +437,10 @@ rtw89_core_tx_update_ampdu_info(struct rtw89_dev *rtwdev,
 
 	ampdu_num = (u8)((rtwsta->ampdu_params[tid].agg_num ?
 			  rtwsta->ampdu_params[tid].agg_num :
-			  4 << sta->ht_cap.ampdu_factor) - 1);
+			  4 << sta->deflink.ht_cap.ampdu_factor) - 1);
 
 	desc_info->agg_en = true;
-	desc_info->ampdu_density = sta->ht_cap.ampdu_density;
+	desc_info->ampdu_density = sta->deflink.ht_cap.ampdu_density;
 	desc_info->ampdu_num = ampdu_num;
 }
 
@@ -625,7 +625,7 @@ __rtw89_core_tx_check_he_qos_htc(struct rtw89_dev *rtwdev,
 	if (pkt_type < PACKET_MAX)
 		return false;
 
-	if (!sta || !sta->he_cap.has_he)
+	if (!sta || !sta->deflink.he_cap.has_he)
 		return false;
 
 	if (!ieee80211_is_data_qos(fc))
@@ -1386,7 +1386,7 @@ static void rtw89_stats_trigger_frame(struct rtw89_dev *rtwdev,
 		if (aid == RTW89_TF_PAD)
 			break;
 
-		if (aid == vif->bss_conf.aid) {
+		if (aid == vif->cfg.aid) {
 			rtwvif->stats.rx_tf_acc++;
 			rtwdev->stats.rx_tf_acc++;
 			break;

@@ -38,7 +38,7 @@ struct xfs_trans_res;
 struct xfs_inobt_rec_incore;
 union xfs_btree_ptr;
 struct xfs_dqtrx;
-struct xfs_eofblocks;
+struct xfs_icwalk;
 
 #define XFS_ATTR_FILTER_FLAGS \
 	{ XFS_ATTR_ROOT,	"ROOT" }, \
@@ -1942,7 +1942,6 @@ DEFINE_ATTR_EVENT(xfs_attr_refillstate);
 
 DEFINE_ATTR_EVENT(xfs_attr_rmtval_get);
 DEFINE_ATTR_EVENT(xfs_attr_rmtval_set);
-DEFINE_ATTR_EVENT(xfs_attr_rmtval_remove);
 
 #define DEFINE_DA_EVENT(name) \
 DEFINE_EVENT(xfs_da_class, name, \
@@ -3886,10 +3885,10 @@ DEFINE_EVENT(xfs_timestamp_range_class, name, \
 DEFINE_TIMESTAMP_RANGE_EVENT(xfs_inode_timestamp_range);
 DEFINE_TIMESTAMP_RANGE_EVENT(xfs_quota_expiry_range);
 
-DECLARE_EVENT_CLASS(xfs_eofblocks_class,
-	TP_PROTO(struct xfs_mount *mp, struct xfs_eofblocks *eofb,
+DECLARE_EVENT_CLASS(xfs_icwalk_class,
+	TP_PROTO(struct xfs_mount *mp, struct xfs_icwalk *icw,
 		 unsigned long caller_ip),
-	TP_ARGS(mp, eofb, caller_ip),
+	TP_ARGS(mp, icw, caller_ip),
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
 		__field(__u32, flags)
@@ -3897,35 +3896,38 @@ DECLARE_EVENT_CLASS(xfs_eofblocks_class,
 		__field(uint32_t, gid)
 		__field(prid_t, prid)
 		__field(__u64, min_file_size)
+		__field(long, scan_limit)
 		__field(unsigned long, caller_ip)
 	),
 	TP_fast_assign(
 		__entry->dev = mp->m_super->s_dev;
-		__entry->flags = eofb ? eofb->eof_flags : 0;
-		__entry->uid = eofb ? from_kuid(mp->m_super->s_user_ns,
-						eofb->eof_uid) : 0;
-		__entry->gid = eofb ? from_kgid(mp->m_super->s_user_ns,
-						eofb->eof_gid) : 0;
-		__entry->prid = eofb ? eofb->eof_prid : 0;
-		__entry->min_file_size = eofb ? eofb->eof_min_file_size : 0;
+		__entry->flags = icw ? icw->icw_flags : 0;
+		__entry->uid = icw ? from_kuid(mp->m_super->s_user_ns,
+						icw->icw_uid) : 0;
+		__entry->gid = icw ? from_kgid(mp->m_super->s_user_ns,
+						icw->icw_gid) : 0;
+		__entry->prid = icw ? icw->icw_prid : 0;
+		__entry->min_file_size = icw ? icw->icw_min_file_size : 0;
+		__entry->scan_limit = icw ? icw->icw_scan_limit : 0;
 		__entry->caller_ip = caller_ip;
 	),
-	TP_printk("dev %d:%d flags 0x%x uid %u gid %u prid %u minsize %llu caller %pS",
+	TP_printk("dev %d:%d flags 0x%x uid %u gid %u prid %u minsize %llu scan_limit %ld caller %pS",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
 		  __entry->flags,
 		  __entry->uid,
 		  __entry->gid,
 		  __entry->prid,
 		  __entry->min_file_size,
+		  __entry->scan_limit,
 		  (char *)__entry->caller_ip)
 );
-#define DEFINE_EOFBLOCKS_EVENT(name)	\
-DEFINE_EVENT(xfs_eofblocks_class, name,	\
-	TP_PROTO(struct xfs_mount *mp, struct xfs_eofblocks *eofb, \
+#define DEFINE_ICWALK_EVENT(name)	\
+DEFINE_EVENT(xfs_icwalk_class, name,	\
+	TP_PROTO(struct xfs_mount *mp, struct xfs_icwalk *icw, \
 		 unsigned long caller_ip), \
-	TP_ARGS(mp, eofb, caller_ip))
-DEFINE_EOFBLOCKS_EVENT(xfs_ioc_free_eofblocks);
-DEFINE_EOFBLOCKS_EVENT(xfs_blockgc_free_space);
+	TP_ARGS(mp, icw, caller_ip))
+DEFINE_ICWALK_EVENT(xfs_ioc_free_eofblocks);
+DEFINE_ICWALK_EVENT(xfs_blockgc_free_space);
 
 TRACE_DEFINE_ENUM(XLOG_STATE_ACTIVE);
 TRACE_DEFINE_ENUM(XLOG_STATE_WANT_SYNC);

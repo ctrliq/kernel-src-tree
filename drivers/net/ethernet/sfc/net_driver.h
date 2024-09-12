@@ -178,6 +178,7 @@ struct efx_tx_buffer {
 #define EFX_TX_BUF_OPTION	0x10	/* empty buffer for option descriptor */
 #define EFX_TX_BUF_XDP		0x20	/* buffer was sent with XDP */
 #define EFX_TX_BUF_TSO_V3	0x40	/* empty buffer for a TSO_V3 descriptor */
+#define EFX_TX_BUF_EFV		0x100	/* buffer was sent from representor */
 
 /**
  * struct efx_tx_queue - An Efx TX queue
@@ -969,12 +970,15 @@ enum efx_xdp_tx_queues_mode {
  * @vf_count: Number of VFs intended to be enabled.
  * @vf_init_count: Number of VFs that have been fully initialised.
  * @vi_scale: log2 number of vnics per VF.
+ * @vf_reps_lock: Protects vf_reps list
+ * @vf_reps: local VF reps
  * @ptp_data: PTP state data
  * @ptp_warned: has this NIC seen and warned about unexpected PTP events?
  * @vpd_sn: Serial number read from VPD
  * @xdp_rxq_info_failed: Have any of the rx queues failed to initialise their
  *      xdp_rxq_info structures?
  * @netdev_notifier: Netdevice notifier.
+ * @tc: state for TC offload (EF100).
  * @mem_bar: The BAR that is mapped into membase.
  * @reg_base: Offset from the start of the bar to the function control window.
  * @monitor_work: Hardware monitor workitem
@@ -1148,6 +1152,8 @@ struct efx_nic {
 	unsigned vf_init_count;
 	unsigned vi_scale;
 #endif
+	spinlock_t vf_reps_lock;
+	struct list_head vf_reps;
 
 	struct efx_ptp_data *ptp_data;
 	bool ptp_warned;
@@ -1156,6 +1162,7 @@ struct efx_nic {
 	bool xdp_rxq_info_failed;
 
 	struct notifier_block netdev_notifier;
+	struct efx_tc_state *tc;
 
 	unsigned int mem_bar;
 	u32 reg_base;

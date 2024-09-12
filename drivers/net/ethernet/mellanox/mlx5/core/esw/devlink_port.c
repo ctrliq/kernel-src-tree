@@ -91,9 +91,11 @@ int mlx5_esw_offloads_devlink_port_register(struct mlx5_eswitch *esw, u16 vport_
 	if (err)
 		goto reg_err;
 
-	err = devlink_rate_leaf_create(dl_port, vport);
-	if (err)
-		goto rate_err;
+	if (vport_num != MLX5_VPORT_UPLINK) {
+		err = devlink_rate_leaf_create(dl_port, vport);
+		if (err)
+			goto rate_err;
+	}
 
 	vport->dl_port = dl_port;
 	return 0;

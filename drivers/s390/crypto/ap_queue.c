@@ -20,7 +20,7 @@ static void __ap_flush_queue(struct ap_queue *aq);
 
 /**
  * ap_queue_enable_irq(): Enable interrupt support on this AP queue.
- * @qid: The AP queue number
+ * @aq: The AP queue
  * @ind: the notification indicator byte
  *
  * Enables interruption on AP queue via ap_aqic(). Based on the return
@@ -99,7 +99,7 @@ int ap_recv(ap_qid_t qid, unsigned long long *psmid, void *msg, size_t length)
 {
 	struct ap_queue_status status;
 
-	if (msg == NULL)
+	if (!msg)
 		return -EINVAL;
 	status = ap_dqap(qid, psmid, msg, length);
 	switch (status.response_code) {
@@ -317,7 +317,7 @@ static enum ap_sm_wait ap_sm_read_write(struct ap_queue *aq)
 
 /**
  * ap_sm_reset(): Reset an AP queue.
- * @qid: The AP queue number
+ * @aq: The AP queue
  *
  * Submit the Reset command to an AP queue.
  */
@@ -632,7 +632,7 @@ static ssize_t interrupt_show(struct device *dev,
 static DEVICE_ATTR_RO(interrupt);
 
 static ssize_t config_show(struct device *dev,
-			     struct device_attribute *attr, char *buf)
+			   struct device_attribute *attr, char *buf)
 {
 	struct ap_queue *aq = to_ap_queue(dev);
 	int rc;
@@ -856,8 +856,9 @@ int ap_queue_message(struct ap_queue *aq, struct ap_message *ap_msg)
 		aq->requestq_count++;
 		aq->total_request_count++;
 		atomic64_inc(&aq->card->total_request_count);
-	} else
+	} else {
 		rc = -ENODEV;
+	}
 
 	/* Send/receive as many request from the queue as possible. */
 	ap_wait(ap_sm_event_loop(aq, AP_SM_EVENT_POLL));

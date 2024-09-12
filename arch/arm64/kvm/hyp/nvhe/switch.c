@@ -116,7 +116,7 @@ static void __hyp_vgic_restore_state(struct kvm_vcpu *vcpu)
 	}
 }
 
-/**
+/*
  * Disable host events, enable guest events
  */
 static bool __pmu_switch_to_guest(struct kvm_cpu_context *host_ctxt)
@@ -136,7 +136,7 @@ static bool __pmu_switch_to_guest(struct kvm_cpu_context *host_ctxt)
 	return (pmu->events_host || pmu->events_guest);
 }
 
-/**
+/*
  * Disable guest events, enable host events
  */
 static void __pmu_switch_to_host(struct kvm_cpu_context *host_ctxt)

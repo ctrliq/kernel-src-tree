@@ -10,6 +10,7 @@
 #define __SOUND_SOC_SOF_IPC4_PRIV_H
 
 #include <linux/idr.h>
+#include <sound/sof/ext_manifest4.h>
 #include "sof-priv.h"
 
 /**
@@ -17,11 +18,34 @@
  * @manifest_fw_hdr_offset: FW header offset in the manifest
  * @num_fw_modules : Number of modules in base FW
  * @fw_modules: Array of base FW modules
+ * @nhlt: NHLT table either from the BIOS or the topology manifest
  */
 struct sof_ipc4_fw_data {
 	u32 manifest_fw_hdr_offset;
 	int num_fw_modules;
 	void *fw_modules;
+	void *nhlt;
 };
+
+/**
+ * struct sof_ipc4_fw_module - IPC4 module info
+ * @sof_man4_module : Module info
+ * @m_ida: Module instance identifier
+ * @bss_size: Module object size
+ * @private: Module private data
+ */
+struct sof_ipc4_fw_module {
+	struct sof_man4_module man4_module_entry;
+	struct ida m_ida;
+	u32 bss_size;
+	void *private;
+};
+
+extern const struct sof_ipc_fw_loader_ops ipc4_loader_ops;
+extern const struct sof_ipc_tplg_ops ipc4_tplg_ops;
+extern const struct sof_ipc_tplg_control_ops tplg_ipc4_control_ops;
+extern const struct sof_ipc_pcm_ops ipc4_pcm_ops;
+
+int sof_ipc4_set_pipeline_state(struct snd_sof_dev *sdev, u32 id, u32 state);
 
 #endif

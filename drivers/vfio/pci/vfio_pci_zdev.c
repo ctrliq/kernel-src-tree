@@ -16,6 +16,7 @@
 #include <linux/uaccess.h>
 #include <linux/vfio.h>
 #include <linux/vfio_zdev.h>
+#include <linux/kvm_host.h>
 #include <asm/pci_clp.h>
 #include <asm/pci_io.h>
 
@@ -147,4 +148,64 @@ int vfio_pci_info_zdev_add_caps(struct vfio_pci_device *vdev,
 	ret = zpci_pfip_cap(zdev, vdev, caps);
 
 	return ret;
+}
+
+static int rhel_vfio_pci_zdev_group_notifier(struct notifier_block *nb,
+					     unsigned long action, void *data)
+{
+	struct zpci_dev *zdev = container_of(nb, struct zpci_dev,
+					     kzd_group_notifier);
+
+	/* the only action we care about */
+	if (action == VFIO_GROUP_NOTIFY_SET_KVM && zpci_kvm_hook.kvm_register) {
+		if (data) {
+			if (zpci_kvm_hook.kvm_register(zdev, data))
+				return NOTIFY_BAD;
+		}
+	}
+
+	return NOTIFY_OK;
+}
+
+int vfio_pci_zdev_open_device(struct vfio_pci_device *vdev)
+{
+	struct zpci_dev *zdev = to_zpci(vdev->pdev);
+	unsigned long events = VFIO_GROUP_NOTIFY_SET_KVM;
+	int ret;
+
+	if (!zdev)
+		return -ENODEV;
+
+	/* RHEL8 specific: Get kvm pointer via group notifier */
+	zdev->kzd_group_notifier.notifier_call = rhel_vfio_pci_zdev_group_notifier;
+	ret = vfio_register_notifier(&vdev->pdev->dev, VFIO_GROUP_NOTIFY,
+				     &events, &zdev->kzd_group_notifier);
+	if (ret != 0) {
+		pr_warn("vfio_register_notifier for group failed: %d\n", ret);
+		return ret;
+	}
+
+	/*
+	 * RHEL8: The notifier is called immediately after the registration
+	 * since the kvm pointer has been set before already. Avoid further
+	 * notifications by unregistering right now again.
+	 * (This ugliness has been fixed in upstream by commit 421cfe6596f6cb3
+	 * - however we cannot backport it easily since the VFIO subsystems
+	 * differs too much in downstream RHEL already)
+	 */
+	vfio_unregister_notifier(&vdev->pdev->dev, VFIO_GROUP_NOTIFY,
+				 &zdev->kzd_group_notifier);
+
+	return 0;
+}
+
+void vfio_pci_zdev_close_device(struct vfio_pci_device *vdev)
+{
+	struct zpci_dev *zdev = to_zpci(vdev->pdev);
+
+	if (!zdev || !zdev->kzdev)
+		return;
+
+	if (zpci_kvm_hook.kvm_unregister)
+		zpci_kvm_hook.kvm_unregister(zdev);
 }

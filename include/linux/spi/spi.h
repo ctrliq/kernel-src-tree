@@ -14,6 +14,8 @@
 #include <linux/scatterlist.h>
 #include <linux/gpio/consumer.h>
 
+#include <linux/acpi.h>
+
 struct dma_chan;
 struct property_entry;
 struct spi_controller;
@@ -661,6 +663,12 @@ extern int devm_spi_register_controller(struct device *dev,
 extern void spi_unregister_controller(struct spi_controller *ctlr);
 
 extern struct spi_controller *spi_busnum_to_master(u16 busnum);
+#if IS_ENABLED(CONFIG_ACPI)
+extern struct spi_device *acpi_spi_device_alloc(struct spi_controller *ctlr,
+						struct acpi_device *adev,
+						int index);
+int acpi_spi_count_resources(struct acpi_device *adev);
+#endif
 
 /*
  * SPI resource management while processing a SPI message

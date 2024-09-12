@@ -24,6 +24,8 @@
 #include "ef100_tx.h"
 #include "ef100_sriov.h"
 #include "ef100_netdev.h"
+#include "tc.h"
+#include "mae.h"
 #include "rx_common.h"
 
 #define EF100_MAX_VIS 4096
@@ -148,7 +150,7 @@ static int ef100_get_mac_address(struct efx_nic *efx, u8 *mac_address)
 	return 0;
 }
 
-static int efx_ef100_init_datapath_caps(struct efx_nic *efx)
+int efx_ef100_init_datapath_caps(struct efx_nic *efx)
 {
 	MCDI_DECLARE_BUF(outbuf, MC_CMD_GET_CAPABILITIES_V7_OUT_LEN);
 	struct ef100_nic_data *nic_data = efx->nic_data;
@@ -327,7 +329,7 @@ static irqreturn_t ef100_msi_interrupt(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-static int ef100_phy_probe(struct efx_nic *efx)
+int ef100_phy_probe(struct efx_nic *efx)
 {
 	struct efx_mcdi_phy_data *phy_data;
 	int rc;
@@ -365,7 +367,7 @@ static int ef100_phy_probe(struct efx_nic *efx)
 	return 0;
 }
 
-static int ef100_filter_table_probe(struct efx_nic *efx)
+int ef100_filter_table_probe(struct efx_nic *efx)
 {
 	return efx_mcdi_filter_table_probe(efx, true);
 }
@@ -382,7 +384,18 @@ static int ef100_filter_table_up(struct efx_nic *efx)
 	rc = efx_mcdi_filter_add_vlan(efx, 0);
 	if (rc)
 		goto fail_vlan0;
+	/* Drop the lock: we've finished altering table existence, and
+	 * filter insertion will need to take the lock for read.
+	 */
 	up_write(&efx->filter_sem);
+#ifdef CONFIG_SFC_SRIOV
+	rc = efx_tc_insert_rep_filters(efx);
+	/* Rep filter failure is nonfatal */
+	if (rc)
+		netif_warn(efx, drv, efx->net_dev,
+			   "Failed to insert representor filters, rc %d\n",
+			   rc);
+#endif
 	return 0;
 
 fail_vlan0:
@@ -395,6 +408,9 @@ fail_unspec:
 
 static void ef100_filter_table_down(struct efx_nic *efx)
 {
+#ifdef CONFIG_SFC_SRIOV
+	efx_tc_remove_rep_filters(efx);
+#endif
 	down_write(&efx->filter_sem);
 	efx_mcdi_filter_del_vlan(efx, 0);
 	efx_mcdi_filter_del_vlan(efx, EFX_FILTER_VID_UNSPEC);
@@ -710,6 +726,31 @@ static unsigned int efx_ef100_recycle_ring_size(const struct efx_nic *efx)
 	return 10 * EFX_RECYCLE_RING_SIZE_10G;
 }
 
+#ifdef CONFIG_SFC_SRIOV
+static int efx_ef100_get_base_mport(struct efx_nic *efx)
+{
+	struct ef100_nic_data *nic_data = efx->nic_data;
+	u32 selector, id;
+	int rc;
+
+	/* Construct mport selector for "physical network port" */
+	efx_mae_mport_wire(efx, &selector);
+	/* Look up actual mport ID */
+	rc = efx_mae_lookup_mport(efx, selector, &id);
+	if (rc)
+		return rc;
+	/* The ID should always fit in 16 bits, because that's how wide the
+	 * corresponding fields in the RX prefix & TX override descriptor are
+	 */
+	if (id >> 16)
+		netif_warn(efx, probe, efx->net_dev, "Bad base m-port id %#x\n",
+			   id);
+	nic_data->base_mport = id;
+	nic_data->have_mport = true;
+	return 0;
+}
+#endif
+
 static int compare_versions(const char *a, const char *b)
 {
 	int a_major, a_minor, a_point, a_patch;
@@ -843,11 +884,13 @@ static int ef100_process_design_param(struct efx_nic *efx,
 		return 0;
 	case ESE_EF100_DP_GZ_TSO_MAX_PAYLOAD_LEN:
 		nic_data->tso_max_payload_len = min_t(u64, reader->value, GSO_MAX_SIZE);
-		netif_set_gso_max_size(efx->net_dev, nic_data->tso_max_payload_len);
+		netif_set_tso_max_size(efx->net_dev,
+				       nic_data->tso_max_payload_len);
 		return 0;
 	case ESE_EF100_DP_GZ_TSO_MAX_PAYLOAD_NUM_SEGS:
 		nic_data->tso_max_payload_num_segs = min_t(u64, reader->value, 0xffff);
-		netif_set_gso_max_segs(efx->net_dev, nic_data->tso_max_payload_num_segs);
+		netif_set_tso_max_segs(efx->net_dev,
+				       nic_data->tso_max_payload_num_segs);
 		return 0;
 	case ESE_EF100_DP_GZ_TSO_MAX_NUM_FRAMES:
 		nic_data->tso_max_frames = min_t(u64, reader->value, 0xffff);
@@ -908,8 +951,7 @@ static int ef100_check_design_params(struct efx_nic *efx)
 
 	efx_readd(efx, &reg, ER_GZ_PARAMS_TLV_LEN);
 	total_len = EFX_DWORD_FIELD(reg, EFX_DWORD_0);
-	netif_dbg(efx, probe, efx->net_dev, "%u bytes of design parameters\n",
-		  total_len);
+	pci_dbg(efx->pci_dev, "%u bytes of design parameters\n", total_len);
 	while (offset < total_len) {
 		efx_readd(efx, &reg, ER_GZ_PARAMS_TLV + offset);
 		data = EFX_DWORD_FIELD(reg, EFX_DWORD_0);
@@ -948,7 +990,6 @@ out:
 static int ef100_probe_main(struct efx_nic *efx)
 {
 	unsigned int bar_size = resource_size(&efx->pci_dev->resource[efx->mem_bar]);
-	struct net_device *net_dev = efx->net_dev;
 	struct ef100_nic_data *nic_data;
 	char fw_version[32];
 	u32 priv_mask = 0;
@@ -962,23 +1003,18 @@ static int ef100_probe_main(struct efx_nic *efx)
 		return -ENOMEM;
 	efx->nic_data = nic_data;
 	nic_data->efx = efx;
-	net_dev->features |= efx->type->offload_features;
-	net_dev->hw_features |= efx->type->offload_features;
-	net_dev->hw_enc_features |= efx->type->offload_features;
-	net_dev->vlan_features |= NETIF_F_HW_CSUM | NETIF_F_SG |
-				  NETIF_F_HIGHDMA | NETIF_F_ALL_TSO;
+	efx->max_vis = EF100_MAX_VIS;
 
 	/* Populate design-parameter defaults */
 	nic_data->tso_max_hdr_len = ESE_EF100_DP_GZ_TSO_MAX_HDR_LEN_DEFAULT;
 	nic_data->tso_max_frames = ESE_EF100_DP_GZ_TSO_MAX_NUM_FRAMES_DEFAULT;
 	nic_data->tso_max_payload_num_segs = ESE_EF100_DP_GZ_TSO_MAX_PAYLOAD_NUM_SEGS_DEFAULT;
 	nic_data->tso_max_payload_len = ESE_EF100_DP_GZ_TSO_MAX_PAYLOAD_LEN_DEFAULT;
-	netif_set_gso_max_segs(net_dev, ESE_EF100_DP_GZ_TSO_MAX_HDR_NUM_SEGS_DEFAULT);
+
 	/* Read design parameters */
 	rc = ef100_check_design_params(efx);
 	if (rc) {
-		netif_err(efx, probe, efx->net_dev,
-			  "Unsupported design parameters\n");
+		pci_err(efx->pci_dev, "Unsupported design parameters\n");
 		goto fail;
 	}
 
@@ -1015,12 +1051,6 @@ static int ef100_probe_main(struct efx_nic *efx)
 	/* Post-IO section. */
 
 	rc = efx_mcdi_init(efx);
-	if (!rc && efx->mcdi->fn_flags &
-		   (1 << MC_CMD_DRV_ATTACH_EXT_OUT_FLAG_NO_ACTIVE_PORT)) {
-		netif_info(efx, probe, efx->net_dev,
-			   "No network port on this PCI function");
-		rc = -ENODEV;
-	}
 	if (rc)
 		goto fail;
 	/* Reset (most) configuration for this function */
@@ -1036,19 +1066,13 @@ static int ef100_probe_main(struct efx_nic *efx)
 	if (rc)
 		goto fail;
 
-	rc = efx_ef100_init_datapath_caps(efx);
-	if (rc < 0)
-		goto fail;
-
-	efx->max_vis = EF100_MAX_VIS;
-
 	rc = efx_mcdi_port_get_number(efx);
 	if (rc < 0)
 		goto fail;
 	efx->port_num = rc;
 
 	efx_mcdi_print_fwver(efx, fw_version, sizeof(fw_version));
-	netif_dbg(efx, drv, efx->net_dev, "Firmware version %s\n", fw_version);
+	pci_dbg(efx->pci_dev, "Firmware version %s\n", fw_version);
 
 	rc = efx_mcdi_get_privilege_mask(efx, &priv_mask);
 	if (rc) /* non-fatal, and priv_mask will still be 0 */
@@ -1057,52 +1081,28 @@ static int ef100_probe_main(struct efx_nic *efx)
 	nic_data->grp_mae = !!(priv_mask & MC_CMD_PRIVILEGE_MASK_IN_GRP_MAE);
 
 	if (compare_versions(fw_version, "1.1.0.1000") < 0) {
-		netif_info(efx, drv, efx->net_dev, "Firmware uses old event descriptors\n");
+		pci_info(efx->pci_dev, "Firmware uses old event descriptors\n");
 		rc = -EINVAL;
 		goto fail;
 	}
 
 	if (efx_has_cap(efx, UNSOL_EV_CREDIT_SUPPORTED)) {
-		netif_info(efx, drv, efx->net_dev, "Firmware uses unsolicited-event credits\n");
+		pci_info(efx->pci_dev, "Firmware uses unsolicited-event credits\n");
 		rc = -EINVAL;
 		goto fail;
 	}
-
-	rc = ef100_phy_probe(efx);
-	if (rc)
-		goto fail;
-
-	down_write(&efx->filter_sem);
-	rc = ef100_filter_table_probe(efx);
-	up_write(&efx->filter_sem);
-	if (rc)
-		goto fail;
-
-	netdev_rss_key_fill(efx->rss_context.rx_hash_key,
-			    sizeof(efx->rss_context.rx_hash_key));
-
-	/* Don't fail init if RSS setup doesn't work. */
-	efx_mcdi_push_default_indir_table(efx, efx->n_rx_channels);
-
-	rc = ef100_register_netdev(efx);
-	if (rc)
-		goto fail;
 
 	return 0;
 fail:
 	return rc;
 }
 
-int ef100_probe_pf(struct efx_nic *efx)
+int ef100_probe_netdev_pf(struct efx_nic *efx)
 {
+	struct ef100_nic_data *nic_data = efx->nic_data;
 	struct net_device *net_dev = efx->net_dev;
-	struct ef100_nic_data *nic_data;
-	int rc = ef100_probe_main(efx);
+	int rc;
 
-	if (rc)
-		goto fail;
-
-	nic_data = efx->nic_data;
 	rc = ef100_get_mac_address(efx, net_dev->perm_addr);
 	if (rc)
 		goto fail;
@@ -1110,6 +1110,34 @@ int ef100_probe_pf(struct efx_nic *efx)
 	eth_hw_addr_set(net_dev, net_dev->perm_addr);
 	memcpy(nic_data->port_id, net_dev->perm_addr, ETH_ALEN);
 
+	if (!nic_data->grp_mae)
+		return 0;
+
+#ifdef CONFIG_SFC_SRIOV
+	rc = efx_init_struct_tc(efx);
+	if (rc)
+		return rc;
+
+	rc = efx_ef100_get_base_mport(efx);
+	if (rc) {
+		netif_warn(efx, probe, net_dev,
+			   "Failed to probe base mport rc %d; representors will not function\n",
+			   rc);
+	}
+
+	rc = efx_init_tc(efx);
+	if (rc) {
+		/* Either we don't have an MAE at all (i.e. legacy v-switching),
+		 * or we do but we failed to probe it.  In the latter case, we
+		 * may not have set up default rules, in which case we won't be
+		 * able to pass any traffic.  However, we don't fail the probe,
+		 * because the user might need to use the netdevice to apply
+		 * configuration changes to fix whatever's wrong with the MAE.
+		 */
+		netif_warn(efx, probe, net_dev, "Failed to probe MAE rc %d\n",
+			   rc);
+	}
+#endif
 	return 0;
 
 fail:
@@ -1125,14 +1153,6 @@ void ef100_remove(struct efx_nic *efx)
 {
 	struct ef100_nic_data *nic_data = efx->nic_data;
 
-	ef100_unregister_netdev(efx);
-
-	down_write(&efx->filter_sem);
-	efx_mcdi_filter_table_remove(efx);
-	up_write(&efx->filter_sem);
-	efx_fini_channels(efx);
-	kfree(efx->phy_data);
-	efx->phy_data = NULL;
 	efx_mcdi_detach(efx);
 	efx_mcdi_fini(efx);
 	if (nic_data)
@@ -1151,7 +1171,7 @@ void ef100_remove(struct efx_nic *efx)
 const struct efx_nic_type ef100_pf_nic_type = {
 	.revision = EFX_REV_EF100,
 	.is_vf = false,
-	.probe = ef100_probe_pf,
+	.probe = ef100_probe_main,
 	.offload_features = EF100_OFFLOAD_FEATURES,
 	.mcdi_max_ver = 2,
 	.mcdi_request = ef100_mcdi_request,

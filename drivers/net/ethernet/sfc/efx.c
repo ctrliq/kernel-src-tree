@@ -708,7 +708,7 @@ static int efx_register_netdev(struct efx_nic *efx)
 	if (efx_nic_rev(efx) >= EFX_REV_HUNT_A0)
 		net_dev->priv_flags |= IFF_UNICAST_FLT;
 	net_dev->ethtool_ops = &efx_ethtool_ops;
-	netif_set_gso_max_segs(net_dev, EFX_TSO_MAX_SEGS);
+	netif_set_tso_max_segs(net_dev, EFX_TSO_MAX_SEGS);
 	net_dev->min_mtu = EFX_MIN_MTU;
 	net_dev->max_mtu = EFX_MAX_MTU;
 
@@ -813,12 +813,6 @@ static const struct pci_device_id efx_pci_table[] = {
 	{0}			/* end of list */
 };
 
-static const struct pci_device_id efx_deprecated_pci_table[] = {
-	{PCI_DEVICE(PCI_VENDOR_ID_SOLARFLARE, 0x0803)},	/* SFC9020 */
-	{PCI_DEVICE(PCI_VENDOR_ID_SOLARFLARE, 0x0813)},	/* SFL9021 */
-	{0}
-};
-
 /**************************************************************************
  *
  * Data housekeeping
@@ -893,7 +887,7 @@ static void efx_pci_remove(struct pci_dev *pci_dev)
 	efx_pci_remove_main(efx);
 
 	efx_fini_io(efx);
-	netif_dbg(efx, drv, efx->net_dev, "shutdown successful\n");
+	pci_dbg(efx->pci_dev, "shutdown successful\n");
 
 	efx_fini_struct(efx);
 	free_netdev(efx->net_dev);
@@ -1087,8 +1081,6 @@ static int efx_pci_probe(struct pci_dev *pci_dev,
 
 	if (!efx->type->is_vf)
 		efx_probe_vpd_strings(efx);
-
-	pci_hw_deprecated(efx_deprecated_pci_table, pci_dev);
 
 	/* Set up basic I/O (BAR mappings etc) */
 	rc = efx_init_io(efx, efx->type->mem_bar(efx), efx->type->max_dma_mask,

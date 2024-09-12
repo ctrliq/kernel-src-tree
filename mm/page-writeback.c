@@ -2029,7 +2029,6 @@ int dirty_writeback_centisecs_handler(struct ctl_table *table, int write,
 	return ret;
 }
 
-#ifdef CONFIG_BLOCK
 void laptop_mode_timer_fn(struct timer_list *t)
 {
 	struct backing_dev_info *backing_dev_info =
@@ -2064,7 +2063,6 @@ void laptop_sync_completion(void)
 
 	rcu_read_unlock();
 }
-#endif
 
 /*
  * If ratelimit_pages is too high then we can get into dirty-data overload
@@ -2391,7 +2389,7 @@ int do_writepages(struct address_space *mapping, struct writeback_control *wbc)
 		 * guess as any.
 		 */
 		reclaim_throttle(NODE_DATA(numa_node_id()),
-			VMSCAN_THROTTLE_WRITEBACK, HZ/50);
+			VMSCAN_THROTTLE_WRITEBACK);
 	}
 	/*
 	 * Usually few pages are written by now from those we've just submitted
@@ -2779,7 +2777,7 @@ static void wb_inode_writeback_end(struct bdi_writeback *wb)
 	 * that if multiple inodes end writeback at a similar time, they get
 	 * batched into one bandwidth update.
 	 */
-	queue_delayed_work(bdi_wq, wb->bw_dwork, BANDWIDTH_INTERVAL);
+	queue_delayed_work(bdi_wq, &wb->_rh->bw_dwork, BANDWIDTH_INTERVAL);
 }
 
 int test_clear_page_writeback(struct page *page)

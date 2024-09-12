@@ -41,6 +41,12 @@
 #define FN(reg_name, field) \
 	FD(reg_name##__##field)
 
+#include "logger_types.h"
+#undef DC_LOGGER
+#define DC_LOGGER \
+	CTX->logger
+#define smu_print(str, ...) {DC_LOG_SMU(str, ##__VA_ARGS__); }
+
 #define VBIOSSMC_MSG_GetSmuVersion                0x2
 #define VBIOSSMC_MSG_SetDispclkFreq               0x4
 #define VBIOSSMC_MSG_SetDprefclkFreq              0x5
@@ -88,11 +94,20 @@ static uint32_t dcn301_smu_wait_for_response(struct clk_mgr_internal *clk_mgr, u
 	return res_val;
 }
 
-int dcn301_smu_send_msg_with_param(
-		struct clk_mgr_internal *clk_mgr,
-		unsigned int msg_id, unsigned int param)
+static int dcn301_smu_send_msg_with_param(struct clk_mgr_internal *clk_mgr,
+					  unsigned int msg_id,
+					  unsigned int param)
 {
 	uint32_t result;
+
+	result = dcn301_smu_wait_for_response(clk_mgr, 10, 200000);
+
+	if (result != VBIOSSMC_Result_OK)
+		smu_print("SMU Response was not OK. SMU response after wait received is: %d\n", result);
+
+	if (result == VBIOSSMC_Status_BUSY) {
+		return -1;
+	}
 
 	/* First clear response register */
 	REG_WRITE(MP1_SMN_C2PMSG_91, VBIOSSMC_Status_BUSY);
@@ -133,7 +148,7 @@ int dcn301_smu_set_dispclk(struct clk_mgr_internal *clk_mgr, int requested_dispc
 	actual_dispclk_set_mhz = dcn301_smu_send_msg_with_param(
 			clk_mgr,
 			VBIOSSMC_MSG_SetDispclkFreq,
-			requested_dispclk_khz / 1000);
+			khz_to_mhz_ceil(requested_dispclk_khz));
 
 	return actual_dispclk_set_mhz * 1000;
 }
@@ -147,7 +162,7 @@ int dcn301_smu_set_dprefclk(struct clk_mgr_internal *clk_mgr)
 	actual_dprefclk_set_mhz = dcn301_smu_send_msg_with_param(
 			clk_mgr,
 			VBIOSSMC_MSG_SetDprefclkFreq,
-			clk_mgr->base.dprefclk_khz / 1000);
+			khz_to_mhz_ceil(clk_mgr->base.dprefclk_khz));
 
 	/* TODO: add code for programing DP DTO, currently this is down by command table */
 
@@ -163,7 +178,11 @@ int dcn301_smu_set_hard_min_dcfclk(struct clk_mgr_internal *clk_mgr, int request
 	actual_dcfclk_set_mhz = dcn301_smu_send_msg_with_param(
 			clk_mgr,
 			VBIOSSMC_MSG_SetHardMinDcfclkByFreq,
-			requested_dcfclk_khz / 1000);
+			khz_to_mhz_ceil(requested_dcfclk_khz));
+
+#ifdef DBG
+	smu_print("actual_dcfclk_set_mhz %d is set to : %d\n", actual_dcfclk_set_mhz, actual_dcfclk_set_mhz * 1000);
+#endif
 
 	return actual_dcfclk_set_mhz * 1000;
 }
@@ -177,7 +196,7 @@ int dcn301_smu_set_min_deep_sleep_dcfclk(struct clk_mgr_internal *clk_mgr, int r
 	actual_min_ds_dcfclk_mhz = dcn301_smu_send_msg_with_param(
 			clk_mgr,
 			VBIOSSMC_MSG_SetMinDeepSleepDcfclk,
-			requested_min_ds_dcfclk_khz / 1000);
+			khz_to_mhz_ceil(requested_min_ds_dcfclk_khz));
 
 	return actual_min_ds_dcfclk_mhz * 1000;
 }
@@ -191,7 +210,7 @@ int dcn301_smu_set_dppclk(struct clk_mgr_internal *clk_mgr, int requested_dpp_kh
 	actual_dppclk_set_mhz = dcn301_smu_send_msg_with_param(
 			clk_mgr,
 			VBIOSSMC_MSG_SetDppclkFreq,
-			requested_dpp_khz / 1000);
+			khz_to_mhz_ceil(requested_dpp_khz));
 
 	return actual_dppclk_set_mhz * 1000;
 }

@@ -1416,6 +1416,15 @@ static struct ctl_table vm_table[] = {
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= &two_hundred,
 	},
+	{
+		.procname	= "force_cgroup_v2_swappiness",
+		.data		= &force_cgroup_v2_swappiness,
+		.maxlen		= sizeof(force_cgroup_v2_swappiness),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
 #ifdef CONFIG_HUGETLB_PAGE
 	{
 		.procname	= "nr_hugepages",

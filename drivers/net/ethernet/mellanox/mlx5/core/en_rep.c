@@ -650,11 +650,6 @@ static void mlx5e_build_rep_params(struct net_device *netdev)
 	params->mqprio.num_tc       = 1;
 	params->tunneled_offload_en = false;
 
-	/* Set an initial non-zero value, so that mlx5e_select_queue won't
-	 * divide by zero if called before first activating channels.
-	 */
-	priv->num_tc_x_num_ch = params->num_channels * params->mqprio.num_tc;
-
 	mlx5_query_min_inline(mdev, &params->tx_min_inline_mode);
 }
 
@@ -826,7 +821,6 @@ int mlx5e_rep_bond_update(struct mlx5e_priv *priv, bool cleanup)
 static int mlx5e_init_rep_rx(struct mlx5e_priv *priv)
 {
 	struct mlx5_core_dev *mdev = priv->mdev;
-	struct mlx5e_lro_param lro_param;
 	int err;
 
 	priv->rx_res = mlx5e_rx_res_alloc();
@@ -841,9 +835,9 @@ static int mlx5e_init_rep_rx(struct mlx5e_priv *priv)
 		return err;
 	}
 
-	lro_param = mlx5e_get_lro_param(&priv->channels.params);
 	err = mlx5e_rx_res_init(priv->rx_res, priv->mdev, 0,
-				priv->max_nch, priv->drop_rq.rqn, &lro_param,
+				priv->max_nch, priv->drop_rq.rqn,
+				&priv->channels.params.packet_merge,
 				priv->channels.params.num_channels);
 	if (err)
 		goto err_close_drop_rq;
@@ -944,6 +938,13 @@ err_event_reg:
 	return err;
 }
 
+static void mlx5e_cleanup_uplink_rep_tx(struct mlx5e_rep_priv *rpriv)
+{
+	mlx5e_rep_tc_netdevice_event_unregister(rpriv);
+	mlx5e_rep_bond_cleanup(rpriv);
+	mlx5e_rep_tc_cleanup(rpriv);
+}
+
 static int mlx5e_init_rep_tx(struct mlx5e_priv *priv)
 {
 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
@@ -958,32 +959,33 @@ static int mlx5e_init_rep_tx(struct mlx5e_priv *priv)
 	if (rpriv->rep->vport == MLX5_VPORT_UPLINK) {
 		err = mlx5e_init_uplink_rep_tx(rpriv);
 		if (err)
-			goto destroy_tises;
+			goto err_init_tx;
 	}
+
+	err = mlx5e_tc_ht_init(&rpriv->tc_ht);
+	if (err)
+		goto err_ht_init;
 
 	return 0;
 
-destroy_tises:
+err_ht_init:
+	if (rpriv->rep->vport == MLX5_VPORT_UPLINK)
+		mlx5e_cleanup_uplink_rep_tx(rpriv);
+err_init_tx:
 	mlx5e_destroy_tises(priv);
 	return err;
-}
-
-static void mlx5e_cleanup_uplink_rep_tx(struct mlx5e_rep_priv *rpriv)
-{
-	mlx5e_rep_tc_netdevice_event_unregister(rpriv);
-
-	mlx5e_rep_bond_cleanup(rpriv);
-	mlx5e_rep_tc_cleanup(rpriv);
 }
 
 static void mlx5e_cleanup_rep_tx(struct mlx5e_priv *priv)
 {
 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
 
-	mlx5e_destroy_tises(priv);
+	mlx5e_tc_ht_cleanup(&rpriv->tc_ht);
 
 	if (rpriv->rep->vport == MLX5_VPORT_UPLINK)
 		mlx5e_cleanup_uplink_rep_tx(rpriv);
+
+	mlx5e_destroy_tises(priv);
 }
 
 static void mlx5e_rep_enable(struct mlx5e_priv *priv)

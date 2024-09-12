@@ -1044,12 +1044,6 @@ static struct ishtp_cl_driver	loader_ishtp_cl_driver = {
 	.reset = loader_ishtp_cl_reset,
 };
 
-static const struct ishtp_device_id loader_ishtp_id_table[] = {
-	{ loader_ishtp_guid },
-	{ }
-};
-MODULE_DEVICE_TABLE(ishtp, loader_ishtp_id_table);
-
 static int __init ish_loader_init(void)
 {
 	return ishtp_cl_driver_register(&loader_ishtp_cl_driver, THIS_MODULE);

@@ -158,12 +158,10 @@ struct neighbour {
 	struct hh_cache		hh;
 	int			(*output)(struct neighbour *, struct sk_buff *);
 	const struct neigh_ops	*ops;
-	struct list_head	gc_list;
 	struct rcu_head		rcu;
 	struct net_device	*dev;
 
-	RH_KABI_RESERVE(1)
-	RH_KABI_RESERVE(2)
+	RH_KABI_USE(1, 2, struct list_head	gc_list)
 	u8			primary_key[0];
 } __randomize_layout;
 
@@ -224,13 +222,14 @@ struct neigh_table {
 	struct timer_list 	proxy_timer;
 	struct sk_buff_head	proxy_queue;
 	atomic_t		entries;
-	atomic_t		gc_entries;
-	struct list_head	gc_list;
 	rwlock_t		lock;
 	unsigned long		last_rand;
 	struct neigh_statistics	__percpu *stats;
 	struct neigh_hash_table __rcu *nht;
 	struct pneigh_entry	**phash_buckets;
+	RH_KABI_EXTEND(atomic_t		gc_entries)
+	RH_KABI_EXTEND(struct list_head	gc_list)
+	RH_KABI_EXTEND(int			(*is_multicast)(const void *pkey))
 };
 
 enum {

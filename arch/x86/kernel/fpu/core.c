@@ -73,7 +73,7 @@ bool irq_fpu_usable(void)
 	 * - Soft interrupt processing context which cannot happen
 	 *   while in a fpregs_lock()'ed critical region.
 	 */
-	if (!in_hardirq())
+	if (!in_irq())
 		return true;
 
 	/*

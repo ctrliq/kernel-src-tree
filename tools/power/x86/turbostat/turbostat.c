@@ -1281,14 +1281,7 @@ int format_counters(struct thread_data *t, struct core_data *c, struct pkg_data 
 		}
 	}
 
-	/*
-	 * If measurement interval exceeds minimum RAPL Joule Counter range,
-	 * indicate that results are suspect by printing "**" in fraction place.
-	 */
-	if (interval_float < rapl_joule_counter_range)
-		fmt8 = "%s%.2f";
-	else
-		fmt8 = "%6.0f**";
+	fmt8 = "%s%.2f";
 
 	if (DO_BIC(BIC_CorWatt) && (do_rapl & RAPL_PER_CORE_ENERGY))
 		outp +=
@@ -2284,39 +2277,39 @@ retry:
 		p->sys_lpi = cpuidle_cur_sys_lpi_us;
 
 	if (do_rapl & RAPL_PKG) {
-		if (get_msr(cpu, MSR_PKG_ENERGY_STATUS, &msr))
+		if (get_msr_sum(cpu, MSR_PKG_ENERGY_STATUS, &msr))
 			return -13;
-		p->energy_pkg = msr & 0xFFFFFFFF;
+		p->energy_pkg = msr;
 	}
 	if (do_rapl & RAPL_CORES_ENERGY_STATUS) {
-		if (get_msr(cpu, MSR_PP0_ENERGY_STATUS, &msr))
+		if (get_msr_sum(cpu, MSR_PP0_ENERGY_STATUS, &msr))
 			return -14;
-		p->energy_cores = msr & 0xFFFFFFFF;
+		p->energy_cores = msr;
 	}
 	if (do_rapl & RAPL_DRAM) {
-		if (get_msr(cpu, MSR_DRAM_ENERGY_STATUS, &msr))
+		if (get_msr_sum(cpu, MSR_DRAM_ENERGY_STATUS, &msr))
 			return -15;
-		p->energy_dram = msr & 0xFFFFFFFF;
+		p->energy_dram = msr;
 	}
 	if (do_rapl & RAPL_GFX) {
-		if (get_msr(cpu, MSR_PP1_ENERGY_STATUS, &msr))
+		if (get_msr_sum(cpu, MSR_PP1_ENERGY_STATUS, &msr))
 			return -16;
-		p->energy_gfx = msr & 0xFFFFFFFF;
+		p->energy_gfx = msr;
 	}
 	if (do_rapl & RAPL_PKG_PERF_STATUS) {
-		if (get_msr(cpu, MSR_PKG_PERF_STATUS, &msr))
+		if (get_msr_sum(cpu, MSR_PKG_PERF_STATUS, &msr))
 			return -16;
-		p->rapl_pkg_perf_status = msr & 0xFFFFFFFF;
+		p->rapl_pkg_perf_status = msr;
 	}
 	if (do_rapl & RAPL_DRAM_PERF_STATUS) {
-		if (get_msr(cpu, MSR_DRAM_PERF_STATUS, &msr))
+		if (get_msr_sum(cpu, MSR_DRAM_PERF_STATUS, &msr))
 			return -16;
-		p->rapl_dram_perf_status = msr & 0xFFFFFFFF;
+		p->rapl_dram_perf_status = msr;
 	}
 	if (do_rapl & RAPL_AMD_F17H) {
-		if (get_msr(cpu, MSR_PKG_ENERGY_STAT, &msr))
+		if (get_msr_sum(cpu, MSR_PKG_ENERGY_STAT, &msr))
 			return -13;
-		p->energy_pkg = msr & 0xFFFFFFFF;
+		p->energy_pkg = msr;
 	}
 	if (DO_BIC(BIC_PkgTmp)) {
 		if (get_msr(cpu, MSR_IA32_PACKAGE_THERM_STATUS, &msr))
@@ -3729,9 +3722,9 @@ int probe_nhm_msrs(unsigned int family, unsigned int model)
 		has_misc_feature_control = 1;
 		break;
 	case INTEL_FAM6_HASWELL:	/* HSW */
+	case INTEL_FAM6_HASWELL_G:	/* HSW */
 	case INTEL_FAM6_HASWELL_X:	/* HSX */
 	case INTEL_FAM6_HASWELL_L:	/* HSW */
-	case INTEL_FAM6_HASWELL_G:	/* HSW */
 	case INTEL_FAM6_BROADWELL:	/* BDW */
 	case INTEL_FAM6_BROADWELL_G:	/* BDW */
 	case INTEL_FAM6_BROADWELL_X:	/* BDX */
@@ -5068,8 +5061,8 @@ int has_snb_msrs(unsigned int family, unsigned int model)
 	case INTEL_FAM6_ATOM_GOLDMONT:	/* BXT */
 	case INTEL_FAM6_ATOM_GOLDMONT_PLUS:
 	case INTEL_FAM6_ATOM_GOLDMONT_D:	/* DNV */
-	case INTEL_FAM6_ATOM_TREMONT:		/* EHL */
-	case INTEL_FAM6_ATOM_TREMONT_D:		/* JVL */
+	case INTEL_FAM6_ATOM_TREMONT:	/* EHL */
+	case INTEL_FAM6_ATOM_TREMONT_D:	/* JVL */
 		return 1;
 	}
 	return 0;
@@ -5568,6 +5561,10 @@ void process_cpuid()
 			edx_flags & (1 << 22) ? "ACPI-TM" : "-",
 			edx_flags & (1 << 28) ? "HT" : "-", edx_flags & (1 << 29) ? "TM" : "-");
 	}
+	if (genuine_intel) {
+		model_orig = model;
+		model = intel_model_duplicates(model);
+	}
 
 	if (!(edx_flags & (1 << 5)))
 		errx(1, "CPUID: no MSR");
@@ -5580,10 +5577,6 @@ void process_cpuid()
 		 */
 		__cpuid(0x80000007, eax, ebx, ecx, edx);
 		has_invariant_tsc = edx & (1 << 8);
-	}
-	if (genuine_intel) {
-		model_orig = model;
-		model = intel_model_duplicates(model);
 	}
 
 	/*

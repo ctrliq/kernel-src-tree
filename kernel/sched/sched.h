@@ -80,8 +80,24 @@
 
 #include <trace/events/sched.h>
 
+#define WARN_ONCE_SAFE(condition, format...)	({		\
+	static bool __section(.data.once) __warned;		\
+	int __ret_warn_once = !!(condition);			\
+								\
+	if (unlikely(__ret_warn_once && !__warned)) {		\
+		bool __warn_deferred = irqs_disabled();         \
+		__warned = true;				\
+		if(__warn_deferred)                         	\
+			printk_deferred_enter();		\
+		WARN(1, format);				\
+		if (__warn_deferred)				\
+			printk_deferred_exit();			\
+	}							\
+	unlikely(__ret_warn_once);				\
+})
+
 #ifdef CONFIG_SCHED_DEBUG
-# define SCHED_WARN_ON(x)	WARN_ONCE(x, #x)
+# define SCHED_WARN_ON(x)	WARN_ONCE_SAFE(x, #x)
 #else
 # define SCHED_WARN_ON(x)	({ (void)(x), 0; })
 #endif
@@ -604,8 +620,8 @@ struct cfs_rq {
 	s64			runtime_remaining;
 
 	u64			throttled_clock;
-	u64			throttled_clock_pelt;
-	u64			throttled_clock_pelt_time;
+	u64	RH_KABI_RENAME(throttled_clock_task, throttled_clock_pelt);
+	u64	RH_KABI_RENAME(throttled_clock_task_time, throttled_clock_pelt_time);
 	int			throttled;
 	int			throttle_count;
 	struct list_head	throttled_list;
@@ -1427,6 +1443,11 @@ queue_balance_callback(struct rq *rq,
 {
 	lockdep_assert_held(&rq->lock);
 
+	/*
+	 * Don't (re)queue an already queued item; nor queue anything when
+	 * balance_push() is active, see the comment with
+	 * balance_push_callback.
+	 */
 	if (unlikely(head->next || rq->balance_callback == &balance_push_callback))
 		return;
 

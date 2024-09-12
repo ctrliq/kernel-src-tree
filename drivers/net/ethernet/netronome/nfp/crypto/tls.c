@@ -289,7 +289,7 @@ nfp_net_tls_add(struct net_device *netdev, struct sock *sk,
 	switch (sk->sk_family) {
 #if IS_ENABLED(CONFIG_IPV6)
 	case AF_INET6:
-		if (ipv6_only_sock(sk) ||
+		if (sk->sk_ipv6only ||
 		    ipv6_addr_type(&sk->sk_v6_daddr) != IPV6_ADDR_MAPPED) {
 			req_sz = sizeof(struct nfp_crypto_req_add_v6);
 			ipv6 = true;

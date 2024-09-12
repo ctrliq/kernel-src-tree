@@ -1886,11 +1886,10 @@ rtw8852a_btc_set_wl_txpwr_ctrl(struct rtw89_dev *rtwdev, u32 txpwr_val)
 		const u32 _reg = __btc_cr_ ## _case;			\
 		u32 _val = __btc_ctrl_val_ ## _case(txpwr_val);		\
 		u32 _cur, _wrt;						\
-		int ret;						\
 		rtw89_debug(rtwdev, RTW89_DBG_TXPWR,			\
 			    "btc ctrl %s: 0x%x\n", #_case, _val);	\
-		ret = rtw89_mac_txpwr_read32(rtwdev, RTW89_PHY_0, _reg, &_cur);\
-		if (ret) break;						\
+		if (rtw89_mac_txpwr_read32(rtwdev, RTW89_PHY_0, _reg, &_cur))\
+			break;						\
 		rtw89_debug(rtwdev, RTW89_DBG_TXPWR,			\
 			    "btc ctrl ori 0x%x: 0x%x\n", _reg, _cur);	\
 		_wrt = __do_clr(_val) ?					\

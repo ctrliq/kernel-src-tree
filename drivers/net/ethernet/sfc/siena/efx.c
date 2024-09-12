@@ -587,7 +587,7 @@ static const struct net_device_ops efx_netdev_ops = {
 	.ndo_tx_timeout		= efx_siena_watchdog,
 	.ndo_start_xmit		= efx_siena_hard_start_xmit,
 	.ndo_validate_addr	= eth_validate_addr,
-	.ndo_eth_ioctl		= efx_ioctl,
+	.ndo_do_ioctl		= efx_ioctl,
 	.ndo_change_mtu		= efx_siena_change_mtu,
 	.ndo_set_mac_address	= efx_siena_set_mac_address,
 	.ndo_set_rx_mode	= efx_siena_set_rx_mode,
@@ -795,6 +795,12 @@ static const struct pci_device_id efx_pci_table[] = {
 	{PCI_DEVICE(PCI_VENDOR_ID_SOLARFLARE, 0x0813),	/* SFL9021 */
 	 .driver_data = (unsigned long)&siena_a0_nic_type},
 	{0}			/* end of list */
+};
+
+static const struct pci_device_id efx_deprecated_pci_table[] = {
+	{PCI_DEVICE(PCI_VENDOR_ID_SOLARFLARE, 0x0803)},	/* SFC9020 */
+	{PCI_DEVICE(PCI_VENDOR_ID_SOLARFLARE, 0x0813)},	/* SFL9021 */
+	{0}
 };
 
 /**************************************************************************
@@ -1050,6 +1056,8 @@ static int efx_pci_probe(struct pci_dev *pci_dev,
 
 	if (!efx->type->is_vf)
 		efx_probe_vpd_strings(efx);
+
+	pci_hw_deprecated(efx_deprecated_pci_table, pci_dev);
 
 	/* Set up basic I/O (BAR mappings etc) */
 	rc = efx_siena_init_io(efx, efx->type->mem_bar(efx),

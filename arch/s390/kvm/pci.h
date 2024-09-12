@@ -10,9 +10,10 @@
 #ifndef __KVM_S390_PCI_H
 #define __KVM_S390_PCI_H
 
+#include <linux/kvm.h>
 #include <linux/kvm_host.h>
-#include <linux/pci.h>
 #include <linux/mutex.h>
+#include <linux/pci.h>
 #include <asm/airq.h>
 #include <asm/cpu.h>
 
@@ -20,6 +21,7 @@ struct kvm_zdev {
 	struct zpci_dev *zdev;
 	struct kvm *kvm;
 	struct zpci_fib fib;
+	struct list_head entry;
 };
 
 struct zpci_gaite {
@@ -41,8 +43,22 @@ struct zpci_aift {
 
 extern struct zpci_aift *aift;
 
+static inline struct kvm *kvm_s390_pci_si_to_kvm(struct zpci_aift *aift,
+						 unsigned long si)
+{
+	if (!IS_ENABLED(CONFIG_VFIO_PCI_ZDEV_KVM) || !aift->kzdev ||
+	    !aift->kzdev[si])
+		return NULL;
+	return aift->kzdev[si]->kvm;
+};
+
 int kvm_s390_pci_aen_init(u8 nisc);
 void kvm_s390_pci_aen_exit(void);
+
+void kvm_s390_pci_init_list(struct kvm *kvm);
+void kvm_s390_pci_clear_list(struct kvm *kvm);
+
+int kvm_s390_pci_zpci_op(struct kvm *kvm, struct kvm_s390_zpci_op *args);
 
 int kvm_s390_pci_init(void);
 void kvm_s390_pci_exit(void);

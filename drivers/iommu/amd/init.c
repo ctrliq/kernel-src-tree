@@ -39,7 +39,6 @@
 #include <asm/apic.h>
 #include <asm/gart.h>
 #include <asm/x86_init.h>
-#include <asm/iommu_table.h>
 #include <asm/io_apic.h>
 #include <asm/irq_remapping.h>
 #include <asm/set_memory.h>
@@ -176,7 +175,6 @@ u16 amd_iommu_last_bdf;			/* largest PCI device id we have
 					   to handle */
 LIST_HEAD(amd_iommu_unity_map);		/* a list of required unity mappings
 					   we find in ACPI */
-bool amd_iommu_unmap_flush;		/* if true, flush on every unmap */
 
 LIST_HEAD(amd_iommu_list);		/* list of all AMD IOMMUs in the
 					   system */
@@ -684,7 +682,7 @@ void amd_iommu_restart_event_logging(struct amd_iommu *iommu)
  * This function resets the command buffer if the IOMMU stopped fetching
  * commands from it.
  */
-void amd_iommu_reset_cmd_buffer(struct amd_iommu *iommu)
+static void amd_iommu_reset_cmd_buffer(struct amd_iommu *iommu)
 {
 	iommu_feature_disable(iommu, CONTROL_CMDBUF_EN);
 
@@ -3180,7 +3178,7 @@ static int __init parse_amd_iommu_options(char *str)
 	for (; *str; ++str) {
 		if (strncmp(str, "fullflush", 9) == 0) {
 			pr_warn("amd_iommu=fullflush deprecated; use iommu.strict=1 instead\n");
-			amd_iommu_unmap_flush = true;
+			iommu_set_dma_strict();
 		}
 		if (strncmp(str, "force_enable", 12) == 0)
 			amd_iommu_force_enable = true;
@@ -3291,11 +3289,6 @@ __setup("amd_iommu_intr=",	parse_amd_iommu_intr);
 __setup("ivrs_ioapic",		parse_ivrs_ioapic);
 __setup("ivrs_hpet",		parse_ivrs_hpet);
 __setup("ivrs_acpihid",		parse_ivrs_acpihid);
-
-IOMMU_INIT_FINISH(amd_iommu_detect,
-		  gart_iommu_hole_init,
-		  NULL,
-		  NULL);
 
 bool amd_iommu_v2_supported(void)
 {

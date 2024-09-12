@@ -47,6 +47,8 @@
  */
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]) + __must_be_array(arr))
 
+#define PTR_IF(cond, ptr)	((cond) ? (ptr) : NULL)
+
 #define u64_to_user_ptr(x) (		\
 {					\
 	typecheck(u64, x);		\
@@ -542,6 +544,7 @@ extern int __kernel_text_address(unsigned long addr);
 extern int kernel_text_address(unsigned long addr);
 extern int func_ptr_is_kernel_text(void *ptr);
 
+u64 int_pow(u64 base, unsigned int exp);
 unsigned long int_sqrt(unsigned long);
 
 #if BITS_PER_LONG < 64

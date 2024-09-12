@@ -66,56 +66,7 @@ static struct pci_driver hyperv_pci_driver = {
 	.remove =	hyperv_pci_remove,
 };
 
-static int hyperv_setup_gen1(struct hyperv_drm_device *hv)
-{
-	struct drm_device *dev = &hv->dev;
-	struct pci_dev *pdev;
-	int ret;
-
-	pdev = pci_get_device(PCI_VENDOR_ID_MICROSOFT,
-			      PCI_DEVICE_ID_HYPERV_VIDEO, NULL);
-	if (!pdev) {
-		drm_err(dev, "Unable to find PCI Hyper-V video\n");
-		return -ENODEV;
-	}
-
-	ret = drm_aperture_remove_conflicting_pci_framebuffers(pdev, "hypervdrmfb");
-	if (ret) {
-		drm_err(dev, "Not able to remove boot fb\n");
-		return ret;
-	}
-
-	if (pci_request_region(pdev, 0, DRIVER_NAME) != 0)
-		drm_warn(dev, "Cannot request framebuffer, boot fb still active?\n");
-
-	if ((pdev->resource[0].flags & IORESOURCE_MEM) == 0) {
-		drm_err(dev, "Resource at bar 0 is not IORESOURCE_MEM\n");
-		ret = -ENODEV;
-		goto error;
-	}
-
-	hv->fb_base = pci_resource_start(pdev, 0);
-	hv->fb_size = pci_resource_len(pdev, 0);
-	if (!hv->fb_base) {
-		drm_err(dev, "Resource not available\n");
-		ret = -ENODEV;
-		goto error;
-	}
-
-	hv->fb_size = min(hv->fb_size,
-			  (unsigned long)(hv->mmio_megabytes * 1024 * 1024));
-	hv->vram = devm_ioremap(&pdev->dev, hv->fb_base, hv->fb_size);
-	if (!hv->vram) {
-		drm_err(dev, "Failed to map vram\n");
-		ret = -ENOMEM;
-	}
-
-error:
-	pci_dev_put(pdev);
-	return ret;
-}
-
-static int hyperv_setup_gen2(struct hyperv_drm_device *hv,
+static int hyperv_setup_vram(struct hyperv_drm_device *hv,
 			     struct hv_device *hdev)
 {
 	struct drm_device *dev = &hv->dev;
@@ -124,7 +75,7 @@ static int hyperv_setup_gen2(struct hyperv_drm_device *hv,
 	drm_aperture_remove_conflicting_framebuffers(screen_info.lfb_base,
 						     screen_info.lfb_size,
 						     false,
-						     "hypervdrmfb");
+						     &hyperv_driver);
 
 	hv->fb_size = (unsigned long)hv->mmio_megabytes * 1024 * 1024;
 
@@ -178,11 +129,7 @@ static int hyperv_vmbus_probe(struct hv_device *hdev,
 		goto err_hv_set_drv_data;
 	}
 
-	if (efi_enabled(EFI_BOOT))
-		ret = hyperv_setup_gen2(hv, hdev);
-	else
-		ret = hyperv_setup_gen1(hv);
-
+	ret = hyperv_setup_vram(hv, hdev);
 	if (ret)
 		goto err_vmbus_close;
 
@@ -199,18 +146,20 @@ static int hyperv_vmbus_probe(struct hv_device *hdev,
 
 	ret = hyperv_mode_config_init(hv);
 	if (ret)
-		goto err_vmbus_close;
+		goto err_free_mmio;
 
 	ret = drm_dev_register(dev, 0);
 	if (ret) {
 		drm_err(dev, "Failed to register drm driver.\n");
-		goto err_vmbus_close;
+		goto err_free_mmio;
 	}
 
 	drm_fbdev_generic_setup(dev, 0);
 
 	return 0;
 
+err_free_mmio:
+	vmbus_free_mmio(hv->mem->start, hv->fb_size);
 err_vmbus_close:
 	vmbus_close(hdev->channel);
 err_hv_set_drv_data:
@@ -227,6 +176,7 @@ static int hyperv_vmbus_remove(struct hv_device *hdev)
 	drm_atomic_helper_shutdown(dev);
 	vmbus_close(hdev->channel);
 	hv_set_drvdata(hdev, NULL);
+
 	vmbus_free_mmio(hv->mem->start, hv->fb_size);
 
 	return 0;
@@ -284,6 +234,9 @@ static struct hv_driver hyperv_hv_driver = {
 static int __init hyperv_init(void)
 {
 	int ret;
+
+	if (drm_firmware_drivers_only())
+		return -ENODEV;
 
 	ret = pci_register_driver(&hyperv_pci_driver);
 	if (ret != 0)

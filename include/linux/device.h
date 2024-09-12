@@ -177,6 +177,7 @@ struct device *subsys_dev_iter_next(struct subsys_dev_iter *iter);
 void subsys_dev_iter_exit(struct subsys_dev_iter *iter);
 
 int device_match_acpi_dev(struct device *dev, const void *adev);
+int device_match_acpi_handle(struct device *dev, const void *handle);
 int device_match_name(struct device *dev, const void *name);
 int device_match_of_node(struct device *dev, const void *np);
 int device_match_fwnode(struct device *dev, const void *fwnode);
@@ -1263,7 +1264,7 @@ struct device {
 					     allocations such descriptors. */
 	u64		RH_KABI_RENAME(bus_dma_mask,
 					bus_dma_limit); /* upstream dma constraint */
-	RH_KABI_BROKEN_REPLACE(unsigned long	dma_pfn_offset, const struct bus_dma_region *dma_range_map)
+	RH_KABI_REPLACE(unsigned long	dma_pfn_offset, const struct bus_dma_region *dma_range_map)
 
 	struct device_dma_parameters *dma_parms;
 

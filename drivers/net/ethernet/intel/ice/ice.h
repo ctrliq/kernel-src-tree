@@ -51,10 +51,7 @@
 #include <net/gre.h>
 #include <net/udp_tunnel.h>
 #include <net/vxlan.h>
-#include <net/gtp.h>
-#if IS_ENABLED(CONFIG_DCB)
-#include <scsi/iscsi_proto.h>
-#endif /* CONFIG_DCB */
+#include <linux/ppp_defs.h>
 #include "ice_devids.h"
 #include "ice_type.h"
 #include "ice_txrx.h"
@@ -64,8 +61,8 @@
 #include "ice_flow.h"
 #include "ice_sched.h"
 #include "ice_idc_int.h"
-#include "ice_virtchnl_pf.h"
 #include "ice_sriov.h"
+#include "ice_vf_mbx.h"
 #include "ice_ptp.h"
 #include "ice_fdir.h"
 #include "ice_xsk.h"
@@ -73,6 +70,8 @@
 #include "ice_repr.h"
 #include "ice_eswitch.h"
 #include "ice_lag.h"
+#include "ice_vsi_vlan_ops.h"
+#include "ice_gnss.h"
 
 #define ICE_BAR0		0
 #define ICE_REQ_DESC_MULTIPLE	32
@@ -108,7 +107,6 @@
 /* All VF control VSIs share the same IRQ, so assign a unique ID for them */
 #define ICE_RES_VF_CTRL_VEC_ID	(ICE_RES_RDMA_VEC_ID - 1)
 #define ICE_INVAL_Q_INDEX	0xffff
-#define ICE_INVAL_VFID		256
 
 #define ICE_MAX_RXQS_PER_TC		256	/* Used when setting VSI context per TC Rx queues */
 
@@ -183,7 +181,9 @@
 
 enum ice_feature {
 	ICE_F_DSCP,
+	ICE_F_PTP_EXTTS,
 	ICE_F_SMA_CTRL,
+	ICE_F_GNSS,
 	ICE_F_MAX
 };
 
@@ -247,8 +247,6 @@ struct ice_sw {
 	struct ice_pf *pf;
 	u16 sw_id;		/* switch ID for this switch */
 	u16 bridge_mode;	/* VEB/VEPA/Port Virtualizer */
-	struct ice_vsi *dflt_vsi;	/* default VSI for this switch */
-	u8 dflt_vsi_ena:1;	/* true if above dflt_vsi is enabled */
 };
 
 enum ice_pf_state {
@@ -331,7 +329,7 @@ struct ice_vsi {
 	u16 vsi_num;			/* HW (absolute) index of this VSI */
 	u16 idx;			/* software index in pf->vsi[] */
 
-	s16 vf_id;			/* VF ID for SR-IOV VSIs */
+	struct ice_vf *vf;		/* VF associated with this VSI */
 
 	u16 ethtype;			/* Ethernet protocol for pause frame */
 	u16 num_gfltr;
@@ -368,6 +366,8 @@ struct ice_vsi {
 	u8 irqs_ready:1;
 	u8 current_isup:1;		 /* Sync 'link up' logging */
 	u8 stat_offsets_loaded:1;
+	struct ice_vsi_vlan_ops inner_vlan_ops;
+	struct ice_vsi_vlan_ops outer_vlan_ops;
 	u16 num_vlan;
 
 	/* queue information */
@@ -481,9 +481,11 @@ enum ice_pf_flags {
 	ICE_FLAG_LEGACY_RX,
 	ICE_FLAG_VF_TRUE_PROMISC_ENA,
 	ICE_FLAG_MDD_AUTO_RESET_VF,
+	ICE_FLAG_VF_VLAN_PRUNING,
 	ICE_FLAG_LINK_LENIENT_MODE_ENA,
 	ICE_FLAG_PLUG_AUX_DEV,
 	ICE_FLAG_MTU_CHANGED,
+	ICE_FLAG_GNSS,			/* GNSS successfully initialized */
 	ICE_PF_FLAGS_NBITS		/* must be last */
 };
 
@@ -524,15 +526,7 @@ struct ice_pf {
 	struct ice_vsi **vsi;		/* VSIs created by the driver */
 	struct ice_sw *first_sw;	/* first switch created by firmware */
 	u16 eswitch_mode;		/* current mode of eswitch */
-	/* Virtchnl/SR-IOV config info */
-	struct ice_vf *vf;
-	u16 num_alloc_vfs;		/* actual number of VFs allocated */
-	u16 num_vfs_supported;		/* num VFs supported for this PF */
-	u16 num_qps_per_vf;
-	u16 num_msix_per_vf;
-	/* used to ratelimit the MDD event logging */
-	unsigned long last_printed_mdd_jiffies;
-	DECLARE_BITMAP(malvfs, ICE_MAX_VF_COUNT);
+	struct ice_vfs vfs;
 	DECLARE_BITMAP(features, ICE_F_MAX);
 	DECLARE_BITMAP(state, ICE_STATE_NBITS);
 	DECLARE_BITMAP(flags, ICE_PF_FLAGS_NBITS);
@@ -548,6 +542,9 @@ struct ice_pf {
 	struct mutex adev_mutex;	/* lock to protect aux device access */
 	u32 msg_enable;
 	struct ice_ptp ptp;
+	struct tty_driver *ice_gnss_tty_driver;
+	struct tty_port gnss_tty_port;
+	struct gnss_serial *gnss_serial;
 	u16 num_rdma_msix;		/* Total MSIX vectors for RDMA driver */
 	u16 rdma_base_vector;
 
@@ -595,6 +592,8 @@ struct ice_pf {
 	 */
 	u16 num_dmac_chnl_fltrs;
 	struct hlist_head tc_flower_fltr_list;
+
+	u64 supported_rxdids;
 
 	__le64 nvm_phy_type_lo; /* NVM PHY type low */
 	__le64 nvm_phy_type_hi; /* NVM PHY type high */
@@ -758,6 +757,21 @@ static inline struct ice_vsi *ice_get_ctrl_vsi(struct ice_pf *pf)
 		return NULL;
 
 	return pf->vsi[pf->ctrl_vsi_idx];
+}
+
+/**
+ * ice_find_vsi - Find the VSI from VSI ID
+ * @pf: The PF pointer to search in
+ * @vsi_num: The VSI ID to search for
+ */
+static inline struct ice_vsi *ice_find_vsi(struct ice_pf *pf, u16 vsi_num)
+{
+	int i;
+
+	ice_for_each_vsi(pf, i)
+		if (pf->vsi[i] && pf->vsi[i]->vsi_num == vsi_num)
+			return  pf->vsi[i];
+	return NULL;
 }
 
 /**

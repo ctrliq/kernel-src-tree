@@ -1146,10 +1146,7 @@ static struct irq_domain *intel_get_irq_domain(struct irq_alloc_info *info)
 	case X86_IRQ_ALLOC_TYPE_IOAPIC_GET_PARENT:
 		return map_ioapic_to_ir(info->devid);
 	case X86_IRQ_ALLOC_TYPE_HPET_GET_PARENT:
-		return map_hpet_to_ir(info->hpet_id);
-	case X86_IRQ_ALLOC_TYPE_PCI_MSI:
-	case X86_IRQ_ALLOC_TYPE_PCI_MSIX:
-		return map_dev_to_ir(info->msi_dev);
+		return map_hpet_to_ir(info->devid);
 	default:
 		WARN_ON_ONCE(1);
 		return NULL;
@@ -1330,9 +1327,9 @@ static void intel_irq_remapping_prepare_irte(struct intel_ir_data *data,
 	case X86_IRQ_ALLOC_TYPE_PCI_MSI:
 	case X86_IRQ_ALLOC_TYPE_PCI_MSIX:
 		if (info->type == X86_IRQ_ALLOC_TYPE_HPET)
-			set_hpet_sid(irte, info->hpet_id);
+			set_hpet_sid(irte, info->devid);
 		else
-			set_msi_sid(irte, pci_real_dma_dev(info->msi_dev));
+			set_msi_sid(irte, pci_real_dma_dev(msi_desc_to_pci_dev(info->desc)));
 
 		fill_msi_msg(&data->msi_entry, index, sub_handle);
 		break;

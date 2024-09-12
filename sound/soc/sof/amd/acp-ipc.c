@@ -19,13 +19,13 @@ void acp_mailbox_write(struct snd_sof_dev *sdev, u32 offset, void *message, size
 {
 	memcpy_to_scratch(sdev, offset, message, bytes);
 }
-EXPORT_SYMBOL_NS(acp_mailbox_write, SND_SOC_SOF_AMD_COMMON);
+EXPORT_SYMBOL(acp_mailbox_write);
 
 void acp_mailbox_read(struct snd_sof_dev *sdev, u32 offset, void *message, size_t bytes)
 {
 	memcpy_from_scratch(sdev, offset, message, bytes);
 }
-EXPORT_SYMBOL_NS(acp_mailbox_read, SND_SOC_SOF_AMD_COMMON);
+EXPORT_SYMBOL(acp_mailbox_read);
 
 static void acpbus_trigger_host_to_dsp_swintr(struct acp_dev_data *adata)
 {
@@ -71,7 +71,7 @@ int acp_sof_ipc_send_msg(struct snd_sof_dev *sdev, struct snd_sof_ipc_msg *msg)
 			dev_err(sdev->dev, "%s: Failed to acquire HW lock\n", __func__);
 			return -EINVAL;
 		}
-	};
+	}
 
 	acp_mailbox_write(sdev, offset, msg->msg_data, msg->msg_size);
 	acp_ipc_host_msg_set(sdev);
@@ -84,7 +84,7 @@ int acp_sof_ipc_send_msg(struct snd_sof_dev *sdev, struct snd_sof_ipc_msg *msg)
 
 	return 0;
 }
-EXPORT_SYMBOL_NS(acp_sof_ipc_send_msg, SND_SOC_SOF_AMD_COMMON);
+EXPORT_SYMBOL(acp_sof_ipc_send_msg);
 
 static void acp_dsp_ipc_get_reply(struct snd_sof_dev *sdev)
 {
@@ -170,7 +170,7 @@ irqreturn_t acp_sof_ipc_irq_thread(int irq, void *context)
 
 	return IRQ_HANDLED;
 }
-EXPORT_SYMBOL_NS(acp_sof_ipc_irq_thread, SND_SOC_SOF_AMD_COMMON);
+EXPORT_SYMBOL(acp_sof_ipc_irq_thread);
 
 int acp_sof_ipc_msg_data(struct snd_sof_dev *sdev, struct snd_pcm_substream *substream,
 			 void *p, size_t sz)
@@ -182,12 +182,12 @@ int acp_sof_ipc_msg_data(struct snd_sof_dev *sdev, struct snd_pcm_substream *sub
 
 	return 0;
 }
-EXPORT_SYMBOL_NS(acp_sof_ipc_msg_data, SND_SOC_SOF_AMD_COMMON);
+EXPORT_SYMBOL(acp_sof_ipc_msg_data);
 
 int acp_sof_ipc_get_mailbox_offset(struct snd_sof_dev *sdev)
 {
 	return ACP_SCRATCH_MEMORY_ADDRESS;
 }
-EXPORT_SYMBOL_NS(acp_sof_ipc_get_mailbox_offset, SND_SOC_SOF_AMD_COMMON);
+EXPORT_SYMBOL(acp_sof_ipc_get_mailbox_offset);
 
 MODULE_DESCRIPTION("AMD ACP sof-ipc driver");

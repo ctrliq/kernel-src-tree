@@ -286,7 +286,7 @@ xfs_fs_commit_blocks(
 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
 
 	ASSERT(!(iattr->ia_valid & (ATTR_UID | ATTR_GID)));
-	setattr_copy(&init_user_ns, inode, iattr);
+	setattr_copy(inode, iattr);
 	if (update_isize) {
 		i_size_write(inode, iattr->ia_size);
 		ip->i_disk_size = iattr->ia_size;

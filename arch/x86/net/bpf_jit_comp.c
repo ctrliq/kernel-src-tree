@@ -740,6 +740,20 @@ static void maybe_emit_mod(u8 **pprog, u32 dst_reg, u32 src_reg, bool is64)
 	*pprog = prog;
 }
 
+/*
+ * Similar version of maybe_emit_mod() for a single register
+ */
+static void maybe_emit_1mod(u8 **pprog, u32 reg, bool is64)
+{
+	u8 *prog = *pprog;
+
+	if (is64)
+		EMIT1(add_1mod(0x48, reg));
+	else if (is_ereg(reg))
+		EMIT1(add_1mod(0x40, reg));
+	*pprog = prog;
+}
+
 /* LDX: dst_reg = *(u8*)(src_reg + off) */
 static void emit_ldx(u8 **pprog, u32 size, u32 dst_reg, u32 src_reg, int off)
 {

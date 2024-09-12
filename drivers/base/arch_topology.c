@@ -12,14 +12,11 @@
 #include <linux/device.h>
 #include <linux/of.h>
 #include <linux/slab.h>
-#include <linux/string.h>
 #include <linux/sched/topology.h>
 #include <linux/cpuset.h>
 #include <linux/cpumask.h>
 #include <linux/init.h>
-#include <linux/percpu.h>
 #include <linux/sched.h>
-#include <linux/smp.h>
 
 DEFINE_PER_CPU(unsigned long, freq_scale) = SCHED_CAPACITY_SCALE;
 

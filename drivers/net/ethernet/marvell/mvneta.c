@@ -2153,7 +2153,7 @@ mvneta_tso_put_hdr(struct sk_buff *skb,
 		   struct mvneta_port *pp, struct mvneta_tx_queue *txq)
 {
 	struct mvneta_tx_desc *tx_desc;
-	int hdr_len = skb_transport_offset(skb) + tcp_hdrlen(skb);
+	int hdr_len = skb_tcp_all_headers(skb);
 
 	txq->tx_skb[txq->txq_put_index] = NULL;
 	tx_desc = mvneta_txq_next_desc_get(txq);
@@ -2211,7 +2211,7 @@ static int mvneta_tx_tso(struct sk_buff *skb, struct net_device *dev,
 	if ((txq->count + tso_count_descs(skb)) >= txq->size)
 		return 0;
 
-	if (skb_headlen(skb) < (skb_transport_offset(skb) + tcp_hdrlen(skb))) {
+	if (skb_headlen(skb) < skb_tcp_all_headers(skb)) {
 		pr_info("*** Is this even possible?\n");
 		return 0;
 	}
@@ -4516,7 +4516,7 @@ static int mvneta_probe(struct platform_device *pdev)
 	dev->hw_features |= dev->features;
 	dev->vlan_features |= dev->features;
 	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
-	netif_set_gso_max_segs(dev, MVNETA_MAX_TSO_SEGS);
+	netif_set_tso_max_segs(dev, MVNETA_MAX_TSO_SEGS);
 
 	/* MTU range: 68 - 9676 */
 	dev->min_mtu = ETH_MIN_MTU;

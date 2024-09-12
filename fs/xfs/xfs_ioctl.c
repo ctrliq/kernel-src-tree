@@ -650,8 +650,6 @@ xfs_ioc_space(
 	if (xfs_is_always_cow_inode(ip))
 		return -EOPNOTSUPP;
 
-	if (filp->f_flags & O_DSYNC)
-		flags |= XFS_PREALLOC_SYNC;
 	if (filp->f_mode & FMODE_NOCMTIME)
 		flags |= XFS_PREALLOC_INVISIBLE;
 
@@ -699,6 +697,11 @@ xfs_ioc_space(
 		goto out_unlock;
 
 	error = xfs_update_prealloc_flags(ip, flags);
+	if (error)
+		goto out_unlock;
+
+	if (filp->f_flags & O_DSYNC)
+		error = xfs_log_force_inode(ip);
 
 out_unlock:
 	xfs_iunlock(ip, iolock);
@@ -2014,7 +2017,7 @@ out:
 static inline int
 xfs_fs_eofblocks_from_user(
 	struct xfs_fs_eofblocks		*src,
-	struct xfs_eofblocks		*dst)
+	struct xfs_icwalk		*dst)
 {
 	if (src->eof_version != XFS_EOFBLOCKS_VERSION)
 		return -EINVAL;
@@ -2026,21 +2029,32 @@ xfs_fs_eofblocks_from_user(
 	    memchr_inv(src->pad64, 0, sizeof(src->pad64)))
 		return -EINVAL;
 
-	dst->eof_flags = src->eof_flags;
-	dst->eof_prid = src->eof_prid;
-	dst->eof_min_file_size = src->eof_min_file_size;
+	dst->icw_flags = 0;
+	if (src->eof_flags & XFS_EOF_FLAGS_SYNC)
+		dst->icw_flags |= XFS_ICWALK_FLAG_SYNC;
+	if (src->eof_flags & XFS_EOF_FLAGS_UID)
+		dst->icw_flags |= XFS_ICWALK_FLAG_UID;
+	if (src->eof_flags & XFS_EOF_FLAGS_GID)
+		dst->icw_flags |= XFS_ICWALK_FLAG_GID;
+	if (src->eof_flags & XFS_EOF_FLAGS_PRID)
+		dst->icw_flags |= XFS_ICWALK_FLAG_PRID;
+	if (src->eof_flags & XFS_EOF_FLAGS_MINFILESIZE)
+		dst->icw_flags |= XFS_ICWALK_FLAG_MINFILESIZE;
 
-	dst->eof_uid = INVALID_UID;
+	dst->icw_prid = src->eof_prid;
+	dst->icw_min_file_size = src->eof_min_file_size;
+
+	dst->icw_uid = INVALID_UID;
 	if (src->eof_flags & XFS_EOF_FLAGS_UID) {
-		dst->eof_uid = make_kuid(current_user_ns(), src->eof_uid);
-		if (!uid_valid(dst->eof_uid))
+		dst->icw_uid = make_kuid(current_user_ns(), src->eof_uid);
+		if (!uid_valid(dst->icw_uid))
 			return -EINVAL;
 	}
 
-	dst->eof_gid = INVALID_GID;
+	dst->icw_gid = INVALID_GID;
 	if (src->eof_flags & XFS_EOF_FLAGS_GID) {
-		dst->eof_gid = make_kgid(current_user_ns(), src->eof_gid);
-		if (!gid_valid(dst->eof_gid))
+		dst->icw_gid = make_kgid(current_user_ns(), src->eof_gid);
+		if (!gid_valid(dst->icw_gid))
 			return -EINVAL;
 	}
 	return 0;
@@ -2311,8 +2325,8 @@ xfs_file_ioctl(
 		return xfs_errortag_clearall(mp);
 
 	case XFS_IOC_FREE_EOFBLOCKS: {
-		struct xfs_fs_eofblocks eofb;
-		struct xfs_eofblocks keofb;
+		struct xfs_fs_eofblocks	eofb;
+		struct xfs_icwalk	icw;
 
 		if (!capable(CAP_SYS_ADMIN))
 			return -EPERM;
@@ -2323,14 +2337,14 @@ xfs_file_ioctl(
 		if (copy_from_user(&eofb, arg, sizeof(eofb)))
 			return -EFAULT;
 
-		error = xfs_fs_eofblocks_from_user(&eofb, &keofb);
+		error = xfs_fs_eofblocks_from_user(&eofb, &icw);
 		if (error)
 			return error;
 
-		trace_xfs_ioc_free_eofblocks(mp, &keofb, _RET_IP_);
+		trace_xfs_ioc_free_eofblocks(mp, &icw, _RET_IP_);
 
 		sb_start_write(mp->m_super);
-		error = xfs_blockgc_free_space(mp, &keofb);
+		error = xfs_blockgc_free_space(mp, &icw);
 		sb_end_write(mp->m_super);
 		return error;
 	}

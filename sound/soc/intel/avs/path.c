@@ -478,8 +478,9 @@ static struct avs_module_create avs_module_create[] = {
 static int avs_path_module_type_create(struct avs_dev *adev, struct avs_path_module *mod)
 {
 	const guid_t *type = &mod->template->cfg_ext->type;
+	int i;
 
-	for (int i = 0; i < ARRAY_SIZE(avs_module_create); i++)
+	for (i = 0; i < ARRAY_SIZE(avs_module_create); i++)
 		if (guid_equal(type, avs_module_create[i].guid))
 			return avs_module_create[i].create(adev, mod);
 

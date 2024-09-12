@@ -260,7 +260,6 @@ static const struct snd_soc_component_driver soc_component_dev_cs4349 = {
 	.idle_bias_on		= 1,
 	.use_pmdown_time	= 1,
 	.endianness		= 1,
-	.non_legacy_dai_naming	= 1,
 };
 
 static const struct regmap_config cs4349_regmap = {
@@ -275,8 +274,7 @@ static const struct regmap_config cs4349_regmap = {
 	.cache_type		= REGCACHE_RBTREE,
 };
 
-static int cs4349_i2c_probe(struct i2c_client *client,
-				      const struct i2c_device_id *id)
+static int cs4349_i2c_probe(struct i2c_client *client)
 {
 	struct cs4349_private *cs4349;
 	int ret;
@@ -379,7 +377,7 @@ static struct i2c_driver cs4349_i2c_driver = {
 		.pm = &cs4349_runtime_pm,
 	},
 	.id_table	= cs4349_i2c_id,
-	.probe		= cs4349_i2c_probe,
+	.probe_new	= cs4349_i2c_probe,
 	.remove		= cs4349_i2c_remove,
 };
 

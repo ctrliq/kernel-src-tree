@@ -4533,21 +4533,21 @@ rtl8xxxu_wireless_mode(struct ieee80211_hw *hw, struct ieee80211_sta *sta)
 	u16 network_type = WIRELESS_MODE_UNKNOWN;
 
 	if (hw->conf.chandef.chan->band == NL80211_BAND_5GHZ) {
-		if (sta->vht_cap.vht_supported)
+		if (sta->deflink.vht_cap.vht_supported)
 			network_type = WIRELESS_MODE_AC;
-		else if (sta->ht_cap.ht_supported)
+		else if (sta->deflink.ht_cap.ht_supported)
 			network_type = WIRELESS_MODE_N_5G;
 
 		network_type |= WIRELESS_MODE_A;
 	} else {
-		if (sta->vht_cap.vht_supported)
+		if (sta->deflink.vht_cap.vht_supported)
 			network_type = WIRELESS_MODE_AC;
-		else if (sta->ht_cap.ht_supported)
+		else if (sta->deflink.ht_cap.ht_supported)
 			network_type = WIRELESS_MODE_N_24G;
 
-		if (sta->supp_rates[0] <= 0xf)
+		if (sta->deflink.supp_rates[0] <= 0xf)
 			network_type |= WIRELESS_MODE_B;
-		else if (sta->supp_rates[0] & 0xf)
+		else if (sta->deflink.supp_rates[0] & 0xf)
 			network_type |= (WIRELESS_MODE_B | WIRELESS_MODE_G);
 		else
 			network_type |= WIRELESS_MODE_G;
@@ -4558,7 +4558,7 @@ rtl8xxxu_wireless_mode(struct ieee80211_hw *hw, struct ieee80211_sta *sta)
 
 static void
 rtl8xxxu_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
-			  struct ieee80211_bss_conf *bss_conf, u32 changed)
+			  struct ieee80211_bss_conf *bss_conf, u64 changed)
 {
 	struct rtl8xxxu_priv *priv = hw->priv;
 	struct device *dev = &priv->udev->dev;
@@ -4570,11 +4570,11 @@ rtl8xxxu_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	rarpt = &priv->ra_report;
 
 	if (changed & BSS_CHANGED_ASSOC) {
-		dev_dbg(dev, "Changed ASSOC: %i!\n", bss_conf->assoc);
+		dev_dbg(dev, "Changed ASSOC: %i!\n", vif->cfg.assoc);
 
 		rtl8xxxu_set_linktype(priv, vif->type);
 
-		if (bss_conf->assoc) {
+		if (vif->cfg.assoc) {
 			u32 ramask;
 			int sgi = 0;
 			u8 highest_rate;
@@ -4591,16 +4591,16 @@ rtl8xxxu_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 				goto error;
 			}
 
-			if (sta->ht_cap.ht_supported)
+			if (sta->deflink.ht_cap.ht_supported)
 				dev_info(dev, "%s: HT supported\n", __func__);
-			if (sta->vht_cap.vht_supported)
+			if (sta->deflink.vht_cap.vht_supported)
 				dev_info(dev, "%s: VHT supported\n", __func__);
 
 			/* TODO: Set bits 28-31 for rate adaptive id */
-			ramask = (sta->supp_rates[0] & 0xfff) |
-				sta->ht_cap.mcs.rx_mask[0] << 12 |
-				sta->ht_cap.mcs.rx_mask[1] << 20;
-			if (sta->ht_cap.cap &
+			ramask = (sta->deflink.supp_rates[0] & 0xfff) |
+				sta->deflink.ht_cap.mcs.rx_mask[0] << 12 |
+				sta->deflink.ht_cap.mcs.rx_mask[1] << 20;
+			if (sta->deflink.ht_cap.cap &
 			    (IEEE80211_HT_CAP_SGI_40 | IEEE80211_HT_CAP_SGI_20))
 				sgi = 1;
 			rcu_read_unlock();
@@ -4639,7 +4639,7 @@ rtl8xxxu_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 
 			/* joinbss sequence */
 			rtl8xxxu_write16(priv, REG_BCN_PSR_RPT,
-					 0xc000 | bss_conf->aid);
+					 0xc000 | vif->cfg.aid);
 
 			priv->fops->report_connect(priv, 0, true);
 		} else {
@@ -5095,12 +5095,12 @@ static void rtl8xxxu_tx(struct ieee80211_hw *hw,
 	/* (tx_info->flags & IEEE80211_TX_CTL_AMPDU) && */
 	ampdu_enable = false;
 	if (ieee80211_is_data_qos(hdr->frame_control) && sta) {
-		if (sta->ht_cap.ht_supported) {
+		if (sta->deflink.ht_cap.ht_supported) {
 			u32 ampdu, val32;
 			u8 *qc = ieee80211_get_qos_ctl(hdr);
 			u8 tid = qc[0] & IEEE80211_QOS_CTL_TID_MASK;
 
-			ampdu = (u32)sta->ht_cap.ampdu_density;
+			ampdu = (u32)sta->deflink.ht_cap.ampdu_density;
 			val32 = ampdu << TXDESC_AMPDU_DENSITY_SHIFT;
 			tx_desc->txdw2 |= cpu_to_le32(val32);
 
@@ -5115,7 +5115,7 @@ static void rtl8xxxu_tx(struct ieee80211_hw *hw,
 
 	if (rate_flag & IEEE80211_TX_RC_SHORT_GI ||
 	    (ieee80211_is_data_qos(hdr->frame_control) &&
-	     sta && sta->ht_cap.cap &
+	     sta && sta->deflink.ht_cap.cap &
 	     (IEEE80211_HT_CAP_SGI_40 | IEEE80211_HT_CAP_SGI_20)))
 		sgi = true;
 
@@ -5405,7 +5405,7 @@ void rtl8723bu_handle_bt_inquiry(struct rtl8xxxu_priv *priv)
 
 	vif = priv->vif;
 	btcoex = &priv->bt_coex;
-	wifi_connected = (vif && vif->bss_conf.assoc);
+	wifi_connected = (vif && vif->cfg.assoc);
 
 	if (!wifi_connected) {
 		rtl8723bu_set_ps_tdma(priv, 0x8, 0x0, 0x0, 0x0, 0x0);
@@ -5431,7 +5431,7 @@ void rtl8723bu_handle_bt_info(struct rtl8xxxu_priv *priv)
 
 	vif = priv->vif;
 	btcoex = &priv->bt_coex;
-	wifi_connected = (vif && vif->bss_conf.assoc);
+	wifi_connected = (vif && vif->cfg.assoc);
 
 	if (wifi_connected) {
 		u32 val32 = 0;
@@ -5957,7 +5957,8 @@ exit:
 }
 
 static int rtl8xxxu_conf_tx(struct ieee80211_hw *hw,
-			    struct ieee80211_vif *vif, u16 queue,
+			    struct ieee80211_vif *vif,
+			    unsigned int link_id, u16 queue,
 			    const struct ieee80211_tx_queue_params *param)
 {
 	struct rtl8xxxu_priv *priv = hw->priv;
@@ -6162,8 +6163,8 @@ rtl8xxxu_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	switch (action) {
 	case IEEE80211_AMPDU_TX_START:
 		dev_dbg(dev, "%s: IEEE80211_AMPDU_TX_START\n", __func__);
-		ampdu_factor = sta->ht_cap.ampdu_factor;
-		ampdu_density = sta->ht_cap.ampdu_density;
+		ampdu_factor = sta->deflink.ht_cap.ampdu_factor;
+		ampdu_density = sta->deflink.ht_cap.ampdu_density;
 		rtl8xxxu_set_ampdu_factor(priv, ampdu_factor);
 		rtl8xxxu_set_ampdu_min_space(priv, ampdu_density);
 		dev_dbg(dev,
@@ -6255,10 +6256,10 @@ static void rtl8xxxu_refresh_rate_mask(struct rtl8xxxu_priv *priv,
 		u32 rate_bitmap = 0;
 
 		rcu_read_lock();
-		rate_bitmap = (sta->supp_rates[0] & 0xfff) |
-				(sta->ht_cap.mcs.rx_mask[0] << 12) |
-				(sta->ht_cap.mcs.rx_mask[1] << 20);
-		if (sta->ht_cap.cap &
+		rate_bitmap = (sta->deflink.supp_rates[0] & 0xfff) |
+				(sta->deflink.ht_cap.mcs.rx_mask[0] << 12) |
+				(sta->deflink.ht_cap.mcs.rx_mask[1] << 20);
+		if (sta->deflink.ht_cap.cap &
 		    (IEEE80211_HT_CAP_SGI_40 | IEEE80211_HT_CAP_SGI_20))
 			sgi = 1;
 		rcu_read_unlock();

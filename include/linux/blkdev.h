@@ -582,8 +582,6 @@ struct request_queue {
 	struct percpu_ref	q_usage_counter;
 	RH_KABI_DEPRECATE(struct list_head, all_q_node)
 
-	int			quiesce_depth;
-
 	struct blk_mq_tag_set	*tag_set;
 	struct list_head	tag_set_list;
 	struct bio_set		bio_split;
@@ -626,6 +624,7 @@ struct request_queue {
 
 	RH_KABI_EXTEND(struct sbitmap_queue	sched_bitmap_tags)
 	RH_KABI_EXTEND(struct sbitmap_queue	sched_breserved_tags)
+	RH_KABI_EXTEND(int			quiesce_depth)
 };
 
 /* Keep blk_queue_flag_name[] in sync with the definitions below */

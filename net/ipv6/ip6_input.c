@@ -77,13 +77,14 @@ int ip6_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
 
 int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *orig_dev)
 {
+	enum skb_drop_reason reason;
 	const struct ipv6hdr *hdr;
 	u32 pkt_len;
 	struct inet6_dev *idev;
 	struct net *net = dev_net(skb->dev);
 
 	if (skb->pkt_type == PACKET_OTHERHOST) {
-		kfree_skb(skb);
+		kfree_skb_reason(skb, SKB_DROP_REASON_OTHERHOST);
 		return NET_RX_DROP;
 	}
 
@@ -93,9 +94,12 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
 
 	__IP6_UPD_PO_STATS(net, idev, IPSTATS_MIB_IN, skb->len);
 
+	SKB_DR_SET(reason, NOT_SPECIFIED);
 	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL ||
 	    !idev || unlikely(idev->cnf.disable_ipv6)) {
 		__IP6_INC_STATS(net, idev, IPSTATS_MIB_INDISCARDS);
+		if (idev && unlikely(idev->cnf.disable_ipv6))
+			SKB_DR_SET(reason, IPV6DISABLED);
 		goto drop;
 	}
 
@@ -119,8 +123,10 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
 
 	hdr = ipv6_hdr(skb);
 
-	if (hdr->version != 6)
+	if (hdr->version != 6) {
+		SKB_DR_SET(reason, UNHANDLED_PROTO);
 		goto err;
+	}
 
 	__IP6_ADD_STATS(net, idev,
 			IPSTATS_MIB_NOECTPKTS +
@@ -158,8 +164,10 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
 	if (!ipv6_addr_is_multicast(&hdr->daddr) &&
 	    (skb->pkt_type == PACKET_BROADCAST ||
 	     skb->pkt_type == PACKET_MULTICAST) &&
-	    idev->cnf.drop_unicast_in_l2_multicast)
+	    idev->cnf.drop_unicast_in_l2_multicast) {
+		SKB_DR_SET(reason, UNICAST_IN_L2_MULTICAST);
 		goto err;
+	}
 
 	/* RFC4291 2.7
 	 * Nodes must not originate a packet to a multicast address whose scope
@@ -188,12 +196,11 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
 		if (pkt_len + sizeof(struct ipv6hdr) > skb->len) {
 			__IP6_INC_STATS(net,
 					idev, IPSTATS_MIB_INTRUNCATEDPKTS);
+			SKB_DR_SET(reason, PKT_TOO_SMALL);
 			goto drop;
 		}
-		if (pskb_trim_rcsum(skb, pkt_len + sizeof(struct ipv6hdr))) {
-			__IP6_INC_STATS(net, idev, IPSTATS_MIB_INHDRERRORS);
-			goto drop;
-		}
+		if (pskb_trim_rcsum(skb, pkt_len + sizeof(struct ipv6hdr)))
+			goto err;
 		hdr = ipv6_hdr(skb);
 	}
 
@@ -216,9 +223,10 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
 		       ip6_rcv_finish);
 err:
 	__IP6_INC_STATS(net, idev, IPSTATS_MIB_INHDRERRORS);
+	SKB_DR_OR(reason, IP_INHDR);
 drop:
 	rcu_read_unlock();
-	kfree_skb(skb);
+	kfree_skb_reason(skb, reason);
 	return NET_RX_DROP;
 }
 

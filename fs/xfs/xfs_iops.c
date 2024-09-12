@@ -723,7 +723,7 @@ xfs_setattr_nonsize(
 		}
 	}
 
-	setattr_copy(mnt_userns, inode, iattr);
+	setattr_copy(inode, iattr);
 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
 
 	XFS_STATS_INC(mp, xs_ig_attrchg);
@@ -948,7 +948,7 @@ xfs_setattr_size(
 	}
 
 	ASSERT(!(iattr->ia_valid & (ATTR_UID | ATTR_GID)));
-	setattr_copy(mnt_userns, inode, iattr);
+	setattr_copy(inode, iattr);
 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
 
 	XFS_STATS_INC(mp, xs_ig_attrchg);

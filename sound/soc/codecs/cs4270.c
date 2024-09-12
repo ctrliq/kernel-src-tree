@@ -619,7 +619,6 @@ static const struct snd_soc_component_driver soc_component_device_cs4270 = {
 	.idle_bias_on		= 1,
 	.use_pmdown_time	= 1,
 	.endianness		= 1,
-	.non_legacy_dai_naming	= 1,
 };
 
 /*
@@ -667,8 +666,7 @@ static int cs4270_i2c_remove(struct i2c_client *i2c_client)
  * This function is called whenever the I2C subsystem finds a device that
  * matches the device ID given via a prior call to i2c_add_driver().
  */
-static int cs4270_i2c_probe(struct i2c_client *i2c_client,
-	const struct i2c_device_id *id)
+static int cs4270_i2c_probe(struct i2c_client *i2c_client)
 {
 	struct cs4270_private *cs4270;
 	unsigned int val;
@@ -755,7 +753,7 @@ static struct i2c_driver cs4270_i2c_driver = {
 		.of_match_table = cs4270_of_match,
 	},
 	.id_table = cs4270_id,
-	.probe = cs4270_i2c_probe,
+	.probe_new = cs4270_i2c_probe,
 	.remove = cs4270_i2c_remove,
 };
 

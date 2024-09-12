@@ -63,6 +63,7 @@ struct symbol {
 	unsigned int len;
 	struct symbol *pfunc, *cfunc, *alias;
 	bool uaccess_safe;
+	bool return_thunk;
 };
 
 struct rela {

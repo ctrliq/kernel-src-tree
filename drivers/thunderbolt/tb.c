@@ -695,7 +695,11 @@ static void tb_scan_port(struct tb_port *port)
 	tb_switch_lane_bonding_enable(sw);
 	/* Set the link configured */
 	tb_switch_configure_link(sw);
-	tb_switch_tmu_configure(sw, TB_SWITCH_TMU_RATE_HIFI, false);
+	if (tb_switch_enable_clx(sw, TB_CL0S))
+		tb_sw_warn(sw, "failed to enable CLx on upstream port\n");
+
+	tb_switch_tmu_configure(sw, TB_SWITCH_TMU_RATE_HIFI,
+				tb_switch_is_clx_enabled(sw));
 
 	if (tb_enable_tmu(sw))
 		tb_sw_warn(sw, "failed to enable TMU\n");
@@ -1091,6 +1095,8 @@ static int tb_disconnect_pci(struct tb *tb, struct tb_switch *sw)
 	if (WARN_ON(!tunnel))
 		return -ENODEV;
 
+	tb_switch_xhci_disconnect(sw);
+
 	tb_tunnel_deactivate(tunnel);
 	list_del(&tunnel->list);
 	tb_tunnel_free(tunnel);
@@ -1128,6 +1134,16 @@ static int tb_tunnel_pci(struct tb *tb, struct tb_switch *sw)
 		tb_tunnel_free(tunnel);
 		return -EIO;
 	}
+
+	/*
+	 * PCIe L1 is needed to enable CL0s for Titan Ridge so enable it
+	 * here.
+	 */
+	if (tb_switch_pcie_l1_enable(sw))
+		tb_sw_warn(sw, "failed to enable PCIe L1 for Titan Ridge\n");
+
+	if (tb_switch_xhci_connect(sw))
+		tb_sw_warn(sw, "failed to connect xHCI\n");
 
 	list_add_tail(&tunnel->list, &tcm->tunnel_list);
 	return 0;
@@ -1286,12 +1302,18 @@ static void tb_handle_hotplug(struct work_struct *work)
 			tb_port_unconfigure_xdomain(port);
 		} else if (tb_port_is_dpout(port) || tb_port_is_dpin(port)) {
 			tb_dp_resource_unavailable(tb, port);
+		} else if (!port->port) {
+			tb_sw_dbg(sw, "xHCI disconnect request\n");
+			tb_switch_xhci_disconnect(sw);
 		} else {
 			tb_port_dbg(port,
 				   "got unplug event for disconnected port, ignoring\n");
 		}
 	} else if (port->remote) {
 		tb_port_dbg(port, "got plug event for connected port, ignoring\n");
+	} else if (!port->port && sw->authorized) {
+		tb_sw_dbg(sw, "xHCI connect request\n");
+		tb_switch_xhci_connect(sw);
 	} else {
 		if (tb_port_is_null(port)) {
 			tb_port_dbg(port, "hotplug: scanning\n");
@@ -1462,6 +1484,9 @@ static void tb_restore_children(struct tb_switch *sw)
 	/* No need to restore if the router is already unplugged */
 	if (sw->is_unplugged)
 		return;
+
+	if (tb_switch_enable_clx(sw, TB_CL0S))
+		tb_sw_warn(sw, "failed to re-enable CLx on upstream port\n");
 
 	/*
 	 * tb_switch_tmu_configure() was already called when the switch was

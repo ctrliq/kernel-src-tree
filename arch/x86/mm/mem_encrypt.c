@@ -193,9 +193,6 @@ void __init sme_early_init(void)
 	/* Update the protection map with memory encryption mask */
 	for (i = 0; i < ARRAY_SIZE(protection_map); i++)
 		protection_map[i] = pgprot_encrypted(protection_map[i]);
-
-	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
-		swiotlb_force = SWIOTLB_FORCE;
 }
 
 void __init sev_setup_arch(void)
@@ -229,28 +226,75 @@ void __init sev_setup_arch(void)
 	swiotlb_adjust_size(size);
 }
 
+static unsigned long pg_level_to_pfn(int level, pte_t *kpte, pgprot_t *ret_prot)
+{
+	unsigned long pfn = 0;
+	pgprot_t prot;
+
+	switch (level) {
+	case PG_LEVEL_4K:
+		pfn = pte_pfn(*kpte);
+		prot = pte_pgprot(*kpte);
+		break;
+	case PG_LEVEL_2M:
+		pfn = pmd_pfn(*(pmd_t *)kpte);
+		prot = pmd_pgprot(*(pmd_t *)kpte);
+		break;
+	case PG_LEVEL_1G:
+		pfn = pud_pfn(*(pud_t *)kpte);
+		prot = pud_pgprot(*(pud_t *)kpte);
+		break;
+	default:
+		WARN_ONCE(1, "Invalid level for kpte\n");
+		return 0;
+	}
+
+	if (ret_prot)
+		*ret_prot = prot;
+
+	return pfn;
+}
+
+void notify_range_enc_status_changed(unsigned long vaddr, int npages, bool enc)
+{
+#ifdef CONFIG_PARAVIRT
+	unsigned long sz = npages << PAGE_SHIFT;
+	unsigned long vaddr_end = vaddr + sz;
+
+	while (vaddr < vaddr_end) {
+		int psize, pmask, level;
+		unsigned long pfn;
+		pte_t *kpte;
+
+		kpte = lookup_address(vaddr, &level);
+		if (!kpte || pte_none(*kpte)) {
+			WARN_ONCE(1, "kpte lookup for vaddr\n");
+			return;
+		}
+
+		pfn = pg_level_to_pfn(level, kpte, NULL);
+		if (!pfn)
+			continue;
+
+		psize = page_level_size(level);
+		pmask = page_level_mask(level);
+
+		notify_page_enc_status_changed(pfn, psize >> PAGE_SHIFT, enc);
+
+		vaddr = (vaddr & pmask) + psize;
+	}
+#endif
+}
+
 static void __init __set_clr_pte_enc(pte_t *kpte, int level, bool enc)
 {
 	pgprot_t old_prot, new_prot;
 	unsigned long pfn, pa, size;
 	pte_t new_pte;
 
-	switch (level) {
-	case PG_LEVEL_4K:
-		pfn = pte_pfn(*kpte);
-		old_prot = pte_pgprot(*kpte);
-		break;
-	case PG_LEVEL_2M:
-		pfn = pmd_pfn(*(pmd_t *)kpte);
-		old_prot = pmd_pgprot(*(pmd_t *)kpte);
-		break;
-	case PG_LEVEL_1G:
-		pfn = pud_pfn(*(pud_t *)kpte);
-		old_prot = pud_pgprot(*(pud_t *)kpte);
-		break;
-	default:
+	pfn = pg_level_to_pfn(level, kpte, &old_prot);
+	if (!pfn)
 		return;
-	}
 
 	new_prot = old_prot;
 	if (enc)
@@ -286,12 +330,13 @@ static void __init __set_clr_pte_enc(pte_t *kpte, int level, bool enc)
 static int __init early_set_memory_enc_dec(unsigned long vaddr,
 					   unsigned long size, bool enc)
 {
-	unsigned long vaddr_end, vaddr_next;
+	unsigned long vaddr_end, vaddr_next, start;
 	unsigned long psize, pmask;
 	int split_page_size_mask;
 	int level, ret;
 	pte_t *kpte;
 
+	start = vaddr;
 	vaddr_next = vaddr;
 	vaddr_end = vaddr + size;
 
@@ -346,6 +391,7 @@ static int __init early_set_memory_enc_dec(unsigned long vaddr,
 
 	ret = 0;
 
+	notify_range_enc_status_changed(start, PAGE_ALIGN(size) >> PAGE_SHIFT, enc);
 out:
 	__flush_tlb_all();
 	return ret;
@@ -359,6 +405,11 @@ int __init early_set_memory_decrypted(unsigned long vaddr, unsigned long size)
 int __init early_set_memory_encrypted(unsigned long vaddr, unsigned long size)
 {
 	return early_set_memory_enc_dec(vaddr, size, true);
+}
+
+void __init early_set_mem_enc_dec_hypercall(unsigned long vaddr, int npages, bool enc)
+{
+	notify_range_enc_status_changed(vaddr, npages, enc);
 }
 
 /*
@@ -421,7 +472,7 @@ void __init mem_encrypt_free_decrypted_mem(void)
 	 * The unused memory range was mapped decrypted, change the encryption
 	 * attribute from decrypted to encrypted before freeing it.
 	 */
-	if (mem_encrypt_active()) {
+	if (cc_platform_has(CC_ATTR_MEM_ENCRYPT)) {
 		r = set_memory_encrypted(vaddr, npages);
 		if (r) {
 			pr_warn("failed to free unused decrypted pages\n");

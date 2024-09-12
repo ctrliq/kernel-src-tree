@@ -6,6 +6,8 @@
 #ifndef _MEI_HW_MEI_REGS_H_
 #define _MEI_HW_MEI_REGS_H_
 
+#define MEI_DEV_ID_ADP_S      0x7AE8  /* Alder Lake Point S */
+
 /*
  * MEI device IDs
  */
@@ -102,8 +104,7 @@
 
 #define MEI_DEV_ID_EBG        0x1BE0  /* Emmitsburg WS */
 
-#define MEI_DEV_ID_ADP_S      0x7AE8  /* Alder Lake Point S */
-
+#define MEI_DEV_ID_ADP_N      0x54E0  /* Alder Lake Point N */
 /*
  * MEI HW Section
  */

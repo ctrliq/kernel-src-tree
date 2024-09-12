@@ -370,7 +370,7 @@ static netdev_tx_t bnxt_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	i = skb_get_queue_mapping(skb);
 	if (unlikely(i >= bp->tx_nr_rings)) {
 		dev_kfree_skb_any(skb);
-		atomic_long_inc(&dev->tx_dropped);
+		dev_core_stats_tx_dropped_inc(dev);
 		return NETDEV_TX_OK;
 	}
 
@@ -534,12 +534,9 @@ normal_tx:
 		u32 hdr_len;
 
 		if (skb->encapsulation)
-			hdr_len = skb_inner_network_offset(skb) +
-				skb_inner_network_header_len(skb) +
-				inner_tcp_hdrlen(skb);
+			hdr_len = skb_inner_tcp_all_headers(skb);
 		else
-			hdr_len = skb_transport_offset(skb) +
-				tcp_hdrlen(skb);
+			hdr_len = skb_tcp_all_headers(skb);
 
 		txbd1->tx_bd_hsize_lflags |= cpu_to_le32(TX_BD_FLAGS_LSO |
 					TX_BD_FLAGS_T_IPID |
@@ -646,7 +643,7 @@ tx_kick_pending:
 	if (txr->kick_pending)
 		bnxt_txr_db_kick(bp, txr, txr->tx_prod);
 	txr->tx_buf_ring[txr->tx_prod].skb = NULL;
-	atomic_long_inc(&dev->tx_dropped);
+	dev_core_stats_tx_dropped_inc(dev);
 	return NETDEV_TX_OK;
 }
 

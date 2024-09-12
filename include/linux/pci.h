@@ -488,6 +488,7 @@ struct pci_dev {
 	RH_KABI_FILL_HOLE(unsigned int	dpc_rp_extensions:1)
 #endif
         RH_KABI_FILL_HOLE(unsigned int  no_command_memory:1)    /* No PCI_COMMAND_MEMORY */
+	RH_KABI_FILL_HOLE(unsigned int	rom_bar_overlap:1)	/* ROM BAR disable broken */
 	pci_dev_flags_t dev_flags;
 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
 
@@ -936,6 +937,8 @@ struct module;
  *              MSI-X vectors available for distribution to the VFs.
  * @err_handler: See Documentation/PCI/pci-error-recovery.rst
  * @groups:	Sysfs attribute groups.
+ * @dev_groups: Attributes attached to the device that will be
+ *              created once it is bound to the driver.
  * @driver:	Driver model structure.
  * @dynids:	List of dynamically added device IDs.
  */
@@ -962,7 +965,7 @@ struct pci_driver {
 	struct device_driver	driver;
 	struct pci_dynids	dynids;
 
-	RH_KABI_RESERVE(5)
+	RH_KABI_USE(5, const struct attribute_group **dev_groups)
 	RH_KABI_RESERVE(6)
 	RH_KABI_RESERVE(7)
 	RH_KABI_RESERVE(8)

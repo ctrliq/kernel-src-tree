@@ -28,10 +28,12 @@
  *    Alan Cox <alan@linux.intel.com>
  */
 
+#include "gem.h"
 #include "power.h"
 #include "psb_drv.h"
 #include "psb_reg.h"
 #include "psb_intel_reg.h"
+#include "psb_irq.h"
 #include <linux/mutex.h>
 #include <linux/pm_runtime.h>
 
@@ -46,7 +48,7 @@ static DEFINE_SPINLOCK(power_ctrl_lock);	/* Serialize power claim */
  */
 void gma_power_init(struct drm_device *dev)
 {
-	struct drm_psb_private *dev_priv = dev->dev_private;
+	struct drm_psb_private *dev_priv = to_drm_psb_private(dev);
 
 	/* FIXME: Move APM/OSPM base into relevant device code */
 	dev_priv->apm_base = dev_priv->apm_reg & 0xffff;
@@ -81,7 +83,7 @@ void gma_power_uninit(struct drm_device *dev)
  */
 static void gma_suspend_display(struct drm_device *dev)
 {
-	struct drm_psb_private *dev_priv = dev->dev_private;
+	struct drm_psb_private *dev_priv = to_drm_psb_private(dev);
 
 	if (dev_priv->suspended)
 		return;
@@ -100,7 +102,7 @@ static void gma_suspend_display(struct drm_device *dev)
 static void gma_resume_display(struct pci_dev *pdev)
 {
 	struct drm_device *dev = pci_get_drvdata(pdev);
-	struct drm_psb_private *dev_priv = dev->dev_private;
+	struct drm_psb_private *dev_priv = to_drm_psb_private(dev);
 
 	/* turn on the display power island */
 	dev_priv->ops->power_up(dev);
@@ -111,7 +113,9 @@ static void gma_resume_display(struct pci_dev *pdev)
 	pci_write_config_word(pdev, PSB_GMCH_CTRL,
 			dev_priv->gmch_ctrl | _PSB_GMCH_ENABLED);
 
-	psb_gtt_restore(dev); /* Rebuild our GTT mappings */
+	/* Rebuild our GTT mappings */
+	psb_gtt_resume(dev);
+	psb_gem_mm_resume(dev);
 	dev_priv->ops->restore_regs(dev);
 }
 
@@ -124,7 +128,7 @@ static void gma_resume_display(struct pci_dev *pdev)
 static void gma_suspend_pci(struct pci_dev *pdev)
 {
 	struct drm_device *dev = pci_get_drvdata(pdev);
-	struct drm_psb_private *dev_priv = dev->dev_private;
+	struct drm_psb_private *dev_priv = to_drm_psb_private(dev);
 	int bsm, vbt;
 
 	if (dev_priv->suspended)
@@ -135,8 +139,6 @@ static void gma_suspend_pci(struct pci_dev *pdev)
 	dev_priv->regs.saveBSM = bsm;
 	pci_read_config_dword(pdev, 0xFC, &vbt);
 	dev_priv->regs.saveVBT = vbt;
-	pci_read_config_dword(pdev, PSB_PCIx_MSI_ADDR_LOC, &dev_priv->msi_addr);
-	pci_read_config_dword(pdev, PSB_PCIx_MSI_DATA_LOC, &dev_priv->msi_data);
 
 	pci_disable_device(pdev);
 	pci_set_power_state(pdev, PCI_D3hot);
@@ -154,7 +156,7 @@ static void gma_suspend_pci(struct pci_dev *pdev)
 static bool gma_resume_pci(struct pci_dev *pdev)
 {
 	struct drm_device *dev = pci_get_drvdata(pdev);
-	struct drm_psb_private *dev_priv = dev->dev_private;
+	struct drm_psb_private *dev_priv = to_drm_psb_private(dev);
 	int ret;
 
 	if (!dev_priv->suspended)
@@ -164,9 +166,6 @@ static bool gma_resume_pci(struct pci_dev *pdev)
 	pci_restore_state(pdev);
 	pci_write_config_dword(pdev, 0x5c, dev_priv->regs.saveBSM);
 	pci_write_config_dword(pdev, 0xFC, dev_priv->regs.saveVBT);
-	/* restoring MSI address and data in PCIx space */
-	pci_write_config_dword(pdev, PSB_PCIx_MSI_ADDR_LOC, dev_priv->msi_addr);
-	pci_write_config_dword(pdev, PSB_PCIx_MSI_DATA_LOC, dev_priv->msi_data);
 	ret = pci_enable_device(pdev);
 
 	if (ret != 0)
@@ -188,7 +187,7 @@ int gma_power_suspend(struct device *_dev)
 {
 	struct pci_dev *pdev = to_pci_dev(_dev);
 	struct drm_device *dev = pci_get_drvdata(pdev);
-	struct drm_psb_private *dev_priv = dev->dev_private;
+	struct drm_psb_private *dev_priv = to_drm_psb_private(dev);
 
 	mutex_lock(&power_mutex);
 	if (!dev_priv->suspended) {
@@ -197,7 +196,7 @@ int gma_power_suspend(struct device *_dev)
 			dev_err(dev->dev, "GPU hardware busy, cannot suspend\n");
 			return -EBUSY;
 		}
-		psb_irq_uninstall(dev);
+		gma_irq_uninstall(dev);
 		gma_suspend_display(dev);
 		gma_suspend_pci(pdev);
 	}
@@ -219,8 +218,7 @@ int gma_power_resume(struct device *_dev)
 	mutex_lock(&power_mutex);
 	gma_resume_pci(pdev);
 	gma_resume_display(pdev);
-	psb_irq_preinstall(dev);
-	psb_irq_postinstall(dev);
+	gma_irq_install(dev);
 	mutex_unlock(&power_mutex);
 	return 0;
 }
@@ -233,7 +231,7 @@ int gma_power_resume(struct device *_dev)
  */
 bool gma_power_is_on(struct drm_device *dev)
 {
-	struct drm_psb_private *dev_priv = dev->dev_private;
+	struct drm_psb_private *dev_priv = to_drm_psb_private(dev);
 	return dev_priv->display_power;
 }
 
@@ -247,7 +245,7 @@ bool gma_power_is_on(struct drm_device *dev)
  */
 bool gma_power_begin(struct drm_device *dev, bool force_on)
 {
-	struct drm_psb_private *dev_priv = dev->dev_private;
+	struct drm_psb_private *dev_priv = to_drm_psb_private(dev);
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
 	int ret;
 	unsigned long flags;
@@ -266,8 +264,8 @@ bool gma_power_begin(struct drm_device *dev, bool force_on)
 	/* Ok power up needed */
 	ret = gma_resume_pci(pdev);
 	if (ret == 0) {
-		psb_irq_preinstall(dev);
-		psb_irq_postinstall(dev);
+		gma_irq_preinstall(dev);
+		gma_irq_postinstall(dev);
 		pm_runtime_get(dev->dev);
 		dev_priv->display_count++;
 		spin_unlock_irqrestore(&power_ctrl_lock, flags);
@@ -287,7 +285,7 @@ out_false:
  */
 void gma_power_end(struct drm_device *dev)
 {
-	struct drm_psb_private *dev_priv = dev->dev_private;
+	struct drm_psb_private *dev_priv = to_drm_psb_private(dev);
 	unsigned long flags;
 	spin_lock_irqsave(&power_ctrl_lock, flags);
 	dev_priv->display_count--;
@@ -309,7 +307,7 @@ int psb_runtime_resume(struct device *dev)
 int psb_runtime_idle(struct device *dev)
 {
 	struct drm_device *drmdev = pci_get_drvdata(to_pci_dev(dev));
-	struct drm_psb_private *dev_priv = drmdev->dev_private;
+	struct drm_psb_private *dev_priv = to_drm_psb_private(drmdev);
 	if (dev_priv->display_count)
 		return 0;
 	else

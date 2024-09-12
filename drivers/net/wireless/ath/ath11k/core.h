@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause-Clear */
 /*
  * Copyright (c) 2018-2019 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef ATH11K_CORE_H
@@ -10,6 +11,10 @@
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/bitfield.h>
+#include <linux/dmi.h>
+#include <linux/ctype.h>
+#include <linux/rhashtable.h>
+#include <linux/average.h>
 #include "qmi.h"
 #include "htc.h"
 #include "wmi.h"
@@ -36,6 +41,15 @@
 
 #define ATH11K_INVALID_HW_MAC_ID	0xFF
 #define ATH11K_CONNECTION_LOSS_HZ	(3 * HZ)
+
+/* SMBIOS type containing Board Data File Name Extension */
+#define ATH11K_SMBIOS_BDF_EXT_TYPE 0xF8
+
+/* SMBIOS type structure length (excluding strings-set) */
+#define ATH11K_SMBIOS_BDF_EXT_LENGTH 0x9
+
+/* The magic used by QCA spec */
+#define ATH11K_SMBIOS_BDF_EXT_MAGIC "BDF_"
 
 extern unsigned int ath11k_frame_mode;
 
@@ -127,6 +141,7 @@ enum ath11k_hw_rev {
 	ATH11K_HW_QCN9074_HW10,
 	ATH11K_HW_WCN6855_HW20,
 	ATH11K_HW_WCN6855_HW21,
+	ATH11K_HW_WCN6750_HW10,
 };
 
 enum ath11k_firmware_mode {
@@ -155,6 +170,39 @@ struct ath11k_ext_irq_grp {
 	struct napi_struct napi;
 	struct net_device napi_ndev;
 };
+
+enum ath11k_smbios_cc_type {
+	/* disable country code setting from SMBIOS */
+	ATH11K_SMBIOS_CC_DISABLE = 0,
+
+	/* set country code by ANSI country name, based on ISO3166-1 alpha2 */
+	ATH11K_SMBIOS_CC_ISO = 1,
+
+	/* worldwide regdomain */
+	ATH11K_SMBIOS_CC_WW = 2,
+};
+
+struct ath11k_smbios_bdf {
+	struct dmi_header hdr;
+
+	u8 features_disabled;
+
+	/* enum ath11k_smbios_cc_type */
+	u8 country_code_flag;
+
+	/* To set specific country, you need to set country code
+	 * flag=ATH11K_SMBIOS_CC_ISO first, then if country is United
+	 * States, then country code value = 0x5553 ("US",'U' = 0x55, 'S'=
+	 * 0x53). To set country to INDONESIA, then country code value =
+	 * 0x4944 ("IN", 'I'=0x49, 'D'=0x44). If country code flag =
+	 * ATH11K_SMBIOS_CC_WW, then you can use worldwide regulatory
+	 * setting.
+	 */
+	u16 cc_code;
+
+	u8 bdf_enabled;
+	u8 bdf_ext[];
+} __packed;
 
 #define HEHANDLE_CAP_PHYINFO_SIZE       3
 #define HECAP_PHYINFO_SIZE              9
@@ -219,6 +267,8 @@ enum ath11k_dev_flags {
 	ATH11K_FLAG_CE_IRQ_ENABLED,
 	ATH11K_FLAG_EXT_IRQ_ENABLED,
 	ATH11K_FLAG_FIXED_MEM_RGN,
+	ATH11K_FLAG_DEVICE_INIT_DONE,
+	ATH11K_FLAG_MULTI_MSI_VECTORS,
 };
 
 enum ath11k_monitor_flags {
@@ -415,6 +465,8 @@ struct ath11k_per_ppdu_tx_stats {
 	u32 retry_bytes;
 };
 
+DECLARE_EWMA(avg_rssi, 10, 8)
+
 struct ath11k_sta {
 	struct ath11k_vif *arvif;
 
@@ -433,6 +485,7 @@ struct ath11k_sta {
 	u64 rx_duration;
 	u64 tx_duration;
 	u8 rssi_comb;
+	struct ewma_avg_rssi avg_rssi;
 	s8 rssi_beacon;
 	s8 chain_signal[IEEE80211_MAX_CHAINS];
 	struct ath11k_htt_tx_stats *tx_stats;
@@ -698,12 +751,12 @@ struct ath11k_board_data {
 	size_t len;
 };
 
-struct ath11k_bus_params {
-	bool mhi_support;
-	bool m3_fw_support;
-	bool fixed_bdf_addr;
-	bool fixed_mem_region;
-	bool static_window_map;
+struct ath11k_pci_ops {
+	int (*wakeup)(struct ath11k_base *ab);
+	void (*release)(struct ath11k_base *ab);
+	int (*get_msi_irq)(struct ath11k_base *ab, unsigned int vector);
+	void (*window_write32)(struct ath11k_base *ab, u32 offset, u32 value);
+	u32 (*window_read32)(struct ath11k_base *ab, u32 offset);
 };
 
 /* IPQ8074 HW channel counters frequency value in hertz */
@@ -745,6 +798,19 @@ struct ath11k_soc_dp_stats {
 	u32 hal_reo_error[DP_REO_DST_RING_MAX];
 	struct ath11k_soc_dp_tx_err_stats tx_err;
 	struct ath11k_dp_ring_bp_stats bp_stats;
+};
+
+struct ath11k_msi_user {
+	char *name;
+	int num_vectors;
+	u32 base_vector;
+};
+
+struct ath11k_msi_config {
+	int total_vectors;
+	int total_users;
+	struct ath11k_msi_user *users;
+	u16 hw_rev;
 };
 
 /* Master structure to hold the hw data which may be used in core module */
@@ -791,6 +857,18 @@ struct ath11k_base {
 	struct ath11k_pdev __rcu *pdevs_active[MAX_RADIOS];
 	struct ath11k_hal_reg_capabilities_ext hal_reg_cap[MAX_RADIOS];
 	unsigned long long free_vdev_map;
+
+	/* To synchronize rhash tbl write operation */
+	struct mutex tbl_mtx_lock;
+
+	/* The rhashtable containing struct ath11k_peer keyed by mac addr */
+	struct rhashtable *rhead_peer_addr;
+	struct rhashtable_params rhash_peer_addr_param;
+
+	/* The rhashtable containing struct ath11k_peer keyed by id  */
+	struct rhashtable *rhead_peer_id;
+	struct rhashtable_params rhash_peer_id_param;
+
 	struct list_head peers;
 	wait_queue_head_t peer_mapping_wq;
 	u8 mac_addr[ETH_ALEN];
@@ -804,7 +882,6 @@ struct ath11k_base {
 	int bd_api;
 
 	struct ath11k_hw_params hw_params;
-	struct ath11k_bus_params bus_params;
 
 	const struct firmware *cal_file;
 
@@ -852,10 +929,6 @@ struct ath11k_base {
 
 	struct ath11k_dbring_cap *db_caps;
 	u32 num_db_cap;
-	struct work_struct rfkill_work;
-
-	/* true means radio is on */
-	bool rfkill_radio_on;
 
 	/* To synchronize 11d scan vdev id */
 	struct mutex vdev_id_11d_lock;
@@ -870,6 +943,18 @@ struct ath11k_base {
 		u32 subsystem_vendor;
 		u32 subsystem_device;
 	} id;
+
+	struct {
+		struct {
+			const struct ath11k_msi_config *config;
+			u32 ep_base_data;
+			u32 irqs[32];
+			u32 addr_lo;
+			u32 addr_hi;
+		} msi;
+
+		const struct ath11k_pci_ops *ops;
+	} pci;
 
 	/* must be last */
 	u8 drv_priv[] __aligned(sizeof(void *));
@@ -1041,8 +1126,7 @@ int ath11k_core_pre_init(struct ath11k_base *ab);
 int ath11k_core_init(struct ath11k_base *ath11k);
 void ath11k_core_deinit(struct ath11k_base *ath11k);
 struct ath11k_base *ath11k_core_alloc(struct device *dev, size_t priv_size,
-				      enum ath11k_bus bus,
-				      const struct ath11k_bus_params *bus_params);
+				      enum ath11k_bus bus);
 void ath11k_core_free(struct ath11k_base *ath11k);
 int ath11k_core_fetch_bdf(struct ath11k_base *ath11k,
 			  struct ath11k_board_data *bd);
@@ -1052,7 +1136,7 @@ int ath11k_core_fetch_board_data_api_1(struct ath11k_base *ab,
 				       const char *name);
 void ath11k_core_free_bdf(struct ath11k_base *ab, struct ath11k_board_data *bd);
 int ath11k_core_check_dt(struct ath11k_base *ath11k);
-
+int ath11k_core_check_smbios(struct ath11k_base *ab);
 void ath11k_core_halt(struct ath11k *ar);
 int ath11k_core_resume(struct ath11k_base *ab);
 int ath11k_core_suspend(struct ath11k_base *ab);

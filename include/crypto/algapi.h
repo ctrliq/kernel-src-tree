@@ -51,12 +51,12 @@ struct crypto_instance {
 
 	struct crypto_template *tmpl;
 
-	union {
+	RH_KABI_REPLACE(struct hlist_node list, union {
 		/* Node in list of instances after registration. */
 		struct hlist_node list;
 		/* List of attached spawns before registration. */
 		struct crypto_spawn *spawns;
-	};
+	})
 
 	void *__ctx[] CRYPTO_MINALIGN_ATTR;
 };

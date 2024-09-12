@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
+
 //
 // This file is provided under a dual BSD/GPLv2 license. When using or
 // redistributing this file, you may do so under either license.
@@ -147,7 +147,7 @@ struct acp_dsp_stream *acp_dsp_stream_get(struct snd_sof_dev *sdev, int tag)
 	dev_err(sdev->dev, "stream %d active or no inactive stream\n", tag);
 	return NULL;
 }
-EXPORT_SYMBOL_NS(acp_dsp_stream_get, SND_SOC_SOF_AMD_COMMON);
+EXPORT_SYMBOL(acp_dsp_stream_get);
 
 int acp_dsp_stream_put(struct snd_sof_dev *sdev,
 		       struct acp_dsp_stream *acp_stream)
@@ -167,7 +167,7 @@ int acp_dsp_stream_put(struct snd_sof_dev *sdev,
 	dev_err(sdev->dev, "Cannot find active stream tag %d\n", acp_stream->stream_tag);
 	return -EINVAL;
 }
-EXPORT_SYMBOL_NS(acp_dsp_stream_put, SND_SOC_SOF_AMD_COMMON);
+EXPORT_SYMBOL(acp_dsp_stream_put);
 
 int acp_dsp_stream_init(struct snd_sof_dev *sdev)
 {
@@ -181,4 +181,4 @@ int acp_dsp_stream_init(struct snd_sof_dev *sdev)
 	}
 	return 0;
 }
-EXPORT_SYMBOL_NS(acp_dsp_stream_init, SND_SOC_SOF_AMD_COMMON);
+EXPORT_SYMBOL(acp_dsp_stream_init);

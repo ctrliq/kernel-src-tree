@@ -109,6 +109,13 @@ struct tb_switch_tmu {
 	enum tb_switch_tmu_rate rate_request;
 };
 
+enum tb_clx {
+	TB_CLX_DISABLE,
+	TB_CL0S,
+	TB_CL1,
+	TB_CL2,
+};
+
 /**
  * struct tb_switch - a thunderbolt switch
  * @dev: Device for the switch
@@ -133,6 +140,7 @@ struct tb_switch_tmu {
  * @cap_plug_events: Offset to the plug events capability (%0 if not found)
  * @cap_vsec_tmu: Offset to the TMU vendor specific capability (%0 if not found)
  * @cap_lc: Offset to the link controller capability (%0 if not found)
+ * @cap_lp: Offset to the low power (CLx for TBT) capability (%0 if not found)
  * @is_unplugged: The switch is going away
  * @drom: DROM of the switch (%NULL if not found)
  * @nvm: Pointer to the NVM if the switch has one (%NULL otherwise)
@@ -158,6 +166,7 @@ struct tb_switch_tmu {
  * @min_dp_main_credits: Router preferred minimum number of buffers for DP MAIN
  * @max_pcie_credits: Router preferred number of buffers for PCIe
  * @max_dma_credits: Router preferred number of buffers for DMA/P2P
+ * @clx: CLx state on the upstream link of the router
  *
  * When the switch is being added or removed to the domain (other
  * switches) you need to have domain lock held.
@@ -184,6 +193,7 @@ struct tb_switch {
 	int cap_plug_events;
 	int cap_vsec_tmu;
 	int cap_lc;
+	int cap_lp;
 	bool is_unplugged;
 	u8 *drom;
 	struct tb_nvm *nvm;
@@ -207,6 +217,7 @@ struct tb_switch {
 	unsigned int min_dp_main_credits;
 	unsigned int max_pcie_credits;
 	unsigned int max_dma_credits;
+	enum tb_clx clx;
 };
 
 /**
@@ -867,6 +878,19 @@ static inline bool tb_switch_is_titan_ridge(const struct tb_switch *sw)
 	return false;
 }
 
+static inline bool tb_switch_is_tiger_lake(const struct tb_switch *sw)
+{
+	if (sw->config.vendor_id == PCI_VENDOR_ID_INTEL) {
+		switch (sw->config.device_id) {
+		case PCI_DEVICE_ID_INTEL_TGL_NHI0:
+		case PCI_DEVICE_ID_INTEL_TGL_NHI1:
+		case PCI_DEVICE_ID_INTEL_TGL_H_NHI0:
+		case PCI_DEVICE_ID_INTEL_TGL_H_NHI1:
+			return true;
+		}
+	}
+	return false;
+}
 
 /**
  * tb_switch_is_usb4() - Is the switch USB4 compliant
@@ -923,6 +947,49 @@ static inline bool tb_switch_tmu_hifi_is_enabled(const struct tb_switch *sw,
 	return sw->tmu.rate == TB_SWITCH_TMU_RATE_HIFI &&
 	       sw->tmu.unidirectional == unidirectional;
 }
+
+int tb_switch_enable_clx(struct tb_switch *sw, enum tb_clx clx);
+int tb_switch_disable_clx(struct tb_switch *sw, enum tb_clx clx);
+
+/**
+ * tb_switch_is_clx_enabled() - Checks if the CLx is enabled
+ * @sw: Router to check the CLx state for
+ *
+ * Checks if the CLx is enabled on the router upstream link.
+ * Not applicable for a host router.
+ */
+static inline bool tb_switch_is_clx_enabled(const struct tb_switch *sw)
+{
+	return sw->clx != TB_CLX_DISABLE;
+}
+
+/**
+ * tb_switch_is_cl0s_enabled() - Checks if the CL0s is enabled
+ * @sw: Router to check for the CL0s
+ *
+ * Checks if the CL0s is enabled on the router upstream link.
+ * Not applicable for a host router.
+ */
+static inline bool tb_switch_is_cl0s_enabled(const struct tb_switch *sw)
+{
+	return sw->clx == TB_CL0S;
+}
+
+/**
+ * tb_switch_is_clx_supported() - Is CLx supported on this type of router
+ * @sw: The router to check CLx support for
+ */
+static inline bool tb_switch_is_clx_supported(const struct tb_switch *sw)
+{
+	return tb_switch_is_usb4(sw) || tb_switch_is_titan_ridge(sw);
+}
+
+int tb_switch_mask_clx_objections(struct tb_switch *sw);
+
+int tb_switch_pcie_l1_enable(struct tb_switch *sw);
+
+int tb_switch_xhci_connect(struct tb_switch *sw);
+void tb_switch_xhci_disconnect(struct tb_switch *sw);
 
 int tb_wait_for_port(struct tb_port *port, bool wait_if_unplugged);
 int tb_port_add_nfc_credits(struct tb_port *port, int credits);
@@ -1017,6 +1084,11 @@ void tb_lc_unconfigure_port(struct tb_port *port);
 int tb_lc_configure_xdomain(struct tb_port *port);
 void tb_lc_unconfigure_xdomain(struct tb_port *port);
 int tb_lc_start_lane_initialization(struct tb_port *port);
+bool tb_lc_is_clx_supported(struct tb_port *port);
+bool tb_lc_is_usb_plugged(struct tb_port *port);
+bool tb_lc_is_xhci_connected(struct tb_port *port);
+int tb_lc_xhci_connect(struct tb_port *port);
+void tb_lc_xhci_disconnect(struct tb_port *port);
 int tb_lc_set_wake(struct tb_switch *sw, unsigned int flags);
 int tb_lc_set_sleep(struct tb_switch *sw);
 bool tb_lc_lane_bonding_possible(struct tb_switch *sw);
@@ -1103,6 +1175,7 @@ void usb4_port_unconfigure_xdomain(struct tb_port *port);
 int usb4_port_router_offline(struct tb_port *port);
 int usb4_port_router_online(struct tb_port *port);
 int usb4_port_enumerate_retimers(struct tb_port *port);
+bool usb4_port_clx_supported(struct tb_port *port);
 
 int usb4_port_retimer_set_inbound_sbtx(struct tb_port *port, u8 index);
 int usb4_port_retimer_read(struct tb_port *port, u8 index, u8 reg, void *buf,

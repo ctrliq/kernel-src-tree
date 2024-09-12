@@ -2981,6 +2981,11 @@ int __init cpuset_init(void)
 	set_bit(CS_SCHED_LOAD_BALANCE, &top_cpuset.flags);
 	top_cpuset.relax_domain_level = -1;
 
+	/*
+	 * Force all cpuset_rwsem readers into slow path.
+	 */
+	rcu_sync_enter_start(&cpuset_rwsem.rss);
+
 	BUG_ON(!alloc_cpumask_var(&cpus_attach, GFP_KERNEL));
 
 	return 0;

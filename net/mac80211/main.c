@@ -200,15 +200,94 @@ int ieee80211_hw_config(struct ieee80211_local *local, u32 changed)
 	return ret;
 }
 
+#define BSS_CHANGED_VIF_CFG_FLAGS (BSS_CHANGED_ASSOC |\
+				   BSS_CHANGED_IDLE |\
+				   BSS_CHANGED_PS |\
+				   BSS_CHANGED_IBSS |\
+				   BSS_CHANGED_ARP_FILTER |\
+				   BSS_CHANGED_SSID)
+
 void ieee80211_bss_info_change_notify(struct ieee80211_sub_if_data *sdata,
-				      u32 changed)
+				      u64 changed)
 {
 	struct ieee80211_local *local = sdata->local;
+
+	might_sleep();
 
 	if (!changed || sdata->vif.type == NL80211_IFTYPE_AP_VLAN)
 		return;
 
-	drv_bss_info_changed(local, sdata, &sdata->vif.bss_conf, changed);
+	if (WARN_ON_ONCE(changed & (BSS_CHANGED_BEACON |
+				    BSS_CHANGED_BEACON_ENABLED) &&
+			 sdata->vif.type != NL80211_IFTYPE_AP &&
+			 sdata->vif.type != NL80211_IFTYPE_ADHOC &&
+			 sdata->vif.type != NL80211_IFTYPE_MESH_POINT &&
+			 sdata->vif.type != NL80211_IFTYPE_OCB))
+		return;
+
+	if (WARN_ON_ONCE(sdata->vif.type == NL80211_IFTYPE_P2P_DEVICE ||
+			 sdata->vif.type == NL80211_IFTYPE_NAN ||
+			 (sdata->vif.type == NL80211_IFTYPE_MONITOR &&
+			  !sdata->vif.bss_conf.mu_mimo_owner &&
+			  !(changed & BSS_CHANGED_TXPOWER))))
+		return;
+
+	if (!check_sdata_in_driver(sdata))
+		return;
+
+	if (changed & BSS_CHANGED_VIF_CFG_FLAGS) {
+		u64 ch = changed & BSS_CHANGED_VIF_CFG_FLAGS;
+
+		trace_drv_vif_cfg_changed(local, sdata, changed);
+		if (local->ops->vif_cfg_changed)
+			local->ops->vif_cfg_changed(&local->hw, &sdata->vif, ch);
+	}
+
+	if (changed & ~BSS_CHANGED_VIF_CFG_FLAGS) {
+		u64 ch = changed & ~BSS_CHANGED_VIF_CFG_FLAGS;
+
+		/* FIXME: should be for each link */
+		trace_drv_link_info_changed(local, sdata, &sdata->vif.bss_conf,
+					    changed);
+		if (local->ops->link_info_changed)
+			local->ops->link_info_changed(&local->hw, &sdata->vif,
+						      &sdata->vif.bss_conf, ch);
+	}
+
+	if (local->ops->bss_info_changed)
+		local->ops->bss_info_changed(&local->hw, &sdata->vif,
+					     &sdata->vif.bss_conf, changed);
+	trace_drv_return_void(local);
+}
+
+void ieee80211_vif_cfg_change_notify(struct ieee80211_sub_if_data *sdata,
+				     u64 changed)
+{
+	struct ieee80211_local *local = sdata->local;
+
+	WARN_ON_ONCE(changed & ~BSS_CHANGED_VIF_CFG_FLAGS);
+
+	if (!changed || sdata->vif.type == NL80211_IFTYPE_AP_VLAN)
+		return;
+
+	drv_vif_cfg_changed(local, sdata, changed);
+}
+
+void ieee80211_link_info_change_notify(struct ieee80211_sub_if_data *sdata,
+				       struct ieee80211_link_data *link,
+				       u64 changed)
+{
+	struct ieee80211_local *local = sdata->local;
+
+	WARN_ON_ONCE(changed & BSS_CHANGED_VIF_CFG_FLAGS);
+
+	if (!changed || sdata->vif.type == NL80211_IFTYPE_AP_VLAN)
+		return;
+
+	if (!check_sdata_in_driver(sdata))
+		return;
+
+	drv_link_info_changed(local, sdata, link->conf, link->link_id, changed);
 }
 
 u32 ieee80211_reset_erp_info(struct ieee80211_sub_if_data *sdata)
@@ -350,7 +429,7 @@ static int ieee80211_ifa_changed(struct notifier_block *nb,
 	struct wireless_dev *wdev = ndev->ieee80211_ptr;
 	struct in_device *idev;
 	struct ieee80211_sub_if_data *sdata;
-	struct ieee80211_bss_conf *bss_conf;
+	struct ieee80211_vif_cfg *vif_cfg;
 	struct ieee80211_if_managed *ifmgd;
 	int c = 0;
 
@@ -362,7 +441,7 @@ static int ieee80211_ifa_changed(struct notifier_block *nb,
 		return NOTIFY_DONE;
 
 	sdata = IEEE80211_DEV_TO_SUB_IF(ndev);
-	bss_conf = &sdata->vif.bss_conf;
+	vif_cfg = &sdata->vif.cfg;
 
 	/* ARP filtering is only supported in managed mode */
 	if (sdata->vif.type != NL80211_IFTYPE_STATION)
@@ -375,21 +454,20 @@ static int ieee80211_ifa_changed(struct notifier_block *nb,
 	ifmgd = &sdata->u.mgd;
 	sdata_lock(sdata);
 
-	/* Copy the addresses to the bss_conf list */
+	/* Copy the addresses to the vif config list */
 	ifa = rtnl_dereference(idev->ifa_list);
 	while (ifa) {
 		if (c < IEEE80211_BSS_ARP_ADDR_LIST_LEN)
-			bss_conf->arp_addr_list[c] = ifa->ifa_address;
+			vif_cfg->arp_addr_list[c] = ifa->ifa_address;
 		ifa = rtnl_dereference(ifa->ifa_next);
 		c++;
 	}
 
-	bss_conf->arp_addr_cnt = c;
+	vif_cfg->arp_addr_cnt = c;
 
 	/* Configure driver only if associated (which also implies it is up) */
 	if (ifmgd->associated)
-		ieee80211_bss_info_change_notify(sdata,
-						 BSS_CHANGED_ARP_FILTER);
+		ieee80211_vif_cfg_change_notify(sdata, BSS_CHANGED_ARP_FILTER);
 
 	sdata_unlock(sdata);
 
@@ -558,6 +636,10 @@ struct ieee80211_hw *ieee80211_alloc_hw_nm(size_t priv_data_len,
 	if (WARN_ON(ops->sta_state && (ops->sta_add || ops->sta_remove)))
 		return NULL;
 
+	if (WARN_ON(!!ops->link_info_changed != !!ops->vif_cfg_changed ||
+		    (ops->link_info_changed && ops->bss_info_changed)))
+		return NULL;
+
 	/* check all or no channel context operations exist */
 	i = !!ops->add_chanctx + !!ops->remove_chanctx +
 	    !!ops->change_chanctx + !!ops->assign_vif_chanctx +
@@ -708,14 +790,12 @@ struct ieee80211_hw *ieee80211_alloc_hw_nm(size_t priv_data_len,
 	spin_lock_init(&local->queue_stop_reason_lock);
 
 	for (i = 0; i < IEEE80211_NUM_ACS; i++) {
-		struct airtime_sched_info *air_sched = &local->airtime[i];
-
-		air_sched->active_txqs = RB_ROOT_CACHED;
-		INIT_LIST_HEAD(&air_sched->active_list);
-		spin_lock_init(&air_sched->lock);
-		air_sched->aql_txq_limit_low = IEEE80211_DEFAULT_AQL_TXQ_LIMIT_L;
-		air_sched->aql_txq_limit_high =
+		INIT_LIST_HEAD(&local->active_txqs[i]);
+		spin_lock_init(&local->active_txq_lock[i]);
+		local->aql_txq_limit_low[i] = IEEE80211_DEFAULT_AQL_TXQ_LIMIT_L;
+		local->aql_txq_limit_high[i] =
 			IEEE80211_DEFAULT_AQL_TXQ_LIMIT_H;
+		atomic_set(&local->aql_ac_pending_airtime[i], 0);
 	}
 
 	local->airtime_flags = AIRTIME_USE_TX | AIRTIME_USE_RX;
@@ -907,7 +987,8 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 			return -EINVAL;
 
 		if (WARN_ON(ieee80211_hw_check(hw, SUPPORTS_PS) &&
-			    !ieee80211_hw_check(hw, SUPPORTS_DYNAMIC_PS)))
+			    (!ieee80211_hw_check(hw, SUPPORTS_DYNAMIC_PS) ||
+			     ieee80211_hw_check(hw, PS_NULLFUNC_STACK))))
 			return -EINVAL;
 
 		if (WARN_ON(!ieee80211_hw_check(hw, MFP_CAPABLE)))

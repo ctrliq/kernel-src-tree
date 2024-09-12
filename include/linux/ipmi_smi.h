@@ -30,11 +30,6 @@ struct device;
 /* Structure for the low-level drivers. */
 typedef struct ipmi_smi *ipmi_smi_t;
 
-/* RHEL extension for struct ipmi_smi_msg
- */
-struct ipmi_smi_msg_rh {
-};
-
 /*
  * Flags for set_check_watch() below.  Tells if the SMI should be
  * waiting for watchdog timeouts, commands and/or messages.
@@ -96,6 +91,12 @@ enum ipmi_smi_msg_type {
 	IPMI_SMI_MSG_TYPE_IPMB_DIRECT
 };
 
+/* RHEL extension for struct ipmi_smi_msg
+ */
+struct ipmi_smi_msg_rh {
+	enum ipmi_smi_msg_type type;
+};
+
 /*
  * Messages to/from the lower layer.  The smi interface will take one
  * of these to send. After the send has occurred and a response has
@@ -111,8 +112,6 @@ enum ipmi_smi_msg_type {
  */
 struct ipmi_smi_msg {
 	struct list_head link;
-
-	enum ipmi_smi_msg_type type;
 
 	long    msgid;
 	void    *user_data;
@@ -143,15 +142,11 @@ struct ipmi_smi_handlers_rh {
 #define INIT_IPMI_SMI_MSG(done_handler) \
 {						\
 	.done = done_handler,			\
-	.type = IPMI_SMI_MSG_TYPE_NORMAL	\
+	._rh.type = IPMI_SMI_MSG_TYPE_NORMAL	\
 }
 
 struct ipmi_smi_handlers {
 	struct module *owner;
-
-	/* Capabilities of the SMI. */
-#define IPMI_SMI_CAN_HANDLE_IPMB_DIRECT		(1 << 0)
-	unsigned int flags;
 
 	/*
 	 * The low-level interface cannot start sending messages to
@@ -237,7 +232,20 @@ struct ipmi_smi_handlers {
 	 */
 	void (*set_maintenance_mode)(void *send_info, bool enable);
 
-	RH_KABI_AUX_PTR(ipmi_smi_handlers)
+	/* Capabilities of the SMI. */
+#define IPMI_SMI_CAN_HANDLE_IPMB_DIRECT		(1 << 0)
+
+#ifndef __GENKSYMS__
+	/* The RH_KABI_AUX_PTR macro inserts two 8-byte fields
+	 * - an 8-byte size_t field for the size of the aux pointer's target
+	 * - an 8-byte pointer
+	 */
+	unsigned int flags;	/* 4 bytes */
+	unsigned int pad_1;	/* 4 bytes */
+	void *pad_2;		/* 8 bytes */
+#else
+	RH_KABI_AUX_PTR(ipmi_smi_handlers)	/* 16 bytes */
+#endif
 };
 
 struct ipmi_device_id {
