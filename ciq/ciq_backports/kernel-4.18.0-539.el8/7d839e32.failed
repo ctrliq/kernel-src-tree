@@ -1,0 +1,136 @@
+xfs: check return codes when flushing block devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-539.el8
+commit-author Darrick J. Wong <djwong@kernel.org>
+commit 7d839e325af221ff69d52e15c112cf09da91d149
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-539.el8/7d839e32.failed
+
+If a blkdev_issue_flush fails, fsync needs to report that to upper
+levels.  Modify xfs_file_fsync to capture the errors, while trying to
+flush as much data and log updates to disk as possible.
+
+If log writes cannot flush the data device, we need to shut down the log
+immediately because we've violated a log invariant.  Modify this code to
+check the return value of blkdev_issue_flush as well.
+
+This behavior seems to go back to about 2.6.15 or so, which makes this
+fixes tag a bit misleading.
+
+Link: https://elixir.bootlin.com/linux/v2.6.15/source/fs/xfs/xfs_vnodeops.c#L1187
+Fixes: b5071ada510a ("xfs: remove xfs_blkdev_issue_flush")
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+(cherry picked from commit 7d839e325af221ff69d52e15c112cf09da91d149)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_log.c
+diff --cc fs/xfs/xfs_log.c
+index 75e0aaeef89b,386b0307aed8..000000000000
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@@ -1858,13 -1911,39 +1858,37 @@@ xlog_write_iclog
+  	 * writeback throttle from throttling log writes behind background
+  	 * metadata writeback and causing priority inversions.
+  	 */
+ -	bio_init(&iclog->ic_bio, log->l_targ->bt_bdev, iclog->ic_bvec,
+ -		 howmany(count, PAGE_SIZE),
+ -		 REQ_OP_WRITE | REQ_META | REQ_SYNC | REQ_IDLE);
+ -	iclog->ic_bio.bi_iter.bi_sector = log->l_logBBstart + bno;
+ -	iclog->ic_bio.bi_end_io = xlog_bio_end_io;
+ -	iclog->ic_bio.bi_private = iclog;
+ -
+ -	if (iclog->ic_flags & XLOG_ICL_NEED_FLUSH) {
+ +	iclog->ic_bio.bi_opf = REQ_OP_WRITE | REQ_META | REQ_SYNC |
+ +				REQ_IDLE | REQ_FUA;
+ +	if (need_flush)
+  		iclog->ic_bio.bi_opf |= REQ_PREFLUSH;
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * For external log devices, we also need to flush the data
++ 		 * device cache first to ensure all metadata writeback covered
++ 		 * by the LSN in this iclog is on stable storage. This is slow,
++ 		 * but it *must* complete before we issue the external log IO.
++ 		 *
++ 		 * If the flush fails, we cannot conclude that past metadata
++ 		 * writeback from the log succeeded.  Repeating the flush is
++ 		 * not possible, hence we must shut down with log IO error to
++ 		 * avoid shutdown re-entering this path and erroring out again.
++ 		 */
++ 		if (log->l_targ != log->l_mp->m_ddev_targp &&
++ 		    blkdev_issue_flush(log->l_mp->m_ddev_targp->bt_bdev)) {
++ 			xlog_force_shutdown(log, SHUTDOWN_LOG_IO_ERROR);
++ 			return;
++ 		}
++ 	}
++ 	if (iclog->ic_flags & XLOG_ICL_NEED_FUA)
++ 		iclog->ic_bio.bi_opf |= REQ_FUA;
++ 
++ 	iclog->ic_flags &= ~(XLOG_ICL_NEED_FLUSH | XLOG_ICL_NEED_FUA);
+++>>>>>>> 7d839e325af2 (xfs: check return codes when flushing block devices)
+  
+  	if (xlog_map_iclog_data(&iclog->ic_bio, iclog->ic_data, count)) {
+ -		xlog_force_shutdown(log, SHUTDOWN_LOG_IO_ERROR);
+ +		xfs_force_shutdown(log->l_mp, SHUTDOWN_LOG_IO_ERROR);
+  		return;
+  	}
+  	if (is_vmalloc_addr(iclog->ic_data))
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 137f800d7415..3c276358ea1f 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -173,7 +173,7 @@ xfs_file_fsync(
+ {
+ 	struct xfs_inode	*ip = XFS_I(file->f_mapping->host);
+ 	struct xfs_mount	*mp = ip->i_mount;
+-	int			error = 0;
++	int			error, err2;
+ 	int			log_flushed = 0;
+ 
+ 	trace_xfs_file_fsync(ip);
+@@ -194,18 +194,21 @@ xfs_file_fsync(
+ 	 * inode size in case of an extending write.
+ 	 */
+ 	if (XFS_IS_REALTIME_INODE(ip))
+-		blkdev_issue_flush(mp->m_rtdev_targp->bt_bdev);
++		error = blkdev_issue_flush(mp->m_rtdev_targp->bt_bdev);
+ 	else if (mp->m_logdev_targp != mp->m_ddev_targp)
+-		blkdev_issue_flush(mp->m_ddev_targp->bt_bdev);
++		error = blkdev_issue_flush(mp->m_ddev_targp->bt_bdev);
+ 
+ 	/*
+ 	 * Any inode that has dirty modifications in the log is pinned.  The
+-	 * racy check here for a pinned inode while not catch modifications
++	 * racy check here for a pinned inode will not catch modifications
+ 	 * that happen concurrently to the fsync call, but fsync semantics
+ 	 * only require to sync previously completed I/O.
+ 	 */
+-	if (xfs_ipincount(ip))
+-		error = xfs_fsync_flush_log(ip, datasync, &log_flushed);
++	if (xfs_ipincount(ip)) {
++		err2 = xfs_fsync_flush_log(ip, datasync, &log_flushed);
++		if (err2 && !error)
++			error = err2;
++	}
+ 
+ 	/*
+ 	 * If we only have a single device, and the log force about was
+@@ -215,8 +218,11 @@ xfs_file_fsync(
+ 	 * commit.
+ 	 */
+ 	if (!log_flushed && !XFS_IS_REALTIME_INODE(ip) &&
+-	    mp->m_logdev_targp == mp->m_ddev_targp)
+-		blkdev_issue_flush(mp->m_ddev_targp->bt_bdev);
++	    mp->m_logdev_targp == mp->m_ddev_targp) {
++		err2 = blkdev_issue_flush(mp->m_ddev_targp->bt_bdev);
++		if (err2 && !error)
++			error = err2;
++	}
+ 
+ 	return error;
+ }
+* Unmerged path fs/xfs/xfs_log.c
