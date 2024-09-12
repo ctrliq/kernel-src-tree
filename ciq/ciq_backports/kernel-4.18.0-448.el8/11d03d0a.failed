@@ -1,0 +1,183 @@
+NFS: Trace effects of the readdirplus heuristic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 11d03d0a1ed8dbdabab1b5ab21861ad5cad4aef2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/11d03d0a.failed
+
+Enable tracking of when the readdirplus heuristic causes a page cache
+invalidation.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 11d03d0a1ed8dbdabab1b5ab21861ad5cad4aef2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/dir.c
+#	fs/nfs/nfstrace.h
+diff --cc fs/nfs/dir.c
+index ce0607cf0a27,8a246df98db5..000000000000
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@@ -1087,6 -1158,23 +1092,26 @@@ out
+  	return status;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define NFS_READDIR_CACHE_MISS_THRESHOLD (16UL)
++ 
++ static void nfs_readdir_handle_cache_misses(struct inode *inode,
++ 					    struct nfs_readdir_descriptor *desc,
++ 					    pgoff_t page_index,
++ 					    unsigned int cache_misses)
++ {
++ 	if (desc->ctx->pos == 0 ||
++ 	    cache_misses <= NFS_READDIR_CACHE_MISS_THRESHOLD)
++ 		return;
++ 	if (invalidate_mapping_pages(inode->i_mapping, page_index + 1, -1) == 0)
++ 		return;
++ 	trace_nfs_readdir_invalidate_cache_range(
++ 		inode, (loff_t)(page_index + 1) << PAGE_SHIFT,
++ 		MAX_LFS_FILESIZE);
++ }
++ 
+++>>>>>>> 11d03d0a1ed8 (NFS: Trace effects of the readdirplus heuristic)
+  /* The file offset position represents the dirent entry number.  A
+     last cookie cache takes care of the common case of reading the
+     whole directory.
+diff --cc fs/nfs/nfstrace.h
+index ae23b6675585,ec2645d20abf..000000000000
+--- a/fs/nfs/nfstrace.h
++++ b/fs/nfs/nfstrace.h
+@@@ -274,6 -273,122 +274,125 @@@ DEFINE_NFS_UPDATE_SIZE_EVENT(wcc)
+  DEFINE_NFS_UPDATE_SIZE_EVENT(update);
+  DEFINE_NFS_UPDATE_SIZE_EVENT(grow);
+  
+++<<<<<<< HEAD
+++=======
++ DECLARE_EVENT_CLASS(nfs_inode_range_event,
++ 		TP_PROTO(
++ 			const struct inode *inode,
++ 			loff_t range_start,
++ 			loff_t range_end
++ 		),
++ 
++ 		TP_ARGS(inode, range_start, range_end),
++ 
++ 		TP_STRUCT__entry(
++ 			__field(dev_t, dev)
++ 			__field(u32, fhandle)
++ 			__field(u64, fileid)
++ 			__field(u64, version)
++ 			__field(loff_t, range_start)
++ 			__field(loff_t, range_end)
++ 		),
++ 
++ 		TP_fast_assign(
++ 			const struct nfs_inode *nfsi = NFS_I(inode);
++ 
++ 			__entry->dev = inode->i_sb->s_dev;
++ 			__entry->fhandle = nfs_fhandle_hash(&nfsi->fh);
++ 			__entry->fileid = nfsi->fileid;
++ 			__entry->version = inode_peek_iversion_raw(inode);
++ 			__entry->range_start = range_start;
++ 			__entry->range_end = range_end;
++ 		),
++ 
++ 		TP_printk(
++ 			"fileid=%02x:%02x:%llu fhandle=0x%08x version=%llu "
++ 			"range=[%lld, %lld]",
++ 			MAJOR(__entry->dev), MINOR(__entry->dev),
++ 			(unsigned long long)__entry->fileid,
++ 			__entry->fhandle, __entry->version,
++ 			__entry->range_start, __entry->range_end
++ 		)
++ );
++ 
++ #define DEFINE_NFS_INODE_RANGE_EVENT(name) \
++ 	DEFINE_EVENT(nfs_inode_range_event, name, \
++ 			TP_PROTO( \
++ 				const struct inode *inode, \
++ 				loff_t range_start, \
++ 				loff_t range_end \
++ 			), \
++ 			TP_ARGS(inode, range_start, range_end))
++ 
++ DEFINE_NFS_INODE_RANGE_EVENT(nfs_readdir_invalidate_cache_range);
++ 
++ DECLARE_EVENT_CLASS(nfs_readdir_event,
++ 		TP_PROTO(
++ 			const struct file *file,
++ 			const __be32 *verifier,
++ 			u64 cookie,
++ 			pgoff_t page_index,
++ 			unsigned int dtsize
++ 		),
++ 
++ 		TP_ARGS(file, verifier, cookie, page_index, dtsize),
++ 
++ 		TP_STRUCT__entry(
++ 			__field(dev_t, dev)
++ 			__field(u32, fhandle)
++ 			__field(u64, fileid)
++ 			__field(u64, version)
++ 			__array(char, verifier, NFS4_VERIFIER_SIZE)
++ 			__field(u64, cookie)
++ 			__field(pgoff_t, index)
++ 			__field(unsigned int, dtsize)
++ 		),
++ 
++ 		TP_fast_assign(
++ 			const struct inode *dir = file_inode(file);
++ 			const struct nfs_inode *nfsi = NFS_I(dir);
++ 
++ 			__entry->dev = dir->i_sb->s_dev;
++ 			__entry->fileid = nfsi->fileid;
++ 			__entry->fhandle = nfs_fhandle_hash(&nfsi->fh);
++ 			__entry->version = inode_peek_iversion_raw(dir);
++ 			if (cookie != 0)
++ 				memcpy(__entry->verifier, verifier,
++ 				       NFS4_VERIFIER_SIZE);
++ 			else
++ 				memset(__entry->verifier, 0,
++ 				       NFS4_VERIFIER_SIZE);
++ 			__entry->cookie = cookie;
++ 			__entry->index = page_index;
++ 			__entry->dtsize = dtsize;
++ 		),
++ 
++ 		TP_printk(
++ 			"fileid=%02x:%02x:%llu fhandle=0x%08x version=%llu "
++ 			"cookie=%s:0x%llx cache_index=%lu dtsize=%u",
++ 			MAJOR(__entry->dev), MINOR(__entry->dev),
++ 			(unsigned long long)__entry->fileid, __entry->fhandle,
++ 			__entry->version, show_nfs4_verifier(__entry->verifier),
++ 			(unsigned long long)__entry->cookie, __entry->index,
++ 			__entry->dtsize
++ 		)
++ );
++ 
++ #define DEFINE_NFS_READDIR_EVENT(name) \
++ 	DEFINE_EVENT(nfs_readdir_event, name, \
++ 			TP_PROTO( \
++ 				const struct file *file, \
++ 				const __be32 *verifier, \
++ 				u64 cookie, \
++ 				pgoff_t page_index, \
++ 				unsigned int dtsize \
++ 				), \
++ 			TP_ARGS(file, verifier, cookie, page_index, dtsize))
++ 
++ DEFINE_NFS_READDIR_EVENT(nfs_readdir_cache_fill);
++ DEFINE_NFS_READDIR_EVENT(nfs_readdir_uncached);
++ 
+++>>>>>>> 11d03d0a1ed8 (NFS: Trace effects of the readdirplus heuristic)
+  DECLARE_EVENT_CLASS(nfs_lookup_event,
+  		TP_PROTO(
+  			const struct inode *dir,
+* Unmerged path fs/nfs/dir.c
+* Unmerged path fs/nfs/nfstrace.h
