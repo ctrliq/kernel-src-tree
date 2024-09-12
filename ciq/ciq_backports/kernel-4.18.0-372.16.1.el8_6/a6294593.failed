@@ -1,0 +1,159 @@
+iov_iter: Turn iov_iter_fault_in_readable into fault_in_iov_iter_readable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-372.16.1.el8_6
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit a6294593e8a1290091d0b078d5d33da5e0cd3dfe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-372.16.1.el8_6/a6294593.failed
+
+Turn iov_iter_fault_in_readable into a function that returns the number
+of bytes not faulted in, similar to copy_to_user, instead of returning a
+non-zero value when any of the requested pages couldn't be faulted in.
+This supports the existing users that require all pages to be faulted in
+as well as new users that are happy if any pages can be faulted in.
+
+Rename iov_iter_fault_in_readable to fault_in_iov_iter_readable to make
+sure this change doesn't silently break things.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit a6294593e8a1290091d0b078d5d33da5e0cd3dfe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ntfs3/file.c
+#	lib/iov_iter.c
+diff --cc lib/iov_iter.c
+index ca9bcc01dca1,ce3d4f610626..000000000000
+--- a/lib/iov_iter.c
++++ b/lib/iov_iter.c
+@@@ -422,19 -449,19 +429,34 @@@ size_t fault_in_iov_iter_readable(cons
+  		const struct iovec *p;
+  		size_t skip;
+  
+++<<<<<<< HEAD
+ +		if (bytes > i->count)
+ +			bytes = i->count;
+ +		for (p = i->iov, skip = i->iov_offset; bytes; p++, skip = 0) {
+ +			size_t len = min(bytes, p->iov_len - skip);
+ +			int err;
+ +
+ +			if (unlikely(!len))
+ +				continue;
+ +			err = fault_in_pages_readable(p->iov_base + skip, len);
+ +			if (unlikely(err))
+ +				return err;
+ +			bytes -= len;
+++=======
++ 		size -= count;
++ 		for (p = i->iov, skip = i->iov_offset; count; p++, skip = 0) {
++ 			size_t len = min(count, p->iov_len - skip);
++ 			size_t ret;
++ 
++ 			if (unlikely(!len))
++ 				continue;
++ 			ret = fault_in_readable(p->iov_base + skip, len);
++ 			count -= len - ret;
++ 			if (ret)
++ 				break;
+++>>>>>>> a6294593e8a1 (iov_iter: Turn iov_iter_fault_in_readable into fault_in_iov_iter_readable)
+  		}
++ 		return count + size;
+  	}
+  	return 0;
+  }
+* Unmerged path fs/ntfs3/file.c
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index 06e87d1444a8..dbc43aa4da66 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -1617,7 +1617,7 @@ static noinline ssize_t __btrfs_buffered_write(struct file *file,
+ 		 * Fault pages before locking them in prepare_pages
+ 		 * to avoid recursive lock
+ 		 */
+-		if (unlikely(iov_iter_fault_in_readable(i, write_bytes))) {
++		if (unlikely(fault_in_iov_iter_readable(i, write_bytes))) {
+ 			ret = -EFAULT;
+ 			break;
+ 		}
+diff --git a/fs/f2fs/file.c b/fs/f2fs/file.c
+index b85fae11c83f..576e11c54e97 100644
+--- a/fs/f2fs/file.c
++++ b/fs/f2fs/file.c
+@@ -2933,7 +2933,7 @@ static ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ 		size_t target_size = 0;
+ 		int err;
+ 
+-		if (iov_iter_fault_in_readable(from, iov_iter_count(from)))
++		if (fault_in_iov_iter_readable(from, iov_iter_count(from)))
+ 			set_inode_flag(inode, FI_NO_PREALLOC);
+ 
+ 		if ((iocb->ki_flags & IOCB_NOWAIT) &&
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index 03709c2fa555..59c1d1e52573 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -1207,7 +1207,7 @@ static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
+ 
+  again:
+ 		err = -EFAULT;
+-		if (iov_iter_fault_in_readable(ii, bytes))
++		if (fault_in_iov_iter_readable(ii, bytes))
+ 			break;
+ 
+ 		err = -ENOMEM;
+diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
+index fd9a6bc60f11..929fa0ee7d3b 100644
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@ -837,7 +837,7 @@ iomap_write_actor(struct inode *inode, loff_t pos, loff_t length, void *data,
+ 		 * to check that the address is actually valid, when atomic
+ 		 * usercopies are used, below.
+ 		 */
+-		if (unlikely(iov_iter_fault_in_readable(i, bytes))) {
++		if (unlikely(fault_in_iov_iter_readable(i, bytes))) {
+ 			status = -EFAULT;
+ 			break;
+ 		}
+diff --git a/fs/ntfs/file.c b/fs/ntfs/file.c
+index 331910fa8442..9333e9f7e992 100644
+--- a/fs/ntfs/file.c
++++ b/fs/ntfs/file.c
+@@ -1849,7 +1849,7 @@ static ssize_t ntfs_perform_write(struct file *file, struct iov_iter *i,
+ 		 * pages being swapped out between us bringing them into memory
+ 		 * and doing the actual copying.
+ 		 */
+-		if (unlikely(iov_iter_fault_in_readable(i, bytes))) {
++		if (unlikely(fault_in_iov_iter_readable(i, bytes))) {
+ 			status = -EFAULT;
+ 			break;
+ 		}
+* Unmerged path fs/ntfs3/file.c
+diff --git a/include/linux/uio.h b/include/linux/uio.h
+index d49cf8113657..6cbc60321959 100644
+--- a/include/linux/uio.h
++++ b/include/linux/uio.h
+@@ -138,7 +138,7 @@ size_t iov_iter_copy_from_user_atomic(struct page *page,
+ 		struct iov_iter *i, unsigned long offset, size_t bytes);
+ void iov_iter_advance(struct iov_iter *i, size_t bytes);
+ void iov_iter_revert(struct iov_iter *i, size_t bytes);
+-int iov_iter_fault_in_readable(const struct iov_iter *i, size_t bytes);
++size_t fault_in_iov_iter_readable(const struct iov_iter *i, size_t bytes);
+ size_t iov_iter_single_seg_count(const struct iov_iter *i);
+ size_t copy_page_to_iter(struct page *page, size_t offset, size_t bytes,
+ 			 struct iov_iter *i);
+* Unmerged path lib/iov_iter.c
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 37e2ef20fa83..349be62a9267 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3383,7 +3383,7 @@ ssize_t generic_perform_write(struct file *file,
+ 		 * to check that the address is actually valid, when atomic
+ 		 * usercopies are used, below.
+ 		 */
+-		if (unlikely(iov_iter_fault_in_readable(i, bytes))) {
++		if (unlikely(fault_in_iov_iter_readable(i, bytes))) {
+ 			status = -EFAULT;
+ 			break;
+ 		}
