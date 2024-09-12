@@ -1,0 +1,161 @@
+powerpc/mm: Fix lockup on kernel exec fault
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-486.el8
+commit-author Christophe Leroy <christophe.leroy@csgroup.eu>
+commit cd5d5e602f502895e47e18cd46804d6d7014e65c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-486.el8/cd5d5e60.failed
+
+The powerpc kernel is not prepared to handle exec faults from kernel.
+Especially, the function is_exec_fault() will return 'false' when an
+exec fault is taken by kernel, because the check is based on reading
+current->thread.regs->trap which contains the trap from user.
+
+For instance, when provoking a LKDTM EXEC_USERSPACE test,
+current->thread.regs->trap is set to SYSCALL trap (0xc00), and
+the fault taken by the kernel is not seen as an exec fault by
+set_access_flags_filter().
+
+Commit d7df2443cd5f ("powerpc/mm: Fix spurious segfaults on radix
+with autonuma") made it clear and handled it properly. But later on
+commit d3ca587404b3 ("powerpc/mm: Fix reporting of kernel execute
+faults") removed that handling, introducing test based on error_code.
+And here is the problem, because on the 603 all upper bits of SRR1
+get cleared when the TLB instruction miss handler bails out to ISI.
+
+Until commit cbd7e6ca0210 ("powerpc/fault: Avoid heavy
+search_exception_tables() verification"), an exec fault from kernel
+at a userspace address was indirectly caught by the lack of entry for
+that address in the exception tables. But after that commit the
+kernel mainly relies on KUAP or on core mm handling to catch wrong
+user accesses. Here the access is not wrong, so mm handles it.
+It is a minor fault because PAGE_EXEC is not set,
+set_access_flags_filter() should set PAGE_EXEC and voila.
+But as is_exec_fault() returns false as explained in the beginning,
+set_access_flags_filter() bails out without setting PAGE_EXEC flag,
+which leads to a forever minor exec fault.
+
+As the kernel is not prepared to handle such exec faults, the thing to
+do is to fire in bad_kernel_fault() for any exec fault taken by the
+kernel, as it was prior to commit d3ca587404b3.
+
+Fixes: d3ca587404b3 ("powerpc/mm: Fix reporting of kernel execute faults")
+	Cc: stable@vger.kernel.org # v4.14+
+	Signed-off-by: Christophe Leroy <christophe.leroy@csgroup.eu>
+	Acked-by: Nicholas Piggin <npiggin@gmail.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/024bb05105050f704743a0083fe3548702be5706.1625138205.git.christophe.leroy@csgroup.eu
+
+(cherry picked from commit cd5d5e602f502895e47e18cd46804d6d7014e65c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/fault.c
+diff --cc arch/powerpc/mm/fault.c
+index 288e47193ab3,a8d0ce85d39a..000000000000
+--- a/arch/powerpc/mm/fault.c
++++ b/arch/powerpc/mm/fault.c
+@@@ -251,69 -194,41 +251,82 @@@ static int mm_fault_error(struct pt_reg
+  }
+  
+  /* Is this a bad kernel fault ? */
+ -static bool bad_kernel_fault(struct pt_regs *regs, unsigned long error_code,
+ -			     unsigned long address, bool is_write)
+ +static bool bad_kernel_fault(bool is_exec, unsigned long error_code,
+ +			     unsigned long address)
+  {
+++<<<<<<< HEAD
+ +	/* NX faults set DSISR_PROTFAULT on the 8xx, DSISR_NOEXEC_OR_G on others */
+ +	if (is_exec && (error_code & (DSISR_NOEXEC_OR_G | DSISR_KEYFAULT |
+ +				      DSISR_PROTFAULT))) {
+ +		printk_ratelimited(KERN_CRIT "kernel tried to execute"
+ +				   " exec-protected page (%lx) -"
+ +				   "exploit attempt? (uid: %d)\n",
+ +				   address, from_kuid(&init_user_ns,
+ +						      current_uid()));
+++=======
++ 	int is_exec = TRAP(regs) == INTERRUPT_INST_STORAGE;
++ 
++ 	if (is_exec) {
++ 		pr_crit_ratelimited("kernel tried to execute %s page (%lx) - exploit attempt? (uid: %d)\n",
++ 				    address >= TASK_SIZE ? "exec-protected" : "user",
++ 				    address,
++ 				    from_kuid(&init_user_ns, current_uid()));
++ 
++ 		// Kernel exec fault is always bad
++ 		return true;
+++>>>>>>> cd5d5e602f50 (powerpc/mm: Fix lockup on kernel exec fault)
+  	}
+ +	return is_exec || (address >= TASK_SIZE);
+ +}
+  
+ -	// Kernel fault on kernel address is bad
+ -	if (address >= TASK_SIZE)
+ -		return true;
+ +// This comes from 64-bit struct rt_sigframe + __SIGNAL_FRAMESIZE
+ +#define SIGFRAME_MAX_SIZE	(4096 + 128)
+  
+ -	// Read/write fault blocked by KUAP is bad, it can never succeed.
+ -	if (bad_kuap_fault(regs, address, is_write)) {
+ -		pr_crit_ratelimited("Kernel attempted to %s user page (%lx) - exploit attempt? (uid: %d)\n",
+ -				    is_write ? "write" : "read", address,
+ -				    from_kuid(&init_user_ns, current_uid()));
+ -
+ -		// Fault on user outside of certain regions (eg. copy_tofrom_user()) is bad
+ -		if (!search_exception_tables(regs->nip))
+ +static bool bad_stack_expansion(struct pt_regs *regs, unsigned long address,
+ +				struct vm_area_struct *vma, unsigned int flags,
+ +				bool *must_retry)
+ +{
+ +	/*
+ +	 * N.B. The POWER/Open ABI allows programs to access up to
+ +	 * 288 bytes below the stack pointer.
+ +	 * The kernel signal delivery code writes a bit over 4KB
+ +	 * below the stack pointer (r1) before decrementing it.
+ +	 * The exec code can write slightly over 640kB to the stack
+ +	 * before setting the user r1.  Thus we allow the stack to
+ +	 * expand to 1MB without further checks.
+ +	 */
+ +	if (address + 0x100000 < vma->vm_end) {
+ +		struct ppc_inst __user *nip = (struct ppc_inst __user *)regs->nip;
+ +		/* get user regs even if this fault is in kernel mode */
+ +		struct pt_regs *uregs = current->thread.regs;
+ +		if (uregs == NULL)
+  			return true;
+  
+ -		// Read/write fault in a valid region (the exception table search passed
+ -		// above), but blocked by KUAP is bad, it can never succeed.
+ -		return WARN(true, "Bug: %s fault blocked by KUAP!", is_write ? "Write" : "Read");
+ -	}
+ +		/*
+ +		 * A user-mode access to an address a long way below
+ +		 * the stack pointer is only valid if the instruction
+ +		 * is one which would update the stack pointer to the
+ +		 * address accessed if the instruction completed,
+ +		 * i.e. either stwu rs,n(r1) or stwux rs,r1,rb
+ +		 * (or the byte, halfword, float or double forms).
+ +		 *
+ +		 * If we don't check this then any write to the area
+ +		 * between the last mapped region and the stack will
+ +		 * expand the stack rather than segfaulting.
+ +		 */
+ +		if (address + SIGFRAME_MAX_SIZE >= uregs->gpr[1])
+ +			return false;
+  
+ -	// What's left? Kernel fault on user and allowed by KUAP in the faulting context.
+ +		if ((flags & FAULT_FLAG_WRITE) && (flags & FAULT_FLAG_USER) &&
+ +		    access_ok(nip, sizeof(*nip))) {
+ +			struct ppc_inst inst;
+ +
+ +			if (!probe_user_read_inst(&inst, nip))
+ +				return !store_updates_sp(inst);
+ +			*must_retry = true;
+ +		}
+ +		return true;
+ +	}
+  	return false;
+  }
+  
+* Unmerged path arch/powerpc/mm/fault.c
