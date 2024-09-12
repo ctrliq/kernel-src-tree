@@ -1,0 +1,437 @@
+kprobes: convert tests to kunit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-494.el8
+commit-author Sven Schnelle <svens@linux.ibm.com>
+commit e44e81c5b90f698025eadceb7eef8661eda117d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-494.el8/e44e81c5.failed
+
+This converts the kprobes testcases to use the kunit framework.
+It adds a dependency on CONFIG_KUNIT, and the output will change
+to TAP:
+
+TAP version 14
+1..1
+    # Subtest: kprobes_test
+    1..4
+random: crng init done
+    ok 1 - test_kprobe
+    ok 2 - test_kprobes
+    ok 3 - test_kretprobe
+    ok 4 - test_kretprobes
+ok 1 - kprobes_test
+
+Note that the kprobes testcases are no longer run immediately after
+kprobes initialization, but as a late initcall when kunit is
+initialized. kprobes itself is initialized with an early initcall,
+so the order is still correct.
+
+	Signed-off-by: Sven Schnelle <svens@linux.ibm.com>
+	Acked-by: Masami Hiramatsu <mhiramat@kernel.org>
+	Signed-off-by: Masami Hiramatsu <mhiramat@kernel.org>
+	Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+(cherry picked from commit e44e81c5b90f698025eadceb7eef8661eda117d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/Kconfig.debug
+diff --cc lib/Kconfig.debug
+index 745b2ebbbec6,6ceb11a43e4c..000000000000
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@@ -1852,11 -2069,21 +1852,15 @@@ config TEST_SOR
+  
+  	  If unsure, say N.
+  
+ -config TEST_DIV64
+ -	tristate "64bit/32bit division and modulo test"
+ -	depends on DEBUG_KERNEL || m
+ -	help
+ -	  Enable this to turn on 'do_div()' function test. This test is
+ -	  executed only once during system boot (so affects only boot time),
+ -	  or at module load time.
+ -
+ -	  If unsure, say N.
+ -
+  config KPROBES_SANITY_TEST
+- 	bool "Kprobes sanity tests"
++ 	tristate "Kprobes sanity tests"
+  	depends on DEBUG_KERNEL
+  	depends on KPROBES
+++<<<<<<< HEAD
+ +	default n
+++=======
++ 	depends on KUNIT
+++>>>>>>> e44e81c5b90f (kprobes: convert tests to kunit)
+  	help
+  	  This option provides for testing basic kprobes functionality on
+  	  boot. Samples of kprobe and kretprobe are inserted and
+diff --git a/kernel/kprobes.c b/kernel/kprobes.c
+index eb1900481e65..5edb99e640c8 100644
+--- a/kernel/kprobes.c
++++ b/kernel/kprobes.c
+@@ -2283,9 +2283,6 @@ static int __init init_kprobes(void)
+ 		err = register_module_notifier(&kprobe_module_nb);
+ 
+ 	kprobes_initialized = (err == 0);
+-
+-	if (!err)
+-		init_test_probes();
+ 	return err;
+ }
+ 
+diff --git a/kernel/test_kprobes.c b/kernel/test_kprobes.c
+index 7bca480151b0..9ba487c760ac 100644
+--- a/kernel/test_kprobes.c
++++ b/kernel/test_kprobes.c
+@@ -14,18 +14,17 @@
+  * the GNU General Public License for more details.
+  */
+ 
+-#define pr_fmt(fmt) "Kprobe smoke test: " fmt
+-
+ #include <linux/kernel.h>
+ #include <linux/kprobes.h>
+ #include <linux/random.h>
++#include <kunit/test.h>
+ 
+ #define div_factor 3
+ 
+ static u32 rand1, preh_val, posth_val;
+-static int errors, handler_errors, num_tests;
+ static u32 (*target)(u32 value);
+ static u32 (*target2)(u32 value);
++static struct kunit *current_test;
+ 
+ static noinline u32 kprobe_target(u32 value)
+ {
+@@ -34,10 +33,7 @@ static noinline u32 kprobe_target(u32 value)
+ 
+ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
+ {
+-	if (preemptible()) {
+-		handler_errors++;
+-		pr_err("pre-handler is preemptible\n");
+-	}
++	KUNIT_EXPECT_FALSE(current_test, preemptible());
+ 	preh_val = (rand1 / div_factor);
+ 	return 0;
+ }
+@@ -45,14 +41,8 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
+ static void kp_post_handler(struct kprobe *p, struct pt_regs *regs,
+ 		unsigned long flags)
+ {
+-	if (preemptible()) {
+-		handler_errors++;
+-		pr_err("post-handler is preemptible\n");
+-	}
+-	if (preh_val != (rand1 / div_factor)) {
+-		handler_errors++;
+-		pr_err("incorrect value in post_handler\n");
+-	}
++	KUNIT_EXPECT_FALSE(current_test, preemptible());
++	KUNIT_EXPECT_EQ(current_test, preh_val, (rand1 / div_factor));
+ 	posth_val = preh_val + div_factor;
+ }
+ 
+@@ -62,30 +52,14 @@ static struct kprobe kp = {
+ 	.post_handler = kp_post_handler
+ };
+ 
+-static int test_kprobe(void)
++static void test_kprobe(struct kunit *test)
+ {
+-	int ret;
+-
+-	ret = register_kprobe(&kp);
+-	if (ret < 0) {
+-		pr_err("register_kprobe returned %d\n", ret);
+-		return ret;
+-	}
+-
+-	ret = target(rand1);
++	current_test = test;
++	KUNIT_EXPECT_EQ(test, 0, register_kprobe(&kp));
++	target(rand1);
+ 	unregister_kprobe(&kp);
+-
+-	if (preh_val == 0) {
+-		pr_err("kprobe pre_handler not called\n");
+-		handler_errors++;
+-	}
+-
+-	if (posth_val == 0) {
+-		pr_err("kprobe post_handler not called\n");
+-		handler_errors++;
+-	}
+-
+-	return 0;
++	KUNIT_EXPECT_NE(test, 0, preh_val);
++	KUNIT_EXPECT_NE(test, 0, posth_val);
+ }
+ 
+ static noinline u32 kprobe_target2(u32 value)
+@@ -102,10 +76,7 @@ static int kp_pre_handler2(struct kprobe *p, struct pt_regs *regs)
+ static void kp_post_handler2(struct kprobe *p, struct pt_regs *regs,
+ 		unsigned long flags)
+ {
+-	if (preh_val != (rand1 / div_factor) + 1) {
+-		handler_errors++;
+-		pr_err("incorrect value in post_handler2\n");
+-	}
++	KUNIT_EXPECT_EQ(current_test, preh_val, (rand1 / div_factor) + 1);
+ 	posth_val = preh_val + div_factor;
+ }
+ 
+@@ -115,51 +86,31 @@ static struct kprobe kp2 = {
+ 	.post_handler = kp_post_handler2
+ };
+ 
+-static int test_kprobes(void)
++static void test_kprobes(struct kunit *test)
+ {
+-	int ret;
+ 	struct kprobe *kps[2] = {&kp, &kp2};
+ 
++	current_test = test;
++
+ 	/* addr and flags should be cleard for reusing kprobe. */
+ 	kp.addr = NULL;
+ 	kp.flags = 0;
+-	ret = register_kprobes(kps, 2);
+-	if (ret < 0) {
+-		pr_err("register_kprobes returned %d\n", ret);
+-		return ret;
+-	}
+ 
++	KUNIT_EXPECT_EQ(test, 0, register_kprobes(kps, 2));
+ 	preh_val = 0;
+ 	posth_val = 0;
+-	ret = target(rand1);
++	target(rand1);
+ 
+-	if (preh_val == 0) {
+-		pr_err("kprobe pre_handler not called\n");
+-		handler_errors++;
+-	}
+-
+-	if (posth_val == 0) {
+-		pr_err("kprobe post_handler not called\n");
+-		handler_errors++;
+-	}
++	KUNIT_EXPECT_NE(test, 0, preh_val);
++	KUNIT_EXPECT_NE(test, 0, posth_val);
+ 
+ 	preh_val = 0;
+ 	posth_val = 0;
+-	ret = target2(rand1);
+-
+-	if (preh_val == 0) {
+-		pr_err("kprobe pre_handler2 not called\n");
+-		handler_errors++;
+-	}
+-
+-	if (posth_val == 0) {
+-		pr_err("kprobe post_handler2 not called\n");
+-		handler_errors++;
+-	}
++	target2(rand1);
+ 
++	KUNIT_EXPECT_NE(test, 0, preh_val);
++	KUNIT_EXPECT_NE(test, 0, posth_val);
+ 	unregister_kprobes(kps, 2);
+-	return 0;
+-
+ }
+ 
+ #ifdef CONFIG_KRETPROBES
+@@ -167,10 +118,7 @@ static u32 krph_val;
+ 
+ static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+ {
+-	if (preemptible()) {
+-		handler_errors++;
+-		pr_err("kretprobe entry handler is preemptible\n");
+-	}
++	KUNIT_EXPECT_FALSE(current_test, preemptible());
+ 	krph_val = (rand1 / div_factor);
+ 	return 0;
+ }
+@@ -179,19 +127,9 @@ static int return_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+ {
+ 	unsigned long ret = regs_return_value(regs);
+ 
+-	if (preemptible()) {
+-		handler_errors++;
+-		pr_err("kretprobe return handler is preemptible\n");
+-	}
+-	if (ret != (rand1 / div_factor)) {
+-		handler_errors++;
+-		pr_err("incorrect value in kretprobe handler\n");
+-	}
+-	if (krph_val == 0) {
+-		handler_errors++;
+-		pr_err("call to kretprobe entry handler failed\n");
+-	}
+-
++	KUNIT_EXPECT_FALSE(current_test, preemptible());
++	KUNIT_EXPECT_EQ(current_test, ret, rand1 / div_factor);
++	KUNIT_EXPECT_NE(current_test, krph_val, 0);
+ 	krph_val = rand1;
+ 	return 0;
+ }
+@@ -202,39 +140,21 @@ static struct kretprobe rp = {
+ 	.kp.symbol_name = "kprobe_target"
+ };
+ 
+-static int test_kretprobe(void)
++static void test_kretprobe(struct kunit *test)
+ {
+-	int ret;
+-
+-	ret = register_kretprobe(&rp);
+-	if (ret < 0) {
+-		pr_err("register_kretprobe returned %d\n", ret);
+-		return ret;
+-	}
+-
+-	ret = target(rand1);
++	current_test = test;
++	KUNIT_EXPECT_EQ(test, 0, register_kretprobe(&rp));
++	target(rand1);
+ 	unregister_kretprobe(&rp);
+-	if (krph_val != rand1) {
+-		pr_err("kretprobe handler not called\n");
+-		handler_errors++;
+-	}
+-
+-	return 0;
++	KUNIT_EXPECT_EQ(test, krph_val, rand1);
+ }
+ 
+ static int return_handler2(struct kretprobe_instance *ri, struct pt_regs *regs)
+ {
+ 	unsigned long ret = regs_return_value(regs);
+ 
+-	if (ret != (rand1 / div_factor) + 1) {
+-		handler_errors++;
+-		pr_err("incorrect value in kretprobe handler2\n");
+-	}
+-	if (krph_val == 0) {
+-		handler_errors++;
+-		pr_err("call to kretprobe entry handler failed\n");
+-	}
+-
++	KUNIT_EXPECT_EQ(current_test, ret, (rand1 / div_factor) + 1);
++	KUNIT_EXPECT_NE(current_test, krph_val, 0);
+ 	krph_val = rand1;
+ 	return 0;
+ }
+@@ -245,78 +165,54 @@ static struct kretprobe rp2 = {
+ 	.kp.symbol_name = "kprobe_target2"
+ };
+ 
+-static int test_kretprobes(void)
++static void test_kretprobes(struct kunit *test)
+ {
+-	int ret;
+ 	struct kretprobe *rps[2] = {&rp, &rp2};
+ 
++	current_test = test;
+ 	/* addr and flags should be cleard for reusing kprobe. */
+ 	rp.kp.addr = NULL;
+ 	rp.kp.flags = 0;
+-	ret = register_kretprobes(rps, 2);
+-	if (ret < 0) {
+-		pr_err("register_kretprobe returned %d\n", ret);
+-		return ret;
+-	}
++	KUNIT_EXPECT_EQ(test, 0, register_kretprobes(rps, 2));
+ 
+ 	krph_val = 0;
+-	ret = target(rand1);
+-	if (krph_val != rand1) {
+-		pr_err("kretprobe handler not called\n");
+-		handler_errors++;
+-	}
++	target(rand1);
++	KUNIT_EXPECT_EQ(test, krph_val, rand1);
+ 
+ 	krph_val = 0;
+-	ret = target2(rand1);
+-	if (krph_val != rand1) {
+-		pr_err("kretprobe handler2 not called\n");
+-		handler_errors++;
+-	}
++	target2(rand1);
++	KUNIT_EXPECT_EQ(test, krph_val, rand1);
+ 	unregister_kretprobes(rps, 2);
+-	return 0;
+ }
+ #endif /* CONFIG_KRETPROBES */
+ 
+-int init_test_probes(void)
++static int kprobes_test_init(struct kunit *test)
+ {
+-	int ret;
+-
+ 	target = kprobe_target;
+ 	target2 = kprobe_target2;
+ 
+ 	do {
+ 		rand1 = prandom_u32();
+ 	} while (rand1 <= div_factor);
++	return 0;
++}
+ 
+-	pr_info("started\n");
+-	num_tests++;
+-	ret = test_kprobe();
+-	if (ret < 0)
+-		errors++;
+-
+-	num_tests++;
+-	ret = test_kprobes();
+-	if (ret < 0)
+-		errors++;
+-
++static struct kunit_case kprobes_testcases[] = {
++	KUNIT_CASE(test_kprobe),
++	KUNIT_CASE(test_kprobes),
+ #ifdef CONFIG_KRETPROBES
+-	num_tests++;
+-	ret = test_kretprobe();
+-	if (ret < 0)
+-		errors++;
+-
+-	num_tests++;
+-	ret = test_kretprobes();
+-	if (ret < 0)
+-		errors++;
+-#endif /* CONFIG_KRETPROBES */
++	KUNIT_CASE(test_kretprobe),
++	KUNIT_CASE(test_kretprobes),
++#endif
++	{}
++};
+ 
+-	if (errors)
+-		pr_err("BUG: %d out of %d tests failed\n", errors, num_tests);
+-	else if (handler_errors)
+-		pr_err("BUG: %d error(s) running handlers\n", handler_errors);
+-	else
+-		pr_info("passed successfully\n");
++static struct kunit_suite kprobes_test_suite = {
++	.name = "kprobes_test",
++	.init = kprobes_test_init,
++	.test_cases = kprobes_testcases,
++};
+ 
+-	return 0;
+-}
++kunit_test_suites(&kprobes_test_suite);
++
++MODULE_LICENSE("GPL");
+* Unmerged path lib/Kconfig.debug
