@@ -1,0 +1,221 @@
+perf intel-pt: Synthesize iflag event
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-500.el8
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit 069ca70e48cdcb1ba6e1de87dde6abd3a4d14013
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-500.el8/069ca70e.failed
+
+Synthesize an attribute event and sample events for changes to the
+interrupt flag represented by the MODE.Exec packet.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+Link: https://lore.kernel.org/r/20220124084201.2699795-16-adrian.hunter@intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 069ca70e48cdcb1ba6e1de87dde6abd3a4d14013)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/intel-pt.c
+diff --cc tools/perf/util/intel-pt.c
+index 4e3ff71a4217,c5b860c842f0..000000000000
+--- a/tools/perf/util/intel-pt.c
++++ b/tools/perf/util/intel-pt.c
+@@@ -128,6 -120,13 +128,15 @@@ struct intel_pt 
+  	bool sample_pebs;
+  	struct evsel *pebs_evsel;
+  
+++<<<<<<< HEAD
+++=======
++ 	u64 evt_sample_type;
++ 	u64 evt_id;
++ 
++ 	u64 iflag_chg_sample_type;
++ 	u64 iflag_chg_id;
++ 
+++>>>>>>> 069ca70e48cd (perf intel-pt: Synthesize iflag event)
+  	u64 tsc_bit;
+  	u64 mtc_bit;
+  	u64 mtc_freq_bits;
+@@@ -2127,6 -2134,117 +2136,120 @@@ static int intel_pt_synth_pebs_sample(s
+  	return intel_pt_deliver_synth_event(pt, event, &sample, sample_type);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int intel_pt_synth_single_pebs_sample(struct intel_pt_queue *ptq)
++ {
++ 	struct intel_pt *pt = ptq->pt;
++ 	struct evsel *evsel = pt->pebs_evsel;
++ 	u64 id = evsel->core.id[0];
++ 
++ 	return intel_pt_do_synth_pebs_sample(ptq, evsel, id);
++ }
++ 
++ static int intel_pt_synth_pebs_sample(struct intel_pt_queue *ptq)
++ {
++ 	const struct intel_pt_blk_items *items = &ptq->state->items;
++ 	struct intel_pt_pebs_event *pe;
++ 	struct intel_pt *pt = ptq->pt;
++ 	int err = -EINVAL;
++ 	int hw_id;
++ 
++ 	if (!items->has_applicable_counters || !items->applicable_counters) {
++ 		if (!pt->single_pebs)
++ 			pr_err("PEBS-via-PT record with no applicable_counters\n");
++ 		return intel_pt_synth_single_pebs_sample(ptq);
++ 	}
++ 
++ 	for_each_set_bit(hw_id, (unsigned long *)&items->applicable_counters, INTEL_PT_MAX_PEBS) {
++ 		pe = &ptq->pebs[hw_id];
++ 		if (!pe->evsel) {
++ 			if (!pt->single_pebs)
++ 				pr_err("PEBS-via-PT record with no matching event, hw_id %d\n",
++ 				       hw_id);
++ 			return intel_pt_synth_single_pebs_sample(ptq);
++ 		}
++ 		err = intel_pt_do_synth_pebs_sample(ptq, pe->evsel, pe->id);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static int intel_pt_synth_events_sample(struct intel_pt_queue *ptq)
++ {
++ 	struct intel_pt *pt = ptq->pt;
++ 	union perf_event *event = ptq->event_buf;
++ 	struct perf_sample sample = { .ip = 0, };
++ 	struct {
++ 		struct perf_synth_intel_evt cfe;
++ 		struct perf_synth_intel_evd evd[INTEL_PT_MAX_EVDS];
++ 	} raw;
++ 	int i;
++ 
++ 	if (intel_pt_skip_event(pt))
++ 		return 0;
++ 
++ 	intel_pt_prep_p_sample(pt, ptq, event, &sample);
++ 
++ 	sample.id        = ptq->pt->evt_id;
++ 	sample.stream_id = ptq->pt->evt_id;
++ 
++ 	raw.cfe.type     = ptq->state->cfe_type;
++ 	raw.cfe.reserved = 0;
++ 	raw.cfe.ip       = !!(ptq->state->flags & INTEL_PT_FUP_IP);
++ 	raw.cfe.vector   = ptq->state->cfe_vector;
++ 	raw.cfe.evd_cnt  = ptq->state->evd_cnt;
++ 
++ 	for (i = 0; i < ptq->state->evd_cnt; i++) {
++ 		raw.evd[i].et       = 0;
++ 		raw.evd[i].evd_type = ptq->state->evd[i].type;
++ 		raw.evd[i].payload  = ptq->state->evd[i].payload;
++ 	}
++ 
++ 	sample.raw_size = perf_synth__raw_size(raw) +
++ 			  ptq->state->evd_cnt * sizeof(struct perf_synth_intel_evd);
++ 	sample.raw_data = perf_synth__raw_data(&raw);
++ 
++ 	return intel_pt_deliver_synth_event(pt, event, &sample,
++ 					    pt->evt_sample_type);
++ }
++ 
++ static int intel_pt_synth_iflag_chg_sample(struct intel_pt_queue *ptq)
++ {
++ 	struct intel_pt *pt = ptq->pt;
++ 	union perf_event *event = ptq->event_buf;
++ 	struct perf_sample sample = { .ip = 0, };
++ 	struct perf_synth_intel_iflag_chg raw;
++ 
++ 	if (intel_pt_skip_event(pt))
++ 		return 0;
++ 
++ 	intel_pt_prep_p_sample(pt, ptq, event, &sample);
++ 
++ 	sample.id = ptq->pt->iflag_chg_id;
++ 	sample.stream_id = ptq->pt->iflag_chg_id;
++ 
++ 	raw.flags = 0;
++ 	raw.iflag = ptq->state->to_iflag;
++ 
++ 	if (ptq->state->type & INTEL_PT_BRANCH) {
++ 		raw.via_branch = 1;
++ 		raw.branch_ip = ptq->state->to_ip;
++ 	} else {
++ 		sample.addr = 0;
++ 	}
++ 	sample.flags = ptq->flags;
++ 
++ 	sample.raw_size = perf_synth__raw_size(raw);
++ 	sample.raw_data = perf_synth__raw_data(&raw);
++ 
++ 	return intel_pt_deliver_synth_event(pt, event, &sample,
++ 					    pt->iflag_chg_sample_type);
++ }
++ 
+++>>>>>>> 069ca70e48cd (perf intel-pt: Synthesize iflag event)
+  static int intel_pt_synth_error(struct intel_pt *pt, int code, int cpu,
+  				pid_t pid, pid_t tid, u64 ip, u64 timestamp)
+  {
+@@@ -2226,6 -2351,19 +2349,22 @@@ static int intel_pt_sample(struct intel
+  			return err;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (pt->synth_opts.intr_events) {
++ 		if (state->type & INTEL_PT_EVT) {
++ 			err = intel_pt_synth_events_sample(ptq);
++ 			if (err)
++ 				return err;
++ 		}
++ 		if (state->type & INTEL_PT_IFLAG_CHG) {
++ 			err = intel_pt_synth_iflag_chg_sample(ptq);
++ 			if (err)
++ 				return err;
++ 		}
++ 	}
++ 
+++>>>>>>> 069ca70e48cd (perf intel-pt: Synthesize iflag event)
+  	if (pt->sample_pwr_events) {
+  		if (state->type & INTEL_PT_PSB_EVT) {
+  			err = intel_pt_synth_psb_sample(ptq);
+@@@ -3397,6 -3561,28 +3536,31 @@@ static int intel_pt_synth_events(struc
+  		id += 1;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (pt->synth_opts.intr_events && (evsel->core.attr.config & INTEL_PT_CFG_EVT_EN)) {
++ 		attr.config = PERF_SYNTH_INTEL_EVT;
++ 		err = intel_pt_synth_event(session, "evt", &attr, id);
++ 		if (err)
++ 			return err;
++ 		pt->evt_sample_type = attr.sample_type;
++ 		pt->evt_id = id;
++ 		intel_pt_set_event_name(evlist, id, "evt");
++ 		id += 1;
++ 	}
++ 
++ 	if (pt->synth_opts.intr_events && pt->cap_event_trace) {
++ 		attr.config = PERF_SYNTH_INTEL_IFLAG_CHG;
++ 		err = intel_pt_synth_event(session, "iflag", &attr, id);
++ 		if (err)
++ 			return err;
++ 		pt->iflag_chg_sample_type = attr.sample_type;
++ 		pt->iflag_chg_id = id;
++ 		intel_pt_set_event_name(evlist, id, "iflag");
++ 		id += 1;
++ 	}
++ 
+++>>>>>>> 069ca70e48cd (perf intel-pt: Synthesize iflag event)
+  	return 0;
+  }
+  
+* Unmerged path tools/perf/util/intel-pt.c
