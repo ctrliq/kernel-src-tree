@@ -1,0 +1,198 @@
+usb: typec: tipd: Add support for Apple CD321X
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-500.el8
+commit-author Sven Peter <sven@svenpeter.dev>
+commit 45188f27b3d0fa2970a6cd8510d724164ee1bfca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-500.el8/45188f27.failed
+
+Apple CD321x chips are a variant of the TI TPS 6598x chips.
+The major differences are the changed interrupt numbers and
+the concurrent connection to the SMC which we must not disturb.
+
+	Reviewed-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+	Signed-off-by: Sven Peter <sven@svenpeter.dev>
+Link: https://lore.kernel.org/r/20210928155502.71372-5-sven@svenpeter.dev
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 45188f27b3d0fa2970a6cd8510d724164ee1bfca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/typec/tipd/core.c
+diff --cc drivers/usb/typec/tipd/core.c
+index 6e64a81907c2,cc4a154eabcb..000000000000
+--- a/drivers/usb/typec/tipd/core.c
++++ b/drivers/usb/typec/tipd/core.c
+@@@ -404,6 -405,108 +405,111 @@@ static const struct typec_operations tp
+  	.pr_set = tps6598x_pr_set,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static bool tps6598x_read_status(struct tps6598x *tps, u32 *status)
++ {
++ 	int ret;
++ 
++ 	ret = tps6598x_read32(tps, TPS_REG_STATUS, status);
++ 	if (ret) {
++ 		dev_err(tps->dev, "%s: failed to read status\n", __func__);
++ 		return false;
++ 	}
++ 	trace_tps6598x_status(*status);
++ 
++ 	return true;
++ }
++ 
++ static bool tps6598x_read_data_status(struct tps6598x *tps)
++ {
++ 	u32 data_status;
++ 	int ret;
++ 
++ 	ret = tps6598x_read32(tps, TPS_REG_DATA_STATUS, &data_status);
++ 	if (ret < 0) {
++ 		dev_err(tps->dev, "failed to read data status: %d\n", ret);
++ 		return false;
++ 	}
++ 	trace_tps6598x_data_status(data_status);
++ 
++ 	return true;
++ }
++ 
++ static bool tps6598x_read_power_status(struct tps6598x *tps)
++ {
++ 	u16 pwr_status;
++ 	int ret;
++ 
++ 	ret = tps6598x_read16(tps, TPS_REG_POWER_STATUS, &pwr_status);
++ 	if (ret < 0) {
++ 		dev_err(tps->dev, "failed to read power status: %d\n", ret);
++ 		return false;
++ 	}
++ 	trace_tps6598x_power_status(pwr_status);
++ 
++ 	return true;
++ }
++ 
++ static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
++ {
++ 	int ret;
++ 
++ 	if (status & TPS_STATUS_PLUG_PRESENT) {
++ 		ret = tps6598x_connect(tps, status);
++ 		if (ret)
++ 			dev_err(tps->dev, "failed to register partner\n");
++ 	} else {
++ 		tps6598x_disconnect(tps, status);
++ 	}
++ }
++ 
++ static irqreturn_t cd321x_interrupt(int irq, void *data)
++ {
++ 	struct tps6598x *tps = data;
++ 	u64 event;
++ 	u32 status;
++ 	int ret;
++ 
++ 	mutex_lock(&tps->lock);
++ 
++ 	ret = tps6598x_read64(tps, TPS_REG_INT_EVENT1, &event);
++ 	if (ret) {
++ 		dev_err(tps->dev, "%s: failed to read events\n", __func__);
++ 		goto err_unlock;
++ 	}
++ 	trace_cd321x_irq(event);
++ 
++ 	if (!event)
++ 		goto err_unlock;
++ 
++ 	if (!tps6598x_read_status(tps, &status))
++ 		goto err_clear_ints;
++ 
++ 	if (event & APPLE_CD_REG_INT_POWER_STATUS_UPDATE)
++ 		if (!tps6598x_read_power_status(tps))
++ 			goto err_clear_ints;
++ 
++ 	if (event & APPLE_CD_REG_INT_DATA_STATUS_UPDATE)
++ 		if (!tps6598x_read_data_status(tps))
++ 			goto err_clear_ints;
++ 
++ 	/* Handle plug insert or removal */
++ 	if (event & APPLE_CD_REG_INT_PLUG_EVENT)
++ 		tps6598x_handle_plug_event(tps, status);
++ 
++ err_clear_ints:
++ 	tps6598x_write64(tps, TPS_REG_INT_CLEAR1, event);
++ 
++ err_unlock:
++ 	mutex_unlock(&tps->lock);
++ 
++ 	if (event)
++ 		return IRQ_HANDLED;
++ 	return IRQ_NONE;
++ }
++ 
+++>>>>>>> 45188f27b3d0 (usb: typec: tipd: Add support for Apple CD321X)
+  static irqreturn_t tps6598x_interrupt(int irq, void *data)
+  {
+  	struct tps6598x *tps = data;
+* Unmerged path drivers/usb/typec/tipd/core.c
+diff --git a/drivers/usb/typec/tipd/tps6598x.h b/drivers/usb/typec/tipd/tps6598x.h
+index 003a577be216..e13b16419843 100644
+--- a/drivers/usb/typec/tipd/tps6598x.h
++++ b/drivers/usb/typec/tipd/tps6598x.h
+@@ -129,6 +129,12 @@
+ #define TPS_REG_INT_HARD_RESET				BIT(1)
+ #define TPS_REG_INT_PD_SOFT_RESET			BIT(0)
+ 
++/* Apple-specific TPS_REG_INT_* bits */
++#define APPLE_CD_REG_INT_DATA_STATUS_UPDATE		BIT(10)
++#define APPLE_CD_REG_INT_POWER_STATUS_UPDATE		BIT(9)
++#define APPLE_CD_REG_INT_STATUS_UPDATE			BIT(8)
++#define APPLE_CD_REG_INT_PLUG_EVENT			BIT(1)
++
+ /* TPS_REG_POWER_STATUS bits */
+ #define TPS_POWER_STATUS_CONNECTION(x)  TPS_FIELD_GET(BIT(0), (x))
+ #define TPS_POWER_STATUS_SOURCESINK(x)	TPS_FIELD_GET(BIT(1), (x))
+diff --git a/drivers/usb/typec/tipd/trace.h b/drivers/usb/typec/tipd/trace.h
+index 5d09d6f78930..12cad1bde7cc 100644
+--- a/drivers/usb/typec/tipd/trace.h
++++ b/drivers/usb/typec/tipd/trace.h
+@@ -67,6 +67,13 @@
+ 		{ TPS_REG_INT_USER_VID_ALT_MODE_ATTN_VDM,	"USER_VID_ALT_MODE_ATTN_VDM" }, \
+ 		{ TPS_REG_INT_USER_VID_ALT_MODE_OTHER_VDM,	"USER_VID_ALT_MODE_OTHER_VDM" })
+ 
++#define show_cd321x_irq_flags(flags) \
++	__print_flags_u64(flags, "|", \
++		{ APPLE_CD_REG_INT_PLUG_EVENT,			"PLUG_EVENT" }, \
++		{ APPLE_CD_REG_INT_POWER_STATUS_UPDATE,		"POWER_STATUS_UPDATE" }, \
++		{ APPLE_CD_REG_INT_DATA_STATUS_UPDATE,		"DATA_STATUS_UPDATE" }, \
++		{ APPLE_CD_REG_INT_STATUS_UPDATE,		"STATUS_UPDATE" })
++
+ #define TPS6598X_STATUS_FLAGS_MASK (GENMASK(31, 0) ^ (TPS_STATUS_CONN_STATE_MASK | \
+ 						      TPS_STATUS_PP_5V0_SWITCH_MASK | \
+ 						      TPS_STATUS_PP_HV_SWITCH_MASK | \
+@@ -207,6 +214,22 @@ TRACE_EVENT(tps6598x_irq,
+ 		      show_irq_flags(__entry->event2))
+ );
+ 
++TRACE_EVENT(cd321x_irq,
++	    TP_PROTO(u64 event),
++	    TP_ARGS(event),
++
++	    TP_STRUCT__entry(
++			     __field(u64, event)
++			     ),
++
++	    TP_fast_assign(
++			   __entry->event = event;
++			   ),
++
++	    TP_printk("event=%s",
++		      show_cd321x_irq_flags(__entry->event))
++);
++
+ TRACE_EVENT(tps6598x_status,
+ 	    TP_PROTO(u32 status),
+ 	    TP_ARGS(status),
