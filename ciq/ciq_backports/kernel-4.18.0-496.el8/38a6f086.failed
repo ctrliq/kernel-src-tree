@@ -1,0 +1,175 @@
+net: sched: support hash selecting tx queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-496.el8
+commit-author Tonghao Zhang <xiangxia.m.yue@gmail.com>
+commit 38a6f0865796e26fc38fff4858f681d9ae76fa0f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-496.el8/38a6f086.failed
+
+This patch allows users to pick queue_mapping, range
+from A to B. Then we can load balance packets from A
+to B tx queue. The range is an unsigned 16bit value
+in decimal format.
+
+$ tc filter ... action skbedit queue_mapping skbhash A B
+
+"skbedit queue_mapping QUEUE_MAPPING" (from "man 8 tc-skbedit")
+is enhanced with flags: SKBEDIT_F_TXQ_SKBHASH
+
+  +----+      +----+      +----+
+  | P1 |      | P2 |      | Pn |
+  +----+      +----+      +----+
+    |           |           |
+    +-----------+-----------+
+                |
+                | clsact/skbedit
+                |      MQ
+                v
+    +-----------+-----------+
+    | q0        | qn        | qm
+    v           v           v
+  HTB/FQ       FIFO   ...  FIFO
+
+For example:
+If P1 sends out packets to different Pods on other host, and
+we want distribute flows from qn - qm. Then we can use skb->hash
+as hash.
+
+setup commands:
+$ NETDEV=eth0
+$ ip netns add n1
+$ ip link add ipv1 link $NETDEV type ipvlan mode l2
+$ ip link set ipv1 netns n1
+$ ip netns exec n1 ifconfig ipv1 2.2.2.100/24 up
+
+$ tc qdisc add dev $NETDEV clsact
+$ tc filter add dev $NETDEV egress protocol ip prio 1 \
+        flower skip_hw src_ip 2.2.2.100 action skbedit queue_mapping skbhash 2 6
+$ tc qdisc add dev $NETDEV handle 1: root mq
+$ tc qdisc add dev $NETDEV parent 1:1 handle 2: htb
+$ tc class add dev $NETDEV parent 2: classid 2:1 htb rate 100kbit
+$ tc class add dev $NETDEV parent 2: classid 2:2 htb rate 200kbit
+$ tc qdisc add dev $NETDEV parent 1:2 tbf rate 100mbit burst 100mb latency 1
+$ tc qdisc add dev $NETDEV parent 1:3 pfifo
+$ tc qdisc add dev $NETDEV parent 1:4 pfifo
+$ tc qdisc add dev $NETDEV parent 1:5 pfifo
+$ tc qdisc add dev $NETDEV parent 1:6 pfifo
+$ tc qdisc add dev $NETDEV parent 1:7 pfifo
+
+$ ip netns exec n1 iperf3 -c 2.2.2.1 -i 1 -t 10 -P 10
+
+pick txqueue from 2 - 6:
+$ ethtool -S $NETDEV | grep -i tx_queue_[0-9]_bytes
+     tx_queue_0_bytes: 42
+     tx_queue_1_bytes: 0
+     tx_queue_2_bytes: 11442586444
+     tx_queue_3_bytes: 7383615334
+     tx_queue_4_bytes: 3981365579
+     tx_queue_5_bytes: 3983235051
+     tx_queue_6_bytes: 6706236461
+     tx_queue_7_bytes: 42
+     tx_queue_8_bytes: 0
+     tx_queue_9_bytes: 0
+
+txqueues 2 - 6 are mapped to classid 1:3 - 1:7
+$ tc -s class show dev $NETDEV
+...
+class mq 1:3 root leaf 8002:
+ Sent 11949133672 bytes 7929798 pkt (dropped 0, overlimits 0 requeues 0)
+ backlog 0b 0p requeues 0
+class mq 1:4 root leaf 8003:
+ Sent 7710449050 bytes 5117279 pkt (dropped 0, overlimits 0 requeues 0)
+ backlog 0b 0p requeues 0
+class mq 1:5 root leaf 8004:
+ Sent 4157648675 bytes 2758990 pkt (dropped 0, overlimits 0 requeues 0)
+ backlog 0b 0p requeues 0
+class mq 1:6 root leaf 8005:
+ Sent 4159632195 bytes 2759990 pkt (dropped 0, overlimits 0 requeues 0)
+ backlog 0b 0p requeues 0
+class mq 1:7 root leaf 8006:
+ Sent 7003169603 bytes 4646912 pkt (dropped 0, overlimits 0 requeues 0)
+ backlog 0b 0p requeues 0
+...
+
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Cc: Cong Wang <xiyou.wangcong@gmail.com>
+	Cc: Jiri Pirko <jiri@resnulli.us>
+	Cc: "David S. Miller" <davem@davemloft.net>
+	Cc: Jakub Kicinski <kuba@kernel.org>
+	Cc: Jonathan Lemon <jonathan.lemon@gmail.com>
+	Cc: Eric Dumazet <edumazet@google.com>
+	Cc: Alexander Lobakin <alobakin@pm.me>
+	Cc: Paolo Abeni <pabeni@redhat.com>
+	Cc: Talal Ahmad <talalahmad@google.com>
+	Cc: Kevin Hao <haokexin@gmail.com>
+	Cc: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+	Cc: Antoine Tenart <atenart@kernel.org>
+	Cc: Wei Wang <weiwan@google.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Signed-off-by: Tonghao Zhang <xiangxia.m.yue@gmail.com>
+	Reviewed-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit 38a6f0865796e26fc38fff4858f681d9ae76fa0f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_skbedit.c
+diff --cc net/sched/act_skbedit.c
+index f6ca4a336c39,e3bd11dfe1ca..000000000000
+--- a/net/sched/act_skbedit.c
++++ b/net/sched/act_skbedit.c
+@@@ -69,8 -72,12 +83,17 @@@ static int tcf_skbedit_act(struct sk_bu
+  		}
+  	}
+  	if (params->flags & SKBEDIT_F_QUEUE_MAPPING &&
+++<<<<<<< HEAD
+ +	    skb->dev->real_num_tx_queues > params->queue_mapping)
+ +		skb_set_queue_mapping(skb, params->queue_mapping);
+++=======
++ 	    skb->dev->real_num_tx_queues > params->queue_mapping) {
++ #ifdef CONFIG_NET_EGRESS
++ 		netdev_xmit_skip_txqueue(true);
++ #endif
++ 		skb_set_queue_mapping(skb, tcf_skbedit_hash(params, skb));
++ 	}
+++>>>>>>> 38a6f0865796 (net: sched: support hash selecting tx queue)
+  	if (params->flags & SKBEDIT_F_MARK) {
+  		skb->mark &= ~params->mask;
+  		skb->mark |= params->mark & params->mask;
+diff --git a/include/net/tc_act/tc_skbedit.h b/include/net/tc_act/tc_skbedit.h
+index 7c82693134de..fa3852eaa440 100644
+--- a/include/net/tc_act/tc_skbedit.h
++++ b/include/net/tc_act/tc_skbedit.h
+@@ -28,6 +28,7 @@ struct tcf_skbedit_params {
+ 	u32 mark;
+ 	u32 mask;
+ 	u16 queue_mapping;
++	u16 mapping_mod;
+ 	u16 ptype;
+ 	struct rcu_head rcu;
+ };
+diff --git a/include/uapi/linux/tc_act/tc_skbedit.h b/include/uapi/linux/tc_act/tc_skbedit.h
+index 800e93377218..6cb6101208d0 100644
+--- a/include/uapi/linux/tc_act/tc_skbedit.h
++++ b/include/uapi/linux/tc_act/tc_skbedit.h
+@@ -29,6 +29,7 @@
+ #define SKBEDIT_F_PTYPE			0x8
+ #define SKBEDIT_F_MASK			0x10
+ #define SKBEDIT_F_INHERITDSFIELD	0x20
++#define SKBEDIT_F_TXQ_SKBHASH		0x40
+ 
+ struct tc_skbedit {
+ 	tc_gen;
+@@ -45,6 +46,7 @@ enum {
+ 	TCA_SKBEDIT_PTYPE,
+ 	TCA_SKBEDIT_MASK,
+ 	TCA_SKBEDIT_FLAGS,
++	TCA_SKBEDIT_QUEUE_MAPPING_MAX,
+ 	__TCA_SKBEDIT_MAX
+ };
+ #define TCA_SKBEDIT_MAX (__TCA_SKBEDIT_MAX - 1)
+* Unmerged path net/sched/act_skbedit.c
