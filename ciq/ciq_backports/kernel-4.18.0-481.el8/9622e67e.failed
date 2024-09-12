@@ -1,0 +1,197 @@
+perf/x86/amd/core: Add PerfMonV2 counter control
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Sandipan Das <sandipan.das@amd.com>
+commit 9622e67e3980c01872490de0925e5c6c23247c94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/9622e67e.failed
+
+If AMD Performance Monitoring Version 2 (PerfMonV2) is
+supported, use a new scheme to manage the Core PMCs using
+the new global control and status registers. This will be
+bypassed on unsupported hardware (x86_pmu.version < 2).
+
+Currently, all PMCs have dedicated control (PERF_CTL) and
+counter (PERF_CTR) registers. For a given PMC, the enable
+(En) bit of its PERF_CTL register is used to start or stop
+counting.
+
+The Performance Counter Global Control (PerfCntrGlobalCtl)
+register has enable (PerfCntrEn) bits for each PMC. For a
+PMC to start counting, both PERF_CTL and PerfCntrGlobalCtl
+enable bits must be set. If either of those are cleared,
+the PMC stops counting.
+
+In x86_pmu_{en,dis}able_all(), the PERF_CTL registers of
+all active PMCs are written to in a loop. Ideally, PMCs
+counting the same event that were started and stopped at
+the same time should record the same counts. Due to delays
+in between writes to the PERF_CTL registers across loop
+iterations, the PMCs cannot be enabled or disabled at the
+same instant and hence, record slightly different counts.
+This is fixed by enabling or disabling all active PMCs at
+the same time with a single write to the PerfCntrGlobalCtl
+register.
+
+	Signed-off-by: Sandipan Das <sandipan.das@amd.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/dfe8e934074aaabc6ba748dfaccd0a77c974bb82.1650515382.git.sandipan.das@amd.com
+(cherry picked from commit 9622e67e3980c01872490de0925e5c6c23247c94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/amd/core.c
+diff --cc arch/x86/events/amd/core.c
+index fc84e3f05348,a339c3e0be33..000000000000
+--- a/arch/x86/events/amd/core.c
++++ b/arch/x86/events/amd/core.c
+@@@ -573,8 -660,15 +573,13 @@@ static void amd_pmu_cpu_dead(int cpu
+  
+  		cpuhw->amd_nb = NULL;
+  	}
+ -
+ -	amd_pmu_cpu_reset(cpu);
+  }
+  
++ static inline void amd_pmu_set_global_ctl(u64 ctl)
++ {
++ 	wrmsrl(MSR_AMD64_PERF_CNTR_GLOBAL_CTL, ctl);
++ }
++ 
+  /*
+   * When a PMC counter overflows, an NMI is used to process the event and
+   * reset the counter. NMI latency can result in the counter being updated
+@@@ -609,8 -703,6 +614,11 @@@ static void amd_pmu_check_overflow(void
+  	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+  	int idx;
+  
+++<<<<<<< HEAD
+ +	x86_pmu_disable_all();
+ +
+++=======
+++>>>>>>> 9622e67e3980 (perf/x86/amd/core: Add PerfMonV2 counter control)
+  	/*
+  	 * This shouldn't be called from NMI context, but add a safeguard here
+  	 * to return, since if we're in NMI context we can't wait for an NMI
+@@@ -633,6 -725,50 +641,53 @@@
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void amd_pmu_enable_event(struct perf_event *event)
++ {
++ 	x86_pmu_enable_event(event);
++ }
++ 
++ static void amd_pmu_enable_all(int added)
++ {
++ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++ 	struct hw_perf_event *hwc;
++ 	int idx;
++ 
++ 	amd_brs_enable_all();
++ 
++ 	for (idx = 0; idx < x86_pmu.num_counters; idx++) {
++ 		hwc = &cpuc->events[idx]->hw;
++ 
++ 		/* only activate events which are marked as active */
++ 		if (!test_bit(idx, cpuc->active_mask))
++ 			continue;
++ 
++ 		amd_pmu_enable_event(cpuc->events[idx]);
++ 	}
++ }
++ 
++ static void amd_pmu_v2_enable_event(struct perf_event *event)
++ {
++ 	struct hw_perf_event *hwc = &event->hw;
++ 
++ 	/*
++ 	 * Testing cpu_hw_events.enabled should be skipped in this case unlike
++ 	 * in x86_pmu_enable_event().
++ 	 *
++ 	 * Since cpu_hw_events.enabled is set only after returning from
++ 	 * x86_pmu_start(), the PMCs must be programmed and kept ready.
++ 	 * Counting starts only after x86_pmu_enable_all() is called.
++ 	 */
++ 	__x86_pmu_enable_event(hwc, ARCH_PERFMON_EVENTSEL_ENABLE);
++ }
++ 
++ static void amd_pmu_v2_enable_all(int added)
++ {
++ 	amd_pmu_set_global_ctl(amd_pmu_global_cntr_mask);
++ }
++ 
+++>>>>>>> 9622e67e3980 (perf/x86/amd/core: Add PerfMonV2 counter control)
+  static void amd_pmu_disable_event(struct perf_event *event)
+  {
+  	x86_pmu_disable_event(event);
+@@@ -650,6 -786,32 +705,35 @@@
+  	amd_pmu_wait_on_overflow(event->hw.idx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void amd_pmu_disable_all(void)
++ {
++ 	amd_brs_disable_all();
++ 	x86_pmu_disable_all();
++ 	amd_pmu_check_overflow();
++ }
++ 
++ static void amd_pmu_v2_disable_all(void)
++ {
++ 	/* Disable all PMCs */
++ 	amd_pmu_set_global_ctl(0);
++ 	amd_pmu_check_overflow();
++ }
++ 
++ static void amd_pmu_add_event(struct perf_event *event)
++ {
++ 	if (needs_branch_stack(event))
++ 		amd_pmu_brs_add(event);
++ }
++ 
++ static void amd_pmu_del_event(struct perf_event *event)
++ {
++ 	if (needs_branch_stack(event))
++ 		amd_pmu_brs_del(event);
++ }
++ 
+++>>>>>>> 9622e67e3980 (perf/x86/amd/core: Add PerfMonV2 counter control)
+  /*
+   * Because of NMI latency, if multiple PMC counters are active or other sources
+   * of NMIs are received, the perf NMI handler can handle one or more overflowed
+@@@ -956,6 -1239,25 +1040,28 @@@ static int __init amd_core_pmu_init(voi
+  	x86_pmu.eventsel	= MSR_F15H_PERF_CTL;
+  	x86_pmu.perfctr		= MSR_F15H_PERF_CTR;
+  	x86_pmu.num_counters	= AMD64_NUM_COUNTERS_CORE;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Check for Performance Monitoring v2 support */
++ 	if (boot_cpu_has(X86_FEATURE_PERFMON_V2)) {
++ 		ebx.full = cpuid_ebx(EXT_PERFMON_DEBUG_FEATURES);
++ 
++ 		/* Update PMU version for later usage */
++ 		x86_pmu.version = 2;
++ 
++ 		/* Find the number of available Core PMCs */
++ 		x86_pmu.num_counters = ebx.split.num_core_pmc;
++ 
++ 		amd_pmu_global_cntr_mask = (1ULL << x86_pmu.num_counters) - 1;
++ 
++ 		/* Update PMC handling functions */
++ 		x86_pmu.enable_all = amd_pmu_v2_enable_all;
++ 		x86_pmu.disable_all = amd_pmu_v2_disable_all;
++ 		x86_pmu.enable = amd_pmu_v2_enable_event;
++ 	}
++ 
+++>>>>>>> 9622e67e3980 (perf/x86/amd/core: Add PerfMonV2 counter control)
+  	/*
+  	 * AMD Core perfctr has separate MSRs for the NB events, see
+  	 * the amd/uncore.c driver.
+* Unmerged path arch/x86/events/amd/core.c
