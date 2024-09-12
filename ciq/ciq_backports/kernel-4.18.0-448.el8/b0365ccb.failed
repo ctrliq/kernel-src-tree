@@ -1,0 +1,228 @@
+NFS: Fix up forced readdirplus
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit b0365ccb0712efacf99936e94e92eb7ae63de4d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/b0365ccb.failed
+
+Avoid clearing the entire readdir page cache if we're just doing forced
+readdirplus for the 'ls -l' heuristic.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit b0365ccb0712efacf99936e94e92eb7ae63de4d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/dir.c
+#	fs/nfs/nfstrace.h
+#	include/linux/nfs_fs.h
+diff --cc fs/nfs/dir.c
+index ce0607cf0a27,f6aac1e8a8b9..000000000000
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@@ -167,7 -168,9 +167,13 @@@ struct nfs_readdir_descriptor 
+  	unsigned long	gencount;
+  	unsigned long	attr_gencount;
+  	unsigned int	cache_entry_index;
+++<<<<<<< HEAD
+ +	signed char duped;
+++=======
++ 	unsigned int	buffer_fills;
++ 	unsigned int	dtsize;
++ 	bool clear_cache;
+++>>>>>>> b0365ccb0712 (NFS: Fix up forced readdirplus)
+  	bool plus;
+  	bool eob;
+  	bool eof;
+@@@ -390,13 -435,12 +403,22 @@@ static struct page *nfs_readdir_page_ge
+  {
+  	struct page *page;
+  
+++<<<<<<< HEAD
+ +	page = nfs_readdir_page_get_locked(mapping, index, cookie);
+ +	if (page) {
+ +		if (nfs_readdir_page_last_cookie(page) == cookie)
+ +			return page;
+ +		nfs_readdir_page_unlock_and_put(page);
+ +	}
+ +	return NULL;
+++=======
++ 	page = nfs_readdir_page_get_locked(mapping, cookie, change_attr);
++ 	if (!page)
++ 		return NULL;
++ 	if (nfs_readdir_page_last_cookie(page) != cookie)
++ 		nfs_readdir_page_reinit_array(page, cookie, change_attr);
++ 	return page;
+++>>>>>>> b0365ccb0712 (NFS: Fix up forced readdirplus)
+  }
+  
+  static inline
+@@@ -927,9 -965,17 +949,23 @@@ nfs_readdir_page_unlock_and_put_cached(
+  static struct page *
+  nfs_readdir_page_get_cached(struct nfs_readdir_descriptor *desc)
+  {
+++<<<<<<< HEAD
+ +	return nfs_readdir_page_get_locked(desc->file->f_mapping,
+ +					   desc->page_index,
+ +					   desc->last_cookie);
+++=======
++ 	struct address_space *mapping = desc->file->f_mapping;
++ 	u64 change_attr = inode_peek_iversion_raw(mapping->host);
++ 	u64 cookie = desc->last_cookie;
++ 	struct page *page;
++ 
++ 	page = nfs_readdir_page_get_locked(mapping, cookie, change_attr);
++ 	if (!page)
++ 		return NULL;
++ 	if (desc->clear_cache && !nfs_readdir_page_needs_filling(page))
++ 		nfs_readdir_page_reinit_array(page, cookie, change_attr);
++ 	return page;
+++>>>>>>> b0365ccb0712 (NFS: Fix up forced readdirplus)
+  }
+  
+  /*
+@@@ -965,10 -1021,12 +1001,11 @@@ static int find_and_lock_cache_page(str
+  		    memcmp(nfsi->cookieverf, verf, sizeof(nfsi->cookieverf))) {
+  			memcpy(nfsi->cookieverf, verf,
+  			       sizeof(nfsi->cookieverf));
+ -			invalidate_inode_pages2_range(desc->file->f_mapping, 1,
+ +			invalidate_inode_pages2_range(desc->file->f_mapping,
+ +						      desc->page_index_max + 1,
+  						      -1);
+ -			trace_nfs_readdir_invalidate_cache_range(
+ -				inode, 1, MAX_LFS_FILESIZE);
+  		}
++ 		desc->clear_cache = false;
+  	}
+  	res = nfs_readdir_search_array(desc);
+  	if (res == 0)
+@@@ -1087,6 -1159,21 +1124,24 @@@ out
+  	return status;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define NFS_READDIR_CACHE_MISS_THRESHOLD (16UL)
++ 
++ static bool nfs_readdir_handle_cache_misses(struct inode *inode,
++ 					    struct nfs_readdir_descriptor *desc,
++ 					    unsigned int cache_misses,
++ 					    bool force_clear)
++ {
++ 	if (desc->ctx->pos == 0 || !desc->plus)
++ 		return false;
++ 	if (cache_misses <= NFS_READDIR_CACHE_MISS_THRESHOLD && !force_clear)
++ 		return false;
++ 	trace_nfs_readdir_force_readdirplus(inode);
++ 	return true;
++ }
++ 
+++>>>>>>> b0365ccb0712 (NFS: Fix up forced readdirplus)
+  /* The file offset position represents the dirent entry number.  A
+     last cookie cache takes care of the common case of reading the
+     whole directory.
+@@@ -1098,7 -1185,8 +1153,12 @@@ static int nfs_readdir(struct file *fil
+  	struct nfs_inode *nfsi = NFS_I(inode);
+  	struct nfs_open_dir_context *dir_ctx = file->private_data;
+  	struct nfs_readdir_descriptor *desc;
+++<<<<<<< HEAD
+ +	pgoff_t page_index;
+++=======
++ 	unsigned int cache_hits, cache_misses;
++ 	bool force_clear;
+++>>>>>>> b0365ccb0712 (NFS: Fix up forced readdirplus)
+  	int res;
+  
+  	dfprintk(FILE, "NFS: readdir(%pD2) starting at cookie %llu\n",
+@@@ -1130,7 -1215,11 +1190,13 @@@
+  	desc->last_cookie = dir_ctx->last_cookie;
+  	desc->attr_gencount = dir_ctx->attr_gencount;
+  	desc->eof = dir_ctx->eof;
+ -	nfs_set_dtsize(desc, dir_ctx->dtsize);
+  	memcpy(desc->verf, dir_ctx->verf, sizeof(desc->verf));
+++<<<<<<< HEAD
+++=======
++ 	cache_hits = atomic_xchg(&dir_ctx->cache_hits, 0);
++ 	cache_misses = atomic_xchg(&dir_ctx->cache_misses, 0);
++ 	force_clear = dir_ctx->force_clear;
+++>>>>>>> b0365ccb0712 (NFS: Fix up forced readdirplus)
+  	spin_unlock(&file->f_lock);
+  
+  	if (desc->eof) {
+@@@ -1138,9 -1227,10 +1204,16 @@@
+  		goto out_free;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (test_and_clear_bit(NFS_INO_FORCE_READDIR, &nfsi->flags) &&
+ +	    list_is_singular(&nfsi->open_files))
+ +		invalidate_mapping_pages(inode->i_mapping, page_index + 1, -1);
+++=======
++ 	desc->plus = nfs_use_readdirplus(inode, ctx, cache_hits, cache_misses);
++ 	force_clear = nfs_readdir_handle_cache_misses(inode, desc, cache_misses,
++ 						      force_clear);
++ 	desc->clear_cache = force_clear;
+++>>>>>>> b0365ccb0712 (NFS: Fix up forced readdirplus)
+  
+  	do {
+  		res = readdir_search_pagecache(desc);
+@@@ -1175,12 -1265,12 +1250,13 @@@
+  
+  	spin_lock(&file->f_lock);
+  	dir_ctx->dir_cookie = desc->dir_cookie;
+ +	dir_ctx->dup_cookie = desc->dup_cookie;
+  	dir_ctx->last_cookie = desc->last_cookie;
+ +	dir_ctx->duped = desc->duped;
+  	dir_ctx->attr_gencount = desc->attr_gencount;
+  	dir_ctx->page_index = desc->page_index;
++ 	dir_ctx->force_clear = force_clear;
+  	dir_ctx->eof = desc->eof;
+ -	dir_ctx->dtsize = desc->dtsize;
+  	memcpy(dir_ctx->verf, desc->verf, sizeof(dir_ctx->verf));
+  	spin_unlock(&file->f_lock);
+  out_free:
+diff --cc fs/nfs/nfstrace.h
+index ae23b6675585,59f4ca803fd0..000000000000
+--- a/fs/nfs/nfstrace.h
++++ b/fs/nfs/nfstrace.h
+@@@ -163,6 -160,9 +163,12 @@@ DEFINE_NFS_INODE_EVENT(nfs_fsync_enter)
+  DEFINE_NFS_INODE_EVENT_DONE(nfs_fsync_exit);
+  DEFINE_NFS_INODE_EVENT(nfs_access_enter);
+  DEFINE_NFS_INODE_EVENT_DONE(nfs_set_cache_invalid);
+++<<<<<<< HEAD
+++=======
++ DEFINE_NFS_INODE_EVENT(nfs_readdir_force_readdirplus);
++ DEFINE_NFS_INODE_EVENT_DONE(nfs_readdir_cache_fill_done);
++ DEFINE_NFS_INODE_EVENT_DONE(nfs_readdir_uncached_done);
+++>>>>>>> b0365ccb0712 (NFS: Fix up forced readdirplus)
+  
+  TRACE_EVENT(nfs_access_exit,
+  		TP_PROTO(
+diff --cc include/linux/nfs_fs.h
+index f07136abc22c,3893386ceaed..000000000000
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@@ -102,11 -104,14 +102,16 @@@ struct nfs_open_dir_context 
+  	unsigned long attr_gencount;
+  	__be32	verf[NFS_DIR_VERIFIER_SIZE];
+  	__u64 dir_cookie;
+ +	__u64 dup_cookie;
+  	__u64 last_cookie;
+  	pgoff_t page_index;
+++<<<<<<< HEAD
+ +	signed char duped;
+++=======
++ 	unsigned int dtsize;
++ 	bool force_clear;
+++>>>>>>> b0365ccb0712 (NFS: Fix up forced readdirplus)
+  	bool eof;
+ -	struct rcu_head rcu_head;
+  };
+  
+  /*
+* Unmerged path fs/nfs/dir.c
+* Unmerged path fs/nfs/nfstrace.h
+* Unmerged path include/linux/nfs_fs.h
