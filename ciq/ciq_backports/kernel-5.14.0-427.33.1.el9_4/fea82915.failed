@@ -1,0 +1,151 @@
+ice: don't check has_ready_bitmap in E810 functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-5.14.0-427.33.1.el9_4
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit fea82915fca626eaa83f36d8a23194e8593ef4b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.33.1.el9_4/fea82915.failed
+
+E810 hardware does not have a Tx timestamp ready bitmap. Don't check
+has_ready_bitmap in E810-specific functions.
+Add has_ready_bitmap check in ice_ptp_process_tx_tstamp() to stop
+relying on the fact that ice_get_phy_tx_tstamp_ready() returns all 1s.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Signed-off-by: Karol Kolacinski <karol.kolacinski@intel.com>
+	Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+	Tested-by: Pucha Himasekhar Reddy <himasekharx.reddy.pucha@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit fea82915fca626eaa83f36d8a23194e8593ef4b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_ptp.c
+diff --cc drivers/net/ethernet/intel/ice/ice_ptp.c
+index d864fbb8c3da,69d11dbda22c..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@@ -526,6 -525,115 +526,118 @@@ ice_ptp_is_tx_tracker_up(struct ice_ptp
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_ptp_req_tx_single_tstamp - Request Tx timestamp for a port from FW
++  * @tx: the PTP Tx timestamp tracker
++  * @idx: index of the timestamp to request
++  */
++ void ice_ptp_req_tx_single_tstamp(struct ice_ptp_tx *tx, u8 idx)
++ {
++ 	struct ice_ptp_port *ptp_port;
++ 	struct sk_buff *skb;
++ 	struct ice_pf *pf;
++ 
++ 	if (!tx->init)
++ 		return;
++ 
++ 	ptp_port = container_of(tx, struct ice_ptp_port, tx);
++ 	pf = ptp_port_to_pf(ptp_port);
++ 
++ 	/* Drop packets which have waited for more than 2 seconds */
++ 	if (time_is_before_jiffies(tx->tstamps[idx].start + 2 * HZ)) {
++ 		/* Count the number of Tx timestamps that timed out */
++ 		pf->ptp.tx_hwtstamp_timeouts++;
++ 
++ 		skb = tx->tstamps[idx].skb;
++ 		tx->tstamps[idx].skb = NULL;
++ 		clear_bit(idx, tx->in_use);
++ 
++ 		dev_kfree_skb_any(skb);
++ 		return;
++ 	}
++ 
++ 	ice_trace(tx_tstamp_fw_req, tx->tstamps[idx].skb, idx);
++ 
++ 	/* Write TS index to read to the PF register so the FW can read it */
++ 	wr32(&pf->hw, PF_SB_ATQBAL,
++ 	     TS_LL_READ_TS_INTR | FIELD_PREP(TS_LL_READ_TS_IDX, idx) |
++ 	     TS_LL_READ_TS);
++ 	tx->last_ll_ts_idx_read = idx;
++ }
++ 
++ /**
++  * ice_ptp_complete_tx_single_tstamp - Complete Tx timestamp for a port
++  * @tx: the PTP Tx timestamp tracker
++  */
++ void ice_ptp_complete_tx_single_tstamp(struct ice_ptp_tx *tx)
++ {
++ 	struct skb_shared_hwtstamps shhwtstamps = {};
++ 	u8 idx = tx->last_ll_ts_idx_read;
++ 	struct ice_ptp_port *ptp_port;
++ 	u64 raw_tstamp, tstamp;
++ 	bool drop_ts = false;
++ 	struct sk_buff *skb;
++ 	struct ice_pf *pf;
++ 	u32 val;
++ 
++ 	if (!tx->init || tx->last_ll_ts_idx_read < 0)
++ 		return;
++ 
++ 	ptp_port = container_of(tx, struct ice_ptp_port, tx);
++ 	pf = ptp_port_to_pf(ptp_port);
++ 
++ 	ice_trace(tx_tstamp_fw_done, tx->tstamps[idx].skb, idx);
++ 
++ 	val = rd32(&pf->hw, PF_SB_ATQBAL);
++ 
++ 	/* When the bit is cleared, the TS is ready in the register */
++ 	if (val & TS_LL_READ_TS) {
++ 		dev_err(ice_pf_to_dev(pf), "Failed to get the Tx tstamp - FW not ready");
++ 		return;
++ 	}
++ 
++ 	/* High 8 bit value of the TS is on the bits 16:23 */
++ 	raw_tstamp = FIELD_GET(TS_LL_READ_TS_HIGH, val);
++ 	raw_tstamp <<= 32;
++ 
++ 	/* Read the low 32 bit value */
++ 	raw_tstamp |= (u64)rd32(&pf->hw, PF_SB_ATQBAH);
++ 
++ 	/* Devices using this interface always verify the timestamp differs
++ 	 * relative to the last cached timestamp value.
++ 	 */
++ 	if (raw_tstamp == tx->tstamps[idx].cached_tstamp)
++ 		return;
++ 
++ 	tx->tstamps[idx].cached_tstamp = raw_tstamp;
++ 	clear_bit(idx, tx->in_use);
++ 	skb = tx->tstamps[idx].skb;
++ 	tx->tstamps[idx].skb = NULL;
++ 	if (test_and_clear_bit(idx, tx->stale))
++ 		drop_ts = true;
++ 
++ 	if (!skb)
++ 		return;
++ 
++ 	if (drop_ts) {
++ 		dev_kfree_skb_any(skb);
++ 		return;
++ 	}
++ 
++ 	/* Extend the timestamp using cached PHC time */
++ 	tstamp = ice_ptp_extend_40b_ts(pf, raw_tstamp);
++ 	if (tstamp) {
++ 		shhwtstamps.hwtstamp = ns_to_ktime(tstamp);
++ 		ice_trace(tx_tstamp_complete, skb, idx);
++ 	}
++ 
++ 	skb_tstamp_tx(skb, &shhwtstamps);
++ 	dev_kfree_skb_any(skb);
++ }
++ 
++ /**
+++>>>>>>> fea82915fca6 (ice: don't check has_ready_bitmap in E810 functions)
+   * ice_ptp_process_tx_tstamp - Process Tx timestamps for a port
+   * @tx: the PTP Tx timestamp tracker
+   *
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.c
