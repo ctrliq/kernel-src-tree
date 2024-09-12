@@ -3961,7 +3961,7 @@ void scheduler_tick(void)
 	struct task_struct *curr = rq->curr;
 	struct rq_flags rf;
 
-	if (housekeeping_cpu(cpu, HK_TYPE_TICK))
+	if (housekeeping_cpu(cpu, HK_FLAG_TICK))
 		arch_scale_freq_tick();
 
 	sched_clock_tick();
