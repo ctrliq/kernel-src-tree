@@ -1,0 +1,216 @@
+wifi: mac80211: expand ieee80211_mgmt_tx() for MLO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit e1e68b14c5f85f2ad43d06a1b2f0d0fcc8dbdd62
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/e1e68b14.failed
+
+There are a couple of new things that should be possible
+with MLO:
+ * selecting the link to transmit to a station by link ID,
+   which a previous patch added to the nl80211 API
+ * selecting the link by frequency, similarly
+ * allowing transmittion to an MLD without specifying any
+   channel or link ID, with MLD addresses
+
+Enable these use cases. Also fix the address comparison
+in client mode to use the AP (MLD) address.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit e1e68b14c5f85f2ad43d06a1b2f0d0fcc8dbdd62)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/offchannel.c
+diff --cc net/mac80211/offchannel.c
+index 09a1c2d722be,d78c82d6b696..000000000000
+--- a/net/mac80211/offchannel.c
++++ b/net/mac80211/offchannel.c
+@@@ -800,8 -804,13 +802,13 @@@ int ieee80211_mgmt_tx(struct wiphy *wip
+  	case NL80211_IFTYPE_P2P_GO:
+  		if (sdata->vif.type != NL80211_IFTYPE_ADHOC &&
+  		    !ieee80211_vif_is_mesh(&sdata->vif) &&
+ -		    !sdata->bss->active)
+ +		    !rcu_access_pointer(sdata->bss->beacon))
+  			need_offchan = true;
++ 
++ 		rcu_read_lock();
++ 		sta = sta_info_get_bss(sdata, mgmt->da);
++ 		mlo_sta = sta && sta->sta.mlo;
++ 
+  		if (!ieee80211_is_action(mgmt->frame_control) ||
+  		    mgmt->u.action.category == WLAN_CATEGORY_PUBLIC ||
+  		    mgmt->u.action.category == WLAN_CATEGORY_SELF_PROTECTED ||
+@@@ -819,8 -837,7 +835,12 @@@
+  		if (!sdata->u.mgd.associated ||
+  		    (params->offchan && params->wait &&
+  		     local->ops->remain_on_channel &&
+++<<<<<<< HEAD
+ +		     memcmp(sdata->u.mgd.bssid,
+ +			    mgmt->bssid, ETH_ALEN)))
+++=======
++ 		     memcmp(sdata->vif.cfg.ap_addr, mgmt->bssid, ETH_ALEN)))
+++>>>>>>> e1e68b14c5f8 (wifi: mac80211: expand ieee80211_mgmt_tx() for MLO)
+  			need_offchan = true;
+  		sdata_unlock(sdata);
+  		break;
+@@@ -855,7 -877,13 +877,17 @@@
+  			if (!chanctx_conf)
+  				continue;
+  
+++<<<<<<< HEAD
+ +			if (ether_addr_equal(sdata->vif.link_conf[i]->addr, mgmt->sa))
+++=======
++ 			if (mlo_sta && params->chan == chanctx_conf->def.chan &&
++ 			    ether_addr_equal(sdata->vif.addr, mgmt->sa)) {
++ 				link_id = i;
++ 				break;
++ 			}
++ 
++ 			if (ether_addr_equal(conf->addr, mgmt->sa))
+++>>>>>>> e1e68b14c5f8 (wifi: mac80211: expand ieee80211_mgmt_tx() for MLO)
+  				break;
+  
+  			chanctx_conf = NULL;
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index 52a92fd97dcc..491692a297f9 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -892,7 +892,9 @@ enum mac80211_tx_info_flags {
+  * @IEEE80211_TX_CTRL_MLO_LINK: If not @IEEE80211_LINK_UNSPECIFIED, this
+  *	frame should be transmitted on the specific link. This really is
+  *	only relevant for frames that do not have data present, and is
+- *	also not used for 802.3 format frames.
++ *	also not used for 802.3 format frames. Note that even if the frame
++ *	is on a specific link, address translation might still apply if
++ *	it's intended for an MLD.
+  *
+  * These flags are used in tx_info->control.flags.
+  */
+diff --git a/net/mac80211/agg-tx.c b/net/mac80211/agg-tx.c
+index 1deb3d874a4b..1e959333237d 100644
+--- a/net/mac80211/agg-tx.c
++++ b/net/mac80211/agg-tx.c
+@@ -106,7 +106,7 @@ static void ieee80211_send_addba_request(struct ieee80211_sub_if_data *sdata,
+ 	mgmt->u.action.u.addba_req.start_seq_num =
+ 					cpu_to_le16(start_seq_num << 4);
+ 
+-	ieee80211_tx_skb_tid(sdata, skb, tid);
++	ieee80211_tx_skb_tid(sdata, skb, tid, -1);
+ }
+ 
+ void ieee80211_send_bar(struct ieee80211_vif *vif, u8 *ra, u16 tid, u16 ssn)
+@@ -135,7 +135,7 @@ void ieee80211_send_bar(struct ieee80211_vif *vif, u8 *ra, u16 tid, u16 ssn)
+ 
+ 	IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_INTFL_DONT_ENCRYPT |
+ 					IEEE80211_TX_CTL_REQ_TX_STATUS;
+-	ieee80211_tx_skb_tid(sdata, skb, tid);
++	ieee80211_tx_skb_tid(sdata, skb, tid, -1);
+ }
+ EXPORT_SYMBOL(ieee80211_send_bar);
+ 
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 1d0fde5d1620..20e4b16b42ee 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -2220,7 +2220,7 @@ void ieee80211_xmit(struct ieee80211_sub_if_data *sdata,
+ 		    struct sta_info *sta, struct sk_buff *skb);
+ 
+ void __ieee80211_tx_skb_tid_band(struct ieee80211_sub_if_data *sdata,
+-				 struct sk_buff *skb, int tid,
++				 struct sk_buff *skb, int tid, int link_id,
+ 				 enum nl80211_band band);
+ 
+ /* sta_out needs to be checked for ERR_PTR() before using */
+@@ -2234,18 +2234,18 @@ ieee80211_tx_skb_tid_band(struct ieee80211_sub_if_data *sdata,
+ 			  enum nl80211_band band)
+ {
+ 	rcu_read_lock();
+-	__ieee80211_tx_skb_tid_band(sdata, skb, tid, band);
++	__ieee80211_tx_skb_tid_band(sdata, skb, tid, -1, band);
+ 	rcu_read_unlock();
+ }
+ 
+ void ieee80211_tx_skb_tid(struct ieee80211_sub_if_data *sdata,
+-			  struct sk_buff *skb, int tid);
++			  struct sk_buff *skb, int tid, int link_id);
+ 
+ static inline void ieee80211_tx_skb(struct ieee80211_sub_if_data *sdata,
+ 				    struct sk_buff *skb)
+ {
+ 	/* Send all internal mgmt frames on VO. Accordingly set TID to 7. */
+-	ieee80211_tx_skb_tid(sdata, skb, 7);
++	ieee80211_tx_skb_tid(sdata, skb, 7, -1);
+ }
+ 
+ /**
+* Unmerged path net/mac80211/offchannel.c
+diff --git a/net/mac80211/rx.c b/net/mac80211/rx.c
+index c8983c3c6c50..15ff04cbfcb3 100644
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -3727,7 +3727,7 @@ ieee80211_rx_h_action_return(struct ieee80211_rx_data *rx)
+ 					local->hw.offchannel_tx_hw_queue;
+ 		}
+ 
+-		__ieee80211_tx_skb_tid_band(rx->sdata, nskb, 7,
++		__ieee80211_tx_skb_tid_band(rx->sdata, nskb, 7, -1,
+ 					    status->band);
+ 	}
+ 	dev_kfree_skb(rx->skb);
+diff --git a/net/mac80211/tx.c b/net/mac80211/tx.c
+index 5e475e8597b4..26604e518aa2 100644
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -5724,7 +5724,7 @@ void ieee80211_unreserve_tid(struct ieee80211_sta *pubsta, u8 tid)
+ EXPORT_SYMBOL(ieee80211_unreserve_tid);
+ 
+ void __ieee80211_tx_skb_tid_band(struct ieee80211_sub_if_data *sdata,
+-				 struct sk_buff *skb, int tid,
++				 struct sk_buff *skb, int tid, int link_id,
+ 				 enum nl80211_band band)
+ {
+ 	const struct ieee80211_hdr *hdr = (void *)skb->data;
+@@ -5743,6 +5743,8 @@ void __ieee80211_tx_skb_tid_band(struct ieee80211_sub_if_data *sdata,
+ 
+ 	if (!sdata->vif.valid_links) {
+ 		link = 0;
++	} else if (link_id >= 0) {
++		link = link_id;
+ 	} else if (memcmp(sdata->vif.addr, hdr->addr2, ETH_ALEN) == 0) {
+ 		/* address from the MLD */
+ 		link = IEEE80211_LINK_UNSPECIFIED;
+@@ -5773,13 +5775,14 @@ void __ieee80211_tx_skb_tid_band(struct ieee80211_sub_if_data *sdata,
+ }
+ 
+ void ieee80211_tx_skb_tid(struct ieee80211_sub_if_data *sdata,
+-			  struct sk_buff *skb, int tid)
++			  struct sk_buff *skb, int tid, int link_id)
+ {
+ 	struct ieee80211_chanctx_conf *chanctx_conf;
+ 	enum nl80211_band band;
+ 
+ 	rcu_read_lock();
+ 	if (!sdata->vif.valid_links) {
++		WARN_ON(link_id >= 0);
+ 		chanctx_conf =
+ 			rcu_dereference(sdata->vif.bss_conf.chanctx_conf);
+ 		if (WARN_ON(!chanctx_conf)) {
+@@ -5789,11 +5792,13 @@ void ieee80211_tx_skb_tid(struct ieee80211_sub_if_data *sdata,
+ 		}
+ 		band = chanctx_conf->def.chan->band;
+ 	} else {
++		WARN_ON(link_id >= 0 &&
++			!(sdata->vif.valid_links & BIT(link_id)));
+ 		/* MLD transmissions must not rely on the band */
+ 		band = 0;
+ 	}
+ 
+-	__ieee80211_tx_skb_tid_band(sdata, skb, tid, band);
++	__ieee80211_tx_skb_tid_band(sdata, skb, tid, link_id, band);
+ 	rcu_read_unlock();
+ }
+ 
