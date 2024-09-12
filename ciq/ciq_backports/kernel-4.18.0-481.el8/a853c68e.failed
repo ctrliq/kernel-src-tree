@@ -1,0 +1,234 @@
+net: pcs: xpcs: export xpcs_do_config and xpcs_link_up
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-481.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit a853c68e29bb974ca0cc0a8eaf88c333217556aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-481.el8/a853c68e.failed
+
+The sja1105 hardware has a quirk in that some changes require a switch
+reset, which loses all configuration. When the reset is initiated,
+everything needs to be reprogrammed, including the MACs and the PCS.
+This is currently done in sja1105_static_config_reload() - we manually
+call sja1105_adjust_port_config(), sja1105_sgmii_pcs_config() and
+sja1105_sgmii_pcs_force_speed() which are all internal functions.
+
+There is a desire for sja1105 to use the common xpcs driver, and that
+means that the equivalents of those functions, xpcs_do_config() and
+xpcs_link_up() respectively, will no longer be local functions.
+
+Forcing phylink to retrigger a resolve somehow, say by doing dev_close()
+followed by dev_open() is not really an option, because the CPU port
+might have a PCS as well, and there is no net device which we can close
+and reopen for that. Additionally, the dev_close/dev_open sequence might
+force a renegotiation of the copper-side link for SGMII ports connected
+to a PHY, and this is undesirable as well, because the switch reset is
+much quicker than a PHY autoneg, so we would have a lot more downtime.
+
+The only solution I see is for the sja1105 driver to keep doing what
+it's doing, and that means we need to export the equivalents from xpcs
+for sja1105_sgmii_pcs_config and sja1105_sgmii_pcs_force_speed, and call
+them directly in sja1105_static_config_reload(). This will be done
+during the conversion patch.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a853c68e29bb974ca0cc0a8eaf88c333217556aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/pcs/pcs-xpcs.c
+#	include/linux/pcs/pcs-xpcs.h
+diff --cc drivers/net/pcs/pcs-xpcs.c
+index 5a3057094a72,63fda3fc40aa..000000000000
+--- a/drivers/net/pcs/pcs-xpcs.c
++++ b/drivers/net/pcs/pcs-xpcs.c
+@@@ -794,8 -735,30 +794,35 @@@ static int xpcs_config_aneg_c37_sgmii(s
+  	return xpcs_write(xpcs, MDIO_MMD_VEND2, DW_VR_MII_DIG_CTRL1, ret);
+  }
+  
+++<<<<<<< HEAD
+ +static int xpcs_config(struct mdio_xpcs_args *xpcs,
+ +		       const struct phylink_link_state *state)
+++=======
++ static int xpcs_config_2500basex(struct dw_xpcs *xpcs)
++ {
++ 	int ret;
++ 
++ 	ret = xpcs_read(xpcs, MDIO_MMD_VEND2, DW_VR_MII_DIG_CTRL1);
++ 	if (ret < 0)
++ 		return ret;
++ 	ret |= DW_VR_MII_DIG_CTRL1_2G5_EN;
++ 	ret &= ~DW_VR_MII_DIG_CTRL1_MAC_AUTO_SW;
++ 	ret = xpcs_write(xpcs, MDIO_MMD_VEND2, DW_VR_MII_DIG_CTRL1, ret);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	ret = xpcs_read(xpcs, MDIO_MMD_VEND2, DW_VR_MII_MMD_CTRL);
++ 	if (ret < 0)
++ 		return ret;
++ 	ret &= ~AN_CL37_EN;
++ 	ret |= SGMII_SPEED_SS6;
++ 	ret &= ~SGMII_SPEED_SS13;
++ 	return xpcs_write(xpcs, MDIO_MMD_VEND2, DW_VR_MII_MMD_CTRL, ret);
++ }
++ 
++ int xpcs_do_config(struct dw_xpcs *xpcs, phy_interface_t interface,
++ 		   unsigned int mode)
+++>>>>>>> a853c68e29bb (net: pcs: xpcs: export xpcs_do_config and xpcs_link_up)
+  {
+  	const struct xpcs_compat *compat;
+  	int ret;
+@@@ -821,10 -789,27 +848,11 @@@
+  		return -1;
+  	}
+  
+ -	if (compat->pma_config) {
+ -		ret = compat->pma_config(xpcs);
+ -		if (ret)
+ -			return ret;
+ -	}
+ -
+  	return 0;
+  }
++ EXPORT_SYMBOL_GPL(xpcs_do_config);
+  
+ -static int xpcs_config(struct phylink_pcs *pcs, unsigned int mode,
+ -		       phy_interface_t interface,
+ -		       const unsigned long *advertising,
+ -		       bool permit_pause_to_mac)
+ -{
+ -	struct dw_xpcs *xpcs = phylink_pcs_to_xpcs(pcs);
+ -
+ -	return xpcs_do_config(xpcs, interface, mode);
+ -}
+ -
+ -static int xpcs_get_state_c73(struct dw_xpcs *xpcs,
+ +static int xpcs_get_state_c73(struct mdio_xpcs_args *xpcs,
+  			      struct phylink_link_state *state,
+  			      const struct xpcs_compat *compat)
+  {
+@@@ -917,26 -906,59 +945,32 @@@ static int xpcs_get_state(struct mdio_x
+  		break;
+  	case DW_AN_C37_SGMII:
+  		ret = xpcs_get_state_c37_sgmii(xpcs, state);
+ -		if (ret) {
+ -			pr_err("xpcs_get_state_c37_sgmii returned %pe\n",
+ -			       ERR_PTR(ret));
+ -		}
+ -		break;
+ -	default:
+ -		return;
+ -	}
+ -}
+ -
+ -static void xpcs_link_up_sgmii(struct dw_xpcs *xpcs, unsigned int mode,
+ -			       int speed, int duplex)
+ -{
+ -	int val, ret;
+ -
+ -	if (phylink_autoneg_inband(mode))
+ -		return;
+ -
+ -	switch (speed) {
+ -	case SPEED_1000:
+ -		val = BMCR_SPEED1000;
+ -		break;
+ -	case SPEED_100:
+ -		val = BMCR_SPEED100;
+ -		break;
+ -	case SPEED_10:
+ -		val = BMCR_SPEED10;
+ +		if (ret)
+ +			return ret;
+  		break;
+  	default:
+ -		return;
+ +		return -1;
+  	}
+  
+ -	if (duplex == DUPLEX_FULL)
+ -		val |= BMCR_FULLDPLX;
+ -
+ -	ret = xpcs_write(xpcs, MDIO_MMD_VEND2, MDIO_CTRL1, val);
+ -	if (ret)
+ -		pr_err("%s: xpcs_write returned %pe\n", __func__, ERR_PTR(ret));
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int xpcs_link_up(struct mdio_xpcs_args *xpcs, int speed,
+ +			phy_interface_t interface)
+++=======
++ void xpcs_link_up(struct phylink_pcs *pcs, unsigned int mode,
++ 		  phy_interface_t interface, int speed, int duplex)
+++>>>>>>> a853c68e29bb (net: pcs: xpcs: export xpcs_do_config and xpcs_link_up)
+  {
+ -	struct dw_xpcs *xpcs = phylink_pcs_to_xpcs(pcs);
+ -
+  	if (interface == PHY_INTERFACE_MODE_USXGMII)
+  		return xpcs_config_usxgmii(xpcs, speed);
+ -	if (interface == PHY_INTERFACE_MODE_SGMII)
+ -		return xpcs_link_up_sgmii(xpcs, mode, speed, duplex);
+ +
+ +	return 0;
+  }
++ EXPORT_SYMBOL_GPL(xpcs_link_up);
+  
+ -static u32 xpcs_get_id(struct dw_xpcs *xpcs)
+ +static u32 xpcs_get_id(struct mdio_xpcs_args *xpcs)
+  {
+  	int ret;
+  	u32 id;
+diff --cc include/linux/pcs/pcs-xpcs.h
+index 57a199393d63,add077a81b21..000000000000
+--- a/include/linux/pcs/pcs-xpcs.h
++++ b/include/linux/pcs/pcs-xpcs.h
+@@@ -16,28 -19,24 +16,37 @@@
+  
+  struct xpcs_id;
+  
+ -struct dw_xpcs {
+ +struct mdio_xpcs_args {
+  	struct mdio_device *mdiodev;
+  	const struct xpcs_id *id;
+ -	struct phylink_pcs pcs;
+  };
+  
+++<<<<<<< HEAD
+ +struct mdio_xpcs_ops {
+ +	int (*config)(struct mdio_xpcs_args *xpcs,
+ +		      const struct phylink_link_state *state);
+ +	int (*get_state)(struct mdio_xpcs_args *xpcs,
+ +			 struct phylink_link_state *state);
+ +	int (*link_up)(struct mdio_xpcs_args *xpcs, int speed,
+ +		       phy_interface_t interface);
+ +};
+ +
+ +int xpcs_get_an_mode(struct mdio_xpcs_args *xpcs, phy_interface_t interface);
+ +struct mdio_xpcs_ops *mdio_xpcs_get_ops(void);
+ +void xpcs_validate(struct mdio_xpcs_args *xpcs, unsigned long *supported,
+++=======
++ int xpcs_get_an_mode(struct dw_xpcs *xpcs, phy_interface_t interface);
++ void xpcs_link_up(struct phylink_pcs *pcs, unsigned int mode,
++ 		  phy_interface_t interface, int speed, int duplex);
++ int xpcs_do_config(struct dw_xpcs *xpcs, phy_interface_t interface,
++ 		   unsigned int mode);
++ void xpcs_validate(struct dw_xpcs *xpcs, unsigned long *supported,
+++>>>>>>> a853c68e29bb (net: pcs: xpcs: export xpcs_do_config and xpcs_link_up)
+  		   struct phylink_link_state *state);
+ -int xpcs_config_eee(struct dw_xpcs *xpcs, int mult_fact_100ns,
+ +int xpcs_config_eee(struct mdio_xpcs_args *xpcs, int mult_fact_100ns,
+  		    int enable);
+ -struct dw_xpcs *xpcs_create(struct mdio_device *mdiodev,
+ -			    phy_interface_t interface);
+ -void xpcs_destroy(struct dw_xpcs *xpcs);
+ +struct mdio_xpcs_args *xpcs_create(struct mdio_device *mdiodev,
+ +				   phy_interface_t interface);
+ +void xpcs_destroy(struct mdio_xpcs_args *xpcs);
+  
+  #endif /* __LINUX_PCS_XPCS_H */
+* Unmerged path drivers/net/pcs/pcs-xpcs.c
+* Unmerged path include/linux/pcs/pcs-xpcs.h
