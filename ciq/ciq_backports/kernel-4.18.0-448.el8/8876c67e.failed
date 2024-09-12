@@ -1,0 +1,227 @@
+wifi: nl80211: require MLD address on link STA add/modify
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 8876c67e6296b44c283cd748d4888788af3f7942
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/8876c67e.failed
+
+We always need the MLD address and link ID to add or
+modify the link STA, so require it in the API.
+
+Fixes: 577e5b8c3924 ("wifi: cfg80211: add API to add/modify/remove a link station")
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 8876c67e6296b44c283cd748d4888788af3f7942)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/wireless/nl80211.c
+diff --cc net/wireless/nl80211.c
+index 58cddd48e85e,310d22b263d1..000000000000
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@@ -15403,6 -15750,198 +15403,201 @@@ static int nl80211_set_fils_aad(struct 
+  	return rdev_set_fils_aad(rdev, dev, &fils_aad);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nl80211_add_link(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct cfg80211_registered_device *rdev = info->user_ptr[0];
++ 	unsigned int link_id = nl80211_link_id(info->attrs);
++ 	struct net_device *dev = info->user_ptr[1];
++ 	struct wireless_dev *wdev = dev->ieee80211_ptr;
++ 	int ret;
++ 
++ 	if (!(wdev->wiphy->flags & WIPHY_FLAG_SUPPORTS_MLO))
++ 		return -EINVAL;
++ 
++ 	switch (wdev->iftype) {
++ 	case NL80211_IFTYPE_AP:
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!info->attrs[NL80211_ATTR_MAC] ||
++ 	    !is_valid_ether_addr(nla_data(info->attrs[NL80211_ATTR_MAC])))
++ 		return -EINVAL;
++ 
++ 	wdev_lock(wdev);
++ 	wdev->valid_links |= BIT(link_id);
++ 	ether_addr_copy(wdev->links[link_id].addr,
++ 			nla_data(info->attrs[NL80211_ATTR_MAC]));
++ 
++ 	ret = rdev_add_intf_link(rdev, wdev, link_id);
++ 	if (ret) {
++ 		wdev->valid_links &= ~BIT(link_id);
++ 		eth_zero_addr(wdev->links[link_id].addr);
++ 	}
++ 	wdev_unlock(wdev);
++ 
++ 	return ret;
++ }
++ 
++ static int nl80211_remove_link(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	unsigned int link_id = nl80211_link_id(info->attrs);
++ 	struct net_device *dev = info->user_ptr[1];
++ 	struct wireless_dev *wdev = dev->ieee80211_ptr;
++ 
++ 	/* cannot remove if there's no link */
++ 	if (!info->attrs[NL80211_ATTR_MLO_LINK_ID])
++ 		return -EINVAL;
++ 
++ 	switch (wdev->iftype) {
++ 	case NL80211_IFTYPE_AP:
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	wdev_lock(wdev);
++ 	cfg80211_remove_link(wdev, link_id);
++ 	wdev_unlock(wdev);
++ 
++ 	return 0;
++ }
++ 
++ static int
++ nl80211_add_mod_link_station(struct sk_buff *skb, struct genl_info *info,
++ 			     bool add)
++ {
++ 	struct link_station_parameters params = {};
++ 	struct cfg80211_registered_device *rdev = info->user_ptr[0];
++ 	struct net_device *dev = info->user_ptr[1];
++ 	int err;
++ 
++ 	if ((add && !rdev->ops->add_link_station) ||
++ 	    (!add && !rdev->ops->mod_link_station))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (add && !info->attrs[NL80211_ATTR_MAC])
++ 		return -EINVAL;
++ 
++ 	if (!info->attrs[NL80211_ATTR_MLD_ADDR])
++ 		return -EINVAL;
++ 
++ 	if (add && !info->attrs[NL80211_ATTR_STA_SUPPORTED_RATES])
++ 		return -EINVAL;
++ 
++ 	params.mld_mac = nla_data(info->attrs[NL80211_ATTR_MLD_ADDR]);
++ 
++ 	if (info->attrs[NL80211_ATTR_MAC]) {
++ 		params.link_mac = nla_data(info->attrs[NL80211_ATTR_MAC]);
++ 		if (!is_valid_ether_addr(params.link_mac))
++ 			return -EINVAL;
++ 	}
++ 
++ 	if (!info->attrs[NL80211_ATTR_MLO_LINK_ID])
++ 		return -EINVAL;
++ 
++ 	params.link_id = nla_get_u8(info->attrs[NL80211_ATTR_MLO_LINK_ID]);
++ 
++ 	if (info->attrs[NL80211_ATTR_STA_SUPPORTED_RATES]) {
++ 		params.supported_rates =
++ 			nla_data(info->attrs[NL80211_ATTR_STA_SUPPORTED_RATES]);
++ 		params.supported_rates_len =
++ 			nla_len(info->attrs[NL80211_ATTR_STA_SUPPORTED_RATES]);
++ 	}
++ 
++ 	if (info->attrs[NL80211_ATTR_HT_CAPABILITY])
++ 		params.ht_capa =
++ 			nla_data(info->attrs[NL80211_ATTR_HT_CAPABILITY]);
++ 
++ 	if (info->attrs[NL80211_ATTR_VHT_CAPABILITY])
++ 		params.vht_capa =
++ 			nla_data(info->attrs[NL80211_ATTR_VHT_CAPABILITY]);
++ 
++ 	if (info->attrs[NL80211_ATTR_HE_CAPABILITY]) {
++ 		params.he_capa =
++ 			nla_data(info->attrs[NL80211_ATTR_HE_CAPABILITY]);
++ 		params.he_capa_len =
++ 			nla_len(info->attrs[NL80211_ATTR_HE_CAPABILITY]);
++ 
++ 		if (info->attrs[NL80211_ATTR_EHT_CAPABILITY]) {
++ 			params.eht_capa =
++ 				nla_data(info->attrs[NL80211_ATTR_EHT_CAPABILITY]);
++ 			params.eht_capa_len =
++ 				nla_len(info->attrs[NL80211_ATTR_EHT_CAPABILITY]);
++ 
++ 			if (!ieee80211_eht_capa_size_ok((const u8 *)params.he_capa,
++ 							(const u8 *)params.eht_capa,
++ 							params.eht_capa_len))
++ 				return -EINVAL;
++ 		}
++ 	}
++ 
++ 	if (info->attrs[NL80211_ATTR_HE_6GHZ_CAPABILITY])
++ 		params.he_6ghz_capa =
++ 			nla_data(info->attrs[NL80211_ATTR_HE_6GHZ_CAPABILITY]);
++ 
++ 	if (info->attrs[NL80211_ATTR_OPMODE_NOTIF]) {
++ 		params.opmode_notif_used = true;
++ 		params.opmode_notif =
++ 			nla_get_u8(info->attrs[NL80211_ATTR_OPMODE_NOTIF]);
++ 	}
++ 
++ 	err = nl80211_parse_sta_txpower_setting(info, &params.txpwr,
++ 						&params.txpwr_set);
++ 	if (err)
++ 		return err;
++ 
++ 	wdev_lock(dev->ieee80211_ptr);
++ 	if (add)
++ 		err = rdev_add_link_station(rdev, dev, &params);
++ 	else
++ 		err = rdev_mod_link_station(rdev, dev, &params);
++ 	wdev_unlock(dev->ieee80211_ptr);
++ 
++ 	return err;
++ }
++ 
++ static int
++ nl80211_add_link_station(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	return nl80211_add_mod_link_station(skb, info, true);
++ }
++ 
++ static int
++ nl80211_modify_link_station(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	return nl80211_add_mod_link_station(skb, info, false);
++ }
++ 
++ static int
++ nl80211_remove_link_station(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct link_station_del_parameters params = {};
++ 	struct cfg80211_registered_device *rdev = info->user_ptr[0];
++ 	struct net_device *dev = info->user_ptr[1];
++ 	int ret;
++ 
++ 	if (!rdev->ops->del_link_station)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (!info->attrs[NL80211_ATTR_MLD_ADDR] ||
++ 	    !info->attrs[NL80211_ATTR_MLO_LINK_ID])
++ 		return -EINVAL;
++ 
++ 	params.mld_mac = nla_data(info->attrs[NL80211_ATTR_MLD_ADDR]);
++ 	params.link_id = nla_get_u8(info->attrs[NL80211_ATTR_MLO_LINK_ID]);
++ 
++ 	wdev_lock(dev->ieee80211_ptr);
++ 	ret = rdev_del_link_station(rdev, dev, &params);
++ 	wdev_unlock(dev->ieee80211_ptr);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 8876c67e6296 (wifi: nl80211: require MLD address on link STA add/modify)
+  #define NL80211_FLAG_NEED_WIPHY		0x01
+  #define NL80211_FLAG_NEED_NETDEV	0x02
+  #define NL80211_FLAG_NEED_RTNL		0x04
+* Unmerged path net/wireless/nl80211.c
