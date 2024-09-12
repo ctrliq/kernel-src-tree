@@ -1,0 +1,115 @@
+net: tls: factor out tls_*crypt_async_wait()
+
+jira LE-1907
+cve CVE-2024-26583
+Rebuild_History Non-Buildable kernel-5.14.0-427.16.1.el9_4
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit c57ca512f3b68ddcd62bda9cc24a8f5584ab01b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.16.1.el9_4/c57ca512.failed
+
+Factor out waiting for async encrypt and decrypt to finish.
+There are already multiple copies and a subsequent fix will
+need more. No functional changes.
+
+Note that crypto_wait_req() returns wait->err
+
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+	Reviewed-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c57ca512f3b68ddcd62bda9cc24a8f5584ab01b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tls/tls_sw.c
+diff --cc net/tls/tls_sw.c
+index 4c918094226a,6a73714f34cc..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -938,12 -1020,7 +974,11 @@@ int tls_sw_sendmsg(struct sock *sk, str
+  	int num_zc = 0;
+  	int orig_size;
+  	int ret = 0;
+- 	int pending;
+  
+ +	if (msg->msg_flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL |
+ +			       MSG_EOR | MSG_CMSG_COMPAT))
+ +		return -EOPNOTSUPP;
+ +
+  	if (!eor && (msg->msg_flags & MSG_EOR))
+  		return -EINVAL;
+  
+@@@ -1296,6 -1239,67 +1319,70 @@@ int tls_sw_sendpage(struct sock *sk, st
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Handle unexpected EOF during splice without SPLICE_F_MORE set.
++  */
++ void tls_sw_splice_eof(struct socket *sock)
++ {
++ 	struct sock *sk = sock->sk;
++ 	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
++ 	struct tls_rec *rec;
++ 	struct sk_msg *msg_pl;
++ 	ssize_t copied = 0;
++ 	bool retrying = false;
++ 	int ret = 0;
++ 
++ 	if (!ctx->open_rec)
++ 		return;
++ 
++ 	mutex_lock(&tls_ctx->tx_lock);
++ 	lock_sock(sk);
++ 
++ retry:
++ 	/* same checks as in tls_sw_push_pending_record() */
++ 	rec = ctx->open_rec;
++ 	if (!rec)
++ 		goto unlock;
++ 
++ 	msg_pl = &rec->msg_plaintext;
++ 	if (msg_pl->sg.size == 0)
++ 		goto unlock;
++ 
++ 	/* Check the BPF advisor and perform transmission. */
++ 	ret = bpf_exec_tx_verdict(msg_pl, sk, false, TLS_RECORD_TYPE_DATA,
++ 				  &copied, 0);
++ 	switch (ret) {
++ 	case 0:
++ 	case -EAGAIN:
++ 		if (retrying)
++ 			goto unlock;
++ 		retrying = true;
++ 		goto retry;
++ 	case -EINPROGRESS:
++ 		break;
++ 	default:
++ 		goto unlock;
++ 	}
++ 
++ 	/* Wait for pending encryptions to get completed */
++ 	if (tls_encrypt_async_wait(ctx))
++ 		goto unlock;
++ 
++ 	/* Transmit if any encryptions have completed */
++ 	if (test_and_clear_bit(BIT_TX_SCHEDULED, &ctx->tx_bitmask)) {
++ 		cancel_delayed_work(&ctx->tx_work.work);
++ 		tls_tx_records(sk, 0);
++ 	}
++ 
++ unlock:
++ 	release_sock(sk);
++ 	mutex_unlock(&tls_ctx->tx_lock);
++ }
++ 
+++>>>>>>> c57ca512f3b6 (net: tls: factor out tls_*crypt_async_wait())
+  static int
+  tls_rx_rec_wait(struct sock *sk, struct sk_psock *psock, bool nonblock,
+  		bool released)
+* Unmerged path net/tls/tls_sw.c
