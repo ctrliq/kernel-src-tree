@@ -1,0 +1,96 @@
+xfs: use byte ranges for write cleanup ranges
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-477.21.1.el8_8
+commit-author Dave Chinner <dchinner@redhat.com>
+commit b71f889c18ada210a97aa3eb5e00c0de552234c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-477.21.1.el8_8/b71f889c.failed
+
+xfs_buffered_write_iomap_end() currently converts the byte ranges
+passed to it to filesystem blocks to pass them to the bmap code to
+punch out delalloc blocks, but then has to convert filesytem
+blocks back to byte ranges for page cache truncate.
+
+We're about to make the page cache truncate go away and replace it
+with a page cache walk, so having to convert everything to/from/to
+filesystem blocks is messy and error-prone. It is much easier to
+pass around byte ranges and convert to page indexes and/or
+filesystem blocks only where those units are needed.
+
+In preparation for the page cache walk being added, add a helper
+that converts byte ranges to filesystem blocks and calls
+xfs_bmap_punch_delalloc_range() and convert
+xfs_buffered_write_iomap_end() to calculate limits in byte ranges.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit b71f889c18ada210a97aa3eb5e00c0de552234c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_iomap.c
+diff --cc fs/xfs/xfs_iomap.c
+index d8cd2583dedb,7bb55dbc19d3..000000000000
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@@ -1108,32 -1170,30 +1121,50 @@@ xfs_buffered_write_iomap_end
+  	 * the range.
+  	 */
+  	if (unlikely(!written))
+- 		start_fsb = XFS_B_TO_FSBT(mp, offset);
++ 		start_byte = round_down(offset, mp->m_sb.sb_blocksize);
+  	else
+- 		start_fsb = XFS_B_TO_FSB(mp, offset + written);
+- 	end_fsb = XFS_B_TO_FSB(mp, offset + length);
++ 		start_byte = round_up(offset + written, mp->m_sb.sb_blocksize);
++ 	end_byte = round_up(offset + length, mp->m_sb.sb_blocksize);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Nothing to do if we've written the entire delalloc extent */
++ 	if (start_byte >= end_byte)
++ 		return 0;
++ 
+++>>>>>>> b71f889c18ad (xfs: use byte ranges for write cleanup ranges)
+  	/*
+ -	 * Lock the mapping to avoid races with page faults re-instantiating
+ -	 * folios and dirtying them via ->page_mkwrite between the page cache
+ -	 * truncation and the delalloc extent removal. Failing to do this can
+ -	 * leave dirty pages with no space reservation in the cache.
+ +	 * Trim delalloc blocks if they were allocated by this write and we
+ +	 * didn't manage to write the whole range.
+ +	 *
+ +	 * We don't need to care about racing delalloc as we hold i_mutex
+ +	 * across the reserve/allocate/unreserve calls. If there are delalloc
+ +	 * blocks in the range, they are ours.
+  	 */
+++<<<<<<< HEAD
+ +	if ((iomap->flags & IOMAP_F_NEW) && start_fsb < end_fsb) {
+ +		truncate_pagecache_range(VFS_I(ip), XFS_FSB_TO_B(mp, start_fsb),
+ +					 XFS_FSB_TO_B(mp, end_fsb) - 1);
+ +
+ +		error = xfs_bmap_punch_delalloc_range(ip, start_fsb,
+ +					       end_fsb - start_fsb);
+ +		if (error && !XFS_FORCED_SHUTDOWN(mp)) {
+ +			xfs_alert(mp, "%s: unable to clean up ino %lld",
+ +				__func__, ip->i_ino);
+ +			return error;
+ +		}
+++=======
++ 	filemap_invalidate_lock(inode->i_mapping);
++ 	truncate_pagecache_range(inode, start_byte, end_byte - 1);
++ 	error = xfs_buffered_write_delalloc_punch(inode, start_byte, end_byte);
++ 	filemap_invalidate_unlock(inode->i_mapping);
++ 	if (error && !xfs_is_shutdown(mp)) {
++ 		xfs_alert(mp, "%s: unable to clean up ino 0x%llx",
++ 			__func__, XFS_I(inode)->i_ino);
++ 		return error;
+++>>>>>>> b71f889c18ad (xfs: use byte ranges for write cleanup ranges)
+  	}
+ +
+  	return 0;
+  }
+  
+* Unmerged path fs/xfs/xfs_iomap.c
