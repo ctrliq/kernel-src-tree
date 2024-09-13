@@ -443,6 +443,18 @@ void kernel_fpu_end(void)
 }
 EXPORT_SYMBOL_GPL(kernel_fpu_end);
 
+void kernel_fpu_resched(void)
+{
+	WARN_ON_FPU(!this_cpu_read(in_kernel_fpu));
+
+	if (should_resched(PREEMPT_OFFSET)) {
+		kernel_fpu_end();
+		cond_resched();
+		kernel_fpu_begin();
+	}
+}
+EXPORT_SYMBOL_GPL(kernel_fpu_resched);
+
 /*
  * Sync the FPU register state to current's memory register state when the
  * current task owns the FPU. The hardware register state is preserved.
@@ -839,4 +851,18 @@ int fpu__exception_code(struct fpu *fpu, int trap_nr)
 	 * we get a spurious trap, which is not an error.
 	 */
 	return 0;
+}
+
+/*
+ * Initialize register state that may prevent from entering low-power idle.
+ * This function will be invoked from the cpuidle driver only when needed.
+ */
+void fpu_idle_fpregs(void)
+{
+	/* Note: AMX_TILE being enabled implies XGETBV1 support */
+	if (cpu_feature_enabled(X86_FEATURE_AMX_TILE) &&
+	    (xfeatures_in_use() & XFEATURE_MASK_XTILE)) {
+		tile_release();
+		fpregs_deactivate(&current->thread.fpu);
+	}
 }

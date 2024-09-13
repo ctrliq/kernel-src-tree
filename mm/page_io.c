@@ -26,6 +26,7 @@
 #include <linux/uio.h>
 #include <linux/sched/task.h>
 #include <asm/pgtable.h>
+#include <linux/delayacct.h>
 
 static struct bio *get_swap_bio(gfp_t gfp_flags,
 				struct page *page, bio_end_io_t end_io)
@@ -377,18 +378,21 @@ int swap_readpage(struct page *page, bool synchronous)
 	struct gendisk *disk;
 	bool workingset = PageWorkingset(page);
 	unsigned long pflags;
+	bool in_thrashing;
 
 	VM_BUG_ON_PAGE(!PageSwapCache(page) && !synchronous, page);
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
 	VM_BUG_ON_PAGE(PageUptodate(page), page);
 
 	/*
-	 * Count submission time as memory stall. When the device is congested,
-	 * or the submitting cgroup IO-throttled, submission can be a
-	 * significant part of overall IO time.
+	 * Count submission time as memory stall and delay. When the device
+	 * is congested, or the submitting cgroup IO-throttled, submission
+	 * can be a significant part of overall IO time.
 	 */
-	if (workingset)
+	if (workingset) {
+		delayacct_thrashing_start(&in_thrashing);
 		psi_memstall_enter(&pflags);
+	}
 
 	if (frontswap_load(page) == 0) {
 		SetPageUptodate(page);
@@ -452,8 +456,10 @@ int swap_readpage(struct page *page, bool synchronous)
 	bio_put(bio);
 
 out:
-	if (workingset)
+	if (workingset) {
+		delayacct_thrashing_end(&in_thrashing);
 		psi_memstall_leave(&pflags);
+	}
 	return ret;
 }
 

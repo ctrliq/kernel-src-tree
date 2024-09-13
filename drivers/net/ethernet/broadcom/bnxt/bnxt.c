@@ -55,7 +55,6 @@
 #include <linux/hwmon.h>
 #include <linux/hwmon-sysfs.h>
 #include <net/page_pool.h>
-#include <linux/align.h>
 
 #include "bnxt_hsi.h"
 #include "bnxt.h"
@@ -976,7 +975,7 @@ static struct sk_buff *bnxt_rx_page_skb(struct bnxt *bp,
 {
 	unsigned int payload = offset_and_len >> 16;
 	unsigned int len = offset_and_len & 0xffff;
-	struct skb_frag_struct *frag;
+	skb_frag_t *frag;
 	struct page *page = data;
 	u16 prod = rxr->rx_prod;
 	struct sk_buff *skb;
@@ -1008,7 +1007,7 @@ static struct sk_buff *bnxt_rx_page_skb(struct bnxt *bp,
 
 	frag = &skb_shinfo(skb)->frags[0];
 	skb_frag_size_sub(frag, payload);
-	frag->page_offset += payload;
+	skb_frag_off_add(frag, payload);
 	skb->data_len -= payload;
 	skb->tail += payload;
 
@@ -1864,13 +1863,13 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
 	dma_addr = rx_buf->mapping;
 
 	if (bnxt_xdp_attached(bp, rxr)) {
-		bnxt_xdp_buff_init(bp, rxr, cons, &data_ptr, &len, &xdp);
+		bnxt_xdp_buff_init(bp, rxr, cons, data_ptr, len, &xdp);
 		xdp_active = true;
 	}
 
 	/* skip running XDP prog if there are aggregation bufs */
 	if (!agg_bufs && xdp_active) {
-		if (bnxt_rx_xdp(bp, rxr, cons, xdp, data, &len, event)) {
+		if (bnxt_rx_xdp(bp, rxr, cons, xdp, data, &data_ptr, &len, event)) {
 			rc = 1;
 			goto next_rx;
 		}
@@ -2052,7 +2051,7 @@ u32 bnxt_fw_health_readl(struct bnxt *bp, int reg_idx)
 		break;
 	case BNXT_FW_HEALTH_REG_TYPE_GRC:
 		reg_off = fw_health->mapped_regs[reg_idx];
-		/* fall through */
+		fallthrough;
 	case BNXT_FW_HEALTH_REG_TYPE_BAR0:
 		val = readl(bp->bar0 + reg_off);
 		break;
@@ -2154,11 +2153,11 @@ static int bnxt_async_event_process(struct bnxt *bp,
 		}
 		set_bit(BNXT_LINK_SPEED_CHNG_SP_EVENT, &bp->sp_event);
 	}
-	/* fall through */
+		fallthrough;
 	case ASYNC_EVENT_CMPL_EVENT_ID_LINK_SPEED_CHANGE:
 	case ASYNC_EVENT_CMPL_EVENT_ID_PORT_PHY_CFG_CHANGE:
 		set_bit(BNXT_LINK_CFG_CHANGE_SP_EVENT, &bp->sp_event);
-		/* fall through */
+		fallthrough;
 	case ASYNC_EVENT_CMPL_EVENT_ID_LINK_STATUS_CHANGE:
 		set_bit(BNXT_LINK_CHNG_SP_EVENT, &bp->sp_event);
 		break;
@@ -3297,8 +3296,6 @@ static int bnxt_alloc_tx_rings(struct bnxt *bp)
 			mapping = txr->tx_push_mapping +
 				sizeof(struct tx_push_bd);
 			txr->data_mapping = cpu_to_le64(mapping);
-
-			memset(txr->tx_push, 0, sizeof(struct tx_push_bd));
 		}
 		qidx = bp->tc_to_qidx[j];
 		ring->queue_id = bp->q_info[qidx].queue_id;
@@ -3885,8 +3882,10 @@ void bnxt_set_ring_params(struct bnxt *bp)
 		bp->rx_agg_ring_mask = (bp->rx_agg_nr_pages * RX_DESC_CNT) - 1;
 
 		if (BNXT_RX_PAGE_MODE(bp)) {
-			rx_space = BNXT_PAGE_MODE_BUF_SIZE;
-			rx_size = BNXT_MAX_PAGE_MODE_MTU;
+			rx_space = PAGE_SIZE;
+			rx_size = PAGE_SIZE -
+				  ALIGN(max(NET_SKB_PAD, XDP_PACKET_HEADROOM), 8) -
+				  SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
 		} else {
 			rx_size = SKB_DATA_ALIGN(BNXT_RX_COPY_THRESH + NET_IP_ALIGN);
 			rx_space = rx_size + NET_SKB_PAD +
@@ -4944,7 +4943,7 @@ static int bnxt_hwrm_cfa_ntuple_filter_alloc(struct bnxt *bp,
 #endif
 
 static int bnxt_hwrm_set_vnic_filter(struct bnxt *bp, u16 vnic_id, u16 idx,
-				     u8 *mac_addr)
+				     const u8 *mac_addr)
 {
 	struct hwrm_cfa_l2_filter_alloc_output *resp;
 	struct hwrm_cfa_l2_filter_alloc_input *req;
@@ -9280,16 +9279,16 @@ static void bnxt_init_napi(struct bnxt *bp)
 			cp_nr_rings--;
 		for (i = 0; i < cp_nr_rings; i++) {
 			bnapi = bp->bnapi[i];
-			netif_napi_add(bp->dev, &bnapi->napi, poll_fn, 64);
+			netif_napi_add(bp->dev, &bnapi->napi, poll_fn);
 		}
 		if (BNXT_CHIP_TYPE_NITRO_A0(bp)) {
 			bnapi = bp->bnapi[cp_nr_rings];
 			netif_napi_add(bp->dev, &bnapi->napi,
-				       bnxt_poll_nitroa0, 64);
+				       bnxt_poll_nitroa0);
 		}
 	} else {
 		bnapi = bp->bnapi[0];
-		netif_napi_add(bp->dev, &bnapi->napi, bnxt_poll, 64);
+		netif_napi_add(bp->dev, &bnapi->napi, bnxt_poll);
 	}
 }
 
@@ -10698,7 +10697,7 @@ static int bnxt_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	case SIOCGMIIPHY:
 		mdio->phy_id = bp->link_info.phy_addr;
 
-		/* fallthru */
+		fallthrough;
 	case SIOCGMIIREG: {
 		u16 mii_regval = 0;
 
@@ -12242,7 +12241,7 @@ static void bnxt_fw_reset_writel(struct bnxt *bp, int reg_idx)
 		writel(reg_off & BNXT_GRC_BASE_MASK,
 		       bp->bar0 + BNXT_GRCPF_REG_WINDOW_BASE_OUT + 4);
 		reg_off = (reg_off & BNXT_GRC_OFFSET_MASK) + 0x2000;
-		/* fall through */
+		fallthrough;
 	case BNXT_FW_HEALTH_REG_TYPE_BAR0:
 		writel(val, bp->bar0 + reg_off);
 		break;
@@ -12394,7 +12393,7 @@ static void bnxt_fw_reset_task(struct work_struct *work)
 		}
 		bp->fw_reset_state = BNXT_FW_RESET_STATE_RESET_FW;
 	}
-	/* fall through */
+		fallthrough;
 	case BNXT_FW_RESET_STATE_RESET_FW:
 		bnxt_reset_all(bp);
 		bp->fw_reset_state = BNXT_FW_RESET_STATE_ENABLE_DEV;
@@ -12429,7 +12428,7 @@ static void bnxt_fw_reset_task(struct work_struct *work)
 		}
 		pci_set_master(bp->pdev);
 		bp->fw_reset_state = BNXT_FW_RESET_STATE_POLL_FW;
-		/* fall through */
+		fallthrough;
 	case BNXT_FW_RESET_STATE_POLL_FW:
 		bp->hwrm_cmd_timeout = SHORT_HWRM_CMD_TIMEOUT;
 		rc = bnxt_hwrm_poll(bp);
@@ -12443,7 +12442,7 @@ static void bnxt_fw_reset_task(struct work_struct *work)
 		}
 		bp->hwrm_cmd_timeout = DFLT_HWRM_CMD_TIMEOUT;
 		bp->fw_reset_state = BNXT_FW_RESET_STATE_OPENING;
-		/* fall through */
+		fallthrough;
 	case BNXT_FW_RESET_STATE_OPENING:
 		while (!rtnl_trylock()) {
 			bnxt_queue_fw_reset_work(bp, HZ / 10);
@@ -12600,7 +12599,7 @@ static int bnxt_change_mac_addr(struct net_device *dev, void *p)
 	if (rc)
 		return rc;
 
-	memcpy(dev->dev_addr, addr->sa_data, dev->addr_len);
+	eth_hw_addr_set(dev, addr->sa_data);
 	if (netif_running(dev)) {
 		bnxt_close_nic(bp, false, false);
 		rc = bnxt_open_nic(bp, false, false);

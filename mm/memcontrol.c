@@ -66,6 +66,7 @@
 #include <net/sock.h>
 #include <net/ip.h>
 #include "slab.h"
+#include <linux/local_lock.h>
 
 #include <linux/uaccess.h>
 
@@ -82,8 +83,6 @@ DEFINE_PER_CPU(struct mem_cgroup *, int_active_memcg);
 /* Socket memory accounting disabled? */
 static bool cgroup_memory_nosocket __ro_after_init;
 
-static DEFINE_SPINLOCK(lruvec_stats_flush_lock);
-
 /* Kernel memory accounting disabled? */
 bool cgroup_memory_nokmem __ro_after_init;
 
@@ -93,6 +92,13 @@ bool cgroup_memory_noswap __ro_after_init;
 #else
 #define cgroup_memory_noswap		1
 #endif
+
+struct event_lock {
+	local_lock_t l;
+};
+static DEFINE_PER_CPU(struct event_lock, event_lock) = {
+	.l      = INIT_LOCAL_LOCK(l),
+};
 
 #ifdef CONFIG_CGROUP_WRITEBACK
 static DECLARE_WAIT_QUEUE_HEAD(memcg_cgwb_frn_waitq);
@@ -271,7 +277,8 @@ bool mem_cgroup_kmem_disabled(void)
 }
 
 static void obj_cgroup_uncharge_pages(struct obj_cgroup *objcg,
-				      unsigned int nr_pages);
+				      unsigned int nr_pages,
+				      bool lock_memcg_stock);
 
 static void obj_cgroup_release(struct percpu_ref *ref)
 {
@@ -305,7 +312,7 @@ static void obj_cgroup_release(struct percpu_ref *ref)
 	nr_pages = nr_bytes >> PAGE_SHIFT;
 
 	if (nr_pages)
-		obj_cgroup_uncharge_pages(objcg, nr_pages);
+		obj_cgroup_uncharge_pages(objcg, nr_pages, false);
 
 	spin_lock_irqsave(&objcg_lock, flags);
 	list_del(&objcg->list);
@@ -639,59 +646,6 @@ mem_cgroup_largest_soft_limit_node(struct mem_cgroup_tree_per_node *mctz)
 	return mz;
 }
 
-/*
- * Accessors to ensure that preemption is disabled on PREEMPT_RT because it can
- * not rely on this as part of an acquired spinlock_t lock. These functions are
- * never used in hardirq context on PREEMPT_RT and therefore disabling preemtion
- * is sufficient.
- */
-static void memcg_stats_lock(void)
-{
-#ifdef CONFIG_PREEMPT_RT
-      preempt_disable();
-#else
-      VM_BUG_ON(!irqs_disabled());
-#endif
-}
-
-static void __memcg_stats_lock(void)
-{
-#ifdef CONFIG_PREEMPT_RT
-      preempt_disable();
-#endif
-}
-
-static void memcg_stats_unlock(void)
-{
-#ifdef CONFIG_PREEMPT_RT
-      preempt_enable();
-#endif
-}
-
-/*
- * Return the active percpu stats memcg and optionally mem_cgroup_per_node.
- *
- * When percpu_stats_disabled, the percpu stats update is transferred to
- * its parent.
- */
-static inline struct mem_cgroup *
-percpu_stats_memcg(struct mem_cgroup *memcg, struct mem_cgroup_per_node **pn)
-{
-	if (likely(!memcg->percpu_stats_disabled))
-		return memcg;
-
-	do {
-		memcg = parent_mem_cgroup(memcg);
-	} while (memcg->percpu_stats_disabled);
-
-	if (pn) {
-		unsigned int nid = (*pn)->nid;
-
-		*pn = memcg->nodeinfo[nid];
-	}
-	return memcg;
-}
-
 /* Subset of vm_event_item to report for memcg event stats */
 static const unsigned int memcg_vm_event_stat[] = {
 	PGPGIN,
@@ -763,6 +717,98 @@ unsigned long memcg_page_state(struct mem_cgroup *memcg, int idx)
 	return x;
 }
 
+/*
+ * memcg and lruvec stats flushing
+ *
+ * Many codepaths leading to stats update or read are performance sensitive and
+ * adding stats flushing in such codepaths is not desirable. So, to optimize the
+ * flushing the kernel does:
+ *
+ * 1) Periodically and asynchronously flush the stats every 2 seconds to not let
+ *    rstat update tree grow unbounded.
+ *
+ * 2) Flush the stats synchronously on reader side only when there are more than
+ *    (MEMCG_CHARGE_BATCH * nr_cpus) update events. Though this optimization
+ *    will let stats be out of sync by atmost (MEMCG_CHARGE_BATCH * nr_cpus) but
+ *    only for 2 seconds due to (1).
+ */
+static void flush_memcg_stats_dwork(struct work_struct *w);
+static DECLARE_DEFERRABLE_WORK(stats_flush_dwork, flush_memcg_stats_dwork);
+static DEFINE_SPINLOCK(stats_flush_lock);
+static DEFINE_PER_CPU(unsigned int, stats_updates);
+static atomic_t stats_flush_threshold = ATOMIC_INIT(0);
+static u64 flush_next_time;
+
+#define FLUSH_TIME (2UL*HZ)
+
+static inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)
+{
+	unsigned int x;
+
+	cgroup_rstat_updated(memcg->css.cgroup, smp_processor_id());
+
+	x = __this_cpu_add_return(stats_updates, abs(val));
+	if (x > MEMCG_CHARGE_BATCH) {
+		atomic_add(x / MEMCG_CHARGE_BATCH, &stats_flush_threshold);
+		__this_cpu_write(stats_updates, 0);
+	}
+}
+
+static void __mem_cgroup_flush_stats(void)
+{
+	unsigned long flag;
+
+	if (!spin_trylock_irqsave(&stats_flush_lock, flag))
+		return;
+
+	flush_next_time = jiffies_64 + 2*FLUSH_TIME;
+	cgroup_rstat_flush_irqsafe(root_mem_cgroup->css.cgroup);
+	atomic_set(&stats_flush_threshold, 0);
+	spin_unlock_irqrestore(&stats_flush_lock, flag);
+}
+
+void mem_cgroup_flush_stats(void)
+{
+	if (atomic_read(&stats_flush_threshold) > num_online_cpus())
+		__mem_cgroup_flush_stats();
+}
+
+void mem_cgroup_flush_stats_delayed(void)
+{
+	if (time_after64(jiffies_64, flush_next_time))
+		mem_cgroup_flush_stats();
+}
+
+static void flush_memcg_stats_dwork(struct work_struct *w)
+{
+	__mem_cgroup_flush_stats();
+	queue_delayed_work(system_unbound_wq, &stats_flush_dwork, FLUSH_TIME);
+}
+
+/*
+ * Return the active percpu stats memcg and optionally mem_cgroup_per_node.
+ *
+ * When percpu_stats_disabled, the percpu stats update is transferred to
+ * its parent.
+ */
+static inline struct mem_cgroup *
+percpu_stats_memcg(struct mem_cgroup *memcg, struct mem_cgroup_per_node **pn)
+{
+	if (likely(!memcg->percpu_stats_disabled))
+		return memcg;
+
+	do {
+		memcg = parent_mem_cgroup(memcg);
+	} while (memcg->percpu_stats_disabled);
+
+	if (pn) {
+		unsigned int nid = (*pn)->nid;
+
+		*pn = memcg->nodeinfo[nid];
+	}
+	return memcg;
+}
+
 /**
  * __mod_memcg_state - update cgroup memory statistics
  * @memcg: the memory cgroup
@@ -776,7 +822,7 @@ void __mod_memcg_state(struct mem_cgroup *memcg, int idx, int val)
 
 	memcg = percpu_stats_memcg(memcg, NULL);
 	__this_cpu_add(memcg->vmstats_percpu->state[idx], val);
-	cgroup_rstat_updated(memcg->css.cgroup, smp_processor_id());
+	memcg_rstat_updated(memcg, val);
 }
 
 /* idx can be of type enum memcg_stat_item or node_stat_item. */
@@ -797,22 +843,6 @@ static unsigned long memcg_page_state_local(struct mem_cgroup *memcg, int idx)
 	return x;
 }
 
-static struct mem_cgroup_per_node *
-parent_nodeinfo(struct mem_cgroup_per_node *pn, int nid)
-{
-	struct mem_cgroup *parent;
-
-	parent = parent_mem_cgroup(pn->memcg);
-	if (!parent)
-		return NULL;
-	return parent->nodeinfo[nid];
-}
-
-static inline bool memcg_percpu_vmstats_flushed(struct mem_cgroup *memcg)
-{
-	return memcg->percpu_stats_disabled >= MEMCG_PERCPU_VMSTATS_FLUSHED;
-}
-
 static inline bool memcg_percpu_stats_flushed(struct mem_cgroup *memcg)
 {
 	return memcg->percpu_stats_disabled >= MEMCG_PERCPU_STATS_FLUSHED;
@@ -823,16 +853,8 @@ void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
 {
 	struct mem_cgroup_per_node *pn;
 	struct mem_cgroup *memcg;
-	long x, threshold = MEMCG_CHARGE_BATCH;
 
 	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
-
-	__memcg_stats_lock();
-	/* Update lruvec */
-	if (!pn->memcg->percpu_stats_disabled)
-		__this_cpu_add(pn->lruvec_stat_local->count[idx], val);
-
-	memcg = percpu_stats_memcg(pn->memcg, &pn);
 
 	/*
 	 * The caller from rmap relay on disabled preemption becase they never
@@ -840,6 +862,7 @@ void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
 	 * counters we check that the update is never performed from an
 	 * interrupt context while other caller need to have disabled interrupt.
 	 */
+	preempt_disable_rt();
 	if (IS_ENABLED(CONFIG_DEBUG_VM) && !IS_ENABLED(CONFIG_PREEMPT_RT)) {
 		switch (idx) {
 		case NR_ANON_MAPPED:
@@ -854,23 +877,16 @@ void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
 		}
 	}
 
+	memcg = percpu_stats_memcg(pn->memcg, &pn);
+
 	/* Update memcg */
-	__mod_memcg_state(memcg, idx, val);
+	__this_cpu_add(memcg->vmstats_percpu->state[idx], val);
 
-	if (vmstat_item_in_bytes(idx))
-		threshold <<= PAGE_SHIFT;
+	/* Update lruvec */
+	__this_cpu_add(pn->lruvec_stats_percpu->state[idx], val);
 
-	x = val + __this_cpu_read(pn->lruvec_stat_cpu->count[idx]);
-	if (unlikely(abs(x) > threshold)) {
-		pg_data_t *pgdat = lruvec_pgdat(lruvec);
-		struct mem_cgroup_per_node *pi;
-
-		for (pi = pn; pi; pi = parent_nodeinfo(pi, pgdat->node_id))
-			atomic_long_add(x, &pi->lruvec_stat[idx]);
-		x = 0;
-	}
-	__this_cpu_write(pn->lruvec_stat_cpu->count[idx], x);
-	memcg_stats_unlock();
+	memcg_rstat_updated(memcg, val);
+	preempt_enable_rt();
 }
 
 /**
@@ -954,13 +970,10 @@ void __count_memcg_events(struct mem_cgroup *memcg, enum vm_event_item idx,
 
 	if (mem_cgroup_disabled() || index < 0)
 		return;
-
-	memcg_stats_lock();
 	memcg = percpu_stats_memcg(memcg, NULL);
 
 	__this_cpu_add(memcg->vmstats_percpu->events[index], count);
-	cgroup_rstat_updated(memcg->css.cgroup, smp_processor_id());
-	memcg_stats_unlock();
+	memcg_rstat_updated(memcg, count);
 }
 
 static unsigned long memcg_events(struct mem_cgroup *memcg, int event)
@@ -1594,7 +1607,7 @@ static void memory_stat_format(struct mem_cgroup *memcg, char *buf, int bufsize)
 	 *
 	 * Current memory state:
 	 */
-	cgroup_rstat_flush(memcg->css.cgroup);
+	mem_cgroup_flush_stats();
 
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
 		u64 size;
@@ -2214,6 +2227,7 @@ struct obj_stock {
 };
 
 struct memcg_stock_pcp {
+	local_lock_t lock;
 	struct mem_cgroup *cached; /* this never be root cgroup */
 	unsigned int nr_pages;
 	struct obj_stock task_obj;
@@ -2262,7 +2276,7 @@ static bool consume_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
 	if (nr_pages > MEMCG_CHARGE_BATCH)
 		return ret;
 
-	local_irq_save(flags);
+	local_lock_irqsave(&memcg_stock.lock, flags);
 
 	stock = this_cpu_ptr(&memcg_stock);
 	if (memcg == stock->cached && stock->nr_pages >= nr_pages) {
@@ -2270,7 +2284,7 @@ static bool consume_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
 		ret = true;
 	}
 
-	local_irq_restore(flags);
+	local_unlock_irqrestore(&memcg_stock.lock, flags);
 
 	return ret;
 }
@@ -2305,7 +2319,7 @@ static void drain_local_stock(struct work_struct *dummy)
 	 * The only protection from memory hotplug vs. drain_stock races is
 	 * that we always operate on local CPU stock here with IRQ disabled
 	 */
-	local_irq_save(flags);
+	local_lock_irqsave(&memcg_stock.lock, flags);
 
 	stock = this_cpu_ptr(&memcg_stock);
 	drain_obj_stock(&stock->irq_obj);
@@ -2314,19 +2328,21 @@ static void drain_local_stock(struct work_struct *dummy)
 	drain_stock(stock);
 	clear_bit(FLUSHING_CACHED_CHARGE, &stock->flags);
 
-	local_irq_restore(flags);
+	local_unlock_irqrestore(&memcg_stock.lock, flags);
 }
 
 /*
  * Cache charges(val) to local per_cpu area.
  * This will be consumed by consume_stock() function, later.
  */
-static void refill_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
+static void refill_stock(struct mem_cgroup *memcg, unsigned int nr_pages,
+			 bool lock_memcg_stock)
 {
 	struct memcg_stock_pcp *stock;
 	unsigned long flags;
 
-	local_irq_save(flags);
+	if (lock_memcg_stock)
+		local_lock_irqsave(&memcg_stock.lock, flags);
 
 	stock = this_cpu_ptr(&memcg_stock);
 	if (stock->cached != memcg) { /* reset if necessary */
@@ -2339,7 +2355,8 @@ static void refill_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
 	if (stock->nr_pages > MEMCG_CHARGE_BATCH)
 		drain_stock(stock);
 
-	local_irq_restore(flags);
+	if (lock_memcg_stock)
+		local_unlock_irqrestore(&memcg_stock.lock, flags);
 }
 
 /*
@@ -2359,7 +2376,7 @@ static void drain_all_stock(struct mem_cgroup *root_memcg)
 	 * as well as workers from this path always operate on the local
 	 * per-cpu data. CPU up doesn't touch memcg_stock at all.
 	 */
-	curcpu = get_cpu();
+	curcpu = get_cpu_light();
 	for_each_online_cpu(cpu) {
 		struct memcg_stock_pcp *stock = &per_cpu(memcg_stock, cpu);
 		struct mem_cgroup *memcg;
@@ -2382,50 +2399,16 @@ static void drain_all_stock(struct mem_cgroup *root_memcg)
 				schedule_work_on(cpu, &stock->work);
 		}
 	}
-	put_cpu();
+	put_cpu_light();
 	mutex_unlock(&percpu_charge_mutex);
-}
-
-static void memcg_flush_lruvec_page_state(struct mem_cgroup *memcg, int cpu)
-{
-	int nid;
-
-	if (memcg_percpu_stats_flushed(memcg))
-		return;
-
-	for_each_node(nid) {
-		struct mem_cgroup_per_node *pn = memcg->nodeinfo[nid];
-		unsigned long stat[NR_VM_NODE_STAT_ITEMS];
-		struct batched_lruvec_stat *lstatc;
-		int i;
-
-		lstatc = per_cpu_ptr(pn->lruvec_stat_cpu, cpu);
-		for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++) {
-			stat[i] = lstatc->count[i];
-			lstatc->count[i] = 0;
-		}
-
-		do {
-			for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++)
-				atomic_long_add(stat[i], &pn->lruvec_stat[i]);
-		} while ((pn = parent_nodeinfo(pn, nid)));
-	}
 }
 
 static int memcg_hotplug_cpu_dead(unsigned int cpu)
 {
 	struct memcg_stock_pcp *stock;
-	struct mem_cgroup *memcg;
-	unsigned long flags;
 
 	stock = &per_cpu(memcg_stock, cpu);
 	drain_stock(stock);
-
-	for_each_mem_cgroup(memcg) {
-		spin_lock_irqsave(&lruvec_stats_flush_lock, flags);
-		memcg_flush_lruvec_page_state(memcg, cpu);
-		spin_unlock_irqrestore(&lruvec_stats_flush_lock, flags);
-	}
 
 	return 0;
 }
@@ -2812,7 +2795,7 @@ force:
 
 done_restock:
 	if (batch > nr_pages)
-		refill_stock(memcg, batch - nr_pages);
+		refill_stock(memcg, batch - nr_pages, true);
 
 	/*
 	 * If the hierarchy is above the normal consumption range, schedule
@@ -2932,29 +2915,30 @@ retry:
  * can only be accessed after disabling interrupt. User context code can
  * access interrupt object stock, but not vice versa.
  */
-static inline struct obj_stock *get_obj_stock(unsigned long *pflags)
-{
-	struct memcg_stock_pcp *stock;
+ static inline struct obj_stock *get_obj_stock(unsigned long *pflags)
+ {
+ 	struct memcg_stock_pcp *stock;
 
-	if (likely(in_task())) {
-		*pflags = 0UL;
-		preempt_disable();
-		stock = this_cpu_ptr(&memcg_stock);
-		return &stock->task_obj;
-	}
+ 	if (likely(!(in_hardirq() || in_nmi()))) {
+ 		/* softirqs are also serviced in task context in RT */
+ 		local_lock(&memcg_stock.lock);
+ 		stock = this_cpu_ptr(&memcg_stock);
+ 		return &stock->task_obj;
+ 	} else
+ 		local_irq_save(*pflags);
 
-	local_irq_save(*pflags);
-	stock = this_cpu_ptr(&memcg_stock);
-	return &stock->irq_obj;
-}
+ 	stock = this_cpu_ptr(&memcg_stock);
 
-static inline void put_obj_stock(unsigned long flags)
-{
-	if (likely(in_task()))
-		preempt_enable();
-	else
-		local_irq_restore(flags);
-}
+ 	return &stock->irq_obj;
+ }
+
+ static inline void put_obj_stock(unsigned long flags)
+ {
+ 	if (likely(!(in_hardirq() || in_nmi())))
+ 		local_unlock(&memcg_stock.lock);
+ 	else
+ 		local_irq_restore(flags);
+ }
 
 /*
  * mod_objcg_mlstate() may be called with irq enabled, so
@@ -3131,7 +3115,8 @@ static void memcg_free_cache_id(int id)
  * @nr_pages: number of pages to uncharge
  */
 static void obj_cgroup_uncharge_pages(struct obj_cgroup *objcg,
-				      unsigned int nr_pages)
+				      unsigned int nr_pages,
+				      bool lock_memcg_stock)
 {
 	struct mem_cgroup *memcg;
 
@@ -3139,7 +3124,7 @@ static void obj_cgroup_uncharge_pages(struct obj_cgroup *objcg,
 
 	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
 		page_counter_uncharge(&memcg->kmem, nr_pages);
-	refill_stock(memcg, nr_pages);
+	refill_stock(memcg, nr_pages, lock_memcg_stock);
 
 	css_put(&memcg->css);
 }
@@ -3226,7 +3211,7 @@ void __memcg_kmem_uncharge_page(struct page *page, int order)
 		return;
 
 	objcg = __page_objcg(page);
-	obj_cgroup_uncharge_pages(objcg, nr_pages);
+	obj_cgroup_uncharge_pages(objcg, nr_pages, true);
 	page->memcg_data = 0;
 	obj_cgroup_put(objcg);
 }
@@ -3234,7 +3219,7 @@ void __memcg_kmem_uncharge_page(struct page *page, int order)
 void mod_objcg_state(struct obj_cgroup *objcg, struct pglist_data *pgdat,
 		     enum node_stat_item idx, int nr)
 {
-	unsigned long flags;
+	unsigned long flags = 0;
 	struct obj_stock *stock = get_obj_stock(&flags);
 	int *bytes;
 
@@ -3293,7 +3278,7 @@ void mod_objcg_state(struct obj_cgroup *objcg, struct pglist_data *pgdat,
 
 static bool consume_obj_stock(struct obj_cgroup *objcg, unsigned int nr_bytes)
 {
-	unsigned long flags;
+	unsigned long flags = 0;
 	struct obj_stock *stock = get_obj_stock(&flags);
 	bool ret = false;
 
@@ -3319,7 +3304,7 @@ static void drain_obj_stock(struct obj_stock *stock)
 		unsigned int nr_bytes = stock->nr_bytes & (PAGE_SIZE - 1);
 
 		if (nr_pages)
-			obj_cgroup_uncharge_pages(old, nr_pages);
+			obj_cgroup_uncharge_pages(old, nr_pages, false);
 
 		/*
 		 * The leftover is flushed to the centralized per-memcg value.
@@ -3380,7 +3365,7 @@ static bool obj_stock_flush_required(struct memcg_stock_pcp *stock,
 static void refill_obj_stock(struct obj_cgroup *objcg, unsigned int nr_bytes,
 			     bool allow_uncharge)
 {
-	unsigned long flags;
+	unsigned long flags = 0;
 	struct obj_stock *stock = get_obj_stock(&flags);
 	unsigned int nr_pages = 0;
 
@@ -3402,7 +3387,7 @@ static void refill_obj_stock(struct obj_cgroup *objcg, unsigned int nr_bytes,
 	put_obj_stock(flags);
 
 	if (nr_pages)
-		obj_cgroup_uncharge_pages(objcg, nr_pages);
+		obj_cgroup_uncharge_pages(objcg, nr_pages, true);
 }
 
 int obj_cgroup_charge(struct obj_cgroup *objcg, gfp_t gfp, size_t size)
@@ -3714,8 +3699,7 @@ static unsigned long mem_cgroup_usage(struct mem_cgroup *memcg, bool swap)
 	unsigned long val;
 
 	if (mem_cgroup_is_root(memcg)) {
-		/* mem_cgroup_threshold() calls here from irqsafe context */
-		cgroup_rstat_flush_irqsafe(memcg->css.cgroup);
+		mem_cgroup_flush_stats();
 		val = memcg_page_state(memcg, NR_FILE_PAGES) +
 			memcg_page_state(memcg, NR_ANON_MAPPED);
 		if (swap)
@@ -4093,7 +4077,7 @@ static int memcg_numa_stat_show(struct seq_file *m, void *v)
 	int nid;
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
 
-	cgroup_rstat_flush(memcg->css.cgroup);
+	mem_cgroup_flush_stats();
 
 	for (stat = stats; stat < stats + ARRAY_SIZE(stats); stat++) {
 		seq_printf(m, "%s=%lu", stat->name,
@@ -4165,7 +4149,7 @@ static int memcg_stat_show(struct seq_file *m, void *v)
 
 	BUILD_BUG_ON(ARRAY_SIZE(memcg1_stat_names) != ARRAY_SIZE(memcg1_stats));
 
-	cgroup_rstat_flush(memcg->css.cgroup);
+	mem_cgroup_flush_stats();
 
 	for (i = 0; i < ARRAY_SIZE(memcg1_stats); i++) {
 		unsigned long nr;
@@ -4670,7 +4654,7 @@ void mem_cgroup_wb_stats(struct bdi_writeback *wb, unsigned long *pfilepages,
 	struct mem_cgroup *memcg = mem_cgroup_from_css(wb->memcg_css);
 	struct mem_cgroup *parent;
 
-	cgroup_rstat_flush_irqsafe(memcg->css.cgroup);
+	mem_cgroup_flush_stats();
 
 	*pdirty = memcg_page_state(memcg, NR_FILE_DIRTY);
 	*pwriteback = memcg_page_state(memcg, NR_WRITEBACK);
@@ -5266,17 +5250,9 @@ static int alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 	if (!pn)
 		return 1;
 
-	pn->lruvec_stat_local = alloc_percpu_gfp(struct lruvec_stat,
-						 GFP_KERNEL_ACCOUNT);
-	if (!pn->lruvec_stat_local) {
-		kfree(pn);
-		return 1;
-	}
-
-	pn->lruvec_stat_cpu = alloc_percpu_gfp(struct batched_lruvec_stat,
-					       GFP_KERNEL_ACCOUNT);
-	if (!pn->lruvec_stat_cpu) {
-		free_percpu(pn->lruvec_stat_local);
+	pn->lruvec_stats_percpu = alloc_percpu_gfp(struct lruvec_stats_percpu,
+						   GFP_KERNEL_ACCOUNT);
+	if (!pn->lruvec_stats_percpu) {
 		kfree(pn);
 		return 1;
 	}
@@ -5395,29 +5371,17 @@ static void percpu_stats_free_rwork_fn(struct work_struct *work)
 	struct mem_cgroup *memcg = container_of(to_rcu_work(work),
 						struct mem_cgroup,
 						percpu_stats_rwork);
-	int node, cpu;
+	int node;
 
 	cgroup_rstat_flush_hold(memcg->css.cgroup);
-	memcg->percpu_stats_disabled = MEMCG_PERCPU_VMSTATS_FLUSHED;
-	cgroup_rstat_flush_release();
-
-	spin_lock_irq(&lruvec_stats_flush_lock);
-	/*
-	 * Flush percpu lruvec stats to guarantee the value
-	 * correctness on parent's and all ancestor levels.
-	 */
-	for_each_online_cpu(cpu)
-		memcg_flush_lruvec_page_state(memcg, cpu);
 	memcg->percpu_stats_disabled = MEMCG_PERCPU_STATS_FLUSHED;
-	spin_unlock_irq(&lruvec_stats_flush_lock);
+	cgroup_rstat_flush_release();
 
 	for_each_node(node) {
 		struct mem_cgroup_per_node *pn = memcg->nodeinfo[node];
 
-		if (pn) {
-			free_percpu(pn->lruvec_stat_cpu);
-			free_percpu(pn->lruvec_stat_local);
-		}
+		if (pn)
+			free_percpu(pn->lruvec_stats_percpu);
 	}
 	free_percpu(memcg->vmstats_percpu);
 	memcg->percpu_stats_disabled = MEMCG_PERCPU_STATS_FREED;
@@ -5498,6 +5462,10 @@ static int mem_cgroup_css_online(struct cgroup_subsys_state *css)
 	/* Online state pins memcg ID, memcg ID pins CSS */
 	refcount_set(&memcg->id.ref, 1);
 	css_get(css);
+
+	if (unlikely(mem_cgroup_is_root(memcg)))
+		queue_delayed_work(system_unbound_wq, &stats_flush_dwork,
+				   2UL*HZ);
 	return 0;
 }
 
@@ -5595,9 +5563,9 @@ static void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state *css, int cpu)
 	struct mem_cgroup *parent = parent_mem_cgroup(memcg);
 	struct memcg_vmstats_percpu *statc;
 	long delta, v;
-	int i;
+	int i, nid;
 
-	if (memcg_percpu_vmstats_flushed(memcg))
+	if (memcg_percpu_stats_flushed(memcg))
 		return;
 
 	statc = per_cpu_ptr(memcg->vmstats_percpu, cpu);
@@ -5645,6 +5613,36 @@ static void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state *css, int cpu)
 		memcg->vmstats->events[i] += delta;
 		if (parent)
 			parent->vmstats->events_pending[i] += delta;
+	}
+
+	for_each_node_state(nid, N_MEMORY) {
+		struct mem_cgroup_per_node *pn = memcg->nodeinfo[nid];
+		struct mem_cgroup_per_node *ppn = NULL;
+		struct lruvec_stats_percpu *lstatc;
+
+		if (parent)
+			ppn = parent->nodeinfo[nid];
+
+		lstatc = per_cpu_ptr(pn->lruvec_stats_percpu, cpu);
+
+		for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++) {
+			delta = pn->lruvec_stats.state_pending[i];
+			if (delta)
+				pn->lruvec_stats.state_pending[i] = 0;
+
+			v = READ_ONCE(lstatc->state[i]);
+			if (v != lstatc->state_prev[i]) {
+				delta += v - lstatc->state_prev[i];
+				lstatc->state_prev[i] = v;
+			}
+
+			if (!delta)
+				continue;
+
+			pn->lruvec_stats.state[i] += delta;
+			if (ppn)
+				ppn->lruvec_stats.state_pending[i] += delta;
+		}
 	}
 }
 
@@ -5889,12 +5887,12 @@ static int mem_cgroup_move_account(struct page *page,
 
 	ret = 0;
 
-	local_irq_disable();
+	local_lock_irq(&event_lock.l);
 	mem_cgroup_charge_statistics(to, nr_pages);
 	memcg_check_events(to, page);
 	mem_cgroup_charge_statistics(from, -nr_pages);
 	memcg_check_events(from, page);
-	local_irq_enable();
+	local_unlock_irq(&event_lock.l);
 out_unlock:
 	unlock_page(page);
 out:
@@ -6594,6 +6592,8 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 	int i;
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
 
+	mem_cgroup_flush_stats();
+
 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
 		int nid;
 
@@ -6957,10 +6957,10 @@ static int __mem_cgroup_charge(struct page *page, struct mem_cgroup *memcg,
 	css_get(&memcg->css);
 	commit_charge(page, memcg);
 
-	local_irq_disable();
+	local_lock_irq(&event_lock.l);
 	mem_cgroup_charge_statistics(memcg, nr_pages);
 	memcg_check_events(memcg, page);
-	local_irq_enable();
+	local_unlock_irq(&event_lock.l);
 out:
 	return ret;
 }
@@ -7090,11 +7090,11 @@ static void uncharge_batch(const struct uncharge_gather *ug)
 
 	memcg = percpu_stats_memcg(ug->memcg, NULL);
 
-	local_irq_save(flags);
+	local_lock_irqsave(&event_lock.l, flags);
 	__count_memcg_events(memcg, PGPGOUT, ug->pgpgout);
 	__this_cpu_add(memcg->vmstats_percpu->nr_page_events, ug->nr_memory);
 	memcg_check_events(memcg, ug->dummy_page);
-	local_irq_restore(flags);
+	local_unlock_irqrestore(&event_lock.l, flags);
 
 	/* drop reference from uncharge_page */
 	css_put(&ug->memcg->css);
@@ -7250,10 +7250,10 @@ void mem_cgroup_migrate(struct page *oldpage, struct page *newpage)
 	css_get(&memcg->css);
 	commit_charge(newpage, memcg);
 
-	local_irq_save(flags);
+	local_lock_irqsave(&event_lock.l, flags);
 	mem_cgroup_charge_statistics(memcg, nr_pages);
 	memcg_check_events(memcg, newpage);
-	local_irq_restore(flags);
+	local_unlock_irqrestore(&event_lock.l, flags);
 }
 
 DEFINE_STATIC_KEY_FALSE(memcg_sockets_enabled_key);
@@ -7339,7 +7339,7 @@ void mem_cgroup_uncharge_skmem(struct mem_cgroup *memcg, unsigned int nr_pages)
 
 	mod_memcg_state(memcg, MEMCG_SOCK, -nr_pages);
 
-	refill_stock(memcg, nr_pages);
+	refill_stock(memcg, nr_pages, true);
 }
 
 static int __init cgroup_memory(char *s)
@@ -7381,9 +7381,13 @@ static int __init mem_cgroup_init(void)
 	cpuhp_setup_state_nocalls(CPUHP_MM_MEMCQ_DEAD, "mm/memctrl:dead", NULL,
 				  memcg_hotplug_cpu_dead);
 
-	for_each_possible_cpu(cpu)
-		INIT_WORK(&per_cpu_ptr(&memcg_stock, cpu)->work,
-			  drain_local_stock);
+	for_each_possible_cpu(cpu) {
+		struct memcg_stock_pcp *stock;
+
+		stock = per_cpu_ptr(&memcg_stock, cpu);
+		INIT_WORK(&stock->work, drain_local_stock);
+		local_lock_init(&stock->lock);
+	}
 
 	for_each_node(node) {
 		struct mem_cgroup_tree_per_node *rtpn;
@@ -7432,6 +7436,7 @@ void mem_cgroup_swapout(struct page *page, swp_entry_t entry)
 	struct mem_cgroup *memcg, *swap_memcg;
 	unsigned int nr_entries;
 	unsigned short oldid;
+	unsigned long flags;
 
 	VM_BUG_ON_PAGE(PageLRU(page), page);
 	VM_BUG_ON_PAGE(page_count(page), page);
@@ -7480,10 +7485,10 @@ void mem_cgroup_swapout(struct page *page, swp_entry_t entry)
 	 * important here to have the interrupts disabled because it is the
 	 * only synchronisation we have for updating the per-CPU variables.
 	 */
-	memcg_stats_lock();
+	local_lock_irqsave(&event_lock.l, flags);
 	mem_cgroup_charge_statistics(memcg, -nr_entries);
-	memcg_stats_unlock();
 	memcg_check_events(memcg, page);
+	local_unlock_irqrestore(&event_lock.l, flags);
 
 	css_put(&memcg->css);
 }

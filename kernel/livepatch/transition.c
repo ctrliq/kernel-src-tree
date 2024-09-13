@@ -21,6 +21,7 @@
 
 #include <linux/cpu.h>
 #include <linux/stacktrace.h>
+#include <linux/sched/idle.h>
 #include "core.h"
 #include "patch.h"
 #include "transition.h"

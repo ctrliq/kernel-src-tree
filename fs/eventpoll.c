@@ -223,12 +223,17 @@ struct eventpoll {
 	struct file *file;
 
 	/* used to optimize loop detection check */
-	int visited;
 	struct list_head visited_list_link;
+	int visited;
 
 #ifdef CONFIG_NET_RX_BUSY_POLL
 	/* used to track busy poll napi_id */
 	unsigned int napi_id;
+#endif
+
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+	/* tracks wakeup nests for lockdep validation */
+	u8 nests;
 #endif
 };
 
@@ -551,35 +556,47 @@ out_unlock:
  */
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 
-static struct nested_calls poll_safewake_ncalls;
-
-static int ep_poll_wakeup_proc(void *priv, void *cookie, int call_nests)
+static void ep_poll_safewake(struct eventpoll *ep, struct epitem *epi)
 {
+	struct eventpoll *ep_src;
 	unsigned long flags;
-	wait_queue_head_t *wqueue = (wait_queue_head_t *)cookie;
+	u8 nests = 0;
 
-	spin_lock_irqsave_nested(&wqueue->lock, flags, call_nests + 1);
-	wake_up_locked_poll(wqueue, EPOLLIN);
-	spin_unlock_irqrestore(&wqueue->lock, flags);
-
-	return 0;
-}
-
-static void ep_poll_safewake(wait_queue_head_t *wq)
-{
-	int this_cpu = get_cpu();
-
-	ep_call_nested(&poll_safewake_ncalls, EP_MAX_NESTS,
-		       ep_poll_wakeup_proc, NULL, wq, (void *) (long) this_cpu);
-
-	put_cpu();
+	/*
+	 * To set the subclass or nesting level for spin_lock_irqsave_nested()
+	 * it might be natural to create a per-cpu nest count. However, since
+	 * we can recurse on ep->poll_wait.lock, and a non-raw spinlock can
+	 * schedule() in the -rt kernel, the per-cpu variable are no longer
+	 * protected. Thus, we are introducing a per eventpoll nest field.
+	 * If we are not being call from ep_poll_callback(), epi is NULL and
+	 * we are at the first level of nesting, 0. Otherwise, we are being
+	 * called from ep_poll_callback() and if a previous wakeup source is
+	 * not an epoll file itself, we are at depth 1 since the wakeup source
+	 * is depth 0. If the wakeup source is a previous epoll file in the
+	 * wakeup chain then we use its nests value and record ours as
+	 * nests + 1. The previous epoll file nests value is stable since its
+	 * already holding its own poll_wait.lock.
+	 */
+	if (epi) {
+		if ((is_file_epoll(epi->ffd.file))) {
+			ep_src = epi->ffd.file->private_data;
+			nests = ep_src->nests;
+		} else {
+			nests = 1;
+		}
+	}
+	spin_lock_irqsave_nested(&ep->poll_wait.lock, flags, nests);
+	ep->nests = nests + 1;
+	wake_up_locked_poll(&ep->poll_wait, EPOLLIN);
+	ep->nests = 0;
+	spin_unlock_irqrestore(&ep->poll_wait.lock, flags);
 }
 
 #else
 
-static void ep_poll_safewake(wait_queue_head_t *wq)
+static void ep_poll_safewake(struct eventpoll *ep, struct epitem *epi)
 {
-	wake_up_poll(wq, EPOLLIN);
+	wake_up_poll(&ep->poll_wait, EPOLLIN);
 }
 
 #endif
@@ -671,7 +688,6 @@ static __poll_t ep_scan_ready_list(struct eventpoll *ep,
 			      void *priv, int depth, bool ep_locked)
 {
 	__poll_t res;
-	int pwake = 0;
 	unsigned long flags;
 	struct epitem *epi, *nepi;
 	LIST_HEAD(txlist);
@@ -733,25 +749,10 @@ static __poll_t ep_scan_ready_list(struct eventpoll *ep,
 	 */
 	list_splice(&txlist, &ep->rdllist);
 	__pm_relax(ep->ws);
-
-	if (!list_empty(&ep->rdllist)) {
-		/*
-		 * Wake up (if active) both the eventpoll wait list and
-		 * the ->poll() wait list (delayed after we release the lock).
-		 */
-		if (waitqueue_active(&ep->wq))
-			wake_up_locked(&ep->wq);
-		if (waitqueue_active(&ep->poll_wait))
-			pwake++;
-	}
 	spin_unlock_irqrestore(&ep->lock, flags);
 
 	if (!ep_locked)
 		mutex_unlock(&ep->mtx);
-
-	/* We have to call this outside the lock */
-	if (pwake)
-		ep_poll_safewake(&ep->poll_wait);
 
 	return res;
 }
@@ -815,7 +816,7 @@ static void ep_free(struct eventpoll *ep)
 
 	/* We need to release all tasks waiting for these file */
 	if (waitqueue_active(&ep->poll_wait))
-		ep_poll_safewake(&ep->poll_wait);
+		ep_poll_safewake(ep, NULL);
 
 	/*
 	 * We need to lock this because we could be hit by
@@ -1207,7 +1208,7 @@ out_unlock:
 
 	/* We have to call this outside the lock */
 	if (pwake)
-		ep_poll_safewake(&ep->poll_wait);
+		ep_poll_safewake(ep, epi);
 
 	if (!(epi->event.events & EPOLLEXCLUSIVE))
 		ewake = 1;
@@ -1511,7 +1512,7 @@ static int ep_insert(struct eventpoll *ep, const struct epoll_event *event,
 
 	/* We have to call this outside the lock */
 	if (pwake)
-		ep_poll_safewake(&ep->poll_wait);
+		ep_poll_safewake(ep, NULL);
 
 	return 0;
 
@@ -1613,7 +1614,7 @@ static int ep_modify(struct eventpoll *ep, struct epitem *epi,
 
 	/* We have to call this outside the lock */
 	if (pwake)
-		ep_poll_safewake(&ep->poll_wait);
+		ep_poll_safewake(ep, NULL);
 
 	return 0;
 }
@@ -2304,11 +2305,6 @@ static int __init eventpoll_init(void)
 	 * inclusion loops checks.
 	 */
 	ep_nested_calls_init(&poll_loop_ncalls);
-
-#ifdef CONFIG_DEBUG_LOCK_ALLOC
-	/* Initialize the structure used to perform safe poll wait head wake ups */
-	ep_nested_calls_init(&poll_safewake_ncalls);
-#endif
 
 	/*
 	 * We can have many thousands of epitems, so prevent this from

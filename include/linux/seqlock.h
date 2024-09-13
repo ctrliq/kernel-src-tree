@@ -802,11 +802,7 @@ typedef struct {
 	 * Make sure that readers don't starve writers on PREEMPT_RT: use
 	 * seqcount_spinlock_t instead of seqcount_t. Check __SEQ_LOCK().
 	 */
-#if defined(CONFIG_LOCKDEP) || defined(CONFIG_PREEMPT_RT)
 	seqcount_spinlock_t seqcount;
-#else
-	RH_KABI_REPLACE(struct seqcount seqcount, seqcount_spinlock_t seqcount)
-#endif
 	spinlock_t lock;
 } seqlock_t;
 

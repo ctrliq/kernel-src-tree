@@ -39,6 +39,7 @@
 #include "ib_rep.h"
 #include "counters.h"
 #include "cmd.h"
+#include "umr.h"
 #include "qp.h"
 #include "wr.h"
 

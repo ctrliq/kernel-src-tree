@@ -2503,17 +2503,11 @@ void netif_napi_add_weight(struct net_device *dev, struct napi_struct *napi,
  * @dev:  network device
  * @napi: NAPI context
  * @poll: polling function
- * @weight: default weight
  *
  * netif_napi_add() must be used to initialize a NAPI context prior to calling
  * *any* of the other NAPI-related functions.
  */
-static inline void
-netif_napi_add(struct net_device *dev, struct napi_struct *napi,
-	       int (*poll)(struct napi_struct *, int), int weight)
-{
-	netif_napi_add_weight(dev, napi, poll, weight);
-}
+#define netif_napi_add(dev, napi, poll) netif_napi_add_weight((dev), (napi), (poll), NAPI_POLL_WEIGHT)
 
 static inline void
 netif_napi_add_tx_weight(struct net_device *dev,

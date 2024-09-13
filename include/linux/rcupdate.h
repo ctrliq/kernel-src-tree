@@ -67,6 +67,11 @@ void __rcu_read_unlock(void);
  * types of kernel builds, the rcu_read_lock() nesting depth is unknowable.
  */
 #define rcu_preempt_depth() (current->rcu_read_lock_nesting)
+#ifndef CONFIG_PREEMPT_RT
+#define sched_rcu_preempt_depth()	rcu_preempt_depth()
+#else
+static inline int sched_rcu_preempt_depth(void) { return 0; }
+#endif
 
 #else /* #ifdef CONFIG_PREEMPT_RCU */
 
@@ -93,6 +98,8 @@ static inline int rcu_preempt_depth(void)
 	return 0;
 }
 
+#define sched_rcu_preempt_depth()	rcu_preempt_depth()
+
 #endif /* #else #ifdef CONFIG_PREEMPT_RCU */
 
 /* Internal to kernel */
@@ -107,6 +114,13 @@ void rcu_init_tasks_generic(void);
 #else
 static inline void rcu_init_tasks_generic(void) { }
 #endif
+
+#if defined(CONFIG_PROVE_RCU) && defined(CONFIG_TASKS_RCU_GENERIC)
+void rcu_tasks_initiate_self_tests(void);
+#else
+static inline void rcu_tasks_initiate_self_tests(void) {}
+#endif
+
 
 #ifdef CONFIG_RCU_STALL_COMMON
 void rcu_sysrq_start(void);
@@ -348,7 +362,8 @@ static inline void rcu_preempt_sleep_check(void) { }
 #define rcu_sleep_check()						\
 	do {								\
 		rcu_preempt_sleep_check();				\
-		RCU_LOCKDEP_WARN(lock_is_held(&rcu_bh_lock_map),	\
+		if (!IS_ENABLED(CONFIG_PREEMPT_RT))			\
+		    RCU_LOCKDEP_WARN(lock_is_held(&rcu_bh_lock_map),	\
 				 "Illegal context switch in RCU-bh read-side critical section"); \
 		RCU_LOCKDEP_WARN(lock_is_held(&rcu_sched_lock_map),	\
 				 "Illegal context switch in RCU-sched read-side critical section"); \

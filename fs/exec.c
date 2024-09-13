@@ -62,6 +62,7 @@
 #include <linux/oom.h>
 #include <linux/compat.h>
 #include <linux/vmalloc.h>
+#include <linux/time_namespace.h>
 
 #include <linux/uaccess.h>
 #include <asm/mmu_context.h>
@@ -1316,6 +1317,10 @@ int begin_new_exec(struct linux_binprm * bprm)
 	 */
 	bprm->point_of_no_return = true;
 	bprm->mm = NULL;
+
+	retval = exec_task_namespaces();
+	if (retval)
+		goto out_unlock;
 
 #ifdef CONFIG_POSIX_TIMERS
 	exit_itimers(me->signal);

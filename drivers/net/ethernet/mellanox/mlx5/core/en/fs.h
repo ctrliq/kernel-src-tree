@@ -137,13 +137,16 @@ static inline int mlx5e_arfs_disable(struct mlx5e_priv *priv) {	return -EOPNOTSU
 struct mlx5e_accel_fs_tcp;
 #endif
 
+struct mlx5e_profile;
 struct mlx5e_fs_udp;
 struct mlx5e_fs_any;
 struct mlx5e_ptp_fs;
 
 struct mlx5e_flow_steering {
+	bool				state_destroy;
+	bool				vlan_strip_disable;
+	struct mlx5_core_dev		*mdev;
 	struct mlx5_flow_namespace      *ns;
-	struct mlx5_flow_namespace      *egress_ns;
 #ifdef CONFIG_MLX5_EN_RXNFC
 	struct mlx5e_ethtool_steering   ethtool;
 #endif
@@ -178,13 +181,22 @@ void mlx5e_disable_cvlan_filter(struct mlx5e_priv *priv);
 int mlx5e_create_flow_steering(struct mlx5e_priv *priv);
 void mlx5e_destroy_flow_steering(struct mlx5e_priv *priv);
 
-int mlx5e_fs_init(struct mlx5e_priv *priv);
-void mlx5e_fs_cleanup(struct mlx5e_priv *priv);
+struct mlx5e_flow_steering *mlx5e_fs_init(const struct mlx5e_profile *profile,
+					  struct mlx5_core_dev *mdev,
+					  bool state_destroy);
+void mlx5e_fs_cleanup(struct mlx5e_flow_steering *fs);
 
 int mlx5e_add_vlan_trap(struct mlx5e_priv *priv, int  trap_id, int tir_num);
 void mlx5e_remove_vlan_trap(struct mlx5e_priv *priv);
 int mlx5e_add_mac_trap(struct mlx5e_priv *priv, int  trap_id, int tir_num);
 void mlx5e_remove_mac_trap(struct mlx5e_priv *priv);
-
+void mlx5e_fs_set_rx_mode_work(struct mlx5e_flow_steering *fs, struct net_device *netdev);
+int mlx5e_fs_vlan_rx_add_vid(struct mlx5e_flow_steering *fs,
+			     struct net_device *netdev,
+			     __be16 proto, u16 vid);
+int mlx5e_fs_vlan_rx_kill_vid(struct mlx5e_flow_steering *fs,
+			      struct net_device *netdev,
+			      __be16 proto, u16 vid);
+void mlx5e_fs_init_l2_addr(struct mlx5e_flow_steering *fs, struct net_device *netdev);
 #endif /* __MLX5E_FLOW_STEER_H__ */
 

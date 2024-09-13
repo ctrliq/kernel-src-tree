@@ -1666,7 +1666,7 @@ struct nfs_unlinkdata {
 	struct nfs_removeargs args;
 	struct nfs_removeres res;
 	struct dentry *dentry;
-	wait_queue_head_t wq;
+	struct swait_queue_head wq;
 	const struct cred *cred;
 	struct nfs_fattr dir_attr;
 	long timeout;
@@ -1719,7 +1719,7 @@ struct nfs_rpc_ops {
 			    struct nfs_fh *, struct nfs_fattr *);
 	int	(*lookupp) (struct inode *, struct nfs_fh *,
 			    struct nfs_fattr *);
-	int	(*access)  (struct inode *, struct nfs_access_entry *);
+	int	(*access)  (struct inode *, struct nfs_access_entry *, const struct cred *);
 	int	(*readlink)(struct inode *, struct page *, unsigned int,
 			    unsigned int);
 	int	(*create)  (struct inode *, struct dentry *,

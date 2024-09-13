@@ -56,16 +56,23 @@ struct task_struct;
 struct thread_info {
 	unsigned long		flags;		/* low level flags */
 	u32			status;		/* thread synchronous flags */
+	int			preempt_lazy_count;	/* 0 => lazy preemptable
+							  <0 => BUG */
 };
 
 #define INIT_THREAD_INFO(tsk)			\
 {						\
 	.flags		= 0,			\
+	.preempt_lazy_count = 0,		\
 }
 
 #else /* !__ASSEMBLY__ */
 
 #include <asm/asm-offsets.h>
+
+#define GET_THREAD_INFO(reg) \
+	_ASM_MOV PER_CPU_VAR(cpu_current_top_of_stack),reg ; \
+	_ASM_SUB $(THREAD_SIZE),reg ;
 
 #endif
 
@@ -92,7 +99,7 @@ struct thread_info {
 #define TIF_NOCPUID		15	/* CPUID is not accessible in userland */
 #define TIF_NOTSC		16	/* TSC is not accessible in userland */
 #define TIF_IA32		17	/* IA32 compatibility process */
-#define TIF_SLD			18	/* Restore split lock detection on context switch */
+#define TIF_NEED_RESCHED_LAZY	18	/* lazy rescheduling necessary */
 #define TIF_NOHZ		19	/* in adaptive nohz mode */
 #define TIF_MEMDIE		20	/* is terminating due to OOM killer */
 #define TIF_POLLING_NRFLAG	21	/* idle is polling for TIF_NEED_RESCHED */
@@ -104,36 +111,38 @@ struct thread_info {
 #define TIF_ADDR32		29	/* 32-bit address space on 64 bits */
 #define TIF_X32			30	/* 32-bit native x86-64 binary */
 #define TIF_FSCHECK		31	/* Check FS is USER_DS on return */
+#define TIF_SLD			32	/* Restore split lock detection on context switch */
 
-#define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
-#define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
-#define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
-#define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
-#define _TIF_SINGLESTEP		(1 << TIF_SINGLESTEP)
-#define _TIF_SSBD		(1 << TIF_SSBD)
-#define _TIF_SYSCALL_EMU	(1 << TIF_SYSCALL_EMU)
-#define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
-#define _TIF_SECCOMP		(1 << TIF_SECCOMP)
-#define _TIF_SPEC_IB		(1 << TIF_SPEC_IB)
-#define _TIF_SPEC_FORCE_UPDATE	(1 << TIF_SPEC_FORCE_UPDATE)
-#define _TIF_USER_RETURN_NOTIFY	(1 << TIF_USER_RETURN_NOTIFY)
-#define _TIF_UPROBE		(1 << TIF_UPROBE)
-#define _TIF_PATCH_PENDING	(1 << TIF_PATCH_PENDING)
-#define _TIF_NEED_FPU_LOAD	(1 << TIF_NEED_FPU_LOAD)
-#define _TIF_NOCPUID		(1 << TIF_NOCPUID)
-#define _TIF_NOTSC		(1 << TIF_NOTSC)
-#define _TIF_IA32		(1 << TIF_IA32)
-#define _TIF_SLD		(1 << TIF_SLD)
-#define _TIF_NOHZ		(1 << TIF_NOHZ)
-#define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
-#define _TIF_IO_BITMAP		(1 << TIF_IO_BITMAP)
-#define _TIF_FORCED_TF		(1 << TIF_FORCED_TF)
-#define _TIF_BLOCKSTEP		(1 << TIF_BLOCKSTEP)
-#define _TIF_LAZY_MMU_UPDATES	(1 << TIF_LAZY_MMU_UPDATES)
-#define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
-#define _TIF_ADDR32		(1 << TIF_ADDR32)
-#define _TIF_X32		(1 << TIF_X32)
-#define _TIF_FSCHECK		(1 << TIF_FSCHECK)
+#define _TIF_SYSCALL_TRACE	(1UL << TIF_SYSCALL_TRACE)
+#define _TIF_NOTIFY_RESUME	(1UL << TIF_NOTIFY_RESUME)
+#define _TIF_SIGPENDING		(1UL << TIF_SIGPENDING)
+#define _TIF_NEED_RESCHED	(1UL << TIF_NEED_RESCHED)
+#define _TIF_SINGLESTEP		(1UL << TIF_SINGLESTEP)
+#define _TIF_SSBD		(1UL << TIF_SSBD)
+#define _TIF_SYSCALL_EMU	(1UL << TIF_SYSCALL_EMU)
+#define _TIF_SYSCALL_AUDIT	(1UL << TIF_SYSCALL_AUDIT)
+#define _TIF_SECCOMP		(1UL << TIF_SECCOMP)
+#define _TIF_SPEC_IB		(1UL << TIF_SPEC_IB)
+#define _TIF_SPEC_FORCE_UPDATE	(1UL << TIF_SPEC_FORCE_UPDATE)
+#define _TIF_USER_RETURN_NOTIFY	(1UL << TIF_USER_RETURN_NOTIFY)
+#define _TIF_UPROBE		(1UL << TIF_UPROBE)
+#define _TIF_PATCH_PENDING	(1UL << TIF_PATCH_PENDING)
+#define _TIF_NEED_FPU_LOAD	(1UL << TIF_NEED_FPU_LOAD)
+#define _TIF_NOCPUID		(1UL << TIF_NOCPUID)
+#define _TIF_NOTSC		(1UL << TIF_NOTSC)
+#define _TIF_IA32		(1UL << TIF_IA32)
+#define _TIF_NEED_RESCHED_LAZY	(1UL << TIF_NEED_RESCHED_LAZY)
+#define _TIF_NOHZ		(1UL << TIF_NOHZ)
+#define _TIF_POLLING_NRFLAG	(1UL << TIF_POLLING_NRFLAG)
+#define _TIF_IO_BITMAP		(1UL << TIF_IO_BITMAP)
+#define _TIF_FORCED_TF		(1UL << TIF_FORCED_TF)
+#define _TIF_BLOCKSTEP		(1UL << TIF_BLOCKSTEP)
+#define _TIF_LAZY_MMU_UPDATES	(1UL << TIF_LAZY_MMU_UPDATES)
+#define _TIF_SYSCALL_TRACEPOINT	(1UL << TIF_SYSCALL_TRACEPOINT)
+#define _TIF_ADDR32		(1UL << TIF_ADDR32)
+#define _TIF_X32		(1UL << TIF_X32)
+#define _TIF_FSCHECK		(1UL << TIF_FSCHECK)
+#define _TIF_SLD		(1UL << TIF_SLD)
 
 /*
  * work to do in syscall_trace_enter().  Also includes TIF_NOHZ for
@@ -168,6 +177,8 @@ struct thread_info {
 
 #define _TIF_WORK_CTXSW_PREV (_TIF_WORK_CTXSW|_TIF_USER_RETURN_NOTIFY)
 #define _TIF_WORK_CTXSW_NEXT (_TIF_WORK_CTXSW)
+
+#define _TIF_NEED_RESCHED_MASK	(_TIF_NEED_RESCHED | _TIF_NEED_RESCHED_LAZY)
 
 #define STACK_WARN		(THREAD_SIZE/8)
 

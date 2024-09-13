@@ -964,6 +964,10 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 		P(dl.runtime);
 		P(dl.deadline);
 	}
+#if defined(CONFIG_SMP)
+	P(migration_disabled);
+#endif
+	P(nr_cpus_allowed);
 #undef PN_SCHEDSTAT
 #undef P_SCHEDSTAT
 

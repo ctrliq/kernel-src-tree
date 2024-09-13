@@ -36,6 +36,7 @@
 #include <linux/cpu.h>
 #include <linux/sched/isolation.h>
 #include <linux/sched/task_stack.h>
+#include <linux/irq.h>
 
 #include <linux/delay.h>
 #include <linux/notifier.h>
@@ -1367,6 +1368,8 @@ static void vmbus_isr(void)
 		= this_cpu_ptr(hv_context.cpu_context);
 	void *page_addr;
 	struct hv_message *msg;
+	struct pt_regs *regs = get_irq_regs();
+	u64 ip = regs ? instruction_pointer(regs) : 0;
 
 	vmbus_chan_sched(hv_cpu);
 
@@ -1382,7 +1385,7 @@ static void vmbus_isr(void)
 			tasklet_schedule(&hv_cpu->msg_dpc);
 	}
 
-	add_interrupt_randomness(vmbus_interrupt);
+	add_interrupt_randomness(vmbus_interrupt, ip);
 }
 
 static irqreturn_t vmbus_percpu_isr(int irq, void *dev_id)

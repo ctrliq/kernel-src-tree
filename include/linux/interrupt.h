@@ -577,7 +577,7 @@ struct softirq_action
 asmlinkage void do_softirq(void);
 asmlinkage void __do_softirq(void);
 
-#ifdef __ARCH_HAS_DO_SOFTIRQ
+#if defined(__ARCH_HAS_DO_SOFTIRQ) && !defined(CONFIG_PREEMPT_RT)
 void do_softirq_own_stack(void);
 #else
 static inline void do_softirq_own_stack(void)
@@ -601,6 +601,34 @@ extern void __raise_softirq_irqoff(unsigned int nr);
 
 extern void raise_softirq_irqoff(unsigned int nr);
 extern void raise_softirq(unsigned int nr);
+
+#ifdef CONFIG_PREEMPT_RT
+DECLARE_PER_CPU(unsigned long, pending_timer_softirq);
+
+extern void raise_timer_softirq(void);
+extern void raise_hrtimer_softirq(void);
+
+static inline unsigned int local_pending_timers(void)
+{
+        return __this_cpu_read(pending_timer_softirq);
+}
+
+#else
+static inline void raise_timer_softirq(void)
+{
+	raise_softirq(TIMER_SOFTIRQ);
+}
+
+static inline void raise_hrtimer_softirq(void)
+{
+	raise_softirq_irqoff(HRTIMER_SOFTIRQ);
+}
+
+static inline unsigned int local_pending_timers(void)
+{
+        return local_softirq_pending();
+}
+#endif
 
 DECLARE_PER_CPU(struct task_struct *, ksoftirqd);
 
@@ -651,7 +679,7 @@ enum
 	TASKLET_STATE_RUN	/* Tasklet is running (SMP only) */
 };
 
-#ifdef CONFIG_SMP
+#if defined(CONFIG_SMP) || defined(CONFIG_PREEMPT_RT)
 static inline int tasklet_trylock(struct tasklet_struct *t)
 {
 	return !test_and_set_bit(TASKLET_STATE_RUN, &(t)->state);
@@ -663,10 +691,7 @@ static inline void tasklet_unlock(struct tasklet_struct *t)
 	clear_bit(TASKLET_STATE_RUN, &(t)->state);
 }
 
-static inline void tasklet_unlock_wait(struct tasklet_struct *t)
-{
-	while (test_bit(TASKLET_STATE_RUN, &(t)->state)) { barrier(); }
-}
+void tasklet_unlock_wait(struct tasklet_struct *t);
 
 /*
  * Do not use in new code. Waiting for tasklets from atomic contexts is
@@ -763,7 +788,7 @@ extern void tasklet_init(struct tasklet_struct *t,
  * if more than one irq occurred.
  */
 
-#if !defined(CONFIG_GENERIC_IRQ_PROBE) 
+#if !defined(CONFIG_GENERIC_IRQ_PROBE)
 static inline unsigned long probe_irq_on(void)
 {
 	return 0;

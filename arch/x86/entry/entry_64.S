@@ -240,7 +240,10 @@ syscall_return_via_sysret:
 
 	popq	%rdi
 	popq	%rsp
+
+SYM_INNER_LABEL(entry_SYSRETQ_unsafe_stack, SYM_L_GLOBAL)
 	USERGS_SYSRET64
+SYM_INNER_LABEL(entry_SYSRETQ_end, SYM_L_GLOBAL)
 SYM_CODE_END(entry_SYSCALL_64)
 
 /*
@@ -713,7 +716,23 @@ retint_kernel:
 	btl	$9, EFLAGS(%rsp)		/* were interrupts off? */
 	jnc	1f
 	cmpl	$0, PER_CPU_VAR(__preempt_count)
+#ifndef CONFIG_PREEMPT_LAZY
 	jnz	1f
+#else
+	jz	do_preempt_schedule_irq
+
+	# atleast preempt count == 0 ?
+	cmpl	$_PREEMPT_ENABLED,PER_CPU_VAR(__preempt_count)
+	jnz	1f
+
+	movq	PER_CPU_VAR(current_task), %rcx
+	cmpl	$0, TASK_TI_preempt_lazy_count(%rcx)
+	jnz	1f
+
+	btl	$TIF_NEED_RESCHED_LAZY,TASK_TI_flags(%rcx)
+	jnc	1f
+do_preempt_schedule_irq:
+#endif
 	call	preempt_schedule_irq
 1:
 #endif
@@ -1052,6 +1071,9 @@ idtentry coprocessor_error		do_coprocessor_error		has_error_code=0
 idtentry alignment_check		do_alignment_check		has_error_code=1
 idtentry simd_coprocessor_error		do_simd_coprocessor_error	has_error_code=0
 idtentry_vc vmm_communication		do_vmm_communication
+#ifdef CONFIG_INTEL_TDX_GUEST
+idtentry virtualization_exception	do_virtualization_exception	has_error_code=0
+#endif
 
 	/*
 	 * Reload gs selector with exception handling
@@ -1090,6 +1112,7 @@ EXPORT_SYMBOL(native_load_gs_index)
 	jmp	2b
 	.previous
 
+#ifndef CONFIG_PREEMPT_RT
 /* Call softirq on interrupt stack. Interrupts are off. */
 SYM_FUNC_START(do_softirq_own_stack)
 	pushq	%rbp
@@ -1100,6 +1123,7 @@ SYM_FUNC_START(do_softirq_own_stack)
 	leaveq
 	RET
 SYM_FUNC_END(do_softirq_own_stack)
+#endif
 
 #ifdef CONFIG_XEN_PV
 idtentry hypervisor_callback xen_do_hypervisor_callback has_error_code=0
