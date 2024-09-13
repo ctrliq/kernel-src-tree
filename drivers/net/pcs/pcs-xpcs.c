@@ -724,6 +724,10 @@ int xpcs_config_eee(struct mdio_xpcs_args *xpcs, int mult_fact_100ns,
 {
 	int ret;
 
+	ret = xpcs_read(xpcs, MDIO_MMD_VEND2, DW_VR_MII_EEE_MCTRL0);
+	if (ret < 0)
+		return ret;
+
 	if (enable) {
 	/* Enable EEE */
 		ret = DW_VR_MII_EEE_LTX_EN | DW_VR_MII_EEE_LRX_EN |
@@ -731,9 +735,6 @@ int xpcs_config_eee(struct mdio_xpcs_args *xpcs, int mult_fact_100ns,
 		      DW_VR_MII_EEE_TX_EN_CTRL | DW_VR_MII_EEE_RX_EN_CTRL |
 		      mult_fact_100ns << DW_VR_MII_EEE_MULT_FACT_100NS_SHIFT;
 	} else {
-		ret = xpcs_read(xpcs, MDIO_MMD_VEND2, DW_VR_MII_EEE_MCTRL0);
-		if (ret < 0)
-			return ret;
 		ret &= ~(DW_VR_MII_EEE_LTX_EN | DW_VR_MII_EEE_LRX_EN |
 		       DW_VR_MII_EEE_TX_QUIET_EN | DW_VR_MII_EEE_RX_QUIET_EN |
 		       DW_VR_MII_EEE_TX_EN_CTRL | DW_VR_MII_EEE_RX_EN_CTRL |
@@ -748,7 +749,11 @@ int xpcs_config_eee(struct mdio_xpcs_args *xpcs, int mult_fact_100ns,
 	if (ret < 0)
 		return ret;
 
-	ret |= DW_VR_MII_EEE_TRN_LPI;
+	if (enable)
+		ret |= DW_VR_MII_EEE_TRN_LPI;
+	else
+		ret &= ~DW_VR_MII_EEE_TRN_LPI;
+
 	return xpcs_write(xpcs, MDIO_MMD_VEND2, DW_VR_MII_EEE_MCTRL1, ret);
 }
 EXPORT_SYMBOL_GPL(xpcs_config_eee);
