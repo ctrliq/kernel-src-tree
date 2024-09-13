@@ -1186,7 +1186,8 @@ ice_aq_alloc_free_vsi_list(struct ice_hw *hw, u16 *vsi_list_id,
 	    lkup_type == ICE_SW_LKUP_ETHERTYPE ||
 	    lkup_type == ICE_SW_LKUP_ETHERTYPE_MAC ||
 	    lkup_type == ICE_SW_LKUP_PROMISC ||
-	    lkup_type == ICE_SW_LKUP_PROMISC_VLAN) {
+	    lkup_type == ICE_SW_LKUP_PROMISC_VLAN ||
+	    lkup_type == ICE_SW_LKUP_DFLT) {
 		sw_buf->res_type = cpu_to_le16(ICE_AQC_RES_TYPE_VSI_LIST_REP);
 	} else if (lkup_type == ICE_SW_LKUP_VLAN) {
 		sw_buf->res_type =
@@ -1319,6 +1320,64 @@ ice_aq_get_recipe(struct ice_hw *hw,
 	status = ice_aq_send_cmd(hw, &desc, s_recipe_list, buf_size, cd);
 	*num_recipes = le16_to_cpu(cmd->num_sub_recipes);
 
+	return status;
+}
+
+/**
+ * ice_update_recipe_lkup_idx - update a default recipe based on the lkup_idx
+ * @hw: pointer to the HW struct
+ * @params: parameters used to update the default recipe
+ *
+ * This function only supports updating default recipes and it only supports
+ * updating a single recipe based on the lkup_idx at a time.
+ *
+ * This is done as a read-modify-write operation. First, get the current recipe
+ * contents based on the recipe's ID. Then modify the field vector index and
+ * mask if it's valid at the lkup_idx. Finally, use the add recipe AQ to update
+ * the pre-existing recipe with the modifications.
+ */
+int
+ice_update_recipe_lkup_idx(struct ice_hw *hw,
+			   struct ice_update_recipe_lkup_idx_params *params)
+{
+	struct ice_aqc_recipe_data_elem *rcp_list;
+	u16 num_recps = ICE_MAX_NUM_RECIPES;
+	int status;
+
+	rcp_list = kcalloc(num_recps, sizeof(*rcp_list), GFP_KERNEL);
+	if (!rcp_list)
+		return -ENOMEM;
+
+	/* read current recipe list from firmware */
+	rcp_list->recipe_indx = params->rid;
+	status = ice_aq_get_recipe(hw, rcp_list, &num_recps, params->rid, NULL);
+	if (status) {
+		ice_debug(hw, ICE_DBG_SW, "Failed to get recipe %d, status %d\n",
+			  params->rid, status);
+		goto error_out;
+	}
+
+	/* only modify existing recipe's lkup_idx and mask if valid, while
+	 * leaving all other fields the same, then update the recipe firmware
+	 */
+	rcp_list->content.lkup_indx[params->lkup_idx] = params->fv_idx;
+	if (params->mask_valid)
+		rcp_list->content.mask[params->lkup_idx] =
+			cpu_to_le16(params->mask);
+
+	if (params->ignore_valid)
+		rcp_list->content.lkup_indx[params->lkup_idx] |=
+			ICE_AQ_RECIPE_LKUP_IGNORE;
+
+	status = ice_aq_add_recipe(hw, &rcp_list[0], 1, NULL);
+	if (status)
+		ice_debug(hw, ICE_DBG_SW, "Failed to update recipe %d lkup_idx %d fv_idx %d mask %d mask_valid %s, status %d\n",
+			  params->rid, params->lkup_idx, params->fv_idx,
+			  params->mask, params->mask_valid ? "true" : "false",
+			  status);
+
+error_out:
+	kfree(rcp_list);
 	return status;
 }
 
@@ -1621,8 +1680,6 @@ ice_init_port_info(struct ice_port_info *pi, u16 vsi_port_num, u8 type,
 		pi->sw_id = swid;
 		pi->pf_vf_num = pf_vf_num;
 		pi->is_vf = is_vf;
-		pi->dflt_tx_vsi_num = ICE_DFLT_VSI_INVAL;
-		pi->dflt_rx_vsi_num = ICE_DFLT_VSI_INVAL;
 		break;
 	default:
 		ice_debug(pi->hw, ICE_DBG_SW, "incorrect VSI/port type received\n");
@@ -1765,6 +1822,7 @@ ice_fill_sw_rule(struct ice_hw *hw, struct ice_fltr_info *f_info,
 		 struct ice_aqc_sw_rules_elem *s_rule, enum ice_adminq_opc opc)
 {
 	u16 vlan_id = ICE_MAX_VLAN_ID + 1;
+	u16 vlan_tpid = ETH_P_8021Q;
 	void *daddr = NULL;
 	u16 eth_hdr_sz;
 	u8 *eth_hdr;
@@ -1837,6 +1895,8 @@ ice_fill_sw_rule(struct ice_hw *hw, struct ice_fltr_info *f_info,
 		break;
 	case ICE_SW_LKUP_VLAN:
 		vlan_id = f_info->l_data.vlan.vlan_id;
+		if (f_info->l_data.vlan.tpid_valid)
+			vlan_tpid = f_info->l_data.vlan.tpid;
 		if (f_info->fltr_act == ICE_FWD_TO_VSI ||
 		    f_info->fltr_act == ICE_FWD_TO_VSI_LIST) {
 			act |= ICE_SINGLE_ACT_PRUNE;
@@ -1879,6 +1939,8 @@ ice_fill_sw_rule(struct ice_hw *hw, struct ice_fltr_info *f_info,
 	if (!(vlan_id > ICE_MAX_VLAN_ID)) {
 		off = (__force __be16 *)(eth_hdr + ICE_ETH_VLAN_TCI_OFFSET);
 		*off = cpu_to_be16(vlan_id);
+		off = (__force __be16 *)(eth_hdr + ICE_ETH_ETHTYPE_OFFSET);
+		*off = cpu_to_be16(vlan_tpid);
 	}
 
 	/* Create the switch rule with the final dummy Ethernet header */
@@ -2053,7 +2115,8 @@ ice_update_vsi_list_rule(struct ice_hw *hw, u16 *vsi_handle_arr, u16 num_vsi,
 	    lkup_type == ICE_SW_LKUP_ETHERTYPE ||
 	    lkup_type == ICE_SW_LKUP_ETHERTYPE_MAC ||
 	    lkup_type == ICE_SW_LKUP_PROMISC ||
-	    lkup_type == ICE_SW_LKUP_PROMISC_VLAN)
+	    lkup_type == ICE_SW_LKUP_PROMISC_VLAN ||
+	    lkup_type == ICE_SW_LKUP_DFLT)
 		rule_type = remove ? ICE_AQC_SW_RULES_T_VSI_LIST_CLEAR :
 			ICE_AQC_SW_RULES_T_VSI_LIST_SET;
 	else if (lkup_type == ICE_SW_LKUP_VLAN)
@@ -3236,7 +3299,7 @@ ice_rem_adv_rule_info(struct ice_hw *hw, struct list_head *rule_head)
 
 /**
  * ice_cfg_dflt_vsi - change state of VSI to set/clear default
- * @hw: pointer to the hardware structure
+ * @pi: pointer to the port_info structure
  * @vsi_handle: VSI handle to set as default
  * @set: true to add the above mentioned switch rule, false to remove it
  * @direction: ICE_FLTR_RX or ICE_FLTR_TX
@@ -3244,25 +3307,20 @@ ice_rem_adv_rule_info(struct ice_hw *hw, struct list_head *rule_head)
  * add filter rule to set/unset given VSI as default VSI for the switch
  * (represented by swid)
  */
-int ice_cfg_dflt_vsi(struct ice_hw *hw, u16 vsi_handle, bool set, u8 direction)
+int
+ice_cfg_dflt_vsi(struct ice_port_info *pi, u16 vsi_handle, bool set,
+		 u8 direction)
 {
-	struct ice_aqc_sw_rules_elem *s_rule;
+	struct ice_fltr_list_entry f_list_entry;
 	struct ice_fltr_info f_info;
-	enum ice_adminq_opc opcode;
-	u16 s_rule_size;
+	struct ice_hw *hw = pi->hw;
 	u16 hw_vsi_id;
 	int status;
 
 	if (!ice_is_vsi_valid(hw, vsi_handle))
 		return -EINVAL;
+
 	hw_vsi_id = ice_get_hw_vsi_num(hw, vsi_handle);
-
-	s_rule_size = set ? ICE_SW_RULE_RX_TX_ETH_HDR_SIZE :
-		ICE_SW_RULE_RX_TX_NO_HDR_SIZE;
-
-	s_rule = devm_kzalloc(ice_hw_to_dev(hw), s_rule_size, GFP_KERNEL);
-	if (!s_rule)
-		return -ENOMEM;
 
 	memset(&f_info, 0, sizeof(f_info));
 
@@ -3270,54 +3328,80 @@ int ice_cfg_dflt_vsi(struct ice_hw *hw, u16 vsi_handle, bool set, u8 direction)
 	f_info.flag = direction;
 	f_info.fltr_act = ICE_FWD_TO_VSI;
 	f_info.fwd_id.hw_vsi_id = hw_vsi_id;
+	f_info.vsi_handle = vsi_handle;
 
 	if (f_info.flag & ICE_FLTR_RX) {
 		f_info.src = hw->port_info->lport;
 		f_info.src_id = ICE_SRC_ID_LPORT;
-		if (!set)
-			f_info.fltr_rule_id =
-				hw->port_info->dflt_rx_vsi_rule_id;
 	} else if (f_info.flag & ICE_FLTR_TX) {
 		f_info.src_id = ICE_SRC_ID_VSI;
 		f_info.src = hw_vsi_id;
-		if (!set)
-			f_info.fltr_rule_id =
-				hw->port_info->dflt_tx_vsi_rule_id;
 	}
+	f_list_entry.fltr_info = f_info;
 
 	if (set)
-		opcode = ice_aqc_opc_add_sw_rules;
+		status = ice_add_rule_internal(hw, ICE_SW_LKUP_DFLT,
+					       &f_list_entry);
 	else
-		opcode = ice_aqc_opc_remove_sw_rules;
+		status = ice_remove_rule_internal(hw, ICE_SW_LKUP_DFLT,
+						  &f_list_entry);
 
-	ice_fill_sw_rule(hw, &f_info, s_rule, opcode);
+	return status;
+}
 
-	status = ice_aq_sw_rules(hw, s_rule, s_rule_size, 1, opcode, NULL);
-	if (status || !(f_info.flag & ICE_FLTR_TX_RX))
-		goto out;
-	if (set) {
-		u16 index = le16_to_cpu(s_rule->pdata.lkup_tx_rx.index);
+/**
+ * ice_vsi_uses_fltr - Determine if given VSI uses specified filter
+ * @fm_entry: filter entry to inspect
+ * @vsi_handle: VSI handle to compare with filter info
+ */
+static bool
+ice_vsi_uses_fltr(struct ice_fltr_mgmt_list_entry *fm_entry, u16 vsi_handle)
+{
+	return ((fm_entry->fltr_info.fltr_act == ICE_FWD_TO_VSI &&
+		 fm_entry->fltr_info.vsi_handle == vsi_handle) ||
+		(fm_entry->fltr_info.fltr_act == ICE_FWD_TO_VSI_LIST &&
+		 fm_entry->vsi_list_info &&
+		 (test_bit(vsi_handle, fm_entry->vsi_list_info->vsi_map))));
+}
 
-		if (f_info.flag & ICE_FLTR_TX) {
-			hw->port_info->dflt_tx_vsi_num = hw_vsi_id;
-			hw->port_info->dflt_tx_vsi_rule_id = index;
-		} else if (f_info.flag & ICE_FLTR_RX) {
-			hw->port_info->dflt_rx_vsi_num = hw_vsi_id;
-			hw->port_info->dflt_rx_vsi_rule_id = index;
-		}
-	} else {
-		if (f_info.flag & ICE_FLTR_TX) {
-			hw->port_info->dflt_tx_vsi_num = ICE_DFLT_VSI_INVAL;
-			hw->port_info->dflt_tx_vsi_rule_id = ICE_INVAL_ACT;
-		} else if (f_info.flag & ICE_FLTR_RX) {
-			hw->port_info->dflt_rx_vsi_num = ICE_DFLT_VSI_INVAL;
-			hw->port_info->dflt_rx_vsi_rule_id = ICE_INVAL_ACT;
+/**
+ * ice_check_if_dflt_vsi - check if VSI is default VSI
+ * @pi: pointer to the port_info structure
+ * @vsi_handle: vsi handle to check for in filter list
+ * @rule_exists: indicates if there are any VSI's in the rule list
+ *
+ * checks if the VSI is in a default VSI list, and also indicates
+ * if the default VSI list is empty
+ */
+bool
+ice_check_if_dflt_vsi(struct ice_port_info *pi, u16 vsi_handle,
+		      bool *rule_exists)
+{
+	struct ice_fltr_mgmt_list_entry *fm_entry;
+	struct ice_sw_recipe *recp_list;
+	struct list_head *rule_head;
+	struct mutex *rule_lock; /* Lock to protect filter rule list */
+	bool ret = false;
+
+	recp_list = &pi->hw->switch_info->recp_list[ICE_SW_LKUP_DFLT];
+	rule_lock = &recp_list->filt_rule_lock;
+	rule_head = &recp_list->filt_rules;
+
+	mutex_lock(rule_lock);
+
+	if (rule_exists && !list_empty(rule_head))
+		*rule_exists = true;
+
+	list_for_each_entry(fm_entry, rule_head, list_entry) {
+		if (ice_vsi_uses_fltr(fm_entry, vsi_handle)) {
+			ret = true;
+			break;
 		}
 	}
 
-out:
-	devm_kfree(ice_hw_to_dev(hw), s_rule);
-	return status;
+	mutex_unlock(rule_lock);
+
+	return ret;
 }
 
 /**
@@ -3434,21 +3518,6 @@ int ice_remove_vlan(struct ice_hw *hw, struct list_head *v_list)
 			return v_list_itr->status;
 	}
 	return 0;
-}
-
-/**
- * ice_vsi_uses_fltr - Determine if given VSI uses specified filter
- * @fm_entry: filter entry to inspect
- * @vsi_handle: VSI handle to compare with filter info
- */
-static bool
-ice_vsi_uses_fltr(struct ice_fltr_mgmt_list_entry *fm_entry, u16 vsi_handle)
-{
-	return ((fm_entry->fltr_info.fltr_act == ICE_FWD_TO_VSI &&
-		 fm_entry->fltr_info.vsi_handle == vsi_handle) ||
-		(fm_entry->fltr_info.fltr_act == ICE_FWD_TO_VSI_LIST &&
-		 fm_entry->vsi_list_info &&
-		 (test_bit(vsi_handle, fm_entry->vsi_list_info->vsi_map))));
 }
 
 /**
@@ -4100,6 +4169,23 @@ ice_find_recp(struct ice_hw *hw, struct ice_prot_lkup_ext *lkup_exts,
 		}
 	}
 	return ICE_MAX_NUM_RECIPES;
+}
+
+/**
+ * ice_change_proto_id_to_dvm - change proto id in prot_id_tbl
+ *
+ * As protocol id for outer vlan is different in dvm and svm, if dvm is
+ * supported protocol array record for outer vlan has to be modified to
+ * reflect the value proper for DVM.
+ */
+void ice_change_proto_id_to_dvm(void)
+{
+	u8 i;
+
+	for (i = 0; i < ARRAY_SIZE(ice_prot_id_tbl); i++)
+		if (ice_prot_id_tbl[i].type == ICE_VLAN_OFOS &&
+		    ice_prot_id_tbl[i].protocol_id != ICE_VLAN_OF_HW)
+			ice_prot_id_tbl[i].protocol_id = ICE_VLAN_OF_HW;
 }
 
 /**
