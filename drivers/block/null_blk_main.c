@@ -1535,7 +1535,7 @@ static int null_map_queues(struct blk_mq_tag_set *set)
 	return 0;
 }
 
-static int null_poll(struct blk_mq_hw_ctx *hctx, struct io_comp_batch *iob)
+static int null_poll(struct blk_mq_hw_ctx *hctx)
 {
 	struct nullb_queue *nq = hctx->driver_data;
 	LIST_HEAD(list);
