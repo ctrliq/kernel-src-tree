@@ -776,6 +776,10 @@ struct gfs2_sbd {
 
 	struct completion sd_journal_ready;
 
+	/* Workqueue stuff */
+
+	struct workqueue_struct *sd_delete_wq;
+
 	/* Daemon stuff */
 
 	struct task_struct *sd_logd_process;
