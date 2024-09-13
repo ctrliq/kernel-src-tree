@@ -490,7 +490,7 @@ int gfs2_instantiate(struct gfs2_holder *gh)
 
 again:
 	if (!test_bit(GLF_INSTANTIATE_NEEDED, &gl->gl_flags))
-		return 0;
+		goto done;
 
 	/*
 	 * Since we unlock the lockref lock, we set a flag to indicate
@@ -513,7 +513,13 @@ again:
 	if (!ret)
 		clear_bit(GLF_INSTANTIATE_NEEDED, &gl->gl_flags);
 	clear_and_wake_up_bit(GLF_INSTANTIATE_IN_PROG, &gl->gl_flags);
-	return ret;
+	if (ret)
+		return ret;
+
+done:
+	if (glops->go_held)
+		return glops->go_held(gh);
+	return 0;
 }
 
 /**
