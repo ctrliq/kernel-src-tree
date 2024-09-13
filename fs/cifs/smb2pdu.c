@@ -1420,7 +1420,7 @@ SMB2_sess_auth_rawntlmssp_negotiate(struct SMB2_sess_data *sess_data)
 					  &blob_length, ses,
 					  sess_data->nls_cp);
 	if (rc)
-		goto out_err;
+		goto out;
 
 	if (use_spnego) {
 		/* BB eventually need to add this */
