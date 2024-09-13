@@ -1335,6 +1335,8 @@ static unsigned char __swap_entry_free(struct swap_info_struct *p,
 	ci = lock_cluster_or_swap_info(p, offset);
 	usage = __swap_entry_free_locked(p, offset, usage);
 	unlock_cluster_or_swap_info(p, ci);
+	if (!usage)
+		free_swap_slot(entry);
 
 	return usage;
 }
@@ -1365,10 +1367,8 @@ void swap_free(swp_entry_t entry)
 	struct swap_info_struct *p;
 
 	p = _swap_info_get(entry);
-	if (p) {
-		if (!__swap_entry_free(p, entry, 1))
-			free_swap_slot(entry);
-	}
+	if (p)
+		__swap_entry_free(p, entry, 1);
 }
 
 /*
@@ -1841,8 +1841,6 @@ int free_swap_and_cache(swp_entry_t entry)
 		    !swap_page_trans_huge_swapped(p, entry))
 			__try_to_reclaim_swap(p, swp_offset(entry),
 					      TTRS_UNMAPPED | TTRS_FULL);
-		else if (!count)
-			free_swap_slot(entry);
 	}
 	return p != NULL;
 }
