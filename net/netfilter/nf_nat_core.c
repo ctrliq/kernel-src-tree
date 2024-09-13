@@ -1205,7 +1205,7 @@ static int __init nf_nat_init(void)
 
 	ret = nf_ct_extend_register(&nat_extend);
 	if (ret < 0) {
-		nf_ct_free_hashtable(nf_nat_bysource, nf_nat_htable_size);
+		kvfree(nf_nat_bysource);
 		pr_err("Unable to register extension\n");
 		return ret;
 	}
@@ -1239,7 +1239,7 @@ static void __exit nf_nat_cleanup(void)
 	RCU_INIT_POINTER(nf_nat_hook, NULL);
 
 	synchronize_net();
-	nf_ct_free_hashtable(nf_nat_bysource, nf_nat_htable_size);
+	kvfree(nf_nat_bysource);
 	unregister_pernet_subsys(&nat_net_ops);
 }
 
