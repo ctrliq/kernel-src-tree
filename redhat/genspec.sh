@@ -21,7 +21,7 @@ fi
 
 # The SPECRELEASE variable uses the SPECBUILDID variable which is
 # defined above.  IOW, don't remove SPECBUILDID ;)
-SPECRELEASE="${UPSTREAMBUILD}""${BUILD}""%{?buildid}%{?dist}"
+SPECRELEASE=${UPSTREAMBUILD}${BUILD}${RTTAG}.${RTBUILD}"%{?buildid}%{?dist}"
 
 EXCLUDE_FILES=":(exclude,top).get_maintainer.conf \
 		:(exclude,top).gitattributes \
@@ -53,6 +53,7 @@ fi
 # self-test begin
 test -f "$SOURCES/$SPECFILE" &&
 	sed -i -e "
+	s/%%PACKAGE_NAME%%/$PACKAGE_NAME/
 	s/%%SPECBUILDID%%/$SPECBUILDID/
 	s/%%SPECKVERSION%%/$SPECKVERSION/
 	s/%%SPECKPATCHLEVEL%%/$SPECKPATCHLEVEL/
@@ -91,8 +92,30 @@ clogf=$(mktemp)
 trap 'rm -f "$clogf" "$clogf".stripped' SIGHUP SIGINT SIGTERM EXIT
 "${0%/*}"/genlog.sh "$clogf"
 
+#Adjust the Resolves: line for kernel-rt
+if grep "^Resolves: $" "$clogf"; then
+	sed -i "s/^Resolves:/Resolves: rhbz#${RTBZ}/" "$clogf"
+else
+	sed -i "s/^Resolves:\(.*\)$/Resolves: rhbz#${RTBZ},\1/" "$clogf"
+fi
+
+### Should we use RT tracker BZs in the changelog?
+if [ -n "$RTCVES" ]; then
+	scripts/edit_cve_list_rt_changelog.py $clogf
+	mv -f $clogf.rt $clogf
+fi
+
 cat "$clogf" "$SOURCES/$SPECCHANGELOG" > "$clogf.full"
 mv -f "$clogf.full" "$SOURCES/$SPECCHANGELOG"
+
+### Should we manually edit the changelog?
+if [ -n "$EDITCLOG" ]; then
+	if [ -n "$EDITOR" ]; then
+		$EDITOR "$SOURCES/$SPECCHANGELOG"
+	else
+		vi "$SOURCES/$SPECCHANGELOG"
+	fi
+fi
 
 # genlog.py generates Resolves lines as well, strip these from RPM changelog
 grep -v -e "^Resolves: " "$SOURCES/$SPECCHANGELOG" > "$clogf".stripped

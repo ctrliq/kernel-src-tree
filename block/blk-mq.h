@@ -383,11 +383,12 @@ do {								\
 		rcu_read_unlock();				\
 	} else {						\
 		int srcu_idx;					\
+		struct request_queue *__q = (q);		\
 								\
 		might_sleep_if(check_sleep);			\
-		srcu_idx = srcu_read_lock((q)->srcu);		\
+		srcu_idx = srcu_read_lock(__q->srcu);		\
 		(dispatch_ops);					\
-		srcu_read_unlock((q)->srcu, srcu_idx);		\
+		srcu_read_unlock(__q->srcu, srcu_idx);		\
 	}							\
 } while (0)
 

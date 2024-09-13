@@ -65,9 +65,13 @@ FLAVOR=
 CURARCH := $(shell uname -m)
 ARCHCONFIG := $(shell uname -m | sed -e s/x86_64/X86_64/ \
 				     -e s/s390x/S390/ -e s/ppc.*/PPC/ )
+# Realtime variables
+RTBZ:=2228482
+RTTAG:=.$(shell cat $(REDHAT)/../localversion-rt | cut -c 2-)
+RTBUILD:=$(shell sed -n -e 's/^RTBUILD:=\.\(.*\)/\1/p' $(REDHAT)/../Makefile.rhelver)
 
 # rpm information
-SPECFILE:=$(PACKAGE_NAME).spec
+SPECFILE:=kernel.spec
 RPM:=$(REDHAT)/rpm
 SRPMS:=$(RPM)/SRPMS
 SOURCES:=$(RPM)/SOURCES
@@ -228,7 +232,7 @@ endif
 # $(PACKAGE_NAME)-$(BASEVERSION)                                                            $(DIST)
 # $(RELEASETAG)                                                                             $(DIST)
 #
-SPECBUILD:=$(UPSTREAMBUILD)$(BUILD)$(DISTLOCALVERSION)
+SPECBUILD:=$(UPSTREAMBUILD)$(BUILD)$(RTTAG).$(RTBUILD)$(DISTLOCALVERSION)
 SPECVERSION:=$(SPECKVERSION).$(SPECKPATCHLEVEL).$(SPECKSUBLEVEL)
 BASEVERSION:=$(SPECVERSION)-$(SPECBUILD)
 RELEASETAG:=$(PACKAGE_NAME)-$(BASEVERSION)
@@ -593,6 +597,7 @@ _setup-source: dist-git-version-check
 		echo "Creating $(SPECCHANGELOG) as copy of $(CHANGELOG_PREV)"; \
 		cp $(REDHAT)/$(CHANGELOG_PREV) $(REDHAT)/$(SPECCHANGELOG); \
 	fi
+
 	@if [ -z "$(RHSELFTESTDATA)" ]; then \
 		cp $(REDHAT)/$(SPECCHANGELOG) $(SOURCES)/$(SPECCHANGELOG); \
 	else \
@@ -636,6 +641,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		kvm_stat.logrotate \
 		mod-denylist.sh \
 		mod-internal.list \
+	    	mod-kvm.list \
 		mod-partner.list \
 		mod-sign.sh \
 		configs/flavors \
@@ -710,7 +716,7 @@ dist-release-changed:
 		$(MAKE) dist-release-finish; \
 	fi
 
-dist-release: dist-clean-sources
+dist-release: rt-cves dist-clean-sources
 	@$(MAKE) dist-release-changed
 
 dist-release-tag:
@@ -782,6 +788,12 @@ endif
 dist-rtg: dist-release
 	@$(MAKE) dist-release-tag
 	@$(MAKE) dist-git
+
+rt-cves:
+	@if [ -n "$(RTCVES)" ]; then \
+		echo "Verifying Bugzilla credentials..."; \
+		$(REDHAT)/scripts/bugzilla_login.py; \
+	fi
 
 # RH_LATEST returns the value of the latest "known good" kernel from brew.
 # This should not be confused with the latest top-of-tree development tag.
