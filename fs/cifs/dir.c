@@ -1,5 +1,4 @@
 /*
- *   fs/cifs/dir.c
  *
  *   vfs operations that deal with dentries
  *

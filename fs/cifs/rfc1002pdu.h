@@ -1,5 +1,4 @@
 /*
- *   fs/cifs/rfc1002pdu.h
  *
  *   Protocol Data Unit definitions for RFC 1001/1002 support
  *

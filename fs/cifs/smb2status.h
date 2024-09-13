@@ -1,5 +1,4 @@
 /*
- *   fs/cifs/smb2status.h
  *
  *   SMB2 Status code (network error) definitions
  *   Definitions are from MS-ERREF

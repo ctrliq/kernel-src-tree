@@ -1,5 +1,5 @@
 /*
- *   fs/cifs/fscache.h - CIFS filesystem cache interface definitions
+ *   CIFS filesystem cache interface definitions
  *
  *   Copyright (c) 2010 Novell, Inc.
  *   Authors(s): Suresh Jayaraman (sjayaraman@suse.de>

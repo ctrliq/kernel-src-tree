@@ -1,5 +1,5 @@
 /*
- *   fs/cifs/cifs_spnego.h -- SPNEGO upcall management for CIFS
+ *   SPNEGO upcall management for CIFS
  *
  *   Copyright (c) 2007 Red Hat, Inc.
  *   Author(s): Jeff Layton (jlayton@redhat.com)

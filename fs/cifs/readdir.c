@@ -1,5 +1,4 @@
 /*
- *   fs/cifs/readdir.c
  *
  *   Directory search handling
  *
