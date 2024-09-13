@@ -2635,22 +2635,28 @@ void mlx5e_set_netdev_mtu_boundaries(struct mlx5e_priv *priv)
 				ETH_MAX_MTU);
 }
 
-static void mlx5e_netdev_set_tcs(struct net_device *netdev, u16 nch, u8 ntc)
+static int mlx5e_netdev_set_tcs(struct net_device *netdev, u16 nch, u8 ntc)
 {
-	int tc;
+	int tc, err;
 
 	netdev_reset_tc(netdev);
 
 	if (ntc == 1)
-		return;
+		return 0;
 
-	netdev_set_num_tc(netdev, ntc);
+	err = netdev_set_num_tc(netdev, ntc);
+	if (err) {
+		netdev_WARN(netdev, "netdev_set_num_tc failed (%d), ntc = %d\n", err, ntc);
+		return err;
+	}
 
 	/* Map netdev TCs to offset 0
 	 * We have our own UP to TXQ mapping for QoS
 	 */
 	for (tc = 0; tc < ntc; tc++)
 		netdev_set_tc_queue(netdev, tc, nch, 0);
+
+	return 0;
 }
 
 int mlx5e_update_tx_netdev_queues(struct mlx5e_priv *priv)
@@ -2687,8 +2693,9 @@ static int mlx5e_update_netdev_queues(struct mlx5e_priv *priv)
 	ntc = priv->channels.params.num_tc;
 	num_rxqs = nch * priv->profile->rq_groups;
 
-	mlx5e_netdev_set_tcs(netdev, nch, ntc);
-
+	err = mlx5e_netdev_set_tcs(netdev, nch, ntc);
+	if (err)
+		goto err_out;
 	err = mlx5e_update_tx_netdev_queues(priv);
 	if (err)
 		goto err_tcs;
@@ -2710,6 +2717,7 @@ err_txqs:
 
 err_tcs:
 	mlx5e_netdev_set_tcs(netdev, old_num_txqs / old_ntc, old_ntc);
+err_out:
 	return err;
 }
 
