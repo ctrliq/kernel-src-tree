@@ -2543,6 +2543,9 @@ static void blk_mq_bio_to_request(struct request *rq, struct bio *bio,
 
 	rq->__sector = bio->bi_iter.bi_sector;
 	blk_rq_bio_prep(rq, bio, nr_segs);
+	if (bio_integrity(bio))
+		rq->nr_integrity_segments = blk_rq_count_integrity_sg(rq->q,
+								      bio);
 
 	/* This can't fail, since GFP_NOIO includes __GFP_DIRECT_RECLAIM. */
 	err = blk_crypto_rq_bio_prep(rq, bio, GFP_NOIO);
