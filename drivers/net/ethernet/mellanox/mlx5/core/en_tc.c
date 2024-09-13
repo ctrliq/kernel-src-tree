@@ -4998,7 +4998,7 @@ int mlx5e_tc_esw_init(struct rhashtable *tc_ht)
 					       uplink_priv->post_act);
 
 #if IS_ENABLED(CONFIG_MLX5_TC_SAMPLE)
-	uplink_priv->tc_psample = mlx5e_tc_sample_init(esw);
+	uplink_priv->tc_psample = mlx5e_tc_sample_init(esw, uplink_priv->post_act);
 #endif
 
 	mapping = mapping_create(sizeof(struct tunnel_match_key),
