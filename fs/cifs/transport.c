@@ -1,22 +1,10 @@
+// SPDX-License-Identifier: LGPL-2.1
 /*
  *
  *   Copyright (C) International Business Machines  Corp., 2002,2008
  *   Author(s): Steve French (sfrench@us.ibm.com)
  *   Jeremy Allison (jra@samba.org) 2006.
  *
- *   This library is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU Lesser General Public License as published
- *   by the Free Software Foundation; either version 2.1 of the License, or
- *   (at your option) any later version.
- *
- *   This library is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See
- *   the GNU Lesser General Public License for more details.
- *
- *   You should have received a copy of the GNU Lesser General Public License
- *   along with this library; if not, write to the Free Software
- *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  */
 
 #include <linux/fs.h>
@@ -211,10 +199,6 @@ smb_send_kvec(struct TCP_Server_Info *server, struct msghdr *smb_msg,
 
 	*sent = 0;
 
-	smb_msg->msg_name = NULL;
-	smb_msg->msg_namelen = 0;
-	smb_msg->msg_control = NULL;
-	smb_msg->msg_controllen = 0;
 	if (server->noblocksnd)
 		smb_msg->msg_flags = MSG_DONTWAIT + MSG_NOSIGNAL;
 	else
@@ -326,7 +310,7 @@ __smb_send_rqst(struct TCP_Server_Info *server, int num_rqst,
 	sigset_t mask, oldmask;
 	size_t total_len = 0, sent, size;
 	struct socket *ssocket = server->ssocket;
-	struct msghdr smb_msg;
+	struct msghdr smb_msg = {};
 	int val = 1;
 	__be32 rfc1002_marker;
 
@@ -453,7 +437,7 @@ unmask:
 		server->tcpStatus = CifsNeedReconnect;
 		spin_unlock(&GlobalMid_Lock);
 		trace_smb3_partial_send_reconnect(server->CurrentMid,
-						  server->hostname);
+						  server->conn_id, server->hostname);
 	}
 smbd_done:
 	/*
@@ -465,7 +449,10 @@ smbd_done:
 		cifs_server_dbg(VFS, "Error %d sending data on socket to server\n",
 			 rc);
 		rc = -ECONNABORTED;
-		cifs_signal_cifsd_for_reconnect(server, false);
+		spin_lock(&GlobalMid_Lock);
+		if (server->tcpStatus != CifsExiting)
+			server->tcpStatus = CifsNeedReconnect;
+		spin_unlock(&GlobalMid_Lock);
 	} else if (rc > 0)
 		rc = 0;
 
@@ -542,7 +529,7 @@ wait_for_free_credits(struct TCP_Server_Info *server, const int num_credits,
 	int *credits;
 	int optype;
 	long int t;
-	int scredits = server->credits;
+	int scredits, in_flight;
 
 	if (timeout < 0)
 		t = MAX_JIFFY_OFFSET;
@@ -566,23 +553,39 @@ wait_for_free_credits(struct TCP_Server_Info *server, const int num_credits,
 			server->max_in_flight = server->in_flight;
 		*credits -= 1;
 		*instance = server->reconnect_instance;
+		scredits = *credits;
+		in_flight = server->in_flight;
 		spin_unlock(&server->req_lock);
+
+		trace_smb3_add_credits(server->CurrentMid,
+				server->conn_id, server->hostname, scredits, -1, in_flight);
+		cifs_dbg(FYI, "%s: remove %u credits total=%d\n",
+				__func__, 1, scredits);
+
 		return 0;
 	}
 
 	while (1) {
 		if (*credits < num_credits) {
+			scredits = *credits;
 			spin_unlock(&server->req_lock);
+
 			cifs_num_waiters_inc(server);
 			rc = wait_event_killable_timeout(server->request_q,
 				has_credits(server, credits, num_credits), t);
 			cifs_num_waiters_dec(server);
 			if (!rc) {
+				spin_lock(&server->req_lock);
+				scredits = *credits;
+				in_flight = server->in_flight;
+				spin_unlock(&server->req_lock);
+
 				trace_smb3_credit_timeout(server->CurrentMid,
-					server->hostname, num_credits, 0);
+						server->conn_id, server->hostname, scredits,
+						num_credits, in_flight);
 				cifs_server_dbg(VFS, "wait timed out after %d ms\n",
-					 timeout);
-				return -ENOTSUPP;
+						timeout);
+				return -EBUSY;
 			}
 			if (rc == -ERESTARTSYS)
 				return -ERESTARTSYS;
@@ -610,6 +613,7 @@ wait_for_free_credits(struct TCP_Server_Info *server, const int num_credits,
 			    server->in_flight > 2 * MAX_COMPOUND &&
 			    *credits <= MAX_COMPOUND) {
 				spin_unlock(&server->req_lock);
+
 				cifs_num_waiters_inc(server);
 				rc = wait_event_killable_timeout(
 					server->request_q,
@@ -618,13 +622,18 @@ wait_for_free_credits(struct TCP_Server_Info *server, const int num_credits,
 					t);
 				cifs_num_waiters_dec(server);
 				if (!rc) {
+					spin_lock(&server->req_lock);
+					scredits = *credits;
+					in_flight = server->in_flight;
+					spin_unlock(&server->req_lock);
+
 					trace_smb3_credit_timeout(
-						server->CurrentMid,
-						server->hostname, num_credits,
-						0);
+							server->CurrentMid,
+							server->conn_id, server->hostname,
+							scredits, num_credits, in_flight);
 					cifs_server_dbg(VFS, "wait timed out after %d ms\n",
-						 timeout);
-					return -ENOTSUPP;
+							timeout);
+					return -EBUSY;
 				}
 				if (rc == -ERESTARTSYS)
 					return -ERESTARTSYS;
@@ -640,16 +649,18 @@ wait_for_free_credits(struct TCP_Server_Info *server, const int num_credits,
 			/* update # of requests on the wire to server */
 			if ((flags & CIFS_TIMEOUT_MASK) != CIFS_BLOCKING_OP) {
 				*credits -= num_credits;
-				scredits = *credits;
 				server->in_flight += num_credits;
 				if (server->in_flight > server->max_in_flight)
 					server->max_in_flight = server->in_flight;
 				*instance = server->reconnect_instance;
 			}
+			scredits = *credits;
+			in_flight = server->in_flight;
 			spin_unlock(&server->req_lock);
 
 			trace_smb3_add_credits(server->CurrentMid,
-					server->hostname, scredits, -(num_credits));
+					server->conn_id, server->hostname, scredits,
+					-(num_credits), in_flight);
 			cifs_dbg(FYI, "%s: remove %u credits total=%d\n",
 					__func__, num_credits, scredits);
 			break;
@@ -671,13 +682,13 @@ wait_for_compound_request(struct TCP_Server_Info *server, int num,
 			  const int flags, unsigned int *instance)
 {
 	int *credits;
-	int scredits, sin_flight;
+	int scredits, in_flight;
 
 	credits = server->ops->get_credits_field(server, flags & CIFS_OP_MASK);
 
 	spin_lock(&server->req_lock);
 	scredits = *credits;
-	sin_flight = server->in_flight;
+	in_flight = server->in_flight;
 
 	if (*credits < num) {
 		/*
@@ -699,10 +710,11 @@ wait_for_compound_request(struct TCP_Server_Info *server, int num,
 		if (server->in_flight == 0) {
 			spin_unlock(&server->req_lock);
 			trace_smb3_insufficient_credits(server->CurrentMid,
-					server->hostname, scredits, sin_flight);
+					server->conn_id, server->hostname, scredits,
+					num, in_flight);
 			cifs_dbg(FYI, "%s: %d requests in flight, needed %d total=%d\n",
-					__func__, sin_flight, num, scredits);
-			return -ENOTSUPP;
+					__func__, in_flight, num, scredits);
+			return -EDEADLK;
 		}
 	}
 	spin_unlock(&server->req_lock);

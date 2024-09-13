@@ -2677,11 +2677,10 @@ struct packet_type {
 					 struct net_device *);
 	bool			(*id_match)(struct packet_type *ptype,
 					    struct sock *sk);
-	struct net		*af_packet_net;
 	void			*af_packet_priv;
 	struct list_head	list;
 
-	RH_KABI_RESERVE(1)
+	RH_KABI_USE(1, struct net *af_packet_net)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
