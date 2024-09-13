@@ -58,6 +58,7 @@ struct mlx5e_neigh_update_table {
 };
 
 struct mlx5_tc_ct_priv;
+struct mlx5_tc_int_port_priv;
 struct mlx5e_rep_bond;
 struct mlx5e_tc_tun_encap;
 struct mlx5e_post_act;
@@ -98,6 +99,9 @@ struct mlx5_rep_uplink_priv {
 
 	/* tc tunneling encapsulation private data */
 	struct mlx5e_tc_tun_encap *encap;
+
+	/* OVS internal port support */
+	struct mlx5e_tc_int_port_priv *int_port_priv;
 };
 
 struct mlx5e_rep_priv {
@@ -148,7 +152,7 @@ struct mlx5e_neigh_hash_entry {
 	 */
 	refcount_t refcnt;
 
-	/* Save the last reported time offloaded trafic pass over one of the
+	/* Save the last reported time offloaded traffic pass over one of the
 	 * neigh hash entry flows. Use it to periodically update the neigh
 	 * 'used' value and avoid neigh deleting by the kernel.
 	 */

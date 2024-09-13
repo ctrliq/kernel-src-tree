@@ -2939,7 +2939,16 @@ __call_rcu(struct rcu_head *head, rcu_callback_t func)
 	head->func = func;
 	head->next = NULL;
 	local_irq_save(flags);
-	kasan_record_aux_stack(head);
+
+	/*
+	 * Commit 747402145a55 added the call to kasan_record_aux_stack()
+	 * which takes a lock with IRQs disabled, dangerous on kernel-rt.
+	 * Until a solution is accepted upstream, disabling this call.
+	 * RHBZ#1917950
+	*/
+	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
+		kasan_record_aux_stack(head);
+
 	rdp = this_cpu_ptr(&rcu_data);
 
 	/* Add the callback to our list. */

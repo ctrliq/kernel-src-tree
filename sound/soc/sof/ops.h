@@ -241,23 +241,7 @@ snd_sof_dsp_set_power_state(struct snd_sof_dev *sdev,
 }
 
 /* debug */
-static inline void snd_sof_dsp_dbg_dump(struct snd_sof_dev *sdev, u32 flags)
-{
-	if (sof_ops(sdev)->dbg_dump) {
-		dev_err(sdev->dev, "------------[ DSP dump start ]------------\n");
-		sof_ops(sdev)->dbg_dump(sdev, flags);
-		dev_err(sdev->dev, "------------[ DSP dump end ]------------\n");
-	}
-}
-
-static inline void snd_sof_ipc_dump(struct snd_sof_dev *sdev)
-{
-	if (sof_ops(sdev)->ipc_dump) {
-		dev_err(sdev->dev, "------------[ IPC dump start ]------------\n");
-		sof_ops(sdev)->ipc_dump(sdev);
-		dev_err(sdev->dev, "------------[ IPC dump end ]------------\n");
-	}
-}
+void snd_sof_dsp_dbg_dump(struct snd_sof_dev *sdev, u32 flags);
 
 static inline int snd_sof_debugfs_add_region_item(struct snd_sof_dev *sdev,
 		enum snd_sof_fw_blk_type blk_type, u32 offset, size_t size,
@@ -326,6 +310,21 @@ static inline int snd_sof_dsp_block_write(struct snd_sof_dev *sdev,
 					  u32 offset, void *src, size_t bytes)
 {
 	return sof_ops(sdev)->block_write(sdev, blk_type, offset, src, bytes);
+}
+
+/* mailbox IO */
+static inline void snd_sof_dsp_mailbox_read(struct snd_sof_dev *sdev,
+					    u32 offset, void *dest, size_t bytes)
+{
+	if (sof_ops(sdev)->mailbox_read)
+		sof_ops(sdev)->mailbox_read(sdev, offset, dest, bytes);
+}
+
+static inline void snd_sof_dsp_mailbox_write(struct snd_sof_dev *sdev,
+					     u32 offset, void *src, size_t bytes)
+{
+	if (sof_ops(sdev)->mailbox_write)
+		sof_ops(sdev)->mailbox_write(sdev, offset, src, bytes);
 }
 
 /* ipc */

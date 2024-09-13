@@ -183,6 +183,7 @@ enum xprt_transports {
 };
 
 struct rpc_xprt {
+	struct rcu_head		rcu;
 	struct kref		kref;		/* Reference count */
 	const struct rpc_xprt_ops *ops;		/* transport methods */
 
@@ -286,7 +287,6 @@ struct rpc_xprt {
 	struct dentry		*debugfs;		/* debugfs directory */
 	atomic_t		inject_disconnect;
 #endif
-	struct rcu_head		rcu;
 };
 
 #if defined(CONFIG_SUNRPC_BACKCHANNEL)

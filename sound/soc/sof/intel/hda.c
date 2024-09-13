@@ -41,17 +41,6 @@
 #define EXCEPT_MAX_HDR_SIZE	0x400
 #define HDA_EXT_ROM_STATUS_SIZE 8
 
-static const struct sof_intel_dsp_desc
-	*get_chip_info(struct snd_sof_pdata *pdata)
-{
-	const struct sof_dev_desc *desc = pdata->desc;
-	const struct sof_intel_dsp_desc *chip_info;
-
-	chip_info = desc->chip_info;
-
-	return chip_info;
-}
-
 int hda_ctrl_dai_widget_setup(struct snd_soc_dapm_widget *w)
 {
 	struct snd_sof_widget *swidget = w->dobj.private;
@@ -143,6 +132,17 @@ int hda_ctrl_dai_widget_free(struct snd_soc_dapm_widget *w)
 	sof_dai->configured = false;
 
 	return sof_widget_free(sdev, swidget);
+}
+
+static const struct sof_intel_dsp_desc
+	*get_chip_info(struct snd_sof_pdata *pdata)
+{
+	const struct sof_dev_desc *desc = pdata->desc;
+	const struct sof_intel_dsp_desc *chip_info;
+
+	chip_info = desc->chip_info;
+
+	return chip_info;
 }
 
 #if IS_ENABLED(CONFIG_SND_SOC_SOF_INTEL_SOUNDWIRE)
@@ -539,8 +539,7 @@ static void hda_dsp_dump_ext_rom_status(struct snd_sof_dev *sdev, u32 flags)
 		len += snprintf(msg + len, sizeof(msg) - len, " 0x%x", value);
 	}
 
-	sof_dev_dbg_or_err(sdev->dev, flags & SOF_DBG_DUMP_FORCE_ERR_LEVEL,
-			   "extended rom status: %s", msg);
+	dev_err(sdev->dev, "extended rom status: %s", msg);
 
 }
 
@@ -582,12 +581,9 @@ void hda_ipc_irq_dump(struct snd_sof_dev *sdev)
 	ppsts = snd_sof_dsp_read(sdev, HDA_DSP_PP_BAR, SOF_HDA_REG_PP_PPSTS);
 	rirbsts = snd_hdac_chip_readb(bus, RIRBSTS);
 
-	dev_err(sdev->dev,
-		"error: hda irq intsts 0x%8.8x intlctl 0x%8.8x rirb %2.2x\n",
+	dev_err(sdev->dev, "hda irq intsts 0x%8.8x intlctl 0x%8.8x rirb %2.2x\n",
 		intsts, intctl, rirbsts);
-	dev_err(sdev->dev,
-		"error: dsp irq ppsts 0x%8.8x adspis 0x%8.8x\n",
-		ppsts, adspis);
+	dev_err(sdev->dev, "dsp irq ppsts 0x%8.8x adspis 0x%8.8x\n", ppsts, adspis);
 }
 
 void hda_ipc_dump(struct snd_sof_dev *sdev)
@@ -605,8 +601,7 @@ void hda_ipc_dump(struct snd_sof_dev *sdev)
 
 	/* dump the IPC regs */
 	/* TODO: parse the raw msg */
-	dev_err(sdev->dev,
-		"error: host status 0x%8.8x dsp status 0x%8.8x mask 0x%8.8x\n",
+	dev_err(sdev->dev, "host status 0x%8.8x dsp status 0x%8.8x mask 0x%8.8x\n",
 		hipcie, hipct, hipcctl);
 }
 

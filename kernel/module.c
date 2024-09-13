@@ -71,7 +71,7 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/module.h>
 
-#include <linux/rh_features.h>
+#include <linux/rh_flags.h>
 
 #ifndef ARCH_SHF_SMALL
 #define ARCH_SHF_SMALL 0
@@ -4424,7 +4424,7 @@ void print_modules(void)
 		pr_cont(" [last unloaded: %s]", last_unloaded_module);
 	pr_cont("\n");
 
-	rh_print_used_features();
+	rh_print_flags();
 }
 
 #ifdef CONFIG_MODVERSIONS

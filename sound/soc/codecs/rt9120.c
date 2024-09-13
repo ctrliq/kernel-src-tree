@@ -79,7 +79,13 @@ struct rt9120_data {
 };
 
 /* 11bit [min,max,step] = [-103.9375dB, 24dB, 0.0625dB] */
-static const DECLARE_TLV_DB_SCALE(digital_gain, -1039375, 625, -1039375);
+static const DECLARE_TLV_DB_SCALE(digital_tlv, -1039375, 625, 1);
+
+/* {6, 8, 10, 12, 13, 14, 15, 16}dB */
+static const DECLARE_TLV_DB_RANGE(classd_tlv,
+	0, 3, TLV_DB_SCALE_ITEM(600, 200, 0),
+	4, 7, TLV_DB_SCALE_ITEM(1300, 100, 0)
+);
 
 static const char * const sdo_select_text[] = {
 	"None", "INTF", "Final", "RMS Detect"
@@ -90,8 +96,8 @@ static const struct soc_enum sdo_select_enum =
 			sdo_select_text);
 
 static const struct snd_kcontrol_new rt9120_snd_controls[] = {
-	SOC_SINGLE_TLV("MS Volume", RT9120_REG_MSVOL, 0, 2047, 1, digital_gain),
-	SOC_SINGLE("SPK Volume", RT9120_REG_SPKGAIN, 0, 7, 0),
+	SOC_SINGLE_TLV("MS Volume", RT9120_REG_MSVOL, 0, 2047, 1, digital_tlv),
+	SOC_SINGLE_TLV("SPK Gain Volume", RT9120_REG_SPKGAIN, 0, 7, 0, classd_tlv),
 	SOC_SINGLE("PBTL Switch", RT9120_REG_SYSCTL, 3, 1, 0),
 	SOC_ENUM("SDO Select", sdo_select_enum),
 };

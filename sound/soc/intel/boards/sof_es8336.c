@@ -566,4 +566,3 @@ module_platform_driver(sof_es8336_driver);
 MODULE_DESCRIPTION("ASoC Intel(R) SOF + ES8336 Machine driver");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS("platform:sof-essx8336");
-MODULE_IMPORT_NS(SND_SOC_INTEL_HDA_DSP_COMMON);

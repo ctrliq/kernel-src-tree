@@ -1112,7 +1112,7 @@ xfs_log_cover(
 	bool			need_covered;
 
 	ASSERT((xlog_cil_empty(mp->m_log) && xlog_iclogs_empty(mp->m_log) &&
-	        !xfs_ail_min_lsn(mp->m_log->l_ailp)) ||
+		!xfs_ail_min_lsn(mp->m_log->l_ailp)) ||
 	       XFS_FORCED_SHUTDOWN(mp));
 
 	if (!xfs_log_writable(mp))

@@ -319,7 +319,8 @@ linked_maps.skel.h-deps := linked_maps1.o linked_maps2.o
 
 LINKED_BPF_SRCS := $(patsubst %.o,%.c,$(foreach skel,$(LINKED_SKELS),$($(skel)-deps)))
 
-RHSKIP_FILTER := awk -F: '!/:/ || /:$(ARCH)/ {print $$$$1}'
+RHSKIP_FILTER := awk -F: '!/:/ || /:$(ARCH)/ {print $$1}'
+RHSKIP_FILTER_EVAL := $(subst $$,$$$$,$(RHSKIP_FILTER))
 
 # Set up extra TRUNNER_XXX "temporary" variables in the environment (relies on
 # $eval()) and pass control to DEFINE_TEST_RUNNER_RULES.
@@ -330,7 +331,7 @@ define DEFINE_TEST_RUNNER
 
 TRUNNER_OUTPUT := $(OUTPUT)$(if $2,/)$2
 TRUNNER_BINARY := $1$(if $2,-)$2
-TRUNNER_TESTS_RHSKIP := $$(shell $(RHSKIP_FILTER) 			\
+TRUNNER_TESTS_RHSKIP := $$(shell $(RHSKIP_FILTER_EVAL)			\
 				 $$(TRUNNER_TESTS_DIR)/rhskip 2>/dev/null)
 TRUNNER_TEST_OBJS := $$(patsubst %.c,$$(TRUNNER_OUTPUT)/%.test.o,	\
 				 $$(filter-out $$(TRUNNER_TESTS_RHSKIP),\
@@ -339,7 +340,7 @@ TRUNNER_EXTRA_OBJS := $$(patsubst %.c,$$(TRUNNER_OUTPUT)/%.o,		\
 				 $$(filter %.c,$(TRUNNER_EXTRA_SOURCES)))
 TRUNNER_EXTRA_HDRS := $$(filter %.h,$(TRUNNER_EXTRA_SOURCES))
 TRUNNER_TESTS_HDR := $(TRUNNER_TESTS_DIR)/tests.h
-TRUNNER_BPF_RHSKIP := $$(shell $(RHSKIP_FILTER)				\
+TRUNNER_BPF_RHSKIP := $$(shell $(RHSKIP_FILTER_EVAL)			\
 			       $$(TRUNNER_BPF_PROGS_DIR)/rhskip 2>/dev/null)
 TRUNNER_BPF_SRCS := $$(filter-out $$(TRUNNER_BPF_RHSKIP),		\
 				  $$(notdir $$(wildcard $(TRUNNER_BPF_PROGS_DIR)/*.c)))
@@ -407,8 +408,8 @@ $(TRUNNER_TESTS_HDR): $(TRUNNER_TESTS_DIR)/*.c				\
 	$$(shell ( cd $(TRUNNER_TESTS_DIR);				\
 		  echo '/* Generated header, do not edit */';		\
 		  ls *.c 2> /dev/null |					\
-		  ([[ -f rhskip ]] && 					\
-		   grep -v "`$(RHSKIP_FILTER) rhskip`" || cat		\
+		  ([ -f rhskip ] && 					\
+		   grep -v "`$(RHSKIP_FILTER_EVAL) rhskip`" || cat	\
 		  ) |							\
 			sed -e 's@\([^\.]*\)\.c@DEFINE_TEST(\1)@';	\
 		 ) > $$@)
@@ -491,11 +492,16 @@ $(eval $(call DEFINE_TEST_RUNNER,test_maps))
 # It is much simpler than test_maps/test_progs and sufficiently different from
 # them (e.g., test.h is using completely pattern), that it's worth just
 # explicitly defining all the rules explicitly.
-verifier/tests.h: verifier/*.c
+verifier/tests.h: verifier/*.c \
+		  $(wildcard verifier/rhskip)
 	$(shell ( cd verifier/; \
 		  echo '/* Generated header, do not edit */'; \
 		  echo '#ifdef FILL_ARRAY'; \
-		  ls *.c 2> /dev/null | sed -e 's@\(.*\)@#include \"\1\"@'; \
+		  ls *.c 2> /dev/null | \
+		  ([ -f rhskip ] && \
+		   grep -v "`$(RHSKIP_FILTER) rhskip`" || cat \
+		  ) | \
+		  sed -e 's@\(.*\)@#include \"\1\"@'; \
 		  echo '#endif' \
 		) > verifier/tests.h)
 $(OUTPUT)/test_verifier: test_verifier.c verifier/tests.h $(BPFOBJ) | $(OUTPUT)

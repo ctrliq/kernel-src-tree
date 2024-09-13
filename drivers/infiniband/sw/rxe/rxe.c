@@ -285,7 +285,7 @@ static int __init rxe_module_init(void)
 {
 	int err;
 
-	mark_driver_deprecated(THIS_MODULE->name);
+	mark_driver_unmaintained(THIS_MODULE->name);
 
 	err = rxe_net_init();
 	if (err)

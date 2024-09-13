@@ -33,7 +33,7 @@
 #endif
 #include <linux/bpf-netns.h>
 
-#include <linux/rh_features.h>
+#include <linux/rh_flags.h>
 
 static void dissector_set_key(struct flow_dissector *flow_dissector,
 			      enum flow_dissector_key_id key_id)
@@ -77,7 +77,7 @@ int flow_dissector_bpf_prog_attach_check(struct net *net,
 {
 	enum netns_bpf_attach_type type = NETNS_BPF_FLOW_DISSECTOR;
 
-	rh_mark_used_feature("eBPF/flowdissector");
+	rh_add_flag("eBPF/flowdissector");
 
 	if (net == &init_net) {
 		/* BPF flow dissector in the root namespace overrides

@@ -313,7 +313,7 @@ const struct snd_soc_dai_ops asoc_acp_cpu_dai_ops = {
 	.prepare = acp_i2s_prepare,
 	.trigger = acp_i2s_trigger,
 };
-EXPORT_SYMBOL_NS_GPL(asoc_acp_cpu_dai_ops, SND_SOC_ACP_COMMON);
+EXPORT_SYMBOL(asoc_acp_cpu_dai_ops);
 
 int asoc_acp_i2s_probe(struct snd_soc_dai *dai)
 {
@@ -334,7 +334,7 @@ int asoc_acp_i2s_probe(struct snd_soc_dai *dai)
 
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(asoc_acp_i2s_probe, SND_SOC_ACP_COMMON);
+EXPORT_SYMBOL(asoc_acp_i2s_probe);
 
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_ALIAS(DRV_NAME);

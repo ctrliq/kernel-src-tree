@@ -367,20 +367,3 @@ void crash_free_reserved_phys_range(unsigned long begin, unsigned long end)
 	}
 }
 #endif /* CONFIG_HIBERNATION */
-
-void arch_crash_save_vmcoreinfo(void)
-{
-	VMCOREINFO_NUMBER(VA_BITS);
-	VMCOREINFO_NUMBER(MAX_PHYSMEM_BITS);
-
-	/* MAX_USER_VA_BITS was removed but keep VA_BITS here for compatibility
-	 * reasons due to RHEL commit 68bdded37d6a ([arm64] arm64, vmcoreinfo :
-	 * Append 'MAX_USER_VA_BITS' to vmcoreinfo) */
-	VMCOREINFO_NUMBER(VA_BITS);
-	/* Please note VMCOREINFO_NUMBER() uses "%d", not "%x" */
-	vmcoreinfo_append_str("NUMBER(kimage_voffset)=0x%llx\n",
-						kimage_voffset);
-	vmcoreinfo_append_str("NUMBER(PHYS_OFFSET)=0x%llx\n",
-						PHYS_OFFSET);
-	vmcoreinfo_append_str("KERNELOFFSET=%lx\n", kaslr_offset());
-}

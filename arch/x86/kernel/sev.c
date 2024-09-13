@@ -255,7 +255,6 @@ Efault:
 	pagefault_enable();
 	return -EFAULT;
 }
-
 static int vc_fetch_insn_kernel(struct es_em_ctxt *ctxt,
 				unsigned char *buffer)
 {

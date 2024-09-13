@@ -1378,6 +1378,7 @@ struct sctp_endpoint {
 	      reconf_enable:1;
 
 	__u8  strreset_enable;
+	struct rcu_head rcu;
 };
 
 /* Recover the outter endpoint structure. */
@@ -1393,7 +1394,7 @@ static inline struct sctp_endpoint *sctp_ep(struct sctp_ep_common *base)
 struct sctp_endpoint *sctp_endpoint_new(struct sock *, gfp_t);
 void sctp_endpoint_free(struct sctp_endpoint *);
 void sctp_endpoint_put(struct sctp_endpoint *);
-void sctp_endpoint_hold(struct sctp_endpoint *);
+int sctp_endpoint_hold(struct sctp_endpoint *ep);
 void sctp_endpoint_add_asoc(struct sctp_endpoint *, struct sctp_association *);
 struct sctp_association *sctp_endpoint_lookup_assoc(
 	const struct sctp_endpoint *ep,
@@ -1586,6 +1587,8 @@ struct sctp_priv_assoc_stats {
 
 /* Here we have information about each individual association. */
 struct sctp_association {
+
+	struct rcu_head rcu;
 
 	/* A base structure common to endpoint and association.
 	 * In this context, it represents the associations's view
@@ -2125,8 +2128,6 @@ struct sctp_association {
 
 	u32 secid;
 	u32 peer_secid;
-
-	struct rcu_head rcu;
 };
 
 

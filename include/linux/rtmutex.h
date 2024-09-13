@@ -16,6 +16,7 @@
 #include <linux/compiler.h>
 #include <linux/linkage.h>
 #include <linux/rbtree_types.h>
+#include <linux/rh_kabi.h>
 #include <linux/spinlock_types_raw.h>
 
 extern int max_lock_depth; /* for sysctl */

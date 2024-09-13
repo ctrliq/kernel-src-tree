@@ -194,6 +194,8 @@ kgdb_arch_handle_exception(int vector, int signo, int err_code,
  */
 extern void kgdb_roundup_cpus(unsigned long flags);
 
+extern void kgdb_roundup_cpu(unsigned int cpu);
+
 /**
  *	kgdb_arch_set_pc - Generic call back to the program counter
  *	@regs: Current &struct pt_regs.
@@ -323,5 +325,6 @@ extern void __init dbg_late_init(void);
 #else /* ! CONFIG_KGDB */
 #define in_dbg_master() (0)
 #define dbg_late_init()
+static inline void kgdb_roundup_cpu(unsigned int cpu) {}
 #endif /* ! CONFIG_KGDB */
 #endif /* _KGDB_H_ */

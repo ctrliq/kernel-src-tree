@@ -11,7 +11,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/skbuff.h>
-#include <linux/rh_features.h>
+#include <linux/rh_flags.h>
 #include <linux/rtnetlink.h>
 #include <linux/if_vlan.h>
 #include <net/netlink.h>
@@ -200,7 +200,7 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 			push_prio = nla_get_u8(tb[TCA_VLAN_PUSH_VLAN_PRIORITY]);
 		break;
 	case TCA_VLAN_ACT_POP_ETH:
-		rh_mark_used_feature("act_vlan/pop_eth");
+		rh_add_flag("act_vlan/pop_eth");
 		break;
 	case TCA_VLAN_ACT_PUSH_ETH:
 		if (!tb[TCA_VLAN_PUSH_ETH_DST] || !tb[TCA_VLAN_PUSH_ETH_SRC]) {
@@ -210,7 +210,7 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 				tcf_idr_cleanup(tn, index);
 			return -EINVAL;
 		}
-		rh_mark_used_feature("act_vlan/push_eth");
+		rh_add_flag("act_vlan/push_eth");
 		break;
 	default:
 		if (exists)

@@ -2693,8 +2693,7 @@ static int rt5682s_register_dai_clks(struct snd_soc_component *component)
 
 	for (i = 0; i < RT5682S_DAI_NUM_CLKS; ++i) {
 		struct clk_init_data init = { };
-		struct clk_parent_data parent_data;
-		const struct clk_hw *parent;
+		const char *parent_name;
 
 		dai_clk_hw = &rt5682s->dai_clks_hw[i];
 
@@ -2702,17 +2701,15 @@ static int rt5682s_register_dai_clks(struct snd_soc_component *component)
 		case RT5682S_DAI_WCLK_IDX:
 			/* Make MCLK the parent of WCLK */
 			if (rt5682s->mclk) {
-				parent_data = (struct clk_parent_data){
-					.fw_name = "mclk",
-				};
-				init.parent_data = &parent_data;
+				parent_name = __clk_get_name(rt5682s->mclk);
+				init.parent_names = &parent_name;
 				init.num_parents = 1;
 			}
 			break;
 		case RT5682S_DAI_BCLK_IDX:
 			/* Make WCLK the parent of BCLK */
-			parent = &rt5682s->dai_clks_hw[RT5682S_DAI_WCLK_IDX];
-			init.parent_hws = &parent;
+			parent_name = clk_hw_get_name(&rt5682s->dai_clks_hw[RT5682S_DAI_WCLK_IDX]);
+			init.parent_names = &parent_name;
 			init.num_parents = 1;
 			break;
 		default:

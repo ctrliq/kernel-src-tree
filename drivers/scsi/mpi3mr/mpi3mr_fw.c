@@ -448,7 +448,7 @@ mpi3mr_get_reply_desc(struct op_reply_qinfo *op_reply_q, u32 reply_ci)
 	return reply_desc;
 }
 
-static int mpi3mr_process_op_reply_q(struct mpi3mr_ioc *mrioc,
+int mpi3mr_process_op_reply_q(struct mpi3mr_ioc *mrioc,
 	struct mpi3mr_intr_info *intr_info)
 {
 	struct op_reply_qinfo *op_reply_q = intr_info->op_reply_q;
@@ -3912,8 +3912,8 @@ int mpi3mr_soft_reset_handler(struct mpi3mr_ioc *mrioc,
 	mpi3mr_flush_drv_cmds(mrioc);
 	memset(mrioc->devrem_bitmap, 0, mrioc->devrem_bitmap_sz);
 	memset(mrioc->removepend_bitmap, 0, mrioc->dev_handle_bitmap_sz);
-	mpi3mr_cleanup_fwevt_list(mrioc);
 	mpi3mr_flush_host_io(mrioc);
+	mpi3mr_cleanup_fwevt_list(mrioc);
 	mpi3mr_invalidate_devhandles(mrioc);
 	mpi3mr_memset_buffers(mrioc);
 	retval = mpi3mr_init_ioc(mrioc, MPI3MR_IT_RESET);

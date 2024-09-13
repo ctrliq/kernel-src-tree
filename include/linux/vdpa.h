@@ -6,6 +6,8 @@
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/vhost_iotlb.h>
+#include <linux/virtio_net.h>
+#include <linux/if_ether.h>
 
 /**
  * struct vdpa_calllback - vDPA callback definition.
@@ -95,6 +97,15 @@ struct vdpa_iova_range {
 	u64 last;
 };
 
+struct vdpa_dev_set_config {
+	struct {
+		u8 mac[ETH_ALEN];
+		u16 mtu;
+		u16 max_vq_pairs;
+	} net;
+	u64 mask;
+};
+
 /**
  * Corresponding file area for device memory mapping
  * @file: vma->vm_file for the mapping
@@ -161,14 +172,17 @@ struct vdpa_map_file {
  *				for the device
  *				@vdev: vdpa device
  *				Returns virtqueue algin requirement
- * @get_features:		Get virtio features supported by the device
+ * @get_device_features:	Get virtio features supported by the device
  *				@vdev: vdpa device
  *				Returns the virtio features support by the
  *				device
- * @set_features:		Set virtio features supported by the driver
+ * @set_driver_features:	Set virtio features supported by the driver
  *				@vdev: vdpa device
  *				@features: feature support by the driver
  *				Returns integer: success (0) or error (< 0)
+ * @get_driver_features:	Get the virtio driver features in action
+ *				@vdev: vdpa device
+ *				Returns the virtio features accepted
  * @set_config_cb:		Set the config interrupt callback
  *				@vdev: vdpa device
  *				@cb: virtio-vdev interrupt callback structure
@@ -268,8 +282,9 @@ struct vdpa_config_ops {
 
 	/* Device ops */
 	u32 (*get_vq_align)(struct vdpa_device *vdev);
-	u64 (*get_features)(struct vdpa_device *vdev);
-	int (*set_features)(struct vdpa_device *vdev, u64 features);
+	u64 (*get_device_features)(struct vdpa_device *vdev);
+	int (*set_driver_features)(struct vdpa_device *vdev, u64 features);
+	u64 (*get_driver_features)(struct vdpa_device *vdev);
 	void (*set_config_cb)(struct vdpa_device *vdev,
 			      struct vdpa_callback *cb);
 	u16 (*get_vq_num_max)(struct vdpa_device *vdev);
@@ -377,17 +392,29 @@ static inline struct device *vdpa_get_dma_dev(struct vdpa_device *vdev)
 static inline int vdpa_reset(struct vdpa_device *vdev)
 {
 	const struct vdpa_config_ops *ops = vdev->config;
+	int ret;
 
+	mutex_lock(&vdev->cf_mutex);
 	vdev->features_valid = false;
-	return ops->reset(vdev);
+	ret = ops->reset(vdev);
+	mutex_unlock(&vdev->cf_mutex);
+	return ret;
 }
 
-static inline int vdpa_set_features(struct vdpa_device *vdev, u64 features)
+static inline int vdpa_set_features(struct vdpa_device *vdev, u64 features, bool locked)
 {
 	const struct vdpa_config_ops *ops = vdev->config;
+	int ret;
+
+	if (!locked)
+		mutex_lock(&vdev->cf_mutex);
 
 	vdev->features_valid = true;
-	return ops->set_features(vdev, features);
+	ret = ops->set_driver_features(vdev, features);
+	if (!locked)
+		mutex_unlock(&vdev->cf_mutex);
+
+	return ret;
 }
 
 void vdpa_get_config(struct vdpa_device *vdev, unsigned int offset,
@@ -401,6 +428,7 @@ void vdpa_set_status(struct vdpa_device *vdev, u8 status);
  * @dev_add: Add a vdpa device using alloc and register
  *	     @mdev: parent device to use for device addition
  *	     @name: name of the new vdpa device
+ *	     @config: config attributes to apply to the device under creation
  *	     Driver need to add a new device using _vdpa_register_device()
  *	     after fully initializing the vdpa device. Driver must return 0
  *	     on success or appropriate error code.
@@ -411,7 +439,8 @@ void vdpa_set_status(struct vdpa_device *vdev, u8 status);
  *	     _vdpa_unregister_device().
  */
 struct vdpa_mgmtdev_ops {
-	int (*dev_add)(struct vdpa_mgmt_dev *mdev, const char *name);
+	int (*dev_add)(struct vdpa_mgmt_dev *mdev, const char *name,
+		       const struct vdpa_dev_set_config *config);
 	void (*dev_del)(struct vdpa_mgmt_dev *mdev, struct vdpa_device *dev);
 };
 
@@ -420,13 +449,18 @@ struct vdpa_mgmtdev_ops {
  * @device: Management parent device
  * @ops: operations supported by management device
  * @id_table: Pointer to device id table of supported ids
+ * @config_attr_mask: bit mask of attributes of type enum vdpa_attr that
+ *		      management device support during dev_add callback
  * @list: list entry
  */
 struct vdpa_mgmt_dev {
 	struct device *device;
 	const struct vdpa_mgmtdev_ops *ops;
 	const struct virtio_device_id *id_table;
+	u64 config_attr_mask;
 	struct list_head list;
+	u64 supported_features;
+	u32 max_supported_vqs;
 };
 
 int vdpa_mgmtdev_register(struct vdpa_mgmt_dev *mdev);

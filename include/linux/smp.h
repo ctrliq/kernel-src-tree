@@ -23,6 +23,9 @@ struct __call_single_data {
 	unsigned int flags;
 };
 
+#define CSD_INIT(_func, _info) \
+	(struct __call_single_data){ .func = (_func), .info = (_info), .flags = 0, }
+
 /* Use __aligned() to avoid to use 2 cache lines for 1 csd */
 typedef struct __call_single_data call_single_data_t
 	__aligned(sizeof(struct __call_single_data));
@@ -221,6 +224,9 @@ static inline int get_boot_cpu_id(void)
 
 #define get_cpu()		({ preempt_disable(); __smp_processor_id(); })
 #define put_cpu()		preempt_enable()
+
+#define get_cpu_light()		({ migrate_disable(); __smp_processor_id(); })
+#define put_cpu_light()		migrate_enable()
 
 /*
  * Callback to arch code if there's nosmp or maxcpus=0 on the

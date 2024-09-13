@@ -307,7 +307,7 @@ static u64 virtio_vdpa_get_features(struct virtio_device *vdev)
 	struct vdpa_device *vdpa = vd_get_vdpa(vdev);
 	const struct vdpa_config_ops *ops = vdpa->config;
 
-	return ops->get_features(vdpa);
+	return ops->get_device_features(vdpa);
 }
 
 static int virtio_vdpa_finalize_features(struct virtio_device *vdev)
@@ -317,7 +317,7 @@ static int virtio_vdpa_finalize_features(struct virtio_device *vdev)
 	/* Give virtio_ring a chance to accept features. */
 	vring_transport_features(vdev);
 
-	return vdpa_set_features(vdpa, vdev->features);
+	return vdpa_set_features(vdpa, vdev->features, false);
 }
 
 static const char *virtio_vdpa_bus_name(struct virtio_device *vdev)

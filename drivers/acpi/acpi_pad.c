@@ -96,7 +96,7 @@ static void round_robin_cpu(unsigned int tsk_index)
 	cpumask_var_t tmp;
 	int cpu;
 	unsigned long min_weight = -1;
-	unsigned long preferred_cpu = (unsigned long)smp_processor_id() ;
+	unsigned long preferred_cpu = (unsigned long)raw_smp_processor_id();
 
 	if (!alloc_cpumask_var(&tmp, GFP_KERNEL))
 		return;

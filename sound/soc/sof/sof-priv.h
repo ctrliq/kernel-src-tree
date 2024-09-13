@@ -23,13 +23,23 @@
 /* debug flags */
 #define SOF_DBG_ENABLE_TRACE	BIT(0)
 #define SOF_DBG_RETAIN_CTX	BIT(1)	/* prevent DSP D3 on FW exception */
+#define SOF_DBG_VERIFY_TPLG	BIT(2) /* verify topology during load */
+#define SOF_DBG_DYNAMIC_PIPELINES_OVERRIDE	BIT(3) /* 0: use topology token
+							* 1: override topology
+							*/
+#define SOF_DBG_DYNAMIC_PIPELINES_ENABLE	BIT(4) /* 0: use static pipelines
+							* 1: use dynamic pipelines
+							*/
+#define SOF_DBG_DISABLE_MULTICORE		BIT(5) /* schedule all pipelines/widgets
+							* on primary core
+							*/
+#define SOF_DBG_PRINT_ALL_DUMPS		BIT(6) /* Print all ipc and dsp dumps */
 
 #define SOF_DBG_DUMP_REGS		BIT(0)
 #define SOF_DBG_DUMP_MBOX		BIT(1)
 #define SOF_DBG_DUMP_TEXT		BIT(2)
 #define SOF_DBG_DUMP_PCI		BIT(3)
-#define SOF_DBG_DUMP_FORCE_ERR_LEVEL	BIT(4) /* used to dump dsp status with error log level */
-
+#define SOF_DBG_DUMP_OPTIONAL		BIT(4) /* only dump if SOF_DBG_PRINT_ALL_DUMPS is set */
 
 /* global debug state set by SOF_DBG_ flags */
 extern int sof_core_debug;
@@ -143,6 +153,14 @@ struct snd_sof_dsp_ops {
 	int (*block_write)(struct snd_sof_dev *sof_dev,
 			   enum snd_sof_fw_blk_type type, u32 offset,
 			   void *src, size_t size); /* mandatory */
+
+	/* Mailbox IO */
+	void (*mailbox_read)(struct snd_sof_dev *sof_dev,
+			     u32 offset, void *dest,
+			     size_t size); /* optional */
+	void (*mailbox_write)(struct snd_sof_dev *sof_dev,
+			      u32 offset, void *src,
+			      size_t size); /* optional */
 
 	/* doorbell */
 	irqreturn_t (*irq_handler)(int irq, void *context); /* optional */
@@ -282,17 +300,17 @@ struct snd_sof_dsp_ops {
 	/* ALSA HW info flags, will be stored in snd_pcm_runtime.hw.info */
 	u32 hw_info;
 
-	const struct sof_arch_ops *arch_ops;
+	const struct dsp_arch_ops *dsp_arch_ops;
 };
 
 /* DSP architecture specific callbacks for oops and stack dumps */
-struct sof_arch_ops {
+struct dsp_arch_ops {
 	void (*dsp_oops)(struct snd_sof_dev *sdev, void *oops);
 	void (*dsp_stack)(struct snd_sof_dev *sdev, void *oops,
 			  u32 *stack, u32 stack_words);
 };
 
-#define sof_arch_ops(sdev) ((sdev)->pdata->desc->ops->arch_ops)
+#define sof_dsp_arch_ops(sdev) ((sdev)->pdata->desc->ops->dsp_arch_ops)
 
 /* FS entry for debug files that can expose DSP memories, registers */
 struct snd_sof_dfsentry {
@@ -412,6 +430,8 @@ struct snd_sof_dev {
 	/* debug */
 	struct dentry *debugfs_root;
 	struct list_head dfsentry_list;
+	bool dbg_dump_printed;
+	bool ipc_dump_printed;
 
 	/* firmware loader */
 	struct snd_dma_buffer dmab;
@@ -540,16 +560,29 @@ int snd_sof_debugfs_add_region_item_iomem(struct snd_sof_dev *sdev,
 static inline void sof_stack(struct snd_sof_dev *sdev, void *oops, u32 *stack,
 			     u32 stack_words)
 {
-		sof_arch_ops(sdev)->dsp_stack(sdev, oops, stack, stack_words);
+		sof_dsp_arch_ops(sdev)->dsp_stack(sdev, oops, stack, stack_words);
 }
 
 static inline void sof_oops(struct snd_sof_dev *sdev, void *oops)
 {
-	if (sof_arch_ops(sdev)->dsp_oops)
-		sof_arch_ops(sdev)->dsp_oops(sdev, oops);
+	if (sof_dsp_arch_ops(sdev)->dsp_oops)
+		sof_dsp_arch_ops(sdev)->dsp_oops(sdev, oops);
 }
 
-extern const struct sof_arch_ops sof_xtensa_arch_ops;
+extern const struct dsp_arch_ops sof_xtensa_arch_ops;
+
+/*
+ * Firmware state tracking
+ */
+static inline void sof_set_fw_state(struct snd_sof_dev *sdev,
+				    enum snd_sof_fw_state new_state)
+{
+	if (sdev->fw_state == new_state)
+		return;
+
+	dev_dbg(sdev->dev, "fw_state change: %d -> %d\n", sdev->fw_state, new_state);
+	sdev->fw_state = new_state;
+}
 
 /*
  * Utilities
@@ -569,26 +602,17 @@ int sof_block_read(struct snd_sof_dev *sdev, enum snd_sof_fw_blk_type blk_type,
 
 int sof_fw_ready(struct snd_sof_dev *sdev, u32 msg_id);
 
-int intel_ipc_msg_data(struct snd_sof_dev *sdev,
+int sof_ipc_msg_data(struct snd_sof_dev *sdev,
+		     struct snd_pcm_substream *substream,
+		     void *p, size_t sz);
+int sof_ipc_pcm_params(struct snd_sof_dev *sdev,
 		       struct snd_pcm_substream *substream,
-		       void *p, size_t sz);
-int intel_ipc_pcm_params(struct snd_sof_dev *sdev,
-			 struct snd_pcm_substream *substream,
-			 const struct sof_ipc_pcm_params_reply *reply);
+		       const struct sof_ipc_pcm_params_reply *reply);
 
-int intel_pcm_open(struct snd_sof_dev *sdev,
-		   struct snd_pcm_substream *substream);
-int intel_pcm_close(struct snd_sof_dev *sdev,
-		    struct snd_pcm_substream *substream);
+int sof_stream_pcm_open(struct snd_sof_dev *sdev,
+			struct snd_pcm_substream *substream);
+int sof_stream_pcm_close(struct snd_sof_dev *sdev,
+			 struct snd_pcm_substream *substream);
 
 int sof_machine_check(struct snd_sof_dev *sdev);
-
-#define sof_dev_dbg_or_err(dev, is_err, fmt, ...)			\
-	do {								\
-		if (is_err)						\
-			dev_err(dev, "error: " fmt, __VA_ARGS__);	\
-		else							\
-			dev_dbg(dev, fmt, __VA_ARGS__);			\
-	} while (0)
-
 #endif

@@ -284,7 +284,9 @@ __visible void __irq_entry kvm_async_pf_intr(struct pt_regs *regs)
 
 	entering_ack_irq();
 
+#if IS_ENABLED(CONFIG_HYPERV) || defined(CONFIG_XEN)
 	inc_irq_stat(irq_hv_callback_count);
+#endif
 
 	if (__this_cpu_read(apf_reason.enabled)) {
 		token = __this_cpu_read(apf_reason.token);

@@ -98,7 +98,6 @@ static struct platform_driver acp_asoc_audio = {
 
 module_platform_driver(acp_asoc_audio);
 
-MODULE_IMPORT_NS(SND_SOC_AMD_MACH);
 MODULE_DESCRIPTION("ACP chrome audio support");
 MODULE_ALIAS("platform:rn_rt5682_rt1019");
 MODULE_LICENSE("GPL v2");

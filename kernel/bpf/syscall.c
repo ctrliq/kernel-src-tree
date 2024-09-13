@@ -40,7 +40,7 @@
 #include <linux/rcupdate_trace.h>
 #include <linux/memcontrol.h>
 
-#include <linux/rh_features.h>
+#include <linux/rh_flags.h>
 
 #define IS_FD_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PERF_EVENT_ARRAY || \
 			  (map)->map_type == BPF_MAP_TYPE_CGROUP_ARRAY || \
@@ -2622,7 +2622,7 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 			err = -EINVAL;
 			goto out_put_prog;
 		}
-		rh_mark_used_feature("eBPF/LSM");
+		rh_add_flag("eBPF/LSM");
 		break;
 	default:
 		err = -EINVAL;
@@ -2854,7 +2854,7 @@ static int bpf_raw_tracepoint_open(const union bpf_attr *attr)
 	char buf[128];
 	int err;
 
-	rh_mark_used_feature("eBPF/rawtrace");
+	rh_add_flag("eBPF/rawtrace");
 
 	if (CHECK_ATTR(BPF_RAW_TRACEPOINT_OPEN))
 		return -EINVAL;
@@ -3174,7 +3174,7 @@ static int bpf_prog_test_run(const union bpf_attr *attr,
 	if (IS_ERR(prog))
 		return PTR_ERR(prog);
 
-	rh_mark_used_feature("eBPF/test");
+	rh_add_flag("eBPF/test");
 
 	if (prog->aux->ops->test_run)
 		ret = prog->aux->ops->test_run(prog, attr, uattr);
@@ -4055,7 +4055,7 @@ err_put:
 
 static int tracing_bpf_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 {
-	rh_mark_used_feature("eBPF/rawtrace");
+	rh_add_flag("eBPF/rawtrace");
 
 	if (attr->link_create.attach_type != prog->expected_attach_type)
 		return -EINVAL;

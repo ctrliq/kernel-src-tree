@@ -399,6 +399,15 @@ extern int copy_regset_to_user(struct task_struct *target,
 			       unsigned int setno, unsigned int offset,
 			       unsigned int size, void __user *data);
 
+extern int regset_get(struct task_struct *target,
+		      const struct user_regset *regset,
+		      unsigned int size, void *data);
+
+extern int regset_get_alloc(struct task_struct *target,
+			    const struct user_regset *regset,
+			    unsigned int size,
+			    void **data);
+
 /**
  * copy_regset_from_user - store into thread's user_regset data from user memory
  * @target:	thread to be examined

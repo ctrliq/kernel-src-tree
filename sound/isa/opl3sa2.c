@@ -22,11 +22,6 @@
 MODULE_AUTHOR("Jaroslav Kysela <perex@perex.cz>");
 MODULE_DESCRIPTION("Yamaha OPL3SA2+");
 MODULE_LICENSE("GPL");
-MODULE_SUPPORTED_DEVICE("{{Yamaha,YMF719E-S},"
-		"{Genius,Sound Maker 3DX},"
-		"{Yamaha,OPL3SA3},"
-		"{Intel,AL440LX sound},"
-	        "{NeoMagic,MagicWave 3DX}}");
 
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;	/* Index 0-MAX */
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;	/* ID for this card */
@@ -213,7 +208,8 @@ static int snd_opl3sa2_detect(struct snd_card *card)
 	char str[2];
 
 	port = chip->port;
-	chip->res_port = request_region(port, 2, "OPL3-SA control");
+	chip->res_port = devm_request_region(card->dev, port, 2,
+					     "OPL3-SA control");
 	if (!chip->res_port) {
 		snd_printk(KERN_ERR PFX "can't grab port 0x%lx\n", port);
 		return -EBUSY;
@@ -614,14 +610,6 @@ static int snd_opl3sa2_pnp(int dev, struct snd_opl3sa2 *chip,
 }
 #endif /* CONFIG_PNP */
 
-static void snd_opl3sa2_free(struct snd_card *card)
-{
-	struct snd_opl3sa2 *chip = card->private_data;
-	if (chip->irq >= 0)
-		free_irq(chip->irq, card);
-	release_and_free_resource(chip->res_port);
-}
-
 static int snd_opl3sa2_card_new(struct device *pdev, int dev,
 				struct snd_card **cardp)
 {
@@ -629,8 +617,8 @@ static int snd_opl3sa2_card_new(struct device *pdev, int dev,
 	struct snd_opl3sa2 *chip;
 	int err;
 
-	err = snd_card_new(pdev, index[dev], id[dev], THIS_MODULE,
-			   sizeof(struct snd_opl3sa2), &card);
+	err = snd_devm_card_new(pdev, index[dev], id[dev], THIS_MODULE,
+				sizeof(struct snd_opl3sa2), &card);
 	if (err < 0)
 		return err;
 	strcpy(card->driver, "OPL3SA2");
@@ -638,7 +626,6 @@ static int snd_opl3sa2_card_new(struct device *pdev, int dev,
 	chip = card->private_data;
 	spin_lock_init(&chip->reg_lock);
 	chip->irq = -1;
-	card->private_free = snd_opl3sa2_free;
 	*cardp = card;
 	return 0;
 }
@@ -663,8 +650,8 @@ static int snd_opl3sa2_probe(struct snd_card *card, int dev)
 	err = snd_opl3sa2_detect(card);
 	if (err < 0)
 		return err;
-	err = request_irq(xirq, snd_opl3sa2_interrupt, 0,
-			  "OPL3-SA2", card);
+	err = devm_request_irq(card->dev, xirq, snd_opl3sa2_interrupt, 0,
+			       "OPL3-SA2", card);
 	if (err) {
 		snd_printk(KERN_ERR PFX "can't grab IRQ %d\n", xirq);
 		return -ENODEV;
@@ -742,23 +729,14 @@ static int snd_opl3sa2_pnp_detect(struct pnp_dev *pdev,
 	if (err < 0)
 		return err;
 	err = snd_opl3sa2_pnp(dev, card->private_data, pdev);
-	if (err < 0) {
-		snd_card_free(card);
+	if (err < 0)
 		return err;
-	}
 	err = snd_opl3sa2_probe(card, dev);
-	if (err < 0) {
-		snd_card_free(card);
+	if (err < 0)
 		return err;
-	}
 	pnp_set_drvdata(pdev, card);
 	dev++;
 	return 0;
-}
-
-static void snd_opl3sa2_pnp_remove(struct pnp_dev *pdev)
-{
-	snd_card_free(pnp_get_drvdata(pdev));
 }
 
 #ifdef CONFIG_PM
@@ -776,7 +754,6 @@ static struct pnp_driver opl3sa2_pnp_driver = {
 	.name = "snd-opl3sa2-pnpbios",
 	.id_table = snd_opl3sa2_pnpbiosids,
 	.probe = snd_opl3sa2_pnp_detect,
-	.remove = snd_opl3sa2_pnp_remove,
 #ifdef CONFIG_PM
 	.suspend = snd_opl3sa2_pnp_suspend,
 	.resume = snd_opl3sa2_pnp_resume,
@@ -808,24 +785,14 @@ static int snd_opl3sa2_pnp_cdetect(struct pnp_card_link *pcard,
 	if (err < 0)
 		return err;
 	err = snd_opl3sa2_pnp(dev, card->private_data, pdev);
-	if (err < 0) {
-		snd_card_free(card);
+	if (err < 0)
 		return err;
-	}
 	err = snd_opl3sa2_probe(card, dev);
-	if (err < 0) {
-		snd_card_free(card);
+	if (err < 0)
 		return err;
-	}
 	pnp_set_card_drvdata(pcard, card);
 	dev++;
 	return 0;
-}
-
-static void snd_opl3sa2_pnp_cremove(struct pnp_card_link *pcard)
-{
-	snd_card_free(pnp_get_card_drvdata(pcard));
-	pnp_set_card_drvdata(pcard, NULL);
 }
 
 #ifdef CONFIG_PM
@@ -844,7 +811,6 @@ static struct pnp_card_driver opl3sa2_pnpc_driver = {
 	.name = "snd-opl3sa2-cpnp",
 	.id_table = snd_opl3sa2_pnpids,
 	.probe = snd_opl3sa2_pnp_cdetect,
-	.remove = snd_opl3sa2_pnp_cremove,
 #ifdef CONFIG_PM
 	.suspend = snd_opl3sa2_pnp_csuspend,
 	.resume = snd_opl3sa2_pnp_cresume,
@@ -890,18 +856,9 @@ static int snd_opl3sa2_isa_probe(struct device *pdev,
 	if (err < 0)
 		return err;
 	err = snd_opl3sa2_probe(card, dev);
-	if (err < 0) {
-		snd_card_free(card);
+	if (err < 0)
 		return err;
-	}
 	dev_set_drvdata(pdev, card);
-	return 0;
-}
-
-static int snd_opl3sa2_isa_remove(struct device *devptr,
-				  unsigned int dev)
-{
-	snd_card_free(dev_get_drvdata(devptr));
 	return 0;
 }
 
@@ -923,7 +880,6 @@ static int snd_opl3sa2_isa_resume(struct device *dev, unsigned int n)
 static struct isa_driver snd_opl3sa2_isa_driver = {
 	.match		= snd_opl3sa2_isa_match,
 	.probe		= snd_opl3sa2_isa_probe,
-	.remove		= snd_opl3sa2_isa_remove,
 #ifdef CONFIG_PM
 	.suspend	= snd_opl3sa2_isa_suspend,
 	.resume		= snd_opl3sa2_isa_resume,

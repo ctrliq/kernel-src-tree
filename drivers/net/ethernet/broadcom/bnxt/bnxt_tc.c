@@ -1884,6 +1884,9 @@ bnxt_tc_indr_block_cb_lookup(struct bnxt *bp, struct net_device *netdev)
 {
 	struct bnxt_flower_indr_block_cb_priv *cb_priv;
 
+	/* All callback list access should be protected by RTNL. */
+	ASSERT_RTNL();
+
 	list_for_each_entry(cb_priv, &bp->tc_indr_block_list, list)
 		if (cb_priv->tunnel_netdev == netdev)
 			return cb_priv;
@@ -2053,7 +2056,11 @@ int bnxt_init_tc(struct bnxt *bp)
 
 	tc_info->enabled = true;
 	bp->dev->hw_features |= NETIF_F_HW_TC;
-	bp->dev->features |= NETIF_F_HW_TC;
+	/*
+	 * RHEL-only.  NETIF_F_HW_TC causes extra logging to the console
+	 * which introduces latency.  Do not enable by default.
+	 */
+	/* bp->dev->features |= NETIF_F_HW_TC; */
 	bp->tc_info = tc_info;
 
 	/* init indirect block notifications */
