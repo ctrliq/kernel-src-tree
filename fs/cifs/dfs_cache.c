@@ -443,17 +443,6 @@ static int cache_entry_hash(const void *data, int size, unsigned int *hash)
 	return 0;
 }
 
-/* Check whether second path component of @path is SYSVOL or NETLOGON */
-static inline bool is_sysvol_or_netlogon(const char *path)
-{
-	const char *s;
-	char sep = path[0];
-
-	s = strchr(path + 1, sep) + 1;
-	return !strncasecmp(s, "sysvol", strlen("sysvol")) ||
-		!strncasecmp(s, "netlogon", strlen("netlogon"));
-}
-
 /* Return target hint of a DFS cache entry */
 static inline char *get_tgt_name(const struct cache_entry *ce)
 {
