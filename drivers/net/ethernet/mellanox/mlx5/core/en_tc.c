@@ -4985,7 +4985,7 @@ int mlx5e_tc_esw_init(struct rhashtable *tc_ht)
 					       MLX5_FLOW_NAMESPACE_FDB);
 
 #if IS_ENABLED(CONFIG_MLX5_TC_SAMPLE)
-	uplink_priv->esw_psample = mlx5_esw_sample_init(netdev_priv(priv->netdev));
+	uplink_priv->esw_psample = mlx5_esw_sample_init(esw);
 #endif
 
 	mapping = mapping_create(sizeof(struct tunnel_match_key),
