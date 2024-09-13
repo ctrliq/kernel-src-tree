@@ -1,5 +1,4 @@
 /*
- *   fs/smb2/smb2maperror.c
  *
  *   Functions which do error mapping of SMB2 status codes to POSIX errors
  *
