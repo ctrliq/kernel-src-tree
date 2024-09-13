@@ -1329,7 +1329,7 @@ static int papr_scm_probe(struct platform_device *pdev)
 	}
 
 	/*
-	 * open firmware platform device create won't update the NUMA 
+	 * open firmware platform device create won't update the NUMA
 	 * distance table. For PAPR SCM devices we use numa_map_to_online_node()
 	 * to find the nearest online NUMA node and that requires correct
 	 * distance table information.
