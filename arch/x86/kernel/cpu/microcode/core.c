@@ -61,7 +61,9 @@ LIST_HEAD(microcode_cache);
  * We guarantee that only a single cpu is being
  * updated at any particular moment of time.
  */
+#ifdef CONFIG_MICROCODE_LATE_LOADING
 static DEFINE_MUTEX(microcode_mutex);
+#endif
 
 struct ucode_cpu_info		ucode_cpu_info[NR_CPUS];
 

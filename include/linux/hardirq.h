@@ -6,6 +6,7 @@
 #include <linux/preempt.h>
 #include <linux/lockdep.h>
 #include <linux/ftrace_irq.h>
+#include <linux/sched.h>
 #include <linux/vtime.h>
 #include <asm/hardirq.h>
 
@@ -114,7 +115,6 @@ extern void rcu_nmi_exit(void);
 #define nmi_enter()						\
 	do {							\
 		arch_nmi_enter();				\
-		printk_nmi_enter();				\
 		lockdep_off();					\
 		ftrace_nmi_enter();				\
 		BUG_ON(in_nmi() == NMI_MASK);			\
@@ -131,7 +131,6 @@ extern void rcu_nmi_exit(void);
 		__preempt_count_sub(NMI_OFFSET + HARDIRQ_OFFSET);	\
 		ftrace_nmi_exit();				\
 		lockdep_on();					\
-		printk_nmi_exit();				\
 		arch_nmi_exit();				\
 	} while (0)
 

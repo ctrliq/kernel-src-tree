@@ -6,6 +6,7 @@
 #include <linux/socket.h>
 #include <linux/rtnetlink.h>
 #include <linux/pkt_sched.h>
+#include <net/net_seq_lock.h>
 
 /* Throughput stats.
  * Must be initialized beforehand with gnet_stats_basic_sync_init().

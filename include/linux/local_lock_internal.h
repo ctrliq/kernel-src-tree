@@ -80,6 +80,12 @@ do {								\
 		local_lock_acquire(this_cpu_ptr(lock));		\
 	} while (0)
 
+#define __local_lock_irqsave_on(lock, flags, cpu)		\
+	do {							\
+		local_irq_save(flags);				\
+		local_lock_acquire(per_cpu_ptr(lock, cpu));	\
+	} while (0)
+
 #define __local_unlock(lock)					\
 	do {							\
 		local_lock_release(this_cpu_ptr(lock));		\
@@ -95,6 +101,12 @@ do {								\
 #define __local_unlock_irqrestore(lock, flags)			\
 	do {							\
 		local_lock_release(this_cpu_ptr(lock));		\
+		local_irq_restore(flags);			\
+	} while (0)
+
+#define __local_unlock_irqrestore_on(lock, flags, cpu)		\
+	do {							\
+		local_lock_release(per_cpu_ptr(lock, cpu));	\
 		local_irq_restore(flags);			\
 	} while (0)
 
@@ -128,6 +140,14 @@ typedef spinlock_t local_lock_t;
 		__local_lock(lock);				\
 	} while (0)
 
+#define __local_lock_irqsave_on(lock, flags, cpu)		\
+	do {							\
+		typecheck(unsigned long, flags);		\
+		flags = 0;					\
+		migrate_disable();				\
+		spin_lock(per_cpu_ptr(lock, cpu));		\
+	} while (0)
+
 #define __local_unlock(__lock)					\
 	do {							\
 		spin_unlock(this_cpu_ptr((__lock)));		\
@@ -137,5 +157,11 @@ typedef spinlock_t local_lock_t;
 #define __local_unlock_irq(lock)		__local_unlock(lock)
 
 #define __local_unlock_irqrestore(lock, flags)	__local_unlock(lock)
+
+#define __local_unlock_irqrestore_on(lock, flags, cpu)		\
+	do {							\
+		spin_unlock(per_cpu_ptr(lock, cpu));		\
+		migrate_enable();				\
+	} while (0)
 
 #endif /* CONFIG_PREEMPT_RT */

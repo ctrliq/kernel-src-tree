@@ -10,6 +10,7 @@
 #include <linux/percpu.h>
 #include <linux/dynamic_queue_limits.h>
 #include <linux/list.h>
+#include <net/net_seq_lock.h>
 #include <linux/refcount.h>
 #include <linux/workqueue.h>
 #include <linux/mutex.h>

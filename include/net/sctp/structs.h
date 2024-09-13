@@ -1589,6 +1589,8 @@ struct sctp_priv_assoc_stats {
 /* Here we have information about each individual association. */
 struct sctp_association {
 
+	struct rcu_head rcu;
+
 	/* A base structure common to endpoint and association.
 	 * In this context, it represents the associations's view
 	 * of the local endpoint of the association.
@@ -2127,8 +2129,6 @@ struct sctp_association {
 
 	u32 secid;
 	u32 peer_secid;
-
-	struct rcu_head rcu;
 };
 
 
