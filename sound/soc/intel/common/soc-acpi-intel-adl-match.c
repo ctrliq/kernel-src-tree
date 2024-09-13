@@ -453,6 +453,7 @@ struct snd_soc_acpi_mach snd_soc_acpi_intel_adl_sdw_machines[] = {
 		.link_mask = 0x7, /* rt1316 on link0 and link1 & rt711 on link2*/
 		.links = adl_sdw_rt711_link2_rt1316_link01,
 		.drv_name = "sof_sdw",
+		.sof_fw_filename = "sof-adl.ri",
 		.sof_tplg_filename = "sof-adl-rt711-l2-rt1316-l01.tplg",
 	},
 	{
