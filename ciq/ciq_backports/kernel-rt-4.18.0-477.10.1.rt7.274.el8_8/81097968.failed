@@ -1,0 +1,88 @@
+irq_work: Allow irq_work_sync() to sleep if irq_work() no IRQ support.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-rt-4.18.0-477.10.1.rt7.274.el8_8
+commit-author Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+commit 810979682ccc98dbd83f341c18a2e556c30a7164
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-477.10.1.rt7.274.el8_8/81097968.failed
+
+irq_work() triggers instantly an interrupt if supported by the
+architecture. Otherwise the work will be processed on the next timer
+tick. In worst case irq_work_sync() could spin up to a jiffy.
+
+irq_work_sync() is usually used in tear down context which is fully
+preemptible. Based on review irq_work_sync() is invoked from preemptible
+context and there is one waiter at a time. This qualifies it to use
+rcuwait for synchronisation.
+
+Let irq_work_sync() synchronize with rcuwait if the architecture
+processes irqwork via the timer tick.
+
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20211006111852.1514359-3-bigeasy@linutronix.de
+(cherry picked from commit 810979682ccc98dbd83f341c18a2e556c30a7164)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/irq_work.h
+diff --cc include/linux/irq_work.h
+index 5071b82ab54a,b48955e9c920..000000000000
+--- a/include/linux/irq_work.h
++++ b/include/linux/irq_work.h
+@@@ -3,7 -3,7 +3,11 @@@
+  #define _LINUX_IRQ_WORK_H
+  
+  #include <linux/smp_types.h>
+++<<<<<<< HEAD
+ +#include <linux/rh_kabi.h>
+++=======
++ #include <linux/rcuwait.h>
+++>>>>>>> 810979682ccc (irq_work: Allow irq_work_sync() to sleep if irq_work() no IRQ support.)
+  
+  /*
+   * An entry can be in one of four states:
+@@@ -15,10 -15,9 +19,11 @@@
+   */
+  
+  struct irq_work {
+ -	struct __call_single_node node;
+ +	RH_KABI_REPLACE(unsigned long flags;
+ +			struct llist_node llnode,
+ +			struct __call_single_node node)
+  	void (*func)(struct irq_work *);
++ 	struct rcuwait irqwait;
+  };
+  
+  #define __IRQ_WORK_INIT(_func, _flags) (struct irq_work){	\
+* Unmerged path include/linux/irq_work.h
+diff --git a/kernel/irq_work.c b/kernel/irq_work.c
+index 64ae81d50b5b..4c3921723100 100644
+--- a/kernel/irq_work.c
++++ b/kernel/irq_work.c
+@@ -159,6 +159,9 @@ void irq_work_single(void *arg)
+ 	 * else claimed it meanwhile.
+ 	 */
+ 	(void)atomic_cmpxchg(&work->node.a_flags, flags, flags & ~IRQ_WORK_BUSY);
++
++	if (!arch_irq_work_has_interrupt())
++		rcuwait_wake_up(&work->irqwait);
+ }
+ 
+ static void irq_work_run_list(struct llist_head *list)
+@@ -203,6 +206,13 @@ void irq_work_tick(void)
+ void irq_work_sync(struct irq_work *work)
+ {
+ 	lockdep_assert_irqs_enabled();
++	might_sleep();
++
++	if (!arch_irq_work_has_interrupt()) {
++		rcuwait_wait_event(&work->irqwait, !irq_work_is_busy(work),
++				   TASK_UNINTERRUPTIBLE);
++		return;
++	}
+ 
+ 	while (irq_work_is_busy(work))
+ 		cpu_relax();
